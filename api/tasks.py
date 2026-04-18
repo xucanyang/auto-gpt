@@ -76,10 +76,17 @@ def _prepare_register_request(req: RegisterTaskRequest) -> RegisterTaskRequest:
         prepared.email = str(prepared.email or "").strip()
         if not prepared.email:
             raise HTTPException(400, "manual_email_otp 模式必须填写邮箱地址")
+        existing_account_capture = prepared.extra.get("chatgpt_existing_account_capture")
+        if isinstance(existing_account_capture, str):
+            existing_account_capture = existing_account_capture.strip().lower() in {"1", "true", "yes", "on"}
+        else:
+            existing_account_capture = bool(existing_account_capture)
         prepared.count = 1
         prepared.concurrency = 1
-        prepared.password = None
+        if not existing_account_capture:
+            prepared.password = None
         prepared.extra["manual_email_address"] = prepared.email
+        prepared.extra["chatgpt_existing_account_capture"] = existing_account_capture
 
     if mail_provider == "luckmail":
         prepared.extra["luckmail_project_code"] = "openai"
@@ -255,6 +262,7 @@ def _check_chatgpt_deferred_invite_availability(
 
     try:
         from platforms.chatgpt.business_workspace_recovery import BusinessWorkspaceRecovery
+        from services.team_embedded_backend import team_embedded_backend
 
         recovery = BusinessWorkspaceRecovery(
             effective_extra,
@@ -267,13 +275,49 @@ def _check_chatgpt_deferred_invite_availability(
         teams = recovery.list_available_teams()
         if not teams:
             return False, "当前没有可邀请 team，延迟邀请任务终止"
-        team_ids = []
+
+        candidate_team_ids = []
         for item in teams:
             try:
                 team_id = int((item or {}).get("id") or 0)
             except Exception:
                 team_id = 0
-            if team_id > 0 and team_id not in team_ids:
+            if team_id > 0 and team_id not in candidate_team_ids:
+                candidate_team_ids.append(team_id)
+
+        # 预检查不能只看旧 DB 状态；先强制刷新候选 Team，剔除 token 失效/已满/过期项。
+        verified_team_ids = []
+        for team_id in candidate_team_ids:
+            try:
+                sync_result = team_embedded_backend.sync_team_info(team_id, force_refresh=True)
+            except Exception as exc:
+                if callable(log_fn):
+                    log_fn(f"[邀请] 预检查刷新 team={team_id} 失败: {exc}")
+                continue
+            if bool((sync_result or {}).get("success")):
+                verified_team_ids.append(team_id)
+                continue
+            if callable(log_fn):
+                error_text = str((sync_result or {}).get("error") or "unknown").strip() or "unknown"
+                log_fn(f"[邀请] 预检查剔除 team={team_id}: {error_text}")
+
+        if not verified_team_ids:
+            return False, "预检查刷新后候选 Team 全部不可用，延迟邀请任务终止"
+
+        teams = recovery.list_available_teams()
+        if not teams:
+            return False, "预检查刷新后没有可邀请 team，延迟邀请任务终止"
+
+        team_ids = []
+        verified_team_id_set = set(verified_team_ids)
+        for item in teams:
+            try:
+                team_id = int((item or {}).get("id") or 0)
+            except Exception:
+                team_id = 0
+            if team_id <= 0 or team_id not in verified_team_id_set:
+                continue
+            if team_id not in team_ids:
                 team_ids.append(team_id)
         if isinstance(effective_extra, dict) and team_ids:
             effective_extra["chatgpt_deferred_invite_team_ids"] = list(team_ids)
@@ -281,7 +325,7 @@ def _check_chatgpt_deferred_invite_availability(
         if team_ids:
             available_text = ",".join(str(team_id) for team_id in team_ids)
             return True, f"延迟邀请预检查通过，可用 team_id={available_text}"
-        return True, "延迟邀请预检查通过，但未解析出可用 team_id"
+        return False, "预检查刷新后候选 Team 全部不可用，延迟邀请任务终止"
     except Exception as exc:
         return False, f"延迟邀请预检查失败: {exc}"
 
@@ -444,6 +488,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                             "chatgpt_team_invite_deferred_activation",
                             "chatgpt_capture_free_workspace",
                             "chatgpt_capture_business_workspace",
+                            "chatgpt_existing_account_capture",
                             "chatgpt_deferred_invite_team_id",
                             "chatgpt_deferred_invite_team_ids",
                         ):

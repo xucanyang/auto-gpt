@@ -8,7 +8,11 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Optional
 
+from sqlalchemy import or_
+from sqlmodel import Session, select
+
 from core.config_store import config_store
+from core.db import AccountModel, engine as account_engine
 from services.team_embedded_backend import team_embedded_backend
 
 
@@ -63,6 +67,175 @@ class TeamLiteService:
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
         conn.row_factory = sqlite3.Row
         return conn
+
+    @staticmethod
+    def _normalize_workspace_scope(value: str) -> str:
+        normalized = str(value or "").strip().lower().replace("-", "_")
+        if normalized in {"business", "team", "enterprise", "workspace"}:
+            return "business"
+        if normalized in {"free", "personal", "personal_free"}:
+            return "free"
+        return ""
+
+    @staticmethod
+    def _parse_account_extra(raw_value: str) -> dict[str, Any]:
+        try:
+            parsed = json.loads(raw_value or "{}")
+        except Exception:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    def _find_existing_team(self, *, account_id: str = "", email: str = "") -> dict[str, Any] | None:
+        normalized_account_id = str(account_id or "").strip()
+        normalized_email = str(email or "").strip().lower()
+        if not normalized_account_id and not normalized_email:
+            return None
+
+        where_parts: list[str] = []
+        params: list[Any] = []
+        if normalized_account_id:
+            where_parts.append("account_id = ?")
+            params.append(normalized_account_id)
+        if normalized_email:
+            where_parts.append("lower(email) = ?")
+            params.append(normalized_email)
+
+        where_clause = " OR ".join(where_parts)
+        with self._connect_db() as conn:
+            row = conn.execute(
+                f"""
+                SELECT id, email, account_id, team_name, status
+                FROM teams
+                WHERE {where_clause}
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                params,
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "id": int(row["id"] or 0),
+            "email": str(row["email"] or ""),
+            "account_id": str(row["account_id"] or ""),
+            "team_name": str(row["team_name"] or ""),
+            "status": str(row["status"] or ""),
+        }
+
+    def _match_source_account(self, team_email: str, team_account_id: str, candidates: list[AccountModel]) -> dict[str, Any]:
+        normalized_email = str(team_email or "").strip().lower()
+        normalized_account_id = str(team_account_id or "").strip()
+        ranked: list[tuple[int, AccountModel, dict[str, Any], str]] = []
+
+        for account in candidates:
+            extra = self._parse_account_extra(getattr(account, "extra_json", "{}"))
+            scope = self._normalize_workspace_scope(str(extra.get("chatgpt_workspace_scope") or ""))
+            if scope != "business":
+                continue
+            score = 0
+            if normalized_account_id and str(getattr(account, "user_id", "") or "").strip() == normalized_account_id:
+                score += 100
+            if normalized_email and str(getattr(account, "email", "") or "").strip().lower() == normalized_email:
+                score += 10
+            if score <= 0:
+                continue
+            ranked.append((score, account, extra, scope))
+
+        if not ranked:
+            return {}
+
+        ranked.sort(
+            key=lambda item: (
+                item[0],
+                str(getattr(item[1], "created_at", "") or ""),
+                int(getattr(item[1], "id", 0) or 0),
+            ),
+            reverse=True,
+        )
+        _, account, extra, scope = ranked[0]
+        return {
+            "account_db_id": int(getattr(account, "id", 0) or 0),
+            "email": str(getattr(account, "email", "") or ""),
+            "account_id": str(getattr(account, "user_id", "") or ""),
+            "status": str(getattr(account, "status", "") or ""),
+            "workspace_scope": scope,
+            "workspace_label": str(extra.get("chatgpt_workspace_label") or scope or ""),
+            "workspace_id": str(extra.get("workspace_id") or ""),
+            "has_refresh_token": bool(str(extra.get("refresh_token") or "").strip()),
+        }
+
+    def _build_team_source_map(self, team_refs: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
+        normalized_refs = [item for item in team_refs if int(item.get("id") or 0) > 0]
+        if not normalized_refs:
+            return {}
+
+        emails = {
+            str(item.get("email") or "").strip().lower()
+            for item in normalized_refs
+            if str(item.get("email") or "").strip()
+        }
+        account_ids = {
+            str(item.get("account_id") or "").strip()
+            for item in normalized_refs
+            if str(item.get("account_id") or "").strip()
+        }
+        if not emails and not account_ids:
+            return {}
+
+        with Session(account_engine) as session:
+            stmt = select(AccountModel).where(AccountModel.platform == "chatgpt")
+            filters = []
+            if emails:
+                filters.append(AccountModel.email.in_(sorted(emails)))
+            if account_ids:
+                filters.append(AccountModel.user_id.in_(sorted(account_ids)))
+            if filters:
+                stmt = stmt.where(or_(*filters))
+            candidates = list(session.exec(stmt).all())
+
+        source_map: dict[int, dict[str, Any]] = {}
+        for item in normalized_refs:
+            source_map[int(item["id"])] = self._match_source_account(
+                str(item.get("email") or ""),
+                str(item.get("account_id") or ""),
+                candidates,
+            )
+        return source_map
+
+    def _get_account_for_team_import(self, account_row_id: int) -> AccountModel | None:
+        with Session(account_engine) as session:
+            return session.get(AccountModel, int(account_row_id))
+
+    def _build_team_import_payload_from_account(self, account: AccountModel) -> dict[str, Any]:
+        if not account or str(getattr(account, "platform", "") or "").strip().lower() != "chatgpt":
+            raise RuntimeError("只支持从 ChatGPT 账号导入 Team")
+
+        extra = self._parse_account_extra(getattr(account, "extra_json", "{}"))
+        workspace_scope = self._normalize_workspace_scope(str(extra.get("chatgpt_workspace_scope") or ""))
+        if workspace_scope != "business":
+            raise RuntimeError("只有 business 工作空间账号才能设为 Team 母号")
+
+        email = str(getattr(account, "email", "") or "").strip()
+        account_id = str(getattr(account, "user_id", "") or extra.get("account_id") or "").strip()
+        access_token = str(extra.get("access_token") or getattr(account, "token", "") or "").strip()
+        refresh_token = str(extra.get("refresh_token") or "").strip()
+        session_token = str(extra.get("session_token") or "").strip()
+        client_id = str(extra.get("client_id") or "app_EMoamEEZ73f0CkXaXp7hrann").strip()
+
+        if not any((access_token, refresh_token, session_token)):
+            raise RuntimeError("该账号缺少可用于 Team 导入的凭证")
+
+        return {
+            "email": email,
+            "account_id": account_id,
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "session_token": session_token,
+            "client_id": client_id,
+            "workspace_scope": workspace_scope,
+            "workspace_label": str(extra.get("chatgpt_workspace_label") or workspace_scope or ""),
+            "account_row_id": int(getattr(account, "id", 0) or 0),
+        }
 
     def _get_team_db_detail(self, team_id: int) -> dict[str, Any] | None:
         with self._connect_db() as conn:
@@ -358,6 +531,10 @@ class TeamLiteService:
 
             items.append(item)
 
+        source_map = self._build_team_source_map(items)
+        for item in items:
+            item["source_account"] = dict(source_map.get(int(item.get("id") or 0)) or {})
+
         return {
             "items": items,
             "page": page,
@@ -465,6 +642,16 @@ class TeamLiteService:
         detail.setdefault("db_current_members", int(detail.get("current_members") or 0))
         detail.setdefault("invited_members", 0)
         self._apply_live_member_counts(detail, live_counts)
+        detail["source_account"] = dict(
+            self._build_team_source_map([
+                {
+                    "id": int(detail.get("id") or team_id),
+                    "email": str(detail.get("email") or ""),
+                    "account_id": str(detail.get("account_id") or ""),
+                }
+            ]).get(int(detail.get("id") or team_id))
+            or {}
+        )
 
         return {
             **external,
@@ -493,6 +680,72 @@ class TeamLiteService:
             body[key] = value
         result = team_embedded_backend.update_team(int(team_id), body)
         self._invalidate_live_member_cache(team_id)
+        return result
+
+    def import_team_from_account(self, account_row_id: int) -> dict[str, Any]:
+        account = self._get_account_for_team_import(int(account_row_id))
+        if not account:
+            raise RuntimeError(f"账号不存在: {account_row_id}")
+
+        payload = self._build_team_import_payload_from_account(account)
+        existing_team = self._find_existing_team(
+            account_id=str(payload.get("account_id") or ""),
+            email=str(payload.get("email") or ""),
+        )
+        source_account = {
+            "account_db_id": int(account.id or 0),
+            "email": str(account.email or ""),
+            "account_id": str(account.user_id or ""),
+            "workspace_scope": str(payload.get("workspace_scope") or ""),
+            "workspace_label": str(payload.get("workspace_label") or ""),
+            "status": str(account.status or ""),
+            "has_refresh_token": bool(str(payload.get("refresh_token") or "").strip()),
+        }
+
+        if existing_team:
+            result = self.update_team(
+                int(existing_team["id"]),
+                {
+                    "email": payload.get("email"),
+                    "account_id": payload.get("account_id"),
+                    "access_token": payload.get("access_token"),
+                    "refresh_token": payload.get("refresh_token"),
+                    "session_token": payload.get("session_token"),
+                    "client_id": payload.get("client_id"),
+                },
+            )
+            if not result.get("success"):
+                return result
+            try:
+                self.refresh_team(int(existing_team["id"]), force=True)
+            except Exception:
+                pass
+            return {
+                "success": True,
+                "action": "updated",
+                "team_id": int(existing_team["id"]),
+                "message": f"Team 已存在，已更新凭证（Team #{int(existing_team['id'])}）",
+                "source_account": source_account,
+            }
+
+        result = self.import_teams(
+            {
+                "import_type": "single",
+                "email": payload.get("email"),
+                "account_id": payload.get("account_id"),
+                "access_token": payload.get("access_token"),
+                "refresh_token": payload.get("refresh_token"),
+                "session_token": payload.get("session_token"),
+                "client_id": payload.get("client_id"),
+            }
+        )
+        if result.get("success") and result.get("team_id"):
+            try:
+                self.refresh_team(int(result["team_id"]), force=True)
+            except Exception:
+                pass
+        result["action"] = "created" if result.get("success") else "failed"
+        result["source_account"] = source_account
         return result
 
     def refresh_team(self, team_id: int, *, force: bool = True) -> dict[str, Any]:

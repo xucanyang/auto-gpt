@@ -19,7 +19,6 @@ import {
   Table,
   Tabs,
   Tag,
-  Tooltip,
   Typography,
 } from 'antd'
 import {
@@ -682,25 +681,42 @@ export default function Teams() {
     {
       title: 'Team',
       key: 'team',
+      width: 180,
       render: (_: any, record: any) => (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-          <Text strong>{compactText(record.team_name, `Team #${record.id}`)}</Text>
-          <Text type="secondary" style={{ fontSize: 12 }}>{record.email || '-'}</Text>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 4, minWidth: 0 }}>
+          <Text strong ellipsis={{ tooltip: record.team_name || `Team #${record.id}` }}>
+            {compactText(record.team_name, `Team #${record.id}`)}
+          </Text>
+          <Text type="secondary" style={{ fontSize: 12 }} ellipsis={{ tooltip: record.email || '-' }}>
+            {record.email || '-'}
+          </Text>
         </div>
       ),
     },
     {
-      title: 'Account ID',
-      dataIndex: 'account_id',
-      key: 'account_id',
-      render: (value: string) => (
-        <Text style={{ fontFamily: 'monospace', fontSize: 12 }}>{compactText(value)}</Text>
-      ),
+      title: '来源',
+      key: 'source_account',
+      width: 180,
+      render: (_: any, record: any) => {
+        const source = record.source_account || {}
+        if (!source.account_db_id) {
+          return <Text type="secondary">-</Text>
+        }
+        return (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 4, minWidth: 0 }}>
+            <Text ellipsis={{ tooltip: source.email }}>{compactText(source.email)}</Text>
+            <Space wrap size={4}>
+              <Tag>{compactText(source.workspace_label || source.workspace_scope)}</Tag>
+              <Text type="secondary" style={{ fontSize: 12 }}>账号 #{source.account_db_id}</Text>
+            </Space>
+          </div>
+        )
+      },
     },
     {
       title: '成员',
       key: 'members',
-      width: 180,
+      width: 130,
       render: (_: any, record: any) => (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
           <Text>{record.current_members}/{record.max_members}</Text>
@@ -711,47 +727,34 @@ export default function Teams() {
       ),
     },
     {
-      title: '同步',
-      key: 'liveSync',
-      width: 130,
-      render: (_: any, record: any) => {
-        const meta = getLiveSyncMeta(record.live_sync_state)
-        const tooltip = record.live_sync_error
-          ? `${meta.description}\n${record.live_sync_error}`
-          : meta.description
-        return (
-          <Tooltip title={<div style={{ whiteSpace: 'pre-wrap' }}>{tooltip}</div>}>
-            <Tag color={meta.color}>{meta.label}</Tag>
-          </Tooltip>
-        )
-      },
-    },
-    {
       title: '状态',
       dataIndex: 'status',
       key: 'status',
-      width: 110,
+      width: 90,
       render: (value: string) => <Tag color={STATUS_COLORS[value] || 'default'}>{compactText(value)}</Tag>,
     },
     {
       title: '订阅',
       dataIndex: 'subscription_plan',
       key: 'subscription_plan',
-      render: (value: string) => compactText(value),
+      width: 120,
+      render: (value: string) => (
+        <Text ellipsis={{ tooltip: value || '-' }}>{compactText(value)}</Text>
+      ),
     },
     {
       title: '最后同步',
       dataIndex: 'last_sync',
       key: 'last_sync',
-      width: 180,
+      width: 150,
       render: (value: string) => <Text type="secondary">{formatDateTime(value)}</Text>,
     },
     {
       title: '操作',
       key: 'actions',
-      width: 400,
+      width: 260,
       render: (_: any, record: any) => (
-        <Space wrap>
+        <Space wrap size={[4, 4]}>
           <Button size="small" icon={<ReloadOutlined />} onClick={() => refreshTeam(record)}>
             刷新
           </Button>
@@ -765,7 +768,7 @@ export default function Teams() {
             邀请
           </Button>
           <Button danger size="small" icon={<DeleteOutlined />} loading={deletingTeamId === record.id} onClick={() => deleteTeam(record)}>
-            删除 Team
+            删除
           </Button>
         </Space>
       ),
@@ -1016,6 +1019,7 @@ export default function Teams() {
           columns={teamColumns}
           dataSource={teams}
           loading={loading}
+          tableLayout="fixed"
           pagination={{
             current: page,
             pageSize,
@@ -1023,7 +1027,6 @@ export default function Teams() {
             showSizeChanger: true,
             onChange: (nextPage, nextPageSize) => loadTeams(nextPage, nextPageSize, search, status),
           }}
-          scroll={{ x: 1220 }}
         />
       </Card>
 
@@ -1110,6 +1113,14 @@ export default function Teams() {
               <div>
                 {currentTeam?.primary_account?.account_name || currentTeam?.primary_account?.account_id
                   ? `${compactText(currentTeam?.primary_account?.account_name)} · ${compactText(currentTeam?.primary_account?.account_id)}`
+                  : '-'}
+              </div>
+            </Col>
+            <Col xs={24} md={12}>
+              <Text type="secondary">来源账号</Text>
+              <div>
+                {currentTeam?.source_account?.account_db_id
+                  ? `${compactText(currentTeam?.source_account?.email)} · ${compactText(currentTeam?.source_account?.workspace_label || currentTeam?.source_account?.workspace_scope)} · 账号 #${currentTeam?.source_account?.account_db_id}`
                   : '-'}
               </div>
             </Col>

@@ -92,6 +92,7 @@ CONFIG_KEYS = [
     "chatgpt_team_invite_deferred_activation",
     "chatgpt_capture_free_workspace",
     "chatgpt_capture_business_workspace",
+    "chatgpt_existing_account_login_password",
     "codex_proxy_url",
     "codex_proxy_key",
     "codex_proxy_upload_type",

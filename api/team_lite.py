@@ -83,6 +83,14 @@ def import_teams(body: TeamImportRequest):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@router.post("/teams/import-from-account/{account_row_id}")
+def import_team_from_account(account_row_id: int):
+    try:
+        return team_lite_service.import_team_from_account(account_row_id)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.post("/teams/live-sync")
 def sync_live_member_counts(body: TeamBulkActionRequest):
     try:

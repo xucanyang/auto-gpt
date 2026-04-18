@@ -566,6 +566,9 @@ class RefreshTokenRegistrationEngine:
     def _is_team_invite_deferred_activation_enabled(self) -> bool:
         return self._read_bool_config("chatgpt_team_invite_deferred_activation", default=False)
 
+    def _is_existing_account_capture_enabled(self) -> bool:
+        return self._read_bool_config("chatgpt_existing_account_capture", default=False)
+
     @staticmethod
     def _normalize_workspace_scope(value: str) -> str:
         normalized = str(value or "").strip().lower().replace("-", "_")
@@ -578,8 +581,21 @@ class RefreshTokenRegistrationEngine:
     def _resolve_workspace_capture_scopes(self, current_scope: str = "") -> list[str]:
         normalized_current = self._normalize_workspace_scope(current_scope)
         team_invite_enabled = self._is_team_invite_enabled()
+        existing_account_capture = self._is_existing_account_capture_enabled()
         has_business_flag = "chatgpt_capture_business_workspace" in self.extra_config
         has_free_flag = "chatgpt_capture_free_workspace" in self.extra_config
+
+        if existing_account_capture:
+            scopes: list[str] = []
+            if self._read_bool_config("chatgpt_capture_business_workspace", default=not has_free_flag or normalized_current == "business"):
+                scopes.append("business")
+            if self._read_bool_config("chatgpt_capture_free_workspace", default=True):
+                scopes.append("free")
+            if not scopes:
+                if normalized_current:
+                    return [normalized_current]
+                return ["business"]
+            return scopes
 
         if not team_invite_enabled:
             if normalized_current:
@@ -1142,10 +1158,13 @@ class RefreshTokenRegistrationEngine:
         first_name: str,
         last_name: str,
         birthdate: str,
+        primary_oauth_client: Optional[OAuthClient] = None,
     ) -> bool:
         current_scope = self._infer_scope_from_access_token(result.access_token, source=result.source)
         selected_scopes = self._resolve_workspace_capture_scopes(current_scope=current_scope)
+        allow_partial_success = self._is_existing_account_capture_enabled()
         available_artifacts: dict[str, dict[str, Any]] = {}
+        optional_failures: list[str] = []
 
         if result.access_token:
             primary_artifact = {
@@ -1165,25 +1184,41 @@ class RefreshTokenRegistrationEngine:
         for scope in selected_scopes:
             if scope in available_artifacts:
                 continue
-            artifact = self._capture_workspace_artifact_via_fresh_login(
-                scope=scope,
-                email=result.email,
-                password=result.password,
-                device_id=getattr(register_client, "device_id", "") or "",
-                user_agent=getattr(register_client, "ua", None),
-                sec_ch_ua=getattr(register_client, "sec_ch_ua", None),
-                impersonate=getattr(register_client, "impersonate", None),
-                browser_fingerprint=getattr(register_client, "fingerprint", None),
-                email_adapter=email_adapter,
-                first_name=first_name,
-                last_name=last_name,
-                birthdate=birthdate,
-            )
-            if artifact:
+            artifact = None
+            if primary_oauth_client is not None:
+                artifact = self._capture_workspace_artifact_via_existing_session(
+                    scope=scope,
+                    oauth_client=primary_oauth_client,
+                    device_id=getattr(register_client, "device_id", "") or "",
+                    user_agent=getattr(register_client, "ua", None),
+                    sec_ch_ua=getattr(register_client, "sec_ch_ua", None),
+                    impersonate=getattr(register_client, "impersonate", None),
+                )
+            if not artifact:
+                artifact = self._capture_workspace_artifact_via_fresh_login(
+                    scope=scope,
+                    email=result.email,
+                    password=result.password,
+                    device_id=getattr(register_client, "device_id", "") or "",
+                    user_agent=getattr(register_client, "ua", None),
+                    sec_ch_ua=getattr(register_client, "sec_ch_ua", None),
+                    impersonate=getattr(register_client, "impersonate", None),
+                    browser_fingerprint=getattr(register_client, "fingerprint", None),
+                    email_adapter=email_adapter,
+                    first_name=first_name,
+                    last_name=last_name,
+                    birthdate=birthdate,
+                )
+            if artifact and self._artifact_has_refresh_token(artifact):
                 available_artifacts[scope] = artifact
+                self._log(
+                    f"[{self._scope_label(scope)}] 已保存 account_id={artifact.get('account_id') or '-'} workspace_id={artifact.get('workspace_id') or '-'}"
+                )
+                continue
+            optional_failures.append(scope)
 
         missing_scopes = [scope for scope in selected_scopes if scope not in available_artifacts]
-        if missing_scopes:
+        if missing_scopes and not allow_partial_success:
             result.success = False
             result.error_message = f"未能获取所选工作空间: {', '.join(missing_scopes)}"
             self._log(result.error_message, "warning")
@@ -1206,8 +1241,11 @@ class RefreshTokenRegistrationEngine:
 
         self._apply_workspace_artifact_to_result(result, ordered_artifacts[0])
         result.workspace_artifacts = ordered_artifacts
+        result.error_message = ""
         result.metadata = result.metadata or {}
         result.metadata["selected_workspace_scopes"] = selected_scopes
+        result.metadata["workspace_capture_optional_failures"] = optional_failures
+        result.metadata["workspace_capture_partial_success"] = bool(optional_failures)
         result.metadata["workspace_artifact_summaries"] = [
             {
                 "scope": str(item.get("scope") or ""),
@@ -1218,6 +1256,14 @@ class RefreshTokenRegistrationEngine:
             }
             for item in ordered_artifacts
         ]
+        if optional_failures:
+            failed_labels = " / ".join(self._scope_label(scope) for scope in optional_failures)
+            if allow_partial_success:
+                self._log(f"[结果] 部分成功：已保存 {len(ordered_artifacts)} 个工作空间，未获取 {failed_labels}", "warning")
+            else:
+                self._log(f"[结果] 未获取 {failed_labels}", "warning")
+        else:
+            self._log("[结果] 成功，所需工作空间均已获取")
         return True
 
     def _populate_result_from_tokens(
@@ -1292,23 +1338,29 @@ class RefreshTokenRegistrationEngine:
 
             self._log("[主链路] 开始 ChatGPT RT 主链路")
 
+            existing_account_capture = self._is_existing_account_capture_enabled()
+            if existing_account_capture and not fixed_email:
+                result.error_message = "已有账号抓 auth 模式必须填写邮箱地址"
+                return result
             if not fixed_email:
                 self.email = None
 
-            self._log_stage("注册阶段")
-            self._log("[注册] 开始创建邮箱")
+            self._log_stage("登录阶段" if existing_account_capture else "注册阶段")
+            self._log("[登录] 开始准备已有账号登录" if existing_account_capture else "[注册] 开始创建邮箱")
             if not self._create_email():
                 last_error = "创建邮箱失败"
                 result.error_message = last_error
                 return result
 
             result.email = self.email or ""
-            self.password = self.password or generate_random_password(16)
+            self.password = str(self.password or "").strip() if existing_account_capture else (self.password or generate_random_password(16))
             result.password = self.password
 
             first_name, last_name = generate_random_name()
             birthdate = generate_random_birthday()
-            self._log(f"[注册] 邮箱已创建 {result.email}")
+            self._log(
+                f"[登录] 已锁定账号 {result.email}，准备直接抓取 auth" if existing_account_capture else f"[注册] 邮箱已创建 {result.email}"
+            )
 
             email_adapter = EmailServiceAdapter(
                 self.email_service,
@@ -1317,6 +1369,74 @@ class RefreshTokenRegistrationEngine:
             )
 
             register_client = self._build_chatgpt_client()
+            if existing_account_capture:
+                selected_scopes = self._resolve_workspace_capture_scopes(current_scope="business")
+                login_scope = selected_scopes[0] if selected_scopes else "business"
+                oauth_client = None
+                tokens = None
+                for index, preferred_scope in enumerate(selected_scopes or ["business"]):
+                    oauth_client = self._build_oauth_client()
+                    self._log(
+                        (
+                            f"[登录] 已启用已有账号抓 auth 模式，跳过注册状态机，优先抓取 {self._scope_label(preferred_scope)}"
+                            if index == 0
+                            else f"[登录] 主抓 {self._scope_label(login_scope)} 失败，回退抓取 {self._scope_label(preferred_scope)}"
+                        )
+                    )
+                    candidate_tokens = oauth_client.login_and_get_tokens(
+                        result.email,
+                        self.password,
+                        device_id=getattr(register_client, "device_id", "") or "",
+                        user_agent=getattr(register_client, "ua", None),
+                        sec_ch_ua=getattr(register_client, "sec_ch_ua", None),
+                        impersonate=getattr(register_client, "impersonate", None),
+                        browser_fingerprint=getattr(register_client, "fingerprint", None),
+                        skymail_client=email_adapter,
+                        prefer_passwordless_login=True,
+                        allow_phone_verification=False,
+                        force_new_browser=True,
+                        force_chatgpt_entry=False,
+                        screen_hint="login",
+                        force_password_login=bool(self.password),
+                        complete_about_you_if_needed=True,
+                        first_name=first_name,
+                        last_name=last_name,
+                        birthdate=birthdate,
+                        login_source=f"workspace_capture_{preferred_scope}:existing_account_capture",
+                        workspace_scope_preference=preferred_scope,
+                    )
+                    if candidate_tokens:
+                        tokens = candidate_tokens
+                        login_scope = preferred_scope
+                        break
+                    last_error = oauth_client.last_error or f"抓取 {preferred_scope} 失败"
+                if not tokens or oauth_client is None:
+                    result.error_message = last_error or "已有账号抓 auth 失败"
+                    return result
+                self._populate_result_from_tokens(
+                    result=result,
+                    tokens=tokens,
+                    oauth_client=oauth_client,
+                    registration_message="existing_account_capture:ok",
+                    source=f"workspace_capture_{login_scope}",
+                    register_client=register_client,
+                )
+                if not result.success:
+                    self._log(result.error_message or "已有账号主链路未获取到 refresh_token", "warning")
+                    return result
+                if not self._finalize_workspace_artifacts(
+                    result=result,
+                    register_client=register_client,
+                    email_adapter=email_adapter,
+                    first_name=first_name,
+                    last_name=last_name,
+                    birthdate=birthdate,
+                    primary_oauth_client=oauth_client,
+                ):
+                    return result
+                self._log(f"[结果] 成功，account_id={result.account_id or '-'} workspace_id={result.workspace_id or '-'}")
+                return result
+
             self._log("[注册] 开始执行注册状态机")
             registered, registration_message = register_client.register_complete_flow(
                 result.email,

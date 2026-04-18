@@ -655,6 +655,7 @@ export default function Accounts() {
   const [businessDeferredModalOpen, setBusinessDeferredModalOpen] = useState(false)
   const [currentAccount, setCurrentAccount] = useState<any>(null)
   const [removingTeamAccountId, setRemovingTeamAccountId] = useState<number | null>(null)
+  const [importingTeamAccountId, setImportingTeamAccountId] = useState<number | null>(null)
 
   const [registerForm] = Form.useForm()
   const [addForm] = Form.useForm()
@@ -853,6 +854,8 @@ export default function Accounts() {
           register_delay_seconds: Number(savedSettings.register_delay_seconds || 0) || 0,
           mail_provider_override: String(savedSettings.mail_provider_override || '__global__'),
           email: String(savedSettings.email || savedEmail || '').trim(),
+          login_password: String(cfg.chatgpt_existing_account_login_password || '').trim(),
+          chatgpt_existing_account_capture: savedSettings.chatgpt_existing_account_capture ?? false,
           chatgpt_enable_team_invite:
             savedSettings.chatgpt_enable_team_invite ?? parseBooleanConfigValue(cfg.chatgpt_enable_team_invite),
           chatgpt_team_invite_deferred_activation:
@@ -875,6 +878,8 @@ export default function Accounts() {
           register_delay_seconds: Number(savedSettings.register_delay_seconds || 0) || 0,
           mail_provider_override: String(savedSettings.mail_provider_override || '__global__'),
           email: String(savedSettings.email || savedEmail || '').trim(),
+          login_password: '',
+          chatgpt_existing_account_capture: savedSettings.chatgpt_existing_account_capture ?? false,
           chatgpt_enable_team_invite: savedSettings.chatgpt_enable_team_invite ?? false,
           chatgpt_team_invite_deferred_activation: savedSettings.chatgpt_team_invite_deferred_activation ?? false,
           chatgpt_capture_business_workspace: savedSettings.chatgpt_capture_business_workspace ?? true,
@@ -930,6 +935,15 @@ export default function Accounts() {
     }
   }
 
+  const canImportAccountToTeam = (record: any): boolean => {
+    if (currentPlatform !== 'chatgpt') return false
+    if (String(record?.extra?.chatgpt_workspace_scope || '').trim().toLowerCase() !== 'business') return false
+    const rt = getRefreshToken(record)
+    const accessToken = String(record?.token || '').trim()
+    const sessionToken = String(record?.extra?.session_token || '').trim()
+    return Boolean(rt || accessToken || sessionToken)
+  }
+
   const exportCsv = () => {
     const header = 'email,password,status,region,cashier_url,created_at'
     const rows = accounts.map((a) => [a.email, a.password, a.status, a.region, a.cashier_url, a.created_at].join(','))
@@ -982,6 +996,18 @@ export default function Accounts() {
       message.error(e.message || '移除队伍失败')
     } finally {
       setRemovingTeamAccountId(null)
+    }
+  }
+
+  const handleImportAccountToTeam = async (record: any) => {
+    setImportingTeamAccountId(record.id)
+    try {
+      const res = await apiFetch(`/team-lite/teams/import-from-account/${record.id}`, { method: 'POST' })
+      message.success(res.message || '已导入 Team 列表')
+    } catch (e: any) {
+      message.error(e.message || '导入 Team 失败')
+    } finally {
+      setImportingTeamAccountId(null)
     }
   }
 
@@ -1056,6 +1082,7 @@ export default function Accounts() {
       register_delay_seconds: Number(values.register_delay_seconds || 0) || 0,
       mail_provider_override: String(values.mail_provider_override || '__global__'),
       email: String(values.email || '').trim(),
+      chatgpt_existing_account_capture: Boolean(values.chatgpt_existing_account_capture),
       chatgpt_enable_team_invite: Boolean(values.chatgpt_enable_team_invite),
       chatgpt_team_invite_deferred_activation: Boolean(values.chatgpt_team_invite_deferred_activation),
       chatgpt_capture_free_workspace:
@@ -1090,6 +1117,15 @@ export default function Accounts() {
           : (String(cfg.mail_provider || 'luckmail').trim() || 'luckmail')
       setRegisterMailProvider(resolvedMailProvider)
       const executorType = normalizeExecutorForPlatform(currentPlatform, cfg.default_executor)
+      const existingAccountCapture =
+        currentPlatform === 'chatgpt'
+        && chatgptRegistrationMode === CHATGPT_REGISTRATION_MODE_REFRESH_TOKEN
+        && resolvedMailProvider === 'manual_email_otp'
+        && Boolean(values.chatgpt_existing_account_capture)
+      const normalizedLoginPassword = String(values.login_password || '').trim()
+      if (existingAccountCapture && !values.chatgpt_capture_business_workspace && !values.chatgpt_capture_free_workspace) {
+        throw new Error('已有账号抓 auth 模式至少要选择一个工作空间')
+      }
       const registerExtra = {
         mail_provider: resolvedMailProvider,
         applemail_base_url: cfg.applemail_base_url,
@@ -1155,17 +1191,21 @@ export default function Accounts() {
         luckmail_api_key: cfg.luckmail_api_key,
         luckmail_email_type: cfg.luckmail_email_type,
         luckmail_domain: cfg.luckmail_domain,
-        chatgpt_enable_team_invite: currentPlatform === 'chatgpt' ? Boolean(values.chatgpt_enable_team_invite) : undefined,
+        chatgpt_existing_account_capture: currentPlatform === 'chatgpt' ? existingAccountCapture : undefined,
+        chatgpt_enable_team_invite:
+          currentPlatform === 'chatgpt'
+            ? (existingAccountCapture ? false : Boolean(values.chatgpt_enable_team_invite))
+            : undefined,
         chatgpt_capture_free_workspace:
           currentPlatform === 'chatgpt'
             ? Boolean(values.chatgpt_capture_free_workspace)
             : undefined,
         chatgpt_capture_business_workspace:
-          currentPlatform === 'chatgpt' && values.chatgpt_enable_team_invite
+          currentPlatform === 'chatgpt' && (values.chatgpt_enable_team_invite || existingAccountCapture)
             ? values.chatgpt_capture_business_workspace
             : undefined,
         chatgpt_team_invite_deferred_activation:
-          currentPlatform === 'chatgpt' && values.chatgpt_enable_team_invite
+          currentPlatform === 'chatgpt' && values.chatgpt_enable_team_invite && !existingAccountCapture
             ? Boolean(values.chatgpt_team_invite_deferred_activation)
             : undefined,
       }
@@ -1192,6 +1232,7 @@ export default function Accounts() {
         register_delay_seconds: Number(values.register_delay_seconds || 0) || 0,
         mail_provider_override: selectedProviderOverride || '__global__',
         email: String(values.email || '').trim(),
+        chatgpt_existing_account_capture: Boolean(values.chatgpt_existing_account_capture),
         chatgpt_enable_team_invite: Boolean(values.chatgpt_enable_team_invite),
         chatgpt_team_invite_deferred_activation: Boolean(values.chatgpt_team_invite_deferred_activation),
         chatgpt_capture_free_workspace: Boolean(values.chatgpt_capture_free_workspace),
@@ -1207,6 +1248,7 @@ export default function Accounts() {
             resolvedMailProvider === 'manual_email_otp' && currentPlatform === 'chatgpt'
               ? (String(values.email || '').trim() || null)
               : null,
+          password: existingAccountCapture ? (normalizedLoginPassword || null) : null,
           count: values.count,
           concurrency: values.concurrency,
           register_delay_seconds: values.register_delay_seconds || 0,
@@ -1735,6 +1777,16 @@ export default function Accounts() {
           <Button type="link" size="small" onClick={() => { setCurrentAccount(record); setDetailModalOpen(true); }}>
             详情
           </Button>
+          {canImportAccountToTeam(record) ? (
+            <Button
+              type="link"
+              size="small"
+              loading={importingTeamAccountId === record.id}
+              onClick={() => handleImportAccountToTeam(record)}
+            >
+              设为 Team 母号
+            </Button>
+          ) : null}
           {record.teamInviteSource?.removable ? (
             <Popconfirm
               title={`确认${getTeamInviteActionLabel(record.teamInviteSource)}？`}
@@ -2136,23 +2188,51 @@ export default function Accounts() {
               </Form.Item>
             ) : null}
             {currentPlatform === 'chatgpt' && effectiveRegisterMailProvider === 'manual_email_otp' ? (
-              <Alert
-                type="info"
-                showIcon
-                style={{ marginBottom: 16 }}
-                message="当前注册将使用手动邮箱模式"
-                description="请先填写你的邮箱地址；真正需要验证码时，弹窗会切到任务日志面板，再出现验证码输入卡片。"
-              />
-            ) : null}
-            {currentPlatform === 'chatgpt' && effectiveRegisterMailProvider === 'manual_email_otp' ? (
-              <Form.Item
-                name="email"
-                label="手填邮箱地址"
-                rules={[{ required: true, message: '请输入邮箱地址' }]}
-                extra="会自动记住你上次填写的邮箱。"
-              >
-                <Input placeholder="name@gmail.com" autoComplete="email" />
-              </Form.Item>
+              <>
+                <Alert
+                  type="info"
+                  showIcon
+                  style={{ marginBottom: 16 }}
+                  message="当前注册将使用手动邮箱模式"
+                  description="请先填写你的邮箱地址。默认仍走原始“注册新号”逻辑；若开启“已有账号抓 auth”，则会跳过注册状态机，直接登录并抓取 workspace auth。真正需要验证码时，弹窗会切到任务日志面板，再出现验证码输入卡片。"
+                />
+                <Form.Item
+                  name="email"
+                  label="手填邮箱地址"
+                  rules={[{ required: true, message: '请输入邮箱地址' }]}
+                  extra="会自动记住你上次填写的邮箱。"
+                >
+                  <Input placeholder="name@gmail.com" autoComplete="email" />
+                </Form.Item>
+                {chatgptRegistrationMode === CHATGPT_REGISTRATION_MODE_REFRESH_TOKEN ? (
+                  <>
+                    <Form.Item
+                      name="chatgpt_existing_account_capture"
+                      valuePropName="checked"
+                      initialValue={false}
+                      extra="开启后：跳过注册状态机，直接登录已有账号抓取 auth / workspace。关闭则保持原始手动注册新号逻辑。"
+                    >
+                      <Checkbox>已有账号抓 auth</Checkbox>
+                    </Form.Item>
+                    <Form.Item
+                      noStyle
+                      shouldUpdate={(prev, next) => prev.chatgpt_existing_account_capture !== next.chatgpt_existing_account_capture}
+                    >
+                      {({ getFieldValue }) =>
+                        getFieldValue('chatgpt_existing_account_capture') ? (
+                          <Form.Item
+                            name="login_password"
+                            label="登录密码"
+                            extra="优先尝试密码登录；若流程仍要求邮箱 OTP，任务面板会继续等待你手动输入验证码。默认值来自设置页，可临时覆盖。"
+                          >
+                            <Input.Password placeholder="留空则优先走邮箱 OTP" autoComplete="current-password" />
+                          </Form.Item>
+                        ) : null
+                      }
+                    </Form.Item>
+                  </>
+                ) : null}
+              </>
             ) : null}
             <Form.Item name="count" label="注册数量" initialValue={1} rules={[{ required: true }]}>
               <Input type="number" min={1} disabled={currentPlatform === 'chatgpt' && effectiveRegisterMailProvider === 'manual_email_otp'} />
@@ -2172,60 +2252,89 @@ export default function Accounts() {
                   />
                 </Form.Item>
                 {chatgptRegistrationMode === CHATGPT_REGISTRATION_MODE_REFRESH_TOKEN ? (
-                  <>
-                    <Form.Item
-                      label="工作空间抓取"
-                      extra="free 勾选独立生效；business 依赖 team invite。若两项都勾，会分别获取并按名称区分保存。"
-                    >
-                      <Space direction="vertical" size={6}>
-                        <Form.Item name="chatgpt_capture_free_workspace" valuePropName="checked" initialValue={true} noStyle>
-                          <Checkbox>抓取 free 工作空间</Checkbox>
-                        </Form.Item>
-                      </Space>
-                    </Form.Item>
-                    <Form.Item
-                      name="chatgpt_enable_team_invite"
-                      valuePropName="checked"
-                      initialValue={false}
-                      label="Business Team Invite"
-                      extra="关闭时走原始注册/登录链路；开启后才会进入 business recovery / team invite。"
-                    >
-                      <Checkbox>启用 team invite / business 恢复</Checkbox>
-                    </Form.Item>
-                    <Form.Item
-                      noStyle
-                      shouldUpdate={(prev, next) => prev.chatgpt_enable_team_invite !== next.chatgpt_enable_team_invite}
-                    >
-                      {({ getFieldValue }) =>
-                        getFieldValue('chatgpt_enable_team_invite') ? (
-                          <>
-                            <Form.Item
-                              name="chatgpt_team_invite_deferred_activation"
-                              valuePropName="checked"
-                              initialValue={false}
-                              extra="开启后：先完成全部账号注册并发出邀请，再统一进入激活阶段；不会在单账号刚注册完时立刻进入 business/free。窗口里的“Business 延迟邀请”只作为补救/重试入口。"
-                            >
-                              <Checkbox>延迟邀请（先统一发邀请，再统一激活）</Checkbox>
-                            </Form.Item>
-                            <Form.Item>
-                              <Space direction="vertical" size={6}>
-                                <Form.Item name="chatgpt_capture_business_workspace" valuePropName="checked" initialValue={true} noStyle>
-                                  <Checkbox>抓取 business 工作空间</Checkbox>
-                                </Form.Item>
-                              </Space>
-                            </Form.Item>
-                          </>
-                        ) : (
+                  <Form.Item
+                    noStyle
+                    shouldUpdate={(prev, next) => (
+                      prev.chatgpt_existing_account_capture !== next.chatgpt_existing_account_capture
+                      || prev.chatgpt_enable_team_invite !== next.chatgpt_enable_team_invite
+                    )}
+                  >
+                    {({ getFieldValue }) => {
+                      const existingAccountCapture = Boolean(getFieldValue('chatgpt_existing_account_capture'))
+                      const teamInviteEnabled = Boolean(getFieldValue('chatgpt_enable_team_invite'))
+                      return existingAccountCapture ? (
+                        <>
+                          <Form.Item
+                            label="工作空间抓取"
+                            extra="默认同时抓取 business + free。哪个成功保存哪个；缺失项只在日志里提示，不回滚已保存的工作空间。"
+                          >
+                            <Space direction="vertical" size={6}>
+                              <Form.Item name="chatgpt_capture_business_workspace" valuePropName="checked" initialValue={true} noStyle>
+                                <Checkbox>抓取 business 工作空间</Checkbox>
+                              </Form.Item>
+                              <Form.Item name="chatgpt_capture_free_workspace" valuePropName="checked" initialValue={true} noStyle>
+                                <Checkbox>抓取 free 工作空间</Checkbox>
+                              </Form.Item>
+                            </Space>
+                          </Form.Item>
                           <Alert
                             type="info"
                             showIcon
-                            message="当前关闭 team invite"
-                            description="普通模式下会直接走 free 主链；business 与延迟邀请配置在开启 team invite 后才生效。"
+                            message="当前使用已有账号抓 auth"
+                            description="这条链路不会进入注册 / team invite；会直接登录已有账号，并优先抓取 business，再补抓 free。"
                           />
-                        )
-                      }
-                    </Form.Item>
-                  </>
+                        </>
+                      ) : (
+                        <>
+                          <Form.Item
+                            label="工作空间抓取"
+                            extra="free 勾选独立生效；business 依赖 team invite。若两项都勾，会分别获取并按名称区分保存。"
+                          >
+                            <Space direction="vertical" size={6}>
+                              <Form.Item name="chatgpt_capture_free_workspace" valuePropName="checked" initialValue={true} noStyle>
+                                <Checkbox>抓取 free 工作空间</Checkbox>
+                              </Form.Item>
+                            </Space>
+                          </Form.Item>
+                          <Form.Item
+                            name="chatgpt_enable_team_invite"
+                            valuePropName="checked"
+                            initialValue={false}
+                            label="Business Team Invite"
+                            extra="关闭时走原始注册/登录链路；开启后才会进入 business recovery / team invite。"
+                          >
+                            <Checkbox>启用 team invite / business 恢复</Checkbox>
+                          </Form.Item>
+                          {teamInviteEnabled ? (
+                            <>
+                              <Form.Item
+                                name="chatgpt_team_invite_deferred_activation"
+                                valuePropName="checked"
+                                initialValue={false}
+                                extra="开启后：先完成全部账号注册并发出邀请，再统一进入激活阶段；不会在单账号刚注册完时立刻进入 business/free。窗口里的“Business 延迟邀请”只作为补救/重试入口。"
+                              >
+                                <Checkbox>延迟邀请（先统一发邀请，再统一激活）</Checkbox>
+                              </Form.Item>
+                              <Form.Item>
+                                <Space direction="vertical" size={6}>
+                                  <Form.Item name="chatgpt_capture_business_workspace" valuePropName="checked" initialValue={true} noStyle>
+                                    <Checkbox>抓取 business 工作空间</Checkbox>
+                                  </Form.Item>
+                                </Space>
+                              </Form.Item>
+                            </>
+                          ) : (
+                            <Alert
+                              type="info"
+                              showIcon
+                              message="当前关闭 team invite"
+                              description="普通模式下会直接走 free 主链；business 与延迟邀请配置在开启 team invite 后才生效。"
+                            />
+                          )}
+                        </>
+                      )
+                    }}
+                  </Form.Item>
                 ) : null}
               </>
             )}
@@ -2360,6 +2469,17 @@ export default function Accounts() {
                 </div>
               )
             })()}
+            {canImportAccountToTeam(currentAccount) ? (
+              <div style={{ marginTop: 12 }}>
+                <Button
+                  type="primary"
+                  loading={importingTeamAccountId === currentAccount.id}
+                  onClick={() => handleImportAccountToTeam(currentAccount)}
+                >
+                  设为 Team 母号
+                </Button>
+              </div>
+            ) : null}
             {currentPlatform === 'chatgpt' && currentAccount.teamInviteSource ? (
               <DetailSection title="Business / Team Invite 来源">
                 <SummaryField label="母号邮箱" value={currentAccount.teamInviteSource.team_email} />
