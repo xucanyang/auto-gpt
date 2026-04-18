@@ -19,7 +19,7 @@ class ChatGPTAccountStateTests(unittest.TestCase):
             account,
             local_probe={
                 "auth": {
-                    "state": "access_token_invalidated",
+                    "state": "refresh_token_invalidated",
                     "http_status": 401,
                     "error_code": "token_invalidated",
                     "message": "invalidated",
@@ -42,11 +42,33 @@ class ChatGPTAccountStateTests(unittest.TestCase):
             "remote_401",
         )
 
+    def test_valid_probe_recovers_invalid_account(self):
+        account = DummyAccount(status="invalid")
+        reason = apply_chatgpt_status_policy(
+            account,
+            local_probe={
+                "auth": {
+                    "state": "access_token_valid",
+                    "http_status": 200,
+                    "error_code": "",
+                    "message": "ok",
+                },
+                "codex": {
+                    "state": "usable",
+                    "http_status": 200,
+                    "error_code": "",
+                    "message": "ok",
+                },
+            },
+        )
+        self.assertEqual(reason, "")
+        self.assertEqual(account.status, "registered")
+
     def test_payment_and_quota_do_not_mark_invalid(self):
         self.assertEqual(
             classify_local_probe_state(
                 {
-                    "auth": {"state": "access_token_valid", "http_status": 200},
+                    "auth": {"state": "refresh_token_valid", "http_status": 200},
                     "codex": {"state": "payment_required", "http_status": 403, "message": "payment required"},
                 }
             ),
@@ -73,6 +95,70 @@ class ChatGPTAccountStateTests(unittest.TestCase):
                         "http_status": 403,
                         "error_code": "account_deactivated",
                         "message": "You do not have an account because it has been deleted or deactivated.",
+                    }
+                }
+            ),
+            "auth_deactivated",
+        )
+
+    def test_refresh_token_invalidated_marks_invalid(self):
+        self.assertEqual(
+            classify_local_probe_state(
+                {
+                    "auth": {
+                        "state": "refresh_token_invalidated",
+                        "http_status": 401,
+                        "error_code": "token_invalidated",
+                        "message": "invalidated",
+                    }
+                }
+            ),
+            "auth_401",
+        )
+
+    def test_codex_refresh_token_invalidated_marks_invalid(self):
+        self.assertEqual(
+            classify_local_probe_state(
+                {
+                    "auth": {
+                        "state": "refresh_token_valid",
+                        "http_status": 200,
+                    },
+                    "codex": {
+                        "state": "refresh_token_invalidated",
+                        "http_status": 401,
+                        "error_code": "token_invalidated",
+                        "message": "invalidated",
+                    },
+                }
+            ),
+            "codex_401",
+        )
+
+    def test_access_token_invalidated_marks_invalid(self):
+        self.assertEqual(
+            classify_local_probe_state(
+                {
+                    "auth": {
+                        "state": "access_token_invalidated",
+                        "http_status": 401,
+                        "error_code": "token_invalidated",
+                        "message": "invalidated",
+                    }
+                }
+            ),
+            "auth_401",
+        )
+
+    def test_deactivated_workspace_marks_invalid(self):
+        self.assertEqual(
+            classify_local_probe_state(
+                {
+                    "auth": {
+                        "state": "account_deactivated",
+                        "http_status": 402,
+                        "error_code": "deactivated_workspace",
+                        "message": '{"detail":{"code":"deactivated_workspace"}}',
                     }
                 }
             ),

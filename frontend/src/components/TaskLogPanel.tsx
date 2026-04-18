@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState } from 'react'
-import { Button, message, Space } from 'antd'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { Button, message, Segmented, Space } from 'antd'
 import { CopyOutlined, FastForwardOutlined, StopOutlined } from '@ant-design/icons'
 
 import { API_BASE, apiFetch, getToken } from '@/lib/utils'
@@ -10,6 +10,17 @@ interface TaskLogPanelProps {
 }
 
 type TaskTerminalStatus = 'idle' | 'done' | 'failed' | 'stopped'
+type LogViewMode = 'info' | 'debug'
+
+const LOG_VIEW_STORAGE_KEY = 'task-log-panel-view-mode'
+
+function parseLogLine(rawLine: string) {
+  const line = String(rawLine || '')
+  const normalized = line.replace(/^\[\d{2}:\d{2}:\d{2}\]\s*/, '')
+  const isDebug = normalized.startsWith('[DEBUG] ')
+  const text = isDebug ? normalized.replace(/^\[DEBUG\]\s*/, '') : normalized
+  return { raw: line, text, isDebug }
+}
 
 export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
   const [lines, setLines] = useState<string[]>([])
@@ -18,15 +29,26 @@ export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
   const [skipLoading, setSkipLoading] = useState(false)
   const [stopLoading, setStopLoading] = useState(false)
   const [stopRequested, setStopRequested] = useState(false)
+  const [viewMode, setViewMode] = useState<LogViewMode>(() => {
+    if (typeof window === 'undefined') return 'info'
+    const saved = window.localStorage.getItem(LOG_VIEW_STORAGE_KEY)
+    return saved === 'debug' ? 'debug' : 'info'
+  })
   const panelRef = useRef<HTMLDivElement>(null)
   const onDoneRef = useRef(onDone)
   const nextSinceRef = useRef(0)
 
   const isFinished = terminalStatus !== 'idle' || stopRequested
 
+  const parsedLines = useMemo(() => lines.map(parseLogLine), [lines])
+  const visibleLines = useMemo(
+    () => (viewMode === 'debug' ? parsedLines : parsedLines.filter((line) => !line.isDebug)),
+    [parsedLines, viewMode],
+  )
+
   const handleCopyAll = async () => {
     try {
-      await navigator.clipboard.writeText(lines.join('\n'))
+      await navigator.clipboard.writeText(visibleLines.map((line) => line.raw).join('\n'))
       message.success('日志已复制')
     } catch {
       message.error('复制失败')
@@ -72,6 +94,11 @@ export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
   useEffect(() => {
     onDoneRef.current = onDone
   }, [onDone])
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    window.localStorage.setItem(LOG_VIEW_STORAGE_KEY, viewMode)
+  }, [viewMode])
 
   useEffect(() => {
     if (!taskId) return
@@ -246,9 +273,20 @@ export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
             停止任务
           </Button>
         </Space>
-        <Button size="small" icon={<CopyOutlined />} onClick={handleCopyAll} disabled={lines.length === 0}>
-          复制日志
-        </Button>
+        <Space>
+          <Segmented
+            size="small"
+            value={viewMode}
+            onChange={(value) => setViewMode(value as LogViewMode)}
+            options={[
+              { label: 'Info', value: 'info' },
+              { label: 'Debug', value: 'debug' },
+            ]}
+          />
+          <Button size="small" icon={<CopyOutlined />} onClick={handleCopyAll} disabled={visibleLines.length === 0}>
+            复制日志
+          </Button>
+        </Space>
       </div>
 
       <div
@@ -273,24 +311,29 @@ export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
           wordBreak: 'break-word',
         }}
       >
-        {lines.length === 0 && !error && <div style={{ color: '#9ca3af' }}>等待日志...</div>}
+        {visibleLines.length === 0 && !error && (
+          <div style={{ color: '#9ca3af' }}>
+            {lines.length === 0 ? '等待日志...' : '当前 Info 视图下没有可显示的日志'}
+          </div>
+        )}
         {error && <div style={{ color: '#dc2626' }}>{error}</div>}
-        {lines.map((line, index) => (
+        {visibleLines.map((line, index) => (
           <div
-            key={index}
+            key={`${index}-${line.raw}`}
             style={{
               lineHeight: 1.5,
-              color:
-                line.includes('✓') || line.includes('成功')
+              color: line.isDebug
+                ? '#6b7280'
+                : line.text.includes('✓') || line.text.includes('成功')
                   ? '#059669'
-                  : line.includes('✗') || line.includes('失败') || line.includes('错误')
+                  : line.text.includes('✗') || line.text.includes('失败') || line.text.includes('错误')
                     ? '#dc2626'
-                    : line.includes('停止') || line.includes('跳过')
+                    : line.text.includes('停止') || line.text.includes('跳过')
                       ? '#d97706'
                       : '#1f2937',
             }}
           >
-            {line}
+            {line.raw}
           </div>
         ))}
       </div>

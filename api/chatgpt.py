@@ -17,8 +17,6 @@ class UploadRequest(BaseModel):
     account_ids: list[int]
     cpa_api_url: Optional[str] = None
     cpa_api_token: Optional[str] = None
-    team_manager_url: Optional[str] = None
-    team_manager_key: Optional[str] = None
 
 
 def _get_account(account_id: int, session: Session) -> AccountModel:
@@ -143,6 +141,61 @@ def probe_local_status(account_id: int, proxy: Optional[str] = None,
     return {"ok": True, "email": acc.email, "probe": probe}
 
 
+class PendingBusinessInviteActivateReq(BaseModel):
+    pass
+
+
+class PendingBusinessInviteBatchActivateReq(BaseModel):
+    invite_ids: list[int] = []
+    limit: int = 200
+
+
+class PendingBusinessInviteAbandonReq(BaseModel):
+    pass
+
+
+@router.get("/pending-business-invites")
+def list_pending_business_invites(status: Optional[str] = None, limit: int = 200):
+    from platforms.chatgpt.pending_business_invites import list_pending_invites
+
+    items = list_pending_invites(status=(status or "").strip() or None, limit=limit)
+    return {
+        "ok": True,
+        "count": len(items),
+        "items": items,
+    }
+
+
+@router.post("/pending-business-invites/{invite_id}/activate")
+def activate_pending_business_invite(invite_id: int, req: PendingBusinessInviteActivateReq):
+    from platforms.chatgpt.pending_business_invites import activate_pending_invite
+
+    try:
+        return activate_pending_invite(invite_id)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/pending-business-invites/batch-activate")
+def activate_pending_business_invites(req: PendingBusinessInviteBatchActivateReq):
+    from platforms.chatgpt.pending_business_invites import activate_pending_invites
+
+    try:
+        return activate_pending_invites(invite_ids=req.invite_ids or None, limit=req.limit)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/pending-business-invites/{invite_id}/abandon")
+def abandon_pending_business_invite(invite_id: int, req: PendingBusinessInviteAbandonReq):
+    from platforms.chatgpt.pending_business_invites import abandon_pending_invite
+
+    try:
+        return abandon_pending_invite(invite_id)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 # ── CPA 上传 ────────────────────────────────────────────────
 class CpaUploadReq(BaseModel):
     api_url: str
@@ -162,7 +215,7 @@ def upload_cpa(account_id: int, req: CpaUploadReq,
 
 
 class Sub2ApiUploadReq(BaseModel):
-    api_url: str
+    api_url: str = ""
     api_key: str = ""
 
 
@@ -170,13 +223,12 @@ class Sub2ApiUploadReq(BaseModel):
 def upload_sub2api(account_id: int, req: Sub2ApiUploadReq,
                    session: Session = Depends(get_session)):
     acc = _get_account(account_id, session)
-    codex_acc = _to_codex_account(acc)
 
-    from platforms.chatgpt.sub2api_upload import upload_to_sub2api
+    from services.sub2api_sync import backfill_chatgpt_account_to_sub2api
 
-    ok, msg = upload_to_sub2api(
-        codex_acc,
-        api_url=req.api_url,
-        api_key=req.api_key,
-    )
-    return {"ok": ok, "message": msg}
+    outcome = backfill_chatgpt_account_to_sub2api(acc, session=session, commit=True)
+    return {
+        "ok": bool(outcome.get("ok")),
+        "message": str(outcome.get("message") or ""),
+        "results": outcome.get("results") or [],
+    }

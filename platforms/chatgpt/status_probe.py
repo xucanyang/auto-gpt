@@ -10,9 +10,11 @@ from typing import Any, Optional
 
 from curl_cffi import requests as cffi_requests
 from services.chatgpt_account_state import is_account_deactivated_message
+from .token_refresh import TokenRefreshManager
 
 CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 CHATGPT_ME_URL = "https://chatgpt.com/backend-api/me"
+CHATGPT_ACCOUNTS_CHECK_URL = "https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27"
 CODEX_USER_AGENT = "codex_cli_rs/0.116.0 (Mac OS 26.0.1; arm64) Apple_Terminal/464"
 
 
@@ -70,6 +72,33 @@ def extract_chatgpt_account_id(account: Any) -> str:
     access_payload = _decode_jwt_payload(access_token)
     auth_info = _extract_auth_info(access_payload)
     return str(auth_info.get("chatgpt_account_id") or auth_info.get("account_id") or "").strip()
+
+
+def extract_chatgpt_organization_id(account: Any, access_token: str = "") -> str:
+    extra = getattr(account, "extra", {}) or {}
+    direct = str(extra.get("organization_id") or getattr(account, "organization_id", "") or "").strip()
+    if direct:
+        return direct
+
+    id_token = str(extra.get("id_token") or getattr(account, "id_token", "") or "").strip()
+    for token in (id_token, access_token):
+        payload = _decode_jwt_payload(token)
+        auth_info = _extract_auth_info(payload)
+        organization_id = str(
+            auth_info.get("organization_id")
+            or auth_info.get("poid")
+            or ""
+        ).strip()
+        if organization_id:
+            return organization_id
+        organizations = auth_info.get("organizations") or []
+        if isinstance(organizations, list):
+            for item in organizations:
+                if isinstance(item, dict):
+                    organization_id = str(item.get("id") or "").strip()
+                    if organization_id:
+                        return organization_id
+    return ""
 
 
 def _parse_loose_json(raw: str) -> dict[str, Any]:
@@ -190,6 +219,18 @@ def _probe_backend_me(access_token: str, proxy: Optional[str]) -> ProbeHTTPResul
     return _perform_get(CHATGPT_ME_URL, headers=headers, proxy=proxy)
 
 
+def _probe_accounts_check(access_token: str, proxy: Optional[str]) -> ProbeHTTPResult:
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/json, text/plain, */*",
+        "Content-Type": "application/json",
+        "Origin": "https://chatgpt.com",
+        "Referer": "https://chatgpt.com/",
+        "User-Agent": CODEX_USER_AGENT,
+    }
+    return _perform_get(CHATGPT_ACCOUNTS_CHECK_URL, headers=headers, proxy=proxy)
+
+
 def _probe_codex_usage(access_token: str, account_id: str, proxy: Optional[str]) -> ProbeHTTPResult:
     headers = {
         "Authorization": f"Bearer {access_token}",
@@ -202,18 +243,179 @@ def _probe_codex_usage(access_token: str, account_id: str, proxy: Optional[str])
     return _perform_get(CODEX_USAGE_URL, headers=headers, proxy=proxy)
 
 
+def _extract_accounts_check_plan_type(acct: dict[str, Any]) -> str:
+    account = acct.get("account") if isinstance(acct.get("account"), dict) else {}
+    plan_type = str(account.get("plan_type") or "").strip()
+    if plan_type:
+        return plan_type
+    entitlement = acct.get("entitlement") if isinstance(acct.get("entitlement"), dict) else {}
+    return str(entitlement.get("subscription_plan") or "").strip()
+
+
+def _extract_accounts_check_expires_at(acct: dict[str, Any]) -> str:
+    entitlement = acct.get("entitlement") if isinstance(acct.get("entitlement"), dict) else {}
+    return str(entitlement.get("expires_at") or "").strip()
+
+
+def _select_accounts_check_subscription(
+    body: dict[str, Any],
+    preferred_keys: list[str] | tuple[str, ...],
+    scope_hint: str = "",
+) -> tuple[str, str]:
+    accounts = body.get("accounts") if isinstance(body.get("accounts"), dict) else {}
+    if not accounts:
+        return "", ""
+
+    seen_keys: set[str] = set()
+    for raw_key in preferred_keys or []:
+        key = str(raw_key or "").strip()
+        if not key or key in seen_keys:
+            continue
+        seen_keys.add(key)
+        acct = accounts.get(key)
+        if isinstance(acct, dict):
+            plan_type = _extract_accounts_check_plan_type(acct)
+            expires_at = _extract_accounts_check_expires_at(acct)
+            if plan_type:
+                return plan_type, expires_at
+
+    default_candidate = ("", "")
+    paid_candidate = ("", "")
+    free_candidate = ("", "")
+    any_candidate = ("", "")
+    for acct in accounts.values():
+        if not isinstance(acct, dict):
+            continue
+        plan_type = _extract_accounts_check_plan_type(acct)
+        if not plan_type:
+            continue
+        expires_at = _extract_accounts_check_expires_at(acct)
+        normalized_plan = _normalize_plan_type(plan_type, "")
+        if not any_candidate[0]:
+            any_candidate = (plan_type, expires_at)
+        account = acct.get("account") if isinstance(acct.get("account"), dict) else {}
+        if bool(account.get("is_default")) and not default_candidate[0]:
+            default_candidate = (plan_type, expires_at)
+        if normalized_plan == "free" and not free_candidate[0]:
+            free_candidate = (plan_type, expires_at)
+        if normalized_plan != "free" and normalized_plan != "unknown" and not paid_candidate[0]:
+            paid_candidate = (plan_type, expires_at)
+
+    normalized_scope = str(scope_hint or "").strip().lower()
+    if normalized_scope == "free":
+        if default_candidate[0]:
+            return default_candidate
+        if free_candidate[0]:
+            return free_candidate
+        return any_candidate
+    if normalized_scope == "business":
+        if paid_candidate[0]:
+            return paid_candidate
+        return any_candidate
+
+    if default_candidate[0]:
+        return default_candidate
+    if paid_candidate[0]:
+        return paid_candidate
+    if free_candidate[0]:
+        return free_candidate
+    return any_candidate
+
+
+def _auth_state_for_source(source: str, *, valid: bool = False, invalidated: bool = False) -> str:
+    source = str(source or "refresh_token").strip().lower() or "refresh_token"
+    if valid:
+        return "access_token_valid" if source == "access_token" else "refresh_token_valid"
+    if invalidated:
+        return "access_token_invalidated" if source == "access_token" else "refresh_token_invalidated"
+    return "unauthorized"
+
+
+def _resolve_probe_access_token(
+    *,
+    refresh_token: str,
+    access_token: str,
+    client_id: str,
+    proxy: Optional[str],
+) -> dict[str, Any]:
+    manager = TokenRefreshManager(proxy_url=proxy)
+    refresh_token = str(refresh_token or "").strip()
+    access_token = str(access_token or "").strip()
+
+    refresh_error_message = ""
+    refresh_http_status = 0
+    refresh_error_code = ""
+
+    if refresh_token:
+        refresh_result = manager.refresh_by_oauth_token(refresh_token=refresh_token, client_id=client_id or None)
+        if refresh_result.success and str(refresh_result.access_token or "").strip():
+            return {
+                "ok": True,
+                "source": "refresh_token",
+                "access_token": str(refresh_result.access_token or "").strip(),
+                "refresh_token": str(refresh_result.refresh_token or refresh_token or "").strip(),
+                "http_status": 200,
+                "error_code": "",
+                "message": "refresh_token 刷新成功",
+            }
+
+        refresh_error_message = str(refresh_result.error_message or "refresh_token 刷新失败").strip()
+        refresh_http_status = 401 if "HTTP 401" in refresh_error_message else 403 if "HTTP 403" in refresh_error_message else 0
+        refresh_error_code = "token_invalidated" if refresh_http_status == 401 else ""
+
+        if not access_token:
+            return {
+                "ok": False,
+                "source": "refresh_token",
+                "access_token": "",
+                "refresh_token": refresh_token,
+                "http_status": refresh_http_status,
+                "error_code": refresh_error_code,
+                "message": refresh_error_message,
+            }
+
+    if access_token:
+        fallback_message = (
+            f"{refresh_error_message}；回退使用现有 access_token 继续探测"
+            if refresh_error_message
+            else "账号缺少 refresh_token；使用现有 access_token 继续探测"
+        )
+        return {
+            "ok": True,
+            "source": "access_token",
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "http_status": 200,
+            "error_code": "",
+            "message": fallback_message,
+        }
+
+    return {
+        "ok": False,
+        "source": "refresh_token",
+        "access_token": "",
+        "refresh_token": "",
+        "http_status": 0,
+        "error_code": "",
+        "message": "账号缺少 refresh_token 且没有可用 access_token",
+    }
+
+
 def probe_local_chatgpt_status(account: Any, proxy: Optional[str] = None) -> dict[str, Any]:
     checked_at = _utcnow_iso()
     extra = getattr(account, "extra", {}) or {}
+    refresh_token = str(extra.get("refresh_token") or getattr(account, "refresh_token", "") or "").strip()
     access_token = str(
         extra.get("access_token")
         or getattr(account, "access_token", "")
         or getattr(account, "token", "")
         or ""
     ).strip()
-    refresh_token = str(extra.get("refresh_token") or getattr(account, "refresh_token", "") or "").strip()
-    session_token = str(extra.get("session_token") or getattr(account, "session_token", "") or "").strip()
+    client_id = str(extra.get("client_id") or getattr(account, "client_id", "") or "").strip()
     account_id = extract_chatgpt_account_id(account)
+    organization_id = extract_chatgpt_organization_id(account)
+    workspace_id = str(extra.get("workspace_id") or getattr(account, "workspace_id", "") or "").strip()
+    workspace_scope = str(extra.get("chatgpt_workspace_scope") or getattr(account, "workspace_scope", "") or "").strip()
 
     result: dict[str, Any] = {
         "version": 1,
@@ -221,16 +423,17 @@ def probe_local_chatgpt_status(account: Any, proxy: Optional[str] = None) -> dic
         "auth": {
             "state": "unknown",
             "checked_at": checked_at,
-            "source": "backend_me",
+            "source": "unknown",
             "http_status": 0,
             "error_code": "",
             "message": "",
-            "refresh_available": bool(refresh_token or session_token),
+            "refresh_available": bool(refresh_token),
+            "access_available": bool(access_token),
         },
         "subscription": {
             "plan": "unknown",
             "checked_at": checked_at,
-            "source": "backend_me",
+            "source": "unknown",
             "workspace_plan_type": "",
             "subscription_active_until": "",
             "chatgpt_account_id": account_id,
@@ -238,7 +441,7 @@ def probe_local_chatgpt_status(account: Any, proxy: Optional[str] = None) -> dic
         "codex": {
             "state": "not_checked",
             "checked_at": checked_at,
-            "source": "wham_usage",
+            "source": "unknown",
             "http_status": 0,
             "error_code": "",
             "message": "",
@@ -246,22 +449,47 @@ def probe_local_chatgpt_status(account: Any, proxy: Optional[str] = None) -> dic
         },
     }
 
-    if not access_token:
+    token_resolution = _resolve_probe_access_token(
+        refresh_token=refresh_token,
+        access_token=access_token,
+        client_id=client_id,
+        proxy=proxy,
+    )
+    token_source = str(token_resolution.get("source") or "refresh_token").strip() or "refresh_token"
+    result["auth"]["source"] = token_source
+    result["subscription"]["source"] = token_source
+    result["codex"]["source"] = token_source
+
+    if not token_resolution.get("ok"):
+        http_status = int(token_resolution.get("http_status") or 0)
+        error_code = str(token_resolution.get("error_code") or "").strip()
+        message = str(token_resolution.get("message") or "").strip()
+        if http_status == 401:
+            state = _auth_state_for_source(token_source, invalidated=True)
+        elif http_status == 403:
+            state = "account_deactivated" if is_account_deactivated_message(error_code, message) else "banned_like"
+        elif http_status == 0:
+            state = "missing_refresh_token"
+        else:
+            state = "probe_failed"
         result["auth"].update(
             {
-                "state": "missing_access_token",
-                "message": "账号缺少 access_token",
+                "state": state,
+                "http_status": http_status,
+                "error_code": error_code,
+                "message": message,
             }
         )
         result["codex"].update(
             {
                 "state": "skipped_auth_invalid",
-                "message": "缺少 access_token，跳过 Codex 探测",
+                "message": f"本地 {token_source} 未通过校验，跳过 Codex 探测",
             }
         )
         return result
 
-    me_result = _probe_backend_me(access_token, proxy=proxy)
+    probe_access_token = str(token_resolution.get("access_token") or "").strip()
+    me_result = _probe_backend_me(probe_access_token, proxy=proxy)
     result["auth"].update(
         {
             "http_status": me_result.status_code,
@@ -270,8 +498,8 @@ def probe_local_chatgpt_status(account: Any, proxy: Optional[str] = None) -> dic
         }
     )
 
-    if me_result.status_code == 200 and me_result.body_json:
-        body = me_result.body_json
+    if me_result.status_code == 200:
+        body = me_result.body_json if isinstance(me_result.body_json, dict) else {}
         plan_type = str(body.get("plan_type") or "").strip()
         workspace_plan_type = ""
         orgs = ((body.get("orgs") or {}).get("data") if isinstance(body.get("orgs"), dict) else []) or []
@@ -284,16 +512,39 @@ def probe_local_chatgpt_status(account: Any, proxy: Optional[str] = None) -> dic
                     workspace_plan_type = str(settings.get("workspace_plan_type") or "").strip()
                     break
 
-        result["auth"]["state"] = "access_token_valid"
+        result["auth"]["state"] = _auth_state_for_source(token_source, valid=True)
+        normalized_plan = _normalize_plan_type(plan_type, workspace_plan_type)
+        subscription_active_until = str(
+            body.get("chatgpt_subscription_active_until")
+            or body.get("subscription_active_until")
+            or ""
+        ).strip()
+
+        if normalized_plan == "unknown":
+            accounts_check = _probe_accounts_check(probe_access_token, proxy=proxy)
+            if accounts_check.status_code == 200 and accounts_check.body_json:
+                matched_org_id = organization_id or extract_chatgpt_organization_id(account, probe_access_token)
+                preferred_keys = [
+                    workspace_id,
+                    account_id,
+                    matched_org_id,
+                ]
+                plan_type_from_accounts, expires_at_from_accounts = _select_accounts_check_subscription(
+                    accounts_check.body_json,
+                    preferred_keys,
+                    workspace_scope,
+                )
+                if plan_type_from_accounts:
+                    normalized_plan = _normalize_plan_type(plan_type_from_accounts, workspace_plan_type)
+                    if expires_at_from_accounts:
+                        subscription_active_until = expires_at_from_accounts
+                    result["subscription"]["source"] = "accounts_check"
+
         result["subscription"].update(
             {
-                "plan": _normalize_plan_type(plan_type, workspace_plan_type),
+                "plan": normalized_plan,
                 "workspace_plan_type": workspace_plan_type,
-                "subscription_active_until": str(
-                    body.get("chatgpt_subscription_active_until")
-                    or body.get("subscription_active_until")
-                    or ""
-                ).strip(),
+                "subscription_active_until": subscription_active_until,
             }
         )
 
@@ -306,7 +557,7 @@ def probe_local_chatgpt_status(account: Any, proxy: Optional[str] = None) -> dic
             )
             return result
 
-        codex_result = _probe_codex_usage(access_token, account_id=account_id, proxy=proxy)
+        codex_result = _probe_codex_usage(probe_access_token, account_id=account_id, proxy=proxy)
         result["codex"].update(
             {
                 "http_status": codex_result.status_code,
@@ -318,7 +569,7 @@ def probe_local_chatgpt_status(account: Any, proxy: Optional[str] = None) -> dic
             result["codex"]["state"] = "usable"
         elif codex_result.status_code == 401:
             if codex_result.error_code == "token_invalidated":
-                result["codex"]["state"] = "access_token_invalidated"
+                result["codex"]["state"] = _auth_state_for_source(token_source, invalidated=True)
             else:
                 result["codex"]["state"] = "unauthorized"
         elif is_account_deactivated_message(codex_result.error_code, codex_result.message):
@@ -332,29 +583,27 @@ def probe_local_chatgpt_status(account: Any, proxy: Optional[str] = None) -> dic
         return result
 
     if me_result.status_code == 401:
-        result["auth"]["state"] = (
-            "access_token_invalidated"
-            if me_result.error_code == "token_invalidated"
-            else "unauthorized"
+        result["auth"]["state"] = _auth_state_for_source(
+            token_source,
+            invalidated=True,
         )
         result["codex"].update(
             {
                 "state": "skipped_auth_invalid",
-                "message": "本地 access_token 未通过 /backend-api/me 校验，跳过 Codex 探测",
+                "message": f"本地 {token_source} 未通过 /backend-api/me 校验，跳过 Codex 探测",
             }
         )
         return result
 
-    if me_result.status_code == 403:
-        result["auth"]["state"] = (
-            "account_deactivated"
-            if is_account_deactivated_message(me_result.error_code, me_result.message)
-            else "banned_like"
-        )
+    if me_result.status_code in (402, 403):
+        if is_account_deactivated_message(me_result.error_code, me_result.message):
+            result["auth"]["state"] = "account_deactivated"
+        else:
+            result["auth"]["state"] = "banned_like" if me_result.status_code == 403 else "probe_failed"
         result["codex"].update(
             {
                 "state": "skipped_auth_invalid",
-                "message": "本地 access_token 被拒绝，跳过 Codex 探测",
+                "message": f"本地 {token_source} 被拒绝，跳过 Codex 探测",
             }
         )
         return result

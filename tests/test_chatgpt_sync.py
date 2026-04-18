@@ -71,7 +71,7 @@ class ChatGPTBackfillTests(unittest.TestCase):
                 "platforms.chatgpt.status_probe.probe_local_chatgpt_status",
                 return_value={
                     "auth": {
-                        "state": "access_token_invalidated",
+                        "state": "refresh_token_invalidated",
                         "http_status": 401,
                         "error_code": "token_invalidated",
                         "message": "invalidated",
@@ -115,7 +115,7 @@ class ChatGPTBackfillTests(unittest.TestCase):
                 "platforms.chatgpt.status_probe.probe_local_chatgpt_status",
                 return_value={
                     "auth": {
-                        "state": "access_token_valid",
+                        "state": "refresh_token_valid",
                         "http_status": 200,
                         "error_code": "",
                         "message": "ok",
@@ -159,7 +159,7 @@ class ChatGPTBackfillTests(unittest.TestCase):
                 "platforms.chatgpt.status_probe.probe_local_chatgpt_status",
                 return_value={
                     "auth": {
-                        "state": "access_token_valid",
+                        "state": "refresh_token_valid",
                         "http_status": 200,
                         "error_code": "",
                         "message": "ok",
@@ -177,6 +177,50 @@ class ChatGPTBackfillTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertTrue(result["uploaded"])
         self.assertEqual(sync_mock.call_count, 2)
+
+    def test_backfill_accepts_access_token_valid_probe(self):
+        account = self._make_account()
+        extra = account.get_extra()
+        extra["sync_statuses"] = {
+            "cliproxyapi": {
+                "uploaded": False,
+                "remote_state": "not_found",
+                "message": "未发现",
+            }
+        }
+        account.set_extra(extra)
+
+        with mock.patch(
+            "services.cliproxyapi_sync.sync_chatgpt_cliproxyapi_status",
+            return_value={
+                "uploaded": True,
+                "remote_state": "usable",
+                "message": "远端可用",
+            },
+        ) as sync_mock:
+            with mock.patch(
+                "platforms.chatgpt.status_probe.probe_local_chatgpt_status",
+                return_value={
+                    "auth": {
+                        "state": "access_token_valid",
+                        "http_status": 200,
+                        "error_code": "",
+                        "message": "ok",
+                    },
+                    "subscription": {"plan": "free"},
+                    "codex": {"state": "usable"},
+                },
+            ):
+                with mock.patch(
+                    "services.chatgpt_sync.upload_account_model_to_cpa",
+                    return_value=(True, "上传成功"),
+                ) as upload_mock:
+                    result = backfill_chatgpt_account_to_cpa(account, commit=False)
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["uploaded"])
+        self.assertEqual(sync_mock.call_count, 1)
+        upload_mock.assert_called_once()
 
 
 if __name__ == "__main__":

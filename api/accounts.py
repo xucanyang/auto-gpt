@@ -2,14 +2,109 @@ from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from fastapi.responses import StreamingResponse
 from sqlmodel import Session, select, func
 from pydantic import BaseModel
-from core.db import AccountModel, get_session
-from typing import Optional
+from core.db import AccountModel, PendingBusinessInviteModel, get_session
+from services.team_lite import team_lite_service
+from typing import Any, Optional
 from datetime import datetime, timezone
 import io, csv, json, logging
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/accounts", tags=["accounts"])
+
+
+def _safe_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except Exception:
+        return 0
+
+
+def _safe_str(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _serialize_account(account: AccountModel, *, team_invite_source: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    data = account.model_dump(mode="json") if hasattr(account, "model_dump") else account.dict()
+    if team_invite_source:
+        data["team_invite_source"] = team_invite_source
+    return data
+
+
+def _build_team_invite_sources(accounts: list[AccountModel], session: Session) -> dict[int, dict[str, Any]]:
+    chatgpt_accounts = [account for account in accounts if account.platform == "chatgpt" and int(account.id or 0) > 0]
+    if not chatgpt_accounts:
+        return {}
+
+    account_ids = [int(account.id or 0) for account in chatgpt_accounts]
+    pending_rows = session.exec(
+        select(PendingBusinessInviteModel).where(PendingBusinessInviteModel.account_id.in_(account_ids))
+    ).all()
+    pending_by_account = {
+        int(row.account_id or 0): row
+        for row in pending_rows
+        if int(row.account_id or 0) > 0
+    }
+
+    sources: dict[int, dict[str, Any]] = {}
+    team_ids: list[int] = []
+    seen_team_ids: set[int] = set()
+
+    for account in chatgpt_accounts:
+        account_id = int(account.id or 0)
+        extra = account.get_extra()
+        pending_payload = dict(extra.get("chatgpt_pending_business_invite") or {})
+        pending_row = pending_by_account.get(account_id)
+
+        team_id = _safe_int(getattr(pending_row, "team_id", 0) if pending_row else pending_payload.get("team_id"))
+        invite_status = _safe_str(getattr(pending_row, "status", "") if pending_row else pending_payload.get("status"))
+        workspace_scope = _safe_str(extra.get("chatgpt_workspace_scope"))
+        team_name = _safe_str(getattr(pending_row, "team_name", "") if pending_row else pending_payload.get("team_name"))
+        invited_at = _safe_str(getattr(pending_row, "invited_at", "") if pending_row else pending_payload.get("invite_sent_at") or pending_payload.get("invited_at"))
+        joined_at = _safe_str(getattr(pending_row, "joined_at", "") if pending_row else pending_payload.get("joined_at"))
+        removed_from_team_at = _safe_str(extra.get("chatgpt_team_invite_removed_at"))
+
+        if team_id <= 0 and not invite_status and workspace_scope not in {"business", "pending_activation"}:
+            continue
+
+        source = {
+            "team_id": team_id,
+            "team_name": team_name,
+            "invite_status": invite_status,
+            "workspace_scope": workspace_scope,
+            "invited_at": invited_at,
+            "joined_at": joined_at,
+            "removed_from_team_at": removed_from_team_at,
+            "removable": team_id > 0 and not removed_from_team_at,
+        }
+        sources[account_id] = source
+        if team_id > 0 and team_id not in seen_team_ids:
+            seen_team_ids.add(team_id)
+            team_ids.append(team_id)
+
+    if not sources:
+        return {}
+
+    team_briefs = team_lite_service.get_team_db_briefs(team_ids)
+    for source in sources.values():
+        team_id = _safe_int(source.get("team_id"))
+        if team_id <= 0:
+            continue
+        team_brief = team_briefs.get(team_id) or {}
+        primary_account = dict(team_brief.get("primary_account") or {})
+        source.update(
+            {
+                "team_email": _safe_str(team_brief.get("email")),
+                "team_account_id": _safe_str(team_brief.get("account_id")),
+                "team_status": _safe_str(team_brief.get("status")),
+                "primary_account_id": _safe_str(primary_account.get("account_id")),
+                "primary_account_name": _safe_str(primary_account.get("account_name")),
+            }
+        )
+        if not source.get("team_name"):
+            source["team_name"] = _safe_str(team_brief.get("team_name"))
+
+    return sources
 
 
 class AccountCreate(BaseModel):
@@ -36,6 +131,12 @@ class BatchDeleteRequest(BaseModel):
     ids: list[int]
 
 
+class BatchDeleteByFilterRequest(BaseModel):
+    platform: Optional[str] = None
+    status: Optional[str] = None
+    email: Optional[str] = None
+
+
 @router.get("")
 def list_accounts(
     platform: Optional[str] = None,
@@ -52,9 +153,17 @@ def list_accounts(
         q = q.where(AccountModel.status == status)
     if email:
         q = q.where(AccountModel.email.contains(email))
-    total = len(session.exec(q).all())
+    total = int(session.exec(select(func.count()).select_from(q.subquery())).one())
     items = session.exec(q.offset((page - 1) * page_size).limit(page_size)).all()
-    return {"total": total, "page": page, "items": items}
+    team_invite_sources = _build_team_invite_sources(items, session)
+    return {
+        "total": total,
+        "page": page,
+        "items": [
+            _serialize_account(item, team_invite_source=team_invite_sources.get(int(item.id or 0)))
+            for item in items
+        ],
+    }
 
 
 @router.post("")
@@ -188,12 +297,140 @@ def check_all_accounts(platform: Optional[str] = None,
     return {"message": "批量检测任务已启动"}
 
 
+@router.post("/batch-delete-by-filter")
+def batch_delete_accounts_by_filter(
+    body: BatchDeleteByFilterRequest,
+    session: Session = Depends(get_session),
+):
+    """按筛选条件批量删除账号。至少需要一个筛选条件。"""
+    if not any([body.platform, body.status, body.email]):
+        raise HTTPException(400, "至少需要一个筛选条件")
+
+    q = select(AccountModel)
+    if body.platform:
+        q = q.where(AccountModel.platform == body.platform)
+    if body.status:
+        q = q.where(AccountModel.status == body.status)
+    if body.email:
+        q = q.where(AccountModel.email.contains(body.email))
+
+    accounts = session.exec(q).all()
+    deleted_count = 0
+    deleted_ids: list[int] = []
+
+    try:
+        for acc in accounts:
+            if acc.id is None:
+                continue
+            deleted_ids.append(acc.id)
+            session.delete(acc)
+            deleted_count += 1
+
+        session.commit()
+        logger.info("按筛选条件批量删除成功: %s 个账号", deleted_count)
+        filters = body.model_dump() if hasattr(body, "model_dump") else body.dict()
+        return {
+            "deleted": deleted_count,
+            "deleted_ids": deleted_ids,
+            "filters": filters,
+        }
+    except Exception as e:
+        session.rollback()
+        logger.exception("按筛选条件批量删除失败")
+        raise HTTPException(500, f"按筛选条件批量删除失败: {str(e)}")
+
+
 @router.get("/{account_id}")
 def get_account(account_id: int, session: Session = Depends(get_session)):
     acc = session.get(AccountModel, account_id)
     if not acc:
         raise HTTPException(404, "账号不存在")
-    return acc
+    team_invite_source = _build_team_invite_sources([acc], session).get(int(acc.id or 0))
+    return _serialize_account(acc, team_invite_source=team_invite_source)
+
+
+@router.post("/{account_id}/chatgpt-team-remove")
+def remove_chatgpt_team_member(account_id: int, session: Session = Depends(get_session)):
+    acc = session.get(AccountModel, account_id)
+    if not acc:
+        raise HTTPException(404, "账号不存在")
+    if acc.platform != "chatgpt":
+        raise HTTPException(400, "只有 ChatGPT 账号支持移除队伍")
+
+    team_invite_source = _build_team_invite_sources([acc], session).get(int(acc.id or 0))
+    if not team_invite_source:
+        raise HTTPException(400, "当前账号没有 Team Invite 来源信息")
+
+    team_id = _safe_int(team_invite_source.get("team_id"))
+    if team_id <= 0:
+        raise HTTPException(400, "当前账号未关联可操作的 Team")
+
+    email = _safe_str(acc.email).lower()
+    if not email:
+        raise HTTPException(400, "当前账号缺少邮箱")
+
+    try:
+        member_result = team_lite_service.check_member(team_id, email, force=True)
+    except Exception as exc:
+        raise HTTPException(400, f"检查 Team 成员失败: {exc}") from exc
+
+    member = dict(member_result.get("member") or {})
+    member_status = _safe_str(member_result.get("status") or member.get("status")).lower()
+    matched = bool(member_result.get("matched"))
+
+    try:
+        if matched and member_status == "joined":
+            role = _safe_str(member.get("role")).lower()
+            if role == "account-owner":
+                raise HTTPException(400, "这是 Team 母号，不能直接从自己的 Team 中移除")
+            user_id = _safe_str(member.get("user_id"))
+            if not user_id:
+                raise HTTPException(400, "命中了已加入成员，但缺少 user_id，无法删除")
+            result = team_lite_service.delete_member(team_id, user_id)
+            action = "delete_member"
+            message_text = "已从 Team 中删除成员"
+        elif matched and member_status == "invited":
+            result = team_lite_service.revoke_invite(team_id, email)
+            action = "revoke_invite"
+            message_text = "已撤销 Team 邀请"
+        elif _safe_str(team_invite_source.get("invite_status")) and _safe_str(team_invite_source.get("invite_status")) != "completed":
+            result = team_lite_service.revoke_invite(team_id, email)
+            action = "revoke_invite"
+            message_text = "已按 pending invite 撤销 Team 邀请"
+        else:
+            # 如果 Team 已经没有该账号，视为“已移除”，记录本地移除时间以便前端更新按钮态
+            action = "noop"
+            result = None
+            message_text = "Team 中未找到该账号，可能已经被移除"
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(400, f"移除队伍失败: {exc}") from exc
+
+    extra = acc.get_extra()
+    extra["chatgpt_team_invite_removed_at"] = datetime.now(timezone.utc).isoformat()
+    acc.set_extra(extra)
+    acc.updated_at = datetime.now(timezone.utc)
+    session.add(acc)
+    session.commit()
+    session.refresh(acc)
+
+    if action == "noop" and not team_invite_source.get("removed_from_team_at"):
+        # 为了让前端“移除队伍”按钮立即消失，未匹配到成员时也直接写本地移除时间
+        team_invite_source["removed_from_team_at"] = extra["chatgpt_team_invite_removed_at"]
+        team_invite_source["removable"] = False
+
+    refreshed_source = _build_team_invite_sources([acc], session).get(int(acc.id or 0)) or team_invite_source
+    if not action == "noop":
+        # 明确刷新成功执行动作后再同步一次，避免因列表查询延迟导致前端刷新后又出现按钮
+        refreshed_source = _build_team_invite_sources([acc], session).get(int(acc.id or 0)) or team_invite_source
+    return {
+        "ok": True,
+        "action": action,
+        "message": message_text,
+        "result": result,
+        "team_invite_source": refreshed_source,
+    }
 
 
 @router.patch("/{account_id}")

@@ -13,6 +13,7 @@ from typing import Any, Tuple
 from curl_cffi import requests as cffi_requests
 
 from platforms.chatgpt.cpa_upload import generate_token_json
+from platforms.chatgpt.status_probe import probe_local_chatgpt_status
 
 logger = logging.getLogger(__name__)
 
@@ -90,7 +91,7 @@ def _extract_organization_id(id_token_payload: dict[str, Any]) -> str:
     return ""
 
 
-def _build_sub2api_account_payload(account, group_ids: list[int] | None = None) -> dict[str, Any]:
+def build_sub2api_lookup_payload(account) -> dict[str, Any]:
     token_data = generate_token_json(account)
     access_token = str(token_data.get("access_token") or "").strip()
     refresh_token = str(token_data.get("refresh_token") or "").strip()
@@ -103,33 +104,55 @@ def _build_sub2api_account_payload(account, group_ids: list[int] | None = None) 
     if not isinstance(expires_at, int) or expires_at <= 0:
         expires_at = int(time.time()) + 863999
 
-    # 关键逻辑：Sub2API 依赖 OpenAI OAuth 结构化字段，这里尽量从现有 token 自动补齐。
     organization_id = _extract_organization_id(_decode_jwt_payload(id_token))
+
+    credentials = {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "expires_in": 863999,
+        "expires_at": expires_at,
+        "chatgpt_account_id": str(
+            access_auth.get("chatgpt_account_id") or token_data.get("account_id") or ""
+        ).strip(),
+        "chatgpt_user_id": str(access_auth.get("chatgpt_user_id") or "").strip(),
+        "organization_id": organization_id,
+        "client_id": str(getattr(account, "client_id", "") or DEFAULT_CLIENT_ID).strip() or DEFAULT_CLIENT_ID,
+        "id_token": id_token,
+    }
 
     return {
         "name": email,
         "notes": "",
         "platform": "openai",
         "type": "oauth",
-        "credentials": {
-            "access_token": access_token,
-            "refresh_token": refresh_token,
-            "expires_in": 863999,
-            "expires_at": expires_at,
-            "chatgpt_account_id": str(
-                access_auth.get("chatgpt_account_id") or token_data.get("account_id") or ""
-            ).strip(),
-            "chatgpt_user_id": str(access_auth.get("chatgpt_user_id") or "").strip(),
-            "organization_id": organization_id,
-            "client_id": str(getattr(account, "client_id", "") or DEFAULT_CLIENT_ID).strip() or DEFAULT_CLIENT_ID,
-            "id_token": id_token,
-        },
+        "credentials": credentials,
         "extra": {"email": email},
-        "group_ids": _parse_group_ids(group_ids),
         "concurrency": 10,
         "priority": 1,
         "auto_pause_on_expired": True,
     }
+
+
+def build_sub2api_account_payload(account, group_ids: list[int] | None = None) -> dict[str, Any]:
+    payload = build_sub2api_lookup_payload(account)
+    credentials = payload.get("credentials") if isinstance(payload.get("credentials"), dict) else {}
+
+    # 上传前做一次本地套餐探测，尽量把 plan_type / subscription_expires_at 一起带到 Sub2API。
+    try:
+        probe = probe_local_chatgpt_status(account)
+        subscription = probe.get("subscription") if isinstance(probe.get("subscription"), dict) else {}
+        plan_type = str(subscription.get("plan") or "").strip().lower()
+        if plan_type and plan_type != "unknown":
+            credentials["plan_type"] = plan_type
+        subscription_active_until = str(subscription.get("subscription_active_until") or "").strip()
+        if subscription_active_until:
+            credentials["subscription_expires_at"] = subscription_active_until
+    except Exception as exc:
+        logger.warning("Sub2API 上传前套餐探测失败: %s", exc)
+
+    payload["credentials"] = credentials
+    payload["group_ids"] = _parse_group_ids(group_ids)
+    return payload
 
 
 def upload_to_sub2api(
@@ -150,7 +173,7 @@ def upload_to_sub2api(
     if not api_key:
         return False, "Sub2API API Key 未配置"
 
-    payload = _build_sub2api_account_payload(account, group_ids=resolved_group_ids)
+    payload = build_sub2api_account_payload(account, group_ids=resolved_group_ids)
     url = f"{api_url.rstrip('/')}/api/v1/admin/accounts"
     headers = {
         "Content-Type": "application/json",

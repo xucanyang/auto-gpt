@@ -22,19 +22,33 @@ class EmailServiceAdapter:
         self.es = email_service
         self.email = email
         self.log_fn = log_fn
-        self._used_codes = set()
+        self._used_codes_by_phase: dict[str, set[str]] = {}
 
-    def wait_for_verification_code(self, email, timeout=60, otp_sent_at=None, exclude_codes=None):
-        msg = f"\u6b63\u5728\u7b49\u5f85\u90ae\u7bb1 {email} \u7684\u9a8c\u8bc1\u7801 ({timeout}s)..."
+    def wait_for_verification_code(
+        self,
+        email,
+        timeout=60,
+        otp_sent_at=None,
+        exclude_codes=None,
+        phase=None,
+        phase_label=None,
+    ):
+        phase_key = str(phase or "email_otp").strip() or "email_otp"
+        phase_title = str(phase_label or phase_key).strip() or phase_key
+        used_codes = self._used_codes_by_phase.setdefault(phase_key, set())
+        msg = f"\u6b63\u5728\u7b49\u5f85\u90ae\u7bb1 {email} \u7684\u9a8c\u8bc1\u7801（{phase_title}, {timeout}s）..."
         self.log_fn(msg)
         code = self.es.get_verification_code(
             timeout=timeout,
             otp_sent_at=otp_sent_at,
-            exclude_codes=exclude_codes or self._used_codes,
+            exclude_codes=set(exclude_codes or set()) | set(used_codes),
+            phase=phase_key,
+            phase_label=phase_title,
         )
         if code:
-            self._used_codes.add(code)
-            self.log_fn(f"\u6210\u529f\u83b7\u53d6\u9a8c\u8bc1\u7801: {code}")
+            code = str(code).strip()
+            used_codes.add(code)
+            self.log_fn(f"\u6210\u529f\u83b7\u53d6\u9a8c\u8bc1\u7801（{phase_title}）")
         return code
 
 class AccessTokenOnlyRegistrationEngine:
@@ -59,15 +73,70 @@ class AccessTokenOnlyRegistrationEngine:
         self.email = None
         self.password = None
         self.logs = []
-        
+
+    @staticmethod
+    def _classify_log_level(message: str, level: str = "info") -> str:
+        normalized_level = str(level or "info").strip().lower() or "info"
+        if normalized_level in {"error", "warning", "debug"}:
+            return normalized_level
+        text = str(message or "").strip()
+        normalized_text = text
+        while normalized_text.startswith("[") and "]" in normalized_text:
+            _, _, rest = normalized_text.partition("]")
+            if not rest:
+                break
+            normalized_text = rest.strip()
+        debug_prefixes = (
+            "开始 OAuth 登录流程...",
+            "OAuth 策略:",
+            "OAuth 状态起点:",
+            "注册状态起点:",
+            "注册状态推进:",
+            "状态步进[",
+            "follow[",
+            "workspace 解析入口:",
+            "workspace 候选:",
+            "workspace session 数据为空:",
+            "Sentinel Browser 模式:",
+            "Sentinel Browser 启动:",
+            "Sentinel Browser 成功:",
+            "business recovery:",
+            "Authorize →",
+            "请求模式:",
+            "实现策略:",
+            "流程策略:",
+            "验证码等待策略:",
+            "邮箱:",
+            "密码:",
+            "注册信息:",
+            "正在创建 ",
+            "生成固定域名邮箱:",
+            "命中验证码:",
+            "成功获取验证码（",
+            "正在等待邮箱 ",
+            "成功创建邮箱:",
+        )
+        if text.startswith("="):
+            return "debug"
+        if text[:2].isdigit() and len(text) > 2 and text[2] == ".":
+            return "debug"
+        if normalized_text.startswith(debug_prefixes) or text.startswith(debug_prefixes) or "page=" in text or "authorize_continue:" in text or "/oauth/authorize ->" in text or "login_session: 已获取" in text:
+            return "debug"
+        return "info"
+
     def _log(self, message: str, level: str = "info"):
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        log_message = f"[{timestamp}] {message}"
+        effective_level = self._classify_log_level(message, level)
+        clean_message = str(message or "").strip()
+        log_message = f"[DEBUG] {clean_message}" if effective_level == "debug" else clean_message
         self.logs.append(log_message)
         if self.callback_logger:
             self.callback_logger(log_message)
-        if level == "error":
+        if effective_level == "error":
             logger.error(log_message)
+        elif effective_level == "warning":
+            logger.warning(log_message)
+        elif effective_level == "debug":
+            logger.debug(log_message)
         else:
             logger.info(log_message)
 

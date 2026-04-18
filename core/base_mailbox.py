@@ -87,6 +87,23 @@ class BaseMailbox(ABC):
         self._checkpoint()
         raise TimeoutError(timeout_message or f"等待验证码超时 ({timeout_seconds}s)")
 
+    def _record_verification_result(
+        self,
+        *,
+        message_id: Any = "",
+        code: str = "",
+        phase: str = "",
+        provider: str = "",
+        metadata: Optional[dict] = None,
+    ) -> None:
+        payload = dict(metadata or {})
+        payload["message_id"] = str(message_id or payload.get("message_id") or payload.get("id") or "").strip()
+        payload["code"] = str(code or payload.get("code") or "").strip()
+        payload["phase"] = str(phase or payload.get("phase") or "").strip()
+        payload["provider"] = str(provider or payload.get("provider") or self.__class__.__name__).strip()
+        payload["recorded_at"] = time.time()
+        self._last_verification_result = payload
+
     @abstractmethod
     def get_email(self) -> MailboxAccount:
         """获取一个可用邮箱"""
@@ -364,13 +381,83 @@ class BaseMailbox(ABC):
         text = re.sub(r"\s+", " ", text).strip()
         return text
 
+
+class ManualEmailOtpMailbox(BaseMailbox):
+    """人工邮箱验证码模式：邮箱地址由用户提供，验证码由任务页手动提交。"""
+
+    def __init__(self, email: str = ""):
+        self._email = str(email or "").strip()
+
+    def get_email(self) -> MailboxAccount:
+        if not self._email:
+            raise RuntimeError("manual_email_otp 模式缺少邮箱地址")
+        return MailboxAccount(email=self._email, account_id=self._email, extra={})
+
+    def get_current_ids(self, account: MailboxAccount) -> set:
+        # 手动邮箱模式不拉收件箱，因此没有“已有邮件 ID”概念。
+        return set()
+
+    def wait_for_code(
+        self,
+        account: MailboxAccount,
+        keyword: str = "",
+        timeout: int = 120,
+        before_ids: set = None,
+        code_pattern: str = None,
+        **kwargs,
+    ) -> str:
+        email = str(getattr(account, "email", "") or self._email or "").strip()
+        if not email:
+            raise RuntimeError("manual_email_otp 模式缺少邮箱地址")
+
+        task_control = getattr(self, "_task_control", None)
+        if task_control is None:
+            raise RuntimeError("manual_email_otp 模式未绑定任务控制器")
+
+        phase = str(kwargs.get("phase") or "email_otp").strip() or "email_otp"
+        phase_label = (
+            str(kwargs.get("phase_label") or "邮箱验证码").strip() or "邮箱验证码"
+        )
+        timeout_seconds = max(int(timeout or 0), 1)
+        self._log(
+            f"等待人工输入验证码：{phase_label}（邮箱 {email}，超时 {timeout_seconds}s）"
+        )
+        code = task_control.wait_for_verification_code(
+            attempt_id=getattr(self, "_task_attempt_token", None),
+            phase=phase,
+            phase_label=phase_label,
+            email=email,
+            timeout_seconds=timeout_seconds,
+        )
+        self._log(f"已收到人工验证码：{phase_label}")
+        return code
+
+
 def create_mailbox(
     provider: str, extra: dict = None, proxy: str = None
 ) -> "BaseMailbox":
     """工厂方法：根据 provider 创建对应的 mailbox 实例"""
     extra = extra or {}
-    if provider == "tempmail_lol":
+    if provider == "manual_email_otp":
+        return ManualEmailOtpMailbox(
+            email=extra.get("manual_email_address") or extra.get("email") or "",
+        )
+    elif provider == "tempmail_lol":
         return TempMailLolMailbox(proxy=proxy)
+    elif provider in ("tempmail_local", "tempmail_api"):
+        return TempMailLocalMailbox(
+            api_url=extra.get("tempmail_api_url", ""),
+            api_key=extra.get("tempmail_api_key", ""),
+            api_key_header=extra.get("tempmail_api_key_header", "Authorization"),
+            primary_domain=extra.get("tempmail_primary_domain", ""),
+            mode=extra.get("tempmail_mode", "fixed_domain"),
+            wait_timeout_seconds=extra.get("tempmail_wait_timeout_seconds", 180),
+            ttl_minutes=extra.get("tempmail_ttl_minutes", 30),
+            reuse_window_minutes=extra.get("tempmail_reuse_window_minutes", 20),
+            permanent=extra.get("tempmail_permanent", False),
+            platform=extra.get("tempmail_platform", "chatgpt"),
+            proxy=proxy,
+        )
     elif provider == "skymail":
         return SkyMailMailbox(
             api_base=extra.get("skymail_api_base", "https://api.skymail.ink"),
@@ -795,9 +882,14 @@ class AppleMailMailbox(BaseMailbox):
                         continue
 
                     code = self._extract_code_from_message(message, code_pattern)
-                    if code and code in exclude_codes:
-                        continue
                     if code:
+                        self._record_verification_result(
+                            message_id=message_id,
+                            code=code,
+                            phase=kwargs.get("phase") or "",
+                            provider="AppleMailMailbox",
+                            metadata={"mailbox": mailbox},
+                        )
                         self._log(f"[AppleMail] {mailbox} 收到验证码: {code}")
                         return code
             return None
@@ -859,7 +951,7 @@ class LaoudoMailbox(BaseMailbox):
     def wait_for_code(
         self,
         account: MailboxAccount,
-        keyword: str = "trae",
+        keyword: str = "",
         timeout: int = 120,
         before_ids: set = None,
         code_pattern: str = None,
@@ -939,7 +1031,7 @@ class AitreMailbox(BaseMailbox):
     def wait_for_code(
         self,
         account: MailboxAccount,
-        keyword: str = "trae",
+        keyword: str = "",
         timeout: int = 120,
         before_ids: set = None,
         code_pattern: str = None,
@@ -1069,6 +1161,319 @@ class TempMailLolMailbox(BaseMailbox):
                         continue
                     code = self._safe_extract(text, code_pattern)
                     if code:
+                        return code
+            except Exception:
+                pass
+            return None
+
+        return self._run_polling_wait(
+            timeout=timeout,
+            poll_interval=3,
+            poll_once=poll_once,
+        )
+
+
+class TempMailLocalMailbox(BaseMailbox):
+    """TempMail 本地接口：支持固定域名直建邮箱，也支持任务级随机子域 ready 建箱"""
+
+    def __init__(
+        self,
+        api_url: str,
+        api_key: str = "",
+        api_key_header: str = "Authorization",
+        primary_domain: str = "",
+        mode: str = "fixed_domain",
+        wait_timeout_seconds: int = 180,
+        ttl_minutes: int = 30,
+        reuse_window_minutes: int = 20,
+        permanent: Any = False,
+        platform: str = "chatgpt",
+        proxy: str = None,
+    ):
+        self.api = self._normalize_api_url(api_url)
+        self.api_key = str(api_key or "").strip()
+        self.api_key_header = str(api_key_header or "Authorization").strip() or "Authorization"
+        self.primary_domain = str(primary_domain or "").strip().lstrip("@.")
+        self.mode = str(mode or "fixed_domain").strip().lower() or "fixed_domain"
+        self._bypass_proxy = self._should_bypass_proxy(self.api)
+        self.proxy = None if self._bypass_proxy else build_requests_proxy_config(proxy)
+        self.platform = str(platform or "chatgpt").strip() or "chatgpt"
+        self._wait_timeout_seconds = self._to_int(wait_timeout_seconds, 180)
+        self._ttl_minutes = self._to_int(ttl_minutes, 30)
+        self._reuse_window_minutes = self._to_int(reuse_window_minutes, 20)
+        self._permanent = self._to_bool(permanent)
+
+    @staticmethod
+    def _to_int(value: Any, default: int) -> int:
+        try:
+            parsed = int(value)
+            return parsed if parsed > 0 else default
+        except Exception:
+            return default
+
+    @staticmethod
+    def _to_bool(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        text = str(value or "").strip().lower()
+        return text in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _normalize_api_url(api_url: str) -> str:
+        from urllib.parse import urlsplit
+
+        raw = str(api_url or "").strip().rstrip("/")
+        if not raw:
+            return ""
+        parts = urlsplit(raw)
+        host = (parts.hostname or "").lower()
+        port = parts.port
+        if host in {"127.0.0.1", "localhost", "138.197.33.125", "any-auto-local.666800.xyz"} and port in {18081, 18082}:
+            scheme = parts.scheme or "http"
+            return f"{scheme}://tempmail-api-1:8080"
+        return raw
+
+    @staticmethod
+    def _should_bypass_proxy(api_url: str) -> bool:
+        from urllib.parse import urlsplit
+
+        host = (urlsplit(str(api_url or "")).hostname or "").lower()
+        if not host:
+            return False
+        return host in {"127.0.0.1", "localhost", "tempmail-api-1", "host.docker.internal"}
+
+    def _headers(self) -> dict:
+        headers = {
+            "accept": "application/json",
+            "content-type": "application/json",
+        }
+        if not self.api_key:
+            return headers
+        if self.api_key_header.lower() == "authorization":
+            token = self.api_key
+            headers["Authorization"] = token if token.lower().startswith("bearer ") else f"Bearer {token}"
+        else:
+            headers[self.api_key_header] = self.api_key
+        return headers
+
+    def _request(self, method: str, path: str, *, timeout: int, **kwargs):
+        import requests
+
+        url = f"{self.api}{path}"
+        if self._bypass_proxy:
+            with requests.Session() as session:
+                session.trust_env = False
+                return session.request(method, url, timeout=timeout, proxies={}, **kwargs)
+        return requests.request(method, url, timeout=timeout, proxies=self.proxy, **kwargs)
+
+    def _ensure_config(self) -> None:
+        if not self.api:
+            raise RuntimeError("TempMail Ready API 未配置：请设置 tempmail_api_url")
+        if not self.api_key:
+            raise RuntimeError("TempMail Ready API 未配置：请设置 tempmail_api_key")
+
+    def _new_task_key(self) -> str:
+        import secrets
+
+        return f"anyauto-{int(time.time() * 1000)}-{threading.get_ident()}-{secrets.token_hex(4)}"
+
+    @staticmethod
+    def _parse_message_timestamp(message: dict) -> Optional[float]:
+        from datetime import datetime
+
+        for key in ("received_at", "receivedAt", "created_at", "createdAt", "date", "timestamp"):
+            value = message.get(key)
+            if value in (None, ""):
+                continue
+            if isinstance(value, (int, float)):
+                numeric = float(value)
+                return numeric / 1000 if numeric > 10_000_000_000 else numeric
+            text = str(value).strip()
+            if not text:
+                continue
+            try:
+                numeric = float(text)
+                return numeric / 1000 if numeric > 10_000_000_000 else numeric
+            except (TypeError, ValueError):
+                pass
+            try:
+                return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                continue
+        return None
+
+    @staticmethod
+    def _message_id(message: dict, index: int = 0) -> str:
+        value = message.get("id")
+        if value not in (None, ""):
+            return str(value)
+        return f"idx-{index}-{message.get('received_at') or message.get('subject') or ''}"
+
+    def _list_emails(self, mailbox_id: str) -> list[dict]:
+        r = self._request(
+            "GET",
+            f"/api/mailboxes/{mailbox_id}/emails",
+            headers=self._headers(),
+            params={"page": 1, "size": 20},
+            timeout=15,
+        )
+        if r.status_code != 200:
+            raise RuntimeError(f"TempMail Ready API 列邮件失败: {r.status_code} {r.text[:200]}")
+        data = r.json()
+        items = data.get("data") if isinstance(data, dict) else []
+        return items if isinstance(items, list) else []
+
+    def _get_email_detail(self, mailbox_id: str, email_id: str) -> dict:
+        r = self._request(
+            "GET",
+            f"/api/mailboxes/{mailbox_id}/emails/{email_id}",
+            headers=self._headers(),
+            timeout=15,
+        )
+        if r.status_code != 200:
+            raise RuntimeError(f"TempMail Ready API 邮件详情失败: {r.status_code} {r.text[:200]}")
+        data = r.json()
+        detail = data.get("email") if isinstance(data, dict) else {}
+        return detail if isinstance(detail, dict) else {}
+
+    def get_email(self) -> MailboxAccount:
+        self._ensure_config()
+
+        if self.mode in {"task_subdomain", "ready_subdomain", "random_domain"}:
+            payload = {
+                "task_key": self._new_task_key(),
+                "platform": self.platform,
+                "wait_timeout_seconds": self._wait_timeout_seconds,
+                "permanent": self._permanent,
+            }
+            if self.primary_domain:
+                payload["primary_domain"] = self.primary_domain
+            if self._ttl_minutes > 0:
+                payload["ttl_minutes"] = self._ttl_minutes
+            if self._reuse_window_minutes > 0:
+                payload["reuse_window_minutes"] = self._reuse_window_minutes
+
+            r = self._request(
+                "POST",
+                "/api/task-mailboxes/prepare",
+                json=payload,
+                headers=self._headers(),
+                timeout=max(30, self._wait_timeout_seconds + 20),
+            )
+            if r.status_code not in (200, 201):
+                raise RuntimeError(f"TempMail Ready API 建箱失败: {r.status_code} {r.text[:300]}")
+            data = r.json()
+            mailbox = data.get("mailbox") if isinstance(data, dict) else {}
+            lease = data.get("lease") if isinstance(data, dict) else {}
+            email = str((mailbox or {}).get("full_address") or "").strip()
+            mailbox_id = str((mailbox or {}).get("id") or "").strip()
+            if not email or not mailbox_id:
+                raise RuntimeError(f"TempMail Ready API 返回异常: {data}")
+            self._log(f"[TempMailLocal] 生成随机子域邮箱: {email}")
+            return MailboxAccount(
+                email=email,
+                account_id=mailbox_id,
+                extra={
+                    "mailbox": mailbox,
+                    "lease": lease,
+                    "task_key": payload["task_key"],
+                    "tempmail_mode": self.mode,
+                },
+            )
+
+        payload = {
+            "ttl_minutes": self._ttl_minutes,
+            "permanent": self._permanent,
+        }
+        if self.primary_domain:
+            payload["domain"] = self.primary_domain
+        r = self._request(
+            "POST",
+            "/api/mailboxes",
+            json=payload,
+            headers=self._headers(),
+            timeout=20,
+        )
+        if r.status_code not in (200, 201):
+            raise RuntimeError(f"TempMail 固定域名建箱失败: {r.status_code} {r.text[:300]}")
+        data = r.json()
+        mailbox = data.get("mailbox") if isinstance(data, dict) else {}
+        email = str((mailbox or {}).get("full_address") or "").strip()
+        mailbox_id = str((mailbox or {}).get("id") or "").strip()
+        if not email or not mailbox_id:
+            raise RuntimeError(f"TempMail 固定域名返回异常: {data}")
+        self._log(f"[TempMailLocal] 生成固定域名邮箱: {email}")
+        return MailboxAccount(
+            email=email,
+            account_id=mailbox_id,
+            extra={
+                "mailbox": mailbox,
+                "tempmail_mode": self.mode,
+            },
+        )
+
+    def get_current_ids(self, account: MailboxAccount) -> set:
+        try:
+            mails = self._list_emails(account.account_id)
+            return {self._message_id(msg, idx) for idx, msg in enumerate(mails)}
+        except Exception:
+            return set()
+
+    def wait_for_code(
+        self,
+        account: MailboxAccount,
+        keyword: str = "",
+        timeout: int = 120,
+        before_ids: set = None,
+        code_pattern: str = None,
+        **kwargs,
+    ) -> str:
+        seen = set(before_ids or [])
+        otp_sent_at = kwargs.get("otp_sent_at")
+        exclude_codes = {
+            str(code).strip()
+            for code in (kwargs.get("exclude_codes") or set())
+            if str(code or "").strip()
+        }
+
+        def poll_once() -> Optional[str]:
+            try:
+                mails = self._list_emails(account.account_id)
+                for idx, msg in enumerate(mails):
+                    mid = self._message_id(msg, idx)
+                    if mid in seen:
+                        continue
+                    msg_ts = self._parse_message_timestamp(msg)
+                    if otp_sent_at and msg_ts and msg_ts < float(otp_sent_at):
+                        seen.add(mid)
+                        continue
+                    try:
+                        detail = self._get_email_detail(account.account_id, mid)
+                    except Exception:
+                        detail = {}
+                    full_text = " ".join(
+                        [
+                            str(msg.get("subject") or ""),
+                            str(detail.get("subject") or ""),
+                            str(detail.get("body_text") or ""),
+                            str(detail.get("body_html") or ""),
+                            str(detail.get("raw_message") or ""),
+                        ]
+                    )
+                    if keyword and keyword.lower() not in full_text.lower():
+                        if full_text.strip():
+                            seen.add(mid)
+                        continue
+                    code = self._safe_extract(full_text, code_pattern)
+                    if code:
+                        seen.add(mid)
+                        self._record_verification_result(
+                            message_id=mid,
+                            code=code,
+                            phase=kwargs.get("phase") or "",
+                            provider="TempMailLocalMailbox",
+                        )
+                        self._log(f"[TempMailLocal] 命中验证码: {code}")
                         return code
             except Exception:
                 pass
@@ -1547,9 +1952,13 @@ class CloudMailMailbox(BaseMailbox):
                     if keyword and keyword.lower() not in content.lower():
                         continue
                     code = self._safe_extract(content, code_pattern)
-                    if code and code in exclude_codes:
-                        continue
                     if code:
+                        self._record_verification_result(
+                            message_id=mid,
+                            code=code,
+                            phase=kwargs.get("phase") or "",
+                            provider="CloudMailMailbox",
+                        )
                         self._log(f"[CloudMail] 命中验证码: {code}")
                         return code
             except Exception:
@@ -1747,9 +2156,13 @@ class DuckMailMailbox(BaseMailbox):
                         r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", "", body
                     )
                     code = self._safe_extract(body, code_pattern)
-                    if code and code in exclude_codes:
-                        continue
                     if code:
+                        self._record_verification_result(
+                            message_id=mid,
+                            code=code,
+                            phase=kwargs.get("phase") or "",
+                            provider="OpenTrashMailMailboxApi",
+                        )
                         return code
             except Exception:
                 pass
@@ -2139,9 +2552,13 @@ class GPTMailMailbox(BaseMailbox):
                         continue
 
                     code = self._safe_extract(search_text, code_pattern)
-                    if code and code in exclude_codes:
-                        continue
                     if code:
+                        self._record_verification_result(
+                            message_id=message_id,
+                            code=code,
+                            phase=kwargs.get("phase") or "",
+                            provider="GPTMailMailbox",
+                        )
                         self._log(f"[GPTMail] 收到验证码: {code}")
                         return code
             except Exception:
@@ -2405,9 +2822,13 @@ class OpenTrashMailMailbox(BaseMailbox):
                         continue
 
                     code = self._safe_extract(search_text, code_pattern)
-                    if code and code in exclude_codes:
-                        continue
                     if code:
+                        self._record_verification_result(
+                            message_id=message_id,
+                            code=code,
+                            phase=kwargs.get("phase") or "",
+                            provider="OpenTrashMailMailbox",
+                        )
                         self._log(f"[OpenTrashMail] 收到验证码: {code}")
                         return code
             except Exception:
@@ -2717,12 +3138,14 @@ class CFWorkerMailbox(BaseMailbox):
                         continue
 
                     code = self._safe_extract(search_text, code_pattern)
-                    if code and code in exclude_codes:
-                        self._log(
-                            f"[CFWorker] \u8df3\u8fc7\u5df2\u7528\u9a8c\u8bc1\u7801 id={mid} created_at={created_at} code={code}"
-                        )
-                        continue
                     if code:
+                        self._record_verification_result(
+                            message_id=mid,
+                            code=code,
+                            phase=kwargs.get("phase") or "",
+                            provider="CFWorkerMailbox",
+                            metadata={"created_at": created_at},
+                        )
                         self._log(
                             f"[CFWorker] \u547d\u4e2d\u65b0\u9a8c\u8bc1\u7801 id={mid} created_at={created_at} code={code}"
                         )
@@ -3179,12 +3602,13 @@ class LuckMailMailbox(BaseMailbox):
                     ]
                 )
                 code = self._safe_extract(body, code_pattern)
-                if code and code in exclude_codes:
-                    self._log(
-                        f"[LuckMail] 跳过已使用验证码 message_id={message_id or '-'} code={code}"
-                    )
-                    continue
                 if code:
+                    self._record_verification_result(
+                        message_id=message_id,
+                        code=code,
+                        phase=kwargs.get("phase") or "",
+                        provider="LuckMailMailbox",
+                    )
                     self._log(f"[LuckMail] 收到验证码: {code}")
                     return code
 

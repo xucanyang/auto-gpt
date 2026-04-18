@@ -1,6 +1,11 @@
 """
 Token 刷新模块
-支持 Session Token 和 OAuth Refresh Token 两种刷新方式
+
+当前主链路采用纯 RT 方案：
+- 主流程 / 状态探测 / 刷新动作只认 OAuth Refresh Token
+- Session Token 不再作为主判定链的一部分
+
+文件内保留 session 刷新 helper 仅为兼容历史排障代码，默认业务流程不会调用。
 """
 
 from __future__ import annotations
@@ -34,10 +39,10 @@ class TokenRefreshResult:
 
 class TokenRefreshManager:
     """
-    Token 刷新管理器
-    支持两种刷新方式：
-    1. Session Token 刷新（优先）
-    2. OAuth Refresh Token 刷新
+    Token 刷新管理器。
+
+    现行业务口径：纯 RT。
+    Session Token helper 保留但不参与主业务判定。
     """
 
     # OpenAI OAuth 端点
@@ -63,13 +68,9 @@ class TokenRefreshManager:
 
     def refresh_by_session_token(self, session_token: str) -> TokenRefreshResult:
         """
-        使用 Session Token 刷新
+        使用 Session Token 刷新（仅历史兼容 helper）。
 
-        Args:
-            session_token: 会话令牌
-
-        Returns:
-            TokenRefreshResult: 刷新结果
+        注意：纯 RT 主链路不会调用此方法。
         """
         result = TokenRefreshResult(success=False)
 
@@ -205,11 +206,9 @@ class TokenRefreshManager:
 
     def refresh_account(self, account: Account) -> TokenRefreshResult:
         """
-        刷新账号的 Token
+        刷新账号的 Token（纯 RT 模式）
 
-        优先级：
-        1. Session Token 刷新
-        2. OAuth Refresh Token 刷新
+        仅使用 OAuth Refresh Token 刷新。
 
         Args:
             account: 账号对象
@@ -217,15 +216,6 @@ class TokenRefreshManager:
         Returns:
             TokenRefreshResult: 刷新结果
         """
-        # 优先尝试 Session Token
-        if account.session_token:
-            logger.info(f"尝试使用 Session Token 刷新账号 {account.email}")
-            result = self.refresh_by_session_token(account.session_token)
-            if result.success:
-                return result
-            logger.warning(f"Session Token 刷新失败，尝试 OAuth 刷新")
-
-        # 尝试 OAuth Refresh Token
         if account.refresh_token:
             logger.info(f"尝试使用 OAuth Refresh Token 刷新账号 {account.email}")
             result = self.refresh_by_oauth_token(
@@ -234,10 +224,9 @@ class TokenRefreshManager:
             )
             return result
 
-        # 无可用刷新方式
         return TokenRefreshResult(
             success=False,
-            error_message="账号没有可用的刷新方式（缺少 session_token 和 refresh_token）"
+            error_message="账号没有可用的刷新方式（缺少 refresh_token）"
         )
 
     def validate_token(self, access_token: str) -> Tuple[bool, Optional[str]]:

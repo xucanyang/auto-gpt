@@ -3,9 +3,8 @@ ChatGPT 注册客户端模块
 使用 curl_cffi 模拟浏览器行为
 """
 
-import random
-import uuid
 import time
+import uuid
 from urllib.parse import urlparse
 from core.proxy_utils import build_requests_proxy_config
 
@@ -21,52 +20,16 @@ from .sentinel_token import build_sentinel_token
 from .sentinel_browser import get_sentinel_token_via_browser
 from .utils import (
     FlowState,
+    apply_browser_fingerprint,
     build_browser_headers,
+    coerce_browser_fingerprint,
     decode_jwt_payload,
     describe_flow_state,
     extract_flow_state,
     generate_datadog_trace,
     normalize_flow_url,
     random_delay,
-    seed_oai_device_cookie,
 )
-
-
-# Chrome 指纹配置
-_CHROME_PROFILES = [
-    {
-        "major": 131,
-        "impersonate": "chrome131",
-        "build": 6778,
-        "patch_range": (69, 205),
-        "sec_ch_ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
-    },
-    {
-        "major": 133,
-        "impersonate": "chrome133a",
-        "build": 6943,
-        "patch_range": (33, 153),
-        "sec_ch_ua": '"Not(A:Brand";v="99", "Google Chrome";v="133", "Chromium";v="133"',
-    },
-    {
-        "major": 136,
-        "impersonate": "chrome136",
-        "build": 7103,
-        "patch_range": (48, 175),
-        "sec_ch_ua": '"Chromium";v="136", "Google Chrome";v="136", "Not.A/Brand";v="99"',
-    },
-]
-
-
-def _random_chrome_version():
-    """随机选择一个 Chrome 版本"""
-    profile = random.choice(_CHROME_PROFILES)
-    major = profile["major"]
-    build = profile["build"]
-    patch = random.randint(*profile["patch_range"])
-    full_ver = f"{major}.0.{build}.{patch}"
-    ua = f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{full_ver} Safari/537.36"
-    return profile["impersonate"], major, full_ver, ua, profile["sec_ch_ua"]
 
 
 class ChatGPTClient:
@@ -75,7 +38,7 @@ class ChatGPTClient:
     BASE = "https://chatgpt.com"
     AUTH = "https://auth.openai.com"
 
-    def __init__(self, proxy=None, verbose=True, browser_mode="protocol"):
+    def __init__(self, proxy=None, verbose=True, browser_mode="protocol", fingerprint=None):
         """
         初始化 ChatGPT 客户端
 
@@ -87,24 +50,8 @@ class ChatGPTClient:
         self.proxy = proxy
         self.verbose = verbose
         self.browser_mode = browser_mode or "protocol"
-        self.device_id = str(uuid.uuid4())
-        self.accept_language = random.choice(
-            [
-                "en-US,en;q=0.9",
-                "en-US,en;q=0.9,zh-CN;q=0.8",
-                "en,en-US;q=0.9",
-                "en-US,en;q=0.8",
-            ]
-        )
-
-        # 随机 Chrome 版本
-        (
-            self.impersonate,
-            self.chrome_major,
-            self.chrome_full,
-            self.ua,
-            self.sec_ch_ua,
-        ) = _random_chrome_version()
+        self.fingerprint = coerce_browser_fingerprint(fingerprint)
+        self._apply_fingerprint_meta(self.fingerprint)
 
         # 创建 session
         self.session = curl_requests.Session(impersonate=self.impersonate)
@@ -112,23 +59,7 @@ class ChatGPTClient:
         if self.proxy:
             self.session.proxies = build_requests_proxy_config(self.proxy)
 
-        # 设置基础 headers
-        self.session.headers.update(
-            {
-                "User-Agent": self.ua,
-                "Accept-Language": self.accept_language,
-                "sec-ch-ua": self.sec_ch_ua,
-                "sec-ch-ua-mobile": "?0",
-                "sec-ch-ua-platform": '"Windows"',
-                "sec-ch-ua-arch": '"x86"',
-                "sec-ch-ua-bitness": '"64"',
-                "sec-ch-ua-full-version": f'"{self.chrome_full}"',
-                "sec-ch-ua-platform-version": f'"{random.randint(10, 15)}.0.0"',
-            }
-        )
-
-        # 设置 oai-did cookie
-        seed_oai_device_cookie(self.session, self.device_id)
+        apply_browser_fingerprint(self.session, self.fingerprint)
         self.last_registration_state = FlowState()
 
     def _get_sentinel_token(self, flow: str, *, page_url: str | None = None):
@@ -140,6 +71,13 @@ class ChatGPTClient:
                 page_url=page_url,
                 headless=self.browser_mode != "headed",
                 device_id=self.device_id,
+                user_agent=self.ua,
+                sec_ch_ua=self.sec_ch_ua,
+                chrome_full_version=self.chrome_full,
+                accept_language=self.accept_language,
+                platform_version=self.chrome_platform_version,
+                viewport_width=self.viewport_width,
+                viewport_height=self.viewport_height,
                 log_fn=lambda msg: self._log(msg),
             )
             if token:
@@ -187,6 +125,7 @@ class ChatGPTClient:
             user_agent=self.ua,
             sec_ch_ua=self.sec_ch_ua,
             chrome_full_version=self.chrome_full,
+            sec_ch_platform_version=self.chrome_platform_version,
             accept=accept,
             accept_language=self.accept_language,
             referer=referer,
@@ -200,43 +139,25 @@ class ChatGPTClient:
             extra_headers=extra_headers,
         )
 
-    def _reset_session(self):
-        """重置浏览器指纹与会话，用于绕过偶发的 Cloudflare/SPA 中间页。"""
-        self.device_id = str(uuid.uuid4())
-        (
-            self.impersonate,
-            self.chrome_major,
-            self.chrome_full,
-            self.ua,
-            self.sec_ch_ua,
-        ) = _random_chrome_version()
-        self.accept_language = random.choice(
-            [
-                "en-US,en;q=0.9",
-                "en-US,en;q=0.9,zh-CN;q=0.8",
-                "en,en-US;q=0.9",
-                "en-US,en;q=0.8",
-            ]
-        )
+    def _apply_fingerprint_meta(self, fingerprint):
+        self.fingerprint = fingerprint
+        self.device_id = fingerprint.device_id
+        self.accept_language = fingerprint.accept_language
+        self.impersonate = fingerprint.impersonate
+        self.chrome_major = fingerprint.chrome_major
+        self.chrome_full = fingerprint.chrome_full_version
+        self.ua = fingerprint.user_agent
+        self.sec_ch_ua = fingerprint.sec_ch_ua
+        self.chrome_platform_version = fingerprint.platform_version
+        self.viewport_width = fingerprint.viewport_width
+        self.viewport_height = fingerprint.viewport_height
 
+    def _reset_session(self):
+        """重建会话容器，但保持任务级指纹一致。"""
         self.session = curl_requests.Session(impersonate=self.impersonate)
         if self.proxy:
             self.session.proxies = build_requests_proxy_config(self.proxy)
-
-        self.session.headers.update(
-            {
-                "User-Agent": self.ua,
-                "Accept-Language": self.accept_language,
-                "sec-ch-ua": self.sec_ch_ua,
-                "sec-ch-ua-mobile": "?0",
-                "sec-ch-ua-platform": '"Windows"',
-                "sec-ch-ua-arch": '"x86"',
-                "sec-ch-ua-bitness": '"64"',
-                "sec-ch-ua-full-version": f'"{self.chrome_full}"',
-                "sec-ch-ua-platform-version": f'"{random.randint(10, 15)}.0.0"',
-            }
-        )
-        seed_oai_device_cookie(self.session, self.device_id)
+        apply_browser_fingerprint(self.session, self.fingerprint)
 
     def _state_from_url(self, url, method="GET"):
         state = extract_flow_state(
@@ -354,9 +275,18 @@ class ChatGPTClient:
         """获取 ChatGPT next-auth 会话 Cookie。"""
         return self._get_cookie_value("__Secure-next-auth.session-token", "chatgpt.com")
 
-    def fetch_chatgpt_session(self):
+    def fetch_chatgpt_session(self, workspace_id: str = "", workspace_reason: str = "setCurrentAccount"):
         """请求 ChatGPT Session 接口并返回原始会话数据。"""
         url = f"{self.BASE}/api/auth/session"
+        workspace_id = str(workspace_id or "").strip()
+        if workspace_id:
+            from urllib.parse import quote
+
+            url = (
+                f"{self.BASE}/api/auth/session?exchange_workspace_token=true"
+                f"&workspace_id={quote(workspace_id, safe='')}"
+                f"&reason={quote(str(workspace_reason or 'setCurrentAccount'), safe='')}"
+            )
         self._browser_pause()
         response = self.session.get(
             url,
@@ -381,7 +311,7 @@ class ChatGPTClient:
             return False, "/api/auth/session 未返回 accessToken"
         return True, data
 
-    def reuse_session_and_get_tokens(self):
+    def reuse_session_and_get_tokens(self, workspace_id: str = "", workspace_reason: str = "setCurrentAccount"):
         """
         复用注册阶段已建立的 ChatGPT 会话，直接读取 Session / AccessToken。
 
@@ -407,7 +337,10 @@ class ChatGPTClient:
             return False, "缺少 __Secure-next-auth.session-token，注册回调可能未落地"
 
         self._log("步骤 3/4: 请求 ChatGPT /api/auth/session ...")
-        ok, session_or_error = self.fetch_chatgpt_session()
+        ok, session_or_error = self.fetch_chatgpt_session(
+            workspace_id=workspace_id,
+            workspace_reason=workspace_reason,
+        )
         if not ok:
             return False, session_or_error
 
@@ -978,7 +911,10 @@ class ChatGPTClient:
             if self._state_is_email_otp(state):
                 self._log("等待邮箱验证码...")
                 otp_code = skymail_client.wait_for_verification_code(
-                    email, timeout=otp_wait_timeout
+                    email,
+                    timeout=otp_wait_timeout,
+                    phase="register_email_otp",
+                    phase_label="注册阶段邮箱验证码",
                 )
                 if not otp_code:
                     self._log(
@@ -994,7 +930,10 @@ class ChatGPTClient:
                     else:
                         self._log(f"重发验证码失败: attempt={otp_send_attempts}")
                     otp_code = skymail_client.wait_for_verification_code(
-                        email, timeout=otp_resend_wait_timeout
+                        email,
+                        timeout=otp_resend_wait_timeout,
+                        phase="register_email_otp",
+                        phase_label="注册阶段邮箱验证码",
                     )
                 if not otp_code:
                     return False, "未收到验证码"

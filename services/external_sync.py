@@ -22,22 +22,7 @@ def sync_account(account) -> list[dict[str, Any]]:
     platform = getattr(account, "platform", "")
     results: list[dict[str, Any]] = []
 
-    def _build_chatgpt_upload_account():
-        class _A:
-            pass
-
-        a = _A()
-        a.email = account.email
-        extra = _get_account_extra(account)
-        a.access_token = extra.get("access_token") or account.token
-        a.refresh_token = extra.get("refresh_token", "")
-        a.id_token = extra.get("id_token", "")
-        a.session_token = extra.get("session_token", "")
-        a.client_id = extra.get("client_id", "app_EMoamEEZ73f0CkXaXp7hrann")
-        return a
-
     if platform == "chatgpt":
-        upload_account = _build_chatgpt_upload_account()
 
         # 贡献模式优先级最高：开启后仅上传到贡献服务器，避免重复上报到其它平台。
         contribution_enabled = _is_config_enabled(config_store.get("contribution_enabled", "0"))
@@ -86,40 +71,33 @@ def sync_account(account) -> list[dict[str, Any]]:
                 ok, msg = upload_at_to_codex_proxy(cp)
                 results.append({"name": "CodexProxy(AT)", "ok": ok, "msg": msg})
 
-        # 关键逻辑：ChatGPT 现在支持同时回填 CPA 和 Sub2API，互不覆盖、分别上报结果。
+        # Sub2API 自动同步统一走 backfill 逻辑，避免注册后重复上传且能写回探测状态。
         sub2api_url = str(config_store.get("sub2api_api_url", "") or "").strip()
         sub2api_key = str(config_store.get("sub2api_api_key", "") or "").strip()
         if sub2api_url and sub2api_key:
-            from platforms.chatgpt.sub2api_upload import upload_to_sub2api
+            from core.db import AccountModel, Session, engine, select
+            from services.sub2api_sync import backfill_chatgpt_account_to_sub2api
 
-            ok, msg = upload_to_sub2api(
-                upload_account,
-                api_url=sub2api_url,
-                api_key=sub2api_key,
+            account_id = getattr(account, "id", None)
+            if isinstance(account, AccountModel) and isinstance(account_id, int) and account_id > 0:
+                with Session(engine) as session:
+                    db_account = session.exec(select(AccountModel).where(AccountModel.id == account_id)).first()
+                    if db_account is None:
+                        outcome = {
+                            "ok": False,
+                            "message": f"本地账号不存在: #{account_id}",
+                        }
+                    else:
+                        outcome = backfill_chatgpt_account_to_sub2api(db_account, session=session, commit=True)
+            else:
+                outcome = backfill_chatgpt_account_to_sub2api(account)
+
+            results.append(
+                {
+                    "name": "Sub2API",
+                    "ok": bool(outcome.get("ok")),
+                    "msg": str(outcome.get("message") or ""),
+                }
             )
-            results.append({"name": "Sub2API", "ok": ok, "msg": msg})
-
-    elif platform == "grok":
-        grok2api_url = str(config_store.get("grok2api_url", "") or "").strip()
-        if grok2api_url:
-            from services.grok2api_runtime import ensure_grok2api_ready
-            from platforms.grok.grok2api_upload import upload_to_grok2api
-
-            ready, ready_msg = ensure_grok2api_ready()
-            if not ready:
-                results.append({"name": "grok2api", "ok": False, "msg": ready_msg})
-                return results
-
-            ok, msg = upload_to_grok2api(account)
-            results.append({"name": "grok2api", "ok": ok, "msg": msg})
-
-    elif platform == "kiro":
-        from platforms.kiro.account_manager_upload import resolve_manager_path, upload_to_kiro_manager
-
-        configured_path = str(config_store.get("kiro_manager_path", "") or "").strip()
-        target_path = resolve_manager_path(configured_path or None)
-        if configured_path or target_path.parent.exists() or target_path.exists():
-            ok, msg = upload_to_kiro_manager(account, path=configured_path or None)
-            results.append({"name": "Kiro Manager", "ok": ok, "msg": msg})
 
     return results

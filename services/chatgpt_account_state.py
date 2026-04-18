@@ -6,6 +6,7 @@ from typing import Any
 
 
 INVALID_ACCOUNT_STATUS = "invalid"
+RECOVERED_ACCOUNT_STATUS = "registered"
 
 
 def _lower_text(value: Any) -> str:
@@ -15,12 +16,13 @@ def _lower_text(value: Any) -> str:
 def is_account_deactivated_message(error_code: Any = "", message: Any = "") -> bool:
     code = _lower_text(error_code)
     text = _lower_text(message)
-    if code in {"account_deactivated", "account_deleted"}:
+    if code in {"account_deactivated", "account_deleted", "deactivated_workspace"}:
         return True
     markers = (
         "deleted or deactivated",
         "account has been deleted or deactivated",
         "you do not have an account because it has been deleted or deactivated",
+        "deactivated_workspace",
     )
     return any(marker in text for marker in markers)
 
@@ -37,7 +39,11 @@ def classify_local_probe_state(probe: dict[str, Any] | None) -> str:
     auth_error_code = auth.get("error_code")
     auth_message = auth.get("message")
 
-    if auth_status == 401 or auth_state in {"access_token_invalidated", "unauthorized"}:
+    if auth_status == 401 or auth_state in {
+        "refresh_token_invalidated",
+        "access_token_invalidated",
+        "unauthorized",
+    }:
         return "auth_401"
     if is_account_deactivated_message(auth_error_code, auth_message):
         return "auth_deactivated"
@@ -49,7 +55,7 @@ def classify_local_probe_state(probe: dict[str, Any] | None) -> str:
     codex_error_code = codex.get("error_code")
     codex_message = codex.get("message")
 
-    if codex_status == 401 or codex_state in {"access_token_invalidated", "unauthorized"}:
+    if codex_status == 401 or codex_state in {"refresh_token_invalidated", "access_token_invalidated", "unauthorized"}:
         return "codex_401"
     if is_account_deactivated_message(codex_error_code, codex_message):
         return "codex_deactivated"
@@ -87,4 +93,6 @@ def apply_chatgpt_status_policy(
     reason = classify_local_probe_state(local_probe) or classify_remote_sync_state(remote_sync)
     if reason:
         setattr(account, "status", INVALID_ACCOUNT_STATUS)
+    elif getattr(account, "status", "") == INVALID_ACCOUNT_STATUS:
+        setattr(account, "status", RECOVERED_ACCOUNT_STATUS)
     return reason

@@ -79,27 +79,138 @@ class BaseChatGPTRegistrationModeAdapter(ABC):
         return engine.run()
 
     def build_account(self, result, fallback_password: str) -> Account:
-        return Account(
-            platform="chatgpt",
-            email=getattr(result, "email", ""),
-            password=getattr(result, "password", "") or fallback_password,
-            user_id=getattr(result, "account_id", ""),
-            token=getattr(result, "access_token", ""),
-            status=AccountStatus.REGISTERED,
-            extra=self._build_account_extra(result),
-        )
+        accounts = self._build_workspace_accounts(result, fallback_password)
+        primary = accounts[0]
+        if len(accounts) > 1:
+            primary.extra = dict(primary.extra or {})
+            primary.extra["_linked_accounts_to_save"] = [
+                {
+                    "platform": account.platform,
+                    "email": account.email,
+                    "password": account.password,
+                    "user_id": account.user_id,
+                    "region": account.region,
+                    "token": account.token,
+                    "status": account.status.value,
+                    "extra": account.extra,
+                }
+                for account in accounts[1:]
+            ]
+            primary.extra["chatgpt_workspace_variants"] = [
+                {
+                    "scope": str((account.extra or {}).get("chatgpt_workspace_scope") or ""),
+                    "label": str((account.extra or {}).get("chatgpt_workspace_label") or ""),
+                    "workspace_id": str((account.extra or {}).get("workspace_id") or ""),
+                    "display_name": str((account.extra or {}).get("chatgpt_workspace_display_name") or ""),
+                }
+                for account in accounts
+            ]
+        return primary
+
+    @staticmethod
+    def _normalize_workspace_scope(value) -> str:
+        normalized = str(value or "").strip().lower().replace("-", "_")
+        if normalized in {"free", "personal", "personal_free"}:
+            return "free"
+        if normalized in {"business", "team", "workspace", "enterprise"}:
+            return "business"
+        return ""
 
     def _build_account_extra(self, result) -> dict:
-        return {
-            "access_token": getattr(result, "access_token", ""),
-            "refresh_token": getattr(result, "refresh_token", ""),
-            "id_token": getattr(result, "id_token", ""),
-            "session_token": getattr(result, "session_token", ""),
-            "workspace_id": getattr(result, "workspace_id", ""),
+        scope = self._normalize_workspace_scope(
+            getattr(result, "source", "") == "business_recovery" and "business" or ""
+        ) or "free"
+        return self._build_account_extra_for_artifact(
+            {
+                "scope": scope,
+                "access_token": getattr(result, "access_token", ""),
+                "refresh_token": getattr(result, "refresh_token", ""),
+                "id_token": getattr(result, "id_token", ""),
+                "session_token": "",
+                "workspace_id": getattr(result, "workspace_id", ""),
+                "account_id": getattr(result, "account_id", ""),
+                "source": getattr(result, "source", "register"),
+                "variant_key": f"{scope}:{getattr(result, 'workspace_id', '') or getattr(result, 'account_id', '') or 'default'}",
+            },
+            result,
+        )
+
+    def _build_account_extra_for_artifact(self, artifact: dict, result) -> dict:
+        scope = self._normalize_workspace_scope(artifact.get("scope") or "") or "free"
+        label = "business" if scope == "business" else "free"
+        email = getattr(result, "email", "")
+        workspace_id = artifact.get("workspace_id") or getattr(result, "workspace_id", "")
+        account_id = artifact.get("account_id") or getattr(result, "account_id", "")
+        variant_key = artifact.get("variant_key") or f"{scope}:{workspace_id or account_id or 'default'}"
+        extra = {
+            "access_token": artifact.get("access_token") or getattr(result, "access_token", ""),
+            "refresh_token": artifact.get("refresh_token") or getattr(result, "refresh_token", ""),
+            "id_token": artifact.get("id_token") or getattr(result, "id_token", ""),
+            "session_token": "",
+            "workspace_id": workspace_id,
             "chatgpt_registration_mode": self.mode,
             "chatgpt_has_refresh_token_solution": self.mode == CHATGPT_REGISTRATION_MODE_REFRESH_TOKEN,
-            "chatgpt_token_source": getattr(result, "source", "register"),
+            "chatgpt_token_source": artifact.get("source") or getattr(result, "source", "register"),
+            "chatgpt_workspace_scope": scope,
+            "chatgpt_workspace_label": label,
+            "chatgpt_workspace_display_name": f"{email} [{label}]" if email else f"[{label}]",
+            "chatgpt_workspace_variant_key": variant_key,
         }
+        metadata = getattr(result, "metadata", None) or {}
+        if isinstance(metadata, dict):
+            if metadata.get("mailbox_state"):
+                extra["chatgpt_mailbox_state"] = metadata.get("mailbox_state")
+            if metadata.get("registration_context"):
+                extra["chatgpt_registration_context"] = metadata.get("registration_context")
+            if metadata.get("pending_business_invite"):
+                extra["chatgpt_pending_business_invite"] = metadata.get("pending_business_invite")
+            if metadata.get("deferred_activation"):
+                deferred_status = str(
+                    metadata.get("deferred_activation_status") or "invite_sent_pending_activation"
+                )
+                extra["chatgpt_deferred_activation"] = True
+                extra["chatgpt_deferred_activation_status"] = deferred_status
+                extra["chatgpt_workspace_scope"] = "pending_activation"
+                extra["chatgpt_workspace_label"] = "pending_activation"
+                extra["chatgpt_workspace_display_name"] = (
+                    f"{email} [pending_activation]" if email else "[pending_activation]"
+                )
+        return extra
+
+    def _build_workspace_accounts(self, result, fallback_password: str) -> list[Account]:
+        artifacts = [
+            item
+            for item in (getattr(result, "workspace_artifacts", None) or [])
+            if isinstance(item, dict)
+        ]
+        if not artifacts:
+            artifacts = [{
+                "scope": "business" if getattr(result, "source", "") == "business_recovery" else "free",
+                "access_token": getattr(result, "access_token", ""),
+                "refresh_token": getattr(result, "refresh_token", ""),
+                "id_token": getattr(result, "id_token", ""),
+                "session_token": "",
+                "workspace_id": getattr(result, "workspace_id", ""),
+                "account_id": getattr(result, "account_id", ""),
+                "source": getattr(result, "source", "register"),
+                "variant_key": f"{getattr(result, 'source', '') == 'business_recovery' and 'business' or 'free'}:{getattr(result, 'workspace_id', '') or getattr(result, 'account_id', '') or 'default'}",
+            }]
+
+        accounts: list[Account] = []
+        for artifact in artifacts:
+            extra = self._build_account_extra_for_artifact(artifact, result)
+            accounts.append(
+                Account(
+                    platform="chatgpt",
+                    email=getattr(result, "email", ""),
+                    password=getattr(result, "password", "") or fallback_password,
+                    user_id=str(artifact.get("account_id") or getattr(result, "account_id", "") or ""),
+                    token=str(artifact.get("access_token") or getattr(result, "access_token", "") or ""),
+                    status=AccountStatus.REGISTERED,
+                    extra=extra,
+                )
+            )
+        return accounts
 
 
 class RefreshTokenChatGPTRegistrationAdapter(BaseChatGPTRegistrationModeAdapter):

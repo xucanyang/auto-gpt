@@ -56,30 +56,77 @@ class AttemptResult:
         return cls(AttemptOutcome.STOPPED, message)
 
 
+@dataclass(slots=True)
+class VerificationChallenge:
+    challenge_id: str
+    attempt_id: int | None
+    phase: str
+    phase_label: str
+    email: str
+    timeout_seconds: int
+    created_at: float = field(default_factory=time.time)
+    expires_at: float = 0.0
+    status: str = "pending"
+    code: str = ""
+    cancel_reason: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.expires_at:
+            self.expires_at = self.created_at + max(int(self.timeout_seconds or 0), 1)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "challenge_id": self.challenge_id,
+            "attempt_id": self.attempt_id,
+            "phase": self.phase,
+            "phase_label": self.phase_label,
+            "email": self.email,
+            "timeout_seconds": self.timeout_seconds,
+            "created_at": self.created_at,
+            "expires_at": self.expires_at,
+            "status": self.status,
+        }
+
+
 class RegisterTaskControl:
-    """协作式任务控制器：支持停止整个任务、跳过一个当前账号。"""
+    """协作式任务控制器：支持停止整个任务、跳过一个当前账号，并处理人工验证码等待。"""
 
     def __init__(self):
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
+        self._condition = threading.Condition(self._lock)
         self._stop_requested = False
         self._pending_skip_requests = 0
         self._next_attempt_id = 1
+        self._next_challenge_id = 1
         self._active_attempt_ids: set[int] = set()
         self._skip_active_attempt_ids: set[int] = set()
+        self._pending_verification: VerificationChallenge | None = None
+
+    def _cancel_pending_verification(self, reason: str) -> None:
+        challenge = self._pending_verification
+        if challenge is None or challenge.status != "pending":
+            return
+        challenge.status = "cancelled"
+        challenge.cancel_reason = str(reason or "cancelled")
+        self._condition.notify_all()
 
     def request_stop(self) -> None:
-        with self._lock:
+        with self._condition:
             self._stop_requested = True
+            self._cancel_pending_verification("stop_requested")
+            self._condition.notify_all()
 
     def request_skip_current(self) -> None:
-        with self._lock:
+        with self._condition:
             if self._active_attempt_ids:
                 self._skip_active_attempt_ids.update(self._active_attempt_ids)
             else:
                 self._pending_skip_requests += 1
+            self._cancel_pending_verification("skip_requested")
+            self._condition.notify_all()
 
     def start_attempt(self) -> int:
-        with self._lock:
+        with self._condition:
             attempt_id = self._next_attempt_id
             self._next_attempt_id += 1
             self._active_attempt_ids.add(attempt_id)
@@ -88,9 +135,17 @@ class RegisterTaskControl:
     def finish_attempt(self, attempt_id: int | None) -> None:
         if attempt_id is None:
             return
-        with self._lock:
+        with self._condition:
             self._active_attempt_ids.discard(attempt_id)
             self._skip_active_attempt_ids.discard(attempt_id)
+            challenge = self._pending_verification
+            if (
+                challenge is not None
+                and challenge.attempt_id == attempt_id
+                and challenge.status == "pending"
+            ):
+                self._cancel_pending_verification("attempt_finished")
+            self._condition.notify_all()
 
     def checkpoint(
         self,
@@ -115,6 +170,109 @@ class RegisterTaskControl:
     def is_stop_requested(self) -> bool:
         with self._lock:
             return self._stop_requested
+
+    def current_verification_snapshot(self) -> dict[str, Any] | None:
+        with self._lock:
+            challenge = self._pending_verification
+            if challenge is None:
+                return None
+            if challenge.status != "pending":
+                return None
+            return challenge.to_dict()
+
+    def wait_for_verification_code(
+        self,
+        *,
+        attempt_id: int | None,
+        phase: str,
+        phase_label: str,
+        email: str,
+        timeout_seconds: int,
+    ) -> str:
+        timeout_value = max(int(timeout_seconds or 0), 1)
+        phase_value = str(phase or "email_otp").strip() or "email_otp"
+        phase_label_value = str(phase_label or "邮箱验证码").strip() or "邮箱验证码"
+        email_value = str(email or "").strip()
+
+        with self._condition:
+            self.checkpoint(attempt_id=attempt_id)
+            challenge_id = f"verify_{int(time.time() * 1000)}_{self._next_challenge_id}"
+            self._next_challenge_id += 1
+            challenge = VerificationChallenge(
+                challenge_id=challenge_id,
+                attempt_id=attempt_id,
+                phase=phase_value,
+                phase_label=phase_label_value,
+                email=email_value,
+                timeout_seconds=timeout_value,
+            )
+            self._pending_verification = challenge
+            self._condition.notify_all()
+
+            while True:
+                self.checkpoint(attempt_id=attempt_id)
+                current = self._pending_verification
+                if current is None:
+                    raise RuntimeError("验证码等待状态已丢失")
+                if current.challenge_id != challenge_id:
+                    raise RuntimeError("验证码等待状态已被新的挑战替换")
+                if current.status == "submitted":
+                    code = str(current.code or "").strip()
+                    self._pending_verification = None
+                    self._condition.notify_all()
+                    if not code:
+                        raise RuntimeError("验证码为空")
+                    return code
+                if current.status == "cancelled":
+                    self._pending_verification = None
+                    self._condition.notify_all()
+                    reason = current.cancel_reason or "cancelled"
+                    if reason == "stop_requested":
+                        raise StopTaskRequested()
+                    if reason == "skip_requested":
+                        if (
+                            attempt_id is not None
+                            and attempt_id in self._skip_active_attempt_ids
+                        ):
+                            self._skip_active_attempt_ids.discard(attempt_id)
+                        raise SkipCurrentAttemptRequested()
+                    raise RuntimeError("验证码等待已取消")
+
+                now = time.time()
+                if now >= current.expires_at:
+                    current.status = "expired"
+                    self._pending_verification = None
+                    self._condition.notify_all()
+                    raise TimeoutError(f"等待 {phase_label_value} 超时 ({timeout_value}s)")
+
+                self._condition.wait(timeout=min(0.5, current.expires_at - now))
+
+    def submit_verification(self, *, challenge_id: str, code: str) -> dict[str, Any]:
+        challenge_id_value = str(challenge_id or "").strip()
+        code_value = str(code or "").strip()
+        if not challenge_id_value:
+            raise ValueError("challenge_id 不能为空")
+        if not code_value:
+            raise ValueError("验证码不能为空")
+
+        with self._condition:
+            challenge = self._pending_verification
+            if challenge is None:
+                raise KeyError("当前没有待提交的验证码挑战")
+            if challenge.challenge_id != challenge_id_value:
+                raise KeyError("验证码挑战不存在或已过期")
+            if challenge.status != "pending":
+                raise ValueError("验证码挑战已结束，无法重复提交")
+            if time.time() >= challenge.expires_at:
+                challenge.status = "expired"
+                self._pending_verification = None
+                self._condition.notify_all()
+                raise ValueError("验证码挑战已超时")
+
+            challenge.code = code_value
+            challenge.status = "submitted"
+            self._condition.notify_all()
+            return challenge.to_dict()
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
@@ -162,6 +320,9 @@ class RegisterTaskRecord:
             "errors": list(self.errors),
             "control": self.control.snapshot(),
         }
+        pending_verification = self.control.current_verification_snapshot()
+        if pending_verification:
+            data["pending_verification"] = pending_verification
         if self.cashier_urls:
             data["cashier_urls"] = list(self.cashier_urls)
         if self.error:
@@ -323,4 +484,5 @@ __all__ = [
     "SkipCurrentAttemptRequested",
     "StopTaskRequested",
     "TaskInterruption",
+    "VerificationChallenge",
 ]

@@ -19,10 +19,12 @@ import { apiFetch } from '@/lib/utils'
 const SELECT_FIELDS: Record<string, { label: string; value: string }[]> = {
   mail_provider: [
     { label: 'LuckMail（订单接码 / 已购邮箱）', value: 'luckmail' },
+    { label: '手动邮箱 + 手输验证码（仅 ChatGPT）', value: 'manual_email_otp' },
     { label: 'Outlook（本地导入）', value: 'outlook' },
     { label: 'AppleMail（小苹果 / 本地邮箱池）', value: 'applemail' },
     { label: 'Laoudo（固定邮箱）', value: 'laoudo' },
     { label: 'TempMail.lol（自动生成）', value: 'tempmail_lol' },
+    { label: 'TempMail Ready API（本地接口）', value: 'tempmail_local' },
     { label: 'SkyMail（CloudMail 接口）', value: 'skymail' },
     { label: 'CloudMail（genToken 口令模式）', value: 'cloudmail' },
     { label: 'DuckMail（自动生成）', value: 'duckmail' },
@@ -37,6 +39,10 @@ const SELECT_FIELDS: Record<string, { label: string; value: string }[]> = {
     { label: 'balanced', value: 'balanced' },
     { label: 'prefer_owned', value: 'prefer_owned' },
     { label: 'prefer_public', value: 'prefer_public' },
+  ],
+  tempmail_mode: [
+    { label: '固定域名', value: 'fixed_domain' },
+    { label: '随机子域 / Ready', value: 'task_subdomain' },
   ],
   default_executor: [
     { label: 'API 协议（无浏览器）', value: 'protocol' },
@@ -177,6 +183,22 @@ const TAB_ITEMS = [
         fields: [],
       },
       {
+        title: 'TempMail 本地接口',
+        desc: '支持固定域名建箱，也支持任务级随机子域 ready 建箱',
+        fields: [
+          { key: 'tempmail_api_url', label: 'API URL', placeholder: 'http://127.0.0.1:18081' },
+          { key: 'tempmail_api_key', label: 'API Key', secret: true },
+          { key: 'tempmail_api_key_header', label: '鉴权 Header', placeholder: 'Authorization' },
+          { key: 'tempmail_mode', label: '建箱模式', type: 'select' },
+          { key: 'tempmail_primary_domain', label: '主域名（固定域名模式时必填）', placeholder: 'mail.666800.xyz' },
+          { key: 'tempmail_wait_timeout_seconds', label: '建箱等待秒数', placeholder: '180' },
+          { key: 'tempmail_ttl_minutes', label: '邮箱 TTL 分钟', placeholder: '30' },
+          { key: 'tempmail_reuse_window_minutes', label: '子域复用窗口分钟', placeholder: '20' },
+          { key: 'tempmail_permanent', label: '永久邮箱', type: 'boolean' },
+          { key: 'tempmail_platform', label: '平台标识', placeholder: 'chatgpt' },
+        ],
+      },
+      {
         title: 'DuckMail',
         desc: '自动生成邮箱，随机创建账号',
         fields: [
@@ -260,11 +282,13 @@ const TAB_ITEMS = [
         ],
       },
       {
-        title: 'Team Manager',
-        desc: '上传到自建 Team Manager 系统',
+        title: 'Business / 工作空间',
+        desc: '控制 ChatGPT 注册后是否走 team invite，以及默认抓取哪些工作空间',
         fields: [
-          { key: 'team_manager_url', label: 'API URL', placeholder: 'https://your-tm.example.com' },
-          { key: 'team_manager_key', label: 'API Key', secret: true },
+          { key: 'chatgpt_enable_team_invite', label: '启用 team invite / business 恢复', type: 'boolean' },
+          { key: 'chatgpt_team_invite_deferred_activation', label: '默认延迟邀请', type: 'boolean' },
+          { key: 'chatgpt_capture_free_workspace', label: '默认抓取 free 工作空间', type: 'boolean' },
+          { key: 'chatgpt_capture_business_workspace', label: '默认抓取 business 工作空间', type: 'boolean' },
         ],
       },
       {
@@ -306,46 +330,6 @@ const TAB_ITEMS = [
     ],
   },
   {
-    key: 'grok',
-    label: 'Grok',
-    icon: <ApiOutlined />,
-    sections: [
-      {
-        title: 'grok2api',
-        desc: '注册成功后自动导入到 grok2api 管理后台',
-        fields: [
-          { key: 'grok2api_url', label: 'API URL', placeholder: 'http://127.0.0.1:7860' },
-          { key: 'grok2api_app_key', label: 'App Key', secret: true },
-          { key: 'grok2api_pool', label: 'Token Pool', placeholder: 'ssoBasic 或 ssoSuper' },
-          { key: 'grok2api_quota', label: 'Quota（可选）', placeholder: '留空按池默认值' },
-        ],
-      },
-    ],
-  },
-  {
-    key: 'kiro',
-    label: 'Kiro',
-    icon: <ApiOutlined />,
-    sections: [
-      {
-        title: 'Kiro Account Manager',
-        desc: '注册成功后自动写入 kiro-account-manager 的 accounts.json',
-        fields: [
-          {
-            key: 'kiro_manager_path',
-            label: 'accounts.json 路径（可选）',
-            placeholder: '留空则自动使用系统默认路径',
-          },
-          {
-            key: 'kiro_manager_exe',
-            label: 'Kiro Manager 可执行文件（可选）',
-            placeholder: '未安装 Rust 时可填写已安装的 KiroAccountManager.exe',
-          },
-        ],
-      },
-    ],
-  },
-  {
     key: 'contribution',
     label: '贡献',
     icon: <PlusOutlined />,
@@ -377,6 +361,41 @@ interface SectionConfig {
   title: string
   desc?: string
   fields: FieldConfig[]
+}
+
+function getMailboxSectionProvider(title: string): string | null {
+  switch (title) {
+    case 'Laoudo':
+      return 'laoudo'
+    case 'Freemail':
+      return 'freemail'
+    case 'MoeMail':
+      return 'moemail'
+    case 'SkyMail':
+      return 'skymail'
+    case 'CloudMail':
+      return 'cloudmail'
+    case 'YYDS Mail / MaliAPI':
+      return 'maliapi'
+    case 'AppleMail / 小苹果':
+      return 'applemail'
+    case 'GPTMail':
+      return 'gptmail'
+    case 'OpenTrashMail':
+      return 'opentrashmail'
+    case 'TempMail.lol':
+      return 'tempmail_lol'
+    case 'TempMail 本地接口':
+      return 'tempmail_local'
+    case 'DuckMail':
+      return 'duckmail'
+    case 'CF Worker 自建邮箱':
+      return 'cfworker'
+    case 'LuckMail':
+      return 'luckmail'
+    default:
+      return null
+  }
 }
 
 interface TabConfig {
@@ -928,23 +947,6 @@ function IntegrationsPanel() {
     }
   }
 
-  const backfill = async (platforms: string[], label: string, busyKey: string) => {
-    setBusy(busyKey)
-    try {
-      const d = await apiFetch('/integrations/backfill', {
-        method: 'POST',
-        body: JSON.stringify({ platforms }),
-      })
-      message.success(`${label} 回填完成：成功 ${d.success} / ${d.total}`)
-      showResultModal(`${label} 回填结果`, d, true)
-    } catch (e: any) {
-      message.error(e?.message || `${label} 回填失败`)
-      showResultModal(`${label} 回填结果`, e?.message || e || `${label} 回填失败`, false)
-    } finally {
-      setBusy('')
-    }
-  }
-
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
       <Modal
@@ -1036,22 +1038,6 @@ function IntegrationsPanel() {
               >
                 停止
               </Button>
-              {item.name === 'grok2api' ? (
-                <Button
-                  loading={busy === 'backfill-grok'}
-                  onClick={() => backfill(['grok'], 'Grok', 'backfill-grok')}
-                >
-                  回填现有 Grok 账号
-                </Button>
-              ) : null}
-              {item.name === 'kiro-manager' ? (
-                <Button
-                  loading={busy === 'backfill-kiro'}
-                  onClick={() => backfill(['kiro'], 'Kiro', 'backfill-kiro')}
-                >
-                  回填现有 Kiro 账号
-                </Button>
-              ) : null}
             </Space>
           </Space>
         </Card>
@@ -1664,6 +1650,7 @@ export default function Settings() {
   const [saving, setSaving] = useState(false)
   const [saved, setSaved] = useState(false)
   const [activeTab, setActiveTab] = useState('register')
+  const selectedMailProvider = Form.useWatch('mail_provider', form) || 'luckmail'
 
   useEffect(() => {
     apiFetch('/config').then((data) => {
@@ -1694,10 +1681,36 @@ export default function Settings() {
       if (!data.cloudmail_timeout) {
         data.cloudmail_timeout = 30
       }
+      if (!data.tempmail_api_url) {
+        data.tempmail_api_url = 'http://127.0.0.1:18081'
+      }
+      if (!data.tempmail_api_key_header) {
+        data.tempmail_api_key_header = 'Authorization'
+      }
+      if (!data.tempmail_mode) {
+        data.tempmail_mode = 'fixed_domain'
+      }
+      if (!data.tempmail_wait_timeout_seconds) {
+        data.tempmail_wait_timeout_seconds = 180
+      }
+      if (!data.tempmail_ttl_minutes) {
+        data.tempmail_ttl_minutes = 30
+      }
+      if (!data.tempmail_reuse_window_minutes) {
+        data.tempmail_reuse_window_minutes = 20
+      }
+      if (!data.tempmail_platform) {
+        data.tempmail_platform = 'chatgpt'
+      }
+      data.tempmail_permanent = parseBooleanConfigValue(data.tempmail_permanent)
       data.cfworker_domains = parseStoredDomainList(data.cfworker_domains)
       data.cfworker_enabled_domains = parseStoredDomainList(data.cfworker_enabled_domains)
       data.cfworker_random_subdomain = parseBooleanConfigValue(data.cfworker_random_subdomain)
       data.contribution_enabled = parseBooleanConfigValue(data.contribution_enabled)
+      data.chatgpt_enable_team_invite = parseBooleanConfigValue(data.chatgpt_enable_team_invite)
+      data.chatgpt_team_invite_deferred_activation = parseBooleanConfigValue(data.chatgpt_team_invite_deferred_activation)
+      data.chatgpt_capture_free_workspace = data.chatgpt_capture_free_workspace === '' ? true : parseBooleanConfigValue(data.chatgpt_capture_free_workspace)
+      data.chatgpt_capture_business_workspace = data.chatgpt_capture_business_workspace === '' ? true : parseBooleanConfigValue(data.chatgpt_capture_business_workspace)
       form.setFieldsValue(data)
     })
   }, [form])
@@ -1721,7 +1734,13 @@ export default function Settings() {
         values.cfworker_domain = ''
       }
       values.cfworker_random_subdomain = parseBooleanConfigValue(values.cfworker_random_subdomain)
+      values.tempmail_permanent = parseBooleanConfigValue(values.tempmail_permanent)
+      values.tempmail_mode = values.tempmail_mode || 'fixed_domain'
       values.contribution_enabled = parseBooleanConfigValue(values.contribution_enabled)
+      values.chatgpt_enable_team_invite = parseBooleanConfigValue(values.chatgpt_enable_team_invite)
+      values.chatgpt_team_invite_deferred_activation = parseBooleanConfigValue(values.chatgpt_team_invite_deferred_activation)
+      values.chatgpt_capture_free_workspace = parseBooleanConfigValue(values.chatgpt_capture_free_workspace)
+      values.chatgpt_capture_business_workspace = parseBooleanConfigValue(values.chatgpt_capture_business_workspace)
 
       await apiFetch('/config', { method: 'PUT', body: JSON.stringify({ data: values }) })
       form.setFieldsValue({
@@ -1729,7 +1748,12 @@ export default function Settings() {
         cfworker_enabled_domains: enabledDomains,
         cfworker_domain: domains.length > 0 ? '' : values.cfworker_domain,
         cfworker_random_subdomain: values.cfworker_random_subdomain,
+        tempmail_permanent: values.tempmail_permanent,
         contribution_enabled: values.contribution_enabled,
+        chatgpt_enable_team_invite: values.chatgpt_enable_team_invite,
+        chatgpt_team_invite_deferred_activation: values.chatgpt_team_invite_deferred_activation,
+        chatgpt_capture_free_workspace: values.chatgpt_capture_free_workspace,
+        chatgpt_capture_business_workspace: values.chatgpt_capture_business_workspace,
       })
       message.success('保存成功')
       setSaved(true)
@@ -1740,6 +1764,15 @@ export default function Settings() {
   }
 
   const currentTab = TAB_ITEMS.find((t) => t.key === activeTab) as TabConfig
+  const visibleSections =
+    activeTab === 'mailbox'
+      ? currentTab.sections.filter((section) => {
+          if (section.title === '默认邮箱服务') return true
+          const provider = getMailboxSectionProvider(section.title)
+          if (!provider) return false
+          return provider === selectedMailProvider
+        })
+      : currentTab.sections
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
@@ -1778,12 +1811,21 @@ export default function Settings() {
               ) : (
                 <>
                   {activeTab === 'captcha' ? <SolverStatus /> : null}
-                  {currentTab.sections.map((section) => (
+                  {activeTab === 'mailbox' && selectedMailProvider === 'manual_email_otp' ? (
+                    <Alert
+                      type="info"
+                      showIcon
+                      style={{ marginBottom: 16 }}
+                      message="手动邮箱 + 手输验证码"
+                      description="这是任务级模式：真正的邮箱地址不在全局设置里填写，而是在“注册任务”页面、选择 ChatGPT 后，在邮箱服务下拉里选它，再填写邮箱地址。任务跑到邮箱 OTP 时，会在任务状态区弹出验证码输入框。"
+                    />
+                  ) : null}
+                  {visibleSections.map((section) => (
                     <ConfigSection key={section.title} section={section} />
                   ))}
-                  {activeTab === 'mailbox' ? <AppleMailPoolImportSection form={form} /> : null}
-                  {activeTab === 'mailbox' ? <CFWorkerDomainPoolSection form={form} /> : null}
-                  {activeTab === 'mailbox' ? <OutlookImportSection /> : null}
+                  {activeTab === 'mailbox' && selectedMailProvider === 'applemail' ? <AppleMailPoolImportSection form={form} /> : null}
+                  {activeTab === 'mailbox' && selectedMailProvider === 'cfworker' ? <CFWorkerDomainPoolSection form={form} /> : null}
+                  {activeTab === 'mailbox' && selectedMailProvider === 'outlook' ? <OutlookImportSection /> : null}
                   <Button type="primary" icon={<SaveOutlined />} onClick={save} loading={saving} block>
                     {saved ? '已保存 ✓' : '保存配置'}
                   </Button>

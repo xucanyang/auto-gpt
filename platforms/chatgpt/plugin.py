@@ -73,6 +73,10 @@ class ChatGPTPlatform(BasePlatform):
         if self.mailbox:
             _mailbox = self.mailbox
             _fixed_email = email
+            _mail_provider = (
+                str(extra_config.get("mail_provider") or "custom_provider").strip()
+                or "custom_provider"
+            )
 
             def _resolve_email(candidate_email: str = "") -> str:
                 resolved_email = str(_fixed_email or candidate_email or "").strip()
@@ -81,12 +85,14 @@ class ChatGPTPlatform(BasePlatform):
                 return resolved_email
 
             class GenericEmailService:
-                service_type = type("ST", (), {"value": "custom_provider"})()
+                service_type = type("ST", (), {"value": _mail_provider})()
 
                 def __init__(self):
                     self._acct = None
                     self._email = _fixed_email
                     self._before_ids = set()
+                    self._mailbox = _mailbox
+                    self._last_verification_result = {}
 
                 def create_email(self, config=None):
                     if self._email and self._acct and _fixed_email:
@@ -112,17 +118,37 @@ class ChatGPTPlatform(BasePlatform):
                     pattern=None,
                     otp_sent_at=None,
                     exclude_codes=None,
+                    phase=None,
+                    phase_label=None,
                 ):
                     if not self._acct:
                         raise RuntimeError("邮箱账户尚未创建，无法获取验证码")
-                    return _mailbox.wait_for_code(
+                    code = _mailbox.wait_for_code(
                         self._acct,
                         keyword="",
                         timeout=_resolve_mailbox_timeout(timeout),
                         before_ids=self._before_ids,
                         otp_sent_at=otp_sent_at,
                         exclude_codes=exclude_codes,
+                        phase=phase,
+                        phase_label=phase_label,
                     )
+                    self._last_verification_result = dict(getattr(_mailbox, "_last_verification_result", None) or {})
+                    return code
+
+                def export_state(self):
+                    return {
+                        "provider": _mail_provider,
+                        "email": str(self._email or getattr(self._acct, "email", "") or "").strip(),
+                        "account": {
+                            "email": str(getattr(self._acct, "email", "") or "").strip(),
+                            "account_id": str(getattr(self._acct, "account_id", "") or "").strip(),
+                            "extra": getattr(self._acct, "extra", None) or {},
+                        },
+                        "before_ids": sorted(self._before_ids),
+                        "config": dict(extra_config or {}),
+                        "proxy": proxy,
+                    }
 
                 def update_status(self, success, error=None):
                     pass
@@ -144,6 +170,8 @@ class ChatGPTPlatform(BasePlatform):
                 def __init__(self):
                     self._acct = None
                     self._before_ids = set()
+                    self._mailbox = _tmail
+                    self._last_verification_result = {}
 
                 def create_email(self, config=None):
                     acct = _tmail.get_email()
@@ -162,15 +190,35 @@ class ChatGPTPlatform(BasePlatform):
                     pattern=None,
                     otp_sent_at=None,
                     exclude_codes=None,
+                    phase=None,
+                    phase_label=None,
                 ):
-                    return _tmail.wait_for_code(
+                    code = _tmail.wait_for_code(
                         self._acct,
                         keyword="",
                         timeout=_resolve_mailbox_timeout(timeout),
                         before_ids=self._before_ids,
                         otp_sent_at=otp_sent_at,
                         exclude_codes=exclude_codes,
+                        phase=phase,
+                        phase_label=phase_label,
                     )
+                    self._last_verification_result = dict(getattr(_tmail, "_last_verification_result", None) or {})
+                    return code
+
+                def export_state(self):
+                    return {
+                        "provider": "tempmail_lol",
+                        "email": str(getattr(self._acct, "email", "") or "").strip(),
+                        "account": {
+                            "email": str(getattr(self._acct, "email", "") or "").strip(),
+                            "account_id": str(getattr(self._acct, "account_id", "") or "").strip(),
+                            "extra": getattr(self._acct, "extra", None) or {},
+                        },
+                        "before_ids": sorted(self._before_ids),
+                        "config": dict(extra_config or {}),
+                        "proxy": proxy,
+                    }
 
                 def update_status(self, success, error=None):
                     pass
@@ -193,7 +241,15 @@ class ChatGPTPlatform(BasePlatform):
             extra_config=extra_config,
         )
         result = adapter.run(context)
-        if not result or not result.success:
+        metadata = (getattr(result, "metadata", None) or {}) if result else {}
+        is_deferred_pending = bool(
+            result
+            and isinstance(metadata, dict)
+            and metadata.get("deferred_activation")
+            and str(metadata.get("deferred_activation_status") or "") == "invite_sent_pending_activation"
+            and metadata.get("registration_stage_complete")
+        )
+        if not result or (not result.success and not is_deferred_pending):
             raise RuntimeError(result.error_message if result else "注册失败")
 
         return adapter.build_account(result, password)
@@ -202,6 +258,7 @@ class ChatGPTPlatform(BasePlatform):
         return [
             {"id": "probe_local_status", "label": "探测本地状态", "params": []},
             {"id": "sync_cliproxyapi_status", "label": "同步 CLIProxyAPI 状态", "params": []},
+            {"id": "sync_sub2api_status", "label": "同步 Sub2API 状态", "params": []},
             {"id": "refresh_token", "label": "刷新 Token", "params": []},
             {
                 "id": "payment_link",
@@ -301,6 +358,30 @@ class ChatGPTPlatform(BasePlatform):
                 "account_extra_patch": {
                     "sync_statuses": {
                         "cliproxyapi": sync_result,
+                    },
+                },
+            }
+
+        if action_id == "sync_sub2api_status":
+            from services.sub2api_sync import probe_chatgpt_sub2api_status
+
+            sync_result = probe_chatgpt_sub2api_status(a)
+            remote_state = str(sync_result.get("remote_state") or "").strip().lower()
+            ok = remote_state in {"exists", "not_found"}
+            summary = (
+                f"远端状态={sync_result.get('status') or remote_state or 'unknown'}, "
+                f"探测={remote_state or 'not_checked'}"
+            )
+            return {
+                "ok": ok,
+                "data": {
+                    "message": f"Sub2API 状态同步完成：{summary}",
+                    "sync": sync_result,
+                },
+                "error": sync_result.get("message") if not ok else "",
+                "account_extra_patch": {
+                    "sync_statuses": {
+                        "sub2api": sync_result,
                     },
                 },
             }

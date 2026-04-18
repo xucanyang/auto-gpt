@@ -239,7 +239,7 @@ def _remote_auth_missing(sync_result: dict[str, Any]) -> bool:
 
 def _local_probe_uploadable(probe: dict[str, Any]) -> bool:
     auth = probe.get("auth") if isinstance(probe.get("auth"), dict) else {}
-    return str(auth.get("state") or "").strip() == "access_token_valid"
+    return str(auth.get("state") or "").strip() in {"refresh_token_valid", "access_token_valid"}
 
 
 def _remote_state_label(sync_result: dict[str, Any]) -> str:

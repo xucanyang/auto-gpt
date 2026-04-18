@@ -1,5 +1,6 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import {
+  Alert,
   Card,
   Form,
   Input,
@@ -11,6 +12,7 @@ import {
   Space,
   Typography,
   Descriptions,
+  message,
 } from 'antd'
 import {
   PlayCircleOutlined,
@@ -20,24 +22,42 @@ import {
 } from '@ant-design/icons'
 import { ChatGPTRegistrationModeSwitch } from '@/components/ChatGPTRegistrationModeSwitch'
 import { TaskLogPanel } from '@/components/TaskLogPanel'
+import { TaskVerificationPanel } from '@/components/TaskVerificationPanel'
 import { usePersistentChatGPTRegistrationMode } from '@/hooks/usePersistentChatGPTRegistrationMode'
 import { parseBooleanConfigValue } from '@/lib/configValueParsers'
 import { buildChatGPTRegistrationRequestAdapter } from '@/lib/chatgptRegistrationRequestAdapter'
+import { CHATGPT_REGISTRATION_MODE_REFRESH_TOKEN } from '@/lib/chatgptRegistrationMode'
 import { getExecutorOptions, normalizeExecutorForPlatform } from '@/lib/platformExecutorOptions'
 import { apiFetch } from '@/lib/utils'
 
 const { Text } = Typography
 
+function normalizeTaskSnapshot(task: any, fallbackTaskId?: string) {
+  if (!task) return null
+  const normalizedId = task.id || task.task_id || fallbackTaskId || ''
+  return {
+    ...task,
+    id: normalizedId,
+    task_id: normalizedId,
+    status: task.status || 'pending',
+    progress: task.progress || '0/0',
+    skipped: task.skipped ?? 0,
+    success: task.success ?? 0,
+    errors: Array.isArray(task.errors) ? task.errors : [],
+  }
+}
+
 export default function RegisterTaskPage() {
   const [form] = Form.useForm()
   const [task, setTask] = useState<any>(null)
   const [polling, setPolling] = useState(false)
+  const pollTimerRef = useRef<number | null>(null)
   const { mode: chatgptRegistrationMode, setMode: setChatgptRegistrationMode } =
     usePersistentChatGPTRegistrationMode()
 
   useEffect(() => {
     apiFetch('/config').then((cfg) => {
-      const currentPlatform = form.getFieldValue('platform') || 'trae'
+      const currentPlatform = form.getFieldValue('platform') || 'chatgpt'
       form.setFieldsValue({
         executor_type: normalizeExecutorForPlatform(currentPlatform, cfg.default_executor),
         captcha_solver: cfg.default_captcha_solver || 'yescaptcha',
@@ -49,6 +69,16 @@ export default function RegisterTaskPage() {
         yescaptcha_key: cfg.yescaptcha_key || '',
         moemail_api_url: cfg.moemail_api_url || '',
         moemail_api_key: cfg.moemail_api_key || '',
+        tempmail_api_url: cfg.tempmail_api_url || 'http://127.0.0.1:18081',
+        tempmail_api_key: cfg.tempmail_api_key || '',
+        tempmail_api_key_header: cfg.tempmail_api_key_header || 'Authorization',
+        tempmail_mode: cfg.tempmail_mode || 'fixed_domain',
+        tempmail_primary_domain: cfg.tempmail_primary_domain || '',
+        tempmail_wait_timeout_seconds: cfg.tempmail_wait_timeout_seconds || 180,
+        tempmail_ttl_minutes: cfg.tempmail_ttl_minutes || 30,
+        tempmail_reuse_window_minutes: cfg.tempmail_reuse_window_minutes || 20,
+        tempmail_permanent: parseBooleanConfigValue(cfg.tempmail_permanent),
+        tempmail_platform: cfg.tempmail_platform || 'chatgpt',
         skymail_api_base: cfg.skymail_api_base || 'https://api.skymail.ink',
         skymail_token: cfg.skymail_token || '',
         skymail_domain: cfg.skymail_domain || '',
@@ -96,9 +126,21 @@ export default function RegisterTaskPage() {
         luckmail_api_key: cfg.luckmail_api_key || '',
         luckmail_email_type: cfg.luckmail_email_type || '',
         luckmail_domain: cfg.luckmail_domain || '',
+        chatgpt_enable_team_invite: parseBooleanConfigValue(cfg.chatgpt_enable_team_invite),
+        chatgpt_team_invite_deferred_activation: parseBooleanConfigValue(cfg.chatgpt_team_invite_deferred_activation),
+        chatgpt_capture_business_workspace: cfg.chatgpt_capture_business_workspace === '' ? true : parseBooleanConfigValue(cfg.chatgpt_capture_business_workspace),
+        chatgpt_capture_free_workspace: cfg.chatgpt_capture_free_workspace === '' ? true : parseBooleanConfigValue(cfg.chatgpt_capture_free_workspace),
       })
     })
   }, [form])
+
+  const stopPolling = () => {
+    if (pollTimerRef.current != null) {
+      window.clearInterval(pollTimerRef.current)
+      pollTimerRef.current = null
+    }
+    setPolling(false)
+  }
 
   const submit = async () => {
     const values = await form.validateFields()
@@ -123,6 +165,16 @@ export default function RegisterTaskPage() {
       maliapi_auto_domain_strategy: values.maliapi_auto_domain_strategy,
       moemail_api_url: values.moemail_api_url,
       moemail_api_key: values.moemail_api_key,
+      tempmail_api_url: values.tempmail_api_url,
+      tempmail_api_key: values.tempmail_api_key,
+      tempmail_api_key_header: values.tempmail_api_key_header,
+      tempmail_mode: values.tempmail_mode,
+      tempmail_primary_domain: values.tempmail_primary_domain,
+      tempmail_wait_timeout_seconds: values.tempmail_wait_timeout_seconds,
+      tempmail_ttl_minutes: values.tempmail_ttl_minutes,
+      tempmail_reuse_window_minutes: values.tempmail_reuse_window_minutes,
+      tempmail_permanent: values.tempmail_permanent,
+      tempmail_platform: values.tempmail_platform,
       skymail_api_base: values.skymail_api_base,
       skymail_token: values.skymail_token,
       skymail_domain: values.skymail_domain,
@@ -159,6 +211,19 @@ export default function RegisterTaskPage() {
       luckmail_domain: values.luckmail_domain,
       yescaptcha_key: values.yescaptcha_key,
       solver_url: values.solver_url,
+      chatgpt_enable_team_invite: platform === 'chatgpt' ? Boolean(values.chatgpt_enable_team_invite) : undefined,
+      chatgpt_capture_free_workspace:
+        platform === 'chatgpt'
+          ? Boolean(values.chatgpt_capture_free_workspace)
+          : undefined,
+      chatgpt_capture_business_workspace:
+        platform === 'chatgpt' && values.chatgpt_enable_team_invite
+          ? values.chatgpt_capture_business_workspace
+          : undefined,
+      chatgpt_team_invite_deferred_activation:
+        platform === 'chatgpt' && values.chatgpt_enable_team_invite
+          ? Boolean(values.chatgpt_team_invite_deferred_activation)
+          : undefined,
     }
     const chatgptRegistrationRequestAdapter =
       buildChatGPTRegistrationRequestAdapter(
@@ -169,36 +234,70 @@ export default function RegisterTaskPage() {
       ? chatgptRegistrationRequestAdapter.extendExtra(registerExtra)
       : registerExtra
 
-    const res = await apiFetch('/tasks/register', {
-      method: 'POST',
-      body: JSON.stringify({
-        platform: values.platform,
-        email: values.email || null,
-        password: values.password || null,
-        count: values.count,
-        concurrency: values.concurrency,
-        register_delay_seconds: values.register_delay_seconds || 0,
-        proxy: values.proxy || null,
-        executor_type: values.executor_type,
-        captcha_solver: values.captcha_solver,
-        extra: adaptedRegisterExtra,
-      }),
-    })
-    setTask(res)
-    setPolling(true)
-    pollTask(res.task_id)
+    try {
+      const res = await apiFetch('/tasks/register', {
+        method: 'POST',
+        body: JSON.stringify({
+          platform: values.platform,
+          email: values.email || null,
+          password: values.password || null,
+          count: values.count,
+          concurrency: values.concurrency,
+          register_delay_seconds: values.register_delay_seconds || 0,
+          proxy: values.proxy || null,
+          executor_type: values.executor_type,
+          captcha_solver: values.captcha_solver,
+          extra: adaptedRegisterExtra,
+        }),
+      }) as { task_id?: string }
+
+      const createdTaskId = String(res?.task_id || '').trim()
+      if (!createdTaskId) {
+        throw new Error('创建任务成功，但未返回 task_id')
+      }
+
+      setTask(normalizeTaskSnapshot({ id: createdTaskId, status: 'running', progress: `0/${values.count || 1}` }, createdTaskId))
+      setPolling(true)
+
+      try {
+        const snapshot = await apiFetch(`/tasks/${createdTaskId}`)
+        setTask(normalizeTaskSnapshot(snapshot, createdTaskId))
+      } catch {
+        // 任务已创建成功；如果首轮快照暂时失败，后续轮询会继续拉取
+      }
+
+      pollTask(createdTaskId)
+    } catch (error_: unknown) {
+      stopPolling()
+      const detail = error_ instanceof Error ? error_.message : '创建注册任务失败'
+      message.error(detail)
+    }
   }
 
   const pollTask = async (id: string) => {
-    const interval = setInterval(async () => {
-      const t = await apiFetch(`/tasks/${id}`)
-      setTask(t)
-      if (t.status === 'done' || t.status === 'failed' || t.status === 'stopped') {
-        clearInterval(interval)
-        setPolling(false)
-        if (t.cashier_urls && t.cashier_urls.length > 0) {
-          t.cashier_urls.forEach((url: string) => window.open(url, '_blank'))
+    stopPolling()
+    setPolling(true)
+    pollTimerRef.current = window.setInterval(async () => {
+      try {
+        const t = await apiFetch(`/tasks/${id}`)
+        const normalizedTask = normalizeTaskSnapshot(t, id)
+        setTask(normalizedTask)
+        if (normalizedTask.status === 'done' || normalizedTask.status === 'failed' || normalizedTask.status === 'stopped') {
+          stopPolling()
+          if (normalizedTask.cashier_urls && normalizedTask.cashier_urls.length > 0) {
+            normalizedTask.cashier_urls.forEach((url: string) => window.open(url, '_blank'))
+          }
         }
+      } catch (error_: unknown) {
+        stopPolling()
+        const detail = error_ instanceof Error ? error_.message : '获取任务状态失败'
+        setTask((previous: any) => normalizeTaskSnapshot({
+          ...(previous || {}),
+          id,
+          status: previous?.status || 'failed',
+          error: detail,
+        }, id))
+        message.error(detail)
       }
     }, 2000)
   }
@@ -206,7 +305,9 @@ export default function RegisterTaskPage() {
   const mailProvider = Form.useWatch('mail_provider', form)
   const captchaSolver = Form.useWatch('captcha_solver', form)
   const platform = Form.useWatch('platform', form)
+  const manualEmail = Form.useWatch('email', form)
   const executorOptions = getExecutorOptions(platform)
+  const isManualEmailOtp = platform === 'chatgpt' && mailProvider === 'manual_email_otp'
 
   useEffect(() => {
     const currentExecutor = form.getFieldValue('executor_type')
@@ -216,6 +317,30 @@ export default function RegisterTaskPage() {
     }
   }, [form, platform])
 
+  useEffect(() => {
+    if (platform !== 'chatgpt' && mailProvider === 'manual_email_otp') {
+      form.setFieldValue('mail_provider', 'luckmail')
+      return
+    }
+    if (platform === 'chatgpt' && mailProvider === 'manual_email_otp') {
+      form.setFieldsValue({ count: 1, concurrency: 1 })
+      const savedEmail = window.localStorage.getItem('any-auto-register.manual_email_otp.email') || ''
+      const currentEmail = String(form.getFieldValue('email') || '').trim()
+      if (!currentEmail && savedEmail) {
+        form.setFieldValue('email', savedEmail)
+      }
+    }
+  }, [form, platform, mailProvider])
+
+  useEffect(() => {
+    if (!isManualEmailOtp) return
+    const normalizedEmail = String(manualEmail || '').trim()
+    if (!normalizedEmail) return
+    window.localStorage.setItem('any-auto-register.manual_email_otp.email', normalizedEmail)
+  }, [isManualEmailOtp, manualEmail])
+
+  useEffect(() => () => stopPolling(), [])
+
   return (
     <div style={{ maxWidth: 800 }}>
       <div style={{ marginBottom: 24 }}>
@@ -224,7 +349,7 @@ export default function RegisterTaskPage() {
       </div>
 
       <Form form={form} layout="vertical" onFinish={submit} initialValues={{
-        platform: 'trae',
+        platform: 'chatgpt',
         executor_type: 'protocol',
         captcha_solver: 'yescaptcha',
         mail_provider: 'luckmail',
@@ -233,6 +358,18 @@ export default function RegisterTaskPage() {
         applemail_mailboxes: 'INBOX,Junk',
         gptmail_base_url: 'https://mail.chatgpt.org.uk',
         cloudmail_timeout: 30,
+        tempmail_api_url: 'http://127.0.0.1:18081',
+        tempmail_api_key_header: 'Authorization',
+        tempmail_mode: 'fixed_domain',
+        tempmail_wait_timeout_seconds: 180,
+        tempmail_ttl_minutes: 30,
+        tempmail_reuse_window_minutes: 20,
+        tempmail_platform: 'chatgpt',
+        tempmail_permanent: false,
+        chatgpt_enable_team_invite: false,
+        chatgpt_team_invite_deferred_activation: false,
+        chatgpt_capture_business_workspace: true,
+        chatgpt_capture_free_workspace: true,
         count: 1,
         concurrency: 1,
         register_delay_seconds: 0,
@@ -245,12 +382,6 @@ export default function RegisterTaskPage() {
             <Select
               options={[
                 { value: 'chatgpt', label: 'ChatGPT' },
-                { value: 'trae', label: 'Trae.ai' },
-                { value: 'cursor', label: 'Cursor' },
-                { value: 'kiro', label: 'Kiro' },
-                { value: 'grok', label: 'Grok' },
-                { value: 'tavily', label: 'Tavily' },
-                { value: 'openblocklabs', label: 'OpenBlockLabs' },
               ]}
             />
           </Form.Item>
@@ -268,10 +399,10 @@ export default function RegisterTaskPage() {
           </Form.Item>
           <Space style={{ width: '100%' }}>
             <Form.Item name="count" label="批量数量" style={{ flex: 1 }}>
-              <Input type="number" min={1} />
+              <Input type="number" min={1} disabled={isManualEmailOtp} />
             </Form.Item>
             <Form.Item name="concurrency" label="并发数" style={{ flex: 1 }}>
-              <Input type="number" min={1} max={5} />
+              <Input type="number" min={1} max={5} disabled={isManualEmailOtp} />
             </Form.Item>
           </Space>
           <Space style={{ width: '100%' }}>
@@ -283,12 +414,68 @@ export default function RegisterTaskPage() {
             </Form.Item>
           </Space>
           {platform === 'chatgpt' && (
-            <Form.Item label="ChatGPT Token 方案">
-              <ChatGPTRegistrationModeSwitch
-                mode={chatgptRegistrationMode}
-                onChange={setChatgptRegistrationMode}
-              />
-            </Form.Item>
+            <>
+              <Form.Item label="ChatGPT Token 方案">
+                <ChatGPTRegistrationModeSwitch
+                  mode={chatgptRegistrationMode}
+                  onChange={setChatgptRegistrationMode}
+                />
+              </Form.Item>
+              {chatgptRegistrationMode === CHATGPT_REGISTRATION_MODE_REFRESH_TOKEN ? (
+                <>
+                  <Form.Item
+                    label="工作空间抓取"
+                    extra="free 勾选独立生效；business 依赖 team invite。若两项都勾，会分别获取并按名称区分保存。"
+                  >
+                    <Space direction="vertical" size={6}>
+                      <Form.Item name="chatgpt_capture_free_workspace" valuePropName="checked" noStyle>
+                        <Checkbox>抓取 free 工作空间</Checkbox>
+                      </Form.Item>
+                    </Space>
+                  </Form.Item>
+                  <Form.Item
+                    name="chatgpt_enable_team_invite"
+                    valuePropName="checked"
+                    label="Business Team Invite"
+                    extra="关闭时走原始注册/登录链路；开启后才会进入 business recovery / team invite。"
+                  >
+                    <Checkbox>启用 team invite / business 恢复</Checkbox>
+                  </Form.Item>
+                  <Form.Item
+                    noStyle
+                    shouldUpdate={(prev, next) => prev.chatgpt_enable_team_invite !== next.chatgpt_enable_team_invite}
+                  >
+                    {({ getFieldValue }) =>
+                      getFieldValue('chatgpt_enable_team_invite') ? (
+                        <>
+                          <Form.Item
+                            name="chatgpt_team_invite_deferred_activation"
+                            valuePropName="checked"
+                            extra="开启后：先完成全部账号注册并发出邀请，再统一进入激活阶段；不会在单账号刚注册完时立刻进入 business/free。"
+                          >
+                            <Checkbox>延迟邀请（先统一发邀请，再统一激活）</Checkbox>
+                          </Form.Item>
+                          <Form.Item>
+                            <Space direction="vertical" size={6}>
+                              <Form.Item name="chatgpt_capture_business_workspace" valuePropName="checked" noStyle>
+                                <Checkbox>抓取 business 工作空间</Checkbox>
+                              </Form.Item>
+                            </Space>
+                          </Form.Item>
+                        </>
+                      ) : (
+                        <Alert
+                          type="info"
+                          showIcon
+                          message="当前关闭 team invite"
+                          description="普通模式下会直接走 free 主链；business 与延迟邀请配置在开启 team invite 后才生效。"
+                        />
+                      )
+                    }
+                  </Form.Item>
+                </>
+              ) : null}
+            </>
           )}
         </Card>
 
@@ -296,10 +483,14 @@ export default function RegisterTaskPage() {
           <Form.Item name="mail_provider" label="邮箱服务" rules={[{ required: true }]}>
             <Select
               options={[
+                ...(platform === 'chatgpt'
+                  ? [{ value: 'manual_email_otp', label: '手动邮箱 + 手输验证码' }]
+                  : []),
                 { value: 'luckmail', label: 'LuckMail' },
                 { value: 'applemail', label: 'AppleMail / 小苹果' },
                 { value: 'moemail', label: 'MoeMail (sall.cc)' },
                 { value: 'tempmail_lol', label: 'TempMail.lol' },
+                { value: 'tempmail_local', label: 'TempMail Ready API' },
                 { value: 'skymail', label: 'SkyMail (CloudMail)' },
                 { value: 'cloudmail', label: 'CloudMail (genToken)' },
                 { value: 'maliapi', label: 'YYDS Mail / MaliAPI' },
@@ -312,6 +503,73 @@ export default function RegisterTaskPage() {
               ]}
             />
           </Form.Item>
+          {mailProvider === 'manual_email_otp' && (
+            <>
+              <Alert
+                type="info"
+                showIcon
+                style={{ marginBottom: 16 }}
+                message="手动邮箱 + 手输验证码"
+                description={
+                  <div>
+                    <div>适合你自己掌控邮箱时使用。</div>
+                    <div>流程是：先手填邮箱 → 开始任务 → 若注册阶段或 OAuth 阶段需要邮箱验证码，任务状态区会弹出输入框。</div>
+                    <div>当前模式会自动锁定为单任务、单并发，密码仍由系统随机生成。</div>
+                  </div>
+                }
+              />
+              <Form.Item
+                name="email"
+                label="手填邮箱地址"
+                rules={[{ required: true, message: '请输入邮箱地址' }]}
+                extra="会记住你上次填写的邮箱；下次切回这个模式时自动回填。"
+              >
+                <Input placeholder="name@gmail.com" autoComplete="email" />
+              </Form.Item>
+              <Text type="secondary" style={{ display: 'block', marginBottom: 8 }}>
+                当前模式下密码不会手填，系统会自动随机生成；批量数量和并发数会强制锁为 1。
+              </Text>
+            </>
+          )}
+          {mailProvider === 'tempmail_local' && (
+            <>
+              <Form.Item name="tempmail_api_url" label="API URL" rules={[{ required: true, message: '请输入 TempMail API 地址' }]}>
+                <Input placeholder="http://127.0.0.1:18081" />
+              </Form.Item>
+              <Form.Item name="tempmail_api_key" label="API Key" rules={[{ required: true, message: '请输入 TempMail API Key' }]}>
+                <Input.Password placeholder="tm_xxx" />
+              </Form.Item>
+              <Form.Item name="tempmail_api_key_header" label="鉴权 Header">
+                <Input placeholder="Authorization" />
+              </Form.Item>
+              <Form.Item name="tempmail_mode" label="建箱模式">
+                <Select
+                  options={[
+                    { value: 'fixed_domain', label: '固定域名' },
+                    { value: 'task_subdomain', label: '随机子域 / Ready' },
+                  ]}
+                />
+              </Form.Item>
+              <Form.Item name="tempmail_primary_domain" label="主域名（固定域名模式时必填）">
+                <Input placeholder="mail.666800.xyz" />
+              </Form.Item>
+              <Form.Item name="tempmail_wait_timeout_seconds" label="建箱等待秒数">
+                <InputNumber min={30} max={600} style={{ width: '100%' }} />
+              </Form.Item>
+              <Form.Item name="tempmail_ttl_minutes" label="邮箱 TTL 分钟">
+                <InputNumber min={1} max={1440} style={{ width: '100%' }} />
+              </Form.Item>
+              <Form.Item name="tempmail_reuse_window_minutes" label="子域复用窗口分钟">
+                <InputNumber min={1} max={1440} style={{ width: '100%' }} />
+              </Form.Item>
+              <Form.Item name="tempmail_platform" label="平台标识">
+                <Input placeholder="chatgpt" />
+              </Form.Item>
+              <Form.Item name="tempmail_permanent" valuePropName="checked">
+                <Checkbox>永久邮箱</Checkbox>
+              </Form.Item>
+            </>
+          )}
           {mailProvider === 'skymail' && (
             <>
               <Form.Item name="skymail_api_base" label="API Base">
@@ -603,6 +861,12 @@ export default function RegisterTaskPage() {
               <CloseCircleOutlined /> {task.error}
             </div>
           )}
+          {task.pending_verification ? (
+            <TaskVerificationPanel
+              taskId={task.id}
+              verification={task.pending_verification}
+            />
+          ) : null}
           {task.id ? (
             <div style={{ marginTop: 16 }}>
               <TaskLogPanel taskId={task.id} />

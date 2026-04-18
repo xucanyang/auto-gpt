@@ -1,6 +1,7 @@
 import unittest
 from unittest import mock
 
+from core.db import AccountModel
 from services.external_sync import sync_account
 
 
@@ -87,6 +88,80 @@ class ExternalSyncContributionModeTests(unittest.TestCase):
         self.assertEqual(result[0]["name"], "CPA")
         upload_mock.assert_called_once_with(account)
         persist_mock.assert_called_once_with(account, True, "ok")
+
+    def test_sub2api_sync_uses_backfill_pipeline(self):
+        account = DummyAccount()
+        cfg = {
+            "contribution_enabled": "0",
+            "sub2api_api_url": "http://sub2api.local",
+            "sub2api_api_key": "sub2-key",
+        }
+
+        with mock.patch("core.config_store.config_store.get", side_effect=_config_getter(cfg)):
+            with mock.patch(
+                "services.sub2api_sync.backfill_chatgpt_account_to_sub2api",
+                return_value={"ok": True, "message": "补传完成，远端账号 #12"},
+            ) as backfill_mock:
+                result = sync_account(account)
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["name"], "Sub2API")
+        self.assertTrue(result[0]["ok"])
+        self.assertIn("补传完成", result[0]["msg"])
+        backfill_mock.assert_called_once_with(account)
+
+    def test_sub2api_sync_persists_when_account_model_is_provided(self):
+        cfg = {
+            "contribution_enabled": "0",
+            "sub2api_api_url": "http://sub2api.local",
+            "sub2api_api_key": "sub2-key",
+        }
+        account = AccountModel(
+            id=7,
+            platform="chatgpt",
+            email="demo@example.com",
+            password="secret",
+            token="at-token",
+            status="registered",
+        )
+        db_account = AccountModel(
+            id=7,
+            platform="chatgpt",
+            email="demo@example.com",
+            password="secret",
+            token="at-token",
+            status="registered",
+        )
+
+        class _ExecResult:
+            def first(self):
+                return db_account
+
+        fake_session = mock.Mock()
+        fake_session.exec.return_value = _ExecResult()
+
+        class _SessionFactory:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def __enter__(self):
+                return fake_session
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        with mock.patch("core.config_store.config_store.get", side_effect=_config_getter(cfg)):
+            with mock.patch("core.db.Session", _SessionFactory):
+                with mock.patch(
+                    "services.sub2api_sync.backfill_chatgpt_account_to_sub2api",
+                    return_value={"ok": True, "message": "补传完成，远端账号 #99"},
+                ) as backfill_mock:
+                    result = sync_account(account)
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["name"], "Sub2API")
+        self.assertTrue(result[0]["ok"])
+        backfill_mock.assert_called_once_with(db_account, session=fake_session, commit=True)
 
 
 if __name__ == "__main__":

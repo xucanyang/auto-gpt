@@ -10,13 +10,15 @@ from core.base_platform import Account, AccountStatus
 from core.db import AccountModel, engine
 from services.external_apps import install, list_status, start, start_all, stop, stop_all
 from services.chatgpt_sync import backfill_chatgpt_account_to_cpa, get_cliproxy_sync_state
+from services.sub2api_sync import backfill_chatgpt_account_to_sub2api, get_sub2api_sync_state
 
 router = APIRouter(prefix="/integrations", tags=["integrations"])
 
 
 class BackfillRequest(BaseModel):
-    platforms: list[str] = Field(default_factory=lambda: ["grok", "kiro"])
+    platforms: list[str] = Field(default_factory=lambda: ["chatgpt"])
     account_ids: list[int] = Field(default_factory=list)
+    destination: str = "cliproxyapi"
     pending_only: bool = False
     status: Optional[str] = None
     email: Optional[str] = None
@@ -69,6 +71,7 @@ def stop_service(name: str):
 def backfill_integrations(body: BackfillRequest):
     summary = {"total": 0, "success": 0, "failed": 0, "skipped": 0, "items": []}
     targets = set(body.platforms or [])
+    destination = str(body.destination or "cliproxyapi").strip().lower() or "cliproxyapi"
 
     with Session(engine) as s:
         q = select(AccountModel)
@@ -88,35 +91,36 @@ def backfill_integrations(body: BackfillRequest):
 
         rows = s.exec(q).all()
         if body.pending_only:
-            rows = [
-                row for row in rows
-                if row.platform != "chatgpt"
-                or str(get_cliproxy_sync_state(row).get("remote_state") or "").strip().lower() == "not_found"
-            ]
+            def _is_pending_target(row: AccountModel) -> bool:
+                if row.platform != "chatgpt":
+                    return False
+                if destination == "sub2api":
+                    state = get_sub2api_sync_state(row)
+                else:
+                    state = get_cliproxy_sync_state(row)
+                if not state:
+                    return True
+                return str(state.get("remote_state") or "").strip().lower() in {"not_found", "cross_workspace_only"}
 
-        if any(row.platform == "grok" for row in rows):
-            from services.grok2api_runtime import ensure_grok2api_ready
-
-            ok, msg = ensure_grok2api_ready()
-            if not ok:
-                return {
-                    "total": 0,
-                    "success": 0,
-                    "failed": 0,
-                    "items": [{"platform": "grok", "email": "", "results": [{"name": "grok2api", "ok": False, "msg": msg}]}],
-                }
+            rows = [row for row in rows if _is_pending_target(row)]
 
         for row in rows:
             item = {"platform": row.platform, "email": row.email, "results": []}
             try:
                 results = []
                 if row.platform == "chatgpt":
-                    outcome = backfill_chatgpt_account_to_cpa(row, session=s, commit=True)
+                    if destination == "sub2api":
+                        outcome = backfill_chatgpt_account_to_sub2api(row, session=s, commit=True)
+                        default_name = "Sub2API"
+                    else:
+                        outcome = backfill_chatgpt_account_to_cpa(row, session=s, commit=True)
+                        default_name = "CLIProxyAPI"
+
                     ok = bool(outcome.get("ok"))
                     skipped = bool(outcome.get("skipped"))
                     results.extend(outcome.get("results") or [])
                     if not results:
-                        results.append({"name": "CLIProxyAPI", "ok": ok, "msg": outcome.get("message", "")})
+                        results.append({"name": default_name, "ok": ok, "msg": outcome.get("message", "")})
                     if skipped:
                         summary["skipped"] += 1
                     elif ok:
@@ -124,35 +128,11 @@ def backfill_integrations(body: BackfillRequest):
                     else:
                         summary["failed"] += 1
 
-                elif row.platform == "grok":
-                    from core.config_store import config_store
-                    from platforms.grok.grok2api_upload import upload_to_grok2api
-
-                    account = _to_account(row)
-                    api_url = str(config_store.get("grok2api_url", "") or "").strip() or "http://127.0.0.1:8011"
-                    app_key = str(config_store.get("grok2api_app_key", "") or "").strip() or "grok2api"
-                    ok, msg = upload_to_grok2api(account, api_url=api_url, app_key=app_key)
-                    results.append({"name": "grok2api", "ok": ok, "msg": msg})
-
-                elif row.platform == "kiro":
-                    from core.config_store import config_store
-                    from platforms.kiro.account_manager_upload import upload_to_kiro_manager
-
-                    account = _to_account(row)
-                    configured_path = str(config_store.get("kiro_manager_path", "") or "").strip() or None
-                    ok, msg = upload_to_kiro_manager(account, path=configured_path)
-                    results.append({"name": "Kiro Manager", "ok": ok, "msg": msg})
-
                 if not results:
                     item["results"].append({"name": "skip", "ok": False, "msg": "未配置对应导入目标"})
                     summary["failed"] += 1
                 else:
                     item["results"] = results
-                    if row.platform != "chatgpt":
-                        if all(r.get("ok") for r in results):
-                            summary["success"] += 1
-                        else:
-                            summary["failed"] += 1
             except Exception as e:
                 s.rollback()
                 item["results"].append({"name": "error", "ok": False, "msg": str(e)})

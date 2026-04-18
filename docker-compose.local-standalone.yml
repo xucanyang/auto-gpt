@@ -30,10 +30,10 @@ services:
       SUB2API_DB_PEER_UID: "999"
       SUB2API_DB_PEER_GID: "988"
     ports:
-      - "8000:8000"
-      - "127.0.0.1:8889:8889"
-      - "${CLIPROXYAPI_PORT_BIND:-8317}:8317"
-      - "${GROK2API_PORT_BIND:-8011}:8011"
+      - "8001:8000"
+      - "127.0.0.1:8890:8889"
+      - "8013:8011"
+      - "8320:8317"
     volumes:
       - ${APP_RUNTIME_BIND:-./data}:/runtime
       - ${APP_EXT_TARGETS_BIND:-./_ext_targets}:/_ext_targets
@@ -48,6 +48,8 @@ services:
       - tempmail_internal
       - team_manage_default
     shm_size: "1gb"
+    mem_limit: "1500m"
+    memswap_limit: "2500m"
 
 networks:
   tempmail_internal:

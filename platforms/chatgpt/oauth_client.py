@@ -19,7 +19,9 @@ except ImportError:
 from .phone_service import SMSToMePhoneService
 from .utils import (
     FlowState,
+    apply_browser_fingerprint,
     build_browser_headers,
+    coerce_browser_fingerprint,
     describe_flow_state,
     extract_flow_state,
     generate_datadog_trace,
@@ -58,12 +60,68 @@ class OAuthClient:
         self.browser_mode = browser_mode or "protocol"
         self.last_error = ""
         self.last_workspace_id = ""
+        self.last_workspace_candidates = []
         self.last_state = FlowState()
+        self.browser_fingerprint = None
+        self._about_you_existing_account_detected = False
+        self._about_you_should_skip_create_account = False
 
         # 创建 session
         self.session = curl_requests.Session()
         if self.proxy:
             self.session.proxies = build_requests_proxy_config(self.proxy)
+
+    def adopt_browser_context(
+        self,
+        session,
+        *,
+        device_id: str = "",
+        user_agent=None,
+        sec_ch_ua=None,
+        accept_language=None,
+        browser_fingerprint=None,
+    ):
+        """承接前序注册阶段的 session / cookie / 指纹。"""
+        if session is not None:
+            self.session = session
+
+        if self.proxy:
+            try:
+                if not getattr(self.session, "proxies", None):
+                    self.session.proxies = build_requests_proxy_config(self.proxy)
+            except Exception:
+                pass
+
+        effective_device_id = str(device_id or "").strip()
+        if browser_fingerprint is not None:
+            self.browser_fingerprint = coerce_browser_fingerprint(
+                browser_fingerprint,
+                device_id=effective_device_id or None,
+                user_agent=user_agent,
+                sec_ch_ua=sec_ch_ua,
+                accept_language=accept_language,
+            )
+            apply_browser_fingerprint(self.session, self.browser_fingerprint)
+            effective_device_id = str(
+                getattr(self.browser_fingerprint, "device_id", "") or effective_device_id
+            ).strip()
+        else:
+            header_updates = {}
+            if user_agent:
+                header_updates["User-Agent"] = user_agent
+            if sec_ch_ua:
+                header_updates["sec-ch-ua"] = sec_ch_ua
+            if accept_language:
+                header_updates["Accept-Language"] = accept_language
+            if header_updates:
+                try:
+                    self.session.headers.update(header_updates)
+                except Exception:
+                    pass
+
+        if effective_device_id:
+            seed_oai_device_cookie(self.session, effective_device_id)
+            self._log(f"已承接前序注册上下文: device_id={effective_device_id}")
 
     def _log(self, msg):
         """输出日志"""
@@ -80,77 +138,35 @@ class OAuthClient:
         if self.browser_mode == "headed":
             random_delay(low, high)
 
-    @staticmethod
-    def _random_chrome_fingerprint():
-        profiles = [
-            {
-                "major": 131,
-                "impersonate": "chrome131",
-                "build": 6778,
-                "patch_range": (69, 205),
-                "sec_ch_ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
-            },
-            {
-                "major": 133,
-                "impersonate": "chrome133a",
-                "build": 6943,
-                "patch_range": (33, 153),
-                "sec_ch_ua": '"Not(A:Brand";v="99", "Google Chrome";v="133", "Chromium";v="133"',
-            },
-            {
-                "major": 136,
-                "impersonate": "chrome136",
-                "build": 7103,
-                "patch_range": (48, 175),
-                "sec_ch_ua": '"Chromium";v="136", "Google Chrome";v="136", "Not.A/Brand";v="99"',
-            },
-        ]
-        profile = random.choice(profiles)
-        major = profile["major"]
-        build = profile["build"]
-        patch = random.randint(*profile["patch_range"])
-        full_ver = f"{major}.0.{build}.{patch}"
-        ua = (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            f"AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{full_ver} Safari/537.36"
-        )
-        return ua, profile["sec_ch_ua"], profile["impersonate"]
-
-    def _ensure_oauth_fingerprint(self, user_agent, sec_ch_ua, impersonate):
-        if user_agent and sec_ch_ua and impersonate:
-            return user_agent, sec_ch_ua, impersonate
-
-        ua, ch_ua, imp = self._random_chrome_fingerprint()
-        user_agent = user_agent or ua
-        sec_ch_ua = sec_ch_ua or ch_ua
-        impersonate = impersonate or imp
-
+    def _ensure_oauth_fingerprint(self, user_agent, sec_ch_ua, impersonate, device_id=None):
+        accept_language = None
         try:
-            self.session.headers.update(
-                {
-                    "User-Agent": user_agent,
-                    "Accept-Language": random.choice(
-                        [
-                            "en-US,en;q=0.9",
-                            "en-US,en;q=0.9,zh-CN;q=0.8",
-                            "en,en-US;q=0.9",
-                            "en-US,en;q=0.8",
-                        ]
-                    ),
-                    "sec-ch-ua": sec_ch_ua,
-                    "sec-ch-ua-mobile": "?0",
-                    "sec-ch-ua-platform": '"Windows"',
-                    "sec-ch-ua-arch": '"x86"',
-                    "sec-ch-ua-bitness": '"64"',
-                }
-            )
+            accept_language = self.session.headers.get("Accept-Language")
         except Exception:
-            pass
+            accept_language = None
+
+        self.browser_fingerprint = coerce_browser_fingerprint(
+            self.browser_fingerprint,
+            device_id=device_id,
+            user_agent=user_agent,
+            sec_ch_ua=sec_ch_ua,
+            impersonate=impersonate,
+            accept_language=accept_language,
+        )
+        apply_browser_fingerprint(self.session, self.browser_fingerprint)
 
         self._log(
-            f"OAuth 指纹: ua={user_agent.split('Chrome/')[-1][:24]}..., sec-ch-ua={sec_ch_ua}, impersonate={impersonate}"
+            "OAuth 指纹: "
+            f"ua={self.browser_fingerprint.user_agent.split('Chrome/')[-1][:24]}..., "
+            f"sec-ch-ua={self.browser_fingerprint.sec_ch_ua}, "
+            f"impersonate={self.browser_fingerprint.impersonate}, "
+            f"device_id={self.browser_fingerprint.device_id}"
         )
-        return user_agent, sec_ch_ua, impersonate
+        return (
+            self.browser_fingerprint.user_agent,
+            self.browser_fingerprint.sec_ch_ua,
+            self.browser_fingerprint.impersonate,
+        )
 
 
     @staticmethod
@@ -265,16 +281,30 @@ class OAuthClient:
         fetch_site=None,
         extra_headers=None,
     ):
+        fingerprint = getattr(self, "browser_fingerprint", None)
         accept_language = None
+        chrome_full_version = None
+        platform_version = None
         try:
-            accept_language = self.session.headers.get("Accept-Language")
+            accept_language = (
+                (fingerprint.accept_language if fingerprint else None)
+                or self.session.headers.get("Accept-Language")
+            )
+            chrome_full_version = (
+                fingerprint.chrome_full_version if fingerprint else None
+            )
+            platform_version = (
+                fingerprint.platform_version if fingerprint else None
+            ) or str(self.session.headers.get("sec-ch-ua-platform-version") or "").strip('"')
         except Exception:
             accept_language = None
 
         return build_browser_headers(
             url=url,
-            user_agent=user_agent or "Mozilla/5.0",
-            sec_ch_ua=sec_ch_ua,
+            user_agent=user_agent or (fingerprint.user_agent if fingerprint else "Mozilla/5.0"),
+            sec_ch_ua=sec_ch_ua or (fingerprint.sec_ch_ua if fingerprint else None),
+            chrome_full_version=chrome_full_version,
+            sec_ch_platform_version=platform_version,
             accept=accept,
             accept_language=accept_language or "en-US,en;q=0.9",
             referer=referer,
@@ -346,6 +376,27 @@ class OAuthClient:
     def _state_is_about_you(self, state: FlowState):
         target = f"{state.continue_url} {state.current_url}".lower()
         return state.page_type == "about_you" or "about-you" in target
+
+    @staticmethod
+    def _should_skip_create_account_for_login_source(login_source):
+        source = str(login_source or "").strip().lower()
+        if not source:
+            return False
+        return any(
+            marker in source
+            for marker in (
+                "post_register_workspace_recovery",
+                "business_workspace_recovery",
+                "workspace_capture_",
+                "existing_account_after_about_you",
+            )
+        )
+
+    @staticmethod
+    def _should_retry_fresh_oauth_after_about_you(login_source, workspace_scope_preference):
+        source = str(login_source or "").strip().lower()
+        scope = OAuthClient._normalize_workspace_scope_preference(workspace_scope_preference)
+        return scope == "free" and "workspace_capture_free" in source
 
     def _state_requires_navigation(self, state: FlowState):
         method = (state.method or "GET").upper()
@@ -709,27 +760,35 @@ class OAuthClient:
         current_referer = continue_referer
         for attempt in range(2):
             self._log(f"authorize_continue: device_id={device_id}")
-            sentinel_token = get_sentinel_token_via_browser(
+            sentinel_token = build_sentinel_token(
+                self.session,
+                device_id,
                 flow="authorize_continue",
-                proxy=self.proxy,
-                page_url=current_referer or f"{self.oauth_issuer}/log-in",
-                headless=self.browser_mode != "headed",
-                device_id=device_id,
-                log_fn=lambda msg: self._log(f"authorize_continue: {msg}"),
+                user_agent=user_agent,
+                sec_ch_ua=sec_ch_ua,
+                impersonate=impersonate,
             )
             if sentinel_token:
-                self._log("authorize_continue: 已通过 Playwright SentinelSDK 获取 token")
+                self._log("authorize_continue: 已通过 HTTP PoW 获取 token")
             else:
-                sentinel_token = build_sentinel_token(
-                    self.session,
-                    device_id,
+                self._log("authorize_continue: HTTP PoW 获取 token 失败，回退到 Playwright SentinelSDK")
+                sentinel_token = get_sentinel_token_via_browser(
                     flow="authorize_continue",
+                    proxy=self.proxy,
+                    page_url=current_referer or f"{self.oauth_issuer}/log-in",
+                    headless=self.browser_mode != "headed",
+                    device_id=device_id,
                     user_agent=user_agent,
                     sec_ch_ua=sec_ch_ua,
-                    impersonate=impersonate,
+                    accept_language=(self.browser_fingerprint.accept_language if self.browser_fingerprint else None),
+                    chrome_full_version=(self.browser_fingerprint.chrome_full_version if self.browser_fingerprint else None),
+                    platform_version=(self.browser_fingerprint.platform_version if self.browser_fingerprint else None),
+                    viewport_width=(self.browser_fingerprint.viewport_width if self.browser_fingerprint else None),
+                    viewport_height=(self.browser_fingerprint.viewport_height if self.browser_fingerprint else None),
+                    log_fn=lambda msg: self._log(f"authorize_continue: {msg}"),
                 )
                 if sentinel_token:
-                    self._log("authorize_continue: 已通过 HTTP PoW 获取 token")
+                    self._log("authorize_continue: 已通过 Playwright SentinelSDK 获取 token")
                 else:
                     self._set_error("无法获取 sentinel token (authorize_continue)")
                     return None
@@ -839,6 +898,10 @@ class OAuthClient:
                     data, current_url=str(r.url) or request_url
                 )
                 self._log(describe_flow_state(flow_state))
+                if self._state_is_email_otp(flow_state):
+                    self._log("authorize_continue 分支判定: 进入 email_otp_first / 既有账号恢复倾向链")
+                elif self._state_is_login_password(flow_state):
+                    self._log("authorize_continue 分支判定: 进入 login_password / 标准密码登录链")
                 return flow_state
             except Exception as e:
                 self._set_error(f"提交邮箱异常: {e}")
@@ -847,6 +910,7 @@ class OAuthClient:
 
     def _submit_password_verify(
         self,
+        email,
         password,
         device_id,
         *,
@@ -869,6 +933,13 @@ class OAuthClient:
                 page_url=referer or f"{self.oauth_issuer}/log-in/password",
                 headless=self.browser_mode != "headed",
                 device_id=device_id,
+                user_agent=user_agent,
+                sec_ch_ua=sec_ch_ua,
+                accept_language=(self.browser_fingerprint.accept_language if self.browser_fingerprint else None),
+                chrome_full_version=(self.browser_fingerprint.chrome_full_version if self.browser_fingerprint else None),
+                platform_version=(self.browser_fingerprint.platform_version if self.browser_fingerprint else None),
+                viewport_width=(self.browser_fingerprint.viewport_width if self.browser_fingerprint else None),
+                viewport_height=(self.browser_fingerprint.viewport_height if self.browser_fingerprint else None),
                 log_fn=lambda msg: self._log(f"password_verify: {msg}"),
             )
             if sentinel_pwd:
@@ -927,8 +998,34 @@ class OAuthClient:
                     continue
 
                 if r.status_code != 200:
+                    response_text = ""
+                    try:
+                        response_text = r.text or ""
+                    except Exception:
+                        response_text = ""
+
+                    lowered = response_text.lower()
+                    if r.status_code == 401 and (
+                        "login failed" in lowered
+                        or "invalid_request_error" in lowered
+                        or "invalid credentials" in lowered
+                    ):
+                        self._log(
+                            "密码验证失败，自动退回邮箱验证码登录链路"
+                        )
+                        next_state = self._send_passwordless_login_otp(
+                            email,
+                            device_id,
+                            user_agent=user_agent,
+                            sec_ch_ua=sec_ch_ua,
+                            impersonate=impersonate,
+                            referer=referer or f"{self.oauth_issuer}/log-in/password",
+                        )
+                        if next_state:
+                            return next_state
+
                     self._set_error(
-                        f"密码验证失败: {r.status_code} - {r.text[:180]}"
+                        f"密码验证失败: {r.status_code} - {response_text[:180]}"
                     )
                     return None
 
@@ -1032,17 +1129,37 @@ class OAuthClient:
             self._set_error("about_you 资料不完整: 缺少姓名或生日")
             return None
 
-        sentinel_token = build_sentinel_token(
-            self.session,
-            device_id,
+        sentinel_token = get_sentinel_token_via_browser(
             flow="oauth_create_account",
+            proxy=self.proxy,
+            page_url=referer or f"{self.oauth_issuer}/about-you",
+            headless=self.browser_mode != "headed",
+            device_id=device_id,
             user_agent=user_agent,
             sec_ch_ua=sec_ch_ua,
-            impersonate=impersonate,
+            accept_language=(self.browser_fingerprint.accept_language if self.browser_fingerprint else None),
+            chrome_full_version=(self.browser_fingerprint.chrome_full_version if self.browser_fingerprint else None),
+            platform_version=(self.browser_fingerprint.platform_version if self.browser_fingerprint else None),
+            viewport_width=(self.browser_fingerprint.viewport_width if self.browser_fingerprint else None),
+            viewport_height=(self.browser_fingerprint.viewport_height if self.browser_fingerprint else None),
+            log_fn=lambda msg: self._log(f"oauth_create_account: {msg}"),
         )
-        if not sentinel_token:
-            self._set_error("无法获取 sentinel token (oauth_create_account)")
-            return None
+        if sentinel_token:
+            self._log("oauth_create_account: 已通过 Playwright SentinelSDK 获取 token")
+        else:
+            sentinel_token = build_sentinel_token(
+                self.session,
+                device_id,
+                flow="oauth_create_account",
+                user_agent=user_agent,
+                sec_ch_ua=sec_ch_ua,
+                impersonate=impersonate,
+            )
+            if sentinel_token:
+                self._log("oauth_create_account: 已通过 HTTP PoW 获取 token")
+            else:
+                self._set_error("无法获取 sentinel token (oauth_create_account)")
+                return None
 
         request_url = f"{self.oauth_issuer}/api/accounts/create_account"
         headers = self._headers(
@@ -1081,8 +1198,30 @@ class OAuthClient:
             r = self.session.post(request_url, **kwargs)
             self._log(f"/create_account -> {r.status_code}")
 
+            response_text = ""
+            try:
+                response_text = r.text or ""
+            except Exception:
+                response_text = ""
+
             if r.status_code != 200:
-                self._set_error(f"about_you 提交失败: {r.status_code} - {r.text[:180]}")
+                lowered = response_text.lower()
+                if (
+                    r.status_code == 400
+                    and (
+                        "account already exists" in lowered
+                        or "please login instead" in lowered
+                        or "user_already_exists" in lowered
+                    )
+                ):
+                    self._about_you_existing_account_detected = True
+                    self._log(
+                        "about_you 返回 user_already_exists，说明账号已存在；"
+                        "当前 OAuth 会话仍停留在补注册路径，准备重开一次既有账号登录恢复"
+                    )
+                    return None
+
+                self._set_error(f"about_you 提交失败: {r.status_code} - {response_text[:180]}")
                 return None
 
             try:
@@ -1118,6 +1257,8 @@ class OAuthClient:
         self.session = curl_requests.Session()
         if self.proxy:
             self.session.proxies = build_requests_proxy_config(self.proxy)
+        if self.browser_fingerprint:
+            apply_browser_fingerprint(self.session, self.browser_fingerprint)
 
     def login_and_get_tokens(
         self,
@@ -1127,6 +1268,7 @@ class OAuthClient:
         user_agent=None,
         sec_ch_ua=None,
         impersonate=None,
+        browser_fingerprint=None,
         skymail_client=None,
         prefer_passwordless_login=False,
         allow_phone_verification=True,
@@ -1140,6 +1282,7 @@ class OAuthClient:
         birthdate="",
         login_source="",
         stop_after_login=False,
+        workspace_scope_preference=None,
         _recovery_depth=0,
     ):
         """
@@ -1169,7 +1312,10 @@ class OAuthClient:
         """
         self.last_error = ""
         self.last_workspace_id = ""
+        self.last_workspace_candidates = []
         self.last_state = FlowState()
+        self._about_you_existing_account_detected = False
+        self._about_you_should_skip_create_account = False
         self._log(
             "开始 OAuth 登录流程..."
             + (f" (source={login_source})" if login_source else "")
@@ -1183,21 +1329,33 @@ class OAuthClient:
             f"force_password_login={'on' if force_password_login else 'off'}, "
             f"force_chatgpt_entry={'on' if force_chatgpt_entry else 'off'}, "
             f"screen_hint={screen_hint or 'login'}, "
-            f"stop_after_login={'on' if stop_after_login else 'off'}"
+            f"stop_after_login={'on' if stop_after_login else 'off'}, "
+            f"workspace_scope={str(workspace_scope_preference or 'auto').strip() or 'auto'}"
         )
+
+        if browser_fingerprint is not None:
+            self.browser_fingerprint = coerce_browser_fingerprint(browser_fingerprint)
+            if not device_id:
+                device_id = self.browser_fingerprint.device_id
+            user_agent = user_agent or self.browser_fingerprint.user_agent
+            sec_ch_ua = sec_ch_ua or self.browser_fingerprint.sec_ch_ua
+            impersonate = impersonate or self.browser_fingerprint.impersonate
 
         if force_new_browser:
             self._log("force_new_browser: 重新创建 OAuth 会话容器")
             self._recreate_session()
-            device_id = str(uuid.uuid4())
-            self._log(f"force_new_browser: 新 device_id={device_id}")
+            if device_id:
+                self._log(f"force_new_browser: 复用上游 device_id={device_id}")
+            else:
+                device_id = str(uuid.uuid4())
+                self._log(f"force_new_browser: 新 device_id={device_id}")
         else:
             if not device_id:
                 device_id = str(uuid.uuid4())
                 self._log(f"OAuth device_id 缺失，已生成新的 device_id={device_id}")
 
         user_agent, sec_ch_ua, impersonate = self._ensure_oauth_fingerprint(
-            user_agent, sec_ch_ua, impersonate
+            user_agent, sec_ch_ua, impersonate, device_id=device_id
         )
 
         code_verifier, code_challenge = generate_pkce()
@@ -1317,6 +1475,7 @@ class OAuthClient:
             if self._state_is_create_account_password(state) and force_password_login:
                 self._log("命中 create_account_password，按强制密码登录路径继续")
                 next_state = self._submit_password_verify(
+                    email,
                     password,
                     device_id,
                     user_agent=user_agent,
@@ -1341,6 +1500,7 @@ class OAuthClient:
 
             if self._state_is_login_password(state):
                 next_state = self._submit_password_verify(
+                    email,
                     password,
                     device_id,
                     user_agent=user_agent,
@@ -1402,6 +1562,13 @@ class OAuthClient:
                     impersonate,
                     skymail_client,
                     state,
+                    scope_log_prefix=(
+                        "[business]"
+                        if self._normalize_workspace_scope_preference(workspace_scope_preference) == "business"
+                        else "[free]"
+                        if self._normalize_workspace_scope_preference(workspace_scope_preference) == "free"
+                        else ""
+                    ),
                 )
                 if not next_state:
                     if not self.last_error:
@@ -1414,8 +1581,68 @@ class OAuthClient:
                     self.last_state = next_state
                     self._set_error("登录链路已完成，按要求停止")
                     return None
+                if self._state_is_about_you(next_state) and self._should_retry_fresh_oauth_after_about_you(
+                    login_source,
+                    workspace_scope_preference,
+                ):
+                    if _recovery_depth < 1:
+                        self._log(
+                            "free 工作空间链路在邮箱 OTP 后回到 about_you；"
+                            "判定本次登录态无效，重开全新 OAuth session 再试一次"
+                        )
+                        return self.login_and_get_tokens(
+                            email,
+                            password,
+                            device_id,
+                            user_agent=user_agent,
+                            sec_ch_ua=sec_ch_ua,
+                            impersonate=impersonate,
+                            browser_fingerprint=self.browser_fingerprint,
+                            skymail_client=skymail_client,
+                            prefer_passwordless_login=prefer_passwordless_login,
+                            allow_phone_verification=allow_phone_verification,
+                            force_new_browser=True,
+                            force_password_login=force_password_login,
+                            force_chatgpt_entry=force_chatgpt_entry,
+                            screen_hint=screen_hint,
+                            complete_about_you_if_needed=complete_about_you_if_needed,
+                            first_name=first_name,
+                            last_name=last_name,
+                            birthdate=birthdate,
+                            login_source=f"{login_source}:retry_after_invalid_about_you",
+                            stop_after_login=stop_after_login,
+                            workspace_scope_preference=workspace_scope_preference,
+                            _recovery_depth=_recovery_depth + 1,
+                        )
+                    self._set_error(
+                        "free 工作空间链路在 OTP 后再次回到 about_you，判定登录态无效"
+                    )
+                    return None
+                if (
+                    complete_about_you_if_needed
+                    and self._should_skip_create_account_for_login_source(login_source)
+                    and self._state_is_about_you(next_state)
+                ):
+                    self._about_you_should_skip_create_account = True
+                    self._log(
+                        "恢复链路在邮箱 OTP 后直接回到 about_you；"
+                        "后续将跳过 create_account，按既有账号恢复路径继续"
+                    )
                 referer = state.current_url or referer
                 state = next_state
+                continue
+
+            if self._state_is_about_you(state) and (
+                self._about_you_should_skip_create_account
+                or self._should_skip_create_account_for_login_source(login_source)
+            ):
+                self._log(
+                    "步骤5: 当前 about_you 属于既有账号恢复链路，跳过 create_account，直接转 consent/workspace"
+                )
+                referer = state.current_url or referer
+                state = self._state_from_url(
+                    f"{self.oauth_issuer}/sign-in-with-chatgpt/codex/consent"
+                )
                 continue
 
             if complete_about_you_if_needed and self._state_is_about_you(state):
@@ -1431,6 +1658,39 @@ class OAuthClient:
                     referer=state.current_url or state.continue_url or referer,
                 )
                 if not next_state:
+                    if self._about_you_existing_account_detected and _recovery_depth < 1:
+                        self._log(
+                            "about_you 命中既有账号，重开一次全新 OAuth 会话，切换到既有账号恢复路径"
+                        )
+                        self._recreate_session()
+                        return self.login_and_get_tokens(
+                            email,
+                            password,
+                            device_id,
+                            user_agent=user_agent,
+                            sec_ch_ua=sec_ch_ua,
+                            impersonate=impersonate,
+                            browser_fingerprint=self.browser_fingerprint,
+                            skymail_client=skymail_client,
+                            prefer_passwordless_login=prefer_passwordless_login,
+                            allow_phone_verification=allow_phone_verification,
+                            force_new_browser=True,
+                            force_password_login=force_password_login,
+                            force_chatgpt_entry=force_chatgpt_entry,
+                            screen_hint="login",
+                            complete_about_you_if_needed=False,
+                            first_name=first_name,
+                            last_name=last_name,
+                            birthdate=birthdate,
+                            login_source=(
+                                f"{login_source}:existing_account_after_about_you"
+                                if login_source
+                                else "existing_account_after_about_you"
+                            ),
+                            stop_after_login=stop_after_login,
+                            workspace_scope_preference=workspace_scope_preference,
+                            _recovery_depth=_recovery_depth + 1,
+                        )
                     if not self.last_error:
                         self._set_error("about_you 提交后未进入下一步 OAuth 状态")
                     return None
@@ -1462,6 +1722,7 @@ class OAuthClient:
                             user_agent=user_agent,
                             sec_ch_ua=sec_ch_ua,
                             impersonate=impersonate,
+                            browser_fingerprint=self.browser_fingerprint,
                             skymail_client=skymail_client,
                             prefer_passwordless_login=prefer_passwordless_login,
                             allow_phone_verification=allow_phone_verification,
@@ -1474,6 +1735,7 @@ class OAuthClient:
                                 if login_source
                                 else "add_phone_recovery"
                             ),
+                            workspace_scope_preference=workspace_scope_preference,
                             _recovery_depth=_recovery_depth + 1,
                         )
                     else:
@@ -1521,22 +1783,12 @@ class OAuthClient:
                 continue
 
             if self._state_supports_workspace_resolution(state):
-                self._log("步骤6: 执行 workspace/org 选择")
-                consent_entry = (
-                    state.continue_url
-                    or state.current_url
-                    or f"{self.oauth_issuer}/sign-in-with-chatgpt/codex/consent"
-                )
-                if self._state_is_add_phone(state):
-                    consent_entry = (
-                        f"{self.oauth_issuer}/sign-in-with-chatgpt/codex/consent"
-                    )
-                    self._log("步骤6: 当前处于 add_phone，改用 canonical consent URL 继续")
-                code, next_state = self._oauth_submit_workspace_and_org(
-                    consent_entry,
+                code, next_state = self.resolve_codex_workspace(
+                    state,
                     device_id,
                     user_agent,
                     impersonate,
+                    workspace_scope_preference=workspace_scope_preference,
                 )
                 if code:
                     self._log(f"获取到 authorization code: {code[:20]}...")
@@ -1576,6 +1828,139 @@ class OAuthClient:
         except Exception:
             return None
 
+    def capture_workspace_tokens_from_authenticated_session(
+        self,
+        *,
+        device_id,
+        user_agent=None,
+        sec_ch_ua=None,
+        impersonate=None,
+        workspace_scope_preference=None,
+    ):
+        """基于已登录的 OAuth 会话做一次 workspace 预热抓取；失败时仅返回 None。"""
+        self.last_error = ""
+        self.last_workspace_id = ""
+        self.last_workspace_candidates = []
+        self.last_state = FlowState()
+        self._log(
+            "复用已登录 auth 会话抓取 workspace"
+            + (
+                f" (target={str(workspace_scope_preference or 'auto').strip() or 'auto'})"
+                if workspace_scope_preference
+                else ""
+            )
+        )
+
+        user_agent, sec_ch_ua, impersonate = self._ensure_oauth_fingerprint(
+            user_agent,
+            sec_ch_ua,
+            impersonate,
+            device_id=device_id,
+        )
+        seed_oai_device_cookie(self.session, device_id)
+
+        code_verifier, code_challenge = generate_pkce()
+        oauth_state = secrets.token_urlsafe(32)
+        authorize_params = {
+            "response_type": "code",
+            "client_id": self.oauth_client_id,
+            "redirect_uri": self.oauth_redirect_uri,
+            "scope": "openid profile email offline_access",
+            "code_challenge": code_challenge,
+            "code_challenge_method": "S256",
+            "state": oauth_state,
+        }
+        authorize_url = f"{self.oauth_issuer}/oauth/authorize"
+
+        authorize_final_url = self._bootstrap_oauth_session(
+            authorize_url,
+            authorize_params,
+            device_id=device_id,
+            user_agent=user_agent,
+            sec_ch_ua=sec_ch_ua,
+            impersonate=impersonate,
+        )
+        if not authorize_final_url:
+            if not self.last_error:
+                self._set_error("复用会话 bootstrap 失败")
+            return None
+
+        state = self._state_from_url(authorize_final_url)
+        referer = authorize_final_url if authorize_final_url.startswith(self.oauth_issuer) else authorize_url
+
+        for step in range(10):
+            self.last_state = state
+            self._log(f"复用会话状态步进[{step + 1}/10]: {describe_flow_state(state)}")
+
+            code = self._extract_code_from_state(state)
+            if code:
+                self._log(f"获取到 authorization code: {code[:20]}...")
+                self._log("步骤7: POST /oauth/token")
+                tokens = self._exchange_code_for_tokens(code, code_verifier, user_agent, impersonate)
+                if tokens:
+                    self._log("✅ OAuth 登录成功")
+                else:
+                    self._log("换取 tokens 失败")
+                return tokens
+
+            if self._state_supports_workspace_resolution(state):
+                code, next_state = self.resolve_codex_workspace(
+                    state,
+                    device_id,
+                    user_agent,
+                    impersonate,
+                    workspace_scope_preference=workspace_scope_preference,
+                )
+                if code:
+                    self._log(f"获取到 authorization code: {code[:20]}...")
+                    self._log("步骤7: POST /oauth/token")
+                    tokens = self._exchange_code_for_tokens(code, code_verifier, user_agent, impersonate)
+                    if tokens:
+                        self._log("✅ OAuth 登录成功")
+                    else:
+                        self._log("换取 tokens 失败")
+                    return tokens
+                if next_state:
+                    referer = state.current_url or referer
+                    state = next_state
+                    continue
+                if not self.last_error:
+                    self._set_error("复用会话 workspace/org 选择失败")
+                return None
+
+            if self._state_requires_navigation(state):
+                code, next_state = self._follow_flow_state(
+                    state,
+                    referer=referer,
+                    user_agent=user_agent,
+                    impersonate=impersonate,
+                )
+                if code:
+                    self._log(f"获取到 authorization code: {code[:20]}...")
+                    self._log("步骤7: POST /oauth/token")
+                    tokens = self._exchange_code_for_tokens(code, code_verifier, user_agent, impersonate)
+                    if tokens:
+                        self._log("✅ OAuth 登录成功")
+                    else:
+                        self._log("换取 tokens 失败")
+                    return tokens
+                if next_state:
+                    referer = state.current_url or referer
+                    state = next_state
+                    continue
+
+            if self._state_is_login_password(state) or self._state_is_email_otp(state) or self._state_is_about_you(state):
+                self._set_error(
+                    "复用已登录 auth 会话时仍回到了登录/OTP/about_you，无法直接解析目标 workspace"
+                )
+                return None
+
+            self._set_error(f"复用会话遇到未支持的 OAuth 状态: {describe_flow_state(state)}")
+            return None
+
+        self._set_error("复用已登录 auth 会话超出最大步数")
+        return None
+
     def _oauth_follow_for_code(
         self, start_url, referer, user_agent, impersonate, max_hops=16
     ):
@@ -1589,11 +1974,115 @@ class OAuthClient:
         )
         return code, (next_state.current_url or next_state.continue_url or start_url)
 
+    @staticmethod
+    def _normalize_workspace_scope_preference(value):
+        normalized = str(value or "").strip().lower().replace("-", "_")
+        if normalized in {"free", "personal", "default", "personal_free"}:
+            return "free"
+        if normalized in {"business", "team", "workspace", "org", "enterprise"}:
+            return "business"
+        return ""
+
+    def _classify_workspace_candidate(self, workspace):
+        if not isinstance(workspace, dict):
+            return ""
+
+        raw_values = []
+        for key in (
+            "kind",
+            "type",
+            "plan_type",
+            "workspace_type",
+            "subscription_plan",
+            "name",
+            "title",
+            "display_name",
+            "label",
+            "slug",
+        ):
+            value = workspace.get(key)
+            if value not in (None, ""):
+                raw_values.append(str(value).strip().lower())
+
+        if workspace.get("is_default") is True:
+            raw_values.append("is_default")
+
+        joined = " | ".join(raw_values)
+        if any(token in joined for token in ("team", "business", "enterprise")):
+            return "business"
+        if any(token in joined for token in ("free", "personal", "individual")):
+            return "free"
+        if workspace.get("is_default") is True:
+            return "free"
+        return ""
+
+    def _pick_workspace_candidate(self, workspaces, scope_preference):
+        preferred_scope = self._normalize_workspace_scope_preference(scope_preference)
+        items = list(workspaces or [])
+        if not items:
+            return None
+
+        if not preferred_scope:
+            return items[0]
+
+        classified = [(item, self._classify_workspace_candidate(item)) for item in items]
+
+        if preferred_scope == "free":
+            for item, scope in classified:
+                if scope == "free":
+                    return item
+            for item in items:
+                if isinstance(item, dict) and item.get("is_default") is True:
+                    return item
+            if len(items) >= 2:
+                return items[-1]
+            return items[0]
+
+        for item, scope in classified:
+            if scope == "business":
+                return item
+        if len(items) >= 2:
+            return items[0]
+        return items[0]
+
+    def resolve_codex_workspace(
+        self,
+        state: FlowState,
+        device_id,
+        user_agent,
+        impersonate,
+        workspace_scope_preference=None,
+    ):
+        """解析并提交 Codex workspace / org，返回 code 或下一状态。"""
+        self._log("步骤6: 解析 Codex workspace / org / code")
+        consent_entry = (
+            state.continue_url
+            or state.current_url
+            or f"{self.oauth_issuer}/sign-in-with-chatgpt/codex/consent"
+        )
+        if self._state_is_add_phone(state):
+            consent_entry = f"{self.oauth_issuer}/sign-in-with-chatgpt/codex/consent"
+            self._log("步骤6: 当前处于 add_phone，改用 canonical consent URL 继续")
+        return self._oauth_submit_workspace_and_org(
+            consent_entry,
+            device_id,
+            user_agent,
+            impersonate,
+            workspace_scope_preference=workspace_scope_preference,
+        )
+
     def _oauth_submit_workspace_and_org(
-        self, consent_url, device_id, user_agent, impersonate, max_retries=3
+        self,
+        consent_url,
+        device_id,
+        user_agent,
+        impersonate,
+        max_retries=3,
+        workspace_scope_preference=None,
     ):
         """提交 workspace 和 organization 选择（带重试）"""
         session_data = None
+        self._log(f"workspace 解析入口: {consent_url}")
 
         for attempt in range(max_retries):
             session_data = self._load_workspace_session_data(
@@ -1614,17 +2103,57 @@ class OAuthClient:
                 return None, None
 
         workspaces = session_data.get("workspaces", [])
+        self.last_workspace_candidates = list(workspaces or [])
         if not workspaces:
+            try:
+                session_keys = sorted((session_data or {}).keys())
+            except Exception:
+                session_keys = []
+            self._log(
+                "workspace session 数据为空: "
+                f"keys={session_keys}, session_id={str((session_data or {}).get('session_id') or '')[:24]}"
+            )
             self._set_error("session 中没有 workspace 信息")
             return None, None
 
-        workspace_id = (workspaces[0] or {}).get("id")
+        preferred_scope = self._normalize_workspace_scope_preference(workspace_scope_preference)
+        scope_log_prefix = "[business]" if preferred_scope == "business" else "[free]" if preferred_scope == "free" else ""
+        if scope_log_prefix:
+            self._log(f"{scope_log_prefix} 已读取 {len(workspaces)} 个 workspace")
+        selected_workspace = self._pick_workspace_candidate(workspaces, preferred_scope)
+        workspace_id = str((selected_workspace or {}).get("id") or "").strip()
         if not workspace_id:
             self._set_error("workspace_id 为空")
             return None, None
 
+        candidate_summaries = []
+        for item in workspaces:
+            if not isinstance(item, dict):
+                continue
+            candidate_summaries.append(
+                {
+                    "id": str(item.get("id") or "")[:8],
+                    "kind": str(item.get("kind") or item.get("type") or ""),
+                    "name": str(item.get("name") or item.get("title") or item.get("display_name") or ""),
+                    "is_default": bool(item.get("is_default")),
+                }
+            )
+        if candidate_summaries:
+            self._log(f"workspace 候选: {candidate_summaries}")
+
+        selected_scope = self._classify_workspace_candidate(selected_workspace)
         self.last_workspace_id = str(workspace_id).strip()
-        self._log(f"选择 workspace: {workspace_id}")
+        if preferred_scope:
+            self._log(
+                f"选择 workspace: {workspace_id} (target={preferred_scope}, actual={selected_scope or 'unknown'})"
+            )
+        else:
+            self._log(f"选择 workspace: {workspace_id}")
+        if scope_log_prefix:
+            if preferred_scope == "business":
+                self._log("[business] 已选择 organization workspace")
+            elif preferred_scope == "free":
+                self._log("[free] 已选择 free workspace")
 
         headers = self._headers(
             f"{self.oauth_issuer}/api/accounts/workspace/select",
@@ -1687,6 +2216,8 @@ class OAuthClient:
 
                         if org_id:
                             self._log(f"选择 organization: {org_id}")
+                            if scope_log_prefix == "[business]":
+                                self._log("[business] 已选择 organization")
 
                             org_body = {"org_id": org_id}
                             if project_id:
@@ -1786,10 +2317,20 @@ class OAuthClient:
         """优先从 cookie 解码 session，失败时回退到 consent HTML 中提取 workspace 数据。"""
         session_data = self._decode_oauth_session_cookie()
         if session_data and session_data.get("workspaces"):
+            self._log(
+                f"从 oai-client-auth-session cookie 读取到 {len(session_data.get('workspaces', []))} 个 workspace"
+            )
             return session_data
+        if session_data:
+            self._log(
+                "oai-client-auth-session 已存在，但其中没有 workspaces 字段"
+            )
+        else:
+            self._log("当前未从 cookie 解出 oai-client-auth-session workspace 数据")
 
         html = self._fetch_consent_page_html(consent_url, user_agent, impersonate)
         if not html:
+            self._log("consent HTML 为空，无法从页面提取 workspace 数据")
             return session_data
 
         parsed = self._extract_session_data_from_consent_html(html)
@@ -1799,6 +2340,7 @@ class OAuthClient:
             )
             return parsed
 
+        self._log("consent HTML 中也未提取到 workspace 数据")
         return session_data
 
     def _fetch_consent_page_html(self, consent_url, user_agent, impersonate):
@@ -1816,12 +2358,20 @@ class OAuthClient:
                 kwargs["impersonate"] = impersonate
             self._browser_pause(0.12, 0.3)
             r = self.session.get(consent_url, **kwargs)
-            if r.status_code == 200 and "text/html" in (
-                r.headers.get("content-type", "").lower()
-            ):
+            location = normalize_flow_url(
+                r.headers.get("Location", ""), auth_base=self.oauth_issuer
+            )
+            content_type = (r.headers.get("content-type", "") or "").lower()
+            self._log(
+                f"consent 页面请求 -> {r.status_code}, url={str(r.url)[:120]}, "
+                f"location={location[:120] if location else ''}, content-type={content_type[:80]}"
+            )
+            if r.status_code in (301, 302, 303, 307, 308) and location:
+                self._log(f"consent 页面发生重定向 -> {location}")
+            if r.status_code == 200 and "text/html" in content_type:
                 return r.text
-        except Exception:
-            pass
+        except Exception as e:
+            self._log(f"获取 consent HTML 异常: {e}")
         return ""
 
     def _extract_session_data_from_consent_html(self, html):
@@ -2277,9 +2827,11 @@ class OAuthClient:
         impersonate,
         skymail_client,
         state,
+        scope_log_prefix="",
     ):
         """处理 OAuth 阶段的邮箱 OTP 验证，返回服务端声明的下一步状态。"""
         self._log("步骤4: 检测到邮箱 OTP 验证")
+        scope_log_prefix = str(scope_log_prefix or "").strip()
 
         def _resend_email_otp() -> bool:
             prefer_passwordless = bool(
@@ -2361,6 +2913,13 @@ class OAuthClient:
             or f"{self.oauth_issuer}/email-verification",
             headless=self.browser_mode != "headed",
             device_id=device_id,
+            user_agent=user_agent,
+            sec_ch_ua=sec_ch_ua,
+            accept_language=(self.browser_fingerprint.accept_language if self.browser_fingerprint else None),
+            chrome_full_version=(self.browser_fingerprint.chrome_full_version if self.browser_fingerprint else None),
+            platform_version=(self.browser_fingerprint.platform_version if self.browser_fingerprint else None),
+            viewport_width=(self.browser_fingerprint.viewport_width if self.browser_fingerprint else None),
+            viewport_height=(self.browser_fingerprint.viewport_height if self.browser_fingerprint else None),
             log_fn=lambda msg: self._log(f"email_otp_validate: {msg}"),
         )
         if sentinel_otp:
@@ -2401,6 +2960,7 @@ class OAuthClient:
             skymail_client._used_codes = set()
 
         tried_codes = set(getattr(skymail_client, "_used_codes", set()))
+        tried_message_ids = set()
         try:
             otp_wait_seconds = int(
                 self.config.get(
@@ -2425,14 +2985,16 @@ class OAuthClient:
             otp_resend_wait_seconds = 120
         otp_resend_wait_seconds = max(30, min(otp_resend_wait_seconds, 900))
         otp_deadline = time.time() + otp_wait_seconds
-        otp_sent_at = time.time()
-        next_resend_at = otp_sent_at + otp_resend_wait_seconds
+        otp_sent_at = time.time() - 15
+        next_resend_at = time.time() + otp_resend_wait_seconds
         self._log(
-            f"OAuth OTP 等待窗口: total={otp_wait_seconds}s, poll_window={otp_poll_window}s"
+            f"OAuth OTP 等待窗口: total={otp_wait_seconds}s, poll_window={otp_poll_window}s, initial_grace=15s"
         )
 
-        def validate_otp(code):
+        def validate_otp(code, *, message_id=""):
             tried_codes.add(code)
+            if message_id:
+                tried_message_ids.add(str(message_id).strip())
             self._log(f"尝试 OTP: {code}")
 
             try:
@@ -2468,6 +3030,8 @@ class OAuthClient:
                 or (state.current_url or state.continue_url or request_url),
             )
             self._log(f"OTP 验证通过 {describe_flow_state(next_state)}")
+            if scope_log_prefix:
+                self._log(f"{scope_log_prefix} OTP 验证通过")
             skymail_client._used_codes.add(code)
             return next_state
 
@@ -2482,7 +3046,21 @@ class OAuthClient:
                         timeout=wait_time,
                         otp_sent_at=otp_sent_at,
                         exclude_codes=tried_codes,
+                        phase="oauth_email_otp",
+                        phase_label="OAuth 登录邮箱验证码",
                     )
+                    verification_meta = {}
+                    getter = getattr(skymail_client, "get_last_verification_result", None)
+                    if callable(getter):
+                        try:
+                            verification_meta = getter("oauth_email_otp") or {}
+                        except Exception:
+                            verification_meta = {}
+                    current_message_id = str(
+                        verification_meta.get("message_id")
+                        or verification_meta.get("id")
+                        or ""
+                    ).strip()
                 except TaskInterruption:
                     self._set_error("任务已手动停止")
                     return None
@@ -2492,6 +3070,7 @@ class OAuthClient:
                         return None
                     self._log(f"等待 OTP 异常: {e}")
                     code = None
+                    current_message_id = ""
 
                 if not code:
                     if time.time() >= next_resend_at and not self.last_error:
@@ -2499,8 +3078,8 @@ class OAuthClient:
                             f"暂未收到 OTP，触发重发（间隔 {otp_resend_wait_seconds}s）"
                         )
                         if _resend_email_otp():
-                            otp_sent_at = time.time()
-                            next_resend_at = otp_sent_at + otp_resend_wait_seconds
+                            otp_sent_at = time.time() - 5
+                            next_resend_at = time.time() + otp_resend_wait_seconds
                         else:
                             next_resend_at = time.time() + otp_resend_wait_seconds
                     self._log("暂未收到新的 OTP，继续等待...")
@@ -2508,11 +3087,11 @@ class OAuthClient:
                         break
                     continue
 
-                if code in tried_codes:
+                if code in tried_codes and (not current_message_id or current_message_id in tried_message_ids):
                     self._log(f"跳过已尝试验证码: {code}")
                     continue
 
-                next_state = validate_otp(code)
+                next_state = validate_otp(code, message_id=current_message_id)
                 if next_state:
                     return next_state
                 if self.last_error:

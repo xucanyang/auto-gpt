@@ -10,6 +10,7 @@ from core.base_platform import RegisterConfig
 from core.config_store import config_store
 from services.chatgpt_account_state import apply_chatgpt_status_policy
 from services.chatgpt_sync import update_account_model_cliproxy_sync
+from services.sub2api_sync import backfill_chatgpt_account_to_sub2api, probe_chatgpt_sub2api_status, update_account_model_sub2api_sync
 
 router = APIRouter(prefix="/actions", tags=["actions"])
 
@@ -86,6 +87,15 @@ def _apply_action_result(
             session=session,
             commit=False,
         )
+    if platform == "chatgpt" and action_id == "sync_sub2api_status":
+        data = result.get("data") if isinstance(result.get("data"), dict) else {}
+        sync_result = data.get("sync") if isinstance(data.get("sync"), dict) else {}
+        update_account_model_sub2api_sync(
+            acc_model,
+            sync_result,
+            session=session,
+            commit=False,
+        )
     if result.get("ok") and result.get("data", {}) and isinstance(result["data"], dict):
         data = result["data"]
         tracked_keys = {"access_token", "accessToken", "refreshToken", "clientId", "clientSecret", "webAccessToken"}
@@ -111,6 +121,19 @@ def _execute_platform_action(
     params: dict,
     session: Session,
 ) -> dict[str, Any]:
+    if platform == "chatgpt" and action_id == "upload_sub2api":
+        outcome = backfill_chatgpt_account_to_sub2api(acc_model, session=session, commit=False)
+        result = {
+            "ok": bool(outcome.get("ok")),
+            "data": {
+                "message": str(outcome.get("message") or ""),
+                "results": outcome.get("results") or [],
+            },
+            "error": "" if outcome.get("ok") else str(outcome.get("message") or ""),
+        }
+        _apply_action_result(platform, action_id, acc_model, result, session)
+        return result
+
     account = _to_platform_account(acc_model)
     result = instance.execute_action(action_id, account, params)
     _apply_action_result(platform, action_id, acc_model, result, session)
@@ -225,6 +248,42 @@ def _execute_batch_cliproxy_sync(accounts: list[AccountModel], session: Session)
     }
 
 
+def _execute_batch_sub2api_sync(accounts: list[AccountModel], session: Session) -> dict[str, Any]:
+    items = []
+    success_count = 0
+    failed_count = 0
+
+    for acc_model in accounts:
+        sync_result = probe_chatgpt_sub2api_status(acc_model)
+        update_account_model_sub2api_sync(acc_model, sync_result, session=session, commit=False)
+        remote_state = str(sync_result.get("remote_state") or "").strip().lower()
+        ok = remote_state in {"exists", "not_found"}
+        if ok:
+            success_count += 1
+        else:
+            failed_count += 1
+        summary = (
+            f"远端状态={sync_result.get('status') or remote_state or 'unknown'}, "
+            f"探测={remote_state or 'not_checked'}"
+        )
+        items.append(
+            {
+                "id": acc_model.id,
+                "email": acc_model.email,
+                "ok": ok,
+                "message": f"Sub2API 状态同步完成：{summary}",
+                "status": acc_model.status,
+            }
+        )
+
+    return {
+        "total": len(items),
+        "success": success_count,
+        "failed": failed_count,
+        "items": items,
+    }
+
+
 @router.get("/{platform}")
 def list_actions(platform: str):
     """获取平台支持的操作列表"""
@@ -247,8 +306,11 @@ def execute_batch_action(
     if not accounts and not missing_ids:
         return {"total": 0, "success": 0, "failed": 0, "items": []}
 
-    if platform == "chatgpt" and action_id == "sync_cliproxyapi_status":
-        batch_result = _execute_batch_cliproxy_sync(accounts, session)
+    if platform == "chatgpt" and action_id in {"sync_cliproxyapi_status", "sync_sub2api_status"}:
+        if action_id == "sync_cliproxyapi_status":
+            batch_result = _execute_batch_cliproxy_sync(accounts, session)
+        else:
+            batch_result = _execute_batch_sub2api_sync(accounts, session)
         if missing_ids:
             for missing_id in missing_ids:
                 batch_result["failed"] += 1
