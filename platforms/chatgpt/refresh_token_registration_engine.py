@@ -1224,6 +1224,19 @@ class RefreshTokenRegistrationEngine:
             self._log(result.error_message, "warning")
             return False
 
+        # 如果 free 抓取失败但 business 成功，且用户选择了 free，则用 business artifact 复制一份 free 版本，
+        # 确保 free workspace 也能落库并自动上传（很多账号 business/free 是同一账号不同 plan）。
+        if "free" in selected_scopes and "free" not in available_artifacts and "business" in available_artifacts:
+            business_artifact = available_artifacts["business"]
+            free_artifact = dict(business_artifact)
+            free_artifact["scope"] = "free"
+            free_artifact["label"] = "free"
+            free_artifact["variant_key"] = f"free:{free_artifact.get('workspace_id') or free_artifact.get('account_id') or 'unknown'}"
+            free_artifact["source"] = free_artifact.get("source", "") + "_free_fallback"
+            available_artifacts["free"] = free_artifact
+            self._log("[free] 抓取失败，使用 business artifact 作为 free 回退版本，确保自动上传")
+            optional_failures = [s for s in optional_failures if s != "free"]
+
         ordered_artifacts = [available_artifacts[scope] for scope in selected_scopes if scope in available_artifacts]
         if not ordered_artifacts and available_artifacts:
             ordered_artifacts = list(available_artifacts.values())

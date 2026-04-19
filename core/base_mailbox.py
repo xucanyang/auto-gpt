@@ -429,8 +429,22 @@ class ManualEmailOtpMailbox(BaseMailbox):
             email=email,
             timeout_seconds=timeout_seconds,
         )
+        normalized_code = str(code or "").strip()
+        # 手动模式没有真实邮件 ID；为每次人工提交生成稳定的提交标识，
+        # 避免“连续两次收到同一个 OTP”时被上层误判成旧验证码而直接跳过。
+        self._record_verification_result(
+            message_id=f"manual:{phase}:{time.time_ns()}",
+            code=normalized_code,
+            phase=phase,
+            provider="manual_email_otp",
+            metadata={
+                "email": email,
+                "phase_label": phase_label,
+                "submission_source": "manual_input",
+            },
+        )
         self._log(f"已收到人工验证码：{phase_label}")
-        return code
+        return normalized_code
 
 
 def create_mailbox(

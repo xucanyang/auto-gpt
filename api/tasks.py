@@ -518,6 +518,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                                 merged_extra.get("luckmail_base_url"),
                             )
                 additional_accounts_payload = []
+                saved_linked_accounts = []
                 if isinstance(account.extra, dict):
                     payload = account.extra.pop("_linked_accounts_to_save", None)
                     if isinstance(payload, list):
@@ -575,7 +576,9 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                                 status=AccountStatus(str(extra_account_payload.get("status") or "registered")),
                                 extra=dict(extra_account_payload.get("extra") or {}),
                             )
-                            save_account(linked_account)
+                            saved_linked = save_account(linked_account)
+                            if saved_linked is not None:
+                                saved_linked_accounts.append(saved_linked)
                             if isinstance(linked_account.extra, dict):
                                 scope_label = str(linked_account.extra.get("chatgpt_workspace_label") or "").strip()
                                 if scope_label:
@@ -602,6 +605,8 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                     return AttemptResult.success()
                 _log(task_id, f"[OK] 注册成功: {account.email}")
                 _auto_upload_integrations(task_id, saved_account or account)
+                for linked_saved_account in saved_linked_accounts:
+                    _auto_upload_integrations(task_id, linked_saved_account)
                 cashier_url = (account.extra or {}).get("cashier_url", "")
                 if cashier_url:
                     _log(task_id, f"  [升级链接] {cashier_url}")
