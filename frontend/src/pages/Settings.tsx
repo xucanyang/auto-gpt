@@ -356,6 +356,18 @@ const TAB_ITEMS = [
       {
         title: '外部订阅链接 API',
         desc: '允许外部支付程序领取已缓存的订阅链接，并在支付后写回账号状态',
+        help: {
+          title: '接口使用方法',
+          lines: [
+            '请求头统一使用 Authorization: Bearer <访问 Token>。',
+            '领取订阅链接: POST /api/external/subscription-links/claim，body 示例 {"consumer":"payment-worker-01","limit":10,"lease_seconds":900}。',
+            '查询领取状态: GET /api/external/subscription-links/{claim_id}。',
+            '支付成功写回: POST /api/external/subscription-links/{claim_id}/result，body 示例 {"status":"paid","external_payment_id":"pay_123","message":"payment completed"}。',
+            '支付失败写回: POST /api/external/subscription-links/{claim_id}/result，body 示例 {"status":"failed","external_payment_id":"pay_123","error_code":"declined","message":"payment failed"}。',
+            '放弃本次领取: POST /api/external/subscription-links/{claim_id}/release，body 示例 {"reason":"checkout unavailable"}。',
+            '接口只返回 account_id、email、payment_link、plan、country、currency、claim_id 等支付所需字段，不返回密码或 token。',
+          ],
+        },
         fields: [
           { key: 'external_subscription_api_enabled', label: '启用外部 API', type: 'boolean' },
           { key: 'external_subscription_api_token', label: '访问 Token', secret: true, placeholder: '外部程序使用 Authorization: Bearer <token>' },
@@ -430,6 +442,10 @@ interface FieldConfig {
 interface SectionConfig {
   title: string
   desc?: string
+  help?: {
+    title: string
+    lines: string[]
+  }
   fields: FieldConfig[]
 }
 
@@ -678,6 +694,7 @@ function ConfigField({ field }: { field: FieldConfig }) {
 
 function ConfigSection({ section, defaultCollapsed = false }: { section: SectionConfig; defaultCollapsed?: boolean }) {
   const [collapsed, setCollapsed] = useState(defaultCollapsed)
+  const [helpCollapsed, setHelpCollapsed] = useState(true)
 
   return (
     <Card
@@ -694,9 +711,40 @@ function ConfigSection({ section, defaultCollapsed = false }: { section: Section
       )}
       style={{ marginBottom: 16 }}
     >
-      {collapsed ? null : section.fields.map((field) => (
-        <ConfigField key={field.key} field={field} />
-      ))}
+      {collapsed ? null : (
+        <>
+          {section.help ? (
+            <div
+              style={{
+                border: '1px solid #d9e2ef',
+                borderRadius: 8,
+                background: '#f8fbff',
+                marginBottom: 16,
+                padding: '10px 12px',
+              }}
+            >
+              <Button
+                size="small"
+                type="link"
+                style={{ padding: 0, height: 'auto', fontWeight: 600 }}
+                onClick={() => setHelpCollapsed((value) => !value)}
+              >
+                {helpCollapsed ? `展开${section.help.title}` : `收起${section.help.title}`}
+              </Button>
+              {helpCollapsed ? null : (
+                <div style={{ marginTop: 10, color: '#42526e', fontSize: 13, lineHeight: 1.8 }}>
+                  {section.help.lines.map((line) => (
+                    <div key={line}>{line}</div>
+                  ))}
+                </div>
+              )}
+            </div>
+          ) : null}
+          {section.fields.map((field) => (
+            <ConfigField key={field.key} field={field} />
+          ))}
+        </>
+      )}
     </Card>
   )
 }
