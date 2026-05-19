@@ -354,6 +354,14 @@ const TAB_ITEMS = [
         ],
       },
       {
+        title: '外部订阅链接 API',
+        desc: '允许外部支付程序领取已缓存的订阅链接，并在支付后写回账号状态',
+        fields: [
+          { key: 'external_subscription_api_enabled', label: '启用外部 API', type: 'boolean' },
+          { key: 'external_subscription_api_token', label: '访问 Token', secret: true, placeholder: '外部程序使用 Authorization: Bearer <token>' },
+        ],
+      },
+      {
         title: 'CodexProxy',
         desc: '注册完成后自动上传到 CodexProxy 管理平台',
         fields: [
@@ -2379,6 +2387,7 @@ export default function Settings() {
       data.chatgpt_access_token_only_zero_amount_stop_enabled = parseBooleanConfigValue(
         data.chatgpt_access_token_only_zero_amount_stop_enabled,
       )
+      data.external_subscription_api_enabled = parseBooleanConfigValue(data.external_subscription_api_enabled)
       form.setFieldsValue(data)
     })
   }, [form])
@@ -2437,6 +2446,8 @@ export default function Settings() {
       values.chatgpt_access_token_only_zero_amount_stop_enabled = parseBooleanConfigValue(
         values.chatgpt_access_token_only_zero_amount_stop_enabled,
       )
+      values.external_subscription_api_enabled = parseBooleanConfigValue(values.external_subscription_api_enabled)
+      values.external_subscription_api_token = String(values.external_subscription_api_token || '').trim()
       values.chatgpt_access_token_only_zero_amount_stop_threshold = String(
         values.chatgpt_access_token_only_zero_amount_stop_threshold || '1',
       ).trim() || '1'
@@ -2470,6 +2481,8 @@ export default function Settings() {
         chatgpt_access_token_only_checkout_currency: values.chatgpt_access_token_only_checkout_currency,
         chatgpt_access_token_only_zero_amount_stop_enabled: values.chatgpt_access_token_only_zero_amount_stop_enabled,
         chatgpt_access_token_only_zero_amount_stop_threshold: values.chatgpt_access_token_only_zero_amount_stop_threshold,
+        external_subscription_api_enabled: values.external_subscription_api_enabled,
+        external_subscription_api_token: values.external_subscription_api_token,
       })
       message.success('保存成功')
       setSaved(true)

@@ -111,6 +111,8 @@ CONFIG_KEYS = [
     "chatgpt_access_token_only_checkout_currency",
     "chatgpt_access_token_only_zero_amount_stop_enabled",
     "chatgpt_access_token_only_zero_amount_stop_threshold",
+    "external_subscription_api_enabled",
+    "external_subscription_api_token",
     "chatgpt_gopay_billing_llm_enabled",
     "chatgpt_gopay_billing_llm_base_url",
     "chatgpt_gopay_billing_llm_api_key",
@@ -195,6 +197,8 @@ def get_config():
         all_cfg["chatgpt_access_token_only_checkout_currency"] = "USD"
     if not all_cfg.get("chatgpt_access_token_only_zero_amount_stop_threshold"):
         all_cfg["chatgpt_access_token_only_zero_amount_stop_threshold"] = "1"
+    if not all_cfg.get("external_subscription_api_enabled"):
+        all_cfg["external_subscription_api_enabled"] = "false"
     if not all_cfg.get("chatgpt_gopay_billing_llm_base_url"):
         all_cfg["chatgpt_gopay_billing_llm_base_url"] = "https://api.666800.xyz"
     if not all_cfg.get("chatgpt_gopay_billing_llm_model"):

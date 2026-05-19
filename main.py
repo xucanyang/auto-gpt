@@ -21,6 +21,7 @@ from api.contribution import router as contribution_router
 from api.team_lite import router as team_lite_router
 from api.icloud_hme import router as icloud_hme_router
 from api.pipeline import router as pipeline_router
+from api.external_subscription import router as external_subscription_router
 from services.chatgpt_core import ChatGPTPlatform
 from services.pipeline import pipeline_engine
 
@@ -107,6 +108,8 @@ async def auth_middleware(request: Request, call_next):
     path = request.url.path
     if path in PUBLIC_API_PATHS:
         return await call_next(request)
+    if path.startswith("/api/external/subscription-links"):
+        return await call_next(request)
     if path.startswith("/api/auth/") or not path.startswith("/api/"):
         return await call_next(request)
     from core.config_store import config_store as _cs
@@ -148,6 +151,7 @@ app.include_router(contribution_router, prefix="/api")
 app.include_router(team_lite_router, prefix="/api")
 app.include_router(icloud_hme_router, prefix="/api")
 app.include_router(pipeline_router, prefix="/api")
+app.include_router(external_subscription_router, prefix="/api")
 
 
 @app.get("/api/solver/status")
