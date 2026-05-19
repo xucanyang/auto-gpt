@@ -3,7 +3,7 @@ from unittest import mock
 
 from core.base_mailbox import MailboxAccount
 from core.base_platform import RegisterConfig
-from platforms.chatgpt.plugin import ChatGPTPlatform
+from services.chatgpt_core.plugin import ChatGPTPlatform
 
 
 class _BlankMailbox:
@@ -32,6 +32,24 @@ class _TrackingMailbox:
         return "123456"
 
 
+class _ReuseThenCreateFailMailbox:
+    def __init__(self):
+        self.account = MailboxAccount(email="alive@example.com", account_id="alive-1")
+        self.get_email_calls = 0
+
+    def get_email(self):
+        self.get_email_calls += 1
+        if self.get_email_calls == 1:
+            return self.account
+        raise RuntimeError("mailbox create failed")
+
+    def get_current_ids(self, account):
+        return {"mid-old"} if account and account.email else set()
+
+    def wait_for_code(self, *args, **kwargs):
+        return "123456"
+
+
 class _FakeAdapter:
     def run(self, context):
         context.email_service.create_email()
@@ -57,6 +75,21 @@ class _VerificationAdapter:
         return {"success": True, "password": fallback_password}
 
 
+class _RetryCreateAdapter:
+    def run(self, context):
+        first = context.email_service.create_email()
+        second = context.email_service.create_email()
+        return mock.Mock(success=True, first=first, second=second)
+
+    def build_account(self, result, fallback_password):
+        return {
+            "success": True,
+            "password": fallback_password,
+            "first": getattr(result, "first", {}),
+            "second": getattr(result, "second", {}),
+        }
+
+
 class ChatGPTPluginTests(unittest.TestCase):
     def test_custom_provider_rejects_blank_email(self):
         platform = ChatGPTPlatform(
@@ -65,7 +98,7 @@ class ChatGPTPluginTests(unittest.TestCase):
         )
 
         with mock.patch(
-            "platforms.chatgpt.plugin.build_chatgpt_registration_mode_adapter",
+            "services.chatgpt_core.plugin.build_chatgpt_registration_mode_adapter",
             return_value=_FakeAdapter(),
         ):
             with self.assertRaises(RuntimeError) as ctx:
@@ -82,7 +115,7 @@ class ChatGPTPluginTests(unittest.TestCase):
         adapter = _VerificationAdapter()
 
         with mock.patch(
-            "platforms.chatgpt.plugin.build_chatgpt_registration_mode_adapter",
+            "services.chatgpt_core.plugin.build_chatgpt_registration_mode_adapter",
             return_value=adapter,
         ):
             result = platform.register()
@@ -111,13 +144,79 @@ class ChatGPTPluginTests(unittest.TestCase):
         adapter = _VerificationAdapter()
 
         with mock.patch(
-            "platforms.chatgpt.plugin.build_chatgpt_registration_mode_adapter",
+            "services.chatgpt_core.plugin.build_chatgpt_registration_mode_adapter",
             return_value=adapter,
         ):
             platform.register()
 
         _, kwargs = mailbox.wait_call
         self.assertEqual(kwargs.get("timeout"), 90)
+
+    def test_resume_subscription_auth_action_is_exposed(self):
+        platform = ChatGPTPlatform(config=RegisterConfig(extra={}))
+
+        actions = platform.get_platform_actions()
+
+        self.assertIn("resume_subscription_auth", {action["id"] for action in actions})
+
+    def test_probe_local_status_uses_direct_connection(self):
+        account = mock.Mock(
+            email="demo@example.com",
+            token="at-demo",
+            user_id="acct-123",
+            extra={"access_token": "at-demo"},
+        )
+        platform = ChatGPTPlatform(config=RegisterConfig(proxy="http://proxy.example:8080", extra={}))
+
+        with mock.patch(
+            "services.chatgpt_core.plugin.resolve_runtime_proxy",
+            return_value="http://proxy.example:8080",
+        ) as resolve_proxy, mock.patch(
+            "services.chatgpt_core.status_probe.probe_local_chatgpt_status",
+            return_value={
+                "auth": {"state": "access_token_valid"},
+                "subscription": {"plan": "unknown"},
+                "codex": {"state": "not_checked"},
+            },
+        ) as probe:
+            result = platform.execute_action("probe_local_status", account, {})
+
+        self.assertTrue(result["ok"])
+        resolve_proxy.assert_not_called()
+        probe.assert_called_once()
+        self.assertEqual(probe.call_args.kwargs.get("proxy"), "")
+
+    def test_custom_provider_reuses_existing_mailbox_on_second_create_call(self):
+        mailbox = _ReuseThenCreateFailMailbox()
+        platform = ChatGPTPlatform(
+            config=RegisterConfig(extra={"chatgpt_registration_mode": "refresh_token"}),
+            mailbox=mailbox,
+        )
+
+        with mock.patch(
+            "services.chatgpt_core.plugin.build_chatgpt_registration_mode_adapter",
+            return_value=_RetryCreateAdapter(),
+        ):
+            result = platform.register()
+
+        self.assertEqual(result.get("first", {}).get("mailbox_action"), "created")
+        self.assertEqual(result.get("second", {}).get("mailbox_action"), "reused_existing")
+        self.assertEqual(mailbox.get_email_calls, 1)
+
+    def test_custom_provider_fallback_reuses_alive_mailbox_after_create_error(self):
+        mailbox = _ReuseThenCreateFailMailbox()
+        platform = ChatGPTPlatform(
+            config=RegisterConfig(extra={"chatgpt_registration_mode": "refresh_token"}),
+            mailbox=mailbox,
+        )
+
+        with mock.patch(
+            "services.chatgpt_core.plugin.build_chatgpt_registration_mode_adapter",
+            return_value=_VerificationAdapter(),
+        ):
+            platform.register()
+
+        self.assertEqual(mailbox.get_email_calls, 1)
 
 
 if __name__ == "__main__":

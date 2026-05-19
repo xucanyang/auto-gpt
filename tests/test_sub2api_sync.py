@@ -48,11 +48,13 @@ class Sub2ApiSyncTests(unittest.TestCase):
         )
         account.set_extra(
             {
-                "access_token": "",
-                "refresh_token": "",
+                "access_token": "at-demo",
+                "refresh_token": "rt-demo",
                 "id_token": "",
+                "workspace_id": "ws-demo",
             }
         )
+        account.user_id = "acct-demo"
         return account
 
     def test_probe_reports_existing_remote_account_by_email(self):
@@ -208,25 +210,16 @@ class Sub2ApiSyncTests(unittest.TestCase):
         probe_mock.assert_called_once()
         upload_mock.assert_not_called()
 
-    def test_backfill_uploads_and_verifies_when_remote_missing(self):
+    def test_backfill_uploads_and_accepts_api_success_when_remote_missing(self):
         account = self._make_account()
 
         with mock.patch(
             "services.sub2api_sync.probe_chatgpt_sub2api_status",
-            side_effect=[
-                {
-                    "remote_state": "not_found",
-                    "uploaded": False,
-                    "message": "远端未发现",
-                },
-                {
-                    "remote_state": "exists",
-                    "uploaded": True,
-                    "remote_account_id": 654,
-                    "matched_by": "email",
-                    "message": "远端已存在",
-                },
-            ],
+            return_value={
+                "remote_state": "not_found",
+                "uploaded": False,
+                "message": "远端未发现",
+            },
         ) as probe_mock:
             with mock.patch(
                 "services.sub2api_sync.probe_local_chatgpt_status",
@@ -245,8 +238,8 @@ class Sub2ApiSyncTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertTrue(result["uploaded"])
         self.assertFalse(result["skipped"])
-        self.assertIn("补传完成", result["message"])
-        self.assertEqual(probe_mock.call_count, 2)
+        self.assertEqual(result["message"], "上传成功")
+        self.assertEqual(probe_mock.call_count, 1)
         upload_mock.assert_called_once()
 
     def test_backfill_uploads_when_only_other_workspace_matches(self):
@@ -254,23 +247,14 @@ class Sub2ApiSyncTests(unittest.TestCase):
 
         with mock.patch(
             "services.sub2api_sync.probe_chatgpt_sub2api_status",
-            side_effect=[
-                {
-                    "remote_state": "cross_workspace_only",
-                    "uploaded": False,
-                    "matched_by": "email, chatgpt_user_id",
-                    "message": "仅命中同邮箱/同用户的其他 workspace，可为当前 workspace 补传",
-                    "candidate_count": 1,
-                    "candidates": [{"id": 777}],
-                },
-                {
-                    "remote_state": "exists",
-                    "uploaded": True,
-                    "remote_account_id": 778,
-                    "matched_by": "email, organization_account, chatgpt_user_id",
-                    "message": "远端已存在",
-                },
-            ],
+            return_value={
+                "remote_state": "cross_workspace_only",
+                "uploaded": False,
+                "matched_by": "email, chatgpt_user_id",
+                "message": "仅命中同邮箱/同用户的其他 workspace，可为当前 workspace 补传",
+                "candidate_count": 1,
+                "candidates": [{"id": 777}],
+            },
         ) as probe_mock:
             with mock.patch(
                 "services.sub2api_sync.probe_local_chatgpt_status",
@@ -289,7 +273,7 @@ class Sub2ApiSyncTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertTrue(result["uploaded"])
         self.assertFalse(result["skipped"])
-        self.assertEqual(probe_mock.call_count, 2)
+        self.assertEqual(probe_mock.call_count, 1)
         upload_mock.assert_called_once()
 
     def test_backfill_uploads_when_exact_remote_rows_were_soft_deleted(self):
@@ -297,23 +281,14 @@ class Sub2ApiSyncTests(unittest.TestCase):
 
         with mock.patch(
             "services.sub2api_sync.probe_chatgpt_sub2api_status",
-            side_effect=[
-                {
-                    "remote_state": "deleted_exact_match",
-                    "uploaded": False,
-                    "matched_by": "organization_account, email, chatgpt_user_id",
-                    "message": "远端存在 2 条已删除的精确 Sub2API 记录，可重新补传",
-                    "candidate_count": 2,
-                    "candidates": [{"id": 777}, {"id": 778}],
-                },
-                {
-                    "remote_state": "exists",
-                    "uploaded": True,
-                    "remote_account_id": 779,
-                    "matched_by": "organization_account, email, chatgpt_user_id",
-                    "message": "远端已存在",
-                },
-            ],
+            return_value={
+                "remote_state": "deleted_exact_match",
+                "uploaded": False,
+                "matched_by": "organization_account, email, chatgpt_user_id",
+                "message": "远端存在 2 条已删除的精确 Sub2API 记录，可重新补传",
+                "candidate_count": 2,
+                "candidates": [{"id": 777}, {"id": 778}],
+            },
         ) as probe_mock:
             with mock.patch(
                 "services.sub2api_sync.probe_local_chatgpt_status",
@@ -332,7 +307,7 @@ class Sub2ApiSyncTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertTrue(result["uploaded"])
         self.assertFalse(result["skipped"])
-        self.assertEqual(probe_mock.call_count, 2)
+        self.assertEqual(probe_mock.call_count, 1)
         upload_mock.assert_called_once()
 
     def test_backfill_reprobes_when_cached_state_is_not_found(self):
@@ -403,7 +378,7 @@ class Sub2ApiSyncTests(unittest.TestCase):
         state = extra["sync_statuses"]["sub2api"]
         self.assertEqual(state["remote_state"], "deleted_exact_match")
         self.assertIn("当前无法补传", state["message"])
-        self.assertIn("token invalidated", state["message"])
+        self.assertIn("认证已失效", state["message"])
 
     def test_backfill_reprobes_when_cached_state_is_ambiguous(self):
         account = self._make_account()

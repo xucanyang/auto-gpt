@@ -1,12 +1,12 @@
 import unittest
 from datetime import datetime
 
-from platforms.chatgpt.constants import (
+from services.chatgpt_core.constants import (
     MAX_REGISTRATION_AGE,
     MIN_REGISTRATION_AGE,
     generate_random_user_info,
 )
-from platforms.chatgpt.utils import generate_random_birthday
+from services.chatgpt_core.utils import generate_random_birthday
 
 
 class ChatGPTBirthdateRangeTests(unittest.TestCase):

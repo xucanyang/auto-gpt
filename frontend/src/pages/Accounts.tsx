@@ -1,38 +1,42 @@
-import { useEffect, useState, useCallback, useRef } from 'react'
-import { useParams } from 'react-router-dom'
+import { lazy, Suspense, useEffect, useState, useCallback, useRef } from 'react'
+import type { CSSProperties } from 'react'
 import {
-  Table,
   Button,
-  Checkbox,
+  Dropdown,
   Input,
-  InputNumber,
-  Select,
   Tag,
   Space,
   Modal,
   Form,
   message,
-  Popconfirm,
-  Dropdown,
   Typography,
   Alert,
+  Popconfirm,
   theme,
+  Steps,
 } from 'antd'
 import type { MenuProps } from 'antd'
 import {
-  ReloadOutlined,
   CopyOutlined,
   LinkOutlined,
-  PlusOutlined,
-  DownloadOutlined,
-  UploadOutlined,
   MoreOutlined,
-  DeleteOutlined,
+  UploadOutlined,
   SyncOutlined,
 } from '@ant-design/icons'
-import { ChatGPTRegistrationModeSwitch } from '@/components/ChatGPTRegistrationModeSwitch'
 import { TaskLogPanel } from '@/components/TaskLogPanel'
-import { TaskVerificationPanel } from '@/components/TaskVerificationPanel'
+import { AddAccountModal } from '@/features/accounts/components/AddAccountModal'
+import { AccountsTable } from '@/features/accounts/components/AccountsTable'
+import { AccountDetailModal } from '@/features/accounts/components/AccountDetailModal'
+import { AccountsToolbar } from '@/features/accounts/components/AccountsToolbar'
+import { BatchGopayWorkbench } from '@/features/accounts/components/BatchGopayWorkbench'
+import { ImportAccountsModal } from '@/features/accounts/components/ImportAccountsModal'
+import { PendingInvitesModal } from '@/features/accounts/components/PendingInvitesModal'
+import { Sub2ApiOverviewPanel } from '@/features/accounts/components/Sub2ApiOverviewPanel'
+import { useAccountDetailQuery } from '@/features/accounts/hooks/useAccountDetailQuery'
+import { useActiveTasksQuery } from '@/features/accounts/hooks/useActiveTasksQuery'
+import { RegisterTaskModal } from '@/features/auth/components/RegisterTaskModal'
+import { useAccountsQuery } from '@/features/accounts/hooks/useAccountsQuery'
+import { usePendingInvitesQuery } from '@/features/accounts/hooks/usePendingInvitesQuery'
 import { usePersistentChatGPTRegistrationMode } from '@/hooks/usePersistentChatGPTRegistrationMode'
 import { parseBooleanConfigValue } from '@/lib/configValueParsers'
 import { buildChatGPTRegistrationRequestAdapter } from '@/lib/chatgptRegistrationRequestAdapter'
@@ -42,14 +46,251 @@ import { normalizeExecutorForPlatform } from '@/lib/platformExecutorOptions'
 
 const { Text } = Typography
 
-const REGISTER_FORM_SETTINGS_STORAGE_PREFIX = 'any-auto-register.register-form-settings.'
+const AccountActionSurface = lazy(() =>
+  import('@/features/accounts/components/AccountActionSurface').then((module) => ({
+    default: module.AccountActionSurface,
+  })),
+)
+
+const GOPAY_ACTIVE_PHASES = new Set(['created', 'starting', 'waiting_otp', 'waiting_link_pin', 'waiting_payment_pin', 'verifying'])
+const TASK_MODAL_STORAGE_KEY = 'auto-chatgpt.accounts.task-modal.current-task'
+
+const GOPAY_PHASE_META: Record<string, { title: string; description: string; step: number; status?: 'wait' | 'process' | 'finish' | 'error' }> = {
+  created: { title: '已创建', description: '准备开始 GoPay 支付', step: 0, status: 'process' },
+  starting: { title: '初始化', description: '正在准备 ChatGPT/Stripe/Midtrans 支付会话', step: 0, status: 'process' },
+  waiting_otp: { title: 'OTP', description: '输入 GoPay 短信验证码', step: 1, status: 'process' },
+  waiting_link_pin: { title: '绑定 PIN', description: '输入 GoPay PIN 以绑定支付方式', step: 2, status: 'process' },
+  waiting_payment_pin: { title: '支付 PIN', description: '再次输入 GoPay PIN 完成扣款', step: 3, status: 'process' },
+  verifying: { title: '验证', description: '正在等待 ChatGPT 确认订阅', step: 4, status: 'process' },
+  succeeded: { title: '完成', description: '订阅支付已完成', step: 4, status: 'finish' },
+  failed: { title: '失败', description: '支付流程失败', step: 4, status: 'error' },
+  cancelled: { title: '已取消', description: '支付流程已取消', step: 4, status: 'error' },
+}
+
+function gopayPhaseMeta(phase?: string) {
+  return GOPAY_PHASE_META[String(phase || '').trim()] || { title: '未知', description: String(phase || '未知阶段'), step: 0, status: 'process' as const }
+}
+
+const REGISTER_FORM_SETTINGS_STORAGE_PREFIX = 'auto-chatgpt.register-form-settings.'
+const DEFAULT_CHECKOUT_COUNTRY = 'ID'
+const DEFAULT_CHECKOUT_CURRENCY = 'IDR'
+const DEFAULT_GOPAY_OTP_AUTO_RESEND_DELAY_SECONDS = 120
+const ACCOUNTS_PAGE_SIZE = 10
+const EMPTY_LIST: any[] = []
+
+function normalizeCheckoutCountry(value: unknown) {
+  return String(value || DEFAULT_CHECKOUT_COUNTRY).trim().toUpperCase() || DEFAULT_CHECKOUT_COUNTRY
+}
+
+function normalizeCheckoutCurrency(value: unknown) {
+  return String(value || DEFAULT_CHECKOUT_CURRENCY).trim().toUpperCase() || DEFAULT_CHECKOUT_CURRENCY
+}
+
+function normalizeGopayOtpAutoResendDelay(value: unknown) {
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed)) return DEFAULT_GOPAY_OTP_AUTO_RESEND_DELAY_SECONDS
+  return Math.max(0, Math.min(Math.trunc(parsed), 3600))
+}
+
+function parseMaybeJsonObject(value: unknown) {
+  if (value && typeof value === 'object') return value as Record<string, any>
+  const text = String(value || '').trim()
+  if (!text) return {}
+  try {
+    const parsed = JSON.parse(text)
+    return parsed && typeof parsed === 'object' ? parsed : {}
+  } catch {
+    return {}
+  }
+}
+
+type GopayPhoneCandidate = {
+  id: string
+  label: string
+  phone_country_code: string
+  phone_number: string
+  enabled?: boolean
+  last_used_at?: string
+}
+
+type BatchGopayItem = {
+  account: any
+  phone: GopayPhoneCandidate
+  batchIndex: number
+  round: number
+  status: 'queued' | 'starting' | 'running' | 'done' | 'failed' | 'cancelled'
+  snapshot?: any
+  error?: string
+  logsOpen?: boolean
+  configOpen?: boolean
+  submitting?: boolean
+}
+
+function parseMaybeJsonArray(value: unknown) {
+  if (Array.isArray(value)) return value
+  const text = String(value || '').trim()
+  if (!text) return []
+  try {
+    const parsed = JSON.parse(text)
+    return Array.isArray(parsed) ? parsed : []
+  } catch {
+    return []
+  }
+}
+
+function normalizeGopayPhonePart(value: unknown) {
+  return String(value || '').replace(/\D/g, '')
+}
+
+function getGopayPhoneKey(phone: Pick<GopayPhoneCandidate, 'phone_country_code' | 'phone_number'>) {
+  return `${normalizeGopayPhonePart(phone.phone_country_code)}:${normalizeGopayPhonePart(phone.phone_number)}`
+}
+
+function formatGopayPhoneLabel(phone: Partial<GopayPhoneCandidate>) {
+  const label = String(phone.label || '').trim()
+  const countryCode = normalizeGopayPhonePart(phone.phone_country_code)
+  const number = normalizeGopayPhonePart(phone.phone_number)
+  const value = countryCode && number ? `+${countryCode} ${number}` : number
+  return label ? `${label} · ${value}` : value
+}
+
+function normalizeGopayPhoneCandidate(value: any, index = 0): GopayPhoneCandidate | null {
+  const phone_country_code = normalizeGopayPhonePart(value?.phone_country_code || value?.country_code || value?.code || '86')
+  const phone_number = normalizeGopayPhonePart(value?.phone_number || value?.number || value?.phone || '')
+  if (!phone_country_code || !phone_number) return null
+  const key = `${phone_country_code}:${phone_number}`
+  return {
+    id: String(value?.id || `phone_${key}_${index}`).replace(/[^A-Za-z0-9:_-]/g, '_'),
+    label: String(value?.label || value?.name || `GoPay ${index + 1}`).trim(),
+    phone_country_code,
+    phone_number,
+    enabled: value?.enabled !== false,
+    last_used_at: String(value?.last_used_at || '').trim(),
+  }
+}
+
+function normalizeGopayPhoneCandidates(value: unknown): GopayPhoneCandidate[] {
+  const items = parseMaybeJsonArray(value)
+  const seen = new Set<string>()
+  const normalized: GopayPhoneCandidate[] = []
+  items.forEach((item, index) => {
+    const candidate = normalizeGopayPhoneCandidate(item, index)
+    if (!candidate) return
+    const key = getGopayPhoneKey(candidate)
+    if (seen.has(key)) return
+    seen.add(key)
+    normalized.push(candidate)
+  })
+  return normalized
+}
+
+function upsertGopayPhoneCandidate(candidates: GopayPhoneCandidate[], phone: Partial<GopayPhoneCandidate>) {
+  const candidate = normalizeGopayPhoneCandidate(
+    {
+      ...phone,
+      last_used_at: new Date().toISOString(),
+    },
+    candidates.length,
+  )
+  if (!candidate) return candidates
+  const key = getGopayPhoneKey(candidate)
+  const rest = candidates.filter((item) => getGopayPhoneKey(item) !== key)
+  return [candidate, ...rest]
+}
+
+function removeGopayPhoneCandidate(candidates: GopayPhoneCandidate[], phoneId: string) {
+  return candidates.filter((item) => item.id !== phoneId)
+}
+
+function moveGopayPhoneCandidate(
+  candidates: GopayPhoneCandidate[],
+  phoneId: string,
+  direction: 'up' | 'down' | 'top' | 'bottom',
+) {
+  const index = candidates.findIndex((item) => item.id === phoneId)
+  if (index < 0) return candidates
+  const next = [...candidates]
+  const [item] = next.splice(index, 1)
+  if (direction === 'top') {
+    next.unshift(item)
+  } else if (direction === 'bottom') {
+    next.push(item)
+  } else if (direction === 'up') {
+    next.splice(Math.max(0, index - 1), 0, item)
+  } else {
+    next.splice(Math.min(next.length, index + 1), 0, item)
+  }
+  return next
+}
+
+function compareGopayBatchAccounts(a: any, b: any) {
+  const emailA = String(a?.email || '').trim().toLowerCase()
+  const emailB = String(b?.email || '').trim().toLowerCase()
+  if (emailA !== emailB) return emailA.localeCompare(emailB)
+  return Number(a?.id || 0) - Number(b?.id || 0)
+}
+
+function buildBatchGopayItems(accounts: any[], phones: GopayPhoneCandidate[]) {
+  const sortedAccounts = [...accounts].sort(compareGopayBatchAccounts)
+  return sortedAccounts.map((account, index) => ({
+    account,
+    phone: phones[index % phones.length],
+    batchIndex: index + 1,
+    round: Math.floor(index / phones.length) + 1,
+    status: 'queued' as const,
+    logsOpen: false,
+    configOpen: false,
+  }))
+}
+
+function reassignBatchGopayPhones(items: BatchGopayItem[], phones: GopayPhoneCandidate[]) {
+  if (phones.length === 0) return items
+  const sortedItems = [...items].sort((a, b) => compareGopayBatchAccounts(a.account, b.account))
+  return sortedItems.map((item, index) => ({
+    ...item,
+    phone: phones[index % phones.length],
+    batchIndex: index + 1,
+    round: Math.floor(index / phones.length) + 1,
+  }))
+}
+
+function normalizeTaskStatus(value: unknown) {
+  const normalized = String(value || '').trim().toLowerCase()
+  if (normalized === 'success') return 'done'
+  if (normalized === 'skipped') return 'stopped'
+  if (normalized === 'pending' || normalized === 'running' || normalized === 'done' || normalized === 'failed' || normalized === 'stopped') {
+    return normalized
+  }
+  return 'pending'
+}
+
+function isActiveTaskStatus(value: unknown) {
+  return !['done', 'failed', 'stopped'].includes(normalizeTaskStatus(value))
+}
+
+function clearTaskModalStorage() {
+  if (typeof window === 'undefined') return
+  window.localStorage.removeItem(TASK_MODAL_STORAGE_KEY)
+}
 
 const STATUS_COLORS: Record<string, string> = {
   registered: 'default',
+  pending_payment: 'warning',
+  payment_failed: 'error',
   trial: 'success',
   subscribed: 'success',
   expired: 'warning',
   invalid: 'error',
+}
+
+const STATUS_LABELS: Record<string, string> = {
+  registered: '已注册',
+  pending_payment: '待支付',
+  payment_failed: '支付失败',
+  trial: '试用中',
+  subscribed: '已订阅',
+  expired: '已过期',
+  invalid: '已失效',
 }
 
 function pendingInviteStatusMeta(status?: string) {
@@ -63,6 +304,8 @@ function pendingInviteStatusMeta(status?: string) {
       return { color: 'error', label: '终止失败' }
     case 'abandoned':
       return { color: 'default', label: '已放弃' }
+    case 'subscription_pending_auth':
+      return { color: 'blue', label: '订阅待补抓' }
     case 'activation_fetching_invite_mail':
       return { color: 'processing', label: '拉取邀请邮件' }
     case 'activation_auth_login':
@@ -75,6 +318,15 @@ function pendingInviteStatusMeta(status?: string) {
       return { color: 'blue', label: '待激活' }
     default:
       return { color: 'default', label: status || '未知' }
+  }
+}
+
+function pendingActivationKindMeta(kind?: string) {
+  switch (String(kind || '').trim()) {
+    case 'subscription_auth':
+      return { color: 'purple', label: '订阅补抓' }
+    default:
+      return { color: 'cyan', label: '邀请激活' }
   }
 }
 
@@ -110,15 +362,52 @@ function saveRegisterFormSettings(platform: string, values: Record<string, unkno
 }
 
 function normalizeAccount(account: any) {
-  const extra = parseExtraJson(account.extra_json)
+  const parsedExtra = parseExtraJson(account.extra_json)
+  const extra = account.extra && typeof account.extra === 'object'
+    ? { ...parsedExtra, ...account.extra }
+    : parsedExtra
   const syncStatuses = extra.sync_statuses && typeof extra.sync_statuses === 'object' ? extra.sync_statuses : {}
   const cliproxySync = syncStatuses.cliproxyapi && typeof syncStatuses.cliproxyapi === 'object' ? syncStatuses.cliproxyapi : {}
   const sub2apiSync = syncStatuses.sub2api && typeof syncStatuses.sub2api === 'object' ? syncStatuses.sub2api : {}
-  const chatgptLocal = extra.chatgpt_local && typeof extra.chatgpt_local === 'object' ? extra.chatgpt_local : {}
+  const chatgptLocal = account.chatgptLocal && typeof account.chatgptLocal === 'object'
+    ? account.chatgptLocal
+    : extra.chatgpt_local && typeof extra.chatgpt_local === 'object'
+      ? extra.chatgpt_local
+      : {}
+  const chatgptCapabilities = account.chatgptCapabilities && typeof account.chatgptCapabilities === 'object'
+    ? account.chatgptCapabilities
+    : extra.chatgpt_capabilities && typeof extra.chatgpt_capabilities === 'object'
+      ? extra.chatgpt_capabilities
+      : {}
+  const chatgptPendingSubscriptionAuth = extra.chatgpt_pending_subscription_auth && typeof extra.chatgpt_pending_subscription_auth === 'object'
+    ? extra.chatgpt_pending_subscription_auth
+    : {}
+  const chatgptGopay = extra.chatgpt_gopay && typeof extra.chatgpt_gopay === 'object' ? extra.chatgpt_gopay : null
+  const chatgptGopayDefaults = extra.chatgpt_gopay_defaults && typeof extra.chatgpt_gopay_defaults === 'object' ? extra.chatgpt_gopay_defaults : {}
+  const chatgptLastPaymentLink = extra.chatgpt_last_payment_link && typeof extra.chatgpt_last_payment_link === 'object'
+    ? extra.chatgpt_last_payment_link
+    : {}
+  const chatgptPaymentLinkDefaults = extra.chatgpt_payment_link_defaults && typeof extra.chatgpt_payment_link_defaults === 'object'
+    ? extra.chatgpt_payment_link_defaults
+    : {}
   const teamInviteSource = account.team_invite_source && typeof account.team_invite_source === 'object'
     ? account.team_invite_source
     : null
-  return { ...account, extra, cliproxySync, sub2apiSync, chatgptLocal, teamInviteSource }
+  return {
+    ...account,
+    extra,
+    cliproxySync,
+    sub2apiSync,
+    chatgptLocal,
+    chatgptCapabilities,
+    chatgptPendingSubscriptionAuth,
+    chatgptGopay,
+    chatgptGopayDefaults,
+    chatgptLastPaymentLink,
+    chatgptPaymentLinkDefaults,
+    teamInviteSource,
+    manuallyUsed: account.manually_used !== undefined ? Boolean(account.manually_used) : Boolean(extra.manually_used),
+  }
 }
 
 function formatSyncTime(value?: string) {
@@ -133,10 +422,62 @@ function formatCreatedAt(value?: string) {
   if (Number.isNaN(date.getTime())) {
     return { date: value, time: '' }
   }
+  const month = String(date.getMonth() + 1).padStart(2, '0')
+  const day = String(date.getDate()).padStart(2, '0')
+  const hour = String(date.getHours()).padStart(2, '0')
+  const minute = String(date.getMinutes()).padStart(2, '0')
   return {
-    date: date.toLocaleDateString(),
-    time: date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+    date: `${month}-${day}`,
+    time: `${hour}:${minute}`,
   }
+}
+
+function copyTextToClipboardFallback(text: string) {
+  if (typeof document === 'undefined' || !document.body) return false
+  const textarea = document.createElement('textarea')
+  textarea.value = text
+  textarea.setAttribute('readonly', 'true')
+  textarea.style.position = 'fixed'
+  textarea.style.top = '0'
+  textarea.style.left = '-9999px'
+  textarea.style.opacity = '0'
+  document.body.appendChild(textarea)
+  textarea.focus()
+  textarea.select()
+  textarea.setSelectionRange(0, textarea.value.length)
+  let ok = false
+  try {
+    ok = document.execCommand('copy')
+  } catch {
+    ok = false
+  } finally {
+    document.body.removeChild(textarea)
+  }
+  return ok
+}
+
+async function copyTextToClipboard(text: string) {
+  const value = String(text || '')
+  if (!value) return false
+  if (typeof window !== 'undefined' && typeof navigator !== 'undefined' && navigator.clipboard?.writeText && window.isSecureContext) {
+    try {
+      await navigator.clipboard.writeText(value)
+      return true
+    } catch {
+      // Fall through to the legacy clipboard path.
+    }
+  }
+  return copyTextToClipboardFallback(value)
+}
+
+async function copyText(text: string) {
+  const ok = await copyTextToClipboard(text)
+  if (ok) {
+    message.success('已复制')
+    return true
+  }
+  message.error('复制失败')
+  return false
 }
 
 function getTeamInviteOwnerLabel(source: any) {
@@ -151,18 +492,12 @@ function getTeamInviteOwnerLabel(source: any) {
   ).trim()
 }
 
-function getTeamInviteActionLabel(source: any) {
-  const inviteStatus = String(source?.invite_status || '').trim().toLowerCase()
-  if (inviteStatus && inviteStatus !== 'completed') return '撤销邀请'
-  return '移除队伍'
-}
-
 function authStateMeta(state?: string) {
   switch (state) {
     case 'refresh_token_valid':
       return { color: 'success', label: 'RT有效' }
     case 'access_token_valid':
-      return { color: 'success', label: 'AT有效' }
+      return { color: 'blue', label: '仅AT有效' }
     case 'account_deactivated':
       return { color: 'error', label: '已失效' }
     case 'refresh_token_invalidated':
@@ -180,6 +515,26 @@ function authStateMeta(state?: string) {
     default:
       return { color: 'default', label: '未探测' }
   }
+}
+
+function authLevelMeta(level?: string, fallbackState?: string) {
+  switch (String(level || '').toLowerCase()) {
+    case 'refresh_token':
+      return { color: 'success', label: 'RT有效' }
+    case 'access_token_only':
+      return { color: 'blue', label: '仅AT有效' }
+    case 'invalid':
+      return { color: 'error', label: '认证失效' }
+    default:
+      return authStateMeta(fallbackState)
+  }
+}
+
+function workspaceMeta(capabilities: any) {
+  if (capabilities?.has_workspace && capabilities?.has_account_id) return { color: 'success', label: '材料完整' }
+  if (capabilities?.has_workspace) return { color: 'warning', label: '缺account_id' }
+  if (capabilities?.has_account_id) return { color: 'warning', label: '缺workspace' }
+  return { color: 'default', label: '缺材料' }
 }
 
 function codexStateMeta(state?: string) {
@@ -207,6 +562,11 @@ function codexStateMeta(state?: string) {
   }
 }
 
+function statusLabel(status?: string) {
+  const normalized = String(status || '').trim()
+  return STATUS_LABELS[normalized] || normalized || '未知'
+}
+
 function planMeta(plan?: string) {
   switch ((plan || '').toLowerCase()) {
     case 'plus':
@@ -224,185 +584,6 @@ function planMeta(plan?: string) {
   }
 }
 
-function formatStructuredText(value?: string) {
-  if (!value) return ''
-  const trimmed = String(value).trim()
-  if (!trimmed) return ''
-  if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
-    try {
-      return JSON.stringify(JSON.parse(trimmed), null, 2)
-    } catch {
-      return trimmed
-    }
-  }
-  return trimmed
-}
-
-function SummaryField({
-  label,
-  value,
-  code = false,
-}: {
-  label: string
-  value?: string
-  code?: boolean
-}) {
-  const { token } = theme.useToken()
-  if (!value) return null
-
-  const content = code ? formatStructuredText(value) : value
-  const isBlock = code || content.length > 96 || content.includes('\n')
-
-  return (
-    <div
-      style={{
-        display: 'grid',
-        gridTemplateColumns: '104px minmax(0, 1fr)',
-        gap: 12,
-        alignItems: 'start',
-      }}
-    >
-      <Text type="secondary" style={{ fontSize: 12, lineHeight: '20px' }}>
-        {label}
-      </Text>
-      {isBlock ? (
-        <pre
-          style={{
-            margin: 0,
-            padding: code ? '8px 10px' : 0,
-            borderRadius: code ? token.borderRadius : 0,
-            border: code ? `1px solid ${token.colorBorder}` : 'none',
-            background: code ? token.colorBgElevated : 'transparent',
-            color: code ? token.colorText : token.colorTextSecondary,
-            fontFamily: code ? 'SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace' : 'inherit',
-            fontSize: 12,
-            lineHeight: 1.6,
-            whiteSpace: 'pre-wrap',
-            wordBreak: 'break-word',
-            overflowWrap: 'anywhere',
-            maxHeight: code ? 160 : 'none',
-            overflow: code ? 'auto' : 'visible',
-          }}
-        >
-          {content}
-        </pre>
-      ) : (
-        <Text style={{ display: 'block', color: token.colorTextSecondary, lineHeight: '20px' }}>
-          {content}
-        </Text>
-      )}
-    </div>
-  )
-}
-
-function DetailSection({ title, children }: { title: string; children: React.ReactNode }) {
-  const { token } = theme.useToken()
-
-  return (
-    <div
-      style={{
-        marginTop: 16,
-        padding: 14,
-        borderRadius: token.borderRadiusLG,
-        border: `1px solid ${token.colorBorder}`,
-        background: token.colorFillAlter,
-      }}
-    >
-      <div style={{ marginBottom: 10, fontWeight: 600, color: token.colorText }}>{title}</div>
-      {children}
-    </div>
-  )
-}
-
-function LocalProbeSummary({ probe }: { probe: any }) {
-  const checkedAt = probe?.checked_at || probe?.auth?.checked_at || probe?.subscription?.checked_at || probe?.codex?.checked_at
-  const auth = probe?.auth || {}
-  const subscription = probe?.subscription || {}
-  const codex = probe?.codex || {}
-
-  return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-        <Tag color={authStateMeta(auth.state).color}>认证: {authStateMeta(auth.state).label}</Tag>
-        <Tag color={planMeta(subscription.plan).color}>订阅: {planMeta(subscription.plan).label}</Tag>
-        <Tag color={codexStateMeta(codex.state).color}>Codex: {codexStateMeta(codex.state).label}</Tag>
-      </div>
-      <SummaryField label="探测时间" value={checkedAt ? formatSyncTime(checkedAt) : ''} />
-      <SummaryField label="认证信息" value={auth.message} code />
-      <SummaryField label="工作区套餐" value={subscription.workspace_plan_type} />
-      <SummaryField label="Codex 信息" value={codex.message} code />
-    </div>
-  )
-}
-
-function cliproxyStateMeta(sync: any) {
-  if (!sync || Object.keys(sync).length === 0) {
-    return { color: 'default', label: '未同步' }
-  }
-  if (sync.remote_state === 'unreachable') {
-    return { color: 'error', label: '不可连接' }
-  }
-  if (sync.remote_state === 'not_found') {
-    return { color: 'default', label: '远端未发现' }
-  }
-  if (!sync.uploaded) {
-    return { color: 'default', label: '未发现' }
-  }
-  if (sync.remote_state === 'usable') {
-    return { color: 'success', label: '远端可用' }
-  }
-  if (sync.remote_state === 'account_deactivated') {
-    return { color: 'error', label: '远端已失效' }
-  }
-  if (sync.remote_state === 'access_token_invalidated') {
-    return { color: 'error', label: '远端AT失效' }
-  }
-  if (sync.remote_state === 'unauthorized') {
-    return { color: 'error', label: '远端未授权' }
-  }
-  if (sync.remote_state === 'payment_required') {
-    return { color: 'warning', label: '远端需付费/权限' }
-  }
-  if (sync.remote_state === 'quota_exhausted') {
-    return { color: 'warning', label: '远端额度耗尽' }
-  }
-  if (sync.status === 'active') {
-    return { color: 'processing', label: '远端Active' }
-  }
-  if (sync.status === 'refreshing') {
-    return { color: 'processing', label: '远端刷新中' }
-  }
-  if (sync.status === 'pending') {
-    return { color: 'default', label: '远端待处理' }
-  }
-  if (sync.status === 'error') {
-    return { color: 'error', label: '远端错误' }
-  }
-  if (sync.status === 'disabled') {
-    return { color: 'default', label: '远端禁用' }
-  }
-  return { color: 'default', label: '未同步' }
-}
-
-function CliproxySyncSummary({ sync }: { sync: any }) {
-  const meta = cliproxyStateMeta(sync)
-  return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-        <Tag color={meta.color}>{meta.label}</Tag>
-        {sync?.status ? <Tag>{`status: ${sync.status}`}</Tag> : null}
-      </div>
-      <SummaryField label="状态信息" value={sync?.status_message} code />
-      <SummaryField label="auth-file" value={sync?.name} />
-      <SummaryField label="API URL" value={sync?.base_url} />
-      <SummaryField label="同步时间" value={sync?.last_synced_at ? formatSyncTime(sync.last_synced_at) : ''} />
-      <SummaryField label="远端刷新时间" value={sync?.last_refresh ? formatSyncTime(sync.last_refresh) : ''} />
-      <SummaryField label="下次重试时间" value={sync?.next_retry_after ? formatSyncTime(sync.next_retry_after) : ''} />
-      <SummaryField label="探测信息" value={sync?.last_probe_message} code />
-    </div>
-  )
-}
-
 function sub2apiStateMeta(sync: any) {
   if (!sync || Object.keys(sync).length === 0) {
     return { color: 'default', label: '未同步' }
@@ -415,6 +596,9 @@ function sub2apiStateMeta(sync: any) {
   }
   if (sync.remote_state === 'cross_workspace_only') {
     return { color: 'processing', label: '其他工作区已存在' }
+  }
+  if (sync.remote_state === 'deleted_exact_match') {
+    return { color: 'warning', label: '已删可重传' }
   }
   if (sync.remote_state === 'not_found') {
     return { color: 'default', label: '远端未发现' }
@@ -431,28 +615,8 @@ function sub2apiStateMeta(sync: any) {
   return { color: 'default', label: '未同步' }
 }
 
-function Sub2ApiSyncSummary({ sync }: { sync: any }) {
-  const meta = sub2apiStateMeta(sync)
-  return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-        <Tag color={meta.color}>{meta.label}</Tag>
-        {sync?.status ? <Tag>{`status: ${sync.status}`}</Tag> : null}
-        {sync?.matched_by ? <Tag>{`matched_by: ${sync.matched_by}`}</Tag> : null}
-      </div>
-      <SummaryField label="远端账号 ID" value={sync?.remote_account_id ? String(sync.remote_account_id) : ''} />
-      <SummaryField label="匹配方式" value={sync?.matched_by} />
-      <SummaryField label="候选数量" value={sync?.candidate_count ? String(sync.candidate_count) : ''} />
-      <SummaryField label="最近探测" value={sync?.checked_at ? formatSyncTime(sync.checked_at) : ''} />
-      <SummaryField label="最近尝试" value={sync?.last_attempt_at ? formatSyncTime(sync.last_attempt_at) : ''} />
-      <SummaryField label="状态信息" value={sync?.message || sync?.last_message} code />
-      <SummaryField label="候选明细" value={sync?.candidates ? JSON.stringify(sync.candidates, null, 2) : ''} code />
-    </div>
-  )
-}
-
 function summarizeSub2ApiStates(items: any[]) {
-  const summary = { exists: 0, notFound: 0, crossWorkspace: 0, ambiguous: 0, unreachable: 0, unknown: 0, pending: 0 }
+  const summary = { exists: 0, notFound: 0, crossWorkspace: 0, deletedExact: 0, ambiguous: 0, unreachable: 0, unknown: 0, pending: 0 }
   for (const item of items || []) {
     const sync = item?.sub2apiSync || {}
     const remoteState = String(sync?.remote_state || '').trim().toLowerCase()
@@ -467,6 +631,9 @@ function summarizeSub2ApiStates(items: any[]) {
     } else if (remoteState === 'cross_workspace_only') {
       summary.crossWorkspace += 1
       summary.pending += 1
+    } else if (remoteState === 'deleted_exact_match') {
+      summary.deletedExact += 1
+      summary.pending += 1
     } else if (remoteState === 'ambiguous') {
       summary.ambiguous += 1
     } else if (remoteState === 'unreachable') {
@@ -479,285 +646,309 @@ function summarizeSub2ApiStates(items: any[]) {
   return summary
 }
 
-function ActionMenu({ acc, onRefresh, actions }: { acc: any; onRefresh: () => Promise<void> | void; actions: any[] }) {
-  const [resultOpen, setResultOpen] = useState(false)
-  const [resultTitle, setResultTitle] = useState('')
-  const [resultStatus, setResultStatus] = useState<'success' | 'error'>('success')
-  const [resultText, setResultText] = useState('')
-  const [resultUrl, setResultUrl] = useState('')
-  const [resultProbe, setResultProbe] = useState<any>(null)
-  const [resultCliproxySync, setResultCliproxySync] = useState<any>(null)
+function shouldShowResumeAuthButton(record: any) {
+  const capabilities = record?.chatgptCapabilities || {}
+  const authLevel = String(record?.auth_level || capabilities.auth_level || '').trim().toLowerCase()
+  const uploadGate = String(capabilities.upload_gate || '').trim().toLowerCase()
+  const status = String(record?.status || '').trim().toLowerCase()
+  const pendingStatus = String(record?.chatgptPendingSubscriptionAuth?.status || '').trim().toLowerCase()
+  if (status === 'pending_payment') return true
+  if (pendingStatus && pendingStatus !== 'completed' && pendingStatus !== 'abandoned') return true
+  if (authLevel === 'access_token_only' || authLevel === 'invalid') return true
+  if (uploadGate === 'blocked_missing_rt' || uploadGate === 'blocked_missing_workspace') return true
+  return false
+}
 
-  const showResult = (title: string, status: 'success' | 'error', text: string, url = '', probe: any = null, cliproxySync: any = null) => {
-    setResultTitle(title)
-    setResultStatus(status)
-    setResultText(text)
-    setResultUrl(url)
-    setResultProbe(probe)
-    setResultCliproxySync(cliproxySync)
-    setResultOpen(true)
-  }
+function taskModalModeFromSource(source: unknown): 'register' | 'resume_auth' | 'payment_link' {
+  const normalized = String(source || '').trim().toLowerCase()
+  if (normalized === 'resume_auth' || normalized === 'resume_subscription_auth' || normalized === 'batch_resume_subscription_auth') return 'resume_auth'
+  if (normalized === 'payment_link' || normalized === 'batch_payment_link') return 'payment_link'
+  return 'register'
+}
 
-  const copyResultUrl = async () => {
-    if (!resultUrl) return
-    try {
-      await navigator.clipboard.writeText(resultUrl)
-      message.success('链接已复制')
-    } catch {
-      message.error('复制失败')
-    }
-  }
-
-  const handleAction = async (actionId: string) => {
-    const actionLabel = actions.find((item) => item.id === actionId)?.label || actionId
-
-    try {
-      const r = await apiFetch(`/actions/${acc.platform}/${acc.id}/${actionId}`, {
-        method: 'POST',
-        body: JSON.stringify({ params: {} }),
-      })
-      if (!r.ok) {
-        const data = r.data || {}
-        const probe = typeof data === 'object' && data ? data.probe || null : null
-        const cliproxySync = typeof data === 'object' && data ? data.sync || null : null
-        showResult(actionLabel, 'error', r.error || data.message || '操作失败', '', probe, cliproxySync)
-        await onRefresh()
-        return
-      }
-      const data = r.data || {}
-      if (data.url || data.checkout_url || data.cashier_url) {
-        const targetUrl = data.url || data.checkout_url || data.cashier_url
-        message.success('链接已生成')
-        showResult(actionLabel, 'success', '操作成功，请在弹窗中打开或复制链接。', targetUrl)
-      } else {
-        message.success(data.message || '操作成功')
-        const probe = typeof data === 'object' && data ? data.probe || null : null
-        const cliproxySync = typeof data === 'object' && data ? data.sync || null : null
-        const text =
-          probe
-            ? String(data.message || '操作成功')
-            : cliproxySync
-            ? String(data.message || '操作成功')
-            : typeof data === 'string'
-            ? data
-            : Object.keys(data).length > 0
-              ? JSON.stringify(data, null, 2)
-              : '操作成功'
-        showResult(actionLabel, 'success', text, '', probe, cliproxySync)
-      }
-      await onRefresh()
-    } catch (e: any) {
-      const detail = e?.message ? String(e.message) : '请求失败'
-      message.error(detail)
-      showResult(actionLabel, 'error', detail)
-    }
-  }
-
-  const menuItems: MenuProps['items'] = actions.map((a) => ({
-    key: a.id,
-    label: a.label,
-  }))
-
-  if (actions.length === 0) return null
-
-  return (
-    <>
-      <Dropdown
-        menu={{
-          items: menuItems,
-          onClick: ({ key }) => handleAction(String(key)),
-        }}
-      >
-        <Button type="link" size="small" icon={<MoreOutlined />} />
-      </Dropdown>
-      <Modal
-        title={resultTitle}
-        open={resultOpen}
-        onCancel={() => setResultOpen(false)}
-        footer={[
-          resultUrl ? (
-            <Button key="copy" onClick={copyResultUrl}>
-              复制链接
-            </Button>
-          ) : null,
-          resultUrl ? (
-            <Button
-              key="open"
-              type="primary"
-              onClick={() => window.open(resultUrl, '_blank', 'noopener,noreferrer')}
-            >
-              打开链接
-            </Button>
-          ) : null,
-          <Button key="ok" type={resultUrl ? 'default' : 'primary'} onClick={() => setResultOpen(false)}>
-            确定
-          </Button>,
-        ].filter(Boolean)}
-        maskClosable={false}
-      >
-        <Alert
-          type={resultStatus}
-          showIcon
-          message={resultStatus === 'success' ? '操作完成' : '操作失败'}
-          style={{ marginBottom: 12 }}
-        />
-        {resultProbe ? (
-          <div style={{ marginBottom: 12 }}>
-            <LocalProbeSummary probe={resultProbe} />
-          </div>
-        ) : null}
-        {resultCliproxySync ? (
-          <div style={{ marginBottom: 12 }}>
-            <CliproxySyncSummary sync={resultCliproxySync} />
-          </div>
-        ) : null}
-        {resultUrl ? (
-          <Space direction="vertical" style={{ width: '100%' }}>
-            <Text copyable={{ text: resultUrl }} style={{ wordBreak: 'break-all' }}>
-              {resultUrl}
-            </Text>
-          </Space>
-        ) : null}
-        {resultText ? (
-          <pre
-            style={{
-              margin: 0,
-              whiteSpace: 'pre-wrap',
-              wordBreak: 'break-word',
-              fontFamily: 'monospace',
-              fontSize: 12,
-            }}
-          >
-            {resultText}
-          </pre>
-        ) : null}
-      </Modal>
-    </>
-  )
+const accountActionTextStyles: Record<string, CSSProperties> = {
+  payment: { color: '#1677ff' },
+  refresh: { color: '#389e0d' },
+  resume: { color: '#d48806' },
+  more: { color: '#722ed1' },
 }
 
 export default function Accounts() {
-  const { platform } = useParams<{ platform: string }>()
   const { token } = theme.useToken()
-  const [currentPlatform, setCurrentPlatform] = useState(platform || 'chatgpt')
+  const currentPlatform = 'chatgpt'
   const [accounts, setAccounts] = useState<any[]>([])
   const [platformActions, setPlatformActions] = useState<any[]>([])
+  const [platformActionsLoading, setPlatformActionsLoading] = useState(false)
   const [total, setTotal] = useState(0)
-  const [loading, setLoading] = useState(false)
+  const [currentPage, setCurrentPage] = useState(1)
   const [search, setSearch] = useState('')
+  const [debouncedSearch, setDebouncedSearch] = useState('')
+  const [pageVisible, setPageVisible] = useState(
+    typeof document === 'undefined' ? true : document.visibilityState === 'visible',
+  )
   const [filterStatus, setFilterStatus] = useState('')
   const [selectedRowKeys, setSelectedRowKeys] = useState<React.Key[]>([])
 
   const [registerModalOpen, setRegisterModalOpen] = useState(false)
+  const [taskModalMode, setTaskModalMode] = useState<'register' | 'resume_auth' | 'payment_link'>('register')
+  const [taskModalAccount, setTaskModalAccount] = useState<any>(null)
   const [addModalOpen, setAddModalOpen] = useState(false)
   const [importModalOpen, setImportModalOpen] = useState(false)
   const [detailModalOpen, setDetailModalOpen] = useState(false)
+  const [actionSurfaceOpen, setActionSurfaceOpen] = useState(false)
   const [businessDeferredModalOpen, setBusinessDeferredModalOpen] = useState(false)
-  const [currentAccount, setCurrentAccount] = useState<any>(null)
-  const [removingTeamAccountId, setRemovingTeamAccountId] = useState<number | null>(null)
+  const [detailAccount, setDetailAccount] = useState<any>(null)
+  const [actionAccount, setActionAccount] = useState<any>(null)
+  const [actionSurfaceInitialActionId, setActionSurfaceInitialActionId] = useState<string | null>(null)
+  const [actionSurfaceInitialActionMode, setActionSurfaceInitialActionMode] = useState<'direct' | 'dialog'>('dialog')
   const [importingTeamAccountId, setImportingTeamAccountId] = useState<number | null>(null)
+  const [resumeAuthAccountId, setResumeAuthAccountId] = useState<number | null>(null)
 
   const [registerForm] = Form.useForm()
   const [addForm] = Form.useForm()
   const [detailForm] = Form.useForm()
   const [registerMailProvider, setRegisterMailProvider] = useState('luckmail')
-  const registerProviderOverride = Form.useWatch('mail_provider_override', registerForm)
-  const effectiveRegisterMailProvider =
-    currentPlatform === 'chatgpt' && registerProviderOverride && registerProviderOverride !== '__global__'
-      ? registerProviderOverride
-      : registerMailProvider
+  const [configCache, setConfigCache] = useState<Record<string, any> | null>(null)
   const { mode: chatgptRegistrationMode, setMode: setChatgptRegistrationMode } =
     usePersistentChatGPTRegistrationMode()
   const [importText, setImportText] = useState('')
   const [importLoading, setImportLoading] = useState(false)
   const [taskId, setTaskId] = useState<string | null>(null)
   const [taskSnapshot, setTaskSnapshot] = useState<any>(null)
+  const [activeTasksPanelOpen, setActiveTasksPanelOpen] = useState(false)
   const [registerLoading, setRegisterLoading] = useState(false)
   const [registerSettingsSaving, setRegisterSettingsSaving] = useState(false)
-  const [pendingBusinessInvites, setPendingBusinessInvites] = useState<any[]>([])
-  const [pendingBusinessInvitesLoading, setPendingBusinessInvitesLoading] = useState(false)
   const [selectedPendingInviteRowKeys, setSelectedPendingInviteRowKeys] = useState<React.Key[]>([])
   const [activatingPendingInviteId, setActivatingPendingInviteId] = useState<number | null>(null)
   const [abandoningPendingInviteId, setAbandoningPendingInviteId] = useState<number | null>(null)
   const [activatingAllPendingInvites, setActivatingAllPendingInvites] = useState(false)
   const [backfillLoading, setBackfillLoading] = useState<'' | 'cliproxyapi_pending' | 'cliproxyapi_selected' | 'sub2api_pending' | 'sub2api_selected'>('')
+  const [batchResumeAuthLoading, setBatchResumeAuthLoading] = useState<'' | 'selected' | 'filtered'>('')
+  const [batchPaymentLinkLoading, setBatchPaymentLinkLoading] = useState(false)
   const [statusSyncLoading, setStatusSyncLoading] = useState<
     'probe_selected' | 'probe_all' | 'remote_selected' | 'remote_all' | 'sub2api_selected' | 'sub2api_all' | ''
   >('')
-  const [sub2apiOverviewSyncing, setSub2apiOverviewSyncing] = useState(false)
   const [deleteInvalidLoading, setDeleteInvalidLoading] = useState(false)
-  const sub2apiOverviewSyncKeyRef = useRef('')
+  const [batchGopayOpen, setBatchGopayOpen] = useState(false)
+  const [batchGopayItems, setBatchGopayItems] = useState<BatchGopayItem[]>([])
+  const [batchGopayPhones, setBatchGopayPhones] = useState<GopayPhoneCandidate[]>([])
+  const [batchGopayDefaults, setBatchGopayDefaults] = useState<Record<string, any>>({})
+  const [batchGopayLoading, setBatchGopayLoading] = useState(false)
+  const [batchGopayPhoneCountryCode, setBatchGopayPhoneCountryCode] = useState('86')
+  const [batchGopayPhoneNumber, setBatchGopayPhoneNumber] = useState('')
+  const [batchGopayPhoneSaving, setBatchGopayPhoneSaving] = useState(false)
+  const [batchGopayStarted, setBatchGopayStarted] = useState(false)
+  const [batchGopayRoundInterval, setBatchGopayRoundInterval] = useState(60)
+  const [batchGopayOtpAutoResendDelay, setBatchGopayOtpAutoResendDelay] = useState(DEFAULT_GOPAY_OTP_AUTO_RESEND_DELAY_SECONDS)
+  const [batchGopayOtpDelaySaving, setBatchGopayOtpDelaySaving] = useState(false)
+  const [batchGopayNextRoundAt, setBatchGopayNextRoundAt] = useState<number | null>(null)
+  const batchGopayStartingRef = useRef(false)
+  const batchGopayCancelRequestedRef = useRef(false)
+  const accountsQuery = useAccountsQuery({
+    email: debouncedSearch,
+    status: filterStatus,
+    page: currentPage,
+    pageSize: ACCOUNTS_PAGE_SIZE,
+  })
+  const accountDetailQuery = useAccountDetailQuery(detailAccount?.id ? Number(detailAccount.id) : null, detailModalOpen)
+  const activeTasksQuery = useActiveTasksQuery(activeTasksPanelOpen)
+  const pendingInvitesQuery = usePendingInvitesQuery(businessDeferredModalOpen && currentPlatform === 'chatgpt')
+  const activeTasks = activeTasksQuery.data ?? EMPTY_LIST
+  const activeTasksLoading = activeTasksQuery.isLoading || activeTasksQuery.isFetching
+  const pendingBusinessInvites = pendingInvitesQuery.data ?? EMPTY_LIST
+  const pendingBusinessInvitesLoading = pendingInvitesQuery.isLoading || pendingInvitesQuery.isFetching
+  const loading = accountsQuery.isLoading || accountsQuery.isFetching
 
   useEffect(() => {
-    if (platform) setCurrentPlatform(platform)
-  }, [platform])
+    const timer = window.setTimeout(() => {
+      setDebouncedSearch(search.trim())
+    }, 300)
+    return () => window.clearTimeout(timer)
+  }, [search])
 
   useEffect(() => {
-    if (!detailModalOpen || !currentAccount) return
-    detailForm.setFieldsValue({
-      status: currentAccount.status,
-      token: currentAccount.token,
-    })
-  }, [detailModalOpen, currentAccount, detailForm])
+    setCurrentPage(1)
+  }, [debouncedSearch, filterStatus])
 
-  const fetchAccountDetail = useCallback(async (accountId: number) => {
-    const data = await apiFetch(`/accounts/${accountId}`)
-    const normalized = normalizeAccount(data)
-    setCurrentAccount(normalized)
-    return normalized
+  useEffect(() => {
+    if (typeof document === 'undefined') return
+    const updateVisibility = () => {
+      setPageVisible(document.visibilityState === 'visible')
+    }
+    updateVisibility()
+    document.addEventListener('visibilitychange', updateVisibility)
+    return () => {
+      document.removeEventListener('visibilitychange', updateVisibility)
+    }
   }, [])
 
   useEffect(() => {
-    if (!detailModalOpen || !currentAccount?.id) return
-    const latest = accounts.find((item) => item.id === currentAccount.id)
-    if (latest && latest !== currentAccount) {
-      setCurrentAccount(latest)
-    }
-    fetchAccountDetail(currentAccount.id).catch(() => {})
-  }, [accounts, detailModalOpen, currentAccount?.id, fetchAccountDetail])
+    if (!detailModalOpen || !detailAccount) return
+    detailForm.setFieldsValue({
+      status: detailAccount.status,
+      token: detailAccount.token,
+    })
+  }, [detailModalOpen, detailAccount, detailForm])
+
+  const openAccountPaymentLinkAction = useCallback((record: any) => {
+    setActionAccount(record)
+    setActionSurfaceInitialActionId('payment_link')
+    setActionSurfaceInitialActionMode('direct')
+    setActionSurfaceOpen(true)
+  }, [])
+
+  const openAccountPaymentLinkRegenerateAction = useCallback((record: any) => {
+    setActionAccount(record)
+    setActionSurfaceInitialActionId('payment_link_regenerate')
+    setActionSurfaceInitialActionMode('direct')
+    setActionSurfaceOpen(true)
+  }, [])
+
+  const openAccountProbeStatusAction = useCallback((record: any) => {
+    setActionAccount(record)
+    setActionSurfaceInitialActionId('probe_local_status')
+    setActionSurfaceInitialActionMode('direct')
+    setActionSurfaceOpen(true)
+  }, [])
+
+  const openAccountInlineAction = useCallback((record: any, actionId: string, mode: 'direct' | 'dialog' = 'direct') => {
+    setActionAccount(record)
+    setActionSurfaceInitialActionId(actionId)
+    setActionSurfaceInitialActionMode(mode)
+    setActionSurfaceOpen(true)
+  }, [])
+
+  const loadConfigCache = useCallback(async (options: { force?: boolean } = {}) => {
+    if (!options.force && configCache) return configCache
+    const cfg = await apiFetch('/config')
+    setConfigCache(cfg)
+    return cfg
+  }, [configCache])
 
   const load = useCallback(async () => {
-    setLoading(true)
-    try {
-      const params = new URLSearchParams({ platform: currentPlatform, page: '1', page_size: '100' })
-      if (search) params.set('email', search)
-      if (filterStatus) params.set('status', filterStatus)
-      const data = await apiFetch(`/accounts?${params}`)
-      setAccounts((data.items || []).map(normalizeAccount))
-      setTotal(data.total)
-    } finally {
-      setLoading(false)
+    await accountsQuery.refetch()
+  }, [accountsQuery.refetch])
+
+  useEffect(() => {
+    const data = accountsQuery.data
+    if (!data) return
+    const nextTotal = data.total || 0
+    setAccounts((data.items || []).map(normalizeAccount))
+    setTotal(nextTotal)
+
+    const maxPage = Math.max(1, Math.ceil(nextTotal / ACCOUNTS_PAGE_SIZE))
+    if (currentPage > maxPage) {
+      setCurrentPage(maxPage)
     }
-  }, [currentPlatform, search, filterStatus])
+  }, [accountsQuery.data, currentPage])
 
   useEffect(() => {
-    load()
-  }, [load])
-
-  useEffect(() => {
-    apiFetch(`/actions/${currentPlatform}`)
-      .then((data) => setPlatformActions(data.actions || []))
-      .catch(() => setPlatformActions([]))
-  }, [currentPlatform])
-
-  const loadPendingBusinessInvites = useCallback(async () => {
-    if (currentPlatform !== 'chatgpt') return
-    setPendingBusinessInvitesLoading(true)
-    try {
-      const data = await apiFetch('/chatgpt/pending-business-invites?limit=200')
-      setPendingBusinessInvites(data.items || [])
-      setSelectedPendingInviteRowKeys((prev) => prev.filter((key) => (data.items || []).some((item: any) => item.id === key)))
-    } catch (e: any) {
-      message.error(`加载 pending invite 失败: ${e.message}`)
-    } finally {
-      setPendingBusinessInvitesLoading(false)
+    if (!detailAccount?.id) return
+    const latest = accounts.find((item) => item.id === detailAccount.id)
+    if (latest) {
+      setDetailAccount((prev: any) => (
+        prev && prev.id === latest.id
+          ? { ...prev, ...latest }
+          : prev
+      ))
     }
-  }, [currentPlatform])
+  }, [accounts, detailAccount?.id])
 
   useEffect(() => {
-    if (!businessDeferredModalOpen || currentPlatform !== 'chatgpt') return
-    loadPendingBusinessInvites()
-  }, [businessDeferredModalOpen, currentPlatform, loadPendingBusinessInvites])
+    if (!actionAccount?.id) return
+    const latest = accounts.find((item) => item.id === actionAccount.id)
+    if (latest) {
+      setActionAccount((prev: any) => (
+        prev && prev.id === latest.id
+          ? { ...prev, ...latest }
+          : prev
+      ))
+    }
+  }, [accounts, actionAccount?.id])
+
+  useEffect(() => {
+    const data = accountDetailQuery.data
+    if (!data || !detailModalOpen) return
+    setDetailAccount(normalizeAccount(data))
+  }, [accountDetailQuery.data, detailModalOpen])
+
+  const markAccountUsed = useCallback(async (accountId: number) => {
+    if (!accountId) return
+    await apiFetch(`/accounts/${accountId}/mark-used`, {
+      method: 'POST',
+      body: JSON.stringify({ used: true }),
+    })
+    setAccounts((prev) =>
+      prev.map((item) => (
+        item.id === accountId
+          ? normalizeAccount({
+              ...item,
+              extra_json: JSON.stringify({ ...(item.extra || {}), manually_used: true }),
+            })
+          : item
+      )),
+    )
+    if (detailAccount?.id === accountId) {
+      setDetailAccount((prev: any) => prev ? normalizeAccount({
+        ...prev,
+        extra_json: JSON.stringify({ ...(prev.extra || {}), manually_used: true }),
+      }) : prev)
+    }
+    if (actionAccount?.id === accountId) {
+      setActionAccount((prev: any) => prev ? normalizeAccount({
+        ...prev,
+        extra_json: JSON.stringify({ ...(prev.extra || {}), manually_used: true }),
+      }) : prev)
+    }
+  }, [detailAccount?.id, actionAccount?.id])
+
+  const ensurePlatformActionsLoaded = useCallback(async () => {
+    if (platformActionsLoading || platformActions.length > 0) return
+    setPlatformActionsLoading(true)
+    try {
+      const data = await apiFetch(`/actions/${currentPlatform}`)
+      setPlatformActions(data.actions || [])
+    } catch {
+      setPlatformActions([])
+    } finally {
+      setPlatformActionsLoading(false)
+    }
+  }, [currentPlatform, platformActions.length, platformActionsLoading])
+
+  useEffect(() => {
+    void ensurePlatformActionsLoaded()
+  }, [ensurePlatformActionsLoaded])
+
+  const refreshActiveTasks = useCallback(async () => {
+    setActiveTasksPanelOpen(true)
+    await activeTasksQuery.refetch()
+  }, [activeTasksQuery])
+
+  const openTaskFromSnapshot = (snapshot: any) => {
+    const id = String(snapshot?.id || snapshot?.task_id || '').trim()
+    if (!id) return
+    const normalizedSnapshot = {
+      ...snapshot,
+      id,
+      task_id: id,
+      status: normalizeTaskStatus(snapshot?.status || snapshot?.status_snapshot),
+    }
+    setTaskId(id)
+    setTaskSnapshot(normalizedSnapshot)
+    setTaskModalMode(taskModalModeFromSource(snapshot?.source))
+    setTaskModalAccount(null)
+    setRegisterModalOpen(true)
+  }
+
+  useEffect(() => {
+    setSelectedPendingInviteRowKeys((prev) => {
+      const next = prev.filter((key) => pendingBusinessInvites.some((item: any) => item.id === key))
+      if (next.length === prev.length && next.every((value, index) => value === prev[index])) {
+        return prev
+      }
+      return next
+    })
+  }, [pendingBusinessInvites])
 
   const handleActivatePendingInvite = async (inviteId: number) => {
     setActivatingPendingInviteId(inviteId)
@@ -767,11 +958,11 @@ export default function Accounts() {
         body: JSON.stringify({}),
       })
       message.success(`激活成功：${res.email || inviteId}`)
-      await loadPendingBusinessInvites()
+      await pendingInvitesQuery.refetch()
       load()
     } catch (e: any) {
       message.error(`激活失败: ${e.message}`)
-      await loadPendingBusinessInvites()
+      await pendingInvitesQuery.refetch()
     } finally {
       setActivatingPendingInviteId(null)
     }
@@ -801,11 +992,11 @@ export default function Accounts() {
         body: JSON.stringify({ invite_ids: resolvedIds, limit: 200 }),
       })
       message.success(`批量激活完成：成功 ${res.success || 0} / ${res.total || 0}`)
-      await loadPendingBusinessInvites()
+      await pendingInvitesQuery.refetch()
       load()
     } catch (e: any) {
       message.error(`批量激活失败: ${e.message}`)
-      await loadPendingBusinessInvites()
+      await pendingInvitesQuery.refetch()
     } finally {
       setActivatingAllPendingInvites(false)
     }
@@ -832,7 +1023,7 @@ export default function Accounts() {
         body: JSON.stringify({}),
       })
       message.success(`已标记放弃：${inviteId}`)
-      await loadPendingBusinessInvites()
+      await pendingInvitesQuery.refetch()
     } catch (e: any) {
       message.error(`标记放弃失败: ${e.message}`)
     } finally {
@@ -842,11 +1033,11 @@ export default function Accounts() {
 
   useEffect(() => {
     if (!registerModalOpen) return
-    apiFetch('/config')
+    loadConfigCache()
       .then((cfg) => {
         const provider = String(cfg?.mail_provider || 'luckmail').trim() || 'luckmail'
         const savedSettings = loadRegisterFormSettings(currentPlatform)
-        const savedEmail = window.localStorage.getItem('any-auto-register.manual_email_otp.email') || ''
+        const savedEmail = window.localStorage.getItem('auto-chatgpt.manual_email_otp.email') || ''
         setRegisterMailProvider(provider)
         registerForm.setFieldsValue({
           count: Number(savedSettings.count || 1) || 1,
@@ -862,16 +1053,18 @@ export default function Accounts() {
             savedSettings.chatgpt_team_invite_deferred_activation ?? parseBooleanConfigValue(cfg.chatgpt_team_invite_deferred_activation),
           chatgpt_capture_business_workspace:
             savedSettings.chatgpt_capture_business_workspace
-            ?? (cfg.chatgpt_capture_business_workspace === '' ? true : parseBooleanConfigValue(cfg.chatgpt_capture_business_workspace)),
+            ?? (cfg.chatgpt_capture_business_workspace === '' ? false : parseBooleanConfigValue(cfg.chatgpt_capture_business_workspace)),
           chatgpt_capture_free_workspace:
             savedSettings.chatgpt_capture_free_workspace
             ?? (cfg.chatgpt_capture_free_workspace === '' ? true : parseBooleanConfigValue(cfg.chatgpt_capture_free_workspace)),
+          chatgpt_save_registration_access_token_account:
+            savedSettings.chatgpt_save_registration_access_token_account ?? false,
         })
       })
       .catch(() => {
         setRegisterMailProvider('luckmail')
         const savedSettings = loadRegisterFormSettings(currentPlatform)
-        const savedEmail = window.localStorage.getItem('any-auto-register.manual_email_otp.email') || ''
+        const savedEmail = window.localStorage.getItem('auto-chatgpt.manual_email_otp.email') || ''
         registerForm.setFieldsValue({
           count: Number(savedSettings.count || 1) || 1,
           concurrency: Number(savedSettings.concurrency || 1) || 1,
@@ -882,14 +1075,15 @@ export default function Accounts() {
           chatgpt_existing_account_capture: savedSettings.chatgpt_existing_account_capture ?? false,
           chatgpt_enable_team_invite: savedSettings.chatgpt_enable_team_invite ?? false,
           chatgpt_team_invite_deferred_activation: savedSettings.chatgpt_team_invite_deferred_activation ?? false,
-          chatgpt_capture_business_workspace: savedSettings.chatgpt_capture_business_workspace ?? true,
+          chatgpt_capture_business_workspace: savedSettings.chatgpt_capture_business_workspace ?? false,
           chatgpt_capture_free_workspace: savedSettings.chatgpt_capture_free_workspace ?? true,
+          chatgpt_save_registration_access_token_account: savedSettings.chatgpt_save_registration_access_token_account ?? false,
         })
       })
-  }, [registerModalOpen, currentPlatform, registerForm])
+  }, [registerModalOpen, currentPlatform, registerForm, loadConfigCache])
 
   useEffect(() => {
-    if (!taskId) {
+    if (!taskId || !registerModalOpen) {
       setTaskSnapshot(null)
       return
     }
@@ -902,11 +1096,16 @@ export default function Accounts() {
         const snapshot = await apiFetch(`/tasks/${taskId}`)
         if (cancelled) return
         setTaskSnapshot(snapshot)
-        if (!['done', 'failed', 'stopped'].includes(String(snapshot?.status || ''))) {
+        setActiveTasksPanelOpen(true)
+        void activeTasksQuery.refetch()
+        if (isActiveTaskStatus(snapshot?.status)) {
           timer = window.setTimeout(pull, 1000)
+        } else {
+          clearTaskModalStorage()
         }
       } catch {
         if (cancelled) return
+        clearTaskModalStorage()
         timer = window.setTimeout(pull, 1500)
       }
     }
@@ -919,14 +1118,65 @@ export default function Accounts() {
         window.clearTimeout(timer)
       }
     }
-  }, [taskId])
+  }, [taskId, registerModalOpen, refreshActiveTasks])
 
-  const copyText = (text: string) => {
-    navigator.clipboard.writeText(text)
-    message.success('已复制')
-  }
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    if (!registerModalOpen || !taskId) return
+    window.localStorage.setItem(TASK_MODAL_STORAGE_KEY, JSON.stringify({
+      taskId,
+      taskModalMode,
+      taskModalAccount: taskModalAccount
+        ? {
+            id: taskModalAccount.id,
+            email: taskModalAccount.email,
+          }
+        : null,
+    }))
+  }, [registerModalOpen, taskId, taskModalMode, taskModalAccount])
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    const raw = window.localStorage.getItem(TASK_MODAL_STORAGE_KEY)
+    if (!raw) return
+    let cancelled = false
+
+    const restoreSavedTask = async () => {
+      try {
+        const saved = JSON.parse(raw)
+        const restoredTaskId = String(saved?.taskId || '').trim()
+        if (!restoredTaskId) {
+          clearTaskModalStorage()
+          return
+        }
+        const snapshot = await apiFetch(`/tasks/${restoredTaskId}`)
+        if (cancelled) return
+        if (!isActiveTaskStatus(snapshot?.status)) {
+          clearTaskModalStorage()
+          return
+        }
+        setTaskId(restoredTaskId)
+        setTaskSnapshot(snapshot)
+        setTaskModalMode(taskModalModeFromSource(saved?.taskModalMode))
+        setTaskModalAccount(saved?.taskModalAccount || null)
+        setRegisterModalOpen(true)
+        setActiveTasksPanelOpen(true)
+        void activeTasksQuery.refetch()
+      } catch {
+        clearTaskModalStorage()
+      }
+    }
+
+    void restoreSavedTask()
+    return () => {
+      cancelled = true
+    }
+    // restore once on mount
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   const getRefreshToken = (record: any): string => {
+    if (record?.refresh_token) return String(record.refresh_token || '')
     try {
       const extra = JSON.parse(record.extra_json || '{}')
       return extra.refresh_token || ''
@@ -937,14 +1187,54 @@ export default function Accounts() {
 
   const canImportAccountToTeam = (record: any): boolean => {
     if (currentPlatform !== 'chatgpt') return false
-    if (String(record?.extra?.chatgpt_workspace_scope || '').trim().toLowerCase() !== 'business') return false
+    if (String(record?.workspace_scope || record?.extra?.chatgpt_workspace_scope || '').trim().toLowerCase() !== 'business') return false
     const rt = getRefreshToken(record)
     const accessToken = String(record?.token || '').trim()
-    const sessionToken = String(record?.extra?.session_token || '').trim()
+    const sessionToken = String(record?.session_token || record?.extra?.session_token || '').trim()
     return Boolean(rt || accessToken || sessionToken)
   }
 
-  const exportCsv = () => {
+  const exportCsv = async () => {
+    if (currentPlatform === 'chatgpt') {
+      try {
+        const token = localStorage.getItem('auth_token') || ''
+        if (!token) {
+          throw new Error('未认证，请先登录')
+        }
+        const selectedIds = selectedRowKeys
+          .map((key) => Number(key))
+          .filter((id) => Number.isFinite(id) && id > 0)
+        const res = await fetch('/api/chatgpt/export-sub2api-ticket', {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${token}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ ids: selectedIds }),
+        })
+        if (!res.ok) {
+          let detail = ''
+          try {
+            const data = await res.json()
+            detail = String(data?.detail || data?.message || '')
+          } catch {
+            detail = await res.text()
+          }
+          throw new Error(detail || `导出失败: HTTP ${res.status}`)
+        }
+        const data = await res.json()
+        const ticket = String(data?.ticket || '').trim()
+        if (!ticket) {
+          throw new Error('导出失败：后端未返回下载票据')
+        }
+        window.location.assign(`/api/chatgpt/export-sub2api-download?ticket=${encodeURIComponent(ticket)}`)
+        return
+      } catch (e: any) {
+        message.error(e?.message || '导出失败')
+        return
+      }
+    }
+
     const header = 'email,password,status,region,cashier_url,created_at'
     const rows = accounts.map((a) => [a.email, a.password, a.status, a.region, a.cashier_url, a.created_at].join(','))
     const blob = new Blob([[header, ...rows].join('\n')], { type: 'text/csv' })
@@ -952,51 +1242,11 @@ export default function Accounts() {
     const a = document.createElement('a')
     a.href = url
     a.download = `${currentPlatform}_accounts.csv`
+    a.style.display = 'none'
+    document.body.appendChild(a)
     a.click()
-    URL.revokeObjectURL(url)
-  }
-
-  const handleDelete = async (id: number) => {
-    await apiFetch(`/accounts/${id}`, { method: 'DELETE' })
-    message.success('删除成功')
-    load()
-  }
-
-  const handleRemoveFromTeam = async (record: any) => {
-    setRemovingTeamAccountId(record.id)
-    try {
-      const res = await apiFetch(`/accounts/${record.id}/chatgpt-team-remove`, { method: 'POST' })
-      message.success(res.message || `${getTeamInviteActionLabel(record.teamInviteSource)}成功`)
-      const sourceFromResponse = res?.team_invite_source
-      const teamInviteSource =
-        sourceFromResponse && typeof sourceFromResponse === 'object'
-          ? sourceFromResponse
-          : {
-            ...(record.teamInviteSource || {}),
-            removed_from_team_at: (res?.team_invite_source?.removed_from_team_at || new Date().toISOString()),
-            removable: false,
-          }
-
-      setCurrentAccount((prev: any) => {
-        if (!prev || prev.id !== record.id) return prev
-        return { ...prev, teamInviteSource }
-      })
-
-      setAccounts((prev) =>
-        prev.map((item) =>
-          item.id === record.id
-            ? { ...item, teamInviteSource }
-            : item,
-        ),
-      )
-
-
-      await load()
-    } catch (e: any) {
-      message.error(e.message || '移除队伍失败')
-    } finally {
-      setRemovingTeamAccountId(null)
-    }
+    a.remove()
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000)
   }
 
   const handleImportAccountToTeam = async (record: any) => {
@@ -1011,6 +1261,180 @@ export default function Accounts() {
     }
   }
 
+  const handleResumeSubscriptionAuth = async (record: any) => {
+    setResumeAuthAccountId(record.id)
+    try {
+      const res = await apiFetch('/tasks/chatgpt/resume-subscription-auth', {
+        method: 'POST',
+        body: JSON.stringify({ account_id: Number(record.id) }),
+      })
+      if (!res?.task_id) {
+        throw new Error('任务创建失败：未返回 task_id')
+      }
+      setTaskModalMode('resume_auth')
+      setTaskModalAccount(record)
+      setTaskId(res.task_id)
+      setRegisterModalOpen(true)
+      message.success('补抓Auth任务已启动')
+    } catch (e: any) {
+      message.error(e?.message || '补抓 Auth 失败')
+      await pendingInvitesQuery.refetch()
+    } finally {
+      setResumeAuthAccountId(null)
+    }
+  }
+
+  const getResumeAuthScope = (): 'selected' | 'filtered' => (selectedRowKeys.length > 0 ? 'selected' : 'filtered')
+
+  const getResumeAuthSelectedIds = () =>
+    Array.from(selectedRowKeys)
+      .map((value) => Number(value))
+      .filter((value) => Number.isInteger(value) && value > 0)
+
+  const buildResumeAuthMenuLabel = () => {
+    const scope = getResumeAuthScope()
+    return scope === 'selected'
+      ? `补抓所选 Auth (${selectedRowKeys.length})`
+      : `补抓当前筛选待补抓账号 (${total})`
+  }
+
+  const handleBatchResumeSubscriptionAuth = async (scope: 'selected' | 'filtered') => {
+    const toastKey = `resume-auth:${scope}`
+    const body: Record<string, unknown> = {}
+    let requestedCount = total
+
+    if (scope === 'selected') {
+      const accountIds = getResumeAuthSelectedIds()
+      if (accountIds.length === 0) {
+        message.warning('请先选择要补抓的账号')
+        return
+      }
+      requestedCount = accountIds.length
+      body.account_ids = accountIds
+    } else {
+      body.all_filtered = true
+      if (search) body.email = search
+      if (filterStatus) body.status = filterStatus
+    }
+
+    setBatchResumeAuthLoading(scope)
+    message.loading({ content: '批量补抓Auth任务创建中...', key: toastKey, duration: 0 })
+    try {
+      const res = await apiFetch('/tasks/chatgpt/resume-subscription-auth/batch', {
+        method: 'POST',
+        body: JSON.stringify(body),
+      })
+
+      const eligible = Number(res?.eligible || 0)
+      const skipped = Number(res?.skipped || 0)
+      const missing = Number(res?.missing || 0)
+      const taskIdFromResponse = String(res?.task_id || '').trim()
+
+      if (!taskIdFromResponse) {
+        message.info({
+          content: `没有可执行补抓的账号。请求 ${requestedCount} 个，跳过 ${skipped} 个${missing > 0 ? `，缺失 ${missing} 个` : ''}`,
+          key: toastKey,
+        })
+        if (res && typeof res === 'object') {
+          showBatchActionResult('批量补抓Auth结果', res)
+        }
+        return
+      }
+
+      const snapshot = await apiFetch(`/tasks/${taskIdFromResponse}`)
+      setTaskModalMode('resume_auth')
+      setTaskModalAccount(
+        scope === 'selected'
+          ? null
+          : { email: `当前筛选 ${eligible} 个账号` },
+      )
+      setTaskId(taskIdFromResponse)
+      setTaskSnapshot(snapshot)
+      setRegisterModalOpen(true)
+      setActiveTasksPanelOpen(true)
+      void activeTasksQuery.refetch()
+      message.success({
+        content: `批量补抓Auth任务已启动：可执行 ${eligible} 个，跳过 ${skipped} 个${missing > 0 ? `，缺失 ${missing} 个` : ''}`,
+        key: toastKey,
+      })
+      showBatchActionResult('批量补抓Auth结果', res)
+    } catch (e: any) {
+      message.error({ content: `批量补抓Auth失败: ${e.message}`, key: toastKey })
+    } finally {
+      setBatchResumeAuthLoading('')
+    }
+  }
+
+  const handleBatchPaymentLink = async () => {
+    const scope: 'selected' | 'filtered' = selectedRowKeys.length > 0 ? 'selected' : 'filtered'
+    const toastKey = `payment-link:${scope}`
+    const body: Record<string, unknown> = {
+      skip_existing: true,
+      force_refresh: false,
+      params: {},
+    }
+    let requestedCount = total
+
+    if (scope === 'selected') {
+      const accountIds = Array.from(selectedRowKeys)
+        .map((value) => Number(value))
+        .filter((value) => Number.isInteger(value) && value > 0)
+      if (accountIds.length === 0) {
+        message.warning('请先选择要生成订阅链接的账号')
+        return
+      }
+      requestedCount = accountIds.length
+      body.account_ids = accountIds
+    } else {
+      body.all_filtered = true
+      if (search) body.email = search
+      if (filterStatus) body.status = filterStatus
+    }
+
+    setBatchPaymentLinkLoading(true)
+    message.loading({ content: '批量订阅链接任务创建中...', key: toastKey, duration: 0 })
+    try {
+      const res = await apiFetch('/tasks/chatgpt/payment-links/batch', {
+        method: 'POST',
+        body: JSON.stringify(body),
+      })
+
+      const eligible = Number(res?.eligible || 0)
+      const skipped = Number(res?.skipped || 0)
+      const missing = Number(res?.missing || 0)
+      const taskIdFromResponse = String(res?.task_id || '').trim()
+
+      if (!taskIdFromResponse) {
+        message.info({
+          content: `没有可生成订阅链接的账号。请求 ${requestedCount} 个，跳过 ${skipped} 个${missing > 0 ? `，缺失 ${missing} 个` : ''}`,
+          key: toastKey,
+        })
+        if (res && typeof res === 'object') {
+          showBatchActionResult('批量订阅链接结果', res)
+        }
+        return
+      }
+
+      const snapshot = await apiFetch(`/tasks/${taskIdFromResponse}`)
+      setTaskModalMode('payment_link')
+      setTaskModalAccount(scope === 'selected' ? null : { email: `当前筛选 ${eligible} 个账号` })
+      setTaskId(taskIdFromResponse)
+      setTaskSnapshot(snapshot)
+      setRegisterModalOpen(true)
+      setActiveTasksPanelOpen(true)
+      void activeTasksQuery.refetch()
+      message.success({
+        content: `批量订阅链接任务已启动：可执行 ${eligible} 个，跳过 ${skipped} 个${missing > 0 ? `，缺失 ${missing} 个` : ''}`,
+        key: toastKey,
+      })
+      showBatchActionResult('批量订阅链接结果', res)
+    } catch (e: any) {
+      message.error({ content: `批量订阅链接失败: ${e.message}`, key: toastKey })
+    } finally {
+      setBatchPaymentLinkLoading(false)
+    }
+  }
+
   const handleBatchDelete = async () => {
     if (selectedRowKeys.length === 0) return
     await apiFetch('/accounts/batch-delete', {
@@ -1020,6 +1444,354 @@ export default function Accounts() {
     message.success('批量删除成功')
     setSelectedRowKeys([])
     load()
+  }
+
+  const handleDeleteAccount = async (record: any) => {
+    const accountId = Number(record?.id || 0)
+    if (!accountId) return
+    const label = String(record?.email || accountId)
+    await apiFetch(`/accounts/${accountId}`, { method: 'DELETE' })
+    message.success(`已删除账号：${label}`)
+    setSelectedRowKeys((keys) => keys.filter((key) => Number(key) !== accountId))
+    load()
+  }
+
+  const getSelectedChatgptAccounts = () => {
+    const selected = new Set(selectedRowKeys.map((key) => Number(key)))
+    return accounts.filter((account) => account.platform === 'chatgpt' && selected.has(Number(account.id)))
+  }
+
+  const loadGopayBatchConfig = async () => {
+    const [data, otpSettings] = await Promise.all([
+      apiFetch('/config'),
+      apiFetch('/integrations/gopay-otp').catch(() => ({})),
+    ])
+    const phones = normalizeGopayPhoneCandidates(data.chatgpt_gopay_phone_candidates).filter((phone) => phone.enabled !== false)
+    const defaults = parseMaybeJsonObject(data.chatgpt_gopay_defaults)
+    setBatchGopayOtpAutoResendDelay(normalizeGopayOtpAutoResendDelay(otpSettings.otp_auto_resend_delay_seconds))
+    setBatchGopayPhones(phones)
+    setBatchGopayDefaults(defaults)
+    if (batchGopayOpen && !batchGopayStarted && batchGopayItems.length > 0 && phones.length > 0) {
+      setBatchGopayItems((items) => reassignBatchGopayPhones(items, phones))
+    }
+    return { phones, defaults }
+  }
+
+  const saveBatchGopayOtpAutoResendDelay = async (
+    value: unknown,
+    options: { notify?: boolean; throwOnError?: boolean } = {},
+  ) => {
+    const delay = normalizeGopayOtpAutoResendDelay(value)
+    setBatchGopayOtpDelaySaving(true)
+    try {
+      const data = await apiFetch('/integrations/gopay-otp/settings', {
+        method: 'PUT',
+        body: JSON.stringify({ otp_auto_resend_delay_seconds: delay }),
+      })
+      const savedDelay = normalizeGopayOtpAutoResendDelay(data.otp_auto_resend_delay_seconds)
+      setBatchGopayOtpAutoResendDelay(savedDelay)
+      if (options.notify !== false) message.success('GoPay OTP 自动重发延迟已保存')
+      return savedDelay
+    } catch (e: any) {
+      if (options.notify !== false) message.error(e?.message || '保存 GoPay OTP 自动重发延迟失败')
+      if (options.throwOnError) throw e
+      return delay
+    } finally {
+      setBatchGopayOtpDelaySaving(false)
+    }
+  }
+
+  const saveBatchGopayPhoneCandidates = async (nextCandidates: GopayPhoneCandidate[]) => {
+    const normalized = normalizeGopayPhoneCandidates(nextCandidates)
+    setBatchGopayPhones(normalized)
+    await apiFetch('/config', {
+      method: 'PUT',
+      body: JSON.stringify({
+        data: {
+          chatgpt_gopay_phone_candidates: JSON.stringify(normalized),
+        },
+      }),
+    })
+    if (batchGopayOpen && !batchGopayStarted && batchGopayItems.length > 0 && normalized.length > 0) {
+      setBatchGopayItems((items) => reassignBatchGopayPhones(items, normalized))
+    }
+    return normalized
+  }
+
+  const deleteBatchGopayPhone = async (phoneId: string) => {
+    await saveBatchGopayPhoneCandidates(removeGopayPhoneCandidate(batchGopayPhones, phoneId))
+  }
+
+  const moveBatchGopayPhone = async (phoneId: string, direction: 'up' | 'down' | 'top' | 'bottom') => {
+    await saveBatchGopayPhoneCandidates(moveGopayPhoneCandidate(batchGopayPhones, phoneId, direction))
+  }
+
+  const openBatchGopayWorkbench = async () => {
+    const selectedAccounts = getSelectedChatgptAccounts()
+    if (selectedAccounts.length === 0) {
+      message.warning('请先选择要批量支付的 ChatGPT 账号')
+      return
+    }
+    setBatchGopayOpen(true)
+    setBatchGopayLoading(true)
+    setBatchGopayPhoneCountryCode('86')
+    setBatchGopayPhoneNumber('')
+    setBatchGopayPhoneSaving(false)
+    setBatchGopayItems([])
+    setBatchGopayPhones([])
+    setBatchGopayDefaults({})
+    setBatchGopayStarted(false)
+    setBatchGopayNextRoundAt(null)
+    try {
+      const { phones } = await loadGopayBatchConfig()
+      if (phones.length === 0) {
+        message.warning('手机号池为空，请先在单账号 GoPay 中保存手机号候选')
+        return
+      }
+      const items = buildBatchGopayItems(selectedAccounts, phones)
+      setBatchGopayItems(items)
+    } catch (e: any) {
+      message.error(e?.message || '加载 GoPay 批量配置失败')
+    } finally {
+      setBatchGopayLoading(false)
+    }
+  }
+
+  const addBatchGopayPhoneToPool = async () => {
+    const phone_country_code = normalizeGopayPhonePart(batchGopayPhoneCountryCode)
+    const phone_number = normalizeGopayPhonePart(batchGopayPhoneNumber)
+    if (!phone_country_code || !phone_number) {
+      message.warning('请输入区号和手机号')
+      return
+    }
+    setBatchGopayPhoneSaving(true)
+    try {
+      await saveBatchGopayPhoneCandidates(upsertGopayPhoneCandidate(batchGopayPhones, {
+        label: `GoPay ${batchGopayPhones.length + 1}`,
+        phone_country_code,
+        phone_number,
+        enabled: true,
+      }))
+      setBatchGopayPhoneNumber('')
+      message.success('手机号已加入候选池')
+    } catch (e: any) {
+      message.error(e?.message || '加入手机号池失败')
+    } finally {
+      setBatchGopayPhoneSaving(false)
+    }
+  }
+
+  const updateBatchGopayItem = (accountId: number, patch: Partial<BatchGopayItem>) => {
+    setBatchGopayItems((items) => items.map((item) => (
+      Number(item.account.id) === Number(accountId)
+        ? { ...item, ...patch }
+        : item
+    )))
+  }
+
+  const buildBatchGopayPayload = (item: BatchGopayItem) => {
+    const accountEmail = String(item.account.email || '').trim()
+    const phoneCountryCode = String(item.phone.phone_country_code || '').trim()
+    const phoneNumber = String(item.phone.phone_number || '').trim()
+    return {
+      phone_country_code: phoneCountryCode,
+      phone_number: phoneNumber,
+      pin: String(batchGopayDefaults.pin || '').trim(),
+      proxy: String(batchGopayDefaults.proxy || '').trim(),
+      browser_profile_mode: String(batchGopayDefaults.browser_profile_mode || 'fresh_payment').trim() || 'fresh_payment',
+      save_defaults: false,
+      plan: 'plus',
+      country: normalizeCheckoutCountry(batchGopayDefaults.country || DEFAULT_CHECKOUT_COUNTRY),
+      currency: normalizeCheckoutCurrency(batchGopayDefaults.currency || DEFAULT_CHECKOUT_CURRENCY),
+      checkout_url: '',
+      billing_name: String(batchGopayDefaults.billing_name || '').trim(),
+      billing_email: accountEmail || String(batchGopayDefaults.billing_email || '').trim(),
+      billing_country: String(batchGopayDefaults.billing_country || 'US').trim(),
+      billing_line1: String(batchGopayDefaults.billing_line1 || '').trim(),
+      billing_city: String(batchGopayDefaults.billing_city || '').trim(),
+      billing_state: String(batchGopayDefaults.billing_state || '').trim(),
+      billing_postal_code: String(batchGopayDefaults.billing_postal_code || '').trim(),
+      billing_generation_context: [
+        `batch_index=${item.batchIndex || ''}`,
+        `round=${item.round || ''}`,
+        `account_id=${item.account.id || ''}`,
+        `account_email=${accountEmail}`,
+        `phone=+${phoneCountryCode} ${phoneNumber}`,
+      ].filter((part) => !part.endsWith('=') && !part.endsWith('=+ ')).join('; '),
+    }
+  }
+
+  const startBatchGopayItem = async (item: BatchGopayItem) => {
+    if (batchGopayCancelRequestedRef.current) {
+      updateBatchGopayItem(item.account.id, { status: 'cancelled', error: '' })
+      return null
+    }
+    updateBatchGopayItem(item.account.id, { status: 'starting', error: '' })
+    try {
+      const data = await apiFetch(`/chatgpt/${item.account.id}/gopay/start`, {
+        method: 'POST',
+        body: JSON.stringify(buildBatchGopayPayload(item)),
+      })
+      if (batchGopayCancelRequestedRef.current) {
+        const cancelled = await apiFetch(`/chatgpt/${item.account.id}/gopay/${encodeURIComponent(data.session_id)}/cancel`, {
+          method: 'POST',
+        })
+        updateBatchGopayItem(item.account.id, { status: 'cancelled', snapshot: cancelled, error: '' })
+        return cancelled
+      }
+      updateBatchGopayItem(item.account.id, { status: 'running', snapshot: data, error: '' })
+      return data
+    } catch (e: any) {
+      updateBatchGopayItem(item.account.id, { status: 'failed', error: e?.message || '启动失败' })
+      return null
+    }
+  }
+
+  const startBatchGopayRound = async (round: number) => {
+    if (batchGopayStartingRef.current) return
+    batchGopayStartingRef.current = true
+    try {
+      const roundItems = batchGopayItems.filter((item) => item.round === round && item.status === 'queued')
+      await Promise.all(roundItems.map((item) => startBatchGopayItem(item)))
+    } finally {
+      batchGopayStartingRef.current = false
+    }
+  }
+
+  const startBatchGopay = async () => {
+    if (batchGopayItems.length === 0) return
+    try {
+      await saveBatchGopayOtpAutoResendDelay(batchGopayOtpAutoResendDelay, { notify: false, throwOnError: true })
+      batchGopayCancelRequestedRef.current = false
+      setBatchGopayStarted(true)
+      setBatchGopayNextRoundAt(null)
+      await startBatchGopayRound(1)
+    } catch (e: any) {
+      message.error(e?.message || '启动批量 GoPay 失败')
+    }
+  }
+
+  const batchGopayActiveItems = batchGopayItems.filter((item) => {
+    const phase = String(item.snapshot?.phase || '')
+    return item.snapshot?.session_id && GOPAY_ACTIVE_PHASES.has(phase)
+  })
+
+  useEffect(() => {
+    if (!pageVisible || !batchGopayOpen || batchGopayActiveItems.length === 0) return
+    const timer = window.setInterval(async () => {
+      await Promise.all(batchGopayActiveItems.map(async (item) => {
+        try {
+          const data = await apiFetch(`/chatgpt/${item.account.id}/gopay/${encodeURIComponent(item.snapshot.session_id)}`)
+          const phase = String(data.phase || '')
+          updateBatchGopayItem(item.account.id, {
+            snapshot: data,
+            status: phase === 'succeeded' ? 'done' : phase === 'failed' ? 'failed' : phase === 'cancelled' ? 'cancelled' : 'running',
+            error: data.last_error || '',
+          })
+        } catch (e: any) {
+          updateBatchGopayItem(item.account.id, { error: e?.message || '刷新状态失败' })
+        }
+      }))
+    }, 3000)
+    return () => window.clearInterval(timer)
+  }, [pageVisible, batchGopayOpen, batchGopayActiveItems.map((item) => `${item.account.id}:${item.snapshot?.session_id}:${item.snapshot?.phase}`).join('|')])
+
+  useEffect(() => {
+    if (!batchGopayOpen || !batchGopayStarted || batchGopayItems.length === 0) return
+    const rounds = Array.from(new Set(batchGopayItems.map((item) => item.round))).sort((a, b) => a - b)
+    const currentRound = rounds.find((round) => batchGopayItems.some((item) => item.round === round && ['queued', 'starting', 'running'].includes(item.status)))
+    if (!currentRound) return
+    const currentItems = batchGopayItems.filter((item) => item.round === currentRound)
+    const hasQueuedCurrent = currentItems.some((item) => item.status === 'queued')
+    const hasActiveCurrent = currentItems.some((item) => item.status === 'starting' || item.status === 'running')
+    if (hasQueuedCurrent && !hasActiveCurrent && batchGopayNextRoundAt == null && currentRound === 1) {
+      startBatchGopayRound(currentRound)
+      return
+    }
+    if (hasQueuedCurrent || hasActiveCurrent) return
+    const nextRound = rounds.find((round) => round > currentRound && batchGopayItems.some((item) => item.round === round && item.status === 'queued'))
+    if (!nextRound) return
+    if (batchGopayNextRoundAt == null) {
+      setBatchGopayNextRoundAt(Date.now() + Math.max(0, Number(batchGopayRoundInterval || 0)) * 1000)
+    }
+  }, [batchGopayOpen, batchGopayStarted, batchGopayItems, batchGopayNextRoundAt, batchGopayRoundInterval])
+
+  useEffect(() => {
+    if (!batchGopayOpen || !batchGopayStarted || batchGopayNextRoundAt == null) return
+    const delay = Math.max(0, batchGopayNextRoundAt - Date.now())
+    const timer = window.setTimeout(async () => {
+      const next = Math.min(...batchGopayItems.filter((item) => item.status === 'queued').map((item) => item.round))
+      setBatchGopayNextRoundAt(null)
+      if (Number.isFinite(next)) {
+        await startBatchGopayRound(next)
+      }
+    }, delay)
+    return () => window.clearTimeout(timer)
+  }, [batchGopayOpen, batchGopayStarted, batchGopayNextRoundAt, batchGopayItems])
+
+  const submitBatchGopayInput = async (item: BatchGopayItem, value: string) => {
+    if (!item.snapshot?.session_id) return
+    const phase = String(item.snapshot.phase || '')
+    const path = phase === 'waiting_otp' ? 'otp' : 'pin'
+    const key = phase === 'waiting_otp' ? 'otp' : 'pin'
+    updateBatchGopayItem(item.account.id, { submitting: true })
+    try {
+      const data = await apiFetch(`/chatgpt/${item.account.id}/gopay/${encodeURIComponent(item.snapshot.session_id)}/${path}`, {
+        method: 'POST',
+        body: JSON.stringify({ [key]: String(value || '').trim() }),
+      })
+      updateBatchGopayItem(item.account.id, { snapshot: data, submitting: false, error: '' })
+      message.success(`已提交 ${item.account.email}`)
+    } catch (e: any) {
+      updateBatchGopayItem(item.account.id, { submitting: false, error: e?.message || '提交失败' })
+      message.error(e?.message || '提交失败')
+    }
+  }
+
+  const resendBatchGopayOtp = async (item: BatchGopayItem) => {
+    if (!item.snapshot?.session_id) return
+    updateBatchGopayItem(item.account.id, { submitting: true, error: '' })
+    try {
+      const data = await apiFetch(`/chatgpt/${item.account.id}/gopay/${encodeURIComponent(item.snapshot.session_id)}/resend-otp`, {
+        method: 'POST',
+      })
+      updateBatchGopayItem(item.account.id, { snapshot: data, submitting: false, error: '' })
+      message.success(`GoPay OTP 重发请求已提交：${item.account.email}`)
+    } catch (e: any) {
+      updateBatchGopayItem(item.account.id, { submitting: false, error: e?.message || '重发 OTP 失败' })
+      message.error(e?.message || '重发 OTP 失败')
+    }
+  }
+
+  const cancelBatchGopayItem = async (item: BatchGopayItem) => {
+    if (!item.snapshot?.session_id) {
+      updateBatchGopayItem(item.account.id, { status: 'cancelled' })
+      return
+    }
+    try {
+      const data = await apiFetch(`/chatgpt/${item.account.id}/gopay/${encodeURIComponent(item.snapshot.session_id)}/cancel`, {
+        method: 'POST',
+      })
+      updateBatchGopayItem(item.account.id, { status: 'cancelled', snapshot: data })
+    } catch (e: any) {
+      message.error(e?.message || '取消 GoPay 会话失败')
+    }
+  }
+
+  const cancelBatchGopayAll = async () => {
+    const cancellableItems = batchGopayItems.filter((item) => (
+      ['queued', 'starting', 'running'].includes(item.status)
+      || (item.snapshot?.session_id && GOPAY_ACTIVE_PHASES.has(String(item.snapshot?.phase || '')))
+    ))
+    if (cancellableItems.length === 0) {
+      message.info('当前没有可取消的批量支付任务')
+      return
+    }
+    batchGopayCancelRequestedRef.current = true
+    setBatchGopayStarted(false)
+    setBatchGopayNextRoundAt(null)
+    await Promise.all(cancellableItems.map((item) => cancelBatchGopayItem(item)))
+    message.success(`已取消 ${cancellableItems.length} 个批量支付任务`)
   }
 
   const handleDeleteInvalid = async () => {
@@ -1088,14 +1860,15 @@ export default function Accounts() {
       chatgpt_capture_free_workspace:
         values.chatgpt_capture_free_workspace === undefined ? true : Boolean(values.chatgpt_capture_free_workspace),
       chatgpt_capture_business_workspace:
-        values.chatgpt_capture_business_workspace === undefined ? true : Boolean(values.chatgpt_capture_business_workspace),
+        values.chatgpt_capture_business_workspace === undefined ? false : Boolean(values.chatgpt_capture_business_workspace),
+      chatgpt_save_registration_access_token_account: Boolean(values.chatgpt_save_registration_access_token_account),
     }
 
     setRegisterSettingsSaving(true)
     try {
       saveRegisterFormSettings(currentPlatform, settingsPayload)
       if (settingsPayload.mail_provider_override === 'manual_email_otp' && settingsPayload.email) {
-        window.localStorage.setItem('any-auto-register.manual_email_otp.email', settingsPayload.email)
+        window.localStorage.setItem('auto-chatgpt.manual_email_otp.email', settingsPayload.email)
       }
       message.success('注册设置已保存')
     } catch (e: any) {
@@ -1109,7 +1882,9 @@ export default function Accounts() {
     const values = await registerForm.validateFields()
     setRegisterLoading(true)
     try {
-      const cfg = await apiFetch('/config')
+      setTaskModalMode('register')
+      setTaskModalAccount(null)
+      const cfg = await loadConfigCache({ force: true })
       const selectedProviderOverride = String(values.mail_provider_override || '').trim()
       const resolvedMailProvider =
         selectedProviderOverride && selectedProviderOverride !== '__global__'
@@ -1208,6 +1983,10 @@ export default function Accounts() {
           currentPlatform === 'chatgpt' && values.chatgpt_enable_team_invite && !existingAccountCapture
             ? Boolean(values.chatgpt_team_invite_deferred_activation)
             : undefined,
+        chatgpt_save_registration_access_token_account:
+          currentPlatform === 'chatgpt'
+            ? Boolean(values.chatgpt_save_registration_access_token_account)
+            : undefined,
       }
       const chatgptRegistrationRequestAdapter =
         buildChatGPTRegistrationRequestAdapter(
@@ -1223,7 +2002,7 @@ export default function Accounts() {
         if (!normalizedEmail) {
           throw new Error('手动邮箱模式必须填写邮箱地址')
         }
-        window.localStorage.setItem('any-auto-register.manual_email_otp.email', normalizedEmail)
+        window.localStorage.setItem('auto-chatgpt.manual_email_otp.email', normalizedEmail)
       }
 
       saveRegisterFormSettings(currentPlatform, {
@@ -1237,7 +2016,8 @@ export default function Accounts() {
         chatgpt_team_invite_deferred_activation: Boolean(values.chatgpt_team_invite_deferred_activation),
         chatgpt_capture_free_workspace: Boolean(values.chatgpt_capture_free_workspace),
         chatgpt_capture_business_workspace:
-          values.chatgpt_capture_business_workspace === undefined ? true : Boolean(values.chatgpt_capture_business_workspace),
+          values.chatgpt_capture_business_workspace === undefined ? false : Boolean(values.chatgpt_capture_business_workspace),
+        chatgpt_save_registration_access_token_account: Boolean(values.chatgpt_save_registration_access_token_account),
       })
 
       const res = await apiFetch('/tasks/register', {
@@ -1268,12 +2048,13 @@ export default function Accounts() {
 
   const handleDetailSave = async () => {
     const values = await detailForm.validateFields()
-    await apiFetch(`/accounts/${currentAccount.id}`, {
+    await apiFetch(`/accounts/${detailAccount.id}`, {
       method: 'PATCH',
       body: JSON.stringify(values),
     })
     message.success('保存成功')
     setDetailModalOpen(false)
+    await accountDetailQuery.refetch()
     load()
   }
 
@@ -1319,10 +2100,15 @@ export default function Accounts() {
 
   const showBatchActionResult = (title: string, result: any) => {
     const lines = (result.items || [])
-      .filter((item: any) => !item.ok)
+      .filter((item: any) => Object.prototype.hasOwnProperty.call(item || {}, 'ok') && !item.ok)
       .map((item: any) => `[${item.id || '-'}] ${item.email || '-'}: ${item.message || '失败'}`)
+    const skippedLines = (result.skipped_items || [])
+      .map((item: any) => `[${item.account_id || '-'}] ${item.email || '-'}: ${item.reason || '已跳过'}`)
+    const missingLines = (result.missing_ids || [])
+      .map((id: any) => `[${id || '-'}] 账号不存在`)
+    const allLines = [...lines, ...skippedLines, ...missingLines]
 
-    if (lines.length === 0) return
+    if (allLines.length === 0) return
 
     Modal.info({
       title,
@@ -1342,7 +2128,7 @@ export default function Accounts() {
             wordBreak: 'break-word',
           }}
         >
-          {lines.join('\n')}
+          {allLines.join('\n')}
         </pre>
       ),
     })
@@ -1533,71 +2319,23 @@ export default function Accounts() {
   const cellStackStyle: React.CSSProperties = {
     display: 'flex',
     flexDirection: 'column',
-    gap: 6,
+    gap: isChatgptPlatform ? 4 : 6,
     minWidth: 0,
   }
-  const secretPreviewStyle: React.CSSProperties = {
-    ...monospaceStyle,
-    filter: 'blur(4px)',
-    whiteSpace: 'nowrap',
-    overflow: 'hidden',
-    textOverflow: 'ellipsis',
-    maxWidth: '100%',
-    opacity: 0.9,
-  }
   const compactPanelStyle: React.CSSProperties = {
-    padding: '8px 10px',
+    padding: '6px 8px',
     borderRadius: token.borderRadiusLG,
     border: `1px solid ${token.colorBorder}`,
     background: token.colorFillAlter,
   }
-  const remoteOverviewStyle: React.CSSProperties = {
-    display: 'flex',
-    flexWrap: 'wrap',
-    gap: 8,
-    alignItems: 'center',
-    padding: '8px 10px',
-    borderRadius: token.borderRadiusLG,
-    border: `1px solid ${token.colorBorder}`,
-    background: token.colorBgContainer,
-  }
-
   const sub2apiOverview = summarizeSub2ApiStates(accounts)
-
-  useEffect(() => {
-    if (currentPlatform !== 'chatgpt' || accounts.length === 0 || sub2apiOverview.unknown === 0 || sub2apiOverviewSyncing) {
-      return
-    }
-
-    const syncKey = `${currentPlatform}|${search}|${filterStatus}|${accounts.map((item: any) => item.id).join(',')}`
-    if (sub2apiOverviewSyncKeyRef.current === syncKey) {
-      return
-    }
-    sub2apiOverviewSyncKeyRef.current = syncKey
-    setSub2apiOverviewSyncing(true)
-
-    const body: Record<string, unknown> = {
-      all_filtered: true,
-      params: {},
-    }
-    if (search) body.email = search
-    if (filterStatus) body.status = filterStatus
-
-    apiFetch(`/actions/${currentPlatform}/sync_sub2api_status/batch`, {
-      method: 'POST',
-      body: JSON.stringify(body),
-    })
-      .then(() => load())
-      .catch(() => {})
-      .finally(() => setSub2apiOverviewSyncing(false))
-  }, [accounts, currentPlatform, filterStatus, load, search, sub2apiOverview.unknown, sub2apiOverviewSyncing])
 
   const columns: any[] = [
     {
       title: '邮箱',
       dataIndex: 'email',
       key: 'email',
-      width: 260,
+      width: 220,
       render: (text: string, record: any) => {
         const teamInviteOwner = getTeamInviteOwnerLabel(record.teamInviteSource)
         const teamInviteMeta = [
@@ -1607,36 +2345,50 @@ export default function Accounts() {
 
         return (
           <div style={cellStackStyle}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 4, minWidth: 0 }}>
               <Text
-                style={{ ...monospaceStyle, flex: 1, minWidth: 0, whiteSpace: 'nowrap' }}
+                style={{ ...monospaceStyle, flex: 1, minWidth: 0, whiteSpace: 'nowrap', fontSize: 12 }}
                 ellipsis={{ tooltip: text }}
               >
                 {text}
               </Text>
-              {record.extra?.chatgpt_workspace_label ? (
-                <Tag color={record.extra.chatgpt_workspace_scope === 'business' ? 'processing' : 'default'}>
-                  {record.extra.chatgpt_workspace_label}
+              {record.manuallyUsed ? (
+                <Tag color="orange">已使用</Tag>
+              ) : null}
+              {record.workspace_label || record.extra?.chatgpt_workspace_label ? (
+                <Tag color={(record.workspace_scope || record.extra?.chatgpt_workspace_scope) === 'business' ? 'processing' : 'default'}>
+                  {record.workspace_label || record.extra?.chatgpt_workspace_label}
                 </Tag>
               ) : null}
-              <Button type="text" size="small" icon={<CopyOutlined />} onClick={() => copyText(text)} />
+              <Button
+                type="text"
+                size="small"
+                icon={<CopyOutlined />}
+                onClick={async () => {
+                  const ok = await copyText(text)
+                  if (ok) {
+                    await markAccountUsed(Number(record.id || 0))
+                  }
+                }}
+              />
             </div>
             <Text
               type="secondary"
-              style={secondaryTextStyle}
-              ellipsis={{ tooltip: record.extra?.chatgpt_workspace_display_name || record.user_id || `账号 #${record.id}` }}
+              style={{ ...secondaryTextStyle, fontSize: 11, lineHeight: '18px' }}
+              ellipsis={{ tooltip: record.workspace_display_name || record.extra?.chatgpt_workspace_display_name || record.user_id || `账号 #${record.id}` }}
             >
-              {record.extra?.chatgpt_workspace_display_name
-                ? `名称: ${record.extra.chatgpt_workspace_display_name}`
-                : (record.user_id ? `UID: ${record.user_id}` : `账号 #${record.id}`)}
+              {record.workspace_display_name
+                || record.extra?.chatgpt_workspace_display_name
+                || record.user_id
+                || `#${record.id}`}
             </Text>
             {teamInviteOwner ? (
               <Text
                 type="secondary"
-                style={secondaryTextStyle}
+                style={{ ...secondaryTextStyle, fontSize: 11, lineHeight: '18px' }}
                 ellipsis={{ tooltip: `${teamInviteOwner}${teamInviteMeta ? ` · ${teamInviteMeta}` : ''}` }}
               >
-                {`母号: ${teamInviteOwner}${teamInviteMeta ? ` · ${teamInviteMeta}` : ''}`}
+                {`${teamInviteOwner}${teamInviteMeta ? ` · ${teamInviteMeta}` : ''}`}
               </Text>
             ) : null}
           </div>
@@ -1647,29 +2399,36 @@ export default function Accounts() {
       title: '密码',
       dataIndex: 'password',
       key: 'password',
-      width: 150,
-      render: (text: string) => (
-        <Space size={6} style={{ width: '100%', justifyContent: 'space-between' }}>
-          <Text style={{ ...secretPreviewStyle, maxWidth: 90 }} title={text}>
-            {text}
-          </Text>
-          <Button type="text" size="small" icon={<CopyOutlined />} onClick={() => copyText(text)} />
-        </Space>
-      ),
+      width: 96,
+      render: (text: string) => {
+        const hasPassword = Boolean(String(text || '').trim())
+        return (
+          <Space size={2} style={{ width: '100%', justifyContent: 'center' }}>
+            <Tag color={hasPassword ? 'success' : 'default'}>{hasPassword ? '有密码' : '无密码'}</Tag>
+            {hasPassword ? (
+              <Button title="复制密码" type="text" size="small" icon={<CopyOutlined />} onClick={() => copyText(text)} />
+            ) : null}
+          </Space>
+        )
+      },
     },
     {
       title: 'RT',
       key: 'refresh_token',
-      width: 120,
+      width: 92,
       render: (_: any, record: any) => {
         const rt = getRefreshToken(record)
-        if (!rt) return <span style={{ color: '#ccc' }}>-</span>
+        if (!rt) {
+          return (
+            <Space size={2} style={{ width: '100%', justifyContent: 'center' }}>
+              <Tag color="default">无RT</Tag>
+            </Space>
+          )
+        }
         return (
-          <Space size={6} style={{ width: '100%', justifyContent: 'space-between' }}>
-            <Text style={{ ...secretPreviewStyle, fontSize: 11, maxWidth: 58 }} title={rt}>
-              {rt}
-            </Text>
-            <Button type="text" size="small" icon={<CopyOutlined />} onClick={() => copyText(rt)} />
+          <Space size={2} style={{ width: '100%', justifyContent: 'center' }}>
+            <Tag color="success">有RT</Tag>
+            <Button title="复制RT" type="text" size="small" icon={<CopyOutlined />} onClick={() => copyText(rt)} />
           </Space>
         )
       },
@@ -1678,8 +2437,8 @@ export default function Accounts() {
       title: '状态',
       dataIndex: 'status',
       key: 'status',
-      width: 110,
-      render: (status: string) => <Tag color={STATUS_COLORS[status] || 'default'}>{status}</Tag>,
+      width: 84,
+      render: (status: string) => <Tag color={STATUS_COLORS[status] || 'default'}>{statusLabel(status)}</Tag>,
     },
   ]
 
@@ -1688,21 +2447,24 @@ export default function Accounts() {
       {
         title: '本地状态',
         key: 'chatgpt_local_state',
-        width: 220,
+        width: isChatgptPlatform ? 164 : 220,
         render: (_: any, record: any) => {
           const auth = record.chatgptLocal?.auth || {}
           const subscription = record.chatgptLocal?.subscription || {}
           const codex = record.chatgptLocal?.codex || {}
-          const authMeta = authStateMeta(auth.state)
-          const planTag = planMeta(subscription.plan)
-          const codexMeta = codexStateMeta(codex.state)
+          const capabilities = record.chatgptCapabilities || {}
+          const authMeta = authLevelMeta(record.auth_level || capabilities.auth_level, auth.state)
+          const materialMeta = workspaceMeta(capabilities)
+          const planTag = planMeta(record.subscription_plan || capabilities.subscription_plan || subscription.plan)
+          const codexMeta = codexStateMeta(record.codex_state || codex.state)
 
           return (
             <div style={{ ...cellStackStyle, ...compactPanelStyle }}>
-              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
                 <Tag color={authMeta.color}>{authMeta.label}</Tag>
+                <Tag color={materialMeta.color}>{materialMeta.label}</Tag>
                 <Tag color={planTag.color}>{planTag.label}</Tag>
-                <Tag color={codexMeta.color}>Codex {codexMeta.label}</Tag>
+                <Tag color={codexMeta.color}>Codex{codexMeta.label}</Tag>
               </div>
             </div>
           )
@@ -1711,10 +2473,14 @@ export default function Accounts() {
       {
         title: 'Sub2API',
         key: 'sub2api_sync',
-        width: 170,
+        width: 88,
         render: (_: any, record: any) => {
           const sync = record.sub2apiSync || {}
-          const meta = sub2apiStateMeta(sync)
+          const meta = sub2apiStateMeta(
+            record.sub2api_remote_state
+              ? { ...sync, remote_state: record.sub2api_remote_state }
+              : sync,
+          )
 
           return (
             <div style={{ ...cellStackStyle, ...compactPanelStyle }}>
@@ -1756,61 +2522,129 @@ export default function Accounts() {
       title: '注册时间',
       dataIndex: 'created_at',
       key: 'created_at',
-      width: 132,
+      width: 64,
       render: (text: string) => {
         const formatted = formatCreatedAt(text)
         return (
-          <div style={cellStackStyle}>
-            <Text style={{ fontSize: 13 }}>{formatted.date}</Text>
-            {formatted.time ? <Text type="secondary" style={secondaryTextStyle}>{formatted.time}</Text> : null}
-          </div>
+          <Text style={{ display: 'block', fontSize: 11, lineHeight: '20px' }} title={`${formatted.date} ${formatted.time}`.trim()}>
+            {formatted.date}
+          </Text>
         )
       },
     },
     {
       title: '操作',
       key: 'action',
-      width: 220,
+      width: 236,
       fixed: isChatgptPlatform ? 'right' : undefined,
-      render: (_: any, record: any) => (
-        <Space size={4} wrap>
-          <Button type="link" size="small" onClick={() => { setCurrentAccount(record); setDetailModalOpen(true); }}>
-            详情
-          </Button>
-          {canImportAccountToTeam(record) ? (
-            <Button
-              type="link"
-              size="small"
-              loading={importingTeamAccountId === record.id}
-              onClick={() => handleImportAccountToTeam(record)}
-            >
-              设为 Team 母号
-            </Button>
-          ) : null}
-          {record.teamInviteSource?.removable ? (
-            <Popconfirm
-              title={`确认${getTeamInviteActionLabel(record.teamInviteSource)}？`}
-              description={record.teamInviteSource?.team_name ? `目标 Team: ${record.teamInviteSource.team_name}` : undefined}
-              onConfirm={() => handleRemoveFromTeam(record)}
+      render: (_: any, record: any) => {
+        const commonActions = Array.isArray(platformActions) ? platformActions : []
+        const paymentLinkAction = commonActions.find((action: any) => String(action?.id || '').trim().toLowerCase() === 'payment_link')
+        const showResumeAuth = isChatgptPlatform && shouldShowResumeAuthButton(record)
+        const hiddenIds = new Set([
+          paymentLinkAction ? String(paymentLinkAction.id) : '',
+          'probe_local_status',
+          'resume_subscription_auth',
+        ].filter(Boolean))
+        const moreActions = commonActions.filter((action: any) => !hiddenIds.has(String(action?.id || '')))
+        const moreMenuItems: MenuProps['items'] = [
+          { key: '__detail__', label: '账号详情' },
+          ...(paymentLinkAction ? [{ key: '__payment_link_config__', label: '订阅链接配置' }] : []),
+          ...(paymentLinkAction ? [{ key: '__payment_link_regenerate__', label: '重新生成订阅链接' }] : []),
+          ...moreActions.map((action: any) => ({
+            key: String(action.id),
+            label: String(action.label || action.id),
+          })),
+          {
+            key: '__delete_account__',
+            danger: true,
+            label: (
+              <Popconfirm
+                title="确认删除这个账号？"
+                description={String(record.email || record.id || '')}
+                okText="删除"
+                cancelText="取消"
+                okButtonProps={{ danger: true }}
+                onConfirm={() => handleDeleteAccount(record)}
+              >
+                <span onClick={(event) => event.stopPropagation()}>删除账号</span>
+              </Popconfirm>
+            ),
+          },
+        ]
+
+        return (
+          <Space direction="vertical" size={4} style={{ width: '100%' }}>
+            <Space size={4} wrap>
+              {paymentLinkAction ? (
+                <Button
+                  type="link"
+                  size="small"
+                  style={accountActionTextStyles.payment}
+                  onClick={() => openAccountPaymentLinkAction(record)}
+                >
+                  订阅链接
+                </Button>
+              ) : null}
+              <Button
+                type="link"
+                size="small"
+                style={accountActionTextStyles.refresh}
+                onClick={() => openAccountProbeStatusAction(record)}
+              >
+                刷新状态
+              </Button>
+            </Space>
+            <Space size={4} wrap>
+              {showResumeAuth ? (
+                <Button
+                  type="link"
+                  size="small"
+                  loading={resumeAuthAccountId === record.id}
+                  style={accountActionTextStyles.resume}
+                  onClick={() => handleResumeSubscriptionAuth(record)}
+                >
+                  补抓Auth
+                </Button>
+              ) : null}
+            <Dropdown
+              menu={{
+                items: moreMenuItems,
+                onClick: ({ key }) => {
+                  if (String(key) === '__detail__') {
+                    setDetailAccount(record)
+                    setDetailModalOpen(true)
+                    return
+                  }
+                  if (String(key) === '__payment_link_config__') {
+                    openAccountInlineAction(record, 'payment_link', 'dialog')
+                    return
+                  }
+                  if (String(key) === '__payment_link_regenerate__') {
+                    openAccountPaymentLinkRegenerateAction(record)
+                    return
+                  }
+                  if (String(key) === '__delete_account__') {
+                    return
+                  }
+                  openAccountInlineAction(record, String(key))
+                },
+              }}
             >
               <Button
                 type="link"
                 size="small"
-                danger
-                loading={removingTeamAccountId === record.id}
+                icon={<MoreOutlined />}
+                loading={platformActionsLoading}
+                style={accountActionTextStyles.more}
               >
-                {getTeamInviteActionLabel(record.teamInviteSource)}
+                更多
               </Button>
-            </Popconfirm>
-          ) : null}
-          <Popconfirm title="确认删除？" onConfirm={() => handleDelete(record.id)}>
-            <Button type="link" size="small" danger>
-              删除
-            </Button>
-          </Popconfirm>
-          <ActionMenu acc={record} onRefresh={load} actions={platformActions} />
-        </Space>
-      ),
+            </Dropdown>
+            </Space>
+          </Space>
+        )
+      },
     },
   )
 
@@ -1859,670 +2693,412 @@ export default function Accounts() {
       disabled: backfillDisabled,
     },
   ]
+  const resumeAuthScope = getResumeAuthScope()
+  const resumeAuthMenuItems: MenuProps['items'] = [
+    {
+      key: resumeAuthScope,
+      label: buildResumeAuthMenuLabel(),
+      disabled: resumeAuthScope === 'selected' ? selectedRowKeys.length === 0 : total === 0,
+    },
+  ]
 
-  return (
-    <div>
-      <div style={{ marginBottom: 16, display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8 }}>
-        <Space>
-          <Input.Search
-            placeholder="搜索邮箱..."
-            allowClear
-            onSearch={setSearch}
-            style={{ width: 200 }}
-          />
-          <Select
-            placeholder="状态筛选"
-            allowClear
-            style={{ width: 120 }}
-            onChange={setFilterStatus}
-            options={[
-              { value: 'registered', label: '已注册' },
-              { value: 'trial', label: '试用中' },
-              { value: 'subscribed', label: '已订阅' },
-              { value: 'expired', label: '已过期' },
-              { value: 'invalid', label: '已失效' },
-            ]}
-          />
-          <Text type="secondary">{total} 个账号</Text>
-          {selectedRowKeys.length > 0 && (
-            <Text type="success">已选 {selectedRowKeys.length} 个</Text>
-          )}
-        </Space>
-        <Space>
-          {currentPlatform === 'chatgpt' && (
-            <Dropdown
-              trigger={['click']}
-              menu={{
-                items: statusSyncMenuItems,
-                onClick: ({ key }) => {
-                  const [kind, scope] = String(key).split(':') as ['probe' | 'remote' | 'sub2api', 'selected' | 'all']
-                  handleBatchStatusSync(kind, scope)
-                },
-              }}
-            >
-              <Button
-                icon={<SyncOutlined />}
-                loading={statusSyncLoading !== ''}
-                disabled={total === 0}
-              >
-                状态同步
-              </Button>
-            </Dropdown>
-          )}
-          {currentPlatform === 'chatgpt' && (
-            <Dropdown
-              trigger={['click']}
-              menu={{
-                items: backfillMenuItems,
-                onClick: ({ key }) => {
-                  const [destination, scope] = String(key).split(':') as ['cliproxyapi' | 'sub2api', 'selected' | 'pending']
-                  Modal.confirm({
-                    title:
-                      scope === 'selected'
-                        ? `确认补传所选 ${selectedRowKeys.length} 个账号到 ${destination === 'sub2api' ? 'Sub2API' : 'CLIProxyAPI'}？`
-                        : `确认处理当前筛选范围内 ${getPendingBackfillCount(destination)} 个 ${destination === 'sub2api' ? 'Sub2API' : 'CLIProxyAPI'} 待补传账号？`,
-                    onOk: () => handleBackfill(destination, scope),
-                  })
-                },
-              }}
-            >
-              <Button
-                loading={backfillLoading !== ''}
-                icon={backfillLoading !== '' ? <SyncOutlined spin /> : <UploadOutlined />}
-                disabled={backfillDisabled}
-              >
-                {backfillLoading !== '' ? '远端补传中...' : '远端补传'}
-              </Button>
-            </Dropdown>
-          )}
-          {currentPlatform === 'chatgpt' && (
-            <Button icon={<LinkOutlined />} onClick={() => setBusinessDeferredModalOpen(true)}>
-              Business 补激活
-            </Button>
-          )}
-          <Popconfirm
-            title={`确认删除当前平台的全部无效账号？`}
-            description="只会删除 status=invalid 的账号，操作不可恢复。"
-            onConfirm={handleDeleteInvalid}
-          >
-            <Button danger icon={<DeleteOutlined />} loading={deleteInvalidLoading} disabled={total === 0}>
-              一键删无效
-            </Button>
-          </Popconfirm>
-          {selectedRowKeys.length > 0 && (
-            <Popconfirm title={`确认删除选中的 ${selectedRowKeys.length} 个账号？`} onConfirm={handleBatchDelete}>
-              <Button danger icon={<DeleteOutlined />}>删除 {selectedRowKeys.length} 个</Button>
-            </Popconfirm>
-          )}
-          <Button icon={<UploadOutlined />} onClick={() => setImportModalOpen(true)}>导入</Button>
-          <Button icon={<DownloadOutlined />} onClick={exportCsv} disabled={accounts.length === 0}>导出</Button>
-          <Button icon={<PlusOutlined />} onClick={() => setAddModalOpen(true)}>新增</Button>
-          <Button type="primary" icon={<PlusOutlined />} onClick={() => setRegisterModalOpen(true)}>注册</Button>
-          <Button icon={<ReloadOutlined spin={loading} />} onClick={load} />
-        </Space>
-      </div>
-
-      {currentPlatform === 'chatgpt' && accounts.length > 0 && (
-        <div style={{ ...remoteOverviewStyle, marginBottom: 16, justifyContent: 'space-between' }}>
-          <Space wrap size={[8, 8]}>
-            <Text strong style={{ fontSize: 13 }}>Sub2API 远端概览</Text>
-            <Tag color="success">已存在 {sub2apiOverview.exists}</Tag>
-            <Tag>未发现 {sub2apiOverview.notFound}</Tag>
-            <Tag color="processing">其他工作区已存在 {sub2apiOverview.crossWorkspace}</Tag>
-            <Tag color="warning">多候选 {sub2apiOverview.ambiguous}</Tag>
-            <Tag color="error">不可达 {sub2apiOverview.unreachable}</Tag>
-            <Tag>未同步 {sub2apiOverview.unknown}</Tag>
-            <Tag color="processing">待补传 {sub2apiOverview.pending}</Tag>
-            {sub2apiOverviewSyncing ? <Tag color="processing">正在自动刷新</Tag> : null}
-            <Text type="secondary" style={{ fontSize: 12 }}>基于当前列表 {accounts.length} 个账号</Text>
+  const renderBatchGopayItem = (item: BatchGopayItem) => {
+    const phase = String(item.snapshot?.phase || (item.status === 'queued' ? 'created' : item.status))
+    const meta = gopayPhaseMeta(phase)
+    const needsInput = phase === 'waiting_otp' || phase === 'waiting_link_pin' || phase === 'waiting_payment_pin'
+    const canResendOtp = phase === 'waiting_otp' && Boolean(item.snapshot?.session_id)
+    const isTerminal = ['done', 'failed', 'cancelled'].includes(item.status) || ['succeeded', 'failed', 'cancelled'].includes(phase)
+    return (
+      <div
+        key={item.account.id}
+        style={{
+          border: `1px solid ${token.colorBorder}`,
+          borderRadius: token.borderRadiusLG,
+          padding: 14,
+          background: token.colorBgContainer,
+        }}
+      >
+        <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap', marginBottom: 10 }}>
+          <Space wrap>
+            <Text strong>{item.account.email || item.account.id}</Text>
+            <Tag color="blue">第 {item.round} 轮</Tag>
+            <Tag>{formatGopayPhoneLabel(item.phone)}</Tag>
+            <Tag color={isTerminal ? (phase === 'succeeded' || item.status === 'done' ? 'success' : item.status === 'cancelled' ? 'default' : 'error') : 'processing'}>
+              {meta.title}
+            </Tag>
           </Space>
-          <Space wrap size={8}>
+          {!isTerminal ? (
+            <Button size="small" danger onClick={() => cancelBatchGopayItem(item)}>
+              取消
+            </Button>
+          ) : null}
+        </div>
+        <Steps
+          size="small"
+          current={meta.step}
+          status={meta.status === 'error' ? 'error' : meta.status === 'finish' ? 'finish' : 'process'}
+          items={[
+            { title: '初始化' },
+            { title: 'OTP' },
+            { title: '绑定 PIN' },
+            { title: '支付 PIN' },
+            { title: '确认' },
+          ]}
+        />
+          <Alert
+            type={item.error || meta.status === 'error' ? 'error' : meta.status === 'finish' ? 'success' : 'info'}
+            showIcon
+            message={item.error || item.snapshot?.last_error || meta.description}
+            style={{ marginTop: 12 }}
+          />
+        {canResendOtp ? (
+          <div style={{ marginTop: 10, display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+            <Tag color={item.snapshot?.otp_auto_resend_done ? 'success' : 'default'}>
+              自动重发 {item.snapshot?.otp_auto_resend_done ? '已触发' : '待触发'}
+            </Tag>
+            <Text type="secondary">延迟 {item.snapshot?.otp_auto_resend_delay_seconds ?? batchGopayOtpAutoResendDelay} 秒</Text>
+            <Text type="secondary">已重发 {item.snapshot?.otp_resend_count ?? 0} 次</Text>
+            <Button size="small" loading={item.submitting} onClick={() => resendBatchGopayOtp(item)}>
+              重发 OTP
+            </Button>
+          </div>
+        ) : null}
+        {needsInput ? (
+          <div style={{ marginTop: 12 }}>
+            <Text style={{ display: 'block', marginBottom: 6 }}>
+              {phase === 'waiting_otp' ? 'GoPay OTP' : phase === 'waiting_link_pin' ? 'GoPay 绑定 PIN' : 'GoPay 支付 PIN'}
+            </Text>
+            <Input.Search
+              enterButton={phase === 'waiting_otp' ? '提交 OTP' : phase === 'waiting_link_pin' ? '提交绑定 PIN' : '提交支付 PIN'}
+              loading={item.submitting}
+              inputMode="numeric"
+              maxLength={8}
+              onSearch={(value: string) => {
+                const trimmed = String(value || '').trim()
+                if (!trimmed) return
+                void submitBatchGopayInput(item, trimmed)
+              }}
+            />
+          </div>
+        ) : null}
+        <div style={{ marginTop: 10 }}>
+          <Space>
             <Button
+              type="link"
               size="small"
-              icon={<ReloadOutlined spin={statusSyncLoading === 'sub2api_all' || sub2apiOverviewSyncing} />}
-              loading={statusSyncLoading === 'sub2api_all'}
-              onClick={() => handleBatchStatusSync('sub2api', 'all')}
+              style={{ paddingLeft: 0 }}
+              onClick={() => updateBatchGopayItem(item.account.id, { configOpen: !item.configOpen })}
             >
-              刷新
+              {item.configOpen ? '收起参数配置' : '展开参数配置'}
             </Button>
             <Button
+              type="link"
               size="small"
-              type="primary"
-              icon={sub2apiOverviewUploading ? <SyncOutlined spin /> : <UploadOutlined />}
-              loading={sub2apiOverviewUploading}
-              disabled={sub2apiOverviewUploadDisabled}
-              onClick={() => {
-                Modal.confirm({
-                  title:
-                    sub2apiOverviewBackfillScope === 'selected'
-                      ? `确认补传所选 ${selectedRowKeys.length} 个账号到 Sub2API？`
-                      : `确认补传当前筛选范围内 ${sub2apiOverviewPendingCount} 个 Sub2API 待补传账号？`,
-                  onOk: () => handleBackfill('sub2api', sub2apiOverviewBackfillScope),
-                })
-              }}
+              onClick={() => updateBatchGopayItem(item.account.id, { logsOpen: !item.logsOpen })}
             >
-              {sub2apiOverviewUploading
-                ? (sub2apiOverviewBackfillScope === 'selected' ? `上传所选中... (${selectedRowKeys.length})` : `上传待补传中... (${sub2apiOverviewPendingCount})`)
-                : (sub2apiOverviewBackfillScope === 'selected' ? `上传所选 (${selectedRowKeys.length})` : `上传待补传 (${sub2apiOverviewPendingCount})`)}
+              {item.logsOpen ? '收起日志' : '展开日志'}
             </Button>
           </Space>
         </div>
-      )}
+        {item.configOpen ? (
+          <pre
+            style={{
+              margin: '8px 0 0',
+              padding: 10,
+              borderRadius: token.borderRadius,
+              background: token.colorFillAlter,
+              whiteSpace: 'pre-wrap',
+              wordBreak: 'break-word',
+              fontFamily: 'monospace',
+              fontSize: 12,
+            }}
+          >
+            {JSON.stringify(buildBatchGopayPayload(item), null, 2)}
+          </pre>
+        ) : null}
+        {item.logsOpen && item.snapshot?.task_id ? (
+          <div style={{ marginTop: 8 }}>
+            <TaskLogPanel taskId={String(item.snapshot.task_id)} onDone={load} />
+          </div>
+        ) : item.logsOpen && item.snapshot?.logs?.length ? (
+          <pre
+            style={{
+              margin: '8px 0 0',
+              maxHeight: 180,
+              overflow: 'auto',
+              whiteSpace: 'pre-wrap',
+              wordBreak: 'break-word',
+              fontFamily: 'monospace',
+              fontSize: 12,
+            }}
+          >
+            {item.snapshot.logs.join('\n')}
+          </pre>
+        ) : null}
+      </div>
+    )
+  }
 
-      <Table
-        rowKey="id"
-        columns={columns}
-        dataSource={accounts}
+  return (
+    <div>
+      <AccountsToolbar
+        search={search}
+        onSearchChange={setSearch}
+        filterStatus={filterStatus}
+        onFilterStatusChange={setFilterStatus}
+        total={total}
+        accountsCount={accounts.length}
+        selectedRowKeys={selectedRowKeys}
+        activeTasksLoading={activeTasksLoading}
+        activeTasks={activeTasks}
+        onOpenTaskSnapshot={openTaskFromSnapshot}
+        onRefreshActiveTasks={refreshActiveTasks}
+        onActiveTasksOpen={() => setActiveTasksPanelOpen(true)}
+        isChatgptPlatform={currentPlatform === 'chatgpt'}
+        batchGopayLoading={batchGopayLoading}
+        batchPaymentLinkLoading={batchPaymentLinkLoading}
+        onBatchPaymentLink={handleBatchPaymentLink}
+        onOpenBatchGopay={openBatchGopayWorkbench}
+        onOpenBusinessDeferred={() => setBusinessDeferredModalOpen(true)}
+        deleteInvalidLoading={deleteInvalidLoading}
+        onDeleteInvalid={handleDeleteInvalid}
+        onBatchDelete={handleBatchDelete}
+        onOpenImport={() => setImportModalOpen(true)}
+        onExportCsv={exportCsv}
+        onOpenAdd={() => setAddModalOpen(true)}
         loading={loading}
-        size="middle"
-        rowSelection={{
-          selectedRowKeys,
-          onChange: setSelectedRowKeys,
+        onRefresh={load}
+        onOpenRegister={() => {
+          clearTaskModalStorage()
+          setTaskModalMode('register')
+          setTaskModalAccount(null)
+          setTaskId(null)
+          setTaskSnapshot(null)
+          setRegisterModalOpen(true)
         }}
-        pagination={{ pageSize: 20, showSizeChanger: false }}
-        scroll={{ x: isChatgptPlatform ? 1450 : 980 }}
-        onRow={(record) => ({
-          onDoubleClick: () => {
-            setCurrentAccount(record)
-            setDetailModalOpen(true)
-          },
-        })}
+        statusSyncMenuItems={statusSyncMenuItems}
+        onStatusSyncClick={({ key }) => {
+          const [kind, scope] = String(key).split(':') as ['probe' | 'remote' | 'sub2api', 'selected' | 'all']
+          void handleBatchStatusSync(kind, scope)
+        }}
+        statusSyncLoading={statusSyncLoading}
+        resumeAuthMenuItems={resumeAuthMenuItems}
+        onResumeAuthClick={({ key }) => {
+          const scope = String(key) === 'selected' ? 'selected' : 'filtered'
+          void handleBatchResumeSubscriptionAuth(scope)
+        }}
+        resumeAuthLoading={batchResumeAuthLoading}
+        backfillMenuItems={backfillMenuItems}
+        onBackfillClick={({ key }) => {
+          const [destination, scope] = String(key).split(':') as ['cliproxyapi' | 'sub2api', 'selected' | 'pending']
+          Modal.confirm({
+            title:
+              scope === 'selected'
+                ? `确认补传所选 ${selectedRowKeys.length} 个账号到 ${destination === 'sub2api' ? 'Sub2API' : 'CLIProxyAPI'}？`
+                : `确认处理当前筛选范围内 ${getPendingBackfillCount(destination)} 个 ${destination === 'sub2api' ? 'Sub2API' : 'CLIProxyAPI'} 待补传账号？`,
+            onOk: () => handleBackfill(destination, scope),
+          })
+        }}
+        backfillLoading={backfillLoading}
       />
 
-      <Modal
-        title="ChatGPT Business 补激活中心"
-        open={businessDeferredModalOpen}
-        onCancel={() => { setBusinessDeferredModalOpen(false); setSelectedPendingInviteRowKeys([]) }}
-        footer={[
-          <Button key="refresh" onClick={loadPendingBusinessInvites} loading={pendingBusinessInvitesLoading}>
-            刷新
-          </Button>,
-          <Button key="activate-selected" onClick={handleActivateSelectedPendingInvites} loading={activatingAllPendingInvites} disabled={selectedPendingInviteRowKeys.length === 0}>
-            激活所选 {selectedPendingInviteRowKeys.length > 0 ? `(${selectedPendingInviteRowKeys.length})` : ''}
-          </Button>,
-          <Button key="activate-all" onClick={handleActivateAllPendingInvites} loading={activatingAllPendingInvites}>
-            激活可恢复项
-          </Button>,
-          <Button key="close" type="primary" onClick={() => { setBusinessDeferredModalOpen(false); setSelectedPendingInviteRowKeys([]) }}>
-            确定
-          </Button>,
-        ]}
-        width={1180}
-      >
-        <Space direction="vertical" size={12} style={{ width: '100%' }}>
-          <Alert
-            type="info"
-            showIcon
-            message="这里承载的是“延迟邀请 / 激活中断恢复 / 手动补激活”流程。"
-            description="如果注册阶段已发出邀请，但激活阶段中断、报错或容器重启，这里可以从保存的检查点继续补激活；不会重新注册账号。"
-          />
-
-          <Table
-            rowKey="id"
-            size="small"
-            loading={pendingBusinessInvitesLoading}
-            pagination={{ pageSize: 8, showSizeChanger: false }}
-            rowSelection={{
-              selectedRowKeys: selectedPendingInviteRowKeys,
-              onChange: setSelectedPendingInviteRowKeys,
-              getCheckboxProps: (record: any) => ({ disabled: record.can_activate === false }),
-            }}
-            dataSource={pendingBusinessInvites}
-            columns={[
-              {
-                title: '邮箱',
-                dataIndex: 'email',
-                key: 'email',
-                width: 220,
-                render: (value: string) => <Text copyable={{ text: value }}>{value}</Text>,
-              },
-              {
-                title: 'Team',
-                key: 'team',
-                width: 120,
-                render: (_: any, record: any) => record.team_name || (record.team_id ? `team=${record.team_id}` : '-'),
-              },
-              {
-                title: '状态',
-                dataIndex: 'status',
-                key: 'status',
-                width: 132,
-                render: (value: string) => {
-                  const meta = pendingInviteStatusMeta(value)
-                  return <Tag color={meta.color}>{meta.label}</Tag>
-                },
-              },
-              {
-                title: '检查点',
-                dataIndex: 'last_checkpoint_label',
-                key: 'last_checkpoint_label',
-                width: 120,
-                render: (value: string) => value || '-',
-              },
-              {
-                title: '尝试',
-                dataIndex: 'activation_attempt_count',
-                key: 'activation_attempt_count',
-                width: 80,
-                render: (value: number) => value || 0,
-              },
-              {
-                title: '最近尝试',
-                dataIndex: 'last_attempt_at',
-                key: 'last_attempt_at',
-                width: 168,
-                render: (value: string) => formatSyncTime(value) || '-',
-              },
-              {
-                title: '邀请时间',
-                dataIndex: 'invited_at',
-                key: 'invited_at',
-                width: 168,
-                render: (value: string) => formatSyncTime(value) || value || '-',
-              },
-              {
-                title: '错误',
-                dataIndex: 'last_error',
-                key: 'last_error',
-                render: (value: string, record: any) => value || record.last_error_code || '-',
-              },
-              {
-                title: '操作',
-                key: 'action',
-                width: 220,
-                render: (_: any, record: any) => (
-                  <Space size={4} wrap>
-                    <Button
-                      type="primary"
-                      size="small"
-                      disabled={record.can_activate === false}
-                      loading={activatingPendingInviteId === record.id}
-                      onClick={() => handleActivatePendingInvite(record.id)}
-                    >
-                      重新激活
-                    </Button>
-                    <Popconfirm
-                      title="确认标记放弃？"
-                      description="放弃后这条记录不会再参与自动补激活。"
-                      onConfirm={() => handleAbandonPendingInvite(record.id)}
-                      disabled={record.status === 'completed' || record.status === 'abandoned'}
-                    >
-                      <Button
-                        size="small"
-                        danger
-                        disabled={record.status === 'completed' || record.status === 'abandoned'}
-                        loading={abandoningPendingInviteId === record.id}
-                      >
-                        标记放弃
-                      </Button>
-                    </Popconfirm>
-                  </Space>
-                ),
-              },
-            ]}
-          />
-        </Space>
-      </Modal>
-
-      <Modal
-        title={`注册 ${currentPlatform}`}
-        open={registerModalOpen}
-        onCancel={() => { setRegisterModalOpen(false); setTaskId(null); setTaskSnapshot(null); registerForm.resetFields(); }}
-        footer={null}
-        width={500}
-        maskClosable={false}
-      >
-        {!taskId ? (
-          <Form form={registerForm} layout="vertical" onFinish={handleRegister}>
-            {currentPlatform === 'chatgpt' ? (
-              <Form.Item name="mail_provider_override" label="邮箱服务" initialValue="__global__">
-                <Select
-                  options={[
-                    {
-                      value: '__global__',
-                      label: `跟随全局默认（当前：${registerMailProvider === 'manual_email_otp' ? '手动邮箱 + 手输验证码' : registerMailProvider || 'luckmail'}）`,
-                    },
-                    { value: 'manual_email_otp', label: '手动邮箱 + 手输验证码' },
-                  ]}
-                />
-              </Form.Item>
-            ) : null}
-            {currentPlatform === 'chatgpt' && effectiveRegisterMailProvider === 'manual_email_otp' ? (
-              <>
-                <Alert
-                  type="info"
-                  showIcon
-                  style={{ marginBottom: 16 }}
-                  message="当前注册将使用手动邮箱模式"
-                  description="请先填写你的邮箱地址。默认仍走原始“注册新号”逻辑；若开启“已有账号抓 auth”，则会跳过注册状态机，直接登录并抓取 workspace auth。真正需要验证码时，弹窗会切到任务日志面板，再出现验证码输入卡片。"
-                />
-                <Form.Item
-                  name="email"
-                  label="手填邮箱地址"
-                  rules={[{ required: true, message: '请输入邮箱地址' }]}
-                  extra="会自动记住你上次填写的邮箱。"
-                >
-                  <Input placeholder="name@gmail.com" autoComplete="email" />
-                </Form.Item>
-                {chatgptRegistrationMode === CHATGPT_REGISTRATION_MODE_REFRESH_TOKEN ? (
-                  <>
-                    <Form.Item
-                      name="chatgpt_existing_account_capture"
-                      valuePropName="checked"
-                      initialValue={false}
-                      extra="开启后：跳过注册状态机，直接登录已有账号抓取 auth / workspace。关闭则保持原始手动注册新号逻辑。"
-                    >
-                      <Checkbox>已有账号抓 auth</Checkbox>
-                    </Form.Item>
-                    <Form.Item
-                      noStyle
-                      shouldUpdate={(prev, next) => prev.chatgpt_existing_account_capture !== next.chatgpt_existing_account_capture}
-                    >
-                      {({ getFieldValue }) =>
-                        getFieldValue('chatgpt_existing_account_capture') ? (
-                          <Form.Item
-                            name="login_password"
-                            label="登录密码"
-                            extra="优先尝试密码登录；若流程仍要求邮箱 OTP，任务面板会继续等待你手动输入验证码。默认值来自设置页，可临时覆盖。"
-                          >
-                            <Input.Password placeholder="留空则优先走邮箱 OTP" autoComplete="current-password" />
-                          </Form.Item>
-                        ) : null
-                      }
-                    </Form.Item>
-                  </>
-                ) : null}
-              </>
-            ) : null}
-            <Form.Item name="count" label="注册数量" initialValue={1} rules={[{ required: true }]}>
-              <Input type="number" min={1} disabled={currentPlatform === 'chatgpt' && effectiveRegisterMailProvider === 'manual_email_otp'} />
-            </Form.Item>
-            <Form.Item name="concurrency" label="并发数" initialValue={1} rules={[{ required: true }]}>
-              <Input type="number" min={1} max={5} disabled={currentPlatform === 'chatgpt' && effectiveRegisterMailProvider === 'manual_email_otp'} />
-            </Form.Item>
-            <Form.Item name="register_delay_seconds" label="每个注册延迟(秒)" initialValue={0}>
-              <InputNumber min={0} precision={1} step={0.5} style={{ width: '100%' }} placeholder="0 = 不延迟" />
-            </Form.Item>
-            {currentPlatform === 'chatgpt' && (
-              <>
-                <Form.Item label="ChatGPT Token 方案">
-                  <ChatGPTRegistrationModeSwitch
-                    mode={chatgptRegistrationMode}
-                    onChange={setChatgptRegistrationMode}
-                  />
-                </Form.Item>
-                {chatgptRegistrationMode === CHATGPT_REGISTRATION_MODE_REFRESH_TOKEN ? (
-                  <Form.Item
-                    noStyle
-                    shouldUpdate={(prev, next) => (
-                      prev.chatgpt_existing_account_capture !== next.chatgpt_existing_account_capture
-                      || prev.chatgpt_enable_team_invite !== next.chatgpt_enable_team_invite
-                    )}
-                  >
-                    {({ getFieldValue }) => {
-                      const existingAccountCapture = Boolean(getFieldValue('chatgpt_existing_account_capture'))
-                      const teamInviteEnabled = Boolean(getFieldValue('chatgpt_enable_team_invite'))
-                      return existingAccountCapture ? (
-                        <>
-                          <Form.Item
-                            label="工作空间抓取"
-                            extra="默认同时抓取 business + free。哪个成功保存哪个；缺失项只在日志里提示，不回滚已保存的工作空间。"
-                          >
-                            <Space direction="vertical" size={6}>
-                              <Form.Item name="chatgpt_capture_business_workspace" valuePropName="checked" initialValue={true} noStyle>
-                                <Checkbox>抓取 business 工作空间</Checkbox>
-                              </Form.Item>
-                              <Form.Item name="chatgpt_capture_free_workspace" valuePropName="checked" initialValue={true} noStyle>
-                                <Checkbox>抓取 free 工作空间</Checkbox>
-                              </Form.Item>
-                            </Space>
-                          </Form.Item>
-                          <Alert
-                            type="info"
-                            showIcon
-                            message="当前使用已有账号抓 auth"
-                            description="这条链路不会进入注册 / team invite；会直接登录已有账号，并优先抓取 business，再补抓 free。"
-                          />
-                        </>
-                      ) : (
-                        <>
-                          <Form.Item
-                            label="工作空间抓取"
-                            extra="free 勾选独立生效；business 依赖 team invite。若两项都勾，会分别获取并按名称区分保存。"
-                          >
-                            <Space direction="vertical" size={6}>
-                              <Form.Item name="chatgpt_capture_free_workspace" valuePropName="checked" initialValue={true} noStyle>
-                                <Checkbox>抓取 free 工作空间</Checkbox>
-                              </Form.Item>
-                            </Space>
-                          </Form.Item>
-                          <Form.Item
-                            name="chatgpt_enable_team_invite"
-                            valuePropName="checked"
-                            initialValue={false}
-                            label="Business Team Invite"
-                            extra="关闭时走原始注册/登录链路；开启后才会进入 business recovery / team invite。"
-                          >
-                            <Checkbox>启用 team invite / business 恢复</Checkbox>
-                          </Form.Item>
-                          {teamInviteEnabled ? (
-                            <>
-                              <Form.Item
-                                name="chatgpt_team_invite_deferred_activation"
-                                valuePropName="checked"
-                                initialValue={false}
-                                extra="开启后：先完成全部账号注册并发出邀请，再统一进入激活阶段；不会在单账号刚注册完时立刻进入 business/free。窗口里的“Business 延迟邀请”只作为补救/重试入口。"
-                              >
-                                <Checkbox>延迟邀请（先统一发邀请，再统一激活）</Checkbox>
-                              </Form.Item>
-                              <Form.Item>
-                                <Space direction="vertical" size={6}>
-                                  <Form.Item name="chatgpt_capture_business_workspace" valuePropName="checked" initialValue={true} noStyle>
-                                    <Checkbox>抓取 business 工作空间</Checkbox>
-                                  </Form.Item>
-                                </Space>
-                              </Form.Item>
-                            </>
-                          ) : (
-                            <Alert
-                              type="info"
-                              showIcon
-                              message="当前关闭 team invite"
-                              description="普通模式下会直接走 free 主链；business 与延迟邀请配置在开启 team invite 后才生效。"
-                            />
-                          )}
-                        </>
-                      )
-                    }}
-                  </Form.Item>
-                ) : null}
-              </>
-            )}
-            <Form.Item>
-              <Space direction="vertical" style={{ width: '100%' }} size={8}>
-                {currentPlatform === 'chatgpt' ? (
-                  <Button block onClick={handleSaveRegisterSettings} loading={registerSettingsSaving}>
-                    保存设置
-                  </Button>
-                ) : null}
-                <Button type="primary" htmlType="submit" block loading={registerLoading}>
-                  开始注册
-                </Button>
-              </Space>
-            </Form.Item>
-          </Form>
-        ) : (
-          <Space direction="vertical" style={{ width: '100%' }} size={12}>
-            {taskSnapshot?.pending_verification ? (
-              <TaskVerificationPanel
-                taskId={taskId}
-                verification={taskSnapshot.pending_verification}
-              />
-            ) : null}
-            <TaskLogPanel taskId={taskId} onDone={() => { load(); }} />
-          </Space>
-        )}
-      </Modal>
-
-      <Modal
-        title="手动新增账号"
-        open={addModalOpen}
-        onCancel={() => { setAddModalOpen(false); addForm.resetFields(); }}
-        onOk={handleAdd}
-        maskClosable={false}
-      >
-        <Form form={addForm} layout="vertical">
-          <Form.Item name="email" label="邮箱" rules={[{ required: true }]}>
-            <Input />
-          </Form.Item>
-          <Form.Item name="password" label="密码" rules={[{ required: true }]}>
-            <Input.Password />
-          </Form.Item>
-          <Form.Item name="token" label="Token">
-            <Input />
-          </Form.Item>
-          <Form.Item name="cashier_url" label="试用链接">
-            <Input />
-          </Form.Item>
-          <Form.Item name="status" label="状态" initialValue="registered">
-            <Select
-              options={[
-                { value: 'registered', label: '已注册' },
-                { value: 'trial', label: '试用中' },
-                { value: 'subscribed', label: '已订阅' },
-              ]}
-            />
-          </Form.Item>
-        </Form>
-      </Modal>
-
-      <Modal
-        title="批量导入"
-        open={importModalOpen}
-        onCancel={() => { setImportModalOpen(false); setImportText(''); }}
-        onOk={handleImport}
-        confirmLoading={importLoading}
-        maskClosable={false}
-      >
-        <p style={{ marginBottom: 8, fontSize: 12, color: '#7a8ba3' }}>
-          每行格式: <code style={{ background: 'rgba(255,255,255,0.1)', padding: '2px 4px', borderRadius: 4 }}>email password [cashier_url]</code>
-        </p>
-        <Input.TextArea
-          value={importText}
-          onChange={(e) => setImportText(e.target.value)}
-          rows={8}
-          style={{ fontFamily: 'monospace' }}
+      {currentPlatform === 'chatgpt' && accounts.length > 0 && (
+        <Sub2ApiOverviewPanel
+          accountsCount={accounts.length}
+          overview={sub2apiOverview}
+          syncing={false}
+          statusSyncLoading={statusSyncLoading}
+          uploadLoading={sub2apiOverviewUploading}
+          uploadDisabled={sub2apiOverviewUploadDisabled}
+          pendingCount={sub2apiOverviewPendingCount}
+          scope={sub2apiOverviewBackfillScope}
+          selectedCount={selectedRowKeys.length}
+          onRefresh={() => handleBatchStatusSync('sub2api', 'all')}
+          onUpload={() => handleBackfill('sub2api', sub2apiOverviewBackfillScope)}
         />
-      </Modal>
+      )}
 
-      <Modal
-        title="账号详情"
+      <AccountsTable
+        columns={columns}
+        accounts={accounts}
+        loading={loading}
+        total={total}
+        currentPage={currentPage}
+        pageSize={ACCOUNTS_PAGE_SIZE}
+        onPageChange={setCurrentPage}
+        selectedRowKeys={selectedRowKeys}
+        setSelectedRowKeys={setSelectedRowKeys}
+        isChatgptPlatform={isChatgptPlatform}
+        onOpenDetail={(record) => {
+          setDetailAccount(record)
+          setDetailModalOpen(true)
+        }}
+      />
+
+      <BatchGopayWorkbench
+        open={batchGopayOpen}
+        onClose={() => {
+          setBatchGopayOpen(false)
+          setBatchGopayPhoneCountryCode('86')
+          setBatchGopayPhoneNumber('')
+          setBatchGopayPhoneSaving(false)
+        }}
+        token={token}
+        items={batchGopayItems}
+        phones={batchGopayPhones}
+        loading={batchGopayLoading}
+        phoneSaving={batchGopayPhoneSaving}
+        started={batchGopayStarted}
+        roundInterval={batchGopayRoundInterval}
+        otpAutoResendDelay={batchGopayOtpAutoResendDelay}
+        otpDelaySaving={batchGopayOtpDelaySaving}
+        nextRoundAt={batchGopayNextRoundAt}
+        phoneCountryCode={batchGopayPhoneCountryCode}
+        phoneNumber={batchGopayPhoneNumber}
+        onPhoneCountryCodeChange={(value) => setBatchGopayPhoneCountryCode(normalizeGopayPhonePart(value))}
+        onPhoneNumberChange={(value) => setBatchGopayPhoneNumber(normalizeGopayPhonePart(value))}
+        onSaveOtpDelay={() => saveBatchGopayOtpAutoResendDelay(batchGopayOtpAutoResendDelay)}
+        onRefreshConfig={loadGopayBatchConfig}
+        onStart={startBatchGopay}
+        onCancelAll={cancelBatchGopayAll}
+        onAddPhone={addBatchGopayPhoneToPool}
+        onMovePhone={moveBatchGopayPhone}
+        onDeletePhone={deleteBatchGopayPhone}
+        onRoundIntervalChange={(value) => setBatchGopayRoundInterval(Number(value || 0))}
+        onOtpAutoResendDelayChange={(value) => setBatchGopayOtpAutoResendDelay(value)}
+        formatGopayPhoneLabel={formatGopayPhoneLabel}
+        renderBatchGopayItem={renderBatchGopayItem}
+        normalizeGopayOtpAutoResendDelay={normalizeGopayOtpAutoResendDelay}
+        activePhaseMatcher={(item) => Boolean(item.snapshot?.session_id && GOPAY_ACTIVE_PHASES.has(String(item.snapshot?.phase || '')))}
+      />
+
+      <PendingInvitesModal
+        open={businessDeferredModalOpen}
+        onClose={() => {
+          setBusinessDeferredModalOpen(false)
+          setSelectedPendingInviteRowKeys([])
+        }}
+        loading={pendingBusinessInvitesLoading}
+        items={pendingBusinessInvites}
+        selectedRowKeys={selectedPendingInviteRowKeys}
+        onSelectedRowKeysChange={setSelectedPendingInviteRowKeys}
+        activatingAll={activatingAllPendingInvites}
+        activatingId={activatingPendingInviteId}
+        abandoningId={abandoningPendingInviteId}
+        onRefresh={async () => {
+          await pendingInvitesQuery.refetch()
+        }}
+        onActivateSelected={handleActivateSelectedPendingInvites}
+        onActivateAll={handleActivateAllPendingInvites}
+        onActivateOne={handleActivatePendingInvite}
+        onAbandonOne={handleAbandonPendingInvite}
+        pendingActivationKindMeta={pendingActivationKindMeta}
+        pendingInviteStatusMeta={pendingInviteStatusMeta}
+        formatSyncTime={formatSyncTime}
+      />
+
+      <RegisterTaskModal
+        open={registerModalOpen}
+        currentPlatform={currentPlatform}
+        taskModalMode={taskModalMode}
+        taskModalAccount={taskModalAccount}
+        taskId={taskId}
+        taskSnapshot={taskSnapshot}
+        registerForm={registerForm}
+        registerMailProvider={registerMailProvider}
+        chatgptRegistrationMode={chatgptRegistrationMode}
+        setChatgptRegistrationMode={setChatgptRegistrationMode}
+        registerLoading={registerLoading}
+        registerSettingsSaving={registerSettingsSaving}
+        onClose={() => {
+          clearTaskModalStorage()
+          setRegisterModalOpen(false)
+          setTaskId(null)
+          setTaskSnapshot(null)
+          setTaskModalMode('register')
+          setTaskModalAccount(null)
+          registerForm.resetFields()
+        }}
+        onSaveRegisterSettings={handleSaveRegisterSettings}
+        onRegister={handleRegister}
+        onTaskDone={() => {
+          clearTaskModalStorage()
+          load()
+          pendingInvitesQuery.refetch()
+        }}
+      />
+
+      <AddAccountModal
+        open={addModalOpen}
+        addForm={addForm}
+        onClose={() => {
+          setAddModalOpen(false)
+          addForm.resetFields()
+        }}
+        onSubmit={handleAdd}
+      />
+
+      <ImportAccountsModal
+        open={importModalOpen}
+        importLoading={importLoading}
+        importText={importText}
+        onClose={() => {
+          setImportModalOpen(false)
+          setImportText('')
+        }}
+        onSubmit={handleImport}
+        onImportTextChange={setImportText}
+      />
+
+      <Suspense fallback={null}>
+        <AccountActionSurface
+        account={actionAccount}
+        open={actionSurfaceOpen && Boolean(actionAccount)}
+        showShell={false}
+        onClose={() => {
+          setActionSurfaceOpen(false)
+          setActionAccount(null)
+          setActionSurfaceInitialActionId(null)
+          setActionSurfaceInitialActionMode('dialog')
+        }}
+        onRefresh={load}
+        onOpenDetail={(record) => {
+          setDetailAccount(record)
+          setDetailModalOpen(true)
+        }}
+        actionsLoading={platformActionsLoading}
+        actions={platformActions}
+        onEnsureActionsLoaded={ensurePlatformActionsLoaded}
+        initialActionId={actionSurfaceInitialActionId}
+        initialActionMode={actionSurfaceInitialActionMode}
+        onInitialActionHandled={() => setActionSurfaceInitialActionId(null)}
+        onResumeAuthTask={handleResumeSubscriptionAuth}
+        authStateMeta={authStateMeta}
+        planMeta={planMeta}
+          codexStateMeta={codexStateMeta}
+          formatSyncTime={formatSyncTime}
+        />
+      </Suspense>
+
+      <AccountDetailModal
         open={detailModalOpen}
-        onCancel={() => setDetailModalOpen(false)}
-        onOk={handleDetailSave}
-        maskClosable={false}
-        width={760}
-        styles={{ body: { maxHeight: '72vh', overflowY: 'auto' } }}
-      >
-        {currentAccount && (
-          <>
-            <Form form={detailForm} layout="vertical" initialValues={currentAccount}>
-              <Form.Item name="status" label="状态">
-                <Select
-                  options={[
-                    { value: 'registered', label: '已注册' },
-                    { value: 'trial', label: '试用中' },
-                    { value: 'subscribed', label: '已订阅' },
-                    { value: 'expired', label: '已过期' },
-                    { value: 'invalid', label: '已失效' },
-                  ]}
-                />
-              </Form.Item>
-              <Form.Item name="token" label="Access Token">
-                <Input.TextArea rows={2} style={{ fontFamily: 'monospace' }} />
-              </Form.Item>
-            </Form>
-            {(() => {
-              const rt = getRefreshToken(currentAccount)
-              if (!rt) return null
-              return (
-                <div style={{ marginTop: 8 }}>
-                  <div style={{ marginBottom: 4, fontWeight: 500, fontSize: 13 }}>Refresh Token</div>
-                  <div
-                    style={{
-                      display: 'flex',
-                      alignItems: 'flex-start',
-                      gap: 8,
-                      background: token.colorFillAlter,
-                      border: `1px solid ${token.colorBorder}`,
-                      borderRadius: token.borderRadius,
-                      padding: '8px 10px',
-                    }}
-                  >
-                    <Text
-                      style={{ fontFamily: 'monospace', fontSize: 11, wordBreak: 'break-all', flex: 1, userSelect: 'text' }}
-                      copyable={{ text: rt, tooltips: ['复制 RT', '已复制'] }}
-                    >
-                      {rt}
-                    </Text>
-                  </div>
-                </div>
-              )
-            })()}
-            {canImportAccountToTeam(currentAccount) ? (
-              <div style={{ marginTop: 12 }}>
-                <Button
-                  type="primary"
-                  loading={importingTeamAccountId === currentAccount.id}
-                  onClick={() => handleImportAccountToTeam(currentAccount)}
-                >
-                  设为 Team 母号
-                </Button>
-              </div>
-            ) : null}
-            {currentPlatform === 'chatgpt' && currentAccount.teamInviteSource ? (
-              <DetailSection title="Business / Team Invite 来源">
-                <SummaryField label="母号邮箱" value={currentAccount.teamInviteSource.team_email} />
-                <SummaryField label="母号 Account ID" value={currentAccount.teamInviteSource.team_account_id || currentAccount.teamInviteSource.primary_account_id} />
-                <SummaryField label="母号名称" value={currentAccount.teamInviteSource.primary_account_name} />
-                <SummaryField label="Team 名称" value={currentAccount.teamInviteSource.team_name} />
-                <SummaryField label="Team ID" value={currentAccount.teamInviteSource.team_id ? String(currentAccount.teamInviteSource.team_id) : ''} />
-                <SummaryField label="Invite 状态" value={currentAccount.teamInviteSource.invite_status} />
-                <SummaryField label="邀请时间" value={currentAccount.teamInviteSource.invited_at ? formatSyncTime(currentAccount.teamInviteSource.invited_at) : ''} />
-                <SummaryField label="加入时间" value={currentAccount.teamInviteSource.joined_at ? formatSyncTime(currentAccount.teamInviteSource.joined_at) : ''} />
-                <SummaryField label="移除时间" value={currentAccount.teamInviteSource.removed_from_team_at ? formatSyncTime(currentAccount.teamInviteSource.removed_from_team_at) : ''} />
-              </DetailSection>
-            ) : null}
-            {currentPlatform === 'chatgpt' ? (
-              <DetailSection title="本地真实状态">
-                {currentAccount.chatgptLocal && Object.keys(currentAccount.chatgptLocal).length > 0 ? (
-                  <LocalProbeSummary probe={currentAccount.chatgptLocal} />
-                ) : (
-                  <Text type="secondary">尚未探测。可在操作菜单中点击“探测本地状态”。</Text>
-                )}
-              </DetailSection>
-            ) : null}
-            {currentPlatform === 'chatgpt' ? (
-              <DetailSection title="CLIProxyAPI 状态">
-                {currentAccount.cliproxySync && Object.keys(currentAccount.cliproxySync).length > 0 ? (
-                  <CliproxySyncSummary sync={currentAccount.cliproxySync} />
-                ) : (
-                  <Text type="secondary">尚未同步。可在操作菜单中点击“同步 CLIProxyAPI 状态”。</Text>
-                )}
-              </DetailSection>
-            ) : null}
-            {currentPlatform === 'chatgpt' ? (
-              <DetailSection title="Sub2API 状态">
-                {currentAccount.sub2apiSync && Object.keys(currentAccount.sub2apiSync).length > 0 ? (
-                  <Sub2ApiSyncSummary sync={currentAccount.sub2apiSync} />
-                ) : (
-                  <Text type="secondary">尚未同步。可在“状态同步”里先执行一次 Sub2API 探测，或直接走补传。</Text>
-                )}
-              </DetailSection>
-            ) : null}
-          </>
-        )}
-      </Modal>
+        onClose={() => {
+          setDetailModalOpen(false)
+          setDetailAccount(null)
+        }}
+        onSave={handleDetailSave}
+        currentAccount={detailAccount}
+        detailForm={detailForm}
+        token={token}
+        importingTeamAccountId={importingTeamAccountId}
+        onImportAccountToTeam={handleImportAccountToTeam}
+        formatSyncTime={formatSyncTime}
+        getRefreshToken={getRefreshToken}
+        canImportAccountToTeam={canImportAccountToTeam}
+        authStateMeta={authStateMeta}
+        planMeta={planMeta}
+        codexStateMeta={codexStateMeta}
+      />
     </div>
   )
 }

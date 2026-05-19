@@ -76,3 +76,18 @@ def toggle_proxy(proxy_id: int, session: Session = Depends(get_session)):
 def check_proxies(background_tasks: BackgroundTasks):
     background_tasks.add_task(proxy_pool.check_all)
     return {"message": "检测任务已启动"}
+
+
+@router.post("/clear-cooldowns")
+def clear_proxy_cooldowns(session: Session = Depends(get_session)):
+    items = session.exec(select(ProxyModel)).all()
+    cleared = 0
+    for item in items:
+        had_cooldown = bool(getattr(item, "homepage_circuit_open_until", None))
+        if had_cooldown or int(getattr(item, "homepage_consecutive_failures", 0) or 0) > 0:
+            item.homepage_circuit_open_until = None
+            item.homepage_consecutive_failures = 0
+            session.add(item)
+            cleared += 1
+    session.commit()
+    return {"ok": True, "cleared": cleared}

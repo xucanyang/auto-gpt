@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from platforms.chatgpt.sentinel_batch import (
+from services.chatgpt_core.sentinel_batch import (
     ConfigResolver,
     DEFAULT_FLOW_SPECS,
     DEFAULT_FRAME_URL,

@@ -1,15 +1,29 @@
 import unittest
 
 from services.chatgpt_account_state import (
+    apply_auth_capture_status,
     apply_chatgpt_status_policy,
+    apply_payment_snapshot_status,
+    classify_chatgpt_capabilities,
     classify_local_probe_state,
     classify_remote_sync_state,
+    is_chatgpt_upload_ready,
+    mark_payment_failed,
+    mark_payment_pending,
+    mark_payment_succeeded,
 )
 
 
 class DummyAccount:
-    def __init__(self, status="registered"):
+    def __init__(self, status="registered", extra=None, token=""):
         self.status = status
+        self.extra = dict(extra or {})
+        self.token = token
+        self.user_id = ""
+        self.cashier_url = ""
+
+    def get_extra(self):
+        return dict(self.extra)
 
 
 class ChatGPTAccountStateTests(unittest.TestCase):
@@ -62,9 +76,201 @@ class ChatGPTAccountStateTests(unittest.TestCase):
             },
         )
         self.assertEqual(reason, "")
+        self.assertEqual(account.status, "pending_payment")
+
+    def test_access_token_only_is_pending_payment_and_not_upload_ready(self):
+        account = DummyAccount(
+            status="registered",
+            token="at-demo",
+            extra={"access_token": "at-demo", "partial_auth": True},
+        )
+
+        capabilities = classify_chatgpt_capabilities(
+            account,
+            local_probe={
+                "auth": {"state": "access_token_valid", "http_status": 200},
+                "subscription": {"plan": "free"},
+                "codex": {"state": "not_checked"},
+            },
+        )
+        ready, message, _ = is_chatgpt_upload_ready(account, local_probe={"auth": {"state": "access_token_valid"}})
+        apply_chatgpt_status_policy(account, local_probe={"auth": {"state": "access_token_valid", "http_status": 200}})
+
+        self.assertEqual(capabilities["auth_level"], "access_token_only")
+        self.assertEqual(capabilities["upload_gate"], "blocked_missing_rt")
+        self.assertFalse(ready)
+        self.assertIn("refresh_token", message)
+        self.assertEqual(account.status, "pending_payment")
+
+    def test_refresh_token_with_workspace_is_upload_ready(self):
+        account = DummyAccount(
+            status="pending_payment",
+            token="at-demo",
+            extra={"access_token": "at-demo", "refresh_token": "rt-demo", "workspace_id": "ws-demo"},
+        )
+        account.user_id = "acct-demo"
+
+        ready, message, capabilities = is_chatgpt_upload_ready(
+            account,
+            local_probe={
+                "auth": {"state": "refresh_token_valid", "http_status": 200},
+                "subscription": {"plan": "plus"},
+                "codex": {"state": "usable", "http_status": 200},
+            },
+        )
+        apply_chatgpt_status_policy(
+            account,
+            local_probe={
+                "auth": {"state": "refresh_token_valid", "http_status": 200},
+                "subscription": {"plan": "plus"},
+            },
+        )
+
+        self.assertTrue(ready)
+        self.assertEqual(message, "")
+        self.assertEqual(capabilities["upload_gate"], "ready")
+        self.assertEqual(account.status, "subscribed")
+
+    def test_payment_pending_helper_preserves_subscribed_and_invalid(self):
+        account = DummyAccount(status="registered")
+        self.assertEqual(mark_payment_pending(account), "pending_payment")
+        self.assertEqual(account.status, "pending_payment")
+
+        subscribed = DummyAccount(status="subscribed")
+        self.assertEqual(mark_payment_pending(subscribed), "subscribed")
+        self.assertEqual(subscribed.status, "subscribed")
+
+        invalid = DummyAccount(status="invalid")
+        self.assertEqual(mark_payment_pending(invalid), "invalid")
+        self.assertEqual(invalid.status, "invalid")
+
+    def test_payment_failed_helper_preserves_subscribed(self):
+        subscribed = DummyAccount(status="subscribed")
+        self.assertEqual(mark_payment_failed(subscribed), "subscribed")
+        self.assertEqual(subscribed.status, "subscribed")
+
+        pending = DummyAccount(status="pending_payment")
+        self.assertEqual(mark_payment_failed(pending), "payment_failed")
+        self.assertEqual(pending.status, "payment_failed")
+
+    def test_payment_snapshot_status_transitions(self):
+        active = DummyAccount(status="registered")
+        self.assertEqual(apply_payment_snapshot_status(active, {"phase": "waiting_otp", "status": "active"}), "pending_payment")
+        self.assertEqual(active.status, "pending_payment")
+
+        succeeded = DummyAccount(status="payment_failed")
+        self.assertEqual(apply_payment_snapshot_status(succeeded, {"phase": "succeeded", "status": "done"}), "subscribed")
+        self.assertEqual(succeeded.status, "subscribed")
+
+        failed = DummyAccount(status="pending_payment")
+        self.assertEqual(apply_payment_snapshot_status(failed, {"phase": "failed", "status": "failed"}), "payment_failed")
+        self.assertEqual(failed.status, "payment_failed")
+
+    def test_auth_capture_status_preserves_payment_state(self):
+        pending = DummyAccount(
+            status="pending_payment",
+            extra={"chatgpt_last_payment_link": {"url": "https://checkout.example.test/cs_123"}},
+        )
+        self.assertEqual(apply_auth_capture_status(pending, "registered"), "pending_payment")
+        self.assertEqual(pending.status, "pending_payment")
+
+        failed = DummyAccount(status="payment_failed")
+        self.assertEqual(apply_auth_capture_status(failed, "registered"), "payment_failed")
+        self.assertEqual(failed.status, "payment_failed")
+
+        subscribed = DummyAccount(status="subscribed")
+        self.assertEqual(apply_auth_capture_status(subscribed, "registered"), "subscribed")
+        self.assertEqual(subscribed.status, "subscribed")
+
+    def test_auth_capture_status_can_recover_non_payment_pending(self):
+        account = DummyAccount(status="pending_payment")
+        self.assertEqual(apply_auth_capture_status(account, "registered"), "registered")
         self.assertEqual(account.status, "registered")
 
-    def test_payment_and_quota_do_not_mark_invalid(self):
+    def test_confirmed_free_probe_demotes_buggy_subscribed_to_pending_when_payment_link_exists(self):
+        account = DummyAccount(
+            status="subscribed",
+            token="at-demo",
+            extra={
+                "access_token": "at-demo",
+                "chatgpt_last_payment_link": {"url": "https://checkout.example.test/cs_123"},
+            },
+        )
+
+        reason = apply_chatgpt_status_policy(
+            account,
+            local_probe={
+                "auth": {"state": "access_token_valid", "http_status": 200},
+                "subscription": {"plan": "free"},
+            },
+        )
+
+        self.assertEqual(reason, "")
+        self.assertEqual(account.status, "pending_payment")
+
+    def test_confirmed_free_probe_demotes_buggy_subscribed_to_registered_without_payment_marker(self):
+        account = DummyAccount(
+            status="subscribed",
+            token="at-demo",
+            extra={"access_token": "at-demo"},
+        )
+
+        reason = apply_chatgpt_status_policy(
+            account,
+            local_probe={
+                "auth": {"state": "access_token_valid", "http_status": 200},
+                "subscription": {"plan": "free"},
+            },
+        )
+
+        self.assertEqual(reason, "")
+        self.assertEqual(account.status, "registered")
+
+    def test_successful_payment_marker_preserves_subscribed_when_probe_is_free(self):
+        account = DummyAccount(
+            status="subscribed",
+            token="at-demo",
+            extra={
+                "access_token": "at-demo",
+                "chatgpt_gopay": {"phase": "succeeded", "status": "done"},
+            },
+        )
+
+        reason = apply_chatgpt_status_policy(
+            account,
+            local_probe={
+                "auth": {"state": "access_token_valid", "http_status": 200},
+                "subscription": {"plan": "free"},
+            },
+        )
+
+        self.assertEqual(reason, "")
+        self.assertEqual(account.status, "subscribed")
+
+    def test_probe_failure_unknown_does_not_demote_subscribed(self):
+        account = DummyAccount(
+            status="subscribed",
+            token="at-demo",
+            extra={"access_token": "at-demo"},
+        )
+
+        reason = apply_chatgpt_status_policy(
+            account,
+            local_probe={
+                "auth": {"state": "probe_failed", "http_status": 0},
+                "subscription": {"plan": "unknown"},
+            },
+        )
+
+        self.assertEqual(reason, "")
+        self.assertEqual(account.status, "subscribed")
+
+    def test_mark_payment_succeeded_overrides_stale_invalid(self):
+        account = DummyAccount(status="invalid")
+        self.assertEqual(mark_payment_succeeded(account), "subscribed")
+        self.assertEqual(account.status, "subscribed")
+
+    def test_quota_does_not_mark_invalid(self):
         self.assertEqual(
             classify_local_probe_state(
                 {

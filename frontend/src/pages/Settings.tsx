@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { App, Card, Form, Input, Select, Button, message, Tabs, Space, Tag, Typography, Modal, QRCode, Switch, Alert } from 'antd'
+import { App, Card, Form, Input, Select, Button, message, Tabs, Space, Tag, Typography, Modal, QRCode, Switch, Alert, Table } from 'antd'
 import {
   SaveOutlined,
   EyeOutlined,
@@ -12,6 +12,7 @@ import {
   SyncOutlined,
   PlusOutlined,
   LockOutlined,
+  CopyOutlined,
 } from '@ant-design/icons'
 import { parseBooleanConfigValue } from '@/lib/configValueParsers'
 import { apiFetch } from '@/lib/utils'
@@ -25,6 +26,7 @@ const SELECT_FIELDS: Record<string, { label: string; value: string }[]> = {
     { label: 'Laoudo（固定邮箱）', value: 'laoudo' },
     { label: 'TempMail.lol（自动生成）', value: 'tempmail_lol' },
     { label: 'TempMail Ready API（本地接口）', value: 'tempmail_local' },
+    { label: 'iCloud HME（共享转发到 TempMail）', value: 'icloud_hme' },
     { label: 'SkyMail（CloudMail 接口）', value: 'skymail' },
     { label: 'CloudMail（genToken 口令模式）', value: 'cloudmail' },
     { label: 'DuckMail（自动生成）', value: 'duckmail' },
@@ -44,6 +46,15 @@ const SELECT_FIELDS: Record<string, { label: string; value: string }[]> = {
     { label: '固定域名', value: 'fixed_domain' },
     { label: '随机子域 / Ready', value: 'task_subdomain' },
   ],
+  icloud_domain_base: [
+    { label: 'icloud.com', value: 'icloud.com' },
+    { label: 'icloud.com.cn', value: 'icloud.com.cn' },
+  ],
+  icloud_hme_mode: [
+    { label: '实时创建', value: 'live' },
+    { label: '仅导入池', value: 'import_pool' },
+    { label: '优先导入池', value: 'prefer_import' },
+  ],
   default_executor: [
     { label: 'API 协议（无浏览器）', value: 'protocol' },
     { label: '无头浏览器', value: 'headless' },
@@ -62,6 +73,11 @@ const SELECT_FIELDS: Record<string, { label: string; value: string }[]> = {
     { label: 'AT（Access Token，推荐）', value: 'at' },
     { label: 'RT（Refresh Token）', value: 'rt' },
   ],
+  chatgpt_gopay_billing_llm_country_strategy: [
+    { label: '跟随账单国家', value: 'billing_country' },
+    { label: '跟随结账国家', value: 'checkout_country' },
+    { label: '固定国家', value: 'fixed_country' },
+  ],
 }
 
 const TAB_ITEMS = [
@@ -73,7 +89,9 @@ const TAB_ITEMS = [
       {
         title: '默认注册方式',
         desc: '控制注册任务如何执行',
-        fields: [{ key: 'default_executor', label: '执行器类型', type: 'select' }],
+        fields: [
+          { key: 'default_executor', label: '执行器类型', type: 'select' },
+        ],
       },
     ],
   },
@@ -199,6 +217,22 @@ const TAB_ITEMS = [
         ],
       },
       {
+        title: 'iCloud HME',
+        desc: '调用 iCloud Hide My Email 私有接口生成别名，并统一转发到共享 TempMail 收件箱',
+        fields: [
+          { key: 'icloud_hme_mode', label: '别名来源模式', type: 'select' },
+          { key: 'icloud_cookie', label: 'iCloud Cookie', type: 'textarea', placeholder: '从 www.icloud.com DevTools 请求头复制完整 Cookie 字符串' },
+          { key: 'icloud_domain_base', label: 'iCloud 域', type: 'select' },
+          { key: 'icloud_forward_to', label: '转发目标邮箱', placeholder: 'b@cccy.me' },
+          { key: 'icloud_forward_mailbox_id', label: '转发目标 mailbox_id（可选）', placeholder: '0d355f68-8506-4c93-ac56-5ef017f0b932' },
+          { key: 'icloud_hme_auto_create_enabled', label: '自动创建导入池邮箱', type: 'boolean' },
+          { key: 'icloud_hme_auto_create_stock_limit', label: '导入池库存上限', placeholder: '10' },
+          { key: 'icloud_hme_auto_create_interval_min_minutes', label: '随机间隔最小分钟', placeholder: '60' },
+          { key: 'icloud_hme_auto_create_interval_max_minutes', label: '随机间隔最大分钟', placeholder: '120' },
+          { key: 'icloud_hme_auto_create_rate_limit_backoff_minutes', label: '遇到限流延长等待分钟', placeholder: '360' },
+        ],
+      },
+      {
         title: 'DuckMail',
         desc: '自动生成邮箱，随机创建账号',
         fields: [
@@ -223,7 +257,7 @@ const TAB_ITEMS = [
       },
       {
         title: 'LuckMail',
-        desc: 'ChatGPT 走购买邮箱，其他平台继续走订单接码老逻辑',
+        desc: 'ChatGPT 默认走购买邮箱 / 已购邮箱模式',
         fields: [
           { key: 'luckmail_base_url', label: '平台地址', placeholder: 'https://mails.luckyous.com' },
           { key: 'luckmail_api_key', label: 'API Key', secret: true },
@@ -293,6 +327,33 @@ const TAB_ITEMS = [
         ],
       },
       {
+        title: 'GoPay 账单地址 LLM',
+        desc: 'GoPay 启动时生成本次账单地址，失败时回落到表单/默认地址',
+        fields: [
+          { key: 'chatgpt_gopay_billing_llm_enabled', label: '启用 LLM 地址', type: 'boolean' },
+          { key: 'chatgpt_gopay_billing_llm_base_url', label: 'Base URL', placeholder: 'https://api.666800.xyz' },
+          { key: 'chatgpt_gopay_billing_llm_api_key', label: 'API Key', secret: true },
+          { key: 'chatgpt_gopay_billing_llm_model', label: '模型', placeholder: 'gpt-5.4' },
+          { key: 'chatgpt_gopay_billing_llm_wire_api', label: '接口格式', placeholder: 'responses' },
+          { key: 'chatgpt_gopay_billing_llm_country_strategy', label: '地址国家策略', type: 'select' },
+          { key: 'chatgpt_gopay_billing_llm_fixed_country', label: '固定国家代码', placeholder: 'US' },
+          { key: 'chatgpt_gopay_billing_llm_reasoning_effort', label: '推理强度', placeholder: 'xhigh' },
+          { key: 'chatgpt_gopay_billing_llm_timeout_seconds', label: '超时秒数', placeholder: '45' },
+          { key: 'chatgpt_gopay_billing_llm_prompt', label: '提示词', type: 'textarea', placeholder: '生成一个真实可用的账单地址，地址在谷歌地图中能找到对应的位置。' },
+        ],
+      },
+      {
+        title: '无 RT / Access Token Only',
+        desc: '控制是否执行订阅链接账单 amount 校验，以及 amount=0 命中后的自动停策略',
+        fields: [
+          { key: 'chatgpt_access_token_only_checkout_amount_check_enabled', label: '启用额度验证', type: 'boolean' },
+          { key: 'chatgpt_access_token_only_checkout_country', label: '额度验证国家', placeholder: 'US' },
+          { key: 'chatgpt_access_token_only_checkout_currency', label: '额度验证货币', placeholder: 'USD' },
+          { key: 'chatgpt_access_token_only_zero_amount_stop_enabled', label: '启用 amount=0 自动停', type: 'boolean' },
+          { key: 'chatgpt_access_token_only_zero_amount_stop_threshold', label: 'amount=0 命中阈值', placeholder: '1' },
+        ],
+      },
+      {
         title: 'CodexProxy',
         desc: '注册完成后自动上传到 CodexProxy 管理平台',
         fields: [
@@ -354,7 +415,7 @@ interface FieldConfig {
   key: string
   label: string
   placeholder?: string
-  type?: 'select' | 'input' | 'boolean'
+  type?: 'select' | 'input' | 'boolean' | 'textarea'
   secret?: boolean
 }
 
@@ -388,6 +449,8 @@ function getMailboxSectionProvider(title: string): string | null {
       return 'tempmail_lol'
     case 'TempMail 本地接口':
       return 'tempmail_local'
+    case 'iCloud HME':
+      return 'icloud_hme'
     case 'DuckMail':
       return 'duckmail'
     case 'CF Worker 自建邮箱':
@@ -418,6 +481,25 @@ interface AppleMailPoolSnapshot {
   count: number
   items: AppleMailPoolPreviewItem[]
   truncated: boolean
+}
+
+interface ICloudHmeAutoPoolStatus {
+  running?: boolean
+  enabled?: boolean
+  stock_limit?: number
+  ready_count?: number
+  interval_min_minutes?: number
+  interval_max_minutes?: number
+  rate_limit_backoff_minutes?: number
+  next_run_at?: string
+  seconds_until_next_run?: number
+  rate_limit_until?: string
+  in_rate_limit_backoff?: boolean
+  last_run_at?: string
+  last_success_at?: string
+  last_created_hme?: string
+  last_error?: string
+  forward_to?: string
 }
 
 function formatResultText(data: unknown) {
@@ -515,13 +597,46 @@ function formatDisplayPercent(value: number | null): string {
   return `${value.toFixed(2)}%`
 }
 
+function formatDateTimeText(value: string | undefined): string {
+  const text = String(value || '').trim()
+  if (!text) return '-'
+  const date = new Date(text)
+  if (Number.isNaN(date.getTime())) return text
+  return date.toLocaleString('zh-CN', { hour12: false })
+}
+
+function formatDurationText(seconds: number | undefined): string {
+  const totalSeconds = Math.max(0, Math.floor(Number(seconds || 0)))
+  if (!totalSeconds) return '-'
+  const minutes = Math.floor(totalSeconds / 60)
+  const hours = Math.floor(minutes / 60)
+  const restMinutes = minutes % 60
+  if (hours > 0) return `${hours}小时${restMinutes}分钟`
+  if (minutes > 0) return `${minutes}分钟`
+  return `${totalSeconds}秒`
+}
+
 function ConfigField({ field }: { field: FieldConfig }) {
   const [showSecret, setShowSecret] = useState(false)
   const options = SELECT_FIELDS[field.key]
   const isBooleanField = field.type === 'boolean'
   const helpText =
     field.key === 'default_executor'
-      ? '仅对支持的平台生效；ChatGPT、Cursor、Grok、Kiro、Tavily、Trae 支持浏览器模式，OpenBlockLabs 仅支持纯协议。'
+      ? '当前仅对 ChatGPT 生效；支持纯协议、无头浏览器和有头浏览器模式。'
+      : field.key === 'icloud_cookie'
+        ? '从浏览器打开 www.icloud.com，进入 DevTools，找到发往 setup.icloud.com 或 /hme/ 的请求，把完整 Cookie 请求头原样复制到这里。不要删任何字段。'
+      : field.key === 'icloud_hme_mode'
+        ? '实时创建会直接调用 Apple 私有接口；仅导入池会只从本地已导入的 HME 别名池领取；优先导入池会先领池里的别名，没货再实时创建。'
+      : field.key === 'icloud_hme_auto_create_enabled'
+        ? '开启后后台会按随机时间间隔自动创建 1 个新 HME，并放入导入池；达到库存上限时暂停创建。'
+      : field.key === 'icloud_hme_auto_create_stock_limit'
+        ? '只统计当前转发邮箱下可注册的导入池库存；库存达到该数量时不再创建新 HME。'
+      : field.key === 'icloud_hme_auto_create_interval_min_minutes'
+        ? '每次成功创建或跳过后，会在最小和最大分钟之间随机选择下次检查时间。'
+      : field.key === 'icloud_hme_auto_create_interval_max_minutes'
+        ? '必须大于或等于最小分钟；填写更大的范围可以降低固定节奏触发风控的概率。'
+      : field.key === 'icloud_hme_auto_create_rate_limit_backoff_minutes'
+        ? '如果 Apple 返回创建限流，后台会至少等待这么久后再尝试。'
       : undefined
 
   return (
@@ -544,6 +659,8 @@ function ConfigField({ field }: { field: FieldConfig }) {
           }}
           iconRender={(visible) => (visible ? <EyeOutlined /> : <EyeInvisibleOutlined />)}
         />
+      ) : field.type === 'textarea' ? (
+        <Input.TextArea rows={6} placeholder={field.placeholder} />
       ) : (
         <Input placeholder={field.placeholder} />
       )}
@@ -551,10 +668,25 @@ function ConfigField({ field }: { field: FieldConfig }) {
   )
 }
 
-function ConfigSection({ section }: { section: SectionConfig }) {
+function ConfigSection({ section, defaultCollapsed = false }: { section: SectionConfig; defaultCollapsed?: boolean }) {
+  const [collapsed, setCollapsed] = useState(defaultCollapsed)
+
   return (
-    <Card title={section.title} extra={section.desc && <span style={{ fontSize: 12, color: '#7a8ba3' }}>{section.desc}</span>} style={{ marginBottom: 16 }}>
-      {section.fields.map((field) => (
+    <Card
+      title={section.title}
+      extra={(
+        <Space size={8} wrap>
+          {section.desc ? <span style={{ fontSize: 12, color: '#7a8ba3' }}>{section.desc}</span> : null}
+          {defaultCollapsed ? (
+            <Button size="small" type="link" onClick={() => setCollapsed((value) => !value)}>
+              {collapsed ? '展开' : '收起'}
+            </Button>
+          ) : null}
+        </Space>
+      )}
+      style={{ marginBottom: 16 }}
+    >
+      {collapsed ? null : section.fields.map((field) => (
         <ConfigField key={field.key} field={field} />
       ))}
     </Card>
@@ -1402,6 +1534,486 @@ function OutlookImportSection() {
   )
 }
 
+function ICloudHmeManagerSection({ form }: { form: any }) {
+  const [syncing, setSyncing] = useState(false)
+  const [loading, setLoading] = useState(false)
+  const [bulkEnabling, setBulkEnabling] = useState(false)
+  const [bulkDisablingUsed, setBulkDisablingUsed] = useState(false)
+  const [switchingMode, setSwitchingMode] = useState(false)
+  const [togglingId, setTogglingId] = useState('')
+  const [aliases, setAliases] = useState<any[]>([])
+  const [total, setTotal] = useState(0)
+  const [availableImportPoolCount, setAvailableImportPoolCount] = useState(0)
+  const [autoPoolStatus, setAutoPoolStatus] = useState<ICloudHmeAutoPoolStatus | null>(null)
+  const [autoPoolStatusLoading, setAutoPoolStatusLoading] = useState(false)
+  const [onlyReadyView, setOnlyReadyView] = useState(false)
+  const [page, setPage] = useState(1)
+  const [pageSize, setPageSize] = useState(20)
+  const [statusFilter, setStatusFilter] = useState('')
+  const [enabledFilter, setEnabledFilter] = useState('')
+  const [sourceFilter, setSourceFilter] = useState('')
+  const [searchHme, setSearchHme] = useState('')
+
+  const loadAutoPoolStatus = async () => {
+    setAutoPoolStatusLoading(true)
+    try {
+      const data = await apiFetch('/icloud-hme/auto-pool/status')
+      setAutoPoolStatus(data || null)
+    } catch {
+      setAutoPoolStatus(null)
+    } finally {
+      setAutoPoolStatusLoading(false)
+    }
+  }
+
+  const loadAliases = async (
+    nextPage = page,
+    nextPageSize = pageSize,
+    nextOnlyReadyView = onlyReadyView,
+    nextStatus = statusFilter,
+    nextEnabled = enabledFilter,
+    nextSource = sourceFilter,
+    nextSearchHme = searchHme,
+  ) => {
+    setLoading(true)
+    try {
+      const values = form.getFieldsValue(true)
+      const currentForwardTo = String(values.icloud_forward_to || 'b@cccy.me').trim() || 'b@cccy.me'
+      const params = new URLSearchParams({
+        page: String(nextPage),
+        size: String(nextPageSize),
+        purpose: 'chatgpt_register',
+        bound_service: 'chatgpt',
+      })
+      if (nextOnlyReadyView) {
+        params.set('ready_only', 'true')
+        params.set('forward_to', currentForwardTo)
+      }
+      if (nextStatus) params.set('status', nextStatus)
+      if (nextEnabled) params.set('enabled', nextEnabled)
+      if (nextSource) params.set('created_source', nextSource)
+      if (String(nextSearchHme || '').trim()) params.set('hme', String(nextSearchHme || '').trim())
+
+      const data = await apiFetch(`/icloud-hme/aliases?${params.toString()}`)
+      setAliases(Array.isArray(data?.data) ? data.data : [])
+      setTotal(Number(data?.total || 0) || 0)
+      setAvailableImportPoolCount(Number(data?.available_import_pool_count || 0) || 0)
+      setPage(Number(data?.page || nextPage) || 1)
+      setPageSize(Number(data?.size || nextPageSize) || nextPageSize)
+      loadAutoPoolStatus().catch(() => {})
+    } catch (e: any) {
+      message.error(e?.message || '读取 iCloud HME 别名失败')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  useEffect(() => {
+    loadAliases().catch(() => {})
+    loadAutoPoolStatus().catch(() => {})
+  }, [])
+
+  const syncLiveAliases = async () => {
+    const values = form.getFieldsValue(true)
+    const payload = {
+      icloud_cookie: String(values.icloud_cookie || '').trim(),
+      icloud_domain_base: String(values.icloud_domain_base || 'icloud.com').trim() || 'icloud.com',
+      forward_to: String(values.icloud_forward_to || 'b@cccy.me').trim() || 'b@cccy.me',
+      purpose: 'chatgpt_register',
+      bound_service: 'chatgpt',
+    }
+    if (!payload.icloud_cookie) {
+      message.error('请先填写 iCloud Cookie')
+      return
+    }
+    setSyncing(true)
+    try {
+      const result = await apiFetch('/icloud-hme/sync-live', {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      })
+      message.success(`同步完成：${Number(result?.synced_count || 0)} 条`)
+      await loadAliases(1, pageSize)
+    } catch (e: any) {
+      message.error(e?.message || '同步 iCloud 官网别名失败')
+    } finally {
+      setSyncing(false)
+    }
+  }
+
+  const bulkEnableAvailableAliases = async () => {
+    const values = form.getFieldsValue(true)
+    const forwardTo = String(values.icloud_forward_to || 'b@cccy.me').trim() || 'b@cccy.me'
+    setBulkEnabling(true)
+    try {
+      const result = await apiFetch('/icloud-hme/aliases/bulk-enable', {
+        method: 'POST',
+        body: JSON.stringify({
+          forward_to: forwardTo,
+          only_manual_created: false,
+          only_unused: true,
+        }),
+      })
+      message.success(
+        `批量启用完成：命中 ${Number(result?.matched || 0)} 条，新启用 ${Number(result?.enabled || 0)} 条，恢复失败 ${Number(result?.recycled || 0)} 条`
+      )
+      await loadAliases(page, pageSize)
+    } catch (e: any) {
+      message.error(e?.message || '批量启用失败')
+    } finally {
+      setBulkEnabling(false)
+    }
+  }
+
+  const switchToImportPoolMode = async () => {
+    const values = form.getFieldsValue(true)
+    const nextValues = {
+      ...values,
+      icloud_hme_mode: 'import_pool',
+    }
+    setSwitchingMode(true)
+    try {
+      await apiFetch('/config', {
+        method: 'PUT',
+        body: JSON.stringify({ data: nextValues }),
+      })
+      form.setFieldsValue({ icloud_hme_mode: 'import_pool' })
+      message.success('已切换到 import_pool 模式')
+    } catch (e: any) {
+      message.error(e?.message || '切换 import_pool 模式失败')
+    } finally {
+      setSwitchingMode(false)
+    }
+  }
+
+  const bulkDisableUsedAliases = async () => {
+    const values = form.getFieldsValue(true)
+    const forwardTo = String(values.icloud_forward_to || 'b@cccy.me').trim() || 'b@cccy.me'
+    setBulkDisablingUsed(true)
+    try {
+      const result = await apiFetch('/icloud-hme/aliases/bulk-disable-used', {
+        method: 'POST',
+        body: JSON.stringify({
+          forward_to: forwardTo,
+        }),
+      })
+      message.success(`批量停用完成：命中 ${Number(result?.matched || 0)} 条，新停用 ${Number(result?.disabled || 0)} 条`)
+      await loadAliases(page, pageSize)
+    } catch (e: any) {
+      message.error(e?.message || '批量停用失败')
+    } finally {
+      setBulkDisablingUsed(false)
+    }
+  }
+
+  const toggleAliasEnabled = async (anonymousId: string, enabled: boolean) => {
+    if (!anonymousId) return
+    setTogglingId(anonymousId)
+    try {
+      await apiFetch(`/icloud-hme/aliases/${encodeURIComponent(anonymousId)}/enabled`, {
+        method: 'POST',
+        body: JSON.stringify({ enabled }),
+      })
+      message.success(enabled ? '已启用到邮箱池' : '已从邮箱池停用')
+      await loadAliases(page, pageSize)
+    } catch (e: any) {
+      message.error(e?.message || '切换启用状态失败')
+    } finally {
+      setTogglingId('')
+    }
+  }
+
+  const copyText = async (item: any) => {
+    const anonymousId = String(item?.anonymous_id || '').trim()
+    const value = String(item?.hme || '').trim()
+    if (!value) return
+    setTogglingId(anonymousId)
+    try {
+      await navigator.clipboard.writeText(value)
+      if (anonymousId) {
+        await apiFetch(`/icloud-hme/aliases/${encodeURIComponent(anonymousId)}/mark-used`, {
+          method: 'POST',
+          body: JSON.stringify({ note: 'manually_copied' }),
+        })
+      }
+      message.success('已复制，并标记为已使用')
+      await loadAliases(page, pageSize)
+    } catch {
+      message.error('复制失败')
+    } finally {
+      setTogglingId('')
+    }
+  }
+
+  const columns = [
+    {
+      title: '标签 / 地址',
+      key: 'alias',
+      render: (_: any, item: any) => (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+          <Space size={6}>
+            <Typography.Text strong>{String(item.label || '-')}</Typography.Text>
+          </Space>
+          <Space size={6}>
+            <Typography.Text style={{ fontFamily: 'monospace' }}>{String(item.hme || '')}</Typography.Text>
+            <Button
+              size="small"
+              type="text"
+              icon={<CopyOutlined />}
+              loading={togglingId === String(item.anonymous_id || '')}
+              onClick={() => copyText(item)}
+            />
+          </Space>
+        </div>
+      ),
+    },
+    {
+      title: '来源',
+      key: 'source',
+      width: 140,
+      render: (_: any, item: any) => (
+        <Tag color={item.is_manual_created ? 'blue' : 'purple'}>
+          {item.is_manual_created ? '手动创建' : '系统创建'}
+        </Tag>
+      ),
+    },
+    {
+      title: '使用状态',
+      key: 'used',
+      width: 140,
+      render: (_: any, item: any) => (
+        <Tag color={item.used_by_system ? 'orange' : 'green'}>
+          {item.used_by_system ? '系统已使用' : '系统未使用'}
+        </Tag>
+      ),
+    },
+    {
+      title: '绑定账号',
+      dataIndex: 'bound_account_email',
+      key: 'bound_account_email',
+      width: 220,
+      render: (value: string) => <Typography.Text type="secondary">{String(value || '-')}</Typography.Text>,
+    },
+    {
+      title: '使用次数',
+      dataIndex: 'use_count',
+      key: 'use_count',
+      width: 100,
+      render: (value: number) => String(value ?? 0),
+    },
+    {
+      title: '转发',
+      dataIndex: 'forward_to',
+      key: 'forward_to',
+      width: 180,
+      render: (value: string) => <Typography.Text type="secondary">{String(value || '-')}</Typography.Text>,
+    },
+    {
+      title: '操作',
+      key: 'actions',
+      width: 180,
+      render: (_: any, item: any) => (
+        <Space>
+          <Switch
+            checked={Boolean(item.enabled)}
+            checkedChildren="启用"
+            unCheckedChildren="停用"
+            loading={togglingId === String(item.anonymous_id || '')}
+            onChange={(checked) => toggleAliasEnabled(String(item.anonymous_id || ''), checked)}
+          />
+        </Space>
+      ),
+    },
+  ]
+
+  const displayedAliases = aliases
+  const statusReadyCount = Number(autoPoolStatus?.ready_count ?? availableImportPoolCount) || 0
+  const statusStockLimit = Number(autoPoolStatus?.stock_limit || 0) || 0
+
+  return (
+    <Card
+      title="iCloud HME 已创建邮箱"
+      extra={(
+        <Space>
+          <Tag color="blue">总数: {total}</Tag>
+          <Tag color="geekblue">当前显示: {displayedAliases.length}</Tag>
+          <Button loading={bulkDisablingUsed} onClick={bulkDisableUsedAliases}>
+            批量停用系统已使用别名
+          </Button>
+          <Button loading={switchingMode} onClick={switchToImportPoolMode}>
+            一键切换 import_pool
+          </Button>
+          <Button loading={bulkEnabling} onClick={bulkEnableAvailableAliases}>
+            批量启用可用官网别名
+          </Button>
+          <Button icon={<SyncOutlined />} loading={syncing || loading} onClick={syncLiveAliases}>
+            同步官网别名
+          </Button>
+        </Space>
+      )}
+      style={{ marginBottom: 16 }}
+    >
+      <Alert
+        type="info"
+        showIcon
+        style={{ marginBottom: 16 }}
+        message="来源与使用状态说明"
+        description="手动创建表示该别名来自 iCloud 官网同步；系统创建表示它由当前系统 live create 或导入消费链路落库。只有启用到邮箱池的别名，才会被 import_pool / prefer_import 模式拿去注册。系统已使用的别名仅作历史标记，不代表当前自动再次复用。register_failed 的官网别名可通过批量启用恢复回可用池。"
+      />
+      <div
+        style={{
+          marginBottom: 16,
+          padding: 12,
+          border: '1px solid rgba(24, 144, 255, 0.18)',
+          borderRadius: 8,
+          background: 'rgba(24, 144, 255, 0.04)',
+        }}
+      >
+        <Space wrap size={[8, 8]} style={{ width: '100%', justifyContent: 'space-between' }}>
+          <Space wrap>
+            <Tag color={autoPoolStatus?.enabled ? 'green' : 'default'}>
+              自动补池: {autoPoolStatus?.enabled ? '开启' : '关闭'}
+            </Tag>
+            <Tag color={autoPoolStatus?.running ? 'blue' : 'default'}>
+              调度线程: {autoPoolStatus?.running ? '运行中' : '未运行'}
+            </Tag>
+            <Tag color={autoPoolStatus?.in_rate_limit_backoff ? 'red' : 'cyan'}>
+              {autoPoolStatus?.in_rate_limit_backoff ? '限流等待中' : '未限流'}
+            </Tag>
+            <Tag color={statusStockLimit > 0 && statusReadyCount >= statusStockLimit ? 'gold' : 'green'}>
+              库存: {statusReadyCount}/{statusStockLimit || '-'}
+            </Tag>
+          </Space>
+          <Button size="small" loading={autoPoolStatusLoading} onClick={() => loadAutoPoolStatus()}>
+            刷新自动补池状态
+          </Button>
+        </Space>
+        <Space wrap size={[16, 6]} style={{ marginTop: 8 }}>
+          <Typography.Text type="secondary">
+            下次创建: {formatDateTimeText(autoPoolStatus?.next_run_at)}
+          </Typography.Text>
+          <Typography.Text type="secondary">
+            剩余: {formatDurationText(autoPoolStatus?.seconds_until_next_run)}
+          </Typography.Text>
+          <Typography.Text type="secondary">
+            随机间隔: {autoPoolStatus?.interval_min_minutes || '-'} - {autoPoolStatus?.interval_max_minutes || '-'} 分钟
+          </Typography.Text>
+          <Typography.Text type="secondary">
+            限流延长: {autoPoolStatus?.rate_limit_backoff_minutes || '-'} 分钟
+          </Typography.Text>
+          <Typography.Text type="secondary">
+            最近创建: {autoPoolStatus?.last_created_hme || '-'}
+          </Typography.Text>
+          <Typography.Text type={autoPoolStatus?.last_error ? 'danger' : 'secondary'}>
+            最近错误: {autoPoolStatus?.last_error || '-'}
+          </Typography.Text>
+        </Space>
+      </div>
+      <Space wrap style={{ marginBottom: 12 }}>
+        <Tag color="green">导入池可用账号: {availableImportPoolCount}</Tag>
+        <Typography.Text type="secondary">
+          按当前转发邮箱统计，表示 import_pool / prefer_import 实际还能领取去注册的邮箱数量
+        </Typography.Text>
+      </Space>
+      <Space wrap style={{ marginBottom: 12 }}>
+        <Switch
+          checked={onlyReadyView}
+          checkedChildren="只看可注册"
+          unCheckedChildren="显示全部"
+          onChange={(checked) => {
+            setOnlyReadyView(checked)
+            setPage(1)
+            loadAliases(1, pageSize, checked, statusFilter, enabledFilter, sourceFilter, searchHme).catch(() => {})
+          }}
+        />
+        <Select
+          allowClear
+          placeholder="状态"
+          style={{ width: 140 }}
+          value={statusFilter || undefined}
+          onChange={(value) => {
+            const nextValue = String(value || '')
+            setStatusFilter(nextValue)
+            setPage(1)
+            loadAliases(1, pageSize, onlyReadyView, nextValue, enabledFilter, sourceFilter, searchHme).catch(() => {})
+          }}
+          options={[
+            { label: 'reserved', value: 'reserved' },
+            { label: 'in_use', value: 'in_use' },
+            { label: 'registered', value: 'registered' },
+            { label: 'register_failed', value: 'register_failed' },
+            { label: 'retired', value: 'retired' },
+          ]}
+        />
+        <Select
+          allowClear
+          placeholder="启用状态"
+          style={{ width: 140 }}
+          value={enabledFilter || undefined}
+          onChange={(value) => {
+            const nextValue = String(value || '')
+            setEnabledFilter(nextValue)
+            setPage(1)
+            loadAliases(1, pageSize, onlyReadyView, statusFilter, nextValue, sourceFilter, searchHme).catch(() => {})
+          }}
+          options={[
+            { label: '已启用', value: 'enabled' },
+            { label: '已停用', value: 'disabled' },
+          ]}
+        />
+        <Select
+          allowClear
+          placeholder="来源"
+          style={{ width: 140 }}
+          value={sourceFilter || undefined}
+          onChange={(value) => {
+            const nextValue = String(value || '')
+            setSourceFilter(nextValue)
+            setPage(1)
+            loadAliases(1, pageSize, onlyReadyView, statusFilter, enabledFilter, nextValue, searchHme).catch(() => {})
+          }}
+          options={[
+            { label: '手动创建', value: 'manual_created' },
+            { label: '系统创建', value: 'live_create' },
+            { label: 'CSV 导入', value: 'csv_import' },
+          ]}
+        />
+        <Input.Search
+          allowClear
+          placeholder="搜索邮箱地址"
+          style={{ width: 220 }}
+          value={searchHme}
+          onChange={(event) => setSearchHme(event.target.value)}
+          onSearch={(value) => {
+            const nextValue = String(value || '')
+            setSearchHme(nextValue)
+            setPage(1)
+            loadAliases(1, pageSize, onlyReadyView, statusFilter, enabledFilter, sourceFilter, nextValue).catch(() => {})
+          }}
+        />
+      </Space>
+      <Table
+        rowKey={(item) => String(item.anonymous_id || item.id)}
+        loading={loading}
+        columns={columns}
+        dataSource={displayedAliases}
+        pagination={{
+          current: page,
+          pageSize,
+          total,
+          showSizeChanger: true,
+          pageSizeOptions: ['20', '50', '100'],
+          onChange: (nextPage, nextPageSize) => {
+            loadAliases(nextPage, nextPageSize, onlyReadyView, statusFilter, enabledFilter, sourceFilter, searchHme).catch(() => {})
+          },
+        }}
+        locale={{ emptyText: '还没有同步到任何 iCloud HME 别名。' }}
+        scroll={{ x: 1100, y: '60vh' }}
+      />
+    </Card>
+  )
+}
+
 type TotpSetupState = 'idle' | 'setup'
 
 function SecurityPanel() {
@@ -1679,6 +2291,39 @@ export default function Settings() {
       if (!data.contribution_server_url) {
         data.contribution_server_url = 'http://new.xem8k5.top:7317/'
       }
+      if (!data.chatgpt_gopay_billing_llm_base_url) {
+        data.chatgpt_gopay_billing_llm_base_url = 'https://api.666800.xyz'
+      }
+      if (!data.chatgpt_gopay_billing_llm_model) {
+        data.chatgpt_gopay_billing_llm_model = 'gpt-5.4'
+      }
+      if (!data.chatgpt_gopay_billing_llm_wire_api) {
+        data.chatgpt_gopay_billing_llm_wire_api = 'responses'
+      }
+      if (!data.chatgpt_gopay_billing_llm_country_strategy) {
+        data.chatgpt_gopay_billing_llm_country_strategy = 'billing_country'
+      }
+      if (!data.chatgpt_gopay_billing_llm_fixed_country) {
+        data.chatgpt_gopay_billing_llm_fixed_country = 'US'
+      }
+      if (!data.chatgpt_gopay_billing_llm_reasoning_effort) {
+        data.chatgpt_gopay_billing_llm_reasoning_effort = 'xhigh'
+      }
+      if (!data.chatgpt_gopay_billing_llm_timeout_seconds) {
+        data.chatgpt_gopay_billing_llm_timeout_seconds = 45
+      }
+      if (!data.chatgpt_gopay_billing_llm_prompt) {
+        data.chatgpt_gopay_billing_llm_prompt = '生成一个真实可用的账单地址，地址在谷歌地图中能找到对应的位置。'
+      }
+      if (!data.chatgpt_access_token_only_zero_amount_stop_threshold) {
+        data.chatgpt_access_token_only_zero_amount_stop_threshold = '1'
+      }
+      if (!data.chatgpt_access_token_only_checkout_country) {
+        data.chatgpt_access_token_only_checkout_country = 'US'
+      }
+      if (!data.chatgpt_access_token_only_checkout_currency) {
+        data.chatgpt_access_token_only_checkout_currency = 'USD'
+      }
       if (!data.cloudmail_timeout) {
         data.cloudmail_timeout = 30
       }
@@ -1703,7 +2348,21 @@ export default function Settings() {
       if (!data.tempmail_platform) {
         data.tempmail_platform = 'chatgpt'
       }
+      if (!data.icloud_hme_auto_create_stock_limit) {
+        data.icloud_hme_auto_create_stock_limit = '10'
+      }
+      if (!data.icloud_hme_auto_create_interval_min_minutes) {
+        data.icloud_hme_auto_create_interval_min_minutes = '60'
+      }
+      if (!data.icloud_hme_auto_create_interval_max_minutes) {
+        data.icloud_hme_auto_create_interval_max_minutes = '120'
+      }
+      if (!data.icloud_hme_auto_create_rate_limit_backoff_minutes) {
+        data.icloud_hme_auto_create_rate_limit_backoff_minutes = '360'
+      }
       data.tempmail_permanent = parseBooleanConfigValue(data.tempmail_permanent)
+      data.icloud_hme_auto_create_enabled = parseBooleanConfigValue(data.icloud_hme_auto_create_enabled)
+      data.proxy_pool_cooldown_enabled = data.proxy_pool_cooldown_enabled === '' ? true : parseBooleanConfigValue(data.proxy_pool_cooldown_enabled)
       data.cfworker_domains = parseStoredDomainList(data.cfworker_domains)
       data.cfworker_enabled_domains = parseStoredDomainList(data.cfworker_enabled_domains)
       data.cfworker_random_subdomain = parseBooleanConfigValue(data.cfworker_random_subdomain)
@@ -1712,6 +2371,14 @@ export default function Settings() {
       data.chatgpt_team_invite_deferred_activation = parseBooleanConfigValue(data.chatgpt_team_invite_deferred_activation)
       data.chatgpt_capture_free_workspace = data.chatgpt_capture_free_workspace === '' ? true : parseBooleanConfigValue(data.chatgpt_capture_free_workspace)
       data.chatgpt_capture_business_workspace = data.chatgpt_capture_business_workspace === '' ? true : parseBooleanConfigValue(data.chatgpt_capture_business_workspace)
+      data.chatgpt_gopay_billing_llm_enabled = data.chatgpt_gopay_billing_llm_enabled === '' ? true : parseBooleanConfigValue(data.chatgpt_gopay_billing_llm_enabled)
+      data.chatgpt_access_token_only_checkout_amount_check_enabled =
+        data.chatgpt_access_token_only_checkout_amount_check_enabled === ''
+          ? true
+          : parseBooleanConfigValue(data.chatgpt_access_token_only_checkout_amount_check_enabled)
+      data.chatgpt_access_token_only_zero_amount_stop_enabled = parseBooleanConfigValue(
+        data.chatgpt_access_token_only_zero_amount_stop_enabled,
+      )
       form.setFieldsValue(data)
     })
   }, [form])
@@ -1736,12 +2403,49 @@ export default function Settings() {
       }
       values.cfworker_random_subdomain = parseBooleanConfigValue(values.cfworker_random_subdomain)
       values.tempmail_permanent = parseBooleanConfigValue(values.tempmail_permanent)
+      values.icloud_hme_auto_create_enabled = parseBooleanConfigValue(values.icloud_hme_auto_create_enabled)
+      values.icloud_hme_auto_create_stock_limit = String(
+        Math.max(1, Number.parseInt(String(values.icloud_hme_auto_create_stock_limit || '10'), 10) || 10),
+      )
+      const intervalMin = Math.max(
+        1,
+        Number.parseInt(String(values.icloud_hme_auto_create_interval_min_minutes || '60'), 10) || 60,
+      )
+      const intervalMax = Math.max(
+        intervalMin,
+        Number.parseInt(String(values.icloud_hme_auto_create_interval_max_minutes || '120'), 10) || 120,
+      )
+      values.icloud_hme_auto_create_interval_min_minutes = String(intervalMin)
+      values.icloud_hme_auto_create_interval_max_minutes = String(intervalMax)
+      values.icloud_hme_auto_create_rate_limit_backoff_minutes = String(
+        Math.max(
+          1,
+          Number.parseInt(String(values.icloud_hme_auto_create_rate_limit_backoff_minutes || '360'), 10) || 360,
+        ),
+      )
+      values.proxy_pool_cooldown_enabled = parseBooleanConfigValue(values.proxy_pool_cooldown_enabled)
       values.tempmail_mode = values.tempmail_mode || 'fixed_domain'
       values.contribution_enabled = parseBooleanConfigValue(values.contribution_enabled)
       values.chatgpt_enable_team_invite = parseBooleanConfigValue(values.chatgpt_enable_team_invite)
       values.chatgpt_team_invite_deferred_activation = parseBooleanConfigValue(values.chatgpt_team_invite_deferred_activation)
       values.chatgpt_capture_free_workspace = parseBooleanConfigValue(values.chatgpt_capture_free_workspace)
       values.chatgpt_capture_business_workspace = parseBooleanConfigValue(values.chatgpt_capture_business_workspace)
+      values.chatgpt_gopay_billing_llm_enabled = parseBooleanConfigValue(values.chatgpt_gopay_billing_llm_enabled)
+      values.chatgpt_access_token_only_checkout_amount_check_enabled = parseBooleanConfigValue(
+        values.chatgpt_access_token_only_checkout_amount_check_enabled,
+      )
+      values.chatgpt_access_token_only_zero_amount_stop_enabled = parseBooleanConfigValue(
+        values.chatgpt_access_token_only_zero_amount_stop_enabled,
+      )
+      values.chatgpt_access_token_only_zero_amount_stop_threshold = String(
+        values.chatgpt_access_token_only_zero_amount_stop_threshold || '1',
+      ).trim() || '1'
+      values.chatgpt_access_token_only_checkout_country = String(
+        values.chatgpt_access_token_only_checkout_country || 'US',
+      ).trim().toUpperCase() || 'US'
+      values.chatgpt_access_token_only_checkout_currency = String(
+        values.chatgpt_access_token_only_checkout_currency || 'USD',
+      ).trim().toUpperCase() || 'USD'
 
       await apiFetch('/config', { method: 'PUT', body: JSON.stringify({ data: values }) })
       form.setFieldsValue({
@@ -1750,11 +2454,22 @@ export default function Settings() {
         cfworker_domain: domains.length > 0 ? '' : values.cfworker_domain,
         cfworker_random_subdomain: values.cfworker_random_subdomain,
         tempmail_permanent: values.tempmail_permanent,
+        icloud_hme_auto_create_enabled: values.icloud_hme_auto_create_enabled,
+        icloud_hme_auto_create_stock_limit: values.icloud_hme_auto_create_stock_limit,
+        icloud_hme_auto_create_interval_min_minutes: values.icloud_hme_auto_create_interval_min_minutes,
+        icloud_hme_auto_create_interval_max_minutes: values.icloud_hme_auto_create_interval_max_minutes,
+        icloud_hme_auto_create_rate_limit_backoff_minutes: values.icloud_hme_auto_create_rate_limit_backoff_minutes,
         contribution_enabled: values.contribution_enabled,
         chatgpt_enable_team_invite: values.chatgpt_enable_team_invite,
         chatgpt_team_invite_deferred_activation: values.chatgpt_team_invite_deferred_activation,
         chatgpt_capture_free_workspace: values.chatgpt_capture_free_workspace,
         chatgpt_capture_business_workspace: values.chatgpt_capture_business_workspace,
+        chatgpt_gopay_billing_llm_enabled: values.chatgpt_gopay_billing_llm_enabled,
+        chatgpt_access_token_only_checkout_amount_check_enabled: values.chatgpt_access_token_only_checkout_amount_check_enabled,
+        chatgpt_access_token_only_checkout_country: values.chatgpt_access_token_only_checkout_country,
+        chatgpt_access_token_only_checkout_currency: values.chatgpt_access_token_only_checkout_currency,
+        chatgpt_access_token_only_zero_amount_stop_enabled: values.chatgpt_access_token_only_zero_amount_stop_enabled,
+        chatgpt_access_token_only_zero_amount_stop_threshold: values.chatgpt_access_token_only_zero_amount_stop_threshold,
       })
       message.success('保存成功')
       setSaved(true)
@@ -1822,8 +2537,9 @@ export default function Settings() {
                     />
                   ) : null}
                   {visibleSections.map((section) => (
-                    <ConfigSection key={section.title} section={section} />
+                    <ConfigSection key={`${activeTab}:${section.title}`} section={section} defaultCollapsed={activeTab === 'chatgpt'} />
                   ))}
+                  {activeTab === 'mailbox' && selectedMailProvider === 'icloud_hme' ? <ICloudHmeManagerSection form={form} /> : null}
                   {activeTab === 'mailbox' && selectedMailProvider === 'applemail' ? <AppleMailPoolImportSection form={form} /> : null}
                   {activeTab === 'mailbox' && selectedMailProvider === 'cfworker' ? <CFWorkerDomainPoolSection form={form} /> : null}
                   {activeTab === 'mailbox' && selectedMailProvider === 'outlook' ? <OutlookImportSection /> : null}

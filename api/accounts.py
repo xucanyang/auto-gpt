@@ -3,6 +3,7 @@ from fastapi.responses import StreamingResponse
 from sqlmodel import Session, select, func
 from pydantic import BaseModel
 from core.db import AccountModel, PendingBusinessInviteModel, get_session
+from services.chatgpt_account_state import classify_chatgpt_capabilities
 from services.team_lite import team_lite_service
 from typing import Any, Optional
 from datetime import datetime, timezone
@@ -24,6 +25,32 @@ def _safe_str(value: Any) -> str:
     return str(value or "").strip()
 
 
+def _is_team_invite_source_visible(*, workspace_scope: str, invite_status: str, team_id: int) -> bool:
+    """Return whether an account should expose Team invite/removal metadata.
+
+    Free workspace rows may still have historical PendingBusinessInvite rows because
+    the same registration flow used the pending table as a staging area.  Those
+    rows must not make the UI show "移除队伍" for a free-only account.
+    """
+    scope = _safe_str(workspace_scope).lower()
+    status = _safe_str(invite_status).lower()
+    if scope in {"business", "pending_activation"}:
+        return True
+    if team_id > 0 and status and status not in {"completed", "abandoned", "failed", "failed_terminal"}:
+        return True
+    return False
+
+
+def _is_team_invite_source_removable(*, workspace_scope: str, invite_status: str, team_id: int, removed_from_team_at: str) -> bool:
+    if team_id <= 0 or _safe_str(removed_from_team_at):
+        return False
+    return _is_team_invite_source_visible(
+        workspace_scope=workspace_scope,
+        invite_status=invite_status,
+        team_id=team_id,
+    )
+
+
 def _serialize_account(account: AccountModel, *, team_invite_source: Optional[dict[str, Any]] = None) -> dict[str, Any]:
     data = account.model_dump(mode="json") if hasattr(account, "model_dump") else account.dict()
     if team_invite_source:
@@ -31,7 +58,61 @@ def _serialize_account(account: AccountModel, *, team_invite_source: Optional[di
     return data
 
 
-def _build_team_invite_sources(accounts: list[AccountModel], session: Session) -> dict[int, dict[str, Any]]:
+def _serialize_account_list_item(account: AccountModel, *, team_invite_source: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    extra = account.get_extra()
+    sync_statuses = extra.get("sync_statuses") if isinstance(extra.get("sync_statuses"), dict) else {}
+    chatgpt_local = extra.get("chatgpt_local") if isinstance(extra.get("chatgpt_local"), dict) else {}
+    chatgpt_capabilities = extra.get("chatgpt_capabilities") if isinstance(extra.get("chatgpt_capabilities"), dict) else {}
+    if account.platform == "chatgpt" and not chatgpt_capabilities:
+        # Older rows may have tokens/workspace IDs but no derived capability snapshot yet.
+        chatgpt_capabilities = classify_chatgpt_capabilities(account, local_probe=chatgpt_local)
+    payload = {
+        "id": account.id,
+        "platform": account.platform,
+        "email": account.email,
+        "password": account.password,
+        "user_id": account.user_id,
+        "region": account.region,
+        "token": account.token,
+        "status": account.status,
+        "cashier_url": account.cashier_url,
+        "created_at": account.created_at,
+        "updated_at": account.updated_at,
+        "extra_json": account.extra_json,
+        "extra": {
+            "manually_used": bool(extra.get("manually_used")),
+            "chatgpt_workspace_label": _safe_str(extra.get("chatgpt_workspace_label")),
+            "chatgpt_workspace_scope": _safe_str(extra.get("chatgpt_workspace_scope")),
+            "chatgpt_workspace_display_name": _safe_str(extra.get("chatgpt_workspace_display_name")),
+            "session_token": _safe_str(extra.get("session_token")),
+        },
+        "workspace_scope": _safe_str(extra.get("chatgpt_workspace_scope")),
+        "workspace_label": _safe_str(extra.get("chatgpt_workspace_label")),
+        "workspace_display_name": _safe_str(extra.get("chatgpt_workspace_display_name")),
+        "manually_used": bool(extra.get("manually_used")),
+        "session_token": _safe_str(extra.get("session_token")),
+        "auth_level": _safe_str(chatgpt_capabilities.get("auth_level")),
+        "subscription_plan": _safe_str(chatgpt_capabilities.get("subscription_plan")),
+        "codex_state": _safe_str((chatgpt_local.get("codex") or {}).get("state")),
+        "cliproxy_remote_state": _safe_str((sync_statuses.get("cliproxyapi") or {}).get("remote_state")),
+        "sub2api_remote_state": _safe_str((sync_statuses.get("sub2api") or {}).get("remote_state")),
+        "team_invite_status": _safe_str(team_invite_source.get("invite_status") if team_invite_source else ""),
+        "chatgptLocal": chatgpt_local,
+        "chatgptCapabilities": chatgpt_capabilities,
+        "sub2apiSync": sync_statuses.get("sub2api") if isinstance(sync_statuses.get("sub2api"), dict) else {},
+        "cliproxySync": sync_statuses.get("cliproxyapi") if isinstance(sync_statuses.get("cliproxyapi"), dict) else {},
+    }
+    if team_invite_source:
+        payload["team_invite_source"] = team_invite_source
+    return payload
+
+
+def _build_team_invite_sources(
+    accounts: list[AccountModel],
+    session: Session,
+    *,
+    include_team_brief: bool = True,
+) -> dict[int, dict[str, Any]]:
     chatgpt_accounts = [account for account in accounts if account.platform == "chatgpt" and int(account.id or 0) > 0]
     if not chatgpt_accounts:
         return {}
@@ -64,7 +145,11 @@ def _build_team_invite_sources(accounts: list[AccountModel], session: Session) -
         joined_at = _safe_str(getattr(pending_row, "joined_at", "") if pending_row else pending_payload.get("joined_at"))
         removed_from_team_at = _safe_str(extra.get("chatgpt_team_invite_removed_at"))
 
-        if team_id <= 0 and not invite_status and workspace_scope not in {"business", "pending_activation"}:
+        if not _is_team_invite_source_visible(
+            workspace_scope=workspace_scope,
+            invite_status=invite_status,
+            team_id=team_id,
+        ):
             continue
 
         source = {
@@ -75,14 +160,19 @@ def _build_team_invite_sources(accounts: list[AccountModel], session: Session) -
             "invited_at": invited_at,
             "joined_at": joined_at,
             "removed_from_team_at": removed_from_team_at,
-            "removable": team_id > 0 and not removed_from_team_at,
+            "removable": _is_team_invite_source_removable(
+                workspace_scope=workspace_scope,
+                invite_status=invite_status,
+                team_id=team_id,
+                removed_from_team_at=removed_from_team_at,
+            ),
         }
         sources[account_id] = source
         if team_id > 0 and team_id not in seen_team_ids:
             seen_team_ids.add(team_id)
             team_ids.append(team_id)
 
-    if not sources:
+    if not sources or not include_team_brief:
         return {}
 
     team_briefs = team_lite_service.get_team_db_briefs(team_ids)
@@ -107,6 +197,61 @@ def _build_team_invite_sources(accounts: list[AccountModel], session: Session) -
     return sources
 
 
+def _build_team_invite_source_summaries(accounts: list[AccountModel], session: Session) -> dict[int, dict[str, Any]]:
+    chatgpt_accounts = [account for account in accounts if account.platform == "chatgpt" and int(account.id or 0) > 0]
+    if not chatgpt_accounts:
+        return {}
+
+    account_ids = [int(account.id or 0) for account in chatgpt_accounts]
+    pending_rows = session.exec(
+        select(PendingBusinessInviteModel).where(PendingBusinessInviteModel.account_id.in_(account_ids))
+    ).all()
+    pending_by_account = {
+        int(row.account_id or 0): row
+        for row in pending_rows
+        if int(row.account_id or 0) > 0
+    }
+
+    sources: dict[int, dict[str, Any]] = {}
+    for account in chatgpt_accounts:
+        account_id = int(account.id or 0)
+        extra = account.get_extra()
+        pending_payload = dict(extra.get("chatgpt_pending_business_invite") or {})
+        pending_row = pending_by_account.get(account_id)
+
+        team_id = _safe_int(getattr(pending_row, "team_id", 0) if pending_row else pending_payload.get("team_id"))
+        invite_status = _safe_str(getattr(pending_row, "status", "") if pending_row else pending_payload.get("status"))
+        workspace_scope = _safe_str(extra.get("chatgpt_workspace_scope"))
+        team_name = _safe_str(getattr(pending_row, "team_name", "") if pending_row else pending_payload.get("team_name"))
+        invited_at = _safe_str(getattr(pending_row, "invited_at", "") if pending_row else pending_payload.get("invite_sent_at") or pending_payload.get("invited_at"))
+        joined_at = _safe_str(getattr(pending_row, "joined_at", "") if pending_row else pending_payload.get("joined_at"))
+        removed_from_team_at = _safe_str(extra.get("chatgpt_team_invite_removed_at"))
+
+        if not _is_team_invite_source_visible(
+            workspace_scope=workspace_scope,
+            invite_status=invite_status,
+            team_id=team_id,
+        ):
+            continue
+
+        sources[account_id] = {
+            "team_id": team_id,
+            "team_name": team_name,
+            "invite_status": invite_status,
+            "workspace_scope": workspace_scope,
+            "invited_at": invited_at,
+            "joined_at": joined_at,
+            "removed_from_team_at": removed_from_team_at,
+            "removable": _is_team_invite_source_removable(
+                workspace_scope=workspace_scope,
+                invite_status=invite_status,
+                team_id=team_id,
+                removed_from_team_at=removed_from_team_at,
+            ),
+        }
+    return sources
+
+
 class AccountCreate(BaseModel):
     platform: str
     email: str
@@ -120,6 +265,10 @@ class AccountUpdate(BaseModel):
     status: Optional[str] = None
     token: Optional[str] = None
     cashier_url: Optional[str] = None
+
+
+class AccountMarkUsedRequest(BaseModel):
+    used: bool = True
 
 
 class ImportRequest(BaseModel):
@@ -144,6 +293,8 @@ def list_accounts(
     email: Optional[str] = None,
     page: int = 1,
     page_size: int = 20,
+    detail: bool = False,
+    include_team_brief: bool = False,
     session: Session = Depends(get_session),
 ):
     q = select(AccountModel)
@@ -153,14 +304,23 @@ def list_accounts(
         q = q.where(AccountModel.status == status)
     if email:
         q = q.where(AccountModel.email.contains(email))
+    q = q.order_by(AccountModel.id.desc())
     total = int(session.exec(select(func.count()).select_from(q.subquery())).one())
     items = session.exec(q.offset((page - 1) * page_size).limit(page_size)).all()
-    team_invite_sources = _build_team_invite_sources(items, session)
+    team_invite_sources = (
+        _build_team_invite_sources(items, session, include_team_brief=True)
+        if detail or include_team_brief
+        else _build_team_invite_source_summaries(items, session)
+    )
     return {
         "total": total,
         "page": page,
         "items": [
-            _serialize_account(item, team_invite_source=team_invite_sources.get(int(item.id or 0)))
+            (
+                _serialize_account(item, team_invite_source=team_invite_sources.get(int(item.id or 0)))
+                if detail
+                else _serialize_account_list_item(item, team_invite_source=team_invite_sources.get(int(item.id or 0)))
+            )
             for item in items
         ],
     }
@@ -192,6 +352,46 @@ def get_stats(session: Session = Depends(get_session)):
         platforms[acc.platform] = platforms.get(acc.platform, 0) + 1
         statuses[acc.status] = statuses.get(acc.status, 0) + 1
     return {"total": len(accounts), "by_platform": platforms, "by_status": statuses}
+
+
+@router.get("/overview")
+def get_accounts_overview(
+    platform: Optional[str] = None,
+    status: Optional[str] = None,
+    email: Optional[str] = None,
+    session: Session = Depends(get_session),
+):
+    q = select(AccountModel)
+    if platform:
+        q = q.where(AccountModel.platform == platform)
+    if status:
+        q = q.where(AccountModel.status == status)
+    if email:
+        q = q.where(AccountModel.email.contains(email))
+
+    accounts = session.exec(q).all()
+    by_status: dict[str, int] = {}
+    by_platform: dict[str, int] = {}
+    manually_used = 0
+    workspace_scope_counts: dict[str, int] = {}
+
+    for acc in accounts:
+        by_status[acc.status] = by_status.get(acc.status, 0) + 1
+        by_platform[acc.platform] = by_platform.get(acc.platform, 0) + 1
+        extra = acc.get_extra()
+        if bool(extra.get("manually_used")):
+            manually_used += 1
+        scope = _safe_str(extra.get("chatgpt_workspace_scope"))
+        if scope:
+            workspace_scope_counts[scope] = workspace_scope_counts.get(scope, 0) + 1
+
+    return {
+        "total": len(accounts),
+        "by_status": by_status,
+        "by_platform": by_platform,
+        "manually_used": manually_used,
+        "workspace_scope_counts": workspace_scope_counts,
+    }
 
 
 @router.get("/export")
@@ -345,8 +545,20 @@ def get_account(account_id: int, session: Session = Depends(get_session)):
     acc = session.get(AccountModel, account_id)
     if not acc:
         raise HTTPException(404, "账号不存在")
-    team_invite_source = _build_team_invite_sources([acc], session).get(int(acc.id or 0))
+    team_invite_source = _build_team_invite_sources([acc], session, include_team_brief=True).get(int(acc.id or 0))
     return _serialize_account(acc, team_invite_source=team_invite_source)
+
+
+@router.get("/{account_id}/team-source")
+def get_account_team_source(account_id: int, session: Session = Depends(get_session)):
+    acc = session.get(AccountModel, account_id)
+    if not acc:
+        raise HTTPException(404, "账号不存在")
+    team_invite_source = _build_team_invite_sources([acc], session, include_team_brief=True).get(int(acc.id or 0))
+    return {
+        "account_id": int(acc.id or 0),
+        "team_invite_source": team_invite_source,
+    }
 
 
 @router.post("/{account_id}/chatgpt-team-remove")
@@ -452,6 +664,27 @@ def update_account(account_id: int, body: AccountUpdate,
     return acc
 
 
+@router.post("/{account_id}/mark-used")
+def mark_account_used(account_id: int, body: AccountMarkUsedRequest,
+                      session: Session = Depends(get_session)):
+    acc = session.get(AccountModel, account_id)
+    if not acc:
+        raise HTTPException(404, "账号不存在")
+    try:
+        extra = json.loads(acc.extra_json or "{}")
+    except Exception:
+        extra = {}
+    if not isinstance(extra, dict):
+        extra = {}
+    extra["manually_used"] = bool(body.used)
+    acc.extra_json = json.dumps(extra, ensure_ascii=False)
+    acc.updated_at = datetime.now(timezone.utc)
+    session.add(acc)
+    session.commit()
+    session.refresh(acc)
+    return _serialize_account(acc)
+
+
 @router.delete("/{account_id}")
 def delete_account(account_id: int, session: Session = Depends(get_session)):
     acc = session.get(AccountModel, account_id)
@@ -475,14 +708,15 @@ def check_account(account_id: int, background_tasks: BackgroundTasks,
 def _do_check(account_id: int):
     from core.db import engine
     from sqlmodel import Session
+    from services.chatgpt_core import ChatGPTPlatform
     with Session(engine) as s:
         acc = s.get(AccountModel, account_id)
     if acc:
         from core.base_platform import Account, RegisterConfig
-        from core.registry import get
         try:
-            PlatformCls = get(acc.platform)
-            plugin = PlatformCls(config=RegisterConfig())
+            if acc.platform != "chatgpt":
+                return
+            plugin = ChatGPTPlatform(config=RegisterConfig())
             obj = Account(platform=acc.platform, email=acc.email,
                          password=acc.password, user_id=acc.user_id,
                          region=acc.region, token=acc.token,

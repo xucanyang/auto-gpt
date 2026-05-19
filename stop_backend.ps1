@@ -1,7 +1,6 @@
 param(
     [int]$BackendPort = 8000,
     [int]$SolverPort = 8889,
-    [int]$Grok2ApiPort = 8011,
     [int]$CLIProxyAPIPort = 8317,
     [int]$FullStop = 1
 )
@@ -9,7 +8,7 @@ param(
 $ErrorActionPreference = "Stop"
 $ports = @($BackendPort, $SolverPort)
 if ($FullStop -ne 0) {
-    $ports += @($Grok2ApiPort, $CLIProxyAPIPort)
+    $ports += @($CLIProxyAPIPort)
 }
 $ports = $ports | Where-Object { $_ -gt 0 } | Select-Object -Unique
 
@@ -103,9 +102,6 @@ function Stop-ProcessTreeSafe {
 
 $connections = Get-ProcessIdsByPorts -TargetPorts $ports
 $extraNames = @()
-if ($FullStop -ne 0) {
-    $extraNames += @("KiroAccountManager", "kiro-account-manager")
-}
 $extraPids = Get-ProcessIdsByNames -Names $extraNames
 $targets = @($connections + $extraPids) | Where-Object { $_ } | Select-Object -Unique
 

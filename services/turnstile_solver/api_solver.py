@@ -5,7 +5,8 @@ import uuid
 import random
 import logging
 import asyncio
-from typing import Optional, Union
+import inspect
+from typing import Any, Optional, Union
 import argparse
 from quart import Quart, request, jsonify
 
@@ -74,9 +75,21 @@ class TurnstileAPIServer:
         self.debug = debug
         self.browser_type = browser_type
         self.headless = headless
-        self.thread_count = thread
+        self.thread_count = max(int(thread or 1), 1)
+        self.min_warm_browsers = max(
+            1,
+            min(
+                self.thread_count,
+                int(os.getenv("SOLVER_WARM_BROWSERS", "1") or "1"),
+            ),
+        )
         self.proxy_support = proxy_support
         self.browser_pool = asyncio.Queue()
+        self._browser_condition = asyncio.Condition()
+        self._launched_browser_count = 0
+        self._next_browser_index = 0
+        self._playwright = None
+        self._camoufox = None
         self.use_random_config = use_random_config
         self.browser_name = browser_name
         self.browser_version = browser_version
@@ -143,13 +156,14 @@ class TurnstileAPIServer:
     def _setup_routes(self) -> None:
         """Set up the application routes."""
         self.app.before_serving(self._startup)
+        self.app.after_serving(self._shutdown)
         self.app.route('/turnstile', methods=['GET'])(self.process_turnstile)
         self.app.route('/result', methods=['GET'])(self.get_result)
         self.app.route('/')(self.index)
         
 
     async def _startup(self) -> None:
-        """Initialize the browser and page pool on startup."""
+        """Initialize the solver runtime and warm browser pool on startup."""
         self.display_welcome()
         logger.info("Starting browser initialization")
         try:
@@ -164,96 +178,219 @@ class TurnstileAPIServer:
             raise
 
     async def _initialize_browser(self) -> None:
-        """Initialize the browser and create the page pool."""
-        playwright = None
-        camoufox = None
+        """Initialize browser runtime and keep only a small warm pool."""
+        await self._ensure_browser_runtime()
+        await self._warm_browser_pool()
+        logger.info(
+            "Browser pool initialized with %s warm browser(s), max dynamic browsers=%s",
+            self.browser_pool.qsize(),
+            self.thread_count,
+        )
 
+    async def _ensure_browser_runtime(self) -> None:
         if self.browser_type in ['chromium', 'chrome', 'msedge']:
+            if self._playwright is not None:
+                return
             if async_playwright is None:
                 raise RuntimeError(
                     "当前浏览器模式需要 patchright，但未安装。请执行: pip install patchright"
                 )
-            playwright = await async_playwright().start()
-        elif self.browser_type == "camoufox":
+            self._playwright = await async_playwright().start()
+            return
+
+        if self.browser_type == "camoufox":
+            if self._camoufox is not None:
+                return
             if AsyncCamoufox is None:
                 raise RuntimeError(
                     "当前浏览器模式需要 camoufox，但未安装。请执行: pip install camoufox && python -m camoufox fetch"
                 )
-            camoufox = AsyncCamoufox(headless=self.headless)
+            self._camoufox = AsyncCamoufox(headless=self.headless)
 
-        browser_configs = []
-        for _ in range(self.thread_count):
-            if self.browser_type in ['chromium', 'chrome', 'msedge']:
-                if self.use_random_config:
-                    browser, version, useragent, sec_ch_ua = browser_config.get_random_browser_config(self.browser_type)
-                elif self.browser_name and self.browser_version:
-                    config = browser_config.get_browser_config(self.browser_name, self.browser_version)
-                    if config:
-                        useragent, sec_ch_ua = config
-                        browser = self.browser_name
-                        version = self.browser_version
-                    else:
-                        browser, version, useragent, sec_ch_ua = browser_config.get_random_browser_config(self.browser_type)
+    def _build_browser_config(self) -> dict[str, str]:
+        if self.browser_type in ['chromium', 'chrome', 'msedge']:
+            if self.use_random_config:
+                browser, version, useragent, sec_ch_ua = browser_config.get_random_browser_config(self.browser_type)
+            elif self.browser_name and self.browser_version:
+                config = browser_config.get_browser_config(self.browser_name, self.browser_version)
+                if config:
+                    useragent, sec_ch_ua = config
+                    browser = self.browser_name
+                    version = self.browser_version
                 else:
-                    browser = getattr(self, 'browser_name', 'custom')
-                    version = getattr(self, 'browser_version', 'custom')
-                    useragent = self.useragent
-                    sec_ch_ua = getattr(self, 'sec_ch_ua', '')
+                    browser, version, useragent, sec_ch_ua = browser_config.get_random_browser_config(self.browser_type)
             else:
-                # Для camoufox и других браузеров используем значения по умолчанию
-                browser = self.browser_type
-                version = 'custom'
+                browser = getattr(self, 'browser_name', 'custom')
+                version = getattr(self, 'browser_version', 'custom')
                 useragent = self.useragent
                 sec_ch_ua = getattr(self, 'sec_ch_ua', '')
-
-            
-            browser_configs.append({
-                'browser_name': browser,
-                'browser_version': version,
-                'useragent': useragent,
-                'sec_ch_ua': sec_ch_ua
-            })
-
-        for i in range(self.thread_count):
-            config = browser_configs[i]
-            
-            browser_args = [
-                "--window-position=0,0",
-                "--force-device-scale-factor=1"
-            ]
-            if config['useragent']:
-                browser_args.append(f"--user-agent={config['useragent']}")
-            
-            browser = None
-            if self.browser_type in ['chromium', 'chrome', 'msedge'] and playwright:
-                browser = await playwright.chromium.launch(
-                    channel=self.browser_type,
-                    headless=self.headless,
-                    args=browser_args
-                )
-            elif self.browser_type == "camoufox" and camoufox:
-                browser = await camoufox.start()
-
-            if browser:
-                await self.browser_pool.put((i+1, browser, config))
-
-            if self.debug:
-                logger.info(f"Browser {i + 1} initialized successfully with {config['browser_name']} {config['browser_version']}")
-
-        logger.info(f"Browser pool initialized with {self.browser_pool.qsize()} browsers")
-        
-        if self.use_random_config:
-            logger.info(f"Each browser in pool received random configuration")
-        elif self.browser_name and self.browser_version:
-            logger.info(f"All browsers using configuration: {self.browser_name} {self.browser_version}")
         else:
-            logger.info("Using custom configuration")
-            
+            browser = self.browser_type
+            version = 'custom'
+            useragent = self.useragent
+            sec_ch_ua = getattr(self, 'sec_ch_ua', '')
+
+        return {
+            'browser_name': browser,
+            'browser_version': version,
+            'useragent': useragent,
+            'sec_ch_ua': sec_ch_ua,
+        }
+
+    async def _launch_browser(self, index: int, config: dict[str, str]):
+        browser_args = [
+            "--window-position=0,0",
+            "--force-device-scale-factor=1",
+        ]
+        if config['useragent']:
+            browser_args.append(f"--user-agent={config['useragent']}")
+
+        await self._ensure_browser_runtime()
+        browser = None
+        if self.browser_type in ['chromium', 'chrome', 'msedge'] and self._playwright:
+            browser = await self._playwright.chromium.launch(
+                channel=self.browser_type,
+                headless=self.headless,
+                args=browser_args,
+            )
+        elif self.browser_type == "camoufox" and self._camoufox:
+            browser = await self._camoufox.start()
+
+        if browser is None:
+            raise RuntimeError("无法启动浏览器实例")
+
         if self.debug:
-            for i, config in enumerate(browser_configs):
-                logger.debug(f"Browser {i+1} config: {config['browser_name']} {config['browser_version']}")
-                logger.debug(f"Browser {i+1} User-Agent: {config['useragent']}")
-                logger.debug(f"Browser {i+1} Sec-CH-UA: {config['sec_ch_ua']}")
+            logger.info(
+                f"Browser {index} initialized successfully with "
+                f"{config['browser_name']} {config['browser_version']}"
+            )
+            logger.debug(f"Browser {index} User-Agent: {config['useragent']}")
+            logger.debug(f"Browser {index} Sec-CH-UA: {config['sec_ch_ua']}")
+
+        return browser
+
+    async def _warm_browser_pool(self) -> None:
+        while self.browser_pool.qsize() < self.min_warm_browsers:
+            index = 0
+            async with self._browser_condition:
+                if self._launched_browser_count >= self.min_warm_browsers:
+                    break
+                self._launched_browser_count += 1
+                self._next_browser_index += 1
+                index = self._next_browser_index
+
+            config = self._build_browser_config()
+            try:
+                browser = await self._launch_browser(index, config)
+            except Exception:
+                async with self._browser_condition:
+                    self._launched_browser_count = max(0, self._launched_browser_count - 1)
+                    self._browser_condition.notify_all()
+                raise
+
+            async with self._browser_condition:
+                self.browser_pool.put_nowait((index, browser, config))
+                self._browser_condition.notify(1)
+
+    async def _acquire_browser(self):
+        while True:
+            try:
+                return self.browser_pool.get_nowait()
+            except asyncio.QueueEmpty:
+                index = 0
+                async with self._browser_condition:
+                    if self._launched_browser_count < self.thread_count:
+                        self._launched_browser_count += 1
+                        self._next_browser_index += 1
+                        index = self._next_browser_index
+                    else:
+                        await self._browser_condition.wait()
+
+                if index <= 0:
+                    continue
+
+                config = self._build_browser_config()
+                try:
+                    browser = await self._launch_browser(index, config)
+                    return index, browser, config
+                except Exception:
+                    async with self._browser_condition:
+                        self._launched_browser_count = max(0, self._launched_browser_count - 1)
+                        self._browser_condition.notify_all()
+                    raise
+
+    async def _close_browser(self, index: int, browser) -> None:
+        try:
+            close_method = getattr(browser, "close", None)
+            if close_method is None:
+                return
+            result = close_method()
+            if inspect.isawaitable(result):
+                await result
+            if self.debug:
+                logger.debug(f"Browser {index}: Closed browser instance")
+        except Exception as e:
+            if self.debug:
+                logger.warning(f"Browser {index}: Error closing browser: {str(e)}")
+
+    async def _release_browser(self, index: int, browser, browser_config: dict[str, str]) -> None:
+        try:
+            connected = not hasattr(browser, 'is_connected') or browser.is_connected()
+        except Exception:
+            connected = False
+
+        if not connected:
+            async with self._browser_condition:
+                self._launched_browser_count = max(0, self._launched_browser_count - 1)
+                self._browser_condition.notify_all()
+            if self.debug:
+                logger.warning(f"Browser {index}: Browser disconnected, removed from pool")
+            await self._close_browser(index, browser)
+            return
+
+        keep_warm = False
+        async with self._browser_condition:
+            if self.browser_pool.qsize() < self.min_warm_browsers:
+                self.browser_pool.put_nowait((index, browser, browser_config))
+                keep_warm = True
+                self._browser_condition.notify(1)
+            else:
+                self._launched_browser_count = max(0, self._launched_browser_count - 1)
+                self._browser_condition.notify_all()
+
+        if keep_warm:
+            if self.debug:
+                logger.debug(f"Browser {index}: Browser returned to warm pool")
+            return
+
+        if self.debug:
+            logger.debug(f"Browser {index}: Closing extra idle browser")
+        await self._close_browser(index, browser)
+
+    async def _shutdown(self) -> None:
+        idle_browsers = []
+        while True:
+            try:
+                idle_browsers.append(self.browser_pool.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+
+        for index, browser, _config in idle_browsers:
+            await self._close_browser(index, browser)
+
+        async with self._browser_condition:
+            self._launched_browser_count = 0
+            self._browser_condition.notify_all()
+
+        if self._playwright is not None:
+            try:
+                result = self._playwright.stop()
+                if inspect.isawaitable(result):
+                    await result
+            except Exception:
+                pass
+            self._playwright = None
+        self._camoufox = None
 
     async def _periodic_cleanup(self):
         """Periodic cleanup of old results every hour"""
@@ -626,7 +763,7 @@ class TurnstileAPIServer:
         """Solve the Turnstile challenge."""
         proxy = None
 
-        index, browser, browser_config = await self.browser_pool.get()
+        index, browser, browser_config = await self._acquire_browser()
         
         try:
             if hasattr(browser, 'is_connected') and not browser.is_connected():
@@ -932,13 +1069,7 @@ class TurnstileAPIServer:
                     logger.warning(f"Browser {index}: Error closing context: {str(e)}")
             
             try:
-                if hasattr(browser, 'is_connected') and browser.is_connected():
-                    await self.browser_pool.put((index, browser, browser_config))
-                    if self.debug:
-                        logger.debug(f"Browser {index}: Browser returned to pool")
-                else:
-                    if self.debug:
-                        logger.warning(f"Browser {index}: Browser disconnected, not returning to pool")
+                await self._release_browser(index, browser, browser_config)
             except Exception as e:
                 if self.debug:
                     logger.warning(f"Browser {index}: Error returning browser to pool: {str(e)}")
@@ -1099,7 +1230,7 @@ def parse_args():
     parser.add_argument('--useragent', type=str, help='User-Agent string (if not specified, random configuration is used)')
     parser.add_argument('--debug', action='store_true', help='Enable or disable debug mode for additional logging and troubleshooting information (default: False)')
     parser.add_argument('--browser_type', type=str, default='chromium', help='Specify the browser type for the solver. Supported options: chromium, chrome, msedge, camoufox (default: chromium)')
-    parser.add_argument('--thread', type=int, default=4, help='Set the number of browser threads to use for multi-threaded mode. Increasing this will speed up execution but requires more resources (default: 1)')
+    parser.add_argument('--thread', type=int, default=4, help='Set the maximum number of browser workers. Browsers scale up on demand and shrink back to the warm pool when idle (default: 4)')
     parser.add_argument('--proxy', action='store_true', help='Enable proxy support for the solver (Default: False)')
     parser.add_argument('--random', action='store_true', help='Use random User-Agent and Sec-CH-UA configuration from pool')
     parser.add_argument('--browser', type=str, help='Specify browser name to use (e.g., chrome, firefox)')

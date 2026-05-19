@@ -1,4 +1,4 @@
-# Any Auto Register
+# Auto ChatGPT
 
 <p align="center">
   <a href="https://linux.do" target="_blank">
@@ -8,7 +8,7 @@
 
 > ⚠️ 免责声明：本项目仅供学习与研究使用，不得用于任何商业用途。使用本项目所产生的一切后果由使用者自行承担。
 
-多平台账号自动注册与管理系统，支持插件化扩展、Web UI 管理、批量注册、状态同步，以及本地 Turnstile Solver 自动拉起。
+ChatGPT 账号自动注册与管理系统，支持 Web UI 管理、批量注册、状态同步，以及本地 Turnstile Solver 自动拉起。
 
 ## 目录
 
@@ -49,19 +49,15 @@
 
 ## 当前界面与实际平台展示
 
-根据当前前端代码与界面，**左侧“平台管理”菜单默认显示的平台**为：
+根据当前前端代码与界面，**左侧账号入口当前聚焦的平台**为：
 
 - ChatGPT
-- Grok
-- Kiro (AWS Builder ID)
-- OpenBlockLabs
-- Trae.ai
 
 
 
 ## 功能特性
 
-- **多平台账号注册与管理**：统一的账号列表、详情、导入、导出、删除、批量操作
+- **ChatGPT 账号注册与管理**：统一的账号列表、详情、导入、导出、删除、批量操作
 - **多执行器模式**：纯协议、无头浏览器、有头浏览器
 - **多邮箱服务接入**：支持内置、第三方、自建 Worker 邮箱等多种方案
 - **验证码支持**：YesCaptcha、本地 Turnstile Solver（Camoufox）
@@ -151,22 +147,13 @@
 | Laoudo | `laoudo` | 固定邮箱方案 |
 | CF Worker | `cfworker` | Cloudflare Worker 自建邮箱 |
 
-### Kiro 邮箱说明
-
-Kiro 当前风控较严格，邮箱方案会显著影响成功率。当前项目内也保留了这条重点提示：
-
-- **自建邮箱成功率：100%**
-- **项目内置临时邮箱成功率：0%**
-
-因此进行 **Kiro (AWS Builder ID)** 注册时，建议优先使用**自建邮箱**。
-
 ## 快速开始
 
 ### 1. 创建并激活 Conda 环境
 
 ```bash
-conda create -n any-auto-register python=3.12 -y
-conda activate any-auto-register
+conda create -n auto-chatgpt python=3.12 -y
+conda activate auto-chatgpt
 ```
 
 ### 2. 安装后端依赖
@@ -216,7 +203,7 @@ start_backend.bat
 #### 手动启动
 
 ```bash
-conda activate any-auto-register
+conda activate auto-chatgpt
 python main.py
 ```
 
@@ -237,7 +224,7 @@ http://localhost:8000
 - `stop_backend.bat`
 - `stop_backend.ps1`
 
-这些脚本会强制使用 `any-auto-register` 环境启动/停止后端，可避免以下常见问题：
+这些脚本会强制使用 `auto-chatgpt` 环境启动/停止后端，可避免以下常见问题：
 
 - 后端能启动，但 Solver 没有拉起
 - `ModuleNotFoundError: quart`
@@ -305,7 +292,7 @@ http://localhost:8889
 ### 手动启动 Solver
 
 ```bash
-conda activate any-auto-register
+conda activate auto-chatgpt
 python services/turnstile_solver/start.py --browser_type camoufox --port 8889
 ```
 
@@ -397,8 +384,8 @@ CAMOUFOX_VERSION=135.0.1 CAMOUFOX_RELEASE=beta.24 docker compose build app
 ### Docker 使用建议
 
 - 当前 Docker 镜像主要覆盖主应用和本地 Turnstile Solver
-- `grok2api`、`CLIProxyAPI`、`Kiro Account Manager` 的自动安装/拉起逻辑仍偏向宿主机环境
-- 若依赖 `conda`、Go 或 Windows 可执行文件，不建议直接在当前 Linux 容器中启动这些插件
+- `CLIProxyAPI` 的自动安装/拉起逻辑仍偏向宿主机环境
+- 若依赖 `conda`、Go 或 Windows 可执行文件，不建议直接在当前 Linux 容器中启动这些外部组件
 - 如果你只需要 Web UI、账号管理、任务调度和本地 Solver，当前 Compose 配置可直接使用
 
 ## 插件与外部依赖
@@ -416,8 +403,6 @@ CAMOUFOX_VERSION=135.0.1 CAMOUFOX_RELEASE=beta.24 docker compose build app
 | 项目 | 用途 | Git 地址 |
 | --- | --- | --- |
 | CLIProxyAPI | CPA / 代理池管理服务 | `https://github.com/router-for-me/CLIProxyAPI.git` |
-| grok2api | Grok token 管理、回填、聊天/API 服务 | `https://github.com/chenyme/grok2api.git` |
-| kiro-account-manager | Kiro 账号管理相关插件 | `https://github.com/hj01857655/kiro-account-manager.git` |
 
 如果你后续要改成 `ghproxy`、`gitclone`、企业 Git 镜像或其他代理地址，需要同步修改：
 
@@ -445,7 +430,7 @@ curl http://localhost:8000/api/solver/status
 
 ### 2. 出现 `ModuleNotFoundError: quart`
 
-说明当前启动后端的 Python 不是 `any-auto-register` 环境，请改用：
+说明当前启动后端的 Python 不是 `auto-chatgpt` 环境，请改用：
 
 ```powershell
 .\start_backend.ps1
@@ -466,7 +451,7 @@ python -c "import sys; print(sys.executable)"
 输出应类似：
 
 ```text
-D:\miniconda\conda3\envs\any-auto-register\python.exe
+D:\miniconda\conda3\envs\auto-chatgpt\python.exe
 ```
 
 ### 4. Solver 能打开，但状态仍然异常
@@ -497,7 +482,7 @@ http://localhost:8889/
 ## 项目结构
 
 ```text
-any-auto-register/
+auto-chatgpt/
 ├── api/
 ├── core/
 ├── docs/
@@ -537,7 +522,7 @@ MIT License — 仅供学习研究，禁止商业使用。
 
 ## 用户讨论群
 
-- QQ群：**1065114376**（any-auto-register 注册机用户讨论群）
+- QQ群：**1065114376**（auto-chatgpt 用户讨论群）
 
 ## 赞助支持
 

@@ -9,6 +9,7 @@ from services.chatgpt_sync import (
     persist_cpa_sync_result,
     upload_chatgpt_account_to_cpa,
 )
+from services.chatgpt_account_state import is_chatgpt_upload_ready
 
 
 def _is_config_enabled(value: Any) -> bool:
@@ -23,6 +24,11 @@ def sync_account(account) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
 
     if platform == "chatgpt":
+        ready, gate_msg, _capabilities = is_chatgpt_upload_ready(account)
+        if not ready:
+            msg = gate_msg or "跳过上传：账号材料不完整"
+            persist_cpa_sync_result(account, False, msg)
+            return [{"name": "Upload Gate", "ok": False, "msg": msg}]
 
         # 贡献模式优先级最高：开启后仅上传到贡献服务器，避免重复上报到其它平台。
         contribution_enabled = _is_config_enabled(config_store.get("contribution_enabled", "0"))
@@ -63,11 +69,11 @@ def sync_account(account) -> list[dict[str, Any]]:
             cp.refresh_token = extra.get("refresh_token", "")
 
             if upload_type == "rt":
-                from platforms.chatgpt.cpa_upload import upload_to_codex_proxy
+                from services.chatgpt_core.cpa_upload import upload_to_codex_proxy
                 ok, msg = upload_to_codex_proxy(cp)
                 results.append({"name": "CodexProxy(RT)", "ok": ok, "msg": msg})
             else:
-                from platforms.chatgpt.cpa_upload import upload_at_to_codex_proxy
+                from services.chatgpt_core.cpa_upload import upload_at_to_codex_proxy
                 ok, msg = upload_at_to_codex_proxy(cp)
                 results.append({"name": "CodexProxy(AT)", "ok": ok, "msg": msg})
 

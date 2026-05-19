@@ -13,8 +13,9 @@ from sqlmodel import Session
 
 from core.config_store import config_store
 from core.db import AccountModel
-from platforms.chatgpt.status_probe import probe_local_chatgpt_status
-from platforms.chatgpt.sub2api_upload import build_sub2api_lookup_payload, upload_to_sub2api
+from services.chatgpt_core.status_probe import probe_local_chatgpt_status
+from services.chatgpt_core.sub2api_upload import build_sub2api_lookup_payload, upload_to_sub2api
+from services.chatgpt_account_state import classify_chatgpt_capabilities, is_chatgpt_upload_ready
 from services.chatgpt_sync import build_chatgpt_sync_account, update_account_model_local_probe
 
 SUB2API_SYNC_NAME = "sub2api"
@@ -90,6 +91,7 @@ def update_account_model_sub2api_sync(
 ) -> dict[str, Any]:
     extra = account.get_extra()
     state = record_sub2api_sync_result(extra, sync_result)
+    extra["chatgpt_capabilities"] = classify_chatgpt_capabilities(account)
     account.set_extra(extra)
     account.updated_at = _utcnow()
     if session is not None:
@@ -412,7 +414,7 @@ def _remote_ambiguous(sync_result: dict[str, Any]) -> bool:
 
 def _local_probe_uploadable(probe: dict[str, Any]) -> bool:
     auth = probe.get("auth") if isinstance(probe.get("auth"), dict) else {}
-    return str(auth.get("state") or "").strip() in {"refresh_token_valid", "access_token_valid"}
+    return str(auth.get("state") or "").strip() == "refresh_token_valid"
 
 
 def _build_upload_failure_state(message: str) -> dict[str, Any]:
@@ -421,6 +423,16 @@ def _build_upload_failure_state(message: str) -> dict[str, Any]:
         "uploaded": False,
         "message": message,
         "checked_at": _utcnow_iso(),
+    }
+
+
+def _build_upload_success_state(message: str) -> dict[str, Any]:
+    return {
+        "remote_state": "uploaded",
+        "uploaded": True,
+        "message": message or "上传成功",
+        "checked_at": _utcnow_iso(),
+        "uploaded_at": _utcnow_iso(),
     }
 
 
@@ -480,9 +492,10 @@ def backfill_chatgpt_account_to_sub2api(
     sync_account = build_chatgpt_sync_account(account)
     probe = probe_local_chatgpt_status(sync_account, proxy=None)
     update_account_model_local_probe(account, probe, session=session, commit=False)
-    if not _local_probe_uploadable(probe):
+    ready, gate_msg, _capabilities = is_chatgpt_upload_ready(account, local_probe=probe)
+    if not ready:
         auth = probe.get("auth") if isinstance(probe.get("auth"), dict) else {}
-        msg = auth.get("message") or f"本地状态不可上传: {auth.get('state') or 'unknown'}"
+        msg = gate_msg or auth.get("message") or f"本地状态不可上传: {auth.get('state') or 'unknown'}"
         blocked_sync_state = {
             **dict(initial_sync or {}),
             "uploaded": False,
@@ -497,12 +510,7 @@ def backfill_chatgpt_account_to_sub2api(
         return {"ok": False, "uploaded": False, "skipped": False, "message": msg, "results": results}
 
     ok, msg = upload_to_sub2api(sync_account)
-    upload_state = probe_chatgpt_sub2api_status(account) if ok else _build_upload_failure_state(msg)
-    if ok and str(upload_state.get("remote_state") or "").strip().lower() == "not_found":
-        upload_state = {
-            **upload_state,
-            "message": "上传后远端仍未发现 Sub2API 账号",
-        }
+    upload_state = _build_upload_success_state(msg) if ok else _build_upload_failure_state(msg)
     update_account_model_sub2api_sync(account, upload_state, session=session, commit=False)
     results.append({"name": "Sub2API 上传", "ok": ok, "msg": msg})
 
@@ -511,17 +519,8 @@ def backfill_chatgpt_account_to_sub2api(
             session.commit()
             session.refresh(account)
         return {"ok": False, "uploaded": False, "skipped": False, "message": msg, "results": results}
-
-    if not _remote_exists(upload_state):
-        verify_msg = upload_state.get("message") or "上传后远端仍未发现 Sub2API 账号"
-        results.append({"name": "Sub2API 复核", "ok": False, "msg": verify_msg})
-        if session is not None and commit:
-            session.commit()
-            session.refresh(account)
-        return {"ok": False, "uploaded": False, "skipped": False, "message": verify_msg, "results": results}
-
-    verify_msg = f"补传完成，远端账号 #{upload_state.get('remote_account_id')}"
-    results.append({"name": "Sub2API 复核", "ok": True, "msg": verify_msg})
+    verify_msg = upload_state.get("message") or "上传成功"
+    results.append({"name": "Sub2API 确认", "ok": True, "msg": f"以上传接口返回为准：{verify_msg}"})
     if session is not None and commit:
         session.commit()
         session.refresh(account)

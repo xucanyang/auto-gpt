@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Card, Table, Button, Input, Tag, Space, Popconfirm, message } from 'antd'
+import { Card, Table, Button, Input, Tag, Space, Popconfirm, message, Typography, Switch } from 'antd'
 import {
   PlusOutlined,
   DeleteOutlined,
@@ -16,6 +16,9 @@ export default function Proxies() {
   const [newProxy, setNewProxy] = useState('')
   const [region, setRegion] = useState('')
   const [checking, setChecking] = useState(false)
+  const [clearingCooldowns, setClearingCooldowns] = useState(false)
+  const [cooldownEnabled, setCooldownEnabled] = useState(true)
+  const [savingCooldownSetting, setSavingCooldownSetting] = useState(false)
   const [loading, setLoading] = useState(false)
 
   const load = async () => {
@@ -23,6 +26,10 @@ export default function Proxies() {
     try {
       const data = await apiFetch('/proxies')
       setProxies(data)
+      const cfg = await apiFetch('/config')
+      setCooldownEnabled(
+        String(cfg?.proxy_pool_cooldown_enabled ?? 'true').trim().toLowerCase() !== 'false',
+      )
     } finally {
       setLoading(false)
     }
@@ -76,6 +83,39 @@ export default function Proxies() {
     }, 3000)
   }
 
+  const clearCooldowns = async () => {
+    setClearingCooldowns(true)
+    try {
+      const result = await apiFetch('/proxies/clear-cooldowns', { method: 'POST' })
+      message.success(`已清空冷却：${Number(result?.cleared || 0)} 条`)
+      await load()
+    } catch (e: any) {
+      message.error(e?.message || '清空冷却失败')
+    } finally {
+      setClearingCooldowns(false)
+    }
+  }
+
+  const toggleCooldownSetting = async (checked: boolean) => {
+    setSavingCooldownSetting(true)
+    try {
+      await apiFetch('/config', {
+        method: 'PUT',
+        body: JSON.stringify({
+          data: {
+            proxy_pool_cooldown_enabled: checked,
+          },
+        }),
+      })
+      setCooldownEnabled(checked)
+      message.success(checked ? '已启用代理冷却' : '已关闭代理冷却')
+    } catch (e: any) {
+      message.error(e?.message || '保存代理冷却设置失败')
+    } finally {
+      setSavingCooldownSetting(false)
+    }
+  }
+
   const columns: any[] = [
     {
       title: '代理地址',
@@ -97,6 +137,31 @@ export default function Proxies() {
           <Tag color="success">{record.success_count}</Tag>
           <span>/</span>
           <Tag color="error">{record.fail_count}</Tag>
+        </Space>
+      ),
+    },
+    {
+      title: '首页健康',
+      key: 'homepage_stats',
+      render: (_: any, record: any) => (
+        <Space direction="vertical" size={4}>
+          <Space>
+            <Tag color="blue">首页成功 {Number(record.homepage_success_count || 0)}</Tag>
+            <Tag color="volcano">首页失败 {Number(record.homepage_fail_count || 0)}</Tag>
+            <Tag color={Number(record.homepage_consecutive_failures || 0) > 0 ? 'red' : 'default'}>
+              连续失败 {Number(record.homepage_consecutive_failures || 0)}
+            </Tag>
+          </Space>
+          {record.homepage_circuit_open_until ? (
+            <Typography.Text type="danger">
+              冷却至: {String(record.homepage_circuit_open_until)}
+            </Typography.Text>
+          ) : null}
+          {record.homepage_last_error ? (
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+              最近失败: {String(record.homepage_last_error)}
+            </Typography.Text>
+          ) : null}
         </Space>
       ),
     },
@@ -136,9 +201,18 @@ export default function Proxies() {
           <h1 style={{ fontSize: 24, fontWeight: 'bold', margin: 0 }}>代理管理</h1>
           <p style={{ color: '#7a8ba3', marginTop: 4 }}>共 {proxies.length} 个代理</p>
         </div>
-        <Button icon={<ReloadOutlined spin={checking} />} onClick={check} loading={checking}>
-          检测全部
-        </Button>
+        <Space>
+          <Space>
+            <Typography.Text type="secondary">代理冷却</Typography.Text>
+            <Switch checked={cooldownEnabled} loading={savingCooldownSetting} onChange={toggleCooldownSetting} />
+          </Space>
+          <Button onClick={clearCooldowns} loading={clearingCooldowns}>
+            清空全部冷却
+          </Button>
+          <Button icon={<ReloadOutlined spin={checking} />} onClick={check} loading={checking}>
+            检测全部
+          </Button>
+        </Space>
       </div>
 
       <Card title="添加代理（每行一个）">

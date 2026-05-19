@@ -5,10 +5,11 @@ from pydantic import BaseModel
 import json
 from typing import Any
 from core.db import AccountModel, get_session
-from core.registry import get
 from core.base_platform import RegisterConfig
 from core.config_store import config_store
-from services.chatgpt_account_state import apply_chatgpt_status_policy
+from services.chatgpt_account_state import apply_chatgpt_status_policy, classify_chatgpt_capabilities, mark_payment_pending
+from services.chatgpt_core import ChatGPTPlatform
+from services.chatgpt_core.payment_link_cache import build_payment_link_cache_payload
 from services.chatgpt_sync import update_account_model_cliproxy_sync
 from services.sub2api_sync import backfill_chatgpt_account_to_sub2api, probe_chatgpt_sub2api_status, update_account_model_sub2api_sync
 
@@ -72,10 +73,57 @@ def _apply_action_result(
     if isinstance(result.get("account_extra_patch"), dict):
         extra = acc_model.get_extra()
         _merge_extra_patch(extra, result["account_extra_patch"])
+        if platform == "chatgpt":
+            data = result.get("data") if isinstance(result.get("data"), dict) else {}
+            probe = data.get("probe") if isinstance(data.get("probe"), dict) else extra.get("chatgpt_local")
+            sync = data.get("sync") if isinstance(data.get("sync"), dict) else None
+            extra["chatgpt_capabilities"] = classify_chatgpt_capabilities(
+                acc_model,
+                local_probe=probe if isinstance(probe, dict) else None,
+                remote_sync=sync if isinstance(sync, dict) else None,
+            )
         acc_model.set_extra(extra)
         from datetime import datetime, timezone
         acc_model.updated_at = datetime.now(timezone.utc)
         session.add(acc_model)
+    if platform == "chatgpt" and action_id == "payment_link" and result.get("ok"):
+        data = result.get("data") if isinstance(result.get("data"), dict) else {}
+        checkout_url = str(data.get("url") or data.get("checkout_url") or data.get("cashier_url") or "").strip()
+        if checkout_url:
+            extra = acc_model.get_extra()
+            acc_model.cashier_url = checkout_url
+            existing_cache = extra.get("chatgpt_last_payment_link") if isinstance(extra.get("chatgpt_last_payment_link"), dict) else {}
+            extra["chatgpt_last_payment_link"] = build_payment_link_cache_payload(
+                data,
+                source=str(data.get("cache_source") or "payment_link_action"),
+                fallback=existing_cache,
+            )
+            acc_model.set_extra(extra)
+            mark_payment_pending(acc_model, reason="payment_link_generated")
+            from datetime import datetime, timezone
+
+            acc_model.updated_at = datetime.now(timezone.utc)
+            session.add(acc_model)
+        try:
+            from services.chatgpt_core.pending_business_invites import upsert_pending_subscription_auth_from_account
+
+            pending = upsert_pending_subscription_auth_from_account(
+                acc_model,
+                checkout_url=checkout_url,
+                plan=str(data.get("plan") or ""),
+                country=str(data.get("country") or ""),
+                currency=str(data.get("currency") or ""),
+            )
+            data["pending_activation"] = {
+                "id": int(getattr(pending, "id", 0) or 0),
+                "status": str(getattr(pending, "status", "") or ""),
+                "activation_kind": "subscription_auth",
+            }
+            result["data"] = data
+        except Exception as exc:
+            data["pending_activation_error"] = str(exc)
+            result["data"] = data
+
     if platform == "chatgpt" and action_id == "upload_cpa":
         from services.chatgpt_sync import update_account_model_cpa_sync
 
@@ -113,6 +161,127 @@ def _apply_action_result(
             session.add(acc_model)
 
 
+def _execute_chatgpt_resume_subscription_auth(
+    acc_model: AccountModel,
+    *,
+    log_fn=None,
+) -> dict[str, Any]:
+    from services.chatgpt_core.pending_business_invites import (
+        activate_pending_invite,
+        upsert_pending_subscription_auth_from_account,
+    )
+
+    action_logs: list[str] = []
+
+    def _collect_log(message: str) -> None:
+        text = str(message or "").strip()
+        if text:
+            action_logs.append(text)
+            if callable(log_fn):
+                log_fn(text)
+
+    _collect_log(f"[补抓] 开始处理账号：{acc_model.email}")
+    try:
+        pending = upsert_pending_subscription_auth_from_account(acc_model)
+    except Exception as exc:
+        message = f"补抓 Auth 入池失败：{exc}"
+        _collect_log(f"[补抓] {message}")
+        return {
+            "ok": False,
+            "error": message,
+            "data": {
+                "message": message,
+                "logs": action_logs,
+                "pending_activation": {
+                    "id": 0,
+                    "status": "",
+                    "activation_kind": "subscription_auth",
+                },
+            },
+        }
+
+    pending_id = int(getattr(pending, "id", 0) or 0)
+    if pending_id <= 0:
+        _collect_log("[补抓] 补抓 Auth 入池失败：未拿到 pending id")
+        return {
+            "ok": False,
+            "error": "补抓 Auth 入池失败",
+            "data": {
+                "message": "补抓 Auth 入池失败",
+                "logs": action_logs,
+                "pending_activation": {
+                    "id": 0,
+                    "status": "",
+                    "activation_kind": "subscription_auth",
+                },
+            },
+        }
+
+    _collect_log(f"[补抓] 已写入待激活池：pending_id={pending_id}")
+
+    try:
+        activation_result = activate_pending_invite(pending_id, log_fn=_collect_log)
+    except Exception as exc:
+        message = str(exc or "补抓 Auth 失败")
+        _collect_log(f"[补抓] 失败：{message}")
+        return {
+            "ok": False,
+            "error": message,
+            "data": {
+                "message": message,
+                "logs": action_logs,
+                "pending_activation": {
+                    "id": pending_id,
+                    "status": str(getattr(pending, "status", "") or "subscription_pending_auth"),
+                    "activation_kind": "subscription_auth",
+                },
+            },
+        }
+
+    ok = bool(activation_result.get("ok"))
+    message = "补抓 Auth 完成" if ok else str(activation_result.get("message") or activation_result.get("error") or "补抓 Auth 失败")
+    return {
+        "ok": ok,
+        "data": {
+            "message": message,
+            "logs": action_logs,
+            "pending_activation": {
+                "id": pending_id,
+                "status": str(getattr(pending, "status", "") or "subscription_pending_auth"),
+                "activation_kind": "subscription_auth",
+            },
+            "activation_result": activation_result,
+        },
+        "error": "" if ok else message,
+    }
+
+
+def _apply_chatgpt_resume_auth_result(acc_model: AccountModel, result: dict[str, Any], session: Session) -> None:
+    data = result.get("data") if isinstance(result.get("data"), dict) else {}
+    activation_result = data.get("activation_result") if isinstance(data.get("activation_result"), dict) else {}
+    extra = acc_model.get_extra()
+    _merge_extra_patch(
+        extra,
+        {
+            "chatgpt_pending_subscription_auth": data.get("pending_activation") or {},
+            "chatgpt_subscription_auth_result": activation_result,
+        },
+    )
+    extra["chatgpt_capabilities"] = classify_chatgpt_capabilities(acc_model, local_probe=extra.get("chatgpt_local"))
+    acc_model.set_extra(extra)
+    from datetime import datetime, timezone
+
+    acc_model.updated_at = datetime.now(timezone.utc)
+    session.add(acc_model)
+
+
+def _execute_chatgpt_resume_subscription_auth_action(acc_model: AccountModel, session: Session) -> dict[str, Any]:
+    result = _execute_chatgpt_resume_subscription_auth(acc_model)
+    session.refresh(acc_model)
+    _apply_chatgpt_resume_auth_result(acc_model, result, session)
+    return result
+
+
 def _execute_platform_action(
     instance: Any,
     platform: str,
@@ -121,6 +290,9 @@ def _execute_platform_action(
     params: dict,
     session: Session,
 ) -> dict[str, Any]:
+    if platform == "chatgpt" and action_id == "resume_subscription_auth":
+        return _execute_chatgpt_resume_subscription_auth_action(acc_model, session)
+
     if platform == "chatgpt" and action_id == "upload_sub2api":
         outcome = backfill_chatgpt_account_to_sub2api(acc_model, session=session, commit=False)
         result = {
@@ -287,8 +459,9 @@ def _execute_batch_sub2api_sync(accounts: list[AccountModel], session: Session) 
 @router.get("/{platform}")
 def list_actions(platform: str):
     """获取平台支持的操作列表"""
-    PlatformCls = get(platform)
-    instance = PlatformCls(config=RegisterConfig(extra=config_store.get_all()))
+    if platform != "chatgpt":
+        raise HTTPException(404, "平台不存在")
+    instance = ChatGPTPlatform(config=RegisterConfig(extra=config_store.get_all()))
     return {"actions": instance.get_platform_actions()}
 
 
@@ -299,8 +472,9 @@ def execute_batch_action(
     body: BatchActionRequest,
     session: Session = Depends(get_session),
 ):
-    PlatformCls = get(platform)
-    instance = PlatformCls(config=RegisterConfig(extra=config_store.get_all()))
+    if platform != "chatgpt":
+        raise HTTPException(404, "平台不存在")
+    instance = ChatGPTPlatform(config=RegisterConfig(extra=config_store.get_all()))
     accounts, missing_ids = _resolve_batch_accounts(platform, body, session)
 
     if not accounts and not missing_ids:
@@ -394,8 +568,9 @@ def execute_action(
     if not acc_model or acc_model.platform != platform:
         raise HTTPException(404, "账号不存在")
 
-    PlatformCls = get(platform)
-    instance = PlatformCls(config=RegisterConfig(extra=config_store.get_all()))
+    if platform != "chatgpt":
+        raise HTTPException(404, "平台不存在")
+    instance = ChatGPTPlatform(config=RegisterConfig(extra=config_store.get_all()))
 
     try:
         result = _execute_platform_action(instance, platform, acc_model, action_id, body.params, session)

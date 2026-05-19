@@ -6,7 +6,7 @@ services:
       args:
         CAMOUFOX_VERSION: ${CAMOUFOX_VERSION:-135.0.1}
         CAMOUFOX_RELEASE: ${CAMOUFOX_RELEASE:-beta.24}
-    container_name: any-auto-register-local
+    container_name: auto-chatgpt
     init: true
     restart: unless-stopped
     env_file:
@@ -27,13 +27,12 @@ services:
       TEAM_MANAGER_DB_PATH: /runtime/team_manage.db
       TEAM_MANAGER_SEED_DB_PATH: /team-manage-seed-data/team_manage.db
       SUB2API_DB_HOST: /var/run/postgresql
-      SUB2API_DB_PEER_UID: "999"
-      SUB2API_DB_PEER_GID: "988"
+      SUB2API_DB_PEER_UID: "995"
+      SUB2API_DB_PEER_GID: "987"
     ports:
       - "8000:8000"
       - "127.0.0.1:8889:8889"
       - "${CLIPROXYAPI_PORT_BIND:-8317}:8317"
-      - "${GROK2API_PORT_BIND:-8011}:8011"
     volumes:
       - ${APP_RUNTIME_BIND:-./data}:/runtime
       - ${APP_EXT_TARGETS_BIND:-./_ext_targets}:/_ext_targets
@@ -50,6 +49,12 @@ services:
     shm_size: "1gb"
 
 networks:
+  default:
+    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+        - subnet: 2604:a880:2:d1:2::/80
   tempmail_internal:
     external: true
   team_manage_default:

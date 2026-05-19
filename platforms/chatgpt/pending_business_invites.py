@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any, Callable, Optional
@@ -41,10 +42,12 @@ ACTIVATION_PROGRESS_STATUSES = {
     "activation_auth_login",
     "activation_consuming_invite",
     "activation_capturing_workspace",
+    "subscription_pending_auth",
 }
 NON_ACTIVATABLE_PENDING_STATUSES = {"completed", "abandoned", "failed_terminal"}
 CHECKPOINT_LABELS = {
     "invite_sent_pending_activation": "待激活",
+    "subscription_pending_auth": "订阅待补抓",
     "activation_fetching_invite_mail": "拉取邀请邮件",
     "activation_auth_login": "登录并消费邀请",
     "activation_consuming_invite": "消费邀请链接",
@@ -52,6 +55,27 @@ CHECKPOINT_LABELS = {
     "completed": "已完成",
 }
 TERMINAL_ERROR_CODES = {"missing_mailbox_state", "account_not_found", "invite_not_found", "abandoned"}
+DEFAULT_SUBSCRIPTION_AUTH_RETRY_DELAYS_SECONDS = (30, 60, 120)
+SUBSCRIPTION_AUTH_RETRYABLE_ERROR_MARKERS = (
+    "workspace/select",
+    "workspace/org",
+    "page=consent",
+    "codex/consent",
+    "consent",
+    "未获取到 workspace",
+    "未获取所选工作空间",
+    "未能获取所选工作空间",
+    "workspace / callback",
+    "workspace/callback",
+    "workspace_capture_failed",
+    "add_phone",
+    "add-phone",
+    "phone verification",
+    "手机号",
+    "429",
+    "rate limit",
+    "rate_limited",
+)
 
 
 def _make_activation_run_id() -> str:
@@ -166,12 +190,22 @@ def _simplify_activation_error(text: str) -> str:
 
 
 def _normalize_activation_log_message(message: str, level: str = "info") -> str:
-    text = str(message or "").strip()
+    raw_text = str(message or "").strip()
+    if not raw_text:
+        return ""
+
+    normalized_level = str(level or "info").strip().lower() or "info"
+    is_debug = normalized_level == "debug" or raw_text.startswith("[DEBUG] ")
+    text = raw_text[len("[DEBUG] "):].strip() if raw_text.startswith("[DEBUG] ") else raw_text
     if not text:
         return ""
 
-    if text.startswith("[DEBUG] "):
-        return ""
+    if is_debug:
+        return f"[DEBUG] {text}"
+
+    if text.startswith("[订阅] OpenAI 空间/权限可能仍在同步"):
+        return text
+
     if text.startswith("正在等待邮箱 ") or text.startswith("成功获取验证码（"):
         return ""
     if "Sentinel Browser" in text or "email_otp_validate:" in text:
@@ -274,6 +308,24 @@ class RestoredEmailService:
         self._last_verification_result = {}
         self.service_type = type("ST", (), {"value": self._provider})()
 
+    def create_email(self, config=None) -> dict[str, str]:
+        if not self._acct or not str(getattr(self._acct, "email", "") or "").strip():
+            raise RuntimeError("恢复邮箱状态缺少 email，无法复用")
+        get_current_ids = getattr(self._mailbox, "get_current_ids", None)
+        if callable(get_current_ids):
+            try:
+                self._before_ids = set(get_current_ids(self._acct) or self._before_ids or [])
+            except Exception:
+                # 某些 provider 不支持旧账号列表探测；保留导出时的 before_ids 继续等新验证码。
+                self._before_ids = set(self._before_ids or [])
+        self._email = str(getattr(self._acct, "email", "") or "").strip()
+        return {
+            "email": self._email,
+            "service_id": str(getattr(self._acct, "account_id", "") or ""),
+            "token": str(getattr(self._acct, "account_id", "") or ""),
+            "mailbox_action": "restored_existing",
+        }
+
     def get_verification_code(
         self,
         email=None,
@@ -355,21 +407,90 @@ def upsert_pending_invite_from_account(account: AccountModel) -> PendingBusiness
         )
 
 
+def upsert_pending_subscription_auth_from_account(
+    account: AccountModel,
+    *,
+    checkout_url: str = "",
+    plan: str = "",
+    country: str = "",
+    currency: str = "",
+) -> SimpleNamespace:
+    extra = account.get_extra()
+    mailbox_state = dict(extra.get("chatgpt_mailbox_state") or {})
+    registration_context = dict(extra.get("chatgpt_registration_context") or {})
+    activation_context = {
+        **registration_context,
+        "activation_kind": "subscription_auth",
+        "checkout_url": str(checkout_url or ""),
+        "plan": str(plan or ""),
+        "country": str(country or ""),
+        "currency": str(currency or ""),
+        "created_from_action": "payment_link",
+    }
+    now_iso = _utcnow().isoformat()
+
+    with Session(engine) as session:
+        existing = session.exec(
+            select(PendingBusinessInviteModel)
+            .where(PendingBusinessInviteModel.account_id == int(account.id or 0))
+            .where(PendingBusinessInviteModel.status.notin_(tuple(NON_ACTIVATABLE_PENDING_STATUSES)))
+        ).first()
+        if existing is None:
+            existing = PendingBusinessInviteModel(
+                account_id=int(account.id or 0),
+                email=account.email,
+                status="subscription_pending_auth",
+            )
+
+        existing.email = account.email
+        existing.status = "subscription_pending_auth"
+        existing.team_id = 0
+        existing.team_name = str(plan or "subscription")
+        existing.invite_url = str(checkout_url or existing.invite_url or "")
+        existing.mail_provider = str(mailbox_state.get("provider") or extra.get("mail_provider") or "")
+        existing.mailbox_state_json = _dumps(mailbox_state)
+        existing.registration_context_json = _dumps(activation_context)
+        existing.invited_at = now_iso
+        existing.last_error = ""
+        existing.last_error_code = ""
+        existing.last_checkpoint = "subscription_pending_auth"
+        existing.updated_at = _utcnow()
+        session.add(existing)
+        session.commit()
+        session.refresh(existing)
+        return SimpleNamespace(
+            id=int(existing.id or 0),
+            account_id=int(existing.account_id or 0),
+            email=str(existing.email or ""),
+            team_id=0,
+            team_name=str(existing.team_name or ""),
+            status=str(existing.status or ""),
+            activation_kind="subscription_auth",
+        )
+
+
 def list_pending_invites(*, status: str | None = None, limit: int = 200) -> list[dict[str, Any]]:
     limit = max(1, min(int(limit or 200), 1000))
     with Session(engine) as session:
-        stmt = select(PendingBusinessInviteModel).order_by(PendingBusinessInviteModel.id.desc())
+        stmt = select(PendingBusinessInviteModel).order_by(
+            PendingBusinessInviteModel.updated_at.desc(),
+            PendingBusinessInviteModel.invited_at.desc(),
+            PendingBusinessInviteModel.id.desc(),
+        )
         if status:
             stmt = stmt.where(PendingBusinessInviteModel.status == status)
         rows = session.exec(stmt).all()
         items: list[dict[str, Any]] = []
         for row in rows[:limit]:
             account = session.get(AccountModel, row.account_id) if row.account_id else None
+            registration_context = _loads(row.registration_context_json, {})
+            activation_kind = str(registration_context.get("activation_kind") or "business_invite")
             items.append(
                 {
                     "id": int(row.id or 0),
                     "account_id": int(row.account_id or 0),
                     "email": row.email,
+                    "activation_kind": activation_kind,
                     "status": row.status,
                     "team_id": row.team_id,
                     "team_name": row.team_name,
@@ -441,6 +562,128 @@ def abandon_pending_invite(invite_id: int) -> dict[str, Any]:
     }
 
 
+BUSINESS_SUBSCRIPTION_PLANS = {"team", "business", "enterprise"}
+
+
+def _normalize_subscription_plan(value: Any) -> str:
+    normalized = str(value or "").strip().lower().replace("-", "_")
+    if normalized in {"chatgptteamplan", "team_plan", "teams"}:
+        return "team"
+    if normalized in {"business_plan", "workspace", "workspaces"}:
+        return "business"
+    if normalized in {"enterprise_plan"}:
+        return "enterprise"
+    if normalized in {"chatgptplusplan", "plus_plan"}:
+        return "plus"
+    if normalized in {"free_plan", "none"}:
+        return "free"
+    return normalized
+
+
+def _infer_subscription_auth_capture_scope(
+    *,
+    registration_context: dict[str, Any],
+    account_extra: dict[str, Any],
+) -> tuple[bool, bool, str]:
+    context = registration_context or {}
+    extra = account_extra or {}
+    capabilities = extra.get("chatgpt_capabilities") if isinstance(extra.get("chatgpt_capabilities"), dict) else {}
+    local_probe = extra.get("chatgpt_local") if isinstance(extra.get("chatgpt_local"), dict) else {}
+    local_subscription = local_probe.get("subscription") if isinstance(local_probe.get("subscription"), dict) else {}
+
+    candidates = [
+        context.get("plan"),
+        context.get("checkout_plan"),
+        context.get("subscription_plan"),
+        extra.get("chatgpt_plan_type"),
+        extra.get("plan_type"),
+        capabilities.get("subscription_plan"),
+        local_subscription.get("plan"),
+        local_subscription.get("workspace_plan_type"),
+    ]
+    plan = ""
+    for item in candidates:
+        plan = _normalize_subscription_plan(item)
+        if plan and plan != "unknown":
+            break
+    if plan in BUSINESS_SUBSCRIPTION_PLANS:
+        return False, True, plan
+    return True, False, plan or "free"
+
+
+def _is_subscription_auth_retryable_error(error_text: str) -> bool:
+    text = str(error_text or "").strip().lower()
+    if not text:
+        return False
+    return any(marker.lower() in text for marker in SUBSCRIPTION_AUTH_RETRYABLE_ERROR_MARKERS)
+
+
+def _subscription_auth_retry_delays_seconds(config: dict[str, Any] | None = None) -> list[int]:
+    raw = (config or {}).get("chatgpt_subscription_auth_retry_delays_seconds")
+    values: list[int] = []
+    if isinstance(raw, (list, tuple)):
+        candidates = raw
+    elif raw not in (None, ""):
+        candidates = re.split(r"[,\s]+", str(raw))
+    else:
+        candidates = DEFAULT_SUBSCRIPTION_AUTH_RETRY_DELAYS_SECONDS
+    for item in candidates:
+        try:
+            seconds = int(float(str(item).strip()))
+        except Exception:
+            continue
+        if seconds < 0:
+            continue
+        values.append(min(seconds, 600))
+    return values or list(DEFAULT_SUBSCRIPTION_AUTH_RETRY_DELAYS_SECONDS)
+
+
+def _run_subscription_auth_engine_once(
+    *,
+    mailbox_state: dict[str, Any],
+    merged_config: dict[str, Any],
+    browser_mode: str,
+    account_email: str,
+    account_password: str,
+    log_fn: Callable[[str, str], None],
+) -> RegistrationResult:
+    email_service = RestoredEmailService(state=mailbox_state)
+    engine_instance = RefreshTokenRegistrationEngine(
+        email_service=email_service,
+        proxy_url=None,
+        callback_logger=lambda msg, level="info", *_: log_fn(msg, level),
+        browser_mode=browser_mode,
+        extra_config=merged_config,
+    )
+    engine_instance.email = account_email
+    engine_instance.password = account_password
+    return engine_instance.run()
+
+
+def _account_identity_for_dedupe(account: Any) -> tuple[str, ...]:
+    extra = dict(getattr(account, "extra", None) or {})
+    return (
+        str(getattr(account, "platform", "") or "").strip(),
+        str(getattr(account, "email", "") or "").strip().lower(),
+        str(extra.get("chatgpt_workspace_variant_key") or "").strip(),
+        str(extra.get("workspace_id") or "").strip(),
+        str(getattr(account, "user_id", "") or "").strip(),
+        str(extra.get("refresh_token") or "").strip(),
+    )
+
+
+def _dedupe_linked_accounts(primary: Any, linked_accounts: list[Any]) -> list[Any]:
+    seen = {_account_identity_for_dedupe(primary)}
+    deduped: list[Any] = []
+    for linked in linked_accounts or []:
+        key = _account_identity_for_dedupe(linked)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(linked)
+    return deduped
+
+
 def _update_account_from_activation_result(account: AccountModel, result: RegistrationResult) -> None:
     from .chatgpt_registration_mode_adapter import RefreshTokenChatGPTRegistrationAdapter
 
@@ -466,8 +709,159 @@ def _update_account_from_activation_result(account: AccountModel, result: Regist
     account.set_extra(merged_extra)
     account.updated_at = _utcnow()
 
-    linked_accounts = accounts[1:]
+    linked_accounts = _dedupe_linked_accounts(primary, accounts[1:])
     return primary, linked_accounts
+
+
+def _activate_subscription_auth_pending(
+    *,
+    invite_id: int,
+    pending_account_id: int,
+    account_email: str,
+    account_password: str,
+    mailbox_state: dict[str, Any],
+    registration_context: dict[str, Any],
+    activation_run_id: str,
+    log_fn: Callable[[str, str], None],
+) -> dict[str, Any]:
+    current_checkpoint = "activation_auth_login"
+    _mark_pending_invite_state(
+        int(invite_id),
+        status=current_checkpoint,
+        checkpoint=current_checkpoint,
+        run_id=activation_run_id,
+        increment_attempt=True,
+        clear_error=True,
+    )
+    log_fn("[订阅] 开始重新登录并补抓 auth", "info")
+
+    merged_config = config_store.get_all().copy()
+    extra: dict[str, Any] = {}
+    with Session(engine) as session:
+        account = session.get(AccountModel, pending_account_id)
+        extra = account.get_extra() if account else {}
+        merged_config.update({k: v for k, v in extra.items() if v not in (None, "")})
+
+    merged_config["chatgpt_existing_account_capture"] = True
+    capture_free, capture_business, inferred_plan = _infer_subscription_auth_capture_scope(
+        registration_context=registration_context or {},
+        account_extra=extra or {},
+    )
+    merged_config["chatgpt_capture_free_workspace"] = capture_free
+    merged_config["chatgpt_capture_business_workspace"] = capture_business
+    log_fn(
+        f"[订阅] 补抓范围：plan={inferred_plan}，free={'on' if capture_free else 'off'}，business={'on' if capture_business else 'off'}",
+        "info",
+    )
+    browser_mode = str(
+        (registration_context or {}).get("browser_mode")
+        or merged_config.get("browser_mode")
+        or merged_config.get("default_executor")
+        or "protocol"
+    )
+
+    retry_delays = _subscription_auth_retry_delays_seconds(merged_config)
+    max_attempts = 1 + len(retry_delays)
+    result: RegistrationResult | None = None
+    last_error = ""
+    emitted_result_log_count = 0
+    for attempt in range(1, max_attempts + 1):
+        if attempt > 1:
+            log_fn(f"[订阅] 开始第 {attempt}/{max_attempts} 次补抓 auth", "info")
+        result = _run_subscription_auth_engine_once(
+            mailbox_state=mailbox_state,
+            merged_config=merged_config,
+            browser_mode=browser_mode,
+            account_email=account_email,
+            account_password=account_password,
+            log_fn=log_fn,
+        )
+        current_logs = list(getattr(result, "logs", None) or []) if result else []
+        if current_logs and len(current_logs) > emitted_result_log_count:
+            for line in current_logs[emitted_result_log_count:]:
+                log_fn(str(line), "info")
+            emitted_result_log_count = len(current_logs)
+        if result and result.success:
+            if attempt > 1:
+                log_fn(f"[订阅] 第 {attempt}/{max_attempts} 次补抓成功", "info")
+            break
+
+        last_error = str(getattr(result, "error_message", "") or "订阅后 auth 补抓失败")
+        if attempt >= max_attempts or not _is_subscription_auth_retryable_error(last_error):
+            raise ValueError(last_error)
+
+        delay_seconds = int(retry_delays[attempt - 1])
+        compact_error = _simplify_activation_error(last_error)
+        log_fn(
+            f"[订阅] OpenAI 空间/权限可能仍在同步，本次失败：{compact_error}；等待 {delay_seconds}s 后自动重试 ({attempt + 1}/{max_attempts})",
+            "warning",
+        )
+        _mark_pending_invite_state(
+            int(invite_id),
+            status="subscription_pending_auth",
+            checkpoint="activation_auth_login",
+            error=last_error,
+            error_code="workspace_sync_retry_wait",
+            run_id=activation_run_id,
+        )
+        if delay_seconds > 0:
+            time.sleep(delay_seconds)
+
+    if not result or not result.success:
+        raise ValueError(last_error or "订阅后 auth 补抓失败")
+
+    current_checkpoint = "activation_capturing_workspace"
+    _mark_pending_invite_state(
+        int(invite_id),
+        status=current_checkpoint,
+        checkpoint=current_checkpoint,
+        run_id=activation_run_id,
+        clear_error=True,
+    )
+
+    local_account_id = pending_account_id
+    linked_account_ids: list[int] = []
+    now_iso = _utcnow().isoformat()
+    with Session(engine) as session:
+        pending_db = session.get(PendingBusinessInviteModel, int(invite_id))
+        account_db = session.get(AccountModel, pending_account_id)
+        update_result = _update_account_from_activation_result(account_db, result)
+        linked_accounts = update_result[1] if isinstance(update_result, tuple) and len(update_result) == 2 else []
+        local_account_id = int(account_db.id or 0) if account_db is not None else pending_account_id
+        session.add(account_db)
+        for linked in linked_accounts or []:
+            from core.db import save_account
+
+            saved_linked = save_account(linked)
+            saved_linked_id = int(getattr(saved_linked, "id", 0) or 0)
+            if saved_linked_id > 0:
+                linked_account_ids.append(saved_linked_id)
+
+        if pending_db is not None:
+            pending_db.status = "completed"
+            pending_db.join_consumed_at = pending_db.join_consumed_at or now_iso
+            pending_db.joined_at = pending_db.joined_at or now_iso
+            pending_db.last_error = ""
+            pending_db.last_error_code = ""
+            pending_db.last_checkpoint = "completed"
+            pending_db.activation_run_id = activation_run_id
+            pending_db.updated_at = _utcnow()
+            session.add(pending_db)
+        session.commit()
+
+    log_fn("[订阅] auth 补抓完成", "info")
+    return {
+        "ok": True,
+        "invite_id": int(invite_id),
+        "activation_kind": "subscription_auth",
+        "email": account_email,
+        "local_account_id": local_account_id,
+        "linked_account_ids": linked_account_ids,
+        "account_id": result.account_id,
+        "workspace_id": result.workspace_id,
+        "workspace_artifacts": result.workspace_artifacts or [],
+        "activation_run_id": activation_run_id,
+    }
 
 
 def activate_pending_invite(
@@ -510,12 +904,25 @@ def activate_pending_invite(
             pending_invite_workspace_id = str(pending.invite_workspace_id or "").strip()
             mailbox_state = _loads(pending.mailbox_state_json, {})
             registration_context = _loads(pending.registration_context_json, {})
+            activation_kind = str(registration_context.get("activation_kind") or "business_invite")
             current_checkpoint = str(
                 pending.last_checkpoint
                 or ("activation_auth_login" if pending_invite_url else "invite_sent_pending_activation")
             )
             if not mailbox_state:
                 raise ValueError("mailbox_state 缺失，无法继续激活")
+
+        if activation_kind == "subscription_auth":
+            return _activate_subscription_auth_pending(
+                invite_id=int(invite_id),
+                pending_account_id=pending_account_id,
+                account_email=account_email,
+                account_password=account_password,
+                mailbox_state=mailbox_state,
+                registration_context=registration_context,
+                activation_run_id=activation_run_id,
+                log_fn=_log,
+            )
 
         _mark_pending_invite_state(
             int(invite_id),
@@ -642,7 +1049,7 @@ def activate_pending_invite(
         engine_instance = RefreshTokenRegistrationEngine(
             email_service=email_service,
             proxy_url=None,
-            callback_logger=lambda msg, *_: _log(msg, "info"),
+            callback_logger=lambda msg, level="info", *_: _log(msg, level),
             browser_mode=browser_mode,
             extra_config=merged_config,
         )
@@ -742,6 +1149,8 @@ def activate_pending_invites(
         with Session(engine) as session:
             row = session.get(PendingBusinessInviteModel, int(invite_id))
             email = str(getattr(row, "email", "") or "")
+        account_label = email or f"invite_id={invite_id}"
+        _log(f"[账号] -------- 激活 {index}/{len(resolved_ids)} | {account_label} --------")
         _log(f"[激活] 批量阶段 {index}/{len(resolved_ids)} invite_id={invite_id}")
         try:
             item = activate_pending_invite(invite_id, log_fn=log_fn, run_id=activation_run_id)

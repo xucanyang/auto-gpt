@@ -137,7 +137,7 @@ class EmailServiceAdapter:
             if str(code or "").strip()
         }
         deadline = time.monotonic() + max(int(timeout or 0), 1)
-        self._log(f"正在等待邮箱 {email} 的验证码（{phase_title}, {timeout}s）...")
+        self._log(f"[验证码] 正在等待邮箱 {email} 的验证码（{phase_title}, {timeout}s）...")
 
         while time.monotonic() < deadline:
             remaining = max(1, int(deadline - time.monotonic()))
@@ -165,7 +165,7 @@ class EmailServiceAdapter:
                 meta["code"] = normalized_code
                 meta["phase"] = phase_key
                 self._last_verification_result_by_phase[phase_key] = meta
-                self._log(f"成功获取验证码（{phase_title}）")
+                self._log(f"[验证码] 成功获取验证码（{phase_title}）")
                 return normalized_code
 
             if normalized_code in used_codes or normalized_code in excluded_codes:
@@ -178,7 +178,7 @@ class EmailServiceAdapter:
                 "code": normalized_code,
                 "phase": phase_key,
             }
-            self._log(f"成功获取验证码（{phase_title}）")
+            self._log(f"[验证码] 成功获取验证码（{phase_title}）")
             return normalized_code
 
         return None
@@ -191,7 +191,7 @@ class RefreshTokenRegistrationEngine:
         self,
         email_service,
         proxy_url: Optional[str] = None,
-        callback_logger: Optional[Callable[[str], None]] = None,
+        callback_logger: Optional[Callable[..., None]] = None,
         task_uuid: Optional[str] = None,
         browser_mode: str = "protocol",
         max_retries: int = 3,
@@ -199,7 +199,7 @@ class RefreshTokenRegistrationEngine:
     ):
         self.email_service = email_service
         self.proxy_url = proxy_url
-        self.callback_logger = callback_logger or (lambda msg: logger.info(msg))
+        self.callback_logger = callback_logger or (lambda msg, *_: logger.info(msg))
         self.task_uuid = task_uuid
         self.browser_mode = str(browser_mode or "protocol").strip().lower() or "protocol"
         # 已移除整流程重试能力，保留参数仅兼容调用方
@@ -211,6 +211,7 @@ class RefreshTokenRegistrationEngine:
         self.email_info: Optional[Dict[str, Any]] = None
         self.logs: list[str] = []
         self._last_pending_invite_error_message: str = ""
+        self._last_workspace_capture_error: str = ""
 
     @staticmethod
     def _classify_log_level(message: str, level: str = "info") -> str:
@@ -219,7 +220,7 @@ class RefreshTokenRegistrationEngine:
             return normalized_level
 
         text = str(message or "").strip()
-        allowed_info_prefixes = ("[主链路]", "[注册]", "[邀请]", "[business]", "[free]", "[结果]")
+        allowed_info_prefixes = ("[阶段]", "[账号]", "[主链路]", "[注册]", "[登录]", "[邮箱]", "[验证码]", "[邀请]", "[business]", "[free]", "[结果]", "[TempMailLocal]")
         if text.startswith(allowed_info_prefixes):
             return "info"
         if text.startswith("[") and "]" in text:
@@ -340,7 +341,10 @@ class RefreshTokenRegistrationEngine:
         self.logs.append(log_message)
 
         if self.callback_logger:
-            self.callback_logger(log_message)
+            try:
+                self.callback_logger(log_message, effective_level)
+            except TypeError:
+                self.callback_logger(log_message)
 
         if effective_level == "error":
             logger.error(log_message)
@@ -351,12 +355,12 @@ class RefreshTokenRegistrationEngine:
         else:
             logger.info(log_message)
 
-    def _log_stage(self, title: str, *, level: str = "debug"):
-        self._log(f"================ {title} ================", level)
+    def _log_stage(self, title: str, *, level: str = "info"):
+        self._log(f"[阶段] ================ {title} ================", level)
 
     def _create_email(self) -> bool:
         try:
-            self._log(f"正在创建 {self.email_service.service_type.value} 邮箱...")
+            self._log(f"[邮箱] 正在创建 {self.email_service.service_type.value} 邮箱...")
             self.email_info = self.email_service.create_email()
 
             email_value = str(
@@ -366,7 +370,7 @@ class RefreshTokenRegistrationEngine:
             ).strip()
             if not email_value:
                 self._log(
-                    f"创建邮箱失败: {self.email_service.service_type.value} 返回空邮箱地址",
+                    f"[邮箱] 创建邮箱失败: {self.email_service.service_type.value} 返回空邮箱地址",
                     "error",
                 )
                 return False
@@ -375,10 +379,10 @@ class RefreshTokenRegistrationEngine:
                 self.email_info = {}
             self.email_info["email"] = email_value
             self.email = email_value
-            self._log(f"成功创建邮箱: {self.email}")
+            self._log(f"[邮箱] 成功创建邮箱: {self.email}")
             return True
         except Exception as e:
-            self._log(f"创建邮箱失败: {e}", "error")
+            self._log(f"[邮箱] 创建邮箱失败: {e}", "error")
             return False
 
     @staticmethod
@@ -413,6 +417,36 @@ class RefreshTokenRegistrationEngine:
                 continue
             return max(minimum, min(parsed, maximum))
         return max(minimum, min(int(default), maximum))
+
+    @staticmethod
+    def _workspace_capture_retry_delay_seconds(error_text: str, attempt: int) -> int:
+        text = str(error_text or "").strip().lower()
+        normalized_attempt = max(1, int(attempt or 1))
+        if any(marker in text for marker in ("429", "rate limit", "rate_limited", "请求过快", "限流")):
+            return min(300, 90 * normalized_attempt)
+        if any(marker in text for marker in ("add_phone", "add-phone", "手机号", "phone verification")):
+            return min(240, 60 * normalized_attempt)
+        return min(45, 10 * normalized_attempt)
+
+    @staticmethod
+    def _is_workspace_capture_cooldown_error(error_text: str) -> bool:
+        text = str(error_text or "").strip().lower()
+        return any(marker in text for marker in (
+            "429",
+            "rate limit",
+            "rate_limited",
+            "请求过快",
+            "限流",
+            "add_phone",
+            "add-phone",
+            "手机号",
+            "phone verification",
+        ))
+
+    @staticmethod
+    def _compact_error_text(error_text: str, limit: int = 180) -> str:
+        text = " ".join(str(error_text or "").split())
+        return text[: max(20, int(limit or 180))]
 
     @staticmethod
     def _should_attempt_business_workspace_recovery(oauth_client: OAuthClient) -> bool:
@@ -460,7 +494,7 @@ class RefreshTokenRegistrationEngine:
             self.extra_config,
             proxy=self.proxy_url,
             browser_mode=self.browser_mode,
-            log_fn=lambda msg: self._log(msg),
+            log_fn=lambda msg, level="info": self._log(msg, level),
         )
         if not recovery.is_enabled():
             self._log("本地 Team 运行时不可用，跳过 business workspace recovery", "warning")
@@ -713,6 +747,55 @@ class RefreshTokenRegistrationEngine:
             "variant_key": f"{normalized_scope}:{workspace_id or account_id or 'unknown'}",
         }
 
+    def _is_registration_access_token_save_enabled(self) -> bool:
+        value = self.extra_config.get("chatgpt_save_registration_access_token_account")
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+
+    def _build_registration_access_token_artifact(
+        self,
+        *,
+        session_tokens: dict[str, Any],
+    ) -> dict[str, Any]:
+        artifact = self._build_workspace_artifact_from_session_tokens(
+            session_tokens=session_tokens,
+            scope="free",
+            source="registration_session",
+        )
+        artifact["label"] = "registration_at"
+        artifact["variant_key"] = (
+            f"registration_at:{artifact.get('workspace_id') or artifact.get('account_id') or 'unknown'}"
+        )
+        artifact["auth_level"] = "access_token_only"
+        artifact["partial_auth"] = True
+        return artifact
+
+    def _return_registration_access_token_partial_result(
+        self,
+        *,
+        result: RegistrationResult,
+        artifact: Optional[dict[str, Any]],
+        reason: str,
+    ) -> bool:
+        if not artifact or not str(artifact.get("access_token") or "").strip():
+            return False
+        self._apply_workspace_artifact_to_result(result, artifact)
+        result.success = True
+        result.source = "registration_session"
+        result.workspace_artifacts = [artifact]
+        result.error_message = ""
+        result.metadata = result.metadata or {}
+        result.metadata["registration_stage_complete"] = True
+        result.metadata["registration_access_token_saved"] = True
+        result.metadata["registration_access_token_partial_reason"] = str(reason or "").strip()
+        result.metadata["workspace_capture_partial_success"] = True
+        self._log(
+            f"[结果] 注册阶段 AccessToken 已保存；后续 auth 未完成: {self._compact_error_text(reason)}",
+            "warning",
+        )
+        return True
+
     @classmethod
     def _to_json_safe(cls, value: Any) -> Any:
         if value is None or isinstance(value, (str, int, float, bool)):
@@ -804,7 +887,7 @@ class RefreshTokenRegistrationEngine:
             self.extra_config,
             proxy=self.proxy_url,
             browser_mode=self.browser_mode,
-            log_fn=lambda msg: self._log(msg),
+            log_fn=lambda msg, level="info": self._log(msg, level),
         )
         if not recovery.is_enabled():
             self._last_pending_invite_error_message = "本地 Team 运行时不可用，无法保存 pending invite"
@@ -847,7 +930,7 @@ class RefreshTokenRegistrationEngine:
             self.extra_config,
             proxy=self.proxy_url,
             browser_mode=self.browser_mode,
-            log_fn=lambda msg: self._log(msg),
+            log_fn=lambda msg, level="info": self._log(msg, level),
         )
         if not recovery.is_enabled():
             self._log("本地 Team 运行时不可用，无法进入 business 工作空间", "warning")
@@ -902,6 +985,7 @@ class RefreshTokenRegistrationEngine:
         business_tokens = business_join_result.get("tokens") if isinstance(business_join_result, dict) else None
         business_oauth_client = business_join_result.get("oauth_client") if isinstance(business_join_result, dict) else None
         business_source = str((business_join_result or {}).get("source") or "business_recovery")
+        last_business_capture_error = ""
 
         if isinstance(business_tokens, dict) and business_oauth_client is not None:
             business_artifact = self._build_workspace_artifact(
@@ -922,32 +1006,60 @@ class RefreshTokenRegistrationEngine:
             )
         else:
             self._log("[business] 开始保存 business 工作空间")
-            business_artifact = self._capture_workspace_artifact_via_fresh_login(
-                scope="business",
-                email=result.email,
-                password=result.password,
-                device_id=getattr(register_client, "device_id", "") or "",
-                user_agent=getattr(register_client, "ua", None),
-                sec_ch_ua=getattr(register_client, "sec_ch_ua", None),
-                impersonate=getattr(register_client, "impersonate", None),
-                browser_fingerprint=getattr(register_client, "fingerprint", None),
-                email_adapter=email_adapter,
-                first_name=first_name,
-                last_name=last_name,
-                birthdate=birthdate,
-            )
-            if business_artifact:
-                available_artifacts["business"] = business_artifact
+            business_capture_attempts = 3
+            for attempt in range(1, business_capture_attempts + 1):
+                if attempt > 1:
+                    wait_seconds = self._workspace_capture_retry_delay_seconds(last_business_capture_error, attempt)
+                    reason = "；检测到 add_phone/429，已延长冷却" if self._is_workspace_capture_cooldown_error(last_business_capture_error) else ""
+                    self._log(
+                        f"[business] 工作空间补抓重试 {attempt}/{business_capture_attempts}，等待 {wait_seconds}s{reason}",
+                        "debug",
+                    )
+                    time.sleep(wait_seconds)
+                self._last_workspace_capture_error = ""
+                business_artifact = self._capture_workspace_artifact_via_fresh_login(
+                    scope="business",
+                    email=result.email,
+                    password=result.password,
+                    device_id=getattr(register_client, "device_id", "") or "",
+                    user_agent=getattr(register_client, "ua", None),
+                    sec_ch_ua=getattr(register_client, "sec_ch_ua", None),
+                    impersonate=getattr(register_client, "impersonate", None),
+                    browser_fingerprint=getattr(register_client, "fingerprint", None),
+                    email_adapter=email_adapter,
+                    first_name=first_name,
+                    last_name=last_name,
+                    birthdate=birthdate,
+                )
+                if business_artifact:
+                    available_artifacts["business"] = business_artifact
+                    if not self._artifact_has_refresh_token(business_artifact):
+                        self._log("[business] 已命中 business 工作空间，但当前 artifact 缺少 refresh_token", "debug")
+                    break
+                last_business_capture_error = str(self._last_workspace_capture_error or "").strip()
+                self._log(
+                    f"[business] 第 {attempt}/{business_capture_attempts} 次补抓未命中 business 工作空间",
+                    "debug",
+                )
 
         if "business" not in available_artifacts:
             result.success = False
-            result.error_message = "未能获取所选工作空间: business"
+            if last_business_capture_error:
+                result.error_message = f"未能获取所选工作空间: business（最后错误: {self._compact_error_text(last_business_capture_error)}）"
+            else:
+                result.error_message = "未能获取所选工作空间: business"
+            self._log("[business] 激活后未拿到 business artifact", "debug")
             self._log(result.error_message, "warning")
             return False
 
         if not self._artifact_has_refresh_token(available_artifacts.get("business")):
             result.success = False
+            business_artifact = available_artifacts.get("business") or {}
             result.error_message = "business 工作空间未获取到 refresh_token"
+            self._log(
+                f"[business] 已拿到 artifact 但缺少 refresh_token: account_id={business_artifact.get('account_id') or '-'} workspace_id={business_artifact.get('workspace_id') or '-'} source={business_artifact.get('source') or '-'}",
+                "debug",
+            )
             self._log(result.error_message, "warning")
             return False
 
@@ -1125,12 +1237,18 @@ class RefreshTokenRegistrationEngine:
             workspace_scope_preference=normalized_scope,
         )
         if not tokens:
+            self._last_workspace_capture_error = str(scoped_oauth_client.last_error or "OAuth 登录失败")
             self._log(
                 f"抓取 {normalized_scope} 工作空间失败: {scoped_oauth_client.last_error or 'OAuth 登录失败'}",
                 "warning",
             )
+            self._log(
+                f"[{normalized_scope}] fresh auth 未返回 tokens，last_error={scoped_oauth_client.last_error or 'OAuth 登录失败'}",
+                "debug",
+            )
             return None
 
+        self._last_workspace_capture_error = ""
         artifact = self._build_workspace_artifact(
             tokens=tokens,
             oauth_client=scoped_oauth_client,
@@ -1139,9 +1257,14 @@ class RefreshTokenRegistrationEngine:
         )
         actual_scope = self._normalize_workspace_scope(artifact.get("scope") or "")
         if actual_scope and actual_scope != normalized_scope:
+            self._last_workspace_capture_error = f"目标是 {normalized_scope} 工作空间，但实际拿到 {actual_scope}"
             self._log(
                 f"目标是 {normalized_scope} 工作空间，但实际拿到 {actual_scope}，本轮视为未命中",
                 "warning",
+            )
+            self._log(
+                f"[{normalized_scope}] artifact scope mismatch: actual_scope={actual_scope} account_id={artifact.get('account_id') or '-'} workspace_id={artifact.get('workspace_id') or '-'} source={artifact.get('source') or '-'}",
+                "debug",
             )
             return None
         artifact["scope"] = normalized_scope
@@ -1224,9 +1347,15 @@ class RefreshTokenRegistrationEngine:
             self._log(result.error_message, "warning")
             return False
 
-        # 如果 free 抓取失败但 business 成功，且用户选择了 free，则用 business artifact 复制一份 free 版本，
-        # 确保 free workspace 也能落库并自动上传（很多账号 business/free 是同一账号不同 plan）。
-        if "free" in selected_scopes and "free" not in available_artifacts and "business" in available_artifacts:
+        # 如果 free 抓取失败但 business 成功，且用户明确同时选择 business + free，
+        # 才用 business artifact 复制一份 free 回退版本。订阅后补抓的默认 free-only 链路
+        # 不应因为一次误判/回退保存出两条相同工作空间数据。
+        if (
+            "free" in selected_scopes
+            and "business" in selected_scopes
+            and "free" not in available_artifacts
+            and "business" in available_artifacts
+        ):
             business_artifact = available_artifacts["business"]
             free_artifact = dict(business_artifact)
             free_artifact["scope"] = "free"
@@ -1344,6 +1473,8 @@ class RefreshTokenRegistrationEngine:
             minimum=30,
             maximum=3600,
         )
+        save_registration_access_token_account = self._is_registration_access_token_save_enabled()
+        registration_access_token_artifact: Optional[dict[str, Any]] = None
 
         try:
             registration_message = ""
@@ -1382,6 +1513,7 @@ class RefreshTokenRegistrationEngine:
             )
 
             register_client = self._build_chatgpt_client()
+
             if existing_account_capture:
                 selected_scopes = self._resolve_workspace_capture_scopes(current_scope="business")
                 login_scope = selected_scopes[0] if selected_scopes else "business"
@@ -1481,6 +1613,10 @@ class RefreshTokenRegistrationEngine:
                     result.error_message = f"注册收尾失败: {session_or_error}"
                     self._log(result.error_message, "warning")
                     return result
+                if save_registration_access_token_account:
+                    registration_access_token_artifact = self._build_registration_access_token_artifact(
+                        session_tokens=session_or_error or {},
+                    )
                 result.metadata = result.metadata or {}
                 result.metadata["registration_session_account_id"] = str((session_or_error or {}).get("account_id") or "")
                 result.metadata["registration_session_workspace_id"] = str((session_or_error or {}).get("workspace_id") or "")
@@ -1542,6 +1678,12 @@ class RefreshTokenRegistrationEngine:
                     if not business_join_result:
                         result.error_message = "进入 business 工作空间失败"
                         self._log(result.error_message, "warning")
+                        if save_registration_access_token_account and self._return_registration_access_token_partial_result(
+                            result=result,
+                            artifact=registration_access_token_artifact,
+                            reason=result.error_message,
+                        ):
+                            return result
                         return result
 
                     self._log("[business] 邀请阶段已完成，开始保存 business 工作空间")
@@ -1554,6 +1696,12 @@ class RefreshTokenRegistrationEngine:
                         birthdate=birthdate,
                         business_join_result=business_join_result,
                     ):
+                        if save_registration_access_token_account and self._return_registration_access_token_partial_result(
+                            result=result,
+                            artifact=registration_access_token_artifact,
+                            reason=result.error_message,
+                        ):
+                            return result
                         return result
 
                     self._log(f"[结果] 成功，account_id={result.account_id or '-'} workspace_id={result.workspace_id or '-'}")
@@ -1576,6 +1724,12 @@ class RefreshTokenRegistrationEngine:
                     last_name=last_name,
                     birthdate=birthdate,
                 ):
+                    if save_registration_access_token_account and self._return_registration_access_token_partial_result(
+                        result=result,
+                        artifact=registration_access_token_artifact,
+                        reason=result.error_message,
+                    ):
+                        return result
                     return result
 
                 self._log(f"[结果] 成功，account_id={result.account_id or '-'} workspace_id={result.workspace_id or '-'}")

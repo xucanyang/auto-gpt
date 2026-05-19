@@ -8,7 +8,6 @@ import {
   message,
   Popconfirm,
   Segmented,
-  Select,
   Space,
   Table,
   Tag,
@@ -20,18 +19,20 @@ import { apiFetch } from '@/lib/utils'
 
 const { Text } = Typography
 
-type TaskStatus = 'success' | 'failed' | 'skipped' | 'pending_activation'
+type TaskStatus = 'running' | 'success' | 'failed' | 'skipped' | 'stopped' | 'pending_activation'
 type LogViewMode = 'info' | 'debug'
 
 const LOG_VIEW_STORAGE_KEY = 'task-history-log-view-mode'
 
 interface TaskLogItem {
   id: number
+  task_id?: string
   created_at: string
   platform: string
   email: string
   status: TaskStatus
   error: string
+  detail?: TaskLogDetailPayload
 }
 
 interface TaskLogListResponse {
@@ -73,23 +74,65 @@ function parseLogLine(rawLine: string) {
 }
 
 function statusTagColor(status: TaskStatus) {
+  if (status === 'running') return 'processing'
   if (status === 'success') return 'success'
   if (status === 'pending_activation') return 'processing'
   if (status === 'skipped') return 'warning'
+  if (status === 'stopped') return 'warning'
   return 'error'
 }
 
 function statusLabel(status: TaskStatus) {
+  if (status === 'running') return '运行中'
   if (status === 'success') return '成功'
   if (status === 'pending_activation') return '待激活'
   if (status === 'skipped') return '跳过'
+  if (status === 'stopped') return '已停止'
   return '失败'
+}
+
+function taskOutcomeLabel(outcome?: string) {
+  switch (String(outcome || '').trim()) {
+    case 'task_created':
+      return '已创建'
+    case 'success':
+      return '成功'
+    case 'success_skip_save':
+      return '成功不保存'
+    case 'invite_saved_pending_activation':
+      return '待激活'
+    case 'activation_success':
+      return '激活成功'
+    case 'activation_failed':
+      return '激活失败'
+    case 'resume_subscription_auth_success':
+      return '补抓成功'
+    case 'resume_subscription_auth_failed':
+      return '补抓失败'
+    case 'resume_subscription_auth_stopped':
+      return '补抓停止'
+    case 'resume_subscription_auth_skipped':
+      return '补抓跳过'
+    case 'batch_resume_subscription_auth_success':
+      return '批量补抓成功'
+    case 'batch_resume_subscription_auth_failed':
+      return '批量补抓失败'
+    case 'batch_resume_subscription_auth_stopped':
+      return '批量补抓停止'
+    case 'skipped':
+      return '跳过'
+    case 'failed':
+      return '失败'
+    case 'invite_exhausted_stop_phase':
+      return '邀请耗尽'
+    default:
+      return String(outcome || '').trim() || '-'
+  }
 }
 
 export default function TaskHistory() {
   const [logs, setLogs] = useState<TaskLogItem[]>([])
   const [total, setTotal] = useState(0)
-  const [platform, setPlatform] = useState('')
   const [loading, setLoading] = useState(false)
   const [selectedRowKeys, setSelectedRowKeys] = useState<number[]>([])
   const [detailOpen, setDetailOpen] = useState(false)
@@ -104,8 +147,7 @@ export default function TaskHistory() {
   const load = useCallback(async () => {
     setLoading(true)
     try {
-      const params = new URLSearchParams({ page: '1', page_size: '50' })
-      if (platform) params.set('platform', platform)
+      const params = new URLSearchParams({ page: '1', page_size: '50', platform: 'chatgpt' })
       const data = await apiFetch(`/tasks/logs?${params}`) as TaskLogListResponse
       setLogs(data.items || [])
       setTotal(data.total || 0)
@@ -113,7 +155,7 @@ export default function TaskHistory() {
     } finally {
       setLoading(false)
     }
-  }, [platform])
+  }, [])
 
   useEffect(() => {
     load()
@@ -183,6 +225,13 @@ export default function TaskHistory() {
       render: (text: string) => (text ? new Date(text).toLocaleString('zh-CN') : '-'),
     },
     {
+      title: '任务 ID',
+      dataIndex: 'task_id',
+      key: 'task_id',
+      width: 180,
+      render: (text: string) => <span style={{ fontFamily: 'monospace', fontSize: 12 }}>{text || '-'}</span>,
+    },
+    {
       title: '平台',
       dataIndex: 'platform',
       key: 'platform',
@@ -196,11 +245,37 @@ export default function TaskHistory() {
       render: (text: string) => <span style={{ fontFamily: 'monospace', fontSize: 12 }}>{text || '-'}</span>,
     },
     {
+      title: '结果',
+      key: 'attempt_outcome',
+      width: 120,
+      render: (_, record) => {
+        const outcome = record.detail?.attempt_outcome
+        return <Tag>{taskOutcomeLabel(outcome)}</Tag>
+      },
+    },
+    {
       title: '状态',
       dataIndex: 'status',
       key: 'status',
       width: 90,
       render: (status: TaskStatus) => <Tag color={statusTagColor(status)}>{statusLabel(status)}</Tag>,
+    },
+    {
+      title: '进度',
+      key: 'progress',
+      width: 100,
+      render: (_, record) => record.detail?.progress || '-',
+    },
+    {
+      title: '统计',
+      key: 'counts',
+      width: 150,
+      render: (_, record) => {
+        const success = Number(record.detail?.success || 0)
+        const skipped = Number(record.detail?.skipped || 0)
+        const failed = Array.isArray(record.detail?.errors) ? record.detail?.errors.length : 0
+        return `${success}/${skipped}/${failed}`
+      },
     },
     {
       title: '错误信息',
@@ -240,18 +315,6 @@ export default function TaskHistory() {
               </Button>
             </Popconfirm>
           )}
-          <Select
-            value={platform}
-            onChange={(value) => {
-              setPlatform(value)
-              setSelectedRowKeys([])
-            }}
-            style={{ width: 140 }}
-            options={[
-              { value: '', label: '全部平台' },
-              { value: 'chatgpt', label: 'ChatGPT' },
-            ]}
-          />
           <Button icon={<ReloadOutlined spin={loading} />} onClick={load} loading={loading} />
         </Space>
       </div>
@@ -289,7 +352,11 @@ export default function TaskHistory() {
                 {detailRecord.created_at ? new Date(detailRecord.created_at).toLocaleString('zh-CN') : '-'}
               </Descriptions.Item>
               <Descriptions.Item label="任务 ID">{detailRecord.detail?.task_id || '-'}</Descriptions.Item>
+              <Descriptions.Item label="结果">{taskOutcomeLabel(detailRecord.detail?.attempt_outcome)}</Descriptions.Item>
               <Descriptions.Item label="进度">{detailRecord.detail?.progress || '-'}</Descriptions.Item>
+              <Descriptions.Item label="成功">{detailRecord.detail?.success ?? 0}</Descriptions.Item>
+              <Descriptions.Item label="跳过">{detailRecord.detail?.skipped ?? 0}</Descriptions.Item>
+              <Descriptions.Item label="失败">{Array.isArray(detailRecord.detail?.errors) ? detailRecord.detail?.errors.length : 0}</Descriptions.Item>
               <Descriptions.Item label="错误信息" span={2}>{detailRecord.error || '-'}</Descriptions.Item>
             </Descriptions>
 

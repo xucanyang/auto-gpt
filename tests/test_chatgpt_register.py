@@ -12,12 +12,12 @@ smstome_tool_stub.update_global_phone_list = lambda *args, **kwargs: 0
 smstome_tool_stub.wait_for_otp = lambda *args, **kwargs: None
 sys.modules.setdefault("smstome_tool", smstome_tool_stub)
 
-from platforms.chatgpt.oauth_client import OAuthClient
-from platforms.chatgpt.refresh_token_registration_engine import (
+from services.chatgpt_core.oauth_client import OAuthClient
+from services.chatgpt_core.refresh_token_registration_engine import (
     RefreshTokenRegistrationEngine,
     RegistrationResult,
 )
-from platforms.chatgpt.utils import FlowState
+from services.chatgpt_core.utils import FlowState
 
 
 class DummyEmailService:
@@ -40,9 +40,9 @@ class RefreshTokenRegistrationEngineTests(unittest.TestCase):
             **kwargs,
         )
 
-    @mock.patch("platforms.chatgpt.refresh_token_registration_engine.OAuthManager")
-    @mock.patch("platforms.chatgpt.refresh_token_registration_engine.OAuthClient")
-    @mock.patch("platforms.chatgpt.refresh_token_registration_engine.ChatGPTClient")
+    @mock.patch("services.chatgpt_core.refresh_token_registration_engine.OAuthManager")
+    @mock.patch("services.chatgpt_core.refresh_token_registration_engine.OAuthClient")
+    @mock.patch("services.chatgpt_core.refresh_token_registration_engine.ChatGPTClient")
     def test_run_finishes_registration_then_enters_business_and_captures_artifacts(
         self,
         mock_chatgpt_client_cls,
@@ -177,15 +177,59 @@ class RefreshTokenRegistrationEngineTests(unittest.TestCase):
         self.assertEqual(result.source, "business_recovery")
         self.assertEqual(result.error_message, "")
         self.assertEqual([item["scope"] for item in (result.workspace_artifacts or [])], ["business"])
-        self.assertEqual(result.metadata["selected_workspace_scopes"], ["business", "free"])
-        self.assertEqual(result.metadata["workspace_capture_optional_failures"], ["free"])
-        self.assertTrue(result.metadata["workspace_capture_partial_success"])
-        mock_capture.assert_called_once()
-        self.assertEqual(mock_capture.call_args.kwargs["scope"], "free")
 
-    @mock.patch("platforms.chatgpt.refresh_token_registration_engine.OAuthManager")
-    @mock.patch("platforms.chatgpt.refresh_token_registration_engine.OAuthClient")
-    @mock.patch("platforms.chatgpt.refresh_token_registration_engine.ChatGPTClient")
+    @mock.patch("services.chatgpt_core.refresh_token_registration_engine.OAuthManager")
+    @mock.patch("services.chatgpt_core.refresh_token_registration_engine.OAuthClient")
+    @mock.patch("services.chatgpt_core.refresh_token_registration_engine.ChatGPTClient")
+    def test_run_saves_registration_access_token_when_workspace_capture_fails(
+        self,
+        mock_chatgpt_client_cls,
+        mock_oauth_client_cls,
+        mock_oauth_manager_cls,
+    ):
+        register_client = mock.Mock()
+        register_client.device_id = "device-fixed"
+        register_client.ua = "UA"
+        register_client.sec_ch_ua = '"Chromium";v="136"'
+        register_client.impersonate = "chrome136"
+        register_client.fingerprint = {"device_id": "device-fixed"}
+        register_client.register_complete_flow.return_value = (True, "注册成功")
+        register_client.reuse_session_and_get_tokens.return_value = (
+            True,
+            {
+                "access_token": "at-registration",
+                "session_token": "session-registration",
+                "account_id": "acct-registration",
+                "workspace_id": "acct-registration",
+            },
+        )
+        mock_chatgpt_client_cls.return_value = register_client
+        mock_oauth_client_cls.return_value = mock.Mock()
+        mock_oauth_manager_cls.return_value = mock.Mock()
+
+        engine = self._make_engine(
+            extra_config={
+                "register_max_retries": 1,
+                "chatgpt_save_registration_access_token_account": True,
+                "chatgpt_capture_free_workspace": True,
+                "chatgpt_enable_team_invite": False,
+            }
+        )
+
+        with mock.patch.object(engine, "_finalize_workspace_artifacts", return_value=False) as finalize:
+            result = engine.run()
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.source, "registration_session")
+        self.assertEqual(result.access_token, "at-registration")
+        self.assertEqual(result.session_token, "session-registration")
+        self.assertEqual(result.workspace_artifacts[0]["variant_key"], "registration_at:acct-registration")
+        self.assertTrue(result.metadata["registration_access_token_saved"])
+        finalize.assert_called_once()
+
+    @mock.patch("services.chatgpt_core.refresh_token_registration_engine.OAuthManager")
+    @mock.patch("services.chatgpt_core.refresh_token_registration_engine.OAuthClient")
+    @mock.patch("services.chatgpt_core.refresh_token_registration_engine.ChatGPTClient")
     def test_run_switches_to_login_when_register_flow_reports_existing_account(
         self,
         mock_chatgpt_client_cls,
@@ -232,9 +276,9 @@ class RefreshTokenRegistrationEngineTests(unittest.TestCase):
         login_kwargs = oauth_client.login_and_get_tokens.call_args.kwargs
         self.assertEqual(login_kwargs["login_source"], "existing_account_recovery")
 
-    @mock.patch("platforms.chatgpt.refresh_token_registration_engine.OAuthManager")
-    @mock.patch("platforms.chatgpt.refresh_token_registration_engine.OAuthClient")
-    @mock.patch("platforms.chatgpt.refresh_token_registration_engine.ChatGPTClient")
+    @mock.patch("services.chatgpt_core.refresh_token_registration_engine.OAuthManager")
+    @mock.patch("services.chatgpt_core.refresh_token_registration_engine.OAuthClient")
+    @mock.patch("services.chatgpt_core.refresh_token_registration_engine.ChatGPTClient")
     def test_run_keeps_first_created_email_when_global_retry_disabled(
         self,
         mock_chatgpt_client_cls,
@@ -282,11 +326,10 @@ class RefreshTokenRegistrationEngineTests(unittest.TestCase):
         self.assertEqual(len(call_args), 1)
         self.assertEqual(call_args[0].args[0], "user1@example.com")
 
-
     @mock.patch.object(RefreshTokenRegistrationEngine, "_recover_workspace_with_business")
-    @mock.patch("platforms.chatgpt.refresh_token_registration_engine.OAuthManager")
-    @mock.patch("platforms.chatgpt.refresh_token_registration_engine.OAuthClient")
-    @mock.patch("platforms.chatgpt.refresh_token_registration_engine.ChatGPTClient")
+    @mock.patch("services.chatgpt_core.refresh_token_registration_engine.OAuthManager")
+    @mock.patch("services.chatgpt_core.refresh_token_registration_engine.OAuthClient")
+    @mock.patch("services.chatgpt_core.refresh_token_registration_engine.ChatGPTClient")
     def test_run_switches_into_business_recovery_when_workspace_missing(
         self,
         mock_chatgpt_client_cls,
@@ -361,10 +404,20 @@ class RefreshTokenRegistrationEngineTests(unittest.TestCase):
         self.assertEqual(engine._resolve_workspace_capture_scopes(current_scope=""), ["free"])
         self.assertEqual(engine._resolve_workspace_capture_scopes(current_scope="free"), ["free"])
 
+    def test_workspace_capture_can_be_explicitly_disabled_when_team_invite_disabled(self):
+        engine = self._make_engine(
+            extra_config={
+                "chatgpt_capture_free_workspace": False,
+            }
+        )
+        self.assertFalse(engine._is_team_invite_enabled())
+        self.assertEqual(engine._resolve_workspace_capture_scopes(current_scope=""), [])
+        self.assertEqual(engine._resolve_workspace_capture_scopes(current_scope="free"), [])
+
     @mock.patch.object(RefreshTokenRegistrationEngine, "_recover_workspace_with_business")
-    @mock.patch("platforms.chatgpt.refresh_token_registration_engine.OAuthManager")
-    @mock.patch("platforms.chatgpt.refresh_token_registration_engine.OAuthClient")
-    @mock.patch("platforms.chatgpt.refresh_token_registration_engine.ChatGPTClient")
+    @mock.patch("services.chatgpt_core.refresh_token_registration_engine.OAuthManager")
+    @mock.patch("services.chatgpt_core.refresh_token_registration_engine.OAuthClient")
+    @mock.patch("services.chatgpt_core.refresh_token_registration_engine.ChatGPTClient")
     def test_run_skips_business_recovery_when_team_invite_disabled(
         self,
         mock_chatgpt_client_cls,

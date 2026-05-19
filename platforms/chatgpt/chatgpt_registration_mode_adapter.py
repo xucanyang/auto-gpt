@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 from core.base_platform import Account, AccountStatus
 
@@ -116,6 +116,23 @@ class BaseChatGPTRegistrationModeAdapter(ABC):
             return "business"
         return ""
 
+    @staticmethod
+    def _dedupe_workspace_artifacts(artifacts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        seen: set[tuple[str, str, str, str]] = set()
+        deduped: list[dict[str, Any]] = []
+        for item in artifacts:
+            scope = BaseChatGPTRegistrationModeAdapter._normalize_workspace_scope(item.get("scope") or "") or "free"
+            workspace_id = str(item.get("workspace_id") or "").strip()
+            account_id = str(item.get("account_id") or "").strip()
+            refresh_token = str(item.get("refresh_token") or "").strip()
+            variant_key = str(item.get("variant_key") or "").strip()
+            key = (scope, workspace_id, account_id, refresh_token or variant_key)
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(item)
+        return deduped
+
     def _build_account_extra(self, result) -> dict:
         scope = self._normalize_workspace_scope(
             getattr(result, "source", "") == "business_recovery" and "business" or ""
@@ -126,7 +143,7 @@ class BaseChatGPTRegistrationModeAdapter(ABC):
                 "access_token": getattr(result, "access_token", ""),
                 "refresh_token": getattr(result, "refresh_token", ""),
                 "id_token": getattr(result, "id_token", ""),
-                "session_token": "",
+                "session_token": getattr(result, "session_token", ""),
                 "workspace_id": getattr(result, "workspace_id", ""),
                 "account_id": getattr(result, "account_id", ""),
                 "source": getattr(result, "source", "register"),
@@ -146,7 +163,7 @@ class BaseChatGPTRegistrationModeAdapter(ABC):
             "access_token": artifact.get("access_token") or getattr(result, "access_token", ""),
             "refresh_token": artifact.get("refresh_token") or getattr(result, "refresh_token", ""),
             "id_token": artifact.get("id_token") or getattr(result, "id_token", ""),
-            "session_token": "",
+            "session_token": artifact.get("session_token") or getattr(result, "session_token", ""),
             "workspace_id": workspace_id,
             "chatgpt_registration_mode": self.mode,
             "chatgpt_has_refresh_token_solution": self.mode == CHATGPT_REGISTRATION_MODE_REFRESH_TOKEN,
@@ -156,6 +173,10 @@ class BaseChatGPTRegistrationModeAdapter(ABC):
             "chatgpt_workspace_display_name": f"{email} [{label}]" if email else f"[{label}]",
             "chatgpt_workspace_variant_key": variant_key,
         }
+        if artifact.get("auth_level"):
+            extra["auth_level"] = artifact.get("auth_level")
+        if artifact.get("partial_auth"):
+            extra["partial_auth"] = True
         metadata = getattr(result, "metadata", None) or {}
         if isinstance(metadata, dict):
             if metadata.get("mailbox_state"):
@@ -183,13 +204,14 @@ class BaseChatGPTRegistrationModeAdapter(ABC):
             for item in (getattr(result, "workspace_artifacts", None) or [])
             if isinstance(item, dict)
         ]
+        artifacts = self._dedupe_workspace_artifacts(artifacts)
         if not artifacts:
             artifacts = [{
                 "scope": "business" if getattr(result, "source", "") == "business_recovery" else "free",
                 "access_token": getattr(result, "access_token", ""),
                 "refresh_token": getattr(result, "refresh_token", ""),
                 "id_token": getattr(result, "id_token", ""),
-                "session_token": "",
+                "session_token": getattr(result, "session_token", ""),
                 "workspace_id": getattr(result, "workspace_id", ""),
                 "account_id": getattr(result, "account_id", ""),
                 "source": getattr(result, "source", "register"),
@@ -199,6 +221,11 @@ class BaseChatGPTRegistrationModeAdapter(ABC):
         accounts: list[Account] = []
         for artifact in artifacts:
             extra = self._build_account_extra_for_artifact(artifact, result)
+            status = (
+                AccountStatus.PENDING_PAYMENT
+                if extra.get("partial_auth") or extra.get("auth_level") == "access_token_only"
+                else AccountStatus.REGISTERED
+            )
             accounts.append(
                 Account(
                     platform="chatgpt",
@@ -206,7 +233,7 @@ class BaseChatGPTRegistrationModeAdapter(ABC):
                     password=getattr(result, "password", "") or fallback_password,
                     user_id=str(artifact.get("account_id") or getattr(result, "account_id", "") or ""),
                     token=str(artifact.get("access_token") or getattr(result, "access_token", "") or ""),
-                    status=AccountStatus.REGISTERED,
+                    status=status,
                     extra=extra,
                 )
             )

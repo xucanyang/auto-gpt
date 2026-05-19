@@ -6,7 +6,7 @@ services:
       args:
         CAMOUFOX_VERSION: ${CAMOUFOX_VERSION:-135.0.1}
         CAMOUFOX_RELEASE: ${CAMOUFOX_RELEASE:-beta.24}
-    container_name: any-auto-register-local
+    container_name: auto-chatgpt
     init: true
     restart: unless-stopped
     env_file:

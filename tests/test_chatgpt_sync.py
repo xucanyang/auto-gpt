@@ -17,11 +17,33 @@ class ChatGPTBackfillTests(unittest.TestCase):
         account.set_extra(
             {
                 "access_token": "access-token",
+                "refresh_token": "refresh-token",
+                "workspace_id": "ws-demo",
                 "session_token": "session-token",
                 "mail_provider": "cfworker",
             }
         )
+        account.user_id = "acct-demo"
         return account
+
+    def test_cpa_upload_skips_access_token_only_account(self):
+        account = AccountModel(
+            platform="chatgpt",
+            email="partial@example.com",
+            password="secret",
+            token="access-token",
+            status="pending_payment",
+        )
+        account.set_extra({"access_token": "access-token", "partial_auth": True})
+
+        with mock.patch("services.chatgpt_core.cpa_upload.upload_to_cpa") as upload_mock:
+            result = backfill_chatgpt_account_to_cpa(account, commit=False)
+
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["uploaded"])
+        self.assertTrue(result["skipped"])
+        self.assertIn("refresh_token", result["message"])
+        upload_mock.assert_not_called()
 
     def test_build_sync_account_preserves_user_id(self):
         account = self._make_account()
@@ -44,7 +66,7 @@ class ChatGPTBackfillTests(unittest.TestCase):
         account.set_extra(extra)
 
         with mock.patch("services.cliproxyapi_sync.sync_chatgpt_cliproxyapi_status") as sync_mock:
-            with mock.patch("platforms.chatgpt.status_probe.probe_local_chatgpt_status") as probe_mock:
+            with mock.patch("services.chatgpt_core.status_probe.probe_local_chatgpt_status") as probe_mock:
                 result = backfill_chatgpt_account_to_cpa(account, commit=False)
 
         self.assertTrue(result["ok"])
@@ -68,7 +90,7 @@ class ChatGPTBackfillTests(unittest.TestCase):
 
         with mock.patch("services.cliproxyapi_sync.sync_chatgpt_cliproxyapi_status") as sync_mock:
             with mock.patch(
-                "platforms.chatgpt.status_probe.probe_local_chatgpt_status",
+                "services.chatgpt_core.status_probe.probe_local_chatgpt_status",
                 return_value={
                     "auth": {
                         "state": "refresh_token_invalidated",
@@ -112,7 +134,7 @@ class ChatGPTBackfillTests(unittest.TestCase):
             ],
         ) as sync_mock:
             with mock.patch(
-                "platforms.chatgpt.status_probe.probe_local_chatgpt_status",
+                "services.chatgpt_core.status_probe.probe_local_chatgpt_status",
                 return_value={
                     "auth": {
                         "state": "refresh_token_valid",
@@ -156,7 +178,7 @@ class ChatGPTBackfillTests(unittest.TestCase):
             ],
         ) as sync_mock:
             with mock.patch(
-                "platforms.chatgpt.status_probe.probe_local_chatgpt_status",
+                "services.chatgpt_core.status_probe.probe_local_chatgpt_status",
                 return_value={
                     "auth": {
                         "state": "refresh_token_valid",
@@ -199,7 +221,7 @@ class ChatGPTBackfillTests(unittest.TestCase):
             },
         ) as sync_mock:
             with mock.patch(
-                "platforms.chatgpt.status_probe.probe_local_chatgpt_status",
+                "services.chatgpt_core.status_probe.probe_local_chatgpt_status",
                 return_value={
                     "auth": {
                         "state": "access_token_valid",

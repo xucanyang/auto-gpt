@@ -32,6 +32,29 @@ import { apiFetch } from '@/lib/utils'
 
 const { Text } = Typography
 
+const REGISTER_TASK_STORAGE_KEY = 'auto-chatgpt.register-task-page.current-task'
+
+type RegisterTaskStatus = 'pending' | 'running' | 'done' | 'failed' | 'stopped'
+
+function normalizeRegisterTaskStatus(value: unknown): RegisterTaskStatus {
+  const normalized = String(value || '').trim().toLowerCase()
+  if (normalized === 'success') return 'done'
+  if (normalized === 'skipped') return 'stopped'
+  if (normalized === 'pending' || normalized === 'running' || normalized === 'done' || normalized === 'failed' || normalized === 'stopped') {
+    return normalized
+  }
+  return 'pending'
+}
+
+function mapHistoryTaskStatus(status: unknown, snapshotStatus?: unknown): RegisterTaskStatus {
+  const normalized = String(status || '').trim().toLowerCase()
+  if (normalized === 'success') return 'done'
+  if (normalized === 'failed') return 'failed'
+  if (normalized === 'skipped' || normalized === 'stopped') return 'stopped'
+  if (normalized === 'running') return 'running'
+  return normalizeRegisterTaskStatus(snapshotStatus)
+}
+
 function normalizeTaskSnapshot(task: any, fallbackTaskId?: string) {
   if (!task) return null
   const normalizedId = task.id || task.task_id || fallbackTaskId || ''
@@ -39,11 +62,14 @@ function normalizeTaskSnapshot(task: any, fallbackTaskId?: string) {
     ...task,
     id: normalizedId,
     task_id: normalizedId,
-    status: task.status || 'pending',
+    status: normalizeRegisterTaskStatus(task.status || task.status_snapshot || 'pending'),
     progress: task.progress || '0/0',
     skipped: task.skipped ?? 0,
     success: task.success ?? 0,
     errors: Array.isArray(task.errors) ? task.errors : [],
+    cashier_urls: Array.isArray(task.cashier_urls) ? task.cashier_urls : [],
+    pending_verification: task.pending_verification || null,
+    error: task.error || '',
   }
 }
 
@@ -52,6 +78,7 @@ export default function RegisterTaskPage() {
   const [task, setTask] = useState<any>(null)
   const [polling, setPolling] = useState(false)
   const pollTimerRef = useRef<number | null>(null)
+  const taskRef = useRef<any>(null)
   const { mode: chatgptRegistrationMode, setMode: setChatgptRegistrationMode } =
     usePersistentChatGPTRegistrationMode()
 
@@ -130,9 +157,20 @@ export default function RegisterTaskPage() {
         chatgpt_team_invite_deferred_activation: parseBooleanConfigValue(cfg.chatgpt_team_invite_deferred_activation),
         chatgpt_capture_business_workspace: cfg.chatgpt_capture_business_workspace === '' ? true : parseBooleanConfigValue(cfg.chatgpt_capture_business_workspace),
         chatgpt_capture_free_workspace: cfg.chatgpt_capture_free_workspace === '' ? true : parseBooleanConfigValue(cfg.chatgpt_capture_free_workspace),
+        chatgpt_access_token_only_checkout_amount_check_enabled:
+          cfg.chatgpt_access_token_only_checkout_amount_check_enabled === ''
+            ? true
+            : parseBooleanConfigValue(cfg.chatgpt_access_token_only_checkout_amount_check_enabled),
+        chatgpt_access_token_only_checkout_country: String(cfg.chatgpt_access_token_only_checkout_country || 'US').trim().toUpperCase() || 'US',
+        chatgpt_access_token_only_checkout_currency: String(cfg.chatgpt_access_token_only_checkout_currency || 'USD').trim().toUpperCase() || 'USD',
+        chatgpt_save_registration_access_token_account: false,
       })
     })
   }, [form])
+
+  useEffect(() => {
+    taskRef.current = task
+  }, [task])
 
   const stopPolling = () => {
     if (pollTimerRef.current != null) {
@@ -224,6 +262,22 @@ export default function RegisterTaskPage() {
         platform === 'chatgpt' && values.chatgpt_enable_team_invite
           ? Boolean(values.chatgpt_team_invite_deferred_activation)
           : undefined,
+      chatgpt_save_registration_access_token_account:
+        platform === 'chatgpt'
+          ? Boolean(values.chatgpt_save_registration_access_token_account)
+          : undefined,
+      chatgpt_access_token_only_checkout_amount_check_enabled:
+        platform === 'chatgpt'
+          ? Boolean(values.chatgpt_access_token_only_checkout_amount_check_enabled)
+          : undefined,
+      chatgpt_access_token_only_checkout_country:
+        platform === 'chatgpt'
+          ? String(values.chatgpt_access_token_only_checkout_country || 'US').trim().toUpperCase() || 'US'
+          : undefined,
+      chatgpt_access_token_only_checkout_currency:
+        platform === 'chatgpt'
+          ? String(values.chatgpt_access_token_only_checkout_currency || 'USD').trim().toUpperCase() || 'USD'
+          : undefined,
     }
     const chatgptRegistrationRequestAdapter =
       buildChatGPTRegistrationRequestAdapter(
@@ -277,6 +331,42 @@ export default function RegisterTaskPage() {
   const pollTask = async (id: string) => {
     stopPolling()
     setPolling(true)
+
+    const loadHistoryFallback = async (reason: string) => {
+      try {
+        const history = await apiFetch(`/tasks/logs/by-task/${encodeURIComponent(id)}`) as {
+          detail?: {
+            status_snapshot?: string
+            progress?: string
+            success?: number
+            skipped?: number
+            errors?: string[]
+            cashier_urls?: string[]
+          }
+          status?: string
+          error?: string
+          email?: string
+        }
+        const detail = history?.detail && typeof history.detail === 'object' ? history.detail : {}
+        const restoredTask = normalizeTaskSnapshot({
+          ...(taskRef.current || {}),
+          id,
+          status: mapHistoryTaskStatus(history.status, detail.status_snapshot),
+          progress: detail.progress || taskRef.current?.progress || '0/0',
+          skipped: detail.skipped ?? taskRef.current?.skipped ?? 0,
+          success: detail.success ?? taskRef.current?.success ?? 0,
+          errors: Array.isArray(detail.errors) ? detail.errors : (taskRef.current?.errors || []),
+          cashier_urls: Array.isArray(detail.cashier_urls) ? detail.cashier_urls : (taskRef.current?.cashier_urls || []),
+          error: history.error || taskRef.current?.error || (reason ? `${reason}，已切换到历史日志` : '已切换到历史日志'),
+        }, id)
+        setTask(restoredTask)
+        setPolling(false)
+        return true
+      } catch {
+        return false
+      }
+    }
+
     pollTimerRef.current = window.setInterval(async () => {
       try {
         const t = await apiFetch(`/tasks/${id}`)
@@ -289,8 +379,16 @@ export default function RegisterTaskPage() {
           }
         }
       } catch (error_: unknown) {
-        stopPolling()
         const detail = error_ instanceof Error ? error_.message : '获取任务状态失败'
+        const recovered = await loadHistoryFallback(detail)
+        if (recovered) {
+          stopPolling()
+          if (!taskRef.current?.status || !['done', 'failed', 'stopped'].includes(String(taskRef.current.status))) {
+            message.warning(detail)
+          }
+          return
+        }
+        stopPolling()
         setTask((previous: any) => normalizeTaskSnapshot({
           ...(previous || {}),
           id,
@@ -302,12 +400,52 @@ export default function RegisterTaskPage() {
     }, 2000)
   }
 
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    const saved = window.localStorage.getItem(REGISTER_TASK_STORAGE_KEY)
+    if (!saved) return
+
+    try {
+      const parsed = JSON.parse(saved)
+      const restoredTask = normalizeTaskSnapshot(parsed, parsed?.id)
+      if (!restoredTask?.id) return
+      setTask(restoredTask)
+      if (!['done', 'failed', 'stopped'].includes(String(restoredTask.status))) {
+        void pollTask(restoredTask.id)
+      }
+    } catch {
+      window.localStorage.removeItem(REGISTER_TASK_STORAGE_KEY)
+    }
+    // Restore only once on mount.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    if (!task?.id) return
+    const persistedTask = normalizeTaskSnapshot(task, task.id)
+    window.localStorage.setItem(REGISTER_TASK_STORAGE_KEY, JSON.stringify({
+      id: persistedTask?.id,
+      task_id: persistedTask?.task_id,
+      status: persistedTask?.status,
+      progress: persistedTask?.progress,
+      skipped: persistedTask?.skipped,
+      success: persistedTask?.success,
+      errors: persistedTask?.errors,
+      cashier_urls: persistedTask?.cashier_urls,
+      pending_verification: persistedTask?.pending_verification,
+      error: persistedTask?.error,
+    }))
+  }, [task])
+
   const mailProvider = Form.useWatch('mail_provider', form)
   const captchaSolver = Form.useWatch('captcha_solver', form)
   const platform = Form.useWatch('platform', form)
   const manualEmail = Form.useWatch('email', form)
   const executorOptions = getExecutorOptions(platform)
   const isManualEmailOtp = platform === 'chatgpt' && mailProvider === 'manual_email_otp'
+  const isRefreshTokenMode =
+    chatgptRegistrationMode === CHATGPT_REGISTRATION_MODE_REFRESH_TOKEN
 
   useEffect(() => {
     const currentExecutor = form.getFieldValue('executor_type')
@@ -324,7 +462,7 @@ export default function RegisterTaskPage() {
     }
     if (platform === 'chatgpt' && mailProvider === 'manual_email_otp') {
       form.setFieldsValue({ count: 1, concurrency: 1 })
-      const savedEmail = window.localStorage.getItem('any-auto-register.manual_email_otp.email') || ''
+      const savedEmail = window.localStorage.getItem('auto-chatgpt.manual_email_otp.email') || ''
       const currentEmail = String(form.getFieldValue('email') || '').trim()
       if (!currentEmail && savedEmail) {
         form.setFieldValue('email', savedEmail)
@@ -336,7 +474,7 @@ export default function RegisterTaskPage() {
     if (!isManualEmailOtp) return
     const normalizedEmail = String(manualEmail || '').trim()
     if (!normalizedEmail) return
-    window.localStorage.setItem('any-auto-register.manual_email_otp.email', normalizedEmail)
+    window.localStorage.setItem('auto-chatgpt.manual_email_otp.email', normalizedEmail)
   }, [isManualEmailOtp, manualEmail])
 
   useEffect(() => () => stopPolling(), [])
@@ -370,6 +508,7 @@ export default function RegisterTaskPage() {
         chatgpt_team_invite_deferred_activation: false,
         chatgpt_capture_business_workspace: true,
         chatgpt_capture_free_workspace: true,
+        chatgpt_save_registration_access_token_account: false,
         count: 1,
         concurrency: 1,
         register_delay_seconds: 0,
@@ -378,12 +517,8 @@ export default function RegisterTaskPage() {
         solver_url: 'http://localhost:8889',
       }}>
         <Card title="基本配置" style={{ marginBottom: 16 }}>
-          <Form.Item name="platform" label="平台" rules={[{ required: true }]}>
-            <Select
-              options={[
-                { value: 'chatgpt', label: 'ChatGPT' },
-              ]}
-            />
+          <Form.Item label="平台">
+            <Input value="ChatGPT" readOnly />
           </Form.Item>
           <Form.Item name="executor_type" label="执行器" rules={[{ required: true }]}>
             <Select options={executorOptions} />
@@ -398,7 +533,7 @@ export default function RegisterTaskPage() {
             />
           </Form.Item>
           <Space style={{ width: '100%' }}>
-            <Form.Item name="count" label="批量数量" style={{ flex: 1 }}>
+            <Form.Item name="count" label="目标成功数" style={{ flex: 1 }}>
               <Input type="number" min={1} disabled={isManualEmailOtp} />
             </Form.Item>
             <Form.Item name="concurrency" label="并发数" style={{ flex: 1 }}>
@@ -421,60 +556,107 @@ export default function RegisterTaskPage() {
                   onChange={setChatgptRegistrationMode}
                 />
               </Form.Item>
-              {chatgptRegistrationMode === CHATGPT_REGISTRATION_MODE_REFRESH_TOKEN ? (
-                <>
-                  <Form.Item
-                    label="工作空间抓取"
-                    extra="free 勾选独立生效；business 依赖 team invite。若两项都勾，会分别获取并按名称区分保存。"
-                  >
-                    <Space direction="vertical" size={6}>
-                      <Form.Item name="chatgpt_capture_free_workspace" valuePropName="checked" noStyle>
-                        <Checkbox>抓取 free 工作空间</Checkbox>
-                      </Form.Item>
-                    </Space>
-                  </Form.Item>
-                  <Form.Item
-                    name="chatgpt_enable_team_invite"
-                    valuePropName="checked"
-                    label="Business Team Invite"
-                    extra="关闭时走原始注册/登录链路；开启后才会进入 business recovery / team invite。"
-                  >
-                    <Checkbox>启用 team invite / business 恢复</Checkbox>
-                  </Form.Item>
-                  <Form.Item
-                    noStyle
-                    shouldUpdate={(prev, next) => prev.chatgpt_enable_team_invite !== next.chatgpt_enable_team_invite}
-                  >
-                    {({ getFieldValue }) =>
-                      getFieldValue('chatgpt_enable_team_invite') ? (
-                        <>
-                          <Form.Item
-                            name="chatgpt_team_invite_deferred_activation"
-                            valuePropName="checked"
-                            extra="开启后：先完成全部账号注册并发出邀请，再统一进入激活阶段；不会在单账号刚注册完时立刻进入 business/free。"
-                          >
-                            <Checkbox>延迟邀请（先统一发邀请，再统一激活）</Checkbox>
-                          </Form.Item>
-                          <Form.Item>
-                            <Space direction="vertical" size={6}>
-                              <Form.Item name="chatgpt_capture_business_workspace" valuePropName="checked" noStyle>
-                                <Checkbox>抓取 business 工作空间</Checkbox>
-                              </Form.Item>
-                            </Space>
-                          </Form.Item>
-                        </>
-                      ) : (
-                        <Alert
-                          type="info"
-                          showIcon
-                          message="当前关闭 team invite"
-                          description="普通模式下会直接走 free 主链；business 与延迟邀请配置在开启 team invite 后才生效。"
-                        />
-                      )
-                    }
-                  </Form.Item>
-                </>
+              {!isRefreshTokenMode ? (
+                <Alert
+                  type="warning"
+                  showIcon
+                  style={{ marginBottom: 12 }}
+                  message="当前为无 RT 方案"
+                  description="team invite / 延迟激活相关配置会保留，但无 RT 方案下可能无法完整生效。"
+                />
               ) : null}
+              {!isRefreshTokenMode ? (
+                <Form.Item
+                  name="chatgpt_access_token_only_checkout_amount_check_enabled"
+                  valuePropName="checked"
+                  extra="关闭后：仍生成订阅链接，但不做 checkout amount 额度校验，也不会因为额度结果跳过保存账号。"
+                >
+                  <Checkbox>启用额度验证</Checkbox>
+                </Form.Item>
+              ) : null}
+              {!isRefreshTokenMode ? (
+                <Space style={{ width: '100%' }}>
+                  <Form.Item
+                    name="chatgpt_access_token_only_checkout_country"
+                    label="额度验证国家"
+                    style={{ flex: 1 }}
+                    extra="无 RT 注册生成订阅链接并验证 amount 时使用。"
+                  >
+                    <Input placeholder="US" />
+                  </Form.Item>
+                  <Form.Item
+                    name="chatgpt_access_token_only_checkout_currency"
+                    label="额度验证货币"
+                    style={{ flex: 1 }}
+                    extra="默认 USD；留空会按国家推导。"
+                  >
+                    <Input placeholder="USD" />
+                  </Form.Item>
+                </Space>
+              ) : null}
+              {isRefreshTokenMode ? (
+                <Form.Item
+                  name="chatgpt_save_registration_access_token_account"
+                  valuePropName="checked"
+                  extra="开启后：注册阶段已拿到 AccessToken，但后续 refresh_token / 工作空间抓取失败时，也会保存一个 AccessToken-only 账号。"
+                >
+                  <Checkbox>保存注册阶段 AccessToken 账号</Checkbox>
+                </Form.Item>
+              ) : null}
+              <>
+                <Form.Item
+                  label="工作空间抓取"
+                  extra="free 勾选独立生效；business 依赖 team invite。若两项都勾，会分别获取并按名称区分保存。"
+                >
+                  <Space direction="vertical" size={6}>
+                    <Form.Item name="chatgpt_capture_free_workspace" valuePropName="checked" noStyle>
+                      <Checkbox>抓取 free 工作空间</Checkbox>
+                    </Form.Item>
+                  </Space>
+                </Form.Item>
+                <Form.Item
+                  name="chatgpt_enable_team_invite"
+                  valuePropName="checked"
+                  label="Business Team Invite"
+                  extra="关闭时走原始注册/登录链路；开启后才会进入 business recovery / team invite。"
+                >
+                  <Checkbox>启用 team invite / business 恢复</Checkbox>
+                </Form.Item>
+                <Form.Item
+                  noStyle
+                  shouldUpdate={(prev, next) => prev.chatgpt_enable_team_invite !== next.chatgpt_enable_team_invite}
+                >
+                  {({ getFieldValue }) => {
+                    const teamInviteEnabled = getFieldValue('chatgpt_enable_team_invite')
+                    return (
+                      <>
+                        <Form.Item
+                          name="chatgpt_team_invite_deferred_activation"
+                          valuePropName="checked"
+                          extra="开启后：先完成全部账号注册并发出邀请，再统一进入激活阶段；不会在单账号刚注册完时立刻进入 business/free。"
+                        >
+                          <Checkbox disabled={!teamInviteEnabled}>延迟邀请（先统一发邀请，再统一激活）</Checkbox>
+                        </Form.Item>
+                        <Form.Item>
+                          <Space direction="vertical" size={6}>
+                            <Form.Item name="chatgpt_capture_business_workspace" valuePropName="checked" noStyle>
+                              <Checkbox disabled={!teamInviteEnabled}>抓取 business 工作空间</Checkbox>
+                            </Form.Item>
+                          </Space>
+                        </Form.Item>
+                        {!teamInviteEnabled ? (
+                          <Alert
+                            type="info"
+                            showIcon
+                            message="当前关闭 team invite"
+                            description="普通模式下会直接走 free 主链；business 与延迟邀请配置在开启 team invite 后才生效。"
+                          />
+                        ) : null}
+                      </>
+                    )
+                  }}
+                </Form.Item>
+              </>
             </>
           )}
         </Card>
@@ -839,7 +1021,7 @@ export default function RegisterTaskPage() {
             <Descriptions.Item label="任务 ID">
               <Text copyable style={{ fontFamily: 'monospace' }}>{task.id}</Text>
             </Descriptions.Item>
-            <Descriptions.Item label="进度">{task.progress}</Descriptions.Item>
+            <Descriptions.Item label="成功进度">{task.progress}</Descriptions.Item>
             <Descriptions.Item label="跳过">{task.skipped ?? 0}</Descriptions.Item>
           </Descriptions>
           {task.success != null && (

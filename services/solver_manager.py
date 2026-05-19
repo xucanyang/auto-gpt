@@ -31,6 +31,14 @@ def _solver_browser_type() -> str:
     return os.getenv("SOLVER_BROWSER_TYPE", "camoufox")
 
 
+def _solver_max_browsers() -> int:
+    raw = str(os.getenv("SOLVER_MAX_BROWSERS", "4") or "4").strip()
+    try:
+        return max(int(raw), 1)
+    except Exception:
+        return 4
+
+
 def is_running() -> bool:
     try:
         r = requests.get(f"{_solver_url()}/", timeout=2)
@@ -62,6 +70,8 @@ def start():
                 solver_script,
                 "--browser_type",
                 _solver_browser_type(),
+                "--thread",
+                str(_solver_max_browsers()),
                 "--host",
                 _solver_bind_host(),
                 "--port",

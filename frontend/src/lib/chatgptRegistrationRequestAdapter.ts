@@ -21,6 +21,9 @@ class RefreshTokenChatGPTRegistrationRequestAdapter
       ...extra,
       chatgpt_registration_mode: this.mode,
       chatgpt_has_refresh_token_solution: true,
+      chatgpt_save_registration_access_token_account: Boolean(
+        extra.chatgpt_save_registration_access_token_account,
+      ),
     }
   }
 }

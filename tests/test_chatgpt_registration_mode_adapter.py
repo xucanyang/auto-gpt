@@ -1,7 +1,8 @@
 import unittest
+import types
 from unittest import mock
 
-from platforms.chatgpt.chatgpt_registration_mode_adapter import (
+from services.chatgpt_core.chatgpt_registration_mode_adapter import (
     CHATGPT_REGISTRATION_MODE_ACCESS_TOKEN_ONLY,
     CHATGPT_REGISTRATION_MODE_REFRESH_TOKEN,
     ChatGPTRegistrationContext,
@@ -55,6 +56,83 @@ class ChatGPTRegistrationModeAdapterTests(unittest.TestCase):
         )
         self.assertFalse(account.extra["chatgpt_has_refresh_token_solution"])
 
+    def test_build_account_propagates_checkout_skip_save_metadata(self):
+        adapter = build_chatgpt_registration_mode_adapter(
+            {"chatgpt_registration_mode": "access_token_only"}
+        )
+        result = type(
+            "Result",
+            (),
+            {
+                "email": "demo@example.com",
+                "password": "pw",
+                "account_id": "acct-demo",
+                "access_token": "at-demo",
+                "refresh_token": "",
+                "id_token": "",
+                "session_token": "session-demo",
+                "workspace_id": "ws-demo",
+                "source": "register",
+                "metadata": {
+                    "chatgpt_checkout_url": "https://chatgpt.com/checkout/openai_llc/cs_live_123",
+                    "chatgpt_checkout_amount": "34900000",
+                    "chatgpt_checkout_amount_is_zero": False,
+                    "chatgpt_skip_save_account": True,
+                    "chatgpt_skip_save_reason": "Plus checkout amount != 0",
+                },
+            },
+        )()
+
+        account = adapter.build_account(result, fallback_password="fallback")
+
+        self.assertTrue(account.extra["chatgpt_skip_save_account"])
+        self.assertEqual(account.extra["chatgpt_checkout_amount"], "34900000")
+        self.assertEqual(
+            account.extra["cashier_url"],
+            "https://chatgpt.com/checkout/openai_llc/cs_live_123",
+        )
+
+    def test_build_account_marks_registration_access_token_partial_auth(self):
+        adapter = build_chatgpt_registration_mode_adapter(
+            {"chatgpt_registration_mode": "refresh_token"}
+        )
+        result = type(
+            "Result",
+            (),
+            {
+                "email": "demo@example.com",
+                "password": "pw",
+                "account_id": "acct-demo",
+                "access_token": "at-demo",
+                "refresh_token": "",
+                "id_token": "",
+                "session_token": "session-demo",
+                "workspace_id": "acct-demo",
+                "source": "registration_session",
+                "metadata": {"registration_access_token_saved": True},
+                "workspace_artifacts": [
+                    {
+                        "scope": "free",
+                        "label": "registration_at",
+                        "account_id": "acct-demo",
+                        "workspace_id": "acct-demo",
+                        "access_token": "at-demo",
+                        "session_token": "session-demo",
+                        "source": "registration_session",
+                        "variant_key": "registration_at:acct-demo",
+                        "auth_level": "access_token_only",
+                        "partial_auth": True,
+                    }
+                ],
+            },
+        )()
+
+        account = adapter.build_account(result, fallback_password="fallback")
+
+        self.assertEqual(account.token, "at-demo")
+        self.assertEqual(account.status.value, "pending_payment")
+        self.assertEqual(account.extra["chatgpt_token_source"], "registration_session")
+
     def test_access_token_only_adapter_passes_runtime_context_to_engine(self):
         created = {}
 
@@ -83,9 +161,11 @@ class ChatGPTRegistrationModeAdapterTests(unittest.TestCase):
             extra_config={"register_max_retries": 5},
         )
 
-        with mock.patch(
-            "platforms.chatgpt.access_token_only_registration_engine.AccessTokenOnlyRegistrationEngine",
-            FakeEngine,
+        fake_module = types.ModuleType("services.chatgpt_core.access_token_only_registration_engine")
+        fake_module.AccessTokenOnlyRegistrationEngine = FakeEngine
+        with mock.patch.dict(
+            "sys.modules",
+            {"services.chatgpt_core.access_token_only_registration_engine": fake_module},
         ):
             adapter.run(context)
 

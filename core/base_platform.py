@@ -9,6 +9,8 @@ import time
 
 class AccountStatus(str, Enum):
     REGISTERED   = "registered"
+    PENDING_PAYMENT = "pending_payment"
+    PAYMENT_FAILED = "payment_failed"
     TRIAL        = "trial"
     SUBSCRIBED   = "subscribed"
     EXPIRED      = "expired"

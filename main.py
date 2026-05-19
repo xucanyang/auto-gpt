@@ -1,4 +1,4 @@
-"""account_manager - 多平台账号管理后台"""
+"""account_manager - ChatGPT 账号管理后台"""
 import os
 import sys
 from contextlib import asynccontextmanager
@@ -8,11 +8,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
 from core.db import init_db, recover_stuck_pending_business_invites
-from core.registry import load_all
 from api.accounts import router as accounts_router
 from api.chatgpt import router as chatgpt_router
 from api.tasks import router as tasks_router
-from api.platforms import router as platforms_router
 from api.proxies import router as proxies_router
 from api.config import router as config_router
 from api.actions import router as actions_router
@@ -21,8 +19,21 @@ from api.auth import router as auth_router
 from api.outlook import router as outlook_router
 from api.contribution import router as contribution_router
 from api.team_lite import router as team_lite_router
+from api.icloud_hme import router as icloud_hme_router
+from api.pipeline import router as pipeline_router
+from services.chatgpt_core import ChatGPTPlatform
+from services.pipeline import pipeline_engine
 
-EXPECTED_CONDA_ENV = os.getenv("APP_CONDA_ENV", "any-auto-register")
+EXPECTED_CONDA_ENV = os.getenv("APP_CONDA_ENV", "auto-chatgpt")
+PUBLIC_API_PATHS = {
+    "/api/chatgpt/export-sub2api-download",
+    "/api/integrations/gopay-otp/admin",
+    "/api/integrations/gopay-otp/smsforwarder",
+}
+
+TOKEN_QUERY_API_PATHS = {
+    "/api/pipeline/logs/stream",
+}
 
 
 def _detect_conda_env() -> str:
@@ -61,19 +72,29 @@ async def lifespan(app: FastAPI):
     _print_runtime_info()
     init_db()
     recovered_pending = recover_stuck_pending_business_invites()
-    load_all()
     print("[OK] 数据库初始化完成")
     if recovered_pending:
         print(f"[OK] 已恢复 {recovered_pending} 条中断的 pending invite 激活记录")
-    from core.registry import list_platforms
-    print(f"[OK] 已加载平台: {[p['name'] for p in list_platforms()]}")
+    print(f"[OK] 已加载核心模块: {[ChatGPTPlatform.name]}")
     from core.scheduler import scheduler
     scheduler.start()
+    from services.icloud_hme_auto_pool import start as start_icloud_hme_auto_pool
+    start_icloud_hme_auto_pool()
     from services.solver_manager import start_async
     start_async()
+    try:
+        pipeline_engine.restore_or_start()
+    except Exception as exc:
+        print(f"[WARN] 自动流水线恢复/启动失败: {exc}")
     yield
     from core.scheduler import scheduler as _scheduler
     _scheduler.stop()
+    from services.icloud_hme_auto_pool import stop as stop_icloud_hme_auto_pool
+    stop_icloud_hme_auto_pool()
+    try:
+        pipeline_engine.stop()
+    except Exception:
+        pass
     from services.solver_manager import stop
     stop()
 
@@ -84,17 +105,24 @@ app = FastAPI(title="Account Manager", version="1.0.0", lifespan=lifespan)
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
     path = request.url.path
+    if path in PUBLIC_API_PATHS:
+        return await call_next(request)
     if path.startswith("/api/auth/") or not path.startswith("/api/"):
         return await call_next(request)
     from core.config_store import config_store as _cs
     if not _cs.get("auth_password_hash", ""):
         return await call_next(request)
     auth_header = request.headers.get("Authorization", "")
-    if not auth_header.startswith("Bearer "):
+    token = ""
+    if auth_header.startswith("Bearer "):
+        token = auth_header[7:]
+    elif path in TOKEN_QUERY_API_PATHS:
+        token = str(request.query_params.get("access_token") or "").strip()
+    if not token:
         return JSONResponse({"detail": "未认证，请先登录"}, status_code=401)
     try:
         from api.auth import verify_token
-        verify_token(auth_header[7:])
+        verify_token(token)
     except HTTPException as e:
         return JSONResponse({"detail": e.detail}, status_code=e.status_code)
     return await call_next(request)
@@ -110,7 +138,6 @@ app.add_middleware(
 app.include_router(accounts_router, prefix="/api")
 app.include_router(chatgpt_router, prefix="/api")
 app.include_router(tasks_router, prefix="/api")
-app.include_router(platforms_router, prefix="/api")
 app.include_router(proxies_router, prefix="/api")
 app.include_router(config_router, prefix="/api")
 app.include_router(actions_router, prefix="/api")
@@ -119,6 +146,8 @@ app.include_router(auth_router, prefix="/api")
 app.include_router(outlook_router, prefix="/api")
 app.include_router(contribution_router, prefix="/api")
 app.include_router(team_lite_router, prefix="/api")
+app.include_router(icloud_hme_router, prefix="/api")
+app.include_router(pipeline_router, prefix="/api")
 
 
 @app.get("/api/solver/status")

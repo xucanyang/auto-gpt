@@ -9,7 +9,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from platforms.chatgpt.status_probe import CODEX_USER_AGENT, extract_chatgpt_account_id
+from services.chatgpt_core.status_probe import CODEX_USER_AGENT, extract_chatgpt_account_id
 from services.chatgpt_account_state import is_account_deactivated_message
 
 DEFAULT_CLIPROXYAPI_BASE_URL = "http://127.0.0.1:8317"

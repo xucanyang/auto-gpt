@@ -8,7 +8,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from platforms.chatgpt.sentinel_batch import (  # noqa: E402
+from services.chatgpt_core.sentinel_batch import (  # noqa: E402
     ConfigResolver,
     SentinelBatchService,
     write_batch_result,

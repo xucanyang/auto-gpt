@@ -179,6 +179,14 @@ def delete_team_member(team_id: int, body: TeamMemberDeleteRequest):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@router.post("/teams/{team_id}/members/delete-all")
+def delete_all_team_members(team_id: int):
+    try:
+        return team_lite_service.delete_all_members(team_id)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.get("/teams/{team_id}/members/check")
 def check_team_member(
     team_id: int,

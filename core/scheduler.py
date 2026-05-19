@@ -2,8 +2,8 @@
 from datetime import datetime, timezone
 from sqlmodel import Session, select
 from .db import engine, AccountModel
-from .registry import get, load_all
 from .base_platform import Account, AccountStatus, RegisterConfig
+from services.chatgpt_core import ChatGPTPlatform
 import threading
 import time
 
@@ -75,7 +75,6 @@ class Scheduler:
 
     def check_accounts_valid(self, platform: str = None, limit: int = 50):
         """批量检测账号有效性"""
-        load_all()
         with Session(engine) as s:
             q = select(AccountModel).where(
                 AccountModel.status.in_(["registered", "trial", "subscribed"])
@@ -87,8 +86,9 @@ class Scheduler:
         results = {"valid": 0, "invalid": 0, "error": 0}
         for acc in accounts:
             try:
-                PlatformCls = get(acc.platform)
-                plugin = PlatformCls(config=RegisterConfig())
+                if acc.platform != "chatgpt":
+                    continue
+                plugin = ChatGPTPlatform(config=RegisterConfig())
                 import json
                 account_obj = Account(
                     platform=acc.platform,
@@ -103,8 +103,6 @@ class Scheduler:
                 with Session(engine) as s:
                     a = s.get(AccountModel, acc.id)
                     if a:
-                        if acc.platform != "chatgpt":
-                            a.status = acc.status if valid else AccountStatus.INVALID.value
                         a.updated_at = datetime.now(timezone.utc)
                         s.add(a)
                         s.commit()

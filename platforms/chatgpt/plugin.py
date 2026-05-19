@@ -94,10 +94,48 @@ class ChatGPTPlatform(BasePlatform):
                     self._mailbox = _mailbox
                     self._last_verification_result = {}
 
+                def _can_reuse_current_account(self) -> bool:
+                    acct = self._acct
+                    if not acct:
+                        return False
+                    account_email = str(getattr(acct, "email", "") or "").strip()
+                    if not account_email:
+                        return False
+                    get_current_ids = getattr(_mailbox, "get_current_ids", None)
+                    if callable(get_current_ids):
+                        try:
+                            self._before_ids = set(get_current_ids(acct) or [])
+                        except Exception:
+                            return False
+                    return True
+
+                def _reuse_existing_email_payload(self):
+                    if not self._can_reuse_current_account():
+                        return None
+                    generated_email = str(getattr(self._acct, "email", "") or "").strip()
+                    if not self._email or not _fixed_email:
+                        self._email = _resolve_email(generated_email)
+                    return {
+                        "email": self._email,
+                        "service_id": str(getattr(self._acct, "account_id", "") or ""),
+                        "token": "",
+                        "mailbox_action": "reused_existing",
+                    }
+
                 def create_email(self, config=None):
-                    if self._email and self._acct and _fixed_email:
-                        return {"email": self._email, "service_id": self._acct.account_id, "token": ""}
-                    self._acct = _mailbox.get_email()
+                    reused = self._reuse_existing_email_payload()
+                    if reused:
+                        return reused
+
+                    try:
+                        self._acct = _mailbox.get_email()
+                    except Exception:
+                        reused_after_error = self._reuse_existing_email_payload()
+                        if reused_after_error:
+                            reused_after_error["mailbox_action"] = "recovered_after_create_error"
+                            return reused_after_error
+                        raise
+
                     get_current_ids = getattr(_mailbox, "get_current_ids", None)
                     if callable(get_current_ids):
                         self._before_ids = set(get_current_ids(self._acct) or [])
@@ -108,7 +146,12 @@ class ChatGPTPlatform(BasePlatform):
                         self._email = _resolve_email(generated_email)
                     elif not _fixed_email:
                         self._email = _resolve_email(generated_email)
-                    return {"email": self._email, "service_id": self._acct.account_id, "token": ""}
+                    return {
+                        "email": self._email,
+                        "service_id": self._acct.account_id,
+                        "token": "",
+                        "mailbox_action": "created",
+                    }
 
                 def get_verification_code(
                     self,
@@ -173,14 +216,51 @@ class ChatGPTPlatform(BasePlatform):
                     self._mailbox = _tmail
                     self._last_verification_result = {}
 
+                def _can_reuse_current_account(self) -> bool:
+                    acct = self._acct
+                    if not acct:
+                        return False
+                    account_email = str(getattr(acct, "email", "") or "").strip()
+                    if not account_email:
+                        return False
+                    try:
+                        self._before_ids = set(_tmail.get_current_ids(acct) or [])
+                    except Exception:
+                        return False
+                    return True
+
                 def create_email(self, config=None):
-                    acct = _tmail.get_email()
+                    if self._can_reuse_current_account():
+                        return {
+                            "email": str(getattr(self._acct, "email", "") or "").strip(),
+                            "service_id": str(getattr(self._acct, "account_id", "") or ""),
+                            "token": str(getattr(self._acct, "account_id", "") or ""),
+                            "mailbox_action": "reused_existing",
+                        }
+
+                    try:
+                        acct = _tmail.get_email()
+                    except Exception:
+                        if self._can_reuse_current_account():
+                            return {
+                                "email": str(getattr(self._acct, "email", "") or "").strip(),
+                                "service_id": str(getattr(self._acct, "account_id", "") or ""),
+                                "token": str(getattr(self._acct, "account_id", "") or ""),
+                                "mailbox_action": "recovered_after_create_error",
+                            }
+                        raise
+
                     self._acct = acct
                     self._before_ids = set(_tmail.get_current_ids(acct) or [])
                     resolved_email = str(getattr(acct, "email", "") or "").strip()
                     if not resolved_email:
                         raise RuntimeError("tempmail_lol 返回空邮箱地址")
-                    return {"email": resolved_email, "service_id": acct.account_id, "token": acct.account_id}
+                    return {
+                        "email": resolved_email,
+                        "service_id": acct.account_id,
+                        "token": acct.account_id,
+                        "mailbox_action": "created",
+                    }
 
                 def get_verification_code(
                     self,
@@ -262,12 +342,14 @@ class ChatGPTPlatform(BasePlatform):
             {"id": "refresh_token", "label": "刷新 Token", "params": []},
             {
                 "id": "payment_link",
-                "label": "生成支付链接",
+                "label": "生成订阅链接",
                 "params": [
-                    {"key": "country", "label": "地区", "type": "select", "options": ["US", "SG", "TR", "HK", "JP", "GB", "AU", "CA"]},
                     {"key": "plan", "label": "套餐", "type": "select", "options": ["plus", "team"]},
+                    {"key": "country", "label": "地区", "type": "checkout_country", "default": "ID"},
+                    {"key": "currency", "label": "货币", "type": "text", "default": "IDR"},
                 ],
             },
+            {"id": "resume_subscription_auth", "label": "补抓Auth", "params": []},
             {
                 "id": "upload_cpa",
                 "label": "上传 CPA",
@@ -318,6 +400,8 @@ class ChatGPTPlatform(BasePlatform):
         a.client_id = extra.get("client_id", "app_EMoamEEZ73f0CkXaXp7hrann")
         a.cookies = extra.get("cookies", "")
         a.user_id = account.user_id
+        a.workspace_id = extra.get("workspace_id", "")
+        a.extra = extra
 
         if action_id == "probe_local_status":
             from platforms.chatgpt.status_probe import probe_local_chatgpt_status
@@ -404,10 +488,22 @@ class ChatGPTPlatform(BasePlatform):
         if action_id == "payment_link":
             from platforms.chatgpt.payment import generate_plus_link, generate_team_link
 
-            plan = params.get("plan", "plus")
-            country = params.get("country", "US")
+            plan = str(params.get("plan") or "plus").strip().lower()
+            if plan not in {"plus", "team"}:
+                plan = "plus"
+            country = str(params.get("country") or "ID").strip().upper() or "ID"
+            currency = str(params.get("currency") or "IDR").strip().upper() or "IDR"
+            billing = {
+                "name": str(params.get("billing_name") or "").strip(),
+                "email": str(params.get("billing_email") or getattr(a, "email", "") or "").strip(),
+                "country": str(params.get("billing_country") or country).strip().upper() or country,
+                "line1": str(params.get("billing_line1") or "").strip(),
+                "city": str(params.get("billing_city") or "").strip(),
+                "state": str(params.get("billing_state") or "").strip(),
+                "postal_code": str(params.get("billing_postal_code") or "").strip(),
+            }
             if plan == "plus":
-                url = generate_plus_link(a, proxy=proxy, country=country)
+                url = generate_plus_link(a, proxy=proxy, country=country, currency=currency, billing=billing)
             else:
                 url = generate_team_link(
                     a,
@@ -416,11 +512,27 @@ class ChatGPTPlatform(BasePlatform):
                     seat_quantity=int(params.get("seat_quantity", 5) or 5),
                     proxy=proxy,
                     country=country,
+                    currency=currency,
+                    billing=billing,
                 )
-            return {"ok": bool(url), "data": {"url": url}}
+            return {"ok": bool(url), "data": {"url": url, "plan": plan, "country": country, "currency": currency, "billing": billing}}
+
+        if action_id == "resume_subscription_auth":
+            return {
+                "ok": True,
+                "data": {
+                    "message": "已提交补抓 Auth 请求",
+                    "activation_kind": "subscription_auth",
+                },
+            }
 
         if action_id == "upload_cpa":
             from platforms.chatgpt.cpa_upload import generate_token_json, upload_to_cpa
+            from services.chatgpt_account_state import is_chatgpt_upload_ready
+
+            ready, gate_msg, _capabilities = is_chatgpt_upload_ready(a)
+            if not ready:
+                return {"ok": False, "data": gate_msg, "error": gate_msg}
 
             token_data = generate_token_json(a)
             ok, msg = upload_to_cpa(
@@ -432,6 +544,11 @@ class ChatGPTPlatform(BasePlatform):
 
         if action_id == "upload_sub2api":
             from platforms.chatgpt.sub2api_upload import upload_to_sub2api
+            from services.chatgpt_account_state import is_chatgpt_upload_ready
+
+            ready, gate_msg, _capabilities = is_chatgpt_upload_ready(a)
+            if not ready:
+                return {"ok": False, "data": gate_msg, "error": gate_msg}
 
             ok, msg = upload_to_sub2api(
                 a,
@@ -442,6 +559,11 @@ class ChatGPTPlatform(BasePlatform):
 
         if action_id == "upload_tm":
             from platforms.chatgpt.cpa_upload import upload_to_team_manager
+            from services.chatgpt_account_state import is_chatgpt_upload_ready
+
+            ready, gate_msg, _capabilities = is_chatgpt_upload_ready(a)
+            if not ready:
+                return {"ok": False, "data": gate_msg, "error": gate_msg}
 
             ok, msg = upload_to_team_manager(
                 a,
@@ -451,6 +573,12 @@ class ChatGPTPlatform(BasePlatform):
             return {"ok": ok, "data": msg}
 
         if action_id == "upload_codex_proxy":
+            from services.chatgpt_account_state import is_chatgpt_upload_ready
+
+            ready, gate_msg, _capabilities = is_chatgpt_upload_ready(a)
+            if not ready:
+                return {"ok": False, "data": gate_msg, "error": gate_msg}
+
             upload_type = str(
                 params.get("upload_type")
                 or (self.config.extra or {}).get("codex_proxy_upload_type")

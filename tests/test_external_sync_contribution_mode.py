@@ -10,7 +10,14 @@ class DummyAccount:
         self.platform = platform
         self.email = email
         self.token = token
-        self.extra = dict(extra or {})
+        self.user_id = "acct-demo"
+        defaults = {
+            "access_token": token,
+            "refresh_token": "rt-token",
+            "workspace_id": "ws-demo",
+        }
+        defaults.update(dict(extra or {}))
+        self.extra = defaults
         self.id = None
 
     def get_extra(self):
@@ -124,6 +131,8 @@ class ExternalSyncContributionModeTests(unittest.TestCase):
             token="at-token",
             status="registered",
         )
+        account.user_id = "acct-demo"
+        account.set_extra({"access_token": "at-token", "refresh_token": "rt-token", "workspace_id": "ws-demo"})
         db_account = AccountModel(
             id=7,
             platform="chatgpt",
@@ -132,6 +141,8 @@ class ExternalSyncContributionModeTests(unittest.TestCase):
             token="at-token",
             status="registered",
         )
+        db_account.user_id = "acct-demo"
+        db_account.set_extra({"access_token": "at-token", "refresh_token": "rt-token", "workspace_id": "ws-demo"})
 
         class _ExecResult:
             def first(self):

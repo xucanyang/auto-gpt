@@ -140,7 +140,15 @@ class TeamEmbeddedBackend:
         return self._run(_collect)
 
     def get_team_info(self, team_id: int) -> dict[str, Any]:
-        return self._run(lambda team_service, session: team_service.get_team_by_id(int(team_id), session))
+        async def _get(team_service, session):
+            getter = getattr(team_service, "get_team_by_id", None)
+            if callable(getter):
+                return await getter(int(team_id), session)
+            fallback = getattr(team_service, "get_team_info", None)
+            if callable(fallback):
+                return await fallback(int(team_id), session)
+            raise AttributeError("TeamService 缺少 get_team_by_id/get_team_info")
+        return self._run(_get)
 
     def update_team(self, team_id: int, payload: dict[str, Any]) -> dict[str, Any]:
         return self._run(

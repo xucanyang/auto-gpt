@@ -712,6 +712,7 @@ class TeamLiteService:
                     "refresh_token": payload.get("refresh_token"),
                     "session_token": payload.get("session_token"),
                     "client_id": payload.get("client_id"),
+                    "max_members": 20,
                 },
             )
             if not result.get("success"):
@@ -802,6 +803,99 @@ class TeamLiteService:
         result = team_embedded_backend.delete_team_member(int(team_id), normalized_user_id)
         self._invalidate_live_member_cache(team_id)
         return result
+
+    def delete_members(self, team_id: int, user_ids: Any) -> dict[str, Any]:
+        """Delete multiple joined members, preserving legacy caller compatibility."""
+        if isinstance(user_ids, str):
+            normalized_user_ids = [user_ids.strip()]
+        else:
+            normalized_user_ids = []
+            for item in list(user_ids or []):
+                if isinstance(item, dict):
+                    item = item.get("user_id") or item.get("id")
+                normalized_user_ids.append(str(item or "").strip())
+        normalized_user_ids = [item for item in normalized_user_ids if item]
+        if not normalized_user_ids:
+            raise RuntimeError("请选择至少一个成员")
+
+        deleted_count = 0
+        failed_items: list[str] = []
+        for user_id in normalized_user_ids:
+            result = self.delete_member(team_id, user_id)
+            if result.get("success"):
+                deleted_count += 1
+            else:
+                failed_items.append(f"删除成员 {user_id} 失败: {result.get('error') or 'unknown'}")
+
+        self._invalidate_live_member_cache(team_id)
+        message = f"已删除 {deleted_count} 个成员"
+        if failed_items:
+            message += f"，失败 {len(failed_items)} 项"
+        return {
+            "success": len(failed_items) == 0,
+            "message": message,
+            "deleted_count": deleted_count,
+            "failed_count": len(failed_items),
+            "failed_items": failed_items,
+            "error": None if not failed_items else "；".join(failed_items[:5]),
+        }
+
+    def delete_all_members(self, team_id: int) -> dict[str, Any]:
+        members_result = self.get_team_members(team_id)
+        if not members_result.get("success"):
+            return members_result
+
+        members = list(members_result.get("members") or [])
+        removable_joined = [
+            item for item in members
+            if str(item.get("status") or "").strip().lower() == "joined"
+            and str(item.get("role") or "").strip().lower() != "account-owner"
+            and str(item.get("user_id") or "").strip()
+        ]
+        removable_invites = [
+            item for item in members
+            if str(item.get("status") or "").strip().lower() == "invited"
+            and str(item.get("email") or "").strip()
+        ]
+
+        deleted_count = 0
+        revoked_count = 0
+        joined_count = len([item for item in members if str(item.get("status") or "").strip().lower() == "joined"])
+        skipped_owner_count = max(0, joined_count - len(removable_joined))
+        failed_items: list[str] = []
+
+        for item in removable_joined:
+            user_id = str(item.get("user_id") or "").strip()
+            email = str(item.get("email") or user_id).strip()
+            result = self.delete_member(team_id, user_id)
+            if result.get("success"):
+                deleted_count += 1
+            else:
+                failed_items.append(f"删除成员 {email} 失败: {result.get('error') or 'unknown'}")
+
+        for item in removable_invites:
+            email = str(item.get("email") or "").strip()
+            result = self.revoke_invite(team_id, email)
+            if result.get("success"):
+                revoked_count += 1
+            else:
+                failed_items.append(f"撤回邀请 {email} 失败: {result.get('error') or 'unknown'}")
+
+        self._invalidate_live_member_cache(team_id)
+        message = f"已删除 {deleted_count} 个成员，已撤回 {revoked_count} 个邀请"
+        if skipped_owner_count > 0:
+            message += f"，保留 {skipped_owner_count} 个 Owner"
+        if failed_items:
+            message += f"，失败 {len(failed_items)} 项"
+        return {
+            "success": len(failed_items) == 0,
+            "message": message,
+            "deleted_count": deleted_count,
+            "revoked_count": revoked_count,
+            "skipped_owner_count": skipped_owner_count,
+            "failed_items": failed_items,
+            "error": None if not failed_items else "；".join(failed_items[:5]),
+        }
 
     def check_member(self, team_id: int, email: str, *, force: bool = False) -> dict[str, Any]:
         normalized_email = str(email or "").strip().lower()

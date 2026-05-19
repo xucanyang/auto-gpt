@@ -3,6 +3,7 @@ import os
 import re
 from pathlib import Path
 from typing import Optional
+from sqlalchemy.exc import OperationalError
 from sqlmodel import Field, SQLModel, Session, select
 from .db import engine
 
@@ -124,11 +125,14 @@ class ConfigStore:
 
     def get(self, key: str, default: str = "") -> str:
         env_values = _runtime_env_values()
-        with Session(engine) as s:
-            item = s.get(ConfigItem, key)
-            value = str(item.value if item else "" or "").strip()
-            if value:
-                return value
+        try:
+            with Session(engine) as s:
+                item = s.get(ConfigItem, key)
+                value = str(item.value if item else "" or "").strip()
+                if value:
+                    return value
+        except OperationalError:
+            pass
         fallback = _get_env_fallback_value(key, env_values=env_values)
         return fallback or default
 
@@ -143,9 +147,12 @@ class ConfigStore:
             s.commit()
 
     def get_all(self) -> dict:
-        with Session(engine) as s:
-            items = s.exec(select(ConfigItem)).all()
-            values = {i.key: i.value for i in items}
+        try:
+            with Session(engine) as s:
+                items = s.exec(select(ConfigItem)).all()
+                values = {i.key: i.value for i in items}
+        except OperationalError:
+            values = {}
         return _merge_env_fallback(values)
 
     def set_many(self, data: dict) -> None:

@@ -9,6 +9,7 @@ from sqlmodel import Session
 
 from core.db import AccountModel, engine
 from services.chatgpt_account_state import apply_chatgpt_status_policy
+from services.chatgpt_account_state import classify_chatgpt_capabilities, is_chatgpt_upload_ready
 
 CPA_SYNC_NAME = "cpa"
 CLIPROXY_SYNC_NAME = "cliproxyapi"
@@ -134,11 +135,14 @@ def build_chatgpt_sync_account(account: Any):
 
 def upload_chatgpt_account_to_cpa(account: Any, api_url: str | None = None, api_key: str | None = None) -> tuple[bool, str]:
     try:
+        ready, gate_msg, _capabilities = is_chatgpt_upload_ready(account)
+        if not ready:
+            return False, gate_msg
         sync_account = build_chatgpt_sync_account(account)
         if not getattr(sync_account, "access_token", ""):
             return False, "账号缺少 access_token"
 
-        from platforms.chatgpt.cpa_upload import generate_token_json, upload_to_cpa
+        from services.chatgpt_core.cpa_upload import generate_token_json, upload_to_cpa
 
         token_data = generate_token_json(sync_account)
         return upload_to_cpa(token_data, api_url=api_url, api_key=api_key)
@@ -173,6 +177,7 @@ def update_account_model_cliproxy_sync(
 ) -> dict[str, Any]:
     extra = account.get_extra()
     state = record_cliproxy_sync_result(extra, sync_result)
+    extra["chatgpt_capabilities"] = classify_chatgpt_capabilities(account, remote_sync=sync_result)
     account.set_extra(extra)
     apply_chatgpt_status_policy(account, remote_sync=sync_result)
     account.updated_at = _utcnow()
@@ -192,6 +197,7 @@ def update_account_model_local_probe(
 ) -> dict[str, Any]:
     extra = account.get_extra()
     extra["chatgpt_local"] = probe
+    extra["chatgpt_capabilities"] = classify_chatgpt_capabilities(account, local_probe=probe)
     account.set_extra(extra)
     apply_chatgpt_status_policy(account, local_probe=probe)
     account.updated_at = _utcnow()
@@ -238,8 +244,8 @@ def _remote_auth_missing(sync_result: dict[str, Any]) -> bool:
 
 
 def _local_probe_uploadable(probe: dict[str, Any]) -> bool:
-    auth = probe.get("auth") if isinstance(probe.get("auth"), dict) else {}
-    return str(auth.get("state") or "").strip() in {"refresh_token_valid", "access_token_valid"}
+    auth = probe.get("auth") if isinstance((probe or {}).get("auth"), dict) else {}
+    return str(auth.get("state") or "").strip() == "refresh_token_valid"
 
 
 def _remote_state_label(sync_result: dict[str, Any]) -> str:
@@ -255,14 +261,32 @@ def backfill_chatgpt_account_to_cpa(
     api_key: str | None = None,
     commit: bool = True,
 ) -> dict[str, Any]:
-    from platforms.chatgpt.status_probe import probe_local_chatgpt_status
+    from services.chatgpt_core.status_probe import probe_local_chatgpt_status
     from services.cliproxyapi_sync import sync_chatgpt_cliproxyapi_status
 
     api_url, api_key = _resolve_cliproxy_target(api_url=api_url, api_key=api_key)
     results: list[dict[str, Any]] = []
     cached_sync = get_cliproxy_sync_state(account)
+    cached_remote_state = str(cached_sync.get("remote_state") or "").strip().lower()
+
+    if cached_sync and cached_remote_state != "unreachable" and not _remote_auth_missing(cached_sync):
+        msg = f"远端已存在 ({_remote_state_label(cached_sync)})，跳过上传"
+        results.append({"name": "CLIProxyAPI 同步", "ok": True, "msg": msg})
+        if session is not None and commit:
+            session.commit()
+            session.refresh(account)
+        return {"ok": True, "uploaded": False, "skipped": True, "message": msg, "results": results}
+
+    preflight_ready, preflight_msg, _preflight_capabilities = is_chatgpt_upload_ready(account)
+    if not preflight_ready:
+        results.append({"name": "上传闸门", "ok": False, "msg": preflight_msg})
+        if session is not None and commit:
+            session.commit()
+            session.refresh(account)
+        return {"ok": False, "uploaded": False, "skipped": True, "message": preflight_msg, "results": results}
+
     initial_sync = cached_sync if cached_sync else {}
-    used_cached_sync = bool(cached_sync) and str(cached_sync.get("remote_state") or "").strip().lower() != "unreachable"
+    used_cached_sync = bool(cached_sync) and cached_remote_state != "unreachable"
 
     if not used_cached_sync:
         sync_account = build_chatgpt_sync_account(account)
@@ -289,9 +313,10 @@ def backfill_chatgpt_account_to_cpa(
     sync_account = build_chatgpt_sync_account(account)
     probe = probe_local_chatgpt_status(sync_account, proxy=None)
     update_account_model_local_probe(account, probe, session=session, commit=False)
-    if not _local_probe_uploadable(probe):
+    ready, gate_msg, _capabilities = is_chatgpt_upload_ready(account, local_probe=probe)
+    if not ready:
         auth = probe.get("auth") if isinstance(probe.get("auth"), dict) else {}
-        msg = auth.get("message") or f"本地状态不可上传: {auth.get('state') or 'unknown'}"
+        msg = gate_msg or auth.get("message") or f"本地状态不可上传: {auth.get('state') or 'unknown'}"
         results.append({"name": "本地状态探测", "ok": False, "msg": msg})
         if session is not None and commit:
             session.commit()

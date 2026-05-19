@@ -68,7 +68,7 @@ const LIVE_SYNC_META: Record<string, { label: string; color: string; description
   live: {
     label: '实时',
     color: 'success',
-    description: '本次列表直接从 any-auto-register-local 内嵌 Team 运行时同步。',
+    description: '本次列表直接从 auto-chatgpt 内嵌 Team 运行时同步。',
   },
   cached: {
     label: '缓存',
@@ -153,6 +153,7 @@ export default function Teams() {
   const [currentTeam, setCurrentTeam] = useState<any>(null)
 
   const [deletingTeamId, setDeletingTeamId] = useState<number | null>(null)
+  const [clearingMembers, setClearingMembers] = useState(false)
   const [quickInviting, setQuickInviting] = useState(false)
 
   const [inviteOpen, setInviteOpen] = useState(false)
@@ -619,26 +620,54 @@ export default function Teams() {
     }
   }
 
-  const removeMember = async (userId: string) => {
-    if (!currentTeam?.id || !userId) return
-    const key = `${currentTeam.id}:${userId}:delete`
-    setMemberActionLoading((prev) => ({ ...prev, [key]: true }))
-    try {
-      const result = await apiFetch(`/team-lite/teams/${currentTeam.id}/members/delete`, {
-        method: 'POST',
-        body: JSON.stringify({ user_id: userId }),
-      })
-      messageApi.success(result.message || '成员已删除')
-      await openMembers(currentTeam)
-      await loadTeams(page, pageSize, search, status)
-    } catch (error: any) {
-      messageApi.error(error.message || '删除成员失败')
-    } finally {
-      setMemberActionLoading((prev) => ({ ...prev, [key]: false }))
-    }
-  }
 
-  const settings = Form.useWatch([], settingsForm)
+const removeMember = async (userId: string) => {
+  if (!currentTeam?.id || !userId) return
+  const key = `${currentTeam.id}:${userId}:delete`
+  setMemberActionLoading((prev) => ({ ...prev, [key]: true }))
+  try {
+    const result = await apiFetch(`/team-lite/teams/${currentTeam.id}/members/delete`, {
+      method: 'POST',
+      body: JSON.stringify({ user_id: userId }),
+    })
+    messageApi.success(result.message || '成员已删除')
+    await openMembers(currentTeam)
+    await loadTeams(page, pageSize, search, status)
+  } catch (error: any) {
+    messageApi.error(error.message || '删除成员失败')
+  } finally {
+    setMemberActionLoading((prev) => ({ ...prev, [key]: false }))
+  }
+}
+
+const clearAllMembers = async () => {
+  if (!currentTeam?.id) return
+  modal.confirm({
+    title: `清空 ${compactText(currentTeam.team_name, `Team #${currentTeam.id}`)} 成员`,
+    content: `将删除 ${memberSummary.joined} 个已 joined 成员，并撤回 ${memberSummary.invited} 个邀请。Owner 会被保留。`,
+    okText: '立即清空',
+    okButtonProps: { danger: true, loading: clearingMembers },
+    cancelText: '取消',
+    onOk: async () => {
+      setClearingMembers(true)
+      try {
+        const result = await apiFetch(`/team-lite/teams/${currentTeam.id}/members/delete-all`, {
+          method: 'POST',
+        })
+        messageApi.success(result.message || '已清空成员')
+        await openMembers(currentTeam)
+        await loadTeams(page, pageSize, search, status)
+      } catch (error: any) {
+        messageApi.error(error.message || '清空成员失败')
+        throw error
+      } finally {
+        setClearingMembers(false)
+      }
+    },
+  })
+}
+
+const settings = Form.useWatch([], settingsForm)
   const missingConnection = !String(settings?.team_manager_db_path || '').trim()
   const importType = Form.useWatch('import_type', importForm) || 'batch'
 
@@ -947,7 +976,7 @@ export default function Teams() {
                 type="info"
                 showIcon
                 message="当前已切到 local-only 模式"
-                description="Team 列表、导入、邀请、成员同步都直接走 any-auto-register-local 内嵌运行时，不再依赖 team-manager 对外 API。"
+                description="Team 列表、导入、邀请、成员同步都直接走 auto-chatgpt 内嵌运行时，不再依赖 team-manager 对外 API。"
               />
             </Col>
             <Col xs={24} md={8}>
@@ -1037,6 +1066,9 @@ export default function Teams() {
         width={920}
         extra={currentTeam ? (
           <Space>
+            <Button icon={<DeleteOutlined />} danger loading={clearingMembers} onClick={clearAllMembers}>
+              清空成员
+            </Button>
             <Button icon={<EditOutlined />} onClick={() => openEditTeam(currentTeam)}>
               编辑
             </Button>

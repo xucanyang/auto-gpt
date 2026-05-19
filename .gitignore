@@ -17,6 +17,16 @@ build/
 logs/
 *.log
 
+# 本地备份/回滚文件
+.rollback-backups/
+*.bak
+*.bak.*
+*.bak.*
+*.bak.*.*
+*.backup
+*.backup.*
+*.orig
+
 # 账号数据
 accounts.txt
 *_accounts.txt
@@ -56,3 +66,6 @@ CLAUDE.md
 .ace-tool/
 smstome*_numbers.txt
 smstome_used/
+
+# 临时调试脚本
+tmp_*.py

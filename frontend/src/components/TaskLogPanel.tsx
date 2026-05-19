@@ -26,6 +26,9 @@ export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
   const [lines, setLines] = useState<string[]>([])
   const [error, setError] = useState('')
   const [terminalStatus, setTerminalStatus] = useState<TaskTerminalStatus>('idle')
+  const [pageVisible, setPageVisible] = useState(
+    typeof document === 'undefined' ? true : document.visibilityState === 'visible',
+  )
   const [skipLoading, setSkipLoading] = useState(false)
   const [stopLoading, setStopLoading] = useState(false)
   const [stopRequested, setStopRequested] = useState(false)
@@ -101,7 +104,19 @@ export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
   }, [viewMode])
 
   useEffect(() => {
-    if (!taskId) return
+    if (typeof document === 'undefined') return
+    const updateVisibility = () => {
+      setPageVisible(document.visibilityState === 'visible')
+    }
+    updateVisibility()
+    document.addEventListener('visibilitychange', updateVisibility)
+    return () => {
+      document.removeEventListener('visibilitychange', updateVisibility)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!taskId || !pageVisible) return
     const controller = new AbortController()
     let cancelled = false
     const baseRetryMs = 1000
@@ -233,7 +248,7 @@ export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
       cancelled = true
       controller.abort()
     }
-  }, [taskId])
+  }, [taskId, pageVisible])
 
   useEffect(() => {
     if (!panelRef.current) return
@@ -242,7 +257,7 @@ export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
 
   const footerText =
     terminalStatus === 'done'
-      ? { text: '注册完成', color: '#10b981' }
+      ? { text: '任务完成', color: '#10b981' }
       : terminalStatus === 'stopped'
         ? { text: '任务已停止', color: '#d97706' }
         : terminalStatus === 'failed'
@@ -250,8 +265,8 @@ export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
           : null
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 8 }}>
+    <div style={{ display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap', marginBottom: 8 }}>
         <Space>
           <Button
             size="small"
@@ -302,8 +317,8 @@ export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
           padding: 12,
           fontFamily: 'monospace',
           fontSize: 12,
-          minHeight: 320,
-          maxHeight: '65vh',
+          minHeight: 240,
+          maxHeight: 'calc(100vh - 320px)',
           userSelect: 'text',
           WebkitUserSelect: 'text',
           cursor: 'text',

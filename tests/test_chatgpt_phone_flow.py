@@ -5,9 +5,9 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from platforms.chatgpt.oauth_client import OAuthClient
-from platforms.chatgpt.phone_service import SMSToMePhoneService
-from platforms.chatgpt.utils import FlowState
+from services.chatgpt_core.oauth_client import OAuthClient
+from services.chatgpt_core.phone_service import SMSToMePhoneService
+from services.chatgpt_core.utils import FlowState
 from smstome_tool import PhoneEntry, parse_country_slugs
 
 
@@ -68,7 +68,7 @@ class SMSToMeConfigTests(unittest.TestCase):
             }
         )
 
-        with mock.patch("platforms.chatgpt.phone_service.wait_for_otp", return_value="123456") as mocked:
+        with mock.patch("services.chatgpt_core.phone_service.wait_for_otp", return_value="123456") as mocked:
             code = service.wait_for_code(entry)
 
         self.assertEqual(code, "123456")
@@ -91,7 +91,7 @@ class SMSToMeConfigTests(unittest.TestCase):
                 }
             )
 
-            with mock.patch("platforms.chatgpt.phone_service.update_global_phone_list", return_value=3) as mocked:
+            with mock.patch("services.chatgpt_core.phone_service.update_global_phone_list", return_value=3) as mocked:
                 service.ensure_pool_ready()
 
         mocked.assert_called_once()
@@ -139,7 +139,7 @@ class OAuthPhoneBlacklistTests(unittest.TestCase):
         phone_service.acquire_phone.return_value = entry
         phone_service.prefix_hint.return_value = "+447000"
 
-        with mock.patch("platforms.chatgpt.oauth_client.SMSToMePhoneService", return_value=phone_service):
+        with mock.patch("services.chatgpt_core.oauth_client.SMSToMePhoneService", return_value=phone_service):
             with mock.patch.object(
                 client,
                 "_send_phone_number",
@@ -176,7 +176,7 @@ class OAuthPhoneBlacklistTests(unittest.TestCase):
             continue_url="https://auth.openai.com/phone-verification",
         )
 
-        with mock.patch("platforms.chatgpt.oauth_client.SMSToMePhoneService", return_value=phone_service):
+        with mock.patch("services.chatgpt_core.oauth_client.SMSToMePhoneService", return_value=phone_service):
             with mock.patch.object(client, "_send_phone_number", return_value=(True, next_state, "")):
                 with mock.patch.object(
                     client,

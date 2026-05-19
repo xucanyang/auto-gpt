@@ -12,7 +12,7 @@ if str(ROOT) not in sys.path:
 
 from core.base_platform import Account, AccountStatus, RegisterConfig
 from core.db import AccountModel, engine
-from core.registry import get, load_all
+from services.chatgpt_core import ChatGPTPlatform
 
 
 def load_accounts(ids: list[int]) -> list[AccountModel]:
@@ -71,9 +71,7 @@ def choose_account(items: list[AccountModel]) -> AccountModel:
 
 
 def main() -> None:
-    load_all()
-    platform_cls = get("chatgpt")
-    instance = platform_cls(config=RegisterConfig())
+    instance = ChatGPTPlatform(config=RegisterConfig())
 
     raw_ids = input("输入 ChatGPT 账号 id 列表，逗号分隔: ").strip()
     if not raw_ids:

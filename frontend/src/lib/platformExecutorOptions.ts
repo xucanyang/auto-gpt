@@ -4,13 +4,11 @@ export const EXECUTOR_OPTIONS = [
   { value: 'headed', label: '有头浏览器' },
 ] as const
 
-const PLATFORM_EXECUTORS: Record<string, string[]> = {
-  chatgpt: ['protocol', 'headless', 'headed'],
-}
+const CHATGPT_EXECUTORS = ['protocol', 'headless', 'headed']
 
 export function getSupportedExecutors(platform?: string) {
-  if (!platform) return ['protocol']
-  return PLATFORM_EXECUTORS[platform] || ['protocol']
+  if (!platform || platform === 'chatgpt') return CHATGPT_EXECUTORS
+  return ['protocol']
 }
 
 export function getExecutorOptions(platform?: string) {

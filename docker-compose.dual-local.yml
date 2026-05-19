@@ -1,6 +1,6 @@
 services:
   app:
-    container_name: any-auto-register-local
+    container_name: auto-chatgpt-dual
     ports:
       - "8001:8000"
       - "127.0.0.1:8890:8889"

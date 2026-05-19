@@ -1,7 +1,7 @@
 import unittest
 from unittest import mock
 
-from platforms.chatgpt.status_probe import ProbeHTTPResult, probe_local_chatgpt_status
+from services.chatgpt_core.status_probe import ProbeHTTPResult, probe_local_chatgpt_status
 
 
 class DummyAccount:
@@ -28,7 +28,7 @@ class ChatGPTStatusProbeTests(unittest.TestCase):
         account = DummyAccount(refresh_token="rt-token")
 
         with mock.patch(
-            "platforms.chatgpt.status_probe.TokenRefreshManager.refresh_by_oauth_token",
+            "services.chatgpt_core.status_probe.TokenRefreshManager.refresh_by_oauth_token",
             return_value=mock.Mock(success=False, access_token="", refresh_token="", error_message="OAuth token 刷新失败: HTTP 401"),
         ):
             result = probe_local_chatgpt_status(account)
@@ -40,7 +40,7 @@ class ChatGPTStatusProbeTests(unittest.TestCase):
         account = DummyAccount(refresh_token="rt-token")
 
         with mock.patch(
-            "platforms.chatgpt.status_probe.TokenRefreshManager.refresh_by_oauth_token",
+            "services.chatgpt_core.status_probe.TokenRefreshManager.refresh_by_oauth_token",
             return_value=mock.Mock(success=False, access_token="", refresh_token="", error_message="OAuth token 刷新失败: HTTP 401"),
         ):
             result = probe_local_chatgpt_status(account)
@@ -52,10 +52,10 @@ class ChatGPTStatusProbeTests(unittest.TestCase):
         account = DummyAccount(refresh_token="rt-token")
 
         with mock.patch(
-            "platforms.chatgpt.status_probe.TokenRefreshManager.refresh_by_oauth_token",
+            "services.chatgpt_core.status_probe.TokenRefreshManager.refresh_by_oauth_token",
             return_value=mock.Mock(success=True, access_token="fresh-access-token", refresh_token="rt-token-2", error_message=""),
         ), mock.patch(
-            "platforms.chatgpt.status_probe._probe_backend_me",
+            "services.chatgpt_core.status_probe._probe_backend_me",
             return_value=ProbeHTTPResult(
                 status_code=403,
                 headers={},
@@ -78,10 +78,10 @@ class ChatGPTStatusProbeTests(unittest.TestCase):
         )
 
         with mock.patch(
-            "platforms.chatgpt.status_probe.TokenRefreshManager.refresh_by_oauth_token",
+            "services.chatgpt_core.status_probe.TokenRefreshManager.refresh_by_oauth_token",
             return_value=mock.Mock(success=False, access_token="", refresh_token="", error_message="OAuth token 刷新失败: HTTP 401"),
         ), mock.patch(
-            "platforms.chatgpt.status_probe._probe_backend_me",
+            "services.chatgpt_core.status_probe._probe_backend_me",
             return_value=ProbeHTTPResult(
                 status_code=200,
                 headers={},
@@ -91,7 +91,7 @@ class ChatGPTStatusProbeTests(unittest.TestCase):
                 message="ok",
             ),
         ), mock.patch(
-            "platforms.chatgpt.status_probe._probe_codex_usage",
+            "services.chatgpt_core.status_probe._probe_codex_usage",
             return_value=ProbeHTTPResult(
                 status_code=200,
                 headers={},
@@ -115,7 +115,7 @@ class ChatGPTStatusProbeTests(unittest.TestCase):
         )
 
         with mock.patch(
-            "platforms.chatgpt.status_probe._probe_backend_me",
+            "services.chatgpt_core.status_probe._probe_backend_me",
             return_value=ProbeHTTPResult(
                 status_code=200,
                 headers={},
@@ -125,7 +125,7 @@ class ChatGPTStatusProbeTests(unittest.TestCase):
                 message="ok",
             ),
         ), mock.patch(
-            "platforms.chatgpt.status_probe._probe_codex_usage",
+            "services.chatgpt_core.status_probe._probe_codex_usage",
             return_value=ProbeHTTPResult(
                 status_code=200,
                 headers={},
@@ -141,11 +141,104 @@ class ChatGPTStatusProbeTests(unittest.TestCase):
         self.assertEqual(result["auth"]["source"], "access_token")
         self.assertEqual(result["subscription"]["plan"], "free")
 
+    def test_probe_backend_me_timeout_returns_structured_probe_failure(self):
+        account = DummyAccount(
+            access_token="cached-access-token",
+            user_id="acct-123",
+        )
+
+        with mock.patch(
+            "services.chatgpt_core.status_probe._probe_backend_me",
+            side_effect=TimeoutError("backend timeout"),
+        ):
+            result = probe_local_chatgpt_status(account)
+
+        self.assertEqual(result["auth"]["state"], "probe_failed")
+        self.assertEqual(result["auth"]["http_status"], 0)
+        self.assertIn("backend timeout", result["auth"]["message"])
+        self.assertEqual(result["codex"]["state"], "not_checked")
+
+    def test_probe_refresh_token_timeout_does_not_mark_missing_refresh_token(self):
+        account = DummyAccount(refresh_token="rt-token")
+
+        with mock.patch(
+            "services.chatgpt_core.status_probe.TokenRefreshManager.refresh_by_oauth_token",
+            return_value=mock.Mock(success=False, access_token="", refresh_token="", error_message="OAuth token 刷新异常: timeout"),
+        ):
+            result = probe_local_chatgpt_status(account)
+
+        self.assertEqual(result["auth"]["state"], "probe_failed")
+        self.assertEqual(result["auth"]["http_status"], 0)
+        self.assertEqual(result["codex"]["state"], "not_checked")
+
+    def test_probe_accounts_check_timeout_still_probes_codex(self):
+        account = DummyAccount(
+            access_token="cached-access-token",
+            user_id="acct-123",
+        )
+
+        with mock.patch(
+            "services.chatgpt_core.status_probe._probe_backend_me",
+            return_value=ProbeHTTPResult(
+                status_code=200,
+                headers={},
+                body_text="{}",
+                body_json={},
+                error_code="",
+                message="ok",
+            ),
+        ), mock.patch(
+            "services.chatgpt_core.status_probe._probe_accounts_check",
+            side_effect=TimeoutError("accounts check timeout"),
+        ), mock.patch(
+            "services.chatgpt_core.status_probe._probe_codex_usage",
+            return_value=ProbeHTTPResult(
+                status_code=200,
+                headers={},
+                body_text='{"ok":true}',
+                body_json={"ok": True},
+                error_code="",
+                message="ok",
+            ),
+        ):
+            result = probe_local_chatgpt_status(account)
+
+        self.assertEqual(result["auth"]["state"], "access_token_valid")
+        self.assertEqual(result["subscription"]["plan"], "unknown")
+        self.assertEqual(result["codex"]["state"], "usable")
+
+    def test_probe_codex_timeout_returns_structured_codex_failure(self):
+        account = DummyAccount(
+            access_token="cached-access-token",
+            user_id="acct-123",
+        )
+
+        with mock.patch(
+            "services.chatgpt_core.status_probe._probe_backend_me",
+            return_value=ProbeHTTPResult(
+                status_code=200,
+                headers={},
+                body_text='{"plan_type":"chatgptplusplan"}',
+                body_json={"plan_type": "chatgptplusplan"},
+                error_code="",
+                message="ok",
+            ),
+        ), mock.patch(
+            "services.chatgpt_core.status_probe._probe_codex_usage",
+            side_effect=TimeoutError("codex timeout"),
+        ):
+            result = probe_local_chatgpt_status(account)
+
+        self.assertEqual(result["auth"]["state"], "access_token_valid")
+        self.assertEqual(result["codex"]["state"], "probe_failed")
+        self.assertEqual(result["codex"]["http_status"], 0)
+        self.assertIn("codex timeout", result["codex"]["message"])
+
     def test_probe_treats_deactivated_workspace_as_deactivated(self):
         account = DummyAccount(access_token="cached-access-token")
 
         with mock.patch(
-            "platforms.chatgpt.status_probe._probe_backend_me",
+            "services.chatgpt_core.status_probe._probe_backend_me",
             return_value=ProbeHTTPResult(
                 status_code=402,
                 headers={},
@@ -164,10 +257,10 @@ class ChatGPTStatusProbeTests(unittest.TestCase):
         account = DummyAccount(refresh_token="rt-token", user_id="acct-123")
 
         with mock.patch(
-            "platforms.chatgpt.status_probe.TokenRefreshManager.refresh_by_oauth_token",
+            "services.chatgpt_core.status_probe.TokenRefreshManager.refresh_by_oauth_token",
             return_value=mock.Mock(success=True, access_token="fresh-access-token", refresh_token="rt-token-2", error_message=""),
         ), mock.patch(
-            "platforms.chatgpt.status_probe._probe_backend_me",
+            "services.chatgpt_core.status_probe._probe_backend_me",
             return_value=ProbeHTTPResult(
                 status_code=200,
                 headers={},
@@ -178,7 +271,7 @@ class ChatGPTStatusProbeTests(unittest.TestCase):
             ),
         ):
             with mock.patch(
-                "platforms.chatgpt.status_probe._probe_codex_usage",
+                "services.chatgpt_core.status_probe._probe_codex_usage",
                 return_value=ProbeHTTPResult(
                     status_code=429,
                     headers={},
@@ -198,10 +291,10 @@ class ChatGPTStatusProbeTests(unittest.TestCase):
         account = DummyAccount(refresh_token="rt-token", user_id="acct-rt")
 
         with mock.patch(
-            "platforms.chatgpt.status_probe.TokenRefreshManager.refresh_by_oauth_token",
+            "services.chatgpt_core.status_probe.TokenRefreshManager.refresh_by_oauth_token",
             return_value=mock.Mock(success=True, access_token="fresh-access-token", refresh_token="rt-token-2", error_message=""),
         ), mock.patch(
-            "platforms.chatgpt.status_probe._probe_backend_me",
+            "services.chatgpt_core.status_probe._probe_backend_me",
             return_value=ProbeHTTPResult(
                 status_code=200,
                 headers={},
@@ -211,7 +304,7 @@ class ChatGPTStatusProbeTests(unittest.TestCase):
                 message="ok",
             ),
         ), mock.patch(
-            "platforms.chatgpt.status_probe._probe_codex_usage",
+            "services.chatgpt_core.status_probe._probe_codex_usage",
             return_value=ProbeHTTPResult(
                 status_code=200,
                 headers={},
@@ -232,10 +325,10 @@ class ChatGPTStatusProbeTests(unittest.TestCase):
         account = DummyAccount(refresh_token="rt-token", user_id="acct-rt")
 
         with mock.patch(
-            "platforms.chatgpt.status_probe.TokenRefreshManager.refresh_by_oauth_token",
+            "services.chatgpt_core.status_probe.TokenRefreshManager.refresh_by_oauth_token",
             return_value=mock.Mock(success=True, access_token="fresh-access-token", refresh_token="rt-token-2", error_message=""),
         ), mock.patch(
-            "platforms.chatgpt.status_probe._probe_backend_me",
+            "services.chatgpt_core.status_probe._probe_backend_me",
             return_value=ProbeHTTPResult(
                 status_code=200,
                 headers={},
@@ -245,7 +338,7 @@ class ChatGPTStatusProbeTests(unittest.TestCase):
                 message="ok",
             ),
         ), mock.patch(
-            "platforms.chatgpt.status_probe._probe_codex_usage",
+            "services.chatgpt_core.status_probe._probe_codex_usage",
             return_value=ProbeHTTPResult(
                 status_code=401,
                 headers={},
@@ -268,10 +361,10 @@ class ChatGPTStatusProbeTests(unittest.TestCase):
         )
 
         with mock.patch(
-            "platforms.chatgpt.status_probe.TokenRefreshManager.refresh_by_oauth_token",
+            "services.chatgpt_core.status_probe.TokenRefreshManager.refresh_by_oauth_token",
             return_value=mock.Mock(success=True, access_token="fresh-access-token", refresh_token="rt-token-2", error_message=""),
         ), mock.patch(
-            "platforms.chatgpt.status_probe._probe_backend_me",
+            "services.chatgpt_core.status_probe._probe_backend_me",
             return_value=ProbeHTTPResult(
                 status_code=200,
                 headers={},
@@ -281,7 +374,7 @@ class ChatGPTStatusProbeTests(unittest.TestCase):
                 message="ok",
             ),
         ), mock.patch(
-            "platforms.chatgpt.status_probe._probe_accounts_check",
+            "services.chatgpt_core.status_probe._probe_accounts_check",
             return_value=ProbeHTTPResult(
                 status_code=200,
                 headers={},
@@ -298,7 +391,7 @@ class ChatGPTStatusProbeTests(unittest.TestCase):
                 message="ok",
             ),
         ), mock.patch(
-            "platforms.chatgpt.status_probe._probe_codex_usage",
+            "services.chatgpt_core.status_probe._probe_codex_usage",
             return_value=ProbeHTTPResult(
                 status_code=200,
                 headers={},
@@ -324,7 +417,7 @@ class ChatGPTStatusProbeTests(unittest.TestCase):
         )
 
         with mock.patch(
-            "platforms.chatgpt.status_probe._probe_backend_me",
+            "services.chatgpt_core.status_probe._probe_backend_me",
             return_value=ProbeHTTPResult(
                 status_code=200,
                 headers={},
@@ -334,7 +427,7 @@ class ChatGPTStatusProbeTests(unittest.TestCase):
                 message="ok",
             ),
         ), mock.patch(
-            "platforms.chatgpt.status_probe._probe_accounts_check",
+            "services.chatgpt_core.status_probe._probe_accounts_check",
             return_value=ProbeHTTPResult(
                 status_code=200,
                 headers={},
@@ -359,7 +452,7 @@ class ChatGPTStatusProbeTests(unittest.TestCase):
                 message="ok",
             ),
         ), mock.patch(
-            "platforms.chatgpt.status_probe._probe_codex_usage",
+            "services.chatgpt_core.status_probe._probe_codex_usage",
             return_value=ProbeHTTPResult(
                 status_code=200,
                 headers={},
