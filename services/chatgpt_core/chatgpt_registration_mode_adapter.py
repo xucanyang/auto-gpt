@@ -191,6 +191,12 @@ class BaseChatGPTRegistrationModeAdapter(ABC):
                 "chatgpt_access_token_only_zero_amount_stop_enabled",
                 "chatgpt_access_token_only_zero_amount_stop_threshold",
                 "chatgpt_checkout_probe",
+                "chatgpt_checkout_error_code",
+                "chatgpt_checkout_error_status",
+                "chatgpt_checkout_error_body",
+                "chatgpt_account_unavailable",
+                "chatgpt_unavailable_reason",
+                "chatgpt_payment_already_paid",
                 "chatgpt_skip_save_account",
                 "chatgpt_skip_save_reason",
             ):
@@ -246,11 +252,12 @@ class BaseChatGPTRegistrationModeAdapter(ABC):
         accounts: list[Account] = []
         for artifact in artifacts:
             extra = self._build_account_extra_for_artifact(artifact, result)
-            status = (
-                AccountStatus.PENDING_PAYMENT
-                if extra.get("partial_auth") or extra.get("auth_level") == "access_token_only"
-                else AccountStatus.REGISTERED
-            )
+            if extra.get("chatgpt_payment_already_paid"):
+                status = AccountStatus.SUBSCRIBED
+            elif extra.get("partial_auth") or extra.get("auth_level") == "access_token_only":
+                status = AccountStatus.PENDING_PAYMENT
+            else:
+                status = AccountStatus.REGISTERED
             accounts.append(
                 Account(
                     platform="chatgpt",

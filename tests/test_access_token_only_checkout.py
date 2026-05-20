@@ -2,6 +2,7 @@ import unittest
 from unittest import mock
 
 from services.chatgpt_core.access_token_only_registration_engine import AccessTokenOnlyRegistrationEngine
+from services.chatgpt_core.payment import CheckoutRequestError
 
 
 class AccessTokenOnlyCheckoutTests(unittest.TestCase):
@@ -84,6 +85,41 @@ class AccessTokenOnlyCheckoutTests(unittest.TestCase):
         self.assertEqual(generate_link.call_args.kwargs["currency"], "USD")
         self.assertEqual(probe_amount.call_args.kwargs["country"], "US")
         self.assertEqual(probe_amount.call_args.kwargs["currency"], "USD")
+
+    def test_checkout_already_paid_response_is_classified_as_skip_save(self):
+        engine = AccessTokenOnlyRegistrationEngine(
+            email_service=mock.Mock(),
+            proxy_url="http://proxy.local:8080",
+            extra_config={
+                "chatgpt_access_token_only_checkout_country": "US",
+                "chatgpt_access_token_only_checkout_currency": "USD",
+            },
+        )
+
+        with (
+            mock.patch(
+                "core.proxy_utils.iter_enabled_runtime_proxies",
+                return_value=["http://proxy.local:8080"],
+            ),
+            mock.patch(
+                "services.chatgpt_core.payment.generate_plus_link",
+                side_effect=CheckoutRequestError(400, '{"detail":"you have paid"}'),
+            ),
+        ):
+            metadata = engine._probe_plus_checkout_billing(
+                {
+                    "access_token": "at-demo",
+                    "cookies": "oai-did=device",
+                    "account_id": "acct-demo",
+                },
+                "buyer@example.com",
+            )
+
+        self.assertTrue(metadata["chatgpt_skip_save_account"])
+        self.assertTrue(metadata["chatgpt_account_unavailable"])
+        self.assertTrue(metadata["chatgpt_payment_already_paid"])
+        self.assertEqual(metadata["chatgpt_checkout_error_code"], "already_paid")
+        self.assertIn("you have paid", metadata["chatgpt_checkout_error_body"])
 
 
 if __name__ == "__main__":

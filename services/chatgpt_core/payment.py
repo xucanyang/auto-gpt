@@ -33,6 +33,18 @@ _checkout_countries_cache: dict[str, Any] = {"expires_at": 0.0, "value": None}
 _checkout_pricing_config_cache: dict[str, dict[str, Any]] = {}
 
 
+class CheckoutRequestError(RuntimeError):
+    """Raised when ChatGPT checkout creation returns a non-2xx response."""
+
+    def __init__(self, status_code: int, body: str):
+        self.status_code = int(status_code or 0)
+        self.body = str(body or "").strip()
+        message = f"HTTP Error {self.status_code}"
+        if self.body:
+            message = f"{message}: {self.body[:500]}"
+        super().__init__(message)
+
+
 def _build_proxies(proxy: Optional[str]) -> Optional[dict]:
     return build_requests_proxy_config(proxy)
 
@@ -294,7 +306,8 @@ def _generate_checkout_url(
         timeout=30,
         impersonate="chrome110",
     )
-    response.raise_for_status()
+    if int(getattr(response, "status_code", 0) or 0) >= 400:
+        raise CheckoutRequestError(int(response.status_code), str(getattr(response, "text", "") or ""))
     data = response.json()
 
     checkout_url = str(data.get("url") or data.get("checkout_url") or data.get("cashier_url") or "").strip()

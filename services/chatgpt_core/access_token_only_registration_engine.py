@@ -139,6 +139,7 @@ class AccessTokenOnlyRegistrationEngine:
 
         from services.chatgpt_core.gopay_flow import probe_chatgpt_checkout_amount
         from services.chatgpt_core.payment import (
+            CheckoutRequestError,
             generate_plus_link,
             normalize_checkout_country,
             normalize_checkout_currency,
@@ -191,13 +192,35 @@ class AccessTokenOnlyRegistrationEngine:
         checkout_proxy = proxy_candidates[0]
 
         self._log(f"Plus 账单探测: 生成订阅链接 country={country} currency={currency}")
-        checkout_url = generate_plus_link(
-            account,
-            proxy=checkout_proxy,
-            country=country,
-            currency=currency,
-            billing=billing,
-        )
+        try:
+            checkout_url = generate_plus_link(
+                account,
+                proxy=checkout_proxy,
+                country=country,
+                currency=currency,
+                billing=billing,
+            )
+        except CheckoutRequestError as exc:
+            body_text = str(getattr(exc, "body", "") or str(exc)).strip()
+            if int(getattr(exc, "status_code", 0) or 0) == 400 and "you have paid" in body_text.lower():
+                reason = f"Plus checkout 已付费响应: {body_text[:300] or exc}"
+                self._log(reason, "warning")
+                return {
+                    "chatgpt_checkout_plan": "plus",
+                    "chatgpt_checkout_url": "",
+                    "chatgpt_checkout_country": country,
+                    "chatgpt_checkout_currency": currency,
+                    "chatgpt_checkout_amount_check_enabled": True,
+                    "chatgpt_checkout_error_code": "already_paid",
+                    "chatgpt_checkout_error_status": int(getattr(exc, "status_code", 0) or 0),
+                    "chatgpt_checkout_error_body": body_text,
+                    "chatgpt_account_unavailable": True,
+                    "chatgpt_unavailable_reason": reason,
+                    "chatgpt_skip_save_account": True,
+                    "chatgpt_skip_save_reason": reason,
+                    "chatgpt_payment_already_paid": True,
+                }
+            raise
         self._log(f"Plus checkout created: {checkout_url}")
         probe = probe_chatgpt_checkout_amount(
             account,

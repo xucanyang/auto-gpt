@@ -92,6 +92,39 @@ class ChatGPTRegistrationModeAdapterTests(unittest.TestCase):
             "https://chatgpt.com/checkout/openai_llc/cs_live_123",
         )
 
+    def test_build_account_marks_already_paid_checkout_as_subscribed(self):
+        adapter = build_chatgpt_registration_mode_adapter(
+            {"chatgpt_registration_mode": "access_token_only"}
+        )
+        result = type(
+            "Result",
+            (),
+            {
+                "email": "paid@example.com",
+                "password": "pw",
+                "account_id": "acct-demo",
+                "access_token": "at-demo",
+                "refresh_token": "",
+                "id_token": "",
+                "session_token": "session-demo",
+                "workspace_id": "ws-demo",
+                "source": "register",
+                "metadata": {
+                    "chatgpt_checkout_error_code": "already_paid",
+                    "chatgpt_account_unavailable": True,
+                    "chatgpt_payment_already_paid": True,
+                    "chatgpt_skip_save_account": True,
+                    "chatgpt_skip_save_reason": "Plus checkout 已付费响应: you have paid",
+                },
+            },
+        )()
+
+        account = adapter.build_account(result, fallback_password="fallback")
+
+        self.assertEqual(account.status.value, "subscribed")
+        self.assertTrue(account.extra["chatgpt_payment_already_paid"])
+        self.assertTrue(account.extra["chatgpt_skip_save_account"])
+
     def test_build_account_marks_registration_access_token_partial_auth(self):
         adapter = build_chatgpt_registration_mode_adapter(
             {"chatgpt_registration_mode": "refresh_token"}
