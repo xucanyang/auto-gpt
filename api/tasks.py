@@ -882,11 +882,11 @@ def _build_effective_register_extra(req: RegisterTaskRequest) -> dict:
     if req.platform == "chatgpt":
         checkout_country = str(
             merged_extra.get("chatgpt_access_token_only_checkout_country")
-            or ""
+            or "US"
         ).strip()
         checkout_currency = str(
             merged_extra.get("chatgpt_access_token_only_checkout_currency")
-            or ""
+            or "USD"
         ).strip()
         if checkout_country and not merged_extra.get("chatgpt_checkout_country"):
             merged_extra["chatgpt_checkout_country"] = checkout_country

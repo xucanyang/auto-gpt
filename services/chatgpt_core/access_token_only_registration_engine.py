@@ -139,7 +139,6 @@ class AccessTokenOnlyRegistrationEngine:
 
         from services.chatgpt_core.gopay_flow import probe_chatgpt_checkout_amount
         from services.chatgpt_core.payment import (
-            DEFAULT_CHECKOUT_COUNTRY,
             generate_plus_link,
             normalize_checkout_country,
             normalize_checkout_currency,
@@ -166,16 +165,17 @@ class AccessTokenOnlyRegistrationEngine:
 
         country = normalize_checkout_country(
             self.extra_config.get("chatgpt_checkout_country")
+            or self.extra_config.get("chatgpt_access_token_only_checkout_country")
             or self.extra_config.get("checkout_country")
             or self.extra_config.get("country")
-            or self.extra_config.get("chatgpt_access_token_only_checkout_country")
-            or DEFAULT_CHECKOUT_COUNTRY
+            or "US"
         )
         raw_currency = (
             self.extra_config.get("chatgpt_checkout_currency")
+            or self.extra_config.get("chatgpt_access_token_only_checkout_currency")
             or self.extra_config.get("checkout_currency")
             or self.extra_config.get("currency")
-            or self.extra_config.get("chatgpt_access_token_only_checkout_currency")
+            or "USD"
         )
         currency = normalize_checkout_currency(
             raw_currency,
