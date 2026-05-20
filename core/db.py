@@ -41,6 +41,47 @@ class AccountModel(SQLModel, table=True):
         self.extra_json = json.dumps(d, ensure_ascii=False)
 
 
+class ExternalSubscriptionClaimModel(SQLModel, table=True):
+    __tablename__ = "external_subscription_claims"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    claim_id: str = Field(index=True, sa_column_kwargs={"unique": True})
+    account_id: int = Field(index=True)
+    email: str = Field(default="", index=True)
+    consumer: str = ""
+    status: str = Field(default="prechecking", index=True)
+    payment_link: str = ""
+    plan: str = "plus"
+    country: str = ""
+    currency: str = ""
+    precheck_expires_at: str = ""
+    lease_expires_at: str = ""
+    verify_after_at: str = ""
+    claimed_at: str = ""
+    prechecked_at: str = ""
+    result_written_at: str = ""
+    paid_at: str = ""
+    failed_at: str = ""
+    released_at: str = ""
+    provider: str = ""
+    external_payment_id: str = ""
+    message: str = ""
+    error_code: str = ""
+    last_error: str = ""
+    details_json: str = "{}"
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
+
+    def get_details(self) -> dict:
+        try:
+            return json.loads(self.details_json or "{}")
+        except Exception:
+            return {}
+
+    def set_details(self, d: dict):
+        self.details_json = json.dumps(d if isinstance(d, dict) else {}, ensure_ascii=False)
+
+
 class TaskLog(SQLModel, table=True):
     __tablename__ = "task_logs"
 
@@ -272,6 +313,70 @@ def _ensure_task_log_schema() -> None:
             )
         conn.exec_driver_sql(
             "CREATE INDEX IF NOT EXISTS idx_task_logs_task_id ON task_logs(task_id)"
+        )
+
+
+def _ensure_external_subscription_claim_schema() -> None:
+    required_columns = {
+        "claim_id": "TEXT NOT NULL DEFAULT ''",
+        "account_id": "INTEGER NOT NULL DEFAULT 0",
+        "email": "TEXT NOT NULL DEFAULT ''",
+        "consumer": "TEXT NOT NULL DEFAULT ''",
+        "status": "TEXT NOT NULL DEFAULT 'prechecking'",
+        "payment_link": "TEXT NOT NULL DEFAULT ''",
+        "plan": "TEXT NOT NULL DEFAULT 'plus'",
+        "country": "TEXT NOT NULL DEFAULT ''",
+        "currency": "TEXT NOT NULL DEFAULT ''",
+        "precheck_expires_at": "TEXT NOT NULL DEFAULT ''",
+        "lease_expires_at": "TEXT NOT NULL DEFAULT ''",
+        "verify_after_at": "TEXT NOT NULL DEFAULT ''",
+        "claimed_at": "TEXT NOT NULL DEFAULT ''",
+        "prechecked_at": "TEXT NOT NULL DEFAULT ''",
+        "result_written_at": "TEXT NOT NULL DEFAULT ''",
+        "paid_at": "TEXT NOT NULL DEFAULT ''",
+        "failed_at": "TEXT NOT NULL DEFAULT ''",
+        "released_at": "TEXT NOT NULL DEFAULT ''",
+        "provider": "TEXT NOT NULL DEFAULT ''",
+        "external_payment_id": "TEXT NOT NULL DEFAULT ''",
+        "message": "TEXT NOT NULL DEFAULT ''",
+        "error_code": "TEXT NOT NULL DEFAULT ''",
+        "last_error": "TEXT NOT NULL DEFAULT ''",
+        "details_json": "TEXT NOT NULL DEFAULT '{}'",
+        "created_at": "TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP",
+        "updated_at": "TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP",
+    }
+
+    with engine.begin() as conn:
+        existing_columns = {
+            str(row[1])
+            for row in conn.exec_driver_sql("PRAGMA table_info(external_subscription_claims)").fetchall()
+        }
+        if not existing_columns:
+            return
+        for column_name, ddl in required_columns.items():
+            if column_name in existing_columns:
+                continue
+            conn.exec_driver_sql(
+                f"ALTER TABLE external_subscription_claims ADD COLUMN {column_name} {ddl}"
+            )
+        conn.exec_driver_sql(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_external_subscription_claims_claim_id "
+            "ON external_subscription_claims(claim_id)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_external_subscription_claims_account_id "
+            "ON external_subscription_claims(account_id)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_external_subscription_claims_status "
+            "ON external_subscription_claims(status)"
+        )
+        conn.exec_driver_sql(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_external_subscription_claims_active_account
+            ON external_subscription_claims(account_id)
+            WHERE status IN ('prechecking', 'claimed', 'processing')
+            """
         )
 
 
@@ -1161,6 +1266,7 @@ def init_db():
     _ensure_task_log_schema()
     _ensure_proxy_schema()
     _ensure_pending_business_invite_schema()
+    _ensure_external_subscription_claim_schema()
     _ensure_pipeline_schema()
 
 

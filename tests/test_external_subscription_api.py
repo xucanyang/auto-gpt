@@ -1,24 +1,29 @@
 import json
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
 
-from sqlmodel import Session, SQLModel, create_engine
+from sqlmodel import Session, SQLModel, create_engine, select
 
 from api import external_subscription as external_api
 from core import db as core_db
-from core.db import AccountModel
+from core.db import AccountModel, ExternalSubscriptionClaimModel
 
 
 class ExternalSubscriptionApiTests(unittest.TestCase):
     def setUp(self):
         self._tmpdir = tempfile.TemporaryDirectory()
         db_path = Path(self._tmpdir.name) / "external_subscription.db"
-        self.engine = create_engine(f"sqlite:///{db_path}")
+        self.engine = create_engine(
+            f"sqlite:///{db_path}",
+            connect_args={"check_same_thread": False, "timeout": 30},
+        )
         self.core_engine_patch = mock.patch.object(core_db, "engine", self.engine)
         self.core_engine_patch.start()
         SQLModel.metadata.create_all(self.engine)
+        core_db._ensure_external_subscription_claim_schema()
         self.preflight_patch = mock.patch.object(
             external_api,
             "_preflight_subscription_link",
@@ -111,6 +116,12 @@ class ExternalSubscriptionApiTests(unittest.TestCase):
             link = account.get_extra()["chatgpt_last_payment_link"]
             self.assertEqual(link["link_status"], "leased")
             self.assertEqual(link["claim_id"], claim["claim_id"])
+            row = session.exec(
+                select(ExternalSubscriptionClaimModel)
+                .where(ExternalSubscriptionClaimModel.claim_id == claim["claim_id"])
+            ).first()
+            self.assertIsNotNone(row)
+            self.assertEqual(row.status, "claimed")
         self.schedule_mock.assert_called_once()
 
     def test_claim_skips_active_claim_until_released(self):
@@ -176,10 +187,16 @@ class ExternalSubscriptionApiTests(unittest.TestCase):
         with self._session() as session:
             account = session.get(AccountModel, account_id)
             extra = account.get_extra()
+            row = session.exec(
+                select(ExternalSubscriptionClaimModel)
+                .where(ExternalSubscriptionClaimModel.claim_id == extra["external_subscription_claim"]["claim_id"])
+            ).first()
         self.assertEqual(account.status, "subscribed")
         self.assertEqual(extra["external_subscription_claim"]["status"], "paid")
         self.assertEqual(extra["external_subscription_payment"]["status"], "paid")
         self.assertEqual(extra["external_subscription_payment"]["external_payment_id"], "pay_123")
+        self.assertIsNotNone(row)
+        self.assertEqual(row.status, "paid")
 
     def test_failed_result_marks_account_payment_failed(self):
         account_id = self._add_account(status="pending_payment")
@@ -204,9 +221,15 @@ class ExternalSubscriptionApiTests(unittest.TestCase):
         with self._session() as session:
             account = session.get(AccountModel, account_id)
             extra = account.get_extra()
+            row = session.exec(
+                select(ExternalSubscriptionClaimModel)
+                .where(ExternalSubscriptionClaimModel.claim_id == extra["external_subscription_claim"]["claim_id"])
+            ).first()
         self.assertEqual(account.status, "payment_failed")
         self.assertEqual(extra["external_subscription_claim"]["status"], "failed")
         self.assertEqual(extra["external_subscription_payment"]["error_code"], "declined")
+        self.assertIsNotNone(row)
+        self.assertEqual(row.status, "failed")
 
     def test_claim_scans_beyond_old_twenty_account_window(self):
         for index in range(25):
@@ -256,8 +279,14 @@ class ExternalSubscriptionApiTests(unittest.TestCase):
         with self._session() as session:
             first = session.get(AccountModel, first_id)
             second = session.get(AccountModel, second_id)
+            failed_row = session.exec(
+                select(ExternalSubscriptionClaimModel)
+                .where(ExternalSubscriptionClaimModel.account_id == first_id)
+            ).first()
         self.assertEqual(first.get_extra()["chatgpt_last_payment_link"]["link_status"], "already_paid")
         self.assertEqual(second.get_extra()["chatgpt_last_payment_link"]["link_status"], "leased")
+        self.assertIsNotNone(failed_row)
+        self.assertEqual(failed_row.status, "already_paid")
 
     def test_due_local_verification_marks_paid_from_checkout_recheck(self):
         account_id = self._add_account(status="pending_payment")
@@ -306,6 +335,13 @@ class ExternalSubscriptionApiTests(unittest.TestCase):
             claim["verify_after_at"] = external_api._iso(external_api._utcnow() - external_api.timedelta(seconds=1))
             extra["external_subscription_claim"] = claim
             account.set_extra(extra)
+            row = session.exec(
+                select(ExternalSubscriptionClaimModel)
+                .where(ExternalSubscriptionClaimModel.claim_id == claim["claim_id"])
+            ).first()
+            row.lease_expires_at = claim["lease_expires_at"]
+            row.verify_after_at = claim["verify_after_at"]
+            session.add(row)
             session.add(account)
             session.commit()
 
@@ -330,6 +366,30 @@ class ExternalSubscriptionApiTests(unittest.TestCase):
         self.assertEqual(claimed["count"], 1)
         self.assertEqual(account.status, "subscribed")
         self.assertEqual(extra["external_subscription_claim"]["status"], "paid")
+
+    def test_concurrent_claims_do_not_duplicate_single_link(self):
+        account_id = self._add_account()
+
+        def claim_once(index: int) -> dict:
+            with self._session() as session:
+                return external_api.claim_subscription_links(
+                    external_api.ClaimSubscriptionLinksRequest(consumer=f"worker-{index}", limit=1),
+                    session=session,
+                )
+
+        with ThreadPoolExecutor(max_workers=10) as pool:
+            results = list(pool.map(claim_once, range(10)))
+
+        claimed_items = [item for result in results for item in result.get("items", [])]
+        self.assertEqual(len(claimed_items), 1)
+        self.assertEqual(claimed_items[0]["account_id"], account_id)
+        with self._session() as session:
+            rows = session.exec(
+                select(ExternalSubscriptionClaimModel)
+                .where(ExternalSubscriptionClaimModel.account_id == account_id)
+            ).all()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].status, "claimed")
 
     def test_dedicated_token_dependency(self):
         with (

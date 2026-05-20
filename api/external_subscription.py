@@ -12,10 +12,12 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel
+from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
 from core.config_store import config_store
-from core.db import AccountModel, get_session
+from core.db import AccountModel, ExternalSubscriptionClaimModel, get_session
 from services.chatgpt_account_state import (
     apply_chatgpt_status_policy,
     classify_chatgpt_capabilities,
@@ -37,9 +39,11 @@ MAX_LIMIT = 100
 DEFAULT_LEASE_SECONDS = 900
 MAX_LEASE_SECONDS = 86400
 DEFAULT_VERIFY_AFTER_SECONDS = 180
+DEFAULT_PRECHECK_SECONDS = 300
 SCAN_BATCH_SIZE = 50
 DUE_VERIFICATION_LIMIT = 25
 SENDABLE_CURRENCY = "USD"
+ACTIVE_CLAIM_STATUSES = {"prechecking", "claimed", "processing"}
 TERMINAL_LINK_STATUSES = {
     "paid",
     "already_paid",
@@ -270,6 +274,157 @@ def _serialize_claimed_item(account: AccountModel, link: dict[str, Any], claim: 
     return item
 
 
+def _claim_row_to_dict(row: ExternalSubscriptionClaimModel) -> dict[str, Any]:
+    details = row.get_details()
+    claim: dict[str, Any] = {
+        "claim_id": row.claim_id,
+        "consumer": row.consumer,
+        "status": row.status,
+        "claimed_at": row.claimed_at,
+        "lease_expires_at": row.lease_expires_at,
+        "verify_after_at": row.verify_after_at,
+        "payment_link": row.payment_link,
+        "plan": row.plan,
+        "country": row.country,
+        "currency": row.currency,
+        "external_payment_id": row.external_payment_id,
+        "provider": row.provider,
+        "paid_at": row.paid_at,
+        "failed_at": row.failed_at,
+        "released_at": row.released_at,
+        "last_error": row.last_error,
+        "failure_status": details.get("failure_status") or row.error_code,
+        "release_reason": details.get("release_reason") or "",
+        "attempt": _safe_int(details.get("attempt"), 1),
+        "source": "external_subscription_claims",
+    }
+    for key in ("precheck_expires_at", "prechecked_at", "result_written_at", "message", "error_code"):
+        value = getattr(row, key, "")
+        if value:
+            claim[key] = value
+    return claim
+
+
+def _find_claim_row(session: Session, claim_id: str) -> Optional[ExternalSubscriptionClaimModel]:
+    claim_id = str(claim_id or "").strip()
+    if not claim_id:
+        return None
+    return session.exec(
+        select(ExternalSubscriptionClaimModel).where(ExternalSubscriptionClaimModel.claim_id == claim_id)
+    ).first()
+
+
+def _active_claim_for_account(session: Session, account_id: int) -> Optional[ExternalSubscriptionClaimModel]:
+    return session.exec(
+        select(ExternalSubscriptionClaimModel)
+        .where(ExternalSubscriptionClaimModel.account_id == int(account_id or 0))
+        .where(ExternalSubscriptionClaimModel.status.in_(tuple(ACTIVE_CLAIM_STATUSES)))
+        .order_by(ExternalSubscriptionClaimModel.id.desc())
+    ).first()
+
+
+def _expire_stale_prechecking_claims(session: Session, now: datetime) -> int:
+    result = session.execute(
+        text(
+            """
+            UPDATE external_subscription_claims
+            SET status = 'precheck_expired',
+                last_error = '预检预占超时，已自动释放',
+                updated_at = :updated_at
+            WHERE status = 'prechecking'
+              AND precheck_expires_at != ''
+              AND precheck_expires_at <= :now_iso
+            """
+        ),
+        {"updated_at": now, "now_iso": _iso(now)},
+    )
+    session.commit()
+    return int(getattr(result, "rowcount", 0) or 0)
+
+
+def _update_claim_row_from_claim(
+    session: Session,
+    claim: dict[str, Any],
+    *,
+    details_update: dict[str, Any] | None = None,
+) -> None:
+    row = _find_claim_row(session, str(claim.get("claim_id") or ""))
+    if row is None:
+        return
+    for key in (
+        "consumer",
+        "status",
+        "payment_link",
+        "plan",
+        "country",
+        "currency",
+        "lease_expires_at",
+        "verify_after_at",
+        "claimed_at",
+        "prechecked_at",
+        "result_written_at",
+        "paid_at",
+        "failed_at",
+        "released_at",
+        "provider",
+        "external_payment_id",
+        "message",
+        "error_code",
+        "last_error",
+    ):
+        if key in claim:
+            setattr(row, key, str(claim.get(key) or ""))
+    details = row.get_details()
+    if isinstance(details_update, dict):
+        details.update(details_update)
+    if "attempt" in claim:
+        details["attempt"] = _safe_int(claim.get("attempt"), 1)
+    if "failure_status" in claim:
+        details["failure_status"] = str(claim.get("failure_status") or "")
+    if "release_reason" in claim:
+        details["release_reason"] = str(claim.get("release_reason") or "")
+    row.set_details(details)
+    row.updated_at = _utcnow()
+    session.add(row)
+
+
+def _reserve_subscription_claim(
+    session: Session,
+    account: AccountModel,
+    link: dict[str, Any],
+    *,
+    consumer: str,
+    now: datetime,
+    attempt: int,
+) -> dict[str, Any]:
+    if _active_claim_for_account(session, int(account.id or 0)) is not None:
+        return {}
+    claim_id = _now_id("subclaim")
+    precheck_expires_at = now + timedelta(seconds=DEFAULT_PRECHECK_SECONDS)
+    row = ExternalSubscriptionClaimModel(
+        claim_id=claim_id,
+        account_id=int(account.id or 0),
+        email=str(account.email or ""),
+        consumer=consumer,
+        status="prechecking",
+        payment_link=str(link.get("url") or ""),
+        plan=str(link.get("plan") or "plus"),
+        country=str(link.get("country") or ""),
+        currency=str(link.get("currency") or ""),
+        precheck_expires_at=_iso(precheck_expires_at),
+        claimed_at=_iso(now),
+    )
+    row.set_details({"attempt": max(1, int(attempt or 1)), "precheck_seconds": DEFAULT_PRECHECK_SECONDS})
+    session.add(row)
+    try:
+        session.commit()
+        session.refresh(row)
+    except IntegrityError:
+        session.rollback()
+        return {}
+    return _claim_row_to_dict(row)
+
+
 def _account_probe_object(account: AccountModel, extra: dict[str, Any] | None = None) -> SimpleNamespace:
     data = extra if isinstance(extra, dict) else account.get_extra()
     return SimpleNamespace(
@@ -389,6 +544,12 @@ def _find_claim(session: Session, claim_id: str) -> tuple[AccountModel, dict[str
     claim_id = str(claim_id or "").strip()
     if not claim_id:
         raise HTTPException(status_code=404, detail="claim 不存在")
+    row = _find_claim_row(session, claim_id)
+    if row is not None:
+        account = session.get(AccountModel, int(row.account_id or 0))
+        if account is None or account.platform != "chatgpt":
+            raise HTTPException(status_code=404, detail="claim 对应账号不存在")
+        return account, account.get_extra(), _claim_row_to_dict(row)
     rows = session.exec(select(AccountModel).where(AccountModel.platform == "chatgpt")).all()
     for account in rows:
         extra = account.get_extra()
@@ -461,6 +622,7 @@ def _set_claim_paid(
     extra[EXTERNAL_PAYMENT_KEY] = payment
     _mark_link_status(extra, status="paid", reason=message, now=now)
     mark_payment_succeeded(account, reason="external_subscription_local_verify_paid")
+    _update_claim_row_from_claim(session, claim, details_update={"payment": payment})
     _persist_account(session, account, extra)
     return payment
 
@@ -497,6 +659,7 @@ def _set_claim_failed(
     extra[EXTERNAL_PAYMENT_KEY] = payment
     _mark_link_status(extra, status=status, reason=reason, now=now)
     mark_payment_failed(account, reason="external_subscription_local_verify_failed")
+    _update_claim_row_from_claim(session, claim, details_update={"payment": payment})
     _persist_account(session, account, extra)
     return payment
 
@@ -608,28 +771,42 @@ def _schedule_subscription_verification(claim_id: str, verify_after_at: datetime
 
 
 def _run_due_local_verifications(session: Session, now: datetime) -> int:
+    checked = 0
     rows = session.exec(
+        select(ExternalSubscriptionClaimModel)
+        .where(ExternalSubscriptionClaimModel.status.in_(("claimed", "processing")))
+        .order_by(ExternalSubscriptionClaimModel.id.asc())
+        .limit(1000)
+    ).all()
+    for row in rows:
+        if checked >= DUE_VERIFICATION_LIMIT:
+            return checked
+        verify_after_at = _parse_dt(row.verify_after_at)
+        if verify_after_at and verify_after_at <= now:
+            _verify_subscription_claim_now(session, row.claim_id)
+            checked += 1
+
+    legacy_rows = session.exec(
         select(AccountModel)
         .where(AccountModel.platform == "chatgpt")
         .order_by(AccountModel.id.asc())
         .limit(1000)
     ).all()
-    checked = 0
-    for account in rows:
+    for account in legacy_rows:
         if checked >= DUE_VERIFICATION_LIMIT:
             break
         extra = account.get_extra()
         claim = extra.get(EXTERNAL_CLAIM_KEY) if isinstance(extra.get(EXTERNAL_CLAIM_KEY), dict) else {}
+        if str(claim.get("source") or "") == "external_subscription_claims":
+            continue
         if str(claim.get("status") or "").strip().lower() not in {"claimed", "processing"}:
             continue
         verify_after_at = _parse_dt(claim.get("verify_after_at"))
-        if not verify_after_at or verify_after_at > now:
-            continue
-        claim_id = str(claim.get("claim_id") or "").strip()
-        if not claim_id:
-            continue
-        _verify_subscription_claim_now(session, claim_id)
-        checked += 1
+        if verify_after_at and verify_after_at <= now:
+            claim_id = str(claim.get("claim_id") or "").strip()
+            if claim_id:
+                _verify_subscription_claim_now(session, claim_id)
+                checked += 1
     return checked
 
 
@@ -637,6 +814,7 @@ def _run_due_local_verifications(session: Session, now: datetime) -> int:
 def claim_subscription_links(req: ClaimSubscriptionLinksRequest, session: Session = Depends(get_session)):
     now = _utcnow()
     _run_due_local_verifications(session, now)
+    _expire_stale_prechecking_claims(session, now)
     if not _claim_requires_usd_zero(req):
         raise HTTPException(status_code=400, detail="外部订阅链接只允许抽取 USD 0 元账单")
     limit = min(MAX_LIMIT, max(1, _safe_int(req.limit, 1)))
@@ -671,11 +849,29 @@ def claim_subscription_links(req: ClaimSubscriptionLinksRequest, session: Sessio
             if not link or _link_is_blocked(link, now) or not _claim_matches_filters(link, req):
                 continue
 
+            claim = _reserve_subscription_claim(
+                session,
+                account,
+                link,
+                consumer=consumer,
+                now=now,
+                attempt=_safe_int(current_claim.get("attempt"), 0) + 1,
+            )
+            if not claim:
+                continue
+
             preflight = _preflight_subscription_link(account, link)
             preflight_probe = preflight.get("probe") if isinstance(preflight.get("probe"), dict) else {}
             if not bool(preflight.get("ok_to_send")):
                 status = str(preflight.get("link_status") or "precheck_failed")
                 reason = str(preflight.get("reason") or "订阅链接本地预检未通过")
+                claim.update({
+                    "status": status,
+                    "prechecked_at": _iso(_utcnow()),
+                    "result_written_at": _iso(_utcnow()),
+                    "last_error": _clean_text(reason, 800),
+                    "failure_status": status,
+                })
                 _mark_link_status(
                     extra,
                     status=status,
@@ -684,6 +880,12 @@ def claim_subscription_links(req: ClaimSubscriptionLinksRequest, session: Sessio
                     now=now,
                     last_preflight_at=_iso(now),
                 )
+                extra[EXTERNAL_CLAIM_KEY] = claim
+                _update_claim_row_from_claim(
+                    session,
+                    claim,
+                    details_update={"preflight": preflight_probe, "preflight_error": reason},
+                )
                 _persist_account(session, account, extra)
                 try:
                     _refresh_account_local_status(session, account, account.get_extra())
@@ -691,20 +893,18 @@ def claim_subscription_links(req: ClaimSubscriptionLinksRequest, session: Sessio
                     pass
                 continue
 
-            claim_id = _now_id("subclaim")
-            claim = {
-                "claim_id": claim_id,
-                "consumer": consumer,
+            claim_id = str(claim.get("claim_id") or "")
+            claim.update({
                 "status": "claimed",
-                "claimed_at": _iso(now),
                 "lease_expires_at": _iso(lease_expires_at),
                 "verify_after_at": _iso(verify_after_at),
-                "attempt": _safe_int(current_claim.get("attempt"), 0) + 1,
                 "payment_link": link.get("url") or "",
                 "plan": link.get("plan") or "plus",
                 "country": link.get("country") or "",
                 "currency": SENDABLE_CURRENCY,
-            }
+                "prechecked_at": _iso(_utcnow()),
+                "last_error": "",
+            })
             extra[EXTERNAL_CLAIM_KEY] = claim
             updated_link = _mark_link_status(
                 extra,
@@ -722,6 +922,11 @@ def claim_subscription_links(req: ClaimSubscriptionLinksRequest, session: Sessio
                 verify_after_at=_iso(verify_after_at),
             )
             mark_payment_pending(account, reason="external_subscription_claimed")
+            _update_claim_row_from_claim(
+                session,
+                claim,
+                details_update={"preflight": preflight_probe, "link_status": "leased"},
+            )
             _persist_account(session, account, extra)
             _upsert_pending_subscription_auth(account, updated_link)
             _schedule_subscription_verification(claim_id, verify_after_at)
@@ -771,6 +976,7 @@ def release_subscription_claim(
     })
     extra[EXTERNAL_CLAIM_KEY] = claim
     _mark_link_status(extra, status="available", reason=str(req.reason or "claim 已释放"), now=_utcnow())
+    _update_claim_row_from_claim(session, claim, details_update={"release_reason": str(req.reason or "").strip()})
     _persist_account(session, account, extra)
     return {"ok": True, "released": True, "claim": claim}
 
@@ -848,6 +1054,7 @@ def write_subscription_result(
 
     extra[EXTERNAL_CLAIM_KEY] = claim
     extra[EXTERNAL_PAYMENT_KEY] = payment
+    _update_claim_row_from_claim(session, claim, details_update={"payment": payment})
     _persist_account(session, account, extra)
 
     return {
