@@ -385,6 +385,12 @@ class AccessTokenOnlyRegistrationEngine:
         except Exception as exc:
             self._log(f"[邮箱] finalize_failure 执行失败: {exc}", "warning")
 
+    @staticmethod
+    def _metadata_indicates_discard_without_mailbox_writeback(metadata: dict | None) -> bool:
+        if not isinstance(metadata, dict):
+            return False
+        return bool(metadata.get("chatgpt_payment_already_paid") or metadata.get("chatgpt_account_unavailable"))
+
     def _probe_homepage_before_email_creation(self) -> tuple[bool, str]:
         client = ChatGPTClient(
             proxy=self.proxy_url,
@@ -548,7 +554,10 @@ class AccessTokenOnlyRegistrationEngine:
                         self._log("=" * 60)
                         self._log("注册流程成功结束!")
                         self._log("=" * 60)
-                        self._finalize_email_service_success(result)
+                        if self._metadata_indicates_discard_without_mailbox_writeback(result.metadata):
+                            self._log("[邮箱] 账号不可用，跳过邮箱写回", "warning")
+                        else:
+                            self._finalize_email_service_success(result)
                         return result
 
                     last_error = f"注册成功，但复用会话获取 AccessToken 失败: {session_result}"

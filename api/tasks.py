@@ -1728,8 +1728,6 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                     if checkout_url:
                         _log(task_id, f"  [升级链接] {checkout_url}")
                         _task_store.add_cashier_url(task_id, checkout_url)
-                    if skip_save_is_failure:
-                        control.request_stop()
                     if should_stop_after_current_account and zero_amount_stop_reason:
                         control.request_stop()
                         _log(task_id, f"[STOP] {zero_amount_stop_reason}")
@@ -2090,10 +2088,10 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
         _task_store.cleanup()
         return
 
-    if errors:
-        final_status = "failed"
-    elif success >= target_successes:
+    if success >= target_successes:
         final_status = "done"
+    elif errors and not (control.is_stop_requested() or stopped):
+        final_status = "failed"
     elif control.is_stop_requested() or stopped:
         final_status = "stopped"
     else:

@@ -37,14 +37,8 @@ class _FakeMailbox(BaseMailbox):
         code_pattern: str = None,
         **kwargs,
     ) -> str:
-        def poll_once():
-            return None
-
-        return self._run_polling_wait(
-            timeout=timeout,
-            poll_interval=0.01,
-            poll_once=poll_once,
-        )
+        self._checkpoint()
+        return "123456"
 
 
 class _FakePlatform(BasePlatform):
@@ -99,12 +93,22 @@ class _FakeChatGPTSkipSavePlatform(BasePlatform):
 class _FakeChatGPTAlreadyPaidPlatform(BasePlatform):
     name = "chatgpt"
     display_name = "ChatGPT"
+    calls = 0
 
     def __init__(self, config=None, mailbox=None):
         super().__init__(config)
         self.mailbox = mailbox
 
     def register(self, email: str, password: str = None) -> Account:
+        type(self).calls += 1
+        if type(self).calls > 1:
+            return Account(
+                platform="chatgpt",
+                email="success-after-already-paid@example.com",
+                password=password or "pw",
+                token="at-demo-success",
+                extra={},
+            )
         return Account(
             platform="chatgpt",
             email="already-paid@example.com",
@@ -126,7 +130,7 @@ class _FakeChatGPTAlreadyPaidPlatform(BasePlatform):
 class RegisterTaskControlFlowTests(unittest.TestCase):
     def _build_request(self):
         return RegisterTaskRequest(
-            platform="fake",
+            platform="chatgpt",
             count=1,
             concurrency=1,
             proxy="http://proxy.local:8080",
@@ -142,7 +146,7 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
             _task_store.request_skip_current(task_id)
 
         with (
-            patch("api.tasks.ChatGPTPlatform", _FakePlatform),
+            patch("services.chatgpt_core.ChatGPTPlatform", _FakePlatform),
             patch("core.base_mailbox.create_mailbox", return_value=_FakeMailbox()),
             patch("core.db.save_account", side_effect=lambda account: account),
             patch("api.tasks._save_task_log"),
@@ -155,7 +159,7 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
         snapshot = self._run_with_control("task-control-skip", skip=True)
 
         self.assertEqual(snapshot["status"], "done")
-        self.assertEqual(snapshot["success"], 0)
+        self.assertEqual(snapshot["success"], 1)
         self.assertEqual(snapshot["skipped"], 1)
         self.assertEqual(snapshot["errors"], [])
 
@@ -193,7 +197,7 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
         self.assertTrue(any("amount!=0: 1" in line for line in snapshot["logs"]))
         self.assertTrue(any("success_skip_save" in str(call) for call in save_log.call_args_list))
 
-    def test_chatgpt_already_paid_skip_save_counts_as_failure_without_saving(self):
+    def test_chatgpt_already_paid_skip_save_counts_as_failure_without_saving_and_continues(self):
         task_id = "task-chatgpt-already-paid-skip-save"
         req = RegisterTaskRequest(
             platform="chatgpt",
@@ -203,6 +207,7 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
             extra={"mail_provider": "fake"},
         )
         _create_task_record(task_id, req, "manual", None)
+        _FakeChatGPTAlreadyPaidPlatform.calls = 0
 
         with (
             patch("services.chatgpt_core.ChatGPTPlatform", _FakeChatGPTAlreadyPaidPlatform),
@@ -213,10 +218,11 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
             _run_register(task_id, req)
 
         snapshot = _task_store.snapshot(task_id)
-        self.assertEqual(snapshot["status"], "failed")
-        self.assertEqual(snapshot["success"], 0)
+        self.assertEqual(snapshot["status"], "done")
+        self.assertEqual(snapshot["success"], 1)
+        self.assertEqual(_FakeChatGPTAlreadyPaidPlatform.calls, 2)
         self.assertTrue(snapshot["errors"])
-        save_account.assert_not_called()
+        self.assertEqual(save_account.call_count, 1)
         self.assertTrue(any("注册未计成功且不保存账号" in line for line in snapshot["logs"]))
         self.assertTrue(any("failed_skip_save" in str(call) for call in save_log.call_args_list))
 
