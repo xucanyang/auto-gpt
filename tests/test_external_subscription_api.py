@@ -19,26 +19,55 @@ class ExternalSubscriptionApiTests(unittest.TestCase):
         self.core_engine_patch = mock.patch.object(core_db, "engine", self.engine)
         self.core_engine_patch.start()
         SQLModel.metadata.create_all(self.engine)
+        self.preflight_patch = mock.patch.object(
+            external_api,
+            "_preflight_subscription_link",
+            return_value={
+                "ok_to_send": True,
+                "link_status": "available",
+                "reason": "",
+                "probe": {"currency": "usd", "amount": 0, "amount_text": "0", "amount_is_zero": True},
+                "checkout_amount": "0",
+                "checkout_amount_is_zero": True,
+            },
+        )
+        self.schedule_patch = mock.patch.object(external_api, "_schedule_subscription_verification")
+        self.upsert_patch = mock.patch.object(external_api, "_upsert_pending_subscription_auth")
+        self.preflight_mock = self.preflight_patch.start()
+        self.schedule_mock = self.schedule_patch.start()
+        self.upsert_mock = self.upsert_patch.start()
 
     def tearDown(self):
+        self.upsert_patch.stop()
+        self.schedule_patch.stop()
+        self.preflight_patch.stop()
         self.core_engine_patch.stop()
         self._tmpdir.cleanup()
 
     def _session(self):
         return Session(self.engine)
 
-    def _add_account(self, *, email: str = "demo@example.com", status: str = "registered") -> int:
+    def _add_account(
+        self,
+        *,
+        email: str = "demo@example.com",
+        status: str = "registered",
+        currency: str = "USD",
+        link_status: str = "",
+    ) -> int:
         extra = {
             "chatgpt_last_payment_link": {
                 "url": "https://chatgpt.com/checkout/openai_llc/cs_live_123",
                 "plan": "plus",
                 "country": "US",
-                "currency": "USD",
+                "currency": currency,
                 "checkout_amount": "0",
                 "checkout_amount_is_zero": True,
                 "source": "batch_payment_link",
             }
         }
+        if link_status:
+            extra["chatgpt_last_payment_link"]["link_status"] = link_status
         with self._session() as session:
             row = AccountModel(
                 platform="chatgpt",
@@ -78,6 +107,11 @@ class ExternalSubscriptionApiTests(unittest.TestCase):
             claim = account.get_extra()["external_subscription_claim"]
             self.assertEqual(claim["status"], "claimed")
             self.assertEqual(claim["consumer"], "worker-a")
+            self.assertIn("verify_after_at", claim)
+            link = account.get_extra()["chatgpt_last_payment_link"]
+            self.assertEqual(link["link_status"], "leased")
+            self.assertEqual(link["claim_id"], claim["claim_id"])
+        self.schedule_mock.assert_called_once()
 
     def test_claim_skips_active_claim_until_released(self):
         self._add_account(email="first@example.com")
@@ -173,6 +207,129 @@ class ExternalSubscriptionApiTests(unittest.TestCase):
         self.assertEqual(account.status, "payment_failed")
         self.assertEqual(extra["external_subscription_claim"]["status"], "failed")
         self.assertEqual(extra["external_subscription_payment"]["error_code"], "declined")
+
+    def test_claim_scans_beyond_old_twenty_account_window(self):
+        for index in range(25):
+            self._add_account(email=f"blocked{index}@example.com", link_status="already_paid")
+        valid_id = self._add_account(email="valid@example.com")
+
+        with self._session() as session:
+            result = external_api.claim_subscription_links(
+                external_api.ClaimSubscriptionLinksRequest(consumer="worker-a", limit=1),
+                session=session,
+            )
+
+        self.assertEqual(result["count"], 1)
+        self.assertEqual(result["items"][0]["account_id"], valid_id)
+
+    def test_preflight_failure_marks_link_refreshes_and_continues(self):
+        first_id = self._add_account(email="bad@example.com")
+        second_id = self._add_account(email="good@example.com")
+        self.preflight_mock.side_effect = [
+            {
+                "ok_to_send": False,
+                "link_status": "already_paid",
+                "reason": "you have paid",
+                "probe": {},
+            },
+            {
+                "ok_to_send": True,
+                "link_status": "available",
+                "reason": "",
+                "probe": {"currency": "usd", "amount": 0, "amount_text": "0", "amount_is_zero": True},
+                "checkout_amount": "0",
+                "checkout_amount_is_zero": True,
+            },
+        ]
+        with (
+            mock.patch.object(external_api, "_refresh_account_local_status", return_value={}) as refresh_mock,
+            self._session() as session,
+        ):
+            result = external_api.claim_subscription_links(
+                external_api.ClaimSubscriptionLinksRequest(consumer="worker-a", limit=1),
+                session=session,
+            )
+
+        self.assertEqual(result["count"], 1)
+        self.assertEqual(result["items"][0]["account_id"], second_id)
+        refresh_mock.assert_called_once()
+        with self._session() as session:
+            first = session.get(AccountModel, first_id)
+            second = session.get(AccountModel, second_id)
+        self.assertEqual(first.get_extra()["chatgpt_last_payment_link"]["link_status"], "already_paid")
+        self.assertEqual(second.get_extra()["chatgpt_last_payment_link"]["link_status"], "leased")
+
+    def test_due_local_verification_marks_paid_from_checkout_recheck(self):
+        account_id = self._add_account(status="pending_payment")
+        with self._session() as session:
+            claimed = external_api.claim_subscription_links(
+                external_api.ClaimSubscriptionLinksRequest(consumer="worker-a", limit=1),
+                session=session,
+            )
+            claim_id = claimed["items"][0]["claim_id"]
+
+        self.preflight_mock.return_value = {
+            "ok_to_send": False,
+            "link_status": "already_paid",
+            "reason": "you have paid",
+            "probe": {},
+        }
+        with (
+            mock.patch.object(external_api, "_refresh_account_local_status", return_value={}),
+            mock.patch.object(external_api, "_paid_from_probe", return_value=False),
+            mock.patch.object(external_api, "_enqueue_resume_subscription_auth", return_value="task_auth_1") as enqueue_mock,
+            self._session() as session,
+        ):
+            result = external_api._verify_subscription_claim_now(session, claim_id)
+
+        self.assertEqual(result["status"], "paid")
+        enqueue_mock.assert_called_once_with(account_id)
+        with self._session() as session:
+            account = session.get(AccountModel, account_id)
+            extra = account.get_extra()
+        self.assertEqual(account.status, "subscribed")
+        self.assertEqual(extra["external_subscription_claim"]["status"], "paid")
+        self.assertEqual(extra["external_subscription_payment"]["provider"], "local_checkout_verify")
+        self.assertEqual(extra["chatgpt_last_payment_link"]["link_status"], "paid")
+
+    def test_due_local_verification_runs_after_short_lease_expires(self):
+        account_id = self._add_account(status="pending_payment")
+        with self._session() as session:
+            claimed = external_api.claim_subscription_links(
+                external_api.ClaimSubscriptionLinksRequest(consumer="worker-a", limit=1),
+                session=session,
+            )
+            account = session.get(AccountModel, account_id)
+            extra = account.get_extra()
+            claim = extra["external_subscription_claim"]
+            claim["lease_expires_at"] = external_api._iso(external_api._utcnow() - external_api.timedelta(seconds=1))
+            claim["verify_after_at"] = external_api._iso(external_api._utcnow() - external_api.timedelta(seconds=1))
+            extra["external_subscription_claim"] = claim
+            account.set_extra(extra)
+            session.add(account)
+            session.commit()
+
+        self.preflight_mock.return_value = {
+            "ok_to_send": False,
+            "link_status": "already_paid",
+            "reason": "you have paid",
+            "probe": {},
+        }
+        with (
+            mock.patch.object(external_api, "_refresh_account_local_status", return_value={}),
+            mock.patch.object(external_api, "_paid_from_probe", return_value=False),
+            mock.patch.object(external_api, "_enqueue_resume_subscription_auth", return_value="task_auth_1"),
+            self._session() as session,
+        ):
+            checked = external_api._run_due_local_verifications(session, external_api._utcnow())
+
+        self.assertEqual(checked, 1)
+        with self._session() as session:
+            account = session.get(AccountModel, account_id)
+            extra = account.get_extra()
+        self.assertEqual(claimed["count"], 1)
+        self.assertEqual(account.status, "subscribed")
+        self.assertEqual(extra["external_subscription_claim"]["status"], "paid")
 
     def test_dedicated_token_dependency(self):
         with (
