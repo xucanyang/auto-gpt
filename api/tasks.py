@@ -1709,31 +1709,43 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                             chatgpt_checkout_amount_nonzero += 1
                 if skip_save_account:
                     skip_reason = str(account_extra.get("chatgpt_skip_save_reason") or "Plus checkout amount != 0").strip()
+                    skip_save_is_failure = _is_truthy(account_extra.get("chatgpt_payment_already_paid")) or _is_truthy(
+                        account_extra.get("chatgpt_account_unavailable")
+                    )
                     amount_text = str(account_extra.get("chatgpt_checkout_amount") or account_extra.get("chatgpt_checkout_amount_raw") or "").strip()
                     currency_text = str(account_extra.get("chatgpt_checkout_currency") or "").strip()
                     checkout_url = str(account_extra.get("chatgpt_checkout_url") or account_extra.get("cashier_url") or "").strip()
                     _log(
                         task_id,
-                        f"[SKIP_SAVE] 注册成功但不保存账号: {account.email} reason={skip_reason}",
+                        (
+                            f"[SKIP_SAVE] 注册未计成功且不保存账号: {account.email} reason={skip_reason}"
+                            if skip_save_is_failure
+                            else f"[SKIP_SAVE] 注册成功但不保存账号: {account.email} reason={skip_reason}"
+                        ),
                     )
                     if amount_text or currency_text:
                         _log(task_id, f"[SKIP_SAVE] Plus checkout amount={amount_text or 'unknown'} currency={currency_text or 'unknown'}")
                     if checkout_url:
                         _log(task_id, f"  [升级链接] {checkout_url}")
                         _task_store.add_cashier_url(task_id, checkout_url)
+                    if skip_save_is_failure:
+                        control.request_stop()
                     if should_stop_after_current_account and zero_amount_stop_reason:
                         control.request_stop()
                         _log(task_id, f"[STOP] {zero_amount_stop_reason}")
                     _save_task_log(
                         req.platform,
                         account.email,
-                        "success",
+                        "failed" if skip_save_is_failure else "success",
+                        error=skip_reason if skip_save_is_failure else "",
                         detail=_build_task_log_detail(
                             task_id,
                             {
-                                "attempt_outcome": "success_skip_save",
+                                "attempt_outcome": "failed_skip_save" if skip_save_is_failure else "success_skip_save",
                                 "email": account.email,
                                 "skip_save_reason": skip_reason,
+                                "skip_save_is_failure": skip_save_is_failure,
+                                "chatgpt_checkout_error_code": str(account_extra.get("chatgpt_checkout_error_code") or ""),
                                 "chatgpt_checkout_amount": amount_text,
                                 "chatgpt_checkout_currency": currency_text,
                                 "chatgpt_checkout_amount_is_zero": checkout_amount_is_zero,
@@ -1745,7 +1757,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                             },
                         ),
                     )
-                    return AttemptResult.success()
+                    return AttemptResult.failed(skip_reason) if skip_save_is_failure else AttemptResult.success()
                 saved_account = save_account(account)
                 pending_invite = None
                 if req.platform == "chatgpt" and saved_account is not None:
@@ -2078,18 +2090,29 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
         _task_store.cleanup()
         return
 
-    final_status = "stopped" if control.is_stop_requested() or stopped else "done"
+    if errors:
+        final_status = "failed"
+    elif success >= target_successes:
+        final_status = "done"
+    elif control.is_stop_requested() or stopped:
+        final_status = "stopped"
+    else:
+        final_status = "done"
     if deferred_activation_enabled:
         if final_status == "stopped":
             summary = (
                 f"任务已停止: 注册完成 {registration_success} 个, 激活成功 {success} 个, 跳过 {skipped} 个, 失败 {len(errors)} 个"
             )
+        elif final_status == "failed":
+            summary = f"失败: 注册完成 {registration_success} 个, 激活成功 {success} 个, 跳过 {skipped} 个, 失败 {len(errors)} 个"
         else:
             summary = f"完成: 注册完成 {registration_success} 个, 激活成功 {success} 个, 跳过 {skipped} 个, 失败 {len(errors)} 个"
     elif final_status == "stopped":
         summary = (
             f"任务已停止: 成功 {success} 个, 跳过 {skipped} 个, 失败 {len(errors)} 个"
         )
+    elif final_status == "failed":
+        summary = f"失败: 成功 {success} 个, 跳过 {skipped} 个, 失败 {len(errors)} 个"
     else:
         summary = f"完成: 成功 {success} 个, 跳过 {skipped} 个, 失败 {len(errors)} 个"
     if req.platform == "chatgpt" and (chatgpt_checkout_amount_zero + chatgpt_checkout_amount_nonzero) > 0:

@@ -96,6 +96,33 @@ class _FakeChatGPTSkipSavePlatform(BasePlatform):
         return True
 
 
+class _FakeChatGPTAlreadyPaidPlatform(BasePlatform):
+    name = "chatgpt"
+    display_name = "ChatGPT"
+
+    def __init__(self, config=None, mailbox=None):
+        super().__init__(config)
+        self.mailbox = mailbox
+
+    def register(self, email: str, password: str = None) -> Account:
+        return Account(
+            platform="chatgpt",
+            email="already-paid@example.com",
+            password=password or "pw",
+            token="at-demo",
+            extra={
+                "chatgpt_payment_already_paid": True,
+                "chatgpt_account_unavailable": True,
+                "chatgpt_checkout_error_code": "already_paid",
+                "chatgpt_skip_save_account": True,
+                "chatgpt_skip_save_reason": "Plus checkout 已付费响应: you have paid",
+            },
+        )
+
+    def check_valid(self, account: Account) -> bool:
+        return True
+
+
 class RegisterTaskControlFlowTests(unittest.TestCase):
     def _build_request(self):
         return RegisterTaskRequest(
@@ -152,7 +179,7 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
         _create_task_record(task_id, req, "manual", None)
 
         with (
-            patch("api.tasks.ChatGPTPlatform", _FakeChatGPTSkipSavePlatform),
+            patch("services.chatgpt_core.ChatGPTPlatform", _FakeChatGPTSkipSavePlatform),
             patch("core.base_mailbox.create_mailbox", return_value=_FakeMailbox()),
             patch("core.db.save_account") as save_account,
             patch("api.tasks._save_task_log") as save_log,
@@ -165,6 +192,33 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
         save_account.assert_not_called()
         self.assertTrue(any("amount!=0: 1" in line for line in snapshot["logs"]))
         self.assertTrue(any("success_skip_save" in str(call) for call in save_log.call_args_list))
+
+    def test_chatgpt_already_paid_skip_save_counts_as_failure_without_saving(self):
+        task_id = "task-chatgpt-already-paid-skip-save"
+        req = RegisterTaskRequest(
+            platform="chatgpt",
+            count=1,
+            concurrency=1,
+            proxy="http://proxy.local:8080",
+            extra={"mail_provider": "fake"},
+        )
+        _create_task_record(task_id, req, "manual", None)
+
+        with (
+            patch("services.chatgpt_core.ChatGPTPlatform", _FakeChatGPTAlreadyPaidPlatform),
+            patch("core.base_mailbox.create_mailbox", return_value=_FakeMailbox()),
+            patch("core.db.save_account") as save_account,
+            patch("api.tasks._save_task_log") as save_log,
+        ):
+            _run_register(task_id, req)
+
+        snapshot = _task_store.snapshot(task_id)
+        self.assertEqual(snapshot["status"], "failed")
+        self.assertEqual(snapshot["success"], 0)
+        self.assertTrue(snapshot["errors"])
+        save_account.assert_not_called()
+        self.assertTrue(any("注册未计成功且不保存账号" in line for line in snapshot["logs"]))
+        self.assertTrue(any("failed_skip_save" in str(call) for call in save_log.call_args_list))
 
     def test_effective_register_extra_uses_access_token_checkout_defaults(self):
         req = RegisterTaskRequest(
