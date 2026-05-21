@@ -16,7 +16,7 @@ try:
 except ImportError:
     import requests as curl_requests
 
-from .phone_service import SMSToMePhoneService
+from .phone_service import create_phone_service
 from .utils import (
     FlowState,
     apply_browser_fingerprint,
@@ -1285,6 +1285,7 @@ class OAuthClient:
         login_source="",
         stop_after_login=False,
         workspace_scope_preference=None,
+        allow_add_phone_session_recovery=True,
         _recovery_depth=0,
     ):
         """
@@ -1308,6 +1309,7 @@ class OAuthClient:
             last_name: about_you 姓氏
             birthdate: about_you 生日，格式 YYYY-MM-DD
             login_source: 当前登录场景，仅用于日志
+            allow_add_phone_session_recovery: allow_phone_verification=false 时是否允许内部重启一次 add_phone OAuth session
 
         Returns:
             dict: tokens 字典，包含 access_token, refresh_token, id_token
@@ -1616,6 +1618,7 @@ class OAuthClient:
                             login_source=f"{login_source}:retry_after_invalid_about_you",
                             stop_after_login=stop_after_login,
                             workspace_scope_preference=workspace_scope_preference,
+                            allow_add_phone_session_recovery=allow_add_phone_session_recovery,
                             _recovery_depth=_recovery_depth + 1,
                         )
                     self._set_error(
@@ -1693,6 +1696,7 @@ class OAuthClient:
                             ),
                             stop_after_login=stop_after_login,
                             workspace_scope_preference=workspace_scope_preference,
+                            allow_add_phone_session_recovery=allow_add_phone_session_recovery,
                             _recovery_depth=_recovery_depth + 1,
                         )
                     if not self.last_error:
@@ -1714,7 +1718,7 @@ class OAuthClient:
                         self._log(
                             "步骤5: add_phone 命中，但检测到 workspace 线索，继续尝试 workspace/org 选择"
                         )
-                    elif prefer_passwordless_login and _recovery_depth < 1:
+                    elif prefer_passwordless_login and allow_add_phone_session_recovery and _recovery_depth < 1:
                         self._log(
                             "步骤5: add_phone 仍无 workspace/callback，重启一次全新 OAuth session + 新 PKCE"
                         )
@@ -1740,6 +1744,7 @@ class OAuthClient:
                                 else "add_phone_recovery"
                             ),
                             workspace_scope_preference=workspace_scope_preference,
+                            allow_add_phone_session_recovery=allow_add_phone_session_recovery,
                             _recovery_depth=_recovery_depth + 1,
                         )
                     else:
@@ -1754,6 +1759,7 @@ class OAuthClient:
                         sec_ch_ua,
                         impersonate,
                         state,
+                        email=email,
                     )
                     if not next_state:
                         if not self.last_error:
@@ -3039,12 +3045,12 @@ class OAuthClient:
         return True, next_state, ""
 
     def _handle_add_phone_verification(
-        self, device_id, user_agent, sec_ch_ua, impersonate, state: FlowState
+        self, device_id, user_agent, sec_ch_ua, impersonate, state: FlowState, email: str = ""
     ):
-        phone_service = SMSToMePhoneService(self.config, log_fn=self._log)
+        phone_service = create_phone_service(self.config, log_fn=self._log)
         if not phone_service.enabled:
             self._set_error(
-                "OAuth 登录被 add_phone 阻断，当前账号需要手机号验证；未配置可用的 SMSToMe 号码池"
+                "OAuth 登录被 add_phone 阻断，当前账号需要手机号验证；未配置可用的接码服务"
             )
             return None
 
@@ -3053,7 +3059,7 @@ class OAuthClient:
 
         for attempt in range(phone_service.max_attempts):
             try:
-                entry = phone_service.acquire_phone(exclude_prefixes=excluded_prefixes)
+                entry = phone_service.acquire_phone(exclude_prefixes=excluded_prefixes, email=email)
             except Exception as e:
                 last_failure = f"获取手机号失败: {e}"
                 self._log(last_failure)
@@ -3078,6 +3084,7 @@ class OAuthClient:
             if not sent or not next_state:
                 last_failure = detail or "add-phone/send 未返回有效状态"
                 self._log(last_failure)
+                phone_service.cancel(entry, reason=last_failure)
                 self._blacklist_phone_if_needed(phone_service, entry, last_failure)
                 excluded_prefixes.add(prefix)
                 continue
@@ -3089,6 +3096,7 @@ class OAuthClient:
             ):
                 last_failure = f"add-phone/send 未进入手机验证码页: {describe_flow_state(next_state)}"
                 self._log(last_failure)
+                phone_service.cancel(entry, reason=last_failure)
                 self._blacklist_phone_if_needed(
                     phone_service, entry, last_failure, next_state
                 )
@@ -3109,10 +3117,12 @@ class OAuthClient:
             self._log(
                 f"add_phone 发码成功: phone={bound_phone}, channel={verification_channel}"
             )
+            phone_service.mark_sms_sent(entry)
 
             if verification_channel != "sms":
-                last_failure = f"add_phone 已切到 {verification_channel} 通道，当前 SMSToMe 仅支持短信接码"
+                last_failure = f"add_phone 已切到 {verification_channel} 通道，当前接码服务仅支持短信接码"
                 self._log(last_failure)
+                phone_service.cancel(entry, reason=last_failure)
                 excluded_prefixes.add(prefix)
                 continue
 
@@ -3127,12 +3137,14 @@ class OAuthClient:
                     next_state,
                 )
                 if resend_ok:
+                    phone_service.request_next_code(entry)
                     code = phone_service.wait_for_code(entry)
                 if not code:
                     last_failure = (
                         resend_detail or f"手机号 {entry.phone} 未收到短信验证码"
                     )
                     self._log(last_failure)
+                    phone_service.cancel(entry, reason=last_failure)
                     excluded_prefixes.add(prefix)
                     continue
 
@@ -3147,9 +3159,11 @@ class OAuthClient:
             if not valid or not validated_state:
                 last_failure = detail or "手机号 OTP 验证失败"
                 self._log(last_failure)
+                phone_service.cancel(entry, reason=last_failure)
                 excluded_prefixes.add(prefix)
                 continue
 
+            phone_service.complete(entry)
             return validated_state
 
         self._set_error(f"add_phone 阶段失败: {last_failure or '未完成手机号验证'}")
@@ -3464,4 +3478,3 @@ class OAuthClient:
                 f"OAuth 阶段 OTP 验证失败，已尝试 {len(tried_codes)} 个验证码，等待窗口 {otp_wait_seconds}s"
             )
         return None
-

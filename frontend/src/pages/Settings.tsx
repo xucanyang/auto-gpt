@@ -78,6 +78,10 @@ const SELECT_FIELDS: Record<string, { label: string; value: string }[]> = {
     { label: '跟随结账国家', value: 'checkout_country' },
     { label: '固定国家', value: 'fixed_country' },
   ],
+  chatgpt_phone_verification_provider: [
+    { label: 'SMSToMe 号码池', value: 'smstome' },
+    { label: '本地接码网关', value: 'local_gateway' },
+  ],
 }
 
 const TAB_ITEMS = [
@@ -327,6 +331,14 @@ const TAB_ITEMS = [
         ],
       },
       {
+        title: '补抓 Auth',
+        desc: '账号页与批量补抓 Auth 的默认参数',
+        fields: [
+          { key: 'chatgpt_resume_auth_allow_phone_verification', label: '默认允许手机号验证', type: 'boolean' },
+          { key: 'chatgpt_subscription_auth_capture_retry_delays_seconds', label: '重试间隔（秒）', placeholder: '5,10' },
+        ],
+      },
+      {
         title: 'GoPay 账单地址 LLM',
         desc: 'GoPay 启动时生成本次账单地址，失败时回落到表单/默认地址',
         fields: [
@@ -383,15 +395,22 @@ const TAB_ITEMS = [
         ],
       },
       {
-        title: 'SMSToMe 手机验证',
+        title: '手机验证 / 接码服务',
         desc: 'ChatGPT add_phone 阶段自动取号并轮询短信验证码',
         fields: [
+          { key: 'chatgpt_phone_verification_provider', label: '接码服务', type: 'select' },
+          { key: 'local_phone_gateway_url', label: '本地网关 URL', placeholder: 'http://sms-gateway:8720' },
+          { key: 'local_phone_gateway_token', label: '本地网关 Token', secret: true },
+          { key: 'local_phone_gateway_service_alias', label: '本地网关服务别名', placeholder: 'chatgpt' },
+          { key: 'local_phone_gateway_timeout_seconds', label: '本地网关等待秒数', placeholder: '180' },
+          { key: 'local_phone_gateway_poll_interval_seconds', label: '本地网关轮询间隔秒数', placeholder: '5' },
+          { key: 'local_phone_gateway_max_attempts', label: '本地网关换号次数', placeholder: '3' },
           { key: 'smstome_cookie', label: 'SMSToMe Cookie', secret: true },
-          { key: 'smstome_country_slugs', label: '国家列表', placeholder: 'united-kingdom,poland' },
-          { key: 'smstome_phone_attempts', label: '手机号尝试次数', placeholder: '3' },
-          { key: 'smstome_otp_timeout_seconds', label: '短信等待秒数', placeholder: '45' },
-          { key: 'smstome_poll_interval_seconds', label: '轮询间隔秒数', placeholder: '5' },
-          { key: 'smstome_sync_max_pages_per_country', label: '每国同步页数', placeholder: '5' },
+          { key: 'smstome_country_slugs', label: 'SMSToMe 国家列表', placeholder: 'united-kingdom,poland' },
+          { key: 'smstome_phone_attempts', label: 'SMSToMe 手机号尝试次数', placeholder: '3' },
+          { key: 'smstome_otp_timeout_seconds', label: 'SMSToMe 短信等待秒数', placeholder: '45' },
+          { key: 'smstome_poll_interval_seconds', label: 'SMSToMe 轮询间隔秒数', placeholder: '5' },
+          { key: 'smstome_sync_max_pages_per_country', label: 'SMSToMe 每国同步页数', placeholder: '5' },
         ],
       },
     ],
@@ -447,6 +466,40 @@ interface SectionConfig {
     lines: string[]
   }
   fields: FieldConfig[]
+}
+
+const CHATGPT_PINNED_SECTIONS_STORAGE_KEY = 'any-auto-register.settings.chatgpt.pinned-sections'
+
+function loadChatgptPinnedSections(): string[] {
+  if (typeof window === 'undefined') return []
+  try {
+    const raw = window.localStorage.getItem(CHATGPT_PINNED_SECTIONS_STORAGE_KEY)
+    const parsed = raw ? JSON.parse(raw) : []
+    if (!Array.isArray(parsed)) return []
+    return parsed.map((item) => String(item || '').trim()).filter(Boolean)
+  } catch {
+    return []
+  }
+}
+
+function normalizePinnedSections(pinnedSections: string[], sections: SectionConfig[]): string[] {
+  const available = new Set(sections.map((section) => section.title))
+  const seen = new Set<string>()
+  return pinnedSections.filter((title) => {
+    if (!available.has(title) || seen.has(title)) return false
+    seen.add(title)
+    return true
+  })
+}
+
+function orderPinnedSections(sections: SectionConfig[], pinnedSections: string[]): SectionConfig[] {
+  const normalizedPinned = normalizePinnedSections(pinnedSections, sections)
+  if (!normalizedPinned.length) return sections
+  const byTitle = new Map(sections.map((section) => [section.title, section]))
+  return [
+    ...(normalizedPinned.map((title) => byTitle.get(title)).filter(Boolean) as SectionConfig[]),
+    ...sections.filter((section) => !normalizedPinned.includes(section.title)),
+  ]
 }
 
 function getMailboxSectionProvider(title: string): string | null {
@@ -661,6 +714,16 @@ function ConfigField({ field }: { field: FieldConfig }) {
         ? '必须大于或等于最小分钟；填写更大的范围可以降低固定节奏触发风控的概率。'
       : field.key === 'icloud_hme_auto_create_rate_limit_backoff_minutes'
         ? '如果 Apple 返回创建限流，后台会至少等待这么久后再尝试。'
+      : field.key === 'chatgpt_resume_auth_allow_phone_verification'
+        ? '关闭时遇到 add_phone 只记录为需要手机号；开启后补抓 Auth 会调用已配置的手机验证码 API。'
+      : field.key === 'chatgpt_subscription_auth_capture_retry_delays_seconds'
+        ? '用英文逗号分隔，例如 5,10；遇到 add_phone 或临时认证错误时按这些间隔重试。'
+      : field.key === 'chatgpt_phone_verification_provider'
+        ? '选择 add_phone 阶段使用的接码来源；本地接码网关会把 SMSBower 等平台隔离到独立项目里。'
+      : field.key === 'local_phone_gateway_url'
+        ? '主容器内访问独立接码网关的地址；Docker 网络内推荐 http://sms-gateway:8720。'
+      : field.key === 'local_phone_gateway_token'
+        ? '独立接码网关的 Bearer Token，只保存在主项目配置中，不会展示明文。'
       : undefined
 
   return (
@@ -692,9 +755,23 @@ function ConfigField({ field }: { field: FieldConfig }) {
   )
 }
 
-function ConfigSection({ section, defaultCollapsed = false }: { section: SectionConfig; defaultCollapsed?: boolean }) {
+function ConfigSection({
+  section,
+  defaultCollapsed = false,
+  autoExpand = false,
+}: {
+  section: SectionConfig
+  defaultCollapsed?: boolean
+  autoExpand?: boolean
+}) {
   const [collapsed, setCollapsed] = useState(defaultCollapsed)
   const [helpCollapsed, setHelpCollapsed] = useState(true)
+
+  useEffect(() => {
+    if (autoExpand) {
+      setCollapsed(false)
+    }
+  }, [autoExpand, section.title])
 
   return (
     <Card
@@ -2319,7 +2396,13 @@ export default function Settings() {
   const [saving, setSaving] = useState(false)
   const [saved, setSaved] = useState(false)
   const [activeTab, setActiveTab] = useState('register')
+  const [chatgptPinnedSections, setChatgptPinnedSections] = useState<string[]>(loadChatgptPinnedSections)
   const selectedMailProvider = Form.useWatch('mail_provider', form) || 'luckmail'
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    window.localStorage.setItem(CHATGPT_PINNED_SECTIONS_STORAGE_KEY, JSON.stringify(chatgptPinnedSections))
+  }, [chatgptPinnedSections])
 
   useEffect(() => {
     apiFetch('/config').then((data) => {
@@ -2380,6 +2463,27 @@ export default function Settings() {
       if (!data.chatgpt_access_token_only_checkout_currency) {
         data.chatgpt_access_token_only_checkout_currency = 'USD'
       }
+      if (!data.chatgpt_subscription_auth_capture_retry_delays_seconds) {
+        data.chatgpt_subscription_auth_capture_retry_delays_seconds = '5,10'
+      }
+      if (!data.chatgpt_phone_verification_provider) {
+        data.chatgpt_phone_verification_provider = 'smstome'
+      }
+      if (!data.local_phone_gateway_url) {
+        data.local_phone_gateway_url = 'http://sms-gateway:8720'
+      }
+      if (!data.local_phone_gateway_service_alias) {
+        data.local_phone_gateway_service_alias = 'chatgpt'
+      }
+      if (!data.local_phone_gateway_timeout_seconds) {
+        data.local_phone_gateway_timeout_seconds = '180'
+      }
+      if (!data.local_phone_gateway_poll_interval_seconds) {
+        data.local_phone_gateway_poll_interval_seconds = '5'
+      }
+      if (!data.local_phone_gateway_max_attempts) {
+        data.local_phone_gateway_max_attempts = '3'
+      }
       if (!data.cloudmail_timeout) {
         data.cloudmail_timeout = 30
       }
@@ -2434,6 +2538,9 @@ export default function Settings() {
           : parseBooleanConfigValue(data.chatgpt_access_token_only_checkout_amount_check_enabled)
       data.chatgpt_access_token_only_zero_amount_stop_enabled = parseBooleanConfigValue(
         data.chatgpt_access_token_only_zero_amount_stop_enabled,
+      )
+      data.chatgpt_resume_auth_allow_phone_verification = parseBooleanConfigValue(
+        data.chatgpt_resume_auth_allow_phone_verification,
       )
       data.external_subscription_api_enabled = parseBooleanConfigValue(data.external_subscription_api_enabled)
       form.setFieldsValue(data)
@@ -2494,6 +2601,9 @@ export default function Settings() {
       values.chatgpt_access_token_only_zero_amount_stop_enabled = parseBooleanConfigValue(
         values.chatgpt_access_token_only_zero_amount_stop_enabled,
       )
+      values.chatgpt_resume_auth_allow_phone_verification = parseBooleanConfigValue(
+        values.chatgpt_resume_auth_allow_phone_verification,
+      )
       values.external_subscription_api_enabled = parseBooleanConfigValue(values.external_subscription_api_enabled)
       values.external_subscription_api_token = String(values.external_subscription_api_token || '').trim()
       values.chatgpt_access_token_only_zero_amount_stop_threshold = String(
@@ -2505,6 +2615,16 @@ export default function Settings() {
       values.chatgpt_access_token_only_checkout_currency = String(
         values.chatgpt_access_token_only_checkout_currency || 'USD',
       ).trim().toUpperCase() || 'USD'
+      values.chatgpt_subscription_auth_capture_retry_delays_seconds = String(
+        values.chatgpt_subscription_auth_capture_retry_delays_seconds || '5,10',
+      ).trim() || '5,10'
+      values.chatgpt_phone_verification_provider = String(values.chatgpt_phone_verification_provider || 'smstome').trim() || 'smstome'
+      values.local_phone_gateway_url = String(values.local_phone_gateway_url || 'http://sms-gateway:8720').trim() || 'http://sms-gateway:8720'
+      values.local_phone_gateway_token = String(values.local_phone_gateway_token || '').trim()
+      values.local_phone_gateway_service_alias = String(values.local_phone_gateway_service_alias || 'chatgpt').trim() || 'chatgpt'
+      values.local_phone_gateway_timeout_seconds = String(values.local_phone_gateway_timeout_seconds || '180').trim() || '180'
+      values.local_phone_gateway_poll_interval_seconds = String(values.local_phone_gateway_poll_interval_seconds || '5').trim() || '5'
+      values.local_phone_gateway_max_attempts = String(values.local_phone_gateway_max_attempts || '3').trim() || '3'
 
       await apiFetch('/config', { method: 'PUT', body: JSON.stringify({ data: values }) })
       form.setFieldsValue({
@@ -2529,6 +2649,15 @@ export default function Settings() {
         chatgpt_access_token_only_checkout_currency: values.chatgpt_access_token_only_checkout_currency,
         chatgpt_access_token_only_zero_amount_stop_enabled: values.chatgpt_access_token_only_zero_amount_stop_enabled,
         chatgpt_access_token_only_zero_amount_stop_threshold: values.chatgpt_access_token_only_zero_amount_stop_threshold,
+        chatgpt_resume_auth_allow_phone_verification: values.chatgpt_resume_auth_allow_phone_verification,
+        chatgpt_subscription_auth_capture_retry_delays_seconds: values.chatgpt_subscription_auth_capture_retry_delays_seconds,
+        chatgpt_phone_verification_provider: values.chatgpt_phone_verification_provider,
+        local_phone_gateway_url: values.local_phone_gateway_url,
+        local_phone_gateway_token: values.local_phone_gateway_token,
+        local_phone_gateway_service_alias: values.local_phone_gateway_service_alias,
+        local_phone_gateway_timeout_seconds: values.local_phone_gateway_timeout_seconds,
+        local_phone_gateway_poll_interval_seconds: values.local_phone_gateway_poll_interval_seconds,
+        local_phone_gateway_max_attempts: values.local_phone_gateway_max_attempts,
         external_subscription_api_enabled: values.external_subscription_api_enabled,
         external_subscription_api_token: values.external_subscription_api_token,
       })
@@ -2550,6 +2679,16 @@ export default function Settings() {
           return provider === selectedMailProvider
         })
       : currentTab.sections
+  const normalizedChatgptPinnedSections =
+    activeTab === 'chatgpt' ? normalizePinnedSections(chatgptPinnedSections, visibleSections) : []
+  const orderedVisibleSections =
+    activeTab === 'chatgpt' ? orderPinnedSections(visibleSections, normalizedChatgptPinnedSections) : visibleSections
+  const toggleChatgptPinnedSection = (sectionTitle: string, checked: boolean) => {
+    setChatgptPinnedSections((prev) => {
+      const withoutCurrent = prev.filter((title) => title !== sectionTitle)
+      return checked ? [...withoutCurrent, sectionTitle] : withoutCurrent
+    })
+  }
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
@@ -2597,16 +2736,77 @@ export default function Settings() {
                       description="这是任务级模式：真正的邮箱地址不在全局设置里填写，而是在“注册任务”页面、选择 ChatGPT 后，在邮箱服务下拉里选它，再填写邮箱地址。任务跑到邮箱 OTP 时，会在任务状态区弹出验证码输入框。若你要走“已有账号抓 auth”，默认登录密码请到 ChatGPT 分组里的“已有账号抓 auth 默认密码”填写。"
                     />
                   ) : null}
-                  {visibleSections.map((section) => (
-                    <ConfigSection key={`${activeTab}:${section.title}`} section={section} defaultCollapsed={activeTab === 'chatgpt'} />
+                  {activeTab === 'chatgpt' ? (
+                    <>
+                      <Card size="small" style={{ marginBottom: 12 }}>
+                        <Space direction="vertical" size={10} style={{ width: '100%' }}>
+                          <Space size={8} wrap style={{ width: '100%', justifyContent: 'space-between' }}>
+                            <Space size={8} wrap>
+                              <Typography.Text strong>置顶面板</Typography.Text>
+                              <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                                勾选后会把对应 ChatGPT 面板移动到最上方
+                              </Typography.Text>
+                            </Space>
+                            {normalizedChatgptPinnedSections.length > 0 ? (
+                              <Button size="small" type="link" onClick={() => setChatgptPinnedSections([])}>
+                                清空置顶
+                              </Button>
+                            ) : null}
+                          </Space>
+                          <Space size={[8, 8]} wrap>
+                            {visibleSections.map((section) => {
+                              const checked = normalizedChatgptPinnedSections.includes(section.title)
+                              return (
+                                <Tag.CheckableTag
+                                  key={section.title}
+                                  checked={checked}
+                                  onChange={(nextChecked) => toggleChatgptPinnedSection(section.title, nextChecked)}
+                                  style={{
+                                    border: `1px solid ${checked ? '#91caff' : '#d9d9d9'}`,
+                                    borderRadius: 999,
+                                    padding: '4px 10px',
+                                    marginInlineEnd: 0,
+                                    background: checked ? '#e6f4ff' : '#fafafa',
+                                    color: checked ? '#0958d9' : 'rgba(0, 0, 0, 0.65)',
+                                    fontWeight: checked ? 600 : 500,
+                                  }}
+                                >
+                                  {section.title}
+                                </Tag.CheckableTag>
+                              )
+                            })}
+                          </Space>
+                        </Space>
+                      </Card>
+                      <Button
+                        type="primary"
+                        icon={<SaveOutlined />}
+                        onClick={save}
+                        loading={saving}
+                        block
+                        style={{ marginBottom: 16 }}
+                      >
+                        {saved ? '已保存 ✓' : '保存配置'}
+                      </Button>
+                    </>
+                  ) : null}
+                  {orderedVisibleSections.map((section) => (
+                    <ConfigSection
+                      key={`${activeTab}:${section.title}`}
+                      section={section}
+                      defaultCollapsed={activeTab === 'chatgpt'}
+                      autoExpand={activeTab === 'chatgpt' && normalizedChatgptPinnedSections.includes(section.title)}
+                    />
                   ))}
                   {activeTab === 'mailbox' && selectedMailProvider === 'icloud_hme' ? <ICloudHmeManagerSection form={form} /> : null}
                   {activeTab === 'mailbox' && selectedMailProvider === 'applemail' ? <AppleMailPoolImportSection form={form} /> : null}
                   {activeTab === 'mailbox' && selectedMailProvider === 'cfworker' ? <CFWorkerDomainPoolSection form={form} /> : null}
                   {activeTab === 'mailbox' && selectedMailProvider === 'outlook' ? <OutlookImportSection /> : null}
-                  <Button type="primary" icon={<SaveOutlined />} onClick={save} loading={saving} block>
-                    {saved ? '已保存 ✓' : '保存配置'}
-                  </Button>
+                  {activeTab !== 'chatgpt' ? (
+                    <Button type="primary" icon={<SaveOutlined />} onClick={save} loading={saving} block>
+                      {saved ? '已保存 ✓' : '保存配置'}
+                    </Button>
+                  ) : null}
                 </>
               )}
             </Form>

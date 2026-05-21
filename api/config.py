@@ -79,6 +79,13 @@ CONFIG_KEYS = [
     "cfworker_subdomain",
     "cfworker_random_subdomain",
     "cfworker_fingerprint",
+    "chatgpt_phone_verification_provider",
+    "local_phone_gateway_url",
+    "local_phone_gateway_token",
+    "local_phone_gateway_service_alias",
+    "local_phone_gateway_timeout_seconds",
+    "local_phone_gateway_poll_interval_seconds",
+    "local_phone_gateway_max_attempts",
     "smstome_cookie",
     "smstome_country_slugs",
     "smstome_phone_attempts",
@@ -104,6 +111,8 @@ CONFIG_KEYS = [
     "chatgpt_capture_free_workspace",
     "chatgpt_capture_business_workspace",
     "chatgpt_existing_account_login_password",
+    "chatgpt_resume_auth_allow_phone_verification",
+    "chatgpt_subscription_auth_capture_retry_delays_seconds",
     "chatgpt_gopay_defaults",
     "chatgpt_payment_link_defaults",
     "chatgpt_access_token_only_checkout_amount_check_enabled",
@@ -199,6 +208,22 @@ def get_config():
         all_cfg["chatgpt_access_token_only_zero_amount_stop_threshold"] = "1"
     if not all_cfg.get("external_subscription_api_enabled"):
         all_cfg["external_subscription_api_enabled"] = "false"
+    if not all_cfg.get("chatgpt_resume_auth_allow_phone_verification"):
+        all_cfg["chatgpt_resume_auth_allow_phone_verification"] = "false"
+    if not all_cfg.get("chatgpt_subscription_auth_capture_retry_delays_seconds"):
+        all_cfg["chatgpt_subscription_auth_capture_retry_delays_seconds"] = "5,10"
+    if not all_cfg.get("chatgpt_phone_verification_provider"):
+        all_cfg["chatgpt_phone_verification_provider"] = "smstome"
+    if not all_cfg.get("local_phone_gateway_url"):
+        all_cfg["local_phone_gateway_url"] = "http://sms-gateway:8720"
+    if not all_cfg.get("local_phone_gateway_service_alias"):
+        all_cfg["local_phone_gateway_service_alias"] = "chatgpt"
+    if not all_cfg.get("local_phone_gateway_timeout_seconds"):
+        all_cfg["local_phone_gateway_timeout_seconds"] = "180"
+    if not all_cfg.get("local_phone_gateway_poll_interval_seconds"):
+        all_cfg["local_phone_gateway_poll_interval_seconds"] = "5"
+    if not all_cfg.get("local_phone_gateway_max_attempts"):
+        all_cfg["local_phone_gateway_max_attempts"] = "3"
     if not all_cfg.get("chatgpt_gopay_billing_llm_base_url"):
         all_cfg["chatgpt_gopay_billing_llm_base_url"] = "https://api.666800.xyz"
     if not all_cfg.get("chatgpt_gopay_billing_llm_model"):

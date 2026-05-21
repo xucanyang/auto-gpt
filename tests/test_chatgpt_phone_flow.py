@@ -139,7 +139,7 @@ class OAuthPhoneBlacklistTests(unittest.TestCase):
         phone_service.acquire_phone.return_value = entry
         phone_service.prefix_hint.return_value = "+447000"
 
-        with mock.patch("services.chatgpt_core.oauth_client.SMSToMePhoneService", return_value=phone_service):
+        with mock.patch("services.chatgpt_core.oauth_client.create_phone_service", return_value=phone_service):
             with mock.patch.object(
                 client,
                 "_send_phone_number",
@@ -176,7 +176,7 @@ class OAuthPhoneBlacklistTests(unittest.TestCase):
             continue_url="https://auth.openai.com/phone-verification",
         )
 
-        with mock.patch("services.chatgpt_core.oauth_client.SMSToMePhoneService", return_value=phone_service):
+        with mock.patch("services.chatgpt_core.oauth_client.create_phone_service", return_value=phone_service):
             with mock.patch.object(client, "_send_phone_number", return_value=(True, next_state, "")):
                 with mock.patch.object(
                     client,
