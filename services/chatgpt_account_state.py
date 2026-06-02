@@ -172,9 +172,12 @@ def apply_auth_capture_status(account: Any, captured_status: Any) -> str:
 def is_account_deactivated_message(error_code: Any = "", message: Any = "") -> bool:
     code = _lower_text(error_code)
     text = _lower_text(message)
-    if code in {"account_deactivated", "account_deleted", "deactivated_workspace"}:
+    if code in {"account_deactivated", "account_deleted", "account_delete", "deactivated_workspace"}:
         return True
     markers = (
+        "account_delete",
+        "account_deleted",
+        "account_deactivated",
         "deleted or deactivated",
         "account has been deleted or deactivated",
         "you do not have an account because it has been deleted or deactivated",

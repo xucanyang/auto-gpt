@@ -2,26 +2,34 @@ import { lazy, Suspense, useEffect, useState, useCallback, useRef } from 'react'
 import type { CSSProperties } from 'react'
 import {
   Button,
+  Checkbox,
   Dropdown,
   Input,
+  InputNumber,
   Tag,
   Space,
   Modal,
   Form,
+  Select,
   message,
   Typography,
   Alert,
   Popconfirm,
   theme,
+  Grid,
   Steps,
+  Switch,
 } from 'antd'
+import type { CheckboxOptionType } from 'antd/es/checkbox/Group'
 import type { MenuProps } from 'antd'
 import {
   CopyOutlined,
+  DownOutlined,
   LinkOutlined,
   MoreOutlined,
   UploadOutlined,
   SyncOutlined,
+  SettingOutlined,
 } from '@ant-design/icons'
 import { TaskLogPanel } from '@/components/TaskLogPanel'
 import { AddAccountModal } from '@/features/accounts/components/AddAccountModal'
@@ -41,6 +49,12 @@ import { usePersistentChatGPTRegistrationMode } from '@/hooks/usePersistentChatG
 import { parseBooleanConfigValue } from '@/lib/configValueParsers'
 import { buildChatGPTRegistrationRequestAdapter } from '@/lib/chatgptRegistrationRequestAdapter'
 import { CHATGPT_REGISTRATION_MODE_REFRESH_TOKEN } from '@/lib/chatgptRegistrationMode'
+import {
+  DEFAULT_GOPAY_PHONE_COUNTRY_CODE,
+  normalizeGopayPhonePart,
+  normalizeGopayRecognizedCountryCodes,
+  splitGopayPhoneInput,
+} from '@/lib/gopayPhone'
 import { apiFetch } from '@/lib/utils'
 import { normalizeExecutorForPlatform } from '@/lib/platformExecutorOptions'
 
@@ -54,6 +68,7 @@ const AccountActionSurface = lazy(() =>
 
 const GOPAY_ACTIVE_PHASES = new Set(['created', 'starting', 'waiting_otp', 'waiting_link_pin', 'waiting_payment_pin', 'verifying'])
 const TASK_MODAL_STORAGE_KEY = 'auto-chatgpt.accounts.task-modal.current-task'
+const ACCOUNT_COLUMN_VISIBILITY_STORAGE_KEY = 'auto-chatgpt.accounts.visible-columns.v1'
 
 const GOPAY_PHASE_META: Record<string, { title: string; description: string; step: number; status?: 'wait' | 'process' | 'finish' | 'error' }> = {
   created: { title: '已创建', description: '准备开始 GoPay 支付', step: 0, status: 'process' },
@@ -77,6 +92,117 @@ const DEFAULT_CHECKOUT_CURRENCY = 'IDR'
 const DEFAULT_GOPAY_OTP_AUTO_RESEND_DELAY_SECONDS = 120
 const ACCOUNTS_PAGE_SIZE = 10
 const EMPTY_LIST: any[] = []
+const SUBSCRIPTION_EXPIRY_SORT_FIELD = 'subscription_active_until'
+
+type SubscriptionExpirySortOrder = '' | 'asc' | 'desc'
+
+type AccountColumnKey =
+  | 'manually_used'
+  | 'phone_binding'
+  | 'password'
+  | 'auth_type'
+  | 'status'
+  | 'subscription_type'
+  | 'subscription_active_until'
+  | 'account_validity'
+  | 'sub2api_state'
+  | 'created_at'
+
+const ACCOUNT_COLUMN_OPTIONS: Array<{ value: AccountColumnKey; text: string; chatgptOnly?: boolean }> = [
+  { value: 'manually_used', text: '使用状态' },
+  { value: 'phone_binding', text: '手机号/API', chatgptOnly: true },
+  { value: 'password', text: '密码' },
+  { value: 'auth_type', text: '认证类型', chatgptOnly: true },
+  { value: 'status', text: '账号状态' },
+  { value: 'subscription_type', text: '订阅类型', chatgptOnly: true },
+  { value: 'subscription_active_until', text: '订阅到期', chatgptOnly: true },
+  { value: 'account_validity', text: '账号有效性', chatgptOnly: true },
+  { value: 'sub2api_state', text: 'Sub2API', chatgptOnly: true },
+  { value: 'created_at', text: '注册时间' },
+]
+
+const DEFAULT_VISIBLE_ACCOUNT_COLUMNS: AccountColumnKey[] = [
+  'manually_used',
+  'phone_binding',
+  'auth_type',
+  'status',
+  'subscription_type',
+  'subscription_active_until',
+  'account_validity',
+  'created_at',
+]
+
+const ACCOUNT_COLUMN_OPTION_KEYS = new Set<AccountColumnKey>(ACCOUNT_COLUMN_OPTIONS.map((item) => item.value))
+
+type AccountColumnFilters = {
+  email: string
+  status: string[]
+  manuallyUsed: string[]
+  authType: string[]
+  subscriptionType: string[]
+  accountValidity: string[]
+  sub2apiState: string[]
+}
+
+const EMPTY_ACCOUNT_FILTERS: AccountColumnFilters = {
+  email: '',
+  status: [],
+  manuallyUsed: [],
+  authType: [],
+  subscriptionType: [],
+  accountValidity: [],
+  sub2apiState: [],
+}
+
+const STATUS_FILTER_OPTIONS = [
+  { value: 'registered', text: '已注册' },
+  { value: 'pending_payment', text: '待支付' },
+  { value: 'payment_failed', text: '支付失败' },
+  { value: 'trial', text: '试用中' },
+  { value: 'subscribed', text: '已订阅' },
+  { value: 'expired', text: '已过期' },
+  { value: 'invalid', text: '已失效' },
+]
+
+const MANUAL_USE_FILTER_OPTIONS = [
+  { value: 'true', text: '已使用' },
+  { value: 'false', text: '未使用' },
+]
+
+const AUTH_TYPE_FILTER_OPTIONS = [
+  { value: 'refresh_token', text: '有 RT' },
+  { value: 'access_token_only', text: '仅 AT' },
+  { value: 'unknown', text: '无认证材料' },
+]
+
+const SUBSCRIPTION_TYPE_FILTER_OPTIONS = [
+  { value: 'free', text: 'Free' },
+  { value: 'plus', text: 'Plus' },
+  { value: 'team', text: 'Team / Business' },
+  { value: 'pro', text: 'Pro' },
+  { value: 'enterprise', text: 'Enterprise' },
+  { value: 'unknown', text: '未知' },
+]
+
+const ACCOUNT_VALIDITY_FILTER_OPTIONS = [
+  { value: 'valid', text: '有效' },
+  { value: 'invalid', text: '失效' },
+]
+
+const SUB2API_FILTER_OPTIONS = [
+  { value: 'exists', text: '已存在' },
+  { value: 'not_found', text: '未发现' },
+  { value: 'cross_workspace_only', text: '其他工作区已存在' },
+  { value: 'deleted_exact_match', text: '已删可重传' },
+  { value: 'ambiguous', text: '多候选' },
+  { value: 'unreachable', text: '不可达' },
+  { value: 'unknown', text: '未同步' },
+]
+
+const SUBSCRIPTION_EXPIRY_SORT_OPTIONS = [
+  { value: 'asc', text: '到期最早' },
+  { value: 'desc', text: '到期最晚' },
+]
 
 function normalizeCheckoutCountry(value: unknown) {
   return String(value || DEFAULT_CHECKOUT_COUNTRY).trim().toUpperCase() || DEFAULT_CHECKOUT_COUNTRY
@@ -138,10 +264,6 @@ function parseMaybeJsonArray(value: unknown) {
   }
 }
 
-function normalizeGopayPhonePart(value: unknown) {
-  return String(value || '').replace(/\D/g, '')
-}
-
 function getGopayPhoneKey(phone: Pick<GopayPhoneCandidate, 'phone_country_code' | 'phone_number'>) {
   return `${normalizeGopayPhonePart(phone.phone_country_code)}:${normalizeGopayPhonePart(phone.phone_number)}`
 }
@@ -155,7 +277,7 @@ function formatGopayPhoneLabel(phone: Partial<GopayPhoneCandidate>) {
 }
 
 function normalizeGopayPhoneCandidate(value: any, index = 0): GopayPhoneCandidate | null {
-  const phone_country_code = normalizeGopayPhonePart(value?.phone_country_code || value?.country_code || value?.code || '86')
+  const phone_country_code = normalizeGopayPhonePart(value?.phone_country_code || value?.country_code || value?.code || DEFAULT_GOPAY_PHONE_COUNTRY_CODE)
   const phone_number = normalizeGopayPhonePart(value?.phone_number || value?.number || value?.phone || '')
   if (!phone_country_code || !phone_number) return null
   const key = `${phone_country_code}:${phone_number}`
@@ -361,11 +483,40 @@ function saveRegisterFormSettings(platform: string, values: Record<string, unkno
   window.localStorage.setItem(getRegisterFormSettingsStorageKey(platform), JSON.stringify(values))
 }
 
+function normalizeVisibleAccountColumns(value: unknown): AccountColumnKey[] {
+  if (!Array.isArray(value)) return [...DEFAULT_VISIBLE_ACCOUNT_COLUMNS]
+  const normalized = value
+    .map((item) => String(item || '').trim())
+    .filter((item): item is AccountColumnKey => ACCOUNT_COLUMN_OPTION_KEYS.has(item as AccountColumnKey))
+  return Array.from(new Set(normalized))
+}
+
+function loadVisibleAccountColumnKeys() {
+  if (typeof window === 'undefined') return [...DEFAULT_VISIBLE_ACCOUNT_COLUMNS]
+  try {
+    const raw = window.localStorage.getItem(ACCOUNT_COLUMN_VISIBILITY_STORAGE_KEY)
+    if (!raw) return [...DEFAULT_VISIBLE_ACCOUNT_COLUMNS]
+    return normalizeVisibleAccountColumns(JSON.parse(raw))
+  } catch {
+    return [...DEFAULT_VISIBLE_ACCOUNT_COLUMNS]
+  }
+}
+
+function saveVisibleAccountColumnKeys(keys: AccountColumnKey[]) {
+  if (typeof window === 'undefined') return
+  window.localStorage.setItem(ACCOUNT_COLUMN_VISIBILITY_STORAGE_KEY, JSON.stringify(normalizeVisibleAccountColumns(keys)))
+}
+
 function normalizeAccount(account: any) {
   const parsedExtra = parseExtraJson(account.extra_json)
   const extra = account.extra && typeof account.extra === 'object'
     ? { ...parsedExtra, ...account.extra }
     : parsedExtra
+  const phoneBinding = account.phone_binding && typeof account.phone_binding === 'object'
+    ? account.phone_binding
+    : extra.chatgpt_phone_binding && typeof extra.chatgpt_phone_binding === 'object'
+      ? extra.chatgpt_phone_binding
+      : {}
   const syncStatuses = extra.sync_statuses && typeof extra.sync_statuses === 'object' ? extra.sync_statuses : {}
   const cliproxySync = syncStatuses.cliproxyapi && typeof syncStatuses.cliproxyapi === 'object' ? syncStatuses.cliproxyapi : {}
   const sub2apiSync = syncStatuses.sub2api && typeof syncStatuses.sub2api === 'object' ? syncStatuses.sub2api : {}
@@ -405,15 +556,100 @@ function normalizeAccount(account: any) {
     chatgptGopayDefaults,
     chatgptLastPaymentLink,
     chatgptPaymentLinkDefaults,
+    phoneBinding,
     teamInviteSource,
     manuallyUsed: account.manually_used !== undefined ? Boolean(account.manually_used) : Boolean(extra.manually_used),
   }
 }
 
-function formatSyncTime(value?: string) {
+function getPhoneBinding(record: any) {
+  const binding = record?.phoneBinding && typeof record.phoneBinding === 'object'
+    ? record.phoneBinding
+    : record?.phone_binding && typeof record.phone_binding === 'object'
+      ? record.phone_binding
+      : record?.extra?.chatgpt_phone_binding && typeof record.extra.chatgpt_phone_binding === 'object'
+        ? record.extra.chatgpt_phone_binding
+        : {}
+  return {
+    phone: String(binding.phone || '').trim(),
+    apiUrl: String(binding.api_url || binding.apiUrl || '').trim(),
+    rawLine: String(binding.raw_line || binding.rawLine || '').trim(),
+    boundAt: String(binding.bound_at || binding.boundAt || '').trim(),
+    apiExpiredDate: String(binding.api_expired_date || binding.apiExpiredDate || '').trim(),
+    codeTime: String(binding.code_time || binding.codeTime || '').trim(),
+  }
+}
+
+function parseFlexibleDateValue(value?: string | number) {
+  if (!value) return null
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    const timestampMs = value > 1_000_000_000_000 ? value : value * 1000
+    const date = new Date(timestampMs)
+    return Number.isNaN(date.getTime()) ? null : date
+  }
+  const text = String(value || '').trim()
+  if (!text) return null
+  if (/^\d+(\.\d+)?$/.test(text)) {
+    const numeric = Number(text)
+    if (Number.isFinite(numeric)) {
+      const timestampMs = numeric > 1_000_000_000_000 ? numeric : numeric * 1000
+      const date = new Date(timestampMs)
+      return Number.isNaN(date.getTime()) ? null : date
+    }
+  }
+  const date = new Date(text)
+  return Number.isNaN(date.getTime()) ? null : date
+}
+
+function formatSyncTime(value?: string | number) {
   if (!value) return ''
-  const date = new Date(value)
-  return Number.isNaN(date.getTime()) ? value : date.toLocaleString()
+  const date = parseFlexibleDateValue(value)
+  if (!date) return String(value || '')
+  return date.toLocaleString()
+}
+
+function getSubscriptionExpiryValue(record: any) {
+  const subscription = record?.chatgptLocal?.subscription && typeof record.chatgptLocal.subscription === 'object'
+    ? record.chatgptLocal.subscription
+    : {}
+  const extra = record?.extra && typeof record.extra === 'object' ? record.extra : {}
+  const candidates = [
+    record?.subscription_active_until,
+    subscription.subscription_active_until,
+    subscription.subscription_expires_at_iso,
+    subscription.subscription_expires_at,
+    extra.subscription_expires_at,
+    extra.chatgpt_subscription_active_until,
+  ]
+  for (const value of candidates) {
+    const text = String(value || '').trim()
+    if (text) return value
+  }
+  return ''
+}
+
+function formatSubscriptionExpiry(record: any) {
+  const value = getSubscriptionExpiryValue(record)
+  if (!value) return null
+  const date = parseFlexibleDateValue(value)
+  if (!date) {
+    const text = String(value || '').trim()
+    return text ? { date: text, time: '', title: text, expired: false, compact: text } : null
+  }
+  const year = date.getFullYear()
+  const month = String(date.getMonth() + 1).padStart(2, '0')
+  const day = String(date.getDate()).padStart(2, '0')
+  const hour = String(date.getHours()).padStart(2, '0')
+  const minute = String(date.getMinutes()).padStart(2, '0')
+  const dateText = `${year}-${month}-${day}`
+  const timeText = `${hour}:${minute}`
+  return {
+    date: dateText,
+    time: timeText,
+    title: date.toLocaleString(),
+    expired: date.getTime() < Date.now(),
+    compact: `${month}-${day} ${timeText}`,
+  }
 }
 
 function formatCreatedAt(value?: string) {
@@ -480,6 +716,17 @@ async function copyText(text: string) {
   return false
 }
 
+function getRefreshToken(record: any): string {
+  if (record?.refresh_token) return String(record.refresh_token || '')
+  if (record?.extra?.refresh_token) return String(record.extra.refresh_token || '')
+  try {
+    const extra = JSON.parse(record.extra_json || '{}')
+    return extra.refresh_token || ''
+  } catch {
+    return ''
+  }
+}
+
 function getTeamInviteOwnerLabel(source: any) {
   if (!source || typeof source !== 'object') return ''
   return String(
@@ -515,26 +762,6 @@ function authStateMeta(state?: string) {
     default:
       return { color: 'default', label: '未探测' }
   }
-}
-
-function authLevelMeta(level?: string, fallbackState?: string) {
-  switch (String(level || '').toLowerCase()) {
-    case 'refresh_token':
-      return { color: 'success', label: 'RT有效' }
-    case 'access_token_only':
-      return { color: 'blue', label: '仅AT有效' }
-    case 'invalid':
-      return { color: 'error', label: '认证失效' }
-    default:
-      return authStateMeta(fallbackState)
-  }
-}
-
-function workspaceMeta(capabilities: any) {
-  if (capabilities?.has_workspace && capabilities?.has_account_id) return { color: 'success', label: '材料完整' }
-  if (capabilities?.has_workspace) return { color: 'warning', label: '缺account_id' }
-  if (capabilities?.has_account_id) return { color: 'warning', label: '缺workspace' }
-  return { color: 'default', label: '缺材料' }
 }
 
 function codexStateMeta(state?: string) {
@@ -582,6 +809,95 @@ function planMeta(plan?: string) {
     default:
       return { color: 'default', label: '未知' }
   }
+}
+
+function authTypeValue(record: any) {
+  const capabilities = record?.chatgptCapabilities || {}
+  const authLevel = String(record?.auth_level || capabilities.auth_level || '').trim().toLowerCase()
+  if (authLevel === 'refresh_token') return 'refresh_token'
+  const rt = getRefreshToken(record)
+  if (rt) return 'refresh_token'
+  if (authLevel === 'access_token_only') return 'access_token_only'
+  if (String(record?.token || record?.extra?.access_token || '').trim()) return 'access_token_only'
+  return 'unknown'
+}
+
+function authTypeMeta(record: any) {
+  switch (authTypeValue(record)) {
+    case 'refresh_token':
+      return { color: 'success', label: '有RT' }
+    case 'access_token_only':
+      return { color: 'blue', label: '仅AT' }
+    default:
+      return { color: 'default', label: '无认证' }
+  }
+}
+
+function subscriptionTypeValue(record: any) {
+  const capabilities = record?.chatgptCapabilities || {}
+  const localSubscription = record?.chatgptLocal?.subscription || {}
+  const workspaceScope = String(record?.workspace_scope || record?.extra?.chatgpt_workspace_scope || '').trim().toLowerCase()
+  const values = [
+    capabilities.subscription_plan,
+    record?.subscription_plan,
+    localSubscription.plan,
+    record?.extra?.chatgpt_plan_type,
+    record?.extra?.chatgpt_subscription_plan,
+  ]
+  for (const value of values) {
+    const plan = String(value || '').trim().toLowerCase().replace('-', '_')
+    if (!plan) continue
+    if (plan.includes('enterprise')) return 'enterprise'
+    if (plan.includes('team') || plan.includes('business')) return 'team'
+    if (plan.includes('pro')) return 'pro'
+    if (plan.includes('plus')) return 'plus'
+    if (plan.includes('free')) return 'free'
+  }
+  if (workspaceScope === 'business') return 'team'
+  if (workspaceScope === 'free') return 'free'
+  return 'unknown'
+}
+
+function subscriptionTypeMeta(record: any) {
+  switch (subscriptionTypeValue(record)) {
+    case 'free':
+      return { color: 'default', label: 'Free' }
+    case 'plus':
+      return { color: 'success', label: 'Plus' }
+    case 'team':
+      return { color: 'processing', label: 'Team' }
+    case 'pro':
+      return { color: 'processing', label: 'Pro' }
+    case 'enterprise':
+      return { color: 'processing', label: 'Enterprise' }
+    default:
+      return { color: 'default', label: '未知' }
+  }
+}
+
+function accountValidityValue(record: any) {
+  const capabilities = record?.chatgptCapabilities || {}
+  const authState = String(record?.chatgptLocal?.auth?.state || '').trim().toLowerCase()
+  const codexState = String(record?.chatgptLocal?.codex?.state || '').trim().toLowerCase()
+  const invalidStates = new Set([
+    'refresh_token_invalidated',
+    'access_token_invalidated',
+    'unauthorized',
+    'account_deactivated',
+    'banned_like',
+    'invalid',
+  ])
+  if (String(record?.status || '').trim().toLowerCase() === 'invalid') return 'invalid'
+  if (String(record?.auth_level || capabilities.auth_level || '').trim().toLowerCase() === 'invalid') return 'invalid'
+  if (String(capabilities.upload_gate || '').trim().toLowerCase() === 'blocked_auth_invalid') return 'invalid'
+  if (invalidStates.has(authState) || invalidStates.has(codexState)) return 'invalid'
+  return 'valid'
+}
+
+function accountValidityMeta(record: any) {
+  return accountValidityValue(record) === 'invalid'
+    ? { color: 'error', label: '失效' }
+    : { color: 'success', label: '有效' }
 }
 
 function sub2apiStateMeta(sync: any) {
@@ -659,11 +975,25 @@ function shouldShowResumeAuthButton(record: any) {
   return false
 }
 
+function shouldShowInvalidRecheckButton(record: any) {
+  return String(record?.status || '').trim().toLowerCase() === 'invalid'
+}
+
 function taskModalModeFromSource(source: unknown): 'register' | 'resume_auth' | 'payment_link' {
   const normalized = String(source || '').trim().toLowerCase()
+  if (normalized === 'phone_binding_test') return 'resume_auth'
   if (normalized === 'resume_auth' || normalized === 'resume_subscription_auth' || normalized === 'batch_resume_subscription_auth') return 'resume_auth'
+  if (normalized === 'invalid_recheck' || normalized === 'batch_invalid_recheck') return 'resume_auth'
   if (normalized === 'payment_link' || normalized === 'batch_payment_link') return 'payment_link'
   return 'register'
+}
+
+function toSelectOptions(options: Array<{ value: string; text: string }>) {
+  return options.map((option) => ({ value: option.value, label: option.text }))
+}
+
+function toCheckboxOptions(options: Array<{ value: string; text: string }>): CheckboxOptionType<string>[] {
+  return options.map((option) => ({ value: option.value, label: option.text }))
 }
 
 const accountActionTextStyles: Record<string, CSSProperties> = {
@@ -675,19 +1005,25 @@ const accountActionTextStyles: Record<string, CSSProperties> = {
 
 export default function Accounts() {
   const { token } = theme.useToken()
+  const screens = Grid.useBreakpoint()
+  const isMobile = screens.md === false
+  const isCompactDesktop = !isMobile && screens.xl === false
   const currentPlatform = 'chatgpt'
   const [accounts, setAccounts] = useState<any[]>([])
   const [platformActions, setPlatformActions] = useState<any[]>([])
   const [platformActionsLoading, setPlatformActionsLoading] = useState(false)
   const [total, setTotal] = useState(0)
   const [currentPage, setCurrentPage] = useState(1)
+  const [columnFilters, setColumnFilters] = useState<AccountColumnFilters>(EMPTY_ACCOUNT_FILTERS)
   const [search, setSearch] = useState('')
   const [debouncedSearch, setDebouncedSearch] = useState('')
   const [pageVisible, setPageVisible] = useState(
     typeof document === 'undefined' ? true : document.visibilityState === 'visible',
   )
   const [filterStatus, setFilterStatus] = useState('')
+  const [subscriptionExpirySortOrder, setSubscriptionExpirySortOrder] = useState<SubscriptionExpirySortOrder>('')
   const [selectedRowKeys, setSelectedRowKeys] = useState<React.Key[]>([])
+  const [selectedAccountSnapshots, setSelectedAccountSnapshots] = useState<Record<string, any>>({})
 
   const [registerModalOpen, setRegisterModalOpen] = useState(false)
   const [taskModalMode, setTaskModalMode] = useState<'register' | 'resume_auth' | 'payment_link'>('register')
@@ -703,10 +1039,19 @@ export default function Accounts() {
   const [actionSurfaceInitialActionMode, setActionSurfaceInitialActionMode] = useState<'direct' | 'dialog'>('dialog')
   const [importingTeamAccountId, setImportingTeamAccountId] = useState<number | null>(null)
   const [resumeAuthAccountId, setResumeAuthAccountId] = useState<number | null>(null)
+  const [resumeAuthConfigOpen, setResumeAuthConfigOpen] = useState(false)
+  const [resumeAuthConfigMode, setResumeAuthConfigMode] = useState<'single' | 'batch'>('single')
+  const [resumeAuthConfigAccount, setResumeAuthConfigAccount] = useState<any>(null)
+  const [resumeAuthConfigScope, setResumeAuthConfigScope] = useState<'selected' | 'filtered'>('selected')
+  const [phoneBindingTestOpen, setPhoneBindingTestOpen] = useState(false)
+  const [phoneBindingTestLoading, setPhoneBindingTestLoading] = useState(false)
+  const [phoneBindingTestScope, setPhoneBindingTestScope] = useState<'selected' | 'filtered'>('selected')
 
   const [registerForm] = Form.useForm()
   const [addForm] = Form.useForm()
   const [detailForm] = Form.useForm()
+  const [resumeAuthConfigForm] = Form.useForm()
+  const [phoneBindingTestForm] = Form.useForm()
   const [registerMailProvider, setRegisterMailProvider] = useState('luckmail')
   const [configCache, setConfigCache] = useState<Record<string, any> | null>(null)
   const { mode: chatgptRegistrationMode, setMode: setChatgptRegistrationMode } =
@@ -723,8 +1068,10 @@ export default function Accounts() {
   const [abandoningPendingInviteId, setAbandoningPendingInviteId] = useState<number | null>(null)
   const [activatingAllPendingInvites, setActivatingAllPendingInvites] = useState(false)
   const [backfillLoading, setBackfillLoading] = useState<'' | 'cliproxyapi_pending' | 'cliproxyapi_selected' | 'sub2api_pending' | 'sub2api_selected'>('')
-  const [batchResumeAuthLoading, setBatchResumeAuthLoading] = useState<'' | 'selected' | 'filtered'>('')
+  const [batchResumeAuthLoading, setBatchResumeAuthLoading] = useState<'' | 'selected' | 'filtered' | 'selected_phone' | 'filtered_phone'>('')
   const [batchPaymentLinkLoading, setBatchPaymentLinkLoading] = useState(false)
+  const [batchInvalidRecheckLoading, setBatchInvalidRecheckLoading] = useState(false)
+  const [visibleColumnKeys, setVisibleColumnKeys] = useState<AccountColumnKey[]>(() => loadVisibleAccountColumnKeys())
   const [statusSyncLoading, setStatusSyncLoading] = useState<
     'probe_selected' | 'probe_all' | 'remote_selected' | 'remote_all' | 'sub2api_selected' | 'sub2api_all' | ''
   >('')
@@ -734,8 +1081,9 @@ export default function Accounts() {
   const [batchGopayPhones, setBatchGopayPhones] = useState<GopayPhoneCandidate[]>([])
   const [batchGopayDefaults, setBatchGopayDefaults] = useState<Record<string, any>>({})
   const [batchGopayLoading, setBatchGopayLoading] = useState(false)
-  const [batchGopayPhoneCountryCode, setBatchGopayPhoneCountryCode] = useState('86')
+  const [batchGopayPhoneCountryCode, setBatchGopayPhoneCountryCode] = useState(DEFAULT_GOPAY_PHONE_COUNTRY_CODE)
   const [batchGopayPhoneNumber, setBatchGopayPhoneNumber] = useState('')
+  const [batchGopayRecognizedCountryCodes, setBatchGopayRecognizedCountryCodes] = useState<string[]>([DEFAULT_GOPAY_PHONE_COUNTRY_CODE])
   const [batchGopayPhoneSaving, setBatchGopayPhoneSaving] = useState(false)
   const [batchGopayStarted, setBatchGopayStarted] = useState(false)
   const [batchGopayRoundInterval, setBatchGopayRoundInterval] = useState(60)
@@ -747,6 +1095,13 @@ export default function Accounts() {
   const accountsQuery = useAccountsQuery({
     email: debouncedSearch,
     status: filterStatus,
+    manuallyUsed: columnFilters.manuallyUsed.join(','),
+    authType: columnFilters.authType.join(','),
+    subscriptionType: columnFilters.subscriptionType.join(','),
+    accountValidity: columnFilters.accountValidity.join(','),
+    sub2apiState: columnFilters.sub2apiState.join(','),
+    sortBy: subscriptionExpirySortOrder ? SUBSCRIPTION_EXPIRY_SORT_FIELD : '',
+    sortOrder: subscriptionExpirySortOrder,
     page: currentPage,
     pageSize: ACCOUNTS_PAGE_SIZE,
   })
@@ -768,7 +1123,7 @@ export default function Accounts() {
 
   useEffect(() => {
     setCurrentPage(1)
-  }, [debouncedSearch, filterStatus])
+  }, [debouncedSearch, filterStatus, columnFilters.manuallyUsed, columnFilters.authType, columnFilters.subscriptionType, columnFilters.accountValidity, columnFilters.sub2apiState, subscriptionExpirySortOrder])
 
   useEffect(() => {
     if (typeof document === 'undefined') return
@@ -829,6 +1184,16 @@ export default function Accounts() {
     await accountsQuery.refetch()
   }, [accountsQuery.refetch])
 
+  const applyCurrentFiltersToBody = (body: Record<string, unknown>) => {
+    if (search) body.email = search
+    if (filterStatus) body.status = filterStatus
+    if (columnFilters.manuallyUsed.length) body.manually_used = columnFilters.manuallyUsed.join(',')
+    if (columnFilters.authType.length) body.auth_type = columnFilters.authType.join(',')
+    if (columnFilters.subscriptionType.length) body.subscription_type = columnFilters.subscriptionType.join(',')
+    if (columnFilters.accountValidity.length) body.account_validity = columnFilters.accountValidity.join(',')
+    if (columnFilters.sub2apiState.length) body.sub2api_state = columnFilters.sub2apiState.join(',')
+  }
+
   useEffect(() => {
     const data = accountsQuery.data
     if (!data) return
@@ -841,6 +1206,22 @@ export default function Accounts() {
       setCurrentPage(maxPage)
     }
   }, [accountsQuery.data, currentPage])
+
+  useEffect(() => {
+    if (selectedRowKeys.length === 0) {
+      setSelectedAccountSnapshots({})
+      return
+    }
+    const currentAccountsById = new Map(accounts.map((account) => [String(account.id), account]))
+    setSelectedAccountSnapshots((prev) => {
+      const next: Record<string, any> = {}
+      selectedRowKeys.forEach((key) => {
+        const id = String(key)
+        next[id] = currentAccountsById.get(id) || prev[id] || { id }
+      })
+      return next
+    })
+  }, [accounts, selectedRowKeys])
 
   useEffect(() => {
     if (!detailAccount?.id) return
@@ -1175,16 +1556,6 @@ export default function Accounts() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  const getRefreshToken = (record: any): string => {
-    if (record?.refresh_token) return String(record.refresh_token || '')
-    try {
-      const extra = JSON.parse(record.extra_json || '{}')
-      return extra.refresh_token || ''
-    } catch {
-      return ''
-    }
-  }
-
   const canImportAccountToTeam = (record: any): boolean => {
     if (currentPlatform !== 'chatgpt') return false
     if (String(record?.workspace_scope || record?.extra?.chatgpt_workspace_scope || '').trim().toLowerCase() !== 'business') return false
@@ -1261,12 +1632,25 @@ export default function Accounts() {
     }
   }
 
-  const handleResumeSubscriptionAuth = async (record: any) => {
+  const getResumeAuthGlobalDefaults = async () => {
+    const cfg = await loadConfigCache({ force: true })
+    return {
+      allow_phone_verification: parseBooleanConfigValue(cfg.chatgpt_resume_auth_allow_phone_verification),
+    }
+  }
+
+  const handleResumeSubscriptionAuth = async (record: any, allowPhoneVerification?: boolean) => {
     setResumeAuthAccountId(record.id)
     try {
+      const body: Record<string, unknown> = {
+        account_id: Number(record.id),
+      }
+      if (typeof allowPhoneVerification === 'boolean') {
+        body.allow_phone_verification = allowPhoneVerification
+      }
       const res = await apiFetch('/tasks/chatgpt/resume-subscription-auth', {
         method: 'POST',
-        body: JSON.stringify({ account_id: Number(record.id) }),
+        body: JSON.stringify(body),
       })
       if (!res?.task_id) {
         throw new Error('任务创建失败：未返回 task_id')
@@ -1284,6 +1668,50 @@ export default function Accounts() {
     }
   }
 
+  const openResumeAuthConfig = async (record: any) => {
+    let defaults = { allow_phone_verification: false }
+    try {
+      defaults = await getResumeAuthGlobalDefaults()
+    } catch (e: any) {
+      message.warning(e?.message || '读取全局补抓 Auth 配置失败，已使用默认参数')
+    }
+    setResumeAuthConfigMode('single')
+    setResumeAuthConfigAccount(record)
+    setResumeAuthConfigScope('selected')
+    resumeAuthConfigForm.setFieldsValue({
+      allow_phone_verification: defaults.allow_phone_verification,
+    })
+    setResumeAuthConfigOpen(true)
+  }
+
+  const openBatchResumeAuthConfig = async (scope: 'selected' | 'filtered') => {
+    let defaults = { allow_phone_verification: false }
+    try {
+      defaults = await getResumeAuthGlobalDefaults()
+    } catch (e: any) {
+      message.warning(e?.message || '读取全局补抓 Auth 配置失败，已使用默认参数')
+    }
+    setResumeAuthConfigMode('batch')
+    setResumeAuthConfigAccount(null)
+    setResumeAuthConfigScope(scope)
+    resumeAuthConfigForm.setFieldsValue({
+      allow_phone_verification: defaults.allow_phone_verification,
+    })
+    setResumeAuthConfigOpen(true)
+  }
+
+  const submitResumeAuthConfig = async () => {
+    const values = await resumeAuthConfigForm.validateFields()
+    const allowPhoneVerification = Boolean(values.allow_phone_verification)
+    setResumeAuthConfigOpen(false)
+    if (resumeAuthConfigMode === 'single') {
+      if (!resumeAuthConfigAccount) return
+      await handleResumeSubscriptionAuth(resumeAuthConfigAccount, allowPhoneVerification)
+      return
+    }
+    await handleBatchResumeSubscriptionAuth(resumeAuthConfigScope, allowPhoneVerification)
+  }
+
   const getResumeAuthScope = (): 'selected' | 'filtered' => (selectedRowKeys.length > 0 ? 'selected' : 'filtered')
 
   const getResumeAuthSelectedIds = () =>
@@ -1291,16 +1719,20 @@ export default function Accounts() {
       .map((value) => Number(value))
       .filter((value) => Number.isInteger(value) && value > 0)
 
-  const buildResumeAuthMenuLabel = () => {
+  const buildResumeAuthMenuLabel = (useTemporaryConfig = false) => {
     const scope = getResumeAuthScope()
-    return scope === 'selected'
+    const base = scope === 'selected'
       ? `补抓所选 Auth (${selectedRowKeys.length})`
       : `补抓当前筛选待补抓账号 (${total})`
+    return useTemporaryConfig ? `${base}，临时配置` : base
   }
 
-  const handleBatchResumeSubscriptionAuth = async (scope: 'selected' | 'filtered') => {
-    const toastKey = `resume-auth:${scope}`
+  const handleBatchResumeSubscriptionAuth = async (scope: 'selected' | 'filtered', allowPhoneVerification?: boolean) => {
+    const toastKey = `resume-auth:${scope}:${allowPhoneVerification === true ? 'phone' : allowPhoneVerification === false ? 'no-phone' : 'global'}`
     const body: Record<string, unknown> = {}
+    if (typeof allowPhoneVerification === 'boolean') {
+      body.allow_phone_verification = allowPhoneVerification
+    }
     let requestedCount = total
 
     if (scope === 'selected') {
@@ -1313,11 +1745,11 @@ export default function Accounts() {
       body.account_ids = accountIds
     } else {
       body.all_filtered = true
-      if (search) body.email = search
-      if (filterStatus) body.status = filterStatus
+      applyCurrentFiltersToBody(body)
     }
 
-    setBatchResumeAuthLoading(scope)
+    const loadingKey = `${scope}${allowPhoneVerification ? '_phone' : ''}` as 'selected' | 'filtered' | 'selected_phone' | 'filtered_phone'
+    setBatchResumeAuthLoading(loadingKey)
     message.loading({ content: '批量补抓Auth任务创建中...', key: toastKey, duration: 0 })
     try {
       const res = await apiFetch('/tasks/chatgpt/resume-subscription-auth/batch', {
@@ -1365,14 +1797,16 @@ export default function Accounts() {
     }
   }
 
-  const handleBatchPaymentLink = async () => {
+  const handleBatchPaymentLink = async (options: { forceRefresh?: boolean } = {}) => {
     const scope: 'selected' | 'filtered' = selectedRowKeys.length > 0 ? 'selected' : 'filtered'
-    const toastKey = `payment-link:${scope}`
+    const forceRefresh = Boolean(options.forceRefresh)
+    const toastKey = `payment-link:${scope}:${forceRefresh ? 'force' : 'normal'}`
     const body: Record<string, unknown> = {
-      skip_existing: true,
-      force_refresh: false,
+      skip_existing: !forceRefresh,
+      force_refresh: forceRefresh,
       params: {},
     }
+    const actionLabel = forceRefresh ? '强制重新生成订阅链接' : '批量订阅链接'
     let requestedCount = total
 
     if (scope === 'selected') {
@@ -1380,19 +1814,18 @@ export default function Accounts() {
         .map((value) => Number(value))
         .filter((value) => Number.isInteger(value) && value > 0)
       if (accountIds.length === 0) {
-        message.warning('请先选择要生成订阅链接的账号')
+        message.warning(`请先选择要${forceRefresh ? '强制重新生成' : '生成'}订阅链接的账号`)
         return
       }
       requestedCount = accountIds.length
       body.account_ids = accountIds
     } else {
       body.all_filtered = true
-      if (search) body.email = search
-      if (filterStatus) body.status = filterStatus
+      applyCurrentFiltersToBody(body)
     }
 
     setBatchPaymentLinkLoading(true)
-    message.loading({ content: '批量订阅链接任务创建中...', key: toastKey, duration: 0 })
+    message.loading({ content: `${actionLabel}任务创建中...`, key: toastKey, duration: 0 })
     try {
       const res = await apiFetch('/tasks/chatgpt/payment-links/batch', {
         method: 'POST',
@@ -1406,11 +1839,11 @@ export default function Accounts() {
 
       if (!taskIdFromResponse) {
         message.info({
-          content: `没有可生成订阅链接的账号。请求 ${requestedCount} 个，跳过 ${skipped} 个${missing > 0 ? `，缺失 ${missing} 个` : ''}`,
+          content: `没有可${forceRefresh ? '重新生成' : '生成'}订阅链接的账号。请求 ${requestedCount} 个，跳过 ${skipped} 个${missing > 0 ? `，缺失 ${missing} 个` : ''}`,
           key: toastKey,
         })
         if (res && typeof res === 'object') {
-          showBatchActionResult('批量订阅链接结果', res)
+          showBatchActionResult(`${actionLabel}结果`, res)
         }
         return
       }
@@ -1424,14 +1857,195 @@ export default function Accounts() {
       setActiveTasksPanelOpen(true)
       void activeTasksQuery.refetch()
       message.success({
-        content: `批量订阅链接任务已启动：可执行 ${eligible} 个，跳过 ${skipped} 个${missing > 0 ? `，缺失 ${missing} 个` : ''}`,
+        content: `${actionLabel}任务已启动：可执行 ${eligible} 个，跳过 ${skipped} 个${missing > 0 ? `，缺失 ${missing} 个` : ''}`,
         key: toastKey,
       })
-      showBatchActionResult('批量订阅链接结果', res)
+      showBatchActionResult(`${actionLabel}结果`, res)
     } catch (e: any) {
-      message.error({ content: `批量订阅链接失败: ${e.message}`, key: toastKey })
+      message.error({ content: `${actionLabel}失败: ${e.message}`, key: toastKey })
     } finally {
       setBatchPaymentLinkLoading(false)
+    }
+  }
+
+  const handleInvalidRecheck = async (record: any) => {
+    const accountId = Number(record?.id || 0)
+    if (!accountId) return
+    const toastKey = `invalid-recheck:${accountId}`
+    message.loading({ content: '失效测活任务创建中...', key: toastKey, duration: 0 })
+    try {
+      const res = await apiFetch('/tasks/chatgpt/invalid-recheck', {
+        method: 'POST',
+        body: JSON.stringify({ account_id: accountId }),
+      })
+      const taskIdFromResponse = String(res?.task_id || '').trim()
+      if (taskIdFromResponse) {
+        const snapshot = await apiFetch(`/tasks/${taskIdFromResponse}`)
+        setTaskModalMode('resume_auth')
+        setTaskModalAccount(record)
+        setTaskId(taskIdFromResponse)
+        setTaskSnapshot(snapshot)
+        setRegisterModalOpen(true)
+        setActiveTasksPanelOpen(true)
+        void activeTasksQuery.refetch()
+      }
+      message.success({ content: '失效测活任务已启动', key: toastKey })
+    } catch (e: any) {
+      message.error({ content: `失效测活失败: ${e.message}`, key: toastKey })
+    }
+  }
+
+  const handleBatchInvalidRecheck = async () => {
+    const scope: 'selected' | 'filtered' = selectedRowKeys.length > 0 ? 'selected' : 'filtered'
+    const toastKey = `invalid-recheck:${scope}`
+    const body: Record<string, unknown> = {}
+    let requestedCount = total
+
+    if (scope === 'selected') {
+      const accountIds = Array.from(selectedRowKeys)
+        .map((value) => Number(value))
+        .filter((value) => Number.isInteger(value) && value > 0)
+      if (accountIds.length === 0) {
+        message.warning('请先选择要测活的失效账号')
+        return
+      }
+      requestedCount = accountIds.length
+      body.account_ids = accountIds
+    } else {
+      body.all_filtered = true
+      applyCurrentFiltersToBody(body)
+    }
+
+    setBatchInvalidRecheckLoading(true)
+    message.loading({ content: '批量失效测活任务创建中...', key: toastKey, duration: 0 })
+    try {
+      const res = await apiFetch('/tasks/chatgpt/invalid-recheck/batch', {
+        method: 'POST',
+        body: JSON.stringify(body),
+      })
+
+      const eligible = Number(res?.eligible || 0)
+      const skipped = Number(res?.skipped || 0)
+      const missing = Number(res?.missing || 0)
+      const taskIdFromResponse = String(res?.task_id || '').trim()
+
+      if (!taskIdFromResponse) {
+        message.info({
+          content: `没有可执行失效测活的账号。请求 ${requestedCount} 个，跳过 ${skipped} 个${missing > 0 ? `，缺失 ${missing} 个` : ''}`,
+          key: toastKey,
+        })
+        if (res && typeof res === 'object') {
+          showBatchActionResult('批量失效测活结果', res)
+        }
+        return
+      }
+
+      const snapshot = await apiFetch(`/tasks/${taskIdFromResponse}`)
+      setTaskModalMode('resume_auth')
+      setTaskModalAccount(scope === 'selected' ? null : { email: `当前筛选 ${eligible} 个失效账号` })
+      setTaskId(taskIdFromResponse)
+      setTaskSnapshot(snapshot)
+      setRegisterModalOpen(true)
+      setActiveTasksPanelOpen(true)
+      void activeTasksQuery.refetch()
+      message.success({
+        content: `批量失效测活任务已启动：可执行 ${eligible} 个，跳过 ${skipped} 个${missing > 0 ? `，缺失 ${missing} 个` : ''}`,
+        key: toastKey,
+      })
+      showBatchActionResult('批量失效测活结果', res)
+    } catch (e: any) {
+      message.error({ content: `批量失效测活失败: ${e.message}`, key: toastKey })
+    } finally {
+      setBatchInvalidRecheckLoading(false)
+    }
+  }
+
+  const openPhoneBindingTest = () => {
+    const scope: 'selected' | 'filtered' = selectedRowKeys.length > 0 ? 'selected' : 'filtered'
+    setPhoneBindingTestScope(scope)
+    phoneBindingTestForm.setFieldsValue({
+      scope,
+      phone_lines: '',
+      timeout_seconds: 180,
+      poll_interval_seconds: 5,
+      max_resend_attempts: 0,
+      resend_interval_seconds: 0,
+      account_interval_seconds: 60,
+      reuse_phone_until_unusable: false,
+    })
+    setPhoneBindingTestOpen(true)
+  }
+
+  const submitPhoneBindingTest = async () => {
+    const values = await phoneBindingTestForm.validateFields()
+    const scope = (values.scope === 'filtered' ? 'filtered' : 'selected') as 'selected' | 'filtered'
+    const body: Record<string, unknown> = {
+      phone_lines: String(values.phone_lines || '').trim(),
+      timeout_seconds: Number(values.timeout_seconds || 180),
+      poll_interval_seconds: Number(values.poll_interval_seconds || 5),
+      max_resend_attempts: Number(values.max_resend_attempts || 0),
+      resend_interval_seconds: Number(values.resend_interval_seconds || 0),
+      account_interval_seconds: Number(values.account_interval_seconds || 60),
+      reuse_phone_until_unusable: Boolean(values.reuse_phone_until_unusable),
+    }
+    let requestedAccounts = total
+    if (scope === 'selected') {
+      const accountIds = getResumeAuthSelectedIds()
+      if (accountIds.length === 0) {
+        message.warning('请先选择用于测试绑定的账号，或切换为当前筛选范围')
+        return
+      }
+      requestedAccounts = accountIds.length
+      body.account_ids = accountIds
+    } else {
+      body.all_filtered = true
+      applyCurrentFiltersToBody(body)
+    }
+
+    const toastKey = `phone-binding-test:${scope}`
+    setPhoneBindingTestLoading(true)
+    message.loading({ content: '号码绑定测试任务创建中...', key: toastKey, duration: 0 })
+    try {
+      const res = await apiFetch('/tasks/chatgpt/phone-binding-test', {
+        method: 'POST',
+        body: JSON.stringify(body),
+      })
+      const taskIdFromResponse = String(res?.task_id || '').trim()
+      const eligible = Number(res?.eligible_accounts || 0)
+      const phoneCount = Number(res?.phone_count || 0)
+      const parseErrors = Array.isArray(res?.parse_errors) ? res.parse_errors : []
+
+      if (!taskIdFromResponse) {
+        message.info({
+          content: `没有可用于测试的账号。请求 ${requestedAccounts} 个账号，待测号码 ${phoneCount} 个`,
+          key: toastKey,
+        })
+        if (res && typeof res === 'object') {
+          showBatchActionResult('号码绑定测试结果', res)
+        }
+        return
+      }
+
+      const snapshot = await apiFetch(`/tasks/${taskIdFromResponse}`)
+      setPhoneBindingTestOpen(false)
+      setTaskModalMode('resume_auth')
+      setTaskModalAccount({ email: `号码绑定测试：${phoneCount} 个号码 / ${eligible} 个账号` })
+      setTaskId(taskIdFromResponse)
+      setTaskSnapshot(snapshot)
+      setRegisterModalOpen(true)
+      setActiveTasksPanelOpen(true)
+      void activeTasksQuery.refetch()
+      message.success({
+        content: `号码绑定测试已启动：${phoneCount} 个号码，${eligible} 个账号${parseErrors.length > 0 ? `，解析跳过 ${parseErrors.length} 行` : ''}`,
+        key: toastKey,
+      })
+      if (parseErrors.length > 0) {
+        showBatchActionResult('号码解析结果', { items: parseErrors, total: parseErrors.length })
+      }
+    } catch (e: any) {
+      message.error({ content: `号码绑定测试失败: ${e.message}`, key: toastKey })
+    } finally {
+      setPhoneBindingTestLoading(false)
     }
   }
 
@@ -1443,6 +2057,7 @@ export default function Accounts() {
     })
     message.success('批量删除成功')
     setSelectedRowKeys([])
+    setSelectedAccountSnapshots({})
     load()
   }
 
@@ -1453,6 +2068,11 @@ export default function Accounts() {
     await apiFetch(`/accounts/${accountId}`, { method: 'DELETE' })
     message.success(`已删除账号：${label}`)
     setSelectedRowKeys((keys) => keys.filter((key) => Number(key) !== accountId))
+    setSelectedAccountSnapshots((prev) => {
+      const next = { ...prev }
+      delete next[String(accountId)]
+      return next
+    })
     load()
   }
 
@@ -1468,7 +2088,9 @@ export default function Accounts() {
     ])
     const phones = normalizeGopayPhoneCandidates(data.chatgpt_gopay_phone_candidates).filter((phone) => phone.enabled !== false)
     const defaults = parseMaybeJsonObject(data.chatgpt_gopay_defaults)
+    const recognizedCodes = normalizeGopayRecognizedCountryCodes(otpSettings.recognized_country_codes)
     setBatchGopayOtpAutoResendDelay(normalizeGopayOtpAutoResendDelay(otpSettings.otp_auto_resend_delay_seconds))
+    setBatchGopayRecognizedCountryCodes(recognizedCodes)
     setBatchGopayPhones(phones)
     setBatchGopayDefaults(defaults)
     if (batchGopayOpen && !batchGopayStarted && batchGopayItems.length > 0 && phones.length > 0) {
@@ -1534,8 +2156,9 @@ export default function Accounts() {
     }
     setBatchGopayOpen(true)
     setBatchGopayLoading(true)
-    setBatchGopayPhoneCountryCode('86')
+    setBatchGopayPhoneCountryCode(DEFAULT_GOPAY_PHONE_COUNTRY_CODE)
     setBatchGopayPhoneNumber('')
+    setBatchGopayRecognizedCountryCodes([DEFAULT_GOPAY_PHONE_COUNTRY_CODE])
     setBatchGopayPhoneSaving(false)
     setBatchGopayItems([])
     setBatchGopayPhones([])
@@ -1558,8 +2181,13 @@ export default function Accounts() {
   }
 
   const addBatchGopayPhoneToPool = async () => {
-    const phone_country_code = normalizeGopayPhonePart(batchGopayPhoneCountryCode)
-    const phone_number = normalizeGopayPhonePart(batchGopayPhoneNumber)
+    const { phone_country_code, phone_number } = splitGopayPhoneInput(
+      batchGopayPhoneCountryCode,
+      batchGopayPhoneNumber,
+      batchGopayRecognizedCountryCodes,
+    )
+    setBatchGopayPhoneCountryCode(phone_country_code)
+    setBatchGopayPhoneNumber(phone_number)
     if (!phone_country_code || !phone_number) {
       message.warning('请输入区号和手机号')
       return
@@ -1579,6 +2207,16 @@ export default function Accounts() {
     } finally {
       setBatchGopayPhoneSaving(false)
     }
+  }
+
+  const updateBatchGopayPhoneNumberInput = (value: string) => {
+    const normalizedPhone = splitGopayPhoneInput(
+      batchGopayPhoneCountryCode,
+      value,
+      batchGopayRecognizedCountryCodes,
+    )
+    setBatchGopayPhoneCountryCode(normalizedPhone.phone_country_code)
+    setBatchGopayPhoneNumber(normalizedPhone.phone_number)
   }
 
   const updateBatchGopayItem = (accountId: number, patch: Partial<BatchGopayItem>) => {
@@ -1806,6 +2444,7 @@ export default function Accounts() {
       })
       message.success(`已删除 ${res.deleted || 0} 个无效账号`)
       setSelectedRowKeys([])
+      setSelectedAccountSnapshots({})
       load()
     } catch (e: any) {
       message.error(`删除无效账号失败: ${e.message}`)
@@ -2154,8 +2793,7 @@ export default function Accounts() {
       body.account_ids = accountIds
     } else {
       body.pending_only = true
-      if (filterStatus) body.status = filterStatus
-      if (search) body.email = search
+      applyCurrentFiltersToBody(body)
     }
 
     const destinationLabel = destination === 'sub2api' ? 'Sub2API' : 'CLIProxyAPI'
@@ -2239,8 +2877,7 @@ export default function Accounts() {
       body.account_ids = accountIds
     } else {
       body.all_filtered = true
-      if (search) body.email = search
-      if (filterStatus) body.status = filterStatus
+      applyCurrentFiltersToBody(body)
     }
 
     setStatusSyncLoading(loadingKey)
@@ -2322,172 +2959,853 @@ export default function Accounts() {
     gap: isChatgptPlatform ? 4 : 6,
     minWidth: 0,
   }
-  const compactPanelStyle: React.CSSProperties = {
-    padding: '6px 8px',
-    borderRadius: token.borderRadiusLG,
-    border: `1px solid ${token.colorBorder}`,
-    background: token.colorFillAlter,
-  }
   const sub2apiOverview = summarizeSub2ApiStates(accounts)
+  const compactTagStyle: React.CSSProperties = {
+    marginInlineEnd: 0,
+    whiteSpace: 'nowrap',
+  }
+  const visibleColumnKeySet = new Set(visibleColumnKeys)
+  const isColumnVisible = (key: string) => {
+    if (!ACCOUNT_COLUMN_OPTION_KEYS.has(key as AccountColumnKey)) return true
+    return visibleColumnKeySet.has(key as AccountColumnKey)
+  }
+  const columnVisibilityOptions = ACCOUNT_COLUMN_OPTIONS
+    .filter((option) => !option.chatgptOnly || isChatgptPlatform)
+    .map((option) => ({ value: option.value, text: option.text }))
+  const updateVisibleColumns = (next: string[]) => {
+    const normalized = normalizeVisibleAccountColumns(next)
+    setVisibleColumnKeys(normalized)
+    saveVisibleAccountColumnKeys(normalized)
+  }
+  const resetVisibleColumns = () => {
+    const defaults = normalizeVisibleAccountColumns(DEFAULT_VISIBLE_ACCOUNT_COLUMNS)
+    setVisibleColumnKeys(defaults)
+    saveVisibleAccountColumnKeys(defaults)
+  }
+
+  const renderColumnVisibilityControl = () => {
+    const selectedCount = visibleColumnKeys.filter((key) => columnVisibilityOptions.some((option) => option.value === key)).length
+    const overlay = (
+      <div
+        onClick={(event) => event.stopPropagation()}
+        style={{
+          minWidth: isMobile ? 240 : 280,
+          maxWidth: isMobile ? 'calc(100vw - 48px)' : 320,
+          padding: 12,
+          borderRadius: 8,
+          background: token.colorBgElevated,
+          boxShadow: token.boxShadowSecondary,
+        }}
+      >
+        <Checkbox.Group
+          value={visibleColumnKeys}
+          options={toCheckboxOptions(columnVisibilityOptions)}
+          onChange={(checkedValues) => updateVisibleColumns(checkedValues.map((item) => String(item)))}
+          style={{
+            display: 'grid',
+            gridTemplateColumns: isMobile ? '1fr' : 'repeat(2, minmax(0, 1fr))',
+            gap: 8,
+          }}
+        />
+        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 12 }}>
+          <Button size="small" onClick={() => updateVisibleColumns(columnVisibilityOptions.map((option) => option.value))}>
+            全选
+          </Button>
+          <Button size="small" onClick={resetVisibleColumns}>
+            默认
+          </Button>
+        </div>
+      </div>
+    )
+
+    return (
+      <div
+        style={{
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'center',
+          gap: 10,
+          marginBottom: 10,
+          flex: '0 0 auto',
+        }}
+      >
+        <Text type="secondary" style={{ fontSize: 12 }}>
+          固定显示账号和操作，可选列 {selectedCount}/{columnVisibilityOptions.length}
+        </Text>
+        <Dropdown dropdownRender={() => overlay} trigger={['click']}>
+          <Button size="small" icon={<SettingOutlined />}>
+            列显示
+          </Button>
+        </Dropdown>
+      </div>
+    )
+  }
+
+  const renderAccountIdentity = (text: string, record: any) => {
+    const teamInviteOwner = getTeamInviteOwnerLabel(record.teamInviteSource)
+    const teamInviteMeta = [
+      record.teamInviteSource?.team_name ? `Team: ${record.teamInviteSource.team_name}` : '',
+      record.teamInviteSource?.team_id ? `#${record.teamInviteSource.team_id}` : '',
+    ].filter(Boolean).join(' · ')
+
+    return (
+      <div style={cellStackStyle}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 4, minWidth: 0 }}>
+          <Text
+            style={{ ...monospaceStyle, flex: 1, minWidth: 0, whiteSpace: 'nowrap', fontSize: 12 }}
+            ellipsis={{ tooltip: text }}
+          >
+            {text}
+          </Text>
+          {record.workspace_label || record.extra?.chatgpt_workspace_label ? (
+            <Tag color={(record.workspace_scope || record.extra?.chatgpt_workspace_scope) === 'business' ? 'processing' : 'default'}>
+              {record.workspace_label || record.extra?.chatgpt_workspace_label}
+            </Tag>
+          ) : null}
+          <Button
+            type="text"
+            size="small"
+            icon={<CopyOutlined />}
+            onClick={async () => {
+              const ok = await copyText(text)
+              if (ok) {
+                await markAccountUsed(Number(record.id || 0))
+              }
+            }}
+          />
+        </div>
+        <Text
+          type="secondary"
+          style={{ ...secondaryTextStyle, fontSize: 11, lineHeight: '18px' }}
+          ellipsis={{ tooltip: record.workspace_display_name || record.extra?.chatgpt_workspace_display_name || record.user_id || `账号 #${record.id}` }}
+        >
+          {record.workspace_display_name
+            || record.extra?.chatgpt_workspace_display_name
+            || record.user_id
+            || `#${record.id}`}
+        </Text>
+        {teamInviteOwner ? (
+          <Text
+            type="secondary"
+            style={{ ...secondaryTextStyle, fontSize: 11, lineHeight: '18px' }}
+            ellipsis={{ tooltip: `${teamInviteOwner}${teamInviteMeta ? ` · ${teamInviteMeta}` : ''}` }}
+          >
+            {`${teamInviteOwner}${teamInviteMeta ? ` · ${teamInviteMeta}` : ''}`}
+          </Text>
+        ) : null}
+      </div>
+    )
+  }
+
+  const renderPasswordState = (text: string) => {
+    const hasPassword = Boolean(String(text || '').trim())
+    return (
+      <Space size={4} style={{ width: '100%', justifyContent: 'center' }}>
+        <Tag color={hasPassword ? 'success' : 'default'} style={compactTagStyle}>{hasPassword ? '有密码' : '无密码'}</Tag>
+        {hasPassword ? (
+          <Button title="复制密码" type="text" size="small" icon={<CopyOutlined />} onClick={() => copyText(text)} />
+        ) : null}
+      </Space>
+    )
+  }
+
+  const renderPhoneBindingState = (record: any) => {
+    const binding = getPhoneBinding(record)
+    if (!binding.phone && !binding.apiUrl) {
+      return <Text type="secondary" style={{ fontSize: 12 }}>-</Text>
+    }
+    const rawLine = binding.rawLine || [binding.phone, binding.apiUrl].filter(Boolean).join('----')
+    const secondary = binding.codeTime || binding.boundAt || binding.apiExpiredDate
+
+    return (
+      <div style={{ ...cellStackStyle, gap: 3, maxWidth: 260 }}>
+        <Space size={4} style={{ minWidth: 0 }}>
+          <Text
+            style={{ ...monospaceStyle, maxWidth: 132 }}
+            ellipsis={{ tooltip: binding.phone || '' }}
+          >
+            {binding.phone || '-'}
+          </Text>
+          {binding.phone ? (
+            <Button title="复制手机号" type="text" size="small" icon={<CopyOutlined />} onClick={() => copyText(binding.phone)} />
+          ) : null}
+        </Space>
+        {binding.apiUrl ? (
+          <Space size={4} style={{ minWidth: 0 }}>
+            <Text
+              type="secondary"
+              style={{ ...monospaceStyle, maxWidth: 168, fontSize: 11 }}
+              ellipsis={{ tooltip: binding.apiUrl }}
+            >
+              {binding.apiUrl}
+            </Text>
+            <Button title="复制完整 API" type="text" size="small" icon={<CopyOutlined />} onClick={() => copyText(binding.apiUrl)} />
+          </Space>
+        ) : null}
+        <Space size={6} wrap>
+          {rawLine ? (
+            <Button size="small" type="link" icon={<CopyOutlined />} style={{ paddingInline: 0 }} onClick={() => copyText(rawLine)}>
+              复制整行
+            </Button>
+          ) : null}
+          {secondary ? (
+            <Text type="secondary" style={{ fontSize: 11 }} ellipsis={{ tooltip: secondary }}>
+              {secondary}
+            </Text>
+          ) : null}
+        </Space>
+      </div>
+    )
+  }
+
+  const renderAuthTypeState = (record: any) => {
+    const meta = authTypeMeta(record)
+    return (
+      <Space size={4} style={{ width: '100%', justifyContent: 'center' }}>
+        <Tag color={meta.color} style={compactTagStyle}>{meta.label}</Tag>
+        {authTypeValue(record) === 'refresh_token' ? (
+          <Button title="复制RT" type="text" size="small" icon={<CopyOutlined />} onClick={() => copyText(getRefreshToken(record))} />
+        ) : null}
+      </Space>
+    )
+  }
+
+  const renderSubscriptionTypeState = (record: any) => {
+    const meta = subscriptionTypeMeta(record)
+    return <Tag color={meta.color} style={compactTagStyle}>{meta.label}</Tag>
+  }
+
+  const renderSubscriptionExpiryState = (record: any) => {
+    const expiry = formatSubscriptionExpiry(record)
+    if (!expiry) {
+      return <Text type="secondary" style={{ fontSize: 11, lineHeight: '18px' }}>-</Text>
+    }
+    return (
+      <div title={expiry.title} style={{ lineHeight: '16px', minWidth: 0 }}>
+        <Text
+          type={expiry.expired ? 'danger' : undefined}
+          style={{
+            display: 'block',
+            fontSize: 11,
+            whiteSpace: 'nowrap',
+          }}
+        >
+          {expiry.date}
+        </Text>
+        {expiry.time ? (
+          <Text type="secondary" style={{ display: 'block', fontSize: 11, whiteSpace: 'nowrap' }}>
+            {expiry.time}
+          </Text>
+        ) : null}
+      </div>
+    )
+  }
+
+  const renderAccountValidityState = (record: any) => {
+    const meta = accountValidityMeta(record)
+    return <Tag color={meta.color} style={compactTagStyle}>{meta.label}</Tag>
+  }
+
+  const applySubscriptionExpirySortOrder = useCallback((next: SubscriptionExpirySortOrder) => {
+    setSubscriptionExpirySortOrder(next)
+    setCurrentPage(1)
+  }, [])
+
+  const handleAccountsTableChange = useCallback((_pagination: any, _filters: Record<string, any>, sorter: any) => {
+    const activeSorter = Array.isArray(sorter)
+      ? sorter.find((item) => String(item?.columnKey || item?.field || '') === SUBSCRIPTION_EXPIRY_SORT_FIELD)
+      : sorter
+    const sorterKey = String(activeSorter?.columnKey || activeSorter?.field || '')
+    const order = sorterKey === SUBSCRIPTION_EXPIRY_SORT_FIELD ? String(activeSorter?.order || '') : ''
+    const nextOrder: SubscriptionExpirySortOrder = order === 'ascend' ? 'asc' : order === 'descend' ? 'desc' : ''
+    applySubscriptionExpirySortOrder(nextOrder)
+  }, [applySubscriptionExpirySortOrder])
+
+  const renderMobileFilterControls = () => {
+    if (!isMobile) return null
+    return (
+      <div
+        style={{
+          display: 'grid',
+          gap: 8,
+          padding: 10,
+          border: `1px solid ${token.colorBorderSecondary}`,
+          borderRadius: 8,
+          background: token.colorBgContainer,
+        }}
+      >
+        <Input.Search
+          allowClear
+          size="small"
+          placeholder="搜索邮箱"
+          value={search}
+          onChange={(event) => {
+            setSearch(event.target.value)
+            setColumnFilters((prev) => ({ ...prev, email: event.target.value }))
+          }}
+          onSearch={(value) => setDebouncedSearch(String(value || '').trim())}
+        />
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 8 }}>
+          <Select
+            allowClear
+            size="small"
+            placeholder="使用状态"
+            value={columnFilters.manuallyUsed[0]}
+            options={toSelectOptions(MANUAL_USE_FILTER_OPTIONS)}
+            onChange={(value) => setColumnFilters((prev) => ({ ...prev, manuallyUsed: value ? [value] : [] }))}
+          />
+          <Select
+            allowClear
+            size="small"
+            placeholder="账号状态"
+            value={columnFilters.status[0]}
+            options={toSelectOptions(STATUS_FILTER_OPTIONS)}
+            onChange={(value) => {
+              const next = value ? [value] : []
+              setColumnFilters((prev) => ({ ...prev, status: next }))
+              setFilterStatus(next.join(','))
+            }}
+          />
+          <Select
+            allowClear
+            size="small"
+            placeholder="认证类型"
+            value={columnFilters.authType[0]}
+            options={toSelectOptions(AUTH_TYPE_FILTER_OPTIONS)}
+            onChange={(value) => setColumnFilters((prev) => ({ ...prev, authType: value ? [value] : [] }))}
+          />
+          <Select
+            allowClear
+            size="small"
+            placeholder="订阅类型"
+            value={columnFilters.subscriptionType[0]}
+            options={toSelectOptions(SUBSCRIPTION_TYPE_FILTER_OPTIONS)}
+            onChange={(value) => setColumnFilters((prev) => ({ ...prev, subscriptionType: value ? [value] : [] }))}
+          />
+          <Select
+            allowClear
+            size="small"
+            placeholder="有效性"
+            value={columnFilters.accountValidity[0]}
+            options={toSelectOptions(ACCOUNT_VALIDITY_FILTER_OPTIONS)}
+            onChange={(value) => setColumnFilters((prev) => ({ ...prev, accountValidity: value ? [value] : [] }))}
+          />
+          <Select
+            allowClear
+            size="small"
+            placeholder="Sub2API"
+            value={columnFilters.sub2apiState[0]}
+            options={toSelectOptions(SUB2API_FILTER_OPTIONS)}
+            onChange={(value) => setColumnFilters((prev) => ({ ...prev, sub2apiState: value ? [value] : [] }))}
+          />
+          <Select
+            allowClear
+            size="small"
+            placeholder="到期排序"
+            value={subscriptionExpirySortOrder || undefined}
+            options={toSelectOptions(SUBSCRIPTION_EXPIRY_SORT_OPTIONS)}
+            onChange={(value) => applySubscriptionExpirySortOrder((value || '') as SubscriptionExpirySortOrder)}
+          />
+        </div>
+      </div>
+    )
+  }
+
+  const renderSub2ApiState = (record: any) => {
+    const sync = record.sub2apiSync || {}
+    const meta = sub2apiStateMeta(
+      record.sub2api_remote_state
+        ? { ...sync, remote_state: record.sub2api_remote_state }
+        : sync,
+    )
+
+    return (
+      <Tag color={meta.color} style={compactTagStyle}>{meta.label}</Tag>
+    )
+  }
+
+  const renderColumnFilterTitle = (
+    label: string,
+    values: string[],
+    options: Array<{ value: string; text: string }>,
+    onChange: (next: string[]) => void,
+  ) => {
+    const selectedCount = values.length
+    const overlay = (
+      <div
+        onClick={(event) => event.stopPropagation()}
+        style={{
+          minWidth: 168,
+          padding: 10,
+          borderRadius: 8,
+          background: token.colorBgElevated,
+          boxShadow: token.boxShadowSecondary,
+        }}
+      >
+        <Checkbox.Group
+          value={values}
+          options={toCheckboxOptions(options)}
+          onChange={(checkedValues) => onChange(checkedValues.map((item) => String(item)))}
+          style={{ display: 'grid', gap: 8 }}
+        />
+        <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 10 }}>
+          <Button size="small" onClick={() => onChange([])}>
+            清空
+          </Button>
+        </div>
+      </div>
+    )
+
+    return (
+      <Dropdown dropdownRender={() => overlay} trigger={['click']}>
+        <button
+          type="button"
+          style={{
+            width: '100%',
+            minWidth: 0,
+            border: 0,
+            padding: 0,
+            background: 'transparent',
+            color: selectedCount ? token.colorPrimary : 'inherit',
+            cursor: 'pointer',
+            display: 'inline-flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            gap: 4,
+            font: 'inherit',
+            fontWeight: 600,
+          }}
+          onClick={(event) => event.preventDefault()}
+        >
+          <span>{label}</span>
+          {selectedCount ? <span style={{ fontSize: 11 }}>({selectedCount})</span> : null}
+          <DownOutlined style={{ fontSize: 10 }} />
+        </button>
+      </Dropdown>
+    )
+  }
+
+  const buildAccountMoreMenuItems = (record: any): MenuProps['items'] => {
+    const commonActions = Array.isArray(platformActions) ? platformActions : []
+    const paymentLinkAction = commonActions.find((action: any) => String(action?.id || '').trim().toLowerCase() === 'payment_link')
+    const invalidRecheckAction = commonActions.find((action: any) => String(action?.id || '').trim().toLowerCase() === 'invalid_recheck')
+    const hiddenIds = new Set([
+      paymentLinkAction ? String(paymentLinkAction.id) : '',
+      invalidRecheckAction ? String(invalidRecheckAction.id) : '',
+      'probe_local_status',
+      'resume_subscription_auth',
+    ].filter(Boolean))
+    const moreActions = commonActions.filter((action: any) => !hiddenIds.has(String(action?.id || '')))
+
+    return [
+      { key: '__detail__', label: '账号详情' },
+      ...(paymentLinkAction ? [{ key: '__payment_link_config__', label: '订阅链接配置' }] : []),
+      ...(paymentLinkAction ? [{ key: '__payment_link_regenerate__', label: '重新生成订阅链接' }] : []),
+      ...(isChatgptPlatform && shouldShowResumeAuthButton(record) ? [{ key: '__resume_auth_config__', label: '补抓Auth临时配置' }] : []),
+      ...moreActions.map((action: any) => ({
+        key: String(action.id),
+        label: String(action.label || action.id),
+      })),
+      {
+        key: '__delete_account__',
+        danger: true,
+        label: (
+          <Popconfirm
+            title="确认删除这个账号？"
+            description={String(record.email || record.id || '')}
+            okText="删除"
+            cancelText="取消"
+            okButtonProps={{ danger: true }}
+            onConfirm={() => handleDeleteAccount(record)}
+          >
+            <span onClick={(event) => event.stopPropagation()}>删除账号</span>
+          </Popconfirm>
+        ),
+      },
+    ]
+  }
+
+  const handleAccountMoreMenuClick = (record: any, key: React.Key) => {
+    if (String(key) === '__detail__') {
+      setDetailAccount(record)
+      setDetailModalOpen(true)
+      return
+    }
+    if (String(key) === '__payment_link_config__') {
+      openAccountInlineAction(record, 'payment_link', 'dialog')
+      return
+    }
+    if (String(key) === '__payment_link_regenerate__') {
+      openAccountPaymentLinkRegenerateAction(record)
+      return
+    }
+    if (String(key) === '__resume_auth_config__') {
+      void openResumeAuthConfig(record)
+      return
+    }
+    if (String(key) === '__delete_account__') {
+      return
+    }
+    openAccountInlineAction(record, String(key))
+  }
+
+  const renderAccountActions = (record: any, compact = false) => {
+    const commonActions = Array.isArray(platformActions) ? platformActions : []
+    const paymentLinkAction = commonActions.find((action: any) => String(action?.id || '').trim().toLowerCase() === 'payment_link')
+    const showResumeAuth = isChatgptPlatform && shouldShowResumeAuthButton(record)
+    const showInvalidRecheck = isChatgptPlatform && shouldShowInvalidRecheckButton(record)
+    const moreMenuItems = buildAccountMoreMenuItems(record)
+
+    return (
+      <Space direction="vertical" size={compact ? 6 : 4} style={{ width: '100%' }}>
+        <Space size={compact ? 8 : 4} wrap style={{ width: '100%' }}>
+          {paymentLinkAction ? (
+            <Button
+              type="link"
+              size="small"
+              style={accountActionTextStyles.payment}
+              onClick={() => openAccountPaymentLinkAction(record)}
+            >
+              订阅链接
+            </Button>
+          ) : null}
+          <Button
+            type="link"
+            size="small"
+            style={accountActionTextStyles.refresh}
+            onClick={() => openAccountProbeStatusAction(record)}
+          >
+            刷新状态
+          </Button>
+        </Space>
+        <Space size={compact ? 8 : 4} wrap style={{ width: '100%' }}>
+          {showResumeAuth ? (
+            <Button
+              type="link"
+              size="small"
+              loading={resumeAuthAccountId === record.id}
+              style={accountActionTextStyles.resume}
+              onClick={() => handleResumeSubscriptionAuth(record)}
+            >
+              补抓Auth
+            </Button>
+          ) : null}
+          {isChatgptPlatform ? (
+            <Button
+              type="link"
+              size="small"
+              style={accountActionTextStyles.payment}
+              onClick={() => openAccountInlineAction(record, 'gopay', 'direct')}
+            >
+              GoPay支付
+            </Button>
+          ) : null}
+          {showInvalidRecheck ? (
+            <Button
+              type="link"
+              size="small"
+              style={accountActionTextStyles.resume}
+              onClick={() => handleInvalidRecheck(record)}
+            >
+              失效测活
+            </Button>
+          ) : null}
+          <Dropdown
+            menu={{
+              items: moreMenuItems,
+              onClick: ({ key }) => handleAccountMoreMenuClick(record, key),
+            }}
+          >
+            <Button
+              type="link"
+              size="small"
+              icon={<MoreOutlined />}
+              loading={platformActionsLoading}
+              style={accountActionTextStyles.more}
+            >
+              更多
+            </Button>
+          </Dropdown>
+        </Space>
+      </Space>
+    )
+  }
+
+  const renderAccountMobileCard = (record: any, helpers: { checked: boolean; onCheckedChange: (checked: boolean) => void }) => {
+    const formatted = formatCreatedAt(record.created_at)
+    const subscriptionExpiry = formatSubscriptionExpiry(record)
+
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 10, minWidth: 0 }}>
+        <div style={{ display: 'flex', alignItems: 'flex-start', gap: 8, minWidth: 0 }}>
+          <Checkbox
+            checked={helpers.checked}
+            onChange={(event) => helpers.onCheckedChange(event.target.checked)}
+            style={{ marginTop: 3, flex: '0 0 auto' }}
+          />
+          <div style={{ flex: 1, minWidth: 0 }}>
+            {renderAccountIdentity(String(record.email || ''), record)}
+          </div>
+          <Tag color={STATUS_COLORS[record.status] || 'default'} style={{ marginInlineEnd: 0 }}>
+            {statusLabel(record.status)}
+          </Tag>
+        </div>
+
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+          <Tag color="default">ID {record.id}</Tag>
+          {isColumnVisible('created_at') ? <Tag color="default">注册 {`${formatted.date}${formatted.time ? ` ${formatted.time}` : ''}`}</Tag> : null}
+          {isColumnVisible('password') ? <span style={{ display: 'inline-flex' }}>{renderPasswordState(record.password)}</span> : null}
+          {isColumnVisible('phone_binding') ? <span style={{ display: 'inline-flex', maxWidth: '100%' }}>{renderPhoneBindingState(record)}</span> : null}
+          {isColumnVisible('auth_type') ? <span style={{ display: 'inline-flex' }}>{renderAuthTypeState(record)}</span> : null}
+          {isColumnVisible('manually_used') ? <Tag color={record.manuallyUsed ? 'orange' : 'default'}>{record.manuallyUsed ? '已使用' : '未使用'}</Tag> : null}
+          {isColumnVisible('subscription_type') ? <span style={{ display: 'inline-flex' }}>{renderSubscriptionTypeState(record)}</span> : null}
+          {isColumnVisible('subscription_active_until') ? (
+            <Tag color={subscriptionExpiry?.expired ? 'error' : subscriptionExpiry ? 'blue' : 'default'}>
+              到期 {subscriptionExpiry?.compact || '-'}
+            </Tag>
+          ) : null}
+          {isColumnVisible('account_validity') ? <span style={{ display: 'inline-flex' }}>{renderAccountValidityState(record)}</span> : null}
+          {isChatgptPlatform && isColumnVisible('sub2api_state') ? <span style={{ display: 'inline-flex' }}>{renderSub2ApiState(record)}</span> : null}
+        </div>
+
+        <div style={{ borderTop: `1px solid ${token.colorBorderSecondary}`, paddingTop: 8 }}>
+          {renderAccountActions(record, true)}
+        </div>
+      </div>
+    )
+  }
+
+  const selectedAccountItems = selectedRowKeys.map((key) => {
+    const id = String(key)
+    return selectedAccountSnapshots[id] || accounts.find((account) => String(account.id) === id) || { id }
+  })
+
+  const removeSelectedAccount = (accountId: React.Key) => {
+    const id = String(accountId)
+    setSelectedRowKeys((keys) => keys.filter((key) => String(key) !== id))
+    setSelectedAccountSnapshots((prev) => {
+      const next = { ...prev }
+      delete next[id]
+      return next
+    })
+  }
+
+  const clearSelectedAccounts = () => {
+    setSelectedRowKeys([])
+    setSelectedAccountSnapshots({})
+  }
+
+  const subscriptionExpiryTableSortOrder =
+    subscriptionExpirySortOrder === 'asc'
+      ? 'ascend'
+      : subscriptionExpirySortOrder === 'desc'
+        ? 'descend'
+        : null
+
+  const renderSelectedAccountsSummary = () => {
+    if (selectedAccountItems.length === 0) return null
+    return (
+      <div
+        style={{
+          flex: '0 0 auto',
+          marginBottom: isMobile ? 10 : 12,
+          padding: isMobile ? 10 : 12,
+          border: `1px solid ${token.colorBorderSecondary}`,
+          borderRadius: 12,
+          background: token.colorFillAlter,
+        }}
+      >
+        <div
+          style={{
+            display: 'flex',
+            justifyContent: 'space-between',
+            alignItems: 'center',
+            gap: 10,
+            marginBottom: 8,
+          }}
+        >
+          <Space size={6} wrap>
+            <Text strong>已选账号</Text>
+            <Tag color="processing">{selectedAccountItems.length}</Tag>
+          </Space>
+          <Button size="small" type="link" onClick={clearSelectedAccounts}>
+            清空
+          </Button>
+        </div>
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, maxHeight: isMobile ? 180 : 92, overflow: 'auto' }}>
+          {selectedAccountItems.map((account) => {
+            const id = String(account?.id || '')
+            const email = String(account?.email || '').trim()
+            const status = String(account?.status || '').trim()
+            const title = email || `账号 ${id}`
+            return (
+              <Tag
+                key={id}
+                closable
+                onClose={(event) => {
+                  event.preventDefault()
+                  removeSelectedAccount(id)
+                }}
+                color={STATUS_COLORS[status] || 'default'}
+                style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: 4,
+                  maxWidth: isMobile ? '100%' : 360,
+                  marginInlineEnd: 0,
+                  padding: '4px 8px',
+                }}
+              >
+                <span
+                  title={title}
+                  style={{
+                    display: 'inline-block',
+                    maxWidth: isMobile ? 210 : 260,
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    verticalAlign: 'bottom',
+                  }}
+                >
+                  {title}
+                </span>
+                <Text type="secondary" style={{ fontSize: 11 }}>
+                  ID {id}{status ? ` · ${statusLabel(status)}` : ''}
+                </Text>
+              </Tag>
+            )
+          })}
+        </div>
+      </div>
+    )
+  }
 
   const columns: any[] = [
     {
-      title: '邮箱',
+      title: (
+        <Input.Search
+          allowClear
+          size="small"
+          placeholder="搜索邮箱"
+          value={search}
+          onChange={(event) => {
+            const value = event.target.value
+            setSearch(value)
+            setColumnFilters((prev) => ({ ...prev, email: value }))
+          }}
+          onSearch={(value) => {
+            const next = String(value || '').trim()
+            setSearch(next)
+            setColumnFilters((prev) => ({ ...prev, email: next }))
+            setDebouncedSearch(next)
+          }}
+          onClick={(event) => event.stopPropagation()}
+        />
+      ),
       dataIndex: 'email',
       key: 'email',
-      width: 220,
-      render: (text: string, record: any) => {
-        const teamInviteOwner = getTeamInviteOwnerLabel(record.teamInviteSource)
-        const teamInviteMeta = [
-          record.teamInviteSource?.team_name ? `Team: ${record.teamInviteSource.team_name}` : '',
-          record.teamInviteSource?.team_id ? `#${record.teamInviteSource.team_id}` : '',
-        ].filter(Boolean).join(' · ')
-
-        return (
-          <div style={cellStackStyle}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 4, minWidth: 0 }}>
-              <Text
-                style={{ ...monospaceStyle, flex: 1, minWidth: 0, whiteSpace: 'nowrap', fontSize: 12 }}
-                ellipsis={{ tooltip: text }}
-              >
-                {text}
-              </Text>
-              {record.manuallyUsed ? (
-                <Tag color="orange">已使用</Tag>
-              ) : null}
-              {record.workspace_label || record.extra?.chatgpt_workspace_label ? (
-                <Tag color={(record.workspace_scope || record.extra?.chatgpt_workspace_scope) === 'business' ? 'processing' : 'default'}>
-                  {record.workspace_label || record.extra?.chatgpt_workspace_label}
-                </Tag>
-              ) : null}
-              <Button
-                type="text"
-                size="small"
-                icon={<CopyOutlined />}
-                onClick={async () => {
-                  const ok = await copyText(text)
-                  if (ok) {
-                    await markAccountUsed(Number(record.id || 0))
-                  }
-                }}
-              />
-            </div>
-            <Text
-              type="secondary"
-              style={{ ...secondaryTextStyle, fontSize: 11, lineHeight: '18px' }}
-              ellipsis={{ tooltip: record.workspace_display_name || record.extra?.chatgpt_workspace_display_name || record.user_id || `账号 #${record.id}` }}
-            >
-              {record.workspace_display_name
-                || record.extra?.chatgpt_workspace_display_name
-                || record.user_id
-                || `#${record.id}`}
-            </Text>
-            {teamInviteOwner ? (
-              <Text
-                type="secondary"
-                style={{ ...secondaryTextStyle, fontSize: 11, lineHeight: '18px' }}
-                ellipsis={{ tooltip: `${teamInviteOwner}${teamInviteMeta ? ` · ${teamInviteMeta}` : ''}` }}
-              >
-                {`${teamInviteOwner}${teamInviteMeta ? ` · ${teamInviteMeta}` : ''}`}
-              </Text>
-            ) : null}
-          </div>
-        )
-      },
+      width: isCompactDesktop ? 210 : 230,
+      render: (text: string, record: any) => renderAccountIdentity(text, record),
+    },
+    {
+      title: renderColumnFilterTitle(
+        '使用状态',
+        columnFilters.manuallyUsed,
+        MANUAL_USE_FILTER_OPTIONS,
+        (next) => setColumnFilters((prev) => ({ ...prev, manuallyUsed: next })),
+      ),
+      dataIndex: 'manually_used',
+      key: 'manually_used',
+      width: 108,
+      render: (_: any, record: any) => (
+        <Tag color={record.manuallyUsed ? 'orange' : 'default'} style={compactTagStyle}>
+          {record.manuallyUsed ? '已使用' : '未使用'}
+        </Tag>
+      ),
     },
     {
       title: '密码',
       dataIndex: 'password',
       key: 'password',
       width: 96,
-      render: (text: string) => {
-        const hasPassword = Boolean(String(text || '').trim())
-        return (
-          <Space size={2} style={{ width: '100%', justifyContent: 'center' }}>
-            <Tag color={hasPassword ? 'success' : 'default'}>{hasPassword ? '有密码' : '无密码'}</Tag>
-            {hasPassword ? (
-              <Button title="复制密码" type="text" size="small" icon={<CopyOutlined />} onClick={() => copyText(text)} />
-            ) : null}
-          </Space>
-        )
-      },
+      render: (text: string) => renderPasswordState(text),
     },
     {
-      title: 'RT',
-      key: 'refresh_token',
-      width: 92,
-      render: (_: any, record: any) => {
-        const rt = getRefreshToken(record)
-        if (!rt) {
-          return (
-            <Space size={2} style={{ width: '100%', justifyContent: 'center' }}>
-              <Tag color="default">无RT</Tag>
-            </Space>
-          )
-        }
-        return (
-          <Space size={2} style={{ width: '100%', justifyContent: 'center' }}>
-            <Tag color="success">有RT</Tag>
-            <Button title="复制RT" type="text" size="small" icon={<CopyOutlined />} onClick={() => copyText(rt)} />
-          </Space>
-        )
-      },
+      title: '手机号/API',
+      key: 'phone_binding',
+      width: 280,
+      render: (_: any, record: any) => renderPhoneBindingState(record),
     },
     {
-      title: '状态',
+      title: renderColumnFilterTitle(
+        '认证类型',
+        columnFilters.authType,
+        AUTH_TYPE_FILTER_OPTIONS,
+        (next) => setColumnFilters((prev) => ({ ...prev, authType: next })),
+      ),
+      key: 'auth_type',
+      width: 112,
+      render: (_: any, record: any) => renderAuthTypeState(record),
+    },
+    {
+      title: renderColumnFilterTitle(
+        '状态',
+        columnFilters.status,
+        STATUS_FILTER_OPTIONS,
+        (next) => {
+          setColumnFilters((prev) => ({ ...prev, status: next }))
+          setFilterStatus(next.join(','))
+        },
+      ),
       dataIndex: 'status',
       key: 'status',
-      width: 84,
-      render: (status: string) => <Tag color={STATUS_COLORS[status] || 'default'}>{statusLabel(status)}</Tag>,
+      width: 96,
+      render: (status: string) => <Tag color={STATUS_COLORS[status] || 'default'} style={compactTagStyle}>{statusLabel(status)}</Tag>,
     },
   ]
 
   if (isChatgptPlatform) {
     columns.push(
       {
-        title: '本地状态',
-        key: 'chatgpt_local_state',
-        width: isChatgptPlatform ? 164 : 220,
-        render: (_: any, record: any) => {
-          const auth = record.chatgptLocal?.auth || {}
-          const subscription = record.chatgptLocal?.subscription || {}
-          const codex = record.chatgptLocal?.codex || {}
-          const capabilities = record.chatgptCapabilities || {}
-          const authMeta = authLevelMeta(record.auth_level || capabilities.auth_level, auth.state)
-          const materialMeta = workspaceMeta(capabilities)
-          const planTag = planMeta(record.subscription_plan || capabilities.subscription_plan || subscription.plan)
-          const codexMeta = codexStateMeta(record.codex_state || codex.state)
-
-          return (
-            <div style={{ ...cellStackStyle, ...compactPanelStyle }}>
-              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
-                <Tag color={authMeta.color}>{authMeta.label}</Tag>
-                <Tag color={materialMeta.color}>{materialMeta.label}</Tag>
-                <Tag color={planTag.color}>{planTag.label}</Tag>
-                <Tag color={codexMeta.color}>Codex{codexMeta.label}</Tag>
-              </div>
-            </div>
-          )
-        },
+        title: renderColumnFilterTitle(
+          '订阅类型',
+          columnFilters.subscriptionType,
+          SUBSCRIPTION_TYPE_FILTER_OPTIONS,
+          (next) => setColumnFilters((prev) => ({ ...prev, subscriptionType: next })),
+        ),
+        key: 'subscription_type',
+        width: 112,
+        render: (_: any, record: any) => renderSubscriptionTypeState(record),
       },
       {
-        title: 'Sub2API',
-        key: 'sub2api_sync',
-        width: 88,
-        render: (_: any, record: any) => {
-          const sync = record.sub2apiSync || {}
-          const meta = sub2apiStateMeta(
-            record.sub2api_remote_state
-              ? { ...sync, remote_state: record.sub2api_remote_state }
-              : sync,
-          )
-
-          return (
-            <div style={{ ...cellStackStyle, ...compactPanelStyle }}>
-              <Tag color={meta.color}>{meta.label}</Tag>
-            </div>
-          )
-        },
+        title: '订阅到期',
+        dataIndex: SUBSCRIPTION_EXPIRY_SORT_FIELD,
+        key: 'subscription_active_until',
+        width: 118,
+        sorter: true,
+        sortOrder: subscriptionExpiryTableSortOrder,
+        render: (_: any, record: any) => renderSubscriptionExpiryState(record),
+      },
+      {
+        title: renderColumnFilterTitle(
+          '账号有效性',
+          columnFilters.accountValidity,
+          ACCOUNT_VALIDITY_FILTER_OPTIONS,
+          (next) => setColumnFilters((prev) => ({ ...prev, accountValidity: next })),
+        ),
+        key: 'account_validity',
+        width: 116,
+        render: (_: any, record: any) => renderAccountValidityState(record),
+      },
+      {
+        title: renderColumnFilterTitle(
+          'Sub2API',
+          columnFilters.sub2apiState,
+          SUB2API_FILTER_OPTIONS,
+          (next) => setColumnFilters((prev) => ({ ...prev, sub2apiState: next })),
+        ),
+        key: 'sub2api_state',
+        width: 106,
+        render: (_: any, record: any) => renderSub2ApiState(record),
       },
     )
   } else {
@@ -2522,7 +3840,7 @@ export default function Accounts() {
       title: '注册时间',
       dataIndex: 'created_at',
       key: 'created_at',
-      width: 64,
+      width: 76,
       render: (text: string) => {
         const formatted = formatCreatedAt(text)
         return (
@@ -2535,118 +3853,12 @@ export default function Accounts() {
     {
       title: '操作',
       key: 'action',
-      width: 236,
+      width: isCompactDesktop ? 214 : 236,
       fixed: isChatgptPlatform ? 'right' : undefined,
-      render: (_: any, record: any) => {
-        const commonActions = Array.isArray(platformActions) ? platformActions : []
-        const paymentLinkAction = commonActions.find((action: any) => String(action?.id || '').trim().toLowerCase() === 'payment_link')
-        const showResumeAuth = isChatgptPlatform && shouldShowResumeAuthButton(record)
-        const hiddenIds = new Set([
-          paymentLinkAction ? String(paymentLinkAction.id) : '',
-          'probe_local_status',
-          'resume_subscription_auth',
-        ].filter(Boolean))
-        const moreActions = commonActions.filter((action: any) => !hiddenIds.has(String(action?.id || '')))
-        const moreMenuItems: MenuProps['items'] = [
-          { key: '__detail__', label: '账号详情' },
-          ...(paymentLinkAction ? [{ key: '__payment_link_config__', label: '订阅链接配置' }] : []),
-          ...(paymentLinkAction ? [{ key: '__payment_link_regenerate__', label: '重新生成订阅链接' }] : []),
-          ...moreActions.map((action: any) => ({
-            key: String(action.id),
-            label: String(action.label || action.id),
-          })),
-          {
-            key: '__delete_account__',
-            danger: true,
-            label: (
-              <Popconfirm
-                title="确认删除这个账号？"
-                description={String(record.email || record.id || '')}
-                okText="删除"
-                cancelText="取消"
-                okButtonProps={{ danger: true }}
-                onConfirm={() => handleDeleteAccount(record)}
-              >
-                <span onClick={(event) => event.stopPropagation()}>删除账号</span>
-              </Popconfirm>
-            ),
-          },
-        ]
-
-        return (
-          <Space direction="vertical" size={4} style={{ width: '100%' }}>
-            <Space size={4} wrap>
-              {paymentLinkAction ? (
-                <Button
-                  type="link"
-                  size="small"
-                  style={accountActionTextStyles.payment}
-                  onClick={() => openAccountPaymentLinkAction(record)}
-                >
-                  订阅链接
-                </Button>
-              ) : null}
-              <Button
-                type="link"
-                size="small"
-                style={accountActionTextStyles.refresh}
-                onClick={() => openAccountProbeStatusAction(record)}
-              >
-                刷新状态
-              </Button>
-            </Space>
-            <Space size={4} wrap>
-              {showResumeAuth ? (
-                <Button
-                  type="link"
-                  size="small"
-                  loading={resumeAuthAccountId === record.id}
-                  style={accountActionTextStyles.resume}
-                  onClick={() => handleResumeSubscriptionAuth(record)}
-                >
-                  补抓Auth
-                </Button>
-              ) : null}
-            <Dropdown
-              menu={{
-                items: moreMenuItems,
-                onClick: ({ key }) => {
-                  if (String(key) === '__detail__') {
-                    setDetailAccount(record)
-                    setDetailModalOpen(true)
-                    return
-                  }
-                  if (String(key) === '__payment_link_config__') {
-                    openAccountInlineAction(record, 'payment_link', 'dialog')
-                    return
-                  }
-                  if (String(key) === '__payment_link_regenerate__') {
-                    openAccountPaymentLinkRegenerateAction(record)
-                    return
-                  }
-                  if (String(key) === '__delete_account__') {
-                    return
-                  }
-                  openAccountInlineAction(record, String(key))
-                },
-              }}
-            >
-              <Button
-                type="link"
-                size="small"
-                icon={<MoreOutlined />}
-                loading={platformActionsLoading}
-                style={accountActionTextStyles.more}
-              >
-                更多
-              </Button>
-            </Dropdown>
-            </Space>
-          </Space>
-        )
-      },
+      render: (_: any, record: any) => renderAccountActions(record),
     },
   )
+  const visibleColumns = columns.filter((column) => isColumnVisible(String(column?.key || column?.dataIndex || '')))
 
   const statusSyncMenuItems: MenuProps['items'] = [
     {
@@ -2698,6 +3910,11 @@ export default function Accounts() {
     {
       key: resumeAuthScope,
       label: buildResumeAuthMenuLabel(),
+      disabled: resumeAuthScope === 'selected' ? selectedRowKeys.length === 0 : total === 0,
+    },
+    {
+      key: `${resumeAuthScope}:config`,
+      label: buildResumeAuthMenuLabel(true),
       disabled: resumeAuthScope === 'selected' ? selectedRowKeys.length === 0 : total === 0,
     },
   ]
@@ -2840,12 +4057,18 @@ export default function Accounts() {
   }
 
   return (
-    <div>
+    <div
+      style={{
+        width: '100%',
+        maxWidth: '100%',
+        minWidth: 0,
+        height: isMobile ? 'auto' : 'calc(100vh - 48px)',
+        overflow: isMobile ? 'visible' : 'hidden',
+        display: 'flex',
+        flexDirection: 'column',
+      }}
+    >
       <AccountsToolbar
-        search={search}
-        onSearchChange={setSearch}
-        filterStatus={filterStatus}
-        onFilterStatusChange={setFilterStatus}
         total={total}
         accountsCount={accounts.length}
         selectedRowKeys={selectedRowKeys}
@@ -2857,7 +4080,11 @@ export default function Accounts() {
         isChatgptPlatform={currentPlatform === 'chatgpt'}
         batchGopayLoading={batchGopayLoading}
         batchPaymentLinkLoading={batchPaymentLinkLoading}
+        batchInvalidRecheckLoading={batchInvalidRecheckLoading}
+        phoneBindingTestLoading={phoneBindingTestLoading}
         onBatchPaymentLink={handleBatchPaymentLink}
+        onBatchInvalidRecheck={handleBatchInvalidRecheck}
+        onOpenPhoneBindingTest={openPhoneBindingTest}
         onOpenBatchGopay={openBatchGopayWorkbench}
         onOpenBusinessDeferred={() => setBusinessDeferredModalOpen(true)}
         deleteInvalidLoading={deleteInvalidLoading}
@@ -2884,7 +4111,13 @@ export default function Accounts() {
         statusSyncLoading={statusSyncLoading}
         resumeAuthMenuItems={resumeAuthMenuItems}
         onResumeAuthClick={({ key }) => {
-          const scope = String(key) === 'selected' ? 'selected' : 'filtered'
+          const rawKey = String(key)
+          const [scopeKey, modeKey] = rawKey.split(':')
+          const scope = scopeKey === 'selected' ? 'selected' : 'filtered'
+          if (modeKey === 'config') {
+            void openBatchResumeAuthConfig(scope)
+            return
+          }
           void handleBatchResumeSubscriptionAuth(scope)
         }}
         resumeAuthLoading={batchResumeAuthLoading}
@@ -2900,26 +4133,33 @@ export default function Accounts() {
           })
         }}
         backfillLoading={backfillLoading}
+        isMobile={isMobile}
       />
 
+      {renderSelectedAccountsSummary()}
+
+      {renderColumnVisibilityControl()}
+
       {currentPlatform === 'chatgpt' && accounts.length > 0 && (
-        <Sub2ApiOverviewPanel
-          accountsCount={accounts.length}
-          overview={sub2apiOverview}
-          syncing={false}
-          statusSyncLoading={statusSyncLoading}
-          uploadLoading={sub2apiOverviewUploading}
-          uploadDisabled={sub2apiOverviewUploadDisabled}
-          pendingCount={sub2apiOverviewPendingCount}
-          scope={sub2apiOverviewBackfillScope}
-          selectedCount={selectedRowKeys.length}
-          onRefresh={() => handleBatchStatusSync('sub2api', 'all')}
-          onUpload={() => handleBackfill('sub2api', sub2apiOverviewBackfillScope)}
-        />
+        <div style={{ flex: '0 0 auto' }}>
+          <Sub2ApiOverviewPanel
+            accountsCount={accounts.length}
+            overview={sub2apiOverview}
+            syncing={false}
+            statusSyncLoading={statusSyncLoading}
+            uploadLoading={sub2apiOverviewUploading}
+            uploadDisabled={sub2apiOverviewUploadDisabled}
+            pendingCount={sub2apiOverviewPendingCount}
+            scope={sub2apiOverviewBackfillScope}
+            selectedCount={selectedRowKeys.length}
+            onRefresh={() => handleBatchStatusSync('sub2api', 'all')}
+            onUpload={() => handleBackfill('sub2api', sub2apiOverviewBackfillScope)}
+          />
+        </div>
       )}
 
       <AccountsTable
-        columns={columns}
+        columns={visibleColumns}
         accounts={accounts}
         loading={loading}
         total={total}
@@ -2928,7 +4168,10 @@ export default function Accounts() {
         onPageChange={setCurrentPage}
         selectedRowKeys={selectedRowKeys}
         setSelectedRowKeys={setSelectedRowKeys}
-        isChatgptPlatform={isChatgptPlatform}
+        onTableChange={handleAccountsTableChange}
+        filterSummary={renderMobileFilterControls()}
+        isMobile={isMobile}
+        renderMobileCard={renderAccountMobileCard}
         onOpenDetail={(record) => {
           setDetailAccount(record)
           setDetailModalOpen(true)
@@ -2939,8 +4182,9 @@ export default function Accounts() {
         open={batchGopayOpen}
         onClose={() => {
           setBatchGopayOpen(false)
-          setBatchGopayPhoneCountryCode('86')
+          setBatchGopayPhoneCountryCode(DEFAULT_GOPAY_PHONE_COUNTRY_CODE)
           setBatchGopayPhoneNumber('')
+          setBatchGopayRecognizedCountryCodes([DEFAULT_GOPAY_PHONE_COUNTRY_CODE])
           setBatchGopayPhoneSaving(false)
         }}
         token={token}
@@ -2956,7 +4200,7 @@ export default function Accounts() {
         phoneCountryCode={batchGopayPhoneCountryCode}
         phoneNumber={batchGopayPhoneNumber}
         onPhoneCountryCodeChange={(value) => setBatchGopayPhoneCountryCode(normalizeGopayPhonePart(value))}
-        onPhoneNumberChange={(value) => setBatchGopayPhoneNumber(normalizeGopayPhonePart(value))}
+        onPhoneNumberChange={updateBatchGopayPhoneNumberInput}
         onSaveOtpDelay={() => saveBatchGopayOtpAutoResendDelay(batchGopayOtpAutoResendDelay)}
         onRefreshConfig={loadGopayBatchConfig}
         onStart={startBatchGopay}
@@ -3050,6 +4294,102 @@ export default function Accounts() {
         onImportTextChange={setImportText}
       />
 
+      <Modal
+        title={resumeAuthConfigMode === 'single' ? '补抓 Auth 配置' : '批量补抓 Auth 配置'}
+        open={resumeAuthConfigOpen}
+        onCancel={() => setResumeAuthConfigOpen(false)}
+        onOk={submitResumeAuthConfig}
+        confirmLoading={Boolean(resumeAuthAccountId || batchResumeAuthLoading)}
+        okText="启动补抓"
+        cancelText="取消"
+        maskClosable={false}
+      >
+        <Form form={resumeAuthConfigForm} layout="vertical">
+          <Alert
+            type="info"
+            showIcon
+            style={{ marginBottom: 12 }}
+            message={
+              resumeAuthConfigMode === 'single'
+                ? `账号：${resumeAuthConfigAccount?.email || resumeAuthConfigAccount?.id || '-'}`
+                : resumeAuthConfigScope === 'selected'
+                  ? `范围：当前选中 ${selectedRowKeys.length} 个账号`
+                  : `范围：当前筛选结果 ${total} 个账号`
+            }
+            description="这里是本次任务的临时覆盖项；默认值来自“全局配置 > ChatGPT > 补抓 Auth”。勾选后，遇到 add_phone 会调用已配置的手机验证码 API。"
+          />
+          <Form.Item name="allow_phone_verification" valuePropName="checked" initialValue={false}>
+            <Checkbox>允许 add_phone 后使用手机验证码 API</Checkbox>
+          </Form.Item>
+        </Form>
+      </Modal>
+
+      <Modal
+        title="OpenAI 号码绑定测试"
+        open={phoneBindingTestOpen}
+        onCancel={() => setPhoneBindingTestOpen(false)}
+        onOk={submitPhoneBindingTest}
+        confirmLoading={phoneBindingTestLoading}
+        okText="开始真实绑定"
+        cancelText="取消"
+        width={720}
+        maskClosable={false}
+      >
+        <Form form={phoneBindingTestForm} layout="vertical">
+          <Alert
+            type="warning"
+            showIcon
+            style={{ marginBottom: 12 }}
+            message={
+              phoneBindingTestScope === 'selected'
+                ? `范围：当前选中 ${selectedRowKeys.length} 个账号`
+                : `范围：当前筛选结果 ${total} 个账号`
+            }
+          />
+          <Form.Item name="scope" label="账号范围" initialValue={phoneBindingTestScope}>
+            <Select
+              value={phoneBindingTestScope}
+              onChange={(value) => setPhoneBindingTestScope(value)}
+              options={[
+                { value: 'selected', label: `当前选中账号（${selectedRowKeys.length}）`, disabled: selectedRowKeys.length === 0 },
+                { value: 'filtered', label: `当前筛选账号（${total}）` },
+              ]}
+            />
+          </Form.Item>
+          <Form.Item
+            name="phone_lines"
+            label="手机号与收码 API"
+            rules={[{ required: true, message: '请粘贴至少一行手机号与 API' }]}
+            extra="+13434832954----https://api.sms8.net/api/record?token=xxx"
+          >
+            <Input.TextArea
+              autoSize={{ minRows: 8, maxRows: 14 }}
+              placeholder="+13434832954----https://api.sms8.net/api/record?token=..."
+            />
+          </Form.Item>
+          <div style={{ display: 'grid', gridTemplateColumns: isMobile ? '1fr' : 'repeat(3, 1fr)', gap: 12 }}>
+            <Form.Item name="timeout_seconds" label="等待验证码" initialValue={180}>
+              <InputNumber min={10} max={900} step={5} addonAfter="秒" style={{ width: '100%' }} />
+            </Form.Item>
+            <Form.Item name="poll_interval_seconds" label="轮询间隔" initialValue={5}>
+              <InputNumber min={1} max={60} step={1} addonAfter="秒" style={{ width: '100%' }} />
+            </Form.Item>
+            <Form.Item name="account_interval_seconds" label="账号/号码间隔" initialValue={60}>
+              <InputNumber min={1} max={3600} step={5} addonAfter="秒" style={{ width: '100%' }} />
+            </Form.Item>
+          </div>
+          <Form.Item
+            name="reuse_phone_until_unusable"
+            label="同号连续绑定"
+            valuePropName="checked"
+            initialValue={false}
+            extra="开启后，同一个上传手机号会连续绑定多个账号，直到 OpenAI 或收码接口判定该号码不可继续使用。"
+          >
+            <Switch checkedChildren="开启" unCheckedChildren="关闭" />
+          </Form.Item>
+        </Form>
+      </Modal>
+
       <Suspense fallback={null}>
         <AccountActionSurface
         account={actionAccount}
@@ -3073,6 +4413,7 @@ export default function Accounts() {
         initialActionMode={actionSurfaceInitialActionMode}
         onInitialActionHandled={() => setActionSurfaceInitialActionId(null)}
         onResumeAuthTask={handleResumeSubscriptionAuth}
+        onInvalidRecheckTask={handleInvalidRecheck}
         authStateMeta={authStateMeta}
         planMeta={planMeta}
           codexStateMeta={codexStateMeta}

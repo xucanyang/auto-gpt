@@ -1,3 +1,6 @@
+import os
+from pathlib import Path
+
 from fastapi import APIRouter
 from pydantic import BaseModel
 from core.config_store import config_store
@@ -46,6 +49,13 @@ CONFIG_KEYS = [
     "icloud_hme_auto_create_interval_min_minutes",
     "icloud_hme_auto_create_interval_max_minutes",
     "icloud_hme_auto_create_rate_limit_backoff_minutes",
+    "tempmail_archive_cleanup_enabled",
+    "tempmail_archive_cleanup_interval_minutes",
+    "tempmail_archive_cleanup_keep_recent_minutes",
+    "tempmail_archive_cleanup_threshold",
+    "tempmail_archive_cleanup_pause_active_tasks",
+    "tempmail_archive_cleanup_mailbox",
+    "tempmail_archive_cleanup_backup_path",
     "tempmail_api_url",
     "tempmail_api_key",
     "tempmail_api_key_header",
@@ -83,9 +93,13 @@ CONFIG_KEYS = [
     "local_phone_gateway_url",
     "local_phone_gateway_token",
     "local_phone_gateway_service_alias",
+    "local_phone_gateway_auto_acquire_enabled",
     "local_phone_gateway_timeout_seconds",
     "local_phone_gateway_poll_interval_seconds",
     "local_phone_gateway_max_attempts",
+    "local_phone_gateway_max_resend_attempts",
+    "local_phone_gateway_resend_interval_seconds",
+    "local_phone_gateway_queue_timeout_seconds",
     "smstome_cookie",
     "smstome_country_slugs",
     "smstome_phone_attempts",
@@ -113,6 +127,7 @@ CONFIG_KEYS = [
     "chatgpt_existing_account_login_password",
     "chatgpt_resume_auth_allow_phone_verification",
     "chatgpt_subscription_auth_capture_retry_delays_seconds",
+    "chatgpt_workspace_select_no_org_retry_delays_seconds",
     "chatgpt_gopay_defaults",
     "chatgpt_payment_link_defaults",
     "chatgpt_access_token_only_checkout_amount_check_enabled",
@@ -122,6 +137,7 @@ CONFIG_KEYS = [
     "chatgpt_access_token_only_zero_amount_stop_threshold",
     "external_subscription_api_enabled",
     "external_subscription_api_token",
+    "external_subscription_verify_after_seconds",
     "chatgpt_gopay_billing_llm_enabled",
     "chatgpt_gopay_billing_llm_base_url",
     "chatgpt_gopay_billing_llm_api_key",
@@ -159,6 +175,13 @@ class AppleMailImportRequest(BaseModel):
     bind_to_config: bool = True
 
 
+def _default_tempmail_archive_backup_path() -> str:
+    runtime_dir = str(os.getenv("APP_RUNTIME_DIR") or "").strip()
+    if runtime_dir:
+        return str(Path(runtime_dir) / "tempmail_email_backups.db")
+    return "data/tempmail_email_backups.db"
+
+
 @router.get("")
 def get_config():
     all_cfg = config_store.get_all()
@@ -182,6 +205,20 @@ def get_config():
         all_cfg["icloud_hme_auto_create_interval_max_minutes"] = "120"
     if not all_cfg.get("icloud_hme_auto_create_rate_limit_backoff_minutes"):
         all_cfg["icloud_hme_auto_create_rate_limit_backoff_minutes"] = "360"
+    if not all_cfg.get("tempmail_archive_cleanup_enabled"):
+        all_cfg["tempmail_archive_cleanup_enabled"] = "false"
+    if not all_cfg.get("tempmail_archive_cleanup_interval_minutes"):
+        all_cfg["tempmail_archive_cleanup_interval_minutes"] = "30"
+    if not all_cfg.get("tempmail_archive_cleanup_keep_recent_minutes"):
+        all_cfg["tempmail_archive_cleanup_keep_recent_minutes"] = "60"
+    if not all_cfg.get("tempmail_archive_cleanup_threshold"):
+        all_cfg["tempmail_archive_cleanup_threshold"] = "100"
+    if not all_cfg.get("tempmail_archive_cleanup_pause_active_tasks"):
+        all_cfg["tempmail_archive_cleanup_pause_active_tasks"] = "true"
+    if not all_cfg.get("tempmail_archive_cleanup_mailbox"):
+        all_cfg["tempmail_archive_cleanup_mailbox"] = all_cfg.get("icloud_forward_to") or "b@cccy.me"
+    if not all_cfg.get("tempmail_archive_cleanup_backup_path"):
+        all_cfg["tempmail_archive_cleanup_backup_path"] = _default_tempmail_archive_backup_path()
     if not all_cfg.get("applemail_base_url"):
         all_cfg["applemail_base_url"] = "https://www.appleemail.top"
     if not all_cfg.get("applemail_pool_dir"):
@@ -208,22 +245,34 @@ def get_config():
         all_cfg["chatgpt_access_token_only_zero_amount_stop_threshold"] = "1"
     if not all_cfg.get("external_subscription_api_enabled"):
         all_cfg["external_subscription_api_enabled"] = "false"
+    if not all_cfg.get("external_subscription_verify_after_seconds"):
+        all_cfg["external_subscription_verify_after_seconds"] = "300"
     if not all_cfg.get("chatgpt_resume_auth_allow_phone_verification"):
         all_cfg["chatgpt_resume_auth_allow_phone_verification"] = "false"
     if not all_cfg.get("chatgpt_subscription_auth_capture_retry_delays_seconds"):
         all_cfg["chatgpt_subscription_auth_capture_retry_delays_seconds"] = "5,10"
+    if not all_cfg.get("chatgpt_workspace_select_no_org_retry_delays_seconds"):
+        all_cfg["chatgpt_workspace_select_no_org_retry_delays_seconds"] = "5,10,20"
     if not all_cfg.get("chatgpt_phone_verification_provider"):
         all_cfg["chatgpt_phone_verification_provider"] = "smstome"
     if not all_cfg.get("local_phone_gateway_url"):
         all_cfg["local_phone_gateway_url"] = "http://sms-gateway:8720"
     if not all_cfg.get("local_phone_gateway_service_alias"):
         all_cfg["local_phone_gateway_service_alias"] = "chatgpt"
+    if not all_cfg.get("local_phone_gateway_auto_acquire_enabled"):
+        all_cfg["local_phone_gateway_auto_acquire_enabled"] = "true"
     if not all_cfg.get("local_phone_gateway_timeout_seconds"):
         all_cfg["local_phone_gateway_timeout_seconds"] = "180"
     if not all_cfg.get("local_phone_gateway_poll_interval_seconds"):
         all_cfg["local_phone_gateway_poll_interval_seconds"] = "5"
     if not all_cfg.get("local_phone_gateway_max_attempts"):
         all_cfg["local_phone_gateway_max_attempts"] = "3"
+    if not all_cfg.get("local_phone_gateway_max_resend_attempts"):
+        all_cfg["local_phone_gateway_max_resend_attempts"] = "20"
+    if not all_cfg.get("local_phone_gateway_resend_interval_seconds"):
+        all_cfg["local_phone_gateway_resend_interval_seconds"] = "30"
+    if not all_cfg.get("local_phone_gateway_queue_timeout_seconds"):
+        all_cfg["local_phone_gateway_queue_timeout_seconds"] = "3600"
     if not all_cfg.get("chatgpt_gopay_billing_llm_base_url"):
         all_cfg["chatgpt_gopay_billing_llm_base_url"] = "https://api.666800.xyz"
     if not all_cfg.get("chatgpt_gopay_billing_llm_model"):

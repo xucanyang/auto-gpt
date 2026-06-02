@@ -371,7 +371,18 @@ class ChatGPTPlatform(BasePlatform):
                     {"key": "currency", "label": "货币", "type": "text", "default": "IDR"},
                 ],
             },
-            {"id": "resume_subscription_auth", "label": "补抓Auth", "params": []},
+            {
+                "id": "resume_subscription_auth",
+                "label": "补抓Auth",
+                "params": [
+                    {
+                        "key": "allow_phone_verification",
+                        "label": "允许手机号验证",
+                        "type": "boolean",
+                    }
+                ],
+            },
+            {"id": "invalid_recheck", "label": "失效测活", "params": []},
             {
                 "id": "upload_cpa",
                 "label": "上传 CPA",
@@ -613,6 +624,15 @@ class ChatGPTPlatform(BasePlatform):
                 "data": {
                     "message": "已提交补抓 Auth 请求",
                     "activation_kind": "subscription_auth",
+                },
+            }
+
+        if action_id == "invalid_recheck":
+            return {
+                "ok": True,
+                "data": {
+                    "message": "已提交失效测活请求",
+                    "activation_kind": "invalid_recheck",
                 },
             }
 

@@ -7,8 +7,10 @@ from typing import Any
 from core.db import AccountModel, get_session
 from core.base_platform import RegisterConfig
 from core.config_store import config_store
+from services.account_filters import account_base_query, filter_account_rows
 from services.chatgpt_account_state import apply_chatgpt_status_policy, classify_chatgpt_capabilities, mark_payment_pending
 from services.chatgpt_core import ChatGPTPlatform
+from services.chatgpt_core.invalid_account_recheck import recheck_invalid_chatgpt_account
 from services.chatgpt_core.payment_link_cache import build_payment_link_cache_payload
 from services.chatgpt_sync import update_account_model_cliproxy_sync
 from services.sub2api_sync import backfill_chatgpt_account_to_sub2api, probe_chatgpt_sub2api_status, update_account_model_sub2api_sync
@@ -25,6 +27,11 @@ class BatchActionRequest(BaseModel):
     all_filtered: bool = False
     email: str = ""
     status: str = ""
+    manually_used: str | None = None
+    auth_type: str = ""
+    subscription_type: str = ""
+    account_validity: str = ""
+    sub2api_state: str = ""
     params: dict = {}
 
 
@@ -35,6 +42,38 @@ def _merge_extra_patch(base: dict, patch: dict) -> dict:
         else:
             base[key] = value
     return base
+
+
+def _to_bool(value: Any, *, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def _optional_bool(value: Any) -> bool | None:
+    if value is None:
+        return None
+    text = str(value or "").strip().lower()
+    if not text:
+        return None
+    if text in {"1", "true", "yes", "on", "used"}:
+        return True
+    if text in {"0", "false", "no", "off", "unused"}:
+        return False
+    return None
+
+
+def _resolve_resume_auth_allow_phone_verification(value: Any = None) -> bool:
+    if value is not None:
+        return _to_bool(value, default=False)
+    return _to_bool(config_store.get("chatgpt_resume_auth_allow_phone_verification", "false"), default=False)
 
 
 def _to_platform_account(acc_model: AccountModel):
@@ -104,25 +143,8 @@ def _apply_action_result(
 
             acc_model.updated_at = datetime.now(timezone.utc)
             session.add(acc_model)
-        try:
-            from services.chatgpt_core.pending_business_invites import upsert_pending_subscription_auth_from_account
-
-            pending = upsert_pending_subscription_auth_from_account(
-                acc_model,
-                checkout_url=checkout_url,
-                plan=str(data.get("plan") or ""),
-                country=str(data.get("country") or ""),
-                currency=str(data.get("currency") or ""),
-            )
-            data["pending_activation"] = {
-                "id": int(getattr(pending, "id", 0) or 0),
-                "status": str(getattr(pending, "status", "") or ""),
-                "activation_kind": "subscription_auth",
-            }
-            result["data"] = data
-        except Exception as exc:
-            data["pending_activation_error"] = str(exc)
-            result["data"] = data
+        data["auth_capture_required"] = True
+        result["data"] = data
 
     if platform == "chatgpt" and action_id == "upload_cpa":
         from services.chatgpt_sync import update_account_model_cpa_sync
@@ -164,16 +186,20 @@ def _apply_action_result(
 def _execute_chatgpt_resume_subscription_auth(
     acc_model: AccountModel,
     *,
+    allow_phone_verification: bool | None = None,
     log_fn=None,
+    shared_phone_service=None,
+    stop_checker=None,
+    retry_delays_seconds=None,
 ) -> dict[str, Any]:
-    from services.chatgpt_core.pending_business_invites import (
-        activate_pending_invite,
-        upsert_pending_subscription_auth_from_account,
-    )
+    from services.chatgpt_core.subscription_auth_capture import capture_subscription_auth_for_account
 
     action_logs: list[str] = []
+    resolved_allow_phone_verification = _resolve_resume_auth_allow_phone_verification(allow_phone_verification)
 
     def _collect_log(message: str) -> None:
+        if callable(stop_checker):
+            stop_checker()
         text = str(message or "").strip()
         if text:
             action_logs.append(text)
@@ -181,90 +207,42 @@ def _execute_chatgpt_resume_subscription_auth(
                 log_fn(text)
 
     _collect_log(f"[补抓] 开始处理账号：{acc_model.email}")
-    try:
-        pending = upsert_pending_subscription_auth_from_account(acc_model)
-    except Exception as exc:
-        message = f"补抓 Auth 入池失败：{exc}"
-        _collect_log(f"[补抓] {message}")
-        return {
-            "ok": False,
-            "error": message,
-            "data": {
-                "message": message,
-                "logs": action_logs,
-                "pending_activation": {
-                    "id": 0,
-                    "status": "",
-                    "activation_kind": "subscription_auth",
-                },
-            },
-        }
-
-    pending_id = int(getattr(pending, "id", 0) or 0)
-    if pending_id <= 0:
-        _collect_log("[补抓] 补抓 Auth 入池失败：未拿到 pending id")
-        return {
-            "ok": False,
-            "error": "补抓 Auth 入池失败",
-            "data": {
-                "message": "补抓 Auth 入池失败",
-                "logs": action_logs,
-                "pending_activation": {
-                    "id": 0,
-                    "status": "",
-                    "activation_kind": "subscription_auth",
-                },
-            },
-        }
-
-    _collect_log(f"[补抓] 已写入待激活池：pending_id={pending_id}")
-
-    try:
-        activation_result = activate_pending_invite(pending_id, log_fn=_collect_log)
-    except Exception as exc:
-        message = str(exc or "补抓 Auth 失败")
-        _collect_log(f"[补抓] 失败：{message}")
-        return {
-            "ok": False,
-            "error": message,
-            "data": {
-                "message": message,
-                "logs": action_logs,
-                "pending_activation": {
-                    "id": pending_id,
-                    "status": str(getattr(pending, "status", "") or "subscription_pending_auth"),
-                    "activation_kind": "subscription_auth",
-                },
-            },
-        }
-
-    ok = bool(activation_result.get("ok"))
-    message = "补抓 Auth 完成" if ok else str(activation_result.get("message") or activation_result.get("error") or "补抓 Auth 失败")
-    return {
-        "ok": ok,
-        "data": {
-            "message": message,
-            "logs": action_logs,
-            "pending_activation": {
-                "id": pending_id,
-                "status": str(getattr(pending, "status", "") or "subscription_pending_auth"),
-                "activation_kind": "subscription_auth",
-            },
-            "activation_result": activation_result,
-        },
-        "error": "" if ok else message,
+    capture_kwargs = {
+        "allow_phone_verification": resolved_allow_phone_verification,
+        "log_fn": _collect_log,
     }
+    if shared_phone_service is not None:
+        capture_kwargs["shared_phone_service"] = shared_phone_service
+    if callable(stop_checker):
+        capture_kwargs["stop_checker"] = stop_checker
+    if retry_delays_seconds is not None:
+        capture_kwargs["retry_delays_seconds"] = retry_delays_seconds
+    result = capture_subscription_auth_for_account(int(acc_model.id or 0), **capture_kwargs)
+    data = result.get("data") if isinstance(result.get("data"), dict) else {}
+    logs = list(data.get("logs") or []) if isinstance(data.get("logs"), list) else []
+    if logs:
+        # capture_subscription_auth_for_account 已通过 log_fn 实时输出；这里去重后保证返回体也包含完整日志。
+        seen = set()
+        merged_logs = []
+        for line in action_logs + [str(item) for item in logs]:
+            if line in seen:
+                continue
+            seen.add(line)
+            merged_logs.append(line)
+        data["logs"] = merged_logs
+        result["data"] = data
+    return result
 
 
 def _apply_chatgpt_resume_auth_result(acc_model: AccountModel, result: dict[str, Any], session: Session) -> None:
     data = result.get("data") if isinstance(result.get("data"), dict) else {}
-    activation_result = data.get("activation_result") if isinstance(data.get("activation_result"), dict) else {}
+    auth_capture = data.get("auth_capture") if isinstance(data.get("auth_capture"), dict) else {}
     extra = acc_model.get_extra()
     _merge_extra_patch(
         extra,
         {
-            "chatgpt_pending_subscription_auth": data.get("pending_activation") or {},
-            "chatgpt_subscription_auth_result": activation_result,
+            "chatgpt_subscription_auth_result": auth_capture,
+            "chatgpt_last_auth_capture": auth_capture,
         },
     )
     extra["chatgpt_capabilities"] = classify_chatgpt_capabilities(acc_model, local_probe=extra.get("chatgpt_local"))
@@ -275,10 +253,70 @@ def _apply_chatgpt_resume_auth_result(acc_model: AccountModel, result: dict[str,
     session.add(acc_model)
 
 
-def _execute_chatgpt_resume_subscription_auth_action(acc_model: AccountModel, session: Session) -> dict[str, Any]:
-    result = _execute_chatgpt_resume_subscription_auth(acc_model)
+def _apply_chatgpt_invalid_recheck_result(acc_model: AccountModel, result: dict[str, Any], session: Session) -> None:
+    data = result.get("data") if isinstance(result.get("data"), dict) else {}
+    recheck = data.get("invalid_recheck") if isinstance(data.get("invalid_recheck"), dict) else {}
+    if not recheck:
+        return
+    extra = acc_model.get_extra()
+    extra["chatgpt_invalid_recheck"] = recheck
+    local_probe = extra.get("chatgpt_local") if isinstance(extra.get("chatgpt_local"), dict) else None
+    if str(recheck.get("status") or "") == "recovered_access_token":
+        local_probe = {}
+    extra["chatgpt_capabilities"] = classify_chatgpt_capabilities(acc_model, local_probe=local_probe)
+    acc_model.set_extra(extra)
+    from datetime import datetime, timezone
+
+    acc_model.updated_at = datetime.now(timezone.utc)
+    session.add(acc_model)
+
+
+def _execute_chatgpt_resume_subscription_auth_action(
+    acc_model: AccountModel,
+    session: Session,
+    params: dict | None = None,
+) -> dict[str, Any]:
+    params = params or {}
+    allow_phone_verification = (
+        params.get("allow_phone_verification")
+        if "allow_phone_verification" in params
+        else None
+    )
+    result = _execute_chatgpt_resume_subscription_auth(
+        acc_model,
+        allow_phone_verification=allow_phone_verification,
+    )
     session.refresh(acc_model)
     _apply_chatgpt_resume_auth_result(acc_model, result, session)
+    return result
+
+
+def _execute_chatgpt_invalid_recheck(
+    acc_model: AccountModel,
+    *,
+    log_fn=None,
+    stop_checker=None,
+    task_id: str = "",
+) -> dict[str, Any]:
+    return recheck_invalid_chatgpt_account(
+        int(acc_model.id or 0),
+        log_fn=log_fn,
+        stop_checker=stop_checker,
+        task_id=task_id,
+    )
+
+
+def _execute_chatgpt_invalid_recheck_action(
+    acc_model: AccountModel,
+    session: Session,
+    params: dict | None = None,
+) -> dict[str, Any]:
+    result = _execute_chatgpt_invalid_recheck(
+        acc_model,
+        task_id=str((params or {}).get("task_id") or ""),
+    )
+    session.refresh(acc_model)
+    _apply_chatgpt_invalid_recheck_result(acc_model, result, session)
     return result
 
 
@@ -291,7 +329,10 @@ def _execute_platform_action(
     session: Session,
 ) -> dict[str, Any]:
     if platform == "chatgpt" and action_id == "resume_subscription_auth":
-        return _execute_chatgpt_resume_subscription_auth_action(acc_model, session)
+        return _execute_chatgpt_resume_subscription_auth_action(acc_model, session, params)
+
+    if platform == "chatgpt" and action_id == "invalid_recheck":
+        return _execute_chatgpt_invalid_recheck_action(acc_model, session, params)
 
     if platform == "chatgpt" and action_id == "upload_sub2api":
         outcome = backfill_chatgpt_account_to_sub2api(acc_model, session=session, commit=False)
@@ -341,13 +382,15 @@ def _resolve_batch_accounts(platform: str, body: BatchActionRequest, session: Se
     if not body.all_filtered:
         raise HTTPException(400, "请提供 account_ids，或指定 all_filtered=true")
 
-    query = select(AccountModel).where(AccountModel.platform == platform)
-    if body.status:
-        query = query.where(AccountModel.status == body.status)
-    if body.email:
-        query = query.where(AccountModel.email.contains(body.email))
-
-    rows = session.exec(query).all()
+    query = account_base_query(platform=platform, status=body.status, email=body.email)
+    rows = filter_account_rows(
+        session.exec(query).all(),
+        manually_used=_optional_bool(body.manually_used),
+        auth_type=body.auth_type,
+        subscription_type=body.subscription_type,
+        account_validity_filter=body.account_validity,
+        sub2api_state=body.sub2api_state,
+    )
     if len(rows) > 1000:
         raise HTTPException(400, "单次最多处理 1000 个账号")
     return rows, []

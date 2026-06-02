@@ -22,6 +22,27 @@ class DummyAccount:
 
 
 class GoPayFlowTests(unittest.TestCase):
+    def test_midtrans_snap_signature_matches_charge_har_vector(self):
+        path = "/snap/v2/transactions/dc7fb3e6-42e1-4cd6-9e32-bbfc0ae29d2a/charge"
+        body = '{"payment_type":"gopay","tokenization":"true","promo_details":null}'
+
+        signature = gopay_flow._midtrans_snap_signature(path, body, "1780049346")
+
+        self.assertEqual(
+            signature,
+            "7f64ac82676c9ef480a74be1711f4e6683a58dbc136137f94118bb2dce94e9cc",
+        )
+
+    def test_midtrans_snap_signature_matches_status_har_vector(self):
+        path = "/snap/v1/transactions/dc7fb3e6-42e1-4cd6-9e32-bbfc0ae29d2a/status"
+
+        signature = gopay_flow._midtrans_snap_signature(path, "", "1780049355")
+
+        self.assertEqual(
+            signature,
+            "2d44379736d5f6555929c9d90ee997fa4178522a9d8eaaa3203e495bb10635b1",
+        )
+
     def test_parse_checkout_url_accepts_hosted_url(self):
         cs_id, stripe_url = gopay_flow.parse_checkout_url("https://chatgpt.com/checkout/openai_llc/cs_live_123")
         self.assertEqual(cs_id, "cs_live_123")
@@ -63,6 +84,12 @@ class GoPayFlowTests(unittest.TestCase):
         self.assertEqual(probe["amount_source"], "total_summary.due")
         self.assertFalse(probe["amount_is_zero"])
 
+    def test_elements_options_client_payload_omits_rejected_stripe_locale(self):
+        payload = gopay_flow._elements_options_client_payload()
+
+        self.assertNotIn("elements_options_client[stripe_js_locale]", payload)
+        self.assertEqual(payload["elements_options_client[saved_payment_method][enable_save]"], "never")
+
     def test_resolve_checkout_creates_hosted_checkout_when_no_session_id_is_present(self):
         session = gopay_flow.GoPaySession(
             session_id="gp_test",
@@ -76,6 +103,7 @@ class GoPayFlowTests(unittest.TestCase):
         runner.s = session
         runner.account = DummyAccount()
         runner.proxy = ""
+        runner.checkout_proxy = ""
         runner.profile = {"impersonate": "chrome146", "ua": "ua"}
         runner.ext = mock.Mock()
 
@@ -473,7 +501,14 @@ class GoPayFlowTests(unittest.TestCase):
         first_headers = runner.ext.post.call_args_list[0].kwargs["headers"]
         fallback_headers = runner.ext.post.call_args_list[1].kwargs["headers"]
         self.assertIn("Authorization", first_headers)
+        self.assertIn("X-Snap-Signature", first_headers)
+        self.assertIn("X-Timestamp", first_headers)
         self.assertNotIn("Authorization", fallback_headers)
+        self.assertIn("X-Snap-Signature", fallback_headers)
+        self.assertEqual(
+            runner.ext.post.call_args_list[0].kwargs["data"],
+            '{"type":"gopay","country_code":"62","phone_number":"81234567890"}',
+        )
         sleep.assert_not_called()
 
     def test_resend_otp_posts_reference_and_updates_snapshot(self):

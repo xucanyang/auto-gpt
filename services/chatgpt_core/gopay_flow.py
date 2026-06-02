@@ -7,6 +7,8 @@ machine so the UI only ever asks for one input at a time.
 from __future__ import annotations
 
 import base64
+import hashlib
+import hmac
 import json
 import random
 import re
@@ -42,7 +44,14 @@ KNOWN_PUBLISHABLE_KEYS = (
     "pk_live_51HOrSwC6h1nxGoI3lTAgRjYVrz4dU3fVOabyCcKR3pbEJguCVAlqCxdxCUvoRh1XWwRacViovU3kLKvpkjh7IqkW00iXQsjo3n",
 )
 DEFAULT_MIDTRANS_CLIENT_ID = "Mid-client-3TX8nUa-f_RgNrky"
+MIDTRANS_SNAP_SIGNING_KEY = "1feab063-bf3f-4025-90bf-3be6fa4f4cc2"
+MIDTRANS_SNAP_SOURCE_HEADERS = {
+    "X-Source": "snap",
+    "X-Source-App-Type": "redirection",
+    "X-Source-Version": "2.3.0",
+}
 DEFAULT_TIMEOUT = 30
+CHECKOUT_PROBE_TIMEOUT = 8
 LINK_RETRY_LIMIT = 2
 LINK_RETRY_SLEEP_SECONDS = 12.0
 DEFAULT_OTP_AUTO_RESEND_DELAY_SECONDS = 120
@@ -577,6 +586,43 @@ def _extract_midtrans_link_reference(data: dict[str, Any]) -> str:
     return m.group(1)
 
 
+def _midtrans_snap_body_text(body: Optional[dict[str, Any]] = None) -> str:
+    if body is None:
+        return ""
+    return json.dumps(body, separators=(",", ":"), ensure_ascii=False)
+
+
+def _midtrans_snap_shuffle_hex(value: str) -> str:
+    chars = list(value)
+    for idx in range(0, len(chars) - 3, 4):
+        chars[idx], chars[idx + 1], chars[idx + 2], chars[idx + 3] = (
+            chars[idx + 2],
+            chars[idx + 3],
+            chars[idx],
+            chars[idx + 1],
+        )
+    return "".join(chars)
+
+
+def _midtrans_snap_signature(path: str, body_text: str, timestamp: str) -> str:
+    base = f"{path}:{timestamp}:{body_text or ''}"
+    digest = hmac.new(
+        MIDTRANS_SNAP_SIGNING_KEY.encode("utf-8"),
+        base.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return _midtrans_snap_shuffle_hex(digest)
+
+
+def _midtrans_snap_headers(path: str, body_text: str = "") -> dict[str, str]:
+    timestamp = str(int(time.time()))
+    return {
+        **MIDTRANS_SNAP_SOURCE_HEADERS,
+        "X-Timestamp": timestamp,
+        "X-Snap-Signature": _midtrans_snap_signature(path, body_text, timestamp),
+    }
+
+
 def _extract_processor_entity(raw: str, default: str = "openai_llc") -> str:
     raw = str(raw or "").strip()
     match = re.search(r"chatgpt\.com/checkout/([A-Za-z0-9_]+)/", raw)
@@ -656,7 +702,6 @@ def _stripe_headers(profile: Optional[dict[str, Any]] = None) -> dict[str, str]:
 
 def _elements_options_client_payload() -> dict[str, str]:
     return {
-        "elements_options_client[stripe_js_locale]": "auto",
         "elements_options_client[saved_payment_method][enable_save]": "never",
         "elements_options_client[saved_payment_method][enable_redisplay]": "never",
     }
@@ -837,6 +882,7 @@ class GoPayRunner:
         stripe_js_id = str(uuid.uuid4())
         elements_session_id = _gen_elements_session_id()
         elements_options = _elements_options_client_payload()
+        request_timeout = int(self.profile.get("checkout_probe_timeout") or DEFAULT_TIMEOUT)
         for version in (STRIPE_VERSION_BASE, STRIPE_VERSION_FULL):
             body = {
                 "browser_locale": str(self.profile.get("stripe_locale") or self.profile.get("locale") or "id"),
@@ -853,7 +899,7 @@ class GoPayRunner:
             if version == STRIPE_VERSION_FULL:
                 body["elements_session_client[client_betas][0]"] = "custom_checkout_server_updates_1"
                 body["elements_session_client[client_betas][1]"] = "custom_checkout_manual_approval_1"
-            r = self.ext.post(f"{STRIPE_API}/v1/payment_pages/{cs_id}/init", data=body, headers=_stripe_headers(self.profile), timeout=DEFAULT_TIMEOUT)
+            r = self.ext.post(f"{STRIPE_API}/v1/payment_pages/{cs_id}/init", data=body, headers=_stripe_headers(self.profile), timeout=request_timeout)
             if r.status_code == 200:
                 init_data = r.json() or {}
                 ctx = {
@@ -1214,9 +1260,13 @@ class GoPayRunner:
         return {"Authorization": f"Basic {token}"}
 
     def _midtrans_load_transaction(self, snap_token: str) -> None:
+        path = f"/snap/v1/transactions/{snap_token}"
         r = self.ext.get(
-            f"https://app.midtrans.com/snap/v1/transactions/{snap_token}",
-            headers={"x-source": "snap", "x-source-app-type": "redirection", "x-source-version": "2.3.0"},
+            f"https://app.midtrans.com{path}",
+            headers={
+                **_midtrans_snap_headers(path),
+                "Referer": f"https://app.midtrans.com/snap/v4/redirection/{snap_token}",
+            },
             timeout=DEFAULT_TIMEOUT,
         )
         _raise_for_gopay_status(r, "midtrans load transaction")
@@ -1224,17 +1274,20 @@ class GoPayRunner:
         _safe_log(self.s, f"Midtrans payments loaded: {enabled}")
 
     def _midtrans_init_linking(self, snap_token: str, phone_country_code: str, phone_number: str) -> str:
-        url = f"https://app.midtrans.com/snap/v3/accounts/{snap_token}/linking"
+        path = f"/snap/v3/accounts/{snap_token}/linking"
+        url = f"https://app.midtrans.com{path}"
         body = {"type": "gopay", "country_code": phone_country_code, "phone_number": phone_number}
+        body_text = _midtrans_snap_body_text(body)
         headers = {
             **self._midtrans_auth(),
+            **_midtrans_snap_headers(path, body_text),
             "Content-Type": "application/json",
             "Origin": "https://app.midtrans.com",
             "Referer": f"https://app.midtrans.com/snap/v4/redirection/{snap_token}",
         }
         last_err = ""
         for attempt in range(1, LINK_RETRY_LIMIT + 2):
-            r = self.ext.post(url, json=body, headers=headers, timeout=DEFAULT_TIMEOUT)
+            r = self.ext.post(url, data=body_text, headers=headers, timeout=DEFAULT_TIMEOUT)
             if r.status_code == 201:
                 self.s.reference_id = _extract_midtrans_link_reference(r.json() or {})
                 _safe_log(self.s, f"Midtrans linking ready: {self.s.reference_id}")
@@ -1248,7 +1301,7 @@ class GoPayRunner:
                 if r.status_code == 429:
                     fallback_headers = dict(headers)
                     fallback_headers.pop("Authorization", None)
-                    fallback = self.ext.post(url, json=body, headers=fallback_headers, timeout=DEFAULT_TIMEOUT)
+                    fallback = self.ext.post(url, data=body_text, headers=fallback_headers, timeout=DEFAULT_TIMEOUT)
                     if fallback.status_code == 201:
                         self.s.reference_id = _extract_midtrans_link_reference(fallback.json() or {})
                         _safe_log(self.s, f"Midtrans linking no-auth fallback ready: {self.s.reference_id}")
@@ -1453,14 +1506,18 @@ class GoPayRunner:
             self.submit_payment_pin_until_done(pin)
 
     def _midtrans_create_charge(self) -> str:
-        url = f"https://app.midtrans.com/snap/v2/transactions/{self.s.snap_token}/charge"
+        path = f"/snap/v2/transactions/{self.s.snap_token}/charge"
+        url = f"https://app.midtrans.com{path}"
+        body = {"payment_type": "gopay", "tokenization": "true", "promo_details": None}
+        body_text = _midtrans_snap_body_text(body)
         headers = {
             **self._midtrans_auth(),
+            **_midtrans_snap_headers(path, body_text),
             "Content-Type": "application/json",
             "Origin": "https://app.midtrans.com",
             "Referer": f"https://app.midtrans.com/snap/v4/redirection/{self.s.snap_token}",
         }
-        r = self.ext.post(url, json={"payment_type": "gopay", "tokenization": "true", "promo_details": None}, headers=headers, timeout=DEFAULT_TIMEOUT)
+        r = self.ext.post(url, data=body_text, headers=headers, timeout=DEFAULT_TIMEOUT)
         _safe_log(self.s, f"Midtrans /charge HTTP 状态码: {r.status_code}")
         _safe_log(self.s, f"Midtrans /charge 返回体: {r.text[:1200]}")
         _raise_for_gopay_status(r, "midtrans create charge")
@@ -1617,8 +1674,10 @@ def probe_chatgpt_checkout_amount(
     country: str = DEFAULT_CHECKOUT_COUNTRY,
     currency: str = DEFAULT_CHECKOUT_CURRENCY,
     proxy: str = "",
-    browser_profile: Optional[dict[str, Any]] = None,
+        browser_profile: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
+    profile = dict(browser_profile or {})
+    profile.setdefault("checkout_probe_timeout", CHECKOUT_PROBE_TIMEOUT)
     session = GoPaySession(
         session_id=f"probe_{uuid.uuid4().hex}",
         account_id=0,
@@ -1629,7 +1688,7 @@ def probe_chatgpt_checkout_amount(
         proxy=str(proxy or ""),
         proxy_source="probe",
         checkout_url=str(checkout_url or "").strip(),
-        browser_profile=dict(browser_profile or {}),
+        browser_profile=profile,
     )
     runner = GoPayRunner(session, account)
     cs_id = runner._resolve_checkout()

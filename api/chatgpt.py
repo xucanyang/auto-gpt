@@ -21,6 +21,11 @@ from services.chatgpt_account_state import (
     mark_payment_failed,
     mark_payment_pending,
 )
+from services.chatgpt_core.gopay_phone import (
+    GOPAY_RECOGNIZED_COUNTRY_CODES_KEY,
+    normalize_gopay_recognized_country_codes,
+    split_gopay_phone_input,
+)
 import json, sys
 
 
@@ -1263,6 +1268,20 @@ def _save_global_gopay_defaults(defaults: dict) -> None:
     config_store.set("chatgpt_gopay_defaults", json.dumps(defaults or {}, ensure_ascii=False))
 
 
+def _load_gopay_recognized_country_codes() -> list[str]:
+    try:
+        from core.config_store import config_store
+
+        raw = config_store.get(GOPAY_RECOGNIZED_COUNTRY_CODES_KEY, "")
+        try:
+            parsed = json.loads(str(raw or ""))
+        except Exception:
+            parsed = raw
+        return normalize_gopay_recognized_country_codes(parsed)
+    except Exception:
+        return normalize_gopay_recognized_country_codes([])
+
+
 def _merge_gopay_defaults(*defaults: dict) -> dict:
     merged: dict = {}
     for item in defaults:
@@ -2420,8 +2439,11 @@ def _active_gopay_batch_task() -> dict | None:
 
 def _build_gopay_batch_item(req_item: GoPayBatchItemReq, acc: AccountModel) -> dict:
     phone = req_item.phone
-    phone_country_code = re.sub(r"\D", "", str(phone.phone_country_code or ""))
-    phone_number = re.sub(r"\D", "", str(phone.phone_number or ""))
+    normalized_phone = split_gopay_phone_input(
+        phone.phone_country_code,
+        phone.phone_number,
+        _load_gopay_recognized_country_codes(),
+    )
     return {
         "account_id": int(acc.id),
         "account": {
@@ -2433,8 +2455,8 @@ def _build_gopay_batch_item(req_item: GoPayBatchItemReq, acc: AccountModel) -> d
         "phone": {
             "id": str(phone.id or "").strip(),
             "label": str(phone.label or "").strip(),
-            "phone_country_code": phone_country_code,
-            "phone_number": phone_number,
+            "phone_country_code": normalized_phone["phone_country_code"],
+            "phone_number": normalized_phone["phone_number"],
         },
         "batch_index": int(req_item.batch_index or 0),
         "batchIndex": int(req_item.batch_index or 0),
@@ -2978,6 +3000,11 @@ def start_gopay_payment(account_id: int, req: GoPayStartReq,
         saved_defaults = _merge_gopay_defaults(account_defaults, global_defaults)
         requested_pin = _normalize_gopay_pin(req.pin)
         default_pin = requested_pin or _normalize_gopay_pin(saved_defaults.get("pin"))
+        normalized_phone = split_gopay_phone_input(
+            req.phone_country_code,
+            req.phone_number,
+            _load_gopay_recognized_country_codes(),
+        )
         billing, billing_source, billing_target_country, billing_country_strategy, billing_warning = _resolve_gopay_billing(
             req,
             saved_defaults,
@@ -2992,8 +3019,8 @@ def start_gopay_payment(account_id: int, req: GoPayStartReq,
             country=country,
             currency=currency,
             proxy=proxy,
-            phone_country_code=req.phone_country_code,
-            phone_number=req.phone_number,
+            phone_country_code=normalized_phone["phone_country_code"],
+            phone_number=normalized_phone["phone_number"],
             checkout_url=str(req.checkout_url or ""),
             default_pin=default_pin,
             billing=billing,
@@ -3017,8 +3044,8 @@ def start_gopay_payment(account_id: int, req: GoPayStartReq,
         _start_gopay_task_monitor(account_id, snapshot.get("session_id") or "")
         if req.save_defaults:
             defaults_payload = {
-                "phone_country_code": str(req.phone_country_code or "").strip().lstrip("+"),
-                "phone_number": str(req.phone_number or "").strip(),
+                "phone_country_code": normalized_phone["phone_country_code"],
+                "phone_number": normalized_phone["phone_number"],
                 "country": country,
                 "currency": currency,
                 "pin": default_pin,

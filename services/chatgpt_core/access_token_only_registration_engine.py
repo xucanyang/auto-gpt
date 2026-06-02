@@ -100,6 +100,26 @@ class AccessTokenOnlyRegistrationEngine:
             return text == "0"
 
     @staticmethod
+    def _is_checkout_already_paid_error(status_code: Any, body_text: str) -> bool:
+        try:
+            code = int(status_code or 0)
+        except (TypeError, ValueError):
+            code = 0
+        if code and code not in {400, 409}:
+            return False
+        lowered = str(body_text or "").strip().lower()
+        return any(
+            marker in lowered
+            for marker in (
+                "you have paid",
+                "already paid",
+                "user is already paid",
+                "has been paid",
+                "no payment required",
+            )
+        )
+
+    @staticmethod
     def _parse_bool(value: Any) -> bool:
         if isinstance(value, bool):
             return value
@@ -202,8 +222,8 @@ class AccessTokenOnlyRegistrationEngine:
             )
         except CheckoutRequestError as exc:
             body_text = str(getattr(exc, "body", "") or str(exc)).strip()
-            if int(getattr(exc, "status_code", 0) or 0) == 400 and "you have paid" in body_text.lower():
-                reason = f"Plus checkout 已付费响应: {body_text[:300] or exc}"
+            if self._is_checkout_already_paid_error(getattr(exc, "status_code", 0), body_text):
+                reason = f"Plus checkout 已付费/不可用响应: {body_text[:300] or exc}"
                 self._log(reason, "warning")
                 return {
                     "chatgpt_checkout_plan": "plus",
@@ -219,6 +239,8 @@ class AccessTokenOnlyRegistrationEngine:
                     "chatgpt_skip_save_account": True,
                     "chatgpt_skip_save_reason": reason,
                     "chatgpt_payment_already_paid": True,
+                    "chatgpt_invalid_registration_failure": True,
+                    "chatgpt_invalid_registration_reason": reason,
                 }
             raise
         self._log(f"Plus checkout created: {checkout_url}")
@@ -243,7 +265,7 @@ class AccessTokenOnlyRegistrationEngine:
         reason = ""
         if skip_save:
             reason = f"Plus checkout amount != 0: amount={amount_text or 'unknown'} currency={currency_text or currency}"
-            self._log(f"{reason}，注册成功但不保存账号", "warning")
+            self._log(f"{reason}，注册失败且不保存账号", "warning")
         return {
             "chatgpt_checkout_plan": "plus",
             "chatgpt_checkout_url": checkout_url,
@@ -259,6 +281,9 @@ class AccessTokenOnlyRegistrationEngine:
             "chatgpt_checkout_probe": probe,
             "chatgpt_skip_save_account": skip_save,
             "chatgpt_skip_save_reason": reason,
+            "chatgpt_invalid_registration_failure": skip_save,
+            "chatgpt_invalid_registration_reason": reason,
+            "chatgpt_nonzero_checkout_amount_failure": skip_save,
         }
 
     @staticmethod
@@ -390,6 +415,28 @@ class AccessTokenOnlyRegistrationEngine:
         if not isinstance(metadata, dict):
             return False
         return bool(metadata.get("chatgpt_payment_already_paid") or metadata.get("chatgpt_account_unavailable"))
+
+    @staticmethod
+    def _metadata_indicates_invalid_registration_failure(metadata: dict | None) -> bool:
+        if not isinstance(metadata, dict):
+            return False
+        return bool(
+            metadata.get("chatgpt_invalid_registration_failure")
+            or metadata.get("chatgpt_payment_already_paid")
+            or metadata.get("chatgpt_account_unavailable")
+        )
+
+    @staticmethod
+    def _metadata_invalid_registration_reason(metadata: dict | None) -> str:
+        if not isinstance(metadata, dict):
+            return "账号无效"
+        return str(
+            metadata.get("chatgpt_invalid_registration_reason")
+            or metadata.get("chatgpt_skip_save_reason")
+            or metadata.get("chatgpt_unavailable_reason")
+            or metadata.get("chatgpt_checkout_error_body")
+            or "账号无效"
+        ).strip()
 
     def _probe_homepage_before_email_creation(self) -> tuple[bool, str]:
         client = ChatGPTClient(
@@ -529,7 +576,6 @@ class AccessTokenOnlyRegistrationEngine:
 
                     if session_ok:
                         self._log("Token 提取完成！")
-                        result.success = True
                         result.access_token = session_result.get("access_token", "")
                         result.session_token = session_result.get("session_token", "")
                         result.account_id = (
@@ -550,6 +596,16 @@ class AccessTokenOnlyRegistrationEngine:
 
                         if result.workspace_id:
                             self._log(f"Session Workspace ID: {result.workspace_id}")
+
+                        if self._metadata_indicates_invalid_registration_failure(result.metadata):
+                            failure_reason = self._metadata_invalid_registration_reason(result.metadata)
+                            result.success = False
+                            result.error_message = failure_reason
+                            self._log(f"无 RT 注册判定为无效失败: {failure_reason}", "warning")
+                            self._finalize_email_service_failure(result, fallback_error=failure_reason)
+                            return result
+
+                        result.success = True
 
                         self._log("=" * 60)
                         self._log("注册流程成功结束!")
@@ -586,6 +642,7 @@ class AccessTokenOnlyRegistrationEngine:
             self._log(f"无 RT 注册全流程执行异常: {e}", "error")
             import traceback
             traceback.print_exc()
+            result.success = False
             result.error_message = str(e)
             self._finalize_email_service_failure(result, fallback_error=result.error_message)
             return result

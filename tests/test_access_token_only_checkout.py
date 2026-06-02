@@ -24,7 +24,7 @@ class AccessTokenOnlyCheckoutTests(unittest.TestCase):
                 "cookies": "oai-did=device",
             }
 
-    def test_already_paid_metadata_skips_mailbox_writeback(self):
+    def test_already_paid_metadata_fails_registration_without_saving(self):
         email_service = mock.Mock()
         email_service.create_email.return_value = {"email": "buyer@example.com"}
         engine = AccessTokenOnlyRegistrationEngine(
@@ -49,15 +49,16 @@ class AccessTokenOnlyCheckoutTests(unittest.TestCase):
             ),
             mock.patch(
                 "services.chatgpt_core.payment.generate_plus_link",
-                side_effect=CheckoutRequestError(400, '{"detail":"you have paid"}'),
+                side_effect=CheckoutRequestError(400, '{"detail":"User is already paid"}'),
             ),
         ):
             result = engine.run()
 
-        self.assertTrue(result.success)
+        self.assertFalse(result.success)
+        self.assertIn("already paid", result.error_message.lower())
         self.assertTrue(result.metadata["chatgpt_payment_already_paid"])
         email_service.finalize_success.assert_not_called()
-        email_service.finalize_failure.assert_not_called()
+        email_service.finalize_failure.assert_called_once()
 
     def test_checkout_currency_follows_country_when_currency_is_blank(self):
         engine = AccessTokenOnlyRegistrationEngine(
@@ -139,7 +140,7 @@ class AccessTokenOnlyCheckoutTests(unittest.TestCase):
         self.assertEqual(probe_amount.call_args.kwargs["country"], "US")
         self.assertEqual(probe_amount.call_args.kwargs["currency"], "USD")
 
-    def test_checkout_already_paid_response_is_classified_as_skip_save(self):
+    def test_checkout_already_paid_response_is_classified_as_invalid_failure(self):
         engine = AccessTokenOnlyRegistrationEngine(
             email_service=mock.Mock(),
             proxy_url="http://proxy.local:8080",
@@ -156,7 +157,7 @@ class AccessTokenOnlyCheckoutTests(unittest.TestCase):
             ),
             mock.patch(
                 "services.chatgpt_core.payment.generate_plus_link",
-                side_effect=CheckoutRequestError(400, '{"detail":"you have paid"}'),
+                side_effect=CheckoutRequestError(400, '{"detail":"User is already paid"}'),
             ),
         ):
             metadata = engine._probe_plus_checkout_billing(
@@ -171,8 +172,49 @@ class AccessTokenOnlyCheckoutTests(unittest.TestCase):
         self.assertTrue(metadata["chatgpt_skip_save_account"])
         self.assertTrue(metadata["chatgpt_account_unavailable"])
         self.assertTrue(metadata["chatgpt_payment_already_paid"])
+        self.assertTrue(metadata["chatgpt_invalid_registration_failure"])
         self.assertEqual(metadata["chatgpt_checkout_error_code"], "already_paid")
-        self.assertIn("you have paid", metadata["chatgpt_checkout_error_body"])
+        self.assertIn("User is already paid", metadata["chatgpt_checkout_error_body"])
+
+    def test_nonzero_checkout_amount_fails_registration_without_mailbox_success(self):
+        email_service = mock.Mock()
+        email_service.create_email.return_value = {"email": "buyer@example.com"}
+        engine = AccessTokenOnlyRegistrationEngine(
+            email_service=email_service,
+            proxy_url="http://proxy.local:8080",
+            extra_config={
+                "chatgpt_access_token_only_checkout_country": "US",
+                "chatgpt_access_token_only_checkout_currency": "USD",
+            },
+        )
+
+        with (
+            mock.patch.object(engine, "_probe_homepage_before_email_creation", return_value=(True, "")),
+            mock.patch.object(engine, "_report_homepage_probe"),
+            mock.patch(
+                "services.chatgpt_core.access_token_only_registration_engine.ChatGPTClient",
+                self._FakeChatGPTClient,
+            ),
+            mock.patch(
+                "core.proxy_utils.iter_enabled_runtime_proxies",
+                return_value=["http://proxy.local:8080"],
+            ),
+            mock.patch(
+                "services.chatgpt_core.payment.generate_plus_link",
+                return_value="https://chatgpt.com/checkout/openai_llc/cs_live_123",
+            ),
+            mock.patch(
+                "services.chatgpt_core.gopay_flow.probe_chatgpt_checkout_amount",
+                return_value={"amount_text": "20.00", "amount": 2000, "currency": "usd", "amount_is_zero": False},
+            ),
+        ):
+            result = engine.run()
+
+        self.assertFalse(result.success)
+        self.assertIn("amount != 0", result.error_message)
+        self.assertTrue(result.metadata["chatgpt_nonzero_checkout_amount_failure"])
+        email_service.finalize_success.assert_not_called()
+        email_service.finalize_failure.assert_called_once()
 
 
 if __name__ == "__main__":

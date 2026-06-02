@@ -857,6 +857,7 @@ def wait_for_otp(
     otp_regex: str = r"\b(\d{4,8})\b",
     http_max_attempts: int = 3,
     trace: Callable[[str], None] | None = None,
+    stop_checker: Callable[[], None] | None = None,
     raise_on_timeout: bool = False,
 ) -> Optional[str]:
     """轮询指定手机号短信，提取验证码并返回。
@@ -877,6 +878,7 @@ def wait_for_otp(
         otp_regex: 用于从短信中提取验证码的正则，默认匹配 4–8 位数字。
         http_max_attempts: 每次抓取短信时的 HTTP 重试次数。
         trace: 可选日志回调；若提供，会输出每轮轮询的诊断摘要。
+        stop_checker: 可选任务停止检查回调；若抛异常则立即中断等待。
         raise_on_timeout: 若为 True，超时后抛出更具体的异常，而不是返回 None。
 
     Returns:
@@ -887,11 +889,16 @@ def wait_for_otp(
     pattern = re.compile(otp_regex)
     emit = trace or (lambda _msg: None)
 
+    def _check_stop() -> None:
+        if callable(stop_checker):
+            stop_checker()
+
     seen_messages: set[str] = set()
     unmatched_new_message_count = 0
     latest_unmatched_message: SmsMessage | None = None
 
     def _fetch_messages(phase: str, *, poll_number: int | None = None) -> List[SmsMessage]:
+        _check_stop()
         try:
             return _fetch_sms_messages(
                 client, entry.detail_url, http_max_attempts=http_max_attempts
@@ -906,6 +913,7 @@ def wait_for_otp(
             ) from exc
 
     # 初始抓取，避免把历史短信误当成“新短信”
+    _check_stop()
     initial_messages = _fetch_messages("initial")
     latest_message = initial_messages[0] if initial_messages else None
     latest_snapshot = (
@@ -936,6 +944,7 @@ def wait_for_otp(
     poll_count = 0
 
     while True:
+        _check_stop()
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             timeout_state = _classify_timeout_state(
@@ -968,9 +977,16 @@ def wait_for_otp(
 
         sleep_s = min(poll_interval, max(remaining, 0))
         if sleep_s > 0:
-            time.sleep(sleep_s)
+            sleep_deadline = time.monotonic() + sleep_s
+            while True:
+                _check_stop()
+                sleep_remaining = sleep_deadline - time.monotonic()
+                if sleep_remaining <= 0:
+                    break
+                time.sleep(min(1.0, sleep_remaining))
 
         poll_count += 1
+        _check_stop()
         messages = _fetch_messages("poll", poll_number=poll_count)
         latest_message = messages[0] if messages else None
         current_snapshot = (

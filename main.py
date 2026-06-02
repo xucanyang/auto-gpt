@@ -20,8 +20,13 @@ from api.outlook import router as outlook_router
 from api.contribution import router as contribution_router
 from api.team_lite import router as team_lite_router
 from api.icloud_hme import router as icloud_hme_router
+from api.tempmail_archive import router as tempmail_archive_router
 from api.pipeline import router as pipeline_router
-from api.external_subscription import router as external_subscription_router
+from api.external_subscription import (
+    router as external_subscription_router,
+    start_subscription_verification_scheduler,
+    stop_subscription_verification_scheduler,
+)
 from services.chatgpt_core import ChatGPTPlatform
 from services.pipeline import pipeline_engine
 
@@ -81,6 +86,9 @@ async def lifespan(app: FastAPI):
     scheduler.start()
     from services.icloud_hme_auto_pool import start as start_icloud_hme_auto_pool
     start_icloud_hme_auto_pool()
+    from services.tempmail_archive_cleanup import start as start_tempmail_archive_cleanup
+    start_tempmail_archive_cleanup()
+    start_subscription_verification_scheduler()
     from services.solver_manager import start_async
     start_async()
     try:
@@ -92,6 +100,9 @@ async def lifespan(app: FastAPI):
     _scheduler.stop()
     from services.icloud_hme_auto_pool import stop as stop_icloud_hme_auto_pool
     stop_icloud_hme_auto_pool()
+    from services.tempmail_archive_cleanup import stop as stop_tempmail_archive_cleanup
+    stop_tempmail_archive_cleanup()
+    stop_subscription_verification_scheduler()
     try:
         pipeline_engine.stop()
     except Exception:
@@ -150,6 +161,7 @@ app.include_router(outlook_router, prefix="/api")
 app.include_router(contribution_router, prefix="/api")
 app.include_router(team_lite_router, prefix="/api")
 app.include_router(icloud_hme_router, prefix="/api")
+app.include_router(tempmail_archive_router, prefix="/api")
 app.include_router(pipeline_router, prefix="/api")
 app.include_router(external_subscription_router, prefix="/api")
 
@@ -174,7 +186,14 @@ if os.path.isdir(_static_dir):
 
     @app.get("/{full_path:path}", include_in_schema=False)
     def spa_fallback(full_path: str):
-        return FileResponse(os.path.join(_static_dir, "index.html"))
+        return FileResponse(
+            os.path.join(_static_dir, "index.html"),
+            headers={
+                "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+                "Pragma": "no-cache",
+                "Expires": "0",
+            },
+        )
 
 
 if __name__ == "__main__":

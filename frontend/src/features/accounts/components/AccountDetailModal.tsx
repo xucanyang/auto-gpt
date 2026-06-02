@@ -106,6 +106,7 @@ export function LocalProbeSummary({
       <SummaryField label="探测时间" value={checkedAt ? formatSyncTime(checkedAt) : ''} />
       <SummaryField label="认证信息" value={auth.message} code />
       <SummaryField label="工作区套餐" value={subscription.workspace_plan_type} />
+      <SummaryField label="订阅到期" value={subscription.subscription_active_until ? formatSyncTime(subscription.subscription_active_until) : ''} />
       <SummaryField label="Codex 信息" value={codex.message} code />
     </div>
   )

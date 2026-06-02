@@ -30,6 +30,12 @@ import {
   SaveOutlined,
   SafetyOutlined,
 } from '@ant-design/icons'
+import {
+  DEFAULT_GOPAY_PHONE_COUNTRY_CODE,
+  normalizeGopayPhonePart,
+  normalizeGopayRecognizedCountryCodes,
+  splitGopayPhoneInput,
+} from '@/lib/gopayPhone'
 import { apiFetch } from '@/lib/utils'
 
 const { Paragraph, Text, Title } = Typography
@@ -159,10 +165,12 @@ type AdapterState = {
   web_params_form: string
   web_params_json: string
   otp_auto_resend_delay_seconds: number
+  default_phone_country_code?: string
+  recognized_country_codes?: string[]
 }
 
 const emptyPoolItem: PhonePoolItem = {
-  phone_country_code: '86',
+  phone_country_code: DEFAULT_GOPAY_PHONE_COUNTRY_CODE,
   phone_number: '',
   uid: '',
   status: 'ready',
@@ -182,10 +190,15 @@ const emptyPoolItem: PhonePoolItem = {
   updated_at: '',
 }
 
-function cleanPoolItem(value: PhonePoolItem): PhonePoolItem {
+function cleanPoolItem(value: PhonePoolItem, recognizedCountryCodes: unknown = [DEFAULT_GOPAY_PHONE_COUNTRY_CODE]): PhonePoolItem {
+  const normalizedPhone = splitGopayPhoneInput(
+    value.phone_country_code || DEFAULT_GOPAY_PHONE_COUNTRY_CODE,
+    value.phone_number,
+    recognizedCountryCodes,
+  )
   return {
-    phone_country_code: String(value.phone_country_code || '86').replace(/\D/g, '') || '86',
-    phone_number: String(value.phone_number || '').replace(/\D/g, ''),
+    phone_country_code: normalizedPhone.phone_country_code,
+    phone_number: normalizedPhone.phone_number,
     uid: String(value.uid || '').trim(),
     status: String(value.status || 'ready').trim() || 'ready',
     source: String(value.source || 'manual').trim() || 'manual',
@@ -193,10 +206,10 @@ function cleanPoolItem(value: PhonePoolItem): PhonePoolItem {
     title: String(value.title || '').trim(),
     label: String(value.label || '').trim(),
     device: String(value.device || '').trim(),
-    pin: String(value.pin || '').replace(/\D/g, ''),
+    pin: normalizeGopayPhonePart(value.pin),
     note: String(value.note || '').trim(),
     enabled: value.enabled !== false,
-    last_otp: String(value.last_otp || '').replace(/\D/g, ''),
+    last_otp: normalizeGopayPhonePart(value.last_otp),
     last_otp_at: value.last_otp_at || '',
     last_error: String(value.last_error || '').trim(),
     last_seen_at: value.last_seen_at || '',
@@ -238,7 +251,7 @@ function eventTimeMs(event: RecentEvent) {
 
 function phoneText(item: { phone_country_code?: string; phone_number?: string }) {
   const number = item.phone_number || ''
-  return number ? `+${item.phone_country_code || '86'} ${number}` : '-'
+  return number ? `+${item.phone_country_code || DEFAULT_GOPAY_PHONE_COUNTRY_CODE} ${number}` : '-'
 }
 
 export default function GoPayOtpAdapter() {
@@ -246,11 +259,13 @@ export default function GoPayOtpAdapter() {
   const [state, setState] = useState<AdapterState | null>(null)
   const [loading, setLoading] = useState(false)
   const [saving, setSaving] = useState(false)
+  const [countryCodesSaving, setCountryCodesSaving] = useState(false)
   const [activeEvent, setActiveEvent] = useState<RecentEvent | null>(null)
   const [poolForm] = Form.useForm<PhonePoolItem>()
   const [startForm] = Form.useForm()
   const [secretForm] = Form.useForm<{ smsforwarder_secret: string }>()
   const [delayForm] = Form.useForm<{ otp_auto_resend_delay_seconds: number }>()
+  const [countryCodesForm] = Form.useForm<{ recognized_country_codes: string }>()
   const [parseForm] = Form.useForm<{ raw: string }>()
   const [parseResult, setParseResult] = useState<Record<string, unknown> | null>(null)
 
@@ -266,6 +281,9 @@ export default function GoPayOtpAdapter() {
       setState(data)
       delayForm.setFieldsValue({
         otp_auto_resend_delay_seconds: Number(data.otp_auto_resend_delay_seconds ?? 120),
+      })
+      countryCodesForm.setFieldsValue({
+        recognized_country_codes: normalizeGopayRecognizedCountryCodes(data.recognized_country_codes).join(','),
       })
     } finally {
       setLoading(false)
@@ -292,7 +310,7 @@ export default function GoPayOtpAdapter() {
   }
 
   const addPoolItem = async (values: PhonePoolItem) => {
-    const next = cleanPoolItem(values)
+    const next = cleanPoolItem(values, state?.recognized_country_codes)
     if (!next.phone_number) {
       message.warning('手机号不能为空')
       return
@@ -310,7 +328,7 @@ export default function GoPayOtpAdapter() {
   const updatePoolItem = async (record: PhonePoolItem, patch: Partial<PhonePoolItem>) => {
     const key = `${record.phone_country_code}:${record.phone_number}`
     const items = (state?.phone_pool || []).map((item) => (
-      `${item.phone_country_code}:${item.phone_number}` === key ? cleanPoolItem({ ...item, ...patch }) : item
+      `${item.phone_country_code}:${item.phone_number}` === key ? cleanPoolItem({ ...item, ...patch }, state?.recognized_country_codes) : item
     ))
     await savePhonePool(items)
   }
@@ -351,6 +369,36 @@ export default function GoPayOtpAdapter() {
       otp_auto_resend_delay_seconds: Number(data.otp_auto_resend_delay_seconds ?? 120),
     })
     message.success('自动重发延迟已更新')
+  }
+
+  const saveRecognizedCountryCodes = async (values: { recognized_country_codes: string }) => {
+    const codes = normalizeGopayRecognizedCountryCodes(values.recognized_country_codes)
+    setCountryCodesSaving(true)
+    try {
+      const data = await apiFetch('/integrations/gopay-otp/settings', {
+        method: 'PUT',
+        body: JSON.stringify({
+          recognized_country_codes: codes,
+        }),
+      })
+      setState(data)
+      countryCodesForm.setFieldsValue({
+        recognized_country_codes: normalizeGopayRecognizedCountryCodes(data.recognized_country_codes).join(','),
+      })
+      message.success('可识别国家码已更新')
+    } finally {
+      setCountryCodesSaving(false)
+    }
+  }
+
+  const applyPoolPhoneInput = (value: unknown) => {
+    const normalizedPhone = splitGopayPhoneInput(
+      poolForm.getFieldValue('phone_country_code'),
+      value,
+      state?.recognized_country_codes,
+    )
+    poolForm.setFieldsValue(normalizedPhone)
+    return normalizedPhone.phone_number
   }
 
   const startByUid = async (values: { account_id: number; uid: string; pin?: string; plan?: string; force?: boolean }) => {
@@ -528,16 +576,43 @@ export default function GoPayOtpAdapter() {
                   style={{ marginBottom: 16 }}
                   message="手机号池是唯一主入口：UID 绑定、手机号状态、GoPay PIN 来源和最近 OTP 都在这里维护。保存后会自动同步底层 UID 绑定配置。"
                 />
+                <Form form={countryCodesForm} layout="vertical" onFinish={saveRecognizedCountryCodes}>
+                  <Row gutter={12} align="bottom">
+                    <Col xs={24} md={8}>
+                      <Form.Item name="recognized_country_codes" label="可识别国家码">
+                        <Input placeholder={DEFAULT_GOPAY_PHONE_COUNTRY_CODE} />
+                      </Form.Item>
+                    </Col>
+                    <Col xs={24} md={8}>
+                      <Form.Item label=" " colon={false}>
+                        <Button htmlType="submit" loading={countryCodesSaving}>保存识别国家码</Button>
+                      </Form.Item>
+                    </Col>
+                    <Col xs={24} md={8}>
+                      <Form.Item label=" " colon={false}>
+                        <Text type="secondary">只拆分这里配置的国家码；未匹配时完整保留手机号，区号使用默认 {state?.default_phone_country_code || DEFAULT_GOPAY_PHONE_COUNTRY_CODE}。</Text>
+                      </Form.Item>
+                    </Col>
+                  </Row>
+                </Form>
                 <Form form={poolForm} layout="vertical" onFinish={addPoolItem}>
                   <Row gutter={12}>
                     <Col xs={12} md={3}>
                       <Form.Item name="phone_country_code" label="区号">
-                        <Input placeholder="86" />
+                        <Input
+                          placeholder={DEFAULT_GOPAY_PHONE_COUNTRY_CODE}
+                          onChange={(event) => poolForm.setFieldValue('phone_country_code', normalizeGopayPhonePart(event.target.value))}
+                        />
                       </Form.Item>
                     </Col>
                     <Col xs={12} md={5}>
-                      <Form.Item name="phone_number" label="手机号" rules={[{ required: true }]}>
-                        <Input placeholder="15335521131" />
+                      <Form.Item
+                        name="phone_number"
+                        label="手机号"
+                        rules={[{ required: true }]}
+                        getValueFromEvent={(event) => applyPoolPhoneInput(event?.target?.value)}
+                      >
+                        <Input placeholder="08123456789 或 628123456789" inputMode="numeric" />
                       </Form.Item>
                     </Col>
                     <Col xs={24} md={4}>

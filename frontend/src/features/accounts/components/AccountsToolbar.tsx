@@ -1,21 +1,21 @@
-import { Button, Dropdown, Input, Popconfirm, Select, Space } from 'antd'
+import type { CSSProperties } from 'react'
+import { Button, Dropdown, Popconfirm } from 'antd'
 import type { MenuProps } from 'antd'
 import {
   DeleteOutlined,
+  DownOutlined,
   DownloadOutlined,
   LinkOutlined,
+  MobileOutlined,
   PlusOutlined,
   ReloadOutlined,
+  SafetyCertificateOutlined,
   SyncOutlined,
   UploadOutlined,
 } from '@ant-design/icons'
 import { ActiveTasksPanel } from './ActiveTasksPanel'
 
 type AccountsToolbarProps = {
-  search: string
-  onSearchChange: (value: string) => void
-  filterStatus: string
-  onFilterStatusChange: (value: string) => void
   total: number
   accountsCount: number
   selectedRowKeys: React.Key[]
@@ -27,7 +27,11 @@ type AccountsToolbarProps = {
   isChatgptPlatform: boolean
   batchGopayLoading: boolean
   batchPaymentLinkLoading: boolean
-  onBatchPaymentLink: () => void
+  batchInvalidRecheckLoading: boolean
+  phoneBindingTestLoading: boolean
+  onBatchPaymentLink: (options?: { forceRefresh?: boolean }) => void
+  onBatchInvalidRecheck: () => void
+  onOpenPhoneBindingTest: () => void
   onOpenBatchGopay: () => void
   onOpenBusinessDeferred: () => void
   deleteInvalidLoading: boolean
@@ -48,24 +52,10 @@ type AccountsToolbarProps = {
   backfillMenuItems: MenuProps['items']
   onBackfillClick: MenuProps['onClick']
   backfillLoading: string
+  isMobile?: boolean
 }
 
-const STATUS_FILTER_OPTIONS = [
-  { value: '', label: '全部状态' },
-  { value: 'registered', label: '已注册' },
-  { value: 'pending_payment', label: '待支付' },
-  { value: 'payment_failed', label: '支付失败' },
-  { value: 'trial', label: '试用中' },
-  { value: 'subscribed', label: '已订阅' },
-  { value: 'expired', label: '已过期' },
-  { value: 'invalid', label: '已失效' },
-]
-
 export function AccountsToolbar({
-  search,
-  onSearchChange,
-  filterStatus,
-  onFilterStatusChange,
   total,
   accountsCount,
   selectedRowKeys,
@@ -77,7 +67,11 @@ export function AccountsToolbar({
   isChatgptPlatform,
   batchGopayLoading,
   batchPaymentLinkLoading,
+  batchInvalidRecheckLoading,
+  phoneBindingTestLoading,
   onBatchPaymentLink,
+  onBatchInvalidRecheck,
+  onOpenPhoneBindingTest,
   onOpenBatchGopay,
   onOpenBusinessDeferred,
   deleteInvalidLoading,
@@ -98,99 +92,185 @@ export function AccountsToolbar({
   backfillMenuItems,
   onBackfillClick,
   backfillLoading,
+  isMobile = false,
 }: AccountsToolbarProps) {
+  const toolbarStyle: CSSProperties = {
+    display: 'flex',
+    justifyContent: 'space-between',
+    gap: isMobile ? 10 : 12,
+    flexWrap: 'wrap',
+    alignItems: 'flex-start',
+  }
+  const controlsStyle: CSSProperties = {
+    display: 'flex',
+    flexWrap: 'wrap',
+    gap: 8,
+    justifyContent: isMobile ? 'stretch' : 'flex-end',
+    width: isMobile ? '100%' : undefined,
+    flex: isMobile ? '1 1 100%' : undefined,
+  }
+  const buttonStyle: CSSProperties = isMobile
+    ? { flex: '1 1 calc(50% - 4px)', minWidth: 132 }
+    : {}
+  const groupStyle: CSSProperties = {
+    display: 'flex',
+    flexWrap: 'wrap',
+    gap: 8,
+    alignItems: 'center',
+    justifyContent: isMobile ? 'stretch' : 'flex-end',
+    width: isMobile ? '100%' : undefined,
+  }
+  const separatedGroupStyle: CSSProperties = {
+    ...groupStyle,
+    paddingLeft: isMobile ? 0 : 10,
+    borderLeft: isMobile ? undefined : '1px solid rgba(127,127,127,0.18)',
+  }
+  const paymentLinkDisabled = selectedRowKeys.length === 0 && total === 0
+  const paymentLinkMenuItems: MenuProps['items'] = [
+    {
+      key: 'normal',
+      label: '生成订阅链接（可复用缓存）',
+      disabled: paymentLinkDisabled,
+    },
+    {
+      key: 'force',
+      label: '强制重新生成订阅链接',
+      disabled: paymentLinkDisabled,
+    },
+  ]
+
   return (
-    <div style={{ marginBottom: 16 }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap', alignItems: 'flex-start' }}>
-        <div>
-          <h1 style={{ fontSize: 24, fontWeight: 'bold', margin: 0 }}>ChatGPT 账号</h1>
-          <p style={{ color: '#7a8ba3', marginTop: 4 }}>
+    <div style={{ marginBottom: isMobile ? 12 : 16, flexShrink: 0 }}>
+      <div style={toolbarStyle}>
+        <div style={{ minWidth: 0 }}>
+          <h1 style={{ fontSize: isMobile ? 20 : 24, fontWeight: 'bold', margin: 0 }}>ChatGPT 账号</h1>
+          <p style={{ color: '#7a8ba3', marginTop: 4, fontSize: isMobile ? 12 : 14 }}>
             当前展示 {accountsCount} 个账号，共 {total} 个
           </p>
         </div>
-        <Space wrap>
-          <Input.Search
-            allowClear
-            placeholder="搜索邮箱"
-            style={{ width: 220 }}
-            value={search}
-            onChange={(event) => onSearchChange(event.target.value)}
-          />
-          <Select
-            value={filterStatus}
-            onChange={onFilterStatusChange}
-            style={{ width: 140 }}
-            options={STATUS_FILTER_OPTIONS}
-          />
+        <div style={controlsStyle}>
+          <div style={groupStyle}>
+            <Button block={isMobile} style={buttonStyle} type="primary" icon={<PlusOutlined />} onClick={onOpenRegister}>注册</Button>
+            <Button block={isMobile} style={buttonStyle} icon={<PlusOutlined />} onClick={onOpenAdd}>新增</Button>
+            <Button block={isMobile} style={buttonStyle} icon={<UploadOutlined />} onClick={onOpenImport}>导入</Button>
+            <Button block={isMobile} style={buttonStyle} icon={<DownloadOutlined />} onClick={onExportCsv} disabled={accountsCount === 0}>导出</Button>
+            <Button block={isMobile} style={buttonStyle} icon={<ReloadOutlined spin={loading} />} onClick={onRefresh}>
+              {isMobile ? '刷新' : null}
+            </Button>
+            <ActiveTasksPanel
+              loading={activeTasksLoading}
+              items={activeTasks}
+              onRefresh={onRefreshActiveTasks}
+              onOpen={onActiveTasksOpen}
+              onOpenTaskSnapshot={onOpenTaskSnapshot}
+              style={isMobile ? { flex: '1 1 100%', width: '100%', minWidth: 0 } : undefined}
+            />
+          </div>
           {isChatgptPlatform && (
-            <Dropdown menu={{ items: statusSyncMenuItems, onClick: onStatusSyncClick }}>
-              <Button loading={statusSyncLoading !== ''} icon={statusSyncLoading !== '' ? <SyncOutlined spin /> : <ReloadOutlined />}>
-                状态同步
-              </Button>
-            </Dropdown>
-          )}
-          {isChatgptPlatform && (
-            <Dropdown menu={{ items: resumeAuthMenuItems, onClick: onResumeAuthClick }}>
+            <div style={separatedGroupStyle}>
+              <Dropdown menu={{ items: statusSyncMenuItems, onClick: onStatusSyncClick }}>
+                <Button
+                  block={isMobile}
+                  style={buttonStyle}
+                  loading={statusSyncLoading !== ''}
+                  icon={statusSyncLoading !== '' ? <SyncOutlined spin /> : <ReloadOutlined />}
+                >
+                  状态同步
+                </Button>
+              </Dropdown>
+              <Dropdown menu={{ items: resumeAuthMenuItems, onClick: onResumeAuthClick }}>
+                <Button
+                  block={isMobile}
+                  style={buttonStyle}
+                  loading={resumeAuthLoading !== ''}
+                  icon={resumeAuthLoading !== '' ? <SyncOutlined spin /> : <ReloadOutlined />}
+                >
+                  批量补抓Auth
+                </Button>
+              </Dropdown>
+              <Dropdown menu={{ items: backfillMenuItems, onClick: onBackfillClick }}>
+                <Button
+                  block={isMobile}
+                  style={buttonStyle}
+                  loading={backfillLoading !== ''}
+                  icon={backfillLoading !== '' ? <SyncOutlined spin /> : <UploadOutlined />}
+                >
+                  远端补传
+                </Button>
+              </Dropdown>
               <Button
-                loading={resumeAuthLoading !== ''}
-                icon={resumeAuthLoading !== '' ? <SyncOutlined spin /> : <ReloadOutlined />}
+                block={isMobile}
+                style={buttonStyle}
+                icon={batchInvalidRecheckLoading ? <SyncOutlined spin /> : <SafetyCertificateOutlined />}
+                loading={batchInvalidRecheckLoading}
+                onClick={onBatchInvalidRecheck}
               >
-                批量补抓Auth
+                批量失效测活
               </Button>
-            </Dropdown>
-          )}
-          {isChatgptPlatform && (
-            <Dropdown menu={{ items: backfillMenuItems, onClick: onBackfillClick }}>
               <Button
-                loading={backfillLoading !== ''}
-                icon={backfillLoading !== '' ? <SyncOutlined spin /> : <UploadOutlined />}
+                block={isMobile}
+                style={buttonStyle}
+                icon={phoneBindingTestLoading ? <SyncOutlined spin /> : <MobileOutlined />}
+                loading={phoneBindingTestLoading}
+                onClick={onOpenPhoneBindingTest}
               >
-                远端补传
+                号码绑定测试
               </Button>
-            </Dropdown>
+              <Dropdown
+                disabled={paymentLinkDisabled || batchPaymentLinkLoading}
+                menu={{
+                  items: paymentLinkMenuItems,
+                  onClick: ({ key }) => onBatchPaymentLink({ forceRefresh: String(key) === 'force' }),
+                }}
+              >
+                <Button
+                  block={isMobile}
+                  style={buttonStyle}
+                  icon={<LinkOutlined />}
+                  loading={batchPaymentLinkLoading}
+                  disabled={paymentLinkDisabled}
+                >
+                  批量订阅链接 <DownOutlined />
+                </Button>
+              </Dropdown>
+              <Button
+                block={isMobile}
+                style={buttonStyle}
+                icon={<LinkOutlined />}
+                loading={batchGopayLoading}
+                onClick={onOpenBatchGopay}
+              >
+                批量 GoPay
+              </Button>
+              <Button block={isMobile} style={buttonStyle} icon={<LinkOutlined />} onClick={onOpenBusinessDeferred}>
+                Business 补激活
+              </Button>
+            </div>
           )}
-          {isChatgptPlatform && (
-            <Button icon={<LinkOutlined />} loading={batchPaymentLinkLoading} onClick={onBatchPaymentLink}>
-              批量订阅链接
-            </Button>
-          )}
-          {isChatgptPlatform && (
-            <Button icon={<LinkOutlined />} loading={batchGopayLoading} onClick={onOpenBatchGopay}>
-              批量 GoPay
-            </Button>
-          )}
-          {isChatgptPlatform && (
-            <Button icon={<LinkOutlined />} onClick={onOpenBusinessDeferred}>
-              Business 补激活
-            </Button>
-          )}
-          <Popconfirm
-            title="确认删除当前平台的全部无效账号？"
-            description="只会删除 status=invalid 的账号，操作不可恢复。"
-            onConfirm={onDeleteInvalid}
-          >
-            <Button danger icon={<DeleteOutlined />} loading={deleteInvalidLoading} disabled={total === 0}>
-              一键删无效
-            </Button>
-          </Popconfirm>
-          {selectedRowKeys.length > 0 && (
-            <Popconfirm title={`确认删除选中的 ${selectedRowKeys.length} 个账号？`} onConfirm={onBatchDelete}>
-              <Button danger icon={<DeleteOutlined />}>删除 {selectedRowKeys.length} 个</Button>
+          <div style={separatedGroupStyle}>
+            <Popconfirm
+              title="确认删除当前平台的全部无效账号？"
+              description="只会删除 status=invalid 的账号，操作不可恢复。"
+              onConfirm={onDeleteInvalid}
+            >
+              <Button
+                block={isMobile}
+                style={buttonStyle}
+                danger
+                icon={<DeleteOutlined />}
+                loading={deleteInvalidLoading}
+                disabled={total === 0}
+              >
+                一键删无效
+              </Button>
             </Popconfirm>
-          )}
-          <Button icon={<UploadOutlined />} onClick={onOpenImport}>导入</Button>
-          <Button icon={<DownloadOutlined />} onClick={onExportCsv} disabled={accountsCount === 0}>导出</Button>
-          <Button icon={<PlusOutlined />} onClick={onOpenAdd}>新增</Button>
-          <ActiveTasksPanel
-            loading={activeTasksLoading}
-            items={activeTasks}
-            onRefresh={onRefreshActiveTasks}
-            onOpen={onActiveTasksOpen}
-            onOpenTaskSnapshot={onOpenTaskSnapshot}
-          />
-          <Button type="primary" icon={<PlusOutlined />} onClick={onOpenRegister}>注册</Button>
-          <Button icon={<ReloadOutlined spin={loading} />} onClick={onRefresh} />
-        </Space>
+            {selectedRowKeys.length > 0 && (
+              <Popconfirm title={`确认删除选中的 ${selectedRowKeys.length} 个账号？`} onConfirm={onBatchDelete}>
+                <Button block={isMobile} style={buttonStyle} danger icon={<DeleteOutlined />}>删除 {selectedRowKeys.length} 个</Button>
+              </Popconfirm>
+            )}
+          </div>
+        </div>
       </div>
     </div>
   )

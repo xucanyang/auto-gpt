@@ -3,6 +3,7 @@ from fastapi.responses import StreamingResponse
 from sqlmodel import Session, select, func
 from pydantic import BaseModel
 from core.db import AccountModel, PendingBusinessInviteModel, get_session
+from services.account_filters import account_base_query, filter_account_rows, should_sort_account_rows, sort_account_rows
 from services.chatgpt_account_state import classify_chatgpt_capabilities
 from services.team_lite import team_lite_service
 from typing import Any, Optional
@@ -23,6 +24,21 @@ def _safe_int(value: Any) -> int:
 
 def _safe_str(value: Any) -> str:
     return str(value or "").strip()
+
+
+def _parse_optional_bool(value: Any) -> bool | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    text = str(value or "").strip().lower()
+    if not text:
+        return None
+    if text in {"1", "true", "yes", "on", "used"}:
+        return True
+    if text in {"0", "false", "no", "off", "unused"}:
+        return False
+    return None
 
 
 def _is_team_invite_source_visible(*, workspace_scope: str, invite_status: str, team_id: int) -> bool:
@@ -62,7 +78,9 @@ def _serialize_account_list_item(account: AccountModel, *, team_invite_source: O
     extra = account.get_extra()
     sync_statuses = extra.get("sync_statuses") if isinstance(extra.get("sync_statuses"), dict) else {}
     chatgpt_local = extra.get("chatgpt_local") if isinstance(extra.get("chatgpt_local"), dict) else {}
+    chatgpt_subscription = chatgpt_local.get("subscription") if isinstance(chatgpt_local.get("subscription"), dict) else {}
     chatgpt_capabilities = extra.get("chatgpt_capabilities") if isinstance(extra.get("chatgpt_capabilities"), dict) else {}
+    phone_binding = extra.get("chatgpt_phone_binding") if isinstance(extra.get("chatgpt_phone_binding"), dict) else {}
     if account.platform == "chatgpt" and not chatgpt_capabilities:
         # Older rows may have tokens/workspace IDs but no derived capability snapshot yet.
         chatgpt_capabilities = classify_chatgpt_capabilities(account, local_probe=chatgpt_local)
@@ -85,6 +103,7 @@ def _serialize_account_list_item(account: AccountModel, *, team_invite_source: O
             "chatgpt_workspace_scope": _safe_str(extra.get("chatgpt_workspace_scope")),
             "chatgpt_workspace_display_name": _safe_str(extra.get("chatgpt_workspace_display_name")),
             "session_token": _safe_str(extra.get("session_token")),
+            "chatgpt_phone_binding": phone_binding,
         },
         "workspace_scope": _safe_str(extra.get("chatgpt_workspace_scope")),
         "workspace_label": _safe_str(extra.get("chatgpt_workspace_label")),
@@ -93,12 +112,14 @@ def _serialize_account_list_item(account: AccountModel, *, team_invite_source: O
         "session_token": _safe_str(extra.get("session_token")),
         "auth_level": _safe_str(chatgpt_capabilities.get("auth_level")),
         "subscription_plan": _safe_str(chatgpt_capabilities.get("subscription_plan")),
+        "subscription_active_until": _safe_str(chatgpt_subscription.get("subscription_active_until")),
         "codex_state": _safe_str((chatgpt_local.get("codex") or {}).get("state")),
         "cliproxy_remote_state": _safe_str((sync_statuses.get("cliproxyapi") or {}).get("remote_state")),
         "sub2api_remote_state": _safe_str((sync_statuses.get("sub2api") or {}).get("remote_state")),
         "team_invite_status": _safe_str(team_invite_source.get("invite_status") if team_invite_source else ""),
         "chatgptLocal": chatgpt_local,
         "chatgptCapabilities": chatgpt_capabilities,
+        "phone_binding": phone_binding,
         "sub2apiSync": sync_statuses.get("sub2api") if isinstance(sync_statuses.get("sub2api"), dict) else {},
         "cliproxySync": sync_statuses.get("cliproxyapi") if isinstance(sync_statuses.get("cliproxyapi"), dict) else {},
     }
@@ -291,22 +312,45 @@ def list_accounts(
     platform: Optional[str] = None,
     status: Optional[str] = None,
     email: Optional[str] = None,
+    manually_used: Optional[str] = None,
+    auth_type: Optional[str] = None,
+    subscription_type: Optional[str] = None,
+    account_validity: Optional[str] = None,
+    sub2api_state: Optional[str] = None,
+    sort_by: Optional[str] = None,
+    sort_order: Optional[str] = None,
     page: int = 1,
     page_size: int = 20,
     detail: bool = False,
     include_team_brief: bool = False,
     session: Session = Depends(get_session),
 ):
-    q = select(AccountModel)
-    if platform:
-        q = q.where(AccountModel.platform == platform)
-    if status:
-        q = q.where(AccountModel.status == status)
-    if email:
-        q = q.where(AccountModel.email.contains(email))
-    q = q.order_by(AccountModel.id.desc())
-    total = int(session.exec(select(func.count()).select_from(q.subquery())).one())
-    items = session.exec(q.offset((page - 1) * page_size).limit(page_size)).all()
+    page_value = max(1, int(page or 1))
+    page_size_value = max(1, min(int(page_size or 20), 200))
+    q = account_base_query(platform=platform, status=status, email=email).order_by(AccountModel.id.desc())
+    has_derived_filters = any([
+        _parse_optional_bool(manually_used) is not None,
+        _safe_str(auth_type),
+        _safe_str(subscription_type),
+        _safe_str(account_validity),
+        _safe_str(sub2api_state),
+    ])
+    has_python_sort = should_sort_account_rows(sort_by, sort_order)
+    if has_derived_filters or has_python_sort:
+        filtered_items = filter_account_rows(
+            session.exec(q).all(),
+            manually_used=_parse_optional_bool(manually_used),
+            auth_type=auth_type,
+            subscription_type=subscription_type,
+            account_validity_filter=account_validity,
+            sub2api_state=sub2api_state,
+        ) if has_derived_filters else session.exec(q).all()
+        filtered_items = sort_account_rows(filtered_items, sort_by=sort_by, sort_order=sort_order)
+        total = len(filtered_items)
+        items = filtered_items[(page_value - 1) * page_size_value:page_value * page_size_value]
+    else:
+        total = int(session.exec(select(func.count()).select_from(q.subquery())).one())
+        items = session.exec(q.offset((page_value - 1) * page_size_value).limit(page_size_value)).all()
     team_invite_sources = (
         _build_team_invite_sources(items, session, include_team_brief=True)
         if detail or include_team_brief
@@ -314,7 +358,7 @@ def list_accounts(
     )
     return {
         "total": total,
-        "page": page,
+        "page": page_value,
         "items": [
             (
                 _serialize_account(item, team_invite_source=team_invite_sources.get(int(item.id or 0)))

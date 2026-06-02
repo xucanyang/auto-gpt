@@ -41,35 +41,46 @@ export function Sub2ApiOverviewPanel({
   onRefresh,
   onUpload,
 }: Sub2ApiOverviewPanelProps) {
+  const hasAttention =
+    overview.pending > 0 ||
+    overview.unreachable > 0 ||
+    overview.ambiguous > 0 ||
+    syncing ||
+    statusSyncLoading === 'sub2api_all'
+
   return (
     <div
       style={{
         display: 'flex',
         flexWrap: 'wrap',
-        gap: 8,
+        gap: 10,
         alignItems: 'center',
-        padding: '8px 10px',
-        borderRadius: 8,
-        border: '1px solid rgba(127,127,127,0.18)',
-        background: 'rgba(255,255,255,0.02)',
-        marginBottom: 16,
+        padding: '7px 2px 9px',
+        borderTop: '1px solid rgba(127,127,127,0.16)',
+        borderBottom: '1px solid rgba(127,127,127,0.16)',
+        marginBottom: 10,
         justifyContent: 'space-between',
       }}
     >
-      <Space wrap size={[8, 8]}>
-        <Text strong style={{ fontSize: 13 }}>Sub2API 远端概览</Text>
-        <Tag color="success">已存在 {overview.exists}</Tag>
-        <Tag>未发现 {overview.notFound}</Tag>
-        <Tag color="processing">其他工作区已存在 {overview.crossWorkspace}</Tag>
-        <Tag color="warning">已删可重传 {overview.deletedExact}</Tag>
-        <Tag color="warning">多候选 {overview.ambiguous}</Tag>
-        <Tag color="error">不可达 {overview.unreachable}</Tag>
-        <Tag>未同步 {overview.unknown}</Tag>
-        <Tag color="processing">待补传 {overview.pending}</Tag>
-        {syncing ? <Tag color="processing">正在自动刷新</Tag> : null}
-        <Text type="secondary" style={{ fontSize: 12 }}>基于当前列表 {accountsCount} 个账号</Text>
+      <Space wrap size={[6, 6]}>
+        <Text strong style={{ fontSize: 12 }}>Sub2API</Text>
+        <Text type="secondary" style={{ fontSize: 12 }}>当前列表 {accountsCount}</Text>
+        <Tag color="success" style={{ marginInlineEnd: 0 }}>已存在 {overview.exists}</Tag>
+        <Tag color={overview.pending ? 'processing' : 'default'} style={{ marginInlineEnd: 0 }}>
+          待补传 {overview.pending}
+        </Tag>
+        {overview.unreachable ? (
+          <Tag color="error" style={{ marginInlineEnd: 0 }}>不可达 {overview.unreachable}</Tag>
+        ) : null}
+        {overview.ambiguous ? (
+          <Tag color="warning" style={{ marginInlineEnd: 0 }}>多候选 {overview.ambiguous}</Tag>
+        ) : null}
+        {hasAttention ? null : (
+          <Text type="secondary" style={{ fontSize: 12 }}>远端状态正常</Text>
+        )}
+        {syncing ? <Tag color="processing" style={{ marginInlineEnd: 0 }}>自动刷新中</Tag> : null}
       </Space>
-      <Space wrap size={8}>
+      <Space wrap size={6}>
         <Button
           size="small"
           icon={<ReloadOutlined spin={statusSyncLoading === 'sub2api_all' || syncing} />}

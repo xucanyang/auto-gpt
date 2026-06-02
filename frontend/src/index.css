@@ -119,3 +119,11 @@ body {
   background: rgba(99, 102, 241, 0.35);
   color: inherit;
 }
+
+.auto-chatgpt-accounts-table .ant-table-tbody > tr > td {
+  vertical-align: middle;
+}
+
+.auto-chatgpt-accounts-table .ant-table {
+  height: 100%;
+}

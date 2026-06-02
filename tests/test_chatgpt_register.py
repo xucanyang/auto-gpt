@@ -617,6 +617,46 @@ class OAuthClientPasswordlessTests(unittest.TestCase):
         self.assertNotIn("json", kwargs)
         self.assertNotIn("data", kwargs)
 
+    def test_email_otp_validate_account_deleted_stops_waiting_for_codes(self):
+        client = self._make_client()
+        state = FlowState(
+            page_type="email_otp_verification",
+            continue_url="https://auth.openai.com/email-verification",
+            current_url="https://auth.openai.com/email-verification",
+        )
+        response = mock.Mock()
+        response.status_code = 403
+        response.text = (
+            '{"error":{"code":"account_delete","message":"You do not have an account '
+            'because it has been deleted or deactivated."}}'
+        )
+        response.json.return_value = {
+            "error": {
+                "code": "account_delete",
+                "message": "You do not have an account because it has been deleted or deactivated.",
+            }
+        }
+        client.session.post = mock.Mock(return_value=response)
+        skymail_client = mock.Mock()
+        skymail_client._used_codes = set()
+        skymail_client.wait_for_verification_code.side_effect = ["972138", "111111"]
+        skymail_client.get_last_verification_result.return_value = {"message_id": "otp-1"}
+
+        with mock.patch("services.chatgpt_core.oauth_client.get_sentinel_token_via_browser", return_value="sentinel"):
+            next_state = client._handle_otp_verification(
+                "user@example.com",
+                "device-fixed",
+                "UA",
+                '"Chromium";v="136"',
+                "chrome136",
+                skymail_client,
+                state,
+            )
+
+        self.assertIsNone(next_state)
+        self.assertEqual(skymail_client.wait_for_verification_code.call_count, 1)
+        self.assertIn("account_deactivated", client.last_error)
+
     def test_login_and_get_tokens_submits_about_you_when_configured(self):
         client = self._make_client()
         about_you_state = FlowState(
@@ -709,6 +749,115 @@ class OAuthClientPasswordlessTests(unittest.TestCase):
             submit_workspace.call_args.args[0],
             "https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
         )
+
+    def test_workspace_select_no_valid_organizations_uses_workspace_only_fallback(self):
+        client = OAuthClient(
+            {"chatgpt_workspace_select_no_org_retry_delays_seconds": "0"},
+            proxy="http://127.0.0.1:7890",
+            verbose=False,
+        )
+        response = mock.Mock()
+        response.status_code = 400
+        response.json.return_value = {
+            "error": {
+                "code": "no_valid_organizations",
+                "type": "invalid_request_error",
+                "message": "You do not have any valid organizations.",
+            }
+        }
+        client.session.post = mock.Mock(return_value=response)
+
+        with mock.patch.object(
+            client,
+            "_load_workspace_session_data",
+            return_value={
+                "workspaces": [
+                    {"id": "ws-personal", "kind": "personal"},
+                ],
+            },
+        ), mock.patch.object(
+            client,
+            "_oauth_try_workspace_only_authorization",
+            return_value=("auth-code", None),
+        ) as fallback:
+            code, next_state = client._oauth_submit_workspace_and_org(
+                "https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+                "device-fixed",
+                "UA",
+                "chrome136",
+                workspace_scope_preference="free",
+                authorize_url="https://auth.openai.com/oauth/authorize",
+                authorize_params={"client_id": "app-demo", "state": "state-demo"},
+            )
+
+        self.assertEqual(code, "auth-code")
+        self.assertIsNone(next_state)
+        self.assertEqual(client.last_workspace_id, "ws-personal")
+        fallback.assert_called_once()
+        self.assertEqual(fallback.call_args.kwargs["workspace_id"], "ws-personal")
+
+    def test_workspace_select_no_valid_organizations_retries_before_fallback(self):
+        client = OAuthClient(
+            {"chatgpt_workspace_select_no_org_retry_delays_seconds": "1,2"},
+            proxy="http://127.0.0.1:7890",
+            verbose=False,
+        )
+        failed_response = mock.Mock()
+        failed_response.status_code = 400
+        failed_response.json.return_value = {
+            "error": {
+                "code": "no_valid_organizations",
+                "type": "invalid_request_error",
+                "message": "You do not have any valid organizations.",
+            }
+        }
+        ok_response = mock.Mock()
+        ok_response.status_code = 200
+        ok_response.json.return_value = {
+            "orgs": [
+                {"id": "org-demo", "projects": [{"id": "proj-demo"}]},
+            ],
+            "continue_url": "https://auth.openai.com/sign-in-with-chatgpt/codex/organization",
+        }
+        client.session.post = mock.Mock(side_effect=[failed_response, ok_response])
+
+        with mock.patch.object(
+            client,
+            "_load_workspace_session_data",
+            return_value={
+                "workspaces": [
+                    {"id": "ws-personal", "kind": "personal"},
+                ],
+            },
+        ) as load_session, mock.patch.object(
+            client,
+            "_sleep_with_stop",
+        ) as sleep_with_stop, mock.patch.object(
+            client,
+            "_oauth_submit_organization_selection",
+            return_value=("auth-code", None),
+        ) as submit_org, mock.patch.object(
+            client,
+            "_oauth_try_workspace_only_authorization",
+            return_value=("fallback-code", None),
+        ) as fallback:
+            code, next_state = client._oauth_submit_workspace_and_org(
+                "https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+                "device-fixed",
+                "UA",
+                "chrome136",
+                workspace_scope_preference="free",
+                authorize_url="https://auth.openai.com/oauth/authorize",
+                authorize_params={"client_id": "app-demo", "state": "state-demo"},
+            )
+
+        self.assertEqual(code, "auth-code")
+        self.assertIsNone(next_state)
+        self.assertEqual(client.session.post.call_count, 2)
+        self.assertEqual(load_session.call_count, 2)
+        sleep_with_stop.assert_called_once_with(1)
+        submit_org.assert_called_once()
+        fallback.assert_not_called()
 
 
 if __name__ == "__main__":

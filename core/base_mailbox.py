@@ -1564,7 +1564,18 @@ class IcloudHmeMailbox(BaseMailbox):
             "homepage",
             "csrf",
         )
-        if any(marker.lower() in lowered for marker in early_failure_markers):
+        keep_alias_failure_markers = (
+            "already paid",
+            "user is already paid",
+            "you have paid",
+            "已付费",
+            "amount != 0",
+            "checkout amount",
+            "chatgpt_payment_already_paid",
+            "chatgpt_nonzero_checkout_amount_failure",
+        )
+        should_keep_alias_used = any(marker.lower() in lowered for marker in keep_alias_failure_markers)
+        if not should_keep_alias_used and any(marker.lower() in lowered for marker in early_failure_markers):
             release_icloud_hme_alias_after_early_failure(
                 anonymous_id,
                 error_message=error_text,

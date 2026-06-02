@@ -564,7 +564,7 @@ def probe_local_chatgpt_status(account: Any, proxy: Optional[str] = None) -> dic
             or ""
         ).strip()
 
-        if normalized_plan == "unknown":
+        if normalized_plan == "unknown" or not subscription_active_until:
             try:
                 accounts_check = _probe_accounts_check(probe_access_token, proxy=proxy)
             except Exception as exc:
@@ -582,7 +582,9 @@ def probe_local_chatgpt_status(account: Any, proxy: Optional[str] = None) -> dic
                     workspace_scope,
                 )
                 if plan_type_from_accounts:
-                    normalized_plan = _normalize_plan_type(plan_type_from_accounts, workspace_plan_type)
+                    accounts_plan = _normalize_plan_type(plan_type_from_accounts, workspace_plan_type)
+                    if normalized_plan == "unknown":
+                        normalized_plan = accounts_plan
                     if expires_at_from_accounts:
                         subscription_active_until = expires_at_from_accounts
                     result["subscription"]["source"] = "accounts_check"

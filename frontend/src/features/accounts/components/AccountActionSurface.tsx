@@ -23,6 +23,12 @@ import type { MenuProps } from 'antd'
 import { MoreOutlined, SyncOutlined } from '@ant-design/icons'
 import { TaskLogPanel } from '@/components/TaskLogPanel'
 import { CliproxySyncSummary, LocalProbeSummary } from '@/features/accounts/components/AccountDetailModal'
+import {
+  DEFAULT_GOPAY_PHONE_COUNTRY_CODE,
+  normalizeGopayPhonePart,
+  normalizeGopayRecognizedCountryCodes,
+  splitGopayPhoneInput,
+} from '@/lib/gopayPhone'
 import { apiFetch } from '@/lib/utils'
 
 const { Text } = Typography
@@ -61,6 +67,7 @@ type AccountActionSurfaceProps = {
   initialActionMode?: 'direct' | 'dialog'
   onInitialActionHandled?: () => void
   onResumeAuthTask?: (record: any) => Promise<void> | void
+  onInvalidRecheckTask?: (record: any) => Promise<void> | void
   authStateMeta: (state?: string) => { color: string; label: string }
   planMeta: (plan?: string) => { color: string; label: string }
   codexStateMeta: (state?: string) => { color: string; label: string }
@@ -121,10 +128,6 @@ function parseMaybeJsonArray(value: unknown) {
   }
 }
 
-function normalizeGopayPhonePart(value: unknown) {
-  return String(value || '').replace(/\D/g, '')
-}
-
 function getGopayPhoneKey(phone: Pick<GopayPhoneCandidate, 'phone_country_code' | 'phone_number'>) {
   return `${normalizeGopayPhonePart(phone.phone_country_code)}:${normalizeGopayPhonePart(phone.phone_number)}`
 }
@@ -138,7 +141,7 @@ function formatGopayPhoneLabel(phone: Partial<GopayPhoneCandidate>) {
 }
 
 function normalizeGopayPhoneCandidate(value: any, index = 0): GopayPhoneCandidate | null {
-  const phone_country_code = normalizeGopayPhonePart(value?.phone_country_code || value?.country_code || value?.code || '86')
+  const phone_country_code = normalizeGopayPhonePart(value?.phone_country_code || value?.country_code || value?.code || DEFAULT_GOPAY_PHONE_COUNTRY_CODE)
   const phone_number = normalizeGopayPhonePart(value?.phone_number || value?.number || value?.phone || '')
   if (!phone_country_code || !phone_number) return null
   const key = `${phone_country_code}:${phone_number}`
@@ -296,6 +299,7 @@ export function AccountActionSurface({
   initialActionMode = 'dialog',
   onInitialActionHandled,
   onResumeAuthTask,
+  onInvalidRecheckTask,
   authStateMeta,
   planMeta,
   codexStateMeta,
@@ -343,6 +347,7 @@ export function AccountActionSurface({
   const [gopayOtpAutoResendDelay, setGopayOtpAutoResendDelay] = useState(DEFAULT_GOPAY_OTP_AUTO_RESEND_DELAY_SECONDS)
   const [gopayGlobalDefaults, setGopayGlobalDefaults] = useState<Record<string, any>>({})
   const [gopayPhoneCandidates, setGopayPhoneCandidates] = useState<GopayPhoneCandidate[]>([])
+  const [gopayRecognizedCountryCodes, setGopayRecognizedCountryCodes] = useState<string[]>([DEFAULT_GOPAY_PHONE_COUNTRY_CODE])
   const [gopayConfigCollapsed, setGopayConfigCollapsed] = useState(false)
   const [browserAuthOpen, setBrowserAuthOpen] = useState(false)
   const [browserAuthSnapshot, setBrowserAuthSnapshot] = useState<any>(null)
@@ -638,6 +643,10 @@ export function AccountActionSurface({
       await onResumeAuthTask(acc)
       return
     }
+    if (actionId === 'invalid_recheck' && onInvalidRecheckTask) {
+      await onInvalidRecheckTask(acc)
+      return
+    }
 
     try {
       setRunningActionId(actionId)
@@ -864,7 +873,7 @@ export function AccountActionSurface({
       || DEFAULT_CHECKOUT_CURRENCY,
     )
     return {
-      phone_country_code: '86',
+      phone_country_code: DEFAULT_GOPAY_PHONE_COUNTRY_CODE,
       phone_number: '',
       pin: String(mergedDefaults.pin || '').trim(),
       proxy: String(mergedDefaults.proxy || '').trim(),
@@ -903,10 +912,13 @@ export function AccountActionSurface({
     try {
       const data = await apiFetch('/integrations/gopay-otp')
       const delay = normalizeGopayOtpAutoResendDelay(data.otp_auto_resend_delay_seconds)
+      const recognizedCodes = normalizeGopayRecognizedCountryCodes(data.recognized_country_codes)
       setGopayOtpAutoResendDelay(delay)
+      setGopayRecognizedCountryCodes(recognizedCodes)
       return delay
     } catch {
       setGopayOtpAutoResendDelay(DEFAULT_GOPAY_OTP_AUTO_RESEND_DELAY_SECONDS)
+      setGopayRecognizedCountryCodes([DEFAULT_GOPAY_PHONE_COUNTRY_CODE])
       return DEFAULT_GOPAY_OTP_AUTO_RESEND_DELAY_SECONDS
     }
   }
@@ -950,8 +962,11 @@ export function AccountActionSurface({
   }
 
   const rememberCurrentGopayPhone = async (values: Record<string, any>) => {
-    const phone_country_code = normalizeGopayPhonePart(values.phone_country_code)
-    const phone_number = normalizeGopayPhonePart(values.phone_number)
+    const { phone_country_code, phone_number } = splitGopayPhoneInput(
+      values.phone_country_code,
+      values.phone_number,
+      gopayRecognizedCountryCodes,
+    )
     if (!phone_country_code || !phone_number) return gopayPhoneCandidates
     return saveGopayPhoneCandidates(upsertGopayPhoneCandidate(gopayPhoneCandidates, {
       label: `GoPay ${gopayPhoneCandidates.length + 1}`,
@@ -967,6 +982,16 @@ export function AccountActionSurface({
 
   const moveCurrentGopayPhone = async (phoneId: string, direction: 'up' | 'down' | 'top' | 'bottom') => {
     await saveGopayPhoneCandidates(moveGopayPhoneCandidate(gopayPhoneCandidates, phoneId, direction))
+  }
+
+  const applyGopayPhoneInput = (value: unknown) => {
+    const normalizedPhone = splitGopayPhoneInput(
+      gopayForm.getFieldValue('phone_country_code'),
+      value,
+      gopayRecognizedCountryCodes,
+    )
+    gopayForm.setFieldsValue(normalizedPhone)
+    return normalizedPhone.phone_number
   }
 
   const buildGopayDefaultsPayload = async () => {
@@ -1050,10 +1075,12 @@ export function AccountActionSurface({
 
   const addCurrentGopayPhoneToPool = async () => {
     try {
-      gopayForm.setFieldsValue({
-        phone_country_code: normalizeGopayPhonePart(gopayForm.getFieldValue('phone_country_code')),
-        phone_number: normalizeGopayPhonePart(gopayForm.getFieldValue('phone_number')),
-      })
+      const normalizedPhone = splitGopayPhoneInput(
+        gopayForm.getFieldValue('phone_country_code'),
+        gopayForm.getFieldValue('phone_number'),
+        gopayRecognizedCountryCodes,
+      )
+      gopayForm.setFieldsValue(normalizedPhone)
       const values = await gopayForm.validateFields(['phone_country_code', 'phone_number'])
       setGopayPhonePoolSaving(true)
       await rememberCurrentGopayPhone(values)
@@ -1090,11 +1117,17 @@ export function AccountActionSurface({
       await saveGopayOtpAutoResendDelay(gopayOtpAutoResendDelay, { notify: false, throwOnError: true })
       const country = normalizeCheckoutCountry(values.country)
       const checkoutUrl = String(values.checkout_url || '').trim()
+      const normalizedPhone = splitGopayPhoneInput(
+        values.phone_country_code,
+        values.phone_number,
+        gopayRecognizedCountryCodes,
+      )
+      gopayForm.setFieldsValue(normalizedPhone)
       const data = await apiFetch(`/chatgpt/${acc.id}/gopay/start`, {
         method: 'POST',
         body: JSON.stringify({
-          phone_country_code: String(values.phone_country_code || '').trim(),
-          phone_number: String(values.phone_number || '').trim(),
+          phone_country_code: normalizedPhone.phone_country_code,
+          phone_number: normalizedPhone.phone_number,
           pin: String(values.pin || '').trim(),
           access_token: String(values.access_token || '').trim(),
           proxy: String(values.proxy || '').trim(),
@@ -1293,6 +1326,15 @@ export function AccountActionSurface({
       return
     }
     if (actionsLoading || actionOpen || resultOpen || gopayOpen || browserAuthOpen || runningActionId) return
+    if (resolvedInitialActionId === 'gopay' && acc?.platform === 'chatgpt') {
+      const signature = `${acc?.id || ''}:${initialActionKey || resolvedInitialActionId}`
+      if (autoHandledActionRef.current === signature) return
+      autoHandledActionRef.current = signature
+      void openGopayDialog().finally(() => {
+        onInitialActionHandled?.()
+      })
+      return
+    }
     const matchedAction = actions.find((item) => String(item?.id || '') === resolvedInitialActionId)
     if (!matchedAction) return
     const signature = `${acc?.id || ''}:${initialActionKey || resolvedInitialActionId}`
@@ -1472,9 +1514,17 @@ export function AccountActionSurface({
     }
 
     return (activeAction.params || []).map((param: any) => (
-      <Form.Item key={param.key} name={param.key} label={param.label} initialValue={param.default}>
+      <Form.Item
+        key={param.key}
+        name={param.key}
+        label={param.type === 'boolean' ? undefined : param.label}
+        initialValue={param.default}
+        valuePropName={param.type === 'boolean' ? 'checked' : 'value'}
+      >
         {param.type === 'select' ? (
           <Select options={(param.options || []).map((option: string) => ({ label: option, value: option }))} />
+        ) : param.type === 'boolean' ? (
+          <Checkbox>{param.label}</Checkbox>
         ) : (
           <Input />
         )}
@@ -1671,7 +1721,7 @@ export function AccountActionSurface({
                   name="phone_number"
                   noStyle
                   rules={[{ required: true, message: '请输入手机号' }]}
-                  getValueFromEvent={(value) => normalizeGopayPhonePart(value)}
+                  getValueFromEvent={(value) => applyGopayPhoneInput(value)}
                 >
                   <AutoComplete
                     allowClear
@@ -1682,7 +1732,7 @@ export function AccountActionSurface({
                       String(option?.label ?? option?.value ?? '').toLowerCase().includes(inputValue.toLowerCase())
                     }
                     onChange={(value) => {
-                      gopayForm.setFieldValue('phone_number', normalizeGopayPhonePart(value))
+                      applyGopayPhoneInput(value)
                     }}
                     onSelect={(value, option: any) => {
                       const candidate = option?.candidate
@@ -1690,7 +1740,11 @@ export function AccountActionSurface({
                         phone_country_code: candidate.phone_country_code,
                         phone_number: candidate.phone_number,
                       } : {
-                        phone_number: normalizeGopayPhonePart(value),
+                        ...splitGopayPhoneInput(
+                          gopayForm.getFieldValue('phone_country_code'),
+                          value,
+                          gopayRecognizedCountryCodes,
+                        ),
                       })
                     }}
                   />

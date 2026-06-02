@@ -11,10 +11,46 @@ from services.chatgpt_core.payment import (
     normalize_checkout_currency,
 )
 
+PAYMENT_LINK_STATUS_LABELS = {
+    "invalid": "无效",
+    "already_paid": "已经支付过",
+    "amount_not_zero": "非0元订单",
+    "not_usd": "非指定区域订单",
+    "precheck_failed": "支付链接核验失败",
+}
+PAYMENT_LINK_REGENERATE_STATUSES = {
+    "invalid",
+    "amount_not_zero",
+    "not_usd",
+    "precheck_failed",
+}
+PAYMENT_LINK_STATUS_SYNC_STATUSES = {"already_paid"}
+
 
 def normalize_payment_link_plan(value: Any) -> str:
     plan = str(value or "plus").strip().lower()
     return plan if plan in {"plus", "team"} else "plus"
+
+
+def normalize_payment_link_status(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def payment_link_status_label(value: Any) -> str:
+    status = normalize_payment_link_status(value)
+    return PAYMENT_LINK_STATUS_LABELS.get(status, status)
+
+
+def payment_link_requires_regeneration(cached: dict[str, Any] | None) -> bool:
+    if not isinstance(cached, dict):
+        return False
+    return normalize_payment_link_status(cached.get("link_status")) in PAYMENT_LINK_REGENERATE_STATUSES
+
+
+def payment_link_requires_status_sync(cached: dict[str, Any] | None) -> bool:
+    if not isinstance(cached, dict):
+        return False
+    return normalize_payment_link_status(cached.get("link_status")) in PAYMENT_LINK_STATUS_SYNC_STATUSES
 
 
 def _positive_int(value: Any, default: int) -> int:

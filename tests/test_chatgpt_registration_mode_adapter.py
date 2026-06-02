@@ -92,7 +92,7 @@ class ChatGPTRegistrationModeAdapterTests(unittest.TestCase):
             "https://chatgpt.com/checkout/openai_llc/cs_live_123",
         )
 
-    def test_build_account_marks_already_paid_checkout_as_subscribed(self):
+    def test_build_account_marks_already_paid_checkout_as_invalid(self):
         adapter = build_chatgpt_registration_mode_adapter(
             {"chatgpt_registration_mode": "access_token_only"}
         )
@@ -121,7 +121,7 @@ class ChatGPTRegistrationModeAdapterTests(unittest.TestCase):
 
         account = adapter.build_account(result, fallback_password="fallback")
 
-        self.assertEqual(account.status.value, "subscribed")
+        self.assertEqual(account.status.value, "invalid")
         self.assertTrue(account.extra["chatgpt_payment_already_paid"])
         self.assertTrue(account.extra["chatgpt_skip_save_account"])
 

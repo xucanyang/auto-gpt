@@ -3,14 +3,21 @@ from unittest.mock import patch
 
 import api.actions as api_actions
 from sqlmodel import Session, SQLModel, create_engine
+from core.task_runtime import StopTaskRequested
 from api.tasks import (
+    BatchPaymentLinkTaskRequest,
     BatchResumeSubscriptionAuthTaskRequest,
+    PhoneBindingTestTaskRequest,
     RegisterTaskRequest,
+    enqueue_batch_payment_link_task,
     enqueue_batch_resume_subscription_auth_task,
+    enqueue_phone_binding_test_task,
+    _run_batch_payment_links,
     _create_task_record,
     _create_standalone_task_record,
     _build_effective_register_extra,
     _run_batch_resume_subscription_auth,
+    _run_phone_binding_test,
     _run_register,
     _run_resume_subscription_auth,
     _task_store,
@@ -65,12 +72,22 @@ class _FakePlatform(BasePlatform):
 class _FakeChatGPTSkipSavePlatform(BasePlatform):
     name = "chatgpt"
     display_name = "ChatGPT"
+    calls = 0
 
     def __init__(self, config=None, mailbox=None):
         super().__init__(config)
         self.mailbox = mailbox
 
     def register(self, email: str, password: str = None) -> Account:
+        type(self).calls += 1
+        if type(self).calls > 1:
+            return Account(
+                platform="chatgpt",
+                email="success-after-nonzero@example.com",
+                password=password or "pw",
+                token="at-demo-success",
+                extra={},
+            )
         return Account(
             platform="chatgpt",
             email="skip-save@example.com",
@@ -171,7 +188,7 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
         self.assertEqual(snapshot["skipped"], 0)
         self.assertEqual(snapshot["errors"], [])
 
-    def test_chatgpt_nonzero_checkout_amount_counts_success_without_saving(self):
+    def test_chatgpt_nonzero_checkout_amount_counts_failure_without_saving_and_continues(self):
         task_id = "task-chatgpt-skip-save"
         req = RegisterTaskRequest(
             platform="chatgpt",
@@ -181,6 +198,7 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
             extra={"mail_provider": "fake"},
         )
         _create_task_record(task_id, req, "manual", None)
+        _FakeChatGPTSkipSavePlatform.calls = 0
 
         with (
             patch("services.chatgpt_core.ChatGPTPlatform", _FakeChatGPTSkipSavePlatform),
@@ -193,9 +211,13 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
         snapshot = _task_store.snapshot(task_id)
         self.assertEqual(snapshot["status"], "done")
         self.assertEqual(snapshot["success"], 1)
-        save_account.assert_not_called()
+        self.assertEqual(_FakeChatGPTSkipSavePlatform.calls, 2)
+        self.assertTrue(snapshot["errors"])
+        self.assertTrue(any("Plus checkout amount != 0" in error for error in snapshot["errors"]))
+        self.assertEqual(save_account.call_count, 1)
         self.assertTrue(any("amount!=0: 1" in line for line in snapshot["logs"]))
-        self.assertTrue(any("success_skip_save" in str(call) for call in save_log.call_args_list))
+        self.assertTrue(any("注册未计成功且不保存账号" in line for line in snapshot["logs"]))
+        self.assertTrue(any("failed_skip_save" in str(call) for call in save_log.call_args_list))
 
     def test_chatgpt_already_paid_skip_save_counts_as_failure_without_saving_and_continues(self):
         task_id = "task-chatgpt-already-paid-skip-save"
@@ -305,7 +327,7 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
             patch.object(
                 api_actions,
                 "_execute_chatgpt_resume_subscription_auth",
-                side_effect=lambda _account, log_fn=None: (
+                side_effect=lambda _account, allow_phone_verification=False, log_fn=None, shared_phone_service=None, stop_checker=None: (
                     log_fn("[补抓] fake runtime log") if callable(log_fn) else None,
                     {"ok": True, "data": {"message": "done"}},
                 )[1],
@@ -349,7 +371,7 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
             def refresh(self, _account):
                 return None
 
-        def _fake_execute(account, log_fn=None):
+        def _fake_execute(account, allow_phone_verification=False, log_fn=None, shared_phone_service=None, stop_checker=None):
             if callable(log_fn):
                 log_fn(f"[补抓] fake runtime log {account.email}")
             if str(account.email).startswith("resume456"):
@@ -372,9 +394,683 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
         self.assertTrue(any("resume456@example.com" in line for line in snapshot["logs"]))
         self.assertTrue(any("workspace missing" in error for error in snapshot["errors"]))
         self.assertTrue(any(
-            call.kwargs.get("status") == "success" or (len(call.args) >= 3 and call.args[2] == "success")
+            call.kwargs.get("status") == "failed" or (len(call.args) >= 3 and call.args[2] == "failed")
             for call in save_log.call_args_list
         ))
+
+    def test_batch_resume_auth_uses_gateway_global_serial_lane(self):
+        task_id = "task-batch-resume-auth-shared-phone"
+        _create_standalone_task_record(
+            task_id,
+            platform="chatgpt",
+            source="batch_resume_subscription_auth",
+            total=2,
+            meta={"account_ids": [123, 456], "eligible": 2, "skipped_items": [], "missing_ids": []},
+        )
+
+        class _FakeSession:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def get(self, _model, account_id):
+                account_id_value = int(account_id or 0)
+                return type(
+                    "AccountModel",
+                    (),
+                    {"platform": "chatgpt", "email": f"resume{account_id_value}@example.com"},
+                )()
+
+            def refresh(self, _account):
+                return None
+
+        shared_services = []
+
+        def _fake_execute(_account, allow_phone_verification=False, log_fn=None, shared_phone_service=None, stop_checker=None):
+            shared_services.append(shared_phone_service)
+            return {"ok": True, "data": {"message": "done"}}
+
+        class _FakeBasePhoneService:
+            enabled = True
+            max_attempts = 3
+            max_resend_attempts = 20
+            resend_interval_seconds = 30
+
+            def complete(self, _entry):
+                return None
+
+        base_phone_service = _FakeBasePhoneService()
+
+        with (
+            patch("api.tasks.Session", return_value=_FakeSession()),
+            patch("core.config_store.config_store.get_all", return_value={"chatgpt_phone_verification_provider": "local_gateway"}),
+            patch("services.chatgpt_core.phone_service.create_phone_service", return_value=base_phone_service) as create_service,
+            patch.object(api_actions, "_execute_chatgpt_resume_subscription_auth", side_effect=_fake_execute),
+            patch.object(api_actions, "_apply_chatgpt_resume_auth_result"),
+            patch("api.tasks._save_task_log"),
+        ):
+            _run_batch_resume_subscription_auth(task_id, [123, 456], allow_phone_verification=True)
+
+        self.assertEqual(create_service.call_count, 1)
+        self.assertEqual(len(shared_services), 2)
+        self.assertIsNotNone(shared_services[0])
+        self.assertIs(shared_services[0], shared_services[1])
+        snapshot = _task_store.snapshot(task_id)
+        self.assertTrue(any("全局串行通道" in line for line in snapshot["logs"]))
+
+    def test_batch_resume_auth_stops_inside_current_account(self):
+        task_id = "task-batch-resume-auth-stop-current"
+        _create_standalone_task_record(
+            task_id,
+            platform="chatgpt",
+            source="batch_resume_subscription_auth",
+            total=2,
+            meta={"account_ids": [123, 456], "eligible": 2, "skipped_items": [], "missing_ids": []},
+        )
+
+        class _FakeSession:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def get(self, _model, account_id):
+                account_id_value = int(account_id or 0)
+                return type(
+                    "AccountModel",
+                    (),
+                    {"platform": "chatgpt", "email": f"resume{account_id_value}@example.com"},
+                )()
+
+            def refresh(self, _account):
+                return None
+
+        calls = []
+
+        def _fake_execute(account, allow_phone_verification=False, log_fn=None, shared_phone_service=None, stop_checker=None):
+            calls.append(str(account.email))
+            if callable(log_fn):
+                log_fn(f"[补抓] fake runtime log {account.email}")
+            _task_store.request_stop(task_id)
+            if callable(stop_checker):
+                stop_checker()
+            raise StopTaskRequested()
+
+        with (
+            patch("api.tasks.Session", return_value=_FakeSession()),
+            patch.object(api_actions, "_execute_chatgpt_resume_subscription_auth", side_effect=_fake_execute),
+            patch.object(api_actions, "_apply_chatgpt_resume_auth_result"),
+            patch("api.tasks._save_task_log") as save_log,
+        ):
+            _run_batch_resume_subscription_auth(task_id, [123, 456])
+
+        snapshot = _task_store.snapshot(task_id)
+        self.assertEqual(snapshot["status"], "stopped")
+        self.assertEqual(calls, ["resume123@example.com"])
+        self.assertTrue(any("[STOP]" in line for line in snapshot["logs"]))
+        self.assertTrue(any(
+            call.kwargs.get("status") == "stopped" or (len(call.args) >= 3 and call.args[2] == "stopped")
+            for call in save_log.call_args_list
+        ))
+
+    def test_phone_binding_test_accepts_configured_account_interval(self):
+        class _BackgroundTasks:
+            def __init__(self):
+                self.calls = []
+
+            def add_task(self, *args, **kwargs):
+                self.calls.append((args, kwargs))
+
+        created_meta = {}
+
+        def _fake_create_task_record(_task_id, *, platform, source, total, meta):
+            created_meta.update(meta)
+
+        req = PhoneBindingTestTaskRequest(
+            account_ids=[123],
+            phone_lines="+13434832954----https://example.com/api/record?token=demo",
+            account_interval_seconds=30,
+            reuse_phone_until_unusable=True,
+        )
+        background_tasks = _BackgroundTasks()
+
+        with (
+            patch(
+                "api.tasks._resolve_phone_binding_test_accounts",
+                return_value=(
+                    [{"account_id": 123, "email": "phone-test@example.com", "status": "pending_payment"}],
+                    [],
+                    [],
+                    [],
+                ),
+            ),
+            patch("api.tasks._create_standalone_task_record", side_effect=_fake_create_task_record),
+            patch("api.tasks._save_task_log"),
+        ):
+            result = enqueue_phone_binding_test_task(req, background_tasks=background_tasks)
+
+        self.assertTrue(result["task_id"])
+        self.assertEqual(created_meta["settings"]["account_interval_seconds"], 30)
+        self.assertTrue(created_meta["settings"]["reuse_phone_until_unusable"])
+        self.assertEqual(len(background_tasks.calls), 1)
+        queued_settings = background_tasks.calls[0][0][4]
+        self.assertEqual(queued_settings["account_interval_seconds"], 30)
+        self.assertTrue(queued_settings["reuse_phone_until_unusable"])
+
+    def test_phone_binding_test_pairs_one_account_to_one_phone(self):
+        task_id = "task-phone-binding-pairwise"
+        _create_standalone_task_record(
+            task_id,
+            platform="chatgpt",
+            source="phone_binding_test",
+            total=2,
+            meta={"missing_ids": [], "parse_errors": []},
+        )
+        phone_items = [
+            {
+                "line_no": 1,
+                "phone": "+11111111111",
+                "api_url": "https://example.com/api/one",
+                "raw_line": "+11111111111----https://example.com/api/one",
+            },
+            {
+                "line_no": 2,
+                "phone": "+12222222222",
+                "api_url": "https://example.com/api/two",
+                "raw_line": "+12222222222----https://example.com/api/two",
+            },
+        ]
+
+        class _FakeAccount:
+            def __init__(self, account_id: int):
+                self.id = account_id
+                self.platform = "chatgpt"
+                self.email = f"phone{account_id}@example.com"
+                self.extra = {}
+
+            def get_extra(self):
+                return dict(self.extra)
+
+            def set_extra(self, extra):
+                self.extra = dict(extra or {})
+
+        accounts_by_id = {}
+
+        class _FakeSession:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def get(self, _model, account_id):
+                account_id_value = int(account_id or 0)
+                if account_id_value not in accounts_by_id:
+                    accounts_by_id[account_id_value] = _FakeAccount(account_id_value)
+                return accounts_by_id[account_id_value]
+
+            def refresh(self, _account):
+                return None
+
+            def add(self, _account):
+                return None
+
+            def commit(self):
+                return None
+
+        attempts = []
+
+        def _fake_execute(account, allow_phone_verification=False, log_fn=None, shared_phone_service=None, stop_checker=None, retry_delays_seconds=None):
+            entry = shared_phone_service.current_entry
+            attempts.append((int(account.id or 0), entry.phone))
+            shared_phone_service.last_expired_date = "2026-07-06 00:00:00"
+            if int(account.id or 0) == 456:
+                shared_phone_service.last_code_time = "2026-06-02 20:48:02"
+                shared_phone_service.last_code_was_extracted = True
+                shared_phone_service.complete(entry)
+            return {"ok": True, "data": {"message": "done"}}
+
+        with (
+            patch("api.tasks.Session", return_value=_FakeSession()),
+            patch.object(api_actions, "_execute_chatgpt_resume_subscription_auth", side_effect=_fake_execute),
+            patch.object(api_actions, "_apply_chatgpt_resume_auth_result"),
+            patch("api.tasks._save_task_log"),
+            patch("api.tasks.time.monotonic", side_effect=[100.0, 200.0, 300.0]),
+        ):
+            _run_phone_binding_test(
+                task_id,
+                [123, 456],
+                phone_items,
+                {
+                    "timeout_seconds": 180,
+                    "poll_interval_seconds": 5,
+                    "max_resend_attempts": 0,
+                    "resend_interval_seconds": 0,
+                    "account_interval_seconds": 60,
+                },
+            )
+
+        snapshot = _task_store.snapshot(task_id)
+        self.assertEqual(attempts, [(123, "+11111111111"), (456, "+12222222222")])
+        self.assertEqual(snapshot["status"], "done")
+        self.assertEqual(snapshot["success"], 1)
+        self.assertEqual(snapshot["skipped"], 1)
+        runtime_results = snapshot["meta"]["runtime_results"]
+        self.assertEqual([item["phone"] for item in runtime_results], ["+11111111111", "+12222222222"])
+        self.assertEqual(runtime_results[0]["status"], "account_phone_bound")
+        self.assertEqual(runtime_results[1]["status"], "bound")
+        self.assertEqual(runtime_results[1]["api_expired_date"], "2026-07-06 00:00:00")
+        self.assertEqual(runtime_results[1]["code_time"], "2026-06-02 20:48:02")
+        self.assertTrue(runtime_results[1]["code_extracted"])
+        saved_binding = accounts_by_id[456].extra["chatgpt_phone_binding"]
+        self.assertEqual(saved_binding["phone"], "+12222222222")
+        self.assertEqual(saved_binding["api_url"], "https://example.com/api/two")
+        self.assertEqual(saved_binding["raw_line"], "+12222222222----https://example.com/api/two")
+        self.assertEqual(accounts_by_id[456].extra["chatgpt_phone_binding_history"][-1]["task_id"], task_id)
+        self.assertTrue(any("===== 手机号 1/2 | +11111111111 =====" in line for line in snapshot["logs"]))
+        self.assertTrue(any("===== 成功手机号 1/1 | +12222222222 =====" in line for line in snapshot["logs"]))
+        self.assertTrue(any("接口有效期: 2026-07-06 00:00:00" in line for line in snapshot["logs"]))
+
+    def test_phone_binding_test_reuses_phone_until_terminal_failure(self):
+        task_id = "task-phone-binding-reuse"
+        _create_standalone_task_record(
+            task_id,
+            platform="chatgpt",
+            source="phone_binding_test",
+            total=1,
+            meta={"missing_ids": [], "parse_errors": []},
+        )
+        phone_items = [
+            {
+                "line_no": 1,
+                "phone": "+15555550123",
+                "api_url": "https://example.com/api/reuse",
+                "raw_line": "+15555550123----https://example.com/api/reuse",
+            },
+        ]
+
+        class _FakeAccount:
+            def __init__(self, account_id: int):
+                self.id = account_id
+                self.platform = "chatgpt"
+                self.email = f"reuse{account_id}@example.com"
+                self.extra = {}
+
+            def get_extra(self):
+                return dict(self.extra)
+
+            def set_extra(self, extra):
+                self.extra = dict(extra or {})
+
+        accounts_by_id = {}
+
+        class _FakeSession:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def get(self, _model, account_id):
+                account_id_value = int(account_id or 0)
+                if account_id_value not in accounts_by_id:
+                    accounts_by_id[account_id_value] = _FakeAccount(account_id_value)
+                return accounts_by_id[account_id_value]
+
+            def refresh(self, _account):
+                return None
+
+            def add(self, _account):
+                return None
+
+            def commit(self):
+                return None
+
+        attempts = []
+
+        def _fake_execute(account, allow_phone_verification=False, log_fn=None, shared_phone_service=None, stop_checker=None, retry_delays_seconds=None):
+            entry = shared_phone_service.current_entry
+            account_id = int(account.id or 0)
+            attempts.append((account_id, entry.phone))
+            shared_phone_service.mark_sms_sent(entry)
+            shared_phone_service.last_expired_date = "2026-07-06 00:00:00"
+            if account_id in {101, 102}:
+                shared_phone_service.last_code_time = f"2026-06-02 20:48:0{account_id - 100}"
+                shared_phone_service.complete(entry)
+                return {"ok": True, "data": {"message": "done"}}
+            return {
+                "ok": False,
+                "error": "add_phone 阶段失败: add-phone/send 失败: This phone number is already linked to the maximum number of accounts.",
+                "data": {"message": "This phone number is already linked to the maximum number of accounts."},
+            }
+
+        with (
+            patch("api.tasks.Session", return_value=_FakeSession()),
+            patch.object(api_actions, "_execute_chatgpt_resume_subscription_auth", side_effect=_fake_execute),
+            patch.object(api_actions, "_apply_chatgpt_resume_auth_result"),
+            patch("api.tasks._save_task_log"),
+            patch("api.tasks.time.monotonic", side_effect=[100.0, 200.0, 300.0, 400.0, 500.0]),
+        ):
+            _run_phone_binding_test(
+                task_id,
+                [101, 102, 103],
+                phone_items,
+                {
+                    "timeout_seconds": 180,
+                    "poll_interval_seconds": 5,
+                    "max_resend_attempts": 0,
+                    "resend_interval_seconds": 0,
+                    "account_interval_seconds": 30,
+                    "reuse_phone_until_unusable": True,
+                },
+            )
+
+        snapshot = _task_store.snapshot(task_id)
+        self.assertEqual(attempts, [
+            (101, "+15555550123"),
+            (102, "+15555550123"),
+            (103, "+15555550123"),
+        ])
+        self.assertEqual(snapshot["status"], "done")
+        self.assertEqual(snapshot["success"], 2)
+        self.assertEqual(snapshot["skipped"], 1)
+        runtime_results = snapshot["meta"]["runtime_results"]
+        self.assertEqual([item["status"] for item in runtime_results], ["bound", "bound", "openai_phone_limit"])
+        self.assertEqual(snapshot["meta"]["bound_phone_lines"], [
+            "+15555550123----https://example.com/api/reuse",
+            "+15555550123----https://example.com/api/reuse",
+        ])
+        self.assertTrue(any("同号连续绑定已开启" in line for line in snapshot["logs"]))
+        self.assertTrue(any("同号连续绑定继续" in line for line in snapshot["logs"]))
+        self.assertTrue(any("===== 成功手机号 2/2 | +15555550123 =====" in line for line in snapshot["logs"]))
+
+    def test_phone_binding_test_does_not_consume_phone_on_account_preflight_failure(self):
+        task_id = "task-phone-binding-preflight-failure"
+        _create_standalone_task_record(
+            task_id,
+            platform="chatgpt",
+            source="phone_binding_test",
+            total=1,
+            meta={"missing_ids": [], "parse_errors": []},
+        )
+        phone_items = [
+            {
+                "line_no": 1,
+                "phone": "+13333333333",
+                "api_url": "https://example.com/api/three",
+                "raw_line": "+13333333333----https://example.com/api/three",
+            },
+        ]
+
+        class _FakeAccount:
+            def __init__(self, account_id: int):
+                self.id = account_id
+                self.platform = "chatgpt"
+                self.email = f"phone{account_id}@example.com"
+                self.extra = {}
+
+            def get_extra(self):
+                return dict(self.extra)
+
+            def set_extra(self, extra):
+                self.extra = dict(extra or {})
+
+        accounts_by_id = {}
+
+        class _FakeSession:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def get(self, _model, account_id):
+                account_id_value = int(account_id or 0)
+                if account_id_value not in accounts_by_id:
+                    accounts_by_id[account_id_value] = _FakeAccount(account_id_value)
+                return accounts_by_id[account_id_value]
+
+            def refresh(self, _account):
+                return None
+
+            def add(self, _account):
+                return None
+
+            def commit(self):
+                return None
+
+        attempts = []
+
+        def _fake_execute(account, allow_phone_verification=False, log_fn=None, shared_phone_service=None, stop_checker=None, retry_delays_seconds=None):
+            entry = shared_phone_service.current_entry
+            attempts.append((int(account.id or 0), entry.phone))
+            if int(account.id or 0) == 123:
+                return {
+                    "ok": False,
+                    "error": "提交邮箱失败: 409 - invalid_request_error: Your sign-in session is no longer valid. Please start over to continue.",
+                    "data": {"message": "提交邮箱失败: 409 - invalid_request_error: Your sign-in session is no longer valid. Please start over to continue."},
+                }
+            shared_phone_service.last_expired_date = "2026-07-06 00:00:00"
+            shared_phone_service.last_code_time = "2026-06-02 20:48:02"
+            shared_phone_service.mark_sms_sent(entry)
+            shared_phone_service.complete(entry)
+            return {"ok": True, "data": {"message": "done"}}
+
+        with (
+            patch("api.tasks.Session", return_value=_FakeSession()),
+            patch.object(api_actions, "_execute_chatgpt_resume_subscription_auth", side_effect=_fake_execute),
+            patch.object(api_actions, "_apply_chatgpt_resume_auth_result"),
+            patch("api.tasks._save_task_log"),
+            patch("api.tasks.time.monotonic", side_effect=[100.0, 200.0, 300.0]),
+        ):
+            _run_phone_binding_test(
+                task_id,
+                [123, 456],
+                phone_items,
+                {
+                    "timeout_seconds": 180,
+                    "poll_interval_seconds": 5,
+                    "max_resend_attempts": 0,
+                    "resend_interval_seconds": 0,
+                    "account_interval_seconds": 60,
+                },
+            )
+
+        snapshot = _task_store.snapshot(task_id)
+        self.assertEqual(attempts, [(123, "+13333333333"), (456, "+13333333333")])
+        runtime_results = snapshot["meta"]["runtime_results"]
+        self.assertEqual(len(runtime_results), 1)
+        self.assertEqual(runtime_results[0]["status"], "bound")
+        self.assertEqual(runtime_results[0]["phone"], "+13333333333")
+        self.assertEqual(snapshot["success"], 1)
+        self.assertEqual(snapshot["skipped"], 0)
+        self.assertTrue(any("账号前置失败，手机号未测试" in line for line in snapshot["logs"]))
+        self.assertTrue(any("===== 手机号 1/1 | +13333333333 =====" in line for line in snapshot["logs"]))
+
+
+class BatchPaymentLinkTaskTests(unittest.TestCase):
+    def setUp(self):
+        self.engine = create_engine("sqlite://")
+        self.core_engine_patch = patch.object(core_db, "engine", self.engine)
+        self.tasks_engine_patch = patch("api.tasks.engine", self.engine)
+        self.core_engine_patch.start()
+        self.tasks_engine_patch.start()
+        SQLModel.metadata.create_all(self.engine)
+
+    def tearDown(self):
+        self.tasks_engine_patch.stop()
+        self.core_engine_patch.stop()
+
+    def _add_account(self, *, email: str, status: str = "registered", link_status: str = "") -> int:
+        extra = {
+            "chatgpt_last_payment_link": {
+                "url": "https://pay.example.test/cached",
+                "plan": "plus",
+                "country": "US",
+                "currency": "USD",
+                "proxy": "",
+                "link_status": link_status,
+            }
+        }
+        with Session(self.engine) as session:
+            row = AccountModel(
+                platform="chatgpt",
+                email=email,
+                password="pw",
+                status=status,
+            )
+            row.set_extra(extra)
+            session.add(row)
+            session.commit()
+            session.refresh(row)
+            return int(row.id or 0)
+
+    def _create_payment_link_task(
+        self,
+        task_id: str,
+        account_id: int,
+        email: str,
+        *,
+        force_refresh: bool = False,
+    ) -> None:
+        _create_standalone_task_record(
+            task_id,
+            platform="chatgpt",
+            source="batch_payment_link",
+            total=1,
+            meta={
+                "account_ids": [account_id],
+                "emails": [email],
+                "params": {},
+                "skip_existing": True,
+                "force_refresh": bool(force_refresh),
+                "skipped_items": [],
+                "missing_ids": [],
+            },
+        )
+
+    def test_batch_payment_link_regenerates_invalid_cached_link(self):
+        task_id = "task-batch-payment-invalid-cache"
+        account_id = self._add_account(email="invalid-cache@example.com", link_status="invalid")
+        self._create_payment_link_task(task_id, account_id, "invalid-cache@example.com")
+        calls = []
+
+        def _fake_execute(_instance, _platform, _account, _action, params, _session):
+            calls.append(dict(params))
+            return {
+                "ok": True,
+                "data": {
+                    "url": "https://pay.example.test/new",
+                    "plan": "plus",
+                    "country": "US",
+                    "currency": "USD",
+                    "cache_reused": False,
+                },
+            }
+
+        class _FakeChatGPTPlatform:
+            def __init__(self, config=None):
+                self.config = config
+
+        with (
+            patch("services.chatgpt_core.ChatGPTPlatform", _FakeChatGPTPlatform),
+            patch("core.config_store.config_store.get_all", return_value={}),
+            patch.object(api_actions, "_execute_platform_action", side_effect=_fake_execute),
+            patch("api.tasks._save_task_log"),
+        ):
+            _run_batch_payment_links(task_id, [account_id])
+
+        self.assertEqual(len(calls), 1)
+        self.assertIs(calls[0]["reuse_cached_link"], False)
+        snapshot = _task_store.snapshot(task_id)
+        self.assertEqual(snapshot["success"], 1)
+        self.assertTrue(any("缓存订阅链接无效，重新生成" in line for line in snapshot["logs"]))
+
+    def test_batch_payment_link_syncs_already_paid_instead_of_generating(self):
+        task_id = "task-batch-payment-already-paid"
+        account_id = self._add_account(email="already-paid-link@example.com", link_status="already_paid")
+        self._create_payment_link_task(task_id, account_id, "already-paid-link@example.com")
+
+        with (
+            patch("services.chatgpt_core.ChatGPTPlatform"),
+            patch("core.config_store.config_store.get_all", return_value={}),
+            patch.object(api_actions, "_execute_platform_action") as execute_action,
+            patch("api.tasks._sync_payment_link_account_status", return_value={"status": "subscribed"}) as sync_status,
+            patch("api.tasks._save_task_log"),
+        ):
+            _run_batch_payment_links(task_id, [account_id])
+
+        execute_action.assert_not_called()
+        sync_status.assert_called_once()
+        snapshot = _task_store.snapshot(task_id)
+        self.assertEqual(snapshot["success"], 0)
+        self.assertEqual(snapshot["skipped"], 1)
+        self.assertTrue(any("已经支付过，开始同步账号状态" in line for line in snapshot["logs"]))
+
+    def test_batch_payment_link_force_refresh_regenerates_existing_link(self):
+        task_id = "task-batch-payment-force-refresh"
+        account_id = self._add_account(email="force-refresh@example.com")
+        self._create_payment_link_task(
+            task_id,
+            account_id,
+            "force-refresh@example.com",
+            force_refresh=True,
+        )
+        calls = []
+
+        def _fake_execute(_instance, _platform, _account, _action, params, _session):
+            calls.append(dict(params))
+            return {
+                "ok": True,
+                "data": {
+                    "url": "https://pay.example.test/fresh",
+                    "plan": "plus",
+                    "country": "US",
+                    "currency": "USD",
+                    "cache_reused": False,
+                },
+            }
+
+        class _FakeChatGPTPlatform:
+            def __init__(self, config=None):
+                self.config = config
+
+        with (
+            patch("services.chatgpt_core.ChatGPTPlatform", _FakeChatGPTPlatform),
+            patch("core.config_store.config_store.get_all", return_value={}),
+            patch.object(api_actions, "_execute_platform_action", side_effect=_fake_execute),
+            patch("api.tasks._save_task_log"),
+        ):
+            _run_batch_payment_links(task_id, [account_id])
+
+        self.assertEqual(len(calls), 1)
+        self.assertIs(calls[0]["reuse_cached_link"], False)
+        snapshot = _task_store.snapshot(task_id)
+        self.assertEqual(snapshot["success"], 1)
+        self.assertEqual(snapshot["skipped"], 0)
+
+    def test_enqueue_batch_payment_link_force_refresh_still_skips_invalid_accounts(self):
+        valid_id = self._add_account(email="force-valid@example.com", status="registered")
+        invalid_id = self._add_account(email="force-invalid@example.com", status="invalid")
+
+        req = BatchPaymentLinkTaskRequest(
+            account_ids=[valid_id, invalid_id],
+            force_refresh=True,
+            skip_existing=True,
+        )
+        with patch("api.tasks.threading.Thread") as thread_cls:
+            result = enqueue_batch_payment_link_task(req)
+
+        self.assertTrue(str(result["task_id"]).startswith("task_"))
+        self.assertEqual(result["eligible"], 1)
+        self.assertEqual(result["skipped"], 1)
+        self.assertEqual([item["account_id"] for item in result["items"]], [valid_id])
+        self.assertEqual([item["account_id"] for item in result["skipped_items"]], [invalid_id])
+        self.assertIn("不能生成订阅链接", result["skipped_items"][0]["reason"])
+        thread_cls.assert_called_once()
 
 
 class BatchResumeAuthTaskCreationTests(unittest.TestCase):
@@ -441,6 +1137,20 @@ class BatchResumeAuthTaskCreationTests(unittest.TestCase):
         self.assertEqual([item["account_id"] for item in result["skipped_items"]], [skipped_id])
         thread_cls.assert_called_once()
 
+    def test_enqueue_batch_resume_auth_uses_global_phone_default_when_omitted(self):
+        eligible_id = self._add_account(
+            email="eligible-global@example.com",
+            status="registered",
+            extra={"chatgpt_capabilities": {"auth_level": "access_token_only", "upload_gate": "blocked_missing_rt"}},
+        )
+
+        req = BatchResumeSubscriptionAuthTaskRequest(account_ids=[eligible_id])
+        with patch("core.config_store.config_store.get", return_value="true"), patch("api.tasks.threading.Thread") as thread_cls:
+            result = enqueue_batch_resume_subscription_auth_task(req)
+
+        self.assertTrue(result["allow_phone_verification"])
+        self.assertTrue(thread_cls.call_args.kwargs["args"][2])
+
     def test_enqueue_batch_resume_auth_returns_without_task_when_nothing_is_eligible(self):
         skipped_id = self._add_account(
             email="ok@example.com",
@@ -457,7 +1167,7 @@ class BatchResumeAuthTaskCreationTests(unittest.TestCase):
         self.assertEqual(result["skipped"], 1)
         thread_cls.assert_not_called()
 
-    def test_enqueue_batch_resume_auth_marks_pending_subscription_rows_as_eligible(self):
+    def test_enqueue_batch_resume_auth_ignores_pending_subscription_rows(self):
         account_id = self._add_account(
             email="pending@example.com",
             status="registered",
@@ -469,9 +1179,9 @@ class BatchResumeAuthTaskCreationTests(unittest.TestCase):
         with patch("api.tasks.threading.Thread") as thread_cls:
             result = enqueue_batch_resume_subscription_auth_task(req)
 
-        self.assertEqual(result["eligible"], 1)
-        self.assertEqual(result["items"][0]["pending_status"], "subscription_pending_auth")
-        thread_cls.assert_called_once()
+        self.assertEqual(result["eligible"], 0)
+        self.assertEqual(result["skipped"], 1)
+        thread_cls.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -7,9 +7,10 @@ import secrets
 import uuid
 import json
 import random
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, urlencode
 from core.proxy_utils import build_requests_proxy_config
-from core.task_runtime import TaskInterruption
+from core.task_runtime import TaskInterruption, StopTaskRequested
+from services.chatgpt_account_state import is_account_deactivated_message
 
 try:
     from curl_cffi import requests as curl_requests
@@ -67,6 +68,8 @@ class OAuthClient:
         self.browser_fingerprint = None
         self._about_you_existing_account_detected = False
         self._about_you_should_skip_create_account = False
+        self.shared_phone_service = self.config.get("_shared_phone_service")
+        self.stop_checker = self.config.get("_task_stop_checker")
 
         # 创建 session
         self.session = curl_requests.Session()
@@ -130,6 +133,10 @@ class OAuthClient:
         if self.verbose:
             print(f"  [OAuth] {msg}")
 
+    def _check_stop(self) -> None:
+        if callable(self.stop_checker):
+            self.stop_checker()
+
     def _set_error(self, message):
         self.last_error = str(message or "").strip()
         if self.last_error:
@@ -139,6 +146,21 @@ class OAuthClient:
         """在 headed 模式下注入轻微延迟，模拟真实浏览器操作节奏。"""
         if self.browser_mode == "headed":
             random_delay(low, high)
+
+    def _sleep_with_stop(self, wait_seconds) -> None:
+        try:
+            remaining = max(float(wait_seconds or 0), 0.0)
+        except Exception:
+            remaining = 0.0
+        while remaining > 0:
+            self._check_stop()
+            chunk = min(1.0, remaining)
+            time.sleep(chunk)
+            remaining -= chunk
+        self._check_stop()
+
+    def _sleep_before_phone_resend(self, wait_seconds) -> None:
+        self._sleep_with_stop(wait_seconds)
 
     def _ensure_oauth_fingerprint(self, user_agent, sec_ch_ua, impersonate, device_id=None):
         accept_language = None
@@ -206,6 +228,9 @@ class OAuthClient:
         if not combined:
             return False
 
+        if cls._phone_reached_account_limit(detail, state):
+            return True
+
         non_blacklist_markers = (
             "whatsapp",
             "未收到短信验证码",
@@ -254,18 +279,76 @@ class OAuthClient:
         )
         return any(marker in combined for marker in blacklist_markers)
 
+    @classmethod
+    def _phone_reached_account_limit(cls, detail="", state: FlowState | None = None):
+        fragments = [str(detail or "").strip()]
+        if state is not None:
+            fragments.extend(
+                cls._iter_text_fragments(
+                    {
+                        "page_type": state.page_type,
+                        "continue_url": state.continue_url,
+                        "current_url": state.current_url,
+                        "payload": state.payload,
+                        "raw": state.raw,
+                    }
+                )
+            )
+        combined = " | ".join(fragment for fragment in fragments if fragment).lower()
+        if not combined:
+            return False
+        return (
+            "maximum number of accounts" in combined
+            or "already linked to the maximum" in combined
+            or "绑定上限" in combined
+            or "账号绑定上限" in combined
+            or "phone_max" in combined
+            or "phone_number_max" in combined
+            or "phone_number_already_linked" in combined
+        )
+
     def _blacklist_phone_if_needed(
         self, phone_service, entry, detail="", state: FlowState | None = None
     ):
         if not entry or not self._should_blacklist_phone_failure(detail, state):
             return False
         try:
-            phone_service.mark_blacklisted(entry.phone)
+            try:
+                phone_service.mark_blacklisted(entry.phone, reason=detail)
+            except TypeError:
+                phone_service.mark_blacklisted(entry.phone)
             self._log(f"已将手机号加入黑名单: {entry.phone}")
             return True
         except Exception as e:
+            if self._is_stop_exception(e):
+                self._raise_stop(e)
             self._log(f"写入手机号黑名单失败: {e}")
             return False
+
+    def _reject_phone_and_continue(
+        self,
+        phone_service,
+        entry,
+        reason,
+        *,
+        state: FlowState | None = None,
+    ) -> None:
+        if self._phone_reached_account_limit(reason, state):
+            reason = f"手机号已达到 OpenAI 账号绑定上限，需要取新号: {reason}"
+            self._log(reason)
+        if self._blacklist_phone_if_needed(phone_service, entry, reason, state):
+            return
+        phone_service.cancel(entry, reason=reason)
+
+    def _is_stop_exception(self, exc: BaseException) -> bool:
+        if isinstance(exc, TaskInterruption):
+            return True
+        return "手动停止" in str(exc or "")
+
+    def _raise_stop(self, exc: BaseException | None = None) -> None:
+        if isinstance(exc, TaskInterruption):
+            raise exc
+        raise StopTaskRequested()
 
     def _headers(
         self,
@@ -448,6 +531,7 @@ class OAuthClient:
         """跟随服务端返回的 continue_url / current_url，返回新的状态或 authorization code。"""
         import re
 
+        self._check_stop()
         current_url = state.continue_url or state.current_url
         last_url = current_url or ""
         referer_url = referer
@@ -460,6 +544,7 @@ class OAuthClient:
             return initial_code, self._state_from_url(current_url)
 
         for hop in range(max_hops):
+            self._check_stop()
             try:
                 headers = self._headers(
                     current_url,
@@ -477,6 +562,8 @@ class OAuthClient:
                 last_url = str(r.url)
                 self._log(f"follow[{hop + 1}] {r.status_code} {last_url[:120]}")
             except Exception as e:
+                if self._is_stop_exception(e):
+                    self._raise_stop(e)
                 maybe_localhost = re.search(r"(https?://localhost[^\s\'\"]+)", str(e))
                 if maybe_localhost:
                     location = maybe_localhost.group(1)
@@ -487,6 +574,7 @@ class OAuthClient:
                 self._log(f"follow[{hop + 1}] 异常: {str(e)[:160]}")
                 return None, self._state_from_url(last_url or current_url)
 
+            self._check_stop()
             code = self._extract_code_from_url(last_url)
             if code:
                 return code, self._state_from_url(last_url)
@@ -529,6 +617,7 @@ class OAuthClient:
         impersonate=None,
     ):
         """启动 OAuth 会话，确保 auth 域上的 login_session 已建立。"""
+        self._check_stop()
         if device_id:
             seed_oai_device_cookie(self.session, device_id)
 
@@ -536,6 +625,7 @@ class OAuthClient:
         authorize_final_url = ""
 
         try:
+            self._check_stop()
             headers = self._headers(
                 authorize_url,
                 user_agent=user_agent,
@@ -566,6 +656,8 @@ class OAuthClient:
             )
             self._log(f"login_session: {'已获取' if has_login_session else '未获取'}")
         except Exception as e:
+            if self._is_stop_exception(e):
+                self._raise_stop(e)
             self._log(f"/oauth/authorize 异常: {e}")
 
         if has_login_session:
@@ -573,6 +665,7 @@ class OAuthClient:
 
         self._log("未获取到 login_session，尝试 /api/oauth/oauth2/auth...")
         try:
+            self._check_stop()
             oauth2_url = f"{self.oauth_issuer}/api/oauth/oauth2/auth"
             kwargs = {
                 "params": authorize_params,
@@ -607,6 +700,8 @@ class OAuthClient:
                 f"login_session(重试): {'已获取' if has_login_session else '未获取'}"
             )
         except Exception as e:
+            if self._is_stop_exception(e):
+                self._raise_stop(e)
             self._log(f"/api/oauth/oauth2/auth 异常: {e}")
 
         return authorize_final_url
@@ -621,11 +716,13 @@ class OAuthClient:
         impersonate=None,
     ) -> str:
         """模拟注册链路一致的 ChatGPT 首页 -> CSRF -> signin/openai。"""
+        self._check_stop()
         homepage_url = "https://chatgpt.com/"
         csrf_url = "https://chatgpt.com/api/auth/csrf"
         signin_url = "https://chatgpt.com/api/auth/signin/openai"
 
         try:
+            self._check_stop()
             self._log("force_chatgpt_entry: 访问 ChatGPT 首页...")
             self._browser_pause()
             r_home = self.session.get(
@@ -642,10 +739,13 @@ class OAuthClient:
             )
             self._log(f"force_chatgpt_entry: 首页状态 {r_home.status_code}")
         except Exception as e:
+            if self._is_stop_exception(e):
+                self._raise_stop(e)
             self._log(f"force_chatgpt_entry: 首页访问异常: {e}")
 
         csrf_token = ""
         try:
+            self._check_stop()
             self._log("force_chatgpt_entry: 获取 CSRF token...")
             r_csrf = self.session.get(
                 csrf_url,
@@ -664,10 +764,13 @@ class OAuthClient:
                 if csrf_token:
                     self._log(f"force_chatgpt_entry: CSRF token={csrf_token[:16]}...")
         except Exception as e:
+            if self._is_stop_exception(e):
+                self._raise_stop(e)
             self._log(f"force_chatgpt_entry: 获取 CSRF 异常: {e}")
 
         authorize_url = ""
         try:
+            self._check_stop()
             self._log("force_chatgpt_entry: 提交邮箱获取 authorize URL...")
             params = {
                 "prompt": "login",
@@ -706,12 +809,15 @@ class OAuthClient:
                     f"force_chatgpt_entry: authorize URL 获取失败 {r_signin.status_code}"
                 )
         except Exception as e:
+            if self._is_stop_exception(e):
+                self._raise_stop(e)
             self._log(f"force_chatgpt_entry: 提交邮箱异常: {e}")
 
         if not authorize_url:
             return ""
 
         try:
+            self._check_stop()
             self._log("force_chatgpt_entry: 访问 authorize URL...")
             self._browser_pause()
             kwargs = {
@@ -735,6 +841,8 @@ class OAuthClient:
             )
             return final_url
         except Exception as e:
+            if self._is_stop_exception(e):
+                self._raise_stop(e)
             self._log(f"force_chatgpt_entry: 访问 authorize 异常: {e}")
             return authorize_url
 
@@ -752,6 +860,7 @@ class OAuthClient:
         screen_hint=None,
     ):
         """提交邮箱，获取 OAuth 流程的第一页状态。"""
+        self._check_stop()
         self._log("步骤2: POST /api/accounts/authorize/continue")
 
         request_url = f"{self.oauth_issuer}/api/accounts/authorize/continue"
@@ -761,6 +870,7 @@ class OAuthClient:
 
         current_referer = continue_referer
         for attempt in range(2):
+            self._check_stop()
             self._log(f"authorize_continue: device_id={device_id}")
             sentinel_token = build_sentinel_token(
                 self.session,
@@ -830,7 +940,7 @@ class OAuthClient:
                     self._log(
                         f"authorize_continue: 429 限流，等待 {wait_seconds}s 后重试"
                     )
-                    time.sleep(wait_seconds)
+                    self._sleep_with_stop(wait_seconds)
                     continue
 
                 if (
@@ -906,6 +1016,8 @@ class OAuthClient:
                     self._log("authorize_continue 分支判定: 进入 login_password / 标准密码登录链")
                 return flow_state
             except Exception as e:
+                if self._is_stop_exception(e):
+                    self._raise_stop(e)
                 self._set_error(f"提交邮箱异常: {e}")
                 return None
         return None
@@ -922,12 +1034,14 @@ class OAuthClient:
         referer=None,
     ):
         """提交密码，获取下一步状态。"""
+        self._check_stop()
         self._log("步骤3: POST /api/accounts/password/verify")
 
         request_url = f"{self.oauth_issuer}/api/accounts/password/verify"
         payload = {"password": password}
 
         for attempt in range(2):
+            self._check_stop()
             self._log(f"password_verify: device_id={device_id}")
             sentinel_pwd = get_sentinel_token_via_browser(
                 flow="password_verify",
@@ -996,7 +1110,7 @@ class OAuthClient:
                     self._log(
                         f"password_verify: 429 限流，等待 {wait_seconds}s 后重试"
                     )
-                    time.sleep(wait_seconds)
+                    self._sleep_with_stop(wait_seconds)
                     continue
 
                 if r.status_code != 200:
@@ -1038,6 +1152,8 @@ class OAuthClient:
                 self._log(f"verify {describe_flow_state(flow_state)}")
                 return flow_state
             except Exception as e:
+                if self._is_stop_exception(e):
+                    self._raise_stop(e)
                 self._set_error(f"密码验证异常: {e}")
                 return None
         return None
@@ -1053,6 +1169,7 @@ class OAuthClient:
         referer=None,
     ):
         """在 login_password 状态下直接切到 passwordless OTP。"""
+        self._check_stop()
         self._log("步骤3: 命中 login_password，按新链路直接触发 passwordless OTP")
 
         request_url = f"{self.oauth_issuer}/api/accounts/passwordless/send-otp"
@@ -1100,8 +1217,11 @@ class OAuthClient:
             if not self._state_is_email_otp(flow_state):
                 flow_state = self._state_from_url(f"{self.oauth_issuer}/email-verification")
             self._log(f"passwordless OTP 已触发 {describe_flow_state(flow_state)}")
+            self._check_stop()
             return flow_state
         except Exception as e:
+            if self._is_stop_exception(e):
+                self._raise_stop(e)
             self._set_error(f"触发 passwordless OTP 异常: {e}")
             return None
 
@@ -1118,6 +1238,7 @@ class OAuthClient:
         referer=None,
     ):
         """在 OAuth 登录态命中 about_you 后提交资料，完成账户创建。"""
+        self._check_stop()
         self._log("步骤5: 命中 about_you，提交姓名和生日完成注册")
         self._log(
             "about_you 参数: "
@@ -1187,6 +1308,7 @@ class OAuthClient:
         self._log("about_you 请求体已构建，准备 POST /api/accounts/create_account")
 
         try:
+            self._check_stop()
             kwargs = {
                 "json": payload,
                 "headers": headers,
@@ -1249,8 +1371,11 @@ class OAuthClient:
                 if raw_json and raw_json != raw_text:
                     self._log("add_phone 触发响应体(json): " + raw_json)
             self._log(f"about_you 提交成功 {describe_flow_state(flow_state)}")
+            self._check_stop()
             return flow_state
         except Exception as e:
+            if self._is_stop_exception(e):
+                self._raise_stop(e)
             self._set_error(f"about_you 提交异常: {e}")
             return None
 
@@ -1314,6 +1439,7 @@ class OAuthClient:
         Returns:
             dict: tokens 字典，包含 access_token, refresh_token, id_token
         """
+        self._check_stop()
         self.last_error = ""
         self.last_workspace_id = ""
         self.last_workspace_candidates = []
@@ -1390,6 +1516,7 @@ class OAuthClient:
             )
 
         self._log("步骤1: Bootstrap OAuth session...")
+        self._check_stop()
         authorize_final_url = self._bootstrap_oauth_session(
             authorize_url,
             authorize_params,
@@ -1440,6 +1567,7 @@ class OAuthClient:
             return True
 
         for step in range(20):
+            self._check_stop()
             self.last_state = state
             self._log(f"状态步进[{step + 1}/20]: {describe_flow_state(state)}")
             signature = self._state_signature(state)
@@ -1452,6 +1580,7 @@ class OAuthClient:
             if code:
                 self._log(f"获取到 authorization code: {code[:20]}...")
                 self._log("步骤7: POST /oauth/token")
+                self._check_stop()
                 tokens = self._exchange_code_for_tokens(
                     code, code_verifier, user_agent, impersonate
                 )
@@ -1474,6 +1603,7 @@ class OAuthClient:
                     if not self.last_error:
                         self._set_error("passwordless OTP 触发后未进入邮箱验证码状态")
                     return None
+                self._check_stop()
                 referer = state.current_url or referer
                 state = next_state
                 continue
@@ -1493,6 +1623,7 @@ class OAuthClient:
                     if not self.last_error:
                         self._set_error("密码验证后未进入下一步 OAuth 状态")
                     return None
+                self._check_stop()
                 if _should_stop_after_login(next_state):
                     self._log(
                         "登录链路已完成（密码验证后进入下一状态），按要求停止"
@@ -1518,6 +1649,7 @@ class OAuthClient:
                     if not self.last_error:
                         self._set_error("密码验证后未进入下一步 OAuth 状态")
                     return None
+                self._check_stop()
                 if _should_stop_after_login(next_state):
                     self._log(
                         "登录链路已完成（密码验证后进入下一状态），按要求停止"
@@ -1544,6 +1676,7 @@ class OAuthClient:
                 if code:
                     self._log(f"获取到 authorization code: {code[:20]}...")
                     self._log("步骤7: POST /oauth/token")
+                    self._check_stop()
                     tokens = self._exchange_code_for_tokens(
                         code, code_verifier, user_agent, impersonate
                     )
@@ -1580,6 +1713,7 @@ class OAuthClient:
                     if not self.last_error:
                         self._set_error("邮箱 OTP 验证后未进入下一步 OAuth 状态")
                     return None
+                self._check_stop()
                 if _should_stop_after_login(next_state):
                     self._log(
                         "登录链路已完成（OTP 验证后进入下一状态），按要求停止"
@@ -1702,6 +1836,7 @@ class OAuthClient:
                     if not self.last_error:
                         self._set_error("about_you 提交后未进入下一步 OAuth 状态")
                     return None
+                self._check_stop()
                 referer = state.current_url or referer
                 state = next_state
                 continue
@@ -1765,6 +1900,7 @@ class OAuthClient:
                         if not self.last_error:
                             self._set_error("手机号验证后未进入下一步 OAuth 状态")
                         return None
+                    self._check_stop()
                     referer = state.current_url or referer
                     state = next_state
                     continue
@@ -1779,6 +1915,7 @@ class OAuthClient:
                 if code:
                     self._log(f"获取到 authorization code: {code[:20]}...")
                     self._log("步骤7: POST /oauth/token")
+                    self._check_stop()
                     tokens = self._exchange_code_for_tokens(
                         code, code_verifier, user_agent, impersonate
                     )
@@ -1799,10 +1936,13 @@ class OAuthClient:
                     user_agent,
                     impersonate,
                     workspace_scope_preference=workspace_scope_preference,
+                    authorize_url=authorize_url,
+                    authorize_params=authorize_params,
                 )
                 if code:
                     self._log(f"获取到 authorization code: {code[:20]}...")
                     self._log("步骤7: POST /oauth/token")
+                    self._check_stop()
                     tokens = self._exchange_code_for_tokens(
                         code, code_verifier, user_agent, impersonate
                     )
@@ -1922,6 +2062,8 @@ class OAuthClient:
                     user_agent,
                     impersonate,
                     workspace_scope_preference=workspace_scope_preference,
+                    authorize_url=authorize_url,
+                    authorize_params=authorize_params,
                 )
                 if code:
                     self._log(f"获取到 authorization code: {code[:20]}...")
@@ -2064,6 +2206,8 @@ class OAuthClient:
         user_agent,
         impersonate,
         workspace_scope_preference=None,
+        authorize_url=None,
+        authorize_params=None,
     ):
         """解析并提交 Codex workspace / org，返回 code 或下一状态。"""
         self._log("步骤6: 解析 Codex workspace / org / code")
@@ -2104,6 +2248,8 @@ class OAuthClient:
             user_agent,
             impersonate,
             workspace_scope_preference=workspace_scope_preference,
+            authorize_url=authorize_url,
+            authorize_params=authorize_params,
         )
 
 
@@ -2157,6 +2303,14 @@ class OAuthClient:
             parts.append(f"message={message[:240]}")
         return ", ".join(parts)
 
+    def _set_terminal_otp_error_if_needed(self, label, response) -> bool:
+        info = self._auth_error_info_from_response(response)
+        message = str(info.get("error_message") or info.get("text") or "").strip()
+        if is_account_deactivated_message(info.get("error_code"), message):
+            self._set_error(f"account_deactivated: {message or self._format_auth_error_info(label, info)}")
+            return True
+        return False
+
     def _is_duplicate_default_project_error(self, info):
         haystack = " ".join(
             str(info.get(key) or "")
@@ -2170,6 +2324,44 @@ class OAuthClient:
             for key in ("error_code", "error_type", "error_message", "text")
         ).lower()
         return "invalid_state" in haystack or "invalid session" in haystack
+
+    def _is_no_valid_organizations_error(self, info):
+        haystack = " ".join(
+            str(info.get(key) or "")
+            for key in ("error_code", "error_type", "error_message", "text")
+        ).lower()
+        return "no_valid_organizations" in haystack or "no valid organizations" in haystack
+
+    def _coerce_positive_delay_list(self, value, default):
+        if value is None:
+            return list(default)
+        if isinstance(value, str):
+            raw = value.strip()
+            if not raw:
+                return list(default)
+            items = raw.replace("，", ",").replace(";", ",").split(",")
+        elif isinstance(value, (list, tuple, set)):
+            items = list(value)
+        else:
+            items = [value]
+
+        delays = []
+        for item in items:
+            try:
+                delay = int(float(str(item).strip()))
+            except Exception:
+                continue
+            if delay > 0:
+                delays.append(min(delay, 120))
+        return delays
+
+    def _workspace_select_no_org_retry_delays(self):
+        raw = self.config.get("chatgpt_workspace_select_no_org_retry_delays_seconds")
+        if raw in (None, ""):
+            raw = self.config.get(
+                "chatgpt_workspace_select_no_valid_organizations_retry_delays_seconds"
+            )
+        return self._coerce_positive_delay_list(raw, [5, 10, 20])
 
     def _normalize_org_candidate(self, item):
         if not isinstance(item, dict):
@@ -2319,6 +2511,8 @@ class OAuthClient:
                     self._log(f"organization 页面提取到 {len(orgs)} 个 org 候选")
                     return orgs
             except Exception as exc:
+                if self._is_stop_exception(exc):
+                    self._raise_stop(exc)
                 self._log(f"organization 页面解析异常: {exc}")
         return []
 
@@ -2392,12 +2586,16 @@ class OAuthClient:
             kwargs["impersonate"] = impersonate
 
         try:
+            self._check_stop()
             self._browser_pause()
             r_org = self.session.post(
                 f"{self.oauth_issuer}/api/accounts/organization/select",
                 **kwargs,
             )
+            self._check_stop()
         except Exception as exc:
+            if self._is_stop_exception(exc):
+                self._raise_stop(exc)
             self._set_error(f"organization/select 异常: {exc}")
             return None, None
 
@@ -2426,11 +2624,92 @@ class OAuthClient:
                     return code, org_state
                 return None, org_state
             except Exception as exc:
+                if self._is_stop_exception(exc):
+                    self._raise_stop(exc)
                 self._set_error(f"解析 organization/select 响应异常: {exc}")
                 return None, None
 
         error_info = self._auth_error_info_from_response(r_org)
         self._set_error(self._format_auth_error_info("organization/select", error_info))
+        return None, None
+
+    def _oauth_authorize_url_with_params(self, base_url, authorize_params, workspace_id=""):
+        params = dict(authorize_params or {})
+        if workspace_id:
+            params["workspace_id"] = str(workspace_id).strip()
+        query = urlencode(params)
+        if not query:
+            return str(base_url or "")
+        separator = "&" if "?" in str(base_url or "") else "?"
+        return f"{base_url}{separator}{query}"
+
+    def _oauth_try_workspace_only_authorization(
+        self,
+        *,
+        consent_url,
+        authorize_url,
+        authorize_params,
+        workspace_id,
+        device_id,
+        user_agent,
+        impersonate,
+    ):
+        """When workspace exists but org selection is empty, try to continue OAuth with the workspace only."""
+        workspace_id = str(workspace_id or "").strip()
+        if not workspace_id:
+            return None, None
+        if not authorize_params:
+            self._log("workspace-only fallback 缺少 OAuth 授权参数，无法继续")
+            return None, None
+
+        auth_url = str(authorize_url or f"{self.oauth_issuer}/oauth/authorize").strip()
+        oauth2_url = f"{self.oauth_issuer}/api/oauth/oauth2/auth"
+        attempts = [
+            ("oauth2+workspace", oauth2_url, True),
+            ("authorize+workspace", auth_url, True),
+            ("oauth2", oauth2_url, False),
+            ("authorize", auth_url, False),
+        ]
+
+        seen_urls = set()
+        for label, base_url, include_workspace in attempts:
+            full_url = self._oauth_authorize_url_with_params(
+                base_url,
+                authorize_params,
+                workspace_id=workspace_id if include_workspace else "",
+            )
+            if not full_url or full_url in seen_urls:
+                continue
+            seen_urls.add(full_url)
+            self._log(f"workspace-only fallback: 尝试 {label} 继续 OAuth")
+            code, next_state = self._follow_flow_state(
+                self._state_from_url(full_url),
+                referer=consent_url,
+                user_agent=user_agent,
+                impersonate=impersonate,
+            )
+            if code:
+                self._log("workspace-only fallback 获取到 authorization code")
+                return code, next_state
+            if next_state and self._state_is_codex_organization(next_state):
+                orgs = self._extract_orgs_from_payload_object(next_state.raw)
+                if not orgs:
+                    orgs = self._load_organization_page_orgs(
+                        next_state.continue_url or next_state.current_url,
+                        user_agent=user_agent,
+                        impersonate=impersonate,
+                    )
+                if orgs:
+                    return self._oauth_submit_organization_selection(
+                        orgs,
+                        organization_url=next_state.continue_url or next_state.current_url,
+                        fallback_referer=consent_url,
+                        device_id=device_id,
+                        user_agent=user_agent,
+                        impersonate=impersonate,
+                    )
+            if next_state:
+                self._log(f"workspace-only fallback state -> {describe_flow_state(next_state)}")
         return None, None
 
     def _oauth_submit_workspace_and_org(
@@ -2441,12 +2720,16 @@ class OAuthClient:
         impersonate,
         max_retries=3,
         workspace_scope_preference=None,
+        authorize_url=None,
+        authorize_params=None,
     ):
         """提交 workspace 和 organization 选择（带重试）"""
         session_data = None
+        self._check_stop()
         self._log(f"workspace 解析入口: {consent_url}")
 
         for attempt in range(max_retries):
+            self._check_stop()
             session_data = self._load_workspace_session_data(
                 consent_url=consent_url,
                 user_agent=user_agent,
@@ -2459,7 +2742,7 @@ class OAuthClient:
                 self._log(
                     f"无法获取 consent session 数据 (尝试 {attempt + 1}/{max_retries})"
                 )
-                time.sleep(0.3)
+                self._sleep_with_stop(0.3)
             else:
                 self._set_error("无法获取 consent session 数据")
                 return None, None
@@ -2531,7 +2814,7 @@ class OAuthClient:
         )
         headers.update(generate_datadog_trace())
 
-        try:
+        def _post_workspace_select():
             kwargs = {
                 "json": {"workspace_id": workspace_id},
                 "headers": headers,
@@ -2540,13 +2823,46 @@ class OAuthClient:
             }
             if impersonate:
                 kwargs["impersonate"] = impersonate
-
             self._browser_pause()
-            r = self.session.post(
+            response = self.session.post(
                 f"{self.oauth_issuer}/api/accounts/workspace/select", **kwargs
             )
+            self._check_stop()
+            return response
+
+        no_org_retry_delays = self._workspace_select_no_org_retry_delays()
+        try:
+            r = _post_workspace_select()
 
             self._log(f"workspace/select -> {r.status_code}")
+
+            no_org_retry_count = 0
+            while r.status_code not in (200, 301, 302, 303, 307, 308):
+                retry_error_info = self._auth_error_info_from_response(r)
+                if not (
+                    self._is_no_valid_organizations_error(retry_error_info)
+                    and workspace_id
+                    and no_org_retry_count < len(no_org_retry_delays)
+                ):
+                    break
+                delay_seconds = no_org_retry_delays[no_org_retry_count]
+                no_org_retry_count += 1
+                self._log(
+                    "workspace/select 返回 no_valid_organizations，"
+                    f"workspace 已存在，等待 {delay_seconds}s 后重试 "
+                    f"({no_org_retry_count}/{len(no_org_retry_delays)})"
+                )
+                self._sleep_with_stop(delay_seconds)
+                session_data = self._load_workspace_session_data(
+                    consent_url=consent_url,
+                    user_agent=user_agent,
+                    impersonate=impersonate,
+                )
+                workspaces = (session_data or {}).get("workspaces", [])
+                if workspaces:
+                    self.last_workspace_candidates = list(workspaces or [])
+                r = _post_workspace_select()
+                self._log(f"workspace/select -> {r.status_code}")
 
             # 检查重定向
             if r.status_code in (301, 302, 303, 307, 308):
@@ -2611,12 +2927,34 @@ class OAuthClient:
                     return None, workspace_state
 
                 except Exception as e:
+                    if self._is_stop_exception(e):
+                        self._raise_stop(e)
                     self._set_error(f"处理 workspace/select 响应异常: {e}")
                     return None, None
 
             error_info = self._auth_error_info_from_response(r)
             error_summary = self._format_auth_error_info("workspace/select", error_info)
             self._log(error_summary)
+            if self._is_no_valid_organizations_error(error_info) and workspace_id:
+                self._log(
+                    "workspace/select 返回 no_valid_organizations，但 workspace 已存在；"
+                    "按 workspace-only 继续尝试 OAuth"
+                )
+                code, next_state = self._oauth_try_workspace_only_authorization(
+                    consent_url=consent_url,
+                    authorize_url=authorize_url,
+                    authorize_params=authorize_params,
+                    workspace_id=workspace_id,
+                    device_id=device_id,
+                    user_agent=user_agent,
+                    impersonate=impersonate,
+                )
+                if code:
+                    return code, next_state
+                if next_state and self._state_signature(next_state) != self._state_signature(
+                    self._state_from_url(consent_url)
+                ):
+                    return None, next_state
             if self._is_duplicate_default_project_error(error_info):
                 orgs = self._extract_orgs_from_payload_object(error_info.get("data"))
                 if not orgs:
@@ -2651,6 +2989,8 @@ class OAuthClient:
             return None, None
 
         except Exception as e:
+            if self._is_stop_exception(e):
+                self._raise_stop(e)
             self._set_error(f"workspace/select 异常: {e}")
             return None, None
 
@@ -2689,6 +3029,7 @@ class OAuthClient:
     def _fetch_consent_page_html(self, consent_url, user_agent, impersonate):
         """获取 consent 页 HTML，用于解析 React Router stream 中的 session 数据。"""
         try:
+            self._check_stop()
             headers = self._headers(
                 consent_url,
                 user_agent=user_agent,
@@ -2701,6 +3042,7 @@ class OAuthClient:
                 kwargs["impersonate"] = impersonate
             self._browser_pause(0.12, 0.3)
             r = self.session.get(consent_url, **kwargs)
+            self._check_stop()
             location = normalize_flow_url(
                 r.headers.get("Location", ""), auth_base=self.oauth_issuer
             )
@@ -2714,6 +3056,8 @@ class OAuthClient:
             if r.status_code == 200 and "text/html" in content_type:
                 return r.text
         except Exception as e:
+            if self._is_stop_exception(e):
+                self._raise_stop(e)
             self._log(f"获取 consent HTML 异常: {e}")
         return ""
 
@@ -2871,6 +3215,7 @@ class OAuthClient:
 
     def _exchange_code_for_tokens(self, code, code_verifier, user_agent, impersonate):
         """用 authorization code 换取 tokens"""
+        self._check_stop()
         url = f"{self.oauth_issuer}/oauth/token"
 
         payload = {
@@ -2897,7 +3242,9 @@ class OAuthClient:
                 kwargs["impersonate"] = impersonate
 
             self._browser_pause()
+            self._check_stop()
             r = self.session.post(url, **kwargs)
+            self._check_stop()
 
             if r.status_code == 200:
                 return r.json()
@@ -2905,11 +3252,14 @@ class OAuthClient:
                 self._set_error(f"换取 tokens 失败: {r.status_code} - {r.text[:200]}")
 
         except Exception as e:
+            if self._is_stop_exception(e):
+                self._raise_stop(e)
             self._set_error(f"换取 tokens 异常: {e}")
 
         return None
 
     def _send_phone_number(self, phone, device_id, user_agent, sec_ch_ua, impersonate):
+        self._check_stop()
         request_url = f"{self.oauth_issuer}/api/accounts/add-phone/send"
         headers = self._headers(
             request_url,
@@ -2935,8 +3285,12 @@ class OAuthClient:
                 kwargs["impersonate"] = impersonate
 
             self._browser_pause(0.12, 0.25)
+            self._check_stop()
             resp = self.session.post(request_url, **kwargs)
+            self._check_stop()
         except Exception as e:
+            if self._is_stop_exception(e):
+                self._raise_stop(e)
             return False, None, f"add-phone/send 异常: {e}"
 
         self._log(f"/add-phone/send -> {resp.status_code}")
@@ -2961,6 +3315,7 @@ class OAuthClient:
     def _resend_phone_otp(
         self, device_id, user_agent, sec_ch_ua, impersonate, state: FlowState
     ):
+        self._check_stop()
         request_url = f"{self.oauth_issuer}/api/accounts/phone-otp/resend"
         headers = self._headers(
             request_url,
@@ -2981,8 +3336,12 @@ class OAuthClient:
             if impersonate:
                 kwargs["impersonate"] = impersonate
             self._browser_pause(0.12, 0.25)
+            self._check_stop()
             resp = self.session.post(request_url, **kwargs)
+            self._check_stop()
         except Exception as e:
+            if self._is_stop_exception(e):
+                self._raise_stop(e)
             return False, f"phone-otp/resend 异常: {e}"
 
         self._log(f"/phone-otp/resend -> {resp.status_code}")
@@ -2993,6 +3352,7 @@ class OAuthClient:
     def _validate_phone_otp(
         self, code, device_id, user_agent, sec_ch_ua, impersonate, state: FlowState
     ):
+        self._check_stop()
         request_url = f"{self.oauth_issuer}/api/accounts/phone-otp/validate"
         headers = self._headers(
             request_url,
@@ -3019,8 +3379,12 @@ class OAuthClient:
             if impersonate:
                 kwargs["impersonate"] = impersonate
             self._browser_pause(0.12, 0.25)
+            self._check_stop()
             resp = self.session.post(request_url, **kwargs)
+            self._check_stop()
         except Exception as e:
+            if self._is_stop_exception(e):
+                self._raise_stop(e)
             return False, None, f"phone-otp/validate 异常: {e}"
 
         self._log(f"/phone-otp/validate -> {resp.status_code}")
@@ -3047,7 +3411,8 @@ class OAuthClient:
     def _handle_add_phone_verification(
         self, device_id, user_agent, sec_ch_ua, impersonate, state: FlowState, email: str = ""
     ):
-        phone_service = create_phone_service(self.config, log_fn=self._log)
+        self._check_stop()
+        phone_service = self.shared_phone_service or create_phone_service(self.config, log_fn=self._log)
         if not phone_service.enabled:
             self._set_error(
                 "OAuth 登录被 add_phone 阻断，当前账号需要手机号验证；未配置可用的接码服务"
@@ -3056,19 +3421,38 @@ class OAuthClient:
 
         excluded_prefixes = set()
         last_failure = ""
+        last_rejected_phone_failure = ""
 
         for attempt in range(phone_service.max_attempts):
+            self._check_stop()
             try:
-                entry = phone_service.acquire_phone(exclude_prefixes=excluded_prefixes, email=email)
+                entry = phone_service.acquire_phone(
+                    exclude_prefixes=excluded_prefixes,
+                    email=email,
+                    account_id=self.config.get("_current_account_id") or self.config.get("account_id") or 0,
+                    task_id=self.config.get("_current_task_id") or self.config.get("task_id") or "",
+                )
             except Exception as e:
+                if self._is_stop_exception(e):
+                    self._raise_stop(e)
                 last_failure = f"获取手机号失败: {e}"
+                if last_rejected_phone_failure:
+                    last_failure = (
+                        f"{last_rejected_phone_failure}；随后取新号失败: {e}"
+                    )
                 self._log(last_failure)
                 break
 
             if not entry:
-                last_failure = last_failure or "SMSToMe 号码池中无可用手机号"
+                last_failure = last_failure or "接码服务中无可用手机号"
+                if last_rejected_phone_failure:
+                    last_failure = (
+                        f"{last_rejected_phone_failure}；随后取新号失败: "
+                        f"{last_failure}"
+                    )
                 break
 
+            self._check_stop()
             prefix = phone_service.prefix_hint(entry.phone)
             self._log(
                 f"步骤5: add_phone 选择手机号 {attempt + 1}/{phone_service.max_attempts}: {entry.phone} ({entry.country_slug})"
@@ -3084,11 +3468,13 @@ class OAuthClient:
             if not sent or not next_state:
                 last_failure = detail or "add-phone/send 未返回有效状态"
                 self._log(last_failure)
-                phone_service.cancel(entry, reason=last_failure)
-                self._blacklist_phone_if_needed(phone_service, entry, last_failure)
+                self._reject_phone_and_continue(phone_service, entry, last_failure)
+                if self._should_blacklist_phone_failure(last_failure):
+                    last_rejected_phone_failure = last_failure
                 excluded_prefixes.add(prefix)
                 continue
 
+            self._check_stop()
             if (
                 next_state.page_type != "phone_otp_verification"
                 and "phone-verification"
@@ -3096,10 +3482,11 @@ class OAuthClient:
             ):
                 last_failure = f"add-phone/send 未进入手机验证码页: {describe_flow_state(next_state)}"
                 self._log(last_failure)
-                phone_service.cancel(entry, reason=last_failure)
-                self._blacklist_phone_if_needed(
-                    phone_service, entry, last_failure, next_state
+                self._reject_phone_and_continue(
+                    phone_service, entry, last_failure, state=next_state
                 )
+                if self._should_blacklist_phone_failure(last_failure, next_state):
+                    last_rejected_phone_failure = last_failure
                 excluded_prefixes.add(prefix)
                 continue
 
@@ -3117,7 +3504,9 @@ class OAuthClient:
             self._log(
                 f"add_phone 发码成功: phone={bound_phone}, channel={verification_channel}"
             )
+            self._check_stop()
             phone_service.mark_sms_sent(entry)
+            self._check_stop()
 
             if verification_channel != "sms":
                 last_failure = f"add_phone 已切到 {verification_channel} 通道，当前接码服务仅支持短信接码"
@@ -3127,8 +3516,19 @@ class OAuthClient:
                 continue
 
             code = phone_service.wait_for_code(entry)
-            if not code:
-                self._log("手机号验证码暂未收到，尝试重发一次...")
+            self._check_stop()
+            max_resends = getattr(phone_service, "max_resend_attempts", 1)
+            resend_interval_seconds = getattr(
+                phone_service, "resend_interval_seconds", 0
+            )
+            resend_attempt = 0
+            while not code and resend_attempt < max_resends:
+                self._check_stop()
+                resend_attempt += 1
+                self._log(
+                    f"手机号验证码暂未收到，等待 {resend_interval_seconds:g} 秒后继续使用当前手机号重发 {resend_attempt}/{max_resends}..."
+                )
+                self._sleep_before_phone_resend(resend_interval_seconds)
                 resend_ok, resend_detail = self._resend_phone_otp(
                     device_id,
                     user_agent,
@@ -3136,17 +3536,27 @@ class OAuthClient:
                     impersonate,
                     next_state,
                 )
-                if resend_ok:
-                    phone_service.request_next_code(entry)
-                    code = phone_service.wait_for_code(entry)
-                if not code:
-                    last_failure = (
-                        resend_detail or f"手机号 {entry.phone} 未收到短信验证码"
-                    )
-                    self._log(last_failure)
-                    phone_service.cancel(entry, reason=last_failure)
-                    excluded_prefixes.add(prefix)
-                    continue
+                if not resend_ok:
+                    last_failure = resend_detail or "OpenAI 无法继续发送手机号验证码"
+                    break
+                if not phone_service.request_next_code(entry):
+                    last_failure = "接码网关无法继续为当前手机号请求下一条短信"
+                    break
+                code = phone_service.wait_for_code(entry)
+                self._check_stop()
+
+            if not code:
+                if not last_failure:
+                    if resend_attempt >= max_resends:
+                        last_failure = (
+                            f"手机号 {entry.phone} 达到同号重发上限 {max_resends} 次，仍未收到短信验证码"
+                        )
+                    else:
+                        last_failure = f"手机号 {entry.phone} 未收到短信验证码"
+                self._log(last_failure)
+                phone_service.cancel(entry, reason=last_failure)
+                excluded_prefixes.add(prefix)
+                continue
 
             valid, validated_state, detail = self._validate_phone_otp(
                 code,
@@ -3163,6 +3573,7 @@ class OAuthClient:
                 excluded_prefixes.add(prefix)
                 continue
 
+            self._check_stop()
             phone_service.complete(entry)
             return validated_state
 
@@ -3181,10 +3592,12 @@ class OAuthClient:
         scope_log_prefix="",
     ):
         """处理 OAuth 阶段的邮箱 OTP 验证，返回服务端声明的下一步状态。"""
+        self._check_stop()
         self._log("步骤4: 检测到邮箱 OTP 验证")
         scope_log_prefix = str(scope_log_prefix or "").strip()
 
         def _resend_email_otp() -> bool:
+            self._check_stop()
             prefer_passwordless = bool(
                 self.config.get("prefer_passwordless_login")
                 or self.config.get("force_passwordless_login")
@@ -3213,11 +3626,15 @@ class OAuthClient:
                     if impersonate:
                         kwargs["impersonate"] = impersonate
                     self._browser_pause()
+                    self._check_stop()
                     resp = self.session.post(request_url, **kwargs)
+                    self._check_stop()
                     self._log(f"/passwordless/send-otp -> {resp.status_code}")
                     if resp.status_code == 200:
                         resend_ok = True
                 except Exception as e:
+                    if self._is_stop_exception(e):
+                        self._raise_stop(e)
                     self._log(f"passwordless resend 异常: {e}")
 
             if resend_ok:
@@ -3244,18 +3661,23 @@ class OAuthClient:
                 if impersonate:
                     kwargs["impersonate"] = impersonate
                 self._browser_pause()
+                self._check_stop()
                 resp = self.session.get(request_url, **kwargs)
+                self._check_stop()
                 self._log(f"/email-otp/send -> {resp.status_code}")
                 if resp.status_code == 200:
                     self._log("已触发 email-otp 重发")
                     return True
                 self._log(f"email-otp/send 重发失败: {resp.text[:120]}")
             except Exception as e:
+                if self._is_stop_exception(e):
+                    self._raise_stop(e)
                 self._log(f"email-otp/send 重发异常: {e}")
             return False
 
         request_url = f"{self.oauth_issuer}/api/accounts/email-otp/validate"
         self._log(f"email_otp_validate: device_id={device_id}")
+        self._check_stop()
         sentinel_otp = get_sentinel_token_via_browser(
             flow="email_otp_validate",
             proxy=self.proxy,
@@ -3343,6 +3765,7 @@ class OAuthClient:
         )
 
         def validate_otp(code, *, message_id=""):
+            self._check_stop()
             tried_codes.add(code)
             if message_id:
                 tried_message_ids.add(str(message_id).strip())
@@ -3359,13 +3782,19 @@ class OAuthClient:
                     kwargs["impersonate"] = impersonate
 
                 self._browser_pause(0.12, 0.25)
+                self._check_stop()
                 resp_otp = self.session.post(request_url, **kwargs)
+                self._check_stop()
             except Exception as e:
+                if self._is_stop_exception(e):
+                    self._raise_stop(e)
                 self._log(f"email-otp/validate 异常: {e}")
                 return None
 
             self._log(f"/email-otp/validate -> {resp_otp.status_code}")
             if resp_otp.status_code != 200:
+                if self._set_terminal_otp_error_if_needed("email-otp/validate", resp_otp):
+                    return None
                 self._log(f"OTP 无效: {resp_otp.text[:160]}")
                 return None
 
@@ -3389,6 +3818,7 @@ class OAuthClient:
         if hasattr(skymail_client, "wait_for_verification_code"):
             self._log("使用 wait_for_verification_code 进行阻塞式获取新验证码...")
             while time.time() < otp_deadline:
+                self._check_stop()
                 remaining = max(1, int(otp_deadline - time.time()))
                 wait_time = min(otp_poll_window, remaining)
                 try:
@@ -3413,12 +3843,10 @@ class OAuthClient:
                         or ""
                     ).strip()
                 except TaskInterruption:
-                    self._set_error("任务已手动停止")
-                    return None
+                    raise
                 except Exception as e:
                     if "手动停止" in str(e):
-                        self._set_error("任务已手动停止")
-                        return None
+                        raise TaskInterruption("任务已手动停止") from e
                     self._log(f"等待 OTP 异常: {e}")
                     code = None
                     current_message_id = ""
@@ -3449,6 +3877,7 @@ class OAuthClient:
                     break
         else:
             while time.time() < otp_deadline:
+                self._check_stop()
                 messages = skymail_client.fetch_emails(email) or []
                 candidate_codes = []
 
@@ -3461,7 +3890,7 @@ class OAuthClient:
                 if not candidate_codes:
                     elapsed = int(otp_wait_seconds - max(0, otp_deadline - time.time()))
                     self._log(f"等待新的 OTP... ({elapsed}s/{otp_wait_seconds}s)")
-                    time.sleep(2)
+                    self._sleep_with_stop(2)
                     continue
 
                 for otp_code in candidate_codes:
@@ -3469,7 +3898,7 @@ class OAuthClient:
                     if next_state:
                         return next_state
 
-                time.sleep(2)
+                self._sleep_with_stop(2)
                 if self.last_error:
                     break
 

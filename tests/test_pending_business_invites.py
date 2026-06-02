@@ -10,7 +10,7 @@ from core.base_mailbox import MailboxAccount
 from core.db import AccountModel, PendingBusinessInviteModel, SQLModel
 from api import actions as api_actions
 from services.chatgpt_core import pending_business_invites
-from services.chatgpt_core.refresh_token_registration_engine import RegistrationResult
+from services.chatgpt_core.refresh_token_registration_engine import EmailServiceAdapter, RegistrationResult
 
 
 class PendingBusinessInviteRecoveryTests(unittest.TestCase):
@@ -254,6 +254,43 @@ class PendingBusinessInviteRecoveryTests(unittest.TestCase):
         self.assertEqual(payload["email"], "restored@example.com")
         self.assertEqual(payload["mailbox_action"], "restored_existing")
 
+    def test_restored_email_service_marks_processed_otp_message_in_before_ids(self):
+        state = {
+            "provider": "dummy",
+            "email": "restored@example.com",
+            "account": {"email": "restored@example.com", "account_id": "mailbox-1", "extra": {}},
+            "before_ids": [],
+        }
+
+        class _DummyMailbox:
+            _last_verification_result = {}
+
+            def get_current_ids(self, account):
+                return set()
+
+            def wait_for_code(self, account, **kwargs):
+                self._last_verification_result = {
+                    "message_id": "otp-message-1",
+                    "code": "476433",
+                }
+                return "476433"
+
+        with mock.patch.object(pending_business_invites, "create_mailbox", return_value=_DummyMailbox()):
+            service = pending_business_invites.RestoredEmailService(state=state)
+            service.create_email()
+            adapter = EmailServiceAdapter(service, "restored@example.com", lambda *_args: None)
+
+            code = adapter.wait_for_verification_code(
+                "restored@example.com",
+                timeout=1,
+                phase="oauth_email_otp",
+                phase_label="OAuth 登录邮箱验证码",
+            )
+            exported = service.export_state()
+
+        self.assertEqual(code, "476433")
+        self.assertIn("otp-message-1", exported["before_ids"])
+
     def test_restored_email_service_recreates_expired_tempmail_mailbox_by_exact_email(self):
         state = {
             "provider": "tempmail_local",
@@ -297,13 +334,13 @@ class PendingBusinessInviteRecoveryTests(unittest.TestCase):
         self.assertEqual(exported["account"]["account_id"], "new-mailbox")
         self.assertTrue(any("按原地址新建" in line for line in logs))
 
-    def test_actions_resume_subscription_auth_uses_pending_pool(self):
+    def test_actions_resume_subscription_auth_uses_account_level_capture(self):
         account_id = self._add_account(email="api-resume@example.com")
         with Session(self.engine) as session:
             account = session.get(AccountModel, account_id)
             with mock.patch.object(api_actions, "_execute_chatgpt_resume_subscription_auth", return_value={
                 "ok": True,
-                "data": {"message": "补抓 Auth 完成", "pending_activation": {"id": 123, "status": "completed"}},
+                "data": {"message": "补抓 Auth 完成", "auth_capture": {"account_id": "acct-1"}},
             }) as mocked:
                 result = api_actions._execute_platform_action(None, "chatgpt", account, "resume_subscription_auth", {}, session)
 
@@ -357,13 +394,10 @@ class PendingBusinessInviteRecoveryTests(unittest.TestCase):
             account = session.get(AccountModel, account_id)
 
             with mock.patch(
-                "services.chatgpt_core.pending_business_invites.upsert_pending_subscription_auth_from_account",
-                return_value=mock.Mock(id=456, status="subscription_pending_auth"),
-            ), mock.patch(
-                "services.chatgpt_core.pending_business_invites.activate_pending_invite",
-                side_effect=lambda invite_id, log_fn=None: (
-                    log_fn("[订阅] 开始重新登录并补抓 auth") if callable(log_fn) else None,
-                    {"ok": True, "invite_id": invite_id, "activation_kind": "subscription_auth"},
+                "services.chatgpt_core.subscription_auth_capture.capture_subscription_auth_for_account",
+                side_effect=lambda account_id, allow_phone_verification=False, log_fn=None: (
+                    log_fn("[补抓] 账号级补抓 auth") if callable(log_fn) else None,
+                    {"ok": True, "data": {"message": "补抓 Auth 完成", "auth_capture": {"account_id": "acct-log"}, "logs": ["[补抓] 账号级补抓 auth"]}},
                 )[1],
             ):
                 result = api_actions._execute_chatgpt_resume_subscription_auth(account)
@@ -372,19 +406,50 @@ class PendingBusinessInviteRecoveryTests(unittest.TestCase):
         self.assertIn("logs", result.get("data", {}))
         self.assertTrue(any("补抓 auth" in line for line in (result.get("data", {}).get("logs") or [])))
 
+    def test_resume_subscription_auth_does_not_use_pending_activation(self):
+        account_id = self._add_account(email="api-direct@example.com")
+        with Session(self.engine) as session:
+            account = session.get(AccountModel, account_id)
+
+            with mock.patch(
+                "services.chatgpt_core.subscription_auth_capture.capture_subscription_auth_for_account",
+                return_value={
+                    "ok": True,
+                    "data": {
+                        "message": "补抓 Auth 完成",
+                        "auth_capture": {"account_id": "acct-direct"},
+                        "logs": [],
+                    },
+                    "error": "",
+                },
+            ) as capture_mock, mock.patch.object(
+                pending_business_invites,
+                "upsert_pending_subscription_auth_from_account",
+            ) as upsert_mock, mock.patch.object(
+                pending_business_invites,
+                "activate_pending_invite",
+            ) as activate_mock:
+                result = api_actions._execute_chatgpt_resume_subscription_auth(
+                    account,
+                    allow_phone_verification=True,
+                )
+
+        self.assertTrue(result["ok"])
+        capture_mock.assert_called_once()
+        self.assertTrue(capture_mock.call_args.kwargs["allow_phone_verification"])
+        upsert_mock.assert_not_called()
+        activate_mock.assert_not_called()
+
     def test_resume_subscription_auth_returns_logs_on_failure(self):
         account_id = self._add_account(email="api-log-fail@example.com")
         with Session(self.engine) as session:
             account = session.get(AccountModel, account_id)
 
             with mock.patch(
-                "services.chatgpt_core.pending_business_invites.upsert_pending_subscription_auth_from_account",
-                return_value=mock.Mock(id=789, status="subscription_pending_auth"),
-            ), mock.patch(
-                "services.chatgpt_core.pending_business_invites.activate_pending_invite",
-                side_effect=lambda invite_id, log_fn=None: (
+                "services.chatgpt_core.subscription_auth_capture.capture_subscription_auth_for_account",
+                side_effect=lambda account_id, allow_phone_verification=False, log_fn=None: (
                     log_fn("[补抓] 登录失败前的详细日志") if callable(log_fn) else None,
-                    (_ for _ in ()).throw(ValueError("创建邮箱失败")),
+                    {"ok": False, "error": "创建邮箱失败", "data": {"message": "创建邮箱失败", "logs": ["[补抓] 登录失败前的详细日志", "[补抓] 失败：创建邮箱失败"]}},
                 )[1],
             ):
                 result = api_actions._execute_chatgpt_resume_subscription_auth(account)

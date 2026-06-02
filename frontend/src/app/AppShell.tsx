@@ -1,6 +1,6 @@
 import { Suspense, useEffect, useState } from 'react'
 import { Routes, Route, useLocation, useNavigate } from 'react-router-dom'
-import { App as AntdApp, ConfigProvider, Layout, Menu, Button, Spin } from 'antd'
+import { App as AntdApp, ConfigProvider, Layout, Menu, Button, Grid, Spin } from 'antd'
 import {
   DashboardOutlined,
   UserOutlined,
@@ -13,6 +13,7 @@ import {
   TeamOutlined,
   MobileOutlined,
   RocketOutlined,
+  ExperimentOutlined,
 } from '@ant-design/icons'
 import zhCN from 'antd/locale/zh_CN'
 import { APP_ROUTES } from './router'
@@ -61,6 +62,8 @@ function ProtectedLayout() {
 }
 
 function AppContent({ hasPassword }: { hasPassword: boolean }) {
+  const screens = Grid.useBreakpoint()
+  const isMobile = screens.md === false
   const [themeMode, setThemeMode] = useState<'dark' | 'light'>(() =>
     (localStorage.getItem('theme') as 'dark' | 'light') || 'dark',
   )
@@ -77,6 +80,12 @@ function AppContent({ hasPassword }: { hasPassword: boolean }) {
     localStorage.setItem('theme', themeMode)
   }, [themeMode])
 
+  useEffect(() => {
+    if (isMobile) {
+      setCollapsed(true)
+    }
+  }, [isMobile])
+
   const isLight = themeMode === 'light'
   const currentTheme = isLight ? lightTheme : darkTheme
 
@@ -84,6 +93,7 @@ function AppContent({ hasPassword }: { hasPassword: boolean }) {
     const path = location.pathname
     if (path === '/') return ['/']
     if (path.startsWith('/chatgpt') || path.startsWith('/accounts')) return ['/chatgpt']
+    if (path === '/custom-email-recheck') return ['/custom-email-recheck']
     if (path.startsWith('/teams')) return ['/teams']
     if (path === '/pipeline') return ['/pipeline']
     if (path === '/gopay-otp') return ['/gopay-otp']
@@ -96,6 +106,7 @@ function AppContent({ hasPassword }: { hasPassword: boolean }) {
   const menuItems = [
     { key: '/', icon: <DashboardOutlined />, label: '仪表盘' },
     { key: '/chatgpt', icon: <UserOutlined />, label: 'ChatGPT' },
+    { key: '/custom-email-recheck', icon: <ExperimentOutlined />, label: '自定义邮箱测活' },
     { key: '/teams', icon: <TeamOutlined />, label: 'Team' },
     { key: '/gopay-otp', icon: <MobileOutlined />, label: 'GoPay OTP' },
     { key: '/pipeline', icon: <RocketOutlined />, label: '自动流水线' },
@@ -110,11 +121,17 @@ function AppContent({ hasPassword }: { hasPassword: boolean }) {
         <Layout style={{ minHeight: '100vh' }}>
           <Sider
             collapsible
+            breakpoint="md"
+            collapsedWidth={isMobile ? 0 : 80}
             collapsed={collapsed}
             onCollapse={setCollapsed}
             style={{
               background: currentTheme.token?.colorBgContainer,
               borderRight: `1px solid ${currentTheme.token?.colorBorder}`,
+              position: isMobile ? 'fixed' : 'relative',
+              zIndex: isMobile ? 100 : undefined,
+              minHeight: '100vh',
+              boxShadow: isMobile && !collapsed ? '0 12px 40px rgba(0,0,0,0.32)' : undefined,
             }}
             width={220}
           >
@@ -198,9 +215,10 @@ function AppContent({ hasPassword }: { hasPassword: boolean }) {
           </Sider>
           <Content
             style={{
-              padding: 24,
+              padding: isMobile ? 12 : 24,
               overflow: 'hidden',
               background: currentTheme.token?.colorBgLayout,
+              minWidth: 0,
             }}
           >
             <Suspense fallback={<RouteFallback />}>

@@ -10,6 +10,7 @@ import random
 from urllib.parse import urlparse, parse_qs
 from core.proxy_utils import build_requests_proxy_config
 from core.task_runtime import TaskInterruption
+from services.chatgpt_account_state import is_account_deactivated_message
 
 try:
     from curl_cffi import requests as curl_requests
@@ -132,6 +133,51 @@ class OAuthClient:
         self.last_error = str(message or "").strip()
         if self.last_error:
             self._log(self.last_error)
+
+    def _auth_error_info_from_response(self, response):
+        info = {
+            "status_code": getattr(response, "status_code", None),
+            "error_type": "",
+            "error_code": "",
+            "error_message": "",
+            "data": {},
+            "text": "",
+        }
+        try:
+            data = response.json()
+        except Exception:
+            data = None
+        if isinstance(data, dict):
+            info["data"] = data
+            error = data.get("error") if isinstance(data.get("error"), dict) else {}
+            info["error_type"] = str(error.get("type") or "").strip()
+            info["error_code"] = str(error.get("code") or "").strip()
+            info["error_message"] = str(error.get("message") or "").strip()
+        if not info["error_message"]:
+            try:
+                info["text"] = str(response.text or "")[:300]
+            except Exception:
+                info["text"] = ""
+        return info
+
+    def _format_auth_error_info(self, label, info):
+        parts = [f"{label} 失败: HTTP {info.get('status_code') or '-'}"]
+        if info.get("error_code"):
+            parts.append(f"code={info.get('error_code')}")
+        if info.get("error_type"):
+            parts.append(f"type={info.get('error_type')}")
+        message = str(info.get("error_message") or info.get("text") or "").strip()
+        if message:
+            parts.append(f"message={message[:240]}")
+        return ", ".join(parts)
+
+    def _set_terminal_otp_error_if_needed(self, label, response) -> bool:
+        info = self._auth_error_info_from_response(response)
+        message = str(info.get("error_message") or info.get("text") or "").strip()
+        if is_account_deactivated_message(info.get("error_code"), message):
+            self._set_error(f"account_deactivated: {message or self._format_auth_error_info(label, info)}")
+            return True
+        return False
 
     def _browser_pause(self, low=0.15, high=0.4):
         """在 headed 模式下注入轻微延迟，模拟真实浏览器操作节奏。"""
@@ -3015,6 +3061,8 @@ class OAuthClient:
 
             self._log(f"/email-otp/validate -> {resp_otp.status_code}")
             if resp_otp.status_code != 200:
+                if self._set_terminal_otp_error_if_needed("email-otp/validate", resp_otp):
+                    return None
                 self._log(f"OTP 无效: {resp_otp.text[:160]}")
                 return None
 
@@ -3127,4 +3175,3 @@ class OAuthClient:
                 f"OAuth 阶段 OTP 验证失败，已尝试 {len(tried_codes)} 个验证码，等待窗口 {otp_wait_seconds}s"
             )
         return None
-

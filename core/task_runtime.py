@@ -426,6 +426,13 @@ class RegisterTaskStore:
             record.cashier_urls.append(cashier_url)
             record.updated_at = time.time()
 
+    def update_meta(self, task_id: str, patch: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            record = self._records[task_id]
+            record.meta.update(dict(patch or {}))
+            record.updated_at = time.time()
+            return dict(record.meta)
+
     def finish(
         self,
         task_id: str,

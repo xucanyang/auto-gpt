@@ -112,6 +112,14 @@ class EmailServiceAdapter:
             return dict(meta)
         return {}
 
+    def _mark_message_processed(self, message_id: str) -> None:
+        marker = getattr(self.email_service, "mark_verification_message_processed", None)
+        if callable(marker):
+            try:
+                marker(message_id)
+            except Exception as exc:
+                self._log(f"标记已处理验证码邮件失败: {exc}", "debug")
+
     def get_last_verification_result(self, phase: str | None = None) -> dict[str, Any]:
         phase_key = str(phase or "").strip()
         if phase_key:
@@ -158,9 +166,11 @@ class EmailServiceAdapter:
 
             if message_id:
                 if message_id in used_message_ids:
+                    self._mark_message_processed(message_id)
                     self._log(f"跳过已处理验证码邮件（{phase_title}）", "debug")
                     continue
                 used_message_ids.add(message_id)
+                self._mark_message_processed(message_id)
                 used_codes.add(normalized_code)
                 meta["code"] = normalized_code
                 meta["phase"] = phase_key

@@ -234,6 +234,13 @@ const TAB_ITEMS = [
           { key: 'icloud_hme_auto_create_interval_min_minutes', label: '随机间隔最小分钟', placeholder: '60' },
           { key: 'icloud_hme_auto_create_interval_max_minutes', label: '随机间隔最大分钟', placeholder: '120' },
           { key: 'icloud_hme_auto_create_rate_limit_backoff_minutes', label: '遇到限流延长等待分钟', placeholder: '360' },
+          { key: 'tempmail_archive_cleanup_enabled', label: '归档清理共享收件箱', type: 'boolean' },
+          { key: 'tempmail_archive_cleanup_interval_minutes', label: '归档清理间隔分钟', placeholder: '30' },
+          { key: 'tempmail_archive_cleanup_keep_recent_minutes', label: '保留最近邮件分钟', placeholder: '60' },
+          { key: 'tempmail_archive_cleanup_threshold', label: '触发清理邮件数阈值', placeholder: '100' },
+          { key: 'tempmail_archive_cleanup_pause_active_tasks', label: '活跃任务期间暂停清理', type: 'boolean' },
+          { key: 'tempmail_archive_cleanup_mailbox', label: '归档清理邮箱', placeholder: 'b@cccy.me' },
+          { key: 'tempmail_archive_cleanup_backup_path', label: '归档备份路径', placeholder: '/runtime/tempmail_email_backups.db' },
         ],
       },
       {
@@ -331,14 +338,6 @@ const TAB_ITEMS = [
         ],
       },
       {
-        title: '补抓 Auth',
-        desc: '账号页与批量补抓 Auth 的默认参数',
-        fields: [
-          { key: 'chatgpt_resume_auth_allow_phone_verification', label: '默认允许手机号验证', type: 'boolean' },
-          { key: 'chatgpt_subscription_auth_capture_retry_delays_seconds', label: '重试间隔（秒）', placeholder: '5,10' },
-        ],
-      },
-      {
         title: 'GoPay 账单地址 LLM',
         desc: 'GoPay 启动时生成本次账单地址，失败时回落到表单/默认地址',
         fields: [
@@ -373,6 +372,7 @@ const TAB_ITEMS = [
           lines: [
             '请求头统一使用 Authorization: Bearer <访问 Token>。',
             '领取订阅链接: POST /api/external/subscription-links/claim，body 示例 {"consumer":"payment-worker-01","limit":10,"lease_seconds":900}。',
+            '领取成功后默认 300 秒会触发一次本地账号订阅探测；服务重启后会自动恢复未完成的复核计划。',
             '查询领取状态: GET /api/external/subscription-links/{claim_id}。',
             '支付成功写回: POST /api/external/subscription-links/{claim_id}/result，body 示例 {"status":"paid","external_payment_id":"pay_123","message":"payment completed"}。',
             '支付失败写回: POST /api/external/subscription-links/{claim_id}/result，body 示例 {"status":"failed","external_payment_id":"pay_123","error_code":"declined","message":"payment failed"}。',
@@ -383,6 +383,7 @@ const TAB_ITEMS = [
         fields: [
           { key: 'external_subscription_api_enabled', label: '启用外部 API', type: 'boolean' },
           { key: 'external_subscription_api_token', label: '访问 Token', secret: true, placeholder: '外部程序使用 Authorization: Bearer <token>' },
+          { key: 'external_subscription_verify_after_seconds', label: '领取后本地探测延迟秒数', placeholder: '300' },
         ],
       },
       {
@@ -396,15 +397,20 @@ const TAB_ITEMS = [
       },
       {
         title: '手机验证 / 接码服务',
-        desc: 'ChatGPT add_phone 阶段自动取号并轮询短信验证码',
+        desc: '补抓 Auth 遇到 add_phone 后，是否允许接码以及使用哪个接码渠道',
         fields: [
+          { key: 'chatgpt_resume_auth_allow_phone_verification', label: '补抓 Auth 允许手机号验证', type: 'boolean' },
+          { key: 'chatgpt_subscription_auth_capture_retry_delays_seconds', label: '补抓 Auth 重试间隔（秒）', placeholder: '5,10' },
           { key: 'chatgpt_phone_verification_provider', label: '接码服务', type: 'select' },
           { key: 'local_phone_gateway_url', label: '本地网关 URL', placeholder: 'http://sms-gateway:8720' },
           { key: 'local_phone_gateway_token', label: '本地网关 Token', secret: true },
           { key: 'local_phone_gateway_service_alias', label: '本地网关服务别名', placeholder: 'chatgpt' },
+          { key: 'local_phone_gateway_auto_acquire_enabled', label: '允许自动取号', type: 'boolean' },
           { key: 'local_phone_gateway_timeout_seconds', label: '本地网关等待秒数', placeholder: '180' },
           { key: 'local_phone_gateway_poll_interval_seconds', label: '本地网关轮询间隔秒数', placeholder: '5' },
           { key: 'local_phone_gateway_max_attempts', label: '本地网关换号次数', placeholder: '3' },
+          { key: 'local_phone_gateway_max_resend_attempts', label: '同号最大重发次数', placeholder: '20' },
+          { key: 'local_phone_gateway_resend_interval_seconds', label: '同号重发间隔秒数', placeholder: '30' },
           { key: 'smstome_cookie', label: 'SMSToMe Cookie', secret: true },
           { key: 'smstome_country_slugs', label: 'SMSToMe 国家列表', placeholder: 'united-kingdom,poland' },
           { key: 'smstome_phone_attempts', label: 'SMSToMe 手机号尝试次数', placeholder: '3' },
@@ -579,6 +585,24 @@ interface ICloudHmeAutoPoolStatus {
   forward_to?: string
 }
 
+interface TempMailArchiveCleanupStatus {
+  running?: boolean
+  enabled?: boolean
+  mailbox?: string
+  backup_path?: string
+  interval_minutes?: number
+  keep_recent_minutes?: number
+  threshold?: number
+  pause_active_tasks?: boolean
+  active_task_count?: number
+  next_run_at?: string
+  seconds_until_next_run?: number
+  last_run_at?: string
+  last_success_at?: string
+  last_error?: string
+  last_result?: Record<string, any>
+}
+
 function formatResultText(data: unknown) {
   if (typeof data === 'string') return data
   try {
@@ -714,16 +738,36 @@ function ConfigField({ field }: { field: FieldConfig }) {
         ? '必须大于或等于最小分钟；填写更大的范围可以降低固定节奏触发风控的概率。'
       : field.key === 'icloud_hme_auto_create_rate_limit_backoff_minutes'
         ? '如果 Apple 返回创建限流，后台会至少等待这么久后再尝试。'
+      : field.key === 'tempmail_archive_cleanup_enabled'
+        ? '开启后后台会定时扫描共享 TempMail 收件箱，先写入本地备份库，再删除超过保留窗口的旧邮件。'
+      : field.key === 'tempmail_archive_cleanup_interval_minutes'
+        ? '后台定时检查的间隔；只有邮件数达到阈值时才会自动清理。'
+      : field.key === 'tempmail_archive_cleanup_keep_recent_minutes'
+        ? '这个时间窗口内的邮件不会删除，用来保护正在等待验证码的任务。'
+      : field.key === 'tempmail_archive_cleanup_threshold'
+        ? '收件箱邮件数达到该数量才触发自动清理；手动执行会绕过这个阈值。'
+      : field.key === 'tempmail_archive_cleanup_pause_active_tasks'
+        ? '开启后只要后台还有注册、补抓、号码测试等活跃任务，归档清理会先跳过。'
+      : field.key === 'tempmail_archive_cleanup_mailbox'
+        ? '通常填写 iCloud HME 的转发目标邮箱；留空时后端默认使用当前转发目标。'
+      : field.key === 'tempmail_archive_cleanup_backup_path'
+        ? 'SQLite 备份库路径；容器内推荐 /runtime/tempmail_email_backups.db，可随运行数据持久化。'
       : field.key === 'chatgpt_resume_auth_allow_phone_verification'
-        ? '关闭时遇到 add_phone 只记录为需要手机号；开启后补抓 Auth 会调用已配置的手机验证码 API。'
+        ? '这是补抓 Auth 接码的唯一开关。关闭时补抓遇到 add_phone 只记录为需要手机号；开启后才会调用下面配置的接码渠道。'
       : field.key === 'chatgpt_subscription_auth_capture_retry_delays_seconds'
         ? '用英文逗号分隔，例如 5,10；遇到 add_phone 或临时认证错误时按这些间隔重试。'
       : field.key === 'chatgpt_phone_verification_provider'
-        ? '选择 add_phone 阶段使用的接码来源；本地接码网关会把 SMSBower 等平台隔离到独立项目里。'
+        ? '选择补抓 Auth add_phone 阶段使用的接码来源；本地接码网关会把 SMSBower 等平台隔离到独立项目里。'
       : field.key === 'local_phone_gateway_url'
         ? '主容器内访问独立接码网关的地址；Docker 网络内推荐 http://sms-gateway:8720。'
       : field.key === 'local_phone_gateway_token'
         ? '独立接码网关的 Bearer Token，只保存在主项目配置中，不会展示明文。'
+      : field.key === 'local_phone_gateway_auto_acquire_enabled'
+        ? '开启时先领取短信网关面板待用池号码，待用池为空会按网关配置自动新取号；关闭时只用待用池，避免自动创建订单。'
+      : field.key === 'local_phone_gateway_max_resend_attempts'
+        ? '同一个手机号未收到验证码时，继续触发 OpenAI 重发和网关下一条短信的最大次数；用于把一个号码用到无法发送为止。'
+      : field.key === 'local_phone_gateway_resend_interval_seconds'
+        ? '同一个手机号每次触发 OpenAI resend 前的等待时间，避免短时间连续重发。'
       : undefined
 
   return (
@@ -1679,6 +1723,9 @@ function ICloudHmeManagerSection({ form }: { form: any }) {
   const [availableImportPoolCount, setAvailableImportPoolCount] = useState(0)
   const [autoPoolStatus, setAutoPoolStatus] = useState<ICloudHmeAutoPoolStatus | null>(null)
   const [autoPoolStatusLoading, setAutoPoolStatusLoading] = useState(false)
+  const [archiveStatus, setArchiveStatus] = useState<TempMailArchiveCleanupStatus | null>(null)
+  const [archiveStatusLoading, setArchiveStatusLoading] = useState(false)
+  const [archiveRunning, setArchiveRunning] = useState(false)
   const [onlyReadyView, setOnlyReadyView] = useState(false)
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = useState(20)
@@ -1696,6 +1743,18 @@ function ICloudHmeManagerSection({ form }: { form: any }) {
       setAutoPoolStatus(null)
     } finally {
       setAutoPoolStatusLoading(false)
+    }
+  }
+
+  const loadArchiveStatus = async () => {
+    setArchiveStatusLoading(true)
+    try {
+      const data = await apiFetch('/tempmail-archive/status')
+      setArchiveStatus(data || null)
+    } catch {
+      setArchiveStatus(null)
+    } finally {
+      setArchiveStatusLoading(false)
     }
   }
 
@@ -1734,6 +1793,7 @@ function ICloudHmeManagerSection({ form }: { form: any }) {
       setPage(Number(data?.page || nextPage) || 1)
       setPageSize(Number(data?.size || nextPageSize) || nextPageSize)
       loadAutoPoolStatus().catch(() => {})
+      loadArchiveStatus().catch(() => {})
     } catch (e: any) {
       message.error(e?.message || '读取 iCloud HME 别名失败')
     } finally {
@@ -1744,7 +1804,39 @@ function ICloudHmeManagerSection({ form }: { form: any }) {
   useEffect(() => {
     loadAliases().catch(() => {})
     loadAutoPoolStatus().catch(() => {})
+    loadArchiveStatus().catch(() => {})
   }, [])
+
+  const runArchiveCleanup = async () => {
+    setArchiveRunning(true)
+    try {
+      const result = await apiFetch('/tempmail-archive/run', {
+        method: 'POST',
+        body: JSON.stringify({
+          force: true,
+          ignore_active_tasks: false,
+          delete: true,
+        }),
+      })
+      setArchiveStatus((prev) => ({
+        ...(prev || {}),
+        last_result: result || {},
+        last_error: String(result?.error || result?.last_error || ''),
+      }))
+      if (result?.reason === 'active_tasks') {
+        message.warning(`当前有 ${Number(result?.active_task_count || 0)} 个活跃任务，已跳过清理`)
+      } else if (result?.ok) {
+        message.success(`归档清理完成：归档 ${Number(result?.archived || 0)} 封，删除 ${Number(result?.deleted || 0)} 封`)
+      } else {
+        message.warning(result?.error || '归档清理已执行，但存在未完成项')
+      }
+      await loadArchiveStatus()
+    } catch (e: any) {
+      message.error(e?.message || '归档清理失败')
+    } finally {
+      setArchiveRunning(false)
+    }
+  }
 
   const syncLiveAliases = async () => {
     const values = form.getFieldsValue(true)
@@ -1962,6 +2054,11 @@ function ICloudHmeManagerSection({ form }: { form: any }) {
   const displayedAliases = aliases
   const statusReadyCount = Number(autoPoolStatus?.ready_count ?? availableImportPoolCount) || 0
   const statusStockLimit = Number(autoPoolStatus?.stock_limit || 0) || 0
+  const archiveLastResult = archiveStatus?.last_result || {}
+  const archiveEmailCount = Number(archiveLastResult.email_count || 0) || 0
+  const archiveArchivedCount = Number(archiveLastResult.archived || 0) || 0
+  const archiveDeletedCount = Number(archiveLastResult.deleted || 0) || 0
+  const archiveActiveTaskCount = Number(archiveStatus?.active_task_count || archiveLastResult.active_task_count || 0) || 0
 
   return (
     <Card
@@ -2039,6 +2136,63 @@ function ICloudHmeManagerSection({ form }: { form: any }) {
           </Typography.Text>
           <Typography.Text type={autoPoolStatus?.last_error ? 'danger' : 'secondary'}>
             最近错误: {autoPoolStatus?.last_error || '-'}
+          </Typography.Text>
+        </Space>
+      </div>
+      <div
+        style={{
+          marginBottom: 16,
+          padding: 12,
+          border: '1px solid rgba(82, 196, 26, 0.22)',
+          borderRadius: 8,
+          background: 'rgba(82, 196, 26, 0.04)',
+        }}
+      >
+        <Space wrap size={[8, 8]} style={{ width: '100%', justifyContent: 'space-between' }}>
+          <Space wrap>
+            <Tag color={archiveStatus?.enabled ? 'green' : 'default'}>
+              归档清理: {archiveStatus?.enabled ? '开启' : '关闭'}
+            </Tag>
+            <Tag color={archiveStatus?.running ? 'blue' : 'default'}>
+              调度线程: {archiveStatus?.running ? '运行中' : '未运行'}
+            </Tag>
+            <Tag color={archiveActiveTaskCount > 0 ? 'gold' : 'green'}>
+              活跃任务: {archiveActiveTaskCount}
+            </Tag>
+            <Tag color="cyan">最近扫描: {archiveEmailCount || '-'}</Tag>
+            <Tag color="geekblue">归档: {archiveArchivedCount || '-'}</Tag>
+            <Tag color="purple">删除: {archiveDeletedCount || '-'}</Tag>
+          </Space>
+          <Space wrap>
+            <Button size="small" loading={archiveStatusLoading} onClick={() => loadArchiveStatus()}>
+              刷新归档状态
+            </Button>
+            <Button size="small" type="primary" loading={archiveRunning} onClick={runArchiveCleanup}>
+              立即归档清理
+            </Button>
+          </Space>
+        </Space>
+        <Space wrap size={[16, 6]} style={{ marginTop: 8 }}>
+          <Typography.Text type="secondary">
+            归档邮箱: {archiveStatus?.mailbox || '-'}
+          </Typography.Text>
+          <Typography.Text type="secondary">
+            下次清理: {formatDateTimeText(archiveStatus?.next_run_at)}
+          </Typography.Text>
+          <Typography.Text type="secondary">
+            剩余: {formatDurationText(archiveStatus?.seconds_until_next_run)}
+          </Typography.Text>
+          <Typography.Text type="secondary">
+            保留最近: {archiveStatus?.keep_recent_minutes || '-'} 分钟
+          </Typography.Text>
+          <Typography.Text type="secondary">
+            触发阈值: {archiveStatus?.threshold || '-'} 封
+          </Typography.Text>
+          <Typography.Text type="secondary">
+            备份: {archiveStatus?.backup_path || '-'}
+          </Typography.Text>
+          <Typography.Text type={archiveStatus?.last_error ? 'danger' : 'secondary'}>
+            最近错误: {archiveStatus?.last_error || '-'}
           </Typography.Text>
         </Space>
       </div>
@@ -2475,6 +2629,9 @@ export default function Settings() {
       if (!data.local_phone_gateway_service_alias) {
         data.local_phone_gateway_service_alias = 'chatgpt'
       }
+      if (data.local_phone_gateway_auto_acquire_enabled === '') {
+        data.local_phone_gateway_auto_acquire_enabled = true
+      }
       if (!data.local_phone_gateway_timeout_seconds) {
         data.local_phone_gateway_timeout_seconds = '180'
       }
@@ -2483,6 +2640,12 @@ export default function Settings() {
       }
       if (!data.local_phone_gateway_max_attempts) {
         data.local_phone_gateway_max_attempts = '3'
+      }
+      if (!data.local_phone_gateway_max_resend_attempts) {
+        data.local_phone_gateway_max_resend_attempts = '20'
+      }
+      if (!data.local_phone_gateway_resend_interval_seconds) {
+        data.local_phone_gateway_resend_interval_seconds = '30'
       }
       if (!data.cloudmail_timeout) {
         data.cloudmail_timeout = 30
@@ -2520,8 +2683,28 @@ export default function Settings() {
       if (!data.icloud_hme_auto_create_rate_limit_backoff_minutes) {
         data.icloud_hme_auto_create_rate_limit_backoff_minutes = '360'
       }
+      if (!data.tempmail_archive_cleanup_interval_minutes) {
+        data.tempmail_archive_cleanup_interval_minutes = '30'
+      }
+      if (!data.tempmail_archive_cleanup_keep_recent_minutes) {
+        data.tempmail_archive_cleanup_keep_recent_minutes = '60'
+      }
+      if (!data.tempmail_archive_cleanup_threshold) {
+        data.tempmail_archive_cleanup_threshold = '100'
+      }
+      if (!data.tempmail_archive_cleanup_mailbox) {
+        data.tempmail_archive_cleanup_mailbox = data.icloud_forward_to || 'b@cccy.me'
+      }
+      if (!data.tempmail_archive_cleanup_backup_path) {
+        data.tempmail_archive_cleanup_backup_path = '/runtime/tempmail_email_backups.db'
+      }
       data.tempmail_permanent = parseBooleanConfigValue(data.tempmail_permanent)
       data.icloud_hme_auto_create_enabled = parseBooleanConfigValue(data.icloud_hme_auto_create_enabled)
+      data.tempmail_archive_cleanup_enabled = parseBooleanConfigValue(data.tempmail_archive_cleanup_enabled)
+      data.tempmail_archive_cleanup_pause_active_tasks =
+        data.tempmail_archive_cleanup_pause_active_tasks === ''
+          ? true
+          : parseBooleanConfigValue(data.tempmail_archive_cleanup_pause_active_tasks)
       data.proxy_pool_cooldown_enabled = data.proxy_pool_cooldown_enabled === '' ? true : parseBooleanConfigValue(data.proxy_pool_cooldown_enabled)
       data.cfworker_domains = parseStoredDomainList(data.cfworker_domains)
       data.cfworker_enabled_domains = parseStoredDomainList(data.cfworker_enabled_domains)
@@ -2542,6 +2725,7 @@ export default function Settings() {
       data.chatgpt_resume_auth_allow_phone_verification = parseBooleanConfigValue(
         data.chatgpt_resume_auth_allow_phone_verification,
       )
+      data.local_phone_gateway_auto_acquire_enabled = parseBooleanConfigValue(data.local_phone_gateway_auto_acquire_enabled)
       data.external_subscription_api_enabled = parseBooleanConfigValue(data.external_subscription_api_enabled)
       form.setFieldsValue(data)
     })
@@ -2587,6 +2771,34 @@ export default function Settings() {
           Number.parseInt(String(values.icloud_hme_auto_create_rate_limit_backoff_minutes || '360'), 10) || 360,
         ),
       )
+      values.tempmail_archive_cleanup_enabled = parseBooleanConfigValue(values.tempmail_archive_cleanup_enabled)
+      values.tempmail_archive_cleanup_pause_active_tasks = parseBooleanConfigValue(
+        values.tempmail_archive_cleanup_pause_active_tasks,
+      )
+      values.tempmail_archive_cleanup_interval_minutes = String(
+        Math.max(
+          1,
+          Number.parseInt(String(values.tempmail_archive_cleanup_interval_minutes || '30'), 10) || 30,
+        ),
+      )
+      values.tempmail_archive_cleanup_keep_recent_minutes = String(
+        Math.max(
+          1,
+          Number.parseInt(String(values.tempmail_archive_cleanup_keep_recent_minutes || '60'), 10) || 60,
+        ),
+      )
+      values.tempmail_archive_cleanup_threshold = String(
+        Math.max(
+          1,
+          Number.parseInt(String(values.tempmail_archive_cleanup_threshold || '100'), 10) || 100,
+        ),
+      )
+      values.tempmail_archive_cleanup_mailbox = String(
+        values.tempmail_archive_cleanup_mailbox || values.icloud_forward_to || 'b@cccy.me',
+      ).trim() || 'b@cccy.me'
+      values.tempmail_archive_cleanup_backup_path = String(
+        values.tempmail_archive_cleanup_backup_path || '/runtime/tempmail_email_backups.db',
+      ).trim() || '/runtime/tempmail_email_backups.db'
       values.proxy_pool_cooldown_enabled = parseBooleanConfigValue(values.proxy_pool_cooldown_enabled)
       values.tempmail_mode = values.tempmail_mode || 'fixed_domain'
       values.contribution_enabled = parseBooleanConfigValue(values.contribution_enabled)
@@ -2604,6 +2816,7 @@ export default function Settings() {
       values.chatgpt_resume_auth_allow_phone_verification = parseBooleanConfigValue(
         values.chatgpt_resume_auth_allow_phone_verification,
       )
+      values.local_phone_gateway_auto_acquire_enabled = parseBooleanConfigValue(values.local_phone_gateway_auto_acquire_enabled)
       values.external_subscription_api_enabled = parseBooleanConfigValue(values.external_subscription_api_enabled)
       values.external_subscription_api_token = String(values.external_subscription_api_token || '').trim()
       values.chatgpt_access_token_only_zero_amount_stop_threshold = String(
@@ -2625,6 +2838,8 @@ export default function Settings() {
       values.local_phone_gateway_timeout_seconds = String(values.local_phone_gateway_timeout_seconds || '180').trim() || '180'
       values.local_phone_gateway_poll_interval_seconds = String(values.local_phone_gateway_poll_interval_seconds || '5').trim() || '5'
       values.local_phone_gateway_max_attempts = String(values.local_phone_gateway_max_attempts || '3').trim() || '3'
+      values.local_phone_gateway_max_resend_attempts = String(values.local_phone_gateway_max_resend_attempts || '20').trim() || '20'
+      values.local_phone_gateway_resend_interval_seconds = String(values.local_phone_gateway_resend_interval_seconds || '30').trim() || '30'
 
       await apiFetch('/config', { method: 'PUT', body: JSON.stringify({ data: values }) })
       form.setFieldsValue({
@@ -2638,6 +2853,13 @@ export default function Settings() {
         icloud_hme_auto_create_interval_min_minutes: values.icloud_hme_auto_create_interval_min_minutes,
         icloud_hme_auto_create_interval_max_minutes: values.icloud_hme_auto_create_interval_max_minutes,
         icloud_hme_auto_create_rate_limit_backoff_minutes: values.icloud_hme_auto_create_rate_limit_backoff_minutes,
+        tempmail_archive_cleanup_enabled: values.tempmail_archive_cleanup_enabled,
+        tempmail_archive_cleanup_interval_minutes: values.tempmail_archive_cleanup_interval_minutes,
+        tempmail_archive_cleanup_keep_recent_minutes: values.tempmail_archive_cleanup_keep_recent_minutes,
+        tempmail_archive_cleanup_threshold: values.tempmail_archive_cleanup_threshold,
+        tempmail_archive_cleanup_pause_active_tasks: values.tempmail_archive_cleanup_pause_active_tasks,
+        tempmail_archive_cleanup_mailbox: values.tempmail_archive_cleanup_mailbox,
+        tempmail_archive_cleanup_backup_path: values.tempmail_archive_cleanup_backup_path,
         contribution_enabled: values.contribution_enabled,
         chatgpt_enable_team_invite: values.chatgpt_enable_team_invite,
         chatgpt_team_invite_deferred_activation: values.chatgpt_team_invite_deferred_activation,
@@ -2655,9 +2877,12 @@ export default function Settings() {
         local_phone_gateway_url: values.local_phone_gateway_url,
         local_phone_gateway_token: values.local_phone_gateway_token,
         local_phone_gateway_service_alias: values.local_phone_gateway_service_alias,
+        local_phone_gateway_auto_acquire_enabled: values.local_phone_gateway_auto_acquire_enabled,
         local_phone_gateway_timeout_seconds: values.local_phone_gateway_timeout_seconds,
         local_phone_gateway_poll_interval_seconds: values.local_phone_gateway_poll_interval_seconds,
         local_phone_gateway_max_attempts: values.local_phone_gateway_max_attempts,
+        local_phone_gateway_max_resend_attempts: values.local_phone_gateway_max_resend_attempts,
+        local_phone_gateway_resend_interval_seconds: values.local_phone_gateway_resend_interval_seconds,
         external_subscription_api_enabled: values.external_subscription_api_enabled,
         external_subscription_api_token: values.external_subscription_api_token,
       })

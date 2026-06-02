@@ -569,6 +569,11 @@ class RestoredEmailService:
         )
         return code
 
+    def mark_verification_message_processed(self, message_id: str | None) -> None:
+        normalized = str(message_id or "").strip()
+        if normalized:
+            self._before_ids.add(normalized)
+
     def export_state(self) -> dict[str, Any]:
         return {
             **dict(self._state),

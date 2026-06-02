@@ -252,8 +252,8 @@ class BaseChatGPTRegistrationModeAdapter(ABC):
         accounts: list[Account] = []
         for artifact in artifacts:
             extra = self._build_account_extra_for_artifact(artifact, result)
-            if extra.get("chatgpt_payment_already_paid"):
-                status = AccountStatus.SUBSCRIBED
+            if extra.get("chatgpt_payment_already_paid") or extra.get("chatgpt_account_unavailable"):
+                status = AccountStatus.INVALID
             elif extra.get("partial_auth") or extra.get("auth_level") == "access_token_only":
                 status = AccountStatus.PENDING_PAYMENT
             else:

@@ -18,9 +18,16 @@ from sqlmodel import Session, select
 from core.base_platform import Account, AccountStatus
 from core.config_store import config_store
 from core.db import AccountModel, engine
+from services.account_filters import filter_account_rows
 from services.external_apps import install, list_status, start, start_all, stop, stop_all
 from services.chatgpt_sync import backfill_chatgpt_account_to_cpa, get_cliproxy_sync_state
 from services.sub2api_sync import backfill_chatgpt_account_to_sub2api, get_sub2api_sync_state
+from services.chatgpt_core.gopay_phone import (
+    DEFAULT_GOPAY_PHONE_COUNTRY_CODE,
+    GOPAY_RECOGNIZED_COUNTRY_CODES_KEY,
+    normalize_gopay_recognized_country_codes,
+    split_gopay_phone_input,
+)
 
 router = APIRouter(prefix="/integrations", tags=["integrations"])
 
@@ -32,11 +39,29 @@ class BackfillRequest(BaseModel):
     pending_only: bool = False
     status: Optional[str] = None
     email: Optional[str] = None
+    manually_used: Optional[str] = None
+    auth_type: str = ""
+    subscription_type: str = ""
+    account_validity: str = ""
+    sub2api_state: str = ""
+
+
+def _optional_bool(value: Any) -> bool | None:
+    if value is None:
+        return None
+    text = str(value or "").strip().lower()
+    if not text:
+        return None
+    if text in {"1", "true", "yes", "on", "used"}:
+        return True
+    if text in {"0", "false", "no", "off", "unused"}:
+        return False
+    return None
 
 
 class GoPayOtpUidBinding(BaseModel):
     uid: str
-    phone_country_code: str = "86"
+    phone_country_code: str = DEFAULT_GOPAY_PHONE_COUNTRY_CODE
     phone_number: str
     package_name: str = ""
     title: str = ""
@@ -52,7 +77,7 @@ class GoPayOtpBindingsRequest(BaseModel):
 
 
 class GoPayOtpPhonePoolItem(BaseModel):
-    phone_country_code: str = "86"
+    phone_country_code: str = DEFAULT_GOPAY_PHONE_COUNTRY_CODE
     phone_number: str
     uid: str = ""
     status: str = "ready"
@@ -81,6 +106,7 @@ class GoPayOtpSettingsRequest(BaseModel):
     smsforwarder_secret: Optional[str] = None
     clear_secret: bool = False
     otp_auto_resend_delay_seconds: Optional[int] = None
+    recognized_country_codes: Optional[Any] = None
 
 
 class GoPayOtpStartByUidRequest(BaseModel):
@@ -273,7 +299,7 @@ GOPAY_OTP_ADMIN_HTML = r"""<!doctype html>
       <h2>UID 与手机号绑定</h2>
       <div class="cols">
         <div><label>UID</label><input id="uid" placeholder="99910283" /></div>
-        <div><label>区号</label><input id="cc" value="86" /></div>
+        <div><label>区号</label><input id="cc" value="62" /></div>
         <div class="wide"><label>手机号</label><input id="phone" placeholder="15335521131" /></div>
         <div class="wide"><label>包名</label><input id="pkg" value="com.whatsapp" /></div>
         <div><label>标题</label><input id="title" value="GoPay" /></div>
@@ -385,7 +411,7 @@ GOPAY_OTP_ADMIN_HTML = r"""<!doctype html>
     document.getElementById('addBindingBtn').onclick = async () => {
       const next = {
         uid: document.getElementById('uid').value.trim(),
-        phone_country_code: document.getElementById('cc').value.replace(/\D/g, '') || '86',
+        phone_country_code: document.getElementById('cc').value.replace(/\D/g, '') || '62',
         phone_number: document.getElementById('phone').value.replace(/\D/g, ''),
         package_name: document.getElementById('pkg').value.trim(),
         title: document.getElementById('title').value.trim(),
@@ -516,6 +542,20 @@ def _save_auto_resend_delay_seconds(value: Any) -> None:
     config_store.set(GOPAY_OTP_AUTO_RESEND_DELAY_SECONDS_KEY, str(_normalize_auto_resend_delay(value)))
 
 
+def _load_recognized_country_codes() -> list[str]:
+    raw = config_store.get(GOPAY_RECOGNIZED_COUNTRY_CODES_KEY, "")
+    try:
+        parsed = json.loads(str(raw or ""))
+    except Exception:
+        parsed = raw
+    return normalize_gopay_recognized_country_codes(parsed)
+
+
+def _save_recognized_country_codes(value: Any) -> None:
+    codes = normalize_gopay_recognized_country_codes(value)
+    config_store.set(GOPAY_RECOGNIZED_COUNTRY_CODES_KEY, json.dumps(codes, ensure_ascii=False))
+
+
 def _status_text(status: Any, detail: Any = "") -> str:
     key = str(status or "").strip()
     if key in GOPAY_STATUS_TEXT:
@@ -559,13 +599,17 @@ def _global_gopay_pin_configured() -> bool:
 def _normalize_binding(value: Any) -> Optional[dict[str, Any]]:
     data = value if isinstance(value, dict) else {}
     uid = str(data.get("uid") or "").strip()
-    phone_number = _digits(data.get("phone_number"))
-    if not uid or not phone_number:
+    phone = split_gopay_phone_input(
+        data.get("phone_country_code") or DEFAULT_GOPAY_PHONE_COUNTRY_CODE,
+        data.get("phone_number"),
+        _load_recognized_country_codes(),
+    )
+    if not uid or not phone["phone_number"]:
         return None
     return {
         "uid": uid,
-        "phone_country_code": _digits(data.get("phone_country_code") or "86") or "86",
-        "phone_number": phone_number,
+        "phone_country_code": phone["phone_country_code"],
+        "phone_number": phone["phone_number"],
         "package_name": str(data.get("package_name") or "").strip(),
         "title": str(data.get("title") or "").strip(),
         "label": str(data.get("label") or "").strip(),
@@ -623,8 +667,12 @@ def _find_uid_binding(uid: Any, *, enabled_only: bool = True) -> Optional[dict[s
 
 def _normalize_phone_pool_item(value: Any) -> Optional[dict[str, Any]]:
     data = value if isinstance(value, dict) else {}
-    phone_number = _digits(data.get("phone_number"))
-    if not phone_number:
+    phone = split_gopay_phone_input(
+        data.get("phone_country_code") or DEFAULT_GOPAY_PHONE_COUNTRY_CODE,
+        data.get("phone_number"),
+        _load_recognized_country_codes(),
+    )
+    if not phone["phone_number"]:
         return None
     status = str(data.get("status") or "ready").strip().lower()
     if status not in GOPAY_PHONE_POOL_STATUSES:
@@ -635,8 +683,8 @@ def _normalize_phone_pool_item(value: Any) -> Optional[dict[str, Any]]:
     except Exception:
         normalized_account_id = None
     return {
-        "phone_country_code": _digits(data.get("phone_country_code") or "86") or "86",
-        "phone_number": phone_number,
+        "phone_country_code": phone["phone_country_code"],
+        "phone_number": phone["phone_number"],
         "uid": str(data.get("uid") or "").strip(),
         "status": status,
         "source": str(data.get("source") or "manual").strip() or "manual",
@@ -711,7 +759,7 @@ def _upsert_phone_pool_from_binding(
     existing = dict(pool[existing_index]) if existing_index >= 0 else {}
     next_item = {
         **existing,
-        "phone_country_code": binding.get("phone_country_code", "86"),
+        "phone_country_code": binding.get("phone_country_code", DEFAULT_GOPAY_PHONE_COUNTRY_CODE),
         "phone_number": binding.get("phone_number", ""),
         "uid": binding.get("uid", ""),
         "status": status or existing.get("status") or "ready",
@@ -779,7 +827,7 @@ def _ensure_phone_pool_from_bindings(bindings: list[dict[str, Any]]) -> list[dic
         if not key or key in existing_keys:
             continue
         normalized = _normalize_phone_pool_item({
-            "phone_country_code": binding.get("phone_country_code", "86"),
+            "phone_country_code": binding.get("phone_country_code", DEFAULT_GOPAY_PHONE_COUNTRY_CODE),
             "phone_number": binding.get("phone_number", ""),
             "uid": binding.get("uid", ""),
             "status": "ready",
@@ -1176,8 +1224,6 @@ def _extract_phone_number(text: str) -> str:
     for candidate in candidates:
         digits = _digits(candidate)
         if 10 <= len(digits) <= 15:
-            if len(digits) == 13 and digits.startswith("86"):
-                digits = digits[2:]
             return digits
     return ""
 
@@ -1217,7 +1263,7 @@ def _parse_smsforwarder_content(data: dict[str, Any], body_text: str) -> dict[st
         _first_text(data, "phone_country_code", "country_code", "cc", "CC")
         or fields.get("phone_country_code")
         or _extract_inline_field(raw, ("CC", "COUNTRY_CODE", "PHONE_COUNTRY_CODE", "区号"), ("PHONE", "PHONE_NUMBER", "MOBILE", "PKG", "PACKAGE_NAME", "TITLE", "MSG", "MESSAGE", "DEVICE", "UID", "手机号", "包名", "标题", "内容", "应用名", "来自"))
-        or "86"
+        or DEFAULT_GOPAY_PHONE_COUNTRY_CODE
     ).strip()
     phone_number = (
         _first_text(data, "phone_number", "phoneNumber", "phone", "mobile")
@@ -1232,17 +1278,21 @@ def _parse_smsforwarder_content(data: dict[str, Any], body_text: str) -> dict[st
         or ""
     ).strip().splitlines()[0].strip().split()[0].upper()
     otp = _extract_otp(message)
-    phone_number = _digits(phone_number)
+    phone = split_gopay_phone_input(
+        phone_country_code,
+        phone_number,
+        _load_recognized_country_codes(),
+    )
     if not event_type:
-        if phone_number and not otp:
+        if phone["phone_number"] and not otp:
             event_type = "GOPAY_BIND"
         elif otp:
             event_type = "GOPAY_OTP"
     return {
         "type": event_type,
         "uid": uid,
-        "phone_country_code": _digits(phone_country_code) or "86",
-        "phone_number": phone_number,
+        "phone_country_code": phone["phone_country_code"],
+        "phone_number": phone["phone_number"],
         "package_name": package_name,
         "title": title,
         "app_name": str(_first_text(data, "app_name", "appName") or fields.get("app_name") or "").strip(),
@@ -1374,6 +1424,8 @@ def _adapter_state() -> dict[str, Any]:
         },
         "secret_enabled": bool(str(config_store.get(GOPAY_SMSFORWARDER_SECRET_KEY, "") or "").strip()),
         "otp_auto_resend_delay_seconds": _load_auto_resend_delay_seconds(),
+        "default_phone_country_code": DEFAULT_GOPAY_PHONE_COUNTRY_CODE,
+        "recognized_country_codes": _load_recognized_country_codes(),
         "webhook_path": GOPAY_WEBHOOK_PATH,
         "message_template": GOPAY_SMSFORWARDER_TEMPLATE,
         "bind_message_template": GOPAY_SMSFORWARDER_BIND_TEMPLATE,
@@ -1441,7 +1493,14 @@ def backfill_integrations(body: BackfillRequest):
         if body.email:
             q = q.where(AccountModel.email.contains(body.email))
 
-        rows = s.exec(q).all()
+        rows = filter_account_rows(
+            s.exec(q).all(),
+            manually_used=_optional_bool(body.manually_used),
+            auth_type=body.auth_type,
+            subscription_type=body.subscription_type,
+            account_validity_filter=body.account_validity,
+            sub2api_state=body.sub2api_state,
+        )
         if body.pending_only:
             def _is_pending_target(row: AccountModel) -> bool:
                 if row.platform != "chatgpt":
@@ -1581,6 +1640,8 @@ def update_gopay_otp_adapter_settings(body: GoPayOtpSettingsRequest):
         config_store.set(GOPAY_SMSFORWARDER_SECRET_KEY, str(body.smsforwarder_secret or "").strip())
     if body.otp_auto_resend_delay_seconds is not None:
         _save_auto_resend_delay_seconds(body.otp_auto_resend_delay_seconds)
+    if body.recognized_country_codes is not None:
+        _save_recognized_country_codes(body.recognized_country_codes)
     return _adapter_state()
 
 
@@ -1744,7 +1805,7 @@ def _handle_smsforwarder_bind(parsed: dict[str, Any], event_base: dict[str, Any]
 
     next_binding = _normalize_binding({
         "uid": uid,
-        "phone_country_code": parsed.get("phone_country_code") or "86",
+        "phone_country_code": parsed.get("phone_country_code") or DEFAULT_GOPAY_PHONE_COUNTRY_CODE,
         "phone_number": phone_number,
         "package_name": parsed.get("package_name") or "",
         "title": parsed.get("title") or "",
