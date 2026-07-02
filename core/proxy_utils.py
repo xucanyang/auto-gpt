@@ -150,11 +150,21 @@ def resolve_probe_candidate_proxies(
             from .db import engine, ProxyModel
             with Session(engine) as session:
                 proxy_record = session.exec(select(ProxyModel).where(ProxyModel.url == explicit_proxy)).first()
-                if proxy_record:
+                if proxy_record and getattr(proxy_record, "exit_ip", ""):
                     country = str(getattr(proxy_record, "exit_country_code", "") or "unknown").strip() or "unknown"
                     exit_ip = str(getattr(proxy_record, "exit_ip", "") or "").strip()
                     exit_ip_str = f" exit_ip={exit_ip}" if exit_ip else ""
                     source = f"specified country={country}{exit_ip_str}"
+                else:
+                    import requests
+                    proxies = {"http": explicit_proxy, "https": explicit_proxy}
+                    resp = requests.get("http://ip-api.com/json", proxies=proxies, timeout=5)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        country = data.get("countryCode") or "unknown"
+                        exit_ip = data.get("query") or ""
+                        exit_ip_str = f" exit_ip={exit_ip}" if exit_ip else ""
+                        source = f"specified (live) country={country}{exit_ip_str}"
         except Exception:
             pass
             
