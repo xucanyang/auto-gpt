@@ -161,9 +161,11 @@ def resolve_probe_candidate_proxies(
             if not url or any(existing[0] == url for existing in candidates):
                 continue
             country = str((candidate.get("exit_country_code") if isinstance(candidate, dict) else getattr(candidate, "exit_country_code", "")) or "unknown").strip() or "unknown"
+            exit_ip = str((candidate.get("exit_ip") if isinstance(candidate, dict) else getattr(candidate, "exit_ip", "")) or "").strip()
             score = candidate.get("health_score") if isinstance(candidate, dict) else getattr(candidate, "health_score", None)
             latency = int((candidate.get("latency_ms") if isinstance(candidate, dict) else getattr(candidate, "latency_ms", 0)) or 0)
-            source = f"pool country={country} score={score} latency={latency}ms"
+            exit_ip_str = f" exit_ip={exit_ip}" if exit_ip else ""
+            source = f"pool country={country}{exit_ip_str} score={score} latency={latency}ms"
             candidates.append((url, proxy_pool, source))
         if mode == "pool" and not candidates:
             country_text = country_code or "不限"

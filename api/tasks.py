@@ -9939,8 +9939,8 @@ def _run_batch_probe_local_status(task_id: str, account_ids: list[int], params: 
                 success_probe = False
                 last_err = ""
                 for attempt_idx, (proxy_url, proxy_pool, source) in enumerate(candidates, start=1):
-                    if len(candidates) > 1:
-                        task_log(f" -> [尝试 {attempt_idx}/{len(candidates)}] 使用代理: {source}")
+                    proxy_display = proxy_url or "直连"
+                    task_log(f" -> [尝试 {attempt_idx}/{len(candidates)}] \n    使用代理: {proxy_display}\n    代理信息: {source}")
                     try:
                         res = sync_chatgpt_account_local_status(session, acc, proxy=proxy_url)
                         plan = res.get("probe", {}).get("subscription", {}).get("plan", "unknown")
