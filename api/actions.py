@@ -3,6 +3,8 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlmodel import Session, select
 from pydantic import BaseModel
 import json
+import random
+import time
 from typing import Any
 from core.db import AccountModel, get_session
 from core.base_platform import RegisterConfig
@@ -651,7 +653,29 @@ def execute_batch_action(
             }
         )
 
-    for acc_model in accounts:
+    delay_min = 0.0
+    delay_max = 0.0
+    if isinstance(body.params, dict):
+        try:
+            delay_min = max(0.0, float(body.params.get("delay_seconds") or body.params.get("register_delay_seconds") or body.params.get("probe_delay_seconds") or 0.0))
+            delay_max = max(0.0, float(body.params.get("delay_max_seconds") or body.params.get("register_delay_max_seconds") or body.params.get("probe_delay_max_seconds") or 0.0))
+        except (ValueError, TypeError):
+            pass
+
+    next_start_time = 0.0
+
+    for idx, acc_model in enumerate(accounts):
+        if (delay_min > 0 or delay_max > 0) and idx > 0:
+            now = time.time()
+            wait_seconds = max(0.0, next_start_time - now)
+            if wait_seconds > 0:
+                time.sleep(wait_seconds)
+            chosen_delay = random.uniform(delay_min, delay_max) if delay_max > delay_min else delay_min
+            next_start_time = time.time() + chosen_delay
+        elif (delay_min > 0 or delay_max > 0) and idx == 0:
+            chosen_delay = random.uniform(delay_min, delay_max) if delay_max > delay_min else delay_min
+            next_start_time = time.time() + chosen_delay
+
         try:
             result = _execute_platform_action(instance, platform, acc_model, action_id, body.params, session)
             if platform == "chatgpt" and _action_should_auto_refresh_local_status(action_id, result, acc_model):

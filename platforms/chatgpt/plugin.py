@@ -405,23 +405,58 @@ class ChatGPTPlatform(BasePlatform):
 
         if action_id == "probe_local_status":
             from platforms.chatgpt.status_probe import probe_local_chatgpt_status
+            from core.proxy_utils import resolve_probe_candidate_proxies, is_proxy_error_text
 
-            probe_result = probe_local_chatgpt_status(a, proxy=proxy)
-            summary = (
-                f"认证={probe_result.get('auth', {}).get('state', 'unknown')}, "
-                f"订阅={probe_result.get('subscription', {}).get('plan', 'unknown')}, "
-                f"Codex={probe_result.get('codex', {}).get('state', 'unknown')}"
+            candidates = resolve_probe_candidate_proxies(
+                params,
+                fallback_proxy=proxy,
+                default_mode="specified" if proxy else "direct",
             )
-            return {
-                "ok": True,
-                "data": {
-                    "message": f"本地状态探测完成：{summary}",
-                    "probe": probe_result,
-                },
-                "account_extra_patch": {
-                    "chatgpt_local": probe_result,
-                },
-            }
+            last_error = None
+            for i, (proxy_url, proxy_pool, source) in enumerate(candidates):
+                try:
+                    probe_result = probe_local_chatgpt_status(a, proxy=proxy_url)
+                    auth_state = str(probe_result.get("auth", {}).get("state") or "").strip()
+                    if auth_state == "probe_failed" and i < len(candidates) - 1:
+                        if proxy_pool is not None and proxy_url:
+                            msg = str(probe_result.get("auth", {}).get("message") or "")
+                            if is_proxy_error_text(msg):
+                                try:
+                                    proxy_pool.report_fail(proxy_url)
+                                except Exception:
+                                    pass
+                        continue
+                    if proxy_pool is not None and proxy_url:
+                        try:
+                            proxy_pool.report_success(proxy_url)
+                        except Exception:
+                            pass
+                    summary = (
+                        f"认证={probe_result.get('auth', {}).get('state', 'unknown')}, "
+                        f"订阅={probe_result.get('subscription', {}).get('plan', 'unknown')}, "
+                        f"Codex={probe_result.get('codex', {}).get('state', 'unknown')}"
+                    )
+                    return {
+                        "ok": True,
+                        "data": {
+                            "message": f"本地状态探测完成：{summary}",
+                            "probe": probe_result,
+                        },
+                        "account_extra_patch": {
+                            "chatgpt_local": probe_result,
+                        },
+                    }
+                except Exception as exc:
+                    last_error = exc
+                    if proxy_pool is not None and proxy_url and is_proxy_error_text(str(exc)):
+                        try:
+                            proxy_pool.report_fail(proxy_url)
+                        except Exception:
+                            pass
+                    if i == len(candidates) - 1:
+                        raise
+            if last_error:
+                raise last_error
 
         if action_id == "sync_cliproxyapi_status":
             from services.cliproxyapi_sync import sync_chatgpt_cliproxyapi_status

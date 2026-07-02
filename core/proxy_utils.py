@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import ipaddress
-from typing import Optional
+from typing import Any, Optional
 from urllib.parse import unquote, urlsplit
 
 
@@ -56,6 +56,123 @@ def resolve_runtime_proxy_with_metadata(proxy_url: Optional[str] = None) -> tupl
     except Exception:
         pass
     return "", None, "direct"
+
+
+def resolve_probe_candidate_proxies(
+    params: Optional[dict] = None,
+    fallback_proxy: Optional[str] = None,
+    default_mode: str = "direct",
+) -> list[tuple[str, Any, str]]:
+    """为批量本地状态探测（或其他 Action）解析候选代理列表，支持参考注册的代理配置语义。"""
+    if params is None or not isinstance(params, dict):
+        params = {}
+
+    explicit_proxy = normalize_proxy_url(
+        params.get("proxy")
+        or params.get("proxy_url")
+        or params.get("register_proxy")
+        or params.get("probe_proxy")
+        or fallback_proxy
+    ) or ""
+    mode = str(
+        params.get("proxy_mode")
+        or params.get("register_proxy_mode")
+        or params.get("probe_proxy_mode")
+        or ""
+    ).strip().lower()
+
+    if not mode:
+        mode = "specified" if params.get("proxy") or params.get("proxy_url") or params.get("register_proxy") or params.get("probe_proxy") else default_mode
+
+    if mode in {"none", "no_proxy", "direct", "直连"}:
+        return [("", None, "direct")]
+
+    if mode in {"manual", "explicit"}:
+        mode = "specified"
+    if mode not in {"specified", "pool"}:
+        mode = "specified" if explicit_proxy else default_mode
+    if mode == "direct":
+        return [("", None, "direct")]
+
+    country_code = str(
+        params.get("proxy_country_code")
+        or params.get("register_proxy_country_code")
+        or params.get("probe_proxy_country_code")
+        or ""
+    ).strip().upper()
+
+    raw_failover = params.get("proxy_failover")
+    if raw_failover is None:
+        raw_failover = params.get("register_proxy_failover")
+    if raw_failover is None:
+        raw_failover = params.get("probe_proxy_failover")
+
+    failover = False
+    if raw_failover is not None:
+        if isinstance(raw_failover, bool):
+            failover = raw_failover
+        else:
+            text = str(raw_failover).strip().lower()
+            failover = text in {"1", "true", "yes", "on"}
+
+    try:
+        max_candidates = int(
+            float(
+                params.get("proxy_max_candidates")
+                or params.get("register_proxy_max_candidates")
+                or params.get("probe_proxy_max_candidates")
+                or 5
+            )
+        )
+    except Exception:
+        max_candidates = 5
+    max_candidates = max(1, min(100, max_candidates))
+
+    try:
+        min_score = float(
+            params.get("proxy_min_score")
+            or params.get("register_proxy_min_score")
+            or params.get("probe_proxy_min_score")
+            or 50
+        )
+    except Exception:
+        min_score = 50.0
+    min_score = max(0.0, min(100.0, min_score))
+
+    candidates: list[tuple[str, Any, str]] = []
+    if mode == "specified":
+        if not explicit_proxy:
+            raise RuntimeError("已选择指定代理模式，但代理地址为空")
+        candidates.append((explicit_proxy, None, "specified"))
+        if not failover:
+            return candidates
+
+    try:
+        from .proxy_pool import proxy_pool
+
+        pool_candidates = proxy_pool.get_candidate_records(
+            target="chatgpt",
+            country_code=country_code,
+            limit=max_candidates,
+            min_score=min_score,
+        )
+        for candidate in pool_candidates:
+            url = normalize_proxy_url(candidate.get("url") if isinstance(candidate, dict) else getattr(candidate, "url", "")) or ""
+            if not url or any(existing[0] == url for existing in candidates):
+                continue
+            country = str((candidate.get("exit_country_code") if isinstance(candidate, dict) else getattr(candidate, "exit_country_code", "")) or "unknown").strip() or "unknown"
+            score = candidate.get("health_score") if isinstance(candidate, dict) else getattr(candidate, "health_score", None)
+            latency = int((candidate.get("latency_ms") if isinstance(candidate, dict) else getattr(candidate, "latency_ms", 0)) or 0)
+            source = f"pool country={country} score={score} latency={latency}ms"
+            candidates.append((url, proxy_pool, source))
+        if mode == "pool" and not candidates:
+            country_text = country_code or "不限"
+            raise RuntimeError(f"代理池没有可用候选：target=chatgpt country={country_text} min_score={min_score:g}")
+    except Exception as exc:
+        if mode == "pool" and not candidates:
+            raise
+    return candidates or [("", None, "direct")]
+
 
 
 def build_requests_proxy_config(proxy_url: Optional[str]) -> Optional[dict[str, str]]:

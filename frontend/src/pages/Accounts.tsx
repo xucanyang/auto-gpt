@@ -1602,6 +1602,8 @@ export default function Accounts() {
   const [baxiCdkPoolSummaryLoading, setBaxiCdkPoolSummaryLoading] = useState(false)
   const [batchPaymentLinkConfigOpen, setBatchPaymentLinkConfigOpen] = useState(false)
   const [batchPaymentLinkForceRefresh, setBatchPaymentLinkForceRefresh] = useState(false)
+  const [batchProbeStatusConfigOpen, setBatchProbeStatusConfigOpen] = useState(false)
+  const [batchProbeStatusConfigScope, setBatchProbeStatusConfigScope] = useState<'selected' | 'all'>('selected')
 
   const [registerForm] = Form.useForm()
   const [addForm] = Form.useForm()
@@ -1611,12 +1613,14 @@ export default function Accounts() {
   const [baxiCdkSubmitForm] = Form.useForm()
   const [paypalBindingForm] = Form.useForm()
   const [batchPaymentLinkConfigForm] = Form.useForm()
+  const [batchProbeStatusConfigForm] = Form.useForm()
   const phoneBindingUsePoolValue = Form.useWatch('use_pool', phoneBindingTestForm)
   const phoneBindingPrefixSampleValue = Form.useWatch('prefix_sample_enabled', phoneBindingTestForm)
   const phoneBindingPrefixSampleSizeValue = Form.useWatch('prefix_sample_size', phoneBindingTestForm)
   const phoneBindingPrefixSampleFilterValue = Form.useWatch('prefix_sample_filter', phoneBindingTestForm)
   const phoneBindingPhoneLinesValue = Form.useWatch('phone_lines', phoneBindingTestForm)
   const phoneBindingProxyModeValue = Form.useWatch('proxy_mode', phoneBindingTestForm)
+  const probeProxyModeValue = Form.useWatch('proxy_mode', batchProbeStatusConfigForm)
   const baxiCdkUsePoolValue = Form.useWatch('use_pool', baxiCdkSubmitForm)
   const baxiCdkCodeLinesValue = Form.useWatch('code_lines', baxiCdkSubmitForm)
   const [registerMailProvider, setRegisterMailProvider] = useState('luckmail')
@@ -2587,6 +2591,42 @@ export default function Accounts() {
       return
     }
     await handleBatchResumeSubscriptionAuth(resumeAuthConfigScope, allowPhoneVerification)
+  }
+
+  const openBatchProbeStatusConfig = (scope: 'selected' | 'all') => {
+    setBatchProbeStatusConfigScope(scope)
+    batchProbeStatusConfigForm.resetFields()
+    batchProbeStatusConfigForm.setFieldsValue({
+      register_delay_seconds: 0,
+      register_delay_max_seconds: 0,
+      proxy_mode: 'pool',
+      proxy: '',
+      proxy_failover: false,
+      proxy_country_code: '',
+      proxy_min_score: 50,
+      proxy_max_candidates: 5,
+    })
+    setBatchProbeStatusConfigOpen(true)
+  }
+
+  const submitBatchProbeStatusConfig = async () => {
+    const values = await batchProbeStatusConfigForm.validateFields()
+    setBatchProbeStatusConfigOpen(false)
+    const customParams = {
+      proxy_mode: values.proxy_mode || 'pool',
+      proxy: values.proxy || '',
+      proxy_failover: Boolean(values.proxy_failover),
+      proxy_country_code: values.proxy_country_code || '',
+      proxy_min_score: Number(values.proxy_min_score ?? 50),
+      proxy_max_candidates: Number(values.proxy_max_candidates ?? 5),
+      register_delay_seconds: Number(values.register_delay_seconds ?? 0),
+      register_delay_max_seconds: Number(values.register_delay_max_seconds ?? 0),
+      probe_delay_seconds: Number(values.register_delay_seconds ?? 0),
+      probe_delay_max_seconds: Number(values.register_delay_max_seconds ?? 0),
+      delay_seconds: Number(values.register_delay_seconds ?? 0),
+      delay_max_seconds: Number(values.register_delay_max_seconds ?? 0),
+    }
+    await handleBatchStatusSync('probe', batchProbeStatusConfigScope, customParams)
   }
 
   const getResumeAuthScope = (): 'selected' | 'filtered' => (selectedRowKeys.length > 0 ? 'selected' : 'filtered')
@@ -4063,7 +4103,11 @@ export default function Accounts() {
     }
   }
 
-  const handleBatchStatusSync = async (kind: 'probe' | 'remote' | 'sub2api' | 'oaipay', scope: 'selected' | 'all') => {
+  const handleBatchStatusSync = async (
+    kind: 'probe' | 'remote' | 'sub2api' | 'oaipay',
+    scope: 'selected' | 'all',
+    customParams?: Record<string, unknown>,
+  ) => {
     if (currentPlatform !== 'chatgpt') return
 
     const loadingKey = `${kind}_${scope}` as typeof statusSyncLoading
@@ -4087,7 +4131,7 @@ export default function Accounts() {
     const toastKey = `status-sync:${loadingKey}`
 
     const body: Record<string, unknown> = {
-      params: {},
+      params: customParams || {},
     }
 
     if (scope === 'selected') {
@@ -5563,6 +5607,14 @@ export default function Accounts() {
       disabled: getStatusSyncScope() === 'selected' ? selectedRowKeys.length === 0 : total === 0,
     },
     {
+      key: `probe:${getStatusSyncScope()}:config`,
+      label:
+        getStatusSyncScope() === 'selected'
+          ? `同步所选本地状态 (${selectedRowKeys.length})，配置代理与延时`
+          : `同步当前筛选本地状态 (${total})，配置代理与延时`,
+      disabled: getStatusSyncScope() === 'selected' ? selectedRowKeys.length === 0 : total === 0,
+    },
+    {
       key: `remote:${getStatusSyncScope()}`,
       label:
         getStatusSyncScope() === 'selected'
@@ -5910,8 +5962,14 @@ export default function Accounts() {
         }}
         statusSyncMenuItems={statusSyncMenuItems}
         onStatusSyncClick={({ key }) => {
-          const [kind, scope] = String(key).split(':') as ['probe' | 'remote' | 'sub2api' | 'oaipay', 'selected' | 'all']
-          void handleBatchStatusSync(kind, scope)
+          const rawKey = String(key)
+          const [kind, scopeKey, modeKey] = rawKey.split(':')
+          const scope = scopeKey as 'selected' | 'all'
+          if (kind === 'probe' && modeKey === 'config') {
+            openBatchProbeStatusConfig(scope)
+            return
+          }
+          void handleBatchStatusSync(kind as any, scope)
         }}
         statusSyncLoading={statusSyncLoading}
         resumeAuthMenuItems={resumeAuthMenuItems}
@@ -6142,6 +6200,78 @@ export default function Accounts() {
           <Form.Item name="allow_phone_verification" valuePropName="checked" initialValue={false}>
             <Checkbox>允许 add_phone 后使用手机验证码 API</Checkbox>
           </Form.Item>
+        </Form>
+      </Modal>
+
+      <Modal
+        title="批量同步本地状态配置"
+        open={batchProbeStatusConfigOpen}
+        onCancel={() => setBatchProbeStatusConfigOpen(false)}
+        onOk={submitBatchProbeStatusConfig}
+        confirmLoading={Boolean(statusSyncLoading)}
+        okText="开始同步"
+        cancelText="取消"
+        width={720}
+        maskClosable={false}
+      >
+        <Form form={batchProbeStatusConfigForm} layout="vertical">
+          <Alert
+            type="info"
+            showIcon
+            style={{ marginBottom: 16 }}
+            message={
+              batchProbeStatusConfigScope === 'selected'
+                ? `范围：当前选中 ${selectedRowKeys.length} 个账号`
+                : `范围：当前筛选结果 ${total} 个账号`
+            }
+            description="可参考注册任务设置请求代理模式、可用代理失败后重试以及每次处理账号之间的随机延时时间。"
+          />
+          <Form.Item label="每次请求间延时 (秒)">
+            <Space style={{ display: 'flex' }}>
+              <Form.Item name="register_delay_seconds" noStyle initialValue={0}>
+                <InputNumber min={0} max={3600} step={1} style={{ width: 140 }} placeholder="最小延时" />
+              </Form.Item>
+              <span>至</span>
+              <Form.Item name="register_delay_max_seconds" noStyle initialValue={0}>
+                <InputNumber min={0} max={3600} step={1} style={{ width: 140 }} placeholder="最大延时" />
+              </Form.Item>
+              <span style={{ color: '#888', marginLeft: 8 }}>（都填 0 为无延时，填不同数值则在区间内随机）</span>
+            </Space>
+          </Form.Item>
+
+          <Form.Item label="代理模式" name="proxy_mode" initialValue="pool">
+            <Select style={{ width: 260 }}>
+              <Select.Option value="pool">代理池自动选取</Select.Option>
+              <Select.Option value="specified">手动指定代理</Select.Option>
+              <Select.Option value="direct">直连 (不使用代理)</Select.Option>
+            </Select>
+          </Form.Item>
+
+          {probeProxyModeValue === 'specified' && (
+            <Form.Item label="代理地址" name="proxy" rules={[{ required: true, message: '请输入代理地址' }]}>
+              <Input placeholder="http://user:pass@host:port 或 socks5://..." />
+            </Form.Item>
+          )}
+
+          {probeProxyModeValue === 'pool' && (
+            <Space style={{ display: 'flex', flexWrap: 'wrap', gap: 16 }} align="baseline">
+              <Form.Item label="目标国家 (ISO 缩写)" name="proxy_country_code">
+                <Input style={{ width: 140 }} placeholder="如 US, JP, 不填则不限" />
+              </Form.Item>
+              <Form.Item label="最低健康度分数" name="proxy_min_score" initialValue={50}>
+                <InputNumber min={0} max={100} step={5} style={{ width: 140 }} />
+              </Form.Item>
+              <Form.Item label="候选代理数量" name="proxy_max_candidates" initialValue={5}>
+                <InputNumber min={1} max={20} step={1} style={{ width: 140 }} />
+              </Form.Item>
+            </Space>
+          )}
+
+          {probeProxyModeValue !== 'direct' && (
+            <Form.Item name="proxy_failover" valuePropName="checked" initialValue={false}>
+              <Checkbox>使用多个候选代理，遇到网络失败时自动切换</Checkbox>
+            </Form.Item>
+          )}
         </Form>
       </Modal>
 
