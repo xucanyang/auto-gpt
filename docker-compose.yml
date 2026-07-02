@@ -52,8 +52,8 @@ networks:
     enable_ipv6: true
     ipam:
       config:
-        - subnet: 172.29.0.0/16
-        - subnet: 2604:a880:2:d1:9::/80
+        - subnet: 172.20.0.0/16
+        - subnet: 2604:a880:2:d1:2::/80
   tempmail_internal:
     external: true
   team_manage_default:
