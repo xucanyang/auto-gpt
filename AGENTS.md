@@ -36,8 +36,25 @@
    * 脚本在完成 Git 存档后，将直接调用底层热更新脚本把变动文件通过 `docker cp` 热注入两端运行中的容器，无需重新构建 Docker 镜像。
 3. **如需自动推送到远程分支**：在命令参数尾部追加 `--push` 即可。
 
+## Changelog 更新维护约定（Agent 强制记录）
+
+> [!IMPORTANT]
+> **【Changelog 实时更新原则：每次代码/配置修改必填日志！】**
+> **当 AI Agent 在本项目中进行任何功能添加、逻辑重构、Bug 修复、UI 改动或系统架构调整后，在执行 `deploy.sh` 部署上线前，必须主动打开并编辑 `/opt/auto-gpt/changelog.md` 文档，将本次修改详细、规范地记录在 `## [Unreleased] (未发布)` 或对应日期的版本条目中！**
+
+编写 `changelog.md` 需遵循以下规范：
+1. **格式与语义化版本**：遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/) 和 [Semantic Versioning](https://semver.org/lang/zh-CN/) (语义化版本)。
+2. **分类清晰**：根据修改性质，将其归入恰当的小节标题下：
+   - `### 新增 (Added)`：新功能、新接口、新页面或新配置项；
+   - `### 优化 (Changed)`：现有功能改进、交互体验提升、性能优化、容器编排重构；
+   - `### 修复 (Fixed)`：Bug 修复、异常容错、兼容性解决；
+   - `### 安全 (Security)`：漏洞修补、风控拦截优化、权限与凭证加固；
+   - `### 移除 (Removed)` / `### 废弃 (Deprecated)`：废弃或下线的历史功能。
+3. **内容专业详实**：严禁随意敷衍一句话概括。需结合业务场景、前后端关联说明修改的背景与实际效果，并在重点功能与问题修复中提及对应的文件、模块或接口路径，以便于日后开发和维护回溯。
+
 ## 修改原则
 
+- **文档与日志更新**：发生代码或配置修改时，必须在 `/opt/auto-gpt/changelog.md` 对应分类下追加本次改动的详细说明。
 - 前端改动：统一在 `/opt/auto-gpt/frontend/` build，再同步到容器实际静态目录；不要只停在 checkout。
 - 后端改动：确认容器内 `/app` 代码是否更新，必要时使用多实例编排重建镜像，并重启对应服务。
 - 数据库操作前：SQLite 用 `.backup`，然后 `PRAGMA integrity_check`；容器/镜像改动前优先 `docker commit` + `docker save`。操作时务必认清您修改的是主服务还是 Plus 服务的挂载目录。
