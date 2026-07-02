@@ -15,6 +15,9 @@
   - **随机延时平滑执行**：后台批量执行引擎 (`api/actions.py`) 针对批量本地状态探测等平台动作增加了区间随机延时（如 `delay_seconds` 至 `delay_max_seconds`），并在每个账号探测之间自动加入等待时间，避免并发过高触发风控限流。
 
 ### 修复 (Fixed)
+- **修复本地状态批量同步及日志面板因导入不存在的代理解析方法导致异常崩溃无法工作的问题**：
+  - **纠正代理解析函数引用与候选列表调用结构**：修复了在异步批量处理函数 `_run_batch_probe_local_status` (`api/tasks.py`) 中错误导入了未定义的 `build_account_action_proxy_candidates` 与 `format_proxy_candidate_label` 导致后台任务启动即发生 `ImportError` 崩溃的问题；将其修正为调用标准的 `resolve_probe_candidate_proxies` 代理解析函数。
+  - **修复代理切换与日志面板汇报逻辑**：正确处理由候选列表解析出的 `(proxy_url, proxy_pool, source)` 元组数据结构，规范化对代理名称、网络失败自动切换 (Failover) 及向代理池 (`proxy_pool`) 汇报成功与失败的状态回调，从而确保本地状态批量同步的进度展示、代理重试与延时等候日志均能在日志面板 (`TaskLogPanel`) 中正确打印和更新。
 - **修复 Codex 剩余用量列表中 5 小时与 7 日/30 日窗口剩余量混淆未区分的问题**：
   - **窗口严格分离与时长校验**：后端 Codex 用量构建逻辑（`codex_usage.py`）与前台数据归一化（`Accounts.tsx`）中增设窗口时长校验（<=360分钟为 5h 短期窗口，>360分钟为 7d/30d 长期窗口），彻底解决因缺失对应短/长窗口字段而盲目互用 fallback 导致 5h 与 7d/30d 用量互串和重复展示的问题。
   - **长期窗口动态自适应标签展示**：在账号池列表（`Accounts.tsx`）及 Codex 监控列表（`CodexUsagePage.tsx`）中，根据实际检测到的额度周期（如 `window_minutes >= 20000`），将长期窗口动态精准显示为 `30d` 或 `7d`（及对应前缀 `[30d]` / `[7d]`），避免将 30 天月期用量误标为 7 天。

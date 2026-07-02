@@ -9875,7 +9875,7 @@ def _run_batch_invalid_recheck(task_id: str, account_ids: list[int]):
 def _run_batch_probe_local_status(task_id: str, account_ids: list[int], params: dict[str, Any]):
     from core.db import AccountModel, engine
     from services.chatgpt_core.local_status_refresh import sync_chatgpt_account_local_status
-    from core.proxy_utils import build_account_action_proxy_candidates, format_proxy_candidate_label
+    from core.proxy_utils import resolve_probe_candidate_proxies, is_proxy_error_text
     import random
 
     control = _task_store.control_for(task_id)
@@ -9931,29 +9931,37 @@ def _run_batch_probe_local_status(task_id: str, account_ids: list[int], params: 
                     primary_email = email
                 task_log(f"[{index}/{total}] 开始同步本地状态 账号ID：{account_id}｜邮箱：{email}")
 
-                candidates = build_account_action_proxy_candidates(
-                    acc,
+                candidates = resolve_probe_candidate_proxies(
                     params,
-                    action_id="probe_local_status",
-                    platform="chatgpt",
+                    fallback_proxy="",
+                    default_mode="direct",
                 )
                 success_probe = False
                 last_err = ""
-                for attempt_idx, candidate in enumerate(candidates, start=1):
-                    proxy_url = str(candidate.get("url") or "").strip()
-                    proxy_label = format_proxy_candidate_label(candidate)
+                for attempt_idx, (proxy_url, proxy_pool, source) in enumerate(candidates, start=1):
                     if len(candidates) > 1:
-                        task_log(f" -> [尝试 {attempt_idx}/{len(candidates)}] 使用代理: {proxy_label}")
+                        task_log(f" -> [尝试 {attempt_idx}/{len(candidates)}] 使用代理: {source}")
                     try:
                         res = sync_chatgpt_account_local_status(session, acc, proxy=proxy_url)
                         plan = res.get("probe", {}).get("subscription", {}).get("plan", "unknown")
                         task_log(f" -> [成功] 账号 {email} 本地状态同步完成｜当前订阅计划: {plan}")
+                        if proxy_pool is not None and proxy_url:
+                            try:
+                                proxy_pool.report_success(proxy_url)
+                            except Exception:
+                                pass
                         success_probe = True
                         success_count += 1
                         break
                     except Exception as exc:
                         last_err = str(exc)
-                        task_log(f" -> [失败] 代理 {proxy_label} 探测异常: {exc}")
+                        task_log(f" -> [失败] 代理 {source} 探测异常: {exc}")
+                        if attempt_idx < len(candidates) and proxy_pool is not None and proxy_url:
+                            if is_proxy_error_text(last_err):
+                                try:
+                                    proxy_pool.report_fail(proxy_url)
+                                except Exception:
+                                    pass
                 if not success_probe:
                     errors.append(f"{email}: {last_err or '探测失败'}")
                     task_log(f" -> [异常] 账号 {email} 本地状态全部失败: {last_err or '探测失败'}")

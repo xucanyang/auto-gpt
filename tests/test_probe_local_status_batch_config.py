@@ -121,3 +121,20 @@ class ProbeLocalStatusBatchConfigTests(unittest.TestCase):
         self.assertIn("task_id", res)
         self.assertEqual(res["eligible"], 1)
 
+    @mock.patch("api.tasks._save_task_log")
+    @mock.patch("api.tasks._task_store")
+    @mock.patch("services.chatgpt_core.local_status_refresh.sync_chatgpt_account_local_status")
+    @mock.patch("api.tasks.Session")
+    def test_run_batch_probe_local_status_execution(self, mock_session_cls, mock_sync, mock_store, mock_save_log):
+        from api.tasks import _run_batch_probe_local_status
+        mock_acc = mock.Mock(id=10, email="a10@example.com", status="ok")
+        mock_session_cls.return_value.__enter__.return_value.get.return_value = mock_acc
+        mock_sync.return_value = {"probe": {"subscription": {"plan": "plus"}}}
+        mock_store.snapshot.return_value = {"meta": {}}
+        mock_store.control_for.return_value = mock.Mock()
+
+        _run_batch_probe_local_status("task_test_probe", [10], {"proxy_mode": "direct"})
+        mock_sync.assert_called_once()
+        mock_store.finish.assert_called_once()
+
+
