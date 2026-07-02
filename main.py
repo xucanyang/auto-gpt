@@ -27,6 +27,12 @@ from api.external_subscription import (
     start_subscription_verification_scheduler,
     stop_subscription_verification_scheduler,
 )
+from api.external_access_tokens import router as external_access_tokens_router
+from api.phone_pool import router as phone_pool_router
+from api.baxigpt_cdk_pool import router as baxigpt_cdk_pool_router
+from api.delivery_cards import public_router as delivery_cards_public_router
+from api.delivery_cards import router as delivery_cards_router
+from api.system import router as system_router
 from services.chatgpt_core import ChatGPTPlatform
 from services.pipeline import pipeline_engine
 
@@ -41,6 +47,121 @@ TOKEN_QUERY_API_PATHS = {
     "/api/pipeline/logs/stream",
 }
 
+SENSITIVE_SPA_FALLBACK_ROOTS = {
+    "actuator",
+    "adminer",
+    "ansible",
+    "backup",
+    "backups",
+    "config",
+    "configs",
+    "credentials",
+    "database",
+    "db",
+    "debug",
+    "deploy",
+    "deployment",
+    "dump",
+    "dumps",
+    "env",
+    "iac",
+    "infra",
+    "infrastructure",
+    "ops",
+    "phpinfo",
+    "server-status",
+    "secrets",
+    "tf",
+}
+
+SENSITIVE_SPA_FALLBACK_FILENAMES = {
+    "app.py",
+    "application.properties",
+    "application.yaml",
+    "application.yml",
+    "compose.yaml",
+    "compose.yml",
+    "config.json",
+    "config.local.json",
+    "config.prod.json",
+    "config.production.json",
+    "config.yaml",
+    "config.yml",
+    "credentials.json",
+    "database.json",
+    "database.yaml",
+    "database.yml",
+    "docker-compose.override.yml",
+    "docker-compose.prod.yml",
+    "docker-compose.production.yml",
+    "docker-compose.yaml",
+    "docker-compose.yml",
+    "info.php",
+    "local_settings.py",
+    "main.py",
+    "manage.py",
+    "package-lock.json",
+    "package.json",
+    "pnpm-lock.yaml",
+    "poetry.lock",
+    "pulumi.prod.yaml",
+    "pulumi.yaml",
+    "pyproject.toml",
+    "requirements.txt",
+    "service-account.json",
+    "secrets.json",
+    "secrets.yaml",
+    "secrets.yml",
+    "settings.json",
+    "settings.local.json",
+    "settings.prod.json",
+    "settings.production.json",
+    "settings.py",
+    "terraform.tfstate",
+    "terraform.tfvars",
+    "yarn.lock",
+}
+
+SENSITIVE_SPA_FALLBACK_FILENAME_PREFIXES = (
+    "application.",
+    "config.",
+    "credentials.",
+    "database.",
+    "docker-compose.",
+    "secret.",
+    "secrets.",
+    "service-account.",
+    "settings.",
+)
+
+SENSITIVE_SPA_FALLBACK_SUFFIXES = (
+    ".7z",
+    ".bak",
+    ".backup",
+    ".conf",
+    ".db",
+    ".dump",
+    ".gz",
+    ".ini",
+    ".log",
+    ".old",
+    ".orig",
+    ".pem",
+    ".php",
+    ".py",
+    ".rar",
+    ".sql",
+    ".sqlite",
+    ".sqlite3",
+    ".swp",
+    ".tar",
+    ".tgz",
+    ".tfstate",
+    ".tfvars",
+    ".toml",
+    ".zip",
+)
+
 
 def _detect_conda_env() -> str:
     conda_env = os.getenv("CONDA_DEFAULT_ENV")
@@ -53,6 +174,38 @@ def _detect_conda_env() -> str:
         if idx + 1 < len(prefix_parts):
             return prefix_parts[idx + 1]
     return ""
+
+
+def _should_block_spa_fallback(full_path: str) -> bool:
+    """Reject scanner-style requests before the SPA catch-all returns index.html.
+
+    The frontend needs history-mode routes such as /settings to fall back to
+    index.html, but paths like /.git/config, /.env, /main.py and
+    /docker-compose.yml should be a real 404 instead of a misleading 200.
+    """
+    normalized = (full_path or "").replace("\\", "/").strip("/")
+    if not normalized:
+        return False
+
+    lowered = normalized.lower()
+    segments = [segment for segment in lowered.split("/") if segment]
+    if not segments:
+        return False
+
+    if any(segment.startswith(".") for segment in segments):
+        return True
+
+    root = segments[0]
+    if root in SENSITIVE_SPA_FALLBACK_ROOTS:
+        return True
+
+    filename = segments[-1]
+    if filename in SENSITIVE_SPA_FALLBACK_FILENAMES:
+        return True
+    if filename.startswith(SENSITIVE_SPA_FALLBACK_FILENAME_PREFIXES):
+        return True
+
+    return filename.endswith(SENSITIVE_SPA_FALLBACK_SUFFIXES)
 
 
 def _print_runtime_info() -> None:
@@ -88,6 +241,25 @@ async def lifespan(app: FastAPI):
     start_icloud_hme_auto_pool()
     from services.tempmail_archive_cleanup import start as start_tempmail_archive_cleanup
     start_tempmail_archive_cleanup()
+    from services.icloud_hme_auto_delete import start as start_icloud_hme_auto_delete
+    start_icloud_hme_auto_delete()
+    from services.account_rate_limit_recovery import start as start_account_rate_limit_recovery
+    start_account_rate_limit_recovery()
+    try:
+        from services.chatgpt_core.phone_pool_repository import start_phone_pool_api_expiry_autofill
+        start_phone_pool_api_expiry_autofill(delay_seconds=30, limit=50)
+    except Exception as exc:
+        print(f"[WARN] 手机号池 API 到期时间后台补全启动失败: {exc}")
+    from services.proxy_scan_scheduler import start as start_proxy_scan_scheduler
+    start_proxy_scan_scheduler()
+    from services.chatgpt_core.baxigpt_status_poller import (
+        restore_pending_targets as restore_baxigpt_status_poller_targets,
+        start as start_baxigpt_status_poller,
+    )
+    start_baxigpt_status_poller()
+    restored_baxigpt_targets = restore_baxigpt_status_poller_targets()
+    if restored_baxigpt_targets:
+        print(f"[BaxiGPT] 已恢复订单状态轮询: {restored_baxigpt_targets} 个")
     start_subscription_verification_scheduler()
     from services.solver_manager import start_async
     start_async()
@@ -102,6 +274,14 @@ async def lifespan(app: FastAPI):
     stop_icloud_hme_auto_pool()
     from services.tempmail_archive_cleanup import stop as stop_tempmail_archive_cleanup
     stop_tempmail_archive_cleanup()
+    from services.icloud_hme_auto_delete import stop as stop_icloud_hme_auto_delete
+    stop_icloud_hme_auto_delete()
+    from services.account_rate_limit_recovery import stop as stop_account_rate_limit_recovery
+    stop_account_rate_limit_recovery()
+    from services.proxy_scan_scheduler import stop as stop_proxy_scan_scheduler
+    stop_proxy_scan_scheduler()
+    from services.chatgpt_core.baxigpt_status_poller import stop as stop_baxigpt_status_poller
+    stop_baxigpt_status_poller()
     stop_subscription_verification_scheduler()
     try:
         pipeline_engine.stop()
@@ -120,6 +300,10 @@ async def auth_middleware(request: Request, call_next):
     if path in PUBLIC_API_PATHS:
         return await call_next(request)
     if path.startswith("/api/external/subscription-links"):
+        return await call_next(request)
+    if path.startswith("/api/external/access-tokens"):
+        return await call_next(request)
+    if path.startswith("/api/public/delivery-cards"):
         return await call_next(request)
     if path.startswith("/api/auth/") or not path.startswith("/api/"):
         return await call_next(request)
@@ -164,6 +348,12 @@ app.include_router(icloud_hme_router, prefix="/api")
 app.include_router(tempmail_archive_router, prefix="/api")
 app.include_router(pipeline_router, prefix="/api")
 app.include_router(external_subscription_router, prefix="/api")
+app.include_router(external_access_tokens_router, prefix="/api")
+app.include_router(phone_pool_router, prefix="/api")
+app.include_router(baxigpt_cdk_pool_router, prefix="/api")
+app.include_router(delivery_cards_router, prefix="/api/admin")
+app.include_router(delivery_cards_public_router, prefix="/api")
+app.include_router(system_router, prefix="/api")
 
 
 @app.get("/api/solver/status")
@@ -184,8 +374,10 @@ _static_dir = os.path.join(os.path.dirname(__file__), "static")
 if os.path.isdir(_static_dir):
     app.mount("/assets", StaticFiles(directory=os.path.join(_static_dir, "assets")), name="assets")
 
-    @app.get("/{full_path:path}", include_in_schema=False)
+    @app.api_route("/{full_path:path}", methods=["GET", "HEAD"], include_in_schema=False)
     def spa_fallback(full_path: str):
+        if _should_block_spa_fallback(full_path):
+            raise HTTPException(status_code=404, detail="Not Found")
         return FileResponse(
             os.path.join(_static_dir, "index.html"),
             headers={

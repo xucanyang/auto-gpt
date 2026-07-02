@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   Alert,
   Card,
@@ -19,8 +19,10 @@ import {
   CheckCircleOutlined,
   CloseCircleOutlined,
   LoadingOutlined,
+  ReloadOutlined,
 } from '@ant-design/icons'
 import { ChatGPTRegistrationModeSwitch } from '@/components/ChatGPTRegistrationModeSwitch'
+import { PhoneBindingResultsTable } from '@/components/phone-binding/PhoneBindingResultsTable'
 import { TaskLogPanel } from '@/components/TaskLogPanel'
 import { TaskVerificationPanel } from '@/components/TaskVerificationPanel'
 import { usePersistentChatGPTRegistrationMode } from '@/hooks/usePersistentChatGPTRegistrationMode'
@@ -29,6 +31,7 @@ import { buildChatGPTRegistrationRequestAdapter } from '@/lib/chatgptRegistratio
 import { CHATGPT_REGISTRATION_MODE_REFRESH_TOKEN } from '@/lib/chatgptRegistrationMode'
 import { getExecutorOptions, normalizeExecutorForPlatform } from '@/lib/platformExecutorOptions'
 import { apiFetch } from '@/lib/utils'
+import { normalizeDomainList, parseStoredDomainList } from '@/lib/domainList'
 
 const { Text } = Typography
 
@@ -77,6 +80,8 @@ export default function RegisterTaskPage() {
   const [form] = Form.useForm()
   const [task, setTask] = useState<any>(null)
   const [polling, setPolling] = useState(false)
+  const [tempmailDomains, setTempmailDomains] = useState<any[]>([])
+  const [tempmailDomainsLoading, setTempmailDomainsLoading] = useState(false)
   const pollTimerRef = useRef<number | null>(null)
   const taskRef = useRef<any>(null)
   const { mode: chatgptRegistrationMode, setMode: setChatgptRegistrationMode } =
@@ -101,6 +106,7 @@ export default function RegisterTaskPage() {
         tempmail_api_key_header: cfg.tempmail_api_key_header || 'Authorization',
         tempmail_mode: cfg.tempmail_mode || 'fixed_domain',
         tempmail_primary_domain: cfg.tempmail_primary_domain || '',
+        tempmail_fixed_domains: parseStoredDomainList(cfg.tempmail_fixed_domains || cfg.tempmail_primary_domain),
         tempmail_wait_timeout_seconds: cfg.tempmail_wait_timeout_seconds || 180,
         tempmail_ttl_minutes: cfg.tempmail_ttl_minutes || 30,
         tempmail_reuse_window_minutes: cfg.tempmail_reuse_window_minutes || 20,
@@ -118,6 +124,8 @@ export default function RegisterTaskPage() {
         laoudo_auth: cfg.laoudo_auth || '',
         laoudo_email: cfg.laoudo_email || '',
         laoudo_account_id: cfg.laoudo_account_id || '',
+        proxy_max_candidates: Number(cfg.proxy_pool_max_candidates || 5),
+        proxy_min_score: Number(cfg.proxy_scan_min_score || 50),
         gptmail_base_url: cfg.gptmail_base_url || 'https://mail.chatgpt.org.uk',
         gptmail_api_key: cfg.gptmail_api_key || '',
         gptmail_domain: cfg.gptmail_domain || '',
@@ -149,6 +157,14 @@ export default function RegisterTaskPage() {
         smstome_otp_timeout_seconds: cfg.smstome_otp_timeout_seconds || '',
         smstome_poll_interval_seconds: cfg.smstome_poll_interval_seconds || '',
         smstome_sync_max_pages_per_country: cfg.smstome_sync_max_pages_per_country || '',
+        chatgpt_registration_entry: 'email_signup',
+        chatgpt_phone_signup_use_pool: parseBooleanConfigValue(cfg.chatgpt_phone_signup_use_pool),
+        chatgpt_phone_signup_phone_lines: '',
+        chatgpt_phone_signup_timeout_seconds: cfg.chatgpt_phone_signup_timeout_seconds || 180,
+        chatgpt_phone_signup_poll_interval_seconds: cfg.chatgpt_phone_signup_poll_interval_seconds || 5,
+        chatgpt_phone_signup_max_resend_attempts: cfg.chatgpt_phone_signup_max_resend_attempts || 1,
+        chatgpt_phone_signup_resend_interval_seconds: cfg.chatgpt_phone_signup_resend_interval_seconds || 60,
+        login_password: cfg.chatgpt_phone_signup_password || '',
         luckmail_base_url: cfg.luckmail_base_url || 'https://mails.luckyous.com/',
         luckmail_api_key: cfg.luckmail_api_key || '',
         luckmail_email_type: cfg.luckmail_email_type || '',
@@ -163,7 +179,15 @@ export default function RegisterTaskPage() {
             : parseBooleanConfigValue(cfg.chatgpt_access_token_only_checkout_amount_check_enabled),
         chatgpt_access_token_only_checkout_country: String(cfg.chatgpt_access_token_only_checkout_country || 'US').trim().toUpperCase() || 'US',
         chatgpt_access_token_only_checkout_currency: String(cfg.chatgpt_access_token_only_checkout_currency || 'USD').trim().toUpperCase() || 'USD',
-        chatgpt_save_registration_access_token_account: false,
+        chatgpt_access_token_only_gopay_provider_link_enabled: parseBooleanConfigValue(
+          cfg.chatgpt_access_token_only_gopay_provider_link_enabled,
+        ),
+        chatgpt_save_registration_access_token_account:
+          cfg.chatgpt_save_registration_access_token_account === ''
+            ? true
+            : cfg.chatgpt_save_registration_access_token_account === undefined
+              ? true
+              : parseBooleanConfigValue(cfg.chatgpt_save_registration_access_token_account),
       })
     })
   }, [form])
@@ -182,6 +206,22 @@ export default function RegisterTaskPage() {
 
   const submit = async () => {
     const values = await form.validateFields()
+    const phoneSignupEnabled = values.platform === 'chatgpt' && values.chatgpt_registration_entry === 'phone_signup'
+    if (values.mail_provider === 'tempmail_local' && (values.tempmail_mode || 'fixed_domain') === 'fixed_domain'
+      && normalizeDomainList(values.tempmail_fixed_domains).length === 0) {
+      message.error('固定域名模式下请至少选择一个 TempMail 可用域名')
+      return
+    }
+    if (phoneSignupEnabled && !values.chatgpt_phone_signup_use_pool && !String(values.chatgpt_phone_signup_phone_lines || '').trim()) {
+      message.error('手机号注册请粘贴 手机号----收码API，或勾选使用手机号池')
+      return
+    }
+    if (phoneSignupEnabled && !String(values.login_password || values.password || '').trim()) {
+      message.error('手机号注册/已注册手机号登录必须填写同一个密码')
+      return
+    }
+
+
     const registerExtra = {
       mail_provider: values.mail_provider,
       applemail_base_url: values.applemail_base_url,
@@ -207,7 +247,8 @@ export default function RegisterTaskPage() {
       tempmail_api_key: values.tempmail_api_key,
       tempmail_api_key_header: values.tempmail_api_key_header,
       tempmail_mode: values.tempmail_mode,
-      tempmail_primary_domain: values.tempmail_primary_domain,
+      tempmail_primary_domain: normalizeDomainList(values.tempmail_fixed_domains)[0] || values.tempmail_primary_domain,
+      tempmail_fixed_domains: normalizeDomainList(values.tempmail_fixed_domains),
       tempmail_wait_timeout_seconds: values.tempmail_wait_timeout_seconds,
       tempmail_ttl_minutes: values.tempmail_ttl_minutes,
       tempmail_reuse_window_minutes: values.tempmail_reuse_window_minutes,
@@ -243,6 +284,14 @@ export default function RegisterTaskPage() {
       smstome_otp_timeout_seconds: values.smstome_otp_timeout_seconds,
       smstome_poll_interval_seconds: values.smstome_poll_interval_seconds,
       smstome_sync_max_pages_per_country: values.smstome_sync_max_pages_per_country,
+      chatgpt_registration_entry: phoneSignupEnabled ? 'phone_signup' : 'email_signup',
+      chatgpt_phone_signup_password: phoneSignupEnabled ? String(values.login_password || values.password || '').trim() : undefined,
+      chatgpt_phone_signup_use_pool: phoneSignupEnabled ? Boolean(values.chatgpt_phone_signup_use_pool) : undefined,
+      chatgpt_phone_signup_phone_lines: phoneSignupEnabled ? values.chatgpt_phone_signup_phone_lines : undefined,
+      chatgpt_phone_signup_timeout_seconds: phoneSignupEnabled ? values.chatgpt_phone_signup_timeout_seconds : undefined,
+      chatgpt_phone_signup_poll_interval_seconds: phoneSignupEnabled ? values.chatgpt_phone_signup_poll_interval_seconds : undefined,
+      chatgpt_phone_signup_max_resend_attempts: phoneSignupEnabled ? values.chatgpt_phone_signup_max_resend_attempts : undefined,
+      chatgpt_phone_signup_resend_interval_seconds: phoneSignupEnabled ? values.chatgpt_phone_signup_resend_interval_seconds : undefined,
       luckmail_base_url: values.luckmail_base_url,
       luckmail_api_key: values.luckmail_api_key,
       luckmail_email_type: values.luckmail_email_type,
@@ -264,7 +313,9 @@ export default function RegisterTaskPage() {
           : undefined,
       chatgpt_save_registration_access_token_account:
         platform === 'chatgpt'
-          ? Boolean(values.chatgpt_save_registration_access_token_account)
+          ? (values.chatgpt_save_registration_access_token_account === undefined
+            ? true
+            : Boolean(values.chatgpt_save_registration_access_token_account))
           : undefined,
       chatgpt_access_token_only_checkout_amount_check_enabled:
         platform === 'chatgpt'
@@ -278,6 +329,10 @@ export default function RegisterTaskPage() {
         platform === 'chatgpt'
           ? String(values.chatgpt_access_token_only_checkout_currency || 'USD').trim().toUpperCase() || 'USD'
           : undefined,
+      chatgpt_access_token_only_gopay_provider_link_enabled:
+        platform === 'chatgpt'
+          ? Boolean(values.chatgpt_access_token_only_gopay_provider_link_enabled)
+          : undefined,
     }
     const chatgptRegistrationRequestAdapter =
       buildChatGPTRegistrationRequestAdapter(
@@ -285,20 +340,35 @@ export default function RegisterTaskPage() {
         chatgptRegistrationMode,
       )
     const adaptedRegisterExtra = chatgptRegistrationRequestAdapter
-      ? chatgptRegistrationRequestAdapter.extendExtra(registerExtra)
+      ? (phoneSignupEnabled ? registerExtra : chatgptRegistrationRequestAdapter.extendExtra(registerExtra))
       : registerExtra
 
     try {
+      if (phoneSignupEnabled) {
+        await apiFetch('/config', {
+          method: 'PUT',
+          body: JSON.stringify({
+            data: {
+              chatgpt_phone_signup_password: String(values.login_password || values.password || '').trim(),
+            },
+          }),
+        })
+      }
       const res = await apiFetch('/tasks/register', {
         method: 'POST',
         body: JSON.stringify({
           platform: values.platform,
           email: values.email || null,
-          password: values.password || null,
+          password: phoneSignupEnabled ? String(values.login_password || values.password || '').trim() : values.password || null,
           count: values.count,
-          concurrency: values.concurrency,
+          concurrency: phoneSignupEnabled ? 1 : values.concurrency,
           register_delay_seconds: values.register_delay_seconds || 0,
-          proxy: values.proxy || null,
+          proxy: values.proxy_mode === 'specified' ? values.proxy || null : null,
+          proxy_mode: values.proxy_mode || (values.proxy ? 'specified' : 'pool'),
+          proxy_country_code: String(values.proxy_country_code || '').trim().toUpperCase(),
+          proxy_failover: Boolean(values.proxy_failover),
+          proxy_max_candidates: Number(values.proxy_max_candidates || 5),
+          proxy_min_score: Number(values.proxy_min_score || 0),
           executor_type: values.executor_type,
           captcha_solver: values.captcha_solver,
           extra: adaptedRegisterExtra,
@@ -439,13 +509,57 @@ export default function RegisterTaskPage() {
   }, [task])
 
   const mailProvider = Form.useWatch('mail_provider', form)
+  const tempmailSelectedDomains = Form.useWatch('tempmail_fixed_domains', form) || []
   const captchaSolver = Form.useWatch('captcha_solver', form)
   const platform = Form.useWatch('platform', form)
+  const proxyMode = Form.useWatch('proxy_mode', form)
+  const proxyFailover = Form.useWatch('proxy_failover', form)
   const manualEmail = Form.useWatch('email', form)
+  const chatgptRegistrationEntry = Form.useWatch('chatgpt_registration_entry', form)
+  const phoneSignupUsePool = Form.useWatch('chatgpt_phone_signup_use_pool', form)
   const executorOptions = getExecutorOptions(platform)
   const isManualEmailOtp = platform === 'chatgpt' && mailProvider === 'manual_email_otp'
+  const isPhoneSignup = platform === 'chatgpt' && chatgptRegistrationEntry === 'phone_signup'
   const isRefreshTokenMode =
     chatgptRegistrationMode === CHATGPT_REGISTRATION_MODE_REFRESH_TOKEN
+  const normalizedTempMailSelectedDomains = normalizeDomainList(tempmailSelectedDomains)
+  const tempmailDomainOptions = useMemo(() => {
+    const byDomain = new Map<string, any>()
+    tempmailDomains.forEach((item) => {
+      const domain = String(item?.domain || '').trim().toLowerCase()
+      if (domain) byDomain.set(domain, item)
+    })
+    normalizedTempMailSelectedDomains.forEach((domain) => {
+      if (!byDomain.has(domain)) byDomain.set(domain, { domain, available: true })
+    })
+    return Array.from(byDomain.values()).map((item) => ({
+      label: item.dns_status ? `${item.domain} · ${item.dns_status}` : item.domain,
+      value: item.domain,
+      disabled: item.available === false,
+    }))
+  }, [normalizedTempMailSelectedDomains, tempmailDomains])
+
+  const loadTempMailDomains = async (silent = false) => {
+    setTempmailDomainsLoading(true)
+    try {
+      const data = await apiFetch('/config/tempmail/domains', {
+        method: 'POST',
+        body: JSON.stringify({ include_inactive: false }),
+      })
+      const domains = Array.isArray(data?.domains) ? data.domains : []
+      setTempmailDomains(domains)
+      if (!silent) message.success(`已加载 ${domains.length} 个可用域名`)
+    } catch (error: any) {
+      if (!silent) message.error(error?.message || '读取 TempMail 域名失败')
+    } finally {
+      setTempmailDomainsLoading(false)
+    }
+  }
+
+  useEffect(() => {
+    if (mailProvider !== 'tempmail_local') return
+    void loadTempMailDomains(true)
+  }, [mailProvider])
 
   useEffect(() => {
     const currentExecutor = form.getFieldValue('executor_type')
@@ -456,7 +570,7 @@ export default function RegisterTaskPage() {
   }, [form, platform])
 
   useEffect(() => {
-    if (platform !== 'chatgpt' && mailProvider === 'manual_email_otp') {
+    if (platform !== 'chatgpt' && ['manual_email_otp'].includes(String(mailProvider || ''))) {
       form.setFieldValue('mail_provider', 'luckmail')
       return
     }
@@ -469,6 +583,11 @@ export default function RegisterTaskPage() {
       }
     }
   }, [form, platform, mailProvider])
+
+  useEffect(() => {
+    if (!isPhoneSignup) return
+    form.setFieldValue('concurrency', 1)
+  }, [form, isPhoneSignup])
 
   useEffect(() => {
     if (!isManualEmailOtp) return
@@ -508,7 +627,18 @@ export default function RegisterTaskPage() {
         chatgpt_team_invite_deferred_activation: false,
         chatgpt_capture_business_workspace: true,
         chatgpt_capture_free_workspace: true,
-        chatgpt_save_registration_access_token_account: false,
+        chatgpt_save_registration_access_token_account: true,
+        chatgpt_registration_entry: 'email_signup',
+        chatgpt_phone_signup_use_pool: false,
+        chatgpt_phone_signup_timeout_seconds: 180,
+        chatgpt_phone_signup_poll_interval_seconds: 5,
+        chatgpt_phone_signup_max_resend_attempts: 1,
+        chatgpt_phone_signup_resend_interval_seconds: 60,
+        proxy_mode: 'pool',
+        proxy_country_code: '',
+        proxy_failover: false,
+        proxy_max_candidates: 5,
+        proxy_min_score: 50,
         count: 1,
         concurrency: 1,
         register_delay_seconds: 0,
@@ -537,19 +667,74 @@ export default function RegisterTaskPage() {
               <Input type="number" min={1} disabled={isManualEmailOtp} />
             </Form.Item>
             <Form.Item name="concurrency" label="并发数" style={{ flex: 1 }}>
-              <Input type="number" min={1} max={5} disabled={isManualEmailOtp} />
+              <Input type="number" min={1} max={5} disabled={isManualEmailOtp || isPhoneSignup} />
             </Form.Item>
           </Space>
           <Space style={{ width: '100%' }}>
-            <Form.Item name="register_delay_seconds" label="每个注册延迟(秒)" style={{ flex: 1 }}>
+            <Form.Item name="register_delay_seconds" label="最小注册延迟(秒)" initialValue={0} style={{ flex: 1 }}>
               <InputNumber min={0} precision={1} step={0.5} style={{ width: '100%' }} placeholder="0" />
             </Form.Item>
-            <Form.Item name="proxy" label="代理 (可选)" style={{ flex: 1 }}>
-              <Input placeholder="http://user:pass@host:port" />
+            <Form.Item name="register_delay_max_seconds" label="最大延迟(秒)" initialValue={0} style={{ flex: 1 }}>
+              <InputNumber min={0} precision={1} step={0.5} style={{ width: '100%' }} placeholder="0" />
+            </Form.Item>
+            <Form.Item name="proxy_mode" label="代理模式" style={{ flex: 1 }}>
+              <Select
+                options={[
+                  { value: 'direct', label: '直连' },
+                  { value: 'pool', label: '使用代理池' },
+                  { value: 'specified', label: '指定代理' },
+                ]}
+              />
             </Form.Item>
           </Space>
+          {proxyMode === 'specified' ? (
+            <Space style={{ width: '100%' }} align="start">
+              <Form.Item name="proxy" label="指定代理" style={{ flex: 1 }}>
+                <Input placeholder="http://user:pass@host:port" />
+              </Form.Item>
+              <Form.Item name="proxy_failover" valuePropName="checked" label="失败处理" style={{ width: 180 }}>
+                <Checkbox>失败后切换代理池</Checkbox>
+              </Form.Item>
+            </Space>
+          ) : null}
+          {proxyMode === 'pool' || (proxyMode === 'specified' && proxyFailover) ? (
+            <Space style={{ width: '100%' }} align="start">
+              <Form.Item name="proxy_country_code" label="出口国家" style={{ flex: 1 }}>
+                <Input placeholder="不限，或填 US / JP / SG" />
+              </Form.Item>
+              <Form.Item name="proxy_min_score" label="最低健康分" style={{ width: 150 }}>
+                <InputNumber min={0} max={100} precision={0} style={{ width: '100%' }} />
+              </Form.Item>
+              <Form.Item name="proxy_max_candidates" label="最多候选" style={{ width: 150 }}>
+                <InputNumber min={1} max={100} precision={0} style={{ width: '100%' }} />
+              </Form.Item>
+            </Space>
+          ) : null}
+          <Alert
+            type="info"
+            showIcon
+            style={{ marginBottom: 12 }}
+            message="代理模式说明"
+            description="直连不会使用代理池；指定代理只用填写的节点，勾选失败切换后才会回退代理池；使用代理池会按健康分、冷却状态和实测出口国家挑选候选。"
+          />
           {platform === 'chatgpt' && (
             <>
+              <Form.Item name="chatgpt_registration_entry" label="注册入口">
+                <Select
+                  options={[
+                    { value: 'email_signup', label: '邮箱注册' },
+                  ]}
+                />
+              </Form.Item>
+              {isPhoneSignup ? (
+                <Alert
+                  type="info"
+                  showIcon
+                  style={{ marginBottom: 12 }}
+                  message="当前为手机号注册"
+                  description="手机号会作为 ChatGPT 登录标识；接码输入格式沿用手机号绑定的“手机号----收码API”。当前只执行注册阶段，并保存注册阶段 AccessToken 账号。"
+                />
+              ) : null}
               <Form.Item label="ChatGPT Token 方案">
                 <ChatGPTRegistrationModeSwitch
                   mode={chatgptRegistrationMode}
@@ -594,11 +779,19 @@ export default function RegisterTaskPage() {
                   </Form.Item>
                 </Space>
               ) : null}
+              <Form.Item
+                name="chatgpt_access_token_only_gopay_provider_link_enabled"
+                valuePropName="checked"
+                extra="开启后：注册/登录成功后继续进入 GoPay/Midtrans 平台链接阶段，只保存平台链接，不进入手机号 OTP/PIN；失败不会丢弃已注册账号。"
+              >
+                <Checkbox>注册后获取 GoPay 平台链接</Checkbox>
+              </Form.Item>
               {isRefreshTokenMode ? (
                 <Form.Item
                   name="chatgpt_save_registration_access_token_account"
                   valuePropName="checked"
-                  extra="开启后：注册阶段已拿到 AccessToken，但后续 refresh_token / 工作空间抓取失败时，也会保存一个 AccessToken-only 账号。"
+                  initialValue={true}
+                  extra="默认开启：注册阶段已拿到 AccessToken，但后续 refresh_token / 工作空间抓取失败时，也会保存一个 AccessToken-only 账号，避免真实注册成功却没有入库。"
                 >
                   <Checkbox>保存注册阶段 AccessToken 账号</Checkbox>
                 </Form.Item>
@@ -661,12 +854,17 @@ export default function RegisterTaskPage() {
           )}
         </Card>
 
+        {!isPhoneSignup ? (
         <Card title="邮箱配置" style={{ marginBottom: 16 }}>
           <Form.Item name="mail_provider" label="邮箱服务" rules={[{ required: true }]}>
             <Select
               options={[
                 ...(platform === 'chatgpt'
-                  ? [{ value: 'manual_email_otp', label: '手动邮箱 + 手输验证码' }]
+                  ? [
+                      { value: 'manual_email_otp', label: '手动邮箱 + 手输验证码' },
+                      { value: 'hme_ready_api', label: 'HME Ready API' },
+                      { value: 'icloud_hme', label: 'iCloud HME' },
+                    ]
                   : []),
                 { value: 'luckmail', label: 'LuckMail' },
                 { value: 'applemail', label: 'AppleMail / 小苹果' },
@@ -732,8 +930,44 @@ export default function RegisterTaskPage() {
                   ]}
                 />
               </Form.Item>
-              <Form.Item name="tempmail_primary_domain" label="主域名（固定域名模式时必填）">
-                <Input placeholder="mail.666800.xyz" />
+              <Space align="start" style={{ width: '100%' }}>
+                <Form.Item
+                  name="tempmail_fixed_domains"
+                  label="可用域名（固定域名模式时必填）"
+                  style={{ flex: 1 }}
+                  rules={[
+                    {
+                      validator: (_, value) => {
+                        if (form.getFieldValue('tempmail_mode') !== 'fixed_domain') return Promise.resolve()
+                        return normalizeDomainList(value).length > 0
+                          ? Promise.resolve()
+                          : Promise.reject(new Error('请选择至少一个 TempMail 可用域名'))
+                      },
+                    },
+                  ]}
+                  extra="可单选或多选；多选时每个新邮箱会从候选域名中随机选择一个。"
+                >
+                  <Select
+                    mode="multiple"
+                    allowClear
+                    showSearch
+                    loading={tempmailDomainsLoading}
+                    placeholder={tempmailDomainsLoading ? '正在加载域名...' : '请选择一个或多个可用域名'}
+                    options={tempmailDomainOptions}
+                    optionFilterProp="label"
+                  />
+                </Form.Item>
+                <Button
+                  icon={<ReloadOutlined />}
+                  loading={tempmailDomainsLoading}
+                  onClick={() => { void loadTempMailDomains(false) }}
+                  style={{ marginTop: 30 }}
+                >
+                  刷新
+                </Button>
+              </Space>
+              <Form.Item name="tempmail_primary_domain" hidden>
+                <Input />
               </Form.Item>
               <Form.Item name="tempmail_wait_timeout_seconds" label="建箱等待秒数">
                 <InputNumber min={30} max={600} style={{ width: '100%' }} />
@@ -953,30 +1187,95 @@ export default function RegisterTaskPage() {
             </>
           )}
         </Card>
+        ) : null}
 
         {platform === 'chatgpt' && (
           <Card title="ChatGPT 手机验证" style={{ marginBottom: 16 }}>
-            <Text type="secondary" style={{ display: 'block', marginBottom: 12 }}>
-              仅在 OAuth 流程进入 `add_phone` 时使用，用于自动取号并轮询短信验证码。
-            </Text>
-            <Form.Item name="smstome_cookie" label="SMSToMe Cookie">
-              <Input.Password placeholder="cf_clearance=...; PHPSESSID=..." />
-            </Form.Item>
-            <Form.Item name="smstome_country_slugs" label="国家列表">
-              <Input placeholder="united-kingdom,poland,finland" />
-            </Form.Item>
-            <Form.Item name="smstome_phone_attempts" label="手机号尝试次数">
-              <Input placeholder="3" />
-            </Form.Item>
-            <Form.Item name="smstome_otp_timeout_seconds" label="短信等待秒数">
-              <Input placeholder="45" />
-            </Form.Item>
-            <Form.Item name="smstome_poll_interval_seconds" label="轮询间隔秒数">
-              <Input placeholder="5" />
-            </Form.Item>
-            <Form.Item name="smstome_sync_max_pages_per_country" label="每国同步页数">
-              <Input placeholder="5" />
-            </Form.Item>
+            {isPhoneSignup ? (
+              <>
+                <Text type="secondary" style={{ display: 'block', marginBottom: 12 }}>
+                  手机号注册使用与手机号绑定一致的输入格式：每行 `手机号----收码API`。若号码已注册，会使用同一个密码走手机号登录短信验证。
+                </Text>
+                <Form.Item
+                  name="login_password"
+                  label="手机号注册/登录密码"
+                  rules={[{ required: isPhoneSignup, message: '请输入手机号注册/登录密码' }]}
+                  extra="新手机号注册时用这个密码创建账号；遇到已注册手机号时，也用这个密码登录续跑。"
+                >
+                  <Input.Password placeholder="新注册和已注册登录共用同一个密码" autoComplete="new-password" />
+                </Form.Item>
+                <Form.Item name="chatgpt_phone_signup_use_pool" valuePropName="checked">
+                  <Checkbox>使用手机号池</Checkbox>
+                </Form.Item>
+                {!phoneSignupUsePool ? (
+                  <Form.Item
+                    name="chatgpt_phone_signup_phone_lines"
+                    label="手机号----收码API"
+                    rules={[
+                      {
+                        validator: (_, value) => {
+                          if (!isPhoneSignup || phoneSignupUsePool) return Promise.resolve()
+                          return String(value || '').trim()
+                            ? Promise.resolve()
+                            : Promise.reject(new Error('请粘贴 手机号----收码API，或勾选使用手机号池'))
+                        },
+                      },
+                    ]}
+                    extra="示例：+573234567890----https://example.com/api/sms?id=xxx"
+                  >
+                    <Input.TextArea autoSize={{ minRows: 4, maxRows: 10 }} placeholder="+573234567890----https://example.com/api/sms?id=xxx" />
+                  </Form.Item>
+                ) : (
+                  <Alert
+                    type="info"
+                    showIcon
+                    style={{ marginBottom: 12 }}
+                    message="将从手机号池取号"
+                    description="手机号注册会串行执行，成功注册后的号码会标记为已用，避免再次作为注册手机号复用。"
+                  />
+                )}
+                <Space style={{ width: '100%' }} align="start">
+                  <Form.Item name="chatgpt_phone_signup_timeout_seconds" label="短信等待秒数" style={{ flex: 1 }}>
+                    <InputNumber min={10} max={1800} style={{ width: '100%' }} />
+                  </Form.Item>
+                  <Form.Item name="chatgpt_phone_signup_poll_interval_seconds" label="轮询间隔秒数" style={{ flex: 1 }}>
+                    <InputNumber min={1} max={60} style={{ width: '100%' }} />
+                  </Form.Item>
+                </Space>
+                <Space style={{ width: '100%' }} align="start">
+                  <Form.Item name="chatgpt_phone_signup_max_resend_attempts" label="重发次数" style={{ flex: 1 }}>
+                    <InputNumber min={1} max={20} style={{ width: '100%' }} />
+                  </Form.Item>
+                  <Form.Item name="chatgpt_phone_signup_resend_interval_seconds" label="重发后等待秒数" style={{ flex: 1 }}>
+                    <InputNumber min={10} max={600} style={{ width: '100%' }} />
+                  </Form.Item>
+                </Space>
+              </>
+            ) : (
+              <>
+                <Text type="secondary" style={{ display: 'block', marginBottom: 12 }}>
+                  仅在 OAuth 流程进入 `add_phone` 时使用，用于自动取号并轮询短信验证码。
+                </Text>
+                <Form.Item name="smstome_cookie" label="SMSToMe Cookie">
+                  <Input.Password placeholder="cf_clearance=...; PHPSESSID=..." />
+                </Form.Item>
+                <Form.Item name="smstome_country_slugs" label="国家列表">
+                  <Input placeholder="united-kingdom,poland,finland" />
+                </Form.Item>
+                <Form.Item name="smstome_phone_attempts" label="手机号尝试次数">
+                  <Input placeholder="3" />
+                </Form.Item>
+                <Form.Item name="smstome_otp_timeout_seconds" label="短信等待秒数">
+                  <Input placeholder="45" />
+                </Form.Item>
+                <Form.Item name="smstome_poll_interval_seconds" label="轮询间隔秒数">
+                  <Input placeholder="5" />
+                </Form.Item>
+                <Form.Item name="smstome_sync_max_pages_per_country" label="每国同步页数">
+                  <Input placeholder="5" />
+                </Form.Item>
+              </>
+            )}
           </Card>
         )}
 
@@ -1000,7 +1299,7 @@ export default function RegisterTaskPage() {
         )}
 
         <Button type="primary" htmlType="submit" block disabled={polling} icon={polling ? <LoadingOutlined /> : <PlayCircleOutlined />}>
-          {polling ? '注册中...' : '开始注册'}
+          {polling ? '任务运行中...' : '开始注册'}
         </Button>
       </Form>
 
@@ -1048,6 +1347,18 @@ export default function RegisterTaskPage() {
               taskId={task.id}
               verification={task.pending_verification}
             />
+          ) : null}
+          {Array.isArray(task?.meta?.runtime_results) && task.meta.runtime_results.length > 0 ? (
+            <div style={{ marginTop: 16 }}>
+              <PhoneBindingResultsTable
+                results={task.meta.runtime_results}
+                prefixSummary={task.meta.prefix_summary}
+                showPrefixSummary={Array.isArray(task?.meta?.prefix_summary?.items)}
+                showSuccessfulLines
+                boundPhoneLines={Array.isArray(task?.meta?.registered_phone_lines) ? task.meta.registered_phone_lines : []}
+                emptyText="任务结束后，这里会输出已完成手机号注册的手机号。"
+              />
+            </div>
           ) : null}
           {task.id ? (
             <div style={{ marginTop: 16 }}>

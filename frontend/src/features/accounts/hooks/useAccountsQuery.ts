@@ -9,6 +9,8 @@ export type AccountsQueryParams = {
   subscriptionType?: string
   accountValidity?: string
   sub2apiState?: string
+  oaipayState?: string
+  revivalState?: string
   sortBy?: string
   sortOrder?: string
   page?: number
@@ -29,14 +31,16 @@ export function useAccountsQuery({
   subscriptionType = '',
   accountValidity = '',
   sub2apiState = '',
+  oaipayState = '',
+  revivalState = '',
   sortBy = '',
   sortOrder = '',
   page = 1,
   pageSize = 50,
 }: AccountsQueryParams) {
   return useQuery<AccountsQueryResult>({
-    queryKey: ['accounts', { email, status, manuallyUsed, authType, subscriptionType, accountValidity, sub2apiState, sortBy, sortOrder, page, pageSize }],
-    queryFn: async () => {
+    queryKey: ['accounts', { email, status, manuallyUsed, authType, subscriptionType, accountValidity, sub2apiState, oaipayState, revivalState, sortBy, sortOrder, page, pageSize }],
+    queryFn: async ({ signal }) => {
       const params = new URLSearchParams({
         platform: 'chatgpt',
         page: String(page),
@@ -50,11 +54,15 @@ export function useAccountsQuery({
       if (subscriptionType) params.set('subscription_type', subscriptionType)
       if (accountValidity) params.set('account_validity', accountValidity)
       if (sub2apiState) params.set('sub2api_state', sub2apiState)
+      if (oaipayState) params.set('oaipay_state', oaipayState)
+      if (revivalState) params.set('revival_state', revivalState)
       if (sortBy && sortOrder) {
         params.set('sort_by', sortBy)
         params.set('sort_order', sortOrder)
       }
-      return apiFetch(`/accounts?${params}`) as Promise<AccountsQueryResult>
+      return apiFetch(`/accounts?${params}`, { signal }) as Promise<AccountsQueryResult>
     },
+    placeholderData: (previousData) => previousData,
+    staleTime: 60_000,
   })
 }

@@ -8,14 +8,30 @@ from core.db import AccountModel, get_session
 from core.base_platform import RegisterConfig
 from core.config_store import config_store
 from services.account_filters import account_base_query, filter_account_rows
+from services.account_rate_limit_recovery import reconcile_rate_limited_accounts
 from services.chatgpt_account_state import apply_chatgpt_status_policy, classify_chatgpt_capabilities, mark_payment_pending
 from services.chatgpt_core import ChatGPTPlatform
+from services.chatgpt_core.local_status_refresh import schedule_chatgpt_local_status_refresh_for_account_id
 from services.chatgpt_core.invalid_account_recheck import recheck_invalid_chatgpt_account
 from services.chatgpt_core.payment_link_cache import build_payment_link_cache_payload
 from services.chatgpt_sync import update_account_model_cliproxy_sync
 from services.sub2api_sync import backfill_chatgpt_account_to_sub2api, probe_chatgpt_sub2api_status, update_account_model_sub2api_sync
+from services.oaipay_sync import backfill_chatgpt_account_to_oaipay, probe_chatgpt_oaipay_status, update_account_model_oaipay_sync
 
 router = APIRouter(prefix="/actions", tags=["actions"])
+
+_LOCAL_STATUS_AUTH_ACTION_IDS = {
+    "refresh_token",
+    "resume_subscription_auth",
+    "invalid_recheck",
+}
+_LOCAL_STATUS_AUTH_PATCH_KEYS = {
+    "access_token",
+    "accessToken",
+    "refresh_token",
+    "refreshToken",
+    "webAccessToken",
+}
 
 
 class ActionRequest(BaseModel):
@@ -32,6 +48,7 @@ class BatchActionRequest(BaseModel):
     subscription_type: str = ""
     account_validity: str = ""
     sub2api_state: str = ""
+    oaipay_state: str = ""
     params: dict = {}
 
 
@@ -183,6 +200,23 @@ def _apply_action_result(
             session.add(acc_model)
 
 
+def _action_should_auto_refresh_local_status(action_id: str, result: dict[str, Any], acc_model: AccountModel) -> bool:
+    if not bool(result.get("ok")):
+        return False
+    if str(action_id or "") in _LOCAL_STATUS_AUTH_ACTION_IDS:
+        return True
+
+    data = result.get("data") if isinstance(result.get("data"), dict) else {}
+    if _LOCAL_STATUS_AUTH_PATCH_KEYS.intersection(data.keys()):
+        return True
+
+    patch = result.get("account_extra_patch") if isinstance(result.get("account_extra_patch"), dict) else {}
+    if _LOCAL_STATUS_AUTH_PATCH_KEYS.intersection(patch.keys()):
+        return True
+
+    return False
+
+
 def _execute_chatgpt_resume_subscription_auth(
     acc_model: AccountModel,
     *,
@@ -191,6 +225,8 @@ def _execute_chatgpt_resume_subscription_auth(
     shared_phone_service=None,
     stop_checker=None,
     retry_delays_seconds=None,
+    proxy_url: str | None = None,
+    phone_sms_probe_only: bool = False,
 ) -> dict[str, Any]:
     from services.chatgpt_core.subscription_auth_capture import capture_subscription_auth_for_account
 
@@ -210,7 +246,10 @@ def _execute_chatgpt_resume_subscription_auth(
     capture_kwargs = {
         "allow_phone_verification": resolved_allow_phone_verification,
         "log_fn": _collect_log,
+        "phone_sms_probe_only": bool(phone_sms_probe_only),
     }
+    if proxy_url:
+        capture_kwargs["proxy_url"] = str(proxy_url or "")
     if shared_phone_service is not None:
         capture_kwargs["shared_phone_service"] = shared_phone_service
     if callable(stop_checker):
@@ -285,6 +324,7 @@ def _execute_chatgpt_resume_subscription_auth_action(
     result = _execute_chatgpt_resume_subscription_auth(
         acc_model,
         allow_phone_verification=allow_phone_verification,
+        proxy_url=str(params.get("proxy_url") or params.get("proxy") or "") or None,
     )
     session.refresh(acc_model)
     _apply_chatgpt_resume_auth_result(acc_model, result, session)
@@ -297,12 +337,16 @@ def _execute_chatgpt_invalid_recheck(
     log_fn=None,
     stop_checker=None,
     task_id: str = "",
+    task_control=None,
+    attempt_id: int | None = None,
 ) -> dict[str, Any]:
     return recheck_invalid_chatgpt_account(
         int(acc_model.id or 0),
         log_fn=log_fn,
         stop_checker=stop_checker,
         task_id=task_id,
+        task_control=task_control,
+        attempt_id=attempt_id,
     )
 
 
@@ -336,6 +380,9 @@ def _execute_platform_action(
 
     if platform == "chatgpt" and action_id == "upload_sub2api":
         outcome = backfill_chatgpt_account_to_sub2api(acc_model, session=session, commit=False)
+    if platform == "chatgpt" and action_id == "upload_oaipay":
+        category_id = params.get("category_id")
+        outcome = backfill_chatgpt_account_to_oaipay(acc_model, session=session, commit=False, category_id=category_id)
         result = {
             "ok": bool(outcome.get("ok")),
             "data": {
@@ -369,6 +416,7 @@ def _resolve_batch_accounts(platform: str, body: BatchActionRequest, session: Se
         if len(account_ids) > 1000:
             raise HTTPException(400, "单次最多处理 1000 个账号")
 
+        reconcile_rate_limited_accounts(session, platform=platform, account_ids=account_ids)
         rows = session.exec(
             select(AccountModel)
             .where(AccountModel.platform == platform)
@@ -382,6 +430,7 @@ def _resolve_batch_accounts(platform: str, body: BatchActionRequest, session: Se
     if not body.all_filtered:
         raise HTTPException(400, "请提供 account_ids，或指定 all_filtered=true")
 
+    reconcile_rate_limited_accounts(session, platform=platform)
     query = account_base_query(platform=platform, status=body.status, email=body.email)
     rows = filter_account_rows(
         session.exec(query).all(),
@@ -390,6 +439,7 @@ def _resolve_batch_accounts(platform: str, body: BatchActionRequest, session: Se
         subscription_type=body.subscription_type,
         account_validity_filter=body.account_validity,
         sub2api_state=body.sub2api_state,
+        oaipay_state=body.oaipay_state,
     )
     if len(rows) > 1000:
         raise HTTPException(400, "单次最多处理 1000 个账号")
@@ -472,7 +522,7 @@ def _execute_batch_sub2api_sync(accounts: list[AccountModel], session: Session) 
         sync_result = probe_chatgpt_sub2api_status(acc_model)
         update_account_model_sub2api_sync(acc_model, sync_result, session=session, commit=False)
         remote_state = str(sync_result.get("remote_state") or "").strip().lower()
-        ok = remote_state in {"exists", "not_found"}
+        ok = remote_state in {"exists", "not_found", "cross_workspace_only"}
         if ok:
             success_count += 1
         else:
@@ -487,6 +537,44 @@ def _execute_batch_sub2api_sync(accounts: list[AccountModel], session: Session) 
                 "email": acc_model.email,
                 "ok": ok,
                 "message": f"Sub2API 状态同步完成：{summary}",
+                "status": acc_model.status,
+            }
+        )
+
+    return {
+        "total": len(items),
+        "success": success_count,
+        "failed": failed_count,
+        "items": items,
+    }
+
+
+def _execute_batch_oaipay_sync(accounts: list[AccountModel], session: Session) -> dict[str, Any]:
+    items = []
+    success_count = 0
+    failed_count = 0
+
+    from services.oaipay_sync import probe_chatgpt_oaipay_status, update_account_model_oaipay_sync
+
+    for acc_model in accounts:
+        sync_result = probe_chatgpt_oaipay_status(acc_model)
+        update_account_model_oaipay_sync(acc_model, sync_result, session=session, commit=False)
+        remote_state = str(sync_result.get("remote_state") or "").strip().lower()
+        ok = remote_state in {"exists", "not_found", "cross_workspace_only"}
+        if ok:
+            success_count += 1
+        else:
+            failed_count += 1
+        summary = (
+            f"远端状态={sync_result.get('status') or remote_state or 'unknown'}, "
+            f"探测={remote_state or 'not_checked'}"
+        )
+        items.append(
+            {
+                "id": acc_model.id,
+                "email": acc_model.email,
+                "ok": ok,
+                "message": f"OAIPay 状态同步完成：{summary}",
                 "status": acc_model.status,
             }
         )
@@ -523,11 +611,13 @@ def execute_batch_action(
     if not accounts and not missing_ids:
         return {"total": 0, "success": 0, "failed": 0, "items": []}
 
-    if platform == "chatgpt" and action_id in {"sync_cliproxyapi_status", "sync_sub2api_status"}:
+    if platform == "chatgpt" and action_id in {"sync_cliproxyapi_status", "sync_sub2api_status", "sync_oaipay_status"}:
         if action_id == "sync_cliproxyapi_status":
             batch_result = _execute_batch_cliproxy_sync(accounts, session)
-        else:
+        elif action_id == "sync_sub2api_status":
             batch_result = _execute_batch_sub2api_sync(accounts, session)
+        else:
+            batch_result = _execute_batch_oaipay_sync(accounts, session)
         if missing_ids:
             for missing_id in missing_ids:
                 batch_result["failed"] += 1
@@ -547,6 +637,7 @@ def execute_batch_action(
     items = []
     success_count = 0
     failed_count = 0
+    local_status_auto_refresh_ids: list[int] = []
 
     for missing_id in missing_ids:
         failed_count += 1
@@ -563,6 +654,10 @@ def execute_batch_action(
     for acc_model in accounts:
         try:
             result = _execute_platform_action(instance, platform, acc_model, action_id, body.params, session)
+            if platform == "chatgpt" and _action_should_auto_refresh_local_status(action_id, result, acc_model):
+                account_id_value = int(acc_model.id or 0)
+                if account_id_value > 0:
+                    local_status_auto_refresh_ids.append(account_id_value)
             ok = bool(result.get("ok"))
             if ok:
                 success_count += 1
@@ -590,6 +685,8 @@ def execute_batch_action(
             )
 
     session.commit()
+    for account_id_value in dict.fromkeys(local_status_auto_refresh_ids):
+        schedule_chatgpt_local_status_refresh_for_account_id(account_id_value, reason=f"action:{action_id}")
     return {
         "total": len(items),
         "success": success_count,
@@ -617,7 +714,10 @@ def execute_action(
 
     try:
         result = _execute_platform_action(instance, platform, acc_model, action_id, body.params, session)
+        should_refresh_local_status = _action_should_auto_refresh_local_status(action_id, result, acc_model)
         session.commit()
+        if should_refresh_local_status:
+            schedule_chatgpt_local_status_refresh_for_account_id(acc_model.id, reason=f"action:{action_id}")
         return result
     except NotImplementedError as e:
         raise HTTPException(400, str(e))

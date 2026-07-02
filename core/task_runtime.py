@@ -69,6 +69,10 @@ class VerificationChallenge:
     status: str = "pending"
     code: str = ""
     cancel_reason: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
+    actions: list[str] = field(default_factory=list)
+    action_request: dict[str, Any] = field(default_factory=dict)
+    action_seq: int = 0
 
     def __post_init__(self) -> None:
         if not self.expires_at:
@@ -85,6 +89,10 @@ class VerificationChallenge:
             "created_at": self.created_at,
             "expires_at": self.expires_at,
             "status": self.status,
+            "metadata": dict(self.metadata or {}),
+            "actions": list(self.actions or []),
+            "action_request": dict(self.action_request or {}),
+            "action_seq": int(self.action_seq or 0),
         }
 
 
@@ -188,6 +196,9 @@ class RegisterTaskControl:
         phase_label: str,
         email: str,
         timeout_seconds: int,
+        metadata: dict[str, Any] | None = None,
+        actions: list[str] | None = None,
+        action_handler=None,
     ) -> str:
         timeout_value = max(int(timeout_seconds or 0), 1)
         phase_value = str(phase or "email_otp").strip() or "email_otp"
@@ -205,9 +216,12 @@ class RegisterTaskControl:
                 phase_label=phase_label_value,
                 email=email_value,
                 timeout_seconds=timeout_value,
+                metadata=dict(metadata or {}),
+                actions=[str(item or "").strip() for item in (actions or []) if str(item or "").strip()],
             )
             self._pending_verification = challenge
             self._condition.notify_all()
+            handled_action_seq = 0
 
             while True:
                 self.checkpoint(attempt_id=attempt_id)
@@ -237,6 +251,51 @@ class RegisterTaskControl:
                             self._skip_active_attempt_ids.discard(attempt_id)
                         raise SkipCurrentAttemptRequested()
                     raise RuntimeError("验证码等待已取消")
+
+                if (
+                    callable(action_handler)
+                    and current.action_seq > handled_action_seq
+                    and isinstance(current.action_request, dict)
+                ):
+                    action_seq = int(current.action_seq or 0)
+                    action_payload = dict(current.action_request or {})
+                    current.metadata = {
+                        **dict(current.metadata or {}),
+                        "action_status": "handling",
+                        "action": str(action_payload.get("action") or ""),
+                    }
+                    self._condition.notify_all()
+
+                    self._condition.release()
+                    try:
+                        try:
+                            action_result = action_handler(
+                                str(action_payload.get("action") or ""),
+                                dict(action_payload.get("payload") or {}),
+                            )
+                            action_error = ""
+                        except Exception as exc:
+                            action_result = {}
+                            action_error = str(exc or "验证码动作处理失败")
+                    finally:
+                        self._condition.acquire()
+
+                    current = self._pending_verification
+                    if current is not None and current.challenge_id == challenge_id:
+                        result_metadata = (
+                            dict(action_result.get("metadata") or {})
+                            if isinstance(action_result, dict)
+                            else {}
+                        )
+                        current.metadata = {
+                            **dict(current.metadata or {}),
+                            **result_metadata,
+                            "action_status": "failed" if action_error else "done",
+                            "action_error": action_error,
+                        }
+                        handled_action_seq = action_seq
+                        self._condition.notify_all()
+                    continue
 
                 now = time.time()
                 if now >= current.expires_at:
@@ -271,6 +330,74 @@ class RegisterTaskControl:
 
             challenge.code = code_value
             challenge.status = "submitted"
+            self._condition.notify_all()
+            return challenge.to_dict()
+
+    def update_verification_metadata(
+        self,
+        *,
+        challenge_id: str,
+        patch: dict[str, Any],
+    ) -> dict[str, Any]:
+        challenge_id_value = str(challenge_id or "").strip()
+        with self._condition:
+            challenge = self._pending_verification
+            if challenge is None:
+                raise KeyError("当前没有待更新的验证码挑战")
+            if challenge.challenge_id != challenge_id_value:
+                raise KeyError("验证码挑战不存在或已过期")
+            if challenge.status != "pending":
+                raise ValueError("验证码挑战已结束")
+            challenge.metadata = {
+                **dict(challenge.metadata or {}),
+                **dict(patch or {}),
+            }
+            self._condition.notify_all()
+            return challenge.to_dict()
+
+    def request_verification_action(
+        self,
+        *,
+        challenge_id: str,
+        action: str,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        challenge_id_value = str(challenge_id or "").strip()
+        action_value = str(action or "").strip()
+        if not challenge_id_value:
+            raise ValueError("challenge_id 不能为空")
+        if not action_value:
+            raise ValueError("action 不能为空")
+
+        with self._condition:
+            challenge = self._pending_verification
+            if challenge is None:
+                raise KeyError("当前没有待处理的验证码挑战")
+            if challenge.challenge_id != challenge_id_value:
+                raise KeyError("验证码挑战不存在或已过期")
+            if challenge.status != "pending":
+                raise ValueError("验证码挑战已结束")
+            if time.time() >= challenge.expires_at:
+                challenge.status = "expired"
+                self._pending_verification = None
+                self._condition.notify_all()
+                raise ValueError("验证码挑战已超时")
+            allowed = {str(item or "").strip() for item in (challenge.actions or [])}
+            if allowed and action_value not in allowed:
+                raise ValueError(f"当前验证码挑战不支持动作: {action_value}")
+            challenge.action_seq += 1
+            challenge.action_request = {
+                "seq": challenge.action_seq,
+                "action": action_value,
+                "payload": dict(payload or {}),
+                "requested_at": time.time(),
+            }
+            challenge.metadata = {
+                **dict(challenge.metadata or {}),
+                "action_status": "pending",
+                "action": action_value,
+                "action_error": "",
+            }
             self._condition.notify_all()
             return challenge.to_dict()
 

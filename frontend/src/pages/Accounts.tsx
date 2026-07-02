@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useState, useCallback, useRef } from 'react'
+import { lazy, Suspense, useEffect, useState, useCallback, useMemo, useRef } from 'react'
 import type { CSSProperties } from 'react'
 import {
   Button,
@@ -17,6 +17,7 @@ import {
   Popconfirm,
   theme,
   Grid,
+  Segmented,
   Steps,
   Switch,
 } from 'antd'
@@ -39,7 +40,6 @@ import { AccountsToolbar } from '@/features/accounts/components/AccountsToolbar'
 import { BatchGopayWorkbench } from '@/features/accounts/components/BatchGopayWorkbench'
 import { ImportAccountsModal } from '@/features/accounts/components/ImportAccountsModal'
 import { PendingInvitesModal } from '@/features/accounts/components/PendingInvitesModal'
-import { Sub2ApiOverviewPanel } from '@/features/accounts/components/Sub2ApiOverviewPanel'
 import { useAccountDetailQuery } from '@/features/accounts/hooks/useAccountDetailQuery'
 import { useActiveTasksQuery } from '@/features/accounts/hooks/useActiveTasksQuery'
 import { RegisterTaskModal } from '@/features/auth/components/RegisterTaskModal'
@@ -68,7 +68,10 @@ const AccountActionSurface = lazy(() =>
 
 const GOPAY_ACTIVE_PHASES = new Set(['created', 'starting', 'waiting_otp', 'waiting_link_pin', 'waiting_payment_pin', 'verifying'])
 const TASK_MODAL_STORAGE_KEY = 'auto-chatgpt.accounts.task-modal.current-task'
-const ACCOUNT_COLUMN_VISIBILITY_STORAGE_KEY = 'auto-chatgpt.accounts.visible-columns.v1'
+const ACCOUNT_COLUMN_VISIBILITY_STORAGE_KEY = 'auto-chatgpt.accounts.visible-columns.v2'
+const PHONE_BINDING_SETTINGS_STORAGE_KEY = 'auto-chatgpt.accounts.phone-binding-settings.v1'
+const BAXIGPT_CDK_SETTINGS_STORAGE_KEY = 'auto-chatgpt.accounts.baxigpt-cdk-settings.v1'
+const PAYPAL_BINDING_SETTINGS_STORAGE_KEY = 'auto-chatgpt.accounts.paypal-binding-settings.v1'
 
 const GOPAY_PHASE_META: Record<string, { title: string; description: string; step: number; status?: 'wait' | 'process' | 'finish' | 'error' }> = {
   created: { title: '已创建', description: '准备开始 GoPay 支付', step: 0, status: 'process' },
@@ -89,10 +92,100 @@ function gopayPhaseMeta(phase?: string) {
 const REGISTER_FORM_SETTINGS_STORAGE_PREFIX = 'auto-chatgpt.register-form-settings.'
 const DEFAULT_CHECKOUT_COUNTRY = 'ID'
 const DEFAULT_CHECKOUT_CURRENCY = 'IDR'
+const DEFAULT_PAYMENT_LINK_FORMAT = 'long_hosted'
+const PAYMENT_LINK_FORMAT_OPTIONS = [
+  { label: '长支付链接', value: 'long_hosted' },
+  { label: '短连接路径', value: 'short_chatgpt' },
+]
 const DEFAULT_GOPAY_OTP_AUTO_RESEND_DELAY_SECONDS = 120
 const ACCOUNTS_PAGE_SIZE = 10
 const EMPTY_LIST: any[] = []
 const SUBSCRIPTION_EXPIRY_SORT_FIELD = 'subscription_active_until'
+
+const DEFAULT_PHONE_BINDING_SETTINGS = {
+  use_pool: true,
+  prefix_sample_enabled: false,
+  prefix_sample_size: 1,
+  prefix_sample_filter: 'all',
+  timeout_seconds: 180,
+  poll_interval_seconds: 5,
+  max_resend_attempts: 0,
+  resend_interval_seconds: 30,
+  account_interval_seconds: 60,
+  reuse_phone_until_unusable: false,
+  proxy_mode: 'pool',
+  proxy: '',
+  proxy_country_code: '',
+  proxy_failover: true,
+  proxy_max_candidates: 10,
+  proxy_min_score: 50,
+}
+
+const DEFAULT_BAXIGPT_CDK_SETTINGS = {
+  use_pool: true,
+  precheck: true,
+  failure_continue: true,
+  submit_interval_seconds: 5,
+  auto_poll_status: true,
+  status_poll_interval_seconds: 5,
+  status_poll_timeout_seconds: 300,
+}
+
+const DEFAULT_PAYPAL_BINDING_SETTINGS = {
+  base_url: 'https://plus.iceaix.com',
+  proxy: '',
+  proxy_jp: '',
+  phone: '',
+  paypal_email: '',
+  sms_api: '',
+  sms_api_test_mode: false,
+  otp_timeout: 180,
+  pplink_retry: 3,
+  timeout: 30,
+  event_timeout: 60,
+  account_interval_seconds: 0,
+  failure_continue: true,
+}
+
+const PAYPAL_BINDING_ALLOWED_SUBSCRIPTION_TYPES = new Set(['free'])
+const PAYPAL_BINDING_ALLOWED_ACCOUNT_VALIDITY = new Set(['valid'])
+const PAYPAL_BINDING_EMPTY_FILTER = '__paypal_no_match__'
+
+type PhoneBindingSettings = typeof DEFAULT_PHONE_BINDING_SETTINGS
+type BaxiGptCdkSettings = typeof DEFAULT_BAXIGPT_CDK_SETTINGS
+type PaypalBindingSettings = typeof DEFAULT_PAYPAL_BINDING_SETTINGS
+type PhonePoolSummary = {
+  total?: number
+  available?: number
+  remaining_capacity?: number
+  rate_limited?: number
+  unavailable?: number
+  cannot_send?: number
+  cooldown?: number
+  exhausted?: number
+  disabled?: number
+  available_prefix_count?: number
+  available_prefix_sample_1?: number
+  available_prefix_sample_2?: number
+  prefix_sample_prefix_count?: number
+  prefix_sample_phone_count?: number
+  prefix_sample_count_1?: number
+  prefix_sample_count_2?: number
+  rejected_prefix_count?: number
+  rejected_prefix_sample_1?: number
+  rejected_prefix_sample_2?: number
+}
+
+type BaxiGptCdkPoolSummary = {
+  total?: number
+  available?: number
+  reserved?: number
+  submitted?: number
+  processing?: number
+  paid?: number
+  failed?: number
+  disabled?: number
+}
 
 type SubscriptionExpirySortOrder = '' | 'asc' | 'desc'
 
@@ -106,6 +199,9 @@ type AccountColumnKey =
   | 'subscription_active_until'
   | 'account_validity'
   | 'sub2api_state'
+  | 'sub2api_upload_record'
+  | 'oaipay_state'
+  | 'oaipay_upload_record'
   | 'created_at'
 
 const ACCOUNT_COLUMN_OPTIONS: Array<{ value: AccountColumnKey; text: string; chatgptOnly?: boolean }> = [
@@ -118,6 +214,9 @@ const ACCOUNT_COLUMN_OPTIONS: Array<{ value: AccountColumnKey; text: string; cha
   { value: 'subscription_active_until', text: '订阅到期', chatgptOnly: true },
   { value: 'account_validity', text: '账号有效性', chatgptOnly: true },
   { value: 'sub2api_state', text: 'Sub2API', chatgptOnly: true },
+  { value: 'sub2api_upload_record', text: 'Sub2API上传', chatgptOnly: true },
+  { value: 'oaipay_state', text: 'OAIPay', chatgptOnly: true },
+  { value: 'oaipay_upload_record', text: 'OAIPay上传', chatgptOnly: true },
   { value: 'created_at', text: '注册时间' },
 ]
 
@@ -129,6 +228,10 @@ const DEFAULT_VISIBLE_ACCOUNT_COLUMNS: AccountColumnKey[] = [
   'subscription_type',
   'subscription_active_until',
   'account_validity',
+  'sub2api_state',
+  'sub2api_upload_record',
+  'oaipay_state',
+  'oaipay_upload_record',
   'created_at',
 ]
 
@@ -142,6 +245,7 @@ type AccountColumnFilters = {
   subscriptionType: string[]
   accountValidity: string[]
   sub2apiState: string[]
+  oaipayState: string[]
 }
 
 const EMPTY_ACCOUNT_FILTERS: AccountColumnFilters = {
@@ -152,12 +256,14 @@ const EMPTY_ACCOUNT_FILTERS: AccountColumnFilters = {
   subscriptionType: [],
   accountValidity: [],
   sub2apiState: [],
+  oaipayState: [],
 }
 
 const STATUS_FILTER_OPTIONS = [
   { value: 'registered', text: '已注册' },
   { value: 'pending_payment', text: '待支付' },
   { value: 'payment_failed', text: '支付失败' },
+  { value: 'rate_limited', text: '限流' },
   { value: 'trial', text: '试用中' },
   { value: 'subscribed', text: '已订阅' },
   { value: 'expired', text: '已过期' },
@@ -199,6 +305,16 @@ const SUB2API_FILTER_OPTIONS = [
   { value: 'unknown', text: '未同步' },
 ]
 
+const OAIPAY_FILTER_OPTIONS = [
+  { value: 'exists', text: '已存在' },
+  { value: 'not_found', text: '未发现' },
+  { value: 'cross_workspace_only', text: '其他工作区已存在' },
+  { value: 'deleted_exact_match', text: '已删可重传' },
+  { value: 'ambiguous', text: '多候选' },
+  { value: 'unreachable', text: '不可达' },
+  { value: 'unknown', text: '未同步' },
+]
+
 const SUBSCRIPTION_EXPIRY_SORT_OPTIONS = [
   { value: 'asc', text: '到期最早' },
   { value: 'desc', text: '到期最晚' },
@@ -212,6 +328,17 @@ function normalizeCheckoutCurrency(value: unknown) {
   return String(value || DEFAULT_CHECKOUT_CURRENCY).trim().toUpperCase() || DEFAULT_CHECKOUT_CURRENCY
 }
 
+function normalizePaymentLinkFormat(value: unknown) {
+  const normalized = String(value || '').trim().toLowerCase().replace(/-/g, '_')
+  return normalized === 'short' || normalized === 'short_chatgpt' || normalized === 'chatgpt' || normalized === 'custom'
+    ? 'short_chatgpt'
+    : DEFAULT_PAYMENT_LINK_FORMAT
+}
+
+function paymentLinkFormatLabel(value: unknown) {
+  return normalizePaymentLinkFormat(value) === 'short_chatgpt' ? '短连接路径' : '长支付链接'
+}
+
 function normalizeGopayOtpAutoResendDelay(value: unknown) {
   const parsed = Number(value)
   if (!Number.isFinite(parsed)) return DEFAULT_GOPAY_OTP_AUTO_RESEND_DELAY_SECONDS
@@ -219,12 +346,13 @@ function normalizeGopayOtpAutoResendDelay(value: unknown) {
 }
 
 function parseMaybeJsonObject(value: unknown) {
-  if (value && typeof value === 'object') return value as Record<string, any>
+  if (!value) return {}
+  if (typeof value === 'object') return !Array.isArray(value) ? value as Record<string, any> : {}
   const text = String(value || '').trim()
   if (!text) return {}
   try {
     const parsed = JSON.parse(text)
-    return parsed && typeof parsed === 'object' ? parsed : {}
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {}
   } catch {
     return {}
   }
@@ -237,6 +365,7 @@ type GopayPhoneCandidate = {
   phone_number: string
   enabled?: boolean
   last_used_at?: string
+  api_expired_date?: string
 }
 
 type BatchGopayItem = {
@@ -276,6 +405,10 @@ function formatGopayPhoneLabel(phone: Partial<GopayPhoneCandidate>) {
   return label ? `${label} · ${value}` : value
 }
 
+function formatGopayPhoneExpiryLabel(phone: Partial<GopayPhoneCandidate>) {
+  return String((phone as any).api_expired_date || (phone as any).apiExpiredDate || '').trim()
+}
+
 function normalizeGopayPhoneCandidate(value: any, index = 0): GopayPhoneCandidate | null {
   const phone_country_code = normalizeGopayPhonePart(value?.phone_country_code || value?.country_code || value?.code || DEFAULT_GOPAY_PHONE_COUNTRY_CODE)
   const phone_number = normalizeGopayPhonePart(value?.phone_number || value?.number || value?.phone || '')
@@ -288,6 +421,7 @@ function normalizeGopayPhoneCandidate(value: any, index = 0): GopayPhoneCandidat
     phone_number,
     enabled: value?.enabled !== false,
     last_used_at: String(value?.last_used_at || '').trim(),
+    api_expired_date: String(value?.api_expired_date || value?.apiExpiredDate || '').trim(),
   }
 }
 
@@ -399,6 +533,7 @@ const STATUS_COLORS: Record<string, string> = {
   registered: 'default',
   pending_payment: 'warning',
   payment_failed: 'error',
+  rate_limited: 'warning',
   trial: 'success',
   subscribed: 'success',
   expired: 'warning',
@@ -409,6 +544,7 @@ const STATUS_LABELS: Record<string, string> = {
   registered: '已注册',
   pending_payment: '待支付',
   payment_failed: '支付失败',
+  rate_limited: '限流',
   trial: '试用中',
   subscribed: '已订阅',
   expired: '已过期',
@@ -483,6 +619,152 @@ function saveRegisterFormSettings(platform: string, values: Record<string, unkno
   window.localStorage.setItem(getRegisterFormSettingsStorageKey(platform), JSON.stringify(values))
 }
 
+function intWithDefault(value: unknown, fallback: number, min = 0) {
+  const next = Number(value)
+  if (!Number.isFinite(next)) return fallback
+  return Math.max(Math.floor(next), min)
+}
+
+function normalizePhoneBindingSettings(value: unknown): PhoneBindingSettings {
+  const raw = value && typeof value === 'object' ? value as Record<string, unknown> : {}
+  return {
+    use_pool: raw.use_pool === undefined ? DEFAULT_PHONE_BINDING_SETTINGS.use_pool : Boolean(raw.use_pool),
+    prefix_sample_enabled: Boolean(raw.prefix_sample_enabled),
+    prefix_sample_size: intWithDefault(raw.prefix_sample_size, DEFAULT_PHONE_BINDING_SETTINGS.prefix_sample_size, 1) === 2 ? 2 : 1,
+    prefix_sample_filter: (() => {
+      const value = String(raw.prefix_sample_filter || DEFAULT_PHONE_BINDING_SETTINGS.prefix_sample_filter)
+      if (value === 'available' || value === 'available_only' || value === 'healthy' || value === 'healthy_only') return 'available'
+      if (value === 'rejected' || value === 'rejected_only' || value === 'unavailable' || value === 'unavailable_only') return 'rejected'
+      return 'all'
+    })(),
+    timeout_seconds: intWithDefault(raw.timeout_seconds, DEFAULT_PHONE_BINDING_SETTINGS.timeout_seconds, 10),
+    poll_interval_seconds: intWithDefault(raw.poll_interval_seconds, DEFAULT_PHONE_BINDING_SETTINGS.poll_interval_seconds, 1),
+    max_resend_attempts: intWithDefault(raw.max_resend_attempts, DEFAULT_PHONE_BINDING_SETTINGS.max_resend_attempts, 0),
+    resend_interval_seconds: intWithDefault(raw.resend_interval_seconds, DEFAULT_PHONE_BINDING_SETTINGS.resend_interval_seconds, 0),
+    account_interval_seconds: intWithDefault(raw.account_interval_seconds, DEFAULT_PHONE_BINDING_SETTINGS.account_interval_seconds, 1),
+    reuse_phone_until_unusable: Boolean(raw.reuse_phone_until_unusable),
+    proxy_mode: (() => {
+      const value = String(raw.proxy_mode || DEFAULT_PHONE_BINDING_SETTINGS.proxy_mode).trim()
+      return value === 'direct' || value === 'specified' || value === 'pool' ? value : 'pool'
+    })(),
+    proxy: String(raw.proxy || ''),
+    proxy_country_code: String(raw.proxy_country_code || '').trim().toUpperCase(),
+    proxy_failover: raw.proxy_failover === undefined ? DEFAULT_PHONE_BINDING_SETTINGS.proxy_failover : Boolean(raw.proxy_failover),
+    proxy_max_candidates: intWithDefault(raw.proxy_max_candidates, DEFAULT_PHONE_BINDING_SETTINGS.proxy_max_candidates, 1),
+    proxy_min_score: intWithDefault(raw.proxy_min_score, DEFAULT_PHONE_BINDING_SETTINGS.proxy_min_score, 0),
+  }
+}
+
+function loadPhoneBindingSettings() {
+  if (typeof window === 'undefined') return { ...DEFAULT_PHONE_BINDING_SETTINGS }
+  try {
+    const raw = window.localStorage.getItem(PHONE_BINDING_SETTINGS_STORAGE_KEY)
+    if (!raw) return { ...DEFAULT_PHONE_BINDING_SETTINGS }
+    return normalizePhoneBindingSettings(JSON.parse(raw))
+  } catch {
+    return { ...DEFAULT_PHONE_BINDING_SETTINGS }
+  }
+}
+
+function savePhoneBindingSettings(values: Record<string, unknown>) {
+  if (typeof window === 'undefined') return
+  window.localStorage.setItem(PHONE_BINDING_SETTINGS_STORAGE_KEY, JSON.stringify(normalizePhoneBindingSettings(values)))
+}
+
+function normalizeBaxiGptCdkSettings(value: unknown): BaxiGptCdkSettings {
+  const raw = value && typeof value === 'object' ? value as Record<string, unknown> : {}
+  return {
+    use_pool: raw.use_pool === undefined ? DEFAULT_BAXIGPT_CDK_SETTINGS.use_pool : Boolean(raw.use_pool),
+    precheck: raw.precheck === undefined ? DEFAULT_BAXIGPT_CDK_SETTINGS.precheck : Boolean(raw.precheck),
+    failure_continue: raw.failure_continue === undefined ? DEFAULT_BAXIGPT_CDK_SETTINGS.failure_continue : Boolean(raw.failure_continue),
+    submit_interval_seconds: intWithDefault(raw.submit_interval_seconds, DEFAULT_BAXIGPT_CDK_SETTINGS.submit_interval_seconds, 0),
+    auto_poll_status: raw.auto_poll_status === undefined ? DEFAULT_BAXIGPT_CDK_SETTINGS.auto_poll_status : Boolean(raw.auto_poll_status),
+    status_poll_interval_seconds: intWithDefault(raw.status_poll_interval_seconds, DEFAULT_BAXIGPT_CDK_SETTINGS.status_poll_interval_seconds, 1),
+    status_poll_timeout_seconds: intWithDefault(raw.status_poll_timeout_seconds, DEFAULT_BAXIGPT_CDK_SETTINGS.status_poll_timeout_seconds, 5),
+  }
+}
+
+function loadBaxiGptCdkSettings() {
+  if (typeof window === 'undefined') return { ...DEFAULT_BAXIGPT_CDK_SETTINGS }
+  try {
+    const raw = window.localStorage.getItem(BAXIGPT_CDK_SETTINGS_STORAGE_KEY)
+    if (!raw) return { ...DEFAULT_BAXIGPT_CDK_SETTINGS }
+    return normalizeBaxiGptCdkSettings(JSON.parse(raw))
+  } catch {
+    return { ...DEFAULT_BAXIGPT_CDK_SETTINGS }
+  }
+}
+
+function saveBaxiGptCdkSettings(values: Record<string, unknown>) {
+  if (typeof window === 'undefined') return
+  window.localStorage.setItem(BAXIGPT_CDK_SETTINGS_STORAGE_KEY, JSON.stringify(normalizeBaxiGptCdkSettings(values)))
+}
+
+function normalizePaypalBindingSettings(value: unknown): PaypalBindingSettings {
+  const raw = value && typeof value === 'object' ? value as Record<string, unknown> : {}
+  return {
+    base_url: String(raw.base_url || DEFAULT_PAYPAL_BINDING_SETTINGS.base_url).trim() || DEFAULT_PAYPAL_BINDING_SETTINGS.base_url,
+    proxy: String(raw.proxy || '').trim(),
+    proxy_jp: String(raw.proxy_jp || '').trim(),
+    phone: String(raw.phone || '').trim(),
+    paypal_email: String(raw.paypal_email || '').trim(),
+    sms_api: String(raw.sms_api || '').trim(),
+    sms_api_test_mode: raw.sms_api_test_mode === undefined ? DEFAULT_PAYPAL_BINDING_SETTINGS.sms_api_test_mode : Boolean(raw.sms_api_test_mode),
+    otp_timeout: intWithDefault(raw.otp_timeout, DEFAULT_PAYPAL_BINDING_SETTINGS.otp_timeout, 30),
+    pplink_retry: intWithDefault(raw.pplink_retry, DEFAULT_PAYPAL_BINDING_SETTINGS.pplink_retry, 1),
+    timeout: intWithDefault(raw.timeout, DEFAULT_PAYPAL_BINDING_SETTINGS.timeout, 5),
+    event_timeout: intWithDefault(raw.event_timeout, DEFAULT_PAYPAL_BINDING_SETTINGS.event_timeout, 10),
+    account_interval_seconds: intWithDefault(raw.account_interval_seconds, DEFAULT_PAYPAL_BINDING_SETTINGS.account_interval_seconds, 0),
+    failure_continue: raw.failure_continue === undefined ? DEFAULT_PAYPAL_BINDING_SETTINGS.failure_continue : Boolean(raw.failure_continue),
+  }
+}
+
+function loadPaypalBindingSettings() {
+  if (typeof window === 'undefined') return { ...DEFAULT_PAYPAL_BINDING_SETTINGS }
+  try {
+    const raw = window.localStorage.getItem(PAYPAL_BINDING_SETTINGS_STORAGE_KEY)
+    if (!raw) return { ...DEFAULT_PAYPAL_BINDING_SETTINGS }
+    return normalizePaypalBindingSettings(JSON.parse(raw))
+  } catch {
+    return { ...DEFAULT_PAYPAL_BINDING_SETTINGS }
+  }
+}
+
+function savePaypalBindingSettings(values: Record<string, unknown>) {
+  if (typeof window === 'undefined') return
+  window.localStorage.setItem(PAYPAL_BINDING_SETTINGS_STORAGE_KEY, JSON.stringify(normalizePaypalBindingSettings(values)))
+}
+
+function splitCommaFilterValues(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    return value
+      .flatMap((item) => splitCommaFilterValues(item))
+      .filter(Boolean)
+  }
+  return String(value || '')
+    .split(',')
+    .map((item) => item.trim().toLowerCase())
+    .filter(Boolean)
+}
+
+function constrainCommaFilterToAllowed(value: unknown, allowed: Set<string>): string {
+  const current = splitCommaFilterValues(value)
+  if (current.length === 0) return Array.from(allowed).join(',')
+  const constrained = current.filter((item) => allowed.has(item))
+  return constrained.length > 0 ? constrained.join(',') : PAYPAL_BINDING_EMPTY_FILTER
+}
+
+function applyPaypalBindingEligibilityFilters(body: Record<string, unknown>): void {
+  body.account_validity = constrainCommaFilterToAllowed(
+    body.account_validity,
+    PAYPAL_BINDING_ALLOWED_ACCOUNT_VALIDITY,
+  )
+  body.subscription_type = constrainCommaFilterToAllowed(
+    body.subscription_type,
+    PAYPAL_BINDING_ALLOWED_SUBSCRIPTION_TYPES,
+  )
+}
+
 function normalizeVisibleAccountColumns(value: unknown): AccountColumnKey[] {
   if (!Array.isArray(value)) return [...DEFAULT_VISIBLE_ACCOUNT_COLUMNS]
   const normalized = value
@@ -544,6 +826,15 @@ function normalizeAccount(account: any) {
   const teamInviteSource = account.team_invite_source && typeof account.team_invite_source === 'object'
     ? account.team_invite_source
     : null
+  const accountRateLimit = account.rate_limit && typeof account.rate_limit === 'object'
+    ? account.rate_limit
+    : {}
+  const rateLimit = {
+    started_at: account.rate_limit_started_at || accountRateLimit.started_at || extra.rate_limit_started_at || '',
+    recover_at: account.rate_limit_recover_at || accountRateLimit.recover_at || extra.rate_limit_recover_at || '',
+    previous_status: account.rate_limit_previous_status || accountRateLimit.previous_status || extra.rate_limit_previous_status || '',
+    seconds_remaining: Number(accountRateLimit.seconds_remaining || 0),
+  }
   return {
     ...account,
     extra,
@@ -557,6 +848,11 @@ function normalizeAccount(account: any) {
     chatgptLastPaymentLink,
     chatgptPaymentLinkDefaults,
     phoneBinding,
+    rateLimit,
+    rate_limit: rateLimit,
+    rate_limit_started_at: rateLimit.started_at,
+    rate_limit_recover_at: rateLimit.recover_at,
+    rate_limit_previous_status: rateLimit.previous_status,
     teamInviteSource,
     manuallyUsed: account.manually_used !== undefined ? Boolean(account.manually_used) : Boolean(extra.manually_used),
   }
@@ -652,6 +948,34 @@ function formatSubscriptionExpiry(record: any) {
   }
 }
 
+function getRateLimitRecoverValue(record: any) {
+  const rateLimit = record?.rateLimit && typeof record.rateLimit === 'object'
+    ? record.rateLimit
+    : record?.rate_limit && typeof record.rate_limit === 'object'
+      ? record.rate_limit
+      : {}
+  return record?.rate_limit_recover_at || rateLimit.recover_at || record?.extra?.rate_limit_recover_at || ''
+}
+
+function formatRateLimitRecoverAt(record: any) {
+  const value = getRateLimitRecoverValue(record)
+  if (!value) return null
+  const date = parseFlexibleDateValue(value)
+  if (!date) {
+    const text = String(value || '').trim()
+    return text ? { compact: text, title: text, expired: false } : null
+  }
+  const month = String(date.getMonth() + 1).padStart(2, '0')
+  const day = String(date.getDate()).padStart(2, '0')
+  const hour = String(date.getHours()).padStart(2, '0')
+  const minute = String(date.getMinutes()).padStart(2, '0')
+  return {
+    compact: `${month}-${day} ${hour}:${minute}`,
+    title: date.toLocaleString(),
+    expired: date.getTime() <= Date.now(),
+  }
+}
+
 function formatCreatedAt(value?: string) {
   if (!value) return { date: '-', time: '' }
   const date = new Date(value)
@@ -727,6 +1051,18 @@ function getRefreshToken(record: any): string {
   }
 }
 
+function getAccessToken(record: any): string {
+  if (record?.token) return String(record.token || '')
+  if (record?.access_token) return String(record.access_token || '')
+  if (record?.extra?.access_token) return String(record.extra.access_token || '')
+  try {
+    const extra = JSON.parse(record.extra_json || '{}')
+    return String(extra.access_token || '')
+  } catch {
+    return ''
+  }
+}
+
 function getTeamInviteOwnerLabel(source: any) {
   if (!source || typeof source !== 'object') return ''
   return String(
@@ -792,6 +1128,88 @@ function codexStateMeta(state?: string) {
 function statusLabel(status?: string) {
   const normalized = String(status || '').trim()
   return STATUS_LABELS[normalized] || normalized || '未知'
+}
+
+function getBaxiGptCdk(record: any) {
+  const topLevel = parseMaybeJsonObject(record?.baxigpt_cdk)
+  if (Object.keys(topLevel).length > 0) return topLevel
+  return parseMaybeJsonObject(record?.extra?.baxigpt_cdk)
+}
+
+function getBaxiGptCdkStatus(recordOrCdk: any) {
+  const cdk = recordOrCdk?.status !== undefined || recordOrCdk?.order_id !== undefined
+    ? recordOrCdk
+    : getBaxiGptCdk(recordOrCdk)
+  return String(cdk?.status || '').trim().toLowerCase()
+}
+
+function hasBaxiGptOrderId(cdk: any) {
+  return Boolean(String(cdk?.order_id || cdk?.orderId || '').trim())
+}
+
+function isBaxiGptPendingOrder(record: any) {
+  const cdk = getBaxiGptCdk(record)
+  const status = getBaxiGptCdkStatus(cdk)
+  return (status === 'submitted' || status === 'processing') && hasBaxiGptOrderId(cdk)
+}
+
+function isBaxiGptTerminalCdkStatus(status?: string) {
+  return ['paid', 'failed', 'disabled'].includes(String(status || '').trim().toLowerCase())
+}
+
+function isBaxiGptTerminalAccountStatus(status?: string) {
+  return ['subscribed', 'payment_failed', 'invalid'].includes(String(status || '').trim().toLowerCase())
+}
+
+function isBaxiGptWatchTerminal(record: any) {
+  return isBaxiGptTerminalAccountStatus(record?.status) || isBaxiGptTerminalCdkStatus(getBaxiGptCdkStatus(record))
+}
+
+function collectBaxiPollingAccountIdsFromTaskSnapshot(snapshot: any) {
+  const ids = new Set<number>()
+  const seen = new WeakSet<object>()
+  const visit = (value: any) => {
+    if (!value) return
+    if (Array.isArray(value)) {
+      value.forEach(visit)
+      return
+    }
+    if (typeof value !== 'object') return
+    if (seen.has(value)) return
+    seen.add(value)
+    if (value.status_polling === true) {
+      const accountId = Number(value.account_id || value.accountId || value.id || 0)
+      if (Number.isFinite(accountId) && accountId > 0) ids.add(accountId)
+    }
+    Object.values(value).forEach(visit)
+  }
+  visit(snapshot?.runtime_results)
+  visit(snapshot?.meta?.runtime_results)
+  return ids
+}
+
+function mergeBaxiSnapshotIntoAccount(account: any, item: any) {
+  if (!item || typeof item !== 'object') return account
+  const extraPatch = item.extra && typeof item.extra === 'object' && !Array.isArray(item.extra) ? item.extra : {}
+  const snapshotCdk = parseMaybeJsonObject(item.baxigpt_cdk)
+  const extraSnapshotCdk = parseMaybeJsonObject(extraPatch.baxigpt_cdk)
+  const currentCdk = getBaxiGptCdk(account)
+  const nextCdk = Object.keys(snapshotCdk).length > 0
+    ? snapshotCdk
+    : Object.keys(extraSnapshotCdk).length > 0
+      ? extraSnapshotCdk
+      : currentCdk
+  return {
+    ...account,
+    status: item.status !== undefined ? item.status : account.status,
+    updated_at: item.updated_at !== undefined ? item.updated_at : account.updated_at,
+    baxigpt_cdk: nextCdk,
+    extra: {
+      ...(account.extra || {}),
+      ...extraPatch,
+      baxigpt_cdk: nextCdk,
+    },
+  }
 }
 
 function planMeta(plan?: string) {
@@ -900,6 +1318,13 @@ function accountValidityMeta(record: any) {
     : { color: 'success', label: '有效' }
 }
 
+function isPaypalBindingEligibleAccount(record: any) {
+  const status = String(record?.status || '').trim().toLowerCase()
+  return status !== 'subscribed'
+    && PAYPAL_BINDING_ALLOWED_ACCOUNT_VALIDITY.has(accountValidityValue(record))
+    && PAYPAL_BINDING_ALLOWED_SUBSCRIPTION_TYPES.has(subscriptionTypeValue(record))
+}
+
 function sub2apiStateMeta(sync: any) {
   if (!sync || Object.keys(sync).length === 0) {
     return { color: 'default', label: '未同步' }
@@ -979,10 +1404,14 @@ function shouldShowInvalidRecheckButton(record: any) {
   return String(record?.status || '').trim().toLowerCase() === 'invalid'
 }
 
-function taskModalModeFromSource(source: unknown): 'register' | 'resume_auth' | 'payment_link' {
+function taskModalModeFromSource(source: unknown): 'register' | 'resume_auth' | 'payment_link' | 'sub2api_upload' | 'oaipay_upload' | 'baxigpt_cdk' | 'paypal_bind' {
   const normalized = String(source || '').trim().toLowerCase()
+  if (normalized === 'baxigpt_cdk' || normalized === 'baxigpt_cdk_submit') return 'baxigpt_cdk'
+  if (normalized === 'chatgpt_paypal_bind' || normalized === 'paypal_bind') return 'paypal_bind'
   if (normalized === 'phone_binding_test') return 'resume_auth'
   if (normalized === 'resume_auth' || normalized === 'resume_subscription_auth' || normalized === 'batch_resume_subscription_auth') return 'resume_auth'
+  if (normalized === 'batch_sub2api_upload') return 'sub2api_upload'
+  if (normalized === 'batch_oaipay_upload') return 'oaipay_upload'
   if (normalized === 'invalid_recheck' || normalized === 'batch_invalid_recheck') return 'resume_auth'
   if (normalized === 'payment_link' || normalized === 'batch_payment_link') return 'payment_link'
   return 'register'
@@ -1006,10 +1435,11 @@ const accountActionTextStyles: Record<string, CSSProperties> = {
 export default function Accounts() {
   const { token } = theme.useToken()
   const screens = Grid.useBreakpoint()
-  const isMobile = screens.md === false
+  const isMobile = screens.lg === false
   const isCompactDesktop = !isMobile && screens.xl === false
   const currentPlatform = 'chatgpt'
   const [accounts, setAccounts] = useState<any[]>([])
+  const [watchingBaxiAccountIds, setWatchingBaxiAccountIds] = useState<Set<number>>(() => new Set())
   const [platformActions, setPlatformActions] = useState<any[]>([])
   const [platformActionsLoading, setPlatformActionsLoading] = useState(false)
   const [total, setTotal] = useState(0)
@@ -1026,7 +1456,7 @@ export default function Accounts() {
   const [selectedAccountSnapshots, setSelectedAccountSnapshots] = useState<Record<string, any>>({})
 
   const [registerModalOpen, setRegisterModalOpen] = useState(false)
-  const [taskModalMode, setTaskModalMode] = useState<'register' | 'resume_auth' | 'payment_link'>('register')
+  const [taskModalMode, setTaskModalMode] = useState<'register' | 'resume_auth' | 'payment_link' | 'sub2api_upload' | 'oaipay_upload' | 'baxigpt_cdk' | 'paypal_bind'>('register')
   const [taskModalAccount, setTaskModalAccount] = useState<any>(null)
   const [addModalOpen, setAddModalOpen] = useState(false)
   const [importModalOpen, setImportModalOpen] = useState(false)
@@ -1046,12 +1476,41 @@ export default function Accounts() {
   const [phoneBindingTestOpen, setPhoneBindingTestOpen] = useState(false)
   const [phoneBindingTestLoading, setPhoneBindingTestLoading] = useState(false)
   const [phoneBindingTestScope, setPhoneBindingTestScope] = useState<'selected' | 'filtered'>('selected')
+  const [phoneBindingManualOpen, setPhoneBindingManualOpen] = useState(false)
+  const [phoneBindingAdvancedOpen, setPhoneBindingAdvancedOpen] = useState(false)
+  const [phonePoolSummary, setPhonePoolSummary] = useState<PhonePoolSummary | null>(null)
+  const [phonePoolSummaryLoading, setPhonePoolSummaryLoading] = useState(false)
+  const [baxiCdkSubmitOpen, setBaxiCdkSubmitOpen] = useState(false)
+  const [baxiCdkSubmitLoading, setBaxiCdkSubmitLoading] = useState(false)
+  const [baxiCdkSubmitScope, setBaxiCdkSubmitScope] = useState<'selected' | 'filtered'>('selected')
+  const [baxiCdkManualOpen, setBaxiCdkManualOpen] = useState(false)
+  const [baxiCdkAdvancedOpen, setBaxiCdkAdvancedOpen] = useState(false)
+  const [paypalBindingOpen, setPaypalBindingOpen] = useState(false)
+  const [paypalBindingLoading, setPaypalBindingLoading] = useState(false)
+  const [paypalBindingScope, setPaypalBindingScope] = useState<'selected' | 'filtered'>('selected')
+  const [paypalFilteredEligibleCount, setPaypalFilteredEligibleCount] = useState<number | null>(null)
+  const [paypalFilteredEligibleLoading, setPaypalFilteredEligibleLoading] = useState(false)
+  const [baxiCdkPoolSummary, setBaxiCdkPoolSummary] = useState<BaxiGptCdkPoolSummary | null>(null)
+  const [baxiCdkPoolSummaryLoading, setBaxiCdkPoolSummaryLoading] = useState(false)
+  const [batchPaymentLinkConfigOpen, setBatchPaymentLinkConfigOpen] = useState(false)
+  const [batchPaymentLinkForceRefresh, setBatchPaymentLinkForceRefresh] = useState(false)
 
   const [registerForm] = Form.useForm()
   const [addForm] = Form.useForm()
   const [detailForm] = Form.useForm()
   const [resumeAuthConfigForm] = Form.useForm()
   const [phoneBindingTestForm] = Form.useForm()
+  const [baxiCdkSubmitForm] = Form.useForm()
+  const [paypalBindingForm] = Form.useForm()
+  const [batchPaymentLinkConfigForm] = Form.useForm()
+  const phoneBindingUsePoolValue = Form.useWatch('use_pool', phoneBindingTestForm)
+  const phoneBindingPrefixSampleValue = Form.useWatch('prefix_sample_enabled', phoneBindingTestForm)
+  const phoneBindingPrefixSampleSizeValue = Form.useWatch('prefix_sample_size', phoneBindingTestForm)
+  const phoneBindingPrefixSampleFilterValue = Form.useWatch('prefix_sample_filter', phoneBindingTestForm)
+  const phoneBindingPhoneLinesValue = Form.useWatch('phone_lines', phoneBindingTestForm)
+  const phoneBindingProxyModeValue = Form.useWatch('proxy_mode', phoneBindingTestForm)
+  const baxiCdkUsePoolValue = Form.useWatch('use_pool', baxiCdkSubmitForm)
+  const baxiCdkCodeLinesValue = Form.useWatch('code_lines', baxiCdkSubmitForm)
   const [registerMailProvider, setRegisterMailProvider] = useState('luckmail')
   const [configCache, setConfigCache] = useState<Record<string, any> | null>(null)
   const { mode: chatgptRegistrationMode, setMode: setChatgptRegistrationMode } =
@@ -1060,6 +1519,34 @@ export default function Accounts() {
   const [importLoading, setImportLoading] = useState(false)
   const [taskId, setTaskId] = useState<string | null>(null)
   const [taskSnapshot, setTaskSnapshot] = useState<any>(null)
+
+  const [oaipayUploadModalOpen, setOaipayUploadModalOpen] = useState(false)
+  const [oaipayUploadScope, setOaipayUploadScope] = useState<'selected' | 'pending'>('selected')
+  const [oaipayCategories, setOaipayCategories] = useState<{id: number, name: string}[]>([])
+  const [oaipayCategoryLoading, setOaipayCategoryLoading] = useState(false)
+  const [oaipaySelectedCategory, setOaipaySelectedCategory] = useState<number | undefined>()
+
+  const openOaipayUploadModal = async (scope: 'selected' | 'pending') => {
+    setOaipayUploadScope(scope)
+    setOaipayUploadModalOpen(true)
+    setOaipayCategoryLoading(true)
+    try {
+      const res = await apiFetch('/integrations/oaipay-categories')
+      if (Array.isArray(res)) {
+        setOaipayCategories(res)
+      } else if (res?.categories && Array.isArray(res.categories)) {
+        setOaipayCategories(res.categories)
+      } else if (res?.data && Array.isArray(res.data)) {
+        setOaipayCategories(res.data)
+      } else if (res?.error) {
+        message.error('无法获取 OAIPay 分组: ' + res.error)
+      }
+    } catch (e) {
+      message.error('请求 OAIPay 分组失败: ' + String(e))
+    } finally {
+      setOaipayCategoryLoading(false)
+    }
+  }
   const [activeTasksPanelOpen, setActiveTasksPanelOpen] = useState(false)
   const [registerLoading, setRegisterLoading] = useState(false)
   const [registerSettingsSaving, setRegisterSettingsSaving] = useState(false)
@@ -1090,6 +1577,7 @@ export default function Accounts() {
   const [batchGopayOtpAutoResendDelay, setBatchGopayOtpAutoResendDelay] = useState(DEFAULT_GOPAY_OTP_AUTO_RESEND_DELAY_SECONDS)
   const [batchGopayOtpDelaySaving, setBatchGopayOtpDelaySaving] = useState(false)
   const [batchGopayNextRoundAt, setBatchGopayNextRoundAt] = useState<number | null>(null)
+  const [accessTokenCopiedAccountIds, setAccessTokenCopiedAccountIds] = useState<Set<number>>(() => new Set())
   const batchGopayStartingRef = useRef(false)
   const batchGopayCancelRequestedRef = useRef(false)
   const accountsQuery = useAccountsQuery({
@@ -1100,6 +1588,7 @@ export default function Accounts() {
     subscriptionType: columnFilters.subscriptionType.join(','),
     accountValidity: columnFilters.accountValidity.join(','),
     sub2apiState: columnFilters.sub2apiState.join(','),
+    oaipayState: columnFilters.oaipayState.join(','),
     sortBy: subscriptionExpirySortOrder ? SUBSCRIPTION_EXPIRY_SORT_FIELD : '',
     sortOrder: subscriptionExpirySortOrder,
     page: currentPage,
@@ -1113,6 +1602,15 @@ export default function Accounts() {
   const pendingBusinessInvites = pendingInvitesQuery.data ?? EMPTY_LIST
   const pendingBusinessInvitesLoading = pendingInvitesQuery.isLoading || pendingInvitesQuery.isFetching
   const loading = accountsQuery.isLoading || accountsQuery.isFetching
+  const visibleAccountIds = useMemo(() => new Set(
+    accounts.map((account) => Number(account?.id || 0)).filter((id) => Number.isFinite(id) && id > 0),
+  ), [accounts])
+  const watchingBaxiAccountIdsKey = useMemo(() => (
+    Array.from(watchingBaxiAccountIds)
+      .filter((id) => visibleAccountIds.has(Number(id)))
+      .sort((a, b) => a - b)
+      .join(',')
+  ), [visibleAccountIds, watchingBaxiAccountIds])
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -1123,7 +1621,7 @@ export default function Accounts() {
 
   useEffect(() => {
     setCurrentPage(1)
-  }, [debouncedSearch, filterStatus, columnFilters.manuallyUsed, columnFilters.authType, columnFilters.subscriptionType, columnFilters.accountValidity, columnFilters.sub2apiState, subscriptionExpirySortOrder])
+  }, [debouncedSearch, filterStatus, columnFilters.manuallyUsed, columnFilters.authType, columnFilters.subscriptionType, columnFilters.accountValidity, columnFilters.sub2apiState, columnFilters.oaipayState, subscriptionExpirySortOrder])
 
   useEffect(() => {
     if (typeof document === 'undefined') return
@@ -1184,6 +1682,32 @@ export default function Accounts() {
     await accountsQuery.refetch()
   }, [accountsQuery.refetch])
 
+  const loadPhonePoolSummary = useCallback(async (silent = true) => {
+    setPhonePoolSummaryLoading(true)
+    try {
+      const data = await apiFetch('/phone-pool')
+      const summary = data?.summary && typeof data.summary === 'object' ? data.summary : data
+      setPhonePoolSummary(summary && typeof summary === 'object' ? summary : {})
+    } catch (e: any) {
+      if (!silent) message.error(e?.message || '读取手机号池状态失败')
+    } finally {
+      setPhonePoolSummaryLoading(false)
+    }
+  }, [])
+
+  const loadBaxiCdkPoolSummary = useCallback(async (silent = true) => {
+    setBaxiCdkPoolSummaryLoading(true)
+    try {
+      const data = await apiFetch('/baxigpt-cdk-pool/summary')
+      const summary = data?.summary && typeof data.summary === 'object' ? data.summary : data
+      setBaxiCdkPoolSummary(summary && typeof summary === 'object' ? summary : {})
+    } catch (e: any) {
+      if (!silent) message.error(e?.message || '读取卡密池状态失败')
+    } finally {
+      setBaxiCdkPoolSummaryLoading(false)
+    }
+  }, [])
+
   const applyCurrentFiltersToBody = (body: Record<string, unknown>) => {
     if (search) body.email = search
     if (filterStatus) body.status = filterStatus
@@ -1192,7 +1716,70 @@ export default function Accounts() {
     if (columnFilters.subscriptionType.length) body.subscription_type = columnFilters.subscriptionType.join(',')
     if (columnFilters.accountValidity.length) body.account_validity = columnFilters.accountValidity.join(',')
     if (columnFilters.sub2apiState.length) body.sub2api_state = columnFilters.sub2apiState.join(',')
+    if (columnFilters.oaipayState.length) body.oaipay_state = columnFilters.oaipayState.join(',')
   }
+
+  const buildPaypalFilteredEligibleParams = useCallback(() => {
+    const body: Record<string, unknown> = {}
+    applyCurrentFiltersToBody(body)
+    applyPaypalBindingEligibilityFilters(body)
+    const params = new URLSearchParams({
+      platform: 'chatgpt',
+      page: '1',
+      page_size: '1',
+      detail: 'false',
+    })
+    if (body.email) params.set('email', String(body.email))
+    if (body.status) params.set('status', String(body.status))
+    if (body.manually_used) params.set('manually_used', String(body.manually_used))
+    if (body.auth_type) params.set('auth_type', String(body.auth_type))
+    if (body.subscription_type) params.set('subscription_type', String(body.subscription_type))
+    if (body.account_validity) params.set('account_validity', String(body.account_validity))
+    if (body.sub2api_state) params.set('sub2api_state', String(body.sub2api_state))
+    if (body.oaipay_state) params.set('oaipay_state', String(body.oaipay_state))
+    return params
+  }, [
+    search,
+    filterStatus,
+    columnFilters.manuallyUsed,
+    columnFilters.authType,
+    columnFilters.subscriptionType,
+    columnFilters.accountValidity,
+    columnFilters.sub2apiState,
+    columnFilters.oaipayState,
+  ])
+
+  useEffect(() => {
+    if (!phoneBindingTestOpen) return
+    void loadPhonePoolSummary()
+  }, [phoneBindingTestOpen, loadPhonePoolSummary])
+
+  useEffect(() => {
+    if (!baxiCdkSubmitOpen) return
+    void loadBaxiCdkPoolSummary()
+  }, [baxiCdkSubmitOpen, loadBaxiCdkPoolSummary])
+
+  useEffect(() => {
+    if (!paypalBindingOpen || paypalBindingScope !== 'filtered') return
+    let cancelled = false
+    setPaypalFilteredEligibleLoading(true)
+    const params = buildPaypalFilteredEligibleParams()
+    apiFetch(`/accounts?${params}`)
+      .then((data) => {
+        if (cancelled) return
+        setPaypalFilteredEligibleCount(Number(data?.total || 0))
+      })
+      .catch(() => {
+        if (cancelled) return
+        setPaypalFilteredEligibleCount(null)
+      })
+      .finally(() => {
+        if (!cancelled) setPaypalFilteredEligibleLoading(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [paypalBindingOpen, paypalBindingScope, buildPaypalFilteredEligibleParams])
 
   useEffect(() => {
     const data = accountsQuery.data
@@ -1206,6 +1793,121 @@ export default function Accounts() {
       setCurrentPage(maxPage)
     }
   }, [accountsQuery.data, currentPage])
+
+  useEffect(() => {
+    if (!accounts.length) return
+    setWatchingBaxiAccountIds((prev) => {
+      const next = new Set(prev)
+      let changed = false
+      accounts.forEach((record) => {
+        const accountId = Number(record?.id || 0)
+        if (!Number.isFinite(accountId) || accountId <= 0) return
+        if (isBaxiGptWatchTerminal(record)) {
+          if (next.delete(accountId)) changed = true
+          return
+        }
+        if (isBaxiGptPendingOrder(record) && !next.has(accountId)) {
+          next.add(accountId)
+          changed = true
+        }
+      })
+      return changed ? next : prev
+    })
+  }, [accounts])
+
+  useEffect(() => {
+    const ids = new Set<number>()
+    collectBaxiPollingAccountIdsFromTaskSnapshot(taskSnapshot).forEach((id) => ids.add(id))
+    activeTasks.forEach((task: any) => {
+      collectBaxiPollingAccountIdsFromTaskSnapshot(task).forEach((id) => ids.add(id))
+    })
+    if (ids.size === 0) return
+    setWatchingBaxiAccountIds((prev) => {
+      const next = new Set(prev)
+      let changed = false
+      ids.forEach((id) => {
+        if (!next.has(id)) {
+          next.add(id)
+          changed = true
+        }
+      })
+      return changed ? next : prev
+    })
+  }, [taskSnapshot, activeTasks])
+
+  useEffect(() => {
+    if (!pageVisible || !watchingBaxiAccountIdsKey) return
+    let cancelled = false
+    let timer: number | null = null
+    const pull = async () => {
+      const ids = watchingBaxiAccountIdsKey
+        .split(',')
+        .map((item: string) => Number(item))
+        .filter((id: number) => Number.isFinite(id) && id > 0)
+      if (ids.length === 0) return
+      try {
+        const data = await apiFetch('/accounts/snapshot', {
+          method: 'POST',
+          body: JSON.stringify({ ids }),
+        })
+        if (cancelled) return
+        const items = Array.isArray(data?.items) ? data.items : []
+        const requestedIds = ids
+        const returnedIds = new Set<number>()
+        items.forEach((item: any) => {
+          const id = Number(item?.id || 0)
+          if (Number.isFinite(id) && id > 0) returnedIds.add(id)
+        })
+        if (items.length > 0) {
+          const byId = new Map<number, any>()
+          items.forEach((item: any) => {
+            const id = Number(item?.id || 0)
+            if (Number.isFinite(id) && id > 0) byId.set(id, item)
+          })
+          setAccounts((prev) => prev.map((account) => {
+            const item = byId.get(Number(account?.id || 0))
+            return item ? mergeBaxiSnapshotIntoAccount(account, item) : account
+          }))
+          setWatchingBaxiAccountIds((prev) => {
+            const next = new Set(prev)
+            let changed = false
+            requestedIds.forEach((id: number) => {
+              if (!returnedIds.has(Number(id)) && next.delete(Number(id))) changed = true
+            })
+            items.forEach((item: any) => {
+              const id = Number(item?.id || 0)
+              if (!Number.isFinite(id) || id <= 0) return
+              const patched = mergeBaxiSnapshotIntoAccount({ id, extra: {} }, item)
+              if (isBaxiGptWatchTerminal(patched)) {
+                if (next.delete(id)) changed = true
+              }
+            })
+            return changed ? next : prev
+          })
+        } else {
+          setWatchingBaxiAccountIds((prev) => {
+            const next = new Set(prev)
+            let changed = false
+            requestedIds.forEach((id: number) => {
+              if (next.delete(Number(id))) changed = true
+            })
+            return changed ? next : prev
+          })
+        }
+      } catch {
+        // 后端 snapshot 接口可能还没上线，或者字段临时缺失；账号页不要因此中断。
+      } finally {
+        if (!cancelled) {
+          timer = window.setTimeout(pull, 4000)
+        }
+      }
+    }
+    void pull()
+    return () => {
+      cancelled = true
+      if (timer != null) window.clearTimeout(timer)
+    }
+  }, [pageVisible, watchingBaxiAccountIdsKey])
 
   useEffect(() => {
     if (selectedRowKeys.length === 0) {
@@ -1253,18 +1955,18 @@ export default function Accounts() {
     setDetailAccount(normalizeAccount(data))
   }, [accountDetailQuery.data, detailModalOpen])
 
-  const markAccountUsed = useCallback(async (accountId: number) => {
+  const markAccountUsed = useCallback(async (accountId: number, used = true) => {
     if (!accountId) return
     await apiFetch(`/accounts/${accountId}/mark-used`, {
       method: 'POST',
-      body: JSON.stringify({ used: true }),
+      body: JSON.stringify({ used }),
     })
     setAccounts((prev) =>
       prev.map((item) => (
         item.id === accountId
           ? normalizeAccount({
               ...item,
-              extra_json: JSON.stringify({ ...(item.extra || {}), manually_used: true }),
+              extra_json: JSON.stringify({ ...(item.extra || {}), manually_used: used }),
             })
           : item
       )),
@@ -1272,16 +1974,38 @@ export default function Accounts() {
     if (detailAccount?.id === accountId) {
       setDetailAccount((prev: any) => prev ? normalizeAccount({
         ...prev,
-        extra_json: JSON.stringify({ ...(prev.extra || {}), manually_used: true }),
+        extra_json: JSON.stringify({ ...(prev.extra || {}), manually_used: used }),
       }) : prev)
     }
     if (actionAccount?.id === accountId) {
       setActionAccount((prev: any) => prev ? normalizeAccount({
         ...prev,
-        extra_json: JSON.stringify({ ...(prev.extra || {}), manually_used: true }),
+        extra_json: JSON.stringify({ ...(prev.extra || {}), manually_used: used }),
       }) : prev)
     }
   }, [detailAccount?.id, actionAccount?.id])
+
+  const unmarkAccountUsed = useCallback(async (record: any) => {
+    const accountId = Number(record?.id || 0)
+    if (!accountId) return
+    await markAccountUsed(accountId, false)
+    message.success('已取消已使用标记')
+  }, [markAccountUsed])
+
+  const copyAccessToken = useCallback(async (record: any) => {
+    const accessToken = getAccessToken(record)
+    if (!accessToken) {
+      message.warning('当前账号没有 AT')
+      return
+    }
+    const ok = await copyText(accessToken)
+    if (!ok) return
+
+    const accountId = Number(record?.id || 0)
+    if (accountId) {
+      setAccessTokenCopiedAccountIds((prev) => new Set(prev).add(accountId))
+    }
+  }, [])
 
   const ensurePlatformActionsLoaded = useCallback(async () => {
     if (platformActionsLoading || platformActions.length > 0) return
@@ -1424,6 +2148,12 @@ export default function Accounts() {
           count: Number(savedSettings.count || 1) || 1,
           concurrency: Number(savedSettings.concurrency || 1) || 1,
           register_delay_seconds: Number(savedSettings.register_delay_seconds || 0) || 0,
+          proxy_mode: String(savedSettings.proxy_mode || 'pool'),
+          proxy: String(savedSettings.proxy || ''),
+          proxy_country_code: String(savedSettings.proxy_country_code || '').trim().toUpperCase(),
+          proxy_failover: Boolean(savedSettings.proxy_failover),
+          proxy_max_candidates: Number(savedSettings.proxy_max_candidates || cfg.proxy_pool_max_candidates || 5) || 5,
+          proxy_min_score: Number(savedSettings.proxy_min_score || cfg.proxy_scan_min_score || 50) || 50,
           mail_provider_override: String(savedSettings.mail_provider_override || '__global__'),
           email: String(savedSettings.email || savedEmail || '').trim(),
           login_password: String(cfg.chatgpt_existing_account_login_password || '').trim(),
@@ -1439,7 +2169,12 @@ export default function Accounts() {
             savedSettings.chatgpt_capture_free_workspace
             ?? (cfg.chatgpt_capture_free_workspace === '' ? true : parseBooleanConfigValue(cfg.chatgpt_capture_free_workspace)),
           chatgpt_save_registration_access_token_account:
-            savedSettings.chatgpt_save_registration_access_token_account ?? false,
+            savedSettings.chatgpt_save_registration_access_token_account
+            ?? (cfg.chatgpt_save_registration_access_token_account === ''
+              ? true
+              : cfg.chatgpt_save_registration_access_token_account === undefined
+                ? true
+                : parseBooleanConfigValue(cfg.chatgpt_save_registration_access_token_account)),
         })
       })
       .catch(() => {
@@ -1450,6 +2185,12 @@ export default function Accounts() {
           count: Number(savedSettings.count || 1) || 1,
           concurrency: Number(savedSettings.concurrency || 1) || 1,
           register_delay_seconds: Number(savedSettings.register_delay_seconds || 0) || 0,
+          proxy_mode: String(savedSettings.proxy_mode || 'pool'),
+          proxy: String(savedSettings.proxy || ''),
+          proxy_country_code: String(savedSettings.proxy_country_code || '').trim().toUpperCase(),
+          proxy_failover: Boolean(savedSettings.proxy_failover),
+          proxy_max_candidates: Number(savedSettings.proxy_max_candidates || 5) || 5,
+          proxy_min_score: Number(savedSettings.proxy_min_score || 50) || 50,
           mail_provider_override: String(savedSettings.mail_provider_override || '__global__'),
           email: String(savedSettings.email || savedEmail || '').trim(),
           login_password: '',
@@ -1458,7 +2199,7 @@ export default function Accounts() {
           chatgpt_team_invite_deferred_activation: savedSettings.chatgpt_team_invite_deferred_activation ?? false,
           chatgpt_capture_business_workspace: savedSettings.chatgpt_capture_business_workspace ?? false,
           chatgpt_capture_free_workspace: savedSettings.chatgpt_capture_free_workspace ?? true,
-          chatgpt_save_registration_access_token_account: savedSettings.chatgpt_save_registration_access_token_account ?? false,
+          chatgpt_save_registration_access_token_account: savedSettings.chatgpt_save_registration_access_token_account ?? true,
         })
       })
   }, [registerModalOpen, currentPlatform, registerForm, loadConfigCache])
@@ -1798,13 +2539,33 @@ export default function Accounts() {
   }
 
   const handleBatchPaymentLink = async (options: { forceRefresh?: boolean } = {}) => {
-    const scope: 'selected' | 'filtered' = selectedRowKeys.length > 0 ? 'selected' : 'filtered'
     const forceRefresh = Boolean(options.forceRefresh)
+    let defaults: Record<string, any> = {}
+    try {
+      const cfg = await loadConfigCache({ force: true })
+      defaults = parseMaybeJsonObject(cfg.chatgpt_payment_link_defaults)
+    } catch {
+      defaults = {}
+    }
+    batchPaymentLinkConfigForm.setFieldsValue({
+      payment_link_format: normalizePaymentLinkFormat(defaults.payment_link_format),
+    })
+    setBatchPaymentLinkForceRefresh(forceRefresh)
+    setBatchPaymentLinkConfigOpen(true)
+  }
+
+  const submitBatchPaymentLinkConfig = async () => {
+    const values = await batchPaymentLinkConfigForm.validateFields()
+    const scope: 'selected' | 'filtered' = selectedRowKeys.length > 0 ? 'selected' : 'filtered'
+    const forceRefresh = Boolean(batchPaymentLinkForceRefresh)
+    const paymentLinkFormat = normalizePaymentLinkFormat(values.payment_link_format)
     const toastKey = `payment-link:${scope}:${forceRefresh ? 'force' : 'normal'}`
     const body: Record<string, unknown> = {
       skip_existing: !forceRefresh,
       force_refresh: forceRefresh,
-      params: {},
+      params: {
+        payment_link_format: paymentLinkFormat,
+      },
     }
     const actionLabel = forceRefresh ? '强制重新生成订阅链接' : '批量订阅链接'
     let requestedCount = total
@@ -1825,6 +2586,7 @@ export default function Accounts() {
     }
 
     setBatchPaymentLinkLoading(true)
+    setBatchPaymentLinkConfigOpen(false)
     message.loading({ content: `${actionLabel}任务创建中...`, key: toastKey, duration: 0 })
     try {
       const res = await apiFetch('/tasks/chatgpt/payment-links/batch', {
@@ -1857,12 +2619,13 @@ export default function Accounts() {
       setActiveTasksPanelOpen(true)
       void activeTasksQuery.refetch()
       message.success({
-        content: `${actionLabel}任务已启动：可执行 ${eligible} 个，跳过 ${skipped} 个${missing > 0 ? `，缺失 ${missing} 个` : ''}`,
+        content: `${actionLabel}任务已启动：${paymentLinkFormatLabel(paymentLinkFormat)}，可执行 ${eligible} 个，跳过 ${skipped} 个${missing > 0 ? `，缺失 ${missing} 个` : ''}`,
         key: toastKey,
       })
       showBatchActionResult(`${actionLabel}结果`, res)
     } catch (e: any) {
       message.error({ content: `${actionLabel}失败: ${e.message}`, key: toastKey })
+      setBatchPaymentLinkConfigOpen(true)
     } finally {
       setBatchPaymentLinkLoading(false)
     }
@@ -1962,37 +2725,57 @@ export default function Accounts() {
 
   const openPhoneBindingTest = () => {
     const scope: 'selected' | 'filtered' = selectedRowKeys.length > 0 ? 'selected' : 'filtered'
+    const savedSettings = loadPhoneBindingSettings()
     setPhoneBindingTestScope(scope)
     phoneBindingTestForm.setFieldsValue({
       scope,
+      ...savedSettings,
       phone_lines: '',
-      timeout_seconds: 180,
-      poll_interval_seconds: 5,
-      max_resend_attempts: 0,
-      resend_interval_seconds: 0,
-      account_interval_seconds: 60,
-      reuse_phone_until_unusable: false,
     })
+    setPhoneBindingManualOpen(false)
+    setPhoneBindingAdvancedOpen(false)
     setPhoneBindingTestOpen(true)
+    void loadPhonePoolSummary()
   }
 
   const submitPhoneBindingTest = async () => {
     const values = await phoneBindingTestForm.validateFields()
+    savePhoneBindingSettings(values)
     const scope = (values.scope === 'filtered' ? 'filtered' : 'selected') as 'selected' | 'filtered'
+    const phoneLines = String(values.phone_lines || '').trim()
+    // 手动粘贴优先：避免默认“使用手机号池”开启时忽略用户粘贴的号码。
+    const prefixSampleEnabled = !phoneLines && Boolean(values.prefix_sample_enabled)
+    const rawPrefixSampleFilter = String(values.prefix_sample_filter || 'all')
+    const prefixSampleFilter = rawPrefixSampleFilter === 'available' ? 'available' : rawPrefixSampleFilter === 'rejected' ? 'rejected' : 'all'
+    const usePool = !phoneLines && (Boolean(values.use_pool) || prefixSampleEnabled)
+    if (!usePool && !phoneLines) {
+      message.warning('请粘贴手机号/API，或启用手机号池')
+      return
+    }
     const body: Record<string, unknown> = {
-      phone_lines: String(values.phone_lines || '').trim(),
+      phone_lines: phoneLines,
+      use_pool: usePool,
+      prefix_sample_enabled: prefixSampleEnabled,
+      prefix_sample_size: Number(values.prefix_sample_size) === 2 ? 2 : 1,
+      prefix_sample_filter: prefixSampleFilter,
       timeout_seconds: Number(values.timeout_seconds || 180),
       poll_interval_seconds: Number(values.poll_interval_seconds || 5),
       max_resend_attempts: Number(values.max_resend_attempts || 0),
       resend_interval_seconds: Number(values.resend_interval_seconds || 0),
       account_interval_seconds: Number(values.account_interval_seconds || 60),
-      reuse_phone_until_unusable: Boolean(values.reuse_phone_until_unusable),
+      reuse_phone_until_unusable: prefixSampleEnabled ? false : Boolean(values.reuse_phone_until_unusable),
+      proxy: values.proxy_mode === 'specified' ? (String(values.proxy || '').trim() || null) : null,
+      proxy_mode: values.proxy_mode || 'pool',
+      proxy_country_code: String(values.proxy_country_code || '').trim().toUpperCase(),
+      proxy_failover: Boolean(values.proxy_failover),
+      proxy_max_candidates: Number(values.proxy_max_candidates || 10),
+      proxy_min_score: Number(values.proxy_min_score || 50),
     }
     let requestedAccounts = total
     if (scope === 'selected') {
       const accountIds = getResumeAuthSelectedIds()
       if (accountIds.length === 0) {
-        message.warning('请先选择用于测试绑定的账号，或切换为当前筛选范围')
+        message.warning('请先选择用于手机号绑定的账号，或切换为当前筛选范围')
         return
       }
       requestedAccounts = accountIds.length
@@ -2004,7 +2787,7 @@ export default function Accounts() {
 
     const toastKey = `phone-binding-test:${scope}`
     setPhoneBindingTestLoading(true)
-    message.loading({ content: '号码绑定测试任务创建中...', key: toastKey, duration: 0 })
+    message.loading({ content: '手机号绑定任务创建中...', key: toastKey, duration: 0 })
     try {
       const res = await apiFetch('/tasks/chatgpt/phone-binding-test', {
         method: 'POST',
@@ -2013,15 +2796,16 @@ export default function Accounts() {
       const taskIdFromResponse = String(res?.task_id || '').trim()
       const eligible = Number(res?.eligible_accounts || 0)
       const phoneCount = Number(res?.phone_count || 0)
+      const prefixSample = res?.prefix_sample && typeof res.prefix_sample === 'object' ? res.prefix_sample : null
       const parseErrors = Array.isArray(res?.parse_errors) ? res.parse_errors : []
 
       if (!taskIdFromResponse) {
         message.info({
-          content: `没有可用于测试的账号。请求 ${requestedAccounts} 个账号，待测号码 ${phoneCount} 个`,
+          content: `没有可用于绑定的账号。请求 ${requestedAccounts} 个账号，待用手机号 ${phoneCount} 个`,
           key: toastKey,
         })
         if (res && typeof res === 'object') {
-          showBatchActionResult('号码绑定测试结果', res)
+          showBatchActionResult('手机号绑定结果', res)
         }
         return
       }
@@ -2029,23 +2813,228 @@ export default function Accounts() {
       const snapshot = await apiFetch(`/tasks/${taskIdFromResponse}`)
       setPhoneBindingTestOpen(false)
       setTaskModalMode('resume_auth')
-      setTaskModalAccount({ email: `号码绑定测试：${phoneCount} 个号码 / ${eligible} 个账号` })
+      setTaskModalAccount({ email: `手机号绑定：${phoneCount} 个号码 / ${eligible} 个账号` })
       setTaskId(taskIdFromResponse)
       setTaskSnapshot(snapshot)
       setRegisterModalOpen(true)
       setActiveTasksPanelOpen(true)
       void activeTasksQuery.refetch()
       message.success({
-        content: `号码绑定测试已启动：${phoneCount} 个号码，${eligible} 个账号${parseErrors.length > 0 ? `，解析跳过 ${parseErrors.length} 行` : ''}`,
+        content: prefixSample?.enabled
+          ? `号段抽样已启动：${String(prefixSample.filter || 'all') === 'rejected' ? '仅不可用号段，' : ''}${Number(prefixSample.prefix_count || 0)} 个号段，${phoneCount} 个号码，${eligible} 个账号`
+          : `手机号绑定已启动：${phoneCount} 个号码，${eligible} 个账号${parseErrors.length > 0 ? `，解析跳过 ${parseErrors.length} 行` : ''}`,
         key: toastKey,
       })
       if (parseErrors.length > 0) {
-        showBatchActionResult('号码解析结果', { items: parseErrors, total: parseErrors.length })
+        showBatchActionResult('临时号码解析结果', { items: parseErrors, total: parseErrors.length })
       }
     } catch (e: any) {
-      message.error({ content: `号码绑定测试失败: ${e.message}`, key: toastKey })
+      message.error({ content: `手机号绑定失败: ${e.message}`, key: toastKey })
     } finally {
       setPhoneBindingTestLoading(false)
+    }
+  }
+
+  const openBaxiCdkSubmit = () => {
+    const scope: 'selected' | 'filtered' = selectedRowKeys.length > 0 ? 'selected' : 'filtered'
+    const savedSettings = loadBaxiGptCdkSettings()
+    setBaxiCdkSubmitScope(scope)
+    baxiCdkSubmitForm.setFieldsValue({
+      scope,
+      ...savedSettings,
+      code_lines: '',
+    })
+    setBaxiCdkManualOpen(false)
+    setBaxiCdkAdvancedOpen(false)
+    setBaxiCdkSubmitOpen(true)
+    void loadBaxiCdkPoolSummary()
+  }
+
+  const submitBaxiCdkSubmit = async () => {
+    const values = await baxiCdkSubmitForm.validateFields()
+    saveBaxiGptCdkSettings(values)
+    const scope = (values.scope === 'filtered' ? 'filtered' : 'selected') as 'selected' | 'filtered'
+    const codeLines = String(values.code_lines || '').trim()
+    const usePool = !codeLines && Boolean(values.use_pool)
+    if (!usePool && !codeLines) {
+      message.warning('请粘贴卡密，或启用卡密池')
+      return
+    }
+    const body: Record<string, unknown> = {
+      code_lines: codeLines,
+      use_pool: usePool,
+      precheck: Boolean(values.precheck),
+      failure_continue: Boolean(values.failure_continue),
+      submit_interval_seconds: Number(values.submit_interval_seconds || 0),
+      auto_poll_status: values.auto_poll_status !== false,
+      status_poll_interval_seconds: Number(values.status_poll_interval_seconds || 5),
+      status_poll_timeout_seconds: Number(values.status_poll_timeout_seconds || 300),
+    }
+    let requestedAccounts = total
+    if (scope === 'selected') {
+      const accountIds = getResumeAuthSelectedIds()
+      if (accountIds.length === 0) {
+        message.warning('请先选择用于 pix卡密提交的账号，或切换为当前筛选范围')
+        return
+      }
+      requestedAccounts = accountIds.length
+      body.account_ids = accountIds
+    } else {
+      body.all_filtered = true
+      applyCurrentFiltersToBody(body)
+    }
+
+    const toastKey = `baxigpt-cdk-submit:${scope}`
+    setBaxiCdkSubmitLoading(true)
+    message.loading({ content: 'pix卡密提交任务创建中...', key: toastKey, duration: 0 })
+    try {
+      const res = await apiFetch('/tasks/chatgpt/baxigpt-cdk-submit', {
+        method: 'POST',
+        body: JSON.stringify(body),
+      })
+      const taskIdFromResponse = String(res?.task_id || '').trim()
+      const pairCount = Number(res?.pair_count || 0)
+      const eligible = Number(res?.eligible_accounts || 0)
+      const availableCodes = Number(res?.available_codes || 0)
+      const spareCodes = Number(res?.spare_codes || 0)
+      const importInfo = res?.cdk_pool_import && typeof res.cdk_pool_import === 'object' ? res.cdk_pool_import : {}
+      const importErrors = Array.isArray(importInfo?.errors) ? importInfo.errors : []
+
+      if (!taskIdFromResponse) {
+        message.info({
+          content: `没有可提交的卡密/账号配对。请求 ${requestedAccounts} 个账号，可用卡密 ${availableCodes} 个`,
+          key: toastKey,
+        })
+        if (res && typeof res === 'object') {
+          showBatchActionResult('pix卡密提交结果', res)
+        }
+        await loadBaxiCdkPoolSummary()
+        return
+      }
+
+      const snapshot = await apiFetch(`/tasks/${taskIdFromResponse}`)
+      setBaxiCdkSubmitOpen(false)
+      setTaskModalMode('baxigpt_cdk')
+      setTaskModalAccount({ email: `pix卡密提交：${pairCount} 对 / 库存余 ${spareCodes}` })
+      setTaskId(taskIdFromResponse)
+      setTaskSnapshot(snapshot)
+      setRegisterModalOpen(true)
+      setActiveTasksPanelOpen(true)
+      void activeTasksQuery.refetch()
+      void loadBaxiCdkPoolSummary()
+      message.success({
+        content: `pix卡密提交已启动：${pairCount} 对，候选账号 ${eligible} 个，可用卡密 ${availableCodes} 个${spareCodes > 0 ? `，剩余入库 ${spareCodes} 个` : ''}${importErrors.length > 0 ? `，解析跳过 ${importErrors.length} 行` : ''}`,
+        key: toastKey,
+      })
+      if (importErrors.length > 0) {
+        showBatchActionResult('卡密解析结果', { items: importErrors, total: importErrors.length })
+      }
+    } catch (e: any) {
+      message.error({ content: `pix卡密提交失败: ${e.message}`, key: toastKey })
+    } finally {
+      setBaxiCdkSubmitLoading(false)
+    }
+  }
+
+  const getPaypalBindingSelectedItems = () =>
+    Array.from(selectedRowKeys)
+      .map((key) => {
+        const id = String(key)
+        return selectedAccountSnapshots[id] || accounts.find((account) => String(account.id) === id) || { id }
+      })
+
+  const getPaypalBindingSelectedIds = () =>
+    getPaypalBindingSelectedItems()
+      .filter((account) => isPaypalBindingEligibleAccount(account))
+      .map((account) => Number(account?.id || 0))
+      .filter((value) => Number.isInteger(value) && value > 0)
+
+  const openPaypalBinding = () => {
+    const scope: 'selected' | 'filtered' = selectedRowKeys.length > 0 ? 'selected' : 'filtered'
+    const savedSettings = loadPaypalBindingSettings()
+    setPaypalBindingScope(scope)
+    setPaypalFilteredEligibleCount(null)
+    paypalBindingForm.setFieldsValue({
+      scope,
+      ...savedSettings,
+    })
+    setPaypalBindingOpen(true)
+  }
+
+  const submitPaypalBinding = async () => {
+    const values = await paypalBindingForm.validateFields()
+    savePaypalBindingSettings(values)
+    const scope = (values.scope === 'filtered' ? 'filtered' : 'selected') as 'selected' | 'filtered'
+    const body: Record<string, unknown> = {
+      base_url: String(values.base_url || DEFAULT_PAYPAL_BINDING_SETTINGS.base_url).trim(),
+      proxy: String(values.proxy || '').trim(),
+      proxy_jp: String(values.proxy_jp || '').trim(),
+      phone: String(values.phone || '').trim(),
+      paypal_email: String(values.paypal_email || '').trim(),
+      sms_api: String(values.sms_api || '').trim(),
+      sms_api_test_mode: Boolean(values.sms_api_test_mode),
+      otp_timeout: Number(values.otp_timeout || DEFAULT_PAYPAL_BINDING_SETTINGS.otp_timeout),
+      pplink_retry: Number(values.pplink_retry || DEFAULT_PAYPAL_BINDING_SETTINGS.pplink_retry),
+      timeout: Number(values.timeout || DEFAULT_PAYPAL_BINDING_SETTINGS.timeout),
+      event_timeout: Number(values.event_timeout || DEFAULT_PAYPAL_BINDING_SETTINGS.event_timeout),
+      account_interval_seconds: Number(values.account_interval_seconds || 0),
+      failure_continue: values.failure_continue !== false,
+    }
+    if (scope === 'selected') {
+      const accountIds = getPaypalBindingSelectedIds()
+      if (accountIds.length === 0) {
+        message.warning('当前选中账号里没有未订阅且有效的账号，请重新选择或切换为当前筛选范围')
+        return
+      }
+      body.account_ids = accountIds
+    } else {
+      body.all_filtered = true
+      applyCurrentFiltersToBody(body)
+      applyPaypalBindingEligibilityFilters(body)
+    }
+
+    const toastKey = `paypal-binding:${scope}`
+    setPaypalBindingLoading(true)
+    message.loading({ content: 'PayPal绑定任务创建中...', key: toastKey, duration: 0 })
+    try {
+      const res = await apiFetch('/tasks/chatgpt/paypal-bind', {
+        method: 'POST',
+        body: JSON.stringify(body),
+      })
+      const taskIdFromResponse = String(res?.task_id || '').trim()
+      const eligible = Number(res?.eligible_accounts || 0)
+      const skipped = Array.isArray(res?.skipped_accounts) ? res.skipped_accounts.length : 0
+      const missing = Array.isArray(res?.missing_ids) ? res.missing_ids.length : 0
+
+      if (!taskIdFromResponse) {
+        message.info({
+          content: `没有可提交 PayPal 绑定的账号。符合条件 ${eligible} 个，跳过 ${skipped} 个${missing > 0 ? `，缺失 ${missing} 个` : ''}`,
+          key: toastKey,
+        })
+        if (res && typeof res === 'object') {
+          showBatchActionResult('PayPal绑定结果', res)
+        }
+        return
+      }
+
+      const snapshot = await apiFetch(`/tasks/${taskIdFromResponse}`)
+      setPaypalBindingOpen(false)
+      setTaskModalMode('paypal_bind')
+      setTaskModalAccount({ email: `PayPal绑定：${eligible} 个账号` })
+      setTaskId(taskIdFromResponse)
+      setTaskSnapshot(snapshot)
+      setRegisterModalOpen(true)
+      setActiveTasksPanelOpen(true)
+      void activeTasksQuery.refetch()
+      message.success({
+        content: `PayPal绑定已启动：可执行 ${eligible} 个，跳过 ${skipped} 个${missing > 0 ? `，缺失 ${missing} 个` : ''}`,
+        key: toastKey,
+      })
+      showBatchActionResult('PayPal绑定任务', res)
+    } catch (e: any) {
+      message.error({ content: `PayPal绑定失败: ${e.message}`, key: toastKey })
+    } finally {
+      setPaypalBindingLoading(false)
     }
   }
 
@@ -2487,11 +3476,17 @@ export default function Accounts() {
 
   const handleSaveRegisterSettings = async () => {
     const values = registerForm.getFieldsValue(true)
-    const settingsPayload = {
-      count: Number(values.count || 1) || 1,
-      concurrency: Number(values.concurrency || 1) || 1,
-      register_delay_seconds: Number(values.register_delay_seconds || 0) || 0,
-      mail_provider_override: String(values.mail_provider_override || '__global__'),
+      const settingsPayload = {
+        count: Number(values.count || 1) || 1,
+        concurrency: Number(values.concurrency || 1) || 1,
+        register_delay_seconds: Number(values.register_delay_seconds || 0) || 0,
+        proxy_mode: String(values.proxy_mode || 'pool'),
+        proxy: String(values.proxy || '').trim(),
+        proxy_country_code: String(values.proxy_country_code || '').trim().toUpperCase(),
+        proxy_failover: Boolean(values.proxy_failover),
+        proxy_max_candidates: Number(values.proxy_max_candidates || 5) || 5,
+        proxy_min_score: Number(values.proxy_min_score || 50) || 50,
+        mail_provider_override: String(values.mail_provider_override || '__global__'),
       email: String(values.email || '').trim(),
       chatgpt_existing_account_capture: Boolean(values.chatgpt_existing_account_capture),
       chatgpt_enable_team_invite: Boolean(values.chatgpt_enable_team_invite),
@@ -2500,7 +3495,10 @@ export default function Accounts() {
         values.chatgpt_capture_free_workspace === undefined ? true : Boolean(values.chatgpt_capture_free_workspace),
       chatgpt_capture_business_workspace:
         values.chatgpt_capture_business_workspace === undefined ? false : Boolean(values.chatgpt_capture_business_workspace),
-      chatgpt_save_registration_access_token_account: Boolean(values.chatgpt_save_registration_access_token_account),
+      chatgpt_save_registration_access_token_account:
+        values.chatgpt_save_registration_access_token_account === undefined
+          ? true
+          : Boolean(values.chatgpt_save_registration_access_token_account),
     }
 
     setRegisterSettingsSaving(true)
@@ -2624,7 +3622,9 @@ export default function Accounts() {
             : undefined,
         chatgpt_save_registration_access_token_account:
           currentPlatform === 'chatgpt'
-            ? Boolean(values.chatgpt_save_registration_access_token_account)
+            ? (values.chatgpt_save_registration_access_token_account === undefined
+              ? true
+              : Boolean(values.chatgpt_save_registration_access_token_account))
             : undefined,
       }
       const chatgptRegistrationRequestAdapter =
@@ -2648,6 +3648,12 @@ export default function Accounts() {
         count: Number(values.count || 1) || 1,
         concurrency: Number(values.concurrency || 1) || 1,
         register_delay_seconds: Number(values.register_delay_seconds || 0) || 0,
+        proxy_mode: String(values.proxy_mode || 'pool'),
+        proxy: String(values.proxy || '').trim(),
+        proxy_country_code: String(values.proxy_country_code || '').trim().toUpperCase(),
+        proxy_failover: Boolean(values.proxy_failover),
+        proxy_max_candidates: Number(values.proxy_max_candidates || 5) || 5,
+        proxy_min_score: Number(values.proxy_min_score || 50) || 50,
         mail_provider_override: selectedProviderOverride || '__global__',
         email: String(values.email || '').trim(),
         chatgpt_existing_account_capture: Boolean(values.chatgpt_existing_account_capture),
@@ -2656,7 +3662,10 @@ export default function Accounts() {
         chatgpt_capture_free_workspace: Boolean(values.chatgpt_capture_free_workspace),
         chatgpt_capture_business_workspace:
           values.chatgpt_capture_business_workspace === undefined ? false : Boolean(values.chatgpt_capture_business_workspace),
-        chatgpt_save_registration_access_token_account: Boolean(values.chatgpt_save_registration_access_token_account),
+        chatgpt_save_registration_access_token_account:
+          values.chatgpt_save_registration_access_token_account === undefined
+            ? true
+            : Boolean(values.chatgpt_save_registration_access_token_account),
       })
 
       const res = await apiFetch('/tasks/register', {
@@ -2673,7 +3682,12 @@ export default function Accounts() {
           register_delay_seconds: values.register_delay_seconds || 0,
           executor_type: executorType,
           captcha_solver: cfg.default_captcha_solver || 'yescaptcha',
-          proxy: null,
+          proxy: values.proxy_mode === 'specified' ? (String(values.proxy || '').trim() || null) : null,
+          proxy_mode: values.proxy_mode || 'pool',
+          proxy_country_code: String(values.proxy_country_code || '').trim().toUpperCase(),
+          proxy_failover: Boolean(values.proxy_failover),
+          proxy_max_candidates: Number(values.proxy_max_candidates || 5),
+          proxy_min_score: Number(values.proxy_min_score || 0),
           extra: adaptedRegisterExtra,
         }),
       })
@@ -2773,30 +3787,10 @@ export default function Accounts() {
     })
   }
 
-  const handleBackfill = async (destination: 'cliproxyapi' | 'sub2api', mode: 'pending' | 'selected') => {
+  const handleBackfill = async (destination: 'cliproxyapi' | 'sub2api' | 'oaipay', mode: 'pending' | 'selected', categoryId?: number) => {
     if (currentPlatform !== 'chatgpt') return
 
-    const body: Record<string, unknown> = {
-      platforms: ['chatgpt'],
-      destination,
-    }
-
-    if (mode === 'selected') {
-      const accountIds = Array.from(selectedRowKeys)
-        .map((value) => Number(value))
-        .filter((value) => Number.isInteger(value) && value > 0)
-
-      if (accountIds.length === 0) {
-        message.warning('请先选择要上传的账号')
-        return
-      }
-      body.account_ids = accountIds
-    } else {
-      body.pending_only = true
-      applyCurrentFiltersToBody(body)
-    }
-
-    const destinationLabel = destination === 'sub2api' ? 'Sub2API' : 'CLIProxyAPI'
+    const destinationLabel = destination === 'oaipay' ? 'OAIPay' : destination === 'sub2api' ? 'Sub2API' : 'CLIProxyAPI'
     const loadingKey = `${destination}_${mode}` as typeof backfillLoading
     const actionLabel = mode === 'selected' ? `所选账号补传到 ${destinationLabel}` : `${destinationLabel} 待补传处理`
     const toastKey = `backfill:${loadingKey}`
@@ -2804,10 +3798,101 @@ export default function Accounts() {
     setBackfillLoading(loadingKey)
     message.loading({ content: `${actionLabel}进行中...`, key: toastKey, duration: 0 })
     try {
-      const result = await apiFetch('/integrations/backfill', {
-        method: 'POST',
-        body: JSON.stringify(body),
-      })
+      let result: any
+
+      if (destination === 'sub2api' || destination === 'oaipay') {
+        const isSub2Api = destination === 'sub2api'
+        const body: Record<string, unknown> = {
+          params: {},
+        }
+        if (!isSub2Api && categoryId !== undefined) {
+          body.category_id = categoryId
+        }
+
+        if (mode === 'selected') {
+          const accountIds = Array.from(selectedRowKeys)
+            .map((value) => Number(value))
+            .filter((value) => Number.isInteger(value) && value > 0)
+
+          if (accountIds.length === 0) {
+            message.warning('请先选择要上传的账号')
+            return
+          }
+          body.account_ids = accountIds
+        } else {
+          body.all_filtered = true
+          applyCurrentFiltersToBody(body)
+
+          if (isSub2Api) {
+            const pendingSub2ApiStates = ['unknown', 'not_found', 'cross_workspace_only', 'deleted_exact_match']
+            body.sub2api_state = pendingSub2ApiStates.join(',')
+          } else {
+            const pendingOaipayStates = ['unknown', 'not_found', 'cross_workspace_only', 'deleted_exact_match']
+            body.oaipay_state = pendingOaipayStates.join(',')
+          }
+        }
+
+        const endpoint = isSub2Api ? '/tasks/chatgpt/sub2api-upload/batch' : '/tasks/chatgpt/oaipay-upload/batch'
+        const taskResult = await apiFetch(endpoint, {
+          method: 'POST',
+          body: JSON.stringify(body),
+        })
+        const startedTaskId = String(taskResult?.task_id || '').trim()
+        if (!startedTaskId) {
+          message.info({ content: '没有可处理的账号', key: toastKey })
+          showBatchActionResult(`${actionLabel}结果`, taskResult)
+          return
+        }
+
+        setTaskModalMode(isSub2Api ? 'sub2api_upload' : 'oaipay_upload')
+        setTaskModalAccount(mode === 'selected' ? null : { email: `当前筛选 ${Number(taskResult?.eligible || 0)} 个待补传账号` })
+        setTaskId(startedTaskId)
+        setTaskSnapshot({
+          id: startedTaskId,
+          task_id: startedTaskId,
+          status: 'pending',
+          source: isSub2Api ? 'batch_sub2api_upload' : 'batch_oaipay_upload',
+          progress: `0/${Number(taskResult?.eligible || 0) || 1}`,
+          meta: {
+            eligible: Number(taskResult?.eligible || 0),
+            matched: Number(taskResult?.matched || 0),
+            total_requested: Number(taskResult?.total_requested || 0),
+          },
+        })
+        setRegisterModalOpen(true)
+        setActiveTasksPanelOpen(true)
+        void activeTasksQuery.refetch()
+        message.success({ content: `${actionLabel}任务已启动`, key: toastKey })
+        return
+      } else {
+        const body: Record<string, unknown> = {
+          platforms: ['chatgpt'],
+          destination,
+        }
+        if (categoryId) {
+          body.category_id = categoryId
+        }
+
+        if (mode === 'selected') {
+          const accountIds = Array.from(selectedRowKeys)
+            .map((value) => Number(value))
+            .filter((value) => Number.isInteger(value) && value > 0)
+
+          if (accountIds.length === 0) {
+            message.warning('请先选择要上传的账号')
+            return
+          }
+          body.account_ids = accountIds
+        } else {
+          body.pending_only = true
+          applyCurrentFiltersToBody(body)
+        }
+
+        result = await apiFetch('/integrations/backfill', {
+          method: 'POST',
+          body: JSON.stringify(body),
+        })
+      }
 
       const total = Number(result?.total || 0)
       const success = Number(result?.success || 0)
@@ -2842,7 +3927,7 @@ export default function Accounts() {
     }
   }
 
-  const handleBatchStatusSync = async (kind: 'probe' | 'remote' | 'sub2api', scope: 'selected' | 'all') => {
+  const handleBatchStatusSync = async (kind: 'probe' | 'remote' | 'sub2api' | 'oaipay', scope: 'selected' | 'all') => {
     if (currentPlatform !== 'chatgpt') return
 
     const loadingKey = `${kind}_${scope}` as typeof statusSyncLoading
@@ -2851,13 +3936,17 @@ export default function Accounts() {
         ? 'probe_local_status'
         : kind === 'sub2api'
           ? 'sync_sub2api_status'
-          : 'sync_cliproxyapi_status'
+          : kind === 'oaipay'
+            ? 'sync_oaipay_status'
+            : 'sync_cliproxyapi_status'
     const actionLabel =
       kind === 'probe'
         ? '本地状态同步'
         : kind === 'sub2api'
           ? 'Sub2API 状态同步'
-          : 'CLIProxyAPI 状态同步'
+          : kind === 'oaipay'
+            ? 'OAIPay 状态同步'
+            : 'CLIProxyAPI 状态同步'
     const scopeLabel = scope === 'selected' ? '所选账号' : '当前筛选账号'
     const toastKey = `status-sync:${loadingKey}`
 
@@ -2911,9 +4000,16 @@ export default function Accounts() {
 
   const getBackfillScope = (): 'selected' | 'pending' => (selectedRowKeys.length > 0 ? 'selected' : 'pending')
 
-  const getPendingBackfillCount = (destination: 'cliproxyapi' | 'sub2api') => {
+  const getPendingBackfillCount = (destination: 'cliproxyapi' | 'sub2api' | 'oaipay') => {
     if (destination === 'sub2api') {
       return summarizeSub2ApiStates(accounts).pending
+    }
+    if (destination === 'oaipay') {
+      return accounts.filter((item: any) => {
+        const sync = item?.oaipaySync || {}
+        if (!sync || Object.keys(sync).length === 0) return true
+        return String(sync?.remote_state || '').trim().toLowerCase() === 'not_found'
+      }).length
     }
     return accounts.filter((item: any) => {
       const sync = item?.cliproxySync || {}
@@ -2922,18 +4018,18 @@ export default function Accounts() {
     }).length
   }
 
-  const buildBackfillLabel = (destination: 'cliproxyapi' | 'sub2api') => {
+  const buildBackfillLabel = (destination: 'cliproxyapi' | 'sub2api' | 'oaipay') => {
     const scope = getBackfillScope()
     const count = scope === 'selected' ? selectedRowKeys.length : getPendingBackfillCount(destination)
-    const destinationLabel = destination === 'sub2api' ? 'Sub2API' : 'CLIProxyAPI'
+    const destinationLabel = destination === 'oaipay' ? 'OAIPay' : destination === 'sub2api' ? 'Sub2API' : 'CLIProxyAPI'
     return scope === 'selected'
       ? `补传所选到 ${destinationLabel} (${count})`
       : `补传 ${destinationLabel} 待补传 (${count})`
   }
 
-  const isBackfillActionLoading = (destination: 'cliproxyapi' | 'sub2api', scope: 'selected' | 'pending') => backfillLoading === `${destination}_${scope}`
+  const isBackfillActionLoading = (destination: 'cliproxyapi' | 'sub2api' | 'oaipay', scope: 'selected' | 'pending') => backfillLoading === `${destination}_${scope}`
 
-  const buildBackfillMenuLabel = (destination: 'cliproxyapi' | 'sub2api') => {
+  const buildBackfillMenuLabel = (destination: 'cliproxyapi' | 'sub2api' | 'oaipay') => {
     const scope = getBackfillScope()
     const loading = isBackfillActionLoading(destination, scope)
     return (
@@ -2949,17 +4045,12 @@ export default function Accounts() {
     fontFamily: 'SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace',
     fontSize: 12,
   }
-  const secondaryTextStyle: React.CSSProperties = {
-    fontSize: 12,
-    color: token.colorTextSecondary,
-  }
   const cellStackStyle: React.CSSProperties = {
     display: 'flex',
     flexDirection: 'column',
     gap: isChatgptPlatform ? 4 : 6,
     minWidth: 0,
   }
-  const sub2apiOverview = summarizeSub2ApiStates(accounts)
   const compactTagStyle: React.CSSProperties = {
     marginInlineEnd: 0,
     whiteSpace: 'nowrap',
@@ -2984,7 +4075,6 @@ export default function Accounts() {
   }
 
   const renderColumnVisibilityControl = () => {
-    const selectedCount = visibleColumnKeys.filter((key) => columnVisibilityOptions.some((option) => option.value === key)).length
     const overlay = (
       <div
         onClick={(event) => event.stopPropagation()}
@@ -3019,35 +4109,15 @@ export default function Accounts() {
     )
 
     return (
-      <div
-        style={{
-          display: 'flex',
-          justifyContent: 'space-between',
-          alignItems: 'center',
-          gap: 10,
-          marginBottom: 10,
-          flex: '0 0 auto',
-        }}
-      >
-        <Text type="secondary" style={{ fontSize: 12 }}>
-          固定显示账号和操作，可选列 {selectedCount}/{columnVisibilityOptions.length}
-        </Text>
-        <Dropdown dropdownRender={() => overlay} trigger={['click']}>
-          <Button size="small" icon={<SettingOutlined />}>
-            列显示
-          </Button>
-        </Dropdown>
-      </div>
+      <Dropdown dropdownRender={() => overlay} trigger={['click']}>
+        <Button size="small" icon={<SettingOutlined />}>
+          列显示
+        </Button>
+      </Dropdown>
     )
   }
 
   const renderAccountIdentity = (text: string, record: any) => {
-    const teamInviteOwner = getTeamInviteOwnerLabel(record.teamInviteSource)
-    const teamInviteMeta = [
-      record.teamInviteSource?.team_name ? `Team: ${record.teamInviteSource.team_name}` : '',
-      record.teamInviteSource?.team_id ? `#${record.teamInviteSource.team_id}` : '',
-    ].filter(Boolean).join(' · ')
-
     return (
       <div style={cellStackStyle}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 4, minWidth: 0 }}>
@@ -3057,11 +4127,6 @@ export default function Accounts() {
           >
             {text}
           </Text>
-          {record.workspace_label || record.extra?.chatgpt_workspace_label ? (
-            <Tag color={(record.workspace_scope || record.extra?.chatgpt_workspace_scope) === 'business' ? 'processing' : 'default'}>
-              {record.workspace_label || record.extra?.chatgpt_workspace_label}
-            </Tag>
-          ) : null}
           <Button
             type="text"
             size="small"
@@ -3074,25 +4139,6 @@ export default function Accounts() {
             }}
           />
         </div>
-        <Text
-          type="secondary"
-          style={{ ...secondaryTextStyle, fontSize: 11, lineHeight: '18px' }}
-          ellipsis={{ tooltip: record.workspace_display_name || record.extra?.chatgpt_workspace_display_name || record.user_id || `账号 #${record.id}` }}
-        >
-          {record.workspace_display_name
-            || record.extra?.chatgpt_workspace_display_name
-            || record.user_id
-            || `#${record.id}`}
-        </Text>
-        {teamInviteOwner ? (
-          <Text
-            type="secondary"
-            style={{ ...secondaryTextStyle, fontSize: 11, lineHeight: '18px' }}
-            ellipsis={{ tooltip: `${teamInviteOwner}${teamInviteMeta ? ` · ${teamInviteMeta}` : ''}` }}
-          >
-            {`${teamInviteOwner}${teamInviteMeta ? ` · ${teamInviteMeta}` : ''}`}
-          </Text>
-        ) : null}
       </div>
     )
   }
@@ -3160,19 +4206,74 @@ export default function Accounts() {
 
   const renderAuthTypeState = (record: any) => {
     const meta = authTypeMeta(record)
+    const hasAccessToken = Boolean(getAccessToken(record))
+    const accountId = Number(record?.id || 0)
+    const accessTokenCopied = accountId > 0 && accessTokenCopiedAccountIds.has(accountId)
     return (
-      <Space size={4} style={{ width: '100%', justifyContent: 'center' }}>
+      <Space size={4} wrap style={{ width: '100%', justifyContent: 'center' }}>
         <Tag color={meta.color} style={compactTagStyle}>{meta.label}</Tag>
+        {hasAccessToken ? (
+          <Button title="复制AT" type="text" size="small" icon={<CopyOutlined />} onClick={() => copyAccessToken(record)}>
+            AT
+          </Button>
+        ) : null}
         {authTypeValue(record) === 'refresh_token' ? (
           <Button title="复制RT" type="text" size="small" icon={<CopyOutlined />} onClick={() => copyText(getRefreshToken(record))} />
         ) : null}
+        {accessTokenCopied ? <Tag color="orange" style={compactTagStyle}>已复制AT</Tag> : null}
       </Space>
     )
   }
 
+  const renderManualUsedState = (record: any) => (
+    <Space size={4} wrap style={{ width: '100%', justifyContent: 'center' }}>
+      <Tag color={record.manuallyUsed ? 'orange' : 'default'} style={compactTagStyle}>
+        {record.manuallyUsed ? '已使用' : '未使用'}
+      </Tag>
+      {record.manuallyUsed ? (
+        <Button
+          type="link"
+          size="small"
+          style={{ paddingInline: 0 }}
+          onClick={(event) => {
+            event.stopPropagation()
+            void unmarkAccountUsed(record)
+          }}
+        >
+          取消
+        </Button>
+      ) : null}
+    </Space>
+  )
+
   const renderSubscriptionTypeState = (record: any) => {
     const meta = subscriptionTypeMeta(record)
     return <Tag color={meta.color} style={compactTagStyle}>{meta.label}</Tag>
+  }
+
+  const renderAccountStatusState = (status: string, record?: any, options?: { inline?: boolean }) => {
+    const recoverAt = String(status || '').trim() === 'rate_limited' ? formatRateLimitRecoverAt(record) : null
+    const title = recoverAt?.title ? `预计恢复: ${recoverAt.title}` : undefined
+    return (
+      <Space
+        size={4}
+        wrap
+        style={{
+          width: options?.inline ? 'auto' : '100%',
+          maxWidth: '100%',
+          justifyContent: options?.inline ? 'flex-end' : 'center',
+        }}
+      >
+        <Tag color={STATUS_COLORS[status] || 'default'} title={title} style={compactTagStyle}>
+          {statusLabel(status)}
+          {recoverAt ? (
+            <Text type={recoverAt.expired ? 'warning' : 'secondary'} style={{ marginLeft: 4, fontSize: 11 }}>
+              {`恢复 ${recoverAt.compact}`}
+            </Text>
+          ) : null}
+        </Tag>
+      </Space>
+    )
   }
 
   const renderSubscriptionExpiryState = (record: any) => {
@@ -3301,6 +4402,14 @@ export default function Accounts() {
           <Select
             allowClear
             size="small"
+            placeholder="OAIPay"
+            value={columnFilters.oaipayState[0]}
+            options={toSelectOptions(OAIPAY_FILTER_OPTIONS)}
+            onChange={(value) => setColumnFilters((prev) => ({ ...prev, oaipayState: value ? [value] : [] }))}
+          />
+          <Select
+            allowClear
+            size="small"
             placeholder="到期排序"
             value={subscriptionExpirySortOrder || undefined}
             options={toSelectOptions(SUBSCRIPTION_EXPIRY_SORT_OPTIONS)}
@@ -3321,6 +4430,90 @@ export default function Accounts() {
 
     return (
       <Tag color={meta.color} style={compactTagStyle}>{meta.label}</Tag>
+    )
+  }
+
+  const renderSub2ApiUploadRecord = (record: any) => {
+    const sync = record.sub2apiSync && typeof record.sub2apiSync === 'object' ? record.sub2apiSync : {}
+    const lastUpload = sync.last_upload && typeof sync.last_upload === 'object' ? sync.last_upload : {}
+    const status = String(lastUpload.status || '').trim().toLowerCase()
+    const remoteId = lastUpload.remote_account_id || sync.remote_account_id
+    const messageText = String(lastUpload.message || sync.message || sync.last_message || '').trim()
+    const timeText = formatSyncTime(lastUpload.finished_at || lastUpload.attempted_at || sync.uploaded_at || sync.last_attempt_at || sync.checked_at)
+    const source = String(sync.probe_source || '').trim().toUpperCase()
+    const meta = (() => {
+      if (status === 'success') return { color: 'success', label: '成功' }
+      if (status === 'failed') return { color: 'error', label: '失败' }
+      if (status === 'blocked') return { color: 'warning', label: '阻断' }
+      if (status === 'skipped') return { color: 'processing', label: '跳过' }
+      if (sync.uploaded) return { color: 'success', label: '已确认' }
+      if (sync.remote_state) return { color: 'default', label: '仅探测' }
+      return { color: 'default', label: '无记录' }
+    })()
+
+    if (!status && !sync.remote_state && !messageText && !timeText) {
+      return <Typography.Text type="secondary">-</Typography.Text>
+    }
+
+    return (
+      <Space direction="vertical" size={2} style={{ maxWidth: 180 }}>
+        <Space size={5} wrap>
+          <Tag color={meta.color} style={compactTagStyle}>{meta.label}</Tag>
+          {remoteId ? <Typography.Text style={{ fontSize: 12 }}>#{String(remoteId)}</Typography.Text> : null}
+          {source ? <Tag style={{ ...compactTagStyle, fontSize: 11 }}>{source}</Tag> : null}
+        </Space>
+        {timeText ? <Typography.Text type="secondary" style={{ fontSize: 12 }}>{timeText}</Typography.Text> : null}
+        {messageText ? (
+          <Typography.Text type={status === 'failed' || status === 'blocked' ? 'danger' : 'secondary'} ellipsis={{ tooltip: messageText }} style={{ fontSize: 12, maxWidth: 180 }}>
+            {messageText}
+          </Typography.Text>
+        ) : null}
+      </Space>
+    )
+  }
+
+  const renderOaipayState = (record: any) => {
+    const sync = record.oaipaySync || {}
+    const meta = sub2apiStateMeta(sync)
+    return <Tag color={meta.color} style={compactTagStyle}>{meta.label}</Tag>
+  }
+
+  const renderOaipayUploadRecord = (record: any) => {
+    const sync = record.oaipaySync && typeof record.oaipaySync === 'object' ? record.oaipaySync : {}
+    const lastUpload = sync.last_upload && typeof sync.last_upload === 'object' ? sync.last_upload : {}
+    const status = String(lastUpload.status || '').trim().toLowerCase()
+    const remoteId = lastUpload.remote_account_id || sync.remote_account_id
+    const messageText = String(lastUpload.message || sync.message || sync.last_message || '').trim()
+    const timeText = formatSyncTime(lastUpload.finished_at || lastUpload.attempted_at || sync.uploaded_at || sync.last_attempt_at || sync.checked_at)
+    const source = String(sync.probe_source || '').trim().toUpperCase()
+    const meta = (() => {
+      if (status === 'success') return { color: 'success', label: '成功' }
+      if (status === 'failed') return { color: 'error', label: '失败' }
+      if (status === 'blocked') return { color: 'warning', label: '阻断' }
+      if (status === 'skipped') return { color: 'processing', label: '跳过' }
+      if (sync.uploaded) return { color: 'success', label: '已确认' }
+      if (sync.remote_state) return { color: 'default', label: '仅探测' }
+      return { color: 'default', label: '无记录' }
+    })()
+
+    if (!status && !sync.remote_state && !messageText && !timeText) {
+      return <Typography.Text type="secondary">-</Typography.Text>
+    }
+
+    return (
+      <Space direction="vertical" size={2} style={{ maxWidth: 180 }}>
+        <Space size={5} wrap>
+          <Tag color={meta.color} style={compactTagStyle}>{meta.label}</Tag>
+          {remoteId ? <Typography.Text style={{ fontSize: 12 }}>#{String(remoteId)}</Typography.Text> : null}
+          {source ? <Tag style={{ ...compactTagStyle, fontSize: 11 }}>{source}</Tag> : null}
+        </Space>
+        {timeText ? <Typography.Text type="secondary" style={{ fontSize: 12 }}>{timeText}</Typography.Text> : null}
+        {messageText ? (
+          <Typography.Text type={status === 'failed' || status === 'blocked' ? 'danger' : 'secondary'} ellipsis={{ tooltip: messageText }} style={{ fontSize: 12, maxWidth: 180 }}>
+            {messageText}
+          </Typography.Text>
+        ) : null}
+      </Space>
     )
   }
 
@@ -3456,6 +4649,58 @@ export default function Accounts() {
     const showInvalidRecheck = isChatgptPlatform && shouldShowInvalidRecheckButton(record)
     const moreMenuItems = buildAccountMoreMenuItems(record)
 
+    if (compact) {
+      const mobileActionButtonStyle = (style: CSSProperties): React.CSSProperties => ({
+        width: '100%',
+        justifyContent: 'center',
+        color: style.color,
+        borderColor: style.color,
+      })
+
+      return (
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 8 }}>
+          {paymentLinkAction ? (
+            <Button size="small" style={mobileActionButtonStyle(accountActionTextStyles.payment)} onClick={() => openAccountPaymentLinkAction(record)}>
+              订阅链接
+            </Button>
+          ) : null}
+          <Button size="small" style={mobileActionButtonStyle(accountActionTextStyles.refresh)} onClick={() => openAccountProbeStatusAction(record)}>
+            刷新状态
+          </Button>
+          {showResumeAuth ? (
+            <Button
+              size="small"
+              loading={resumeAuthAccountId === record.id}
+              style={mobileActionButtonStyle(accountActionTextStyles.resume)}
+              onClick={() => handleResumeSubscriptionAuth(record)}
+            >
+              补抓Auth
+            </Button>
+          ) : null}
+          {isChatgptPlatform ? (
+            <Button size="small" style={mobileActionButtonStyle(accountActionTextStyles.payment)} onClick={() => openAccountInlineAction(record, 'gopay', 'direct')}>
+              GoPay支付
+            </Button>
+          ) : null}
+          {showInvalidRecheck ? (
+            <Button size="small" style={mobileActionButtonStyle(accountActionTextStyles.resume)} onClick={() => handleInvalidRecheck(record)}>
+              失效测活
+            </Button>
+          ) : null}
+          <Dropdown
+            menu={{
+              items: moreMenuItems,
+              onClick: ({ key }) => handleAccountMoreMenuClick(record, key),
+            }}
+          >
+            <Button size="small" icon={<MoreOutlined />} loading={platformActionsLoading} style={mobileActionButtonStyle(accountActionTextStyles.more)}>
+              更多
+            </Button>
+          </Dropdown>
+        </div>
+      )
+    }
+
     return (
       <Space direction="vertical" size={compact ? 6 : 4} style={{ width: '100%' }}>
         <Space size={compact ? 8 : 4} wrap style={{ width: '100%' }}>
@@ -3534,39 +4779,222 @@ export default function Accounts() {
   const renderAccountMobileCard = (record: any, helpers: { checked: boolean; onCheckedChange: (checked: boolean) => void }) => {
     const formatted = formatCreatedAt(record.created_at)
     const subscriptionExpiry = formatSubscriptionExpiry(record)
+    const email = String(record.email || '').trim()
+    const teamInviteOwner = getTeamInviteOwnerLabel(record.teamInviteSource)
+    const teamInviteMeta = [
+      record.teamInviteSource?.team_name ? `Team: ${record.teamInviteSource.team_name}` : '',
+      record.teamInviteSource?.team_id ? `#${record.teamInviteSource.team_id}` : '',
+    ].filter(Boolean).join(' · ')
+    const phoneBinding = getPhoneBinding(record)
+    const hasPhoneBinding = Boolean(phoneBinding.phone || phoneBinding.apiUrl)
+    const rawPhoneLine = phoneBinding.rawLine || [phoneBinding.phone, phoneBinding.apiUrl].filter(Boolean).join('----')
+    const phoneSecondary = phoneBinding.codeTime || phoneBinding.boundAt || phoneBinding.apiExpiredDate
+    const registeredAt = `${formatted.date}${formatted.time ? ` ${formatted.time}` : ''}`
+    const expiresAt = subscriptionExpiry?.compact || '-'
+    const mobileMetaParts = [
+      isColumnVisible('created_at') ? `注册 ${registeredAt}` : '',
+      isColumnVisible('subscription_active_until') ? `到期 ${expiresAt}` : '',
+    ].filter(Boolean)
+    const mobileStatusLabelStyle: React.CSSProperties = {
+      display: 'block',
+      marginBottom: 4,
+      color: token.colorTextSecondary,
+      fontSize: 11,
+      lineHeight: '16px',
+    }
+    const mobileStatusPillStyle: React.CSSProperties = {
+      marginInlineEnd: 0,
+      padding: '2px 9px',
+      borderRadius: 8,
+      fontSize: 13,
+      lineHeight: '22px',
+      fontWeight: 600,
+    }
+    const renderMobileStatusPill = (
+      key: string,
+      label: React.ReactNode,
+      color: string,
+      extra?: React.ReactNode,
+    ) => (
+      <span key={key} style={{ display: 'inline-flex', alignItems: 'center', gap: 5, maxWidth: '100%' }}>
+        <Tag color={color} style={mobileStatusPillStyle}>{label}</Tag>
+        {extra}
+      </span>
+    )
+    const authMetaForMobile = authTypeMeta(record)
+    const authTypeForMobile = authTypeValue(record)
+    const hasAccessTokenForMobile = Boolean(getAccessToken(record))
+    const accessTokenCopiedForMobile = Number(record?.id || 0) > 0 && accessTokenCopiedAccountIds.has(Number(record.id || 0))
+    const hasRefreshTokenForMobile = Boolean(getRefreshToken(record))
+    const subscriptionMetaForMobile = subscriptionTypeMeta(record)
+    const validityMetaForMobile = accountValidityMeta(record)
+    const hasPasswordForMobile = Boolean(String(record.password || '').trim())
+    const mobileStatusItems = [
+      isColumnVisible('auth_type') ? renderMobileStatusPill(
+        'auth_type',
+        authMetaForMobile.label,
+        authMetaForMobile.color,
+        <>
+          {hasAccessTokenForMobile ? (
+            <Button title="复制AT" type="text" size="small" icon={<CopyOutlined />} onClick={() => copyAccessToken(record)}>
+              AT
+            </Button>
+          ) : null}
+          {authTypeForMobile === 'refresh_token' && hasRefreshTokenForMobile ? (
+            <Button title="复制RT" type="text" size="small" icon={<CopyOutlined />} onClick={() => copyText(getRefreshToken(record))} />
+          ) : null}
+          {accessTokenCopiedForMobile ? <Tag color="orange" style={{ ...compactTagStyle, fontSize: 11 }}>已复制AT</Tag> : null}
+        </>,
+      ) : null,
+      isColumnVisible('manually_used') ? renderMobileStatusPill(
+        'manually_used',
+        record.manuallyUsed ? '已使用' : '未使用',
+        record.manuallyUsed ? 'orange' : 'default',
+      ) : null,
+      isColumnVisible('subscription_type') ? renderMobileStatusPill('subscription_type', subscriptionMetaForMobile.label, subscriptionMetaForMobile.color) : null,
+      isColumnVisible('account_validity') ? renderMobileStatusPill('account_validity', validityMetaForMobile.label, validityMetaForMobile.color) : null,
+      isColumnVisible('password') ? renderMobileStatusPill(
+        'password',
+        hasPasswordForMobile ? '有密码' : '无密码',
+        hasPasswordForMobile ? 'success' : 'default',
+        hasPasswordForMobile ? <Button title="复制密码" type="text" size="small" icon={<CopyOutlined />} onClick={() => copyText(record.password)} /> : null,
+      ) : null,
+      isChatgptPlatform && isColumnVisible('sub2api_state') ? renderSub2ApiState(record) : null,
+      isChatgptPlatform && isColumnVisible('sub2api_upload_record') ? renderSub2ApiUploadRecord(record) : null,
+      isChatgptPlatform && isColumnVisible('oaipay_state') ? renderOaipayState(record) : null,
+      isChatgptPlatform && isColumnVisible('oaipay_upload_record') ? renderOaipayUploadRecord(record) : null,
+    ].filter(Boolean)
 
     return (
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 10, minWidth: 0 }}>
-        <div style={{ display: 'flex', alignItems: 'flex-start', gap: 8, minWidth: 0 }}>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 12, minWidth: 0 }}>
+        <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10, minWidth: 0 }}>
           <Checkbox
             checked={helpers.checked}
             onChange={(event) => helpers.onCheckedChange(event.target.checked)}
             style={{ marginTop: 3, flex: '0 0 auto' }}
           />
           <div style={{ flex: 1, minWidth: 0 }}>
-            {renderAccountIdentity(String(record.email || ''), record)}
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 }}>
+              <Tag color="default" style={{ ...compactTagStyle, flex: '0 0 auto' }}>{record.id}</Tag>
+              <Text
+                strong
+                style={{
+                  ...monospaceStyle,
+                  flex: '1 1 auto',
+                  minWidth: 0,
+                  maxWidth: '100%',
+                  fontSize: 13,
+                  lineHeight: '22px',
+                }}
+                ellipsis={{ tooltip: email || '-' }}
+              >
+                {email || '-'}
+              </Text>
+              {email ? (
+                <Button
+                  title="复制邮箱"
+                  type="text"
+                  size="small"
+                  icon={<CopyOutlined />}
+                  style={{ flex: '0 0 auto' }}
+                  onClick={async () => {
+                    const ok = await copyText(email)
+                    if (ok) {
+                      await markAccountUsed(Number(record.id || 0))
+                    }
+                  }}
+                />
+              ) : null}
+            </div>
           </div>
-          <Tag color={STATUS_COLORS[record.status] || 'default'} style={{ marginInlineEnd: 0 }}>
-            {statusLabel(record.status)}
-          </Tag>
         </div>
 
-        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-          <Tag color="default">ID {record.id}</Tag>
-          {isColumnVisible('created_at') ? <Tag color="default">注册 {`${formatted.date}${formatted.time ? ` ${formatted.time}` : ''}`}</Tag> : null}
-          {isColumnVisible('password') ? <span style={{ display: 'inline-flex' }}>{renderPasswordState(record.password)}</span> : null}
-          {isColumnVisible('phone_binding') ? <span style={{ display: 'inline-flex', maxWidth: '100%' }}>{renderPhoneBindingState(record)}</span> : null}
-          {isColumnVisible('auth_type') ? <span style={{ display: 'inline-flex' }}>{renderAuthTypeState(record)}</span> : null}
-          {isColumnVisible('manually_used') ? <Tag color={record.manuallyUsed ? 'orange' : 'default'}>{record.manuallyUsed ? '已使用' : '未使用'}</Tag> : null}
-          {isColumnVisible('subscription_type') ? <span style={{ display: 'inline-flex' }}>{renderSubscriptionTypeState(record)}</span> : null}
-          {isColumnVisible('subscription_active_until') ? (
-            <Tag color={subscriptionExpiry?.expired ? 'error' : subscriptionExpiry ? 'blue' : 'default'}>
-              到期 {subscriptionExpiry?.compact || '-'}
-            </Tag>
-          ) : null}
-          {isColumnVisible('account_validity') ? <span style={{ display: 'inline-flex' }}>{renderAccountValidityState(record)}</span> : null}
-          {isChatgptPlatform && isColumnVisible('sub2api_state') ? <span style={{ display: 'inline-flex' }}>{renderSub2ApiState(record)}</span> : null}
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, paddingLeft: 22 }}>
+          {renderAccountStatusState(record.status, record, { inline: true })}
         </div>
+
+        {teamInviteOwner ? (
+          <Text type="secondary" style={{ paddingLeft: 22, fontSize: 11, lineHeight: '18px' }} ellipsis={{ tooltip: `${teamInviteOwner}${teamInviteMeta ? ` · ${teamInviteMeta}` : ''}` }}>
+            {`${teamInviteOwner}${teamInviteMeta ? ` · ${teamInviteMeta}` : ''}`}
+          </Text>
+        ) : null}
+
+        <div
+          style={{
+            minWidth: 0,
+            border: `1px solid ${token.colorBorderSecondary}`,
+            borderRadius: 10,
+            padding: '8px 10px',
+            background: token.colorFillAlter,
+          }}
+        >
+          {mobileMetaParts.length > 0 ? (
+            <div
+              title={[
+                isColumnVisible('created_at') ? `注册 ${registeredAt}` : '',
+                isColumnVisible('subscription_active_until') ? `到期 ${subscriptionExpiry?.title || expiresAt}` : '',
+              ].filter(Boolean).join(' · ')}
+              style={{
+                marginBottom: mobileStatusItems.length > 0 ? 9 : 0,
+                color: token.colorTextSecondary,
+                fontSize: 12,
+                lineHeight: '20px',
+                whiteSpace: 'nowrap',
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+              }}
+            >
+              {mobileMetaParts.join(' · ')}
+            </div>
+          ) : null}
+          {mobileStatusItems.length > 0 ? (
+            <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '9px 10px' }}>
+              {mobileStatusItems.map((item, index) => (
+                <span key={index} style={{ display: 'inline-flex', maxWidth: '100%' }}>{item}</span>
+              ))}
+            </div>
+          ) : null}
+        </div>
+
+        {isColumnVisible('phone_binding') && hasPhoneBinding ? (
+          <div
+            style={{
+              minWidth: 0,
+              border: `1px solid ${token.colorBorderSecondary}`,
+              borderRadius: 10,
+              padding: '8px 10px',
+              background: token.colorFillAlter,
+            }}
+          >
+            <span style={mobileStatusLabelStyle}>手机号 / API</span>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 5, minWidth: 0 }}>
+              {phoneBinding.phone ? (
+                <Space size={4} style={{ minWidth: 0 }}>
+                  <Text style={{ ...monospaceStyle, fontSize: 12 }} ellipsis={{ tooltip: phoneBinding.phone }}>
+                    {phoneBinding.phone}
+                  </Text>
+                  <Button title="复制手机号" type="text" size="small" icon={<CopyOutlined />} onClick={() => copyText(phoneBinding.phone)} />
+                </Space>
+              ) : null}
+              {phoneBinding.apiUrl ? (
+                <Space size={4} style={{ minWidth: 0, maxWidth: '100%' }}>
+                  <Text type="secondary" style={{ ...monospaceStyle, flex: 1, minWidth: 0, fontSize: 11 }} ellipsis={{ tooltip: phoneBinding.apiUrl }}>
+                    {phoneBinding.apiUrl}
+                  </Text>
+                  <Button title="复制完整 API" type="text" size="small" icon={<CopyOutlined />} onClick={() => copyText(phoneBinding.apiUrl)} />
+                </Space>
+              ) : null}
+              <Space size={8} wrap>
+                {rawPhoneLine ? (
+                  <Button size="small" type="link" icon={<CopyOutlined />} style={{ paddingInline: 0 }} onClick={() => copyText(rawPhoneLine)}>
+                    复制整行
+                  </Button>
+                ) : null}
+                {phoneSecondary ? <Text type="secondary" style={{ fontSize: 11 }}>{phoneSecondary}</Text> : null}
+              </Space>
+            </div>
+          </div>
+        ) : null}
 
         <div style={{ borderTop: `1px solid ${token.colorBorderSecondary}`, paddingTop: 8 }}>
           {renderAccountActions(record, true)}
@@ -3681,6 +5109,18 @@ export default function Accounts() {
 
   const columns: any[] = [
     {
+      title: 'ID',
+      dataIndex: 'id',
+      key: 'id',
+      width: 68,
+      align: 'center',
+      render: (id: number) => (
+        <Text style={{ ...monospaceStyle, fontSize: 12 }}>
+          {id}
+        </Text>
+      ),
+    },
+    {
       title: (
         <Input.Search
           allowClear
@@ -3715,12 +5155,8 @@ export default function Accounts() {
       ),
       dataIndex: 'manually_used',
       key: 'manually_used',
-      width: 108,
-      render: (_: any, record: any) => (
-        <Tag color={record.manuallyUsed ? 'orange' : 'default'} style={compactTagStyle}>
-          {record.manuallyUsed ? '已使用' : '未使用'}
-        </Tag>
-      ),
+      width: 126,
+      render: (_: any, record: any) => renderManualUsedState(record),
     },
     {
       title: '密码',
@@ -3743,7 +5179,7 @@ export default function Accounts() {
         (next) => setColumnFilters((prev) => ({ ...prev, authType: next })),
       ),
       key: 'auth_type',
-      width: 112,
+      width: 152,
       render: (_: any, record: any) => renderAuthTypeState(record),
     },
     {
@@ -3758,8 +5194,8 @@ export default function Accounts() {
       ),
       dataIndex: 'status',
       key: 'status',
-      width: 96,
-      render: (status: string) => <Tag color={STATUS_COLORS[status] || 'default'} style={compactTagStyle}>{statusLabel(status)}</Tag>,
+      width: 190,
+      render: (status: string, record: any) => renderAccountStatusState(status, record),
     },
   ]
 
@@ -3806,6 +5242,29 @@ export default function Accounts() {
         key: 'sub2api_state',
         width: 106,
         render: (_: any, record: any) => renderSub2ApiState(record),
+      },
+      {
+        title: 'Sub2API上传',
+        key: 'sub2api_upload_record',
+        width: 196,
+        render: (_: any, record: any) => renderSub2ApiUploadRecord(record),
+      },
+      {
+        title: renderColumnFilterTitle(
+          'OAIPay',
+          columnFilters.oaipayState,
+          OAIPAY_FILTER_OPTIONS,
+          (next) => setColumnFilters((prev) => ({ ...prev, oaipayState: next })),
+        ),
+        key: 'oaipay_state',
+        width: 106,
+        render: (_: any, record: any) => renderOaipayState(record),
+      },
+      {
+        title: 'OAIPay上传',
+        key: 'oaipay_upload_record',
+        width: 196,
+        render: (_: any, record: any) => renderOaipayUploadRecord(record),
       },
     )
   } else {
@@ -3885,24 +5344,37 @@ export default function Accounts() {
           : `同步当前筛选 Sub2API 状态 (${total})`,
       disabled: getStatusSyncScope() === 'selected' ? selectedRowKeys.length === 0 : total === 0,
     },
+    {
+      key: `oaipay:${getStatusSyncScope()}`,
+      label:
+        getStatusSyncScope() === 'selected'
+          ? `同步所选 OAIPay 状态 (${selectedRowKeys.length})`
+          : `同步当前筛选 OAIPay 状态 (${total})`,
+      disabled: getStatusSyncScope() === 'selected' ? selectedRowKeys.length === 0 : total === 0,
+    },
   ]
 
   const backfillScope = getBackfillScope()
-  const backfillDisabled = backfillScope === 'selected' ? selectedRowKeys.length === 0 : getPendingBackfillCount('sub2api') === 0 && getPendingBackfillCount('cliproxyapi') === 0
-  const sub2apiOverviewBackfillScope: 'selected' | 'pending' = selectedRowKeys.length > 0 ? 'selected' : 'pending'
-  const sub2apiOverviewPendingCount = getPendingBackfillCount('sub2api')
-  const sub2apiOverviewUploading = backfillLoading === `sub2api_${sub2apiOverviewBackfillScope}`
-  const sub2apiOverviewUploadDisabled = sub2apiOverviewBackfillScope === 'selected' ? selectedRowKeys.length === 0 : sub2apiOverviewPendingCount === 0
+  const cliproxyapiBackfillDisabled = backfillScope === 'selected'
+    ? selectedRowKeys.length === 0
+    : getPendingBackfillCount('cliproxyapi') === 0
+  const sub2apiBackfillDisabled = backfillScope === 'selected' ? selectedRowKeys.length === 0 : total === 0
+  const oaipayBackfillDisabled = backfillScope === 'selected' ? selectedRowKeys.length === 0 : total === 0
   const backfillMenuItems: MenuProps['items'] = [
     {
       key: `cliproxyapi:${backfillScope}`,
       label: buildBackfillMenuLabel('cliproxyapi'),
-      disabled: backfillDisabled,
+      disabled: cliproxyapiBackfillDisabled,
     },
     {
       key: `sub2api:${backfillScope}`,
       label: buildBackfillMenuLabel('sub2api'),
-      disabled: backfillDisabled,
+      disabled: sub2apiBackfillDisabled,
+    },
+    {
+      key: `oaipay:${backfillScope}`,
+      label: buildBackfillMenuLabel('oaipay'),
+      disabled: oaipayBackfillDisabled,
     },
   ]
   const resumeAuthScope = getResumeAuthScope()
@@ -3940,6 +5412,7 @@ export default function Accounts() {
             <Text strong>{item.account.email || item.account.id}</Text>
             <Tag color="blue">第 {item.round} 轮</Tag>
             <Tag>{formatGopayPhoneLabel(item.phone)}</Tag>
+            {formatGopayPhoneExpiryLabel(item.phone) ? <Tag color="processing">有效期 {formatGopayPhoneExpiryLabel(item.phone)}</Tag> : <Tag>有效期 -</Tag>}
             <Tag color={isTerminal ? (phase === 'succeeded' || item.status === 'done' ? 'success' : item.status === 'cancelled' ? 'default' : 'error') : 'processing'}>
               {meta.title}
             </Tag>
@@ -4056,6 +5529,100 @@ export default function Accounts() {
     )
   }
 
+  const phoneBindingPrefixSampleEnabled = phoneBindingPrefixSampleValue === true
+  const phoneBindingProxyMode = String(phoneBindingProxyModeValue || DEFAULT_PHONE_BINDING_SETTINGS.proxy_mode)
+  const phoneBindingPrefixSampleSize = Number(phoneBindingPrefixSampleSizeValue) === 2 ? 2 : 1
+  const phoneBindingPrefixSampleFilter = (() => {
+    const value = String(phoneBindingPrefixSampleFilterValue || 'all')
+    if (value === 'available') return 'available'
+    if (value === 'rejected') return 'rejected'
+    return 'all'
+  })()
+  const phoneBindingUsePool = phoneBindingPrefixSampleEnabled || phoneBindingUsePoolValue !== false
+  const phoneBindingManualText = String(phoneBindingPhoneLinesValue || '').trim()
+  const phoneBindingShowManualInput = !phoneBindingPrefixSampleEnabled && (phoneBindingManualOpen || !phoneBindingUsePool || Boolean(phoneBindingManualText))
+  const phoneBindingPoolSummary = phonePoolSummary || {}
+  const phoneBindingTargetCount = phoneBindingTestScope === 'selected' ? selectedRowKeys.length : total
+  const phoneBindingSummaryAvailable = Number(phoneBindingPoolSummary.available || 0)
+  const phoneBindingSummaryRemaining = Number(phoneBindingPoolSummary.remaining_capacity || 0)
+  const phoneBindingSummaryRateLimited = Number(phoneBindingPoolSummary.rate_limited || 0)
+  const phoneBindingSummaryUnavailable = Number(phoneBindingPoolSummary.unavailable || phoneBindingPoolSummary.cannot_send || 0)
+  const phoneBindingSummaryExhausted = Number(phoneBindingPoolSummary.exhausted || 0)
+  const phoneBindingSummaryDisabled = Number(phoneBindingPoolSummary.disabled || 0)
+  const phoneBindingSummaryPrefixCount = Number(
+    phoneBindingPrefixSampleFilter === 'available'
+      ? (phoneBindingPoolSummary.available_prefix_count ?? 0)
+      : phoneBindingPrefixSampleFilter === 'rejected'
+        ? (phoneBindingPoolSummary.rejected_prefix_count ?? 0)
+        : (phoneBindingPoolSummary.prefix_sample_prefix_count ?? 0),
+  )
+  const phoneBindingSummarySampleCount = Number(
+    phoneBindingPrefixSampleFilter === 'available'
+      ? (
+          phoneBindingPrefixSampleSize === 2
+            ? (phoneBindingPoolSummary.available_prefix_sample_2 ?? phoneBindingPoolSummary.available_prefix_sample_1)
+            : (phoneBindingPoolSummary.available_prefix_sample_1 ?? phoneBindingPoolSummary.available_prefix_sample_2)
+        )
+      : phoneBindingPrefixSampleFilter === 'rejected'
+      ? (
+          phoneBindingPrefixSampleSize === 2
+            ? phoneBindingPoolSummary.rejected_prefix_sample_2
+            : phoneBindingPoolSummary.rejected_prefix_sample_1
+        )
+      : (
+          phoneBindingPrefixSampleSize === 2
+            ? (phoneBindingPoolSummary.prefix_sample_count_2 ?? phoneBindingPoolSummary.available_prefix_sample_2)
+            : (phoneBindingPoolSummary.prefix_sample_count_1 ?? phoneBindingPoolSummary.available_prefix_sample_1)
+        ),
+  ) || 0
+  const phoneBindingPoolEmpty =
+    phoneBindingUsePool
+    && phoneBindingManualText === ''
+    && phoneBindingTargetCount > 0
+    && phonePoolSummary !== null
+    && !phonePoolSummaryLoading
+    && (phoneBindingPrefixSampleEnabled ? phoneBindingSummarySampleCount <= 0 : phoneBindingSummaryRemaining <= 0)
+  const phoneBindingPoolShortage =
+    !phoneBindingPrefixSampleEnabled
+    &&
+    phoneBindingUsePool
+    && phoneBindingManualText === ''
+    && phoneBindingTargetCount > 0
+    && phoneBindingSummaryRemaining > 0
+    && phoneBindingSummaryRemaining < phoneBindingTargetCount
+  const baxiCdkManualText = String(baxiCdkCodeLinesValue || '').trim()
+  const baxiCdkUsePool = !baxiCdkManualText && baxiCdkUsePoolValue !== false
+  const baxiCdkShowManualInput = baxiCdkManualOpen || Boolean(baxiCdkManualText) || !baxiCdkUsePool
+  const baxiCdkSummary = baxiCdkPoolSummary || {}
+  const baxiCdkTargetCount = baxiCdkSubmitScope === 'selected' ? selectedRowKeys.length : total
+  const baxiCdkAvailable = Number(baxiCdkSummary.available || 0)
+  const baxiCdkSubmitted = Number(baxiCdkSummary.submitted || 0) + Number(baxiCdkSummary.processing || 0)
+  const baxiCdkPaid = Number(baxiCdkSummary.paid || 0)
+  const baxiCdkFailed = Number(baxiCdkSummary.failed || 0)
+  const baxiCdkDisabled = Number(baxiCdkSummary.disabled || 0)
+  const baxiCdkManualCount = baxiCdkManualText
+    ? baxiCdkManualText.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).length
+    : 0
+  const baxiCdkPoolEmpty =
+    baxiCdkUsePool
+    && !baxiCdkManualText
+    && baxiCdkTargetCount > 0
+    && baxiCdkPoolSummary !== null
+    && !baxiCdkPoolSummaryLoading
+    && baxiCdkAvailable <= 0
+  const baxiCdkPoolShortage =
+    baxiCdkUsePool
+    && !baxiCdkManualText
+    && baxiCdkTargetCount > 0
+    && baxiCdkAvailable > 0
+    && baxiCdkAvailable < baxiCdkTargetCount
+  const baxiCdkManualOverflow = baxiCdkManualCount > 0 && baxiCdkTargetCount > 0 && baxiCdkManualCount > baxiCdkTargetCount
+  const paypalFilteredEligibleCountLabel = paypalFilteredEligibleLoading
+    ? '统计中'
+    : paypalFilteredEligibleCount === null
+      ? '-'
+      : String(paypalFilteredEligibleCount)
+
   return (
     <div
       style={{
@@ -4070,8 +5637,8 @@ export default function Accounts() {
     >
       <AccountsToolbar
         total={total}
-        accountsCount={accounts.length}
         selectedRowKeys={selectedRowKeys}
+        columnVisibilityControl={renderColumnVisibilityControl()}
         activeTasksLoading={activeTasksLoading}
         activeTasks={activeTasks}
         onOpenTaskSnapshot={openTaskFromSnapshot}
@@ -4082,9 +5649,13 @@ export default function Accounts() {
         batchPaymentLinkLoading={batchPaymentLinkLoading}
         batchInvalidRecheckLoading={batchInvalidRecheckLoading}
         phoneBindingTestLoading={phoneBindingTestLoading}
+        paypalBindingLoading={paypalBindingLoading}
+        baxiCdkSubmitLoading={baxiCdkSubmitLoading}
         onBatchPaymentLink={handleBatchPaymentLink}
         onBatchInvalidRecheck={handleBatchInvalidRecheck}
         onOpenPhoneBindingTest={openPhoneBindingTest}
+        onOpenPaypalBinding={openPaypalBinding}
+        onOpenBaxiCdkSubmit={openBaxiCdkSubmit}
         onOpenBatchGopay={openBatchGopayWorkbench}
         onOpenBusinessDeferred={() => setBusinessDeferredModalOpen(true)}
         deleteInvalidLoading={deleteInvalidLoading}
@@ -4105,7 +5676,7 @@ export default function Accounts() {
         }}
         statusSyncMenuItems={statusSyncMenuItems}
         onStatusSyncClick={({ key }) => {
-          const [kind, scope] = String(key).split(':') as ['probe' | 'remote' | 'sub2api', 'selected' | 'all']
+          const [kind, scope] = String(key).split(':') as ['probe' | 'remote' | 'sub2api' | 'oaipay', 'selected' | 'all']
           void handleBatchStatusSync(kind, scope)
         }}
         statusSyncLoading={statusSyncLoading}
@@ -4123,40 +5694,18 @@ export default function Accounts() {
         resumeAuthLoading={batchResumeAuthLoading}
         backfillMenuItems={backfillMenuItems}
         onBackfillClick={({ key }) => {
-          const [destination, scope] = String(key).split(':') as ['cliproxyapi' | 'sub2api', 'selected' | 'pending']
-          Modal.confirm({
-            title:
-              scope === 'selected'
-                ? `确认补传所选 ${selectedRowKeys.length} 个账号到 ${destination === 'sub2api' ? 'Sub2API' : 'CLIProxyAPI'}？`
-                : `确认处理当前筛选范围内 ${getPendingBackfillCount(destination)} 个 ${destination === 'sub2api' ? 'Sub2API' : 'CLIProxyAPI'} 待补传账号？`,
-            onOk: () => handleBackfill(destination, scope),
-          })
+          const [destination, scope] = String(key).split(':') as ['cliproxyapi' | 'sub2api' | 'oaipay', 'selected' | 'pending']
+          if (destination === 'oaipay') {
+            void openOaipayUploadModal(scope)
+          } else {
+            void handleBackfill(destination, scope)
+          }
         }}
         backfillLoading={backfillLoading}
         isMobile={isMobile}
       />
 
       {renderSelectedAccountsSummary()}
-
-      {renderColumnVisibilityControl()}
-
-      {currentPlatform === 'chatgpt' && accounts.length > 0 && (
-        <div style={{ flex: '0 0 auto' }}>
-          <Sub2ApiOverviewPanel
-            accountsCount={accounts.length}
-            overview={sub2apiOverview}
-            syncing={false}
-            statusSyncLoading={statusSyncLoading}
-            uploadLoading={sub2apiOverviewUploading}
-            uploadDisabled={sub2apiOverviewUploadDisabled}
-            pendingCount={sub2apiOverviewPendingCount}
-            scope={sub2apiOverviewBackfillScope}
-            selectedCount={selectedRowKeys.length}
-            onRefresh={() => handleBatchStatusSync('sub2api', 'all')}
-            onUpload={() => handleBackfill('sub2api', sub2apiOverviewBackfillScope)}
-          />
-        </div>
-      )}
 
       <AccountsTable
         columns={visibleColumns}
@@ -4211,6 +5760,7 @@ export default function Accounts() {
         onRoundIntervalChange={(value) => setBatchGopayRoundInterval(Number(value || 0))}
         onOtpAutoResendDelayChange={(value) => setBatchGopayOtpAutoResendDelay(value)}
         formatGopayPhoneLabel={formatGopayPhoneLabel}
+        formatGopayPhoneExpiryLabel={formatGopayPhoneExpiryLabel}
         renderBatchGopayItem={renderBatchGopayItem}
         normalizeGopayOtpAutoResendDelay={normalizeGopayOtpAutoResendDelay}
         activePhaseMatcher={(item) => Boolean(item.snapshot?.session_id && GOPAY_ACTIVE_PHASES.has(String(item.snapshot?.phase || '')))}
@@ -4295,6 +5845,43 @@ export default function Accounts() {
       />
 
       <Modal
+        title={batchPaymentLinkForceRefresh ? '强制重新生成订阅链接' : '批量生成订阅链接'}
+        open={batchPaymentLinkConfigOpen}
+        onCancel={() => setBatchPaymentLinkConfigOpen(false)}
+        onOk={submitBatchPaymentLinkConfig}
+        confirmLoading={batchPaymentLinkLoading}
+        okText={batchPaymentLinkForceRefresh ? '开始重新生成' : '开始生成'}
+        cancelText="取消"
+        maskClosable={false}
+      >
+        <Form form={batchPaymentLinkConfigForm} layout="vertical">
+          <Alert
+            type="info"
+            showIcon
+            style={{ marginBottom: 12 }}
+            message={
+              selectedRowKeys.length > 0
+                ? `范围：当前选中 ${selectedRowKeys.length} 个账号`
+                : `范围：当前筛选结果 ${total} 个账号`
+            }
+            description={
+              batchPaymentLinkForceRefresh
+                ? '会绕过已有缓存重新生成，但账号已失效时仍会跳过。其他支付参数继续沿用全局或账号默认配置。'
+                : '默认可复用缓存；如果缓存参数不匹配，会按这里选择的路径重新生成。其他支付参数继续沿用全局或账号默认配置。'
+            }
+          />
+          <Form.Item
+            name="payment_link_format"
+            label="生成路径"
+            initialValue={DEFAULT_PAYMENT_LINK_FORMAT}
+            rules={[{ required: true, message: '请选择生成路径' }]}
+          >
+            <Select options={PAYMENT_LINK_FORMAT_OPTIONS} />
+          </Form.Item>
+        </Form>
+      </Modal>
+
+      <Modal
         title={resumeAuthConfigMode === 'single' ? '补抓 Auth 配置' : '批量补抓 Auth 配置'}
         open={resumeAuthConfigOpen}
         onCancel={() => setResumeAuthConfigOpen(false)}
@@ -4325,19 +5912,23 @@ export default function Accounts() {
       </Modal>
 
       <Modal
-        title="OpenAI 号码绑定测试"
+        title="OpenAI 手机号绑定"
         open={phoneBindingTestOpen}
         onCancel={() => setPhoneBindingTestOpen(false)}
         onOk={submitPhoneBindingTest}
         confirmLoading={phoneBindingTestLoading}
-        okText="开始真实绑定"
+        okText="开始绑定"
         cancelText="取消"
-        width={720}
+        width={820}
         maskClosable={false}
       >
-        <Form form={phoneBindingTestForm} layout="vertical">
+        <Form
+          form={phoneBindingTestForm}
+          layout="vertical"
+          onValuesChange={(_, allValues) => savePhoneBindingSettings(allValues)}
+        >
           <Alert
-            type="warning"
+            type="info"
             showIcon
             style={{ marginBottom: 12 }}
             message={
@@ -4345,6 +5936,7 @@ export default function Accounts() {
                 ? `范围：当前选中 ${selectedRowKeys.length} 个账号`
                 : `范围：当前筛选结果 ${total} 个账号`
             }
+            description="会真实提交手机号验证码并绑定到 OpenAI 账号。"
           />
           <Form.Item name="scope" label="账号范围" initialValue={phoneBindingTestScope}>
             <Select
@@ -4356,37 +5948,660 @@ export default function Accounts() {
               ]}
             />
           </Form.Item>
-          <Form.Item
-            name="phone_lines"
-            label="手机号与收码 API"
-            rules={[{ required: true, message: '请粘贴至少一行手机号与 API' }]}
-            extra="+13434832954----https://api.sms8.net/api/record?token=xxx"
+
+          <Form.Item label="号码来源">
+            <div
+              style={{
+                display: 'flex',
+                gap: 10,
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                flexWrap: 'wrap',
+              }}
+            >
+              <Space wrap>
+                <Form.Item name="use_pool" valuePropName="checked" noStyle>
+                  <Switch
+                    checkedChildren="手机号池"
+                    unCheckedChildren="临时号码"
+                    disabled={phoneBindingPrefixSampleEnabled}
+                    onChange={(checked) => {
+                      if (!checked) setPhoneBindingManualOpen(true)
+                    }}
+                  />
+                </Form.Item>
+                <Button
+                  size="small"
+                  icon={phonePoolSummaryLoading ? <SyncOutlined spin /> : <SyncOutlined />}
+                  onClick={() => {
+                    void loadPhonePoolSummary(false)
+                  }}
+                >
+                  刷新库存
+                </Button>
+              </Space>
+              <Space wrap size={[4, 6]}>
+                <Tag color="blue">可用 {phoneBindingSummaryAvailable}</Tag>
+                <Tag color="cyan">容量 {phoneBindingSummaryRemaining}</Tag>
+                <Tag color={phoneBindingSummaryRateLimited > 0 ? 'warning' : 'default'}>限流 {phoneBindingSummaryRateLimited}</Tag>
+                <Tag color={phoneBindingSummaryUnavailable > 0 ? 'error' : 'default'}>不可用 {phoneBindingSummaryUnavailable}</Tag>
+                <Tag>已绑满 {phoneBindingSummaryExhausted}</Tag>
+                <Tag>停用 {phoneBindingSummaryDisabled}</Tag>
+              </Space>
+            </div>
+            <Text type="secondary" style={{ display: 'block', marginTop: 6 }}>
+              未填写临时号码时会从手机号池自动取号；填写临时号码后，本次任务优先使用粘贴内容。
+            </Text>
+            <div
+              style={{
+                display: 'flex',
+                gap: 12,
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                flexWrap: 'wrap',
+                marginTop: 10,
+                paddingTop: 10,
+                borderTop: `1px solid ${token.colorBorderSecondary}`,
+              }}
+            >
+              <Space wrap>
+                <Form.Item name="prefix_sample_enabled" valuePropName="checked" noStyle>
+                  <Switch
+                    checkedChildren="号段抽样"
+                    unCheckedChildren="普通绑定"
+                    onChange={(checked) => {
+                      if (checked) {
+                        phoneBindingTestForm.setFieldsValue({
+                          use_pool: true,
+                          phone_lines: '',
+                          reuse_phone_until_unusable: false,
+                        })
+                        setPhoneBindingManualOpen(false)
+                      }
+                    }}
+                  />
+                </Form.Item>
+                <Text strong>按手机号前 4 位测试</Text>
+                <Form.Item name="prefix_sample_size" noStyle>
+                  <Segmented
+                    size="small"
+                    disabled={!phoneBindingPrefixSampleEnabled}
+                    options={[
+                      { label: '每段 1 个', value: 1 },
+                      { label: '每段 2 个', value: 2 },
+                    ]}
+                  />
+                </Form.Item>
+                <Form.Item name="prefix_sample_filter" noStyle>
+                  <Segmented
+                    size="small"
+                    disabled={!phoneBindingPrefixSampleEnabled}
+                    options={[
+                      { label: '全部可测试号段', value: 'all' },
+                      { label: '测试可用号段', value: 'available' },
+                      { label: '仅不可用号段', value: 'rejected' },
+                    ]}
+                  />
+                </Form.Item>
+              </Space>
+              <Text type="secondary" style={{ fontSize: 12 }}>
+                {phoneBindingPrefixSampleEnabled
+                  ? phoneBindingPrefixSampleFilter === 'available'
+                    ? `当前可用号段 ${phoneBindingSummaryPrefixCount} 个，预计测试 ${phoneBindingSummarySampleCount} 个号码`
+                    : phoneBindingPrefixSampleFilter === 'rejected'
+                    ? `当前 OpenAI 拒绝号段 ${phoneBindingSummaryPrefixCount} 个，预计复测 ${phoneBindingSummarySampleCount} 个号码`
+                    : `当前可测试 ${phoneBindingSummaryPrefixCount} 个号段，预计 ${phoneBindingSummarySampleCount} 个号码`
+                  : '优先抽取未测试、使用次数少的号码，每个号码只测试一次'}
+              </Text>
+            </div>
+          </Form.Item>
+
+          {phoneBindingPoolEmpty ? (
+            <Alert
+              type="error"
+              showIcon
+              style={{ marginBottom: 12 }}
+              message={phoneBindingPrefixSampleEnabled
+                ? phoneBindingPrefixSampleFilter === 'available'
+                  ? '手机号池没有可测试的可用号段，请先启用/导入不含 OpenAI 拒绝记录的号码。'
+                  : phoneBindingPrefixSampleFilter === 'rejected'
+                  ? '手机号池没有可复测的 OpenAI 拒绝号段，请先确认存在被 OpenAI 明确拒绝的号码。'
+                  : '手机号池没有可用于号段抽样的号码，请先启用/导入带 API 且未绑满的号码。'
+                : '手机号池没有可用绑定容量，请先导入/重置号码，或展开临时粘贴号码。'}
+            />
+          ) : phoneBindingPoolShortage ? (
+            <Alert
+              type="warning"
+              showIcon
+              style={{ marginBottom: 12 }}
+              message={`手机号池容量不足：当前范围 ${phoneBindingTargetCount} 个账号，剩余绑定容量 ${phoneBindingSummaryRemaining}`}
+            />
+          ) : null}
+
+          <div
+            style={{
+              border: `1px solid ${token.colorBorderSecondary}`,
+              borderRadius: token.borderRadiusLG,
+              padding: 12,
+              marginBottom: 12,
+              background: token.colorFillAlter,
+            }}
           >
-            <Input.TextArea
-              autoSize={{ minRows: 8, maxRows: 14 }}
-              placeholder="+13434832954----https://api.sms8.net/api/record?token=..."
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
+              <div>
+                <Text strong>临时粘贴号码</Text>
+                <Text type="secondary" style={{ display: 'block', fontSize: 12 }}>
+                  {phoneBindingPrefixSampleEnabled
+                    ? phoneBindingPrefixSampleFilter === 'available'
+                      ? '测试可用号段模式只测试健康可用号段。'
+                      : phoneBindingPrefixSampleFilter === 'rejected'
+                      ? '仅不可用号段模式只复测 OpenAI 拒绝过的手机号池号码。'
+                      : '号段抽样模式只使用手机号池。'
+                    : '每行：+手机号----收码API，会自动导入手机号池并回写绑定结果。'}
+                </Text>
+              </div>
+              <Button
+                size="small"
+                type={phoneBindingShowManualInput ? 'default' : 'dashed'}
+                icon={<UploadOutlined />}
+                disabled={phoneBindingPrefixSampleEnabled}
+                onClick={() => setPhoneBindingManualOpen((open) => !open)}
+              >
+                {phoneBindingShowManualInput ? '收起' : '展开'}
+              </Button>
+            </div>
+            {phoneBindingShowManualInput ? (
+              <Form.Item
+                name="phone_lines"
+                style={{ marginTop: 12, marginBottom: 0 }}
+                extra="填写后会优先使用这里的号码并忽略号池。"
+              >
+                <Input.TextArea
+                  autoSize={{ minRows: 4, maxRows: 10 }}
+                  placeholder="+13434832954----https://api.sms8.net/api/record?token=..."
+                  style={{ fontFamily: 'monospace' }}
+                />
+              </Form.Item>
+            ) : null}
+          </div>
+
+          <div
+            style={{
+              border: `1px solid ${token.colorBorderSecondary}`,
+              borderRadius: token.borderRadiusLG,
+              padding: 12,
+              background: token.colorBgContainer,
+            }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
+              <div>
+                <Text strong>参数设置</Text>
+                <Text type="secondary" style={{ display: 'block', fontSize: 12 }}>
+                  修改后自动保存，下次打开继续沿用。
+                </Text>
+              </div>
+              <Button
+                size="small"
+                icon={<SettingOutlined />}
+                onClick={() => setPhoneBindingAdvancedOpen((open) => !open)}
+              >
+                {phoneBindingAdvancedOpen ? '收起' : '展开'}
+              </Button>
+            </div>
+            <div
+              style={{
+                display: phoneBindingAdvancedOpen ? 'grid' : 'none',
+                gridTemplateColumns: isMobile ? '1fr' : 'repeat(3, 1fr)',
+                gap: 12,
+                marginTop: 12,
+              }}
+            >
+              <Form.Item name="timeout_seconds" label="等待验证码">
+                <InputNumber min={10} max={900} step={5} addonAfter="秒" style={{ width: '100%' }} />
+              </Form.Item>
+              <Form.Item name="poll_interval_seconds" label="轮询间隔">
+                <InputNumber min={1} max={60} step={1} addonAfter="秒" style={{ width: '100%' }} />
+              </Form.Item>
+              <Form.Item name="account_interval_seconds" label="账号/号码间隔">
+                <InputNumber min={1} max={3600} step={5} addonAfter="秒" style={{ width: '100%' }} />
+              </Form.Item>
+              <Form.Item
+                name="proxy_mode"
+                label="OpenAI 出口"
+                extra="控制 OAuth、add-phone、OTP 提交使用哪个出口。"
+              >
+                <Select
+                  options={[
+                    { value: 'pool', label: '代理池' },
+                    { value: 'specified', label: '指定代理' },
+                    { value: 'direct', label: '直连' },
+                  ]}
+                />
+              </Form.Item>
+              {phoneBindingProxyMode === 'specified' ? (
+                <Form.Item
+                  name="proxy"
+                  label="指定代理"
+                  rules={[{ required: true, message: '请填写代理地址' }]}
+                  extra="容器内建议使用 http://host.docker.internal:110xx。"
+                >
+                  <Input placeholder="http://host.docker.internal:11021" />
+                </Form.Item>
+              ) : (
+                <Form.Item
+                  name="proxy_country_code"
+                  label="代理国家"
+                  extra="可留空；例如 US、JP。"
+                >
+                  <Input placeholder="不限" maxLength={2} />
+                </Form.Item>
+              )}
+              <Form.Item name="proxy_max_candidates" label="代理候选数">
+                <InputNumber min={1} max={20} step={1} style={{ width: '100%' }} />
+              </Form.Item>
+              <Form.Item name="proxy_min_score" label="最低评分">
+                <InputNumber min={0} max={100} step={5} style={{ width: '100%' }} />
+              </Form.Item>
+              <Form.Item
+                name="proxy_failover"
+                label="代理失败切换"
+                valuePropName="checked"
+                extra="仅在手机号还没被 OpenAI 触碰时切换，避免重复消耗号码。"
+              >
+                <Switch checkedChildren="开启" unCheckedChildren="关闭" disabled={phoneBindingProxyMode === 'direct'} />
+              </Form.Item>
+              <Form.Item name="max_resend_attempts" label="同号重发次数">
+                <InputNumber min={0} max={10} step={1} style={{ width: '100%' }} />
+              </Form.Item>
+              <Form.Item name="resend_interval_seconds" label="重发间隔">
+                <InputNumber min={0} max={3600} step={5} addonAfter="秒" style={{ width: '100%' }} />
+              </Form.Item>
+              <Form.Item
+                name="reuse_phone_until_unusable"
+                label="尽量用满同一个手机号"
+                valuePropName="checked"
+                extra={phoneBindingPrefixSampleEnabled
+                  ? '号段抽样模式下固定关闭，每个抽中的号码只测试一次。'
+                  : '开启后，同一个号码会连续绑定多个账号，直到达到上限、限流、无法发码或接口异常。'}
+              >
+                <Switch checkedChildren="开启" unCheckedChildren="关闭" disabled={phoneBindingPrefixSampleEnabled} />
+              </Form.Item>
+            </div>
+          </div>
+        </Form>
+      </Modal>
+
+      <Modal
+        title="PayPal绑定"
+        open={paypalBindingOpen}
+        onCancel={() => setPaypalBindingOpen(false)}
+        onOk={submitPaypalBinding}
+        confirmLoading={paypalBindingLoading}
+        okText="提交外部验证"
+        cancelText="取消"
+        width={820}
+        maskClosable={false}
+      >
+        <Form
+          form={paypalBindingForm}
+          layout="vertical"
+          onValuesChange={(_, allValues) => savePaypalBindingSettings(allValues)}
+        >
+          <Alert
+            type="info"
+            showIcon
+            style={{ marginBottom: 12 }}
+            message={
+              paypalBindingScope === 'selected'
+                ? `范围：当前选中 ${selectedRowKeys.length} 个账号，可提交 ${getPaypalBindingSelectedIds().length} 个`
+                : `范围：当前筛选可提交 ${paypalFilteredEligibleCountLabel} 个账号`
+            }
+            description="PayPal绑定只会提交账号有效且订阅状态明确为 Free 的账号；已订阅、失效、订阅未知的账号不会提交给外部 plus.iceaix.com。外部返回 otp_needed 时，本地任务面板会等待你输入 PayPal 短信 OTP。"
+          />
+
+          <Form.Item name="scope" label="账号范围" initialValue={paypalBindingScope}>
+            <Select
+              value={paypalBindingScope}
+              onChange={(value) => setPaypalBindingScope(value)}
+              options={[
+                {
+                  value: 'selected',
+                  label: `当前选中账号（${selectedRowKeys.length}，可提交 ${getPaypalBindingSelectedIds().length}）`,
+                  disabled: selectedRowKeys.length === 0,
+                },
+                { value: 'filtered', label: `当前筛选账号（可提交 ${paypalFilteredEligibleCountLabel}）` },
+              ]}
             />
           </Form.Item>
-          <div style={{ display: 'grid', gridTemplateColumns: isMobile ? '1fr' : 'repeat(3, 1fr)', gap: 12 }}>
-            <Form.Item name="timeout_seconds" label="等待验证码" initialValue={180}>
-              <InputNumber min={10} max={900} step={5} addonAfter="秒" style={{ width: '100%' }} />
+
+          <div
+            style={{
+              display: 'grid',
+              gridTemplateColumns: isMobile ? '1fr' : '1fr 1fr',
+              columnGap: 12,
+            }}
+          >
+            <Form.Item
+              name="base_url"
+              label="外部接口"
+              rules={[{ required: true, message: '请填写外部接口地址' }]}
+            >
+              <Input placeholder="https://plus.iceaix.com" />
             </Form.Item>
-            <Form.Item name="poll_interval_seconds" label="轮询间隔" initialValue={5}>
-              <InputNumber min={1} max={60} step={1} addonAfter="秒" style={{ width: '100%' }} />
-            </Form.Item>
-            <Form.Item name="account_interval_seconds" label="账号/号码间隔" initialValue={60}>
-              <InputNumber min={1} max={3600} step={5} addonAfter="秒" style={{ width: '100%' }} />
+            <Form.Item
+              name="phone"
+              label="PayPal 手机号"
+              extra="支持 +81 / 080 / 空格分隔格式，后端会按外部脚本规则归一成 808xxxxxxx。"
+              rules={[{ required: true, message: '请填写 PayPal 手机号' }]}
+            >
+              <Input placeholder="+81 8083291906" />
             </Form.Item>
           </div>
+
           <Form.Item
-            name="reuse_phone_until_unusable"
-            label="同号连续绑定"
-            valuePropName="checked"
-            initialValue={false}
-            extra="开启后，同一个上传手机号会连续绑定多个账号，直到 OpenAI 或收码接口判定该号码不可继续使用。"
+            name="proxy"
+            label="绑定代理"
+            extra="外部服务检测出口和执行 PayPal 绑定使用。任务元数据只保存脱敏代理。"
+            rules={[{ required: true, message: '请填写代理' }]}
           >
-            <Switch checkedChildren="开启" unCheckedChildren="关闭" />
+            <Input placeholder="http://user:pass@host:port" />
           </Form.Item>
+          <Form.Item
+            name="proxy_jp"
+            label="日本代理（可选）"
+            extra="对应脚本里的 proxy_jp；没有就留空。"
+          >
+            <Input placeholder="http://user:pass@jp-host:port" />
+          </Form.Item>
+
+          <div
+            style={{
+              display: 'grid',
+              gridTemplateColumns: isMobile ? '1fr' : '1fr 1fr',
+              columnGap: 12,
+            }}
+          >
+            <Form.Item
+              name="paypal_email"
+              label="PayPal 邮箱（可选）"
+              extra="留空时由外部服务决定或生成。"
+            >
+              <Input placeholder="可留空" />
+            </Form.Item>
+            <Form.Item
+              name="sms_api"
+              label="收码 API（可选）"
+              extra="填写后由本地轮询并解析短信；留空时任务会等待你在面板里手动输入 OTP。"
+            >
+              <Input placeholder="可留空" />
+            </Form.Item>
+            <Form.Item
+              name="sms_api_test_mode"
+              label="接码 API 测试模式"
+              valuePropName="checked"
+              extra="开启后仍会本地轮询并解析验证码，但不会自动提交；你需要在任务面板手动输入。"
+            >
+              <Switch checkedChildren="测试" unCheckedChildren="自动提交" />
+            </Form.Item>
+          </div>
+
+          <div
+            style={{
+              border: `1px solid ${token.colorBorderSecondary}`,
+              borderRadius: token.borderRadiusLG,
+              padding: 12,
+              background: token.colorBgContainer,
+            }}
+          >
+            <Text strong>任务参数</Text>
+            <Text type="secondary" style={{ display: 'block', fontSize: 12, marginBottom: 12 }}>
+              这些参数会自动保存到浏览器本地，下次打开继续沿用。
+            </Text>
+            <div
+              style={{
+                display: 'grid',
+                gridTemplateColumns: isMobile ? '1fr' : 'repeat(3, 1fr)',
+                gap: 12,
+              }}
+            >
+              <Form.Item name="otp_timeout" label="OTP等待">
+                <InputNumber min={30} max={1800} step={10} addonAfter="秒" style={{ width: '100%' }} />
+              </Form.Item>
+              <Form.Item name="pplink_retry" label="pplink重试">
+                <InputNumber min={1} max={10} step={1} style={{ width: '100%' }} />
+              </Form.Item>
+              <Form.Item name="account_interval_seconds" label="账号间隔">
+                <InputNumber min={0} max={3600} step={5} addonAfter="秒" style={{ width: '100%' }} />
+              </Form.Item>
+              <Form.Item name="timeout" label="请求超时">
+                <InputNumber min={5} max={180} step={5} addonAfter="秒" style={{ width: '100%' }} />
+              </Form.Item>
+              <Form.Item name="event_timeout" label="事件流空闲超时">
+                <InputNumber min={10} max={300} step={5} addonAfter="秒" style={{ width: '100%' }} />
+              </Form.Item>
+              <Form.Item
+                name="failure_continue"
+                label="失败后继续"
+                valuePropName="checked"
+                extra="关闭后，任一账号失败就停止后续提交。"
+              >
+                <Switch checkedChildren="继续" unCheckedChildren="停止" />
+              </Form.Item>
+            </div>
+          </div>
+        </Form>
+      </Modal>
+
+      <Modal
+        title="pix卡密提交"
+        open={baxiCdkSubmitOpen}
+        onCancel={() => setBaxiCdkSubmitOpen(false)}
+        onOk={submitBaxiCdkSubmit}
+        confirmLoading={baxiCdkSubmitLoading}
+        okText="开始提交"
+        cancelText="取消"
+        width={820}
+        maskClosable={false}
+      >
+        <Form
+          form={baxiCdkSubmitForm}
+          layout="vertical"
+          onValuesChange={(_, allValues) => saveBaxiGptCdkSettings(allValues)}
+        >
+          <Alert
+            type="info"
+            showIcon
+            style={{ marginBottom: 12 }}
+            message={
+              baxiCdkSubmitScope === 'selected'
+                ? `范围：当前选中 ${selectedRowKeys.length} 个账号`
+                : `范围：当前筛选结果 ${total} 个账号`
+            }
+            description="提交成功指上游 /api/submit 返回 ok 和 order_id；不会阻塞等待 paid，默认会把订单加入后台轮询，查到状态后同步卡密池和绑定账号。"
+          />
+          <Form.Item name="scope" label="账号范围" initialValue={baxiCdkSubmitScope}>
+            <Select
+              value={baxiCdkSubmitScope}
+              onChange={(value) => setBaxiCdkSubmitScope(value)}
+              options={[
+                { value: 'selected', label: `当前选中账号（${selectedRowKeys.length}）`, disabled: selectedRowKeys.length === 0 },
+                { value: 'filtered', label: `当前筛选账号（${total}）` },
+              ]}
+            />
+          </Form.Item>
+
+          <Form.Item label="卡密来源">
+            <div
+              style={{
+                display: 'flex',
+                gap: 10,
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                flexWrap: 'wrap',
+              }}
+            >
+              <Space wrap>
+                <Form.Item name="use_pool" valuePropName="checked" noStyle>
+                  <Switch
+                    checkedChildren="卡密池"
+                    unCheckedChildren="仅粘贴"
+                    disabled={Boolean(baxiCdkManualText)}
+                    onChange={(checked) => {
+                      if (!checked) setBaxiCdkManualOpen(true)
+                    }}
+                  />
+                </Form.Item>
+                <Button
+                  size="small"
+                  icon={baxiCdkPoolSummaryLoading ? <SyncOutlined spin /> : <SyncOutlined />}
+                  onClick={() => {
+                    void loadBaxiCdkPoolSummary(false)
+                  }}
+                >
+                  刷新库存
+                </Button>
+              </Space>
+              <Space wrap size={[4, 6]}>
+                <Tag color="blue">可用 {baxiCdkAvailable}</Tag>
+                <Tag color={baxiCdkSubmitted > 0 ? 'processing' : 'default'}>已提交 {baxiCdkSubmitted}</Tag>
+                <Tag color="success">已成功 {baxiCdkPaid}</Tag>
+                <Tag color={baxiCdkFailed > 0 ? 'error' : 'default'}>失败 {baxiCdkFailed}</Tag>
+                <Tag>停用 {baxiCdkDisabled}</Tag>
+              </Space>
+            </div>
+            <Text type="secondary" style={{ display: 'block', marginTop: 6 }}>
+              粘贴卡密会先全部导入库存，再按账号顺序提交并用 code-info 校验配额；无配额/不存在会进入任务日志提示，卡密多出来会留在库存。
+            </Text>
+          </Form.Item>
+
+          {baxiCdkPoolEmpty ? (
+            <Alert
+              type="error"
+              showIcon
+              style={{ marginBottom: 12 }}
+              message="卡密池没有可用卡密，请先粘贴导入卡密。"
+            />
+          ) : baxiCdkPoolShortage ? (
+            <Alert
+              type="warning"
+              showIcon
+              style={{ marginBottom: 12 }}
+              message={`卡密池库存不足：当前范围 ${baxiCdkTargetCount} 个账号，可用卡密 ${baxiCdkAvailable} 个，本轮会优先把卡密全部提交。`}
+            />
+          ) : baxiCdkManualOverflow ? (
+            <Alert
+              type="info"
+              showIcon
+              style={{ marginBottom: 12 }}
+              message={`粘贴卡密多于账号：${baxiCdkManualCount} 个卡密 / ${baxiCdkTargetCount} 个账号，多余卡密会留在库存。`}
+            />
+          ) : null}
+
+          <div
+            style={{
+              border: `1px solid ${token.colorBorderSecondary}`,
+              borderRadius: token.borderRadiusLG,
+              padding: 12,
+              marginBottom: 12,
+              background: token.colorFillAlter,
+            }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
+              <div>
+                <Text strong>粘贴卡密入池</Text>
+                <Text type="secondary" style={{ display: 'block', fontSize: 12 }}>
+                  一行一个卡密。支持“卡密----备注”，备注只用于库存显示。
+                </Text>
+              </div>
+              <Button
+                size="small"
+                type={baxiCdkShowManualInput ? 'default' : 'dashed'}
+                icon={<UploadOutlined />}
+                onClick={() => setBaxiCdkManualOpen((open) => !open)}
+              >
+                {baxiCdkShowManualInput ? '收起' : '展开'}
+              </Button>
+            </div>
+            {baxiCdkShowManualInput ? (
+              <Form.Item
+                name="code_lines"
+                style={{ marginTop: 12, marginBottom: 0 }}
+                extra="本次按粘贴顺序配对账号；无配额、已用完或不存在的卡密会在日志里失败提示，多余卡密保留在池子里。"
+              >
+                <Input.TextArea
+                  autoSize={{ minRows: 4, maxRows: 10 }}
+                  placeholder="CDK-AAAA-BBBB\nCDK-CCCC-DDDD----备注"
+                  style={{ fontFamily: 'monospace' }}
+                />
+              </Form.Item>
+            ) : null}
+          </div>
+
+          <div
+            style={{
+              border: `1px solid ${token.colorBorderSecondary}`,
+              borderRadius: token.borderRadiusLG,
+              padding: 12,
+              background: token.colorBgContainer,
+            }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
+              <div>
+                <Text strong>提交参数</Text>
+                <Text type="secondary" style={{ display: 'block', fontSize: 12 }}>
+                  修改后自动保存，下次打开继续沿用。
+                </Text>
+              </div>
+              <Button
+                size="small"
+                icon={<SettingOutlined />}
+                onClick={() => setBaxiCdkAdvancedOpen((open) => !open)}
+              >
+                {baxiCdkAdvancedOpen ? '收起' : '展开'}
+              </Button>
+            </div>
+            <div
+              style={{
+                display: baxiCdkAdvancedOpen ? 'grid' : 'none',
+                gridTemplateColumns: isMobile ? '1fr' : 'repeat(3, 1fr)',
+                gap: 12,
+                marginTop: 12,
+              }}
+            >
+              <Form.Item
+                name="submit_interval_seconds"
+                label="提交间隔"
+                extra="只在上一个账号 /api/submit 成功后等待；预查失败、无配额或提交失败不会等待。"
+              >
+                <InputNumber min={0} max={3600} step={1} addonAfter="秒" style={{ width: '100%' }} />
+              </Form.Item>
+              <Form.Item
+                name="auto_poll_status"
+                label="自动轮询状态"
+                valuePropName="checked"
+                extra="不阻塞下一个账号提交；后台按 order_id 查询到 paid/failed 后同步卡密池和账号。"
+              >
+                <Switch checkedChildren="开启" unCheckedChildren="关闭" />
+              </Form.Item>
+              <Form.Item name="status_poll_interval_seconds" label="轮询间隔">
+                <InputNumber min={1} max={3600} step={1} addonAfter="秒" style={{ width: '100%' }} />
+              </Form.Item>
+              <Form.Item name="status_poll_timeout_seconds" label="轮询超时">
+                <InputNumber min={5} max={86400} step={5} addonAfter="秒" style={{ width: '100%' }} />
+              </Form.Item>
+              <Form.Item name="precheck" label="提交前预查" valuePropName="checked">
+                <Switch checkedChildren="开启" unCheckedChildren="关闭" />
+              </Form.Item>
+              <Form.Item
+                name="failure_continue"
+                label="失败后继续"
+                valuePropName="checked"
+                extra="开启后，单个卡密或账号失败不会阻断后续配对。"
+              >
+                <Switch checkedChildren="继续" unCheckedChildren="停止" />
+              </Form.Item>
+            </div>
+          </div>
         </Form>
       </Modal>
 
@@ -4435,11 +6650,40 @@ export default function Accounts() {
         onImportAccountToTeam={handleImportAccountToTeam}
         formatSyncTime={formatSyncTime}
         getRefreshToken={getRefreshToken}
+        getAccessToken={getAccessToken}
+        onCopyAccessToken={copyAccessToken}
+        isAccessTokenCopied={(record) => {
+          const accountId = Number(record?.id || 0)
+          return accountId > 0 && accessTokenCopiedAccountIds.has(accountId)
+        }}
         canImportAccountToTeam={canImportAccountToTeam}
         authStateMeta={authStateMeta}
         planMeta={planMeta}
         codexStateMeta={codexStateMeta}
       />
+      
+      <Modal
+        title={oaipayUploadScope === 'selected' ? `确认上传所选 ${selectedRowKeys.length} 个账号到 OAIPay` : `确认上传待补传账号到 OAIPay`}
+        open={oaipayUploadModalOpen}
+        onOk={() => {
+          setOaipayUploadModalOpen(false)
+          void handleBackfill('oaipay', oaipayUploadScope, oaipaySelectedCategory)
+        }}
+        onCancel={() => setOaipayUploadModalOpen(false)}
+        okText="确定上传"
+      >
+        <div style={{ marginBottom: 16 }}>请选择要上传到的 OAIPay 分组（可选，留空使用全局默认分组）：</div>
+        <Select
+          style={{ width: '100%' }}
+          allowClear
+          placeholder="选择分组"
+          loading={oaipayCategoryLoading}
+          value={oaipaySelectedCategory}
+          onChange={(val) => setOaipaySelectedCategory(val)}
+          options={oaipayCategories.map(c => ({ label: `${c.id} - ${c.name}`, value: c.id }))}
+        />
+      </Modal>
+
     </div>
   )
 }

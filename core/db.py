@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 from math import ceil
 import os
 from typing import Any, Optional
-from sqlalchemy import text
+from sqlalchemy import event, text, UniqueConstraint
 from sqlmodel import Field, SQLModel, create_engine, Session, select
 import json
 
@@ -14,7 +14,28 @@ def _utcnow():
     return datetime.now(timezone.utc)
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///account_manager.db")
-engine = create_engine(DATABASE_URL)
+_IS_SQLITE = DATABASE_URL.startswith("sqlite")
+
+_engine_kwargs = {}
+if _IS_SQLITE:
+    _engine_kwargs["connect_args"] = {
+        "timeout": 30,
+        "check_same_thread": False,
+    }
+
+engine = create_engine(DATABASE_URL, **_engine_kwargs)
+
+
+if _IS_SQLITE:
+    @event.listens_for(engine, "connect")
+    def _set_sqlite_pragmas(dbapi_connection, connection_record):
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+            cursor.execute("PRAGMA busy_timeout=30000")
+        finally:
+            cursor.close()
 
 
 class AccountModel(SQLModel, table=True):
@@ -41,6 +62,32 @@ class AccountModel(SQLModel, table=True):
         self.extra_json = json.dumps(d, ensure_ascii=False)
 
 
+class AccountListStateModel(SQLModel, table=True):
+    """List-time derived state cache for account filters/sorts.
+
+    Keep this table free of secrets.  It is a denormalized SQL filter surface
+    derived from ``accounts.extra_json`` and non-secret account columns.
+    """
+
+    __tablename__ = "account_list_state"
+
+    account_id: int = Field(primary_key=True, foreign_key="accounts.id")
+    platform: str = Field(default="", index=True)
+    manually_used: bool = Field(default=False, index=True)
+    auth_type: str = Field(default="unknown", index=True)
+    auth_level: str = Field(default="", index=True)
+    subscription_type: str = Field(default="unknown", index=True)
+    account_validity: str = Field(default="valid", index=True)
+    sub2api_state: str = Field(default="unknown", index=True)
+    oaipay_state: str = Field(default="unknown", index=True)
+    revival_state: str = Field(default="none", index=True)
+    revival_kind: str = Field(default="none", index=True)
+    subscription_active_until: str = ""
+    subscription_active_until_ts: Optional[float] = Field(default=None, index=True)
+    source_updated_at: str = ""
+    refreshed_at: str = ""
+
+
 class ExternalSubscriptionClaimModel(SQLModel, table=True):
     __tablename__ = "external_subscription_claims"
 
@@ -63,6 +110,46 @@ class ExternalSubscriptionClaimModel(SQLModel, table=True):
     paid_at: str = ""
     failed_at: str = ""
     released_at: str = ""
+    provider: str = ""
+    external_payment_id: str = ""
+    message: str = ""
+    error_code: str = ""
+    last_error: str = ""
+    details_json: str = "{}"
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
+
+    def get_details(self) -> dict:
+        try:
+            return json.loads(self.details_json or "{}")
+        except Exception:
+            return {}
+
+    def set_details(self, d: dict):
+        self.details_json = json.dumps(d if isinstance(d, dict) else {}, ensure_ascii=False)
+
+
+class ExternalAccessTokenClaimModel(SQLModel, table=True):
+    __tablename__ = "external_access_token_claims"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    claim_id: str = Field(index=True, sa_column_kwargs={"unique": True})
+    account_id: int = Field(index=True)
+    email: str = Field(default="", index=True)
+    consumer: str = ""
+    status: str = Field(default="prechecking", index=True)
+    token_source: str = ""
+    token_fingerprint: str = ""
+    auth_state: str = ""
+    subscription_plan: str = ""
+    subscription_checked_at: str = ""
+    lease_expires_at: str = ""
+    claimed_at: str = ""
+    prechecked_at: str = ""
+    paid_at: str = ""
+    failed_at: str = ""
+    released_at: str = ""
+    result_written_at: str = ""
     provider: str = ""
     external_payment_id: str = ""
     message: str = ""
@@ -115,6 +202,10 @@ class ProxyModel(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     url: str = Field(unique=True)
     region: str = ""
+    proxy_group: str = ""
+    desired_country_code: str = ""
+    provider: str = ""
+    note: str = ""
     success_count: int = 0
     fail_count: int = 0
     homepage_success_count: int = 0
@@ -126,6 +217,33 @@ class ProxyModel(SQLModel, table=True):
     last_checked: Optional[datetime] = None
     homepage_last_checked: Optional[datetime] = None
     homepage_circuit_open_until: Optional[datetime] = None
+    scheme: str = ""
+    host: str = ""
+    port: int = 0
+    exit_ip: str = ""
+    exit_country_code: str = ""
+    exit_country_name: str = ""
+    exit_region_name: str = ""
+    exit_city: str = ""
+    exit_asn: str = ""
+    exit_isp: str = ""
+    geo_source: str = ""
+    geo_checked_at: Optional[datetime] = None
+    scan_status: str = "unchecked"
+    last_scan_at: Optional[datetime] = None
+    last_scan_duration_ms: int = 0
+    last_latency_ms: int = 0
+    last_error_code: str = ""
+    last_error: str = ""
+    chatgpt_status: str = "unchecked"
+    chatgpt_status_code: int = 0
+    chatgpt_latency_ms: int = 0
+    chatgpt_last_checked_at: Optional[datetime] = None
+    chatgpt_last_error: str = ""
+    health_score: float = 0.0
+    consecutive_failures: int = 0
+    cooldown_until: Optional[datetime] = None
+    last_probe_json: str = "{}"
 
 
 class PendingBusinessInviteModel(SQLModel, table=True):
@@ -187,6 +305,30 @@ class IcloudHmeAliasModel(SQLModel, table=True):
 
 def save_account(account) -> 'AccountModel':
     """从 base_platform.Account 存入数据库（支持同邮箱多工作空间变体并存）"""
+    def _schedule_local_status_refresh(saved: 'AccountModel', *, reason: str) -> None:
+        try:
+            if str(getattr(saved, "platform", "") or "").strip().lower() != "chatgpt":
+                return
+            saved_extra = saved.get_extra()
+            has_auth = bool(
+                str(
+                    saved_extra.get("refresh_token")
+                    or saved_extra.get("refreshToken")
+                    or saved_extra.get("access_token")
+                    or saved_extra.get("accessToken")
+                    or saved_extra.get("webAccessToken")
+                    or getattr(saved, "token", "")
+                    or ""
+                ).strip()
+            )
+            if not has_auth:
+                return
+            from services.chatgpt_core.local_status_refresh import schedule_chatgpt_local_status_refresh_for_account_id
+
+            schedule_chatgpt_local_status_refresh_for_account_id(saved.id, reason=reason, delay_seconds=2.0)
+        except Exception:
+            pass
+
     with Session(engine) as session:
         extra = account.extra or {}
         variant_key = str(extra.get("chatgpt_workspace_variant_key") or "").strip()
@@ -230,6 +372,7 @@ def save_account(account) -> 'AccountModel':
             session.add(existing)
             session.commit()
             session.refresh(existing)
+            _schedule_local_status_refresh(existing, reason="save_account:update")
             return existing
         m = AccountModel(
             platform=account.platform,
@@ -245,7 +388,274 @@ def save_account(account) -> 'AccountModel':
         session.add(m)
         session.commit()
         session.refresh(m)
+        _schedule_local_status_refresh(m, reason="save_account:create")
         return m
+
+
+class PhonePoolModel(SQLModel, table=True):
+    """ChatGPT relay 自有手机号池。"""
+
+    __tablename__ = "phone_pool"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    phone_e164: str = Field(index=True, sa_column_kwargs={"unique": True})
+    api_url: str = ""
+    api_host: str = Field(default="", index=True)
+    api_expired_date: str = ""
+    api_expiry_checked_at: str = ""
+    api_expiry_status: str = ""
+    api_expiry_error: str = ""
+    label: str = ""
+    status: str = Field(default="active", index=True)
+    bound_count: int = 0
+    bound_account_emails_json: str = "[]"
+    max_accounts: int = 3
+    success_count: int = 0
+    fail_count: int = 0
+    last_error_code: str = ""
+    last_error_message: str = ""
+    cooldown_until: str = ""
+    last_used_at: str = ""
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
+
+
+class PhonePrefixStateModel(SQLModel, table=True):
+    """手机号号段状态。
+
+    这里记录的是“号段是否适合某类任务”的派生状态，不改变 phone_pool
+    中任何单个手机号自身的 status / bound_count / fail_count。
+    """
+
+    __tablename__ = "phone_prefix_state"
+    __table_args__ = (UniqueConstraint("purpose", "prefix", name="uq_phone_prefix_state_purpose_prefix"),)
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    purpose: str = Field(default="phone_signup", index=True)
+    prefix: str = Field(index=True)
+    status: str = Field(default="untested", index=True)
+    success_count: int = 0
+    failure_count: int = 0
+    last_success_phone: str = ""
+    last_failure_phone: str = ""
+    last_error_code: str = ""
+    last_error_message: str = ""
+    last_seen_at: str = ""
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
+
+
+class BaxiGptCdkPoolModel(SQLModel, table=True):
+    """BaxiGPT 卡密库存与提交状态。"""
+
+    __tablename__ = "baxigpt_cdk_pool"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    code_value: str
+    code_hash: str = Field(index=True, sa_column_kwargs={"unique": True})
+    code_masked: str = ""
+    label: str = ""
+    status: str = Field(default="available", index=True)
+    bound_account_id: int = Field(default=0, index=True)
+    bound_account_email: str = Field(default="", index=True)
+    bound_at: str = ""
+    task_id: str = Field(default="", index=True)
+    order_id: str = Field(default="", index=True)
+    display_id: str = ""
+    remote_email: str = ""
+    upstream_status: str = ""
+    code_info_remaining: int = 0
+    code_info_total: int = 0
+    submit_response_json: str = "{}"
+    last_status_response_json: str = "{}"
+    last_query_response_json: str = "{}"
+    last_error_code: str = ""
+    last_error_message: str = ""
+    submitted_at: str = ""
+    paid_at: str = ""
+    last_checked_at: str = ""
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
+
+
+
+
+class IcloudHmeRecheckQueueModel(SQLModel, table=True):
+    """iCloud HME 全量复测队列。只记录测活进度，不触发 Apple 端删除。"""
+
+    __tablename__ = "icloud_hme_recheck_queue"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    campaign_id: str = Field(index=True)
+    anonymous_id: str = Field(index=True)
+    hme: str = Field(index=True)
+    account_id: int = Field(default=0, index=True)
+    account_email: str = Field(default="", index=True)
+    source_type: str = Field(default="icloud_hme", index=True)
+    status: str = Field(default="pending", index=True)
+    result_code: str = Field(default="", index=True)
+    result_message: str = ""
+    saved_account_id: int = 0
+    access_token_saved: bool = False
+    delete_candidate: bool = Field(default=False, index=True)
+    delete_candidate_reason: str = ""
+    apple_delete_status: str = "not_requested"
+    attempt_count: int = 0
+    last_task_id: str = Field(default="", index=True)
+    last_error: str = ""
+    details_json: str = "{}"
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
+    checked_at: str = ""
+    started_at: str = ""
+
+    def get_details(self) -> dict:
+        try:
+            data = json.loads(self.details_json or "{}")
+        except Exception:
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def set_details(self, d: dict):
+        self.details_json = json.dumps(d if isinstance(d, dict) else {}, ensure_ascii=False)
+
+
+class DeliverySkuModel(SQLModel, table=True):
+    """对外交付卡密 SKU。"""
+
+    __tablename__ = "delivery_skus"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    code: str = Field(index=True, sa_column_kwargs={"unique": True})
+    name: str = ""
+    platform: str = Field(default="chatgpt", index=True)
+    code_prefix: str = ""
+    delivery_profile: str = "chatgpt_basic"
+    sort_policy: str = "earliest_expiry"
+    eligible_rule_json: str = "{}"
+    allow_refetch: bool = True
+    max_refetch_count: int = 0
+    enabled: bool = True
+    note: str = ""
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
+
+
+class DeliveryCardBatchModel(SQLModel, table=True):
+    """对外交付卡密批次。"""
+
+    __tablename__ = "delivery_card_batches"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    name: str = ""
+    sku_code: str = Field(index=True)
+    platform: str = Field(default="chatgpt", index=True)
+    code_prefix: str = ""
+    total_count: int = 0
+    strict_stock_check: bool = True
+    expires_at: str = ""
+    note: str = ""
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
+
+
+class DeliveryCardModel(SQLModel, table=True):
+    """对外 API 兑换交付卡密。"""
+
+    __tablename__ = "delivery_cards"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    batch_id: int = Field(default=0, index=True)
+    sku_code: str = Field(index=True)
+    platform: str = Field(default="chatgpt", index=True)
+    code_hash: str = Field(index=True, sa_column_kwargs={"unique": True})
+    code_mask: str = ""
+    code_prefix: str = ""
+    status: str = Field(default="unused", index=True)
+    assigned_account_id: int = Field(default=0, index=True)
+    assigned_email_snapshot: str = Field(default="", index=True)
+    assigned_at: str = ""
+    redeem_count: int = 0
+    first_redeemed_at: str = ""
+    last_redeemed_at: str = ""
+    first_redeem_ip: str = ""
+    last_redeem_ip: str = ""
+    first_consumer: str = ""
+    last_consumer: str = ""
+    delivery_payload_json: str = "{}"
+    expires_at: str = ""
+    disabled_reason: str = ""
+    last_failure_code: str = ""
+    last_failure_at: str = ""
+    note: str = ""
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
+
+
+class DeliveryCardEventModel(SQLModel, table=True):
+    """交付卡密业务事件。"""
+
+    __tablename__ = "delivery_card_events"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    card_id: int = Field(default=0, index=True)
+    batch_id: int = Field(default=0, index=True)
+    sku_code: str = Field(default="", index=True)
+    account_id: int = Field(default=0, index=True)
+    event_type: str = Field(index=True)
+    result: str = Field(index=True)
+    failure_code: str = Field(default="", index=True)
+    delivery_sequence: int = 0
+    request_id: str = Field(default="", index=True)
+    idempotency_key: str = Field(default="", index=True)
+    consumer: str = Field(default="", index=True)
+    client_ip: str = ""
+    user_agent: str = ""
+    api_token_id: str = ""
+    response_profile: str = ""
+    message: str = ""
+    detail_json: str = "{}"
+    created_at: datetime = Field(default_factory=_utcnow)
+
+
+class DeliveryRedeemApiLogModel(SQLModel, table=True):
+    """兑换 API 每次调用的独立日志。"""
+
+    __tablename__ = "delivery_redeem_api_logs"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    trace_id: str = Field(index=True)
+    request_id: str = Field(default="", index=True)
+    idempotency_key: str = Field(default="", index=True)
+    consumer: str = Field(default="", index=True)
+    api_token_id: str = Field(default="", index=True)
+    client_ip: str = ""
+    user_agent: str = ""
+    code_prefix: str = Field(default="", index=True)
+    code_mask: str = ""
+    code_hash_prefix: str = ""
+    card_id: int = Field(default=0, index=True)
+    batch_id: int = Field(default=0, index=True)
+    sku_code: str = Field(default="", index=True)
+    assigned_account_id: int = Field(default=0, index=True)
+    assigned_account_email: str = Field(default="", index=True)
+    action: str = Field(default="", index=True)
+    result: str = Field(default="", index=True)
+    error_code: str = Field(default="", index=True)
+    redeem_index: int = 0
+    first_redeem: bool = False
+    idempotent_replay: bool = False
+    duplicate_check_status: str = Field(default="", index=True)
+    duplicate_check_message: str = ""
+    duplicate_card_ids_json: str = "[]"
+    duplicate_event_ids_json: str = "[]"
+    duplicate_api_log_ids_json: str = "[]"
+    stock_before_json: str = "{}"
+    decision_json: str = "{}"
+    response_summary_json: str = "{}"
+    message: str = ""
+    duration_ms: int = 0
+    created_at: datetime = Field(default_factory=_utcnow)
 
 
 def _ensure_pending_business_invite_schema() -> None:
@@ -273,6 +683,10 @@ def _ensure_pending_business_invite_schema() -> None:
 
 def _ensure_proxy_schema() -> None:
     required_columns = {
+        "proxy_group": "TEXT NOT NULL DEFAULT ''",
+        "desired_country_code": "TEXT NOT NULL DEFAULT ''",
+        "provider": "TEXT NOT NULL DEFAULT ''",
+        "note": "TEXT NOT NULL DEFAULT ''",
         "homepage_success_count": "INTEGER NOT NULL DEFAULT 0",
         "homepage_fail_count": "INTEGER NOT NULL DEFAULT 0",
         "homepage_consecutive_failures": "INTEGER NOT NULL DEFAULT 0",
@@ -280,6 +694,33 @@ def _ensure_proxy_schema() -> None:
         "homepage_last_status_code": "INTEGER NOT NULL DEFAULT 0",
         "homepage_last_checked": "TIMESTAMP NULL",
         "homepage_circuit_open_until": "TIMESTAMP NULL",
+        "scheme": "TEXT NOT NULL DEFAULT ''",
+        "host": "TEXT NOT NULL DEFAULT ''",
+        "port": "INTEGER NOT NULL DEFAULT 0",
+        "exit_ip": "TEXT NOT NULL DEFAULT ''",
+        "exit_country_code": "TEXT NOT NULL DEFAULT ''",
+        "exit_country_name": "TEXT NOT NULL DEFAULT ''",
+        "exit_region_name": "TEXT NOT NULL DEFAULT ''",
+        "exit_city": "TEXT NOT NULL DEFAULT ''",
+        "exit_asn": "TEXT NOT NULL DEFAULT ''",
+        "exit_isp": "TEXT NOT NULL DEFAULT ''",
+        "geo_source": "TEXT NOT NULL DEFAULT ''",
+        "geo_checked_at": "TIMESTAMP NULL",
+        "scan_status": "TEXT NOT NULL DEFAULT 'unchecked'",
+        "last_scan_at": "TIMESTAMP NULL",
+        "last_scan_duration_ms": "INTEGER NOT NULL DEFAULT 0",
+        "last_latency_ms": "INTEGER NOT NULL DEFAULT 0",
+        "last_error_code": "TEXT NOT NULL DEFAULT ''",
+        "last_error": "TEXT NOT NULL DEFAULT ''",
+        "chatgpt_status": "TEXT NOT NULL DEFAULT 'unchecked'",
+        "chatgpt_status_code": "INTEGER NOT NULL DEFAULT 0",
+        "chatgpt_latency_ms": "INTEGER NOT NULL DEFAULT 0",
+        "chatgpt_last_checked_at": "TIMESTAMP NULL",
+        "chatgpt_last_error": "TEXT NOT NULL DEFAULT ''",
+        "health_score": "REAL NOT NULL DEFAULT 0",
+        "consecutive_failures": "INTEGER NOT NULL DEFAULT 0",
+        "cooldown_until": "TIMESTAMP NULL",
+        "last_probe_json": "TEXT NOT NULL DEFAULT '{}'",
     }
 
     with engine.begin() as conn:
@@ -380,6 +821,73 @@ def _ensure_external_subscription_claim_schema() -> None:
         )
 
 
+def _ensure_external_access_token_claim_schema() -> None:
+    required_columns = {
+        "claim_id": "TEXT NOT NULL DEFAULT ''",
+        "account_id": "INTEGER NOT NULL DEFAULT 0",
+        "email": "TEXT NOT NULL DEFAULT ''",
+        "consumer": "TEXT NOT NULL DEFAULT ''",
+        "status": "TEXT NOT NULL DEFAULT 'prechecking'",
+        "token_source": "TEXT NOT NULL DEFAULT ''",
+        "token_fingerprint": "TEXT NOT NULL DEFAULT ''",
+        "auth_state": "TEXT NOT NULL DEFAULT ''",
+        "subscription_plan": "TEXT NOT NULL DEFAULT ''",
+        "subscription_checked_at": "TEXT NOT NULL DEFAULT ''",
+        "lease_expires_at": "TEXT NOT NULL DEFAULT ''",
+        "claimed_at": "TEXT NOT NULL DEFAULT ''",
+        "prechecked_at": "TEXT NOT NULL DEFAULT ''",
+        "paid_at": "TEXT NOT NULL DEFAULT ''",
+        "failed_at": "TEXT NOT NULL DEFAULT ''",
+        "released_at": "TEXT NOT NULL DEFAULT ''",
+        "result_written_at": "TEXT NOT NULL DEFAULT ''",
+        "provider": "TEXT NOT NULL DEFAULT ''",
+        "external_payment_id": "TEXT NOT NULL DEFAULT ''",
+        "message": "TEXT NOT NULL DEFAULT ''",
+        "error_code": "TEXT NOT NULL DEFAULT ''",
+        "last_error": "TEXT NOT NULL DEFAULT ''",
+        "details_json": "TEXT NOT NULL DEFAULT '{}'",
+        "created_at": "TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP",
+        "updated_at": "TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP",
+    }
+
+    with engine.begin() as conn:
+        existing_columns = {
+            str(row[1])
+            for row in conn.exec_driver_sql("PRAGMA table_info(external_access_token_claims)").fetchall()
+        }
+        if not existing_columns:
+            return
+        for column_name, ddl in required_columns.items():
+            if column_name in existing_columns:
+                continue
+            conn.exec_driver_sql(
+                f"ALTER TABLE external_access_token_claims ADD COLUMN {column_name} {ddl}"
+            )
+        conn.exec_driver_sql(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_external_access_token_claims_claim_id "
+            "ON external_access_token_claims(claim_id)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_external_access_token_claims_account_id "
+            "ON external_access_token_claims(account_id)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_external_access_token_claims_email "
+            "ON external_access_token_claims(email)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_external_access_token_claims_status "
+            "ON external_access_token_claims(status)"
+        )
+        conn.exec_driver_sql(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_external_access_token_claims_active_account
+            ON external_access_token_claims(account_id)
+            WHERE status IN ('prechecking', 'claimed', 'processing')
+            """
+        )
+
+
 def _ensure_icloud_hme_alias_schema() -> None:
     with engine.begin() as conn:
         conn.exec_driver_sql(
@@ -441,6 +949,89 @@ def _ensure_icloud_hme_alias_schema() -> None:
         )
 
 
+def _ensure_icloud_hme_recheck_queue_schema() -> None:
+    with engine.begin() as conn:
+        conn.exec_driver_sql(
+            """
+            CREATE TABLE IF NOT EXISTS icloud_hme_recheck_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                campaign_id TEXT NOT NULL,
+                anonymous_id TEXT NOT NULL,
+                hme TEXT NOT NULL,
+                account_id INTEGER NOT NULL DEFAULT 0,
+                account_email TEXT NOT NULL DEFAULT '',
+                source_type TEXT NOT NULL DEFAULT 'icloud_hme',
+                status TEXT NOT NULL DEFAULT 'pending',
+                result_code TEXT NOT NULL DEFAULT '',
+                result_message TEXT NOT NULL DEFAULT '',
+                saved_account_id INTEGER NOT NULL DEFAULT 0,
+                access_token_saved INTEGER NOT NULL DEFAULT 0,
+                delete_candidate INTEGER NOT NULL DEFAULT 0,
+                delete_candidate_reason TEXT NOT NULL DEFAULT '',
+                apple_delete_status TEXT NOT NULL DEFAULT 'not_requested',
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                last_task_id TEXT NOT NULL DEFAULT '',
+                last_error TEXT NOT NULL DEFAULT '',
+                details_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                checked_at TEXT NOT NULL DEFAULT '',
+                started_at TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
+        required_columns = {
+            "campaign_id": "TEXT NOT NULL DEFAULT ''",
+            "anonymous_id": "TEXT NOT NULL DEFAULT ''",
+            "hme": "TEXT NOT NULL DEFAULT ''",
+            "account_id": "INTEGER NOT NULL DEFAULT 0",
+            "account_email": "TEXT NOT NULL DEFAULT ''",
+            "source_type": "TEXT NOT NULL DEFAULT 'icloud_hme'",
+            "status": "TEXT NOT NULL DEFAULT 'pending'",
+            "result_code": "TEXT NOT NULL DEFAULT ''",
+            "result_message": "TEXT NOT NULL DEFAULT ''",
+            "saved_account_id": "INTEGER NOT NULL DEFAULT 0",
+            "access_token_saved": "INTEGER NOT NULL DEFAULT 0",
+            "delete_candidate": "INTEGER NOT NULL DEFAULT 0",
+            "delete_candidate_reason": "TEXT NOT NULL DEFAULT ''",
+            "apple_delete_status": "TEXT NOT NULL DEFAULT 'not_requested'",
+            "attempt_count": "INTEGER NOT NULL DEFAULT 0",
+            "last_task_id": "TEXT NOT NULL DEFAULT ''",
+            "last_error": "TEXT NOT NULL DEFAULT ''",
+            "details_json": "TEXT NOT NULL DEFAULT '{}'",
+            "created_at": "TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP",
+            "updated_at": "TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP",
+            "checked_at": "TEXT NOT NULL DEFAULT ''",
+            "started_at": "TEXT NOT NULL DEFAULT ''",
+        }
+        existing_columns = {
+            str(row[1])
+            for row in conn.exec_driver_sql("PRAGMA table_info(icloud_hme_recheck_queue)").fetchall()
+        }
+        for column_name, ddl in required_columns.items():
+            if column_name in existing_columns:
+                continue
+            conn.exec_driver_sql(
+                f"ALTER TABLE icloud_hme_recheck_queue ADD COLUMN {column_name} {ddl}"
+            )
+        conn.exec_driver_sql(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_icloud_hme_recheck_queue_campaign_alias "
+            "ON icloud_hme_recheck_queue(campaign_id, anonymous_id)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_icloud_hme_recheck_queue_campaign_status "
+            "ON icloud_hme_recheck_queue(campaign_id, status)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_icloud_hme_recheck_queue_hme "
+            "ON icloud_hme_recheck_queue(hme)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_icloud_hme_recheck_queue_delete_candidate "
+            "ON icloud_hme_recheck_queue(delete_candidate)"
+        )
+
+
 def _ensure_pipeline_schema() -> None:
     with engine.begin() as conn:
         existing_task_columns = {
@@ -491,11 +1082,12 @@ def _row_to_icloud_hme_alias_payload(row: Any) -> dict[str, Any]:
         status = str(row.get("status") or "")
         use_count = int(row.get("use_count") or 0)
         enabled = bool(int(row.get("enabled") or 0))
+        account_disabled = status in {"account_deactivated", "account_disabled"}
         used_by_system = bool(
             use_count > 0
             or str(row.get("task_id") or "").strip()
             or str(row.get("bound_account_email") or "").strip()
-            or status in {"in_use", "registered", "register_failed"}
+            or status in {"in_use", "registered", "register_failed", "account_deactivated", "account_disabled"}
         )
         return {
             "id": row.get("id"),
@@ -518,6 +1110,8 @@ def _row_to_icloud_hme_alias_payload(row: Any) -> dict[str, Any]:
             "last_claimed_at": str(row.get("last_claimed_at") or ""),
             "last_synced_at": str(row.get("last_synced_at") or ""),
             "used_by_system": used_by_system,
+            "account_disabled": account_disabled,
+            "account_disabled_label": "账号已禁用/死号" if account_disabled else "",
             "is_manual_created": str(row.get("created_source") or "unknown") == "manual_created",
             "last_otp_at": str(row.get("last_otp_at") or ""),
             "last_error": str(row.get("last_error") or ""),
@@ -525,11 +1119,13 @@ def _row_to_icloud_hme_alias_payload(row: Any) -> dict[str, Any]:
             "updated_at": updated_at.isoformat() if hasattr(updated_at, "isoformat") else str(updated_at or ""),
         }
     if isinstance(row, IcloudHmeAliasModel):
+        status = str(getattr(row, "status", "") or "")
+        account_disabled = status in {"account_deactivated", "account_disabled"}
         used_by_system = bool(
             int(getattr(row, "use_count", 0) or 0) > 0
             or str(getattr(row, "task_id", "") or "").strip()
             or str(getattr(row, "bound_account_email", "") or "").strip()
-            or str(getattr(row, "status", "") or "") in {"in_use", "registered", "register_failed"}
+            or status in {"in_use", "registered", "register_failed", "account_deactivated", "account_disabled"}
         )
         return {
             "id": row.id,
@@ -552,12 +1148,16 @@ def _row_to_icloud_hme_alias_payload(row: Any) -> dict[str, Any]:
             "last_claimed_at": row.last_claimed_at,
             "last_synced_at": row.last_synced_at,
             "used_by_system": used_by_system,
+            "account_disabled": account_disabled,
+            "account_disabled_label": "账号已禁用/死号" if account_disabled else "",
             "is_manual_created": row.created_source == "manual_created",
             "last_otp_at": row.last_otp_at,
             "last_error": row.last_error,
             "created_at": row.created_at.isoformat() if getattr(row, "created_at", None) else "",
             "updated_at": row.updated_at.isoformat() if getattr(row, "updated_at", None) else "",
         }
+    status = str(getattr(row, "status", "") or "")
+    account_disabled = status in {"account_deactivated", "account_disabled"}
     return {
         "id": getattr(row, "id", None),
         "anonymous_id": str(getattr(row, "anonymous_id", "") or ""),
@@ -573,11 +1173,19 @@ def _row_to_icloud_hme_alias_payload(row: Any) -> dict[str, Any]:
         "bound_account_email": str(getattr(row, "bound_account_email", "") or ""),
         "bound_account_ref": str(getattr(row, "bound_account_ref", "") or ""),
         "task_id": str(getattr(row, "task_id", "") or ""),
-        "status": str(getattr(row, "status", "") or ""),
+        "status": status,
         "use_count": int(getattr(row, "use_count", 0) or 0),
         "first_claimed_at": str(getattr(row, "first_claimed_at", "") or ""),
         "last_claimed_at": str(getattr(row, "last_claimed_at", "") or ""),
         "last_synced_at": str(getattr(row, "last_synced_at", "") or ""),
+        "used_by_system": bool(
+            int(getattr(row, "use_count", 0) or 0) > 0
+            or str(getattr(row, "task_id", "") or "").strip()
+            or str(getattr(row, "bound_account_email", "") or "").strip()
+            or status in {"in_use", "registered", "register_failed", "account_deactivated", "account_disabled"}
+        ),
+        "account_disabled": account_disabled,
+        "account_disabled_label": "账号已禁用/死号" if account_disabled else "",
         "last_otp_at": str(getattr(row, "last_otp_at", "") or ""),
         "last_error": str(getattr(row, "last_error", "") or ""),
         "created_at": getattr(row, "created_at", ""),
@@ -711,6 +1319,56 @@ def get_icloud_hme_alias_by_anonymous_id(anonymous_id: str) -> dict[str, Any] | 
         return _row_to_icloud_hme_alias_payload(row)
 
 
+def prune_icloud_hme_aliases_not_in_remote(
+    remote_anonymous_ids: set[str] | list[str],
+    *,
+    purpose: str = "chatgpt_register",
+    bound_service: str = "chatgpt",
+    forward_to: str = "",
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Delete local iCloud HME alias rows that no longer exist in Apple HME list.
+
+    This is for local alias-pool reconciliation only. It does not delete ChatGPT
+    accounts and does not call Apple's deactivate/delete endpoints.
+    """
+    remote_ids = {str(value or "").strip() for value in (remote_anonymous_ids or [])}
+    remote_ids = {value for value in remote_ids if value}
+    normalized_purpose = str(purpose or "chatgpt_register").strip() or "chatgpt_register"
+    normalized_service = str(bound_service or "chatgpt").strip() or "chatgpt"
+    normalized_forward_to = str(forward_to or "").strip()
+
+    with Session(engine) as session:
+        query = select(IcloudHmeAliasModel).where(
+            IcloudHmeAliasModel.purpose == normalized_purpose,
+            IcloudHmeAliasModel.bound_service == normalized_service,
+        )
+        if normalized_forward_to:
+            query = query.where(IcloudHmeAliasModel.forward_to == normalized_forward_to)
+        rows = session.exec(query).all()
+
+        to_delete = [
+            row
+            for row in rows
+            if str(getattr(row, "anonymous_id", "") or "").strip() not in remote_ids
+        ]
+        deleted_rows = [_row_to_icloud_hme_alias_payload(row) for row in to_delete]
+
+        if not dry_run:
+            for row in to_delete:
+                session.delete(row)
+            session.commit()
+
+    return {
+        "matched_local": len(rows),
+        "kept": len(rows) - len(to_delete),
+        "deleted": 0 if dry_run else len(to_delete),
+        "would_delete": len(to_delete),
+        "dry_run": bool(dry_run),
+        "data": deleted_rows,
+    }
+
+
 def update_icloud_hme_alias_on_otp(anonymous_id: str, *, last_otp_at: str = "") -> dict[str, Any]:
     return patch_icloud_hme_alias(
         anonymous_id,
@@ -749,6 +1407,24 @@ def update_icloud_hme_alias_on_failure(
         anonymous_id,
         {
             "status": "register_failed",
+            "last_error": str(error_message or ""),
+            "task_id": str(task_id or ""),
+        },
+        allow_internal=True,
+    )
+
+
+def update_icloud_hme_alias_on_account_deactivated(
+    anonymous_id: str,
+    *,
+    error_message: str = "",
+    task_id: str = "",
+) -> dict[str, Any]:
+    return patch_icloud_hme_alias(
+        anonymous_id,
+        {
+            "status": "account_deactivated",
+            "enabled": False,
             "last_error": str(error_message or ""),
             "task_id": str(task_id or ""),
         },
@@ -892,6 +1568,985 @@ def count_icloud_hme_ready_aliases(
         return len(session.exec(query).all())
 
 
+def _norm_alias_email(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def list_icloud_hme_deletion_candidates(
+    *,
+    purpose: str = "chatgpt_register",
+    bound_service: str = "chatgpt",
+) -> dict[str, Any]:
+    """把所有 iCloud HME 别名分类为「可删 / 保护」，供自动删除 worker 与预览使用。
+
+    按顺序判定（命中即停）：
+      - ``retired``：已退役（已在 Apple 端删除）→ 跳过。
+      - ``in_flight``：``status==in_use``，或 ``reserved`` 且已被任务领取（task_id 非空）→ 保护
+        （可能正在注册）。注意：已完成注册的别名 status=registered/register_failed 也会带 task_id，
+        那是历史记录，不算在途，交给账号匹配判定。
+      - ``ready_stock``：``enabled`` 且 ``reserved`` 且未领取且未绑定 → 保护（补池待用库存，勿删）。
+      - 按 ``hme`` / ``bound_account_email`` 匹配 chatgpt 账号：
+          * 无匹配           → ``orphan``（可直接删）
+          * 任一账号未失效   → 保护（``account_alive``）
+          * 全部 ``invalid`` → ``bound_invalid``（需先失效测活再决定），附 ``account_ids``
+    """
+    normalized_purpose = str(purpose or "chatgpt_register").strip() or "chatgpt_register"
+    normalized_service = str(bound_service or "chatgpt").strip() or "chatgpt"
+
+    with Session(engine) as session:
+        alias_rows = session.exec(select(IcloudHmeAliasModel)).all()
+        account_rows = session.exec(
+            select(AccountModel).where(AccountModel.platform == "chatgpt")
+        ).all()
+        latest_recheck_campaign_id = _latest_icloud_hme_recheck_campaign_id(session)
+        recheck_rows = (
+            session.exec(
+                select(IcloudHmeRecheckQueueModel).where(
+                    IcloudHmeRecheckQueueModel.campaign_id == latest_recheck_campaign_id
+                )
+            ).all()
+            if latest_recheck_campaign_id
+            else []
+        )
+        recheck_by_anonymous_id = {
+            str(getattr(row, "anonymous_id", "") or "").strip(): row
+            for row in recheck_rows
+            if str(getattr(row, "anonymous_id", "") or "").strip()
+        }
+
+    accounts_by_email: dict[str, list[dict[str, Any]]] = {}
+    for acc in account_rows:
+        key = _norm_alias_email(acc.email)
+        if not key:
+            continue
+        accounts_by_email.setdefault(key, []).append(
+            {"id": int(acc.id or 0), "status": str(acc.status or "").strip().lower()}
+        )
+
+    orphan: list[dict[str, Any]] = []
+    bound_invalid: list[dict[str, Any]] = []
+    protected: list[dict[str, Any]] = []
+    summary = {
+        "orphan": 0,
+        "bound_invalid": 0,
+        "protected": 0,
+        "in_flight": 0,
+        "ready_stock": 0,
+        "account_alive": 0,
+        "retired": 0,
+        "recheck_not_confirmed": 0,
+    }
+
+    for row in alias_rows:
+        status = str(getattr(row, "status", "") or "").strip()
+        task_id = str(getattr(row, "task_id", "") or "").strip()
+        bound_email = str(getattr(row, "bound_account_email", "") or "").strip()
+        payload = _row_to_icloud_hme_alias_payload(row)
+
+        if status == "retired":
+            summary["retired"] += 1
+            continue
+
+        # 在途：正在注册(in_use)，或 reserved 且已被任务领取的中间态。已完成注册的别名
+        # (registered/register_failed) 也会带 task_id，那是历史记录，不在此拦截。
+        if status == "in_use" or (status == "reserved" and task_id):
+            summary["in_flight"] += 1
+            summary["protected"] += 1
+            protected.append({**payload, "reason": "in_flight"})
+            continue
+
+        # 待用库存：reserved + enabled + 未领取 + 未绑定（与 count_icloud_hme_ready_aliases 对齐）
+        if (
+            bool(getattr(row, "enabled", False))
+            and status == "reserved"
+            and not task_id
+            and not bound_email
+            and str(getattr(row, "purpose", "") or "") == normalized_purpose
+            and str(getattr(row, "bound_service", "") or "") == normalized_service
+        ):
+            summary["ready_stock"] += 1
+            summary["protected"] += 1
+            protected.append({**payload, "reason": "ready_stock"})
+            continue
+
+        # 一旦存在 HME 重跑/复测批次，Apple 端删除模块只处理明确标记的
+        # delete_candidate。pending/running/retry/alive 等都先保护，避免未跑完时误删。
+        recheck_row = None
+        recheck_confirmed_delete = False
+        if latest_recheck_campaign_id:
+            recheck_row = recheck_by_anonymous_id.get(
+                str(getattr(row, "anonymous_id", "") or "").strip()
+            )
+            recheck_confirmed_delete = bool(recheck_row is not None and getattr(recheck_row, "delete_candidate", False))
+            if not recheck_confirmed_delete:
+                summary["recheck_not_confirmed"] += 1
+                summary["protected"] += 1
+                protected.append(
+                    {
+                        **payload,
+                        "reason": "recheck_not_confirmed",
+                        "recheck_campaign_id": latest_recheck_campaign_id,
+                        "recheck_status": str(getattr(recheck_row, "status", "") or "") if recheck_row is not None else "",
+                        "recheck_result_code": str(getattr(recheck_row, "result_code", "") or "") if recheck_row is not None else "",
+                    }
+                )
+                continue
+
+        match_emails = {
+            e
+            for e in (
+                _norm_alias_email(getattr(row, "hme", "")),
+                _norm_alias_email(bound_email),
+            )
+            if e
+        }
+        matched: list[dict[str, Any]] = []
+        for email_key in match_emails:
+            matched.extend(accounts_by_email.get(email_key, []))
+
+        if not matched:
+            summary["orphan"] += 1
+            orphan.append(
+                {
+                    **payload,
+                    "disposition": "orphan",
+                    "delete_reason": "no_account",
+                    "recheck_confirmed": bool(recheck_confirmed_delete),
+                    "recheck_campaign_id": latest_recheck_campaign_id,
+                }
+            )
+            continue
+
+        alive = [a for a in matched if a["status"] != "invalid"]
+        if alive:
+            summary["account_alive"] += 1
+            summary["protected"] += 1
+            protected.append(
+                {
+                    **payload,
+                    "reason": "account_alive",
+                    "account_statuses": sorted({a["status"] for a in matched if a["status"]}),
+                }
+            )
+            continue
+
+        account_ids = sorted({a["id"] for a in matched if a["id"]})
+        summary["bound_invalid"] += 1
+        bound_invalid.append(
+            {
+                **payload,
+                "disposition": "bound_invalid",
+                "delete_reason": "account_invalid",
+                "account_ids": account_ids,
+                "recheck_confirmed": bool(recheck_confirmed_delete),
+                "recheck_campaign_id": latest_recheck_campaign_id,
+            }
+        )
+
+    return {
+        "orphan": orphan,
+        "bound_invalid": bound_invalid,
+        "protected": protected,
+        "candidates": orphan + bound_invalid,
+        "summary": summary,
+        "total": len(alias_rows),
+    }
+
+
+def _row_to_icloud_hme_recheck_payload(row: Any) -> dict[str, Any]:
+    if row is None:
+        return {}
+    if hasattr(row, "_mapping"):
+        row = dict(row._mapping)
+    if isinstance(row, dict):
+        details_raw = row.get("details_json") or "{}"
+        try:
+            details = json.loads(details_raw) if isinstance(details_raw, str) else dict(details_raw or {})
+        except Exception:
+            details = {}
+        created_at = row.get("created_at")
+        updated_at = row.get("updated_at")
+        return {
+            "id": row.get("id"),
+            "campaign_id": str(row.get("campaign_id") or ""),
+            "anonymous_id": str(row.get("anonymous_id") or ""),
+            "hme": str(row.get("hme") or ""),
+            "account_id": int(row.get("account_id") or 0),
+            "account_email": str(row.get("account_email") or ""),
+            "source_type": str(row.get("source_type") or ""),
+            "status": str(row.get("status") or ""),
+            "result_code": str(row.get("result_code") or ""),
+            "result_message": str(row.get("result_message") or ""),
+            "saved_account_id": int(row.get("saved_account_id") or 0),
+            "access_token_saved": bool(int(row.get("access_token_saved") or 0)),
+            "delete_candidate": bool(int(row.get("delete_candidate") or 0)),
+            "delete_candidate_reason": str(row.get("delete_candidate_reason") or ""),
+            "apple_delete_status": str(row.get("apple_delete_status") or "not_requested"),
+            "attempt_count": int(row.get("attempt_count") or 0),
+            "last_task_id": str(row.get("last_task_id") or ""),
+            "last_error": str(row.get("last_error") or ""),
+            "details": details if isinstance(details, dict) else {},
+            "checked_at": str(row.get("checked_at") or ""),
+            "started_at": str(row.get("started_at") or ""),
+            "created_at": created_at.isoformat() if hasattr(created_at, "isoformat") else str(created_at or ""),
+            "updated_at": updated_at.isoformat() if hasattr(updated_at, "isoformat") else str(updated_at or ""),
+        }
+    details = {}
+    try:
+        details = row.get_details() if hasattr(row, "get_details") else {}
+    except Exception:
+        details = {}
+    return {
+        "id": getattr(row, "id", None),
+        "campaign_id": str(getattr(row, "campaign_id", "") or ""),
+        "anonymous_id": str(getattr(row, "anonymous_id", "") or ""),
+        "hme": str(getattr(row, "hme", "") or ""),
+        "account_id": int(getattr(row, "account_id", 0) or 0),
+        "account_email": str(getattr(row, "account_email", "") or ""),
+        "source_type": str(getattr(row, "source_type", "") or ""),
+        "status": str(getattr(row, "status", "") or ""),
+        "result_code": str(getattr(row, "result_code", "") or ""),
+        "result_message": str(getattr(row, "result_message", "") or ""),
+        "saved_account_id": int(getattr(row, "saved_account_id", 0) or 0),
+        "access_token_saved": bool(getattr(row, "access_token_saved", False)),
+        "delete_candidate": bool(getattr(row, "delete_candidate", False)),
+        "delete_candidate_reason": str(getattr(row, "delete_candidate_reason", "") or ""),
+        "apple_delete_status": str(getattr(row, "apple_delete_status", "") or "not_requested"),
+        "attempt_count": int(getattr(row, "attempt_count", 0) or 0),
+        "last_task_id": str(getattr(row, "last_task_id", "") or ""),
+        "last_error": str(getattr(row, "last_error", "") or ""),
+        "details": details if isinstance(details, dict) else {},
+        "checked_at": str(getattr(row, "checked_at", "") or ""),
+        "started_at": str(getattr(row, "started_at", "") or ""),
+        "created_at": getattr(row, "created_at", "").isoformat() if hasattr(getattr(row, "created_at", ""), "isoformat") else str(getattr(row, "created_at", "") or ""),
+        "updated_at": getattr(row, "updated_at", "").isoformat() if hasattr(getattr(row, "updated_at", ""), "isoformat") else str(getattr(row, "updated_at", "") or ""),
+    }
+
+
+ICLOUD_HME_RECHECK_DONE_STATUSES = {"alive", "delete_candidate", "dead_kept", "skipped"}
+
+
+def _latest_icloud_hme_recheck_campaign_id(session: Session | None = None) -> str:
+    close_session = False
+    if session is None:
+        session = Session(engine)
+        close_session = True
+    try:
+        row = session.exec(
+            select(IcloudHmeRecheckQueueModel.campaign_id)
+            .order_by(IcloudHmeRecheckQueueModel.created_at.desc())
+            .limit(1)
+        ).first()
+        return str(row or "").strip()
+    finally:
+        if close_session:
+            session.close()
+
+
+def _recheck_queue_summary_for_campaign(session: Session, campaign_id: str) -> dict[str, Any]:
+    rows = session.exec(
+        select(IcloudHmeRecheckQueueModel).where(IcloudHmeRecheckQueueModel.campaign_id == campaign_id)
+    ).all()
+    by_status: dict[str, int] = {}
+    by_result: dict[str, int] = {}
+    delete_candidates = 0
+    access_token_saved = 0
+    checked = 0
+    for row in rows:
+        status = str(getattr(row, "status", "") or "").strip() or "unknown"
+        result = str(getattr(row, "result_code", "") or "").strip() or "unknown"
+        by_status[status] = by_status.get(status, 0) + 1
+        by_result[result] = by_result.get(result, 0) + 1
+        if bool(getattr(row, "delete_candidate", False)):
+            delete_candidates += 1
+        if bool(getattr(row, "access_token_saved", False)):
+            access_token_saved += 1
+        if status in ICLOUD_HME_RECHECK_DONE_STATUSES:
+            checked += 1
+    total = len(rows)
+    return {
+        "campaign_id": campaign_id,
+        "total": total,
+        "checked": checked,
+        "unchecked": max(total - checked, 0),
+        "pending": by_status.get("pending", 0),
+        "running": by_status.get("running", 0),
+        "retry": by_status.get("retry", 0),
+        "failed": by_status.get("failed", 0),
+        "alive": by_status.get("alive", 0),
+        "delete_candidate": by_status.get("delete_candidate", 0),
+        "dead_kept": by_status.get("dead_kept", 0),
+        "skipped": by_status.get("skipped", 0),
+        "delete_candidates": delete_candidates,
+        "access_token_saved": access_token_saved,
+        "by_status": by_status,
+        "by_result": by_result,
+    }
+
+
+def create_icloud_hme_recheck_campaign(
+    *,
+    campaign_id: str = "",
+    purpose: str = "chatgpt_register",
+    bound_service: str = "chatgpt",
+    forward_to: str = "",
+    include_ready_stock: bool = False,
+    include_in_flight: bool = False,
+    reset_existing: bool = False,
+) -> dict[str, Any]:
+    normalized_campaign = str(campaign_id or "").strip()
+    if not normalized_campaign:
+        normalized_campaign = f"hme_recheck_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+    normalized_purpose = str(purpose or "chatgpt_register").strip() or "chatgpt_register"
+    normalized_service = str(bound_service or "chatgpt").strip() or "chatgpt"
+    normalized_forward_to = str(forward_to or "").strip()
+    now = _utcnow()
+
+    with Session(engine) as session:
+        alias_query = select(IcloudHmeAliasModel).where(
+            IcloudHmeAliasModel.purpose == normalized_purpose,
+            IcloudHmeAliasModel.bound_service == normalized_service,
+        )
+        if normalized_forward_to:
+            alias_query = alias_query.where(IcloudHmeAliasModel.forward_to == normalized_forward_to)
+        aliases = session.exec(alias_query.order_by(IcloudHmeAliasModel.id.asc())).all()
+        accounts = session.exec(
+            select(AccountModel).where(AccountModel.platform == "chatgpt")
+        ).all()
+        accounts_by_email: dict[str, list[AccountModel]] = {}
+        for account in accounts:
+            key = _norm_alias_email(getattr(account, "email", ""))
+            if key:
+                accounts_by_email.setdefault(key, []).append(account)
+
+        inserted = 0
+        updated = 0
+        skipped = 0
+        skipped_reasons: dict[str, int] = {}
+        for alias in aliases:
+            status = str(getattr(alias, "status", "") or "").strip()
+            task_id = str(getattr(alias, "task_id", "") or "").strip()
+            bound_email = str(getattr(alias, "bound_account_email", "") or "").strip()
+            hme = str(getattr(alias, "hme", "") or "").strip()
+            anonymous_id = str(getattr(alias, "anonymous_id", "") or "").strip()
+            if not hme or not anonymous_id:
+                skipped += 1
+                skipped_reasons["missing_hme_or_anonymous_id"] = skipped_reasons.get("missing_hme_or_anonymous_id", 0) + 1
+                continue
+            if status == "retired":
+                skipped += 1
+                skipped_reasons["retired"] = skipped_reasons.get("retired", 0) + 1
+                continue
+            if not include_in_flight and (status == "in_use" or (status == "reserved" and task_id)):
+                skipped += 1
+                skipped_reasons["in_flight"] = skipped_reasons.get("in_flight", 0) + 1
+                continue
+            ready_stock = bool(getattr(alias, "enabled", False)) and status == "reserved" and not task_id and not bound_email
+            if ready_stock and not include_ready_stock:
+                skipped += 1
+                skipped_reasons["ready_stock"] = skipped_reasons.get("ready_stock", 0) + 1
+                continue
+
+            match_keys = {_norm_alias_email(hme), _norm_alias_email(bound_email)} - {""}
+            matched_accounts: list[AccountModel] = []
+            for key in match_keys:
+                matched_accounts.extend(accounts_by_email.get(key, []))
+            matched_accounts = sorted(
+                {int(acc.id or 0): acc for acc in matched_accounts if int(acc.id or 0) > 0}.values(),
+                key=lambda acc: int(acc.id or 0),
+            )
+            primary = matched_accounts[0] if matched_accounts else None
+            source_type = "both" if primary is not None else "icloud_orphan"
+
+            existing = session.exec(
+                select(IcloudHmeRecheckQueueModel).where(
+                    IcloudHmeRecheckQueueModel.campaign_id == normalized_campaign,
+                    IcloudHmeRecheckQueueModel.anonymous_id == anonymous_id,
+                )
+            ).first()
+            details = {
+                "alias_status": status,
+                "alias_enabled": bool(getattr(alias, "enabled", False)),
+                "alias_created_source": str(getattr(alias, "created_source", "") or ""),
+                "alias_record_source": str(getattr(alias, "record_source", "") or ""),
+                "alias_use_count": int(getattr(alias, "use_count", 0) or 0),
+                "alias_task_id": task_id,
+                "alias_bound_account_email": bound_email,
+                "alias_last_otp_at": str(getattr(alias, "last_otp_at", "") or ""),
+                "alias_last_error": str(getattr(alias, "last_error", "") or ""),
+                "matched_account_ids": [int(acc.id or 0) for acc in matched_accounts],
+                "matched_account_statuses": [str(acc.status or "") for acc in matched_accounts],
+                "ready_stock": ready_stock,
+            }
+            if existing is None:
+                existing = IcloudHmeRecheckQueueModel(
+                    campaign_id=normalized_campaign,
+                    anonymous_id=anonymous_id,
+                    hme=hme,
+                    account_id=int(getattr(primary, "id", 0) or 0) if primary is not None else 0,
+                    account_email=str(getattr(primary, "email", "") or "") if primary is not None else "",
+                    source_type=source_type,
+                    status="pending",
+                    apple_delete_status="not_requested",
+                    created_at=now,
+                    updated_at=now,
+                )
+                existing.set_details(details)
+                session.add(existing)
+                inserted += 1
+            else:
+                existing.hme = hme
+                existing.account_id = int(getattr(primary, "id", 0) or 0) if primary is not None else int(existing.account_id or 0)
+                existing.account_email = str(getattr(primary, "email", "") or "") if primary is not None else str(existing.account_email or "")
+                existing.source_type = source_type
+                existing.set_details({**existing.get_details(), **details})
+                if reset_existing:
+                    existing.status = "pending"
+                    existing.result_code = ""
+                    existing.result_message = ""
+                    existing.saved_account_id = 0
+                    existing.access_token_saved = False
+                    existing.delete_candidate = False
+                    existing.delete_candidate_reason = ""
+                    existing.apple_delete_status = "not_requested"
+                    existing.last_error = ""
+                    existing.checked_at = ""
+                    existing.started_at = ""
+                existing.updated_at = now
+                session.add(existing)
+                updated += 1
+        session.commit()
+        summary = _recheck_queue_summary_for_campaign(session, normalized_campaign)
+
+    return {
+        "campaign_id": normalized_campaign,
+        "inserted": inserted,
+        "updated": updated,
+        "skipped": skipped,
+        "skipped_reasons": skipped_reasons,
+        "summary": summary,
+    }
+
+
+def list_icloud_hme_recheck_campaigns(limit: int = 20) -> dict[str, Any]:
+    limit_value = max(1, min(int(limit or 20), 100))
+    with Session(engine) as session:
+        rows = session.exec(select(IcloudHmeRecheckQueueModel)).all()
+        campaign_ids: list[str] = []
+        seen: set[str] = set()
+        for row in sorted(rows, key=lambda item: str(getattr(item, "created_at", "") or ""), reverse=True):
+            cid = str(getattr(row, "campaign_id", "") or "").strip()
+            if not cid or cid in seen:
+                continue
+            seen.add(cid)
+            campaign_ids.append(cid)
+            if len(campaign_ids) >= limit_value:
+                break
+        data = []
+        for cid in campaign_ids:
+            data.append(_recheck_queue_summary_for_campaign(session, cid))
+    return {"data": data, "total": len(data)}
+
+
+def get_icloud_hme_recheck_campaign(
+    campaign_id: str = "",
+    *,
+    page: int = 1,
+    size: int = 20,
+    status: str = "",
+    result_code: str = "",
+    delete_candidate: str = "",
+    hme: str = "",
+) -> dict[str, Any]:
+    page_value = max(int(page or 1), 1)
+    size_value = max(1, min(int(size or 20), 100))
+    with Session(engine) as session:
+        normalized_campaign = str(campaign_id or "").strip() or _latest_icloud_hme_recheck_campaign_id(session)
+        if not normalized_campaign:
+            return {"campaign_id": "", "summary": {}, "data": [], "total": 0, "page": page_value, "size": size_value, "pages": 0}
+        query = select(IcloudHmeRecheckQueueModel).where(IcloudHmeRecheckQueueModel.campaign_id == normalized_campaign)
+        if str(status or "").strip():
+            query = query.where(IcloudHmeRecheckQueueModel.status == str(status).strip())
+        if str(result_code or "").strip():
+            query = query.where(IcloudHmeRecheckQueueModel.result_code == str(result_code).strip())
+        delete_text = str(delete_candidate or "").strip().lower()
+        if delete_text in {"1", "true", "yes", "on"}:
+            query = query.where(IcloudHmeRecheckQueueModel.delete_candidate == True)
+        elif delete_text in {"0", "false", "no", "off"}:
+            query = query.where(IcloudHmeRecheckQueueModel.delete_candidate == False)
+        if str(hme or "").strip():
+            query = query.where(IcloudHmeRecheckQueueModel.hme.contains(str(hme).strip()))
+        rows_all = session.exec(query.order_by(IcloudHmeRecheckQueueModel.id.asc())).all()
+        total = len(rows_all)
+        rows = rows_all[(page_value - 1) * size_value: page_value * size_value]
+        summary = _recheck_queue_summary_for_campaign(session, normalized_campaign)
+    return {
+        "campaign_id": normalized_campaign,
+        "summary": summary,
+        "data": [_row_to_icloud_hme_recheck_payload(row) for row in rows],
+        "total": total,
+        "page": page_value,
+        "size": size_value,
+        "pages": ceil(total / size_value) if size_value else 0,
+    }
+
+
+def claim_icloud_hme_recheck_items(
+    campaign_id: str,
+    *,
+    limit: int = 20,
+    include_retry: bool = False,
+    task_id: str = "",
+) -> list[dict[str, Any]]:
+    normalized_campaign = str(campaign_id or "").strip()
+    if not normalized_campaign:
+        return []
+    limit_value = max(1, min(int(limit or 20), 200))
+    now = _utcnow()
+    status_values = ["pending"]
+    if include_retry:
+        status_values.extend(["retry", "failed"])
+    with Session(engine) as session:
+        rows = session.exec(
+            select(IcloudHmeRecheckQueueModel)
+            .where(IcloudHmeRecheckQueueModel.campaign_id == normalized_campaign)
+            .where(IcloudHmeRecheckQueueModel.status.in_(status_values))
+            .order_by(IcloudHmeRecheckQueueModel.id.asc())
+            .limit(limit_value)
+        ).all()
+        claimed = []
+        for row in rows:
+            row.status = "running"
+            row.started_at = now.isoformat()
+            row.last_task_id = str(task_id or row.last_task_id or "")
+            row.attempt_count = int(row.attempt_count or 0) + 1
+            row.updated_at = now
+            session.add(row)
+            claimed.append(row)
+        session.commit()
+        for row in claimed:
+            session.refresh(row)
+            # detach-safe payload
+        return [_row_to_icloud_hme_recheck_payload(row) for row in claimed]
+
+
+def update_icloud_hme_recheck_item(
+    item_id: int,
+    *,
+    status: str,
+    result_code: str = "",
+    result_message: str = "",
+    saved_account_id: int = 0,
+    access_token_saved: bool = False,
+    delete_candidate: bool = False,
+    delete_candidate_reason: str = "",
+    last_task_id: str = "",
+    last_error: str = "",
+    details: dict[str, Any] | None = None,
+    checked: bool = True,
+) -> dict[str, Any]:
+    now = _utcnow()
+    with Session(engine) as session:
+        row = session.get(IcloudHmeRecheckQueueModel, int(item_id or 0))
+        if row is None:
+            raise LookupError("icloud hme recheck item not found")
+        row.status = str(status or "").strip() or row.status
+        row.result_code = str(result_code or "")[:200]
+        row.result_message = str(result_message or "")[:1000]
+        row.saved_account_id = int(saved_account_id or 0)
+        row.access_token_saved = bool(access_token_saved)
+        row.delete_candidate = bool(delete_candidate)
+        row.delete_candidate_reason = str(delete_candidate_reason or "")[:500]
+        if last_task_id:
+            row.last_task_id = str(last_task_id or "")
+        row.last_error = str(last_error or "")[:1000]
+        if details:
+            row.set_details({**row.get_details(), **dict(details or {})})
+        if checked:
+            row.checked_at = now.isoformat()
+        row.updated_at = now
+        session.add(row)
+        session.commit()
+        session.refresh(row)
+        return _row_to_icloud_hme_recheck_payload(row)
+
+
+def release_stale_icloud_hme_recheck_running(campaign_id: str = "", *, older_than_seconds: int = 7200) -> dict[str, Any]:
+    normalized_campaign = str(campaign_id or "").strip()
+    cutoff = datetime.now(timezone.utc).timestamp() - max(int(older_than_seconds or 7200), 60)
+    released = 0
+    with Session(engine) as session:
+        query = select(IcloudHmeRecheckQueueModel).where(IcloudHmeRecheckQueueModel.status == "running")
+        if normalized_campaign:
+            query = query.where(IcloudHmeRecheckQueueModel.campaign_id == normalized_campaign)
+        rows = session.exec(query).all()
+        for row in rows:
+            started = str(getattr(row, "started_at", "") or "").strip()
+            try:
+                parsed = datetime.fromisoformat(started.replace("Z", "+00:00")) if started else None
+                ts = parsed.timestamp() if parsed else 0
+            except Exception:
+                ts = 0
+            if ts and ts > cutoff:
+                continue
+            row.status = "retry"
+            row.last_error = "running item released after stale timeout"
+            row.updated_at = _utcnow()
+            session.add(row)
+            released += 1
+        session.commit()
+    return {"released": released, "campaign_id": normalized_campaign}
+
+
+def reset_icloud_hme_aliases_for_rerun(
+    *,
+    campaign_id: str = "",
+    purpose: str = "chatgpt_register",
+    bound_service: str = "chatgpt",
+    forward_to: str = "",
+    include_in_flight: bool = False,
+    include_ready_stock: bool = False,
+    reset_existing_queue: bool = True,
+    dry_run: bool = False,
+    limit: int = 0,
+) -> dict[str, Any]:
+    """把已经领取/使用过的 iCloud HME 本地重置回导入池。
+
+    只改本地 DB：不会调用 Apple deactivate/delete，也不会删除 ChatGPT 账号。
+    同时创建一个最新 rerun campaign，用来记录后续注册任务的成功/失败分类。
+    """
+    normalized_campaign = str(campaign_id or "").strip()
+    if not normalized_campaign:
+        normalized_campaign = f"hme_rerun_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+    normalized_purpose = str(purpose or "chatgpt_register").strip() or "chatgpt_register"
+    normalized_service = str(bound_service or "chatgpt").strip() or "chatgpt"
+    normalized_forward_to = str(forward_to or "").strip()
+    limit_value = max(int(limit or 0), 0)
+    now = _utcnow()
+    now_text = now.isoformat()
+
+    with Session(engine) as session:
+        alias_query = select(IcloudHmeAliasModel).where(
+            IcloudHmeAliasModel.purpose == normalized_purpose,
+            IcloudHmeAliasModel.bound_service == normalized_service,
+        )
+        if normalized_forward_to:
+            alias_query = alias_query.where(IcloudHmeAliasModel.forward_to == normalized_forward_to)
+        aliases = session.exec(alias_query.order_by(IcloudHmeAliasModel.id.asc())).all()
+        accounts = session.exec(select(AccountModel).where(AccountModel.platform == "chatgpt")).all()
+        accounts_by_email: dict[str, list[AccountModel]] = {}
+        for account in accounts:
+            key = _norm_alias_email(getattr(account, "email", ""))
+            if key:
+                accounts_by_email.setdefault(key, []).append(account)
+
+        matched = 0
+        reset_count = 0
+        inserted = 0
+        updated = 0
+        skipped = 0
+        skipped_reasons: dict[str, int] = {}
+        preview_rows: list[dict[str, Any]] = []
+
+        for alias in aliases:
+            status = str(getattr(alias, "status", "") or "").strip()
+            task_id_text = str(getattr(alias, "task_id", "") or "").strip()
+            bound_email = str(getattr(alias, "bound_account_email", "") or "").strip()
+            hme = str(getattr(alias, "hme", "") or "").strip()
+            anonymous_id = str(getattr(alias, "anonymous_id", "") or "").strip()
+            enabled = bool(getattr(alias, "enabled", False))
+            use_count = int(getattr(alias, "use_count", 0) or 0)
+            ready_stock = bool(enabled and status == "reserved" and not task_id_text and not bound_email)
+            used_by_system = bool(
+                use_count > 0
+                or task_id_text
+                or bound_email
+                or status in {"in_use", "registered", "register_failed"}
+            )
+
+            reason = ""
+            if not hme or not anonymous_id:
+                reason = "missing_hme_or_anonymous_id"
+            elif status == "retired":
+                reason = "retired"
+            elif ready_stock and not include_ready_stock:
+                reason = "already_ready_stock"
+            elif status == "in_use" and not include_in_flight:
+                reason = "in_flight"
+            elif not used_by_system and not ready_stock:
+                reason = "not_claimed"
+
+            if reason:
+                skipped += 1
+                skipped_reasons[reason] = skipped_reasons.get(reason, 0) + 1
+                continue
+
+            if limit_value and matched >= limit_value:
+                skipped += 1
+                skipped_reasons["limit_exceeded"] = skipped_reasons.get("limit_exceeded", 0) + 1
+                continue
+
+            match_keys = {_norm_alias_email(hme), _norm_alias_email(bound_email)} - {""}
+            matched_accounts: list[AccountModel] = []
+            for key in match_keys:
+                matched_accounts.extend(accounts_by_email.get(key, []))
+            matched_accounts = sorted(
+                {int(acc.id or 0): acc for acc in matched_accounts if int(acc.id or 0) > 0}.values(),
+                key=lambda acc: int(acc.id or 0),
+            )
+            primary = matched_accounts[0] if matched_accounts else None
+            source_type = "both" if primary is not None else "icloud_orphan"
+            original_payload = _row_to_icloud_hme_alias_payload(alias)
+            details = {
+                "reset_mode": "alias_pool_rerun",
+                "reset_at": now_text,
+                "reset_campaign_id": normalized_campaign,
+                "original_alias": original_payload,
+                "alias_status": status,
+                "alias_enabled": enabled,
+                "alias_created_source": str(getattr(alias, "created_source", "") or ""),
+                "alias_record_source": str(getattr(alias, "record_source", "") or ""),
+                "alias_use_count": use_count,
+                "alias_task_id": task_id_text,
+                "alias_bound_account_email": bound_email,
+                "alias_last_otp_at": str(getattr(alias, "last_otp_at", "") or ""),
+                "alias_last_error": str(getattr(alias, "last_error", "") or ""),
+                "matched_account_ids": [int(acc.id or 0) for acc in matched_accounts],
+                "matched_account_statuses": [str(acc.status or "") for acc in matched_accounts],
+                "ready_stock": ready_stock,
+            }
+            matched += 1
+            preview_rows.append(original_payload)
+
+            if not dry_run:
+                existing = session.exec(
+                    select(IcloudHmeRecheckQueueModel).where(
+                        IcloudHmeRecheckQueueModel.campaign_id == normalized_campaign,
+                        IcloudHmeRecheckQueueModel.anonymous_id == anonymous_id,
+                    )
+                ).first()
+                if existing is None:
+                    existing = IcloudHmeRecheckQueueModel(
+                        campaign_id=normalized_campaign,
+                        anonymous_id=anonymous_id,
+                        hme=hme,
+                        account_id=int(getattr(primary, "id", 0) or 0) if primary is not None else 0,
+                        account_email=str(getattr(primary, "email", "") or "") if primary is not None else "",
+                        source_type=source_type,
+                        status="pending",
+                        apple_delete_status="not_requested",
+                        created_at=now,
+                        updated_at=now,
+                    )
+                    existing.set_details(details)
+                    session.add(existing)
+                    inserted += 1
+                else:
+                    existing.hme = hme
+                    existing.account_id = int(getattr(primary, "id", 0) or 0) if primary is not None else int(existing.account_id or 0)
+                    existing.account_email = str(getattr(primary, "email", "") or "") if primary is not None else str(existing.account_email or "")
+                    existing.source_type = source_type
+                    existing.set_details({**existing.get_details(), **details})
+                    if reset_existing_queue:
+                        existing.status = "pending"
+                        existing.result_code = ""
+                        existing.result_message = ""
+                        existing.saved_account_id = 0
+                        existing.access_token_saved = False
+                        existing.delete_candidate = False
+                        existing.delete_candidate_reason = ""
+                        existing.apple_delete_status = "not_requested"
+                        existing.last_error = ""
+                        existing.checked_at = ""
+                        existing.started_at = ""
+                    existing.updated_at = now
+                    session.add(existing)
+                    updated += 1
+
+                alias.enabled = True
+                alias.status = "reserved"
+                alias.task_id = ""
+                alias.bound_account_email = ""
+                alias.bound_account_ref = ""
+                alias.use_count = 0
+                alias.first_claimed_at = ""
+                alias.last_claimed_at = ""
+                alias.last_otp_at = ""
+                alias.last_error = ""
+                alias.updated_at = now
+                session.add(alias)
+                reset_count += 1
+
+        if not dry_run:
+            session.commit()
+            summary = _recheck_queue_summary_for_campaign(session, normalized_campaign)
+        else:
+            summary = {
+                "campaign_id": normalized_campaign,
+                "total": matched,
+                "pending": matched,
+                "checked": 0,
+                "unchecked": matched,
+            }
+
+    return {
+        "campaign_id": normalized_campaign,
+        "matched": matched,
+        "reset": reset_count,
+        "inserted": inserted,
+        "updated": updated,
+        "skipped": skipped,
+        "skipped_reasons": skipped_reasons,
+        "dry_run": bool(dry_run),
+        "summary": summary,
+        "data": preview_rows[:100],
+    }
+
+
+def sync_icloud_hme_rerun_result(
+    *,
+    anonymous_id: str = "",
+    hme: str = "",
+    task_id: str = "",
+    success: bool = False,
+    error_message: str = "",
+    saved_account_id: int = 0,
+    access_token_saved: bool = False,
+    mailbox_state: dict[str, Any] | None = None,
+    result_code: str = "",
+    delete_candidate: bool = False,
+) -> dict[str, Any]:
+    normalized_anonymous_id = str(anonymous_id or "").strip()
+    normalized_hme = str(hme or "").strip()
+    if not normalized_anonymous_id and not normalized_hme:
+        return {"updated": 0, "reason": "missing_alias_identity"}
+
+    now = _utcnow()
+    now_text = now.isoformat()
+    error_text = str(error_message or "").strip()
+    try:
+        from services.chatgpt_account_state import is_account_deactivated_message
+
+        detected_delete_candidate = is_account_deactivated_message(str(result_code or ""), error_text)
+    except Exception:
+        lowered = error_text.lower()
+        detected_delete_candidate = any(marker in lowered for marker in ("account_deactivated", "account deleted", "account_disabled"))
+    delete_candidate = bool(delete_candidate or detected_delete_candidate)
+
+    with Session(engine) as session:
+        latest_campaign_id = _latest_icloud_hme_recheck_campaign_id(session)
+        if not latest_campaign_id:
+            return {"updated": 0, "reason": "no_campaign"}
+        query = select(IcloudHmeRecheckQueueModel).where(
+            IcloudHmeRecheckQueueModel.campaign_id == latest_campaign_id
+        )
+        if normalized_anonymous_id:
+            query = query.where(IcloudHmeRecheckQueueModel.anonymous_id == normalized_anonymous_id)
+        else:
+            query = query.where(IcloudHmeRecheckQueueModel.hme == normalized_hme)
+        row = session.exec(query.order_by(IcloudHmeRecheckQueueModel.id.desc())).first()
+        if row is None and normalized_hme:
+            target = _norm_alias_email(normalized_hme)
+            rows = session.exec(
+                select(IcloudHmeRecheckQueueModel)
+                .where(IcloudHmeRecheckQueueModel.campaign_id == latest_campaign_id)
+            ).all()
+            row = next((item for item in rows if _norm_alias_email(getattr(item, "hme", "")) == target), None)
+        if row is None:
+            return {"updated": 0, "reason": "queue_item_not_found", "campaign_id": latest_campaign_id}
+
+        if success:
+            row.status = "alive"
+            row.result_code = str(result_code or "login_alive")[:200]
+            row.result_message = "账号可登录，已由注册流程重新保存"
+            if int(saved_account_id or 0) > 0:
+                row.saved_account_id = int(saved_account_id or 0)
+            if access_token_saved or int(saved_account_id or 0) > 0:
+                row.access_token_saved = True
+            row.delete_candidate = False
+            row.delete_candidate_reason = ""
+            row.last_error = ""
+        else:
+            row.status = "delete_candidate" if delete_candidate else "retry"
+            row.result_code = str(result_code or ("account_deactivated" if delete_candidate else "register_failed"))[:200]
+            row.result_message = error_text[:1000]
+            row.delete_candidate = bool(delete_candidate)
+            row.delete_candidate_reason = "account_deleted_or_deactivated" if delete_candidate else ""
+            row.last_error = error_text[:1000]
+
+        row.last_task_id = str(task_id or row.last_task_id or "")
+        row.checked_at = now_text
+        row.updated_at = now
+        details = row.get_details()
+        details.update({
+            "rerun_register_flow": True,
+            "last_rerun_task_id": str(task_id or ""),
+            "last_rerun_success": bool(success),
+            "last_rerun_error": error_text,
+            "last_rerun_at": now_text,
+        })
+        if mailbox_state:
+            details["mailbox_state"] = dict(mailbox_state or {})
+        row.set_details(details)
+        session.add(row)
+
+        invalidated_accounts: list[int] = []
+        if delete_candidate:
+            account_ids = []
+            for raw in (details.get("matched_account_ids") or []):
+                try:
+                    value = int(raw or 0)
+                except Exception:
+                    value = 0
+                if value > 0 and value not in account_ids:
+                    account_ids.append(value)
+            email_keys = {_norm_alias_email(normalized_hme), _norm_alias_email(getattr(row, "hme", ""))} - {""}
+            if email_keys:
+                account_rows = session.exec(select(AccountModel).where(AccountModel.platform == "chatgpt")).all()
+                for account in account_rows:
+                    if _norm_alias_email(getattr(account, "email", "")) in email_keys:
+                        value = int(account.id or 0)
+                        if value > 0 and value not in account_ids:
+                            account_ids.append(value)
+            for account_id in account_ids:
+                account = session.get(AccountModel, account_id)
+                if account is None or account.platform != "chatgpt":
+                    continue
+                try:
+                    extra = account.get_extra()
+                except Exception:
+                    extra = {}
+                if not isinstance(extra, dict):
+                    extra = {}
+                extra["chatgpt_hme_rerun_delete_candidate"] = {
+                    "result_code": row.result_code,
+                    "message": row.result_message,
+                    "task_id": str(task_id or ""),
+                    "marked_at": now_text,
+                    "delete_mode": "mark_only",
+                    "campaign_id": latest_campaign_id,
+                }
+                capabilities = extra.get("chatgpt_capabilities") if isinstance(extra.get("chatgpt_capabilities"), dict) else {}
+                capabilities = dict(capabilities or {})
+                capabilities["auth_level"] = "invalid"
+                capabilities["upload_gate"] = "blocked_auth_invalid"
+                extra["chatgpt_capabilities"] = capabilities
+                account.status = "invalid"
+                account.set_extra(extra)
+                account.updated_at = now
+                session.add(account)
+                invalidated_accounts.append(account_id)
+
+        session.commit()
+        session.refresh(row)
+        return {
+            "updated": 1,
+            "campaign_id": latest_campaign_id,
+            "item": _row_to_icloud_hme_recheck_payload(row),
+            "invalidated_account_ids": invalidated_accounts,
+        }
+
+
 def patch_icloud_hme_alias(
     anonymous_id: str,
     updates: dict[str, Any],
@@ -950,6 +2605,17 @@ def patch_icloud_hme_alias(
         session.commit()
         session.refresh(row)
         return _row_to_icloud_hme_alias_payload(row)
+
+
+def mark_icloud_hme_alias_retired(anonymous_id: str, *, reason: str = "") -> dict[str, Any]:
+    """把别名标记为已退役（已在 Apple 端 deactivate+delete）：status=retired, enabled=False。
+
+    本地保留行作为审计记录；retired 行会被 ready/候选查询排除，不会再被 sync-live 当作可用。
+    """
+    updates: dict[str, Any] = {"status": "retired", "enabled": False}
+    if str(reason or "").strip():
+        updates["last_error"] = str(reason).strip()[:500]
+    return patch_icloud_hme_alias(anonymous_id, updates, allow_internal=True)
 
 
 def import_icloud_hme_alias_rows(
@@ -1071,6 +2737,11 @@ def claim_icloud_hme_alias(
 
 
 def set_icloud_hme_alias_enabled(anonymous_id: str, enabled: bool) -> dict[str, Any]:
+    if bool(enabled):
+        existing = get_icloud_hme_alias_by_anonymous_id(anonymous_id)
+        status = str((existing or {}).get("status") or "").strip()
+        if status in {"account_deactivated", "account_disabled"}:
+            raise ValueError("账号已禁用/死号，不允许重新启用到邮箱池")
     return patch_icloud_hme_alias(
         anonymous_id,
         {"enabled": bool(enabled)},
@@ -1102,10 +2773,20 @@ def bulk_enable_icloud_hme_aliases(
             status_text = str(getattr(row, "status", "") or "").strip()
             task_id_text = str(getattr(row, "task_id", "") or "").strip()
             bound_account_email_text = str(getattr(row, "bound_account_email", "") or "").strip()
-            recyclable_failed = status_text == "register_failed"
+            last_error_text = str(getattr(row, "last_error", "") or "").strip()
+            try:
+                from services.chatgpt_account_state import is_account_deactivated_message
+
+                deactivated_failed = is_account_deactivated_message("", last_error_text)
+            except Exception:
+                lowered_error = last_error_text.lower()
+                deactivated_failed = "account_deactivated" in lowered_error or "deleted or deactivated" in lowered_error
+            recyclable_failed = status_text == "register_failed" and not deactivated_failed
 
             if only_unused:
-                if status_text in {"registered", "in_use", "retired"}:
+                if status_text in {"registered", "in_use", "retired", "account_deactivated", "account_disabled"}:
+                    continue
+                if deactivated_failed:
                     continue
                 if not recyclable_failed and (task_id_text or bound_account_email_text):
                     continue
@@ -1260,13 +2941,405 @@ def recover_stuck_pending_business_invites() -> int:
     return recovered
 
 
+def _ensure_phone_pool_schema() -> None:
+    """创建/补齐 relay 自有手机号池表。"""
+    required_columns = {
+        "api_url": "TEXT NOT NULL DEFAULT ''",
+        "api_host": "TEXT NOT NULL DEFAULT ''",
+        "api_expired_date": "TEXT NOT NULL DEFAULT ''",
+        "api_expiry_checked_at": "TEXT NOT NULL DEFAULT ''",
+        "api_expiry_status": "TEXT NOT NULL DEFAULT ''",
+        "api_expiry_error": "TEXT NOT NULL DEFAULT ''",
+        "label": "TEXT NOT NULL DEFAULT ''",
+        "status": "TEXT NOT NULL DEFAULT 'active'",
+        "bound_count": "INTEGER NOT NULL DEFAULT 0",
+        "bound_account_emails_json": "TEXT NOT NULL DEFAULT '[]'",
+        "max_accounts": "INTEGER NOT NULL DEFAULT 3",
+        "success_count": "INTEGER NOT NULL DEFAULT 0",
+        "fail_count": "INTEGER NOT NULL DEFAULT 0",
+        "last_error_code": "TEXT NOT NULL DEFAULT ''",
+        "last_error_message": "TEXT NOT NULL DEFAULT ''",
+        "cooldown_until": "TEXT NOT NULL DEFAULT ''",
+        "last_used_at": "TEXT NOT NULL DEFAULT ''",
+        "created_at": "TIMESTAMP NULL",
+        "updated_at": "TIMESTAMP NULL",
+    }
+
+    with engine.begin() as conn:
+        conn.exec_driver_sql(
+            """
+            CREATE TABLE IF NOT EXISTS phone_pool (
+                id INTEGER PRIMARY KEY,
+                phone_e164 TEXT NOT NULL UNIQUE,
+                api_url TEXT NOT NULL DEFAULT '',
+                api_host TEXT NOT NULL DEFAULT '',
+                api_expired_date TEXT NOT NULL DEFAULT '',
+                api_expiry_checked_at TEXT NOT NULL DEFAULT '',
+                api_expiry_status TEXT NOT NULL DEFAULT '',
+                api_expiry_error TEXT NOT NULL DEFAULT '',
+                label TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'active',
+                bound_count INTEGER NOT NULL DEFAULT 0,
+                bound_account_emails_json TEXT NOT NULL DEFAULT '[]',
+                max_accounts INTEGER NOT NULL DEFAULT 3,
+                success_count INTEGER NOT NULL DEFAULT 0,
+                fail_count INTEGER NOT NULL DEFAULT 0,
+                last_error_code TEXT NOT NULL DEFAULT '',
+                last_error_message TEXT NOT NULL DEFAULT '',
+                cooldown_until TEXT NOT NULL DEFAULT '',
+                last_used_at TEXT NOT NULL DEFAULT '',
+                created_at TIMESTAMP NULL,
+                updated_at TIMESTAMP NULL
+            )
+            """
+        )
+        existing_columns = {
+            str(row[1])
+            for row in conn.exec_driver_sql("PRAGMA table_info(phone_pool)").fetchall()
+        }
+        for column_name, ddl in required_columns.items():
+            if column_name in existing_columns:
+                continue
+            conn.exec_driver_sql(f"ALTER TABLE phone_pool ADD COLUMN {column_name} {ddl}")
+        conn.exec_driver_sql(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_phone_pool_phone_e164 ON phone_pool(phone_e164)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_phone_pool_status ON phone_pool(status)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_phone_pool_api_host ON phone_pool(api_host)"
+        )
+
+
+def _ensure_phone_prefix_state_schema() -> None:
+    """创建/补齐手机号号段状态表。"""
+    required_columns = {
+        "purpose": "TEXT NOT NULL DEFAULT 'phone_signup'",
+        "prefix": "TEXT NOT NULL DEFAULT ''",
+        "status": "TEXT NOT NULL DEFAULT 'untested'",
+        "success_count": "INTEGER NOT NULL DEFAULT 0",
+        "failure_count": "INTEGER NOT NULL DEFAULT 0",
+        "last_success_phone": "TEXT NOT NULL DEFAULT ''",
+        "last_failure_phone": "TEXT NOT NULL DEFAULT ''",
+        "last_error_code": "TEXT NOT NULL DEFAULT ''",
+        "last_error_message": "TEXT NOT NULL DEFAULT ''",
+        "last_seen_at": "TEXT NOT NULL DEFAULT ''",
+        "created_at": "TIMESTAMP NULL",
+        "updated_at": "TIMESTAMP NULL",
+    }
+    with engine.begin() as conn:
+        conn.exec_driver_sql(
+            """
+            CREATE TABLE IF NOT EXISTS phone_prefix_state (
+                id INTEGER PRIMARY KEY,
+                purpose TEXT NOT NULL DEFAULT 'phone_signup',
+                prefix TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'untested',
+                success_count INTEGER NOT NULL DEFAULT 0,
+                failure_count INTEGER NOT NULL DEFAULT 0,
+                last_success_phone TEXT NOT NULL DEFAULT '',
+                last_failure_phone TEXT NOT NULL DEFAULT '',
+                last_error_code TEXT NOT NULL DEFAULT '',
+                last_error_message TEXT NOT NULL DEFAULT '',
+                last_seen_at TEXT NOT NULL DEFAULT '',
+                created_at TIMESTAMP NULL,
+                updated_at TIMESTAMP NULL
+            )
+            """
+        )
+        existing_columns = {
+            str(row[1])
+            for row in conn.exec_driver_sql("PRAGMA table_info(phone_prefix_state)").fetchall()
+        }
+        for column_name, ddl in required_columns.items():
+            if column_name in existing_columns:
+                continue
+            conn.exec_driver_sql(f"ALTER TABLE phone_prefix_state ADD COLUMN {column_name} {ddl}")
+        conn.exec_driver_sql(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_phone_prefix_state_purpose_prefix "
+            "ON phone_prefix_state(purpose, prefix)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_phone_prefix_state_status "
+            "ON phone_prefix_state(status)"
+        )
+
+
+def _ensure_baxigpt_cdk_pool_schema() -> None:
+    """创建/补齐 BaxiGPT 卡密池表。"""
+    required_columns = {
+        "code_value": "TEXT NOT NULL DEFAULT ''",
+        "code_hash": "TEXT NOT NULL DEFAULT ''",
+        "code_masked": "TEXT NOT NULL DEFAULT ''",
+        "label": "TEXT NOT NULL DEFAULT ''",
+        "status": "TEXT NOT NULL DEFAULT 'available'",
+        "bound_account_id": "INTEGER NOT NULL DEFAULT 0",
+        "bound_account_email": "TEXT NOT NULL DEFAULT ''",
+        "bound_at": "TEXT NOT NULL DEFAULT ''",
+        "task_id": "TEXT NOT NULL DEFAULT ''",
+        "order_id": "TEXT NOT NULL DEFAULT ''",
+        "display_id": "TEXT NOT NULL DEFAULT ''",
+        "remote_email": "TEXT NOT NULL DEFAULT ''",
+        "upstream_status": "TEXT NOT NULL DEFAULT ''",
+        "code_info_remaining": "INTEGER NOT NULL DEFAULT 0",
+        "code_info_total": "INTEGER NOT NULL DEFAULT 0",
+        "submit_response_json": "TEXT NOT NULL DEFAULT '{}'",
+        "last_status_response_json": "TEXT NOT NULL DEFAULT '{}'",
+        "last_query_response_json": "TEXT NOT NULL DEFAULT '{}'",
+        "last_error_code": "TEXT NOT NULL DEFAULT ''",
+        "last_error_message": "TEXT NOT NULL DEFAULT ''",
+        "submitted_at": "TEXT NOT NULL DEFAULT ''",
+        "paid_at": "TEXT NOT NULL DEFAULT ''",
+        "last_checked_at": "TEXT NOT NULL DEFAULT ''",
+        "created_at": "TIMESTAMP NULL",
+        "updated_at": "TIMESTAMP NULL",
+    }
+
+    with engine.begin() as conn:
+        conn.exec_driver_sql(
+            """
+            CREATE TABLE IF NOT EXISTS baxigpt_cdk_pool (
+                id INTEGER PRIMARY KEY,
+                code_value TEXT NOT NULL DEFAULT '',
+                code_hash TEXT NOT NULL DEFAULT '',
+                code_masked TEXT NOT NULL DEFAULT '',
+                label TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'available',
+                bound_account_id INTEGER NOT NULL DEFAULT 0,
+                bound_account_email TEXT NOT NULL DEFAULT '',
+                bound_at TEXT NOT NULL DEFAULT '',
+                task_id TEXT NOT NULL DEFAULT '',
+                order_id TEXT NOT NULL DEFAULT '',
+                display_id TEXT NOT NULL DEFAULT '',
+                remote_email TEXT NOT NULL DEFAULT '',
+                upstream_status TEXT NOT NULL DEFAULT '',
+                code_info_remaining INTEGER NOT NULL DEFAULT 0,
+                code_info_total INTEGER NOT NULL DEFAULT 0,
+                submit_response_json TEXT NOT NULL DEFAULT '{}',
+                last_status_response_json TEXT NOT NULL DEFAULT '{}',
+                last_query_response_json TEXT NOT NULL DEFAULT '{}',
+                last_error_code TEXT NOT NULL DEFAULT '',
+                last_error_message TEXT NOT NULL DEFAULT '',
+                submitted_at TEXT NOT NULL DEFAULT '',
+                paid_at TEXT NOT NULL DEFAULT '',
+                last_checked_at TEXT NOT NULL DEFAULT '',
+                created_at TIMESTAMP NULL,
+                updated_at TIMESTAMP NULL
+            )
+            """
+        )
+        existing_columns = {
+            str(row[1])
+            for row in conn.exec_driver_sql("PRAGMA table_info(baxigpt_cdk_pool)").fetchall()
+        }
+        for column_name, ddl in required_columns.items():
+            if column_name in existing_columns:
+                continue
+            conn.exec_driver_sql(f"ALTER TABLE baxigpt_cdk_pool ADD COLUMN {column_name} {ddl}")
+        conn.exec_driver_sql(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_baxigpt_cdk_pool_code_hash ON baxigpt_cdk_pool(code_hash)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_baxigpt_cdk_pool_status ON baxigpt_cdk_pool(status)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_baxigpt_cdk_pool_account ON baxigpt_cdk_pool(bound_account_id)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_baxigpt_cdk_pool_order ON baxigpt_cdk_pool(order_id)"
+        )
+
+
+def _ensure_delivery_card_schema() -> None:
+    """创建交付卡密索引和默认 SKU。"""
+    now = _utcnow()
+    default_skus = [
+        {
+            "code": "plus",
+            "name": "ChatGPT Plus 账号",
+            "platform": "chatgpt",
+            "code_prefix": "PLUS",
+            "delivery_profile": "chatgpt_basic",
+            "sort_policy": "earliest_expiry",
+            "eligible_rule_json": json.dumps({
+                "subscription_type": "plus",
+                "validity": "valid",
+                "exclude_unknown": True,
+            }, ensure_ascii=False),
+        },
+        {
+            "code": "free",
+            "name": "ChatGPT Free 账号",
+            "platform": "chatgpt",
+            "code_prefix": "FREE",
+            "delivery_profile": "email_password",
+            "sort_policy": "oldest_created",
+            "eligible_rule_json": json.dumps({
+                "subscription_type": "free",
+                "validity": "valid",
+                "exclude_unknown": True,
+            }, ensure_ascii=False),
+        },
+    ]
+    with engine.begin() as conn:
+        conn.exec_driver_sql(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_delivery_cards_code_hash ON delivery_cards(code_hash)"
+        )
+        conn.exec_driver_sql(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_delivery_cards_assigned_account "
+            "ON delivery_cards(assigned_account_id) WHERE assigned_account_id > 0"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_delivery_cards_sku_status ON delivery_cards(sku_code, status)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_delivery_card_events_card ON delivery_card_events(card_id)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_delivery_card_events_account ON delivery_card_events(account_id)"
+        )
+        conn.exec_driver_sql(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_delivery_card_events_success_idempotency "
+            "ON delivery_card_events(card_id, idempotency_key) "
+            "WHERE idempotency_key != '' AND result = 'success'"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_delivery_redeem_api_logs_trace ON delivery_redeem_api_logs(trace_id)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_delivery_redeem_api_logs_account ON delivery_redeem_api_logs(assigned_account_id)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_delivery_redeem_api_logs_card ON delivery_redeem_api_logs(card_id)"
+        )
+        for sku in default_skus:
+            exists = conn.exec_driver_sql(
+                "SELECT id FROM delivery_skus WHERE code = ?",
+                (sku["code"],),
+            ).fetchone()
+            if exists:
+                continue
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO delivery_skus (
+                        code, name, platform, code_prefix, delivery_profile,
+                        sort_policy, eligible_rule_json, allow_refetch,
+                        max_refetch_count, enabled, note, created_at, updated_at
+                    ) VALUES (
+                        :code, :name, :platform, :code_prefix, :delivery_profile,
+                        :sort_policy, :eligible_rule_json, 1,
+                        0, 1, '', :created_at, :updated_at
+                    )
+                    """
+                ),
+                {**sku, "created_at": now, "updated_at": now},
+            )
+
+
+def _ensure_account_list_state_schema() -> None:
+    with engine.begin() as conn:
+        conn.exec_driver_sql(
+            """
+            CREATE TABLE IF NOT EXISTS account_list_state (
+                account_id INTEGER PRIMARY KEY,
+                platform TEXT NOT NULL DEFAULT '',
+                manually_used INTEGER NOT NULL DEFAULT 0,
+                auth_type TEXT NOT NULL DEFAULT 'unknown',
+                auth_level TEXT NOT NULL DEFAULT '',
+                subscription_type TEXT NOT NULL DEFAULT 'unknown',
+                account_validity TEXT NOT NULL DEFAULT 'valid',
+                sub2api_state TEXT NOT NULL DEFAULT 'unknown',
+                oaipay_state TEXT NOT NULL DEFAULT 'unknown',
+                revival_state TEXT NOT NULL DEFAULT 'none',
+                revival_kind TEXT NOT NULL DEFAULT 'none',
+                subscription_active_until TEXT NOT NULL DEFAULT '',
+                subscription_active_until_ts REAL,
+                source_updated_at TEXT NOT NULL DEFAULT '',
+                refreshed_at TEXT NOT NULL DEFAULT '',
+                FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+            )
+            """
+        )
+        required_columns = {
+            "platform": "TEXT NOT NULL DEFAULT ''",
+            "manually_used": "INTEGER NOT NULL DEFAULT 0",
+            "auth_type": "TEXT NOT NULL DEFAULT 'unknown'",
+            "auth_level": "TEXT NOT NULL DEFAULT ''",
+            "subscription_type": "TEXT NOT NULL DEFAULT 'unknown'",
+            "account_validity": "TEXT NOT NULL DEFAULT 'valid'",
+            "sub2api_state": "TEXT NOT NULL DEFAULT 'unknown'",
+            "oaipay_state": "TEXT NOT NULL DEFAULT 'unknown'",
+            "revival_state": "TEXT NOT NULL DEFAULT 'none'",
+            "revival_kind": "TEXT NOT NULL DEFAULT 'none'",
+            "subscription_active_until": "TEXT NOT NULL DEFAULT ''",
+            "subscription_active_until_ts": "REAL",
+            "source_updated_at": "TEXT NOT NULL DEFAULT ''",
+            "refreshed_at": "TEXT NOT NULL DEFAULT ''",
+        }
+        existing_columns = {
+            str(row[1])
+            for row in conn.exec_driver_sql("PRAGMA table_info(account_list_state)").fetchall()
+        }
+        for column_name, ddl in required_columns.items():
+            if column_name in existing_columns:
+                continue
+            conn.exec_driver_sql(
+                f"ALTER TABLE account_list_state ADD COLUMN {column_name} {ddl}"
+            )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_account_list_state_platform "
+            "ON account_list_state(platform)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_account_list_state_manually_used "
+            "ON account_list_state(manually_used)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_account_list_state_auth_type "
+            "ON account_list_state(auth_type)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_account_list_state_subscription_type "
+            "ON account_list_state(subscription_type)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_account_list_state_account_validity "
+            "ON account_list_state(account_validity)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_account_list_state_sub2api_state "
+            "ON account_list_state(sub2api_state)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_account_list_state_oaipay_state "
+            "ON account_list_state(oaipay_state)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_account_list_state_revival_state "
+            "ON account_list_state(revival_state)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_account_list_state_subscription_active_until_ts "
+            "ON account_list_state(subscription_active_until_ts)"
+        )
+
+
 def init_db():
     _ensure_icloud_hme_alias_schema()
+    _ensure_icloud_hme_recheck_queue_schema()
+    _ensure_phone_pool_schema()
+    _ensure_phone_prefix_state_schema()
+    _ensure_baxigpt_cdk_pool_schema()
     SQLModel.metadata.create_all(engine)
+    _ensure_account_list_state_schema()
+    _ensure_delivery_card_schema()
     _ensure_task_log_schema()
     _ensure_proxy_schema()
     _ensure_pending_business_invite_schema()
     _ensure_external_subscription_claim_schema()
+    _ensure_external_access_token_claim_schema()
     _ensure_pipeline_schema()
 
 

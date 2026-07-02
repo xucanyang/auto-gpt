@@ -87,7 +87,7 @@ class AccessTokenOnlyCheckoutTests(unittest.TestCase):
             metadata = engine._probe_plus_checkout_billing(
                 {
                     "access_token": "at-demo",
-                    "cookies": "oai-did=device",
+                    "session_token": "session-demo",
                     "account_id": "acct-demo",
                 },
                 "buyer@example.com",
@@ -128,6 +128,7 @@ class AccessTokenOnlyCheckoutTests(unittest.TestCase):
                 {
                     "access_token": "at-demo",
                     "cookies": "oai-did=device",
+                    "session_token": "session-demo",
                     "account_id": "acct-demo",
                 },
                 "buyer@example.com",
@@ -164,6 +165,7 @@ class AccessTokenOnlyCheckoutTests(unittest.TestCase):
                 {
                     "access_token": "at-demo",
                     "cookies": "oai-did=device",
+                    "session_token": "session-demo",
                     "account_id": "acct-demo",
                 },
                 "buyer@example.com",
@@ -215,6 +217,114 @@ class AccessTokenOnlyCheckoutTests(unittest.TestCase):
         self.assertTrue(result.metadata["chatgpt_nonzero_checkout_amount_failure"])
         email_service.finalize_success.assert_not_called()
         email_service.finalize_failure.assert_called_once()
+
+    def test_gopay_provider_link_is_captured_after_zero_amount_checkout(self):
+        engine = AccessTokenOnlyRegistrationEngine(
+            email_service=mock.Mock(),
+            proxy_url="http://proxy.local:8080",
+            extra_config={
+                "chatgpt_access_token_only_checkout_country": "ID",
+                "chatgpt_access_token_only_checkout_currency": "IDR",
+                "chatgpt_access_token_only_gopay_provider_link_enabled": True,
+                "chatgpt_gopay_defaults": '{"billing_country":"US","billing_name":"Michael Anderson"}',
+            },
+        )
+
+        provider_snapshot = {
+            "phase": "provider_link_ready",
+            "checkout_url": "https://pay.openai.com/c/pay/cs_live_123#fid",
+            "cs_id": "cs_live_123",
+            "snap_token": "11111111-1111-1111-1111-111111111111",
+            "payment_platform_url": "https://app.midtrans.com/snap/v4/redirection/11111111-1111-1111-1111-111111111111",
+            "midtrans_redirect_url": "https://app.midtrans.com/snap/v4/redirection/11111111-1111-1111-1111-111111111111",
+            "stripe_redirect_url": "https://pm-redirects.stripe.com/authorize/acct/test",
+            "result": {"payment_method_types": ["gopay"]},
+        }
+        with (
+            mock.patch(
+                "core.proxy_utils.iter_enabled_runtime_proxies",
+                return_value=["http://proxy.local:8080"],
+            ),
+            mock.patch(
+                "services.chatgpt_core.payment.generate_plus_link",
+                return_value="https://pay.openai.com/c/pay/cs_live_123#fid",
+            ) as generate_link,
+            mock.patch(
+                "services.chatgpt_core.gopay_flow.probe_chatgpt_checkout_amount",
+                return_value={"amount_text": "0", "amount": 0, "currency": "idr", "amount_is_zero": True},
+            ),
+            mock.patch(
+                "services.chatgpt_core.gopay_flow.create_gopay_provider_link",
+                return_value=provider_snapshot,
+            ) as create_provider_link,
+        ):
+            metadata = engine._probe_plus_checkout_billing(
+                {
+                    "access_token": "at-demo",
+                    "cookies": "oai-did=device",
+                    "session_token": "session-demo",
+                    "account_id": "acct-demo",
+                },
+                "buyer@example.com",
+            )
+
+        self.assertTrue(metadata["chatgpt_gopay_provider_link_enabled"])
+        self.assertTrue(metadata["chatgpt_gopay_provider_link_ready"])
+        self.assertEqual(metadata["chatgpt_gopay_provider_link"], provider_snapshot["payment_platform_url"])
+        self.assertEqual(metadata["chatgpt_gopay_provider_link_cs_id"], "cs_live_123")
+        self.assertNotIn("link_format", generate_link.call_args.kwargs)
+        self.assertEqual(generate_link.call_args.kwargs["billing"]["country"], "ID")
+        create_provider_link.assert_called_once()
+        self.assertEqual(create_provider_link.call_args.kwargs["checkout_url"], "https://pay.openai.com/c/pay/cs_live_123#fid")
+        self.assertEqual(create_provider_link.call_args.kwargs["billing"]["country"], "ID")
+        checkout_account = create_provider_link.call_args.args[0]
+        self.assertEqual(checkout_account.session_token, "session-demo")
+        self.assertEqual(checkout_account.extra["session_token"], "session-demo")
+
+    def test_gopay_provider_link_failure_does_not_fail_registration(self):
+        email_service = mock.Mock()
+        email_service.create_email.return_value = {"email": "buyer@example.com"}
+        engine = AccessTokenOnlyRegistrationEngine(
+            email_service=email_service,
+            proxy_url="http://proxy.local:8080",
+            extra_config={
+                "chatgpt_access_token_only_checkout_country": "ID",
+                "chatgpt_access_token_only_checkout_currency": "IDR",
+                "chatgpt_access_token_only_gopay_provider_link_enabled": True,
+            },
+        )
+
+        with (
+            mock.patch.object(engine, "_probe_homepage_before_email_creation", return_value=(True, "")),
+            mock.patch.object(engine, "_report_homepage_probe"),
+            mock.patch(
+                "services.chatgpt_core.access_token_only_registration_engine.ChatGPTClient",
+                self._FakeChatGPTClient,
+            ),
+            mock.patch(
+                "core.proxy_utils.iter_enabled_runtime_proxies",
+                return_value=["http://proxy.local:8080"],
+            ),
+            mock.patch(
+                "services.chatgpt_core.payment.generate_plus_link",
+                return_value="https://pay.openai.com/c/pay/cs_live_123#fid",
+            ),
+            mock.patch(
+                "services.chatgpt_core.gopay_flow.probe_chatgpt_checkout_amount",
+                return_value={"amount_text": "0", "amount": 0, "currency": "idr", "amount_is_zero": True},
+            ),
+            mock.patch(
+                "services.chatgpt_core.gopay_flow.create_gopay_provider_link",
+                side_effect=RuntimeError("midtrans unavailable"),
+            ),
+        ):
+            result = engine.run()
+
+        self.assertTrue(result.success)
+        self.assertFalse(result.metadata["chatgpt_gopay_provider_link_ready"])
+        self.assertIn("midtrans unavailable", result.metadata["chatgpt_gopay_provider_link_error"])
+        email_service.finalize_success.assert_called_once()
+        email_service.finalize_failure.assert_not_called()
 
 
 if __name__ == "__main__":

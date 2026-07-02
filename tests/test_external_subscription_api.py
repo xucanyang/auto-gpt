@@ -94,6 +94,58 @@ class ExternalSubscriptionApiTests(unittest.TestCase):
             session.refresh(row)
             return int(row.id or 0)
 
+    def _add_paypal_url_account(
+        self,
+        *,
+        email: str = "paypal-url@example.com",
+        status: str = "registered",
+        source: str = "oaipay",
+    ) -> int:
+        paypal_url = "https://www.paypal.com/agreements/approve?ba_token=BA-123"
+        extra = {
+            "chatgpt_paypal_url": {
+                "url": paypal_url,
+                "paypal_url": paypal_url,
+                "approval_url": paypal_url,
+                "payment_link_format": "paypal_url",
+                "link_type": "paypal",
+                "source": source,
+                "upstream": source,
+                "plan": "plus",
+                "country": "US",
+                "billing_country": "US",
+                "currency": "USD",
+                "checkout_amount": "0 USD",
+                "checkout_amount_is_zero": True,
+                "cs_id": "cs_live_paypal",
+                "payment_method_id": "pm_paypal",
+            },
+            "chatgpt_last_payment_link": {
+                "url": paypal_url,
+                "paypal_url": paypal_url,
+                "payment_link_format": "paypal_url",
+                "source": source,
+                "plan": "plus",
+                "country": "US",
+                "currency": "USD",
+                "checkout_amount": "0 USD",
+                "checkout_amount_is_zero": True,
+            },
+        }
+        with self._session() as session:
+            row = AccountModel(
+                platform="chatgpt",
+                email=email,
+                password="pw",
+                status=status,
+                cashier_url=paypal_url,
+                extra_json=json.dumps(extra, ensure_ascii=False),
+            )
+            session.add(row)
+            session.commit()
+            session.refresh(row)
+            return int(row.id or 0)
+
     def test_claim_marks_account_pending_and_returns_minimal_link(self):
         account_id = self._add_account()
         with self._session() as session:
@@ -132,6 +184,44 @@ class ExternalSubscriptionApiTests(unittest.TestCase):
         self.assertEqual(row.status, "claimed")
         self.schedule_mock.assert_called_once()
         self.preflight_mock.assert_called_once()
+
+    def test_claim_returns_paypal_url_without_live_checkout_preflight(self):
+        account_id = self._add_paypal_url_account(source="oaipay")
+        self.preflight_mock.reset_mock()
+
+        with self._session() as session:
+            result = external_api.claim_subscription_links(
+                external_api.ClaimSubscriptionLinksRequest(consumer="worker-paypal", limit=1, country="US", currency="USD"),
+                session=session,
+            )
+
+        self.assertEqual(result["count"], 1)
+        item = result["items"][0]
+        self.assertEqual(item["account_id"], account_id)
+        self.assertEqual(item["payment_link"], "https://www.paypal.com/agreements/approve?ba_token=BA-123")
+        self.assertEqual(item["paypal_url"], "https://www.paypal.com/agreements/approve?ba_token=BA-123")
+        self.assertEqual(item["payment_link_format"], "paypal_url")
+        self.assertEqual(item["source"], "oaipay")
+        self.assertEqual(item["checkout_amount"], "0 USD")
+        self.assertEqual(item["currency"], "USD")
+
+        with self._session() as session:
+            account = session.get(AccountModel, account_id)
+            extra = account.get_extra()
+            claim = extra["external_subscription_claim"]
+            self.assertEqual(claim["status"], "claimed")
+            self.assertEqual(claim["payment_link"], "https://www.paypal.com/agreements/approve?ba_token=BA-123")
+            self.assertEqual(claim["paypal_url"], "https://www.paypal.com/agreements/approve?ba_token=BA-123")
+            self.assertEqual(extra["chatgpt_last_payment_link"]["link_status"], "leased")
+            self.assertEqual(extra["chatgpt_paypal_url"]["link_status"], "leased")
+            row = session.exec(
+                select(ExternalSubscriptionClaimModel)
+                .where(ExternalSubscriptionClaimModel.claim_id == claim["claim_id"])
+            ).first()
+            self.assertEqual(row.payment_link, "https://www.paypal.com/agreements/approve?ba_token=BA-123")
+            self.assertEqual(row.get_details()["payment_link_format"], "paypal_url")
+
+        self.preflight_mock.assert_not_called()
 
     def test_claim_rechecks_cached_zero_amount_link_before_sending(self):
         account_id = self._add_account(email="stale-zero@example.com")

@@ -1,4 +1,5 @@
 import { Button, Form, Input, Modal, Select, Tag, Typography, theme } from 'antd'
+import { CopyOutlined } from '@ant-design/icons'
 
 const { Text } = Typography
 
@@ -172,9 +173,11 @@ function Sub2ApiSyncSummary({ sync, formatSyncTime }: { sync: any; formatSyncTim
       </div>
       <SummaryField label="远端账号 ID" value={sync?.remote_account_id ? String(sync.remote_account_id) : ''} />
       <SummaryField label="匹配方式" value={sync?.matched_by} />
+      <SummaryField label="探测来源" value={sync?.probe_source ? String(sync.probe_source).toUpperCase() : ''} />
       <SummaryField label="候选数量" value={sync?.candidate_count ? String(sync.candidate_count) : ''} />
       <SummaryField label="最近探测" value={sync?.checked_at ? formatSyncTime(sync.checked_at) : ''} />
       <SummaryField label="最近尝试" value={sync?.last_attempt_at ? formatSyncTime(sync.last_attempt_at) : ''} />
+      <SummaryField label="最近上传记录" value={sync?.last_upload ? JSON.stringify(sync.last_upload, null, 2) : ''} code />
       <SummaryField label="状态信息" value={sync?.message || sync?.last_message} code />
       <SummaryField label="候选明细" value={sync?.candidates ? JSON.stringify(sync.candidates, null, 2) : ''} code />
     </div>
@@ -196,6 +199,9 @@ type AccountDetailModalProps = {
   onImportAccountToTeam: (record: any) => Promise<void> | void
   formatSyncTime: (value?: string) => string
   getRefreshToken: (record: any) => string
+  getAccessToken: (record: any) => string
+  onCopyAccessToken: (record: any) => Promise<void> | void
+  isAccessTokenCopied: (record: any) => boolean
   canImportAccountToTeam: (record: any) => boolean
   authStateMeta: (state?: string) => { color: string; label: string }
   planMeta: (plan?: string) => { color: string; label: string }
@@ -213,6 +219,9 @@ export function AccountDetailModal({
   onImportAccountToTeam,
   formatSyncTime,
   getRefreshToken,
+  getAccessToken,
+  onCopyAccessToken,
+  isAccessTokenCopied,
   canImportAccountToTeam,
   authStateMeta,
   planMeta,
@@ -242,7 +251,27 @@ export function AccountDetailModal({
                 ]}
               />
             </Form.Item>
-            <Form.Item name="token" label="Access Token">
+            <Form.Item
+              name="token"
+              label={
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                  <span>Access Token</span>
+                  {getAccessToken(currentAccount) ? (
+                    <Button
+                      title="复制AT"
+                      type="link"
+                      size="small"
+                      icon={<CopyOutlined />}
+                      style={{ paddingInline: 0, height: 20 }}
+                      onClick={() => onCopyAccessToken(currentAccount)}
+                    >
+                      复制AT
+                    </Button>
+                  ) : null}
+                  {isAccessTokenCopied(currentAccount) ? <Tag color="orange" style={{ marginInlineEnd: 0 }}>已复制AT</Tag> : null}
+                </div>
+              }
+            >
               <Input.TextArea rows={2} style={{ fontFamily: 'monospace' }} />
             </Form.Item>
           </Form>

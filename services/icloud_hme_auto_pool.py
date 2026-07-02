@@ -14,6 +14,8 @@ DEFAULT_STOCK_LIMIT = 10
 DEFAULT_INTERVAL_MINUTES_MIN = 60
 DEFAULT_INTERVAL_MINUTES_MAX = 120
 DEFAULT_RATE_LIMIT_BACKOFF_MINUTES = 360
+DEFAULT_ERROR_BACKOFF_MINUTES = 3
+DEFAULT_ERROR_BACKOFF_MAX_MINUTES = 15
 LOOP_INTERVAL_SECONDS = 60
 
 _state_lock = threading.Lock()
@@ -22,9 +24,12 @@ _stop_event = threading.Event()
 _running = False
 _next_run_at = 0.0
 _rate_limit_until = 0.0
+_error_backoff_until = 0.0
+_consecutive_error_count = 0
 _last_run_at = 0.0
 _last_success_at = 0.0
 _last_error = ""
+_last_backoff_reason = ""
 _last_created_hme = ""
 _last_ready_count = 0
 
@@ -36,6 +41,7 @@ class IcloudHmeAutoPoolConfig:
     interval_min_minutes: int
     interval_max_minutes: int
     rate_limit_backoff_minutes: int
+    error_backoff_minutes: int
     icloud_cookie: str
     icloud_domain_base: str
     forward_to: str
@@ -106,6 +112,11 @@ def get_icloud_hme_auto_pool_config() -> IcloudHmeAutoPoolConfig:
             DEFAULT_RATE_LIMIT_BACKOFF_MINUTES,
             minimum=1,
         ),
+        error_backoff_minutes=_to_int(
+            store.get("icloud_hme_auto_create_error_backoff_minutes", ""),
+            DEFAULT_ERROR_BACKOFF_MINUTES,
+            minimum=0,
+        ),
         icloud_cookie=str(store.get("icloud_cookie", "") or "").strip(),
         icloud_domain_base=str(store.get("icloud_domain_base", "icloud.com") or "icloud.com").strip() or "icloud.com",
         forward_to=str(store.get("icloud_forward_to", "b@cccy.me") or "b@cccy.me").strip() or "b@cccy.me",
@@ -150,6 +161,47 @@ def _record_error(message: str) -> None:
 
     with _state_lock:
         _last_error = str(message or "").strip()
+
+
+def _set_error_backoff(config: IcloudHmeAutoPoolConfig, message: str) -> tuple[float, int]:
+    global _error_backoff_until, _next_run_at, _last_error, _consecutive_error_count, _last_backoff_reason
+
+    with _state_lock:
+        _consecutive_error_count = max(int(_consecutive_error_count or 0), 0) + 1
+        if config.error_backoff_minutes <= 0:
+            wait_minutes = 0
+            _error_backoff_until = 0.0
+        else:
+            wait_minutes = min(
+                config.error_backoff_minutes * _consecutive_error_count,
+                DEFAULT_ERROR_BACKOFF_MAX_MINUTES,
+            )
+            _error_backoff_until = _now() + wait_minutes * 60
+            _next_run_at = _error_backoff_until
+        _last_error = str(message or "").strip()
+        _last_backoff_reason = "普通错误短退避" if wait_minutes > 0 else ""
+        return _error_backoff_until, wait_minutes
+
+
+def _clear_error_backoff() -> None:
+    global _error_backoff_until, _consecutive_error_count, _last_backoff_reason
+
+    with _state_lock:
+        _error_backoff_until = 0.0
+        _consecutive_error_count = 0
+        _last_backoff_reason = ""
+
+
+def _is_non_retryable_error(exc: Exception, message: str) -> bool:
+    try:
+        from core.base_mailbox import ICloudAuthExpiredError
+
+        if isinstance(exc, ICloudAuthExpiredError):
+            return True
+    except Exception:
+        pass
+    text = str(message or "").lower()
+    return any(marker in text for marker in ("未配置", "cookie 已失效", "invalid cookie", "session expired"))
 
 
 def _create_one_alias(config: IcloudHmeAutoPoolConfig) -> dict[str, Any]:
@@ -212,6 +264,8 @@ def _create_one_alias(config: IcloudHmeAutoPoolConfig) -> dict[str, Any]:
 
 def run_once(*, force: bool = False) -> dict[str, Any]:
     global _last_run_at, _last_success_at, _last_created_hme, _last_ready_count, _rate_limit_until, _last_error
+    global _next_run_at
+    global _error_backoff_until, _consecutive_error_count, _last_backoff_reason
 
     config = get_icloud_hme_auto_pool_config()
     ready_count = _ready_count(config)
@@ -221,6 +275,7 @@ def run_once(*, force: bool = False) -> dict[str, Any]:
     if not force and not config.enabled:
         return {"ok": False, "reason": "disabled", "ready_count": ready_count}
     if ready_count >= config.stock_limit:
+        _clear_error_backoff()
         _schedule_next(config)
         return {
             "ok": True,
@@ -233,12 +288,20 @@ def run_once(*, force: bool = False) -> dict[str, Any]:
     now = _now()
     with _state_lock:
         rate_limited = _rate_limit_until and now < _rate_limit_until
+        error_backoff = _error_backoff_until and now < _error_backoff_until
     if not force and rate_limited:
         return {
             "ok": False,
             "reason": "rate_limit_backoff",
             "ready_count": ready_count,
             "rate_limit_until": _iso(_rate_limit_until),
+        }
+    if not force and error_backoff:
+        return {
+            "ok": False,
+            "reason": "error_backoff",
+            "ready_count": ready_count,
+            "error_backoff_until": _iso(_error_backoff_until),
         }
 
     with _state_lock:
@@ -257,6 +320,9 @@ def run_once(*, force: bool = False) -> dict[str, Any]:
             with _state_lock:
                 _rate_limit_until = _now() + backoff_seconds
                 _next_run_at = _rate_limit_until
+                _error_backoff_until = 0.0
+                _consecutive_error_count = 0
+                _last_backoff_reason = ""
                 _last_error = message
             print(
                 "[iCloudHME AutoPool] 触发 iCloud 创建限流，"
@@ -269,10 +335,31 @@ def run_once(*, force: bool = False) -> dict[str, Any]:
                 "rate_limit_until": _iso(_rate_limit_until),
             }
 
+        if _is_non_retryable_error(exc, message):
+            _record_error(message)
+            next_run_at = _schedule_next(config)
+            print(f"[iCloudHME AutoPool] 创建失败，需要人工处理配置/凭据: {message}")
+            return {
+                "ok": False,
+                "reason": "non_retryable_error",
+                "error": message,
+                "next_run_at": _iso(next_run_at),
+            }
+
         _record_error(message)
-        _schedule_next(config)
-        print(f"[iCloudHME AutoPool] 创建失败: {message}")
-        return {"ok": False, "reason": "error", "error": message}
+        error_backoff_until, wait_minutes = _set_error_backoff(config, message)
+        if wait_minutes > 0:
+            print(f"[iCloudHME AutoPool] 创建失败，普通错误短退避 {wait_minutes} 分钟后再试: {message}")
+        else:
+            _schedule_next(config)
+            print(f"[iCloudHME AutoPool] 创建失败: {message}")
+        return {
+            "ok": False,
+            "reason": "error",
+            "error": message,
+            "error_backoff_until": _iso(error_backoff_until),
+            "error_backoff_minutes": wait_minutes,
+        }
 
     ready_count_after = _ready_count(config)
     next_run_at = _schedule_next(config)
@@ -281,6 +368,7 @@ def run_once(*, force: bool = False) -> dict[str, Any]:
         _last_created_hme = str(created.get("hme") or "")
         _last_ready_count = ready_count_after
         _rate_limit_until = 0.0
+    _clear_error_backoff()
     print(
         "[iCloudHME AutoPool] 已创建并加入导入池: "
         f"{created.get('hme') or '-'}，当前可用库存 {ready_count_after}/{config.stock_limit}，"
@@ -302,6 +390,9 @@ def get_status() -> dict[str, Any]:
         _last_ready_count = ready_count
         next_run_at = _next_run_at
         rate_limit_until = _rate_limit_until
+        error_backoff_until = _error_backoff_until
+        consecutive_error_count = _consecutive_error_count
+        last_backoff_reason = _last_backoff_reason
         last_run_at = _last_run_at
         last_success_at = _last_success_at
         last_error = _last_error
@@ -317,10 +408,15 @@ def get_status() -> dict[str, Any]:
         "interval_min_minutes": config.interval_min_minutes,
         "interval_max_minutes": config.interval_max_minutes,
         "rate_limit_backoff_minutes": config.rate_limit_backoff_minutes,
+        "error_backoff_minutes": config.error_backoff_minutes,
         "next_run_at": _iso(next_run_at),
         "seconds_until_next_run": max(int(next_run_at - now), 0) if next_run_at else 0,
         "rate_limit_until": _iso(rate_limit_until),
         "in_rate_limit_backoff": bool(rate_limit_until and now < rate_limit_until),
+        "error_backoff_until": _iso(error_backoff_until),
+        "in_error_backoff": bool(error_backoff_until and now < error_backoff_until),
+        "consecutive_error_count": consecutive_error_count,
+        "last_backoff_reason": last_backoff_reason,
         "last_run_at": _iso(last_run_at),
         "last_success_at": _iso(last_success_at),
         "last_created_hme": last_created_hme,
@@ -341,7 +437,10 @@ def _loop() -> None:
                 with _state_lock:
                     next_run_at = _next_run_at
                     rate_limit_until = _rate_limit_until
+                    error_backoff_until = _error_backoff_until
                 if rate_limit_until and now < rate_limit_until:
+                    pass
+                elif error_backoff_until and now < error_backoff_until:
                     pass
                 elif next_run_at and now >= next_run_at:
                     run_once()

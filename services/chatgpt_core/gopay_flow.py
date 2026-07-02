@@ -38,7 +38,8 @@ from services.chatgpt_core.payment import (
 STRIPE_API = "https://api.stripe.com"
 STRIPE_VERSION_BASE = "2025-03-31.basil"
 STRIPE_VERSION_FULL = "2025-03-31.basil; checkout_server_update_beta=v1; checkout_manual_approval_preview=v1"
-DEFAULT_STRIPE_RUNTIME_VERSION = "6f8494a281"
+STRIPE_VERSION_HOSTED = "2020-08-27;custom_checkout_beta=v1; checkout_server_update_beta=v1; checkout_manual_approval_preview=v1"
+DEFAULT_STRIPE_RUNTIME_VERSION = "0711c6012f"
 KNOWN_PUBLISHABLE_KEYS = (
     DEFAULT_STRIPE_PK,
     "pk_live_51HOrSwC6h1nxGoI3lTAgRjYVrz4dU3fVOabyCcKR3pbEJguCVAlqCxdxCUvoRh1XWwRacViovU3kLKvpkjh7IqkW00iXQsjo3n",
@@ -120,6 +121,7 @@ PHASE_STARTING = "starting"
 PHASE_WAITING_OTP = "waiting_otp"
 PHASE_WAITING_LINK_PIN = "waiting_link_pin"
 PHASE_WAITING_PAYMENT_PIN = "waiting_payment_pin"
+PHASE_PROVIDER_LINK_READY = "provider_link_ready"
 PHASE_VERIFYING = "verifying"
 PHASE_SUCCEEDED = "succeeded"
 PHASE_FAILED = "failed"
@@ -189,6 +191,9 @@ class GoPaySession:
     cs_id: str = ""
     pm_id: str = ""
     snap_token: str = ""
+    stripe_redirect_url: str = ""
+    midtrans_redirect_url: str = ""
+    payment_platform_url: str = ""
     reference_id: str = ""
     charge_ref: str = ""
     link_challenge_id: str = ""
@@ -303,6 +308,25 @@ def _clean_str(value: Any, default: str = "") -> str:
     return text or default
 
 
+def _account_extra(account: Any) -> dict[str, Any]:
+    extra = getattr(account, "extra", {}) or {}
+    return extra if isinstance(extra, dict) else {}
+
+
+def _account_session_token(account: Any) -> str:
+    for value in (
+        getattr(account, "session_token", ""),
+        _account_extra(account).get("session_token"),
+        _account_extra(account).get("chatgpt_session_token"),
+        _account_extra(account).get("__Secure-next-auth.session-token"),
+        _account_extra(account).get("__Secure-authjs.session-token"),
+    ):
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
+
 def _safe_json_summary(value: Any, max_len: int = 700) -> str:
     try:
         text = json.dumps(value, ensure_ascii=False, default=str)
@@ -354,6 +378,9 @@ def _snapshot(session: GoPaySession) -> dict[str, Any]:
             "cs_id": session.cs_id,
             "pm_id": session.pm_id,
             "snap_token": session.snap_token,
+            "stripe_redirect_url": session.stripe_redirect_url,
+            "midtrans_redirect_url": session.midtrans_redirect_url,
+            "payment_platform_url": session.payment_platform_url,
             "reference_id": session.reference_id,
             "charge_ref": session.charge_ref,
             "otp_waiting_since": session.otp_waiting_since,
@@ -400,6 +427,7 @@ def list_gopay_sessions() -> list[dict[str, Any]]:
 def _build_chatgpt_headers(account: Any) -> dict[str, str]:
     if not getattr(account, "access_token", ""):
         raise GoPayFlowError("账号缺少 access_token")
+    extra = _account_extra(account)
     headers = {
         "Authorization": f"Bearer {account.access_token}",
         "Content-Type": "application/json",
@@ -413,11 +441,26 @@ def _build_chatgpt_headers(account: Any) -> dict[str, str]:
         ),
     }
     cookies = str(getattr(account, "cookies", "") or "")
+    if not cookies:
+        session_token = _account_session_token(account)
+        if session_token:
+            cookies = (
+                f"__Secure-next-auth.session-token={session_token}; "
+                f"__Secure-authjs.session-token={session_token}"
+            )
     if cookies:
         headers["Cookie"] = cookies
         oai_did = _extract_oai_did(cookies)
         if oai_did:
             headers["oai-device-id"] = oai_did
+    chatgpt_account_id = str(
+        extra.get("account_id")
+        or extra.get("chatgpt_account_id")
+        or extra.get("workspace_id")
+        or ""
+    ).strip()
+    if chatgpt_account_id:
+        headers["chatgpt-account-id"] = chatgpt_account_id
     return headers
 
 
@@ -522,10 +565,21 @@ def _get_chatgpt(account: Any, url: str, *, params: Optional[dict[str, Any]] = N
     )
 
 
-def _get_chatgpt_with_profile(account: Any, url: str, *, params: Optional[dict[str, Any]] = None, proxy: str = "", profile: dict[str, Any]):
+def _get_chatgpt_with_profile(
+    account: Any,
+    url: str,
+    *,
+    params: Optional[dict[str, Any]] = None,
+    proxy: str = "",
+    profile: dict[str, Any],
+    extra_headers: Optional[dict[str, str]] = None,
+):
+    headers = _build_profile_chatgpt_headers(account, profile)
+    if extra_headers:
+        headers.update(extra_headers)
     return cffi_requests.get(
         url,
-        headers=_build_profile_chatgpt_headers(account, profile),
+        headers=headers,
         params=params,
         proxies=build_requests_proxy_config(proxy or None),
         timeout=DEFAULT_TIMEOUT,
@@ -576,6 +630,19 @@ def parse_checkout_url(raw: str) -> tuple[str, str]:
     if "checkout.stripe.com" in raw:
         return cs_id, raw
     return cs_id, f"https://checkout.stripe.com/c/pay/{cs_id}"
+
+
+def _checkout_fragment(raw: Any) -> str:
+    text = str(raw or "").strip()
+    if "#" not in text:
+        return ""
+    fragment = "#" + text.split("#", 1)[1]
+    return fragment if fragment.lower().startswith("#fid") else ""
+
+
+def _midtrans_redirection_url(snap_token: str) -> str:
+    token = str(snap_token or "").strip()
+    return f"https://app.midtrans.com/snap/v4/redirection/{token}" if token else ""
 
 
 def _extract_midtrans_link_reference(data: dict[str, Any]) -> str:
@@ -648,8 +715,14 @@ def _processor_entity_from_checkout_data(data: dict[str, Any], fallback_url: str
     return _extract_processor_entity(checkout_url, default="")
 
 
-def _create_hosted_checkout(account: Any, *, country: str, currency: str, proxy: str, profile: dict[str, Any]) -> tuple[str, str]:
-    processor_entity = str((getattr(account, "extra", {}) or {}).get("gopay_processor_entity") or "").strip()
+def _create_hosted_checkout(account: Any, *, country: str, currency: str, proxy: str, profile: dict[str, Any]) -> tuple[str, str, str]:
+    extra = _account_extra(account)
+    processor_entity = str(
+        extra.get("gopay_processor_entity")
+        or extra.get("chatgpt_checkout_processor_entity")
+        or extra.get("checkout_processor_entity")
+        or ""
+    ).strip()
     body = {
         "plan_name": "chatgptplusplan",
         "billing_details": {"country": country, "currency": currency},
@@ -661,18 +734,32 @@ def _create_hosted_checkout(account: Any, *, country: str, currency: str, proxy:
     }
     if processor_entity:
         body["processor_entity"] = processor_entity
-    r = _post_chatgpt_with_profile(account, PAYMENT_CHECKOUT_URL, json_body=body, proxy=proxy, profile=profile)
+    r = _post_chatgpt_with_profile(
+        account,
+        PAYMENT_CHECKOUT_URL,
+        json_body=body,
+        proxy=proxy,
+        profile=profile,
+        extra_headers={
+            "x-openai-target-path": "/backend-api/payments/checkout",
+            "x-openai-target-route": "/backend-api/payments/checkout",
+            "oai-session-id": str(uuid.uuid4()),
+        },
+    )
     _raise_for_gopay_status(r, "chatgpt checkout create")
     data = r.json()
     checkout_url = str(data.get("url") or data.get("checkout_url") or data.get("cashier_url") or "").strip()
     cs_id = str(data.get("checkout_session_id") or data.get("session_id") or data.get("id") or "").strip()
     response_entity = _processor_entity_from_checkout_data(data, fallback_url=checkout_url) or processor_entity or "openai_llc"
+    if isinstance(extra, dict):
+        extra["chatgpt_checkout_processor_entity"] = response_entity
+        extra["checkout_processor_entity"] = response_entity
     if checkout_url and not cs_id:
         cs_id, _ = parse_checkout_url(checkout_url)
     if checkout_url and cs_id:
-        return checkout_url, cs_id
+        return checkout_url, cs_id, response_entity
     if cs_id:
-        return f"https://chatgpt.com/checkout/{response_entity}/{cs_id}", cs_id
+        return f"https://chatgpt.com/checkout/{response_entity}/{cs_id}", cs_id, response_entity
     raise GoPayFlowError(f"checkout create: bad response {data!r}")
 
 
@@ -741,9 +828,14 @@ class GoPayRunner:
         self.s = session
         self.account = account
         self.checkout_proxy = session.proxy or ""
-        self.proxy = ""
+        self.proxy = self.checkout_proxy
         self.billing = dict(session.billing or {})
         self.profile = _select_gopay_browser_profile(session, account)
+        self.chatgpt_oai_session_id = str(
+            _account_extra(account).get("chatgpt_oai_session_id")
+            or _account_extra(account).get("oai_session_id")
+            or uuid.uuid4()
+        )
         self.ext = cffi_requests.Session(impersonate=str(self.profile.get("impersonate") or "chrome146"))
         self.ext.headers.update({
             "User-Agent": str(self.profile.get("ua") or _build_chatgpt_headers(account).get("User-Agent", "")),
@@ -794,7 +886,12 @@ class GoPayRunner:
         if self.s.processor_entity:
             return self.s.processor_entity
         extra = getattr(self.account, "extra", {}) or {}
-        configured = str(extra.get("gopay_processor_entity") or "").strip()
+        configured = str(
+            extra.get("gopay_processor_entity")
+            or extra.get("chatgpt_checkout_processor_entity")
+            or extra.get("checkout_processor_entity")
+            or ""
+        ).strip()
         if configured:
             self.s.processor_entity = configured
             return configured
@@ -842,7 +939,7 @@ class GoPayRunner:
         return self._chatgpt_create_checkout()
 
     def _chatgpt_create_checkout(self) -> str:
-        checkout_url, cs_id = _create_hosted_checkout(
+        checkout_url, cs_id, processor_entity = _create_hosted_checkout(
             self.account,
             country=self.s.country,
             currency=self.s.currency,
@@ -850,7 +947,10 @@ class GoPayRunner:
             profile=self.profile,
         )
         self.s.checkout_url = checkout_url
-        self.s.processor_entity = _extract_processor_entity(checkout_url, default=self._processor_entity())
+        self.s.processor_entity = (
+            processor_entity
+            or _extract_processor_entity(checkout_url, default=self._processor_entity())
+        )
         _, stripe_checkout_url = parse_checkout_url(checkout_url)
         self.s.stripe_checkout_url = stripe_checkout_url
         if cs_id:
@@ -880,57 +980,41 @@ class GoPayRunner:
 
     def _stripe_init_checkout(self, cs_id: str, stripe_pk: str) -> tuple[dict[str, Any], str, dict[str, Any]]:
         stripe_js_id = str(uuid.uuid4())
-        elements_session_id = _gen_elements_session_id()
-        elements_options = _elements_options_client_payload()
         request_timeout = int(self.profile.get("checkout_probe_timeout") or DEFAULT_TIMEOUT)
-        for version in (STRIPE_VERSION_BASE, STRIPE_VERSION_FULL):
-            body = {
-                "browser_locale": str(self.profile.get("stripe_locale") or self.profile.get("locale") or "id"),
-                "browser_timezone": str(self.profile.get("timezone") or "Asia/Jakarta"),
-                "elements_session_client[elements_init_source]": "custom_checkout",
-                "elements_session_client[referrer_host]": "chatgpt.com",
-                "elements_session_client[stripe_js_id]": stripe_js_id,
-                "elements_session_client[locale]": str(self.profile.get("locale") or "id-ID"),
-                "elements_session_client[is_aggregation_expected]": "false",
-                "key": stripe_pk,
-                "_stripe_version": version,
-            }
-            body.update(elements_options)
-            if version == STRIPE_VERSION_FULL:
-                body["elements_session_client[client_betas][0]"] = "custom_checkout_server_updates_1"
-                body["elements_session_client[client_betas][1]"] = "custom_checkout_manual_approval_1"
-            r = self.ext.post(f"{STRIPE_API}/v1/payment_pages/{cs_id}/init", data=body, headers=_stripe_headers(self.profile), timeout=request_timeout)
-            if r.status_code == 200:
-                init_data = r.json() or {}
-                ctx = {
-                    "stripe_js_id": stripe_js_id,
-                    "elements_session_id": elements_session_id,
-                    "elements_options_client": elements_options,
-                    "locale": init_data.get("locale") or "en",
-                    "currency": str(init_data.get("currency") or self.s.currency or "idr").lower(),
-                    "checkout_amount": ((init_data.get("total_summary") or {}).get("due")
-                                        if (init_data.get("total_summary") or {}).get("due") is not None
-                                        else (init_data.get("invoice") or {}).get("amount_due")),
-                    "payment_method_types": _extract_payment_method_types(init_data),
-                    "config_id": init_data.get("config_id", ""),
-                    "init_checksum": init_data.get("init_checksum", ""),
-                    "return_url": init_data.get("return_url") or "",
-                    "stripe_hosted_url": init_data.get("stripe_hosted_url") or "",
-                }
-                _safe_log(self.s, f"Stripe checkout initialized: amount={ctx['checkout_amount']} currency={ctx['currency']}")
-                return init_data, version, ctx
-            if r.status_code == 400 and "beta" in (r.text or "").lower():
-                continue
-            _raise_for_gopay_status(r, "stripe payment_pages init")
-        raise GoPayFlowError("stripe payment_pages init failed")
+        body = {
+            "key": stripe_pk,
+            "eid": "NA",
+            "browser_locale": str(self.profile.get("locale") or "id-ID"),
+            "browser_timezone": str(self.profile.get("timezone") or "Asia/Jakarta"),
+            "redirect_type": "url",
+        }
+        r = self.ext.post(f"{STRIPE_API}/v1/payment_pages/{cs_id}/init", data=body, headers=_stripe_headers(self.profile), timeout=request_timeout)
+        _raise_for_gopay_status(r, "stripe payment_pages init")
+        init_data = r.json() or {}
+        ctx = {
+            "stripe_js_id": stripe_js_id,
+            "locale": init_data.get("locale") or self.profile.get("stripe_locale") or "id",
+            "browser_locale": body["browser_locale"],
+            "browser_timezone": body["browser_timezone"],
+            "currency": str(init_data.get("currency") or self.s.currency or "idr").lower(),
+            "checkout_amount": ((init_data.get("total_summary") or {}).get("due")
+                                if (init_data.get("total_summary") or {}).get("due") is not None
+                                else (init_data.get("invoice") or {}).get("amount_due")),
+            "payment_method_types": _extract_payment_method_types(init_data),
+            "config_id": init_data.get("config_id", ""),
+            "init_checksum": init_data.get("init_checksum", ""),
+            "return_url": init_data.get("return_url") or "",
+            "stripe_hosted_url": init_data.get("stripe_hosted_url") or self.s.checkout_url or "",
+            "stripe_version": STRIPE_VERSION_HOSTED,
+        }
+        _safe_log(self.s, f"Stripe checkout initialized: amount={ctx['checkout_amount']} currency={ctx['currency']}")
+        return init_data, STRIPE_VERSION_HOSTED, ctx
 
     def _stripe_create_pm(self, cs_id: str, stripe_pk: str, stripe_ver: str, ctx: dict[str, Any]) -> str:
         billing = dict(self.billing or {})
-        runtime = (getattr(self.account, "extra", {}) or {}).get("gopay_runtime") or {}
+        runtime = _account_extra(self.account).get("gopay_runtime") or {}
         runtime_version = ctx.get("runtime_version") or runtime.get("version") or DEFAULT_STRIPE_RUNTIME_VERSION
         stripe_js_id = ctx.get("stripe_js_id") or str(uuid.uuid4())
-        elements_session_id = ctx.get("elements_session_id") or _gen_elements_session_id()
-        elements_session_config_id = ctx.get("elements_session_config_id") or str(uuid.uuid4())
         checkout_config_id = ctx.get("payment_method_checkout_config_id") or ctx.get("config_id") or ""
         body = {
             "billing_details[name]": _clean_str(billing.get("name"), "John Doe"),
@@ -943,27 +1027,21 @@ class GoPayRunner:
             "type": "gopay",
             "payment_user_agent": (
                 f"stripe.js/{runtime_version}; stripe-js-v3/{runtime_version}; "
-                "payment-element; deferred-intent"
+                "checkout"
             ),
-            "referrer": "https://chatgpt.com",
+            "referrer": "https://pay.openai.com/",
             "time_on_page": str(ctx.get("time_on_page") or self.profile.get("time_on_page") or 30000),
             "client_attribution_metadata[client_session_id]": stripe_js_id,
             "client_attribution_metadata[checkout_session_id]": cs_id,
             "client_attribution_metadata[checkout_config_id]": checkout_config_id,
-            "client_attribution_metadata[elements_session_id]": elements_session_id,
-            "client_attribution_metadata[elements_session_config_id]": elements_session_config_id,
-            "client_attribution_metadata[merchant_integration_source]": "elements",
-            "client_attribution_metadata[merchant_integration_subtype]": "payment-element",
-            "client_attribution_metadata[merchant_integration_version]": "2021",
-            "client_attribution_metadata[payment_intent_creation_flow]": "deferred",
+            "client_attribution_metadata[merchant_integration_source]": "checkout",
+            "client_attribution_metadata[merchant_integration_version]": "custom_checkout",
             "client_attribution_metadata[payment_method_selection_flow]": "automatic",
-            "client_attribution_metadata[merchant_integration_additional_elements][0]": "payment",
-            "client_attribution_metadata[merchant_integration_additional_elements][1]": "address",
             "guid": ctx.get("guid") or uuid.uuid4().hex,
             "muid": ctx.get("muid") or uuid.uuid4().hex,
             "sid": ctx.get("sid") or uuid.uuid4().hex,
             "key": stripe_pk,
-            "_stripe_version": stripe_ver,
+            "_stripe_version": stripe_ver or STRIPE_VERSION_HOSTED,
         }
         r = self.ext.post(f"{STRIPE_API}/v1/payment_methods", data=body, headers=_stripe_headers(self.profile), timeout=DEFAULT_TIMEOUT)
         _raise_for_gopay_status(r, "stripe payment_methods")
@@ -977,7 +1055,7 @@ class GoPayRunner:
     def _stripe_confirm(self, cs_id: str, pm_id: str, stripe_pk: str, init_resp: dict[str, Any], stripe_ver: str, ctx: dict[str, Any]) -> dict[str, Any]:
         import urllib.parse
 
-        runtime = (getattr(self.account, "extra", {}) or {}).get("gopay_runtime") or {}
+        runtime = _account_extra(self.account).get("gopay_runtime") or {}
         init_checksum = init_resp.get("init_checksum") or ctx.get("init_checksum") or ""
         if not init_checksum:
             raise GoPayFlowError("stripe confirm 缺少 init_checksum")
@@ -989,25 +1067,18 @@ class GoPayRunner:
             expected_amount = str((init_resp.get("invoice") or {})["amount_due"])
         elif ctx.get("checkout_amount") is not None:
             expected_amount = str(ctx["checkout_amount"])
-        stripe_hosted_url = ctx.get("stripe_hosted_url") or init_resp.get("stripe_hosted_url") or ""
-        success_return_url = ctx.get("return_url") or init_resp.get("return_url") or init_resp.get("url") or ""
-        processor_entity = self._processor_entity()
-        return_url = stripe_hosted_url or success_return_url
-        if stripe_hosted_url and success_return_url:
-            parsed_hosted = urllib.parse.urlsplit(stripe_hosted_url)
-            hosted_query = urllib.parse.urlencode([
-                ("returned_from_redirect", "true"),
-                ("ui_mode", "custom"),
-                ("return_url", success_return_url),
-            ])
-            return_url = urllib.parse.urlunsplit((
-                parsed_hosted.scheme,
-                parsed_hosted.netloc,
-                parsed_hosted.path,
-                hosted_query,
-                parsed_hosted.fragment,
-            ))
+        hosted_fragment = (
+            _checkout_fragment(ctx.get("stripe_hosted_url"))
+            or _checkout_fragment(init_resp.get("stripe_hosted_url"))
+            or _checkout_fragment(self.s.checkout_url)
+        )
+        return_url = (
+            f"https://pay.openai.com/c/pay/{cs_id}"
+            f"?redirect_pm_type=gopay&lid={uuid.uuid4()}&ui_mode=custom"
+            f"{hosted_fragment}"
+        )
         if not return_url:
+            processor_entity = self._processor_entity()
             chatgpt_return = (
                 f"https://chatgpt.com/checkout/verify?stripe_session_id={cs_id}"
                 f"&processor_entity={processor_entity}&plan_type=plus"
@@ -1017,10 +1088,9 @@ class GoPayRunner:
                 f"?returned_from_redirect=true&ui_mode=custom&return_url={urllib.parse.quote(chatgpt_return, safe='')}"
             )
         stripe_js_id = ctx.get("stripe_js_id") or str(uuid.uuid4())
-        elements_session_id = ctx.get("elements_session_id") or _gen_elements_session_id()
-        elements_session_config_id = ctx.get("elements_session_config_id") or str(uuid.uuid4())
         checkout_config_id = ctx.get("top_checkout_config_id") or ctx.get("config_id") or ""
         body = {
+            "eid": "NA",
             "guid": ctx.get("guid") or uuid.uuid4().hex,
             "muid": ctx.get("muid") or uuid.uuid4().hex,
             "sid": ctx.get("sid") or uuid.uuid4().hex,
@@ -1030,30 +1100,16 @@ class GoPayRunner:
             "expected_amount": expected_amount,
             "expected_payment_method_type": "gopay",
             "return_url": return_url,
-            "elements_session_client[elements_init_source]": "custom_checkout",
-            "elements_session_client[referrer_host]": "chatgpt.com",
-            "elements_session_client[stripe_js_id]": stripe_js_id,
-            "elements_session_client[locale]": ctx.get("locale") or "en",
-            "elements_session_client[is_aggregation_expected]": "false",
-            "elements_session_client[session_id]": elements_session_id,
-            "elements_session_client[client_betas][0]": "custom_checkout_server_updates_1",
-            "elements_session_client[client_betas][1]": "custom_checkout_manual_approval_1",
             "client_attribution_metadata[client_session_id]": stripe_js_id,
             "client_attribution_metadata[checkout_session_id]": cs_id,
             "client_attribution_metadata[checkout_config_id]": checkout_config_id,
-            "client_attribution_metadata[elements_session_id]": elements_session_id,
-            "client_attribution_metadata[elements_session_config_id]": elements_session_config_id,
             "client_attribution_metadata[merchant_integration_source]": "checkout",
-            "client_attribution_metadata[merchant_integration_subtype]": "payment-element",
-            "client_attribution_metadata[merchant_integration_version]": "custom",
-            "client_attribution_metadata[payment_intent_creation_flow]": "deferred",
+            "client_attribution_metadata[merchant_integration_version]": "custom_checkout",
             "client_attribution_metadata[payment_method_selection_flow]": "automatic",
-            "client_attribution_metadata[merchant_integration_additional_elements][0]": "payment",
-            "client_attribution_metadata[merchant_integration_additional_elements][1]": "address",
+            "link_brand": "link",
             "key": stripe_pk,
-            "_stripe_version": STRIPE_VERSION_FULL,
+            "_stripe_version": stripe_ver or STRIPE_VERSION_HOSTED,
         }
-        body.update(ctx.get("elements_options_client") or _elements_options_client_payload())
         consent_collection = init_resp.get("consent_collection") or {}
         if consent_collection.get("terms_of_service") not in (None, "", "none"):
             body["consent[terms_of_service]"] = "accepted"
@@ -1079,24 +1135,10 @@ class GoPayRunner:
             "state": _clean_str(billing.get("state"), "DKI Jakarta"),
             "postal_code": _clean_str(billing.get("postal_code"), "10310"),
         }
-        elements_session_id = ctx.get("elements_session_id") or _gen_elements_session_id()
-        stripe_js_id = ctx.get("stripe_js_id") or str(uuid.uuid4())
-        locale = ctx.get("locale") or self.profile.get("stripe_locale") or self.profile.get("locale") or "en"
         body = {
-            "elements_session_client[client_betas][0]": "custom_checkout_server_updates_1",
-            "elements_session_client[client_betas][1]": "custom_checkout_manual_approval_1",
-            "elements_session_client[elements_init_source]": "custom_checkout",
-            "elements_session_client[referrer_host]": "chatgpt.com",
-            "elements_session_client[session_id]": elements_session_id,
-            "elements_session_client[stripe_js_id]": stripe_js_id,
-            "elements_session_client[locale]": locale,
-            "elements_session_client[is_aggregation_expected]": "false",
-            "client_attribution_metadata[merchant_integration_additional_elements][0]": "payment",
-            "client_attribution_metadata[merchant_integration_additional_elements][1]": "address",
+            "eid": "NA",
             "key": stripe_pk,
-            "_stripe_version": stripe_ver,
         }
-        body.update(ctx.get("elements_options_client") or _elements_options_client_payload())
         _safe_log(self.s, "Stripe payment page address update starting")
         accumulated: dict[str, str] = {}
         for step_idx, new_fields in enumerate([
@@ -1118,8 +1160,135 @@ class GoPayRunner:
             time.sleep(random.uniform(2.0, 4.5))
         _safe_log(self.s, "Stripe payment page address update completed")
 
+    def _chatgpt_target_headers(self, path: str, *, referer: str = "") -> dict[str, str]:
+        normalized_path = str(path or "").strip() or "/"
+        headers = {
+            "x-openai-target-path": normalized_path,
+            "x-openai-target-route": normalized_path,
+            "oai-session-id": str(getattr(self, "chatgpt_oai_session_id", "") or uuid.uuid4()),
+        }
+        if referer:
+            headers["Referer"] = referer
+        return headers
+
+    def _warmup_chatgpt_checkout_context(self, cs_id: str) -> None:
+        processor_entity = self._processor_entity()
+        pricing_country = normalize_checkout_country(self.s.country or self.billing.get("country") or "ID")
+        checkout_path = f"/checkout/{processor_entity}/{cs_id}"
+        warmups = [
+            (
+                "auth_session",
+                "https://chatgpt.com/api/auth/session",
+                {"Accept": "application/json", "Referer": "https://chatgpt.com/"},
+            ),
+            (
+                "accounts_check",
+                "https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27?timezone_offset_min=-420",
+                self._chatgpt_target_headers(
+                    "/backend-api/accounts/check/v4-2023-04-27",
+                    referer="https://chatgpt.com/",
+                ),
+            ),
+            (
+                "pricing_config",
+                f"https://chatgpt.com/backend-api/checkout_pricing_config/configs/{pricing_country}",
+                self._chatgpt_target_headers(
+                    f"/backend-api/checkout_pricing_config/configs/{pricing_country}",
+                    referer="https://chatgpt.com/",
+                ),
+            ),
+            (
+                "checkout_page",
+                f"https://chatgpt.com{checkout_path}",
+                {"Accept": "text/html", "Referer": "https://chatgpt.com/"},
+            ),
+            (
+                "checkout_route_data",
+                f"https://chatgpt.com{checkout_path}.data?_routes=routes%2Fcheckout.%24entity.%24checkoutId",
+                {"Accept": "application/json", "Referer": f"https://chatgpt.com{checkout_path}"},
+            ),
+        ]
+        for name, url, headers in warmups:
+            try:
+                r = _get_chatgpt_with_profile(
+                    self.account,
+                    url,
+                    proxy=self.proxy,
+                    profile=self.profile,
+                    extra_headers=headers,
+                )
+                _safe_log(self.s, f"ChatGPT checkout warmup {name}: {r.status_code}")
+            except Exception as exc:
+                _safe_log(self.s, f"ChatGPT checkout warmup {name} skipped: {exc}")
+
+    def _chatgpt_cookie_header(self) -> str:
+        return str(_build_chatgpt_headers(self.account).get("Cookie") or "").strip()
+
+    def _chatgpt_device_id(self) -> str:
+        cookie_header = self._chatgpt_cookie_header()
+        return str(_extract_oai_did(cookie_header) or "").strip()
+
+    def _checkout_sentinel_token(self, cs_id: str) -> str:
+        processor_entity = self._processor_entity()
+        checkout_url = f"https://chatgpt.com/checkout/{processor_entity}/{cs_id}"
+        cookie_header = self._chatgpt_cookie_header()
+        device_id = self._chatgpt_device_id()
+        viewport = str(self.profile.get("viewport") or "").lower().replace(" ", "")
+        viewport_width = viewport_height = None
+        if "x" in viewport:
+            left, _, right = viewport.partition("x")
+            try:
+                viewport_width = int(left)
+                viewport_height = int(right)
+            except Exception:
+                viewport_width = viewport_height = None
+        try:
+            from services.chatgpt_core.sentinel_browser import get_sentinel_token_via_browser
+
+            token = get_sentinel_token_via_browser(
+                flow="chatgpt_checkout",
+                proxy=self.proxy,
+                page_url=checkout_url,
+                headless=True,
+                device_id=device_id or None,
+                user_agent=str(self.profile.get("ua") or ""),
+                accept_language=str(self.profile.get("accept_language") or "id-ID,id;q=0.9,en-US;q=0.8"),
+                viewport_width=viewport_width,
+                viewport_height=viewport_height,
+                cookie_header=cookie_header,
+                log_fn=lambda msg: _safe_log(self.s, f"checkout sentinel: {msg}"),
+            )
+            if token:
+                _safe_log(self.s, f"ChatGPT checkout sentinel token via browser: len={len(token)}")
+                return str(token)
+        except Exception as exc:
+            _safe_log(self.s, f"ChatGPT checkout sentinel browser failed: {exc}")
+        try:
+            from services.chatgpt_core.sentinel_token import build_sentinel_token
+
+            sentinel_session = cffi_requests.Session(impersonate=str(self.profile.get("impersonate") or "chrome146"))
+            proxies = build_requests_proxy_config(self.proxy or None)
+            if proxies:
+                sentinel_session.proxies = proxies
+            token = build_sentinel_token(
+                sentinel_session,
+                device_id or str(uuid.uuid4()),
+                flow="chatgpt_checkout",
+                user_agent=str(self.profile.get("ua") or ""),
+                impersonate=str(self.profile.get("impersonate") or "chrome146"),
+            )
+            if token:
+                _safe_log(self.s, f"ChatGPT checkout sentinel token via HTTP PoW: len={len(token)}")
+                return str(token)
+        except Exception as exc:
+            _safe_log(self.s, f"ChatGPT checkout sentinel HTTP PoW failed: {exc}")
+        return ""
+
     def _chatgpt_approve(self, cs_id: str) -> dict[str, Any]:
         processor_entity = self._processor_entity()
+        checkout_referer = f"https://chatgpt.com/checkout/{processor_entity}/{cs_id}"
+        self._warmup_chatgpt_checkout_context(cs_id)
+        sentinel_token = self._checkout_sentinel_token(cs_id)
         try:
             _post_chatgpt_with_profile(
                 self.account,
@@ -1130,34 +1299,61 @@ class GoPayRunner:
             )
         except Exception as exc:
             _safe_log(self.s, f"sentinel ping skipped: {exc}")
-        r = _post_chatgpt_with_profile(
-            self.account,
-            "https://chatgpt.com/backend-api/payments/checkout/approve",
-            json_body={"checkout_session_id": cs_id, "processor_entity": processor_entity},
-            proxy=self.proxy,
-            profile=self.profile,
-            extra_headers={"Referer": f"https://chatgpt.com/checkout/{processor_entity}/{cs_id}"},
-        )
-        r.raise_for_status()
-        try:
-            payload = r.json() or {}
-        except Exception:
-            payload = {"raw": (r.text or "")[:500]}
-        result = payload.get("result") if isinstance(payload, dict) else None
-        if result != "approved":
-            summary = {
-                "status_code": r.status_code,
-                "keys": list(payload.keys())[:20] if isinstance(payload, dict) else [],
-                "result": result,
-                "response": payload,
-            }
-            _safe_log(self.s, f"ChatGPT approve response: {_safe_json_summary(summary)}")
+        last_payload: dict[str, Any] = {}
+        last_status = 0
+        for attempt in range(1, 4):
+            approve_headers = self._chatgpt_target_headers(
+                "/backend-api/payments/checkout/approve",
+                referer=checkout_referer,
+            )
+            if sentinel_token:
+                approve_headers["openai-sentinel-token"] = sentinel_token
+            r = _post_chatgpt_with_profile(
+                self.account,
+                "https://chatgpt.com/backend-api/payments/checkout/approve",
+                json_body={"checkout_session_id": cs_id, "processor_entity": processor_entity},
+                proxy=self.proxy,
+                profile=self.profile,
+                extra_headers=approve_headers,
+            )
+            last_status = int(getattr(r, "status_code", 0) or 0)
+            try:
+                payload = r.json() or {}
+            except Exception:
+                payload = {"raw": (r.text or "")[:500]}
+            last_payload = payload if isinstance(payload, dict) else {"raw": str(payload)[:500]}
+            result = last_payload.get("result") if isinstance(last_payload, dict) else None
+            _safe_log(
+                self.s,
+                (
+                    f"ChatGPT approve attempt {attempt}/3: "
+                    f"{_safe_json_summary({'status_code': last_status, 'result': result, 'response': last_payload})}"
+                ),
+            )
+            if last_status >= 400:
+                r.raise_for_status()
+            if result == "approved":
+                _safe_log(self.s, "ChatGPT checkout approved")
+                return last_payload
             if str(result or "").lower() in {"blocked", "exception"}:
-                _safe_log(self.s, "ChatGPT approve returned non-terminal state; continuing Stripe redirect polling")
-                return payload
+                if attempt < 3:
+                    time.sleep(2 + attempt * 1.5)
+                    try:
+                        _post_chatgpt_with_profile(
+                            self.account,
+                            "https://chatgpt.com/backend-api/sentinel/ping",
+                            json_body={},
+                            proxy=self.proxy,
+                            profile=self.profile,
+                        )
+                    except Exception as exc:
+                        _safe_log(self.s, f"sentinel ping retry skipped: {exc}")
+                    continue
+                raise GoPayFlowError(f"chatgpt approve blocked: result={result!r}")
             raise GoPayFlowError(f"chatgpt approve: result={result!r}")
-        _safe_log(self.s, "ChatGPT checkout approved")
-        return payload
+        raise GoPayFlowError(
+            f"chatgpt approve failed: status={last_status} response={_safe_json_summary(last_payload)}"
+        )
 
     def _confirm_requires_approval(self, payload: dict[str, Any]) -> bool:
         submission = payload.get("submission_attempt") if isinstance(payload, dict) else {}
@@ -1168,6 +1364,9 @@ class GoPayRunner:
         return "requires_approval" in raw or "requires_merchant_approval" in raw
 
     def _fetch_pm_redirect_snap_token(self, pm_url: str) -> str:
+        with self.s.lock:
+            self.s.stripe_redirect_url = str(pm_url or "").strip()
+            self.s.updated_at = _utcnow_iso()
         r = self.ext.get(pm_url, allow_redirects=False, timeout=DEFAULT_TIMEOUT)
         if r.status_code not in (301, 302, 303, 307, 308):
             raise GoPayFlowError(f"pm-redirects: expected redirect, got {r.status_code}")
@@ -1175,6 +1374,10 @@ class GoPayRunner:
         m = re.search(r"app\.midtrans\.com/snap/v[14]/redirection/([a-f0-9-]{36})", loc)
         if not m:
             raise GoPayFlowError(f"pm-redirects: no midtrans token in Location={loc!r}")
+        with self.s.lock:
+            self.s.midtrans_redirect_url = str(loc or "").strip() or _midtrans_redirection_url(m.group(1))
+            self.s.payment_platform_url = self.s.midtrans_redirect_url
+            self.s.updated_at = _utcnow_iso()
         return m.group(1)
 
     def _extract_redirect_url(self, payload: dict[str, Any]) -> str:
@@ -1205,21 +1408,13 @@ class GoPayRunner:
             _safe_log(self.s, f"Midtrans snap token resolved from confirm: {snap_token}")
             return snap_token
         ctx = dict(ctx or {})
-        stripe_ver = ctx.get("stripe_version") or STRIPE_VERSION_FULL
+        stripe_ver = ctx.get("stripe_version") or STRIPE_VERSION_HOSTED
         deadline = time.time() + 60
         params = {
-            "elements_session_client[client_betas][0]": "custom_checkout_server_updates_1",
-            "elements_session_client[client_betas][1]": "custom_checkout_manual_approval_1",
-            "elements_session_client[elements_init_source]": "custom_checkout",
-            "elements_session_client[referrer_host]": "chatgpt.com",
-            "elements_session_client[session_id]": ctx.get("elements_session_id") or f"elements_session_{uuid.uuid4().hex[:11]}",
-            "elements_session_client[stripe_js_id]": ctx.get("stripe_js_id") or str(uuid.uuid4()),
-            "elements_session_client[locale]": ctx.get("locale") or self.profile.get("stripe_locale") or "en",
-            "elements_session_client[is_aggregation_expected]": "false",
+            "eid": "NA",
             "key": stripe_pk,
             "_stripe_version": stripe_ver,
         }
-        params.update(ctx.get("elements_options_client") or _elements_options_client_payload())
         last_err = ""
         poll_i = 0
         while time.time() < deadline:
@@ -1326,7 +1521,7 @@ class GoPayRunner:
             raise GoPayFlowError(f"midtrans linking unexpected status={r.status_code} body={r.text[:300]}")
         raise GoPayFlowError(f"midtrans linking exhausted retries: {last_err}")
 
-    def start_until_otp(self, phone_country_code: str, phone_number: str) -> None:
+    def _prepare_gopay_platform_redirect(self) -> dict[str, Any]:
         _set_phase(self.s, PHASE_STARTING)
         cs_id = self._resolve_checkout()
         stripe_pk = self._fetch_publishable_key(cs_id)
@@ -1334,6 +1529,9 @@ class GoPayRunner:
         checkout_amount, _amount_source = self._checkout_amount_from_init(init_resp)
         if str(checkout_amount or "").strip() == "34900000":
             raise GoPayFlowError("该账号无试用资格")
+        method_types = [str(item or "").strip().lower() for item in (init_ctx.get("payment_method_types") or [])]
+        if method_types and "gopay" not in method_types:
+            raise GoPayFlowError(f"当前 checkout 不支持 GoPay: {', '.join(method_types)}")
         now_ms = int(time.time() * 1000)
         init_ctx.update({
             "guid": uuid.uuid4().hex,
@@ -1341,7 +1539,7 @@ class GoPayRunner:
             "sid": uuid.uuid4().hex,
             "page_load_ts": now_ms,
             "time_on_page": self.profile.get("time_on_page") or random.randint(18000, 76000),
-            "runtime_version": ((getattr(self.account, "extra", {}) or {}).get("gopay_runtime") or {}).get("version") or DEFAULT_STRIPE_RUNTIME_VERSION,
+            "runtime_version": (_account_extra(self.account).get("gopay_runtime") or {}).get("version") or DEFAULT_STRIPE_RUNTIME_VERSION,
             "top_checkout_config_id": init_ctx.get("config_id", ""),
             "payment_method_checkout_config_id": init_ctx.get("config_id", ""),
         })
@@ -1361,6 +1559,53 @@ class GoPayRunner:
                 f"ChatGPT approve skipped: submission={state!r} setup_intent={setup_status!r}",
             )
         snap_token = self._follow_redirect_to_midtrans(cs_id, stripe_pk, confirm_data, init_ctx)
+        platform_url = self.s.payment_platform_url or self.s.midtrans_redirect_url or _midtrans_redirection_url(snap_token)
+        with self.s.lock:
+            self.s.snap_token = snap_token
+            self.s.payment_platform_url = platform_url
+            if not self.s.midtrans_redirect_url:
+                self.s.midtrans_redirect_url = platform_url
+            self.s.updated_at = _utcnow_iso()
+        return {
+            "checkout_session_id": cs_id,
+            "stripe_publishable_key_prefix": stripe_pk[:28] + "..." if stripe_pk else "",
+            "stripe_version": stripe_ver,
+            "checkout_amount": checkout_amount,
+            "checkout_amount_text": _normalize_checkout_amount_value(checkout_amount),
+            "currency": str(init_ctx.get("currency") or init_resp.get("currency") or self.s.currency or "").lower(),
+            "payment_method_types": init_ctx.get("payment_method_types") or [],
+            "snap_token": snap_token,
+            "stripe_redirect_url": self.s.stripe_redirect_url,
+            "midtrans_redirect_url": self.s.midtrans_redirect_url,
+            "payment_platform_url": self.s.payment_platform_url,
+        }
+
+    def start_until_provider_link(self) -> dict[str, Any]:
+        redirect_result = self._prepare_gopay_platform_redirect()
+        snap_token = str(redirect_result.get("snap_token") or "")
+        self._midtrans_load_transaction(snap_token)
+        with self.s.lock:
+            self.s.result = {
+                "state": "provider_link_ready",
+                "checkout_session_id": redirect_result.get("checkout_session_id") or self.s.cs_id,
+                "payment_platform_url": self.s.payment_platform_url,
+                "midtrans_redirect_url": self.s.midtrans_redirect_url,
+                "stripe_redirect_url": self.s.stripe_redirect_url,
+                "snap_token": self.s.snap_token,
+                "payment_method_types": redirect_result.get("payment_method_types") or [],
+                "checkout_amount": redirect_result.get("checkout_amount"),
+                "checkout_amount_text": redirect_result.get("checkout_amount_text") or "",
+                "currency": redirect_result.get("currency") or "",
+                "stripe_publishable_key_prefix": redirect_result.get("stripe_publishable_key_prefix") or "",
+                "stripe_version": redirect_result.get("stripe_version") or "",
+            }
+        _set_phase(self.s, PHASE_PROVIDER_LINK_READY)
+        _safe_log(self.s, f"GoPay payment platform link ready: {self.s.payment_platform_url}")
+        return dict(self.s.result or {})
+
+    def start_until_otp(self, phone_country_code: str, phone_number: str) -> None:
+        redirect_result = self._prepare_gopay_platform_redirect()
+        snap_token = str(redirect_result.get("snap_token") or "")
         self._midtrans_load_transaction(snap_token)
         reference_id = self._midtrans_init_linking(snap_token, phone_country_code, phone_number)
         self._gopay_validate_reference(reference_id)
@@ -1664,6 +1909,51 @@ def create_gopay_session(
             _set_phase(session, PHASE_FAILED, error=error)
 
     threading.Thread(target=_worker, daemon=True).start()
+    return _snapshot(session)
+
+
+def create_gopay_provider_link(
+    account: Any,
+    *,
+    account_id: int = 0,
+    plan: str = "plus",
+    country: str = DEFAULT_CHECKOUT_COUNTRY,
+    currency: str = DEFAULT_CHECKOUT_CURRENCY,
+    proxy: str = "",
+    checkout_url: str = "",
+    billing: Optional[dict[str, Any]] = None,
+    proxy_source: str = "registration",
+    browser_profile: Optional[dict[str, Any]] = None,
+    return_on_error: bool = False,
+) -> dict[str, Any]:
+    if str(plan or "plus").strip().lower() != "plus":
+        raise GoPayFlowError("GoPay 当前仅支持 Plus 订阅")
+    checkout_url = str(checkout_url or "").strip()
+    if checkout_url:
+        parse_checkout_url(checkout_url)
+    session = GoPaySession(
+        session_id=f"gplink_{uuid.uuid4().hex}",
+        account_id=int(account_id or 0),
+        email=str(getattr(account, "email", "") or ""),
+        plan="plus",
+        country=normalize_checkout_country(country),
+        currency=normalize_checkout_currency(currency, country),
+        proxy=str(proxy or ""),
+        proxy_source=str(proxy_source or "registration"),
+        checkout_url=checkout_url,
+        billing=dict(billing or {}),
+        browser_profile=dict(browser_profile or {}),
+    )
+    runner = GoPayRunner(session, account)
+    _set_runner(session, runner)
+    try:
+        runner.start_until_provider_link()
+    except Exception as exc:
+        error = str(exc).strip() or exc.__class__.__name__
+        _safe_log(session, f"GoPay provider link failed: {error}")
+        _set_phase(session, PHASE_FAILED, error=error)
+        if not return_on_error:
+            raise
     return _snapshot(session)
 
 

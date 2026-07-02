@@ -90,6 +90,18 @@ class _RetryCreateAdapter:
         }
 
 
+class _CaptureContextAdapter:
+    def __init__(self):
+        self.context = None
+
+    def run(self, context):
+        self.context = context
+        return mock.Mock(success=True)
+
+    def build_account(self, result, fallback_password):
+        return {"success": True, "password": fallback_password}
+
+
 class ChatGPTPluginTests(unittest.TestCase):
     def test_custom_provider_rejects_blank_email(self):
         platform = ChatGPTPlatform(
@@ -217,6 +229,38 @@ class ChatGPTPluginTests(unittest.TestCase):
             platform.register()
 
         self.assertEqual(mailbox.get_email_calls, 1)
+
+    def test_direct_mode_ignores_stale_explicit_proxy(self):
+        mailbox = _TrackingMailbox()
+        log_messages = []
+        platform = ChatGPTPlatform(
+            config=RegisterConfig(
+                proxy="http://host.docker.internal:11011",
+                extra={
+                    "chatgpt_registration_mode": "refresh_token",
+                    "__register_proxy_mode": "direct",
+                },
+            ),
+            mailbox=mailbox,
+        )
+        platform._log_fn = log_messages.append
+        adapter = _CaptureContextAdapter()
+
+        with mock.patch(
+            "services.chatgpt_core.plugin.build_chatgpt_registration_mode_adapter",
+            return_value=adapter,
+        ), mock.patch(
+            "services.chatgpt_core.plugin.resolve_runtime_proxy",
+            return_value="http://proxy.example:8080",
+        ) as resolve_proxy:
+            result = platform.register()
+
+        self.assertTrue(result["success"])
+        resolve_proxy.assert_not_called()
+        self.assertIsNotNone(adapter.context)
+        self.assertEqual(adapter.context.proxy_url, "")
+        self.assertIn("[代理] 已选择直连模式，忽略显式代理配置", log_messages)
+        self.assertIn("[代理] ChatGPT 注册核心链路 proxy=direct", log_messages)
 
 
 if __name__ == "__main__":

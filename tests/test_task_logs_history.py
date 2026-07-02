@@ -31,6 +31,7 @@ class TaskLogHistoryTests(unittest.TestCase):
         with Session(self.engine) as session:
             row = TaskLog(
                 id=log_id,
+                task_id=task_id,
                 platform="chatgpt",
                 email=email,
                 status=status,

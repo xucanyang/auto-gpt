@@ -1,8 +1,11 @@
-import type { CSSProperties } from 'react'
+import type { CSSProperties, ReactNode } from 'react'
+import { useState } from 'react'
 import { Button, Dropdown, Popconfirm } from 'antd'
 import type { MenuProps } from 'antd'
 import {
   DeleteOutlined,
+  CreditCardOutlined,
+  DatabaseOutlined,
   DownOutlined,
   DownloadOutlined,
   LinkOutlined,
@@ -17,8 +20,9 @@ import { ActiveTasksPanel } from './ActiveTasksPanel'
 
 type AccountsToolbarProps = {
   total: number
-  accountsCount: number
+  accountsCount?: number
   selectedRowKeys: React.Key[]
+  columnVisibilityControl?: ReactNode
   activeTasksLoading: boolean
   activeTasks: any[]
   onOpenTaskSnapshot: (snapshot: any) => void
@@ -29,9 +33,13 @@ type AccountsToolbarProps = {
   batchPaymentLinkLoading: boolean
   batchInvalidRecheckLoading: boolean
   phoneBindingTestLoading: boolean
+  paypalBindingLoading: boolean
+  baxiCdkSubmitLoading: boolean
   onBatchPaymentLink: (options?: { forceRefresh?: boolean }) => void
   onBatchInvalidRecheck: () => void
   onOpenPhoneBindingTest: () => void
+  onOpenPaypalBinding: () => void
+  onOpenBaxiCdkSubmit: () => void
   onOpenBatchGopay: () => void
   onOpenBusinessDeferred: () => void
   deleteInvalidLoading: boolean
@@ -57,8 +65,8 @@ type AccountsToolbarProps = {
 
 export function AccountsToolbar({
   total,
-  accountsCount,
   selectedRowKeys,
+  columnVisibilityControl,
   activeTasksLoading,
   activeTasks,
   onOpenTaskSnapshot,
@@ -69,9 +77,13 @@ export function AccountsToolbar({
   batchPaymentLinkLoading,
   batchInvalidRecheckLoading,
   phoneBindingTestLoading,
+  paypalBindingLoading,
+  baxiCdkSubmitLoading,
   onBatchPaymentLink,
   onBatchInvalidRecheck,
   onOpenPhoneBindingTest,
+  onOpenPaypalBinding,
+  onOpenBaxiCdkSubmit,
   onOpenBatchGopay,
   onOpenBusinessDeferred,
   deleteInvalidLoading,
@@ -94,37 +106,13 @@ export function AccountsToolbar({
   backfillLoading,
   isMobile = false,
 }: AccountsToolbarProps) {
-  const toolbarStyle: CSSProperties = {
-    display: 'flex',
-    justifyContent: 'space-between',
-    gap: isMobile ? 10 : 12,
-    flexWrap: 'wrap',
-    alignItems: 'flex-start',
-  }
-  const controlsStyle: CSSProperties = {
-    display: 'flex',
-    flexWrap: 'wrap',
-    gap: 8,
-    justifyContent: isMobile ? 'stretch' : 'flex-end',
-    width: isMobile ? '100%' : undefined,
-    flex: isMobile ? '1 1 100%' : undefined,
-  }
+  const [mobileOpsOpen, setMobileOpsOpen] = useState(false)
   const buttonStyle: CSSProperties = isMobile
     ? { flex: '1 1 calc(50% - 4px)', minWidth: 132 }
     : {}
-  const groupStyle: CSSProperties = {
-    display: 'flex',
-    flexWrap: 'wrap',
-    gap: 8,
-    alignItems: 'center',
-    justifyContent: isMobile ? 'stretch' : 'flex-end',
-    width: isMobile ? '100%' : undefined,
-  }
-  const separatedGroupStyle: CSSProperties = {
-    ...groupStyle,
-    paddingLeft: isMobile ? 0 : 10,
-    borderLeft: isMobile ? undefined : '1px solid rgba(127,127,127,0.18)',
-  }
+  const activeTasksStyle: CSSProperties = isMobile
+    ? { flex: '1 1 100%', width: '100%', minWidth: 0 }
+    : { minWidth: 210 }
   const paymentLinkDisabled = selectedRowKeys.length === 0 && total === 0
   const paymentLinkMenuItems: MenuProps['items'] = [
     {
@@ -138,36 +126,43 @@ export function AccountsToolbar({
       disabled: paymentLinkDisabled,
     },
   ]
+  const showOperationGroups = !isMobile || mobileOpsOpen
 
   return (
-    <div style={{ marginBottom: isMobile ? 12 : 16, flexShrink: 0 }}>
-      <div style={toolbarStyle}>
-        <div style={{ minWidth: 0 }}>
+    <div className={`accounts-toolbar ${isMobile ? 'accounts-toolbar-mobile' : ''}`}>
+      <div className="accounts-toolbar-head">
+        <div className="accounts-toolbar-title">
           <h1 style={{ fontSize: isMobile ? 20 : 24, fontWeight: 'bold', margin: 0 }}>ChatGPT 账号</h1>
-          <p style={{ color: '#7a8ba3', marginTop: 4, fontSize: isMobile ? 12 : 14 }}>
-            当前展示 {accountsCount} 个账号，共 {total} 个
-          </p>
         </div>
-        <div style={controlsStyle}>
-          <div style={groupStyle}>
-            <Button block={isMobile} style={buttonStyle} type="primary" icon={<PlusOutlined />} onClick={onOpenRegister}>注册</Button>
-            <Button block={isMobile} style={buttonStyle} icon={<PlusOutlined />} onClick={onOpenAdd}>新增</Button>
-            <Button block={isMobile} style={buttonStyle} icon={<UploadOutlined />} onClick={onOpenImport}>导入</Button>
-            <Button block={isMobile} style={buttonStyle} icon={<DownloadOutlined />} onClick={onExportCsv} disabled={accountsCount === 0}>导出</Button>
-            <Button block={isMobile} style={buttonStyle} icon={<ReloadOutlined spin={loading} />} onClick={onRefresh}>
-              {isMobile ? '刷新' : null}
+        <div className="accounts-toolbar-primary-actions">
+          <Button block={isMobile} style={buttonStyle} type="primary" icon={<PlusOutlined />} onClick={onOpenRegister}>注册</Button>
+          <Button block={isMobile} style={buttonStyle} icon={<PlusOutlined />} onClick={onOpenAdd}>新增</Button>
+          <Button block={isMobile} style={buttonStyle} icon={<UploadOutlined />} onClick={onOpenImport}>导入</Button>
+          <Button block={isMobile} style={buttonStyle} icon={<DownloadOutlined />} onClick={onExportCsv} disabled={total === 0}>导出</Button>
+          <Button block={isMobile} style={buttonStyle} icon={<ReloadOutlined spin={loading} />} onClick={onRefresh}>
+            {isMobile ? '刷新' : null}
+          </Button>
+          {isMobile ? (
+            <Button block style={buttonStyle} onClick={() => setMobileOpsOpen((value) => !value)}>
+              {mobileOpsOpen ? '收起批量' : '批量操作'}
             </Button>
-            <ActiveTasksPanel
-              loading={activeTasksLoading}
-              items={activeTasks}
-              onRefresh={onRefreshActiveTasks}
-              onOpen={onActiveTasksOpen}
-              onOpenTaskSnapshot={onOpenTaskSnapshot}
-              style={isMobile ? { flex: '1 1 100%', width: '100%', minWidth: 0 } : undefined}
-            />
-          </div>
-          {isChatgptPlatform && (
-            <div style={separatedGroupStyle}>
+          ) : null}
+          <ActiveTasksPanel
+            loading={activeTasksLoading}
+            items={activeTasks}
+            onRefresh={onRefreshActiveTasks}
+            onOpen={onActiveTasksOpen}
+            onOpenTaskSnapshot={onOpenTaskSnapshot}
+            style={activeTasksStyle}
+          />
+        </div>
+      </div>
+
+      {showOperationGroups ? (
+        <div className="accounts-toolbar-ops">
+          <span className="accounts-toolbar-total">总数：{total}</span>
+          {isChatgptPlatform ? (
+            <>
               <Dropdown menu={{ items: statusSyncMenuItems, onClick: onStatusSyncClick }}>
                 <Button
                   block={isMobile}
@@ -178,6 +173,7 @@ export function AccountsToolbar({
                   状态同步
                 </Button>
               </Dropdown>
+              {columnVisibilityControl ? <div className="accounts-toolbar-column-control">{columnVisibilityControl}</div> : null}
               <Dropdown menu={{ items: resumeAuthMenuItems, onClick: onResumeAuthClick }}>
                 <Button
                   block={isMobile}
@@ -198,6 +194,7 @@ export function AccountsToolbar({
                   远端补传
                 </Button>
               </Dropdown>
+
               <Button
                 block={isMobile}
                 style={buttonStyle}
@@ -214,7 +211,26 @@ export function AccountsToolbar({
                 loading={phoneBindingTestLoading}
                 onClick={onOpenPhoneBindingTest}
               >
-                号码绑定测试
+                手机号绑定
+              </Button>
+              <Button
+                block={isMobile}
+                style={buttonStyle}
+                icon={paypalBindingLoading ? <SyncOutlined spin /> : <CreditCardOutlined />}
+                loading={paypalBindingLoading}
+                onClick={onOpenPaypalBinding}
+              >
+                PayPal绑定
+              </Button>
+
+              <Button
+                block={isMobile}
+                style={buttonStyle}
+                icon={baxiCdkSubmitLoading ? <SyncOutlined spin /> : <DatabaseOutlined />}
+                loading={baxiCdkSubmitLoading}
+                onClick={onOpenBaxiCdkSubmit}
+              >
+                pix卡密提交
               </Button>
               <Dropdown
                 disabled={paymentLinkDisabled || batchPaymentLinkLoading}
@@ -233,6 +249,7 @@ export function AccountsToolbar({
                   批量订阅链接 <DownOutlined />
                 </Button>
               </Dropdown>
+
               <Button
                 block={isMobile}
                 style={buttonStyle}
@@ -245,33 +262,32 @@ export function AccountsToolbar({
               <Button block={isMobile} style={buttonStyle} icon={<LinkOutlined />} onClick={onOpenBusinessDeferred}>
                 Business 补激活
               </Button>
-            </div>
-          )}
-          <div style={separatedGroupStyle}>
-            <Popconfirm
-              title="确认删除当前平台的全部无效账号？"
-              description="只会删除 status=invalid 的账号，操作不可恢复。"
-              onConfirm={onDeleteInvalid}
+            </>
+          ) : null}
+
+          <Popconfirm
+            title="确认删除当前平台的全部无效账号？"
+            description="只会删除 status=invalid 的账号，操作不可恢复。"
+            onConfirm={onDeleteInvalid}
+          >
+            <Button
+              block={isMobile}
+              style={buttonStyle}
+              danger
+              icon={<DeleteOutlined />}
+              loading={deleteInvalidLoading}
+              disabled={total === 0}
             >
-              <Button
-                block={isMobile}
-                style={buttonStyle}
-                danger
-                icon={<DeleteOutlined />}
-                loading={deleteInvalidLoading}
-                disabled={total === 0}
-              >
-                一键删无效
-              </Button>
+              一键删无效
+            </Button>
+          </Popconfirm>
+          {selectedRowKeys.length > 0 ? (
+            <Popconfirm title={`确认删除选中的 ${selectedRowKeys.length} 个账号？`} onConfirm={onBatchDelete}>
+              <Button block={isMobile} style={buttonStyle} danger icon={<DeleteOutlined />}>删除 {selectedRowKeys.length} 个</Button>
             </Popconfirm>
-            {selectedRowKeys.length > 0 && (
-              <Popconfirm title={`确认删除选中的 ${selectedRowKeys.length} 个账号？`} onConfirm={onBatchDelete}>
-                <Button block={isMobile} style={buttonStyle} danger icon={<DeleteOutlined />}>删除 {selectedRowKeys.length} 个</Button>
-              </Popconfirm>
-            )}
-          </div>
+          ) : null}
         </div>
-      </div>
+      ) : null}
     </div>
   )
 }

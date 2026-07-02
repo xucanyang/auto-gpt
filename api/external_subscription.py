@@ -121,14 +121,42 @@ def _is_zero_amount(value: Any) -> bool:
     text = str(value if value is not None else "").strip()
     if not text:
         return False
-    try:
-        return Decimal(text) == 0
-    except (InvalidOperation, ValueError):
-        return text in {"0", "0.0", "0.00"}
+    normalized = text.replace(",", "").strip()
+    candidates = [normalized]
+    parts = normalized.split()
+    if parts:
+        candidates.extend([parts[0], parts[-1]])
+    for candidate in candidates:
+        token = str(candidate or "").strip().strip("$")
+        if not token:
+            continue
+        try:
+            return Decimal(token) == 0
+        except (InvalidOperation, ValueError):
+            continue
+    return normalized.upper() in {"0", "0.0", "0.00", "0 USD", "0.0 USD", "0.00 USD", "$0", "$0.00"}
 
 
 def _now_id(prefix: str) -> str:
     return f"{prefix}_{_utcnow().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:10]}"
+
+
+def _looks_like_paypal_url(value: Any) -> bool:
+    text = str(value or "").strip().lower()
+    if not text:
+        return False
+    return (
+        "ba_token=" in text
+        or ("paypal." in text and "/agreements/approve" in text)
+        or ("paypal.com" in text and "approve" in text)
+    )
+
+
+def _currency_from_amount_text(value: Any) -> str:
+    text = str(value or "").strip().upper()
+    if "USD" in text or "$" in text:
+        return "USD"
+    return ""
 
 
 def _external_api_enabled() -> bool:
@@ -180,8 +208,86 @@ class ReleaseSubscriptionLinkRequest(BaseModel):
 def _payment_link_from_account(account: AccountModel) -> dict[str, Any]:
     extra = account.get_extra()
     cached = extra.get("chatgpt_last_payment_link") if isinstance(extra.get("chatgpt_last_payment_link"), dict) else {}
+    paypal = extra.get("chatgpt_paypal_url") if isinstance(extra.get("chatgpt_paypal_url"), dict) else {}
+    legacy_approval = (
+        extra.get("chatgpt_oaipay_approval")
+        if isinstance(extra.get("chatgpt_oaipay_approval"), dict)
+        else {}
+    )
+    paypal_url = str(
+        paypal.get("paypal_url")
+        or paypal.get("url")
+        or paypal.get("approval_url")
+        or legacy_approval.get("paypal_url")
+        or legacy_approval.get("approval_url")
+        or legacy_approval.get("provider_redirect_url")
+        or legacy_approval.get("long_url")
+        or cached.get("paypal_url")
+        or (
+            cached.get("url")
+            if str(cached.get("payment_link_format") or "").strip().lower() == "paypal_url"
+            or _looks_like_paypal_url(cached.get("url"))
+            else ""
+        )
+        or ""
+    ).strip()
+    if paypal_url:
+        amount_text = str(paypal.get("checkout_amount") or legacy_approval.get("checkout_amount") or cached.get("checkout_amount") or "").strip()
+        currency = str(paypal.get("currency") or legacy_approval.get("currency") or cached.get("currency") or _currency_from_amount_text(amount_text) or SENDABLE_CURRENCY).strip().upper()
+        source = str(paypal.get("source") or legacy_approval.get("upstream") or legacy_approval.get("source") or cached.get("source") or "").strip()
+        payload: dict[str, Any] = {
+            "url": paypal_url,
+            "paypal_url": paypal_url,
+            "plan": normalize_payment_link_plan(paypal.get("plan") or cached.get("plan") or "plus"),
+            "country": str(paypal.get("country") or paypal.get("billing_country") or legacy_approval.get("billing_country") or cached.get("country") or "US").strip().upper() or "US",
+            "currency": currency or SENDABLE_CURRENCY,
+            "proxy": str(paypal.get("proxy") or cached.get("proxy") or "").strip(),
+            "payment_link_format": "paypal_url",
+            "link_type": str(paypal.get("link_type") or legacy_approval.get("link_type") or "paypal").strip() or "paypal",
+            "source": source,
+            "created_at": str(paypal.get("created_at") or legacy_approval.get("created_at") or legacy_approval.get("updated_at") or "").strip(),
+            "upstream": source,
+        }
+        if amount_text:
+            payload["checkout_amount"] = amount_text
+            payload["checkout_amount_is_zero"] = _is_zero_amount(amount_text)
+        elif "checkout_amount_is_zero" in paypal:
+            payload["checkout_amount_is_zero"] = _parse_bool(paypal.get("checkout_amount_is_zero"), default=False)
+        elif "checkout_amount_is_zero" in cached:
+            payload["checkout_amount_is_zero"] = _parse_bool(cached.get("checkout_amount_is_zero"), default=False)
+        else:
+            payload["checkout_amount_is_zero"] = True
+        for key in (
+            "cs_id",
+            "payment_method_id",
+            "payment_method_type",
+            "processor_entity",
+            "payment_locale",
+            "provider_redirect_url",
+            "long_url",
+            "stripe_redirect_url",
+            "stripe_hosted_url",
+            "stage",
+            "status",
+            "link_status",
+            "link_status_reason",
+            "last_preflight_at",
+            "precheck_retry_after_at",
+            "verify_after_at",
+            "lease_expires_at",
+            "claim_id",
+        ):
+            if key in paypal:
+                payload[key] = paypal.get(key)
+            elif key in legacy_approval:
+                payload[key] = legacy_approval.get(key)
+            elif key in cached:
+                payload[key] = cached.get(key)
+        return payload
+
     url = str(
         cached.get("url")
+        or cached.get("paypal_url")
         or cached.get("checkout_url")
         or cached.get("cashier_url")
         or account.cashier_url
@@ -193,10 +299,12 @@ def _payment_link_from_account(account: AccountModel) -> dict[str, Any]:
     params = normalize_payment_link_params(cached)
     payload: dict[str, Any] = {
         "url": url,
+        "paypal_url": str(cached.get("paypal_url") or "").strip(),
         "plan": normalize_payment_link_plan(cached.get("plan")),
         "country": params["country"],
         "currency": params["currency"],
         "proxy": params["proxy"],
+        "payment_link_format": params.get("payment_link_format", "long_hosted"),
         "source": str(cached.get("source") or "").strip(),
         "created_at": str(cached.get("created_at") or "").strip(),
     }
@@ -249,6 +357,59 @@ def _link_is_blocked(link: dict[str, Any], now: datetime) -> bool:
 
 
 def _cached_subscription_link_preflight(link: dict[str, Any]) -> dict[str, Any]:
+    link_format = str(link.get("payment_link_format") or "").strip().lower()
+    if link_format == "paypal_url" or _looks_like_paypal_url(link.get("paypal_url") or link.get("url")):
+        currency = str(link.get("currency") or "").strip().upper()
+        amount_value = link.get("checkout_amount")
+        amount_text = str(amount_value if amount_value is not None else "").strip()
+        amount_is_zero = (
+            _parse_bool(link.get("checkout_amount_is_zero"), default=False)
+            or _is_zero_amount(amount_value)
+            or (not amount_text and currency == SENDABLE_CURRENCY)
+        )
+        if currency and currency != SENDABLE_CURRENCY:
+            return {
+                "ok_to_send": False,
+                "link_status": "not_usd",
+                "reason": f"{payment_link_status_label('not_usd')}: PayPal 链接账单货币不是 USD: {currency}",
+                "probe": {
+                    "source": "paypal_url_cache",
+                    "currency": currency.lower(),
+                    "amount_text": amount_text,
+                    "amount_is_zero": amount_is_zero,
+                    "payment_link_format": "paypal_url",
+                },
+            }
+        if not amount_is_zero:
+            return {
+                "ok_to_send": False,
+                "link_status": "amount_not_zero",
+                "reason": f"{payment_link_status_label('amount_not_zero')}: PayPal 链接账单金额不是 0: {amount_text or 'unknown'}",
+                "probe": {
+                    "source": "paypal_url_cache",
+                    "currency": (currency or SENDABLE_CURRENCY).lower(),
+                    "amount": amount_value,
+                    "amount_text": amount_text,
+                    "amount_is_zero": False,
+                    "payment_link_format": "paypal_url",
+                },
+            }
+        return {
+            "ok_to_send": True,
+            "link_status": "available",
+            "reason": "已使用缓存的 PayPal approval URL 校验结果",
+            "probe": {
+                "source": "paypal_url_cache",
+                "currency": (currency or SENDABLE_CURRENCY).lower(),
+                "amount": amount_value,
+                "amount_text": amount_text or "0",
+                "amount_is_zero": True,
+                "payment_link_format": "paypal_url",
+            },
+            "checkout_amount": amount_text or "0",
+            "checkout_amount_is_zero": True,
+        }
+
     currency = str(link.get("currency") or "").strip().upper()
     amount_seen = "checkout_amount" in link or "checkout_amount_is_zero" in link
     amount_value = link.get("checkout_amount")
@@ -302,6 +463,14 @@ def _claim_subscription_link_preflight(account: AccountModel, link: dict[str, An
     cached_preflight = _cached_subscription_link_preflight(link)
     if cached_preflight and not bool(cached_preflight.get("ok_to_send")):
         return cached_preflight
+    if (
+        cached_preflight
+        and (
+            str(link.get("payment_link_format") or "").strip().lower() == "paypal_url"
+            or _looks_like_paypal_url(link.get("paypal_url") or link.get("url"))
+        )
+    ):
+        return cached_preflight
     # A cached USD 0 amount can become stale after the checkout session is paid or expires.
     # The external claim API is the send boundary, so positive cache hits must be rechecked live.
     return _preflight_subscription_link(account, link)
@@ -334,6 +503,7 @@ def _serialize_claimed_item(account: AccountModel, link: dict[str, Any], claim: 
         "email": account.email,
         "status": account.status,
         "payment_link": link.get("url") or "",
+        "paypal_url": link.get("paypal_url") or link.get("url") or "",
         "plan": link.get("plan") or "plus",
         "country": link.get("country") or "",
         "currency": link.get("currency") or "",
@@ -343,7 +513,7 @@ def _serialize_claimed_item(account: AccountModel, link: dict[str, Any], claim: 
         "lease_expires_at": claim.get("lease_expires_at") or "",
         "verify_after_at": claim.get("verify_after_at") or "",
     }
-    for key in ("checkout_amount", "checkout_amount_is_zero", "source", "created_at", "billing"):
+    for key in ("checkout_amount", "checkout_amount_is_zero", "source", "created_at", "billing", "payment_link_format", "upstream", "link_type"):
         if key in link:
             item[key] = link.get(key)
     return item
@@ -359,6 +529,7 @@ def _claim_row_to_dict(row: ExternalSubscriptionClaimModel) -> dict[str, Any]:
         "lease_expires_at": row.lease_expires_at,
         "verify_after_at": row.verify_after_at,
         "payment_link": row.payment_link,
+        "paypal_url": details.get("paypal_url") or row.payment_link,
         "plan": row.plan,
         "country": row.country,
         "currency": row.currency,
@@ -373,6 +544,9 @@ def _claim_row_to_dict(row: ExternalSubscriptionClaimModel) -> dict[str, Any]:
         "attempt": _safe_int(details.get("attempt"), 1),
         "source": "external_subscription_claims",
     }
+    for key in ("payment_link_format", "link_source", "upstream", "link_type"):
+        if details.get(key):
+            claim[key] = details.get(key)
     for key in ("precheck_expires_at", "prechecked_at", "result_written_at", "message", "error_code"):
         value = getattr(row, key, "")
         if value:
@@ -508,7 +682,17 @@ def _reserve_subscription_claim(
         precheck_expires_at=_iso(precheck_expires_at),
         claimed_at=_iso(now),
     )
-    row.set_details({"attempt": max(1, int(attempt or 1)), "precheck_seconds": DEFAULT_PRECHECK_SECONDS})
+    row.set_details(
+        {
+            "attempt": max(1, int(attempt or 1)),
+            "precheck_seconds": DEFAULT_PRECHECK_SECONDS,
+            "paypal_url": str(link.get("paypal_url") or "").strip(),
+            "payment_link_format": str(link.get("payment_link_format") or "").strip(),
+            "link_source": str(link.get("source") or "").strip(),
+            "upstream": str(link.get("upstream") or link.get("source") or "").strip(),
+            "link_type": str(link.get("link_type") or "").strip(),
+        }
+    )
     session.add(row)
     try:
         session.commit()
@@ -581,6 +765,27 @@ def _mark_link_status(
     if updates:
         link.update({key: value for key, value in updates.items() if value is not None})
     extra["chatgpt_last_payment_link"] = link
+    paypal = extra.get("chatgpt_paypal_url") if isinstance(extra.get("chatgpt_paypal_url"), dict) else {}
+    if paypal:
+        paypal_url = str(paypal.get("paypal_url") or paypal.get("url") or "").strip()
+        link_url = str(link.get("paypal_url") or link.get("url") or "").strip()
+        if not paypal_url or not link_url or paypal_url == link_url:
+            paypal.update({key: value for key, value in link.items() if key in {
+                "link_status",
+                "link_status_reason",
+                "link_status_updated_at",
+                "last_preflight_probe",
+                "checkout_amount",
+                "checkout_amount_is_zero",
+                "currency",
+                "claim_id",
+                "consumer",
+                "lease_expires_at",
+                "verify_after_at",
+                "last_preflight_at",
+                "precheck_retry_after_at",
+            }})
+            extra["chatgpt_paypal_url"] = paypal
     return link
 
 

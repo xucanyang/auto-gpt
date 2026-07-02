@@ -10,9 +10,12 @@ from sqlmodel import Session
 from core import db as core_db
 from core.db import AccountModel
 from core.config_store import config_store
+from core.proxy_utils import normalize_proxy_url
 from core.task_runtime import TaskInterruption
 from services.chatgpt_account_state import apply_auth_capture_status, classify_chatgpt_capabilities
+from services.chatgpt_core.task_logging import redact_log_text, redact_proxy_url, sanitize_error_message, sanitize_task_detail
 from .chatgpt_registration_mode_adapter import RefreshTokenChatGPTRegistrationAdapter
+from .local_status_refresh import schedule_chatgpt_local_status_refresh_for_account_id
 from .pending_business_invites import RestoredEmailService, _mailbox_state_from_account
 from .refresh_token_registration_engine import (
     EmailServiceAdapter,
@@ -63,11 +66,17 @@ def _to_bool(value: Any, *, default: bool = False) -> bool:
     if value is None:
         return default
     text = str(value).strip().lower()
-    if text in {"1", "true", "yes", "on"}:
+    if text in {"1", "true", "yes", "on", "y", "是", "开启", "允许", "启用"}:
         return True
-    if text in {"0", "false", "no", "off"}:
+    if text in {"0", "false", "no", "off", "n", "否", "关闭", "禁止", "禁用"}:
         return False
     return default
+
+
+def _config_bool(config: dict[str, Any], key: str, *, default: bool = False) -> bool:
+    if key not in config or config.get(key) in (None, ""):
+        return default
+    return _to_bool(config.get(key), default=default)
 
 
 def _normalize_retry_delays(value: Any, *, use_default_when_empty: bool = True) -> list[int]:
@@ -158,6 +167,8 @@ def _build_auth_capture_payload(
     allow_phone_verification: bool,
     attempts: int,
     scope: str,
+    allow_add_phone_verification: bool | None = None,
+    allow_existing_phone_verification: bool | None = None,
 ) -> dict[str, Any]:
     return {
         "ok": bool(result.success),
@@ -169,6 +180,8 @@ def _build_auth_capture_payload(
         "has_access_token": bool(result.access_token),
         "has_refresh_token": bool(result.refresh_token),
         "allow_phone_verification": bool(allow_phone_verification),
+        "allow_add_phone_verification": bool(allow_add_phone_verification) if allow_add_phone_verification is not None else bool(allow_phone_verification),
+        "allow_existing_phone_verification": bool(allow_existing_phone_verification) if allow_existing_phone_verification is not None else bool(allow_phone_verification),
         "attempts": int(attempts or 0),
         "captured_at": _utcnow().isoformat(),
         "workspace_artifacts": [
@@ -183,6 +196,23 @@ def _build_auth_capture_payload(
             if isinstance(item, dict)
         ],
     }
+
+
+def _timeline_log(
+    log_fn: Callable[[str], None] | None,
+    message: str,
+    *,
+    level: str = "info",
+) -> None:
+    if not callable(log_fn):
+        return
+    try:
+        log_fn(message)
+    except TypeError:
+        try:
+            log_fn(message, level)
+        except TypeError:
+            log_fn(message)
 
 
 def _persist_subscription_auth_result(
@@ -223,6 +253,7 @@ def _persist_subscription_auth_result(
         session.add(account)
         session.commit()
         session.refresh(account)
+        schedule_chatgpt_local_status_refresh_for_account_id(account.id, reason="subscription_auth_capture", delay_seconds=2.0)
         return {
             "status": str(account.status or ""),
             "user_id": str(account.user_id or ""),
@@ -234,10 +265,14 @@ def capture_subscription_auth_for_account(
     account_id: int,
     *,
     allow_phone_verification: bool = False,
+    allow_add_phone_verification: bool | None = None,
+    allow_existing_phone_verification: bool | None = None,
     retry_delays_seconds: Sequence[int] | None = None,
     log_fn: Callable[[str], None] | None = None,
     shared_phone_service: Any = None,
     stop_checker: Callable[[], None] | None = None,
+    proxy_url: str | None = None,
+    phone_sms_probe_only: bool = False,
 ) -> dict[str, Any]:
     action_logs: list[str] = []
 
@@ -247,7 +282,7 @@ def capture_subscription_auth_for_account(
 
     def _log(message: str, level: str = "info") -> None:
         _check_stop()
-        text = str(message or "").strip()
+        text = redact_log_text(str(message or "").strip())
         if not text:
             return
         action_logs.append(text)
@@ -258,6 +293,8 @@ def capture_subscription_auth_for_account(
                 log_fn(text, level)
 
     allow_phone_verification = _to_bool(allow_phone_verification, default=False)
+    phone_sms_probe_only = _to_bool(phone_sms_probe_only, default=False)
+    proxy_url = normalize_proxy_url(proxy_url) or ""
     account_id = int(account_id or 0)
     _check_stop()
     if account_id <= 0:
@@ -269,7 +306,7 @@ def capture_subscription_auth_for_account(
                 "error_code": "invalid_account_id",
                 "retryable": False,
                 "allow_phone_verification": allow_phone_verification,
-                "logs": action_logs,
+                "logs": list(action_logs),
             },
         }
 
@@ -284,7 +321,7 @@ def capture_subscription_auth_for_account(
                     "error_code": "account_not_found",
                     "retryable": False,
                     "allow_phone_verification": allow_phone_verification,
-                    "logs": action_logs,
+                    "logs": list(action_logs),
                 },
             }
         email = str(account.email or "").strip()
@@ -301,7 +338,7 @@ def capture_subscription_auth_for_account(
                 "error_code": "missing_email",
                 "retryable": False,
                 "allow_phone_verification": allow_phone_verification,
-                "logs": action_logs,
+                "logs": list(action_logs),
             },
         }
     if not mailbox_state:
@@ -313,7 +350,7 @@ def capture_subscription_auth_for_account(
                 "error_code": "missing_mailbox_state",
                 "retryable": False,
                 "allow_phone_verification": allow_phone_verification,
-                "logs": action_logs,
+                "logs": list(action_logs),
             },
         }
 
@@ -321,10 +358,29 @@ def capture_subscription_auth_for_account(
     merged_config.update({k: v for k, v in extra.items() if v not in (None, "")})
     merged_config["_current_account_id"] = account_id
     merged_config["_current_account_email"] = email
+    merged_config["_current_task_id"] = str(merged_config.get("_current_task_id") or "")
+    if allow_add_phone_verification is None:
+        allow_add_phone_verification = _config_bool(
+            merged_config,
+            "chatgpt_resume_auth_allow_add_phone_verification",
+            default=allow_phone_verification,
+        )
+    else:
+        allow_add_phone_verification = _to_bool(allow_add_phone_verification, default=False)
+    if allow_existing_phone_verification is None:
+        allow_existing_phone_verification = _config_bool(
+            merged_config,
+            "chatgpt_resume_auth_allow_existing_phone_verification",
+            default=True,
+        )
+    else:
+        allow_existing_phone_verification = _to_bool(allow_existing_phone_verification, default=True)
     if shared_phone_service is not None:
         merged_config["_shared_phone_service"] = shared_phone_service
     if callable(stop_checker):
         merged_config["_task_stop_checker"] = stop_checker
+    if proxy_url:
+        merged_config["_runtime_proxy_url"] = proxy_url
     browser_mode = str(
         extra.get("browser_mode")
         or merged_config.get("browser_mode")
@@ -337,7 +393,14 @@ def capture_subscription_auth_for_account(
 
     _log(
         f"[补抓] 账号级 Auth 捕获开始：{email}，scope={scope}，"
-        f"allow_phone_verification={'true' if allow_phone_verification else 'false'}"
+        f"allow_phone_verification={'true' if allow_phone_verification else 'false'}，"
+        f"allow_add_phone={'true' if allow_add_phone_verification else 'false'}，"
+        f"allow_existing_phone_otp={'true' if allow_existing_phone_verification else 'false'}，"
+        f"proxy={redact_proxy_url(proxy_url) or 'direct'}"
+    )
+    _timeline_log(
+        log_fn,
+        "[补抓Auth] 开始：恢复邮箱状态并进入 OAuth 登录",
     )
 
     last_error = ""
@@ -353,10 +416,11 @@ def capture_subscription_auth_for_account(
         email_service = None
         engine_instance: RefreshTokenRegistrationEngine | None = None
         try:
+            _timeline_log(log_fn, f"[补抓Auth] 阶段 2/5：OAuth 登录并补抓完整 Auth/RT（尝试 {attempt}/{max_attempts}）")
             email_service = RestoredEmailService(state=mailbox_state, log_fn=_log)
             engine_instance = RefreshTokenRegistrationEngine(
                 email_service=email_service,
-                proxy_url=None,
+                proxy_url=proxy_url or None,
                 callback_logger=lambda msg, level="info", *_: _log(str(msg), str(level or "info")),
                 browser_mode=browser_mode,
                 extra_config=merged_config,
@@ -386,7 +450,10 @@ def capture_subscription_auth_for_account(
                 browser_fingerprint=getattr(register_client, "fingerprint", None),
                 skymail_client=email_adapter,
                 prefer_passwordless_login=True,
-                allow_phone_verification=allow_phone_verification,
+                allow_phone_verification=bool(allow_phone_verification or allow_add_phone_verification or allow_existing_phone_verification),
+                allow_add_phone_verification=allow_add_phone_verification,
+                allow_existing_phone_verification=allow_existing_phone_verification,
+                phone_sms_probe_only=phone_sms_probe_only,
                 force_new_browser=True,
                 force_chatgpt_entry=False,
                 screen_hint="login",
@@ -433,11 +500,17 @@ def capture_subscription_auth_for_account(
                 "mailbox_state": exported_mailbox_state,
                 "selected_workspace_scopes": [scope],
                 "allow_phone_verification": allow_phone_verification,
+                "allow_add_phone_verification": allow_add_phone_verification,
+                "allow_existing_phone_verification": allow_existing_phone_verification,
+                "proxy": proxy_url or "direct",
+                "proxy_redacted": redact_proxy_url(proxy_url) or "direct",
             }
 
             auth_capture = _build_auth_capture_payload(
                 result=result,
                 allow_phone_verification=allow_phone_verification,
+                allow_add_phone_verification=allow_add_phone_verification,
+                allow_existing_phone_verification=allow_existing_phone_verification,
                 attempts=attempt,
                 scope=scope,
             )
@@ -452,19 +525,20 @@ def capture_subscription_auth_for_account(
                 f"[补抓] Auth 捕获完成：account_id={result.account_id or '-'} "
                 f"workspace_id={result.workspace_id or '-'}"
             )
+            _timeline_log(log_fn, "[补抓Auth] 成功：refresh_token 已保存")
             return {
                 "ok": True,
                 "data": {
                     "message": "补抓 Auth 完成",
                     "auth_capture": auth_capture,
-                    "logs": action_logs,
+                    "logs": list(action_logs),
                 },
                 "error": "",
             }
         except TaskInterruption:
             raise
         except Exception as exc:
-            last_error = str(exc or "补抓 Auth 失败")
+            last_error = sanitize_error_message(exc or "补抓 Auth 失败")
             last_error_code, retryable = _classify_capture_error(
                 last_error,
                 allow_phone_verification=allow_phone_verification,
@@ -476,6 +550,7 @@ def capture_subscription_auth_for_account(
                 f"[补抓] 本次失败：{last_error}；等待 {delay_seconds}s 后重试 "
                 f"({attempt + 1}/{max_attempts})"
             )
+            _timeline_log(log_fn, f"[补抓Auth] 本次失败：{last_error}；等待 {delay_seconds}s 后重试")
             if delay_seconds > 0:
                 deadline = time.monotonic() + delay_seconds
                 while True:
@@ -485,26 +560,29 @@ def capture_subscription_auth_for_account(
                         break
                     time.sleep(min(1, remaining))
 
-    message = last_error or "补抓 Auth 失败"
+    message = sanitize_error_message(last_error or "补抓 Auth 失败")
     _log(f"[补抓] 失败：{message}")
+    _timeline_log(log_fn, f"[补抓Auth] 失败：{message}")
     return {
         "ok": False,
-        "error": message,
+        "error": sanitize_error_message(message),
         "data": {
             "message": message,
             "error_code": last_error_code,
             "retryable": bool(retryable),
             "allow_phone_verification": allow_phone_verification,
-            "logs": action_logs,
+            "logs": list(action_logs),
             "auth_capture": {
                 "ok": False,
                 "email": email,
                 "source": "subscription_auth_capture",
                 "scope": scope,
                 "allow_phone_verification": allow_phone_verification,
+                "allow_add_phone_verification": allow_add_phone_verification,
+                "allow_existing_phone_verification": allow_existing_phone_verification,
                 "attempts": max_attempts,
                 "error_code": last_error_code,
-                "error": message,
+                "error": sanitize_error_message(message),
             },
         },
     }

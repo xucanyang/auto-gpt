@@ -5,9 +5,11 @@
 from __future__ import annotations
 
 import logging
+import re
 import subprocess
 import sys
 import time
+import uuid
 from typing import Any, Optional
 
 from curl_cffi import requests as cffi_requests
@@ -20,6 +22,10 @@ logger = logging.getLogger(__name__)
 
 PAYMENT_CHECKOUT_URL = "https://chatgpt.com/backend-api/payments/checkout"
 TEAM_CHECKOUT_BASE_URL = "https://chatgpt.com/checkout/openai_llc/"
+PAY_OPENAI_CHECKOUT_BASE_URL = "https://pay.openai.com/c/pay/"
+PAY_OPENAI_CHECKOUT_FRAGMENT = (
+    "#fidnandhYHdWcXxpYCc%2FJ2FgY2RwaXEnKSdpamZkaWAnPyd%2FbScpJ3ZwZ3Zmd2x1cWxqa1BrbHRwYGtgdnZAa2RnaWBhJz9jZGl2YCknYnBkZmRoamlgU2R3bGRrcSc%2FJ2Zqa3F3amknKSdkdWxOYHwnPyd1blppbHNgWjA0TUp3VnJGM200a31Cakw2aVFEYldvXFN3fzFhUDZjU0pkZ3xGZk5XNnVnQE9icEZTRGl0Rn1hfUZQc2pXbTRdUnJXZGZTbGpzUDZuSU5zdW5vbTJMdG5SNTVsXVR2b2o2aycpJ2N3amhWYHdzYHcnP3F3cGApJ2dkZm5id2pwa2FGamlqdyc%2FJyZjY2NjY2MnKSdpZHxqcHFRfHVgJz8ndmxrYmlgWmxxYGgnKSdga2RnaWBVaWRmYG1qaWFgd3YnP3F3cGB4JSUl"
+)
 ACCOUNTS_CHECK_URL = "https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27"
 CHECKOUT_PRICING_COUNTRIES_URL = "https://chatgpt.com/backend-api/checkout_pricing_config/countries"
 CHECKOUT_PRICING_CONFIG_URL = "https://chatgpt.com/backend-api/checkout_pricing_config/configs/{country_code}"
@@ -27,10 +33,18 @@ DEFAULT_CHECKOUT_COUNTRY = "ID"
 DEFAULT_CHECKOUT_CURRENCY = "IDR"
 DEFAULT_CHECKOUT_PROMO_CODE = "STRIPEATLASGPT4BIZ050126"
 DEFAULT_STRIPE_PK = "pk_live_51Pj377KslHRdbaPgTJYjThzH3f5dt1N1vK7LUp0qh0yNSarhfZ6nfbG7FFlh8KLxVkvdMWN5o6Mc4Vda6NHaSnaV00C2Sbl8Zs"
+OPENAI_STRIPE_PK = "pk_live_51HOrSwC6h1nxGoI3lTAgRjYVrz4dU3fVOabyCcKR3pbEJguCVAlqCxdxCUvoRh1XWwRacViovU3kLKvpkjh7IqkW00iXQsjo3n"
+STRIPE_API = "https://api.stripe.com"
+STRIPE_VERSION_BASE = "2025-03-31.basil"
+STRIPE_VERSION_FULL = "2025-03-31.basil; checkout_server_update_beta=v1; checkout_manual_approval_preview=v1"
 CHECKOUT_CONFIG_CACHE_TTL_SECONDS = 24 * 60 * 60
+PAYMENT_LINK_FORMAT_LONG = "long_hosted"
+PAYMENT_LINK_FORMAT_SHORT = "short_chatgpt"
+DEFAULT_PAYMENT_LINK_FORMAT = PAYMENT_LINK_FORMAT_LONG
 
 _checkout_countries_cache: dict[str, Any] = {"expires_at": 0.0, "value": None}
 _checkout_pricing_config_cache: dict[str, dict[str, Any]] = {}
+_CHECKOUT_SESSION_RE = re.compile(r"(cs_(?:live|test)_[A-Za-z0-9_]+)")
 
 
 class CheckoutRequestError(RuntimeError):
@@ -43,6 +57,14 @@ class CheckoutRequestError(RuntimeError):
         if self.body:
             message = f"{message}: {self.body[:500]}"
         super().__init__(message)
+
+
+class CheckoutHostedUrlResolutionError(RuntimeError):
+    """Raised when a checkout session cannot be converted to a hosted pay URL."""
+
+
+class CustomCheckoutResolutionError(CheckoutHostedUrlResolutionError):
+    """Backward-compatible error name for custom checkout hosted URL resolution."""
 
 
 def _build_proxies(proxy: Optional[str]) -> Optional[dict]:
@@ -78,6 +100,19 @@ def normalize_checkout_currency(currency: Optional[str], country: Optional[str] 
         return value
     normalized_country = normalize_checkout_country(country)
     return _COUNTRY_CURRENCY_MAP.get(normalized_country, DEFAULT_CHECKOUT_CURRENCY)
+
+
+def normalize_payment_link_format(value: Any) -> str:
+    text = str(value or "").strip().lower().replace("-", "_")
+    if text in {"short", "short_chatgpt", "chatgpt", "custom", "custom_checkout"}:
+        return PAYMENT_LINK_FORMAT_SHORT
+    if text in {"long", "long_hosted", "hosted", "hosted_checkout", "pay_openai", "stripe_hosted"}:
+        return PAYMENT_LINK_FORMAT_LONG
+    return DEFAULT_PAYMENT_LINK_FORMAT
+
+
+def checkout_ui_mode_for_link_format(value: Any) -> str:
+    return "custom" if normalize_payment_link_format(value) == PAYMENT_LINK_FORMAT_SHORT else "hosted"
 
 
 def fetch_checkout_countries(proxy: Optional[str] = None) -> list[str]:
@@ -168,6 +203,191 @@ def _clean_str(value: Any, default: str = "") -> str:
     return text or default
 
 
+def extract_checkout_session_id(value: Any) -> str:
+    match = _CHECKOUT_SESSION_RE.search(str(value or ""))
+    return match.group(1) if match else ""
+
+
+def _checkout_hash_fragment(value: Any) -> str:
+    text = str(value or "").strip()
+    if "#" not in text:
+        return ""
+    fragment = "#" + text.split("#", 1)[1]
+    return fragment if fragment.lower().startswith("#fid") else ""
+
+
+def hosted_checkout_url_from_session_id(session_id: Any, fragment: Any = "") -> str:
+    cs_id = extract_checkout_session_id(session_id)
+    if not cs_id:
+        return ""
+    checkout_fragment = str(fragment or "").strip()
+    if checkout_fragment and not checkout_fragment.startswith("#"):
+        checkout_fragment = "#" + checkout_fragment
+    if not checkout_fragment.lower().startswith("#fid"):
+        checkout_fragment = PAY_OPENAI_CHECKOUT_FRAGMENT
+    return PAY_OPENAI_CHECKOUT_BASE_URL + cs_id + checkout_fragment
+
+
+def is_default_hosted_checkout_fragment(value: Any) -> bool:
+    return _checkout_hash_fragment(value) == PAY_OPENAI_CHECKOUT_FRAGMENT
+
+
+def chatgpt_checkout_url_from_session_id(session_id: Any, processor_entity: Any = "openai_llc") -> str:
+    cs_id = extract_checkout_session_id(session_id)
+    if not cs_id:
+        return ""
+    entity = str(processor_entity or "openai_llc").strip().strip("/") or "openai_llc"
+    return f"https://chatgpt.com/checkout/{entity}/{cs_id}"
+
+
+def _extract_processor_entity(url: Any, default: str = "openai_llc") -> str:
+    text = str(url or "").strip()
+    match = re.search(r"chatgpt\.com/checkout/([^/?#]+)/", text)
+    if match:
+        return match.group(1).strip() or default
+    return default
+
+
+def normalize_hosted_checkout_url(url: Any) -> str:
+    text = str(url or "").strip()
+    if not text:
+        return ""
+    cs_id = extract_checkout_session_id(text)
+    if not cs_id:
+        return text
+    lowered = text.lower()
+    if (
+        "chatgpt.com/checkout/" in lowered
+        or "checkout.stripe.com/c/pay/" in lowered
+        or "pay.openai.com/c/pay/" in lowered
+    ):
+        return hosted_checkout_url_from_session_id(cs_id, _checkout_hash_fragment(text))
+    return text
+
+
+def normalize_chatgpt_checkout_url(url: Any, processor_entity: Any = "openai_llc") -> str:
+    text = str(url or "").strip()
+    if not text:
+        return ""
+    cs_id = extract_checkout_session_id(text)
+    if not cs_id:
+        return text
+    entity = _extract_processor_entity(text, str(processor_entity or "openai_llc").strip() or "openai_llc")
+    return chatgpt_checkout_url_from_session_id(cs_id, entity)
+
+
+def normalize_checkout_url_for_link_format(url: Any, link_format: Any = None) -> str:
+    return normalize_hosted_checkout_url(url)
+
+
+def _stripe_headers() -> dict[str, str]:
+    return {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/146.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/json",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Origin": "https://js.stripe.com",
+        "Referer": "https://js.stripe.com/",
+    }
+
+
+def _stripe_payment_page_init_body(stripe_pk: str, stripe_version: str) -> dict[str, str]:
+    body = {
+        "browser_locale": "zh-CN",
+        "browser_timezone": "Asia/Shanghai",
+        "elements_session_client[elements_init_source]": "custom_checkout",
+        "elements_session_client[referrer_host]": "chatgpt.com",
+        "elements_session_client[stripe_js_id]": str(uuid.uuid4()),
+        "elements_session_client[locale]": "zh-CN",
+        "elements_session_client[is_aggregation_expected]": "false",
+        "elements_options_client[saved_payment_method][enable_save]": "auto",
+        "elements_options_client[saved_payment_method][enable_redisplay]": "auto",
+        "key": stripe_pk,
+        "_stripe_version": stripe_version,
+    }
+    if stripe_version == STRIPE_VERSION_FULL:
+        body["elements_session_client[client_betas][0]"] = "custom_checkout_server_updates_1"
+        body["elements_session_client[client_betas][1]"] = "custom_checkout_manual_approval_1"
+    return body
+
+
+def _stripe_key_candidates(primary: Any = None) -> list[str]:
+    seen: set[str] = set()
+    candidates: list[str] = []
+    for raw in (primary, OPENAI_STRIPE_PK, DEFAULT_STRIPE_PK):
+        key = str(raw or "").strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        candidates.append(key)
+    return candidates
+
+
+def _resolve_checkout_hosted_url(
+    data: dict[str, Any],
+    *,
+    checkout_url: str = "",
+    checkout_session_id: str = "",
+    proxy: Optional[str] = None,
+    context: str = "支付链接",
+) -> str:
+    raw_url = str(checkout_url or "").strip()
+    cs_id = extract_checkout_session_id(checkout_session_id or raw_url)
+    if raw_url and cs_id and _checkout_hash_fragment(raw_url):
+        return normalize_hosted_checkout_url(raw_url)
+    if not cs_id:
+        if raw_url:
+            return normalize_hosted_checkout_url(raw_url)
+        raise CheckoutHostedUrlResolutionError(f"{context}未返回 checkout session id")
+
+    last_error = ""
+    for stripe_pk in _stripe_key_candidates((data or {}).get("publishable_key")):
+        for stripe_version in (STRIPE_VERSION_FULL, STRIPE_VERSION_BASE):
+            response = cffi_requests.post(
+                f"{STRIPE_API}/v1/payment_pages/{cs_id}/init",
+                headers=_stripe_headers(),
+                data=_stripe_payment_page_init_body(stripe_pk, stripe_version),
+                proxies=_build_proxies(proxy),
+                timeout=30,
+                impersonate="chrome110",
+            )
+            status_code = int(getattr(response, "status_code", 0) or 0)
+            text = str(getattr(response, "text", "") or "")
+            if status_code == 200:
+                payload = response.json() or {}
+                hosted_url = str(payload.get("stripe_hosted_url") or "").strip()
+                if hosted_url:
+                    return normalize_hosted_checkout_url(hosted_url)
+                last_error = "Stripe init 成功但未返回 stripe_hosted_url"
+                continue
+            last_error = f"Stripe init HTTP {status_code}: {text[:300]}"
+            if status_code >= 500:
+                break
+    raise CheckoutHostedUrlResolutionError(last_error or f"{context}未能解析出可打开的支付链接")
+
+
+def _resolve_custom_checkout_hosted_url(
+    data: dict[str, Any],
+    *,
+    checkout_url: str = "",
+    checkout_session_id: str = "",
+    proxy: Optional[str] = None,
+) -> str:
+    try:
+        return _resolve_checkout_hosted_url(
+            data,
+            checkout_url=checkout_url,
+            checkout_session_id=checkout_session_id,
+            proxy=proxy,
+            context="短连接路径",
+        )
+    except CheckoutHostedUrlResolutionError as exc:
+        raise CustomCheckoutResolutionError(str(exc)) from exc
+
+
 def _local_timezone_offset_minutes() -> int:
     from datetime import datetime
 
@@ -199,15 +419,41 @@ def _build_checkout_headers(account: Any, *, chatgpt_account_id: str = "") -> di
     headers = {
         "Authorization": f"Bearer {account.access_token}",
         "Content-Type": "application/json",
+        "Accept": "*/*",
+        "Origin": "https://chatgpt.com",
+        "Referer": "https://chatgpt.com/",
         "oai-language": "zh-CN",
+        "oai-session-id": str(uuid.uuid4()),
+        "x-openai-target-path": "/backend-api/payments/checkout",
+        "x-openai-target-route": "/backend-api/payments/checkout",
     }
-    if account.cookies:
-        headers["cookie"] = account.cookies
-        oai_did = _extract_oai_did(account.cookies)
+    cookies = str(getattr(account, "cookies", "") or "").strip()
+    if not cookies:
+        session_token = str(
+            getattr(account, "session_token", "")
+            or (getattr(account, "extra", {}) or {}).get("session_token")
+            or ""
+        ).strip()
+        if session_token:
+            cookies = (
+                f"__Secure-next-auth.session-token={session_token}; "
+                f"__Secure-authjs.session-token={session_token}"
+            )
+    if cookies:
+        headers["cookie"] = cookies
+        oai_did = _extract_oai_did(cookies)
         if oai_did:
             headers["oai-device-id"] = oai_did
-    if chatgpt_account_id:
-        headers["chatgpt-account-id"] = chatgpt_account_id
+    extra = getattr(account, "extra", {}) or {}
+    resolved_account_id = str(
+        chatgpt_account_id
+        or extra.get("account_id")
+        or extra.get("chatgpt_account_id")
+        or extra.get("workspace_id")
+        or ""
+    ).strip()
+    if resolved_account_id:
+        headers["chatgpt-account-id"] = resolved_account_id
     return headers
 
 
@@ -297,7 +543,10 @@ def _generate_checkout_url(
     payload: dict[str, Any],
     proxy: Optional[str],
     chatgpt_account_id: str = "",
+    link_format: Any = None,
 ) -> str:
+    normalized_format = normalize_payment_link_format(link_format)
+    processor_entity = str(payload.get("processor_entity") or "openai_llc").strip() or "openai_llc"
     response = cffi_requests.post(
         PAYMENT_CHECKOUT_URL,
         headers=_build_checkout_headers(account, chatgpt_account_id=chatgpt_account_id),
@@ -309,14 +558,31 @@ def _generate_checkout_url(
     if int(getattr(response, "status_code", 0) or 0) >= 400:
         raise CheckoutRequestError(int(response.status_code), str(getattr(response, "text", "") or ""))
     data = response.json()
+    processor_entity = str(data.get("processor_entity") or processor_entity).strip() or "openai_llc"
+    extra = getattr(account, "extra", None)
+    if isinstance(extra, dict):
+        extra["chatgpt_checkout_processor_entity"] = processor_entity
+        extra["checkout_processor_entity"] = processor_entity
 
     checkout_url = str(data.get("url") or data.get("checkout_url") or data.get("cashier_url") or "").strip()
-    if checkout_url:
-        return checkout_url
+    checkout_session_id = str(data.get("checkout_session_id") or data.get("session_id") or data.get("id") or "").strip()
+    if normalized_format == PAYMENT_LINK_FORMAT_SHORT:
+        return _resolve_custom_checkout_hosted_url(
+            data if isinstance(data, dict) else {},
+            checkout_url=checkout_url,
+            checkout_session_id=checkout_session_id,
+            proxy=proxy,
+        )
 
-    checkout_session_id = str(data.get("checkout_session_id") or "").strip()
-    if checkout_session_id:
-        return TEAM_CHECKOUT_BASE_URL + checkout_session_id
+    hosted_url = _resolve_checkout_hosted_url(
+        data if isinstance(data, dict) else {},
+        checkout_url=checkout_url,
+        checkout_session_id=checkout_session_id,
+        proxy=proxy,
+        context="长支付链接",
+    )
+    if hosted_url:
+        return hosted_url
 
     raise ValueError(data.get("detail", "API 未返回支付链接"))
 
@@ -374,15 +640,18 @@ def generate_plus_link(
     country: str = DEFAULT_CHECKOUT_COUNTRY,
     currency: Optional[str] = DEFAULT_CHECKOUT_CURRENCY,
     billing: Optional[dict[str, Any]] = None,
+    link_format: Any = DEFAULT_PAYMENT_LINK_FORMAT,
 ) -> str:
-    """生成 Plus 支付链接（优先直接返回 hosted URL）"""
+    """生成 Plus 支付链接。默认长 hosted 链接，可按参数返回 ChatGPT 短链接。"""
     if not account.access_token:
         raise ValueError("账号缺少 access_token")
 
     country = normalize_checkout_country(country)
     currency = normalize_checkout_currency(currency, country)
+    resolved_link_format = normalize_payment_link_format(link_format)
 
     payload = {
+        "entry_point": "all_plans_pricing_modal",
         "plan_name": "chatgptplusplan",
         "billing_details": _checkout_billing_details(
             billing,
@@ -394,12 +663,30 @@ def generate_plus_link(
             "promo_campaign_id": "plus-1-month-free",
             "is_coupon_from_query_param": False,
         },
-        "checkout_ui_mode": "hosted",
+        "checkout_ui_mode": checkout_ui_mode_for_link_format(resolved_link_format),
     }
     return _generate_checkout_url(
         account=account,
         payload=payload,
         proxy=proxy,
+        link_format=resolved_link_format,
+    )
+
+
+def generate_plus_short_link(
+    account: Any,
+    proxy: Optional[str] = None,
+    country: str = DEFAULT_CHECKOUT_COUNTRY,
+    currency: Optional[str] = DEFAULT_CHECKOUT_CURRENCY,
+    billing: Optional[dict[str, Any]] = None,
+) -> str:
+    return generate_plus_link(
+        account,
+        proxy=proxy,
+        country=country,
+        currency=currency,
+        billing=billing,
+        link_format=PAYMENT_LINK_FORMAT_SHORT,
     )
 
 
@@ -413,14 +700,16 @@ def generate_team_link(
     country: str = DEFAULT_CHECKOUT_COUNTRY,
     currency: Optional[str] = DEFAULT_CHECKOUT_CURRENCY,
     billing: Optional[dict[str, Any]] = None,
+    link_format: Any = DEFAULT_PAYMENT_LINK_FORMAT,
 ) -> str:
-    """生成 Team 支付链接（按抓包成功参数优先走 custom checkout）"""
+    """生成 Team 支付链接。默认长 hosted 链接，可按参数返回 ChatGPT 短链接。"""
     if not account.access_token:
         raise ValueError("账号缺少 access_token")
 
     country = normalize_checkout_country(country)
     currency = normalize_checkout_currency(currency, country)
     resolved_promo_code = str(promo_code or DEFAULT_CHECKOUT_PROMO_CODE).strip() or DEFAULT_CHECKOUT_PROMO_CODE
+    resolved_link_format = normalize_payment_link_format(link_format)
 
     payload = {
         "entry_point": "team_workspace_purchase_modal",
@@ -438,12 +727,13 @@ def generate_team_link(
         ),
         "promo_code": resolved_promo_code,
         "cancel_url": f"https://chatgpt.com/?promoCode={resolved_promo_code}",
-        "checkout_ui_mode": "custom",
+        "checkout_ui_mode": checkout_ui_mode_for_link_format(resolved_link_format),
     }
     return _generate_checkout_url(
         account=account,
         payload=payload,
         proxy=proxy,
+        link_format=resolved_link_format,
     )
 
 

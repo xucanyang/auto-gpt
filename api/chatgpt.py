@@ -12,12 +12,13 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
-from sqlmodel import Session
+from sqlmodel import Session, select
 from pydantic import BaseModel, Field
 from core.db import AccountModel, get_session
 from services.chatgpt_account_state import (
     apply_chatgpt_status_policy,
     apply_payment_snapshot_status,
+    classify_chatgpt_capabilities,
     mark_payment_failed,
     mark_payment_pending,
 )
@@ -26,6 +27,12 @@ from services.chatgpt_core.gopay_phone import (
     normalize_gopay_recognized_country_codes,
     split_gopay_phone_input,
 )
+from services.chatgpt_core.codex_usage import (
+    build_codex_usage_progress_from_extra,
+    persist_codex_usage_probe,
+    probe_codex_usage_window,
+)
+from services.chatgpt_core.local_status_refresh import schedule_chatgpt_local_status_refresh_for_account_id
 import json, sys
 
 
@@ -85,6 +92,22 @@ class Sub2ApiExportTicketReq(BaseModel):
     status: str = ""
 
 
+class CodexUsageRefreshReq(BaseModel):
+    force: bool = True
+    proxy: Optional[str] = None
+    model: str = ""
+
+
+class CodexUsageBatchRefreshReq(BaseModel):
+    ids: list[int] = Field(default_factory=list)
+    limit: int = 50
+    force: bool = True
+    proxy: Optional[str] = None
+    model: str = ""
+    status: str = ""
+    email: str = ""
+
+
 def _get_account(account_id: int, session: Session) -> AccountModel:
     acc = session.get(AccountModel, account_id)
     if not acc or acc.platform != "chatgpt":
@@ -131,6 +154,11 @@ def _persist_local_probe(acc: AccountModel, probe: dict, session: Session) -> No
     acc.updated_at = datetime.utcnow()
     session.add(acc)
     session.commit()
+
+
+def _persist_codex_usage_probe(acc: AccountModel, codex_probe: dict[str, Any], session: Session) -> dict[str, Any]:
+    """Persist only Codex usage/auth material; never mark the account invalid for quota exhaustion."""
+    return persist_codex_usage_probe(acc, codex_probe, session, commit=True)
 
 
 def _get_tasks_api():
@@ -546,6 +574,153 @@ def _resolve_required_checkout_proxy(proxy: Optional[str] = None) -> str:
     return str(candidates[0]).strip()
 
 
+def _codex_usage_list_item(acc: AccountModel) -> dict[str, Any]:
+    extra = acc.get_extra()
+    chatgpt_local = extra.get("chatgpt_local") if isinstance(extra.get("chatgpt_local"), dict) else {}
+    codex = chatgpt_local.get("codex") if isinstance(chatgpt_local.get("codex"), dict) else {}
+    usage = codex.get("usage") if isinstance(codex.get("usage"), dict) else {}
+    # 兼容早期/导入数据把 codex_* 字段放在 extra 顶层的情况。
+    if not usage:
+        usage = {
+            key: value
+            for key, value in extra.items()
+            if str(key).startswith("codex_")
+        }
+    return {
+        "id": acc.id,
+        "email": acc.email,
+        "status": acc.status,
+        "state": str(codex.get("state") or "").strip(),
+        "checked_at": str(codex.get("checked_at") or "").strip(),
+        "source": str(codex.get("source") or "").strip(),
+        "http_status": int(codex.get("http_status") or 0),
+        "error_code": str(codex.get("error_code") or "").strip(),
+        "message": str(codex.get("message") or "").strip(),
+        "chatgpt_account_id": str(codex.get("chatgpt_account_id") or "").strip(),
+        "usage": usage,
+        "progress": build_codex_usage_progress_from_extra(usage),
+    }
+
+
+@router.get("/codex-usage")
+def list_codex_usage(
+    page: int = 1,
+    page_size: int = 100,
+    status: Optional[str] = None,
+    email: Optional[str] = None,
+    session: Session = Depends(get_session),
+):
+    page_value = max(1, int(page or 1))
+    page_size_value = max(1, min(int(page_size or 100), 500))
+    q = select(AccountModel).where(AccountModel.platform == "chatgpt")
+    if status:
+        statuses = [item.strip() for item in str(status or "").split(",") if item.strip()]
+        if len(statuses) == 1:
+            q = q.where(AccountModel.status == statuses[0])
+        elif statuses:
+            q = q.where(AccountModel.status.in_(statuses))
+    if email:
+        q = q.where(AccountModel.email.contains(str(email).strip()))
+    rows = session.exec(q.order_by(AccountModel.id.desc())).all()
+    total = len(rows)
+    items = rows[(page_value - 1) * page_size_value:page_value * page_size_value]
+    return {
+        "ok": True,
+        "total": total,
+        "page": page_value,
+        "page_size": page_size_value,
+        "items": [_codex_usage_list_item(acc) for acc in items],
+    }
+
+
+@router.post("/{account_id}/codex-usage/refresh")
+def refresh_account_codex_usage(account_id: int, req: CodexUsageRefreshReq,
+                                session: Session = Depends(get_session)):
+    acc = _get_account(account_id, session)
+    codex_acc = _to_codex_account(acc)
+
+    probe = probe_codex_usage_window(
+        codex_acc,
+        proxy=req.proxy,
+        force=req.force,
+        model=req.model,
+    )
+    codex = _persist_codex_usage_probe(acc, probe, session)
+    return {
+        "ok": str(probe.get("state") or "") in {"usable", "quota_exhausted"},
+        "account_id": acc.id,
+        "email": acc.email,
+        "codex": codex,
+        "probe": {key: value for key, value in probe.items() if not key.startswith("_")},
+    }
+
+
+@router.post("/codex-usage/refresh")
+def refresh_codex_usage_batch(req: CodexUsageBatchRefreshReq,
+                              session: Session = Depends(get_session)):
+    selected_ids = []
+    for item in req.ids or []:
+        try:
+            value = int(item)
+        except Exception:
+            continue
+        if value > 0:
+            selected_ids.append(value)
+    selected_ids = list(dict.fromkeys(selected_ids))
+
+    limit_value = max(1, min(int(req.limit or 50), 200))
+    q = select(AccountModel).where(AccountModel.platform == "chatgpt")
+    if selected_ids:
+        q = q.where(AccountModel.id.in_(selected_ids))
+    if req.status:
+        statuses = [item.strip() for item in str(req.status or "").split(",") if item.strip()]
+        if len(statuses) == 1:
+            q = q.where(AccountModel.status == statuses[0])
+        elif statuses:
+            q = q.where(AccountModel.status.in_(statuses))
+    if req.email:
+        q = q.where(AccountModel.email.contains(str(req.email).strip()))
+
+    accounts = session.exec(q.order_by(AccountModel.id.desc()).limit(limit_value)).all()
+    items: list[dict[str, Any]] = []
+    for acc in accounts:
+        codex_acc = _to_codex_account(acc)
+        try:
+            probe = probe_codex_usage_window(
+                codex_acc,
+                proxy=req.proxy,
+                force=req.force,
+                model=req.model,
+            )
+            codex = _persist_codex_usage_probe(acc, probe, session)
+            items.append(
+                {
+                    "ok": str(probe.get("state") or "") in {"usable", "quota_exhausted"},
+                    "account_id": acc.id,
+                    "email": acc.email,
+                    "state": str(codex.get("state") or "").strip(),
+                    "codex": codex,
+                    "message": str(codex.get("message") or "").strip(),
+                }
+            )
+        except Exception as exc:
+            items.append(
+                {
+                    "ok": False,
+                    "account_id": acc.id,
+                    "email": acc.email,
+                    "state": "probe_failed",
+                    "message": str(exc),
+                }
+            )
+    return {
+        "ok": True,
+        "count": len(items),
+        "success_count": sum(1 for item in items if item.get("ok")),
+        "items": items,
+    }
+
+
 # ── Token 刷新 ──────────────────────────────────────────────
 @router.post("/{account_id}/refresh-token")
 def refresh_token(account_id: int, proxy: Optional[str] = None,
@@ -568,6 +743,7 @@ def refresh_token(account_id: int, proxy: Optional[str] = None,
         acc.updated_at = datetime.utcnow()
         session.add(acc)
         session.commit()
+        schedule_chatgpt_local_status_refresh_for_account_id(acc.id, proxy=proxy, reason="chatgpt_refresh_token")
         return {"ok": True, "access_token": result.access_token[:40] + "..."}
     raise HTTPException(400, result.error_message)
 
@@ -582,6 +758,7 @@ class PaymentReq(BaseModel):
     workspace_name: str = "MyTeam"
     seat_quantity: int = 5
     price_interval: str = "month"
+    payment_link_format: str = "long_hosted"
     save_defaults: bool = True
 
 
@@ -1241,6 +1418,8 @@ async def _browser_auth_capture_to_account(state: _BrowserAuthSession, acc: Acco
     acc.updated_at = datetime.now(timezone.utc)
     session.add(acc)
     session.commit()
+    if access_token or acc.token:
+        schedule_chatgpt_local_status_refresh_for_account_id(acc.id, reason="browser_auth_capture")
     return {
         "ok": True,
         "message": "浏览器登录态已保存",
@@ -2930,23 +3109,41 @@ def generate_payment_link(account_id: int, req: PaymentReq,
     acc = _get_account(account_id, session)
     codex_acc = _to_codex_account(acc)
 
-    from services.chatgpt_core.payment import generate_plus_link, generate_team_link, normalize_checkout_country, normalize_checkout_currency
+    from services.chatgpt_core.payment import (
+        generate_plus_link,
+        generate_team_link,
+        normalize_checkout_country,
+        normalize_checkout_currency,
+        normalize_payment_link_format,
+    )
 
     plan = str(req.plan or "plus").strip().lower()
     if plan not in {"plus", "team"}:
         plan = "plus"
     country = normalize_checkout_country(req.country)
     currency = normalize_checkout_currency(req.currency, country)
+    payment_link_format = normalize_payment_link_format(req.payment_link_format)
     proxy = _resolve_optional_checkout_proxy(req.proxy)
     if plan == "plus":
-        url = generate_plus_link(codex_acc, proxy=proxy, country=country, currency=currency)
+        url = generate_plus_link(
+            codex_acc,
+            proxy=proxy,
+            country=country,
+            currency=currency,
+            link_format=payment_link_format,
+        )
     else:
         url = generate_team_link(
-            codex_acc, workspace_name=req.workspace_name,
-            price_interval=req.price_interval, seat_quantity=req.seat_quantity,
+            codex_acc,
+            workspace_name=req.workspace_name,
+            price_interval=req.price_interval,
+            seat_quantity=req.seat_quantity,
             promo_code=req.promo_code,
-            proxy=proxy, country=country, currency=currency
-    )
+            proxy=proxy,
+            country=country,
+            currency=currency,
+            link_format=payment_link_format,
+        )
     acc.cashier_url = str(url or "")
     mark_payment_pending(acc, reason="payment_link_generated")
     extra = acc.get_extra()
@@ -2956,6 +3153,7 @@ def generate_payment_link(account_id: int, req: PaymentReq,
         "country": country,
         "currency": currency,
         "proxy": proxy,
+        "payment_link_format": payment_link_format,
     }
     if req.save_defaults:
         defaults_payload = {
@@ -2963,6 +3161,7 @@ def generate_payment_link(account_id: int, req: PaymentReq,
             "country": country,
             "currency": currency,
             "proxy": proxy,
+            "payment_link_format": payment_link_format,
             "promo_code": str(req.promo_code or "").strip(),
             "workspace_name": str(req.workspace_name or "MyTeam").strip() or "MyTeam",
             "seat_quantity": max(2, int(req.seat_quantity or 5)),
@@ -2978,7 +3177,15 @@ def generate_payment_link(account_id: int, req: PaymentReq,
     acc.updated_at = datetime.now(timezone.utc)
     session.add(acc)
     session.commit()
-    return {"url": url, "plan": plan, "country": country, "currency": currency, "proxy": proxy, "promo_code": str(req.promo_code or "").strip()}
+    return {
+        "url": url,
+        "plan": plan,
+        "country": country,
+        "currency": currency,
+        "proxy": proxy,
+        "payment_link_format": payment_link_format,
+        "promo_code": str(req.promo_code or "").strip(),
+    }
 
 
 @router.post("/{account_id}/gopay/start")

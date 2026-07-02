@@ -82,6 +82,7 @@ TEMPMAIL_STATE_CONFIG_KEYS = (
     "tempmail_api_key",
     "tempmail_api_key_header",
     "tempmail_primary_domain",
+    "tempmail_fixed_domains",
     "tempmail_mode",
     "tempmail_wait_timeout_seconds",
     "tempmail_ttl_minutes",
@@ -95,11 +96,19 @@ ICLOUD_HME_STATE_CONFIG_KEYS = (
     "icloud_domain_base",
     "icloud_forward_to",
     "icloud_forward_mailbox_id",
+    "icloud_hme_helper_api_url",
+    "icloud_hme_helper_internal_key",
+    "icloud_hme_helper_api_key_header",
+    "icloud_hme_helper_consumer",
+    "icloud_hme_helper_checkout_ttl_seconds",
+    "icloud_hme_helper_wait_timeout_seconds",
+    "icloud_hme_helper_max_cache_age_seconds",
     "tempmail_api_url",
     "tempmail_api_key",
     "tempmail_api_key_header",
     "tempmail_wait_timeout_seconds",
 )
+ICLOUD_HME_PROVIDER_VALUES = {"icloud_hme", "hme_ready_api", "icloud_hme_ready", "icloud_hme_helper_ready"}
 
 
 def _has_value(value: Any) -> bool:
@@ -110,15 +119,73 @@ def _has_value(value: Any) -> bool:
     return True
 
 
+def _current_mailbox_config(keys: tuple[str, ...]) -> dict[str, Any]:
+    try:
+        global_config = config_store.get_all()
+    except Exception:
+        global_config = {}
+    return {
+        key: value
+        for key in keys
+        if _has_value(value := (global_config or {}).get(key))
+    }
+
+
+def _with_current_tempmail_config(mailbox_state: dict[str, Any]) -> dict[str, Any]:
+    state = dict(mailbox_state or {})
+    provider = str(state.get("provider") or "").strip()
+    if provider not in {"tempmail_local", "tempmail_api", *ICLOUD_HME_PROVIDER_VALUES}:
+        return state
+
+    keys = ICLOUD_HME_STATE_CONFIG_KEYS if provider in ICLOUD_HME_PROVIDER_VALUES else TEMPMAIL_STATE_CONFIG_KEYS
+    current_config = _current_mailbox_config(keys)
+    if not current_config:
+        return state
+
+    config = dict(state.get("config") or {})
+    config.update(current_config)
+    if provider in {"hme_ready_api", "icloud_hme_ready", "icloud_hme_helper_ready"}:
+        config["icloud_hme_mode"] = "helper_ready_api"
+    current_forward_mailbox_id = current_config.get("icloud_forward_mailbox_id")
+    if provider in ICLOUD_HME_PROVIDER_VALUES and not _has_value(current_forward_mailbox_id):
+        # The persisted config value is not a durable service endpoint.  If the
+        # current global config has no explicit forward mailbox id, remove any
+        # historical id from the constructor config so the mailbox layer can
+        # resolve/rebind by forward_to instead of blindly trusting stale state.
+        config.pop("icloud_forward_mailbox_id", None)
+    state["config"] = config
+
+    account = dict(state.get("account") or {})
+    account_extra = dict(account.get("extra") or {})
+    if provider in ICLOUD_HME_PROVIDER_VALUES:
+        if _has_value(config.get("icloud_forward_to")):
+            account_extra["forward_to"] = str(config.get("icloud_forward_to") or "").strip()
+        # Global icloud_forward_mailbox_id is optional on this host.  If it is
+        # empty, keep the saved account-extra id only as a cache; IcloudHmeMailbox
+        # verifies it against the current TempMail service and rebinds by
+        # forward_to when it is stale.
+        if _has_value(current_forward_mailbox_id):
+            account_extra["forward_mailbox_id"] = str(current_forward_mailbox_id or "").strip()
+    if account_extra:
+        account["extra"] = account_extra
+    if not str(account.get("email") or "").strip() and str(state.get("email") or "").strip():
+        account["email"] = str(state.get("email") or "").strip()
+    if account:
+        state["account"] = account
+
+    state["config_refreshed_from_current"] = True
+    return state
+
+
 def _mailbox_state_from_account(account: AccountModel, *, extra: dict[str, Any] | None = None) -> dict[str, Any]:
     account_extra = dict(extra or account.get_extra() or {})
     mailbox_state = dict(account_extra.get("chatgpt_mailbox_state") or {})
     if mailbox_state:
-        return mailbox_state
+        return _with_current_tempmail_config(mailbox_state)
 
     legacy_state = dict(account_extra.get("mailbox_state") or {})
     if legacy_state:
-        return legacy_state
+        return _with_current_tempmail_config(legacy_state)
 
     provider = str(
         account_extra.get("mail_provider")
@@ -126,7 +193,7 @@ def _mailbox_state_from_account(account: AccountModel, *, extra: dict[str, Any] 
         or account_extra.get("mailbox_provider")
         or ""
     ).strip()
-    if provider == "icloud_hme":
+    if provider in ICLOUD_HME_PROVIDER_VALUES:
         email = str(getattr(account, "email", "") or account_extra.get("email") or "").strip()
         if not email:
             return {}
@@ -469,8 +536,10 @@ class RestoredEmailService:
         state: dict[str, Any],
         proxy: str | None = None,
         log_fn: Callable[[str, str], None] | None = None,
+        task_control: Any | None = None,
+        attempt_id: int | None = None,
     ):
-        self._state = dict(state or {})
+        self._state = _with_current_tempmail_config(dict(state or {}))
         self._provider = str(self._state.get("provider") or "").strip()
         if not self._provider:
             raise ValueError("mailbox_state.provider 缺失")
@@ -479,6 +548,8 @@ class RestoredEmailService:
         self._log_fn = log_fn
         self._mailbox = create_mailbox(self._provider, extra=self._config, proxy=self._proxy)
         setattr(self._mailbox, "_log_fn", lambda message: self._log(str(message)))
+        setattr(self._mailbox, "_task_control", task_control)
+        setattr(self._mailbox, "_task_attempt_token", attempt_id)
         account_payload = dict(self._state.get("account") or {})
         self._acct = MailboxAccount(
             email=str(account_payload.get("email") or self._state.get("email") or "").strip(),

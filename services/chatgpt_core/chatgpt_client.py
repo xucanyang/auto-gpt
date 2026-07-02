@@ -68,6 +68,13 @@ class ChatGPTClient:
             "detail": "",
             "url": f"{self.BASE}/",
         }
+        self.last_authorize_probe = {
+            "ok": False,
+            "status_code": 0,
+            "reason": "",
+            "detail": "",
+            "url": "",
+        }
 
     def _get_sentinel_token(self, flow: str, *, page_url: str | None = None):
         prefer_browser = flow in {"username_password_create", "oauth_create_account"}
@@ -302,6 +309,25 @@ class ChatGPTClient:
             return ""
         return "".join(str(chunks[index] or "") for index in ordered_indexes)
 
+    def get_chatgpt_cookie_header(self):
+        """导出当前 chatgpt.com 会话 Cookie，供支付/后续动作复用同一 Web 会话。"""
+        pairs = []
+        seen = set()
+        for cookie in self.session.cookies.jar:
+            domain = cookie.domain or ""
+            name = cookie.name or ""
+            value = cookie.value or ""
+            if not name or not value:
+                continue
+            if "chatgpt.com" not in domain:
+                continue
+            key = (name, value)
+            if key in seen:
+                continue
+            seen.add(key)
+            pairs.append(f"{name}={value}")
+        return "; ".join(pairs)
+
     def _describe_auth_cookie_names(self):
         """返回当前认证相关 Cookie 名称摘要，不输出 Cookie 值。"""
         names = []
@@ -437,6 +463,7 @@ class ChatGPTClient:
         normalized = {
             "access_token": access_token,
             "session_token": session_token,
+            "cookies": self.get_chatgpt_cookie_header(),
             "account_id": account_id,
             "user_id": user_id,
             "workspace_id": account_id,
@@ -631,11 +658,27 @@ class ChatGPTClient:
                 )
 
                 final_url = str(r.url)
+                status_code = int(getattr(r, "status_code", 0) or 0)
+                body = str(getattr(r, "text", "") or "")[:300]
+                self.last_authorize_probe = {
+                    "ok": status_code < 400,
+                    "status_code": status_code,
+                    "reason": "ok" if status_code < 400 else f"http_{status_code}",
+                    "detail": body,
+                    "url": final_url,
+                }
                 self._log(f"重定向到: {final_url}")
                 return final_url
 
             except Exception as e:
                 error_msg = str(e)
+                self.last_authorize_probe = {
+                    "ok": False,
+                    "status_code": 0,
+                    "reason": "request_error",
+                    "detail": error_msg[:300],
+                    "url": url,
+                }
                 is_tls_error = (
                     "TLS" in error_msg
                     or "SSL" in error_msg
@@ -795,9 +838,22 @@ class ChatGPTClient:
                 self._log(f"验证成功 {describe_flow_state(next_state)}")
                 return (True, next_state) if return_state else (True, "验证成功")
             else:
-                error_msg = r.text[:200]
+                error_code = ""
+                error_msg = r.text[:500]
+                try:
+                    error_data = r.json() or {}
+                    error_info = error_data.get("error") or {}
+                    error_code = str(error_info.get("code") or "").strip()
+                    error_msg = str(error_info.get("message") or error_msg).strip()
+                except Exception:
+                    pass
                 self._log(f"验证失败: {r.status_code} - {error_msg}")
-                return False, f"HTTP {r.status_code}"
+                detail = f"HTTP {r.status_code}"
+                if error_code:
+                    detail += f": {error_code}"
+                if error_msg:
+                    detail += f": {error_msg[:300]}"
+                return False, detail
 
         except Exception as e:
             self._log(f"验证异常: {e}")
@@ -968,14 +1024,22 @@ class ChatGPTClient:
             final_path = urlparse(final_url).path
             self._log(f"Authorize → {final_path}")
 
-            # /api/accounts/authorize 实际上常对应 Cloudflare 403 中间页，不要继续走 authorize_continue。
+            # /api/accounts/authorize 以前常对应 Cloudflare 403 中间页；但现在也会出现
+            # status=200 停在该 URL、随后仍可继续注册状态机的情况。只有明确 403/429 或
+            # /error 时才把它当拦截；否则交给下面的状态机 fallback 进入密码注册阶段。
             if "api/accounts/authorize" in final_path or final_path == "/error":
+                authorize_probe = dict(getattr(self, "last_authorize_probe", {}) or {})
+                authorize_status = int(authorize_probe.get("status_code") or 0)
+                if final_path == "/error" or authorize_status in {403, 429}:
+                    self._log(
+                        f"检测到 Cloudflare/SPA 中间页，准备重试预授权: status={authorize_status or '-'} {final_url[:160]}..."
+                    )
+                    if auth_attempt < max_auth_attempts - 1:
+                        continue
+                    return False, f"预授权被拦截: {final_path}"
                 self._log(
-                    f"检测到 Cloudflare/SPA 中间页，准备重试预授权: {final_url[:160]}..."
+                    f"Authorize 停在 {final_path} status={authorize_status or '-'}，继续进入注册状态机 fallback"
                 )
-                if auth_attempt < max_auth_attempts - 1:
-                    continue
-                return False, f"预授权被拦截: {final_path}"
 
             break
 

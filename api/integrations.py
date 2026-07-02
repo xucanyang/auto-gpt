@@ -10,7 +10,8 @@ import urllib.parse
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, Depends
+from core.db import get_session
 from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, Field
 from sqlmodel import Session, select
@@ -19,9 +20,11 @@ from core.base_platform import Account, AccountStatus
 from core.config_store import config_store
 from core.db import AccountModel, engine
 from services.account_filters import filter_account_rows
+from services.account_rate_limit_recovery import reconcile_rate_limited_accounts
 from services.external_apps import install, list_status, start, start_all, stop, stop_all
 from services.chatgpt_sync import backfill_chatgpt_account_to_cpa, get_cliproxy_sync_state
 from services.sub2api_sync import backfill_chatgpt_account_to_sub2api, get_sub2api_sync_state
+from services.oaipay_sync import backfill_chatgpt_account_to_oaipay, get_oaipay_sync_state
 from services.chatgpt_core.gopay_phone import (
     DEFAULT_GOPAY_PHONE_COUNTRY_CODE,
     GOPAY_RECOGNIZED_COUNTRY_CODES_KEY,
@@ -44,6 +47,8 @@ class BackfillRequest(BaseModel):
     subscription_type: str = ""
     account_validity: str = ""
     sub2api_state: str = ""
+    oaipay_state: str = ""
+    category_id: Optional[int] = None
 
 
 def _optional_bool(value: Any) -> bool | None:
@@ -1441,6 +1446,40 @@ def _adapter_state() -> dict[str, Any]:
     }
 
 
+import requests
+
+@router.get("/oaipay-categories")
+def get_oaipay_categories(session: Session = Depends(get_session)):
+    api_url = str(config_store.get("oaipay_api_url", "") or "").strip()
+    api_key = str(config_store.get("oaipay_api_key", "") or "").strip()
+    if not api_url or not api_key:
+        raise HTTPException(status_code=400, detail="OAIPay URL/Key not configured")
+    base_url = api_url.split("/api/")[0].rstrip('/')
+    def _wrap(data):
+        if isinstance(data, list):
+            return {"categories": data, "success": True}
+        if isinstance(data, dict):
+            if "categories" in data:
+                return data
+            if "data" in data and isinstance(data["data"], list):
+                return {"categories": data["data"], "success": True}
+        return {"categories": [], "success": False, "error": "Invalid format"}
+
+    try:
+        url = f"{base_url}/api/admin/cdk/categories"
+        res = requests.get(url, headers={"Authorization": api_key}, timeout=10)
+        res.raise_for_status()
+        return _wrap(res.json())
+    except Exception as e:
+        # Fallback to the new endpoint we just created
+        try:
+            url = f"{base_url}/api/auto-gpt/categories"
+            res = requests.get(url, headers={"Authorization": api_key}, timeout=10)
+            res.raise_for_status()
+            return _wrap(res.json())
+        except Exception as e2:
+            return {"success": False, "error": str(e2), "categories": []}
+
 @router.get("/services")
 def get_services():
     return {"items": list_status()}
@@ -1478,6 +1517,7 @@ def backfill_integrations(body: BackfillRequest):
     destination = str(body.destination or "cliproxyapi").strip().lower() or "cliproxyapi"
 
     with Session(engine) as s:
+        reconcile_rate_limited_accounts(s)
         q = select(AccountModel)
         if body.account_ids:
             q = q.where(AccountModel.id.in_(body.account_ids))
@@ -1500,6 +1540,7 @@ def backfill_integrations(body: BackfillRequest):
             subscription_type=body.subscription_type,
             account_validity_filter=body.account_validity,
             sub2api_state=body.sub2api_state,
+            oaipay_state=body.oaipay_state,
         )
         if body.pending_only:
             def _is_pending_target(row: AccountModel) -> bool:
@@ -1507,6 +1548,8 @@ def backfill_integrations(body: BackfillRequest):
                     return False
                 if destination == "sub2api":
                     state = get_sub2api_sync_state(row)
+                elif destination == "oaipay":
+                    state = get_oaipay_sync_state(row)
                     if not state:
                         return True
                     remote_state = str(state.get("remote_state") or "").strip().lower()
@@ -1531,6 +1574,9 @@ def backfill_integrations(body: BackfillRequest):
                     if destination == "sub2api":
                         outcome = backfill_chatgpt_account_to_sub2api(row, session=s, commit=True)
                         default_name = "Sub2API"
+                    elif destination == "oaipay":
+                        outcome = backfill_chatgpt_account_to_oaipay(row, session=s, commit=True, category_id=body.category_id)
+                        default_name = "OAIPay"
                     else:
                         outcome = backfill_chatgpt_account_to_cpa(row, session=s, commit=True)
                         default_name = "CLIProxyAPI"

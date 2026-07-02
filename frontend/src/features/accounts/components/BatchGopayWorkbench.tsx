@@ -31,6 +31,7 @@ type BatchGopayWorkbenchProps = {
   onRoundIntervalChange: (value: number) => void
   onOtpAutoResendDelayChange: (value: number) => void
   formatGopayPhoneLabel: (phone: any) => string
+  formatGopayPhoneExpiryLabel: (phone: any) => string
   renderBatchGopayItem: (item: any) => React.ReactNode
   normalizeGopayOtpAutoResendDelay: (value: unknown) => number
   activePhaseMatcher: (item: any) => boolean
@@ -65,6 +66,7 @@ export function BatchGopayWorkbench({
   onRoundIntervalChange,
   onOtpAutoResendDelayChange,
   formatGopayPhoneLabel,
+  formatGopayPhoneExpiryLabel,
   renderBatchGopayItem,
   normalizeGopayOtpAutoResendDelay,
   activePhaseMatcher,
@@ -198,6 +200,7 @@ export function BatchGopayWorkbench({
                         <Space wrap>
                           <Tag>{index + 1}</Tag>
                           <Text>{formatGopayPhoneLabel(phone)}</Text>
+                          {formatGopayPhoneExpiryLabel(phone) ? <Tag color="processing">有效期 {formatGopayPhoneExpiryLabel(phone)}</Tag> : <Tag>有效期 -</Tag>}
                         </Space>
                         <Space size={4} wrap>
                           <Button size="small" disabled={started || index === 0} onClick={() => onMovePhone(phone.id, 'up')}>上移</Button>

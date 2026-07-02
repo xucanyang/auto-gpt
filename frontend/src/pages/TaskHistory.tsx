@@ -1,26 +1,41 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import {
+  Alert,
   Button,
   Card,
-  Descriptions,
+  Checkbox,
   Drawer,
   Empty,
+  Grid,
   message,
+  Pagination,
   Popconfirm,
   Segmented,
+  Select,
   Space,
   Table,
   Tag,
+  Tooltip,
   Typography,
 } from 'antd'
 import type { TableColumnsType } from 'antd'
 import { CopyOutlined, DeleteOutlined, EyeOutlined, ReloadOutlined } from '@ant-design/icons'
+import { TaskDetailHeader } from '@/components/task-detail/TaskDetailHeader'
+import {
+  SPECIAL_OUTCOME_LABELS,
+  TASK_SOURCE_OPTIONS,
+  statusLabel,
+  statusTagColor,
+  taskObjectSummary,
+  taskSourceLabel,
+} from '@/lib/taskTypes'
 import { apiFetch } from '@/lib/utils'
 
 const { Text } = Typography
 
 type TaskStatus = 'running' | 'success' | 'failed' | 'skipped' | 'stopped' | 'pending_activation'
 type LogViewMode = 'info' | 'debug'
+type StatusFilter = 'all' | TaskStatus
 
 const LOG_VIEW_STORAGE_KEY = 'task-history-log-view-mode'
 
@@ -32,6 +47,13 @@ interface TaskLogItem {
   email: string
   status: TaskStatus
   error: string
+  source?: string
+  attempt_outcome?: string
+  progress?: string
+  success?: number
+  skipped?: number
+  failed?: number
+  meta_summary?: Record<string, unknown>
   detail?: TaskLogDetailPayload
 }
 
@@ -59,6 +81,7 @@ interface TaskLogDetailPayload {
   logs?: string[]
   attempt_outcome?: string
   email?: string
+  [key: string]: unknown
 }
 
 interface TaskLogDetailResponse extends TaskLogItem {
@@ -68,76 +91,63 @@ interface TaskLogDetailResponse extends TaskLogItem {
 function parseLogLine(rawLine: string) {
   const line = String(rawLine || '')
   const normalized = line.replace(/^\[\d{2}:\d{2}:\d{2}\]\s*/, '')
-  const isDebug = normalized.startsWith('[DEBUG] ')
-  const text = isDebug ? normalized.replace(/^\[DEBUG\]\s*/, '') : normalized
+  const isDebug = /^\[[^\]]*DEBUG[^\]]*\]/i.test(normalized)
+  const text = isDebug ? normalized.replace(/^\[[^\]]*DEBUG[^\]]*\]\s*/i, '') : normalized
   return { raw: line, text, isDebug }
 }
 
-function statusTagColor(status: TaskStatus) {
-  if (status === 'running') return 'processing'
-  if (status === 'success') return 'success'
-  if (status === 'pending_activation') return 'processing'
-  if (status === 'skipped') return 'warning'
-  if (status === 'stopped') return 'warning'
-  return 'error'
+function sourceOf(record?: TaskLogItem | TaskLogDetailResponse | null) {
+  const detail = record?.detail
+  const meta = detail?.meta && typeof detail.meta === 'object' ? detail.meta : {}
+  return String(record?.source || detail?.source || meta.source || '').trim()
 }
 
-function statusLabel(status: TaskStatus) {
-  if (status === 'running') return '运行中'
-  if (status === 'success') return '成功'
-  if (status === 'pending_activation') return '待激活'
-  if (status === 'skipped') return '跳过'
-  if (status === 'stopped') return '已停止'
-  return '失败'
+function outcomeOf(record?: TaskLogItem | TaskLogDetailResponse | null) {
+  return String(record?.attempt_outcome || record?.detail?.attempt_outcome || '').trim()
 }
 
-function taskOutcomeLabel(outcome?: string) {
-  switch (String(outcome || '').trim()) {
-    case 'task_created':
-      return '已创建'
-    case 'success':
-      return '成功'
-    case 'success_skip_save':
-      return '成功不保存'
-    case 'invite_saved_pending_activation':
-      return '待激活'
-    case 'activation_success':
-      return '激活成功'
-    case 'activation_failed':
-      return '激活失败'
-    case 'resume_subscription_auth_success':
-      return '补抓成功'
-    case 'resume_subscription_auth_failed':
-      return '补抓失败'
-    case 'resume_subscription_auth_stopped':
-      return '补抓停止'
-    case 'resume_subscription_auth_skipped':
-      return '补抓跳过'
-    case 'batch_resume_subscription_auth_success':
-      return '批量补抓成功'
-    case 'batch_resume_subscription_auth_failed':
-      return '批量补抓失败'
-    case 'batch_resume_subscription_auth_stopped':
-      return '批量补抓停止'
-    case 'skipped':
-      return '跳过'
-    case 'failed':
-      return '失败'
-    case 'invite_exhausted_stop_phase':
-      return '邀请耗尽'
-    default:
-      return String(outcome || '').trim() || '-'
+function countStats(record: TaskLogItem | TaskLogDetailResponse) {
+  const errors = Array.isArray(record.detail?.errors) ? record.detail?.errors : []
+  return {
+    success: Number(record.success ?? record.detail?.success ?? 0),
+    skipped: Number(record.skipped ?? record.detail?.skipped ?? 0),
+    failed: Number(record.failed ?? errors.length ?? 0),
   }
 }
 
+function renderStatsTags(record: TaskLogItem | TaskLogDetailResponse) {
+  const stats = countStats(record)
+  const tags = [
+    stats.success > 0 ? <Tag key="success" color="success">成功 {stats.success}</Tag> : null,
+    stats.skipped > 0 ? <Tag key="skipped" color="warning">跳过 {stats.skipped}</Tag> : null,
+    stats.failed > 0 ? <Tag key="failed" color="error">失败 {stats.failed}</Tag> : null,
+  ].filter(Boolean)
+  return tags.length > 0 ? <Space size={4} wrap>{tags}</Space> : <Text type="secondary">-</Text>
+}
+
+function renderStatus(record: TaskLogItem | TaskLogDetailResponse) {
+  const outcome = outcomeOf(record)
+  return (
+    <Space size={4} wrap>
+      <Tag color={statusTagColor(record.status)}>{statusLabel(record.status)}</Tag>
+      {SPECIAL_OUTCOME_LABELS[outcome] ? <Tag>{SPECIAL_OUTCOME_LABELS[outcome]}</Tag> : null}
+    </Space>
+  )
+}
+
 export default function TaskHistory() {
+  const screens = Grid.useBreakpoint()
+  const isMobile = screens.lg === false
   const [logs, setLogs] = useState<TaskLogItem[]>([])
   const [total, setTotal] = useState(0)
   const [loading, setLoading] = useState(false)
+  const [mobilePage, setMobilePage] = useState(1)
   const [selectedRowKeys, setSelectedRowKeys] = useState<number[]>([])
   const [detailOpen, setDetailOpen] = useState(false)
   const [detailLoading, setDetailLoading] = useState(false)
   const [detailRecord, setDetailRecord] = useState<TaskLogDetailResponse | null>(null)
+  const [sourceFilter, setSourceFilter] = useState('')
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>('all')
   const [viewMode, setViewMode] = useState<LogViewMode>(() => {
     if (typeof window === 'undefined') return 'info'
     const saved = window.localStorage.getItem(LOG_VIEW_STORAGE_KEY)
@@ -148,14 +158,17 @@ export default function TaskHistory() {
     setLoading(true)
     try {
       const params = new URLSearchParams({ page: '1', page_size: '50', platform: 'chatgpt' })
+      if (sourceFilter) params.set('source', sourceFilter)
       const data = await apiFetch(`/tasks/logs?${params}`) as TaskLogListResponse
-      setLogs(data.items || [])
+      const items = data.items || []
+      setLogs(items)
       setTotal(data.total || 0)
-      setSelectedRowKeys((prev) => prev.filter((key) => data.items.some((item) => item.id === key)))
+      setSelectedRowKeys((prev) => prev.filter((key) => items.some((item) => item.id === key)))
+      setMobilePage(1)
     } finally {
       setLoading(false)
     }
-  }, [])
+  }, [sourceFilter])
 
   useEffect(() => {
     load()
@@ -165,6 +178,14 @@ export default function TaskHistory() {
     if (typeof window === 'undefined') return
     window.localStorage.setItem(LOG_VIEW_STORAGE_KEY, viewMode)
   }, [viewMode])
+
+  const filteredLogs = useMemo(() => {
+    if (statusFilter === 'all') return logs
+    return logs.filter((item) => {
+      if (item.status === statusFilter) return true
+      return statusFilter === 'pending_activation' && outcomeOf(item) === 'invite_saved_pending_activation'
+    })
+  }, [logs, statusFilter])
 
   const handleBatchDelete = async () => {
     if (selectedRowKeys.length === 0) return
@@ -216,94 +237,149 @@ export default function TaskHistory() {
     }
   }
 
+  const mobilePageSize = 20
+  const mobileLogs = useMemo(() => {
+    const start = (mobilePage - 1) * mobilePageSize
+    return filteredLogs.slice(start, start + mobilePageSize)
+  }, [filteredLogs, mobilePage])
+
+  useEffect(() => {
+    const maxPage = Math.max(1, Math.ceil(filteredLogs.length / mobilePageSize))
+    if (mobilePage > maxPage) setMobilePage(maxPage)
+  }, [filteredLogs.length, mobilePage])
+
   const columns: TableColumnsType<TaskLogItem> = [
     {
       title: '时间',
       dataIndex: 'created_at',
       key: 'created_at',
-      width: 180,
+      width: 160,
       render: (text: string) => (text ? new Date(text).toLocaleString('zh-CN') : '-'),
     },
     {
-      title: '任务 ID',
-      dataIndex: 'task_id',
-      key: 'task_id',
-      width: 180,
-      render: (text: string) => <span style={{ fontFamily: 'monospace', fontSize: 12 }}>{text || '-'}</span>,
+      title: '任务类型',
+      key: 'source',
+      width: 130,
+      render: (_, record) => <Tag color="blue">{taskSourceLabel(sourceOf(record))}</Tag>,
     },
     {
-      title: '平台',
-      dataIndex: 'platform',
-      key: 'platform',
-      width: 100,
-      render: (text: string) => <Tag>{text}</Tag>,
-    },
-    {
-      title: '邮箱',
-      dataIndex: 'email',
-      key: 'email',
-      render: (text: string) => <span style={{ fontFamily: 'monospace', fontSize: 12 }}>{text || '-'}</span>,
-    },
-    {
-      title: '结果',
-      key: 'attempt_outcome',
-      width: 120,
-      render: (_, record) => {
-        const outcome = record.detail?.attempt_outcome
-        return <Tag>{taskOutcomeLabel(outcome)}</Tag>
-      },
+      title: '对象',
+      key: 'object',
+      width: 200,
+      render: (_, record) => <Text ellipsis={{ tooltip: taskObjectSummary(record.meta_summary, record.email) }}>{taskObjectSummary(record.meta_summary, record.email)}</Text>,
     },
     {
       title: '状态',
-      dataIndex: 'status',
       key: 'status',
-      width: 90,
-      render: (status: TaskStatus) => <Tag color={statusTagColor(status)}>{statusLabel(status)}</Tag>,
-    },
-    {
-      title: '进度',
-      key: 'progress',
-      width: 100,
-      render: (_, record) => record.detail?.progress || '-',
+      width: 150,
+      render: (_, record) => renderStatus(record),
     },
     {
       title: '统计',
       key: 'counts',
-      width: 150,
-      render: (_, record) => {
-        const success = Number(record.detail?.success || 0)
-        const skipped = Number(record.detail?.skipped || 0)
-        const failed = Array.isArray(record.detail?.errors) ? record.detail?.errors.length : 0
-        return `${success}/${skipped}/${failed}`
-      },
+      width: 180,
+      render: (_, record) => renderStatsTags(record),
     },
     {
       title: '错误信息',
       dataIndex: 'error',
       key: 'error',
-      render: (text: string) => text || '-',
+      render: (text: string) => text ? <Tooltip title={text}><Text ellipsis style={{ maxWidth: 260 }}>{text}</Text></Tooltip> : '-',
     },
     {
       title: '操作',
       key: 'actions',
-      width: 110,
+      width: 120,
       render: (_, record) => (
         <Button size="small" icon={<EyeOutlined />} onClick={() => void openDetail(record)}>
-          查看日志
+          查看详情
         </Button>
       ),
     },
   ]
 
+  const renderMobileCards = () => {
+    if (mobileLogs.length === 0) {
+      return <Empty description={loading ? '正在加载任务历史' : '暂无任务历史'} image={Empty.PRESENTED_IMAGE_SIMPLE} />
+    }
+
+    return (
+      <div className="mobile-card-list">
+        {mobileLogs.map((record) => {
+          const selected = selectedRowKeys.some((key) => Number(key) === Number(record.id))
+          const objectSummary = taskObjectSummary(record.meta_summary, record.email)
+
+          return (
+            <Card key={record.id} size="small" className="mobile-record-card">
+              <div className="mobile-record-head">
+                <Checkbox
+                  checked={selected}
+                  onChange={(event) => {
+                    setSelectedRowKeys((prev) => {
+                      if (event.target.checked) return Array.from(new Set([...prev.map((key) => Number(key)), Number(record.id)]))
+                      return prev.filter((key) => Number(key) !== Number(record.id))
+                    })
+                  }}
+                />
+                <div className="mobile-record-main">
+                  <Typography.Text className="mobile-record-title" strong>
+                    {taskSourceLabel(sourceOf(record))} · {objectSummary}
+                  </Typography.Text>
+                  <div className="mobile-record-meta">
+                    {renderStatus(record)}
+                    {renderStatsTags(record)}
+                    <Text type="secondary">{record.created_at ? new Date(record.created_at).toLocaleString('zh-CN') : '-'}</Text>
+                  </div>
+                </div>
+              </div>
+
+              {record.error ? (
+                <Alert style={{ marginTop: 10 }} type="warning" showIcon message={record.error} />
+              ) : null}
+
+              <div className="mobile-record-actions">
+                <Button size="small" icon={<EyeOutlined />} onClick={() => void openDetail(record)}>
+                  查看详情
+                </Button>
+              </div>
+            </Card>
+          )
+        })}
+      </div>
+    )
+  }
+
+  const drawerTitle = detailRecord ? taskSourceLabel(sourceOf(detailRecord)) : '任务详情'
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
         <div>
           <h1 style={{ fontSize: 24, fontWeight: 'bold', margin: 0 }}>任务历史</h1>
           <p style={{ color: '#7a8ba3', marginTop: 4 }}>注册任务执行记录</p>
         </div>
-        <Space>
-          <Text type="secondary">{total} 条记录</Text>
+        <Space wrap>
+          <Select
+            value={sourceFilter}
+            style={{ width: 180 }}
+            options={[{ value: '', label: '全部任务类型' }, ...TASK_SOURCE_OPTIONS]}
+            onChange={(value) => setSourceFilter(value)}
+          />
+          <Select<StatusFilter>
+            value={statusFilter}
+            style={{ width: 140 }}
+            options={[
+              { value: 'all', label: '全部状态' },
+              { value: 'running', label: '运行中' },
+              { value: 'success', label: '成功' },
+              { value: 'failed', label: '失败' },
+              { value: 'stopped', label: '已停止' },
+              { value: 'skipped', label: '跳过' },
+              { value: 'pending_activation', label: '待激活' },
+            ]}
+            onChange={(value) => setStatusFilter(value)}
+          />
+          <Text type="secondary">{filteredLogs.length === logs.length ? total : `${filteredLogs.length}/${total}`} 条记录</Text>
           {selectedRowKeys.length > 0 && <Text type="success">已选 {selectedRowKeys.length} 条</Text>}
           {selectedRowKeys.length > 0 && (
             <Popconfirm
@@ -320,45 +396,45 @@ export default function TaskHistory() {
       </div>
 
       <Card>
-        <Table
-          rowKey="id"
-          columns={columns}
-          dataSource={logs}
-          loading={loading}
-          rowSelection={{
-            selectedRowKeys,
-            onChange: (keys) => setSelectedRowKeys(keys as number[]),
-          }}
-          pagination={{ pageSize: 20, showSizeChanger: false }}
-        />
+        {isMobile ? (
+          <>
+            {renderMobileCards()}
+            <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 12 }}>
+              <Pagination
+                size="small"
+                current={mobilePage}
+                pageSize={mobilePageSize}
+                total={filteredLogs.length}
+                showSizeChanger={false}
+                onChange={setMobilePage}
+              />
+            </div>
+          </>
+        ) : (
+          <Table
+            rowKey="id"
+            columns={columns}
+            dataSource={filteredLogs}
+            loading={loading}
+            rowSelection={{
+              selectedRowKeys,
+              onChange: (keys) => setSelectedRowKeys(keys as number[]),
+            }}
+            pagination={{ pageSize: 20, showSizeChanger: false }}
+          />
+        )}
       </Card>
 
       <Drawer
-        title={detailRecord ? `任务日志 #${detailRecord.id}` : '任务日志'}
+        title={drawerTitle}
         open={detailOpen}
         onClose={() => setDetailOpen(false)}
         width={920}
         destroyOnClose={false}
       >
-        {detailRecord && (
+        {detailRecord ? (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-            <Descriptions bordered size="small" column={2}>
-              <Descriptions.Item label="平台">{detailRecord.platform || '-'}</Descriptions.Item>
-              <Descriptions.Item label="状态">
-                <Tag color={statusTagColor(detailRecord.status)}>{statusLabel(detailRecord.status)}</Tag>
-              </Descriptions.Item>
-              <Descriptions.Item label="邮箱">{detailRecord.email || '-'}</Descriptions.Item>
-              <Descriptions.Item label="时间">
-                {detailRecord.created_at ? new Date(detailRecord.created_at).toLocaleString('zh-CN') : '-'}
-              </Descriptions.Item>
-              <Descriptions.Item label="任务 ID">{detailRecord.detail?.task_id || '-'}</Descriptions.Item>
-              <Descriptions.Item label="结果">{taskOutcomeLabel(detailRecord.detail?.attempt_outcome)}</Descriptions.Item>
-              <Descriptions.Item label="进度">{detailRecord.detail?.progress || '-'}</Descriptions.Item>
-              <Descriptions.Item label="成功">{detailRecord.detail?.success ?? 0}</Descriptions.Item>
-              <Descriptions.Item label="跳过">{detailRecord.detail?.skipped ?? 0}</Descriptions.Item>
-              <Descriptions.Item label="失败">{Array.isArray(detailRecord.detail?.errors) ? detailRecord.detail?.errors.length : 0}</Descriptions.Item>
-              <Descriptions.Item label="错误信息" span={2}>{detailRecord.error || '-'}</Descriptions.Item>
-            </Descriptions>
+            <TaskDetailHeader record={detailRecord} />
 
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
               <Space>
@@ -400,15 +476,20 @@ export default function TaskHistory() {
               ) : rawDetailLines.length === 0 ? (
                 <Empty description="这条历史记录还没有持久化完整日志" image={Empty.PRESENTED_IMAGE_SIMPLE} />
               ) : visibleDetailLines.length === 0 ? (
-                <Text type="secondary">当前 Info 视图下没有可显示的日志</Text>
+                <Text type="secondary">当前 {viewMode === 'debug' ? 'Debug' : 'Info'} 视图下没有可显示的日志</Text>
               ) : (
                 visibleDetailLines.map((line, index) => (
                   <div
                     key={`${index}-${line.raw}`}
                     style={{
                       lineHeight: 1.6,
+                      margin: line.isDebug ? '2px 0' : 0,
+                      padding: line.isDebug ? '2px 8px' : 0,
+                      borderLeft: line.isDebug ? '3px solid #8b5cf6' : '3px solid transparent',
+                      borderRadius: line.isDebug ? 4 : 0,
+                      background: line.isDebug ? '#f5f3ff' : 'transparent',
                       color: line.isDebug
-                        ? '#6b7280'
+                        ? '#5b21b6'
                         : line.text.includes('✓') || line.text.includes('成功')
                           ? '#059669'
                           : line.text.includes('✗') || line.text.includes('失败') || line.text.includes('错误')
@@ -424,7 +505,9 @@ export default function TaskHistory() {
               )}
             </div>
           </div>
-        )}
+        ) : detailLoading ? (
+          <Text type="secondary">正在加载详情...</Text>
+        ) : null}
       </Drawer>
     </div>
   )

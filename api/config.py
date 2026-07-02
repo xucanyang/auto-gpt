@@ -1,7 +1,7 @@
 import os
 from pathlib import Path
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from core.config_store import config_store
 
@@ -16,6 +16,14 @@ CONFIG_KEYS = [
     "default_executor",
     "default_captcha_solver",
     "proxy_pool_cooldown_enabled",
+    "proxy_scan_enabled",
+    "proxy_scan_interval_minutes",
+    "proxy_scan_concurrency",
+    "proxy_scan_timeout_seconds",
+    "proxy_scan_targets",
+    "proxy_scan_only_active",
+    "proxy_scan_min_score",
+    "proxy_pool_max_candidates",
     "duckmail_api_url",
     "duckmail_provider_url",
     "duckmail_bearer",
@@ -44,11 +52,32 @@ CONFIG_KEYS = [
     "icloud_domain_base",
     "icloud_forward_to",
     "icloud_forward_mailbox_id",
+    "icloud_hme_helper_api_url",
+    "icloud_hme_helper_internal_key",
+    "icloud_hme_helper_api_key_header",
+    "icloud_hme_helper_consumer",
+    "icloud_hme_helper_checkout_ttl_seconds",
+    "icloud_hme_helper_wait_timeout_seconds",
+    "icloud_hme_helper_max_cache_age_seconds",
     "icloud_hme_auto_create_enabled",
     "icloud_hme_auto_create_stock_limit",
     "icloud_hme_auto_create_interval_min_minutes",
     "icloud_hme_auto_create_interval_max_minutes",
     "icloud_hme_auto_create_rate_limit_backoff_minutes",
+    "icloud_hme_auto_create_error_backoff_minutes",
+    "icloud_hme_auto_delete_enabled",
+    "icloud_hme_auto_delete_account_interval_min_minutes",
+    "icloud_hme_auto_delete_account_interval_max_minutes",
+    "icloud_hme_auto_delete_interval_min_minutes",
+    "icloud_hme_auto_delete_interval_max_minutes",
+    "icloud_hme_auto_delete_max_per_run",
+    "icloud_hme_auto_delete_per_item_delay_min_seconds",
+    "icloud_hme_auto_delete_per_item_delay_max_seconds",
+    "icloud_hme_auto_delete_rate_limit_backoff_minutes",
+    "icloud_hme_auto_delete_error_backoff_minutes",
+    "icloud_hme_auto_delete_recheck_before_delete",
+    "icloud_hme_auto_delete_pause_active_tasks",
+    "icloud_hme_auto_delete_dead_statuses",
     "tempmail_archive_cleanup_enabled",
     "tempmail_archive_cleanup_interval_minutes",
     "tempmail_archive_cleanup_keep_recent_minutes",
@@ -61,6 +90,7 @@ CONFIG_KEYS = [
     "tempmail_api_key_header",
     "tempmail_mode",
     "tempmail_primary_domain",
+    "tempmail_fixed_domains",
     "tempmail_wait_timeout_seconds",
     "tempmail_ttl_minutes",
     "tempmail_reuse_window_minutes",
@@ -106,6 +136,11 @@ CONFIG_KEYS = [
     "smstome_otp_timeout_seconds",
     "smstome_poll_interval_seconds",
     "smstome_sync_max_pages_per_country",
+    "chatgpt_phone_signup_use_pool",
+    "chatgpt_phone_signup_timeout_seconds",
+    "chatgpt_phone_signup_poll_interval_seconds",
+    "chatgpt_phone_signup_max_resend_attempts",
+    "chatgpt_phone_signup_resend_interval_seconds",
     "luckmail_base_url",
     "luckmail_api_key",
     "luckmail_email_type",
@@ -118,14 +153,27 @@ CONFIG_KEYS = [
     "cpa_cleanup_concurrency",
     "cpa_cleanup_register_delay_seconds",
     "sub2api_api_url",
+    "oaipay_api_url",
     "sub2api_api_key",
+    "oaipay_api_key",
     "sub2api_group_ids",
+    "oaipay_group",
     "chatgpt_enable_team_invite",
     "chatgpt_team_invite_deferred_activation",
     "chatgpt_capture_free_workspace",
     "chatgpt_capture_business_workspace",
+    "chatgpt_save_registration_access_token_account",
+    "chatgpt_phone_signup_password",
     "chatgpt_existing_account_login_password",
     "chatgpt_resume_auth_allow_phone_verification",
+    "chatgpt_resume_auth_allow_add_phone_verification",
+    "chatgpt_resume_auth_allow_existing_phone_verification",
+    "chatgpt_recheck_allow_add_phone_verification",
+    "chatgpt_recheck_allow_existing_phone_verification",
+    "existing_phone_otp_timeout_seconds",
+    "existing_phone_otp_poll_interval_seconds",
+    "existing_phone_otp_max_resend_attempts",
+    "existing_phone_otp_resend_interval_seconds",
     "chatgpt_subscription_auth_capture_retry_delays_seconds",
     "chatgpt_workspace_select_no_org_retry_delays_seconds",
     "chatgpt_gopay_defaults",
@@ -135,9 +183,16 @@ CONFIG_KEYS = [
     "chatgpt_access_token_only_checkout_currency",
     "chatgpt_access_token_only_zero_amount_stop_enabled",
     "chatgpt_access_token_only_zero_amount_stop_threshold",
+    "chatgpt_access_token_only_gopay_provider_link_enabled",
     "external_subscription_api_enabled",
     "external_subscription_api_token",
     "external_subscription_verify_after_seconds",
+    "external_access_token_api_enabled",
+    "external_access_token_api_token",
+    "external_access_token_allow_refresh",
+    "external_access_token_default_lease_seconds",
+    "external_access_token_max_limit",
+    "external_access_token_precheck_cooldown_seconds",
     "chatgpt_gopay_billing_llm_enabled",
     "chatgpt_gopay_billing_llm_base_url",
     "chatgpt_gopay_billing_llm_api_key",
@@ -148,6 +203,13 @@ CONFIG_KEYS = [
     "chatgpt_gopay_billing_llm_reasoning_effort",
     "chatgpt_gopay_billing_llm_timeout_seconds",
     "chatgpt_gopay_billing_llm_prompt",
+    "chatgpt_llm_api_base_url",
+    "chatgpt_llm_api_key",
+    "chatgpt_llm_model",
+    "chatgpt_llm_timeout_seconds",
+    "chatgpt_llm_billing_address_prompt",
+    "chatgpt_phone_verification_enabled",
+    "chatgpt_gopay_otp_auto_resend_delay_seconds",
     "chatgpt_gopay_phone_candidates",
     "chatgpt_gopay_uid_bindings",
     "chatgpt_gopay_uid_sessions",
@@ -168,6 +230,13 @@ class ConfigUpdate(BaseModel):
     data: dict
 
 
+class TempMailDomainsRequest(BaseModel):
+    api_url: str = ""
+    api_key: str = ""
+    api_key_header: str = ""
+    include_inactive: bool = False
+
+
 class AppleMailImportRequest(BaseModel):
     content: str
     filename: str = ""
@@ -182,6 +251,117 @@ def _default_tempmail_archive_backup_path() -> str:
     return "data/tempmail_email_backups.db"
 
 
+def _normalize_tempmail_domain_item(item):
+    if isinstance(item, str):
+        domain = item.strip().lower().lstrip("@.")
+        if not domain:
+            return None
+        return {
+            "domain": domain,
+            "is_active": True,
+            "status": "active",
+            "dns_status": "",
+            "mailbox_count": None,
+        }
+    if not isinstance(item, dict):
+        return None
+    domain = str(
+        item.get("domain")
+        or item.get("name")
+        or item.get("value")
+        or ""
+    ).strip().lower().lstrip("@.")
+    if not domain:
+        return None
+    is_active = item.get("is_active")
+    if is_active is None:
+        is_active = item.get("active")
+    status = str(item.get("status") or ("active" if is_active is not False else "disabled")).strip().lower()
+    dns_status = str(item.get("dns_status") or "").strip().lower()
+    available = (is_active is not False) and status in {"", "active", "ready", "enabled"} and dns_status not in {"missing", "error", "failed", "invalid"}
+    return {
+        "domain": domain,
+        "is_active": bool(is_active is not False),
+        "status": status or "active",
+        "dns_status": dns_status,
+        "available": available,
+        "mailbox_count": item.get("mailbox_count"),
+        "dns_record_count": item.get("dns_record_count"),
+        "is_protected": item.get("is_protected"),
+    }
+
+
+def _extract_tempmail_domain_items(payload):
+    if isinstance(payload, list):
+        return payload
+    if not isinstance(payload, dict):
+        return []
+    for key in ("domains", "data", "items"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return value
+    nested = payload.get("data")
+    if isinstance(nested, dict):
+        for key in ("domains", "items"):
+            value = nested.get(key)
+            if isinstance(value, list):
+                return value
+    return []
+
+
+@router.post("/tempmail/domains")
+def list_tempmail_domains(body: TempMailDomainsRequest | None = None):
+    from core.base_mailbox import TempMailLocalMailbox
+
+    body = body or TempMailDomainsRequest()
+    api_url = str(body.api_url or config_store.get("tempmail_api_url", "") or "").strip()
+    api_key = str(body.api_key or config_store.get("tempmail_api_key", "") or "").strip()
+    api_key_header = str(body.api_key_header or config_store.get("tempmail_api_key_header", "Authorization") or "Authorization").strip() or "Authorization"
+    if not api_url or not api_key:
+        raise HTTPException(400, "TempMail API URL / API Key 未配置")
+
+    mailbox = TempMailLocalMailbox(
+        api_url=api_url,
+        api_key=api_key,
+        api_key_header=api_key_header,
+        mode="fixed_domain",
+    )
+    try:
+        response = mailbox._request(
+            "GET",
+            "/api/domains",
+            headers=mailbox._headers(),
+            timeout=15,
+        )
+    except Exception as exc:
+        raise HTTPException(502, f"读取 TempMail 域名失败: {exc}") from exc
+    if response.status_code != 200:
+        raise HTTPException(502, f"读取 TempMail 域名失败: HTTP {response.status_code} {response.text[:200]}")
+    try:
+        payload = response.json()
+    except Exception as exc:
+        raise HTTPException(502, "读取 TempMail 域名失败: 返回不是 JSON") from exc
+
+    seen = set()
+    domains = []
+    for item in _extract_tempmail_domain_items(payload):
+        normalized = _normalize_tempmail_domain_item(item)
+        if not normalized:
+            continue
+        domain = normalized["domain"]
+        if domain in seen:
+            continue
+        seen.add(domain)
+        if body.include_inactive or normalized.get("available"):
+            domains.append(normalized)
+
+    return {
+        "ok": True,
+        "domains": domains,
+        "available_domains": [item["domain"] for item in domains if item.get("available")],
+    }
+
+
 @router.get("")
 def get_config():
     all_cfg = config_store.get_all()
@@ -189,12 +369,40 @@ def get_config():
         all_cfg["mail_provider"] = "luckmail"
     if not all_cfg.get("proxy_pool_cooldown_enabled"):
         all_cfg["proxy_pool_cooldown_enabled"] = "true"
+    if not all_cfg.get("proxy_scan_enabled"):
+        all_cfg["proxy_scan_enabled"] = "false"
+    if not all_cfg.get("proxy_scan_interval_minutes"):
+        all_cfg["proxy_scan_interval_minutes"] = "30"
+    if not all_cfg.get("proxy_scan_concurrency"):
+        all_cfg["proxy_scan_concurrency"] = "8"
+    if not all_cfg.get("proxy_scan_timeout_seconds"):
+        all_cfg["proxy_scan_timeout_seconds"] = "8"
+    if not all_cfg.get("proxy_scan_targets"):
+        all_cfg["proxy_scan_targets"] = "basic,geo,chatgpt"
+    if not all_cfg.get("proxy_scan_only_active"):
+        all_cfg["proxy_scan_only_active"] = "true"
+    if not all_cfg.get("proxy_scan_min_score"):
+        all_cfg["proxy_scan_min_score"] = "50"
+    if not all_cfg.get("proxy_pool_max_candidates"):
+        all_cfg["proxy_pool_max_candidates"] = "5"
+    if "chatgpt_save_registration_access_token_account" not in all_cfg:
+        all_cfg["chatgpt_save_registration_access_token_account"] = "true"
     if not all_cfg.get("icloud_hme_mode"):
         all_cfg["icloud_hme_mode"] = "live"
     if not all_cfg.get("icloud_domain_base"):
         all_cfg["icloud_domain_base"] = "icloud.com"
     if not all_cfg.get("icloud_forward_to"):
         all_cfg["icloud_forward_to"] = "b@cccy.me"
+    if not all_cfg.get("icloud_hme_helper_api_key_header"):
+        all_cfg["icloud_hme_helper_api_key_header"] = "X-Internal-Key"
+    if not all_cfg.get("icloud_hme_helper_consumer"):
+        all_cfg["icloud_hme_helper_consumer"] = "auto-gpt/chatgpt_register"
+    if not all_cfg.get("icloud_hme_helper_checkout_ttl_seconds"):
+        all_cfg["icloud_hme_helper_checkout_ttl_seconds"] = "10800"
+    if not all_cfg.get("icloud_hme_helper_wait_timeout_seconds"):
+        all_cfg["icloud_hme_helper_wait_timeout_seconds"] = "300"
+    if not all_cfg.get("icloud_hme_helper_max_cache_age_seconds"):
+        all_cfg["icloud_hme_helper_max_cache_age_seconds"] = "86400"
     if not all_cfg.get("icloud_hme_auto_create_enabled"):
         all_cfg["icloud_hme_auto_create_enabled"] = "false"
     if not all_cfg.get("icloud_hme_auto_create_stock_limit"):
@@ -205,6 +413,34 @@ def get_config():
         all_cfg["icloud_hme_auto_create_interval_max_minutes"] = "120"
     if not all_cfg.get("icloud_hme_auto_create_rate_limit_backoff_minutes"):
         all_cfg["icloud_hme_auto_create_rate_limit_backoff_minutes"] = "360"
+    if not all_cfg.get("icloud_hme_auto_create_error_backoff_minutes"):
+        all_cfg["icloud_hme_auto_create_error_backoff_minutes"] = "3"
+    if not all_cfg.get("icloud_hme_auto_delete_enabled"):
+        all_cfg["icloud_hme_auto_delete_enabled"] = "false"
+    if not all_cfg.get("icloud_hme_auto_delete_account_interval_min_minutes"):
+        all_cfg["icloud_hme_auto_delete_account_interval_min_minutes"] = "10"
+    if not all_cfg.get("icloud_hme_auto_delete_account_interval_max_minutes"):
+        all_cfg["icloud_hme_auto_delete_account_interval_max_minutes"] = "30"
+    if not all_cfg.get("icloud_hme_auto_delete_interval_min_minutes"):
+        all_cfg["icloud_hme_auto_delete_interval_min_minutes"] = "60"
+    if not all_cfg.get("icloud_hme_auto_delete_interval_max_minutes"):
+        all_cfg["icloud_hme_auto_delete_interval_max_minutes"] = "120"
+    if not all_cfg.get("icloud_hme_auto_delete_max_per_run"):
+        all_cfg["icloud_hme_auto_delete_max_per_run"] = "20"
+    if not all_cfg.get("icloud_hme_auto_delete_per_item_delay_min_seconds"):
+        all_cfg["icloud_hme_auto_delete_per_item_delay_min_seconds"] = "30"
+    if not all_cfg.get("icloud_hme_auto_delete_per_item_delay_max_seconds"):
+        all_cfg["icloud_hme_auto_delete_per_item_delay_max_seconds"] = "90"
+    if not all_cfg.get("icloud_hme_auto_delete_rate_limit_backoff_minutes"):
+        all_cfg["icloud_hme_auto_delete_rate_limit_backoff_minutes"] = "60"
+    if not all_cfg.get("icloud_hme_auto_delete_error_backoff_minutes"):
+        all_cfg["icloud_hme_auto_delete_error_backoff_minutes"] = "3"
+    if not all_cfg.get("icloud_hme_auto_delete_recheck_before_delete"):
+        all_cfg["icloud_hme_auto_delete_recheck_before_delete"] = "true"
+    if not all_cfg.get("icloud_hme_auto_delete_pause_active_tasks"):
+        all_cfg["icloud_hme_auto_delete_pause_active_tasks"] = "true"
+    if not all_cfg.get("icloud_hme_auto_delete_dead_statuses"):
+        all_cfg["icloud_hme_auto_delete_dead_statuses"] = "account_deactivated,password_invalid"
     if not all_cfg.get("tempmail_archive_cleanup_enabled"):
         all_cfg["tempmail_archive_cleanup_enabled"] = "false"
     if not all_cfg.get("tempmail_archive_cleanup_interval_minutes"):
@@ -243,12 +479,40 @@ def get_config():
         all_cfg["chatgpt_access_token_only_checkout_currency"] = "USD"
     if not all_cfg.get("chatgpt_access_token_only_zero_amount_stop_threshold"):
         all_cfg["chatgpt_access_token_only_zero_amount_stop_threshold"] = "1"
+    if not all_cfg.get("chatgpt_access_token_only_gopay_provider_link_enabled"):
+        all_cfg["chatgpt_access_token_only_gopay_provider_link_enabled"] = "false"
     if not all_cfg.get("external_subscription_api_enabled"):
         all_cfg["external_subscription_api_enabled"] = "false"
     if not all_cfg.get("external_subscription_verify_after_seconds"):
         all_cfg["external_subscription_verify_after_seconds"] = "300"
+    if not all_cfg.get("external_access_token_api_enabled"):
+        all_cfg["external_access_token_api_enabled"] = "false"
+    if not all_cfg.get("external_access_token_allow_refresh"):
+        all_cfg["external_access_token_allow_refresh"] = "true"
+    if not all_cfg.get("external_access_token_default_lease_seconds"):
+        all_cfg["external_access_token_default_lease_seconds"] = "86400"
+    if not all_cfg.get("external_access_token_max_limit"):
+        all_cfg["external_access_token_max_limit"] = "50"
+    if not all_cfg.get("external_access_token_precheck_cooldown_seconds"):
+        all_cfg["external_access_token_precheck_cooldown_seconds"] = "600"
     if not all_cfg.get("chatgpt_resume_auth_allow_phone_verification"):
         all_cfg["chatgpt_resume_auth_allow_phone_verification"] = "false"
+    if not all_cfg.get("chatgpt_resume_auth_allow_add_phone_verification"):
+        all_cfg["chatgpt_resume_auth_allow_add_phone_verification"] = all_cfg.get("chatgpt_resume_auth_allow_phone_verification") or "false"
+    if not all_cfg.get("chatgpt_resume_auth_allow_existing_phone_verification"):
+        all_cfg["chatgpt_resume_auth_allow_existing_phone_verification"] = "true"
+    if not all_cfg.get("chatgpt_recheck_allow_add_phone_verification"):
+        all_cfg["chatgpt_recheck_allow_add_phone_verification"] = "false"
+    if not all_cfg.get("chatgpt_recheck_allow_existing_phone_verification"):
+        all_cfg["chatgpt_recheck_allow_existing_phone_verification"] = "true"
+    if not all_cfg.get("existing_phone_otp_timeout_seconds"):
+        all_cfg["existing_phone_otp_timeout_seconds"] = "180"
+    if not all_cfg.get("existing_phone_otp_poll_interval_seconds"):
+        all_cfg["existing_phone_otp_poll_interval_seconds"] = "5"
+    if not all_cfg.get("existing_phone_otp_max_resend_attempts"):
+        all_cfg["existing_phone_otp_max_resend_attempts"] = "1"
+    if not all_cfg.get("existing_phone_otp_resend_interval_seconds"):
+        all_cfg["existing_phone_otp_resend_interval_seconds"] = "30"
     if not all_cfg.get("chatgpt_subscription_auth_capture_retry_delays_seconds"):
         all_cfg["chatgpt_subscription_auth_capture_retry_delays_seconds"] = "5,10"
     if not all_cfg.get("chatgpt_workspace_select_no_org_retry_delays_seconds"):
@@ -273,6 +537,16 @@ def get_config():
         all_cfg["local_phone_gateway_resend_interval_seconds"] = "30"
     if not all_cfg.get("local_phone_gateway_queue_timeout_seconds"):
         all_cfg["local_phone_gateway_queue_timeout_seconds"] = "3600"
+    if not all_cfg.get("chatgpt_phone_signup_use_pool"):
+        all_cfg["chatgpt_phone_signup_use_pool"] = "false"
+    if not all_cfg.get("chatgpt_phone_signup_timeout_seconds"):
+        all_cfg["chatgpt_phone_signup_timeout_seconds"] = "180"
+    if not all_cfg.get("chatgpt_phone_signup_poll_interval_seconds"):
+        all_cfg["chatgpt_phone_signup_poll_interval_seconds"] = "5"
+    if not all_cfg.get("chatgpt_phone_signup_max_resend_attempts"):
+        all_cfg["chatgpt_phone_signup_max_resend_attempts"] = "1"
+    if not all_cfg.get("chatgpt_phone_signup_resend_interval_seconds"):
+        all_cfg["chatgpt_phone_signup_resend_interval_seconds"] = "60"
     if not all_cfg.get("chatgpt_gopay_billing_llm_base_url"):
         all_cfg["chatgpt_gopay_billing_llm_base_url"] = "https://api.666800.xyz"
     if not all_cfg.get("chatgpt_gopay_billing_llm_model"):
@@ -289,6 +563,20 @@ def get_config():
         all_cfg["chatgpt_gopay_billing_llm_timeout_seconds"] = "45"
     if not all_cfg.get("chatgpt_gopay_billing_llm_prompt"):
         all_cfg["chatgpt_gopay_billing_llm_prompt"] = "生成一个真实可用的账单地址，地址在谷歌地图中能找到对应的位置。"
+    if not all_cfg.get("chatgpt_gopay_billing_llm_api_key") and all_cfg.get("chatgpt_llm_api_key"):
+        all_cfg["chatgpt_gopay_billing_llm_api_key"] = all_cfg.get("chatgpt_llm_api_key") or ""
+    if not all_cfg.get("chatgpt_llm_api_base_url"):
+        all_cfg["chatgpt_llm_api_base_url"] = all_cfg.get("chatgpt_gopay_billing_llm_base_url") or "https://api.666800.xyz/"
+    if not all_cfg.get("chatgpt_llm_model"):
+        all_cfg["chatgpt_llm_model"] = all_cfg.get("chatgpt_gopay_billing_llm_model") or "gpt-5.4"
+    if not all_cfg.get("chatgpt_llm_timeout_seconds"):
+        all_cfg["chatgpt_llm_timeout_seconds"] = all_cfg.get("chatgpt_gopay_billing_llm_timeout_seconds") or "45"
+    if not all_cfg.get("chatgpt_llm_billing_address_prompt"):
+        all_cfg["chatgpt_llm_billing_address_prompt"] = all_cfg.get("chatgpt_gopay_billing_llm_prompt") or ""
+    if not all_cfg.get("chatgpt_phone_verification_enabled"):
+        all_cfg["chatgpt_phone_verification_enabled"] = "true"
+    if not all_cfg.get("chatgpt_gopay_otp_auto_resend_delay_seconds"):
+        all_cfg["chatgpt_gopay_otp_auto_resend_delay_seconds"] = "10"
     # 只返回已知 key，未设置的返回空字符串
     return {k: all_cfg.get(k, "") for k in CONFIG_KEYS}
 

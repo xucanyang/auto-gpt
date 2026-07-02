@@ -13,6 +13,8 @@ def normalize_proxy_url(proxy_url: Optional[str]) -> Optional[str]:
     value = str(proxy_url).strip()
     if not value:
         return None
+    if value.startswith("socks5://") and "cliproxy.io" in value:
+        value = value.replace("socks5://", "http://", 1)
     return value
 
 
@@ -24,33 +26,12 @@ def resolve_runtime_proxy(proxy_url: Optional[str] = None) -> str:
 def iter_enabled_runtime_proxies(proxy_url: Optional[str] = None) -> list[str]:
     try:
         from .proxy_pool import proxy_pool
-        from .db import ProxyModel, engine
-        from sqlmodel import Session, select
-        from datetime import datetime, timezone
 
-        now = datetime.now(timezone.utc)
-        with Session(engine) as s:
-            proxies = s.exec(select(ProxyModel).where(ProxyModel.is_active == True)).all()
-        filtered = [
-            p
-            for p in proxies
-            if (
-                not proxy_pool._is_cooldown_enabled()
-                or getattr(p, "homepage_circuit_open_until", None) is None
-                or p.homepage_circuit_open_until <= now
-            )
-        ]
-        filtered.sort(
-            key=lambda p: (
-                p.homepage_success_count / max(p.homepage_success_count + p.homepage_fail_count, 1),
-                p.success_count / max(p.success_count + p.fail_count, 1),
-            ),
-            reverse=True,
-        )
+        filtered = proxy_pool.get_candidate_records()
         results: list[str] = []
         seen: set[str] = set()
         for item in filtered:
-            value = normalize_proxy_url(getattr(item, "url", ""))
+            value = normalize_proxy_url(item.get("url", "") if isinstance(item, dict) else getattr(item, "url", ""))
             if not value or value in seen:
                 continue
             seen.add(value)
@@ -109,6 +90,15 @@ def build_playwright_proxy_config(proxy_url: Optional[str]) -> Optional[dict[str
 def is_proxy_error_text(error_text: Optional[str]) -> bool:
     text = str(error_text or "").strip().lower()
     if not text:
+        return False
+    account_state_markers = (
+        "account_deactivated",
+        "account_deleted",
+        "account has been deleted or deactivated",
+        "you do not have an account because it has been deleted or deactivated",
+        "deleted or deactivated",
+    )
+    if any(marker in text for marker in account_state_markers):
         return False
     markers = (
         "curl: (7)",

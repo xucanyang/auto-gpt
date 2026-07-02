@@ -617,6 +617,21 @@ def probe_local_chatgpt_status(account: Any, proxy: Optional[str] = None) -> dic
                 "message": codex_result.message,
             }
         )
+        try:
+            from services.chatgpt_core.codex_usage import (
+                build_codex_usage_extra_updates,
+                parse_codex_rate_limit_headers,
+                parse_codex_usage_body,
+            )
+
+            snapshot = parse_codex_rate_limit_headers(codex_result.headers, updated_at=checked_at)
+            if not snapshot:
+                snapshot = parse_codex_usage_body(codex_result.body_json, updated_at=checked_at)
+            usage = build_codex_usage_extra_updates(snapshot, checked_at) if snapshot else {}
+            if usage:
+                result["codex"]["usage"] = usage
+        except Exception:
+            pass
         if codex_result.status_code == 200:
             result["codex"]["state"] = "usable"
         elif codex_result.status_code == 401:

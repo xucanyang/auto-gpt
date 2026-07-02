@@ -4,13 +4,16 @@ import {
   App,
   Button,
   Card,
+  Checkbox,
   Col,
   Drawer,
   Empty,
   Form,
+  Grid,
   Input,
   InputNumber,
   Modal,
+  Pagination,
   Radio,
   Row,
   Select,
@@ -132,6 +135,8 @@ export default function Teams() {
   const [quickInviteForm] = Form.useForm()
   const [editForm] = Form.useForm()
   const { message: messageApi, modal } = App.useApp()
+  const screens = Grid.useBreakpoint()
+  const isMobile = screens.lg === false
 
   const [loading, setLoading] = useState(false)
   const [savingSettings, setSavingSettings] = useState(false)
@@ -804,6 +809,93 @@ const settings = Form.useWatch([], settingsForm)
     },
   ]
 
+  const renderTeamMobileCards = () => {
+    if (teams.length === 0) {
+      return <Empty description={loading ? '正在加载 Team' : '暂无 Team'} image={Empty.PRESENTED_IMAGE_SIMPLE} />
+    }
+
+    return (
+      <div className="mobile-card-list">
+        {teams.map((record) => {
+          const id = Number(record.id)
+          const source = record.source_account || {}
+          const syncMeta = getLiveSyncMeta(record.live_sync_state)
+          const selected = selectedTeamIds.some((teamId) => Number(teamId) === id)
+
+          return (
+            <Card key={record.id} size="small" className="mobile-record-card">
+              <div className="mobile-record-head">
+                <Checkbox
+                  checked={selected}
+                  onChange={(event) => {
+                    setSelectedTeamIds((prev) => {
+                      if (event.target.checked) return Array.from(new Set([...prev.map((key) => Number(key)), id]))
+                      return prev.filter((key) => Number(key) !== id)
+                    })
+                  }}
+                />
+                <div className="mobile-record-main">
+                  <Text strong className="mobile-record-title">
+                    {compactText(record.team_name, `Team #${record.id}`)}
+                  </Text>
+                  <Text type="secondary" className="mobile-record-title" copyable={record.email ? { text: record.email, tooltips: ['复制邮箱', '已复制'] } : false}>
+                    {record.email || '-'}
+                  </Text>
+                  <div className="mobile-record-meta">
+                    <Tag color={STATUS_COLORS[record.status] || 'default'}>{compactText(record.status)}</Tag>
+                    <Tag color={syncMeta.color}>{syncMeta.label}</Tag>
+                    <Tag>{compactText(record.subscription_plan)}</Tag>
+                  </div>
+                </div>
+              </div>
+
+              <div className="mobile-record-section">
+                <div className="mobile-record-field">
+                  <span className="mobile-record-label">成员容量</span>
+                  <span className="mobile-record-value">
+                    {record.current_members}/{record.max_members} · 待加入 {record.invited_members || 0} · 剩余 {record.remaining_slots}
+                  </span>
+                </div>
+                <div className="mobile-record-field">
+                  <span className="mobile-record-label">来源账号</span>
+                  <span className="mobile-record-value">
+                    {source.account_db_id ? `${compactText(source.email)} · ${compactText(source.workspace_label || source.workspace_scope)} · #${source.account_db_id}` : '-'}
+                  </span>
+                </div>
+                <div className="mobile-record-field">
+                  <span className="mobile-record-label">最后同步</span>
+                  <span className="mobile-record-value">{formatDateTime(record.last_sync)}</span>
+                </div>
+                <div className="mobile-record-field">
+                  <span className="mobile-record-label">实时说明</span>
+                  <span className="mobile-record-value">{record.live_sync_error || syncMeta.description}</span>
+                </div>
+              </div>
+
+              <div className="mobile-record-actions">
+                <Button size="small" icon={<ReloadOutlined />} onClick={() => refreshTeam(record)}>
+                  刷新
+                </Button>
+                <Button size="small" icon={<EditOutlined />} onClick={() => openEditTeam(record)}>
+                  编辑
+                </Button>
+                <Button size="small" icon={<UsergroupAddOutlined />} onClick={() => openMembers(record)}>
+                  成员
+                </Button>
+                <Button type="primary" size="small" icon={<UserAddOutlined />} onClick={() => openInvite(record)}>
+                  邀请
+                </Button>
+                <Button danger size="small" icon={<DeleteOutlined />} loading={deletingTeamId === record.id} onClick={() => deleteTeam(record)}>
+                  删除
+                </Button>
+              </div>
+            </Card>
+          )
+        })}
+      </div>
+    )
+  }
+
   const renderInvitedActions = (record: any) => {
     const normalKey = `${currentTeam?.id}:${record.email}:normal`
     const forceKey = `${currentTeam?.id}:${record.email}:force`
@@ -1042,21 +1134,37 @@ const settings = Form.useWatch([], settingsForm)
           </Space>
         </div>
 
-        <Table
-          rowKey="id"
-          rowSelection={rowSelection}
-          columns={teamColumns}
-          dataSource={teams}
-          loading={loading}
-          tableLayout="fixed"
-          pagination={{
-            current: page,
-            pageSize,
-            total,
-            showSizeChanger: true,
-            onChange: (nextPage, nextPageSize) => loadTeams(nextPage, nextPageSize, search, status),
-          }}
-        />
+        {isMobile ? (
+          <>
+            {renderTeamMobileCards()}
+            <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 12 }}>
+              <Pagination
+                size="small"
+                current={page}
+                pageSize={pageSize}
+                total={total}
+                showSizeChanger
+                onChange={(nextPage, nextPageSize) => loadTeams(nextPage, nextPageSize, search, status)}
+              />
+            </div>
+          </>
+        ) : (
+          <Table
+            rowKey="id"
+            rowSelection={rowSelection}
+            columns={teamColumns}
+            dataSource={teams}
+            loading={loading}
+            tableLayout="fixed"
+            pagination={{
+              current: page,
+              pageSize,
+              total,
+              showSizeChanger: true,
+              onChange: (nextPage, nextPageSize) => loadTeams(nextPage, nextPageSize, search, status),
+            }}
+          />
+        )}
       </Card>
 
       <Drawer

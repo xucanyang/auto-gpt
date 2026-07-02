@@ -18,6 +18,7 @@ from services.chatgpt_core.refresh_token_registration_engine import (
     RegistrationResult,
 )
 from services.chatgpt_core.utils import FlowState
+from core.task_runtime import SkipCurrentAttemptRequested
 
 
 class DummyEmailService:
@@ -31,6 +32,23 @@ class DummyEmailService:
 
 
 class RefreshTokenRegistrationEngineTests(unittest.TestCase):
+    def setUp(self):
+        self._homepage_probe_patch = mock.patch.object(
+            RefreshTokenRegistrationEngine,
+            "_probe_homepage_before_email_creation",
+            return_value=(True, ""),
+        )
+        self._homepage_report_patch = mock.patch.object(
+            RefreshTokenRegistrationEngine,
+            "_report_homepage_probe",
+        )
+        self._homepage_probe_patch.start()
+        self._homepage_report_patch.start()
+
+    def tearDown(self):
+        self._homepage_report_patch.stop()
+        self._homepage_probe_patch.stop()
+
     def _make_engine(self, **kwargs):
         return RefreshTokenRegistrationEngine(
             email_service=DummyEmailService(),
@@ -223,9 +241,412 @@ class RefreshTokenRegistrationEngineTests(unittest.TestCase):
         self.assertEqual(result.source, "registration_session")
         self.assertEqual(result.access_token, "at-registration")
         self.assertEqual(result.session_token, "session-registration")
-        self.assertEqual(result.workspace_artifacts[0]["variant_key"], "registration_at:acct-registration")
+        self.assertEqual(result.workspace_artifacts[0]["variant_key"], "free:acct-registration")
         self.assertTrue(result.metadata["registration_access_token_saved"])
         finalize.assert_called_once()
+
+    @mock.patch("services.chatgpt_core.refresh_token_registration_engine.OAuthManager")
+    @mock.patch("services.chatgpt_core.refresh_token_registration_engine.OAuthClient")
+    @mock.patch("services.chatgpt_core.refresh_token_registration_engine.ChatGPTClient")
+    def test_run_defaults_to_saving_registration_access_token_when_workspace_capture_fails(
+        self,
+        mock_chatgpt_client_cls,
+        mock_oauth_client_cls,
+        mock_oauth_manager_cls,
+    ):
+        register_client = mock.Mock()
+        register_client.device_id = "device-fixed"
+        register_client.ua = "UA"
+        register_client.sec_ch_ua = '"Chromium";v="136"'
+        register_client.impersonate = "chrome136"
+        register_client.fingerprint = {"device_id": "device-fixed"}
+        register_client.register_complete_flow.return_value = (True, "注册成功")
+        register_client.reuse_session_and_get_tokens.return_value = (
+            True,
+            {
+                "access_token": "at-registration",
+                "session_token": "session-registration",
+                "account_id": "acct-registration",
+                "workspace_id": "acct-registration",
+            },
+        )
+        mock_chatgpt_client_cls.return_value = register_client
+        mock_oauth_client_cls.return_value = mock.Mock()
+        mock_oauth_manager_cls.return_value = mock.Mock()
+
+        engine = self._make_engine(
+            extra_config={
+                "register_max_retries": 1,
+                "chatgpt_capture_free_workspace": True,
+                "chatgpt_enable_team_invite": False,
+            }
+        )
+
+        with mock.patch.object(engine, "_finalize_workspace_artifacts", return_value=False):
+            result = engine.run()
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.source, "registration_session")
+        self.assertEqual(result.access_token, "at-registration")
+        self.assertEqual(result.session_token, "session-registration")
+        self.assertEqual(result.email, "user@example.com")
+        self.assertEqual(result.workspace_artifacts[0]["variant_key"], "free:acct-registration")
+        self.assertTrue(result.metadata["registration_access_token_saved"])
+
+    @mock.patch("services.chatgpt_core.refresh_token_registration_engine.OAuthManager")
+    @mock.patch("services.chatgpt_core.refresh_token_registration_engine.OAuthClient")
+    @mock.patch("services.chatgpt_core.refresh_token_registration_engine.ChatGPTClient")
+    def test_run_keeps_registration_access_token_when_second_stage_phone_challenge_skipped(
+        self,
+        mock_chatgpt_client_cls,
+        mock_oauth_client_cls,
+        mock_oauth_manager_cls,
+    ):
+        register_client = mock.Mock()
+        register_client.device_id = "device-fixed"
+        register_client.ua = "UA"
+        register_client.sec_ch_ua = '"Chromium";v="136"'
+        register_client.impersonate = "chrome136"
+        register_client.fingerprint = {"device_id": "device-fixed"}
+        register_client.register_complete_flow.return_value = (True, "注册成功")
+        register_client.reuse_session_and_get_tokens.return_value = (
+            True,
+            {
+                "access_token": "at-registration",
+                "session_token": "session-registration",
+                "account_id": "acct-registration",
+                "workspace_id": "acct-registration",
+            },
+        )
+        mock_chatgpt_client_cls.return_value = register_client
+        mock_oauth_client_cls.return_value = mock.Mock()
+        mock_oauth_manager_cls.return_value = mock.Mock()
+
+        engine = self._make_engine(
+            extra_config={
+                "register_max_retries": 1,
+                "chatgpt_save_registration_access_token_account": True,
+                "chatgpt_capture_free_workspace": True,
+                "chatgpt_enable_team_invite": False,
+            }
+        )
+
+        def fake_second_stage(*args, **kwargs):
+            engine._last_phone_challenge_events.append(
+                {
+                    "type": "add_phone",
+                    "status": "unbound_required",
+                    "source": "workspace_capture_free",
+                    "message": "命中 add_phone，账号尚未绑定手机号，未启用自动新绑",
+                    "display": "未绑定手机号",
+                }
+            )
+            raise SkipCurrentAttemptRequested("手机号验证码 60s 内未输入，自动跳过当前账号")
+
+        with mock.patch.object(engine, "_finalize_workspace_artifacts", side_effect=fake_second_stage):
+            result = engine.run()
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.source, "registration_session")
+        self.assertEqual(result.access_token, "at-registration")
+        self.assertEqual(result.refresh_token, "")
+        self.assertTrue(result.metadata["registration_access_token_saved"])
+        self.assertNotIn("registration_full_auth_failed", result.metadata)
+        self.assertNotIn("needs_auth_capture", result.metadata)
+        self.assertNotIn("auth_capture_required", result.metadata)
+        self.assertNotIn("chatgpt_phone_challenge", result.metadata)
+
+    def test_registration_full_auth_capture_uses_standard_second_stage_phone_policy(self):
+        engine = self._make_engine(
+            extra_config={
+                "chatgpt_resume_auth_allow_add_phone_verification": False,
+                "chatgpt_resume_auth_allow_existing_phone_verification": True,
+            }
+        )
+        fake_oauth = mock.Mock()
+        fake_oauth._phone_challenge_events = []
+        fake_oauth.login_and_get_tokens.return_value = {
+            "access_token": "at-free",
+            "refresh_token": "rt-free",
+            "id_token": "",
+            "account_id": "acct-free",
+        }
+        fake_oauth.last_workspace_id = "ws-free"
+        fake_oauth._get_cookie_value.return_value = "session-free"
+
+        with mock.patch.object(engine, "_build_oauth_client", return_value=fake_oauth):
+            artifact = engine._capture_workspace_artifact_via_fresh_login(
+                scope="free",
+                email="user@example.com",
+                password="Secret123!",
+                device_id="device-fixed",
+                user_agent="UA",
+                sec_ch_ua='"Chromium";v="136"',
+                impersonate="chrome136",
+                browser_fingerprint={"device_id": "device-fixed"},
+                email_adapter=mock.Mock(),
+                first_name="Ada",
+                last_name="Lovelace",
+                birthdate="1990-01-02",
+            )
+
+        self.assertEqual(artifact["refresh_token"], "rt-free")
+        login_kwargs = fake_oauth.login_and_get_tokens.call_args.kwargs
+        self.assertTrue(login_kwargs["allow_phone_verification"])
+        self.assertFalse(login_kwargs["allow_add_phone_verification"])
+        self.assertTrue(login_kwargs["allow_existing_phone_verification"])
+        self.assertFalse(login_kwargs["allow_add_phone_session_recovery"])
+        self.assertFalse(login_kwargs["force_chatgpt_entry"])
+        self.assertEqual(login_kwargs["login_source"], "workspace_capture_free")
+
+    @mock.patch("services.chatgpt_core.refresh_token_registration_engine.OAuthManager")
+    @mock.patch("services.chatgpt_core.refresh_token_registration_engine.OAuthClient")
+    @mock.patch("services.chatgpt_core.refresh_token_registration_engine.ChatGPTClient")
+    def test_run_keeps_registration_access_token_checkpoint_even_when_legacy_flag_disabled(
+        self,
+        mock_chatgpt_client_cls,
+        mock_oauth_client_cls,
+        mock_oauth_manager_cls,
+    ):
+        register_client = mock.Mock()
+        register_client.device_id = "device-fixed"
+        register_client.ua = "UA"
+        register_client.sec_ch_ua = '"Chromium";v="136"'
+        register_client.impersonate = "chrome136"
+        register_client.fingerprint = {"device_id": "device-fixed"}
+        register_client.register_complete_flow.return_value = (True, "注册成功")
+        register_client.reuse_session_and_get_tokens.return_value = (
+            True,
+            {
+                "access_token": "at-registration",
+                "session_token": "session-registration",
+                "account_id": "acct-registration",
+                "workspace_id": "acct-registration",
+            },
+        )
+        mock_chatgpt_client_cls.return_value = register_client
+        mock_oauth_client_cls.return_value = mock.Mock()
+        mock_oauth_manager_cls.return_value = mock.Mock()
+
+        engine = self._make_engine(
+            extra_config={
+                "register_max_retries": 1,
+                # 历史 UI/localStorage 里可能残留 false；注册阶段拿到 AT 后仍必须先落 checkpoint，
+                # 不能再让第二阶段“未生成任何工作空间产物”把真实注册结果丢掉。
+                "chatgpt_save_registration_access_token_account": False,
+                "chatgpt_capture_free_workspace": True,
+                "chatgpt_enable_team_invite": False,
+            }
+        )
+
+        with mock.patch.object(engine, "_finalize_workspace_artifacts", return_value=False):
+            result = engine.run()
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.source, "registration_session")
+        self.assertEqual(result.access_token, "at-registration")
+        self.assertEqual(result.session_token, "session-registration")
+        self.assertEqual(result.workspace_artifacts[0]["variant_key"], "free:acct-registration")
+        self.assertTrue(result.metadata["registration_access_token_saved"])
+        self.assertFalse(result.metadata["registration_access_token_save_requested"])
+        self.assertEqual(
+            result.metadata["registration_access_token_checkpoint_policy"],
+            "always_keep_before_full_auth",
+        )
+
+
+    @mock.patch("services.chatgpt_core.refresh_token_registration_engine.OAuthManager")
+    @mock.patch("services.chatgpt_core.refresh_token_registration_engine.OAuthClient")
+    @mock.patch("services.chatgpt_core.refresh_token_registration_engine.ChatGPTClient")
+    def test_registration_access_token_checkpoint_created_before_second_stage_even_when_disabled(
+        self,
+        mock_chatgpt_client_cls,
+        mock_oauth_client_cls,
+        mock_oauth_manager_cls,
+    ):
+        register_client = mock.Mock()
+        register_client.device_id = "device-fixed"
+        register_client.ua = "UA"
+        register_client.sec_ch_ua = '"Chromium";v="136"'
+        register_client.impersonate = "chrome136"
+        register_client.fingerprint = {"device_id": "device-fixed"}
+        register_client.register_complete_flow.return_value = (True, "注册成功")
+        register_client.reuse_session_and_get_tokens.return_value = (
+            True,
+            {
+                "access_token": "at-registration",
+                "session_token": "session-registration",
+                "account_id": "acct-registration",
+                "workspace_id": "acct-registration",
+            },
+        )
+        mock_chatgpt_client_cls.return_value = register_client
+        mock_oauth_client_cls.return_value = mock.Mock()
+        mock_oauth_manager_cls.return_value = mock.Mock()
+
+        engine = self._make_engine(
+            extra_config={
+                "register_max_retries": 1,
+                "chatgpt_save_registration_access_token_account": False,
+                "chatgpt_capture_free_workspace": True,
+                "chatgpt_enable_team_invite": False,
+            }
+        )
+
+        def fake_second_stage(*, result, **kwargs):
+            self.assertTrue(result.metadata["registration_access_token_checkpoint_created"])
+            self.assertEqual(
+                result.metadata["registration_access_token_checkpoint_policy"],
+                "always_keep_before_full_auth",
+            )
+            self.assertFalse(result.metadata["registration_access_token_save_requested"])
+            return False
+
+        with mock.patch.object(engine, "_finalize_workspace_artifacts", side_effect=fake_second_stage):
+            result = engine.run()
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.access_token, "at-registration")
+
+    @mock.patch("services.chatgpt_core.refresh_token_registration_engine.OAuthManager")
+    @mock.patch("services.chatgpt_core.refresh_token_registration_engine.OAuthClient")
+    @mock.patch("services.chatgpt_core.refresh_token_registration_engine.ChatGPTClient")
+    def test_run_captures_gopay_provider_link_after_refresh_token_registration(
+        self,
+        mock_chatgpt_client_cls,
+        mock_oauth_client_cls,
+        mock_oauth_manager_cls,
+    ):
+        register_client = mock.Mock()
+        register_client.device_id = "device-fixed"
+        register_client.ua = "UA"
+        register_client.sec_ch_ua = '"Chromium";v="136"'
+        register_client.impersonate = "chrome136"
+        register_client.fingerprint = {"device_id": "device-fixed"}
+        register_client.register_complete_flow.return_value = (True, "注册成功")
+        register_client.reuse_session_and_get_tokens.return_value = (
+            True,
+            {
+                "access_token": "at-registration",
+                "session_token": "session-registration",
+                "account_id": "acct-registration",
+                "workspace_id": "ws-registration",
+                "cookies": "oai-did=device",
+            },
+        )
+        mock_chatgpt_client_cls.return_value = register_client
+        mock_oauth_client_cls.return_value = mock.Mock()
+        mock_oauth_manager_cls.return_value = mock.Mock()
+
+        engine = self._make_engine(
+            extra_config={
+                "chatgpt_enable_team_invite": False,
+                "chatgpt_access_token_only_gopay_provider_link_enabled": True,
+                "chatgpt_access_token_only_checkout_country": "ID",
+                "chatgpt_access_token_only_checkout_currency": "IDR",
+                "chatgpt_gopay_defaults": '{"billing_country":"US","billing_name":"Michael Anderson"}',
+            }
+        )
+
+        def fake_finalize(result, **kwargs):
+            result.success = True
+            result.email = "user@example.com"
+            result.password = "Secret123!"
+            result.account_id = "acct-free"
+            result.workspace_id = "ws-free"
+            result.access_token = "at-free"
+            result.refresh_token = "rt-free"
+            result.session_token = "session-free"
+            result.source = "workspace_capture_free"
+            result.workspace_artifacts = [
+                {"scope": "free", "account_id": "acct-free", "workspace_id": "ws-free", "access_token": "at-free", "refresh_token": "rt-free", "session_token": "session-free"},
+            ]
+            result.metadata = result.metadata or {}
+            return True
+
+        provider_snapshot = {
+            "phase": "provider_link_ready",
+            "checkout_url": "https://pay.openai.com/c/pay/cs_live_123#fid",
+            "cs_id": "cs_live_123",
+            "snap_token": "11111111-1111-1111-1111-111111111111",
+            "payment_platform_url": "https://app.midtrans.com/snap/v4/redirection/11111111-1111-1111-1111-111111111111",
+            "midtrans_redirect_url": "https://app.midtrans.com/snap/v4/redirection/11111111-1111-1111-1111-111111111111",
+            "stripe_redirect_url": "https://pm-redirects.stripe.com/authorize/acct/test",
+            "result": {"payment_method_types": ["gopay"]},
+        }
+        with mock.patch.object(engine, "_probe_homepage_before_email_creation", return_value=(True, "")), \
+            mock.patch.object(engine, "_report_homepage_probe"), \
+            mock.patch.object(engine, "_finalize_workspace_artifacts", side_effect=fake_finalize), \
+            mock.patch("core.proxy_utils.iter_enabled_runtime_proxies", return_value=["http://127.0.0.1:7890"]), \
+            mock.patch("services.chatgpt_core.payment.generate_plus_link", return_value="https://pay.openai.com/c/pay/cs_live_123#fid") as generate_link, \
+            mock.patch("services.chatgpt_core.gopay_flow.create_gopay_provider_link", return_value=provider_snapshot) as create_provider:
+            result = engine.run()
+
+        self.assertTrue(result.success)
+        self.assertTrue(result.metadata["chatgpt_gopay_provider_link_enabled"])
+        self.assertTrue(result.metadata["chatgpt_gopay_provider_link_ready"])
+        self.assertEqual(result.metadata["chatgpt_gopay_provider_link"], provider_snapshot["payment_platform_url"])
+        generate_link.assert_called_once()
+        self.assertNotIn("link_format", generate_link.call_args.kwargs)
+        self.assertEqual(generate_link.call_args.kwargs["billing"]["country"], "ID")
+        create_provider.assert_called_once()
+        self.assertEqual(create_provider.call_args.kwargs["checkout_url"], "https://pay.openai.com/c/pay/cs_live_123#fid")
+        self.assertEqual(create_provider.call_args.kwargs["billing"]["country"], "ID")
+
+    @mock.patch("services.chatgpt_core.refresh_token_registration_engine.OAuthManager")
+    @mock.patch("services.chatgpt_core.refresh_token_registration_engine.OAuthClient")
+    @mock.patch("services.chatgpt_core.refresh_token_registration_engine.ChatGPTClient")
+    def test_gopay_provider_link_failure_does_not_fail_refresh_token_registration(
+        self,
+        mock_chatgpt_client_cls,
+        mock_oauth_client_cls,
+        mock_oauth_manager_cls,
+    ):
+        register_client = mock.Mock()
+        register_client.device_id = "device-fixed"
+        register_client.ua = "UA"
+        register_client.sec_ch_ua = '"Chromium";v="136"'
+        register_client.impersonate = "chrome136"
+        register_client.fingerprint = {"device_id": "device-fixed"}
+        register_client.register_complete_flow.return_value = (True, "注册成功")
+        register_client.reuse_session_and_get_tokens.return_value = (
+            True,
+            {"access_token": "at-registration", "account_id": "acct-registration", "workspace_id": "ws-registration"},
+        )
+        mock_chatgpt_client_cls.return_value = register_client
+        mock_oauth_client_cls.return_value = mock.Mock()
+        mock_oauth_manager_cls.return_value = mock.Mock()
+
+        engine = self._make_engine(
+            extra_config={
+                "chatgpt_enable_team_invite": False,
+                "chatgpt_access_token_only_gopay_provider_link_enabled": True,
+            }
+        )
+
+        def fake_finalize(result, **kwargs):
+            result.success = True
+            result.email = "user@example.com"
+            result.password = "Secret123!"
+            result.account_id = "acct-free"
+            result.workspace_id = "ws-free"
+            result.access_token = "at-free"
+            result.refresh_token = "rt-free"
+            result.session_token = "session-free"
+            result.source = "workspace_capture_free"
+            result.metadata = result.metadata or {}
+            return True
+
+        with mock.patch.object(engine, "_probe_homepage_before_email_creation", return_value=(True, "")), \
+            mock.patch.object(engine, "_report_homepage_probe"), \
+            mock.patch.object(engine, "_finalize_workspace_artifacts", side_effect=fake_finalize), \
+            mock.patch("core.proxy_utils.iter_enabled_runtime_proxies", return_value=["http://127.0.0.1:7890"]), \
+            mock.patch("services.chatgpt_core.payment.generate_plus_link", side_effect=RuntimeError("checkout unavailable")):
+            result = engine.run()
+
+        self.assertTrue(result.success)
+        self.assertFalse(result.metadata["chatgpt_gopay_provider_link_ready"])
+        self.assertIn("checkout unavailable", result.metadata["chatgpt_gopay_provider_link_error"])
 
     @mock.patch("services.chatgpt_core.refresh_token_registration_engine.OAuthManager")
     @mock.patch("services.chatgpt_core.refresh_token_registration_engine.OAuthClient")
@@ -858,6 +1279,114 @@ class OAuthClientPasswordlessTests(unittest.TestCase):
         sleep_with_stop.assert_called_once_with(1)
         submit_org.assert_called_once()
         fallback.assert_not_called()
+
+
+class OAuthClientBootstrapTests(unittest.TestCase):
+    def _make_client(self):
+        return OAuthClient({}, proxy="http://127.0.0.1:7890", verbose=False)
+
+    def test_bootstrap_invokes_browser_fallback_when_http_bootstrap_hits_cloudflare(self):
+        client = self._make_client()
+        blocked_response = mock.Mock()
+        blocked_response.status_code = 403
+        blocked_response.text = (
+            "<!DOCTYPE html><html><head><title>Just a moment...</title></head></html>"
+        )
+        blocked_response.url = "https://auth.openai.com/"
+        blocked_response.history = []
+        client.session.get = mock.Mock(side_effect=[blocked_response, blocked_response])
+
+        with mock.patch.object(
+            client,
+            "_browser_bootstrap_oauth_session",
+            return_value=("https://auth.openai.com/log-in", True),
+        ) as browser_bootstrap:
+            final_url = client._bootstrap_oauth_session(
+                "https://auth.openai.com/oauth/authorize",
+                {"client_id": "app-demo", "state": "state-demo"},
+                device_id="device-demo",
+                user_agent="UA",
+                sec_ch_ua='"Chromium";v="136"',
+            )
+
+        self.assertEqual(final_url, "https://auth.openai.com/log-in")
+        browser_bootstrap.assert_called_once()
+
+    def test_authorize_continue_stops_early_without_login_session(self):
+        client = self._make_client()
+
+        with mock.patch(
+            "services.chatgpt_core.oauth_client.build_sentinel_token"
+        ) as build_token:
+            state = client._submit_authorize_continue(
+                "user@example.com",
+                "device-demo",
+                "https://auth.openai.com/log-in",
+                user_agent="UA",
+                sec_ch_ua='"Chromium";v="136"',
+                impersonate="chrome136",
+            )
+
+        self.assertIsNone(state)
+        self.assertIn("login_session", client.last_error)
+        build_token.assert_not_called()
+
+    def test_merge_playwright_cookies_backfills_login_session(self):
+        client = self._make_client()
+        merged = client._merge_playwright_cookies_into_session(
+            [
+                {
+                    "name": "login_session",
+                    "value": "demo-session",
+                    "domain": ".auth.openai.com",
+                    "path": "/",
+                    "secure": True,
+                }
+            ]
+        )
+
+        self.assertGreaterEqual(merged, 1)
+        self.assertTrue(client._has_cookie("login_session"))
+
+    def test_stop_after_login_does_not_stop_before_existing_phone_otp_is_handled(self):
+        client = self._make_client()
+        email_otp_state = FlowState(
+            page_type="email_otp_verification",
+            continue_url="https://auth.openai.com/email-verification",
+            current_url="https://auth.openai.com/email-verification",
+            source="api",
+        )
+        existing_phone_state = FlowState(
+            page_type="phone_otp_select_channel",
+            continue_url="https://auth.openai.com/phone-otp/select-channel",
+            current_url="https://auth.openai.com/phone-otp/select-channel",
+            source="api",
+        )
+        external_state = FlowState(
+            page_type="external_url",
+            continue_url="https://chatgpt.com/api/auth/callback/openai?code=demo",
+            current_url="https://chatgpt.com/api/auth/callback/openai?code=demo",
+        )
+
+        with mock.patch.object(client, "_bootstrap_oauth_session", return_value="https://auth.openai.com/log-in"), \
+            mock.patch.object(client, "_submit_authorize_continue", return_value=email_otp_state), \
+            mock.patch.object(client, "_handle_otp_verification", return_value=existing_phone_state), \
+            mock.patch.object(client, "_handle_existing_phone_otp_verification", return_value=external_state) as handle_existing_phone, \
+            mock.patch.object(client, "_exchange_code_for_tokens", return_value={"access_token": "at"}):
+            tokens = client.login_and_get_tokens(
+                "user@example.com",
+                "Secret123!",
+                "device-fixed",
+                prefer_passwordless_login=True,
+                allow_phone_verification=True,
+                allow_existing_phone_verification=True,
+                stop_after_login=True,
+                skymail_client=mock.Mock(),
+            )
+
+        self.assertEqual(tokens["access_token"], "at")
+        handle_existing_phone.assert_called_once()
+        self.assertIn(client.last_state.page_type, {"phone_otp_select_channel", "external_url"})
 
 
 if __name__ == "__main__":

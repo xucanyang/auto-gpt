@@ -5,38 +5,6 @@ from core.db import AccountModel
 from services.sub2api_sync import backfill_chatgpt_account_to_sub2api, probe_chatgpt_sub2api_status
 
 
-class _FakeCursor:
-    def __init__(self, rows):
-        self.rows = rows
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        return False
-
-    def execute(self, query, params):
-        self.query = query
-        self.params = params
-
-    def fetchall(self):
-        return list(self.rows)
-
-
-class _FakeConn:
-    def __init__(self, rows):
-        self.rows = rows
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        return False
-
-    def cursor(self):
-        return _FakeCursor(self.rows)
-
-
 class Sub2ApiSyncTests(unittest.TestCase):
     def _make_account(self) -> AccountModel:
         account = AccountModel(
@@ -57,7 +25,7 @@ class Sub2ApiSyncTests(unittest.TestCase):
         account.user_id = "acct-demo"
         return account
 
-    def test_probe_reports_existing_remote_account_by_email(self):
+    def test_probe_reports_existing_remote_account_by_email_via_api(self):
         account = self._make_account()
         rows = [
             {
@@ -67,18 +35,18 @@ class Sub2ApiSyncTests(unittest.TestCase):
                 "credentials": {},
                 "extra": {"email": "demo@example.com"},
                 "updated_at": None,
-                "created_at": None,
             }
         ]
 
-        with mock.patch("services.sub2api_sync._fetch_matching_rows", return_value=rows):
+        with mock.patch("services.sub2api_sync._fetch_sub2api_account_items", return_value=rows):
             result = probe_chatgpt_sub2api_status(account)
 
         self.assertEqual(result["remote_state"], "exists")
         self.assertEqual(result["remote_account_id"], 321)
+        self.assertEqual(result["probe_source"], "api")
         self.assertIn("email", result["matched_by"])
 
-    def test_probe_marks_cross_workspace_only_when_workspace_identity_present(self):
+    def test_probe_marks_cross_workspace_only_when_workspace_identity_present_via_api(self):
         account = self._make_account()
 
         with mock.patch(
@@ -94,32 +62,29 @@ class Sub2ApiSyncTests(unittest.TestCase):
             },
         ):
             with mock.patch(
-                "services.sub2api_sync._fetch_matching_rows",
-                side_effect=[
-                    [
-                        {
-                            "id": 654,
-                            "name": "demo@example.com",
-                            "status": "active",
-                            "credentials": {
-                                "organization_id": "org-other",
-                                "chatgpt_account_id": "acct-other",
-                                "chatgpt_user_id": "user-local",
-                            },
-                            "extra": {"email": "demo@example.com"},
-                            "updated_at": None,
-                            "created_at": None,
-                        }
-                    ],
-                    [],
+                "services.sub2api_sync._fetch_sub2api_account_items",
+                return_value=[
+                    {
+                        "id": 654,
+                        "name": "demo@example.com",
+                        "status": "active",
+                        "credentials": {
+                            "organization_id": "org-other",
+                            "chatgpt_account_id": "acct-other",
+                            "chatgpt_user_id": "user-local",
+                        },
+                        "extra": {"email": "demo@example.com"},
+                        "updated_at": None,
+                    }
                 ],
             ):
                 result = probe_chatgpt_sub2api_status(account)
 
         self.assertEqual(result["remote_state"], "cross_workspace_only")
+        self.assertEqual(result["probe_source"], "api")
         self.assertIn("其他 workspace", result["message"])
 
-    def test_probe_reports_deleted_exact_match_before_weak_live_match(self):
+    def test_probe_reports_ambiguous_exact_matches_via_api(self):
         account = self._make_account()
 
         with mock.patch(
@@ -135,60 +100,47 @@ class Sub2ApiSyncTests(unittest.TestCase):
             },
         ):
             with mock.patch(
-                "services.sub2api_sync._fetch_matching_rows",
-                side_effect=[
-                    [
-                        {
-                            "id": 654,
-                            "name": "demo@example.com",
-                            "status": "active",
-                            "credentials": {
-                                "organization_id": "org-other",
-                                "chatgpt_account_id": "acct-other",
-                                "chatgpt_user_id": "user-local",
-                            },
-                            "extra": {"email": "demo@example.com"},
-                            "updated_at": None,
-                            "created_at": None,
-                        }
-                    ],
-                    [
-                        {
-                            "id": 655,
-                            "name": "demo@example.com",
-                            "status": "active",
-                            "credentials": {
-                                "organization_id": "org-local",
-                                "chatgpt_account_id": "acct-local",
-                                "chatgpt_user_id": "user-local",
-                            },
-                            "extra": {"email": "demo@example.com"},
-                            "updated_at": None,
-                            "created_at": None,
+                "services.sub2api_sync._fetch_sub2api_account_items",
+                return_value=[
+                    {
+                        "id": 655,
+                        "name": "demo@example.com",
+                        "status": "active",
+                        "credentials": {
+                            "organization_id": "org-local",
+                            "chatgpt_account_id": "acct-local",
+                            "chatgpt_user_id": "user-local",
                         },
-                        {
-                            "id": 656,
-                            "name": "demo@example.com",
-                            "status": "error",
-                            "credentials": {
-                                "organization_id": "org-local",
-                                "chatgpt_account_id": "acct-local",
-                                "chatgpt_user_id": "user-local",
-                            },
-                            "extra": {"email": "demo@example.com"},
-                            "updated_at": None,
-                            "created_at": None,
+                        "extra": {"email": "demo@example.com"},
+                    },
+                    {
+                        "id": 656,
+                        "name": "demo@example.com",
+                        "status": "error",
+                        "credentials": {
+                            "organization_id": "org-local",
+                            "chatgpt_account_id": "acct-local",
+                            "chatgpt_user_id": "user-local",
                         },
-                    ],
+                        "extra": {"email": "demo@example.com"},
+                    },
                 ],
             ):
                 result = probe_chatgpt_sub2api_status(account)
 
-        self.assertEqual(result["remote_state"], "deleted_exact_match")
+        self.assertEqual(result["remote_state"], "ambiguous")
         self.assertEqual(result["candidate_count"], 2)
-        self.assertIn("已删除的精确", result["message"])
+        self.assertIn("API 匹配到 2 条精确", result["message"])
 
-    def test_backfill_skips_when_remote_already_exists(self):
+    def test_probe_reports_unreachable_when_api_fails(self):
+        account = self._make_account()
+        with mock.patch("services.sub2api_sync._fetch_sub2api_account_items", side_effect=RuntimeError("boom")):
+            result = probe_chatgpt_sub2api_status(account)
+        self.assertEqual(result["remote_state"], "unreachable")
+        self.assertEqual(result["probe_source"], "api")
+        self.assertIn("Sub2API API 不可用", result["message"])
+
+    def test_backfill_skips_when_remote_already_exists_and_persists_last_upload(self):
         account = self._make_account()
 
         with mock.patch(
@@ -199,14 +151,17 @@ class Sub2ApiSyncTests(unittest.TestCase):
                 "remote_account_id": 321,
                 "matched_by": "email",
                 "message": "远端已存在",
+                "probe_source": "api",
             },
         ) as probe_mock:
-            with mock.patch("services.sub2api_sync.upload_to_sub2api") as upload_mock:
+            with mock.patch("services.sub2api_sync.upload_to_sub2api_detailed") as upload_mock:
                 result = backfill_chatgpt_account_to_sub2api(account, commit=False)
 
         self.assertTrue(result["ok"])
         self.assertTrue(result["skipped"])
         self.assertFalse(result["uploaded"])
+        state = account.get_extra()["sync_statuses"]["sub2api"]
+        self.assertEqual(state["last_upload"]["status"], "skipped")
         probe_mock.assert_called_once()
         upload_mock.assert_not_called()
 
@@ -219,6 +174,7 @@ class Sub2ApiSyncTests(unittest.TestCase):
                 "remote_state": "not_found",
                 "uploaded": False,
                 "message": "远端未发现",
+                "probe_source": "api",
             },
         ) as probe_mock:
             with mock.patch(
@@ -230,8 +186,8 @@ class Sub2ApiSyncTests(unittest.TestCase):
                 },
             ):
                 with mock.patch(
-                    "services.sub2api_sync.upload_to_sub2api",
-                    return_value=(True, "上传成功"),
+                    "services.sub2api_sync.upload_to_sub2api_detailed",
+                    return_value={"ok": True, "message": "上传成功", "remote_account_id": 889, "remote_status": "active"},
                 ) as upload_mock:
                     result = backfill_chatgpt_account_to_sub2api(account, commit=False)
 
@@ -239,6 +195,9 @@ class Sub2ApiSyncTests(unittest.TestCase):
         self.assertTrue(result["uploaded"])
         self.assertFalse(result["skipped"])
         self.assertEqual(result["message"], "上传成功")
+        state = account.get_extra()["sync_statuses"]["sub2api"]
+        self.assertEqual(state["last_upload"]["status"], "success")
+        self.assertEqual(state["last_upload"]["remote_account_id"], 889)
         self.assertEqual(probe_mock.call_count, 1)
         upload_mock.assert_called_once()
 
@@ -254,6 +213,7 @@ class Sub2ApiSyncTests(unittest.TestCase):
                 "message": "仅命中同邮箱/同用户的其他 workspace，可为当前 workspace 补传",
                 "candidate_count": 1,
                 "candidates": [{"id": 777}],
+                "probe_source": "api",
             },
         ) as probe_mock:
             with mock.patch(
@@ -265,42 +225,8 @@ class Sub2ApiSyncTests(unittest.TestCase):
                 },
             ):
                 with mock.patch(
-                    "services.sub2api_sync.upload_to_sub2api",
-                    return_value=(True, "上传成功"),
-                ) as upload_mock:
-                    result = backfill_chatgpt_account_to_sub2api(account, commit=False)
-
-        self.assertTrue(result["ok"])
-        self.assertTrue(result["uploaded"])
-        self.assertFalse(result["skipped"])
-        self.assertEqual(probe_mock.call_count, 1)
-        upload_mock.assert_called_once()
-
-    def test_backfill_uploads_when_exact_remote_rows_were_soft_deleted(self):
-        account = self._make_account()
-
-        with mock.patch(
-            "services.sub2api_sync.probe_chatgpt_sub2api_status",
-            return_value={
-                "remote_state": "deleted_exact_match",
-                "uploaded": False,
-                "matched_by": "organization_account, email, chatgpt_user_id",
-                "message": "远端存在 2 条已删除的精确 Sub2API 记录，可重新补传",
-                "candidate_count": 2,
-                "candidates": [{"id": 777}, {"id": 778}],
-            },
-        ) as probe_mock:
-            with mock.patch(
-                "services.sub2api_sync.probe_local_chatgpt_status",
-                return_value={
-                    "auth": {"state": "refresh_token_valid", "message": "ok"},
-                    "subscription": {"plan": "free"},
-                    "codex": {"state": "usable"},
-                },
-            ):
-                with mock.patch(
-                    "services.sub2api_sync.upload_to_sub2api",
-                    return_value=(True, "上传成功"),
+                    "services.sub2api_sync.upload_to_sub2api_detailed",
+                    return_value={"ok": True, "message": "上传成功"},
                 ) as upload_mock:
                     result = backfill_chatgpt_account_to_sub2api(account, commit=False)
 
@@ -335,9 +261,10 @@ class Sub2ApiSyncTests(unittest.TestCase):
                 "remote_account_id": 888,
                 "matched_by": "organization_account",
                 "message": "远端已存在",
+                "probe_source": "api",
             },
         ) as probe_mock:
-            with mock.patch("services.sub2api_sync.upload_to_sub2api") as upload_mock:
+            with mock.patch("services.sub2api_sync.upload_to_sub2api_detailed") as upload_mock:
                 result = backfill_chatgpt_account_to_sub2api(account, commit=False)
 
         self.assertTrue(result["ok"])
@@ -352,11 +279,10 @@ class Sub2ApiSyncTests(unittest.TestCase):
         with mock.patch(
             "services.sub2api_sync.probe_chatgpt_sub2api_status",
             return_value={
-                "remote_state": "deleted_exact_match",
+                "remote_state": "not_found",
                 "uploaded": False,
-                "message": "远端存在 2 条已删除的精确 Sub2API 记录，可重新补传",
-                "candidate_count": 2,
-                "candidates": [{"id": 777}, {"id": 778}],
+                "message": "远端 API 未发现 Sub2API 账号",
+                "probe_source": "api",
             },
         ):
             with mock.patch(
@@ -376,7 +302,8 @@ class Sub2ApiSyncTests(unittest.TestCase):
         self.assertFalse(result["uploaded"])
         extra = account.get_extra()
         state = extra["sync_statuses"]["sub2api"]
-        self.assertEqual(state["remote_state"], "deleted_exact_match")
+        self.assertEqual(state["remote_state"], "not_found")
+        self.assertEqual(state["last_upload"]["status"], "blocked")
         self.assertIn("当前无法补传", state["message"])
         self.assertIn("认证已失效", state["message"])
 
@@ -405,9 +332,10 @@ class Sub2ApiSyncTests(unittest.TestCase):
                 "remote_account_id": 889,
                 "matched_by": "organization_account",
                 "message": "远端已存在",
+                "probe_source": "api",
             },
         ) as probe_mock:
-            with mock.patch("services.sub2api_sync.upload_to_sub2api") as upload_mock:
+            with mock.patch("services.sub2api_sync.upload_to_sub2api_detailed") as upload_mock:
                 result = backfill_chatgpt_account_to_sub2api(account, commit=False)
 
         self.assertTrue(result["ok"])
@@ -443,9 +371,10 @@ class Sub2ApiSyncTests(unittest.TestCase):
                 "remote_account_id": 890,
                 "matched_by": "organization_account",
                 "message": "远端已存在",
+                "probe_source": "api",
             },
         ) as probe_mock:
-            with mock.patch("services.sub2api_sync.upload_to_sub2api") as upload_mock:
+            with mock.patch("services.sub2api_sync.upload_to_sub2api_detailed") as upload_mock:
                 result = backfill_chatgpt_account_to_sub2api(account, commit=False)
 
         self.assertTrue(result["ok"])

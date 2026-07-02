@@ -1,0 +1,110 @@
+import json
+import unittest
+
+from core.db import AccountModel
+from api.accounts import _serialize_account_compact_item, _serialize_account_list_item
+
+
+class AccountListCompactSerializationTests(unittest.TestCase):
+    def _account(self, *, huge_size: int = 100_000) -> AccountModel:
+        extra = {
+            "access_token": "SECRET_EXTRA_AT",
+            "accessToken": "SECRET_EXTRA_AT_ALIAS",
+            "refresh_token": "SECRET_RT",
+            "session_token": "SECRET_SESSION",
+            "chatgpt_mailbox_state": "x" * huge_size,
+            "chatgpt_workspace_scope": "free",
+            "chatgpt_workspace_label": "Free",
+            "sync_statuses": {
+                "sub2api": {
+                    "remote_state": "exists",
+                    "remote_account_id": "remote-1",
+                    "last_upload": {
+                        "status": "success",
+                        "message": "ok",
+                        "raw_request": "x" * 10_000,
+                    },
+                    "raw_response": "x" * 10_000,
+                },
+            },
+            "chatgpt_local": {
+                "auth": {"state": "access_token_valid", "message": "ok"},
+                "subscription": {
+                    "plan": "plus",
+                    "subscription_active_until": "2026-12-31T00:00:00Z",
+                },
+                "codex": {
+                    "state": "ok",
+                    "usage": {
+                        "codex_5h_used_percent": 12.3,
+                        "codex_7d_used_percent": 45.6,
+                        "raw_usage": "x" * 10_000,
+                    },
+                },
+            },
+            "chatgpt_capabilities": {
+                "auth_level": "refresh_token",
+                "subscription_plan": "plus",
+                "upload_gate": "ok",
+            },
+            "chatgpt_phone_binding": {
+                "phone": "+10000000000",
+                "api_url": "https://sms.example.test/order/1",
+            },
+        }
+        return AccountModel(
+            id=1,
+            platform="chatgpt",
+            email="compact@example.com",
+            password="SECRET_PASSWORD",
+            token="SECRET_AT",
+            status="registered",
+            extra_json=json.dumps(extra, ensure_ascii=False),
+        )
+
+    def _assert_compact_payload(self, payload: dict):
+        forbidden_top = {"extra_json", "token", "password", "session_token"}
+        self.assertFalse(forbidden_top.intersection(payload.keys()))
+
+        nested_extra = payload.get("extra") if isinstance(payload.get("extra"), dict) else {}
+        forbidden_nested = {"access_token", "refresh_token", "session_token", "token", "password"}
+        self.assertFalse(forbidden_nested.intersection(nested_extra.keys()))
+
+        raw = json.dumps(payload, ensure_ascii=False, default=str)
+        self.assertNotIn("SECRET_AT", raw)
+        self.assertNotIn("SECRET_RT", raw)
+        self.assertNotIn("SECRET_PASSWORD", raw)
+        self.assertNotIn("SECRET_SESSION", raw)
+        self.assertNotIn("chatgpt_mailbox_state", raw)
+        self.assertNotIn("raw_response", raw)
+        self.assertNotIn("raw_usage", raw)
+
+        self.assertTrue(payload["has_access_token"])
+        self.assertTrue(payload["has_refresh_token"])
+        self.assertTrue(payload["password_present"])
+        self.assertEqual(payload["auth_level"], "refresh_token")
+        self.assertEqual(payload["subscription_plan"], "plus")
+        self.assertEqual(payload["subscription_active_until"], "2026-12-31T00:00:00Z")
+        self.assertEqual(payload["sub2api_remote_state"], "exists")
+        self.assertEqual(payload["codex_state"], "ok")
+
+    def test_compact_serializer_does_not_return_raw_extra_or_secrets(self):
+        payload = _serialize_account_compact_item(self._account())
+        self._assert_compact_payload(payload)
+
+    def test_legacy_list_serializer_is_also_compact_safe(self):
+        payload = _serialize_account_list_item(self._account())
+        self._assert_compact_payload(payload)
+
+    def test_compact_payload_size_does_not_scale_with_huge_extra_blob(self):
+        payload = {
+            "items": [_serialize_account_compact_item(self._account(huge_size=100_000)) for _ in range(20)],
+            "total": 20,
+            "page": 1,
+        }
+        raw = json.dumps(payload, ensure_ascii=False, default=str, separators=(",", ":")).encode()
+        self.assertLess(len(raw), 500_000)
+
+
+if __name__ == "__main__":
+    unittest.main()

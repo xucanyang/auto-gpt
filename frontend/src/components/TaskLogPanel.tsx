@@ -1,31 +1,52 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { Button, message, Segmented, Space } from 'antd'
+import { Badge, Button, Card, Descriptions, message, Segmented, Space, Tag } from 'antd'
 import { CopyOutlined, FastForwardOutlined, StopOutlined } from '@ant-design/icons'
 
 import { API_BASE, apiFetch, getToken } from '@/lib/utils'
 
 interface TaskLogPanelProps {
   taskId: string
-  onDone?: () => void
+  onDone?: () => Promise<void> | void
 }
 
 type TaskTerminalStatus = 'idle' | 'done' | 'failed' | 'stopped'
 type LogViewMode = 'info' | 'debug'
+type TaskCurrentState = {
+  task?: string
+  task_label?: string
+  item_index?: number
+  item_total?: number
+  email?: string
+  account_id?: number
+  phone?: string
+  phase?: string
+  phase_label?: string
+  stage_index?: number
+  stage_total?: number
+  started_at?: string
+  last_message?: string
+  next_step?: string
+  resource_touched?: boolean
+}
 
 const LOG_VIEW_STORAGE_KEY = 'task-log-panel-view-mode'
 
 function parseLogLine(rawLine: string) {
   const line = String(rawLine || '')
+  const timeMatch = line.match(/^\[(\d{2}:\d{2}:\d{2})\]\s*/)
+  const time = timeMatch?.[1] || ''
   const normalized = line.replace(/^\[\d{2}:\d{2}:\d{2}\]\s*/, '')
-  const isDebug = normalized.startsWith('[DEBUG] ')
-  const text = isDebug ? normalized.replace(/^\[DEBUG\]\s*/, '') : normalized
-  return { raw: line, text, isDebug }
+  const isDebug = /^\[[^\]]*DEBUG[^\]]*\]/i.test(normalized)
+  const text = isDebug ? normalized.replace(/^\[[^\]]*DEBUG[^\]]*\]\s*/, '') : normalized
+  return { raw: line, text, isDebug, time }
 }
 
 export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
   const [lines, setLines] = useState<string[]>([])
   const [error, setError] = useState('')
   const [terminalStatus, setTerminalStatus] = useState<TaskTerminalStatus>('idle')
+  const [current, setCurrent] = useState<TaskCurrentState | null>(null)
+  const [currentNow, setCurrentNow] = useState(() => Date.now())
   const [pageVisible, setPageVisible] = useState(
     typeof document === 'undefined' ? true : document.visibilityState === 'visible',
   )
@@ -40,12 +61,16 @@ export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
   const panelRef = useRef<HTMLDivElement>(null)
   const onDoneRef = useRef(onDone)
   const nextSinceRef = useRef(0)
+  const terminalNotifyRef = useRef('')
+  const doneCallbackNotifyRef = useRef('')
 
   const isFinished = terminalStatus !== 'idle' || stopRequested
 
   const parsedLines = useMemo(() => lines.map(parseLogLine), [lines])
+  const infoCount = useMemo(() => parsedLines.filter((line) => !line.isDebug).length, [parsedLines])
+  const debugCount = useMemo(() => parsedLines.filter((line) => line.isDebug).length, [parsedLines])
   const visibleLines = useMemo(
-    () => (viewMode === 'debug' ? parsedLines : parsedLines.filter((line) => !line.isDebug)),
+    () => parsedLines.filter((line) => (viewMode === 'debug' ? line.isDebug : !line.isDebug)),
     [parsedLines, viewMode],
   )
 
@@ -116,6 +141,12 @@ export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
   }, [])
 
   useEffect(() => {
+    if (!current?.started_at) return
+    const timer = window.setInterval(() => setCurrentNow(Date.now()), 1000)
+    return () => window.clearInterval(timer)
+  }, [current?.started_at])
+
+  useEffect(() => {
     if (!taskId || !pageVisible) return
     const controller = new AbortController()
     let cancelled = false
@@ -130,12 +161,27 @@ export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
     const sleep = async (ms: number) =>
       new Promise((resolve) => setTimeout(resolve, ms))
 
+    const notifyTaskDone = (status?: TaskTerminalStatus | string) => {
+      const key = `${taskId}:done`
+      if (doneCallbackNotifyRef.current === key) return
+      doneCallbackNotifyRef.current = key
+
+      window.setTimeout(() => {
+        if (cancelled) return
+        void Promise.resolve(onDoneRef.current?.()).catch((error_: unknown) => {
+          const detail = error_ instanceof Error ? error_.message : '刷新页面状态失败'
+          message.warning(`任务已结束，但刷新页面状态失败：${detail}`)
+        })
+      }, status === 'failed' ? 0 : 500)
+    }
+
     const initSnapshot = async (): Promise<boolean> => {
       try {
         const snapshot = await apiFetch(`/tasks/${taskId}`) as {
           logs?: string[]
           status?: TaskTerminalStatus | string
           control?: { stop_requested?: boolean }
+          meta?: { current?: TaskCurrentState }
         }
         if (cancelled) return true
 
@@ -143,10 +189,13 @@ export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
         setLines(snapshotLines)
         nextSinceRef.current = snapshotLines.length
         setStopRequested(Boolean(snapshot.control?.stop_requested))
+        setCurrent(snapshot?.meta?.current && typeof snapshot.meta.current === 'object' ? snapshot.meta.current : null)
 
         if (snapshot.status === 'done' || snapshot.status === 'failed' || snapshot.status === 'stopped') {
           setTerminalStatus(snapshot.status)
-          onDoneRef.current?.()
+          // Keep the completed task's snapshot logs visible. The SSE stream immediately ends
+          // for terminal tasks and otherwise would leave the panel looking empty.
+          notifyTaskDone(snapshot.status)
           return true
         }
       } catch (error_: unknown) {
@@ -208,7 +257,9 @@ export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
               }
               if (payload.done) {
                 setTerminalStatus(payload.status || 'done')
-                onDoneRef.current?.()
+                // Notify the parent after the terminal state is visible so pages can refresh
+                // their business data without making the final log lines disappear first.
+                notifyTaskDone(payload.status || 'done')
                 return true
               }
             } catch {
@@ -255,6 +306,14 @@ export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
     panelRef.current.scrollTop = panelRef.current.scrollHeight
   }, [lines])
 
+  useEffect(() => {
+    if (!taskId || terminalStatus !== 'failed') return
+    const key = `${taskId}:failed`
+    if (terminalNotifyRef.current === key) return
+    terminalNotifyRef.current = key
+    message.error('任务失败，请查看日志里的失败原因')
+  }, [taskId, terminalStatus])
+
   const footerText =
     terminalStatus === 'done'
       ? { text: '任务完成', color: '#10b981' }
@@ -263,6 +322,16 @@ export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
         : terminalStatus === 'failed'
           ? { text: '任务失败', color: '#dc2626' }
           : null
+
+  const currentElapsedText = useMemo(() => {
+    if (!current?.started_at) return ''
+    const started = Date.parse(current.started_at)
+    if (!Number.isFinite(started)) return ''
+    const diff = Math.max(0, Math.floor((currentNow - started) / 1000))
+    const minutes = Math.floor(diff / 60)
+    const seconds = diff % 60
+    return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`
+  }, [current?.started_at, currentNow])
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', minHeight: 0 }}>
@@ -294,8 +363,24 @@ export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
             value={viewMode}
             onChange={(value) => setViewMode(value as LogViewMode)}
             options={[
-              { label: 'Info', value: 'info' },
-              { label: 'Debug', value: 'debug' },
+              {
+                label: (
+                  <Space size={4}>
+                    <span>Info</span>
+                    <Badge count={infoCount} size="small" style={{ backgroundColor: '#64748b' }} />
+                  </Space>
+                ),
+                value: 'info',
+              },
+              {
+                label: (
+                  <Space size={4}>
+                    <span>Debug</span>
+                    <Badge count={debugCount} size="small" style={{ backgroundColor: '#7c3aed' }} />
+                  </Space>
+                ),
+                value: 'debug',
+              },
             ]}
           />
           <Button size="small" icon={<CopyOutlined />} onClick={handleCopyAll} disabled={visibleLines.length === 0}>
@@ -304,18 +389,86 @@ export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
         </Space>
       </div>
 
+      {current && (current.phase_label || current.email || current.phone || current.account_id) ? (
+        <Card
+          size="small"
+          style={{
+            marginBottom: 8,
+            borderColor: 'rgba(255, 255, 255, 0.14)',
+            background: '#1c1f2e',
+          }}
+          bodyStyle={{ padding: 12 }}
+        >
+          <Descriptions
+            size="small"
+            column={2}
+            labelStyle={{ color: '#b0bcd4', fontWeight: 600 }}
+            contentStyle={{ color: '#f1f5f9' }}
+            items={[
+              {
+                key: 'current-target',
+                label: '当前',
+                children: (
+                  <Space size={6} wrap>
+                    {current.item_index && current.item_total ? (
+                      <Tag color="blue">{current.item_index}/{current.item_total}</Tag>
+                    ) : null}
+                    <span>{current.email || current.phone || (current.account_id ? `账号 ${current.account_id}` : '-')}</span>
+                  </Space>
+                ),
+              },
+              {
+                key: 'current-phase',
+                label: '阶段',
+                children: (
+                  <Space size={6} wrap>
+                    {current.stage_index && current.stage_total ? (
+                      <Tag color="processing">{current.stage_index}/{current.stage_total}</Tag>
+                    ) : null}
+                    <span>{current.phase_label || current.phase || '-'}</span>
+                  </Space>
+                ),
+              },
+              {
+                key: 'current-elapsed',
+                label: '已等待',
+                children: currentElapsedText || '-',
+              },
+              {
+                key: 'current-next',
+                label: '下一步',
+                children: current.next_step || current.last_message || '-',
+              },
+              {
+                key: 'current-touched',
+                label: '资源触碰',
+                children:
+                  typeof current.resource_touched === 'boolean'
+                    ? <Tag color={current.resource_touched ? 'warning' : 'default'}>{current.resource_touched ? '已触碰' : '未触碰'}</Tag>
+                    : '-',
+              },
+              {
+                key: 'current-message',
+                label: '状态',
+                children: current.last_message || '-',
+              },
+            ]}
+          />
+        </Card>
+      ) : null}
+
       <div
         ref={panelRef}
         className="log-panel"
         style={{
           flex: 1,
           overflowY: 'auto',
-          overflowX: 'hidden',
-          background: '#ffffff',
-          border: '1px solid #e5e7eb',
+          overflowX: 'auto',
+          background: '#fafafa',
+          border: '1px solid #f0f0f0',
           borderRadius: 8,
           padding: 12,
-          fontFamily: 'monospace',
+          fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace',
           fontSize: 12,
           minHeight: 240,
           maxHeight: 'calc(100vh - 320px)',
@@ -328,29 +481,36 @@ export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
       >
         {visibleLines.length === 0 && !error && (
           <div style={{ color: '#9ca3af' }}>
-            {lines.length === 0 ? '等待日志...' : '当前 Info 视图下没有可显示的日志'}
+            {lines.length === 0 ? '等待日志...' : `当前 ${viewMode === 'debug' ? 'Debug' : 'Info'} 视图下没有可显示的日志`}
           </div>
         )}
         {error && <div style={{ color: '#dc2626' }}>{error}</div>}
-        {visibleLines.map((line, index) => (
-          <div
-            key={`${index}-${line.raw}`}
-            style={{
-              lineHeight: 1.5,
-              color: line.isDebug
-                ? '#6b7280'
-                : line.text.includes('✓') || line.text.includes('成功')
-                  ? '#059669'
-                  : line.text.includes('✗') || line.text.includes('失败') || line.text.includes('错误')
-                    ? '#dc2626'
-                    : line.text.includes('停止') || line.text.includes('跳过')
-                      ? '#d97706'
-                      : '#1f2937',
-            }}
-          >
-            {line.raw}
-          </div>
-        ))}
+        {visibleLines.map((line, index) => {
+          return (
+            <div
+              key={`${index}-${line.raw}`}
+              style={{
+                lineHeight: 1.65,
+                margin: line.isDebug ? '2px 0' : 0,
+                padding: line.isDebug ? '2px 8px' : 0,
+                borderLeft: line.isDebug ? '3px solid #8b5cf6' : '3px solid transparent',
+                borderRadius: line.isDebug ? 4 : 0,
+                background: line.isDebug ? '#f5f3ff' : 'transparent',
+                color: line.isDebug
+                  ? '#5b21b6'
+                  : line.text.includes('✓') || line.text.includes('成功')
+                    ? '#059669'
+                    : line.text.includes('✗') || line.text.includes('失败') || line.text.includes('错误')
+                      ? '#dc2626'
+                      : line.text.includes('停止') || line.text.includes('跳过')
+                        ? '#d97706'
+                        : '#1f2937',
+              }}
+            >
+              {line.raw}
+            </div>
+          )
+        })}
       </div>
 
       {footerText ? (

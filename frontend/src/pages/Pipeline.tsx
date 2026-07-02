@@ -7,9 +7,12 @@ import {
   Col,
   Descriptions,
   Divider,
+  Empty,
   Form,
+  Grid,
   Input,
   InputNumber,
+  Pagination,
   Row,
   Segmented,
   Space,
@@ -398,6 +401,8 @@ function buildActionHint({
 
 export default function Pipeline() {
   const [form] = Form.useForm<PipelineConfig>()
+  const screens = Grid.useBreakpoint()
+  const isMobile = screens.lg === false
   const [configLoading, setConfigLoading] = useState(false)
   const [actionLoading, setActionLoading] = useState('')
   const [statusData, setStatusData] = useState<PipelineStatusResponse | null>(null)
@@ -406,6 +411,7 @@ export default function Pipeline() {
   const [queueTab, setQueueTab] = useState<QueueTabKey>('pending_payment')
   const [queueSearch, setQueueSearch] = useState('')
   const [queueErrorOnly, setQueueErrorOnly] = useState(false)
+  const [queueMobilePage, setQueueMobilePage] = useState(1)
   const [logFilter, setLogFilter] = useState<LogFilterKey>('all')
   const [selectedTaskKey, setSelectedTaskKey] = useState('')
   const [selectedTaskLogsCache, setSelectedTaskLogsCache] = useState<Record<string, string[]>>({})
@@ -623,6 +629,21 @@ export default function Pipeline() {
     })
   }, [queueDataMap, queueErrorOnly, queueSearch, queueTab])
 
+  const queueMobilePageSize = 10
+  const mobileQueueData = useMemo(() => {
+    const start = (queueMobilePage - 1) * queueMobilePageSize
+    return filteredQueueData.slice(start, start + queueMobilePageSize)
+  }, [filteredQueueData, queueMobilePage])
+
+  useEffect(() => {
+    setQueueMobilePage(1)
+  }, [queueErrorOnly, queueSearch, queueTab])
+
+  useEffect(() => {
+    const maxPage = Math.max(1, Math.ceil(filteredQueueData.length / queueMobilePageSize))
+    if (queueMobilePage > maxPage) setQueueMobilePage(maxPage)
+  }, [filteredQueueData.length, queueMobilePage])
+
   const filteredLogs = useMemo(() => {
     return logs.filter((line) => matchesLogFilter(line, logFilter))
   }, [logFilter, logs])
@@ -666,6 +687,68 @@ export default function Pipeline() {
     }
     return (selectedTaskLogsCache[selectedTaskKey] || []).filter((line) => matchesLogFilter(line, logFilter))
   }, [filteredLogs, logFilter, selectedTaskKey, selectedTaskLogsCache, statusData?.task?.task_key])
+
+  const renderQueueMobileCards = (
+    data: PipelineAccountItem[],
+    titleKey: 'pipeline_status' | 'payment_stage' | 'auth_stage' = 'pipeline_status',
+    emptyText = '暂无账号',
+  ) => {
+    if (data.length === 0) {
+      return <Empty description={emptyText} image={Empty.PRESENTED_IMAGE_SIMPLE} />
+    }
+
+    return (
+      <div className="mobile-card-list">
+        {data.map((record) => {
+          const stage = accountStageLabel(record)
+          const issue = getAccountIssueText(record)
+          const isError = Boolean(record.register_error_reason || record.payment_error_reason || record.auth_error_reason)
+          const flowStatus = String(record[titleKey] || '')
+
+          return (
+            <Card key={queueRowKey(record)} size="small" className="mobile-record-card">
+              <div className="mobile-record-head">
+                <div className="mobile-record-main">
+                  <Text strong className="mobile-record-title" copyable={record.email ? { text: record.email, tooltips: ['复制邮箱', '已复制'] } : false}>
+                    {record.email || '-'}
+                  </Text>
+                  <div className="mobile-record-meta">
+                    <Tag color={stage.color}>{stage.label}</Tag>
+                    <Tag color={statusColor(record.account_primary_status)}>{statusLabel(record.account_primary_status)}</Tag>
+                    <Tag color={statusColor(flowStatus)}>{statusLabel(flowStatus)}</Tag>
+                  </div>
+                </div>
+              </div>
+
+              <div className="mobile-record-section">
+                <div className="mobile-record-field">
+                  <span className="mobile-record-label">账号 ID</span>
+                  <span className="mobile-record-value">#{record.account_id || record.id || '-'}</span>
+                </div>
+                <div className="mobile-record-field">
+                  <span className="mobile-record-label">套餐</span>
+                  <span className="mobile-record-value">
+                    {record.subscription_plan_confirmed || '-'}
+                    {record.subscription_refresh_status === 'failed' ? ' / 待刷新' : ''}
+                  </span>
+                </div>
+                <div className="mobile-record-field">
+                  <span className="mobile-record-label">更新时间</span>
+                  <span className="mobile-record-value">{formatDateTime(record.updated_at)}</span>
+                </div>
+                <div className="mobile-record-field">
+                  <span className="mobile-record-label">说明</span>
+                  <Text className="mobile-record-value" type={isError ? 'danger' : 'secondary'}>
+                    {issue || '-'}
+                  </Text>
+                </div>
+              </div>
+            </Card>
+          )
+        })}
+      </div>
+    )
+  }
 
   return (
     <Space direction="vertical" size={16} style={{ display: 'flex' }}>
@@ -872,15 +955,19 @@ export default function Pipeline() {
                 ) : null}
 
                 <Card title="需要关注的账号">
-                  <Table
-                    size="small"
-                    rowKey={queueRowKey}
-                    columns={queueColumns('pipeline_status')}
-                    dataSource={attentionItems}
-                    pagination={false}
-                    scroll={{ x: 980 }}
-                    locale={{ emptyText: '暂无需要关注的账号' }}
-                  />
+                  {isMobile ? (
+                    renderQueueMobileCards(attentionItems, 'pipeline_status', '暂无需要关注的账号')
+                  ) : (
+                    <Table
+                      size="small"
+                      rowKey={queueRowKey}
+                      columns={queueColumns('pipeline_status')}
+                      dataSource={attentionItems}
+                      pagination={false}
+                      scroll={{ x: 980 }}
+                      locale={{ emptyText: '暂无需要关注的账号' }}
+                    />
+                  )}
                 </Card>
               </Space>
             ),
@@ -1104,13 +1191,33 @@ export default function Pipeline() {
                     />
                   ) : null}
 
-                  <Table
-                    rowKey={queueRowKey}
-                    columns={queueColumnMap[queueTab]}
-                    dataSource={filteredQueueData}
-                    pagination={{ pageSize: 10, showSizeChanger: false }}
-                    scroll={{ x: 980 }}
-                  />
+                  {isMobile ? (
+                    <>
+                      {renderQueueMobileCards(
+                        mobileQueueData,
+                        queueTab === 'auth_pending' ? 'auth_stage' : queueTab === 'pending_payment' ? 'pipeline_status' : 'payment_stage',
+                        '暂无账号',
+                      )}
+                      <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+                        <Pagination
+                          size="small"
+                          current={queueMobilePage}
+                          pageSize={queueMobilePageSize}
+                          total={filteredQueueData.length}
+                          showSizeChanger={false}
+                          onChange={setQueueMobilePage}
+                        />
+                      </div>
+                    </>
+                  ) : (
+                    <Table
+                      rowKey={queueRowKey}
+                      columns={queueColumnMap[queueTab]}
+                      dataSource={filteredQueueData}
+                      pagination={{ pageSize: 10, showSizeChanger: false }}
+                      scroll={{ x: 980 }}
+                    />
+                  )}
                 </Space>
               </Card>
             ),

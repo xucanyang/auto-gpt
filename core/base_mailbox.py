@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 import json
 import os
 import random
+import re
 import tempfile
 import threading
 import time
@@ -38,6 +39,10 @@ class MailboxAccount:
     email: str
     account_id: str = ""
     extra: dict = None  # 平台额外信息
+
+
+class TempMailReadyAuthError(RuntimeError):
+    """TempMail Ready 鉴权/配置错误，不能按普通“未收到验证码”继续轮询。"""
 
 
 class BaseMailbox(ABC):
@@ -392,6 +397,14 @@ class ManualEmailOtpMailbox(BaseMailbox):
         self._proxy = proxy
         self._tempmail_mailbox = None
         self._tempmail_account_cache: dict[str, MailboxAccount | None] = {}
+        self._tempmail_domain_allowlist: set[str] | None = None
+
+    @staticmethod
+    def _email_domain(email: str) -> str:
+        normalized = str(email or "").strip().lower()
+        if "@" not in normalized:
+            return ""
+        return normalized.rsplit("@", 1)[-1].strip().lstrip("@.")
 
     @staticmethod
     def _read_bool(value: Any, default: bool = False) -> bool:
@@ -423,6 +436,7 @@ class ManualEmailOtpMailbox(BaseMailbox):
             api_key=api_key,
             api_key_header=self._extra.get("tempmail_api_key_header", "Authorization"),
             primary_domain=self._extra.get("tempmail_primary_domain", ""),
+            primary_domains=self._extra.get("tempmail_fixed_domains", ""),
             mode="fixed_domain",
             wait_timeout_seconds=self._extra.get("tempmail_wait_timeout_seconds", 180),
             ttl_minutes=self._extra.get("tempmail_ttl_minutes", 30),
@@ -436,6 +450,108 @@ class ManualEmailOtpMailbox(BaseMailbox):
         mailbox._task_attempt_token = getattr(self, "_task_attempt_token", None)
         self._tempmail_mailbox = mailbox
         return mailbox
+
+    @staticmethod
+    def _normalize_tempmail_domain_item(item: Any) -> tuple[str, bool]:
+        if isinstance(item, str):
+            domain = str(item or "").strip().lower().lstrip("@.")
+            return domain, bool(domain)
+        if not isinstance(item, dict):
+            return "", False
+        domain = str(
+            item.get("domain")
+            or item.get("name")
+            or item.get("value")
+            or ""
+        ).strip().lower().lstrip("@.")
+        if not domain:
+            return "", False
+        is_active = item.get("is_active")
+        if is_active is None:
+            is_active = item.get("active")
+        status = str(
+            item.get("status") or ("active" if is_active is not False else "disabled")
+        ).strip().lower()
+        dns_status = str(item.get("dns_status") or "").strip().lower()
+        allowed = (
+            is_active is not False
+            and status in {"", "active", "ready", "enabled"}
+            and dns_status not in {"missing", "error", "failed", "invalid"}
+        )
+        return domain, allowed
+
+    def _list_tempmail_domains(self) -> set[str]:
+        if self._tempmail_domain_allowlist is not None:
+            return set(self._tempmail_domain_allowlist)
+        mailbox = self._build_tempmail_mailbox()
+        if mailbox is None:
+            self._tempmail_domain_allowlist = set()
+            return set()
+        domains: set[str] = set()
+        try:
+            response = mailbox._request(
+                "GET",
+                "/api/domains",
+                headers=mailbox._headers(),
+                timeout=15,
+            )
+            if response.status_code == 200:
+                payload = response.json()
+                items: list[Any] = []
+                if isinstance(payload, list):
+                    items = payload
+                elif isinstance(payload, dict):
+                    for key in ("domains", "data", "items"):
+                        value = payload.get(key)
+                        if isinstance(value, list):
+                            items = value
+                            break
+                    if not items and isinstance(payload.get("data"), dict):
+                        nested = payload.get("data") or {}
+                        for key in ("domains", "items"):
+                            value = nested.get(key)
+                            if isinstance(value, list):
+                                items = value
+                                break
+                for item in items:
+                    domain, allowed = self._normalize_tempmail_domain_item(item)
+                    if domain and allowed:
+                        domains.add(domain)
+            else:
+                if mailbox._is_auth_error_response(response.status_code, response.text[:200]):
+                    mailbox._raise_api_error("域名列表读取失败", response)
+                self._log(
+                    f"[manual_email_otp] TempMail 域名列表读取失败: {response.status_code} {response.text[:200]}"
+                )
+        except TempMailReadyAuthError:
+            raise
+        except Exception as exc:
+            self._log(f"[manual_email_otp] TempMail 域名列表读取异常: {exc}")
+
+        if not domains:
+            configured = []
+            primary = str(self._extra.get("tempmail_primary_domain") or "").strip()
+            if primary:
+                configured.append(primary)
+            fixed = self._extra.get("tempmail_fixed_domains")
+            if isinstance(fixed, (list, tuple, set)):
+                configured.extend(str(item or "").strip() for item in fixed)
+            elif fixed not in (None, ""):
+                configured.extend(re.split(r"[\s,;]+", str(fixed)))
+            for item in configured:
+                domain = str(item or "").strip().lower().lstrip("@.")
+                if domain:
+                    domains.add(domain)
+
+        self._tempmail_domain_allowlist = set(domains)
+        return set(self._tempmail_domain_allowlist)
+
+    def _email_matches_tempmail_domain(self, email: str) -> bool:
+        domain = self._email_domain(email)
+        if not domain:
+            return False
+        allowlist = self._list_tempmail_domains()
+        return domain in allowlist
 
     def _lookup_tempmail_account(self, email: str) -> MailboxAccount | None:
         normalized_email = str(email or "").strip().lower()
@@ -458,6 +574,8 @@ class ManualEmailOtpMailbox(BaseMailbox):
                 timeout=15,
             )
             if response.status_code != 200:
+                if mailbox._is_auth_error_response(response.status_code, response.text[:200]):
+                    mailbox._raise_api_error("邮箱查询失败", response)
                 self._log(
                     f"[manual_email_otp] TempMail 邮箱查询失败: {response.status_code} {response.text[:200]}"
                 )
@@ -482,6 +600,8 @@ class ManualEmailOtpMailbox(BaseMailbox):
                 )
                 self._tempmail_account_cache[normalized_email] = account
                 return account
+        except TempMailReadyAuthError:
+            raise
         except Exception as exc:
             self._log(f"[manual_email_otp] TempMail 邮箱查询异常: {exc}")
 
@@ -511,6 +631,8 @@ class ManualEmailOtpMailbox(BaseMailbox):
                 else:
                     self._log(f"[manual_email_otp] 检测到 TempMail 邮箱，已绑定自动收码: {normalized_email}")
                 return account
+        except TempMailReadyAuthError:
+            raise
         except Exception as exc:
             self._log(f"[manual_email_otp] TempMail 邮箱确保失败: {exc}")
 
@@ -522,6 +644,8 @@ class ManualEmailOtpMailbox(BaseMailbox):
             return None, None
         mailbox = self._build_tempmail_mailbox()
         if mailbox is None:
+            return None, None
+        if not self._email_matches_tempmail_domain(email):
             return None, None
         account = self._ensure_tempmail_account(email) if ensure else self._lookup_tempmail_account(email)
         return mailbox, account
@@ -600,24 +724,24 @@ class ManualEmailOtpMailbox(BaseMailbox):
                             "submission_source": "tempmail_auto_poll",
                         },
                     )
-                self._log(f"已自动从 TempMail 收到验证码：{phase_label}")
+                self._log(f"[验证码] 验证码已获取：{phase_label}")
                 return normalized_code
             except TimeoutError:
                 if task_control is None:
                     raise
-                self._log(f"TempMail 自动收码超时，回退人工输入：{phase_label}")
+                self._log(f"[验证码] TempMail 自动收码超时，回退人工输入：{phase_label}")
             except Exception as exc:
+                if isinstance(exc, TempMailReadyAuthError):
+                    raise
                 if task_control is None:
                     raise
-                self._log(f"TempMail 自动收码失败，回退人工输入：{phase_label} ({exc})")
+                self._log(f"[验证码] TempMail 自动收码失败，回退人工输入：{phase_label} ({exc})")
 
         if task_control is None:
             raise RuntimeError("manual_email_otp 模式未绑定任务控制器，且未命中 TempMail 自动收码")
 
         remaining_seconds = max(1, int(deadline - time.monotonic()))
-        self._log(
-            f"等待人工输入验证码：{phase_label}（邮箱 {email}，超时 {remaining_seconds}s）"
-        )
+        self._log(f"[验证码] 等待人工输入：{phase_label}（邮箱 {email}，超时 {remaining_seconds}s）")
         code = task_control.wait_for_verification_code(
             attempt_id=getattr(self, "_task_attempt_token", None),
             phase=phase,
@@ -639,8 +763,43 @@ class ManualEmailOtpMailbox(BaseMailbox):
                 "submission_source": "manual_input",
             },
         )
-        self._log(f"已收到人工验证码：{phase_label}")
+        self._log(f"[验证码] 验证码已获取：{phase_label}")
         return normalized_code
+
+
+def _mailbox_bool(value, *, default: bool = False) -> bool:
+    if value in (None, ""):
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on", "y", "是", "开启", "启用"}:
+        return True
+    if text in {"0", "false", "no", "off", "n", "否", "关闭", "禁用"}:
+        return False
+    return default
+
+
+def _mailbox_api_proxy(extra: dict, task_proxy: str | None = None, *, prefix: str = "") -> str | None:
+    """Return an explicit mailbox-provider API proxy.
+
+    Registration proxies are for ChatGPT/OpenAI traffic.  Mail-provider control
+    planes such as TempMail Ready are normally host-local/admin APIs and should
+    not inherit a random ChatGPT exit proxy unless explicitly requested.
+    """
+    keys = []
+    if prefix:
+        keys.extend((f"{prefix}_proxy", f"{prefix}_api_proxy"))
+    keys.extend(("mailbox_proxy", "email_proxy", "mail_api_proxy"))
+    for key in keys:
+        value = str((extra or {}).get(key) or "").strip()
+        if value:
+            return value
+    if _mailbox_bool((extra or {}).get("mailbox_use_task_proxy"), default=False):
+        return task_proxy
+    if prefix and _mailbox_bool((extra or {}).get(f"{prefix}_use_task_proxy"), default=False):
+        return task_proxy
+    return None
 
 
 def create_mailbox(
@@ -648,6 +807,8 @@ def create_mailbox(
 ) -> "BaseMailbox":
     """工厂方法：根据 provider 创建对应的 mailbox 实例"""
     extra = extra or {}
+    provider = str(provider or "").strip().lower()
+    tempmail_proxy = _mailbox_api_proxy(extra, proxy, prefix="tempmail")
     if provider == "manual_email_otp":
         return ManualEmailOtpMailbox(
             email=extra.get("manual_email_address") or extra.get("email") or "",
@@ -662,25 +823,47 @@ def create_mailbox(
             api_key=extra.get("tempmail_api_key", ""),
             api_key_header=extra.get("tempmail_api_key_header", "Authorization"),
             primary_domain=extra.get("tempmail_primary_domain", ""),
+            primary_domains=extra.get("tempmail_fixed_domains", ""),
             mode=extra.get("tempmail_mode", "fixed_domain"),
             wait_timeout_seconds=extra.get("tempmail_wait_timeout_seconds", 180),
             ttl_minutes=extra.get("tempmail_ttl_minutes", 30),
             reuse_window_minutes=extra.get("tempmail_reuse_window_minutes", 20),
             permanent=extra.get("tempmail_permanent", False),
             platform=extra.get("tempmail_platform", "chatgpt"),
-            proxy=proxy,
+            proxy=tempmail_proxy,
         )
-    elif provider == "icloud_hme":
+    elif provider in ("icloud_hme", "hme_ready_api", "icloud_hme_ready", "icloud_hme_helper_ready"):
+        hme_mode = (
+            "helper_ready_api"
+            if provider in {"hme_ready_api", "icloud_hme_ready", "icloud_hme_helper_ready"}
+            else extra.get("icloud_hme_mode", "live")
+        )
         return IcloudHmeMailbox(
-            icloud_hme_mode=extra.get("icloud_hme_mode", "live"),
+            mail_provider_name=provider,
+            icloud_hme_mode=hme_mode,
             icloud_cookie=extra.get("icloud_cookie", ""),
             icloud_domain_base=extra.get("icloud_domain_base", "icloud.com"),
             icloud_forward_to=extra.get("icloud_forward_to", "b@cccy.me"),
             icloud_forward_mailbox_id=extra.get("icloud_forward_mailbox_id", ""),
+            icloud_hme_helper_api_url=extra.get("icloud_hme_helper_api_url", ""),
+            icloud_hme_helper_internal_key=(
+                extra.get("icloud_hme_helper_internal_key")
+                or extra.get("icloud_hme_helper_api_key")
+                or ""
+            ),
+            icloud_hme_helper_api_key_header=extra.get(
+                "icloud_hme_helper_api_key_header",
+                extra.get("icloud_hme_helper_header", "X-Internal-Key"),
+            ),
+            icloud_hme_helper_consumer=extra.get("icloud_hme_helper_consumer", "auto-gpt/chatgpt_register"),
+            icloud_hme_helper_checkout_ttl_seconds=extra.get("icloud_hme_helper_checkout_ttl_seconds", ""),
+            icloud_hme_helper_wait_timeout_seconds=extra.get("icloud_hme_helper_wait_timeout_seconds", ""),
+            icloud_hme_helper_max_cache_age_seconds=extra.get("icloud_hme_helper_max_cache_age_seconds", ""),
             tempmail_api_url=extra.get("tempmail_api_url", ""),
             tempmail_api_key=extra.get("tempmail_api_key", ""),
             tempmail_api_key_header=extra.get("tempmail_api_key_header", "Authorization"),
             wait_timeout_seconds=extra.get("tempmail_wait_timeout_seconds", 300),
+            tempmail_proxy=tempmail_proxy,
             proxy=proxy,
         )
     elif provider == "skymail":
@@ -953,6 +1136,23 @@ class ICloudHmeClient:
         text = str(message or "").lower()
         return "750" in text or ("limit" in text and "alias" in text)
 
+    @staticmethod
+    def _looks_like_rate_limit_error(status_code: int, message: str) -> bool:
+        if int(status_code or 0) == 429:
+            return True
+        text = str(message or "").lower()
+        return any(
+            marker in text
+            for marker in (
+                "rate limit",
+                "rate_limited",
+                "too many requests",
+                "try again later",
+                "请求过快",
+                "限流",
+            )
+        )
+
     def _request_json(
         self,
         method: str,
@@ -1063,7 +1263,9 @@ class ICloudHmeClient:
             if self._looks_like_auth_error(status_code, response_payload, error_message):
                 self.clear_cached_api_base()
                 raise ICloudAuthExpiredError("iCloud cookie 已失效，请更新 Settings.icloud_cookie")
-            if self._looks_like_alias_limit_error(error_message):
+            if self._looks_like_alias_limit_error(error_message) or self._looks_like_rate_limit_error(
+                status_code, error_message
+            ):
                 retry_after = 0
                 if isinstance(response_payload, dict):
                     try:
@@ -1071,7 +1273,7 @@ class ICloudHmeClient:
                     except Exception:
                         retry_after = 0
                 raise ICloudAliasLimitError(
-                    "iCloud HME 当前创建请求被临时限流，请稍后重试",
+                    "iCloud HME 当前请求被临时限流，请稍后重试",
                     retry_after=retry_after,
                 )
             raise ICloudBusinessError(
@@ -1108,6 +1310,205 @@ class ICloudHmeClient:
             payload["note"] = str(note or "").strip()
         return self._request_action("update_metadata", "POST", "/v1/hme/updateMetaData", payload=payload)
 
+    def deactivate(self, *, anonymous_id: str) -> Any:
+        """停用一个 HME 别名。Apple 要求删除前必须先停用。"""
+        return self._request_action(
+            "deactivate",
+            "POST",
+            "/v1/hme/deactivate",
+            payload={"anonymousId": str(anonymous_id or "").strip()},
+        )
+
+    def delete(self, *, anonymous_id: str) -> Any:
+        """永久删除一个 HME 别名（不可恢复）。需先调用 deactivate。"""
+        return self._request_action(
+            "delete",
+            "POST",
+            "/v1/hme/delete",
+            payload={"anonymousId": str(anonymous_id or "").strip()},
+        )
+
+
+class HmeReadyApiClient:
+    """Client for icloud-hide-email-helper HME Ready API."""
+
+    REQUEST_TIMEOUT_SECONDS = 20
+
+    def __init__(
+        self,
+        *,
+        api_url: str = "",
+        api_key: str = "",
+        api_key_header: str = "X-Internal-Key",
+        proxy: str | None = None,
+    ):
+        self.api_url = str(api_url or "").strip().rstrip("/")
+        self.api_key = str(api_key or "").strip()
+        self.api_key_header = str(api_key_header or "X-Internal-Key").strip() or "X-Internal-Key"
+        self.proxy = build_requests_proxy_config(proxy)
+
+    @staticmethod
+    def _unwrap_payload(payload: Any) -> Any:
+        if isinstance(payload, dict) and "data" in payload and set(payload.keys()).issubset(
+            {"status", "data", "ok", "success"}
+        ):
+            return payload.get("data")
+        return payload
+
+    @staticmethod
+    def _extract_error(payload: Any, raw_text: str = "") -> str:
+        if isinstance(payload, dict):
+            for key in ("error", "message", "detail", "reason"):
+                value = payload.get(key)
+                if value:
+                    return str(value).strip()
+            data = payload.get("data")
+            if isinstance(data, dict):
+                for key in ("error", "message", "detail", "reason"):
+                    value = data.get(key)
+                    if value:
+                        return str(value).strip()
+        return str(raw_text or payload or "").strip()[:500]
+
+    def _headers(self) -> dict[str, str]:
+        headers = {"accept": "application/json", "content-type": "application/json"}
+        if not self.api_key:
+            return headers
+        header = self.api_key_header or "X-Internal-Key"
+        if header.lower() == "authorization":
+            headers["Authorization"] = (
+                self.api_key if self.api_key.lower().startswith("bearer ") else f"Bearer {self.api_key}"
+            )
+        else:
+            headers[header] = self.api_key
+        return headers
+
+    def _ensure_config(self) -> None:
+        if not self.api_url:
+            raise RuntimeError("iCloud HME Helper Ready API 未配置：请设置 icloud_hme_helper_api_url")
+        if not self.api_key:
+            raise RuntimeError("iCloud HME Helper Ready API 未配置：请设置 icloud_hme_helper_internal_key")
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        payload: dict[str, Any] | None = None,
+        params: dict[str, Any] | None = None,
+        timeout: int | None = None,
+    ) -> Any:
+        import requests
+
+        self._ensure_config()
+        url = f"{self.api_url}{path}"
+        try:
+            response = requests.request(
+                method.upper(),
+                url,
+                headers=self._headers(),
+                params=params or None,
+                data=json.dumps(payload or {}, ensure_ascii=False) if method.upper() != "GET" else None,
+                timeout=max(int(timeout or self.REQUEST_TIMEOUT_SECONDS), 1),
+                proxies=self.proxy,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"HME Ready API 调用失败: {method.upper()} {path} error={exc}") from exc
+
+        raw_text = response.text or ""
+        try:
+            data = response.json() if raw_text else {}
+        except Exception as exc:
+            raise RuntimeError(
+                f"HME Ready API 返回不是 JSON: {method.upper()} {path} status={response.status_code}"
+            ) from exc
+
+        if response.status_code >= 400:
+            message = self._extract_error(data, raw_text)
+            raise RuntimeError(f"HME Ready API 调用失败: {method.upper()} {path} status={response.status_code} error={message}")
+        return self._unwrap_payload(data)
+
+    def prepare(
+        self,
+        *,
+        forward_to: str,
+        request_id: str = "",
+        consumer: str = "",
+        ttl_ms: int | None = None,
+        max_cache_age_ms: int | None = None,
+    ) -> Any:
+        body = {
+            "forward_to": str(forward_to or "").strip(),
+            "request_id": str(request_id or "").strip(),
+            "consumer": str(consumer or "").strip(),
+        }
+        if ttl_ms:
+            body["ttl_ms"] = int(ttl_ms)
+        if max_cache_age_ms:
+            body["max_cache_age_ms"] = int(max_cache_age_ms)
+        return self._request("POST", "/api/hme-ready/mailboxes/prepare", payload=body)
+
+    def list_emails(self, lease_id: str, *, page: int = 1, size: int = 100) -> list[dict[str, Any]]:
+        payload = self._request(
+            "GET",
+            f"/api/hme-ready/mailboxes/{lease_id}/emails",
+            params={"page": int(page or 1), "size": int(size or 100)},
+        )
+        if isinstance(payload, dict):
+            data = payload.get("data") or payload.get("emails") or payload.get("items") or []
+            return data if isinstance(data, list) else []
+        return payload if isinstance(payload, list) else []
+
+    def wait_code(
+        self,
+        lease_id: str,
+        *,
+        timeout_seconds: int,
+        before_ids: set | list | tuple | None = None,
+        code_pattern: str = "",
+        otp_sent_at: Any = None,
+        exclude_codes: set | list | tuple | None = None,
+        phase: str = "",
+    ) -> dict[str, Any]:
+        body = {
+            "timeout_seconds": int(timeout_seconds or 1),
+            "before_ids": sorted(str(item) for item in (before_ids or []) if str(item or "").strip()),
+            "exclude_codes": sorted(str(item) for item in (exclude_codes or []) if str(item or "").strip()),
+            "code_pattern": str(code_pattern or "").strip(),
+            "phase": str(phase or "").strip(),
+        }
+        if otp_sent_at:
+            body["otp_sent_at"] = otp_sent_at
+        timeout = max(int(timeout_seconds or 1) + 15, self.REQUEST_TIMEOUT_SECONDS)
+        payload = self._request(
+            "POST",
+            f"/api/hme-ready/mailboxes/{lease_id}/wait-code",
+            payload=body,
+            timeout=timeout,
+        )
+        return payload if isinstance(payload, dict) else {}
+
+    def finalize(
+        self,
+        lease_id: str,
+        *,
+        outcome: str,
+        reason: str = "",
+        chatgpt_account_email: str = "",
+        task_id: str = "",
+    ) -> dict[str, Any]:
+        payload = self._request(
+            "POST",
+            f"/api/hme-ready/mailboxes/{lease_id}/finalize",
+            payload={
+                "outcome": str(outcome or "").strip(),
+                "reason": str(reason or "").strip(),
+                "chatgpt_account_email": str(chatgpt_account_email or "").strip(),
+                "task_id": str(task_id or "").strip(),
+            },
+        )
+        return payload if isinstance(payload, dict) else {}
+
 
 class IcloudHmeMailbox(BaseMailbox):
     RESERVE_MIN_DELAY_SECONDS = 1.5
@@ -1118,6 +1519,7 @@ class IcloudHmeMailbox(BaseMailbox):
     def __init__(
         self,
         *,
+        mail_provider_name: str = "icloud_hme",
         icloud_hme_mode: str = "live",
         icloud_cookie: str,
         icloud_domain_base: str = "icloud.com",
@@ -1127,14 +1529,55 @@ class IcloudHmeMailbox(BaseMailbox):
         tempmail_api_key: str,
         tempmail_api_key_header: str = "Authorization",
         wait_timeout_seconds: int = 300,
+        forward_ttl_minutes: int = 525600,
+        forward_permanent: Any = True,
         proxy: str | None = None,
+        tempmail_proxy: str | None = None,
+        icloud_hme_helper_api_url: str = "",
+        icloud_hme_helper_internal_key: str = "",
+        icloud_hme_helper_api_key_header: str = "X-Internal-Key",
+        icloud_hme_helper_consumer: str = "auto-gpt/chatgpt_register",
+        icloud_hme_helper_checkout_ttl_seconds: Any = "",
+        icloud_hme_helper_wait_timeout_seconds: Any = "",
+        icloud_hme_helper_max_cache_age_seconds: Any = "",
     ):
+        self._mail_provider_name = str(mail_provider_name or "icloud_hme").strip().lower() or "icloud_hme"
         self._icloud_hme_mode = str(icloud_hme_mode or "live").strip().lower() or "live"
         self._icloud_cookie = str(icloud_cookie or "").strip()
         self._icloud_domain_base = str(icloud_domain_base or "icloud.com").strip().lower() or "icloud.com"
-        self._icloud_forward_to = str(icloud_forward_to or "b@cccy.me").strip()
+        self._icloud_forward_to = "*"
+        raw_forward_to = "*"
+        self._icloud_forward_tos = []
         self._icloud_forward_mailbox_id = str(icloud_forward_mailbox_id or "").strip()
         self._wait_timeout_seconds = max(int(wait_timeout_seconds or 300), 1)
+        helper_wait_timeout = str(icloud_hme_helper_wait_timeout_seconds or "").strip()
+        if helper_wait_timeout:
+            try:
+                self._wait_timeout_seconds = max(int(helper_wait_timeout), 1)
+            except (TypeError, ValueError):
+                pass
+        try:
+            self._helper_checkout_ttl_seconds = max(
+                int(str(icloud_hme_helper_checkout_ttl_seconds or "").strip() or "0"),
+                0,
+            )
+        except (TypeError, ValueError):
+            self._helper_checkout_ttl_seconds = 0
+        try:
+            self._helper_max_cache_age_seconds = max(
+                int(str(icloud_hme_helper_max_cache_age_seconds or "").strip() or "86400"),
+                60,
+            )
+        except (TypeError, ValueError):
+            self._helper_max_cache_age_seconds = 86400
+        self._helper_consumer = str(icloud_hme_helper_consumer or "auto-gpt/chatgpt_register").strip()
+        self._helper_wait_started_leases: set[str] = set()
+        self._helper_client = HmeReadyApiClient(
+            api_url=icloud_hme_helper_api_url,
+            api_key=icloud_hme_helper_internal_key,
+            api_key_header=icloud_hme_helper_api_key_header,
+            proxy=tempmail_proxy,
+        )
         self._icloud_client = ICloudHmeClient(
             cookie=self._icloud_cookie,
             domain_base=self._icloud_domain_base,
@@ -1146,10 +1589,13 @@ class IcloudHmeMailbox(BaseMailbox):
             api_key_header=tempmail_api_key_header,
             mode="fixed_domain",
             wait_timeout_seconds=self._wait_timeout_seconds,
+            ttl_minutes=forward_ttl_minutes,
+            permanent=forward_permanent,
             platform="chatgpt",
-            proxy=proxy,
+            proxy=tempmail_proxy,
         )
         self._forward_mailbox_account: MailboxAccount | None = None
+        self._forward_mailbox_accounts: list[MailboxAccount] = []
 
     def _bind_runtime_state(self) -> None:
         self._tempmail_mailbox._log_fn = getattr(self, "_log_fn", None)
@@ -1157,12 +1603,15 @@ class IcloudHmeMailbox(BaseMailbox):
         self._tempmail_mailbox._task_attempt_token = getattr(self, "_task_attempt_token", None)
 
     def _ensure_config(self) -> None:
-        if self._icloud_hme_mode not in {"live", "import_pool", "prefer_import"}:
+        if self._icloud_hme_mode not in {"live", "import_pool", "prefer_import", "helper_ready_api"}:
             raise RuntimeError(f"不支持的 icloud_hme_mode: {self._icloud_hme_mode}")
-        if self._icloud_hme_mode == "live" and not self._icloud_cookie:
-            raise RuntimeError("iCloud HME 未配置：请设置 icloud_cookie")
         if not self._icloud_forward_to:
             raise RuntimeError("iCloud HME 未配置：请设置 icloud_forward_to")
+        if self._icloud_hme_mode == "helper_ready_api":
+            self._helper_client._ensure_config()
+            return
+        if self._icloud_hme_mode == "live" and not self._icloud_cookie:
+            raise RuntimeError("iCloud HME 未配置：请设置 icloud_cookie")
         self._bind_runtime_state()
         self._tempmail_mailbox._ensure_config()
         if self._icloud_hme_mode != "import_pool":
@@ -1230,12 +1679,42 @@ class IcloudHmeMailbox(BaseMailbox):
         )
         return self._forward_mailbox_account
 
+    def _resolve_all_forward_mailboxes(self) -> list[MailboxAccount]:
+        self._ensure_config()
+        if self._forward_mailbox_accounts:
+            return self._forward_mailbox_accounts
+        accounts = []
+        for i, fwd_to in enumerate(self._icloud_forward_tos):
+            if i == 0 and self._icloud_forward_mailbox_id:
+                accounts.append(MailboxAccount(
+                    email=fwd_to,
+                    account_id=self._icloud_forward_mailbox_id,
+                    extra={"mailbox_action": "configured_forward_mailbox"},
+                ))
+            else:
+                accounts.append(self._tempmail_mailbox.ensure_mailbox_by_email(
+                    fwd_to,
+                    force_lookup=True,
+                ))
+        self._forward_mailbox_accounts = accounts
+        return self._forward_mailbox_accounts
+
     def _shared_mailbox_id_for(self, account: MailboxAccount | None = None) -> str:
         if account is not None:
             extra = dict(getattr(account, "extra", None) or {})
             mailbox_id = str(extra.get("forward_mailbox_id") or "").strip()
             if mailbox_id:
-                return mailbox_id
+                try:
+                    self._tempmail_mailbox._list_emails(mailbox_id)
+                    return mailbox_id
+                except Exception as exc:
+                    if self._tempmail_mailbox._is_mailbox_not_found_error(exc):
+                        refreshed = self._refresh_forward_mailbox_binding(account)
+                        self._log(
+                            f"[iCloudHME] 转发邮箱 mailbox_id 已失效，已按 {self._icloud_forward_to} 重新绑定"
+                        )
+                        return str(refreshed.account_id or "").strip()
+                    raise
         return str(self._resolve_forward_mailbox().account_id or "").strip()
 
     def _claim_imported_alias(self) -> MailboxAccount | None:
@@ -1260,7 +1739,7 @@ class IcloudHmeMailbox(BaseMailbox):
             email=hme,
             account_id=anonymous_id,
             extra={
-                "provider": "icloud_hme",
+                "provider": self._mail_provider_name,
                 "anonymous_id": anonymous_id,
                 "hme": hme,
                 "label": str(claimed.get("label") or "").strip(),
@@ -1368,7 +1847,7 @@ class IcloudHmeMailbox(BaseMailbox):
             email=reserved_hme,
             account_id=anonymous_id,
             extra={
-                "provider": "icloud_hme",
+                "provider": self._mail_provider_name,
                 "anonymous_id": anonymous_id,
                 "hme": reserved_hme,
                 "label": label,
@@ -1380,9 +1859,80 @@ class IcloudHmeMailbox(BaseMailbox):
             },
         )
 
+    @staticmethod
+    def _message_id_from_helper_email(message: dict[str, Any], index: int = 0) -> str:
+        for key in ("id", "message_id", "messageId", "uid"):
+            value = str((message or {}).get(key) or "").strip()
+            if value:
+                return value
+        return f"idx-{index}-{(message or {}).get('received_at') or (message or {}).get('subject') or ''}"
+
+    @staticmethod
+    def _helper_lease_id(account: MailboxAccount | None) -> str:
+        extra = dict(getattr(account, "extra", None) or {}) if account is not None else {}
+        return str(
+            extra.get("lease_id")
+            or extra.get("checkout_id")
+            or extra.get("mailbox_id")
+            or getattr(account, "account_id", "")
+            or ""
+        ).strip()
+
+    def _helper_get_email(self) -> MailboxAccount:
+        self._ensure_config()
+        self._log("[iCloudHME] 使用 Helper Ready API 出池")
+        task_id = str(getattr(self, "_task_attempt_token", "") or "").strip()
+        ttl_ms = self._helper_checkout_ttl_seconds * 1000 if self._helper_checkout_ttl_seconds else None
+        payload = self._helper_client.prepare(
+            forward_to="*",
+            request_id=task_id,
+            consumer=self._helper_consumer,
+            ttl_ms=ttl_ms,
+            max_cache_age_ms=self._helper_max_cache_age_seconds * 1000,
+        )
+        auto_gpt = payload.get("auto_gpt") if isinstance(payload, dict) else {}
+        mailbox = payload.get("mailbox") if isinstance(payload, dict) else {}
+        lease = payload.get("lease") if isinstance(payload, dict) else {}
+        if not isinstance(auto_gpt, dict):
+            auto_gpt = {}
+        if not isinstance(mailbox, dict):
+            mailbox = {}
+        if not isinstance(lease, dict):
+            lease = {}
+
+        email = str(auto_gpt.get("email") or mailbox.get("email") or mailbox.get("full_address") or "").strip()
+        lease_id = str(
+            auto_gpt.get("account_id")
+            or lease.get("id")
+            or lease.get("checkout_id")
+            or mailbox.get("id")
+            or ""
+        ).strip()
+        extra = dict(auto_gpt.get("extra") or {})
+        if not email or not lease_id:
+            raise RuntimeError(f"HME Ready API prepare 返回异常: {payload}")
+        extra.update(
+            {
+                "provider": self._mail_provider_name,
+                "mode": "helper_ready_api",
+                "source": extra.get("source") or "icloud-hide-email-helper",
+                "lease_id": extra.get("lease_id") or lease_id,
+                "checkout_id": extra.get("checkout_id") or lease_id,
+                "hme": extra.get("hme") or email,
+                "forward_to": extra.get("forward_to") or self._icloud_forward_to,
+                "configured_forward_to": self._icloud_forward_to,
+                "configured_forward_tos": list(self._icloud_forward_tos),
+                "mailbox_action": extra.get("mailbox_action") or "claimed_helper",
+            }
+        )
+        self._log(f"[iCloudHME] Helper 已领取别名: {email} lease={lease_id}")
+        return MailboxAccount(email=email, account_id=lease_id, extra=extra)
+
     def get_email(self) -> MailboxAccount:
         self._ensure_config()
-        self._log("[邮箱] mail_provider=icloud_hme")
+        self._log(f"[邮箱] mail_provider={self._mail_provider_name}")
+        if self._icloud_hme_mode == "helper_ready_api":
+            return self._helper_get_email()
         if self._icloud_hme_mode in {"live", "import_pool", "prefer_import"}:
             claimed = self._claim_imported_alias()
             if claimed is not None:
@@ -1392,16 +1942,32 @@ class IcloudHmeMailbox(BaseMailbox):
         return self.create_alias_for_import_pool()
 
     def get_current_ids(self, account: MailboxAccount) -> set:
-        mailbox_id = self._shared_mailbox_id_for(account)
-        try:
-            mails = self._tempmail_mailbox._list_emails(mailbox_id)
-        except Exception as exc:
-            if self._tempmail_mailbox._is_mailbox_not_found_error(exc):
-                refreshed = self._refresh_forward_mailbox_binding(account)
-                mails = self._tempmail_mailbox._list_emails(refreshed.account_id)
-            else:
-                raise
-        return {self._tempmail_mailbox._message_id(msg, idx) for idx, msg in enumerate(mails)}
+        if self._icloud_hme_mode == "helper_ready_api":
+            lease_id = self._helper_lease_id(account)
+            if not lease_id:
+                return set()
+            return {
+                self._message_id_from_helper_email(message, idx)
+                for idx, message in enumerate(self._helper_client.list_emails(lease_id))
+            }
+        
+        all_ids = set()
+        mailbox_ids_to_check = {fwd_acc.account_id for fwd_acc in self._resolve_all_forward_mailboxes()}
+        
+        extra = dict(getattr(account, "extra", None) or {})
+        bound_mailbox_id = str(extra.get("forward_mailbox_id") or "").strip()
+        if bound_mailbox_id:
+            mailbox_ids_to_check.add(bound_mailbox_id)
+            
+        for m_id in mailbox_ids_to_check:
+            try:
+                mails = self._tempmail_mailbox._list_emails(m_id)
+                for idx, msg in enumerate(mails):
+                    all_ids.add(self._tempmail_mailbox._message_id(msg, idx))
+            except Exception as exc:
+                if not self._tempmail_mailbox._is_mailbox_not_found_error(exc):
+                    raise
+        return all_ids
 
     def wait_for_code(
         self,
@@ -1415,7 +1981,50 @@ class IcloudHmeMailbox(BaseMailbox):
         from core.db import update_icloud_hme_alias_on_otp
 
         self._ensure_config()
-        mailbox_id = self._shared_mailbox_id_for(account)
+        if self._icloud_hme_mode == "helper_ready_api":
+            lease_id = self._helper_lease_id(account)
+            if not lease_id:
+                raise RuntimeError("icloud_hme helper_ready_api 当前任务缺少 lease_id")
+            self._helper_wait_started_leases.add(lease_id)
+            exclude_codes = {
+                str(code).strip()
+                for code in (kwargs.get("exclude_codes") or set())
+                if str(code or "").strip()
+            }
+            result = self._helper_client.wait_code(
+                lease_id,
+                timeout_seconds=max(int(timeout or self._wait_timeout_seconds), 1),
+                before_ids=before_ids or set(),
+                code_pattern=code_pattern or "",
+                otp_sent_at=kwargs.get("otp_sent_at"),
+                exclude_codes=exclude_codes,
+                phase=kwargs.get("phase") or "",
+            )
+            code = str((result or {}).get("code") or "").strip()
+            if not code:
+                message = str((result or {}).get("message") or (result or {}).get("error") or "等待验证码超时").strip()
+                raise TimeoutError(message)
+            mailbox_meta = dict((result or {}).get("mailbox") or {})
+            self._record_verification_result(
+                message_id=(result or {}).get("message_id") or "",
+                code=code,
+                phase=kwargs.get("phase") or "",
+                provider=(result or {}).get("provider") or "IcloudHmeReadyApiMailbox",
+                metadata={
+                    "received_for": list((result or {}).get("received_for") or []),
+                    "matched_alias": getattr(account, "email", "") or "",
+                    "mailbox": mailbox_meta,
+                    "lease_id": lease_id,
+                    "matched_forward_to": (result or {}).get("matched_forward_to") or mailbox_meta.get("matched_forward_to") or "",
+                    "matched_mailbox_id": (result or {}).get("matched_mailbox_id") or mailbox_meta.get("matched_mailbox_id") or "",
+                    "raw_message_id": (result or {}).get("raw_message_id") or "",
+                    "scan_targets": (result or {}).get("scan_targets") or [],
+                    "scan_errors": (result or {}).get("scan_errors") or [],
+                },
+            )
+            self._log(f"[iCloudHME] Helper 命中验证码: {code}")
+            return code
+
         alias = self._normalize_email(getattr(account, "email", "") or "")
         if not alias:
             raise RuntimeError("icloud_hme 当前任务缺少 alias 邮箱地址")
@@ -1428,75 +2037,85 @@ class IcloudHmeMailbox(BaseMailbox):
             if str(code or "").strip()
         }
 
+        extra = dict(getattr(account, "extra", None) or {})
+        bound_mailbox_id = str(extra.get("forward_mailbox_id") or "").strip()
+
         def poll_once() -> Optional[str]:
-            nonlocal mailbox_id
-            try:
-                mails = self._tempmail_mailbox._list_emails(mailbox_id)
-            except Exception as exc:
-                if self._tempmail_mailbox._is_mailbox_not_found_error(exc):
-                    mailbox_id = self._refresh_forward_mailbox_binding(account).account_id
-                    return None
-                raise
-            for idx, msg in enumerate(mails):
-                mid = self._tempmail_mailbox._message_id(msg, idx)
-                if mid in seen:
-                    continue
-                msg_ts = self._tempmail_mailbox._parse_message_timestamp(msg)
-                if otp_sent_at and msg_ts and msg_ts < float(otp_sent_at):
-                    seen.add(mid)
-                    continue
+            mailbox_ids_to_check = {fwd_acc.account_id for fwd_acc in self._resolve_all_forward_mailboxes()}
+            if bound_mailbox_id:
+                mailbox_ids_to_check.add(bound_mailbox_id)
 
-                detail = self._tempmail_mailbox._get_email_detail(mailbox_id, mid)
-                received_for = detail.get("received_for") if isinstance(detail, dict) else []
-                normalized_targets = {
-                    self._normalize_email(value)
-                    for value in (received_for if isinstance(received_for, list) else [])
-                    if str(value or "").strip()
-                }
-                raw_message = str(detail.get("raw_message") or "")
-                raw_lower = raw_message.lower()
-                alias_header_hit = (
-                    f"for <{alias}>" in raw_lower
-                    or f"delivered-to: {alias}" in raw_lower
-                    or f"x-original-to: {alias}" in raw_lower
-                    or alias in raw_lower
-                )
-                if alias not in normalized_targets and not alias_header_hit:
-                    seen.add(mid)
-                    continue
+            for m_id in mailbox_ids_to_check:
+                try:
+                    mails = self._tempmail_mailbox._list_emails(m_id)
+                except Exception as exc:
+                    if self._tempmail_mailbox._is_mailbox_not_found_error(exc):
+                        continue
+                    raise
 
-                full_text = " ".join(
-                    [
-                        str(msg.get("subject") or ""),
-                        str(detail.get("subject") or ""),
-                        str(detail.get("body_text") or ""),
-                        str(detail.get("body_html") or ""),
-                        str(detail.get("raw_message") or ""),
-                    ]
-                )
-                code = self._safe_extract(full_text, code_pattern)
-                seen.add(mid)
-                if not code or str(code).strip() in exclude_codes:
-                    continue
+                for idx, msg in enumerate(mails):
+                    mid = self._tempmail_mailbox._message_id(msg, idx)
+                    if mid in seen:
+                        continue
+                    msg_ts = self._tempmail_mailbox._parse_message_timestamp(msg)
+                    if otp_sent_at and msg_ts and msg_ts < float(otp_sent_at):
+                        seen.add(mid)
+                        continue
 
-                anonymous_id = str(getattr(account, "account_id", "") or "").strip()
-                if anonymous_id:
-                    update_icloud_hme_alias_on_otp(
-                        anonymous_id,
-                        last_otp_at=self._utcnow_iso(),
+                    detail = self._tempmail_mailbox._get_email_detail(m_id, mid)
+                    received_for = detail.get("received_for") if isinstance(detail, dict) else []
+                    normalized_targets = {
+                        self._normalize_email(value)
+                        for value in (received_for if isinstance(received_for, list) else [])
+                        if str(value or "").strip()
+                    }
+                    raw_message = str(detail.get("raw_message") or "")
+                    raw_lower = raw_message.lower()
+                    alias_header_hit = (
+                        f"for <{alias}>" in raw_lower
+                        or f"delivered-to: {alias}" in raw_lower
+                        or f"x-original-to: {alias}" in raw_lower
+                        or alias in raw_lower
                     )
-                self._record_verification_result(
-                    message_id=mid,
-                    code=code,
-                    phase=kwargs.get("phase") or "",
-                    provider="IcloudHmeMailbox",
-                    metadata={
-                        "received_for": list(received_for or []),
-                        "matched_alias": getattr(account, "email", "") or "",
-                    },
-                )
-                self._log(f"[iCloudHME] 命中验证码: {code}")
-                return code
+                    if alias not in normalized_targets and not alias_header_hit:
+                        seen.add(mid)
+                        continue
+
+                    full_text = " ".join(
+                        [
+                            str(msg.get("subject") or ""),
+                            str(detail.get("subject") or ""),
+                            str(detail.get("body_text") or ""),
+                            str(detail.get("body_html") or ""),
+                            str(detail.get("raw_message") or ""),
+                        ]
+                    )
+                    code = self._safe_extract(full_text, code_pattern)
+                    seen.add(mid)
+                    if not code or str(code).strip() in exclude_codes:
+                        continue
+
+                    anonymous_id = str(getattr(account, "account_id", "") or "").strip()
+                    if anonymous_id and self._icloud_hme_mode != "helper_ready_api":
+                        update_icloud_hme_alias_on_otp(
+                            anonymous_id,
+                            last_otp_at=self._utcnow_iso(),
+                        )
+                    provider = "IcloudHmeReadyApiMailbox" if self._icloud_hme_mode == "helper_ready_api" else "IcloudHmeMailbox"
+                    self._record_verification_result(
+                        message_id=mid,
+                        code=code,
+                        phase=kwargs.get("phase") or "",
+                        provider=provider,
+                        metadata={
+                            "received_for": list(received_for or []),
+                            "matched_alias": getattr(account, "email", "") or "",
+                            "mailbox": {"id": m_id},
+                            "lease_id": lease_id if self._icloud_hme_mode == "helper_ready_api" else "",
+                        },
+                    )
+                    self._log(f"[iCloudHME] 命中验证码: {code}")
+                    return code
             return None
 
         return self._run_polling_wait(
@@ -1515,6 +2134,23 @@ class IcloudHmeMailbox(BaseMailbox):
     ) -> None:
         from core.db import update_icloud_hme_alias_on_success
 
+        if self._icloud_hme_mode == "helper_ready_api":
+            lease_id = self._helper_lease_id(account)
+            if not lease_id:
+                return
+            bound_email = str(registered_email or getattr(account, "email", "") or "").strip()
+            resolved_task_id = str(task_id or getattr(self, "_task_attempt_token", "") or "").strip()
+            self._helper_client.finalize(
+                lease_id,
+                outcome="success",
+                reason="registered",
+                chatgpt_account_email=bound_email,
+                task_id=resolved_task_id,
+            )
+            self._helper_wait_started_leases.discard(lease_id)
+            self._log(f"[iCloudHME] Helper 已提交成功: {getattr(account, 'email', '')}")
+            return
+
         anonymous_id = str(getattr(account, "account_id", "") or "").strip()
         if not anonymous_id:
             return
@@ -1527,14 +2163,6 @@ class IcloudHmeMailbox(BaseMailbox):
             task_id=resolved_task_id,
             note=note,
         )
-        try:
-            self._icloud_client.update_metadata(
-                anonymous_id=anonymous_id,
-                label=str((getattr(account, "extra", None) or {}).get("label") or "").strip(),
-                note=note,
-            )
-        except Exception as exc:
-            self._log(f"[iCloudHME] updateMetaData 失败: {exc}")
 
     def finalize_failure(
         self,
@@ -1545,8 +2173,58 @@ class IcloudHmeMailbox(BaseMailbox):
     ) -> None:
         from core.db import (
             release_icloud_hme_alias_after_early_failure,
+            update_icloud_hme_alias_on_account_deactivated,
             update_icloud_hme_alias_on_failure,
         )
+        from services.chatgpt_account_state import is_account_deactivated_message
+
+        if self._icloud_hme_mode == "helper_ready_api":
+            lease_id = self._helper_lease_id(account)
+            if not lease_id:
+                return
+            resolved_task_id = str(task_id or getattr(self, "_task_attempt_token", "") or "").strip()
+            error_text = str(error_message or "").strip()
+            lowered = error_text.lower()
+            if is_account_deactivated_message("", error_text):
+                outcome = "account_deactivated"
+            else:
+                keep_alias_failure_markers = (
+                    "already paid",
+                    "user is already paid",
+                    "you have paid",
+                    "已付费",
+                    "amount != 0",
+                    "checkout amount",
+                    "chatgpt_payment_already_paid",
+                    "chatgpt_nonzero_checkout_amount_failure",
+                )
+                early_failure_markers = (
+                    "访问首页失败",
+                    "获取 csrf token 失败",
+                    "提交邮箱失败",
+                    "authorize 失败",
+                    "preauth",
+                    "预授权",
+                    "homepage",
+                    "csrf",
+                )
+                if any(marker.lower() in lowered for marker in keep_alias_failure_markers):
+                    outcome = "keep"
+                elif lease_id not in self._helper_wait_started_leases and any(
+                    marker.lower() in lowered for marker in early_failure_markers
+                ):
+                    outcome = "early_failure"
+                else:
+                    outcome = "late_failure"
+            self._helper_client.finalize(
+                lease_id,
+                outcome=outcome,
+                reason=error_text or outcome,
+                task_id=resolved_task_id,
+            )
+            self._helper_wait_started_leases.discard(lease_id)
+            self._log(f"[iCloudHME] Helper 已处理失败 outcome={outcome}: {getattr(account, 'email', '')}")
+            return
 
         anonymous_id = str(getattr(account, "account_id", "") or "").strip()
         if not anonymous_id:
@@ -1554,6 +2232,14 @@ class IcloudHmeMailbox(BaseMailbox):
         resolved_task_id = str(task_id or getattr(self, "_task_attempt_token", "") or "").strip()
         error_text = str(error_message or "").strip()
         lowered = error_text.lower()
+        if is_account_deactivated_message("", error_text):
+            update_icloud_hme_alias_on_account_deactivated(
+                anonymous_id,
+                error_message=error_text,
+                task_id=resolved_task_id,
+            )
+            self._log(f"[iCloudHME] 账号已删除/停用，别名标记为账号已禁用: {getattr(account, 'email', '')}")
+            return
         early_failure_markers = (
             "访问首页失败",
             "获取 csrf token 失败",
@@ -2189,6 +2875,7 @@ class TempMailLocalMailbox(BaseMailbox):
         api_key: str = "",
         api_key_header: str = "Authorization",
         primary_domain: str = "",
+        primary_domains: Any = None,
         mode: str = "fixed_domain",
         wait_timeout_seconds: int = 180,
         ttl_minutes: int = 30,
@@ -2201,6 +2888,7 @@ class TempMailLocalMailbox(BaseMailbox):
         self.api_key = str(api_key or "").strip()
         self.api_key_header = str(api_key_header or "Authorization").strip() or "Authorization"
         self.primary_domain = str(primary_domain or "").strip().lstrip("@.")
+        self.primary_domains = self._parse_domain_candidates(primary_domains, fallback=self.primary_domain)
         self.mode = str(mode or "fixed_domain").strip().lower() or "fixed_domain"
         self._bypass_proxy = self._should_bypass_proxy(self.api)
         self.proxy = None if self._bypass_proxy else build_requests_proxy_config(proxy)
@@ -2209,6 +2897,44 @@ class TempMailLocalMailbox(BaseMailbox):
         self._ttl_minutes = self._to_int(ttl_minutes, 30)
         self._reuse_window_minutes = self._to_int(reuse_window_minutes, 20)
         self._permanent = self._to_bool(permanent)
+
+    @staticmethod
+    def _parse_domain_candidates(value: Any, fallback: str = "") -> list[str]:
+        raw_items: list[Any]
+        if isinstance(value, str):
+            text = value.strip()
+            if text.startswith("["):
+                try:
+                    parsed = json.loads(text)
+                    raw_items = parsed if isinstance(parsed, list) else [text]
+                except Exception:
+                    raw_items = re.split(r"[\n,;]+", text)
+            else:
+                raw_items = re.split(r"[\n,;]+", text)
+        elif isinstance(value, (list, tuple, set)):
+            raw_items = list(value)
+        else:
+            raw_items = []
+        if fallback:
+            raw_items.append(fallback)
+
+        domains: list[str] = []
+        seen: set[str] = set()
+        for item in raw_items:
+            domain = str(item or "").strip().lower().lstrip("@.")
+            if not domain or domain in seen:
+                continue
+            seen.add(domain)
+            domains.append(domain)
+        return domains
+
+    def _choose_fixed_domain(self) -> str:
+        domains = self.primary_domains or self._parse_domain_candidates(None, fallback=self.primary_domain)
+        if not domains:
+            return ""
+        if len(domains) == 1:
+            return domains[0]
+        return random.choice(domains)
 
     @staticmethod
     def _to_int(value: Any, default: int) -> int:
@@ -2274,6 +3000,36 @@ class TempMailLocalMailbox(BaseMailbox):
             headers[self.api_key_header] = self.api_key
         return headers
 
+    @staticmethod
+    def _is_auth_error_response(status_code: int, body: str = "") -> bool:
+        text = f"{status_code} {body or ''}".lower()
+        return (
+            int(status_code or 0) == 401
+            or "invalid api_key" in text
+            or "missing api_key" in text
+        )
+
+    @staticmethod
+    def _is_auth_exception(exc: Exception) -> bool:
+        text = str(exc or "").lower()
+        return (
+            "tempmail ready api" in text
+            and (
+                "401" in text
+                or "invalid api_key" in text
+                or "missing api_key" in text
+            )
+        )
+
+    def _raise_api_error(self, action: str, response, *, limit: int = 200) -> None:
+        body = str(getattr(response, "text", "") or "")[:limit]
+        message = f"TempMail Ready API {action}: {response.status_code} {body}"
+        if self._is_auth_error_response(response.status_code, body):
+            raise TempMailReadyAuthError(
+                f"{message}（请检查 tempmail_api_key / tempmail_api_key_header）"
+            )
+        raise RuntimeError(message)
+
     def _request(self, method: str, path: str, *, timeout: int, **kwargs):
         import requests
 
@@ -2336,7 +3092,7 @@ class TempMailLocalMailbox(BaseMailbox):
             timeout=15,
         )
         if r.status_code != 200:
-            raise RuntimeError(f"TempMail Ready API 列邮件失败: {r.status_code} {r.text[:200]}")
+            self._raise_api_error("列邮件失败", r)
         data = r.json()
         items = data.get("data") if isinstance(data, dict) else []
         return items if isinstance(items, list) else []
@@ -2349,7 +3105,7 @@ class TempMailLocalMailbox(BaseMailbox):
             timeout=15,
         )
         if r.status_code != 200:
-            raise RuntimeError(f"TempMail Ready API 邮件详情失败: {r.status_code} {r.text[:200]}")
+            self._raise_api_error("邮件详情失败", r)
         data = r.json()
         detail = data.get("email") if isinstance(data, dict) else {}
         detail = detail if isinstance(detail, dict) else {}
@@ -2459,7 +3215,7 @@ class TempMailLocalMailbox(BaseMailbox):
                 timeout=15,
             )
             if r.status_code != 200:
-                raise RuntimeError(f"TempMail Ready API 查询邮箱失败: {r.status_code} {r.text[:200]}")
+                self._raise_api_error("查询邮箱失败", r)
             payload = r.json()
             if isinstance(payload, list):
                 items = payload
@@ -2523,6 +3279,8 @@ class TempMailLocalMailbox(BaseMailbox):
                 if rebound is not None and getattr(rebound, "account_id", ""):
                     self._log(f"[TempMailLocal] 建箱冲突后已重新绑定远端邮箱: {target_email}")
                     return rebound
+            if self._is_auth_error_response(r.status_code, r.text[:300]):
+                self._raise_api_error("精确建箱失败", r, limit=300)
             raise RuntimeError(f"TempMail 精确建箱失败: {r.status_code} {r.text[:300]}")
 
         data = r.json()
@@ -2559,7 +3317,7 @@ class TempMailLocalMailbox(BaseMailbox):
                 timeout=max(30, self._wait_timeout_seconds + 20),
             )
             if r.status_code not in (200, 201):
-                raise RuntimeError(f"TempMail Ready API 建箱失败: {r.status_code} {r.text[:300]}")
+                self._raise_api_error("建箱失败", r, limit=300)
             data = r.json()
             mailbox = data.get("mailbox") if isinstance(data, dict) else {}
             lease = data.get("lease") if isinstance(data, dict) else {}
@@ -2583,8 +3341,11 @@ class TempMailLocalMailbox(BaseMailbox):
             "ttl_minutes": self._ttl_minutes,
             "permanent": self._permanent,
         }
-        if self.primary_domain:
-            payload["domain"] = self.primary_domain
+        selected_domain = self._choose_fixed_domain()
+        if selected_domain:
+            payload["domain"] = selected_domain
+        else:
+            raise RuntimeError("TempMail 固定域名模式未选择可用域名")
         r = self._request(
             "POST",
             "/api/mailboxes",
@@ -2593,6 +3354,8 @@ class TempMailLocalMailbox(BaseMailbox):
             timeout=20,
         )
         if r.status_code not in (200, 201):
+            if self._is_auth_error_response(r.status_code, r.text[:300]):
+                self._raise_api_error("固定域名建箱失败", r, limit=300)
             raise RuntimeError(f"TempMail 固定域名建箱失败: {r.status_code} {r.text[:300]}")
         data = r.json()
         mailbox = self._extract_mailbox_payload(data)
@@ -2600,7 +3363,7 @@ class TempMailLocalMailbox(BaseMailbox):
         mailbox_id = str((mailbox or {}).get("id") or "").strip()
         if not email or not mailbox_id:
             raise RuntimeError(f"TempMail 固定域名返回异常: {data}")
-        self._log(f"[TempMailLocal] 生成固定域名邮箱: {email}")
+        self._log(f"[TempMailLocal] 生成固定域名邮箱: {email} ({selected_domain})")
         return MailboxAccount(
             email=email,
             account_id=mailbox_id,
@@ -2695,6 +3458,8 @@ class TempMailLocalMailbox(BaseMailbox):
                         self._log(f"[TempMailLocal] 命中验证码: {code}")
                         return code
             except Exception as exc:
+                if self._is_auth_exception(exc):
+                    raise
                 if (
                     not mailbox_rebound
                     and self._is_mailbox_not_found_error(exc)

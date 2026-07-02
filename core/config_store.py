@@ -1,6 +1,7 @@
 """全局配置持久化 - 存储在 SQLite，并在缺省时回退到环境变量/.env。"""
 import os
 import re
+import time
 from pathlib import Path
 from typing import Optional
 from sqlalchemy.exc import OperationalError
@@ -123,18 +124,48 @@ class ConfigItem(SQLModel, table=True):
 class ConfigStore:
     """简单 key-value 配置存储"""
 
-    def get(self, key: str, default: str = "") -> str:
-        env_values = _runtime_env_values()
+    def __init__(self) -> None:
+        self._cache: dict[str, str] = {}
+        self._warm_cache()
+
+    def _warm_cache(self) -> None:
         try:
             with Session(engine) as s:
-                item = s.get(ConfigItem, key)
-                value = str(item.value if item else "" or "").strip()
-                if value:
-                    return value
+                items = s.exec(select(ConfigItem)).all()
+                for item in items:
+                    text = str(item.value or "").strip()
+                    if text:
+                        self._cache[item.key] = text
         except OperationalError:
             pass
+
+    def get(self, key: str, default: str = "") -> str:
+        env_values = _runtime_env_values()
+        last_error: OperationalError | None = None
+        for attempt in range(3):
+            try:
+                with Session(engine) as s:
+                    item = s.get(ConfigItem, key)
+                    value = str(item.value if item else "" or "").strip()
+                    if value:
+                        self._cache[key] = value
+                        return value
+                    break
+            except OperationalError as exc:
+                last_error = exc
+                if "database is locked" not in str(exc).lower() or attempt >= 2:
+                    break
+                time.sleep(0.05 * (attempt + 1))
+
+        if last_error is not None:
+            cached = str(self._cache.get(key, "") or "").strip()
+            if cached:
+                return cached
         fallback = _get_env_fallback_value(key, env_values=env_values)
-        return fallback or default
+        value = fallback or default
+        if value:
+            self._cache[key] = value
+        return value
 
     def set(self, key: str, value: str) -> None:
         with Session(engine) as s:
@@ -145,15 +176,25 @@ class ConfigStore:
                 item = ConfigItem(key=key, value=value)
             s.add(item)
             s.commit()
+        text = str(value or "").strip()
+        if text:
+            self._cache[key] = text
+        else:
+            self._cache.pop(key, None)
 
     def get_all(self) -> dict:
+        env_values = _runtime_env_values()
         try:
             with Session(engine) as s:
                 items = s.exec(select(ConfigItem)).all()
                 values = {i.key: i.value for i in items}
+                for key, value in values.items():
+                    text = str(value or "").strip()
+                    if text:
+                        self._cache[key] = text
         except OperationalError:
-            values = {}
-        return _merge_env_fallback(values)
+            values = dict(self._cache)
+        return _merge_env_fallback(values, env_values=env_values)
 
     def set_many(self, data: dict) -> None:
         with Session(engine) as s:
@@ -165,6 +206,12 @@ class ConfigStore:
                     item = ConfigItem(key=key, value=value)
                 s.add(item)
             s.commit()
+        for key, value in data.items():
+            text = str(value or "").strip()
+            if text:
+                self._cache[key] = text
+            else:
+                self._cache.pop(key, None)
 
 
 config_store = ConfigStore()

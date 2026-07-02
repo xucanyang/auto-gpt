@@ -36,6 +36,11 @@ const { Text } = Typography
 const GOPAY_ACTIVE_PHASES = new Set(['created', 'starting', 'waiting_otp', 'waiting_link_pin', 'waiting_payment_pin', 'verifying'])
 const DEFAULT_CHECKOUT_COUNTRY = 'ID'
 const DEFAULT_CHECKOUT_CURRENCY = 'IDR'
+const DEFAULT_PAYMENT_LINK_FORMAT = 'long_hosted'
+const PAYMENT_LINK_FORMAT_OPTIONS = [
+  { label: '长支付链接', value: 'long_hosted' },
+  { label: '短连接路径', value: 'short_chatgpt' },
+]
 const DEFAULT_GOPAY_OTP_AUTO_RESEND_DELAY_SECONDS = 120
 const PAYMENT_LINK_REFRESH_DELAY_MS = 20_000
 const CHECKOUT_COUNTRY_LABEL_OVERRIDES: Record<string, string> = {
@@ -51,6 +56,7 @@ type GopayPhoneCandidate = {
   phone_number: string
   enabled?: boolean
   last_used_at?: string
+  api_expired_date?: string
 }
 
 type AccountActionSurfaceProps = {
@@ -98,6 +104,18 @@ function normalizeCheckoutCurrency(value: unknown) {
   return String(value || DEFAULT_CHECKOUT_CURRENCY).trim().toUpperCase() || DEFAULT_CHECKOUT_CURRENCY
 }
 
+function normalizePaymentLinkFormat(value: unknown) {
+  const normalized = String(value || '').trim().toLowerCase().replace(/-/g, '_')
+  return normalized === 'short' || normalized === 'short_chatgpt' || normalized === 'chatgpt' || normalized === 'custom'
+    ? 'short_chatgpt'
+    : DEFAULT_PAYMENT_LINK_FORMAT
+}
+
+function paymentLinkFormatLabel(value: unknown) {
+  const normalized = normalizePaymentLinkFormat(value)
+  return normalized === 'short_chatgpt' ? '短连接路径' : '长支付链接'
+}
+
 function normalizeGopayOtpAutoResendDelay(value: unknown) {
   const parsed = Number(value)
   if (!Number.isFinite(parsed)) return DEFAULT_GOPAY_OTP_AUTO_RESEND_DELAY_SECONDS
@@ -140,6 +158,10 @@ function formatGopayPhoneLabel(phone: Partial<GopayPhoneCandidate>) {
   return label ? `${label} · ${value}` : value
 }
 
+function formatGopayPhoneExpiryLabel(phone: Partial<GopayPhoneCandidate>) {
+  return String((phone as any).api_expired_date || (phone as any).apiExpiredDate || '').trim()
+}
+
 function normalizeGopayPhoneCandidate(value: any, index = 0): GopayPhoneCandidate | null {
   const phone_country_code = normalizeGopayPhonePart(value?.phone_country_code || value?.country_code || value?.code || DEFAULT_GOPAY_PHONE_COUNTRY_CODE)
   const phone_number = normalizeGopayPhonePart(value?.phone_number || value?.number || value?.phone || '')
@@ -152,6 +174,7 @@ function normalizeGopayPhoneCandidate(value: any, index = 0): GopayPhoneCandidat
     phone_number,
     enabled: value?.enabled !== false,
     last_used_at: String(value?.last_used_at || '').trim(),
+    api_expired_date: String(value?.api_expired_date || value?.apiExpiredDate || '').trim(),
   }
 }
 
@@ -281,8 +304,9 @@ function formatCachedPaymentLinkSummary(link: any) {
   const plan = String(link.plan || '').trim().toUpperCase() || 'PLUS'
   const country = String(link.country || '').trim().toUpperCase() || '-'
   const currency = String(link.currency || '').trim().toUpperCase() || '-'
+  const linkFormat = paymentLinkFormatLabel(link.payment_link_format)
   const source = String(link.source || '').trim() || 'unknown'
-  return `${plan} · ${country} / ${currency} · ${source}`
+  return `${plan} · ${country} / ${currency} · ${linkFormat} · ${source}`
 }
 
 export function AccountActionSurface({
@@ -754,6 +778,7 @@ export function AccountActionSurface({
       country: initialCountry,
       currency: initialCurrency,
       proxy: String(defaults.proxy || '').trim(),
+      payment_link_format: normalizePaymentLinkFormat(defaults.payment_link_format),
       promo_code: String(defaults.promo_code || 'STRIPEATLASGPT4BIZ050126').trim(),
       workspace_name: String(defaults.workspace_name || 'MyTeam').trim() || 'MyTeam',
       seat_quantity: Number.isFinite(seatQuantity) ? Math.max(2, Math.trunc(seatQuantity)) : 5,
@@ -824,6 +849,7 @@ export function AccountActionSurface({
       country: normalizeCheckoutCountry(values.country),
       currency: normalizeCheckoutCurrency(values.currency),
       proxy: String(values.proxy || '').trim(),
+      payment_link_format: normalizePaymentLinkFormat(values.payment_link_format),
       promo_code: String(values.promo_code || '').trim(),
       workspace_name: String(values.workspace_name || 'MyTeam').trim() || 'MyTeam',
       seat_quantity: Math.max(2, Math.trunc(Number(values.seat_quantity || 5) || 5)),
@@ -860,6 +886,7 @@ export function AccountActionSurface({
       && normalizeCheckoutCountry(cachedLink.country || DEFAULT_CHECKOUT_COUNTRY) === normalizeCheckoutCountry(values.country)
       && normalizeCheckoutCurrency(cachedLink.currency || DEFAULT_CHECKOUT_CURRENCY) === normalizeCheckoutCurrency(values.currency)
       && String(cachedLink.proxy || '').trim() === String(values.proxy || '').trim()
+      && normalizePaymentLinkFormat(cachedLink.payment_link_format) === normalizePaymentLinkFormat(values.payment_link_format)
     )
   }
 
@@ -1293,6 +1320,7 @@ export function AccountActionSurface({
       params.country = normalizeCheckoutCountry(params.country)
       params.currency = normalizeCheckoutCurrency(params.currency)
       params.proxy = String(params.proxy || '').trim()
+      params.payment_link_format = normalizePaymentLinkFormat(params.payment_link_format)
       params.promo_code = String(params.promo_code || '').trim()
       params.reuse_cached_link = params.reuse_cached_link !== false
       params.save_defaults = params.save_defaults !== false
@@ -1313,6 +1341,7 @@ export function AccountActionSurface({
       country: normalizeCheckoutCountry(values.country),
       currency: normalizeCheckoutCurrency(values.currency),
       proxy: String(values.proxy || '').trim(),
+      payment_link_format: normalizePaymentLinkFormat(values.payment_link_format),
       promo_code: String(values.promo_code || '').trim(),
       reuse_cached_link: options.forceRegenerate ? false : canReusePaymentLinkCache(values),
       save_defaults: false,
@@ -1374,6 +1403,7 @@ export function AccountActionSurface({
       const selectedCurrency = normalizeCheckoutCurrency(actionForm.getFieldValue('currency'))
       const selectedProxy = String(actionForm.getFieldValue('proxy') || '').trim()
       const selectedPlan = String(actionForm.getFieldValue('plan') || 'plus').trim().toLowerCase()
+      const selectedPaymentLinkFormat = normalizePaymentLinkFormat(actionForm.getFieldValue('payment_link_format'))
       const cachedLink = acc.chatgptLastPaymentLink && typeof acc.chatgptLastPaymentLink === 'object'
         ? acc.chatgptLastPaymentLink
         : {}
@@ -1382,12 +1412,14 @@ export function AccountActionSurface({
       const cachedCountry = normalizeCheckoutCountry(cachedLink.country || DEFAULT_CHECKOUT_COUNTRY)
       const cachedCurrency = normalizeCheckoutCurrency(cachedLink.currency || DEFAULT_CHECKOUT_CURRENCY)
       const cachedProxy = String(cachedLink.proxy || '').trim()
+      const cachedPaymentLinkFormat = normalizePaymentLinkFormat(cachedLink.payment_link_format)
       const cacheMatchesCurrentSelection = Boolean(
         cachedUrl
         && cachedPlan === selectedPlan
         && cachedCountry === selectedCountry
         && cachedCurrency === selectedCurrency
         && cachedProxy === selectedProxy
+        && cachedPaymentLinkFormat === selectedPaymentLinkFormat
       )
       const countryOptions = (checkoutCountries.length ? checkoutCountries : [DEFAULT_CHECKOUT_COUNTRY]).map((code) => {
         const currency = checkoutCurrencyByCountry[code]
@@ -1402,6 +1434,9 @@ export function AccountActionSurface({
                 { label: 'Team', value: 'team' },
               ]}
             />
+          </Form.Item>
+          <Form.Item name="payment_link_format" label="生成路径" initialValue={DEFAULT_PAYMENT_LINK_FORMAT} rules={[{ required: true }]}>
+            <Select options={PAYMENT_LINK_FORMAT_OPTIONS} />
           </Form.Item>
           <Form.Item label="国家" required>
             <Space.Compact style={{ width: '100%' }}>
@@ -1430,7 +1465,7 @@ export function AccountActionSurface({
             showIcon
             style={{ marginBottom: 12 }}
             message={`当前选择：${checkoutCountryLabel(selectedCountry, selectedCurrency)}`}
-            description={`国家列表和货币只在打开选择器、刷新或切换国家时更新；生成链接时只使用这里显示的国家和货币。当前代理：${selectedProxy || '直连（不使用代理）'}`}
+            description={`生成路径：${paymentLinkFormatLabel(selectedPaymentLinkFormat)}。国家列表和货币只在打开选择器、刷新或切换国家时更新；生成链接时只使用这里显示的国家和货币。当前代理：${selectedProxy || '直连（不使用代理）'}`}
           />
           {cachedUrl ? (
             <Alert
@@ -1779,6 +1814,7 @@ export function AccountActionSurface({
                             <Space wrap>
                               <Tag>{index + 1}</Tag>
                               <Text>{formatGopayPhoneLabel(phone)}</Text>
+                              {formatGopayPhoneExpiryLabel(phone) ? <Tag color="processing">有效期 {formatGopayPhoneExpiryLabel(phone)}</Tag> : <Tag>有效期 -</Tag>}
                             </Space>
                             <Space size={4} wrap>
                               <Button size="small" disabled={index === 0} onClick={() => moveCurrentGopayPhone(phone.id, 'up')}>上移</Button>

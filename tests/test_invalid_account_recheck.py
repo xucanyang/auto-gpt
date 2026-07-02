@@ -51,8 +51,9 @@ class InvalidAccountRecheckTests(unittest.TestCase):
             session.refresh(row)
             return int(row.id or 0)
 
-    def _patch_recheck_runtime(self, *, tokens=None, error=""):
+    def _patch_recheck_runtime(self, *, oauth_tokens=None, session_ok=True, session_tokens=None, error=""):
         login_calls: list[dict] = []
+        reuse_calls: list[dict] = []
 
         class _FakeEmailService:
             service_type = type("ST", (), {"value": "dummy"})()
@@ -72,13 +73,30 @@ class InvalidAccountRecheckTests(unittest.TestCase):
             sec_ch_ua = "sec"
             impersonate = "chrome"
             fingerprint = None
+            last_registration_state = None
+
+            def reuse_session_and_get_tokens(self, workspace_id: str = "", workspace_reason: str = "setCurrentAccount"):
+                reuse_calls.append(
+                    {
+                        "workspace_id": workspace_id,
+                        "workspace_reason": workspace_reason,
+                    }
+                )
+                if not session_ok:
+                    return False, "session fetch failed"
+                return True, session_tokens or {
+                    "access_token": "at-new",
+                    "session_token": "session-new",
+                    "account_id": "acct-new",
+                    "workspace_id": "ws-new",
+                }
 
         class _FakeOAuthClient:
             last_error = error
 
             def login_and_get_tokens(self, *_args, **kwargs):
                 login_calls.append(kwargs)
-                return tokens
+                return oauth_tokens
 
             def _get_cookie_value(self, *_args, **_kwargs):
                 return "session-new"
@@ -97,19 +115,47 @@ class InvalidAccountRecheckTests(unittest.TestCase):
             def _extract_account_info(self, tokens):
                 return {"account_id": tokens.get("account_id", "")}
 
+            def _reuse_register_browser_context(self, register_client, oauth_client):
+                return None
+
         return (
             login_calls,
+            reuse_calls,
             mock.patch.object(invalid_account_recheck, "RestoredEmailService", _FakeEmailService),
             mock.patch.object(invalid_account_recheck, "RefreshTokenRegistrationEngine", _FakeEngine),
             mock.patch.object(invalid_account_recheck.config_store, "get_all", return_value={}),
         )
 
-    def test_recheck_success_saves_access_token_and_recovers_status(self):
+    def test_recheck_stage1_success_keeps_account_revived_when_followup_auth_fails(self):
         account_id = self._add_account()
-        tokens = {"access_token": "at-new", "refresh_token": "rt-ignored", "account_id": "acct-new"}
-        login_calls, email_patch, engine_patch, config_patch = self._patch_recheck_runtime(tokens=tokens)
+        login_calls, reuse_calls, email_patch, engine_patch, config_patch = self._patch_recheck_runtime(
+            oauth_tokens=None,
+            session_ok=True,
+            session_tokens={"access_token": "at-new", "account_id": "acct-new", "workspace_id": "ws-new", "session_token": "session-new"},
+            error="登录链路已完成，按要求停止",
+        )
 
-        with email_patch, engine_patch, config_patch:
+        with (
+            email_patch,
+            engine_patch,
+            config_patch,
+            mock.patch(
+                "services.chatgpt_core.custom_email_recheck.recheck_custom_chatgpt_email",
+                return_value={
+                    "ok": False,
+                    "error": "workspace/select failed",
+                    "data": {
+                        "message": "workspace/select failed",
+                        "custom_email_recheck": {
+                            "status": "login_blocked",
+                            "message": "workspace/select failed",
+                            "has_access_token": False,
+                            "has_refresh_token": False,
+                        },
+                    },
+                },
+            ),
+        ):
             result = invalid_account_recheck.recheck_invalid_chatgpt_account(
                 account_id,
                 retry_delays_seconds=[],
@@ -118,8 +164,14 @@ class InvalidAccountRecheckTests(unittest.TestCase):
 
         self.assertTrue(result["ok"])
         self.assertEqual(len(login_calls), 1)
+        self.assertEqual(len(reuse_calls), 1)
         self.assertFalse(login_calls[0]["allow_phone_verification"])
+        self.assertFalse(login_calls[0]["allow_add_phone_verification"])
+        self.assertFalse(login_calls[0]["allow_existing_phone_verification"])
+        self.assertTrue(login_calls[0]["stop_after_login"])
         self.assertFalse(login_calls[0]["allow_add_phone_session_recovery"])
+        joined_logs = "\n".join(result["data"]["logs"])
+        self.assertIn("[失效测活] 手机验证策略：", joined_logs)
         with Session(self.engine) as session:
             account = session.get(AccountModel, account_id)
             extra = account.get_extra()
@@ -129,12 +181,16 @@ class InvalidAccountRecheckTests(unittest.TestCase):
         self.assertNotIn("refresh_token", extra)
         self.assertNotIn("chatgpt_local", extra)
         self.assertEqual(extra["chatgpt_invalid_recheck"]["status"], "recovered_access_token")
+        self.assertFalse(extra["chatgpt_invalid_recheck"]["followup_auth_ok"])
+        self.assertEqual(extra["chatgpt_invalid_recheck"]["final_auth_level"], "access_token_only")
+        self.assertIn("chatgpt_last_revival", extra)
         self.assertEqual(extra["chatgpt_capabilities"]["auth_level"], "access_token_only")
 
     def test_deactivated_result_stays_invalid_and_records_reason(self):
         account_id = self._add_account()
-        login_calls, email_patch, engine_patch, config_patch = self._patch_recheck_runtime(
-            tokens=None,
+        login_calls, reuse_calls, email_patch, engine_patch, config_patch = self._patch_recheck_runtime(
+            oauth_tokens=None,
+            session_ok=False,
             error="account_deactivated: You do not have an account because it has been deleted or deactivated.",
         )
 
@@ -147,6 +203,7 @@ class InvalidAccountRecheckTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(result["data"]["error_code"], "account_deactivated")
         self.assertEqual(len(login_calls), 1)
+        self.assertEqual(len(reuse_calls), 0)
         with Session(self.engine) as session:
             account = session.get(AccountModel, account_id)
             extra = account.get_extra()

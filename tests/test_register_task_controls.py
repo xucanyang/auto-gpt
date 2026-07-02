@@ -144,6 +144,23 @@ class _FakeChatGPTAlreadyPaidPlatform(BasePlatform):
         return True
 
 
+class _FakeChatGPTAlwaysFailPlatform(BasePlatform):
+    name = "chatgpt"
+    display_name = "ChatGPT"
+    calls = 0
+
+    def __init__(self, config=None, mailbox=None):
+        super().__init__(config)
+        self.mailbox = mailbox
+
+    def register(self, email: str, password: str = None) -> Account:
+        type(self).calls += 1
+        raise RuntimeError("fake phone signup failure")
+
+    def check_valid(self, account: Account) -> bool:
+        return True
+
+
 class RegisterTaskControlFlowTests(unittest.TestCase):
     def _build_request(self):
         return RegisterTaskRequest(
@@ -218,6 +235,62 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
         self.assertTrue(any("amount!=0: 1" in line for line in snapshot["logs"]))
         self.assertTrue(any("注册未计成功且不保存账号" in line for line in snapshot["logs"]))
         self.assertTrue(any("failed_skip_save" in str(call) for call in save_log.call_args_list))
+
+    def test_register_max_attempts_caps_failure_retry_loop(self):
+        task_id = "task-chatgpt-skip-save-capped"
+        req = RegisterTaskRequest(
+            platform="chatgpt",
+            count=1,
+            concurrency=1,
+            proxy="http://proxy.local:8080",
+            extra={"mail_provider": "fake", "register_max_attempts": 1},
+        )
+        _create_task_record(task_id, req, "manual", None)
+        _FakeChatGPTSkipSavePlatform.calls = 0
+
+        with (
+            patch("services.chatgpt_core.ChatGPTPlatform", _FakeChatGPTSkipSavePlatform),
+            patch("core.base_mailbox.create_mailbox", return_value=_FakeMailbox()),
+            patch("core.db.save_account") as save_account,
+            patch("api.tasks._save_task_log"),
+        ):
+            _run_register(task_id, req)
+
+        snapshot = _task_store.snapshot(task_id)
+        self.assertEqual(snapshot["status"], "failed")
+        self.assertEqual(snapshot["success"], 0)
+        self.assertEqual(_FakeChatGPTSkipSavePlatform.calls, 1)
+        self.assertEqual(save_account.call_count, 0)
+        self.assertTrue(any("已达到注册最大尝试次数 1" in error for error in snapshot["errors"]))
+
+    def test_phone_signup_manual_lines_cap_failure_retry_loop(self):
+        task_id = "task-phone-signup-lines-capped"
+        req = RegisterTaskRequest(
+            platform="chatgpt",
+            count=1,
+            concurrency=1,
+            proxy="http://proxy.local:8080",
+            extra={
+                "chatgpt_registration_entry": "phone_signup",
+                "chatgpt_phone_signup_phone_lines": "+573234567890----https://sms.example/1",
+            },
+        )
+        _create_task_record(task_id, req, "manual", None)
+        _FakeChatGPTAlwaysFailPlatform.calls = 0
+
+        with (
+            patch("services.chatgpt_core.ChatGPTPlatform", _FakeChatGPTAlwaysFailPlatform),
+            patch("core.db.save_account") as save_account,
+            patch("api.tasks._save_task_log"),
+        ):
+            _run_register(task_id, req)
+
+        snapshot = _task_store.snapshot(task_id)
+        self.assertEqual(snapshot["status"], "failed")
+        self.assertEqual(snapshot["success"], 0)
+        self.assertEqual(_FakeChatGPTAlwaysFailPlatform.calls, 1)
+        self.assertEqual(save_account.call_count, 0)
+        self.assertTrue(any("已达到注册最大尝试次数 1" in error for error in snapshot["errors"]))
 
     def test_chatgpt_already_paid_skip_save_counts_as_failure_without_saving_and_continues(self):
         task_id = "task-chatgpt-already-paid-skip-save"
@@ -342,6 +415,53 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
         self.assertEqual(snapshot["success"], 1)
         self.assertTrue(any("fake runtime log" in line for line in snapshot["logs"]))
         self.assertTrue(any(call.kwargs.get("status") == "success" or (len(call.args) >= 3 and call.args[2] == "success") for call in save_log.call_args_list))
+
+    def test_resume_auth_task_stops_inside_current_account(self):
+        task_id = "task-resume-auth-stop-current"
+        req = RegisterTaskRequest(platform="chatgpt", count=1, concurrency=1)
+        _create_task_record(task_id, req, "resume_subscription_auth", {"account_id": 123})
+
+        class _FakeSession:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def get(self, _model, _account_id):
+                return type(
+                    "AccountModel",
+                    (),
+                    {"platform": "chatgpt", "email": "resume@example.com"},
+                )()
+
+            def refresh(self, _account):
+                return None
+
+        def _fake_execute(_account, allow_phone_verification=False, log_fn=None, shared_phone_service=None, stop_checker=None):
+            self.assertTrue(callable(stop_checker))
+            if callable(log_fn):
+                log_fn("[补抓] fake runtime log before stop")
+            _task_store.request_stop(task_id)
+            stop_checker()
+            return {"ok": True, "data": {"message": "should not reach"}}
+
+        with (
+            patch("api.tasks.Session", return_value=_FakeSession()),
+            patch.object(api_actions, "_execute_chatgpt_resume_subscription_auth", side_effect=_fake_execute),
+            patch.object(api_actions, "_apply_chatgpt_resume_auth_result"),
+            patch("api.tasks._save_task_log") as save_log,
+        ):
+            _run_resume_subscription_auth(task_id, 123)
+
+        snapshot = _task_store.snapshot(task_id)
+        self.assertEqual(snapshot["status"], "stopped")
+        self.assertEqual(snapshot["success"], 0)
+        self.assertTrue(any("[STOP]" in line for line in snapshot["logs"]))
+        self.assertTrue(any(
+            call.kwargs.get("status") == "stopped" or (len(call.args) >= 3 and call.args[2] == "stopped")
+            for call in save_log.call_args_list
+        ))
 
     def test_batch_resume_auth_task_persists_logs_and_aggregates_results(self):
         task_id = "task-batch-resume-auth-success"
@@ -654,25 +774,24 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
             )
 
         snapshot = _task_store.snapshot(task_id)
-        self.assertEqual(attempts, [(123, "+11111111111"), (456, "+12222222222")])
+        self.assertEqual(attempts, [(123, "+11111111111"), (456, "+11111111111")])
         self.assertEqual(snapshot["status"], "done")
         self.assertEqual(snapshot["success"], 1)
         self.assertEqual(snapshot["skipped"], 1)
         runtime_results = snapshot["meta"]["runtime_results"]
-        self.assertEqual([item["phone"] for item in runtime_results], ["+11111111111", "+12222222222"])
+        self.assertEqual([item["phone"] for item in runtime_results], ["+11111111111", "+11111111111"])
         self.assertEqual(runtime_results[0]["status"], "account_phone_bound")
         self.assertEqual(runtime_results[1]["status"], "bound")
         self.assertEqual(runtime_results[1]["api_expired_date"], "2026-07-06 00:00:00")
         self.assertEqual(runtime_results[1]["code_time"], "2026-06-02 20:48:02")
         self.assertTrue(runtime_results[1]["code_extracted"])
         saved_binding = accounts_by_id[456].extra["chatgpt_phone_binding"]
-        self.assertEqual(saved_binding["phone"], "+12222222222")
-        self.assertEqual(saved_binding["api_url"], "https://example.com/api/two")
-        self.assertEqual(saved_binding["raw_line"], "+12222222222----https://example.com/api/two")
+        self.assertEqual(saved_binding["phone"], "+11111111111")
+        self.assertEqual(saved_binding["api_url"], "https://example.com/api/one")
+        self.assertEqual(saved_binding["raw_line"], "+11111111111----https://example.com/api/one")
         self.assertEqual(accounts_by_id[456].extra["chatgpt_phone_binding_history"][-1]["task_id"], task_id)
-        self.assertTrue(any("===== 手机号 1/2 | +11111111111 =====" in line for line in snapshot["logs"]))
-        self.assertTrue(any("===== 成功手机号 1/1 | +12222222222 =====" in line for line in snapshot["logs"]))
-        self.assertTrue(any("接口有效期: 2026-07-06 00:00:00" in line for line in snapshot["logs"]))
+        self.assertTrue(any("结果表已生成" in line for line in snapshot["logs"]))
+        self.assertFalse(any("===== 手机号" in line for line in snapshot["logs"]))
 
     def test_phone_binding_test_reuses_phone_until_terminal_failure(self):
         task_id = "task-phone-binding-reuse"
@@ -780,12 +899,13 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
         runtime_results = snapshot["meta"]["runtime_results"]
         self.assertEqual([item["status"] for item in runtime_results], ["bound", "bound", "openai_phone_limit"])
         self.assertEqual(snapshot["meta"]["bound_phone_lines"], [
-            "+15555550123----https://example.com/api/reuse",
-            "+15555550123----https://example.com/api/reuse",
+            "+1555***0123----https://example.com/api/reuse",
+            "+1555***0123----https://example.com/api/reuse",
         ])
         self.assertTrue(any("同号连续绑定已开启" in line for line in snapshot["logs"]))
         self.assertTrue(any("同号连续绑定继续" in line for line in snapshot["logs"]))
-        self.assertTrue(any("===== 成功手机号 2/2 | +15555550123 =====" in line for line in snapshot["logs"]))
+        self.assertFalse(any("===== 成功手机号" in line for line in snapshot["logs"]))
+        self.assertNotIn("+15555550123", "\n".join(snapshot["logs"]))
 
     def test_phone_binding_test_does_not_consume_phone_on_account_preflight_failure(self):
         task_id = "task-phone-binding-preflight-failure"
@@ -887,8 +1007,9 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
         self.assertEqual(runtime_results[0]["phone"], "+13333333333")
         self.assertEqual(snapshot["success"], 1)
         self.assertEqual(snapshot["skipped"], 0)
-        self.assertTrue(any("账号前置失败，手机号未测试" in line for line in snapshot["logs"]))
-        self.assertTrue(any("===== 手机号 1/1 | +13333333333 =====" in line for line in snapshot["logs"]))
+        self.assertTrue(any("账号前置失败" in line and "手机号未被触碰" in line for line in snapshot["logs"]))
+        self.assertFalse(any("===== 手机号" in line for line in snapshot["logs"]))
+        self.assertNotIn("+13333333333", "\n".join(snapshot["logs"]))
 
 
 class BatchPaymentLinkTaskTests(unittest.TestCase):
@@ -904,13 +1025,22 @@ class BatchPaymentLinkTaskTests(unittest.TestCase):
         self.tasks_engine_patch.stop()
         self.core_engine_patch.stop()
 
-    def _add_account(self, *, email: str, status: str = "registered", link_status: str = "") -> int:
+    def _add_account(
+        self,
+        *,
+        email: str,
+        status: str = "registered",
+        link_status: str = "",
+        cached_url: str = "https://pay.example.test/cached",
+        country: str = "US",
+        currency: str = "USD",
+    ) -> int:
         extra = {
             "chatgpt_last_payment_link": {
-                "url": "https://pay.example.test/cached",
+                "url": cached_url,
                 "plan": "plus",
-                "country": "US",
-                "currency": "USD",
+                "country": country,
+                "currency": currency,
                 "proxy": "",
                 "link_status": link_status,
             }
@@ -935,6 +1065,7 @@ class BatchPaymentLinkTaskTests(unittest.TestCase):
         email: str,
         *,
         force_refresh: bool = False,
+        params: dict | None = None,
     ) -> None:
         _create_standalone_task_record(
             task_id,
@@ -944,7 +1075,7 @@ class BatchPaymentLinkTaskTests(unittest.TestCase):
             meta={
                 "account_ids": [account_id],
                 "emails": [email],
-                "params": {},
+                "params": dict(params or {}),
                 "skip_existing": True,
                 "force_refresh": bool(force_refresh),
                 "skipped_items": [],
@@ -1009,6 +1140,128 @@ class BatchPaymentLinkTaskTests(unittest.TestCase):
         self.assertEqual(snapshot["success"], 0)
         self.assertEqual(snapshot["skipped"], 1)
         self.assertTrue(any("已经支付过，开始同步账号状态" in line for line in snapshot["logs"]))
+
+    def test_batch_payment_link_regenerates_legacy_fixed_fragment_cache(self):
+        task_id = "task-batch-payment-regenerate-legacy-cache"
+        account_id = self._add_account(
+            email="legacy-cache@example.com",
+            cached_url="https://chatgpt.com/checkout/openai_llc/cs_live_cached123",
+            country="US",
+            currency="USD",
+        )
+        _create_standalone_task_record(
+            task_id,
+            platform="chatgpt",
+            source="batch_payment_link",
+            total=1,
+            meta={
+                "account_ids": [account_id],
+                "emails": ["legacy-cache@example.com"],
+                "params": {"country": "US", "currency": "USD"},
+                "skip_existing": True,
+                "force_refresh": False,
+                "skipped_items": [],
+                "missing_ids": [],
+            },
+        )
+        calls = []
+
+        def _fake_execute(_instance, _platform, _account, _action, params, _session):
+            calls.append(dict(params))
+            url = "https://pay.openai.com/c/pay/cs_live_regenerated#fid_real"
+            extra = _account.get_extra()
+            extra["chatgpt_last_payment_link"] = {
+                "url": url,
+                "plan": "plus",
+                "country": "US",
+                "currency": "USD",
+                "payment_link_format": "long_hosted",
+            }
+            _account.cashier_url = url
+            _account.set_extra(extra)
+            _session.add(_account)
+            return {
+                "ok": True,
+                "data": {
+                    "url": url,
+                    "plan": "plus",
+                    "country": "US",
+                    "currency": "USD",
+                    "payment_link_format": "long_hosted",
+                    "cache_reused": False,
+                },
+            }
+
+        with (
+            patch("services.chatgpt_core.ChatGPTPlatform"),
+            patch("core.config_store.config_store.get_all", return_value={}),
+            patch("core.config_store.config_store.get", return_value=""),
+            patch.object(api_actions, "_execute_platform_action", side_effect=_fake_execute),
+            patch("api.tasks._save_task_log"),
+        ):
+            _run_batch_payment_links(task_id, [account_id])
+
+        self.assertEqual(len(calls), 1)
+        self.assertIs(calls[0]["reuse_cached_link"], True)
+        snapshot = _task_store.snapshot(task_id)
+        self.assertEqual(snapshot["success"], 1)
+        self.assertEqual(snapshot["skipped"], 0)
+        self.assertEqual(snapshot["cashier_urls"], ["https://pay.openai.com/c/pay/cs_live_regenerated#fid_real"])
+
+        with Session(self.engine) as session:
+            row = session.get(AccountModel, account_id)
+        self.assertEqual(row.cashier_url, "https://pay.openai.com/c/pay/cs_live_regenerated#fid_real")
+        self.assertEqual(row.get_extra()["chatgpt_last_payment_link"]["url"], "https://pay.openai.com/c/pay/cs_live_regenerated#fid_real")
+
+    def test_batch_payment_link_short_format_does_not_reuse_long_cached_link(self):
+        task_id = "task-batch-payment-short-format"
+        account_id = self._add_account(
+            email="short-format@example.com",
+            cached_url="https://pay.openai.com/c/pay/cs_live_cached_long",
+            country="US",
+            currency="USD",
+        )
+        self._create_payment_link_task(
+            task_id,
+            account_id,
+            "short-format@example.com",
+            params={"country": "US", "currency": "USD", "payment_link_format": "short_chatgpt"},
+        )
+        calls = []
+
+        def _fake_execute(_instance, _platform, _account, _action, params, _session):
+            calls.append(dict(params))
+            return {
+                "ok": True,
+                "data": {
+                    "url": "https://chatgpt.com/checkout/openai_llc/cs_live_short_new",
+                    "plan": "plus",
+                    "country": "US",
+                    "currency": "USD",
+                    "payment_link_format": "short_chatgpt",
+                    "cache_reused": False,
+                },
+            }
+
+        class _FakeChatGPTPlatform:
+            def __init__(self, config=None):
+                self.config = config
+
+        with (
+            patch("services.chatgpt_core.ChatGPTPlatform", _FakeChatGPTPlatform),
+            patch("core.config_store.config_store.get_all", return_value={}),
+            patch("core.config_store.config_store.get", return_value=""),
+            patch.object(api_actions, "_execute_platform_action", side_effect=_fake_execute),
+            patch("api.tasks._save_task_log"),
+        ):
+            _run_batch_payment_links(task_id, [account_id])
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["payment_link_format"], "short_chatgpt")
+        self.assertIs(calls[0]["reuse_cached_link"], True)
+        snapshot = _task_store.snapshot(task_id)
+        self.assertEqual(snapshot["success"], 1)
+        self.assertEqual(snapshot["skipped"], 0)
 
     def test_batch_payment_link_force_refresh_regenerates_existing_link(self):
         task_id = "task-batch-payment-force-refresh"

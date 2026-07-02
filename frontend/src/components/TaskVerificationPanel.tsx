@@ -14,6 +14,8 @@ export interface PendingVerificationChallenge {
   created_at?: number
   expires_at?: number
   timeout_seconds?: number
+  metadata?: Record<string, any>
+  actions?: string[]
 }
 
 type TaskVerificationPanelProps = {
@@ -35,6 +37,7 @@ export function TaskVerificationPanel({
 }: TaskVerificationPanelProps) {
   const [code, setCode] = useState('')
   const [submitting, setSubmitting] = useState(false)
+  const [actionLoading, setActionLoading] = useState('')
   const [now, setNow] = useState(Date.now())
   const inputRef = useRef<any>(null)
   const cardRef = useRef<HTMLDivElement | null>(null)
@@ -62,14 +65,35 @@ export function TaskVerificationPanel({
     return null
   }
 
-  const handleCopyEmail = async () => {
-    const email = String(verification?.email || '').trim()
-    if (!email) return
+  const phase = String(verification.phase || '').trim().toLowerCase()
+  const metadata = verification.metadata || {}
+  const isPhoneLike = phase.includes('phone') || phase.includes('sms') || phase.includes('paypal')
+  const isPhoneOtp = phase.includes('phone')
+  const phone = String(metadata.phone || metadata.masked_phone || verification.email || '').trim()
+  const accountEmail = String(metadata.account_email || '').trim()
+  const currentChannel = String(metadata.channel || '').trim().toLowerCase()
+  const availableChannels = Array.isArray(metadata.available_channels) ? metadata.available_channels.map((item) => String(item)) : []
+  const actions = Array.isArray(verification.actions) ? verification.actions : []
+  const targetLabel = isPhoneLike ? '接收方' : '邮箱'
+  const inputPlaceholder = isPhoneOtp
+    ? '请输入 SMS / WhatsApp 手机验证码'
+    : isPhoneLike
+      ? '请输入短信 / PayPal OTP'
+      : '请输入邮箱里的验证码'
+  const helperText = isPhoneOtp
+    ? '当前只验证这个手机号，不会换新手机号；可切换 SMS / WhatsApp 通道、重新发送，或跳过当前账号。60 秒无输入会自动跳过。'
+    : isPhoneLike
+      ? '收到 PayPal 短信 OTP 后直接输入并回车；这个面板会跟着任务阶段自动切到下一次 challenge。'
+    : '如果你邮箱里收到了新验证码，直接覆盖输入并回车即可；这个面板会跟着任务阶段自动切到下一次 challenge。'
+
+  const handleCopyTarget = async () => {
+    const target = String(verification?.email || '').trim()
+    if (!target) return
     try {
-      await navigator.clipboard.writeText(email)
-      message.success('邮箱已复制')
+      await navigator.clipboard.writeText(target)
+      message.success(`${targetLabel}已复制`)
     } catch {
-      message.error('复制邮箱失败')
+      message.error(`复制${targetLabel}失败`)
     }
   }
 
@@ -99,6 +123,39 @@ export function TaskVerificationPanel({
     }
   }
 
+  const handleAction = async (action: string, payload: Record<string, any> = {}) => {
+    setActionLoading(`${action}:${payload.channel || ''}`)
+    try {
+      await apiFetch(`/tasks/${taskId}/verification-action`, {
+        method: 'POST',
+        body: JSON.stringify({
+          challenge_id: verification.challenge_id,
+          action,
+          payload,
+        }),
+      })
+      message.success(action === 'switch_channel' ? '已请求切换通道' : '已请求重新发送')
+    } catch (error_: unknown) {
+      const detail = error_ instanceof Error ? error_.message : '验证码动作失败'
+      message.error(detail)
+    } finally {
+      setActionLoading('')
+    }
+  }
+
+  const handleSkipCurrent = async () => {
+    setActionLoading('skip')
+    try {
+      await apiFetch(`/tasks/${taskId}/skip-current`, { method: 'POST' })
+      message.success('已请求跳过当前账号')
+    } catch (error_: unknown) {
+      const detail = error_ instanceof Error ? error_.message : '跳过当前账号失败'
+      message.error(detail)
+    } finally {
+      setActionLoading('')
+    }
+  }
+
   return (
     <div ref={cardRef}>
       <Card
@@ -109,8 +166,8 @@ export function TaskVerificationPanel({
             <Tag color={secondsLeft <= 30 ? 'error' : 'warning'}>
               剩余 {formatRemainingSeconds(secondsLeft)}
             </Tag>
-            <Button size="small" icon={<CopyOutlined />} onClick={handleCopyEmail}>
-              复制邮箱
+            <Button size="small" icon={<CopyOutlined />} onClick={handleCopyTarget}>
+              复制{targetLabel}
             </Button>
           </Space>
         }
@@ -122,11 +179,21 @@ export function TaskVerificationPanel({
           message={verification.phase_label || '邮箱验证码'}
           description={
             <Space direction="vertical" size={4}>
-              <Text>邮箱：{verification.email || '未知邮箱'}</Text>
+              <Text>{targetLabel}：{verification.email || `未知${targetLabel}`}</Text>
+              {isPhoneOtp && accountEmail ? <Text>账号：{accountEmail}</Text> : null}
+              {isPhoneOtp && phone ? <Text>手机号：{phone}</Text> : null}
               <Space wrap>
                 <Tag color="gold">阶段：{verification.phase || 'email_otp'}</Tag>
+                {isPhoneOtp && currentChannel ? <Tag color={currentChannel === 'sms' ? 'blue' : 'green'}>通道：{currentChannel.toUpperCase()}</Tag> : null}
                 <Tag>challenge：{verification.challenge_id}</Tag>
               </Space>
+              {isPhoneOtp && metadata.reason ? <Text type="secondary">{String(metadata.reason)}</Text> : null}
+              {isPhoneOtp && metadata.action_status === 'failed' && metadata.action_error ? (
+                <Text type="danger">动作失败：{String(metadata.action_error)}</Text>
+              ) : null}
+              {isPhoneOtp && metadata.last_action_detail ? (
+                <Text type="secondary">最近动作：{String(metadata.last_action_detail)}</Text>
+              ) : null}
             </Space>
           }
         />
@@ -134,19 +201,47 @@ export function TaskVerificationPanel({
           ref={inputRef}
           prefix={<LockOutlined />}
           value={code}
-          placeholder="请输入邮箱里的验证码"
+          placeholder={inputPlaceholder}
           onChange={(event) => setCode(event.target.value)}
           onPressEnter={handleSubmit}
           autoComplete="one-time-code"
           autoFocus
         />
         <Text type="secondary">
-          如果你邮箱里收到了新验证码，直接覆盖输入并回车即可；这个面板会跟着任务阶段自动切到下一次 challenge。
+          {helperText}
         </Text>
           <Space>
             <Button type="primary" onClick={handleSubmit} loading={submitting} disabled={!code.trim()}>
               提交验证码
             </Button>
+            {isPhoneOtp && actions.includes('switch_channel') && availableChannels.includes('sms') ? (
+              <Button
+                onClick={() => handleAction('switch_channel', { channel: 'sms' })}
+                loading={actionLoading === 'switch_channel:sms'}
+                disabled={currentChannel === 'sms'}
+              >
+                切换 SMS
+              </Button>
+            ) : null}
+            {isPhoneOtp && actions.includes('switch_channel') && availableChannels.includes('whatsapp') ? (
+              <Button
+                onClick={() => handleAction('switch_channel', { channel: 'whatsapp' })}
+                loading={actionLoading === 'switch_channel:whatsapp'}
+                disabled={currentChannel === 'whatsapp'}
+              >
+                切换 WhatsApp
+              </Button>
+            ) : null}
+            {isPhoneOtp && actions.includes('resend') ? (
+              <Button onClick={() => handleAction('resend')} loading={actionLoading === 'resend:'}>
+                重新发送
+              </Button>
+            ) : null}
+            {isPhoneOtp ? (
+              <Button danger onClick={handleSkipCurrent} loading={actionLoading === 'skip'}>
+                跳过当前账号
+              </Button>
+            ) : null}
             <Button onClick={() => setCode('')} disabled={!code}>
               清空
             </Button>

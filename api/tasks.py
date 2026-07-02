@@ -10,18 +10,44 @@ from core.task_runtime import (
     AttemptResult,
     RegisterTaskStore,
     SkipCurrentAttemptRequested,
+    TaskInterruption,
     StopTaskRequested,
 )
-from services.account_filters import account_base_query, filter_account_rows
+from services.account_filters import (
+    account_base_query,
+    account_subscription_type,
+    account_validity,
+    filter_account_rows,
+)
+from services.account_rate_limit_recovery import (
+    account_rate_limit_payload,
+    mark_account_rate_limited,
+    reconcile_rate_limited_accounts,
+)
 from services.chatgpt_core.payment_link_cache import (
     cache_checkout_link_in_extra,
     payment_link_cache_matches,
     payment_link_requires_regeneration,
     payment_link_requires_status_sync,
     payment_link_status_label,
+    normalize_payment_link_url,
     normalize_payment_link_params,
 )
-import time, json, asyncio, threading, logging
+from services.chatgpt_core.local_status_refresh import schedule_chatgpt_local_status_refresh_for_account_id
+from services.chatgpt_core.task_logging import (
+    REDACTION_VERSION,
+    build_task_current_state,
+    format_task_timeline_log,
+    mask_phone_for_log,
+    redact_log_text,
+    redact_proxy_url,
+    redact_raw_phone_line,
+    sanitize_error_message,
+    sanitize_phone_item,
+    sanitize_phone_result,
+    sanitize_task_detail,
+)
+import time, json, asyncio, threading, logging, re
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
 logger = logging.getLogger(__name__)
@@ -33,6 +59,8 @@ _task_store = RegisterTaskStore(
     cleanup_threshold=CLEANUP_THRESHOLD,
 )
 
+_TASK_STAGE_STARTED_AT: dict[tuple[str, str], str] = {}
+
 
 class RegisterTaskRequest(BaseModel):
     platform: str
@@ -41,7 +69,13 @@ class RegisterTaskRequest(BaseModel):
     count: int = 1
     concurrency: int = 1
     register_delay_seconds: float = 0
+    register_delay_max_seconds: float = 0
     proxy: Optional[str] = None
+    proxy_mode: str = ""  # direct | specified | pool；空值保持旧语义：有 proxy 用指定代理，无 proxy 直连
+    proxy_country_code: str = ""
+    proxy_failover: bool = False
+    proxy_max_candidates: int = 0
+    proxy_min_score: float = 0
     executor_type: str = "protocol"
     captcha_solver: str = "yescaptcha"
     extra: dict = Field(default_factory=dict)
@@ -54,6 +88,12 @@ class TaskLogBatchDeleteRequest(BaseModel):
 class SubmitVerificationRequest(BaseModel):
     challenge_id: str
     code: str
+
+
+class VerificationActionRequest(BaseModel):
+    challenge_id: str
+    action: str
+    payload: dict[str, Any] = Field(default_factory=dict)
 
 
 class ResumeSubscriptionAuthTaskRequest(BaseModel):
@@ -85,12 +125,82 @@ class PhoneBindingTestTaskRequest(BaseModel):
     account_validity: str = ""
     sub2api_state: str = ""
     phone_lines: str = ""
+    use_pool: bool = False
     timeout_seconds: int = 180
     poll_interval_seconds: int = 5
     max_resend_attempts: int = 0
     resend_interval_seconds: int = 30
     account_interval_seconds: int = 60
     reuse_phone_until_unusable: bool = False
+    prefix_bind_enabled: bool = False
+    prefix_sample_enabled: bool = False
+    prefix_sample_size: int = 1
+    prefix_sample_filter: str = "all"
+    selected_prefixes: list[str] = Field(default_factory=list)
+    sms_probe_only: bool = False
+    prefix_sms_probe_only: bool = False
+    limit: int = 0
+    proxy: Optional[str] = None
+    proxy_mode: str = "pool"  # direct | specified | pool
+    proxy_country_code: str = ""
+    proxy_failover: bool = True
+    proxy_max_candidates: int = 0
+    proxy_min_score: float = 0
+
+
+class BaxiGptCdkSubmitTaskRequest(BaseModel):
+    account_ids: list[int] = Field(default_factory=list)
+    all_filtered: bool = False
+    email: str = ""
+    status: str = ""
+    manually_used: str | None = None
+    auth_type: str = ""
+    subscription_type: str = ""
+    account_validity: str = ""
+    sub2api_state: str = ""
+    code_lines: str = ""
+    use_pool: bool = True
+    precheck: bool = True
+    failure_continue: bool = True
+    submit_interval_seconds: int = 5
+    auto_poll_status: bool = True
+    status_poll_interval_seconds: int = 5
+    status_poll_timeout_seconds: int = 300
+    limit: int = 0
+
+
+class ChatGptPaypalBindTaskRequest(BaseModel):
+    account_ids: list[int] = Field(default_factory=list)
+    all_filtered: bool = False
+    email: str = ""
+    status: str = ""
+    manually_used: str | None = None
+    auth_type: str = ""
+    subscription_type: str = ""
+    account_validity: str = ""
+    sub2api_state: str = ""
+    upstream: str = "plus_iceaix"
+    base_url: str = ""
+    proxy: str = ""
+    proxy_jp: str = ""
+    proxy_pool: str = "kookeey"
+    phone: str = ""
+    paypal_email: str = ""
+    sms_api: str = ""
+    sms_api_test_mode: bool = False
+    precheck_token_info: bool = True
+    submit_mode: str = "serial"  # serial | batch
+    submit_delay_seconds: float = 0
+    batch_max_workers: int = 50
+    billing_country: str = "US"
+    payment_locale: str = "en"
+    checkout_ui_mode: str = "hosted"
+    otp_timeout: int = 180
+    pplink_retry: int = 3
+    timeout: float = 30
+    event_timeout: float = 60
+    account_interval_seconds: int = 0
+    failure_continue: bool = True
     limit: int = 0
 
 
@@ -110,9 +220,83 @@ class BatchPaymentLinkTaskRequest(BaseModel):
     limit: int = 0
 
 
+class BatchSub2ApiUploadTaskRequest(BaseModel):
+    account_ids: list[int] = Field(default_factory=list)
+    all_filtered: bool = False
+    email: str = ""
+    status: str = ""
+    manually_used: str | None = None
+    auth_type: str = ""
+    subscription_type: str = ""
+    account_validity: str = ""
+    sub2api_state: str = ""
+    params: dict[str, Any] = Field(default_factory=dict)
+    limit: int = 0
+
+
+class BatchOaipayUploadTaskRequest(BaseModel):
+    account_ids: list[int] = Field(default_factory=list)
+    all_filtered: bool = False
+    category_id: int | None = None
+    email: str = ""
+    status: str = ""
+    manually_used: str | None = None
+    auth_type: str = ""
+    subscription_type: str = ""
+    account_validity: str = ""
+    oaipay_state: str = ""
+    params: dict[str, Any] = Field(default_factory=dict)
+    limit: int = 0
+
+
 class InvalidRecheckTaskRequest(BaseModel):
     account_id: int
 
+
+class CustomEmailRecheckTaskRequest(BaseModel):
+    email: str
+    password: str = ""
+    save_on_success: bool = True
+    proxy: Optional[str] = None
+    proxy_mode: str = ""  # direct | specified | pool；空值保持旧 API 语义：有 proxy 用指定代理，无 proxy 直连
+    proxy_country_code: str = ""
+    proxy_failover: bool = False
+    proxy_max_candidates: int = 0
+    proxy_min_score: float = 0
+
+
+class BatchCustomEmailRecheckTaskRequest(BaseModel):
+    emails: list[str] = Field(default_factory=list)
+    raw_emails: str = ""
+    source_format: str = "email_list"
+    source_text: str = ""
+    source_filename: str = ""
+    password: str = ""
+    save_on_success: bool = True
+    limit: int = 200
+    proxy: Optional[str] = None
+    proxy_mode: str = ""  # direct | specified | pool；空值保持旧 API 语义：有 proxy 用指定代理，无 proxy 直连
+    proxy_country_code: str = ""
+    proxy_failover: bool = False
+    proxy_max_candidates: int = 0
+    proxy_min_score: float = 0
+    account_delay_seconds: float = 0
+
+
+
+
+class IcloudHmeRecheckBatchTaskRequest(BaseModel):
+    campaign_id: str = ""
+    limit: int = 20
+    include_retry: bool = False
+    save_on_success: bool = True
+    proxy: Optional[str] = None
+    proxy_mode: str = "pool"
+    proxy_country_code: str = ""
+    proxy_failover: bool = False
+    proxy_max_candidates: int = 0
+    proxy_min_score: float = 0
+    account_delay_seconds: float = 0
 
 class BatchInvalidRecheckTaskRequest(BaseModel):
     account_ids: list[int] = Field(default_factory=list)
@@ -146,6 +330,19 @@ def _prepare_register_request(req: RegisterTaskRequest) -> RegisterTaskRequest:
     req_data["extra"] = deepcopy(req_data.get("extra") or {})
     prepared = RegisterTaskRequest(**req_data)
 
+    registration_entry = str(
+        prepared.extra.get("chatgpt_registration_entry")
+        or prepared.extra.get("registration_entry")
+        or ""
+    ).strip().lower().replace("-", "_")
+    if prepared.platform == "chatgpt" and registration_entry in {"phone", "phone_signup", "sms", "sms_signup"}:
+        prepared.extra["chatgpt_registration_entry"] = "phone_signup"
+        prepared.extra["chatgpt_registration_mode"] = "access_token_only"
+        prepared.extra["chatgpt_has_refresh_token_solution"] = False
+        # 手机号本身是注册标识；串行能避免同一个号池号码在并发任务里被重复领取。
+        prepared.concurrency = 1
+        return prepared
+
     mail_provider = prepared.extra.get("mail_provider") or config_store.get(
         "mail_provider", ""
     )
@@ -167,6 +364,19 @@ def _prepare_register_request(req: RegisterTaskRequest) -> RegisterTaskRequest:
             prepared.password = None
         prepared.extra["manual_email_address"] = prepared.email
         prepared.extra["chatgpt_existing_account_capture"] = existing_account_capture
+
+    if mail_provider in {"tempmail_local", "tempmail_api"}:
+        mode = str(prepared.extra.get("tempmail_mode") or config_store.get("tempmail_mode", "fixed_domain") or "fixed_domain").strip().lower()
+        if mode == "fixed_domain":
+            domains = _normalize_domain_list(prepared.extra.get("tempmail_fixed_domains"))
+            primary_domain = str(prepared.extra.get("tempmail_primary_domain") or config_store.get("tempmail_primary_domain", "") or "").strip().lstrip("@.")
+            if primary_domain and primary_domain not in domains:
+                domains.append(primary_domain)
+            if not domains:
+                raise HTTPException(400, "固定域名模式下请至少选择一个 TempMail 可用域名")
+            prepared.extra["tempmail_mode"] = "fixed_domain"
+            prepared.extra["tempmail_fixed_domains"] = domains
+            prepared.extra.setdefault("tempmail_primary_domain", domains[0])
 
     if mail_provider == "luckmail":
         prepared.extra["luckmail_project_code"] = "openai"
@@ -212,8 +422,39 @@ def enqueue_register_task(
 ) -> str:
     prepared = _prepare_register_request(req)
     task_id = f"task_{int(time.time() * 1000)}"
-    _create_task_record(task_id, prepared, source, meta)
     prepared_extra = _build_effective_register_extra(prepared)
+    initial_meta = dict(meta or {})
+    registration_entry = str(
+        prepared_extra.get("chatgpt_registration_entry")
+        or prepared_extra.get("registration_entry")
+        or ""
+    ).strip().lower().replace("-", "_")
+    is_phone_signup_task = prepared.platform == "chatgpt" and registration_entry in {"phone", "phone_signup", "sms", "sms_signup"}
+    if is_phone_signup_task:
+        phone_lines = [
+            str(line or "").strip()
+            for line in str(prepared_extra.get("chatgpt_phone_signup_phone_lines") or "").splitlines()
+            if str(line or "").strip()
+        ]
+        selected_prefixes = prepared_extra.get("chatgpt_phone_signup_selected_prefixes") or prepared_extra.get("selected_prefixes") or []
+        if not isinstance(selected_prefixes, list):
+            selected_prefixes = [str(selected_prefixes)] if str(selected_prefixes or "").strip() else []
+        if source == "manual":
+            source = "phone_signup"
+        initial_meta.setdefault(
+            "phone_signup",
+            {
+                "enabled": True,
+                "target_count": int(prepared.count or 1),
+                "use_pool": _is_truthy(prepared_extra.get("chatgpt_phone_signup_use_pool")),
+                "manual_phone_line_count": len(phone_lines),
+                "prefix_bind_enabled": _is_truthy(prepared_extra.get("chatgpt_phone_signup_prefix_bind_enabled")),
+                "prefix_sample_enabled": _is_truthy(prepared_extra.get("chatgpt_phone_signup_prefix_sample_enabled")),
+                "selected_prefixes": [str(value or "").strip() for value in selected_prefixes if str(value or "").strip()],
+            },
+        )
+        initial_meta.setdefault("phone_count", len(phone_lines) or int(prepared.count or 1))
+    _create_task_record(task_id, prepared, source, initial_meta)
     _save_task_log(
         prepared.platform,
         prepared.email or "",
@@ -226,8 +467,9 @@ def enqueue_register_task(
                 "requested_count": int(prepared.count or 0),
                 "requested_concurrency": int(prepared.concurrency or 0),
                 "requested_delay_seconds": float(prepared.register_delay_seconds or 0),
+                "requested_delay_max_seconds": float(prepared.register_delay_max_seconds or 0),
                 "source": source,
-                "meta": dict(meta or {}),
+                "meta": dict(initial_meta or {}),
                 "extra_flags": {
                     "mail_provider": str(prepared_extra.get("mail_provider") or ""),
                     "existing_account_capture": _is_truthy(prepared_extra.get("chatgpt_existing_account_capture")),
@@ -269,6 +511,38 @@ def _resolve_resume_auth_allow_phone_verification(value: Any = None) -> bool:
     return _is_truthy(config_store.get("chatgpt_resume_auth_allow_phone_verification", "false"))
 
 
+def _resolve_resume_auth_phone_modes(value: Any = None) -> dict[str, bool]:
+    legacy = _resolve_resume_auth_allow_phone_verification(value)
+    from core.config_store import config_store
+
+    cfg = config_store.get_all().copy()
+
+    def _cfg_bool(key: str, default: bool) -> bool:
+        if key not in cfg or cfg.get(key) in (None, ""):
+            return default
+        return _is_truthy(cfg.get(key))
+
+    return {
+        "allow_phone_verification": bool(legacy),
+        "allow_add_phone_verification": _cfg_bool(
+            "chatgpt_resume_auth_allow_add_phone_verification",
+            bool(legacy),
+        ),
+        "allow_existing_phone_verification": _cfg_bool(
+            "chatgpt_resume_auth_allow_existing_phone_verification",
+            True,
+        ),
+    }
+
+
+def _format_phone_modes_for_log(modes: dict[str, bool]) -> str:
+    return (
+        f"兼容总开关={'允许' if modes.get('allow_phone_verification') else '不允许'}，"
+        f"add_phone新绑={'允许' if modes.get('allow_add_phone_verification') else '不允许'}，"
+        f"已绑手机号二次验证={'允许' if modes.get('allow_existing_phone_verification') else '不允许'}"
+    )
+
+
 def enqueue_resume_subscription_auth_task(
     account_id: int,
     *,
@@ -278,7 +552,8 @@ def enqueue_resume_subscription_auth_task(
     account_id_value = int(account_id or 0)
     if account_id_value <= 0:
         raise HTTPException(400, "account_id 无效")
-    resolved_allow_phone_verification = _resolve_resume_auth_allow_phone_verification(allow_phone_verification)
+    resolved_modes = _resolve_resume_auth_phone_modes(allow_phone_verification)
+    resolved_allow_phone_verification = resolved_modes["allow_phone_verification"]
 
     with Session(engine) as session:
         account = session.get(AccountModel, account_id_value)
@@ -292,6 +567,8 @@ def enqueue_resume_subscription_auth_task(
         "account_id": account_id_value,
         "email": email,
         "allow_phone_verification": resolved_allow_phone_verification,
+        "allow_add_phone_verification": resolved_modes["allow_add_phone_verification"],
+        "allow_existing_phone_verification": resolved_modes["allow_existing_phone_verification"],
     }
     _create_standalone_task_record(
         task_id,
@@ -361,6 +638,7 @@ def _optional_bool(value: Any) -> bool | None:
 
 
 def _filtered_chatgpt_accounts(session: Session, req: Any) -> list[AccountModel]:
+    reconcile_rate_limited_accounts(session, platform="chatgpt")
     query = account_base_query(platform="chatgpt", status=getattr(req, "status", ""), email=getattr(req, "email", ""))
     return filter_account_rows(
         session.exec(query).all(),
@@ -370,6 +648,64 @@ def _filtered_chatgpt_accounts(session: Session, req: Any) -> list[AccountModel]
         account_validity_filter=getattr(req, "account_validity", ""),
         sub2api_state=getattr(req, "sub2api_state", ""),
     )
+
+
+def _chatgpt_account_access_token(account: AccountModel) -> str:
+    try:
+        extra = account.get_extra()
+    except Exception:
+        extra = {}
+    if not isinstance(extra, dict):
+        extra = {}
+    return str(extra.get("access_token") or getattr(account, "token", "") or "").strip()
+
+
+PAYPAL_BIND_ALLOWED_SUBSCRIPTION_TYPES = {"free"}
+PAYPAL_BIND_BLOCKED_SUBSCRIPTION_TYPES = {"plus", "team", "pro", "enterprise"}
+PAYPAL_BIND_ALREADY_PAID_MARKERS = (
+    "user is already paid",
+    "already paid",
+    "you have paid",
+)
+
+
+def _paypal_bind_account_extra(account: AccountModel) -> dict[str, Any]:
+    try:
+        extra = account.get_extra()
+    except Exception:
+        return {}
+    return extra if isinstance(extra, dict) else {}
+
+
+def _paypal_bind_account_item(account: AccountModel, extra: dict[str, Any] | None = None) -> dict[str, Any]:
+    extra = extra if isinstance(extra, dict) else _paypal_bind_account_extra(account)
+    return {
+        "account_id": int(account.id or 0),
+        "email": str(account.email or ""),
+        "status": str(account.status or ""),
+        "subscription_type": account_subscription_type(account, extra),
+        "account_validity": account_validity(account, extra),
+    }
+
+
+def _paypal_bind_detect_external_state(*values: Any) -> str:
+    parts: list[str] = []
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, (dict, list, tuple)):
+            try:
+                parts.append(json.dumps(value, ensure_ascii=False))
+            except Exception:
+                parts.append(str(value))
+        else:
+            parts.append(str(value))
+    text = "\n".join(parts).strip().lower()
+    if not text:
+        return ""
+    if any(marker in text for marker in PAYPAL_BIND_ALREADY_PAID_MARKERS):
+        return "already_paid"
+    return ""
 
 
 def _is_resume_auth_candidate(account: AccountModel) -> bool:
@@ -464,6 +800,92 @@ def _resolve_batch_resume_auth_accounts(
     return eligible, [], skipped, matched
 
 
+def _parse_phone_binding_upload_lines(raw_lines: Any) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Parse +phone----api lines without importing the runtime phone service."""
+    import re
+    from urllib.parse import urlparse
+
+    if isinstance(raw_lines, str):
+        lines = raw_lines.splitlines()
+    elif isinstance(raw_lines, list | tuple):
+        lines = [str(item or "") for item in raw_lines]
+    else:
+        lines = []
+
+    entries: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, raw_line in enumerate(lines, start=1):
+        line = str(raw_line or "").strip()
+        if not line:
+            continue
+        if "----" not in line:
+            errors.append({"line": index, "raw": line, "reason": "缺少 ---- 分隔符"})
+            continue
+        phone_part, api_part = line.split("----", 1)
+        digits = re.sub(r"\D", "", str(phone_part or ""))
+        phone = f"+{digits}" if digits else ""
+        api_url = str(api_part or "").strip()
+        if not phone:
+            errors.append({"line": index, "raw": line, "reason": "手机号为空或格式无效"})
+            continue
+        parsed_url = urlparse(api_url)
+        if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:
+            errors.append({"line": index, "raw": line, "phone": phone, "reason": "API URL 无效"})
+            continue
+        if phone in seen:
+            errors.append({"line": index, "raw": line, "phone": phone, "reason": "手机号重复，本轮只保留第一次"})
+            continue
+        seen.add(phone)
+        entries.append(
+            {
+                "line_no": index,
+                "phone": phone,
+                "api_url": api_url,
+                "raw_line": line,
+                "pool_managed": False,
+            }
+        )
+    return entries, errors
+
+
+def _import_manual_phone_entries_to_pool(
+    phone_entries: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Import pasted phone/API rows into the phone pool without overwriting existing rows."""
+    from services.chatgpt_core.phone_pool_repository import PhonePoolRepository
+
+    repo = PhonePoolRepository()
+    imported = existing = skipped = 0
+    managed_items: list[dict[str, Any]] = []
+    for item in phone_entries:
+        next_item = dict(item)
+        phone = str(next_item.get("phone") or "").strip()
+        api_url = str(next_item.get("api_url") or "").strip()
+        record = repo.get(phone)
+        if record is None:
+            record = repo.add(
+                phone=phone,
+                api_url=api_url,
+                label="绑定面板导入",
+            )
+            if record is None:
+                skipped += 1
+            else:
+                imported += 1
+        else:
+            existing += 1
+
+        if record is not None:
+            record_id = int(getattr(record, "id", 0) or 0)
+            next_item["id"] = record_id or int(next_item.get("id") or 0)
+            next_item["pool_id"] = record_id or int(next_item.get("pool_id") or 0)
+            next_item["pool_managed"] = True
+        managed_items.append(next_item)
+
+    return managed_items, {"imported": imported, "existing": existing, "skipped": skipped}
+
+
 def _resolve_phone_binding_test_accounts(
     req: PhoneBindingTestTaskRequest,
 ) -> tuple[list[dict[str, Any]], list[int], list[dict[str, Any]], list[dict[str, Any]]]:
@@ -523,6 +945,333 @@ def _resolve_phone_binding_test_accounts(
     return matched, [], [], matched
 
 
+def _resolve_baxigpt_cdk_submit_accounts(
+    req: BaxiGptCdkSubmitTaskRequest,
+) -> tuple[list[dict[str, Any]], list[int], list[dict[str, Any]], list[dict[str, Any]]]:
+    requested_ids = _normalize_batch_account_ids(req.account_ids)
+    limit = max(int(req.limit or 0), 0)
+    if requested_ids:
+        if len(requested_ids) > 1000:
+            raise HTTPException(400, "单次最多处理 1000 个账号")
+        with Session(engine) as session:
+            rows = session.exec(
+                select(AccountModel)
+                .where(AccountModel.platform == "chatgpt")
+                .where(AccountModel.id.in_(requested_ids))
+            ).all()
+        row_map = {int(row.id or 0): row for row in rows if int(row.id or 0) > 0}
+        matched: list[dict[str, Any]] = []
+        eligible: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+        missing_ids: list[int] = []
+        for account_id in requested_ids:
+            account = row_map.get(account_id)
+            if account is None:
+                missing_ids.append(account_id)
+                continue
+            item = {
+                "account_id": account_id,
+                "email": str(account.email or ""),
+                "status": str(account.status or ""),
+            }
+            matched.append(item)
+            if not _chatgpt_account_access_token(account):
+                skipped.append({**item, "reason": "账号缺少 Access Token"})
+            else:
+                eligible.append(item)
+        if limit > 0:
+            overflow = eligible[limit:]
+            eligible = eligible[:limit]
+            skipped.extend({**item, "reason": f"超过本次限制 limit={limit}"} for item in overflow)
+        return eligible, missing_ids, skipped, matched
+
+    if not bool(req.all_filtered):
+        raise HTTPException(400, "请提供 account_ids，或指定 all_filtered=true")
+
+    with Session(engine) as session:
+        rows = _filtered_chatgpt_accounts(session, req)
+
+    if limit > 0:
+        rows = rows[:limit]
+    if len(rows) > 1000:
+        raise HTTPException(400, "单次最多处理 1000 个账号")
+
+    matched: list[dict[str, Any]] = []
+    eligible: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    for account in rows:
+        account_id = int(account.id or 0)
+        if account_id <= 0:
+            continue
+        item = {
+            "account_id": account_id,
+            "email": str(account.email or ""),
+            "status": str(account.status or ""),
+        }
+        matched.append(item)
+        if not _chatgpt_account_access_token(account):
+            skipped.append({**item, "reason": "账号缺少 Access Token"})
+        else:
+            eligible.append(item)
+    return eligible, [], skipped, matched
+
+
+def _paypal_bind_skip_reason(account: AccountModel, extra: dict[str, Any] | None = None) -> str:
+    extra = extra if isinstance(extra, dict) else _paypal_bind_account_extra(account)
+    status = str(getattr(account, "status", "") or "").strip().lower()
+    validity = account_validity(account, extra)
+    subscription_type = account_subscription_type(account, extra)
+    if validity != "valid":
+        return "账号无效，不能提交 PayPal 绑定"
+    if status == "subscribed" or subscription_type in PAYPAL_BIND_BLOCKED_SUBSCRIPTION_TYPES:
+        label = subscription_type if subscription_type != "unknown" else status or "subscribed"
+        return f"账号已订阅({label})，默认不提交 PayPal 绑定"
+    if subscription_type not in PAYPAL_BIND_ALLOWED_SUBSCRIPTION_TYPES:
+        return f"账号订阅状态不是明确 Free({subscription_type})，不能提交 PayPal 绑定"
+    if not _chatgpt_account_access_token(account):
+        return "账号缺少 Access Token"
+    return ""
+
+
+def _resolve_chatgpt_paypal_bind_accounts(
+    req: ChatGptPaypalBindTaskRequest,
+) -> tuple[list[dict[str, Any]], list[int], list[dict[str, Any]], list[dict[str, Any]]]:
+    requested_ids = _normalize_batch_account_ids(req.account_ids)
+    limit = max(int(req.limit or 0), 0)
+    if requested_ids:
+        if len(requested_ids) > 1000:
+            raise HTTPException(400, "单次最多处理 1000 个账号")
+        with Session(engine) as session:
+            rows = session.exec(
+                select(AccountModel)
+                .where(AccountModel.platform == "chatgpt")
+                .where(AccountModel.id.in_(requested_ids))
+            ).all()
+        row_map = {int(row.id or 0): row for row in rows if int(row.id or 0) > 0}
+        matched: list[dict[str, Any]] = []
+        eligible: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+        missing_ids: list[int] = []
+        for account_id in requested_ids:
+            account = row_map.get(account_id)
+            if account is None:
+                missing_ids.append(account_id)
+                continue
+            extra = _paypal_bind_account_extra(account)
+            item = _paypal_bind_account_item(account, extra)
+            matched.append(item)
+            reason = _paypal_bind_skip_reason(account, extra)
+            if reason:
+                skipped.append({**item, "reason": reason})
+            else:
+                eligible.append(item)
+        if limit > 0:
+            overflow = eligible[limit:]
+            eligible = eligible[:limit]
+            skipped.extend({**item, "reason": f"超过本次限制 limit={limit}"} for item in overflow)
+        return eligible, missing_ids, skipped, matched
+
+    if not bool(req.all_filtered):
+        raise HTTPException(400, "请提供 account_ids，或指定 all_filtered=true")
+
+    with Session(engine) as session:
+        rows = _filtered_chatgpt_accounts(session, req)
+
+    if limit > 0:
+        rows = rows[:limit]
+    if len(rows) > 1000:
+        raise HTTPException(400, "单次最多处理 1000 个账号")
+
+    matched: list[dict[str, Any]] = []
+    eligible: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    for account in rows:
+        account_id = int(account.id or 0)
+        if account_id <= 0:
+            continue
+        extra = _paypal_bind_account_extra(account)
+        item = _paypal_bind_account_item(account, extra)
+        matched.append(item)
+        reason = _paypal_bind_skip_reason(account, extra)
+        if reason:
+            skipped.append({**item, "reason": reason})
+        else:
+            eligible.append(item)
+    return eligible, [], skipped, matched
+
+
+def _sub2api_upload_item(account: AccountModel) -> dict[str, Any]:
+    return {
+        "account_id": int(account.id or 0),
+        "email": str(account.email or ""),
+        "status": str(account.status or ""),
+    }
+
+
+def _is_sub2api_pending_upload_account(account: AccountModel) -> bool:
+    try:
+        extra = account.get_extra()
+    except Exception:
+        extra = {}
+    sync_statuses = extra.get("sync_statuses") if isinstance(extra.get("sync_statuses"), dict) else {}
+    state = sync_statuses.get("sub2api") if isinstance(sync_statuses.get("sub2api"), dict) else {}
+    if not state:
+        return True
+    remote_state = str(state.get("remote_state") or "").strip().lower()
+    uploaded = bool(state.get("uploaded"))
+    return remote_state in {"", "not_found", "cross_workspace_only", "deleted_exact_match"} or (not remote_state and not uploaded)
+
+
+def _resolve_batch_sub2api_upload_accounts(
+    req: BatchSub2ApiUploadTaskRequest,
+) -> tuple[list[dict[str, Any]], list[int], list[dict[str, Any]], list[dict[str, Any]]]:
+    requested_ids = _normalize_batch_account_ids(req.account_ids)
+    limit = max(int(req.limit or 0), 0)
+
+    if requested_ids:
+        if len(requested_ids) > 1000:
+            raise HTTPException(400, "单次最多处理 1000 个账号")
+        with Session(engine) as session:
+            rows = session.exec(
+                select(AccountModel)
+                .where(AccountModel.platform == "chatgpt")
+                .where(AccountModel.id.in_(requested_ids))
+            ).all()
+        row_map = {int(row.id or 0): row for row in rows if int(row.id or 0) > 0}
+        eligible: list[dict[str, Any]] = []
+        missing_ids: list[int] = []
+        for account_id in requested_ids:
+            account = row_map.get(account_id)
+            if account is None:
+                missing_ids.append(account_id)
+                continue
+            eligible.append(_sub2api_upload_item(account))
+        if limit > 0:
+            eligible = eligible[:limit]
+        return eligible, missing_ids, [], []
+
+    if not bool(req.all_filtered):
+        raise HTTPException(400, "请提供 account_ids，或指定 all_filtered=true")
+
+    with Session(engine) as session:
+        query = account_base_query(platform="chatgpt", status=req.status, email=req.email)
+        rows = filter_account_rows(
+            session.exec(query).all(),
+            manually_used=_optional_bool(req.manually_used),
+            auth_type=req.auth_type,
+            subscription_type=req.subscription_type,
+            account_validity_filter=req.account_validity,
+            sub2api_state="",
+        )
+
+    matched: list[dict[str, Any]] = []
+    eligible: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    for account in rows:
+        account_id = int(account.id or 0)
+        if account_id <= 0:
+            continue
+        item = _sub2api_upload_item(account)
+        matched.append(item)
+        if _is_sub2api_pending_upload_account(account):
+            eligible.append(item)
+        else:
+            skipped.append({**item, "reason": "Sub2API 远端状态不是待补传"})
+    if limit > 0:
+        overflow = eligible[limit:]
+        eligible = eligible[:limit]
+        skipped.extend({**item, "reason": f"超过本次限制 limit={limit}"} for item in overflow)
+    if len(eligible) > 1000:
+        raise HTTPException(400, "单次最多处理 1000 个账号")
+    return eligible, [], skipped, matched
+
+
+def _oaipay_upload_item(account: AccountModel) -> dict[str, Any]:
+    return {
+        "account_id": int(account.id or 0),
+        "email": str(account.email or ""),
+        "status": str(account.status or ""),
+    }
+
+
+def _is_oaipay_pending_upload_account(account: AccountModel) -> bool:
+    try:
+        extra = account.get_extra()
+    except Exception:
+        extra = {}
+    sync_statuses = extra.get("sync_statuses") if isinstance(extra.get("sync_statuses"), dict) else {}
+    state = sync_statuses.get("oaipay") if isinstance(sync_statuses.get("oaipay"), dict) else {}
+    if not state:
+        return True
+    remote_state = str(state.get("remote_state") or "").strip().lower()
+    uploaded = bool(state.get("uploaded"))
+    return remote_state in {"", "not_found", "cross_workspace_only", "deleted_exact_match"} or (not remote_state and not uploaded)
+
+
+def _resolve_batch_oaipay_upload_accounts(
+    req: BatchOaipayUploadTaskRequest,
+) -> tuple[list[dict[str, Any]], list[int], list[dict[str, Any]], list[dict[str, Any]]]:
+    requested_ids = _normalize_batch_account_ids(req.account_ids)
+    limit = max(int(req.limit or 0), 0)
+
+    if requested_ids:
+        if len(requested_ids) > 1000:
+            raise HTTPException(400, "单次最多处理 1000 个账号")
+        with Session(engine) as session:
+            rows = session.exec(
+                select(AccountModel)
+                .where(AccountModel.platform == "chatgpt")
+                .where(AccountModel.id.in_(requested_ids))
+            ).all()
+        row_map = {int(row.id or 0): row for row in rows if int(row.id or 0) > 0}
+        eligible: list[dict[str, Any]] = []
+        missing_ids: list[int] = []
+        for account_id in requested_ids:
+            account = row_map.get(account_id)
+            if account is None:
+                missing_ids.append(account_id)
+                continue
+            eligible.append(_oaipay_upload_item(account))
+        if limit > 0:
+            eligible = eligible[:limit]
+        return eligible, missing_ids, [], []
+
+    if not bool(req.all_filtered):
+        raise HTTPException(400, "请提供 account_ids，或指定 all_filtered=true")
+
+    with Session(engine) as session:
+        query = account_base_query(platform="chatgpt", status=req.status, email=req.email)
+        rows = filter_account_rows(
+            session.exec(query).all(),
+            manually_used=_optional_bool(req.manually_used),
+            auth_type=req.auth_type,
+            subscription_type=req.subscription_type,
+            account_validity_filter=req.account_validity,
+            oaipay_state="",
+        )
+
+    matched: list[dict[str, Any]] = []
+    eligible: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    for account in rows:
+        account_id = int(account.id or 0)
+        if account_id <= 0:
+            continue
+        item = _oaipay_upload_item(account)
+        matched.append(item)
+        if _is_oaipay_pending_upload_account(account):
+            eligible.append(item)
+        else:
+            skipped.append({**item, "reason": "OAIPay 远端状态不是待补传"})
+    if limit > 0:
+        overflow = eligible[limit:]
+        eligible = eligible[:limit]
+        skipped.extend({**item, "reason": f"超过本次限制 limit={limit}"} for item in overflow)
+    if len(eligible) > 1000:
+        raise HTTPException(400, "单次最多处理 1000 个账号")
+    return eligible, [], skipped, matched
+
+
 def _json_object_from_config(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
         return dict(value)
@@ -544,6 +1293,7 @@ def _filtered_payment_link_request_params(params: dict[str, Any] | None) -> dict
         "country",
         "currency",
         "proxy",
+        "payment_link_format",
         "promo_code",
         "workspace_name",
         "seat_quantity",
@@ -598,45 +1348,9 @@ def _payment_link_skip_reason(account: AccountModel, *, force_refresh: bool = Fa
 
 
 def _sync_payment_link_account_status(session: Session, account: AccountModel) -> dict[str, Any]:
-    from datetime import datetime, timezone
-    from types import SimpleNamespace
+    from services.chatgpt_core.local_status_refresh import sync_chatgpt_account_local_status
 
-    from services.chatgpt_account_state import apply_chatgpt_status_policy, classify_chatgpt_capabilities
-    from services.chatgpt_core.status_probe import probe_local_chatgpt_status
-
-    extra = account.get_extra()
-    probe_account = SimpleNamespace(
-        id=account.id,
-        email=account.email,
-        password=account.password,
-        user_id=account.user_id,
-        token=account.token,
-        status=account.status,
-        access_token=str(extra.get("access_token") or account.token or "").strip(),
-        refresh_token=str(extra.get("refresh_token") or "").strip(),
-        id_token=str(extra.get("id_token") or "").strip(),
-        session_token=str(extra.get("session_token") or "").strip(),
-        client_id=str(extra.get("client_id") or "app_EMoamEEZ73f0CkXaXp7hrann").strip(),
-        cookies=str(extra.get("cookies") or "").strip(),
-        workspace_id=str(extra.get("workspace_id") or "").strip(),
-        extra=extra,
-    )
-    probe = probe_local_chatgpt_status(probe_account, proxy="")
-    extra["chatgpt_local"] = probe
-    capabilities = classify_chatgpt_capabilities(account, local_probe=probe)
-    extra["chatgpt_capabilities"] = capabilities
-    account.set_extra(extra)
-    reason = apply_chatgpt_status_policy(account, local_probe=probe)
-    account.updated_at = datetime.now(timezone.utc)
-    session.add(account)
-    session.commit()
-    session.refresh(account)
-    return {
-        "status": str(account.status or ""),
-        "reason": reason,
-        "capabilities": capabilities,
-        "probe": probe,
-    }
+    return sync_chatgpt_account_local_status(session, account)
 
 
 def _resolve_batch_payment_link_accounts(
@@ -788,6 +1502,918 @@ def _resolve_batch_invalid_recheck_accounts(
     return eligible, [], skipped, matched
 
 
+def _custom_email_proxy_truthy(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on", "y", "是", "开启", "启用"}:
+        return True
+    if text in {"0", "false", "no", "off", "n", "否", "关闭", "禁用"}:
+        return False
+    return default
+
+
+def _custom_email_proxy_positive_int(value: Any, default: int, minimum: int = 1, maximum: int = 50) -> int:
+    try:
+        parsed = int(float(str(value or "").strip()))
+    except Exception:
+        parsed = default
+    return max(minimum, min(maximum, parsed))
+
+
+def _custom_email_proxy_positive_float(value: Any, default: float, minimum: float = 0, maximum: float = 100) -> float:
+    try:
+        parsed = float(str(value or "").strip())
+    except Exception:
+        parsed = default
+    return max(minimum, min(maximum, parsed))
+
+
+def _redact_proxy_for_task_log(proxy: Optional[str]) -> str:
+    value = redact_proxy_url(proxy)
+    return value or "direct"
+
+
+def _custom_email_proxy_settings(req: CustomEmailRecheckTaskRequest | BatchCustomEmailRecheckTaskRequest) -> dict[str, Any]:
+    from core.proxy_utils import normalize_proxy_url
+
+    explicit_proxy = normalize_proxy_url(getattr(req, "proxy", None)) or ""
+    mode = str(getattr(req, "proxy_mode", "") or "").strip().lower()
+    if not mode:
+        mode = "specified" if explicit_proxy else "direct"
+    if mode in {"none", "no_proxy", "direct", "直连"}:
+        mode = "direct"
+    elif mode in {"manual", "explicit"}:
+        mode = "specified"
+    elif mode not in {"specified", "pool"}:
+        mode = "specified" if explicit_proxy else "direct"
+
+    return {
+        "proxy": explicit_proxy,
+        "proxy_mode": mode,
+        "proxy_country_code": str(getattr(req, "proxy_country_code", "") or "").strip().upper(),
+        "proxy_failover": bool(getattr(req, "proxy_failover", False)),
+        "proxy_max_candidates": int(getattr(req, "proxy_max_candidates", 0) or 0),
+        "proxy_min_score": float(getattr(req, "proxy_min_score", 0) or 0),
+    }
+
+
+def _custom_email_proxy_meta(settings: dict[str, Any]) -> dict[str, Any]:
+    mode = str(settings.get("proxy_mode") or "").strip().lower() or "direct"
+    return {
+        "mode": mode,
+        "country_code": str(settings.get("proxy_country_code") or "").strip().upper(),
+        "failover": bool(settings.get("proxy_failover")),
+        "max_candidates": int(settings.get("proxy_max_candidates") or 0),
+        "min_score": float(settings.get("proxy_min_score") or 0),
+        "specified": _redact_proxy_for_task_log(settings.get("proxy")) if mode == "specified" else "",
+    }
+
+
+def _custom_email_account_delay_seconds(value: Any) -> float:
+    try:
+        delay = float(value or 0)
+    except Exception:
+        delay = 0.0
+    if delay <= 0:
+        return 0.0
+    return min(delay, 600.0)
+
+
+def _build_custom_email_recheck_candidate_proxies(settings: dict[str, Any] | None) -> list[tuple[str, object | None, str]]:
+    from core.config_store import config_store
+    from core.proxy_pool import proxy_pool as runtime_proxy_pool
+    from core.proxy_utils import normalize_proxy_url
+
+    settings = dict(settings or {})
+    explicit_proxy = normalize_proxy_url(settings.get("proxy")) or ""
+    mode = str(settings.get("proxy_mode") or "").strip().lower()
+    if not mode:
+        mode = "specified" if explicit_proxy else "direct"
+    if mode in {"none", "no_proxy", "direct", "直连"}:
+        return [("", None, "direct")]
+    if mode in {"manual", "explicit"}:
+        mode = "specified"
+    if mode not in {"specified", "pool"}:
+        mode = "specified" if explicit_proxy else "direct"
+    if mode == "direct":
+        return [("", None, "direct")]
+
+    country_code = str(settings.get("proxy_country_code") or "").strip().upper()
+    failover = _custom_email_proxy_truthy(settings.get("proxy_failover"), default=False)
+    max_candidates = _custom_email_proxy_positive_int(
+        settings.get("proxy_max_candidates") or config_store.get("proxy_pool_max_candidates", "5"),
+        default=5,
+        minimum=1,
+        maximum=100,
+    )
+    min_score = _custom_email_proxy_positive_float(
+        settings.get("proxy_min_score") or config_store.get("proxy_scan_min_score", "50"),
+        default=50,
+        minimum=0,
+        maximum=100,
+    )
+
+    candidates: list[tuple[str, object | None, str]] = []
+    if mode == "specified":
+        if not explicit_proxy:
+            raise RuntimeError("已选择指定代理模式，但代理地址为空")
+        candidates.append((explicit_proxy, None, "specified"))
+        if not failover:
+            return candidates
+
+    pool_candidates = runtime_proxy_pool.get_candidate_records(
+        target="chatgpt",
+        country_code=country_code,
+        limit=max_candidates,
+        min_score=min_score,
+    )
+    for candidate in pool_candidates:
+        url = normalize_proxy_url(candidate.get("url")) or ""
+        if not url or any(existing[0] == url for existing in candidates):
+            continue
+        country = str(candidate.get("exit_country_code") or "unknown").strip() or "unknown"
+        score = candidate.get("health_score")
+        latency = int(candidate.get("latency_ms") or 0)
+        source = f"pool country={country} score={score} latency={latency}ms"
+        candidates.append((url, runtime_proxy_pool, source))
+
+    if mode == "pool" and not candidates:
+        country_text = country_code or "不限"
+        raise RuntimeError(f"代理池没有可用候选：target=chatgpt country={country_text} min_score={min_score:g}")
+    return candidates or [("", None, "direct")]
+
+
+def _log_custom_email_proxy_choice(task_id: str, proxy_url: str, source: str, index: int, total: int) -> None:
+    label = str(source or "direct").strip() or "direct"
+    _log(
+        task_id,
+        f"[代理] 邮箱测活出口 {index}/{total}: source={label} proxy={_redact_proxy_for_task_log(proxy_url)}",
+    )
+
+
+def _report_custom_email_proxy_fail(proxy_pool: Any, proxy_url: str, error_text: str) -> None:
+    if proxy_pool is None or not proxy_url:
+        return
+    try:
+        proxy_pool.report_fail(proxy_url)
+        if (
+            "status=403" in error_text
+            or "HTTP 403" in error_text
+            or "预授权被拦截" in error_text
+            or "访问首页失败" in error_text
+        ):
+            proxy_pool.report_homepage_fail(
+                proxy_url,
+                error_message=error_text,
+                status_code=403 if ("403" in error_text or "访问首页失败" in error_text or "预授权被拦截" in error_text) else 0,
+            )
+    except Exception:
+        pass
+
+
+def _report_custom_email_proxy_success(proxy_pool: Any, proxy_url: str) -> None:
+    if proxy_pool is None or not proxy_url:
+        return
+    try:
+        proxy_pool.report_success(proxy_url)
+    except Exception:
+        pass
+
+
+def _is_custom_email_proxy_error(result: dict[str, Any] | None, error_text: str) -> bool:
+    from core.proxy_utils import is_proxy_error_text
+
+    payload: dict[str, Any] = {}
+    data = result.get("data") if isinstance(result, dict) and isinstance(result.get("data"), dict) else {}
+    if isinstance(data.get("custom_email_recheck"), dict):
+        payload = data.get("custom_email_recheck") or {}
+    status = str(payload.get("status") or data.get("error_code") or "").strip()
+    if status in {"email_otp_timeout", "otp_rate_limited", "password_invalid", "account_deactivated", "login_blocked"}:
+        return False
+    return is_proxy_error_text(error_text)
+
+
+def enqueue_custom_email_recheck_task(
+    req: CustomEmailRecheckTaskRequest,
+    *,
+    background_tasks: BackgroundTasks | None = None,
+) -> str:
+    from services.chatgpt_core.custom_email_recheck import recheck_custom_chatgpt_email
+
+    email = str(req.email or "").strip()
+    if not email:
+        raise HTTPException(400, "邮箱地址不能为空")
+
+    proxy_settings = _custom_email_proxy_settings(req)
+    task_id = f"task_{int(time.time() * 1000)}"
+    source = "custom_email_recheck"
+    meta = {
+        "email": email,
+        "save_on_success": bool(req.save_on_success),
+        "proxy": _custom_email_proxy_meta(proxy_settings),
+    }
+    _create_standalone_task_record(
+        task_id,
+        platform="chatgpt",
+        source=source,
+        total=1,
+        meta=meta,
+    )
+    _save_task_log(
+        "chatgpt",
+        email,
+        "running",
+        detail=_build_task_log_detail(
+            task_id,
+            {
+                "email": email,
+                "attempt_outcome": "task_created",
+                "source": source,
+                "meta": meta,
+            },
+        ),
+    )
+
+    def _runner():
+        _run_custom_email_recheck(
+            task_id,
+            email,
+            str(req.password or ""),
+            bool(req.save_on_success),
+            proxy_settings=proxy_settings,
+        )
+
+    if background_tasks is None:
+        thread = threading.Thread(target=_runner, daemon=True)
+        thread.start()
+    else:
+        background_tasks.add_task(_runner)
+    return task_id
+
+
+def _normalize_custom_email_source_format(value: Any) -> str:
+    normalized = str(value or "email_list").strip().lower()
+    if normalized in {"", "email_list", "sub2api_json"}:
+        return normalized or "email_list"
+    raise HTTPException(400, f"不支持的邮箱导入格式: {value}")
+
+
+def _extract_sub2api_account_items(payload: Any) -> list[Any]:
+    if isinstance(payload, list):
+        return payload
+    if not isinstance(payload, dict):
+        return []
+
+    data = payload.get("data")
+    candidate_lists = [
+        payload.get("accounts"),
+        payload.get("items"),
+        data if isinstance(data, list) else None,
+        data.get("accounts") if isinstance(data, dict) else None,
+        data.get("items") if isinstance(data, dict) else None,
+    ]
+    for candidate in candidate_lists:
+        if isinstance(candidate, list):
+            return candidate
+    if any(key in payload for key in ("credentials", "extra", "name", "email")):
+        return [payload]
+    return []
+
+
+def _sub2api_email_candidates(item: dict[str, Any]) -> list[str]:
+    extra = item.get("extra") if isinstance(item.get("extra"), dict) else {}
+    credentials = item.get("credentials") if isinstance(item.get("credentials"), dict) else {}
+    candidates = [
+        extra.get("email"),
+        item.get("email"),
+        item.get("name"),
+        credentials.get("email"),
+        credentials.get("username"),
+        credentials.get("login"),
+        credentials.get("account"),
+    ]
+    values: list[str] = []
+    for candidate in candidates:
+        text = str(candidate or "").strip().lower()
+        if text:
+            values.append(text)
+    return values
+
+
+def _parse_sub2api_email_batch(req: BatchCustomEmailRecheckTaskRequest) -> tuple[list[str], list[dict[str, Any]], dict[str, Any]]:
+    source_text = str(req.source_text or "")
+    if not source_text.strip():
+        raise HTTPException(400, "请先导入 Sub2API JSON 文件")
+    source_size = len(source_text.encode("utf-8"))
+    if source_size > 5 * 1024 * 1024:
+        raise HTTPException(400, "Sub2API 文件过大，请控制在 5MB 内")
+
+    try:
+        payload = json.loads(source_text)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(400, f"Sub2API 文件不是合法 JSON（第 {exc.lineno} 行，第 {exc.colno} 列）") from exc
+
+    account_items = _extract_sub2api_account_items(payload)
+    if not account_items:
+        raise HTTPException(400, "未在 Sub2API 文件中找到 accounts 列表")
+
+    raw_items: list[str] = []
+    skipped: list[dict[str, Any]] = []
+    for index, item in enumerate(account_items, start=1):
+        if not isinstance(item, dict):
+            skipped.append({"email": f"[第{index}条]", "reason": "条目不是对象"})
+            continue
+        email_value = ""
+        for candidate in _sub2api_email_candidates(item):
+            if candidate:
+                email_value = candidate
+                break
+        if not email_value:
+            skipped.append({"email": f"[第{index}条]", "reason": "未找到邮箱字段"})
+            continue
+        raw_items.append(email_value)
+
+    return raw_items, skipped, {
+        "format": "sub2api_json",
+        "account_count": len(account_items),
+        "source_filename": str(req.source_filename or "").strip(),
+        "source_size_bytes": source_size,
+    }
+
+
+def _normalize_custom_email_batch(req: BatchCustomEmailRecheckTaskRequest) -> tuple[list[str], list[dict[str, Any]], dict[str, Any]]:
+    source_format = _normalize_custom_email_source_format(getattr(req, "source_format", "email_list"))
+    raw_items: list[str] = []
+    skipped: list[dict[str, Any]] = []
+    source_summary: dict[str, Any] = {"format": source_format}
+
+    if source_format == "sub2api_json":
+        raw_items, skipped, source_summary = _parse_sub2api_email_batch(req)
+    else:
+        raw_text = str(req.raw_emails or "")
+        if raw_text:
+            raw_items.extend(re.split(r"[\s,;，；]+", raw_text))
+        raw_items.extend(str(item or "") for item in (req.emails or []))
+
+    emails: list[str] = []
+    seen: set[str] = set()
+    email_pattern = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+    for raw in raw_items:
+        value = str(raw or "").strip().lower()
+        if not value:
+            continue
+        if not email_pattern.match(value):
+            skipped.append({"email": value, "reason": "邮箱格式不合法"})
+            continue
+        if value in seen:
+            skipped.append({"email": value, "reason": "重复邮箱"})
+            continue
+        seen.add(value)
+        emails.append(value)
+
+    limit = int(req.limit or 0)
+    if limit <= 0:
+        limit = 200
+    if limit > 500:
+        limit = 500
+    if len(emails) > limit:
+        overflow = emails[limit:]
+        emails = emails[:limit]
+        skipped.extend({"email": email, "reason": f"超过本次限制 limit={limit}"} for email in overflow)
+
+    source_summary["email_count"] = len(emails)
+    source_summary["skipped_count"] = len(skipped)
+    if source_format == "sub2api_json" and not emails:
+        raise HTTPException(400, "Sub2API 文件里没有解析到可用于测活的邮箱")
+
+    return emails, skipped, source_summary
+
+
+def enqueue_batch_custom_email_recheck_task(
+    req: BatchCustomEmailRecheckTaskRequest,
+    *,
+    background_tasks: BackgroundTasks | None = None,
+) -> dict[str, Any]:
+    emails, skipped_items, source_summary = _normalize_custom_email_batch(req)
+    if not emails:
+        raise HTTPException(400, "请输入至少一个合法邮箱")
+
+    proxy_settings = _custom_email_proxy_settings(req)
+    account_delay_seconds = _custom_email_account_delay_seconds(getattr(req, "account_delay_seconds", 0))
+    task_id = f"task_{int(time.time() * 1000)}"
+    source = "batch_custom_email_recheck"
+    source_format = _normalize_custom_email_source_format(getattr(req, "source_format", "email_list"))
+    source_filename = str(getattr(req, "source_filename", "") or "").strip()
+    meta = {
+        "email": emails[0],
+        "emails": emails,
+        "email_count": len(emails),
+        "save_on_success": bool(req.save_on_success),
+        "skipped_items": skipped_items,
+        "source_format": source_format,
+        "source_filename": source_filename,
+        "source_summary": source_summary,
+        "proxy": _custom_email_proxy_meta(proxy_settings),
+        "account_delay_seconds": account_delay_seconds,
+    }
+    _create_standalone_task_record(
+        task_id,
+        platform="chatgpt",
+        source=source,
+        total=len(emails),
+        meta=meta,
+    )
+    _save_task_log(
+        "chatgpt",
+        emails[0],
+        "running",
+        detail=_build_task_log_detail(
+            task_id,
+            {
+                "email": emails[0],
+                "attempt_outcome": "task_created",
+                "source": source,
+                "meta": meta,
+            },
+        ),
+    )
+
+    def _runner():
+        _run_batch_custom_email_recheck(
+            task_id,
+            emails,
+            str(req.password or ""),
+            bool(req.save_on_success),
+            proxy_settings=proxy_settings,
+            account_delay_seconds=account_delay_seconds,
+        )
+
+    if background_tasks is None:
+        thread = threading.Thread(target=_runner, daemon=True)
+        thread.start()
+    else:
+        background_tasks.add_task(_runner)
+
+    return {
+        "task_id": task_id,
+        "total_requested": len(emails) + len(skipped_items),
+        "eligible": len(emails),
+        "skipped": len(skipped_items),
+        "items": emails,
+        "skipped_items": skipped_items,
+        "source_format": source_format,
+        "source_filename": source_filename,
+        "source_summary": source_summary,
+        "account_delay_seconds": account_delay_seconds,
+    }
+
+
+ICLOUD_HME_RECHECK_DEAD_RESULT_CODES = {
+    "account_deleted",
+    "account_deactivated",
+}
+ICLOUD_HME_RECHECK_RETRY_RESULT_CODES = {
+    "email_otp_timeout",
+    "network_failed",
+    "proxy_error",
+    "rate_limited",
+    "login_blocked",
+    "unknown_error",
+    "failed",
+}
+
+
+def _is_icloud_hme_delete_candidate_result(result_code: Any, message: Any = "") -> bool:
+    code = str(result_code or "").strip().lower()
+    if code in ICLOUD_HME_RECHECK_DEAD_RESULT_CODES:
+        return True
+    from services.chatgpt_account_state import is_account_deactivated_message
+
+    return is_account_deactivated_message(code, message)
+
+
+def _classify_icloud_hme_recheck_failure(result_code: Any, message: Any = "") -> tuple[str, bool, str]:
+    code = str(result_code or "").strip().lower() or "unknown_error"
+    text = str(message or "").strip()
+    if _is_icloud_hme_delete_candidate_result(code, text):
+        return "delete_candidate", True, code if code in ICLOUD_HME_RECHECK_DEAD_RESULT_CODES else "account_deactivated"
+    if code in ICLOUD_HME_RECHECK_RETRY_RESULT_CODES:
+        return "retry", False, code
+    if code == "password_invalid":
+        # 密码错不等于账号被删；复测阶段只记录，不交给 Apple 删除模块。
+        return "dead_kept", False, code
+    return "retry", False, code
+
+
+def _mark_icloud_hme_recheck_accounts_invalid(
+    account_ids: list[int],
+    *,
+    result_code: str,
+    message: str,
+    task_id: str,
+) -> None:
+    normalized_ids = sorted({int(value or 0) for value in account_ids if int(value or 0) > 0})
+    if not normalized_ids:
+        return
+    from datetime import datetime, timezone
+
+    now_text = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    with Session(engine) as session:
+        rows = session.exec(
+            select(AccountModel)
+            .where(AccountModel.platform == "chatgpt")
+            .where(AccountModel.id.in_(normalized_ids))
+        ).all()
+        for row in rows:
+            try:
+                extra = row.get_extra()
+            except Exception:
+                extra = {}
+            if not isinstance(extra, dict):
+                extra = {}
+            extra["chatgpt_hme_recheck_delete_candidate"] = {
+                "result_code": str(result_code or "").strip(),
+                "message": str(message or "").strip()[:1000],
+                "task_id": str(task_id or "").strip(),
+                "marked_at": now_text,
+                "delete_mode": "mark_only",
+            }
+            capabilities = extra.get("chatgpt_capabilities") if isinstance(extra.get("chatgpt_capabilities"), dict) else {}
+            capabilities = dict(capabilities or {})
+            capabilities["auth_level"] = "invalid"
+            capabilities["upload_gate"] = "blocked_auth_invalid"
+            extra["chatgpt_capabilities"] = capabilities
+            row.status = "invalid"
+            row.set_extra(extra)
+            row.updated_at = datetime.now(timezone.utc)
+            session.add(row)
+        session.commit()
+
+
+def enqueue_icloud_hme_recheck_batch_task(
+    req: IcloudHmeRecheckBatchTaskRequest,
+    *,
+    background_tasks: BackgroundTasks | None = None,
+) -> dict[str, Any]:
+    from core.db import claim_icloud_hme_recheck_items, get_icloud_hme_recheck_campaign
+
+    campaign_id = str(req.campaign_id or "").strip()
+    if not campaign_id:
+        latest = get_icloud_hme_recheck_campaign("", size=1)
+        campaign_id = str(latest.get("campaign_id") or "").strip()
+    if not campaign_id:
+        raise HTTPException(400, "请先创建 iCloud HME 复测批次")
+
+    limit = max(1, min(int(req.limit or 20), 200))
+    task_id = f"task_{int(time.time() * 1000)}"
+    claimed_items = claim_icloud_hme_recheck_items(
+        campaign_id,
+        limit=limit,
+        include_retry=bool(req.include_retry),
+        task_id=task_id,
+    )
+    if not claimed_items:
+        return {
+            "task_id": "",
+            "campaign_id": campaign_id,
+            "eligible": 0,
+            "items": [],
+            "message": "没有待复测邮箱",
+        }
+
+    proxy_settings = _custom_email_proxy_settings(req)
+    account_delay_seconds = _custom_email_account_delay_seconds(getattr(req, "account_delay_seconds", 0))
+    source = "icloud_hme_recheck_batch"
+    meta = {
+        "source": source,
+        "campaign_id": campaign_id,
+        "item_count": len(claimed_items),
+        "limit": limit,
+        "include_retry": bool(req.include_retry),
+        "save_on_success": bool(req.save_on_success),
+        "items": claimed_items,
+        "emails": [str(item.get("hme") or "") for item in claimed_items],
+        "proxy": _custom_email_proxy_meta(proxy_settings),
+        "account_delay_seconds": account_delay_seconds,
+        "delete_mode": "mark_only",
+    }
+    _create_standalone_task_record(
+        task_id,
+        platform="chatgpt",
+        source=source,
+        total=len(claimed_items),
+        meta=meta,
+    )
+    primary_email = str(claimed_items[0].get("hme") or "")
+    _save_task_log(
+        "chatgpt",
+        primary_email,
+        "running",
+        detail=_build_task_log_detail(
+            task_id,
+            {
+                "email": primary_email,
+                "attempt_outcome": "task_created",
+                "source": source,
+                "meta": meta,
+            },
+        ),
+    )
+
+    def _runner():
+        _run_icloud_hme_recheck_batch(
+            task_id,
+            campaign_id,
+            claimed_items,
+            bool(req.save_on_success),
+            proxy_settings=proxy_settings,
+            account_delay_seconds=account_delay_seconds,
+        )
+
+    if background_tasks is None:
+        thread = threading.Thread(target=_runner, daemon=True)
+        thread.start()
+    else:
+        background_tasks.add_task(_runner)
+
+    return {
+        "task_id": task_id,
+        "campaign_id": campaign_id,
+        "eligible": len(claimed_items),
+        "items": claimed_items,
+        "account_delay_seconds": account_delay_seconds,
+    }
+
+
+def _run_icloud_hme_recheck_batch(
+    task_id: str,
+    campaign_id: str,
+    items: list[dict[str, Any]],
+    save_on_success: bool,
+    *,
+    proxy_settings: dict[str, Any] | None = None,
+    account_delay_seconds: float = 0,
+):
+    from services.chatgpt_core.custom_email_recheck import recheck_custom_chatgpt_email
+    from core.db import update_icloud_hme_recheck_item
+
+    control = _task_store.control_for(task_id)
+    total = max(len(items), 1)
+    success_count = 0
+    delete_candidate_count = 0
+    retry_count = 0
+    failed_count = 0
+    skipped_count = 0
+    errors: list[str] = []
+    results: list[dict[str, Any]] = []
+    account_delay_seconds = _custom_email_account_delay_seconds(account_delay_seconds)
+    primary_email = str(items[0].get("hme") or "") if items else ""
+
+    def task_log(message: str) -> None:
+        control.checkpoint(consume_skip=False)
+        _log(task_id, message)
+
+    def wait_before_next(index: int) -> None:
+        if index >= total or account_delay_seconds <= 0:
+            return
+        _task_store.update_meta(task_id, {"delay_before_next_seconds": account_delay_seconds, "delay_after_index": index})
+        _log(task_id, f"[HME复测] 等待 {account_delay_seconds:g}s 后开始下一个邮箱")
+        remaining = float(account_delay_seconds)
+        try:
+            while remaining > 0:
+                control.checkpoint(consume_skip=False)
+                chunk = min(1.0, remaining)
+                time.sleep(chunk)
+                remaining -= chunk
+        finally:
+            _task_store.update_meta(task_id, {"delay_before_next_seconds": 0, "delay_after_index": 0})
+
+    _task_store.mark_running(task_id)
+    _task_store.set_progress(task_id, f"0/{total}")
+    try:
+        for index, item in enumerate(items, start=1):
+            control.checkpoint(consume_skip=False)
+            item_id = int(item.get("id") or 0)
+            email = str(item.get("hme") or "").strip()
+            anonymous_id = str(item.get("anonymous_id") or "").strip()
+            preferred_account_id = int(item.get("account_id") or 0)
+            account_ids = [int(value or 0) for value in ((item.get("details") or {}).get("matched_account_ids") or []) if int(value or 0) > 0]
+            if preferred_account_id > 0 and preferred_account_id not in account_ids:
+                account_ids.append(preferred_account_id)
+            _task_store.update_meta(task_id, {"current_email": email, "current_index": index, "results": results})
+            if not item_id or not email:
+                skipped_count += 1
+                results.append({"email": email, "ok": False, "status": "skipped", "message": "队列项缺少 id/email"})
+                continue
+
+            attempt_id = control.start_attempt()
+            try:
+                control.checkpoint(attempt_id=attempt_id)
+                _log(task_id, f"[HME复测] -------- {index}/{total} | {email} --------")
+                candidate_proxies = _build_custom_email_recheck_candidate_proxies(proxy_settings)
+                last_proxy_error = ""
+                final_error = ""
+                result: dict[str, Any] = {}
+                data: dict[str, Any] = {}
+                payload: dict[str, Any] = {}
+                for proxy_index, (candidate_proxy, candidate_proxy_pool, candidate_proxy_source) in enumerate(candidate_proxies, start=1):
+                    _log_custom_email_proxy_choice(task_id, candidate_proxy, candidate_proxy_source, proxy_index, len(candidate_proxies))
+                    try:
+                        result = recheck_custom_chatgpt_email(
+                            email=email,
+                            password="",
+                            save_on_success=save_on_success,
+                            task_id=task_id,
+                            log_fn=task_log,
+                            stop_checker=lambda: control.checkpoint(attempt_id=attempt_id),
+                            task_control=control,
+                            attempt_id=attempt_id,
+                            proxy_url=candidate_proxy or None,
+                            preferred_account_id=preferred_account_id,
+                            finalize_mailbox=False,
+                        )
+                        data = result.get("data") if isinstance(result.get("data"), dict) else {}
+                        payload = data.get("custom_email_recheck") if isinstance(data.get("custom_email_recheck"), dict) else {}
+                        if not bool(result.get("ok")):
+                            error_text = str(result.get("error") or data.get("message") or payload.get("message") or "HME复测失败")
+                            if _is_custom_email_proxy_error(result, error_text) and proxy_index < len(candidate_proxies):
+                                last_proxy_error = error_text
+                                _report_custom_email_proxy_fail(candidate_proxy_pool, candidate_proxy, error_text)
+                                _log(task_id, f"[代理] 当前代理失败，保留当前邮箱重试下一个代理: {error_text[:180]}")
+                                continue
+                            if _is_custom_email_proxy_error(result, error_text):
+                                _report_custom_email_proxy_fail(candidate_proxy_pool, candidate_proxy, error_text)
+                            final_error = error_text
+                            break
+                        _report_custom_email_proxy_success(candidate_proxy_pool, candidate_proxy)
+                        break
+                    except (SkipCurrentAttemptRequested, StopTaskRequested, TaskInterruption):
+                        raise
+                    except Exception as proxy_exc:
+                        error_text = str(proxy_exc or "HME复测失败")
+                        if _is_custom_email_proxy_error(None, error_text) and proxy_index < len(candidate_proxies):
+                            last_proxy_error = error_text
+                            _report_custom_email_proxy_fail(candidate_proxy_pool, candidate_proxy, error_text)
+                            _log(task_id, f"[代理] 当前代理异常，保留当前邮箱重试下一个代理: {error_text[:180]}")
+                            continue
+                        if _is_custom_email_proxy_error(None, error_text):
+                            _report_custom_email_proxy_fail(candidate_proxy_pool, candidate_proxy, error_text)
+                        raise
+
+                if final_error:
+                    result = {"ok": False, "error": final_error, "data": data}
+                elif not bool(result.get("ok")):
+                    raise RuntimeError(last_proxy_error or "所有代理尝试失败")
+
+                saved_account_id = int(data.get("saved_account_id") or payload.get("saved_account_id") or 0)
+                if bool(result.get("ok")):
+                    success_count += 1
+                    result_code = str(payload.get("status") or "login_alive").strip() or "login_alive"
+                    result_message = str((payload.get("message") or ("账号可登录，已保存 access_token" if save_on_success else "账号可登录"))).strip()
+                    token_saved = bool(data.get("token_saved") or payload.get("saved") or saved_account_id)
+                    update_icloud_hme_recheck_item(
+                        item_id,
+                        status="alive",
+                        result_code=result_code,
+                        result_message=result_message,
+                        saved_account_id=saved_account_id,
+                        access_token_saved=token_saved,
+                        delete_candidate=False,
+                        delete_candidate_reason="",
+                        last_task_id=task_id,
+                        last_error="",
+                        details={"anonymous_id": anonymous_id, "result": payload, "raw_ok": True},
+                    )
+                    results.append({"email": email, "ok": True, "status": "alive", "saved_account_id": saved_account_id, "access_token_saved": token_saved, "result": payload})
+                    _log(task_id, f"[OK] HME复测存活: {email} saved_account_id={saved_account_id or '-'}")
+                else:
+                    error_text = str(result.get("error") or data.get("message") or payload.get("message") or final_error or "HME复测失败")
+                    raw_code = str(data.get("error_code") or payload.get("status") or "failed").strip()
+                    next_status, delete_candidate, result_code = _classify_icloud_hme_recheck_failure(raw_code, error_text)
+                    if delete_candidate:
+                        delete_candidate_count += 1
+                        _mark_icloud_hme_recheck_accounts_invalid(account_ids, result_code=result_code, message=error_text, task_id=task_id)
+                    elif next_status == "retry":
+                        retry_count += 1
+                    else:
+                        failed_count += 1
+                    if next_status in {"retry", "failed"}:
+                        errors.append(f"{email}: {error_text}")
+                    update_icloud_hme_recheck_item(
+                        item_id,
+                        status=next_status,
+                        result_code=result_code,
+                        result_message=error_text,
+                        saved_account_id=0,
+                        access_token_saved=False,
+                        delete_candidate=delete_candidate,
+                        delete_candidate_reason=("account_deleted_or_deactivated" if delete_candidate else ""),
+                        last_task_id=task_id,
+                        last_error=error_text,
+                        details={"anonymous_id": anonymous_id, "result": payload, "raw_ok": False, "account_ids": account_ids},
+                    )
+                    results.append({"email": email, "ok": False, "status": next_status, "result_code": result_code, "delete_candidate": delete_candidate, "message": error_text, "result": payload})
+                    if delete_candidate:
+                        _log(task_id, f"[MARK] HME复测确认账号删除/停用，仅标记待删除，不调用 Apple: {email}")
+                    else:
+                        _log(task_id, f"[FAIL] HME复测未通过: {email} - {error_text}")
+            except SkipCurrentAttemptRequested as exc:
+                skipped_count += 1
+                update_icloud_hme_recheck_item(
+                    item_id,
+                    status="skipped",
+                    result_code="skipped",
+                    result_message=str(exc),
+                    last_task_id=task_id,
+                    last_error=str(exc),
+                    details={"anonymous_id": anonymous_id},
+                )
+                results.append({"email": email, "ok": False, "status": "skipped", "message": str(exc)})
+                _log(task_id, f"[SKIP] 已跳过 HME复测: {email} - {exc}")
+            except StopTaskRequested:
+                raise
+            except Exception as exc:
+                error_text = str(exc or "HME复测异常")
+                retry_count += 1
+                errors.append(f"{email}: {error_text}")
+                update_icloud_hme_recheck_item(
+                    item_id,
+                    status="retry",
+                    result_code="exception",
+                    result_message=error_text,
+                    last_task_id=task_id,
+                    last_error=error_text,
+                    details={"anonymous_id": anonymous_id},
+                )
+                results.append({"email": email, "ok": False, "status": "retry", "message": error_text})
+                _log(task_id, f"[FAIL] HME复测异常: {email} - {error_text}")
+            finally:
+                control.finish_attempt(attempt_id)
+                _task_store.set_progress(task_id, f"{index}/{total}")
+                _task_store.update_meta(task_id, {"current_email": email, "current_index": index, "results": results})
+            wait_before_next(index)
+
+        summary_message = (
+            f"HME复测完成: 存活 {success_count} 个，待删除标记 {delete_candidate_count} 个，"
+            f"待重试 {retry_count} 个，跳过 {skipped_count} 个"
+        )
+        _log(task_id, f"[SUMMARY] {summary_message}")
+        _save_task_log(
+            "chatgpt",
+            primary_email,
+            "success" if not errors else "failed",
+            error="" if not errors else summary_message,
+            detail=_build_task_log_detail(
+                task_id,
+                {
+                    "email": primary_email,
+                    "attempt_outcome": "icloud_hme_recheck_batch_done",
+                    "source": "icloud_hme_recheck_batch",
+                    "meta": {
+                        "campaign_id": campaign_id,
+                        "runtime_success": success_count,
+                        "runtime_delete_candidates": delete_candidate_count,
+                        "runtime_retry": retry_count,
+                        "runtime_failed": failed_count,
+                        "runtime_skipped": skipped_count,
+                        "runtime_errors": errors,
+                        "results": results,
+                        "delete_mode": "mark_only",
+                    },
+                },
+            ),
+        )
+        _task_store.update_meta(task_id, {"current_email": "", "current_index": total, "results": results, "summary": {"alive": success_count, "delete_candidate": delete_candidate_count, "retry": retry_count, "skipped": skipped_count}})
+        _task_store.finish(task_id, status="done", success=success_count, skipped=skipped_count, errors=errors, error="" if not errors else summary_message)
+    except StopTaskRequested as exc:
+        _log(task_id, f"[STOP] {exc}")
+        _save_task_log(
+            "chatgpt",
+            primary_email,
+            "stopped",
+            error=str(exc),
+            detail=_build_task_log_detail(task_id, {"email": primary_email, "attempt_outcome": "icloud_hme_recheck_batch_stopped", "source": "icloud_hme_recheck_batch", "meta": {"campaign_id": campaign_id, "results": results}}),
+        )
+        _task_store.finish(task_id, status="stopped", success=success_count, skipped=skipped_count, errors=errors, error=str(exc))
+    except Exception as exc:
+        error_text = str(exc or "HME复测任务失败")
+        _log(task_id, f"[FAIL] HME复测任务失败: {error_text}")
+        _save_task_log(
+            "chatgpt",
+            primary_email,
+            "failed",
+            error=error_text,
+            detail=_build_task_log_detail(task_id, {"email": primary_email, "attempt_outcome": "icloud_hme_recheck_batch_failed", "source": "icloud_hme_recheck_batch", "meta": {"campaign_id": campaign_id, "results": results}}),
+        )
+        _task_store.finish(task_id, status="failed", success=success_count, skipped=skipped_count, errors=errors or [error_text], error=error_text)
+    finally:
+        _task_store.cleanup()
+
+
 def enqueue_invalid_recheck_task(
     account_id: int,
     *,
@@ -936,7 +2562,8 @@ def enqueue_batch_resume_subscription_auth_task(
     *,
     background_tasks: BackgroundTasks | None = None,
 ) -> dict[str, Any]:
-    resolved_allow_phone_verification = _resolve_resume_auth_allow_phone_verification(req.allow_phone_verification)
+    resolved_modes = _resolve_resume_auth_phone_modes(req.allow_phone_verification)
+    resolved_allow_phone_verification = resolved_modes["allow_phone_verification"]
     eligible_accounts, missing_ids, skipped_accounts, matched_accounts = _resolve_batch_resume_auth_accounts(req)
     total_requested = len(_normalize_batch_account_ids(req.account_ids)) if req.account_ids else len(matched_accounts)
 
@@ -949,6 +2576,8 @@ def enqueue_batch_resume_subscription_auth_task(
             "skipped": len(skipped_accounts),
             "missing": len(missing_ids),
             "allow_phone_verification": resolved_allow_phone_verification,
+            "allow_add_phone_verification": resolved_modes["allow_add_phone_verification"],
+            "allow_existing_phone_verification": resolved_modes["allow_existing_phone_verification"],
             "items": [],
             "skipped_items": skipped_accounts,
             "missing_ids": missing_ids,
@@ -969,6 +2598,8 @@ def enqueue_batch_resume_subscription_auth_task(
             "email": str(req.email or ""),
         },
         "allow_phone_verification": resolved_allow_phone_verification,
+        "allow_add_phone_verification": resolved_modes["allow_add_phone_verification"],
+        "allow_existing_phone_verification": resolved_modes["allow_existing_phone_verification"],
         "skipped_items": list(skipped_accounts),
     }
     _create_standalone_task_record(
@@ -1019,6 +2650,8 @@ def enqueue_batch_resume_subscription_auth_task(
         "skipped": len(skipped_accounts),
         "missing": len(missing_ids),
         "allow_phone_verification": resolved_allow_phone_verification,
+        "allow_add_phone_verification": resolved_modes["allow_add_phone_verification"],
+        "allow_existing_phone_verification": resolved_modes["allow_existing_phone_verification"],
         "items": eligible_accounts,
         "skipped_items": skipped_accounts,
         "missing_ids": missing_ids,
@@ -1030,16 +2663,186 @@ def enqueue_phone_binding_test_task(
     *,
     background_tasks: BackgroundTasks | None = None,
 ) -> dict[str, Any]:
-    from services.chatgpt_core.phone_service import parse_uploaded_phone_lines
-
-    phone_entries, parse_errors = parse_uploaded_phone_lines(req.phone_lines)
-    if not phone_entries:
-        raise HTTPException(400, "请至少提供一条有效的 手机号----收码API")
-    if len(phone_entries) > 1000:
-        raise HTTPException(400, "单次最多上传 1000 个手机号")
+    manual_phone_lines = str(req.phone_lines or "").strip()
+    # 手动粘贴的号码/API 优先于默认号池开关，避免用户粘贴后仍误用空号池。
+    prefix_bind_enabled = bool(req.prefix_bind_enabled) and not manual_phone_lines
+    prefix_sample_enabled = bool(req.prefix_sample_enabled) and not manual_phone_lines and not prefix_bind_enabled
+    try:
+        prefix_sample_size = int(req.prefix_sample_size or 1)
+    except (TypeError, ValueError):
+        prefix_sample_size = 1
+    if prefix_sample_size not in {1, 2}:
+        raise HTTPException(400, "每个号段只能抽取 1 个或 2 个号码")
+    prefix_sample_filter = str(req.prefix_sample_filter or "all").strip().lower()
+    if prefix_sample_filter in {"available", "available_only", "healthy", "healthy_only"}:
+        prefix_sample_filter = "available"
+    elif prefix_sample_filter in {"unavailable", "unavailable_only", "rejected", "rejected_only"}:
+        prefix_sample_filter = "rejected"
+    elif prefix_sample_filter not in {"all", ""}:
+        raise HTTPException(400, "号段抽样范围只能是 all、available 或 rejected")
+    else:
+        prefix_sample_filter = "all"
+    selected_prefixes: list[str] = []
+    seen_selected_prefixes: set[str] = set()
+    for raw_prefix in req.selected_prefixes or []:
+        prefix = "".join(ch for ch in str(raw_prefix or "") if ch.isdigit())[:4]
+        if len(prefix) != 4:
+            continue
+        if prefix in seen_selected_prefixes:
+            continue
+        seen_selected_prefixes.add(prefix)
+        selected_prefixes.append(prefix)
+    if len(selected_prefixes) > 500:
+        raise HTTPException(400, "单次最多指定 500 个号段")
+    requested_prefixes = list(selected_prefixes)
+    prefix_sms_probe_only = bool(req.prefix_sms_probe_only or req.sms_probe_only)
+    pool_source = (bool(req.use_pool) or prefix_sample_enabled or prefix_bind_enabled) and not manual_phone_lines
+    use_pool = pool_source and not prefix_sample_enabled
+    reuse_phone_until_unusable = bool(req.reuse_phone_until_unusable) and not prefix_sample_enabled and not prefix_sms_probe_only
+    phone_entries: list[dict[str, Any]] = []
+    parse_errors: list[dict[str, Any]] = []
+    phone_pool_import_summary = {"imported": 0, "existing": 0, "skipped": 0}
+    if not pool_source:
+        phone_entries, parse_errors = _parse_phone_binding_upload_lines(manual_phone_lines)
+        if not phone_entries:
+            raise HTTPException(400, "请至少提供一条有效的 手机号----收码API，或勾选使用手机号池")
+        if len(phone_entries) > 1000:
+            raise HTTPException(400, "单次最多上传 1000 个手机号")
+        # 手动粘贴行只作为本次任务运行输入。日志整改不能把这条路径悄悄变成
+        # phone_pool 写入路径，否则旧的纯手动绑定测试会额外依赖 phone_pool 表。
+        phone_pool_import_summary = {"imported": 0, "existing": 0, "skipped": 0}
+    safe_parse_errors = sanitize_task_detail(parse_errors)
 
     account_items, missing_ids, skipped_accounts, matched_accounts = _resolve_phone_binding_test_accounts(req)
     total_requested_accounts = len(_normalize_batch_account_ids(req.account_ids)) if req.account_ids else len(matched_accounts)
+
+    prefix_sample_meta: dict[str, Any] = {
+        "enabled": prefix_sample_enabled,
+        "sample_size": prefix_sample_size,
+        "prefix_count": 0,
+        "selected_phone_count": 0,
+        "selected_prefixes": [],
+        "selected_counts": {},
+        "filter": prefix_sample_filter,
+        "mode": "filter",
+        "requested_prefixes": requested_prefixes,
+        "sms_probe_only": prefix_sms_probe_only,
+    }
+    prefix_bind_meta: dict[str, Any] = {
+        "enabled": prefix_bind_enabled,
+        "selected_prefixes": requested_prefixes,
+        "prefix_count": len(requested_prefixes) if prefix_bind_enabled else 0,
+        "available_phone_count": 0,
+        "available_slot_count": 0,
+        "reuse_phone_until_unusable": reuse_phone_until_unusable,
+        "sms_probe_only": prefix_sms_probe_only,
+    }
+    prefix_bind_available_records: list[Any] = []
+    if prefix_sample_enabled:
+        from services.chatgpt_core.phone_pool_repository import PhonePoolRepository
+
+        pool_repo = PhonePoolRepository()
+        if requested_prefixes:
+            sampled_records = pool_repo.sample_selected_prefixes(requested_prefixes, prefix_sample_size)
+        elif prefix_sample_filter == "rejected":
+            sampled_records = pool_repo.sample_rejected_by_prefix(prefix_sample_size)
+        elif prefix_sample_filter == "available":
+            sampled_records = pool_repo.sample_available_by_prefix(prefix_sample_size)
+        else:
+            sampled_records = pool_repo.sample_testable_by_prefix(prefix_sample_size)
+        if account_items and sampled_records:
+            sampled_records = pool_repo.restore_prefix_sample_records(
+                [int(getattr(record, "id", 0) or 0) for record in sampled_records]
+            )
+        phone_items = pool_repo.to_phone_items(sampled_records)
+        selected_counts: dict[str, int] = {}
+        for item in phone_items:
+            item["prefix_sample"] = True
+            prefix = str(item.get("prefix4") or _phone_binding_prefix4(item.get("phone"))).strip()
+            item["prefix4"] = prefix
+            if prefix:
+                selected_counts[prefix] = selected_counts.get(prefix, 0) + 1
+        selected_prefixes = sorted(selected_counts)
+        prefix_sample_meta = {
+            "enabled": True,
+            "sample_size": prefix_sample_size,
+            "prefix_count": len(selected_prefixes),
+            "selected_phone_count": len(phone_items),
+            "selected_prefixes": selected_prefixes,
+            "selected_counts": selected_counts,
+            "filter": prefix_sample_filter,
+            "requested_prefixes": requested_prefixes,
+            "mode": "selected" if requested_prefixes else "filter",
+            "sms_probe_only": prefix_sms_probe_only,
+        }
+        phone_count = len(phone_items)
+        if account_items and not phone_items:
+            detail = (
+                f"指定号段没有可抽样号码：{','.join(requested_prefixes)}。请确认这些号段存在未停用、未绑满且带 API 的手机号。"
+                if requested_prefixes
+                else
+                "手机号池没有可用于复测的 OpenAI 拒绝号段。请先在手机号池确认存在 OpenAI 拒绝记录。"
+                if prefix_sample_filter == "rejected"
+                else "手机号池没有可测试的可用号段，请先启用/导入不含 OpenAI 拒绝记录的号码。"
+                if prefix_sample_filter == "available"
+                else "手机号池没有可用于号段抽样的号码（当前号码可能已停用、缺少 API 或已达到本地绑定容量）。请先在手机号池启用/导入可测试号码。"
+            )
+            raise HTTPException(
+                400,
+                detail,
+            )
+    elif prefix_bind_enabled:
+        from services.chatgpt_core.phone_pool_repository import PhonePoolRepository
+
+        if not requested_prefixes:
+            raise HTTPException(400, "限定号段绑定需要至少选择一个号段")
+        pool_repo = PhonePoolRepository()
+        prefix_bind_available_records = pool_repo.list_available_by_prefixes(requested_prefixes)
+        available_phone_count = len(prefix_bind_available_records)
+        available_slot_count = (
+            sum(max(int(getattr(record, "remaining_capacity", 0) or 0), 0) for record in prefix_bind_available_records)
+            if reuse_phone_until_unusable
+            else available_phone_count
+        )
+        prefix_bind_meta = {
+            "enabled": True,
+            "selected_prefixes": requested_prefixes,
+            "prefix_count": len(requested_prefixes),
+            "available_phone_count": available_phone_count,
+            "available_slot_count": available_slot_count,
+            "reuse_phone_until_unusable": reuse_phone_until_unusable,
+            "sms_probe_only": prefix_sms_probe_only,
+        }
+        phone_items = []
+        phone_count = available_phone_count
+        if account_items and available_phone_count <= 0:
+            raise HTTPException(
+                400,
+                f"指定号段没有可用绑定号码：{','.join(requested_prefixes)}。"
+                "请确认这些号段存在未停用、未绑满、带 API 且未被普通绑定策略跳过的手机号。",
+            )
+        if account_items and available_slot_count < len(account_items):
+            raise HTTPException(
+                400,
+                f"指定号段容量不足：{','.join(requested_prefixes)}，"
+                f"需要 {len(account_items)}，当前可用 {available_slot_count}。",
+            )
+    elif use_pool:
+        from services.chatgpt_core.phone_pool_repository import PhonePoolRepository
+
+        pool_repo = PhonePoolRepository()
+        available_records = pool_repo.list_available()
+        phone_items = []
+        phone_count = len(available_records)
+        if account_items and not available_records:
+            raise HTTPException(
+                400,
+                "手机号池没有可用号码（当前号码可能已不可发送、限流或耗尽）。"
+                "请在手机号池重置/导入可用号码，或在本弹窗手动粘贴 +手机号----收码API。",
+            )
+    else:
+        phone_items = list(phone_entries)
+        phone_count = len(phone_items)
 
     if not account_items:
         return {
@@ -1047,8 +2850,12 @@ def enqueue_phone_binding_test_task(
             "total_requested_accounts": total_requested_accounts,
             "matched_accounts": len(matched_accounts),
             "eligible_accounts": 0,
-            "phone_count": len(phone_entries),
-            "parse_errors": parse_errors,
+            "phone_count": phone_count,
+            "phone_pool_import": dict(phone_pool_import_summary),
+            "prefix_sample": dict(prefix_sample_meta),
+            "prefix_bind": dict(prefix_bind_meta),
+            "sms_probe_only": prefix_sms_probe_only,
+            "parse_errors": safe_parse_errors,
             "missing_ids": missing_ids,
             "items": [],
         }
@@ -1057,19 +2864,37 @@ def enqueue_phone_binding_test_task(
     source = "phone_binding_test"
     timeout_seconds = _parse_positive_int(req.timeout_seconds, 180)
     poll_interval_seconds = _parse_positive_int(req.poll_interval_seconds, 5)
-    max_resend_attempts = 0
-    resend_interval_seconds = 0
+    try:
+        max_resend_attempts = max(int(str(req.max_resend_attempts or 0).strip() or "0"), 0)
+    except (TypeError, ValueError):
+        max_resend_attempts = 0
+    resend_interval_seconds = _parse_positive_int(req.resend_interval_seconds, 30)
     account_interval_seconds = _parse_positive_int(req.account_interval_seconds, 60)
-    reuse_phone_until_unusable = bool(req.reuse_phone_until_unusable)
-    phone_items = [
-        {
-            "line_no": entry.line_no,
-            "phone": entry.phone,
-            "api_url": entry.api_url,
-            "raw_line": entry.raw_line,
-        }
-        for entry in phone_entries
-    ]
+    runtime_settings = {
+        "timeout_seconds": timeout_seconds,
+        "poll_interval_seconds": poll_interval_seconds,
+        "max_resend_attempts": max_resend_attempts,
+        "resend_interval_seconds": resend_interval_seconds,
+        "account_interval_seconds": account_interval_seconds,
+        "reuse_phone_until_unusable": reuse_phone_until_unusable,
+        "use_pool": use_pool,
+        "prefix_sample_enabled": prefix_sample_enabled,
+        "prefix_bind_enabled": prefix_bind_enabled,
+        "prefix_sample_size": prefix_sample_size,
+        "prefix_sample_filter": prefix_sample_filter,
+        "selected_prefixes": list(requested_prefixes),
+        "prefix_sms_probe_only": prefix_sms_probe_only,
+        "proxy": str(req.proxy or ""),
+        "proxy_mode": str(req.proxy_mode or "pool"),
+        "proxy_country_code": str(req.proxy_country_code or "").strip().upper(),
+        "proxy_failover": bool(req.proxy_failover),
+        "proxy_max_candidates": int(req.proxy_max_candidates or 0),
+        "proxy_min_score": float(req.proxy_min_score or 0),
+    }
+    display_settings = dict(runtime_settings)
+    display_settings["proxy"] = redact_proxy_url(runtime_settings.get("proxy"))
+    display_settings["proxy_redacted"] = display_settings["proxy"]
+    safe_phone_items = [sanitize_phone_item(item) for item in phone_items]
     meta = {
         "total_requested_accounts": total_requested_accounts,
         "matched_accounts": len(matched_accounts),
@@ -1077,21 +2902,30 @@ def enqueue_phone_binding_test_task(
         "missing_ids": list(missing_ids),
         "account_ids": [int(item["account_id"]) for item in account_items],
         "emails": [str(item["email"] or "") for item in account_items],
-        "phone_count": len(phone_entries),
-        "phone_items": phone_items,
-        "parse_errors": list(parse_errors),
+        "phone_count": phone_count,
+        "phone_items": safe_phone_items,
+        "phone_pool_dynamic": use_pool,
+        "phone_pool_source": pool_source,
+        "phone_pool_import": dict(phone_pool_import_summary),
+        "prefix_sample": dict(prefix_sample_meta),
+        "prefix_bind": dict(prefix_bind_meta),
+        "sms_probe_only": prefix_sms_probe_only,
+        "prefix_summary": _build_phone_prefix_sample_summary(phone_items, []),
+        "parse_errors": safe_parse_errors,
         "filter": {
             "all_filtered": bool(req.all_filtered),
             "status": str(req.status or ""),
             "email": str(req.email or ""),
         },
-        "settings": {
-            "timeout_seconds": timeout_seconds,
-            "poll_interval_seconds": poll_interval_seconds,
-            "max_resend_attempts": max_resend_attempts,
-            "resend_interval_seconds": resend_interval_seconds,
-            "account_interval_seconds": account_interval_seconds,
-            "reuse_phone_until_unusable": reuse_phone_until_unusable,
+        "settings": display_settings,
+        "proxy": {
+            "mode": str(req.proxy_mode or "pool"),
+            "country_code": str(req.proxy_country_code or "").strip().upper(),
+            "failover": bool(req.proxy_failover),
+            "max_candidates": int(req.proxy_max_candidates or 0),
+            "min_score": float(req.proxy_min_score or 0),
+            "specified": redact_proxy_url(req.proxy),
+            "specified_redacted": redact_proxy_url(req.proxy),
         },
         "runtime_results": [],
         "bound_phone_lines": [],
@@ -1101,7 +2935,7 @@ def enqueue_phone_binding_test_task(
         task_id,
         platform="chatgpt",
         source=source,
-        total=max(len(phone_entries), 1),
+        total=max(len(account_items) if use_pool else len(phone_items), 1),
         meta=meta,
     )
 
@@ -1125,7 +2959,7 @@ def enqueue_phone_binding_test_task(
     if background_tasks is None:
         thread = threading.Thread(
             target=_run_phone_binding_test,
-            args=(task_id, account_ids, phone_items, dict(meta["settings"])),
+            args=(task_id, account_ids, phone_items, dict(runtime_settings)),
             daemon=True,
         )
         thread.start()
@@ -1135,7 +2969,7 @@ def enqueue_phone_binding_test_task(
             task_id,
             account_ids,
             phone_items,
-            dict(meta["settings"]),
+            dict(runtime_settings),
         )
 
     return {
@@ -1143,11 +2977,580 @@ def enqueue_phone_binding_test_task(
         "total_requested_accounts": total_requested_accounts,
         "matched_accounts": len(matched_accounts),
         "eligible_accounts": len(account_items),
-        "phone_count": len(phone_entries),
-        "parse_errors": parse_errors,
+        "phone_count": phone_count,
+        "phone_pool_import": dict(phone_pool_import_summary),
+        "prefix_sample": dict(prefix_sample_meta),
+        "prefix_bind": dict(prefix_bind_meta),
+        "sms_probe_only": prefix_sms_probe_only,
+        "parse_errors": safe_parse_errors,
         "missing_ids": missing_ids,
         "items": account_items,
     }
+
+
+def enqueue_batch_sub2api_upload_task(
+    req: BatchSub2ApiUploadTaskRequest,
+    *,
+    background_tasks: BackgroundTasks | None = None,
+) -> dict[str, Any]:
+    eligible_accounts, missing_ids, skipped_accounts, matched_accounts = _resolve_batch_sub2api_upload_accounts(req)
+    total_requested = len(_normalize_batch_account_ids(req.account_ids)) if req.account_ids else len(matched_accounts)
+
+    if not eligible_accounts:
+        task_id = f"task_{int(time.time() * 1000)}"
+        source = "batch_sub2api_upload"
+        meta = {
+            "total_requested": total_requested,
+            "matched": len(matched_accounts),
+            "eligible": 0,
+            "missing_ids": list(missing_ids),
+            "account_ids": [],
+            "emails": [],
+            "filter": {
+                "all_filtered": bool(req.all_filtered),
+                "status": str(req.status or ""),
+                "email": str(req.email or ""),
+                "sub2api_state": str(req.sub2api_state or ""),
+            },
+            "params": dict(req.params or {}),
+            "limit": int(req.limit or 0),
+            "skipped_items": list(skipped_accounts),
+        }
+        _create_standalone_task_record(
+            task_id,
+            platform="chatgpt",
+            source=source,
+            total=1,
+            meta=meta,
+        )
+        _task_store.mark_running(task_id)
+        _task_store.set_progress(task_id, "0/0")
+        for missing_id in missing_ids:
+            _log(task_id, f"[MISS] 账号不存在: account_id={missing_id}")
+        for item in skipped_accounts:
+            _log(task_id, f"[SKIP] {item.get('email') or item.get('account_id') or '-'} - {item.get('reason') or '已跳过'}")
+        _log(task_id, "[SUMMARY] 没有可处理的 Sub2API 上传账号")
+        errors = [f"account_id={missing_id}: 账号不存在" for missing_id in missing_ids]
+        _task_store.finish(
+            task_id,
+            status="done",
+            success=0,
+            skipped=len(skipped_accounts),
+            errors=errors,
+        )
+        _save_task_log(
+            "chatgpt",
+            "",
+            "success" if not errors else "failed",
+            error="" if not errors else "部分账号不存在",
+            detail=_build_task_log_detail(
+                task_id,
+                {
+                    "email": "",
+                    "attempt_outcome": "batch_sub2api_upload_empty",
+                    "source": source,
+                    "meta": meta,
+                },
+            ),
+        )
+        return {
+            "task_id": task_id,
+            "total_requested": total_requested,
+            "matched": len(matched_accounts),
+            "eligible": 0,
+            "skipped": len(skipped_accounts),
+            "missing": len(missing_ids),
+            "items": [],
+            "skipped_items": skipped_accounts,
+            "missing_ids": missing_ids,
+        }
+
+    task_id = f"task_{int(time.time() * 1000)}"
+    source = "batch_sub2api_upload"
+    meta = {
+        "total_requested": total_requested,
+        "matched": len(matched_accounts),
+        "eligible": len(eligible_accounts),
+        "missing_ids": list(missing_ids),
+        "account_ids": [int(item["account_id"]) for item in eligible_accounts],
+        "emails": [str(item["email"] or "") for item in eligible_accounts],
+        "filter": {
+            "all_filtered": bool(req.all_filtered),
+            "status": str(req.status or ""),
+            "email": str(req.email or ""),
+            "sub2api_state": str(req.sub2api_state or ""),
+        },
+        "params": dict(req.params or {}),
+        "limit": int(req.limit or 0),
+        "skipped_items": list(skipped_accounts),
+    }
+    _create_standalone_task_record(
+        task_id,
+        platform="chatgpt",
+        source=source,
+        total=max(len(eligible_accounts), 1),
+        meta=meta,
+    )
+
+    primary_email = str(eligible_accounts[0]["email"] or "") if eligible_accounts else ""
+    _save_task_log(
+        "chatgpt",
+        primary_email,
+        "running",
+        detail=_build_task_log_detail(
+            task_id,
+            {
+                "email": primary_email,
+                "attempt_outcome": "task_created",
+                "source": source,
+                "meta": meta,
+            },
+        ),
+    )
+
+    account_ids = [int(item["account_id"]) for item in eligible_accounts]
+    if background_tasks is None:
+        thread = threading.Thread(
+            target=_run_batch_sub2api_upload,
+            args=(task_id, account_ids),
+            daemon=True,
+        )
+        thread.start()
+    else:
+        background_tasks.add_task(_run_batch_sub2api_upload, task_id, account_ids)
+
+    return {
+        "task_id": task_id,
+        "total_requested": total_requested,
+        "matched": len(matched_accounts),
+        "eligible": len(eligible_accounts),
+        "skipped": len(skipped_accounts),
+        "missing": len(missing_ids),
+        "items": eligible_accounts,
+        "skipped_items": skipped_accounts,
+        "missing_ids": missing_ids,
+    }
+
+
+def enqueue_batch_oaipay_upload_task(
+    req: BatchOaipayUploadTaskRequest,
+    *,
+    background_tasks: BackgroundTasks | None = None,
+) -> dict[str, Any]:
+    eligible_accounts, missing_ids, skipped_accounts, matched_accounts = _resolve_batch_oaipay_upload_accounts(req)
+    total_requested = len(_normalize_batch_account_ids(req.account_ids)) if req.account_ids else len(matched_accounts)
+
+    if not eligible_accounts:
+        task_id = f"task_{int(time.time() * 1000)}"
+        source = "batch_oaipay_upload"
+        meta = {
+            "total_requested": total_requested,
+            "matched": len(matched_accounts),
+            "eligible": 0,
+            "missing_ids": list(missing_ids),
+            "account_ids": [],
+            "emails": [],
+            "filter": {
+                "all_filtered": bool(req.all_filtered),
+                "status": str(req.status or ""),
+                "email": str(req.email or ""),
+                "oaipay_state": str(req.oaipay_state or ""),
+            },
+            "params": dict(req.params or {}),
+            "limit": int(req.limit or 0),
+            "skipped_items": list(skipped_accounts),
+        }
+        _create_standalone_task_record(
+            task_id,
+            platform="chatgpt",
+            source=source,
+            total=1,
+            meta=meta,
+        )
+        _task_store.mark_running(task_id)
+        _task_store.set_progress(task_id, "0/0")
+        for missing_id in missing_ids:
+            _log(task_id, f"[MISS] 账号不存在: account_id={missing_id}")
+        for item in skipped_accounts:
+            _log(task_id, f"[SKIP] {item.get('email') or item.get('account_id') or '-'} - {item.get('reason') or '已跳过'}")
+        _log(task_id, "[SUMMARY] 没有可处理的 OAIPay 上传账号")
+        errors = [f"account_id={missing_id}: 账号不存在" for missing_id in missing_ids]
+        _task_store.finish(
+            task_id,
+            status="done",
+            success=0,
+            skipped=len(skipped_accounts),
+            errors=errors,
+        )
+        _save_task_log(
+            "chatgpt",
+            "",
+            "success" if not errors else "failed",
+            error="" if not errors else "部分账号不存在",
+            detail=_build_task_log_detail(
+                task_id,
+                {
+                    "email": "",
+                    "attempt_outcome": "batch_oaipay_upload_empty",
+                    "source": source,
+                    "meta": meta,
+                },
+            ),
+        )
+        return {
+            "task_id": task_id,
+            "total_requested": total_requested,
+            "matched": len(matched_accounts),
+            "eligible": 0,
+            "skipped": len(skipped_accounts),
+            "missing": len(missing_ids),
+            "items": [],
+            "skipped_items": skipped_accounts,
+            "missing_ids": missing_ids,
+        }
+
+    task_id = f"task_{int(time.time() * 1000)}"
+    source = "batch_oaipay_upload"
+    meta = {
+        "total_requested": total_requested,
+        "matched": len(matched_accounts),
+        "eligible": len(eligible_accounts),
+        "missing_ids": list(missing_ids),
+        "account_ids": [int(item["account_id"]) for item in eligible_accounts],
+        "emails": [str(item["email"] or "") for item in eligible_accounts],
+        "filter": {
+            "all_filtered": bool(req.all_filtered),
+            "status": str(req.status or ""),
+            "email": str(req.email or ""),
+            "oaipay_state": str(req.oaipay_state or ""),
+        },
+        "params": dict(req.params or {}),
+        "limit": int(req.limit or 0),
+        "skipped_items": list(skipped_accounts),
+    }
+    _create_standalone_task_record(
+        task_id,
+        platform="chatgpt",
+        source=source,
+        total=max(len(eligible_accounts), 1),
+        meta=meta,
+    )
+
+    primary_email = str(eligible_accounts[0]["email"] or "") if eligible_accounts else ""
+    _save_task_log(
+        "chatgpt",
+        primary_email,
+        "running",
+        detail=_build_task_log_detail(
+            task_id,
+            {
+                "email": primary_email,
+                "attempt_outcome": "task_created",
+                "source": source,
+                "meta": meta,
+            },
+        ),
+    )
+
+    account_ids = [int(item["account_id"]) for item in eligible_accounts]
+    if background_tasks is None:
+        thread = threading.Thread(
+            target=_run_batch_oaipay_upload,
+            args=(task_id, account_ids, req.category_id),
+            daemon=True,
+        )
+        thread.start()
+    else:
+        background_tasks.add_task(_run_batch_oaipay_upload, task_id, account_ids, req.category_id)
+
+    return {
+        "task_id": task_id,
+        "total_requested": total_requested,
+        "matched": len(matched_accounts),
+        "eligible": len(eligible_accounts),
+        "skipped": len(skipped_accounts),
+        "missing": len(missing_ids),
+        "items": eligible_accounts,
+        "skipped_items": skipped_accounts,
+        "missing_ids": missing_ids,
+    }
+
+
+def enqueue_baxigpt_cdk_submit_task(
+    req: BaxiGptCdkSubmitTaskRequest,
+    *,
+    background_tasks: BackgroundTasks | None = None,
+) -> dict[str, Any]:
+    from services.chatgpt_core.baxigpt_cdk_repository import BaxiGptCdkRepository
+
+    account_items, missing_ids, skipped_accounts, matched_accounts = _resolve_baxigpt_cdk_submit_accounts(req)
+    total_requested_accounts = len(_normalize_batch_account_ids(req.account_ids)) if req.account_ids else len(matched_accounts)
+    repo = BaxiGptCdkRepository()
+    import_summary: dict[str, Any] = {"added": 0, "updated": 0, "skipped": 0, "errors": [], "items": []}
+    code_records = []
+    code_source = "pool"
+    if str(req.code_lines or "").strip():
+        import_summary = repo.import_lines(req.code_lines)
+        imported_ids = [
+            int(item.get("id") or 0)
+            for item in import_summary.get("items", [])
+            if isinstance(item, dict) and int(item.get("id") or 0) > 0
+        ]
+        # 粘贴提交的卡密即使之前已被标记 failed/paid，也要进入任务日志里重新
+        # code-info 校验配额并给出明确原因，不能在创建任务阶段静默过滤掉。
+        code_records = repo.list_by_ids(imported_ids)
+        code_source = "import"
+    elif bool(req.use_pool):
+        code_records = repo.list_available()
+    else:
+        raise HTTPException(400, "请粘贴卡密，或启用卡密池")
+
+    pair_count = min(len(account_items), len(code_records))
+    pairs = []
+    for index in range(pair_count):
+        account = account_items[index]
+        code = code_records[index]
+        pairs.append(
+            {
+                "account_id": int(account["account_id"]),
+                "email": str(account.get("email") or ""),
+                "cdk_id": int(code.id),
+                "code_masked": str(code.code_masked or ""),
+                "code_status": str(code.status or ""),
+                "code_last_error_message": str(code.last_error_message or ""),
+                "manual_code": code_source == "import",
+            }
+        )
+
+    shortage_accounts = account_items[pair_count:]
+    spare_codes = code_records[pair_count:]
+    for item in shortage_accounts:
+        skipped_accounts.append({**item, "reason": "可用卡密不足，本轮未提交"})
+
+    if pair_count <= 0:
+        return {
+            "task_id": "",
+            "total_requested_accounts": total_requested_accounts,
+            "matched_accounts": len(matched_accounts),
+            "eligible_accounts": len(account_items),
+            "available_codes": len(code_records),
+            "pairs": [],
+            "pair_count": 0,
+            "spare_codes": len(spare_codes),
+            "skipped_accounts": skipped_accounts,
+            "missing_ids": missing_ids,
+            "cdk_pool_import": import_summary,
+        }
+
+    task_id = f"task_{int(time.time() * 1000)}"
+    source = "baxigpt_cdk_submit"
+    submit_interval_seconds = max(int(req.submit_interval_seconds or 0), 0)
+    status_poll_interval_seconds = max(int(req.status_poll_interval_seconds or 5), 1)
+    status_poll_timeout_seconds = max(int(req.status_poll_timeout_seconds or 300), status_poll_interval_seconds)
+    meta = {
+        "total_requested_accounts": total_requested_accounts,
+        "matched_accounts": len(matched_accounts),
+        "eligible_accounts": len(account_items),
+        "missing_ids": list(missing_ids),
+        "skipped_accounts": list(skipped_accounts),
+        "account_ids": [int(item["account_id"]) for item in account_items],
+        "emails": [str(item["email"] or "") for item in account_items],
+        "available_codes": len(code_records),
+        "pair_count": len(pairs),
+        "pairs": list(pairs),
+        "spare_codes": len(spare_codes),
+        "code_source": code_source,
+        "cdk_pool_import": import_summary,
+        "filter": {
+            "all_filtered": bool(req.all_filtered),
+            "status": str(req.status or ""),
+            "email": str(req.email or ""),
+        },
+        "settings": {
+            "precheck": bool(req.precheck),
+            "failure_continue": bool(req.failure_continue),
+            "submit_interval_seconds": submit_interval_seconds,
+            "auto_poll_status": bool(req.auto_poll_status),
+            "status_poll_interval_seconds": status_poll_interval_seconds,
+            "status_poll_timeout_seconds": status_poll_timeout_seconds,
+            "use_pool": bool(req.use_pool),
+        },
+        "runtime_results": [],
+    }
+    _create_standalone_task_record(
+        task_id,
+        platform="chatgpt",
+        source=source,
+        total=max(len(pairs), 1),
+        meta=meta,
+    )
+
+    primary_email = str(pairs[0]["email"] or "") if pairs else ""
+    _save_task_log(
+        "chatgpt",
+        primary_email,
+        "running",
+        detail=_build_task_log_detail(
+            task_id,
+            {
+                "email": primary_email,
+                "attempt_outcome": "task_created",
+                "source": source,
+                "meta": meta,
+            },
+        ),
+    )
+
+    if background_tasks is None:
+        thread = threading.Thread(
+            target=_run_baxigpt_cdk_submit,
+            args=(task_id, pairs, dict(meta["settings"])),
+            daemon=True,
+        )
+        thread.start()
+    else:
+        background_tasks.add_task(_run_baxigpt_cdk_submit, task_id, pairs, dict(meta["settings"]))
+
+    return {
+        "task_id": task_id,
+        "total_requested_accounts": total_requested_accounts,
+        "matched_accounts": len(matched_accounts),
+        "eligible_accounts": len(account_items),
+        "available_codes": len(code_records),
+        "pair_count": len(pairs),
+        "spare_codes": len(spare_codes),
+        "skipped_accounts": skipped_accounts,
+        "missing_ids": missing_ids,
+        "cdk_pool_import": import_summary,
+        "pairs": pairs,
+    }
+
+
+def enqueue_chatgpt_paypal_bind_task(
+    req: ChatGptPaypalBindTaskRequest,
+    *,
+    background_tasks: BackgroundTasks | None = None,
+) -> dict[str, Any]:
+    from services.chatgpt_core.paypal_binding_client import DEFAULT_BASE_URL, mask_proxy, normalize_phone
+
+    base_url = str(req.base_url or DEFAULT_BASE_URL).strip().rstrip("/") or DEFAULT_BASE_URL
+    proxy = str(req.proxy or "").strip()
+    proxy_jp = str(req.proxy_jp or "").strip()
+    phone = normalize_phone(req.phone)
+    paypal_email = str(req.paypal_email or "").strip()
+    sms_api = str(req.sms_api or "").strip()
+    sms_api_test_mode = bool(req.sms_api_test_mode)
+    otp_timeout = max(int(req.otp_timeout or 180), 30)
+    pplink_retry = max(int(req.pplink_retry or 3), 1)
+    timeout = max(float(req.timeout or 30), 5.0)
+    event_timeout = max(float(req.event_timeout or 60), 10.0)
+    account_interval_seconds = max(int(req.account_interval_seconds or 0), 0)
+    failure_continue = bool(req.failure_continue)
+
+    if not proxy:
+        raise HTTPException(400, "请填写 PayPal 绑定代理")
+    if not phone:
+        raise HTTPException(400, "请填写 PayPal 手机号")
+
+    eligible_accounts, missing_ids, skipped_accounts, matched_accounts = _resolve_chatgpt_paypal_bind_accounts(req)
+    total_requested_accounts = len(_normalize_batch_account_ids(req.account_ids)) if req.account_ids else len(matched_accounts)
+
+    if not eligible_accounts:
+        return {
+            "task_id": "",
+            "total_requested_accounts": total_requested_accounts,
+            "matched_accounts": len(matched_accounts),
+            "eligible_accounts": 0,
+            "skipped_accounts": skipped_accounts,
+            "missing_ids": missing_ids,
+            "items": [],
+        }
+
+    task_id = f"task_{int(time.time() * 1000)}"
+    source = "chatgpt_paypal_bind"
+    public_settings = {
+        "base_url": base_url,
+        "proxy": mask_proxy(proxy),
+        "proxy_jp": mask_proxy(proxy_jp),
+        "phone": phone,
+        "paypal_email": paypal_email,
+        "sms_api_configured": bool(sms_api),
+        "sms_api_test_mode": sms_api_test_mode,
+        "otp_timeout": otp_timeout,
+        "pplink_retry": pplink_retry,
+        "timeout": timeout,
+        "event_timeout": event_timeout,
+        "account_interval_seconds": account_interval_seconds,
+        "failure_continue": failure_continue,
+    }
+    runtime_settings = {
+        **public_settings,
+        "proxy": proxy,
+        "proxy_jp": proxy_jp,
+        "sms_api": sms_api,
+    }
+    meta = {
+        "total_requested_accounts": total_requested_accounts,
+        "matched_accounts": len(matched_accounts),
+        "eligible": len(eligible_accounts),
+        "eligible_accounts": len(eligible_accounts),
+        "missing_ids": list(missing_ids),
+        "skipped_accounts": list(skipped_accounts),
+        "account_ids": [int(item["account_id"]) for item in eligible_accounts],
+        "emails": [str(item["email"] or "") for item in eligible_accounts],
+        "filter": {
+            "all_filtered": bool(req.all_filtered),
+            "status": str(req.status or ""),
+            "email": str(req.email or ""),
+        },
+        "settings": public_settings,
+        "runtime_results": [],
+    }
+    _create_standalone_task_record(
+        task_id,
+        platform="chatgpt",
+        source=source,
+        total=max(len(eligible_accounts), 1),
+        meta=meta,
+    )
+
+    primary_email = str(eligible_accounts[0]["email"] or "") if eligible_accounts else ""
+    _save_task_log(
+        "chatgpt",
+        primary_email,
+        "running",
+        detail=_build_task_log_detail(
+            task_id,
+            {
+                "email": primary_email,
+                "attempt_outcome": "task_created",
+                "source": source,
+                "meta": meta,
+            },
+        ),
+    )
+
+    account_ids = [int(item["account_id"]) for item in eligible_accounts]
+    if background_tasks is None:
+        thread = threading.Thread(
+            target=_run_chatgpt_paypal_bind,
+            args=(task_id, account_ids, runtime_settings),
+            daemon=True,
+        )
+        thread.start()
+    else:
+        background_tasks.add_task(_run_chatgpt_paypal_bind, task_id, account_ids, runtime_settings)
+
+    return {
+        "task_id": task_id,
+        "total_requested_accounts": total_requested_accounts,
+        "matched_accounts": len(matched_accounts),
+        "eligible_accounts": len(eligible_accounts),
+        "skipped_accounts": skipped_accounts,
+        "missing_ids": missing_ids,
+        "items": eligible_accounts,
+    }
+
 
 
 def enqueue_batch_payment_link_task(
@@ -1227,20 +3630,292 @@ def enqueue_batch_payment_link_task(
     }
 
 
-def _log(task_id: str, msg: str):
-    """向任务追加一条日志"""
+def enqueue_chatgpt_oaipay_approval_task(
+    req: ChatGptPaypalBindTaskRequest,
+    *,
+    background_tasks: BackgroundTasks | None = None,
+) -> dict[str, Any]:
+    from services.chatgpt_core.oaipay_client import DEFAULT_BASE_URL as OAIPAY_DEFAULT_BASE_URL, DEFAULT_PROXY_POOL
+    from services.chatgpt_core.paypal_binding_client import mask_proxy
+
+    base_url = str(req.base_url or OAIPAY_DEFAULT_BASE_URL).strip().rstrip("/") or OAIPAY_DEFAULT_BASE_URL
+    proxy = str(req.proxy or "").strip()
+    proxy_pool = str(req.proxy_pool or DEFAULT_PROXY_POOL).strip() or DEFAULT_PROXY_POOL
+    submit_mode = str(req.submit_mode or "serial").strip().lower()
+    if submit_mode not in {"serial", "batch"}:
+        submit_mode = "serial"
+    submit_delay_seconds = max(float(req.submit_delay_seconds or 0), 0.0)
+    batch_max_workers = min(max(int(req.batch_max_workers or 50), 1), 200)
+    timeout = max(float(req.timeout or 30), 5.0)
+    event_timeout = max(float(req.event_timeout or 90), 10.0)
+    account_interval_seconds = max(int(req.account_interval_seconds or 0), 0)
+    failure_continue = bool(req.failure_continue)
+    precheck_token_info = bool(req.precheck_token_info)
+    billing_country = str(req.billing_country or "US").strip() or "US"
+    payment_locale = str(req.payment_locale or "en").strip() or "en"
+    checkout_ui_mode = str(req.checkout_ui_mode or "hosted").strip() or "hosted"
+
+    if not proxy:
+        raise HTTPException(400, "请填写提交到 oaipay 的代理节点")
+
+    eligible_accounts, missing_ids, skipped_accounts, matched_accounts = _resolve_chatgpt_paypal_bind_accounts(req)
+    total_requested_accounts = len(_normalize_batch_account_ids(req.account_ids)) if req.account_ids else len(matched_accounts)
+
+    if not eligible_accounts:
+        return {
+            "task_id": "",
+            "total_requested_accounts": total_requested_accounts,
+            "matched_accounts": len(matched_accounts),
+            "eligible_accounts": 0,
+            "skipped_accounts": skipped_accounts,
+            "missing_ids": missing_ids,
+            "items": [],
+        }
+
+    task_id = f"task_{int(time.time() * 1000)}"
+    source = "chatgpt_oaipay_approval"
+    public_settings = {
+        "upstream": "oaipay",
+        "base_url": base_url,
+        "proxy": mask_proxy(proxy),
+        "proxy_pool": proxy_pool,
+        "submit_mode": submit_mode,
+        "submit_delay_seconds": submit_delay_seconds,
+        "batch_max_workers": batch_max_workers,
+        "precheck_token_info": precheck_token_info,
+        "timeout": timeout,
+        "event_timeout": event_timeout,
+        "account_interval_seconds": account_interval_seconds,
+        "failure_continue": failure_continue,
+        "billing_country": billing_country,
+        "payment_locale": payment_locale,
+        "checkout_ui_mode": checkout_ui_mode,
+    }
+    runtime_settings = {
+        **public_settings,
+        "proxy": proxy,
+    }
+    meta = {
+        "total_requested_accounts": total_requested_accounts,
+        "matched_accounts": len(matched_accounts),
+        "eligible": len(eligible_accounts),
+        "eligible_accounts": len(eligible_accounts),
+        "missing_ids": list(missing_ids),
+        "skipped_accounts": list(skipped_accounts),
+        "account_ids": [int(item["account_id"]) for item in eligible_accounts],
+        "emails": [str(item["email"] or "") for item in eligible_accounts],
+        "filter": {
+            "all_filtered": bool(req.all_filtered),
+            "status": str(req.status or ""),
+            "email": str(req.email or ""),
+        },
+        "settings": public_settings,
+        "runtime_results": [],
+        "approval_urls": [],
+    }
+    _create_standalone_task_record(
+        task_id,
+        platform="chatgpt",
+        source=source,
+        total=max(len(eligible_accounts), 1),
+        meta=meta,
+    )
+
+    primary_email = str(eligible_accounts[0]["email"] or "") if eligible_accounts else ""
+    _save_task_log(
+        "chatgpt",
+        primary_email,
+        "running",
+        detail=_build_task_log_detail(
+            task_id,
+            {
+                "email": primary_email,
+                "attempt_outcome": "task_created",
+                "source": source,
+                "meta": meta,
+            },
+        ),
+    )
+
+    account_ids = [int(item["account_id"]) for item in eligible_accounts]
+    if background_tasks is None:
+        thread = threading.Thread(
+            target=_run_chatgpt_oaipay_approval,
+            args=(task_id, account_ids, runtime_settings),
+            daemon=True,
+        )
+        thread.start()
+    else:
+        background_tasks.add_task(_run_chatgpt_oaipay_approval, task_id, account_ids, runtime_settings)
+
+    return {
+        "task_id": task_id,
+        "total_requested_accounts": total_requested_accounts,
+        "matched_accounts": len(matched_accounts),
+        "eligible_accounts": len(eligible_accounts),
+        "skipped_accounts": skipped_accounts,
+        "missing_ids": missing_ids,
+        "items": eligible_accounts,
+    }
+
+
+def _log(
+    task_id: str,
+    msg: str,
+    level: str = "info",
+    *,
+    expose_phone: bool = False,
+    expose_otp: bool = False,
+):
+    """向任务追加一条日志。
+
+    level=debug 的日志会统一加 [DEBUG] 前缀，前端据此拆分 Info/Debug 视图；
+    已经带 [DEBUG] 的上游日志不重复加前缀。
+    """
     ts = time.strftime("%H:%M:%S")
-    entry = f"[{ts}] {msg}"
+    text = str(msg or "")
+    normalized_level = str(level or "info").strip().lower() or "info"
+    if normalized_level == "debug" and not text.lstrip().upper().startswith("[DEBUG]"):
+        text = f"[DEBUG] {text}"
+    text = redact_log_text(text, expose_phone=expose_phone, expose_otp=expose_otp)
+    entry = f"[{ts}] {text}"
     _task_store.append_log(task_id, entry)
     print(entry)
+
+
+def _clear_task_current(task_id: str) -> None:
+    task_key = str(task_id or "").strip()
+    stale_keys = [key for key in _TASK_STAGE_STARTED_AT if key[0] == task_key]
+    for key in stale_keys:
+        _TASK_STAGE_STARTED_AT.pop(key, None)
+    try:
+        _task_store.update_meta(task_id, {"current": {}})
+    except Exception:
+        pass
+
+
+def _set_task_current(
+    task_id: str,
+    *,
+    task: str,
+    task_label: str = "",
+    item_index: int | None = None,
+    item_total: int | None = None,
+    email: str = "",
+    account_id: int | str | None = None,
+    phone: str = "",
+    phase: str = "",
+    phase_label: str = "",
+    stage_index: int | None = None,
+    stage_total: int | None = None,
+    last_message: str = "",
+    next_step: str = "",
+    resource_touched: bool | None = None,
+    reset_started_at: bool = False,
+) -> dict[str, Any]:
+    phase_key = str(phase or "").strip() or "unknown"
+    cache_key = (str(task_id or "").strip(), phase_key)
+    if reset_started_at or cache_key not in _TASK_STAGE_STARTED_AT:
+        _TASK_STAGE_STARTED_AT[cache_key] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    payload = build_task_current_state(
+        task=task,
+        task_label=task_label or task,
+        item_index=item_index,
+        item_total=item_total,
+        email=email,
+        account_id=account_id,
+        phone=phone,
+        phase=phase,
+        phase_label=phase_label,
+        stage_index=stage_index,
+        stage_total=stage_total,
+        started_at=_TASK_STAGE_STARTED_AT.get(cache_key, ""),
+        last_message=last_message,
+        next_step=next_step,
+        resource_touched=resource_touched,
+    )
+    _task_store.update_meta(task_id, {"current": payload})
+    return payload
+
+
+def _task_timeline_log(
+    task_id: str,
+    *,
+    task: str,
+    message: str = "",
+    item_index: int | None = None,
+    item_total: int | None = None,
+    email: str = "",
+    account_id: int | str | None = None,
+    phone: str = "",
+    phase: str = "",
+    phase_label: str = "",
+    stage_index: int | None = None,
+    stage_total: int | None = None,
+    next_step: str = "",
+    resource_touched: bool | None = None,
+    level: str = "info",
+    reset_started_at: bool = False,
+) -> str:
+    line = format_task_timeline_log(
+        task,
+        message,
+        item_index=item_index,
+        item_total=item_total,
+        email=email,
+        account_id=account_id,
+        phone=phone,
+        stage_index=stage_index,
+        stage_total=stage_total,
+        phase_label=phase_label,
+    )
+    _set_task_current(
+        task_id,
+        task=task,
+        task_label=task,
+        item_index=item_index,
+        item_total=item_total,
+        email=email,
+        account_id=account_id,
+        phone=phone,
+        phase=phase,
+        phase_label=phase_label,
+        stage_index=stage_index,
+        stage_total=stage_total,
+        last_message=message or phase_label,
+        next_step=next_step,
+        resource_touched=resource_touched,
+        reset_started_at=reset_started_at,
+    )
+    _log(
+        task_id,
+        line,
+        level,
+        expose_phone=str(task or "").strip() in {"手机绑定", "手机号绑定"},
+        expose_otp=str(task or "").strip() in {"手机绑定", "手机号绑定"},
+    )
+    return line
 
 
 def _save_task_log(
     platform: str, email: str, status: str, error: str = "", detail: dict = None
 ):
     """Write or update one TaskLog record per task_id."""
-    detail = detail or {}
-    task_id = str(detail.get("task_id") or "").strip()
+    raw_detail = detail or {}
+    safe_detail = sanitize_task_detail(raw_detail)
+    if not isinstance(safe_detail, dict):
+        safe_detail = {"detail": safe_detail}
+    if (
+        isinstance(raw_detail, dict)
+        and str(raw_detail.get("source") or "").strip() == "phone_binding_test"
+        and isinstance(raw_detail.get("logs"), list)
+    ):
+        # 手机绑定排障依赖完整手机号/验证码上下文；这些日志进入任务前
+        # 已经保留 token/password/proxy 密码等强敏感信息的脱敏。
+        safe_detail["logs"] = list(raw_detail.get("logs") or [])
+    safe_detail.setdefault("redaction_version", REDACTION_VERSION)
+    task_id = str(safe_detail.get("task_id") or "").strip()
+    safe_error = sanitize_error_message(error)
     with Session(engine) as s:
         log = None
         if task_id:
@@ -1256,16 +3931,16 @@ def _save_task_log(
                 platform=platform,
                 email=email,
                 status=status,
-                error=error,
-                detail_json=json.dumps(detail, ensure_ascii=False),
+                error=safe_error,
+                detail_json=json.dumps(safe_detail, ensure_ascii=False),
             )
             s.add(log)
         else:
             log.platform = platform
             log.email = email
             log.status = status
-            log.error = error
-            log.detail_json = json.dumps(detail, ensure_ascii=False)
+            log.error = safe_error
+            log.detail_json = json.dumps(safe_detail, ensure_ascii=False)
             s.add(log)
         s.commit()
 
@@ -1292,6 +3967,47 @@ def _build_task_log_detail(task_id: str, extra: dict | None = None) -> dict:
     return detail
 
 
+TASK_LOG_META_SUMMARY_KEYS = {
+    "email",
+    "email_count",
+    "phone_count",
+    "eligible",
+    "eligible_accounts",
+    "pair_count",
+    "requested_count",
+    "total_requested",
+}
+
+
+def _task_log_source(detail: dict[str, Any]) -> str:
+    source = str(detail.get("source") or "").strip()
+    if source:
+        return source
+    meta = detail.get("meta")
+    if isinstance(meta, dict):
+        return str(meta.get("source") or "").strip()
+    return ""
+
+
+def _task_log_meta_summary(detail: dict[str, Any]) -> dict[str, Any]:
+    meta = detail.get("meta")
+    if not isinstance(meta, dict):
+        return {}
+    summary: dict[str, Any] = {}
+    for key in TASK_LOG_META_SUMMARY_KEYS:
+        value = meta.get(key)
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            summary[key] = value
+    return summary
+
+
+def _task_log_failed_count(detail: dict[str, Any]) -> int:
+    errors = detail.get("errors")
+    if isinstance(errors, list):
+        return len(errors)
+    return 0
+
+
 def _task_log_summary(log: TaskLog) -> dict:
     detail = _task_log_detail_dict(log)
     return {
@@ -1301,7 +4017,14 @@ def _task_log_summary(log: TaskLog) -> dict:
         "status": _effective_task_log_status(log, detail=detail),
         "error": log.error,
         "created_at": log.created_at,
-        "task_id": str(detail.get("task_id") or ""),
+        "task_id": str(log.task_id or detail.get("task_id") or ""),
+        "source": _task_log_source(detail),
+        "attempt_outcome": str(detail.get("attempt_outcome") or ""),
+        "progress": str(detail.get("progress") or ""),
+        "success": int(detail.get("success") or 0),
+        "skipped": int(detail.get("skipped") or 0),
+        "failed": _task_log_failed_count(detail),
+        "meta_summary": _task_log_meta_summary(detail),
     }
 
 
@@ -1347,18 +4070,39 @@ def _effective_task_log_status(log: TaskLog, *, detail: dict[str, Any] | None = 
     return runtime_status or base_status
 
 
+def _task_log_group_task_id(log: TaskLog) -> str:
+    task_id = str(log.task_id or "").strip()
+    if task_id:
+        return task_id
+    detail = _task_log_detail_dict(log)
+    return str(detail.get("task_id") or "").strip()
+
+
 def _group_latest_task_logs(logs: list[TaskLog]) -> list[TaskLog]:
     grouped: list[TaskLog] = []
     seen: set[str] = set()
     for log in logs:
-        detail = _task_log_detail_dict(log)
-        task_id = str(detail.get("task_id") or "").strip()
+        task_id = _task_log_group_task_id(log)
         group_key = f"task:{task_id}" if task_id else f"log:{int(log.id or 0)}"
         if group_key in seen:
             continue
         seen.add(group_key)
         grouped.append(log)
     return grouped
+
+
+def _group_latest_task_log_ids(logs: list[TaskLog]) -> list[int]:
+    grouped_ids: list[int] = []
+    seen: set[str] = set()
+    for log in logs:
+        task_id = _task_log_group_task_id(log)
+        group_key = f"task:{task_id}" if task_id else f"log:{int(log.id or 0)}"
+        if group_key in seen:
+            continue
+        seen.add(group_key)
+        if log.id is not None:
+            grouped_ids.append(int(log.id))
+    return grouped_ids
 
 
 def _auto_upload_integrations(task_id: str, account):
@@ -1382,6 +4126,32 @@ def _is_truthy(value) -> bool:
     if isinstance(value, (int, float)):
         return value != 0
     return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _normalize_domain_list(value: Any) -> list[str]:
+    if isinstance(value, str):
+        text = value.strip()
+        if text.startswith("["):
+            try:
+                parsed = json.loads(text)
+                raw_items = parsed if isinstance(parsed, list) else [text]
+            except Exception:
+                raw_items = re.split(r"[\n,;]+", text)
+        else:
+            raw_items = re.split(r"[\n,;]+", text)
+    elif isinstance(value, (list, tuple, set)):
+        raw_items = list(value)
+    else:
+        raw_items = []
+    domains: list[str] = []
+    seen: set[str] = set()
+    for item in raw_items:
+        domain = str(item or "").strip().lower().lstrip("@.")
+        if not domain or domain in seen:
+            continue
+        seen.add(domain)
+        domains.append(domain)
+    return domains
 
 
 def _parse_positive_int(value, default: int = 1) -> int:
@@ -1537,11 +4307,19 @@ def _run_resume_subscription_auth(
                 raise ValueError("ChatGPT 账号不存在")
             email = str(account.email or "")
 
-        _log(task_id, f"[补抓] -------- 账号 {account_id} --------")
-        _log(task_id, f"[补抓] 开始补抓 Auth：{email or account_id}")
-        _log(
+        phone_modes = _resolve_resume_auth_phone_modes(allow_phone_verification)
+        _task_timeline_log(
             task_id,
-            f"[补抓] 手机验证码：{'允许' if allow_phone_verification else '不允许'}",
+            task="补抓Auth",
+            email=email,
+            account_id=account_id,
+            phase="prepare",
+            phase_label="准备补抓 Auth",
+            stage_index=1,
+            stage_total=5,
+            message=f"开始：scope=free，手机验证策略={_format_phone_modes_for_log(phone_modes)}",
+            next_step="恢复邮箱状态并进入 OAuth 登录",
+            reset_started_at=True,
         )
         attempt_id = control.start_attempt()
         try:
@@ -1550,10 +4328,24 @@ def _run_resume_subscription_auth(
                 account = session.get(AccountModel, int(account_id or 0))
                 if account is None or account.platform != "chatgpt":
                     raise ValueError("ChatGPT 账号不存在")
+                _task_timeline_log(
+                    task_id,
+                    task="补抓Auth",
+                    email=email,
+                    account_id=account_id,
+                    phase="oauth_login",
+                    phase_label="OAuth 登录并补抓完整 Auth/RT",
+                    stage_index=2,
+                    stage_total=5,
+                    message="开始执行账号级 Auth 捕获",
+                    next_step="等待邮箱验证码或进入工作空间选择",
+                    reset_started_at=True,
+                )
                 result = _execute_chatgpt_resume_subscription_auth(
                     account,
                     allow_phone_verification=bool(allow_phone_verification),
                     log_fn=lambda message: _log(task_id, message),
+                    stop_checker=lambda: control.checkpoint(attempt_id=attempt_id),
                 )
                 session.refresh(account)
                 _apply_chatgpt_resume_auth_result(account, result, session)
@@ -1565,7 +4357,19 @@ def _run_resume_subscription_auth(
             control.finish_attempt(attempt_id)
 
         _task_store.set_progress(task_id, "1/1")
-        _log(task_id, f"[OK] 补抓Auth完成: {email or account_id}")
+        _task_timeline_log(
+            task_id,
+            task="补抓Auth",
+            email=email,
+            account_id=account_id,
+            phase="persist_auth",
+            phase_label="保存完整 Auth/RT",
+            stage_index=5,
+            stage_total=5,
+            message="成功：refresh_token 已保存",
+            next_step="任务完成",
+            reset_started_at=True,
+        )
         _save_task_log(
             "chatgpt",
             email,
@@ -1582,7 +4386,20 @@ def _run_resume_subscription_auth(
         )
         _task_store.finish(task_id, status="done", success=1, skipped=0, errors=[])
     except SkipCurrentAttemptRequested as exc:
-        _log(task_id, f"[SKIP] 已跳过补抓Auth: {exc}")
+        _task_timeline_log(
+            task_id,
+            task="补抓Auth",
+            email=email,
+            account_id=account_id,
+            phase="skipped",
+            phase_label="已跳过",
+            stage_index=5,
+            stage_total=5,
+            message=str(exc),
+            next_step="任务停止",
+            level="info",
+            reset_started_at=True,
+        )
         _save_task_log(
             "chatgpt",
             email,
@@ -1601,6 +4418,19 @@ def _run_resume_subscription_auth(
         _task_store.finish(task_id, status="stopped", success=0, skipped=1, errors=[])
     except StopTaskRequested as exc:
         _log(task_id, f"[STOP] {exc}")
+        _task_timeline_log(
+            task_id,
+            task="补抓Auth",
+            email=email,
+            account_id=account_id,
+            phase="stopped",
+            phase_label="已停止",
+            stage_index=5,
+            stage_total=5,
+            message=str(exc),
+            next_step="任务停止",
+            reset_started_at=True,
+        )
         _save_task_log(
             "chatgpt",
             email,
@@ -1620,7 +4450,20 @@ def _run_resume_subscription_auth(
     except Exception as exc:
         error_text = str(exc) or "补抓Auth失败"
         errors.append(error_text)
-        _log(task_id, f"[FAIL] 补抓Auth失败: {error_text}")
+        _task_timeline_log(
+            task_id,
+            task="补抓Auth",
+            email=email,
+            account_id=account_id,
+            phase="failed",
+            phase_label="补抓完整 Auth/RT 失败",
+            stage_index=5,
+            stage_total=5,
+            message=error_text,
+            next_step="查看 Debug 详情",
+            level="info",
+            reset_started_at=True,
+        )
         _save_task_log(
             "chatgpt",
             email,
@@ -1643,6 +4486,621 @@ def _run_resume_subscription_auth(
             skipped=0,
             errors=errors,
             error=error_text,
+        )
+    finally:
+        _clear_task_current(task_id)
+        _task_store.cleanup()
+
+
+def _run_custom_email_recheck(
+    task_id: str,
+    email: str,
+    password: str,
+    save_on_success: bool,
+    *,
+    proxy_settings: dict[str, Any] | None = None,
+):
+    from services.chatgpt_core.custom_email_recheck import recheck_custom_chatgpt_email
+
+    control = _task_store.control_for(task_id)
+    _task_store.mark_running(task_id)
+    _task_store.set_progress(task_id, "0/1")
+    errors: list[str] = []
+    try:
+        attempt_id = control.start_attempt()
+        try:
+            control.checkpoint(attempt_id=attempt_id)
+            candidate_proxies = _build_custom_email_recheck_candidate_proxies(proxy_settings)
+            last_proxy_error = ""
+            final_error = ""
+            result: dict[str, Any] = {}
+            data: dict[str, Any] = {}
+            _task_timeline_log(
+                task_id,
+                task="邮箱测活",
+                email=email,
+                phase="prepare",
+                phase_label="准备测活",
+                stage_index=1,
+                stage_total=2,
+                message=f"开始：模式={'保存账号' if save_on_success else '只测活不保存'}",
+                next_step="登录测活并抓取 AccessToken",
+                reset_started_at=True,
+            )
+            for proxy_index, (candidate_proxy, candidate_proxy_pool, candidate_proxy_source) in enumerate(candidate_proxies, start=1):
+                _log_custom_email_proxy_choice(task_id, candidate_proxy, candidate_proxy_source, proxy_index, len(candidate_proxies))
+                try:
+                    _task_timeline_log(
+                        task_id,
+                        task="邮箱测活",
+                        email=email,
+                        phase="stage1_login_probe",
+                        phase_label="登录测活并抓取 AccessToken",
+                        stage_index=1,
+                        stage_total=2,
+                        message=f"使用代理 {proxy_index}/{len(candidate_proxies)}",
+                        next_step="等待 OAuth 邮箱验证码",
+                        reset_started_at=(proxy_index == 1),
+                    )
+                    result = recheck_custom_chatgpt_email(
+                        email=email,
+                        password=password,
+                        save_on_success=save_on_success,
+                        task_id=task_id,
+                        log_fn=lambda message: _log(task_id, message),
+                        stop_checker=lambda: control.checkpoint(attempt_id=attempt_id),
+                        task_control=control,
+                        attempt_id=attempt_id,
+                        proxy_url=candidate_proxy or None,
+                    )
+                    data = result.get("data") if isinstance(result.get("data"), dict) else {}
+                    if not bool(result.get("ok")):
+                        payload = data.get("custom_email_recheck") if isinstance(data.get("custom_email_recheck"), dict) else {}
+                        error_text = str(result.get("error") or data.get("message") or "邮箱测活失败")
+                        if (
+                            _is_custom_email_proxy_error(result, error_text)
+                            and proxy_index < len(candidate_proxies)
+                        ):
+                            last_proxy_error = error_text
+                            _report_custom_email_proxy_fail(candidate_proxy_pool, candidate_proxy, error_text)
+                            _log(task_id, f"[代理] 当前代理失败，保留当前邮箱重试下一个代理: {error_text[:180]}")
+                            continue
+                        if payload:
+                            _task_store.update_meta(task_id, {"result": payload})
+                        if _is_custom_email_proxy_error(result, error_text):
+                            _report_custom_email_proxy_fail(candidate_proxy_pool, candidate_proxy, error_text)
+                        final_error = error_text
+                        break
+
+                    _report_custom_email_proxy_success(candidate_proxy_pool, candidate_proxy)
+                    break
+                except (SkipCurrentAttemptRequested, StopTaskRequested, TaskInterruption):
+                    raise
+                except Exception as proxy_exc:
+                    error_text = str(proxy_exc or "邮箱测活失败")
+                    if (
+                        _is_custom_email_proxy_error(None, error_text)
+                        and proxy_index < len(candidate_proxies)
+                    ):
+                        last_proxy_error = error_text
+                        _report_custom_email_proxy_fail(candidate_proxy_pool, candidate_proxy, error_text)
+                        _log(task_id, f"[代理] 当前代理异常，保留当前邮箱重试下一个代理: {error_text[:180]}")
+                        continue
+                    if _is_custom_email_proxy_error(None, error_text):
+                        _report_custom_email_proxy_fail(candidate_proxy_pool, candidate_proxy, error_text)
+                    raise
+            if final_error:
+                raise ValueError(final_error)
+            if not bool(result.get("ok")):
+                raise RuntimeError(last_proxy_error or "所有代理尝试失败")
+
+            _task_store.set_progress(task_id, "1/1")
+            payload = data.get("custom_email_recheck") if isinstance(data.get("custom_email_recheck"), dict) else {}
+            if payload:
+                _task_store.update_meta(task_id, {"result": payload})
+            saved_account_id = int(data.get("saved_account_id") or payload.get("saved_account_id") or 0)
+            has_refresh_token = bool(payload.get("has_refresh_token"))
+            _task_timeline_log(
+                task_id,
+                task="邮箱测活",
+                email=email,
+                account_id=saved_account_id,
+                phase="done",
+                phase_label="测活结果",
+                stage_index=2,
+                stage_total=2,
+                message=(
+                    f"结果：{'存活，已保存完整 Auth/RT' if has_refresh_token else '存活，已保存 AT-only，待补抓 Auth'}"
+                ),
+                next_step="任务完成",
+                reset_started_at=True,
+            )
+            _save_task_log(
+                "chatgpt",
+                email,
+                "success",
+                detail=_build_task_log_detail(
+                    task_id,
+                    {
+                        "attempt_outcome": "custom_email_recheck_success",
+                        "email": email,
+                        "account_id": saved_account_id,
+                        "source": "custom_email_recheck",
+                        "result": payload,
+                    },
+                ),
+            )
+            _task_store.finish(task_id, status="done", success=1, skipped=0, errors=[])
+            return
+        finally:
+            control.finish_attempt(attempt_id)
+    except SkipCurrentAttemptRequested as exc:
+        _task_timeline_log(
+            task_id,
+            task="邮箱测活",
+            email=email,
+            phase="skipped",
+            phase_label="已跳过",
+            stage_index=2,
+            stage_total=2,
+            message=str(exc),
+            next_step="任务停止",
+            reset_started_at=True,
+        )
+        _save_task_log(
+            "chatgpt",
+            email,
+            "skipped",
+            error=str(exc),
+            detail=_build_task_log_detail(
+                task_id,
+                {
+                    "attempt_outcome": "custom_email_recheck_skipped",
+                    "email": email,
+                    "source": "custom_email_recheck",
+                },
+            ),
+        )
+        _task_store.finish(task_id, status="stopped", success=0, skipped=1, errors=[])
+    except StopTaskRequested as exc:
+        _task_timeline_log(
+            task_id,
+            task="邮箱测活",
+            email=email,
+            phase="stopped",
+            phase_label="已停止",
+            stage_index=2,
+            stage_total=2,
+            message=str(exc),
+            next_step="任务停止",
+            reset_started_at=True,
+        )
+        _save_task_log(
+            "chatgpt",
+            email,
+            "stopped",
+            error=str(exc),
+            detail=_build_task_log_detail(
+                task_id,
+                {
+                    "attempt_outcome": "custom_email_recheck_stopped",
+                    "email": email,
+                    "source": "custom_email_recheck",
+                },
+            ),
+        )
+        _task_store.finish(task_id, status="stopped", success=0, skipped=0, errors=[])
+    except Exception as exc:
+        error_text = str(exc or "邮箱测活失败")
+        try:
+            snapshot_meta = dict(_task_store.snapshot(task_id).get("meta") or {})
+        except Exception:
+            snapshot_meta = {}
+        payload = snapshot_meta.get("result") if isinstance(snapshot_meta.get("result"), dict) else {}
+        errors.append(error_text)
+        _task_timeline_log(
+            task_id,
+            task="邮箱测活",
+            email=email,
+            phase="failed",
+            phase_label="测活失败",
+            stage_index=2,
+            stage_total=2,
+            message=error_text,
+            next_step="查看 Debug 详情",
+            reset_started_at=True,
+        )
+        _save_task_log(
+            "chatgpt",
+            email,
+            "failed",
+            error=error_text,
+            detail=_build_task_log_detail(
+                task_id,
+                {
+                    "attempt_outcome": "custom_email_recheck_failed",
+                    "email": email,
+                    "source": "custom_email_recheck",
+                    "error": error_text,
+                    "result": payload,
+                },
+            ),
+        )
+        _task_store.finish(task_id, status="failed", success=0, skipped=0, errors=errors, error=error_text)
+    finally:
+        _clear_task_current(task_id)
+        _task_store.cleanup()
+
+
+def _run_batch_custom_email_recheck(
+    task_id: str,
+    emails: list[str],
+    password: str,
+    save_on_success: bool,
+    *,
+    proxy_settings: dict[str, Any] | None = None,
+    account_delay_seconds: float = 0,
+):
+    from services.chatgpt_core.custom_email_recheck import recheck_custom_chatgpt_email
+
+    control = _task_store.control_for(task_id)
+
+    def task_log(message: str) -> None:
+        control.checkpoint(consume_skip=False)
+        _log(task_id, message)
+
+    total = max(len(emails), 1)
+    success_count = 0
+    skipped_count = 0
+    errors: list[str] = []
+    results: list[dict[str, Any]] = []
+    primary_email = emails[0] if emails else ""
+    account_delay_seconds = _custom_email_account_delay_seconds(account_delay_seconds)
+
+    _task_store.mark_running(task_id)
+    _task_store.set_progress(task_id, f"0/{total}")
+
+    meta = dict(_task_store.snapshot(task_id).get("meta") or {})
+    skipped_items = list(meta.get("skipped_items") or [])
+
+    def wait_before_next_email(index: int) -> None:
+        if index >= total or account_delay_seconds <= 0:
+            return
+        _task_store.update_meta(
+            task_id,
+            {
+                "account_delay_seconds": account_delay_seconds,
+                "delay_before_next_seconds": account_delay_seconds,
+                "delay_after_index": index,
+                "next_email": emails[index] if index < len(emails) else "",
+            },
+        )
+        _log(task_id, f"[邮箱测活] 等待 {account_delay_seconds:g}s 后开始下一个邮箱")
+        remaining = float(account_delay_seconds)
+        try:
+            while remaining > 0:
+                control.checkpoint(consume_skip=False)
+                chunk = min(1.0, remaining)
+                time.sleep(chunk)
+                remaining -= chunk
+        except StopTaskRequested:
+            _log(task_id, "[邮箱测活] 延时等待期间收到停止请求")
+            raise
+        finally:
+            _task_store.update_meta(
+                task_id,
+                {
+                    "delay_before_next_seconds": 0,
+                    "delay_after_index": 0,
+                    "next_email": "",
+                },
+            )
+
+    try:
+        for item in skipped_items:
+            _log(task_id, f"[SKIP] {item.get('email') or '-'} - {item.get('reason') or '已跳过'}")
+
+        for index, email in enumerate(emails, start=1):
+            control.checkpoint(consume_skip=False)
+            _task_store.update_meta(
+                task_id,
+                {
+                    "current_email": email,
+                    "current_index": index,
+                    "results": results,
+                },
+            )
+            attempt_id = control.start_attempt()
+            try:
+                control.checkpoint(attempt_id=attempt_id)
+                _task_timeline_log(
+                    task_id,
+                    task="邮箱测活",
+                    email=email,
+                    item_index=index,
+                    item_total=total,
+                    phase="prepare",
+                    phase_label="准备测活",
+                    stage_index=1,
+                    stage_total=2,
+                    message=f"开始：模式={'保存账号' if save_on_success else '只测活不保存'}",
+                    next_step="登录测活并抓取 AccessToken",
+                    reset_started_at=True,
+                )
+                candidate_proxies = _build_custom_email_recheck_candidate_proxies(proxy_settings)
+                last_proxy_error = ""
+                final_error = ""
+                result: dict[str, Any] = {}
+                data: dict[str, Any] = {}
+                payload: dict[str, Any] = {}
+                for proxy_index, (candidate_proxy, candidate_proxy_pool, candidate_proxy_source) in enumerate(candidate_proxies, start=1):
+                    _log_custom_email_proxy_choice(task_id, candidate_proxy, candidate_proxy_source, proxy_index, len(candidate_proxies))
+                    try:
+                        _task_timeline_log(
+                            task_id,
+                            task="邮箱测活",
+                            email=email,
+                            item_index=index,
+                            item_total=total,
+                            phase="stage1_login_probe",
+                            phase_label="登录测活并抓取 AccessToken",
+                            stage_index=1,
+                            stage_total=2,
+                            message=f"使用代理 {proxy_index}/{len(candidate_proxies)}",
+                            next_step="等待 OAuth 邮箱验证码",
+                            reset_started_at=(proxy_index == 1),
+                        )
+                        result = recheck_custom_chatgpt_email(
+                            email=email,
+                            password=password,
+                            save_on_success=save_on_success,
+                            task_id=task_id,
+                            log_fn=task_log,
+                            stop_checker=lambda: control.checkpoint(attempt_id=attempt_id),
+                            task_control=control,
+                            attempt_id=attempt_id,
+                            proxy_url=candidate_proxy or None,
+                        )
+                        data = result.get("data") if isinstance(result.get("data"), dict) else {}
+                        payload = data.get("custom_email_recheck") if isinstance(data.get("custom_email_recheck"), dict) else {}
+                        if not bool(result.get("ok")):
+                            error_text = str(result.get("error") or data.get("message") or payload.get("message") or "邮箱测活失败")
+                            if (
+                                _is_custom_email_proxy_error(result, error_text)
+                                and proxy_index < len(candidate_proxies)
+                            ):
+                                last_proxy_error = error_text
+                                _report_custom_email_proxy_fail(candidate_proxy_pool, candidate_proxy, error_text)
+                                _log(task_id, f"[代理] 当前代理失败，保留当前邮箱重试下一个代理: {error_text[:180]}")
+                                continue
+                            if _is_custom_email_proxy_error(result, error_text):
+                                _report_custom_email_proxy_fail(candidate_proxy_pool, candidate_proxy, error_text)
+                            final_error = error_text
+                            break
+
+                        _report_custom_email_proxy_success(candidate_proxy_pool, candidate_proxy)
+                        break
+                    except (SkipCurrentAttemptRequested, StopTaskRequested, TaskInterruption):
+                        raise
+                    except Exception as proxy_exc:
+                        error_text = str(proxy_exc or "邮箱测活失败")
+                        if (
+                            _is_custom_email_proxy_error(None, error_text)
+                            and proxy_index < len(candidate_proxies)
+                        ):
+                            last_proxy_error = error_text
+                            _report_custom_email_proxy_fail(candidate_proxy_pool, candidate_proxy, error_text)
+                            _log(task_id, f"[代理] 当前代理异常，保留当前邮箱重试下一个代理: {error_text[:180]}")
+                            continue
+                        if _is_custom_email_proxy_error(None, error_text):
+                            _report_custom_email_proxy_fail(candidate_proxy_pool, candidate_proxy, error_text)
+                        raise
+
+                if final_error:
+                    result = {"ok": False}
+                elif not bool(result.get("ok")):
+                    raise RuntimeError(last_proxy_error or "所有代理尝试失败")
+
+                saved_account_id = int(data.get("saved_account_id") or payload.get("saved_account_id") or 0)
+                if not bool(result.get("ok")):
+                    error_text = final_error or str(result.get("error") or data.get("message") or payload.get("message") or "邮箱测活失败")
+                    result_status = str(payload.get("status") or "failed")
+                    result_item = {
+                        "email": email,
+                        "ok": False,
+                        "status": result_status,
+                        "message": error_text,
+                        "result": payload,
+                    }
+                    results.append(result_item)
+                    if result_status == "otp_rate_limited":
+                        skipped_count += 1
+                        _task_timeline_log(
+                            task_id,
+                            task="邮箱测活",
+                            email=email,
+                            item_index=index,
+                            item_total=total,
+                            phase="skipped",
+                            phase_label="OTP 校验冷却，跳过本轮",
+                            stage_index=2,
+                            stage_total=2,
+                            message=error_text,
+                            next_step="稍后重试",
+                            reset_started_at=True,
+                        )
+                    else:
+                        errors.append(f"{email}: {error_text}")
+                        _task_timeline_log(
+                            task_id,
+                            task="邮箱测活",
+                            email=email,
+                            item_index=index,
+                            item_total=total,
+                            phase="failed",
+                            phase_label="测活失败",
+                            stage_index=2,
+                            stage_total=2,
+                            message=error_text,
+                            next_step="查看 Debug 详情",
+                            reset_started_at=True,
+                        )
+                else:
+                    success_count += 1
+                    result_item = {
+                        "email": email,
+                        "ok": True,
+                        "status": str(payload.get("status") or "login_alive"),
+                        "message": str(payload.get("message") or "账号可登录"),
+                        "saved": bool(payload.get("saved") or saved_account_id),
+                        "saved_account_id": saved_account_id,
+                        "result": payload,
+                    }
+                    results.append(result_item)
+                    _task_timeline_log(
+                        task_id,
+                        task="邮箱测活",
+                        email=email,
+                        account_id=saved_account_id,
+                        item_index=index,
+                        item_total=total,
+                        phase="done",
+                        phase_label="测活结果",
+                        stage_index=2,
+                        stage_total=2,
+                        message=(
+                            f"结果：{'存活，已保存完整 Auth/RT' if bool(payload.get('has_refresh_token')) else '存活，已保存 AT-only，待补抓 Auth'}"
+                        ),
+                        next_step="处理下一个邮箱",
+                        reset_started_at=True,
+                    )
+            except SkipCurrentAttemptRequested as exc:
+                skipped_count += 1
+                results.append({"email": email, "ok": False, "status": "skipped", "message": str(exc)})
+                _task_timeline_log(
+                    task_id,
+                    task="邮箱测活",
+                    email=email,
+                    item_index=index,
+                    item_total=total,
+                    phase="skipped",
+                    phase_label="已跳过",
+                    stage_index=2,
+                    stage_total=2,
+                    message=str(exc),
+                    next_step="处理下一个邮箱",
+                    reset_started_at=True,
+                )
+            except StopTaskRequested:
+                raise
+            except Exception as exc:
+                error_text = str(exc or "邮箱测活失败")
+                errors.append(f"{email}: {error_text}")
+                results.append({"email": email, "ok": False, "status": "failed", "message": error_text})
+                _task_timeline_log(
+                    task_id,
+                    task="邮箱测活",
+                    email=email,
+                    item_index=index,
+                    item_total=total,
+                    phase="failed",
+                    phase_label="测活异常结束",
+                    stage_index=2,
+                    stage_total=2,
+                    message=error_text,
+                    next_step="处理下一个邮箱",
+                    reset_started_at=True,
+                )
+            finally:
+                control.finish_attempt(attempt_id)
+                _task_store.set_progress(task_id, f"{index}/{total}")
+                _task_store.update_meta(
+                    task_id,
+                    {
+                        "current_email": email,
+                        "current_index": index,
+                        "results": results,
+                    },
+                )
+            wait_before_next_email(index)
+
+        skipped_total = skipped_count + len(skipped_items)
+        summary_message = f"批量邮箱测活完成: 成功 {success_count} 个，跳过 {skipped_total} 个，失败 {len(errors)} 个"
+        _log(task_id, f"[SUMMARY] {summary_message}")
+        log_status = "success" if not errors else "failed"
+        _save_task_log(
+            "chatgpt",
+            primary_email,
+            log_status,
+            error="" if log_status == "success" else summary_message,
+            detail=_build_task_log_detail(
+                task_id,
+                {
+                    "email": primary_email,
+                    "attempt_outcome": "batch_custom_email_recheck_success" if log_status == "success" else "batch_custom_email_recheck_failed",
+                    "source": "batch_custom_email_recheck",
+                    "meta": {
+                        **meta,
+                        "runtime_success": success_count,
+                        "runtime_skipped": skipped_total,
+                        "runtime_errors": errors,
+                        "results": results,
+                    },
+                },
+            ),
+        )
+        _task_store.update_meta(
+            task_id,
+            {
+                "current_email": "",
+                "current_index": total,
+                "results": results,
+                "summary": {
+                    "success": success_count,
+                    "skipped": skipped_total,
+                    "failed": len(errors),
+                },
+            },
+        )
+        _task_store.finish(
+            task_id,
+            status="done",
+            success=success_count,
+            skipped=skipped_total,
+            errors=errors,
+            error="" if not errors else summary_message,
+        )
+    except StopTaskRequested as exc:
+        skipped_total = skipped_count + len(skipped_items)
+        _log(task_id, f"[STOP] {exc}")
+        _save_task_log(
+            "chatgpt",
+            primary_email,
+            "stopped",
+            error=str(exc),
+            detail=_build_task_log_detail(
+                task_id,
+                {
+                    "email": primary_email,
+                    "attempt_outcome": "batch_custom_email_recheck_stopped",
+                    "source": "batch_custom_email_recheck",
+                    "meta": {
+                        **meta,
+                        "runtime_success": success_count,
+                        "runtime_skipped": skipped_total,
+                        "runtime_errors": errors,
+                        "results": results,
+                    },
+                },
+            ),
+        )
+        _task_store.finish(
+            task_id,
+            status="stopped",
+            success=success_count,
+            skipped=skipped_total,
+            errors=errors,
+            error=str(exc),
         )
     finally:
         _task_store.cleanup()
@@ -1669,8 +5127,19 @@ def _run_invalid_recheck(task_id: str, account_id: int):
                 raise ValueError("仅 status=invalid 的账号需要失效测活")
             email = str(account.email or "")
 
-        _log(task_id, f"[失效测活] -------- 账号 {account_id} --------")
-        _log(task_id, f"[失效测活] 开始测活：{email or account_id}")
+        _task_timeline_log(
+            task_id,
+            task="失效测活",
+            email=email,
+            account_id=account_id,
+            phase="prepare",
+            phase_label="准备测活",
+            stage_index=1,
+            stage_total=2,
+            message="开始：仅处理 status=invalid",
+            next_step="无 RT 登录测活并抓取 AccessToken",
+            reset_started_at=True,
+        )
         attempt_id = control.start_attempt()
         try:
             control.checkpoint(attempt_id=attempt_id)
@@ -1678,11 +5147,26 @@ def _run_invalid_recheck(task_id: str, account_id: int):
                 account = session.get(AccountModel, int(account_id or 0))
                 if account is None or account.platform != "chatgpt":
                     raise ValueError("ChatGPT 账号不存在")
+                _task_timeline_log(
+                    task_id,
+                    task="失效测活",
+                    email=email,
+                    account_id=account_id,
+                    phase="stage1_login_probe",
+                    phase_label="无 RT 登录测活并抓取 AccessToken",
+                    stage_index=1,
+                    stage_total=2,
+                    message="开始执行第一阶段登录测活",
+                    next_step="等待 OAuth 邮箱验证码",
+                    reset_started_at=True,
+                )
                 result = _execute_chatgpt_invalid_recheck(
                     account,
                     log_fn=lambda message: _log(task_id, message),
                     stop_checker=lambda: control.checkpoint(attempt_id=attempt_id),
                     task_id=task_id,
+                    task_control=control,
+                    attempt_id=attempt_id,
                 )
                 session.refresh(account)
                 _apply_chatgpt_invalid_recheck_result(account, result, session)
@@ -1696,7 +5180,24 @@ def _run_invalid_recheck(task_id: str, account_id: int):
             control.finish_attempt(attempt_id)
 
         _task_store.set_progress(task_id, "1/1")
-        _log(task_id, f"[OK] 失效测活完成: {email or account_id}")
+        result_data = result.get("data") if isinstance(result.get("data"), dict) else {}
+        _task_timeline_log(
+            task_id,
+            task="失效测活",
+            email=email,
+            account_id=account_id,
+            phase="done",
+            phase_label="失效测活结果",
+            stage_index=2,
+            stage_total=2,
+            message=(
+                "结果：复活成功，已补全完整 Auth/RT"
+                if bool(result_data.get("followup_auth_ok"))
+                else "结果：复活成功，auth=access_token_only，待补抓 Auth"
+            ),
+            next_step="任务完成",
+            reset_started_at=True,
+        )
         _save_task_log(
             "chatgpt",
             email,
@@ -1713,7 +5214,19 @@ def _run_invalid_recheck(task_id: str, account_id: int):
         )
         _task_store.finish(task_id, status="done", success=1, skipped=0, errors=[])
     except SkipCurrentAttemptRequested as exc:
-        _log(task_id, f"[SKIP] 已跳过失效测活: {exc}")
+        _task_timeline_log(
+            task_id,
+            task="失效测活",
+            email=email,
+            account_id=account_id,
+            phase="skipped",
+            phase_label="已跳过",
+            stage_index=2,
+            stage_total=2,
+            message=str(exc),
+            next_step="任务停止",
+            reset_started_at=True,
+        )
         _save_task_log(
             "chatgpt",
             email,
@@ -1732,6 +5245,19 @@ def _run_invalid_recheck(task_id: str, account_id: int):
         _task_store.finish(task_id, status="stopped", success=0, skipped=1, errors=[])
     except StopTaskRequested as exc:
         _log(task_id, f"[STOP] {exc}")
+        _task_timeline_log(
+            task_id,
+            task="失效测活",
+            email=email,
+            account_id=account_id,
+            phase="stopped",
+            phase_label="已停止",
+            stage_index=2,
+            stage_total=2,
+            message=str(exc),
+            next_step="任务停止",
+            reset_started_at=True,
+        )
         _save_task_log(
             "chatgpt",
             email,
@@ -1751,7 +5277,19 @@ def _run_invalid_recheck(task_id: str, account_id: int):
     except Exception as exc:
         error_text = str(exc) or "失效测活失败"
         errors.append(error_text)
-        _log(task_id, f"[FAIL] 失效测活失败: {error_text}")
+        _task_timeline_log(
+            task_id,
+            task="失效测活",
+            email=email,
+            account_id=account_id,
+            phase="failed",
+            phase_label="失效测活失败",
+            stage_index=2,
+            stage_total=2,
+            message=error_text,
+            next_step="查看 Debug 详情",
+            reset_started_at=True,
+        )
         _save_task_log(
             "chatgpt",
             email,
@@ -1776,7 +5314,1836 @@ def _run_invalid_recheck(task_id: str, account_id: int):
             error=error_text,
         )
     finally:
+        _clear_task_current(task_id)
         _task_store.cleanup()
+
+
+def _run_batch_sub2api_upload(task_id: str, account_ids: list[int]):
+    from services.sub2api_sync import backfill_chatgpt_account_to_sub2api
+
+    control = _task_store.control_for(task_id)
+    total = max(len(account_ids), 1)
+    success_count = 0
+    skipped_count = 0
+    errors: list[str] = []
+    primary_email = ""
+
+    _task_store.mark_running(task_id)
+    _task_store.set_progress(task_id, f"0/{total}")
+
+    meta = dict(_task_store.snapshot(task_id).get("meta") or {})
+    skipped_items = list(meta.get("skipped_items") or [])
+    missing_ids = list(meta.get("missing_ids") or [])
+
+    try:
+        for missing_id in missing_ids:
+            _log(task_id, f"[MISS] 账号不存在: account_id={missing_id}")
+            errors.append(f"account_id={missing_id}: 账号不存在")
+
+        for item in skipped_items:
+            _log(task_id, f"[SKIP] {item.get('email') or item.get('account_id') or '-'} - {item.get('reason') or '已跳过'}")
+
+        for index, account_id in enumerate(account_ids, start=1):
+            control.checkpoint(consume_skip=False)
+            email = ""
+            attempt_id = control.start_attempt()
+            try:
+                control.checkpoint(attempt_id=attempt_id)
+                with Session(engine) as session:
+                    account = session.get(AccountModel, int(account_id or 0))
+                    if account is None or account.platform != "chatgpt":
+                        raise ValueError("ChatGPT 账号不存在")
+                    email = str(account.email or "")
+                    if not primary_email:
+                        primary_email = email
+
+                    _log(task_id, f"[Sub2API] {index}/{total} 开始上传: {email or account_id}")
+                    outcome = backfill_chatgpt_account_to_sub2api(account, session=session, commit=True)
+                    ok = bool(outcome.get("ok"))
+                    uploaded = bool(outcome.get("uploaded"))
+                    skipped = bool(outcome.get("skipped"))
+                    message_text = str(outcome.get("message") or "")
+                    if ok and uploaded:
+                        success_count += 1
+                        _log(task_id, f"[OK] Sub2API 上传成功: {email or account_id} - {message_text or '上传成功'}")
+                    elif ok and skipped:
+                        skipped_count += 1
+                        _log(task_id, f"[SKIP] Sub2API 已存在/跳过: {email or account_id} - {message_text or '已跳过'}")
+                    else:
+                        errors.append(f"{email or account_id}: {message_text or '上传失败'}")
+                        _log(task_id, f"[FAIL] Sub2API 上传失败: {email or account_id} - {message_text or '上传失败'}")
+            except SkipCurrentAttemptRequested as exc:
+                skipped_count += 1
+                _log(task_id, f"[SKIP] 已跳过 Sub2API 上传: {email or account_id} - {exc}")
+            except StopTaskRequested:
+                raise
+            except Exception as exc:
+                error_text = str(exc or "Sub2API 上传失败")
+                errors.append(f"{email or account_id}: {error_text}")
+                _log(task_id, f"[FAIL] Sub2API 上传异常: {email or account_id} - {error_text}")
+            finally:
+                control.finish_attempt(attempt_id)
+                _task_store.set_progress(task_id, f"{index}/{total}")
+
+        final_status = "done"
+        summary_message = f"批量 Sub2API 上传完成: 成功 {success_count} 个，跳过 {skipped_count + len(skipped_items)} 个，失败 {len(errors)} 个"
+        _log(task_id, f"[SUMMARY] {summary_message}")
+        log_status = "success" if not errors else "failed"
+        _save_task_log(
+            "chatgpt",
+            primary_email,
+            log_status,
+            error="" if log_status == "success" else summary_message,
+            detail=_build_task_log_detail(
+                task_id,
+                {
+                    "email": primary_email,
+                    "attempt_outcome": "batch_sub2api_upload_success" if log_status == "success" else "batch_sub2api_upload_failed",
+                    "source": "batch_sub2api_upload",
+                    "meta": {
+                        **meta,
+                        "runtime_success": success_count,
+                        "runtime_skipped": skipped_count,
+                        "runtime_errors": errors,
+                    },
+                },
+            ),
+        )
+        _task_store.finish(
+            task_id,
+            status=final_status,
+            success=success_count,
+            skipped=skipped_count + len(skipped_items),
+            errors=errors,
+            error="" if not errors else summary_message,
+        )
+    except StopTaskRequested as exc:
+        _log(task_id, f"[STOP] {exc}")
+        _save_task_log(
+            "chatgpt",
+            primary_email,
+            "stopped",
+            error=str(exc),
+            detail=_build_task_log_detail(
+                task_id,
+                {
+                    "email": primary_email,
+                    "attempt_outcome": "batch_sub2api_upload_stopped",
+                    "source": "batch_sub2api_upload",
+                    "meta": {
+                        **meta,
+                        "runtime_success": success_count,
+                        "runtime_skipped": skipped_count,
+                        "runtime_errors": errors,
+                    },
+                },
+            ),
+        )
+        _task_store.finish(
+            task_id,
+            status="stopped",
+            success=success_count,
+            skipped=skipped_count + len(skipped_items),
+            errors=errors,
+            error=str(exc),
+        )
+    finally:
+        _task_store.cleanup()
+
+
+def _run_batch_oaipay_upload(task_id: str, account_ids: list[int], category_id: int | None = None):
+    from services.oaipay_sync import backfill_chatgpt_account_to_oaipay
+
+    control = _task_store.control_for(task_id)
+    total = max(len(account_ids), 1)
+    success_count = 0
+    skipped_count = 0
+    errors: list[str] = []
+    primary_email = ""
+
+    _task_store.mark_running(task_id)
+    _task_store.set_progress(task_id, f"0/{total}")
+
+    meta = dict(_task_store.snapshot(task_id).get("meta") or {})
+    skipped_items = list(meta.get("skipped_items") or [])
+    missing_ids = list(meta.get("missing_ids") or [])
+
+    try:
+        for missing_id in missing_ids:
+            _log(task_id, f"[MISS] 账号不存在: account_id={missing_id}")
+            errors.append(f"account_id={missing_id}: 账号不存在")
+
+        for item in skipped_items:
+            _log(task_id, f"[SKIP] {item.get('email') or item.get('account_id') or '-'} - {item.get('reason') or '已跳过'}")
+
+        for index, account_id in enumerate(account_ids, start=1):
+            control.checkpoint(consume_skip=False)
+            email = ""
+            attempt_id = control.start_attempt()
+            try:
+                control.checkpoint(attempt_id=attempt_id)
+                with Session(engine) as session:
+                    account = session.get(AccountModel, int(account_id or 0))
+                    if account is None or account.platform != "chatgpt":
+                        raise ValueError("ChatGPT 账号不存在")
+                    email = str(account.email or "")
+                    if not primary_email:
+                        primary_email = email
+
+                    _log(task_id, f"[OAIPay] {index}/{total} 开始上传: {email or account_id}")
+                    outcome = backfill_chatgpt_account_to_oaipay(account, session=session, commit=True, category_id=category_id)
+                    ok = bool(outcome.get("ok"))
+                    uploaded = bool(outcome.get("uploaded"))
+                    skipped = bool(outcome.get("skipped"))
+                    message_text = str(outcome.get("message") or "")
+                    if ok and uploaded:
+                        success_count += 1
+                        _log(task_id, f"[OK] OAIPay 上传成功: {email or account_id} - {message_text or '上传成功'}")
+                    elif ok and skipped:
+                        skipped_count += 1
+                        _log(task_id, f"[SKIP] OAIPay 已存在/跳过: {email or account_id} - {message_text or '已跳过'}")
+                    else:
+                        errors.append(f"{email or account_id}: {message_text or '上传失败'}")
+                        _log(task_id, f"[FAIL] OAIPay 上传失败: {email or account_id} - {message_text or '上传失败'}")
+            except SkipCurrentAttemptRequested as exc:
+                skipped_count += 1
+                _log(task_id, f"[SKIP] 已跳过 OAIPay 上传: {email or account_id} - {exc}")
+            except StopTaskRequested:
+                raise
+            except Exception as exc:
+                error_text = str(exc or "OAIPay 上传失败")
+                errors.append(f"{email or account_id}: {error_text}")
+                _log(task_id, f"[FAIL] OAIPay 上传异常: {email or account_id} - {error_text}")
+            finally:
+                control.finish_attempt(attempt_id)
+                _task_store.set_progress(task_id, f"{index}/{total}")
+
+        final_status = "done"
+        summary_message = f"批量 OAIPay 上传完成: 成功 {success_count} 个，跳过 {skipped_count + len(skipped_items)} 个，失败 {len(errors)} 个"
+        _log(task_id, f"[SUMMARY] {summary_message}")
+        log_status = "success" if not errors else "failed"
+        _save_task_log(
+            "chatgpt",
+            primary_email,
+            log_status,
+            error="" if log_status == "success" else summary_message,
+            detail=_build_task_log_detail(
+                task_id,
+                {
+                    "email": primary_email,
+                    "attempt_outcome": "batch_oaipay_upload_success" if log_status == "success" else "batch_oaipay_upload_failed",
+                    "source": "batch_oaipay_upload",
+                    "meta": {
+                        **meta,
+                        "runtime_success": success_count,
+                        "runtime_skipped": skipped_count,
+                        "runtime_errors": errors,
+                    },
+                },
+            ),
+        )
+        _task_store.finish(
+            task_id,
+            status=final_status,
+            success=success_count,
+            skipped=skipped_count + len(skipped_items),
+            errors=errors,
+            error="" if not errors else summary_message,
+        )
+    except StopTaskRequested as exc:
+        _log(task_id, f"[STOP] {exc}")
+        _save_task_log(
+            "chatgpt",
+            primary_email,
+            "stopped",
+            error=str(exc),
+            detail=_build_task_log_detail(
+                task_id,
+                {
+                    "email": primary_email,
+                    "attempt_outcome": "batch_oaipay_upload_stopped",
+                    "source": "batch_oaipay_upload",
+                    "meta": {
+                        **meta,
+                        "runtime_success": success_count,
+                        "runtime_skipped": skipped_count,
+                        "runtime_errors": errors,
+                    },
+                },
+            ),
+        )
+        _task_store.finish(
+            task_id,
+            status="stopped",
+            success=success_count,
+            skipped=skipped_count + len(skipped_items),
+            errors=errors,
+            error=str(exc),
+        )
+    finally:
+        _task_store.cleanup()
+
+
+def _run_baxigpt_cdk_submit(task_id: str, pairs: list[dict[str, Any]], settings: dict[str, Any]):
+    from services.chatgpt_core.baxigpt_cdk_repository import BaxiGptCdkRepository
+    from services.chatgpt_core.baxigpt_client import BaxiGptClient
+    from services.chatgpt_core.baxigpt_status_poller import enqueue_status_poll
+
+    control = _task_store.control_for(task_id)
+    repo = BaxiGptCdkRepository()
+    client = BaxiGptClient()
+    total = max(len(pairs), 1)
+    success_count = 0
+    skipped_count = 0
+    errors: list[str] = []
+    runtime_results: list[dict[str, Any]] = []
+    primary_email = ""
+    precheck = _is_truthy(settings.get("precheck"))
+    failure_continue = _is_truthy(settings.get("failure_continue"))
+    submit_interval_seconds = max(int(settings.get("submit_interval_seconds") or 0), 0)
+    auto_poll_status = settings.get("auto_poll_status") is None or _is_truthy(settings.get("auto_poll_status"))
+    status_poll_interval_seconds = max(int(settings.get("status_poll_interval_seconds") or 5), 1)
+    status_poll_timeout_seconds = max(int(settings.get("status_poll_timeout_seconds") or 300), status_poll_interval_seconds)
+
+    _task_store.mark_running(task_id)
+    _task_store.set_progress(task_id, f"0/{total}")
+
+    meta = dict(_task_store.snapshot(task_id).get("meta") or {})
+    missing_ids = list(meta.get("missing_ids") or [])
+    skipped_accounts = list(meta.get("skipped_accounts") or [])
+
+    def sync_meta() -> None:
+        _task_store.update_meta(
+            task_id,
+            {
+                "runtime_results": list(runtime_results),
+                "runtime_success": success_count,
+                "runtime_skipped": skipped_count,
+                "runtime_errors": list(errors),
+            },
+        )
+
+    def wait_before_next(index: int, attempt_id: int | None = None) -> None:
+        if index >= len(pairs) or submit_interval_seconds <= 0:
+            return
+        _log(task_id, f"[Pix] 等待提交间隔 {submit_interval_seconds}s 后继续下一个账号")
+        remaining = float(submit_interval_seconds)
+        while remaining > 0:
+            control.checkpoint(attempt_id=attempt_id)
+            chunk = min(1.0, remaining)
+            time.sleep(chunk)
+            remaining -= chunk
+
+    def append_result(**payload: Any) -> None:
+        runtime_results.append(
+            {
+                "finished_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                **payload,
+            }
+        )
+        sync_meta()
+
+    def log_debug(message: str) -> None:
+        _log(task_id, f"[DEBUG][Pix] {message}")
+
+    def response_brief(response: dict[str, Any] | None, *, keys: tuple[str, ...] = ()) -> dict[str, Any]:
+        data = response if isinstance(response, dict) else {}
+        selected = keys or (
+            "ok",
+            "status",
+            "status_code",
+            "remaining",
+            "total",
+            "used",
+            "order_id",
+            "display_id",
+            "email",
+            "message",
+            "msg",
+            "error",
+            "detail",
+        )
+        return {key: data.get(key) for key in selected if key in data}
+
+    def upstream_message(response: dict[str, Any] | None, fallback: str = "上游返回失败") -> str:
+        data = response if isinstance(response, dict) else {}
+        for key in ("message", "msg", "error", "detail", "reason"):
+            text = str(data.get(key) or "").strip()
+            if text:
+                return text
+        return fallback
+
+    try:
+        log_debug(
+            "task settings: "
+            f"pairs={len(pairs)} precheck={precheck} failure_continue={failure_continue} "
+            f"submit_interval={submit_interval_seconds}s auto_poll={auto_poll_status} "
+            f"poll_interval={status_poll_interval_seconds}s poll_timeout={status_poll_timeout_seconds}s "
+            f"code_source={meta.get('code_source') or '-'}"
+        )
+        for missing_id in missing_ids:
+            _log(task_id, f"[MISS] 账号不存在: account_id={missing_id}")
+            errors.append(f"account_id={missing_id}: 账号不存在")
+
+        for item in skipped_accounts:
+            _log(task_id, f"[SKIP] {item.get('email') or item.get('account_id') or '-'} - {item.get('reason') or '已跳过'}")
+
+        for index, pair in enumerate(pairs, start=1):
+            control.checkpoint(consume_skip=False)
+            account_id = int(pair.get("account_id") or 0)
+            cdk_id = int(pair.get("cdk_id") or 0)
+            email = str(pair.get("email") or "")
+            code_masked = str(pair.get("code_masked") or "")
+            manual_code = bool(pair.get("manual_code")) or str(meta.get("code_source") or "") == "import"
+            if not primary_email and email:
+                primary_email = email
+            attempt_id = control.start_attempt()
+            reserved_record = None
+            already_prechecked = False
+            try:
+                control.checkpoint(attempt_id=attempt_id)
+                log_debug(
+                    f"pair {index}/{len(pairs)}: account_id={account_id} cdk_id={cdk_id} "
+                    f"manual_code={manual_code} code_status={pair.get('code_status') or '-'}"
+                )
+                if manual_code:
+                    # 手动粘贴的卡密不能只按本地 status 过滤；即使本地曾经标记 failed/paid，
+                    # 也要先走上游 code-info，让无配额/不存在能进入任务日志并给出明确提示。
+                    candidate_record = repo.get_by_id(cdk_id)
+                    if candidate_record is None:
+                        skipped_count += 1
+                        _log(task_id, f"[SKIP] 卡密不存在: {code_masked or cdk_id}")
+                        append_result(account_id=account_id, email=email, cdk_id=cdk_id, code_masked=code_masked, status="skipped", reason="卡密不存在")
+                        continue
+                    code_masked = candidate_record.code_masked or code_masked
+                    _log(task_id, f"[Pix] -------- {index}/{len(pairs)} | {email or account_id} | {code_masked} --------")
+                    _log(task_id, f"[Pix] 预查卡密: {code_masked}")
+                    info = client.code_info(candidate_record.code_value)
+                    log_debug(f"code-info response {code_masked}: {response_brief(info)}")
+                    repo.mark_code_info(candidate_record.id, info)
+                    ok = bool(info.get("ok"))
+                    remaining_present = "remaining" in info
+                    try:
+                        remaining = int(info.get("remaining") or 0)
+                    except Exception:
+                        remaining = 0
+                    if not ok or (remaining_present and remaining <= 0):
+                        message = upstream_message(info, f"卡密不可用 remaining={remaining}")
+                        raise ValueError(message)
+                    _log(task_id, f"[Pix] 卡密可用: remaining={info.get('remaining')} total={info.get('total')}")
+                    already_prechecked = True
+                    reserved_record = repo.reserve_for_account(candidate_record.id, account_id=account_id, email=email, task_id=task_id)
+                    if reserved_record is None:
+                        skipped_count += 1
+                        _log(task_id, f"[SKIP] 卡密当前不可用或已被占用: {code_masked or cdk_id}")
+                        append_result(account_id=account_id, email=email, cdk_id=cdk_id, code_masked=code_masked, status="skipped", reason="卡密当前不可用或已被占用")
+                        continue
+                    code_masked = reserved_record.code_masked or code_masked
+                    log_debug(f"reserved manual cdk: record_id={reserved_record.id} account_id={account_id}")
+                else:
+                    reserved_record = repo.reserve_for_account(cdk_id, account_id=account_id, email=email, task_id=task_id)
+                    if reserved_record is None:
+                        skipped_count += 1
+                        _log(task_id, f"[SKIP] 卡密不可用或已被占用: {code_masked or cdk_id}")
+                        append_result(account_id=account_id, email=email, cdk_id=cdk_id, code_masked=code_masked, status="skipped", reason="卡密不可用或已被占用")
+                        continue
+                    code_masked = reserved_record.code_masked
+                    log_debug(f"reserved pool cdk: record_id={reserved_record.id} account_id={account_id}")
+                    _log(task_id, f"[Pix] -------- {index}/{len(pairs)} | {email or account_id} | {code_masked} --------")
+
+                with Session(engine) as session:
+                    account = session.get(AccountModel, account_id)
+                    if account is None or account.platform != "chatgpt":
+                        raise ValueError("ChatGPT 账号不存在")
+                    email = str(account.email or email or "")
+                    access_token = _chatgpt_account_access_token(account)
+                    if not access_token:
+                        raise ValueError("账号缺少 Access Token")
+                    log_debug(f"account auth material: account_id={account_id} access_token_len={len(access_token)}")
+
+                if precheck and not already_prechecked:
+                    _log(task_id, f"[Pix] 预查卡密: {code_masked}")
+                    info = client.code_info(reserved_record.code_value)
+                    log_debug(f"code-info response {code_masked}: {response_brief(info)}")
+                    repo.mark_code_info(reserved_record.id, info)
+                    ok = bool(info.get("ok"))
+                    remaining_present = "remaining" in info
+                    try:
+                        remaining = int(info.get("remaining") or 0)
+                    except Exception:
+                        remaining = 0
+                    if not ok or (remaining_present and remaining <= 0):
+                        message = upstream_message(info, f"卡密不可用 remaining={remaining}")
+                        failed_record = repo.mark_failure(reserved_record.id, error_code="code_info_failed", error_message=message, response=info)
+                        with Session(engine) as session:
+                            account = session.get(AccountModel, account_id)
+                            if account is not None and failed_record is not None:
+                                repo.persist_account_binding_extra(account, failed_record)
+                                session.add(account)
+                                session.commit()
+                        raise ValueError(message)
+                    _log(task_id, f"[Pix] 卡密可用: remaining={info.get('remaining')} total={info.get('total')}")
+
+                _log(task_id, f"[Pix] 提交上游: {email or account_id} -> {code_masked}")
+                response = client.submit(code=reserved_record.code_value, access_token=access_token)
+                log_debug(f"submit response {code_masked}: {response_brief(response)}")
+                ok = bool(response.get("ok"))
+                order_id = str(response.get("order_id") or "").strip()
+                if not ok or not order_id:
+                    message = upstream_message(response, "上游提交失败")
+                    repo.mark_failure(reserved_record.id, error_code="submit_failed", error_message=message, response=response)
+                    raise ValueError(message)
+
+                submitted_record = repo.mark_submit_success(reserved_record.id, response)
+                with Session(engine) as session:
+                    account = session.get(AccountModel, account_id)
+                    if account is not None and submitted_record is not None:
+                        repo.persist_account_binding_extra(account, submitted_record)
+                        session.add(account)
+                        session.commit()
+                success_count += 1
+                status_polling = False
+                if auto_poll_status and submitted_record is not None and submitted_record.order_id:
+                    status_polling = enqueue_status_poll(
+                        submitted_record.id,
+                        task_id=task_id,
+                        interval_seconds=status_poll_interval_seconds,
+                        timeout_seconds=status_poll_timeout_seconds,
+                        log=lambda message, _task_id=task_id: _log(_task_id, message),
+                    )
+                    log_debug(
+                        f"status poll enqueue: record_id={submitted_record.id} order_id={submitted_record.order_id} "
+                        f"queued={status_polling} interval={status_poll_interval_seconds}s timeout={status_poll_timeout_seconds}s"
+                    )
+                append_result(
+                    account_id=account_id,
+                    email=email,
+                    cdk_id=reserved_record.id,
+                    code_masked=code_masked,
+                    status=(submitted_record.status if submitted_record else "submitted"),
+                    upstream_status=str(response.get("status") or ""),
+                    order_id=order_id,
+                    display_id=str(response.get("display_id") or ""),
+                    remote_email=str(response.get("email") or ""),
+                    status_polling=status_polling,
+                )
+                _log(
+                    task_id,
+                    "[OK] 上游提交成功: "
+                    f"{email or account_id} -> {code_masked} "
+                    f"display_id={response.get('display_id') or '-'} status={response.get('status') or 'submitted'}",
+                )
+                if status_polling:
+                    _log(
+                        task_id,
+                        "[Pix] 已加入状态轮询: "
+                        f"{response.get('display_id') or order_id} interval={status_poll_interval_seconds}s timeout={status_poll_timeout_seconds}s",
+                    )
+                wait_before_next(index, attempt_id)
+            except SkipCurrentAttemptRequested as exc:
+                skipped_count += 1
+                _log(task_id, f"[SKIP] 已跳过当前卡密提交: {email or account_id} - {exc}")
+                append_result(account_id=account_id, email=email, cdk_id=cdk_id, code_masked=code_masked, status="skipped", reason=str(exc))
+            except StopTaskRequested:
+                raise
+            except Exception as exc:
+                error_text = str(exc or "Pix 卡密提交失败")
+                log_debug(f"exception: pair={index} account_id={account_id} cdk_id={cdk_id} type={type(exc).__name__} message={error_text}")
+                errors.append(f"{email or account_id}: {error_text}")
+                if reserved_record is not None:
+                    failed_record = repo.mark_failure(reserved_record.id, error_code="submit_error", error_message=error_text)
+                    with Session(engine) as session:
+                        account = session.get(AccountModel, account_id)
+                        if account is not None and failed_record is not None:
+                            repo.persist_account_binding_extra(account, failed_record)
+                            session.add(account)
+                            session.commit()
+                append_result(account_id=account_id, email=email, cdk_id=cdk_id, code_masked=code_masked, status="failed", reason=error_text)
+                _log(task_id, f"[FAIL] Pix 卡密提交失败: {email or account_id} -> {code_masked or cdk_id} - {error_text}")
+                if not failure_continue:
+                    _log(task_id, "[Pix] 失败后继续已关闭，停止后续提交")
+                    break
+            finally:
+                control.finish_attempt(attempt_id)
+                _task_store.set_progress(task_id, f"{index}/{total}")
+
+        summary_message = f"Pix 卡密提交完成: 上游提交成功 {success_count} 个，跳过 {skipped_count} 个，失败 {len(errors)} 个"
+        if errors:
+            summary_message = f"{summary_message}；首个失败: {errors[0]}"
+        _log(task_id, f"[SUMMARY] {summary_message}")
+        latest_meta = dict(_task_store.snapshot(task_id).get("meta") or {})
+        log_status = "success" if success_count > 0 and not errors else "failed"
+        _save_task_log(
+            "chatgpt",
+            primary_email,
+            log_status,
+            error="" if log_status == "success" else summary_message,
+            detail=_build_task_log_detail(
+                task_id,
+                {
+                    "email": primary_email,
+                    "attempt_outcome": "baxigpt_cdk_submit_success" if log_status == "success" else "baxigpt_cdk_submit_failed",
+                    "source": "baxigpt_cdk_submit",
+                    "meta": latest_meta,
+                    "runtime_results": list(runtime_results),
+                },
+            ),
+        )
+        _task_store.finish(
+            task_id,
+            status="done" if log_status == "success" else "failed",
+            success=success_count,
+            skipped=skipped_count,
+            errors=errors,
+            error="" if not errors else summary_message,
+        )
+    except StopTaskRequested as exc:
+        _log(task_id, f"[STOP] {exc}")
+        sync_meta()
+        _task_store.finish(
+            task_id,
+            status="stopped",
+            success=success_count,
+            skipped=skipped_count,
+            errors=errors,
+            error=str(exc),
+        )
+        _save_task_log(
+            "chatgpt",
+            primary_email,
+            "stopped",
+            error=str(exc),
+            detail=_build_task_log_detail(
+                task_id,
+                {
+                    "email": primary_email,
+                    "attempt_outcome": "baxigpt_cdk_submit_stopped",
+                    "source": "baxigpt_cdk_submit",
+                    "meta": dict(_task_store.snapshot(task_id).get("meta") or {}),
+                    "runtime_results": list(runtime_results),
+                },
+            ),
+        )
+        _task_store.finish(
+            task_id,
+            status="stopped",
+            success=success_count,
+            skipped=skipped_count,
+            errors=errors,
+            error=str(exc),
+        )
+    finally:
+        _clear_task_current(task_id)
+        _task_store.cleanup()
+
+
+def _run_chatgpt_oaipay_approval(task_id: str, account_ids: list[int], settings: dict[str, Any]):
+    from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+    from datetime import datetime, timezone
+
+    from services.chatgpt_account_state import mark_payment_pending
+    from services.chatgpt_core.oaipay_client import (
+        DEFAULT_BASE_URL as OAIPAY_DEFAULT_BASE_URL,
+        DEFAULT_PROXY_POOL,
+        OaiPayClient,
+        extract_approval_url,
+        sanitize_oaipay_result,
+    )
+    from services.chatgpt_core.paypal_binding_client import mask_proxy
+
+    control = _task_store.control_for(task_id)
+    total = max(len(account_ids), 1)
+    success_count = 0
+    skipped_count = 0
+    errors: list[str] = []
+    runtime_results: list[dict[str, Any]] = []
+    approval_urls: list[dict[str, Any]] = []
+    results_lock = threading.Lock()
+    primary_email = ""
+
+    base_url = str(settings.get("base_url") or OAIPAY_DEFAULT_BASE_URL).strip().rstrip("/") or OAIPAY_DEFAULT_BASE_URL
+    proxy = str(settings.get("proxy") or "").strip()
+    proxy_pool = str(settings.get("proxy_pool") or DEFAULT_PROXY_POOL).strip() or DEFAULT_PROXY_POOL
+    submit_mode = str(settings.get("submit_mode") or "serial").strip().lower()
+    if submit_mode not in {"serial", "batch"}:
+        submit_mode = "serial"
+    submit_delay_seconds = max(float(settings.get("submit_delay_seconds") or 0), 0.0)
+    batch_max_workers = min(max(int(settings.get("batch_max_workers") or 50), 1), 200)
+    timeout = max(float(settings.get("timeout") or 30), 5.0)
+    event_timeout = max(float(settings.get("event_timeout") or 90), 10.0)
+    account_interval_seconds = max(int(settings.get("account_interval_seconds") or 0), 0)
+    failure_continue = bool(settings.get("failure_continue", True))
+    precheck_token_info = bool(settings.get("precheck_token_info", True))
+    billing_country = str(settings.get("billing_country") or "US").strip() or "US"
+    payment_locale = str(settings.get("payment_locale") or "en").strip() or "en"
+    checkout_ui_mode = str(settings.get("checkout_ui_mode") or "hosted").strip() or "hosted"
+
+    _task_store.mark_running(task_id)
+    _task_store.set_progress(task_id, f"0/{total}")
+    _log(
+        task_id,
+        "[OaiPay] approvalUrl 批量提取启动: "
+        f"base_url={base_url} mode={submit_mode} accounts={len(account_ids)} "
+        f"proxy={mask_proxy(proxy)} proxy_pool={proxy_pool} "
+        f"delay={submit_delay_seconds}s precheck={'on' if precheck_token_info else 'off'}",
+    )
+
+    def sync_meta() -> None:
+        with results_lock:
+            results_snapshot = list(runtime_results)
+            urls_snapshot = list(approval_urls)
+            errors_snapshot = list(errors)
+            success_snapshot = success_count
+            skipped_snapshot = skipped_count
+        _task_store.update_meta(
+            task_id,
+            {
+                "runtime_results": results_snapshot,
+                "approval_urls": urls_snapshot,
+                "runtime_success": success_snapshot,
+                "runtime_skipped": skipped_snapshot,
+                "runtime_errors": errors_snapshot,
+            },
+        )
+
+    def append_result(payload: dict[str, Any]) -> None:
+        nonlocal success_count, skipped_count
+        payload = {
+            "finished_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            **dict(payload or {}),
+        }
+        with results_lock:
+            runtime_results.append(payload)
+            status_value = str(payload.get("status") or "").strip()
+            if status_value == "success":
+                success_count += 1
+                approval_url = str(payload.get("approval_url") or "").strip()
+                if approval_url:
+                    approval_urls.append(
+                        {
+                            "account_id": payload.get("account_id"),
+                            "email": payload.get("email"),
+                            "approval_url": approval_url,
+                            "cs_id": payload.get("cs_id", ""),
+                            "payment_method_id": payload.get("payment_method_id", ""),
+                            "checkout_amount": payload.get("checkout_amount", ""),
+                        }
+                    )
+            elif status_value == "skipped":
+                skipped_count += 1
+        sync_meta()
+
+    def persist_approval_snapshot(account_id: int, *, patch: dict[str, Any]) -> None:
+        with Session(engine) as session:
+            account = session.get(AccountModel, account_id)
+            if account is None or account.platform != "chatgpt":
+                return
+            try:
+                extra = account.get_extra()
+            except Exception:
+                extra = {}
+            if not isinstance(extra, dict):
+                extra = {}
+
+            now_iso = datetime.now(timezone.utc).isoformat()
+            paypal_url = str(
+                patch.get("paypal_url")
+                or patch.get("approval_url")
+                or patch.get("provider_redirect_url")
+                or patch.get("long_url")
+                or ""
+            ).strip()
+            checkout_amount = str(patch.get("checkout_amount") or "").strip()
+            currency = str(patch.get("currency") or ("USD" if "USD" in checkout_amount.upper() else "") or "").strip().upper()
+            amount_normalized = checkout_amount.upper().replace(",", "").strip()
+            checkout_amount_is_zero = (
+                not checkout_amount
+                or amount_normalized in {"0", "0.0", "0.00", "0 USD", "0.0 USD", "0.00 USD", "$0", "$0.00"}
+                or amount_normalized.startswith("0 ")
+            )
+            current = extra.get("chatgpt_oaipay_approval") if isinstance(extra.get("chatgpt_oaipay_approval"), dict) else {}
+            current.update(
+                {
+                    "updated_at": now_iso,
+                    **dict(patch or {}),
+                }
+            )
+            extra["chatgpt_oaipay_approval"] = current
+
+            paypal_marker = extra.get("chatgpt_paypal_binding") if isinstance(extra.get("chatgpt_paypal_binding"), dict) else {}
+            if str(patch.get("status") or "") == "success":
+                paypal_url_payload = {
+                    "updated_at": now_iso,
+                    "created_at": str(patch.get("created_at") or now_iso),
+                    "status": "paypal_url_created",
+                    "stage": "paypal_url_created",
+                    "source": str(patch.get("upstream") or "oaipay"),
+                    "upstream": str(patch.get("upstream") or "oaipay"),
+                    "url": paypal_url,
+                    "paypal_url": paypal_url,
+                    "approval_url": paypal_url,
+                    "payment_link_format": "paypal_url",
+                    "link_type": str(patch.get("link_type") or "paypal"),
+                    "plan": "plus",
+                    "country": str(patch.get("billing_country") or "US").strip().upper() or "US",
+                    "billing_country": str(patch.get("billing_country") or "US").strip().upper() or "US",
+                    "currency": currency or "USD",
+                    "checkout_amount": checkout_amount,
+                    "checkout_amount_is_zero": checkout_amount_is_zero,
+                    "cs_id": str(patch.get("cs_id") or ""),
+                    "payment_method_id": str(patch.get("payment_method_id") or ""),
+                    "payment_method_type": str(patch.get("payment_method_type") or ""),
+                    "processor_entity": str(patch.get("processor_entity") or ""),
+                    "payment_locale": str(patch.get("payment_locale") or ""),
+                    "provider_redirect_url": str(patch.get("provider_redirect_url") or ""),
+                    "long_url": str(patch.get("long_url") or ""),
+                    "stripe_redirect_url": str(patch.get("stripe_redirect_url") or ""),
+                    "stripe_hosted_url": str(patch.get("stripe_hosted_url") or ""),
+                    "proxy": str(patch.get("proxy") or ""),
+                    "proxy_pool": str(patch.get("proxy_pool") or ""),
+                }
+                extra["chatgpt_paypal_url"] = paypal_url_payload
+                last_payment_link = dict(paypal_url_payload)
+                last_payment_link.update(
+                    {
+                        "source": str(patch.get("upstream") or "oaipay"),
+                        "url": paypal_url,
+                    }
+                )
+                extra["chatgpt_last_payment_link"] = last_payment_link
+                account.cashier_url = paypal_url
+                mark_payment_pending(account, reason="paypal_url_created")
+                paypal_marker.update(
+                    {
+                        "updated_at": now_iso,
+                        "status": "paypal_url_created",
+                        "phase": "paypal_url_created",
+                        "upstream": "oaipay",
+                        "paypal_url": paypal_url,
+                        "approval_url": paypal_url,
+                        "cs_id": str(patch.get("cs_id") or ""),
+                        "payment_method_id": str(patch.get("payment_method_id") or ""),
+                        "checkout_amount": checkout_amount,
+                    }
+                )
+            elif str(patch.get("status") or "") == "failed":
+                paypal_marker.update(
+                    {
+                        "updated_at": now_iso,
+                        "status": "paypal_url_failed",
+                        "phase": "paypal_url_failed",
+                        "upstream": "oaipay",
+                        "error": str(patch.get("error") or ""),
+                    }
+                )
+            if paypal_marker:
+                extra["chatgpt_paypal_binding"] = paypal_marker
+
+            account.set_extra(extra)
+            account.updated_at = datetime.now(timezone.utc)
+            session.add(account)
+            session.commit()
+
+    def load_account(account_id: int) -> tuple[str, str]:
+        with Session(engine) as session:
+            account = session.get(AccountModel, int(account_id or 0))
+            if account is None or account.platform != "chatgpt":
+                raise ValueError("ChatGPT 账号不存在")
+            email = str(account.email or "")
+            skip_reason = _paypal_bind_skip_reason(account)
+            if skip_reason:
+                raise SkipCurrentAttemptRequested(skip_reason)
+            access_token = _chatgpt_account_access_token(account)
+            if not access_token:
+                raise ValueError("账号缺少 Access Token")
+            return email, access_token
+
+    def wait_seconds(seconds: float, *, attempt_id: int | None = None) -> None:
+        remaining = max(float(seconds or 0), 0.0)
+        while remaining > 0:
+            control.checkpoint(attempt_id=attempt_id)
+            chunk = min(0.5, remaining)
+            time.sleep(chunk)
+            remaining -= chunk
+
+    def run_one(index: int, account_id: int, *, start_delay: float = 0.0) -> dict[str, Any]:
+        nonlocal primary_email
+        attempt_id = control.start_attempt()
+        email = ""
+        try:
+            control.checkpoint(attempt_id=attempt_id)
+            if start_delay > 0:
+                _log(task_id, f"[OaiPay] {index}/{len(account_ids)} 延时 {start_delay:g}s 后提交")
+                wait_seconds(start_delay, attempt_id=attempt_id)
+            email, access_token = load_account(account_id)
+            if not primary_email and email:
+                primary_email = email
+            control.checkpoint(attempt_id=attempt_id)
+
+            _log(task_id, f"[OaiPay] -------- {index}/{len(account_ids)} | {email or account_id} --------")
+            client = OaiPayClient(base_url=base_url, timeout=timeout, event_timeout=event_timeout)
+            _log(task_id, f"[OaiPay] 请求浏览器: {client.browser_profile_label}")
+
+            token_info: dict[str, Any] = {}
+            if precheck_token_info:
+                _log(task_id, f"[OaiPay] token-info 预检: {email or account_id}")
+                token_info = client.token_info(
+                    access_token=access_token,
+                    proxy=proxy,
+                    proxy_pool=proxy_pool,
+                )
+                _log(
+                    task_id,
+                    "[OaiPay] token-info: "
+                    f"ok={bool(token_info.get('ok'))} "
+                    f"plan={token_info.get('plan') or token_info.get('account_type') or '-'} "
+                    f"proxy={token_info.get('proxy_source') or '-'}",
+                )
+
+            progress_steps: list[dict[str, Any]] = []
+            final_result: dict[str, Any] | None = None
+            final_error = ""
+            _log(task_id, f"[OaiPay] 提交 approvalUrl 提取: {email or account_id}")
+            for event in client.iter_long_link_events(
+                access_token=access_token,
+                proxy=proxy,
+                proxy_pool=proxy_pool,
+                billing_country=billing_country,
+                checkout_ui_mode=checkout_ui_mode,
+                payment_locale=payment_locale,
+                mode=2,
+                link_type="paypal",
+            ):
+                control.checkpoint(attempt_id=attempt_id)
+                event_type = str(event.get("type") or event.get("event") or "").strip()
+                if event_type == "progress":
+                    step = event.get("step", "")
+                    total_steps = event.get("total", "")
+                    desc = str(event.get("desc") or "")
+                    progress_steps.append(
+                        {
+                            "step": step,
+                            "total": total_steps,
+                            "desc": desc,
+                        }
+                    )
+                    _log(task_id, f"[OaiPay] {email or account_id} 进度 {step}/{total_steps}: {desc}")
+                    continue
+                if event_type == "error":
+                    final_error = str(event.get("detail") or event.get("error") or event.get("message") or "oaipay 上游返回失败")
+                    break
+                if event_type == "done":
+                    result = event.get("result") if isinstance(event.get("result"), dict) else {}
+                    final_result = dict(result)
+                    break
+                _log(task_id, f"[OaiPay] {email or account_id} 事件: {json.dumps(event, ensure_ascii=False)}", level="debug")
+
+            if final_error:
+                raise ValueError(final_error)
+            if final_result is None:
+                raise ValueError("上游事件流结束但未返回 done.result")
+
+            approval_url = extract_approval_url(final_result)
+            sanitized = sanitize_oaipay_result(final_result)
+            if not approval_url:
+                raise ValueError("上游成功返回但缺少 approvalUrl")
+            if not bool(final_result.get("ok", False)):
+                raise ValueError(str(final_result.get("provider_error") or "上游 result.ok != true"))
+            if bool(final_result.get("fallback", False)):
+                raise ValueError(str(final_result.get("provider_error") or "上游 fallback=true"))
+
+            payload = {
+                "account_id": account_id,
+                "email": email,
+                "status": "success",
+                "upstream": "oaipay",
+                "stage": "paypal_url_created",
+                "paypal_url": approval_url,
+                "approval_url": approval_url,
+                "provider_redirect_url": str(final_result.get("provider_redirect_url") or ""),
+                "long_url": str(final_result.get("long_url") or ""),
+                "stripe_redirect_url": str(final_result.get("stripe_redirect_url") or ""),
+                "stripe_hosted_url": str(final_result.get("stripe_hosted_url") or ""),
+                "cs_id": str(final_result.get("cs_id") or ""),
+                "payment_method_id": str(final_result.get("payment_method_id") or ""),
+                "payment_method_type": str(final_result.get("payment_method_type") or ""),
+                "checkout_amount": str(final_result.get("checkout_amount") or ""),
+                "processor_entity": str(final_result.get("processor_entity") or ""),
+                "billing_country": str(final_result.get("billing_country") or billing_country),
+                "currency": str(final_result.get("currency") or ""),
+                "payment_locale": str(final_result.get("payment_locale") or payment_locale),
+                "link_type": str(final_result.get("link_type") or "paypal"),
+                "fallback": bool(final_result.get("fallback", False)),
+                "provider_error": str(final_result.get("provider_error") or ""),
+                "proxy": mask_proxy(proxy),
+                "proxy_pool": proxy_pool,
+                "progress": progress_steps,
+                "token_info": {
+                    "ok": bool(token_info.get("ok", False)) if token_info else None,
+                    "email": str(token_info.get("email") or "") if token_info else "",
+                    "plan": str(token_info.get("plan") or token_info.get("account_type") or "") if token_info else "",
+                    "proxy_source": str(token_info.get("proxy_source") or "") if token_info else "",
+                    "proxy_route": str(token_info.get("proxy_route") or "") if token_info else "",
+                },
+                "result": sanitized,
+            }
+            persist_approval_snapshot(
+                account_id,
+                patch={
+                    "status": "success",
+                    "phase": "paypal_url_created",
+                    **payload,
+                },
+            )
+            _task_store.add_cashier_url(task_id, approval_url)
+            append_result(payload)
+            _log(task_id, f"[OK] approvalUrl 已返回: {email or account_id} amount={payload['checkout_amount'] or '-'}")
+            return payload
+        except SkipCurrentAttemptRequested as exc:
+            payload = {
+                "account_id": account_id,
+                "email": email,
+                "status": "skipped",
+                "reason": str(exc),
+            }
+            append_result(payload)
+            _log(task_id, f"[SKIP] {email or account_id} - {exc}")
+            return payload
+        except StopTaskRequested:
+            raise
+        except Exception as exc:
+            error_text = str(exc or "oaipay approvalUrl 提取失败")
+            payload = {
+                "account_id": account_id,
+                "email": email,
+                "status": "failed",
+                "stage": "error",
+                "reason": error_text,
+                "error": error_text,
+                "proxy": mask_proxy(proxy),
+                "proxy_pool": proxy_pool,
+            }
+            try:
+                persist_approval_snapshot(
+                    account_id,
+                    patch={
+                        "status": "failed",
+                        "phase": "error",
+                        "error": error_text,
+                        "proxy": mask_proxy(proxy),
+                        "proxy_pool": proxy_pool,
+                    },
+                )
+            except Exception:
+                pass
+            append_result(payload)
+            _log(task_id, f"[FAIL] approvalUrl 提取失败: {email or account_id} - {error_text}")
+            return payload
+        finally:
+            control.finish_attempt(attempt_id)
+
+    try:
+        if submit_mode == "batch":
+            _log(task_id, f"[OaiPay] 批量提交模式: max_workers={batch_max_workers} start_delay={submit_delay_seconds:g}s")
+            completed = 0
+            with ThreadPoolExecutor(max_workers=min(batch_max_workers, max(len(account_ids), 1))) as executor:
+                pending = {
+                    executor.submit(run_one, index, account_id, start_delay=(index - 1) * submit_delay_seconds): (index, account_id)
+                    for index, account_id in enumerate(account_ids, start=1)
+                }
+                while pending:
+                    control.checkpoint(consume_skip=False)
+                    done, _ = wait(pending, timeout=0.5, return_when=FIRST_COMPLETED)
+                    for future in done:
+                        index, account_id = pending.pop(future)
+                        try:
+                            result = future.result()
+                            if str(result.get("status") or "") == "failed":
+                                errors.append(f"{result.get('email') or account_id}: {result.get('error') or result.get('reason') or 'failed'}")
+                        except StopTaskRequested:
+                            raise
+                        except Exception as exc:
+                            errors.append(f"{account_id}: {exc}")
+                            _log(task_id, f"[FAIL] 批量 worker 异常: {account_id} - {exc}")
+                        completed += 1
+                        _task_store.set_progress(task_id, f"{completed}/{total}")
+                        if errors and not failure_continue:
+                            _log(task_id, "[OaiPay] 已出现失败；批量模式下已派发的请求会等待结束")
+                    sync_meta()
+        else:
+            for index, account_id in enumerate(account_ids, start=1):
+                control.checkpoint(consume_skip=False)
+                result = run_one(index, account_id)
+                if str(result.get("status") or "") == "failed":
+                    errors.append(f"{result.get('email') or account_id}: {result.get('error') or result.get('reason') or 'failed'}")
+                    if not failure_continue:
+                        _log(task_id, "[OaiPay] 失败后继续已关闭，停止后续提交")
+                        _task_store.set_progress(task_id, f"{index}/{total}")
+                        break
+                _task_store.set_progress(task_id, f"{index}/{total}")
+                if index < len(account_ids) and account_interval_seconds > 0:
+                    _log(task_id, f"[OaiPay] 等待账号间隔 {account_interval_seconds}s 后继续下一个账号")
+                    wait_seconds(account_interval_seconds)
+                sync_meta()
+
+        sync_meta()
+        summary_message = f"approvalUrl 提取完成: 成功 {success_count} 个，跳过 {skipped_count} 个，失败 {len(errors)} 个"
+        if errors:
+            summary_message = f"{summary_message}；首个失败: {errors[0]}"
+        _log(task_id, f"[SUMMARY] {summary_message}")
+        latest_meta = dict(_task_store.snapshot(task_id).get("meta") or {})
+        log_status = "success" if success_count > 0 and not errors else "failed"
+        _save_task_log(
+            "chatgpt",
+            primary_email,
+            log_status,
+            error="" if log_status == "success" else summary_message,
+            detail=_build_task_log_detail(
+                task_id,
+                {
+                    "email": primary_email,
+                    "attempt_outcome": "chatgpt_oaipay_approval_success" if log_status == "success" else "chatgpt_oaipay_approval_failed",
+                    "source": "chatgpt_oaipay_approval",
+                    "meta": latest_meta,
+                    "runtime_results": list(runtime_results),
+                },
+            ),
+        )
+        _task_store.finish(
+            task_id,
+            status="done" if log_status == "success" else "failed",
+            success=success_count,
+            skipped=skipped_count,
+            errors=errors,
+            error="" if not errors else summary_message,
+        )
+    except StopTaskRequested as exc:
+        _log(task_id, f"[STOP] {exc}")
+        sync_meta()
+        _save_task_log(
+            "chatgpt",
+            primary_email,
+            "stopped",
+            error=str(exc),
+            detail=_build_task_log_detail(
+                task_id,
+                {
+                    "email": primary_email,
+                    "attempt_outcome": "chatgpt_oaipay_approval_stopped",
+                    "source": "chatgpt_oaipay_approval",
+                    "meta": dict(_task_store.snapshot(task_id).get("meta") or {}),
+                    "runtime_results": list(runtime_results),
+                },
+            ),
+        )
+        _task_store.finish(task_id, status="stopped", success=success_count, skipped=skipped_count, errors=errors, error=str(exc))
+    except Exception as exc:
+        error_text = str(exc or "approvalUrl 提取任务异常")
+        _log(task_id, f"[FAIL] {error_text}")
+        sync_meta()
+        _save_task_log(
+            "chatgpt",
+            primary_email,
+            "failed",
+            error=error_text,
+            detail=_build_task_log_detail(
+                task_id,
+                {
+                    "email": primary_email,
+                    "attempt_outcome": "chatgpt_oaipay_approval_failed",
+                    "source": "chatgpt_oaipay_approval",
+                    "meta": dict(_task_store.snapshot(task_id).get("meta") or {}),
+                    "runtime_results": list(runtime_results),
+                },
+            ),
+        )
+        _task_store.finish(task_id, status="failed", success=success_count, skipped=skipped_count, errors=errors or [error_text], error=error_text)
+
+
+def _run_chatgpt_paypal_bind(task_id: str, account_ids: list[int], settings: dict[str, Any]):
+    import re
+    from datetime import datetime, timezone
+
+    from services.chatgpt_account_state import mark_payment_failed, mark_payment_pending
+    from services.chatgpt_core.paypal_binding_client import (
+        DEFAULT_BASE_URL,
+        DEFAULT_OTP_SIGNAL,
+        PlusIceaixClient,
+        mask_proxy,
+        mask_secret,
+        sanitize_result,
+    )
+    from services.chatgpt_core.paypal_sms_api import (
+        DEFAULT_POLL_INTERVAL_SECONDS,
+        DEFAULT_STABILITY_SECONDS,
+        format_sms_time,
+        mask_sms_code,
+        poll_paypal_sms_otp,
+    )
+
+    control = _task_store.control_for(task_id)
+    total = max(len(account_ids), 1)
+    success_count = 0
+    skipped_count = 0
+    errors: list[str] = []
+    runtime_results: list[dict[str, Any]] = []
+    primary_email = ""
+
+    base_url = str(settings.get("base_url") or DEFAULT_BASE_URL).strip().rstrip("/") or DEFAULT_BASE_URL
+    proxy = str(settings.get("proxy") or "").strip()
+    proxy_jp = str(settings.get("proxy_jp") or "").strip()
+    phone = str(settings.get("phone") or "").strip()
+    paypal_email = str(settings.get("paypal_email") or "").strip()
+    sms_api = str(settings.get("sms_api") or "").strip()
+    sms_api_test_mode = bool(settings.get("sms_api_test_mode", False))
+    otp_timeout = max(int(settings.get("otp_timeout") or 180), 30)
+    pplink_retry = max(int(settings.get("pplink_retry") or 3), 1)
+    timeout = max(float(settings.get("timeout") or 30), 5.0)
+    event_timeout = max(float(settings.get("event_timeout") or 60), 10.0)
+    account_interval_seconds = max(int(settings.get("account_interval_seconds") or 0), 0)
+    failure_continue = bool(settings.get("failure_continue", True))
+    otp_signal = str(settings.get("otp_signal") or DEFAULT_OTP_SIGNAL).strip() or DEFAULT_OTP_SIGNAL
+
+    sms_used_codes: set[str] = set()
+    sms_used_record_ids: set[str] = set()
+    sms_used_lock = threading.Lock()
+    _task_store.mark_running(task_id)
+    _task_store.set_progress(task_id, f"0/{total}")
+    _log(
+        task_id,
+        "[PayPal] 外部绑定任务启动: "
+        f"base_url={base_url} phone={phone} proxy={mask_proxy(proxy)} "
+        f"proxy_jp={mask_proxy(proxy_jp) or '-'} accounts={len(account_ids)} "
+        f"sms_api={'local-test' if sms_api and sms_api_test_mode else 'local-auto' if sms_api else '-'}",
+    )
+
+    def sanitize_external_log(message: Any) -> str:
+        text = str(message or "")
+        text = re.sub(r"\b(?:BA|EC)-[A-Za-z0-9]+", lambda m: mask_secret(m.group(0)), text)
+        text = re.sub(r"\bcs_live_[A-Za-z0-9_]+", lambda m: mask_secret(m.group(0)), text)
+        text = re.sub(r"\bpk_live_[A-Za-z0-9_]+", lambda m: mask_secret(m.group(0)), text)
+        if proxy:
+            text = text.replace(proxy, mask_proxy(proxy))
+        if proxy_jp:
+            text = text.replace(proxy_jp, mask_proxy(proxy_jp))
+        return text
+
+    def sync_meta() -> None:
+        _task_store.update_meta(
+            task_id,
+            {
+                "runtime_results": list(runtime_results),
+                "runtime_success": success_count,
+                "runtime_skipped": skipped_count,
+                "runtime_errors": list(errors),
+            },
+        )
+
+    def append_result(**payload: Any) -> None:
+        runtime_results.append(
+            {
+                "finished_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                **payload,
+            }
+        )
+        sync_meta()
+
+    def sms_exclude_snapshot() -> tuple[set[str], set[str]]:
+        with sms_used_lock:
+            return set(sms_used_codes), set(sms_used_record_ids)
+
+    def remember_sms_otp(code: str = "", record_id: str = "") -> None:
+        code_value = re.sub(r"\D", "", str(code or ""))
+        record_value = str(record_id or "").strip()
+        with sms_used_lock:
+            if code_value:
+                sms_used_codes.add(code_value)
+            if record_value:
+                sms_used_record_ids.add(record_value)
+
+    def persist_binding_snapshot(
+        account_id: int,
+        *,
+        patch: dict[str, Any],
+        payment_status: str = "",
+    ) -> None:
+        with Session(engine) as session:
+            account = session.get(AccountModel, account_id)
+            if account is None or account.platform != "chatgpt":
+                return
+            try:
+                extra = account.get_extra()
+            except Exception:
+                extra = {}
+            current = extra.get("chatgpt_paypal_binding") if isinstance(extra.get("chatgpt_paypal_binding"), dict) else {}
+            current.update(
+                {
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                    **patch,
+                }
+            )
+            extra["chatgpt_paypal_binding"] = current
+            account.set_extra(extra)
+            if payment_status == "pending":
+                mark_payment_pending(account, reason="paypal_bind_processing")
+            elif payment_status == "failed":
+                mark_payment_failed(account, reason="paypal_bind_failed")
+            account.updated_at = datetime.now(timezone.utc)
+            session.add(account)
+            session.commit()
+
+    def persist_external_state_discovery(
+        account_id: int,
+        *,
+        state: str,
+        message: str = "",
+        job_id: str = "",
+        stage: str = "",
+    ) -> None:
+        state_value = str(state or "").strip()
+        if state_value != "already_paid":
+            return
+        with Session(engine) as session:
+            account = session.get(AccountModel, account_id)
+            if account is None or account.platform != "chatgpt":
+                return
+            try:
+                extra = account.get_extra()
+            except Exception:
+                extra = {}
+            if not isinstance(extra, dict):
+                extra = {}
+
+            now_iso = datetime.now(timezone.utc).isoformat()
+            current = extra.get("chatgpt_paypal_binding") if isinstance(extra.get("chatgpt_paypal_binding"), dict) else {}
+            current.update(
+                {
+                    "updated_at": now_iso,
+                    "status": "status_updated",
+                    "phase": state_value,
+                    "job_id": str(job_id or ""),
+                    "error": str(message or ""),
+                    "external_discovered_state": state_value,
+                    "external_discovered_stage": str(stage or ""),
+                }
+            )
+            extra["chatgpt_paypal_binding"] = current
+            account.set_extra(extra)
+            account.updated_at = datetime.now(timezone.utc)
+            session.add(account)
+            session.commit()
+
+    def refresh_account_local_status_after_paypal(
+        account_id: int,
+        *,
+        reason: str,
+        job_id: str = "",
+        stage: str = "",
+    ) -> dict[str, Any] | None:
+        reason_value = str(reason or "").strip() or "paypal_bind"
+        with Session(engine) as session:
+            account = session.get(AccountModel, account_id)
+            if account is None or account.platform != "chatgpt":
+                return None
+            refresh_result = _sync_payment_link_account_status(session, account)
+            try:
+                extra = account.get_extra()
+            except Exception:
+                extra = {}
+            if not isinstance(extra, dict):
+                extra = {}
+            capabilities = refresh_result.get("capabilities") if isinstance(refresh_result.get("capabilities"), dict) else {}
+            probe = refresh_result.get("probe") if isinstance(refresh_result.get("probe"), dict) else {}
+            auth = probe.get("auth") if isinstance(probe.get("auth"), dict) else {}
+            subscription = probe.get("subscription") if isinstance(probe.get("subscription"), dict) else {}
+            codex = probe.get("codex") if isinstance(probe.get("codex"), dict) else {}
+            summary = {
+                "trigger": reason_value,
+                "refreshed_at": datetime.now(timezone.utc).isoformat(),
+                "status": str(refresh_result.get("status") or account.status or ""),
+                "policy_reason": str(refresh_result.get("reason") or ""),
+                "auth_state": str(auth.get("state") or ""),
+                "subscription_plan": str(subscription.get("plan") or capabilities.get("subscription_plan") or ""),
+                "codex_state": str(codex.get("state") or capabilities.get("codex_state") or ""),
+                "upload_gate": str(capabilities.get("upload_gate") or ""),
+                "job_id": str(job_id or ""),
+                "stage": str(stage or ""),
+            }
+            current = extra.get("chatgpt_paypal_binding") if isinstance(extra.get("chatgpt_paypal_binding"), dict) else {}
+            current.update(
+                {
+                    "updated_at": summary["refreshed_at"],
+                    "local_status_refresh": summary,
+                }
+            )
+            extra["chatgpt_paypal_binding"] = current
+            account.set_extra(extra)
+            account.updated_at = datetime.now(timezone.utc)
+            session.add(account)
+            session.commit()
+            return summary
+
+    def trigger_local_status_refresh(account_id: int, *, reason: str, job_id: str = "", stage: str = "") -> dict[str, Any] | None:
+        try:
+            summary = refresh_account_local_status_after_paypal(
+                account_id,
+                reason=reason,
+                job_id=job_id,
+                stage=stage,
+            )
+            if summary:
+                _log(
+                    task_id,
+                    "[PayPal] 本地状态刷新完成: "
+                    f"status={summary.get('status') or '-'} "
+                    f"plan={summary.get('subscription_plan') or '-'} "
+                    f"auth={summary.get('auth_state') or '-'} "
+                    f"gate={summary.get('upload_gate') or '-'}",
+                )
+            return summary
+        except Exception as exc:
+            _log(task_id, f"[PayPal][WARN] 本地状态刷新失败: {exc}")
+            return None
+
+    def wait_before_next(index: int, attempt_id: int | None = None) -> None:
+        if index >= len(account_ids) or account_interval_seconds <= 0:
+            return
+        _log(task_id, f"[PayPal] 等待账号间隔 {account_interval_seconds}s 后继续下一个账号")
+        remaining = float(account_interval_seconds)
+        while remaining > 0:
+            control.checkpoint(attempt_id=attempt_id)
+            chunk = min(1.0, remaining)
+            time.sleep(chunk)
+            remaining -= chunk
+
+    def poll_local_sms_api(
+        *,
+        attempt_id: int | None,
+        target_phone: str,
+        wait_started_at: datetime,
+        reveal_code_in_log: bool = False,
+        stop_event: threading.Event | None = None,
+        consume_task_control: bool = True,
+    ):
+        exclude_codes, exclude_record_ids = sms_exclude_snapshot()
+
+        def sms_log(message: str) -> None:
+            _log(task_id, f"[PayPal][SMS API] {message}")
+
+        return poll_paypal_sms_otp(
+            sms_api,
+            wait_started_at=wait_started_at,
+            expected_phone=target_phone or phone,
+            exclude_codes=exclude_codes,
+            exclude_record_ids=exclude_record_ids,
+            timeout_seconds=otp_timeout,
+            stability_seconds=DEFAULT_STABILITY_SECONDS,
+            poll_interval_seconds=DEFAULT_POLL_INTERVAL_SECONDS,
+            log=sms_log,
+            stop_check=(lambda: control.checkpoint(attempt_id=attempt_id)) if consume_task_control else None,
+            stop_event=stop_event,
+            reveal_code_in_log=reveal_code_in_log,
+        )
+
+    def start_sms_test_poll_thread(
+        *,
+        attempt_id: int | None,
+        target_phone: str,
+        wait_started_at: datetime,
+    ) -> tuple[threading.Event, threading.Thread]:
+        stop_event = threading.Event()
+
+        def worker() -> None:
+            try:
+                parsed = poll_local_sms_api(
+                    attempt_id=attempt_id,
+                    target_phone=target_phone,
+                    wait_started_at=wait_started_at,
+                    reveal_code_in_log=False,
+                    stop_event=stop_event,
+                    consume_task_control=False,
+                )
+                if parsed is None:
+                    return
+                remember_sms_otp(parsed.code, parsed.record_id)
+                _log(
+                    task_id,
+                    "[PayPal][SMS API] "
+                    f"测试模式已解析验证码: {parsed.code} "
+                    f"recordId={parsed.record_id or '-'} received_at={format_sms_time(parsed.received_at)}；"
+                    "未自动提交，请在任务面板手动输入",
+                )
+            except Exception as exc:
+                if not stop_event.is_set():
+                    _log(task_id, f"[PayPal][SMS API] 测试模式轮询异常: {exc}")
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        return stop_event, thread
+
+    try:
+        for index, account_id in enumerate(account_ids, start=1):
+            control.checkpoint(consume_skip=False)
+            attempt_id = control.start_attempt()
+            email = ""
+            job_id = ""
+            external_state_discovery = ""
+            external_state_message = ""
+            try:
+                control.checkpoint(attempt_id=attempt_id)
+                with Session(engine) as session:
+                    account = session.get(AccountModel, int(account_id or 0))
+                    if account is None or account.platform != "chatgpt":
+                        raise ValueError("ChatGPT 账号不存在")
+                    email = str(account.email or "")
+                    if not primary_email and email:
+                        primary_email = email
+                    skip_reason = _paypal_bind_skip_reason(account)
+                    if skip_reason:
+                        skipped_count += 1
+                        _log(task_id, f"[SKIP] {email or account_id} - {skip_reason}")
+                        append_result(account_id=account_id, email=email, status="skipped", reason=skip_reason)
+                        continue
+                    access_token = _chatgpt_account_access_token(account)
+
+                client = PlusIceaixClient(base_url=base_url, timeout=timeout, event_timeout=event_timeout)
+                _log(task_id, f"[PayPal] -------- {index}/{len(account_ids)} | {email or account_id} --------")
+                _log(task_id, f"[PayPal] 外部请求浏览器: {client.browser_profile_label}")
+                persist_binding_snapshot(
+                    account_id,
+                    patch={
+                        "status": "processing",
+                        "phase": "create_job",
+                        "task_id": task_id,
+                        "base_url": base_url,
+                        "phone": phone,
+                        "proxy": mask_proxy(proxy),
+                        "proxy_jp": mask_proxy(proxy_jp),
+                        "paypal_email": paypal_email,
+                        "browser_profile": client.browser_profile_label,
+                    },
+                    payment_status="pending",
+                )
+                _log(task_id, f"[PayPal] 提交外部任务: {email or account_id}")
+                if sms_api:
+                    _log(task_id, "[PayPal][SMS API] 收码 API 将由本地解析，创建外部任务时不透传给外部服务")
+                job_response = client.create_job(
+                    input_token=access_token,
+                    proxy=proxy,
+                    proxy_jp=proxy_jp,
+                    phone=phone,
+                    email=paypal_email,
+                    sms_api="",
+                    otp_timeout=otp_timeout,
+                    pplink_retry=pplink_retry,
+                )
+                job_id = str(job_response.get("job_id") or "").strip()
+                if not job_id:
+                    raise ValueError(f"外部服务未返回 job_id: {sanitize_result(job_response)}")
+                _log(task_id, f"[PayPal] job_id={job_id} events={client.events_url(job_id)}")
+                persist_binding_snapshot(
+                    account_id,
+                    patch={
+                        "status": "processing",
+                        "phase": "events",
+                        "job_id": job_id,
+                        "events_url": client.events_url(job_id),
+                    },
+                    payment_status="pending",
+                )
+
+                final_result: dict[str, Any] | None = None
+                for event in client.iter_events(job_id):
+                    control.checkpoint(attempt_id=attempt_id)
+                    event_type = str(event.get("type") or event.get("event") or "").strip()
+                    if event_type == "log":
+                        raw_message = event.get("msg", "")
+                        display_message = sanitize_external_log(raw_message)
+                        _log(task_id, f"[PayPal] {display_message}")
+                        discovered_state = _paypal_bind_detect_external_state(raw_message)
+                        if discovered_state and not external_state_discovery:
+                            external_state_discovery = discovered_state
+                            external_state_message = display_message
+                            persist_external_state_discovery(
+                                account_id,
+                                state=discovered_state,
+                                message=display_message,
+                                job_id=job_id,
+                                stage="log",
+                            )
+                            if discovered_state == "already_paid":
+                                _log(task_id, f"[PayPal] 外部反馈账号已付费，触发本地状态刷新: {email or account_id}")
+                                trigger_local_status_refresh(
+                                    account_id,
+                                    reason="paypal_bind_already_paid_log",
+                                    job_id=job_id,
+                                    stage="log",
+                                )
+                        continue
+                    if event_type == otp_signal:
+                        target_phone = str(event.get("phone") or phone or "").strip()
+                        # API timestamps are second-precision.  Floor the local
+                        # wait-start marker so old messages from earlier seconds
+                        # are rejected, while the current wait step has a stable
+                        # comparison boundary.
+                        otp_wait_started_at = datetime.now(timezone.utc).replace(microsecond=0)
+                        _log(task_id, f"[PayPal] 等待 OTP: phone={target_phone or '-'} timeout={otp_timeout}s")
+                        if sms_api and sms_api_test_mode:
+                            stop_event, test_thread = start_sms_test_poll_thread(
+                                attempt_id=attempt_id,
+                                target_phone=target_phone,
+                                wait_started_at=otp_wait_started_at,
+                            )
+                            try:
+                                pin = control.wait_for_verification_code(
+                                    attempt_id=attempt_id,
+                                    phase="paypal_otp",
+                                    phase_label="PayPal 短信 OTP",
+                                    email=target_phone or phone or email,
+                                    timeout_seconds=otp_timeout,
+                                )
+                            finally:
+                                stop_event.set()
+                                test_thread.join(timeout=0.2)
+                            remember_sms_otp(pin)
+                            otp_response = client.submit_otp(job_id, pin)
+                            _log(task_id, f"[PayPal] OTP 已手动提交: ok={bool(otp_response.get('ok', True))}")
+                            continue
+
+                        if sms_api:
+                            parsed_otp = poll_local_sms_api(
+                                attempt_id=attempt_id,
+                                target_phone=target_phone,
+                                wait_started_at=otp_wait_started_at,
+                                reveal_code_in_log=False,
+                            )
+                            if parsed_otp is not None:
+                                remember_sms_otp(parsed_otp.code, parsed_otp.record_id)
+                                otp_response = client.submit_otp(job_id, parsed_otp.code)
+                                _log(
+                                    task_id,
+                                    "[PayPal] OTP 已由 SMS API 自动提交: "
+                                    f"code={mask_sms_code(parsed_otp.code)} ok={bool(otp_response.get('ok', True))}",
+                                )
+                                continue
+                            _log(task_id, "[PayPal][SMS API] 未取得可用验证码，切换为手动输入 OTP")
+
+                        pin = control.wait_for_verification_code(
+                            attempt_id=attempt_id,
+                            phase="paypal_otp",
+                            phase_label="PayPal 短信 OTP",
+                            email=target_phone or phone or email,
+                            timeout_seconds=otp_timeout,
+                        )
+                        remember_sms_otp(pin)
+                        otp_response = client.submit_otp(job_id, pin)
+                        _log(task_id, f"[PayPal] OTP 已提交: ok={bool(otp_response.get('ok', True))}")
+                        continue
+                    if event_type == "result":
+                        result = event.get("result") if isinstance(event.get("result"), dict) else {}
+                        final_result = dict(result)
+                        _log(task_id, f"[PayPal] 外部结果: {json.dumps(sanitize_result(result), ensure_ascii=False)}")
+                        break
+                    if event_type == "done":
+                        _log(task_id, "[PayPal] 外部事件流完成")
+                        break
+                    _log(task_id, f"[PayPal] 事件: {json.dumps(sanitize_result(event), ensure_ascii=False)}")
+
+                if final_result is None:
+                    raise ValueError("外部事件流结束但未返回 result")
+
+                is_success = bool(final_result.get("success"))
+                stage = str(final_result.get("stage") or "").strip()
+                error_text = str(final_result.get("error") or "").strip()
+                sanitized = sanitize_result(final_result)
+                discovered_state = _paypal_bind_detect_external_state(final_result, error_text, stage)
+                if discovered_state and not external_state_discovery:
+                    external_state_discovery = discovered_state
+                    external_state_message = error_text or json.dumps(sanitized, ensure_ascii=False)
+                    persist_external_state_discovery(
+                        account_id,
+                        state=discovered_state,
+                        message=external_state_message,
+                        job_id=job_id,
+                        stage=stage or "result",
+                    )
+                    if discovered_state == "already_paid":
+                        _log(task_id, f"[PayPal] 外部结果提示账号已付费，触发本地状态刷新: {email or account_id}")
+                        trigger_local_status_refresh(
+                            account_id,
+                            reason="paypal_bind_already_paid_result",
+                            job_id=job_id,
+                            stage=stage or "result",
+                        )
+                binding_status = "success" if is_success else "status_updated" if external_state_discovery == "already_paid" else "failed"
+                binding_phase = stage or ("done" if is_success else external_state_discovery or "failed")
+                persist_binding_snapshot(
+                    account_id,
+                    patch={
+                        "status": binding_status,
+                        "phase": binding_phase,
+                        "job_id": job_id,
+                        "result": sanitized,
+                        "ba_token": str(final_result.get("ba_token") or ""),
+                        "ec_token": str(final_result.get("ec_token") or ""),
+                        "paypal_email": str(final_result.get("email") or paypal_email or ""),
+                        "paypal_password": str(final_result.get("password") or ""),
+                        "error": error_text,
+                    },
+                    payment_status="" if is_success or external_state_discovery == "already_paid" else "failed",
+                )
+                if external_state_discovery == "already_paid" and not is_success:
+                    skipped_count += 1
+                    message = "外部反馈 User is already paid，已触发本地状态刷新"
+                    append_result(
+                        account_id=account_id,
+                        email=email,
+                        job_id=job_id,
+                        status="skipped",
+                        stage=stage or external_state_discovery,
+                        reason=message,
+                        result=sanitized,
+                    )
+                    _log(task_id, f"[SKIP] {email or account_id} - {message}")
+                    wait_before_next(index, attempt_id)
+                    continue
+                append_result(
+                    account_id=account_id,
+                    email=email,
+                    job_id=job_id,
+                    status="success" if is_success else "failed",
+                    stage=stage,
+                    error=error_text,
+                    result=sanitized,
+                )
+                if is_success:
+                    trigger_local_status_refresh(
+                        account_id,
+                        reason="paypal_bind_success",
+                        job_id=job_id,
+                        stage=stage or "done",
+                    )
+                    success_count += 1
+                    _log(task_id, f"[OK] PayPal 绑定成功: {email or account_id}")
+                else:
+                    message = error_text or stage or "PayPal 绑定失败"
+                    errors.append(f"{email or account_id}: {message}")
+                    _log(task_id, f"[FAIL] PayPal 绑定失败: {email or account_id} stage={stage or '-'} error={error_text or '-'}")
+                    if not failure_continue:
+                        _log(task_id, "[PayPal] 失败后继续已关闭，停止后续提交")
+                        break
+                wait_before_next(index, attempt_id)
+            except SkipCurrentAttemptRequested as exc:
+                skipped_count += 1
+                _log(task_id, f"[SKIP] 已跳过当前 PayPal 绑定: {email or account_id} - {exc}")
+                append_result(account_id=account_id, email=email, job_id=job_id, status="skipped", reason=str(exc))
+            except StopTaskRequested:
+                raise
+            except Exception as exc:
+                error_text = str(exc or "PayPal 绑定失败")
+                if external_state_discovery == "already_paid":
+                    skipped_count += 1
+                    persist_binding_snapshot(
+                        account_id,
+                        patch={
+                            "status": "status_updated",
+                            "phase": external_state_discovery,
+                            "job_id": job_id,
+                            "error": external_state_message or error_text,
+                        },
+                        payment_status="",
+                    )
+                    trigger_local_status_refresh(
+                        account_id,
+                        reason="paypal_bind_already_paid_exception",
+                        job_id=job_id,
+                        stage=external_state_discovery,
+                    )
+                    message = "外部反馈 User is already paid，已触发本地状态刷新"
+                    append_result(account_id=account_id, email=email, job_id=job_id, status="skipped", reason=message)
+                    _log(task_id, f"[SKIP] {email or account_id} - {message}")
+                    wait_before_next(index, attempt_id)
+                    continue
+                errors.append(f"{email or account_id}: {error_text}")
+                persist_binding_snapshot(
+                    account_id,
+                    patch={
+                        "status": "failed",
+                        "phase": "error",
+                        "job_id": job_id,
+                        "error": error_text,
+                    },
+                    payment_status="failed",
+                )
+                append_result(account_id=account_id, email=email, job_id=job_id, status="failed", reason=error_text)
+                _log(task_id, f"[FAIL] PayPal 绑定异常: {email or account_id} - {error_text}")
+                if not failure_continue:
+                    _log(task_id, "[PayPal] 失败后继续已关闭，停止后续提交")
+                    break
+            finally:
+                control.finish_attempt(attempt_id)
+                _task_store.set_progress(task_id, f"{index}/{total}")
+
+        summary_message = f"PayPal 绑定完成: 成功 {success_count} 个，跳过 {skipped_count} 个，失败 {len(errors)} 个"
+        if errors:
+            summary_message = f"{summary_message}；首个失败: {errors[0]}"
+        _log(task_id, f"[SUMMARY] {summary_message}")
+        latest_meta = dict(_task_store.snapshot(task_id).get("meta") or {})
+        log_status = "success" if success_count > 0 and not errors else "failed"
+        _save_task_log(
+            "chatgpt",
+            primary_email,
+            log_status,
+            error="" if log_status == "success" else summary_message,
+            detail=_build_task_log_detail(
+                task_id,
+                {
+                    "email": primary_email,
+                    "attempt_outcome": "chatgpt_paypal_bind_success" if log_status == "success" else "chatgpt_paypal_bind_failed",
+                    "source": "chatgpt_paypal_bind",
+                    "meta": latest_meta,
+                    "runtime_results": list(runtime_results),
+                },
+            ),
+        )
+        _task_store.finish(
+            task_id,
+            status="done" if log_status == "success" else "failed",
+            success=success_count,
+            skipped=skipped_count,
+            errors=errors,
+            error="" if not errors else summary_message,
+        )
+    except StopTaskRequested as exc:
+        _log(task_id, f"[STOP] {exc}")
+        sync_meta()
+        _save_task_log(
+            "chatgpt",
+            primary_email,
+            "stopped",
+            error=str(exc),
+            detail=_build_task_log_detail(
+                task_id,
+                {
+                    "email": primary_email,
+                    "attempt_outcome": "chatgpt_paypal_bind_stopped",
+                    "source": "chatgpt_paypal_bind",
+                    "meta": dict(_task_store.snapshot(task_id).get("meta") or {}),
+                    "runtime_results": list(runtime_results),
+                },
+            ),
+        )
+        _task_store.finish(
+            task_id,
+            status="stopped",
+            success=success_count,
+            skipped=skipped_count,
+            errors=errors,
+            error=str(exc),
+        )
+    finally:
+        _task_store.cleanup()
+
 
 
 def _run_batch_payment_links(task_id: str, account_ids: list[int]):
@@ -1843,7 +7210,13 @@ def _run_batch_payment_links(task_id: str, account_ids: list[int]):
 
                     extra = account.get_extra()
                     cached = extra.get("chatgpt_last_payment_link") if isinstance(extra.get("chatgpt_last_payment_link"), dict) else {}
-                    cached_url = str(cached.get("url") or "").strip()
+                    raw_cached_url = str(cached.get("url") or "").strip()
+                    cached_format = str(cached.get("payment_link_format") or "long_hosted").strip()
+                    cached_url = normalize_payment_link_url(raw_cached_url, cached_format)
+                    if cached_url and cached_url != raw_cached_url:
+                        cached = {**cached, "url": cached_url}
+                        extra["chatgpt_last_payment_link"] = cached
+                        account.set_extra(extra)
                     cache_matches = payment_link_cache_matches(cached, params)
                     if cached_url and not force_refresh and payment_link_requires_status_sync(cached):
                         status_label = payment_link_status_label(cached.get("link_status"))
@@ -1869,7 +7242,7 @@ def _run_batch_payment_links(task_id: str, account_ids: list[int]):
 
                     if skip_existing and not force_refresh and cache_matches and params.get("reuse_cached_link") is not False:
                         if cached_url:
-                            if str(account.cashier_url or "").strip() != cached_url:
+                            if str(account.cashier_url or "").strip() != cached_url or cached_url != raw_cached_url:
                                 account.cashier_url = cached_url
                                 account.updated_at = datetime.now(timezone.utc)
                                 session.add(account)
@@ -1885,7 +7258,7 @@ def _run_batch_payment_links(task_id: str, account_ids: list[int]):
                         "[订阅链接] "
                         f"{index}/{total} {email or account_id} "
                         f"plan={params.get('plan')} country={params.get('country')} "
-                        f"currency={params.get('currency')} proxy={proxy_label}",
+                        f"currency={params.get('currency')} link_format={params.get('payment_link_format')} proxy={proxy_label}",
                     )
                     result = _execute_platform_action(
                         instance,
@@ -2023,8 +7396,9 @@ def _run_batch_resume_subscription_auth(
     meta = dict(_task_store.snapshot(task_id).get("meta") or {})
     skipped_items = list(meta.get("skipped_items") or [])
     missing_ids = list(meta.get("missing_ids") or [])
+    phone_modes = _resolve_resume_auth_phone_modes(allow_phone_verification)
     shared_phone_service = None
-    if allow_phone_verification:
+    if phone_modes.get("allow_add_phone_verification"):
         phone_config = config_store.get_all().copy()
         provider = str(
             phone_config.get("chatgpt_phone_verification_provider")
@@ -2060,11 +7434,20 @@ def _run_batch_resume_subscription_auth(
                     if not primary_email:
                         primary_email = email
 
-                _log(task_id, f"[补抓] -------- 账号 {index}/{total} | {email or account_id} --------")
-                _log(task_id, f"[补抓] 开始补抓 Auth：{email or account_id}")
-                _log(
+                _task_timeline_log(
                     task_id,
-                    f"[补抓] 手机验证码：{'允许' if allow_phone_verification else '不允许'}",
+                    task="补抓Auth",
+                    email=email,
+                    account_id=account_id,
+                    item_index=index,
+                    item_total=total,
+                    phase="prepare",
+                    phase_label="准备补抓 Auth",
+                    stage_index=1,
+                    stage_total=5,
+                    message=f"开始：手机验证策略={_format_phone_modes_for_log(phone_modes)}",
+                    next_step="恢复邮箱状态并进入 OAuth 登录",
+                    reset_started_at=True,
                 )
                 control.checkpoint(attempt_id=attempt_id)
                 with Session(engine) as session:
@@ -2084,16 +7467,58 @@ def _run_batch_resume_subscription_auth(
                         data = result.get("data") if isinstance(result.get("data"), dict) else {}
                         raise ValueError(str(result.get("error") or data.get("message") or "补抓Auth失败"))
                 success_count += 1
-                _log(task_id, f"[OK] 补抓Auth完成: {email or account_id}")
+                _task_timeline_log(
+                    task_id,
+                    task="补抓Auth",
+                    email=email,
+                    account_id=account_id,
+                    item_index=index,
+                    item_total=total,
+                    phase="done",
+                    phase_label="补抓结果",
+                    stage_index=5,
+                    stage_total=5,
+                    message="结果：refresh_token 已保存",
+                    next_step="处理下一个账号",
+                    reset_started_at=True,
+                )
             except SkipCurrentAttemptRequested as exc:
                 skipped_count += 1
-                _log(task_id, f"[SKIP] 已跳过补抓Auth: {email or account_id} - {exc}")
+                _task_timeline_log(
+                    task_id,
+                    task="补抓Auth",
+                    email=email,
+                    account_id=account_id,
+                    item_index=index,
+                    item_total=total,
+                    phase="skipped",
+                    phase_label="已跳过",
+                    stage_index=5,
+                    stage_total=5,
+                    message=str(exc),
+                    next_step="处理下一个账号",
+                    reset_started_at=True,
+                )
             except StopTaskRequested:
                 raise
             except Exception as exc:
                 error_text = str(exc or "补抓Auth失败")
                 errors.append(f"{email or account_id}: {error_text}")
-                _log(task_id, f"[FAIL] 补抓Auth失败: {email or account_id} - {error_text}")
+                _task_timeline_log(
+                    task_id,
+                    task="补抓Auth",
+                    email=email,
+                    account_id=account_id,
+                    item_index=index,
+                    item_total=total,
+                    phase="failed",
+                    phase_label="补抓失败",
+                    stage_index=5,
+                    stage_total=5,
+                    message=error_text,
+                    next_step="查看 Debug 详情",
+                    reset_started_at=True,
+                )
             finally:
                 control.finish_attempt(attempt_id)
                 _task_store.set_progress(task_id, f"{index}/{total}")
@@ -2135,6 +7560,19 @@ def _run_batch_resume_subscription_auth(
         )
     except StopTaskRequested as exc:
         _log(task_id, f"[STOP] {exc}")
+        _task_timeline_log(
+            task_id,
+            task="补抓Auth",
+            item_index=total if total > 0 else None,
+            item_total=total if total > 0 else None,
+            phase="stopped",
+            phase_label="已停止",
+            stage_index=5,
+            stage_total=5,
+            message=str(exc),
+            next_step="任务停止",
+            reset_started_at=True,
+        )
         _save_task_log(
             "chatgpt",
             primary_email,
@@ -2169,13 +7607,126 @@ def _run_batch_resume_subscription_auth(
                 shared_phone_service.release_current(reason="batch resume auth finished", terminal=False)
             except Exception as exc:
                 _log(task_id, f"[补抓] 释放共享手机号失败: {exc}")
+        _clear_task_current(task_id)
         _task_store.cleanup()
+
+
+def _phone_binding_prefix4(value: Any) -> str:
+    from services.chatgpt_core.phone_pool_repository import _phone_effective_digits
+
+    digits = _phone_effective_digits(str(value or ""))
+    return digits[:4] if len(digits) >= 4 else ""
+
+
+def _build_phone_prefix_sample_summary(
+    phone_items: list[dict[str, Any]],
+    runtime_results: list[dict[str, Any]],
+    *,
+    phone_signup: bool = False,
+) -> dict[str, Any]:
+    selected_by_prefix: dict[str, list[str]] = {}
+    selected_phones: set[str] = set()
+    for item in phone_items:
+        phone = str(item.get("phone") or "").strip()
+        prefix = str(item.get("prefix4") or _phone_binding_prefix4(phone)).strip()
+        if not phone or not prefix or phone in selected_phones:
+            continue
+        selected_phones.add(phone)
+        selected_by_prefix.setdefault(prefix, []).append(phone)
+
+    outcomes: dict[str, str] = {}
+    unavailable_statuses = {
+        "openai_rejected",
+        "openai_phone_limit",
+        "api_no_code",
+        "api_error",
+        "rate_limited",
+    }
+    for result in runtime_results:
+        phone = str(result.get("phone") or "").strip()
+        if phone not in selected_phones:
+            continue
+        status = str(result.get("status") or "").strip()
+        if status in {"bound", "sms_probe_received", "registered_phone_signup", "phone_already_used"}:
+            outcomes[phone] = "available"
+        elif outcomes.get(phone) != "available":
+            if phone_signup:
+                try:
+                    from services.chatgpt_core.phone_pool_repository import is_phone_signup_prefix_unavailable_signal
+
+                    reason = str(result.get("reason") or result.get("error") or result.get("message") or "")
+                    if is_phone_signup_prefix_unavailable_signal(status, reason):
+                        outcomes[phone] = "unavailable"
+                except Exception:
+                    pass
+            elif status in unavailable_statuses:
+                outcomes[phone] = "unavailable"
+
+    status_counts = {
+        "available": 0,
+        "unavailable": 0,
+        "partial": 0,
+        "untested": 0,
+    }
+    items: list[dict[str, Any]] = []
+    unavailable_prefixes: list[str] = []
+    for prefix in sorted(selected_by_prefix):
+        phones = selected_by_prefix[prefix]
+        available_count = sum(1 for phone in phones if outcomes.get(phone) == "available")
+        unavailable_count = sum(1 for phone in phones if outcomes.get(phone) == "unavailable")
+        untested_count = max(len(phones) - available_count - unavailable_count, 0)
+        if available_count > 0 and unavailable_count > 0:
+            status = "partial"
+        elif available_count > 0:
+            status = "available"
+        elif unavailable_count > 0:
+            status = "unavailable"
+            unavailable_prefixes.append(prefix)
+        else:
+            status = "untested"
+        status_counts[status] += 1
+        items.append(
+            {
+                "prefix": prefix,
+                "status": status,
+                "selected_count": len(phones),
+                "tested_count": available_count + unavailable_count,
+                "available_count": available_count,
+                "unavailable_count": unavailable_count,
+                "untested_count": untested_count,
+                "phones": list(phones),
+            }
+        )
+
+    return {
+        "prefix_count": len(items),
+        "selected_phone_count": len(selected_phones),
+        "tested_phone_count": sum(1 for phone in selected_phones if phone in outcomes),
+        "available_prefix_count": status_counts["available"],
+        "unavailable_prefix_count": status_counts["unavailable"],
+        "partial_prefix_count": status_counts["partial"],
+        "untested_prefix_count": status_counts["untested"],
+        "unavailable_prefixes": unavailable_prefixes,
+        "items": items,
+    }
 
 
 def _phone_binding_error_status(error_text: str) -> str:
     lowered = str(error_text or "").strip().lower()
     if not lowered:
         return "unknown"
+    if any(
+        marker in lowered
+        for marker in (
+            "phone number already in use",
+            "phone_number_in_use",
+            "手机号已被使用",
+            "号码已被使用",
+            "手机号已使用",
+            "号码已使用",
+        )
+    ):
+        return "phone_already_used"
     if any(
         marker in lowered
         for marker in (
@@ -2215,6 +7766,17 @@ def _phone_binding_error_status(error_text: str) -> str:
         return "api_no_code"
     if any(marker in lowered for marker in ("收码 api", "api 请求失败", "api 响应不是 json", "api 返回失败")):
         return "api_error"
+    if "429" in lowered and any(
+        marker in lowered
+        for marker in (
+            "提交邮箱失败",
+            "authorize_continue",
+            "/authorize/continue",
+            "oauth",
+            "login_session",
+        )
+    ):
+        return "account_auth_error"
     if any(marker in lowered for marker in ("rate limit", "429", "too many verification requests", "验证请求过多")):
         return "rate_limited"
     if any(marker in lowered for marker in ("timeout", "timed out", "network", "connection", "proxy", "ssl", "tls")):
@@ -2240,9 +7802,11 @@ def _phone_binding_error_status(error_text: str) -> str:
 def _phone_binding_status_label(status: str) -> str:
     return {
         "bound": "绑定成功",
+        "sms_probe_received": "已收码，未提交",
         "account_phone_bound": "账号已绑定手机号码",
         "openai_rejected": "OpenAI 拒绝号码",
         "openai_phone_limit": "号码达到 OpenAI 绑定上限",
+        "phone_already_used": "手机号已被使用",
         "api_no_code": "OpenAI 已发码但 API 未收到",
         "api_error": "收码 API 异常",
         "rate_limited": "OpenAI 限流",
@@ -2314,17 +7878,176 @@ def _run_phone_binding_test(
         _execute_chatgpt_resume_subscription_auth,
     )
     from services.chatgpt_core.phone_service import UploadedPhoneEntry, UploadedPhoneService
+    from core.proxy_utils import is_proxy_error_text, normalize_proxy_url
 
     control = _task_store.control_for(task_id)
+    phone_log_context: dict[str, Any] = {
+        "account_index": 0,
+        "account_total": len(account_ids),
+        "stage_index": 1,
+        "stage_label": "准备",
+        "email": "",
+        "account_id": 0,
+        "phone": "",
+        "phone_index": 0,
+        "phone_total": len(phone_items),
+        "attempt": 0,
+    }
+    PHONE_BINDING_STAGE_TOTAL = 12
+    PHONE_BINDING_STAGE_LABELS: dict[int, str] = {
+        1: "准备",
+        2: "选择代理",
+        3: "OAuth登录",
+        4: "邮箱验证",
+        5: "进入绑定",
+        6: "发送短信",
+        7: "接收短信",
+        8: "提交短信",
+        9: "确认绑定",
+        10: "补抓Auth",
+        11: "保存账号",
+        12: "回写号码池",
+    }
+
+    def set_phone_log_context(**updates: Any) -> None:
+        phone_log_context.update({key: value for key, value in updates.items() if value is not None})
+
+    def _phone_stage_label(stage_index: int | None = None, phase_label: str = "") -> str:
+        index = int(stage_index or phone_log_context.get("stage_index") or 1)
+        return str(phase_label or PHONE_BINDING_STAGE_LABELS.get(index) or "").strip()
+
+    def _phone_binding_log_line(
+        message: str,
+        *,
+        stage_index: int | None = None,
+        phase_label: str = "",
+    ) -> str:
+        index = int(stage_index or phone_log_context.get("stage_index") or 1)
+        label = _phone_stage_label(index, phase_label)
+        return format_task_timeline_log(
+            "手机绑定",
+            str(message or ""),
+            item_index=int(phone_log_context.get("account_index") or 0),
+            item_total=int(phone_log_context.get("account_total") or len(account_ids) or 0),
+            email=str(phone_log_context.get("email") or ""),
+            account_id=phone_log_context.get("account_id") or None,
+            phone=str(phone_log_context.get("phone") or ""),
+            stage_index=index,
+            stage_total=PHONE_BINDING_STAGE_TOTAL,
+            phase_label=label,
+        )
+
+    def clean_phone_binding_message(message: str) -> str:
+        text = str(message or "").strip()
+        # 上游组件经常自带 [验证码] / [号码测试] 这类模块标签。
+        # 手机绑定日志前缀已经有步骤名，正文里再重复这些标签只会干扰排版。
+        while True:
+            cleaned = re.sub(
+                r"^\s*\[(?:验证码|手机号验证|号码测试|代理|邮箱|登录|阶段|主链路|注册|结果|TempMailLocal|DEBUG)\]\s*",
+                "",
+                text,
+                flags=re.I,
+            )
+            if cleaned == text:
+                break
+            text = cleaned
+        return text
+
+    def phone_log(
+        message: str,
+        *,
+        level: str = "info",
+        stage_index: int | None = None,
+        phase_label: str = "",
+    ) -> None:
+        index = int(stage_index or phone_log_context.get("stage_index") or 1)
+        label = _phone_stage_label(index, phase_label)
+        set_phone_log_context(stage_index=index, stage_label=label)
+        _log(
+            task_id,
+            _phone_binding_log_line(clean_phone_binding_message(message), stage_index=index, phase_label=label),
+            level,
+            expose_phone=True,
+            expose_otp=True,
+        )
+
+    def phone_attempt_header(*, account_position: int, account_total: int, phone_index: int, phone_total_label: str, phone: str) -> None:
+        _log(
+            task_id,
+            (
+                "[手机号绑定] -------- "
+                f"账号 {account_position}/{account_total} | "
+                f"手机号 {phone_index}/{phone_total_label} | "
+                f"{phone} --------"
+            ),
+            expose_phone=True,
+            expose_otp=True,
+        )
+
+    def infer_phone_binding_stage(message: str) -> tuple[int | None, str]:
+        text = str(message or "")
+        lowered = text.lower()
+        if "绑定手机号 otp 验证通过" in lowered or "otp 验证通过" in lowered:
+            return 9, "确认绑定"
+        if "准备提交绑定手机号验证码" in text or "validate_phone" in lowered:
+            return 8, "提交短信"
+        if "收到验证码" in text or "暂无验证码" in text or "收码 api" in text or "接码" in text:
+            return 7, "接收短信"
+        if "已请求绑定手机号短信验证码" in text or "openai 已接受并发送验证码" in lowered or "add-phone/send" in lowered:
+            return 6, "发送短信"
+        if "add_phone" in lowered or "手机号验证" in text:
+            return 5, "进入绑定"
+        if "邮箱验证码" in text or "email otp" in lowered:
+            return 4, "邮箱验证"
+        if "oauth" in lowered or "登录" in text or "authorize" in lowered:
+            return 3, "OAuth登录"
+        if "代理" in text or "proxy" in lowered:
+            return 2, "选择代理"
+        return None, ""
+
+    def task_log_info_from_upstream(message: str, stage_index: int, phase_label: str) -> None:
+        text = str(message or "")
+        if "已请求绑定手机号短信验证码" in text or "OpenAI 已接受并发送验证码" in text:
+            phone_log("OpenAI 已接受手机号，等待短信验证码", stage_index=6, phase_label="发送短信")
+            return
+        if "收到验证码" in text:
+            phone_log(text, stage_index=7, phase_label="接收短信")
+            return
+        if "准备提交绑定手机号验证码" in text:
+            phone_log(text, stage_index=8, phase_label="提交短信")
+            return
+        if "绑定手机号 OTP 验证通过" in text:
+            phone_log("手机号验证码验证通过", stage_index=9, phase_label="确认绑定")
+            return
+        if "等待邮箱验证码" in text:
+            phone_log(text, stage_index=4, phase_label="邮箱验证")
+            return
+        if "验证码已获取" in text and "邮箱" in text:
+            phone_log(text, stage_index=4, phase_label="邮箱验证")
 
     def stop_checker() -> None:
         control.checkpoint(consume_skip=False)
 
     def task_log(message: str) -> None:
         stop_checker()
-        _log(task_id, message)
+        raw = str(message or "")
+        stage_index, phase_label = infer_phone_binding_stage(raw)
+        if stage_index:
+            set_phone_log_context(stage_index=stage_index, stage_label=phase_label)
+        task_log_info_from_upstream(
+            raw,
+            int(stage_index or phone_log_context.get("stage_index") or 1),
+            phase_label or str(phone_log_context.get("stage_label") or ""),
+        )
+        phone_log(
+            raw,
+            level="debug",
+            stage_index=int(stage_index or phone_log_context.get("stage_index") or 1),
+            phase_label=phase_label or str(phone_log_context.get("stage_label") or ""),
+        )
 
-    total = max(len(phone_items), 1)
+    use_pool = _is_truthy(settings.get("use_pool"))
+    total = max(len(account_ids) if use_pool else len(phone_items), 1)
     success_count = 0
     skipped_count = 0
     errors: list[str] = []
@@ -2334,9 +8057,26 @@ def _run_phone_binding_test(
     bound_phone_lines: list[str] = []
     bound_phone_results: list[dict[str, Any]] = []
     account_index = 0
+    accounts_with_phone_terminal_result: set[int] = set()
+    terminal_phones_this_run: set[str] = set()
     account_interval_seconds = _parse_positive_int(settings.get("account_interval_seconds"), 60)
     reuse_phone_until_unusable = _is_truthy(settings.get("reuse_phone_until_unusable"))
+    prefix_bind_enabled = _is_truthy(settings.get("prefix_bind_enabled"))
+    prefix_sample_enabled = _is_truthy(settings.get("prefix_sample_enabled"))
+    prefix_sample_size = 2 if int(settings.get("prefix_sample_size") or 1) == 2 else 1
+    prefix_sample_filter = str(settings.get("prefix_sample_filter") or "all").strip().lower()
+    if prefix_sample_filter not in {"all", "available", "rejected"}:
+        prefix_sample_filter = "all"
+    prefix_sms_probe_only = _is_truthy(settings.get("prefix_sms_probe_only"))
+    if prefix_sample_enabled or prefix_sms_probe_only:
+        reuse_phone_until_unusable = False
+    selected_prefixes = [
+        str(prefix or "").strip()
+        for prefix in (settings.get("selected_prefixes") or [])
+        if str(prefix or "").strip()
+    ]
     last_account_attempt_finished_at = 0.0
+    no_phone_available = False
 
     _task_store.mark_running(task_id)
     _task_store.set_progress(task_id, f"0/{total}")
@@ -2345,19 +8085,83 @@ def _run_phone_binding_test(
     missing_ids = list(meta.get("missing_ids") or [])
     parse_errors = list(meta.get("parse_errors") or [])
 
-    def sync_meta() -> None:
-        _task_store.update_meta(
-            task_id,
-            {
-                "runtime_results": list(runtime_results),
-                "account_results": list(account_results),
-                "bound_phone_lines": list(bound_phone_lines),
-                "bound_phone_results": list(bound_phone_results),
-                "runtime_success": success_count,
-                "runtime_skipped": skipped_count,
-                "runtime_errors": list(errors),
-            },
+    def timeline(
+        *,
+        email: str = "",
+        account_id: int | str | None = None,
+        phone: str = "",
+        phase: str = "",
+        phase_label: str = "",
+        stage_index: int | None = None,
+        stage_total: int | None = None,
+        message: str = "",
+        next_step: str = "",
+        resource_touched: bool | None = None,
+        reset_started_at: bool = False,
+    ) -> None:
+        normalized_stage_index = int(stage_index or phone_log_context.get("stage_index") or 1)
+        normalized_phase_label = _phone_stage_label(normalized_stage_index, phase_label)
+        set_phone_log_context(
+            email=email or phone_log_context.get("email") or "",
+            account_id=account_id or phone_log_context.get("account_id") or 0,
+            phone=phone or phone_log_context.get("phone") or "",
+            account_index=account_index if account_index > 0 else phone_log_context.get("account_index") or 0,
+            account_total=len(account_ids) if account_ids else phone_log_context.get("account_total") or 0,
+            stage_index=normalized_stage_index,
+            stage_label=normalized_phase_label,
         )
+        _task_timeline_log(
+            task_id,
+            task="手机绑定",
+            email=email,
+            account_id=account_id,
+            phone=phone,
+            item_index=account_index if account_index > 0 else None,
+            item_total=len(account_ids) if account_ids else None,
+            phase=phase,
+            phase_label=normalized_phase_label,
+            stage_index=normalized_stage_index,
+            stage_total=PHONE_BINDING_STAGE_TOTAL,
+            message=message,
+            next_step=next_step,
+            resource_touched=resource_touched,
+            reset_started_at=reset_started_at,
+        )
+
+    def sync_meta() -> None:
+        safe_runtime_results = [sanitize_phone_result(item) for item in runtime_results]
+        safe_bound_phone_results = [sanitize_phone_result(item) for item in bound_phone_results]
+        updates = {
+            "runtime_results": safe_runtime_results,
+            "account_results": sanitize_task_detail(account_results),
+            "bound_phone_lines": [redact_raw_phone_line(line) for line in bound_phone_lines],
+            "bound_phone_results": safe_bound_phone_results,
+            "runtime_success": success_count,
+            "runtime_skipped": skipped_count,
+            "runtime_errors": [sanitize_error_message(err) for err in errors],
+            "no_phone_available": no_phone_available,
+        }
+        if prefix_sample_enabled:
+            updates["prefix_summary"] = _build_phone_prefix_sample_summary(phone_items, runtime_results)
+        _task_store.update_meta(task_id, updates)
+
+    pool_repo = None
+    if use_pool or any(bool(item.get("pool_managed")) for item in phone_items):
+        from services.chatgpt_core.phone_pool_repository import PhonePoolRepository
+
+        pool_repo = PhonePoolRepository()
+
+    def record_pool_result(item: dict[str, Any], status: str, *, reason: str = "", email: str = "", api_expired_date: str = "") -> None:
+        if pool_repo is None or not bool(item.get("pool_managed")):
+            return
+        phone = str(item.get("phone") or "")
+        try:
+            pool_repo.record_task_status(phone, status, reason=reason, email=email)
+            expired = str(api_expired_date or "").strip()
+            if expired and hasattr(pool_repo, "update_api_expired_date"):
+                pool_repo.update_api_expired_date(phone, expired)
+        except Exception as exc:
+            _log(task_id, f"[号码池] 状态回写失败: {item.get('phone') or '-'} - {exc}")
 
     def result_for_phone(
         item: dict[str, Any],
@@ -2372,6 +8176,7 @@ def _run_phone_binding_test(
         return {
             "line_no": int(item.get("line_no") or 0),
             "phone": str(item.get("phone") or ""),
+            "prefix4": str(item.get("prefix4") or _phone_binding_prefix4(item.get("phone"))),
             "api_url": str(item.get("api_url") or ""),
             "raw_line": str(item.get("raw_line") or ""),
             "status": status,
@@ -2388,7 +8193,7 @@ def _run_phone_binding_test(
 
     def format_result_log_line(result: dict[str, Any]) -> str:
         parts = [
-            f"手机号: {result.get('phone') or '-'}",
+            f"手机号: {mask_phone_for_log(result.get('phone')) if result.get('phone') else '-'}",
             f"状态: {result.get('status_label') or result.get('status') or '-'}",
         ]
         email = str(result.get("email") or "").strip()
@@ -2400,7 +8205,7 @@ def _run_phone_binding_test(
         code_time = str(result.get("code_time") or "").strip()
         if code_time:
             parts.append(f"验证码时间: {code_time}")
-        reason = str(result.get("reason") or "").strip()
+        reason = sanitize_error_message(str(result.get("reason") or "").strip())
         if reason:
             parts.append(f"原因: {reason[:160]}")
         return " | ".join(parts)
@@ -2414,24 +8219,275 @@ def _run_phone_binding_test(
             or getattr(phone_service, "last_code_time", "")
         )
 
+    def _positive_int(value: Any, default: int, minimum: int = 1, maximum: int = 20) -> int:
+        try:
+            parsed = int(float(str(value or "").strip()))
+        except Exception:
+            parsed = default
+        return max(minimum, min(maximum, parsed))
+
+    def _positive_float(value: Any, default: float, minimum: float = 0, maximum: float = 100) -> float:
+        try:
+            parsed = float(str(value or "").strip())
+        except Exception:
+            parsed = default
+        return max(minimum, min(maximum, parsed))
+
+    def _build_phone_binding_candidate_proxies() -> list[tuple[str, object | None, str]]:
+        from core.config_store import config_store
+        from core.proxy_pool import proxy_pool as runtime_proxy_pool
+
+        explicit_proxy = normalize_proxy_url(settings.get("proxy")) or ""
+        # Enqueued UI tasks always pass proxy_mode (default pool).  Older direct
+        # callers/tests may omit it; keep those legacy calls direct unless they
+        # explicitly supplied a proxy.
+        mode = str(settings.get("proxy_mode") or ("specified" if explicit_proxy else "direct")).strip().lower()
+        if mode in {"none", "no_proxy", "direct", "直连"}:
+            return [("", None, "direct")]
+        if mode in {"manual", "explicit"}:
+            mode = "specified"
+        if mode not in {"specified", "pool"}:
+            mode = "specified" if explicit_proxy else "pool"
+
+        country_code = str(settings.get("proxy_country_code") or "").strip().upper()
+        failover = _is_truthy(settings.get("proxy_failover"))
+        max_candidates = _positive_int(
+            settings.get("proxy_max_candidates") or config_store.get("proxy_pool_max_candidates", "5"),
+            default=5,
+            minimum=1,
+            maximum=100,
+        )
+        min_score = _positive_float(
+            settings.get("proxy_min_score") or config_store.get("proxy_scan_min_score", "50"),
+            default=50,
+            minimum=0,
+            maximum=100,
+        )
+
+        candidates: list[tuple[str, object | None, str]] = []
+        if mode == "specified":
+            if not explicit_proxy:
+                raise RuntimeError("已选择指定代理模式，但代理地址为空")
+            candidates.append((explicit_proxy, None, "specified"))
+            if not failover:
+                return candidates
+
+        pool_candidates = runtime_proxy_pool.get_candidate_records(
+            target="chatgpt",
+            country_code=country_code,
+            limit=max_candidates,
+            min_score=min_score,
+        )
+        for candidate in pool_candidates:
+            url = normalize_proxy_url(candidate.get("url")) or ""
+            if not url or any(existing[0] == url for existing in candidates):
+                continue
+            country = str(candidate.get("exit_country_code") or "unknown").strip() or "unknown"
+            score = candidate.get("health_score")
+            latency = int(candidate.get("latency_ms") or 0)
+            source = f"pool country={country} score={score} latency={latency}ms"
+            candidates.append((url, runtime_proxy_pool, source))
+
+        if mode == "pool" and not candidates:
+            country_text = country_code or "不限"
+            raise RuntimeError(f"代理池没有可用候选：target=chatgpt country={country_text} min_score={min_score:g}")
+        return candidates or [("", None, "direct")]
+
+    def _log_phone_binding_proxy_choice(proxy_url: str, source: str, index: int, total_count: int) -> None:
+        if proxy_url:
+            phone_log(
+                f"使用代理 {index}/{total_count}：source={source} proxy={redact_proxy_url(proxy_url)}",
+                stage_index=2,
+                phase_label="选择代理",
+            )
+        else:
+            phone_log(
+                f"使用代理 {index}/{total_count}：direct",
+                stage_index=2,
+                phase_label="选择代理",
+            )
+
+    def _report_phone_proxy_success(proxy_pool: Any, proxy_url: str, phone_service: Any, result: dict[str, Any] | None = None) -> None:
+        if proxy_pool is None or not proxy_url:
+            return
+        if phone_was_touched(phone_service) or bool((result or {}).get("ok")):
+            try:
+                proxy_pool.report_success(proxy_url)
+            except Exception:
+                pass
+
+    def _report_phone_proxy_fail(proxy_pool: Any, proxy_url: str, error_text: str) -> None:
+        if proxy_pool is None or not proxy_url or not is_proxy_error_text(error_text):
+            return
+        try:
+            proxy_pool.report_fail(proxy_url)
+        except Exception:
+            pass
+
     def should_keep_phone_for_next_account(status: str, phone_service: Any) -> bool:
         return status in {"account_auth_error", "browser_error", "unknown"} and not phone_was_touched(phone_service)
+
+    def is_account_rate_limit_error(status: str, error_text: str) -> bool:
+        if status != "account_auth_error":
+            return False
+        lowered = str(error_text or "").strip().lower()
+        if not any(marker in lowered for marker in ("429", "rate limit", "too many request", "请求过快", "限流")):
+            return False
+        return any(
+            marker in lowered
+            for marker in (
+                "提交邮箱失败",
+                "authorize_continue",
+                "/authorize/continue",
+                "oauth",
+                "login_session",
+                "rate limit",
+                "too many request",
+                "请求过快",
+                "限流",
+            )
+        )
+
+    def mark_account_rate_limited_for_recovery(account_id: int, email: str, error_text: str) -> str:
+        if account_id <= 0:
+            return ""
+        try:
+            with Session(engine) as rate_session:
+                account = rate_session.get(AccountModel, account_id)
+                if account is None or account.platform != "chatgpt":
+                    return ""
+                mark_account_rate_limited(account)
+                recover_at = str(account_rate_limit_payload(account).get("recover_at") or "")
+                rate_session.add(account)
+                rate_session.commit()
+            _log(task_id, f"[限流] 账号已标记限流，预计恢复: {email or account_id} -> {recover_at or '1小时后'}")
+            return recover_at
+        except Exception as exc:
+            _log(task_id, f"[限流] 账号限流状态写入失败: {email or account_id} - {exc}")
+            return ""
 
     def wait_before_next_account_attempt(attempt_id: int | None = None) -> None:
         if last_account_attempt_finished_at <= 0 or account_interval_seconds <= 0:
             return
         remaining = (last_account_attempt_finished_at + account_interval_seconds) - time.monotonic()
         if remaining > 0:
-            _log(task_id, f"[号码测试] 等待账号/号码间隔 {remaining:.0f}s，降低 OpenAI too many request 风险")
+            _log(task_id, f"[手机号绑定] 等待账号/号码间隔 {remaining:.0f}s，降低 OpenAI too many request 风险")
         while remaining > 0:
             control.checkpoint(attempt_id=attempt_id)
             chunk = min(1.0, remaining)
             time.sleep(chunk)
             remaining = (last_account_attempt_finished_at + account_interval_seconds) - time.monotonic()
 
+    def result_error_text(result: dict[str, Any], default: str = "手机号绑定失败") -> str:
+        data = result.get("data") if isinstance(result.get("data"), dict) else {}
+        return str(result.get("error") or data.get("message") or default)
+
+    def parse_auth_retry_delays(value: Any) -> list[int]:
+        default_delays = [5, 10, 20]
+        if value in (None, ""):
+            return default_delays
+        if isinstance(value, str):
+            candidates = value.replace("，", ",").replace(";", ",").split(",")
+        elif isinstance(value, (list, tuple, set)):
+            candidates = list(value)
+        else:
+            candidates = [value]
+
+        delays: list[int] = []
+        for item in candidates:
+            try:
+                delay = int(float(str(item).strip()))
+            except Exception:
+                continue
+            if delay < 0:
+                continue
+            delays.append(min(delay, 120))
+            if len(delays) >= 3:
+                break
+        return delays or default_delays
+
+    auth_retry_delays_seconds = parse_auth_retry_delays(
+        settings.get("phone_binding_auth_retry_delays_seconds")
+        if settings.get("phone_binding_auth_retry_delays_seconds") not in (None, "")
+        else settings.get("auth_retry_delays_seconds")
+    )
+
+    def sleep_before_auth_retry(delay_seconds: int, attempt_id: int | None) -> None:
+        delay_seconds = max(int(delay_seconds or 0), 0)
+        if delay_seconds <= 0:
+            control.checkpoint(attempt_id=attempt_id)
+            return
+        deadline = time.monotonic() + delay_seconds
+        while True:
+            control.checkpoint(attempt_id=attempt_id)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(1.0, remaining))
+
+    def retry_auth_capture_after_phone_completed(
+        *,
+        account: AccountModel,
+        session: Session,
+        first_result: dict[str, Any],
+        email: str,
+        attempt_id: int | None,
+        proxy_url: str = "",
+    ) -> tuple[dict[str, Any], int, bool]:
+        latest_result = dict(first_result or {})
+        retry_count = 0
+        for retry_index, delay_seconds in enumerate(auth_retry_delays_seconds, start=1):
+            retry_count = retry_index
+            last_error = result_error_text(latest_result, "Auth/RT 获取失败")
+            if delay_seconds > 0:
+                _log(
+                    task_id,
+                    f"[手机号绑定] 手机号已提交成功，但 Auth/RT 获取失败：{last_error[:180]}；"
+                    f"等待 {delay_seconds}s 后重试 {retry_index}/{len(auth_retry_delays_seconds)}",
+                )
+            else:
+                _log(
+                    task_id,
+                    f"[手机号绑定] 手机号已提交成功，但 Auth/RT 获取失败：{last_error[:180]}；"
+                    f"立即重试 {retry_index}/{len(auth_retry_delays_seconds)}",
+                )
+            sleep_before_auth_retry(delay_seconds, attempt_id)
+            try:
+                control.checkpoint(attempt_id=attempt_id)
+                retry_kwargs = {
+                    "allow_phone_verification": False,
+                    "log_fn": task_log,
+                    "stop_checker": lambda: control.checkpoint(attempt_id=attempt_id),
+                    "retry_delays_seconds": [],
+                }
+                if proxy_url:
+                    retry_kwargs["proxy_url"] = proxy_url
+                retry_result = _execute_chatgpt_resume_subscription_auth(
+                    account,
+                    **retry_kwargs,
+                )
+                session.refresh(account)
+                _apply_chatgpt_resume_auth_result(account, retry_result, session)
+                latest_result = retry_result
+            except (SkipCurrentAttemptRequested, StopTaskRequested):
+                raise
+            except Exception as exc:
+                latest_result = {
+                    "ok": False,
+                    "error": str(exc or "Auth/RT 重试失败"),
+                    "data": {"message": str(exc or "Auth/RT 重试失败")},
+                }
+                _log(task_id, f"[手机号绑定] Auth/RT 重试 {retry_index}/{len(auth_retry_delays_seconds)} 异常: {latest_result['error']}")
+
+            if bool(latest_result.get("ok")):
+                _log(task_id, f"[手机号绑定] 手机绑定后 Auth/RT 重试成功: {email or getattr(account, 'id', '')} ({retry_index}/{len(auth_retry_delays_seconds)})")
+                return latest_result, retry_count, True
+
+        return latest_result, retry_count, False
+
     try:
         for parse_error in parse_errors:
-            _log(task_id, f"[号码测试] 解析跳过: line={parse_error.get('line')} {parse_error.get('reason') or ''}")
+            _log(task_id, f"[手机号绑定] 解析跳过: line={parse_error.get('line')} {parse_error.get('reason') or ''}")
 
         for missing_id in missing_ids:
             message = f"account_id={missing_id}: 账号不存在"
@@ -2440,22 +8496,172 @@ def _run_phone_binding_test(
             account_results.append({"account_id": int(missing_id or 0), "email": "", "status": "account_missing", "reason": "账号不存在"})
 
         if reuse_phone_until_unusable:
-            _log(task_id, "[号码测试] 同号连续绑定已开启：同一个手机号会复用到 OpenAI 或收码接口判定不可继续使用")
+            _log(task_id, "[手机号绑定] 同号连续绑定已开启：同一个手机号会复用到 OpenAI 或收码接口判定不可继续使用")
+        if prefix_sms_probe_only:
+            _log(task_id, "[手机号绑定] 短信探测模式已开启：只验证 OpenAI 发码和收码 API 收码，不提交验证码、不完成手机号绑定")
+        if prefix_sample_enabled:
+            prefix_count = int((meta.get("prefix_sample") or {}).get("prefix_count") or 0)
+            sample_filter_label = (
+                f"指定号段 {','.join(selected_prefixes)}"
+                if selected_prefixes
+                else "测试可用号段"
+                if prefix_sample_filter == "available"
+                else "仅复测 OpenAI 拒绝号段"
+                if prefix_sample_filter == "rejected"
+                else "全部号段"
+            )
+            _log(
+                task_id,
+                f"[号段抽样] 已开启：{sample_filter_label}，按手机号前 4 位分组，每个号段最多测试 {prefix_sample_size} 个号码，"
+                f"共选中 {prefix_count} 个号段 / {len(phone_items)} 个号码",
+            )
+        if prefix_bind_enabled:
+            prefix_bind_meta = meta.get("prefix_bind") if isinstance(meta.get("prefix_bind"), dict) else {}
+            slot_count = int((prefix_bind_meta or {}).get("available_slot_count") or 0)
+            phone_count = int((prefix_bind_meta or {}).get("available_phone_count") or 0)
+            _log(
+                task_id,
+                f"[限定号段] 已开启：只从 {','.join(selected_prefixes) or '-'} 取号，"
+                f"可用号码 {phone_count} 个 / 可覆盖账号 {slot_count} 个，不使用其他号段兜底",
+            )
+        phone_cursor = 0
+        total_phones = len(phone_items)
+        dynamic_phone_attempts = 0
+        preferred_phone_item: dict[str, Any] | None = None
+        preferred_pool_phone = ""
+        successful_phones_this_run: set[str] = set()
 
-        for phone_index, item in enumerate(phone_items, start=1):
+        def pool_record_to_item(record: Any, line_no: int) -> dict[str, Any]:
+            phone_value = str(getattr(record, "phone_e164", "") or "")
+            api_url_value = str(getattr(record, "api_url", "") or "")
+            return {
+                "id": int(getattr(record, "id", 0) or 0),
+                "pool_id": int(getattr(record, "id", 0) or 0),
+                "line_no": int(line_no or 0),
+                "phone": phone_value,
+                "api_url": api_url_value,
+                "raw_line": f"{phone_value}----{api_url_value}",
+                "pool_managed": True,
+                "prefix4": _phone_binding_prefix4(phone_value),
+            }
+
+        def next_pool_item() -> tuple[dict[str, Any], int, str] | None:
+            nonlocal dynamic_phone_attempts, preferred_pool_phone
+            if pool_repo is None:
+                return None
+            excluded_phones = set(terminal_phones_this_run)
+            if not reuse_phone_until_unusable:
+                excluded_phones.update(successful_phones_this_run)
+            selected = None
+            preferred = str(preferred_pool_phone or "").strip()
+            if preferred and preferred not in excluded_phones:
+                get_record = getattr(pool_repo, "get", None)
+                if callable(get_record):
+                    candidate = get_record(preferred)
+                    if candidate is not None and getattr(candidate, "available", False) and str(getattr(candidate, "api_url", "") or ""):
+                        selected = candidate
+            if selected is None:
+                preferred_pool_phone = ""
+                available_candidates = (
+                    pool_repo.list_available_by_prefixes(selected_prefixes)
+                    if prefix_bind_enabled and selected_prefixes and hasattr(pool_repo, "list_available_by_prefixes")
+                    else pool_repo.list_available()
+                )
+                for candidate in available_candidates:
+                    phone_value = str(getattr(candidate, "phone_e164", "") or "")
+                    if not phone_value or phone_value in excluded_phones:
+                        continue
+                    if not str(getattr(candidate, "api_url", "") or ""):
+                        continue
+                    selected = candidate
+                    break
+            if selected is None:
+                return None
+            dynamic_phone_attempts += 1
+            item = pool_record_to_item(selected, dynamic_phone_attempts)
+            if preferred and item.get("phone") == preferred:
+                _log(task_id, f"[手机号绑定] 同号连续绑定继续: {preferred}")
+            return item, dynamic_phone_attempts, "动态"
+
+        def next_manual_item() -> tuple[dict[str, Any], int, str] | None:
+            nonlocal phone_cursor, dynamic_phone_attempts, preferred_phone_item
+            if reuse_phone_until_unusable and preferred_phone_item is not None:
+                dynamic_phone_attempts += 1
+                _log(task_id, f"[手机号绑定] 同号连续绑定继续: {preferred_phone_item.get('phone') or '-'}")
+                return dict(preferred_phone_item), dynamic_phone_attempts, "动态"
+            while phone_cursor < total_phones:
+                item = phone_items[phone_cursor]
+                phone_index = phone_cursor + 1
+                phone_cursor += 1
+                phone = str(item.get("phone") or "").strip()
+                if phone and phone in terminal_phones_this_run:
+                    _log(task_id, f"[SKIP] 手机号 {phone_index}/{total} | {phone} 已在本轮判定不可继续使用，跳过重复 slot")
+                    _task_store.set_progress(task_id, f"{min(phone_cursor, total)}/{total}")
+                    continue
+                return item, phone_index, str(total)
+            return None
+
+        def next_phone_item() -> tuple[dict[str, Any], int, str] | None:
+            return next_pool_item() if use_pool else next_manual_item()
+
+        for account_position, account_id_raw in enumerate(account_ids, start=1):
             control.checkpoint(consume_skip=False)
-            phone = str(item.get("phone") or "").strip()
-            raw_line = str(item.get("raw_line") or "").strip()
-            _log(task_id, f"[号码测试] -------- 手机号 {phone_index}/{total} | {phone} --------")
-            _task_store.set_progress(task_id, f"{phone_index - 1}/{total}")
-            phone_finished = False
-            phone_result_count_before = len(runtime_results)
+            account_id = int(account_id_raw or 0)
+            email = ""
+            account_done = False
+            account_attempts = 0
 
-            while account_index < len(account_ids) and not phone_finished:
+            while not account_done:
                 control.checkpoint(consume_skip=False)
-                account_id = int(account_ids[account_index] or 0)
-                account_index += 1
-                email = ""
+                next_item = next_phone_item()
+                if next_item is None:
+                    no_phone_available = True
+                    break
+                item, phone_index, phone_total_label = next_item
+                phone = str(item.get("phone") or "").strip()
+
+                raw_line = str(item.get("raw_line") or "").strip()
+                account_attempts += 1
+                account_index = account_position
+                set_phone_log_context(
+                    account_index=account_position,
+                    account_total=len(account_ids),
+                    account_id=account_id,
+                    email=email,
+                    phone=phone,
+                    phone_index=phone_index,
+                    phone_total=total_phones,
+                    attempt=account_attempts,
+                    stage_index=1,
+                    stage_label="准备",
+                )
+                phone_attempt_header(
+                    account_position=account_position,
+                    account_total=len(account_ids),
+                    phone_index=phone_index,
+                    phone_total_label=phone_total_label,
+                    phone=phone,
+                )
+                timeline(
+                    email=email,
+                    account_id=account_id,
+                    phone=phone,
+                    phase="prepare",
+                    phase_label="准备",
+                    stage_index=1,
+                    message=(
+                        f"账号ID={account_id}，手机号={phone}，手机号序号={phone_index}/{phone_total_label}，"
+                        f"尝试={account_attempts}，来源={'号码池' if use_pool else '上传列表'}"
+                    ),
+                    next_step="选择代理",
+                    resource_touched=False,
+                    reset_started_at=True,
+                )
+                if use_pool:
+                    _task_store.set_progress(task_id, f"{max(account_position - 1, 0)}/{total}")
+                else:
+                    _task_store.set_progress(task_id, f"{max(phone_index - 1, 0)}/{total}")
+
                 attempt_id = control.start_attempt()
                 service_entry = UploadedPhoneEntry(
                     country_slug="uploaded",
@@ -2477,6 +8683,7 @@ def _run_phone_binding_test(
                     log_fn=task_log,
                 )
                 phone_service.bind_entry(service_entry)
+
                 try:
                     wait_before_next_account_attempt(attempt_id)
                     with Session(engine) as session:
@@ -2486,37 +8693,215 @@ def _run_phone_binding_test(
                         email = str(account.email or "")
                         if not primary_email:
                             primary_email = email
+                        set_phone_log_context(email=email)
 
-                    _log(task_id, f"[号码测试] 使用账号测试: {email or account_id} -> {phone}")
+                    candidate_proxies = _build_phone_binding_candidate_proxies()
+                    phone_log(
+                        f"邮箱={email or '-'}，账号ID={account_id}，手机号={phone}",
+                        stage_index=1,
+                        phase_label="准备",
+                    )
                     control.checkpoint(attempt_id=attempt_id)
                     with Session(engine) as session:
                         account = session.get(AccountModel, account_id)
                         if account is None or account.platform != "chatgpt":
                             raise ValueError("ChatGPT 账号不存在")
-                        result = _execute_chatgpt_resume_subscription_auth(
-                            account,
-                            allow_phone_verification=True,
-                            log_fn=task_log,
-                            shared_phone_service=phone_service,
-                            stop_checker=lambda: control.checkpoint(attempt_id=attempt_id),
-                            retry_delays_seconds=[],
-                        )
+                        result: dict[str, Any] = {}
+                        selected_proxy_url = ""
+                        for proxy_index, (candidate_proxy, candidate_proxy_pool, candidate_proxy_source) in enumerate(candidate_proxies, start=1):
+                            selected_proxy_url = candidate_proxy
+                            _log_phone_binding_proxy_choice(candidate_proxy, candidate_proxy_source, proxy_index, len(candidate_proxies))
+                            try:
+                                timeline(
+                                    email=email,
+                                    account_id=account_id,
+                                    phone=phone,
+                                    phase="oauth_login",
+                                    phase_label="OAuth登录",
+                                    stage_index=3,
+                                    message=f"开始 OAuth 登录；代理 {proxy_index}/{len(candidate_proxies)}",
+                                    next_step="邮箱验证或进入手机号绑定",
+                                    resource_touched=False,
+                                    reset_started_at=(proxy_index == 1),
+                                )
+                                resume_kwargs = {
+                                    "allow_phone_verification": True,
+                                    "log_fn": task_log,
+                                    "shared_phone_service": phone_service,
+                                    "stop_checker": lambda: control.checkpoint(attempt_id=attempt_id),
+                                    "retry_delays_seconds": [],
+                                }
+                                if prefix_sms_probe_only:
+                                    resume_kwargs["phone_sms_probe_only"] = True
+                                if candidate_proxy:
+                                    resume_kwargs["proxy_url"] = candidate_proxy
+                                result = _execute_chatgpt_resume_subscription_auth(
+                                    account,
+                                    **resume_kwargs,
+                                )
+                                proxy_error_text = result_error_text(result, "") if not bool(result.get("ok")) else ""
+                                if (
+                                    proxy_error_text
+                                    and is_proxy_error_text(proxy_error_text)
+                                    and not phone_was_touched(phone_service)
+                                    and proxy_index < len(candidate_proxies)
+                                ):
+                                    _report_phone_proxy_fail(candidate_proxy_pool, candidate_proxy, proxy_error_text)
+                                    phone_log(
+                                        f"当前代理疑似不可用且手机号未触碰，切换下一个代理：{proxy_error_text[:180]}",
+                                        stage_index=2,
+                                        phase_label="选择代理",
+                                    )
+                                    continue
+                                _report_phone_proxy_success(candidate_proxy_pool, candidate_proxy, phone_service, result)
+                                break
+                            except (SkipCurrentAttemptRequested, StopTaskRequested):
+                                raise
+                            except Exception as proxy_exc:
+                                proxy_error_text = str(proxy_exc or "手机号绑定失败")
+                                if (
+                                    is_proxy_error_text(proxy_error_text)
+                                    and not phone_was_touched(phone_service)
+                                    and proxy_index < len(candidate_proxies)
+                                ):
+                                    _report_phone_proxy_fail(candidate_proxy_pool, candidate_proxy, proxy_error_text)
+                                    phone_log(
+                                        f"当前代理异常且手机号未触碰，切换下一个代理：{proxy_error_text[:180]}",
+                                        stage_index=2,
+                                        phase_label="选择代理",
+                                    )
+                                    continue
+                                _report_phone_proxy_fail(candidate_proxy_pool, candidate_proxy, proxy_error_text)
+                                raise
                         session.refresh(account)
-                        _apply_chatgpt_resume_auth_result(account, result, session)
                         ok = bool(result.get("ok"))
                         data = result.get("data") if isinstance(result.get("data"), dict) else {}
-                        if ok and phone_service.completed_entries:
+                        auth_retry_attempts = 0
+
+                        if prefix_sms_probe_only and phone_service.completed_entries:
+                            success_count += 1
+                            raw_result_line = raw_line or f"{phone}----{item.get('api_url') or ''}"
+                            success_reason = "OpenAI 已发码，收码 API 已收到验证码；按设置未提交验证码，未完成手机号绑定"
+                            phone_result = result_for_phone(
+                                item,
+                                "sms_probe_received",
+                                account_id=account_id,
+                                email=email,
+                                reason=success_reason,
+                                code_received=True,
+                                phone_service=phone_service,
+                            )
+                            phone_result["verification_submitted"] = False
+                            phone_result["sms_probe_only"] = True
+                            session.commit()
+                            runtime_results.append(phone_result)
+                            record_pool_result(item, "sms_probe_received", reason=success_reason, api_expired_date=str(phone_result.get("api_expired_date") or ""))
+                            if phone:
+                                successful_phones_this_run.add(phone)
+                                preferred_pool_phone = ""
+                                preferred_phone_item = None
+                            bound_phone_results.append({**phone_result, "raw_line": raw_result_line})
+                            account_index = account_position
+                            account_results.append({"account_id": account_id, "email": email, "status": "sms_probe_received", "phone": phone, "reason": success_reason})
+                            timeline(
+                                email=email,
+                                account_id=account_id,
+                                phone=phone,
+                                phase="phone_sms_wait",
+                                phase_label="接收短信",
+                                stage_index=7,
+                                message="已收码未提交：短信探测完成，不执行绑定",
+                                next_step="回写号码池",
+                                resource_touched=True,
+                                reset_started_at=True,
+                            )
+                            timeline(
+                                email=email,
+                                account_id=account_id,
+                                phone=phone,
+                                phase="pool_writeback",
+                                phase_label="回写号码池",
+                                stage_index=12,
+                                message="已回写号码池：短信探测成功",
+                                next_step="处理下一个账号",
+                                resource_touched=True,
+                                reset_started_at=True,
+                            )
+                            account_done = True
+                            sync_meta()
+                            break
+
+                        _apply_chatgpt_resume_auth_result(account, result, session)
+
+                        if (not ok) and phone_service.completed_entries:
+                            result, auth_retry_attempts, _ = retry_auth_capture_after_phone_completed(
+                                account=account,
+                                session=session,
+                                first_result=result,
+                                email=email,
+                                attempt_id=attempt_id,
+                                proxy_url=selected_proxy_url,
+                            )
+                            ok = bool(result.get("ok"))
+                            data = result.get("data") if isinstance(result.get("data"), dict) else {}
+
+                        if phone_service.completed_entries:
                             success_count += 1
                             raw_result_line = raw_line or f"{phone}----{item.get('api_url') or ''}"
                             bound_phone_lines.append(raw_result_line)
+                            auth_error_text = "" if ok else result_error_text(result, "Auth/RT 获取失败")
+                            success_reason = "验证码已提交 OpenAI，手机号绑定完成"
+                            if ok:
+                                success_reason = (
+                                    f"{success_reason}，Auth/RT 已获取"
+                                    if auth_retry_attempts <= 0
+                                    else f"{success_reason}，Auth/RT 重试 {auth_retry_attempts} 次后已获取"
+                                )
+                            else:
+                                success_reason = (
+                                    f"{success_reason}；但 Auth/RT 重试 {auth_retry_attempts} 次仍失败: "
+                                    f"{auth_error_text[:180]}"
+                                )
                             phone_result = result_for_phone(
                                 item,
                                 "bound",
                                 account_id=account_id,
                                 email=email,
-                                reason="验证码已提交 OpenAI，手机号绑定完成",
+                                reason=success_reason,
                                 code_received=True,
                                 phone_service=phone_service,
+                            )
+                            phone_result["auth_capture_ok"] = bool(ok)
+                            phone_result["auth_retry_attempts"] = int(auth_retry_attempts or 0)
+                            if auth_error_text:
+                                phone_result["auth_error"] = auth_error_text
+                            timeline(
+                                email=email,
+                                account_id=account_id,
+                                phone=phone,
+                                phase="phone_bound_confirmed",
+                                phase_label="确认绑定",
+                                stage_index=9,
+                                message="手机号验证码已通过，OpenAI 侧绑定完成",
+                                next_step="补抓 Auth/RT",
+                                resource_touched=True,
+                                reset_started_at=True,
+                            )
+                            timeline(
+                                email=email,
+                                account_id=account_id,
+                                phone=phone,
+                                phase="auth_capture_after_phone",
+                                phase_label="补抓Auth",
+                                stage_index=10,
+                                message=(
+                                    "Auth/RT 获取成功"
+                                    if ok
+                                    else f"Auth/RT 获取失败：{auth_error_text[:180]}"
+                                ),
+                                next_step="保存账号绑定状态",
+                                resource_touched=True,
+                                reset_started_at=True,
                             )
                             _persist_phone_binding_result(
                                 account,
@@ -2526,25 +8911,70 @@ def _run_phone_binding_test(
                             )
                             session.add(account)
                             session.commit()
+                            timeline(
+                                email=email,
+                                account_id=account_id,
+                                phone=phone,
+                                phase="save_account",
+                                phase_label="保存账号",
+                                stage_index=11,
+                                message="已写入账号绑定状态 chatgpt_phone_binding",
+                                next_step="回写号码池",
+                                resource_touched=True,
+                                reset_started_at=True,
+                            )
                             runtime_results.append(phone_result)
+                            record_pool_result(item, "bound", reason=success_reason, email=email, api_expired_date=str(phone_result.get("api_expired_date") or ""))
+                            timeline(
+                                email=email,
+                                account_id=account_id,
+                                phone=phone,
+                                phase="pool_writeback",
+                                phase_label="回写号码池",
+                                stage_index=12,
+                                message="已回写号码池：绑定成功",
+                                next_step="处理下一个账号",
+                                resource_touched=True,
+                                reset_started_at=True,
+                            )
+                            if phone:
+                                successful_phones_this_run.add(phone)
+                                if reuse_phone_until_unusable:
+                                    if use_pool and pool_repo is not None:
+                                        get_record = getattr(pool_repo, "get", None)
+                                        latest_record = get_record(phone) if callable(get_record) else None
+                                        preferred_pool_phone = phone if latest_record is not None and latest_record.available else ""
+                                    else:
+                                        preferred_phone_item = dict(item)
+                                else:
+                                    preferred_pool_phone = ""
+                                    preferred_phone_item = None
                             bound_phone_results.append({**phone_result, "raw_line": raw_result_line})
-                            account_results.append({"account_id": account_id, "email": email, "status": "used_for_binding", "phone": phone})
-                            _log(task_id, f"[OK] 手机号绑定完成: {phone} -> {email or account_id}")
-                            if reuse_phone_until_unusable:
-                                _log(task_id, f"[号码测试] 同号连续绑定继续: {phone} 已完成一次绑定，将继续测试下一个账号")
+                            account_index = account_position
+                            if ok:
+                                account_results.append({"account_id": account_id, "email": email, "status": "used_for_binding", "phone": phone})
                             else:
-                                phone_finished = True
+                                account_results.append(
+                                    {
+                                        "account_id": account_id,
+                                        "email": email,
+                                        "status": "used_for_binding_auth_failed",
+                                        "phone": phone,
+                                        "reason": auth_error_text,
+                                    }
+                                )
+                                errors.append(f"{email or account_id}: 手机号已绑定，但 Auth/RT 获取失败: {auth_error_text}")
+                            account_done = True
                             sync_meta()
-                            continue
+                            break
 
                         if ok and not phone_service.completed_entries:
                             session.commit()
                             skipped_count += 1
-                            skip_reason = (
-                                "账号已完成 Auth，未进入 add_phone；当前手机号未提交 OpenAI，同号连续绑定继续测试下一个账号"
-                                if reuse_phone_until_unusable
-                                else "账号已完成 Auth，未进入 add_phone；当前手机号未提交 OpenAI，本轮按账号/手机号一对一结束"
-                            )
+                            # 账号未进入 add_phone，当前手机号未提交 OpenAI，不消耗该手机号，留给下一个账号。
+                            if not use_pool and preferred_phone_item is None:
+                                phone_cursor = max(phone_cursor - 1, 0)
+                            skip_reason = "账号已完成 Auth，未进入 add_phone；当前手机号未提交 OpenAI，留给下一个账号继续测试"
                             runtime_results.append(
                                 result_for_phone(
                                     item,
@@ -2555,114 +8985,394 @@ def _run_phone_binding_test(
                                     phone_service=phone_service,
                                 )
                             )
+                            account_index = account_position
                             account_results.append({"account_id": account_id, "email": email, "status": "account_phone_bound", "reason": "账号已完成 Auth，未进入 add_phone 或未消耗上传号码"})
-                            if reuse_phone_until_unusable:
-                                _log(task_id, f"[SKIP] 账号已绑定手机号码或无需 add_phone: {email or account_id}，当前手机号未消耗，继续测试下一个账号")
-                            else:
-                                _log(task_id, f"[SKIP] 账号已绑定手机号码或无需 add_phone: {email or account_id}，当前手机号不复用，继续下一组账号/手机号")
-                                phone_finished = True
+                            timeline(
+                                email=email,
+                                account_id=account_id,
+                                phone=phone,
+                                phase="skipped",
+                                phase_label="进入绑定",
+                                stage_index=5,
+                                message="账号已完成 Auth，未进入 add_phone；当前手机号未消耗",
+                                next_step="处理下一个账号",
+                                resource_touched=False,
+                                reset_started_at=True,
+                            )
+                            account_done = True
+                            sync_meta()
+                            break
+
+                        error_text = result_error_text(result)
+                        status = _phone_binding_error_status(error_text)
+                        if status in {"openai_rejected", "openai_phone_limit", "phone_already_used", "api_no_code", "api_error", "rate_limited"}:
+                            skipped_count += 1
+                            accounts_with_phone_terminal_result.add(account_id)
+                            if phone:
+                                terminal_phones_this_run.add(phone)
+                                if phone == preferred_pool_phone:
+                                    preferred_pool_phone = ""
+                                if preferred_phone_item is not None and str(preferred_phone_item.get("phone") or "") == phone:
+                                    preferred_phone_item = None
+                            phone_result = result_for_phone(item, status, account_id=account_id, email=email, reason=error_text, phone_service=phone_service)
+                            runtime_results.append(phone_result)
+                            record_pool_result(item, status, reason=error_text, api_expired_date=str(phone_result.get("api_expired_date") or ""))
+                            failure_stage = 7 if status in {"api_no_code", "api_error"} else 6
+                            timeline(
+                                email=email,
+                                account_id=account_id,
+                                phone=phone,
+                                phase="phone_failed",
+                                phase_label=PHONE_BINDING_STAGE_LABELS.get(failure_stage, "发送短信"),
+                                stage_index=failure_stage,
+                                message=f"{_phone_binding_status_label(status)}：{error_text}",
+                                next_step="回写号码池",
+                                resource_touched=phone_was_touched(phone_service),
+                                reset_started_at=True,
+                            )
+                            writeback_message = "已回写号码池：当前手机号不可继续使用"
+                            if status == "phone_already_used":
+                                writeback_message = "已回写号码池：手机号已被使用；号段记为可用信号"
+                            timeline(
+                                email=email,
+                                account_id=account_id,
+                                phone=phone,
+                                phase="pool_writeback",
+                                phase_label="回写号码池",
+                                stage_index=12,
+                                message=writeback_message,
+                                next_step="继续尝试下一个手机号",
+                                resource_touched=phone_was_touched(phone_service),
+                                reset_started_at=True,
+                            )
                             sync_meta()
                             continue
 
-                        error_text = str(result.get("error") or data.get("message") or "手机号绑定测试失败")
-                        status = _phone_binding_error_status(error_text)
-                        if status in {"openai_rejected", "openai_phone_limit", "api_no_code", "api_error"}:
-                            skipped_count += 1
-                            runtime_results.append(
-                                result_for_phone(item, status, account_id=account_id, email=email, reason=error_text, phone_service=phone_service)
+                        if should_keep_phone_for_next_account(status, phone_service):
+                            # 账号前置失败，手机号没有被 OpenAI 触碰：账号消耗，手机号回退给下一个账号。
+                            if not use_pool and preferred_phone_item is None:
+                                phone_cursor = max(phone_cursor - 1, 0)
+                            recover_at = (
+                                mark_account_rate_limited_for_recovery(account_id, email, error_text)
+                                if is_account_rate_limit_error(status, error_text)
+                                else ""
                             )
-                            _log(task_id, f"[FAIL] 当前手机号结束: {phone} - {_phone_binding_status_label(status)} - {error_text}")
-                            phone_finished = True
-                        elif should_keep_phone_for_next_account(status, phone_service):
-                            account_results.append({"account_id": account_id, "email": email, "status": status, "reason": error_text})
-                            errors.append(f"{email or account_id}: {error_text}")
-                            _log(task_id, f"[WARN] 账号前置失败，手机号未测试，将继续用下一个账号测试当前手机号: {email or account_id} -> {phone} - {error_text}")
-                        else:
-                            runtime_results.append(
-                                result_for_phone(item, status, account_id=account_id, email=email, reason=error_text, phone_service=phone_service)
+                            account_result_status = "rate_limited" if recover_at else status
+                            account_reason = (
+                                f"{error_text}；账号限流预计恢复: {recover_at}"
+                                if recover_at
+                                else error_text
                             )
-                            account_results.append({"account_id": account_id, "email": email, "status": status, "reason": error_text})
-                            errors.append(f"{email or account_id}: {error_text}")
-                            _log(task_id, f"[WARN] 当前账号/手机号测试结束: {email or account_id} -> {phone} - {error_text}")
-                            phone_finished = True
+                            account_index = account_position
+                            account_results.append({"account_id": account_id, "email": email, "status": account_result_status, "reason": account_reason})
+                            errors.append(f"{email or account_id}: {account_reason}")
+                            timeline(
+                                email=email,
+                                account_id=account_id,
+                                phone=phone,
+                                phase="account_failed",
+                                phase_label="OAuth登录",
+                                stage_index=3,
+                                message=f"手机号未被触碰：{account_reason}",
+                                next_step="继续用下一个账号测试当前手机号",
+                                resource_touched=False,
+                                reset_started_at=True,
+                            )
+                            account_done = True
+                            sync_meta()
+                            break
+
+                        account_index = account_position
+                        phone_result = result_for_phone(item, status, account_id=account_id, email=email, reason=error_text, phone_service=phone_service)
+                        runtime_results.append(phone_result)
+                        record_pool_result(item, status, reason=error_text, api_expired_date=str(phone_result.get("api_expired_date") or ""))
+                        account_results.append({"account_id": account_id, "email": email, "status": status, "reason": error_text})
+                        errors.append(f"{email or account_id}: {error_text}")
+                        timeline(
+                            email=email,
+                            account_id=account_id,
+                            phone=phone,
+                            phase="failed",
+                            phase_label="确认绑定",
+                            stage_index=9,
+                            message=error_text,
+                            next_step="查看 Debug 或处理下一个账号",
+                            resource_touched=phone_was_touched(phone_service),
+                            reset_started_at=True,
+                        )
+                        account_done = True
                         sync_meta()
+                        break
+
                 except SkipCurrentAttemptRequested as exc:
+                    account_index = account_position
                     skipped_count += 1
                     runtime_results.append(result_for_phone(item, "not_tested", account_id=account_id, email=email, reason=str(exc), phone_service=phone_service))
                     account_results.append({"account_id": account_id, "email": email, "status": "skipped", "reason": str(exc)})
-                    _log(task_id, f"[SKIP] 已跳过当前账号: {email or account_id} - {exc}")
-                    phone_finished = True
+                    timeline(
+                        email=email,
+                        account_id=account_id,
+                        phone=phone,
+                        phase="skipped",
+                        phase_label="已跳过当前账号",
+                        stage_index=9,
+                        message=str(exc),
+                        next_step="处理下一个账号",
+                        resource_touched=phone_was_touched(phone_service),
+                        reset_started_at=True,
+                    )
+                    account_done = True
                     sync_meta()
+                    break
                 except StopTaskRequested:
                     raise
                 except Exception as exc:
-                    error_text = str(exc or "手机号绑定测试失败")
+                    error_text = str(exc or "手机号绑定失败")
                     status = _phone_binding_error_status(error_text)
-                    if status in {"openai_rejected", "openai_phone_limit", "api_no_code", "api_error"}:
+                    if status in {"openai_rejected", "openai_phone_limit", "phone_already_used", "api_no_code", "api_error", "rate_limited"}:
                         skipped_count += 1
-                        runtime_results.append(result_for_phone(item, status, account_id=account_id, email=email, reason=error_text, phone_service=phone_service))
-                        _log(task_id, f"[FAIL] 当前手机号结束: {phone} - {_phone_binding_status_label(status)} - {error_text}")
-                        phone_finished = True
-                    elif should_keep_phone_for_next_account(status, phone_service):
-                        errors.append(f"{email or account_id}: {error_text}")
-                        account_results.append({"account_id": account_id, "email": email, "status": status, "reason": error_text})
-                        _log(task_id, f"[WARN] 账号前置异常，手机号未测试，将继续用下一个账号测试当前手机号: {email or account_id} -> {phone} - {error_text}")
-                    else:
-                        errors.append(f"{email or account_id}: {error_text}")
-                        runtime_results.append(result_for_phone(item, status, account_id=account_id, email=email, reason=error_text, phone_service=phone_service))
-                        account_results.append({"account_id": account_id, "email": email, "status": status, "reason": error_text})
-                        _log(task_id, f"[WARN] 当前账号/手机号异常结束: {email or account_id} -> {phone} - {error_text}")
-                        phone_finished = True
+                        accounts_with_phone_terminal_result.add(account_id)
+                        if phone:
+                            terminal_phones_this_run.add(phone)
+                            if phone == preferred_pool_phone:
+                                preferred_pool_phone = ""
+                            if preferred_phone_item is not None and str(preferred_phone_item.get("phone") or "") == phone:
+                                preferred_phone_item = None
+                        phone_result = result_for_phone(item, status, account_id=account_id, email=email, reason=error_text, phone_service=phone_service)
+                        runtime_results.append(phone_result)
+                        record_pool_result(item, status, reason=error_text, api_expired_date=str(phone_result.get("api_expired_date") or ""))
+                        failure_stage = 7 if status in {"api_no_code", "api_error"} else 6
+                        timeline(
+                            email=email,
+                            account_id=account_id,
+                            phone=phone,
+                            phase="phone_failed",
+                            phase_label=PHONE_BINDING_STAGE_LABELS.get(failure_stage, "发送短信"),
+                            stage_index=failure_stage,
+                            message=f"{_phone_binding_status_label(status)}：{error_text}",
+                            next_step="回写号码池",
+                            resource_touched=phone_was_touched(phone_service),
+                            reset_started_at=True,
+                        )
+                        writeback_message = "已回写号码池：当前手机号不可继续使用"
+                        if status == "phone_already_used":
+                            writeback_message = "已回写号码池：手机号已被使用；号段记为可用信号"
+                        timeline(
+                            email=email,
+                            account_id=account_id,
+                            phone=phone,
+                            phase="pool_writeback",
+                            phase_label="回写号码池",
+                            stage_index=12,
+                            message=writeback_message,
+                            next_step="继续尝试下一个手机号",
+                            resource_touched=phone_was_touched(phone_service),
+                            reset_started_at=True,
+                        )
+                        sync_meta()
+                        continue
+                    if should_keep_phone_for_next_account(status, phone_service):
+                        if not use_pool and preferred_phone_item is None:
+                            phone_cursor = max(phone_cursor - 1, 0)
+                        recover_at = (
+                            mark_account_rate_limited_for_recovery(account_id, email, error_text)
+                            if is_account_rate_limit_error(status, error_text)
+                            else ""
+                        )
+                        account_result_status = "rate_limited" if recover_at else status
+                        account_reason = (
+                            f"{error_text}；账号限流预计恢复: {recover_at}"
+                            if recover_at
+                            else error_text
+                        )
+                        account_index = account_position
+                        errors.append(f"{email or account_id}: {account_reason}")
+                        account_results.append({"account_id": account_id, "email": email, "status": account_result_status, "reason": account_reason})
+                        timeline(
+                            email=email,
+                            account_id=account_id,
+                            phone=phone,
+                            phase="account_failed",
+                            phase_label="OAuth登录",
+                            stage_index=3,
+                            message=f"手机号未被触碰：{account_reason}",
+                            next_step="继续用下一个账号测试当前手机号",
+                            resource_touched=False,
+                            reset_started_at=True,
+                        )
+                        account_done = True
+                        sync_meta()
+                        break
+
+                    account_index = account_position
+                    errors.append(f"{email or account_id}: {error_text}")
+                    phone_result = result_for_phone(item, status, account_id=account_id, email=email, reason=error_text, phone_service=phone_service)
+                    runtime_results.append(phone_result)
+                    record_pool_result(item, status, reason=error_text, api_expired_date=str(phone_result.get("api_expired_date") or ""))
+                    account_results.append({"account_id": account_id, "email": email, "status": status, "reason": error_text})
+                    timeline(
+                        email=email,
+                        account_id=account_id,
+                        phone=phone,
+                        phase="failed",
+                        phase_label="确认绑定",
+                        stage_index=9,
+                        message=error_text,
+                        next_step="查看 Debug 或处理下一个账号",
+                        resource_touched=phone_was_touched(phone_service),
+                        reset_started_at=True,
+                    )
+                    account_done = True
                     sync_meta()
+                    break
                 finally:
                     control.finish_attempt(attempt_id)
                     last_account_attempt_finished_at = time.monotonic()
 
-            if not phone_finished and len(runtime_results) == phone_result_count_before:
-                skipped_count += 1
-                reason = "可用账号不足，未测试该手机号"
-                runtime_results.append(result_for_phone(item, "not_tested", reason=reason))
-                _log(task_id, f"[SKIP] {phone}: {reason}")
-                sync_meta()
-
-            _task_store.set_progress(task_id, f"{phone_index}/{total}")
-
-        if account_index < len(account_ids):
-            remaining_account_ids = [int(value or 0) for value in account_ids[account_index:] if int(value or 0) > 0]
-            if remaining_account_ids:
-                skipped_count += len(remaining_account_ids)
-                _log(task_id, f"[号码测试] 可用手机号不足，剩余 {len(remaining_account_ids)} 个账号未测试")
-                for account_id in remaining_account_ids:
-                    account_results.append(
-                        {
-                            "account_id": account_id,
-                            "email": "",
-                            "status": "not_tested",
-                            "reason": "可用手机号不足，未分配测试手机号",
-                        }
+            if not account_done:
+                remaining_start = account_position if account_id in accounts_with_phone_terminal_result else account_position - 1
+                remaining_account_ids = [int(value or 0) for value in account_ids[remaining_start:] if int(value or 0) > 0]
+                if remaining_account_ids:
+                    skipped_count += len(remaining_account_ids)
+                    empty_label = (
+                        "手机号池当前没有可用号码"
+                        if use_pool
+                        else "号段抽样号码已耗尽"
+                        if prefix_sample_enabled
+                        else "手机号列表已耗尽"
                     )
-                sync_meta()
+                    empty_reason = f"{empty_label}，未完成绑定"
+                    if remaining_start == account_position:
+                        empty_message = f"[手机号绑定] {empty_label}，剩余 {len(remaining_account_ids)} 个账号未完成绑定"
+                    else:
+                        empty_message = (
+                            f"[手机号绑定] {empty_label}，当前账号 {account_id} "
+                            f"及剩余 {max(len(remaining_account_ids) - 1, 0)} 个账号未完成绑定"
+                        )
+                    _log(
+                        task_id,
+                        empty_message,
+                    )
+                    for remaining_id in remaining_account_ids:
+                        account_results.append(
+                            {
+                                "account_id": remaining_id,
+                                "email": "",
+                                "status": "not_tested",
+                                "reason": empty_reason,
+                            }
+                        )
+                    sync_meta()
+                break
+
+            if use_pool:
+                _task_store.set_progress(task_id, f"{min(account_position, total)}/{total}")
+            else:
+                _task_store.set_progress(task_id, f"{min(phone_cursor, total)}/{total}")
 
         final_status = "done"
-        summary_message = (
-            f"OpenAI 手机号绑定测试完成: 成功绑定 {success_count} 次，未绑定/跳过 {skipped_count} 个，账号/未知错误 {len(errors)} 个"
+        try:
+            from collections import Counter
+
+            runtime_status_counts = Counter(str(item.get("status") or "unknown") for item in runtime_results)
+            account_status_counts = Counter(str(item.get("status") or "unknown") for item in account_results)
+        except Exception:
+            runtime_status_counts = {}
+            account_status_counts = {}
+        phone_issue_count = sum(
+            int(runtime_status_counts.get(status, 0))
+            for status in (
+                "openai_rejected",
+                "openai_phone_limit",
+                "phone_already_used",
+                "api_no_code",
+                "api_error",
+                "rate_limited",
+            )
         )
-        _log(task_id, f"[SUMMARY] {summary_message}")
+        account_issue_count = sum(
+            int(account_status_counts.get(status, 0))
+            for status in ("account_auth_error", "unknown", "rate_limited")
+        )
+        summary_message = (
+            f"OpenAI 手机号绑定完成：成功 {success_count}/{len(account_ids)}，"
+            f"手机号问题 {phone_issue_count}，账号问题 {account_issue_count}，跳过 {skipped_count}"
+        )
+        _log(task_id, f"[SUMMARY] {summary_message}", expose_phone=True, expose_otp=True)
         if runtime_results:
-            _log(task_id, "[RESULT] 号码测试明细:")
-            for index, result in enumerate(runtime_results, start=1):
-                _log(task_id, f"[RESULT] ===== 手机号 {index}/{len(runtime_results)} | {result.get('phone') or '-'} =====")
-                _log(task_id, f"[RESULT] {format_result_log_line(result)}")
-        if bound_phone_lines:
-            _log(task_id, "[RESULT] 已成功绑定的手机号:")
-            for index, result in enumerate(bound_phone_results, start=1):
-                _log(task_id, f"[RESULT] ===== 成功手机号 {index}/{len(bound_phone_results)} | {result.get('phone') or '-'} =====")
-                _log(task_id, f"[RESULT] {format_result_log_line(result)}")
-                _log(task_id, f"[RESULT_RAW] {result.get('raw_line') or ''}")
+            phone_bucket_labels = {
+                "openai_rejected": "OpenAI 拒绝",
+                "openai_phone_limit": "绑定上限",
+                "phone_already_used": "手机号已被使用",
+                "api_no_code": "已发码但未收码",
+                "api_error": "收码 API 异常",
+                "rate_limited": "OpenAI 限流",
+                "bound": "绑定成功",
+                "sms_probe_received": "已收码未提交",
+            }
+            phone_parts = [
+                f"{label}{int(runtime_status_counts.get(status, 0))}"
+                for status, label in phone_bucket_labels.items()
+                if int(runtime_status_counts.get(status, 0))
+            ]
+            if phone_parts:
+                _log(task_id, f"[SUMMARY] 手机号结果：{'，'.join(phone_parts)}", expose_phone=True, expose_otp=True)
+        if account_results:
+            account_bucket_labels = {
+                "used_for_binding": "完成绑定",
+                "used_for_binding_auth_failed": "已绑定但补Auth失败",
+                "account_auth_error": "账号Auth异常",
+                "rate_limited": "账号限流",
+                "unknown": "未知/OTP冷却",
+                "account_phone_bound": "无需绑定",
+                "skipped": "手动跳过",
+                "not_tested": "未测试",
+            }
+            account_parts = [
+                f"{label}{int(account_status_counts.get(status, 0))}"
+                for status, label in account_bucket_labels.items()
+                if int(account_status_counts.get(status, 0))
+            ]
+            if account_parts:
+                _log(task_id, f"[SUMMARY] 账号结果：{'，'.join(account_parts)}", expose_phone=True, expose_otp=True)
+        if prefix_sample_enabled:
+            prefix_summary = _build_phone_prefix_sample_summary(phone_items, runtime_results)
+            _log(
+                task_id,
+                "[号段抽样] 汇总: "
+                f"可用 {prefix_summary['available_prefix_count']}，"
+                f"不可用 {prefix_summary['unavailable_prefix_count']}，"
+                f"部分可用 {prefix_summary['partial_prefix_count']}，"
+                f"未测试 {prefix_summary['untested_prefix_count']}",
+            )
+            for prefix_item in prefix_summary["items"]:
+                _log(
+                    task_id,
+                    "[号段抽样] "
+                    f"{prefix_item['prefix']} | {prefix_item['status']} | "
+                    f"可用 {prefix_item['available_count']} / "
+                    f"不可用 {prefix_item['unavailable_count']} / "
+                    f"未测试 {prefix_item['untested_count']}",
+                )
+            if prefix_summary["unavailable_prefixes"]:
+                _log(task_id, f"[号段抽样] 不可用号段: {','.join(prefix_summary['unavailable_prefixes'])}")
+        if runtime_results:
+            _log(task_id, f"[SUMMARY] 手机绑定结果表已生成：共 {len(runtime_results)} 条，成功绑定 {len(bound_phone_results)} 条")
         else:
-            _log(task_id, "[RESULT] 本次没有成功绑定的手机号")
+            _log(task_id, "[SUMMARY] 本次没有产生可展示的手机绑定结果")
         sync_meta()
-        log_status = "success" if not errors else "failed"
+        log_status = "success" if success_count > 0 and not errors else "failed"
+        attempt_outcome = "phone_binding_test_success" if log_status == "success" else "phone_binding_test_failed"
+        if log_status != "success" and no_phone_available:
+            attempt_outcome = "phone_binding_test_no_phone_available"
+        _task_store.finish(
+            task_id,
+            status=final_status,
+            success=success_count,
+            skipped=skipped_count,
+            errors=errors,
+            error="" if not errors else summary_message,
+        )
         latest_meta = dict(_task_store.snapshot(task_id).get("meta") or {})
         _save_task_log(
             "chatgpt",
@@ -2673,23 +9383,15 @@ def _run_phone_binding_test(
                 task_id,
                 {
                     "email": primary_email,
-                    "attempt_outcome": "phone_binding_test_success" if log_status == "success" else "phone_binding_test_failed",
+                    "attempt_outcome": attempt_outcome,
                     "source": "phone_binding_test",
                     "meta": latest_meta,
-                    "bound_phone_lines": list(bound_phone_lines),
-                    "bound_phone_results": list(bound_phone_results),
-                    "runtime_results": list(runtime_results),
-                    "account_results": list(account_results),
+                    "bound_phone_lines": [redact_raw_phone_line(line) for line in bound_phone_lines],
+                    "bound_phone_results": [sanitize_phone_result(item) for item in bound_phone_results],
+                    "runtime_results": [sanitize_phone_result(item) for item in runtime_results],
+                    "account_results": sanitize_task_detail(account_results),
                 },
             ),
-        )
-        _task_store.finish(
-            task_id,
-            status=final_status,
-            success=success_count,
-            skipped=skipped_count,
-            errors=errors,
-            error="" if not errors else summary_message,
         )
     except StopTaskRequested as exc:
         _log(task_id, f"[STOP] {exc}")
@@ -2706,20 +9408,48 @@ def _run_phone_binding_test(
                     "attempt_outcome": "phone_binding_test_stopped",
                     "source": "phone_binding_test",
                     "meta": dict(_task_store.snapshot(task_id).get("meta") or {}),
-                    "bound_phone_lines": list(bound_phone_lines),
-                    "bound_phone_results": list(bound_phone_results),
-                    "runtime_results": list(runtime_results),
-                    "account_results": list(account_results),
+                    "bound_phone_lines": [redact_raw_phone_line(line) for line in bound_phone_lines],
+                    "bound_phone_results": [sanitize_phone_result(item) for item in bound_phone_results],
+                    "runtime_results": [sanitize_phone_result(item) for item in runtime_results],
+                    "account_results": sanitize_task_detail(account_results),
                 },
             ),
         )
+    except Exception as exc:
+        error_text = str(exc or "手机号绑定测试异常退出")
+        errors.append(error_text)
+        _log(task_id, f"[ERROR] 手机号绑定测试异常退出: {error_text}")
+        try:
+            sync_meta()
+        except Exception as sync_exc:
+            _log(task_id, f"[ERROR] 手机号绑定测试异常状态同步失败: {sync_exc}")
         _task_store.finish(
             task_id,
-            status="stopped",
+            status="failed",
             success=success_count,
             skipped=skipped_count,
             errors=errors,
-            error=str(exc),
+            error=error_text,
+        )
+        latest_meta = dict(_task_store.snapshot(task_id).get("meta") or {})
+        _save_task_log(
+            "chatgpt",
+            primary_email,
+            "failed",
+            error=error_text,
+            detail=_build_task_log_detail(
+                task_id,
+                {
+                    "email": primary_email,
+                    "attempt_outcome": "phone_binding_test_exception",
+                    "source": "phone_binding_test",
+                    "meta": latest_meta,
+                    "bound_phone_lines": [redact_raw_phone_line(line) for line in bound_phone_lines],
+                    "bound_phone_results": [sanitize_phone_result(item) for item in bound_phone_results],
+                    "runtime_results": [sanitize_phone_result(item) for item in runtime_results],
+                    "account_results": sanitize_task_detail(account_results),
+                },
+            ),
         )
     finally:
         _task_store.cleanup()
@@ -2790,6 +9520,8 @@ def _run_batch_invalid_recheck(task_id: str, account_ids: list[int]):
                         log_fn=task_log,
                         stop_checker=lambda: control.checkpoint(attempt_id=attempt_id),
                         task_id=task_id,
+                        task_control=control,
+                        attempt_id=attempt_id,
                     )
                     session.refresh(account)
                     _apply_chatgpt_invalid_recheck_result(account, result, session)
@@ -2973,6 +9705,150 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                 proxy=proxy,
             )
 
+        def _redact_proxy_for_log(proxy: Optional[str]) -> str:
+            value = str(proxy or "").strip()
+            if not value:
+                return "direct"
+            if "://" in value:
+                scheme, rest = value.split("://", 1)
+                if "@" in rest:
+                    rest = rest.rsplit("@", 1)[1]
+                    value = f"{scheme}://***:***@{rest}"
+            if len(value) > 120:
+                value = f"{value[:70]}...{value[-30:]}"
+            return value
+
+        def _log_register_proxy_choice(proxy: str, source: str, index: int, total: int) -> None:
+            label = str(source or "direct").strip() or "direct"
+            ip_info = ""
+            if proxy:
+                try:
+                    from services.proxy_scanner import probe_basic
+                    res = probe_basic(proxy, timeout_seconds=6)
+                    if res.get("ok") and res.get("exit_ip"):
+                        ip_info = f" (出口IP: {res['exit_ip']})"
+                except Exception:
+                    pass
+            _log(
+                task_id,
+                f"[代理] 本次注册出口 {index}/{total}: source={label} proxy={_redact_proxy_for_log(proxy)}{ip_info}",
+            )
+
+        def _truthy(value, default: bool = False) -> bool:
+            if value is None:
+                return default
+            text = str(value).strip().lower()
+            if text in {"1", "true", "yes", "on"}:
+                return True
+            if text in {"0", "false", "no", "off"}:
+                return False
+            return default
+
+        def _positive_int(value, default: int, minimum: int = 1, maximum: int = 50) -> int:
+            try:
+                parsed = int(float(str(value or "").strip()))
+            except Exception:
+                parsed = default
+            return max(minimum, min(maximum, parsed))
+
+        def _positive_float(value, default: float, minimum: float = 0, maximum: float = 100) -> float:
+            try:
+                parsed = float(str(value or "").strip())
+            except Exception:
+                parsed = default
+            return max(minimum, min(maximum, parsed))
+
+        def _build_register_candidate_proxies() -> list[tuple[str, object | None, str]]:
+            from core.config_store import config_store
+            from core.proxy_pool import proxy_pool as runtime_proxy_pool
+
+            explicit_proxy = normalize_proxy_url(req.proxy) or ""
+            extra_proxy_mode = ""
+            extra_proxy_country = ""
+            extra_proxy_failover = None
+            extra_proxy_max_candidates = None
+            extra_proxy_min_score = None
+            if isinstance(req.extra, dict):
+                extra_proxy_mode = str(req.extra.get("proxy_mode") or "").strip()
+                extra_proxy_country = str(req.extra.get("proxy_country_code") or "").strip()
+                extra_proxy_failover = req.extra.get("proxy_failover")
+                extra_proxy_max_candidates = req.extra.get("proxy_max_candidates")
+                extra_proxy_min_score = req.extra.get("proxy_min_score")
+
+            mode = str(req.proxy_mode or extra_proxy_mode or "").strip().lower()
+            if not mode:
+                mode = "specified" if explicit_proxy else "direct"
+            if mode in {"none", "no_proxy", "direct", "直连"}:
+                return [("", None, "direct")]
+            if mode in {"manual", "explicit"}:
+                mode = "specified"
+            if mode not in {"specified", "pool"}:
+                mode = "specified" if explicit_proxy else "direct"
+            if mode == "direct":
+                return [("", None, "direct")]
+
+            country_code = str(req.proxy_country_code or extra_proxy_country or "").strip().upper()
+            failover = _truthy(req.proxy_failover if req.proxy_failover is not None else extra_proxy_failover, default=False)
+            max_candidates = _positive_int(
+                req.proxy_max_candidates
+                or extra_proxy_max_candidates
+                or config_store.get("proxy_pool_max_candidates", "5"),
+                default=5,
+                minimum=1,
+                maximum=100,
+            )
+            min_score = _positive_float(
+                req.proxy_min_score
+                or extra_proxy_min_score
+                or config_store.get("proxy_scan_min_score", "50"),
+                default=50,
+                minimum=0,
+                maximum=100,
+            )
+
+            candidates: list[tuple[str, object | None, str]] = []
+            if mode == "specified":
+                if not explicit_proxy:
+                    raise RuntimeError("已选择指定代理模式，但代理地址为空")
+                candidates.append((explicit_proxy, None, "specified"))
+                if not failover:
+                    return candidates
+
+            pool_candidates = runtime_proxy_pool.get_candidate_records(
+                target="chatgpt",
+                country_code=country_code,
+                limit=max_candidates,
+                min_score=min_score,
+            )
+            for candidate in pool_candidates:
+                url = normalize_proxy_url(candidate.get("url")) or ""
+                if not url or any(existing[0] == url for existing in candidates):
+                    continue
+                country = str(candidate.get("exit_country_code") or "unknown").strip() or "unknown"
+                score = candidate.get("health_score")
+                latency = int(candidate.get("latency_ms") or 0)
+                source = f"pool country={country} score={score} latency={latency}ms"
+                candidates.append((url, runtime_proxy_pool, source))
+
+            if mode == "pool" and not candidates:
+                country_text = country_code or "不限"
+                raise RuntimeError(f"代理池没有可用候选：target=chatgpt country={country_text} min_score={min_score:g}")
+            return candidates or [("", None, "direct")]
+
+        def _select_phone_signup_lines_for_attempt(raw_lines: Any, attempt_index: int) -> str:
+            lines = [
+                str(line or "").strip()
+                for line in str(raw_lines or "").splitlines()
+                if str(line or "").strip()
+            ]
+            if not lines:
+                return ""
+            if attempt_index >= len(lines):
+                raise RuntimeError(
+                    f"手机号注册可用号码行不足：当前尝试 {attempt_index + 1}，有效号码 {len(lines)} 条"
+                )
+            return lines[attempt_index]
+
         def _do_one(i: int):
             nonlocal next_start_time, deferred_phase_close_reason
             nonlocal chatgpt_checkout_amount_zero, chatgpt_checkout_amount_nonzero
@@ -2989,7 +9865,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                 control.checkpoint()
                 attempt_id = control.start_attempt()
                 control.checkpoint(attempt_id=attempt_id)
-                if req.register_delay_seconds > 0:
+                if req.register_delay_seconds > 0 or req.register_delay_max_seconds > 0:
                     with start_gate_lock:
                         control.checkpoint(attempt_id=attempt_id)
                         now = time.time()
@@ -3003,15 +9879,39 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                                 wait_seconds,
                                 attempt_id=attempt_id,
                             )
-                        next_start_time = time.time() + req.register_delay_seconds
+                        
+                        delay_min = req.register_delay_seconds
+                        delay_max = req.register_delay_max_seconds
+                        if delay_max > delay_min:
+                            import random
+                            chosen_delay = random.uniform(delay_min, delay_max)
+                        else:
+                            chosen_delay = delay_min
+                            
+                        next_start_time = time.time() + chosen_delay
                 control.checkpoint(attempt_id=attempt_id)
                 if registration_phase_close_event.is_set():
                     return AttemptResult.stopped(
                         f"{deferred_phase_close_marker}{deferred_phase_close_reason or '当前所有可用 team 都已不可邀请，结束注册阶段并进入激活阶段'}"
                     )
-                candidate_proxies: list[tuple[str, object | None, str]] = [("", None, "direct")]
+                candidate_proxies = _build_register_candidate_proxies()
 
                 merged_extra = _build_effective_register_extra(req)
+                target_successes = max(int(req.count or 1), 1)
+                phone_signup_entry = (
+                    req.platform == "chatgpt"
+                    and str(
+                        merged_extra.get("chatgpt_registration_entry")
+                        or merged_extra.get("registration_entry")
+                        or ""
+                    ).strip().lower().replace("-", "_")
+                    in {"phone", "phone_signup", "sms", "sms_signup"}
+                )
+                if phone_signup_entry:
+                    merged_extra["chatgpt_registration_entry"] = "phone_signup"
+                    merged_extra["chatgpt_registration_mode"] = "access_token_only"
+                    merged_extra["chatgpt_has_refresh_token_solution"] = False
+                    merged_extra["_target_success_count"] = target_successes
                 if deferred_activation_enabled:
                     with deferred_team_ids_lock:
                         current_deferred_team_ids = list(deferred_team_ids)
@@ -3022,7 +9922,6 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                     merged_extra["chatgpt_deferred_invite_team_ids"] = current_deferred_team_ids
                     merged_extra["chatgpt_deferred_invite_team_id"] = current_deferred_team_ids[0]
 
-                target_successes = max(int(req.count or 1), 1)
                 _task_store.set_progress(task_id, f"{success}/{target_successes}")
                 _log(task_id, f"[账号] -------- 尝试 {i + 1} / 目标成功 {target_successes} --------")
                 _log(task_id, f"开始第 {i + 1} 次尝试，目标成功数 {target_successes}")
@@ -3033,18 +9932,30 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                     _proxy = candidate_proxy
                     proxy_pool = candidate_proxy_pool
                     proxy_source = candidate_proxy_source
+                    _log_register_proxy_choice(_proxy, proxy_source, proxy_index, len(candidate_proxies))
 
                     try:
+                        runtime_extra = dict(merged_extra or {})
+                        if not _proxy and str(proxy_source or "").strip().lower() == "direct":
+                            runtime_extra["__register_proxy_mode"] = "direct"
+                        runtime_extra["_current_task_id"] = task_id
+                        if phone_signup_entry:
+                            phone_lines_for_signup = str(runtime_extra.get("chatgpt_phone_signup_phone_lines") or "").strip()
+                            if phone_lines_for_signup:
+                                runtime_extra["chatgpt_phone_signup_phone_lines"] = _select_phone_signup_lines_for_attempt(
+                                    phone_lines_for_signup,
+                                    i,
+                                )
                         _config = RegisterConfig(
                             executor_type=req.executor_type,
                             captcha_solver=req.captcha_solver,
                             proxy=_proxy,
-                            extra=merged_extra,
+                            extra=runtime_extra,
                         )
-                        _mailbox = _build_mailbox(_proxy)
+                        _mailbox = None if phone_signup_entry else _build_mailbox(_proxy)
                         _platform = PlatformCls(config=_config, mailbox=_mailbox)
                         _platform._task_attempt_token = attempt_id
-                        _platform._log_fn = lambda msg: _log(task_id, msg)
+                        _platform._log_fn = lambda msg, level="info", *_: _log(task_id, msg, level)
                         _platform.bind_task_control(control)
                         if getattr(_platform, "mailbox", None) is not None:
                             _platform.mailbox._task_attempt_token = attempt_id
@@ -3061,12 +9972,23 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                     except Exception as proxy_exc:
                         current_email = current_email or req.email or ""
                         error_text = str(proxy_exc or "").strip()
-                        if _proxy and proxy_pool is not None and proxy_source == "pool":
+                        if _proxy and proxy_pool is not None and str(proxy_source or "").startswith("pool"):
                             proxy_pool.report_fail(_proxy)
+                            if (
+                                "status=403" in error_text
+                                or "HTTP 403" in error_text
+                                or "预授权被拦截" in error_text
+                                or "访问首页失败" in error_text
+                            ):
+                                proxy_pool.report_homepage_fail(
+                                    _proxy,
+                                    error_message=error_text,
+                                    status_code=403 if ("403" in error_text or "访问首页失败" in error_text or "预授权被拦截" in error_text) else 0,
+                                )
                         if is_proxy_error_text(error_text) and proxy_index < len(candidate_proxies):
                             last_proxy_error = error_text
                             last_proxy_error_email = current_email
-                            _log(task_id, f"[代理] 当前代理失败，切换下一个代理: {error_text}")
+                            _log(task_id, f"[代理] 当前代理失败，保留当前尝试重试下一个代理: {error_text}")
                             continue
                         raise
                 else:
@@ -3195,6 +10117,81 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                     )
                     return AttemptResult.failed(skip_reason)
                 saved_account = save_account(account)
+                if req.platform == "chatgpt" and saved_account is not None:
+                    schedule_chatgpt_local_status_refresh_for_account_id(
+                        int(getattr(saved_account, "id", 0) or 0),
+                        reason="registration_saved",
+                        delay_seconds=2.0,
+                    )
+                if req.platform == "chatgpt" and isinstance(account.extra, dict) and account.extra.get("chatgpt_registration_entry") == "phone_signup":
+                    try:
+                        phone_result = account.extra.get("chatgpt_phone_signup_result")
+                        phone_results = account.extra.get("chatgpt_phone_signup_results")
+                        if not isinstance(phone_results, list):
+                            phone_results = [phone_result] if isinstance(phone_result, dict) else []
+                        phone_results = [dict(item) for item in phone_results if isinstance(item, dict)]
+                        if phone_results:
+                            saved_account_id = int(getattr(saved_account, "id", 0) or 0) if saved_account is not None else 0
+                            saved_email = str(getattr(saved_account, "email", "") or account.email or "")
+                            latest_meta = dict(_task_store.snapshot(task_id).get("meta") or {})
+                            runtime_results = list(latest_meta.get("runtime_results") or [])
+                            registered_phone_lines = list(latest_meta.get("registered_phone_lines") or [])
+                            last_phone = ""
+                            for item in phone_results:
+                                if str(item.get("status") or "") == "registered_phone_signup":
+                                    item["account_id"] = saved_account_id
+                                    item["email"] = saved_email or str(item.get("email") or "")
+                                    raw_line = str(item.get("raw_line") or "").strip()
+                                    if raw_line:
+                                        registered_phone_lines.append(redact_raw_phone_line(raw_line))
+                                    last_phone = str(item.get("phone") or last_phone or "")
+                                runtime_results.append(sanitize_phone_result(item))
+                            phone_prefix_items = [
+                                {
+                                    "phone": str(item.get("phone") or ""),
+                                    "prefix4": str(item.get("prefix4") or _phone_binding_prefix4(item.get("phone"))),
+                                }
+                                for item in runtime_results
+                                if str(item.get("phone") or "").strip()
+                            ]
+                            _task_store.update_meta(
+                                task_id,
+                                {
+                                    "runtime_results": [sanitize_phone_result(item) for item in runtime_results],
+                                    "registered_phone_lines": [redact_raw_phone_line(line) for line in registered_phone_lines],
+                                    "prefix_summary": _build_phone_prefix_sample_summary(phone_prefix_items, runtime_results, phone_signup=True),
+                                    "phone_signup": {
+                                        "enabled": True,
+                                        "last_phone": last_phone,
+                                        "last_phone_masked": mask_phone_for_log(last_phone),
+                                    },
+                                },
+                            )
+                    except Exception as meta_exc:
+                        _log(task_id, f"[手机号注册] 结果写入任务快照失败: {meta_exc}")
+                if req.platform == "chatgpt" and isinstance(account.extra, dict):
+                    try:
+                        from core.db import sync_icloud_hme_rerun_result
+
+                        mailbox_state = account.extra.get("chatgpt_mailbox_state")
+                        mailbox_state = mailbox_state if isinstance(mailbox_state, dict) else {}
+                        mailbox_account = mailbox_state.get("account") if isinstance(mailbox_state.get("account"), dict) else {}
+                        mailbox_extra = mailbox_account.get("extra") if isinstance(mailbox_account.get("extra"), dict) else {}
+                        provider = str(mailbox_state.get("provider") or account.extra.get("mail_provider") or "").strip()
+                        if provider == "icloud_hme":
+                            token_value = str(account.token or account.extra.get("access_token") or "").strip()
+                            sync_icloud_hme_rerun_result(
+                                anonymous_id=str(mailbox_extra.get("anonymous_id") or mailbox_account.get("account_id") or ""),
+                                hme=str(mailbox_extra.get("hme") or mailbox_state.get("email") or account.email or ""),
+                                task_id=task_id,
+                                success=True,
+                                saved_account_id=int(getattr(saved_account, "id", 0) or 0) if saved_account is not None else 0,
+                                access_token_saved=bool(token_value),
+                                mailbox_state=mailbox_state,
+                                result_code="login_alive",
+                            )
+                    except Exception as sync_exc:
+                        _log(task_id, f"[iCloudHME] 重跑结果写回失败: {sync_exc}")
                 pending_invite = None
                 if req.platform == "chatgpt" and saved_account is not None:
                     try:
@@ -3252,13 +10249,19 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                             saved_linked = save_account(linked_account)
                             if saved_linked is not None:
                                 saved_linked_accounts.append(saved_linked)
+                                if linked_account.platform == "chatgpt":
+                                    schedule_chatgpt_local_status_refresh_for_account_id(
+                                        int(getattr(saved_linked, "id", 0) or 0),
+                                        reason="registration_linked_saved",
+                                        delay_seconds=2.0,
+                                    )
                             if isinstance(linked_account.extra, dict):
                                 scope_label = str(linked_account.extra.get("chatgpt_workspace_label") or "").strip()
                                 if scope_label:
                                     _log(task_id, f"[OK] 已保存附加工作空间: {linked_account.email} [{scope_label}]")
                         except Exception as save_exc:
                             _log(task_id, f"[WARN] 保存附加工作空间失败: {save_exc}")
-                if _proxy and proxy_pool is not None and proxy_source == "pool":
+                if _proxy and proxy_pool is not None and str(proxy_source or "").startswith("pool"):
                     proxy_pool.report_success(_proxy)
                 if deferred_activation_enabled and pending_invite is not None:
                     if should_stop_after_current_account and zero_amount_stop_reason:
@@ -3374,15 +10377,48 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
         from concurrent.futures import FIRST_COMPLETED, CancelledError, ThreadPoolExecutor, wait
 
         target_successes = max(int(req.count or 1), 1)
-        max_workers = min(req.concurrency, target_successes, 5)
+        initial_registration_entry = str(
+            initial_merged_extra.get("chatgpt_registration_entry")
+            or initial_merged_extra.get("registration_entry")
+            or ""
+        ).strip().lower().replace("-", "_")
+        initial_phone_signup_entry = initial_registration_entry in {"phone", "phone_signup", "sms", "sms_signup"}
+        initial_phone_signup_lines = [
+            str(line or "").strip()
+            for line in str(initial_merged_extra.get("chatgpt_phone_signup_phone_lines") or "").splitlines()
+            if str(line or "").strip()
+        ]
+        configured_max_attempts = 0
+        if isinstance(req.extra, dict):
+            configured_max_attempts = _positive_int(
+                req.extra.get("register_max_attempts")
+                or req.extra.get("max_register_attempts")
+                or 0,
+                default=0,
+                minimum=0,
+                maximum=500,
+            )
+        if initial_phone_signup_entry:
+            if initial_phone_signup_lines:
+                attempt_cap = len(initial_phone_signup_lines)
+                if configured_max_attempts > 0:
+                    attempt_cap = min(attempt_cap, max(target_successes, configured_max_attempts))
+            else:
+                attempt_cap = max(target_successes, configured_max_attempts) if configured_max_attempts > 0 else target_successes
+        else:
+            attempt_cap = max(target_successes, configured_max_attempts) if configured_max_attempts > 0 else 0
+        if attempt_cap > 0:
+            _log(task_id, f"[控制] 注册最大尝试次数: {attempt_cap}")
+        max_workers = min(req.concurrency, target_successes, attempt_cap or target_successes, 5)
         stopped = False
         registration_phase_closed_for_activation = False
+        attempt_limit_reached = False
         next_attempt_index = 0
         in_flight: dict[Any, int] = {}
 
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             while (
-                next_attempt_index < target_successes
+                next_attempt_index < (attempt_cap or target_successes)
                 and len(in_flight) < max_workers
                 and not stopped
                 and not registration_phase_closed_for_activation
@@ -3438,6 +10474,13 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                         break
 
                     if success < target_successes:
+                        if attempt_cap > 0 and next_attempt_index >= attempt_cap:
+                            attempt_limit_reached = True
+                            _log(
+                                task_id,
+                                f"[控制] 已达到注册最大尝试次数 {attempt_cap}，停止补尝试",
+                            )
+                            continue
                         future = pool.submit(_do_one, next_attempt_index)
                         in_flight[future] = next_attempt_index
                         next_attempt_index += 1
@@ -3526,6 +10569,8 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
         _task_store.cleanup()
         return
 
+    if 'attempt_limit_reached' in locals() and attempt_limit_reached and success < target_successes:
+        errors.append(f"已达到注册最大尝试次数 {attempt_cap}，成功 {success}/{target_successes}")
     if success >= target_successes:
         final_status = "done"
     elif errors and not (control.is_stop_requested() or stopped):
@@ -3562,6 +10607,24 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                 f"threshold={chatgpt_zero_amount_stop_threshold}"
             )
     _log(task_id, summary)
+    if initial_phone_signup_entry:
+        try:
+            final_meta = dict(_task_store.snapshot(task_id).get("meta") or {})
+            prefix_summary = final_meta.get("prefix_summary") if isinstance(final_meta.get("prefix_summary"), dict) else {}
+            if prefix_summary and prefix_summary.get("items"):
+                _log(
+                    task_id,
+                    "[手机号注册号段] 汇总: "
+                    f"可注册 {int(prefix_summary.get('available_prefix_count') or 0)}，"
+                    f"不可注册 {int(prefix_summary.get('unavailable_prefix_count') or 0)}，"
+                    f"部分 {int(prefix_summary.get('partial_prefix_count') or 0)}，"
+                    f"未测试 {int(prefix_summary.get('untested_prefix_count') or 0)}；"
+                    "仅更新注册号段状态，不改手机号自身状态",
+                )
+                if prefix_summary.get("unavailable_prefixes"):
+                    _log(task_id, f"[手机号注册号段] 不可注册号段: {','.join(prefix_summary.get('unavailable_prefixes') or [])}")
+        except Exception as prefix_exc:
+            _log(task_id, f"[手机号注册号段] 汇总日志失败: {prefix_exc}", "debug")
     _task_store.finish(
         task_id,
         status=final_status,
@@ -3616,6 +10679,35 @@ def create_phone_binding_test_task(
     )
 
 
+@router.post("/chatgpt/baxigpt-cdk-submit")
+def create_baxigpt_cdk_submit_task(
+    req: BaxiGptCdkSubmitTaskRequest,
+    background_tasks: BackgroundTasks,
+):
+    return enqueue_baxigpt_cdk_submit_task(
+        req,
+        background_tasks=background_tasks,
+    )
+
+
+@router.post("/chatgpt/paypal-bind")
+def create_chatgpt_paypal_bind_task(
+    req: ChatGptPaypalBindTaskRequest,
+    background_tasks: BackgroundTasks,
+):
+    upstream = str(req.upstream or "").strip().lower().replace("-", "_")
+    base_url = str(req.base_url or "").strip().lower()
+    if upstream in {"oaipay", "oai_pay"} or "oaipay.12001234.xyz" in base_url:
+        return enqueue_chatgpt_oaipay_approval_task(
+            req,
+            background_tasks=background_tasks,
+        )
+    return enqueue_chatgpt_paypal_bind_task(
+        req,
+        background_tasks=background_tasks,
+    )
+
+
 @router.post("/chatgpt/invalid-recheck")
 def create_invalid_recheck_task(
     req: InvalidRecheckTaskRequest,
@@ -3628,12 +10720,68 @@ def create_invalid_recheck_task(
     return {"task_id": task_id}
 
 
+@router.post("/chatgpt/custom-email-recheck")
+def create_custom_email_recheck_task(
+    req: CustomEmailRecheckTaskRequest,
+    background_tasks: BackgroundTasks,
+):
+    task_id = enqueue_custom_email_recheck_task(
+        req,
+        background_tasks=background_tasks,
+    )
+    return {"task_id": task_id}
+
+
+@router.post("/chatgpt/custom-email-recheck/batch")
+def create_batch_custom_email_recheck_task(
+    req: BatchCustomEmailRecheckTaskRequest,
+    background_tasks: BackgroundTasks,
+):
+    return enqueue_batch_custom_email_recheck_task(
+        req,
+        background_tasks=background_tasks,
+    )
+
+
+@router.post("/chatgpt/icloud-hme-recheck/batch")
+def create_icloud_hme_recheck_batch_task(
+    req: IcloudHmeRecheckBatchTaskRequest,
+    background_tasks: BackgroundTasks,
+):
+    return enqueue_icloud_hme_recheck_batch_task(
+        req,
+        background_tasks=background_tasks,
+    )
+
+
 @router.post("/chatgpt/invalid-recheck/batch")
 def create_batch_invalid_recheck_task(
     req: BatchInvalidRecheckTaskRequest,
     background_tasks: BackgroundTasks,
 ):
     return enqueue_batch_invalid_recheck_task(
+        req,
+        background_tasks=background_tasks,
+    )
+
+
+@router.post("/chatgpt/sub2api-upload/batch")
+def create_batch_sub2api_upload_task(
+    req: BatchSub2ApiUploadTaskRequest,
+    background_tasks: BackgroundTasks,
+):
+    return enqueue_batch_sub2api_upload_task(
+        req,
+        background_tasks=background_tasks,
+    )
+
+
+@router.post("/chatgpt/oaipay-upload/batch")
+def create_batch_oaipay_upload_task(
+    req: BatchOaipayUploadTaskRequest,
+    background_tasks: BackgroundTasks,
+):
+    return enqueue_batch_oaipay_upload_task(
         req,
         background_tasks=background_tasks,
     )
@@ -3669,7 +10817,30 @@ def submit_verification(task_id: str, body: SubmitVerificationRequest):
         "收到人工验证码提交: "
         f"phase={challenge.get('phase')} email={challenge.get('email')}",
     )
-    return {"ok": True, "task_id": task_id, "challenge": challenge}
+    return sanitize_task_detail({"ok": True, "task_id": task_id, "challenge": challenge})
+
+
+@router.post("/{task_id}/verification-action")
+def verification_action(task_id: str, body: VerificationActionRequest):
+    _ensure_task_mutable(task_id)
+    control = _task_store.control_for(task_id)
+    try:
+        challenge = control.request_verification_action(
+            challenge_id=body.challenge_id,
+            action=body.action,
+            payload=body.payload,
+        )
+    except KeyError as e:
+        raise HTTPException(404, e.args[0] if e.args else "验证码挑战不存在")
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    _log(
+        task_id,
+        "收到人工验证码动作: "
+        f"phase={challenge.get('phase')} email={challenge.get('email')} action={body.action}",
+    )
+    return sanitize_task_detail({"ok": True, "task_id": task_id, "challenge": challenge})
 
 
 @router.post("/{task_id}/skip-current")
@@ -3689,17 +10860,36 @@ def stop_task(task_id: str):
 
 
 @router.get("/logs")
-def get_logs(platform: str = None, page: int = 1, page_size: int = 50):
+def get_logs(platform: str = None, page: int = 1, page_size: int = 50, source: str = None):
+    normalized_source = str(source or "").strip()
     with Session(engine) as s:
         q = select(TaskLog)
         if platform:
             q = q.where(TaskLog.platform == platform)
         q = q.order_by(TaskLog.id.desc())
         all_items = s.exec(q).all()
-    grouped_items = _group_latest_task_logs(all_items)
-    total = len(grouped_items)
-    start = max(page - 1, 0) * page_size
-    items = grouped_items[start:start + page_size]
+
+        if normalized_source:
+            source_matched: list[TaskLog] = []
+            for log in all_items:
+                detail = _task_log_detail_dict(log)
+                if _task_log_source(detail) == normalized_source:
+                    source_matched.append(log)
+            grouped_items = _group_latest_task_logs(source_matched)
+            total = len(grouped_items)
+            start = max(page - 1, 0) * page_size
+            items = grouped_items[start:start + page_size]
+            return {"total": total, "items": [_task_log_summary(item) for item in items]}
+
+        grouped_ids = _group_latest_task_log_ids(all_items)
+        total = len(grouped_ids)
+        start = max(page - 1, 0) * page_size
+        page_ids = grouped_ids[start:start + page_size]
+        if not page_ids:
+            return {"total": total, "items": []}
+        page_logs = s.exec(select(TaskLog).where(TaskLog.id.in_(page_ids))).all()
+        by_id = {int(log.id): log for log in page_logs if log.id is not None}
+        items = [by_id[log_id] for log_id in page_ids if log_id in by_id]
     return {"total": total, "items": [_task_log_summary(item) for item in items]}
 
 
@@ -3725,21 +10915,25 @@ def batch_delete_logs(body: TaskLogBatchDeleteRequest):
         try:
             logs = s.exec(select(TaskLog).where(TaskLog.id.in_(unique_ids))).all()
             found_ids = {log.id for log in logs if log.id is not None}
-            selected_task_ids = {
-                str(_task_log_detail_dict(log).get("task_id") or "").strip()
-                for log in logs
-                if str(_task_log_detail_dict(log).get("task_id") or "").strip()
-            }
-            all_logs = s.exec(select(TaskLog)).all()
+            selected_task_ids = {str(log.task_id or "").strip() for log in logs if str(log.task_id or "").strip()}
             logs_to_delete: list[TaskLog] = []
-            for log in all_logs:
-                detail = _task_log_detail_dict(log)
-                task_id = str(detail.get("task_id") or "").strip()
-                if task_id and task_id in selected_task_ids:
+            seen_delete_ids: set[int] = set()
+
+            if selected_task_ids:
+                related_logs = s.exec(select(TaskLog).where(TaskLog.task_id.in_(selected_task_ids))).all()
+                for log in related_logs:
+                    if log.id is None or int(log.id) in seen_delete_ids:
+                        continue
                     logs_to_delete.append(log)
+                    seen_delete_ids.add(int(log.id))
+
+            for log in logs:
+                if str(log.task_id or "").strip():
                     continue
-                if log.id in found_ids and not task_id:
-                    logs_to_delete.append(log)
+                if log.id is None or int(log.id) in seen_delete_ids:
+                    continue
+                logs_to_delete.append(log)
+                seen_delete_ids.add(int(log.id))
 
             for log in logs_to_delete:
                 s.delete(log)
@@ -3796,7 +10990,7 @@ def list_active_task_summaries():
         status = str(item.get("status") or "").strip().lower()
         if status not in {"pending", "running"}:
             continue
-        meta = dict(item.get("meta") or {})
+        meta = sanitize_task_detail(dict(item.get("meta") or {}))
         source = str(item.get("source") or "").strip()
         progress = str(item.get("progress") or "").strip()
         if source == "gopay_payment" and progress == "1/1":
@@ -3811,9 +11005,9 @@ def list_active_task_summaries():
                 "progress": item.get("progress"),
                 "success": item.get("success"),
                 "skipped": item.get("skipped"),
-                "error": item.get("error", ""),
+                "error": sanitize_error_message(item.get("error", "")),
                 "control": dict(item.get("control") or {}),
-                "pending_verification": item.get("pending_verification"),
+                "pending_verification": sanitize_task_detail(item.get("pending_verification")),
             }
         )
     return active_items
@@ -3822,9 +11016,9 @@ def list_active_task_summaries():
 @router.get("/{task_id}")
 def get_task(task_id: str):
     _ensure_task_exists(task_id)
-    return _task_store.snapshot(task_id)
+    return sanitize_task_detail(_task_store.snapshot(task_id))
 
 
 @router.get("")
 def list_tasks():
-    return _task_store.list_snapshots()
+    return sanitize_task_detail(_task_store.list_snapshots())

@@ -310,13 +310,22 @@ def build_sub2api_account_payload(account, group_ids: list[int] | None = None) -
     return payload
 
 
-def upload_to_sub2api(
+def _extract_sub2api_response_data(detail: Any) -> dict[str, Any]:
+    if not isinstance(detail, dict):
+        return {}
+    data = detail.get("data")
+    if isinstance(data, dict):
+        return data
+    return detail
+
+
+def upload_to_sub2api_detailed(
     account,
     api_url: str | None = None,
     api_key: str | None = None,
     group_ids: list[int] | None = None,
-) -> Tuple[bool, str]:
-    """上传单个账号到 Sub2API 管理后台。"""
+) -> dict[str, Any]:
+    """上传单个账号到 Sub2API 管理后台，返回结构化结果。"""
     api_url = str(api_url or _get_config_value("sub2api_api_url")).strip()
     api_key = str(api_key or _get_config_value("sub2api_api_key")).strip()
     resolved_group_ids = _parse_group_ids(
@@ -324,9 +333,9 @@ def upload_to_sub2api(
     )
 
     if not api_url:
-        return False, "Sub2API API URL 未配置"
+        return {"ok": False, "message": "Sub2API API URL 未配置"}
     if not api_key:
-        return False, "Sub2API API Key 未配置"
+        return {"ok": False, "message": "Sub2API API Key 未配置"}
 
     payload = build_sub2api_account_payload(account, group_ids=resolved_group_ids)
     url = f"{api_url.rstrip('/')}/api/v1/admin/accounts"
@@ -348,22 +357,45 @@ def upload_to_sub2api(
             impersonate="chrome110",
         )
 
-        if response.status_code in (200, 201):
-            return True, "上传成功"
-
-        error_msg = f"上传失败: HTTP {response.status_code}"
+        detail: Any = {}
         try:
             detail = response.json()
-            if isinstance(detail, dict):
-                error_msg = str(
-                    detail.get("message")
-                    or detail.get("msg")
-                    or detail.get("error")
-                    or error_msg
-                )
         except Exception:
+            detail = {}
+
+        if response.status_code in (200, 201):
+            data = _extract_sub2api_response_data(detail)
+            remote_id = data.get("id") or data.get("account_id")
+            return {
+                "ok": True,
+                "message": "上传成功",
+                "remote_account_id": remote_id,
+                "remote_status": str(data.get("status") or ""),
+                "response": detail if isinstance(detail, dict) else {},
+            }
+
+        error_msg = f"上传失败: HTTP {response.status_code}"
+        if isinstance(detail, dict):
+            error_msg = str(
+                detail.get("message")
+                or detail.get("msg")
+                or detail.get("error")
+                or error_msg
+            )
+        else:
             error_msg = f"{error_msg} - {response.text[:200]}"
-        return False, error_msg
+        return {"ok": False, "message": error_msg, "response": detail if isinstance(detail, dict) else {}}
     except Exception as exc:
         logger.error("Sub2API 上传异常: %s", exc)
-        return False, f"上传异常: {exc}"
+        return {"ok": False, "message": f"上传异常: {exc}"}
+
+
+def upload_to_sub2api(
+    account,
+    api_url: str | None = None,
+    api_key: str | None = None,
+    group_ids: list[int] | None = None,
+) -> Tuple[bool, str]:
+    """上传单个账号到 Sub2API 管理后台。"""
+    result = upload_to_sub2api_detailed(account, api_url=api_url, api_key=api_key, group_ids=group_ids)
+    return bool(result.get("ok")), str(result.get("message") or "")

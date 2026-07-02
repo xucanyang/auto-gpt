@@ -1,5 +1,6 @@
 """Turnstile Solver 进程管理 - 后端启动时自动拉起"""
 import subprocess
+from subprocess import TimeoutExpired
 import sys
 import os
 import time
@@ -100,8 +101,13 @@ def stop():
     global _proc, _log_file
     with _lock:
         if _proc and _proc.poll() is None:
-            _proc.terminate()
-            _proc.wait(timeout=5)
+            try:
+                _proc.terminate()
+                _proc.wait(timeout=5)
+            except TimeoutExpired:
+                print("[Solver] 停止超时，强制结束进程")
+                _proc.kill()
+                _proc.wait(timeout=5)
             print("[Solver] 已停止")
         _proc = None
         if _log_file:

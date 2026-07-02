@@ -7,8 +7,13 @@ from typing import Any
 
 from core.proxy_utils import normalize_proxy_url
 from services.chatgpt_core.payment import (
+    DEFAULT_PAYMENT_LINK_FORMAT,
+    PAYMENT_LINK_FORMAT_LONG,
+    is_default_hosted_checkout_fragment,
+    normalize_checkout_url_for_link_format,
     normalize_checkout_country,
     normalize_checkout_currency,
+    normalize_payment_link_format,
 )
 
 PAYMENT_LINK_STATUS_LABELS = {
@@ -36,6 +41,10 @@ def normalize_payment_link_status(value: Any) -> str:
     return str(value or "").strip().lower()
 
 
+def normalize_payment_link_output_format(value: Any) -> str:
+    return normalize_payment_link_format(value)
+
+
 def payment_link_status_label(value: Any) -> str:
     status = normalize_payment_link_status(value)
     return PAYMENT_LINK_STATUS_LABELS.get(status, status)
@@ -51,6 +60,13 @@ def payment_link_requires_status_sync(cached: dict[str, Any] | None) -> bool:
     if not isinstance(cached, dict):
         return False
     return normalize_payment_link_status(cached.get("link_status")) in PAYMENT_LINK_STATUS_SYNC_STATUSES
+
+
+def payment_link_url_requires_regeneration(value: Any, link_format: Any = None) -> bool:
+    normalized_format = normalize_payment_link_output_format(link_format or DEFAULT_PAYMENT_LINK_FORMAT)
+    if normalized_format != PAYMENT_LINK_FORMAT_LONG:
+        return False
+    return is_default_hosted_checkout_fragment(value)
 
 
 def _positive_int(value: Any, default: int) -> int:
@@ -71,6 +87,7 @@ def normalize_payment_link_params(params: dict[str, Any] | None) -> dict[str, An
         "country": country,
         "currency": currency,
         "proxy": normalize_proxy_url(source.get("proxy")) or "",
+        "payment_link_format": normalize_payment_link_output_format(source.get("payment_link_format")),
         "promo_code": str(source.get("promo_code") or "").strip(),
         "workspace_name": str(source.get("workspace_name") or "MyTeam").strip() or "MyTeam",
         "seat_quantity": max(2, _positive_int(source.get("seat_quantity", 5), 5)),
@@ -82,19 +99,27 @@ def payment_link_cache_matches(
     cached: dict[str, Any] | None,
     params: dict[str, Any] | None,
 ) -> bool:
-    if not isinstance(cached, dict) or not str(cached.get("url") or "").strip():
+    if not isinstance(cached, dict) or not normalize_payment_link_url(cached.get("url")):
         return False
     expected = normalize_payment_link_params(params)
     cached_plan = normalize_payment_link_plan(cached.get("plan"))
     cached_country = normalize_checkout_country(cached.get("country"))
     cached_currency = normalize_checkout_currency(cached.get("currency"), cached_country)
     cached_proxy = normalize_proxy_url(cached.get("proxy")) or ""
+    cached_format = normalize_payment_link_output_format(cached.get("payment_link_format") or PAYMENT_LINK_FORMAT_LONG)
+    if payment_link_url_requires_regeneration(cached.get("url"), cached_format):
+        return False
     return (
         cached_plan == expected["plan"]
         and cached_country == expected["country"]
         and cached_currency == expected["currency"]
         and cached_proxy == expected["proxy"]
+        and cached_format == expected["payment_link_format"]
     )
+
+
+def normalize_payment_link_url(value: Any, link_format: Any = None) -> str:
+    return normalize_checkout_url_for_link_format(value, link_format or DEFAULT_PAYMENT_LINK_FORMAT)
 
 
 def build_payment_link_cache_payload(
@@ -105,6 +130,11 @@ def build_payment_link_cache_payload(
 ) -> dict[str, Any]:
     payload_source = data if isinstance(data, dict) else {}
     fallback_source = fallback if isinstance(fallback, dict) else {}
+    link_format = normalize_payment_link_output_format(
+        payload_source.get("payment_link_format")
+        or fallback_source.get("payment_link_format")
+        or DEFAULT_PAYMENT_LINK_FORMAT
+    )
     url = str(
         payload_source.get("url")
         or payload_source.get("checkout_url")
@@ -116,6 +146,7 @@ def build_payment_link_cache_payload(
         or fallback_source.get("chatgpt_checkout_url")
         or ""
     ).strip()
+    url = normalize_payment_link_url(url, link_format)
     if not url:
         return {}
 
@@ -145,6 +176,7 @@ def build_payment_link_cache_payload(
         "country": country,
         "currency": currency,
         "proxy": normalize_proxy_url(payload_source.get("proxy") or fallback_source.get("proxy")) or "",
+        "payment_link_format": link_format,
         "promo_code": str(payload_source.get("promo_code") or fallback_source.get("promo_code") or "").strip(),
         "source": str(source or payload_source.get("source") or fallback_source.get("source") or "").strip(),
         "created_at": str(

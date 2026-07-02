@@ -1,6 +1,6 @@
 import unittest
 
-from core.base_mailbox import TempMailLocalMailbox
+from core.base_mailbox import TempMailLocalMailbox, TempMailReadyAuthError
 
 
 class _Response:
@@ -64,6 +64,29 @@ class TempMailLocalMailboxTests(unittest.TestCase):
         self.assertEqual(account.extra["mailbox_action"], "created_exact_address")
         self.assertEqual(mailbox.calls[1]["json"]["address"], "user")
         self.assertEqual(mailbox.calls[1]["json"]["domain"], "example.com")
+
+    def test_find_mailbox_by_email_raises_auth_error_without_retrying_as_empty(self):
+        mailbox = _FakeTempMailLocalMailbox([
+            _Response(401, {"error": "invalid api_key"}, '{"error":"invalid api_key"}'),
+        ])
+
+        with self.assertRaises(TempMailReadyAuthError):
+            mailbox.find_mailbox_by_email("user@example.com")
+
+        self.assertEqual(len(mailbox.calls), 1)
+
+    def test_wait_for_code_raises_auth_error_instead_of_polling_until_timeout(self):
+        mailbox = _FakeTempMailLocalMailbox([
+            _Response(401, {"error": "invalid api_key"}, '{"error":"invalid api_key"}'),
+        ])
+
+        with self.assertRaises(TempMailReadyAuthError):
+            mailbox.wait_for_code(
+                account=type("Account", (), {"email": "user@example.com", "account_id": "mailbox-1"})(),
+                timeout=30,
+            )
+
+        self.assertEqual(len(mailbox.calls), 1)
 
 
 if __name__ == "__main__":

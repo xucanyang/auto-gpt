@@ -3,6 +3,7 @@
 基于 curl_cffi 的注册状态机，注册成功后直接复用同一会话提取 ChatGPT Session。
 """
 
+import json
 import time
 import logging
 from datetime import datetime
@@ -36,7 +37,7 @@ class EmailServiceAdapter:
         phase_key = str(phase or "email_otp").strip() or "email_otp"
         phase_title = str(phase_label or phase_key).strip() or phase_key
         used_codes = self._used_codes_by_phase.setdefault(phase_key, set())
-        msg = f"\u6b63\u5728\u7b49\u5f85\u90ae\u7bb1 {email} \u7684\u9a8c\u8bc1\u7801（{phase_title}, {timeout}s）..."
+        msg = f"[验证码] 等待邮箱验证码：{phase_title} timeout={timeout}s"
         self.log_fn(msg)
         code = self.es.get_verification_code(
             timeout=timeout,
@@ -48,7 +49,7 @@ class EmailServiceAdapter:
         if code:
             code = str(code).strip()
             used_codes.add(code)
-            self.log_fn(f"\u6210\u529f\u83b7\u53d6\u9a8c\u8bc1\u7801（{phase_title}）")
+            self.log_fn(f"[验证码] 验证码已获取：{phase_title}")
         return code
 
 class AccessTokenOnlyRegistrationEngine:
@@ -73,6 +74,9 @@ class AccessTokenOnlyRegistrationEngine:
         self.email = None
         self.password = None
         self.logs = []
+        self._prepared_register_client: ChatGPTClient | None = None
+        self._last_chatgpt_client: ChatGPTClient | None = None
+        self._last_email_adapter = None
 
     def _should_probe_plus_checkout(self) -> bool:
         plan = str(
@@ -144,10 +148,131 @@ class AccessTokenOnlyRegistrationEngine:
             default=1,
         )
 
+    def _should_capture_gopay_provider_link(self) -> bool:
+        for key in (
+            "chatgpt_access_token_only_gopay_provider_link_enabled",
+            "chatgpt_gopay_provider_link_enabled",
+        ):
+            if key in self.extra_config and self.extra_config.get(key) not in (None, ""):
+                return self._parse_bool(self.extra_config.get(key))
+        return False
+
+    @staticmethod
+    def _json_object(value: Any) -> dict:
+        if isinstance(value, dict):
+            return dict(value)
+        if isinstance(value, str) and value.strip():
+            try:
+                parsed = json.loads(value)
+            except Exception:
+                return {}
+            if isinstance(parsed, dict):
+                return dict(parsed)
+        return {}
+
+    def _checkout_billing_config(self, *, country: str, currency: str, email_addr: str) -> dict:
+        billing = self.extra_config.get("chatgpt_checkout_billing")
+        if not isinstance(billing, dict):
+            billing = self.extra_config.get("billing") if isinstance(self.extra_config.get("billing"), dict) else {}
+        resolved = dict(billing or {})
+        gopay_defaults = self._json_object(self.extra_config.get("chatgpt_gopay_defaults"))
+        mapping = {
+            "name": "billing_name",
+            "email": "billing_email",
+            "country": "billing_country",
+            "line1": "billing_line1",
+            "city": "billing_city",
+            "state": "billing_state",
+            "postal_code": "billing_postal_code",
+        }
+        for target_key, source_key in mapping.items():
+            value = gopay_defaults.get(source_key)
+            if value not in (None, "") and not resolved.get(target_key):
+                resolved[target_key] = value
+        resolved.setdefault("email", email_addr)
+        resolved.setdefault("country", country)
+        resolved.setdefault("currency", currency)
+        return resolved
+
+    def _capture_gopay_provider_link(
+        self,
+        account: Any,
+        *,
+        checkout_url: str,
+        country: str,
+        currency: str,
+        billing: dict,
+        proxy: str,
+    ) -> dict:
+        metadata = {
+            "chatgpt_gopay_provider_link_enabled": True,
+            "chatgpt_gopay_provider_link_ready": False,
+            "chatgpt_gopay_provider_link": "",
+            "chatgpt_gopay_provider_link_error": "",
+        }
+        try:
+            from services.chatgpt_core.gopay_flow import create_gopay_provider_link
+
+            self._log("GoPay 平台链接: 开始进入 GoPay/Midtrans 平台链接阶段")
+            snapshot = create_gopay_provider_link(
+                account,
+                account_id=0,
+                plan="plus",
+                country=country,
+                currency=currency,
+                proxy=proxy,
+                checkout_url=checkout_url,
+                billing=billing,
+                proxy_source="registration_checkout_proxy",
+                browser_profile=(
+                    self.extra_config.get("gopay_browser_profile")
+                    if isinstance(self.extra_config.get("gopay_browser_profile"), dict)
+                    else None
+                ),
+                return_on_error=True,
+            )
+            provider_link = str(
+                snapshot.get("payment_platform_url")
+                or snapshot.get("midtrans_redirect_url")
+                or ""
+            ).strip()
+            ready = bool(provider_link)
+            if ready:
+                self._log(f"GoPay 平台链接已获取: {provider_link}")
+            else:
+                error = str(snapshot.get("last_error") or "未返回有效 URL").strip()
+                self._log(f"GoPay 平台链接未返回有效 URL: {error}", "warning")
+            metadata.update(
+                {
+                    "chatgpt_gopay_provider_link_ready": ready,
+                    "chatgpt_gopay_provider_link": provider_link,
+                    "chatgpt_gopay_provider_link_error": "" if ready else str(snapshot.get("last_error") or "未返回有效 URL"),
+                    "chatgpt_gopay_provider_link_snapshot": snapshot,
+                    "chatgpt_gopay_provider_link_checkout_url": snapshot.get("checkout_url") or checkout_url,
+                    "chatgpt_gopay_provider_link_cs_id": snapshot.get("cs_id") or "",
+                    "chatgpt_gopay_provider_link_snap_token": snapshot.get("snap_token") or "",
+                    "chatgpt_gopay_provider_link_stripe_redirect_url": snapshot.get("stripe_redirect_url") or "",
+                    "chatgpt_gopay_provider_link_midtrans_redirect_url": snapshot.get("midtrans_redirect_url") or "",
+                    "chatgpt_gopay_provider_link_payment_method_types": (
+                        (snapshot.get("result") or {}).get("payment_method_types")
+                        if isinstance(snapshot.get("result"), dict)
+                        else []
+                    ),
+                    "chatgpt_gopay_provider_link_phase": snapshot.get("phase") or "",
+                }
+            )
+        except Exception as exc:
+            error = str(exc).strip() or exc.__class__.__name__
+            self._log(f"GoPay 平台链接获取失败，账号仍按注册结果保存: {error}", "warning")
+            metadata["chatgpt_gopay_provider_link_error"] = error
+        return metadata
+
     def _probe_plus_checkout_billing(self, session_result: dict, email_addr: str) -> dict:
         if not self._should_probe_plus_checkout():
             return {}
-        if not self._is_checkout_amount_check_enabled():
+        amount_check_enabled = self._is_checkout_amount_check_enabled()
+        gopay_provider_link_enabled = self._should_capture_gopay_provider_link()
+        if not amount_check_enabled and not gopay_provider_link_enabled:
             self._log("Plus 额度验证已关闭，跳过订阅链接生成和 amount 校验")
             return {
                 "chatgpt_checkout_plan": "plus",
@@ -155,6 +280,7 @@ class AccessTokenOnlyRegistrationEngine:
                 "chatgpt_checkout_amount_check_enabled": False,
                 "chatgpt_skip_save_account": False,
                 "chatgpt_skip_save_reason": "",
+                "chatgpt_gopay_provider_link_enabled": False,
             }
 
         from services.chatgpt_core.gopay_flow import probe_chatgpt_checkout_amount
@@ -172,10 +298,12 @@ class AccessTokenOnlyRegistrationEngine:
         account = _CheckoutAccount()
         account.access_token = str(session_result.get("access_token") or "")
         account.cookies = str(session_result.get("cookies") or session_result.get("cookie") or "")
+        account.session_token = str(session_result.get("session_token") or "")
         account.email = email_addr
         account.extra = {
             "account_id": str(session_result.get("account_id") or session_result.get("user_id") or ""),
             "workspace_id": str(session_result.get("workspace_id") or ""),
+            "session_token": account.session_token,
         }
         if self.extra_config.get("stripe_publishable_key"):
             account.extra["stripe_publishable_key"] = self.extra_config.get("stripe_publishable_key")
@@ -202,9 +330,9 @@ class AccessTokenOnlyRegistrationEngine:
             raw_currency,
             country,
         )
-        billing = self.extra_config.get("chatgpt_checkout_billing")
-        if not isinstance(billing, dict):
-            billing = self.extra_config.get("billing") if isinstance(self.extra_config.get("billing"), dict) else {}
+        billing = self._checkout_billing_config(country=country, currency=currency, email_addr=email_addr)
+        if gopay_provider_link_enabled:
+            billing = {**billing, "country": country, "currency": currency}
 
         proxy_candidates = [str(item or "").strip() for item in iter_enabled_runtime_proxies(self.proxy_url) if str(item or "").strip()]
         if not proxy_candidates:
@@ -244,47 +372,77 @@ class AccessTokenOnlyRegistrationEngine:
                 }
             raise
         self._log(f"Plus checkout created: {checkout_url}")
-        probe = probe_chatgpt_checkout_amount(
-            account,
-            checkout_url=checkout_url,
-            country=country,
-            currency=currency,
-            proxy=checkout_proxy,
-            browser_profile=(
-                self.extra_config.get("gopay_browser_profile")
-                if isinstance(self.extra_config.get("gopay_browser_profile"), dict)
-                else None
-            ),
-        )
-        amount_text = str(probe.get("amount_text") or probe.get("amount") or "").strip()
-        currency_text = str(probe.get("currency") or currency or "").lower()
-        source_text = str(probe.get("amount_source") or "").strip()
-        self._log(f"Plus checkout amount: amount={amount_text or 'unknown'} currency={currency_text} source={source_text or 'unknown'}")
-
-        skip_save = not bool(probe.get("amount_is_zero"))
-        reason = ""
-        if skip_save:
-            reason = f"Plus checkout amount != 0: amount={amount_text or 'unknown'} currency={currency_text or currency}"
-            self._log(f"{reason}，注册失败且不保存账号", "warning")
-        return {
+        metadata = {
             "chatgpt_checkout_plan": "plus",
             "chatgpt_checkout_url": checkout_url,
             "chatgpt_checkout_country": country,
             "chatgpt_checkout_currency": currency,
-            "chatgpt_checkout_amount_check_enabled": True,
-            "chatgpt_checkout_amount": amount_text,
-            "chatgpt_checkout_amount_raw": probe.get("amount"),
-            "chatgpt_checkout_amount_source": source_text,
-            "chatgpt_checkout_amount_is_zero": not skip_save,
+            "chatgpt_checkout_amount_check_enabled": amount_check_enabled,
+            "chatgpt_gopay_provider_link_enabled": gopay_provider_link_enabled,
             "chatgpt_access_token_only_zero_amount_stop_enabled": self._zero_amount_stop_enabled(),
             "chatgpt_access_token_only_zero_amount_stop_threshold": self._zero_amount_stop_threshold(),
-            "chatgpt_checkout_probe": probe,
-            "chatgpt_skip_save_account": skip_save,
-            "chatgpt_skip_save_reason": reason,
-            "chatgpt_invalid_registration_failure": skip_save,
-            "chatgpt_invalid_registration_reason": reason,
-            "chatgpt_nonzero_checkout_amount_failure": skip_save,
         }
+        skip_save = False
+        if amount_check_enabled:
+            probe = probe_chatgpt_checkout_amount(
+                account,
+                checkout_url=checkout_url,
+                country=country,
+                currency=currency,
+                proxy=checkout_proxy,
+                browser_profile=(
+                    self.extra_config.get("gopay_browser_profile")
+                    if isinstance(self.extra_config.get("gopay_browser_profile"), dict)
+                    else None
+                ),
+            )
+            amount_text = str(probe.get("amount_text") or probe.get("amount") or "").strip()
+            currency_text = str(probe.get("currency") or currency or "").lower()
+            source_text = str(probe.get("amount_source") or "").strip()
+            self._log(f"Plus checkout amount: amount={amount_text or 'unknown'} currency={currency_text} source={source_text or 'unknown'}")
+
+            skip_save = not bool(probe.get("amount_is_zero"))
+            reason = ""
+            if skip_save:
+                reason = f"Plus checkout amount != 0: amount={amount_text or 'unknown'} currency={currency_text or currency}"
+                self._log(f"{reason}，注册失败且不保存账号", "warning")
+            metadata.update(
+                {
+                    "chatgpt_checkout_amount": amount_text,
+                    "chatgpt_checkout_amount_raw": probe.get("amount"),
+                    "chatgpt_checkout_amount_source": source_text,
+                    "chatgpt_checkout_amount_is_zero": not skip_save,
+                    "chatgpt_checkout_probe": probe,
+                    "chatgpt_skip_save_account": skip_save,
+                    "chatgpt_skip_save_reason": reason,
+                    "chatgpt_invalid_registration_failure": skip_save,
+                    "chatgpt_invalid_registration_reason": reason,
+                    "chatgpt_nonzero_checkout_amount_failure": skip_save,
+                }
+            )
+            if skip_save:
+                return metadata
+        else:
+            self._log("Plus 额度验证已关闭，仅为 GoPay 平台链接生成 checkout")
+            metadata.update(
+                {
+                    "chatgpt_skip_save_account": False,
+                    "chatgpt_skip_save_reason": "",
+                }
+            )
+
+        if gopay_provider_link_enabled:
+            metadata.update(
+                self._capture_gopay_provider_link(
+                    account,
+                    checkout_url=checkout_url,
+                    country=country,
+                    currency=currency,
+                    billing=billing,
+                    proxy=checkout_proxy,
+                )
+            )
+        return metadata
 
     @staticmethod
     def _classify_log_level(message: str, level: str = "info") -> str:
@@ -439,12 +597,14 @@ class AccessTokenOnlyRegistrationEngine:
         ).strip()
 
     def _probe_homepage_before_email_creation(self) -> tuple[bool, str]:
+        self._prepared_register_client = None
         client = ChatGPTClient(
             proxy=self.proxy_url,
             verbose=False,
             browser_mode=self.browser_mode,
         )
         client._log = self._log
+        keep_client = False
         try:
             max_probe_attempts = 3
             last_error = "访问首页失败"
@@ -461,15 +621,21 @@ class AccessTokenOnlyRegistrationEngine:
                 if not csrf_token:
                     last_error = "获取 CSRF token 失败"
                     continue
+                # 预热成功后必须复用同一个 ChatGPTClient。不同随机浏览器/TLS 指纹
+                # 在同一个代理出口下可能一会儿 200 一会儿 403；重新建 client 会把
+                # 已经通过首页+CSRF 的 session 优势丢掉。
+                self._prepared_register_client = client
+                keep_client = True
                 return True, ""
             return False, last_error
         except Exception as exc:
             return False, str(exc)
         finally:
-            try:
-                client.close()
-            except Exception:
-                pass
+            if not keep_client:
+                try:
+                    client.close()
+                except Exception:
+                    pass
 
     def _report_homepage_probe(self, ok: bool, detail: str = "") -> None:
         proxy_url = str(self.proxy_url or "").strip()
@@ -497,6 +663,7 @@ class AccessTokenOnlyRegistrationEngine:
 
     def run(self) -> RegistrationResult:
         result = RegistrationResult(success=False, logs=self.logs)
+        existing_account_capture = self._parse_bool(self.extra_config.get("chatgpt_existing_account_capture"))
         try:
             last_error = ""
             for attempt in range(self.max_retries):
@@ -514,8 +681,9 @@ class AccessTokenOnlyRegistrationEngine:
                         self._log(f"整流程重试 {attempt + 1}/{self.max_retries} ...")
                         time.sleep(1)
 
-                    homepage_ok, homepage_error = self._probe_homepage_before_email_creation()
-                    self._report_homepage_probe(homepage_ok, homepage_error)
+                    homepage_ok, homepage_error = (True, "") if existing_account_capture else self._probe_homepage_before_email_creation()
+                    if not existing_account_capture:
+                        self._report_homepage_probe(homepage_ok, homepage_error)
                     if not homepage_ok:
                         last_error = homepage_error or "访问首页失败"
                         result.error_message = last_error
@@ -549,34 +717,88 @@ class AccessTokenOnlyRegistrationEngine:
                     skymail_adapter = EmailServiceAdapter(self.email_service, email_addr, self._log)
 
                     # 2. 初始化 V2 客户端
-                    chatgpt_client = ChatGPTClient(
+                    chatgpt_client = self._prepared_register_client or ChatGPTClient(
                         proxy=self.proxy_url,
                         verbose=False,
                         browser_mode=self.browser_mode,
                     )
+                    self._prepared_register_client = None
                     chatgpt_client._log = self._log
+                    self._last_chatgpt_client = chatgpt_client
+                    self._last_email_adapter = skymail_adapter
 
-                    self._log("步骤 1/2: 执行注册状态机...")
+                    if existing_account_capture:
+                        self._log("步骤 1/2: 已启用已有账号抓 AT，跳过注册状态机，直接登录...")
+                        try:
+                            from services.chatgpt_core.oauth_client import OAuthClient
 
-                    success, msg = chatgpt_client.register_complete_flow(
-                        email_addr, pwd, first_name, last_name, birthdate, skymail_adapter
-                    )
+                            oauth_client = OAuthClient(
+                                self.extra_config,
+                                proxy=self.proxy_url,
+                                verbose=False,
+                                browser_mode=self.browser_mode,
+                            )
+                            oauth_client._log = lambda msg: self._log(f"[登录链路] {msg}")
+                            tokens = oauth_client.login_and_get_tokens(
+                                email_addr,
+                                pwd,
+                                device_id=getattr(chatgpt_client, "device_id", "") or "",
+                                user_agent=getattr(chatgpt_client, "ua", None),
+                                sec_ch_ua=getattr(chatgpt_client, "sec_ch_ua", None),
+                                impersonate=getattr(chatgpt_client, "impersonate", None),
+                                browser_fingerprint=getattr(chatgpt_client, "fingerprint", None),
+                                skymail_client=skymail_adapter,
+                                prefer_passwordless_login=True,
+                                allow_phone_verification=False,
+                                force_new_browser=True,
+                                force_chatgpt_entry=False,
+                                screen_hint="login",
+                                force_password_login=bool(self.password),
+                                login_source="access_token_only:existing_account_capture",
+                            )
+                        except Exception as login_exc:
+                            tokens = None
+                            oauth_client = None
+                            last_error = str(login_exc or "已有账号登录失败")
+                        if not tokens:
+                            last_error = str(getattr(oauth_client, "last_error", "") or last_error or "已有账号登录失败")
+                            if attempt < self.max_retries - 1 and self._should_retry(last_error):
+                                self._log(f"已有账号登录失败，准备整流程重试: {last_error}")
+                                continue
+                            result.error_message = last_error
+                            self._finalize_email_service_failure(result, fallback_error=last_error)
+                            return result
+                        session_ok = True
+                        session_result = dict(tokens or {})
+                        session_result.setdefault("access_token", str((tokens or {}).get("access_token") or ""))
+                        session_result.setdefault("session_token", str((tokens or {}).get("session_token") or ""))
+                        session_result.setdefault("account_id", str((tokens or {}).get("account_id") or ""))
+                        session_result.setdefault("workspace_id", str((tokens or {}).get("workspace_id") or ""))
+                    else:
+                        self._log("步骤 1/2: 执行注册状态机...")
 
-                    if not success:
-                        last_error = f"注册流失败: {msg}"
-                        if attempt < self.max_retries - 1 and self._should_retry(msg):
-                            self._log(f"注册流失败，准备整流程重试: {msg}")
-                            continue
-                        result.error_message = last_error
-                        self._finalize_email_service_failure(result, fallback_error=last_error)
-                        return result
+                        success, msg = chatgpt_client.register_complete_flow(
+                            email_addr, pwd, first_name, last_name, birthdate, skymail_adapter
+                        )
 
-                    self._log("步骤 2/2: 复用注册会话，直接获取 ChatGPT Session / AccessToken...")
-                    session_ok, session_result = chatgpt_client.reuse_session_and_get_tokens()
+                    if not existing_account_capture:
+                        if not success:
+                            last_error = f"注册流失败: {msg}"
+                            if attempt < self.max_retries - 1 and self._should_retry(msg):
+                                self._log(f"注册流失败，准备整流程重试: {msg}")
+                                continue
+                            result.error_message = last_error
+                            self._finalize_email_service_failure(result, fallback_error=last_error)
+                            return result
+
+                        self._log("步骤 2/2: 复用注册会话，直接获取 ChatGPT Session / AccessToken...")
+                        session_ok, session_result = chatgpt_client.reuse_session_and_get_tokens()
 
                     if session_ok:
                         self._log("Token 提取完成！")
                         result.access_token = session_result.get("access_token", "")
+                        result.refresh_token = session_result.get("refresh_token", "")
+                        result.id_token = session_result.get("id_token", "")
                         result.session_token = session_result.get("session_token", "")
                         result.account_id = (
                             session_result.get("account_id")
@@ -591,7 +813,14 @@ class AccessTokenOnlyRegistrationEngine:
                             "user_id": session_result.get("user_id", ""),
                             "user": session_result.get("user") or {},
                             "account": session_result.get("account") or {},
+                            "cookies": session_result.get("cookies") or "",
                         }
+                        export_state = getattr(self.email_service, "export_state", None)
+                        if callable(export_state):
+                            try:
+                                result.metadata["mailbox_state"] = export_state()
+                            except Exception:
+                                pass
                         result.metadata.update(checkout_metadata)
 
                         if result.workspace_id:

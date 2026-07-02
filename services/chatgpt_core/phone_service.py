@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import re
 import time
@@ -11,6 +12,7 @@ from urllib.parse import urlparse
 import requests
 
 from core.task_runtime import TaskInterruption
+from services.chatgpt_core.task_logging import mask_phone_for_log, redact_log_text
 
 from smstome_tool import (
     PhoneEntry,
@@ -41,9 +43,49 @@ def _to_bool(value, default: bool = False) -> bool:
     return default
 
 
+_BEIJING_TZ = timezone(timedelta(hours=8))
+
+
+def _parse_uploaded_sms_time(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        numeric = float(value)
+        if numeric <= 0:
+            return None
+        return numeric / 1000 if numeric > 1_000_000_000_000 else numeric
+
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        numeric = float(text)
+    except ValueError:
+        numeric = None
+    if numeric is not None:
+        if numeric <= 0:
+            return None
+        return numeric / 1000 if numeric > 1_000_000_000_000 else numeric
+
+    iso_text = text.replace(" ", "T", 1) if " " in text and "T" not in text else text
+    if iso_text.endswith("Z"):
+        iso_text = iso_text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(iso_text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=_BEIJING_TZ)
+    return parsed.astimezone(timezone.utc).timestamp()
+
+
 def _prefix_hint(phone: str, width: int = 7) -> str:
     value = str(phone or "").strip()
     return value[: min(len(value), width)] if value else ""
+
+
+def _safe_response_snippet(value: Any, limit: int = 300) -> str:
+    return redact_log_text(str(value or ""))[:limit]
 
 
 class SMSToMePhoneService:
@@ -240,10 +282,16 @@ class LocalPhoneGatewayService:
         try:
             data = resp.json()
         except Exception:
-            data = {"message": resp.text[:300]}
+            data = {"message": _safe_response_snippet(resp.text, 300)}
         if resp.status_code >= 400 or not bool(data.get("ok", resp.status_code < 400)):
-            message = str(data.get("message") or data.get("detail") or data.get("error") or resp.text[:300] or "本地接码网关返回失败")
-            raise RuntimeError(message)
+            message = str(
+                data.get("message")
+                or data.get("detail")
+                or data.get("error")
+                or _safe_response_snippet(resp.text, 300)
+                or "本地接码网关返回失败"
+            )
+            raise RuntimeError(redact_log_text(message))
         return data
 
     def acquire_phone(
@@ -528,15 +576,28 @@ class UploadedPhoneService:
             5,
             minimum=1,
         )
+        self.code_time_grace_seconds = _to_positive_int(
+            self.config.get("uploaded_phone_code_time_grace_seconds"),
+            5,
+            minimum=0,
+        )
+        self.validate_delay_seconds = _to_positive_int(
+            self.config.get("uploaded_phone_validate_delay_seconds"),
+            2,
+            minimum=0,
+        )
         self.current_entry: UploadedPhoneEntry | None = None
         self.completed_entries: list[UploadedPhoneEntry] = []
         self.cancelled_entries: list[tuple[UploadedPhoneEntry, str]] = []
         self.last_api_payload: dict[str, Any] = {}
         self.last_api_error = ""
         self.last_expired_date = ""
+        self.last_code = ""
         self.last_code_time = ""
         self.last_code_was_extracted = False
         self.last_sms_sent = False
+        self.last_sms_sent_at = 0.0
+        self._last_stale_code_key = ""
 
     def _check_stop(self) -> None:
         if callable(self.stop_checker):
@@ -564,13 +625,18 @@ class UploadedPhoneService:
         self.last_api_payload = {}
         self.last_api_error = ""
         self.last_expired_date = ""
+        self.last_code = ""
         self.last_code_time = ""
         self.last_code_was_extracted = False
         self.last_sms_sent = False
+        self.last_sms_sent_at = 0.0
+        self._last_stale_code_key = ""
 
     def mark_sms_sent(self, entry: UploadedPhoneEntry) -> None:
         self._check_stop()
         self.last_sms_sent = True
+        self.last_sms_sent_at = time.time()
+        self._last_stale_code_key = ""
         self.log_fn(f"[号码测试] OpenAI 已接受并发送验证码: {entry.phone}")
 
     def request_next_code(self, _entry: UploadedPhoneEntry) -> bool:
@@ -600,10 +666,16 @@ class UploadedPhoneService:
         try:
             payload = resp.json()
         except Exception as exc:
-            raise RuntimeError(f"收码 API 响应不是 JSON: {resp.text[:200]}") from exc
+            raise RuntimeError(f"收码 API 响应不是 JSON: {_safe_response_snippet(resp.text, 200)}") from exc
         if resp.status_code >= 400:
-            message = str(payload.get("msg") or payload.get("message") or payload.get("error") or resp.text[:200] or f"HTTP {resp.status_code}")
-            raise RuntimeError(f"收码 API 返回失败: {message}")
+            message = str(
+                payload.get("msg")
+                or payload.get("message")
+                or payload.get("error")
+                or _safe_response_snippet(resp.text, 200)
+                or f"HTTP {resp.status_code}"
+            )
+            raise RuntimeError(f"收码 API 返回失败: {redact_log_text(message)}")
         return payload if isinstance(payload, dict) else {}
 
     def wait_for_code(self, entry: UploadedPhoneEntry, *, timeout: Optional[int] = None) -> Optional[str]:
@@ -623,7 +695,7 @@ class UploadedPhoneService:
                 raise
             except Exception as exc:
                 self.last_api_error = str(exc)
-                self.log_fn(f"[号码测试] {entry.phone} 收码 API 异常: {exc}")
+                self.log_fn(f"[号码测试] {entry.phone} 收码 API 异常: {redact_log_text(exc)}")
                 raise
 
             data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
@@ -636,9 +708,30 @@ class UploadedPhoneService:
                 code_time = str(data.get("code_time") or "").strip()
                 if code_time:
                     self.last_code_time = code_time
+                code_timestamp = _parse_uploaded_sms_time(code_time)
+                if (
+                    code_timestamp is not None
+                    and self.last_sms_sent_at > 0
+                    and code_timestamp < self.last_sms_sent_at - float(self.code_time_grace_seconds or 0)
+                ):
+                    stale_key = f"{code}:{code_time}"
+                    if stale_key != self._last_stale_code_key:
+                        self.log_fn(
+                            f"[号码测试] {entry.phone} 忽略旧验证码 "
+                            f"otp={code} otp_received=true otp_length={len(code)}"
+                            f"{f'，时间 {code_time}' if code_time else ''}，早于本次 OpenAI 发码"
+                        )
+                        self._last_stale_code_key = stale_key
+                    time.sleep(min(float(self.poll_interval_seconds), max(0.1, remaining)))
+                    continue
+                self.last_code = code
                 self.last_code_was_extracted = str(raw_code or "").strip() != code
                 extracted_hint = "，已提取 6 位验证码" if str(raw_code or "").strip() != code else ""
-                self.log_fn(f"[号码测试] {entry.phone} 收到验证码{f'，时间 {code_time}' if code_time else ''}{extracted_hint}")
+                self.log_fn(
+                    f"[号码测试] {entry.phone} 收到验证码 "
+                    f"otp={code} otp_received=true otp_length={len(code)}"
+                    f"{f'，时间 {code_time}' if code_time else ''}{extracted_hint}"
+                )
                 return code
             if str(raw_code or "").strip():
                 raise RuntimeError("收码 API 返回了验证码字段，但无法提取 6 位数字验证码")
@@ -646,7 +739,7 @@ class UploadedPhoneService:
             message = str(payload.get("msg") or payload.get("message") or "No verification code").strip()
             status_text = f"{message}{f'，有效期至 {expired_date}' if expired_date else ''}"
             if status_text != last_message:
-                self.log_fn(f"[号码测试] {entry.phone} 暂无验证码: {status_text}")
+                self.log_fn(f"[号码测试] {entry.phone} 暂无验证码: {redact_log_text(status_text)}")
                 last_message = status_text
             time.sleep(min(float(self.poll_interval_seconds), max(0.1, remaining)))
 
@@ -729,7 +822,7 @@ class SharedPhoneGatewayService:
         if self.current_entry and getattr(entry, "activation_id", "") == getattr(self.current_entry, "activation_id", ""):
             self._needs_next_sms = True
             self.log_fn(
-                f"[接码网关] 批量手机号保留继续复用: activation_id={entry.activation_id}, phone={entry.phone}"
+                f"[接码网关] 批量手机号保留继续复用: activation_id={entry.activation_id}, phone={mask_phone_for_log(entry.phone)}"
             )
             return None
         return self.base_service.complete(entry)

@@ -17,6 +17,9 @@ const GoPayOtpPage = lazy(() => import('@/pages/GoPayOtpAdapter'))
 const PipelinePage = lazy(() => import('@/pages/Pipeline'))
 const TaskHistoryPage = lazy(() => import('@/pages/TaskHistory'))
 const ProxiesPage = lazy(() => import('@/pages/Proxies'))
+const PhonePoolPage = lazy(() => import('@/pages/PhonePool'))
+const BaxiGptCdkPoolPage = lazy(() => import('@/pages/BaxiGptCdkPool'))
+const DeliveryCardsPage = lazy(() => import('@/pages/DeliveryCards'))
 const SettingsPage = lazy(() => import('@/pages/Settings'))
 
 export const APP_ROUTES: AppRouteItem[] = [
@@ -24,11 +27,14 @@ export const APP_ROUTES: AppRouteItem[] = [
   { path: '/chatgpt', key: '/chatgpt', label: 'ChatGPT', loader: AccountsPage },
   { path: '/accounts', key: '/chatgpt', loader: AccountsPage },
   { path: '/register', key: '/register', loader: RegisterTaskPage },
-  { path: '/custom-email-recheck', key: '/custom-email-recheck', label: '自定义邮箱测活', loader: CustomEmailRecheckPage },
+  { path: '/custom-email-recheck', key: '/custom-email-recheck', label: '邮箱登录测活', loader: CustomEmailRecheckPage },
   { path: '/teams', key: '/teams', label: 'Team', loader: TeamsPage },
   { path: '/gopay-otp', key: '/gopay-otp', label: 'GoPay OTP', loader: GoPayOtpPage },
   { path: '/pipeline', key: '/pipeline', label: '自动流水线', loader: PipelinePage },
   { path: '/history', key: '/history', label: '任务历史', loader: TaskHistoryPage },
   { path: '/proxies', key: '/proxies', label: '代理管理', loader: ProxiesPage },
+  { path: '/phone-pool', key: '/phone-pool', label: '手机号池', loader: PhonePoolPage },
+  { path: '/baxigpt-cdk-pool', key: '/baxigpt-cdk-pool', label: 'pix卡密提交', loader: BaxiGptCdkPoolPage },
+  { path: '/delivery-cards', key: '/delivery-cards', label: '交付卡密', loader: DeliveryCardsPage },
   { path: '/settings', key: '/settings', label: '全局配置', loader: SettingsPage },
 ]

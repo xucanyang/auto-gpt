@@ -102,6 +102,79 @@ class PendingBusinessInviteRecoveryTests(unittest.TestCase):
 
         self.assertEqual(invite_ids, [retryable_id, pending_id])
 
+    def test_icloud_hme_stored_mailbox_state_uses_current_forward_config(self):
+        account = AccountModel(
+            platform="chatgpt",
+            email="alias@icloud.com",
+            password="pw",
+            token="",
+            status="registered",
+            extra_json=(
+                '{"chatgpt_mailbox_state":{'
+                '"provider":"icloud_hme",'
+                '"email":"alias@icloud.com",'
+                '"account":{"email":"alias@icloud.com","account_id":"anon-1",'
+                '"extra":{"provider":"icloud_hme","forward_to":"b@cccy.me","forward_mailbox_id":"old-mailbox"}},'
+                '"config":{"tempmail_api_url":"http://old-api","tempmail_api_key":"old-key",'
+                '"icloud_forward_to":"b@cccy.me","icloud_forward_mailbox_id":"old-mailbox"}}}'
+            ),
+        )
+
+        with mock.patch.object(
+            pending_business_invites.config_store,
+            "get_all",
+            return_value={
+                "tempmail_api_url": "http://new-api",
+                "tempmail_api_key": "new-key",
+                "tempmail_api_key_header": "Authorization",
+                "icloud_hme_mode": "import_pool",
+                "icloud_forward_to": "b@cccy.me",
+                "icloud_forward_mailbox_id": "new-mailbox",
+            },
+        ):
+            state = pending_business_invites._mailbox_state_from_account(account)
+
+        self.assertEqual(state["config"]["tempmail_api_url"], "http://new-api")
+        self.assertEqual(state["config"]["tempmail_api_key"], "new-key")
+        self.assertEqual(state["config"]["icloud_forward_mailbox_id"], "new-mailbox")
+        self.assertEqual(state["account"]["extra"]["forward_mailbox_id"], "new-mailbox")
+
+    def test_icloud_hme_stored_mailbox_state_drops_stale_config_forward_id_when_global_empty(self):
+        account = AccountModel(
+            platform="chatgpt",
+            email="alias@icloud.com",
+            password="pw",
+            token="",
+            status="registered",
+            extra_json=(
+                '{"chatgpt_mailbox_state":{'
+                '"provider":"icloud_hme",'
+                '"email":"alias@icloud.com",'
+                '"account":{"email":"alias@icloud.com","account_id":"anon-1",'
+                '"extra":{"provider":"icloud_hme","forward_to":"old@example.com","forward_mailbox_id":"cache-mailbox"}},'
+                '"config":{"tempmail_api_url":"http://old-api","tempmail_api_key":"old-key",'
+                '"icloud_forward_to":"old@example.com","icloud_forward_mailbox_id":"stale-config-mailbox"}}}'
+            ),
+        )
+
+        with mock.patch.object(
+            pending_business_invites.config_store,
+            "get_all",
+            return_value={
+                "tempmail_api_url": "http://new-api",
+                "tempmail_api_key": "new-key",
+                "icloud_hme_mode": "import_pool",
+                "icloud_forward_to": "b@cccy.me",
+                "icloud_forward_mailbox_id": "",
+            },
+        ):
+            state = pending_business_invites._mailbox_state_from_account(account)
+
+        self.assertEqual(state["config"]["tempmail_api_url"], "http://new-api")
+        self.assertNotIn("icloud_forward_mailbox_id", state["config"])
+        self.assertEqual(state["account"]["extra"]["forward_to"], "b@cccy.me")
+        self.assertEqual(state["account"]["extra"]["forward_mailbox_id"], "cache-mailbox")
+
     def test_upsert_pending_subscription_auth_from_account_creates_subscription_item(self):
         account_id = self._add_account(email="sub@example.com")
         with Session(self.engine) as session:
@@ -334,6 +407,30 @@ class PendingBusinessInviteRecoveryTests(unittest.TestCase):
         self.assertEqual(exported["account"]["account_id"], "new-mailbox")
         self.assertTrue(any("按原地址新建" in line for line in logs))
 
+    def test_restored_email_service_binds_task_control_for_manual_mailbox(self):
+        state = {
+            "provider": "manual_email_otp",
+            "email": "manual@example.com",
+            "account": {"email": "manual@example.com", "account_id": "manual@example.com", "extra": {}},
+            "before_ids": [],
+        }
+
+        class _ManualMailbox:
+            def get_current_ids(self, account):
+                return set()
+
+        mailbox = _ManualMailbox()
+        with mock.patch.object(pending_business_invites, "create_mailbox", return_value=mailbox):
+            service = pending_business_invites.RestoredEmailService(
+                state=state,
+                task_control="task-control",
+                attempt_id=123,
+            )
+            service.create_email()
+
+        self.assertEqual(getattr(mailbox, "_task_control", None), "task-control")
+        self.assertEqual(getattr(mailbox, "_task_attempt_token", None), 123)
+
     def test_actions_resume_subscription_auth_uses_account_level_capture(self):
         account_id = self._add_account(email="api-resume@example.com")
         with Session(self.engine) as session:
@@ -395,7 +492,7 @@ class PendingBusinessInviteRecoveryTests(unittest.TestCase):
 
             with mock.patch(
                 "services.chatgpt_core.subscription_auth_capture.capture_subscription_auth_for_account",
-                side_effect=lambda account_id, allow_phone_verification=False, log_fn=None: (
+                side_effect=lambda account_id, allow_phone_verification=False, log_fn=None, **kwargs: (
                     log_fn("[补抓] 账号级补抓 auth") if callable(log_fn) else None,
                     {"ok": True, "data": {"message": "补抓 Auth 完成", "auth_capture": {"account_id": "acct-log"}, "logs": ["[补抓] 账号级补抓 auth"]}},
                 )[1],
@@ -447,7 +544,7 @@ class PendingBusinessInviteRecoveryTests(unittest.TestCase):
 
             with mock.patch(
                 "services.chatgpt_core.subscription_auth_capture.capture_subscription_auth_for_account",
-                side_effect=lambda account_id, allow_phone_verification=False, log_fn=None: (
+                side_effect=lambda account_id, allow_phone_verification=False, log_fn=None, **kwargs: (
                     log_fn("[补抓] 登录失败前的详细日志") if callable(log_fn) else None,
                     {"ok": False, "error": "创建邮箱失败", "data": {"message": "创建邮箱失败", "logs": ["[补抓] 登录失败前的详细日志", "[补抓] 失败：创建邮箱失败"]}},
                 )[1],

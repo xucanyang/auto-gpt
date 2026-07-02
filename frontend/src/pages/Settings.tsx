@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
-import { App, Card, Form, Input, Select, Button, message, Tabs, Space, Tag, Typography, Modal, QRCode, Switch, Alert, Table } from 'antd'
+import { App, Card, Form, Input, Select, Button, message, Tabs, Space, Tag, Typography, Modal, QRCode, Switch, Alert, Table, Grid } from 'antd'
+import type { FormInstance } from 'antd'
 import {
   SaveOutlined,
   EyeOutlined,
@@ -26,7 +27,8 @@ const SELECT_FIELDS: Record<string, { label: string; value: string }[]> = {
     { label: 'Laoudo（固定邮箱）', value: 'laoudo' },
     { label: 'TempMail.lol（自动生成）', value: 'tempmail_lol' },
     { label: 'TempMail Ready API（本地接口）', value: 'tempmail_local' },
-    { label: 'iCloud HME（共享转发到 TempMail）', value: 'icloud_hme' },
+    { label: 'HME Ready API（iCloud Helper）', value: 'hme_ready_api' },
+    { label: 'iCloud HME', value: 'icloud_hme' },
     { label: 'SkyMail（CloudMail 接口）', value: 'skymail' },
     { label: 'CloudMail（genToken 口令模式）', value: 'cloudmail' },
     { label: 'DuckMail（自动生成）', value: 'duckmail' },
@@ -221,19 +223,61 @@ const TAB_ITEMS = [
         ],
       },
       {
-        title: 'iCloud HME',
-        desc: '调用 iCloud Hide My Email 私有接口生成别名，并统一转发到共享 TempMail 收件箱',
+        title: 'HME Ready API',
+        desc: '通过 icloud-hide-email-helper 领取 HME、收码和 finalize',
+        fields: [
+          { key: 'icloud_forward_to', label: '转发目标邮箱', placeholder: 'b@666800.xyz', type: 'stringList' },
+          { key: 'icloud_hme_helper_api_url', label: 'Helper API URL', placeholder: 'http://host.docker.internal:18765' },
+          { key: 'icloud_hme_helper_internal_key', label: 'Helper Internal Key', secret: true },
+          { key: 'icloud_hme_helper_api_key_header', label: 'Helper 鉴权 Header', placeholder: 'X-Internal-Key' },
+          { key: 'icloud_hme_helper_consumer', label: 'Helper Consumer', placeholder: 'auto-gpt/chatgpt_register' },
+          { key: 'icloud_hme_helper_checkout_ttl_seconds', label: 'Helper lease TTL 秒', placeholder: '10800' },
+          { key: 'icloud_hme_helper_wait_timeout_seconds', label: 'Helper 等码超时秒', placeholder: '300' },
+          { key: 'icloud_hme_helper_max_cache_age_seconds', label: 'Helper iCloud 缓存有效秒', placeholder: '86400' },
+        ],
+      },
+      {
+        title: 'iCloud HME 基础配置',
+        desc: 'auto-gpt 直接管理 iCloud HME Cookie、别名来源和共享收件箱',
         fields: [
           { key: 'icloud_hme_mode', label: '别名来源模式', type: 'select' },
           { key: 'icloud_cookie', label: 'iCloud Cookie', type: 'textarea', placeholder: '从 www.icloud.com DevTools 请求头复制完整 Cookie 字符串' },
           { key: 'icloud_domain_base', label: 'iCloud 域', type: 'select' },
-          { key: 'icloud_forward_to', label: '转发目标邮箱', placeholder: 'b@cccy.me' },
+          { key: 'icloud_forward_to', label: '转发目标邮箱', placeholder: 'b@cccy.me', type: 'stringList' },
           { key: 'icloud_forward_mailbox_id', label: '转发目标 mailbox_id（可选）', placeholder: '0d355f68-8506-4c93-ac56-5ef017f0b932' },
+        ],
+      },
+      {
+        title: 'iCloud HME 自动补池',
+        desc: '按随机间隔创建新 HME，并放入导入池待使用',
+        fields: [
           { key: 'icloud_hme_auto_create_enabled', label: '自动创建导入池邮箱', type: 'boolean' },
           { key: 'icloud_hme_auto_create_stock_limit', label: '导入池库存上限', placeholder: '10' },
           { key: 'icloud_hme_auto_create_interval_min_minutes', label: '随机间隔最小分钟', placeholder: '60' },
           { key: 'icloud_hme_auto_create_interval_max_minutes', label: '随机间隔最大分钟', placeholder: '120' },
           { key: 'icloud_hme_auto_create_rate_limit_backoff_minutes', label: '遇到限流延长等待分钟', placeholder: '360' },
+          { key: 'icloud_hme_auto_create_error_backoff_minutes', label: '普通错误短退避分钟', placeholder: '3' },
+        ],
+      },
+      {
+        title: 'iCloud HME 自动删除',
+        desc: '扫描未使用或失效别名，删除前可再次测活确认',
+        fields: [
+          { key: 'icloud_hme_auto_delete_enabled', label: '自动删除未使用/失效别名', type: 'boolean' },
+          { key: 'icloud_hme_auto_delete_recheck_before_delete', label: '删除前先失效测活', type: 'boolean' },
+          { key: 'icloud_hme_auto_delete_account_interval_min_minutes', label: '账号间隔最小分钟', placeholder: '10' },
+          { key: 'icloud_hme_auto_delete_account_interval_max_minutes', label: '账号间隔最大分钟', placeholder: '30' },
+          { key: 'icloud_hme_auto_delete_max_per_run', label: '单次最多删除个数', placeholder: '20' },
+          { key: 'icloud_hme_auto_delete_rate_limit_backoff_minutes', label: '删除遇限流延长等待分钟', placeholder: '60' },
+          { key: 'icloud_hme_auto_delete_error_backoff_minutes', label: '普通错误短退避分钟', placeholder: '3' },
+          { key: 'icloud_hme_auto_delete_pause_active_tasks', label: '活跃任务期间暂停删除', type: 'boolean' },
+          { key: 'icloud_hme_auto_delete_dead_statuses', label: '判为失效的测活结论', placeholder: 'account_deactivated,password_invalid' },
+        ],
+      },
+      {
+        title: 'TempMail 归档清理',
+        desc: '归档共享收件箱旧邮件，保护验证码任务窗口',
+        fields: [
           { key: 'tempmail_archive_cleanup_enabled', label: '归档清理共享收件箱', type: 'boolean' },
           { key: 'tempmail_archive_cleanup_interval_minutes', label: '归档清理间隔分钟', placeholder: '30' },
           { key: 'tempmail_archive_cleanup_keep_recent_minutes', label: '保留最近邮件分钟', placeholder: '60' },
@@ -334,6 +378,7 @@ const TAB_ITEMS = [
           { key: 'chatgpt_team_invite_deferred_activation', label: '默认延迟邀请', type: 'boolean' },
           { key: 'chatgpt_capture_free_workspace', label: '默认抓取 free 工作空间', type: 'boolean' },
           { key: 'chatgpt_capture_business_workspace', label: '默认抓取 business 工作空间', type: 'boolean' },
+          { key: 'chatgpt_phone_signup_password', label: '手机号注册/登录固定密码', secret: true, placeholder: '新手机号注册和已注册手机号登录共用' },
           { key: 'chatgpt_existing_account_login_password', label: '已有账号抓 auth 默认密码', secret: true, placeholder: '可留空，任务里仍可临时覆盖' },
         ],
       },
@@ -362,29 +407,50 @@ const TAB_ITEMS = [
           { key: 'chatgpt_access_token_only_checkout_currency', label: '额度验证货币', placeholder: 'USD' },
           { key: 'chatgpt_access_token_only_zero_amount_stop_enabled', label: '启用 amount=0 自动停', type: 'boolean' },
           { key: 'chatgpt_access_token_only_zero_amount_stop_threshold', label: 'amount=0 命中阈值', placeholder: '1' },
+          { key: 'chatgpt_access_token_only_gopay_provider_link_enabled', label: '注册后获取 GoPay 平台链接', type: 'boolean' },
         ],
       },
       {
-        title: '外部订阅链接 API',
-        desc: '允许外部支付程序领取已缓存的订阅链接，并在支付后写回账号状态',
+        title: '外部 ChatGPT 分发 API',
+        desc: '订阅链接和 AccessToken 分开领取、分开鉴权。AccessToken 只发送 live 校验有效且未订阅的账号。',
         help: {
           title: '接口使用方法',
           lines: [
-            '请求头统一使用 Authorization: Bearer <访问 Token>。',
+            '请求头统一使用 Authorization: Bearer <对应功能的访问 Token>。',
             '领取订阅链接: POST /api/external/subscription-links/claim，body 示例 {"consumer":"payment-worker-01","limit":10,"lease_seconds":900}。',
             '领取成功后默认 300 秒会触发一次本地账号订阅探测；服务重启后会自动恢复未完成的复核计划。',
             '查询领取状态: GET /api/external/subscription-links/{claim_id}。',
             '支付成功写回: POST /api/external/subscription-links/{claim_id}/result，body 示例 {"status":"paid","external_payment_id":"pay_123","message":"payment completed"}。',
             '支付失败写回: POST /api/external/subscription-links/{claim_id}/result，body 示例 {"status":"failed","external_payment_id":"pay_123","error_code":"declined","message":"payment failed"}。',
             '放弃本次领取: POST /api/external/subscription-links/{claim_id}/release，body 示例 {"reason":"checkout unavailable"}。',
-            '接口只返回 account_id、email、payment_link、plan、country、currency、claim_id 等支付所需字段，不返回密码或 token。',
+            '领取 AccessToken: POST /api/external/access-tokens/claim，body 示例 {"consumer":"token-worker-01","limit":10,"lease_seconds":86400}。',
+            'AccessToken 响应会返回 account_id、email、access_token、claim_id。本轮同一个 access_token 不会重复发送。',
+            'AccessToken 支付成功写回: POST /api/external/access-tokens/{claim_id}/result，body 示例 {"status":"paid","external_payment_id":"pay_123","message":"payment completed"}，本地会立即刷新账号状态。',
+            'AccessToken 支付失败写回: POST /api/external/access-tokens/{claim_id}/result，body 示例 {"status":"failed","external_payment_id":"pay_123","error_code":"declined","message":"payment failed"}，账号状态不变。',
+            'AccessToken 查询和释放: GET /api/external/access-tokens/{claim_id}，POST /api/external/access-tokens/{claim_id}/release。',
+            '接口不返回密码、refresh_token、cookie 或 session_token。',
           ],
         },
         fields: [
-          { key: 'external_subscription_api_enabled', label: '启用外部 API', type: 'boolean' },
-          { key: 'external_subscription_api_token', label: '访问 Token', secret: true, placeholder: '外部程序使用 Authorization: Bearer <token>' },
-          { key: 'external_subscription_verify_after_seconds', label: '领取后本地探测延迟秒数', placeholder: '300' },
+          { key: 'external_subscription_api_enabled', label: '启用订阅链接分发', type: 'boolean' },
+          { key: 'external_subscription_api_token', label: '订阅链接 API Token', secret: true, placeholder: '支付程序使用 Authorization: Bearer <token>' },
+          { key: 'external_subscription_verify_after_seconds', label: '订阅链接领取后本地探测延迟秒数', placeholder: '300' },
+          { key: 'external_access_token_api_enabled', label: '启用 AccessToken 分发', type: 'boolean' },
+          { key: 'external_access_token_api_token', label: 'AccessToken API Token', secret: true, placeholder: '外部服务使用 Authorization: Bearer <token>' },
+          { key: 'external_access_token_allow_refresh', label: '允许 refresh_token 刷新后发送新 AT', type: 'boolean' },
+          { key: 'external_access_token_default_lease_seconds', label: 'AccessToken 租约秒数', placeholder: '86400' },
+          { key: 'external_access_token_max_limit', label: 'AccessToken 单次最大领取数', placeholder: '50' },
+          { key: 'external_access_token_precheck_cooldown_seconds', label: 'AccessToken 预检失败冷却秒数', placeholder: '600' },
         ],
+      },
+      {
+        title: 'OAIPay 面板',
+        desc: '一键将账号推送到 OAIPay (gpt.cccy.me)',
+        fields: [
+          { key: 'oaipay_api_url', label: 'API URL', placeholder: 'http://gpt.cccy.me/api/auto-gpt/upload' },
+          { key: 'oaipay_api_key', label: 'API Key (管理员密码)', secret: true },
+          { key: 'oaipay_group', label: '默认分组', placeholder: '例如: auto-gpt' },
+        ]
       },
       {
         title: 'CodexProxy',
@@ -399,7 +465,14 @@ const TAB_ITEMS = [
         title: '手机验证 / 接码服务',
         desc: '补抓 Auth 遇到 add_phone 后，是否允许接码以及使用哪个接码渠道',
         fields: [
-          { key: 'chatgpt_resume_auth_allow_phone_verification', label: '补抓 Auth 允许手机号验证', type: 'boolean' },
+          { key: 'chatgpt_resume_auth_allow_phone_verification', label: '补抓 Auth 兼容手机号总开关', type: 'boolean' },
+          { key: 'chatgpt_resume_auth_allow_add_phone_verification', label: '补抓 Auth 允许 add_phone 新绑', type: 'boolean' },
+          { key: 'chatgpt_resume_auth_allow_existing_phone_verification', label: '补抓 Auth 允许已绑手机号二次验证', type: 'boolean' },
+          { key: 'chatgpt_recheck_allow_existing_phone_verification', label: '测活允许已绑手机号二次验证', type: 'boolean' },
+          { key: 'existing_phone_otp_timeout_seconds', label: '已绑手机号 OTP 等待秒数', placeholder: '180' },
+          { key: 'existing_phone_otp_poll_interval_seconds', label: '已绑手机号 OTP 轮询间隔秒数', placeholder: '5' },
+          { key: 'existing_phone_otp_max_resend_attempts', label: '已绑手机号 OTP 最大重发次数', placeholder: '1' },
+          { key: 'existing_phone_otp_resend_interval_seconds', label: '已绑手机号 OTP 重发间隔秒数', placeholder: '30' },
           { key: 'chatgpt_subscription_auth_capture_retry_delays_seconds', label: '补抓 Auth 重试间隔（秒）', placeholder: '5,10' },
           { key: 'chatgpt_phone_verification_provider', label: '接码服务', type: 'select' },
           { key: 'local_phone_gateway_url', label: '本地网关 URL', placeholder: 'http://sms-gateway:8720' },
@@ -460,7 +533,7 @@ interface FieldConfig {
   key: string
   label: string
   placeholder?: string
-  type?: 'select' | 'input' | 'boolean' | 'textarea'
+  type?: 'select' | 'input' | 'boolean' | 'textarea' | 'stringList'
   secret?: boolean
 }
 
@@ -475,6 +548,21 @@ interface SectionConfig {
 }
 
 const CHATGPT_PINNED_SECTIONS_STORAGE_KEY = 'any-auto-register.settings.chatgpt.pinned-sections'
+
+const CHATGPT_PIN_GROUPS = [
+  {
+    label: '上传',
+    titles: ['CPA 面板', 'Sub2API 面板', 'OAIPay 面板', 'CodexProxy'],
+  },
+  {
+    label: '账号订阅',
+    titles: ['Business / 工作空间', 'GoPay 账单地址 LLM', '无 RT / Access Token Only', '外部 ChatGPT 分发 API'],
+  },
+  {
+    label: '维护验证',
+    titles: ['CPA 自动维护', '手机验证 / 接码服务'],
+  },
+]
 
 function loadChatgptPinnedSections(): string[] {
   if (typeof window === 'undefined') return []
@@ -508,6 +596,10 @@ function orderPinnedSections(sections: SectionConfig[], pinnedSections: string[]
   ]
 }
 
+function getIcloudHmeModeLabel(mode: string): string {
+  return SELECT_FIELDS.icloud_hme_mode.find((item) => item.value === mode)?.label || mode || '未配置'
+}
+
 function getMailboxSectionProvider(title: string): string | null {
   switch (title) {
     case 'Laoudo':
@@ -532,7 +624,12 @@ function getMailboxSectionProvider(title: string): string | null {
       return 'tempmail_lol'
     case 'TempMail 本地接口':
       return 'tempmail_local'
-    case 'iCloud HME':
+    case 'HME Ready API':
+      return 'hme_ready_api'
+    case 'iCloud HME 基础配置':
+    case 'iCloud HME 自动补池':
+    case 'iCloud HME 自动删除':
+    case 'TempMail 归档清理':
       return 'icloud_hme'
     case 'DuckMail':
       return 'duckmail'
@@ -543,6 +640,164 @@ function getMailboxSectionProvider(title: string): string | null {
     default:
       return null
   }
+}
+
+const MAILBOX_QUICK_PROVIDERS = [
+  'luckmail',
+  'hme_ready_api',
+  'icloud_hme',
+  'applemail',
+  'tempmail_local',
+  'skymail',
+  'cloudmail',
+  'cfworker',
+  'manual_email_otp',
+]
+
+function getMailboxProviderLabel(provider: string): string {
+  return SELECT_FIELDS.mail_provider.find((item) => item.value === provider)?.label || provider
+}
+
+function getMailboxProviderBrief(provider: string): string {
+  switch (provider) {
+    case 'luckmail':
+      return '购买邮箱 / 已购邮箱，适合稳定批量注册。'
+    case 'hme_ready_api':
+      return 'auto-gpt 只调用 helper 的 prepare / wait-code / finalize；iCloud Cookie、alias 池和收件箱都留在 helper。'
+    case 'icloud_hme':
+      return 'auto-gpt 直接管理 iCloud Cookie / HME 别名池 / 共享收件箱，适合导入池、实时创建和别名治理。'
+    case 'applemail':
+      return '本地导入 Outlook/AppleMail 池，适合已有邮箱资产。'
+    case 'tempmail_local':
+      return '自建 TempMail Ready API，适合固定域名和随机子域。'
+    case 'skymail':
+      return 'CloudMail 兼容接口，适合 API 建箱和收件。'
+    case 'cloudmail':
+      return 'CloudMail genToken 口令模式，适合已有管理端。'
+    case 'cfworker':
+      return '自建 CF Worker 邮箱，适合多域名池。'
+    case 'manual_email_otp':
+      return '任务内填写邮箱并手输验证码，不走自动取件。'
+    default:
+      return '当前邮箱服务只展示相关配置，避免无关表单干扰。'
+  }
+}
+
+function applyMailboxQuickProvider(form: FormInstance, provider: string) {
+  if (provider === 'hme_ready_api') {
+    form.setFieldsValue({
+      mail_provider: 'hme_ready_api',
+      icloud_hme_mode: 'helper_ready_api',
+    })
+    return
+  }
+  if (provider === 'icloud_hme') {
+    const currentMode = form.getFieldValue('icloud_hme_mode')
+    form.setFieldsValue({
+      mail_provider: 'icloud_hme',
+      icloud_hme_mode: currentMode === 'helper_ready_api' ? 'import_pool' : (currentMode || 'import_pool'),
+    })
+    return
+  }
+  form.setFieldValue('mail_provider', provider)
+}
+
+function orderMailboxSections(sections: SectionConfig[], selectedProvider: string): SectionConfig[] {
+  const defaultSection = sections.find((section) => section.title === '默认邮箱服务')
+  const selectedProviderSections = sections.filter((section) => {
+    const provider = getMailboxSectionProvider(section.title)
+    return provider && provider === selectedProvider
+  })
+  const picked = new Set<string>()
+  const ordered = [defaultSection, ...selectedProviderSections].filter((section): section is SectionConfig => {
+    if (!section || picked.has(section.title)) return false
+    picked.add(section.title)
+    return true
+  })
+  return [...ordered, ...sections.filter((section) => !picked.has(section.title))]
+}
+
+function MailboxOverviewPanel({
+  form,
+  selectedProvider,
+  visibleSections,
+}: {
+  form: FormInstance
+  selectedProvider: string
+  visibleSections: SectionConfig[]
+}) {
+  const otpTimeout = Form.useWatch('mailbox_otp_timeout_seconds', form) || '90'
+  const icloudMode = Form.useWatch('icloud_hme_mode', form) || 'live'
+  const forwardTo = Form.useWatch('icloud_forward_to', form) || '-'
+  const helperApiUrl = Form.useWatch('icloud_hme_helper_api_url', form) || '-'
+  const providerLabel = getMailboxProviderLabel(selectedProvider)
+  const providerBrief = getMailboxProviderBrief(selectedProvider)
+  const configPanelCount = visibleSections.filter((section) => section.title !== '默认邮箱服务').length
+
+  return (
+    <Card size="small" style={{ marginBottom: 12 }}>
+      <Space direction="vertical" size={12} style={{ width: '100%' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
+          <div>
+            <Typography.Text strong>邮箱管理概览</Typography.Text>
+            <Typography.Text type="secondary" style={{ display: 'block', marginTop: 4 }}>
+              只展示当前邮箱服务相关配置；HME Ready API 和 iCloud HME 是两个独立方式。
+            </Typography.Text>
+          </div>
+          <Space size={6} wrap>
+            <Tag color="blue">当前：{providerLabel}</Tag>
+            {selectedProvider === 'hme_ready_api' ? <Tag color="green">Helper Ready</Tag> : null}
+            <Tag>OTP 等待 {otpTimeout} 秒</Tag>
+            <Tag>配置面板 {configPanelCount}</Tag>
+          </Space>
+        </div>
+
+        <div
+          style={{
+            padding: '10px 12px',
+            borderRadius: 10,
+            border: '1px solid rgba(99, 102, 241, 0.22)',
+            background: 'rgba(99, 102, 241, 0.08)',
+          }}
+        >
+          <Typography.Text>{providerBrief}</Typography.Text>
+          {selectedProvider === 'hme_ready_api' ? (
+            <Typography.Text type="secondary" style={{ display: 'block', marginTop: 4 }}>
+              Helper：{String(helperApiUrl)}，转发目标：{String(forwardTo)}
+            </Typography.Text>
+          ) : null}
+          {selectedProvider === 'icloud_hme' ? (
+            <Typography.Text type="secondary" style={{ display: 'block', marginTop: 4 }}>
+              当前 HME 模式：{getIcloudHmeModeLabel(String(icloudMode))}，转发目标：{String(forwardTo)}
+            </Typography.Text>
+          ) : null}
+        </div>
+
+        <Space size={[8, 8]} wrap>
+          {MAILBOX_QUICK_PROVIDERS.map((provider) => {
+            const checked = provider === selectedProvider
+            return (
+              <Tag.CheckableTag
+                key={provider}
+                checked={checked}
+                onChange={() => applyMailboxQuickProvider(form, provider)}
+                style={{
+                  border: `1px solid ${checked ? '#91caff' : 'rgba(122, 139, 163, 0.28)'}`,
+                  borderRadius: 999,
+                  padding: '4px 10px',
+                  marginInlineEnd: 0,
+                  background: checked ? 'rgba(99, 102, 241, 0.14)' : 'transparent',
+                  fontWeight: checked ? 600 : 500,
+                }}
+              >
+                {getMailboxProviderLabel(provider).split('（')[0]}
+              </Tag.CheckableTag>
+            )
+          })}
+        </Space>
+      </Space>
+    </Card>
+  )
 }
 
 interface TabConfig {
@@ -574,15 +829,58 @@ interface ICloudHmeAutoPoolStatus {
   interval_min_minutes?: number
   interval_max_minutes?: number
   rate_limit_backoff_minutes?: number
+  error_backoff_minutes?: number
   next_run_at?: string
   seconds_until_next_run?: number
   rate_limit_until?: string
   in_rate_limit_backoff?: boolean
+  error_backoff_until?: string
+  in_error_backoff?: boolean
+  consecutive_error_count?: number
+  last_backoff_reason?: string
   last_run_at?: string
   last_success_at?: string
   last_created_hme?: string
   last_error?: string
   forward_to?: string
+}
+
+interface ICloudHmeAutoDeleteStatus {
+  running?: boolean
+  enabled?: boolean
+  account_interval_min_minutes?: number
+  account_interval_max_minutes?: number
+  max_per_run?: number
+  rate_limit_backoff_minutes?: number
+  error_backoff_minutes?: number
+  recheck_before_delete?: boolean
+  pause_active_tasks?: boolean
+  dead_statuses?: string[]
+  pending_candidates?: number
+  candidate_summary?: Record<string, number>
+  next_run_at?: string
+  seconds_until_next_run?: number
+  rate_limit_until?: string
+  in_rate_limit_backoff?: boolean
+  error_backoff_until?: string
+  in_error_backoff?: boolean
+  consecutive_error_count?: number
+  last_backoff_reason?: string
+  last_run_at?: string
+  last_success_at?: string
+  last_error?: string
+  last_result?: Record<string, any>
+}
+
+
+interface ICloudHmeRecheckCampaignData {
+  campaign_id?: string
+  summary?: Record<string, any>
+  data?: any[]
+  total?: number
+  page?: number
+  size?: number
+  pages?: number
 }
 
 interface TempMailArchiveCleanupStatus {
@@ -717,6 +1015,24 @@ function formatDurationText(seconds: number | undefined): string {
   return `${totalSeconds}秒`
 }
 
+function StringListInput({ value, onChange, placeholder }: { value?: string, onChange?: (val: string) => void, placeholder?: string }) {
+  const arr = (value || '').split(',').map(e => e.trim()).filter(Boolean)
+  const handleChange = (newVals: string[]) => {
+    onChange?.(newVals.join(','))
+  }
+  return (
+    <Select
+      mode="tags"
+      value={arr}
+      onChange={handleChange}
+      placeholder={placeholder || '输入邮箱后按回车'}
+      style={{ width: '100%' }}
+      open={false}
+      tokenSeparators={[',', ' ', '\n']}
+    />
+  )
+}
+
 function ConfigField({ field }: { field: FieldConfig }) {
   const [showSecret, setShowSecret] = useState(false)
   const options = SELECT_FIELDS[field.key]
@@ -727,7 +1043,11 @@ function ConfigField({ field }: { field: FieldConfig }) {
       : field.key === 'icloud_cookie'
         ? '从浏览器打开 www.icloud.com，进入 DevTools，找到发往 setup.icloud.com 或 /hme/ 的请求，把完整 Cookie 请求头原样复制到这里。不要删任何字段。'
       : field.key === 'icloud_hme_mode'
-        ? '实时创建会直接调用 Apple 私有接口；仅导入池会只从本地已导入的 HME 别名池领取；优先导入池会先领池里的别名，没货再实时创建。'
+        ? '实时创建会直接调用 Apple 私有接口；仅导入池会只从本地已导入的 HME 别名池领取；优先导入池会先领池里的别名，没货再实时创建。HME Ready API 已拆成独立邮箱方式。'
+      : field.key === 'icloud_hme_helper_api_url'
+        ? 'auto-gpt 容器访问 helper 的内网地址；本机 Docker 推荐 http://host.docker.internal:18765 或宿主 Docker 网关地址。'
+      : field.key === 'icloud_hme_helper_internal_key'
+        ? '读取 helper 项目 .internal-api-key；只用于 auto-gpt 调用本地 Helper Ready API。'
       : field.key === 'icloud_hme_auto_create_enabled'
         ? '开启后后台会按随机时间间隔自动创建 1 个新 HME，并放入导入池；达到库存上限时暂停创建。'
       : field.key === 'icloud_hme_auto_create_stock_limit'
@@ -738,6 +1058,28 @@ function ConfigField({ field }: { field: FieldConfig }) {
         ? '必须大于或等于最小分钟；填写更大的范围可以降低固定节奏触发风控的概率。'
       : field.key === 'icloud_hme_auto_create_rate_limit_backoff_minutes'
         ? '如果 Apple 返回创建限流，后台会至少等待这么久后再尝试。'
+      : field.key === 'icloud_hme_auto_create_error_backoff_minutes'
+        ? '普通网络/API/解析错误会先短暂停再重试；连续普通错误会按该值递增，最多 15 分钟。填 0 可关闭普通错误短退避。'
+      : field.key === 'icloud_hme_auto_delete_enabled'
+        ? '开启后后台按随机间隔扫描候选（不在任何 ChatGPT 账号里的孤儿别名 + 绑定账号已失效的别名）。每个候选删除前都会先免密登录测活：能登录的视为存活、保留并重新导入账号列表，只删确认失效的。永不删待用库存与正在注册的别名。删除在 Apple 端 deactivate+delete，不可恢复。'
+      : field.key === 'icloud_hme_auto_delete_recheck_before_delete'
+        ? '开启（强烈推荐）：每个待删邮箱删除前都先免密登录测活——能登录=账号还活着→保留并重新导入；提示账号不存在/已停用=确认失效→才删；网络/限流等临时失败→本轮跳过。关闭则不测活、直接信任本地状态删除（快但激进，可能误删本地没记录但其实还活着的账号）。'
+      : field.key === 'icloud_hme_auto_delete_account_interval_min_minutes'
+        ? '每个候选邮箱/账号处理完成后，会在最小和最大分钟之间随机等待，再处理下一个候选。'
+      : field.key === 'icloud_hme_auto_delete_account_interval_max_minutes'
+        ? '必须大于或等于最小分钟；例如 10-30 表示每个账号之间随机等待 10 到 30 分钟。'
+      : field.key === 'icloud_hme_auto_delete_max_per_run'
+        ? '每轮最多删除的别名数量，避免一次删太多触发风控；超出的留到下一轮。'
+      : field.key === 'icloud_hme_auto_delete_rate_limit_backoff_minutes'
+        ? '如果删除时 Apple 返回限流，后台会至少等待这么久后再继续。'
+      : field.key === 'icloud_hme_auto_delete_error_backoff_minutes'
+        ? '删除或删前测活遇到普通临时错误时短暂停，不当作限流；连续普通错误会按该值递增，最多 15 分钟。填 0 可关闭。'
+      : field.key === 'icloud_hme_auto_delete_pause_active_tasks'
+        ? '开启后，有注册等任务在跑时本轮删除会自动跳过，避免误删正在使用的别名。'
+      : field.key === 'icloud_hme_auto_delete_dead_statuses'
+        ? '逗号分隔；只有失效测活结论命中这些代码时才会删除绑定的别名。默认 account_deactivated（账号被删/停用）、password_invalid（密码失效）。network_failed 等临时失败不会被删。'
+      : field.key === 'chatgpt_access_token_only_gopay_provider_link_enabled'
+        ? '开启后，无 RT 注册/登录成功并生成 Plus checkout 后，会继续走到 GoPay/Midtrans 平台链接阶段并把链接保存到账号 extra；失败不会让已注册账号丢失。'
       : field.key === 'tempmail_archive_cleanup_enabled'
         ? '开启后后台会定时扫描共享 TempMail 收件箱，先写入本地备份库，再删除超过保留窗口的旧邮件。'
       : field.key === 'tempmail_archive_cleanup_interval_minutes'
@@ -747,13 +1089,23 @@ function ConfigField({ field }: { field: FieldConfig }) {
       : field.key === 'tempmail_archive_cleanup_threshold'
         ? '收件箱邮件数达到该数量才触发自动清理；手动执行会绕过这个阈值。'
       : field.key === 'tempmail_archive_cleanup_pause_active_tasks'
-        ? '开启后只要后台还有注册、补抓、号码测试等活跃任务，归档清理会先跳过。'
+        ? '开启后只要后台还有注册、补抓、手机号绑定等活跃任务，归档清理会先跳过。'
       : field.key === 'tempmail_archive_cleanup_mailbox'
         ? '通常填写 iCloud HME 的转发目标邮箱；留空时后端默认使用当前转发目标。'
       : field.key === 'tempmail_archive_cleanup_backup_path'
         ? 'SQLite 备份库路径；容器内推荐 /runtime/tempmail_email_backups.db，可随运行数据持久化。'
       : field.key === 'chatgpt_resume_auth_allow_phone_verification'
-        ? '这是补抓 Auth 接码的唯一开关。关闭时补抓遇到 add_phone 只记录为需要手机号；开启后才会调用下面配置的接码渠道。'
+        ? '兼容旧任务参数；新逻辑优先看下面两个补抓开关。旧开关开启时，未单独配置 add_phone 开关会继承为允许。'
+      : field.key === 'chatgpt_resume_auth_allow_add_phone_verification'
+        ? '控制补抓 Auth 遇到 add_phone/未接码账号时，是否允许从接码服务取新号并绑定。关闭时不会消耗新手机号。'
+      : field.key === 'chatgpt_resume_auth_allow_existing_phone_verification'
+        ? '控制补抓 Auth 遇到已绑定手机号二次验证时，是否读取完整手机号并到手机号池精确匹配后自动接码；日志会展示手机号。'
+      : field.key === 'chatgpt_recheck_allow_existing_phone_verification'
+        ? '控制邮箱测活/失效测活遇到已绑手机号二次验证时，是否用手机号池里的同一完整号码自动收码。'
+      : field.key === 'existing_phone_otp_timeout_seconds'
+        ? '已绑定手机号二次验证专用等待时间；完整号码必须命中手机号池且有 API URL 才会进入等待。'
+      : field.key === 'existing_phone_otp_max_resend_attempts'
+        ? '已绑定手机号二次验证未收到短信时触发 OpenAI 重发的次数；不同于 add_phone 新绑的同号重发配置。'
       : field.key === 'chatgpt_subscription_auth_capture_retry_delays_seconds'
         ? '用英文逗号分隔，例如 5,10；遇到 add_phone 或临时认证错误时按这些间隔重试。'
       : field.key === 'chatgpt_phone_verification_provider'
@@ -790,6 +1142,8 @@ function ConfigField({ field }: { field: FieldConfig }) {
           }}
           iconRender={(visible) => (visible ? <EyeOutlined /> : <EyeInvisibleOutlined />)}
         />
+      ) : field.type === 'stringList' ? (
+        <StringListInput placeholder={field.placeholder} />
       ) : field.type === 'textarea' ? (
         <Input.TextArea rows={6} placeholder={field.placeholder} />
       ) : (
@@ -1532,7 +1886,7 @@ function ContributionPanel({
           message="开启贡献模式后，注册成功账号将只上传到贡献服务器"
           description={(
             <>
-              <div>CPA / CodexProxy / Sub2API 自动上传会被停用，避免重复上报。</div>
+              <div>CPA / CodexProxy / Sub2API / OAIPay 自动上传会被停用，避免重复上报。</div>
               <div>目前该功能在xem中转站测试中 有兴趣可以进群了解</div>
               <div>中转站https://ai.xem8k5.top/ 群号634758974</div>
             </>
@@ -1716,6 +2070,7 @@ function ICloudHmeManagerSection({ form }: { form: any }) {
   const [loading, setLoading] = useState(false)
   const [bulkEnabling, setBulkEnabling] = useState(false)
   const [bulkDisablingUsed, setBulkDisablingUsed] = useState(false)
+  const [syncPruning, setSyncPruning] = useState(false)
   const [switchingMode, setSwitchingMode] = useState(false)
   const [togglingId, setTogglingId] = useState('')
   const [aliases, setAliases] = useState<any[]>([])
@@ -1726,6 +2081,16 @@ function ICloudHmeManagerSection({ form }: { form: any }) {
   const [archiveStatus, setArchiveStatus] = useState<TempMailArchiveCleanupStatus | null>(null)
   const [archiveStatusLoading, setArchiveStatusLoading] = useState(false)
   const [archiveRunning, setArchiveRunning] = useState(false)
+  const [autoDeleteStatus, setAutoDeleteStatus] = useState<ICloudHmeAutoDeleteStatus | null>(null)
+  const [autoDeleteStatusLoading, setAutoDeleteStatusLoading] = useState(false)
+  const [autoDeleteRunning, setAutoDeleteRunning] = useState(false)
+  const [recheckCampaign, setRecheckCampaign] = useState<ICloudHmeRecheckCampaignData | null>(null)
+  const [recheckLoading, setRecheckLoading] = useState(false)
+  const [rerunResetting, setRerunResetting] = useState(false)
+  const [recheckStatusFilter, setRecheckStatusFilter] = useState('')
+  const [previewLoading, setPreviewLoading] = useState(false)
+  const [previewOpen, setPreviewOpen] = useState(false)
+  const [previewData, setPreviewData] = useState<any | null>(null)
   const [onlyReadyView, setOnlyReadyView] = useState(false)
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = useState(20)
@@ -1755,6 +2120,35 @@ function ICloudHmeManagerSection({ form }: { form: any }) {
       setArchiveStatus(null)
     } finally {
       setArchiveStatusLoading(false)
+    }
+  }
+
+  const loadAutoDeleteStatus = async () => {
+    setAutoDeleteStatusLoading(true)
+    try {
+      const data = await apiFetch('/icloud-hme/auto-delete/status')
+      setAutoDeleteStatus(data || null)
+    } catch {
+      setAutoDeleteStatus(null)
+    } finally {
+      setAutoDeleteStatusLoading(false)
+    }
+  }
+
+  const loadRecheckCampaign = async (campaignId = recheckCampaign?.campaign_id || '', statusValue = recheckStatusFilter) => {
+    setRecheckLoading(true)
+    try {
+      const path = campaignId
+        ? `/icloud-hme/recheck/campaigns/${encodeURIComponent(String(campaignId))}`
+        : '/icloud-hme/recheck/current'
+      const params = new URLSearchParams({ page: '1', size: '8' })
+      if (statusValue) params.set('status', statusValue)
+      const data = await apiFetch(`${path}?${params.toString()}`)
+      setRecheckCampaign(data || null)
+    } catch {
+      setRecheckCampaign(null)
+    } finally {
+      setRecheckLoading(false)
     }
   }
 
@@ -1794,6 +2188,7 @@ function ICloudHmeManagerSection({ form }: { form: any }) {
       setPageSize(Number(data?.size || nextPageSize) || nextPageSize)
       loadAutoPoolStatus().catch(() => {})
       loadArchiveStatus().catch(() => {})
+      loadAutoDeleteStatus().catch(() => {})
     } catch (e: any) {
       message.error(e?.message || '读取 iCloud HME 别名失败')
     } finally {
@@ -1805,6 +2200,8 @@ function ICloudHmeManagerSection({ form }: { form: any }) {
     loadAliases().catch(() => {})
     loadAutoPoolStatus().catch(() => {})
     loadArchiveStatus().catch(() => {})
+    loadAutoDeleteStatus().catch(() => {})
+    loadRecheckCampaign().catch(() => {})
   }, [])
 
   const runArchiveCleanup = async () => {
@@ -1838,7 +2235,121 @@ function ICloudHmeManagerSection({ form }: { form: any }) {
     }
   }
 
-  const syncLiveAliases = async () => {
+  const previewDeletion = async () => {
+    setPreviewLoading(true)
+    try {
+      const data = await apiFetch('/icloud-hme/deletion-preview')
+      setPreviewData(data || null)
+      setPreviewOpen(true)
+    } catch (e: any) {
+      message.error(e?.message || '扫描未使用别名失败')
+    } finally {
+      setPreviewLoading(false)
+    }
+  }
+
+  const resetAliasesForRerun = async () => {
+    const values = form.getFieldsValue(true)
+    const forwardTo = String(values.icloud_forward_to || 'b@cccy.me').trim() || 'b@cccy.me'
+    setRerunResetting(true)
+    try {
+      const result = await apiFetch('/icloud-hme/aliases/reset-rerun', {
+        method: 'POST',
+        body: JSON.stringify({
+          forward_to: forwardTo,
+          purpose: 'chatgpt_register',
+          bound_service: 'chatgpt',
+          include_in_flight: false,
+          include_ready_stock: false,
+          reset_existing_queue: true,
+          dry_run: false,
+        }),
+      })
+      const campaignId = String(result?.campaign_id || '').trim()
+      setRecheckCampaign({
+        campaign_id: campaignId,
+        summary: result?.summary || {},
+        data: [],
+        total: Number(result?.summary?.total || 0),
+      })
+      message.success(`已重置到导入池：${Number(result?.reset || 0)} 个，创建进度批次 ${campaignId || '-'}`)
+      await loadAliases(1, pageSize)
+      await loadRecheckCampaign(campaignId)
+    } catch (e: any) {
+      message.error(e?.message || '重置 HME 到导入池失败')
+    } finally {
+      setRerunResetting(false)
+    }
+  }
+
+  const confirmResetAliasesForRerun = () => {
+    Modal.confirm({
+      title: '重置已领取 HME 到导入池',
+      content: (
+        <div>
+          <div>会把当前转发邮箱下已领取/已使用的 HME 本地恢复为可领取库存。</div>
+          <div style={{ marginTop: 8 }}>重置后请到注册面板继续选择「iCloud HME」和「仅导入池」，分批重新跑。</div>
+          <div style={{ color: '#cf1322', marginTop: 8 }}>
+            本动作只改本地状态，不调用 Apple 停用/删除，也不删除 ChatGPT 账号。明确 account_deleted/account_deactivated 后只会标记待删除。
+          </div>
+        </div>
+      ),
+      okText: '确认重置',
+      cancelText: '取消',
+      onOk: resetAliasesForRerun,
+    })
+  }
+
+  const executeAutoDelete = async () => {
+    setAutoDeleteRunning(true)
+    try {
+      const result = await apiFetch('/icloud-hme/auto-delete/run', {
+        method: 'POST',
+        body: JSON.stringify({ force: true, ignore_active_tasks: false, delete: true }),
+      })
+      if (result?.reason === 'active_tasks') {
+        message.warning(`当前有 ${Number(result?.active_task_count || 0)} 个活跃任务，已跳过删除`)
+      } else if (result?.reason === 'rate_limit_backoff') {
+        message.warning('当前处于限流退避中，已跳过本轮删除')
+      } else if (result?.reason === 'disabled') {
+        message.warning('自动删除未开启（手动执行已被拦截）')
+      } else if (result?.ok) {
+        message.success(`删除完成：测活 ${Number(result?.rechecked || 0)} 个，存活保留 ${Number(result?.kept_alive || 0)} 个，删除 ${Number(result?.deleted || 0)} 个，跳过 ${Number(result?.skipped || 0)} 个`)
+      } else {
+        message.warning(result?.error || `删除已执行：删除 ${Number(result?.deleted || 0)} 个，存在未完成项`)
+      }
+      setPreviewOpen(false)
+      await loadAutoDeleteStatus()
+      await loadAliases()
+    } catch (e: any) {
+      message.error(e?.message || '删除执行失败')
+    } finally {
+      setAutoDeleteRunning(false)
+    }
+  }
+
+  const runAutoDelete = async () => {
+    const summary = autoDeleteStatus?.candidate_summary || {}
+    const orphan = Number(summary.orphan || 0) || 0
+    const boundInvalid = Number(summary.bound_invalid || 0) || 0
+    Modal.confirm({
+      title: '立即删除未使用/失效别名',
+      content: (
+        <div>
+          <div>候选：孤儿别名 {orphan} 个、失效绑定 {boundInvalid} 个。每个删除前都会先免密登录测活：能登录的视为存活、保留并重新导入账号列表，只删确认失效的。</div>
+          <div style={{ color: '#cf1322', marginTop: 8 }}>
+            删除会在 Apple 端 deactivate + delete，不可恢复；测活是真实登录、较慢，受单次上限限制，超出的留到下一轮。
+          </div>
+        </div>
+      ),
+      okText: '确认删除',
+      okButtonProps: { danger: true },
+      cancelText: '取消',
+      onOk: executeAutoDelete,
+    })
+  }
+
+  const syncLiveAliases = async (pruneMissing = false) => {
     const values = form.getFieldsValue(true)
     const payload = {
       icloud_cookie: String(values.icloud_cookie || '').trim(),
@@ -1846,6 +2357,8 @@ function ICloudHmeManagerSection({ form }: { form: any }) {
       forward_to: String(values.icloud_forward_to || 'b@cccy.me').trim() || 'b@cccy.me',
       purpose: 'chatgpt_register',
       bound_service: 'chatgpt',
+      prune_missing: pruneMissing,
+      dry_run: false,
     }
     if (!payload.icloud_cookie) {
       message.error('请先填写 iCloud Cookie')
@@ -1857,13 +2370,45 @@ function ICloudHmeManagerSection({ form }: { form: any }) {
         method: 'POST',
         body: JSON.stringify(payload),
       })
-      message.success(`同步完成：${Number(result?.synced_count || 0)} 条`)
+      const pruned = Number(result?.prune?.deleted || 0)
+      const inserted = Number(result?.result?.inserted || 0)
+      const updated = Number(result?.result?.updated || 0)
+      message.success(
+        pruneMissing
+          ? `同步完成：官网 ${Number(result?.synced_count || 0)} 条，新增 ${inserted}，更新 ${updated}，清理本地多余 ${pruned} 条`
+          : `同步完成：${Number(result?.synced_count || 0)} 条`
+      )
       await loadAliases(1, pageSize)
     } catch (e: any) {
       message.error(e?.message || '同步 iCloud 官网别名失败')
     } finally {
       setSyncing(false)
     }
+  }
+
+  const syncLiveAliasesAndPrune = () => {
+    Modal.confirm({
+      title: '同步并清理本地多余别名',
+      content: (
+        <div>
+          <div>将先读取 iCloud 官网当前 HME 别名列表，然后删除本地别名池中“官网已不存在”的记录。</div>
+          <div style={{ color: '#cf1322', marginTop: 8 }}>
+            只清理本地 iCloud HME 别名池，不删除 ChatGPT 账号，也不会调用 Apple 端 delete。
+          </div>
+        </div>
+      ),
+      okText: '同步并清理',
+      okButtonProps: { danger: true },
+      cancelText: '取消',
+      onOk: async () => {
+        setSyncPruning(true)
+        try {
+          await syncLiveAliases(true)
+        } finally {
+          setSyncPruning(false)
+        }
+      },
+    })
   }
 
   const bulkEnableAvailableAliases = async () => {
@@ -1880,7 +2425,7 @@ function ICloudHmeManagerSection({ form }: { form: any }) {
         }),
       })
       message.success(
-        `批量启用完成：命中 ${Number(result?.matched || 0)} 条，新启用 ${Number(result?.enabled || 0)} 条，恢复失败 ${Number(result?.recycled || 0)} 条`
+        `批量启用完成：命中 ${Number(result?.matched || 0)} 条，新启用 ${Number(result?.enabled || 0)} 条，恢复普通失败 ${Number(result?.recycled || 0)} 条；账号已禁用/死号不会回收`
       )
       await loadAliases(page, pageSize)
     } catch (e: any) {
@@ -2005,12 +2550,38 @@ function ICloudHmeManagerSection({ form }: { form: any }) {
     {
       title: '使用状态',
       key: 'used',
-      width: 140,
-      render: (_: any, item: any) => (
-        <Tag color={item.used_by_system ? 'orange' : 'green'}>
-          {item.used_by_system ? '系统已使用' : '系统未使用'}
-        </Tag>
-      ),
+      width: 170,
+      render: (_: any, item: any) => {
+        if (item.account_disabled || String(item.status || '') === 'account_deactivated' || String(item.status || '') === 'account_disabled') {
+          return <Tag color="red">账号已禁用/死号</Tag>
+        }
+        return (
+          <Tag color={item.used_by_system ? 'orange' : 'green'}>
+            {item.used_by_system ? '系统已使用' : '系统未使用'}
+          </Tag>
+        )
+      },
+    },
+    {
+      title: '池状态',
+      key: 'status',
+      width: 150,
+      render: (_: any, item: any) => {
+        const status = String(item.status || '-')
+        const color = status === 'account_deactivated' || status === 'account_disabled'
+          ? 'red'
+          : status === 'registered'
+            ? 'green'
+            : status === 'register_failed'
+              ? 'orange'
+              : status === 'in_use'
+                ? 'blue'
+                : status === 'retired'
+                  ? 'default'
+                  : 'cyan'
+        const label = status === 'account_deactivated' || status === 'account_disabled' ? '账号已禁用' : status
+        return <Tag color={color}>{label}</Tag>
+      },
     },
     {
       title: '绑定账号',
@@ -2043,6 +2614,8 @@ function ICloudHmeManagerSection({ form }: { form: any }) {
             checked={Boolean(item.enabled)}
             checkedChildren="启用"
             unCheckedChildren="停用"
+            disabled={Boolean(item.account_disabled) || String(item.status || '') === 'account_deactivated' || String(item.status || '') === 'account_disabled'}
+            title={Boolean(item.account_disabled) ? '账号已禁用/死号，不允许重新启用到邮箱池' : undefined}
             loading={togglingId === String(item.anonymous_id || '')}
             onChange={(checked) => toggleAliasEnabled(String(item.anonymous_id || ''), checked)}
           />
@@ -2059,6 +2632,20 @@ function ICloudHmeManagerSection({ form }: { form: any }) {
   const archiveArchivedCount = Number(archiveLastResult.archived || 0) || 0
   const archiveDeletedCount = Number(archiveLastResult.deleted || 0) || 0
   const archiveActiveTaskCount = Number(archiveStatus?.active_task_count || archiveLastResult.active_task_count || 0) || 0
+  const autoDeleteSummary = autoDeleteStatus?.candidate_summary || {}
+  const autoDeletePending = Number(autoDeleteStatus?.pending_candidates || 0) || 0
+  const autoDeleteLastResult = autoDeleteStatus?.last_result || {}
+  const autoDeleteLastDeleted = Number(autoDeleteLastResult.deleted || 0) || 0
+  const autoDeleteLastKept = Number(autoDeleteLastResult.kept_alive || 0) || 0
+  const recheckSummary = recheckCampaign?.summary || {}
+  const recheckCampaignId = String(recheckCampaign?.campaign_id || '').trim()
+  const recheckTotal = Number(recheckSummary.total || 0) || 0
+  const recheckChecked = Number(recheckSummary.checked || 0) || 0
+  const recheckPending = Number(recheckSummary.pending || 0) || 0
+  const recheckRetry = Number(recheckSummary.retry || 0) || 0
+  const recheckAlive = Number(recheckSummary.alive || 0) || 0
+  const recheckDeleteCandidates = Number(recheckSummary.delete_candidates || recheckSummary.delete_candidate || 0) || 0
+  const recheckAccessTokenSaved = Number(recheckSummary.access_token_saved || 0) || 0
 
   return (
     <Card
@@ -2076,7 +2663,10 @@ function ICloudHmeManagerSection({ form }: { form: any }) {
           <Button loading={bulkEnabling} onClick={bulkEnableAvailableAliases}>
             批量启用可用官网别名
           </Button>
-          <Button icon={<SyncOutlined />} loading={syncing || loading} onClick={syncLiveAliases}>
+          <Button danger loading={syncPruning} onClick={syncLiveAliasesAndPrune}>
+            同步并清理多余
+          </Button>
+          <Button icon={<SyncOutlined />} loading={(syncing || loading) && !syncPruning} onClick={() => syncLiveAliases(false)}>
             同步官网别名
           </Button>
         </Space>
@@ -2110,6 +2700,9 @@ function ICloudHmeManagerSection({ form }: { form: any }) {
             <Tag color={autoPoolStatus?.in_rate_limit_backoff ? 'red' : 'cyan'}>
               {autoPoolStatus?.in_rate_limit_backoff ? '限流等待中' : '未限流'}
             </Tag>
+            <Tag color={autoPoolStatus?.in_error_backoff ? 'orange' : 'cyan'}>
+              {autoPoolStatus?.in_error_backoff ? '错误短退避中' : '无错误退避'}
+            </Tag>
             <Tag color={statusStockLimit > 0 && statusReadyCount >= statusStockLimit ? 'gold' : 'green'}>
               库存: {statusReadyCount}/{statusStockLimit || '-'}
             </Tag>
@@ -2132,12 +2725,125 @@ function ICloudHmeManagerSection({ form }: { form: any }) {
             限流延长: {autoPoolStatus?.rate_limit_backoff_minutes || '-'} 分钟
           </Typography.Text>
           <Typography.Text type="secondary">
+            错误短退避: {autoPoolStatus?.error_backoff_minutes ?? '-'} 分钟
+          </Typography.Text>
+          <Typography.Text type="secondary">
+            退避到: {formatDateTimeText(autoPoolStatus?.rate_limit_until || autoPoolStatus?.error_backoff_until)}
+          </Typography.Text>
+          <Typography.Text type="secondary">
             最近创建: {autoPoolStatus?.last_created_hme || '-'}
           </Typography.Text>
           <Typography.Text type={autoPoolStatus?.last_error ? 'danger' : 'secondary'}>
             最近错误: {autoPoolStatus?.last_error || '-'}
           </Typography.Text>
         </Space>
+      </div>
+      <div
+        style={{
+          marginBottom: 16,
+          padding: 12,
+          border: '1px solid rgba(114, 46, 209, 0.22)',
+          borderRadius: 8,
+          background: 'rgba(114, 46, 209, 0.04)',
+        }}
+      >
+        <Space wrap size={[8, 8]} style={{ width: '100%', justifyContent: 'space-between' }}>
+          <Space wrap>
+            <Tag color={recheckCampaignId ? 'purple' : 'default'}>
+              重跑批次: {recheckCampaignId || '未创建'}
+            </Tag>
+            <Tag color="blue">总数: {recheckTotal || '-'}</Tag>
+            <Tag color={recheckPending > 0 ? 'gold' : 'green'}>未跑: {recheckPending}</Tag>
+            <Tag color="green">存活: {recheckAlive}</Tag>
+            <Tag color={recheckDeleteCandidates > 0 ? 'volcano' : 'default'}>
+              待删除标记: {recheckDeleteCandidates}
+            </Tag>
+            <Tag color={recheckRetry > 0 ? 'orange' : 'default'}>待重试: {recheckRetry}</Tag>
+            <Tag color="cyan">AT保存: {recheckAccessTokenSaved}</Tag>
+          </Space>
+          <Space wrap>
+            <Button size="small" loading={recheckLoading} onClick={() => loadRecheckCampaign()}>
+              刷新进度
+            </Button>
+            <Button size="small" loading={rerunResetting} onClick={confirmResetAliasesForRerun}>
+              重置已领取到导入池
+            </Button>
+          </Space>
+        </Space>
+        <Alert
+          type="info"
+          showIcon
+          style={{ marginTop: 10, marginBottom: 10 }}
+          message="重置后走原注册面板分批重跑"
+          description="这里显示重跑进度；先把已领取 HME 重置回导入池，然后到注册面板选择「iCloud HME」并使用「仅导入池」模式分批跑。存活账号会重新保存 access_token；明确 account_deleted/account_deactivated 只标记待删除，真正 Apple 停用/删除仍走下面原来的自动删除模块。"
+        />
+        <Space wrap size={[12, 8]}>
+          <Typography.Text type="secondary">
+            已跑: {recheckChecked}/{recheckTotal || 0}
+          </Typography.Text>
+          <Typography.Text type="secondary">
+            继续分批重跑请使用注册面板：邮箱服务 iCloud HME，模式仅导入池。
+          </Typography.Text>
+        </Space>
+        <Space wrap style={{ marginTop: 10, marginBottom: 8 }}>
+          <Select
+            allowClear
+            size="small"
+            placeholder="重跑状态"
+            style={{ width: 150 }}
+            value={recheckStatusFilter || undefined}
+            onChange={(value) => {
+              const nextValue = String(value || '')
+              setRecheckStatusFilter(nextValue)
+              loadRecheckCampaign(recheckCampaignId, nextValue).catch(() => {})
+            }}
+            options={[
+              { label: 'pending', value: 'pending' },
+              { label: 'running', value: 'running' },
+              { label: 'alive', value: 'alive' },
+              { label: 'delete_candidate', value: 'delete_candidate' },
+              { label: 'retry', value: 'retry' },
+              { label: 'dead_kept', value: 'dead_kept' },
+              { label: 'skipped', value: 'skipped' },
+            ]}
+          />
+        </Space>
+        <Table
+          size="small"
+          rowKey={(r: any) => String(r.id || r.anonymous_id || r.hme)}
+          loading={recheckLoading}
+          pagination={false}
+          dataSource={Array.isArray(recheckCampaign?.data) ? recheckCampaign.data : []}
+          columns={[
+            {
+              title: '邮箱',
+              dataIndex: 'hme',
+              key: 'hme',
+              render: (v: string) => <Typography.Text copyable style={{ fontFamily: 'monospace' }}>{v}</Typography.Text>,
+            },
+            {
+              title: '状态',
+              dataIndex: 'status',
+              key: 'status',
+              width: 130,
+              render: (v: string) => {
+                const value = String(v || '')
+                const color = value === 'alive' ? 'green' : value === 'delete_candidate' ? 'volcano' : value === 'retry' ? 'orange' : 'default'
+                return <Tag color={color}>{value || '-'}</Tag>
+              },
+            },
+            { title: '结果', dataIndex: 'result_code', key: 'result_code', width: 150, render: (v: string) => v || '-' },
+            {
+              title: '待删除',
+              dataIndex: 'delete_candidate',
+              key: 'delete_candidate',
+              width: 90,
+              render: (v: boolean) => <Tag color={v ? 'volcano' : 'default'}>{v ? '是' : '否'}</Tag>,
+            },
+            { title: '保存账号', dataIndex: 'saved_account_id', key: 'saved_account_id', width: 100, render: (v: number) => v || '-' },
+            { title: '重跑时间', dataIndex: 'checked_at', key: 'checked_at', width: 180, render: (v: string) => formatDateTimeText(v) },
+          ]}
+        />
       </div>
       <div
         style={{
@@ -2196,6 +2902,142 @@ function ICloudHmeManagerSection({ form }: { form: any }) {
           </Typography.Text>
         </Space>
       </div>
+      <div
+        style={{
+          marginBottom: 16,
+          padding: 12,
+          border: '1px solid rgba(245, 34, 45, 0.20)',
+          borderRadius: 8,
+          background: 'rgba(245, 34, 45, 0.04)',
+        }}
+      >
+        <Space wrap size={[8, 8]} style={{ width: '100%', justifyContent: 'space-between' }}>
+          <Space wrap>
+            <Tag color={autoDeleteStatus?.enabled ? 'green' : 'default'}>
+              自动删除: {autoDeleteStatus?.enabled ? '开启' : '关闭'}
+            </Tag>
+            <Tag color={autoDeleteStatus?.running ? 'blue' : 'default'}>
+              调度线程: {autoDeleteStatus?.running ? '运行中' : '未运行'}
+            </Tag>
+            <Tag color={autoDeleteStatus?.in_rate_limit_backoff ? 'red' : 'cyan'}>
+              {autoDeleteStatus?.in_rate_limit_backoff ? '限流等待中' : '未限流'}
+            </Tag>
+            <Tag color={autoDeleteStatus?.recheck_before_delete ? 'geekblue' : 'default'}>
+              删前测活: {autoDeleteStatus?.recheck_before_delete ? '是' : '否'}
+            </Tag>
+            <Tag color={autoDeletePending > 0 ? 'volcano' : 'green'}>
+              待测候选: {autoDeletePending}（孤儿 {Number(autoDeleteSummary.orphan || 0)} / 失效绑定 {Number(autoDeleteSummary.bound_invalid || 0)}）
+            </Tag>
+            <Tag color={autoDeleteStatus?.in_rate_limit_backoff ? 'red' : 'cyan'}>
+              {autoDeleteStatus?.in_rate_limit_backoff ? '限流等待中' : '未限流'}
+            </Tag>
+            <Tag color={autoDeleteStatus?.in_error_backoff ? 'orange' : 'cyan'}>
+              {autoDeleteStatus?.in_error_backoff ? '错误短退避中' : '无错误退避'}
+            </Tag>
+          </Space>
+          <Space wrap>
+            <Button size="small" loading={autoDeleteStatusLoading} onClick={() => loadAutoDeleteStatus()}>
+              刷新删除状态
+            </Button>
+            <Button size="small" loading={previewLoading} onClick={previewDeletion}>
+              扫描预览
+            </Button>
+            <Button size="small" danger type="primary" loading={autoDeleteRunning} onClick={runAutoDelete}>
+              立即删除
+            </Button>
+          </Space>
+        </Space>
+        <Space wrap size={[16, 6]} style={{ marginTop: 8 }}>
+          <Typography.Text type="secondary">
+            单次上限: {autoDeleteStatus?.max_per_run || '-'}
+          </Typography.Text>
+          <Typography.Text type="secondary">
+            账号间隔: {autoDeleteStatus?.account_interval_min_minutes ?? '-'} - {autoDeleteStatus?.account_interval_max_minutes ?? '-'} 分钟
+          </Typography.Text>
+          <Typography.Text type="secondary">
+            限流延长: {autoDeleteStatus?.rate_limit_backoff_minutes || '-'} 分钟
+          </Typography.Text>
+          <Typography.Text type="secondary">
+            错误短退避: {autoDeleteStatus?.error_backoff_minutes ?? '-'} 分钟
+          </Typography.Text>
+          <Typography.Text type="secondary">
+            退避到: {formatDateTimeText(autoDeleteStatus?.rate_limit_until || autoDeleteStatus?.error_backoff_until)}
+          </Typography.Text>
+          <Typography.Text type="secondary">
+            上轮删除: {autoDeleteLastDeleted}
+          </Typography.Text>
+          <Typography.Text type="secondary">
+            上轮存活保留: {autoDeleteLastKept}
+          </Typography.Text>
+          <Typography.Text type={autoDeleteStatus?.last_error ? 'danger' : 'secondary'}>
+            最近错误: {autoDeleteStatus?.last_error || '-'}
+          </Typography.Text>
+        </Space>
+      </div>
+      <Modal
+        open={previewOpen}
+        title="未使用/失效别名预览"
+        width={760}
+        onCancel={() => setPreviewOpen(false)}
+        footer={(
+          <Space>
+            <Button onClick={() => setPreviewOpen(false)}>关闭</Button>
+            <Button danger type="primary" loading={autoDeleteRunning} onClick={executeAutoDelete}>
+              立即删除
+            </Button>
+          </Space>
+        )}
+      >
+        {previewData ? (
+          <div>
+            <Space wrap style={{ marginBottom: 12 }}>
+              <Tag color="volcano">孤儿(不在账号里): {(previewData.orphan || []).length}</Tag>
+              <Tag color="orange">失效绑定(需测活): {(previewData.bound_invalid || []).length}</Tag>
+              <Tag color="green">受保护: {Number(previewData.protected_count || 0)}</Tag>
+              <Tag color="blue">别名总数: {Number(previewData.total || 0)}</Tag>
+            </Space>
+            <Alert
+              type="warning"
+              showIcon
+              style={{ marginBottom: 12 }}
+              message="所有候选删除前都会先免密登录测活：能登录的视为存活、保留并重新导入账号列表；只删确认失效（账号被删/停用）的。删除不可恢复，受单次上限限制。"
+            />
+            <Table
+              size="small"
+              rowKey={(r: any) => String(r.anonymous_id || r.hme)}
+              pagination={{ pageSize: 8 }}
+              dataSource={[...(previewData.orphan || []), ...(previewData.bound_invalid || [])]}
+              columns={[
+                {
+                  title: '邮箱',
+                  dataIndex: 'hme',
+                  key: 'hme',
+                  render: (v: string) => (
+                    <Typography.Text copyable style={{ fontFamily: 'monospace' }}>{v}</Typography.Text>
+                  ),
+                },
+                {
+                  title: '类型',
+                  dataIndex: 'disposition',
+                  key: 'disposition',
+                  width: 110,
+                  render: (v: string) =>
+                    v === 'orphan' ? <Tag color="volcano">孤儿</Tag> : <Tag color="orange">失效绑定</Tag>,
+                },
+                { title: '别名状态', dataIndex: 'status', key: 'status', width: 100 },
+                {
+                  title: '绑定账号',
+                  dataIndex: 'bound_account_email',
+                  key: 'bound_account_email',
+                  render: (v: string) => v || '-',
+                },
+              ]}
+            />
+          </div>
+        ) : (
+          <Typography.Text type="secondary">暂无数据</Typography.Text>
+        )}
+      </Modal>
       <Space wrap style={{ marginBottom: 12 }}>
         <Tag color="green">导入池可用账号: {availableImportPoolCount}</Tag>
         <Typography.Text type="secondary">
@@ -2229,6 +3071,7 @@ function ICloudHmeManagerSection({ form }: { form: any }) {
             { label: 'in_use', value: 'in_use' },
             { label: 'registered', value: 'registered' },
             { label: 'register_failed', value: 'register_failed' },
+            { label: '账号已禁用/死号', value: 'account_deactivated' },
             { label: 'retired', value: 'retired' },
           ]}
         />
@@ -2547,11 +3390,19 @@ function SecurityPanel() {
 
 export default function Settings() {
   const [form] = Form.useForm()
+  const screens = Grid.useBreakpoint()
   const [saving, setSaving] = useState(false)
   const [saved, setSaved] = useState(false)
+  const [configLoaded, setConfigLoaded] = useState(false)
+  const [configLoadError, setConfigLoadError] = useState('')
   const [activeTab, setActiveTab] = useState('register')
+  const [chatgptPinEditorOpen, setChatgptPinEditorOpen] = useState(false)
   const [chatgptPinnedSections, setChatgptPinnedSections] = useState<string[]>(loadChatgptPinnedSections)
   const selectedMailProvider = Form.useWatch('mail_provider', form) || 'luckmail'
+  const icloudAutoCreateEnabled = parseBooleanConfigValue(Form.useWatch('icloud_hme_auto_create_enabled', form))
+  const icloudAutoDeleteEnabled = parseBooleanConfigValue(Form.useWatch('icloud_hme_auto_delete_enabled', form))
+  const tempmailArchiveCleanupEnabled = parseBooleanConfigValue(Form.useWatch('tempmail_archive_cleanup_enabled', form))
+  const isMobile = screens.md === false
 
   useEffect(() => {
     if (typeof window === 'undefined') return
@@ -2559,9 +3410,22 @@ export default function Settings() {
   }, [chatgptPinnedSections])
 
   useEffect(() => {
+    setConfigLoaded(false)
+    setConfigLoadError('')
     apiFetch('/config').then((data) => {
+      if (!data || typeof data !== 'object' || Array.isArray(data)) {
+        throw new Error('配置接口返回格式异常')
+      }
       if (!data.mail_provider) {
         data.mail_provider = 'luckmail'
+      }
+      if (data.mail_provider === 'icloud_hme' && data.icloud_hme_mode === 'helper_ready_api') {
+        data.mail_provider = 'hme_ready_api'
+      }
+      if (data.mail_provider === 'hme_ready_api') {
+        data.icloud_hme_mode = 'helper_ready_api'
+      } else if (data.mail_provider === 'icloud_hme' && data.icloud_hme_mode === 'helper_ready_api') {
+        data.icloud_hme_mode = 'import_pool'
       }
       if (!data.applemail_base_url) {
         data.applemail_base_url = 'https://www.appleemail.top'
@@ -2683,6 +3547,27 @@ export default function Settings() {
       if (!data.icloud_hme_auto_create_rate_limit_backoff_minutes) {
         data.icloud_hme_auto_create_rate_limit_backoff_minutes = '360'
       }
+      if (!data.icloud_hme_auto_create_error_backoff_minutes) {
+        data.icloud_hme_auto_create_error_backoff_minutes = '3'
+      }
+      if (!data.icloud_hme_auto_delete_account_interval_min_minutes) {
+        data.icloud_hme_auto_delete_account_interval_min_minutes = '10'
+      }
+      if (!data.icloud_hme_auto_delete_account_interval_max_minutes) {
+        data.icloud_hme_auto_delete_account_interval_max_minutes = '30'
+      }
+      if (!data.icloud_hme_auto_delete_max_per_run) {
+        data.icloud_hme_auto_delete_max_per_run = '20'
+      }
+      if (!data.icloud_hme_auto_delete_rate_limit_backoff_minutes) {
+        data.icloud_hme_auto_delete_rate_limit_backoff_minutes = '60'
+      }
+      if (!data.icloud_hme_auto_delete_error_backoff_minutes) {
+        data.icloud_hme_auto_delete_error_backoff_minutes = '3'
+      }
+      if (!data.icloud_hme_auto_delete_dead_statuses) {
+        data.icloud_hme_auto_delete_dead_statuses = 'account_deactivated,password_invalid'
+      }
       if (!data.tempmail_archive_cleanup_interval_minutes) {
         data.tempmail_archive_cleanup_interval_minutes = '30'
       }
@@ -2700,6 +3585,15 @@ export default function Settings() {
       }
       data.tempmail_permanent = parseBooleanConfigValue(data.tempmail_permanent)
       data.icloud_hme_auto_create_enabled = parseBooleanConfigValue(data.icloud_hme_auto_create_enabled)
+      data.icloud_hme_auto_delete_enabled = parseBooleanConfigValue(data.icloud_hme_auto_delete_enabled)
+      data.icloud_hme_auto_delete_recheck_before_delete =
+        data.icloud_hme_auto_delete_recheck_before_delete === ''
+          ? true
+          : parseBooleanConfigValue(data.icloud_hme_auto_delete_recheck_before_delete)
+      data.icloud_hme_auto_delete_pause_active_tasks =
+        data.icloud_hme_auto_delete_pause_active_tasks === ''
+          ? true
+          : parseBooleanConfigValue(data.icloud_hme_auto_delete_pause_active_tasks)
       data.tempmail_archive_cleanup_enabled = parseBooleanConfigValue(data.tempmail_archive_cleanup_enabled)
       data.tempmail_archive_cleanup_pause_active_tasks =
         data.tempmail_archive_cleanup_pause_active_tasks === ''
@@ -2722,16 +3616,42 @@ export default function Settings() {
       data.chatgpt_access_token_only_zero_amount_stop_enabled = parseBooleanConfigValue(
         data.chatgpt_access_token_only_zero_amount_stop_enabled,
       )
+      data.chatgpt_access_token_only_gopay_provider_link_enabled = parseBooleanConfigValue(
+        data.chatgpt_access_token_only_gopay_provider_link_enabled,
+      )
       data.chatgpt_resume_auth_allow_phone_verification = parseBooleanConfigValue(
         data.chatgpt_resume_auth_allow_phone_verification,
       )
+      data.chatgpt_resume_auth_allow_add_phone_verification = parseBooleanConfigValue(
+        data.chatgpt_resume_auth_allow_add_phone_verification,
+      )
+      data.chatgpt_resume_auth_allow_existing_phone_verification = parseBooleanConfigValue(
+        data.chatgpt_resume_auth_allow_existing_phone_verification === '' ? true : data.chatgpt_resume_auth_allow_existing_phone_verification,
+      )
+      data.chatgpt_recheck_allow_existing_phone_verification = parseBooleanConfigValue(
+        data.chatgpt_recheck_allow_existing_phone_verification === '' ? true : data.chatgpt_recheck_allow_existing_phone_verification,
+      )
       data.local_phone_gateway_auto_acquire_enabled = parseBooleanConfigValue(data.local_phone_gateway_auto_acquire_enabled)
       data.external_subscription_api_enabled = parseBooleanConfigValue(data.external_subscription_api_enabled)
+      data.external_access_token_api_enabled = parseBooleanConfigValue(data.external_access_token_api_enabled)
+      data.external_access_token_allow_refresh =
+        data.external_access_token_allow_refresh === ''
+          ? true
+          : parseBooleanConfigValue(data.external_access_token_allow_refresh)
       form.setFieldsValue(data)
+      setConfigLoaded(true)
+    }).catch((error) => {
+      const detail = error instanceof Error ? error.message : String(error || '配置加载失败')
+      setConfigLoadError(detail)
+      message.error(detail)
     })
   }, [form])
 
   const save = async () => {
+    if (!configLoaded) {
+      message.error(configLoadError || '配置尚未成功加载，已阻止保存，避免覆盖现有配置')
+      return
+    }
     setSaving(true)
     try {
       const values = form.getFieldsValue(true)
@@ -2751,6 +3671,11 @@ export default function Settings() {
       }
       values.cfworker_random_subdomain = parseBooleanConfigValue(values.cfworker_random_subdomain)
       values.tempmail_permanent = parseBooleanConfigValue(values.tempmail_permanent)
+      if (values.mail_provider === 'hme_ready_api') {
+        values.icloud_hme_mode = 'helper_ready_api'
+      } else if (values.mail_provider === 'icloud_hme' && values.icloud_hme_mode === 'helper_ready_api') {
+        values.icloud_hme_mode = 'import_pool'
+      }
       values.icloud_hme_auto_create_enabled = parseBooleanConfigValue(values.icloud_hme_auto_create_enabled)
       values.icloud_hme_auto_create_stock_limit = String(
         Math.max(1, Number.parseInt(String(values.icloud_hme_auto_create_stock_limit || '10'), 10) || 10),
@@ -2771,6 +3696,43 @@ export default function Settings() {
           Number.parseInt(String(values.icloud_hme_auto_create_rate_limit_backoff_minutes || '360'), 10) || 360,
         ),
       )
+      const createErrorBackoff = Number.parseInt(String(values.icloud_hme_auto_create_error_backoff_minutes ?? '3'), 10)
+      values.icloud_hme_auto_create_error_backoff_minutes = String(
+        Math.max(0, Number.isFinite(createErrorBackoff) ? createErrorBackoff : 3),
+      )
+      values.icloud_hme_auto_delete_enabled = parseBooleanConfigValue(values.icloud_hme_auto_delete_enabled)
+      values.icloud_hme_auto_delete_recheck_before_delete = parseBooleanConfigValue(
+        values.icloud_hme_auto_delete_recheck_before_delete,
+      )
+      values.icloud_hme_auto_delete_pause_active_tasks = parseBooleanConfigValue(
+        values.icloud_hme_auto_delete_pause_active_tasks,
+      )
+      const accountIntervalMin = Math.max(
+        0,
+        Number.parseInt(String(values.icloud_hme_auto_delete_account_interval_min_minutes || '10'), 10) || 10,
+      )
+      const accountIntervalMax = Math.max(
+        accountIntervalMin,
+        Number.parseInt(String(values.icloud_hme_auto_delete_account_interval_max_minutes || '30'), 10) || 30,
+      )
+      values.icloud_hme_auto_delete_account_interval_min_minutes = String(accountIntervalMin)
+      values.icloud_hme_auto_delete_account_interval_max_minutes = String(accountIntervalMax)
+      values.icloud_hme_auto_delete_max_per_run = String(
+        Math.max(1, Number.parseInt(String(values.icloud_hme_auto_delete_max_per_run || '20'), 10) || 20),
+      )
+      values.icloud_hme_auto_delete_rate_limit_backoff_minutes = String(
+        Math.max(
+          1,
+          Number.parseInt(String(values.icloud_hme_auto_delete_rate_limit_backoff_minutes || '60'), 10) || 60,
+        ),
+      )
+      const deleteErrorBackoff = Number.parseInt(String(values.icloud_hme_auto_delete_error_backoff_minutes ?? '3'), 10)
+      values.icloud_hme_auto_delete_error_backoff_minutes = String(
+        Math.max(0, Number.isFinite(deleteErrorBackoff) ? deleteErrorBackoff : 3),
+      )
+      values.icloud_hme_auto_delete_dead_statuses =
+        String(values.icloud_hme_auto_delete_dead_statuses || 'account_deactivated,password_invalid').trim() ||
+        'account_deactivated,password_invalid'
       values.tempmail_archive_cleanup_enabled = parseBooleanConfigValue(values.tempmail_archive_cleanup_enabled)
       values.tempmail_archive_cleanup_pause_active_tasks = parseBooleanConfigValue(
         values.tempmail_archive_cleanup_pause_active_tasks,
@@ -2813,12 +3775,45 @@ export default function Settings() {
       values.chatgpt_access_token_only_zero_amount_stop_enabled = parseBooleanConfigValue(
         values.chatgpt_access_token_only_zero_amount_stop_enabled,
       )
+      values.chatgpt_access_token_only_gopay_provider_link_enabled = parseBooleanConfigValue(
+        values.chatgpt_access_token_only_gopay_provider_link_enabled,
+      )
       values.chatgpt_resume_auth_allow_phone_verification = parseBooleanConfigValue(
         values.chatgpt_resume_auth_allow_phone_verification,
+      )
+      values.chatgpt_resume_auth_allow_add_phone_verification = parseBooleanConfigValue(
+        values.chatgpt_resume_auth_allow_add_phone_verification,
+      )
+      values.chatgpt_resume_auth_allow_existing_phone_verification = parseBooleanConfigValue(
+        values.chatgpt_resume_auth_allow_existing_phone_verification,
+      )
+      values.chatgpt_recheck_allow_existing_phone_verification = parseBooleanConfigValue(
+        values.chatgpt_recheck_allow_existing_phone_verification,
       )
       values.local_phone_gateway_auto_acquire_enabled = parseBooleanConfigValue(values.local_phone_gateway_auto_acquire_enabled)
       values.external_subscription_api_enabled = parseBooleanConfigValue(values.external_subscription_api_enabled)
       values.external_subscription_api_token = String(values.external_subscription_api_token || '').trim()
+      values.external_access_token_api_enabled = parseBooleanConfigValue(values.external_access_token_api_enabled)
+      values.external_access_token_api_token = String(values.external_access_token_api_token || '').trim()
+      values.external_access_token_allow_refresh = parseBooleanConfigValue(values.external_access_token_allow_refresh)
+      values.external_access_token_default_lease_seconds = String(
+        Math.max(
+          60,
+          Number.parseInt(String(values.external_access_token_default_lease_seconds || '86400'), 10) || 86400,
+        ),
+      )
+      values.external_access_token_max_limit = String(
+        Math.max(
+          1,
+          Math.min(100, Number.parseInt(String(values.external_access_token_max_limit || '50'), 10) || 50),
+        ),
+      )
+      values.external_access_token_precheck_cooldown_seconds = String(
+        Math.max(
+          60,
+          Number.parseInt(String(values.external_access_token_precheck_cooldown_seconds || '600'), 10) || 600,
+        ),
+      )
       values.chatgpt_access_token_only_zero_amount_stop_threshold = String(
         values.chatgpt_access_token_only_zero_amount_stop_threshold || '1',
       ).trim() || '1'
@@ -2848,11 +3843,23 @@ export default function Settings() {
         cfworker_domain: domains.length > 0 ? '' : values.cfworker_domain,
         cfworker_random_subdomain: values.cfworker_random_subdomain,
         tempmail_permanent: values.tempmail_permanent,
+        mail_provider: values.mail_provider,
+        icloud_hme_mode: values.icloud_hme_mode,
         icloud_hme_auto_create_enabled: values.icloud_hme_auto_create_enabled,
         icloud_hme_auto_create_stock_limit: values.icloud_hme_auto_create_stock_limit,
         icloud_hme_auto_create_interval_min_minutes: values.icloud_hme_auto_create_interval_min_minutes,
         icloud_hme_auto_create_interval_max_minutes: values.icloud_hme_auto_create_interval_max_minutes,
         icloud_hme_auto_create_rate_limit_backoff_minutes: values.icloud_hme_auto_create_rate_limit_backoff_minutes,
+        icloud_hme_auto_create_error_backoff_minutes: values.icloud_hme_auto_create_error_backoff_minutes,
+        icloud_hme_auto_delete_enabled: values.icloud_hme_auto_delete_enabled,
+        icloud_hme_auto_delete_recheck_before_delete: values.icloud_hme_auto_delete_recheck_before_delete,
+        icloud_hme_auto_delete_pause_active_tasks: values.icloud_hme_auto_delete_pause_active_tasks,
+        icloud_hme_auto_delete_account_interval_min_minutes: values.icloud_hme_auto_delete_account_interval_min_minutes,
+        icloud_hme_auto_delete_account_interval_max_minutes: values.icloud_hme_auto_delete_account_interval_max_minutes,
+        icloud_hme_auto_delete_max_per_run: values.icloud_hme_auto_delete_max_per_run,
+        icloud_hme_auto_delete_rate_limit_backoff_minutes: values.icloud_hme_auto_delete_rate_limit_backoff_minutes,
+        icloud_hme_auto_delete_error_backoff_minutes: values.icloud_hme_auto_delete_error_backoff_minutes,
+        icloud_hme_auto_delete_dead_statuses: values.icloud_hme_auto_delete_dead_statuses,
         tempmail_archive_cleanup_enabled: values.tempmail_archive_cleanup_enabled,
         tempmail_archive_cleanup_interval_minutes: values.tempmail_archive_cleanup_interval_minutes,
         tempmail_archive_cleanup_keep_recent_minutes: values.tempmail_archive_cleanup_keep_recent_minutes,
@@ -2871,7 +3878,15 @@ export default function Settings() {
         chatgpt_access_token_only_checkout_currency: values.chatgpt_access_token_only_checkout_currency,
         chatgpt_access_token_only_zero_amount_stop_enabled: values.chatgpt_access_token_only_zero_amount_stop_enabled,
         chatgpt_access_token_only_zero_amount_stop_threshold: values.chatgpt_access_token_only_zero_amount_stop_threshold,
+        chatgpt_access_token_only_gopay_provider_link_enabled: values.chatgpt_access_token_only_gopay_provider_link_enabled,
         chatgpt_resume_auth_allow_phone_verification: values.chatgpt_resume_auth_allow_phone_verification,
+        chatgpt_resume_auth_allow_add_phone_verification: values.chatgpt_resume_auth_allow_add_phone_verification,
+        chatgpt_resume_auth_allow_existing_phone_verification: values.chatgpt_resume_auth_allow_existing_phone_verification,
+        chatgpt_recheck_allow_existing_phone_verification: values.chatgpt_recheck_allow_existing_phone_verification,
+        existing_phone_otp_timeout_seconds: values.existing_phone_otp_timeout_seconds,
+        existing_phone_otp_poll_interval_seconds: values.existing_phone_otp_poll_interval_seconds,
+        existing_phone_otp_max_resend_attempts: values.existing_phone_otp_max_resend_attempts,
+        existing_phone_otp_resend_interval_seconds: values.existing_phone_otp_resend_interval_seconds,
         chatgpt_subscription_auth_capture_retry_delays_seconds: values.chatgpt_subscription_auth_capture_retry_delays_seconds,
         chatgpt_phone_verification_provider: values.chatgpt_phone_verification_provider,
         local_phone_gateway_url: values.local_phone_gateway_url,
@@ -2885,6 +3900,12 @@ export default function Settings() {
         local_phone_gateway_resend_interval_seconds: values.local_phone_gateway_resend_interval_seconds,
         external_subscription_api_enabled: values.external_subscription_api_enabled,
         external_subscription_api_token: values.external_subscription_api_token,
+        external_access_token_api_enabled: values.external_access_token_api_enabled,
+        external_access_token_api_token: values.external_access_token_api_token,
+        external_access_token_allow_refresh: values.external_access_token_allow_refresh,
+        external_access_token_default_lease_seconds: values.external_access_token_default_lease_seconds,
+        external_access_token_max_limit: values.external_access_token_max_limit,
+        external_access_token_precheck_cooldown_seconds: values.external_access_token_precheck_cooldown_seconds,
       })
       message.success('保存成功')
       setSaved(true)
@@ -2907,12 +3928,52 @@ export default function Settings() {
   const normalizedChatgptPinnedSections =
     activeTab === 'chatgpt' ? normalizePinnedSections(chatgptPinnedSections, visibleSections) : []
   const orderedVisibleSections =
-    activeTab === 'chatgpt' ? orderPinnedSections(visibleSections, normalizedChatgptPinnedSections) : visibleSections
+    activeTab === 'mailbox'
+      ? orderMailboxSections(visibleSections, selectedMailProvider)
+      : activeTab === 'chatgpt'
+        ? orderPinnedSections(visibleSections, normalizedChatgptPinnedSections)
+        : visibleSections
+  const chatgptPinGroups =
+    activeTab === 'chatgpt'
+      ? (() => {
+          const sectionByTitle = new Map(visibleSections.map((section) => [section.title, section]))
+          const usedTitles = new Set<string>()
+          const groups = CHATGPT_PIN_GROUPS
+            .map((group) => {
+              const sections = group.titles
+                .map((title) => sectionByTitle.get(title))
+                .filter((section): section is SectionConfig => Boolean(section))
+              sections.forEach((section) => usedTitles.add(section.title))
+              return { label: group.label, sections }
+            })
+            .filter((group) => group.sections.length > 0)
+          const restSections = visibleSections.filter((section) => !usedTitles.has(section.title))
+          if (restSections.length > 0) {
+            groups.push({ label: '其他', sections: restSections })
+          }
+          return groups
+        })()
+      : []
   const toggleChatgptPinnedSection = (sectionTitle: string, checked: boolean) => {
     setChatgptPinnedSections((prev) => {
       const withoutCurrent = prev.filter((title) => title !== sectionTitle)
       return checked ? [...withoutCurrent, sectionTitle] : withoutCurrent
     })
+  }
+  const getMailboxSectionCollapseState = (sectionTitle: string) => {
+    if (activeTab !== 'mailbox' || selectedMailProvider !== 'icloud_hme') {
+      return { defaultCollapsed: false, autoExpand: false }
+    }
+    if (sectionTitle === 'iCloud HME 自动补池') {
+      return { defaultCollapsed: true, autoExpand: icloudAutoCreateEnabled }
+    }
+    if (sectionTitle === 'iCloud HME 自动删除') {
+      return { defaultCollapsed: true, autoExpand: icloudAutoDeleteEnabled }
+    }
+    if (sectionTitle === 'TempMail 归档清理') {
+      return { defaultCollapsed: true, autoExpand: tempmailArchiveCleanupEnabled }
+    }
+    return { defaultCollapsed: false, autoExpand: false }
   }
 
   return (
@@ -2922,25 +3983,75 @@ export default function Settings() {
         <p style={{ color: '#7a8ba3', marginTop: 4 }}>配置将持久化保存，注册任务自动使用</p>
       </div>
 
-      <div style={{ display: 'flex', gap: 24 }}>
-        <div style={{ width: 200 }}>
-          <Tabs
-            tabPosition="left"
-            activeKey={activeTab}
-            onChange={setActiveTab}
-            items={TAB_ITEMS.map((t) => ({
-              key: t.key,
-              label: (
-                <span>
-                  {t.icon}
-                  <span style={{ marginLeft: 8 }}>{t.label}</span>
-                </span>
-              ),
-            }))}
-          />
+      {configLoadError ? (
+        <Alert
+          type="error"
+          showIcon
+          message="配置加载失败，已阻止保存"
+          description={`${configLoadError}。如果刚重启过服务，请重新登录后刷新页面；不要在空表单状态下保存。`}
+        />
+      ) : !configLoaded ? (
+        <Alert type="info" showIcon message="正在加载配置" description="加载完成前暂不允许保存，避免空表单覆盖现有配置。" />
+      ) : null}
+
+      <div
+        className="settings-body"
+        style={{
+          display: 'flex',
+          flexDirection: isMobile ? 'column' : 'row',
+          gap: isMobile ? 12 : 18,
+          minWidth: 0,
+        }}
+      >
+        <div
+          className={`settings-tab-nav ${isMobile ? 'settings-tab-nav-mobile' : 'settings-tab-nav-desktop'}`}
+          style={{
+            width: isMobile ? '100%' : 'max-content',
+            minWidth: isMobile ? 0 : 'max-content',
+            flexShrink: 0,
+          }}
+        >
+          {isMobile ? (
+            <div className="settings-mobile-tab-grid" role="tablist" aria-label="全局配置分组">
+              {TAB_ITEMS.map((t) => {
+                const selected = t.key === activeTab
+                return (
+                  <button
+                    key={t.key}
+                    type="button"
+                    role="tab"
+                    aria-selected={selected}
+                    className={`settings-mobile-tab ${selected ? 'is-active' : ''}`}
+                    onClick={() => setActiveTab(t.key)}
+                  >
+                    <span className="settings-tab-label">
+                      {t.icon}
+                      <span>{t.label}</span>
+                    </span>
+                  </button>
+                )
+              })}
+            </div>
+          ) : (
+            <Tabs
+              className="settings-tabs-desktop"
+              tabPosition="left"
+              activeKey={activeTab}
+              onChange={setActiveTab}
+              items={TAB_ITEMS.map((t) => ({
+                key: t.key,
+                label: (
+                  <span className="settings-tab-label">
+                    {t.icon}
+                    <span>{t.label}</span>
+                  </span>
+                ),
+              }))}
+            />
+          )}
         </div>
 
-        <div style={{ flex: 1 }}>
+        <div className="settings-main" style={{ flex: 1, minWidth: 0 }}>
           {activeTab === 'integrations' ? (
             <IntegrationsPanel />
           ) : activeTab === 'security' ? (
@@ -2952,6 +4063,9 @@ export default function Settings() {
               ) : (
                 <>
                   {activeTab === 'captcha' ? <SolverStatus /> : null}
+                  {activeTab === 'mailbox' ? (
+                    <MailboxOverviewPanel form={form} selectedProvider={selectedMailProvider} visibleSections={orderedVisibleSections} />
+                  ) : null}
                   {activeTab === 'mailbox' && selectedMailProvider === 'manual_email_otp' ? (
                     <Alert
                       type="info"
@@ -2963,65 +4077,96 @@ export default function Settings() {
                   ) : null}
                   {activeTab === 'chatgpt' ? (
                     <>
-                      <Card size="small" style={{ marginBottom: 12 }}>
-                        <Space direction="vertical" size={10} style={{ width: '100%' }}>
-                          <Space size={8} wrap style={{ width: '100%', justifyContent: 'space-between' }}>
+                      <Card size="small" className="settings-chatgpt-toolbar" style={{ marginBottom: 16 }}>
+                        <div className="settings-chatgpt-toolbar-head">
+                          <div className="settings-chatgpt-toolbar-copy">
                             <Space size={8} wrap>
-                              <Typography.Text strong>置顶面板</Typography.Text>
-                              <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                                勾选后会把对应 ChatGPT 面板移动到最上方
-                              </Typography.Text>
+                              <Typography.Text strong>ChatGPT 配置面板</Typography.Text>
+                              <Tag color={normalizedChatgptPinnedSections.length > 0 ? 'blue' : 'default'}>
+                                已置顶 {normalizedChatgptPinnedSections.length}
+                              </Tag>
                             </Space>
+                            <Typography.Text type="secondary">
+                              常用面板可置顶，下面的配置面板默认折叠。
+                            </Typography.Text>
+                          </div>
+                          <Space size={8} wrap className="settings-chatgpt-toolbar-actions">
                             {normalizedChatgptPinnedSections.length > 0 ? (
-                              <Button size="small" type="link" onClick={() => setChatgptPinnedSections([])}>
+                              <Button size="small" onClick={() => setChatgptPinnedSections([])}>
                                 清空置顶
                               </Button>
                             ) : null}
+                            <Button
+                              size="small"
+                              onClick={() => setChatgptPinEditorOpen((value) => !value)}
+                            >
+                              {chatgptPinEditorOpen ? '收起置顶' : '编辑置顶'}
+                            </Button>
+                            <Button
+                              size="small"
+                              type="primary"
+                              icon={<SaveOutlined />}
+                              onClick={save}
+                              loading={saving}
+                            >
+                              {saved ? '已保存 ✓' : '保存配置'}
+                            </Button>
                           </Space>
-                          <Space size={[8, 8]} wrap>
-                            {visibleSections.map((section) => {
-                              const checked = normalizedChatgptPinnedSections.includes(section.title)
-                              return (
-                                <Tag.CheckableTag
-                                  key={section.title}
-                                  checked={checked}
-                                  onChange={(nextChecked) => toggleChatgptPinnedSection(section.title, nextChecked)}
-                                  style={{
-                                    border: `1px solid ${checked ? '#91caff' : '#d9d9d9'}`,
-                                    borderRadius: 999,
-                                    padding: '4px 10px',
-                                    marginInlineEnd: 0,
-                                    background: checked ? '#e6f4ff' : '#fafafa',
-                                    color: checked ? '#0958d9' : 'rgba(0, 0, 0, 0.65)',
-                                    fontWeight: checked ? 600 : 500,
-                                  }}
-                                >
-                                  {section.title}
-                                </Tag.CheckableTag>
-                              )
-                            })}
-                          </Space>
-                        </Space>
+                        </div>
+                        {!chatgptPinEditorOpen && normalizedChatgptPinnedSections.length > 0 ? (
+                          <div className="settings-chatgpt-pinned-summary">
+                            <span className="settings-chatgpt-pin-label">当前置顶</span>
+                            <div className="settings-chatgpt-pin-chips">
+                              {normalizedChatgptPinnedSections.map((title) => (
+                                <Tag key={title} className="settings-chatgpt-pin-chip settings-chatgpt-pin-chip-static">
+                                  {title}
+                                </Tag>
+                              ))}
+                            </div>
+                          </div>
+                        ) : null}
+                        {chatgptPinEditorOpen ? (
+                          <div className="settings-chatgpt-pin-groups">
+                            {chatgptPinGroups.map((group) => (
+                              <div key={group.label} className="settings-chatgpt-pin-group">
+                                <span className="settings-chatgpt-pin-label">{group.label}</span>
+                                <div className="settings-chatgpt-pin-chips">
+                                  {group.sections.map((section) => {
+                                    const checked = normalizedChatgptPinnedSections.includes(section.title)
+                                    return (
+                                      <Tag.CheckableTag
+                                        key={section.title}
+                                        checked={checked}
+                                        onChange={(nextChecked) => toggleChatgptPinnedSection(section.title, nextChecked)}
+                                        className="settings-chatgpt-pin-chip"
+                                      >
+                                        {section.title}
+                                      </Tag.CheckableTag>
+                                    )
+                                  })}
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        ) : null}
                       </Card>
-                      <Button
-                        type="primary"
-                        icon={<SaveOutlined />}
-                        onClick={save}
-                        loading={saving}
-                        block
-                        style={{ marginBottom: 16 }}
-                      >
-                        {saved ? '已保存 ✓' : '保存配置'}
-                      </Button>
                     </>
                   ) : null}
                   {orderedVisibleSections.map((section) => (
-                    <ConfigSection
-                      key={`${activeTab}:${section.title}`}
-                      section={section}
-                      defaultCollapsed={activeTab === 'chatgpt'}
-                      autoExpand={activeTab === 'chatgpt' && normalizedChatgptPinnedSections.includes(section.title)}
-                    />
+                    (() => {
+                      const mailboxCollapseState = getMailboxSectionCollapseState(section.title)
+                      return (
+                        <ConfigSection
+                          key={`${activeTab}:${section.title}`}
+                          section={section}
+                          defaultCollapsed={activeTab === 'chatgpt' || mailboxCollapseState.defaultCollapsed}
+                          autoExpand={
+                            (activeTab === 'chatgpt' && normalizedChatgptPinnedSections.includes(section.title))
+                            || mailboxCollapseState.autoExpand
+                          }
+                        />
+                      )
+                    })()
                   ))}
                   {activeTab === 'mailbox' && selectedMailProvider === 'icloud_hme' ? <ICloudHmeManagerSection form={form} /> : null}
                   {activeTab === 'mailbox' && selectedMailProvider === 'applemail' ? <AppleMailPoolImportSection form={form} /> : null}

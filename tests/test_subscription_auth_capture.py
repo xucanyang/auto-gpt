@@ -178,7 +178,9 @@ class SubscriptionAuthCaptureTests(unittest.TestCase):
         self.assertEqual(result["data"]["error_code"], "add_phone_required")
         self.assertEqual(len(login_calls), 2)
         sleep_mock.assert_not_called()
-        self.assertFalse(login_calls[0]["allow_phone_verification"])
+        self.assertTrue(login_calls[0]["allow_phone_verification"])
+        self.assertFalse(login_calls[0]["allow_add_phone_verification"])
+        self.assertTrue(login_calls[0]["allow_existing_phone_verification"])
         self.assertFalse(login_calls[0]["allow_add_phone_session_recovery"])
 
     def test_explicit_empty_retry_delays_disable_capture_retries(self):

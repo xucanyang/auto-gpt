@@ -1,5 +1,6 @@
 """ChatGPT / Codex CLI 平台插件"""
 
+import json
 import random
 import string
 
@@ -41,15 +42,73 @@ class ChatGPTPlatform(BasePlatform):
         if not password:
             password = "".join(random.choices(string.ascii_letters + string.digits + "!@#$", k=16))
 
-        proxy = ""
         browser_mode = (self.config.executor_type if self.config else None) or "protocol"
-        extra_config = (self.config.extra or {}) if self.config and getattr(self.config, "extra", None) else {}
+        extra_config = dict((self.config.extra or {}) if self.config and getattr(self.config, "extra", None) else {})
+        task_control = getattr(self, "_task_control", None)
+        if task_control is not None:
+            extra_config.setdefault("_task_control", task_control)
+        task_attempt_id = getattr(self, "_task_attempt_token", None)
+        if task_attempt_id is not None:
+            extra_config.setdefault("_task_attempt_id", task_attempt_id)
+        explicit_proxy = normalize_proxy_url(self.config.proxy if self.config else None)
+        proxy_mode_hint = str(
+            extra_config.get("__register_proxy_mode")
+            or extra_config.get("proxy_mode")
+            or ""
+        ).strip().lower()
         log_fn = getattr(self, "_log_fn", print)
+        if proxy_mode_hint in {"none", "no_proxy", "direct", "直连"}:
+            proxy = ""
+            if explicit_proxy:
+                log_fn("[代理] 已选择直连模式，忽略显式代理配置")
+        elif explicit_proxy:
+            proxy = explicit_proxy
+        else:
+            proxy = resolve_runtime_proxy(self.config.proxy if self.config else None)
+        if proxy:
+            proxy_label = proxy
+            if "://" in proxy_label:
+                scheme, rest = proxy_label.split("://", 1)
+                if "@" in rest:
+                    rest = rest.rsplit("@", 1)[1]
+                    proxy_label = f"{scheme}://***:***@{rest}"
+            log_fn(f"[代理] ChatGPT 注册核心链路 proxy={proxy_label}")
+        else:
+            log_fn("[代理] ChatGPT 注册核心链路 proxy=direct")
         max_retries = 3
         try:
             max_retries = int(extra_config.get("register_max_retries", 3) or 3)
         except Exception:
             max_retries = 3
+
+        registration_entry = str(
+            extra_config.get("chatgpt_registration_entry")
+            or extra_config.get("registration_entry")
+            or ""
+        ).strip().lower().replace("-", "_")
+        if registration_entry in {"phone", "phone_signup", "sms", "sms_signup"}:
+            from services.chatgpt_core.phone_registration_engine import PhoneRegistrationEngine
+
+            extra_config["chatgpt_registration_entry"] = "phone_signup"
+            extra_config["chatgpt_registration_mode"] = "access_token_only"
+            extra_config["chatgpt_has_refresh_token_solution"] = False
+            if password:
+                extra_config["password"] = password
+            engine = PhoneRegistrationEngine(
+                extra_config=extra_config,
+                proxy_url=proxy,
+                browser_mode=browser_mode,
+                callback_logger=log_fn,
+                stop_checker=(
+                    (lambda: task_control.checkpoint(attempt_id=task_attempt_id))
+                    if task_control is not None
+                    else None
+                ),
+            )
+            result = engine.run()
+            if not result or not result.success:
+                raise RuntimeError(result.error_message if result else "手机号注册失败")
+            return engine.build_account(result)
 
         def _resolve_mailbox_timeout(requested_timeout: int) -> int:
             candidates = (
@@ -76,6 +135,60 @@ class ChatGPTPlatform(BasePlatform):
                 str(extra_config.get("mail_provider") or "custom_provider").strip()
                 or "custom_provider"
             )
+            _task_id = str(extra_config.get("_current_task_id") or "").strip()
+
+            def _json_loads(value, default):
+                if isinstance(value, str) and value.strip():
+                    try:
+                        parsed = json.loads(value)
+                    except Exception:
+                        return default
+                    return parsed if parsed is not None else default
+                return value if value is not None else default
+
+            def _export_mailbox_state_payload(acct, before_ids):
+                account_extra = dict(getattr(acct, "extra", None) or {}) if acct is not None else {}
+                export_config = {
+                    key: value
+                    for key, value in dict(extra_config or {}).items()
+                    if key not in {"_task_control"} and not callable(value)
+                }
+                return {
+                    "provider": _mail_provider,
+                    "email": str(_fixed_email or getattr(acct, "email", "") or "").strip(),
+                    "account": {
+                        "email": str(getattr(acct, "email", "") or "").strip(),
+                        "account_id": str(getattr(acct, "account_id", "") or "").strip(),
+                        "extra": account_extra,
+                    },
+                    "before_ids": sorted(before_ids or set()),
+                    "config": export_config,
+                    "proxy": proxy,
+                }
+
+            def _sync_hme_rerun_result(acct, *, success: bool, error_message: str = "", task_id: str = ""):
+                if _mail_provider != "icloud_hme" or acct is None:
+                    return
+                account_extra = dict(getattr(acct, "extra", None) or {})
+                anonymous_id = str(account_extra.get("anonymous_id") or getattr(acct, "account_id", "") or "").strip()
+                hme = str(account_extra.get("hme") or getattr(acct, "email", "") or _fixed_email or "").strip()
+                if not anonymous_id and not hme:
+                    return
+                try:
+                    from services.chatgpt_account_state import is_account_deactivated_message
+
+                    from core.db import sync_icloud_hme_rerun_result
+                    sync_icloud_hme_rerun_result(
+                        anonymous_id=anonymous_id,
+                        hme=hme,
+                        task_id=str(task_id or _task_id or "").strip(),
+                        success=bool(success),
+                        error_message=str(error_message or ""),
+                        mailbox_state=_export_mailbox_state_payload(acct, getattr(email_service, "_before_ids", set()) if "email_service" in locals() else set()),
+                        delete_candidate=bool(not success and is_account_deactivated_message("", str(error_message or ""))),
+                    )
+                except Exception as exc:
+                    log_fn(f"[iCloudHME] 重跑进度写回失败: {exc}")
 
             def _resolve_email(candidate_email: str = "") -> str:
                 resolved_email = str(_fixed_email or candidate_email or "").strip()
@@ -180,40 +293,34 @@ class ChatGPTPlatform(BasePlatform):
                     return code
 
                 def export_state(self):
-                    return {
-                        "provider": _mail_provider,
-                        "email": str(self._email or getattr(self._acct, "email", "") or "").strip(),
-                        "account": {
-                            "email": str(getattr(self._acct, "email", "") or "").strip(),
-                            "account_id": str(getattr(self._acct, "account_id", "") or "").strip(),
-                            "extra": getattr(self._acct, "extra", None) or {},
-                        },
-                        "before_ids": sorted(self._before_ids),
-                        "config": dict(extra_config or {}),
-                        "proxy": proxy,
-                    }
+                    return _export_mailbox_state_payload(self._acct, self._before_ids)
 
                 def finalize_success(self, account_email: str = "", task_id: str = ""):
                     if not self._acct:
                         return
                     finalize = getattr(self._mailbox, "finalize_success", None)
+                    resolved_task_id = str(task_id or _task_id or "").strip()
                     if callable(finalize):
                         finalize(
                             self._acct,
                             registered_email=str(account_email or self._email or "").strip(),
-                            task_id=str(task_id or "").strip(),
+                            task_id=resolved_task_id,
                         )
+                    _sync_hme_rerun_result(self._acct, success=True, task_id=resolved_task_id)
 
                 def finalize_failure(self, error_message: str = "", task_id: str = ""):
                     if not self._acct:
                         return
                     finalize = getattr(self._mailbox, "finalize_failure", None)
+                    resolved_task_id = str(task_id or _task_id or "").strip()
+                    normalized_error = str(error_message or "").strip()
                     if callable(finalize):
                         finalize(
                             self._acct,
-                            error_message=str(error_message or "").strip(),
-                            task_id=str(task_id or "").strip(),
+                            error_message=normalized_error,
+                            task_id=resolved_task_id,
                         )
+                    _sync_hme_rerun_result(self._acct, success=False, error_message=normalized_error, task_id=resolved_task_id)
 
                 def update_status(self, success, error=None):
                     pass
@@ -361,6 +468,7 @@ class ChatGPTPlatform(BasePlatform):
             {"id": "probe_local_status", "label": "探测本地状态", "params": []},
             {"id": "sync_cliproxyapi_status", "label": "同步 CLIProxyAPI 状态", "params": []},
             {"id": "sync_sub2api_status", "label": "同步 Sub2API 状态", "params": []},
+            {"id": "sync_oaipay_status", "label": "同步 OAIPay 状态", "params": []},
             {"id": "refresh_token", "label": "刷新 Token", "params": []},
             {
                 "id": "payment_link",
@@ -369,6 +477,13 @@ class ChatGPTPlatform(BasePlatform):
                     {"key": "plan", "label": "套餐", "type": "select", "options": ["plus", "team"]},
                     {"key": "country", "label": "地区", "type": "checkout_country", "default": "ID"},
                     {"key": "currency", "label": "货币", "type": "text", "default": "IDR"},
+                    {
+                        "key": "payment_link_format",
+                        "label": "生成路径",
+                        "type": "select",
+                        "options": ["long_hosted", "short_chatgpt"],
+                        "default": "long_hosted",
+                    },
                 ],
             },
             {
@@ -413,6 +528,13 @@ class ChatGPTPlatform(BasePlatform):
                 "params": [
                     {"key": "api_url", "label": "API URL", "type": "text"},
                     {"key": "api_key", "label": "Admin Key", "type": "text"},
+                ],
+            },
+            {
+                "id": "upload_oaipay",
+                "label": "上传 OAIPay",
+                "params": [
+                    {"key": "category_id", "label": "OAIPay 分类ID", "type": "text"},
                 ],
             },
         ]
@@ -485,7 +607,7 @@ class ChatGPTPlatform(BasePlatform):
 
             sync_result = probe_chatgpt_sub2api_status(a)
             remote_state = str(sync_result.get("remote_state") or "").strip().lower()
-            ok = remote_state in {"exists", "not_found"}
+            ok = remote_state in {"exists", "not_found", "cross_workspace_only"}
             summary = (
                 f"远端状态={sync_result.get('status') or remote_state or 'unknown'}, "
                 f"探测={remote_state or 'not_checked'}"
@@ -500,6 +622,30 @@ class ChatGPTPlatform(BasePlatform):
                 "account_extra_patch": {
                     "sync_statuses": {
                         "sub2api": sync_result,
+                    },
+                },
+            }
+
+        if action_id == "sync_oaipay_status":
+            from services.oaipay_sync import probe_chatgpt_oaipay_status
+
+            sync_result = probe_chatgpt_oaipay_status(a)
+            remote_state = str(sync_result.get("remote_state") or "").strip().lower()
+            ok = remote_state in {"exists", "not_found", "cross_workspace_only"}
+            summary = (
+                f"远端状态={sync_result.get('status') or remote_state or 'unknown'}, "
+                f"探测={remote_state or 'not_checked'}"
+            )
+            return {
+                "ok": ok,
+                "data": {
+                    "message": f"OAIPay 状态同步完成：{summary}",
+                    "sync": sync_result,
+                },
+                "error": sync_result.get("message") if not ok else "",
+                "account_extra_patch": {
+                    "sync_statuses": {
+                        "oaipay": sync_result,
                     },
                 },
             }
@@ -521,6 +667,11 @@ class ChatGPTPlatform(BasePlatform):
 
         if action_id == "payment_link":
             from services.chatgpt_core.payment import generate_plus_link, generate_team_link
+            from services.chatgpt_core.payment_link_cache import (
+                normalize_payment_link_output_format,
+                normalize_payment_link_url,
+                payment_link_url_requires_regeneration,
+            )
 
             plan = str(params.get("plan") or "plus").strip().lower()
             if plan not in {"plus", "team"}:
@@ -528,11 +679,14 @@ class ChatGPTPlatform(BasePlatform):
             country = str(params.get("country") or "ID").strip().upper() or "ID"
             currency = str(params.get("currency") or "IDR").strip().upper() or "IDR"
             payment_proxy = normalize_proxy_url(params.get("proxy")) or ""
+            payment_link_format = normalize_payment_link_output_format(params.get("payment_link_format"))
             promo_code = str(params.get("promo_code") or "").strip()
             save_defaults = params.get("save_defaults") is not False
             reuse_cached_link = params.get("reuse_cached_link") is not False
             cached_link = extra.get("chatgpt_last_payment_link") if isinstance(extra.get("chatgpt_last_payment_link"), dict) else {}
-            cached_url = str(cached_link.get("url") or "").strip()
+            cached_format = normalize_payment_link_output_format(cached_link.get("payment_link_format") or "long_hosted")
+            cached_url = normalize_payment_link_url(cached_link.get("url"), cached_format)
+            cached_url_needs_regeneration = payment_link_url_requires_regeneration(cached_link.get("url"), cached_format)
             cached_plan = str(cached_link.get("plan") or "").strip().lower()
             cached_country = str(cached_link.get("country") or "").strip().upper()
             cached_currency = str(cached_link.get("currency") or "").strip().upper()
@@ -554,6 +708,7 @@ class ChatGPTPlatform(BasePlatform):
                         "country": country,
                         "currency": currency,
                         "proxy": payment_proxy,
+                        "payment_link_format": payment_link_format,
                         "promo_code": promo_code,
                         "workspace_name": str(params.get("workspace_name") or "MyTeam").strip() or "MyTeam",
                         "seat_quantity": max(2, int(params.get("seat_quantity", 5) or 5)),
@@ -566,10 +721,12 @@ class ChatGPTPlatform(BasePlatform):
             should_reuse_cached_link = (
                 reuse_cached_link
                 and bool(cached_url)
+                and not cached_url_needs_regeneration
                 and cached_plan == plan
                 and cached_country == country
                 and cached_currency == currency
                 and cached_proxy == payment_proxy
+                and cached_format == payment_link_format
             )
             if should_reuse_cached_link:
                 return {
@@ -580,6 +737,7 @@ class ChatGPTPlatform(BasePlatform):
                         "country": country,
                         "currency": currency,
                         "proxy": payment_proxy,
+                        "payment_link_format": payment_link_format,
                         "promo_code": str(cached_link.get("promo_code") or promo_code).strip(),
                         "billing": cached_billing or billing,
                         "cache_reused": True,
@@ -589,7 +747,14 @@ class ChatGPTPlatform(BasePlatform):
                     "account_extra_patch": defaults_patch,
                 }
             if plan == "plus":
-                url = generate_plus_link(a, proxy=payment_proxy, country=country, currency=currency, billing=billing)
+                url = generate_plus_link(
+                    a,
+                    proxy=payment_proxy,
+                    country=country,
+                    currency=currency,
+                    billing=billing,
+                    link_format=payment_link_format,
+                )
             else:
                 url = generate_team_link(
                     a,
@@ -601,6 +766,7 @@ class ChatGPTPlatform(BasePlatform):
                     country=country,
                     currency=currency,
                     billing=billing,
+                    link_format=payment_link_format,
                 )
             return {
                 "ok": bool(url),
@@ -610,6 +776,7 @@ class ChatGPTPlatform(BasePlatform):
                     "country": country,
                     "currency": currency,
                     "proxy": payment_proxy,
+                    "payment_link_format": payment_link_format,
                     "promo_code": promo_code,
                     "billing": billing,
                     "cache_reused": False,

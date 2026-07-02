@@ -10,13 +10,14 @@ ChatGPT Refresh Token 注册引擎。
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable, Dict, Optional
 
-from core.task_runtime import TaskInterruption
+from core.task_runtime import SkipCurrentAttemptRequested, TaskInterruption
 
 from .chatgpt_client import ChatGPTClient
 from .oauth import OAuthManager
@@ -145,7 +146,7 @@ class EmailServiceAdapter:
             if str(code or "").strip()
         }
         deadline = time.monotonic() + max(int(timeout or 0), 1)
-        self._log(f"[验证码] 正在等待邮箱 {email} 的验证码（{phase_title}, {timeout}s）...")
+        self._log(f"[验证码] 等待邮箱验证码：{phase_title} timeout={timeout}s")
 
         while time.monotonic() < deadline:
             remaining = max(1, int(deadline - time.monotonic()))
@@ -153,7 +154,7 @@ class EmailServiceAdapter:
                 email=email,
                 timeout=remaining,
                 otp_sent_at=otp_sent_at,
-                exclude_codes=None,
+                exclude_codes=excluded_codes | used_codes,
                 phase=phase_key,
                 phase_label=phase_title,
             )
@@ -175,7 +176,7 @@ class EmailServiceAdapter:
                 meta["code"] = normalized_code
                 meta["phase"] = phase_key
                 self._last_verification_result_by_phase[phase_key] = meta
-                self._log(f"[验证码] 成功获取验证码（{phase_title}）")
+                self._log(f"[验证码] 验证码已获取：{phase_title}")
                 return normalized_code
 
             if normalized_code in used_codes or normalized_code in excluded_codes:
@@ -188,7 +189,7 @@ class EmailServiceAdapter:
                 "code": normalized_code,
                 "phase": phase_key,
             }
-            self._log(f"[验证码] 成功获取验证码（{phase_title}）")
+            self._log(f"[验证码] 验证码已获取：{phase_title}")
             return normalized_code
 
         return None
@@ -222,6 +223,8 @@ class RefreshTokenRegistrationEngine:
         self.logs: list[str] = []
         self._last_pending_invite_error_message: str = ""
         self._last_workspace_capture_error: str = ""
+        self._last_phone_challenge_events: list[dict[str, Any]] = []
+        self._prepared_register_client: ChatGPTClient | None = None
 
     @staticmethod
     def _classify_log_level(message: str, level: str = "info") -> str:
@@ -496,6 +499,77 @@ class RefreshTokenRegistrationEngine:
         text = " ".join(str(error_text or "").split())
         return text[: max(20, int(limit or 180))]
 
+    def _registration_full_auth_phone_policy(self) -> tuple[bool, bool]:
+        """Phone policy for post-registration full-auth capture.
+
+        有 RT 注册第二阶段只补完整 Auth：
+        - 默认不主动 add_phone 新绑；
+        - 默认允许已绑定手机号二次验证，用手机号池/人工面板处理；
+        - 可用专用 key 覆盖；没有专用 key 时复用补抓 Auth 全局配置。
+        """
+        if "chatgpt_registration_full_auth_allow_add_phone_verification" in self.extra_config:
+            allow_add = self._read_bool_config(
+                "chatgpt_registration_full_auth_allow_add_phone_verification",
+                default=False,
+            )
+        else:
+            allow_add = self._read_bool_config(
+                "chatgpt_resume_auth_allow_add_phone_verification",
+                default=False,
+            )
+
+        if "chatgpt_registration_full_auth_allow_existing_phone_verification" in self.extra_config:
+            allow_existing = self._read_bool_config(
+                "chatgpt_registration_full_auth_allow_existing_phone_verification",
+                default=True,
+            )
+        else:
+            allow_existing = self._read_bool_config(
+                "chatgpt_resume_auth_allow_existing_phone_verification",
+                default=True,
+            )
+        return bool(allow_add), bool(allow_existing)
+
+    def _remember_oauth_phone_challenge_events(self, oauth_client: Optional[OAuthClient]) -> None:
+        events = getattr(oauth_client, "_phone_challenge_events", None) if oauth_client is not None else None
+        if not isinstance(events, (list, tuple)) or not events:
+            return
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            safe_event = self._to_json_safe(dict(event))
+            if isinstance(safe_event, dict):
+                self._last_phone_challenge_events.append(safe_event)
+        self._last_phone_challenge_events = self._last_phone_challenge_events[-10:]
+
+    def _apply_phone_challenge_metadata(self, result: RegistrationResult) -> None:
+        events = [dict(item) for item in (self._last_phone_challenge_events or []) if isinstance(item, dict)]
+        if not events:
+            return
+        result.metadata = result.metadata or {}
+        last_event = dict(events[-1])
+        result.metadata["chatgpt_phone_challenge"] = last_event
+        result.metadata["chatgpt_phone_challenge_history"] = events[-5:]
+        if str(last_event.get("type") or last_event.get("challenge_type") or "") == "existing_phone_otp":
+            phone = str(last_event.get("phone") or last_event.get("phone_number") or "").strip()
+            masked = str(last_event.get("masked") or last_event.get("masked_phone") or "").strip()
+            if phone or masked:
+                result.metadata["chatgpt_bound_phone"] = {
+                    "phone": phone,
+                    "phone_number": phone,
+                    "masked": masked,
+                    "masked_phone": masked,
+                    "source": str(last_event.get("source") or "registration_full_auth").strip(),
+                    "detected_at": str(last_event.get("seen_at") or "").strip(),
+                    "updated_at": str(last_event.get("updated_at") or last_event.get("seen_at") or "").strip(),
+                    "last_seen_reason": "existing_phone_otp",
+                    "verification_status": str(last_event.get("status") or "required").strip() or "required",
+                }
+                if phone:
+                    result.metadata["chatgpt_bound_phone_number"] = phone
+                elif masked:
+                    result.metadata["chatgpt_bound_phone_masked"] = masked
+
     @staticmethod
     def _should_attempt_business_workspace_recovery(oauth_client: OAuthClient) -> bool:
         last_error = str(getattr(oauth_client, "last_error", "") or "").strip().lower()
@@ -572,7 +646,9 @@ class RefreshTokenRegistrationEngine:
         return client
 
     def _probe_homepage_before_email_creation(self) -> tuple[bool, str]:
+        self._prepared_register_client = None
         client = self._build_chatgpt_client()
+        keep_client = False
         try:
             max_probe_attempts = 3
             last_error = "访问首页失败"
@@ -589,15 +665,22 @@ class RefreshTokenRegistrationEngine:
                 if not csrf_token:
                     last_error = "获取 CSRF token 失败"
                     continue
+                # 这里不能只把预热当成一次独立探测。Cloudflare/ChatGPT 对同一代理下的
+                # 不同 TLS/browser 指纹会给出不同结果；预热成功后如果注册状态机重新随机
+                # 创建一个 client，仍然可能马上 403。保留已通过首页+CSRF 的同一 session
+                # 和同一任务指纹，注册状态机继续复用它。
+                self._prepared_register_client = client
+                keep_client = True
                 return True, ""
             return False, last_error
         except Exception as exc:
             return False, str(exc)
         finally:
-            try:
-                client.close()
-            except Exception:
-                pass
+            if not keep_client:
+                try:
+                    client.close()
+                except Exception:
+                    pass
 
     def _report_homepage_probe(self, ok: bool, detail: str = "") -> None:
         proxy_url = str(self.proxy_url or "").strip()
@@ -624,8 +707,12 @@ class RefreshTokenRegistrationEngine:
         )
 
     def _build_oauth_client(self) -> OAuthClient:
+        client_config = dict(self.extra_config or {})
+        if client_config.get("_task_control") is not None:
+            client_config.setdefault("_manual_phone_otp_enabled", True)
+            client_config.setdefault("_manual_phone_otp_timeout_seconds", 60)
         client = OAuthClient(
-            self.extra_config,
+            client_config,
             proxy=self.proxy_url,
             verbose=False,
             browser_mode=self.browser_mode,
@@ -702,6 +789,188 @@ class RefreshTokenRegistrationEngine:
 
     def _is_existing_account_capture_enabled(self) -> bool:
         return self._read_bool_config("chatgpt_existing_account_capture", default=False)
+
+    def _should_capture_gopay_provider_link(self) -> bool:
+        for key in (
+            "chatgpt_access_token_only_gopay_provider_link_enabled",
+            "chatgpt_gopay_provider_link_enabled",
+        ):
+            if key in self.extra_config and self.extra_config.get(key) not in (None, ""):
+                return self._read_bool_config(key, default=False)
+        return False
+
+    @staticmethod
+    def _json_object(value: Any) -> dict:
+        if isinstance(value, dict):
+            return dict(value)
+        if isinstance(value, str) and value.strip():
+            try:
+                parsed = json.loads(value)
+            except Exception:
+                return {}
+            if isinstance(parsed, dict):
+                return dict(parsed)
+        return {}
+
+    def _checkout_country_currency(self) -> tuple[str, str]:
+        from services.chatgpt_core.payment import normalize_checkout_country, normalize_checkout_currency
+
+        country = normalize_checkout_country(
+            self.extra_config.get("chatgpt_checkout_country")
+            or self.extra_config.get("chatgpt_access_token_only_checkout_country")
+            or self.extra_config.get("checkout_country")
+            or self.extra_config.get("country")
+            or "US"
+        )
+        currency = normalize_checkout_currency(
+            self.extra_config.get("chatgpt_checkout_currency")
+            or self.extra_config.get("chatgpt_access_token_only_checkout_currency")
+            or self.extra_config.get("checkout_currency")
+            or self.extra_config.get("currency")
+            or "USD",
+            country,
+        )
+        return country, currency
+
+    def _checkout_billing_config(self, *, country: str, currency: str, email_addr: str) -> dict:
+        billing = self.extra_config.get("chatgpt_checkout_billing")
+        if not isinstance(billing, dict):
+            billing = self.extra_config.get("billing") if isinstance(self.extra_config.get("billing"), dict) else {}
+        resolved = dict(billing or {})
+        gopay_defaults = self._json_object(self.extra_config.get("chatgpt_gopay_defaults"))
+        mapping = {
+            "name": "billing_name",
+            "email": "billing_email",
+            "country": "billing_country",
+            "line1": "billing_line1",
+            "city": "billing_city",
+            "state": "billing_state",
+            "postal_code": "billing_postal_code",
+        }
+        for target_key, source_key in mapping.items():
+            value = gopay_defaults.get(source_key)
+            if value not in (None, "") and not resolved.get(target_key):
+                resolved[target_key] = value
+        resolved.setdefault("email", email_addr)
+        resolved.setdefault("country", country)
+        resolved.setdefault("currency", currency)
+        return resolved
+
+    def _append_gopay_provider_link_metadata(
+        self,
+        result: RegistrationResult,
+        session_result: dict[str, Any] | None = None,
+    ) -> None:
+        if not self._should_capture_gopay_provider_link():
+            return
+        result.metadata = result.metadata or {}
+        metadata = {
+            "chatgpt_gopay_provider_link_enabled": True,
+            "chatgpt_gopay_provider_link_ready": False,
+            "chatgpt_gopay_provider_link": "",
+            "chatgpt_gopay_provider_link_error": "",
+        }
+        try:
+            from core.proxy_utils import iter_enabled_runtime_proxies
+            from services.chatgpt_core.gopay_flow import create_gopay_provider_link
+            from services.chatgpt_core.payment import generate_plus_link
+
+            class _CheckoutAccount:
+                pass
+
+            session_result = dict(session_result or {})
+            account = _CheckoutAccount()
+            account.access_token = str(session_result.get("access_token") or result.access_token or "")
+            account.cookies = str(session_result.get("cookies") or session_result.get("cookie") or "")
+            account.session_token = str(session_result.get("session_token") or result.session_token or "")
+            account.email = str(result.email or "")
+            account.extra = {
+                "account_id": str(session_result.get("account_id") or result.account_id or ""),
+                "workspace_id": str(session_result.get("workspace_id") or result.workspace_id or ""),
+                "session_token": account.session_token,
+            }
+            if self.extra_config.get("stripe_publishable_key"):
+                account.extra["stripe_publishable_key"] = self.extra_config.get("stripe_publishable_key")
+            if self.extra_config.get("gopay_browser_profile"):
+                account.extra["gopay_browser_profile"] = self.extra_config.get("gopay_browser_profile")
+            if self.extra_config.get("gopay_processor_entity"):
+                account.extra["gopay_processor_entity"] = self.extra_config.get("gopay_processor_entity")
+            if not account.access_token:
+                raise RuntimeError("缺少 access_token，无法生成 GoPay 平台链接")
+
+            country, currency = self._checkout_country_currency()
+            billing = self._checkout_billing_config(country=country, currency=currency, email_addr=account.email)
+            billing = {**billing, "country": country, "currency": currency}
+            proxy_candidates = [
+                str(item or "").strip()
+                for item in iter_enabled_runtime_proxies(self.proxy_url)
+                if str(item or "").strip()
+            ]
+            if not proxy_candidates:
+                raise RuntimeError("当前没有可用代理，无法生成 GoPay 平台链接")
+            checkout_proxy = proxy_candidates[0]
+            self._log(f"[GoPay] 开始生成注册后平台链接 country={country} currency={currency}")
+            checkout_url = generate_plus_link(
+                account,
+                proxy=checkout_proxy,
+                country=country,
+                currency=currency,
+                billing=billing,
+            )
+            snapshot = create_gopay_provider_link(
+                account,
+                account_id=0,
+                plan="plus",
+                country=country,
+                currency=currency,
+                proxy=checkout_proxy,
+                checkout_url=checkout_url,
+                billing=billing,
+                proxy_source="registration_checkout_proxy",
+                browser_profile=(
+                    self.extra_config.get("gopay_browser_profile")
+                    if isinstance(self.extra_config.get("gopay_browser_profile"), dict)
+                    else None
+                ),
+                return_on_error=True,
+            )
+            provider_link = str(
+                snapshot.get("payment_platform_url")
+                or snapshot.get("midtrans_redirect_url")
+                or ""
+            ).strip()
+            metadata.update(
+                {
+                    "chatgpt_checkout_plan": "plus",
+                    "chatgpt_checkout_url": checkout_url,
+                    "chatgpt_checkout_country": country,
+                    "chatgpt_checkout_currency": currency,
+                    "chatgpt_gopay_provider_link_ready": bool(provider_link),
+                    "chatgpt_gopay_provider_link": provider_link,
+                    "chatgpt_gopay_provider_link_error": "" if provider_link else str(snapshot.get("last_error") or "未返回有效 URL"),
+                    "chatgpt_gopay_provider_link_snapshot": snapshot,
+                    "chatgpt_gopay_provider_link_checkout_url": snapshot.get("checkout_url") or checkout_url,
+                    "chatgpt_gopay_provider_link_cs_id": snapshot.get("cs_id") or "",
+                    "chatgpt_gopay_provider_link_snap_token": snapshot.get("snap_token") or "",
+                    "chatgpt_gopay_provider_link_stripe_redirect_url": snapshot.get("stripe_redirect_url") or "",
+                    "chatgpt_gopay_provider_link_midtrans_redirect_url": snapshot.get("midtrans_redirect_url") or "",
+                    "chatgpt_gopay_provider_link_payment_method_types": (
+                        (snapshot.get("result") or {}).get("payment_method_types")
+                        if isinstance(snapshot.get("result"), dict)
+                        else []
+                    ),
+                    "chatgpt_gopay_provider_link_phase": snapshot.get("phase") or "",
+                }
+            )
+            if provider_link:
+                self._log(f"[GoPay] 注册后平台链接已获取: {provider_link}")
+            else:
+                self._log("[GoPay] 注册后平台链接未返回有效 URL", "warning")
+        except Exception as exc:
+            error = str(exc).strip() or exc.__class__.__name__
+            metadata["chatgpt_gopay_provider_link_error"] = error
+            self._log(f"[GoPay] 注册后平台链接获取失败，账号仍按注册结果保存: {error}", "warning")
+        result.metadata.update(metadata)
 
     @staticmethod
     def _normalize_workspace_scope(value: str) -> str:
@@ -857,6 +1126,11 @@ class RefreshTokenRegistrationEngine:
 
     def _is_registration_access_token_save_enabled(self) -> bool:
         value = self.extra_config.get("chatgpt_save_registration_access_token_account")
+        # 注册阶段已经拿到 ChatGPT session/accessToken 时，默认先保存成 AT-only 账号，
+        # 后续 refresh_token / workspace 捕获失败再走补抓；否则真实注册成功会被
+        # “未生成任何工作空间产物”拖成失败，账号和邮箱资源都白消耗。
+        if value is None or value == "":
+            return True
         if isinstance(value, str):
             return value.strip().lower() in {"1", "true", "yes", "on"}
         return bool(value)
@@ -871,10 +1145,12 @@ class RefreshTokenRegistrationEngine:
             scope="free",
             source="registration_session",
         )
-        artifact["label"] = "registration_at"
-        artifact["variant_key"] = (
-            f"registration_at:{artifact.get('workspace_id') or artifact.get('account_id') or 'unknown'}"
-        )
+        # 注册阶段的 AT checkpoint 本质就是同一账号的 free 工作空间半成品。
+        # 这里必须使用最终 full-auth 升级时相同的 variant key，否则第一阶段
+        # AT-only 和第二阶段 RT 会被保存成两条账号。
+        stable_id = artifact.get("account_id") or artifact.get("workspace_id") or "unknown"
+        artifact["label"] = "free"
+        artifact["variant_key"] = f"free:{stable_id}"
         artifact["auth_level"] = "access_token_only"
         artifact["partial_auth"] = True
         return artifact
@@ -885,21 +1161,33 @@ class RefreshTokenRegistrationEngine:
         result: RegistrationResult,
         artifact: Optional[dict[str, Any]],
         reason: str,
+        session_tokens: Optional[dict[str, Any]] = None,
     ) -> bool:
+        session_tokens = session_tokens if isinstance(session_tokens, dict) else {}
+        if not artifact and session_tokens:
+            artifact = self._build_registration_access_token_artifact(
+                session_tokens=session_tokens,
+            )
         if not artifact or not str(artifact.get("access_token") or "").strip():
             return False
         self._apply_workspace_artifact_to_result(result, artifact)
         result.success = True
+        result.email = self.email or result.email or ""
+        result.password = self.password or result.password or ""
         result.source = "registration_session"
         result.workspace_artifacts = [artifact]
         result.error_message = ""
         result.metadata = result.metadata or {}
         result.metadata["registration_stage_complete"] = True
         result.metadata["registration_access_token_saved"] = True
-        result.metadata["registration_access_token_partial_reason"] = str(reason or "").strip()
-        result.metadata["workspace_capture_partial_success"] = True
+        if session_tokens:
+            result.metadata.setdefault("registration_session_account_id", str(session_tokens.get("account_id") or ""))
+            result.metadata.setdefault("registration_session_workspace_id", str(session_tokens.get("workspace_id") or ""))
+            for key in ("auth_provider", "expires", "user_id", "user", "account", "cookies"):
+                if key in session_tokens and key not in result.metadata:
+                    result.metadata[key] = session_tokens.get(key)
         self._log(
-            f"[结果] 注册阶段 AccessToken 已保存；后续 auth 未完成: {self._compact_error_text(reason)}",
+            f"[注册] 第二阶段未获取 RT，保留第一阶段 AT-only，不改账号: {self._compact_error_text(reason)}",
             "warning",
         )
         return True
@@ -1094,6 +1382,7 @@ class RefreshTokenRegistrationEngine:
         business_oauth_client = business_join_result.get("oauth_client") if isinstance(business_join_result, dict) else None
         business_source = str((business_join_result or {}).get("source") or "business_recovery")
         last_business_capture_error = ""
+        self._remember_oauth_phone_challenge_events(business_oauth_client)
 
         if isinstance(business_tokens, dict) and business_oauth_client is not None:
             business_artifact = self._build_workspace_artifact(
@@ -1242,6 +1531,7 @@ class RefreshTokenRegistrationEngine:
             }
             for item in ordered_artifacts
         ]
+        self._apply_phone_challenge_metadata(result)
         if optional_failures:
             failed_labels = " / ".join(self._scope_label(scope) for scope in optional_failures)
             self._log(f"[结果] 成功，已保留 business；未获取 {failed_labels}")
@@ -1274,6 +1564,7 @@ class RefreshTokenRegistrationEngine:
             impersonate=impersonate,
             workspace_scope_preference=normalized_scope,
         )
+        self._remember_oauth_phone_challenge_events(oauth_client)
         if not tokens:
             self._log(
                 f"预热｜复用已登录 auth 会话抓取 {normalized_scope} 失败: {oauth_client.last_error or 'OAuth 登录失败'}",
@@ -1314,6 +1605,7 @@ class RefreshTokenRegistrationEngine:
         first_name: str,
         last_name: str,
         birthdate: str,
+        login_source: Optional[str] = None,
     ) -> Optional[dict[str, Any]]:
         normalized_scope = self._normalize_workspace_scope(scope)
         if not normalized_scope:
@@ -1321,29 +1613,39 @@ class RefreshTokenRegistrationEngine:
 
         self._log(f"[{normalized_scope}] 开始真实 auth 登录")
         scoped_oauth_client = self._build_oauth_client()
-        tokens = scoped_oauth_client.login_and_get_tokens(
-            email,
-            password,
-            device_id=device_id or "",
-            user_agent=user_agent,
-            sec_ch_ua=sec_ch_ua,
-            impersonate=impersonate,
-            browser_fingerprint=browser_fingerprint,
-            skymail_client=email_adapter,
-            prefer_passwordless_login=True,
-            allow_phone_verification=False,
-            force_new_browser=True,
-            force_chatgpt_entry=False,
-            screen_hint="login",
-            force_password_login=False,
-            complete_about_you_if_needed=True,
-            first_name=first_name,
-            last_name=last_name,
-            birthdate=birthdate,
-            login_source=f"workspace_capture_{normalized_scope}",
-            stop_after_login=False,
-            workspace_scope_preference=normalized_scope,
-        )
+        allow_add_phone_verification, allow_existing_phone_verification = self._registration_full_auth_phone_policy()
+        try:
+            tokens = scoped_oauth_client.login_and_get_tokens(
+                email,
+                password,
+                device_id=device_id or "",
+                user_agent=user_agent,
+                sec_ch_ua=sec_ch_ua,
+                impersonate=impersonate,
+                browser_fingerprint=browser_fingerprint,
+                skymail_client=email_adapter,
+                prefer_passwordless_login=True,
+                allow_phone_verification=bool(allow_add_phone_verification or allow_existing_phone_verification),
+                allow_add_phone_verification=allow_add_phone_verification,
+                allow_existing_phone_verification=allow_existing_phone_verification,
+                force_new_browser=True,
+                force_chatgpt_entry=False,
+                screen_hint="login",
+                force_password_login=False,
+                complete_about_you_if_needed=True,
+                first_name=first_name,
+                last_name=last_name,
+                birthdate=birthdate,
+                login_source=str(login_source or f"workspace_capture_{normalized_scope}").strip()
+                or f"workspace_capture_{normalized_scope}",
+                stop_after_login=False,
+                workspace_scope_preference=normalized_scope,
+                allow_add_phone_session_recovery=False,
+            )
+        except TaskInterruption:
+            self._remember_oauth_phone_challenge_events(scoped_oauth_client)
+            raise
+        self._remember_oauth_phone_challenge_events(scoped_oauth_client)
         if not tokens:
             self._last_workspace_capture_error = str(scoped_oauth_client.last_error or "OAuth 登录失败")
             self._log(
@@ -1506,6 +1808,7 @@ class RefreshTokenRegistrationEngine:
             }
             for item in ordered_artifacts
         ]
+        self._apply_phone_challenge_metadata(result)
         if optional_failures:
             failed_labels = " / ".join(self._scope_label(scope) for scope in optional_failures)
             if allow_partial_success:
@@ -1583,6 +1886,7 @@ class RefreshTokenRegistrationEngine:
         )
         save_registration_access_token_account = self._is_registration_access_token_save_enabled()
         registration_access_token_artifact: Optional[dict[str, Any]] = None
+        self._last_phone_challenge_events = []
 
         try:
             registration_message = ""
@@ -1616,6 +1920,7 @@ class RefreshTokenRegistrationEngine:
                 return result
 
             result.email = self.email or ""
+            self.extra_config["_current_account_email"] = result.email
             self.password = str(self.password or "").strip() if existing_account_capture else (self.password or generate_random_password(16))
             result.password = self.password
 
@@ -1631,7 +1936,8 @@ class RefreshTokenRegistrationEngine:
                 self._log,
             )
 
-            register_client = self._build_chatgpt_client()
+            register_client = self._prepared_register_client or self._build_chatgpt_client()
+            self._prepared_register_client = None
 
             if existing_account_capture:
                 selected_scopes = self._resolve_workspace_capture_scopes(current_scope="business")
@@ -1668,16 +1974,19 @@ class RefreshTokenRegistrationEngine:
                         birthdate=birthdate,
                         login_source=f"workspace_capture_{preferred_scope}:existing_account_capture",
                         workspace_scope_preference=preferred_scope,
+                        allow_add_phone_session_recovery=False,
                     )
                     if candidate_tokens:
                         tokens = candidate_tokens
                         login_scope = preferred_scope
                         break
+                    self._remember_oauth_phone_challenge_events(oauth_client)
                     last_error = oauth_client.last_error or f"抓取 {preferred_scope} 失败"
                 if not tokens or oauth_client is None:
                     result.error_message = last_error or "已有账号抓 auth 失败"
                     self._finalize_email_service_failure(result, fallback_error=result.error_message)
                     return result
+                self._remember_oauth_phone_challenge_events(oauth_client)
                 self._populate_result_from_tokens(
                     result=result,
                     tokens=tokens,
@@ -1709,6 +2018,7 @@ class RefreshTokenRegistrationEngine:
                     birthdate=birthdate,
                 )
                 result.metadata["mailbox_state"] = self._export_mailbox_state(email_adapter)
+                self._append_gopay_provider_link_metadata(result, tokens or {})
                 self._log(f"[结果] 成功，account_id={result.account_id or '-'} workspace_id={result.workspace_id or '-'}")
                 self._finalize_email_service_success(result)
                 return result
@@ -1746,10 +2056,11 @@ class RefreshTokenRegistrationEngine:
                     self._log(result.error_message, "warning")
                     self._finalize_email_service_failure(result, fallback_error=result.error_message)
                     return result
-                if save_registration_access_token_account:
-                    registration_access_token_artifact = self._build_registration_access_token_artifact(
-                        session_tokens=session_or_error or {},
-                    )
+                registration_access_token_artifact = self._build_registration_access_token_artifact(
+                    session_tokens=session_or_error or {},
+                )
+                if not str(registration_access_token_artifact.get("access_token") or "").strip():
+                    registration_access_token_artifact = None
                 result.metadata = result.metadata or {}
                 result.metadata["registration_session_account_id"] = str((session_or_error or {}).get("account_id") or "")
                 result.metadata["registration_session_workspace_id"] = str((session_or_error or {}).get("workspace_id") or "")
@@ -1760,6 +2071,13 @@ class RefreshTokenRegistrationEngine:
                     birthdate=birthdate,
                 )
                 result.metadata["mailbox_state"] = self._export_mailbox_state(email_adapter)
+                result.metadata["registration_stage_complete"] = True
+                result.metadata["registration_access_token_checkpoint_created"] = bool(registration_access_token_artifact)
+                result.metadata["registration_access_token_checkpoint_policy"] = "always_keep_before_full_auth"
+                if not save_registration_access_token_account:
+                    result.metadata["registration_access_token_save_requested"] = False
+                if registration_access_token_artifact:
+                    self._log("[注册] 已完成注册并建立 AT checkpoint")
 
                 if self._is_team_invite_enabled():
                     if self._is_team_invite_deferred_activation_enabled():
@@ -1813,27 +2131,36 @@ class RefreshTokenRegistrationEngine:
                     if not business_join_result:
                         result.error_message = "进入 business 工作空间失败"
                         self._log(result.error_message, "warning")
-                        if save_registration_access_token_account and self._return_registration_access_token_partial_result(
+                        if self._return_registration_access_token_partial_result(
                             result=result,
                             artifact=registration_access_token_artifact,
                             reason=result.error_message,
                         ):
                             self._finalize_email_service_success(result)
                             return result
+                        self._apply_phone_challenge_metadata(result)
                         self._finalize_email_service_failure(result, fallback_error=result.error_message)
                         return result
 
                     self._log("[business] 邀请阶段已完成，开始保存 business 工作空间")
-                    if not self._capture_workspace_artifacts_after_business_join(
-                        result=result,
-                        register_client=register_client,
-                        email_adapter=email_adapter,
-                        first_name=first_name,
-                        last_name=last_name,
-                        birthdate=birthdate,
-                        business_join_result=business_join_result,
-                    ):
-                        if save_registration_access_token_account and self._return_registration_access_token_partial_result(
+                    self._log("[注册] 开始第二阶段完整 Auth 捕获")
+                    try:
+                        business_capture_ok = self._capture_workspace_artifacts_after_business_join(
+                            result=result,
+                            register_client=register_client,
+                            email_adapter=email_adapter,
+                            first_name=first_name,
+                            last_name=last_name,
+                            birthdate=birthdate,
+                            business_join_result=business_join_result,
+                        )
+                    except SkipCurrentAttemptRequested as exc:
+                        business_capture_ok = False
+                        result.error_message = str(exc or "第二阶段完整 Auth 捕获被跳过")
+                    if not business_capture_ok:
+                        if not str(result.error_message or "").strip():
+                            result.error_message = self._last_workspace_capture_error or "未生成任何工作空间产物"
+                        if self._return_registration_access_token_partial_result(
                             result=result,
                             artifact=registration_access_token_artifact,
                             reason=result.error_message,
@@ -1843,6 +2170,10 @@ class RefreshTokenRegistrationEngine:
                         self._finalize_email_service_failure(result, fallback_error=result.error_message)
                         return result
 
+                    self._append_gopay_provider_link_metadata(
+                        result,
+                        session_or_error if isinstance(session_or_error, dict) else {},
+                    )
                     self._log(f"[结果] 成功，account_id={result.account_id or '-'} workspace_id={result.workspace_id or '-'}")
                     self._finalize_email_service_success(result)
                     return result
@@ -1855,16 +2186,23 @@ class RefreshTokenRegistrationEngine:
                 result.account_id = ""
                 result.workspace_id = ""
                 result.source = ""
-                self._log("[free] 开始真实 auth 登录")
-                if not self._finalize_workspace_artifacts(
-                    result=result,
-                    register_client=register_client,
-                    email_adapter=email_adapter,
-                    first_name=first_name,
-                    last_name=last_name,
-                    birthdate=birthdate,
-                ):
-                    if save_registration_access_token_account and self._return_registration_access_token_partial_result(
+                self._log("[注册] 开始第二阶段完整 Auth 捕获")
+                try:
+                    workspace_capture_ok = self._finalize_workspace_artifacts(
+                        result=result,
+                        register_client=register_client,
+                        email_adapter=email_adapter,
+                        first_name=first_name,
+                        last_name=last_name,
+                        birthdate=birthdate,
+                    )
+                except SkipCurrentAttemptRequested as exc:
+                    workspace_capture_ok = False
+                    result.error_message = str(exc or "第二阶段完整 Auth 捕获被跳过")
+                if not workspace_capture_ok:
+                    if not str(result.error_message or "").strip():
+                        result.error_message = self._last_workspace_capture_error or "未生成任何工作空间产物"
+                    if self._return_registration_access_token_partial_result(
                         result=result,
                         artifact=registration_access_token_artifact,
                         reason=result.error_message,
@@ -1874,6 +2212,10 @@ class RefreshTokenRegistrationEngine:
                     self._finalize_email_service_failure(result, fallback_error=result.error_message)
                     return result
 
+                self._append_gopay_provider_link_metadata(
+                    result,
+                    session_or_error if isinstance(session_or_error, dict) else {},
+                )
                 self._log(f"[结果] 成功，account_id={result.account_id or '-'} workspace_id={result.workspace_id or '-'}")
                 self._finalize_email_service_success(result)
                 return result
@@ -1900,9 +2242,11 @@ class RefreshTokenRegistrationEngine:
                 last_name=last_name,
                 birthdate=birthdate,
                 login_source="existing_account_recovery",
+                allow_add_phone_session_recovery=False,
             )
 
             if not tokens:
+                self._remember_oauth_phone_challenge_events(oauth_client)
                 last_error = oauth_client.last_error or "OAuth 登录状态机失败"
                 if self._is_team_invite_enabled() and self._should_attempt_business_workspace_recovery(oauth_client):
                     self._log("[主链路] OAuth 主链路未拿到 workspace，转入 business recovery", "warning")
@@ -1923,6 +2267,7 @@ class RefreshTokenRegistrationEngine:
                         tokens = recovery_result.get("tokens") or {}
                         oauth_client = recovery_result.get("oauth_client") or oauth_client
                         source = "business_recovery"
+                        self._remember_oauth_phone_challenge_events(oauth_client)
                         self._populate_result_from_tokens(
                             result=result,
                             tokens=tokens,
@@ -1933,6 +2278,7 @@ class RefreshTokenRegistrationEngine:
                         )
                         if not result.success:
                             self._log(result.error_message or "business recovery 未获取到 refresh_token", "warning")
+                            self._apply_phone_challenge_metadata(result)
                             self._finalize_email_service_failure(result, fallback_error=result.error_message)
                             return result
                         result.metadata = result.metadata or {}
@@ -1947,15 +2293,20 @@ class RefreshTokenRegistrationEngine:
                             last_name=last_name,
                             birthdate=birthdate,
                         ):
+                            self._apply_phone_challenge_metadata(result)
                             self._finalize_email_service_failure(result, fallback_error=result.error_message)
                             return result
+                        self._append_gopay_provider_link_metadata(result, tokens or {})
+                        self._apply_phone_challenge_metadata(result)
                         self._log(f"[结果] 成功，account_id={result.account_id or '-'} workspace_id={result.workspace_id or '-'}")
                         self._finalize_email_service_success(result)
                         return result
                 result.error_message = last_error
+                self._apply_phone_challenge_metadata(result)
                 self._finalize_email_service_failure(result, fallback_error=last_error)
                 return result
 
+            self._remember_oauth_phone_challenge_events(oauth_client)
             self._populate_result_from_tokens(
                 result=result,
                 tokens=tokens,
@@ -1966,6 +2317,7 @@ class RefreshTokenRegistrationEngine:
             )
             if not result.success:
                 self._log(result.error_message or "OAuth 主链路未获取到 refresh_token", "warning")
+                self._apply_phone_challenge_metadata(result)
                 self._finalize_email_service_failure(result, fallback_error=result.error_message)
                 return result
             if not self._finalize_workspace_artifacts(
@@ -1976,9 +2328,12 @@ class RefreshTokenRegistrationEngine:
                 last_name=last_name,
                 birthdate=birthdate,
             ):
+                self._apply_phone_challenge_metadata(result)
                 self._finalize_email_service_failure(result, fallback_error=result.error_message)
                 return result
 
+            self._append_gopay_provider_link_metadata(result, tokens or {})
+            self._apply_phone_challenge_metadata(result)
             self._log(f"[结果] 成功，account_id={result.account_id or '-'} workspace_id={result.workspace_id or '-'}")
             self._finalize_email_service_success(result)
             return result

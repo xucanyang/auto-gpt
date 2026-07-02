@@ -22,6 +22,39 @@ class DummyAccount:
 
 
 class GoPayFlowTests(unittest.TestCase):
+    def _make_runner(self, *, session=None, account=None):
+        session = session or gopay_flow.GoPaySession(
+            session_id="gp_test",
+            account_id=1,
+            email="demo@example.com",
+            country="ID",
+            currency="IDR",
+            checkout_url="https://pay.openai.com/c/pay/cs_live_123#fid_demo",
+            billing={
+                "country": "ID",
+                "line1": "Jl. M.H. Thamrin No. 1",
+                "city": "Jakarta",
+                "state": "DKI Jakarta",
+                "postal_code": "10310",
+            },
+        )
+        runner = gopay_flow.GoPayRunner.__new__(gopay_flow.GoPayRunner)
+        runner.s = session
+        runner.account = account or DummyAccount()
+        runner.proxy = ""
+        runner.checkout_proxy = ""
+        runner.profile = {
+            "impersonate": "chrome146",
+            "ua": "ua",
+            "locale": "id-ID",
+            "stripe_locale": "id",
+            "timezone": "Asia/Jakarta",
+            "time_on_page": 30000,
+        }
+        runner.billing = dict(session.billing or {})
+        runner.ext = mock.Mock()
+        return runner
+
     def test_midtrans_snap_signature_matches_charge_har_vector(self):
         path = "/snap/v2/transactions/dc7fb3e6-42e1-4cd6-9e32-bbfc0ae29d2a/charge"
         body = '{"payment_type":"gopay","tokenization":"true","promo_details":null}'
@@ -90,6 +123,27 @@ class GoPayFlowTests(unittest.TestCase):
         self.assertNotIn("elements_options_client[stripe_js_locale]", payload)
         self.assertEqual(payload["elements_options_client[saved_payment_method][enable_save]"], "never")
 
+    def test_create_hosted_checkout_uses_hosted_ui_for_gopay_long_link(self):
+        response = mock.Mock()
+        response.status_code = 200
+        response.json.return_value = {"checkout_session_id": "cs_live_gopay_custom"}
+
+        with mock.patch.object(gopay_flow, "_post_chatgpt_with_profile", return_value=response) as post_mock:
+            checkout_url, cs_id, processor_entity = gopay_flow._create_hosted_checkout(
+                DummyAccount(),
+                country="ID",
+                currency="IDR",
+                proxy="",
+                profile={"impersonate": "chrome146"},
+            )
+
+        self.assertEqual(cs_id, "cs_live_gopay_custom")
+        self.assertEqual(processor_entity, "openai_llc")
+        self.assertIn("cs_live_gopay_custom", checkout_url)
+        payload = post_mock.call_args.kwargs["json_body"]
+        self.assertEqual(payload["checkout_ui_mode"], "hosted")
+        self.assertEqual(payload["billing_details"], {"country": "ID", "currency": "IDR"})
+
     def test_resolve_checkout_creates_hosted_checkout_when_no_session_id_is_present(self):
         session = gopay_flow.GoPaySession(
             session_id="gp_test",
@@ -110,7 +164,7 @@ class GoPayFlowTests(unittest.TestCase):
         with mock.patch.object(
             gopay_flow,
             "_create_hosted_checkout",
-            return_value=("https://chatgpt.com/checkout/openai_llc/cs_live_abc123", "cs_live_abc123"),
+            return_value=("https://chatgpt.com/checkout/openai_llc/cs_live_abc123", "cs_live_abc123", "openai_llc"),
         ):
             cs_id = gopay_flow.GoPayRunner._resolve_checkout(runner)
 
@@ -119,7 +173,56 @@ class GoPayFlowTests(unittest.TestCase):
         self.assertEqual(session.stripe_checkout_url, "https://checkout.stripe.com/c/pay/cs_live_abc123")
         self.assertEqual(session.processor_entity, "openai_llc")
 
-    def test_chatgpt_approve_allows_blocked_to_continue_polling(self):
+    def test_chatgpt_approve_sends_checkout_context_headers(self):
+        session = gopay_flow.GoPaySession(
+            session_id="gp_test",
+            account_id=1,
+            email="demo@example.com",
+            processor_entity="openai_ie",
+        )
+        runner = gopay_flow.GoPayRunner.__new__(gopay_flow.GoPayRunner)
+        runner.s = session
+        runner.account = DummyAccount()
+        runner.proxy = ""
+        runner.profile = {"impersonate": "chrome146", "ua": "ua"}
+        runner.chatgpt_oai_session_id = "oai-session-demo"
+
+        warmup = mock.Mock()
+        warmup.status_code = 200
+        approved = mock.Mock()
+        approved.status_code = 200
+        approved.json.return_value = {"result": "approved"}
+        sentinel = mock.Mock()
+        sentinel.status_code = 200
+        sentinel.json.return_value = {}
+        approve_calls = []
+
+        def fake_post(_account, url, **kwargs):
+            if url.endswith("/backend-api/payments/checkout/approve"):
+                approve_calls.append(kwargs)
+                return approved
+            return sentinel
+
+        with mock.patch.object(gopay_flow, "_get_chatgpt_with_profile", return_value=warmup) as get, \
+            mock.patch.object(gopay_flow.GoPayRunner, "_checkout_sentinel_token", return_value="sentinel-demo"), \
+            mock.patch.object(gopay_flow, "_post_chatgpt_with_profile", side_effect=fake_post):
+            payload = gopay_flow.GoPayRunner._chatgpt_approve(runner, "cs_live_123")
+
+        self.assertEqual(payload["result"], "approved")
+        self.assertGreaterEqual(get.call_count, 1)
+        self.assertEqual(len(approve_calls), 1)
+        self.assertEqual(
+            approve_calls[0]["json_body"],
+            {"checkout_session_id": "cs_live_123", "processor_entity": "openai_ie"},
+        )
+        headers = approve_calls[0]["extra_headers"]
+        self.assertEqual(headers["Referer"], "https://chatgpt.com/checkout/openai_ie/cs_live_123")
+        self.assertEqual(headers["x-openai-target-path"], "/backend-api/payments/checkout/approve")
+        self.assertEqual(headers["x-openai-target-route"], "/backend-api/payments/checkout/approve")
+        self.assertEqual(headers["oai-session-id"], "oai-session-demo")
+        self.assertEqual(headers["openai-sentinel-token"], "sentinel-demo")
+
+    def test_chatgpt_approve_raises_after_blocked_retries(self):
         session = gopay_flow.GoPaySession(
             session_id="gp_test",
             account_id=1,
@@ -132,18 +235,38 @@ class GoPayFlowTests(unittest.TestCase):
         runner.proxy = ""
         runner.profile = {"impersonate": "chrome146", "ua": "ua"}
 
+        warmup = mock.Mock()
+        warmup.status_code = 200
         blocked = mock.Mock()
-        blocked.raise_for_status.return_value = None
+        blocked.status_code = 200
         blocked.json.return_value = {"result": "blocked", "detail": "pending manual state"}
+        sentinel = mock.Mock()
+        sentinel.status_code = 200
+        sentinel.json.return_value = {}
 
-        with mock.patch.object(gopay_flow, "_post_chatgpt_with_profile", return_value=blocked) as post:
-            payload = gopay_flow.GoPayRunner._chatgpt_approve(runner, "cs_live_123")
+        def fake_post(_account, url, **kwargs):
+            if url.endswith("/backend-api/payments/checkout/approve"):
+                return blocked
+            return sentinel
 
-        self.assertEqual(payload["result"], "blocked")
-        self.assertEqual(
-            post.call_args.kwargs["json_body"],
-            {"checkout_session_id": "cs_live_123", "processor_entity": "openai_ie"},
-        )
+        with mock.patch.object(gopay_flow, "_get_chatgpt_with_profile", return_value=warmup), \
+            mock.patch.object(gopay_flow.GoPayRunner, "_checkout_sentinel_token", return_value="sentinel-demo"), \
+            mock.patch.object(gopay_flow, "_post_chatgpt_with_profile", side_effect=fake_post), \
+            mock.patch.object(gopay_flow.time, "sleep"):
+            with self.assertRaisesRegex(gopay_flow.GoPayFlowError, "chatgpt approve blocked"):
+                gopay_flow.GoPayRunner._chatgpt_approve(runner, "cs_live_123")
+
+    def test_build_chatgpt_headers_synthesizes_cookie_from_session_token(self):
+        account = mock.Mock()
+        account.access_token = "at-demo"
+        account.cookies = ""
+        account.session_token = ""
+        account.extra = {"session_token": "session-demo"}
+
+        headers = gopay_flow._build_chatgpt_headers(account)
+
+        self.assertIn("__Secure-next-auth.session-token=session-demo", headers["Cookie"])
+        self.assertIn("__Secure-authjs.session-token=session-demo", headers["Cookie"])
 
     def test_follow_redirect_scans_post_approve_payload_for_redirect(self):
         session = gopay_flow.GoPaySession(
@@ -179,6 +302,32 @@ class GoPayFlowTests(unittest.TestCase):
 
         self.assertEqual(snap, "11111111-1111-1111-1111-111111111111")
 
+    def test_stripe_init_checkout_uses_hosted_page_shape(self):
+        runner = self._make_runner()
+        response = mock.Mock(status_code=200)
+        response.json.return_value = {
+            "init_checksum": "init-checksum",
+            "currency": "idr",
+            "total_summary": {"due": 0},
+            "payment_method_types": ["card", "gopay"],
+            "stripe_hosted_url": "https://pay.openai.com/c/pay/cs_live_123#fid_demo",
+        }
+        runner.ext.post.return_value = response
+
+        init_data, stripe_version, ctx = gopay_flow.GoPayRunner._stripe_init_checkout(runner, "cs_live_123", "pk_live")
+
+        self.assertEqual(init_data["init_checksum"], "init-checksum")
+        self.assertEqual(stripe_version, gopay_flow.STRIPE_VERSION_HOSTED)
+        payload = runner.ext.post.call_args.kwargs["data"]
+        self.assertEqual(payload["eid"], "NA")
+        self.assertEqual(payload["browser_locale"], "id-ID")
+        self.assertEqual(payload["browser_timezone"], "Asia/Jakarta")
+        self.assertEqual(payload["redirect_type"], "url")
+        self.assertEqual(payload["key"], "pk_live")
+        self.assertNotIn("elements_session_client[elements_init_source]", payload)
+        self.assertNotIn("elements_options_client[saved_payment_method][enable_save]", payload)
+        self.assertEqual(ctx["payment_method_types"], ["card", "gopay"])
+
     def test_stripe_update_payment_page_address_posts_tax_region_steps(self):
         session = gopay_flow.GoPaySession(
             session_id="gp_test",
@@ -208,15 +357,71 @@ class GoPayFlowTests(unittest.TestCase):
                 runner,
                 "cs_live_123",
                 "pk_live",
-                gopay_flow.STRIPE_VERSION_FULL,
-                {"elements_options_client": {}},
+                gopay_flow.STRIPE_VERSION_HOSTED,
+                {},
             )
 
         self.assertEqual(runner.ext.post.call_count, 6)
         first_call = runner.ext.post.call_args_list[0]
         third_call = runner.ext.post.call_args_list[2]
+        self.assertEqual(first_call.kwargs["data"]["eid"], "NA")
         self.assertEqual(first_call.kwargs["data"]["tax_region[country]"], "ID")
         self.assertEqual(third_call.kwargs["data"]["tax_region[line1]"], "Jl. M.H. Thamrin No. 1")
+        self.assertNotIn("elements_session_client[elements_init_source]", first_call.kwargs["data"])
+
+    def test_stripe_create_pm_uses_hosted_checkout_attribution(self):
+        runner = self._make_runner()
+        response = mock.Mock(status_code=200)
+        response.json.return_value = {"id": "pm_123"}
+        runner.ext.post.return_value = response
+
+        pm_id = gopay_flow.GoPayRunner._stripe_create_pm(
+            runner,
+            "cs_live_123",
+            "pk_live",
+            gopay_flow.STRIPE_VERSION_HOSTED,
+            {"stripe_js_id": "stripe-js-id", "config_id": "cfg_123", "guid": "g", "muid": "m", "sid": "s"},
+        )
+
+        self.assertEqual(pm_id, "pm_123")
+        payload = runner.ext.post.call_args.kwargs["data"]
+        self.assertEqual(payload["type"], "gopay")
+        self.assertEqual(payload["_stripe_version"], gopay_flow.STRIPE_VERSION_HOSTED)
+        self.assertIn("checkout", payload["payment_user_agent"])
+        self.assertEqual(payload["client_attribution_metadata[merchant_integration_source]"], "checkout")
+        self.assertEqual(payload["client_attribution_metadata[merchant_integration_version]"], "custom_checkout")
+        self.assertNotIn("client_attribution_metadata[elements_session_id]", payload)
+
+    def test_stripe_confirm_uses_hosted_return_url_and_minimal_body(self):
+        runner = self._make_runner()
+        response = mock.Mock(status_code=200)
+        response.json.return_value = {"submission_attempt": {"state": "requires_approval"}}
+        runner.ext.post.return_value = response
+
+        payload = gopay_flow.GoPayRunner._stripe_confirm(
+            runner,
+            "cs_live_123",
+            "pm_123",
+            "pk_live",
+            {
+                "init_checksum": "init-checksum",
+                "total_summary": {"due": 0},
+                "stripe_hosted_url": "https://pay.openai.com/c/pay/cs_live_123#fid_demo",
+            },
+            gopay_flow.STRIPE_VERSION_HOSTED,
+            {"stripe_js_id": "stripe-js-id", "config_id": "cfg_123", "guid": "g", "muid": "m", "sid": "s"},
+        )
+
+        self.assertEqual(payload["submission_attempt"]["state"], "requires_approval")
+        data = runner.ext.post.call_args.kwargs["data"]
+        self.assertEqual(data["eid"], "NA")
+        self.assertEqual(data["expected_amount"], "0")
+        self.assertEqual(data["expected_payment_method_type"], "gopay")
+        self.assertIn("https://pay.openai.com/c/pay/cs_live_123?redirect_pm_type=gopay&", data["return_url"])
+        self.assertIn("&ui_mode=custom#fid_demo", data["return_url"])
+        self.assertEqual(data["version"], gopay_flow.DEFAULT_STRIPE_RUNTIME_VERSION)
+        self.assertEqual(data["_stripe_version"], gopay_flow.STRIPE_VERSION_HOSTED)
+        self.assertNotIn("elements_session_client[elements_init_source]", data)
 
     def test_start_until_otp_updates_address_before_required_approve(self):
         session = gopay_flow.GoPaySession(
@@ -356,6 +561,100 @@ class GoPayFlowTests(unittest.TestCase):
             gopay_flow.GoPayRunner.start_until_otp(runner, "62", "81234567890")
 
         self.assertEqual(events, ["follow"])
+
+    def test_start_until_provider_link_stops_before_phone_linking(self):
+        session = gopay_flow.GoPaySession(
+            session_id="gp_provider",
+            account_id=1,
+            email="demo@example.com",
+            country="ID",
+            billing={
+                "country": "ID",
+                "line1": "Jl. M.H. Thamrin No. 1",
+                "city": "Jakarta",
+                "state": "DKI Jakarta",
+                "postal_code": "10310",
+            },
+        )
+        runner = gopay_flow.GoPayRunner.__new__(gopay_flow.GoPayRunner)
+        runner.s = session
+        runner.account = DummyAccount()
+        runner.proxy = ""
+        runner.profile = {"impersonate": "chrome146", "ua": "ua", "time_on_page": 30000}
+        runner.billing = dict(session.billing or {})
+        runner.ext = mock.Mock()
+
+        events: list[str] = []
+
+        with mock.patch.object(gopay_flow.GoPayRunner, "_resolve_checkout", return_value="cs_live_123"), \
+            mock.patch.object(gopay_flow.GoPayRunner, "_fetch_publishable_key", return_value="pk_live"), \
+            mock.patch.object(
+                gopay_flow.GoPayRunner,
+                "_stripe_init_checkout",
+                return_value=(
+                    {"init_checksum": "ic"},
+                    gopay_flow.STRIPE_VERSION_BASE,
+                    {"config_id": "cfg", "elements_options_client": {}, "payment_method_types": ["gopay"]},
+                ),
+            ), \
+            mock.patch.object(gopay_flow.GoPayRunner, "_stripe_update_payment_page_address"), \
+            mock.patch.object(gopay_flow.GoPayRunner, "_stripe_create_pm", return_value="pm_1"), \
+            mock.patch.object(
+                gopay_flow.GoPayRunner,
+                "_stripe_confirm",
+                return_value={"submission_attempt": {"state": "requires_approval"}},
+            ), \
+            mock.patch.object(gopay_flow.GoPayRunner, "_chatgpt_approve", return_value={"result": "approved"}), \
+            mock.patch.object(
+                gopay_flow.GoPayRunner,
+                "_follow_redirect_to_midtrans",
+                return_value="11111111-1111-1111-1111-111111111111",
+            ), \
+            mock.patch.object(
+                gopay_flow.GoPayRunner,
+                "_midtrans_load_transaction",
+                side_effect=lambda *args, **kwargs: events.append("load_transaction"),
+            ), \
+            mock.patch.object(gopay_flow.GoPayRunner, "_midtrans_init_linking") as init_linking, \
+            mock.patch.object(gopay_flow.GoPayRunner, "_gopay_validate_reference") as validate_reference, \
+            mock.patch.object(gopay_flow.GoPayRunner, "_gopay_user_consent") as user_consent:
+            result = gopay_flow.GoPayRunner.start_until_provider_link(runner)
+
+        self.assertEqual(events, ["load_transaction"])
+        init_linking.assert_not_called()
+        validate_reference.assert_not_called()
+        user_consent.assert_not_called()
+        self.assertEqual(session.phase, gopay_flow.PHASE_PROVIDER_LINK_READY)
+        self.assertEqual(result["state"], "provider_link_ready")
+        self.assertEqual(
+            result["payment_platform_url"],
+            "https://app.midtrans.com/snap/v4/redirection/11111111-1111-1111-1111-111111111111",
+        )
+
+    def test_create_gopay_provider_link_returns_snapshot_without_background_session(self):
+        with mock.patch.object(
+            gopay_flow.GoPayRunner,
+            "start_until_provider_link",
+            autospec=True,
+            side_effect=lambda runner: setattr(
+                runner.s,
+                "payment_platform_url",
+                "https://app.midtrans.com/snap/v4/redirection/11111111-1111-1111-1111-111111111111",
+            ),
+        ):
+            snapshot = gopay_flow.create_gopay_provider_link(
+                DummyAccount(),
+                account_id=0,
+                plan="plus",
+                country="ID",
+                currency="IDR",
+                proxy="http://proxy.local:8080",
+                checkout_url="https://pay.openai.com/c/pay/cs_live_123#fid",
+            )
+
+        self.assertEqual(snapshot["session_id"][:7], "gplink_")
+        self.assertEqual(snapshot["payment_platform_url"], "https://app.midtrans.com/snap/v4/redirection/11111111-1111-1111-1111-111111111111")
+        self.assertEqual(snapshot["proxy_source"], "registration")
 
     def test_create_gopay_session_without_checkout_url_keeps_session_active(self):
         class ImmediateThread:

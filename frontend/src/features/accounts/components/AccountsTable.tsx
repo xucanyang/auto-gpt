@@ -15,6 +15,8 @@ type AccountsTableProps = {
   currentPage: number
   pageSize: number
   onPageChange: (page: number) => void
+  onPageSizeChange?: (pageSize: number) => void
+  pageSizeOptions?: number[]
   selectedRowKeys: React.Key[]
   setSelectedRowKeys: (keys: React.Key[]) => void
   onOpenDetail: (record: any) => void
@@ -32,6 +34,8 @@ export function AccountsTable({
   currentPage,
   pageSize,
   onPageChange,
+  onPageSizeChange,
+  pageSizeOptions = [10, 20, 50],
   selectedRowKeys,
   setSelectedRowKeys,
   onOpenDetail,
@@ -45,6 +49,7 @@ export function AccountsTable({
   const selectedKeySet = new Set(selectedRowKeys)
   const pageKeys = accounts.map((record) => record.id as React.Key)
   const selectedOnPage = pageKeys.filter((key) => selectedKeySet.has(key))
+  const totalPages = Math.max(1, Math.ceil(total / Math.max(pageSize, 1)))
 
   const updateRecordSelection = (key: React.Key, checked: boolean) => {
     if (checked) {
@@ -66,6 +71,46 @@ export function AccountsTable({
     observer.observe(tableAreaRef.current)
     return () => observer.disconnect()
   }, [isMobile])
+
+  const renderPager = (align: 'center' | 'flex-end') => {
+    const handlePagerChange = (page: number, nextPageSize?: number) => {
+      if (nextPageSize && nextPageSize !== pageSize) {
+        onPageSizeChange?.(nextPageSize)
+        return
+      }
+      if (page !== currentPage) onPageChange(page)
+    }
+
+    return (
+      <div style={{ display: 'flex', flexWrap: 'wrap', justifyContent: align, alignItems: 'center', gap: 8, width: '100%' }}>
+        <Pagination
+          current={currentPage}
+          pageSize={pageSize}
+          total={total}
+          showSizeChanger={!isMobile && Boolean(onPageSizeChange)}
+          pageSizeOptions={pageSizeOptions}
+          showLessItems={isMobile || totalPages > 12}
+          showQuickJumper={!isMobile && totalPages > 10}
+          responsive
+          showTotal={(value, range) => `第 ${range[0]}-${range[1]} 条 / 共 ${value} 条`}
+          onChange={handlePagerChange}
+          onShowSizeChange={(_, size) => onPageSizeChange?.(size)}
+        />
+      </div>
+    )
+  }
+
+  const renderMobilePager = () => (
+    <Pagination
+      current={currentPage}
+      pageSize={pageSize}
+      total={total}
+      showSizeChanger={false}
+      showLessItems
+      responsive
+      onChange={onPageChange}
+    />
+  )
 
   if (isMobile) {
     return (
@@ -123,15 +168,7 @@ export function AccountsTable({
           )}
 
           <div style={{ display: 'flex', justifyContent: 'center', padding: '4px 0 10px' }}>
-            <Pagination
-              current={currentPage}
-              pageSize={pageSize}
-              total={total}
-              showSizeChanger={false}
-              showLessItems
-              responsive
-              onChange={onPageChange}
-            />
+            {renderMobilePager()}
           </div>
         </div>
       </Spin>
@@ -166,15 +203,8 @@ export function AccountsTable({
           })}
         />
       </div>
-      <div style={{ flex: '0 0 auto', display: 'flex', justifyContent: 'flex-end', paddingTop: 10 }}>
-        <Pagination
-          current={currentPage}
-          pageSize={pageSize}
-          total={total}
-          showSizeChanger={false}
-          responsive
-          onChange={onPageChange}
-        />
+      <div style={{ flex: '0 0 auto', display: 'flex', justifyContent: 'center', paddingTop: 10 }}>
+        {renderPager('center')}
       </div>
     </div>
   )

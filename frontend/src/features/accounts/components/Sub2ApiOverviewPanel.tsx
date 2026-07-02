@@ -1,4 +1,4 @@
-import { Button, Modal, Space, Tag, Typography } from 'antd'
+import { Button, Space, Tag, Typography } from 'antd'
 import { ReloadOutlined, SyncOutlined, UploadOutlined } from '@ant-design/icons'
 
 type Sub2ApiOverview = {
@@ -95,15 +95,7 @@ export function Sub2ApiOverviewPanel({
           icon={uploadLoading ? <SyncOutlined spin /> : <UploadOutlined />}
           loading={uploadLoading}
           disabled={uploadDisabled}
-          onClick={() => {
-            Modal.confirm({
-              title:
-                scope === 'selected'
-                  ? `确认补传所选 ${selectedCount} 个账号到 Sub2API？`
-                  : `确认补传当前筛选范围内 ${pendingCount} 个 Sub2API 待补传账号？`,
-              onOk: () => onUpload(),
-            })
-          }}
+          onClick={() => onUpload()}
         >
           {uploadLoading
             ? (scope === 'selected' ? `上传所选中... (${selectedCount})` : `上传待补传中... (${pendingCount})`)

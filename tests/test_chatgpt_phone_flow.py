@@ -1,10 +1,12 @@
 import base64
+from datetime import datetime, timezone
 import json
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
+from core.task_runtime import SkipCurrentAttemptRequested
 from services.chatgpt_core.oauth_client import OAuthClient
 from services.chatgpt_core.phone_service import (
     LocalPhoneGatewayService,
@@ -362,6 +364,39 @@ class UploadedPhoneServiceTests(unittest.TestCase):
         self.assertEqual(service.last_code_time, "2026-06-02 20:27:44")
         self.assertTrue(service.last_code_was_extracted)
 
+    def test_uploaded_phone_service_ignores_code_older_than_sms_send(self):
+        entries, errors = parse_uploaded_phone_lines(
+            "+13434832954----https://api.sms8.net/api/record?token=one"
+        )
+        self.assertFalse(errors)
+        logs: list[str] = []
+        service = UploadedPhoneService(entries, {"uploaded_phone_poll_interval_seconds": "1"}, log_fn=logs.append)
+        service.bind_entry(entries[0])
+
+        sent_at = datetime(2026, 6, 5, 14, 14, 14, tzinfo=timezone.utc).timestamp()
+        stale = mock.Mock(status_code=200)
+        stale.json.return_value = {
+            "code": 0,
+            "msg": "OK",
+            "data": {"code": "822496", "code_time": "2026-06-05 22:13:38"},
+        }
+        fresh = mock.Mock(status_code=200)
+        fresh.json.return_value = {
+            "code": 0,
+            "msg": "OK",
+            "data": {"code": "654321", "code_time": "2026-06-05 22:14:18"},
+        }
+
+        with mock.patch("services.chatgpt_core.phone_service.time.time", return_value=sent_at):
+            service.mark_sms_sent(entries[0])
+        with mock.patch("services.chatgpt_core.phone_service.requests.get", side_effect=[stale, fresh]):
+            with mock.patch("services.chatgpt_core.phone_service.time.sleep"):
+                self.assertEqual(service.wait_for_code(entries[0], timeout=10), "654321")
+
+        self.assertIn("忽略旧验证码 822496", "\n".join(logs))
+        self.assertIn("收到验证码 654321", "\n".join(logs))
+        self.assertEqual(service.last_code, "654321")
+
 
 class OAuthPhoneBlacklistTests(unittest.TestCase):
     def test_should_blacklist_explicit_phone_rejection(self):
@@ -629,6 +664,51 @@ class OAuthPhoneBlacklistTests(unittest.TestCase):
         phone_service.cancel.assert_not_called()
         phone_service.complete.assert_called_once_with(entry)
 
+    def test_handle_add_phone_sms_probe_stops_before_validate(self):
+        client = OAuthClient(config={}, verbose=False)
+        client._log = lambda _msg: None
+        entry = PhoneEntry(
+            country_slug="united-kingdom",
+            phone="+447000000005",
+            detail_url="https://example.com/phone/5",
+        )
+        phone_service = mock.Mock()
+        phone_service.enabled = True
+        phone_service.max_attempts = 1
+        phone_service.max_resend_attempts = 0
+        phone_service.resend_interval_seconds = 0
+        phone_service.validate_delay_seconds = 0
+        phone_service.acquire_phone.return_value = entry
+        phone_service.prefix_hint.return_value = "+447000"
+        phone_service.wait_for_code.return_value = "123456"
+
+        next_state = FlowState(
+            page_type="phone_otp_verification",
+            continue_url="https://auth.openai.com/phone-verification",
+        )
+
+        with mock.patch("services.chatgpt_core.oauth_client.create_phone_service", return_value=phone_service):
+            with mock.patch.object(client, "_send_phone_number", return_value=(True, next_state, "")):
+                with mock.patch.object(
+                    client,
+                    "_decode_oauth_session_cookie",
+                    return_value={"phone_verification_channel": "sms", "phone_number": entry.phone},
+                ):
+                    with mock.patch.object(client, "_validate_phone_otp") as validate:
+                        state = client._handle_add_phone_verification(
+                            "device-id",
+                            "Mozilla/5.0",
+                            None,
+                            None,
+                            FlowState(page_type="add_phone"),
+                            sms_probe_only=True,
+                        )
+
+        self.assertIsNone(state)
+        validate.assert_not_called()
+        phone_service.complete.assert_called_once_with(entry)
+        self.assertIn("未提交验证码", client.last_error)
+
     def test_handle_add_phone_waits_between_same_number_resends(self):
         client = OAuthClient(config={}, verbose=False)
         client._log = lambda _msg: None
@@ -677,6 +757,150 @@ class OAuthPhoneBlacklistTests(unittest.TestCase):
 
         self.assertEqual(state, done_state)
         sleep_before_resend.assert_called_once_with(12)
+
+    def test_existing_phone_pool_prefix_uses_first_four_digits_after_plus(self):
+        client = OAuthClient(config={}, verbose=False)
+
+        class _Record:
+            def __init__(self, phone):
+                self.phone_e164 = phone
+                self.api_url = "https://relay.example.com/code"
+
+        class _FakeRepo:
+            def get(self, _phone):
+                return None
+
+            def list(self):
+                return [_Record("+12509870220")]
+
+        with mock.patch("services.chatgpt_core.phone_pool_repository.PhonePoolRepository", _FakeRepo):
+            _record, code, message = client._lookup_existing_phone_pool_record("+12532241242")
+
+        self.assertEqual(code, "bound_phone_not_in_pool_prefix")
+        self.assertIn("非手机号池号段", message)
+
+    def test_existing_phone_pool_sms_rejection_stops_before_resend_and_manual(self):
+        client = OAuthClient(config={}, verbose=False)
+        client._log = lambda _msg: None
+        record = mock.Mock(api_url="https://relay.example.com/code")
+        detail = (
+            "phone-otp/send(sms) 失败: 400 - "
+            "We've detected suspicious behavior from phone numbers similar to yours. Please try again later."
+        )
+
+        with mock.patch(
+            "services.chatgpt_core.bound_phone.upsert_chatgpt_bound_phone",
+            return_value=None,
+        ):
+            with mock.patch.object(
+                client,
+                "_resolve_existing_phone_hint",
+                return_value={"phone": "+18255850239", "source": "test", "masked": ""},
+            ):
+                with mock.patch.object(
+                    client,
+                    "_lookup_existing_phone_pool_record",
+                    return_value=(record, "", "手机号 +18255850239 命中手机号池"),
+                ):
+                    with mock.patch.object(client, "_current_phone_otp_channel", return_value="whatsapp"):
+                        with mock.patch.object(
+                            client,
+                            "_select_phone_otp_channel",
+                            return_value=(False, None, detail),
+                        ):
+                            with mock.patch.object(client, "_resend_phone_otp") as resend:
+                                with mock.patch.object(client, "_wait_for_manual_phone_otp") as manual:
+                                    with mock.patch.object(
+                                        client,
+                                        "_record_existing_phone_pool_openai_rejected",
+                                    ) as record_rejected:
+                                        state = client._handle_existing_phone_otp_verification(
+                                            "device-id",
+                                            "Mozilla/5.0",
+                                            None,
+                                            None,
+                                            FlowState(page_type="phone_otp_select_channel"),
+                                            allow_existing_phone_verification=True,
+                                        )
+
+        self.assertIsNone(state)
+        resend.assert_not_called()
+        manual.assert_not_called()
+        record_rejected.assert_called_once()
+        self.assertIn("OpenAI 已拒绝发送 SMS", client.last_error)
+        self.assertIn("+18255850239", client.last_error)
+
+    def test_manual_phone_otp_disables_whatsapp_for_phone_pool_segment(self):
+        captured = {}
+
+        class _TaskControl:
+            def wait_for_verification_code(self, **kwargs):
+                captured.update(kwargs)
+                try:
+                    kwargs["action_handler"]("switch_channel", {"channel": "whatsapp"})
+                except ValueError as exc:
+                    captured["switch_error"] = str(exc)
+                return "123456"
+
+        client = OAuthClient(
+            config={
+                "_manual_phone_otp_enabled": True,
+                "_manual_phone_otp_timeout_seconds": 60,
+                "_task_control": _TaskControl(),
+                "_task_attempt_id": 123,
+            },
+            verbose=False,
+        )
+        client._log = lambda _msg: None
+        done_state = FlowState(page_type="done", current_url="https://chatgpt.com/")
+
+        with mock.patch.object(client, "_select_phone_otp_channel") as select_channel:
+            with mock.patch.object(
+                client,
+                "_validate_phone_otp",
+                return_value=(True, done_state, ""),
+            ):
+                state = client._wait_for_manual_phone_otp(
+                    phone="+18255850239",
+                    masked="",
+                    channel="whatsapp",
+                    reason="手机号池号段",
+                    device_id="device-id",
+                    user_agent="Mozilla/5.0",
+                    sec_ch_ua=None,
+                    impersonate=None,
+                    state=FlowState(page_type="phone_otp_verification"),
+                    allow_whatsapp_channel=False,
+                )
+
+        self.assertEqual(state, done_state)
+        select_channel.assert_not_called()
+        self.assertEqual(captured["metadata"]["available_channels"], ["sms"])
+        self.assertFalse(captured["metadata"]["can_switch_channel"])
+        self.assertEqual(captured["metadata"]["channel"], "sms")
+        self.assertEqual(captured["actions"], ["resend"])
+        self.assertIn("不允许 WhatsApp", captured["switch_error"])
+
+    def test_resend_phone_otp_uses_json_content_type(self):
+        client = OAuthClient(config={}, verbose=False)
+        client._log = lambda _msg: None
+        response = mock.Mock(status_code=200, text="", url="https://auth.openai.com/api/accounts/phone-otp/resend")
+        client.session = mock.Mock()
+        client.session.post.return_value = response
+
+        ok, detail = client._resend_phone_otp(
+            "device-id",
+            "Mozilla/5.0",
+            None,
+            None,
+            FlowState(page_type="phone_otp_verification", current_url="https://auth.openai.com/phone-verification"),
+        )
+
+        self.assertTrue(ok)
+        self.assertEqual(detail, "")
+        kwargs = client.session.post.call_args.kwargs
+        self.assertEqual(kwargs["json"], {})
+        self.assertEqual(kwargs["headers"]["Content-Type"], "application/json")
 
 
 if __name__ == "__main__":

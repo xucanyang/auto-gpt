@@ -14,6 +14,9 @@ import {
   MobileOutlined,
   RocketOutlined,
   ExperimentOutlined,
+  DatabaseOutlined,
+  KeyOutlined,
+  MenuOutlined,
 } from '@ant-design/icons'
 import zhCN from 'antd/locale/zh_CN'
 import { APP_ROUTES } from './router'
@@ -99,6 +102,9 @@ function AppContent({ hasPassword }: { hasPassword: boolean }) {
     if (path === '/gopay-otp') return ['/gopay-otp']
     if (path === '/history') return ['/history']
     if (path === '/proxies') return ['/proxies']
+    if (path === '/phone-pool') return ['/phone-pool']
+    if (path === '/baxigpt-cdk-pool') return ['/baxigpt-cdk-pool']
+    if (path === '/delivery-cards') return ['/delivery-cards']
     if (path === '/settings') return ['/settings']
     return ['/']
   }
@@ -106,38 +112,56 @@ function AppContent({ hasPassword }: { hasPassword: boolean }) {
   const menuItems = [
     { key: '/', icon: <DashboardOutlined />, label: '仪表盘' },
     { key: '/chatgpt', icon: <UserOutlined />, label: 'ChatGPT' },
-    { key: '/custom-email-recheck', icon: <ExperimentOutlined />, label: '自定义邮箱测活' },
+    { key: '/custom-email-recheck', icon: <ExperimentOutlined />, label: '邮箱登录测活' },
     { key: '/teams', icon: <TeamOutlined />, label: 'Team' },
     { key: '/gopay-otp', icon: <MobileOutlined />, label: 'GoPay OTP' },
     { key: '/pipeline', icon: <RocketOutlined />, label: '自动流水线' },
     { key: '/history', icon: <HistoryOutlined />, label: '任务历史' },
     { key: '/proxies', icon: <GlobalOutlined />, label: '代理管理' },
+    { key: '/phone-pool', icon: <MobileOutlined />, label: '手机号池' },
+    { key: '/baxigpt-cdk-pool', icon: <DatabaseOutlined />, label: 'pix卡密提交' },
+    { key: '/delivery-cards', icon: <KeyOutlined />, label: '交付卡密' },
     { key: '/settings', icon: <SettingOutlined />, label: '全局配置' },
   ]
+
+  const activeLabel = menuItems.find((item) => getSelectedKey().includes(item.key))?.label || 'Auto ChatGPT'
+  const handleMenuClick = ({ key }: { key: string }) => {
+    navigate(key)
+    if (isMobile) {
+      setCollapsed(true)
+    }
+  }
 
   return (
     <ConfigProvider theme={currentTheme} locale={zhCN}>
       <AntdApp>
-        <Layout style={{ minHeight: '100vh' }}>
+        <Layout className="app-layout" style={{ minHeight: '100vh' }}>
+          {isMobile && !collapsed ? (
+            <div className="app-mobile-nav-mask" onClick={() => setCollapsed(true)} />
+          ) : null}
           <Sider
+            className="app-sider"
             collapsible
             breakpoint="md"
-            collapsedWidth={isMobile ? 0 : 80}
+            collapsedWidth={isMobile ? 0 : 64}
             collapsed={collapsed}
             onCollapse={setCollapsed}
             style={{
               background: currentTheme.token?.colorBgContainer,
               borderRight: `1px solid ${currentTheme.token?.colorBorder}`,
               position: isMobile ? 'fixed' : 'relative',
-              zIndex: isMobile ? 100 : undefined,
+              zIndex: isMobile ? 1000 : undefined,
               minHeight: '100vh',
+              height: isMobile ? '100vh' : undefined,
+              insetInlineStart: isMobile ? 0 : undefined,
+              top: isMobile ? 0 : undefined,
               boxShadow: isMobile && !collapsed ? '0 12px 40px rgba(0,0,0,0.32)' : undefined,
             }}
-            width={220}
+            width={196}
           >
             <div
               style={{
-                height: 64,
+                height: 52,
                 display: 'flex',
                 alignItems: 'center',
                 justifyContent: 'center',
@@ -150,7 +174,7 @@ function AppContent({ hasPassword }: { hasPassword: boolean }) {
                   style={{
                     marginLeft: 8,
                     fontWeight: 600,
-                    fontSize: 14,
+                    fontSize: 13,
                     color: currentTheme.token?.colorText,
                   }}
                 >
@@ -163,7 +187,7 @@ function AppContent({ hasPassword }: { hasPassword: boolean }) {
               selectedKeys={getSelectedKey()}
               defaultOpenKeys={['/accounts']}
               items={menuItems}
-              onClick={({ key }) => navigate(key)}
+              onClick={handleMenuClick}
               style={{
                 borderRight: 0,
                 background: 'transparent',
@@ -172,13 +196,13 @@ function AppContent({ hasPassword }: { hasPassword: boolean }) {
             <div
               style={{
                 position: 'absolute',
-                bottom: 56,
+                bottom: 48,
                 left: 0,
                 right: 0,
-                padding: '0 16px',
+                padding: '0 10px',
                 display: 'flex',
                 flexDirection: 'column',
-                gap: 8,
+                gap: 6,
               }}
             >
               <Button
@@ -214,13 +238,26 @@ function AppContent({ hasPassword }: { hasPassword: boolean }) {
             </div>
           </Sider>
           <Content
+            className="app-content"
             style={{
-              padding: isMobile ? 12 : 24,
-              overflow: 'hidden',
+              padding: isMobile ? 10 : 14,
+              overflow: 'auto',
               background: currentTheme.token?.colorBgLayout,
               minWidth: 0,
+              height: '100vh',
             }}
           >
+            {isMobile ? (
+              <div className="app-mobile-bar">
+                <Button type="text" icon={<MenuOutlined />} onClick={() => setCollapsed(false)} />
+                <span className="app-mobile-title">{activeLabel}</span>
+                <Button
+                  type="text"
+                  icon={isLight ? <SunOutlined /> : <MoonOutlined />}
+                  onClick={() => setThemeMode(isLight ? 'dark' : 'light')}
+                />
+              </div>
+            ) : null}
             <Suspense fallback={<RouteFallback />}>
               <Routes>
                 {APP_ROUTES.map((route) => (

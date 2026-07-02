@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import threading
 from typing import Any, Callable, Optional
+from urllib.parse import urlsplit
 
 from core.browser_runtime import (
     ensure_browser_display_available,
@@ -26,6 +29,48 @@ def _flow_page_url(flow: str) -> str:
     return mapping.get(flow_name, "https://auth.openai.com/about-you")
 
 
+def _thread_has_running_asyncio_loop() -> bool:
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return bool(loop and loop.is_running())
+
+
+def run_sync_playwright_safely(
+    fn: Callable[[], Any],
+    *,
+    logger: Optional[Callable[[str], None]] = None,
+    label: str = "Playwright Sync API",
+) -> Any:
+    """Run Playwright sync API outside an already-running asyncio loop.
+
+    Playwright's sync API intentionally refuses to start in a thread that already
+    owns a running asyncio loop.  FastAPI/uvicorn and some worker wrappers can put
+    our otherwise-synchronous registration code in exactly that situation, so move
+    only the Playwright sync section into a short-lived clean thread.
+    """
+    if not _thread_has_running_asyncio_loop():
+        return fn()
+
+    log = logger or (lambda _msg: None)
+    log(f"{label}: 当前线程已有 asyncio loop，切换到隔离线程执行")
+    result_box: dict[str, Any] = {}
+
+    def _runner() -> None:
+        try:
+            result_box["value"] = fn()
+        except BaseException as exc:  # noqa: BLE001 - must propagate across thread boundary
+            result_box["exc"] = exc
+
+    thread = threading.Thread(target=_runner, name="sentinel-playwright-sync", daemon=True)
+    thread.start()
+    thread.join()
+    if "exc" in result_box:
+        raise result_box["exc"]
+    return result_box.get("value")
+
+
 def get_sentinel_token_via_browser(
     *,
     flow: str,
@@ -41,9 +86,52 @@ def get_sentinel_token_via_browser(
     platform_version: Optional[str] = None,
     viewport_width: Optional[int] = None,
     viewport_height: Optional[int] = None,
+    cookie_header: Optional[str] = None,
     log_fn: Optional[Callable[[str], None]] = None,
 ) -> Optional[str]:
     """通过浏览器直接调用 SentinelSDK.token(flow) 获取完整 token。"""
+    logger = log_fn or (lambda _msg: None)
+    return run_sync_playwright_safely(
+        lambda: _get_sentinel_token_via_browser_sync(
+            flow=flow,
+            proxy=proxy,
+            timeout_ms=timeout_ms,
+            page_url=page_url,
+            headless=headless,
+            device_id=device_id,
+            user_agent=user_agent,
+            sec_ch_ua=sec_ch_ua,
+            chrome_full_version=chrome_full_version,
+            accept_language=accept_language,
+            platform_version=platform_version,
+            viewport_width=viewport_width,
+            viewport_height=viewport_height,
+            cookie_header=cookie_header,
+            log_fn=logger,
+        ),
+        logger=logger,
+        label="Sentinel Browser",
+    )
+
+
+def _get_sentinel_token_via_browser_sync(
+    *,
+    flow: str,
+    proxy: Optional[str] = None,
+    timeout_ms: int = 45000,
+    page_url: Optional[str] = None,
+    headless: bool = True,
+    device_id: Optional[str] = None,
+    user_agent: Optional[str] = None,
+    sec_ch_ua: Optional[str] = None,
+    chrome_full_version: Optional[str] = None,
+    accept_language: Optional[str] = None,
+    platform_version: Optional[str] = None,
+    viewport_width: Optional[int] = None,
+    viewport_height: Optional[int] = None,
+    cookie_header: Optional[str] = None,
+    log_fn: Optional[Callable[[str], None]] = None,
+) -> Optional[str]:
     logger = log_fn or (lambda _msg: None)
 
     try:
@@ -135,21 +223,60 @@ def get_sentinel_token_via_browser(
                 ignore_https_errors=True,
             )
             logger("Sentinel Browser 阶段完成: create context")
+            cookie_names: set[str] = set()
+            if cookie_header:
+                cookie_items = []
+                target_parts = urlsplit(target_url)
+                cookie_url = (
+                    f"{target_parts.scheme or 'https'}://{target_parts.netloc}/"
+                    if target_parts.netloc
+                    else target_url
+                )
+                for part in str(cookie_header or "").split(";"):
+                    text = part.strip()
+                    if not text or "=" not in text:
+                        continue
+                    name, _, value = text.partition("=")
+                    name = name.strip()
+                    if not name:
+                        continue
+                    cookie_names.add(name)
+                    cookie_items.append(
+                        {
+                            "name": name,
+                            "value": value.strip(),
+                            "url": cookie_url,
+                            "secure": cookie_url.startswith("https://"),
+                            "sameSite": "Lax",
+                        }
+                    )
+                if cookie_items:
+                    try:
+                        context.add_cookies(cookie_items)
+                        logger(f"Sentinel Browser 阶段完成: add cookie_header cookies ({len(cookie_items)})")
+                    except Exception as cookie_exc:
+                        logger(f"Sentinel Browser add cookie_header 失败: {cookie_exc}")
             if device_id:
                 try:
-                    context.add_cookies(
-                        [
-                            {
-                                "name": "oai-did",
-                                "value": str(device_id),
-                                "url": "https://auth.openai.com/",
-                                "path": "/",
-                                "secure": True,
-                                "sameSite": "Lax",
-                            }
-                        ]
+                    target_parts = urlsplit(target_url)
+                    device_cookie_url = (
+                        f"{target_parts.scheme or 'https'}://{target_parts.netloc}/"
+                        if target_parts.netloc
+                        else "https://auth.openai.com/"
                     )
-                    logger("Sentinel Browser 阶段完成: add cookies")
+                    if "oai-did" not in cookie_names:
+                        context.add_cookies(
+                            [
+                                {
+                                    "name": "oai-did",
+                                    "value": str(device_id),
+                                    "url": device_cookie_url,
+                                    "secure": True,
+                                    "sameSite": "Lax",
+                                }
+                            ]
+                        )
+                        logger("Sentinel Browser 阶段完成: add cookies")
                 except Exception as cookie_exc:
                     logger(f"Sentinel Browser add cookies 失败: {cookie_exc}")
 

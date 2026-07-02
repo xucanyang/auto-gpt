@@ -7,10 +7,13 @@ import secrets
 import uuid
 import json
 import random
+import re
+from datetime import datetime, timezone
 from urllib.parse import urlparse, parse_qs, urlencode
 from core.proxy_utils import build_requests_proxy_config
-from core.task_runtime import TaskInterruption, StopTaskRequested
+from core.task_runtime import TaskInterruption, StopTaskRequested, SkipCurrentAttemptRequested
 from services.chatgpt_account_state import is_account_deactivated_message
+from services.chatgpt_core.task_logging import mask_phone_for_log, redact_log_text
 
 try:
     from curl_cffi import requests as curl_requests
@@ -21,10 +24,12 @@ from .phone_service import create_phone_service
 from .utils import (
     FlowState,
     apply_browser_fingerprint,
+    build_sec_ch_ua_full_version_list,
     build_browser_headers,
     coerce_browser_fingerprint,
     describe_flow_state,
     extract_flow_state,
+    extract_chrome_full_version,
     generate_datadog_trace,
     generate_pkce,
     normalize_flow_url,
@@ -70,6 +75,9 @@ class OAuthClient:
         self._about_you_should_skip_create_account = False
         self.shared_phone_service = self.config.get("_shared_phone_service")
         self.stop_checker = self.config.get("_task_stop_checker")
+        self.task_control = self.config.get("_task_control")
+        self.task_attempt_id = self.config.get("_task_attempt_id")
+        self._phone_challenge_events = []
 
         # 创建 session
         self.session = curl_requests.Session()
@@ -131,16 +139,84 @@ class OAuthClient:
     def _log(self, msg):
         """输出日志"""
         if self.verbose:
-            print(f"  [OAuth] {msg}")
+            print(f"  [OAuth] {redact_log_text(msg)}")
 
     def _check_stop(self) -> None:
         if callable(self.stop_checker):
             self.stop_checker()
 
     def _set_error(self, message):
-        self.last_error = str(message or "").strip()
+        self.last_error = redact_log_text(str(message or "").strip())
         if self.last_error:
             self._log(self.last_error)
+
+    def _record_phone_challenge_event(
+        self,
+        *,
+        challenge_type: str,
+        status: str,
+        phone: str = "",
+        masked: str = "",
+        source: str = "",
+        message: str = "",
+        allow_add_phone_verification=None,
+        allow_existing_phone_verification=None,
+    ) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        payload = {
+            "type": str(challenge_type or "").strip(),
+            "challenge_type": str(challenge_type or "").strip(),
+            "status": str(status or "").strip(),
+            "phone": str(phone or "").strip(),
+            "phone_number": str(phone or "").strip(),
+            "masked": str(masked or "").strip(),
+            "masked_phone": str(masked or "").strip(),
+            "source": str(source or "").strip(),
+            "message": str(message or "").strip(),
+            "seen_at": now,
+            "updated_at": now,
+            "allow_add_phone_verification": bool(allow_add_phone_verification),
+            "allow_existing_phone_verification": bool(allow_existing_phone_verification),
+        }
+        if not payload["type"] and not payload["status"]:
+            return
+        if not payload["phone"] and not payload["masked"] and payload["type"] == "add_phone":
+            payload["display"] = "未绑定手机号"
+        else:
+            payload["display"] = payload["phone"] or payload["masked"]
+        self._phone_challenge_events.append(payload)
+
+        try:
+            from services.chatgpt_core.bound_phone import upsert_chatgpt_phone_challenge
+
+            upsert_chatgpt_phone_challenge(
+                account_id=self.config.get("_current_account_id") or self.config.get("account_id") or 0,
+                email=self.config.get("_current_account_email") or self.config.get("email") or "",
+                challenge_type=payload["type"],
+                status=payload["status"],
+                phone=payload["phone"],
+                masked=payload["masked"],
+                source=payload["source"],
+                message=payload["message"],
+                allow_add_phone_verification=allow_add_phone_verification,
+                allow_existing_phone_verification=allow_existing_phone_verification,
+                log_fn=self._log,
+            )
+        except Exception as exc:
+            self._log(f"[手机号验证] 记录手机号挑战失败: {exc}")
+
+    @staticmethod
+    def _coerce_bool(value, *, default=False):
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return default
+        text = str(value).strip().lower()
+        if text in {"1", "true", "yes", "on", "y", "是", "开启", "允许", "启用"}:
+            return True
+        if text in {"0", "false", "no", "off", "n", "否", "关闭", "禁止", "禁用"}:
+            return False
+        return default
 
     def _browser_pause(self, low=0.15, high=0.4):
         """在 headed 模式下注入轻微延迟，模拟真实浏览器操作节奏。"""
@@ -279,6 +355,46 @@ class OAuthClient:
         )
         return any(marker in combined for marker in blacklist_markers)
 
+    @staticmethod
+    def _is_openai_phone_send_rejected(detail=""):
+        combined = str(detail or "").strip().lower()
+        if not combined:
+            return False
+
+        direct_markers = (
+            "detected suspicious behavior from phone numbers",
+            "suspicious behavior from phone numbers",
+            "phone number is invalid",
+            "invalid phone number",
+            "invalid phone",
+            "not a valid mobile number",
+            "unsupported phone number",
+            "phone number not supported",
+            "carrier not supported",
+            "unable to send sms",
+            "send sms verification failed",
+            "sms verification failed",
+            "电话号码无效",
+            "手机号无效",
+            "发送短信验证失败",
+            "号码无效",
+            "号码不支持",
+            "手机号不支持",
+        )
+        if any(marker in combined for marker in direct_markers):
+            return True
+
+        phone_context_markers = ("phone", "sms", "手机号", "号码", "短信")
+        delayed_markers = (
+            "please try again later",
+            "try again later",
+            "temporarily unavailable",
+            "temporarily unable",
+        )
+        return any(marker in combined for marker in phone_context_markers) and any(
+            marker in combined for marker in delayed_markers
+        )
+
     @classmethod
     def _phone_reached_account_limit(cls, detail="", state: FlowState | None = None):
         fragments = [str(detail or "").strip()]
@@ -349,6 +465,366 @@ class OAuthClient:
         if isinstance(exc, TaskInterruption):
             raise exc
         raise StopTaskRequested()
+
+    @staticmethod
+    def _looks_like_cloudflare_challenge(
+        text: str = "",
+        *,
+        status_code: int | None = None,
+        url: str = "",
+    ) -> bool:
+        try:
+            code = int(status_code or 0)
+        except Exception:
+            code = 0
+        combined = " | ".join(
+            fragment
+            for fragment in (
+                str(text or "")[:2000],
+                str(url or "")[:400],
+            )
+            if fragment
+        ).lower()
+        if not combined and code not in {403, 429, 503}:
+            return False
+        markers = (
+            "just a moment",
+            "cf-chl",
+            "challenge-platform",
+            "cdn-cgi/challenge",
+            "cf-browser-verification",
+            "__cf_chl",
+            "cloudflare",
+        )
+        if any(marker in combined for marker in markers):
+            return True
+        return code == 403 and ("<!doctype html" in combined or "<html" in combined)
+
+    def _has_cookie(self, name: str) -> bool:
+        target = str(name or "").strip()
+        if not target:
+            return False
+        try:
+            jar = getattr(getattr(self.session, "cookies", None), "jar", None)
+            if jar is not None:
+                for item in jar:
+                    item_name = getattr(item, "name", None) or getattr(item, "key", None)
+                    item_value = getattr(item, "value", None)
+                    if item_name == target and item_value:
+                        return True
+        except Exception:
+            pass
+        try:
+            value = self.session.cookies.get(target)
+            return bool(value)
+        except Exception:
+            return False
+
+    def _export_session_cookies_for_playwright(
+        self,
+        *,
+        fallback_domain: str = "auth.openai.com",
+    ) -> list[dict[str, object]]:
+        result: list[dict[str, object]] = []
+        cookies = getattr(self.session, "cookies", None)
+        if cookies is None:
+            return result
+
+        iterable = []
+        jar = getattr(cookies, "jar", None)
+        if jar is not None:
+            try:
+                iterable = list(jar)
+            except Exception:
+                iterable = []
+        if not iterable:
+            try:
+                iterable = list(cookies)
+            except Exception:
+                iterable = []
+
+        seen: set[tuple[str, str, str]] = set()
+        for item in iterable:
+            name = getattr(item, "name", None) or getattr(item, "key", None)
+            value = getattr(item, "value", None)
+            domain = str(getattr(item, "domain", "") or "").strip()
+            path = str(getattr(item, "path", "/") or "/").strip() or "/"
+            secure = bool(getattr(item, "secure", True))
+            if not name or value is None:
+                continue
+
+            normalized_domain = domain.lstrip(".") or fallback_domain
+            cookie_key = (str(name), str(value), normalized_domain)
+            if cookie_key in seen:
+                continue
+            seen.add(cookie_key)
+
+            same_site = "Lax"
+            rest = getattr(item, "_rest", {}) or {}
+            for key in ("SameSite", "samesite"):
+                if key not in rest:
+                    continue
+                normalized = str(rest[key]).strip().lower()
+                if normalized.startswith("strict"):
+                    same_site = "Strict"
+                elif normalized.startswith("none"):
+                    same_site = "None"
+                else:
+                    same_site = "Lax"
+                break
+
+            result.append(
+                {
+                    "name": str(name),
+                    "value": str(value),
+                    "domain": normalized_domain,
+                    "path": path,
+                    "secure": secure,
+                    "httpOnly": False,
+                    "sameSite": same_site,
+                }
+            )
+        return result
+
+    def _merge_playwright_cookies_into_session(self, cookies: list[dict[str, object]]) -> int:
+        merged = 0
+        if not cookies:
+            return merged
+        for item in cookies:
+            name = str(item.get("name") or "").strip()
+            value = item.get("value")
+            if not name or value is None:
+                continue
+            domain = str(item.get("domain") or "").strip()
+            path = str(item.get("path") or "/").strip() or "/"
+            secure = bool(item.get("secure"))
+            candidate_domains = []
+            if domain:
+                candidate_domains.append(domain)
+                stripped = domain.lstrip(".")
+                if stripped and stripped != domain:
+                    candidate_domains.append(stripped)
+                elif stripped:
+                    candidate_domains.append(f".{stripped}")
+            else:
+                candidate_domains.append("auth.openai.com")
+
+            stored = False
+            for target_domain in candidate_domains:
+                try:
+                    self.session.cookies.set(
+                        name,
+                        str(value),
+                        domain=target_domain,
+                        path=path,
+                        secure=secure,
+                    )
+                    stored = True
+                except Exception:
+                    continue
+            if stored:
+                merged += 1
+        return merged
+
+    def _browser_bootstrap_oauth_session(
+        self,
+        authorize_url,
+        authorize_params,
+        *,
+        device_id=None,
+        user_agent=None,
+        sec_ch_ua=None,
+    ) -> tuple[str, bool]:
+        try:
+            from playwright.sync_api import sync_playwright
+            from core.browser_runtime import (
+                ensure_browser_display_available,
+                resolve_browser_headless,
+            )
+            from core.proxy_utils import build_playwright_proxy_config
+        except Exception as exc:
+            self._log(f"browser bootstrap: Playwright 不可用: {exc}")
+            return "", False
+
+        self._check_stop()
+        requested_headless = self.browser_mode != "headed"
+        headless, reason = resolve_browser_headless(requested_headless)
+        ensure_browser_display_available(headless)
+
+        fingerprint = getattr(self, "browser_fingerprint", None)
+        effective_user_agent = (
+            user_agent
+            or (fingerprint.user_agent if fingerprint else None)
+            or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/136.0.7103.92 Safari/537.36"
+        )
+        effective_accept_language = (
+            (fingerprint.accept_language if fingerprint else None) or "en-US,en;q=0.9"
+        )
+        effective_locale = (
+            effective_accept_language.split(",", 1)[0].split(";", 1)[0].strip() or "en-US"
+        )
+        effective_platform_version = str(
+            (fingerprint.platform_version if fingerprint else None) or "15.0.0"
+        ).strip('"')
+        effective_chrome_full = (
+            (fingerprint.chrome_full_version if fingerprint else None)
+            or extract_chrome_full_version(effective_user_agent)
+        )
+        effective_viewport_width = int((fingerprint.viewport_width if fingerprint else None) or 1440)
+        effective_viewport_height = int((fingerprint.viewport_height if fingerprint else None) or 900)
+
+        extra_http_headers = {
+            "Accept-Language": effective_accept_language,
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"',
+            "sec-ch-ua-arch": '"x86"',
+            "sec-ch-ua-bitness": '"64"',
+        }
+        if sec_ch_ua:
+            extra_http_headers["sec-ch-ua"] = sec_ch_ua
+        if effective_chrome_full:
+            extra_http_headers["sec-ch-ua-full-version"] = f'"{effective_chrome_full}"'
+        if effective_platform_version:
+            extra_http_headers["sec-ch-ua-platform-version"] = f'"{effective_platform_version}"'
+        full_version_list = build_sec_ch_ua_full_version_list(sec_ch_ua, effective_chrome_full)
+        if full_version_list:
+            extra_http_headers["sec-ch-ua-full-version-list"] = full_version_list
+
+        launch_kwargs: dict[str, object] = {
+            "headless": headless,
+            "args": ["--no-sandbox", "--disable-blink-features=AutomationControlled"],
+        }
+        proxy_config = build_playwright_proxy_config(self.proxy)
+        if proxy_config:
+            launch_kwargs["proxy"] = proxy_config
+
+        encoded_params = urlencode(authorize_params or {}, doseq=True)
+        nav_targets = []
+        primary_url = str(authorize_url or "").strip()
+        if primary_url:
+            nav_targets.append(
+                primary_url if not encoded_params else f"{primary_url}?{encoded_params}"
+            )
+        oauth2_url = f"{self.oauth_issuer}/api/oauth/oauth2/auth"
+        nav_targets.append(oauth2_url if not encoded_params else f"{oauth2_url}?{encoded_params}")
+
+        cookie_payload = self._export_session_cookies_for_playwright(
+            fallback_domain=urlparse(self.oauth_issuer).hostname or "auth.openai.com"
+        )
+        auth_origin = self.oauth_issuer.rstrip("/") + "/"
+        sentinel_origin = "https://sentinel.openai.com/"
+        if device_id:
+            cookie_payload.extend(
+                [
+                    {
+                        "name": "oai-did",
+                        "value": str(device_id),
+                        "url": auth_origin,
+                        "secure": True,
+                        "sameSite": "Lax",
+                    },
+                    {
+                        "name": "oai-did",
+                        "value": str(device_id),
+                        "url": sentinel_origin,
+                        "secure": True,
+                        "sameSite": "Lax",
+                    },
+                ]
+            )
+
+        self._log(
+            "browser bootstrap: 启动浏览器预热 auth.openai.com "
+            f"(cookies={len(cookie_payload)}, mode={'headless' if headless else 'headed'}, {reason})"
+        )
+
+        final_url = ""
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(**launch_kwargs)
+                try:
+                    context = browser.new_context(
+                        viewport={
+                            "width": effective_viewport_width,
+                            "height": effective_viewport_height,
+                        },
+                        user_agent=effective_user_agent,
+                        locale=effective_locale,
+                        extra_http_headers=extra_http_headers,
+                        ignore_https_errors=True,
+                    )
+                    if cookie_payload:
+                        context.add_cookies(cookie_payload)
+                    page = context.new_page()
+                    page.set_default_timeout(45000)
+                    page.set_default_navigation_timeout(45000)
+
+                    for index, target_url in enumerate(nav_targets, start=1):
+                        self._check_stop()
+                        self._log(
+                            "browser bootstrap: "
+                            f"goto[{index}/{len(nav_targets)}] -> {target_url[:180]}"
+                        )
+                        try:
+                            page.goto(target_url, wait_until="domcontentloaded", timeout=45000)
+                        except Exception as exc:
+                            self._log(f"browser bootstrap: goto[{index}] 异常: {exc}")
+                        page.wait_for_timeout(1500)
+
+                        for _ in range(15):
+                            self._check_stop()
+                            final_url = str(page.url or target_url)
+                            try:
+                                body_hint = (
+                                    page.locator("body").inner_text(timeout=1500) or ""
+                                )[:240]
+                            except Exception:
+                                body_hint = ""
+                            cookies_now = context.cookies()
+                            has_login_session = any(
+                                str(cookie.get("name") or "") == "login_session"
+                                and str(cookie.get("value") or "").strip()
+                                for cookie in cookies_now
+                            )
+                            if has_login_session:
+                                break
+                            if not self._looks_like_cloudflare_challenge(
+                                body_hint,
+                                url=final_url,
+                            ):
+                                break
+                            page.wait_for_timeout(1000)
+
+                        cookies_now = context.cookies()
+                        merged = self._merge_playwright_cookies_into_session(cookies_now)
+                        has_login_session = any(
+                            str(cookie.get("name") or "") == "login_session"
+                            and str(cookie.get("value") or "").strip()
+                            for cookie in cookies_now
+                        )
+                        has_cf_clearance = any(
+                            str(cookie.get("name") or "") == "cf_clearance"
+                            and str(cookie.get("value") or "").strip()
+                            for cookie in cookies_now
+                        )
+                        self._log(
+                            "browser bootstrap: "
+                            f"goto[{index}] 完成 final_url={final_url[:180]} "
+                            f"login_session={'✓' if has_login_session else '✗'} "
+                            f"cf_clearance={'✓' if has_cf_clearance else '✗'} "
+                            f"merged={merged}"
+                        )
+                        if has_login_session:
+                            return final_url, True
+                finally:
+                    browser.close()
+        except Exception as exc:
+            self._log(f"browser bootstrap: 浏览器预热失败: {exc}")
+            return final_url, False
+
+        return final_url, self._has_cookie("login_session")
 
     def _headers(
         self,
@@ -458,6 +934,20 @@ class OAuthClient:
         target = f"{state.continue_url} {state.current_url}".lower()
         return state.page_type == "add_phone" or "add-phone" in target
 
+    def _state_is_existing_phone_otp(self, state: FlowState):
+        target = f"{state.continue_url} {state.current_url}".lower()
+        page_type = str(state.page_type or "").strip().lower()
+        return (
+            page_type in {
+                "phone_otp_select_channel",
+                "phone_otp_verification",
+                "phone_verification",
+            }
+            or "phone-otp/select-channel" in target
+            or "phone-otp" in target
+            or "phone-verification" in target
+        )
+
     def _state_is_about_you(self, state: FlowState):
         target = f"{state.continue_url} {state.current_url}".lower()
         return state.page_type == "about_you" or "about-you" in target
@@ -498,6 +988,455 @@ class OAuthClient:
         if state.continue_url and state.continue_url != state.current_url:
             return True
         return False
+
+    @staticmethod
+    def _normalize_phone_hint(value):
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        digits = re.sub(r"\D", "", text)
+        if len(digits) < 8:
+            return ""
+        if text.startswith("+"):
+            return f"+{digits}"
+        if text.startswith("00") and len(digits) > 2:
+            return f"+{digits[2:]}"
+        return f"+{digits}"
+
+    @staticmethod
+    def _looks_like_masked_phone(value):
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        lowered = text.lower()
+        if any(marker in lowered for marker in ("phone", "sms")) or any(ch in text for ch in ("*", "•", "x", "X")):
+            if re.search(r"\d", text):
+                return text[:120]
+        return ""
+
+    def _collect_phone_hints(self, value, *, source="", depth=0):
+        if depth > 5:
+            return []
+        hints = []
+        if isinstance(value, dict):
+            for key, item in value.items():
+                key_text = str(key or "")
+                next_source = f"{source}.{key_text}" if source else key_text
+                key_lower = key_text.lower()
+                if any(marker in key_lower for marker in ("phone", "mobile", "手机号")):
+                    phone = self._normalize_phone_hint(item)
+                    if phone:
+                        hints.append({"phone": phone, "source": next_source, "masked": ""})
+                    else:
+                        masked = self._looks_like_masked_phone(item)
+                        if masked:
+                            hints.append({"phone": "", "source": next_source, "masked": masked})
+                if isinstance(item, str):
+                    stripped = item.strip()
+                    if stripped and stripped[0:1] in {"{", "["}:
+                        try:
+                            parsed = json.loads(stripped)
+                        except Exception:
+                            parsed = None
+                        if parsed is not None:
+                            hints.extend(self._collect_phone_hints(parsed, source=next_source, depth=depth + 1))
+                    if any(marker in key_lower for marker in ("message", "raw", "payload", "response")):
+                        for match in re.findall(r'"phone_number"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"', item):
+                            phone = self._normalize_phone_hint(match)
+                            if phone:
+                                hints.append({"phone": phone, "source": f"{next_source}.phone_number", "masked": ""})
+                elif isinstance(item, (dict, list, tuple)):
+                    hints.extend(self._collect_phone_hints(item, source=next_source, depth=depth + 1))
+        elif isinstance(value, (list, tuple)):
+            for index, item in enumerate(value[:50]):
+                hints.extend(self._collect_phone_hints(item, source=f"{source}[{index}]", depth=depth + 1))
+        return hints
+
+    def _resolve_existing_phone_hint(self, state: FlowState):
+        sources = []
+        session_data = self._decode_oauth_session_cookie() or {}
+        if session_data:
+            sources.append(("oauth_session", session_data))
+        if state.raw:
+            sources.append(("state.raw", state.raw))
+        if state.payload:
+            sources.append(("state.payload", state.payload))
+        sources.append(("account_config", self.config))
+
+        seen = set()
+        masked_candidates = []
+        for source, payload in sources:
+            for hint in self._collect_phone_hints(payload, source=source):
+                phone = str(hint.get("phone") or "").strip()
+                masked = str(hint.get("masked") or "").strip()
+                hint_source = str(hint.get("source") or source).strip()
+                key = (phone, masked, hint_source)
+                if key in seen:
+                    continue
+                seen.add(key)
+                if phone:
+                    return {"phone": phone, "source": hint_source, "masked": masked}
+                if masked:
+                    masked_candidates.append({"phone": "", "source": hint_source, "masked": masked})
+        return masked_candidates[0] if masked_candidates else {"phone": "", "source": "", "masked": ""}
+
+    def _lookup_existing_phone_pool_record(self, phone):
+        phone = self._normalize_phone_hint(phone)
+        if not phone:
+            return None, "bound_phone_missing", "未读取到完整手机号，无法判断手机号池"
+        try:
+            from services.chatgpt_core.phone_pool_repository import PhonePoolRepository
+
+            repo = PhonePoolRepository()
+            exact = repo.get(phone)
+            if exact is not None:
+                api_url = str(getattr(exact, "api_url", "") or "").strip()
+                if not api_url:
+                    return exact, "bound_phone_pool_record_no_api", f"手机号 {phone} 命中手机号池，但 API URL 为空，无法自动收码"
+                return exact, "", (
+                    f"手机号 {phone} 命中手机号池: record_id={getattr(exact, 'id', 0) or '-'} "
+                    f"status={getattr(exact, 'status', '') or '-'} "
+                    f"api_host={getattr(exact, 'api_host', '') or '-'}"
+                )
+            from services.chatgpt_core.phone_pool_repository import _phone_prefix4
+
+            phone_prefix = _phone_prefix4(phone)
+            pool_records = repo.list()
+            for item in pool_records:
+                item_prefix = _phone_prefix4(getattr(item, "phone_e164", "") or "")
+                if not item_prefix or item_prefix != phone_prefix:
+                    continue
+                return None, "bound_phone_prefix_matched_but_exact_missing", f"手机号 {phone} 属于手机号池号段 {phone_prefix}，但池中没有该完整号码，无法自动收码"
+            return None, "bound_phone_not_in_pool_prefix", f"手机号 {phone} 非手机号池号段，无法自动验证"
+        except Exception as exc:
+            return None, "bound_phone_pool_lookup_failed", f"手机号 {phone} 手机号池查询失败: {exc}"
+
+    @staticmethod
+    def _existing_phone_matches_pool_segment(record, error_code: str = "") -> bool:
+        return bool(record is not None) or str(error_code or "") in {
+            "bound_phone_pool_record_no_api",
+            "bound_phone_prefix_matched_but_exact_missing",
+        }
+
+    def _record_existing_phone_pool_openai_rejected(self, phone: str, reason: str) -> None:
+        try:
+            from services.chatgpt_core.phone_pool_repository import PhonePoolRepository
+
+            PhonePoolRepository().record_task_status(phone, "openai_rejected", reason=reason)
+        except Exception as exc:
+            if self._is_stop_exception(exc):
+                self._raise_stop(exc)
+            self._log(f"[手机号验证] 记录手机号池 OpenAI 拒绝状态失败: {exc}")
+
+    def _handle_existing_phone_otp_verification(
+        self,
+        device_id,
+        user_agent,
+        sec_ch_ua,
+        impersonate,
+        state: FlowState,
+        *,
+        allow_existing_phone_verification: bool,
+    ):
+        hint = self._resolve_existing_phone_hint(state)
+        phone = str(hint.get("phone") or "").strip()
+        masked = str(hint.get("masked") or "").strip()
+        source = str(hint.get("source") or "unknown").strip() or "unknown"
+        self._log(f"[手机号验证] 命中已绑定手机号二次验证: {describe_flow_state(state)}")
+
+        if phone:
+            self._log(f"[手机号验证] 二次验证手机号: {phone} source={source}")
+        elif masked:
+            self._log(f"[手机号验证] 二次验证手机号仅解析到掩码: {masked} source={source}")
+        else:
+            self._log("[手机号验证] 二次验证手机号未能从账号记录 / OAuth session / 页面 payload 读取")
+
+        self._record_phone_challenge_event(
+            challenge_type="existing_phone_otp",
+            status="required",
+            phone=phone,
+            masked=masked,
+            source=source,
+            message="命中已绑定手机号二次验证",
+            allow_existing_phone_verification=allow_existing_phone_verification,
+        )
+
+        if phone or masked:
+            try:
+                from services.chatgpt_core.bound_phone import upsert_chatgpt_bound_phone
+
+                upsert_chatgpt_bound_phone(
+                    account_id=self.config.get("_current_account_id") or self.config.get("account_id") or 0,
+                    email=self.config.get("_current_account_email") or self.config.get("email") or "",
+                    phone=phone,
+                    masked=masked,
+                    source=source,
+                    reason="existing_phone_otp",
+                    verification_status="required",
+                    log_fn=self._log,
+                )
+            except Exception as exc:
+                self._log(f"[手机号验证] 记录绑定手机号失败: {exc}")
+
+        if not allow_existing_phone_verification:
+            detail = f"账号要求已绑定手机号二次验证，手机号={phone or masked or 'unknown'}，但当前开关不允许自动验证"
+            self._set_error(detail)
+            return None
+
+        if not phone:
+            detail = (
+                f"账号要求已绑定手机号二次验证，但仅解析到掩码 {masked}，无法自动匹配手机号池"
+                if masked
+                else "账号要求已绑定手机号二次验证，但未读取到完整手机号"
+            )
+            if self._manual_phone_otp_enabled():
+                self._log(f"[手机号验证] {detail}，切换为人工输入验证码")
+                return self._wait_for_manual_phone_otp(
+                    phone="",
+                    masked=masked,
+                    channel=self._current_phone_otp_channel("sms"),
+                    reason=detail,
+                    device_id=device_id,
+                    user_agent=user_agent,
+                    sec_ch_ua=sec_ch_ua,
+                    impersonate=impersonate,
+                    state=state,
+                )
+            self._set_error(detail)
+            return None
+
+        record, error_code, pool_message = self._lookup_existing_phone_pool_record(phone)
+        self._log(f"[手机号验证] {pool_message}")
+        pool_segment_matched = self._existing_phone_matches_pool_segment(record, error_code)
+        allow_whatsapp_channel = not pool_segment_matched
+        if error_code:
+            if self._manual_phone_otp_enabled():
+                self._log("[手机号验证] 手机号池无法自动收码，优先选择 SMS 并等待人工输入验证码")
+                if self._current_phone_otp_channel("sms") != "sms" or state.page_type == "phone_otp_select_channel":
+                    ok, selected_state, detail = self._select_phone_otp_channel(
+                        "sms",
+                        device_id,
+                        user_agent,
+                        sec_ch_ua,
+                        impersonate,
+                        state,
+                    )
+                    if ok and selected_state:
+                        state = selected_state
+                    elif detail:
+                        if pool_segment_matched:
+                            if self._is_openai_phone_send_rejected(detail):
+                                rejected_reason = (
+                                    f"手机号 {mask_phone_for_log(phone)} 属于手机号池号段，OpenAI 已拒绝发送 SMS 验证码: {redact_log_text(detail)}"
+                                )
+                                self._record_existing_phone_pool_openai_rejected(phone, rejected_reason)
+                                self._set_error(rejected_reason)
+                                return None
+                            self._set_error(
+                                f"手机号 {phone} 属于手机号池号段，无法切换/触发 SMS 通道，且不允许 WhatsApp 验证: {detail}"
+                            )
+                            return None
+                        self._log(f"[手机号验证] 自动选择 SMS 通道失败，将保留当前通道: {detail}")
+                return self._wait_for_manual_phone_otp(
+                    phone=phone,
+                    masked=masked,
+                    channel=self._current_phone_otp_channel("sms"),
+                    reason=pool_message,
+                    device_id=device_id,
+                    user_agent=user_agent,
+                    sec_ch_ua=sec_ch_ua,
+                    impersonate=impersonate,
+                    state=state,
+                    allow_whatsapp_channel=allow_whatsapp_channel,
+                )
+            self._set_error(pool_message)
+            return None
+
+        api_url = str(getattr(record, "api_url", "") or "").strip()
+        if not api_url:
+            if self._manual_phone_otp_enabled():
+                detail = f"手机号 {phone} 命中手机号池但缺少 API URL，无法自动验证"
+                self._log(f"[手机号验证] {detail}，切换为人工输入验证码")
+                return self._wait_for_manual_phone_otp(
+                    phone=phone,
+                    masked=masked,
+                    channel=self._current_phone_otp_channel("sms"),
+                    reason=detail,
+                    device_id=device_id,
+                    user_agent=user_agent,
+                    sec_ch_ua=sec_ch_ua,
+                    impersonate=impersonate,
+                    state=state,
+                    allow_whatsapp_channel=False,
+                )
+            self._set_error(f"手机号 {phone} 命中手机号池但缺少 API URL，无法自动验证")
+            return None
+
+        try:
+            from services.chatgpt_core.phone_service import UploadedPhoneEntry, UploadedPhoneService
+        except Exception as exc:
+            self._set_error(f"加载上传手机号接码服务失败: {exc}")
+            return None
+
+        service_entry = UploadedPhoneEntry(
+            country_slug="existing_bound_phone",
+            phone=phone,
+            detail_url=api_url,
+            api_url=api_url,
+            raw_line=f"{phone}----{api_url}",
+            line_no=0,
+        )
+        phone_service = UploadedPhoneService(
+            [service_entry],
+            {
+                "_task_stop_checker": self.stop_checker,
+                "uploaded_phone_timeout_seconds": self.config.get("existing_phone_otp_timeout_seconds")
+                or self.config.get("uploaded_phone_timeout_seconds")
+                or self.config.get("local_phone_gateway_timeout_seconds")
+                or self.config.get("smstome_otp_timeout_seconds")
+                or 180,
+                "uploaded_phone_poll_interval_seconds": self.config.get("existing_phone_otp_poll_interval_seconds")
+                or self.config.get("uploaded_phone_poll_interval_seconds")
+                or self.config.get("local_phone_gateway_poll_interval_seconds")
+                or self.config.get("smstome_poll_interval_seconds")
+                or 5,
+                "uploaded_phone_max_resend_attempts": self.config.get("existing_phone_otp_max_resend_attempts")
+                or self.config.get("uploaded_phone_max_resend_attempts")
+                or 1,
+                "uploaded_phone_resend_interval_seconds": self.config.get("existing_phone_otp_resend_interval_seconds")
+                or self.config.get("uploaded_phone_resend_interval_seconds")
+                or self.config.get("local_phone_gateway_resend_interval_seconds")
+                or 30,
+            },
+            log_fn=self._log,
+        )
+        phone_service.bind_entry(service_entry)
+
+        if self._current_phone_otp_channel("sms") != "sms" or state.page_type == "phone_otp_select_channel":
+            ok, selected_state, detail = self._select_phone_otp_channel(
+                "sms",
+                device_id,
+                user_agent,
+                sec_ch_ua,
+                impersonate,
+                state,
+            )
+            if ok and selected_state:
+                state = selected_state
+                self._log(f"[手机号验证] 已优先选择 SMS 通道: {phone}")
+            elif detail:
+                if self._is_openai_phone_send_rejected(detail):
+                    rejected_reason = f"手机号 {mask_phone_for_log(phone)} 属于手机号池号段，OpenAI 已拒绝发送 SMS 验证码: {redact_log_text(detail)}"
+                    self._record_existing_phone_pool_openai_rejected(phone, rejected_reason)
+                    self._set_error(rejected_reason)
+                    return None
+                self._set_error(
+                    f"手机号 {phone} 属于手机号池号段，无法切换/触发 SMS 通道，且不允许 WhatsApp 验证: {detail}"
+                )
+                return None
+
+        resend_ok, resend_detail = self._resend_phone_otp(
+            device_id,
+            user_agent,
+            sec_ch_ua,
+            impersonate,
+            state,
+        )
+        if not resend_ok:
+            if self._is_openai_phone_send_rejected(resend_detail):
+                rejected_reason = f"手机号 {mask_phone_for_log(phone)} 属于手机号池号段，OpenAI 已拒绝发送 SMS 验证码: {redact_log_text(resend_detail)}"
+                self._record_existing_phone_pool_openai_rejected(phone, rejected_reason)
+                self._set_error(rejected_reason)
+                return None
+            if self._manual_phone_otp_enabled():
+                detail = f"已绑定手机号 {phone} 验证短信触发失败: {resend_detail}"
+                self._log(f"[手机号验证] {detail}，切换为人工输入验证码")
+                return self._wait_for_manual_phone_otp(
+                    phone=phone,
+                    masked=masked,
+                    channel=self._current_phone_otp_channel("sms"),
+                    reason=detail,
+                    device_id=device_id,
+                    user_agent=user_agent,
+                    sec_ch_ua=sec_ch_ua,
+                    impersonate=impersonate,
+                    state=state,
+                    allow_whatsapp_channel=False,
+                )
+            self._set_error(f"已绑定手机号 {phone} 验证短信触发失败: {resend_detail}")
+            return None
+        self._log(f"[手机号验证] 已请求绑定手机号短信验证码: {phone}")
+        phone_service.mark_sms_sent(service_entry)
+
+        code = phone_service.wait_for_code(service_entry)
+        max_resends = int(getattr(phone_service, "max_resend_attempts", 1) or 1)
+        resend_interval_seconds = int(getattr(phone_service, "resend_interval_seconds", 0) or 0)
+        for resend_attempt in range(1, max_resends + 1):
+            if code:
+                break
+            if resend_interval_seconds > 0:
+                self._log(
+                    f"[手机号验证] 绑定手机号验证码暂未收到，等待 {resend_interval_seconds:g}s 后重发 {resend_attempt}/{max_resends}: {phone}"
+                )
+                self._sleep_with_stop(resend_interval_seconds)
+            resend_ok, resend_detail = self._resend_phone_otp(
+                device_id,
+                user_agent,
+                sec_ch_ua,
+                impersonate,
+                state,
+            )
+            if not resend_ok:
+                self._set_error(f"已绑定手机号 {phone} 验证短信重发失败: {resend_detail}")
+                return None
+            phone_service.mark_sms_sent(service_entry)
+            code = phone_service.wait_for_code(service_entry)
+
+        if not code:
+            if self._manual_phone_otp_enabled():
+                detail = f"已绑定手机号 {mask_phone_for_log(phone)} API 未收到验证码"
+                phone_service.cancel(service_entry, reason=detail)
+                self._log(f"[手机号验证] {detail}，切换为人工输入验证码")
+                return self._wait_for_manual_phone_otp(
+                    phone=phone,
+                    masked=masked,
+                    channel=self._current_phone_otp_channel("sms"),
+                    reason=detail,
+                    device_id=device_id,
+                    user_agent=user_agent,
+                    sec_ch_ua=sec_ch_ua,
+                    impersonate=impersonate,
+                    state=state,
+                    allow_whatsapp_channel=False,
+                )
+            self._set_error(f"已绑定手机号 {mask_phone_for_log(phone)} API 未收到验证码")
+            return None
+
+        try:
+            validate_delay_seconds = float(getattr(phone_service, "validate_delay_seconds", 0) or 0)
+        except (TypeError, ValueError):
+            validate_delay_seconds = 0
+        if validate_delay_seconds > 0:
+            self._log(f"[手机号验证] 准备提交绑定手机号验证码 otp={code} otp_present={bool(code)} otp_length={len(str(code or ''))}，等待 {validate_delay_seconds:g}s 后验证")
+            self._sleep_with_stop(validate_delay_seconds)
+        else:
+            self._log(f"[手机号验证] 准备提交绑定手机号验证码 otp={code} otp_present={bool(code)} otp_length={len(str(code or ''))}")
+
+        valid, validated_state, detail = self._validate_phone_otp(
+            code,
+            device_id,
+            user_agent,
+            sec_ch_ua,
+            impersonate,
+            state,
+        )
+        if not valid or not validated_state:
+            phone_service.cancel(service_entry, reason=detail or "bound phone otp validate failed")
+            self._set_error(f"已绑定手机号 {phone} OTP 验证失败: {detail or 'unknown'}")
+            return None
+        phone_service.complete(service_entry)
+        self._log(f"[手机号验证] 绑定手机号 OTP 验证通过: {phone}")
+        return validated_state
 
     def _state_supports_workspace_resolution(self, state: FlowState):
         target = f"{state.continue_url} {state.current_url}".lower()
@@ -623,6 +1562,10 @@ class OAuthClient:
 
         has_login_session = False
         authorize_final_url = ""
+        authorize_status_code = 0
+        authorize_text = ""
+        oauth2_status_code = 0
+        oauth2_text = ""
 
         try:
             self._check_stop()
@@ -645,9 +1588,11 @@ class OAuthClient:
 
             self._browser_pause()
             r = self.session.get(authorize_url, **kwargs)
+            authorize_status_code = int(getattr(r, "status_code", 0) or 0)
+            authorize_text = str(getattr(r, "text", "") or "")
             authorize_final_url = str(r.url)
             redirects = len(getattr(r, "history", []) or [])
-            self._log(f"/oauth/authorize -> {r.status_code}, redirects={redirects}")
+            self._log(f"/oauth/authorize -> {authorize_status_code}, redirects={redirects}")
 
             has_login_session = any(
                 (cookie.name if hasattr(cookie, "name") else str(cookie))
@@ -685,10 +1630,12 @@ class OAuthClient:
 
             self._browser_pause()
             r2 = self.session.get(oauth2_url, **kwargs)
+            oauth2_status_code = int(getattr(r2, "status_code", 0) or 0)
+            oauth2_text = str(getattr(r2, "text", "") or "")
             authorize_final_url = str(r2.url)
             redirects2 = len(getattr(r2, "history", []) or [])
             self._log(
-                f"/api/oauth/oauth2/auth -> {r2.status_code}, redirects={redirects2}"
+                f"/api/oauth/oauth2/auth -> {oauth2_status_code}, redirects={redirects2}"
             )
 
             has_login_session = any(
@@ -703,6 +1650,36 @@ class OAuthClient:
             if self._is_stop_exception(e):
                 self._raise_stop(e)
             self._log(f"/api/oauth/oauth2/auth 异常: {e}")
+
+        challenge_detected = self._looks_like_cloudflare_challenge(
+            authorize_text,
+            status_code=authorize_status_code,
+            url=authorize_final_url or authorize_url,
+        ) or self._looks_like_cloudflare_challenge(
+            oauth2_text,
+            status_code=oauth2_status_code,
+            url=authorize_final_url or f"{self.oauth_issuer}/api/oauth/oauth2/auth",
+        )
+
+        if not has_login_session and challenge_detected:
+            self._log("bootstrap: 检测到 Cloudflare challenge，尝试浏览器预热并回灌 auth cookies...")
+            browser_final_url, browser_ready = self._browser_bootstrap_oauth_session(
+                authorize_url,
+                authorize_params,
+                device_id=device_id,
+                user_agent=user_agent,
+                sec_ch_ua=sec_ch_ua,
+            )
+            if browser_final_url:
+                authorize_final_url = browser_final_url
+            has_login_session = browser_ready or self._has_cookie("login_session")
+            self._log(
+                "login_session(浏览器回灌): "
+                + ("已获取" if has_login_session else "未获取")
+            )
+
+        if not has_login_session:
+            self._log("bootstrap: 仍未建立 login_session，后续 authorize/continue 大概率会被拦截")
 
         return authorize_final_url
 
@@ -872,6 +1849,11 @@ class OAuthClient:
         for attempt in range(2):
             self._check_stop()
             self._log(f"authorize_continue: device_id={device_id}")
+            if not self._has_cookie("login_session"):
+                self._set_error(
+                    "OAuth bootstrap 未建立 login_session，已跳过 authorize/continue 直提邮箱"
+                )
+                return None
             sentinel_token = build_sentinel_token(
                 self.session,
                 device_id,
@@ -1399,6 +2381,9 @@ class OAuthClient:
         skymail_client=None,
         prefer_passwordless_login=False,
         allow_phone_verification=True,
+        allow_add_phone_verification=None,
+        allow_existing_phone_verification=None,
+        phone_sms_probe_only=False,
         force_new_browser=False,
         force_password_login=False,
         force_chatgpt_entry=False,
@@ -1425,7 +2410,10 @@ class OAuthClient:
             impersonate: curl_cffi impersonate 参数
             skymail_client: Skymail 客户端（用于获取 OTP，如果需要）
             prefer_passwordless_login: 是否强制走 passwordless OTP 链路
-            allow_phone_verification: add_phone 后是否允许进入手机号验证码分支
+            allow_phone_verification: 兼容旧开关；未单独指定时同时控制 add_phone 新绑和已绑定手机号二次验证
+            allow_add_phone_verification: add_phone 新绑/未接码账号是否允许自动接码绑定
+            allow_existing_phone_verification: 已绑定手机号二次验证是否允许从手机号池按完整号码自动接码
+            phone_sms_probe_only: add_phone 发码并收到短信后停止，不提交 OTP
             force_password_login: 即使 prefer_passwordless_login=true，也强制走密码登录
             force_chatgpt_entry: 在 OAuth 前先走 ChatGPT 首页 -> CSRF -> signin/openai
             complete_about_you_if_needed: 命中 about_you 后是否自动提交资料完成注册
@@ -1434,7 +2422,7 @@ class OAuthClient:
             last_name: about_you 姓氏
             birthdate: about_you 生日，格式 YYYY-MM-DD
             login_source: 当前登录场景，仅用于日志
-            allow_add_phone_session_recovery: allow_phone_verification=false 时是否允许内部重启一次 add_phone OAuth session
+            allow_add_phone_session_recovery: allow_add_phone_verification=false 时是否允许内部重启一次 add_phone OAuth session
 
         Returns:
             dict: tokens 字典，包含 access_token, refresh_token, id_token
@@ -1448,6 +2436,16 @@ class OAuthClient:
         self.last_state = FlowState()
         self._about_you_existing_account_detected = False
         self._about_you_should_skip_create_account = False
+        allow_phone_verification = self._coerce_bool(allow_phone_verification, default=True)
+        if allow_add_phone_verification is None:
+            allow_add_phone_verification = allow_phone_verification
+        else:
+            allow_add_phone_verification = self._coerce_bool(allow_add_phone_verification, default=False)
+        if allow_existing_phone_verification is None:
+            allow_existing_phone_verification = allow_phone_verification
+        else:
+            allow_existing_phone_verification = self._coerce_bool(allow_existing_phone_verification, default=True)
+        phone_sms_probe_only = self._coerce_bool(phone_sms_probe_only, default=False)
         self._log(
             "开始 OAuth 登录流程..."
             + (f" (source={login_source})" if login_source else "")
@@ -1456,6 +2454,9 @@ class OAuthClient:
             "OAuth 策略: "
             f"prefer_passwordless_login={'on' if prefer_passwordless_login else 'off'}, "
             f"allow_phone_verification={'on' if allow_phone_verification else 'off'}, "
+            f"allow_add_phone={'on' if allow_add_phone_verification else 'off'}, "
+            f"allow_existing_phone_otp={'on' if allow_existing_phone_verification else 'off'}, "
+            f"phone_sms_probe_only={'on' if phone_sms_probe_only else 'off'}, "
             f"complete_about_you_if_needed={'on' if complete_about_you_if_needed else 'off'}, "
             f"force_new_browser={'on' if force_new_browser else 'off'}, "
             f"force_password_login={'on' if force_password_login else 'off'}, "
@@ -1558,13 +2559,19 @@ class OAuthClient:
         def _should_stop_after_login(state_to_check: FlowState):
             if not stop_after_login:
                 return False
-            if self._state_is_login_password(state_to_check):
-                return False
-            if self._state_is_email_otp(state_to_check):
-                return False
-            if self._state_is_create_account_password(state_to_check):
-                return False
-            return True
+            target = f"{state_to_check.continue_url} {state_to_check.current_url}".lower()
+            if state_to_check.page_type in {
+                "external_url",
+                "callback",
+                "oauth_callback",
+                "chatgpt_home",
+            }:
+                return True
+            if "chatgpt.com/api/auth/callback/" in target:
+                return True
+            if "localhost:1455/auth/callback" in target:
+                return True
+            return False
 
         for step in range(20):
             self._check_stop()
@@ -1578,7 +2585,7 @@ class OAuthClient:
 
             code = self._extract_code_from_state(state)
             if code:
-                self._log(f"获取到 authorization code: {code[:20]}...")
+                self._log("获取到 authorization code: [REDACTED_OTP]")
                 self._log("步骤7: POST /oauth/token")
                 self._check_stop()
                 tokens = self._exchange_code_for_tokens(
@@ -1674,7 +2681,7 @@ class OAuthClient:
                     impersonate=impersonate,
                 )
                 if code:
-                    self._log(f"获取到 authorization code: {code[:20]}...")
+                    self._log("获取到 authorization code: [REDACTED_OTP]")
                     self._log("步骤7: POST /oauth/token")
                     self._check_stop()
                     tokens = self._exchange_code_for_tokens(
@@ -1741,6 +2748,9 @@ class OAuthClient:
                             skymail_client=skymail_client,
                             prefer_passwordless_login=prefer_passwordless_login,
                             allow_phone_verification=allow_phone_verification,
+                            allow_add_phone_verification=allow_add_phone_verification,
+                            allow_existing_phone_verification=allow_existing_phone_verification,
+                            phone_sms_probe_only=phone_sms_probe_only,
                             force_new_browser=True,
                             force_password_login=force_password_login,
                             force_chatgpt_entry=force_chatgpt_entry,
@@ -1815,6 +2825,8 @@ class OAuthClient:
                             skymail_client=skymail_client,
                             prefer_passwordless_login=prefer_passwordless_login,
                             allow_phone_verification=allow_phone_verification,
+                            allow_add_phone_verification=allow_add_phone_verification,
+                            allow_existing_phone_verification=allow_existing_phone_verification,
                             force_new_browser=True,
                             force_password_login=force_password_login,
                             force_chatgpt_entry=force_chatgpt_entry,
@@ -1848,14 +2860,22 @@ class OAuthClient:
                     raw_dump = ""
                 if raw_dump:
                     self._log(f"add_phone 状态响应体(raw): {raw_dump}")
-                if not allow_phone_verification:
+                if not allow_add_phone_verification:
+                    self._record_phone_challenge_event(
+                        challenge_type="add_phone",
+                        status="unbound_required",
+                        source=login_source or "oauth_login",
+                        message="命中 add_phone，账号尚未绑定手机号，未启用自动新绑",
+                        allow_add_phone_verification=allow_add_phone_verification,
+                        allow_existing_phone_verification=allow_existing_phone_verification,
+                    )
                     if self._state_supports_workspace_resolution(state):
                         self._log(
                             "步骤5: add_phone 命中，但检测到 workspace 线索，继续尝试 workspace/org 选择"
                         )
                     elif prefer_passwordless_login and allow_add_phone_session_recovery and _recovery_depth < 1:
                         self._log(
-                            "步骤5: add_phone 仍无 workspace/callback，重启一次全新 OAuth session + 新 PKCE"
+                            "步骤5: add_phone 新绑开关关闭，且仍无 workspace/callback，重启一次全新 OAuth session + 新 PKCE"
                         )
                         self._recreate_session()
                         return self.login_and_get_tokens(
@@ -1869,6 +2889,8 @@ class OAuthClient:
                             skymail_client=skymail_client,
                             prefer_passwordless_login=prefer_passwordless_login,
                             allow_phone_verification=allow_phone_verification,
+                            allow_add_phone_verification=allow_add_phone_verification,
+                            allow_existing_phone_verification=allow_existing_phone_verification,
                             complete_about_you_if_needed=complete_about_you_if_needed,
                             first_name=first_name,
                             last_name=last_name,
@@ -1884,7 +2906,7 @@ class OAuthClient:
                         )
                     else:
                         self._set_error(
-                            "passwordless 登录后仍停留在 add_phone，未获取到 workspace / callback"
+                            "passwordless 登录后仍停留在 add_phone，且 add_phone 新绑开关关闭，未获取到 workspace / callback"
                         )
                         return None
                 else:
@@ -1895,6 +2917,7 @@ class OAuthClient:
                         impersonate,
                         state,
                         email=email,
+                        sms_probe_only=phone_sms_probe_only,
                     )
                     if not next_state:
                         if not self.last_error:
@@ -1905,6 +2928,22 @@ class OAuthClient:
                     state = next_state
                     continue
 
+            if self._state_is_existing_phone_otp(state):
+                next_state = self._handle_existing_phone_otp_verification(
+                    device_id,
+                    user_agent,
+                    sec_ch_ua,
+                    impersonate,
+                    state,
+                    allow_existing_phone_verification=allow_existing_phone_verification,
+                )
+                if not next_state:
+                    return None
+                self._check_stop()
+                referer = state.current_url or referer
+                state = next_state
+                continue
+
             if self._state_requires_navigation(state):
                 code, next_state = self._follow_flow_state(
                     state,
@@ -1913,7 +2952,7 @@ class OAuthClient:
                     impersonate=impersonate,
                 )
                 if code:
-                    self._log(f"获取到 authorization code: {code[:20]}...")
+                    self._log("获取到 authorization code: [REDACTED_OTP]")
                     self._log("步骤7: POST /oauth/token")
                     self._check_stop()
                     tokens = self._exchange_code_for_tokens(
@@ -1940,7 +2979,7 @@ class OAuthClient:
                     authorize_params=authorize_params,
                 )
                 if code:
-                    self._log(f"获取到 authorization code: {code[:20]}...")
+                    self._log("获取到 authorization code: [REDACTED_OTP]")
                     self._log("步骤7: POST /oauth/token")
                     self._check_stop()
                     tokens = self._exchange_code_for_tokens(
@@ -2046,7 +3085,7 @@ class OAuthClient:
 
             code = self._extract_code_from_state(state)
             if code:
-                self._log(f"获取到 authorization code: {code[:20]}...")
+                self._log("获取到 authorization code: [REDACTED_OTP]")
                 self._log("步骤7: POST /oauth/token")
                 tokens = self._exchange_code_for_tokens(code, code_verifier, user_agent, impersonate)
                 if tokens:
@@ -2066,7 +3105,7 @@ class OAuthClient:
                     authorize_params=authorize_params,
                 )
                 if code:
-                    self._log(f"获取到 authorization code: {code[:20]}...")
+                    self._log("获取到 authorization code: [REDACTED_OTP]")
                     self._log("步骤7: POST /oauth/token")
                     tokens = self._exchange_code_for_tokens(code, code_verifier, user_agent, impersonate)
                     if tokens:
@@ -2090,7 +3129,7 @@ class OAuthClient:
                     impersonate=impersonate,
                 )
                 if code:
-                    self._log(f"获取到 authorization code: {code[:20]}...")
+                    self._log("获取到 authorization code: [REDACTED_OTP]")
                     self._log("步骤7: POST /oauth/token")
                     tokens = self._exchange_code_for_tokens(code, code_verifier, user_agent, impersonate)
                     if tokens:
@@ -2306,10 +3345,53 @@ class OAuthClient:
     def _set_terminal_otp_error_if_needed(self, label, response) -> bool:
         info = self._auth_error_info_from_response(response)
         message = str(info.get("error_message") or info.get("text") or "").strip()
+        lowered = message.lower()
         if is_account_deactivated_message(info.get("error_code"), message):
             self._set_error(f"account_deactivated: {message or self._format_auth_error_info(label, info)}")
             return True
+        if (
+            "too many tries" in lowered
+            or "too many attempts" in lowered
+            or "please wait a few minutes" in lowered
+            or "rate limit" in lowered
+            or "rate_limited" in lowered
+        ):
+            detail = message or self._format_auth_error_info(label, info)
+            self._set_error(f"otp_rate_limited: OpenAI OTP 校验次数过多，当前邮箱进入冷却，稍后重试。{detail}")
+            return True
         return False
+
+    @staticmethod
+    def _is_fatal_mailbox_config_error(exc) -> bool:
+        text = str(exc or "").lower()
+        if "tempmail ready api" in text:
+            return (
+                "401" in text
+                or "invalid api_key" in text
+                or "missing api_key" in text
+                or "tempmail_api_key" in text
+            )
+
+        mailbox_markers = (
+            "api/mailboxes",
+            "tempmail",
+            "邮箱服务",
+            "mailbox",
+        )
+        connection_markers = (
+            "connection refused",
+            "failed to establish a new connection",
+            "max retries exceeded",
+            "name or service not known",
+            "temporary failure in name resolution",
+            "connection timed out",
+            "connect timeout",
+            "read timed out",
+            "network is unreachable",
+        )
+        return any(marker in text for marker in mailbox_markers) and any(
+            marker in text for marker in connection_markers
+        )
 
     def _is_duplicate_default_project_error(self, info):
         haystack = " ".join(
@@ -3326,13 +4408,14 @@ class OAuthClient:
             or state.continue_url
             or f"{self.oauth_issuer}/phone-verification",
             origin=self.oauth_issuer,
+            content_type="application/json",
             fetch_site="same-origin",
             extra_headers={"oai-device-id": device_id},
         )
         headers.update(generate_datadog_trace())
 
         try:
-            kwargs = {"headers": headers, "timeout": 30, "allow_redirects": False}
+            kwargs = {"json": {}, "headers": headers, "timeout": 30, "allow_redirects": False}
             if impersonate:
                 kwargs["impersonate"] = impersonate
             self._browser_pause(0.12, 0.25)
@@ -3408,8 +4491,221 @@ class OAuthClient:
         self._log(f"手机号 OTP 验证通过 {describe_flow_state(next_state)}")
         return True, next_state, ""
 
+    def _current_phone_otp_channel(self, default="sms"):
+        session_data = self._decode_oauth_session_cookie() or {}
+        channel = str(session_data.get("phone_verification_channel") or default or "sms").strip().lower()
+        return channel if channel in {"sms", "whatsapp"} else str(default or "sms").strip().lower() or "sms"
+
+    def _manual_phone_otp_enabled(self):
+        if not self._coerce_bool(self.config.get("_manual_phone_otp_enabled"), default=False):
+            return False
+        return hasattr(self.task_control, "wait_for_verification_code")
+
+    def _manual_phone_otp_timeout_seconds(self):
+        try:
+            return max(int(float(self.config.get("_manual_phone_otp_timeout_seconds") or 60)), 1)
+        except Exception:
+            return 60
+
+    def _select_phone_otp_channel(
+        self,
+        channel,
+        device_id,
+        user_agent,
+        sec_ch_ua,
+        impersonate,
+        state: FlowState,
+    ):
+        self._check_stop()
+        channel_value = str(channel or "").strip().lower()
+        if channel_value not in {"sms", "whatsapp"}:
+            return False, None, f"不支持的手机号验证码通道: {channel}"
+
+        request_url = f"{self.oauth_issuer}/api/accounts/phone-otp/send"
+        headers = self._headers(
+            request_url,
+            user_agent=user_agent,
+            sec_ch_ua=sec_ch_ua,
+            accept="application/json",
+            referer=state.current_url
+            or state.continue_url
+            or f"{self.oauth_issuer}/phone-otp/select-channel",
+            origin=self.oauth_issuer,
+            content_type="application/json",
+            fetch_site="same-origin",
+            extra_headers={"oai-device-id": device_id},
+        )
+        headers.update(generate_datadog_trace())
+
+        try:
+            kwargs = {
+                "json": {"channel": channel_value},
+                "headers": headers,
+                "timeout": 30,
+                "allow_redirects": False,
+            }
+            if impersonate:
+                kwargs["impersonate"] = impersonate
+            self._browser_pause(0.12, 0.25)
+            resp = self.session.post(request_url, **kwargs)
+            self._check_stop()
+        except Exception as exc:
+            if self._is_stop_exception(exc):
+                self._raise_stop(exc)
+            return False, None, f"phone-otp/send({channel_value}) 异常: {exc}"
+
+        self._log(f"/phone-otp/send({channel_value}) -> {resp.status_code}")
+        if resp.status_code != 200:
+            return False, None, f"phone-otp/send({channel_value}) 失败: {resp.status_code} - {resp.text[:180]}"
+
+        try:
+            data = resp.json()
+        except Exception:
+            return True, state, ""
+
+        next_state = self._state_from_payload(data, current_url=str(resp.url) or request_url)
+        if next_state:
+            self._log(f"phone-otp/send({channel_value}) {describe_flow_state(next_state)}")
+        return True, next_state or state, ""
+
+    def _wait_for_manual_phone_otp(
+        self,
+        *,
+        phone,
+        masked,
+        channel,
+        reason,
+        device_id,
+        user_agent,
+        sec_ch_ua,
+        impersonate,
+        state: FlowState,
+        allow_whatsapp_channel: bool = True,
+        allow_resend_action: bool = True,
+    ):
+        if not self._manual_phone_otp_enabled():
+            self._set_error(reason or "需要人工手机号验证码，但当前任务不支持人工输入")
+            return None
+
+        phone_value = str(phone or "").strip()
+        masked_value = str(masked or "").strip()
+        channel_value = str(channel or self._current_phone_otp_channel("sms") or "sms").strip().lower() or "sms"
+        if channel_value not in {"sms", "whatsapp"}:
+            channel_value = "sms"
+        if not allow_whatsapp_channel and channel_value == "whatsapp":
+            channel_value = "sms"
+        timeout_seconds = self._manual_phone_otp_timeout_seconds()
+        email = str(self.config.get("_current_account_email") or self.config.get("email") or "").strip()
+        state_box = {"state": state, "channel": channel_value}
+        available_channels = ["sms"]
+        if allow_whatsapp_channel:
+            available_channels.append("whatsapp")
+        actions = []
+        if allow_whatsapp_channel:
+            actions.append("switch_channel")
+        if allow_resend_action:
+            actions.append("resend")
+
+        self._log(
+            "[手机号验证] 等待人工输入验证码: "
+            f"phone={phone_value or masked_value or '-'} channel={channel_value} timeout={timeout_seconds}s"
+        )
+
+        def _handle_action(action, payload):
+            action_value = str(action or "").strip().lower()
+            payload = dict(payload or {})
+            if action_value == "switch_channel":
+                next_channel = str(payload.get("channel") or "").strip().lower()
+                if next_channel not in {"sms", "whatsapp"}:
+                    raise ValueError(f"不支持的手机号验证码通道: {next_channel}")
+                if not allow_whatsapp_channel and next_channel == "whatsapp":
+                    raise ValueError("当前手机号属于手机号池号段，默认不允许 WhatsApp 验证")
+                ok, next_state, detail = self._select_phone_otp_channel(
+                    next_channel,
+                    device_id,
+                    user_agent,
+                    sec_ch_ua,
+                    impersonate,
+                    state_box["state"],
+                )
+                if not ok:
+                    self._log(f"[手机号验证] 切换通道失败: channel={next_channel} detail={detail}")
+                    return {"metadata": {"channel": state_box["channel"], "last_action_detail": detail}}
+                state_box["channel"] = next_channel
+                if next_state:
+                    state_box["state"] = next_state
+                self._log(f"[手机号验证] 已切换验证码通道: {next_channel}")
+                return {"metadata": {"channel": next_channel, "last_action_detail": "通道已切换并重新发送"}}
+
+            if action_value == "resend":
+                if not allow_resend_action:
+                    raise ValueError("当前不允许重新发送手机号验证码")
+                ok, detail = self._resend_phone_otp(
+                    device_id,
+                    user_agent,
+                    sec_ch_ua,
+                    impersonate,
+                    state_box["state"],
+                )
+                if not ok:
+                    self._log(f"[手机号验证] 重新发送验证码失败: {detail}")
+                    return {"metadata": {"channel": state_box["channel"], "last_action_detail": detail}}
+                self._log(f"[手机号验证] 已重新发送验证码: channel={state_box['channel']}")
+                return {"metadata": {"channel": state_box["channel"], "last_action_detail": "验证码已重新发送"}}
+
+            raise ValueError(f"不支持的验证码动作: {action_value}")
+
+        try:
+            code = self.task_control.wait_for_verification_code(
+                attempt_id=self.task_attempt_id,
+                phase="phone_otp",
+                phase_label="手机号验证码",
+                email=phone_value or masked_value or email,
+                timeout_seconds=timeout_seconds,
+                metadata={
+                    "kind": "phone_otp",
+                    "phone": phone_value,
+                    "masked_phone": masked_value,
+                    "account_email": email,
+                    "channel": channel_value,
+                    "preferred_channel": "sms",
+                    "available_channels": available_channels,
+                    "reason": str(reason or ""),
+                    "can_switch_channel": bool(allow_whatsapp_channel),
+                    "can_resend": bool(allow_resend_action),
+                },
+                actions=actions,
+                action_handler=_handle_action,
+            )
+        except TimeoutError:
+            message = f"手机号验证码 {timeout_seconds}s 内未输入，自动跳过当前账号"
+            self._log(f"[手机号验证] {message}")
+            raise SkipCurrentAttemptRequested(message)
+
+        self._log(f"[手机号验证] 准备提交人工手机号验证码 otp_present={bool(code)} otp_length={len(str(code or ''))}")
+        valid, validated_state, detail = self._validate_phone_otp(
+            code,
+            device_id,
+            user_agent,
+            sec_ch_ua,
+            impersonate,
+            state_box["state"],
+        )
+        if not valid or not validated_state:
+            self._set_error(f"人工手机号 OTP 验证失败: {detail or 'unknown'}")
+            return None
+        self._log("[手机号验证] 人工手机号 OTP 验证通过")
+        return validated_state
+
     def _handle_add_phone_verification(
-        self, device_id, user_agent, sec_ch_ua, impersonate, state: FlowState, email: str = ""
+        self,
+        device_id,
+        user_agent,
+        sec_ch_ua,
+        impersonate,
+        state: FlowState,
+        email: str = "",
+        sms_probe_only: bool = False,
     ):
         self._check_stop()
         phone_service = self.shared_phone_service or create_phone_service(self.config, log_fn=self._log)
@@ -3455,7 +4751,7 @@ class OAuthClient:
             self._check_stop()
             prefix = phone_service.prefix_hint(entry.phone)
             self._log(
-                f"步骤5: add_phone 选择手机号 {attempt + 1}/{phone_service.max_attempts}: {entry.phone} ({entry.country_slug})"
+                f"步骤5: add_phone 选择手机号 {attempt + 1}/{phone_service.max_attempts}: {mask_phone_for_log(entry.phone)} ({entry.country_slug})"
             )
 
             sent, next_state, detail = self._send_phone_number(
@@ -3502,7 +4798,7 @@ class OAuthClient:
                 or entry.phone
             )
             self._log(
-                f"add_phone 发码成功: phone={bound_phone}, channel={verification_channel}"
+                f"add_phone 发码成功: phone={mask_phone_for_log(bound_phone)}, channel={verification_channel}"
             )
             self._check_stop()
             phone_service.mark_sms_sent(entry)
@@ -3549,15 +4845,34 @@ class OAuthClient:
                 if not last_failure:
                     if resend_attempt >= max_resends:
                         last_failure = (
-                            f"手机号 {entry.phone} 达到同号重发上限 {max_resends} 次，仍未收到短信验证码"
+                            f"手机号 {mask_phone_for_log(entry.phone)} 达到同号重发上限 {max_resends} 次，仍未收到短信验证码"
                         )
                     else:
-                        last_failure = f"手机号 {entry.phone} 未收到短信验证码"
+                        last_failure = f"手机号 {mask_phone_for_log(entry.phone)} 未收到短信验证码"
                 self._log(last_failure)
                 phone_service.cancel(entry, reason=last_failure)
                 excluded_prefixes.add(prefix)
                 continue
 
+            try:
+                validate_delay_seconds = float(getattr(phone_service, "validate_delay_seconds", 0) or 0)
+            except (TypeError, ValueError):
+                validate_delay_seconds = 0
+            if validate_delay_seconds > 0:
+                if sms_probe_only:
+                    self._log(f"号段短信探测已收到验证码 code_received=true otp_length={len(str(code or ''))}；按设置不提交验证码")
+                    phone_service.complete(entry)
+                    self._set_error("号段短信探测完成：OpenAI 已发码且收码 API 已收到验证码，未提交验证码")
+                    return None
+                self._log(f"准备提交手机号验证码 otp_present={bool(code)} otp_length={len(str(code or ''))}，等待 {validate_delay_seconds:g}s 后验证")
+                self._sleep_with_stop(validate_delay_seconds)
+            else:
+                if sms_probe_only:
+                    self._log(f"号段短信探测已收到验证码 code_received=true otp_length={len(str(code or ''))}；按设置不提交验证码")
+                    phone_service.complete(entry)
+                    self._set_error("号段短信探测完成：OpenAI 已发码且收码 API 已收到验证码，未提交验证码")
+                    return None
+                self._log(f"准备提交手机号验证码 otp_present={bool(code)} otp_length={len(str(code or ''))}")
             valid, validated_state, detail = self._validate_phone_otp(
                 code,
                 device_id,
@@ -3769,7 +5084,7 @@ class OAuthClient:
             tried_codes.add(code)
             if message_id:
                 tried_message_ids.add(str(message_id).strip())
-            self._log(f"尝试 OTP: {code}")
+            self._log(f"尝试 OTP otp_present={bool(code)} otp_length={len(str(code or ''))}")
 
             try:
                 kwargs = {
@@ -3816,7 +5131,8 @@ class OAuthClient:
             return next_state
 
         if hasattr(skymail_client, "wait_for_verification_code"):
-            self._log("使用 wait_for_verification_code 进行阻塞式获取新验证码...")
+            self._log("[验证码] 等待 OAuth 邮箱验证码：timeout=600s，poll=30s")
+            last_wait_debug_at = 0.0
             while time.time() < otp_deadline:
                 self._check_stop()
                 remaining = max(1, int(otp_deadline - time.time()))
@@ -3847,11 +5163,15 @@ class OAuthClient:
                 except Exception as e:
                     if "手动停止" in str(e):
                         raise TaskInterruption("任务已手动停止") from e
+                    if self._is_fatal_mailbox_config_error(e):
+                        self._set_error(f"邮箱服务配置错误，停止等待 OTP: {str(e)[:240]}")
+                        break
                     self._log(f"等待 OTP 异常: {e}")
                     code = None
                     current_message_id = ""
 
                 if not code:
+                    now_ts = time.time()
                     if time.time() >= next_resend_at and not self.last_error:
                         self._log(
                             f"暂未收到 OTP，触发重发（间隔 {otp_resend_wait_seconds}s）"
@@ -3861,13 +5181,18 @@ class OAuthClient:
                             next_resend_at = time.time() + otp_resend_wait_seconds
                         else:
                             next_resend_at = time.time() + otp_resend_wait_seconds
-                    self._log("暂未收到新的 OTP，继续等待...")
+                    elapsed = max(0, int(now_ts - (otp_deadline - otp_wait_seconds)))
+                    if now_ts - last_wait_debug_at >= 120:
+                        self._log(
+                            f"still waiting oauth_email_otp elapsed={elapsed}/{otp_wait_seconds}s poll_window={otp_poll_window}s"
+                        )
+                        last_wait_debug_at = now_ts
                     if self.last_error:
                         break
                     continue
 
                 if code in tried_codes and (not current_message_id or current_message_id in tried_message_ids):
-                    self._log(f"跳过已尝试验证码: {code}")
+                    self._log(f"跳过已尝试验证码 otp_present={bool(code)} otp_length={len(str(code or ''))}")
                     continue
 
                 next_state = validate_otp(code, message_id=current_message_id)
