@@ -143,7 +143,22 @@ def resolve_probe_candidate_proxies(
     if mode == "specified":
         if not explicit_proxy:
             raise RuntimeError("已选择指定代理模式，但代理地址为空")
-        candidates.append((explicit_proxy, None, "specified"))
+        
+        source = "specified"
+        try:
+            from sqlmodel import Session, select
+            from .db import engine, ProxyModel
+            with Session(engine) as session:
+                proxy_record = session.exec(select(ProxyModel).where(ProxyModel.url == explicit_proxy)).first()
+                if proxy_record:
+                    country = str(getattr(proxy_record, "exit_country_code", "") or "unknown").strip() or "unknown"
+                    exit_ip = str(getattr(proxy_record, "exit_ip", "") or "").strip()
+                    exit_ip_str = f" exit_ip={exit_ip}" if exit_ip else ""
+                    source = f"specified country={country}{exit_ip_str}"
+        except Exception:
+            pass
+            
+        candidates.append((explicit_proxy, None, source))
         if not failover:
             return candidates
 
