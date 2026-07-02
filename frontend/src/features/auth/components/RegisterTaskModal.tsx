@@ -49,7 +49,7 @@ function mailProviderLabel(provider: string) {
 type RegisterTaskModalProps = {
   open: boolean
   currentPlatform: string
-  taskModalMode: 'register' | 'resume_auth' | 'payment_link' | 'sub2api_upload' | 'oaipay_upload' | 'baxigpt_cdk' | 'paypal_bind'
+  taskModalMode: 'register' | 'resume_auth' | 'payment_link' | 'sub2api_upload' | 'oaipay_upload' | 'baxigpt_cdk' | 'paypal_bind' | 'probe_local_status'
   taskModalAccount: any
   taskId: string | null
   taskSnapshot: any
@@ -159,6 +159,10 @@ export function RegisterTaskModal({
     : {}
   const isPrefixSample = Boolean(prefixSample?.enabled)
   const modalTitle = () => {
+    if (taskModalMode === 'probe_local_status') {
+      const eligible = Number(taskSnapshot?.meta?.eligible || 0)
+      return eligible > 0 ? `批量同步本地状态 (${eligible} 个)` : '批量同步本地状态'
+    }
     if (taskModalMode === 'sub2api_upload') {
       const eligible = Number(taskSnapshot?.meta?.eligible || 0)
       return eligible > 0 ? `Sub2API 批量上传 (${eligible} 个)` : 'Sub2API 批量上传'

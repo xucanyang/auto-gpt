@@ -91,18 +91,31 @@ def sync_chatgpt_account_local_status(session: Session, account: AccountModel, *
         extra=extra,
     )
     probe = probe_local_chatgpt_status(probe_account, proxy=proxy)
-    extra["chatgpt_local"] = probe
+    try:
+        session.commit()
+    except Exception:
+        session.rollback()
+    try:
+        session.refresh(account)
+    except Exception:
+        pass
+    latest_extra = account.get_extra()
+    if not isinstance(latest_extra, dict):
+        latest_extra = {}
+    latest_extra["chatgpt_local"] = probe
     capabilities = classify_chatgpt_capabilities(account, local_probe=probe)
-    extra["chatgpt_capabilities"] = capabilities
-    account.set_extra(extra)
+    latest_extra["chatgpt_capabilities"] = capabilities
+    account.set_extra(latest_extra)
     reason = apply_chatgpt_status_policy(account, local_probe=probe)
     account.updated_at = datetime.now(timezone.utc)
     session.add(account)
     from services.account_filters import upsert_account_list_state_for_account_ids
 
-    upsert_account_list_state_for_account_ids(session, [account.id], commit=False)
-    session.commit()
-    session.refresh(account)
+    upsert_account_list_state_for_account_ids(session, [account.id], commit=True)
+    try:
+        session.refresh(account)
+    except Exception:
+        pass
     return {
         "status": str(account.status or ""),
         "reason": reason,

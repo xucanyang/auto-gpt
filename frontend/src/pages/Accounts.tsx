@@ -1512,12 +1512,13 @@ function shouldShowInvalidRecheckButton(record: any) {
   return String(record?.status || '').trim().toLowerCase() === 'invalid'
 }
 
-function taskModalModeFromSource(source: unknown): 'register' | 'resume_auth' | 'payment_link' | 'sub2api_upload' | 'oaipay_upload' | 'baxigpt_cdk' | 'paypal_bind' {
+function taskModalModeFromSource(source: unknown): 'register' | 'resume_auth' | 'payment_link' | 'sub2api_upload' | 'oaipay_upload' | 'baxigpt_cdk' | 'paypal_bind' | 'probe_local_status' {
   const normalized = String(source || '').trim().toLowerCase()
   if (normalized === 'baxigpt_cdk' || normalized === 'baxigpt_cdk_submit') return 'baxigpt_cdk'
   if (normalized === 'chatgpt_paypal_bind' || normalized === 'paypal_bind') return 'paypal_bind'
   if (normalized === 'phone_binding_test') return 'resume_auth'
   if (normalized === 'resume_auth' || normalized === 'resume_subscription_auth' || normalized === 'batch_resume_subscription_auth') return 'resume_auth'
+  if (normalized === 'batch_probe_local_status' || normalized === 'probe_local_status') return 'probe_local_status'
   if (normalized === 'batch_sub2api_upload') return 'sub2api_upload'
   if (normalized === 'batch_oaipay_upload') return 'oaipay_upload'
   if (normalized === 'invalid_recheck' || normalized === 'batch_invalid_recheck') return 'resume_auth'
@@ -1564,7 +1565,7 @@ export default function Accounts() {
   const [selectedAccountSnapshots, setSelectedAccountSnapshots] = useState<Record<string, any>>({})
 
   const [registerModalOpen, setRegisterModalOpen] = useState(false)
-  const [taskModalMode, setTaskModalMode] = useState<'register' | 'resume_auth' | 'payment_link' | 'sub2api_upload' | 'oaipay_upload' | 'baxigpt_cdk' | 'paypal_bind'>('register')
+  const [taskModalMode, setTaskModalMode] = useState<'register' | 'resume_auth' | 'payment_link' | 'sub2api_upload' | 'oaipay_upload' | 'baxigpt_cdk' | 'paypal_bind' | 'probe_local_status'>('register')
   const [taskModalAccount, setTaskModalAccount] = useState<any>(null)
   const [addModalOpen, setAddModalOpen] = useState(false)
   const [importModalOpen, setImportModalOpen] = useState(false)
@@ -4152,6 +4153,44 @@ export default function Accounts() {
     setStatusSyncLoading(loadingKey)
     message.loading({ content: `${scopeLabel}${actionLabel}进行中...`, key: toastKey, duration: 0 })
     try {
+      if (kind === 'probe') {
+        const res = await apiFetch('/tasks/chatgpt/probe-local-status/batch', {
+          method: 'POST',
+          body: JSON.stringify(body),
+        })
+        const eligible = Number(res?.eligible || 0)
+        const skipped = Number(res?.skipped || 0)
+        const missing = Number(res?.missing || 0)
+        const taskIdFromResponse = String(res?.task_id || '').trim()
+
+        if (!taskIdFromResponse) {
+          const reqCount = Array.isArray(body.account_ids) ? body.account_ids.length : '所有'
+          message.info({
+            content: `没有可同步本地状态的账号。请求 ${reqCount} 个，跳过 ${skipped} 个${missing > 0 ? `，缺失 ${missing} 个` : ''}`,
+            key: toastKey,
+          })
+          if (res && typeof res === 'object') {
+            showBatchActionResult(`${scopeLabel}${actionLabel}结果`, res)
+          }
+          return
+        }
+
+        const snapshot = await apiFetch(`/tasks/${taskIdFromResponse}`)
+        setTaskModalMode('probe_local_status')
+        setTaskModalAccount(scope === 'selected' ? null : { email: `当前筛选 ${eligible} 个账号` })
+        setTaskId(taskIdFromResponse)
+        setTaskSnapshot(snapshot)
+        setRegisterModalOpen(true)
+        setActiveTasksPanelOpen(true)
+        void activeTasksQuery.refetch()
+        message.success({
+          content: `批量同步本地状态任务已启动：可执行 ${eligible} 个，跳过 ${skipped} 个${missing > 0 ? `，缺失 ${missing} 个` : ''}`,
+          key: toastKey,
+        })
+        showBatchActionResult(`${scopeLabel}${actionLabel}结果`, res)
+        return
+      }
+
       const result = await apiFetch(`/actions/${currentPlatform}/${actionId}/batch`, {
         method: 'POST',
         body: JSON.stringify(body),

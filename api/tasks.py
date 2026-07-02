@@ -307,8 +307,23 @@ class BatchInvalidRecheckTaskRequest(BaseModel):
     auth_type: str = ""
     subscription_type: str = ""
     account_validity: str = ""
+    limit: int = 0
+    params: dict[str, Any] = Field(default_factory=dict)
+
+
+class BatchProbeLocalStatusTaskRequest(BaseModel):
+    account_ids: list[int] = Field(default_factory=list)
+    all_filtered: bool = False
+    email: str = ""
+    status: str = ""
+    manually_used: str | None = None
+    auth_type: str = ""
+    subscription_type: str = ""
+    account_validity: str = ""
     sub2api_state: str = ""
     limit: int = 0
+    params: dict[str, Any] = Field(default_factory=dict)
+
 
 
 def _ensure_task_exists(task_id: str) -> None:
@@ -1505,6 +1520,80 @@ def _resolve_batch_invalid_recheck_accounts(
     return eligible, [], skipped, matched
 
 
+def _resolve_batch_probe_local_status_accounts(
+    req: BatchProbeLocalStatusTaskRequest,
+) -> tuple[list[dict[str, Any]], list[int], list[dict[str, Any]], list[dict[str, Any]]]:
+    from services.chatgpt_core.local_status_refresh import account_has_local_status_auth_material
+    requested_ids = _normalize_batch_account_ids(req.account_ids)
+    limit = max(int(req.limit or 0), 0)
+
+    if requested_ids:
+        if len(requested_ids) > 1000:
+            raise HTTPException(400, "单次最多处理 1000 个账号")
+        with Session(engine) as session:
+            rows = session.exec(
+                select(AccountModel)
+                .where(AccountModel.platform == "chatgpt")
+                .where(AccountModel.id.in_(requested_ids))
+            ).all()
+        row_map = {int(row.id or 0): row for row in rows if int(row.id or 0) > 0}
+        eligible: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+        missing_ids: list[int] = []
+        for account_id in requested_ids:
+            account = row_map.get(account_id)
+            if account is None:
+                missing_ids.append(account_id)
+                continue
+            item = {
+                "account_id": account_id,
+                "email": str(account.email or ""),
+                "status": str(account.status or ""),
+            }
+            if account_has_local_status_auth_material(account):
+                eligible.append(item)
+            else:
+                skipped.append({**item, "reason": "账号无有效凭证(缺 access_token/refresh_token)"})
+        if limit > 0:
+            overflow = eligible[limit:]
+            eligible = eligible[:limit]
+            skipped.extend({**item, "reason": f"超过本次限制 limit={limit}"} for item in overflow)
+        return eligible, missing_ids, skipped, []
+
+    if not bool(req.all_filtered):
+        raise HTTPException(400, "请提供 account_ids，或指定 all_filtered=true")
+
+    with Session(engine) as session:
+        rows = _filtered_chatgpt_accounts(session, req)
+
+    if len(rows) > 1000:
+        raise HTTPException(400, "单次最多处理 1000 个账号")
+
+    eligible = []
+    skipped = []
+    matched = []
+    for account in rows:
+        account_id = int(account.id or 0)
+        if account_id <= 0:
+            continue
+        item = {
+            "account_id": account_id,
+            "email": str(account.email or ""),
+            "status": str(account.status or ""),
+        }
+        matched.append(item)
+        if account_has_local_status_auth_material(account):
+            eligible.append(item)
+        else:
+            skipped.append({**item, "reason": "账号无有效凭证(缺 access_token/refresh_token)"})
+    if limit > 0:
+        overflow = eligible[limit:]
+        eligible = eligible[:limit]
+        skipped.extend({**item, "reason": f"超过本次限制 limit={limit}"} for item in overflow)
+    return eligible, [], skipped, matched
+
+
+
 def _custom_email_proxy_truthy(value: Any, default: bool = False) -> bool:
     if value is None:
         return default
@@ -2560,7 +2649,95 @@ def enqueue_batch_invalid_recheck_task(
     }
 
 
+def enqueue_batch_probe_local_status_task(
+    req: BatchProbeLocalStatusTaskRequest,
+    *,
+    background_tasks: BackgroundTasks | None = None,
+) -> dict[str, Any]:
+    eligible_accounts, missing_ids, skipped_accounts, matched_accounts = _resolve_batch_probe_local_status_accounts(req)
+    total_requested = len(_normalize_batch_account_ids(req.account_ids)) if req.account_ids else len(matched_accounts)
+
+    if not eligible_accounts:
+        return {
+            "task_id": "",
+            "total_requested": total_requested,
+            "matched": len(matched_accounts),
+            "eligible": 0,
+            "skipped": len(skipped_accounts),
+            "missing": len(missing_ids),
+            "items": [],
+            "skipped_items": skipped_accounts,
+            "missing_ids": missing_ids,
+        }
+
+    task_id = f"task_{int(time.time() * 1000)}"
+    source = "batch_probe_local_status"
+    meta = {
+        "total_requested": total_requested,
+        "matched": len(matched_accounts),
+        "eligible": len(eligible_accounts),
+        "missing_ids": list(missing_ids),
+        "account_ids": [int(item["account_id"]) for item in eligible_accounts],
+        "emails": [str(item["email"] or "") for item in eligible_accounts],
+        "filter": {
+            "all_filtered": bool(req.all_filtered),
+            "status": str(req.status or ""),
+            "email": str(req.email or ""),
+        },
+        "limit": int(req.limit or 0),
+        "skipped_items": list(skipped_accounts),
+        "params": dict(req.params or {}),
+    }
+    _create_standalone_task_record(
+        task_id,
+        platform="chatgpt",
+        source=source,
+        total=max(len(eligible_accounts), 1),
+        meta=meta,
+    )
+
+    primary_email = str(eligible_accounts[0]["email"] or "") if eligible_accounts else ""
+    _save_task_log(
+        "chatgpt",
+        primary_email,
+        "running",
+        detail=_build_task_log_detail(
+            task_id,
+            {
+                "email": primary_email,
+                "attempt_outcome": "task_created",
+                "source": source,
+                "meta": meta,
+            },
+        ),
+    )
+
+    account_ids = [int(item["account_id"]) for item in eligible_accounts]
+    if background_tasks is None:
+        thread = threading.Thread(
+            target=_run_batch_probe_local_status,
+            args=(task_id, account_ids, dict(req.params or {})),
+            daemon=True,
+        )
+        thread.start()
+    else:
+        background_tasks.add_task(_run_batch_probe_local_status, task_id, account_ids, dict(req.params or {}))
+
+    return {
+        "task_id": task_id,
+        "total_requested": total_requested,
+        "matched": len(matched_accounts),
+        "eligible": len(eligible_accounts),
+        "skipped": len(skipped_accounts),
+        "missing": len(missing_ids),
+        "items": eligible_accounts,
+        "skipped_items": skipped_accounts,
+        "missing_ids": missing_ids,
+    }
+
+
 def enqueue_batch_resume_subscription_auth_task(
+
     req: BatchResumeSubscriptionAuthTaskRequest,
     *,
     background_tasks: BackgroundTasks | None = None,
@@ -7906,6 +8083,16 @@ def _persist_phone_binding_result(
         "bound_at": str(phone_result.get("finished_at") or time.strftime("%Y-%m-%d %H:%M:%S")),
     }
     extra["chatgpt_phone_binding"] = binding
+    if phone:
+        extra["chatgpt_bound_phone"] = {
+            "phone": phone,
+            "phone_number": phone,
+            "api_url": api_url,
+            "source": "phone_binding_test",
+            "updated_at": binding["bound_at"],
+            "status": "bound",
+        }
+        extra["chatgpt_bound_phone_number"] = phone
     history = extra.get("chatgpt_phone_binding_history")
     if not isinstance(history, list):
         history = []
@@ -8882,8 +9069,14 @@ def _run_phone_binding_test(
                             )
                             account_done = True
                             sync_meta()
-                            break
-
+                        try:
+                            session.commit()
+                        except Exception:
+                            session.rollback()
+                        try:
+                            session.refresh(account)
+                        except Exception:
+                            pass
                         _apply_chatgpt_resume_auth_result(account, result, session)
 
                         if (not ok) and phone_service.completed_entries:
@@ -8956,6 +9149,14 @@ def _run_phone_binding_test(
                                 resource_touched=True,
                                 reset_started_at=True,
                             )
+                            try:
+                                session.commit()
+                            except Exception:
+                                session.rollback()
+                            try:
+                                session.refresh(account)
+                            except Exception:
+                                pass
                             _persist_phone_binding_result(
                                 account,
                                 phone_result,
@@ -8964,6 +9165,12 @@ def _run_phone_binding_test(
                             )
                             session.add(account)
                             session.commit()
+                            from services.account_filters import upsert_account_list_state_for_account_ids
+                            upsert_account_list_state_for_account_ids(session, [account.id], commit=True)
+                            try:
+                                session.refresh(account)
+                            except Exception:
+                                pass
                             timeline(
                                 email=email,
                                 account_id=account_id,
@@ -9665,7 +9872,164 @@ def _run_batch_invalid_recheck(task_id: str, account_ids: list[int]):
         _task_store.cleanup()
 
 
+def _run_batch_probe_local_status(task_id: str, account_ids: list[int], params: dict[str, Any]):
+    from core.db import AccountModel, engine
+    from services.chatgpt_core.local_status_refresh import sync_chatgpt_account_local_status
+    from core.proxy_utils import build_account_action_proxy_candidates, format_proxy_candidate_label
+    import random
+
+    control = _task_store.control_for(task_id)
+
+    def stop_checker() -> None:
+        control.checkpoint(consume_skip=False)
+
+    def task_log(message: str) -> None:
+        stop_checker()
+        _log(task_id, message)
+
+    total = max(len(account_ids), 1)
+    success_count = 0
+    skipped_count = 0
+    errors: list[str] = []
+    primary_email = ""
+
+    _task_store.mark_running(task_id)
+    _task_store.set_progress(task_id, f"0/{total}")
+
+    meta = dict(_task_store.snapshot(task_id).get("meta") or {})
+    skipped_items = list(meta.get("skipped_items") or [])
+    missing_ids = list(meta.get("missing_ids") or [])
+
+    try:
+        for missing_id in missing_ids:
+            task_log(f"[MISS] 账号不存在: account_id={missing_id}")
+            errors.append(f"account_id={missing_id}: 账号不存在")
+
+        for item in skipped_items:
+            task_log(f"[SKIP] {item.get('email') or item.get('account_id') or '-'} - {item.get('reason') or '已跳过'}")
+
+        for index, account_id in enumerate(account_ids, start=1):
+            control.checkpoint(consume_skip=False)
+            _task_store.set_progress(task_id, f"{index - 1}/{total}")
+
+            delay_min = float(params.get("delay_seconds") or params.get("probe_delay_seconds") or 0.0)
+            delay_max = float(params.get("delay_max_seconds") or params.get("probe_delay_max_seconds") or 0.0)
+            if (delay_min > 0 or delay_max > 0) and index > 1:
+                wait_sec = random.uniform(min(delay_min, delay_max), max(delay_min, delay_max)) if delay_max > delay_min else delay_min
+                if wait_sec > 0:
+                    task_log(f"--- [等候] 随机延时等待 {wait_sec:.1f} 秒... ---")
+                    time.sleep(wait_sec)
+
+            with Session(engine) as session:
+                acc = session.get(AccountModel, account_id)
+                if not acc:
+                    task_log(f"[{index}/{total}] 账号不存在 ID={account_id}，已跳过")
+                    skipped_count += 1
+                    continue
+                email = str(acc.email or "")
+                if not primary_email:
+                    primary_email = email
+                task_log(f"[{index}/{total}] 开始同步本地状态 账号ID：{account_id}｜邮箱：{email}")
+
+                candidates = build_account_action_proxy_candidates(
+                    acc,
+                    params,
+                    action_id="probe_local_status",
+                    platform="chatgpt",
+                )
+                success_probe = False
+                last_err = ""
+                for attempt_idx, candidate in enumerate(candidates, start=1):
+                    proxy_url = str(candidate.get("url") or "").strip()
+                    proxy_label = format_proxy_candidate_label(candidate)
+                    if len(candidates) > 1:
+                        task_log(f" -> [尝试 {attempt_idx}/{len(candidates)}] 使用代理: {proxy_label}")
+                    try:
+                        res = sync_chatgpt_account_local_status(session, acc, proxy=proxy_url)
+                        plan = res.get("probe", {}).get("subscription", {}).get("plan", "unknown")
+                        task_log(f" -> [成功] 账号 {email} 本地状态同步完成｜当前订阅计划: {plan}")
+                        success_probe = True
+                        success_count += 1
+                        break
+                    except Exception as exc:
+                        last_err = str(exc)
+                        task_log(f" -> [失败] 代理 {proxy_label} 探测异常: {exc}")
+                if not success_probe:
+                    errors.append(f"{email}: {last_err or '探测失败'}")
+                    task_log(f" -> [异常] 账号 {email} 本地状态全部失败: {last_err or '探测失败'}")
+
+            _task_store.set_progress(task_id, f"{index}/{total}")
+
+        final_status = "done"
+        summary_message = (
+            f"批量同步本地状态完成: 成功 {success_count} 个，跳过 {skipped_count + len(skipped_items)} 个，失败 {len(errors)} 个"
+        )
+        task_log(f"[SUMMARY] {summary_message}")
+        log_status = "success" if not errors else "failed"
+        _save_task_log(
+            "chatgpt",
+            primary_email,
+            log_status,
+            error="" if log_status == "success" else summary_message,
+            detail=_build_task_log_detail(
+                task_id,
+                {
+                    "email": primary_email,
+                    "attempt_outcome": "batch_probe_local_status_success" if log_status == "success" else "batch_probe_local_status_failed",
+                    "source": "batch_probe_local_status",
+                    "meta": {
+                        **meta,
+                        "runtime_success": success_count,
+                        "runtime_skipped": skipped_count,
+                        "runtime_errors": errors,
+                    },
+                },
+            ),
+        )
+        _task_store.finish(
+            task_id,
+            status=final_status,
+            success=success_count,
+            skipped=skipped_count + len(skipped_items),
+            errors=errors,
+            error="" if not errors else summary_message,
+        )
+    except StopTaskRequested as exc:
+        task_log(f"[STOP] {exc}")
+        _save_task_log(
+            "chatgpt",
+            primary_email,
+            "stopped",
+            error=str(exc),
+            detail=_build_task_log_detail(
+                task_id,
+                {
+                    "email": primary_email,
+                    "attempt_outcome": "batch_probe_local_status_stopped",
+                    "source": "batch_probe_local_status",
+                    "meta": {
+                        **meta,
+                        "runtime_success": success_count,
+                        "runtime_skipped": skipped_count,
+                        "runtime_errors": errors,
+                    },
+                },
+            ),
+        )
+        _task_store.finish(
+            task_id,
+            status="stopped",
+            success=success_count,
+            skipped=skipped_count + len(skipped_items),
+            errors=errors,
+            error=str(exc),
+        )
+    finally:
+        _task_store.cleanup()
+
+
 def _run_register(task_id: str, req: RegisterTaskRequest):
+
     from core.base_platform import RegisterConfig
     from core.db import save_account
     from core.base_mailbox import create_mailbox
@@ -10813,6 +11177,17 @@ def create_batch_invalid_recheck_task(
     background_tasks: BackgroundTasks,
 ):
     return enqueue_batch_invalid_recheck_task(
+        req,
+        background_tasks=background_tasks,
+    )
+
+
+@router.post("/chatgpt/probe-local-status/batch")
+def create_batch_probe_local_status_task(
+    req: BatchProbeLocalStatusTaskRequest,
+    background_tasks: BackgroundTasks,
+):
+    return enqueue_batch_probe_local_status_task(
         req,
         background_tasks=background_tasks,
     )

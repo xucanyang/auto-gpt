@@ -609,22 +609,29 @@ def _build_phone_summary(
     bound_phone: dict[str, Any],
     phone_challenge: dict[str, Any],
 ) -> dict[str, Any]:
-    return {
-        "binding": _pick_fields(
-            phone_binding,
-            (
-                "phone",
-                "api_url",
-                "status",
-                "status_label",
-                "api_expired_date",
-                "code_time",
-                "code_extracted",
-                "bound_at",
-                "task_id",
-                "source",
-            ),
+    binding_picked = _pick_fields(
+        phone_binding,
+        (
+            "phone",
+            "api_url",
+            "status",
+            "status_label",
+            "api_expired_date",
+            "code_time",
+            "code_extracted",
+            "bound_at",
+            "task_id",
+            "source",
         ),
+    )
+    if not binding_picked.get("phone") and bound_phone.get("phone"):
+        binding_picked["phone"] = bound_phone.get("phone")
+    if not binding_picked.get("api_url") and bound_phone.get("api_url"):
+        binding_picked["api_url"] = bound_phone.get("api_url")
+    if not binding_picked.get("status") and bound_phone.get("status"):
+        binding_picked["status"] = bound_phone.get("status")
+    return {
+        "binding": binding_picked,
         "bound": bound_phone,
         "challenge": phone_challenge,
     }

@@ -104,3 +104,20 @@ class ProbeLocalStatusBatchConfigTests(unittest.TestCase):
 
         self.assertEqual(mock_exec.call_count, 2)
         mock_sleep.assert_called()
+
+    @mock.patch("api.tasks._save_task_log")
+    @mock.patch("api.tasks._resolve_batch_probe_local_status_accounts")
+    def test_create_batch_probe_local_status_task(self, mock_resolve, mock_save_log):
+
+        from api.tasks import create_batch_probe_local_status_task, BatchProbeLocalStatusTaskRequest
+        mock_resolve.return_value = (
+            [{"account_id": 10, "email": "a10@example.com", "status": "ok"}],
+            [],
+            [],
+            [{"account_id": 10, "email": "a10@example.com", "status": "ok"}],
+        )
+        req = BatchProbeLocalStatusTaskRequest(account_ids=[10])
+        res = create_batch_probe_local_status_task(req, background_tasks=mock.Mock())
+        self.assertIn("task_id", res)
+        self.assertEqual(res["eligible"], 1)
+

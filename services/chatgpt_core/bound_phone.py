@@ -47,12 +47,31 @@ def chatgpt_bound_phone_payload(extra: dict[str, Any] | None) -> dict[str, Any]:
         or extra.get("chatgpt_bound_phone_masked")
     )
     if not phone and not masked:
+        binding = extra.get("chatgpt_phone_binding") if isinstance(extra.get("chatgpt_phone_binding"), dict) else {}
+        if isinstance(binding, dict) and str(binding.get("status") or "") == "bound":
+            phone = normalize_bound_phone(binding.get("phone") or binding.get("phone_number"))
+            masked = _safe_text(binding.get("masked") or binding.get("masked_phone"))
+            if phone or masked:
+                return {
+                    "phone": phone,
+                    "phone_number": phone,
+                    "masked": masked,
+                    "masked_phone": masked,
+                    "api_url": _safe_text(binding.get("api_url")),
+                    "source": _safe_text(binding.get("source") or "phone_binding_test"),
+                    "updated_at": _safe_text(binding.get("bound_at") or binding.get("code_time") or _utcnow_iso()),
+                    "verification_status": "verified",
+                    "display": phone or masked,
+                    "is_masked": bool(masked and not phone),
+                }
         return {}
+    binding_api_url = _safe_text((extra.get("chatgpt_phone_binding") if isinstance(extra.get("chatgpt_phone_binding"), dict) else {}).get("api_url"))
     return {
         "phone": phone,
         "phone_number": phone,
         "masked": masked,
         "masked_phone": masked,
+        "api_url": _safe_text(payload.get("api_url") or binding_api_url),
         "source": _safe_text(payload.get("source")),
         "detected_at": _safe_text(payload.get("detected_at")),
         "updated_at": _safe_text(payload.get("updated_at") or payload.get("detected_at")),
