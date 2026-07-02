@@ -42,6 +42,7 @@ services:
       - /root/.openclaw/workspace/team-manage/data:/team-manage-seed-data:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
+      - "openai-pay-submit:host-gateway"
     networks:
       - default
       - tempmail_internal
@@ -83,6 +84,7 @@ services:
       - /root/.openclaw/workspace/team-manage/data:/team-manage-seed-data:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
+      - "openai-pay-submit:host-gateway"
     networks:
       - default
       - tempmail_internal

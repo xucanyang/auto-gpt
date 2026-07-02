@@ -395,7 +395,7 @@ class BaxiGptCdkRepository:
         now_text = _now_text()
         with Session(engine) as session:
             model = session.get(BaxiGptCdkPoolModel, int(record_id or 0))
-            if model is None or str(model.status or "") != STATUS_AVAILABLE:
+            if model is None or str(model.status or "") not in {STATUS_AVAILABLE, STATUS_RESERVED, STATUS_PROCESSING, STATUS_SUBMITTED}:
                 return None
             model.status = STATUS_RESERVED
             model.bound_account_id = int(account_id or 0)
@@ -670,27 +670,38 @@ class BaxiGptCdkRepository:
             session.refresh(model)
             return _to_record(model)
 
-    def persist_account_binding_extra(self, account: AccountModel, record: BaxiGptCdkRecord) -> None:
+    def persist_account_binding_extra(
+        self,
+        account: AccountModel,
+        record: BaxiGptCdkRecord,
+        *,
+        status: str | None = None,
+        upstream_status: str | None = None,
+        order_id: str | None = None,
+        display_id: str | None = None,
+        last_error_message: str | None = None,
+    ) -> None:
         try:
             extra = account.get_extra()
         except Exception:
             extra = {}
         if not isinstance(extra, dict):
             extra = {}
+        target_status = status if status is not None else record.status
         payload = {
-            "status": record.status,
-            "upstream_status": record.upstream_status,
+            "status": target_status,
+            "upstream_status": upstream_status if upstream_status is not None else record.upstream_status,
             "code_masked": record.code_masked,
             "cdk_id": record.id,
-            "order_id": record.order_id,
-            "display_id": record.display_id,
-            "remote_email": record.remote_email,
+            "order_id": order_id if order_id is not None else record.order_id,
+            "display_id": display_id if display_id is not None else record.display_id,
+            "remote_email": account.email or record.remote_email,
             "task_id": record.task_id,
             "bound_at": record.bound_at,
             "submitted_at": record.submitted_at,
             "paid_at": record.paid_at,
             "last_checked_at": record.last_checked_at,
-            "last_error_message": record.last_error_message,
+            "last_error_message": last_error_message if last_error_message is not None else record.last_error_message,
         }
         extra["baxigpt_cdk"] = payload
         history = extra.get("baxigpt_cdk_history")
@@ -705,9 +716,31 @@ class BaxiGptCdkRepository:
             history.append(payload)
         extra["baxigpt_cdk_history"] = history[-20:]
         account.set_extra(extra)
-        status = str(record.status or "").strip().lower()
-        if status == STATUS_PAID:
+        status_text = str(target_status or "").strip().lower()
+        if status_text == STATUS_PAID:
             mark_payment_succeeded(account, reason="baxigpt_cdk_paid")
-        elif status == STATUS_FAILED:
+        elif status_text == STATUS_FAILED:
             mark_payment_failed(account, reason="baxigpt_cdk_failed")
         account.updated_at = _utcnow()
+
+    def mark_account_ineligible(self, account: AccountModel, record: BaxiGptCdkRecord, reason: str) -> None:
+        try:
+            extra = account.get_extra()
+        except Exception:
+            extra = {}
+        if not isinstance(extra, dict):
+            extra = {}
+        extra["chatgpt_account_unavailable"] = True
+        extra["chatgpt_unavailable_reason"] = reason
+        extra["chatgpt_skip_save_account"] = True
+        extra["chatgpt_skip_save_reason"] = reason
+        extra["chatgpt_invalid_registration_failure"] = True
+        extra["chatgpt_invalid_registration_reason"] = reason
+        account.set_extra(extra)
+        self.persist_account_binding_extra(
+            account,
+            record,
+            status=STATUS_FAILED,
+            upstream_status="failed",
+            last_error_message=reason,
+        )

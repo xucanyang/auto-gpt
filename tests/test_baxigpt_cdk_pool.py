@@ -344,6 +344,32 @@ CDK-AAAA-1111
         self.assertNotIn("token", diag["bound_account"])
         self.assertNotIn("password", diag["bound_account"])
 
+    def test_repo_multi_quota_reserve_and_ineligible(self):
+        repo = BaxiGptCdkRepository()
+        code = repo.add(code="CDK-MULTI-1111")
+        
+        rec1 = repo.reserve_for_account(code.id, account_id=101, email="acc1@example.com", task_id="t-1")
+        self.assertIsNotNone(rec1)
+        self.assertEqual(rec1.status, "reserved")
+        
+        rec2 = repo.reserve_for_account(code.id, account_id=102, email="acc2@example.com", task_id="t-1")
+        self.assertIsNotNone(rec2)
+        self.assertEqual(rec2.bound_account_id, 102)
+        
+        with Session(self.engine) as session:
+            account = AccountModel(id=102, platform="chatgpt", email="acc2@example.com", password="pw", token="at")
+            session.add(account)
+            session.commit()
+            
+            repo.mark_account_ineligible(account, rec2, "该账号没有开通资格")
+            session.add(account)
+            session.commit()
+            
+            extra = account.get_extra()
+            self.assertTrue(extra.get("chatgpt_account_unavailable"))
+            self.assertEqual(extra.get("chatgpt_unavailable_reason"), "该账号没有开通资格")
+            self.assertTrue(extra.get("chatgpt_skip_save_account"))
+
 
 class BaxiGptClientRetryTests(unittest.TestCase):
     def test_code_info_retries_transient_request_error(self):
@@ -383,6 +409,40 @@ class BaxiGptClientRetryTests(unittest.TestCase):
 
         self.assertEqual(calls["count"], 1)
 
+    def test_batch_submit_with_multiple_accounts(self):
+        class FakeResponse:
+            status_code = 200
+            def __init__(self, data): self._data = data
+            def json(self): return self._data
+
+        def fake_request(method, url, **kwargs):
+            if "/api/task/submit" in url:
+                return FakeResponse({"ok": True, "order_id": "CDK-MULTI::task-1"})
+            if "/api/task/status" in url:
+                return FakeResponse({
+                    "ok": True,
+                    "tasks": [
+                        {"id": "task-1", "account": "token1", "status": "SUCCESS"},
+                        {"id": "task-2", "account": "token2", "status": "FAILED", "error": "No trial eligibility"}
+                    ]
+                })
+            return FakeResponse({})
+
+        with patch.object(client_module.cffi_requests, "request", fake_request):
+            client = BaxiGptClient()
+            res = client.submit(code="CDK-MULTI", access_token=["token1", "token2"])
+            self.assertTrue(res["ok"])
+            self.assertEqual(len(res["submitted_items"]), 2)
+            self.assertEqual(res["submitted_items"][0]["status"], "submitted")
+            
+            st1 = client.status("CDK-MULTI::task-1")
+            self.assertEqual(st1["status"], "paid")
+            
+            st2 = client.status("CDK-MULTI::task-2")
+            self.assertEqual(st2["status"], "failed")
+            self.assertEqual(st2["message"], "No trial eligibility")
+
 
 if __name__ == "__main__":
     unittest.main()
+

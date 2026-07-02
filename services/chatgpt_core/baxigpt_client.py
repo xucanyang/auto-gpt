@@ -120,29 +120,46 @@ class BaxiGptClient:
             "total": res.get("balance", 0),
         }
 
-    def submit(self, *, code: str, access_token: str) -> dict[str, Any]:
+    def submit(self, *, code: str, access_token: str | list[str]) -> dict[str, Any]:
+        accounts = [access_token] if isinstance(access_token, str) else [str(t or "") for t in access_token if str(t or "").strip()]
         payload = {
             "cdk": str(code or ""),
-            "accounts": [str(access_token or "")]
+            "accounts": accounts
         }
         res = self._request("POST", "/api/task/submit", payload=payload, timeout=self.submit_timeout, retries=self.submit_retries)
         
         status_res = self._request("GET", "/api/task/status", params={"cdk": str(code or "")})
         tasks = status_res.get("tasks", [])
         
-        task_id = ""
-        for t in tasks:
-            if t.get("account") == access_token:
-                task_id = str(t.get("id", ""))
-                break
-                
-        if not task_id:
-            task_id = f"fallback_{access_token[:20]}"
+        submitted_items = []
+        for token in accounts:
+            task_id = ""
+            matched_t = None
+            for t in tasks:
+                t_acc = str(t.get("account") or "")
+                if t_acc == token or (token and t_acc.startswith(token[:20])):
+                    matched_t = t
+                    task_id = str(t.get("id", ""))
+                    break
+            if not task_id:
+                task_id = f"fallback_{token[:20]}"
+            submitted_items.append({
+                "account": token,
+                "task_id": task_id,
+                "order_id": f"{code}::{task_id}",
+                "display_id": task_id,
+                "status": "submitted",
+                "raw_task": matched_t or {}
+            })
             
+        first_item = submitted_items[0] if submitted_items else {"order_id": f"{code}::fallback", "display_id": "fallback", "status": "submitted"}
         return {
             "ok": True,
-            "order_id": f"{code}::{task_id}",
-            "status": "submitted"
+            "order_id": first_item["order_id"],
+            "display_id": first_item.get("display_id", ""),
+            "status": "submitted",
+            "submitted_items": submitted_items,
+            "raw_response": res
         }
 
     def status(self, order_id: str) -> dict[str, Any]:
@@ -167,7 +184,8 @@ class BaxiGptClient:
                     "ok": True,
                     "status": mapped,
                     "display_id": str(t.get("id", "")),
-                    "email": str(t.get("account", ""))
+                    "email": str(t.get("account", "")),
+                    "message": str(t.get("error") or t.get("message") or t.get("reason") or "")
                 }
                 
         return {"ok": False, "status": "processing", "message": "Task not found in status list yet"}
@@ -190,7 +208,8 @@ class BaxiGptClient:
                 "order_id": f"{code}::{t.get('id', '')}",
                 "status": mapped,
                 "display_id": str(t.get("id", "")),
-                "email": str(t.get("account", ""))
+                "email": str(t.get("account", "")),
+                "message": str(t.get("error") or t.get("message") or t.get("reason") or "")
             })
             
         return {
