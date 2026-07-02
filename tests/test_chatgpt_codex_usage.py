@@ -4,6 +4,7 @@ from unittest import mock
 from services.chatgpt_core.codex_usage import (
     account_has_codex_auth_material,
     build_codex_usage_extra_updates,
+    build_codex_usage_progress_from_extra,
     parse_codex_rate_limit_headers,
     parse_codex_usage_body,
     probe_codex_usage_window,
@@ -151,6 +152,11 @@ class CodexUsageTests(unittest.TestCase):
         self.assertEqual(usage["codex_7d_remaining_percent"], 95.0)
         self.assertEqual(usage["codex_7d_window_minutes"], 43200)
         self.assertEqual(usage["codex_primary_used_percent"], 5.0)
+
+        progress = build_codex_usage_progress_from_extra(usage)
+        self.assertIsNone(progress["five_hour"]["used_percent"])
+        self.assertEqual(progress["seven_day"]["used_percent"], 5.0)
+        self.assertEqual(progress["seven_day"]["window_minutes"], 43200)
 
     def test_probe_uses_existing_access_token_without_refresh_token(self):
         account = DummyAccount(extra={"access_token": "cached-access-token"})

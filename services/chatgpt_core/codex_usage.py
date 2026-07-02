@@ -340,28 +340,46 @@ def build_codex_usage_extra_updates(snapshot: dict[str, Any] | None, checked_at:
 
 
 def build_codex_usage_progress_from_extra(extra: dict[str, Any] | None) -> dict[str, Any]:
-    """Return frontend-friendly 5h/7d progress from cached flat fields."""
+    """Return frontend-friendly 5h/7d progress from cached flat fields, strictly separating short vs long windows."""
     data = extra if isinstance(extra, dict) else {}
     updated_at = str(data.get("codex_usage_updated_at") or "").strip()
 
-    def window_payload(window: str) -> dict[str, Any]:
-        used = _to_float(data.get(f"codex_{window}_used_percent"))
-        reset_after = _to_int(data.get(f"codex_{window}_reset_after_seconds"))
-        reset_at = str(data.get(f"codex_{window}_reset_at") or "").strip()
-        window_minutes = _to_int(data.get(f"codex_{window}_window_minutes"))
-        remaining = _remaining_percent(used)
+    def _resolve_window(prefixes: tuple[str, ...], max_minutes: int | None, min_minutes: int | None, default_minutes: int) -> dict[str, Any]:
+        for prefix in prefixes:
+            used = _to_float(data.get(f"{prefix}_used_percent"))
+            if used is None:
+                continue
+            window_minutes = _to_int(data.get(f"{prefix}_window_minutes"))
+            if window_minutes is not None:
+                if max_minutes is not None and window_minutes > max_minutes:
+                    continue
+                if min_minutes is not None and window_minutes <= min_minutes:
+                    continue
+            else:
+                window_minutes = default_minutes
+
+            reset_after = _to_int(data.get(f"{prefix}_reset_after_seconds"))
+            reset_at = str(data.get(f"{prefix}_reset_at") or "").strip()
+            remaining = _remaining_percent(used)
+            return {
+                "used_percent": used,
+                "remaining_percent": remaining,
+                "reset_after_seconds": reset_after,
+                "reset_at": reset_at,
+                "window_minutes": window_minutes,
+            }
         return {
-            "used_percent": used,
-            "remaining_percent": remaining,
-            "reset_after_seconds": reset_after,
-            "reset_at": reset_at,
-            "window_minutes": window_minutes,
+            "used_percent": None,
+            "remaining_percent": None,
+            "reset_after_seconds": None,
+            "reset_at": "",
+            "window_minutes": None,
         }
 
     return {
         "updated_at": updated_at,
-        "five_hour": window_payload("5h"),
-        "seven_day": window_payload("7d"),
+        "five_hour": _resolve_window(("codex_5h", "codex_secondary", "codex_primary"), max_minutes=360, min_minutes=None, default_minutes=300),
+        "seven_day": _resolve_window(("codex_7d", "codex_primary", "codex_secondary"), max_minutes=None, min_minutes=360, default_minutes=10080),
     }
 
 

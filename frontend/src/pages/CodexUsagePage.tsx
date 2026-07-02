@@ -82,7 +82,7 @@ function codexStateTag(state?: string) {
   }
 }
 
-function renderWindowProgress(win?: CodexWindowProgress) {
+function renderWindowProgress(win?: CodexWindowProgress, winLabel?: string) {
   if (!win || win.used_percent === null || win.used_percent === undefined) {
     return <Text type="secondary" style={{ fontSize: 12 }}>暂无记录</Text>
   }
@@ -96,7 +96,7 @@ function renderWindowProgress(win?: CodexWindowProgress) {
   return (
     <div style={{ width: 180 }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, marginBottom: 2 }}>
-        <Text strong style={{ fontSize: 12 }}>已用 {Math.round(used * 10) / 10}%</Text>
+        <Text strong style={{ fontSize: 12 }}>{winLabel ? `[${winLabel}] ` : ''}已用 {Math.round(used * 10) / 10}%</Text>
         <Text type="secondary" style={{ fontSize: 12 }}>剩余 {Math.round(remaining * 10) / 10}%</Text>
       </div>
       <Progress percent={Math.round(used)} size="small" status={status} strokeColor={strokeColor} showInfo={false} />
@@ -243,13 +243,16 @@ export default function CodexUsagePage() {
       title: '5小时窗口用量',
       key: 'five_hour',
       width: 200,
-      render: (_: any, record: CodexUsageRecord) => renderWindowProgress(record.progress?.five_hour),
+      render: (_: any, record: CodexUsageRecord) => renderWindowProgress(record.progress?.five_hour, '5h'),
     },
     {
-      title: '7天窗口用量',
+      title: '7天/30天窗口用量',
       key: 'seven_day',
       width: 200,
-      render: (_: any, record: CodexUsageRecord) => renderWindowProgress(record.progress?.seven_day),
+      render: (_: any, record: CodexUsageRecord) => {
+        const is30d = (record.progress?.seven_day?.window_minutes || 0) >= 20000
+        return renderWindowProgress(record.progress?.seven_day, is30d ? '30d' : '7d')
+      },
     },
     {
       title: '探测时间',

@@ -1168,24 +1168,52 @@ function getCodexUsage(record: any) {
   const progress = codex.progress && typeof codex.progress === 'object' ? codex.progress : {}
   if (usage.codex_5h_used_percent === undefined) {
     if (progress?.five_hour?.used_percent !== undefined && progress?.five_hour?.used_percent !== null) {
-      usage.codex_5h_used_percent = progress.five_hour.used_percent
-      usage.codex_5h_reset_after_seconds = progress.five_hour.reset_after_seconds
-      usage.codex_5h_reset_at = progress.five_hour.reset_at
-    } else if (usage.codex_primary_used_percent !== undefined) {
-      usage.codex_5h_used_percent = usage.codex_primary_used_percent
-      usage.codex_5h_reset_after_seconds = usage.codex_primary_reset_after_seconds
-      usage.codex_5h_reset_at = usage.codex_primary_reset_at
+      const winMins = readNumberValue(progress.five_hour.window_minutes)
+      if (winMins === null || winMins <= 360) {
+        usage.codex_5h_used_percent = progress.five_hour.used_percent
+        usage.codex_5h_reset_after_seconds = progress.five_hour.reset_after_seconds
+        usage.codex_5h_reset_at = progress.five_hour.reset_at
+        usage.codex_5h_window_minutes = progress.five_hour.window_minutes
+      }
+    } else {
+      const pWin = readNumberValue(usage.codex_primary_window_minutes)
+      const sWin = readNumberValue(usage.codex_secondary_window_minutes)
+      if (usage.codex_primary_used_percent !== undefined && pWin !== null && pWin <= 360) {
+        usage.codex_5h_used_percent = usage.codex_primary_used_percent
+        usage.codex_5h_reset_after_seconds = usage.codex_primary_reset_after_seconds
+        usage.codex_5h_reset_at = usage.codex_primary_reset_at
+        usage.codex_5h_window_minutes = usage.codex_primary_window_minutes
+      } else if (usage.codex_secondary_used_percent !== undefined && (sWin !== null ? sWin <= 360 : (pWin !== null && pWin > 360))) {
+        usage.codex_5h_used_percent = usage.codex_secondary_used_percent
+        usage.codex_5h_reset_after_seconds = usage.codex_secondary_reset_after_seconds
+        usage.codex_5h_reset_at = usage.codex_secondary_reset_at
+        usage.codex_5h_window_minutes = usage.codex_secondary_window_minutes
+      }
     }
   }
   if (usage.codex_7d_used_percent === undefined) {
     if (progress?.seven_day?.used_percent !== undefined && progress?.seven_day?.used_percent !== null) {
-      usage.codex_7d_used_percent = progress.seven_day.used_percent
-      usage.codex_7d_reset_after_seconds = progress.seven_day.reset_after_seconds
-      usage.codex_7d_reset_at = progress.seven_day.reset_at
-    } else if (usage.codex_secondary_used_percent !== undefined) {
-      usage.codex_7d_used_percent = usage.codex_secondary_used_percent
-      usage.codex_7d_reset_after_seconds = usage.codex_secondary_reset_after_seconds
-      usage.codex_7d_reset_at = usage.codex_secondary_reset_at
+      const winMins = readNumberValue(progress.seven_day.window_minutes)
+      if (winMins === null || winMins > 360) {
+        usage.codex_7d_used_percent = progress.seven_day.used_percent
+        usage.codex_7d_reset_after_seconds = progress.seven_day.reset_after_seconds
+        usage.codex_7d_reset_at = progress.seven_day.reset_at
+        usage.codex_7d_window_minutes = progress.seven_day.window_minutes
+      }
+    } else {
+      const pWin = readNumberValue(usage.codex_primary_window_minutes)
+      const sWin = readNumberValue(usage.codex_secondary_window_minutes)
+      if (usage.codex_primary_used_percent !== undefined && (pWin === null || pWin > 360)) {
+        usage.codex_7d_used_percent = usage.codex_primary_used_percent
+        usage.codex_7d_reset_after_seconds = usage.codex_primary_reset_after_seconds
+        usage.codex_7d_reset_at = usage.codex_primary_reset_at
+        usage.codex_7d_window_minutes = usage.codex_primary_window_minutes
+      } else if (usage.codex_secondary_used_percent !== undefined && sWin !== null && sWin > 360) {
+        usage.codex_7d_used_percent = usage.codex_secondary_used_percent
+        usage.codex_7d_reset_after_seconds = usage.codex_secondary_reset_after_seconds
+        usage.codex_7d_reset_at = usage.codex_secondary_reset_at
+        usage.codex_7d_window_minutes = usage.codex_secondary_window_minutes
+      }
     }
   }
   if (!usage.codex_usage_updated_at && (progress.updated_at || codex.checked_at)) {
@@ -4539,12 +4567,12 @@ export default function Accounts() {
       || usage.codex_secondary_used_percent !== undefined
     )
 
-    const renderWindow = (label: '5h' | '7d', prefix: 'codex_5h' | 'codex_7d', fallbackPrefix: 'codex_primary' | 'codex_secondary') => {
-      const used = readNumberValue(usage?.[`${prefix}_used_percent`]) ?? readNumberValue(usage?.[`${fallbackPrefix}_used_percent`])
+    const renderWindow = (label: string, prefix: 'codex_5h' | 'codex_7d', fallbackPrefix?: 'codex_primary' | 'codex_secondary') => {
+      const used = readNumberValue(usage?.[`${prefix}_used_percent`]) ?? (fallbackPrefix ? readNumberValue(usage?.[`${fallbackPrefix}_used_percent`]) : null)
       const remaining = codexRemainingPercent(used)
       const resetText = formatCodexResetShort(
-        usage?.[`${prefix}_reset_after_seconds`] ?? usage?.[`${fallbackPrefix}_reset_after_seconds`],
-        usage?.[`${prefix}_reset_at`] ?? usage?.[`${fallbackPrefix}_reset_at`],
+        usage?.[`${prefix}_reset_after_seconds`] ?? (fallbackPrefix ? usage?.[`${fallbackPrefix}_reset_after_seconds`] : undefined),
+        usage?.[`${prefix}_reset_at`] ?? (fallbackPrefix ? usage?.[`${fallbackPrefix}_reset_at`] : undefined),
       )
       const percent = remaining === null ? 0 : Math.round(remaining)
       const strokeColor = percent <= 10 ? token.colorError : percent <= 30 ? token.colorWarning : token.colorSuccess
@@ -4569,6 +4597,9 @@ export default function Accounts() {
       )
     }
 
+    const longWinMins = readNumberValue(usage?.codex_7d_window_minutes) ?? readNumberValue(usage?.codex_primary_window_minutes) ?? readNumberValue(usage?.codex_secondary_window_minutes)
+    const longLabel = (longWinMins !== null && longWinMins >= 20000) ? '30d' : '7d'
+
     return (
       <div style={{ minWidth: 0, width: '100%' }}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 6, marginBottom: 3 }}>
@@ -4588,8 +4619,8 @@ export default function Accounts() {
         </div>
         {hasUsage ? (
           <Space direction="vertical" size={2} style={{ width: '100%' }}>
-            {renderWindow('5h', 'codex_5h', 'codex_primary')}
-            {renderWindow('7d', 'codex_7d', 'codex_secondary')}
+            {renderWindow('5h', 'codex_5h')}
+            {renderWindow(longLabel, 'codex_7d')}
             {updated ? (
               <Text type="secondary" style={{ fontSize: 11 }} title={`更新时间: ${updated?.title || ''}`}>
                 更新 {updated?.compact || ''}
