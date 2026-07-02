@@ -199,7 +199,7 @@ type AccountColumnKey =
   | 'subscription_type'
   | 'subscription_active_until'
   | 'account_validity'
-  | 'codex_state'
+  | 'codex_usage'
   | 'sub2api_state'
   | 'sub2api_upload_record'
   | 'oaipay_state'
@@ -215,7 +215,7 @@ const ACCOUNT_COLUMN_OPTIONS: Array<{ value: AccountColumnKey; text: string; cha
   { value: 'subscription_type', text: '订阅类型', chatgptOnly: true },
   { value: 'subscription_active_until', text: '订阅到期', chatgptOnly: true },
   { value: 'account_validity', text: '账号有效性', chatgptOnly: true },
-  { value: 'codex_state', text: 'Codex额度 / 状态', chatgptOnly: true },
+  { value: 'codex_usage', text: 'Codex用量', chatgptOnly: true },
   { value: 'sub2api_state', text: 'Sub2API', chatgptOnly: true },
   { value: 'sub2api_upload_record', text: 'Sub2API上传', chatgptOnly: true },
   { value: 'oaipay_state', text: 'OAIPay', chatgptOnly: true },
@@ -231,7 +231,7 @@ const DEFAULT_VISIBLE_ACCOUNT_COLUMNS: AccountColumnKey[] = [
   'subscription_type',
   'subscription_active_until',
   'account_validity',
-  'codex_state',
+  'codex_usage',
   'sub2api_state',
   'sub2api_upload_record',
   'oaipay_state',
@@ -913,6 +913,23 @@ function parseFlexibleDateValue(value?: string | number) {
   return Number.isNaN(date.getTime()) ? null : date
 }
 
+function formatCompactDateTime(value?: string) {
+  if (!value) return null
+  const date = parseFlexibleDateValue(value)
+  if (!date) {
+    const text = String(value || '').trim()
+    return text ? { compact: text, title: text } : null
+  }
+  const month = String(date.getMonth() + 1).padStart(2, '0')
+  const day = String(date.getDate()).padStart(2, '0')
+  const hour = String(date.getHours()).padStart(2, '0')
+  const minute = String(date.getMinutes()).padStart(2, '0')
+  return {
+    compact: `${month}-${day} ${hour}:${minute}`,
+    title: date.toLocaleString(),
+  }
+}
+
 function formatSyncTime(value?: string | number) {
   if (!value) return ''
   const date = parseFlexibleDateValue(value)
@@ -1139,6 +1156,81 @@ function codexStateMeta(state?: string) {
     default:
       return { color: 'default', label: '未探测' }
   }
+}
+
+function getCodexUsage(record: any) {
+  const codex = record?.chatgptLocal?.codex && typeof record.chatgptLocal.codex === 'object'
+    ? record.chatgptLocal.codex
+    : (record?.codex && typeof record.codex === 'object' ? record.codex : {})
+  const usage = codex.usage && typeof codex.usage === 'object'
+    ? { ...codex.usage }
+    : {}
+  const progress = codex.progress && typeof codex.progress === 'object' ? codex.progress : {}
+  if (usage.codex_5h_used_percent === undefined) {
+    if (progress?.five_hour?.used_percent !== undefined && progress?.five_hour?.used_percent !== null) {
+      usage.codex_5h_used_percent = progress.five_hour.used_percent
+      usage.codex_5h_reset_after_seconds = progress.five_hour.reset_after_seconds
+      usage.codex_5h_reset_at = progress.five_hour.reset_at
+    } else if (usage.codex_primary_used_percent !== undefined) {
+      usage.codex_5h_used_percent = usage.codex_primary_used_percent
+      usage.codex_5h_reset_after_seconds = usage.codex_primary_reset_after_seconds
+      usage.codex_5h_reset_at = usage.codex_primary_reset_at
+    }
+  }
+  if (usage.codex_7d_used_percent === undefined) {
+    if (progress?.seven_day?.used_percent !== undefined && progress?.seven_day?.used_percent !== null) {
+      usage.codex_7d_used_percent = progress.seven_day.used_percent
+      usage.codex_7d_reset_after_seconds = progress.seven_day.reset_after_seconds
+      usage.codex_7d_reset_at = progress.seven_day.reset_at
+    } else if (usage.codex_secondary_used_percent !== undefined) {
+      usage.codex_7d_used_percent = usage.codex_secondary_used_percent
+      usage.codex_7d_reset_after_seconds = usage.codex_secondary_reset_after_seconds
+      usage.codex_7d_reset_at = usage.codex_secondary_reset_at
+    }
+  }
+  if (!usage.codex_usage_updated_at && (progress.updated_at || codex.checked_at)) {
+    usage.codex_usage_updated_at = progress.updated_at || codex.checked_at
+  }
+  return { codex, usage }
+}
+
+function readNumberValue(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isFinite(value)) return value
+  if (typeof value === 'string') {
+    const parsed = Number(value)
+    if (Number.isFinite(parsed)) return parsed
+  }
+  return null
+}
+
+function formatCodexPercent(value: unknown) {
+  const number = readNumberValue(value)
+  if (number === null) return '-'
+  const rounded = Math.round(number * 10) / 10
+  return `${Number.isInteger(rounded) ? rounded.toFixed(0) : rounded.toFixed(1)}%`
+}
+
+function codexRemainingPercent(usedPercent: unknown): number | null {
+  const used = readNumberValue(usedPercent)
+  if (used === null) return null
+  return Math.max(0, Math.min(100, 100 - used))
+}
+
+function formatCodexResetShort(resetAfter: unknown, resetAt: unknown) {
+  let seconds: number | null = null
+  if (resetAt) {
+    const date = parseFlexibleDateValue(resetAt as any)
+    if (date) seconds = Math.max(0, Math.round((date.getTime() - Date.now()) / 1000))
+  }
+  if (seconds === null) seconds = readNumberValue(resetAfter)
+  if (seconds === null) return ''
+  if (seconds <= 0) return '已重置'
+  const days = Math.floor(seconds / 86400)
+  const hours = Math.floor((seconds % 86400) / 3600)
+  const minutes = Math.floor((seconds % 3600) / 60)
+  if (days > 0) return `${days}天${hours}h`
+  if (hours > 0) return `${hours}h${minutes}m`
+  return `${Math.max(1, minutes)}m`
 }
 
 function statusLabel(status?: string) {
@@ -1594,6 +1686,7 @@ export default function Accounts() {
   const [batchGopayOtpDelaySaving, setBatchGopayOtpDelaySaving] = useState(false)
   const [batchGopayNextRoundAt, setBatchGopayNextRoundAt] = useState<number | null>(null)
   const [accessTokenCopiedAccountIds, setAccessTokenCopiedAccountIds] = useState<Set<number>>(() => new Set())
+  const [codexUsageRefreshingIds, setCodexUsageRefreshingIds] = useState<Set<number>>(() => new Set())
   const batchGopayStartingRef = useRef(false)
   const batchGopayCancelRequestedRef = useRef(false)
   const accountsQuery = useAccountsQuery({
@@ -1686,6 +1779,33 @@ export default function Accounts() {
     setActionSurfaceInitialActionMode(mode)
     setActionSurfaceOpen(true)
   }, [])
+
+  const refreshCodexUsage = useCallback(async (record: any) => {
+    const accountId = Number(record?.id || 0)
+    if (!Number.isFinite(accountId) || accountId <= 0) return
+    setCodexUsageRefreshingIds((prev) => new Set(prev).add(accountId))
+    try {
+      const result = await apiFetch(`/chatgpt/${accountId}/codex-usage/refresh`, {
+        method: 'POST',
+        body: JSON.stringify({ force: true }),
+      })
+      const state = String(result?.codex?.state || result?.probe?.state || '').trim()
+      if (state === 'usable' || state === 'quota_exhausted') {
+        message.success(state === 'quota_exhausted' ? 'Codex 用量已刷新：额度耗尽' : 'Codex 用量已刷新')
+      } else {
+        message.warning(result?.codex?.message || result?.probe?.message || 'Codex 用量已刷新，但状态异常')
+      }
+      await accountsQuery.refetch()
+    } catch (e: any) {
+      message.error(e?.message || '刷新 Codex 用量失败')
+    } finally {
+      setCodexUsageRefreshingIds((prev) => {
+        const next = new Set(prev)
+        next.delete(accountId)
+        return next
+      })
+    }
+  }, [accountsQuery.refetch])
 
   const loadConfigCache = useCallback(async (options: { force?: boolean } = {}) => {
     if (!options.force && configCache) return configCache
@@ -4323,70 +4443,81 @@ export default function Accounts() {
     return <Tag color={meta.color} style={compactTagStyle}>{meta.label}</Tag>
   }
 
-  const formatCodexCountdown = (totalSeconds?: number | null) => {
-    if (!totalSeconds || totalSeconds <= 0) return '即将重置'
-    const hours = Math.floor(totalSeconds / 3600)
-    const minutes = Math.floor((totalSeconds % 3600) / 60)
-    if (hours > 24) {
-      const days = (totalSeconds / 86400).toFixed(1)
-      return `${days}天后重置`
+  const renderCodexUsageState = (record: any) => {
+    const accountId = Number(record?.id || 0)
+    const { codex, usage } = getCodexUsage(record)
+    const meta = codexStateMeta(String(codex?.state || record?.codex_state || '').trim())
+    const updated = formatCompactDateTime(String(usage?.codex_usage_updated_at || codex?.checked_at || '').trim())
+    const refreshing = codexUsageRefreshingIds.has(accountId)
+    const hasUsage = usage && (
+      usage.codex_5h_used_percent !== undefined
+      || usage.codex_7d_used_percent !== undefined
+      || usage.codex_primary_used_percent !== undefined
+      || usage.codex_secondary_used_percent !== undefined
+    )
+
+    const renderWindow = (label: '5h' | '7d', prefix: 'codex_5h' | 'codex_7d', fallbackPrefix: 'codex_primary' | 'codex_secondary') => {
+      const used = readNumberValue(usage?.[`${prefix}_used_percent`]) ?? readNumberValue(usage?.[`${fallbackPrefix}_used_percent`])
+      const remaining = codexRemainingPercent(used)
+      const resetText = formatCodexResetShort(
+        usage?.[`${prefix}_reset_after_seconds`] ?? usage?.[`${fallbackPrefix}_reset_after_seconds`],
+        usage?.[`${prefix}_reset_at`] ?? usage?.[`${fallbackPrefix}_reset_at`],
+      )
+      const percent = remaining === null ? 0 : Math.round(remaining)
+      const strokeColor = percent <= 10 ? token.colorError : percent <= 30 ? token.colorWarning : token.colorSuccess
+      return (
+        <div
+          key={label}
+          title={`${label} 已用 ${formatCodexPercent(used)}${resetText ? `，重置 ${resetText}` : ''}`}
+          style={{ display: 'grid', gridTemplateColumns: '28px minmax(64px, 1fr) 44px', gap: 6, alignItems: 'center' }}
+        >
+          <Text type="secondary" style={{ fontSize: 11 }}>{label}</Text>
+          <Progress
+            percent={percent}
+            showInfo={false}
+            size="small"
+            strokeColor={strokeColor}
+            trailColor={token.colorFillSecondary}
+          />
+          <Text style={{ fontSize: 11, textAlign: 'right', color: strokeColor }}>
+            {remaining === null ? '-' : formatCodexPercent(remaining)}
+          </Text>
+        </div>
+      )
     }
-    if (hours > 0) {
-      return `${hours}小时${minutes}分后重置`
-    }
-    return `${Math.max(1, minutes)}分钟后重置`
-  }
-
-  const renderCodexStateAndUsage = (record: any) => {
-    const codexState = String(record?.codex_state || record?.codex?.state || record?.chatgptLocal?.codex?.state || '').trim().toLowerCase()
-    const meta = codexStateMeta(codexState)
-    const progress = record?.codex?.progress || record?.chatgptLocal?.codex?.progress
-    const usage = record?.codex?.usage || record?.chatgptLocal?.codex?.usage || {}
-
-    const used5h = progress?.five_hour?.used_percent ?? usage.codex_5h_used_percent
-    const reset5h = progress?.five_hour?.reset_after_seconds ?? usage.codex_5h_reset_after_seconds
-    const used7d = progress?.seven_day?.used_percent ?? usage.codex_7d_used_percent
-    const reset7d = progress?.seven_day?.reset_after_seconds ?? usage.codex_7d_reset_after_seconds
-
-    const hasUsage = used5h !== undefined || used7d !== undefined
 
     return (
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 6, width: '100%', minWidth: 155 }}>
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-          <Tag color={meta.color} style={compactTagStyle}>{meta.label || '未探测'}</Tag>
+      <div style={{ minWidth: 0, width: '100%' }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 6, marginBottom: 3 }}>
+          <Tag color={meta.color} style={compactTagStyle}>{meta.label}</Tag>
+          <Button
+            type="text"
+            size="small"
+            title="刷新 Codex 用量"
+            icon={<SyncOutlined spin={refreshing} />}
+            loading={refreshing}
+            onClick={(event) => {
+              event.stopPropagation()
+              void refreshCodexUsage(record)
+            }}
+            style={{ paddingInline: 4 }}
+          />
         </div>
         {hasUsage ? (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-            {used5h !== undefined && used5h !== null ? (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
-                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, lineHeight: '14px', color: '#595959' }}>
-                  <span>5h: <b>{Math.round(Number(used5h))}%</b></span>
-                  {reset5h ? <span style={{ color: '#8c8c8c' }}>{formatCodexCountdown(Number(reset5h))}</span> : null}
-                </div>
-                <Progress
-                  percent={Math.round(Number(used5h))}
-                  size="small"
-                  showInfo={false}
-                  strokeColor={Number(used5h) >= 100 ? '#ff4d4f' : Number(used5h) > 80 ? '#faad14' : '#52c41a'}
-                />
-              </div>
+          <Space direction="vertical" size={2} style={{ width: '100%' }}>
+            {renderWindow('5h', 'codex_5h', 'codex_primary')}
+            {renderWindow('7d', 'codex_7d', 'codex_secondary')}
+            {updated ? (
+              <Text type="secondary" style={{ fontSize: 11 }} title={`更新时间: ${updated?.title || ''}`}>
+                更新 {updated?.compact || ''}
+              </Text>
             ) : null}
-            {used7d !== undefined && used7d !== null ? (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
-                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, lineHeight: '14px', color: '#595959' }}>
-                  <span>7d: <b>{Math.round(Number(used7d))}%</b></span>
-                  {reset7d ? <span style={{ color: '#8c8c8c' }}>{formatCodexCountdown(Number(reset7d))}</span> : null}
-                </div>
-                <Progress
-                  percent={Math.round(Number(used7d))}
-                  size="small"
-                  showInfo={false}
-                  strokeColor={Number(used7d) >= 100 ? '#ff4d4f' : Number(used7d) > 80 ? '#faad14' : '#52c41a'}
-                />
-              </div>
-            ) : null}
-          </div>
-        ) : null}
+          </Space>
+        ) : (
+          <Text type="secondary" style={{ fontSize: 11 }}>
+            无用量缓存
+          </Text>
+        )}
       </div>
     )
   }
@@ -4951,6 +5082,11 @@ export default function Accounts() {
         hasPasswordForMobile ? 'success' : 'default',
         hasPasswordForMobile ? <Button title="复制密码" type="text" size="small" icon={<CopyOutlined />} onClick={() => copyText(record.password)} /> : null,
       ) : null,
+      isChatgptPlatform && isColumnVisible('codex_usage') ? (
+        <span key="codex_usage" style={{ minWidth: 180 }}>
+          {renderCodexUsageState(record)}
+        </span>
+      ) : null,
       isChatgptPlatform && isColumnVisible('sub2api_state') ? renderSub2ApiState(record) : null,
       isChatgptPlatform && isColumnVisible('sub2api_upload_record') ? renderSub2ApiUploadRecord(record) : null,
       isChatgptPlatform && isColumnVisible('oaipay_state') ? renderOaipayState(record) : null,
@@ -5325,15 +5461,10 @@ export default function Accounts() {
         render: (_: any, record: any) => renderAccountValidityState(record),
       },
       {
-        title: renderColumnFilterTitle(
-          'Codex额度 / 状态',
-          columnFilters.codexState,
-          CODEX_STATE_FILTER_OPTIONS,
-          (next) => setColumnFilters((prev) => ({ ...prev, codexState: next })),
-        ),
-        key: 'codex_state',
-        width: 175,
-        render: (_: any, record: any) => renderCodexStateAndUsage(record),
+        title: 'Codex用量',
+        key: 'codex_usage',
+        width: 206,
+        render: (_: any, record: any) => renderCodexUsageState(record),
       },
       {
         title: renderColumnFilterTitle(
