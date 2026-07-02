@@ -285,6 +285,11 @@ def classify_chatgpt_capabilities(
         auth_level = "unknown"
 
     subscription_plan = _lower_text(subscription.get("plan")) or "unknown"
+    if subscription_plan == "unknown":
+        old_caps = extra.get("chatgpt_capabilities") if isinstance(extra.get("chatgpt_capabilities"), dict) else {}
+        old_plan = _lower_text(old_caps.get("subscription_plan"))
+        if old_plan and old_plan != "unknown":
+            subscription_plan = old_plan
     subscription_checked = (
         auth_state in {"refresh_token_valid", "access_token_valid"}
         and isinstance(subscription, dict)
