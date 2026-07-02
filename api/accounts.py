@@ -663,6 +663,9 @@ def _serialize_account_compact_item(
         "id": account.id,
         "platform": account.platform,
         "email": account.email,
+        "token": account.token,
+        "access_token": account.token,
+        "refresh_token": _safe_str(extra.get("refresh_token")),
         "status": account.status,
         "created_at": _iso_datetime(account.created_at),
         "updated_at": _iso_datetime(account.updated_at),
@@ -752,6 +755,8 @@ def _serialize_account_compact_item(
         "cliproxySync": cliproxy_sync,
         "extra": {
             "manually_used": bool(extra.get("manually_used")),
+            "refresh_token": _safe_str(extra.get("refresh_token")),
+            "access_token": _safe_str(extra.get("access_token") or account.token),
             "chatgpt_workspace_label": _safe_str(extra.get("chatgpt_workspace_label")),
             "chatgpt_workspace_scope": _safe_str(extra.get("chatgpt_workspace_scope")),
             "chatgpt_workspace_display_name": _safe_str(extra.get("chatgpt_workspace_display_name")),
