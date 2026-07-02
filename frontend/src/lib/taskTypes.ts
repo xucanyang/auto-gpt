@@ -12,7 +12,7 @@ export const TASK_SOURCE_LABELS: Record<string, string> = {
   phone_signup: '手机号注册',
   batch_sub2api_upload: 'Sub2API上传',
   batch_oaipay_upload: 'OAIPay上传',
-  baxigpt_cdk_submit: 'pix卡密提交',
+  baxigpt_cdk_submit: 'idea批量提交',
   chatgpt_paypal_bind: 'PayPal绑定',
   chatgpt_oaipay_approval: 'OaiPay授权链接',
   batch_payment_link: '批量支付链接',

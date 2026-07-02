@@ -5650,7 +5650,7 @@ def _run_baxigpt_cdk_submit(task_id: str, pairs: list[dict[str, Any]], settings:
     def wait_before_next(index: int, attempt_id: int | None = None) -> None:
         if index >= len(pairs) or submit_interval_seconds <= 0:
             return
-        _log(task_id, f"[Pix] 等待提交间隔 {submit_interval_seconds}s 后继续下一个账号")
+        _log(task_id, f"[Idea] 等待提交间隔 {submit_interval_seconds}s 后继续下一个账号")
         remaining = float(submit_interval_seconds)
         while remaining > 0:
             control.checkpoint(attempt_id=attempt_id)
@@ -5668,7 +5668,7 @@ def _run_baxigpt_cdk_submit(task_id: str, pairs: list[dict[str, Any]], settings:
         sync_meta()
 
     def log_debug(message: str) -> None:
-        _log(task_id, f"[DEBUG][Pix] {message}")
+        _log(task_id, f"[DEBUG][Idea] {message}")
 
     def response_brief(response: dict[str, Any] | None, *, keys: tuple[str, ...] = ()) -> dict[str, Any]:
         data = response if isinstance(response, dict) else {}

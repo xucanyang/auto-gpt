@@ -34,7 +34,7 @@ export const APP_ROUTES: AppRouteItem[] = [
   { path: '/history', key: '/history', label: '任务历史', loader: TaskHistoryPage },
   { path: '/proxies', key: '/proxies', label: '代理管理', loader: ProxiesPage },
   { path: '/phone-pool', key: '/phone-pool', label: '手机号池', loader: PhonePoolPage },
-  { path: '/baxigpt-cdk-pool', key: '/baxigpt-cdk-pool', label: 'pix卡密提交', loader: BaxiGptCdkPoolPage },
+  { path: '/baxigpt-cdk-pool', key: '/baxigpt-cdk-pool', label: 'idea批量提交', loader: BaxiGptCdkPoolPage },
   { path: '/delivery-cards', key: '/delivery-cards', label: '交付卡密', loader: DeliveryCardsPage },
   { path: '/settings', key: '/settings', label: '全局配置', loader: SettingsPage },
 ]

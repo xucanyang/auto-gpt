@@ -1037,7 +1037,7 @@ export default function BaxiGptCdkPool() {
         const pollLastStatus = String(pollTarget?.last_status || pollTarget?.status || '').trim()
         const pollError = String(pollTarget?.last_error || pollTarget?.error || pollTarget?.message || '').trim()
         const timeoutText = formatRemainingSeconds(Number(pollTarget?.deadline_at || 0))
-        const watchTitle = pollerTargetTooltip(pollTarget) || (isBackendPolling ? '后台轮询目标存在，等待下一次 snapshot 返回明细' : '页面只读取本地快照，不请求 Pix 上游')
+        const watchTitle = pollerTargetTooltip(pollTarget) || (isBackendPolling ? '后台轮询目标存在，等待下一次 snapshot 返回明细' : '页面只读取本地快照，不请求 Idea 上游')
         if (!firstDisplay && orders.length === 0 && !isWatching) return <Typography.Text type="secondary">-</Typography.Text>
         return (
           <Space direction="vertical" size={2}>
@@ -1127,7 +1127,7 @@ export default function BaxiGptCdkPool() {
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
         <div>
-          <h1 style={{ fontSize: 24, fontWeight: 'bold', margin: 0 }}>pix卡密提交</h1>
+          <h1 style={{ fontSize: 24, fontWeight: 'bold', margin: 0 }}>idea批量提交</h1>
           <p style={{ color: token.colorTextSecondary, marginTop: 4, marginBottom: 0 }}>
             卡密库存、账号绑定和订单状态查询。ChatGPT 页面提交任务会自动从这里取可用卡密。
           </p>
@@ -1268,7 +1268,7 @@ export default function BaxiGptCdkPool() {
         title={
           <Space direction="vertical" size={2}>
             <Space wrap>
-              <span>Pix 状态诊断</span>
+              <span>Idea 状态诊断</span>
               {diagnosticItem ? statusTag(String(diagnosticItem.status || '')) : null}
             </Space>
             <Typography.Text type="secondary" style={{ fontSize: 12 }}>

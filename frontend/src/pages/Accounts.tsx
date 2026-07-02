@@ -2874,7 +2874,7 @@ export default function Accounts() {
     if (scope === 'selected') {
       const accountIds = getResumeAuthSelectedIds()
       if (accountIds.length === 0) {
-        message.warning('请先选择用于 pix卡密提交的账号，或切换为当前筛选范围')
+        message.warning('请先选择用于 idea批量提交的账号，或切换为当前筛选范围')
         return
       }
       requestedAccounts = accountIds.length
@@ -2886,7 +2886,7 @@ export default function Accounts() {
 
     const toastKey = `baxigpt-cdk-submit:${scope}`
     setBaxiCdkSubmitLoading(true)
-    message.loading({ content: 'pix卡密提交任务创建中...', key: toastKey, duration: 0 })
+    message.loading({ content: 'idea批量提交任务创建中...', key: toastKey, duration: 0 })
     try {
       const res = await apiFetch('/tasks/chatgpt/baxigpt-cdk-submit', {
         method: 'POST',
@@ -2906,7 +2906,7 @@ export default function Accounts() {
           key: toastKey,
         })
         if (res && typeof res === 'object') {
-          showBatchActionResult('pix卡密提交结果', res)
+          showBatchActionResult('idea批量提交结果', res)
         }
         await loadBaxiCdkPoolSummary()
         return
@@ -2915,7 +2915,7 @@ export default function Accounts() {
       const snapshot = await apiFetch(`/tasks/${taskIdFromResponse}`)
       setBaxiCdkSubmitOpen(false)
       setTaskModalMode('baxigpt_cdk')
-      setTaskModalAccount({ email: `pix卡密提交：${pairCount} 对 / 库存余 ${spareCodes}` })
+      setTaskModalAccount({ email: `idea批量提交：${pairCount} 对 / 库存余 ${spareCodes}` })
       setTaskId(taskIdFromResponse)
       setTaskSnapshot(snapshot)
       setRegisterModalOpen(true)
@@ -2923,14 +2923,14 @@ export default function Accounts() {
       void activeTasksQuery.refetch()
       void loadBaxiCdkPoolSummary()
       message.success({
-        content: `pix卡密提交已启动：${pairCount} 对，候选账号 ${eligible} 个，可用卡密 ${availableCodes} 个${spareCodes > 0 ? `，剩余入库 ${spareCodes} 个` : ''}${importErrors.length > 0 ? `，解析跳过 ${importErrors.length} 行` : ''}`,
+        content: `idea批量提交已启动：${pairCount} 对，候选账号 ${eligible} 个，可用卡密 ${availableCodes} 个${spareCodes > 0 ? `，剩余入库 ${spareCodes} 个` : ''}${importErrors.length > 0 ? `，解析跳过 ${importErrors.length} 行` : ''}`,
         key: toastKey,
       })
       if (importErrors.length > 0) {
         showBatchActionResult('卡密解析结果', { items: importErrors, total: importErrors.length })
       }
     } catch (e: any) {
-      message.error({ content: `pix卡密提交失败: ${e.message}`, key: toastKey })
+      message.error({ content: `idea批量提交失败: ${e.message}`, key: toastKey })
     } finally {
       setBaxiCdkSubmitLoading(false)
     }
@@ -6393,7 +6393,7 @@ export default function Accounts() {
       </Modal>
 
       <Modal
-        title="pix卡密提交"
+        title="idea批量提交"
         open={baxiCdkSubmitOpen}
         onCancel={() => setBaxiCdkSubmitOpen(false)}
         onOk={submitBaxiCdkSubmit}

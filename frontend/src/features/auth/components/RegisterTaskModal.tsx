@@ -169,7 +169,7 @@ export function RegisterTaskModal({
     }
     if (taskModalMode === 'baxigpt_cdk') {
       const count = Number(taskSnapshot?.meta?.pair_count || 0)
-      return count > 0 ? `pix卡密提交 (${count} 个)` : 'pix卡密提交'
+      return count > 0 ? `idea批量提交 (${count} 个)` : 'idea批量提交'
     }
     if (taskModalMode === 'paypal_bind') {
       const count = Number(taskSnapshot?.meta?.eligible_accounts || taskSnapshot?.meta?.eligible || 0)

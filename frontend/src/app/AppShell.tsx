@@ -119,7 +119,7 @@ function AppContent({ hasPassword }: { hasPassword: boolean }) {
     { key: '/history', icon: <HistoryOutlined />, label: '任务历史' },
     { key: '/proxies', icon: <GlobalOutlined />, label: '代理管理' },
     { key: '/phone-pool', icon: <MobileOutlined />, label: '手机号池' },
-    { key: '/baxigpt-cdk-pool', icon: <DatabaseOutlined />, label: 'pix卡密提交' },
+    { key: '/baxigpt-cdk-pool', icon: <DatabaseOutlined />, label: 'idea批量提交' },
     { key: '/delivery-cards', icon: <KeyOutlined />, label: '交付卡密' },
     { key: '/settings', icon: <SettingOutlined />, label: '全局配置' },
   ]

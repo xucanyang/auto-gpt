@@ -133,9 +133,9 @@ def _refresh_bound_account_after_paid(record: Any, target: BaxiGptStatusPollTarg
                 .where(AccountModel.email == email)
             ).first()
         if account is None or account.platform != "chatgpt":
-            _safe_log(target, f"[Pix][WARN] paid 后本地状态刷新跳过: 未找到绑定账号 account_id={account_id or '-'} email={email or '-'}")
+            _safe_log(target, f"[Idea][WARN] paid 后本地状态刷新跳过: 未找到绑定账号 account_id={account_id or '-'} email={email or '-'}")
             return None
-        _safe_log(target, f"[Pix] paid 已确认，开始刷新本地账号状态: {account.email or account.id}")
+        _safe_log(target, f"[Idea] paid 已确认，开始刷新本地账号状态: {account.email or account.id}")
         refresh_result = sync_chatgpt_account_local_status(session, account)
         summary = summarize_status_refresh(refresh_result, trigger="pix_cdk_paid")
 
@@ -155,7 +155,7 @@ def _refresh_bound_account_after_paid(record: Any, target: BaxiGptStatusPollTarg
 
         _safe_log(
             target,
-            "[Pix] 本地状态刷新完成: "
+            "[Idea] 本地状态刷新完成: "
             f"{account.email or account.id} "
             f"status={summary.get('status') or '-'} "
             f"plan={summary.get('subscription_plan') or '-'} "
@@ -328,7 +328,7 @@ def _loop() -> None:
                 done = _poll_once(repo, client, target)
             except Exception as exc:
                 target.last_error = str(exc)
-                _safe_log(target, f"[Pix] 状态轮询异常: record_id={target.record_id} - {exc}")
+                _safe_log(target, f"[Idea] 状态轮询异常: record_id={target.record_id} - {exc}")
                 done = time.time() >= target.deadline_at
             if done:
                 _remove_target(target.record_id)
@@ -340,22 +340,22 @@ def _poll_once(repo: BaxiGptCdkRepository, client: BaxiGptClient, target: BaxiGp
     record = repo.get_by_id(target.record_id)
     if record is None:
         target.last_error = "卡密记录不存在"
-        _safe_log(target, f"[Pix] 状态轮询停止: 卡密记录不存在 record_id={target.record_id}")
+        _safe_log(target, f"[Idea] 状态轮询停止: 卡密记录不存在 record_id={target.record_id}")
         return True
     if not record.order_id:
         target.last_error = "没有 order_id"
-        _safe_log(target, f"[Pix] 状态轮询停止: {record.code_masked} 没有 order_id")
+        _safe_log(target, f"[Idea] 状态轮询停止: {record.code_masked} 没有 order_id")
         return True
     if str(record.status or "").strip().lower() not in POLLABLE_STATUSES:
         if record.status in REPOSITORY_TERMINAL_STATUSES:
             repo.persist_bound_account_extra(record)
         target.last_error = f"状态不可轮询: {record.status}"
-        _safe_log(target, f"[Pix] 状态轮询停止: {record.code_masked} status={record.status} 不在 submitted/processing")
+        _safe_log(target, f"[Idea] 状态轮询停止: {record.code_masked} status={record.status} 不在 submitted/processing")
         return True
     if time.time() > target.deadline_at:
         repo.persist_bound_account_extra(record)
         target.last_error = "状态轮询超时"
-        _safe_log(target, f"[Pix] 状态轮询超时: {record.bound_account_email or record.bound_account_id or '-'} {record.display_id or record.order_id} last_status={record.upstream_status or record.status}")
+        _safe_log(target, f"[Idea] 状态轮询超时: {record.bound_account_email or record.bound_account_id or '-'} {record.display_id or record.order_id} last_status={record.upstream_status or record.status}")
         return True
 
     try:
@@ -372,18 +372,18 @@ def _poll_once(repo: BaxiGptCdkRepository, client: BaxiGptClient, target: BaxiGp
     display_id = updated.display_id or updated.order_id
     email = updated.bound_account_email or updated.remote_email or str(updated.bound_account_id or "-")
     if status != target.last_status:
-        _safe_log(target, f"[Pix] 状态轮询: {email} {display_id} status={status or '-'}")
+        _safe_log(target, f"[Idea] 状态轮询: {email} {display_id} status={status or '-'}")
         target.last_status = status
     target.last_error = ""
     if updated.status in TERMINAL_STATUSES:
         if updated.status == STATUS_PAID:
-            _safe_log(target, f"[OK] Pix 开通成功: {email} {display_id} status=paid")
+            _safe_log(target, f"[OK] Idea 提交成功: {email} {display_id} status=paid")
             try:
                 _refresh_bound_account_after_paid(updated, target)
             except Exception as exc:
                 target.last_error = str(exc)
-                _safe_log(target, f"[Pix][WARN] paid 后本地状态刷新失败: {email} {display_id} - {exc}")
+                _safe_log(target, f"[Idea][WARN] paid 后本地状态刷新失败: {email} {display_id} - {exc}")
         elif updated.status == STATUS_FAILED:
-            _safe_log(target, f"[FAIL] Pix 开通失败: {email} {display_id} status={status or updated.status} {updated.last_error_message or ''}".rstrip())
+            _safe_log(target, f"[FAIL] Idea 提交失败: {email} {display_id} status={status or updated.status} {updated.last_error_message or ''}".rstrip())
         return True
     return False

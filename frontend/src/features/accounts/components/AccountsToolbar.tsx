@@ -230,7 +230,7 @@ export function AccountsToolbar({
                 loading={baxiCdkSubmitLoading}
                 onClick={onOpenBaxiCdkSubmit}
               >
-                pix卡密提交
+                idea批量提交
               </Button>
               <Dropdown
                 disabled={paymentLinkDisabled || batchPaymentLinkLoading}
