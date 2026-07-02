@@ -20,12 +20,14 @@ const ProxiesPage = lazy(() => import('@/pages/Proxies'))
 const PhonePoolPage = lazy(() => import('@/pages/PhonePool'))
 const BaxiGptCdkPoolPage = lazy(() => import('@/pages/BaxiGptCdkPool'))
 const DeliveryCardsPage = lazy(() => import('@/pages/DeliveryCards'))
+const CodexUsagePage = lazy(() => import('@/pages/CodexUsagePage'))
 const SettingsPage = lazy(() => import('@/pages/Settings'))
 
 export const APP_ROUTES: AppRouteItem[] = [
   { path: '/', key: '/', label: '仪表盘', loader: DashboardPage },
   { path: '/chatgpt', key: '/chatgpt', label: 'ChatGPT', loader: AccountsPage },
   { path: '/accounts', key: '/chatgpt', loader: AccountsPage },
+  { path: '/codex-usage', key: '/codex-usage', label: 'Codex额度监控', loader: CodexUsagePage },
   { path: '/register', key: '/register', loader: RegisterTaskPage },
   { path: '/custom-email-recheck', key: '/custom-email-recheck', label: '邮箱登录测活', loader: CustomEmailRecheckPage },
   { path: '/teams', key: '/teams', label: 'Team', loader: TeamsPage },

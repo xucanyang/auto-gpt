@@ -17,6 +17,7 @@ import {
   DatabaseOutlined,
   KeyOutlined,
   MenuOutlined,
+  LineChartOutlined,
 } from '@ant-design/icons'
 import zhCN from 'antd/locale/zh_CN'
 import { APP_ROUTES } from './router'
@@ -96,6 +97,7 @@ function AppContent({ hasPassword }: { hasPassword: boolean }) {
     const path = location.pathname
     if (path === '/') return ['/']
     if (path.startsWith('/chatgpt') || path.startsWith('/accounts')) return ['/chatgpt']
+    if (path === '/codex-usage') return ['/codex-usage']
     if (path === '/custom-email-recheck') return ['/custom-email-recheck']
     if (path.startsWith('/teams')) return ['/teams']
     if (path === '/pipeline') return ['/pipeline']
@@ -112,6 +114,7 @@ function AppContent({ hasPassword }: { hasPassword: boolean }) {
   const menuItems = [
     { key: '/', icon: <DashboardOutlined />, label: '仪表盘' },
     { key: '/chatgpt', icon: <UserOutlined />, label: 'ChatGPT' },
+    { key: '/codex-usage', icon: <LineChartOutlined />, label: 'Codex额度监控' },
     { key: '/custom-email-recheck', icon: <ExperimentOutlined />, label: '邮箱登录测活' },
     { key: '/teams', icon: <TeamOutlined />, label: 'Team' },
     { key: '/gopay-otp', icon: <MobileOutlined />, label: 'GoPay OTP' },

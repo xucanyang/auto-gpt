@@ -198,6 +198,7 @@ type AccountColumnKey =
   | 'subscription_type'
   | 'subscription_active_until'
   | 'account_validity'
+  | 'codex_state'
   | 'sub2api_state'
   | 'sub2api_upload_record'
   | 'oaipay_state'
@@ -213,6 +214,7 @@ const ACCOUNT_COLUMN_OPTIONS: Array<{ value: AccountColumnKey; text: string; cha
   { value: 'subscription_type', text: '订阅类型', chatgptOnly: true },
   { value: 'subscription_active_until', text: '订阅到期', chatgptOnly: true },
   { value: 'account_validity', text: '账号有效性', chatgptOnly: true },
+  { value: 'codex_state', text: 'Codex状态', chatgptOnly: true },
   { value: 'sub2api_state', text: 'Sub2API', chatgptOnly: true },
   { value: 'sub2api_upload_record', text: 'Sub2API上传', chatgptOnly: true },
   { value: 'oaipay_state', text: 'OAIPay', chatgptOnly: true },
@@ -228,6 +230,7 @@ const DEFAULT_VISIBLE_ACCOUNT_COLUMNS: AccountColumnKey[] = [
   'subscription_type',
   'subscription_active_until',
   'account_validity',
+  'codex_state',
   'sub2api_state',
   'sub2api_upload_record',
   'oaipay_state',
@@ -244,6 +247,7 @@ type AccountColumnFilters = {
   authType: string[]
   subscriptionType: string[]
   accountValidity: string[]
+  codexState: string[]
   sub2apiState: string[]
   oaipayState: string[]
 }
@@ -255,6 +259,7 @@ const EMPTY_ACCOUNT_FILTERS: AccountColumnFilters = {
   authType: [],
   subscriptionType: [],
   accountValidity: [],
+  codexState: [],
   sub2apiState: [],
   oaipayState: [],
 }
@@ -293,6 +298,16 @@ const SUBSCRIPTION_TYPE_FILTER_OPTIONS = [
 const ACCOUNT_VALIDITY_FILTER_OPTIONS = [
   { value: 'valid', text: '有效' },
   { value: 'invalid', text: '失效' },
+]
+
+const CODEX_STATE_FILTER_OPTIONS = [
+  { value: 'usable', text: '可用' },
+  { value: 'quota_exhausted', text: '额度耗尽' },
+  { value: 'account_deactivated', text: '已失效' },
+  { value: 'refresh_token_invalidated', text: 'RT失效' },
+  { value: 'access_token_invalidated', text: 'AT失效' },
+  { value: 'unauthorized', text: '未授权' },
+  { value: 'payment_required', text: '需付费/权限' },
 ]
 
 const SUB2API_FILTER_OPTIONS = [
@@ -4394,6 +4409,14 @@ export default function Accounts() {
           <Select
             allowClear
             size="small"
+            placeholder="Codex状态"
+            value={columnFilters.codexState[0]}
+            options={toSelectOptions(CODEX_STATE_FILTER_OPTIONS)}
+            onChange={(value) => setColumnFilters((prev) => ({ ...prev, codexState: value ? [value] : [] }))}
+          />
+          <Select
+            allowClear
+            size="small"
             placeholder="Sub2API"
             value={columnFilters.sub2apiState[0]}
             options={toSelectOptions(SUB2API_FILTER_OPTIONS)}
@@ -5231,6 +5254,21 @@ export default function Accounts() {
         key: 'account_validity',
         width: 116,
         render: (_: any, record: any) => renderAccountValidityState(record),
+      },
+      {
+        title: renderColumnFilterTitle(
+          'Codex状态',
+          columnFilters.codexState,
+          CODEX_STATE_FILTER_OPTIONS,
+          (next) => setColumnFilters((prev) => ({ ...prev, codexState: next })),
+        ),
+        key: 'codex_state',
+        width: 110,
+        render: (_: any, record: any) => {
+          const codexState = String(record?.codex_state || record?.chatgptLocal?.codex?.state || '').trim().toLowerCase()
+          const meta = codexStateMeta(codexState)
+          return <Tag color={meta.color}>{meta.label}</Tag>
+        },
       },
       {
         title: renderColumnFilterTitle(
