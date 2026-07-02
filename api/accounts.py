@@ -24,6 +24,7 @@ from services.account_rate_limit_recovery import (
 )
 from services.chatgpt_account_state import classify_chatgpt_capabilities
 from services.chatgpt_core.bound_phone import chatgpt_bound_phone_payload, chatgpt_phone_challenge_payload
+from services.chatgpt_core.codex_usage import build_codex_usage_progress_from_extra
 from services.chatgpt_core.local_status_refresh import schedule_chatgpt_local_status_refresh_for_account_id
 from services.team_lite import team_lite_service
 from typing import Any, Optional
@@ -546,6 +547,7 @@ def _build_codex_summary(codex: dict[str, Any], capabilities: dict[str, Any]) ->
                 "codex_primary_over_secondary_percent",
             ),
         ),
+        "progress": build_codex_usage_progress_from_extra(usage),
     }
 
 

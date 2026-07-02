@@ -20,6 +20,7 @@ import {
   Segmented,
   Steps,
   Switch,
+  Progress,
 } from 'antd'
 import type { CheckboxOptionType } from 'antd/es/checkbox/Group'
 import type { MenuProps } from 'antd'
@@ -214,7 +215,7 @@ const ACCOUNT_COLUMN_OPTIONS: Array<{ value: AccountColumnKey; text: string; cha
   { value: 'subscription_type', text: '订阅类型', chatgptOnly: true },
   { value: 'subscription_active_until', text: '订阅到期', chatgptOnly: true },
   { value: 'account_validity', text: '账号有效性', chatgptOnly: true },
-  { value: 'codex_state', text: 'Codex状态', chatgptOnly: true },
+  { value: 'codex_state', text: 'Codex额度 / 状态', chatgptOnly: true },
   { value: 'sub2api_state', text: 'Sub2API', chatgptOnly: true },
   { value: 'sub2api_upload_record', text: 'Sub2API上传', chatgptOnly: true },
   { value: 'oaipay_state', text: 'OAIPay', chatgptOnly: true },
@@ -4322,6 +4323,74 @@ export default function Accounts() {
     return <Tag color={meta.color} style={compactTagStyle}>{meta.label}</Tag>
   }
 
+  const formatCodexCountdown = (totalSeconds?: number | null) => {
+    if (!totalSeconds || totalSeconds <= 0) return '即将重置'
+    const hours = Math.floor(totalSeconds / 3600)
+    const minutes = Math.floor((totalSeconds % 3600) / 60)
+    if (hours > 24) {
+      const days = (totalSeconds / 86400).toFixed(1)
+      return `${days}天后重置`
+    }
+    if (hours > 0) {
+      return `${hours}小时${minutes}分后重置`
+    }
+    return `${Math.max(1, minutes)}分钟后重置`
+  }
+
+  const renderCodexStateAndUsage = (record: any) => {
+    const codexState = String(record?.codex_state || record?.codex?.state || record?.chatgptLocal?.codex?.state || '').trim().toLowerCase()
+    const meta = codexStateMeta(codexState)
+    const progress = record?.codex?.progress || record?.chatgptLocal?.codex?.progress
+    const usage = record?.codex?.usage || record?.chatgptLocal?.codex?.usage || {}
+
+    const used5h = progress?.five_hour?.used_percent ?? usage.codex_5h_used_percent
+    const reset5h = progress?.five_hour?.reset_after_seconds ?? usage.codex_5h_reset_after_seconds
+    const used7d = progress?.seven_day?.used_percent ?? usage.codex_7d_used_percent
+    const reset7d = progress?.seven_day?.reset_after_seconds ?? usage.codex_7d_reset_after_seconds
+
+    const hasUsage = used5h !== undefined || used7d !== undefined
+
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 6, width: '100%', minWidth: 155 }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+          <Tag color={meta.color} style={compactTagStyle}>{meta.label || '未探测'}</Tag>
+        </div>
+        {hasUsage ? (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            {used5h !== undefined && used5h !== null ? (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, lineHeight: '14px', color: '#595959' }}>
+                  <span>5h: <b>{Math.round(Number(used5h))}%</b></span>
+                  {reset5h ? <span style={{ color: '#8c8c8c' }}>{formatCodexCountdown(Number(reset5h))}</span> : null}
+                </div>
+                <Progress
+                  percent={Math.round(Number(used5h))}
+                  size="small"
+                  showInfo={false}
+                  strokeColor={Number(used5h) >= 100 ? '#ff4d4f' : Number(used5h) > 80 ? '#faad14' : '#52c41a'}
+                />
+              </div>
+            ) : null}
+            {used7d !== undefined && used7d !== null ? (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, lineHeight: '14px', color: '#595959' }}>
+                  <span>7d: <b>{Math.round(Number(used7d))}%</b></span>
+                  {reset7d ? <span style={{ color: '#8c8c8c' }}>{formatCodexCountdown(Number(reset7d))}</span> : null}
+                </div>
+                <Progress
+                  percent={Math.round(Number(used7d))}
+                  size="small"
+                  showInfo={false}
+                  strokeColor={Number(used7d) >= 100 ? '#ff4d4f' : Number(used7d) > 80 ? '#faad14' : '#52c41a'}
+                />
+              </div>
+            ) : null}
+          </div>
+        ) : null}
+      </div>
+    )
+  }
+
   const applySubscriptionExpirySortOrder = useCallback((next: SubscriptionExpirySortOrder) => {
     setSubscriptionExpirySortOrder(next)
     setCurrentPage(1)
@@ -5257,18 +5326,14 @@ export default function Accounts() {
       },
       {
         title: renderColumnFilterTitle(
-          'Codex状态',
+          'Codex额度 / 状态',
           columnFilters.codexState,
           CODEX_STATE_FILTER_OPTIONS,
           (next) => setColumnFilters((prev) => ({ ...prev, codexState: next })),
         ),
         key: 'codex_state',
-        width: 110,
-        render: (_: any, record: any) => {
-          const codexState = String(record?.codex_state || record?.chatgptLocal?.codex?.state || '').trim().toLowerCase()
-          const meta = codexStateMeta(codexState)
-          return <Tag color={meta.color}>{meta.label}</Tag>
-        },
+        width: 175,
+        render: (_: any, record: any) => renderCodexStateAndUsage(record),
       },
       {
         title: renderColumnFilterTitle(
