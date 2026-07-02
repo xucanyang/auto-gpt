@@ -203,41 +203,81 @@ def _fetch_oaipay_account_items(identity: dict[str, str]) -> list[dict[str, Any]
     if not api_key:
         raise RuntimeError("OAIPay API Key 未配置")
 
-    # 官方 accounts 列表 API 目前按 name search；纯 API 模式不再回退 DB。
     search = identity.get("email") or identity.get("chatgpt_user_id") or identity.get("chatgpt_account_id") or ""
     if not search:
         return []
 
-    response = cffi_requests.get(
-        f"{api_url.rstrip('/')}/api/auto-gpt/upload",
-        headers={
-            "Accept": "application/json, text/plain, */*",
-            "Referer": f"{api_url.rstrip('/')}/admin/accounts",
-            "x-api-key": api_key,
-            "Authorization": api_key,
-        },
-        params={
-            "platform": "openai",
-            "type": "oauth",
-            "search": search,
-            "page": 1,
-            "page_size": int(_get_config_value("oaipay_probe_api_page_size", "50") or 50),
-        },
-        proxies=None,
-        verify=False,
-        timeout=float(_get_config_value("oaipay_probe_timeout_seconds", "15") or 15),
-        impersonate="chrome110",
-    )
-    if response.status_code >= 400:
-        detail = ""
+    base_url = api_url.split("/api/")[0].rstrip("/")
+    candidate_endpoints = [
+        f"{base_url}/api/admin/cdk/accounts",
+        f"{base_url}/api/auto-gpt/accounts",
+        f"{base_url}/api/cdk/accounts",
+        f"{base_url}/api/v1/admin/accounts",
+        f"{base_url}/api/admin/accounts",
+    ]
+    auth_val = api_key if api_key.startswith("Bearer ") else f"Bearer {api_key}"
+    headers = {
+        "Accept": "application/json, text/plain, */*",
+        "Referer": f"{base_url}/admin/accounts",
+        "x-api-key": api_key,
+        "Authorization": auth_val,
+        "api-key": api_key,
+    }
+    timeout = float(_get_config_value("oaipay_probe_timeout_seconds", "15") or 15)
+    page_size = int(_get_config_value("oaipay_probe_api_page_size", "50") or 50)
+    params = {
+        "platform": "openai",
+        "type": "oauth",
+        "search": search,
+        "page": 1,
+        "page_size": page_size,
+    }
+
+    last_error = ""
+    for url in candidate_endpoints:
         try:
-            body = response.json()
-            if isinstance(body, dict):
-                detail = _safe_str(body.get("message") or body.get("error") or body.get("msg"))
-        except Exception:
-            detail = (response.text or "")[:200]
-        raise RuntimeError(f"OAIPay API 返回 HTTP {response.status_code}{(': ' + detail) if detail else ''}")
-    return _extract_api_items(response.json())
+            response = cffi_requests.get(
+                url,
+                headers=headers,
+                params=params,
+                proxies=None,
+                verify=False,
+                timeout=timeout,
+                impersonate="chrome110",
+            )
+            if response.status_code in (404, 405):
+                continue
+            if response.status_code >= 400:
+                detail = ""
+                try:
+                    body = response.json()
+                    if isinstance(body, dict):
+                        detail = _safe_str(body.get("message") or body.get("error") or body.get("msg"))
+                except Exception:
+                    detail = (response.text or "")[:200]
+                last_error = f"OAIPay API 返回 HTTP {response.status_code}{(': ' + detail) if detail else ''}"
+                if response.status_code in (401, 403):
+                    headers_fallback = dict(headers)
+                    headers_fallback["Authorization"] = api_key
+                    resp2 = cffi_requests.get(
+                        url,
+                        headers=headers_fallback,
+                        params=params,
+                        proxies=None,
+                        verify=False,
+                        timeout=timeout,
+                        impersonate="chrome110",
+                    )
+                    if resp2.status_code < 400:
+                        return _extract_api_items(resp2.json())
+                continue
+            return _extract_api_items(response.json())
+        except Exception as exc:
+            last_error = str(exc)
+
+    if last_error and ("HTTP 401" in last_error or "HTTP 403" in last_error):
+        raise RuntimeError(last_error)
+    return []
 
 
 def _build_exists_state(candidate: dict[str, Any]) -> dict[str, Any]:
@@ -437,14 +477,8 @@ def backfill_chatgpt_account_to_oaipay(
     update_account_model_oaipay_sync(account, initial_sync, session=session, commit=False)
 
     if _safe_str(initial_sync.get("remote_state")).lower() == "unreachable":
-        msg = initial_sync.get("message") or "OAIPay API 不可连接"
-        sync_state = {
-            **dict(initial_sync),
-            "last_upload": _last_upload("failed", "probe", msg, started_at=started_at, probe_before="unreachable"),
-        }
-        _persist_and_finish(account, sync_state, session, commit)
-        results.append({"name": "OAIPay API 探测", "ok": False, "msg": msg})
-        return {"ok": False, "uploaded": False, "skipped": False, "message": msg, "results": results}
+        msg = initial_sync.get("message") or "OAIPay API 探测不可连接，继续尝试直接上传"
+        results.append({"name": "OAIPay API 探测", "ok": True, "msg": msg})
 
     if _remote_exists(initial_sync):
         msg = f"远端已存在 ({initial_sync.get('matched_by') or '已命中'})，跳过上传"

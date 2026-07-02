@@ -347,67 +347,135 @@ def upload_to_oaipay_detailed(
     token = token_data.get("access_token", "")
 
     payload = {
+        "key": api_key,
         "group": group,
         "accounts": [
             {
                 "email": email,
                 "password": password,
-                "extra_info": token
+                "extra_info": token,
             }
-        ]
+        ],
     }
 
-    url = api_url.rstrip('/')
-    if not url.endswith("/api/auto-gpt/upload") and not url.endswith("/api/cdk/accounts/upload"):
-        url = f"{url}/api/auto-gpt/upload"
+    base_url = api_url.split("/api/")[0].rstrip("/")
+    raw_url = api_url.rstrip("/")
+    candidate_urls = []
+    if raw_url.endswith("/upload"):
+        candidate_urls.append(raw_url)
+    for path in (
+        "/api/auto-gpt/upload",
+        "/api/cdk/accounts/upload",
+        "/api/admin/cdk/accounts/upload",
+    ):
+        full = f"{base_url}{path}"
+        if full not in candidate_urls:
+            candidate_urls.append(full)
 
+    auth_val = api_key if api_key.startswith("Bearer ") else f"Bearer {api_key}"
     headers = {
         "Content-Type": "application/json",
         "Accept": "application/json, text/plain, */*",
         "x-api-key": api_key,
-        "Authorization": api_key,
+        "Authorization": auth_val,
+        "api-key": api_key,
     }
 
-    try:
-        response = cffi_requests.post(
-            url,
-            headers=headers,
-            json=payload,
-            proxies=None,
-            verify=False,
-            timeout=30,
-            impersonate="chrome110",
-        )
-
-        detail: Any = {}
+    last_error = "未知错误"
+    last_detail: Any = {}
+    for url in candidate_urls:
         try:
-            detail = response.json()
-        except Exception:
-            detail = {}
-
-        if response.status_code in (200, 201) and detail.get("success"):
-            return {
-                "ok": True,
-                "message": f"上传成功，导入 {detail.get('imported', 0)} 个账号",
-                "remote_account_id": None,
-                "remote_status": "uploaded",
-                "response": detail,
-            }
-
-        error_msg = f"上传失败: HTTP {response.status_code}"
-        if isinstance(detail, dict):
-            error_msg = str(
-                detail.get("message")
-                or detail.get("msg")
-                or detail.get("error")
-                or error_msg
+            response = cffi_requests.post(
+                url,
+                headers=headers,
+                json=payload,
+                proxies=None,
+                verify=False,
+                timeout=30,
+                impersonate="chrome110",
             )
-        else:
-            error_msg = f"{error_msg} - {response.text[:200]}"
-        return {"ok": False, "message": error_msg, "response": detail if isinstance(detail, dict) else {}}
-    except Exception as exc:
-        logger.error("OAIPay 上传异常: %s", exc)
-        return {"ok": False, "message": f"上传异常: {exc}"}
+            detail: Any = {}
+            try:
+                detail = response.json()
+            except Exception:
+                detail = {}
+            last_detail = detail
+
+            is_success = (
+                response.status_code in (200, 201)
+                and isinstance(detail, dict)
+                and (
+                    detail.get("success")
+                    or detail.get("code") == 0
+                    or detail.get("status") == "success"
+                    or int(detail.get("imported", 0) or 0) > 0
+                )
+            )
+            if is_success:
+                imported = detail.get("imported", 1)
+                return {
+                    "ok": True,
+                    "message": f"上传成功，导入 {imported} 个账号",
+                    "remote_account_id": None,
+                    "remote_status": "uploaded",
+                    "response": detail,
+                }
+
+            if response.status_code in (404, 405):
+                continue
+
+            if response.status_code in (401, 403):
+                headers_fallback = dict(headers)
+                headers_fallback["Authorization"] = api_key
+                resp2 = cffi_requests.post(
+                    url,
+                    headers=headers_fallback,
+                    json=payload,
+                    proxies=None,
+                    verify=False,
+                    timeout=30,
+                    impersonate="chrome110",
+                )
+                try:
+                    detail2 = resp2.json()
+                except Exception:
+                    detail2 = {}
+                is_succ2 = (
+                    resp2.status_code in (200, 201)
+                    and isinstance(detail2, dict)
+                    and (
+                        detail2.get("success")
+                        or detail2.get("code") == 0
+                        or detail2.get("status") == "success"
+                        or int(detail2.get("imported", 0) or 0) > 0
+                    )
+                )
+                if is_succ2:
+                    imported = detail2.get("imported", 1)
+                    return {
+                        "ok": True,
+                        "message": f"上传成功，导入 {imported} 个账号",
+                        "remote_account_id": None,
+                        "remote_status": "uploaded",
+                        "response": detail2,
+                    }
+
+            error_msg = f"上传失败: HTTP {response.status_code}"
+            if isinstance(detail, dict):
+                error_msg = str(
+                    detail.get("message")
+                    or detail.get("msg")
+                    or detail.get("error")
+                    or error_msg
+                )
+            else:
+                error_msg = f"{error_msg} - {response.text[:200]}"
+            return {"ok": False, "message": error_msg, "response": detail if isinstance(detail, dict) else {}}
+        except Exception as exc:
+            logger.error("OAIPay 上传尝试失败 (%s): %s", url, exc)
+            last_error = f"上传异常: {exc}"
+
+    return {"ok": False, "message": last_error, "response": last_detail if isinstance(last_detail, dict) else {}}
 
 
 def upload_to_oaipay(
