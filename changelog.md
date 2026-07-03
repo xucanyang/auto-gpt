@@ -6,6 +6,7 @@
 
 ## [Unreleased] (未发布)
 ### 修复 (Fixed)
+- **修复批量上传时丢失密码与手机号等附加信息的问题**：在同步账号到 OAIPay (`upload_chatgpt_account_to_cpa` 等批量操作) 过程中，修正了 `build_chatgpt_sync_account` 构造伪账户对象时遗漏了 `password` 和 `extra` 的问题，从而彻底修复了该场景下上传的账号在兑换界面只有兜底网关而没有真实专属接码链接的问题。
 - **OAIPay 账号数据上传修复**：修复了上传至 OAIPay (gpt.cccy.me) 时没有包含绑定的手机号（`chatgpt_bound_phone_number`）以及本地接码网关配置（`local_phone_gateway_url` 等）的问题，现在它们会作为顶层字段被包含在 `accounts` 的对象中，使得下游接收方可以正确生成对应的 `delivery_data`。
 
 ### 优化 (Changed)

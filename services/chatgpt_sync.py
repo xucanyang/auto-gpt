@@ -123,6 +123,7 @@ def build_chatgpt_sync_account(account: Any):
 
     obj = _SyncAccount()
     obj.email = getattr(account, "email", "")
+    obj.password = getattr(account, "password", "")
     obj.user_id = getattr(account, "user_id", "")
     obj.access_token = extra.get("access_token") or getattr(account, "token", "")
     obj.refresh_token = extra.get("refresh_token", "")
@@ -130,6 +131,7 @@ def build_chatgpt_sync_account(account: Any):
     obj.session_token = extra.get("session_token", "")
     obj.client_id = extra.get("client_id", "app_EMoamEEZ73f0CkXaXp7hrann")
     obj.cookies = extra.get("cookies", "")
+    obj.extra = extra
     return obj
 
 
