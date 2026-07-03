@@ -5,7 +5,9 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，并且本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/) (语义化版本)。
 
 ## [Unreleased] (未发布)
-
+### 优化 (Changed)
+- **优化手机号池列表的复制体验**：
+  - 将手机号列原有的单纯手机号复制更新为合并复制，格式为 `手机号----API`，并在前端（PC端和移动端）移除收码 API 列独立且冗余的复制按钮，提升了数据提取的便捷性。
 ## [1.2.0] - 2026-07-03
 ### 新增 (Added)
 - **前端版本号展示与规范化版本控制**：

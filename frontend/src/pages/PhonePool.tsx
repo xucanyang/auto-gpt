@@ -953,7 +953,7 @@ export default function PhonePool() {
                   }}
                 />
                 <div className="mobile-record-main">
-                  <Typography.Text code copyable={{ text: record.phone_e164 }} className="mobile-record-title">
+                  <Typography.Text code copyable={{ text: record.api_url ? `${record.phone_e164}----${record.api_url}` : record.phone_e164 }} className="mobile-record-title">
                     {record.phone_e164}
                   </Typography.Text>
                   <div className="mobile-record-meta">
@@ -968,7 +968,7 @@ export default function PhonePool() {
               <div className="mobile-record-section">
                 <div className="mobile-record-field">
                   <span className="mobile-record-label">收码 API</span>
-                  <Typography.Text copyable={record.api_url ? { text: record.api_url } : false} className="mobile-record-value">
+                  <Typography.Text className="mobile-record-value">
                     {record.api_host || record.api_url || '-'}
                   </Typography.Text>
                 </div>
@@ -1024,7 +1024,7 @@ export default function PhonePool() {
       key: 'phone_e164',
       render: (value: string, record: PhonePoolItem) => (
         <Space direction="vertical" size={2}>
-          <Typography.Text code>{value}</Typography.Text>
+          <Typography.Text code copyable={{ text: record.api_url ? `${value}----${record.api_url}` : value, tooltips: ['复制', '已复制'] }}>{value}</Typography.Text>
           {record.label ? <Typography.Text type="secondary" style={{ fontSize: 12 }}>{record.label}</Typography.Text> : null}
         </Space>
       ),
@@ -1035,7 +1035,6 @@ export default function PhonePool() {
       key: 'api_url',
       render: (value: string) => value ? (
         <Typography.Text
-          copyable={{ text: value, tooltips: ['复制 API', '已复制'] }}
           ellipsis={{ tooltip: value }}
           style={{ display: 'block', maxWidth: 260 }}
         >
