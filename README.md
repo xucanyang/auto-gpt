@@ -70,7 +70,7 @@ ChatGPT 账号自动注册与管理系统，支持 Web UI 管理、批量注册�
 
 - `proxy`：动态代理模板，需包含 `region-XX`；支持类似 `socks5://user-region-JP-sid-xxxx-t-1:pass@host:port` 的用户名内嵌国家格式。
 - `proxy_country_code`：目标出口国家，两位 ISO 代码，例如 `US`、`JP`、`SG`。
-- `proxy_failover`：开启后按 `proxy_max_candidates` 生成多个新 `sid` 候选，网络失败时切换下一候选。
+- `proxy_failover`：开启后按动态代理内部重试次数刷新 `sid` 重试；动态模式不使用代理池的 `proxy_min_score` / `proxy_max_candidates`。
 - `dynamic_proxy_probe_enabled` / `dynamic_proxy_require_country_match`：全局配置中可控制是否运行前探测出口，以及实测国家不匹配时是否严格失败。
 
 运行顺序为：改写 `region-XX` → 刷新 `sid-xxx-t-` → 保留现有 cliproxy `socks5://` 到 `http://` 的运行兼容 → 按需探测出口 IP/国家。日志、任务 meta 与预览接口只展示脱敏代理，不保存完整认证信息。

@@ -39,7 +39,7 @@ def test_resolve_probe_candidate_proxies_dynamic_generates_fresh_normalized_cand
             "proxy": TEMPLATE,
             "proxy_country_code": "US",
             "proxy_failover": True,
-            "proxy_max_candidates": 3,
+            "dynamic_proxy_max_attempts": 3,
             "dynamic_proxy_probe_enabled": False,
         }
     )
@@ -54,6 +54,22 @@ def test_resolve_probe_candidate_proxies_dynamic_generates_fresh_normalized_cand
         assert "sid-oldsid-t-" not in url
         assert "dynamic country=US" in source
         assert "probe=disabled" in source
+
+
+def test_dynamic_proxy_uses_dynamic_attempts_not_pool_candidate_count():
+    candidates = resolve_probe_candidate_proxies(
+        {
+            "proxy_mode": "dynamic",
+            "proxy": TEMPLATE,
+            "proxy_country_code": "US",
+            "proxy_failover": True,
+            "proxy_max_candidates": 9,
+            "dynamic_proxy_max_attempts": 2,
+            "dynamic_proxy_probe_enabled": False,
+        }
+    )
+
+    assert len(candidates) == 2
 
 
 def test_specified_mode_does_not_rewrite_region_or_sid():

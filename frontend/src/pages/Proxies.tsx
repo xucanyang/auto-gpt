@@ -1076,7 +1076,7 @@ export default function Proxies() {
             <InputNumber min={1} max={100} value={poolMaxCandidates} onChange={(value) => setPoolMaxCandidates(Number(value || 5))} addonBefore="候选数" />
           </Space>
           <Typography.Text type="secondary">
-            自动扫描目标固定为基础连通、出口国家和 ChatGPT 首页；注册任务使用代理池时按这里的最低健康分和候选数挑选，动态代理模式用候选数控制 sid 重试次数。
+            自动扫描目标固定为基础连通、出口国家和 ChatGPT 首页；代理池及指定代理失败回退时按这里的最低健康分和候选数挑选。动态代理不使用代理池健康分/候选数，只按模板和出口国家生成运行代理。
           </Typography.Text>
         </Space>
       </Card>

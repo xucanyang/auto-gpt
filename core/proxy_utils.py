@@ -315,7 +315,7 @@ def resolve_task_proxy_candidates(
     )
     failover = _truthy(raw_failover, default=False)
 
-    max_candidates = _positive_int(
+    pool_max_candidates = _positive_int(
         _param_first(
             params,
             "proxy_max_candidates",
@@ -350,6 +350,12 @@ def resolve_task_proxy_candidates(
 
     if mode == "dynamic":
         template = raw_proxy or str(_configured_value("dynamic_proxy_template", "") or "").strip()
+        dynamic_max_attempts = _positive_int(
+            params.get("dynamic_proxy_max_attempts") or _configured_value("dynamic_proxy_max_attempts", "5"),
+            default=5,
+            minimum=1,
+            maximum=100,
+        )
         probe_enabled = _truthy(
             params.get("dynamic_proxy_probe_enabled"),
             default=_truthy(_configured_value("dynamic_proxy_probe_enabled", "true"), default=True),
@@ -367,7 +373,7 @@ def resolve_task_proxy_candidates(
         return _dynamic_candidate_tuples(
             template=template,
             country_code=country_code,
-            max_candidates=max_candidates,
+            max_candidates=dynamic_max_attempts,
             failover=failover,
             probe_enabled=probe_enabled,
             require_country_match=require_country_match,
@@ -379,7 +385,7 @@ def resolve_task_proxy_candidates(
             _pool_candidate_tuples(
                 target=target,
                 country_code=country_code,
-                limit=max_candidates,
+                limit=pool_max_candidates,
                 min_score=min_score,
                 existing=candidates,
             )

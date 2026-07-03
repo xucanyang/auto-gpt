@@ -29,6 +29,7 @@ CONFIG_KEYS = [
     "dynamic_proxy_require_country_match",
     "dynamic_proxy_probe_timeout_seconds",
     "dynamic_proxy_probe_enabled",
+    "dynamic_proxy_max_attempts",
     "duckmail_api_url",
     "duckmail_provider_url",
     "duckmail_bearer",
@@ -400,6 +401,8 @@ def get_config():
         all_cfg["dynamic_proxy_probe_timeout_seconds"] = "8"
     if not all_cfg.get("dynamic_proxy_probe_enabled"):
         all_cfg["dynamic_proxy_probe_enabled"] = "true"
+    if not all_cfg.get("dynamic_proxy_max_attempts"):
+        all_cfg["dynamic_proxy_max_attempts"] = "5"
     if "chatgpt_save_registration_access_token_account" not in all_cfg:
         all_cfg["chatgpt_save_registration_access_token_account"] = "true"
     if not all_cfg.get("icloud_hme_mode"):

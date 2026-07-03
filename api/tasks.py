@@ -1660,10 +1660,11 @@ def _custom_email_proxy_meta(settings: dict[str, Any]) -> dict[str, Any]:
         "mode": mode,
         "country_code": str(settings.get("proxy_country_code") or "").strip().upper(),
         "failover": bool(settings.get("proxy_failover")),
-        "max_candidates": int(settings.get("proxy_max_candidates") or 0),
-        "min_score": float(settings.get("proxy_min_score") or 0),
         "specified": _redact_proxy_for_task_log(settings.get("proxy")) if mode == "specified" else "",
     }
+    if mode != "dynamic":
+        meta["max_candidates"] = int(settings.get("proxy_max_candidates") or 0)
+        meta["min_score"] = float(settings.get("proxy_min_score") or 0)
     if mode == "dynamic":
         meta["template"] = _redact_proxy_for_task_log(settings.get("proxy"))
         meta["template_redacted"] = meta["template"]
@@ -3027,6 +3028,22 @@ def enqueue_phone_binding_test_task(
     display_settings = dict(runtime_settings)
     display_settings["proxy"] = redact_proxy_url(runtime_settings.get("proxy"))
     display_settings["proxy_redacted"] = display_settings["proxy"]
+    display_proxy_mode = str(display_settings.get("proxy_mode") or "pool").strip().lower()
+    if display_proxy_mode == "dynamic":
+        display_settings.pop("proxy_max_candidates", None)
+        display_settings.pop("proxy_min_score", None)
+    proxy_meta = {
+        "mode": display_proxy_mode,
+        "country_code": str(req.proxy_country_code or "").strip().upper(),
+        "failover": bool(req.proxy_failover),
+        "specified": redact_proxy_url(req.proxy) if display_proxy_mode == "specified" else "",
+        "specified_redacted": redact_proxy_url(req.proxy) if display_proxy_mode == "specified" else "",
+        "template": redact_proxy_url(req.proxy) if display_proxy_mode == "dynamic" else "",
+        "template_redacted": redact_proxy_url(req.proxy) if display_proxy_mode == "dynamic" else "",
+    }
+    if display_proxy_mode != "dynamic":
+        proxy_meta["max_candidates"] = int(req.proxy_max_candidates or 0)
+        proxy_meta["min_score"] = float(req.proxy_min_score or 0)
     safe_phone_items = [sanitize_phone_item(item) for item in phone_items]
     meta = {
         "total_requested_accounts": total_requested_accounts,
@@ -3051,17 +3068,7 @@ def enqueue_phone_binding_test_task(
             "email": str(req.email or ""),
         },
         "settings": display_settings,
-        "proxy": {
-            "mode": str(req.proxy_mode or "pool"),
-            "country_code": str(req.proxy_country_code or "").strip().upper(),
-            "failover": bool(req.proxy_failover),
-            "max_candidates": int(req.proxy_max_candidates or 0),
-            "min_score": float(req.proxy_min_score or 0),
-            "specified": redact_proxy_url(req.proxy) if str(req.proxy_mode or "pool").strip().lower() == "specified" else "",
-            "specified_redacted": redact_proxy_url(req.proxy) if str(req.proxy_mode or "pool").strip().lower() == "specified" else "",
-            "template": redact_proxy_url(req.proxy) if str(req.proxy_mode or "pool").strip().lower() == "dynamic" else "",
-            "template_redacted": redact_proxy_url(req.proxy) if str(req.proxy_mode or "pool").strip().lower() == "dynamic" else "",
-        },
+        "proxy": proxy_meta,
         "runtime_results": [],
         "bound_phone_lines": [],
         "account_results": [],

@@ -249,14 +249,18 @@ function parseSub2ApiImportPreview(rawValue?: string) {
 function buildProxyPayload(values: any) {
   const mode = String(values?.proxy_mode || 'pool').trim() as ProxyMode
   const proxy = String(values?.proxy || '').trim()
-  return {
+  const includePoolSelectorParams = mode === 'pool' || (mode === 'specified' && Boolean(values?.proxy_failover))
+  const payload: any = {
     proxy: mode === 'specified' || mode === 'dynamic' ? (proxy || null) : null,
     proxy_mode: mode || 'pool',
     proxy_country_code: String(values?.proxy_country_code || '').trim().toUpperCase(),
     proxy_failover: Boolean(values?.proxy_failover),
-    proxy_max_candidates: Number(values?.proxy_max_candidates ?? 5),
-    proxy_min_score: Number(values?.proxy_min_score ?? 50),
   }
+  if (includePoolSelectorParams) {
+    payload.proxy_max_candidates = Number(values?.proxy_max_candidates ?? 5)
+    payload.proxy_min_score = Number(values?.proxy_min_score ?? 50)
+  }
+  return payload
 }
 
 export default function CustomEmailRecheckPage() {
@@ -743,12 +747,16 @@ export default function CustomEmailRecheckPage() {
                       <Form.Item name="proxy_country_code" label="出口国家" style={{ flex: '1 1 180px' }}>
                         <Input size="large" placeholder={proxyMode === 'dynamic' ? '必填，例如 US / JP / SG' : '不限，或填 US / JP / SG'} maxLength={2} />
                       </Form.Item>
+                      {proxyMode !== 'dynamic' ? (
+                        <>
                       <Form.Item name="proxy_min_score" label="最低健康分" style={{ width: 150 }}>
                         <InputNumber min={0} max={100} precision={0} style={{ width: '100%' }} />
                       </Form.Item>
                       <Form.Item name="proxy_max_candidates" label="最多候选" style={{ width: 150 }}>
                         <InputNumber min={1} max={100} precision={0} style={{ width: '100%' }} />
                       </Form.Item>
+                        </>
+                      ) : null}
                     </Space>
                   ) : null}
 
@@ -765,7 +773,7 @@ export default function CustomEmailRecheckPage() {
                     type="info"
                     style={{ marginBottom: 18 }}
                     message="这个入口只做登录测活"
-                    description="代理模式与注册一致：直连不碰代理；指定代理默认只用填写节点，勾选失败切换后回退代理池；代理池按健康分、冷却和实测出口国家挑选；动态代理按出口国家改写 region 并刷新 sid。"
+                    description="代理模式与注册一致：直连不碰代理；指定代理默认只用填写节点，勾选失败切换后才使用代理池筛选项；代理池按健康分、冷却和实测出口国家挑选；动态代理只使用模板和出口国家，失败后刷新 sid 重试，不使用代理池的健康分/候选数。"
                   />
 
                   <Space wrap>

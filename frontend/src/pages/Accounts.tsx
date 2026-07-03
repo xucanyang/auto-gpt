@@ -2643,19 +2643,24 @@ export default function Accounts() {
   const submitBatchProbeStatusConfig = async () => {
     const values = await batchProbeStatusConfigForm.validateFields()
     setBatchProbeStatusConfigOpen(false)
-    const customParams = {
-      proxy_mode: values.proxy_mode || 'pool',
-      proxy: ['specified', 'dynamic'].includes(values.proxy_mode) ? (String(values.proxy || '').trim() || null) : null,
+    const probeProxyMode = String(values.proxy_mode || 'pool').trim()
+    const probeUsesPoolSelector =
+      probeProxyMode === 'pool' || (probeProxyMode === 'specified' && Boolean(values.proxy_failover))
+    const customParams: Record<string, unknown> = {
+      proxy_mode: probeProxyMode,
+      proxy: ['specified', 'dynamic'].includes(probeProxyMode) ? (String(values.proxy || '').trim() || null) : null,
       proxy_failover: Boolean(values.proxy_failover),
       proxy_country_code: String(values.proxy_country_code || '').trim().toUpperCase(),
-      proxy_min_score: Number(values.proxy_min_score ?? 50),
-      proxy_max_candidates: Number(values.proxy_max_candidates ?? 5),
       register_delay_seconds: Number(values.register_delay_seconds ?? 0),
       register_delay_max_seconds: Number(values.register_delay_max_seconds ?? 0),
       probe_delay_seconds: Number(values.register_delay_seconds ?? 0),
       probe_delay_max_seconds: Number(values.register_delay_max_seconds ?? 0),
       delay_seconds: Number(values.register_delay_seconds ?? 0),
       delay_max_seconds: Number(values.register_delay_max_seconds ?? 0),
+    }
+    if (probeUsesPoolSelector) {
+      customParams.proxy_min_score = Number(values.proxy_min_score ?? 50)
+      customParams.proxy_max_candidates = Number(values.proxy_max_candidates ?? 5)
     }
     await handleBatchStatusSync('probe', batchProbeStatusConfigScope, customParams)
   }
@@ -2959,6 +2964,9 @@ export default function Accounts() {
       message.warning('请粘贴手机号/API，或启用手机号池')
       return
     }
+    const phoneProxyMode = String(values.proxy_mode || 'pool').trim()
+    const phoneUsesPoolSelector =
+      phoneProxyMode === 'pool' || (phoneProxyMode === 'specified' && Boolean(values.proxy_failover))
     const body: Record<string, unknown> = {
       phone_lines: phoneLines,
       use_pool: usePool,
@@ -2971,12 +2979,14 @@ export default function Accounts() {
       resend_interval_seconds: Number(values.resend_interval_seconds || 0),
       account_interval_seconds: Number(values.account_interval_seconds || 60),
       reuse_phone_until_unusable: prefixSampleEnabled ? false : Boolean(values.reuse_phone_until_unusable),
-      proxy: ['specified', 'dynamic'].includes(values.proxy_mode) ? (String(values.proxy || '').trim() || null) : null,
-      proxy_mode: values.proxy_mode || 'pool',
+      proxy: ['specified', 'dynamic'].includes(phoneProxyMode) ? (String(values.proxy || '').trim() || null) : null,
+      proxy_mode: phoneProxyMode,
       proxy_country_code: String(values.proxy_country_code || '').trim().toUpperCase(),
       proxy_failover: Boolean(values.proxy_failover),
-      proxy_max_candidates: Number(values.proxy_max_candidates || 10),
-      proxy_min_score: Number(values.proxy_min_score || 50),
+    }
+    if (phoneUsesPoolSelector) {
+      body.proxy_max_candidates = Number(values.proxy_max_candidates || 10)
+      body.proxy_min_score = Number(values.proxy_min_score || 50)
     }
     let requestedAccounts = total
     if (scope === 'selected') {
@@ -3883,6 +3893,20 @@ export default function Accounts() {
             : Boolean(values.chatgpt_save_registration_access_token_account),
       })
 
+      const registerProxyMode = String(values.proxy_mode || 'pool').trim()
+      const registerUsesPoolSelector =
+        registerProxyMode === 'pool' || (registerProxyMode === 'specified' && Boolean(values.proxy_failover))
+      const proxyPayload: Record<string, unknown> = {
+        proxy: ['specified', 'dynamic'].includes(registerProxyMode) ? (String(values.proxy || '').trim() || null) : null,
+        proxy_mode: registerProxyMode,
+        proxy_country_code: String(values.proxy_country_code || '').trim().toUpperCase(),
+        proxy_failover: Boolean(values.proxy_failover),
+      }
+      if (registerUsesPoolSelector) {
+        proxyPayload.proxy_max_candidates = Number(values.proxy_max_candidates || 5)
+        proxyPayload.proxy_min_score = Number(values.proxy_min_score || 0)
+      }
+
       const res = await apiFetch('/tasks/register', {
         method: 'POST',
         body: JSON.stringify({
@@ -3897,12 +3921,7 @@ export default function Accounts() {
           register_delay_seconds: values.register_delay_seconds || 0,
           executor_type: executorType,
           captcha_solver: cfg.default_captcha_solver || 'yescaptcha',
-          proxy: ['specified', 'dynamic'].includes(values.proxy_mode) ? (String(values.proxy || '').trim() || null) : null,
-          proxy_mode: values.proxy_mode || 'pool',
-          proxy_country_code: String(values.proxy_country_code || '').trim().toUpperCase(),
-          proxy_failover: Boolean(values.proxy_failover),
-          proxy_max_candidates: Number(values.proxy_max_candidates || 5),
-          proxy_min_score: Number(values.proxy_min_score || 0),
+          ...proxyPayload,
           extra: adaptedRegisterExtra,
         }),
       })
@@ -6341,20 +6360,24 @@ export default function Accounts() {
           {(probeProxyModeValue === 'pool' || probeProxyModeValue === 'dynamic' || (probeProxyModeValue === 'specified' && probeProxyFailoverValue)) && (
             <Space style={{ display: 'flex', flexWrap: 'wrap', gap: 16 }} align="baseline">
               <Form.Item label="目标国家 (ISO 缩写)" name="proxy_country_code">
-                <Input style={{ width: 140 }} placeholder="如 US, JP, 不填则不限" />
+                <Input style={{ width: 140 }} placeholder={probeProxyModeValue === 'dynamic' ? '必填，如 US' : '如 US, JP, 不填则不限'} />
               </Form.Item>
+              {probeProxyModeValue !== 'dynamic' ? (
+                <>
               <Form.Item label="最低健康度分数" name="proxy_min_score" initialValue={50}>
                 <InputNumber min={0} max={100} step={5} style={{ width: 140 }} />
               </Form.Item>
               <Form.Item label="候选代理数量" name="proxy_max_candidates" initialValue={5}>
                 <InputNumber min={1} max={20} step={1} style={{ width: 140 }} />
               </Form.Item>
+                </>
+              ) : null}
             </Space>
           )}
 
           {probeProxyModeValue !== 'direct' && (
             <Form.Item name="proxy_failover" valuePropName="checked" initialValue={false}>
-              <Checkbox>使用多个候选代理，遇到网络失败时自动切换</Checkbox>
+              <Checkbox>{probeProxyModeValue === 'dynamic' ? '失败后刷新 sid 重试' : '使用多个候选代理，遇到网络失败时自动切换'}</Checkbox>
             </Form.Item>
           )}
         </Form>
@@ -6657,12 +6680,16 @@ export default function Accounts() {
                   >
                     <Input placeholder={phoneBindingProxyMode === 'dynamic' ? 'US' : '不限'} maxLength={2} />
                   </Form.Item>
-                  <Form.Item name="proxy_max_candidates" label={phoneBindingProxyMode === 'dynamic' ? 'sid 候选数' : '代理候选数'}>
-                    <InputNumber min={1} max={20} step={1} style={{ width: '100%' }} />
-                  </Form.Item>
-                  <Form.Item name="proxy_min_score" label="最低评分">
-                    <InputNumber min={0} max={100} step={5} style={{ width: '100%' }} disabled={phoneBindingProxyMode === 'dynamic'} />
-                  </Form.Item>
+                  {phoneBindingProxyMode !== 'dynamic' ? (
+                    <>
+                      <Form.Item name="proxy_max_candidates" label="代理候选数">
+                        <InputNumber min={1} max={20} step={1} style={{ width: '100%' }} />
+                      </Form.Item>
+                      <Form.Item name="proxy_min_score" label="最低评分">
+                        <InputNumber min={0} max={100} step={5} style={{ width: '100%' }} />
+                      </Form.Item>
+                    </>
+                  ) : null}
                 </>
               ) : null}
               <Form.Item name="max_resend_attempts" label="同号重发次数">

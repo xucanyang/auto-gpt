@@ -355,6 +355,19 @@ export default function RegisterTaskPage() {
           }),
         })
       }
+      const requestProxyMode = String(values.proxy_mode || (values.proxy ? 'specified' : 'pool')).trim()
+      const includePoolSelectorParams =
+        requestProxyMode === 'pool' || (requestProxyMode === 'specified' && Boolean(values.proxy_failover))
+      const proxyPayload: Record<string, unknown> = {
+        proxy: ['specified', 'dynamic'].includes(requestProxyMode) ? (String(values.proxy || '').trim() || null) : null,
+        proxy_mode: requestProxyMode,
+        proxy_country_code: String(values.proxy_country_code || '').trim().toUpperCase(),
+        proxy_failover: Boolean(values.proxy_failover),
+      }
+      if (includePoolSelectorParams) {
+        proxyPayload.proxy_max_candidates = Number(values.proxy_max_candidates || 5)
+        proxyPayload.proxy_min_score = Number(values.proxy_min_score || 0)
+      }
       const res = await apiFetch('/tasks/register', {
         method: 'POST',
         body: JSON.stringify({
@@ -364,12 +377,7 @@ export default function RegisterTaskPage() {
           count: values.count,
           concurrency: phoneSignupEnabled ? 1 : values.concurrency,
           register_delay_seconds: values.register_delay_seconds || 0,
-          proxy: ['specified', 'dynamic'].includes(values.proxy_mode) ? (String(values.proxy || '').trim() || null) : null,
-          proxy_mode: values.proxy_mode || (values.proxy ? 'specified' : 'pool'),
-          proxy_country_code: String(values.proxy_country_code || '').trim().toUpperCase(),
-          proxy_failover: Boolean(values.proxy_failover),
-          proxy_max_candidates: Number(values.proxy_max_candidates || 5),
-          proxy_min_score: Number(values.proxy_min_score || 0),
+          ...proxyPayload,
           executor_type: values.executor_type,
           captcha_solver: values.captcha_solver,
           extra: adaptedRegisterExtra,
@@ -709,12 +717,16 @@ export default function RegisterTaskPage() {
               <Form.Item name="proxy_country_code" label="出口国家" style={{ flex: 1 }}>
                 <Input placeholder={proxyMode === 'dynamic' ? '必填，例如 US / JP / SG' : '不限，或填 US / JP / SG'} maxLength={2} />
               </Form.Item>
+              {proxyMode !== 'dynamic' ? (
+                <>
               <Form.Item name="proxy_min_score" label="最低健康分" style={{ width: 150 }}>
                 <InputNumber min={0} max={100} precision={0} style={{ width: '100%' }} />
               </Form.Item>
               <Form.Item name="proxy_max_candidates" label="最多候选" style={{ width: 150 }}>
                 <InputNumber min={1} max={100} precision={0} style={{ width: '100%' }} />
               </Form.Item>
+                </>
+              ) : null}
             </Space>
           ) : null}
           <Alert
@@ -722,7 +734,7 @@ export default function RegisterTaskPage() {
             showIcon
             style={{ marginBottom: 12 }}
             message="代理模式说明"
-            description="直连不使用代理；指定代理默认只用填写节点，勾选失败切换后回退代理池；代理池按健康分、冷却和实测出口国家挑选；动态代理会按出口国家改写 region 并刷新 sid，失败后可生成新 sid 重试。"
+            description="直连不使用代理；指定代理默认只用填写节点，勾选失败切换后才使用代理池筛选项；代理池按健康分、冷却和实测出口国家挑选；动态代理只使用模板和出口国家，失败后刷新 sid 重试，不使用代理池的健康分/候选数。"
           />
           {platform === 'chatgpt' && (
             <>
