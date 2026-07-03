@@ -319,6 +319,39 @@ def _extract_oaipay_response_data(detail: Any) -> dict[str, Any]:
     return detail
 
 
+_CATEGORIES_CACHE = {}
+_CATEGORIES_CACHE_TIME = 0
+
+def _resolve_category_id(api_url: str, api_key: str, name: str) -> str:
+    global _CATEGORIES_CACHE, _CATEGORIES_CACHE_TIME
+    import time
+    now = time.time()
+    if now - _CATEGORIES_CACHE_TIME > 60:
+        try:
+            base_url = api_url.split("/api/")[0].rstrip("/")
+            for path in ("/api/admin/cdk/categories", "/api/auto-gpt/categories"):
+                try:
+                    res = cffi_requests.get(f"{base_url}{path}", headers={"Authorization": api_key}, timeout=10, verify=False, impersonate="chrome110")
+                    if res.status_code == 200:
+                        data = res.json()
+                        cats = data if isinstance(data, list) else data.get("data") or data.get("categories") or []
+                        if isinstance(cats, list):
+                            new_cache = {}
+                            for c in cats:
+                                if isinstance(c, dict):
+                                    cname = str(c.get("name") or "").strip()
+                                    cid = str(c.get("id") or "").strip()
+                                    if cname and cid:
+                                        new_cache[cname] = cid
+                            _CATEGORIES_CACHE = new_cache
+                            _CATEGORIES_CACHE_TIME = now
+                            break
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    return _CATEGORIES_CACHE.get(name, "")
+
 def upload_to_oaipay_detailed(
     account,
     api_url: str | None = None,
@@ -334,22 +367,27 @@ def upload_to_oaipay_detailed(
     has_rt = bool(caps.get("has_refresh_token"))
     has_paid = bool(caps.get("has_paid_subscription"))
 
-    auto_group = ""
+    auto_group_name = ""
     if has_paid:
         if has_rt:
-            auto_group = "PLUS--已接美国长效"
+            auto_group_name = "PLUS--已接美国长效"
         else:
-            auto_group = "PLUS--未接码"
+            auto_group_name = "PLUS--未接码"
     else:
         if has_rt:
-            auto_group = "FREE--已接码带RT"
+            auto_group_name = "FREE--已接码带RT"
 
-    if auto_group:
-        group = auto_group
-    elif group_ids and len(group_ids) > 0:
-        group = str(group_ids[0])
-    else:
-        group = _get_config_value("oaipay_group")
+    group = ""
+    if auto_group_name:
+        resolved_id = _resolve_category_id(api_url, api_key, auto_group_name)
+        if resolved_id:
+            group = resolved_id
+            
+    if not group:
+        if group_ids and len(group_ids) > 0:
+            group = str(group_ids[0])
+        else:
+            group = _get_config_value("oaipay_group")
 
     if not api_url:
         return {"ok": False, "message": "OAIPay API URL 未配置"}
