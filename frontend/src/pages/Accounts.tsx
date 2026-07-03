@@ -3056,7 +3056,14 @@ export default function Accounts() {
   }
 
   const submitBaxiCdkSubmit = async () => {
-    const values = await baxiCdkSubmitForm.validateFields()
+    let values
+    try {
+      values = await baxiCdkSubmitForm.validateFields()
+    } catch (e) {
+      console.error('Validation failed:', e)
+      message.error('表单参数有误，请检查（展开高级参数查看详细错误）')
+      return
+    }
     saveBaxiGptCdkSettings(values)
     const scope = (values.scope === 'filtered' ? 'filtered' : 'selected') as 'selected' | 'filtered'
     const codeLines = String(values.code_lines || '').trim()
@@ -3147,6 +3154,7 @@ export default function Accounts() {
         const id = String(key)
         return selectedAccountSnapshots[id] || accounts.find((account) => String(account.id) === id) || { id }
       })
+
 
   const getPaypalBindingSelectedIds = () =>
     getPaypalBindingSelectedItems()

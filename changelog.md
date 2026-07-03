@@ -25,6 +25,9 @@
     - 含有 RT 的 Free 账号自动归类到 `FREE--已接码带RT`。
 
 ### 修复 (Fixed)
+- **修复 OAIPay 自动分组失败的问题**：
+  - **动态映射分组 ID**：修正了自动分组逻辑，在向 OAIPay 提交数据前，会先拉取对方的分类列表（`/api/auto-gpt/categories`），动态将分组名称（如 `PLUS--已接美国长效`）转换为系统所需的数字 ID 进行上传，避免因为提交中文字符串导致分组无效或被归为默认。
+
 - **修复因状态探针网络异常导致账号原有订阅状态（如 Plus）被重置丢失的问题**：
   - **后端智能 Fallback**：修改了账号能力判定策略 (`chatgpt_account_state.py`)。当探测失败、API 超时或因代理故障导致本次任务无法提取出计划信息（返回 `"unknown"`）时，将不再覆写原有的订阅级别，而是自动回退并保留账号字典 `chatgpt_capabilities` 中最后一次成功记录的 `subscription_plan`。以此确保原本为 Plus/Team 级别的账号在遭受偶然断网时不会在前端被降级或错标为 Free。
 - **修复本地状态批量同步及日志面板因导入不存在的代理解析方法导致异常崩溃无法工作的问题**：
@@ -68,6 +71,8 @@
   - 升级项目的 AI 与开发者操作约定 (`AGENTS.md`)，强制规定任何 Agent 在完成工作区代码、前端资源或配置文件修改后，必须主动执行根目录下的 `./deploy.sh` 进行版本存档、容器编译与在线服务更新。
 
 ### 修复 (Fixed)
+- **修复 Idea 批量提交按钮无反应的问题**：
+  - 修复在 `Accounts.tsx` 中 `submitBaxiCdkSubmit` 方法内因 `validateFields()` 发生校验错误时抛出未捕获的 Promise Rejection 导致页面无任何反应和反馈的问题，现在会正确捕获并提示用户检查表单参数（尤其是被折叠隐藏的高级参数区域）。
 - **前端一键复制 Access Token 修复**：
   - 修复了后端在序列化紧凑版账号列表 (`compact account list serializer`) 时遗漏 Access Token 字段的问题，确保前端管理界面中“一键复制 AT”功能能够准确获取并剪贴完整的 Token 数据。
 - **已支付 Checkout (Already-Paid) 流程处理修复**：
