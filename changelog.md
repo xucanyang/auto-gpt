@@ -5,6 +5,12 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，并且本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/) (语义化版本)。
 
 ## [Unreleased] (未发布)
+
+## [1.2.0] - 2026-07-03
+### 新增 (Added)
+- **前端版本号展示与规范化版本控制**：
+  - **网页前端版本展示**：在侧边栏导航底部（或全局布局中）新增系统当前版本号显示，便于直观确认代码更新情况。
+  - **严格遵守语义化版本控制**：完善 `AGENTS.md` 规范，对每次变更执行大/小版本更迭规范并在 Changelog 中明确标注，以此驱动项目的规范化演进。
 ### 新增 (Added)
 - **本地状态批量同步增设日志面板与任务后台化**：
   - **实时进度与日志面板**：在 ChatGPT 账号列表页面 (`Accounts.tsx`) 触发批量同步本地状态（`probe_local_status`）时，现改为由后台任务处理并弹出实时任务日志面板 (`TaskLogPanel`)，支持实时的进度反馈与详细控制台输出查看。

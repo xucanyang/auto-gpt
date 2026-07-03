@@ -235,6 +235,18 @@ function AppContent({ hasPassword }: { hasPassword: boolean }) {
                   {!collapsed && '退出登录'}
                 </Button>
               )}
+              {!collapsed && (
+                <div
+                  style={{
+                    textAlign: 'center',
+                    fontSize: 12,
+                    color: currentTheme.token?.colorTextSecondary,
+                    marginTop: 4,
+                  }}
+                >
+                  v1.2.0
+                </div>
+              )}
             </div>
           </Sider>
           <Content
