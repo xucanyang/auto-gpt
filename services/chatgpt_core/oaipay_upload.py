@@ -405,6 +405,25 @@ def upload_to_oaipay_detailed(
     token_data = generate_token_json(account)
     token = token_data.get("access_token", "")
 
+    extra = getattr(account, "extra", {})
+    if callable(extra):
+        extra = extra()
+    if not isinstance(extra, dict) and hasattr(account, "get_extra"):
+        try:
+            extra = account.get_extra()
+        except Exception:
+            pass
+    if isinstance(extra, dict):
+        bound_phone = extra.get("chatgpt_bound_phone") or extra.get("chatgpt_phone_binding") or {}
+        if isinstance(bound_phone, dict):
+            api_url_val = bound_phone.get("api_url", "")
+            if api_url_val:
+                token_data["api_url"] = api_url_val
+                token_data["phone"] = bound_phone.get("phone", "")
+
+    import json
+    extra_info_json = json.dumps(token_data, ensure_ascii=False, separators=(',', ':'))
+
     payload = {
         "key": api_key,
         "group": group,
@@ -412,7 +431,7 @@ def upload_to_oaipay_detailed(
             {
                 "email": email,
                 "password": password,
-                "extra_info": token,
+                "extra_info": extra_info_json,
             }
         ],
     }
