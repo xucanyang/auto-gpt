@@ -661,7 +661,7 @@ function normalizePhoneBindingSettings(value: unknown): PhoneBindingSettings {
     reuse_phone_until_unusable: Boolean(raw.reuse_phone_until_unusable),
     proxy_mode: (() => {
       const value = String(raw.proxy_mode || DEFAULT_PHONE_BINDING_SETTINGS.proxy_mode).trim()
-      return value === 'direct' || value === 'specified' || value === 'pool' ? value : 'pool'
+      return value === 'direct' || value === 'specified' || value === 'pool' || value === 'dynamic' ? value : 'pool'
     })(),
     proxy: String(raw.proxy || ''),
     proxy_country_code: String(raw.proxy_country_code || '').trim().toUpperCase(),
@@ -1649,7 +1649,9 @@ export default function Accounts() {
   const phoneBindingPrefixSampleFilterValue = Form.useWatch('prefix_sample_filter', phoneBindingTestForm)
   const phoneBindingPhoneLinesValue = Form.useWatch('phone_lines', phoneBindingTestForm)
   const phoneBindingProxyModeValue = Form.useWatch('proxy_mode', phoneBindingTestForm)
+  const phoneBindingProxyFailoverValue = Form.useWatch('proxy_failover', phoneBindingTestForm)
   const probeProxyModeValue = Form.useWatch('proxy_mode', batchProbeStatusConfigForm)
+  const probeProxyFailoverValue = Form.useWatch('proxy_failover', batchProbeStatusConfigForm)
   const baxiCdkUsePoolValue = Form.useWatch('use_pool', baxiCdkSubmitForm)
   const baxiCdkCodeLinesValue = Form.useWatch('code_lines', baxiCdkSubmitForm)
   const [registerMailProvider, setRegisterMailProvider] = useState('luckmail')
@@ -2318,7 +2320,7 @@ export default function Accounts() {
           concurrency: Number(savedSettings.concurrency || 1) || 1,
           register_delay_seconds: Number(savedSettings.register_delay_seconds || 0) || 0,
           proxy_mode: String(savedSettings.proxy_mode || 'pool'),
-          proxy: String(savedSettings.proxy || ''),
+          proxy: String(savedSettings.proxy || cfg.dynamic_proxy_template || ''),
           proxy_country_code: String(savedSettings.proxy_country_code || '').trim().toUpperCase(),
           proxy_failover: Boolean(savedSettings.proxy_failover),
           proxy_max_candidates: Number(savedSettings.proxy_max_candidates || cfg.proxy_pool_max_candidates || 5) || 5,
@@ -2629,7 +2631,7 @@ export default function Accounts() {
       register_delay_seconds: 0,
       register_delay_max_seconds: 0,
       proxy_mode: 'pool',
-      proxy: '',
+      proxy: String(configCache?.dynamic_proxy_template || ''),
       proxy_failover: false,
       proxy_country_code: '',
       proxy_min_score: 50,
@@ -2643,9 +2645,9 @@ export default function Accounts() {
     setBatchProbeStatusConfigOpen(false)
     const customParams = {
       proxy_mode: values.proxy_mode || 'pool',
-      proxy: values.proxy || '',
+      proxy: ['specified', 'dynamic'].includes(values.proxy_mode) ? (String(values.proxy || '').trim() || null) : null,
       proxy_failover: Boolean(values.proxy_failover),
-      proxy_country_code: values.proxy_country_code || '',
+      proxy_country_code: String(values.proxy_country_code || '').trim().toUpperCase(),
       proxy_min_score: Number(values.proxy_min_score ?? 50),
       proxy_max_candidates: Number(values.proxy_max_candidates ?? 5),
       register_delay_seconds: Number(values.register_delay_seconds ?? 0),
@@ -2969,7 +2971,7 @@ export default function Accounts() {
       resend_interval_seconds: Number(values.resend_interval_seconds || 0),
       account_interval_seconds: Number(values.account_interval_seconds || 60),
       reuse_phone_until_unusable: prefixSampleEnabled ? false : Boolean(values.reuse_phone_until_unusable),
-      proxy: values.proxy_mode === 'specified' ? (String(values.proxy || '').trim() || null) : null,
+      proxy: ['specified', 'dynamic'].includes(values.proxy_mode) ? (String(values.proxy || '').trim() || null) : null,
       proxy_mode: values.proxy_mode || 'pool',
       proxy_country_code: String(values.proxy_country_code || '').trim().toUpperCase(),
       proxy_failover: Boolean(values.proxy_failover),
@@ -3895,7 +3897,7 @@ export default function Accounts() {
           register_delay_seconds: values.register_delay_seconds || 0,
           executor_type: executorType,
           captcha_solver: cfg.default_captcha_solver || 'yescaptcha',
-          proxy: values.proxy_mode === 'specified' ? (String(values.proxy || '').trim() || null) : null,
+          proxy: ['specified', 'dynamic'].includes(values.proxy_mode) ? (String(values.proxy || '').trim() || null) : null,
           proxy_mode: values.proxy_mode || 'pool',
           proxy_country_code: String(values.proxy_country_code || '').trim().toUpperCase(),
           proxy_failover: Boolean(values.proxy_failover),
@@ -6321,17 +6323,22 @@ export default function Accounts() {
             <Select style={{ width: 260 }}>
               <Select.Option value="pool">代理池自动选取</Select.Option>
               <Select.Option value="specified">手动指定代理</Select.Option>
+              <Select.Option value="dynamic">动态代理</Select.Option>
               <Select.Option value="direct">直连 (不使用代理)</Select.Option>
             </Select>
           </Form.Item>
 
-          {probeProxyModeValue === 'specified' && (
-            <Form.Item label="代理地址" name="proxy" rules={[{ required: true, message: '请输入代理地址' }]}>
-              <Input placeholder="http://user:pass@host:port 或 socks5://..." />
+          {(probeProxyModeValue === 'specified' || probeProxyModeValue === 'dynamic') && (
+            <Form.Item
+              label={probeProxyModeValue === 'dynamic' ? '动态代理模板' : '代理地址'}
+              name="proxy"
+              rules={[{ required: true, message: probeProxyModeValue === 'dynamic' ? '请输入动态代理模板' : '请输入代理地址' }]}
+            >
+              <Input placeholder={probeProxyModeValue === 'dynamic' ? 'socks5://user-region-JP-sid-xxxx-t-1:pass@host:port' : 'http://user:pass@host:port 或 socks5://...'} />
             </Form.Item>
           )}
 
-          {probeProxyModeValue === 'pool' && (
+          {(probeProxyModeValue === 'pool' || probeProxyModeValue === 'dynamic' || (probeProxyModeValue === 'specified' && probeProxyFailoverValue)) && (
             <Space style={{ display: 'flex', flexWrap: 'wrap', gap: 16 }} align="baseline">
               <Form.Item label="目标国家 (ISO 缩写)" name="proxy_country_code">
                 <Input style={{ width: 140 }} placeholder="如 US, JP, 不填则不限" />
@@ -6616,42 +6623,48 @@ export default function Accounts() {
                   options={[
                     { value: 'pool', label: '代理池' },
                     { value: 'specified', label: '指定代理' },
+                    { value: 'dynamic', label: '动态代理' },
                     { value: 'direct', label: '直连' },
                   ]}
                 />
               </Form.Item>
-              {phoneBindingProxyMode === 'specified' ? (
+              {phoneBindingProxyMode === 'specified' || phoneBindingProxyMode === 'dynamic' ? (
                 <Form.Item
                   name="proxy"
-                  label="指定代理"
-                  rules={[{ required: true, message: '请填写代理地址' }]}
-                  extra="容器内建议使用 http://host.docker.internal:110xx。"
+                  label={phoneBindingProxyMode === 'dynamic' ? '动态代理模板' : '指定代理'}
+                  rules={[{ required: true, message: phoneBindingProxyMode === 'dynamic' ? '请填写动态代理模板' : '请填写代理地址' }]}
+                  extra={phoneBindingProxyMode === 'dynamic' ? '模板必须包含 region-XX；运行时按下面的代理国家改写并刷新 sid。' : '容器内建议使用 http://host.docker.internal:110xx。'}
                 >
-                  <Input placeholder="http://host.docker.internal:11021" />
+                  <Input placeholder={phoneBindingProxyMode === 'dynamic' ? 'socks5://user-region-JP-sid-xxxx-t-1:pass@host:port' : 'http://host.docker.internal:11021'} />
                 </Form.Item>
-              ) : (
+              ) : null}
+              {phoneBindingProxyMode !== 'direct' ? (
                 <Form.Item
-                  name="proxy_country_code"
-                  label="代理国家"
-                  extra="可留空；例如 US、JP。"
+                  name="proxy_failover"
+                  label="代理失败切换"
+                  valuePropName="checked"
+                  extra={phoneBindingProxyMode === 'dynamic' ? '开启后在号码未被 OpenAI 触碰前刷新 sid 重试，避免重复消耗号码。' : '仅在手机号还没被 OpenAI 触碰时切换，避免重复消耗号码。'}
                 >
-                  <Input placeholder="不限" maxLength={2} />
+                  <Switch checkedChildren="开启" unCheckedChildren="关闭" />
                 </Form.Item>
-              )}
-              <Form.Item name="proxy_max_candidates" label="代理候选数">
-                <InputNumber min={1} max={20} step={1} style={{ width: '100%' }} />
-              </Form.Item>
-              <Form.Item name="proxy_min_score" label="最低评分">
-                <InputNumber min={0} max={100} step={5} style={{ width: '100%' }} />
-              </Form.Item>
-              <Form.Item
-                name="proxy_failover"
-                label="代理失败切换"
-                valuePropName="checked"
-                extra="仅在手机号还没被 OpenAI 触碰时切换，避免重复消耗号码。"
-              >
-                <Switch checkedChildren="开启" unCheckedChildren="关闭" disabled={phoneBindingProxyMode === 'direct'} />
-              </Form.Item>
+              ) : null}
+              {(phoneBindingProxyMode === 'pool' || phoneBindingProxyMode === 'dynamic' || (phoneBindingProxyMode === 'specified' && phoneBindingProxyFailoverValue)) ? (
+                <>
+                  <Form.Item
+                    name="proxy_country_code"
+                    label="代理国家"
+                    extra={phoneBindingProxyMode === 'dynamic' ? '动态代理必填；例如 US、JP。' : '可留空；例如 US、JP。'}
+                  >
+                    <Input placeholder={phoneBindingProxyMode === 'dynamic' ? 'US' : '不限'} maxLength={2} />
+                  </Form.Item>
+                  <Form.Item name="proxy_max_candidates" label={phoneBindingProxyMode === 'dynamic' ? 'sid 候选数' : '代理候选数'}>
+                    <InputNumber min={1} max={20} step={1} style={{ width: '100%' }} />
+                  </Form.Item>
+                  <Form.Item name="proxy_min_score" label="最低评分">
+                    <InputNumber min={0} max={100} step={5} style={{ width: '100%' }} disabled={phoneBindingProxyMode === 'dynamic'} />
+                  </Form.Item>
+                </>
+              ) : null}
               <Form.Item name="max_resend_attempts" label="同号重发次数">
                 <InputNumber min={0} max={10} step={1} style={{ width: '100%' }} />
               </Form.Item>

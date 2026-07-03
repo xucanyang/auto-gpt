@@ -71,7 +71,7 @@ class RegisterTaskRequest(BaseModel):
     register_delay_seconds: float = 0
     register_delay_max_seconds: float = 0
     proxy: Optional[str] = None
-    proxy_mode: str = ""  # direct | specified | pool；空值保持旧语义：有 proxy 用指定代理，无 proxy 直连
+    proxy_mode: str = ""  # direct | specified | pool | dynamic；空值保持旧语义：有 proxy 用指定代理，无 proxy 直连
     proxy_country_code: str = ""
     proxy_failover: bool = False
     proxy_max_candidates: int = 0
@@ -141,7 +141,7 @@ class PhoneBindingTestTaskRequest(BaseModel):
     prefix_sms_probe_only: bool = False
     limit: int = 0
     proxy: Optional[str] = None
-    proxy_mode: str = "pool"  # direct | specified | pool
+    proxy_mode: str = "pool"  # direct | specified | pool | dynamic
     proxy_country_code: str = ""
     proxy_failover: bool = True
     proxy_max_candidates: int = 0
@@ -258,7 +258,7 @@ class CustomEmailRecheckTaskRequest(BaseModel):
     password: str = ""
     save_on_success: bool = True
     proxy: Optional[str] = None
-    proxy_mode: str = ""  # direct | specified | pool；空值保持旧 API 语义：有 proxy 用指定代理，无 proxy 直连
+    proxy_mode: str = ""  # direct | specified | pool | dynamic；空值保持旧 API 语义：有 proxy 用指定代理，无 proxy 直连
     proxy_country_code: str = ""
     proxy_failover: bool = False
     proxy_max_candidates: int = 0
@@ -275,7 +275,7 @@ class BatchCustomEmailRecheckTaskRequest(BaseModel):
     save_on_success: bool = True
     limit: int = 200
     proxy: Optional[str] = None
-    proxy_mode: str = ""  # direct | specified | pool；空值保持旧 API 语义：有 proxy 用指定代理，无 proxy 直连
+    proxy_mode: str = ""  # direct | specified | pool | dynamic；空值保持旧 API 语义：有 proxy 用指定代理，无 proxy 直连
     proxy_country_code: str = ""
     proxy_failover: bool = False
     proxy_max_candidates: int = 0
@@ -1626,6 +1626,7 @@ def _redact_proxy_for_task_log(proxy: Optional[str]) -> str:
 
 
 def _custom_email_proxy_settings(req: CustomEmailRecheckTaskRequest | BatchCustomEmailRecheckTaskRequest) -> dict[str, Any]:
+    from core.config_store import config_store
     from core.proxy_utils import normalize_proxy_url
 
     explicit_proxy = normalize_proxy_url(getattr(req, "proxy", None)) or ""
@@ -1636,13 +1637,17 @@ def _custom_email_proxy_settings(req: CustomEmailRecheckTaskRequest | BatchCusto
         mode = "direct"
     elif mode in {"manual", "explicit"}:
         mode = "specified"
-    elif mode not in {"specified", "pool"}:
+    elif mode not in {"specified", "pool", "dynamic"}:
         mode = "specified" if explicit_proxy else "direct"
+
+    country_code = str(getattr(req, "proxy_country_code", "") or "").strip().upper()
+    if mode == "dynamic" and not country_code:
+        country_code = str(config_store.get("dynamic_proxy_default_country", "") or "").strip().upper()
 
     return {
         "proxy": explicit_proxy,
         "proxy_mode": mode,
-        "proxy_country_code": str(getattr(req, "proxy_country_code", "") or "").strip().upper(),
+        "proxy_country_code": country_code,
         "proxy_failover": bool(getattr(req, "proxy_failover", False)),
         "proxy_max_candidates": int(getattr(req, "proxy_max_candidates", 0) or 0),
         "proxy_min_score": float(getattr(req, "proxy_min_score", 0) or 0),
@@ -1651,7 +1656,7 @@ def _custom_email_proxy_settings(req: CustomEmailRecheckTaskRequest | BatchCusto
 
 def _custom_email_proxy_meta(settings: dict[str, Any]) -> dict[str, Any]:
     mode = str(settings.get("proxy_mode") or "").strip().lower() or "direct"
-    return {
+    meta = {
         "mode": mode,
         "country_code": str(settings.get("proxy_country_code") or "").strip().upper(),
         "failover": bool(settings.get("proxy_failover")),
@@ -1659,6 +1664,10 @@ def _custom_email_proxy_meta(settings: dict[str, Any]) -> dict[str, Any]:
         "min_score": float(settings.get("proxy_min_score") or 0),
         "specified": _redact_proxy_for_task_log(settings.get("proxy")) if mode == "specified" else "",
     }
+    if mode == "dynamic":
+        meta["template"] = _redact_proxy_for_task_log(settings.get("proxy"))
+        meta["template_redacted"] = meta["template"]
+    return meta
 
 
 def _custom_email_account_delay_seconds(value: Any) -> float:
@@ -1672,67 +1681,14 @@ def _custom_email_account_delay_seconds(value: Any) -> float:
 
 
 def _build_custom_email_recheck_candidate_proxies(settings: dict[str, Any] | None) -> list[tuple[str, object | None, str]]:
-    from core.config_store import config_store
-    from core.proxy_pool import proxy_pool as runtime_proxy_pool
-    from core.proxy_utils import normalize_proxy_url
+    from core.proxy_utils import resolve_task_proxy_candidates
 
-    settings = dict(settings or {})
-    explicit_proxy = normalize_proxy_url(settings.get("proxy")) or ""
-    mode = str(settings.get("proxy_mode") or "").strip().lower()
-    if not mode:
-        mode = "specified" if explicit_proxy else "direct"
-    if mode in {"none", "no_proxy", "direct", "直连"}:
-        return [("", None, "direct")]
-    if mode in {"manual", "explicit"}:
-        mode = "specified"
-    if mode not in {"specified", "pool"}:
-        mode = "specified" if explicit_proxy else "direct"
-    if mode == "direct":
-        return [("", None, "direct")]
-
-    country_code = str(settings.get("proxy_country_code") or "").strip().upper()
-    failover = _custom_email_proxy_truthy(settings.get("proxy_failover"), default=False)
-    max_candidates = _custom_email_proxy_positive_int(
-        settings.get("proxy_max_candidates") or config_store.get("proxy_pool_max_candidates", "5"),
-        default=5,
-        minimum=1,
-        maximum=100,
-    )
-    min_score = _custom_email_proxy_positive_float(
-        settings.get("proxy_min_score") or config_store.get("proxy_scan_min_score", "50"),
-        default=50,
-        minimum=0,
-        maximum=100,
-    )
-
-    candidates: list[tuple[str, object | None, str]] = []
-    if mode == "specified":
-        if not explicit_proxy:
-            raise RuntimeError("已选择指定代理模式，但代理地址为空")
-        candidates.append((explicit_proxy, None, "specified"))
-        if not failover:
-            return candidates
-
-    pool_candidates = runtime_proxy_pool.get_candidate_records(
+    return resolve_task_proxy_candidates(
+        dict(settings or {}),
+        fallback_proxy=None,
+        default_mode="direct",
         target="chatgpt",
-        country_code=country_code,
-        limit=max_candidates,
-        min_score=min_score,
     )
-    for candidate in pool_candidates:
-        url = normalize_proxy_url(candidate.get("url")) or ""
-        if not url or any(existing[0] == url for existing in candidates):
-            continue
-        country = str(candidate.get("exit_country_code") or "unknown").strip() or "unknown"
-        score = candidate.get("health_score")
-        latency = int(candidate.get("latency_ms") or 0)
-        source = f"pool country={country} score={score} latency={latency}ms"
-        candidates.append((url, runtime_proxy_pool, source))
-
-    if mode == "pool" and not candidates:
-        country_text = country_code or "不限"
-        raise RuntimeError(f"代理池没有可用候选：target=chatgpt country={country_text} min_score={min_score:g}")
-    return candidates or [("", None, "direct")]
 
 
 def _log_custom_email_proxy_choice(task_id: str, proxy_url: str, source: str, index: int, total: int) -> None:
@@ -2375,9 +2331,9 @@ def _run_icloud_hme_recheck_batch(
                         delete_candidate_reason="",
                         last_task_id=task_id,
                         last_error="",
-                        details={"anonymous_id": anonymous_id, "result": payload, "raw_ok": True},
+                        details={"anonymous_id": anonymous_id, "result": sanitize_task_detail(payload), "raw_ok": True},
                     )
-                    results.append({"email": email, "ok": True, "status": "alive", "saved_account_id": saved_account_id, "access_token_saved": token_saved, "result": payload})
+                    results.append({"email": email, "ok": True, "status": "alive", "saved_account_id": saved_account_id, "access_token_saved": token_saved, "result": sanitize_task_detail(payload)})
                     _log(task_id, f"[OK] HME复测存活: {email} saved_account_id={saved_account_id or '-'}")
                 else:
                     error_text = str(result.get("error") or data.get("message") or payload.get("message") or final_error or "HME复测失败")
@@ -2403,9 +2359,9 @@ def _run_icloud_hme_recheck_batch(
                         delete_candidate_reason=("account_deleted_or_deactivated" if delete_candidate else ""),
                         last_task_id=task_id,
                         last_error=error_text,
-                        details={"anonymous_id": anonymous_id, "result": payload, "raw_ok": False, "account_ids": account_ids},
+                        details={"anonymous_id": anonymous_id, "result": sanitize_task_detail(payload), "raw_ok": False, "account_ids": account_ids},
                     )
-                    results.append({"email": email, "ok": False, "status": next_status, "result_code": result_code, "delete_candidate": delete_candidate, "message": error_text, "result": payload})
+                    results.append({"email": email, "ok": False, "status": next_status, "result_code": result_code, "delete_candidate": delete_candidate, "message": error_text, "result": sanitize_task_detail(payload)})
                     if delete_candidate:
                         _log(task_id, f"[MARK] HME复测确认账号删除/停用，仅标记待删除，不调用 Apple: {email}")
                     else:
@@ -2683,7 +2639,7 @@ def enqueue_batch_probe_local_status_task(
         },
         "limit": int(req.limit or 0),
         "skipped_items": list(skipped_accounts),
-        "params": dict(req.params or {}),
+        "params": sanitize_task_detail(dict(req.params or {})),
     }
     _create_standalone_task_record(
         task_id,
@@ -3101,8 +3057,10 @@ def enqueue_phone_binding_test_task(
             "failover": bool(req.proxy_failover),
             "max_candidates": int(req.proxy_max_candidates or 0),
             "min_score": float(req.proxy_min_score or 0),
-            "specified": redact_proxy_url(req.proxy),
-            "specified_redacted": redact_proxy_url(req.proxy),
+            "specified": redact_proxy_url(req.proxy) if str(req.proxy_mode or "pool").strip().lower() == "specified" else "",
+            "specified_redacted": redact_proxy_url(req.proxy) if str(req.proxy_mode or "pool").strip().lower() == "specified" else "",
+            "template": redact_proxy_url(req.proxy) if str(req.proxy_mode or "pool").strip().lower() == "dynamic" else "",
+            "template_redacted": redact_proxy_url(req.proxy) if str(req.proxy_mode or "pool").strip().lower() == "dynamic" else "",
         },
         "runtime_results": [],
         "bound_phone_lines": [],
@@ -4764,7 +4722,7 @@ def _run_custom_email_recheck(
                             _log(task_id, f"[代理] 当前代理失败，保留当前邮箱重试下一个代理: {error_text[:180]}")
                             continue
                         if payload:
-                            _task_store.update_meta(task_id, {"result": payload})
+                            _task_store.update_meta(task_id, {"result": sanitize_task_detail(payload)})
                         if _is_custom_email_proxy_error(result, error_text):
                             _report_custom_email_proxy_fail(candidate_proxy_pool, candidate_proxy, error_text)
                         final_error = error_text
@@ -4795,7 +4753,7 @@ def _run_custom_email_recheck(
             _task_store.set_progress(task_id, "1/1")
             payload = data.get("custom_email_recheck") if isinstance(data.get("custom_email_recheck"), dict) else {}
             if payload:
-                _task_store.update_meta(task_id, {"result": payload})
+                _task_store.update_meta(task_id, {"result": sanitize_task_detail(payload)})
             saved_account_id = int(data.get("saved_account_id") or payload.get("saved_account_id") or 0)
             has_refresh_token = bool(payload.get("has_refresh_token"))
             _task_timeline_log(
@@ -4824,7 +4782,7 @@ def _run_custom_email_recheck(
                         "email": email,
                         "account_id": saved_account_id,
                         "source": "custom_email_recheck",
-                        "result": payload,
+                        "result": sanitize_task_detail(payload),
                     },
                 ),
             )
@@ -4920,7 +4878,7 @@ def _run_custom_email_recheck(
                     "email": email,
                     "source": "custom_email_recheck",
                     "error": error_text,
-                    "result": payload,
+                    "result": sanitize_task_detail(payload),
                 },
             ),
         )
@@ -5108,7 +5066,7 @@ def _run_batch_custom_email_recheck(
                         "ok": False,
                         "status": result_status,
                         "message": error_text,
-                        "result": payload,
+                        "result": sanitize_task_detail(payload),
                     }
                     results.append(result_item)
                     if result_status == "otp_rate_limited":
@@ -5152,7 +5110,7 @@ def _run_batch_custom_email_recheck(
                         "message": str(payload.get("message") or "账号可登录"),
                         "saved": bool(payload.get("saved") or saved_account_id),
                         "saved_account_id": saved_account_id,
-                        "result": payload,
+                        "result": sanitize_task_detail(payload),
                     }
                     results.append(result_item)
                     _task_timeline_log(
@@ -8505,64 +8463,14 @@ def _run_phone_binding_test(
         return max(minimum, min(maximum, parsed))
 
     def _build_phone_binding_candidate_proxies() -> list[tuple[str, object | None, str]]:
-        from core.config_store import config_store
-        from core.proxy_pool import proxy_pool as runtime_proxy_pool
+        from core.proxy_utils import resolve_task_proxy_candidates
 
-        explicit_proxy = normalize_proxy_url(settings.get("proxy")) or ""
-        # Enqueued UI tasks always pass proxy_mode (default pool).  Older direct
-        # callers/tests may omit it; keep those legacy calls direct unless they
-        # explicitly supplied a proxy.
-        mode = str(settings.get("proxy_mode") or ("specified" if explicit_proxy else "direct")).strip().lower()
-        if mode in {"none", "no_proxy", "direct", "直连"}:
-            return [("", None, "direct")]
-        if mode in {"manual", "explicit"}:
-            mode = "specified"
-        if mode not in {"specified", "pool"}:
-            mode = "specified" if explicit_proxy else "pool"
-
-        country_code = str(settings.get("proxy_country_code") or "").strip().upper()
-        failover = _is_truthy(settings.get("proxy_failover"))
-        max_candidates = _positive_int(
-            settings.get("proxy_max_candidates") or config_store.get("proxy_pool_max_candidates", "5"),
-            default=5,
-            minimum=1,
-            maximum=100,
-        )
-        min_score = _positive_float(
-            settings.get("proxy_min_score") or config_store.get("proxy_scan_min_score", "50"),
-            default=50,
-            minimum=0,
-            maximum=100,
-        )
-
-        candidates: list[tuple[str, object | None, str]] = []
-        if mode == "specified":
-            if not explicit_proxy:
-                raise RuntimeError("已选择指定代理模式，但代理地址为空")
-            candidates.append((explicit_proxy, None, "specified"))
-            if not failover:
-                return candidates
-
-        pool_candidates = runtime_proxy_pool.get_candidate_records(
+        return resolve_task_proxy_candidates(
+            dict(settings or {}),
+            fallback_proxy=None,
+            default_mode="direct",
             target="chatgpt",
-            country_code=country_code,
-            limit=max_candidates,
-            min_score=min_score,
         )
-        for candidate in pool_candidates:
-            url = normalize_proxy_url(candidate.get("url")) or ""
-            if not url or any(existing[0] == url for existing in candidates):
-                continue
-            country = str(candidate.get("exit_country_code") or "unknown").strip() or "unknown"
-            score = candidate.get("health_score")
-            latency = int(candidate.get("latency_ms") or 0)
-            source = f"pool country={country} score={score} latency={latency}ms"
-            candidates.append((url, runtime_proxy_pool, source))
-
-        if mode == "pool" and not candidates:
-            country_text = country_code or "不限"
-            raise RuntimeError(f"代理池没有可用候选：target=chatgpt country={country_text} min_score={min_score:g}")
-        return candidates or [("", None, "direct")]
 
     def _log_phone_binding_proxy_choice(proxy_url: str, source: str, index: int, total_count: int) -> None:
         if proxy_url:
@@ -9970,7 +9878,7 @@ def _run_batch_probe_local_status(task_id: str, account_ids: list[int], params: 
                 success_probe = False
                 last_err = ""
                 for attempt_idx, (proxy_url, proxy_pool, source) in enumerate(candidates, start=1):
-                    proxy_display = proxy_url or "直连"
+                    proxy_display = redact_proxy_url(proxy_url) or "直连"
                     task_log(f" -> [尝试 {attempt_idx}/{len(candidates)}] \n    使用代理: {proxy_display}\n    代理信息: {source}")
                     try:
                         res = sync_chatgpt_account_local_status(session, acc, proxy=proxy_url)
@@ -10162,17 +10070,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
             )
 
         def _redact_proxy_for_log(proxy: Optional[str]) -> str:
-            value = str(proxy or "").strip()
-            if not value:
-                return "direct"
-            if "://" in value:
-                scheme, rest = value.split("://", 1)
-                if "@" in rest:
-                    rest = rest.rsplit("@", 1)[1]
-                    value = f"{scheme}://***:***@{rest}"
-            if len(value) > 120:
-                value = f"{value[:70]}...{value[-30:]}"
-            return value
+            return redact_proxy_url(proxy) or "direct"
 
         def _log_register_proxy_choice(proxy: str, source: str, index: int, total: int) -> None:
             label = str(source or "direct").strip() or "direct"
@@ -10215,81 +10113,28 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
             return max(minimum, min(maximum, parsed))
 
         def _build_register_candidate_proxies() -> list[tuple[str, object | None, str]]:
-            from core.config_store import config_store
-            from core.proxy_pool import proxy_pool as runtime_proxy_pool
+            from core.proxy_utils import resolve_task_proxy_candidates
 
-            explicit_proxy = normalize_proxy_url(req.proxy) or ""
-            extra_proxy_mode = ""
-            extra_proxy_country = ""
-            extra_proxy_failover = None
-            extra_proxy_max_candidates = None
-            extra_proxy_min_score = None
-            if isinstance(req.extra, dict):
-                extra_proxy_mode = str(req.extra.get("proxy_mode") or "").strip()
-                extra_proxy_country = str(req.extra.get("proxy_country_code") or "").strip()
-                extra_proxy_failover = req.extra.get("proxy_failover")
-                extra_proxy_max_candidates = req.extra.get("proxy_max_candidates")
-                extra_proxy_min_score = req.extra.get("proxy_min_score")
+            params = dict(req.extra or {}) if isinstance(req.extra, dict) else {}
+            params["proxy"] = str(req.proxy or params.get("proxy") or params.get("dynamic_proxy_template") or "")
+            params["proxy_mode"] = str(req.proxy_mode or params.get("proxy_mode") or "")
+            params["proxy_country_code"] = str(req.proxy_country_code or params.get("proxy_country_code") or "")
+            params["proxy_failover"] = bool(req.proxy_failover) if req.proxy_failover is not None else params.get("proxy_failover")
+            if req.proxy_max_candidates:
+                params["proxy_max_candidates"] = req.proxy_max_candidates
+            elif params.get("proxy_max_candidates") is None:
+                params.pop("proxy_max_candidates", None)
+            if req.proxy_min_score:
+                params["proxy_min_score"] = req.proxy_min_score
+            elif params.get("proxy_min_score") is None:
+                params.pop("proxy_min_score", None)
 
-            mode = str(req.proxy_mode or extra_proxy_mode or "").strip().lower()
-            if not mode:
-                mode = "specified" if explicit_proxy else "direct"
-            if mode in {"none", "no_proxy", "direct", "直连"}:
-                return [("", None, "direct")]
-            if mode in {"manual", "explicit"}:
-                mode = "specified"
-            if mode not in {"specified", "pool"}:
-                mode = "specified" if explicit_proxy else "direct"
-            if mode == "direct":
-                return [("", None, "direct")]
-
-            country_code = str(req.proxy_country_code or extra_proxy_country or "").strip().upper()
-            failover = _truthy(req.proxy_failover if req.proxy_failover is not None else extra_proxy_failover, default=False)
-            max_candidates = _positive_int(
-                req.proxy_max_candidates
-                or extra_proxy_max_candidates
-                or config_store.get("proxy_pool_max_candidates", "5"),
-                default=5,
-                minimum=1,
-                maximum=100,
-            )
-            min_score = _positive_float(
-                req.proxy_min_score
-                or extra_proxy_min_score
-                or config_store.get("proxy_scan_min_score", "50"),
-                default=50,
-                minimum=0,
-                maximum=100,
-            )
-
-            candidates: list[tuple[str, object | None, str]] = []
-            if mode == "specified":
-                if not explicit_proxy:
-                    raise RuntimeError("已选择指定代理模式，但代理地址为空")
-                candidates.append((explicit_proxy, None, "specified"))
-                if not failover:
-                    return candidates
-
-            pool_candidates = runtime_proxy_pool.get_candidate_records(
+            return resolve_task_proxy_candidates(
+                params,
+                fallback_proxy=None,
+                default_mode="direct",
                 target="chatgpt",
-                country_code=country_code,
-                limit=max_candidates,
-                min_score=min_score,
             )
-            for candidate in pool_candidates:
-                url = normalize_proxy_url(candidate.get("url")) or ""
-                if not url or any(existing[0] == url for existing in candidates):
-                    continue
-                country = str(candidate.get("exit_country_code") or "unknown").strip() or "unknown"
-                score = candidate.get("health_score")
-                latency = int(candidate.get("latency_ms") or 0)
-                source = f"pool country={country} score={score} latency={latency}ms"
-                candidates.append((url, runtime_proxy_pool, source))
-
-            if mode == "pool" and not candidates:
-                country_text = country_code or "不限"
-                raise RuntimeError(f"代理池没有可用候选：target=chatgpt country={country_text} min_score={min_score:g}")
-            return candidates or [("", None, "direct")]
 
         def _select_phone_signup_lines_for_attempt(raw_lines: Any, attempt_index: int) -> str:
             lines = [

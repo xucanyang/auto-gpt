@@ -24,6 +24,11 @@ CONFIG_KEYS = [
     "proxy_scan_only_active",
     "proxy_scan_min_score",
     "proxy_pool_max_candidates",
+    "dynamic_proxy_template",
+    "dynamic_proxy_default_country",
+    "dynamic_proxy_require_country_match",
+    "dynamic_proxy_probe_timeout_seconds",
+    "dynamic_proxy_probe_enabled",
     "duckmail_api_url",
     "duckmail_provider_url",
     "duckmail_bearer",
@@ -385,6 +390,16 @@ def get_config():
         all_cfg["proxy_scan_min_score"] = "50"
     if not all_cfg.get("proxy_pool_max_candidates"):
         all_cfg["proxy_pool_max_candidates"] = "5"
+    if not all_cfg.get("dynamic_proxy_template"):
+        all_cfg["dynamic_proxy_template"] = ""
+    if not all_cfg.get("dynamic_proxy_default_country"):
+        all_cfg["dynamic_proxy_default_country"] = "JP"
+    if not all_cfg.get("dynamic_proxy_require_country_match"):
+        all_cfg["dynamic_proxy_require_country_match"] = "true"
+    if not all_cfg.get("dynamic_proxy_probe_timeout_seconds"):
+        all_cfg["dynamic_proxy_probe_timeout_seconds"] = "8"
+    if not all_cfg.get("dynamic_proxy_probe_enabled"):
+        all_cfg["dynamic_proxy_probe_enabled"] = "true"
     if "chatgpt_save_registration_access_token_account" not in all_cfg:
         all_cfg["chatgpt_save_registration_access_token_account"] = "true"
     if not all_cfg.get("icloud_hme_mode"):

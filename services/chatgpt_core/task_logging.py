@@ -65,7 +65,7 @@ _COOKIE_KEYS = {
     "login_session",
     "loginsession",
 }
-_PROXY_KEYS = {"proxy", "proxy_url", "proxyurl", "proxy_used", "proxyused", "specified"}
+_PROXY_KEYS = {"proxy", "proxy_url", "proxyurl", "proxy_used", "proxyused", "specified", "proxy_template", "proxytemplate", "dynamic_proxy_template", "dynamicproxytemplate", "runtime_proxy", "runtimeproxy"}
 _URL_KEYS = {
     "api_url",
     "apiurl",

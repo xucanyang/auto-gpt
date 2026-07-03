@@ -430,23 +430,29 @@ export function RegisterTaskModal({
                 { value: 'direct', label: '直连' },
                 { value: 'pool', label: '使用代理池' },
                 { value: 'specified', label: '指定代理' },
+                { value: 'dynamic', label: '动态代理' },
               ]}
             />
           </Form.Item>
-          {proxyMode === 'specified' ? (
+          {proxyMode === 'specified' || proxyMode === 'dynamic' ? (
             <Space style={{ width: '100%' }} align="start">
-              <Form.Item name="proxy" label="指定代理" style={{ flex: 1 }}>
-                <Input placeholder="http://user:pass@host:port" />
+              <Form.Item
+                name="proxy"
+                label={proxyMode === 'dynamic' ? '动态代理模板' : '指定代理'}
+                style={{ flex: 1 }}
+                rules={proxyMode === 'dynamic' ? [{ required: true, message: '请输入动态代理模板' }] : undefined}
+              >
+                <Input placeholder={proxyMode === 'dynamic' ? 'socks5://user-region-JP-sid-xxxx-t-1:pass@host:port' : 'http://user:pass@host:port'} />
               </Form.Item>
               <Form.Item name="proxy_failover" label="失败处理" valuePropName="checked" style={{ width: 180 }} initialValue={false}>
-                <Checkbox>失败后切换代理池</Checkbox>
+                <Checkbox>{proxyMode === 'dynamic' ? '失败后刷新 sid 重试' : '失败后切换代理池'}</Checkbox>
               </Form.Item>
             </Space>
           ) : null}
-          {proxyMode === 'pool' || (proxyMode === 'specified' && proxyFailover) ? (
+          {proxyMode === 'pool' || proxyMode === 'dynamic' || (proxyMode === 'specified' && proxyFailover) ? (
             <Space style={{ width: '100%' }} align="start">
               <Form.Item name="proxy_country_code" label="出口国家" style={{ flex: 1 }}>
-                <Input placeholder="不限，或填 US / JP / SG" />
+                <Input placeholder={proxyMode === 'dynamic' ? '必填，例如 US / JP / SG' : '不限，或填 US / JP / SG'} maxLength={2} />
               </Form.Item>
               <Form.Item name="proxy_min_score" label="最低健康分" initialValue={50} style={{ width: 150 }}>
                 <InputNumber min={0} max={100} precision={0} style={{ width: '100%' }} />
@@ -461,7 +467,7 @@ export function RegisterTaskModal({
             showIcon
             style={{ marginBottom: 12 }}
             message="代理模式说明"
-            description="直连不会使用代理池；指定代理只用填写的节点；使用代理池会按健康分、冷却状态和实测出口国家挑选候选。"
+            description="直连不使用代理；指定代理默认只用填写节点，勾选失败切换后回退代理池；代理池按健康分、冷却和实测出口国家挑选；动态代理会按出口国家改写 region 并刷新 sid，失败后可生成新 sid 重试。"
           />
           {currentPlatform === 'chatgpt' && isPhoneSignup ? (
             <Alert

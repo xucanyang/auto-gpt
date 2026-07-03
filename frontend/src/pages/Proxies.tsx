@@ -67,6 +67,11 @@ interface ConfigPayload {
   proxy_scan_only_active?: boolean | string
   proxy_scan_min_score?: string
   proxy_pool_max_candidates?: string
+  dynamic_proxy_template?: string
+  dynamic_proxy_default_country?: string
+  dynamic_proxy_probe_enabled?: boolean | string
+  dynamic_proxy_require_country_match?: boolean | string
+  dynamic_proxy_probe_timeout_seconds?: string
 }
 
 interface ProxyScanJob {
@@ -239,6 +244,11 @@ export default function Proxies() {
   const [scanTimeoutSeconds, setScanTimeoutSeconds] = useState(8)
   const [scanMinScore, setScanMinScore] = useState(50)
   const [poolMaxCandidates, setPoolMaxCandidates] = useState(5)
+  const [dynamicProxyTemplate, setDynamicProxyTemplate] = useState('')
+  const [dynamicProxyCountry, setDynamicProxyCountry] = useState('JP')
+  const [dynamicProxyProbe, setDynamicProxyProbe] = useState(true)
+  const [dynamicPreviewLoading, setDynamicPreviewLoading] = useState(false)
+  const [dynamicPreviewResult, setDynamicPreviewResult] = useState<Record<string, any> | null>(null)
   const [scanJob, setScanJob] = useState<ProxyScanJob | null>(null)
   const scanPollTimerRef = useRef<number | null>(null)
   const [schedulerStatus, setSchedulerStatus] = useState<Record<string, unknown> | null>(null)
@@ -341,6 +351,9 @@ export default function Proxies() {
       setScanTimeoutSeconds(Math.max(2, Number(cfg?.proxy_scan_timeout_seconds || 8) || 8))
       setScanMinScore(Math.max(0, Number(cfg?.proxy_scan_min_score || 50) || 50))
       setPoolMaxCandidates(Math.max(1, Number(cfg?.proxy_pool_max_candidates || 5) || 5))
+      setDynamicProxyTemplate(String(cfg?.dynamic_proxy_template || ''))
+      setDynamicProxyCountry(String(cfg?.dynamic_proxy_default_country || 'JP').trim().toUpperCase() || 'JP')
+      setDynamicProxyProbe(String(cfg?.dynamic_proxy_probe_enabled ?? 'true').trim().toLowerCase() !== 'false')
       try {
         const scheduler = await apiFetch('/proxies/scan-scheduler/status') as Record<string, unknown>
         setSchedulerStatus(scheduler)
@@ -644,6 +657,45 @@ export default function Proxies() {
       message.error(error instanceof Error ? error.message : '保存代理扫描设置失败')
     } finally {
       setSavingScanSetting(false)
+    }
+  }
+
+  const previewDynamicProxy = async () => {
+    const template = dynamicProxyTemplate.trim()
+    const country = dynamicProxyCountry.trim().toUpperCase()
+    if (!template) {
+      message.warning('请填写动态代理模板')
+      return
+    }
+    if (!country) {
+      message.warning('请填写出口国家')
+      return
+    }
+    setDynamicPreviewLoading(true)
+    try {
+      const result = await apiFetch('/proxies/dynamic-preview', {
+        method: 'POST',
+        body: JSON.stringify({
+          proxy: template,
+          country_code: country,
+          refresh_sid: true,
+          probe: dynamicProxyProbe,
+          require_country_match: true,
+          timeout_seconds: scanTimeoutSeconds,
+        }),
+      }) as Record<string, any>
+      setDynamicPreviewResult(result)
+      if (result.ok) {
+        message.success(result.match ? `动态代理出口匹配 ${country}` : '动态代理模板解析成功')
+      } else {
+        message.warning(String(result.message || '动态代理预览未通过'))
+      }
+    } catch (error) {
+      const text = error instanceof Error ? error.message : '动态代理预览失败'
+      setDynamicPreviewResult({ ok: false, message: text })
+      message.error(text)
+    } finally {
+      setDynamicPreviewLoading(false)
     }
   }
 
@@ -1024,8 +1076,58 @@ export default function Proxies() {
             <InputNumber min={1} max={100} value={poolMaxCandidates} onChange={(value) => setPoolMaxCandidates(Number(value || 5))} addonBefore="候选数" />
           </Space>
           <Typography.Text type="secondary">
-            自动扫描目标固定为基础连通、出口国家和 ChatGPT 首页；注册任务使用代理池时会按这里的最低健康分和候选数挑选。
+            自动扫描目标固定为基础连通、出口国家和 ChatGPT 首页；注册任务使用代理池时按这里的最低健康分和候选数挑选，动态代理模式用候选数控制 sid 重试次数。
           </Typography.Text>
+        </Space>
+      </Card>
+
+      <Card title="动态代理预览">
+        <Space direction="vertical" size={12} style={{ width: '100%' }}>
+          <Alert
+            type="info"
+            showIcon
+            message="动态代理不是本地代理池记录"
+            description="输入包含 region-XX / sid-xxx-t- 的模板，系统会按出口国家改写 region 并刷新 sid；预览和日志只展示脱敏地址。"
+          />
+          <Space wrap align="start" style={{ width: '100%' }}>
+            <Input.Password
+              value={dynamicProxyTemplate}
+              onChange={(event) => setDynamicProxyTemplate(event.target.value)}
+              placeholder="socks5://user-region-JP-sid-xxxx-t-1:pass@host:port"
+              style={{ width: isMobile ? '100%' : 520 }}
+            />
+            <Input
+              value={dynamicProxyCountry}
+              onChange={(event) => setDynamicProxyCountry(event.target.value.trim().toUpperCase())}
+              placeholder="US / JP / SG"
+              maxLength={2}
+              style={{ width: 120 }}
+            />
+            <Checkbox checked={dynamicProxyProbe} onChange={(event) => setDynamicProxyProbe(event.target.checked)}>实测出口</Checkbox>
+            <Button type="primary" icon={<ThunderboltOutlined />} loading={dynamicPreviewLoading} onClick={() => void previewDynamicProxy()}>
+              预览动态出口
+            </Button>
+          </Space>
+          {dynamicPreviewResult ? (
+            <Descriptions size="small" bordered column={isMobile ? 1 : 3}>
+              <Descriptions.Item label="结果">
+                <Tag color={dynamicPreviewResult.ok ? 'success' : 'error'}>{dynamicPreviewResult.ok ? '通过' : '未通过'}</Tag>
+              </Descriptions.Item>
+              <Descriptions.Item label="期望国家">{dynamicPreviewResult.expected_country || dynamicProxyCountry || '-'}</Descriptions.Item>
+              <Descriptions.Item label="实测国家">{dynamicPreviewResult.actual_country || (dynamicPreviewResult.probe_enabled ? '-' : '未探测')}</Descriptions.Item>
+              <Descriptions.Item label="出口 IP">{dynamicPreviewResult.exit_ip || '-'}</Descriptions.Item>
+              <Descriptions.Item label="Provider">{dynamicPreviewResult.provider || '-'}</Descriptions.Item>
+              <Descriptions.Item label="sid">{dynamicPreviewResult.sid_refreshed ? '已刷新' : '未刷新/无 sid'}</Descriptions.Item>
+              <Descriptions.Item label="运行代理" span={isMobile ? 1 : 3}>
+                <Typography.Text code copyable={Boolean(dynamicPreviewResult.runtime_proxy_redacted)}>
+                  {dynamicPreviewResult.runtime_proxy_redacted || dynamicPreviewResult.proxy || '-'}
+                </Typography.Text>
+              </Descriptions.Item>
+              {dynamicPreviewResult.message ? (
+                <Descriptions.Item label="说明" span={isMobile ? 1 : 3}>{String(dynamicPreviewResult.message)}</Descriptions.Item>
+              ) : null}
+            </Descriptions>
+          ) : null}
         </Space>
       </Card>
 

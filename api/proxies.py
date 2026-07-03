@@ -7,7 +7,7 @@ from sqlmodel import Session, select
 from pydantic import BaseModel, Field
 from core.db import ProxyModel, get_session
 from core.proxy_pool import proxy_pool
-from services.proxy_scanner import calculate_health_score, mask_proxy_url, parse_proxy_endpoint, proxy_scan_manager
+from services.proxy_scanner import calculate_health_score, mask_proxy_url, parse_proxy_endpoint, proxy_scan_manager, scan_proxy_url
 from services import proxy_scan_scheduler
 
 router = APIRouter(prefix="/proxies", tags=["proxies"])
@@ -53,6 +53,15 @@ class ProxyCandidateRequest(BaseModel):
 
 class ProxySnapshotRequest(BaseModel):
     ids: list[int] = Field(default_factory=list)
+
+
+class DynamicProxyPreviewRequest(BaseModel):
+    proxy: str = ""
+    country_code: str = ""
+    refresh_sid: bool = True
+    probe: bool = True
+    require_country_match: bool | None = None
+    timeout_seconds: int = 8
 
 
 def _apply_proxy_metadata(proxy: ProxyModel, body: ProxyCreate | ProxyBulkCreate) -> None:
@@ -357,6 +366,91 @@ def get_proxy_candidates(body: ProxyCandidateRequest):
             min_score=body.min_score,
         )
     }
+
+
+@router.post("/dynamic-preview")
+def dynamic_proxy_preview(body: DynamicProxyPreviewRequest):
+    from core.config_store import config_store
+    from core.dynamic_proxy import resolve_dynamic_proxy_template, redact_proxy_url
+    from core.proxy_utils import normalize_proxy_url
+
+    template = str(body.proxy or config_store.get("dynamic_proxy_template", "") or "").strip()
+    country_code = str(body.country_code or config_store.get("dynamic_proxy_default_country", "") or "").strip().upper()
+    if not template:
+        raise HTTPException(400, "动态代理模板不能为空")
+    if not country_code:
+        raise HTTPException(400, "出口国家不能为空")
+
+    try:
+        resolved = resolve_dynamic_proxy_template(
+            template,
+            country_code,
+            refresh_sid=bool(body.refresh_sid),
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    runtime_proxy = normalize_proxy_url(resolved.proxy_url) or ""
+    runtime_redacted = mask_proxy_url(runtime_proxy)
+    timeout = max(2, min(60, int(body.timeout_seconds or config_store.get("dynamic_proxy_probe_timeout_seconds", "8") or 8)))
+    require_match = body.require_country_match
+    if require_match is None:
+        require_match = str(config_store.get("dynamic_proxy_require_country_match", "true") or "true").strip().lower() not in {"0", "false", "no", "off"}
+
+    response: dict[str, Any] = {
+        "ok": True,
+        "provider": resolved.provider,
+        "expected_country": resolved.requested_country_code,
+        "template_country": resolved.template_country_code,
+        "declared_country": resolved.resolved_country_code,
+        "sid_refreshed": bool(resolved.sid_refreshed),
+        "template_redacted": resolved.redacted_template,
+        "proxy": runtime_redacted,
+        "runtime_proxy_redacted": runtime_redacted,
+        "normalized_proxy_redacted": redact_proxy_url(runtime_proxy),
+        "probe_enabled": bool(body.probe),
+        "require_country_match": bool(require_match),
+        "actual_country": "",
+        "exit_ip": "",
+        "match": False,
+        "latency_ms": 0,
+    }
+
+    if not body.probe:
+        response["match"] = False
+        response["message"] = "已生成动态代理；未执行出口探测"
+        return response
+
+    summary = scan_proxy_url(runtime_proxy, targets=["basic", "geo"], timeout_seconds=timeout, refresh_geo=True)
+    basic = summary.get("basic") if isinstance(summary.get("basic"), dict) else {}
+    geo = summary.get("geo") if isinstance(summary.get("geo"), dict) else {}
+    exit_ip = str((basic or {}).get("exit_ip") or "").strip()
+    actual_country = str((geo or {}).get("country_code") or "").strip().upper()
+    response.update(
+        {
+            "exit_ip": exit_ip,
+            "actual_country": actual_country,
+            "match": bool(actual_country and actual_country == resolved.requested_country_code),
+            "latency_ms": int((basic or {}).get("latency_ms") or summary.get("duration_ms") or 0),
+            "probe": {
+                "basic_ok": bool((basic or {}).get("ok")),
+                "geo_ok": bool((geo or {}).get("ok")),
+                "basic_error_code": str((basic or {}).get("error_code") or ""),
+                "basic_error": str((basic or {}).get("error") or "")[:200],
+                "geo_error_code": str((geo or {}).get("error_code") or ""),
+                "geo_error": str((geo or {}).get("error") or "")[:200],
+            },
+        }
+    )
+    if not (basic or {}).get("ok"):
+        response["ok"] = False
+        response["message"] = str((basic or {}).get("error") or "动态代理基础连通性探测失败")[:200]
+    elif require_match and not response["match"]:
+        response["ok"] = False
+        response["message"] = f"出口国家不匹配：期望 {resolved.requested_country_code}，实测 {actual_country or 'unknown'}"
+    else:
+        response["message"] = "动态代理出口探测完成"
+    return response
 
 
 @router.get("/scan-scheduler/status")

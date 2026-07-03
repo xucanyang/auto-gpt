@@ -40,7 +40,7 @@ const SUB2API_IMPORT_MAX_BYTES = 5 * 1024 * 1024
 
 type TaskStatus = 'pending' | 'running' | 'done' | 'failed' | 'stopped'
 type BulkInputMode = 'email_list' | 'sub2api_json'
-type ProxyMode = 'direct' | 'pool' | 'specified'
+type ProxyMode = 'direct' | 'pool' | 'specified' | 'dynamic'
 
 function normalizeTaskStatus(value: unknown): TaskStatus {
   const normalized = String(value || '').trim().toLowerCase()
@@ -250,7 +250,7 @@ function buildProxyPayload(values: any) {
   const mode = String(values?.proxy_mode || 'pool').trim() as ProxyMode
   const proxy = String(values?.proxy || '').trim()
   return {
-    proxy: mode === 'specified' ? (proxy || null) : null,
+    proxy: mode === 'specified' || mode === 'dynamic' ? (proxy || null) : null,
     proxy_mode: mode || 'pool',
     proxy_country_code: String(values?.proxy_country_code || '').trim().toUpperCase(),
     proxy_failover: Boolean(values?.proxy_failover),
@@ -717,30 +717,31 @@ export default function CustomEmailRecheckPage() {
                         { value: 'direct', label: '直连' },
                         { value: 'pool', label: '使用代理池' },
                         { value: 'specified', label: '指定代理' },
+                        { value: 'dynamic', label: '动态代理' },
                       ]}
                     />
                   </Form.Item>
 
-                  {proxyMode === 'specified' ? (
+                  {proxyMode === 'specified' || proxyMode === 'dynamic' ? (
                     <Space style={{ width: '100%' }} align="start" wrap>
                       <Form.Item
                         name="proxy"
-                        label="指定代理"
+                        label={proxyMode === 'dynamic' ? '动态代理模板' : '指定代理'}
                         style={{ flex: '1 1 320px' }}
-                        rules={[{ required: true, message: '请输入指定代理地址' }]}
+                        rules={[{ required: true, message: proxyMode === 'dynamic' ? '请输入动态代理模板' : '请输入指定代理地址' }]}
                       >
-                        <Input size="large" placeholder="http://user:pass@host:port" />
+                        <Input size="large" placeholder={proxyMode === 'dynamic' ? 'socks5://user-region-JP-sid-xxxx-t-1:pass@host:port' : 'http://user:pass@host:port'} />
                       </Form.Item>
                       <Form.Item name="proxy_failover" label="失败处理" valuePropName="checked" style={{ width: 190 }}>
-                        <Checkbox>失败后切换代理池</Checkbox>
+                        <Checkbox>{proxyMode === 'dynamic' ? '失败后刷新 sid 重试' : '失败后切换代理池'}</Checkbox>
                       </Form.Item>
                     </Space>
                   ) : null}
 
-                  {proxyMode === 'pool' || (proxyMode === 'specified' && proxyFailover) ? (
+                  {proxyMode === 'pool' || proxyMode === 'dynamic' || (proxyMode === 'specified' && proxyFailover) ? (
                     <Space style={{ width: '100%' }} align="start" wrap>
                       <Form.Item name="proxy_country_code" label="出口国家" style={{ flex: '1 1 180px' }}>
-                        <Input size="large" placeholder="不限，或填 US / JP / SG" />
+                        <Input size="large" placeholder={proxyMode === 'dynamic' ? '必填，例如 US / JP / SG' : '不限，或填 US / JP / SG'} maxLength={2} />
                       </Form.Item>
                       <Form.Item name="proxy_min_score" label="最低健康分" style={{ width: 150 }}>
                         <InputNumber min={0} max={100} precision={0} style={{ width: '100%' }} />
@@ -764,7 +765,7 @@ export default function CustomEmailRecheckPage() {
                     type="info"
                     style={{ marginBottom: 18 }}
                     message="这个入口只做登录测活"
-                    description="代理模式与注册一致：直连不碰代理池，指定代理只用填写的节点，勾选失败切换后再回退代理池；使用代理池会按健康分、冷却状态和实测出口国家挑选候选。"
+                    description="代理模式与注册一致：直连不碰代理；指定代理默认只用填写节点，勾选失败切换后回退代理池；代理池按健康分、冷却和实测出口国家挑选；动态代理按出口国家改写 region 并刷新 sid。"
                   />
 
                   <Space wrap>

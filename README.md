@@ -61,8 +61,19 @@ ChatGPT 账号自动注册与管理系统，支持 Web UI 管理、批量注册�
 - **多执行器模式**：纯协议、无头浏览器、有头浏览器
 - **多邮箱服务接入**：支持内置、第三方、自建 Worker 邮箱等多种方案
 - **验证码支持**：YesCaptcha、本地 Turnstile Solver（Camoufox）
-- **代理能力**：代理池轮询、代理状态维护、注册过程代理接入
+- **代理能力**：代理池轮询、代理状态维护、注册过程代理接入、动态代理按需改写出口国家
 - **批量注册**：支持注册数量、并发数、每个账号启动延迟设置
+
+### 动态代理模式
+
+除 `direct` / `specified` / `pool` 外，任务代理模式新增 `dynamic`。该模式不把动态模板混入本地代理池表，而是按任务参数实时生成运行代理：
+
+- `proxy`：动态代理模板，需包含 `region-XX`；支持类似 `socks5://user-region-JP-sid-xxxx-t-1:pass@host:port` 的用户名内嵌国家格式。
+- `proxy_country_code`：目标出口国家，两位 ISO 代码，例如 `US`、`JP`、`SG`。
+- `proxy_failover`：开启后按 `proxy_max_candidates` 生成多个新 `sid` 候选，网络失败时切换下一候选。
+- `dynamic_proxy_probe_enabled` / `dynamic_proxy_require_country_match`：全局配置中可控制是否运行前探测出口，以及实测国家不匹配时是否严格失败。
+
+运行顺序为：改写 `region-XX` → 刷新 `sid-xxx-t-` → 保留现有 cliproxy `socks5://` 到 `http://` 的运行兼容 → 按需探测出口 IP/国家。日志、任务 meta 与预览接口只展示脱敏代理，不保存完整认证信息。
 - **实时日志**：前端实时查看注册日志
 - **任务历史管理**：支持历史记录查看与批量删除
 - **插件化扩展**：可按需接入外部服务和独立管理端

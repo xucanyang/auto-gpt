@@ -1,0 +1,110 @@
+import pytest
+from fastapi import HTTPException
+
+from core.dynamic_proxy import declared_proxy_region, resolve_dynamic_proxy_template
+from core.proxy_utils import resolve_probe_candidate_proxies
+from services.chatgpt_core.task_logging import sanitize_task_detail
+
+
+TEMPLATE = "socks5://acct-region-JP-sid-oldsid-t-1:secret@example.cliproxy.io:3010"
+
+
+def test_dynamic_proxy_rewrites_region_refreshes_sid_and_redacts_credentials():
+    resolved = resolve_dynamic_proxy_template(TEMPLATE, "us", refresh_sid=True)
+
+    assert resolved.requested_country_code == "US"
+    assert resolved.template_country_code == "JP"
+    assert declared_proxy_region(resolved.proxy_url) == "US"
+    assert "region-US" in resolved.proxy_url
+    assert "sid-oldsid-t-" not in resolved.proxy_url
+    assert resolved.sid_refreshed is True
+    assert "secret" not in resolved.redacted_proxy_url
+    assert "acct-region" not in resolved.redacted_proxy_url
+
+
+def test_dynamic_proxy_requires_region_marker():
+    with pytest.raises(ValueError, match="region-XX"):
+        resolve_dynamic_proxy_template("http://user:pass@127.0.0.1:8080", "US")
+
+
+def test_dynamic_proxy_requires_two_letter_country():
+    with pytest.raises(ValueError, match="两位 ISO"):
+        resolve_dynamic_proxy_template(TEMPLATE, "USA")
+
+
+def test_resolve_probe_candidate_proxies_dynamic_generates_fresh_normalized_candidates():
+    candidates = resolve_probe_candidate_proxies(
+        {
+            "proxy_mode": "dynamic",
+            "proxy": TEMPLATE,
+            "proxy_country_code": "US",
+            "proxy_failover": True,
+            "proxy_max_candidates": 3,
+            "dynamic_proxy_probe_enabled": False,
+        }
+    )
+
+    assert len(candidates) == 3
+    urls = [item[0] for item in candidates]
+    assert len(set(urls)) == 3
+    for url, pool, source in candidates:
+        assert pool is None
+        assert url.startswith("http://")  # cliproxy socks5 is normalized after dynamic rewrite
+        assert "region-US" in url
+        assert "sid-oldsid-t-" not in url
+        assert "dynamic country=US" in source
+        assert "probe=disabled" in source
+
+
+def test_specified_mode_does_not_rewrite_region_or_sid():
+    proxy = "http://acct-region-JP-sid-oldsid-t-1:secret@example.cliproxy.io:3010"
+    candidates = resolve_probe_candidate_proxies(
+        {
+            "proxy_mode": "specified",
+            "proxy": proxy,
+            "proxy_country_code": "US",
+        }
+    )
+
+    assert candidates == [(proxy, None, "specified")]
+
+
+def test_dynamic_proxy_template_key_is_redacted_in_task_detail():
+    safe = sanitize_task_detail({"params": {"dynamic_proxy_template": TEMPLATE}})
+    dumped = str(safe)
+    assert "secret" not in dumped
+    assert "acct-region" not in dumped
+    assert "***:***@example.cliproxy.io:3010" in dumped
+
+
+def test_dynamic_preview_response_never_returns_raw_credentials():
+    from api.proxies import DynamicProxyPreviewRequest, dynamic_proxy_preview
+
+    result = dynamic_proxy_preview(
+        DynamicProxyPreviewRequest(
+            proxy=TEMPLATE,
+            country_code="US",
+            refresh_sid=True,
+            probe=False,
+        )
+    )
+    dumped = str(result)
+    assert result["ok"] is True
+    assert result["expected_country"] == "US"
+    assert "runtime_proxy_redacted" in result
+    assert "secret" not in dumped
+    assert "acct-region" not in dumped
+
+
+def test_dynamic_preview_rejects_missing_region_marker():
+    from api.proxies import DynamicProxyPreviewRequest, dynamic_proxy_preview
+
+    with pytest.raises(HTTPException) as exc:
+        dynamic_proxy_preview(
+            DynamicProxyPreviewRequest(
+                proxy="http://user:pass@127.0.0.1:8080",
+                country_code="US",
+                probe=False,
+            )
+        )
+    assert exc.value.status_code == 400

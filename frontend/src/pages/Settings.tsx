@@ -99,6 +99,17 @@ const TAB_ITEMS = [
           { key: 'default_executor', label: '执行器类型', type: 'select' },
         ],
       },
+      {
+        title: '动态代理',
+        desc: '按任务出口国家改写 region 并刷新 sid',
+        fields: [
+          { key: 'dynamic_proxy_template', label: '默认动态代理模板', secret: true, placeholder: 'socks5://user-region-JP-sid-xxxx-t-1:pass@host:port' },
+          { key: 'dynamic_proxy_default_country', label: '默认出口国家', placeholder: 'JP' },
+          { key: 'dynamic_proxy_require_country_match', label: '要求实测国家匹配', type: 'boolean' },
+          { key: 'dynamic_proxy_probe_enabled', label: '运行前探测出口', type: 'boolean' },
+          { key: 'dynamic_proxy_probe_timeout_seconds', label: '探测超时秒数', placeholder: '8' },
+        ],
+      },
     ],
   },
   {
@@ -1038,7 +1049,17 @@ function ConfigField({ field }: { field: FieldConfig }) {
   const options = SELECT_FIELDS[field.key]
   const isBooleanField = field.type === 'boolean'
   const helpText =
-    field.key === 'default_executor'
+    field.key === 'dynamic_proxy_template'
+      ? '可选全局模板。动态代理模式会先按任务的出口国家改写 region-XX，再刷新 sid-xxx-t-；展示和日志只保存脱敏地址。'
+      : field.key === 'dynamic_proxy_default_country'
+        ? '任务未填写出口国家时使用的两位 ISO 国家码，例如 JP、US、SG。'
+      : field.key === 'dynamic_proxy_require_country_match'
+        ? '开启后，动态代理实测出口国家与声明国家不一致会直接失败，不会继续用错国家。'
+      : field.key === 'dynamic_proxy_probe_enabled'
+        ? '开启后任务生成动态代理候选时先探测出口 IP/国家；关闭后只做模板改写和 sid 刷新。'
+      : field.key === 'dynamic_proxy_probe_timeout_seconds'
+        ? '动态代理出口探测超时，建议 6-12 秒。'
+      : field.key === 'default_executor'
       ? '当前仅对 ChatGPT 生效；支持纯协议、无头浏览器和有头浏览器模式。'
       : field.key === 'icloud_cookie'
         ? '从浏览器打开 www.icloud.com，进入 DevTools，找到发往 setup.icloud.com 或 /hme/ 的请求，把完整 Cookie 请求头原样复制到这里。不要删任何字段。'
@@ -3600,6 +3621,14 @@ export default function Settings() {
           ? true
           : parseBooleanConfigValue(data.tempmail_archive_cleanup_pause_active_tasks)
       data.proxy_pool_cooldown_enabled = data.proxy_pool_cooldown_enabled === '' ? true : parseBooleanConfigValue(data.proxy_pool_cooldown_enabled)
+      if (!data.dynamic_proxy_default_country) {
+        data.dynamic_proxy_default_country = 'JP'
+      }
+      if (!data.dynamic_proxy_probe_timeout_seconds) {
+        data.dynamic_proxy_probe_timeout_seconds = '8'
+      }
+      data.dynamic_proxy_require_country_match = data.dynamic_proxy_require_country_match === '' ? true : parseBooleanConfigValue(data.dynamic_proxy_require_country_match)
+      data.dynamic_proxy_probe_enabled = data.dynamic_proxy_probe_enabled === '' ? true : parseBooleanConfigValue(data.dynamic_proxy_probe_enabled)
       data.cfworker_domains = parseStoredDomainList(data.cfworker_domains)
       data.cfworker_enabled_domains = parseStoredDomainList(data.cfworker_enabled_domains)
       data.cfworker_random_subdomain = parseBooleanConfigValue(data.cfworker_random_subdomain)
@@ -3762,6 +3791,16 @@ export default function Settings() {
         values.tempmail_archive_cleanup_backup_path || '/runtime/tempmail_email_backups.db',
       ).trim() || '/runtime/tempmail_email_backups.db'
       values.proxy_pool_cooldown_enabled = parseBooleanConfigValue(values.proxy_pool_cooldown_enabled)
+      values.dynamic_proxy_template = String(values.dynamic_proxy_template || '').trim()
+      values.dynamic_proxy_default_country = String(values.dynamic_proxy_default_country || 'JP').trim().toUpperCase() || 'JP'
+      values.dynamic_proxy_require_country_match = parseBooleanConfigValue(values.dynamic_proxy_require_country_match)
+      values.dynamic_proxy_probe_enabled = parseBooleanConfigValue(values.dynamic_proxy_probe_enabled)
+      values.dynamic_proxy_probe_timeout_seconds = String(
+        Math.max(
+          2,
+          Math.min(60, Number.parseInt(String(values.dynamic_proxy_probe_timeout_seconds || '8'), 10) || 8),
+        ),
+      )
       values.tempmail_mode = values.tempmail_mode || 'fixed_domain'
       values.contribution_enabled = parseBooleanConfigValue(values.contribution_enabled)
       values.chatgpt_enable_team_invite = parseBooleanConfigValue(values.chatgpt_enable_team_invite)
@@ -3867,6 +3906,11 @@ export default function Settings() {
         tempmail_archive_cleanup_pause_active_tasks: values.tempmail_archive_cleanup_pause_active_tasks,
         tempmail_archive_cleanup_mailbox: values.tempmail_archive_cleanup_mailbox,
         tempmail_archive_cleanup_backup_path: values.tempmail_archive_cleanup_backup_path,
+        dynamic_proxy_template: values.dynamic_proxy_template,
+        dynamic_proxy_default_country: values.dynamic_proxy_default_country,
+        dynamic_proxy_require_country_match: values.dynamic_proxy_require_country_match,
+        dynamic_proxy_probe_enabled: values.dynamic_proxy_probe_enabled,
+        dynamic_proxy_probe_timeout_seconds: values.dynamic_proxy_probe_timeout_seconds,
         contribution_enabled: values.contribution_enabled,
         chatgpt_enable_team_invite: values.chatgpt_enable_team_invite,
         chatgpt_team_invite_deferred_activation: values.chatgpt_team_invite_deferred_activation,
