@@ -990,10 +990,7 @@ def _resolve_baxigpt_cdk_submit_accounts(
                 "status": str(account.status or ""),
             }
             matched.append(item)
-            ineligible_reason = _baxigpt_cdk_ineligible_reason(account)
-            if ineligible_reason:
-                skipped.append({**item, "reason": f"本地标记没有资格: {ineligible_reason}"})
-            elif not _chatgpt_account_access_token(account):
+            if not _chatgpt_account_access_token(account):
                 skipped.append({**item, "reason": "账号缺少 Access Token"})
             else:
                 eligible.append(item)
