@@ -5940,127 +5940,126 @@ def _run_baxigpt_cdk_submit(task_id: str, pairs: list[dict[str, Any]], settings:
         active_orders: list[dict[str, Any]] = []
         attempt_id = control.start_attempt()
         try:
-            last_pending_count = -1
-            # 外层循环：如果一轮遍历后，还有剩余账号且数量减少了，说明可能有额度退回，再扫一轮
-            while pending_accounts and len(pending_accounts) != last_pending_count:
-                last_pending_count = len(pending_accounts)
-                unassignable_accounts = []
+            while pending_accounts or active_orders:
+                control.checkpoint(attempt_id=attempt_id)
                 
-                while pending_accounts:
-                    control.checkpoint(attempt_id=attempt_id)
-                    acc_item = pending_accounts[0]
-                    
-                    assigned_cdk = None
-                    for cid, cdk_data in list(active_cdks.items()):
-                        rec = cdk_data["record"]
-                        try:
-                            # 提交前验证额度
-                            log_debug(f"提交前查验卡密: {rec.code_masked}")
-                            info = client.code_info(rec.code_value)
-                            ok = bool(info.get("ok"))
-                            real_rem = int(info.get("remaining") or 0) if "remaining" in info else 0
-                            if not ok or real_rem <= 0:
-                                cdk_data["remaining"] = 0
-                                continue
-                            
-                            cdk_data["remaining"] = real_rem
-                            assigned_cdk = cdk_data
-                            break
-                        except Exception as exc:
-                            _log(task_id, f"[WARN] 提交前查验卡密异常: {rec.code_masked} ({exc})")
-                            cdk_data["remaining"] = 0
-                            continue
-                            
-                    if not assigned_cdk:
-                        _log(task_id, f"[Idea] 卡密池已无可用额度，剩余 {len(pending_accounts)} 个账号本轮无法提交")
-                        unassignable_accounts.extend(pending_accounts)
-                        pending_accounts.clear()
-                        break
+                # 1. 逐一提交 (完全模拟单账号提交与动态查额度)
+                if pending_accounts:
+                    last_pending_count = -1
+                    # 在进入轮询前，尽可能把本轮能提交的全部提交完
+                    while pending_accounts and len(pending_accounts) != last_pending_count:
+                        last_pending_count = len(pending_accounts)
+                        unassignable_accounts = []
                         
-                    rec = assigned_cdk["record"]
-                    pending_accounts.pop(0)
-                    
-                    with Session(engine) as session:
-                        acc = session.get(AccountModel, int(acc_item["account_id"]))
-                        if not acc or acc.platform != "chatgpt":
-                            skipped_count += 1
-                            _log(task_id, f"[SKIP] 账号不存在或非 ChatGPT: {acc_item.get('email')}")
-                            append_result(account_id=acc_item["account_id"], email=acc_item.get("email"), cdk_id=rec.id, code_masked=rec.code_masked, status="skipped", reason="账号不存在或非 ChatGPT")
-                            continue
-                        token = _chatgpt_account_access_token(acc)
-                        if not token:
-                            skipped_count += 1
-                            _log(task_id, f"[SKIP] 账号缺少 Access Token: {acc_item.get('email')}")
-                            append_result(account_id=acc_item["account_id"], email=acc_item.get("email"), cdk_id=rec.id, code_masked=rec.code_masked, status="skipped", reason="账号缺少 Access Token")
-                            continue
+                        while pending_accounts:
+                            control.checkpoint(attempt_id=attempt_id)
+                            acc_item = pending_accounts[0]
                             
-                    _log(task_id, f"[Idea] 提交上游 (单行模式): 账号 {acc_item.get('email')} -> 卡密 {rec.code_masked}")
-                    try:
-                        res = client.submit(code=rec.code_value, access_token=token)
-                        log_debug(f"submit response {rec.code_masked}: {response_brief(res)}")
-                        if not bool(res.get("ok")):
-                            err_msg = upstream_message(res, "上游提交失败")
-                            raise ValueError(err_msg)
-                            
-                        assigned_cdk["remaining"] -= 1
-                        
-                        submitted_items = res.get("submitted_items") or []
-                        sub_info = submitted_items[0] if submitted_items else {"order_id": f"{rec.code_value}::fallback_0", "display_id": f"fallback_0", "status": "submitted"}
-                        order_id = str(sub_info.get("order_id") or "")
-                        display_id = str(sub_info.get("display_id") or "")
-                        
-                        repo.reserve_for_account(rec.id, account_id=acc_item["account_id"], email=acc_item["email"], task_id=task_id)
-                        with Session(engine) as session:
-                            acc = session.get(AccountModel, acc_item["account_id"])
-                            if acc:
-                                repo.persist_account_binding_extra(acc, rec, status=STATUS_SUBMITTED, order_id=order_id, display_id=display_id)
-                                session.add(acc)
-                                session.commit()
+                            assigned_cdk = None
+                            for cid, cdk_data in list(active_cdks.items()):
+                                rec = cdk_data["record"]
+                                try:
+                                    log_debug(f"提交前查验卡密: {rec.code_masked}")
+                                    info = client.code_info(rec.code_value)
+                                    ok = bool(info.get("ok"))
+                                    real_rem = int(info.get("remaining") or 0) if "remaining" in info else 0
+                                    if not ok or real_rem <= 0:
+                                        cdk_data["remaining"] = 0
+                                        continue
+                                    
+                                    cdk_data["remaining"] = real_rem
+                                    assigned_cdk = cdk_data
+                                    break
+                                except Exception as exc:
+                                    _log(task_id, f"[WARN] 提交前查验卡密异常: {rec.code_masked} ({exc})")
+                                    cdk_data["remaining"] = 0
+                                    continue
+                                    
+                            if not assigned_cdk:
+                                _log(task_id, f"[Idea] 卡密池已无可用额度，本轮剩余 {len(pending_accounts)} 个排队账号等待中...")
+                                unassignable_accounts.extend(pending_accounts)
+                                pending_accounts.clear()
+                                break
                                 
-                        active_orders.append({
-                            "vb": {"item": acc_item, "account": acc, "token": token},
-                            "cdk_data": assigned_cdk,
-                            "order_id": order_id,
-                            "display_id": display_id,
-                            "submitted_at": time.time(),
-                        })
-                        _log(task_id, f"[Idea] 账号 {acc_item.get('email')} 提交成功，已加入后台轮询队列")
-                        
-                        wait_before_next(1, attempt_id=attempt_id)
-                        
-                    except Exception as exc:
-                        err_text = str(exc or "Idea 提交失败")
-                        _log(task_id, f"[FAIL] 卡密 {rec.code_masked} 提交账号 {acc_item.get('email')} 失败: {err_text}")
-                        # 强行将该卡密剩余置0，避免死循环。如果上游实际退回了额度，会在下一次外层循环重新查验出来
-                        assigned_cdk["remaining"] = 0
-                        
-                        if not failure_continue:
-                            _log(task_id, "[Idea] 失败后继续已关闭，停止后续提交")
-                            errors.append(f"卡密 {rec.code_masked} 提交失败: {err_text}")
-                            unassignable_accounts.append(acc_item)
-                            unassignable_accounts.extend(pending_accounts)
-                            pending_accounts.clear()
-                            break
-                        else:
-                            _log(task_id, f"[Idea] 释放所占账号重回队列，准备其他账号/卡密额度重试...")
-                            unassignable_accounts.append(acc_item)
+                            rec = assigned_cdk["record"]
+                            pending_accounts.pop(0)
                             
-                pending_accounts = unassignable_accounts
-                
-            for item in pending_accounts:
-                skipped_count += 1
-                _log(task_id, f"[SKIP] 账号 {item.get('email')} 因可用额度耗尽或连续报错被放弃")
-                append_result(account_id=item["account_id"], email=item.get("email"), status="skipped", reason="卡密可用额度耗尽或连续提交报错放弃")
+                            with Session(engine) as session:
+                                acc = session.get(AccountModel, int(acc_item["account_id"]))
+                                if not acc or acc.platform != "chatgpt":
+                                    skipped_count += 1
+                                    _log(task_id, f"[SKIP] 账号不存在或非 ChatGPT: {acc_item.get('email')}")
+                                    append_result(account_id=acc_item["account_id"], email=acc_item.get("email"), cdk_id=rec.id, code_masked=rec.code_masked, status="skipped", reason="账号不存在或非 ChatGPT")
+                                    continue
+                                token = _chatgpt_account_access_token(acc)
+                                if not token:
+                                    skipped_count += 1
+                                    _log(task_id, f"[SKIP] 账号缺少 Access Token: {acc_item.get('email')}")
+                                    append_result(account_id=acc_item["account_id"], email=acc_item.get("email"), cdk_id=rec.id, code_masked=rec.code_masked, status="skipped", reason="账号缺少 Access Token")
+                                    continue
+                                    
+                            _log(task_id, f"[Idea] 提交上游 (单行模式): 账号 {acc_item.get('email')} -> 卡密 {rec.code_masked}")
+                            try:
+                                res = client.submit(code=rec.code_value, access_token=token)
+                                log_debug(f"submit response {rec.code_masked}: {response_brief(res)}")
+                                if not bool(res.get("ok")):
+                                    err_msg = upstream_message(res, "上游提交失败")
+                                    raise ValueError(err_msg)
+                                    
+                                assigned_cdk["remaining"] -= 1
+                                
+                                submitted_items = res.get("submitted_items") or []
+                                sub_info = submitted_items[0] if submitted_items else {"order_id": f"{rec.code_value}::fallback_0", "display_id": f"fallback_0", "status": "submitted"}
+                                order_id = str(sub_info.get("order_id") or "")
+                                display_id = str(sub_info.get("display_id") or "")
+                                
+                                repo.reserve_for_account(rec.id, account_id=acc_item["account_id"], email=acc_item["email"], task_id=task_id)
+                                with Session(engine) as session:
+                                    acc = session.get(AccountModel, acc_item["account_id"])
+                                    if acc:
+                                        repo.persist_account_binding_extra(acc, rec, status=STATUS_SUBMITTED, order_id=order_id, display_id=display_id)
+                                        session.add(acc)
+                                        session.commit()
+                                        
+                                active_orders.append({
+                                    "vb": {"item": acc_item, "account": acc, "token": token},
+                                    "cdk_data": assigned_cdk,
+                                    "order_id": order_id,
+                                    "display_id": display_id,
+                                    "submitted_at": time.time(),
+                                })
+                                _log(task_id, f"[Idea] 账号 {acc_item.get('email')} 提交成功，已加入后台轮询队列")
+                                
+                                wait_before_next(1, attempt_id=attempt_id)
+                                
+                            except Exception as exc:
+                                err_text = str(exc or "Idea 提交失败")
+                                _log(task_id, f"[FAIL] 卡密 {rec.code_masked} 提交账号 {acc_item.get('email')} 失败: {err_text}")
+                                assigned_cdk["remaining"] = 0
+                                
+                                if not failure_continue:
+                                    _log(task_id, "[Idea] 失败后继续已关闭，停止后续提交")
+                                    errors.append(f"卡密 {rec.code_masked} 提交失败: {err_text}")
+                                    unassignable_accounts.append(acc_item)
+                                    unassignable_accounts.extend(pending_accounts)
+                                    pending_accounts.clear()
+                                    break
+                                else:
+                                    _log(task_id, f"[Idea] 释放所占账号重回队列，准备其他账号/卡密额度重试...")
+                                    unassignable_accounts.append(acc_item)
+                                    
+                        pending_accounts = unassignable_accounts
 
-            if not active_orders:
+                # 2. 如果没有任何提交成功的任务正在处理，且也没待处理账号了，则结束
+                if not active_orders:
                     if not pending_accounts:
                         break
                     else:
-                        # 没有活动的订单且卡密耗尽
+                        # 也没有可用卡密额度了，剩余账号放弃
                         for pa in pending_accounts:
                             skipped_count += 1
                             _log(task_id, f"[SKIP] 剩余候选账号无可用卡密额度: {pa.get('email')}")
-                            append_result(account_id=pa["account_id"], email=pa.get("email"), status="skipped", reason="可用卡密额度不足，本轮未提交")
+                            append_result(account_id=pa["account_id"], email=pa.get("email"), status="skipped", reason="可用卡密额度不足或连续失败")
                         pending_accounts.clear()
                         break
                     
