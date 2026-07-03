@@ -357,13 +357,18 @@ def upload_to_oaipay_detailed(
     api_url: str | None = None,
     api_key: str | None = None,
     group_ids: list[int] | None = None,
+    capabilities: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """上传单个账号到 OAIPay 管理后台，返回结构化结果。"""
     api_url = str(api_url or _get_config_value("oaipay_api_url")).strip()
     api_key = str(api_key or _get_config_value("oaipay_api_key")).strip()
     
-    from services.chatgpt_account_state import classify_chatgpt_capabilities
-    caps = classify_chatgpt_capabilities(account)
+    if capabilities is None:
+        from services.chatgpt_account_state import classify_chatgpt_capabilities
+        caps = classify_chatgpt_capabilities(account)
+    else:
+        caps = capabilities
+
     has_rt = bool(caps.get("has_refresh_token"))
     has_paid = bool(caps.get("has_paid_subscription"))
 

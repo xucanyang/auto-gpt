@@ -539,7 +539,7 @@ def backfill_chatgpt_account_to_oaipay(
         return {"ok": False, "uploaded": False, "skipped": False, "message": msg, "results": results}
 
     group_ids = [int(category_id)] if category_id else None
-    upload_result = upload_to_oaipay_detailed(sync_account, group_ids=group_ids)
+    upload_result = upload_to_oaipay_detailed(sync_account, group_ids=group_ids, capabilities=_capabilities)
     ok = bool(upload_result.get("ok"))
     msg = _safe_str(upload_result.get("message")) or ("上传成功" if ok else "上传失败")
     upload_state = (
