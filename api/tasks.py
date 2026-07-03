@@ -6014,7 +6014,7 @@ def _run_baxigpt_cdk_submit(task_id: str, pairs: list[dict[str, Any]], settings:
                                 with Session(engine) as session:
                                     acc = session.get(AccountModel, acc_item["account_id"])
                                     if acc:
-                                        repo.persist_account_binding_extra(acc, rec, status=STATUS_SUBMITTED, order_id=order_id, display_id=display_id)
+                                        repo.persist_account_binding_extra(acc, rec, status="submitted", order_id=order_id, display_id=display_id)
                                         session.add(acc)
                                         session.commit()
                                         
