@@ -329,8 +329,24 @@ def upload_to_oaipay_detailed(
     api_url = str(api_url or _get_config_value("oaipay_api_url")).strip()
     api_key = str(api_key or _get_config_value("oaipay_api_key")).strip()
     
-    group = ""
-    if group_ids and len(group_ids) > 0:
+    from services.chatgpt_account_state import classify_chatgpt_capabilities
+    caps = classify_chatgpt_capabilities(account)
+    has_rt = bool(caps.get("has_refresh_token"))
+    has_paid = bool(caps.get("has_paid_subscription"))
+
+    auto_group = ""
+    if has_paid:
+        if has_rt:
+            auto_group = "PLUS--已接美国长效"
+        else:
+            auto_group = "PLUS--未接码"
+    else:
+        if has_rt:
+            auto_group = "FREE--已接码带RT"
+
+    if auto_group:
+        group = auto_group
+    elif group_ids and len(group_ids) > 0:
         group = str(group_ids[0])
     else:
         group = _get_config_value("oaipay_group")

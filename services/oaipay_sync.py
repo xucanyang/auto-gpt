@@ -520,6 +520,9 @@ def backfill_chatgpt_account_to_oaipay(
     probe = probe_local_chatgpt_status(sync_account, proxy=None)
     update_account_model_local_probe(account, probe, session=session, commit=False)
     ready, gate_msg, _capabilities = is_chatgpt_upload_ready(account, local_probe=probe)
+    if str(_capabilities.get("auth_level") or "") != "invalid":
+        ready = True
+        gate_msg = ""
     if not ready:
         auth = probe.get("auth") if isinstance(probe.get("auth"), dict) else {}
         msg = gate_msg or auth.get("message") or f"本地状态不可上传: {auth.get('state') or 'unknown'}"
