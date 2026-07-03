@@ -424,16 +424,39 @@ def upload_to_oaipay_detailed(
     import json
     extra_info_json = json.dumps(token_data, ensure_ascii=False, separators=(',', ':'))
 
+    acc_dict = {
+        "email": email,
+        "password": password,
+        "extra_info": extra_info_json,
+    }
+    if isinstance(extra, dict):
+        bound_phone = extra.get("chatgpt_bound_phone") or extra.get("chatgpt_phone_binding") or {}
+        phone_val = ""
+        api_url_val = ""
+        api_token_val = ""
+        
+        if isinstance(bound_phone, dict):
+            api_url_val = bound_phone.get("api_url", "")
+            api_token_val = bound_phone.get("api_token", "")
+            phone_val = bound_phone.get("phone", "")
+            
+        if not phone_val:
+            phone_val = str(extra.get("chatgpt_bound_phone_number") or extra.get("phone") or "")
+            
+        if not api_url_val:
+            api_url_val = _get_config_value("local_phone_gateway_url")
+            api_token_val = _get_config_value("local_phone_gateway_token")
+            
+        if phone_val or api_url_val:
+            acc_dict["phone"] = phone_val
+            acc_dict["phone_api"] = api_url_val
+            if api_token_val:
+                acc_dict["phone_token"] = api_token_val
+
     payload = {
         "key": api_key,
         "group": group,
-        "accounts": [
-            {
-                "email": email,
-                "password": password,
-                "extra_info": extra_info_json,
-            }
-        ],
+        "accounts": [acc_dict],
     }
 
     base_url = api_url.split("/api/")[0].rstrip("/")

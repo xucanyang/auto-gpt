@@ -5,6 +5,9 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，并且本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/) (语义化版本)。
 
 ## [Unreleased] (未发布)
+### 修复 (Fixed)
+- **OAIPay 账号数据上传修复**：修复了上传至 OAIPay (gpt.cccy.me) 时没有包含绑定的手机号（`chatgpt_bound_phone_number`）以及本地接码网关配置（`local_phone_gateway_url` 等）的问题，现在它们会作为顶层字段被包含在 `accounts` 的对象中，使得下游接收方可以正确生成对应的 `delivery_data`。
+
 ### 优化 (Changed)
 - **OAIPay 账号数据上传优化**：
   - 增强向 OAIPay 管理系统上传账号的字段丰富度。原先 `extra_info` 仅简单上传 Access Token，现重构为将该账号的 Refresh Token、绑定的手机号 (phone) 以及手机号接收验证码的完整 API 链接 (api_url) 等字段组装合并为一个完整紧凑的 JSON 字符串（包含所有的 `token_data`），使下游接收方能一次性获取该账号的所有关键会话和关联信息。

@@ -1,32 +1,51 @@
 import sqlite3
 import json
-import requests
 import argparse
-import os
+import urllib.request
+import urllib.error
 
 def export_accounts_to_oaipay(db_path, oaipay_url, key, group):
     conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     
-    # Query accounts
-    cursor.execute("SELECT id, email, password, chatgpt_local FROM account_list_state")
+    # Try querying accounts table which has extra_json
+    try:
+        cursor.execute("SELECT id, email, password, extra_json FROM accounts")
+    except sqlite3.OperationalError:
+        try:
+            cursor.execute("SELECT id, email, password, chatgpt_local FROM account_list_state")
+        except sqlite3.OperationalError:
+            print("Cannot find suitable table to extract accounts")
+            return
+
     rows = cursor.fetchall()
     
     accounts_payload = []
     for row in rows:
-        email = row["email"]
-        password = row["password"]
-        chatgpt_local = row["chatgpt_local"]
-        
-        # Parse tokens
+        acc_id, email, password, extra_data = row
         token = ""
-        if chatgpt_local:
+        phone = ""
+        phone_api = ""
+        
+        if extra_data:
             try:
-                local_data = json.loads(chatgpt_local)
-                # usually access_token or token is in local_data
+                local_data = json.loads(extra_data)
+                
+                # token could be in token, access_token, or inside chatgpt_local
                 token = local_data.get("token", "") or local_data.get("access_token", "")
-            except:
+                if not token and "chatgpt_local" in local_data:
+                    c_local = local_data["chatgpt_local"]
+                    if isinstance(c_local, str):
+                        c_local = json.loads(c_local)
+                    token = c_local.get("token", "") or c_local.get("access_token", "")
+                    
+                # phone is in chatgpt_bound_phone or chatgpt_phone_binding
+                bound_phone = local_data.get("chatgpt_bound_phone") or local_data.get("chatgpt_phone_binding") or {}
+                if isinstance(bound_phone, dict):
+                    phone = bound_phone.get("phone", "")
+                    phone_api = bound_phone.get("api_url", "")
+                    
+            except Exception as e:
                 pass
         
         acc_info = {
@@ -34,6 +53,11 @@ def export_accounts_to_oaipay(db_path, oaipay_url, key, group):
             "password": password,
             "extra_info": token
         }
+        if phone:
+            acc_info["phone"] = phone
+        if phone_api:
+            acc_info["phone_api"] = phone_api
+            
         accounts_payload.append(acc_info)
         
     print(f"Found {len(accounts_payload)} accounts. Uploading to {oaipay_url}...")
@@ -45,26 +69,28 @@ def export_accounts_to_oaipay(db_path, oaipay_url, key, group):
     }
     
     try:
-        url = oaipay_url.rstrip("/")
-        if not url.endswith("/api/auto-gpt/upload") and not url.endswith("/api/cdk/accounts/upload"):
-            url = f"{url}/api/auto-gpt/upload"
-            
-        res = requests.post(url, json=payload, headers={"Authorization": f"Bearer {key}"}, timeout=30)
-        print(f"Status Code: {res.status_code}")
-        print(f"Response: {res.text}")
-    except Exception as e:
-        print(f"Error during upload: {e}")
+        req = urllib.request.Request(
+            oaipay_url,
+            data=json.dumps(payload).encode('utf-8'),
+            headers={
+                "Content-Type": "application/json",
+                "x-api-key": key,
+                "Authorization": f"Bearer {key}"
+            },
+            method="POST"
+        )
+        with urllib.request.urlopen(req) as response:
+            res_body = response.read().decode('utf-8')
+            print(f"Response: {response.status} {res_body}")
+    except urllib.error.URLError as e:
+        print(f"Failed to upload: {e}")
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Upload accounts to OAIPay (gpt.cccy.me)")
-    parser.add_argument("--db", default="../account_manager.db", help="Path to account_manager.db")
-    parser.add_argument("--url", required=True, help="OAIPay URL (e.g. http://127.0.0.1:8080)")
-    parser.add_argument("--key", required=True, help="Upload Key / Admin Password")
-    parser.add_argument("--group", required=True, help="Group / Category name")
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--db", default="data/account_manager.db", help="Path to sqlite db")
+    parser.add_argument("--url", required=True, help="OAIPay api upload url")
+    parser.add_argument("--key", required=True, help="OAIPay api key")
+    parser.add_argument("--group", required=True, help="OAIPay category group")
     args = parser.parse_args()
     
-    db_path = args.db
-    if not os.path.exists(db_path) and os.path.exists("account_manager.db"):
-        db_path = "account_manager.db"
-    
-    export_accounts_to_oaipay(db_path, args.url, args.key, args.group)
+    export_accounts_to_oaipay(args.db, args.url, args.key, args.group)
