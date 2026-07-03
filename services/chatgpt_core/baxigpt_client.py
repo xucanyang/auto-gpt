@@ -124,7 +124,8 @@ class BaxiGptClient:
         accounts = [access_token] if isinstance(access_token, str) else [str(t or "") for t in access_token if str(t or "").strip()]
         payload = {
             "cdk": str(code or ""),
-            "accounts": accounts
+            "accounts": accounts,
+            "account": accounts[0] if accounts else ""
         }
         res = self._request("POST", "/api/task/submit", payload=payload, timeout=self.submit_timeout, retries=self.submit_retries)
         
