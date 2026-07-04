@@ -100,9 +100,17 @@ const PAYMENT_LINK_FORMAT_OPTIONS = [
   { label: '短连接路径', value: 'short_chatgpt' },
 ]
 const DEFAULT_GOPAY_OTP_AUTO_RESEND_DELAY_SECONDS = 120
-const ACCOUNTS_PAGE_SIZE = 10
+const ACCOUNTS_PAGE_SIZE_STORAGE_KEY = 'auto-chatgpt.accounts.page-size.v1'
+const DEFAULT_ACCOUNTS_PAGE_SIZE = 20
+const ACCOUNT_PAGE_SIZE_OPTIONS = [10, 20, 50]
 const EMPTY_LIST: any[] = []
 const SUBSCRIPTION_EXPIRY_SORT_FIELD = 'subscription_active_until'
+
+function loadAccountsPageSize() {
+  if (typeof window === 'undefined') return DEFAULT_ACCOUNTS_PAGE_SIZE
+  const value = Number(window.localStorage.getItem(ACCOUNTS_PAGE_SIZE_STORAGE_KEY) || '')
+  return ACCOUNT_PAGE_SIZE_OPTIONS.includes(value) ? value : DEFAULT_ACCOUNTS_PAGE_SIZE
+}
 
 const DEFAULT_PHONE_BINDING_SETTINGS = {
   use_pool: true,
@@ -1584,6 +1592,7 @@ export default function Accounts() {
   const [platformActionsLoading, setPlatformActionsLoading] = useState(false)
   const [total, setTotal] = useState(0)
   const [currentPage, setCurrentPage] = useState(1)
+  const [accountsPageSize, setAccountsPageSize] = useState(loadAccountsPageSize)
   const [columnFilters, setColumnFilters] = useState<AccountColumnFilters>(EMPTY_ACCOUNT_FILTERS)
   const [search, setSearch] = useState('')
   const [debouncedSearch, setDebouncedSearch] = useState('')
@@ -1740,7 +1749,7 @@ export default function Accounts() {
     sortBy: subscriptionExpirySortOrder ? SUBSCRIPTION_EXPIRY_SORT_FIELD : '',
     sortOrder: subscriptionExpirySortOrder,
     page: currentPage,
-    pageSize: ACCOUNTS_PAGE_SIZE,
+    pageSize: accountsPageSize,
   })
   const accountDetailQuery = useAccountDetailQuery(detailAccount?.id ? Number(detailAccount.id) : null, detailModalOpen)
   const activeTasksQuery = useActiveTasksQuery(activeTasksPanelOpen)
@@ -1963,11 +1972,20 @@ export default function Accounts() {
     setAccounts((data.items || []).map(normalizeAccount))
     setTotal(nextTotal)
 
-    const maxPage = Math.max(1, Math.ceil(nextTotal / ACCOUNTS_PAGE_SIZE))
+    const maxPage = Math.max(1, Math.ceil(nextTotal / accountsPageSize))
     if (currentPage > maxPage) {
       setCurrentPage(maxPage)
     }
-  }, [accountsQuery.data, currentPage])
+  }, [accountsQuery.data, accountsPageSize, currentPage])
+
+  const handleAccountsPageSizeChange = useCallback((pageSize: number) => {
+    const nextPageSize = ACCOUNT_PAGE_SIZE_OPTIONS.includes(pageSize) ? pageSize : DEFAULT_ACCOUNTS_PAGE_SIZE
+    setAccountsPageSize(nextPageSize)
+    setCurrentPage(1)
+    if (typeof window !== 'undefined') {
+      window.localStorage.setItem(ACCOUNTS_PAGE_SIZE_STORAGE_KEY, String(nextPageSize))
+    }
+  }, [])
 
   useEffect(() => {
     if (!accounts.length) return
@@ -6082,8 +6100,10 @@ export default function Accounts() {
         loading={loading}
         total={total}
         currentPage={currentPage}
-        pageSize={ACCOUNTS_PAGE_SIZE}
+        pageSize={accountsPageSize}
         onPageChange={setCurrentPage}
+        onPageSizeChange={handleAccountsPageSizeChange}
+        pageSizeOptions={ACCOUNT_PAGE_SIZE_OPTIONS}
         selectedRowKeys={selectedRowKeys}
         setSelectedRowKeys={setSelectedRowKeys}
         onTableChange={handleAccountsTableChange}

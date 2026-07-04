@@ -5,6 +5,8 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，并且本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/) (语义化版本)。
 
 ## [Unreleased] (未发布)
+
+## [1.2.1] - 2026-07-04
 ### 新增 (Added)
 - **新增任务代理设置统一保存与复用**：代理管理页“动态代理预览”新增“保存为任务默认”入口，并新增 `frontend/src/lib/taskProxySettings.ts` 作为注册任务、批量本地状态同步、邮箱测活、手机号绑定等任务表单的统一代理配置适配层；用户在任一任务中填写的代理模式、动态代理模板/API、出口国家、失败处理、代理池候选数与最低健康分会写入 `/api/config` 的 `task_proxy_*` 全局配置，并同步镜像到 `dynamic_proxy_template` / `dynamic_proxy_default_country`，后续所有任务弹窗默认读取同一套代理参数，避免注册、本地刷新、测活、手机号绑定各自记一份导致配置漂移。
 - **新增动态代理模式，支持按需指定出口国家**：后端新增 `core/dynamic_proxy.py` 与统一候选解析入口，注册任务、批量本地状态同步、邮箱测活、HME 复测和手机号绑定现在均支持 `proxy_mode=dynamic`。该模式使用任务内或全局配置的动态代理模板，按 `proxy_country_code` 改写 `region-XX`，每次候选生成刷新 `sid-xxx-t-`，并保留现有 cliproxy `socks5://` 到运行态 `http://` 的兼容转换。
@@ -15,6 +17,7 @@
 - **强化动态代理与任务日志脱敏边界**：动态代理模板、运行代理、批量本地状态同步参数、邮箱测活结果和 HME 复测详情在任务 meta、历史日志与预览接口中只保存脱敏地址；新增对 `dynamic_proxy_template`、`proxy_template` 等结构化字段的统一代理认证脱敏，避免代理账号、密码或 sid 模板信息进入可展示日志。
 
 ### 修复 (Fixed)
+- **恢复 ChatGPT 账号池分页切页与每页数量选择**：根据 2026-06-17 账号列表性能审计时保留的历史实现，补回 `frontend/src/pages/Accounts.tsx` 中的 `auto-chatgpt.accounts.page-size.v1` 本地持久化、默认每页 20 条以及 10 / 20 / 50 条切换选项，并将当前页码、页大小、后端 `/accounts?page=&page_size=` 查询和 `AccountsTable` 的 `Pagination` 联动起来；修复近期回归后账号池只能固定 10 条且桌面端分页器不再显示每页数量切换的问题，避免运营跨页查看和批量选择账号时被固定页长卡住。
 - **恢复手机号绑定粘贴号码的手机号池 upsert 与状态回写链路**：修复 `api/tasks.py` 在日志重构后把手动粘贴的 `手机号----收码API` 仅作为一次性任务输入、未再调用 `_import_manual_phone_entries_to_pool` 的回归问题。现在手机号绑定任务启动时会先将粘贴号码 upsert 到 `phone_pool`：新号码直接创建池记录，已存在号码会保留原有池记录并更新本次粘贴的收码 API；随后任务仍按粘贴的固定号码列表执行，不切换为动态取号，但每个号码会标记为 `pool_managed`，运行结束后继续通过 `PhonePoolRepository.record_task_status()` 回写绑定成功、短信探测成功、OpenAI 拒绝、限流、无验证码等状态。同步修正短信探测模式误继续进入绑定保存/Auth 重试的保护分支，并补充任务日志，明确展示粘贴号码启动前入池和运行后状态回写结果。
 - **修复手机号绑定“只测发码/收码”前端开关丢失的问题**：补回 `frontend/src/pages/Accounts.tsx` 中全局可用的 `prefix_sms_probe_only` 表单项与本地设置保存，任务提交时同时下发 `prefix_sms_probe_only` / `sms_probe_only`，确保粘贴号码、普通手机号池、号段抽样三种模式都能进入后端短信探测分支；开启后前端会强制关闭“尽量用满同一个手机号”，任务提示也会明确显示“仅测发码/收码”，避免用户以为已开启但实际仍执行真实绑定。
 - **修复批量本地状态同步动态代理异常后任务悬空的问题**：`api/tasks.py` 的 `_run_batch_probe_local_status` 增加普通 `Exception` 兜底捕获，动态代理模板缺少出口国家、缺少 `region-XX`、探测解析异常或其他未预期错误都会写入任务日志、保存失败历史并将任务状态标记为 `failed`，不再让后台任务崩溃后前端持续显示 pending/running；同时动态代理国家 fallback 与前端必填校验保持一致，缺省时使用全局默认国家。
@@ -27,6 +30,7 @@
 - **OAIPay 账号数据上传修复**：修复了上传至 OAIPay (gpt.cccy.me) 时没有包含绑定的手机号（`chatgpt_bound_phone_number`）以及本地接码网关配置（`local_phone_gateway_url` 等）的问题，现在它们会作为顶层字段被包含在 `accounts` 的对象中，使得下游接收方可以正确生成对应的 `delivery_data`。
 
 ### 优化 (Changed)
+- **同步前端版本号至 v1.2.1**：侧边栏底部版本展示由 `v1.2.0` 更新为 `v1.2.1`，用于区分本次账号池分页恢复发布与 2026-07-03 的 `v1.2.0` 基线，方便上线后从 live 页面直接确认静态资源已更新。
 - **OAIPay 账号数据上传优化**：
   - 增强向 OAIPay 管理系统上传账号的字段丰富度。原先 `extra_info` 仅简单上传 Access Token，现重构为将该账号的 Refresh Token、绑定的手机号 (phone) 以及手机号接收验证码的完整 API 链接 (api_url) 等字段组装合并为一个完整紧凑的 JSON 字符串（包含所有的 `token_data`），使下游接收方能一次性获取该账号的所有关键会话和关联信息。
 - **优化手机号池列表的复制体验**：
@@ -158,4 +162,8 @@
 
 ## 2026-07-04 20:37:11 +0800
 - 修复手机号绑定只测发码收码前端开关
+- 发布模式: multi
+
+## 2026-07-04 20:54:27 +0800
+- 恢复账号列表分页切页设置
 - 发布模式: multi
