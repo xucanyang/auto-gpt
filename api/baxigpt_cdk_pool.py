@@ -57,19 +57,23 @@ def _refresh_bound_account_local_status(record: Any, *, trigger: str) -> dict[st
             ).first()
         if account is None or account.platform != "chatgpt":
             return None
-        refresh_result = sync_chatgpt_account_local_status(session, account)
-        summary = summarize_status_refresh(refresh_result, trigger=trigger)
         try:
-            extra = account.get_extra()
-        except Exception:
-            extra = {}
-        if not isinstance(extra, dict):
-            extra = {}
-        cdk_payload = extra.get("baxigpt_cdk") if isinstance(extra.get("baxigpt_cdk"), dict) else {}
-        cdk_payload = dict(cdk_payload)
-        cdk_payload["local_status_refresh"] = summary
-        extra["baxigpt_cdk"] = cdk_payload
-        account.set_extra(extra)
+            refresh_result = sync_chatgpt_account_local_status(session, account)
+            summary = summarize_status_refresh(refresh_result, trigger=trigger)
+        except Exception as exc:
+            summary = {
+                "trigger": str(trigger or ""),
+                "refreshed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "status": str(getattr(account, "status", "") or ""),
+                "error": str(exc),
+            }
+        _repo.persist_account_binding_extra(
+            account,
+            record,
+            status=STATUS_PAID,
+            local_status_refresh=summary,
+            apply_payment_state=False,
+        )
         session.add(account)
         session.commit()
         return summary
@@ -403,7 +407,12 @@ def _refresh_imported_cdk_record(record_id: int, *, client: BaxiGptClient | None
         row["ok"] = False
         row["query_error"] = str(exc)
 
-    row["account_synced"] = _repo.persist_bound_account_extra(updated)
+    if updated is not None and updated.status == STATUS_PAID:
+        local_status_refresh = _refresh_bound_account_local_status(updated, trigger="pix_cdk_import_query")
+        row["account_synced"] = local_status_refresh is not None
+        row["local_status_refresh"] = local_status_refresh
+    else:
+        row["account_synced"] = _repo.persist_bound_account_extra(updated)
     row["item"] = updated.to_dict(include_code=True)
     return row
 
@@ -575,8 +584,12 @@ def query_baxigpt_order_status(body: CdkStatusQueryRequest):
         try:
             response = client.status(record.order_id)
             updated = _repo.mark_status_response(record_id, response)
-            account_synced = _repo.persist_bound_account_extra(updated)
-            local_status_refresh = _refresh_bound_account_local_status(updated, trigger="pix_cdk_manual_status")
+            if updated is not None and updated.status == STATUS_PAID:
+                local_status_refresh = _refresh_bound_account_local_status(updated, trigger="pix_cdk_manual_status")
+                account_synced = local_status_refresh is not None
+            else:
+                account_synced = _repo.persist_bound_account_extra(updated)
+                local_status_refresh = None
             items.append({
                 "id": record_id,
                 "ok": True,
@@ -616,8 +629,12 @@ def check_baxigpt_cdk_quota(body: CdkQuotaCheckRequest):
                         updated = queried
                 except Exception as query_exc:
                     query_response = {"ok": False, "message": str(query_exc)}
-            account_synced = _repo.persist_bound_account_extra(updated)
-            local_status_refresh = _refresh_bound_account_local_status(updated, trigger="pix_cdk_quota_query")
+            if updated is not None and updated.status == STATUS_PAID:
+                local_status_refresh = _refresh_bound_account_local_status(updated, trigger="pix_cdk_quota_query")
+                account_synced = local_status_refresh is not None
+            else:
+                account_synced = _repo.persist_bound_account_extra(updated)
+                local_status_refresh = None
             items.append({
                 "id": record_id,
                 "ok": True,
@@ -711,10 +728,16 @@ def query_baxigpt_codes(body: CdkCodeQueryRequest):
         try:
             response = client.query(code)
             updated = _repo.mark_query_response(code, response)
-            account_synced = _repo.persist_bound_account_extra(updated)
+            if updated is not None and updated.status == STATUS_PAID:
+                local_status_refresh = _refresh_bound_account_local_status(updated, trigger="pix_cdk_query_text")
+                account_synced = local_status_refresh is not None
+            else:
+                local_status_refresh = None
+                account_synced = _repo.persist_bound_account_extra(updated)
             items.append({
                 "ok": True,
                 "account_synced": account_synced,
+                "local_status_refresh": local_status_refresh,
                 "code_masked": mask_code(code),
                 "item": updated.to_dict(include_code=True) if updated else None,
                 "raw": response,

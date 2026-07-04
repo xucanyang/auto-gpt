@@ -680,6 +680,8 @@ class BaxiGptCdkRepository:
         order_id: str | None = None,
         display_id: str | None = None,
         last_error_message: str | None = None,
+        local_status_refresh: dict[str, Any] | None = None,
+        apply_payment_state: bool = True,
     ) -> None:
         try:
             extra = account.get_extra()
@@ -687,6 +689,7 @@ class BaxiGptCdkRepository:
             extra = {}
         if not isinstance(extra, dict):
             extra = {}
+        existing_payload = extra.get("baxigpt_cdk") if isinstance(extra.get("baxigpt_cdk"), dict) else {}
         target_status = status if status is not None else record.status
         payload = {
             "status": target_status,
@@ -703,6 +706,10 @@ class BaxiGptCdkRepository:
             "last_checked_at": record.last_checked_at,
             "last_error_message": last_error_message if last_error_message is not None else record.last_error_message,
         }
+        if isinstance(local_status_refresh, dict):
+            payload["local_status_refresh"] = local_status_refresh
+        elif isinstance(existing_payload.get("local_status_refresh"), dict):
+            payload["local_status_refresh"] = existing_payload["local_status_refresh"]
         extra["baxigpt_cdk"] = payload
         history = extra.get("baxigpt_cdk_history")
         if not isinstance(history, list):
@@ -717,10 +724,11 @@ class BaxiGptCdkRepository:
         extra["baxigpt_cdk_history"] = history[-20:]
         account.set_extra(extra)
         status_text = str(target_status or "").strip().lower()
-        if status_text == STATUS_PAID:
-            mark_payment_succeeded(account, reason="baxigpt_cdk_paid")
-        elif status_text == STATUS_FAILED:
-            mark_payment_failed(account, reason="baxigpt_cdk_failed")
+        if apply_payment_state:
+            if status_text == STATUS_PAID:
+                mark_payment_succeeded(account, reason="baxigpt_cdk_paid")
+            elif status_text == STATUS_FAILED:
+                mark_payment_failed(account, reason="baxigpt_cdk_failed")
         account.updated_at = _utcnow()
 
     def mark_account_ineligible(self, account: AccountModel, record: BaxiGptCdkRecord, reason: str) -> None:

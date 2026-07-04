@@ -33,7 +33,11 @@ from services.chatgpt_core.payment_link_cache import (
     normalize_payment_link_url,
     normalize_payment_link_params,
 )
-from services.chatgpt_core.local_status_refresh import schedule_chatgpt_local_status_refresh_for_account_id
+from services.chatgpt_core.local_status_refresh import (
+    schedule_chatgpt_local_status_refresh_for_account_id,
+    summarize_status_refresh,
+    sync_chatgpt_account_local_status,
+)
 from services.chatgpt_core.task_logging import (
     REDACTION_VERSION,
     build_task_current_state,
@@ -5840,6 +5844,61 @@ def _run_baxigpt_cdk_submit(task_id: str, pairs: list[dict[str, Any]], settings:
                 return text
         return fallback
 
+    def refresh_paid_account_local_status(
+        account_id: int,
+        record: Any,
+        *,
+        order_id: str,
+        display_id: str,
+    ) -> dict[str, Any] | None:
+        """上游 paid 后以本地 ChatGPT 状态刷新为唯一账号状态来源。
+
+        卡密记录本身仍然记为 paid；账号主状态不再由外部 paid 标记直接改成
+        subscribed，而是由 sync_chatgpt_account_local_status 的探测结果统一写入。
+        """
+        with Session(engine) as session:
+            acc = session.get(AccountModel, int(account_id or 0))
+            if acc is None or acc.platform != "chatgpt":
+                _log(task_id, f"[Idea][WARN] paid 后本地状态刷新跳过: 未找到 ChatGPT 账号 account_id={account_id}")
+                return None
+            _log(task_id, f"[Idea] paid 已确认，开始刷新本地账号状态: {acc.email or acc.id}")
+            refresh_ok = True
+            try:
+                refresh_result = sync_chatgpt_account_local_status(session, acc)
+                summary = summarize_status_refresh(refresh_result, trigger="baxigpt_cdk_paid")
+            except Exception as exc:
+                refresh_ok = False
+                summary = {
+                    "trigger": "baxigpt_cdk_paid",
+                    "refreshed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "status": str(getattr(acc, "status", "") or ""),
+                    "error": str(exc),
+                }
+            repo.persist_account_binding_extra(
+                acc,
+                record,
+                status=STATUS_PAID,
+                order_id=order_id,
+                display_id=display_id,
+                local_status_refresh=summary,
+                apply_payment_state=False,
+            )
+            session.add(acc)
+            session.commit()
+            if refresh_ok:
+                _log(
+                    task_id,
+                    "[Idea] 本地状态刷新完成: "
+                    f"{acc.email or acc.id} "
+                    f"status={summary.get('status') or '-'} "
+                    f"plan={summary.get('subscription_plan') or '-'} "
+                    f"auth={summary.get('auth_state') or '-'} "
+                    f"gate={summary.get('upload_gate') or '-'}",
+                )
+            else:
+                _log(task_id, f"[Idea][WARN] paid 后本地状态刷新失败，已写入失败摘要: {acc.email or acc.id} - {summary.get('error')}")
+            return summary
+
     try:
         log_debug(
             "task settings: "
@@ -6064,13 +6123,25 @@ def _run_baxigpt_cdk_submit(task_id: str, pairs: list[dict[str, Any]], settings:
                         _log(task_id, f"[OK] Idea 开通成功: {vb['item'].get('email')} -> {rec.code_masked} (order_id={order_id})")
                         paid_record = repo.mark_submit_success(rec.id, {"status": "paid", "order_id": order_id, "display_id": order["display_id"], "email": vb['item'].get('email')}) or rec
                         order["record"] = paid_record
-                        with Session(engine) as session:
-                            acc = session.get(AccountModel, vb["item"]["account_id"])
-                            if acc:
-                                repo.persist_account_binding_extra(acc, paid_record, status=STATUS_PAID, order_id=order_id, display_id=order["display_id"])
-                                session.add(acc)
-                                session.commit()
-                        append_result(account_id=vb["item"]["account_id"], email=vb["item"].get("email"), cdk_id=rec.id, code_masked=rec.code_masked, status="paid", order_id=order_id)
+                        local_status_summary = None
+                        try:
+                            local_status_summary = refresh_paid_account_local_status(
+                                vb["item"]["account_id"],
+                                paid_record,
+                                order_id=order_id,
+                                display_id=order["display_id"],
+                            )
+                        except Exception as refresh_exc:
+                            _log(task_id, f"[Idea][WARN] paid 后本地状态刷新失败: {vb['item'].get('email')} (order_id={order_id}) - {refresh_exc}")
+                        append_result(
+                            account_id=vb["item"]["account_id"],
+                            email=vb["item"].get("email"),
+                            cdk_id=rec.id,
+                            code_masked=rec.code_masked,
+                            status="paid",
+                            order_id=order_id,
+                            local_status_refresh=local_status_summary,
+                        )
                         
                     elif st_str in {"failed", "expired", "cancelled", "canceled", "invalid", "error"}:
                         err_text = err_msg or "Idea 上游处理失败"

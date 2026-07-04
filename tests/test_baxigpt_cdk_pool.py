@@ -112,6 +112,48 @@ CDK-AAAA-1111
 
         self.assertEqual(account.status, "subscribed")
 
+    def test_paid_extra_can_skip_direct_account_status_and_store_refresh_summary(self):
+        repo = BaxiGptCdkRepository()
+        code = repo.add(code="CDK-AAAA-1111")
+        with Session(self.engine) as session:
+            account = AccountModel(platform="chatgpt", email="user@example.com", password="pw", token="at", status="pending_payment")
+            session.add(account)
+            session.commit()
+            session.refresh(account)
+            account_id = int(account.id or 0)
+
+        reserved = repo.reserve_for_account(code.id, account_id=account_id, email="user@example.com", task_id="task_1")
+        submitted = repo.mark_submit_success(reserved.id, {
+            "ok": True,
+            "order_id": "order_1",
+            "display_id": "PAY-TEST",
+            "email": "user@example.com",
+            "status": "processing",
+        })
+        paid = repo.mark_status_response(submitted.id, {"ok": True, "order_id": "order_1", "status": "paid"})
+        refresh_summary = {
+            "trigger": "baxigpt_cdk_paid",
+            "status": "registered",
+            "subscription_plan": "",
+            "auth_state": "ok",
+        }
+        with Session(self.engine) as session:
+            account = session.get(AccountModel, account_id)
+            repo.persist_account_binding_extra(
+                account,
+                paid,
+                local_status_refresh=refresh_summary,
+                apply_payment_state=False,
+            )
+            session.add(account)
+            session.commit()
+            session.refresh(account)
+            extra = account.get_extra()
+
+        self.assertEqual(account.status, "pending_payment")
+        self.assertEqual(extra["baxigpt_cdk"]["status"], "paid")
+        self.assertEqual(extra["baxigpt_cdk"]["local_status_refresh"], refresh_summary)
+
     def test_failed_status_syncs_account_primary_status(self):
         repo = BaxiGptCdkRepository()
         code = repo.add(code="CDK-AAAA-1111")

@@ -121,7 +121,12 @@ def _safe_log(target: BaxiGptStatusPollTarget, message: str) -> None:
         pass
 
 
-def _refresh_bound_account_after_paid(record: Any, target: BaxiGptStatusPollTarget) -> dict[str, Any] | None:
+def _refresh_bound_account_after_paid(
+    record: Any,
+    target: BaxiGptStatusPollTarget,
+    *,
+    repo: BaxiGptCdkRepository | None = None,
+) -> dict[str, Any] | None:
     account_id = int(getattr(record, "bound_account_id", 0) or 0)
     email = str(getattr(record, "bound_account_email", "") or getattr(record, "remote_email", "") or "").strip()
     with Session(engine) as session:
@@ -136,32 +141,40 @@ def _refresh_bound_account_after_paid(record: Any, target: BaxiGptStatusPollTarg
             _safe_log(target, f"[Idea][WARN] paid 后本地状态刷新跳过: 未找到绑定账号 account_id={account_id or '-'} email={email or '-'}")
             return None
         _safe_log(target, f"[Idea] paid 已确认，开始刷新本地账号状态: {account.email or account.id}")
-        refresh_result = sync_chatgpt_account_local_status(session, account)
-        summary = summarize_status_refresh(refresh_result, trigger="pix_cdk_paid")
-
+        refresh_ok = True
         try:
-            extra = account.get_extra()
-        except Exception:
-            extra = {}
-        if not isinstance(extra, dict):
-            extra = {}
-        cdk_payload = extra.get("baxigpt_cdk") if isinstance(extra.get("baxigpt_cdk"), dict) else {}
-        cdk_payload = dict(cdk_payload)
-        cdk_payload["local_status_refresh"] = summary
-        extra["baxigpt_cdk"] = cdk_payload
-        account.set_extra(extra)
+            refresh_result = sync_chatgpt_account_local_status(session, account)
+            summary = summarize_status_refresh(refresh_result, trigger="pix_cdk_paid")
+        except Exception as exc:
+            refresh_ok = False
+            summary = {
+                "trigger": "pix_cdk_paid",
+                "refreshed_at": datetime.now(timezone.utc).isoformat(),
+                "status": str(getattr(account, "status", "") or ""),
+                "error": str(exc),
+            }
+        (repo or BaxiGptCdkRepository()).persist_account_binding_extra(
+            account,
+            record,
+            status=STATUS_PAID,
+            local_status_refresh=summary,
+            apply_payment_state=False,
+        )
         session.add(account)
         session.commit()
 
-        _safe_log(
-            target,
-            "[Idea] 本地状态刷新完成: "
-            f"{account.email or account.id} "
-            f"status={summary.get('status') or '-'} "
-            f"plan={summary.get('subscription_plan') or '-'} "
-            f"auth={summary.get('auth_state') or '-'} "
-            f"gate={summary.get('upload_gate') or '-'}",
-        )
+        if refresh_ok:
+            _safe_log(
+                target,
+                "[Idea] 本地状态刷新完成: "
+                f"{account.email or account.id} "
+                f"status={summary.get('status') or '-'} "
+                f"plan={summary.get('subscription_plan') or '-'} "
+                f"auth={summary.get('auth_state') or '-'} "
+                f"gate={summary.get('upload_gate') or '-'}",
+            )
+        else:
+            _safe_log(target, f"[Idea][WARN] paid 后本地状态刷新失败，已写入失败摘要: {account.email or account.id} - {summary.get('error')}")
         return summary
 
 
@@ -348,7 +361,10 @@ def _poll_once(repo: BaxiGptCdkRepository, client: BaxiGptClient, target: BaxiGp
         return True
     if str(record.status or "").strip().lower() not in POLLABLE_STATUSES:
         if record.status in REPOSITORY_TERMINAL_STATUSES:
-            repo.persist_bound_account_extra(record)
+            if record.status == STATUS_PAID:
+                _refresh_bound_account_after_paid(record, target, repo=repo)
+            else:
+                repo.persist_bound_account_extra(record)
         target.last_error = f"状态不可轮询: {record.status}"
         _safe_log(target, f"[Idea] 状态轮询停止: {record.code_masked} status={record.status} 不在 submitted/processing")
         return True
@@ -367,7 +383,8 @@ def _poll_once(repo: BaxiGptCdkRepository, client: BaxiGptClient, target: BaxiGp
     if updated is None:
         target.last_error = "状态响应未写入"
         return False
-    repo.persist_bound_account_extra(updated)
+    if updated.status != STATUS_PAID:
+        repo.persist_bound_account_extra(updated)
     status = str(updated.upstream_status or updated.status or response.get("status") or "").strip().lower()
     display_id = updated.display_id or updated.order_id
     email = updated.bound_account_email or updated.remote_email or str(updated.bound_account_id or "-")
@@ -379,7 +396,7 @@ def _poll_once(repo: BaxiGptCdkRepository, client: BaxiGptClient, target: BaxiGp
         if updated.status == STATUS_PAID:
             _safe_log(target, f"[OK] Idea 提交成功: {email} {display_id} status=paid")
             try:
-                _refresh_bound_account_after_paid(updated, target)
+                _refresh_bound_account_after_paid(updated, target, repo=repo)
             except Exception as exc:
                 target.last_error = str(exc)
                 _safe_log(target, f"[Idea][WARN] paid 后本地状态刷新失败: {email} {display_id} - {exc}")
