@@ -13,6 +13,8 @@ def normalize_proxy_url(proxy_url: Optional[str]) -> Optional[str]:
     value = str(proxy_url).strip()
     if not value:
         return None
+    if value.lower().startswith("socks5://"):
+        value = "socks5h://" + value.split("://", 1)[1]
     return value
 
 

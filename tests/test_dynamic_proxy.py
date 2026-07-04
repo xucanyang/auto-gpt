@@ -49,15 +49,15 @@ def test_resolve_probe_candidate_proxies_dynamic_generates_fresh_normalized_cand
     assert len(set(urls)) == 3
     for url, pool, source in candidates:
         assert pool is None
-        assert url.startswith("socks5://")
+        assert url.startswith("socks5h://")
         assert "region-US" in url
         assert "sid-oldsid-t-" not in url
         assert "dynamic country=US" in source
         assert "probe=disabled" in source
 
 
-def test_normalize_proxy_url_preserves_cliproxy_socks5_scheme():
-    assert normalize_proxy_url(TEMPLATE) == TEMPLATE
+def test_normalize_proxy_url_uses_socks5h_for_remote_dns():
+    assert normalize_proxy_url(TEMPLATE) == TEMPLATE.replace("socks5://", "socks5h://", 1)
 
 
 def test_dynamic_proxy_uses_dynamic_attempts_not_pool_candidate_count():

@@ -9,7 +9,7 @@
 ## [1.2.4] - 2026-07-05
 ### 修复 (Fixed)
 - **修复 Cliproxy 动态代理指定国家被 GeoIP 限流误判失败的问题**：`core/proxy_utils.py` 的动态代理候选探测现在区分“基础连通失败”“实测国家不一致”和“GeoIP 无法实测”三种状态；当 Cliproxy 模板已经按 `region-XX` 成功改写到目标国家、基础出口 IP 可用，但第三方 GeoIP 查询返回 429 或无国家时，不再把 `actual=unknown` 误判为 `country_mismatch` 并丢弃所有候选，而是记录 `actual=unverified / probe=geo_unavailable` 后允许任务继续执行。只有实测到明确的其他国家时才继续硬失败，避免 JP/US 等可用出口被探测依赖误杀。
-- **修复动态代理运行态偷偷把 Cliproxy `socks5://` 改成 `http://` 的协议漂移**：`core/proxy_utils.py` 的 `normalize_proxy_url()` 恢复为真正只做空值和空白清洗，保留用户填写的原始代理协议；动态代理日志、预览接口和任务执行现在会按模板协议运行，避免 Cliproxy 文档要求的 Socks5 中间服务器在运行态被隐式改写成 HTTP 后产生难以定位的兼容问题。
+- **修复动态代理运行态偷偷把 Cliproxy `socks5://` 改成 `http://` 的协议漂移**：`core/proxy_utils.py` 的 `normalize_proxy_url()` 不再把 Cliproxy Socks5 模板降级成 HTTP，而是统一规范为 `socks5h://` 以保持 Socks5 协议并使用远端 DNS；动态代理日志、预览接口和任务执行现在与 Cliproxy Socks5 中间服务器语义一致，同时避免本地 DNS/普通 `socks5://` 在部分 HTTPS 目标上触发 `WRONG_VERSION_NUMBER`。
 
 ### 优化 (Changed)
 - **动态代理国家探测优先使用代理出口侧 Cloudflare Trace**：`services/proxy_scanner.py` 新增通过代理访问 `https://www.cloudflare.com/cdn-cgi/trace` 的国家探测路径，优先读取 `loc=XX` 作为出口国家，再回退到服务器侧 `ipapi/ipinfo` 查询；代理扫描、动态代理预览 `/api/proxies/dynamic-preview` 和任务运行前探测都能减少公共 GeoIP API 429 对国家判断的影响，并在响应中暴露 `geo_source`、`geo_unverified` 等诊断字段。
@@ -204,4 +204,8 @@
 
 ## 2026-07-05 04:14:12 +0800
 - 修复 Cliproxy 动态代理按国家探测误判
+- 发布模式: multi
+
+## 2026-07-05 04:20:12 +0800
+- 修正动态代理 Socks5 运行态为 socks5h
 - 发布模式: multi
