@@ -374,6 +374,26 @@ async function copyTextToClipboard(text: string) {
   }
 }
 
+function phoneApiCopyText(record: Pick<PhonePoolItem, 'phone_e164' | 'api_url'>) {
+  const phone = String(record.phone_e164 || '').trim()
+  const apiUrl = String(record.api_url || '').trim()
+  return apiUrl ? `${phone}----${apiUrl}` : phone
+}
+
+async function copyPhoneApiLine(record: Pick<PhonePoolItem, 'phone_e164' | 'api_url'>) {
+  const text = phoneApiCopyText(record)
+  if (!text) {
+    message.info('暂无可复制内容')
+    return
+  }
+  const ok = await copyTextToClipboard(text)
+  if (ok) {
+    message.success(record.api_url ? '已复制完整API' : '已复制手机号')
+    return
+  }
+  message.error('复制失败')
+}
+
 function downloadText(filename: string, text: string) {
   const blob = new Blob([text], { type: 'text/plain;charset=utf-8' })
   const url = URL.createObjectURL(blob)
@@ -953,7 +973,7 @@ export default function PhonePool() {
                   }}
                 />
                 <div className="mobile-record-main">
-                  <Typography.Text code copyable={{ text: record.api_url ? `${record.phone_e164}----${record.api_url}` : record.phone_e164 }} className="mobile-record-title">
+                  <Typography.Text code copyable={{ text: phoneApiCopyText(record), tooltips: [record.api_url ? '复制完整API' : '复制手机号', '已复制'] }} className="mobile-record-title">
                     {record.phone_e164}
                   </Typography.Text>
                   <div className="mobile-record-meta">
@@ -968,9 +988,16 @@ export default function PhonePool() {
               <div className="mobile-record-section">
                 <div className="mobile-record-field">
                   <span className="mobile-record-label">收码 API</span>
-                  <Typography.Text className="mobile-record-value">
-                    {record.api_host || record.api_url || '-'}
-                  </Typography.Text>
+                  <Space size={4} className="mobile-record-value" style={{ minWidth: 0 }}>
+                    <Typography.Text ellipsis={{ tooltip: record.api_url || record.api_host }} style={{ maxWidth: 220 }}>
+                      {record.api_url || record.api_host || '-'}
+                    </Typography.Text>
+                    {record.api_url ? (
+                      <Tooltip title="复制完整API">
+                        <Button type="text" size="small" icon={<CopyOutlined />} onClick={() => void copyPhoneApiLine(record)} />
+                      </Tooltip>
+                    ) : null}
+                  </Space>
                 </div>
                 <div className="mobile-record-field">
                   <span className="mobile-record-label">API到期</span>
@@ -1024,7 +1051,7 @@ export default function PhonePool() {
       key: 'phone_e164',
       render: (value: string, record: PhonePoolItem) => (
         <Space direction="vertical" size={2}>
-          <Typography.Text code copyable={{ text: record.api_url ? `${value}----${record.api_url}` : value, tooltips: ['复制', '已复制'] }}>{value}</Typography.Text>
+          <Typography.Text code copyable={{ text: phoneApiCopyText(record), tooltips: [record.api_url ? '复制完整API' : '复制手机号', '已复制'] }}>{value}</Typography.Text>
           {record.label ? <Typography.Text type="secondary" style={{ fontSize: 12 }}>{record.label}</Typography.Text> : null}
         </Space>
       ),
@@ -1033,13 +1060,23 @@ export default function PhonePool() {
       title: '收码 API',
       dataIndex: 'api_url',
       key: 'api_url',
-      render: (value: string) => value ? (
-        <Typography.Text
-          ellipsis={{ tooltip: value }}
-          style={{ display: 'block', maxWidth: 260 }}
-        >
-          {value}
-        </Typography.Text>
+      render: (value: string, record: PhonePoolItem) => value ? (
+        <Space size={4} style={{ maxWidth: 292 }}>
+          <Typography.Text
+            ellipsis={{ tooltip: value }}
+            style={{ display: 'block', maxWidth: 260 }}
+          >
+            {value}
+          </Typography.Text>
+          <Tooltip title="复制完整API">
+            <Button
+              type="text"
+              size="small"
+              icon={<CopyOutlined />}
+              onClick={() => void copyPhoneApiLine(record)}
+            />
+          </Tooltip>
+        </Space>
       ) : <Typography.Text type="secondary">-</Typography.Text>,
     },
     {
@@ -1512,7 +1549,7 @@ export default function PhonePool() {
             <Descriptions size="small" bordered column={1}>
               <Descriptions.Item label="收码 API">
                 {diagnosticItem.api_url ? (
-                  <Typography.Text copyable={{ text: diagnosticItem.api_url }} ellipsis={{ tooltip: diagnosticItem.api_url }}>
+                  <Typography.Text copyable={{ text: phoneApiCopyText(diagnosticItem), tooltips: ['复制完整API', '已复制'] }} ellipsis={{ tooltip: diagnosticItem.api_url }}>
                     {diagnosticItem.api_url}
                   </Typography.Text>
                 ) : '-'}
