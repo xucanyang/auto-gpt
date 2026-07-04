@@ -5748,7 +5748,7 @@ def _run_batch_oaipay_upload(task_id: str, account_ids: list[int], category_id: 
 
 
 def _run_baxigpt_cdk_submit(task_id: str, pairs: list[dict[str, Any]], settings: dict[str, Any]):
-    from services.chatgpt_core.baxigpt_cdk_repository import BaxiGptCdkRepository
+    from services.chatgpt_core.baxigpt_cdk_repository import BaxiGptCdkRepository, STATUS_PAID
     from services.chatgpt_core.baxigpt_client import BaxiGptClient
     from services.chatgpt_core.baxigpt_status_poller import enqueue_status_poll
 
@@ -5756,7 +5756,9 @@ def _run_baxigpt_cdk_submit(task_id: str, pairs: list[dict[str, Any]], settings:
     repo = BaxiGptCdkRepository()
     client = BaxiGptClient()
     total = max(len(pairs), 1)
+    submitted_count = 0
     success_count = 0
+    timeout_count = 0
     skipped_count = 0
     errors: list[str] = []
     runtime_results: list[dict[str, Any]] = []
@@ -5780,7 +5782,9 @@ def _run_baxigpt_cdk_submit(task_id: str, pairs: list[dict[str, Any]], settings:
             task_id,
             {
                 "runtime_results": list(runtime_results),
+                "runtime_submitted": submitted_count,
                 "runtime_success": success_count,
+                "runtime_timeout": timeout_count,
                 "runtime_skipped": skipped_count,
                 "runtime_errors": list(errors),
             },
@@ -5975,17 +5979,27 @@ def _run_baxigpt_cdk_submit(task_id: str, pairs: list[dict[str, Any]], settings:
                                 order_id = str(sub_info.get("order_id") or "")
                                 display_id = str(sub_info.get("display_id") or "")
                                 
-                                repo.reserve_for_account(rec.id, account_id=acc_item["account_id"], email=acc_item["email"], task_id=task_id)
+                                reserved_record = repo.reserve_for_account(rec.id, account_id=acc_item["account_id"], email=acc_item["email"], task_id=task_id) or rec
+                                submitted_record = repo.mark_submit_success(reserved_record.id, {
+                                    "ok": True,
+                                    "status": str(sub_info.get("status") or res.get("status") or "submitted"),
+                                    "order_id": order_id,
+                                    "display_id": display_id,
+                                    "email": acc_item.get("email") or sub_info.get("email") or "",
+                                    "raw_response": res,
+                                }) or reserved_record
                                 with Session(engine) as session:
                                     acc = session.get(AccountModel, acc_item["account_id"])
                                     if acc:
-                                        repo.persist_account_binding_extra(acc, rec, status="submitted", order_id=order_id, display_id=display_id)
+                                        repo.persist_account_binding_extra(acc, submitted_record)
                                         session.add(acc)
                                         session.commit()
                                         
+                                submitted_count += 1
                                 active_orders.append({
                                     "vb": {"item": acc_item, "account": acc, "token": token},
                                     "cdk_data": assigned_cdk,
+                                    "record": submitted_record,
                                     "order_id": order_id,
                                     "display_id": display_id,
                                     "submitted_at": time.time(),
@@ -6033,7 +6047,7 @@ def _run_baxigpt_cdk_submit(task_id: str, pairs: list[dict[str, Any]], settings:
                     control.checkpoint(attempt_id=attempt_id)
                     vb = order["vb"]
                     cdk_data = order["cdk_data"]
-                    rec = cdk_data["record"]
+                    rec = order.get("record") or cdk_data["record"]
                     order_id = order["order_id"]
                     
                     try:
@@ -6048,11 +6062,12 @@ def _run_baxigpt_cdk_submit(task_id: str, pairs: list[dict[str, Any]], settings:
                         success_count += 1
                         cdk_data["remaining"] -= 1
                         _log(task_id, f"[OK] Idea 开通成功: {vb['item'].get('email')} -> {rec.code_masked} (order_id={order_id})")
-                        repo.mark_submit_success(rec.id, {"status": "paid", "order_id": order_id, "display_id": order["display_id"], "email": vb['item'].get('email')})
+                        paid_record = repo.mark_submit_success(rec.id, {"status": "paid", "order_id": order_id, "display_id": order["display_id"], "email": vb['item'].get('email')}) or rec
+                        order["record"] = paid_record
                         with Session(engine) as session:
                             acc = session.get(AccountModel, vb["item"]["account_id"])
                             if acc:
-                                repo.persist_account_binding_extra(acc, rec, status=STATUS_PAID, order_id=order_id, display_id=order["display_id"])
+                                repo.persist_account_binding_extra(acc, paid_record, status=STATUS_PAID, order_id=order_id, display_id=order["display_id"])
                                 session.add(acc)
                                 session.commit()
                         append_result(account_id=vb["item"]["account_id"], email=vb["item"].get("email"), cdk_id=rec.id, code_masked=rec.code_masked, status="paid", order_id=order_id)
@@ -6061,12 +6076,21 @@ def _run_baxigpt_cdk_submit(task_id: str, pairs: list[dict[str, Any]], settings:
                         err_text = err_msg or "Idea 上游处理失败"
                         _log(task_id, f"[FAIL] Idea 开通失败: {vb['item'].get('email')} -> {rec.code_masked} 原因: {err_text}")
                         errors.append(f"{vb['item'].get('email')}: {err_text}")
+                        failed_record = repo.mark_status_response(rec.id, {
+                            "ok": True,
+                            "status": "failed",
+                            "order_id": order_id,
+                            "display_id": order["display_id"],
+                            "email": vb["item"].get("email"),
+                            "message": err_text,
+                        }) or rec
+                        order["record"] = failed_record
                         
                         # 1. 本地标记提交失败的账号没有资格
                         with Session(engine) as session:
                             acc = session.get(AccountModel, vb["item"]["account_id"])
                             if acc:
-                                repo.mark_account_ineligible(acc, rec, err_text)
+                                repo.mark_account_ineligible(acc, failed_record, err_text)
                                 session.add(acc)
                                 session.commit()
                         _log(task_id, f"[Idea] 自动标记账号没有资格: {vb['item'].get('email')} ({err_text})")
@@ -6082,6 +6106,7 @@ def _run_baxigpt_cdk_submit(task_id: str, pairs: list[dict[str, Any]], settings:
                             pending_accounts.clear()
                             
                     elif time.time() - order["submitted_at"] > status_poll_timeout_seconds:
+                        timeout_count += 1
                         _log(task_id, f"[WARN] 轮询结果超时: {vb['item'].get('email')} (order_id={order_id})")
                         append_result(account_id=vb["item"]["account_id"], email=vb["item"].get("email"), cdk_id=rec.id, code_masked=rec.code_masked, status="timeout", reason="轮询处理超时", order_id=order_id)
                     else:
@@ -6093,12 +6118,18 @@ def _run_baxigpt_cdk_submit(task_id: str, pairs: list[dict[str, Any]], settings:
             control.finish_attempt(attempt_id)
             _task_store.set_progress(task_id, f"{success_count}/{total}")
 
-        summary_message = f"Idea 卡密提交完成: 上游提交成功 {success_count} 个，跳过 {skipped_count} 个，失败 {len(errors)} 个"
+        summary_message = (
+            "Idea 卡密提交完成: "
+            f"上游已受理 {submitted_count} 个，开通成功 {success_count} 个，"
+            f"跳过 {skipped_count} 个，失败 {len(errors)} 个，超时 {timeout_count} 个"
+        )
         if errors:
             summary_message = f"{summary_message}；首个失败: {errors[0]}"
+        elif timeout_count:
+            summary_message = f"{summary_message}；存在轮询超时，请按 order_id 复核上游状态"
         _log(task_id, f"[SUMMARY] {summary_message}")
         latest_meta = dict(_task_store.snapshot(task_id).get("meta") or {})
-        log_status = "success" if success_count > 0 and not errors else "failed"
+        log_status = "success" if success_count > 0 and not errors and timeout_count == 0 else "failed"
         _save_task_log(
             "chatgpt",
             primary_email,

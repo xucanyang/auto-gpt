@@ -1,6 +1,8 @@
 """BaxiGPT 卡密提交接口客户端 (Modified to use openai-pay-submit backend)."""
 from __future__ import annotations
 
+import base64
+import json
 import os
 import time
 from typing import Any
@@ -14,6 +16,56 @@ DEFAULT_WORKER_TOKEN = os.environ.get("OAIPAY_WORKER_TOKEN", "xucanyang")
 
 class BaxiGptRequestError(RuntimeError):
     pass
+
+
+def _email_from_jwt(token: str) -> str:
+    text = str(token or "").strip()
+    parts = text.split(".")
+    if len(parts) < 2:
+        return ""
+    try:
+        payload_segment = parts[1]
+        payload_segment += "=" * (-len(payload_segment) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(payload_segment.encode("utf-8")).decode("utf-8"))
+    except Exception:
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    profile = payload.get("https://api.openai.com/profile")
+    if isinstance(profile, dict):
+        email = str(profile.get("email") or "").strip()
+        if email:
+            return email
+    for key in ("email", "preferred_username", "username"):
+        email = str(payload.get(key) or "").strip()
+        if email:
+            return email
+    return ""
+
+
+def _looks_like_fallback_task_id(task_id: str) -> bool:
+    value = str(task_id or "").strip().lower()
+    return not value or value.startswith("fallback_")
+
+
+def _task_message(task: dict[str, Any] | None, fallback: str = "") -> str:
+    data = task if isinstance(task, dict) else {}
+    for key in ("fail_reason", "raw_fail_reason", "error", "message", "msg", "reason", "detail"):
+        text = str(data.get(key) or "").strip()
+        if text:
+            return text
+    return fallback
+
+
+def _normalize_task_status(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    if raw in {"success", "paid", "completed"}:
+        return "paid"
+    if raw in {"failed", "fail", "expired", "cancelled", "canceled", "invalid", "error", "used"}:
+        return "failed"
+    if raw in {"pending", "processing", "submitted", "extracting", "wait_scan", "verifying", "wait-scan"}:
+        return "processing"
+    return raw or "processing"
 
 
 class BaxiGptClient:
@@ -114,10 +166,21 @@ class BaxiGptClient:
 
     def code_info(self, code: str) -> dict[str, Any]:
         res = self._request("GET", "/api/task/cdk/check", params={"cdk": str(code or "")})
+        balance = int(res.get("balance") if "balance" in res else res.get("remaining") or 0)
+        total = int(res.get("initial_balance") or res.get("total") or balance or 0)
+        blocked_reason = str(res.get("blocked_reason") or "").strip()
+        can_submit_raw = res.get("can_submit")
+        can_submit = bool(can_submit_raw) if "can_submit" in res else balance > 0
+        ok = can_submit and not blocked_reason and balance > 0
         return {
-            "ok": True,
-            "remaining": res.get("balance", 0),
-            "total": res.get("balance", 0),
+            "ok": ok,
+            "remaining": balance,
+            "total": total,
+            "failed_count": int(res.get("failed_count") or 0),
+            "can_submit": can_submit,
+            "blocked_reason": blocked_reason,
+            "message": blocked_reason or ("" if ok else "卡密不可提交"),
+            "raw_response": res,
         }
 
     def submit(self, *, code: str, access_token: str | list[str]) -> dict[str, Any]:
@@ -128,30 +191,74 @@ class BaxiGptClient:
             "account": accounts[0] if accounts else ""
         }
         res = self._request("POST", "/api/task/submit", payload=payload, timeout=self.submit_timeout, retries=self.submit_retries)
-        
-        status_res = self._request("GET", "/api/task/status", params={"cdk": str(code or "")})
-        tasks = status_res.get("tasks", [])
+        created_tasks = [
+            item for item in (
+                res.get("created_tasks")
+                if isinstance(res.get("created_tasks"), list)
+                else res.get("tasks")
+                if isinstance(res.get("tasks"), list)
+                else []
+            )
+            if isinstance(item, dict)
+        ]
+        legacy_status_tasks: list[dict[str, Any]] = []
+        if not created_tasks:
+            status_res = self._request("GET", "/api/task/status", params={"cdk": str(code or "")})
+            legacy_status_tasks = [item for item in (status_res.get("tasks") if isinstance(status_res.get("tasks"), list) else []) if isinstance(item, dict)]
         
         submitted_items = []
+        unresolved: list[str] = []
+        consumed_task_ids: set[str] = set()
         for token in accounts:
+            token_email = _email_from_jwt(token)
             task_id = ""
             matched_t = None
-            for t in tasks:
-                t_acc = str(t.get("account") or "")
-                if t_acc == token or (token and t_acc.startswith(token[:20])):
+            candidate_tasks = created_tasks or legacy_status_tasks
+            for t in candidate_tasks:
+                candidate_id = str(t.get("task_id") or t.get("id") or "").strip()
+                if candidate_id and candidate_id in consumed_task_ids:
+                    continue
+                t_email = str(t.get("email") or t.get("account") or "").strip().lower()
+                if token_email and t_email == token_email.lower():
                     matched_t = t
-                    task_id = str(t.get("id", ""))
+                    task_id = candidate_id
                     break
-            if not task_id:
-                task_id = f"fallback_{token[:20]}"
+            if matched_t is None and len(candidate_tasks) == len(accounts):
+                for t in candidate_tasks:
+                    candidate_id = str(t.get("task_id") or t.get("id") or "").strip()
+                    if candidate_id and candidate_id not in consumed_task_ids:
+                        matched_t = t
+                        task_id = candidate_id
+                        break
+            if matched_t is None:
+                for t in candidate_tasks:
+                    candidate_id = str(t.get("task_id") or t.get("id") or "").strip()
+                    t_acc = str(t.get("account") or "")
+                    if candidate_id and t_acc == token and candidate_id not in consumed_task_ids:
+                        matched_t = t
+                        task_id = candidate_id
+                        break
+            if _looks_like_fallback_task_id(task_id):
+                unresolved.append(token_email or token[:20] or "unknown")
+                continue
+            consumed_task_ids.add(task_id)
             submitted_items.append({
                 "account": token,
+                "email": token_email or str((matched_t or {}).get("email") or (matched_t or {}).get("account") or ""),
                 "task_id": task_id,
                 "order_id": f"{code}::{task_id}",
                 "display_id": task_id,
                 "status": "submitted",
                 "raw_task": matched_t or {}
             })
+        if unresolved:
+            return {
+                "ok": False,
+                "status": "unresolved",
+                "message": "上游已受理但未返回可轮询任务ID: " + ", ".join(unresolved[:5]),
+                "submitted_items": submitted_items,
+                "raw_response": res,
+            }
             
         first_item = submitted_items[0] if submitted_items else {"order_id": f"{code}::fallback", "display_id": "fallback", "status": "submitted"}
         return {
@@ -168,25 +275,25 @@ class BaxiGptClient:
             return {"ok": False, "status": "failed", "message": f"Invalid order_id format: {order_id}"}
             
         code, task_id = order_id.split("::", 1)
-        res = self._request("GET", "/api/task/status", params={"cdk": code})
+        if _looks_like_fallback_task_id(task_id):
+            return {"ok": False, "status": "failed", "message": f"上游任务ID未解析，不能轮询: {task_id}"}
+        try:
+            res = self._request("GET", "/api/task/status", params={"task_id": task_id})
+        except Exception:
+            res = self._request("GET", "/api/task/status", params={"cdk": code})
         tasks = res.get("tasks", [])
         
         for t in tasks:
-            if str(t.get("id", "")) == task_id or (task_id.startswith("fallback_") and str(t.get("account", "")).startswith(task_id[9:])):
-                raw_status = str(t.get("status", ""))
-                if raw_status == "SUCCESS":
-                    mapped = "paid"
-                elif raw_status == "FAILED":
-                    mapped = "failed"
-                else:
-                    mapped = "processing"
+            if str(t.get("task_id") or t.get("id") or "") == task_id:
+                mapped = _normalize_task_status(t.get("status"))
                     
                 return {
                     "ok": True,
                     "status": mapped,
-                    "display_id": str(t.get("id", "")),
-                    "email": str(t.get("account", "")),
-                    "message": str(t.get("error") or t.get("message") or t.get("reason") or "")
+                    "display_id": str(t.get("task_id") or t.get("id") or ""),
+                    "email": str(t.get("email") or t.get("account") or ""),
+                    "message": _task_message(t),
+                    "raw_task": t,
                 }
                 
         return {"ok": False, "status": "processing", "message": "Task not found in status list yet"}
@@ -194,28 +301,28 @@ class BaxiGptClient:
     def query(self, code: str) -> dict[str, Any]:
         res = self._request("GET", "/api/task/status", params={"cdk": str(code or "")})
         tasks = res.get("tasks", [])
+        try:
+            info = self.code_info(code)
+        except Exception as exc:
+            info = {"ok": False, "remaining": 0, "total": 0, "message": str(exc)}
         
         orders = []
         for t in tasks:
-            raw_status = str(t.get("status", ""))
-            if raw_status == "SUCCESS":
-                mapped = "paid"
-            elif raw_status == "FAILED":
-                mapped = "failed"
-            else:
-                mapped = "processing"
+            mapped = _normalize_task_status(t.get("status"))
                 
             orders.append({
-                "order_id": f"{code}::{t.get('id', '')}",
+                "order_id": f"{code}::{t.get('task_id') or t.get('id', '')}",
                 "status": mapped,
-                "display_id": str(t.get("id", "")),
-                "email": str(t.get("account", "")),
-                "message": str(t.get("error") or t.get("message") or t.get("reason") or "")
+                "display_id": str(t.get("task_id") or t.get("id") or ""),
+                "email": str(t.get("email") or t.get("account") or ""),
+                "message": _task_message(t),
+                "raw_task": t,
             })
             
         return {
             "ok": True,
             "orders": orders,
-            "remaining": len(orders), 
-            "total": len(orders)
+            "remaining": int(info.get("remaining") or 0),
+            "total": int(info.get("total") or 0),
+            "code_info": info,
         }

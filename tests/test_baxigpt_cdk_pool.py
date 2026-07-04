@@ -442,7 +442,76 @@ class BaxiGptClientRetryTests(unittest.TestCase):
             self.assertEqual(st2["status"], "failed")
             self.assertEqual(st2["message"], "No trial eligibility")
 
+    def test_submit_prefers_created_task_ids_from_upstream(self):
+        class FakeResponse:
+            status_code = 200
+            def __init__(self, data): self._data = data
+            def json(self): return self._data
+
+        def fake_request(method, url, **kwargs):
+            self.assertIn("/api/task/submit", url)
+            return FakeResponse({
+                "status": "ok",
+                "created_tasks": [
+                    {"task_id": "real-task-1", "email": "user@example.com", "status": "PENDING"}
+                ],
+            })
+
+        with patch.object(client_module.cffi_requests, "request", fake_request):
+            client = BaxiGptClient()
+            res = client.submit(code="CDK-REAL", access_token="not-a-jwt")
+
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["order_id"], "CDK-REAL::real-task-1")
+        self.assertEqual(res["submitted_items"][0]["display_id"], "real-task-1")
+
+    def test_submit_fails_when_upstream_task_id_cannot_be_resolved(self):
+        class FakeResponse:
+            status_code = 200
+            def __init__(self, data): self._data = data
+            def json(self): return self._data
+
+        def fake_request(method, url, **kwargs):
+            if "/api/task/submit" in url:
+                return FakeResponse({"status": "ok", "message": "1 tasks created."})
+            if "/api/task/status" in url:
+                return FakeResponse({"tasks": []})
+            return FakeResponse({})
+
+        with patch.object(client_module.cffi_requests, "request", fake_request):
+            client = BaxiGptClient()
+            res = client.submit(code="CDK-NO-ID", access_token="eyJhbGciOiJSUzI1NiIs.fake")
+
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["status"], "unresolved")
+        self.assertIn("未返回可轮询任务ID", res["message"])
+
+    def test_status_reads_fail_reason_from_upstream_task(self):
+        class FakeResponse:
+            status_code = 200
+            def __init__(self, data): self._data = data
+            def json(self): return self._data
+
+        def fake_request(method, url, **kwargs):
+            self.assertIn("/api/task/status", url)
+            return FakeResponse({
+                "tasks": [
+                    {
+                        "task_id": "task-fail",
+                        "email": "user@example.com",
+                        "status": "FAILED",
+                        "fail_reason": "Billing country must match request country",
+                    }
+                ],
+            })
+
+        with patch.object(client_module.cffi_requests, "request", fake_request):
+            client = BaxiGptClient()
+            res = client.status("CDK-FAIL::task-fail")
+
+        self.assertEqual(res["status"], "failed")
+        self.assertEqual(res["message"], "Billing country must match request country")
+
 
 if __name__ == "__main__":
     unittest.main()
-
