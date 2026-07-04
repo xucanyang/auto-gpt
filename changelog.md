@@ -6,6 +6,14 @@
 
 ## [Unreleased] (未发布)
 
+## [1.2.9] - 2026-07-05
+### 修复 (Fixed)
+- **修复账号处理流水线 OAIPay 上传开关无法拉取分组的问题**：`frontend/src/pages/IdeaOaiPayPipeline.tsx` 为 `/idea-oaipay-pipeline` 的“OAIPay 上传”阶段补齐分组读取状态，当启用上传开关、打开分组下拉或点击“刷新分组”时，会调用现有 `/api/integrations/oaipay-categories` 接口拉取 OAIPay 分类，并把分类 ID、名称与库存统计展示为可搜索下拉选项；接口失败时在配置卡片内直接提示全局 OAIPay API URL / API Key 检查方向，避免只看到开关无反应。
+- **避免运行状态轮询覆盖未提交的流水线配置**：`frontend/src/pages/IdeaOaiPayPipeline.tsx` 将 3 秒状态轮询改为只刷新任务状态、账号明细和日志，不再每次把历史任务配置写回表单；只有页面首次进入和启动新流水线后才同步配置，防止用户刚打开 OAIPay 上传或修改 Idea/手机号参数又被轮询重置。
+
+### 优化 (Changed)
+- **同步前端版本号至 v1.2.9**：`frontend/src/app/AppShell.tsx` 侧边栏版本展示更新为 `v1.2.9`，用于上线后确认本次 `/idea-oaipay-pipeline` 静态资源已加载。
+
 ## [1.2.8] - 2026-07-05
 ### 优化 (Changed)
 - **规整账号处理流水线配置页布局**：`frontend/src/pages/IdeaOaiPayPipeline.tsx` 将 `/idea-oaipay-pipeline` 配置页从不等宽、不等高的 `Row/Col` 卡片拼接改为“账号来源”全宽配置区 + 四个阶段配置卡片的稳定网格结构；账号来源字段按来源、范围、筛选、注册补位目标统一排布，Idea、本地状态/Gate、手机号绑定、OAIPay 上传四个处理阶段使用一致的两列字段节奏和响应式断点，避免配置区大小随机、视觉重心歪斜。
@@ -256,3 +264,7 @@
 ## 2026-07-05 06:57:07 +0800
 - 规整账号处理流水线配置页布局
 - 发布模式: multi
+
+## 2026-07-05 07:24:34 +0800
+- 修复账号处理流水线 OAIPay 分组获取
+- 发布模式: hot

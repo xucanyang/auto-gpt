@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import {
   Alert,
   App,
@@ -105,6 +105,14 @@ type PipelineStatusResponse = {
   items?: PipelineItem[]
   logs?: string[]
   history?: PipelineTask[]
+}
+
+type OaipayCategory = {
+  id: number
+  name: string
+  description?: string
+  stock?: number
+  account_total?: number
 }
 
 type PipelineConfig = {
@@ -299,6 +307,70 @@ function parseIdLines(raw: string): number[] {
   return [...seen]
 }
 
+function optionalNumber(value: unknown): number | null {
+  const text = String(value ?? '').trim()
+  if (!text) return null
+  const num = Number(text)
+  return Number.isFinite(num) ? num : null
+}
+
+function objectRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null
+}
+
+function firstText(...values: unknown[]): string {
+  for (const value of values) {
+    const text = String(value ?? '').trim()
+    if (text) return text
+  }
+  return ''
+}
+
+function firstNumber(...values: unknown[]): number | undefined {
+  for (const value of values) {
+    const num = Number(value)
+    if (Number.isFinite(num)) return num
+  }
+  return undefined
+}
+
+function extractOaipayCategories(payload: unknown): OaipayCategory[] {
+  const root = objectRecord(payload)
+  const data = objectRecord(root?.data)
+  const rawItems =
+    (Array.isArray(payload) ? payload : null)
+    || (Array.isArray(root?.categories) ? root.categories : null)
+    || (Array.isArray(root?.data) ? root.data : null)
+    || (Array.isArray(root?.items) ? root.items : null)
+    || (Array.isArray(data?.categories) ? data.categories : null)
+    || (Array.isArray(data?.items) ? data.items : null)
+    || []
+
+  const seen = new Set<number>()
+  return rawItems.flatMap((raw) => {
+    const item = objectRecord(raw)
+    if (!item) return []
+    const id = firstNumber(item.id, item.category_id, item.value)
+    if (!id || seen.has(id)) return []
+    seen.add(id)
+    return [{
+      id,
+      name: firstText(item.name, item.title, item.label, `分组 ${id}`),
+      description: firstText(item.description),
+      stock: firstNumber(item.stock, item.account_in_stock),
+      account_total: firstNumber(item.account_total, item.total),
+    }]
+  })
+}
+
+function formatOaipayCategoryLabel(category: OaipayCategory): string {
+  const stats: string[] = []
+  if (typeof category.stock === 'number') stats.push(`库存 ${category.stock}`)
+  if (typeof category.account_total === 'number') stats.push(`总数 ${category.account_total}`)
+  const suffix = stats.length ? ` · ${stats.join(' / ')}` : ''
+  return `#${category.id} ${category.name}${suffix}`
+}
+
 function formatDateTime(value?: string) {
   if (!value) return '-'
   const date = new Date(value)
@@ -383,7 +455,7 @@ function buildConfigFromValues(values: Record<string, unknown>): PipelineConfig 
     },
     oaipay: {
       enabled: Boolean(values.oaipay_enabled),
-      category_id: values.oaipay_category_id ? Number(values.oaipay_category_id) : null,
+      category_id: optionalNumber(values.oaipay_category_id),
       exists_as_success: Boolean(values.oaipay_exists_as_success),
       require_phone_bound: Boolean(values.oaipay_require_phone_bound),
       require_subscription_in: Array.isArray(values.oaipay_require_subscription_in) ? values.oaipay_require_subscription_in as string[] : [],
@@ -455,14 +527,46 @@ export default function IdeaOaiPayPipelinePage() {
   const [filter, setFilter] = useState<FilterKey>('all')
   const [search, setSearch] = useState('')
   const [logTaskId, setLogTaskId] = useState('')
+  const [oaipayCategories, setOaipayCategories] = useState<OaipayCategory[]>([])
+  const [oaipayCategoryLoading, setOaipayCategoryLoading] = useState(false)
+  const [oaipayCategoryLoaded, setOaipayCategoryLoaded] = useState(false)
+  const [oaipayCategoryError, setOaipayCategoryError] = useState('')
+  const oaipayUploadEnabled = Form.useWatch('oaipay_enabled', form)
   const isMobile = screens.md === false
 
-  const loadStatus = async () => {
+  const loadOaipayCategories = useCallback(async (options: { force?: boolean; silent?: boolean } = {}) => {
+    if (!options.force && (oaipayCategoryLoaded || oaipayCategoryLoading)) return
+    setOaipayCategoryLoading(true)
+    setOaipayCategoryError('')
+    try {
+      const res = await apiFetch('/integrations/oaipay-categories')
+      const root = objectRecord(res)
+      const errorText = firstText(root?.error, root?.detail, root?.message)
+      if (root?.success === false && errorText) {
+        throw new Error(errorText)
+      }
+      const categories = extractOaipayCategories(res)
+      setOaipayCategories(categories)
+      setOaipayCategoryLoaded(true)
+      if (!options.silent) {
+        message.success(categories.length ? `已获取 ${categories.length} 个 OAIPay 分组` : 'OAIPay 没有返回可选分组，可继续留空使用自动分类')
+      }
+    } catch (error) {
+      const text = (error as Error).message || String(error)
+      setOaipayCategoryError(text)
+      setOaipayCategoryLoaded(false)
+      if (!options.silent) message.error(`获取 OAIPay 分组失败: ${text}`)
+    } finally {
+      setOaipayCategoryLoading(false)
+    }
+  }, [message, oaipayCategoryLoaded, oaipayCategoryLoading])
+
+  const loadStatus = async (options: { syncForm?: boolean } = {}) => {
     setLoading(true)
     try {
       const data = await apiFetch('/idea-oaipay-pipeline/status?item_limit=1000') as PipelineStatusResponse
       setStatusData(data)
-      if (data.config) {
+      if (options.syncForm && data.config) {
         form.setFieldsValue(initialFormValues(data.config))
       }
     } catch (error) {
@@ -473,10 +577,16 @@ export default function IdeaOaiPayPipelinePage() {
   }
 
   useEffect(() => {
-    loadStatus()
-    const timer = window.setInterval(loadStatus, 3000)
+    loadStatus({ syncForm: true })
+    const timer = window.setInterval(() => loadStatus(), 3000)
     return () => window.clearInterval(timer)
   }, [])
+
+  useEffect(() => {
+    if (oaipayUploadEnabled) {
+      void loadOaipayCategories({ silent: true })
+    }
+  }, [loadOaipayCategories, oaipayUploadEnabled])
 
   const task = statusData?.task || null
   const summary = statusData?.summary || {}
@@ -530,7 +640,7 @@ export default function IdeaOaiPayPipelinePage() {
         method: 'POST',
         body: JSON.stringify({ config }),
       })
-      await loadStatus()
+      await loadStatus({ syncForm: true })
       message.success('流水线已启动')
     } catch (error) {
       message.error(`启动失败: ${(error as Error).message}`)
@@ -645,7 +755,7 @@ export default function IdeaOaiPayPipelinePage() {
                 <Button type="primary" icon={<PlayCircleOutlined />} onClick={handleStart} loading={actionLoading === 'start'} disabled={isRunning || isPaused}>启动新流水线</Button>
                 <Button icon={<PauseCircleOutlined />} onClick={() => invokeAction(isPaused ? '/idea-oaipay-pipeline/resume' : '/idea-oaipay-pipeline/pause', 'pause')} loading={actionLoading === 'pause'} disabled={!task || normalized(task.status) === 'stopped'}>{isPaused ? '恢复' : '暂停'}</Button>
                 <Button danger icon={<StopOutlined />} onClick={() => invokeAction('/idea-oaipay-pipeline/stop', 'stop')} loading={actionLoading === 'stop'} disabled={!task || normalized(task.status) === 'stopped'}>停止</Button>
-                <Button icon={<ReloadOutlined />} onClick={loadStatus} loading={loading}>刷新</Button>
+                <Button icon={<ReloadOutlined />} onClick={() => loadStatus()} loading={loading}>刷新</Button>
               </Space>
             </Col>
             <Col xs={24} lg={12}>
@@ -662,7 +772,19 @@ export default function IdeaOaiPayPipelinePage() {
       <Tabs
         items={[
           { key: 'overview', label: '概览', children: <OverviewPanel task={task} items={items} logs={logs} /> },
-          { key: 'config', label: '配置', children: <ConfigPanel form={form} /> },
+          {
+            key: 'config',
+            label: '配置',
+            children: (
+              <ConfigPanel
+                form={form}
+                oaipayCategories={oaipayCategories}
+                oaipayCategoryLoading={oaipayCategoryLoading}
+                oaipayCategoryError={oaipayCategoryError}
+                onLoadOaipayCategories={loadOaipayCategories}
+              />
+            ),
+          },
           {
             key: 'items',
             label: '账号明细',
@@ -770,7 +892,28 @@ function OverviewPanel({ task, items, logs }: { task: PipelineTask | null; items
   )
 }
 
-function ConfigPanel({ form }: { form: ReturnType<typeof Form.useForm>[0] }) {
+function ConfigPanel({
+  form,
+  oaipayCategories,
+  oaipayCategoryLoading,
+  oaipayCategoryError,
+  onLoadOaipayCategories,
+}: {
+  form: ReturnType<typeof Form.useForm>[0]
+  oaipayCategories: OaipayCategory[]
+  oaipayCategoryLoading: boolean
+  oaipayCategoryError: string
+  onLoadOaipayCategories: (options?: { force?: boolean; silent?: boolean }) => Promise<void>
+}) {
+  const oaipayEnabled = Form.useWatch('oaipay_enabled', form)
+  const oaipayCategoryOptions = useMemo(
+    () => oaipayCategories.map((category) => ({
+      value: category.id,
+      label: formatOaipayCategoryLabel(category),
+    })),
+    [oaipayCategories],
+  )
+
   return (
     <Form form={form} layout="vertical" initialValues={initialFormValues(DEFAULT_CONFIG)} className="idea-oaipay-config-form">
       <Space direction="vertical" size={12} style={{ display: 'flex' }}>
@@ -892,14 +1035,60 @@ function ConfigPanel({ form }: { form: ReturnType<typeof Form.useForm>[0] }) {
             </div>
           </Card>
 
-          <Card title="OAIPay 上传" size="small" className="idea-oaipay-config-card">
+          <Card
+            title="OAIPay 上传"
+            size="small"
+            className="idea-oaipay-config-card"
+            extra={
+              <Button
+                size="small"
+                icon={<ReloadOutlined />}
+                loading={oaipayCategoryLoading}
+                onClick={() => onLoadOaipayCategories({ force: true })}
+              >
+                刷新分组
+              </Button>
+            }
+          >
             <div className="idea-oaipay-card-fields">
               <Form.Item name="oaipay_enabled" valuePropName="checked" label="启用上传">
-                <Switch />
+                <Switch onChange={(checked) => {
+                  if (checked) void onLoadOaipayCategories()
+                }} />
               </Form.Item>
-              <Form.Item name="oaipay_category_id" label="分类 ID">
-                <InputNumber min={0} style={{ width: '100%' }} placeholder="为空走自动分类" />
+              <Form.Item
+                name="oaipay_category_id"
+                label="上传分组"
+                tooltip="启用上传后会自动读取 OAIPay 分组；留空时后端按账号状态自动分类，自动分类失败再使用全局默认分组。"
+              >
+                <Select
+                  allowClear
+                  showSearch
+                  disabled={!oaipayEnabled && oaipayCategoryOptions.length === 0}
+                  loading={oaipayCategoryLoading}
+                  options={oaipayCategoryOptions}
+                  optionFilterProp="label"
+                  placeholder={oaipayCategoryLoading ? '正在获取分组...' : '选择分组；留空走自动分类'}
+                  onOpenChange={(open) => {
+                    if (open) void onLoadOaipayCategories()
+                  }}
+                  notFoundContent={oaipayCategoryLoading ? '正在获取分组...' : '暂无分组；可刷新或留空'}
+                />
               </Form.Item>
+              {oaipayCategoryError ? (
+                <Alert
+                  showIcon
+                  type="warning"
+                  className="idea-oaipay-field-full"
+                  message="OAIPay 分组获取失败"
+                  description={`请检查全局配置里的 OAIPay API URL / API Key，或点击刷新重试：${oaipayCategoryError}`}
+                  action={
+                    <Button size="small" onClick={() => onLoadOaipayCategories({ force: true })} loading={oaipayCategoryLoading}>
+                      重试
+                    </Button>
+                  }
+                />
+              ) : null}
               <Form.Item name="oaipay_exists_as_success" valuePropName="checked" className="idea-oaipay-field-full">
                 <Checkbox>远端已存在视为成功</Checkbox>
               </Form.Item>
