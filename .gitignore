@@ -69,3 +69,14 @@ smstome_used/
 
 # 临时调试脚本
 tmp_*.py
+
+# 运行时挂载 / 外部工作区 / 敏感调试材料
+_ext_targets/
+external_logs/
+*.har
+*.har.gz
+*.db-wal
+*.db-shm
+*.sqlite-wal
+*.sqlite-shm
+smstome_used

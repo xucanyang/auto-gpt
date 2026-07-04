@@ -38,6 +38,7 @@ from services.pipeline import pipeline_engine
 
 EXPECTED_CONDA_ENV = os.getenv("APP_CONDA_ENV", "auto-chatgpt")
 PUBLIC_API_PATHS = {
+    "/api/health",
     "/api/chatgpt/export-sub2api-download",
     "/api/integrations/gopay-otp/admin",
     "/api/integrations/gopay-otp/smsforwarder",
@@ -292,6 +293,11 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Account Manager", version="1.0.0", lifespan=lifespan)
+
+
+@app.get("/api/health", include_in_schema=False)
+def api_health():
+    return {"ok": True, "service": "auto-gpt"}
 
 
 @app.middleware("http")
