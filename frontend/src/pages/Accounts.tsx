@@ -106,6 +106,26 @@ const ACCOUNT_PAGE_SIZE_OPTIONS = [10, 20, 50]
 const EMPTY_LIST: any[] = []
 const SUBSCRIPTION_EXPIRY_SORT_FIELD = 'subscription_active_until'
 
+type PhonePoolMode = 'normal' | 'prefix_limited' | 'prefix_sample'
+type PhonePoolPrefixStatus = 'available' | 'unavailable' | 'temporary' | 'exhausted'
+type PhonePoolPrefixItem = {
+  prefix: string
+  status: PhonePoolPrefixStatus | string
+  total?: number
+  available_count?: number
+  remaining_capacity?: number
+  rejected_count?: number
+  bind_limit_count?: number
+  [key: string]: unknown
+}
+
+type PhonePoolPrefixGroup = {
+  key: PhonePoolPrefixStatus
+  label: string
+  color: string
+  items: PhonePoolPrefixItem[]
+}
+
 function loadAccountsPageSize() {
   if (typeof window === 'undefined') return DEFAULT_ACCOUNTS_PAGE_SIZE
   const value = Number(window.localStorage.getItem(ACCOUNTS_PAGE_SIZE_STORAGE_KEY) || '')
@@ -114,6 +134,8 @@ function loadAccountsPageSize() {
 
 const DEFAULT_PHONE_BINDING_SETTINGS = {
   use_pool: true,
+  phone_pool_mode: 'normal' as PhonePoolMode,
+  selected_prefixes: [] as string[],
   prefix_sample_enabled: false,
   prefix_sample_size: 1,
   prefix_sample_filter: 'all',
@@ -185,6 +207,18 @@ type PhonePoolSummary = {
   rejected_prefix_count?: number
   rejected_prefix_sample_1?: number
   rejected_prefix_sample_2?: number
+  available_prefixes?: Array<Record<string, unknown>>
+  rejected_prefixes?: Array<Record<string, unknown>>
+  exhausted_prefix_count?: number
+  exhausted_prefixes?: Array<Record<string, unknown>>
+  temporary_prefix_count?: number
+  temporary_prefixes?: Array<Record<string, unknown>>
+  prefix_health?: {
+    available?: Array<Record<string, unknown>>
+    unavailable?: Array<Record<string, unknown>>
+    exhausted?: Array<Record<string, unknown>>
+    temporary?: Array<Record<string, unknown>>
+  }
 }
 
 type BaxiGptCdkPoolSummary = {
@@ -651,11 +685,73 @@ function intWithDefault(value: unknown, fallback: number, min = 0) {
   return Math.max(Math.floor(next), min)
 }
 
+function normalizePhonePoolMode(value: unknown, raw?: Record<string, unknown>): PhonePoolMode {
+  const mode = String(value || '').trim()
+  if (mode === 'prefix_limited' || mode === 'prefix_sample' || mode === 'normal') {
+    return mode
+  }
+  if (raw && Boolean(raw.prefix_bind_enabled)) return 'prefix_limited'
+  if (raw && Boolean(raw.prefix_sample_enabled)) return 'prefix_sample'
+  return 'normal'
+}
+
+function normalizeSelectedPrefixes(value: unknown): string[] {
+  const rawValues = Array.isArray(value)
+    ? value
+    : typeof value === 'string'
+      ? value.split(/[\s,，;；、]+/)
+      : []
+  const result: string[] = []
+  const seen = new Set<string>()
+  for (const raw of rawValues) {
+    const prefix = String(raw ?? '').replace(/\D/g, '').slice(0, 4)
+    if (prefix.length !== 4 || seen.has(prefix)) continue
+    seen.add(prefix)
+    result.push(prefix)
+    if (result.length >= 500) break
+  }
+  return result
+}
+
+function normalizePhonePoolPrefixItem(raw: unknown, fallbackStatus: PhonePoolPrefixStatus): PhonePoolPrefixItem | null {
+  const source = raw && typeof raw === 'object' ? raw as Record<string, unknown> : { prefix: raw }
+  const prefix = String(source.prefix ?? source.prefix4 ?? source.phone_prefix ?? '').replace(/\D/g, '').slice(0, 4)
+  if (prefix.length !== 4) return null
+  const item: PhonePoolPrefixItem = {
+    ...source,
+    prefix,
+    status: String(source.status || fallbackStatus),
+  }
+  for (const key of ['total', 'available_count', 'remaining_capacity', 'rejected_count', 'bind_limit_count']) {
+    const value = Number(source[key])
+    if (Number.isFinite(value)) {
+      item[key] = value
+    }
+  }
+  return item
+}
+
+function uniquePhonePoolPrefixItems(values: unknown, fallbackStatus: PhonePoolPrefixStatus): PhonePoolPrefixItem[] {
+  const rawItems = Array.isArray(values) ? values : []
+  const result: PhonePoolPrefixItem[] = []
+  const seen = new Set<string>()
+  for (const raw of rawItems) {
+    const item = normalizePhonePoolPrefixItem(raw, fallbackStatus)
+    if (!item || seen.has(item.prefix)) continue
+    seen.add(item.prefix)
+    result.push(item)
+  }
+  return result
+}
+
 function normalizePhoneBindingSettings(value: unknown): PhoneBindingSettings {
   const raw = value && typeof value === 'object' ? value as Record<string, unknown> : {}
+  const phonePoolMode = normalizePhonePoolMode(raw.phone_pool_mode, raw)
   return {
     use_pool: raw.use_pool === undefined ? DEFAULT_PHONE_BINDING_SETTINGS.use_pool : Boolean(raw.use_pool),
-    prefix_sample_enabled: Boolean(raw.prefix_sample_enabled),
+    phone_pool_mode: phonePoolMode,
+    selected_prefixes: normalizeSelectedPrefixes(raw.selected_prefixes),
+    prefix_sample_enabled: phonePoolMode === 'prefix_sample',
     prefix_sample_size: intWithDefault(raw.prefix_sample_size, DEFAULT_PHONE_BINDING_SETTINGS.prefix_sample_size, 1) === 2 ? 2 : 1,
     prefix_sample_filter: (() => {
       const value = String(raw.prefix_sample_filter || DEFAULT_PHONE_BINDING_SETTINGS.prefix_sample_filter)
@@ -1626,6 +1722,7 @@ export default function Accounts() {
   const [phoneBindingTestLoading, setPhoneBindingTestLoading] = useState(false)
   const [phoneBindingTestScope, setPhoneBindingTestScope] = useState<'selected' | 'filtered'>('selected')
   const [phoneBindingManualOpen, setPhoneBindingManualOpen] = useState(false)
+  const [phoneBindingPrefixPickerOpen, setPhoneBindingPrefixPickerOpen] = useState(false)
   const [phoneBindingAdvancedOpen, setPhoneBindingAdvancedOpen] = useState(false)
   const [phonePoolSummary, setPhonePoolSummary] = useState<PhonePoolSummary | null>(null)
   const [phonePoolSummaryLoading, setPhonePoolSummaryLoading] = useState(false)
@@ -1656,10 +1753,12 @@ export default function Accounts() {
   const [batchPaymentLinkConfigForm] = Form.useForm()
   const [batchProbeStatusConfigForm] = Form.useForm()
   const phoneBindingUsePoolValue = Form.useWatch('use_pool', phoneBindingTestForm)
-  const phoneBindingPrefixSampleValue = Form.useWatch('prefix_sample_enabled', phoneBindingTestForm)
+  const phoneBindingPoolModeValue = Form.useWatch('phone_pool_mode', phoneBindingTestForm)
+  const phoneBindingSelectedPrefixesValue = Form.useWatch('selected_prefixes', phoneBindingTestForm)
   const phoneBindingPrefixSampleSizeValue = Form.useWatch('prefix_sample_size', phoneBindingTestForm)
   const phoneBindingPrefixSampleFilterValue = Form.useWatch('prefix_sample_filter', phoneBindingTestForm)
   const phoneBindingSmsProbeOnlyValue = Form.useWatch('prefix_sms_probe_only', phoneBindingTestForm)
+  const phoneBindingReusePhoneValue = Form.useWatch('reuse_phone_until_unusable', phoneBindingTestForm)
   const phoneBindingPhoneLinesValue = Form.useWatch('phone_lines', phoneBindingTestForm)
   const phoneBindingProxyModeValue = Form.useWatch('proxy_mode', phoneBindingTestForm)
   const phoneBindingProxyFailoverValue = Form.useWatch('proxy_failover', phoneBindingTestForm)
@@ -2950,6 +3049,7 @@ export default function Accounts() {
       phone_lines: '',
     })
     setPhoneBindingManualOpen(false)
+    setPhoneBindingPrefixPickerOpen(false)
     setPhoneBindingAdvancedOpen(false)
     setPhoneBindingTestOpen(true)
     void loadPhonePoolSummary()
@@ -2958,25 +3058,43 @@ export default function Accounts() {
   const submitPhoneBindingTest = async () => {
     const values = await phoneBindingTestForm.validateFields()
     validateTaskProxySettings(values)
-    savePhoneBindingSettings(values)
-    await saveTaskProxySettingsToConfig(values)
-    await loadConfigCache({ force: true }).catch(() => null)
     const scope = (values.scope === 'filtered' ? 'filtered' : 'selected') as 'selected' | 'filtered'
     const phoneLines = String(values.phone_lines || '').trim()
     // 手动粘贴优先：避免默认“使用手机号池”开启时忽略用户粘贴的号码。
-    const prefixSampleEnabled = !phoneLines && Boolean(values.prefix_sample_enabled)
+    const phonePoolMode = normalizePhonePoolMode(values.phone_pool_mode, values as Record<string, unknown>)
+    const selectedPrefixes = normalizeSelectedPrefixes(values.selected_prefixes)
+    const prefixBindEnabled = !phoneLines && phonePoolMode === 'prefix_limited'
+    const prefixSampleEnabled = !phoneLines && phonePoolMode === 'prefix_sample'
     const smsProbeOnly = Boolean(values.prefix_sms_probe_only || values.sms_probe_only)
     const rawPrefixSampleFilter = String(values.prefix_sample_filter || 'all')
     const prefixSampleFilter = rawPrefixSampleFilter === 'available' ? 'available' : rawPrefixSampleFilter === 'rejected' ? 'rejected' : 'all'
-    const usePool = !phoneLines && (Boolean(values.use_pool) || prefixSampleEnabled)
+    const usePool = !phoneLines && (Boolean(values.use_pool) || prefixBindEnabled || prefixSampleEnabled)
+    const normalizedValues = {
+      ...values,
+      phone_pool_mode: phonePoolMode,
+      selected_prefixes: selectedPrefixes,
+      prefix_sample_enabled: prefixSampleEnabled,
+      prefix_sms_probe_only: smsProbeOnly,
+      sms_probe_only: smsProbeOnly,
+      reuse_phone_until_unusable: prefixSampleEnabled || smsProbeOnly ? false : Boolean(values.reuse_phone_until_unusable),
+    }
+    savePhoneBindingSettings(normalizedValues)
+    await saveTaskProxySettingsToConfig(values)
+    await loadConfigCache({ force: true }).catch(() => null)
     if (!usePool && !phoneLines) {
       message.warning('请粘贴手机号/API，或启用手机号池')
+      return
+    }
+    if (prefixBindEnabled && selectedPrefixes.length === 0) {
+      message.warning('限定号段绑定需要先选择至少一个号段')
       return
     }
     const body: Record<string, unknown> = {
       phone_lines: phoneLines,
       use_pool: usePool,
+      prefix_bind_enabled: prefixBindEnabled,
       prefix_sample_enabled: prefixSampleEnabled,
+      selected_prefixes: (prefixBindEnabled || prefixSampleEnabled) ? selectedPrefixes : [],
       prefix_sms_probe_only: smsProbeOnly,
       sms_probe_only: smsProbeOnly,
       prefix_sample_size: Number(values.prefix_sample_size) === 2 ? 2 : 1,
@@ -3015,7 +3133,8 @@ export default function Accounts() {
       const eligible = Number(res?.eligible_accounts || 0)
       const phoneCount = Number(res?.phone_count || 0)
       const prefixSample = res?.prefix_sample && typeof res.prefix_sample === 'object' ? res.prefix_sample : null
-      const smsProbeOnly = Boolean(res?.sms_probe_only || prefixSample?.sms_probe_only)
+      const prefixBind = res?.prefix_bind && typeof res.prefix_bind === 'object' ? res.prefix_bind : null
+      const smsProbeOnly = Boolean(res?.sms_probe_only || prefixSample?.sms_probe_only || prefixBind?.sms_probe_only)
       const parseErrors = Array.isArray(res?.parse_errors) ? res.parse_errors : []
 
       if (!taskIdFromResponse) {
@@ -3039,9 +3158,11 @@ export default function Accounts() {
       setActiveTasksPanelOpen(true)
       void activeTasksQuery.refetch()
       message.success({
-        content: prefixSample?.enabled
-          ? `号段抽样已启动：${String(prefixSample.filter || 'all') === 'rejected' ? '仅不可用号段，' : ''}${Number(prefixSample.prefix_count || 0)} 个号段，${phoneCount} 个号码，${eligible} 个账号${smsProbeOnly ? '，仅测发码/收码' : ''}`
-          : `${smsProbeOnly ? '手机号发码/收码探测已启动' : '手机号绑定已启动'}：${phoneCount} 个号码，${eligible} 个账号${parseErrors.length > 0 ? `，解析跳过 ${parseErrors.length} 行` : ''}`,
+        content: prefixBind?.enabled
+          ? `限定号段绑定已启动：${Number(prefixBind.prefix_count || 0)} 个号段，${phoneCount} 个号码，${eligible} 个账号${smsProbeOnly ? '，仅测发码/收码' : ''}`
+          : prefixSample?.enabled
+            ? `号段抽样已启动：${Array.isArray(prefixSample.requested_prefixes) && prefixSample.requested_prefixes.length > 0 ? '指定号段，' : String(prefixSample.filter || 'all') === 'rejected' ? '仅不可用号段，' : ''}${Number(prefixSample.prefix_count || 0)} 个号段，${phoneCount} 个号码，${eligible} 个账号${smsProbeOnly ? '，仅测发码/收码' : ''}`
+            : `${smsProbeOnly ? '手机号发码/收码探测已启动' : '手机号绑定已启动'}：${phoneCount} 个号码，${eligible} 个账号${parseErrors.length > 0 ? `，解析跳过 ${parseErrors.length} 行` : ''}`,
         key: toastKey,
       })
       if (parseErrors.length > 0) {
@@ -5910,7 +6031,11 @@ export default function Accounts() {
     )
   }
 
-  const phoneBindingPrefixSampleEnabled = phoneBindingPrefixSampleValue === true
+  const phoneBindingPoolMode = normalizePhonePoolMode(phoneBindingPoolModeValue)
+  const phoneBindingPrefixBindEnabled = phoneBindingPoolMode === 'prefix_limited'
+  const phoneBindingPrefixSampleEnabled = phoneBindingPoolMode === 'prefix_sample'
+  const phoneBindingPrefixModeActive = phoneBindingPrefixBindEnabled || phoneBindingPrefixSampleEnabled
+  const phoneBindingSelectedPrefixes = normalizeSelectedPrefixes(phoneBindingSelectedPrefixesValue)
   const phoneBindingProxyMode = String(phoneBindingProxyModeValue || DEFAULT_PHONE_BINDING_SETTINGS.proxy_mode)
   const phoneBindingPrefixSampleSize = Number(phoneBindingPrefixSampleSizeValue) === 2 ? 2 : 1
   const phoneBindingPrefixSampleFilter = (() => {
@@ -5919,9 +6044,9 @@ export default function Accounts() {
     if (value === 'rejected') return 'rejected'
     return 'all'
   })()
-  const phoneBindingUsePool = phoneBindingPrefixSampleEnabled || phoneBindingUsePoolValue !== false
+  const phoneBindingUsePool = phoneBindingPrefixModeActive || phoneBindingUsePoolValue !== false
   const phoneBindingManualText = String(phoneBindingPhoneLinesValue || '').trim()
-  const phoneBindingShowManualInput = !phoneBindingPrefixSampleEnabled && (phoneBindingManualOpen || !phoneBindingUsePool || Boolean(phoneBindingManualText))
+  const phoneBindingShowManualInput = !phoneBindingPrefixModeActive && (phoneBindingManualOpen || !phoneBindingUsePool || Boolean(phoneBindingManualText))
   const phoneBindingPoolSummary = phonePoolSummary || {}
   const phoneBindingTargetCount = phoneBindingTestScope === 'selected' ? selectedRowKeys.length : total
   const phoneBindingSummaryAvailable = Number(phoneBindingPoolSummary.available || 0)
@@ -5930,47 +6055,142 @@ export default function Accounts() {
   const phoneBindingSummaryUnavailable = Number(phoneBindingPoolSummary.unavailable || phoneBindingPoolSummary.cannot_send || 0)
   const phoneBindingSummaryExhausted = Number(phoneBindingPoolSummary.exhausted || 0)
   const phoneBindingSummaryDisabled = Number(phoneBindingPoolSummary.disabled || 0)
+  const phoneBindingPrefixGroups: PhonePoolPrefixGroup[] = useMemo(() => {
+    const summary = phonePoolSummary || {}
+    const health = summary.prefix_health || {}
+    return [
+      {
+        key: 'available' as const,
+        label: '可用',
+        color: 'success',
+        items: uniquePhonePoolPrefixItems(health.available || summary.available_prefixes, 'available'),
+      },
+      {
+        key: 'unavailable' as const,
+        label: '不可用',
+        color: 'error',
+        items: uniquePhonePoolPrefixItems(health.unavailable || summary.rejected_prefixes, 'unavailable'),
+      },
+      {
+        key: 'temporary' as const,
+        label: '暂不可用',
+        color: 'warning',
+        items: uniquePhonePoolPrefixItems(health.temporary || summary.temporary_prefixes, 'temporary'),
+      },
+      {
+        key: 'exhausted' as const,
+        label: '已绑满',
+        color: 'default',
+        items: uniquePhonePoolPrefixItems(health.exhausted || summary.exhausted_prefixes, 'exhausted'),
+      },
+    ]
+  }, [phonePoolSummary])
+  const phoneBindingPrefixMap = useMemo(() => {
+    const map = new Map<string, PhonePoolPrefixItem>()
+    for (const group of phoneBindingPrefixGroups) {
+      for (const item of group.items) {
+        map.set(item.prefix, item)
+      }
+    }
+    return map
+  }, [phoneBindingPrefixGroups])
+  const phoneBindingSelectedPrefixItems = phoneBindingSelectedPrefixes.map((prefix) => phoneBindingPrefixMap.get(prefix)).filter(Boolean) as PhonePoolPrefixItem[]
+  const phoneBindingSelectedPrefixSet = useMemo(() => new Set(phoneBindingSelectedPrefixes), [phoneBindingSelectedPrefixes.join('|')])
+  const phoneBindingLimitedAvailablePhones = phoneBindingSelectedPrefixItems.reduce((sum, item) => sum + Number(item.available_count || 0), 0)
+  const phoneBindingLimitedRemainingCapacity = phoneBindingSelectedPrefixItems.reduce((sum, item) => sum + Number(item.remaining_capacity || 0), 0)
+  const phoneBindingLimitedCapacity = phoneBindingReusePhoneValue ? phoneBindingLimitedRemainingCapacity : phoneBindingLimitedAvailablePhones
+  const phoneBindingSelectedSampleCount = phoneBindingSelectedPrefixItems.reduce((sum, item) => {
+    const candidateCount = Math.max(
+      Number(item.available_count || 0),
+      Number(item.remaining_capacity || 0) > 0 ? 1 : 0,
+      Number(item.total || 0),
+    )
+    return sum + Math.min(candidateCount, phoneBindingPrefixSampleSize)
+  }, 0)
   const phoneBindingSummaryPrefixCount = Number(
-    phoneBindingPrefixSampleFilter === 'available'
-      ? (phoneBindingPoolSummary.available_prefix_count ?? 0)
-      : phoneBindingPrefixSampleFilter === 'rejected'
-        ? (phoneBindingPoolSummary.rejected_prefix_count ?? 0)
-        : (phoneBindingPoolSummary.prefix_sample_prefix_count ?? 0),
+    phoneBindingSelectedPrefixes.length > 0 && phoneBindingPrefixSampleEnabled
+      ? phoneBindingSelectedPrefixes.length
+      : phoneBindingPrefixSampleFilter === 'available'
+        ? (phoneBindingPoolSummary.available_prefix_count ?? phoneBindingPrefixGroups.find((group) => group.key === 'available')?.items.length ?? 0)
+        : phoneBindingPrefixSampleFilter === 'rejected'
+          ? (phoneBindingPoolSummary.rejected_prefix_count ?? phoneBindingPrefixGroups.find((group) => group.key === 'unavailable')?.items.length ?? 0)
+          : (phoneBindingPoolSummary.prefix_sample_prefix_count ?? phoneBindingPrefixGroups.reduce((sum, group) => sum + group.items.length, 0)),
   )
-  const phoneBindingSummarySampleCount = Number(
-    phoneBindingPrefixSampleFilter === 'available'
-      ? (
-          phoneBindingPrefixSampleSize === 2
-            ? (phoneBindingPoolSummary.available_prefix_sample_2 ?? phoneBindingPoolSummary.available_prefix_sample_1)
-            : (phoneBindingPoolSummary.available_prefix_sample_1 ?? phoneBindingPoolSummary.available_prefix_sample_2)
-        )
-      : phoneBindingPrefixSampleFilter === 'rejected'
-      ? (
-          phoneBindingPrefixSampleSize === 2
-            ? phoneBindingPoolSummary.rejected_prefix_sample_2
-            : phoneBindingPoolSummary.rejected_prefix_sample_1
-        )
-      : (
-          phoneBindingPrefixSampleSize === 2
-            ? (phoneBindingPoolSummary.prefix_sample_count_2 ?? phoneBindingPoolSummary.available_prefix_sample_2)
-            : (phoneBindingPoolSummary.prefix_sample_count_1 ?? phoneBindingPoolSummary.available_prefix_sample_1)
-        ),
-  ) || 0
+  const phoneBindingSummarySampleCount = phoneBindingSelectedPrefixes.length > 0 && phoneBindingPrefixSampleEnabled
+    ? phoneBindingSelectedSampleCount
+    : Number(
+        phoneBindingPrefixSampleFilter === 'available'
+          ? (
+              phoneBindingPrefixSampleSize === 2
+                ? (phoneBindingPoolSummary.available_prefix_sample_2 ?? phoneBindingPoolSummary.available_prefix_sample_1)
+                : (phoneBindingPoolSummary.available_prefix_sample_1 ?? phoneBindingPoolSummary.available_prefix_sample_2)
+            )
+          : phoneBindingPrefixSampleFilter === 'rejected'
+          ? (
+              phoneBindingPrefixSampleSize === 2
+                ? phoneBindingPoolSummary.rejected_prefix_sample_2
+                : phoneBindingPoolSummary.rejected_prefix_sample_1
+            )
+          : (
+              phoneBindingPrefixSampleSize === 2
+                ? (phoneBindingPoolSummary.prefix_sample_count_2 ?? phoneBindingPoolSummary.available_prefix_sample_2)
+                : (phoneBindingPoolSummary.prefix_sample_count_1 ?? phoneBindingPoolSummary.available_prefix_sample_1)
+            ),
+      ) || 0
+  const setPhoneBindingSelectedPrefixes = (nextPrefixes: unknown) => {
+    const selected = normalizeSelectedPrefixes(nextPrefixes)
+    phoneBindingTestForm.setFieldsValue({ selected_prefixes: selected })
+    savePhoneBindingSettings({ ...phoneBindingTestForm.getFieldsValue(true), selected_prefixes: selected })
+  }
+  const togglePhoneBindingPrefix = (prefix: string) => {
+    const next = phoneBindingSelectedPrefixSet.has(prefix)
+      ? phoneBindingSelectedPrefixes.filter((item) => item !== prefix)
+      : [...phoneBindingSelectedPrefixes, prefix]
+    setPhoneBindingSelectedPrefixes(next)
+  }
+  const togglePhoneBindingPrefixGroup = (prefixes: string[]) => {
+    const normalized = normalizeSelectedPrefixes(prefixes)
+    if (normalized.length === 0) return
+    const allSelected = normalized.every((prefix) => phoneBindingSelectedPrefixSet.has(prefix))
+    const nextSet = new Set(phoneBindingSelectedPrefixes)
+    for (const prefix of normalized) {
+      if (allSelected) {
+        nextSet.delete(prefix)
+      } else {
+        nextSet.add(prefix)
+      }
+    }
+    setPhoneBindingSelectedPrefixes(Array.from(nextSet))
+  }
+  const formatPhoneBindingPrefixMeta = (item: PhonePoolPrefixItem) => {
+    const parts: string[] = []
+    const available = Number(item.available_count || 0)
+    const remaining = Number(item.remaining_capacity || 0)
+    const rejected = Number(item.rejected_count || 0)
+    if (available > 0) parts.push(`可用 ${available}`)
+    if (remaining > 0) parts.push(`容量 ${remaining}`)
+    if (rejected > 0) parts.push(`拒 ${rejected}`)
+    return parts.join(' · ')
+  }
   const phoneBindingPoolEmpty =
     phoneBindingUsePool
     && phoneBindingManualText === ''
     && phoneBindingTargetCount > 0
     && phonePoolSummary !== null
     && !phonePoolSummaryLoading
-    && (phoneBindingPrefixSampleEnabled ? phoneBindingSummarySampleCount <= 0 : phoneBindingSummaryRemaining <= 0)
+    && (phoneBindingPrefixSampleEnabled
+      ? phoneBindingSummarySampleCount <= 0
+      : phoneBindingPrefixBindEnabled
+        ? phoneBindingSelectedPrefixes.length > 0 && phoneBindingLimitedCapacity <= 0
+        : phoneBindingSummaryRemaining <= 0)
   const phoneBindingPoolShortage =
     !phoneBindingPrefixSampleEnabled
-    &&
-    phoneBindingUsePool
+    && phoneBindingUsePool
     && phoneBindingManualText === ''
     && phoneBindingTargetCount > 0
-    && phoneBindingSummaryRemaining > 0
-    && phoneBindingSummaryRemaining < phoneBindingTargetCount
+    && (phoneBindingPrefixBindEnabled
+      ? phoneBindingSelectedPrefixes.length > 0 && phoneBindingLimitedCapacity > 0 && phoneBindingLimitedCapacity < phoneBindingTargetCount
+      : phoneBindingSummaryRemaining > 0 && phoneBindingSummaryRemaining < phoneBindingTargetCount)
   const baxiCdkManualText = String(baxiCdkCodeLinesValue || '').trim()
   const baxiCdkUsePool = !baxiCdkManualText && baxiCdkUsePoolValue !== false
   const baxiCdkShowManualInput = baxiCdkManualOpen || Boolean(baxiCdkManualText) || !baxiCdkUsePool
@@ -6401,6 +6621,12 @@ export default function Accounts() {
           layout="vertical"
           onValuesChange={(_, allValues) => savePhoneBindingSettings(allValues)}
         >
+          <Form.Item name="selected_prefixes" hidden>
+            <Select mode="multiple" options={[]} />
+          </Form.Item>
+          <Form.Item name="prefix_sample_enabled" valuePropName="checked" hidden>
+            <Switch />
+          </Form.Item>
           <Alert
             type="info"
             showIcon
@@ -6438,7 +6664,7 @@ export default function Accounts() {
                   <Switch
                     checkedChildren="手机号池"
                     unCheckedChildren="临时号码"
-                    disabled={phoneBindingPrefixSampleEnabled}
+                    disabled={phoneBindingPrefixModeActive}
                     onChange={(checked) => {
                       if (!checked) setPhoneBindingManualOpen(true)
                     }}
@@ -6464,69 +6690,190 @@ export default function Accounts() {
               </Space>
             </div>
             <Text type="secondary" style={{ display: 'block', marginTop: 6 }}>
-              未填写临时号码时会从手机号池自动取号；填写临时号码后，本次任务优先使用粘贴内容。
+              普通绑定可用手机号池或临时粘贴号码；限定号段绑定和号段抽样固定从手机号池取号。
             </Text>
             <div
               style={{
-                display: 'flex',
-                gap: 12,
-                alignItems: 'center',
-                justifyContent: 'space-between',
-                flexWrap: 'wrap',
                 marginTop: 10,
                 paddingTop: 10,
                 borderTop: `1px solid ${token.colorBorderSecondary}`,
               }}
             >
-              <Space wrap>
-                <Form.Item name="prefix_sample_enabled" valuePropName="checked" noStyle>
-                  <Switch
-                    checkedChildren="号段抽样"
-                    unCheckedChildren="普通绑定"
-                    onChange={(checked) => {
-                      if (checked) {
+              <div style={{ display: 'flex', gap: 12, alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap' }}>
+                <Space wrap size={[8, 8]}>
+                  <Text strong>取号策略</Text>
+                  <Form.Item name="phone_pool_mode" noStyle>
+                    <Segmented
+                      size="small"
+                      options={[
+                        { label: '普通绑定', value: 'normal' },
+                        { label: '限定号段绑定', value: 'prefix_limited' },
+                        { label: '号段抽样测试', value: 'prefix_sample' },
+                      ]}
+                      onChange={(value) => {
+                        const mode = normalizePhonePoolMode(value)
                         phoneBindingTestForm.setFieldsValue({
-                          use_pool: true,
-                          phone_lines: '',
-                          reuse_phone_until_unusable: false,
+                          phone_pool_mode: mode,
+                          prefix_sample_enabled: mode === 'prefix_sample',
+                          use_pool: mode === 'normal' ? phoneBindingUsePoolValue !== false : true,
+                          phone_lines: mode === 'normal' ? phoneBindingPhoneLinesValue : '',
+                          reuse_phone_until_unusable: mode === 'prefix_sample' ? false : phoneBindingReusePhoneValue,
                         })
-                        setPhoneBindingManualOpen(false)
-                      }
+                        if (mode !== 'normal') {
+                          setPhoneBindingManualOpen(false)
+                        }
+                      }}
+                    />
+                  </Form.Item>
+                </Space>
+                <Text type="secondary" style={{ fontSize: 12 }}>
+                  {phoneBindingPrefixBindEnabled
+                    ? `只使用所选号段正式绑定；当前选择 ${phoneBindingSelectedPrefixes.length} 个号段，可覆盖 ${phoneBindingLimitedCapacity} 个账号`
+                    : phoneBindingPrefixSampleEnabled
+                      ? phoneBindingSelectedPrefixes.length > 0
+                        ? `按所选号段抽样，预计测试 ${phoneBindingSummarySampleCount} 个号码`
+                        : `按范围抽样 ${phoneBindingSummaryPrefixCount} 个号段，预计 ${phoneBindingSummarySampleCount} 个号码`
+                      : '普通绑定按手机号池可用容量自动取号，也可展开临时粘贴号码。'}
+                </Text>
+              </div>
+
+              {phoneBindingPrefixModeActive ? (
+                <div
+                  style={{
+                    marginTop: 10,
+                    border: `1px solid ${token.colorBorderSecondary}`,
+                    borderRadius: token.borderRadiusLG,
+                    background: token.colorFillTertiary,
+                    overflow: 'hidden',
+                  }}
+                >
+                  <div
+                    style={{
+                      display: 'flex',
+                      gap: 10,
+                      alignItems: 'center',
+                      justifyContent: 'space-between',
+                      flexWrap: 'wrap',
+                      padding: '8px 10px',
                     }}
-                  />
-                </Form.Item>
-                <Text strong>按手机号前 4 位测试</Text>
-                <Form.Item name="prefix_sample_size" noStyle>
-                  <Segmented
-                    size="small"
-                    disabled={!phoneBindingPrefixSampleEnabled}
-                    options={[
-                      { label: '每段 1 个', value: 1 },
-                      { label: '每段 2 个', value: 2 },
-                    ]}
-                  />
-                </Form.Item>
-                <Form.Item name="prefix_sample_filter" noStyle>
-                  <Segmented
-                    size="small"
-                    disabled={!phoneBindingPrefixSampleEnabled}
-                    options={[
-                      { label: '全部可测试号段', value: 'all' },
-                      { label: '测试可用号段', value: 'available' },
-                      { label: '仅不可用号段', value: 'rejected' },
-                    ]}
-                  />
-                </Form.Item>
-              </Space>
-              <Text type="secondary" style={{ fontSize: 12 }}>
-                {phoneBindingPrefixSampleEnabled
-                  ? phoneBindingPrefixSampleFilter === 'available'
-                    ? `当前可用号段 ${phoneBindingSummaryPrefixCount} 个，预计测试 ${phoneBindingSummarySampleCount} 个号码`
-                    : phoneBindingPrefixSampleFilter === 'rejected'
-                    ? `当前 OpenAI 拒绝号段 ${phoneBindingSummaryPrefixCount} 个，预计复测 ${phoneBindingSummarySampleCount} 个号码`
-                    : `当前可测试 ${phoneBindingSummaryPrefixCount} 个号段，预计 ${phoneBindingSummarySampleCount} 个号码`
-                  : '优先抽取未测试、使用次数少的号码，每个号码只测试一次'}
-              </Text>
+                  >
+                    <Space wrap size={[6, 6]}>
+                      <Text strong>号段范围</Text>
+                      <Tag color={phoneBindingSelectedPrefixes.length > 0 ? 'processing' : 'default'}>已选择 {phoneBindingSelectedPrefixes.length}</Tag>
+                      {phoneBindingPrefixGroups.map((group) => (
+                        <Tag
+                          key={group.key}
+                          color={group.color}
+                          style={{ cursor: group.items.length > 0 ? 'pointer' : 'default', userSelect: 'none' }}
+                          onClick={() => togglePhoneBindingPrefixGroup(group.items.map((item) => item.prefix))}
+                        >
+                          {group.label} {group.items.length}
+                        </Tag>
+                      ))}
+                    </Space>
+                    <Space size={6}>
+                      {phoneBindingSelectedPrefixes.length > 0 ? (
+                        <Button size="small" type="link" onClick={() => setPhoneBindingSelectedPrefixes([])}>
+                          清空
+                        </Button>
+                      ) : null}
+                      <Button size="small" type="link" onClick={() => setPhoneBindingPrefixPickerOpen((open) => !open)}>
+                        {phoneBindingPrefixPickerOpen ? '收起' : '展开'}
+                      </Button>
+                    </Space>
+                  </div>
+
+                  {phoneBindingSelectedPrefixes.length > 0 ? (
+                    <div style={{ padding: '0 10px 8px' }}>
+                      <Space wrap size={[4, 4]}>
+                        {phoneBindingSelectedPrefixes.slice(0, 24).map((prefix) => (
+                          <Tag key={prefix} color="processing" closable onClose={(event) => { event.preventDefault(); togglePhoneBindingPrefix(prefix) }}>
+                            {prefix}
+                          </Tag>
+                        ))}
+                        {phoneBindingSelectedPrefixes.length > 24 ? <Tag>+{phoneBindingSelectedPrefixes.length - 24}</Tag> : null}
+                      </Space>
+                    </div>
+                  ) : null}
+
+                  {phoneBindingPrefixPickerOpen ? (
+                    <div
+                      style={{
+                        padding: '0 10px 10px',
+                        maxHeight: 220,
+                        overflow: 'auto',
+                        borderTop: `1px solid ${token.colorBorderSecondary}`,
+                      }}
+                    >
+                      {phoneBindingPrefixGroups.some((group) => group.items.length > 0) ? phoneBindingPrefixGroups.map((group) => (
+                        <div key={group.key} style={{ marginTop: 10 }}>
+                          <Space wrap size={[6, 6]} align="center">
+                            <Tag color={group.color}>{group.label} {group.items.length}</Tag>
+                            {group.items.map((item) => {
+                              const selected = phoneBindingSelectedPrefixSet.has(item.prefix)
+                              const meta = formatPhoneBindingPrefixMeta(item)
+                              return (
+                                <Tag
+                                  key={`${group.key}:${item.prefix}`}
+                                  onClick={() => togglePhoneBindingPrefix(item.prefix)}
+                                  style={{
+                                    cursor: 'pointer',
+                                    userSelect: 'none',
+                                    borderColor: selected ? token.colorPrimary : token.colorBorder,
+                                    background: selected ? token.colorPrimaryBg : token.colorBgContainer,
+                                    color: selected ? token.colorPrimaryText : token.colorText,
+                                  }}
+                                >
+                                  <span>{item.prefix}</span>
+                                  {meta ? <span style={{ marginLeft: 4, opacity: 0.72 }}>{meta}</span> : null}
+                                </Tag>
+                              )
+                            })}
+                          </Space>
+                        </div>
+                      )) : (
+                        <Text type="secondary" style={{ fontSize: 12 }}>
+                          当前手机号池摘要没有返回号段明细；先刷新库存，或到手机号池页确认号码是否已导入。
+                        </Text>
+                      )}
+                    </div>
+                  ) : null}
+                </div>
+              ) : null}
+
+              {phoneBindingPrefixSampleEnabled ? (
+                <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap', marginTop: 10 }}>
+                  <Form.Item name="prefix_sample_size" noStyle>
+                    <Segmented
+                      size="small"
+                      options={[
+                        { label: '每段 1 个', value: 1 },
+                        { label: '每段 2 个', value: 2 },
+                      ]}
+                    />
+                  </Form.Item>
+                  <Form.Item name="prefix_sample_filter" noStyle>
+                    <Segmented
+                      size="small"
+                      disabled={phoneBindingSelectedPrefixes.length > 0}
+                      options={[
+                        { label: '全部号段', value: 'all' },
+                        { label: '测试可用号段', value: 'available' },
+                        { label: '仅不可用号段', value: 'rejected' },
+                      ]}
+                    />
+                  </Form.Item>
+                  <Text type="secondary" style={{ fontSize: 12 }}>
+                    {phoneBindingSelectedPrefixes.length > 0
+                      ? '已手动选择号段，抽样范围筛选本次不参与。'
+                      : phoneBindingPrefixSampleFilter === 'available'
+                        ? '只从当前可用号段每段抽 1/2 个号码。'
+                        : phoneBindingPrefixSampleFilter === 'rejected'
+                          ? '只复测 OpenAI 拒绝过的号段。'
+                          : '从全部号段按每段 1/2 个号码抽样。'}
+                  </Text>
+                </div>
+              ) : null}
             </div>
           </Form.Item>
 
@@ -6541,6 +6888,8 @@ export default function Accounts() {
                   : phoneBindingPrefixSampleFilter === 'rejected'
                   ? '手机号池没有可复测的 OpenAI 拒绝号段，请先确认存在被 OpenAI 明确拒绝的号码。'
                   : '手机号池没有可用于号段抽样的号码，请先启用/导入带 API 且未绑满的号码。'
+                : phoneBindingPrefixBindEnabled
+                ? '所选号段当前没有可用绑定容量；可以继续提交让后端按实时数据判定，或改选其他号段。'
                 : '手机号池没有可用绑定容量，请先导入/重置号码，或展开临时粘贴号码。'}
             />
           ) : phoneBindingPoolShortage ? (
@@ -6548,7 +6897,9 @@ export default function Accounts() {
               type="warning"
               showIcon
               style={{ marginBottom: 12 }}
-              message={`手机号池容量不足：当前范围 ${phoneBindingTargetCount} 个账号，剩余绑定容量 ${phoneBindingSummaryRemaining}`}
+              message={phoneBindingPrefixBindEnabled
+                ? `所选号段容量可能不足：当前范围 ${phoneBindingTargetCount} 个账号，所选号段可覆盖 ${phoneBindingLimitedCapacity}`
+                : `手机号池容量不足：当前范围 ${phoneBindingTargetCount} 个账号，剩余绑定容量 ${phoneBindingSummaryRemaining}`}
             />
           ) : null}
 
@@ -6565,12 +6916,10 @@ export default function Accounts() {
               <div>
                 <Text strong>临时粘贴号码</Text>
                 <Text type="secondary" style={{ display: 'block', fontSize: 12 }}>
-                  {phoneBindingPrefixSampleEnabled
-                    ? phoneBindingPrefixSampleFilter === 'available'
-                      ? '测试可用号段模式只测试健康可用号段。'
-                      : phoneBindingPrefixSampleFilter === 'rejected'
-                      ? '仅不可用号段模式只复测 OpenAI 拒绝过的手机号池号码。'
-                      : '号段抽样模式只使用手机号池。'
+                  {phoneBindingPrefixBindEnabled
+                    ? '限定号段绑定只使用手机号池；如需粘贴固定号码，请切回普通绑定。'
+                    : phoneBindingPrefixSampleEnabled
+                    ? '号段抽样测试只使用手机号池；如需粘贴固定号码，请切回普通绑定。'
                     : '每行：+手机号----收码API，会自动导入手机号池并回写绑定结果。'}
                 </Text>
               </div>
@@ -6578,7 +6927,7 @@ export default function Accounts() {
                 size="small"
                 type={phoneBindingShowManualInput ? 'default' : 'dashed'}
                 icon={<UploadOutlined />}
-                disabled={phoneBindingPrefixSampleEnabled}
+                disabled={phoneBindingPrefixModeActive}
                 onClick={() => setPhoneBindingManualOpen((open) => !open)}
               >
                 {phoneBindingShowManualInput ? '收起' : '展开'}
@@ -6602,17 +6951,18 @@ export default function Accounts() {
           <div
             style={{
               border: `1px solid ${phoneBindingSmsProbeOnlyValue ? token.colorWarningBorder : token.colorBorderSecondary}`,
-              borderRadius: token.borderRadiusLG,
-              padding: 12,
+              borderRadius: token.borderRadius,
+              padding: '7px 10px',
               marginBottom: 12,
-              background: phoneBindingSmsProbeOnlyValue ? token.colorWarningBg : token.colorBgContainer,
+              background: phoneBindingSmsProbeOnlyValue ? token.colorWarningBg : token.colorFillTertiary,
             }}
           >
-            <Space align="start" size={12}>
+            <Space align="center" wrap size={[8, 4]}>
               <Form.Item name="prefix_sms_probe_only" valuePropName="checked" noStyle>
                 <Switch
-                  checkedChildren="只测收码"
-                  unCheckedChildren="真实绑定"
+                  size="small"
+                  checkedChildren="只测收发码"
+                  unCheckedChildren="完整绑定"
                   onChange={(checked) => {
                     if (checked) {
                       phoneBindingTestForm.setFieldsValue({ reuse_phone_until_unusable: false })
@@ -6620,12 +6970,10 @@ export default function Accounts() {
                   }}
                 />
               </Form.Item>
-              <div>
-                <Text strong>只测发码/收码，不提交验证码</Text>
-                <Text type="secondary" style={{ display: 'block', fontSize: 12 }}>
-                  粘贴号码、普通手机号池、号段抽样都生效；成功后只回写手机号池为“已收码未提交”，不保存账号绑定状态，不补抓 Auth/RT。
-                </Text>
-              </div>
+              <Text strong style={{ fontSize: 13 }}>只测发码/收码，不提交验证码</Text>
+              <Text type="secondary" style={{ fontSize: 12 }}>
+                粘贴号码、普通手机号池、限定号段、号段抽样都生效；不保存账号绑定状态，不补抓 Auth/RT。
+              </Text>
             </Space>
           </div>
 
