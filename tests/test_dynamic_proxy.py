@@ -124,3 +124,23 @@ def test_dynamic_preview_rejects_missing_region_marker():
             )
         )
     assert exc.value.status_code == 400
+
+
+def test_dynamic_proxy_uses_config_default_country_when_task_country_empty(monkeypatch):
+    def fake_configured_value(key, default=""):
+        if key == "dynamic_proxy_default_country":
+            return "US"
+        return default
+
+    monkeypatch.setattr("core.proxy_utils._configured_value", fake_configured_value)
+    candidates = resolve_probe_candidate_proxies(
+        {
+            "proxy_mode": "dynamic",
+            "proxy": TEMPLATE,
+            "dynamic_proxy_probe_enabled": False,
+        }
+    )
+
+    assert len(candidates) == 1
+    assert "region-US" in candidates[0][0]
+    assert "dynamic country=US" in candidates[0][2]

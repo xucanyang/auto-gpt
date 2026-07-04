@@ -451,7 +451,12 @@ export function RegisterTaskModal({
           ) : null}
           {proxyMode === 'pool' || proxyMode === 'dynamic' || (proxyMode === 'specified' && proxyFailover) ? (
             <Space style={{ width: '100%' }} align="start">
-              <Form.Item name="proxy_country_code" label="出口国家" style={{ flex: 1 }}>
+              <Form.Item
+                name="proxy_country_code"
+                label="出口国家"
+                style={{ flex: 1 }}
+                rules={proxyMode === 'dynamic' ? [{ required: true, message: '请输入动态代理出口国家' }] : undefined}
+              >
                 <Input placeholder={proxyMode === 'dynamic' ? '必填，例如 US / JP / SG' : '不限，或填 US / JP / SG'} maxLength={2} />
               </Form.Item>
               {proxyMode !== 'dynamic' ? (

@@ -31,6 +31,7 @@ import { buildChatGPTRegistrationRequestAdapter } from '@/lib/chatgptRegistratio
 import { CHATGPT_REGISTRATION_MODE_REFRESH_TOKEN } from '@/lib/chatgptRegistrationMode'
 import { getExecutorOptions, normalizeExecutorForPlatform } from '@/lib/platformExecutorOptions'
 import { apiFetch } from '@/lib/utils'
+import { buildTaskProxyPayload, saveTaskProxySettingsToConfig, taskProxySettingsFromConfig, validateTaskProxySettings } from '@/lib/taskProxySettings'
 import { normalizeDomainList, parseStoredDomainList } from '@/lib/domainList'
 
 const { Text } = Typography
@@ -90,6 +91,7 @@ export default function RegisterTaskPage() {
   useEffect(() => {
     apiFetch('/config').then((cfg) => {
       const currentPlatform = form.getFieldValue('platform') || 'chatgpt'
+      const proxySettings = taskProxySettingsFromConfig(cfg)
       form.setFieldsValue({
         executor_type: normalizeExecutorForPlatform(currentPlatform, cfg.default_executor),
         captcha_solver: cfg.default_captcha_solver || 'yescaptcha',
@@ -124,9 +126,7 @@ export default function RegisterTaskPage() {
         laoudo_auth: cfg.laoudo_auth || '',
         laoudo_email: cfg.laoudo_email || '',
         laoudo_account_id: cfg.laoudo_account_id || '',
-        proxy: cfg.dynamic_proxy_template || '',
-        proxy_max_candidates: Number(cfg.proxy_pool_max_candidates || 5),
-        proxy_min_score: Number(cfg.proxy_scan_min_score || 50),
+        ...proxySettings,
         gptmail_base_url: cfg.gptmail_base_url || 'https://mail.chatgpt.org.uk',
         gptmail_api_key: cfg.gptmail_api_key || '',
         gptmail_domain: cfg.gptmail_domain || '',
@@ -355,19 +355,9 @@ export default function RegisterTaskPage() {
           }),
         })
       }
-      const requestProxyMode = String(values.proxy_mode || (values.proxy ? 'specified' : 'pool')).trim()
-      const includePoolSelectorParams =
-        requestProxyMode === 'pool' || (requestProxyMode === 'specified' && Boolean(values.proxy_failover))
-      const proxyPayload: Record<string, unknown> = {
-        proxy: ['specified', 'dynamic'].includes(requestProxyMode) ? (String(values.proxy || '').trim() || null) : null,
-        proxy_mode: requestProxyMode,
-        proxy_country_code: String(values.proxy_country_code || '').trim().toUpperCase(),
-        proxy_failover: Boolean(values.proxy_failover),
-      }
-      if (includePoolSelectorParams) {
-        proxyPayload.proxy_max_candidates = Number(values.proxy_max_candidates || 5)
-        proxyPayload.proxy_min_score = Number(values.proxy_min_score || 0)
-      }
+      validateTaskProxySettings(values)
+      await saveTaskProxySettingsToConfig(values)
+      const proxyPayload = buildTaskProxyPayload(values)
       const res = await apiFetch('/tasks/register', {
         method: 'POST',
         body: JSON.stringify({
@@ -643,11 +633,7 @@ export default function RegisterTaskPage() {
         chatgpt_phone_signup_poll_interval_seconds: 5,
         chatgpt_phone_signup_max_resend_attempts: 1,
         chatgpt_phone_signup_resend_interval_seconds: 60,
-        proxy_mode: 'pool',
-        proxy_country_code: '',
-        proxy_failover: false,
-        proxy_max_candidates: 5,
-        proxy_min_score: 50,
+        ...taskProxySettingsFromConfig({}),
         count: 1,
         concurrency: 1,
         register_delay_seconds: 0,
@@ -714,7 +700,12 @@ export default function RegisterTaskPage() {
           ) : null}
           {proxyMode === 'pool' || proxyMode === 'dynamic' || (proxyMode === 'specified' && proxyFailover) ? (
             <Space style={{ width: '100%' }} align="start">
-              <Form.Item name="proxy_country_code" label="出口国家" style={{ flex: 1 }}>
+              <Form.Item
+                name="proxy_country_code"
+                label="出口国家"
+                style={{ flex: 1 }}
+                rules={proxyMode === 'dynamic' ? [{ required: true, message: '请输入动态代理出口国家' }] : undefined}
+              >
                 <Input placeholder={proxyMode === 'dynamic' ? '必填，例如 US / JP / SG' : '不限，或填 US / JP / SG'} maxLength={2} />
               </Form.Item>
               {proxyMode !== 'dynamic' ? (

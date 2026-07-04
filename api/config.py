@@ -24,6 +24,12 @@ CONFIG_KEYS = [
     "proxy_scan_only_active",
     "proxy_scan_min_score",
     "proxy_pool_max_candidates",
+    "task_proxy_mode",
+    "task_proxy_url",
+    "task_proxy_country_code",
+    "task_proxy_failover",
+    "task_proxy_max_candidates",
+    "task_proxy_min_score",
     "dynamic_proxy_template",
     "dynamic_proxy_default_country",
     "dynamic_proxy_require_country_match",
@@ -391,6 +397,18 @@ def get_config():
         all_cfg["proxy_scan_min_score"] = "50"
     if not all_cfg.get("proxy_pool_max_candidates"):
         all_cfg["proxy_pool_max_candidates"] = "5"
+    if not all_cfg.get("task_proxy_mode"):
+        all_cfg["task_proxy_mode"] = "pool"
+    if not all_cfg.get("task_proxy_url"):
+        all_cfg["task_proxy_url"] = ""
+    if not all_cfg.get("task_proxy_country_code"):
+        all_cfg["task_proxy_country_code"] = ""
+    if not all_cfg.get("task_proxy_failover"):
+        all_cfg["task_proxy_failover"] = "false"
+    if not all_cfg.get("task_proxy_max_candidates"):
+        all_cfg["task_proxy_max_candidates"] = all_cfg.get("proxy_pool_max_candidates") or "5"
+    if not all_cfg.get("task_proxy_min_score"):
+        all_cfg["task_proxy_min_score"] = all_cfg.get("proxy_scan_min_score") or "50"
     if not all_cfg.get("dynamic_proxy_template"):
         all_cfg["dynamic_proxy_template"] = ""
     if not all_cfg.get("dynamic_proxy_default_country"):
@@ -603,6 +621,13 @@ def get_config():
 def update_config(body: ConfigUpdate):
     # 只允许更新已知 key
     safe = {k: v for k, v in body.data.items() if k in CONFIG_KEYS}
+    dynamic_template = str(safe.get("dynamic_proxy_template") or "").strip()
+    dynamic_country = str(safe.get("dynamic_proxy_default_country") or "").strip().upper()
+    if dynamic_template:
+        safe.setdefault("task_proxy_mode", "dynamic")
+        safe.setdefault("task_proxy_url", dynamic_template)
+    if dynamic_country:
+        safe.setdefault("task_proxy_country_code", dynamic_country)
     config_store.set_many(safe)
     return {"ok": True, "updated": list(safe.keys())}
 

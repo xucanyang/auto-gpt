@@ -15,6 +15,7 @@ import {
   BugOutlined,
 } from '@ant-design/icons'
 import { apiFetch } from '@/lib/utils'
+import { saveTaskProxySettingsToConfig } from '@/lib/taskProxySettings'
 
 interface ProxyRecord {
   id: number
@@ -248,6 +249,7 @@ export default function Proxies() {
   const [dynamicProxyCountry, setDynamicProxyCountry] = useState('JP')
   const [dynamicProxyProbe, setDynamicProxyProbe] = useState(true)
   const [dynamicPreviewLoading, setDynamicPreviewLoading] = useState(false)
+  const [dynamicSaving, setDynamicSaving] = useState(false)
   const [dynamicPreviewResult, setDynamicPreviewResult] = useState<Record<string, any> | null>(null)
   const [scanJob, setScanJob] = useState<ProxyScanJob | null>(null)
   const scanPollTimerRef = useRef<number | null>(null)
@@ -657,6 +659,36 @@ export default function Proxies() {
       message.error(error instanceof Error ? error.message : '保存代理扫描设置失败')
     } finally {
       setSavingScanSetting(false)
+    }
+  }
+
+  const saveDynamicProxySettings = async () => {
+    const template = dynamicProxyTemplate.trim()
+    const country = dynamicProxyCountry.trim().toUpperCase()
+    if (!template) {
+      message.warning('请填写动态代理模板')
+      return
+    }
+    if (!country) {
+      message.warning('请填写出口国家')
+      return
+    }
+    setDynamicSaving(true)
+    try {
+      await saveTaskProxySettingsToConfig({
+        proxy_mode: 'dynamic',
+        proxy: template,
+        proxy_country_code: country,
+        proxy_failover: false,
+        proxy_max_candidates: poolMaxCandidates,
+        proxy_min_score: scanMinScore,
+      })
+      message.success('动态代理已保存为所有任务默认代理')
+      await load()
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '保存动态代理设置失败')
+    } finally {
+      setDynamicSaving(false)
     }
   }
 
@@ -1106,6 +1138,9 @@ export default function Proxies() {
             <Checkbox checked={dynamicProxyProbe} onChange={(event) => setDynamicProxyProbe(event.target.checked)}>实测出口</Checkbox>
             <Button type="primary" icon={<ThunderboltOutlined />} loading={dynamicPreviewLoading} onClick={() => void previewDynamicProxy()}>
               预览动态出口
+            </Button>
+            <Button loading={dynamicSaving} onClick={() => void saveDynamicProxySettings()}>
+              保存为任务默认
             </Button>
           </Space>
           {dynamicPreviewResult ? (

@@ -57,6 +57,7 @@ import {
   splitGopayPhoneInput,
 } from '@/lib/gopayPhone'
 import { apiFetch } from '@/lib/utils'
+import { buildTaskProxyPayload, saveTaskProxySettingsToConfig, taskProxySettingsFromConfig, validateTaskProxySettings } from '@/lib/taskProxySettings'
 import { normalizeExecutorForPlatform } from '@/lib/platformExecutorOptions'
 
 const { Text } = Typography
@@ -2313,18 +2314,14 @@ export default function Accounts() {
       .then((cfg) => {
         const provider = String(cfg?.mail_provider || 'luckmail').trim() || 'luckmail'
         const savedSettings = loadRegisterFormSettings(currentPlatform)
+        const proxySettings = taskProxySettingsFromConfig(cfg, savedSettings)
         const savedEmail = window.localStorage.getItem('auto-chatgpt.manual_email_otp.email') || ''
         setRegisterMailProvider(provider)
         registerForm.setFieldsValue({
           count: Number(savedSettings.count || 1) || 1,
           concurrency: Number(savedSettings.concurrency || 1) || 1,
           register_delay_seconds: Number(savedSettings.register_delay_seconds || 0) || 0,
-          proxy_mode: String(savedSettings.proxy_mode || 'pool'),
-          proxy: String(savedSettings.proxy || cfg.dynamic_proxy_template || ''),
-          proxy_country_code: String(savedSettings.proxy_country_code || '').trim().toUpperCase(),
-          proxy_failover: Boolean(savedSettings.proxy_failover),
-          proxy_max_candidates: Number(savedSettings.proxy_max_candidates || cfg.proxy_pool_max_candidates || 5) || 5,
-          proxy_min_score: Number(savedSettings.proxy_min_score || cfg.proxy_scan_min_score || 50) || 50,
+          ...proxySettings,
           mail_provider_override: String(savedSettings.mail_provider_override || '__global__'),
           email: String(savedSettings.email || savedEmail || '').trim(),
           login_password: String(cfg.chatgpt_existing_account_login_password || '').trim(),
@@ -2356,12 +2353,7 @@ export default function Accounts() {
           count: Number(savedSettings.count || 1) || 1,
           concurrency: Number(savedSettings.concurrency || 1) || 1,
           register_delay_seconds: Number(savedSettings.register_delay_seconds || 0) || 0,
-          proxy_mode: String(savedSettings.proxy_mode || 'pool'),
-          proxy: String(savedSettings.proxy || ''),
-          proxy_country_code: String(savedSettings.proxy_country_code || '').trim().toUpperCase(),
-          proxy_failover: Boolean(savedSettings.proxy_failover),
-          proxy_max_candidates: Number(savedSettings.proxy_max_candidates || 5) || 5,
-          proxy_min_score: Number(savedSettings.proxy_min_score || 50) || 50,
+          ...taskProxySettingsFromConfig({}, savedSettings),
           mail_provider_override: String(savedSettings.mail_provider_override || '__global__'),
           email: String(savedSettings.email || savedEmail || '').trim(),
           login_password: '',
@@ -2624,43 +2616,32 @@ export default function Accounts() {
     await handleBatchResumeSubscriptionAuth(resumeAuthConfigScope, allowPhoneVerification)
   }
 
-  const openBatchProbeStatusConfig = (scope: 'selected' | 'all') => {
+  const openBatchProbeStatusConfig = async (scope: 'selected' | 'all') => {
+    const cfg = await loadConfigCache({ force: true }).catch(() => configCache || {})
     setBatchProbeStatusConfigScope(scope)
     batchProbeStatusConfigForm.resetFields()
     batchProbeStatusConfigForm.setFieldsValue({
       register_delay_seconds: 0,
       register_delay_max_seconds: 0,
-      proxy_mode: 'pool',
-      proxy: String(configCache?.dynamic_proxy_template || ''),
-      proxy_failover: false,
-      proxy_country_code: '',
-      proxy_min_score: 50,
-      proxy_max_candidates: 5,
+      ...taskProxySettingsFromConfig(cfg || {}),
     })
     setBatchProbeStatusConfigOpen(true)
   }
 
   const submitBatchProbeStatusConfig = async () => {
     const values = await batchProbeStatusConfigForm.validateFields()
+    validateTaskProxySettings(values)
+    await saveTaskProxySettingsToConfig(values)
+    await loadConfigCache({ force: true }).catch(() => null)
     setBatchProbeStatusConfigOpen(false)
-    const probeProxyMode = String(values.proxy_mode || 'pool').trim()
-    const probeUsesPoolSelector =
-      probeProxyMode === 'pool' || (probeProxyMode === 'specified' && Boolean(values.proxy_failover))
     const customParams: Record<string, unknown> = {
-      proxy_mode: probeProxyMode,
-      proxy: ['specified', 'dynamic'].includes(probeProxyMode) ? (String(values.proxy || '').trim() || null) : null,
-      proxy_failover: Boolean(values.proxy_failover),
-      proxy_country_code: String(values.proxy_country_code || '').trim().toUpperCase(),
+      ...buildTaskProxyPayload(values),
       register_delay_seconds: Number(values.register_delay_seconds ?? 0),
       register_delay_max_seconds: Number(values.register_delay_max_seconds ?? 0),
       probe_delay_seconds: Number(values.register_delay_seconds ?? 0),
       probe_delay_max_seconds: Number(values.register_delay_max_seconds ?? 0),
       delay_seconds: Number(values.register_delay_seconds ?? 0),
       delay_max_seconds: Number(values.register_delay_max_seconds ?? 0),
-    }
-    if (probeUsesPoolSelector) {
-      customParams.proxy_min_score = Number(values.proxy_min_score ?? 50)
-      customParams.proxy_max_candidates = Number(values.proxy_max_candidates ?? 5)
     }
     await handleBatchStatusSync('probe', batchProbeStatusConfigScope, customParams)
   }
@@ -2935,13 +2916,16 @@ export default function Accounts() {
     }
   }
 
-  const openPhoneBindingTest = () => {
+  const openPhoneBindingTest = async () => {
+    const cfg = await loadConfigCache({ force: true }).catch(() => configCache || {})
     const scope: 'selected' | 'filtered' = selectedRowKeys.length > 0 ? 'selected' : 'filtered'
     const savedSettings = loadPhoneBindingSettings()
+    const proxySettings = taskProxySettingsFromConfig(cfg || {}, savedSettings as Partial<any>)
     setPhoneBindingTestScope(scope)
     phoneBindingTestForm.setFieldsValue({
       scope,
       ...savedSettings,
+      ...proxySettings,
       phone_lines: '',
     })
     setPhoneBindingManualOpen(false)
@@ -2952,7 +2936,10 @@ export default function Accounts() {
 
   const submitPhoneBindingTest = async () => {
     const values = await phoneBindingTestForm.validateFields()
+    validateTaskProxySettings(values)
     savePhoneBindingSettings(values)
+    await saveTaskProxySettingsToConfig(values)
+    await loadConfigCache({ force: true }).catch(() => null)
     const scope = (values.scope === 'filtered' ? 'filtered' : 'selected') as 'selected' | 'filtered'
     const phoneLines = String(values.phone_lines || '').trim()
     // 手动粘贴优先：避免默认“使用手机号池”开启时忽略用户粘贴的号码。
@@ -2964,9 +2951,6 @@ export default function Accounts() {
       message.warning('请粘贴手机号/API，或启用手机号池')
       return
     }
-    const phoneProxyMode = String(values.proxy_mode || 'pool').trim()
-    const phoneUsesPoolSelector =
-      phoneProxyMode === 'pool' || (phoneProxyMode === 'specified' && Boolean(values.proxy_failover))
     const body: Record<string, unknown> = {
       phone_lines: phoneLines,
       use_pool: usePool,
@@ -2979,14 +2963,7 @@ export default function Accounts() {
       resend_interval_seconds: Number(values.resend_interval_seconds || 0),
       account_interval_seconds: Number(values.account_interval_seconds || 60),
       reuse_phone_until_unusable: prefixSampleEnabled ? false : Boolean(values.reuse_phone_until_unusable),
-      proxy: ['specified', 'dynamic'].includes(phoneProxyMode) ? (String(values.proxy || '').trim() || null) : null,
-      proxy_mode: phoneProxyMode,
-      proxy_country_code: String(values.proxy_country_code || '').trim().toUpperCase(),
-      proxy_failover: Boolean(values.proxy_failover),
-    }
-    if (phoneUsesPoolSelector) {
-      body.proxy_max_candidates = Number(values.proxy_max_candidates || 10)
-      body.proxy_min_score = Number(values.proxy_min_score || 50)
+      ...buildTaskProxyPayload(values),
     }
     let requestedAccounts = total
     if (scope === 'selected') {
@@ -3728,7 +3705,10 @@ export default function Accounts() {
 
     setRegisterSettingsSaving(true)
     try {
+      validateTaskProxySettings(settingsPayload)
       saveRegisterFormSettings(currentPlatform, settingsPayload)
+      await saveTaskProxySettingsToConfig(settingsPayload)
+      await loadConfigCache({ force: true }).catch(() => null)
       if (settingsPayload.mail_provider_override === 'manual_email_otp' && settingsPayload.email) {
         window.localStorage.setItem('auto-chatgpt.manual_email_otp.email', settingsPayload.email)
       }
@@ -3869,6 +3849,7 @@ export default function Accounts() {
         window.localStorage.setItem('auto-chatgpt.manual_email_otp.email', normalizedEmail)
       }
 
+      validateTaskProxySettings(values)
       saveRegisterFormSettings(currentPlatform, {
         count: Number(values.count || 1) || 1,
         concurrency: Number(values.concurrency || 1) || 1,
@@ -3893,19 +3874,9 @@ export default function Accounts() {
             : Boolean(values.chatgpt_save_registration_access_token_account),
       })
 
-      const registerProxyMode = String(values.proxy_mode || 'pool').trim()
-      const registerUsesPoolSelector =
-        registerProxyMode === 'pool' || (registerProxyMode === 'specified' && Boolean(values.proxy_failover))
-      const proxyPayload: Record<string, unknown> = {
-        proxy: ['specified', 'dynamic'].includes(registerProxyMode) ? (String(values.proxy || '').trim() || null) : null,
-        proxy_mode: registerProxyMode,
-        proxy_country_code: String(values.proxy_country_code || '').trim().toUpperCase(),
-        proxy_failover: Boolean(values.proxy_failover),
-      }
-      if (registerUsesPoolSelector) {
-        proxyPayload.proxy_max_candidates = Number(values.proxy_max_candidates || 5)
-        proxyPayload.proxy_min_score = Number(values.proxy_min_score || 0)
-      }
+      await saveTaskProxySettingsToConfig(values)
+      await loadConfigCache({ force: true }).catch(() => null)
+      const proxyPayload = buildTaskProxyPayload(values)
 
       const res = await apiFetch('/tasks/register', {
         method: 'POST',
@@ -6038,7 +6009,7 @@ export default function Accounts() {
         baxiCdkSubmitLoading={baxiCdkSubmitLoading}
         onBatchPaymentLink={handleBatchPaymentLink}
         onBatchInvalidRecheck={handleBatchInvalidRecheck}
-        onOpenPhoneBindingTest={openPhoneBindingTest}
+        onOpenPhoneBindingTest={() => { void openPhoneBindingTest() }}
         onOpenPaypalBinding={openPaypalBinding}
         onOpenBaxiCdkSubmit={openBaxiCdkSubmit}
         onOpenBatchGopay={openBatchGopayWorkbench}
@@ -6065,7 +6036,7 @@ export default function Accounts() {
           const [kind, scopeKey, modeKey] = rawKey.split(':')
           const scope = scopeKey as 'selected' | 'all'
           if (kind === 'probe' && modeKey === 'config') {
-            openBatchProbeStatusConfig(scope)
+            void openBatchProbeStatusConfig(scope)
             return
           }
           void handleBatchStatusSync(kind as any, scope)
@@ -6359,7 +6330,11 @@ export default function Accounts() {
 
           {(probeProxyModeValue === 'pool' || probeProxyModeValue === 'dynamic' || (probeProxyModeValue === 'specified' && probeProxyFailoverValue)) && (
             <Space style={{ display: 'flex', flexWrap: 'wrap', gap: 16 }} align="baseline">
-              <Form.Item label="目标国家 (ISO 缩写)" name="proxy_country_code">
+              <Form.Item
+                label="目标国家 (ISO 缩写)"
+                name="proxy_country_code"
+                rules={probeProxyModeValue === 'dynamic' ? [{ required: true, message: '请输入动态代理出口国家' }] : undefined}
+              >
                 <Input style={{ width: 140 }} placeholder={probeProxyModeValue === 'dynamic' ? '必填，如 US' : '如 US, JP, 不填则不限'} />
               </Form.Item>
               {probeProxyModeValue !== 'dynamic' ? (
@@ -6676,6 +6651,7 @@ export default function Accounts() {
                   <Form.Item
                     name="proxy_country_code"
                     label="代理国家"
+                    rules={phoneBindingProxyMode === 'dynamic' ? [{ required: true, message: '请输入动态代理出口国家' }] : undefined}
                     extra={phoneBindingProxyMode === 'dynamic' ? '动态代理必填；例如 US、JP。' : '可留空；例如 US、JP。'}
                   >
                     <Input placeholder={phoneBindingProxyMode === 'dynamic' ? 'US' : '不限'} maxLength={2} />

@@ -304,7 +304,7 @@ def resolve_task_proxy_candidates(
         or ""
     ).strip().upper()
     if mode == "dynamic" and not country_code:
-        country_code = str(_configured_value("dynamic_proxy_default_country", "") or "").strip().upper()
+        country_code = str(_configured_value("dynamic_proxy_default_country", "JP") or "JP").strip().upper()
 
     raw_failover = _param_first(
         params,

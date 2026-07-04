@@ -137,4 +137,30 @@ class ProbeLocalStatusBatchConfigTests(unittest.TestCase):
         mock_sync.assert_called_once()
         mock_store.finish.assert_called_once()
 
+    @mock.patch("api.tasks._save_task_log")
+    @mock.patch("api.tasks._task_store")
+    @mock.patch("api.tasks.Session")
+    def test_run_batch_probe_local_status_marks_unhandled_exception_failed(self, mock_session_cls, mock_store, mock_save_log):
+        from api.tasks import _run_batch_probe_local_status
+
+        mock_acc = mock.Mock(id=10, email="a10@example.com", status="ok")
+        mock_session_cls.return_value.__enter__.return_value.get.return_value = mock_acc
+        mock_store.snapshot.return_value = {"meta": {"emails": ["a10@example.com"], "skipped_items": []}}
+        mock_store.control_for.return_value = mock.Mock()
+
+        _run_batch_probe_local_status(
+            "task_test_probe_failed",
+            [10],
+            {
+                "proxy_mode": "dynamic",
+                "proxy": "http://user:pass@proxy.test:8080",
+                "proxy_country_code": "US",
+            },
+        )
+
+        mock_save_log.assert_called()
+        finish_kwargs = mock_store.finish.call_args.kwargs
+        self.assertEqual(finish_kwargs.get("status"), "failed")
+        self.assertIn("region-XX", finish_kwargs.get("error", ""))
+
 

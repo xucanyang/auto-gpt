@@ -31,6 +31,7 @@ import {
 import { TaskLogPanel } from '@/components/TaskLogPanel'
 import { TaskVerificationPanel } from '@/components/TaskVerificationPanel'
 import { apiFetch } from '@/lib/utils'
+import { buildTaskProxyPayload, saveTaskProxySettingsToConfig, taskProxySettingsFromConfig, validateTaskProxySettings } from '@/lib/taskProxySettings'
 
 const { Paragraph, Text, Title } = Typography
 
@@ -247,20 +248,7 @@ function parseSub2ApiImportPreview(rawValue?: string) {
 }
 
 function buildProxyPayload(values: any) {
-  const mode = String(values?.proxy_mode || 'pool').trim() as ProxyMode
-  const proxy = String(values?.proxy || '').trim()
-  const includePoolSelectorParams = mode === 'pool' || (mode === 'specified' && Boolean(values?.proxy_failover))
-  const payload: any = {
-    proxy: mode === 'specified' || mode === 'dynamic' ? (proxy || null) : null,
-    proxy_mode: mode || 'pool',
-    proxy_country_code: String(values?.proxy_country_code || '').trim().toUpperCase(),
-    proxy_failover: Boolean(values?.proxy_failover),
-  }
-  if (includePoolSelectorParams) {
-    payload.proxy_max_candidates = Number(values?.proxy_max_candidates ?? 5)
-    payload.proxy_min_score = Number(values?.proxy_min_score ?? 50)
-  }
-  return payload
+  return buildTaskProxyPayload(values)
 }
 
 export default function CustomEmailRecheckPage() {
@@ -273,6 +261,7 @@ export default function CustomEmailRecheckPage() {
   const [bulkEmailsText, setBulkEmailsText] = useState('')
   const [sub2apiImportText, setSub2apiImportText] = useState('')
   const [sub2apiImportName, setSub2apiImportName] = useState('')
+  const [proxyDefaults, setProxyDefaults] = useState(() => taskProxySettingsFromConfig({}))
   const [polling, setPolling] = useState(false)
   const pollTimerRef = useRef<number | null>(null)
   const sub2apiFileInputRef = useRef<HTMLInputElement | null>(null)
@@ -285,21 +274,36 @@ export default function CustomEmailRecheckPage() {
   const sub2apiPreview = useMemo(() => parseSub2ApiImportPreview(sub2apiImportText), [sub2apiImportText])
 
   useEffect(() => {
+    let disposed = false
     const savedEmail = window.localStorage.getItem(CUSTOM_EMAIL_RECHECK_EMAIL_KEY)
       || window.localStorage.getItem('auto-chatgpt.manual_email_otp.email')
       || ''
-    form.setFieldsValue({
-      email: savedEmail,
-      password: '',
-      save_on_success: true,
-    proxy_mode: 'pool',
-    proxy: '',
-    proxy_failover: false,
-    proxy_country_code: '',
-    proxy_min_score: 50,
-    proxy_max_candidates: 5,
-    account_delay_seconds: 0,
-  })
+    apiFetch('/config')
+      .then((cfg) => {
+        if (disposed) return
+        const proxySettings = taskProxySettingsFromConfig(cfg)
+        setProxyDefaults(proxySettings)
+        form.setFieldsValue({
+          email: savedEmail,
+          password: '',
+          save_on_success: true,
+          ...proxySettings,
+          account_delay_seconds: 0,
+        })
+      })
+      .catch(() => {
+        if (disposed) return
+        const proxySettings = taskProxySettingsFromConfig({})
+        setProxyDefaults(proxySettings)
+        form.setFieldsValue({
+          email: savedEmail,
+          password: '',
+          save_on_success: true,
+          ...proxySettings,
+          account_delay_seconds: 0,
+        })
+      })
+    return () => { disposed = true }
 }, [form])
 
   useEffect(() => {
@@ -424,10 +428,13 @@ export default function CustomEmailRecheckPage() {
     const normalizedEmail = String(values.email || '').trim()
     const normalizedPassword = String(values.password || '')
     const saveOnSuccess = values.save_on_success === undefined ? true : Boolean(values.save_on_success)
+    validateTaskProxySettings(values)
     const proxyPayload = buildProxyPayload(values)
 
     setSubmitting(true)
     try {
+      const savedProxySettings = await saveTaskProxySettingsToConfig(values)
+      setProxyDefaults(savedProxySettings)
       window.localStorage.setItem(CUSTOM_EMAIL_RECHECK_EMAIL_KEY, normalizedEmail)
       window.localStorage.setItem('auto-chatgpt.manual_email_otp.email', normalizedEmail)
       const response = await apiFetch('/tasks/chatgpt/custom-email-recheck', {
@@ -513,6 +520,7 @@ export default function CustomEmailRecheckPage() {
     ])
     const normalizedPassword = String(values.password || '')
     const saveOnSuccess = values.save_on_success === undefined ? true : Boolean(values.save_on_success)
+    validateTaskProxySettings(values)
     const proxyPayload = buildProxyPayload(values)
     const accountDelaySeconds = Math.min(Math.max(Number(values.account_delay_seconds || 0), 0), 600)
     const sourceFormat = bulkInputMode
@@ -544,6 +552,8 @@ export default function CustomEmailRecheckPage() {
 
     setBulkSubmitting(true)
     try {
+      const savedProxySettings = await saveTaskProxySettingsToConfig(values)
+      setProxyDefaults(savedProxySettings)
       const response = await apiFetch('/tasks/chatgpt/custom-email-recheck/batch', {
         method: 'POST',
         body: JSON.stringify({
@@ -685,12 +695,7 @@ export default function CustomEmailRecheckPage() {
                     email: '',
                     password: '',
                     save_on_success: true,
-                    proxy_mode: 'pool',
-                    proxy: '',
-                    proxy_failover: false,
-                    proxy_country_code: '',
-                    proxy_min_score: 50,
-                    proxy_max_candidates: 5,
+                    ...proxyDefaults,
                     account_delay_seconds: 0,
                   }}
                   onFinish={handleSubmit}
@@ -744,7 +749,12 @@ export default function CustomEmailRecheckPage() {
 
                   {proxyMode === 'pool' || proxyMode === 'dynamic' || (proxyMode === 'specified' && proxyFailover) ? (
                     <Space style={{ width: '100%' }} align="start" wrap>
-                      <Form.Item name="proxy_country_code" label="出口国家" style={{ flex: '1 1 180px' }}>
+                      <Form.Item
+                        name="proxy_country_code"
+                        label="出口国家"
+                        style={{ flex: '1 1 180px' }}
+                        rules={proxyMode === 'dynamic' ? [{ required: true, message: '请输入动态代理出口国家' }] : undefined}
+                      >
                         <Input size="large" placeholder={proxyMode === 'dynamic' ? '必填，例如 US / JP / SG' : '不限，或填 US / JP / SG'} maxLength={2} />
                       </Form.Item>
                       {proxyMode !== 'dynamic' ? (
@@ -789,12 +799,7 @@ export default function CustomEmailRecheckPage() {
                           email: savedEmail,
                           password: '',
                           save_on_success: true,
-                          proxy_mode: 'pool',
-                          proxy: '',
-                          proxy_failover: false,
-                          proxy_country_code: '',
-                          proxy_min_score: 50,
-                          proxy_max_candidates: 5,
+                          ...proxyDefaults,
                           account_delay_seconds: 0,
                         })
                       }}

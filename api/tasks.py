@@ -5501,7 +5501,6 @@ def _run_batch_sub2api_upload(task_id: str, account_ids: list[int]):
     meta = dict(_task_store.snapshot(task_id).get("meta") or {})
     skipped_items = list(meta.get("skipped_items") or [])
     missing_ids = list(meta.get("missing_ids") or [])
-
     try:
         for missing_id in missing_ids:
             _log(task_id, f"[MISS] 账号不存在: account_id={missing_id}")
@@ -9947,6 +9946,11 @@ def _run_batch_probe_local_status(task_id: str, account_ids: list[int], params: 
     meta = dict(_task_store.snapshot(task_id).get("meta") or {})
     skipped_items = list(meta.get("skipped_items") or [])
     missing_ids = list(meta.get("missing_ids") or [])
+    if not primary_email:
+        meta_emails = meta.get("emails")
+        if isinstance(meta_emails, list) and meta_emails:
+            primary_email = str(meta_emails[0] or "")
+
 
     try:
         for missing_id in missing_ids:
@@ -10079,6 +10083,38 @@ def _run_batch_probe_local_status(task_id: str, account_ids: list[int], params: 
             skipped=skipped_count + len(skipped_items),
             errors=errors,
             error=str(exc),
+        )
+    except Exception as exc:
+        error_text = sanitize_error_message(str(exc) or exc.__class__.__name__)
+        logger.exception("批量同步本地状态任务异常 task_id=%s error=%s", task_id, error_text)
+        _log(task_id, f"[FAIL] 批量同步本地状态异常: {error_text}")
+        _save_task_log(
+            "chatgpt",
+            primary_email,
+            "failed",
+            error=error_text,
+            detail=_build_task_log_detail(
+                task_id,
+                {
+                    "email": primary_email,
+                    "attempt_outcome": "batch_probe_local_status_failed",
+                    "source": "batch_probe_local_status",
+                    "meta": {
+                        **meta,
+                        "runtime_success": success_count,
+                        "runtime_skipped": skipped_count,
+                        "runtime_errors": errors + [error_text],
+                    },
+                },
+            ),
+        )
+        _task_store.finish(
+            task_id,
+            status="failed",
+            success=success_count,
+            skipped=skipped_count + len(skipped_items),
+            errors=errors + [error_text],
+            error=error_text,
         )
     finally:
         _task_store.cleanup()

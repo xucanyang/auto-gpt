@@ -6,6 +6,7 @@
 
 ## [Unreleased] (未发布)
 ### 新增 (Added)
+- **新增任务代理设置统一保存与复用**：代理管理页“动态代理预览”新增“保存为任务默认”入口，并新增 `frontend/src/lib/taskProxySettings.ts` 作为注册任务、批量本地状态同步、邮箱测活、手机号绑定等任务表单的统一代理配置适配层；用户在任一任务中填写的代理模式、动态代理模板/API、出口国家、失败处理、代理池候选数与最低健康分会写入 `/api/config` 的 `task_proxy_*` 全局配置，并同步镜像到 `dynamic_proxy_template` / `dynamic_proxy_default_country`，后续所有任务弹窗默认读取同一套代理参数，避免注册、本地刷新、测活、手机号绑定各自记一份导致配置漂移。
 - **新增动态代理模式，支持按需指定出口国家**：后端新增 `core/dynamic_proxy.py` 与统一候选解析入口，注册任务、批量本地状态同步、邮箱测活、HME 复测和手机号绑定现在均支持 `proxy_mode=dynamic`。该模式使用任务内或全局配置的动态代理模板，按 `proxy_country_code` 改写 `region-XX`，每次候选生成刷新 `sid-xxx-t-`，并保留现有 cliproxy `socks5://` 到运行态 `http://` 的兼容转换。
 - **新增动态代理出口预览接口与前端入口**：代理管理页新增“动态代理预览”卡片，调用 `/api/proxies/dynamic-preview` 生成脱敏运行代理并可按需实测出口 IP/国家；全局配置页新增动态代理默认模板、默认出口国家、国家严格匹配、运行前探测与探测超时配置，便于在任务页复用。
 - **前端任务表单增加“动态代理”代理模式**：注册页、账号页注册弹窗、批量本地状态同步弹窗、邮箱测活页与手机号绑定高级设置均新增动态代理选项，并明确区分“指定代理失败回退代理池”和“动态代理失败刷新 sid 重试”的候选语义。
@@ -14,6 +15,7 @@
 - **强化动态代理与任务日志脱敏边界**：动态代理模板、运行代理、批量本地状态同步参数、邮箱测活结果和 HME 复测详情在任务 meta、历史日志与预览接口中只保存脱敏地址；新增对 `dynamic_proxy_template`、`proxy_template` 等结构化字段的统一代理认证脱敏，避免代理账号、密码或 sid 模板信息进入可展示日志。
 
 ### 修复 (Fixed)
+- **修复批量本地状态同步动态代理异常后任务悬空的问题**：`api/tasks.py` 的 `_run_batch_probe_local_status` 增加普通 `Exception` 兜底捕获，动态代理模板缺少出口国家、缺少 `region-XX`、探测解析异常或其他未预期错误都会写入任务日志、保存失败历史并将任务状态标记为 `failed`，不再让后台任务崩溃后前端持续显示 pending/running；同时动态代理国家 fallback 与前端必填校验保持一致，缺省时使用全局默认国家。
 - **修复 Idea 开通成功后账号本地状态只被外部 paid 标记覆盖的问题**：`api/tasks.py`、`api/baxigpt_cdk_pool.py` 与后台 `baxigpt_status_poller` 在上游订单确认 paid 后，改为先执行 `sync_chatgpt_account_local_status` 本地刷新，由真实 ChatGPT 探测结果统一更新账号 `status`、订阅能力和上传门禁；卡密侧 paid/order_id 仍写入 `extra.baxigpt_cdk`，并将 `local_status_refresh` 摘要同步回账号，避免仅凭外部支付成功把账号状态简单改成 `subscribed` 而遗漏订阅计划、auth/codex 状态等本地字段。
 - **修复 Idea 批量提交轮询全部超时的真实任务 ID 匹配问题**：`services/chatgpt_core/baxigpt_client.py` 现在优先消费上游 `/api/task/submit` 返回的 `created_tasks` 真实任务 ID，并禁止把 Access Token 前缀生成的 `fallback_*` 当成可轮询订单；当旧上游未返回任务 ID 且无法可靠匹配时，会直接返回“上游已受理但未返回可轮询任务ID”的明确失败，避免继续轮询不存在的订单直到超时。
 - **修复 Idea 上游失败原因丢失与 summary 误导问题**：`BaxiGptClient.status/query` 已兼容读取上游 `fail_reason/raw_fail_reason`，任务执行器 (`api/tasks.py`) 增加上游已受理数与轮询超时数统计，summary 不再出现“成功 0、跳过 0、失败 0”但实际全是 timeout 的错误表达。
