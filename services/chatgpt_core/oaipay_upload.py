@@ -319,6 +319,46 @@ def _extract_oaipay_response_data(detail: Any) -> dict[str, Any]:
     return detail
 
 
+def _stringify_error_detail(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (int, float, bool)):
+        return str(value)
+    if isinstance(value, list):
+        parts = [_stringify_error_detail(item) for item in value]
+        return "; ".join(part for part in parts if part).strip()
+    if isinstance(value, dict):
+        for key in ("message", "msg", "error", "detail"):
+            text = _stringify_error_detail(value.get(key))
+            if text:
+                return text
+        try:
+            return json.dumps(value, ensure_ascii=False, separators=(",", ":"))[:500]
+        except Exception:
+            return str(value)[:500]
+    return str(value).strip()
+
+
+def _extract_oaipay_error_detail(detail: Any) -> str:
+    if isinstance(detail, dict):
+        for key in ("message", "msg", "error", "detail"):
+            text = _stringify_error_detail(detail.get(key))
+            if text:
+                return text
+    return _stringify_error_detail(detail)
+
+
+def _format_oaipay_upload_error(response: Any, detail: Any) -> str:
+    status_code = getattr(response, "status_code", "")
+    base = f"上传失败: HTTP {status_code}" if status_code else "上传失败"
+    detail_text = _extract_oaipay_error_detail(detail)
+    if not detail_text:
+        detail_text = str(getattr(response, "text", "") or "")[:500].strip()
+    return f"{base}: {detail_text}" if detail_text else base
+
+
 _CATEGORIES_CACHE = {}
 _CATEGORIES_CACHE_TIME = 0
 
@@ -561,16 +601,7 @@ def upload_to_oaipay_detailed(
                         "response": detail2,
                     }
 
-            error_msg = f"上传失败: HTTP {response.status_code}"
-            if isinstance(detail, dict):
-                error_msg = str(
-                    detail.get("message")
-                    or detail.get("msg")
-                    or detail.get("error")
-                    or error_msg
-                )
-            else:
-                error_msg = f"{error_msg} - {response.text[:200]}"
+            error_msg = _format_oaipay_upload_error(response, detail)
             return {"ok": False, "message": error_msg, "response": detail if isinstance(detail, dict) else {}}
         except Exception as exc:
             logger.error("OAIPay 上传尝试失败 (%s): %s", url, exc)

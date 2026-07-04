@@ -195,6 +195,34 @@ def _extract_api_items(payload: Any) -> list[dict[str, Any]]:
     return [item for item in items if isinstance(item, dict)]
 
 
+def _stringify_api_error_detail(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (int, float, bool)):
+        return str(value)
+    if isinstance(value, list):
+        parts = [_stringify_api_error_detail(item) for item in value]
+        return "; ".join(part for part in parts if part).strip()
+    if isinstance(value, dict):
+        for key in ("message", "msg", "error", "detail"):
+            text = _stringify_api_error_detail(value.get(key))
+            if text:
+                return text
+        return str(value)[:500]
+    return str(value).strip()
+
+
+def _extract_api_error_detail(body: Any, fallback_text: str = "") -> str:
+    if isinstance(body, dict):
+        for key in ("message", "msg", "error", "detail"):
+            text = _stringify_api_error_detail(body.get(key))
+            if text:
+                return text
+    return _stringify_api_error_detail(body) or fallback_text[:500].strip()
+
+
 def _fetch_oaipay_account_items(identity: dict[str, str]) -> list[dict[str, Any]]:
     api_url = _get_config_value("oaipay_api_url")
     api_key = _get_config_value("oaipay_api_key")
@@ -251,8 +279,7 @@ def _fetch_oaipay_account_items(identity: dict[str, str]) -> list[dict[str, Any]
                 detail = ""
                 try:
                     body = response.json()
-                    if isinstance(body, dict):
-                        detail = _safe_str(body.get("message") or body.get("error") or body.get("msg"))
+                    detail = _extract_api_error_detail(body)
                 except Exception:
                     detail = (response.text or "")[:200]
                 last_error = f"OAIPay API 返回 HTTP {response.status_code}{(': ' + detail) if detail else ''}"
@@ -270,6 +297,12 @@ def _fetch_oaipay_account_items(identity: dict[str, str]) -> list[dict[str, Any]
                     )
                     if resp2.status_code < 400:
                         return _extract_api_items(resp2.json())
+                    try:
+                        body2 = resp2.json()
+                        detail2 = _extract_api_error_detail(body2)
+                    except Exception:
+                        detail2 = (resp2.text or "")[:200]
+                    last_error = f"OAIPay API 返回 HTTP {resp2.status_code}{(': ' + detail2) if detail2 else ''}"
                 continue
             return _extract_api_items(response.json())
         except Exception as exc:

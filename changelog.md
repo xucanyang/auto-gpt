@@ -6,6 +6,14 @@
 
 ## [Unreleased] (未发布)
 
+## [1.2.7] - 2026-07-05
+### 修复 (Fixed)
+- **透出 OAIPay 上传认证失败的真实服务端错误**：`services/chatgpt_core/oaipay_upload.py` 在 OAIPay 上传接口返回 `401/403` 或其他 HTTP 错误时，新增对响应 JSON 中 `detail/message/msg/error` 的统一提取，日志与任务结果会展示 `上传失败: HTTP 401: 上传密钥无效` 这类可操作原因，不再只保留泛化的 `上传失败: HTTP 401`；`services/oaipay_sync.py` 的远端账号探测同样透出 `detail`，避免上传前探测阶段把密钥问题误报成普通不可达。
+- **补充 OAIPay 401 诊断回归测试**：`tests/test_oaipay_sync.py` 新增上传与远端探测两个 401 场景，固定 FastAPI 风格 `{"detail":"上传密钥无效"}` 的错误提取行为，防止后续接口兼容重构再次吞掉真实错误详情。
+
+### 优化 (Changed)
+- **同步 OAIPay 设置页上传密钥文案**：`frontend/src/pages/Settings.tsx` 将 OAIPay API Key 标签从“管理员密码”改为“API Key / 上传密钥（gpt.cccy.me 的 UPLOAD_KEY）”，与 `gpt.cccy.me` 安全加固后的独立 `UPLOAD_KEY` 口径保持一致；侧边栏版本展示同步更新为 `v1.2.7`，方便上线后确认新前端资源已加载。
+
 ## [1.2.6] - 2026-07-05
 ### 新增 (Added)
 - **新增账号处理流水线串联注册、本地账号、Idea、手机号与 OAIPay**：新增 `docs/idea-oaipay-pipeline/design.md` 作为方案文档，并增加 `services/idea_oaipay_pipeline/`、`api/idea_oaipay_pipeline.py` 与 `/api/idea-oaipay-pipeline/*` 接口，支持从“注册新账号”或“本地账号快照”启动同一条账号级流水线，再按配置执行 Idea 批量提交、本地状态刷新、状态 Gate、手机号绑定和 OAIPay 上传。流水线不再把 Plus 写成全局硬门槛，`status_gate` 可按 `none / account_valid / subscription_in / upload_ready` 放行，支持 Free 账号只做手机号绑定或继续上传的业务形态。
@@ -234,4 +242,8 @@
 
 ## 2026-07-05 05:49:09 +0800
 - 新增账号处理流水线串联Idea手机号OAIPay
+- 发布模式: multi
+
+## 2026-07-05 06:12:16 +0800
+- 修复 OAIPay 上传密钥文案和 401 错误详情
 - 发布模式: multi

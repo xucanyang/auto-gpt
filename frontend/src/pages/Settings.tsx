@@ -459,7 +459,7 @@ const TAB_ITEMS = [
         desc: '一键将账号推送到 OAIPay (gpt.cccy.me)',
         fields: [
           { key: 'oaipay_api_url', label: 'API URL', placeholder: 'http://gpt.cccy.me/api/auto-gpt/upload' },
-          { key: 'oaipay_api_key', label: 'API Key (管理员密码)', secret: true },
+          { key: 'oaipay_api_key', label: 'API Key / 上传密钥（gpt.cccy.me 的 UPLOAD_KEY）', secret: true },
           { key: 'oaipay_group', label: '默认分组', placeholder: '例如: auto-gpt' },
         ]
       },
