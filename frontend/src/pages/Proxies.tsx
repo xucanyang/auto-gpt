@@ -1119,7 +1119,7 @@ export default function Proxies() {
             type="info"
             showIcon
             message="动态代理不是本地代理池记录"
-            description="输入包含 region-XX / sid-xxx-t- 的模板，系统会按出口国家改写 region 并刷新 sid；预览和日志只展示脱敏地址。"
+            description="输入包含 region-XX / sid-xxx-t- 的模板，系统会按出口国家改写 region 并刷新 sid；预览优先用代理出口侧 Cloudflare Trace 实测国家，GeoIP 临时不可用时会标记未实测，预览和日志只展示脱敏地址。"
           />
           <Space wrap align="start" style={{ width: '100%' }}>
             <Input.Password

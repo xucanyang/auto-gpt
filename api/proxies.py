@@ -426,15 +426,26 @@ def dynamic_proxy_preview(body: DynamicProxyPreviewRequest):
     geo = summary.get("geo") if isinstance(summary.get("geo"), dict) else {}
     exit_ip = str((basic or {}).get("exit_ip") or "").strip()
     actual_country = str((geo or {}).get("country_code") or "").strip().upper()
+    declared_country = str(resolved.resolved_country_code or "").strip().upper()
+    geo_unverified = bool((basic or {}).get("ok") and not actual_country)
+    trusted_declared_country = bool(
+        geo_unverified
+        and resolved.provider == "cliproxy"
+        and declared_country == resolved.requested_country_code
+    )
     response.update(
         {
             "exit_ip": exit_ip,
             "actual_country": actual_country,
             "match": bool(actual_country and actual_country == resolved.requested_country_code),
+            "geo_unverified": geo_unverified,
+            "trusted_declared_country": trusted_declared_country,
+            "geo_source": str((geo or {}).get("source") or ""),
             "latency_ms": int((basic or {}).get("latency_ms") or summary.get("duration_ms") or 0),
             "probe": {
                 "basic_ok": bool((basic or {}).get("ok")),
                 "geo_ok": bool((geo or {}).get("ok")),
+                "geo_source": str((geo or {}).get("source") or ""),
                 "basic_error_code": str((basic or {}).get("error_code") or ""),
                 "basic_error": str((basic or {}).get("error") or "")[:200],
                 "geo_error_code": str((geo or {}).get("error_code") or ""),
@@ -445,9 +456,14 @@ def dynamic_proxy_preview(body: DynamicProxyPreviewRequest):
     if not (basic or {}).get("ok"):
         response["ok"] = False
         response["message"] = str((basic or {}).get("error") or "动态代理基础连通性探测失败")[:200]
-    elif require_match and not response["match"]:
+    elif require_match and actual_country and not response["match"]:
         response["ok"] = False
         response["message"] = f"出口国家不匹配：期望 {resolved.requested_country_code}，实测 {actual_country or 'unknown'}"
+    elif require_match and not actual_country and not trusted_declared_country:
+        response["ok"] = False
+        response["message"] = f"出口国家无法实测：期望 {resolved.requested_country_code}，GeoIP 未返回国家"
+    elif require_match and not actual_country and trusted_declared_country:
+        response["message"] = "动态代理基础连通性通过；GeoIP 未返回国家，已按 Cliproxy 模板 region 标记为未实测可用"
     else:
         response["message"] = "动态代理出口探测完成"
     return response

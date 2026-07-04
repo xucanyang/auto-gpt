@@ -52,6 +52,32 @@ class ProxyScannerTests(unittest.TestCase):
         self.assertEqual(result["country_code"], "JP")
         self.assertEqual(result["asn"], "AS64500")
 
+    def test_lookup_geo_via_proxy_trace_parses_country(self):
+        with mock.patch(
+            "services.proxy_scanner.requests.get",
+            return_value=_Response(text="fl=1\nip=203.0.113.10\nloc=US\ncolo=LAX\n"),
+        ):
+            result = proxy_scanner.lookup_geo_via_proxy_trace("socks5://user:pass@127.0.0.1:1080")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["country_code"], "US")
+        self.assertEqual(result["exit_ip"], "203.0.113.10")
+        self.assertEqual(result["source"], "cloudflare_trace")
+
+    def test_scan_proxy_url_prefers_proxy_trace_geo_over_server_geo_lookup(self):
+        with mock.patch(
+            "services.proxy_scanner.probe_basic",
+            return_value={"ok": True, "exit_ip": "203.0.113.10", "latency_ms": 10},
+        ), mock.patch(
+            "services.proxy_scanner.lookup_geo_via_proxy_trace",
+            return_value={"ok": True, "country_code": "US", "source": "cloudflare_trace", "exit_ip": "203.0.113.10"},
+        ), mock.patch("services.proxy_scanner.lookup_geo") as lookup_geo:
+            result = proxy_scanner.scan_proxy_url("socks5://user:pass@127.0.0.1:1080", targets=["basic", "geo"])
+
+        self.assertEqual(result["geo"]["country_code"], "US")
+        self.assertEqual(result["geo"]["source"], "cloudflare_trace")
+        lookup_geo.assert_not_called()
+
     def test_calculate_health_score_penalizes_blocked_chatgpt(self):
         proxy = ProxyModel(url="http://127.0.0.1:8080", is_active=True)
         proxy.scan_status = "ok"
@@ -63,7 +89,17 @@ class ProxyScannerTests(unittest.TestCase):
         self.assertLess(score, 70)
         self.assertGreater(score, 0)
 
-    def test_probe_chatgpt_prefers_cffi_success_over_legacy_403(self):
+    def test_probe_chatgpt_prefers_registration_success_over_legacy_403(self):
+        registration_result = {
+            "ok": True,
+            "status": "ok",
+            "target": "registration_homepage_csrf",
+            "status_code": 200,
+            "latency_ms": 24,
+            "error_code": "",
+            "error": "",
+            "attempts": [],
+        }
         cffi_result = {
             "ok": True,
             "status": "ok",
@@ -77,7 +113,9 @@ class ProxyScannerTests(unittest.TestCase):
                 "auth": {"ok": True, "status_code": 200},
             },
         }
-        with mock.patch("services.proxy_scanner.probe_chatgpt_cffi", return_value=cffi_result), mock.patch(
+        with mock.patch("services.proxy_scanner.probe_chatgpt_registration_flow", return_value=registration_result), mock.patch(
+            "services.proxy_scanner.probe_chatgpt_cffi", return_value=cffi_result
+        ), mock.patch(
             "services.proxy_scanner._request_via_proxy",
             return_value={"ok": False, "status_code": 403, "latency_ms": 12, "error_code": "http_403", "error": "HTTP 403"},
         ):

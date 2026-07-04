@@ -2,7 +2,7 @@ import pytest
 from fastapi import HTTPException
 
 from core.dynamic_proxy import declared_proxy_region, resolve_dynamic_proxy_template
-from core.proxy_utils import resolve_probe_candidate_proxies
+from core.proxy_utils import _dynamic_probe_source, normalize_proxy_url, resolve_probe_candidate_proxies
 from services.chatgpt_core.task_logging import sanitize_task_detail
 
 
@@ -49,11 +49,15 @@ def test_resolve_probe_candidate_proxies_dynamic_generates_fresh_normalized_cand
     assert len(set(urls)) == 3
     for url, pool, source in candidates:
         assert pool is None
-        assert url.startswith("http://")  # cliproxy socks5 is normalized after dynamic rewrite
+        assert url.startswith("socks5://")
         assert "region-US" in url
         assert "sid-oldsid-t-" not in url
         assert "dynamic country=US" in source
         assert "probe=disabled" in source
+
+
+def test_normalize_proxy_url_preserves_cliproxy_socks5_scheme():
+    assert normalize_proxy_url(TEMPLATE) == TEMPLATE
 
 
 def test_dynamic_proxy_uses_dynamic_attempts_not_pool_candidate_count():
@@ -144,3 +148,50 @@ def test_dynamic_proxy_uses_config_default_country_when_task_country_empty(monke
     assert len(candidates) == 1
     assert "region-US" in candidates[0][0]
     assert "dynamic country=US" in candidates[0][2]
+
+
+def test_dynamic_probe_accepts_cliproxy_declared_country_when_geo_is_unavailable(monkeypatch):
+    def fake_scan_proxy_url(*_args, **_kwargs):
+        return {
+            "basic": {"ok": True, "exit_ip": "203.0.113.10", "latency_ms": 12},
+            "geo": {"ok": False, "error_code": "http_429", "error": "HTTP 429"},
+        }
+
+    monkeypatch.setattr("services.proxy_scanner.scan_proxy_url", fake_scan_proxy_url)
+
+    ok, source = _dynamic_probe_source(
+        "socks5://acct-region-US-sid-newsid-t-1:secret@example.cliproxy.io:3010",
+        expected_country="US",
+        declared_country="US",
+        provider="cliproxy",
+        sid_refreshed=True,
+        timeout_seconds=3,
+        require_country_match=True,
+    )
+
+    assert ok is True
+    assert "actual=unverified" in source
+    assert "probe=geo_unavailable" in source
+
+
+def test_dynamic_probe_rejects_real_country_mismatch(monkeypatch):
+    def fake_scan_proxy_url(*_args, **_kwargs):
+        return {
+            "basic": {"ok": True, "exit_ip": "203.0.113.10", "latency_ms": 12},
+            "geo": {"ok": True, "country_code": "JP", "source": "cloudflare_trace"},
+        }
+
+    monkeypatch.setattr("services.proxy_scanner.scan_proxy_url", fake_scan_proxy_url)
+
+    ok, source = _dynamic_probe_source(
+        "socks5://acct-region-US-sid-newsid-t-1:secret@example.cliproxy.io:3010",
+        expected_country="US",
+        declared_country="US",
+        provider="cliproxy",
+        sid_refreshed=True,
+        timeout_seconds=3,
+        require_country_match=True,
+    )
+
+    assert ok is False
+    assert "country_mismatch" in source

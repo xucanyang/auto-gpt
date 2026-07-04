@@ -6,6 +6,15 @@
 
 ## [Unreleased] (未发布)
 
+## [1.2.4] - 2026-07-05
+### 修复 (Fixed)
+- **修复 Cliproxy 动态代理指定国家被 GeoIP 限流误判失败的问题**：`core/proxy_utils.py` 的动态代理候选探测现在区分“基础连通失败”“实测国家不一致”和“GeoIP 无法实测”三种状态；当 Cliproxy 模板已经按 `region-XX` 成功改写到目标国家、基础出口 IP 可用，但第三方 GeoIP 查询返回 429 或无国家时，不再把 `actual=unknown` 误判为 `country_mismatch` 并丢弃所有候选，而是记录 `actual=unverified / probe=geo_unavailable` 后允许任务继续执行。只有实测到明确的其他国家时才继续硬失败，避免 JP/US 等可用出口被探测依赖误杀。
+- **修复动态代理运行态偷偷把 Cliproxy `socks5://` 改成 `http://` 的协议漂移**：`core/proxy_utils.py` 的 `normalize_proxy_url()` 恢复为真正只做空值和空白清洗，保留用户填写的原始代理协议；动态代理日志、预览接口和任务执行现在会按模板协议运行，避免 Cliproxy 文档要求的 Socks5 中间服务器在运行态被隐式改写成 HTTP 后产生难以定位的兼容问题。
+
+### 优化 (Changed)
+- **动态代理国家探测优先使用代理出口侧 Cloudflare Trace**：`services/proxy_scanner.py` 新增通过代理访问 `https://www.cloudflare.com/cdn-cgi/trace` 的国家探测路径，优先读取 `loc=XX` 作为出口国家，再回退到服务器侧 `ipapi/ipinfo` 查询；代理扫描、动态代理预览 `/api/proxies/dynamic-preview` 和任务运行前探测都能减少公共 GeoIP API 429 对国家判断的影响，并在响应中暴露 `geo_source`、`geo_unverified` 等诊断字段。
+- **同步前端版本号至 v1.2.4**：`frontend/src/app/AppShell.tsx` 侧边栏底部版本展示更新为 `v1.2.4`，用于上线后确认本次动态代理修复的静态资源已经加载。
+
 ## [1.2.3] - 2026-07-05
 ### 优化 (Changed)
 - **恢复手机号绑定面板三策略与统一号段选择器**：`frontend/src/pages/Accounts.tsx` 将原先只有“普通绑定/号段抽样”开关的面板恢复为 `普通绑定`、`限定号段绑定`、`号段抽样测试` 三种取号策略，并用同一个“号段范围”选择器承载两类号段语义。限定号段绑定会把所选号段作为正式绑定约束，号段抽样测试继续按每段 1/2 个号码执行；可用、不可用、暂不可用、已绑满号段均只作为状态提示展示，不再在前端禁点，容量与实时可用性交给后端按 `prefix_bind_enabled` / `prefix_sample_enabled` 判定。
@@ -191,4 +200,8 @@
 
 ## 2026-07-05 03:34:35 +0800
 - 恢复手机号绑定三策略号段选择器并压缩只测发码开关
+- 发布模式: multi
+
+## 2026-07-05 04:14:12 +0800
+- 修复 Cliproxy 动态代理按国家探测误判
 - 发布模式: multi

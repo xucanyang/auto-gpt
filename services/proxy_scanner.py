@@ -35,6 +35,7 @@ GEO_TARGETS = (
     "https://ipapi.co/{ip}/json/",
     "https://ipinfo.io/{ip}/json",
 )
+CLOUDFLARE_TRACE_TARGET = "https://www.cloudflare.com/cdn-cgi/trace"
 CHATGPT_TARGET = "https://chatgpt.com/"
 AUTH_OPENAI_TARGET = "https://auth.openai.com/"
 CFFI_CHATGPT_TARGETS = (CHATGPT_TARGET, AUTH_OPENAI_TARGET)
@@ -434,6 +435,74 @@ def lookup_geo(exit_ip: str, *, timeout_seconds: int = 6) -> dict[str, Any]:
     }
 
 
+def _parse_cloudflare_trace(text: str) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for raw_line in str(text or "").splitlines():
+        line = raw_line.strip()
+        if not line or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        values[key.strip().lower()] = value.strip()
+
+    ip = values.get("ip", "")
+    if ip:
+        try:
+            ipaddress.ip_address(ip)
+        except ValueError:
+            ip = ""
+    country_code = str(values.get("loc") or "").strip().upper()
+    if len(country_code) != 2 or not country_code.isalpha():
+        country_code = ""
+    return {
+        "ip": ip,
+        "country_code": country_code,
+        "colo": str(values.get("colo") or "").strip().upper(),
+        "raw_loc": str(values.get("loc") or "").strip(),
+    }
+
+
+def lookup_geo_via_proxy_trace(proxy_url: str, *, timeout_seconds: int = 6) -> dict[str, Any]:
+    valid, message = _validate_proxy_url(proxy_url)
+    if not valid:
+        return {"ok": False, "error_code": "invalid_url", "error": message}
+
+    result = _request_via_proxy(CLOUDFLARE_TRACE_TARGET, proxy_url, timeout_seconds=timeout_seconds)
+    if not result.get("ok"):
+        return {
+            "ok": False,
+            "error_code": str(result.get("error_code") or "cloudflare_trace_failed"),
+            "error": str(result.get("error") or "Cloudflare trace 查询失败")[:500],
+            "latency_ms": int(result.get("latency_ms") or 0),
+            "source": "cloudflare_trace",
+        }
+
+    parsed = _parse_cloudflare_trace(str(result.get("text") or ""))
+    if parsed.get("country_code"):
+        return {
+            "ok": True,
+            "latency_ms": int(result.get("latency_ms") or 0),
+            "country_code": parsed["country_code"],
+            "country_name": parsed["country_code"],
+            "region_name": "",
+            "city": "",
+            "asn": "",
+            "isp": "",
+            "source": "cloudflare_trace",
+            "exit_ip": parsed.get("ip") or "",
+            "colo": parsed.get("colo") or "",
+        }
+
+    return {
+        "ok": False,
+        "error_code": "cloudflare_trace_country_missing",
+        "error": "Cloudflare trace 未返回 loc 国家码",
+        "latency_ms": int(result.get("latency_ms") or 0),
+        "source": "cloudflare_trace",
+        "exit_ip": parsed.get("ip") or "",
+        "raw_loc": parsed.get("raw_loc") or "",
+    }
+
+
 
 def _request_via_cffi(url: str, proxy_url: str, *, timeout_seconds: int) -> dict[str, Any]:
     start = time.perf_counter()
@@ -790,7 +859,27 @@ def scan_proxy_url(
         ):
             summary["geo"] = {"ok": True, "source": existing.get("source") or "cached", **existing}
         elif exit_ip:
-            summary["geo"] = lookup_geo(exit_ip, timeout_seconds=min(timeout, 8))
+            proxy_trace_geo = lookup_geo_via_proxy_trace(proxy_url, timeout_seconds=min(timeout, 8))
+            if proxy_trace_geo.get("ok"):
+                trace_exit_ip = str(proxy_trace_geo.get("exit_ip") or "").strip()
+                if trace_exit_ip:
+                    proxy_trace_geo["exit_ip"] = trace_exit_ip
+                summary["geo"] = proxy_trace_geo
+            else:
+                ip_geo = lookup_geo(exit_ip, timeout_seconds=min(timeout, 8))
+                if not ip_geo.get("ok"):
+                    failures: list[dict[str, Any]] = []
+                    trace_failure = {
+                        "source": "cloudflare_trace",
+                        "error_code": str(proxy_trace_geo.get("error_code") or ""),
+                        "error": str(proxy_trace_geo.get("error") or "")[:500],
+                        "latency_ms": int(proxy_trace_geo.get("latency_ms") or 0),
+                    }
+                    if trace_failure["error_code"] or trace_failure["error"]:
+                        failures.append(trace_failure)
+                    failures.extend(list(ip_geo.get("failures") or [])[-3:])
+                    ip_geo = {**ip_geo, "failures": failures[-4:]}
+                summary["geo"] = ip_geo
         else:
             summary["geo"] = {"ok": False, "error_code": "exit_ip_missing", "error": "基础扫描未得到出口 IP"}
 

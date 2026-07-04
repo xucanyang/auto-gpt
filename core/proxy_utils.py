@@ -13,8 +13,6 @@ def normalize_proxy_url(proxy_url: Optional[str]) -> Optional[str]:
     value = str(proxy_url).strip()
     if not value:
         return None
-    if value.startswith("socks5://") and "cliproxy.io" in value:
-        value = value.replace("socks5://", "http://", 1)
     return value
 
 
@@ -157,6 +155,7 @@ def _dynamic_probe_source(
     proxy_url: str,
     *,
     expected_country: str,
+    declared_country: str,
     provider: str,
     sid_refreshed: bool,
     timeout_seconds: int,
@@ -174,14 +173,26 @@ def _dynamic_probe_source(
     geo = summary.get("geo") if isinstance(summary.get("geo"), dict) else {}
     exit_ip = str((basic or {}).get("exit_ip") or "").strip()
     actual_country = str((geo or {}).get("country_code") or "").strip().upper()
+    declared = str(declared_country or "").strip().upper()
     sid_text = "refreshed" if sid_refreshed else "unchanged"
     if not (basic or {}).get("ok"):
         error = _safe_source_text((basic or {}).get("error") or (basic or {}).get("error_code") or "基础连通性检测失败", limit=200)
-        return (not require_country_match), f"dynamic country={expected_country} actual=unknown provider={provider} sid={sid_text} probe=failed error={error}"
-    if require_country_match and actual_country != expected_country:
-        actual_text = actual_country or "unknown"
+        return False, f"dynamic country={expected_country} actual=unknown provider={provider} sid={sid_text} probe=failed error={error}"
+    if require_country_match and actual_country and actual_country != expected_country:
         ip_text = f" exit_ip={exit_ip}" if exit_ip else ""
-        return False, f"dynamic country={expected_country} actual={actual_text}{ip_text} provider={provider} sid={sid_text} country_mismatch"
+        return False, f"dynamic country={expected_country} actual={actual_country}{ip_text} provider={provider} sid={sid_text} country_mismatch"
+    if require_country_match and not actual_country:
+        ip_text = f" exit_ip={exit_ip}" if exit_ip else ""
+        geo_error = _safe_source_text((geo or {}).get("error") or (geo or {}).get("error_code") or "geo_unavailable", limit=120)
+        if provider == "cliproxy" and declared == expected_country:
+            return True, (
+                f"dynamic country={expected_country} actual=unverified{ip_text} "
+                f"provider={provider} sid={sid_text} declared={declared} probe=geo_unavailable error={geo_error}"
+            )
+        return False, (
+            f"dynamic country={expected_country} actual=unknown{ip_text} "
+            f"provider={provider} sid={sid_text} country_unverified error={geo_error}"
+        )
     actual_text = actual_country or "unknown"
     ip_text = f" exit_ip={exit_ip}" if exit_ip else ""
     return True, f"dynamic country={expected_country} actual={actual_text}{ip_text} provider={provider} sid={sid_text} probe=ok"
@@ -225,6 +236,7 @@ def _dynamic_candidate_tuples(
                 ok, source = _dynamic_probe_source(
                     runtime_proxy,
                     expected_country=resolved.requested_country_code,
+                    declared_country=resolved.resolved_country_code,
                     provider=resolved.provider,
                     sid_refreshed=resolved.sid_refreshed,
                     timeout_seconds=timeout_seconds,

@@ -1054,7 +1054,7 @@ function ConfigField({ field }: { field: FieldConfig }) {
       : field.key === 'dynamic_proxy_default_country'
         ? '任务未填写出口国家时使用的两位 ISO 国家码，例如 JP、US、SG。'
       : field.key === 'dynamic_proxy_require_country_match'
-        ? '开启后，动态代理实测出口国家与声明国家不一致会直接失败，不会继续用错国家。'
+        ? '开启后，动态代理实测出口国家与声明国家不一致会直接失败；若 Cliproxy 模板 region 已匹配但 GeoIP 临时不可用，会记录未实测而不误杀候选。'
       : field.key === 'dynamic_proxy_probe_enabled'
         ? '开启后任务生成动态代理候选时先探测出口 IP/国家；关闭后只做模板改写和 sid 刷新。'
       : field.key === 'dynamic_proxy_probe_timeout_seconds'
