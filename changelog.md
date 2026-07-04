@@ -6,6 +6,11 @@
 
 ## [Unreleased] (未发布)
 
+## [1.2.5] - 2026-07-05
+### 优化 (Changed)
+- **动态代理任务表单改为默认复用全局模板**：`frontend/src/lib/taskProxySettings.ts` 调整任务代理配置读取与校验逻辑，当全局 `dynamic_proxy_template` 已保存时，注册、账号本地状态同步、手机号绑定和邮箱测活等任务弹窗不再把代理链接作为动态代理必填项；任务内“动态代理模板”字段改为“可选覆盖”，留空时后端继续使用全局模板，只要求填写出口国家并按国家改写 `region-XX`、刷新 `sid`。
+- **同步动态代理表单文案与版本展示**：`frontend/src/pages/RegisterTaskPage.tsx`、`frontend/src/features/auth/components/RegisterTaskModal.tsx`、`frontend/src/pages/Accounts.tsx`、`frontend/src/pages/CustomEmailRecheckPage.tsx` 将动态代理模板标签、占位符和说明统一改为“留空使用全局模板；填写后仅本次任务覆盖”，避免操作者误以为每个任务都必须重复粘贴 Cliproxy 链接；侧边栏版本号同步更新为 `v1.2.5`。
+
 ## [1.2.4] - 2026-07-05
 ### 修复 (Fixed)
 - **修复 Cliproxy 动态代理指定国家被 GeoIP 限流误判失败的问题**：`core/proxy_utils.py` 的动态代理候选探测现在区分“基础连通失败”“实测国家不一致”和“GeoIP 无法实测”三种状态；当 Cliproxy 模板已经按 `region-XX` 成功改写到目标国家、基础出口 IP 可用，但第三方 GeoIP 查询返回 429 或无国家时，不再把 `actual=unknown` 误判为 `country_mismatch` 并丢弃所有候选，而是记录 `actual=unverified / probe=geo_unavailable` 后允许任务继续执行。只有实测到明确的其他国家时才继续硬失败，避免 JP/US 等可用出口被探测依赖误杀。
@@ -208,4 +213,8 @@
 
 ## 2026-07-05 04:20:12 +0800
 - 修正动态代理 Socks5 运行态为 socks5h
+- 发布模式: multi
+
+## 2026-07-05 04:37:06 +0800
+- 动态代理任务表单默认复用全局模板
 - 发布模式: multi

@@ -6567,11 +6567,12 @@ export default function Accounts() {
 
           {(probeProxyModeValue === 'specified' || probeProxyModeValue === 'dynamic') && (
             <Form.Item
-              label={probeProxyModeValue === 'dynamic' ? '动态代理模板' : '代理地址'}
+              label={probeProxyModeValue === 'dynamic' ? '动态代理模板（可选覆盖）' : '代理地址'}
               name="proxy"
-              rules={[{ required: true, message: probeProxyModeValue === 'dynamic' ? '请输入动态代理模板' : '请输入代理地址' }]}
+              rules={probeProxyModeValue === 'specified' ? [{ required: true, message: '请输入代理地址' }] : undefined}
+              extra={probeProxyModeValue === 'dynamic' ? '留空使用全局动态代理模板；填写后仅本次同步覆盖全局模板。' : undefined}
             >
-              <Input placeholder={probeProxyModeValue === 'dynamic' ? 'socks5://user-region-JP-sid-xxxx-t-1:pass@host:port' : 'http://user:pass@host:port 或 socks5://...'} />
+              <Input placeholder={probeProxyModeValue === 'dynamic' ? '可留空；或填 socks5://user-region-JP-sid-xxxx-t-15:pass@host:port' : 'http://user:pass@host:port 或 socks5://...'} />
             </Form.Item>
           )}
 
@@ -7034,11 +7035,11 @@ export default function Accounts() {
               {phoneBindingProxyMode === 'specified' || phoneBindingProxyMode === 'dynamic' ? (
                 <Form.Item
                   name="proxy"
-                  label={phoneBindingProxyMode === 'dynamic' ? '动态代理模板' : '指定代理'}
-                  rules={[{ required: true, message: phoneBindingProxyMode === 'dynamic' ? '请填写动态代理模板' : '请填写代理地址' }]}
-                  extra={phoneBindingProxyMode === 'dynamic' ? '模板必须包含 region-XX；运行时按下面的代理国家改写并刷新 sid。' : '容器内建议使用 http://host.docker.internal:110xx。'}
+                  label={phoneBindingProxyMode === 'dynamic' ? '动态代理模板（可选覆盖）' : '指定代理'}
+                  rules={phoneBindingProxyMode === 'specified' ? [{ required: true, message: '请填写代理地址' }] : undefined}
+                  extra={phoneBindingProxyMode === 'dynamic' ? '留空使用全局动态代理模板；填写后仅本次手机号绑定覆盖全局模板。模板需包含 region-XX。' : '容器内建议使用 http://host.docker.internal:110xx。'}
                 >
-                  <Input placeholder={phoneBindingProxyMode === 'dynamic' ? 'socks5://user-region-JP-sid-xxxx-t-1:pass@host:port' : 'http://host.docker.internal:11021'} />
+                  <Input placeholder={phoneBindingProxyMode === 'dynamic' ? '可留空；或填 socks5://user-region-JP-sid-xxxx-t-15:pass@host:port' : 'http://host.docker.internal:11021'} />
                 </Form.Item>
               ) : null}
               {phoneBindingProxyMode !== 'direct' ? (

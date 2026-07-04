@@ -687,11 +687,11 @@ export default function RegisterTaskPage() {
             <Space style={{ width: '100%' }} align="start">
               <Form.Item
                 name="proxy"
-                label={proxyMode === 'dynamic' ? '动态代理模板' : '指定代理'}
+                label={proxyMode === 'dynamic' ? '动态代理模板（可选覆盖）' : '指定代理'}
                 style={{ flex: 1 }}
-                rules={proxyMode === 'dynamic' ? [{ required: true, message: '请输入动态代理模板' }] : undefined}
+                extra={proxyMode === 'dynamic' ? '留空使用全局动态代理模板；填写后仅本次任务覆盖全局模板。' : undefined}
               >
-                <Input placeholder={proxyMode === 'dynamic' ? 'socks5://user-region-JP-sid-xxxx-t-1:pass@host:port' : 'http://user:pass@host:port'} />
+                <Input placeholder={proxyMode === 'dynamic' ? '可留空；或填 socks5://user-region-JP-sid-xxxx-t-15:pass@host:port' : 'http://user:pass@host:port'} />
               </Form.Item>
               <Form.Item name="proxy_failover" valuePropName="checked" label="失败处理" style={{ width: 180 }}>
                 <Checkbox>{proxyMode === 'dynamic' ? '失败后刷新 sid 重试' : '失败后切换代理池'}</Checkbox>
@@ -725,7 +725,7 @@ export default function RegisterTaskPage() {
             showIcon
             style={{ marginBottom: 12 }}
             message="代理模式说明"
-            description="直连不使用代理；指定代理默认只用填写节点，勾选失败切换后才使用代理池筛选项；代理池按健康分、冷却和实测出口国家挑选；动态代理只使用模板和出口国家，失败后刷新 sid 重试，不使用代理池的健康分/候选数。"
+            description="直连不使用代理；指定代理默认只用填写节点，勾选失败切换后才使用代理池筛选项；代理池按健康分、冷却和实测出口国家挑选；动态代理默认使用全局模板，任务内模板只作为可选覆盖，必须填写出口国家，失败后刷新 sid 重试。"
           />
           {platform === 'chatgpt' && (
             <>

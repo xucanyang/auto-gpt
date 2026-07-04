@@ -78,12 +78,11 @@ export function taskProxySettingsFromConfig(config: unknown, fallback?: Partial<
   const cfg = config && typeof config === 'object' ? config as Record<string, unknown> : {}
   const base = normalizeTaskProxySettings(fallback || {})
   const mode = normalizeTaskProxyMode(cfg.task_proxy_mode, base.proxy_mode)
-  const proxy = stringWithDefault(
-    cfg.task_proxy_url,
-    mode === 'dynamic'
-      ? stringWithDefault(cfg.dynamic_proxy_template, base.proxy)
-      : base.proxy,
-  )
+  const taskProxyUrl = stringWithDefault(cfg.task_proxy_url, base.proxy)
+  const globalDynamicTemplate = stringWithDefault(cfg.dynamic_proxy_template, '')
+  const proxy = mode === 'dynamic'
+    ? (globalDynamicTemplate ? '' : taskProxyUrl)
+    : taskProxyUrl
   const country = countryCode(
     cfg.task_proxy_country_code,
     mode === 'dynamic'
@@ -126,7 +125,6 @@ export function buildTaskProxyPayload(values: unknown): Record<string, unknown> 
 export function validateTaskProxySettings(values: unknown) {
   const settings = normalizeTaskProxySettings(values)
   if (settings.proxy_mode === 'dynamic') {
-    if (!settings.proxy) throw new Error('动态代理模式必须填写动态代理模板')
     if (!settings.proxy_country_code) throw new Error('动态代理模式必须填写出口国家')
   }
   if (settings.proxy_mode === 'specified' && !settings.proxy) {
