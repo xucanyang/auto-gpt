@@ -871,7 +871,12 @@ def _parse_phone_binding_upload_lines(raw_lines: Any) -> tuple[list[dict[str, An
 def _import_manual_phone_entries_to_pool(
     phone_entries: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
-    """Import pasted phone/API rows into the phone pool without overwriting existing rows."""
+    """Upsert pasted phone/API rows into the phone pool and mark them pool-managed.
+
+    粘贴面板里的号码仍按“本轮固定列表”执行，不切换成动态取号；
+    但启动任务前先写入 phone_pool，确保后续绑定/探测/失败结果能走统一
+    record_task_status 回写链路。
+    """
     from services.chatgpt_core.phone_pool_repository import PhonePoolRepository
 
     repo = PhonePoolRepository()
@@ -881,8 +886,8 @@ def _import_manual_phone_entries_to_pool(
         next_item = dict(item)
         phone = str(next_item.get("phone") or "").strip()
         api_url = str(next_item.get("api_url") or "").strip()
-        record = repo.get(phone)
-        if record is None:
+        before = repo.get(phone)
+        if before is None:
             record = repo.add(
                 phone=phone,
                 api_url=api_url,
@@ -893,6 +898,18 @@ def _import_manual_phone_entries_to_pool(
             else:
                 imported += 1
         else:
+            record = before
+            if api_url and str(getattr(before, "api_url", "") or "").strip() != api_url:
+                update = getattr(repo, "update", None)
+                if callable(update):
+                    updated_record = update(int(getattr(before, "id", 0) or 0), api_url=api_url)
+                    if updated_record is not None:
+                        record = updated_record
+                else:
+                    # 兼容旧仓库对象/测试桩：没有 update 时退回 add 的 upsert 语义。
+                    updated_record = repo.add(phone=phone, api_url=api_url, label="绑定面板导入")
+                    if updated_record is not None:
+                        record = updated_record
             existing += 1
 
         if record is not None:
@@ -2846,9 +2863,7 @@ def enqueue_phone_binding_test_task(
             raise HTTPException(400, "请至少提供一条有效的 手机号----收码API，或勾选使用手机号池")
         if len(phone_entries) > 1000:
             raise HTTPException(400, "单次最多上传 1000 个手机号")
-        # 手动粘贴行只作为本次任务运行输入。日志整改不能把这条路径悄悄变成
-        # phone_pool 写入路径，否则旧的纯手动绑定测试会额外依赖 phone_pool 表。
-        phone_pool_import_summary = {"imported": 0, "existing": 0, "skipped": 0}
+        phone_entries, phone_pool_import_summary = _import_manual_phone_entries_to_pool(phone_entries)
     safe_parse_errors = sanitize_task_detail(parse_errors)
 
     account_items, missing_ids, skipped_accounts, matched_accounts = _resolve_phone_binding_test_accounts(req)
@@ -8776,6 +8791,18 @@ def _run_phone_binding_test(
         for parse_error in parse_errors:
             _log(task_id, f"[手机号绑定] 解析跳过: line={parse_error.get('line')} {parse_error.get('reason') or ''}")
 
+        phone_pool_import_meta = meta.get("phone_pool_import") if isinstance(meta.get("phone_pool_import"), dict) else {}
+        imported_count = int((phone_pool_import_meta or {}).get("imported") or 0)
+        existing_count = int((phone_pool_import_meta or {}).get("existing") or 0)
+        skipped_import_count = int((phone_pool_import_meta or {}).get("skipped") or 0)
+        if imported_count or existing_count or skipped_import_count:
+            _log(
+                task_id,
+                "[手机号池] 粘贴号码已在启动任务前 upsert 到手机号池："
+                f"新增 {imported_count}，已存在/已更新 {existing_count}，跳过 {skipped_import_count}；"
+                "运行结果将继续回写绑定/探测/失败状态",
+            )
+
         for missing_id in missing_ids:
             message = f"account_id={missing_id}: 账号不存在"
             _log(task_id, f"[MISS] {message}")
@@ -9116,6 +9143,7 @@ def _run_phone_binding_test(
                             )
                             account_done = True
                             sync_meta()
+                            break
                         try:
                             session.commit()
                         except Exception:
@@ -9168,6 +9196,10 @@ def _run_phone_binding_test(
                             phone_result["auth_retry_attempts"] = int(auth_retry_attempts or 0)
                             if auth_error_text:
                                 phone_result["auth_error"] = auth_error_text
+                                _log(
+                                    task_id,
+                                    f"[手机号绑定] 手机号已绑定完成，但 Auth/RT 获取失败：{auth_error_text[:180]}",
+                                )
                             timeline(
                                 email=email,
                                 account_id=account_id,
@@ -9352,6 +9384,7 @@ def _run_phone_binding_test(
                                 resource_touched=phone_was_touched(phone_service),
                                 reset_started_at=True,
                             )
+                            _log(task_id, "[手机号绑定] 当前手机号不可继续使用，账号将继续尝试下一个手机号")
                             sync_meta()
                             continue
 
@@ -9476,6 +9509,7 @@ def _run_phone_binding_test(
                             resource_touched=phone_was_touched(phone_service),
                             reset_started_at=True,
                         )
+                        _log(task_id, "[手机号绑定] 当前手机号不可继续使用，账号将继续尝试下一个手机号")
                         sync_meta()
                         continue
                     if should_keep_phone_for_next_account(status, phone_service):

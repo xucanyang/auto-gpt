@@ -204,8 +204,9 @@ class PhonePoolTaskIntegrationTests(unittest.TestCase):
         self.assertTrue(queued_settings["prefix_sms_probe_only"])
         self.assertFalse(queued_settings["reuse_phone_until_unusable"])
 
-    def test_manual_existing_phone_is_pool_managed_without_overwriting_api_url(self):
+    def test_manual_existing_phone_is_pool_managed_and_upserts_api_url(self):
         created_meta = {}
+        update_calls = []
 
         class _BackgroundTasks:
             def __init__(self):
@@ -224,8 +225,12 @@ class PhonePoolTaskIntegrationTests(unittest.TestCase):
             def get(self, phone):
                 return _Record() if phone == "+15551230003" else None
 
+            def update(self, record_id, **kwargs):
+                update_calls.append((record_id, kwargs))
+                return _Record()
+
             def add(self, **_kwargs):
-                raise AssertionError("existing manual phone should not be overwritten")
+                raise AssertionError("existing manual phone should be updated via repository update, not inserted")
 
         def _fake_create_task(_task_id, *, platform, source, total, meta):
             created_meta.update(meta)
@@ -255,6 +260,7 @@ class PhonePoolTaskIntegrationTests(unittest.TestCase):
 
         self.assertTrue(result["task_id"])
         self.assertEqual(created_meta["phone_pool_import"], {"imported": 0, "existing": 1, "skipped": 0})
+        self.assertEqual(update_calls, [(88, {"api_url": "https://relay.example.com/pasted-new-api"})])
         self.assertTrue(created_meta["phone_items"][0]["pool_managed"])
         self.assertEqual(created_meta["phone_items"][0]["pool_id"], 88)
         self.assertEqual(created_meta["phone_items"][0]["api_url"], "https://relay.example.com/pasted-new-api")
