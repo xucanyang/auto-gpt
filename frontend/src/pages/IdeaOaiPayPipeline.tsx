@@ -772,71 +772,150 @@ function OverviewPanel({ task, items, logs }: { task: PipelineTask | null; items
 
 function ConfigPanel({ form }: { form: ReturnType<typeof Form.useForm>[0] }) {
   return (
-    <Form form={form} layout="vertical" initialValues={initialFormValues(DEFAULT_CONFIG)}>
-      <Row gutter={[16, 16]}>
-        <Col xs={24} xl={12}>
-          <Card title="账号来源" size="small">
-            <Row gutter={12}>
-              <Col xs={24} md={12}><Form.Item name="source_type" label="来源"><Select options={[{ value: 'local', label: '本地账号' }, { value: 'register', label: '注册新账号' }]} /></Form.Item></Col>
-              <Col xs={24} md={12}><Form.Item name="limit" label="本地账号限制"><InputNumber min={0} style={{ width: '100%' }} /></Form.Item></Col>
-              <Col xs={24}><Form.Item name="account_ids_text" label="本地账号 ID"><TextArea rows={3} placeholder="一行一个或逗号分隔；为空时可用筛选范围" /></Form.Item></Col>
-              <Col xs={24} md={8}><Form.Item name="all_filtered" valuePropName="checked"><Checkbox>使用筛选范围</Checkbox></Form.Item></Col>
-              <Col xs={24} md={8}><Form.Item name="email" label="邮箱搜索"><Input allowClear /></Form.Item></Col>
-              <Col xs={24} md={8}><Form.Item name="status" label="账号状态"><Input allowClear placeholder="registered" /></Form.Item></Col>
-              <Col xs={24} md={8}><Form.Item name="subscription_type" label="订阅筛选"><Input allowClear placeholder="free / plus" /></Form.Item></Col>
-              <Col xs={24} md={8}><Form.Item name="account_validity" label="有效性"><Input allowClear placeholder="valid / invalid" /></Form.Item></Col>
-              <Col xs={24} md={8}><Form.Item name="oaipay_state" label="OAIPay 状态"><Input allowClear placeholder="not_found" /></Form.Item></Col>
-              <Col xs={24} md={8}><Form.Item name="target_count" label="注册目标成功数"><InputNumber min={0} style={{ width: '100%' }} /></Form.Item></Col>
-              <Col xs={24} md={8}><Form.Item name="register_batch_size" label="注册补位批量"><InputNumber min={1} max={50} style={{ width: '100%' }} /></Form.Item></Col>
-              <Col xs={24} md={8}><Form.Item name="register_concurrency" label="注册并发"><InputNumber min={1} max={10} style={{ width: '100%' }} /></Form.Item></Col>
-            </Row>
+    <Form form={form} layout="vertical" initialValues={initialFormValues(DEFAULT_CONFIG)} className="idea-oaipay-config-form">
+      <Space direction="vertical" size={12} style={{ display: 'flex' }}>
+        <Card
+          title="账号来源"
+          size="small"
+          className="idea-oaipay-config-card"
+          extra={<Text type="secondary">选择账号入口、筛选范围和注册补位目标</Text>}
+        >
+          <div className="idea-oaipay-source-grid">
+            <Form.Item name="source_type" label="来源">
+              <Select options={[{ value: 'local', label: '本地账号' }, { value: 'register', label: '注册新账号' }]} />
+            </Form.Item>
+            <Form.Item name="limit" label="本地账号限制">
+              <InputNumber min={0} style={{ width: '100%' }} />
+            </Form.Item>
+            <Form.Item name="target_count" label="注册目标成功数">
+              <InputNumber min={0} style={{ width: '100%' }} />
+            </Form.Item>
+            <Form.Item name="all_filtered" valuePropName="checked" label="筛选范围">
+              <Checkbox>使用筛选范围</Checkbox>
+            </Form.Item>
+            <Form.Item name="account_ids_text" label="本地账号 ID" className="idea-oaipay-field-wide">
+              <TextArea rows={4} placeholder="一行一个或逗号分隔；为空时可用筛选范围" />
+            </Form.Item>
+            <Form.Item name="email" label="邮箱搜索">
+              <Input allowClear />
+            </Form.Item>
+            <Form.Item name="status" label="账号状态">
+              <Input allowClear placeholder="registered" />
+            </Form.Item>
+            <Form.Item name="subscription_type" label="订阅筛选">
+              <Input allowClear placeholder="free / plus" />
+            </Form.Item>
+            <Form.Item name="account_validity" label="有效性">
+              <Input allowClear placeholder="valid / invalid" />
+            </Form.Item>
+            <Form.Item name="oaipay_state" label="OAIPay 状态">
+              <Input allowClear placeholder="not_found" />
+            </Form.Item>
+            <Form.Item name="register_batch_size" label="注册补位批量">
+              <InputNumber min={1} max={50} style={{ width: '100%' }} />
+            </Form.Item>
+            <Form.Item name="register_concurrency" label="注册并发">
+              <InputNumber min={1} max={10} style={{ width: '100%' }} />
+            </Form.Item>
+          </div>
+        </Card>
+
+        <div className="idea-oaipay-stage-grid">
+          <Card title="Idea 提交" size="small" className="idea-oaipay-config-card" extra={<Link to="/baxigpt-cdk-pool">卡密池</Link>}>
+            <div className="idea-oaipay-card-fields">
+              <div className="idea-oaipay-toggle-strip">
+                <Form.Item name="idea_enabled" valuePropName="checked" label="启用">
+                  <Switch />
+                </Form.Item>
+                <Form.Item name="idea_use_pool" valuePropName="checked" label="使用卡密池">
+                  <Switch />
+                </Form.Item>
+                <Form.Item name="idea_failure_continue" valuePropName="checked" label="失败后继续">
+                  <Switch />
+                </Form.Item>
+              </div>
+              <Form.Item name="code_lines" label="粘贴卡密" className="idea-oaipay-field-full">
+                <TextArea rows={3} placeholder="关闭卡密池时必填；支持多行" />
+              </Form.Item>
+              <Form.Item name="submit_interval_seconds" label="提交间隔">
+                <InputNumber min={0} style={{ width: '100%' }} />
+              </Form.Item>
+              <Form.Item name="status_poll_interval_seconds" label="轮询间隔">
+                <InputNumber min={1} style={{ width: '100%' }} />
+              </Form.Item>
+              <Form.Item name="status_poll_timeout_seconds" label="轮询超时" className="idea-oaipay-field-full">
+                <InputNumber min={30} style={{ width: '100%' }} />
+              </Form.Item>
+              <Form.Item name="idea_skip_subs" label="已有这些订阅时跳过 Idea" className="idea-oaipay-field-full">
+                <Select mode="multiple" options={subscriptionOptions} />
+              </Form.Item>
+            </div>
           </Card>
-        </Col>
-        <Col xs={24} xl={12}>
-          <Card title="Idea 提交" size="small" extra={<Link to="/baxigpt-cdk-pool">卡密池</Link>}>
-            <Row gutter={12}>
-              <Col xs={24} md={8}><Form.Item name="idea_enabled" valuePropName="checked" label="启用"><Switch /></Form.Item></Col>
-              <Col xs={24} md={8}><Form.Item name="idea_use_pool" valuePropName="checked" label="使用卡密池"><Switch /></Form.Item></Col>
-              <Col xs={24} md={8}><Form.Item name="idea_failure_continue" valuePropName="checked" label="失败后继续"><Switch /></Form.Item></Col>
-              <Col xs={24}><Form.Item name="code_lines" label="粘贴卡密"><TextArea rows={3} placeholder="关闭卡密池时必填；支持多行" /></Form.Item></Col>
-              <Col xs={24} md={8}><Form.Item name="submit_interval_seconds" label="提交间隔"><InputNumber min={0} style={{ width: '100%' }} /></Form.Item></Col>
-              <Col xs={24} md={8}><Form.Item name="status_poll_interval_seconds" label="轮询间隔"><InputNumber min={1} style={{ width: '100%' }} /></Form.Item></Col>
-              <Col xs={24} md={8}><Form.Item name="status_poll_timeout_seconds" label="轮询超时"><InputNumber min={30} style={{ width: '100%' }} /></Form.Item></Col>
-              <Col xs={24}><Form.Item name="idea_skip_subs" label="已有这些订阅时跳过 Idea"><Select mode="multiple" options={subscriptionOptions} /></Form.Item></Col>
-            </Row>
+
+          <Card title="本地状态刷新 / Gate" size="small" className="idea-oaipay-config-card">
+            <div className="idea-oaipay-card-fields">
+              <Form.Item name="check_enabled" valuePropName="checked" label="刷新本地状态">
+                <Switch />
+              </Form.Item>
+              <Form.Item name="gate_enabled" valuePropName="checked" label="启用放行条件">
+                <Switch />
+              </Form.Item>
+              <Form.Item name="gate_mode" label="放行模式" className="idea-oaipay-field-full">
+                <Select options={[{ value: 'none', label: '不限制' }, { value: 'account_valid', label: '账号有效' }, { value: 'subscription_in', label: '指定订阅类型' }, { value: 'upload_ready', label: '满足上传条件' }]} />
+              </Form.Item>
+              <Form.Item name="allowed_subscription_types" label="允许订阅类型" className="idea-oaipay-field-full">
+                <Select mode="multiple" options={subscriptionOptions} />
+              </Form.Item>
+            </div>
           </Card>
-        </Col>
-        <Col xs={24} xl={8}>
-          <Card title="本地状态刷新 / Gate" size="small">
-            <Form.Item name="check_enabled" valuePropName="checked" label="刷新本地状态"><Switch /></Form.Item>
-            <Form.Item name="gate_enabled" valuePropName="checked" label="启用放行条件"><Switch /></Form.Item>
-            <Form.Item name="gate_mode" label="放行模式"><Select options={[{ value: 'none', label: '不限制' }, { value: 'account_valid', label: '账号有效' }, { value: 'subscription_in', label: '指定订阅类型' }, { value: 'upload_ready', label: '满足上传条件' }]} /></Form.Item>
-            <Form.Item name="allowed_subscription_types" label="允许订阅类型"><Select mode="multiple" options={subscriptionOptions} /></Form.Item>
+
+          <Card title="手机号绑定" size="small" className="idea-oaipay-config-card">
+            <div className="idea-oaipay-card-fields">
+              <Form.Item name="phone_policy" label="策略">
+                <Select options={[{ value: 'disabled', label: '不绑定' }, { value: 'best_effort', label: '尽力绑定' }, { value: 'required', label: '必须绑定' }]} />
+              </Form.Item>
+              <Form.Item name="phone_apply_to" label="适用账号">
+                <Select options={[{ value: 'gate_passed', label: '通过 Gate' }, { value: 'all', label: '全部' }, { value: 'free', label: '仅 free' }, { value: 'plus', label: '仅 plus' }]} />
+              </Form.Item>
+              <Form.Item name="phone_use_pool" valuePropName="checked" label="使用手机号池" className="idea-oaipay-field-full">
+                <Switch />
+              </Form.Item>
+              <Form.Item name="phone_lines" label="粘贴手机号/API" className="idea-oaipay-field-full">
+                <TextArea rows={3} placeholder="+1xxx----https://...；为空则使用手机号池" />
+              </Form.Item>
+              <Form.Item name="phone_timeout_seconds" label="收码超时">
+                <InputNumber min={30} style={{ width: '100%' }} />
+              </Form.Item>
+              <Form.Item name="phone_poll_interval_seconds" label="轮询间隔">
+                <InputNumber min={1} style={{ width: '100%' }} />
+              </Form.Item>
+            </div>
           </Card>
-        </Col>
-        <Col xs={24} xl={8}>
-          <Card title="手机号绑定" size="small">
-            <Form.Item name="phone_policy" label="策略"><Select options={[{ value: 'disabled', label: '不绑定' }, { value: 'best_effort', label: '尽力绑定' }, { value: 'required', label: '必须绑定' }]} /></Form.Item>
-            <Form.Item name="phone_apply_to" label="适用账号"><Select options={[{ value: 'gate_passed', label: '通过 Gate' }, { value: 'all', label: '全部' }, { value: 'free', label: '仅 free' }, { value: 'plus', label: '仅 plus' }]} /></Form.Item>
-            <Form.Item name="phone_use_pool" valuePropName="checked" label="使用手机号池"><Switch /></Form.Item>
-            <Form.Item name="phone_lines" label="粘贴手机号/API"><TextArea rows={3} placeholder="+1xxx----https://...；为空则使用手机号池" /></Form.Item>
-            <Row gutter={12}>
-              <Col span={12}><Form.Item name="phone_timeout_seconds" label="收码超时"><InputNumber min={30} style={{ width: '100%' }} /></Form.Item></Col>
-              <Col span={12}><Form.Item name="phone_poll_interval_seconds" label="轮询间隔"><InputNumber min={1} style={{ width: '100%' }} /></Form.Item></Col>
-            </Row>
+
+          <Card title="OAIPay 上传" size="small" className="idea-oaipay-config-card">
+            <div className="idea-oaipay-card-fields">
+              <Form.Item name="oaipay_enabled" valuePropName="checked" label="启用上传">
+                <Switch />
+              </Form.Item>
+              <Form.Item name="oaipay_category_id" label="分类 ID">
+                <InputNumber min={0} style={{ width: '100%' }} placeholder="为空走自动分类" />
+              </Form.Item>
+              <Form.Item name="oaipay_exists_as_success" valuePropName="checked" className="idea-oaipay-field-full">
+                <Checkbox>远端已存在视为成功</Checkbox>
+              </Form.Item>
+              <Form.Item name="oaipay_require_phone_bound" valuePropName="checked" className="idea-oaipay-field-full">
+                <Checkbox>要求手机号绑定成功</Checkbox>
+              </Form.Item>
+              <Form.Item name="oaipay_require_subscription_in" label="上传订阅要求" className="idea-oaipay-field-full">
+                <Select mode="multiple" allowClear options={subscriptionOptions} />
+              </Form.Item>
+              <Form.Item name="tick_interval_seconds" label="调度间隔" className="idea-oaipay-field-full">
+                <InputNumber min={1} max={60} style={{ width: '100%' }} />
+              </Form.Item>
+            </div>
           </Card>
-        </Col>
-        <Col xs={24} xl={8}>
-          <Card title="OAIPay 上传" size="small">
-            <Form.Item name="oaipay_enabled" valuePropName="checked" label="启用上传"><Switch /></Form.Item>
-            <Form.Item name="oaipay_category_id" label="分类 ID"><InputNumber min={0} style={{ width: '100%' }} placeholder="为空走自动分类" /></Form.Item>
-            <Form.Item name="oaipay_exists_as_success" valuePropName="checked"><Checkbox>远端已存在视为成功</Checkbox></Form.Item>
-            <Form.Item name="oaipay_require_phone_bound" valuePropName="checked"><Checkbox>要求手机号绑定成功</Checkbox></Form.Item>
-            <Form.Item name="oaipay_require_subscription_in" label="上传订阅要求"><Select mode="multiple" allowClear options={subscriptionOptions} /></Form.Item>
-            <Form.Item name="tick_interval_seconds" label="调度间隔"><InputNumber min={1} max={60} style={{ width: '100%' }} /></Form.Item>
-          </Card>
-        </Col>
-      </Row>
+        </div>
+      </Space>
     </Form>
   )
 }

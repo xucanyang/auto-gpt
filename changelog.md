@@ -6,6 +6,11 @@
 
 ## [Unreleased] (未发布)
 
+## [1.2.8] - 2026-07-05
+### 优化 (Changed)
+- **规整账号处理流水线配置页布局**：`frontend/src/pages/IdeaOaiPayPipeline.tsx` 将 `/idea-oaipay-pipeline` 配置页从不等宽、不等高的 `Row/Col` 卡片拼接改为“账号来源”全宽配置区 + 四个阶段配置卡片的稳定网格结构；账号来源字段按来源、范围、筛选、注册补位目标统一排布，Idea、本地状态/Gate、手机号绑定、OAIPay 上传四个处理阶段使用一致的两列字段节奏和响应式断点，避免配置区大小随机、视觉重心歪斜。
+- **补齐配置页响应式与版本展示**：`frontend/src/index.css` 新增 `idea-oaipay-config-*` 作用域样式，统一配置卡片高度、字段间距、宽字段跨列、移动端单列折叠和中等屏两列阶段布局；`frontend/src/app/AppShell.tsx` 侧边栏版本号同步更新为 `v1.2.8`，方便上线后确认新的前端资源已经加载。
+
 ## [1.2.7] - 2026-07-05
 ### 修复 (Fixed)
 - **透出 OAIPay 上传认证失败的真实服务端错误**：`services/chatgpt_core/oaipay_upload.py` 在 OAIPay 上传接口返回 `401/403` 或其他 HTTP 错误时，新增对响应 JSON 中 `detail/message/msg/error` 的统一提取，日志与任务结果会展示 `上传失败: HTTP 401: 上传密钥无效` 这类可操作原因，不再只保留泛化的 `上传失败: HTTP 401`；`services/oaipay_sync.py` 的远端账号探测同样透出 `detail`，避免上传前探测阶段把密钥问题误报成普通不可达。
@@ -246,4 +251,8 @@
 
 ## 2026-07-05 06:12:16 +0800
 - 修复 OAIPay 上传密钥文案和 401 错误详情
+- 发布模式: multi
+
+## 2026-07-05 06:57:07 +0800
+- 规整账号处理流水线配置页布局
 - 发布模式: multi

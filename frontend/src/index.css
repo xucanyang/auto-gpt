@@ -238,6 +238,110 @@ body {
   min-width: 0;
 }
 
+.idea-oaipay-config-form {
+  min-width: 0;
+}
+
+.idea-oaipay-config-form .ant-form-item {
+  margin-bottom: 10px;
+}
+
+.idea-oaipay-config-form .ant-form-item-label {
+  padding-bottom: 4px;
+}
+
+.idea-oaipay-config-card {
+  height: 100%;
+  min-width: 0;
+}
+
+.idea-oaipay-config-card .ant-card-head {
+  min-height: 38px;
+}
+
+.idea-oaipay-config-card .ant-card-head-title {
+  font-weight: 600;
+}
+
+.idea-oaipay-source-grid,
+.idea-oaipay-card-fields {
+  display: grid;
+  min-width: 0;
+  align-items: start;
+  column-gap: 12px;
+}
+
+.idea-oaipay-source-grid {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.idea-oaipay-card-fields {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.idea-oaipay-stage-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(230px, 1fr));
+  gap: 12px;
+  align-items: stretch;
+}
+
+.idea-oaipay-field-wide {
+  grid-column: span 2;
+}
+
+.idea-oaipay-field-full {
+  grid-column: 1 / -1;
+}
+
+.idea-oaipay-toggle-strip {
+  display: grid;
+  grid-column: 1 / -1;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  column-gap: 8px;
+}
+
+.idea-oaipay-config-form .ant-input,
+.idea-oaipay-config-form .ant-input-number,
+.idea-oaipay-config-form .ant-select {
+  min-width: 0;
+}
+
+.idea-oaipay-config-form textarea.ant-input {
+  resize: vertical;
+}
+
+@media (max-width: 1600px) {
+  .idea-oaipay-stage-grid {
+    grid-template-columns: repeat(2, minmax(260px, 1fr));
+  }
+
+  .idea-oaipay-source-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 1100px) {
+  .idea-oaipay-source-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 760px) {
+  .idea-oaipay-source-grid,
+  .idea-oaipay-card-fields,
+  .idea-oaipay-toggle-strip,
+  .idea-oaipay-stage-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .idea-oaipay-field-wide,
+  .idea-oaipay-field-full,
+  .idea-oaipay-toggle-strip {
+    grid-column: 1 / -1;
+  }
+}
+
 .accounts-toolbar-primary-actions {
   display: flex;
   flex-wrap: wrap;
