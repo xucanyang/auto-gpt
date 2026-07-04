@@ -109,6 +109,7 @@ const DEFAULT_PHONE_BINDING_SETTINGS = {
   prefix_sample_enabled: false,
   prefix_sample_size: 1,
   prefix_sample_filter: 'all',
+  prefix_sms_probe_only: false,
   timeout_seconds: 180,
   poll_interval_seconds: 5,
   max_resend_attempts: 0,
@@ -654,6 +655,7 @@ function normalizePhoneBindingSettings(value: unknown): PhoneBindingSettings {
       if (value === 'rejected' || value === 'rejected_only' || value === 'unavailable' || value === 'unavailable_only') return 'rejected'
       return 'all'
     })(),
+    prefix_sms_probe_only: Boolean(raw.prefix_sms_probe_only || raw.sms_probe_only),
     timeout_seconds: intWithDefault(raw.timeout_seconds, DEFAULT_PHONE_BINDING_SETTINGS.timeout_seconds, 10),
     poll_interval_seconds: intWithDefault(raw.poll_interval_seconds, DEFAULT_PHONE_BINDING_SETTINGS.poll_interval_seconds, 1),
     max_resend_attempts: intWithDefault(raw.max_resend_attempts, DEFAULT_PHONE_BINDING_SETTINGS.max_resend_attempts, 0),
@@ -1648,6 +1650,7 @@ export default function Accounts() {
   const phoneBindingPrefixSampleValue = Form.useWatch('prefix_sample_enabled', phoneBindingTestForm)
   const phoneBindingPrefixSampleSizeValue = Form.useWatch('prefix_sample_size', phoneBindingTestForm)
   const phoneBindingPrefixSampleFilterValue = Form.useWatch('prefix_sample_filter', phoneBindingTestForm)
+  const phoneBindingSmsProbeOnlyValue = Form.useWatch('prefix_sms_probe_only', phoneBindingTestForm)
   const phoneBindingPhoneLinesValue = Form.useWatch('phone_lines', phoneBindingTestForm)
   const phoneBindingProxyModeValue = Form.useWatch('proxy_mode', phoneBindingTestForm)
   const phoneBindingProxyFailoverValue = Form.useWatch('proxy_failover', phoneBindingTestForm)
@@ -2944,6 +2947,7 @@ export default function Accounts() {
     const phoneLines = String(values.phone_lines || '').trim()
     // 手动粘贴优先：避免默认“使用手机号池”开启时忽略用户粘贴的号码。
     const prefixSampleEnabled = !phoneLines && Boolean(values.prefix_sample_enabled)
+    const smsProbeOnly = Boolean(values.prefix_sms_probe_only || values.sms_probe_only)
     const rawPrefixSampleFilter = String(values.prefix_sample_filter || 'all')
     const prefixSampleFilter = rawPrefixSampleFilter === 'available' ? 'available' : rawPrefixSampleFilter === 'rejected' ? 'rejected' : 'all'
     const usePool = !phoneLines && (Boolean(values.use_pool) || prefixSampleEnabled)
@@ -2955,6 +2959,8 @@ export default function Accounts() {
       phone_lines: phoneLines,
       use_pool: usePool,
       prefix_sample_enabled: prefixSampleEnabled,
+      prefix_sms_probe_only: smsProbeOnly,
+      sms_probe_only: smsProbeOnly,
       prefix_sample_size: Number(values.prefix_sample_size) === 2 ? 2 : 1,
       prefix_sample_filter: prefixSampleFilter,
       timeout_seconds: Number(values.timeout_seconds || 180),
@@ -2962,7 +2968,7 @@ export default function Accounts() {
       max_resend_attempts: Number(values.max_resend_attempts || 0),
       resend_interval_seconds: Number(values.resend_interval_seconds || 0),
       account_interval_seconds: Number(values.account_interval_seconds || 60),
-      reuse_phone_until_unusable: prefixSampleEnabled ? false : Boolean(values.reuse_phone_until_unusable),
+      reuse_phone_until_unusable: prefixSampleEnabled || smsProbeOnly ? false : Boolean(values.reuse_phone_until_unusable),
       ...buildTaskProxyPayload(values),
     }
     let requestedAccounts = total
@@ -2991,6 +2997,7 @@ export default function Accounts() {
       const eligible = Number(res?.eligible_accounts || 0)
       const phoneCount = Number(res?.phone_count || 0)
       const prefixSample = res?.prefix_sample && typeof res.prefix_sample === 'object' ? res.prefix_sample : null
+      const smsProbeOnly = Boolean(res?.sms_probe_only || prefixSample?.sms_probe_only)
       const parseErrors = Array.isArray(res?.parse_errors) ? res.parse_errors : []
 
       if (!taskIdFromResponse) {
@@ -3015,8 +3022,8 @@ export default function Accounts() {
       void activeTasksQuery.refetch()
       message.success({
         content: prefixSample?.enabled
-          ? `号段抽样已启动：${String(prefixSample.filter || 'all') === 'rejected' ? '仅不可用号段，' : ''}${Number(prefixSample.prefix_count || 0)} 个号段，${phoneCount} 个号码，${eligible} 个账号`
-          : `手机号绑定已启动：${phoneCount} 个号码，${eligible} 个账号${parseErrors.length > 0 ? `，解析跳过 ${parseErrors.length} 行` : ''}`,
+          ? `号段抽样已启动：${String(prefixSample.filter || 'all') === 'rejected' ? '仅不可用号段，' : ''}${Number(prefixSample.prefix_count || 0)} 个号段，${phoneCount} 个号码，${eligible} 个账号${smsProbeOnly ? '，仅测发码/收码' : ''}`
+          : `${smsProbeOnly ? '手机号发码/收码探测已启动' : '手机号绑定已启动'}：${phoneCount} 个号码，${eligible} 个账号${parseErrors.length > 0 ? `，解析跳过 ${parseErrors.length} 行` : ''}`,
         key: toastKey,
       })
       if (parseErrors.length > 0) {
@@ -6574,6 +6581,36 @@ export default function Accounts() {
 
           <div
             style={{
+              border: `1px solid ${phoneBindingSmsProbeOnlyValue ? token.colorWarningBorder : token.colorBorderSecondary}`,
+              borderRadius: token.borderRadiusLG,
+              padding: 12,
+              marginBottom: 12,
+              background: phoneBindingSmsProbeOnlyValue ? token.colorWarningBg : token.colorBgContainer,
+            }}
+          >
+            <Space align="start" size={12}>
+              <Form.Item name="prefix_sms_probe_only" valuePropName="checked" noStyle>
+                <Switch
+                  checkedChildren="只测收码"
+                  unCheckedChildren="真实绑定"
+                  onChange={(checked) => {
+                    if (checked) {
+                      phoneBindingTestForm.setFieldsValue({ reuse_phone_until_unusable: false })
+                    }
+                  }}
+                />
+              </Form.Item>
+              <div>
+                <Text strong>只测发码/收码，不提交验证码</Text>
+                <Text type="secondary" style={{ display: 'block', fontSize: 12 }}>
+                  粘贴号码、普通手机号池、号段抽样都生效；成功后只回写手机号池为“已收码未提交”，不保存账号绑定状态，不补抓 Auth/RT。
+                </Text>
+              </div>
+            </Space>
+          </div>
+
+          <div
+            style={{
               border: `1px solid ${token.colorBorderSecondary}`,
               borderRadius: token.borderRadiusLG,
               padding: 12,
@@ -6680,9 +6717,11 @@ export default function Accounts() {
                 valuePropName="checked"
                 extra={phoneBindingPrefixSampleEnabled
                   ? '号段抽样模式下固定关闭，每个抽中的号码只测试一次。'
+                  : phoneBindingSmsProbeOnlyValue
+                  ? '只测发码/收码模式下固定关闭，避免同一号码重复探测。'
                   : '开启后，同一个号码会连续绑定多个账号，直到达到上限、限流、无法发码或接口异常。'}
               >
-                <Switch checkedChildren="开启" unCheckedChildren="关闭" disabled={phoneBindingPrefixSampleEnabled} />
+                <Switch checkedChildren="开启" unCheckedChildren="关闭" disabled={phoneBindingPrefixSampleEnabled || Boolean(phoneBindingSmsProbeOnlyValue)} />
               </Form.Item>
             </div>
           </div>
