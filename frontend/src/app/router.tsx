@@ -15,6 +15,7 @@ const CustomEmailRecheckPage = lazy(() => import('@/pages/CustomEmailRecheckPage
 const TeamsPage = lazy(() => import('@/pages/Teams'))
 const GoPayOtpPage = lazy(() => import('@/pages/GoPayOtpAdapter'))
 const PipelinePage = lazy(() => import('@/pages/Pipeline'))
+const IdeaOaiPayPipelinePage = lazy(() => import('@/pages/IdeaOaiPayPipeline'))
 const TaskHistoryPage = lazy(() => import('@/pages/TaskHistory'))
 const ProxiesPage = lazy(() => import('@/pages/Proxies'))
 const PhonePoolPage = lazy(() => import('@/pages/PhonePool'))
@@ -33,6 +34,7 @@ export const APP_ROUTES: AppRouteItem[] = [
   { path: '/teams', key: '/teams', label: 'Team', loader: TeamsPage },
   { path: '/gopay-otp', key: '/gopay-otp', label: 'GoPay OTP', loader: GoPayOtpPage },
   { path: '/pipeline', key: '/pipeline', label: '自动流水线', loader: PipelinePage },
+  { path: '/idea-oaipay-pipeline', key: '/idea-oaipay-pipeline', label: '账号处理流水线', loader: IdeaOaiPayPipelinePage },
   { path: '/history', key: '/history', label: '任务历史', loader: TaskHistoryPage },
   { path: '/proxies', key: '/proxies', label: '代理管理', loader: ProxiesPage },
   { path: '/phone-pool', key: '/phone-pool', label: '手机号池', loader: PhonePoolPage },

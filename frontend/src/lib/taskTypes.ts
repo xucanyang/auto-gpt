@@ -17,6 +17,7 @@ export const TASK_SOURCE_LABELS: Record<string, string> = {
   chatgpt_oaipay_approval: 'OaiPay授权链接',
   batch_payment_link: '批量支付链接',
   gopay_payment: 'GoPay支付',
+  idea_oaipay_pipeline: '账号处理流水线',
 }
 
 export const TASK_SOURCE_OPTIONS = Object.entries(TASK_SOURCE_LABELS).map(([value, label]) => ({ value, label }))

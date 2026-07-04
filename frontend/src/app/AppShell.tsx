@@ -13,6 +13,7 @@ import {
   TeamOutlined,
   MobileOutlined,
   RocketOutlined,
+  ApartmentOutlined,
   ExperimentOutlined,
   DatabaseOutlined,
   KeyOutlined,
@@ -99,6 +100,7 @@ function AppContent({ hasPassword }: { hasPassword: boolean }) {
     if (path === '/custom-email-recheck') return ['/custom-email-recheck']
     if (path.startsWith('/teams')) return ['/teams']
     if (path === '/pipeline') return ['/pipeline']
+    if (path === '/idea-oaipay-pipeline') return ['/idea-oaipay-pipeline']
     if (path === '/gopay-otp') return ['/gopay-otp']
     if (path === '/history') return ['/history']
     if (path === '/proxies') return ['/proxies']
@@ -116,6 +118,7 @@ function AppContent({ hasPassword }: { hasPassword: boolean }) {
     { key: '/teams', icon: <TeamOutlined />, label: 'Team' },
     { key: '/gopay-otp', icon: <MobileOutlined />, label: 'GoPay OTP' },
     { key: '/pipeline', icon: <RocketOutlined />, label: '自动流水线' },
+    { key: '/idea-oaipay-pipeline', icon: <ApartmentOutlined />, label: '账号处理流水线' },
     { key: '/history', icon: <HistoryOutlined />, label: '任务历史' },
     { key: '/proxies', icon: <GlobalOutlined />, label: '代理管理' },
     { key: '/phone-pool', icon: <MobileOutlined />, label: '手机号池' },
@@ -244,7 +247,7 @@ function AppContent({ hasPassword }: { hasPassword: boolean }) {
                     marginTop: 4,
                   }}
                 >
-                  v1.2.5
+                  v1.2.6
                 </div>
               )}
             </div>

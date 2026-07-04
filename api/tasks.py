@@ -10598,6 +10598,37 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                     return AttemptResult.failed(skip_reason)
                 saved_account = save_account(account)
                 if req.platform == "chatgpt" and saved_account is not None:
+                    try:
+                        latest_meta = dict(_task_store.snapshot(task_id).get("meta") or {})
+                        registered_accounts = latest_meta.get("registered_accounts")
+                        if not isinstance(registered_accounts, list):
+                            registered_accounts = []
+                        saved_account_id = int(getattr(saved_account, "id", 0) or 0)
+                        saved_email = str(getattr(saved_account, "email", "") or account.email or "").strip()
+                        if saved_account_id > 0 or saved_email:
+                            existing_keys = {
+                                (
+                                    int(item.get("account_id") or 0),
+                                    str(item.get("email") or "").strip().lower(),
+                                )
+                                for item in registered_accounts
+                                if isinstance(item, dict)
+                            }
+                            key = (saved_account_id, saved_email.lower())
+                            if key not in existing_keys:
+                                created_at = getattr(saved_account, "created_at", None)
+                                updated_at = getattr(saved_account, "updated_at", None)
+                                registered_accounts.append(
+                                    {
+                                        "account_id": saved_account_id,
+                                        "email": saved_email,
+                                        "created_at": created_at.isoformat() if hasattr(created_at, "isoformat") else "",
+                                        "updated_at": updated_at.isoformat() if hasattr(updated_at, "isoformat") else "",
+                                    }
+                                )
+                                _task_store.update_meta(task_id, {"registered_accounts": registered_accounts[-500:]})
+                    except Exception as meta_exc:
+                        _log(task_id, f"[WARN] 注册账号结果写入任务快照失败: {meta_exc}")
                     schedule_chatgpt_local_status_refresh_for_account_id(
                         int(getattr(saved_account, "id", 0) or 0),
                         reason="registration_saved",

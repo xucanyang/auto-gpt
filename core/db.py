@@ -8,6 +8,7 @@ from sqlmodel import Field, SQLModel, create_engine, Session, select
 import json
 
 from services.pipeline.models import PipelineAccountItem, PipelineTask
+from services.idea_oaipay_pipeline.models import IdeaOaiPayPipelineItem, IdeaOaiPayPipelineTask
 
 
 def _utcnow():
@@ -1070,6 +1071,46 @@ def _ensure_pipeline_schema() -> None:
             "CREATE INDEX IF NOT EXISTS idx_pipeline_account_items_auth_stage ON pipeline_account_items(auth_stage)"
         )
 
+
+
+def _ensure_idea_oaipay_pipeline_schema() -> None:
+    with engine.begin() as conn:
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_idea_oaipay_pipeline_tasks_task_key ON idea_oaipay_pipeline_tasks(task_key)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_idea_oaipay_pipeline_tasks_status ON idea_oaipay_pipeline_tasks(status)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_idea_oaipay_pipeline_tasks_source_type ON idea_oaipay_pipeline_tasks(source_type)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_idea_oaipay_pipeline_items_pipeline_task_id ON idea_oaipay_pipeline_items(pipeline_task_id)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_idea_oaipay_pipeline_items_account_id ON idea_oaipay_pipeline_items(account_id)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_idea_oaipay_pipeline_items_email ON idea_oaipay_pipeline_items(email)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_idea_oaipay_pipeline_items_overall_status ON idea_oaipay_pipeline_items(overall_status)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_idea_oaipay_pipeline_items_idea_stage ON idea_oaipay_pipeline_items(idea_stage)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_idea_oaipay_pipeline_items_check_stage ON idea_oaipay_pipeline_items(check_stage)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_idea_oaipay_pipeline_items_gate_stage ON idea_oaipay_pipeline_items(gate_stage)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_idea_oaipay_pipeline_items_phone_stage ON idea_oaipay_pipeline_items(phone_stage)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_idea_oaipay_pipeline_items_oaipay_stage ON idea_oaipay_pipeline_items(oaipay_stage)"
+        )
 
 def _row_to_icloud_hme_alias_payload(row: Any) -> dict[str, Any]:
     if row is None:
@@ -3341,6 +3382,7 @@ def init_db():
     _ensure_external_subscription_claim_schema()
     _ensure_external_access_token_claim_schema()
     _ensure_pipeline_schema()
+    _ensure_idea_oaipay_pipeline_schema()
 
 
 def get_session():

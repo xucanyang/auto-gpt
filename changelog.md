@@ -6,6 +6,19 @@
 
 ## [Unreleased] (未发布)
 
+## [1.2.6] - 2026-07-05
+### 新增 (Added)
+- **新增账号处理流水线串联注册、本地账号、Idea、手机号与 OAIPay**：新增 `docs/idea-oaipay-pipeline/design.md` 作为方案文档，并增加 `services/idea_oaipay_pipeline/`、`api/idea_oaipay_pipeline.py` 与 `/api/idea-oaipay-pipeline/*` 接口，支持从“注册新账号”或“本地账号快照”启动同一条账号级流水线，再按配置执行 Idea 批量提交、本地状态刷新、状态 Gate、手机号绑定和 OAIPay 上传。流水线不再把 Plus 写成全局硬门槛，`status_gate` 可按 `none / account_valid / subscription_in / upload_ready` 放行，支持 Free 账号只做手机号绑定或继续上传的业务形态。
+- **新增流水线持久化任务与账号明细表**：`core/db.py` 接入 `idea_oaipay_pipeline_tasks` 与 `idea_oaipay_pipeline_items`，为每个账号独立记录 `register_stage / idea_stage / check_stage / gate_stage / phone_stage / oaipay_stage / overall_status`、子任务 ID、Idea order/card 信息、手机号策略、OAIPay 远端状态和失败原因；服务启动时 `main.py` 会恢复最近仍在运行/暂停的流水线，避免长任务只存在内存态。
+- **新增管理端“账号处理流水线”页面**：`frontend/src/pages/IdeaOaiPayPipeline.tsx`、`frontend/src/app/router.tsx`、`frontend/src/app/AppShell.tsx` 新增独立入口 `/idea-oaipay-pipeline`，提供运行摘要、配置表单、账号明细表、主流水线日志和子任务日志 Drawer。页面复用现有 `TaskLogPanel` 查看注册、Idea、手机号等子任务日志，明细操作支持单账号重刷状态与重传 OAIPay。
+
+### 优化 (Changed)
+- **手机号绑定与 OAIPay Gate 按策略解耦**：流水线手机号步骤支持 `disabled / best_effort / required`，`best_effort` 失败不会阻断后续 OAIPay，`required` 才会把账号停在人工处理；OAIPay 上传条件支持单独配置订阅类型与是否要求手机号，不再默认要求 Plus。手机号判定同时识别真实绑定记录 `chatgpt_phone_binding` 和 OpenAI 已绑定手机号记录 `chatgpt_bound_phone`，避免已有绑定账号被重复执行绑定。
+- **子任务丢失、注册回收与无 OAIPay 场景补强**：Idea / 手机号 / 注册子任务引用在服务重启后若已从内存任务表丢失，流水线会清理 active child task 并把相关账号标记为可排查状态，不再无限卡在 polling/running；进程退出只停止调度线程，不再把数据库中的运行中任务误改为人工停止，确保下次启动可恢复最近流水线。当 OAIPay 未启用时，`oaipay_stage=disabled` 的账号也会在 Gate 与手机号策略满足后正确归档为 `done`。注册任务新增 `registered_accounts` 结构化结果快照，流水线优先按 account_id/email 回收批量注册成功账号，避免只读最后一条 `TaskLog` 导致漏收多账号注册结果。
+
+### 修复 (Fixed)
+- **补充流水线边界回归测试**：新增 `tests/test_idea_oaipay_pipeline_config.py`，覆盖 Pydantic `source.register` alias、来源/手机号策略校验、OAIPay 禁用时的账号完成归档、本地来源匹配 0 个账号的失败收口、历史任务重试拦截，以及已有手机号绑定记录的识别，防止后续把 Free 账号绑定手机号、非 Plus 放行或 OAIPay 可选流程再次写死。
+
 ## [1.2.5] - 2026-07-05
 ### 优化 (Changed)
 - **动态代理任务表单改为默认复用全局模板**：`frontend/src/lib/taskProxySettings.ts` 调整任务代理配置读取与校验逻辑，当全局 `dynamic_proxy_template` 已保存时，注册、账号本地状态同步、手机号绑定和邮箱测活等任务弹窗不再把代理链接作为动态代理必填项；任务内“动态代理模板”字段改为“可选覆盖”，留空时后端继续使用全局模板，只要求填写出口国家并按国家改写 `region-XX`、刷新 `sid`。
@@ -217,4 +230,8 @@
 
 ## 2026-07-05 04:37:06 +0800
 - 动态代理任务表单默认复用全局模板
+- 发布模式: multi
+
+## 2026-07-05 05:49:09 +0800
+- 新增账号处理流水线串联Idea手机号OAIPay
 - 发布模式: multi
