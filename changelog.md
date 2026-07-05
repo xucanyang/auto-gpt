@@ -6,6 +6,17 @@
 
 ## [Unreleased] (未发布)
 
+## [1.3.1] - 2026-07-05
+### 安全 (Security)
+- **封闭账号详情接口的明文凭证旁路**：`api/accounts.py` 将 `/accounts/{account_id}` 与 `/accounts?detail=true` 改为沿用 compact serializer 的安全摘要模型，响应中只保留 `credentials`、`auth`、workspace variants、手机号绑定和同步状态等必要摘要；`token/password/extra_json` 中的 Access Token、Refresh Token、NextAuth session、cookies 与 ID Token 不再随详情接口返回，完整材料继续只能通过 `/accounts/{id}/secrets` 按字段读取。`tests/test_accounts_api_list_compact.py` 补充详情序列化脱敏回归，防止 K12 全空间保存后被 detail=true 绕过列表脱敏边界。
+
+### 修复 (Fixed)
+- **避免账号详情保存时误清空 Access Token**：`frontend/src/pages/Accounts.tsx` 在详情 Drawer 保存基础信息时，如果 Access Token 手动覆盖输入为空，会从 PATCH payload 中移除 `token` 字段，只保存状态等基础信息，避免后端详情脱敏后空 token 被表单原样提交并覆盖数据库中已保存的 AT。
+- **Settings 页复用统一 K12 配置归一化**：`frontend/src/pages/Settings.tsx` 改为直接调用 `frontend/src/lib/chatgptK12Config.ts` 的 `buildChatGPTK12ConfigData()`，与注册页和账号页注册弹窗共享 workspace id 去重、保存所有空间默认值、join 超时/重试/轮询范围和 `capture_refresh_tokens=false` 的口径，减少后续 K12 配置字段漂移。
+
+### 优化 (Changed)
+- **同步前端版本号至 v1.3.1**：`frontend/src/app/AppShell.tsx` 侧边栏版本展示更新为 `v1.3.1`，用于上线后确认账号详情脱敏加固与 K12 Settings 配置统一对应的静态资源已加载。
+
 ## [1.3.0] - 2026-07-05
 ### 新增 (Added)
 - **补齐 K12 注册后 workspace join 与全空间保存链路**：新增 `services/chatgpt_core/k12_workspace.py`，在 ChatGPT 注册成功并复用当前 Web session 拿到 Access Token 后，支持向配置的 K12 `workspace_id` 调用 `/backend-api/accounts/{workspace_id}/invites/request` 发起加入请求，再通过 `/backend-api/accounts/check/v4-2023-04-27` 读取当前账号可见的所有空间。捕获结果按 `workspace_artifacts` 输出，包含 free、K12、workspace 等 scope 摘要，并对每个空间复用现有 `fetch_chatgpt_session(exchange_workspace_token=true)` 交换对应 Access Token，避免重新登录、重复触发邮箱 OTP 或误走手机号绑定链路。
@@ -315,4 +326,8 @@
 
 ## 2026-07-05 21:07:35 +0800
 - 补齐 K12 workspace 注册与全空间保存
+- 发布模式: multi
+
+## 2026-07-05 21:17:43 +0800
+- 加固账号详情脱敏并统一 K12 设置
 - 发布模式: multi

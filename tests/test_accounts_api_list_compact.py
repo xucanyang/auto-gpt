@@ -2,7 +2,7 @@ import json
 import unittest
 
 from core.db import AccountModel
-from api.accounts import _serialize_account_compact_item, _serialize_account_list_item, get_account_secrets
+from api.accounts import _serialize_account, _serialize_account_compact_item, _serialize_account_list_item, get_account_secrets
 
 
 class AccountListCompactSerializationTests(unittest.TestCase):
@@ -134,6 +134,33 @@ class AccountListCompactSerializationTests(unittest.TestCase):
     def test_legacy_list_serializer_is_also_compact_safe(self):
         payload = _serialize_account_list_item(self._account())
         self._assert_compact_payload(payload)
+
+    def test_detail_serializer_redacts_raw_secrets_and_extra_json(self):
+        payload = _serialize_account(self._account())
+        raw = json.dumps(payload, ensure_ascii=False, default=str)
+
+        self.assertEqual(payload.get("token"), "")
+        self.assertEqual(payload.get("password"), "")
+        self.assertTrue(payload.get("secrets_redacted"))
+        self.assertNotIn("SECRET_AT", raw)
+        self.assertNotIn("SECRET_RT", raw)
+        self.assertNotIn("SECRET_PASSWORD", raw)
+        self.assertNotIn("SECRET_SESSION", raw)
+        self.assertNotIn("SECRET_ID_TOKEN", raw)
+        self.assertNotIn("SECRET_COOKIE", raw)
+        self.assertNotIn("SECRET_VARIANT", raw)
+
+        safe_extra = json.loads(payload.get("extra_json") or "{}")
+        self.assertEqual(
+            safe_extra.get("chatgpt_workspace_variants"),
+            payload.get("workspace_variants"),
+        )
+        self.assertNotIn("access_token", safe_extra)
+        self.assertNotIn("refresh_token", safe_extra)
+        self.assertNotIn("session_token", safe_extra)
+        self.assertNotIn("cookies", safe_extra)
+        self.assertTrue(payload["has_access_token"])
+        self.assertTrue(payload["credentials"]["has_cookies"])
 
     def test_compact_payload_size_does_not_scale_with_huge_extra_blob(self):
         payload = {

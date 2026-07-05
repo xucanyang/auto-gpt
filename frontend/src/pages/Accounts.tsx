@@ -4148,9 +4148,18 @@ export default function Accounts() {
 
   const handleDetailSave = async () => {
     const values = await detailForm.validateFields()
+    const payload = { ...values }
+    if (Object.prototype.hasOwnProperty.call(payload, 'token')) {
+      const nextToken = String(payload.token || '').trim()
+      if (nextToken) {
+        payload.token = nextToken
+      } else {
+        delete payload.token
+      }
+    }
     await apiFetch(`/accounts/${detailAccount.id}`, {
       method: 'PATCH',
-      body: JSON.stringify(values),
+      body: JSON.stringify(payload),
     })
     message.success('保存成功')
     setDetailModalOpen(false)

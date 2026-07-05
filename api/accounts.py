@@ -179,6 +179,39 @@ def _serialize_account(account: AccountModel, *, team_invite_source: Optional[di
     }
     if team_invite_source:
         data["team_invite_source"] = team_invite_source
+
+    # Detail endpoints must follow the same secret boundary as compact lists:
+    # raw credentials stay behind /accounts/{id}/secrets, while detail responses
+    # only expose booleans and curated summaries.  Historically this serializer
+    # returned model_dump() verbatim, which leaked token/password/extra_json when
+    # callers used /accounts/{id} or /accounts?detail=true.
+    compact = _serialize_account_compact_item(
+        account,
+        extra=extra,
+        team_invite_source=team_invite_source,
+    )
+    data.update(compact)
+    for secret_key in (
+        "access_token",
+        "accessToken",
+        "refresh_token",
+        "refreshToken",
+        "session_token",
+        "sessionToken",
+        "id_token",
+        "idToken",
+        "cookies",
+        "cookie",
+        "cookie_header",
+        "cookieHeader",
+    ):
+        data.pop(secret_key, None)
+    safe_extra = compact.get("extra") if isinstance(compact.get("extra"), dict) else {}
+    data["password"] = ""
+    data["token"] = ""
+    data["extra"] = safe_extra
+    data["extra_json"] = json.dumps(safe_extra, ensure_ascii=False)
+    data["secrets_redacted"] = True
     return data
 
 

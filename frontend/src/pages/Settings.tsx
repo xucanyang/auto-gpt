@@ -16,6 +16,7 @@ import {
   CopyOutlined,
 } from '@ant-design/icons'
 import { parseBooleanConfigValue } from '@/lib/configValueParsers'
+import { buildChatGPTK12ConfigData } from '@/lib/chatgptK12Config'
 import { apiFetch } from '@/lib/utils'
 
 const SELECT_FIELDS: Record<string, { label: string; value: string }[]> = {
@@ -978,36 +979,6 @@ function parseStoredDomainList(value: unknown): string[] {
       .flatMap((line) => line.split(','))
       .map((item) => item.trim()),
   )
-}
-
-function normalizeConfigStringList(value: unknown): string[] {
-  const rawItems = Array.isArray(value)
-    ? value
-    : String(value || '')
-      .split(/[\n,\s]+/)
-      .map((item) => item.trim())
-  const seen = new Set<string>()
-  const items: string[] = []
-  rawItems.forEach((item) => {
-    const text = String(item || '').trim()
-    if (!text || seen.has(text)) return
-    seen.add(text)
-    items.push(text)
-  })
-  return items
-}
-
-function boundedIntString(value: unknown, fallback: number, min: number, max: number): string {
-  const parsed = Number.parseInt(String(value ?? ''), 10)
-  const next = Number.isFinite(parsed) ? parsed : fallback
-  return String(Math.max(min, Math.min(max, next)))
-}
-
-function normalizePollDelayList(value: unknown, fallback = '3,8,15'): string {
-  const delays = normalizeConfigStringList(value)
-    .map((item) => Number.parseInt(item, 10))
-    .filter((item) => Number.isFinite(item) && item >= 0 && item <= 3600)
-  return delays.length > 0 ? delays.join(',') : fallback
 }
 
 const CONTRIBUTION_REDEEM_OPTIONS = [10, 100, 1000]
@@ -3705,19 +3676,7 @@ export default function Settings() {
       data.chatgpt_team_invite_deferred_activation = parseBooleanConfigValue(data.chatgpt_team_invite_deferred_activation)
       data.chatgpt_capture_free_workspace = data.chatgpt_capture_free_workspace === '' ? true : parseBooleanConfigValue(data.chatgpt_capture_free_workspace)
       data.chatgpt_capture_business_workspace = data.chatgpt_capture_business_workspace === '' ? true : parseBooleanConfigValue(data.chatgpt_capture_business_workspace)
-      data.chatgpt_k12_enabled = parseBooleanConfigValue(data.chatgpt_k12_enabled)
-      data.chatgpt_k12_workspace_ids = normalizeConfigStringList(data.chatgpt_k12_workspace_ids).join(',')
-      data.chatgpt_k12_save_all_spaces =
-        data.chatgpt_k12_save_all_spaces === ''
-          ? true
-          : data.chatgpt_k12_save_all_spaces === undefined
-            ? true
-            : parseBooleanConfigValue(data.chatgpt_k12_save_all_spaces)
-      data.chatgpt_k12_strict_join = parseBooleanConfigValue(data.chatgpt_k12_strict_join)
-      data.chatgpt_k12_join_timeout_seconds = data.chatgpt_k12_join_timeout_seconds || '60'
-      data.chatgpt_k12_join_retry_count = data.chatgpt_k12_join_retry_count || '2'
-      data.chatgpt_k12_post_join_poll_seconds = data.chatgpt_k12_post_join_poll_seconds || '3,8,15'
-      data.chatgpt_k12_capture_refresh_tokens = false
+      Object.assign(data, buildChatGPTK12ConfigData(data))
       data.chatgpt_gopay_billing_llm_enabled = data.chatgpt_gopay_billing_llm_enabled === '' ? true : parseBooleanConfigValue(data.chatgpt_gopay_billing_llm_enabled)
       data.chatgpt_access_token_only_checkout_amount_check_enabled =
         data.chatgpt_access_token_only_checkout_amount_check_enabled === ''
@@ -3888,17 +3847,7 @@ export default function Settings() {
       values.chatgpt_team_invite_deferred_activation = parseBooleanConfigValue(values.chatgpt_team_invite_deferred_activation)
       values.chatgpt_capture_free_workspace = parseBooleanConfigValue(values.chatgpt_capture_free_workspace)
       values.chatgpt_capture_business_workspace = parseBooleanConfigValue(values.chatgpt_capture_business_workspace)
-      values.chatgpt_k12_enabled = parseBooleanConfigValue(values.chatgpt_k12_enabled)
-      values.chatgpt_k12_workspace_ids = normalizeConfigStringList(values.chatgpt_k12_workspace_ids).join(',')
-      values.chatgpt_k12_save_all_spaces =
-        values.chatgpt_k12_save_all_spaces === '' || values.chatgpt_k12_save_all_spaces === undefined
-          ? true
-          : parseBooleanConfigValue(values.chatgpt_k12_save_all_spaces)
-      values.chatgpt_k12_strict_join = parseBooleanConfigValue(values.chatgpt_k12_strict_join)
-      values.chatgpt_k12_join_timeout_seconds = boundedIntString(values.chatgpt_k12_join_timeout_seconds, 60, 30, 3600)
-      values.chatgpt_k12_join_retry_count = boundedIntString(values.chatgpt_k12_join_retry_count, 2, 0, 20)
-      values.chatgpt_k12_post_join_poll_seconds = normalizePollDelayList(values.chatgpt_k12_post_join_poll_seconds)
-      values.chatgpt_k12_capture_refresh_tokens = false
+      Object.assign(values, buildChatGPTK12ConfigData(values))
       values.chatgpt_gopay_billing_llm_enabled = parseBooleanConfigValue(values.chatgpt_gopay_billing_llm_enabled)
       values.chatgpt_access_token_only_checkout_amount_check_enabled = parseBooleanConfigValue(
         values.chatgpt_access_token_only_checkout_amount_check_enabled,
