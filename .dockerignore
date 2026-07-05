@@ -10,6 +10,7 @@ static/
 _ext_targets/
 external_logs/
 shared_config/
+shared-config-bootstrap-backups/
 services/external_logs/
 services/turnstile_solver/solver.log
 account_manager.db
