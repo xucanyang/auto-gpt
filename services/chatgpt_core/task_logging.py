@@ -92,7 +92,7 @@ _FULL_URL_KEYS = {
     "long_url",
     "longurl",
 }
-_RAW_LINE_KEYS = {"raw_line", "rawline", "phone_signup_raw_line", "phonesignuprawline"}
+_RAW_LINE_KEYS = {"raw_line", "rawline", "phone_signup_raw_line", "phonesignuprawline", "email_api_line", "emailapiline"}
 _TEXT_KEYS = {"reason", "message", "raw_error", "rawerror", "last_error", "lasterror"}
 _TEXT_LIST_KEYS = {"logs", "errors", "action_logs", "actionlogs"}
 _BODY_KEYS = {"raw_message", "rawmessage", "body", "html", "text", "content"}
@@ -202,6 +202,19 @@ def redact_raw_phone_line(value: Any) -> str:
     if "----" in text:
         phone, api_url = text.split("----", 1)
         return f"{mask_phone_for_log(phone)}----{redact_url(api_url)}"
+    return _redact_text_patterns(text)
+
+
+def redact_raw_email_api_line(value: Any) -> str:
+    """Redact a pasted ``email----api_url`` line while keeping the email visible."""
+
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    parts = re.split(r"-{4,}", text, maxsplit=1)
+    if len(parts) == 2:
+        email, api_url = parts
+        return f"{str(email or '').strip()}----{redact_url(api_url)}"
     return _redact_text_patterns(text)
 
 
@@ -364,7 +377,13 @@ def _sanitize_mapping_item(key: Any, value: Any) -> Any:
         return str(value or "")
     if nk in _URL_KEYS or ck in _URL_KEYS:
         return redact_url(value)
+    if nk in {"email_api_lines", "emailapi_lines", "email_api_accounts", "emailapiaccounts"} or ck in {"emailapilines", "emailapiaccounts"}:
+        if isinstance(value, (list, tuple)):
+            return [redact_raw_email_api_line(item) for item in value]
+        return "\n".join(redact_raw_email_api_line(line) for line in str(value or "").splitlines())
     if nk in _RAW_LINE_KEYS or ck in _RAW_LINE_KEYS:
+        if "email" in nk or "email" in ck:
+            return redact_raw_email_api_line(value)
         return redact_raw_phone_line(value)
     if nk == "bound_phone_lines" or ck == "boundphonelines":
         if isinstance(value, (list, tuple)):

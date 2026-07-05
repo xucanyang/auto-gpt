@@ -41,6 +41,7 @@ type TempMailDomainOption = {
 const MAIL_PROVIDER_LABELS: Record<string, string> = {
   luckmail: 'LuckMail',
   manual_email_otp: '手动邮箱 + 手输验证码',
+  email_api: '邮箱验证码 API',
   hme_ready_api: 'HME Ready API',
   icloud_hme: 'iCloud HME',
   tempmail_local: 'TempMail Ready API',
@@ -346,6 +347,7 @@ export function RegisterTaskModal({
                   { value: 'hme_ready_api', label: 'HME Ready API' },
                   { value: 'icloud_hme', label: 'iCloud HME' },
                   { value: 'tempmail_local', label: 'TempMail Ready API' },
+                  { value: 'email_api', label: '邮箱验证码 API（email----api）' },
                   { value: 'manual_email_otp', label: '手动邮箱 + 手输验证码' },
                 ]}
               />
@@ -461,6 +463,25 @@ export function RegisterTaskModal({
                   </Form.Item>
                 </>
               ) : null}
+            </>
+          ) : null}
+          {currentPlatform === 'chatgpt' && !isPhoneSignup && effectiveRegisterMailProvider === 'email_api' ? (
+            <>
+              <Alert
+                type="info"
+                showIcon
+                style={{ marginBottom: 16 }}
+                message="当前注册将使用邮箱验证码 API"
+                description="每行 email----api；API 返回 JSON，status 字段为验证码。status=0/空/非 4-8 位数字会继续等待。Gmail 每行会自动展开为原邮箱和一个 dot 变体，共用同一个 API。"
+              />
+              <Form.Item
+                name="email_api_lines"
+                label="邮箱 API 行"
+                rules={[{ required: true, message: '请至少填写一行 email----api' }]}
+                extra="API 可省略协议，后端会自动补 https://。"
+              >
+                <Input.TextArea rows={6} placeholder={'name@gmail.com----api.example.com/get?id=xxx\nuser@example.com----https://api.example.com/code?u=2'} style={{ fontFamily: 'monospace' }} />
+              </Form.Item>
             </>
           ) : null}
           <Form.Item name="count" label="注册数量" initialValue={1} rules={[{ required: true }]}>

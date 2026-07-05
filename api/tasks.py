@@ -384,6 +384,31 @@ def _prepare_register_request(req: RegisterTaskRequest) -> RegisterTaskRequest:
         prepared.extra["manual_email_address"] = prepared.email
         prepared.extra["chatgpt_existing_account_capture"] = existing_account_capture
 
+    if str(mail_provider or "").strip().lower() in {"email_api", "api_email", "email_otp_api", "mail_api_otp"}:
+        if prepared.platform != "chatgpt":
+            raise HTTPException(400, "email_api 模式目前只支持 ChatGPT")
+        from core.base_mailbox import parse_email_api_lines
+
+        lines = prepared.extra.get("email_api_lines") or prepared.extra.get("email_api_accounts") or ""
+        candidates, errors = parse_email_api_lines(
+            lines,
+            gmail_dot_variant_enabled=_is_truthy(prepared.extra.get("email_api_gmail_dot_variant_enabled", True)),
+            default_scheme=str(prepared.extra.get("email_api_default_scheme") or "https"),
+        )
+        if errors:
+            first = errors[0]
+            raise HTTPException(400, f"Email API 行解析失败: 第 {first.get('line')} 行 {first.get('reason')}")
+        if not candidates:
+            raise HTTPException(400, "email_api 模式请至少提供一条 email----api")
+        prepared.extra["mail_provider"] = "email_api"
+        prepared.extra["email_api_candidate_count"] = len(candidates)
+        if _is_truthy(prepared.extra.get("email_api_use_all_identities", True)):
+            prepared.count = len(candidates)
+        else:
+            prepared.count = min(max(int(prepared.count or 1), 1), len(candidates))
+        prepared.concurrency = min(max(int(prepared.concurrency or 1), 1), prepared.count, 5)
+        prepared.email = None
+
     if mail_provider in {"tempmail_local", "tempmail_api"}:
         mode = str(prepared.extra.get("tempmail_mode") or config_store.get("tempmail_mode", "fixed_domain") or "fixed_domain").strip().lower()
         if mode == "fixed_domain":
@@ -10243,8 +10268,8 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                 _task_store.cleanup()
                 return
 
-        def _build_mailbox(proxy: Optional[str]):
-            merged_extra = _build_effective_register_extra(req)
+        def _build_mailbox(proxy: Optional[str], runtime_extra: dict | None = None):
+            merged_extra = dict(runtime_extra or _build_effective_register_extra(req))
             return create_mailbox(
                 provider=merged_extra.get("mail_provider", "luckmail"),
                 extra=merged_extra,
@@ -10435,7 +10460,10 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                             proxy=_proxy,
                             extra=runtime_extra,
                         )
-                        _mailbox = None if phone_signup_entry else _build_mailbox(_proxy)
+                        if str(runtime_extra.get("mail_provider") or "").strip().lower() in {"email_api", "api_email", "email_otp_api", "mail_api_otp"}:
+                            runtime_extra["mail_provider"] = "email_api"
+                            runtime_extra["email_api_pool_key"] = task_id
+                        _mailbox = None if phone_signup_entry else _build_mailbox(_proxy, runtime_extra)
                         _platform = PlatformCls(config=_config, mailbox=_mailbox)
                         _platform._task_attempt_token = attempt_id
                         _platform._log_fn = lambda msg, level="info", *_: _log(task_id, msg, level)
@@ -10910,6 +10938,20 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
             for line in str(initial_merged_extra.get("chatgpt_phone_signup_phone_lines") or "").splitlines()
             if str(line or "").strip()
         ]
+        initial_mail_provider = str(initial_merged_extra.get("mail_provider") or "").strip().lower()
+        initial_email_api_entry = initial_mail_provider in {"email_api", "api_email", "email_otp_api", "mail_api_otp"}
+        initial_email_api_candidates = []
+        if initial_email_api_entry:
+            try:
+                from core.base_mailbox import parse_email_api_lines
+
+                initial_email_api_candidates, _initial_email_api_errors = parse_email_api_lines(
+                    initial_merged_extra.get("email_api_lines") or initial_merged_extra.get("email_api_accounts") or "",
+                    gmail_dot_variant_enabled=_truthy(initial_merged_extra.get("email_api_gmail_dot_variant_enabled", True), default=True),
+                    default_scheme=str(initial_merged_extra.get("email_api_default_scheme") or "https"),
+                )
+            except Exception:
+                initial_email_api_candidates = []
         configured_max_attempts = 0
         if isinstance(req.extra, dict):
             configured_max_attempts = _positive_int(
@@ -10927,6 +10969,10 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                     attempt_cap = min(attempt_cap, max(target_successes, configured_max_attempts))
             else:
                 attempt_cap = max(target_successes, configured_max_attempts) if configured_max_attempts > 0 else target_successes
+        elif initial_email_api_entry:
+            attempt_cap = len(initial_email_api_candidates) or target_successes
+            if configured_max_attempts > 0:
+                attempt_cap = min(attempt_cap, max(target_successes, configured_max_attempts))
         else:
             attempt_cap = max(target_successes, configured_max_attempts) if configured_max_attempts > 0 else 0
         if attempt_cap > 0:
@@ -11088,6 +11134,13 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
             errors=errors,
             error=str(e),
         )
+        if 'initial_email_api_entry' in locals() and initial_email_api_entry:
+            try:
+                from core.base_mailbox import EmailApiMailbox
+
+                EmailApiMailbox.release_pool(task_id)
+            except Exception:
+                pass
         _task_store.cleanup()
         return
 
@@ -11154,6 +11207,13 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
         skipped=skipped,
         errors=errors,
     )
+    if 'initial_email_api_entry' in locals() and initial_email_api_entry:
+        try:
+            from core.base_mailbox import EmailApiMailbox
+
+            EmailApiMailbox.release_pool(task_id)
+        except Exception:
+            pass
     _task_store.cleanup()
 
 

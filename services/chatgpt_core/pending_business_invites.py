@@ -262,6 +262,46 @@ def _mailbox_state_from_account(account: AccountModel, *, extra: dict[str, Any] 
             "proxy": str(account_extra.get("proxy") or account_extra.get("proxy_url") or "").strip(),
             "recovered_from_account_config": True,
         }
+    if provider in {"email_api", "api_email", "email_otp_api", "mail_api_otp"}:
+        email = str(getattr(account, "email", "") or account_extra.get("email") or "").strip()
+        raw_api_url = str(
+            account_extra.get("email_api_url")
+            or account_extra.get("api_url")
+            or account_extra.get("mail_api_url")
+            or ""
+        ).strip()
+        if not email or not raw_api_url:
+            return {}
+        try:
+            from core.base_mailbox import normalize_email_api_url
+
+            api_url = normalize_email_api_url(raw_api_url)
+        except Exception:
+            return {}
+        return {
+            "provider": "email_api",
+            "email": email,
+            "account": {
+                "email": email,
+                "account_id": email,
+                "extra": {
+                    "provider": "email_api",
+                    "api_url": api_url,
+                    "source_email": str(account_extra.get("source_email") or email),
+                    "variant": str(account_extra.get("variant") or "restored"),
+                },
+            },
+            "before_ids": [],
+            "config": {
+                "mail_provider": "email_api",
+                "email_api_poll_interval_seconds": account_extra.get("email_api_poll_interval_seconds", 3),
+                "email_api_request_timeout_seconds": account_extra.get("email_api_request_timeout_seconds", 15),
+                "email_api_gmail_dot_variant_enabled": account_extra.get("email_api_gmail_dot_variant_enabled", True),
+            },
+            "proxy": str(account_extra.get("email_api_proxy") or account_extra.get("proxy") or account_extra.get("proxy_url") or "").strip(),
+            "recovered_from_account_config": True,
+        }
+
     if provider not in {"tempmail_local", "tempmail_api"}:
         return {}
 

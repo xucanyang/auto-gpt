@@ -61,6 +61,11 @@ CONFIG_KEYS = [
     "cloudmail_timeout",
     "mail_provider",
     "mailbox_otp_timeout_seconds",
+    "email_api_lines",
+    "email_api_poll_interval_seconds",
+    "email_api_request_timeout_seconds",
+    "email_api_gmail_dot_variant_enabled",
+    "email_api_default_scheme",
     "icloud_hme_mode",
     "icloud_cookie",
     "icloud_domain_base",
@@ -444,6 +449,14 @@ def _build_config_response(*, local_only: bool = False) -> dict[str, Any]:
         all_cfg["dynamic_proxy_max_attempts"] = "5"
     if "chatgpt_save_registration_access_token_account" not in all_cfg:
         all_cfg["chatgpt_save_registration_access_token_account"] = "true"
+    if not all_cfg.get("email_api_poll_interval_seconds"):
+        all_cfg["email_api_poll_interval_seconds"] = "3"
+    if not all_cfg.get("email_api_request_timeout_seconds"):
+        all_cfg["email_api_request_timeout_seconds"] = "15"
+    if not all_cfg.get("email_api_gmail_dot_variant_enabled"):
+        all_cfg["email_api_gmail_dot_variant_enabled"] = "true"
+    if not all_cfg.get("email_api_default_scheme"):
+        all_cfg["email_api_default_scheme"] = "https"
     if not all_cfg.get("icloud_hme_mode"):
         all_cfg["icloud_hme_mode"] = "live"
     if not all_cfg.get("icloud_domain_base"):

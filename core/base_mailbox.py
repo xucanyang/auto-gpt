@@ -8,9 +8,10 @@ import re
 import tempfile
 import threading
 import time
+import hashlib
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Any, Callable
 from .proxy_utils import build_requests_proxy_config
 
@@ -767,6 +768,533 @@ class ManualEmailOtpMailbox(BaseMailbox):
         return normalized_code
 
 
+EMAIL_API_PROVIDER_VALUES = {"email_api", "api_email", "email_otp_api", "mail_api_otp"}
+_GMAIL_DOMAIN_TYPOS = {"gamil.com", "gmial.com", "gmai.com"}
+_EMAIL_API_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def _email_api_truthy(value: Any, default: bool = False) -> bool:
+    if value in (None, ""):
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on", "y", "是", "开启", "启用"}:
+        return True
+    if text in {"0", "false", "no", "off", "n", "否", "关闭", "禁用"}:
+        return False
+    return default
+
+
+def _email_api_positive_float(value: Any, default: float, minimum: float = 0.5, maximum: float = 300.0) -> float:
+    try:
+        parsed = float(str(value).strip())
+    except Exception:
+        parsed = default
+    return max(float(minimum), min(float(maximum), parsed))
+
+
+def normalize_email_api_url(raw: Any, *, default_scheme: str = "https") -> str:
+    from urllib.parse import urlsplit, urlunsplit
+
+    text = str(raw or "").strip()
+    if not text:
+        raise ValueError("API URL 为空")
+    scheme = str(default_scheme or "https").strip().lower() or "https"
+    if scheme not in {"http", "https"}:
+        scheme = "https"
+    if text.startswith("//"):
+        text = f"{scheme}:{text}"
+    elif "://" not in text:
+        text = f"{scheme}://{text}"
+
+    parts = urlsplit(text)
+    if parts.scheme not in {"http", "https"} or not parts.netloc:
+        raise ValueError("API URL 只支持 http/https")
+    return urlunsplit((parts.scheme, parts.netloc, parts.path or "", parts.query or "", ""))
+
+
+def _redact_email_api_url(value: Any) -> str:
+    from urllib.parse import urlsplit, urlunsplit
+
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        parts = urlsplit(text)
+        if parts.scheme and parts.netloc:
+            netloc = parts.hostname or ""
+            if parts.port:
+                netloc = f"{netloc}:{parts.port}"
+            return urlunsplit((parts.scheme, netloc, parts.path or "", "", ""))[:240]
+    except Exception:
+        pass
+    return text[:120]
+
+
+def _normalize_email_api_email(raw_email: Any) -> tuple[str, list[str]]:
+    raw = str(raw_email or "").strip().lower()
+    warnings: list[str] = []
+    if not raw:
+        raise ValueError("邮箱为空")
+    if any(ch.isspace() for ch in raw):
+        raise ValueError("邮箱不能包含空白字符")
+
+    # 容错用户常见写法：xx.xxxxx.gmail.com / xx.xxxxx.gamil.com。
+    if "@" not in raw:
+        for suffix in (".gmail.com", ".gamil.com", ".gmial.com", ".gmai.com"):
+            if raw.endswith(suffix) and len(raw) > len(suffix):
+                local = raw[: -len(suffix)].strip(".")
+                if local:
+                    raw = f"{local}@gmail.com"
+                    warnings.append(f"已将 {raw_email} 按 Gmail 地址处理为 {raw}")
+                    break
+
+    if "@" not in raw:
+        raise ValueError("邮箱格式不合法")
+    local, domain = raw.rsplit("@", 1)
+    local = local.strip().lower()
+    domain = domain.strip().lower().lstrip(".")
+    if domain in _GMAIL_DOMAIN_TYPOS:
+        warnings.append(f"检测到 {domain}，已按 gmail.com 处理")
+        domain = "gmail.com"
+    if not local or not domain:
+        raise ValueError("邮箱格式不合法")
+    email = f"{local}@{domain}"
+    if not _EMAIL_API_EMAIL_RE.fullmatch(email):
+        raise ValueError("邮箱格式不合法")
+    return email, warnings
+
+
+def _gmail_canonical_email(email: str) -> str:
+    normalized = str(email or "").strip().lower()
+    if "@" not in normalized:
+        return normalized
+    local, domain = normalized.rsplit("@", 1)
+    if domain != "gmail.com":
+        return normalized
+    if "+" in local:
+        local = local.split("+", 1)[0]
+    return f"{local.replace('.', '')}@gmail.com"
+
+
+def build_gmail_dot_variant(email: Any) -> str:
+    normalized = str(email or "").strip().lower()
+    if "@" not in normalized:
+        return ""
+    local, domain = normalized.rsplit("@", 1)
+    if domain != "gmail.com":
+        return ""
+    tag = ""
+    base_local = local
+    if "+" in base_local:
+        base_local, suffix = base_local.split("+", 1)
+        tag = "+" + suffix
+    compact = base_local.replace(".", "")
+    if len(compact) < 2:
+        return ""
+
+    candidates: list[str] = []
+    if "." in base_local:
+        candidates.append(compact + tag)
+    preferred = 2 if len(compact) > 2 else 1
+    positions = [preferred] + [pos for pos in range(1, len(compact)) if pos != preferred]
+    for pos in positions:
+        candidates.append(compact[:pos] + "." + compact[pos:] + tag)
+
+    for local_candidate in candidates:
+        candidate = f"{local_candidate}@gmail.com".lower()
+        if candidate != normalized:
+            return candidate
+    return ""
+
+
+def parse_email_api_lines(
+    lines: Any,
+    *,
+    gmail_dot_variant_enabled: bool = True,
+    default_scheme: str = "https",
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Parse ``email----api`` rows into registration identities.
+
+    Gmail rows expand to the exact submitted address plus one dot-equivalent
+    address.  The exact ChatGPT account email is never canonicalized; the Gmail
+    canonical address is only used for duplicate and lock detection.
+    """
+
+    candidates: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    seen_emails: set[str] = set()
+    gmail_api_by_root: dict[str, str] = {}
+    emitted_gmail_roots: set[str] = set()
+
+    if isinstance(lines, (list, tuple, set)):
+        raw_lines = [str(item or "") for item in lines]
+    else:
+        raw_lines = str(lines or "").splitlines()
+
+    for line_no, raw in enumerate(raw_lines, start=1):
+        line = str(raw or "").strip()
+        if not line:
+            continue
+        parts = re.split(r"-{4,}", line, maxsplit=1)
+        if len(parts) != 2:
+            errors.append({"line": line_no, "raw": line, "reason": "缺少 ---- 分隔符"})
+            continue
+        raw_email, raw_api = parts[0].strip(), parts[1].strip()
+        try:
+            email, warnings = _normalize_email_api_email(raw_email)
+            api_url = normalize_email_api_url(raw_api, default_scheme=default_scheme)
+        except ValueError as exc:
+            errors.append({"line": line_no, "raw": line, "reason": str(exc)})
+            continue
+
+        is_gmail = email.endswith("@gmail.com")
+        gmail_root = _gmail_canonical_email(email) if is_gmail else ""
+        if gmail_root:
+            existing_api = gmail_api_by_root.get(gmail_root)
+            if existing_api and existing_api != api_url:
+                errors.append({"line": line_no, "raw": line, "reason": "同一个 Gmail 根邮箱绑定了不同 API"})
+                continue
+            gmail_api_by_root[gmail_root] = api_url
+            if gmail_root in emitted_gmail_roots:
+                # 同一个 Gmail 根邮箱最多展开一次：原地址 + 一个 dot 变体。
+                continue
+            emitted_gmail_roots.add(gmail_root)
+
+        def add(candidate_email: str, variant: str) -> None:
+            normalized_candidate = candidate_email.strip().lower()
+            if not normalized_candidate or normalized_candidate in seen_emails:
+                return
+            seen_emails.add(normalized_candidate)
+            lock_keys = {f"api:{api_url}"}
+            if gmail_root:
+                lock_keys.add(f"gmail:{gmail_root}")
+            candidates.append(
+                {
+                    "email": normalized_candidate,
+                    "source_email": email,
+                    "gmail_root": gmail_root,
+                    "api_url": api_url,
+                    "api_url_masked": _redact_email_api_url(api_url),
+                    "variant": variant,
+                    "line": line_no,
+                    "warnings": list(warnings),
+                    "lock_keys": sorted(lock_keys),
+                }
+            )
+
+        add(email, "original")
+        if gmail_dot_variant_enabled and is_gmail:
+            dot_variant = build_gmail_dot_variant(email)
+            if dot_variant:
+                add(dot_variant, "gmail_dot")
+    return candidates, errors
+
+
+@dataclass
+class EmailApiPool:
+    candidates: list[dict[str, Any]]
+    statuses: list[str] = field(default_factory=list)
+    active_locks: set[str] = field(default_factory=set)
+    condition: threading.Condition = field(default_factory=lambda: threading.Condition(threading.Lock()))
+
+    def __post_init__(self) -> None:
+        if not self.statuses or len(self.statuses) != len(self.candidates):
+            self.statuses = ["available" for _ in self.candidates]
+
+    def acquire(self, *, wait_timeout: float = 1800.0) -> dict[str, Any]:
+        deadline = time.monotonic() + max(float(wait_timeout or 0), 1.0)
+        with self.condition:
+            while True:
+                for idx, item in enumerate(self.candidates):
+                    if self.statuses[idx] != "available":
+                        continue
+                    lock_keys = {str(key) for key in (item.get("lock_keys") or []) if str(key)}
+                    if lock_keys & self.active_locks:
+                        continue
+                    self.statuses[idx] = "leased"
+                    self.active_locks.update(lock_keys)
+                    allocated = dict(item)
+                    allocated["_pool_index"] = idx
+                    allocated["_lock_keys"] = sorted(lock_keys)
+                    return allocated
+
+                if not any(status == "available" for status in self.statuses):
+                    raise RuntimeError("Email API 邮箱行已用完")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError("Email API 邮箱等待同 API/Gmail 串行锁超时")
+                self.condition.wait(min(0.25, remaining))
+
+    def finalize(self, item: dict[str, Any], status: str) -> None:
+        idx = item.get("_pool_index")
+        lock_keys = {str(key) for key in (item.get("_lock_keys") or item.get("lock_keys") or []) if str(key)}
+        with self.condition:
+            try:
+                idx_int = int(idx)
+            except Exception:
+                idx_int = -1
+            if 0 <= idx_int < len(self.statuses) and self.statuses[idx_int] == "leased":
+                self.statuses[idx_int] = status or "failed"
+            for key in lock_keys:
+                self.active_locks.discard(key)
+            self.condition.notify_all()
+
+
+class EmailApiMailbox(BaseMailbox):
+    """邮箱验证码 API：固定邮箱 + GET JSON status 字段轮询验证码。"""
+
+    _pools: dict[str, EmailApiPool] = {}
+    _pools_lock = threading.Lock()
+
+    def __init__(
+        self,
+        lines: Any = "",
+        candidates: list[dict[str, Any]] | None = None,
+        api_url: str = "",
+        email: str = "",
+        poll_interval_seconds: Any = 3,
+        request_timeout_seconds: Any = 15,
+        gmail_dot_variant_enabled: Any = True,
+        default_scheme: str = "https",
+        pool_key: str = "",
+        proxy: str | None = None,
+    ):
+        self.raw_lines = lines
+        self.candidates = candidates if isinstance(candidates, list) else None
+        self.api_url = str(api_url or "").strip()
+        self.email = str(email or "").strip()
+        self.poll_interval_seconds = _email_api_positive_float(poll_interval_seconds, 3, minimum=0.5, maximum=60)
+        self.request_timeout_seconds = _email_api_positive_float(request_timeout_seconds, 15, minimum=1, maximum=120)
+        self.gmail_dot_variant_enabled = _email_api_truthy(gmail_dot_variant_enabled, default=True)
+        self.default_scheme = str(default_scheme or "https").strip().lower() or "https"
+        self.pool_key = str(pool_key or "").strip()
+        self.proxy = build_requests_proxy_config(proxy)
+        self._allocated_item: dict[str, Any] | None = None
+        self._pool: EmailApiPool | None = None
+        self._pool_lookup_key = ""
+        self._last_poll_error = ""
+
+    @classmethod
+    def release_pool(cls, pool_key: str) -> None:
+        key = str(pool_key or "").strip()
+        if not key:
+            return
+        with cls._pools_lock:
+            cls._pools.pop(key, None)
+
+    @staticmethod
+    def code_from_status(value: Any) -> str:
+        raw = "" if value is None else str(value).strip()
+        if not raw or raw.lower() in {"false", "none", "null"}:
+            return ""
+        if re.fullmatch(r"0+", raw):
+            return ""
+        return raw if re.fullmatch(r"\d{4,8}", raw) else ""
+
+    def _normalized_candidates(self) -> list[dict[str, Any]]:
+        if isinstance(self.candidates, list) and self.candidates:
+            return [dict(item) for item in self.candidates if isinstance(item, dict)]
+        candidates, errors = parse_email_api_lines(
+            self.raw_lines,
+            gmail_dot_variant_enabled=self.gmail_dot_variant_enabled,
+            default_scheme=self.default_scheme,
+        )
+        if errors:
+            first = errors[0]
+            raise RuntimeError(f"Email API 行解析失败: 第 {first.get('line')} 行 {first.get('reason')}")
+        return candidates
+
+    def _resolve_pool(self) -> EmailApiPool:
+        if self._pool is not None:
+            return self._pool
+        candidates = self._normalized_candidates()
+        if not candidates:
+            raise RuntimeError("Email API 模式请至少提供一条 email----api")
+        key = self.pool_key
+        if not key:
+            digest_source = json.dumps(
+                [{"email": item.get("email"), "api_url": item.get("api_url")} for item in candidates],
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            key = hashlib.sha256(digest_source.encode("utf-8")).hexdigest()
+        with self._pools_lock:
+            pool = self._pools.get(key)
+            if pool is None:
+                pool = EmailApiPool(candidates=[dict(item) for item in candidates])
+                self._pools[key] = pool
+        self._pool_lookup_key = key
+        self._pool = pool
+        return pool
+
+    def _account_api_url(self, account: MailboxAccount | None = None) -> str:
+        extra = dict(getattr(account, "extra", None) or {}) if account is not None else {}
+        raw = extra.get("api_url") or self.api_url
+        if not raw:
+            raise RuntimeError("Email API 邮箱状态缺少 api_url")
+        return normalize_email_api_url(raw, default_scheme=self.default_scheme)
+
+    def _request_status_payload(self, api_url: str) -> dict[str, Any]:
+        import requests
+
+        response = requests.request(
+            "GET",
+            api_url,
+            headers={"accept": "application/json"},
+            timeout=self.request_timeout_seconds,
+            proxies=self.proxy,
+        )
+        raw_text = response.text or ""
+        try:
+            payload = response.json()
+        except Exception as exc:
+            raise RuntimeError(
+                f"Email API 返回不是 JSON: HTTP {response.status_code} {_redact_email_api_url(api_url)} {raw_text[:120]}"
+            ) from exc
+        if response.status_code >= 400:
+            message = ""
+            if isinstance(payload, dict):
+                message = str(payload.get("error") or payload.get("message") or payload.get("detail") or "").strip()
+            raise RuntimeError(f"Email API 请求失败: HTTP {response.status_code} {message or _redact_email_api_url(api_url)}")
+        if not isinstance(payload, dict):
+            raise RuntimeError("Email API 返回不是 JSON Object")
+        return payload
+
+    def _poll_status_code(self, account: MailboxAccount, *, swallow_errors: bool = False) -> str:
+        api_url = self._account_api_url(account)
+        try:
+            payload = self._request_status_payload(api_url)
+        except Exception as exc:
+            if swallow_errors:
+                return ""
+            raise RuntimeError(str(exc)) from exc
+        return self.code_from_status(payload.get("status"))
+
+    def get_email(self) -> MailboxAccount:
+        if self.email and self.api_url:
+            email, warnings = _normalize_email_api_email(self.email)
+            api_url = normalize_email_api_url(self.api_url, default_scheme=self.default_scheme)
+            extra = {
+                "provider": "email_api",
+                "api_url": api_url,
+                "api_url_masked": _redact_email_api_url(api_url),
+                "source_email": email,
+                "gmail_root": _gmail_canonical_email(email) if email.endswith("@gmail.com") else "",
+                "variant": "restored",
+                "warnings": warnings,
+                "mailbox_action": "restored_existing",
+            }
+            return MailboxAccount(email=email, account_id=email, extra=extra)
+
+        pool = self._resolve_pool()
+        item = pool.acquire()
+        self._allocated_item = item
+        email = str(item.get("email") or "").strip()
+        api_url = str(item.get("api_url") or "").strip()
+        self._log(
+            f"[EmailAPI] 分配邮箱: {email} variant={item.get('variant') or 'original'} api={_redact_email_api_url(api_url)}"
+        )
+        extra = {
+            "provider": "email_api",
+            "api_url": api_url,
+            "api_url_masked": _redact_email_api_url(api_url),
+            "source_email": item.get("source_email") or email,
+            "gmail_root": item.get("gmail_root") or "",
+            "variant": item.get("variant") or "original",
+            "line": item.get("line") or 0,
+            "warnings": item.get("warnings") or [],
+            "lock_keys": item.get("_lock_keys") or item.get("lock_keys") or [],
+            "pool_key": self._pool_lookup_key or self.pool_key,
+            "pool_index": item.get("_pool_index"),
+            "mailbox_action": "leased",
+        }
+        return MailboxAccount(email=email, account_id=email, extra=extra)
+
+    def get_current_ids(self, account: MailboxAccount) -> set:
+        code = self._poll_status_code(account, swallow_errors=True)
+        return {f"status:{code}"} if code else set()
+
+    def wait_for_code(
+        self,
+        account: MailboxAccount,
+        keyword: str = "",
+        timeout: int = 120,
+        before_ids: set = None,
+        code_pattern: str = None,
+        **kwargs,
+    ) -> str:
+        seen = {str(mid) for mid in (before_ids or set()) if str(mid)}
+        exclude_codes = {str(code).strip() for code in (kwargs.get("exclude_codes") or set()) if str(code or "").strip()}
+        api_url = self._account_api_url(account)
+
+        def poll_once() -> Optional[str]:
+            try:
+                payload = self._request_status_payload(api_url)
+                self._last_poll_error = ""
+            except Exception as exc:
+                error_text = str(exc or "").strip()
+                if error_text and error_text != self._last_poll_error:
+                    self._last_poll_error = error_text
+                    self._log(f"[EmailAPI] 收码接口暂未可用，继续轮询: {error_text[:240]}")
+                return None
+
+            code = self.code_from_status(payload.get("status"))
+            if not code:
+                return None
+            message_id = f"status:{code}"
+            if message_id in seen or code in exclude_codes:
+                return None
+            seen.add(message_id)
+            self._record_verification_result(
+                message_id=message_id,
+                code=code,
+                phase=kwargs.get("phase") or "",
+                provider="EmailApiMailbox",
+                metadata={
+                    "email": str(getattr(account, "email", "") or ""),
+                    "source_email": str((getattr(account, "extra", None) or {}).get("source_email") or ""),
+                    "gmail_root": str((getattr(account, "extra", None) or {}).get("gmail_root") or ""),
+                    "variant": str((getattr(account, "extra", None) or {}).get("variant") or ""),
+                    "api_url": _redact_email_api_url(api_url),
+                    "submission_source": "email_api_status",
+                },
+            )
+            self._log(f"[EmailAPI] 收到验证码: {code}")
+            return code
+
+        return self._run_polling_wait(
+            timeout=timeout,
+            poll_interval=self.poll_interval_seconds,
+            poll_once=poll_once,
+            timeout_message=f"等待 Email API 验证码超时 ({max(int(timeout or 0), 1)}s)",
+        )
+
+    def _finalize_pool_item(self, status: str) -> None:
+        if self._pool is None or not self._allocated_item:
+            return
+        self._pool.finalize(self._allocated_item, status)
+        self._allocated_item = None
+
+    def finalize_success(self, account: MailboxAccount, registered_email: str = "", task_id: str = "") -> None:
+        self._finalize_pool_item("registered")
+
+    def finalize_failure(self, account: MailboxAccount, error_message: str = "", task_id: str = "") -> None:
+        self._finalize_pool_item("failed")
+
+    def export_state_config(self, account: MailboxAccount | None = None, extra_config: dict | None = None) -> dict[str, Any]:
+        return {
+            "mail_provider": "email_api",
+            "email_api_poll_interval_seconds": self.poll_interval_seconds,
+            "email_api_request_timeout_seconds": self.request_timeout_seconds,
+            "email_api_gmail_dot_variant_enabled": self.gmail_dot_variant_enabled,
+            "email_api_default_scheme": self.default_scheme,
+        }
+
+
 def _mailbox_bool(value, *, default: bool = False) -> bool:
     if value in (None, ""):
         return default
@@ -814,6 +1342,20 @@ def create_mailbox(
             email=extra.get("manual_email_address") or extra.get("email") or "",
             extra=extra,
             proxy=proxy,
+        )
+    elif provider in EMAIL_API_PROVIDER_VALUES:
+        email_api_proxy = _mailbox_api_proxy(extra, proxy, prefix="email_api")
+        return EmailApiMailbox(
+            lines=extra.get("email_api_lines") or extra.get("email_api_accounts") or "",
+            candidates=extra.get("email_api_candidates") if isinstance(extra.get("email_api_candidates"), list) else None,
+            api_url=extra.get("email_api_url") or extra.get("api_url") or "",
+            email=extra.get("email_api_email") or extra.get("manual_email_address") or extra.get("email") or "",
+            poll_interval_seconds=extra.get("email_api_poll_interval_seconds", 3),
+            request_timeout_seconds=extra.get("email_api_request_timeout_seconds", 15),
+            gmail_dot_variant_enabled=extra.get("email_api_gmail_dot_variant_enabled", True),
+            default_scheme=extra.get("email_api_default_scheme", "https"),
+            pool_key=extra.get("email_api_pool_key") or extra.get("_current_task_id") or "",
+            proxy=email_api_proxy,
         )
     elif provider == "tempmail_lol":
         return TempMailLolMailbox(proxy=proxy)

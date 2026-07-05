@@ -2541,6 +2541,10 @@ export default function Accounts() {
           register_delay_seconds: Number(savedSettings.register_delay_seconds || 0) || 0,
           ...proxySettings,
           mail_provider_override: String(savedSettings.mail_provider_override || '__global__'),
+          email_api_lines: String(cfg.email_api_lines || '').trim(),
+          email_api_poll_interval_seconds: cfg.email_api_poll_interval_seconds || 3,
+          email_api_request_timeout_seconds: cfg.email_api_request_timeout_seconds || 15,
+          email_api_gmail_dot_variant_enabled: cfg.email_api_gmail_dot_variant_enabled === '' ? true : parseBooleanConfigValue(cfg.email_api_gmail_dot_variant_enabled),
           email: String(savedSettings.email || savedEmail || '').trim(),
           login_password: String(cfg.chatgpt_existing_account_login_password || '').trim(),
           chatgpt_existing_account_capture: savedSettings.chatgpt_existing_account_capture ?? false,
@@ -2573,6 +2577,10 @@ export default function Accounts() {
           register_delay_seconds: Number(savedSettings.register_delay_seconds || 0) || 0,
           ...taskProxySettingsFromConfig({}, savedSettings),
           mail_provider_override: String(savedSettings.mail_provider_override || '__global__'),
+          email_api_lines: '',
+          email_api_poll_interval_seconds: 3,
+          email_api_request_timeout_seconds: 15,
+          email_api_gmail_dot_variant_enabled: true,
           email: String(savedSettings.email || savedEmail || '').trim(),
           login_password: '',
           chatgpt_existing_account_capture: savedSettings.chatgpt_existing_account_capture ?? false,
@@ -3986,6 +3994,14 @@ export default function Accounts() {
       }
       const registerExtra = {
         mail_provider: resolvedMailProvider,
+        email_api_lines: resolvedMailProvider === 'email_api' ? String(values.email_api_lines || cfg.email_api_lines || '').trim() : undefined,
+        email_api_poll_interval_seconds: cfg.email_api_poll_interval_seconds || values.email_api_poll_interval_seconds || 3,
+        email_api_request_timeout_seconds: cfg.email_api_request_timeout_seconds || values.email_api_request_timeout_seconds || 15,
+        email_api_gmail_dot_variant_enabled: parseBooleanConfigValue(
+          values.email_api_gmail_dot_variant_enabled ?? cfg.email_api_gmail_dot_variant_enabled ?? true,
+        ),
+        email_api_default_scheme: cfg.email_api_default_scheme || 'https',
+        email_api_use_all_identities: resolvedMailProvider === 'email_api' ? true : undefined,
         applemail_base_url: cfg.applemail_base_url,
         applemail_pool_dir: cfg.applemail_pool_dir,
         applemail_pool_file: cfg.applemail_pool_file,
@@ -4082,6 +4098,13 @@ export default function Accounts() {
       const adaptedRegisterExtra = chatgptRegistrationRequestAdapter
         ? chatgptRegistrationRequestAdapter.extendExtra(registerExtra)
         : registerExtra
+
+      if (resolvedMailProvider === 'email_api' && currentPlatform === 'chatgpt') {
+        const rawLines = String(values.email_api_lines || cfg.email_api_lines || '').trim()
+        if (!rawLines) {
+          throw new Error('邮箱验证码 API 模式必须填写 email----api 行')
+        }
+      }
 
       if (resolvedMailProvider === 'manual_email_otp' && currentPlatform === 'chatgpt') {
         const normalizedEmail = String(values.email || '').trim()

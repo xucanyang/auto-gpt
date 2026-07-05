@@ -7,6 +7,20 @@
 ## [Unreleased] (未发布)
 
 
+## [1.3.5] - 2026-07-05
+### 新增 (Added)
+- **新增邮箱验证码 API 注册/登录收码 provider**：`core/base_mailbox.py` 新增独立 `email_api` 邮箱服务，并兼容 `api_email`、`email_otp_api`、`mail_api_otp` 别名；支持每行 `邮箱----API` 输入，自动补全无协议 API URL，轮询 JSON 响应中的 `status` 字段作为验证码来源。`status=0`、空值或非 4-8 位数字会按“尚未收到验证码”继续等待，收到有效验证码后复用现有 ChatGPT 注册与 OAuth 登录邮箱 OTP 流程。
+- **支持 Gmail 一行双账号身份**：`parse_email_api_lines()` 会把 Gmail 原邮箱展开为“原地址 + 一个点号变体”两个注册身份，两个身份共用同一个接码 API；运行时按 Gmail canonical 与 API URL 建立任务级串行锁，避免单字段 `status` 在并发注册或二阶段登录时串码。账号落库时保留实际提交给 ChatGPT 的邮箱地址，不会把点号别名去点后覆盖为 canonical 邮箱。
+- **补齐注册入口和配置入口**：`api/tasks.py` 在 `_prepare_register_request()` 中对 `email_api` 做后端权威解析、候选数量统计、注册数量自动展开和并发上限收敛；注册页、账号页注册弹窗与 Settings 邮箱服务配置区新增“邮箱验证码 API（email----api）”入口，可配置邮箱 API 行、轮询间隔、请求超时、默认 URL 协议与 Gmail 点号变体开关。
+
+### 修复 (Fixed)
+- **保护邮箱 API 敏感链接不进入任务日志**：`services/chatgpt_core/task_logging.py` 新增 `redact_raw_email_api_line()`，并对 `email_api_line`、`email_api_lines`、`email_api_accounts` 等字段逐行脱敏，只保留邮箱与 API host/path，移除 `s=`、token、query 和 fragment，避免接码凭证进入任务详情、历史日志和错误文本；`tests/test_chatgpt_task_logging.py` 补充结构化脱敏回归。
+- **避免注册任务重复消费同一邮箱行**：`api/tasks.py` 将 mailbox 构造改为接收每次 attempt 的 `runtime_extra`，并为 `email_api` 注入 task 级共享池 key；`EmailApiMailbox` 在成功或失败 finalize 后释放同 Gmail/API 锁，任务结束时清理共享池，防止并发或代理重试时每个 worker 都从第一行重新分配邮箱。
+- **确保后续登录/补抓 Auth 可恢复同一 API**：`services/chatgpt_core/plugin.py` 支持 mailbox 自定义 `export_state_config()`，避免把整批 `email_api_lines` 写进每个账号的 `chatgpt_mailbox_state.config`；成功账号只保存当前账号自己的 `api_url`、source email、Gmail root 和 variant。`services/chatgpt_core/pending_business_invites.py` 增加 `email_api` legacy state 兼容，后续 pending invite、邮箱测活和 auth recheck 能通过已保存 mailbox state 自动复用同一邮箱 API 收码。
+
+### 优化 (Changed)
+- **同步前端版本号至 v1.3.5**：`frontend/src/app/AppShell.tsx` 侧边栏版本展示更新为 `v1.3.5`，用于上线后确认邮箱验证码 API 注册/登录能力对应的静态资源已加载。
+
 ## [1.3.4] - 2026-07-05
 ### 优化 (Changed)
 - **发布流程默认不再创建运行态备份**：`deploy.sh` 将 `.rollback-backups/deploy-*` 发布前备份改为显式 `--backup` 才创建，常规 multi/image/hot 发布只依赖 Git 提交与 live smoke，避免每次部署都复制三实例 SQLite、容器 inspect 和共享配置快照导致磁盘快速膨胀。
@@ -385,4 +399,8 @@
 
 ## 2026-07-05 23:10:58 +0800
 - 默认关闭发布备份并清理历史备份
+- 发布模式: multi
+
+## 2026-07-06 00:05:14 +0800
+- 新增邮箱验证码 API 注册登录能力
 - 发布模式: multi

@@ -148,11 +148,18 @@ class ChatGPTPlatform(BasePlatform):
 
             def _export_mailbox_state_payload(acct, before_ids):
                 account_extra = dict(getattr(acct, "extra", None) or {}) if acct is not None else {}
-                export_config = {
-                    key: value
-                    for key, value in dict(extra_config or {}).items()
-                    if key not in {"_task_control"} and not callable(value)
-                }
+                state_config_exporter = getattr(_mailbox, "export_state_config", None)
+                if callable(state_config_exporter):
+                    try:
+                        export_config = state_config_exporter(acct, extra_config)
+                    except TypeError:
+                        export_config = state_config_exporter()
+                else:
+                    export_config = {
+                        key: value
+                        for key, value in dict(extra_config or {}).items()
+                        if key not in {"_task_control"} and not callable(value)
+                    }
                 return {
                     "provider": _mail_provider,
                     "email": str(_fixed_email or getattr(acct, "email", "") or "").strip(),

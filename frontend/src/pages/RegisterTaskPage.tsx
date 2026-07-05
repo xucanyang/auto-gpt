@@ -97,6 +97,11 @@ export default function RegisterTaskPage() {
         executor_type: normalizeExecutorForPlatform(currentPlatform, cfg.default_executor),
         captcha_solver: cfg.default_captcha_solver || 'yescaptcha',
         mail_provider: cfg.mail_provider || 'luckmail',
+        email_api_lines: cfg.email_api_lines || '',
+        email_api_poll_interval_seconds: cfg.email_api_poll_interval_seconds || 3,
+        email_api_request_timeout_seconds: cfg.email_api_request_timeout_seconds || 15,
+        email_api_gmail_dot_variant_enabled: cfg.email_api_gmail_dot_variant_enabled === '' ? true : parseBooleanConfigValue(cfg.email_api_gmail_dot_variant_enabled),
+        email_api_default_scheme: cfg.email_api_default_scheme || 'https',
         applemail_base_url: cfg.applemail_base_url || 'https://www.appleemail.top',
         applemail_pool_dir: cfg.applemail_pool_dir || 'mail',
         applemail_pool_file: cfg.applemail_pool_file || '',
@@ -219,6 +224,10 @@ export default function RegisterTaskPage() {
       message.error('手机号注册请粘贴 手机号----收码API，或勾选使用手机号池')
       return
     }
+    if (!phoneSignupEnabled && values.platform === 'chatgpt' && values.mail_provider === 'email_api' && !String(values.email_api_lines || '').trim()) {
+      message.error('邮箱验证码 API 模式请填写 email----api 行')
+      return
+    }
     if (phoneSignupEnabled && !String(values.login_password || values.password || '').trim()) {
       message.error('手机号注册/已注册手机号登录必须填写同一个密码')
       return
@@ -227,6 +236,12 @@ export default function RegisterTaskPage() {
 
     const registerExtra = {
       mail_provider: values.mail_provider,
+      email_api_lines: values.mail_provider === 'email_api' ? String(values.email_api_lines || '').trim() : undefined,
+      email_api_poll_interval_seconds: values.email_api_poll_interval_seconds,
+      email_api_request_timeout_seconds: values.email_api_request_timeout_seconds,
+      email_api_gmail_dot_variant_enabled: values.email_api_gmail_dot_variant_enabled,
+      email_api_default_scheme: values.email_api_default_scheme,
+      email_api_use_all_identities: values.mail_provider === 'email_api' ? true : undefined,
       applemail_base_url: values.applemail_base_url,
       applemail_pool_dir: values.applemail_pool_dir,
       applemail_pool_file: values.applemail_pool_file,
@@ -612,6 +627,10 @@ export default function RegisterTaskPage() {
         executor_type: 'protocol',
         captcha_solver: 'yescaptcha',
         mail_provider: 'luckmail',
+        email_api_poll_interval_seconds: 3,
+        email_api_request_timeout_seconds: 15,
+        email_api_gmail_dot_variant_enabled: true,
+        email_api_default_scheme: 'https',
         applemail_base_url: 'https://www.appleemail.top',
         applemail_pool_dir: 'mail',
         applemail_mailboxes: 'INBOX,Junk',
@@ -954,6 +973,7 @@ export default function RegisterTaskPage() {
                 ...(platform === 'chatgpt'
                   ? [
                       { value: 'manual_email_otp', label: '手动邮箱 + 手输验证码' },
+                      { value: 'email_api', label: '邮箱验证码 API（email----api）' },
                       { value: 'hme_ready_api', label: 'HME Ready API' },
                       { value: 'icloud_hme', label: 'iCloud HME' },
                     ]
@@ -1001,6 +1021,42 @@ export default function RegisterTaskPage() {
               <Text type="secondary" style={{ display: 'block', marginBottom: 8 }}>
                 当前模式下密码不会手填，系统会自动随机生成；批量数量和并发数会强制锁为 1。
               </Text>
+            </>
+          )}
+          {mailProvider === 'email_api' && (
+            <>
+              <Alert
+                type="info"
+                showIcon
+                style={{ marginBottom: 16 }}
+                message="邮箱验证码 API（email----api）"
+                description={
+                  <div>
+                    <div>每行格式：邮箱----验证码 API。API 可以省略 http/https，后端默认补 https://。</div>
+                    <div>API 返回 JSON，status 字段为验证码；status=0、空或非 4-8 位数字会继续等待。</div>
+                    <div>Gmail 每行会自动展开为原邮箱和一个点号变体，共用同一个 API，并按 Gmail/API 串行发码。</div>
+                  </div>
+                }
+              />
+              <Form.Item
+                name="email_api_lines"
+                label="邮箱 API 行"
+                rules={[{ required: true, message: '请至少填写一行 email----api' }]}
+                extra="示例：sumi523red@gmail.com----smsbower.page/api/mail/getCodeBySignature?s=xxx"
+              >
+                <Input.TextArea rows={6} placeholder={'name@gmail.com----api.example.com/get?id=xxx\nuser@example.com----https://api.example.com/code?u=2'} style={{ fontFamily: 'monospace' }} />
+              </Form.Item>
+              <Space align="start" style={{ width: '100%' }}>
+                <Form.Item name="email_api_poll_interval_seconds" label="轮询间隔秒" style={{ flex: 1 }}>
+                  <InputNumber min={1} max={60} precision={0} style={{ width: '100%' }} />
+                </Form.Item>
+                <Form.Item name="email_api_request_timeout_seconds" label="请求超时秒" style={{ flex: 1 }}>
+                  <InputNumber min={1} max={120} precision={0} style={{ width: '100%' }} />
+                </Form.Item>
+              </Space>
+              <Form.Item name="email_api_gmail_dot_variant_enabled" valuePropName="checked">
+                <Checkbox>Gmail 自动生成第二个点号变体</Checkbox>
+              </Form.Item>
             </>
           )}
           {mailProvider === 'tempmail_local' && (

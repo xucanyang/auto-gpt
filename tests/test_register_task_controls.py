@@ -16,6 +16,7 @@ from api.tasks import (
     _create_task_record,
     _create_standalone_task_record,
     _build_effective_register_extra,
+    _prepare_register_request,
     _run_batch_resume_subscription_auth,
     _run_phone_binding_test,
     _run_register,
@@ -159,6 +160,58 @@ class _FakeChatGPTAlwaysFailPlatform(BasePlatform):
 
     def check_valid(self, account: Account) -> bool:
         return True
+
+
+class EmailApiRegisterRequestTests(unittest.TestCase):
+    def test_prepare_email_api_gmail_line_uses_all_identities(self):
+        req = RegisterTaskRequest(
+            platform="chatgpt",
+            count=1,
+            concurrency=5,
+            extra={
+                "mail_provider": "email_api",
+                "email_api_lines": "name@gmail.com----api.example.com/code?id=1",
+            },
+        )
+
+        prepared = _prepare_register_request(req)
+
+        self.assertEqual(prepared.count, 2)
+        self.assertEqual(prepared.concurrency, 2)
+        self.assertEqual(prepared.extra["mail_provider"], "email_api")
+        self.assertEqual(prepared.extra["email_api_candidate_count"], 2)
+
+    def test_prepare_email_api_non_gmail_line_uses_one_identity(self):
+        req = RegisterTaskRequest(
+            platform="chatgpt",
+            count=10,
+            concurrency=5,
+            extra={
+                "mail_provider": "email_api",
+                "email_api_lines": "user@example.com----api.example.com/code?id=1",
+            },
+        )
+
+        prepared = _prepare_register_request(req)
+
+        self.assertEqual(prepared.count, 1)
+        self.assertEqual(prepared.concurrency, 1)
+
+    def test_prepare_email_api_rejects_bad_line(self):
+        req = RegisterTaskRequest(
+            platform="chatgpt",
+            count=1,
+            concurrency=1,
+            extra={
+                "mail_provider": "email_api",
+                "email_api_lines": "name@gmail.com api.example.com/code",
+            },
+        )
+
+        with self.assertRaises(Exception) as ctx:
+            _prepare_register_request(req)
+
+        self.assertIn("----", str(ctx.exception))
 
 
 class RegisterTaskControlFlowTests(unittest.TestCase):

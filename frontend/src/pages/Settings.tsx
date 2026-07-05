@@ -40,6 +40,7 @@ const SELECT_FIELDS: Record<string, { label: string; value: string }[]> = {
   mail_provider: [
     { label: 'LuckMail（订单接码 / 已购邮箱）', value: 'luckmail' },
     { label: '手动邮箱 + 手输验证码（仅 ChatGPT）', value: 'manual_email_otp' },
+    { label: '邮箱验证码 API（email----api）', value: 'email_api' },
     { label: 'Outlook（本地导入）', value: 'outlook' },
     { label: 'AppleMail（小苹果 / 本地邮箱池）', value: 'applemail' },
     { label: 'Laoudo（固定邮箱）', value: 'laoudo' },
@@ -164,6 +165,17 @@ const TAB_ITEMS = [
         fields: [
           { key: 'mail_provider', label: '邮箱服务', type: 'select' },
           { key: 'mailbox_otp_timeout_seconds', label: '邮箱验证码等待秒数', placeholder: '例如 60 / 90 / 120' },
+        ],
+      },
+      {
+        title: '邮箱验证码 API',
+        desc: '每行 email----api。API 返回 JSON，status 字段为验证码；status=0/空/非 4-8 位数字表示未收到。Gmail 会自动展开为原地址和一个 dot 变体。',
+        fields: [
+          { key: 'email_api_lines', label: '邮箱 API 行', type: 'textarea', placeholder: 'name@gmail.com----api.example.com/get?id=xxx\nuser@example.com----https://api.example.com/code?u=2' },
+          { key: 'email_api_poll_interval_seconds', label: '轮询间隔秒数', placeholder: '3' },
+          { key: 'email_api_request_timeout_seconds', label: '单次请求超时秒数', placeholder: '15' },
+          { key: 'email_api_gmail_dot_variant_enabled', label: 'Gmail 生成 dot 变体', type: 'boolean' },
+          { key: 'email_api_default_scheme', label: '默认 URL 协议', placeholder: 'https' },
         ],
       },
       {
@@ -655,6 +667,8 @@ function getIcloudHmeModeLabel(mode: string): string {
 
 function getMailboxSectionProvider(title: string): string | null {
   switch (title) {
+    case '邮箱验证码 API':
+      return 'email_api'
     case 'Laoudo':
       return 'laoudo'
     case 'Freemail':
@@ -699,6 +713,7 @@ const MAILBOX_QUICK_PROVIDERS = [
   'luckmail',
   'hme_ready_api',
   'icloud_hme',
+  'email_api',
   'applemail',
   'tempmail_local',
   'skymail',
@@ -719,6 +734,8 @@ function getMailboxProviderBrief(provider: string): string {
       return 'auto-gpt 只调用 helper 的 prepare / wait-code / finalize；iCloud Cookie、alias 池和收件箱都留在 helper。'
     case 'icloud_hme':
       return 'auto-gpt 直接管理 iCloud Cookie / HME 别名池 / 共享收件箱，适合导入池、实时创建和别名治理。'
+    case 'email_api':
+      return '自带邮箱 + 外部 API 自动收码；Gmail 一行会展开为原地址和一个 dot 变体，共用同一 API。'
     case 'applemail':
       return '本地导入 Outlook/AppleMail 池，适合已有邮箱资产。'
     case 'tempmail_local':
@@ -3619,6 +3636,18 @@ export default function Settings() {
       if (!data.maliapi_base_url) {
         data.maliapi_base_url = 'https://maliapi.215.im/v1'
       }
+      if (!data.email_api_poll_interval_seconds) {
+        data.email_api_poll_interval_seconds = '3'
+      }
+      if (!data.email_api_request_timeout_seconds) {
+        data.email_api_request_timeout_seconds = '15'
+      }
+      if (data.email_api_gmail_dot_variant_enabled === undefined || data.email_api_gmail_dot_variant_enabled === '') {
+        data.email_api_gmail_dot_variant_enabled = true
+      }
+      if (!data.email_api_default_scheme) {
+        data.email_api_default_scheme = 'https'
+      }
       if (!data.luckmail_base_url) {
         data.luckmail_base_url = 'https://mails.luckyous.com/'
       }
@@ -3959,6 +3988,11 @@ export default function Settings() {
         ),
       )
       values.tempmail_mode = values.tempmail_mode || 'fixed_domain'
+      values.email_api_lines = String(values.email_api_lines || '').trim()
+      values.email_api_poll_interval_seconds = String(values.email_api_poll_interval_seconds || '3').trim() || '3'
+      values.email_api_request_timeout_seconds = String(values.email_api_request_timeout_seconds || '15').trim() || '15'
+      values.email_api_gmail_dot_variant_enabled = parseBooleanConfigValue(values.email_api_gmail_dot_variant_enabled)
+      values.email_api_default_scheme = String(values.email_api_default_scheme || 'https').trim() || 'https'
       values.contribution_enabled = parseBooleanConfigValue(values.contribution_enabled)
       values.chatgpt_enable_team_invite = parseBooleanConfigValue(values.chatgpt_enable_team_invite)
       values.chatgpt_team_invite_deferred_activation = parseBooleanConfigValue(values.chatgpt_team_invite_deferred_activation)

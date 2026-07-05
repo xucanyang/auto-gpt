@@ -13,6 +13,7 @@ from services.chatgpt_core.task_logging import (
     mask_phone_for_log,
     redact_log_text,
     redact_proxy_url,
+    redact_raw_email_api_line,
     redact_raw_phone_line,
     redact_url,
     sanitize_error_message,
@@ -78,6 +79,21 @@ def test_raw_line_and_phone_helpers_do_not_expose_sms_api_secret():
     assert "token=secret" not in safe
     assert safe.endswith("https://sms.example.com/get")
     assert mask_phone_for_log("+15551234567") != "+15551234567"
+
+
+def test_raw_email_api_line_keeps_email_and_endpoint_but_removes_url_secrets():
+    raw = "demo@example.com----https://mail-api.example.com/path?token=secret&id=1#frag"
+
+    safe = redact_raw_email_api_line(raw)
+
+    assert safe == "demo@example.com----https://mail-api.example.com/path"
+    assert "demo@example.com" in safe
+    assert "https://mail-api.example.com/path" in safe
+    assert "token=secret" not in safe
+    assert "secret" not in safe
+    assert "id=1" not in safe
+    assert "?" not in safe
+    assert "#frag" not in safe
 
 
 def test_redact_log_text_masks_phone_after_verification_context_without_otp_misfire():
@@ -185,6 +201,41 @@ def test_sanitize_task_detail_covers_structured_api_secret_keys():
     dumped = json.dumps(safe, ensure_ascii=False)
     assert "abc123xyz999" not in dumped
     assert dumped.count(REDACTED_TOKEN) >= 8
+
+
+def test_sanitize_task_detail_redacts_email_api_line_fields_without_losing_identity():
+    raw_line = "demo@example.com----https://mail-api.example.com/path?token=secret&id=1#frag"
+    raw_lines = "\n".join(
+        [
+            raw_line,
+            "second@example.com----https://mail-api.example.com/second?token=other&id=2#tail",
+        ]
+    )
+
+    safe = sanitize_task_detail(
+        {
+            "email_api_line": raw_line,
+            "nested": {
+                "email_api_lines": raw_lines,
+            },
+        }
+    )
+
+    assert safe["email_api_line"] == "demo@example.com----https://mail-api.example.com/path"
+    assert safe["nested"]["email_api_lines"].splitlines() == [
+        "demo@example.com----https://mail-api.example.com/path",
+        "second@example.com----https://mail-api.example.com/second",
+    ]
+
+    dumped = json.dumps(safe, ensure_ascii=False)
+    assert "demo@example.com" in dumped
+    assert "second@example.com" in dumped
+    assert "https://mail-api.example.com/path" in dumped
+    assert "https://mail-api.example.com/second" in dumped
+    for leaked in ("token=secret", "token=other", "secret", "other", "id=1", "id=2", "#frag", "#tail"):
+        assert leaked not in dumped
+    assert "?" not in dumped
+    assert "#" not in dumped
 
 
 def test_sanitize_phone_item_and_result_return_display_copies():
@@ -456,4 +507,3 @@ def test_enqueue_batch_oaipay_upload_task_empty(tmp_path, monkeypatch):
         saved_detail = json.loads(row.detail_json)
 
     assert saved_detail["attempt_outcome"] == "batch_oaipay_upload_empty"
-
