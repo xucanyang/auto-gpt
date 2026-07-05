@@ -1,7 +1,10 @@
 import json
 import unittest
+from unittest.mock import MagicMock, patch
 
+from core.base_platform import RegisterConfig
 from core.db import AccountModel
+from services.chatgpt_core import ChatGPTPlatform
 from services.chatgpt_core.k12_recapture import (
     _find_matching_artifact,
     _merge_account_extra_for_artifact,
@@ -109,6 +112,45 @@ class K12RecapturePersistenceTests(unittest.TestCase):
         self.assertEqual(next_extra["cookies"], "new_cookie=1")
         self.assertEqual(len(next_extra["chatgpt_workspace_variants"]), 2)
         self.assertEqual(next_extra["chatgpt_k12_manual_recapture"]["summary"]["saved_spaces"], 2)
+
+    def test_platform_actions_exposes_k12_workspace_recapture_for_action_column(self):
+        actions = ChatGPTPlatform(RegisterConfig()).get_platform_actions()
+        matched = [item for item in actions if item.get("id") == "k12_workspace_recapture"]
+        self.assertEqual(len(matched), 1)
+        self.assertTrue(matched[0].get("params"))
+
+    def test_action_wrapper_returns_changed_ids_for_batch_refresh(self):
+        from api import actions as actions_api
+
+        account = self._account()
+        mocked_result = {
+            "ok": True,
+            "summary": {"saved_spaces": 2},
+            "artifacts": [{"workspace_id": "ws-k12"}],
+            "saved_accounts": [{"id": 11}],
+            "changed_account_ids": [10, 11],
+            "logs": [],
+        }
+        with patch(
+            "services.chatgpt_core.k12_recapture.recapture_saved_account_k12_workspaces",
+            return_value=mocked_result,
+        ) as mocked_recapture:
+            result = actions_api._execute_chatgpt_k12_workspace_recapture_action(
+                account,
+                MagicMock(),
+                {"proxy_mode": "direct", "workspace_ids": "ws-k12"},
+            )
+        self.assertTrue(result["ok"])
+        self.assertIn("K12 / Workspace 重跑完成", result["data"]["message"])
+        self.assertEqual(result["data"]["changed_account_ids"], [10, 11])
+        mocked_recapture.assert_called_once()
+
+        refresh_ids = actions_api._action_local_status_refresh_ids(
+            "k12_workspace_recapture",
+            result,
+            account,
+        )
+        self.assertEqual(refresh_ids, [10, 11])
 
 
 if __name__ == "__main__":

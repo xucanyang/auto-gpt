@@ -1825,6 +1825,9 @@ export default function Accounts() {
   const [batchPaymentLinkForceRefresh, setBatchPaymentLinkForceRefresh] = useState(false)
   const [batchProbeStatusConfigOpen, setBatchProbeStatusConfigOpen] = useState(false)
   const [batchProbeStatusConfigScope, setBatchProbeStatusConfigScope] = useState<'selected' | 'all'>('selected')
+  const [batchK12RecaptureOpen, setBatchK12RecaptureOpen] = useState(false)
+  const [batchK12RecaptureScope, setBatchK12RecaptureScope] = useState<'selected' | 'filtered'>('selected')
+  const [batchK12RecaptureLoading, setBatchK12RecaptureLoading] = useState(false)
 
   const [registerForm] = Form.useForm()
   const [addForm] = Form.useForm()
@@ -1835,6 +1838,7 @@ export default function Accounts() {
   const [paypalBindingForm] = Form.useForm()
   const [batchPaymentLinkConfigForm] = Form.useForm()
   const [batchProbeStatusConfigForm] = Form.useForm()
+  const [batchK12RecaptureForm] = Form.useForm()
   const phoneBindingUsePoolValue = Form.useWatch('use_pool', phoneBindingTestForm)
   const phoneBindingPoolModeValue = Form.useWatch('phone_pool_mode', phoneBindingTestForm)
   const phoneBindingSelectedPrefixesValue = Form.useWatch('selected_prefixes', phoneBindingTestForm)
@@ -1847,6 +1851,8 @@ export default function Accounts() {
   const phoneBindingProxyFailoverValue = Form.useWatch('proxy_failover', phoneBindingTestForm)
   const probeProxyModeValue = Form.useWatch('proxy_mode', batchProbeStatusConfigForm)
   const probeProxyFailoverValue = Form.useWatch('proxy_failover', batchProbeStatusConfigForm)
+  const batchK12ProxyModeValue = Form.useWatch('proxy_mode', batchK12RecaptureForm)
+  const batchK12ProxyFailoverValue = Form.useWatch('proxy_failover', batchK12RecaptureForm)
   const baxiCdkUsePoolValue = Form.useWatch('use_pool', baxiCdkSubmitForm)
   const baxiCdkCodeLinesValue = Form.useWatch('code_lines', baxiCdkSubmitForm)
   const [registerMailProvider, setRegisterMailProvider] = useState('luckmail')
@@ -1917,7 +1923,6 @@ export default function Accounts() {
   const [batchGopayNextRoundAt, setBatchGopayNextRoundAt] = useState<number | null>(null)
   const [accessTokenCopiedAccountIds, setAccessTokenCopiedAccountIds] = useState<Set<number>>(() => new Set())
   const [codexUsageRefreshingIds, setCodexUsageRefreshingIds] = useState<Set<number>>(() => new Set())
-  const [recapturingK12AccountId, setRecapturingK12AccountId] = useState<number | null>(null)
   const batchGopayStartingRef = useRef(false)
   const batchGopayCancelRequestedRef = useRef(false)
   const accountsQuery = useAccountsQuery({
@@ -2037,49 +2042,6 @@ export default function Accounts() {
       })
     }
   }, [accountsQuery.refetch])
-
-  const recaptureK12Workspaces = useCallback(async (record: any, values: Record<string, any>) => {
-    const accountId = Number(record?.id || 0)
-    if (!Number.isFinite(accountId) || accountId <= 0) throw new Error('账号 ID 无效')
-    setRecapturingK12AccountId(accountId)
-    try {
-      const payload = {
-        workspace_ids: String(values?.workspace_ids || '').trim(),
-        save_all_spaces: values?.save_all_spaces !== false,
-        strict_join: Boolean(values?.strict_join),
-        proxy: String(values?.proxy || '').trim(),
-        join_timeout_seconds: Number(values?.join_timeout_seconds || 60),
-        join_retry_count: Number(values?.join_retry_count || 2),
-        post_join_poll_seconds: String(values?.post_join_poll_seconds || '3,8,15').trim(),
-      }
-      const result = await apiFetch(`/chatgpt/${accountId}/k12-workspaces/recapture`, {
-        method: 'POST',
-        body: JSON.stringify(payload),
-      })
-      const savedSpaces = Number(result?.summary?.saved_spaces || result?.artifacts?.length || 0)
-      const savedAccounts = Number(result?.saved_accounts?.length || 0)
-      if (result?.ok) {
-        message.success(`K12 / Workspace 已重新导出：${savedSpaces} 个空间，写入 ${savedAccounts} 个账号`)
-      } else {
-        message.warning(result?.summary?.accounts_check_error || 'K12 / Workspace 已执行，但存在部分失败')
-      }
-      await accountsQuery.refetch()
-      if (detailModalOpen && detailAccount?.id === accountId) {
-        try {
-          const latest = await apiFetch(`/accounts/${accountId}`)
-          setDetailAccount(normalizeAccount(latest))
-        } catch {
-          // 列表刷新已完成，详情刷新失败不阻断结果展示。
-        }
-      }
-      return result
-    } catch (e: any) {
-      message.error(e?.message || '重新进入/导出 K12 失败')
-      throw e
-    } finally {
-      setRecapturingK12AccountId(null)
-    }
-  }, [accountsQuery.refetch, detailAccount?.id, detailModalOpen])
 
   const loadConfigCache = useCallback(async (options: { force?: boolean } = {}) => {
     if (!options.force && configCache) return configCache
@@ -2911,6 +2873,89 @@ export default function Accounts() {
       delay_max_seconds: Number(values.register_delay_max_seconds ?? 0),
     }
     await handleBatchStatusSync('probe', batchProbeStatusConfigScope, customParams)
+  }
+
+  const openBatchK12Recapture = async () => {
+    const cfg = await loadConfigCache({ force: true }).catch(() => configCache || {})
+    const scope: 'selected' | 'filtered' = selectedRowKeys.length > 0 ? 'selected' : 'filtered'
+    setBatchK12RecaptureScope(scope)
+    batchK12RecaptureForm.resetFields()
+    batchK12RecaptureForm.setFieldsValue({
+      scope,
+      workspace_ids: '',
+      save_all_spaces: true,
+      strict_join: false,
+      join_timeout_seconds: 60,
+      join_retry_count: 2,
+      post_join_poll_seconds: '3,8,15',
+      delay_seconds: 0,
+      delay_max_seconds: 0,
+      ...taskProxySettingsFromConfig(cfg || {}, { proxy_mode: 'pool', proxy_failover: true }),
+    })
+    setBatchK12RecaptureOpen(true)
+  }
+
+  const submitBatchK12Recapture = async () => {
+    const values = await batchK12RecaptureForm.validateFields()
+    validateTaskProxySettings(values)
+    await saveTaskProxySettingsToConfig(values)
+    await loadConfigCache({ force: true }).catch(() => null)
+    const scope = (values.scope === 'filtered' ? 'filtered' : 'selected') as 'selected' | 'filtered'
+    const body: Record<string, unknown> = {
+      params: {
+        ...buildTaskProxyPayload(values),
+        workspace_ids: String(values.workspace_ids || '').trim(),
+        save_all_spaces: values.save_all_spaces !== false,
+        strict_join: Boolean(values.strict_join),
+        join_timeout_seconds: Number(values.join_timeout_seconds || 60),
+        join_retry_count: Number(values.join_retry_count || 2),
+        post_join_poll_seconds: String(values.post_join_poll_seconds || '3,8,15').trim(),
+        delay_seconds: Number(values.delay_seconds || 0),
+        delay_max_seconds: Number(values.delay_max_seconds || 0),
+      },
+    }
+    const scopeLabel = scope === 'selected' ? '所选账号' : '当前筛选账号'
+    const toastKey = `k12-recapture:${scope}`
+
+    if (scope === 'selected') {
+      const accountIds = Array.from(selectedRowKeys)
+        .map((value) => Number(value))
+        .filter((value) => Number.isInteger(value) && value > 0)
+      if (accountIds.length === 0) {
+        message.warning('请先选择要重新进入/导出 K12 的账号，或切换为当前筛选范围')
+        return
+      }
+      body.account_ids = accountIds
+    } else {
+      body.all_filtered = true
+      applyCurrentFiltersToBody(body)
+    }
+
+    setBatchK12RecaptureLoading(true)
+    setBatchK12RecaptureOpen(false)
+    message.loading({ content: `${scopeLabel} K12 / Workspace 重跑中...`, key: toastKey, duration: 0 })
+    try {
+      const result = await apiFetch('/actions/chatgpt/k12_workspace_recapture/batch', {
+        method: 'POST',
+        body: JSON.stringify(body),
+      })
+      if (!result.total) {
+        message.info({ content: '没有可处理的账号', key: toastKey })
+      } else if (!result.failed) {
+        message.success({ content: `${scopeLabel} K12 / Workspace 重跑完成：成功 ${result.success} / ${result.total}`, key: toastKey })
+      } else if (!result.success) {
+        message.error({ content: `${scopeLabel} K12 / Workspace 重跑失败：成功 ${result.success} / ${result.total}`, key: toastKey })
+      } else {
+        message.warning({ content: `${scopeLabel} K12 / Workspace 重跑部分完成：成功 ${result.success} / ${result.total}`, key: toastKey })
+      }
+      showBatchActionResult(`${scopeLabel} K12 / Workspace 重跑结果`, result)
+      await load()
+    } catch (e: any) {
+      message.error({ content: `K12 / Workspace 重跑失败: ${e.message}`, key: toastKey })
+      setBatchK12RecaptureOpen(true)
+    } finally {
+      setBatchK12RecaptureLoading(false)
+    }
   }
 
   const getResumeAuthScope = (): 'selected' | 'filtered' => (selectedRowKeys.length > 0 ? 'selected' : 'filtered')
@@ -5238,9 +5283,11 @@ export default function Accounts() {
     const commonActions = Array.isArray(platformActions) ? platformActions : []
     const paymentLinkAction = commonActions.find((action: any) => String(action?.id || '').trim().toLowerCase() === 'payment_link')
     const invalidRecheckAction = commonActions.find((action: any) => String(action?.id || '').trim().toLowerCase() === 'invalid_recheck')
+    const k12RecaptureAction = commonActions.find((action: any) => String(action?.id || '').trim().toLowerCase() === 'k12_workspace_recapture')
     const hiddenIds = new Set([
       paymentLinkAction ? String(paymentLinkAction.id) : '',
       invalidRecheckAction ? String(invalidRecheckAction.id) : '',
+      k12RecaptureAction ? String(k12RecaptureAction.id) : '',
       'probe_local_status',
       'resume_subscription_auth',
     ].filter(Boolean))
@@ -5301,6 +5348,7 @@ export default function Accounts() {
   const renderAccountActions = (record: any, compact = false) => {
     const commonActions = Array.isArray(platformActions) ? platformActions : []
     const paymentLinkAction = commonActions.find((action: any) => String(action?.id || '').trim().toLowerCase() === 'payment_link')
+    const k12RecaptureAction = commonActions.find((action: any) => String(action?.id || '').trim().toLowerCase() === 'k12_workspace_recapture')
     const showResumeAuth = isChatgptPlatform && shouldShowResumeAuthButton(record)
     const showInvalidRecheck = isChatgptPlatform && shouldShowInvalidRecheckButton(record)
     const moreMenuItems = buildAccountMoreMenuItems(record)
@@ -5341,6 +5389,11 @@ export default function Accounts() {
           {showInvalidRecheck ? (
             <Button size="small" style={mobileActionButtonStyle(accountActionTextStyles.resume)} onClick={() => handleInvalidRecheck(record)}>
               失效测活
+            </Button>
+          ) : null}
+          {k12RecaptureAction ? (
+            <Button size="small" style={mobileActionButtonStyle(accountActionTextStyles.refresh)} onClick={() => openAccountInlineAction(record, 'k12_workspace_recapture', 'dialog')}>
+              K12重跑
             </Button>
           ) : null}
           <Dropdown
@@ -5409,6 +5462,16 @@ export default function Accounts() {
               onClick={() => handleInvalidRecheck(record)}
             >
               失效测活
+            </Button>
+          ) : null}
+          {k12RecaptureAction ? (
+            <Button
+              type="link"
+              size="small"
+              style={accountActionTextStyles.refresh}
+              onClick={() => openAccountInlineAction(record, 'k12_workspace_recapture', 'dialog')}
+            >
+              K12重跑
             </Button>
           ) : null}
           <Dropdown
@@ -6421,11 +6484,13 @@ export default function Accounts() {
         batchGopayLoading={batchGopayLoading}
         batchPaymentLinkLoading={batchPaymentLinkLoading}
         batchInvalidRecheckLoading={batchInvalidRecheckLoading}
+        batchK12RecaptureLoading={batchK12RecaptureLoading}
         phoneBindingTestLoading={phoneBindingTestLoading}
         paypalBindingLoading={paypalBindingLoading}
         baxiCdkSubmitLoading={baxiCdkSubmitLoading}
         onBatchPaymentLink={handleBatchPaymentLink}
         onBatchInvalidRecheck={handleBatchInvalidRecheck}
+        onOpenBatchK12Recapture={() => { void openBatchK12Recapture() }}
         onOpenPhoneBindingTest={() => { void openPhoneBindingTest() }}
         onOpenPaypalBinding={openPaypalBinding}
         onOpenBaxiCdkSubmit={openBaxiCdkSubmit}
@@ -6773,6 +6838,130 @@ export default function Accounts() {
           {probeProxyModeValue !== 'direct' && (
             <Form.Item name="proxy_failover" valuePropName="checked" initialValue={false}>
               <Checkbox>{probeProxyModeValue === 'dynamic' ? '失败后刷新 sid 重试' : '使用多个候选代理，遇到网络失败时自动切换'}</Checkbox>
+            </Form.Item>
+          )}
+        </Form>
+      </Modal>
+
+      <Modal
+        title="批量重新进入并导出 K12 / Workspace"
+        open={batchK12RecaptureOpen}
+        onCancel={() => setBatchK12RecaptureOpen(false)}
+        onOk={submitBatchK12Recapture}
+        confirmLoading={batchK12RecaptureLoading}
+        okText="开始重跑"
+        cancelText="取消"
+        width={760}
+        maskClosable={false}
+      >
+        <Form form={batchK12RecaptureForm} layout="vertical">
+          <Alert
+            type="warning"
+            showIcon
+            style={{ marginBottom: 16 }}
+            message={
+              batchK12RecaptureScope === 'selected'
+                ? `范围：当前选中 ${selectedRowKeys.length} 个账号`
+                : `范围：当前筛选结果 ${total} 个账号`
+            }
+            description="复用每个账号已保存的 AccessToken + cookies/session_token，重新 join K12、拉取 accounts/check 空间并写回 workspace variants；不会在结果里展示 token/cookies 原文。"
+          />
+          <Form.Item name="scope" label="账号范围" initialValue={batchK12RecaptureScope}>
+            <Select
+              value={batchK12RecaptureScope}
+              onChange={(value) => {
+                setBatchK12RecaptureScope(value)
+                batchK12RecaptureForm.setFieldsValue({ scope: value })
+              }}
+              options={[
+                { value: 'selected', label: `当前选中账号（${selectedRowKeys.length}）`, disabled: selectedRowKeys.length === 0 },
+                { value: 'filtered', label: `当前筛选账号（${total}）` },
+              ]}
+            />
+          </Form.Item>
+          <Form.Item
+            name="workspace_ids"
+            label="目标 K12 workspace_id"
+            extra="留空时只导出当前可见空间；多个 ID 支持换行、逗号或空格分隔。"
+          >
+            <Input.TextArea rows={4} placeholder={'ws_xxx\nws_yyy'} />
+          </Form.Item>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 12 }}>
+            <Form.Item name="save_all_spaces" valuePropName="checked">
+              <Checkbox>同时导出所有可见空间</Checkbox>
+            </Form.Item>
+            <Form.Item name="strict_join" valuePropName="checked">
+              <Checkbox>严格 join（失败即异常）</Checkbox>
+            </Form.Item>
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 12 }}>
+            <Form.Item name="join_timeout_seconds" label="Join 超时秒数">
+              <InputNumber min={5} max={180} precision={0} style={{ width: '100%' }} />
+            </Form.Item>
+            <Form.Item name="join_retry_count" label="Join 重试次数">
+              <InputNumber min={0} max={5} precision={0} style={{ width: '100%' }} />
+            </Form.Item>
+            <Form.Item name="post_join_poll_seconds" label="Join 后轮询秒">
+              <Input placeholder="3,8,15" />
+            </Form.Item>
+          </div>
+          <Form.Item label="账号间延时 (秒)">
+            <Space style={{ display: 'flex' }}>
+              <Form.Item name="delay_seconds" noStyle initialValue={0}>
+                <InputNumber min={0} max={3600} step={1} style={{ width: 140 }} placeholder="最小延时" />
+              </Form.Item>
+              <span>至</span>
+              <Form.Item name="delay_max_seconds" noStyle initialValue={0}>
+                <InputNumber min={0} max={3600} step={1} style={{ width: 140 }} placeholder="最大延时" />
+              </Form.Item>
+              <span style={{ color: '#888', marginLeft: 8 }}>（都填 0 为无延时，填不同数值则在区间内随机）</span>
+            </Space>
+          </Form.Item>
+          <Form.Item label="代理模式" name="proxy_mode" initialValue="pool">
+            <Select style={{ width: 260 }}>
+              <Select.Option value="pool">代理池自动选取</Select.Option>
+              <Select.Option value="specified">手动指定代理</Select.Option>
+              <Select.Option value="dynamic">动态代理</Select.Option>
+              <Select.Option value="direct">直连 (不使用代理)</Select.Option>
+            </Select>
+          </Form.Item>
+
+          {(batchK12ProxyModeValue === 'specified' || batchK12ProxyModeValue === 'dynamic') && (
+            <Form.Item
+              label={batchK12ProxyModeValue === 'dynamic' ? '动态代理模板（可选覆盖）' : '代理地址'}
+              name="proxy"
+              rules={batchK12ProxyModeValue === 'specified' ? [{ required: true, message: '请输入代理地址' }] : undefined}
+              extra={batchK12ProxyModeValue === 'dynamic' ? '留空使用全局动态代理模板；填写后仅本次重跑覆盖全局模板。' : undefined}
+            >
+              <Input placeholder={batchK12ProxyModeValue === 'dynamic' ? '可留空；或填 socks5://user-region-JP-sid-xxxx-t-15:pass@host:port' : 'http://user:pass@host:port 或 socks5://...'} />
+            </Form.Item>
+          )}
+
+          {(batchK12ProxyModeValue === 'pool' || batchK12ProxyModeValue === 'dynamic' || (batchK12ProxyModeValue === 'specified' && batchK12ProxyFailoverValue)) && (
+            <Space style={{ display: 'flex', flexWrap: 'wrap', gap: 16 }} align="baseline">
+              <Form.Item
+                label="目标国家 (ISO 缩写)"
+                name="proxy_country_code"
+                rules={batchK12ProxyModeValue === 'dynamic' ? [{ required: true, message: '请输入动态代理出口国家' }] : undefined}
+              >
+                <Input style={{ width: 140 }} placeholder={batchK12ProxyModeValue === 'dynamic' ? '必填，如 US' : '如 US, JP, 不填则不限'} />
+              </Form.Item>
+              {batchK12ProxyModeValue !== 'dynamic' ? (
+                <>
+                  <Form.Item label="最低健康度分数" name="proxy_min_score" initialValue={50}>
+                    <InputNumber min={0} max={100} step={5} style={{ width: 140 }} />
+                  </Form.Item>
+                  <Form.Item label="候选代理数量" name="proxy_max_candidates" initialValue={5}>
+                    <InputNumber min={1} max={20} step={1} style={{ width: 140 }} />
+                  </Form.Item>
+                </>
+              ) : null}
+            </Space>
+          )}
+
+          {batchK12ProxyModeValue !== 'direct' && (
+            <Form.Item name="proxy_failover" valuePropName="checked" initialValue={true}>
+              <Checkbox>{batchK12ProxyModeValue === 'dynamic' ? '失败后刷新 sid 重试' : '使用多个候选代理，遇到网络失败时自动切换'}</Checkbox>
             </Form.Item>
           )}
         </Form>
@@ -7692,8 +7881,6 @@ export default function Accounts() {
         onCopyAccessToken={copyAccessToken}
         onCopySecret={copyAccountSecret}
         onFetchSecret={fetchAccountSecrets}
-        onRecaptureK12={recaptureK12Workspaces}
-        recapturingK12AccountId={recapturingK12AccountId}
         isAccessTokenCopied={(record) => {
           const accountId = Number(record?.id || 0)
           return accountId > 0 && accessTokenCopiedAccountIds.has(accountId)

@@ -483,6 +483,18 @@ class ChatGPTPlatform(BasePlatform):
     def get_platform_actions(self) -> list:
         return [
             {"id": "probe_local_status", "label": "探测本地状态", "params": []},
+            {
+                "id": "k12_workspace_recapture",
+                "label": "重新进入/导出 K12",
+                "params": [
+                    {
+                        "key": "workspace_ids",
+                        "label": "目标 K12 workspace_id",
+                        "type": "textarea",
+                        "default": "",
+                    }
+                ],
+            },
             {"id": "sync_cliproxyapi_status", "label": "同步 CLIProxyAPI 状态", "params": []},
             {"id": "sync_sub2api_status", "label": "同步 Sub2API 状态", "params": []},
             {"id": "sync_oaipay_status", "label": "同步 OAIPay 状态", "params": []},

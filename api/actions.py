@@ -26,6 +26,7 @@ _LOCAL_STATUS_AUTH_ACTION_IDS = {
     "refresh_token",
     "resume_subscription_auth",
     "invalid_recheck",
+    "k12_workspace_recapture",
 }
 _LOCAL_STATUS_AUTH_PATCH_KEYS = {
     "access_token",
@@ -219,6 +220,30 @@ def _action_should_auto_refresh_local_status(action_id: str, result: dict[str, A
     return False
 
 
+def _action_local_status_refresh_ids(action_id: str, result: dict[str, Any], acc_model: AccountModel) -> list[int]:
+    """Return all ChatGPT account IDs whose local status should be refreshed after an action commit."""
+    if not bool(result.get("ok")):
+        return []
+    ids: list[int] = []
+    data = result.get("data") if isinstance(result.get("data"), dict) else {}
+    if str(action_id or "") == "k12_workspace_recapture":
+        for raw in data.get("changed_account_ids") or []:
+            try:
+                value = int(raw)
+            except Exception:
+                continue
+            if value > 0 and value not in ids:
+                ids.append(value)
+    if _action_should_auto_refresh_local_status(action_id, result, acc_model):
+        try:
+            value = int(acc_model.id or 0)
+        except Exception:
+            value = 0
+        if value > 0 and value not in ids:
+            ids.append(value)
+    return ids
+
+
 def _execute_chatgpt_resume_subscription_auth(
     acc_model: AccountModel,
     *,
@@ -366,6 +391,162 @@ def _execute_chatgpt_invalid_recheck_action(
     return result
 
 
+def _bounded_int(value: Any, *, default: int, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(float(str(value or "").strip()))
+    except Exception:
+        parsed = int(default)
+    return max(minimum, min(maximum, parsed))
+
+
+def _chatgpt_k12_recapture_config(params: dict[str, Any] | None = None) -> dict[str, Any]:
+    from services.chatgpt_core.k12_recapture import K12_RECAPTURE_CONFIG_KEYS
+
+    params = params or {}
+    config = {key: config_store.get(key, "") for key in K12_RECAPTURE_CONFIG_KEYS}
+    if params.get("join_timeout_seconds") not in (None, ""):
+        config["chatgpt_k12_join_timeout_seconds"] = _bounded_int(
+            params.get("join_timeout_seconds"),
+            default=60,
+            minimum=5,
+            maximum=180,
+        )
+    if params.get("join_retry_count") not in (None, ""):
+        config["chatgpt_k12_join_retry_count"] = _bounded_int(
+            params.get("join_retry_count"),
+            default=2,
+            minimum=0,
+            maximum=5,
+        )
+    if params.get("post_join_poll_seconds") not in (None, ""):
+        config["chatgpt_k12_post_join_poll_seconds"] = str(params.get("post_join_poll_seconds") or "")
+    return config
+
+
+def _chatgpt_k12_recapture_message(result: dict[str, Any]) -> str:
+    summary = result.get("summary") if isinstance(result.get("summary"), dict) else {}
+    try:
+        saved_spaces = int(summary.get("saved_spaces") or len(result.get("artifacts") or []) or 0)
+    except Exception:
+        saved_spaces = len(result.get("artifacts") or [])
+    saved_accounts = len(result.get("saved_accounts") or [])
+    changed_ids = len(result.get("changed_account_ids") or [])
+    if bool(result.get("ok")):
+        return f"K12 / Workspace 重跑完成：导出 {saved_spaces} 个空间，写入 {saved_accounts} 个账号，变更 {changed_ids} 个账号"
+    error_text = str(
+        summary.get("accounts_check_error")
+        or summary.get("error")
+        or result.get("error")
+        or "未导出有效 workspace"
+    ).strip()
+    return f"K12 / Workspace 重跑未完全成功：导出 {saved_spaces} 个空间，写入 {saved_accounts} 个账号；{error_text}"
+
+
+def _execute_chatgpt_k12_workspace_recapture_action(
+    acc_model: AccountModel,
+    session: Session,
+    params: dict | None = None,
+) -> dict[str, Any]:
+    from core.proxy_utils import is_proxy_error_text, resolve_probe_candidate_proxies
+    from services.chatgpt_core.k12_recapture import recapture_saved_account_k12_workspaces
+    from services.chatgpt_core.k12_workspace import safe_k12_error
+
+    params = params or {}
+    config = _chatgpt_k12_recapture_config(params)
+    candidates = resolve_probe_candidate_proxies(
+        params,
+        fallback_proxy=None,
+        default_mode="direct",
+    )
+    last_error = ""
+    last_data: dict[str, Any] = {}
+
+    for idx, (proxy_url, proxy_pool, source) in enumerate(candidates):
+        proxy_text = str(proxy_url or "").strip()
+        source_text = str(source or ("specified" if proxy_text else "direct")).strip()
+        try:
+            result = recapture_saved_account_k12_workspaces(
+                session=session,
+                account=acc_model,
+                config=config,
+                workspace_ids=params.get("workspace_ids"),
+                save_all_spaces=params.get("save_all_spaces") is not False,
+                strict_join=_to_bool(params.get("strict_join"), default=False),
+                proxy=proxy_text,
+            )
+            data = dict(result)
+            data["proxy_source"] = source_text
+            data["proxy_used"] = bool(proxy_text)
+            data["message"] = _chatgpt_k12_recapture_message(data)
+            ok = bool(data.get("ok"))
+            error_text = "" if ok else str(
+                (data.get("summary") if isinstance(data.get("summary"), dict) else {}).get("accounts_check_error")
+                or (data.get("summary") if isinstance(data.get("summary"), dict) else {}).get("error")
+                or data.get("message")
+                or "K12 / Workspace 重跑未产生有效空间"
+            )
+            if ok and proxy_pool is not None and proxy_text:
+                try:
+                    proxy_pool.report_success(proxy_text)
+                except Exception:
+                    pass
+            if not ok and proxy_pool is not None and proxy_text and is_proxy_error_text(error_text):
+                try:
+                    proxy_pool.report_fail(proxy_text)
+                except Exception:
+                    pass
+            if not ok and idx < len(candidates) - 1 and is_proxy_error_text(error_text):
+                last_error = safe_k12_error(error_text, 300)
+                last_data = data
+                continue
+            return {
+                "ok": ok,
+                "data": data,
+                "error": "" if ok else safe_k12_error(error_text, 300),
+            }
+        except ValueError as exc:
+            error_text = safe_k12_error(exc, 300)
+            return {
+                "ok": False,
+                "data": {
+                    "message": f"K12 / Workspace 重跑失败：{error_text}",
+                    "proxy_source": source_text,
+                    "proxy_used": bool(proxy_text),
+                },
+                "error": error_text,
+            }
+        except Exception as exc:
+            error_text = safe_k12_error(exc, 300)
+            if proxy_pool is not None and proxy_text and is_proxy_error_text(error_text):
+                try:
+                    proxy_pool.report_fail(proxy_text)
+                except Exception:
+                    pass
+            if idx < len(candidates) - 1 and is_proxy_error_text(error_text):
+                last_error = error_text
+                last_data = {
+                    "message": f"K12 / Workspace 重跑失败，已尝试切换代理：{error_text}",
+                    "proxy_source": source_text,
+                    "proxy_used": bool(proxy_text),
+                }
+                continue
+            return {
+                "ok": False,
+                "data": {
+                    "message": f"K12 / Workspace 重跑失败：{error_text}",
+                    "proxy_source": source_text,
+                    "proxy_used": bool(proxy_text),
+                },
+                "error": error_text,
+            }
+
+    return {
+        "ok": False,
+        "data": last_data or {"message": "K12 / Workspace 重跑失败"},
+        "error": last_error or "K12 / Workspace 重跑失败",
+    }
+
+
 def _execute_platform_action(
     instance: Any,
     platform: str,
@@ -379,6 +560,9 @@ def _execute_platform_action(
 
     if platform == "chatgpt" and action_id == "invalid_recheck":
         return _execute_chatgpt_invalid_recheck_action(acc_model, session, params)
+
+    if platform == "chatgpt" and action_id == "k12_workspace_recapture":
+        return _execute_chatgpt_k12_workspace_recapture_action(acc_model, session, params)
 
     if platform == "chatgpt" and action_id == "upload_sub2api":
         outcome = backfill_chatgpt_account_to_sub2api(acc_model, session=session, commit=False)
@@ -678,10 +862,8 @@ def execute_batch_action(
 
         try:
             result = _execute_platform_action(instance, platform, acc_model, action_id, body.params, session)
-            if platform == "chatgpt" and _action_should_auto_refresh_local_status(action_id, result, acc_model):
-                account_id_value = int(acc_model.id or 0)
-                if account_id_value > 0:
-                    local_status_auto_refresh_ids.append(account_id_value)
+            if platform == "chatgpt":
+                local_status_auto_refresh_ids.extend(_action_local_status_refresh_ids(action_id, result, acc_model))
             ok = bool(result.get("ok"))
             if ok:
                 success_count += 1
@@ -738,10 +920,10 @@ def execute_action(
 
     try:
         result = _execute_platform_action(instance, platform, acc_model, action_id, body.params, session)
-        should_refresh_local_status = _action_should_auto_refresh_local_status(action_id, result, acc_model)
+        local_status_auto_refresh_ids = _action_local_status_refresh_ids(action_id, result, acc_model)
         session.commit()
-        if should_refresh_local_status:
-            schedule_chatgpt_local_status_refresh_for_account_id(acc_model.id, reason=f"action:{action_id}")
+        for account_id_value in dict.fromkeys(local_status_auto_refresh_ids):
+            schedule_chatgpt_local_status_refresh_for_account_id(account_id_value, reason=f"action:{action_id}")
         return result
     except NotImplementedError as e:
         raise HTTPException(400, str(e))

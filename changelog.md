@@ -8,6 +8,22 @@
 
 
 
+## [1.3.12] - 2026-07-06
+### 新增 (Added)
+- **K12 重捕获接入账号操作列**：`services/chatgpt_core/plugin.py` 新增 `k12_workspace_recapture` 平台操作，`frontend/src/pages/Accounts.tsx` 在账号列表“操作”列直接提供 `K12重跑` 入口；执行面板统一走 `frontend/src/features/accounts/components/AccountActionSurface.tsx`，不再藏在账号详情页，避免用户必须打开详情抽屉才能重跑空间导出。
+- **批量 K12 / Workspace 重跑**：`frontend/src/features/accounts/components/AccountsToolbar.tsx` 与 `frontend/src/pages/Accounts.tsx` 新增“批量K12重跑”工具栏入口，支持当前选中账号或当前筛选结果，参数包含 workspace_id、是否导出所有可见空间、严格 join、Join 超时/重试/轮询以及账号间随机延时；后端复用 `POST /api/actions/chatgpt/k12_workspace_recapture/batch`，逐账号返回成功/失败摘要并刷新列表。
+
+### 优化 (Changed)
+- **K12 重捕获代理配置统一为四模式**：单账号操作面板与批量弹窗均改为和注册/本地状态同步一致的 `direct` / `specified` / `pool` / `dynamic` 四种代理模式，支持代理池国家、健康度、候选数量、指定代理失败切换，以及动态代理模板/出口国家；`api/actions.py` 使用 `core.proxy_utils.resolve_probe_candidate_proxies()` 统一解析候选代理并在网络类失败时自动 failover。
+- **详情页回归只读摘要职责**：`frontend/src/features/accounts/components/AccountDetailModal.tsx` 移除 K12 重跑按钮和单独弹窗，只保留 Workspace variants 脱敏摘要，并提示用户从列表操作列执行，避免详情页和操作列出现两套不一致入口。
+- **同步前端版本号至 v1.3.12**：`frontend/src/app/AppShell.tsx` 侧边栏版本展示更新为 `v1.3.12`，用于上线后确认操作列入口、四模式代理和批量重跑配置已加载。
+
+### 修复 (Fixed)
+- **批量执行后刷新所有变更账号状态**：`api/actions.py` 对 `k12_workspace_recapture` 返回的 `changed_account_ids` 逐个调度本地状态刷新，覆盖当前账号与新建/更新的 workspace variant 账号，避免只刷新发起账号导致列表状态短期不一致。
+
+### 测试 (Tests)
+- **补充 K12 action 回归测试**：`tests/test_chatgpt_k12_recapture.py` 新增平台操作暴露与 action wrapper changed IDs 测试，确保列表操作列/批量入口能发现 `k12_workspace_recapture`，并能把重捕获写入的账号 ID 传递给后续状态刷新。
+
 ## [1.3.11] - 2026-07-06
 ### 新增 (Added)
 - **已保存 ChatGPT 凭证支持手动重跑 K12 / Workspace 捕获**：`api/chatgpt.py` 新增 `POST /api/chatgpt/{account_id}/k12-workspaces/recapture`，复用账号库中已保存的 `access_token`、`session_token` 与完整 `cookies`，重新执行 K12 workspace join、`accounts/check` 空间列表拉取与 workspace token exchange；用于原 K12 空间失效后重新进入新空间，并把当前可进入空间重新导出为 workspace variants。
@@ -508,4 +524,8 @@
 
 ## 2026-07-06 05:27:33 +0800
 - 新增已保存凭证重跑 K12 workspace 捕获
+- 发布模式: multi
+
+## 2026-07-06 05:48:35 +0800
+- 修正 K12 重捕获入口代理模式和批量操作
 - 发布模式: multi

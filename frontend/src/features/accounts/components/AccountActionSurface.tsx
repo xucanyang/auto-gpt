@@ -30,6 +30,7 @@ import {
   splitGopayPhoneInput,
 } from '@/lib/gopayPhone'
 import { apiFetch } from '@/lib/utils'
+import { buildTaskProxyPayload, taskProxySettingsFromConfig, validateTaskProxySettings } from '@/lib/taskProxySettings'
 
 const { Text } = Typography
 
@@ -380,6 +381,8 @@ export function AccountActionSurface({
   const [browserAuthText, setBrowserAuthText] = useState('')
   const [browserAuthProxy, setBrowserAuthProxy] = useState('')
   const [browserAuthFreshProfile, setBrowserAuthFreshProfile] = useState(true)
+  const actionProxyModeValue = Form.useWatch('proxy_mode', actionForm)
+  const actionProxyFailoverValue = Form.useWatch('proxy_failover', actionForm)
   const autoHandledActionRef = useRef('')
   const paymentLinkRefreshTimerRef = useRef<number | null>(null)
   const initialActionKey = String(initialActionId || '').trim()
@@ -1294,6 +1297,25 @@ export function AccountActionSurface({
       setActionOpen(true)
       return
     }
+    if (action.id === 'k12_workspace_recapture') {
+      let cfg: Record<string, any> = {}
+      try {
+        cfg = await apiFetch('/config')
+      } catch {
+        cfg = {}
+      }
+      actionForm.setFieldsValue({
+        workspace_ids: '',
+        save_all_spaces: true,
+        strict_join: false,
+        join_timeout_seconds: 60,
+        join_retry_count: 2,
+        post_join_poll_seconds: '3,8,15',
+        ...taskProxySettingsFromConfig(cfg || {}, { proxy_mode: 'pool', proxy_failover: true }),
+      })
+      setActionOpen(true)
+      return
+    }
     const initialValues: Record<string, any> = {}
     for (const param of action.params || []) {
       if (param.default !== undefined) initialValues[param.key] = param.default
@@ -1327,6 +1349,17 @@ export function AccountActionSurface({
       if (params.save_defaults) {
         await savePaymentLinkGlobalDefaults(params)
       }
+    }
+    if (activeAction.id === 'k12_workspace_recapture') {
+      validateTaskProxySettings(values)
+      Object.assign(params, buildTaskProxyPayload(values), {
+        workspace_ids: String(values.workspace_ids || '').trim(),
+        save_all_spaces: values.save_all_spaces !== false,
+        strict_join: Boolean(values.strict_join),
+        join_timeout_seconds: Number(values.join_timeout_seconds || 60),
+        join_retry_count: Number(values.join_retry_count || 2),
+        post_join_poll_seconds: String(values.post_join_poll_seconds || '3,8,15').trim(),
+      })
     }
     setActionOpen(false)
     await runAction(activeAction, params)
@@ -1544,6 +1577,92 @@ export function AccountActionSurface({
           <Form.Item name="save_defaults" valuePropName="checked" style={{ marginBottom: 0 }}>
             <Checkbox>保存本次订阅链接配置</Checkbox>
           </Form.Item>
+        </>
+      )
+    }
+
+    if (activeAction.id === 'k12_workspace_recapture') {
+      const proxyMode = String(actionProxyModeValue || actionForm.getFieldValue('proxy_mode') || 'pool')
+      const proxyFailover = Boolean(actionProxyFailoverValue)
+      return (
+        <>
+          <Alert
+            type="warning"
+            showIcon
+            style={{ marginBottom: 12 }}
+            message="复用当前账号已保存的 AccessToken + cookies/session_token"
+            description="会重新执行 K12 join、拉取 accounts/check 空间列表并交换 workspace AccessToken；结果写回当前账号与 workspace variant 账号，弹窗结果只展示脱敏摘要。"
+          />
+          <Form.Item
+            name="workspace_ids"
+            label="目标 K12 workspace_id"
+            extra="留空时只导出当前可见空间；多个 ID 支持换行、逗号或空格分隔。"
+          >
+            <Input.TextArea rows={4} placeholder={'ws_xxx\nws_yyy'} />
+          </Form.Item>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 12 }}>
+            <Form.Item name="save_all_spaces" valuePropName="checked">
+              <Checkbox>同时导出所有可见空间</Checkbox>
+            </Form.Item>
+            <Form.Item name="strict_join" valuePropName="checked">
+              <Checkbox>严格 join（失败即异常）</Checkbox>
+            </Form.Item>
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 12 }}>
+            <Form.Item name="join_timeout_seconds" label="Join 超时秒数">
+              <InputNumber min={5} max={180} precision={0} style={{ width: '100%' }} />
+            </Form.Item>
+            <Form.Item name="join_retry_count" label="Join 重试次数">
+              <InputNumber min={0} max={5} precision={0} style={{ width: '100%' }} />
+            </Form.Item>
+            <Form.Item name="post_join_poll_seconds" label="Join 后轮询秒">
+              <Input placeholder="3,8,15" />
+            </Form.Item>
+          </div>
+          <Form.Item label="代理模式" name="proxy_mode">
+            <Select style={{ width: 260 }}>
+              <Select.Option value="pool">代理池自动选取</Select.Option>
+              <Select.Option value="specified">手动指定代理</Select.Option>
+              <Select.Option value="dynamic">动态代理</Select.Option>
+              <Select.Option value="direct">直连 (不使用代理)</Select.Option>
+            </Select>
+          </Form.Item>
+          {(proxyMode === 'specified' || proxyMode === 'dynamic') && (
+            <Form.Item
+              label={proxyMode === 'dynamic' ? '动态代理模板（可选覆盖）' : '代理地址'}
+              name="proxy"
+              rules={proxyMode === 'specified' ? [{ required: true, message: '请输入代理地址' }] : undefined}
+              extra={proxyMode === 'dynamic' ? '留空使用全局动态代理模板；填写后仅本次重跑覆盖全局模板。' : undefined}
+            >
+              <Input placeholder={proxyMode === 'dynamic' ? '可留空；或填 socks5://user-region-JP-sid-xxxx-t-15:pass@host:port' : 'http://user:pass@host:port 或 socks5://...'} />
+            </Form.Item>
+          )}
+          {(proxyMode === 'pool' || proxyMode === 'dynamic' || (proxyMode === 'specified' && proxyFailover)) && (
+            <Space style={{ display: 'flex', flexWrap: 'wrap', gap: 16 }} align="baseline">
+              <Form.Item
+                label="目标国家 (ISO 缩写)"
+                name="proxy_country_code"
+                rules={proxyMode === 'dynamic' ? [{ required: true, message: '请输入动态代理出口国家' }] : undefined}
+              >
+                <Input style={{ width: 140 }} placeholder={proxyMode === 'dynamic' ? '必填，如 US' : '如 US, JP, 不填则不限'} />
+              </Form.Item>
+              {proxyMode !== 'dynamic' ? (
+                <>
+                  <Form.Item label="最低健康度分数" name="proxy_min_score">
+                    <InputNumber min={0} max={100} step={5} style={{ width: 140 }} />
+                  </Form.Item>
+                  <Form.Item label="候选代理数量" name="proxy_max_candidates">
+                    <InputNumber min={1} max={20} step={1} style={{ width: 140 }} />
+                  </Form.Item>
+                </>
+              ) : null}
+            </Space>
+          )}
+          {proxyMode !== 'direct' && (
+            <Form.Item name="proxy_failover" valuePropName="checked">
+              <Checkbox>{proxyMode === 'dynamic' ? '失败后刷新 sid 重试' : '使用多个候选代理，遇到网络失败时自动切换'}</Checkbox>
+            </Form.Item>
+          )}
         </>
       )
     }

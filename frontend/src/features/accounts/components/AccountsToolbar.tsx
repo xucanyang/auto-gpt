@@ -32,11 +32,13 @@ type AccountsToolbarProps = {
   batchGopayLoading: boolean
   batchPaymentLinkLoading: boolean
   batchInvalidRecheckLoading: boolean
+  batchK12RecaptureLoading: boolean
   phoneBindingTestLoading: boolean
   paypalBindingLoading: boolean
   baxiCdkSubmitLoading: boolean
   onBatchPaymentLink: (options?: { forceRefresh?: boolean }) => void
   onBatchInvalidRecheck: () => void
+  onOpenBatchK12Recapture: () => void
   onOpenPhoneBindingTest: () => void
   onOpenPaypalBinding: () => void
   onOpenBaxiCdkSubmit: () => void
@@ -76,11 +78,13 @@ export function AccountsToolbar({
   batchGopayLoading,
   batchPaymentLinkLoading,
   batchInvalidRecheckLoading,
+  batchK12RecaptureLoading,
   phoneBindingTestLoading,
   paypalBindingLoading,
   baxiCdkSubmitLoading,
   onBatchPaymentLink,
   onBatchInvalidRecheck,
+  onOpenBatchK12Recapture,
   onOpenPhoneBindingTest,
   onOpenPaypalBinding,
   onOpenBaxiCdkSubmit,
@@ -203,6 +207,16 @@ export function AccountsToolbar({
                 onClick={onBatchInvalidRecheck}
               >
                 批量失效测活
+              </Button>
+              <Button
+                block={isMobile}
+                style={buttonStyle}
+                icon={batchK12RecaptureLoading ? <SyncOutlined spin /> : <SyncOutlined />}
+                loading={batchK12RecaptureLoading}
+                disabled={selectedRowKeys.length === 0 && total === 0}
+                onClick={onOpenBatchK12Recapture}
+              >
+                批量K12重跑
               </Button>
               <Button
                 block={isMobile}
