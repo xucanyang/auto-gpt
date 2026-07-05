@@ -150,14 +150,18 @@ class EmailServiceAdapter:
 
         while time.monotonic() < deadline:
             remaining = max(1, int(deadline - time.monotonic()))
-            code = self.email_service.get_verification_code(
-                email=email,
-                timeout=remaining,
-                otp_sent_at=otp_sent_at,
-                exclude_codes=excluded_codes | used_codes,
-                phase=phase_key,
-                phase_label=phase_title,
-            )
+            try:
+                code = self.email_service.get_verification_code(
+                    email=email,
+                    timeout=remaining,
+                    otp_sent_at=otp_sent_at,
+                    exclude_codes=excluded_codes | used_codes,
+                    phase=phase_key,
+                    phase_label=phase_title,
+                )
+            except TimeoutError as exc:
+                self._log(f"[验证码] {phase_title} 等待超时: {exc}", "debug")
+                return None
             if not code:
                 return code
 

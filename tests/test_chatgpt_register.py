@@ -14,11 +14,13 @@ sys.modules.setdefault("smstome_tool", smstome_tool_stub)
 
 from services.chatgpt_core.oauth_client import OAuthClient
 from services.chatgpt_core.refresh_token_registration_engine import (
+    EmailServiceAdapter,
     RefreshTokenRegistrationEngine,
     RegistrationResult,
 )
 from services.chatgpt_core.utils import FlowState
 from core.task_runtime import SkipCurrentAttemptRequested
+from services.chatgpt_core.chatgpt_client import ChatGPTClient
 
 
 class DummyEmailService:
@@ -29,6 +31,33 @@ class DummyEmailService:
 
     def get_verification_code(self, **kwargs):
         return "123456"
+
+
+class TimeoutEmailService(DummyEmailService):
+    def __init__(self):
+        self.calls = []
+
+    def get_verification_code(self, **kwargs):
+        self.calls.append(kwargs)
+        raise TimeoutError("等待 Email API 验证码超时 (60s)")
+
+
+class _FakeOtpSendResponse:
+    status_code = 200
+    url = "https://auth.openai.com/email-verification"
+    text = '{"page":{"type":"email_otp_verification"}}'
+
+    def json(self):
+        return {"page": {"type": "email_otp_verification"}}
+
+
+class _FakeOtpSession:
+    def __init__(self):
+        self.calls = []
+
+    def get(self, url, **kwargs):
+        self.calls.append((url, kwargs))
+        return _FakeOtpSendResponse()
 
 
 class RefreshTokenRegistrationEngineTests(unittest.TestCase):
@@ -57,6 +86,40 @@ class RefreshTokenRegistrationEngineTests(unittest.TestCase):
             max_retries=1,
             **kwargs,
         )
+
+    def test_email_adapter_returns_none_on_mailbox_timeout_for_resend_path(self):
+        service = TimeoutEmailService()
+        logs = []
+        adapter = EmailServiceAdapter(service, "user@example.com", lambda msg, *_: logs.append(str(msg)))
+
+        code = adapter.wait_for_verification_code(
+            "user@example.com",
+            timeout=60,
+            phase="register_email_otp",
+            phase_label="注册阶段邮箱验证码",
+        )
+
+        self.assertIsNone(code)
+        self.assertEqual(len(service.calls), 1)
+        self.assertEqual(service.calls[0]["phase"], "register_email_otp")
+        self.assertTrue(any("等待超时" in line for line in logs))
+
+    def test_send_email_otp_uses_device_and_trace_headers(self):
+        client = ChatGPTClient(verbose=False)
+        client.session = _FakeOtpSession()
+        with mock.patch(
+            "services.chatgpt_core.chatgpt_client.generate_datadog_trace",
+            return_value={"x-datadog-trace-id": "trace-1"},
+        ):
+            ok = client.send_email_otp(referer="https://auth.openai.com/email-verification")
+
+        self.assertTrue(ok)
+        self.assertEqual(len(client.session.calls), 1)
+        _, kwargs = client.session.calls[0]
+        headers = kwargs["headers"]
+        self.assertEqual(headers.get("oai-device-id"), client.device_id)
+        self.assertEqual(headers.get("x-datadog-trace-id"), "trace-1")
+        self.assertEqual(headers.get("Referer"), "https://auth.openai.com/email-verification")
 
     @mock.patch("services.chatgpt_core.refresh_token_registration_engine.OAuthManager")
     @mock.patch("services.chatgpt_core.refresh_token_registration_engine.OAuthClient")

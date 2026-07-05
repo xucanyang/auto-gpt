@@ -767,14 +767,19 @@ class ChatGPTClient:
 
         try:
             self._browser_pause()
+            headers = self._headers(
+                url,
+                accept="application/json, text/plain, */*",
+                referer=referer or f"{self.AUTH}/create-account/password",
+                fetch_site="same-origin",
+                extra_headers={
+                    "oai-device-id": self.device_id,
+                },
+            )
+            headers.update(generate_datadog_trace())
             r = self.session.get(
                 url,
-                headers=self._headers(
-                    url,
-                    accept="application/json, text/plain, */*",
-                    referer=referer or f"{self.AUTH}/create-account/password",
-                    fetch_site="same-origin",
-                ),
+                headers=headers,
                 allow_redirects=True,
                 timeout=30,
             )

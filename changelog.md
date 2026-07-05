@@ -8,6 +8,17 @@
 
 
 
+## [1.3.7] - 2026-07-06
+### 修复 (Fixed)
+- **邮箱 API 等待超时后允许注册状态机执行重发**：`services/chatgpt_core/refresh_token_registration_engine.py` 的 `EmailServiceAdapter` 现在会把邮箱 provider 的 `TimeoutError` 归一为“本轮未收到验证码”，返回给 `ChatGPTClient.register_complete_flow()`，从而真正进入“首次等待未收到后重发一次 `email-otp/send` 再等待”的既有分支；修复此前 `EmailApiMailbox.wait_for_code()` 超时会直接抛出并中断整轮注册，导致 K12/email_api 场景虽然配置了重发窗口却永远不会重发的问题。
+- **补齐注册发码请求的浏览器一致性头**：`services/chatgpt_core/chatgpt_client.py` 的 `send_email_otp()` 与密码提交、OAuth 重发逻辑对齐，向 `/api/accounts/email-otp/send` 请求补充 `oai-device-id` 与 Datadog trace 头，降低服务端将发码请求视为不完整浏览器上下文而只返回 200 但不稳定投递验证码的概率。
+
+### 测试 (Tests)
+- **补充邮箱 API 重发链路回归**：`tests/test_chatgpt_register.py` 新增 `EmailServiceAdapter` provider 超时归一测试，以及 `send_email_otp()` 请求头测试，固定本次 K12 smsbower 排障暴露的重发阻断和请求头漂移问题。
+
+### 优化 (Changed)
+- **同步前端版本号至 v1.3.7**：`frontend/src/app/AppShell.tsx` 侧边栏版本展示更新为 `v1.3.7`，用于上线后确认邮箱 API 重发与发码请求头修复已加载。
+
 ## [1.3.6] - 2026-07-06
 ### 修复 (Fixed)
 - **修复邮箱验证码 API 被全局邮箱等待秒数压成 20 秒的问题**：`services/chatgpt_core/plugin.py` 针对 `email_api` 改为服从 ChatGPT 注册/OAuth 状态机传入的等待窗口，避免 K12/注册链路已显示 `otp_wait_timeout=600s` 时仍被历史 `mailbox_otp_timeout_seconds=20` 提前中断，导致 `等待 Email API 验证码超时 (20s)`。
@@ -424,4 +435,8 @@
 
 ## 2026-07-06 00:34:09 +0800
 - 主动触发邮箱验证码 API 注册发码
+- 发布模式: multi
+
+## 2026-07-06 00:49:40 +0800
+- 修复邮箱 API 重发链路和发码请求头
 - 发布模式: multi
