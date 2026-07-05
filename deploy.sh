@@ -5,7 +5,7 @@ set -Eeuo pipefail
 # auto-gpt 安全发布门禁
 # - Git 变更自动写入 changelog.md 并提交
 # - 禁止把运行态/密钥/抓包/依赖产物提交进仓库
-# - multi 模式发布前备份多实例 SQLite 运行库
+# - 默认不再创建发布前备份；如需临时备份，显式追加 --backup
 # - 发布后校验 /api/health 与首页
 # ==============================================================================
 
@@ -19,16 +19,18 @@ MSG=""
 MODE="multi"      # multi / image / hot
 DRY_RUN=0
 PUSH=0
+BACKUP="${AUTO_GPT_DEPLOY_BACKUP:-0}"
 
 usage() {
   cat <<USAGE
 Usage:
-  $0 "本次变更说明" [--mode=multi|image|hot] [--dry-run] [--push]
+  $0 "本次变更说明" [--mode=multi|image|hot] [--dry-run] [--push] [--backup]
 
 Modes:
   --mode=multi    默认：docker-compose.multi.yml 构建 auto-gpt:latest 并重启 auto-gpt / auto-gpt-plus / auto-k12
   --mode=image    调用 scripts/deploy-image-release.sh --apply
   --mode=hot      调用 scripts/deploy-to-auto-gpt-container.sh 对多容器做热同步，仅适合静态/Python 小补丁
+  --backup        本次发布前额外创建 .rollback-backups/deploy-<timestamp> 运行态备份；默认关闭
 
 Examples:
   $0 "规范 auto-gpt 发布门禁" --mode=multi
@@ -44,6 +46,8 @@ while [[ $# -gt 0 ]]; do
     --mode=*) MODE="${1#*=}" ;;
     --dry-run) DRY_RUN=1 ;;
     --push) PUSH=1 ;;
+    --backup) BACKUP=1 ;;
+    --no-backup) BACKUP=0 ;;
     -m|--message)
       shift
       MSG="${1:-}"
@@ -62,6 +66,11 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ "$MODE" =~ ^(multi|image|hot)$ ]] || fatal "错误的模式: $MODE，可选值 multi|image|hot"
+[[ "$BACKUP" =~ ^(0|1|false|true|no|yes|off|on)$ ]] || fatal "错误的备份开关: $BACKUP，可选 0/1/true/false"
+case "${BACKUP,,}" in
+  1|true|yes|on) BACKUP=1 ;;
+  *) BACKUP=0 ;;
+esac
 if [[ -z "$MSG" && "$DRY_RUN" == "0" ]]; then
   usage >&2
   fatal "缺少提交/发布说明"
@@ -313,7 +322,7 @@ smoke_after_deploy() {
   smoke_url "auto-k12 index" "http://127.0.0.1:8002/"
 }
 
-log "root=$ROOT_DIR mode=$MODE dry_run=$DRY_RUN compose=${COMPOSE_CMD[*]}"
+log "root=$ROOT_DIR mode=$MODE dry_run=$DRY_RUN backup=$BACKUP compose=${COMPOSE_CMD[*]}"
 
 assert_no_forbidden_git_changes
 [[ "$MODE" != "hot" ]] || assert_hot_scope
@@ -348,7 +357,12 @@ if [[ "$PUSH" == "1" ]]; then
   git push
 fi
 
-backup_root="$(create_backup | tail -n 1)"
+backup_root=""
+if [[ "$BACKUP" == "1" ]]; then
+  backup_root="$(create_backup | tail -n 1)"
+else
+  log "发布前备份: 已跳过（默认关闭；如需临时备份追加 --backup）"
+fi
 
 case "$MODE" in
   multi)
@@ -363,19 +377,38 @@ case "$MODE" in
     ;;
   hot)
     log "热同步 auto-gpt"
-    BACKUP_ROOT="$backup_root/auto-gpt-hot" CONTAINER=auto-gpt SMOKE_URL=http://127.0.0.1:8000/api/health \
-      scripts/deploy-to-auto-gpt-container.sh --apply --backend --restart --commit-image
+    if [[ "$BACKUP" == "1" ]]; then
+      BACKUP_ROOT="$backup_root/auto-gpt-hot" CONTAINER=auto-gpt SMOKE_URL=http://127.0.0.1:8000/api/health \
+        scripts/deploy-to-auto-gpt-container.sh --apply --backend --restart --commit-image
+    else
+      SKIP_BACKUP=1 CONTAINER=auto-gpt SMOKE_URL=http://127.0.0.1:8000/api/health \
+        scripts/deploy-to-auto-gpt-container.sh --apply --backend --restart
+    fi
     log "热同步 auto-gpt-plus"
-    BACKUP_ROOT="$backup_root/auto-gpt-plus-hot" CONTAINER=auto-gpt-plus SMOKE_URL=http://127.0.0.1:8001/api/health \
-      scripts/deploy-to-auto-gpt-container.sh --apply --backend --restart --commit-image
+    if [[ "$BACKUP" == "1" ]]; then
+      BACKUP_ROOT="$backup_root/auto-gpt-plus-hot" CONTAINER=auto-gpt-plus SMOKE_URL=http://127.0.0.1:8001/api/health \
+        scripts/deploy-to-auto-gpt-container.sh --apply --backend --restart --commit-image
+    else
+      SKIP_BACKUP=1 CONTAINER=auto-gpt-plus SMOKE_URL=http://127.0.0.1:8001/api/health \
+        scripts/deploy-to-auto-gpt-container.sh --apply --backend --restart
+    fi
     log "热同步 auto-k12"
-    BACKUP_ROOT="$backup_root/auto-k12-hot" CONTAINER=auto-k12 SMOKE_URL=http://127.0.0.1:8002/api/health \
-      scripts/deploy-to-auto-gpt-container.sh --apply --backend --restart --commit-image
+    if [[ "$BACKUP" == "1" ]]; then
+      BACKUP_ROOT="$backup_root/auto-k12-hot" CONTAINER=auto-k12 SMOKE_URL=http://127.0.0.1:8002/api/health \
+        scripts/deploy-to-auto-gpt-container.sh --apply --backend --restart --commit-image
+    else
+      SKIP_BACKUP=1 CONTAINER=auto-k12 SMOKE_URL=http://127.0.0.1:8002/api/health \
+        scripts/deploy-to-auto-gpt-container.sh --apply --backend --restart
+    fi
     ;;
 esac
 
 smoke_after_deploy
 
 log "发布完成"
-log "备份目录: $backup_root"
+if [[ "$BACKUP" == "1" ]]; then
+  log "备份目录: $backup_root"
+else
+  log "备份目录: 未创建（默认关闭）"
+fi
 log "当前版本: $(git log -1 --oneline)"

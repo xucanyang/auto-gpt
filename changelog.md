@@ -6,6 +6,13 @@
 
 ## [Unreleased] (未发布)
 
+
+## [1.3.4] - 2026-07-05
+### 优化 (Changed)
+- **发布流程默认不再创建运行态备份**：`deploy.sh` 将 `.rollback-backups/deploy-*` 发布前备份改为显式 `--backup` 才创建，常规 multi/image/hot 发布只依赖 Git 提交与 live smoke，避免每次部署都复制三实例 SQLite、容器 inspect 和共享配置快照导致磁盘快速膨胀。
+- **热更新脚本支持跳过备份**：`scripts/deploy-to-auto-gpt-container.sh` 增加 `SKIP_BACKUP=1`，在默认发布路径下跳过 container inspect、静态目录备份和 predeploy image commit；需要临时保守发布时仍可用 `deploy.sh "说明" --mode=hot --backup` 恢复原来的热补丁备份行为。
+- **同步前端版本号至 v1.3.4**：`frontend/src/app/AppShell.tsx` 侧边栏版本展示更新为 `v1.3.4`，用于上线后确认本次发布脚本调整对应的静态资源已加载。
+
 ## [1.3.3] - 2026-07-05
 ### 新增 (Added)
 - **新增三实例共享配置中心**：新增 `core/shared_config.py`，在 `/opt/auto-gpt/shared_config/shared_config.db` 中维护独立于账号/任务数据库的共享配置模板，使用 SQLite revision、审计记录和 JSON snapshots 替代裸文件互拷；`core/config_store.py` 按实例本地开关决定读写共享模板或本地 `configs` 表，避免共用 `account_manager.db` 导致账号、任务、日志和手机号池混库。
@@ -374,4 +381,8 @@
 
 ## 2026-07-05 22:55:06 +0800
 - 修正共享配置差异忽略环境变量兜底
+- 发布模式: multi
+
+## 2026-07-05 23:10:58 +0800
+- 默认关闭发布备份并清理历史备份
 - 发布模式: multi

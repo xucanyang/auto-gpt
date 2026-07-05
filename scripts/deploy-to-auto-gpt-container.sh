@@ -5,6 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONTAINER="${CONTAINER:-auto-gpt}"
 STAMP="$(date +%Y%m%dT%H%M%SZ)"
 BACKUP_ROOT="${BACKUP_ROOT:-$ROOT_DIR/.rollback-backups/deploy-$STAMP}"
+SKIP_BACKUP="${SKIP_BACKUP:-0}"
 APPLY=0
 BUILD_FRONTEND=1
 COPY_FRONTEND=1
@@ -33,6 +34,7 @@ Options:
 Environment:
   CONTAINER=auto-gpt
   BACKUP_ROOT=$ROOT_DIR/.rollback-backups/deploy-<timestamp>
+  SKIP_BACKUP=1  跳过 container inspect、静态目录备份和 predeploy image commit
   SMOKE_URL=http://127.0.0.1:8000/
 USAGE
 }
@@ -70,6 +72,7 @@ fi
 log "root=$ROOT_DIR"
 log "container=$CONTAINER"
 log "mode=$([[ "$APPLY" == "1" ]] && echo apply || echo dry-run)"
+log "backup=$([[ "$SKIP_BACKUP" == "1" ]] && echo disabled || echo enabled)"
 log "backup_root=$BACKUP_ROOT"
 
 if [[ "$BUILD_FRONTEND" == "1" ]]; then
@@ -87,20 +90,26 @@ if [[ ! -f "$ROOT_DIR/static/index.html" ]]; then
   exit 1
 fi
 
-mkdir -p "$BACKUP_ROOT"
-log "capturing current container metadata"
-docker inspect "$CONTAINER" > "$BACKUP_ROOT/container-inspect.json"
+if [[ "$SKIP_BACKUP" != "1" ]]; then
+  mkdir -p "$BACKUP_ROOT"
+  log "capturing current container metadata"
+  docker inspect "$CONTAINER" > "$BACKUP_ROOT/container-inspect.json"
+else
+  log "backup disabled; skip container metadata/static backup"
+fi
 
-if [[ "$COMMIT_IMAGE" == "1" ]]; then
+if [[ "$COMMIT_IMAGE" == "1" && "$SKIP_BACKUP" != "1" ]]; then
   image="auto-gpt-predeploy:$STAMP"
   run docker commit "$CONTAINER" "$image"
   log "predeploy image tag: $image"
+elif [[ "$COMMIT_IMAGE" == "1" ]]; then
+  log "backup disabled; skip predeploy image commit"
 fi
 
-if [[ "$APPLY" == "1" ]]; then
+if [[ "$APPLY" == "1" && "$SKIP_BACKUP" != "1" ]]; then
   log "backing up /app/static from container"
   docker cp "$CONTAINER:/app/static" "$BACKUP_ROOT/static"
-else
+elif [[ "$APPLY" != "1" && "$SKIP_BACKUP" != "1" ]]; then
   log "+ docker cp $CONTAINER:/app/static $BACKUP_ROOT/static"
 fi
 
