@@ -5,7 +5,7 @@ set -Eeuo pipefail
 # auto-gpt 安全发布门禁
 # - Git 变更自动写入 changelog.md 并提交
 # - 禁止把运行态/密钥/抓包/依赖产物提交进仓库
-# - multi 模式发布前备份双实例 SQLite 运行库
+# - multi 模式发布前备份多实例 SQLite 运行库
 # - 发布后校验 /api/health 与首页
 # ==============================================================================
 
@@ -26,9 +26,9 @@ Usage:
   $0 "本次变更说明" [--mode=multi|image|hot] [--dry-run] [--push]
 
 Modes:
-  --mode=multi    默认：docker-compose.multi.yml 构建 auto-gpt:latest 并重启 auto-gpt / auto-gpt-plus
+  --mode=multi    默认：docker-compose.multi.yml 构建 auto-gpt:latest 并重启 auto-gpt / auto-gpt-plus / auto-k12
   --mode=image    调用 scripts/deploy-image-release.sh --apply
-  --mode=hot      调用 scripts/deploy-to-auto-gpt-container.sh 对双容器做热同步，仅适合静态/Python 小补丁
+  --mode=hot      调用 scripts/deploy-to-auto-gpt-container.sh 对多容器做热同步，仅适合静态/Python 小补丁
 
 Examples:
   $0 "规范 auto-gpt 发布门禁" --mode=multi
@@ -265,12 +265,12 @@ create_backup() {
   git rev-parse HEAD > "$backup_root/git-head.before.txt"
   git status --short --ignored > "$backup_root/git-status.before.txt" || true
   compose_multi config > "$backup_root/docker-compose.multi.rendered.yml"
-  for service in auto-gpt auto-gpt-plus; do
+  for service in auto-gpt auto-gpt-plus auto-k12; do
     if docker inspect "$service" >/dev/null 2>&1; then
       docker inspect "$service" > "$backup_root/${service}.inspect.before.json"
     fi
   done
-  for data_root in /opt/auto-gpt/data /opt/auto-gpt-plus/data; do
+  for data_root in /opt/auto-gpt/data /opt/auto-gpt-plus/data /opt/auto-k12/data; do
     [[ -d "$data_root" ]] || continue
     name="$(basename "$(dirname "$data_root")")"
     for db in account_manager.db team_manage.db; do
@@ -297,11 +297,13 @@ smoke_url() {
 
 smoke_after_deploy() {
   log "运行容器状态"
-  docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' | grep -E 'NAMES|auto-gpt' || true
+  docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' | grep -E 'NAMES|auto-gpt|auto-k12' || true
   smoke_url "auto-gpt health" "http://127.0.0.1:8000/api/health"
   smoke_url "auto-gpt-plus health" "http://127.0.0.1:8001/api/health"
+  smoke_url "auto-k12 health" "http://127.0.0.1:8002/api/health"
   smoke_url "auto-gpt index" "http://127.0.0.1:8000/"
   smoke_url "auto-gpt-plus index" "http://127.0.0.1:8001/"
+  smoke_url "auto-k12 index" "http://127.0.0.1:8002/"
 }
 
 log "root=$ROOT_DIR mode=$MODE dry_run=$DRY_RUN compose=${COMPOSE_CMD[*]}"
@@ -358,6 +360,9 @@ case "$MODE" in
       scripts/deploy-to-auto-gpt-container.sh --apply --backend --restart --commit-image
     log "热同步 auto-gpt-plus"
     BACKUP_ROOT="$backup_root/auto-gpt-plus-hot" CONTAINER=auto-gpt-plus SMOKE_URL=http://127.0.0.1:8001/api/health \
+      scripts/deploy-to-auto-gpt-container.sh --apply --backend --restart --commit-image
+    log "热同步 auto-k12"
+    BACKUP_ROOT="$backup_root/auto-k12-hot" CONTAINER=auto-k12 SMOKE_URL=http://127.0.0.1:8002/api/health \
       scripts/deploy-to-auto-gpt-container.sh --apply --backend --restart --commit-image
     ;;
 esac

@@ -13,19 +13,22 @@
 
 这是 ChatGPT 账号自动注册与资源池管理项目。最容易踩坑的点：checkout 不等于线上运行态，live 行为通常以 Docker 容器为准。
 
-本规则只适用于 `/opt/auto-gpt` 源码主线；`/opt/auto-gpt-plus` 只作为 Plus 实例的数据/配置隔离目录，不能在该目录做源码开发或部署。
+本规则只适用于 `/opt/auto-gpt` 源码主线；`/opt/auto-gpt-plus` 与 `/opt/auto-k12` 只作为实例的数据/配置隔离目录，不能在这些目录做源码开发或部署。
 
 ## 运行真相
 
 - 唯一源代码与主开发路径：`/opt/auto-gpt`（所有功能研发、Git提交、前端 npm build 均在此进行）
 - Plus 数据隔离路径：`/opt/auto-gpt-plus`（不再维护源码，仅保留 `data/`、`external_logs/`、`_ext_targets/` 与 `.env` 作数据驱动）
+- K12 数据隔离路径：`/opt/auto-k12`（不维护源码，仅保留 `data/`、`external_logs/`、`_ext_targets/` 与 `.env` 作数据驱动）
 - 统一镜像名称：`auto-gpt:latest`
 - 多实例编排配置：`docker-compose.multi.yml`
-- 双实例映射：
+- 三实例映射：
   - **主服务实例 (`auto-gpt`)**：端口 `0.0.0.0:8000->8000/tcp`，`0.0.0.0:8317->8317/tcp`，`127.0.0.1:8889->8889/tcp`
     - 数据卷：`/opt/auto-gpt/data -> /runtime` 等
   - **Plus 增强实例 (`auto-gpt-plus`)**：端口 `0.0.0.0:8001->8000/tcp`，`0.0.0.0:8318->8317/tcp`，`127.0.0.1:8890->8889/tcp`
     - 数据卷：`/opt/auto-gpt-plus/data -> /runtime` 等
+  - **K12 专用实例 (`auto-k12`)**：端口 `0.0.0.0:8002->8000/tcp`，`0.0.0.0:8319->8317/tcp`，`127.0.0.1:8891->8889/tcp`
+    - 数据卷：`/opt/auto-k12/data -> /runtime` 等
 
 本地文件修改不会自动影响容器里的代码或静态资源。需要明确部署到容器、重启或重建镜像，并做 live smoke。
 
@@ -41,12 +44,12 @@
    ```bash
    /opt/auto-gpt/deploy.sh "<清晰明确的 Git Commit 描述>" --mode=multi
    ```
-   * 脚本会自动执行 `git add .` + `git commit`，通过 `docker-compose.multi.yml` 编译更新 `auto-gpt:latest` 镜像，并同时平滑升级主服务 (`8000`) 与 Plus 服务 (`8001`)。
+   * 脚本会自动执行 `git add .` + `git commit`，通过 `docker-compose.multi.yml` 编译更新 `auto-gpt:latest` 镜像，并同时平滑升级主服务 (`8000`)、Plus 服务 (`8001`) 与 K12 服务 (`8002`)。
 2. **极其紧急且轻微的 Python/前端逻辑热补丁**（秒级热更新）：
    ```bash
    /opt/auto-gpt/deploy.sh "<热补丁修复说明>" --mode=hot
    ```
-   * 脚本在完成 Git 存档后，将直接调用底层热更新脚本把变动文件通过 `docker cp` 热注入两端运行中的容器，无需重新构建 Docker 镜像。
+   * 脚本在完成 Git 存档后，将直接调用底层热更新脚本把变动文件通过 `docker cp` 热注入多端运行中的容器，无需重新构建 Docker 镜像。
 3. **如需自动推送到远程分支**：在命令参数尾部追加 `--push` 即可。
 
 ## Changelog 更新维护约定（Agent 强制记录）
@@ -73,14 +76,14 @@
 - **文档与日志更新**：发生代码或配置修改时，必须在 `/opt/auto-gpt/changelog.md` 对应分类下追加本次改动的详细说明。
 - 前端改动：统一在 `/opt/auto-gpt/frontend/` build，再同步到容器实际静态目录；不要只停在 checkout。
 - 后端改动：确认容器内 `/app` 代码是否更新，必要时使用多实例编排重建镜像，并重启对应服务。
-- 数据库操作前：SQLite 用 `.backup`，然后 `PRAGMA integrity_check`；容器/镜像改动前优先 `docker commit` + `docker save`。操作时务必认清您修改的是主服务还是 Plus 服务的挂载目录。
+- 数据库操作前：SQLite 用 `.backup`，然后 `PRAGMA integrity_check`；容器/镜像改动前优先 `docker commit` + `docker save`。操作时务必认清您修改的是主服务、Plus 服务还是 K12 服务的挂载目录。
 - 资源池语义必须分清来源、绑定、释放、失败原因、复用规则，不要把账号库存、源系统库存、兑换券库存混成一张表。
 - ChatGPT account 的 `used`、复制 AT、订阅、手机号绑定、邮箱绑定、auth 补抓状态要分开表达，不能因为一个动作误改另一个状态。
 - 跨项目接入 `/root/account-delivery` 或源系统时，保持本地解析/本地库存和上游状态边界，不要把 plaintext 账号复制成两份库存。
 
 ## 汇报口径
 
-默认用中文简洁汇报：做了什么、现在运行态怎样、验证结果、还剩什么风险。不要主动粘贴长代码、长命令输出或大段日志；涉及主服务/Plus 实例时必须明确写清操作对象，避免把两个实例混报。
+默认用中文简洁汇报：做了什么、现在运行态怎样、验证结果、还剩什么风险。不要主动粘贴长代码、长命令输出或大段日志；涉及主服务/Plus/K12 实例时必须明确写清操作对象，避免把不同实例混报。
 
 ## 推荐验证
 
@@ -91,11 +94,12 @@ cd frontend && npm run build
 
 # 使用多实例编排构建并查看状态
 docker compose -f docker-compose.multi.yml build
-docker ps | grep auto-gpt
+docker ps | grep -E 'auto-gpt|auto-k12'
 
-# 分别验证两个不同功能网页的连通性
+# 分别验证三个实例网页的连通性
 curl -fsS http://127.0.0.1:8000/ >/dev/null || true
 curl -fsS http://127.0.0.1:8001/ >/dev/null || true
+curl -fsS http://127.0.0.1:8002/ >/dev/null || true
 ```
 
 如需把 checkout 热加载发布到调试容器，优先使用：

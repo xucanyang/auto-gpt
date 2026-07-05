@@ -6,6 +6,14 @@
 
 ## [Unreleased] (未发布)
 
+## [1.3.2] - 2026-07-05
+### 新增 (Added)
+- **新增 K12 独立运行实例 `auto-k12`**：`docker-compose.multi.yml` 增加第三个服务，复用统一镜像 `auto-gpt:latest`，但使用 `/opt/auto-k12/data`、`/opt/auto-k12/_ext_targets` 与 `/opt/auto-k12/external_logs` 作为独立运行态挂载；对外业务端口为 `8002`，CLIProxyAPI 端口为 `8319`，Solver 仅本机暴露为 `8891`，避免与主服务 `auto-gpt` 和 Plus 实例 `auto-gpt-plus` 的数据、日志、插件目录混用。
+
+### 优化 (Changed)
+- **扩展发布脚本到三实例闭环**：`deploy.sh` 的 multi/hot 发布、发布前 SQLite 备份、容器 inspect 归档和发布后 smoke 检查同步覆盖 `auto-k12`，上线后会同时校验 `http://127.0.0.1:8000/`、`8001` 与 `8002` 的首页和 `/api/health`，避免新增实例只写入 Compose 但未纳入发布门禁。
+- **同步操作约定与前端版本号至 v1.3.2**：`AGENTS.md` 更新为主服务、Plus、K12 三实例口径，明确 `/opt/auto-k12` 仅作为数据/配置隔离目录；`frontend/src/app/AppShell.tsx` 侧边栏版本展示更新为 `v1.3.2`，用于确认新三实例编排对应的前端资源已加载。
+
 ## [1.3.1] - 2026-07-05
 ### 安全 (Security)
 - **封闭账号详情接口的明文凭证旁路**：`api/accounts.py` 将 `/accounts/{account_id}` 与 `/accounts?detail=true` 改为沿用 compact serializer 的安全摘要模型，响应中只保留 `credentials`、`auth`、workspace variants、手机号绑定和同步状态等必要摘要；`token/password/extra_json` 中的 Access Token、Refresh Token、NextAuth session、cookies 与 ID Token 不再随详情接口返回，完整材料继续只能通过 `/accounts/{id}/secrets` 按字段读取。`tests/test_accounts_api_list_compact.py` 补充详情序列化脱敏回归，防止 K12 全空间保存后被 detail=true 绕过列表脱敏边界。
@@ -330,4 +338,8 @@
 
 ## 2026-07-05 21:17:43 +0800
 - 加固账号详情脱敏并统一 K12 设置
+- 发布模式: multi
+
+## 2026-07-05 21:53:20 +0800
+- 新增 auto-k12 独立实例并纳入多实例发布
 - 发布模式: multi
