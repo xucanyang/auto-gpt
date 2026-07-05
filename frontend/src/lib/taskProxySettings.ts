@@ -9,6 +9,7 @@ export type TaskProxySettings = {
   proxy_failover: boolean
   proxy_max_candidates: number
   proxy_min_score: number
+  dynamic_proxy_ip_retention_minutes: number
 }
 
 const DEFAULT_TASK_PROXY_SETTINGS: TaskProxySettings = {
@@ -18,6 +19,7 @@ const DEFAULT_TASK_PROXY_SETTINGS: TaskProxySettings = {
   proxy_failover: false,
   proxy_max_candidates: 5,
   proxy_min_score: 50,
+  dynamic_proxy_ip_retention_minutes: 5,
 }
 
 const VALID_PROXY_MODES = new Set<TaskProxyMode>(['direct', 'pool', 'specified', 'dynamic'])
@@ -71,6 +73,7 @@ export function normalizeTaskProxySettings(value: unknown, fallback?: Partial<Ta
     proxy_failover: booleanWithDefault(valueOf(record, 'proxy_failover', 'register_proxy_failover', 'probe_proxy_failover'), base.proxy_failover),
     proxy_max_candidates: numberWithDefault(valueOf(record, 'proxy_max_candidates', 'register_proxy_max_candidates', 'probe_proxy_max_candidates'), base.proxy_max_candidates, 1, 100),
     proxy_min_score: numberWithDefault(valueOf(record, 'proxy_min_score', 'register_proxy_min_score', 'probe_proxy_min_score'), base.proxy_min_score, 0, 100),
+    dynamic_proxy_ip_retention_minutes: numberWithDefault(valueOf(record, 'dynamic_proxy_ip_retention_minutes'), base.dynamic_proxy_ip_retention_minutes, 1, 1440),
   }
 }
 
@@ -96,6 +99,7 @@ export function taskProxySettingsFromConfig(config: unknown, fallback?: Partial<
     proxy_failover: booleanWithDefault(cfg.task_proxy_failover, base.proxy_failover),
     proxy_max_candidates: numberWithDefault(cfg.task_proxy_max_candidates ?? cfg.proxy_pool_max_candidates, base.proxy_max_candidates, 1, 100),
     proxy_min_score: numberWithDefault(cfg.task_proxy_min_score ?? cfg.proxy_scan_min_score, base.proxy_min_score, 0, 100),
+    dynamic_proxy_ip_retention_minutes: numberWithDefault(cfg.dynamic_proxy_ip_retention_minutes, base.dynamic_proxy_ip_retention_minutes, 1, 1440),
   }
 }
 
@@ -118,6 +122,9 @@ export function buildTaskProxyPayload(values: unknown): Record<string, unknown> 
   if (taskProxyUsesPoolSelector(settings)) {
     payload.proxy_max_candidates = settings.proxy_max_candidates
     payload.proxy_min_score = settings.proxy_min_score
+  }
+  if (settings.proxy_mode === 'dynamic') {
+    payload.dynamic_proxy_ip_retention_minutes = settings.dynamic_proxy_ip_retention_minutes
   }
   return payload
 }
@@ -146,6 +153,9 @@ export async function saveTaskProxySettingsToConfig(values: unknown) {
 
   if (settings.proxy_mode === 'dynamic' && settings.proxy) {
     data.dynamic_proxy_template = settings.proxy
+  }
+  if (settings.proxy_mode === 'dynamic') {
+    data.dynamic_proxy_ip_retention_minutes = String(settings.dynamic_proxy_ip_retention_minutes)
   }
   if (settings.proxy_country_code) {
     data.dynamic_proxy_default_country = settings.proxy_country_code

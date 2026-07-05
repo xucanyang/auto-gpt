@@ -7,9 +7,12 @@ import string
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
-REGION_RE = re.compile(r"(?i)(region-)([a-z]{2})")
-SID_RE = re.compile(r"(?i)(sid-)([^-:@/]+)(-t-)")
+REGION_RE = re.compile(r"(?i)(region-)([^-:@/]+)")
+SID_RE = re.compile(r"(?i)(sid-)([^-:@/]+)")
+RETENTION_RE = re.compile(r"(?i)(-t-)([^-:@/]+)")
 COUNTRY_RE = re.compile(r"^[A-Z]{2}$")
+MIN_RETENTION_MINUTES = 1
+MAX_RETENTION_MINUTES = 1440
 
 
 @dataclass(frozen=True)
@@ -24,6 +27,8 @@ class DynamicProxyResolution:
     sid: str
     redacted_template: str
     redacted_proxy_url: str
+    retention_minutes: int | None = None
+    retention_applied: bool = False
 
 
 def normalize_country_code(value: Any) -> str:
@@ -69,7 +74,7 @@ def proxy_with_region(proxy_url: Any, country_code: Any) -> str:
     if not country:
         raise ValueError("动态代理模式必须填写出口国家")
     if not REGION_RE.search(value):
-        raise ValueError("动态代理模板缺少 region-XX 标记，无法按需改写出口国家")
+        raise ValueError("动态代理模板缺少 region-XX/region-Rand 标记，无法按需改写出口国家")
     return REGION_RE.sub(lambda match: f"{match.group(1)}{country}", value, count=1)
 
 
@@ -80,7 +85,42 @@ def proxy_with_fresh_sid(proxy_url: Any) -> tuple[str, bool, str]:
     sid = _new_sid()
     if not SID_RE.search(value):
         return value, False, ""
-    return SID_RE.sub(lambda match: f"{match.group(1)}{sid}{match.group(3)}", value, count=1), True, sid
+    return SID_RE.sub(lambda match: f"{match.group(1)}{sid}", value, count=1), True, sid
+
+
+def normalize_retention_minutes(
+    value: Any,
+    *,
+    default: int | None = None,
+    minimum: int = MIN_RETENTION_MINUTES,
+    maximum: int = MAX_RETENTION_MINUTES,
+) -> int | None:
+    if value is None or value == "":
+        return default
+    try:
+        text = str(value).strip()
+        if not re.fullmatch(r"\d+", text):
+            raise ValueError
+        parsed = int(text)
+    except Exception as exc:
+        raise ValueError(f"动态代理 IP 保留时长必须是 {minimum}-{maximum} 分钟整数") from exc
+    if parsed < minimum or parsed > maximum:
+        raise ValueError(f"动态代理 IP 保留时长必须是 {minimum}-{maximum} 分钟整数")
+    return parsed
+
+
+def proxy_with_retention(proxy_url: Any, retention_minutes: Any = None) -> tuple[str, bool, int | None]:
+    value = str(proxy_url or "").strip()
+    if not value:
+        raise ValueError("动态代理模板为空")
+    minutes = normalize_retention_minutes(retention_minutes, default=None)
+    if minutes is None:
+        return value, False, None
+    if RETENTION_RE.search(value):
+        return RETENTION_RE.sub(lambda match: f"{match.group(1)}{minutes}", value, count=1), True, minutes
+    if SID_RE.search(value):
+        return SID_RE.sub(lambda match: f"{match.group(0)}-t-{minutes}", value, count=1), True, minutes
+    return value, False, minutes
 
 
 def redact_proxy_url(proxy_url: Any) -> str:
@@ -110,6 +150,7 @@ def resolve_dynamic_proxy_template(
     country_code: Any,
     *,
     refresh_sid: bool = True,
+    retention_minutes: Any = None,
 ) -> DynamicProxyResolution:
     template = str(proxy_url or "").strip()
     if not template:
@@ -119,13 +160,14 @@ def resolve_dynamic_proxy_template(
         raise ValueError("动态代理模式必须填写出口国家")
     template_country = declared_proxy_region(template)
     if not template_country:
-        raise ValueError("动态代理模板缺少 region-XX 标记，无法按需改写出口国家")
+        raise ValueError("动态代理模板缺少 region-XX/region-Rand 标记，无法按需改写出口国家")
 
     resolved = proxy_with_region(template, requested)
     sid_refreshed = False
     sid = ""
     if refresh_sid:
         resolved, sid_refreshed, sid = proxy_with_fresh_sid(resolved)
+    resolved, retention_applied, retention = proxy_with_retention(resolved, retention_minutes)
 
     return DynamicProxyResolution(
         template=template,
@@ -138,4 +180,6 @@ def resolve_dynamic_proxy_template(
         sid=sid,
         redacted_template=redact_proxy_url(template),
         redacted_proxy_url=redact_proxy_url(resolved),
+        retention_minutes=retention,
+        retention_applied=retention_applied,
     )

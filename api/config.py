@@ -34,6 +34,7 @@ CONFIG_KEYS = [
     "task_proxy_min_score",
     "dynamic_proxy_template",
     "dynamic_proxy_default_country",
+    "dynamic_proxy_ip_retention_minutes",
     "dynamic_proxy_require_country_match",
     "dynamic_proxy_probe_timeout_seconds",
     "dynamic_proxy_probe_enabled",
@@ -439,6 +440,8 @@ def _build_config_response(*, local_only: bool = False) -> dict[str, Any]:
         all_cfg["dynamic_proxy_template"] = ""
     if not all_cfg.get("dynamic_proxy_default_country"):
         all_cfg["dynamic_proxy_default_country"] = "JP"
+    if not all_cfg.get("dynamic_proxy_ip_retention_minutes"):
+        all_cfg["dynamic_proxy_ip_retention_minutes"] = "5"
     if not all_cfg.get("dynamic_proxy_require_country_match"):
         all_cfg["dynamic_proxy_require_country_match"] = "true"
     if not all_cfg.get("dynamic_proxy_probe_timeout_seconds"):
@@ -737,6 +740,15 @@ def update_config(body: ConfigUpdate):
     safe = {k: v for k, v in body.data.items() if k in CONFIG_KEYS}
     dynamic_template = str(safe.get("dynamic_proxy_template") or "").strip()
     dynamic_country = str(safe.get("dynamic_proxy_default_country") or "").strip().upper()
+    if "dynamic_proxy_ip_retention_minutes" in safe:
+        try:
+            from core.dynamic_proxy import normalize_retention_minutes
+
+            safe["dynamic_proxy_ip_retention_minutes"] = str(
+                normalize_retention_minutes(safe.get("dynamic_proxy_ip_retention_minutes"), default=5)
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
     if dynamic_template:
         safe.setdefault("task_proxy_mode", "dynamic")
         safe.setdefault("task_proxy_url", dynamic_template)

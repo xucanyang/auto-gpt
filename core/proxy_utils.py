@@ -209,6 +209,7 @@ def _dynamic_candidate_tuples(
     probe_enabled: bool,
     require_country_match: bool,
     timeout_seconds: int,
+    retention_minutes: Any = None,
 ) -> list[tuple[str, Any, str]]:
     from .dynamic_proxy import resolve_dynamic_proxy_template
 
@@ -225,7 +226,12 @@ def _dynamic_candidate_tuples(
 
     for _ in range(desired_count):
         try:
-            resolved = resolve_dynamic_proxy_template(template, country_code, refresh_sid=True)
+            resolved = resolve_dynamic_proxy_template(
+                template,
+                country_code,
+                refresh_sid=True,
+                retention_minutes=retention_minutes,
+            )
             runtime_proxy = normalize_proxy_url(resolved.proxy_url) or ""
             if not runtime_proxy:
                 raise RuntimeError("动态代理模板解析后为空")
@@ -249,7 +255,8 @@ def _dynamic_candidate_tuples(
                     continue
             else:
                 sid_text = "refreshed" if resolved.sid_refreshed else "unchanged"
-                source = f"dynamic country={resolved.requested_country_code} actual=unverified provider={resolved.provider} sid={sid_text} probe=disabled"
+                retention_text = f" retention=t-{resolved.retention_minutes}" if resolved.retention_minutes else ""
+                source = f"dynamic country={resolved.requested_country_code} actual=unverified provider={resolved.provider} sid={sid_text}{retention_text} probe=disabled"
             candidates.append((runtime_proxy, None, source))
         except Exception as exc:
             errors.append(_safe_source_text(exc))
@@ -384,9 +391,13 @@ def resolve_task_proxy_candidates(
             minimum=2,
             maximum=60,
         )
+        retention_minutes = params.get("dynamic_proxy_ip_retention_minutes")
+        if retention_minutes in (None, ""):
+            retention_minutes = _configured_value("dynamic_proxy_ip_retention_minutes", "5")
         return _dynamic_candidate_tuples(
             template=template,
             country_code=country_code,
+            retention_minutes=retention_minutes,
             max_candidates=dynamic_max_attempts,
             failover=failover,
             probe_enabled=probe_enabled,

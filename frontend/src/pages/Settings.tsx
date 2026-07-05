@@ -120,10 +120,11 @@ const TAB_ITEMS = [
       },
       {
         title: '动态代理',
-        desc: '按任务出口国家改写 region 并刷新 sid',
+        desc: '按任务出口国家改写 region、刷新 sid 并覆盖 t-N',
         fields: [
-          { key: 'dynamic_proxy_template', label: '默认动态代理模板', secret: true, placeholder: 'socks5://user-region-JP-sid-xxxx-t-1:pass@host:port' },
+          { key: 'dynamic_proxy_template', label: '默认动态代理模板', secret: true, placeholder: 'socks5://user-region-Rand-sid-xxxx-t-5:pass@host:port' },
           { key: 'dynamic_proxy_default_country', label: '默认出口国家', placeholder: 'JP' },
+          { key: 'dynamic_proxy_ip_retention_minutes', label: 'IP 保留分钟数（t-N）', placeholder: '5' },
           { key: 'dynamic_proxy_require_country_match', label: '要求实测国家匹配', type: 'boolean' },
           { key: 'dynamic_proxy_probe_enabled', label: '运行前探测出口', type: 'boolean' },
           { key: 'dynamic_proxy_probe_timeout_seconds', label: '探测超时秒数', placeholder: '8' },
@@ -1109,9 +1110,11 @@ function ConfigField({ field }: { field: FieldConfig }) {
   const isBooleanField = field.type === 'boolean'
   const helpText =
     field.key === 'dynamic_proxy_template'
-      ? '可选全局模板。动态代理模式会先按任务的出口国家改写 region-XX，再刷新 sid-xxx-t-；展示和日志只保存脱敏地址。'
+      ? '可选全局模板。支持 region-JP/region-US 等固定国家，也支持 Cliproxy 生成的 region-Rand；动态代理模式会先按任务出口国家改写完整 region token，再刷新 sid；展示和日志只保存脱敏地址。'
       : field.key === 'dynamic_proxy_default_country'
         ? '任务未填写出口国家时使用的两位 ISO 国家码，例如 JP、US、SG。'
+      : field.key === 'dynamic_proxy_ip_retention_minutes'
+        ? '覆盖 Cliproxy 用户名里的 t-N 字段，例如填 5 会生成 t-5；模板没有 t-N 但包含 sid 时会自动补到 sid 后。范围 1-1440 分钟。'
       : field.key === 'dynamic_proxy_require_country_match'
         ? '开启后，动态代理实测出口国家与声明国家不一致会直接失败；若 Cliproxy 模板 region 已匹配但 GeoIP 临时不可用，会记录未实测而不误杀候选。'
       : field.key === 'dynamic_proxy_probe_enabled'
@@ -3812,6 +3815,9 @@ export default function Settings() {
       if (!data.dynamic_proxy_probe_timeout_seconds) {
         data.dynamic_proxy_probe_timeout_seconds = '8'
       }
+      if (!data.dynamic_proxy_ip_retention_minutes) {
+        data.dynamic_proxy_ip_retention_minutes = '5'
+      }
       data.dynamic_proxy_require_country_match = data.dynamic_proxy_require_country_match === '' ? true : parseBooleanConfigValue(data.dynamic_proxy_require_country_match)
       data.dynamic_proxy_probe_enabled = data.dynamic_proxy_probe_enabled === '' ? true : parseBooleanConfigValue(data.dynamic_proxy_probe_enabled)
       data.cfworker_domains = parseStoredDomainList(data.cfworker_domains)
@@ -3987,6 +3993,12 @@ export default function Settings() {
           Math.min(60, Number.parseInt(String(values.dynamic_proxy_probe_timeout_seconds || '8'), 10) || 8),
         ),
       )
+      values.dynamic_proxy_ip_retention_minutes = String(
+        Math.max(
+          1,
+          Math.min(1440, Number.parseInt(String(values.dynamic_proxy_ip_retention_minutes || '5'), 10) || 5),
+        ),
+      )
       values.tempmail_mode = values.tempmail_mode || 'fixed_domain'
       values.email_api_lines = String(values.email_api_lines || '').trim()
       values.email_api_poll_interval_seconds = String(values.email_api_poll_interval_seconds || '3').trim() || '3'
@@ -4112,6 +4124,7 @@ export default function Settings() {
         dynamic_proxy_require_country_match: values.dynamic_proxy_require_country_match,
         dynamic_proxy_probe_enabled: values.dynamic_proxy_probe_enabled,
         dynamic_proxy_probe_timeout_seconds: values.dynamic_proxy_probe_timeout_seconds,
+        dynamic_proxy_ip_retention_minutes: values.dynamic_proxy_ip_retention_minutes,
         contribution_enabled: values.contribution_enabled,
         chatgpt_enable_team_invite: values.chatgpt_enable_team_invite,
         chatgpt_team_invite_deferred_activation: values.chatgpt_team_invite_deferred_activation,

@@ -8,6 +8,20 @@
 
 
 
+## [1.3.10] - 2026-07-06
+### 新增 (Added)
+- **动态代理新增 Cliproxy IP 保留时长配置**：`api/config.py` 新增 `dynamic_proxy_ip_retention_minutes` 全局配置，默认 `5`，任务生成动态代理时会把用户名中的 `t-N` 统一覆盖为该值；模板没有 `t-N` 但包含 `sid-xxx` 时会自动补成 `sid-xxx-t-N`，让 `t-5` 这类 IP 保留时长不再只能写死在代理模板里。
+- **代理管理与 Settings 暴露 t-N 编辑入口**：`frontend/src/pages/Proxies.tsx` 的动态代理预览区新增“IP保留分钟”输入并随“保存为任务默认”落库；`frontend/src/pages/Settings.tsx` 动态代理配置区新增“IP 保留分钟数（t-N）”，并把模板提示改为支持 `region-Rand` / `t-5` 的 Cliproxy 形式。
+
+### 修复 (Fixed)
+- **修复 Cliproxy `region-Rand` 被截断成坏国家 token**：`core/dynamic_proxy.py` 的 region 解析从只匹配两位国家码改为匹配完整 region token，`region-Rand` 改写为 `region-US` / `region-JP` 时不再残留 `nd`，避免生成 `region-USnd`、`region-JPnd` 后触发代理侧 TLS/SSL 错误。
+
+### 测试 (Tests)
+- **补齐动态代理回归测试**：`tests/test_dynamic_proxy.py` 覆盖 `region-Rand` 完整改写、`t-N` 覆盖/补插、候选代理使用配置保留时长，以及动态代理预览接口不泄露原始代理凭证。
+
+### 优化 (Changed)
+- **同步前端版本号至 v1.3.10**：`frontend/src/app/AppShell.tsx` 侧边栏版本展示更新为 `v1.3.10`，用于上线后确认 Cliproxy 动态代理修复与 IP 保留时长配置已加载。
+
 ## [1.3.9] - 2026-07-06
 ### 修复 (Fixed)
 - **恢复普通邮箱注册的自动发码优先路径**：`services/chatgpt_core/chatgpt_client.py` 在 `Authorize -> /email-verification` 的注册分支中恢复旧行为，先等待 OpenAI 已自动发送到普通邮箱/邮箱 API 的验证码；只有首次等待窗口未收到时才触发 `email-otp/send` 补发，避免一进入验证码页就额外发码导致 OpenAI Auth session/OTP 状态被刷新，最终在 `/api/accounts/email-otp/validate` 返回 `409 invalid_state`、注册不能落库。
@@ -467,4 +481,8 @@
 
 ## 2026-07-06 01:49:32 +0800
 - 恢复普通邮箱注册验证码等待行为
+- 发布模式: multi
+
+## 2026-07-06 04:31:45 +0800
+- 兼容 Cliproxy region-Rand 并支持动态代理 IP 保留时长配置
 - 发布模式: multi

@@ -7,6 +7,7 @@ from services.chatgpt_core.task_logging import sanitize_task_detail
 
 
 TEMPLATE = "socks5://acct-region-JP-sid-oldsid-t-1:secret@example.cliproxy.io:3010"
+RAND_TEMPLATE = "socks5://acct-region-Rand-sid-oldsid-t-5:secret@example.cliproxy.io:3010"
 
 
 def test_dynamic_proxy_rewrites_region_refreshes_sid_and_redacts_credentials():
@@ -20,6 +21,32 @@ def test_dynamic_proxy_rewrites_region_refreshes_sid_and_redacts_credentials():
     assert resolved.sid_refreshed is True
     assert "secret" not in resolved.redacted_proxy_url
     assert "acct-region" not in resolved.redacted_proxy_url
+
+
+def test_dynamic_proxy_rewrites_full_region_rand_token_without_suffix_leak():
+    resolved = resolve_dynamic_proxy_template(RAND_TEMPLATE, "jp", refresh_sid=False)
+
+    assert resolved.template_country_code == "RAND"
+    assert resolved.resolved_country_code == "JP"
+    assert "region-JP-sid-" in resolved.proxy_url
+    assert "region-JPnd" not in resolved.proxy_url
+
+
+def test_dynamic_proxy_can_override_cliproxy_retention_token():
+    resolved = resolve_dynamic_proxy_template(TEMPLATE, "US", refresh_sid=False, retention_minutes=15)
+
+    assert "region-US" in resolved.proxy_url
+    assert "sid-oldsid-t-15" in resolved.proxy_url
+    assert resolved.retention_minutes == 15
+    assert resolved.retention_applied is True
+
+
+def test_dynamic_proxy_inserts_retention_after_sid_when_template_lacks_t_token():
+    template = "socks5://acct-region-Rand-sid-oldsid:secret@example.cliproxy.io:3010"
+    resolved = resolve_dynamic_proxy_template(template, "SG", refresh_sid=False, retention_minutes=7)
+
+    assert "region-SG" in resolved.proxy_url
+    assert "sid-oldsid-t-7:secret@" in resolved.proxy_url
 
 
 def test_dynamic_proxy_requires_region_marker():
@@ -76,6 +103,29 @@ def test_dynamic_proxy_uses_dynamic_attempts_not_pool_candidate_count():
     assert len(candidates) == 2
 
 
+def test_dynamic_proxy_candidate_uses_configured_retention_minutes(monkeypatch):
+    def fake_configured_value(key, default=""):
+        if key == "dynamic_proxy_ip_retention_minutes":
+            return "12"
+        return default
+
+    monkeypatch.setattr("core.proxy_utils._configured_value", fake_configured_value)
+    candidates = resolve_probe_candidate_proxies(
+        {
+            "proxy_mode": "dynamic",
+            "proxy": RAND_TEMPLATE,
+            "proxy_country_code": "US",
+            "dynamic_proxy_probe_enabled": False,
+        }
+    )
+
+    assert len(candidates) == 1
+    assert "region-US-sid-" in candidates[0][0]
+    assert "region-USnd" not in candidates[0][0]
+    assert "-t-12" in candidates[0][0]
+    assert "retention=t-12" in candidates[0][2]
+
+
 def test_specified_mode_does_not_rewrite_region_or_sid():
     proxy = "http://acct-region-JP-sid-oldsid-t-1:secret@example.cliproxy.io:3010"
     candidates = resolve_probe_candidate_proxies(
@@ -104,6 +154,7 @@ def test_dynamic_preview_response_never_returns_raw_credentials():
         DynamicProxyPreviewRequest(
             proxy=TEMPLATE,
             country_code="US",
+            retention_minutes=9,
             refresh_sid=True,
             probe=False,
         )
@@ -111,6 +162,7 @@ def test_dynamic_preview_response_never_returns_raw_credentials():
     dumped = str(result)
     assert result["ok"] is True
     assert result["expected_country"] == "US"
+    assert result["retention_minutes"] == 9
     assert "runtime_proxy_redacted" in result
     assert "secret" not in dumped
     assert "acct-region" not in dumped

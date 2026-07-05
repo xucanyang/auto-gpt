@@ -70,6 +70,7 @@ interface ConfigPayload {
   proxy_pool_max_candidates?: string
   dynamic_proxy_template?: string
   dynamic_proxy_default_country?: string
+  dynamic_proxy_ip_retention_minutes?: string
   dynamic_proxy_probe_enabled?: boolean | string
   dynamic_proxy_require_country_match?: boolean | string
   dynamic_proxy_probe_timeout_seconds?: string
@@ -247,6 +248,7 @@ export default function Proxies() {
   const [poolMaxCandidates, setPoolMaxCandidates] = useState(5)
   const [dynamicProxyTemplate, setDynamicProxyTemplate] = useState('')
   const [dynamicProxyCountry, setDynamicProxyCountry] = useState('JP')
+  const [dynamicProxyRetentionMinutes, setDynamicProxyRetentionMinutes] = useState(5)
   const [dynamicProxyProbe, setDynamicProxyProbe] = useState(true)
   const [dynamicPreviewLoading, setDynamicPreviewLoading] = useState(false)
   const [dynamicSaving, setDynamicSaving] = useState(false)
@@ -355,6 +357,7 @@ export default function Proxies() {
       setPoolMaxCandidates(Math.max(1, Number(cfg?.proxy_pool_max_candidates || 5) || 5))
       setDynamicProxyTemplate(String(cfg?.dynamic_proxy_template || ''))
       setDynamicProxyCountry(String(cfg?.dynamic_proxy_default_country || 'JP').trim().toUpperCase() || 'JP')
+      setDynamicProxyRetentionMinutes(Math.max(1, Math.min(1440, Number(cfg?.dynamic_proxy_ip_retention_minutes || 5) || 5)))
       setDynamicProxyProbe(String(cfg?.dynamic_proxy_probe_enabled ?? 'true').trim().toLowerCase() !== 'false')
       try {
         const scheduler = await apiFetch('/proxies/scan-scheduler/status') as Record<string, unknown>
@@ -679,6 +682,7 @@ export default function Proxies() {
         proxy_mode: 'dynamic',
         proxy: template,
         proxy_country_code: country,
+        dynamic_proxy_ip_retention_minutes: dynamicProxyRetentionMinutes,
         proxy_failover: false,
         proxy_max_candidates: poolMaxCandidates,
         proxy_min_score: scanMinScore,
@@ -710,6 +714,7 @@ export default function Proxies() {
         body: JSON.stringify({
           proxy: template,
           country_code: country,
+          retention_minutes: dynamicProxyRetentionMinutes,
           refresh_sid: true,
           probe: dynamicProxyProbe,
           require_country_match: true,
@@ -1119,13 +1124,13 @@ export default function Proxies() {
             type="info"
             showIcon
             message="动态代理不是本地代理池记录"
-            description="输入包含 region-XX / sid-xxx-t- 的模板，系统会按出口国家改写 region 并刷新 sid；预览优先用代理出口侧 Cloudflare Trace 实测国家，GeoIP 临时不可用时会标记未实测，预览和日志只展示脱敏地址。"
+            description="输入包含 region-XX 或 region-Rand、sid-xxx-t-N 的模板，系统会按出口国家改写 region、刷新 sid，并按“IP保留分钟”覆盖 t-N；预览优先用代理出口侧 Cloudflare Trace 实测国家，GeoIP 临时不可用时会标记未实测，预览和日志只展示脱敏地址。"
           />
           <Space wrap align="start" style={{ width: '100%' }}>
             <Input.Password
               value={dynamicProxyTemplate}
               onChange={(event) => setDynamicProxyTemplate(event.target.value)}
-              placeholder="socks5://user-region-JP-sid-xxxx-t-1:pass@host:port"
+              placeholder="socks5://user-region-Rand-sid-xxxx-t-5:pass@host:port"
               style={{ width: isMobile ? '100%' : 520 }}
             />
             <Input
@@ -1134,6 +1139,15 @@ export default function Proxies() {
               placeholder="US / JP / SG"
               maxLength={2}
               style={{ width: 120 }}
+            />
+            <InputNumber
+              min={1}
+              max={1440}
+              precision={0}
+              value={dynamicProxyRetentionMinutes}
+              onChange={(value) => setDynamicProxyRetentionMinutes(Number(value || 5))}
+              addonBefore="IP保留分钟"
+              style={{ width: 180 }}
             />
             <Checkbox checked={dynamicProxyProbe} onChange={(event) => setDynamicProxyProbe(event.target.checked)}>实测出口</Checkbox>
             <Button type="primary" icon={<ThunderboltOutlined />} loading={dynamicPreviewLoading} onClick={() => void previewDynamicProxy()}>
@@ -1153,6 +1167,7 @@ export default function Proxies() {
               <Descriptions.Item label="出口 IP">{dynamicPreviewResult.exit_ip || '-'}</Descriptions.Item>
               <Descriptions.Item label="Provider">{dynamicPreviewResult.provider || '-'}</Descriptions.Item>
               <Descriptions.Item label="sid">{dynamicPreviewResult.sid_refreshed ? '已刷新' : '未刷新/无 sid'}</Descriptions.Item>
+              <Descriptions.Item label="IP保留">{dynamicPreviewResult.retention_minutes ? `t-${dynamicPreviewResult.retention_minutes}` : '-'}</Descriptions.Item>
               <Descriptions.Item label="运行代理" span={isMobile ? 1 : 3}>
                 <Typography.Text code copyable={Boolean(dynamicPreviewResult.runtime_proxy_redacted)}>
                   {dynamicPreviewResult.runtime_proxy_redacted || dynamicPreviewResult.proxy || '-'}

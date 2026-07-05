@@ -58,6 +58,7 @@ class ProxySnapshotRequest(BaseModel):
 class DynamicProxyPreviewRequest(BaseModel):
     proxy: str = ""
     country_code: str = ""
+    retention_minutes: int | None = None
     refresh_sid: bool = True
     probe: bool = True
     require_country_match: bool | None = None
@@ -376,6 +377,11 @@ def dynamic_proxy_preview(body: DynamicProxyPreviewRequest):
 
     template = str(body.proxy or config_store.get("dynamic_proxy_template", "") or "").strip()
     country_code = str(body.country_code or config_store.get("dynamic_proxy_default_country", "") or "").strip().upper()
+    retention_minutes = (
+        body.retention_minutes
+        if body.retention_minutes is not None
+        else config_store.get("dynamic_proxy_ip_retention_minutes", "5")
+    )
     if not template:
         raise HTTPException(400, "动态代理模板不能为空")
     if not country_code:
@@ -386,6 +392,7 @@ def dynamic_proxy_preview(body: DynamicProxyPreviewRequest):
             template,
             country_code,
             refresh_sid=bool(body.refresh_sid),
+            retention_minutes=retention_minutes,
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
@@ -404,6 +411,8 @@ def dynamic_proxy_preview(body: DynamicProxyPreviewRequest):
         "template_country": resolved.template_country_code,
         "declared_country": resolved.resolved_country_code,
         "sid_refreshed": bool(resolved.sid_refreshed),
+        "retention_minutes": resolved.retention_minutes,
+        "retention_applied": bool(resolved.retention_applied),
         "template_redacted": resolved.redacted_template,
         "proxy": runtime_redacted,
         "runtime_proxy_redacted": runtime_redacted,
