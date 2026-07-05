@@ -639,15 +639,13 @@ def _build_config_response(*, local_only: bool = False) -> dict[str, Any]:
 
 
 def _build_shareable_local_snapshot() -> dict[str, str]:
-    """构造“本实例本地配置”视角的共享模板候选。
+    """构造“本实例已保存本地配置”视角的共享模板候选。
 
     Settings 页只维护 CONFIG_KEYS，但历史/集成模块可能也通过 config_store 写入
-    其他全局 key。推送或对比共享模板时不能把这些非页面字段静默丢掉。
+    其他全局 key。推送或对比共享模板时必须基于本地 configs 全量快照，
+    避免丢掉非页面字段，也避免把默认值/布尔展示值当成真实差异。
     """
-    raw_local = config_store.get_local_all()
-    settings_view = _build_config_response(local_only=True)
-    merged = {**raw_local, **settings_view}
-    return filter_shareable_config(merged)
+    return filter_shareable_config(config_store.get_local_all())
 
 
 @router.get("")
