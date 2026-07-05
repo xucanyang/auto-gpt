@@ -23,6 +23,12 @@ import {
 } from '@/lib/chatgptRegistrationMode'
 import { apiFetch } from '@/lib/utils'
 import { normalizeDomainList } from '@/lib/domainList'
+import {
+  CHATGPT_K12_FIELD_NAMES,
+  buildChatGPTK12ConfigData,
+  chatgptK12InitialValues,
+  normalizeK12WorkspaceIds,
+} from '@/lib/chatgptK12Config'
 
 
 type TempMailDomainOption = {
@@ -89,6 +95,8 @@ export function RegisterTaskModal({
   const selectedTempMailDomains = Form.useWatch('tempmail_fixed_domains', registerForm) || []
   const proxyMode = Form.useWatch('proxy_mode', registerForm)
   const proxyFailover = Form.useWatch('proxy_failover', registerForm)
+  const k12Enabled = Form.useWatch('chatgpt_k12_enabled', registerForm)
+  const k12SaveAllSpaces = Form.useWatch('chatgpt_k12_save_all_spaces', registerForm)
   const [tempmailDomains, setTempmailDomains] = useState<TempMailDomainOption[]>([])
   const [tempmailDomainsLoading, setTempmailDomainsLoading] = useState(false)
   const isPhoneSignup = currentPlatform === 'chatgpt' && chatgptRegistrationEntry === 'phone_signup'
@@ -140,6 +148,24 @@ export function RegisterTaskModal({
     if (!open || !isPhoneSignup) return
     registerForm.setFieldsValue({ concurrency: 1 })
   }, [open, isPhoneSignup, registerForm])
+
+  useEffect(() => {
+    if (!open || currentPlatform !== 'chatgpt') return
+    let cancelled = false
+    apiFetch('/config')
+      .then((cfg) => {
+        if (cancelled) return
+        const isTouched = typeof registerForm.isFieldsTouched === 'function'
+          ? registerForm.isFieldsTouched(CHATGPT_K12_FIELD_NAMES, false)
+          : false
+        if (isTouched) return
+        registerForm.setFieldsValue(chatgptK12InitialValues(cfg))
+      })
+      .catch(() => null)
+    return () => {
+      cancelled = true
+    }
+  }, [currentPlatform, open, registerForm])
 
   const isPhoneBindingTest = String(taskSnapshot?.source || '').trim() === 'phone_binding_test'
   const boundPhoneLines = Array.isArray(taskSnapshot?.meta?.bound_phone_lines) ? taskSnapshot.meta.bound_phone_lines : []
@@ -202,6 +228,33 @@ export function RegisterTaskModal({
     return `注册 ${currentPlatform}`
   }
 
+  const persistChatGPTK12Config = async () => {
+    if (currentPlatform !== 'chatgpt') return
+    const values = registerForm.getFieldsValue(true)
+    await apiFetch('/config', {
+      method: 'PUT',
+      body: JSON.stringify({ data: buildChatGPTK12ConfigData(values) }),
+    })
+  }
+
+  const handleSaveRegisterSettings = async () => {
+    try {
+      await persistChatGPTK12Config()
+      await onSaveRegisterSettings()
+    } catch (error: any) {
+      message.error(error?.message || '保存 K12 配置失败')
+    }
+  }
+
+  const handleRegister = async () => {
+    try {
+      await persistChatGPTK12Config()
+      await onRegister()
+    } catch (error: any) {
+      message.error(error?.message || '保存 K12 配置失败')
+    }
+  }
+
   return (
     <Modal
       title={modalTitle()}
@@ -212,7 +265,7 @@ export function RegisterTaskModal({
       maskClosable={false}
     >
       {!taskId ? (
-        <Form form={registerForm} layout="vertical" onFinish={onRegister}>
+        <Form form={registerForm} layout="vertical" onFinish={handleRegister}>
           {currentPlatform === 'chatgpt' ? (
             <Form.Item name="chatgpt_registration_entry" label="注册入口" initialValue="email_signup">
               <Select
@@ -514,6 +567,64 @@ export function RegisterTaskModal({
                 </Form.Item>
               ) : null}
               <Form.Item
+                label="K12 / Workspace 加入"
+                extra="只保存 workspace variants 摘要与抓取策略；token/cookies 不会在列表或摘要中展开。"
+              >
+                <Space direction="vertical" size={8} style={{ width: '100%' }}>
+                  <Space size={16} wrap>
+                    <Form.Item name="chatgpt_k12_enabled" valuePropName="checked" initialValue={false} noStyle>
+                      <Checkbox>启用 K12</Checkbox>
+                    </Form.Item>
+                    <Form.Item name="chatgpt_k12_save_all_spaces" valuePropName="checked" initialValue={true} noStyle>
+                      <Checkbox disabled={!k12Enabled}>保存所有空间 variants</Checkbox>
+                    </Form.Item>
+                    <Form.Item name="chatgpt_k12_strict_join" valuePropName="checked" initialValue={false} noStyle>
+                      <Checkbox disabled={!k12Enabled}>严格 join</Checkbox>
+                    </Form.Item>
+                    <Form.Item name="chatgpt_k12_capture_refresh_tokens" valuePropName="checked" initialValue={false} noStyle>
+                      <Checkbox disabled>抓取 RT variants（预留）</Checkbox>
+                    </Form.Item>
+                  </Space>
+                  <Form.Item
+                    name="chatgpt_k12_workspace_ids"
+                    label="Workspace IDs"
+                    initialValue={[]}
+                    rules={[
+                      {
+                        validator: (_, value) => {
+                          if (!k12Enabled || k12SaveAllSpaces || normalizeK12WorkspaceIds(value).length > 0) {
+                            return Promise.resolve()
+                          }
+                          return Promise.reject(new Error('启用 K12 且未保存所有空间时，请至少填写一个 workspace_id'))
+                        },
+                      },
+                    ]}
+                    extra="可粘贴多个 workspace_id，逗号、空格或回车分隔；勾选保存所有空间时可留空。"
+                  >
+                    <Select
+                      mode="tags"
+                      open={false}
+                      allowClear
+                      disabled={!k12Enabled || k12SaveAllSpaces}
+                      tokenSeparators={[',', ' ', '\n']}
+                      placeholder="ws_xxx / org_xxx"
+                      style={{ width: '100%' }}
+                    />
+                  </Form.Item>
+                  <Space align="start" style={{ width: '100%' }}>
+                    <Form.Item name="chatgpt_k12_join_timeout_seconds" label="超时秒数" initialValue={60} style={{ flex: 1 }}>
+                      <InputNumber disabled={!k12Enabled} min={30} max={3600} precision={0} style={{ width: '100%' }} />
+                    </Form.Item>
+                    <Form.Item name="chatgpt_k12_join_retry_count" label="重试次数" initialValue={2} style={{ flex: 1 }}>
+                      <InputNumber disabled={!k12Enabled} min={0} max={20} precision={0} style={{ width: '100%' }} />
+                    </Form.Item>
+                    <Form.Item name="chatgpt_k12_post_join_poll_seconds" label="轮询间隔秒" initialValue="3,8,15" style={{ flex: 1 }}>
+                      <Input disabled={!k12Enabled} placeholder="3,8,15" />
+                    </Form.Item>
+                  </Space>
+                </Space>
+              </Form.Item>
+              <Form.Item
                 noStyle
                 shouldUpdate={(prev, next) => (
                   prev.chatgpt_existing_account_capture !== next.chatgpt_existing_account_capture
@@ -599,7 +710,7 @@ export function RegisterTaskModal({
           <Form.Item>
             <Space direction="vertical" style={{ width: '100%' }} size={8}>
               {currentPlatform === 'chatgpt' ? (
-                <Button block onClick={onSaveRegisterSettings} loading={registerSettingsSaving}>
+                <Button block onClick={handleSaveRegisterSettings} loading={registerSettingsSaving}>
                   保存设置
                 </Button>
               ) : null}

@@ -496,6 +496,9 @@ def enqueue_register_task(
                     "capture_business_workspace": _is_truthy(prepared_extra.get("chatgpt_capture_business_workspace")),
                     "enable_team_invite": _is_truthy(prepared_extra.get("chatgpt_enable_team_invite")),
                     "deferred_activation": _is_truthy(prepared_extra.get("chatgpt_team_invite_deferred_activation")),
+                    "k12_enabled": _is_truthy(prepared_extra.get("chatgpt_k12_enabled")),
+                    "k12_workspace_count": len([item for item in re.split(r"[\s,;，；]+", str(prepared_extra.get("chatgpt_k12_workspace_ids") or "").strip()) if item]),
+                    "k12_save_all_spaces": _is_truthy(prepared_extra.get("chatgpt_k12_save_all_spaces", True)),
                     "zero_amount_stop_enabled": _is_truthy(
                         prepared_extra.get("chatgpt_access_token_only_zero_amount_stop_enabled")
                     ),
@@ -10487,6 +10490,14 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                             "chatgpt_capture_free_workspace",
                             "chatgpt_capture_business_workspace",
                             "chatgpt_existing_account_capture",
+                            "chatgpt_k12_enabled",
+                            "chatgpt_k12_workspace_ids",
+                            "chatgpt_k12_save_all_spaces",
+                            "chatgpt_k12_strict_join",
+                            "chatgpt_k12_join_timeout_seconds",
+                            "chatgpt_k12_join_retry_count",
+                            "chatgpt_k12_post_join_poll_seconds",
+                            "chatgpt_k12_capture_refresh_tokens",
                             "chatgpt_deferred_invite_team_id",
                             "chatgpt_deferred_invite_team_ids",
                         ):
@@ -10771,7 +10782,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                                 if scope_label:
                                     _log(task_id, f"[OK] 已保存附加工作空间: {linked_account.email} [{scope_label}]")
                         except Exception as save_exc:
-                            _log(task_id, f"[WARN] 保存附加工作空间失败: {save_exc}")
+                            _log(task_id, f"[WARN] 保存附加工作空间失败: {sanitize_error_message(save_exc)}")
                 if _proxy and proxy_pool is not None and str(proxy_source or "").startswith("pool"):
                     proxy_pool.report_success(_proxy)
                 if deferred_activation_enabled and pending_invite is not None:

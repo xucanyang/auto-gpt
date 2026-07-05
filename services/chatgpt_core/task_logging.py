@@ -58,8 +58,12 @@ _PASSWORD_KEYS = {
 _COOKIE_KEYS = {
     "cookie",
     "cookies",
+    "cookie_header",
+    "cookieheader",
     "set-cookie",
     "setcookie",
+    "next_auth_session",
+    "nextauthsession",
     "oai-client-auth-session",
     "oaiclientauthsession",
     "login_session",
@@ -249,7 +253,7 @@ def _redact_key_value_text(text: str, *, expose_otp: bool = False) -> str:
         r"access[_-]?token|refresh[_-]?token|id[_-]?token|session[_-]?token|accessToken|sessionToken|csrf[_-]?token|csrf\s+token|token|api[_-]?key|apikey|x[_-]?api[_-]?key|api[_-]?secret|client[_-]?secret|clientSecret|secret"
     )
     password_keys = r"password|login_password|chatgpt_phone_signup_password"
-    cookie_keys = r"cookie|cookies|set-cookie|oai-client-auth-session|login_session"
+    cookie_keys = r"cookie|cookies|cookie[_-]?header|set-cookie|oai-client-auth-session|login_session|next[_-]?auth[_-]?session|__Secure-next-auth\\.session-token|authjs\\.session-token|oai-did|cf_clearance"
     otp_keys = r"otp|code|verification[_-]?code|phone[_-]?otp|email[_-]?otp|auth[_-]?code|authorization[_-]?code"
 
     text = re.sub(
@@ -266,6 +270,11 @@ def _redact_key_value_text(text: str, *, expose_otp: bool = False) -> str:
     text = re.sub(
         rf"(?i)\b({token_keys})\b(\"?\s*[:=]\s*\"?)[^\"',;}}\]\s]+",
         rf"\1\2{REDACTED_TOKEN}",
+        text,
+    )
+    text = re.sub(
+        rf"(?i)([\"']\s*(?:{token_keys})\s*[\"']\s*:\s*[\"'])[^\"']+([\"'])",
+        rf"\1{REDACTED_TOKEN}\2",
         text,
     )
     if not expose_otp:
@@ -285,8 +294,18 @@ def _redact_key_value_text(text: str, *, expose_otp: bool = False) -> str:
         text,
     )
     text = re.sub(
+        rf"(?i)([\"']\s*(?:{password_keys})\s*[\"']\s*:\s*[\"'])[^\"']+([\"'])",
+        rf"\1{REDACTED}\2",
+        text,
+    )
+    text = re.sub(
         rf"(?i)\b({cookie_keys})\b(\"?\s*[:=]\s*\"?).*?(?=$|\n|\r)",
         rf"\1\2{REDACTED}",
+        text,
+    )
+    text = re.sub(
+        rf"(?i)([\"']\s*(?:{cookie_keys})\s*[\"']\s*:\s*[\"'])[^\"']+([\"'])",
+        rf"\1{REDACTED}\2",
         text,
     )
     text = _JWT_RE.sub(REDACTED_TOKEN, text)

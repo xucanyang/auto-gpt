@@ -29,6 +29,7 @@ import { usePersistentChatGPTRegistrationMode } from '@/hooks/usePersistentChatG
 import { parseBooleanConfigValue } from '@/lib/configValueParsers'
 import { buildChatGPTRegistrationRequestAdapter } from '@/lib/chatgptRegistrationRequestAdapter'
 import { CHATGPT_REGISTRATION_MODE_REFRESH_TOKEN } from '@/lib/chatgptRegistrationMode'
+import { buildChatGPTK12Payload, chatgptK12InitialValues, normalizeK12WorkspaceIds } from '@/lib/chatgptK12Config'
 import { getExecutorOptions, normalizeExecutorForPlatform } from '@/lib/platformExecutorOptions'
 import { apiFetch } from '@/lib/utils'
 import { buildTaskProxyPayload, saveTaskProxySettingsToConfig, taskProxySettingsFromConfig, validateTaskProxySettings } from '@/lib/taskProxySettings'
@@ -174,6 +175,7 @@ export default function RegisterTaskPage() {
         chatgpt_team_invite_deferred_activation: parseBooleanConfigValue(cfg.chatgpt_team_invite_deferred_activation),
         chatgpt_capture_business_workspace: cfg.chatgpt_capture_business_workspace === '' ? true : parseBooleanConfigValue(cfg.chatgpt_capture_business_workspace),
         chatgpt_capture_free_workspace: cfg.chatgpt_capture_free_workspace === '' ? true : parseBooleanConfigValue(cfg.chatgpt_capture_free_workspace),
+        ...chatgptK12InitialValues(cfg),
         chatgpt_access_token_only_checkout_amount_check_enabled:
           cfg.chatgpt_access_token_only_checkout_amount_check_enabled === ''
             ? true
@@ -334,6 +336,7 @@ export default function RegisterTaskPage() {
         platform === 'chatgpt'
           ? Boolean(values.chatgpt_access_token_only_gopay_provider_link_enabled)
           : undefined,
+      ...(platform === 'chatgpt' ? buildChatGPTK12Payload(values) : {}),
     }
     const chatgptRegistrationRequestAdapter =
       buildChatGPTRegistrationRequestAdapter(
@@ -626,6 +629,14 @@ export default function RegisterTaskPage() {
         chatgpt_team_invite_deferred_activation: false,
         chatgpt_capture_business_workspace: true,
         chatgpt_capture_free_workspace: true,
+        chatgpt_k12_enabled: false,
+        chatgpt_k12_workspace_ids: [],
+        chatgpt_k12_save_all_spaces: true,
+        chatgpt_k12_strict_join: false,
+        chatgpt_k12_join_timeout_seconds: 60,
+        chatgpt_k12_join_retry_count: 2,
+        chatgpt_k12_post_join_poll_seconds: '3,8,15',
+        chatgpt_k12_capture_refresh_tokens: false,
         chatgpt_save_registration_access_token_account: true,
         chatgpt_registration_entry: 'email_signup',
         chatgpt_phone_signup_use_pool: false,
@@ -856,6 +867,77 @@ export default function RegisterTaskPage() {
                           />
                         ) : null}
                       </>
+                    )
+                  }}
+                </Form.Item>
+                <Form.Item
+                  noStyle
+                  shouldUpdate={(prev, next) => (
+                    prev.chatgpt_k12_enabled !== next.chatgpt_k12_enabled
+                    || prev.chatgpt_k12_save_all_spaces !== next.chatgpt_k12_save_all_spaces
+                  )}
+                >
+                  {({ getFieldValue }) => {
+                    const k12Enabled = Boolean(getFieldValue('chatgpt_k12_enabled'))
+                    const saveAllSpaces = Boolean(getFieldValue('chatgpt_k12_save_all_spaces'))
+                    return (
+                      <Form.Item
+                        label="K12 / Workspace 加入"
+                        extra="只提交 workspace 元信息与抓取策略；token/cookies 不会在列表或摘要里展开。"
+                      >
+                        <Space direction="vertical" size={8} style={{ width: '100%' }}>
+                          <Space size={16} wrap>
+                            <Form.Item name="chatgpt_k12_enabled" valuePropName="checked" noStyle>
+                              <Checkbox>启用 K12</Checkbox>
+                            </Form.Item>
+                            <Form.Item name="chatgpt_k12_save_all_spaces" valuePropName="checked" noStyle>
+                              <Checkbox disabled={!k12Enabled}>保存所有空间 variants</Checkbox>
+                            </Form.Item>
+                            <Form.Item name="chatgpt_k12_strict_join" valuePropName="checked" noStyle>
+                              <Checkbox disabled={!k12Enabled}>严格 join</Checkbox>
+                            </Form.Item>
+                            <Form.Item name="chatgpt_k12_capture_refresh_tokens" valuePropName="checked" noStyle>
+                              <Checkbox disabled>抓取 RT variants（预留）</Checkbox>
+                            </Form.Item>
+                          </Space>
+                          <Form.Item
+                            name="chatgpt_k12_workspace_ids"
+                            label="Workspace IDs"
+                            rules={[
+                              {
+                                validator: (_, value) => {
+                                  if (!k12Enabled || saveAllSpaces || normalizeK12WorkspaceIds(value).length > 0) {
+                                    return Promise.resolve()
+                                  }
+                                  return Promise.reject(new Error('启用 K12 且未保存所有空间时，请至少填写一个 workspace_id'))
+                                },
+                              },
+                            ]}
+                            extra="可粘贴多个 workspace_id，逗号、空格或回车分隔；勾选保存所有空间时可留空。"
+                          >
+                            <Select
+                              mode="tags"
+                              open={false}
+                              allowClear
+                              disabled={!k12Enabled || saveAllSpaces}
+                              tokenSeparators={[',', ' ', '\n']}
+                              placeholder="ws_xxx / org_xxx"
+                              style={{ width: '100%' }}
+                            />
+                          </Form.Item>
+                          <Space align="start" style={{ width: '100%' }}>
+                            <Form.Item name="chatgpt_k12_join_timeout_seconds" label="超时秒数" style={{ flex: 1 }}>
+                              <InputNumber disabled={!k12Enabled} min={30} max={3600} precision={0} style={{ width: '100%' }} />
+                            </Form.Item>
+                            <Form.Item name="chatgpt_k12_join_retry_count" label="重试次数" style={{ flex: 1 }}>
+                              <InputNumber disabled={!k12Enabled} min={0} max={20} precision={0} style={{ width: '100%' }} />
+                            </Form.Item>
+                            <Form.Item name="chatgpt_k12_post_join_poll_seconds" label="轮询间隔秒" style={{ flex: 1 }}>
+                              <Input disabled={!k12Enabled} placeholder="3,8,15" />
+                            </Form.Item>
+                          </Space>
+                        </Space>
+                      </Form.Item>
                     )
                   }}
                 </Form.Item>

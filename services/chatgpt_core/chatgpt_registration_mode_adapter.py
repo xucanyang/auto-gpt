@@ -101,7 +101,11 @@ class BaseChatGPTRegistrationModeAdapter(ABC):
                     "scope": str((account.extra or {}).get("chatgpt_workspace_scope") or ""),
                     "label": str((account.extra or {}).get("chatgpt_workspace_label") or ""),
                     "workspace_id": str((account.extra or {}).get("workspace_id") or ""),
+                    "account_id": str((account.extra or {}).get("account_id") or account.user_id or ""),
                     "display_name": str((account.extra or {}).get("chatgpt_workspace_display_name") or ""),
+                    "source": str((account.extra or {}).get("chatgpt_token_source") or ""),
+                    "auth_level": str((account.extra or {}).get("auth_level") or ""),
+                    "partial_auth": bool((account.extra or {}).get("partial_auth")),
                 }
                 for account in accounts
             ]
@@ -110,27 +114,39 @@ class BaseChatGPTRegistrationModeAdapter(ABC):
     @staticmethod
     def _normalize_workspace_scope(value) -> str:
         normalized = str(value or "").strip().lower().replace("-", "_")
-        if normalized in {"free", "personal", "personal_free"}:
+        if normalized in {"free", "personal", "personal_free", "default"}:
             return "free"
         if normalized in {"business", "team", "workspace", "enterprise"}:
             return "business"
+        if normalized in {"k12", "education", "edu", "school"}:
+            return "k12"
         return ""
 
     @staticmethod
+    def _artifact_strength(item: dict[str, Any]) -> tuple[int, int, int]:
+        refresh_token = str(item.get("refresh_token") or "").strip()
+        access_token = str(item.get("access_token") or "").strip()
+        partial = bool(item.get("partial_auth")) or str(item.get("auth_level") or "").strip() == "access_token_only"
+        return (1 if refresh_token else 0, 1 if access_token else 0, 0 if partial else 1)
+
+    @staticmethod
     def _dedupe_workspace_artifacts(artifacts: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        seen: set[tuple[str, str, str, str]] = set()
         deduped: list[dict[str, Any]] = []
+        positions: dict[tuple[str, str, str], int] = {}
         for item in artifacts:
             scope = BaseChatGPTRegistrationModeAdapter._normalize_workspace_scope(item.get("scope") or "") or "free"
             workspace_id = str(item.get("workspace_id") or "").strip()
             account_id = str(item.get("account_id") or "").strip()
-            refresh_token = str(item.get("refresh_token") or "").strip()
-            variant_key = str(item.get("variant_key") or "").strip()
-            key = (scope, workspace_id, account_id, refresh_token or variant_key)
-            if key in seen:
+            variant_key = str(item.get("variant_key") or "").strip() or f"{scope}:{workspace_id or account_id or 'default'}"
+            key = (variant_key, workspace_id, account_id)
+            if key not in positions:
+                positions[key] = len(deduped)
+                deduped.append(item)
                 continue
-            seen.add(key)
-            deduped.append(item)
+            previous_index = positions[key]
+            previous = deduped[previous_index]
+            if BaseChatGPTRegistrationModeAdapter._artifact_strength(item) > BaseChatGPTRegistrationModeAdapter._artifact_strength(previous):
+                deduped[previous_index] = item
         return deduped
 
     def _build_account_extra(self, result) -> dict:
@@ -154,25 +170,52 @@ class BaseChatGPTRegistrationModeAdapter(ABC):
 
     def _build_account_extra_for_artifact(self, artifact: dict, result) -> dict:
         scope = self._normalize_workspace_scope(artifact.get("scope") or "") or "free"
-        label = "business" if scope == "business" else "free"
+        default_label = {"business": "business", "k12": "k12", "free": "free"}.get(scope, scope or "free")
+        label = str(artifact.get("label") or default_label).strip() or default_label
         email = getattr(result, "email", "")
         workspace_id = artifact.get("workspace_id") or getattr(result, "workspace_id", "")
         account_id = artifact.get("account_id") or getattr(result, "account_id", "")
         variant_key = artifact.get("variant_key") or f"{scope}:{workspace_id or account_id or 'default'}"
+        space_payload = artifact.get("space") if isinstance(artifact.get("space"), dict) else {}
+        display_name = str(artifact.get("display_name") or space_payload.get("name") or "").strip()
+        if not display_name:
+            display_name = f"{email} [{label}]" if email else f"[{label}]"
+        def _artifact_or_result(key: str, attr: str) -> Any:
+            if key in artifact:
+                return artifact.get(key) or ""
+            return getattr(result, attr, "")
+
+        access_token = _artifact_or_result("access_token", "access_token")
+        refresh_token = _artifact_or_result("refresh_token", "refresh_token")
+        id_token = _artifact_or_result("id_token", "id_token")
+        session_token = _artifact_or_result("session_token", "session_token")
         extra = {
-            "access_token": artifact.get("access_token") or getattr(result, "access_token", ""),
-            "refresh_token": artifact.get("refresh_token") or getattr(result, "refresh_token", ""),
-            "id_token": artifact.get("id_token") or getattr(result, "id_token", ""),
-            "session_token": artifact.get("session_token") or getattr(result, "session_token", ""),
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "id_token": id_token,
+            "session_token": session_token,
             "workspace_id": workspace_id,
+            "account_id": account_id,
             "chatgpt_registration_mode": self.mode,
-            "chatgpt_has_refresh_token_solution": self.mode == CHATGPT_REGISTRATION_MODE_REFRESH_TOKEN,
+            "chatgpt_has_refresh_token_solution": bool(str(refresh_token or "").strip()),
             "chatgpt_token_source": artifact.get("source") or getattr(result, "source", "register"),
             "chatgpt_workspace_scope": scope,
             "chatgpt_workspace_label": label,
-            "chatgpt_workspace_display_name": f"{email} [{label}]" if email else f"[{label}]",
+            "chatgpt_workspace_display_name": display_name,
             "chatgpt_workspace_variant_key": variant_key,
         }
+        if artifact.get("cookies"):
+            extra["cookies"] = artifact.get("cookies")
+            extra.setdefault("cookie_header", artifact.get("cookies"))
+        if artifact.get("cookie_header"):
+            extra["cookie_header"] = artifact.get("cookie_header")
+            extra.setdefault("cookies", artifact.get("cookie_header"))
+        if isinstance(artifact.get("space"), dict):
+            extra["chatgpt_workspace_space"] = artifact.get("space")
+        if isinstance(artifact.get("k12_join"), dict):
+            extra["chatgpt_k12_join"] = artifact.get("k12_join")
+        if artifact.get("all_spaces_capture"):
+            extra["chatgpt_all_spaces_capture"] = artifact.get("all_spaces_capture")
         if artifact.get("auth_level"):
             extra["auth_level"] = artifact.get("auth_level")
         if artifact.get("partial_auth"):
@@ -226,8 +269,14 @@ class BaseChatGPTRegistrationModeAdapter(ABC):
                 "cookies",
                 "cookie_header",
                 "registration_web_session_material_preserved",
+                "chatgpt_k12_join_summary",
+                "chatgpt_k12_join_results",
+                "chatgpt_all_spaces",
+                "chatgpt_k12_exchange_failures",
             ):
                 if key in metadata:
+                    if key in {"cookies", "cookie_header"} and extra.get(key):
+                        continue
                     extra[key] = metadata.get(key)
             if metadata.get("chatgpt_checkout_url"):
                 extra.setdefault("cashier_url", metadata.get("chatgpt_checkout_url"))
@@ -387,8 +436,22 @@ class RefreshTokenChatGPTRegistrationAdapter(BaseChatGPTRegistrationModeAdapter)
             "auth_level": "access_token_only",
             "partial_auth": True,
         }
+        existing_artifacts = [
+            item
+            for item in (getattr(result, "workspace_artifacts", None) or [])
+            if isinstance(item, dict)
+        ]
+        preserved_artifacts: list[dict[str, Any]] = []
+        for existing in existing_artifacts:
+            existing_scope = self._normalize_workspace_scope(existing.get("scope") or "") or "free"
+            if existing_scope == "free":
+                for key in ("cookies", "cookie_header", "display_name", "space"):
+                    if existing.get(key) and not artifact.get(key):
+                        artifact[key] = existing.get(key)
+                continue
+            preserved_artifacts.append(existing)
         result.source = "registration_session"
-        result.workspace_artifacts = [artifact]
+        result.workspace_artifacts = self._dedupe_workspace_artifacts([artifact] + preserved_artifacts)
         return artifact
 
     @staticmethod
@@ -536,10 +599,71 @@ class RefreshTokenChatGPTRegistrationAdapter(BaseChatGPTRegistrationModeAdapter)
         if inherited:
             target_metadata["registration_web_session_material_preserved"] = True
 
+    def _merge_stage1_workspace_artifacts(
+        self,
+        target_result,
+        stage1_result,
+        *,
+        checkpoint_variant_key: str = "",
+    ) -> None:
+        """Keep K12/all-space AT-only variants captured in stage1 after free RT upgrade."""
+        target_artifacts = [
+            item
+            for item in (getattr(target_result, "workspace_artifacts", None) or [])
+            if isinstance(item, dict)
+        ]
+        checkpoint_variant_key = str(checkpoint_variant_key or "").strip()
+        merged: list[dict[str, Any]] = list(target_artifacts)
+        seen: set[str] = set()
+        for item in merged:
+            seen.add(
+                str(item.get("variant_key") or "").strip()
+                or f"{self._normalize_workspace_scope(item.get('scope') or '')}:{item.get('workspace_id') or item.get('account_id') or ''}"
+            )
+
+        for item in (getattr(stage1_result, "workspace_artifacts", None) or []):
+            if not isinstance(item, dict):
+                continue
+            scope = self._normalize_workspace_scope(item.get("scope") or "") or "free"
+            variant_key = str(item.get("variant_key") or "").strip()
+            # The free checkpoint is upgraded by stage2; keep only additional
+            # K12/business workspace variants from stage1.
+            if scope == "free" or (checkpoint_variant_key and variant_key == checkpoint_variant_key):
+                continue
+            key = variant_key or f"{scope}:{item.get('workspace_id') or item.get('account_id') or ''}"
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            merged.append(dict(item))
+
+        if not merged:
+            return
+        merged = self._dedupe_workspace_artifacts(merged)
+        target_result.workspace_artifacts = merged
+        metadata = getattr(target_result, "metadata", None)
+        if not isinstance(metadata, dict):
+            metadata = {}
+            target_result.metadata = metadata
+        metadata["workspace_artifact_summaries"] = [
+            {
+                "scope": str(item.get("scope") or ""),
+                "label": str(item.get("label") or ""),
+                "account_id": str(item.get("account_id") or ""),
+                "workspace_id": str(item.get("workspace_id") or ""),
+                "source": str(item.get("source") or ""),
+            }
+            for item in merged
+        ]
+
     def _save_checkpoint_account(self, result, fallback_password: str):
         from core.db import save_account
 
         account = self.build_account(result, fallback_password)
+        if isinstance(account.extra, dict):
+            # Checkpoint saves only the primary/free row. Linked workspace variants
+            # are persisted by api.tasks after the final result is returned, so the
+            # transient handoff payload must never leak into extra_json here.
+            account.extra.pop("_linked_accounts_to_save", None)
         return save_account(account)
 
     def _capture_stage2_from_stage1_session(
@@ -655,6 +779,10 @@ class RefreshTokenChatGPTRegistrationAdapter(BaseChatGPTRegistrationModeAdapter)
                 "registration_session_workspace_id",
                 "cookies",
                 "cookie_header",
+                "chatgpt_k12_join_summary",
+                "chatgpt_k12_join_results",
+                "chatgpt_all_spaces",
+                "chatgpt_k12_exchange_failures",
             }
         }
         result.metadata.update(
@@ -798,6 +926,11 @@ class RefreshTokenChatGPTRegistrationAdapter(BaseChatGPTRegistrationModeAdapter)
                 }
             )
             self._align_free_artifacts_to_checkpoint_variant(stage2_result, checkpoint_variant_key)
+            self._merge_stage1_workspace_artifacts(
+                stage2_result,
+                stage1_result,
+                checkpoint_variant_key=checkpoint_variant_key,
+            )
             self._inherit_stage1_web_session_material(stage2_result, stage1_result)
             if not str(getattr(stage2_result, "email", "") or "").strip():
                 stage2_result.email = str(getattr(stage1_result, "email", "") or "")

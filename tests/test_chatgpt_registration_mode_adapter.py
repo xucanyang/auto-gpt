@@ -203,6 +203,72 @@ class ChatGPTRegistrationModeAdapterTests(unittest.TestCase):
         self.assertEqual(account.status.value, "pending_payment")
         self.assertEqual(account.extra["chatgpt_token_source"], "registration_session")
 
+    def test_build_account_saves_k12_workspace_as_linked_variant(self):
+        adapter = build_chatgpt_registration_mode_adapter(
+            {"chatgpt_registration_mode": "access_token_only"}
+        )
+        result = type(
+            "Result",
+            (),
+            {
+                "email": "demo@example.com",
+                "password": "pw",
+                "account_id": "acct-free",
+                "access_token": "at-free",
+                "refresh_token": "",
+                "id_token": "",
+                "session_token": "session-free",
+                "workspace_id": "acct-free",
+                "source": "register",
+                "metadata": {
+                    "chatgpt_k12_join_summary": {"enabled": True, "saved_spaces": 2},
+                    "cookies": "base-cookie=1",
+                    "cookie_header": "base-cookie=1",
+                },
+                "workspace_artifacts": [
+                    {
+                        "scope": "free",
+                        "label": "free",
+                        "account_id": "acct-free",
+                        "workspace_id": "acct-free",
+                        "access_token": "at-free",
+                        "session_token": "session-free",
+                        "source": "registration_session",
+                        "variant_key": "free:acct-free",
+                        "auth_level": "access_token_only",
+                        "partial_auth": True,
+                    },
+                    {
+                        "scope": "k12",
+                        "label": "k12",
+                        "account_id": "ws-k12",
+                        "workspace_id": "ws-k12",
+                        "access_token": "at-k12",
+                        "session_token": "session-free",
+                        "cookies": "cookie=1",
+                        "source": "k12_workspace_join",
+                        "variant_key": "k12:ws-k12",
+                        "auth_level": "access_token_only",
+                        "partial_auth": True,
+                        "space": {"name": "School Lab", "structure": "workspace", "plan_type": "edu"},
+                    },
+                ],
+            },
+        )()
+
+        account = adapter.build_account(result, fallback_password="fallback")
+
+        self.assertEqual(account.extra["chatgpt_workspace_variant_key"], "free:acct-free")
+        linked = account.extra["_linked_accounts_to_save"]
+        self.assertEqual(len(linked), 1)
+        linked_extra = linked[0]["extra"]
+        self.assertEqual(linked_extra["chatgpt_workspace_scope"], "k12")
+        self.assertEqual(linked_extra["chatgpt_workspace_variant_key"], "k12:ws-k12")
+        self.assertEqual(linked_extra["chatgpt_workspace_display_name"], "School Lab")
+        self.assertEqual(linked_extra["chatgpt_token_source"], "k12_workspace_join")
+        self.assertEqual(linked_extra["cookies"], "cookie=1")
+        self.assertEqual(account.extra["chatgpt_workspace_variants"][1]["scope"], "k12")
+
     def test_build_account_carries_full_auth_failure_and_phone_challenge_metadata(self):
         adapter = build_chatgpt_registration_mode_adapter(
             {"chatgpt_registration_mode": "refresh_token"}
@@ -539,6 +605,169 @@ class ChatGPTRegistrationModeAdapterTests(unittest.TestCase):
         self.assertEqual(created["stage2"]["capture_kwargs"]["scope"], "free")
         self.assertEqual(created["stage2"]["capture_kwargs"]["device_id"], "device-stage1")
         self.assertEqual(created["stage2"]["capture_kwargs"]["login_source"], "registration_stage2_full_auth")
+
+    def test_refresh_token_two_stage_keeps_stage1_k12_artifact_after_free_rt_upgrade(self):
+        class FakeStage1Engine:
+            def __init__(self, **kwargs):
+                self.email = None
+                self.password = None
+                self._last_chatgpt_client = types.SimpleNamespace(
+                    session=object(),
+                    device_id="device-stage1",
+                    ua="UA",
+                    sec_ch_ua='"Chromium";v="136"',
+                    impersonate="chrome136",
+                    fingerprint={"device_id": "device-stage1"},
+                )
+
+            def run(self):
+                return types.SimpleNamespace(
+                    success=True,
+                    email="stage1@example.com",
+                    password="pw-stage1",
+                    account_id="acct-stage1",
+                    workspace_id="acct-stage1",
+                    access_token="at-stage1",
+                    refresh_token="",
+                    id_token="",
+                    session_token="session-stage1",
+                    source="register",
+                    metadata={"cookies": "cookie=1", "chatgpt_k12_join_summary": {"enabled": True}},
+                    logs=["stage1-ok"],
+                    workspace_artifacts=[
+                        {
+                            "scope": "free",
+                            "label": "free",
+                            "account_id": "acct-stage1",
+                            "workspace_id": "acct-stage1",
+                            "access_token": "at-stage1",
+                            "session_token": "session-stage1",
+                            "source": "registration_session",
+                            "variant_key": "free:acct-stage1",
+                            "auth_level": "access_token_only",
+                            "partial_auth": True,
+                        },
+                        {
+                            "scope": "k12",
+                            "label": "k12",
+                            "account_id": "ws-k12",
+                            "workspace_id": "ws-k12",
+                            "access_token": "at-k12",
+                            "session_token": "session-stage1",
+                            "cookies": "cookie=1",
+                            "source": "k12_workspace_join",
+                            "variant_key": "k12:ws-k12",
+                            "auth_level": "access_token_only",
+                            "partial_auth": True,
+                        },
+                    ],
+                    error_message="",
+                )
+
+        class FakeRegistrationResult:
+            def __init__(self, **kwargs):
+                defaults = {
+                    "success": False,
+                    "email": "",
+                    "password": "",
+                    "account_id": "",
+                    "workspace_id": "",
+                    "access_token": "",
+                    "refresh_token": "",
+                    "id_token": "",
+                    "session_token": "",
+                    "error_message": "",
+                    "logs": [],
+                    "metadata": {},
+                    "source": "register",
+                    "workspace_artifacts": None,
+                }
+                defaults.update(kwargs)
+                self.__dict__.update(defaults)
+
+        class FakeStage2Engine:
+            def __init__(self, **kwargs):
+                self.email = None
+                self.password = None
+                self.logs = []
+                self._last_workspace_capture_error = ""
+                self.email_service = kwargs.get("email_service")
+
+            def _log(self, message, level="info"):
+                self.logs.append(str(message))
+
+            def _capture_workspace_artifact_via_fresh_login(self, **kwargs):
+                return {
+                    "scope": "free",
+                    "label": "free",
+                    "account_id": "acct-stage2",
+                    "workspace_id": "acct-stage2",
+                    "access_token": "at-stage2",
+                    "refresh_token": "rt-stage2",
+                    "id_token": "id-stage2",
+                    "session_token": "",
+                    "source": "workspace_capture_free",
+                    "variant_key": "free:acct-stage2",
+                }
+
+            def _artifact_has_refresh_token(self, artifact):
+                return bool(artifact.get("refresh_token"))
+
+            def _apply_workspace_artifact_to_result(self, result, artifact):
+                result.success = True
+                result.email = self.email or result.email
+                result.password = self.password or result.password
+                result.account_id = artifact["account_id"]
+                result.workspace_id = artifact["workspace_id"]
+                result.access_token = artifact["access_token"]
+                result.refresh_token = artifact["refresh_token"]
+                result.id_token = artifact["id_token"]
+                result.session_token = artifact["session_token"]
+                result.source = artifact["source"]
+
+            def _append_gopay_provider_link_metadata(self, result, session_result=None):
+                return None
+
+        fake_stage1_module = types.ModuleType("services.chatgpt_core.access_token_only_registration_engine")
+        fake_stage1_module.AccessTokenOnlyRegistrationEngine = FakeStage1Engine
+        fake_stage2_module = types.ModuleType("services.chatgpt_core.refresh_token_registration_engine")
+        fake_stage2_module.RefreshTokenRegistrationEngine = FakeStage2Engine
+        fake_stage2_module.RegistrationResult = FakeRegistrationResult
+        fake_stage2_module.EmailServiceAdapter = lambda email_service, email, log_fn: types.SimpleNamespace(email_service=email_service, email=email, log_fn=log_fn)
+        saved_accounts = []
+
+        def fake_save_account(account):
+            saved_accounts.append(account)
+            return types.SimpleNamespace(id=42)
+
+        adapter = build_chatgpt_registration_mode_adapter(
+            {"chatgpt_registration_mode": "refresh_token"}
+        )
+        context = ChatGPTRegistrationContext(
+            email_service=mock.Mock(),
+            proxy_url="http://127.0.0.1:7890",
+            callback_logger=lambda _msg, *_: None,
+            email=None,
+            password="pw",
+            browser_mode="protocol",
+            max_retries=1,
+            extra_config={"chatgpt_registration_mode": "refresh_token"},
+        )
+
+        with mock.patch.dict(
+            "sys.modules",
+            {
+                "services.chatgpt_core.access_token_only_registration_engine": fake_stage1_module,
+                "services.chatgpt_core.refresh_token_registration_engine": fake_stage2_module,
+            },
+        ), mock.patch("core.db.save_account", side_effect=fake_save_account):
+            result = adapter.run(context)
+
+        self.assertTrue(result.success)
+        self.assertEqual([item["scope"] for item in result.workspace_artifacts], ["free", "k12"])
+        final_account = adapter.build_account(result, fallback_password="fallback")
+        self.assertEqual(final_account.extra["_linked_accounts_to_save"][0]["extra"]["chatgpt_workspace_scope"], "k12")
+        self.assertEqual(final_account.extra["_linked_accounts_to_save"][0]["extra"]["access_token"], "at-k12")
 
 
 if __name__ == "__main__":

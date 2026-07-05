@@ -50,6 +50,7 @@ import { usePersistentChatGPTRegistrationMode } from '@/hooks/usePersistentChatG
 import { parseBooleanConfigValue } from '@/lib/configValueParsers'
 import { buildChatGPTRegistrationRequestAdapter } from '@/lib/chatgptRegistrationRequestAdapter'
 import { CHATGPT_REGISTRATION_MODE_REFRESH_TOKEN } from '@/lib/chatgptRegistrationMode'
+import { buildChatGPTK12Payload } from '@/lib/chatgptK12Config'
 import {
   DEFAULT_GOPAY_PHONE_COUNTRY_CODE,
   normalizeGopayPhonePart,
@@ -4071,6 +4072,7 @@ export default function Accounts() {
               ? true
               : Boolean(values.chatgpt_save_registration_access_token_account))
             : undefined,
+        ...(currentPlatform === 'chatgpt' ? buildChatGPTK12Payload(values) : {}),
       }
       const chatgptRegistrationRequestAdapter =
         buildChatGPTRegistrationRequestAdapter(

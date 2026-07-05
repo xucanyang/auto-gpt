@@ -6,6 +6,24 @@
 
 ## [Unreleased] (未发布)
 
+## [1.3.0] - 2026-07-05
+### 新增 (Added)
+- **补齐 K12 注册后 workspace join 与全空间保存链路**：新增 `services/chatgpt_core/k12_workspace.py`，在 ChatGPT 注册成功并复用当前 Web session 拿到 Access Token 后，支持向配置的 K12 `workspace_id` 调用 `/backend-api/accounts/{workspace_id}/invites/request` 发起加入请求，再通过 `/backend-api/accounts/check/v4-2023-04-27` 读取当前账号可见的所有空间。捕获结果按 `workspace_artifacts` 输出，包含 free、K12、workspace 等 scope 摘要，并对每个空间复用现有 `fetch_chatgpt_session(exchange_workspace_token=true)` 交换对应 Access Token，避免重新登录、重复触发邮箱 OTP 或误走手机号绑定链路。
+- **注册结果按 workspace variants 保存多条账号**：`services/chatgpt_core/access_token_only_registration_engine.py` 在 AT-only 注册成功后新增 K12/all-spaces 捕获步骤，保留 primary/free 账号不被覆盖，并将额外空间作为 linked accounts 交给现有保存逻辑落库；`services/chatgpt_core/chatgpt_registration_mode_adapter.py` 扩展 `k12` scope、artifact 去重、artifact 强度优先级、workspace 摘要与两阶段 RT 合并逻辑，确保第一阶段捕获到的 K12/全空间 AT-only variants 在第二阶段 free RT 成功后仍会保留为附加账号。
+- **新增 K12 全局配置与任务参数透传**：`api/config.py` 增加 `chatgpt_k12_enabled`、`chatgpt_k12_workspace_ids`、`chatgpt_k12_save_all_spaces`、`chatgpt_k12_strict_join`、`chatgpt_k12_join_timeout_seconds`、`chatgpt_k12_join_retry_count`、`chatgpt_k12_post_join_poll_seconds`、`chatgpt_k12_capture_refresh_tokens` 配置项；`api/tasks.py` 将这些参数写入注册任务 extra 与账号 extra，任务创建日志也记录 K12 是否启用、目标数量与是否保存所有空间，方便后续排障回溯。
+- **前端补齐注册页、注册弹窗、设置页和账号详情入口**：`frontend/src/pages/RegisterTaskPage.tsx` 与 `frontend/src/features/auth/components/RegisterTaskModal.tsx` 新增 K12 / Workspace 配置区，默认保存所有空间 variants、join 超时 60 秒、join 后轮询 `3,8,15` 秒，并将 Refresh Token variants 明确标记为预留禁用项；`frontend/src/pages/Settings.tsx` 新增全局 K12 / Workspace 配置分组；`frontend/src/features/accounts/components/AccountDetailModal.tsx` 新增“所有空间 / Workspace variants”摘要区，展示 scope、workspace_id、display_name、auth_level、partial_auth 和 source。
+
+### 安全 (Security)
+- **收紧 workspace variants 展示脱敏边界**：`api/accounts.py` 的 compact 账号列表只返回 workspace variants 摘要，不透出 access_token、refresh_token、id_token、session_token、cookies 或 cookie_header；账号详情页同样只展示空间摘要，完整凭证仍沿用 `/accounts/{id}/secrets` 按需读取，避免全空间保存功能把 Web session 材料泄漏到列表接口或普通详情摘要。
+- **加固 K12 捕获异常与日志脱敏**：`services/chatgpt_core/k12_workspace.py` 与 `services/chatgpt_core/task_logging.py` 扩展 Bearer、`cookie_header`、NextAuth/Auth.js cookie、Python dict repr 等敏感字段脱敏；`api/tasks.py` 保存附加工作空间失败时也统一走 `sanitize_error_message()`，避免 linked workspace 的 token/cookies 因异常文本进入任务日志。
+
+### 修复 (Fixed)
+- **避免 K12 捕获影响基础注册落库**：K12 join 默认非严格模式，单个 workspace join、accounts/check 或 workspace token exchange 失败时只记录 `chatgpt_k12_join_summary`、`chatgpt_k12_join_results`、`chatgpt_all_spaces` 与 `chatgpt_k12_exchange_failures`，不会丢弃已经注册成功的基础账号；只有显式开启 `strict_join` 时才把 K12 捕获失败升级为注册失败，且严格模式现在同时覆盖目标 workspace token exchange 失败。补充 `tests/test_chatgpt_k12_workspace.py`、`tests/test_chatgpt_registration_mode_adapter.py` 与 `tests/test_accounts_api_list_compact.py`，覆盖 K12 join 请求、accounts/check 解析、全空间 artifact 生成、显式关闭 K12、compact 脱敏和两阶段 RT 合并 K12 variants。
+
+### 优化 (Changed)
+- **同步前端版本号至 v1.3.0**：`frontend/src/app/AppShell.tsx` 侧边栏版本展示更新为 `v1.3.0`，用于上线后确认 K12 workspace 注册与全空间保存对应的静态资源已加载。
+- **统一 K12 前端配置口径**：新增 `frontend/src/lib/chatgptK12Config.ts`，注册页、账号页注册弹窗与设置页共用 workspace id、轮询间隔、超时与保存所有空间的归一化逻辑；`chatgpt_k12_capture_refresh_tokens` 在前端统一固定为 false 并禁用展示，明确当前版本只保存 AT-only workspace variants，避免预留开关被旧配置误触发。
+
 ## [1.2.11] - 2026-07-05
 ### 修复 (Fixed)
 - **补齐账号详情页 Web session 凭证查看能力**：`frontend/src/features/accounts/components/AccountDetailModal.tsx` 将原先拥挤的账号详情 Modal 重构为右侧 Drawer，并新增独立“凭证材料”区；Access Token、Refresh Token、ID Token、NextAuth `session_token`、完整 `cookies` 与登录密码现在都按字段显示“已保存/未保存”，默认隐藏，点击“显示/复制”时才通过 `/api/accounts/{id}/secrets` 拉取完整内容，避免把 `extra_json` 原始结构整块铺开，同时保留状态与主表 token 的基础编辑入口。
@@ -293,4 +311,8 @@
 
 ## 2026-07-05 20:05:33 +0800
 - 重构账号详情凭证展示并补齐 Web session 查看
+- 发布模式: multi
+
+## 2026-07-05 21:07:35 +0800
+- 补齐 K12 workspace 注册与全空间保存
 - 发布模式: multi

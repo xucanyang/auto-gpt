@@ -227,6 +227,184 @@ function firstText(...values: any[]): string {
   return ''
 }
 
+function firstScalarText(...values: any[]): string {
+  for (const value of values) {
+    if (value === undefined || value === null) continue
+    if (typeof value === 'object') continue
+    const text = String(value || '').trim()
+    if (text) return text
+  }
+  return ''
+}
+
+function boolText(value: any): string {
+  if (typeof value === 'boolean') return value ? 'true' : 'false'
+  if (value === undefined || value === null || value === '') return ''
+  const normalized = String(value).trim().toLowerCase()
+  if (['1', 'true', 'yes', 'y', 'on'].includes(normalized)) return 'true'
+  if (['0', 'false', 'no', 'n', 'off'].includes(normalized)) return 'false'
+  return String(value).trim()
+}
+
+function safeWorkspaceSummaryText(value: string): string {
+  const text = String(value || '').trim()
+  if (!text) return ''
+  if (/bearer|cookie|session|access[_-]?token|refresh[_-]?token|id[_-]?token|__secure-|next-auth|authjs/i.test(text)) {
+    return '[redacted]'
+  }
+  return text.length > 160 ? `${text.slice(0, 80)}…${text.slice(-20)}` : text
+}
+
+type WorkspaceVariantSummaryItem = {
+  key: string
+  scope: string
+  workspaceId: string
+  label: string
+  displayName: string
+  authLevel: string
+  partialAuth: string
+  source: string
+}
+
+function appendWorkspaceVariantCandidates(target: any[], value: any) {
+  if (!value) return
+  if (Array.isArray(value)) {
+    value.forEach((item) => appendWorkspaceVariantCandidates(target, item))
+    return
+  }
+  if (typeof value !== 'object') return
+  target.push(value)
+}
+
+function toWorkspaceVariantSummary(raw: any, index: number): WorkspaceVariantSummaryItem | null {
+  if (!raw || typeof raw !== 'object') return null
+  const nestedExtra = raw.extra && typeof raw.extra === 'object' ? raw.extra : {}
+  const source = { ...raw, ...nestedExtra }
+  const scope = firstScalarText(source.scope, source.chatgpt_workspace_scope, source.workspace_scope)
+  const workspaceId = firstScalarText(source.workspace_id, source.workspaceId, source.id, source.organization_id)
+  const label = firstScalarText(source.label, source.chatgpt_workspace_label, source.workspace_label)
+  const displayName = firstScalarText(
+    source.display_name,
+    source.displayName,
+    source.chatgpt_workspace_display_name,
+    source.workspace_display_name,
+  )
+  const authLevel = firstScalarText(source.auth_level, source.authLevel, source.level)
+  const partialAuth = boolText(source.partial_auth ?? source.partialAuth)
+  const sourceText = safeWorkspaceSummaryText(firstScalarText(source.source, source.chatgpt_token_source, source.auth_source))
+  if (!scope && !workspaceId && !label && !displayName && !authLevel && !partialAuth && !sourceText) return null
+  return {
+    key: [
+      scope || 'scope',
+      workspaceId || 'workspace',
+      label || displayName || 'label',
+      sourceText || 'source',
+      index,
+    ].join(':'),
+    scope,
+    workspaceId,
+    label,
+    displayName,
+    authLevel,
+    partialAuth,
+    source: sourceText,
+  }
+}
+
+function collectWorkspaceVariants(
+  account: any,
+  extra: Record<string, any>,
+  workspace: Record<string, any>,
+  capabilities: Record<string, any>,
+  authSummary: Record<string, any>,
+): WorkspaceVariantSummaryItem[] {
+  const candidates: any[] = []
+  appendWorkspaceVariantCandidates(candidates, extra.chatgpt_workspace_variants)
+  appendWorkspaceVariantCandidates(candidates, account?.chatgpt_workspace_variants)
+  appendWorkspaceVariantCandidates(candidates, account?.workspace_variants)
+  appendWorkspaceVariantCandidates(candidates, capabilities.workspace_variants)
+  appendWorkspaceVariantCandidates(candidates, extra.workspace_variants)
+  appendWorkspaceVariantCandidates(candidates, extra.workspace_artifact_summaries)
+  appendWorkspaceVariantCandidates(candidates, extra.chatgpt_workspace_artifacts)
+  appendWorkspaceVariantCandidates(candidates, account?.workspace_artifact_summaries)
+  appendWorkspaceVariantCandidates(
+    candidates,
+    Array.isArray(extra._linked_accounts_to_save)
+      ? extra._linked_accounts_to_save.map((item: any) => item?.extra).filter(Boolean)
+      : [],
+  )
+  appendWorkspaceVariantCandidates(candidates, {
+    scope: workspace.scope || account?.workspace_scope || extra.chatgpt_workspace_scope,
+    label: workspace.label || account?.workspace_label || extra.chatgpt_workspace_label,
+    display_name: workspace.display_name || account?.workspace_display_name || extra.chatgpt_workspace_display_name,
+    workspace_id: workspace.id || extra.workspace_id || extra.organization_id || capabilities.workspace_id,
+    auth_level: account?.auth_level || authSummary.level || capabilities.auth_level || extra.auth_level,
+    partial_auth: extra.partial_auth,
+    source: authSummary.source || extra.chatgpt_token_source,
+  })
+
+  const seen = new Set<string>()
+  const variants: WorkspaceVariantSummaryItem[] = []
+  candidates.forEach((candidate, index) => {
+    const item = toWorkspaceVariantSummary(candidate, index)
+    if (!item) return
+    const dedupeKey = [
+      item.scope,
+      item.workspaceId,
+      item.label,
+      item.displayName,
+      item.authLevel,
+      item.partialAuth,
+      item.source,
+    ].join('|')
+    if (seen.has(dedupeKey)) return
+    seen.add(dedupeKey)
+    variants.push(item)
+  })
+  return variants
+}
+
+function WorkspaceVariantsSummary({ variants }: { variants: WorkspaceVariantSummaryItem[] }) {
+  const { token } = theme.useToken()
+  if (variants.length === 0) {
+    return <Text type="secondary">尚未记录 workspace variants。</Text>
+  }
+
+  return (
+    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 320px), 1fr))', gap: 10 }}>
+      {variants.map((variant, index) => (
+        <div
+          key={variant.key}
+          style={{
+            border: `1px solid ${token.colorBorder}`,
+            borderRadius: token.borderRadiusLG,
+            background: token.colorBgContainer,
+            padding: 12,
+            minWidth: 0,
+          }}
+        >
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 10 }}>
+            <Tag color={variant.scope === 'k12' ? 'purple' : variant.scope === 'business' ? 'blue' : variant.scope === 'free' ? 'green' : 'default'} style={{ marginInlineEnd: 0 }}>
+              {variant.scope || `variant ${index + 1}`}
+            </Tag>
+            <Tag style={{ marginInlineEnd: 0 }}>{`auth_level: ${variant.authLevel || '-'}`}</Tag>
+            <Tag color={variant.partialAuth === 'true' ? 'orange' : 'default'} style={{ marginInlineEnd: 0 }}>
+              {`partial_auth: ${variant.partialAuth || '-'}`}
+            </Tag>
+            <Tag style={{ marginInlineEnd: 0 }}>{`source: ${variant.source || '-'}`}</Tag>
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            <SummaryField label="workspace_id" value={variant.workspaceId || '-'} />
+            <SummaryField label="label" value={variant.label || '-'} />
+            <SummaryField label="display_name" value={variant.displayName || '-'} />
+            <SummaryField label="source" value={variant.source || '-'} />
+          </div>
+        </div>
+      ))}
+    </div>
+  )
+}
+
 function explicitSecretFlag(...values: any[]): boolean | undefined {
   for (const value of values) {
     if (typeof value === 'boolean') return value
@@ -482,6 +660,7 @@ export function AccountDetailModal({
     : currentAccount?.codex && typeof currentAccount.codex === 'object'
       ? currentAccount.codex
       : {}
+  const workspaceVariants = collectWorkspaceVariants(currentAccount, extra, workspace, capabilities, authSummary)
   const drawerTitle = currentAccount ? (
     <Space size={8} wrap>
       <span>账号详情</span>
@@ -549,6 +728,13 @@ export function AccountDetailModal({
                 </div>
               ) : null}
             </div>
+          </DetailSection>
+
+          <DetailSection
+            title="所有空间 / Workspace variants"
+            extra={<Text type="secondary" style={{ fontSize: 12 }}>仅展示空间摘要，不展开 token/cookies</Text>}
+          >
+            <WorkspaceVariantsSummary variants={workspaceVariants} />
           </DetailSection>
 
           <DetailSection

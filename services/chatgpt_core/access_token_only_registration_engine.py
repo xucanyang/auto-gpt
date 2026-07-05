@@ -445,6 +445,137 @@ class AccessTokenOnlyRegistrationEngine:
         return metadata
 
     @staticmethod
+    def _artifact_key(artifact: dict[str, Any]) -> str:
+        return str(
+            artifact.get("variant_key")
+            or f"{artifact.get('scope') or ''}:{artifact.get('workspace_id') or artifact.get('account_id') or ''}"
+        ).strip()
+
+    def _build_registration_session_artifact(
+        self,
+        *,
+        result: RegistrationResult,
+        session_result: dict[str, Any],
+    ) -> dict[str, Any]:
+        account_id = str(
+            getattr(result, "account_id", "")
+            or session_result.get("account_id")
+            or session_result.get("user_id")
+            or ""
+        ).strip()
+        workspace_id = str(
+            getattr(result, "workspace_id", "")
+            or session_result.get("workspace_id")
+            or account_id
+            or ""
+        ).strip()
+        stable_id = account_id or workspace_id or str(getattr(result, "email", "") or "").strip() or "unknown"
+        return {
+            "scope": "free",
+            "label": "free",
+            "account_id": account_id,
+            "workspace_id": workspace_id,
+            "access_token": str(getattr(result, "access_token", "") or session_result.get("access_token") or "").strip(),
+            "refresh_token": str(getattr(result, "refresh_token", "") or "").strip(),
+            "id_token": str(getattr(result, "id_token", "") or session_result.get("id_token") or "").strip(),
+            "session_token": str(getattr(result, "session_token", "") or session_result.get("session_token") or "").strip(),
+            "cookies": str(session_result.get("cookies") or session_result.get("cookie_header") or "").strip(),
+            "source": "registration_session",
+            "variant_key": f"free:{stable_id}",
+            "auth_level": "access_token_only",
+            "partial_auth": True,
+            "display_name": "free",
+            "space": {
+                "name": "Personal",
+                "structure": "personal",
+                "plan_type": "",
+                "is_default": True,
+                "source": "registration_session",
+            },
+        }
+
+    def _capture_k12_workspace_artifacts(
+        self,
+        *,
+        result: RegistrationResult,
+        chatgpt_client: ChatGPTClient,
+        session_result: dict[str, Any],
+    ) -> tuple[bool, str]:
+        try:
+            from services.chatgpt_core.k12_workspace import (
+                capture_k12_and_all_spaces,
+                k12_capture_enabled,
+                safe_k12_error,
+            )
+        except Exception as exc:
+            return True, f"K12 模块不可用: {exc}"
+
+        if not k12_capture_enabled(self.extra_config):
+            return True, ""
+
+        try:
+            capture = capture_k12_and_all_spaces(
+                chatgpt_client=chatgpt_client,
+                base_session=session_result,
+                access_token=str(getattr(result, "access_token", "") or session_result.get("access_token") or ""),
+                session_token=str(getattr(result, "session_token", "") or session_result.get("session_token") or ""),
+                cookies=str(session_result.get("cookies") or session_result.get("cookie_header") or ""),
+                target_workspace_ids=self.extra_config.get("chatgpt_k12_workspace_ids"),
+                proxy=self.proxy_url or "",
+                config=self.extra_config,
+                log_fn=lambda msg, level="info": self._log(msg, level),
+                stop_checker=self.extra_config.get("_task_stop_checker"),
+            )
+        except Exception as exc:
+            if isinstance(exc, TaskInterruption):
+                raise
+            error = safe_k12_error(str(exc or exc.__class__.__name__).strip() or exc.__class__.__name__)
+            if self._parse_bool(self.extra_config.get("chatgpt_k12_strict_join")):
+                return False, f"K12 workspace 捕获异常: {error}"
+            self._log(f"K12 workspace 捕获异常，已保留基础账号: {error}", "warning")
+            return True, error
+        metadata = getattr(result, "metadata", None)
+        if not isinstance(metadata, dict):
+            metadata = {}
+            result.metadata = metadata
+        summary = capture.get("summary") if isinstance(capture.get("summary"), dict) else {}
+        metadata["chatgpt_k12_join_summary"] = summary
+        metadata["chatgpt_k12_join_results"] = capture.get("join_results") or []
+        metadata["chatgpt_all_spaces"] = capture.get("spaces") or []
+        if capture.get("exchange_failures"):
+            metadata["chatgpt_k12_exchange_failures"] = capture.get("exchange_failures")
+
+        if summary.get("strict_join_failed"):
+            return False, "K12 workspace join 失败（strict_join=true）"
+
+        primary_artifact = self._build_registration_session_artifact(
+            result=result,
+            session_result=session_result,
+        )
+        artifacts: list[dict[str, Any]] = [primary_artifact]
+        seen = {self._artifact_key(primary_artifact)}
+        for artifact in capture.get("artifacts") or []:
+            if not isinstance(artifact, dict):
+                continue
+            key = self._artifact_key(artifact)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            artifacts.append(artifact)
+        result.workspace_artifacts = artifacts
+        metadata["workspace_artifact_summaries"] = [
+            {
+                "scope": str(item.get("scope") or ""),
+                "label": str(item.get("label") or ""),
+                "account_id": str(item.get("account_id") or ""),
+                "workspace_id": str(item.get("workspace_id") or ""),
+                "source": str(item.get("source") or ""),
+            }
+            for item in artifacts
+        ]
+        return True, ""
+
+    @staticmethod
     def _classify_log_level(message: str, level: str = "info") -> str:
         normalized_level = str(level or "info").strip().lower() or "info"
         if normalized_level in {"error", "warning", "debug"}:
@@ -814,6 +945,7 @@ class AccessTokenOnlyRegistrationEngine:
                             "user": session_result.get("user") or {},
                             "account": session_result.get("account") or {},
                             "cookies": session_result.get("cookies") or "",
+                            "cookie_header": session_result.get("cookie_header") or session_result.get("cookies") or "",
                         }
                         export_state = getattr(self.email_service, "export_state", None)
                         if callable(export_state):
@@ -825,6 +957,18 @@ class AccessTokenOnlyRegistrationEngine:
 
                         if result.workspace_id:
                             self._log(f"Session Workspace ID: {result.workspace_id}")
+
+                        k12_ok, k12_error = self._capture_k12_workspace_artifacts(
+                            result=result,
+                            chatgpt_client=chatgpt_client,
+                            session_result=session_result,
+                        )
+                        if not k12_ok:
+                            result.success = False
+                            result.error_message = k12_error or "K12 workspace 捕获失败"
+                            self._log(result.error_message, "warning")
+                            self._finalize_email_service_failure(result, fallback_error=result.error_message)
+                            return result
 
                         if self._metadata_indicates_invalid_registration_failure(result.metadata):
                             failure_reason = self._metadata_invalid_registration_reason(result.metadata)

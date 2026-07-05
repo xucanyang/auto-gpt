@@ -680,6 +680,37 @@ def _build_phone_summary(
     }
 
 
+def _build_workspace_variants_summary(extra: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_items = extra.get("chatgpt_workspace_variants")
+    if not isinstance(raw_items, list):
+        return []
+    variants: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        variant = {
+            "scope": _safe_str(item.get("scope")),
+            "label": _safe_str(item.get("label")),
+            "workspace_id": _safe_str(item.get("workspace_id")),
+            "account_id": _safe_str(item.get("account_id")),
+            "display_name": _safe_str(item.get("display_name")),
+            "source": _safe_str(item.get("source")),
+            "auth_level": _safe_str(item.get("auth_level")),
+            "partial_auth": bool(item.get("partial_auth")),
+        }
+        key = (
+            variant["scope"],
+            variant["workspace_id"],
+            variant["account_id"],
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        variants.append(variant)
+    return variants[:50]
+
+
 def _serialize_account_compact_item(
     account: AccountModel,
     *,
@@ -710,6 +741,7 @@ def _serialize_account_compact_item(
     codex_summary = _build_codex_summary(codex, chatgpt_capabilities)
     validity_summary = _build_account_validity_summary(account, auth_summary, chatgpt_capabilities)
     baxigpt_cdk = _build_baxigpt_cdk_summary(extra.get("baxigpt_cdk") if isinstance(extra.get("baxigpt_cdk"), dict) else {})
+    workspace_variants = _build_workspace_variants_summary(extra)
 
     payload = {
         "id": account.id,
@@ -732,6 +764,7 @@ def _serialize_account_compact_item(
         "workspace_scope": _safe_str(extra.get("chatgpt_workspace_scope")),
         "workspace_label": _safe_str(extra.get("chatgpt_workspace_label")),
         "workspace_display_name": _safe_str(extra.get("chatgpt_workspace_display_name")),
+        "workspace_variants": workspace_variants,
         "auth": auth_summary,
         "subscription": subscription_summary,
         "account_validity": _safe_str(validity_summary.get("state")),
@@ -817,6 +850,7 @@ def _serialize_account_compact_item(
             "chatgpt_workspace_label": _safe_str(extra.get("chatgpt_workspace_label")),
             "chatgpt_workspace_scope": _safe_str(extra.get("chatgpt_workspace_scope")),
             "chatgpt_workspace_display_name": _safe_str(extra.get("chatgpt_workspace_display_name")),
+            "chatgpt_workspace_variants": workspace_variants,
             "chatgpt_phone_binding": _build_phone_summary(phone_binding, bound_phone, phone_challenge)["binding"],
             "chatgpt_bound_phone": bound_phone,
             "chatgpt_phone_challenge": phone_challenge,
