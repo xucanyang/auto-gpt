@@ -8,6 +8,16 @@
 
 
 
+## [1.3.8] - 2026-07-06
+### 修复 (Fixed)
+- **补齐无 RT/V2 注册引擎的邮箱 API 超时与重发配置**：`services/chatgpt_core/access_token_only_registration_engine.py` 的 V2 `EmailServiceAdapter` 现在同样会把邮箱 provider 的 `TimeoutError` 归一为未收到验证码，让 `ChatGPTClient.register_complete_flow()` 能执行 `email-otp/send` 重发；同时 V2 注册调用会读取并透传 `chatgpt_register_otp_wait_seconds` 与 `chatgpt_register_otp_resend_wait_seconds`，避免 K12/email_api 实际运行仍固定显示 `otp_wait_timeout=600s`、`otp_resend_wait_timeout=300s`。
+
+### 测试 (Tests)
+- **新增无 RT/V2 注册回归测试**：`tests/test_access_token_only_checkout.py` 覆盖 V2 邮箱 adapter 超时返回 `None`、以及配置化 OTP 等待/重发秒数会传入 `register_complete_flow()`，防止只修到 RefreshToken 引擎而漏掉 K12 当前使用的 AccessToken-only 注册链路。
+
+### 优化 (Changed)
+- **同步前端版本号至 v1.3.8**：`frontend/src/app/AppShell.tsx` 侧边栏版本展示更新为 `v1.3.8`，用于上线后确认无 RT/V2 邮箱 API 重发修复已加载。
+
 ## [1.3.7] - 2026-07-06
 ### 修复 (Fixed)
 - **邮箱 API 等待超时后允许注册状态机执行重发**：`services/chatgpt_core/refresh_token_registration_engine.py` 的 `EmailServiceAdapter` 现在会把邮箱 provider 的 `TimeoutError` 归一为“本轮未收到验证码”，返回给 `ChatGPTClient.register_complete_flow()`，从而真正进入“首次等待未收到后重发一次 `email-otp/send` 再等待”的既有分支；修复此前 `EmailApiMailbox.wait_for_code()` 超时会直接抛出并中断整轮注册，导致 K12/email_api 场景虽然配置了重发窗口却永远不会重发的问题。
@@ -439,4 +449,8 @@
 
 ## 2026-07-06 00:49:40 +0800
 - 修复邮箱 API 重发链路和发码请求头
+- 发布模式: multi
+
+## 2026-07-06 00:55:12 +0800
+- 补齐 V2 邮箱 API 重发和 OTP 等待配置
 - 发布模式: multi

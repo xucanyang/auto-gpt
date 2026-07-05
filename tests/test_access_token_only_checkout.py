@@ -1,7 +1,10 @@
 import unittest
 from unittest import mock
 
-from services.chatgpt_core.access_token_only_registration_engine import AccessTokenOnlyRegistrationEngine
+from services.chatgpt_core.access_token_only_registration_engine import (
+    AccessTokenOnlyRegistrationEngine,
+    EmailServiceAdapter,
+)
 from services.chatgpt_core.payment import CheckoutRequestError
 
 
@@ -23,6 +26,59 @@ class AccessTokenOnlyCheckoutTests(unittest.TestCase):
                 "workspace_id": "ws-demo",
                 "cookies": "oai-did=device",
             }
+
+    class _TrackingChatGPTClient(_FakeChatGPTClient):
+        last_register_kwargs = {}
+
+        def register_complete_flow(self, *args, **kwargs):
+            type(self).last_register_kwargs = dict(kwargs)
+            return True, "ok"
+
+    def test_v2_email_adapter_returns_none_on_mailbox_timeout_for_resend_path(self):
+        email_service = mock.Mock()
+        email_service.get_verification_code.side_effect = TimeoutError("等待 Email API 验证码超时 (30s)")
+        logs = []
+        adapter = EmailServiceAdapter(email_service, "buyer@example.com", logs.append)
+
+        code = adapter.wait_for_verification_code(
+            "buyer@example.com",
+            timeout=30,
+            phase="register_email_otp",
+            phase_label="注册阶段邮箱验证码",
+        )
+
+        self.assertIsNone(code)
+        self.assertEqual(email_service.get_verification_code.call_count, 1)
+        self.assertTrue(any("等待超时" in line for line in logs))
+
+    def test_v2_registration_passes_configured_email_otp_timeouts(self):
+        email_service = mock.Mock()
+        email_service.create_email.return_value = {"email": "buyer@example.com"}
+        engine = AccessTokenOnlyRegistrationEngine(
+            email_service=email_service,
+            proxy_url="http://proxy.local:8080",
+            extra_config={
+                "chatgpt_register_otp_wait_seconds": 45,
+                "chatgpt_register_otp_resend_wait_seconds": 35,
+            },
+        )
+        self._TrackingChatGPTClient.last_register_kwargs = {}
+
+        with (
+            mock.patch.object(engine, "_probe_homepage_before_email_creation", return_value=(True, "")),
+            mock.patch.object(engine, "_report_homepage_probe"),
+            mock.patch.object(engine, "_probe_plus_checkout_billing", return_value={}),
+            mock.patch.object(engine, "_capture_k12_workspace_artifacts", return_value=(True, "")),
+            mock.patch(
+                "services.chatgpt_core.access_token_only_registration_engine.ChatGPTClient",
+                self._TrackingChatGPTClient,
+            ),
+        ):
+            result = engine.run()
+
+        self.assertTrue(result.success)
+        self.assertEqual(self._TrackingChatGPTClient.last_register_kwargs["otp_wait_timeout"], 45)
+        self.assertEqual(self._TrackingChatGPTClient.last_register_kwargs["otp_resend_wait_timeout"], 35)
 
     def test_already_paid_metadata_fails_registration_without_saving(self):
         email_service = mock.Mock()

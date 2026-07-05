@@ -39,13 +39,17 @@ class EmailServiceAdapter:
         used_codes = self._used_codes_by_phase.setdefault(phase_key, set())
         msg = f"[验证码] 等待邮箱验证码：{phase_title} timeout={timeout}s"
         self.log_fn(msg)
-        code = self.es.get_verification_code(
-            timeout=timeout,
-            otp_sent_at=otp_sent_at,
-            exclude_codes=set(exclude_codes or set()) | set(used_codes),
-            phase=phase_key,
-            phase_label=phase_title,
-        )
+        try:
+            code = self.es.get_verification_code(
+                timeout=timeout,
+                otp_sent_at=otp_sent_at,
+                exclude_codes=set(exclude_codes or set()) | set(used_codes),
+                phase=phase_key,
+                phase_label=phase_title,
+            )
+        except TimeoutError as exc:
+            self.log_fn(f"[验证码] {phase_title} 等待超时: {exc}")
+            return None
         if code:
             code = str(code).strip()
             used_codes.add(code)
@@ -147,6 +151,28 @@ class AccessTokenOnlyRegistrationEngine:
             self.extra_config.get("chatgpt_access_token_only_zero_amount_stop_threshold"),
             default=1,
         )
+
+    def _read_int_config(
+        self,
+        primary_key: str,
+        *,
+        fallback_keys: tuple[str, ...] = (),
+        default: int,
+        minimum: int,
+        maximum: int,
+    ) -> int:
+        for key in (primary_key, *tuple(fallback_keys or ())):
+            if key not in self.extra_config:
+                continue
+            value = self.extra_config.get(key)
+            if value in (None, ""):
+                continue
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError):
+                continue
+            return max(minimum, min(parsed, maximum))
+        return max(minimum, min(int(default), maximum))
 
     def _should_capture_gopay_provider_link(self) -> bool:
         for key in (
@@ -795,6 +821,20 @@ class AccessTokenOnlyRegistrationEngine:
     def run(self) -> RegistrationResult:
         result = RegistrationResult(success=False, logs=self.logs)
         existing_account_capture = self._parse_bool(self.extra_config.get("chatgpt_existing_account_capture"))
+        register_otp_wait_seconds = self._read_int_config(
+            "chatgpt_register_otp_wait_seconds",
+            fallback_keys=("chatgpt_otp_wait_seconds",),
+            default=600,
+            minimum=30,
+            maximum=3600,
+        )
+        register_otp_resend_wait_seconds = self._read_int_config(
+            "chatgpt_register_otp_resend_wait_seconds",
+            fallback_keys=("chatgpt_register_otp_wait_seconds", "chatgpt_otp_wait_seconds"),
+            default=300,
+            minimum=30,
+            maximum=3600,
+        )
         try:
             last_error = ""
             for attempt in range(self.max_retries):
@@ -909,7 +949,14 @@ class AccessTokenOnlyRegistrationEngine:
                         self._log("步骤 1/2: 执行注册状态机...")
 
                         success, msg = chatgpt_client.register_complete_flow(
-                            email_addr, pwd, first_name, last_name, birthdate, skymail_adapter
+                            email_addr,
+                            pwd,
+                            first_name,
+                            last_name,
+                            birthdate,
+                            skymail_adapter,
+                            otp_wait_timeout=register_otp_wait_seconds,
+                            otp_resend_wait_timeout=register_otp_resend_wait_seconds,
                         )
 
                     if not existing_account_capture:
