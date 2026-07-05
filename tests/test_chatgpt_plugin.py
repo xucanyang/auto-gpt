@@ -164,6 +164,30 @@ class ChatGPTPluginTests(unittest.TestCase):
         _, kwargs = mailbox.wait_call
         self.assertEqual(kwargs.get("timeout"), 90)
 
+    def test_email_api_provider_does_not_shrink_state_machine_timeout(self):
+        mailbox = _TrackingMailbox()
+        platform = ChatGPTPlatform(
+            config=RegisterConfig(
+                extra={
+                    "chatgpt_registration_mode": "refresh_token",
+                    "mail_provider": "email_api",
+                    "mailbox_otp_timeout_seconds": 20,
+                    "email_otp_timeout_seconds": 20,
+                }
+            ),
+            mailbox=mailbox,
+        )
+        adapter = _VerificationAdapter()
+
+        with mock.patch(
+            "services.chatgpt_core.plugin.build_chatgpt_registration_mode_adapter",
+            return_value=adapter,
+        ):
+            platform.register()
+
+        _, kwargs = mailbox.wait_call
+        self.assertEqual(kwargs.get("timeout"), 30)
+
     def test_resume_subscription_auth_action_is_exposed(self):
         platform = ChatGPTPlatform(config=RegisterConfig(extra={}))
 

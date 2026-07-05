@@ -25,6 +25,7 @@ class EmailApiMailboxTests(unittest.TestCase):
 
     def test_status_code_parser_treats_zero_and_non_codes_as_pending(self):
         self.assertEqual(EmailApiMailbox.code_from_status(0), "")
+        self.assertEqual(EmailApiMailbox.code_from_status(1), "")
         self.assertEqual(EmailApiMailbox.code_from_status("0"), "")
         self.assertEqual(EmailApiMailbox.code_from_status(""), "")
         self.assertEqual(EmailApiMailbox.code_from_status(None), "")
@@ -34,6 +35,20 @@ class EmailApiMailboxTests(unittest.TestCase):
         self.assertEqual(EmailApiMailbox.code_from_status("1234"), "1234")
         self.assertEqual(EmailApiMailbox.code_from_status("123456"), "123456")
         self.assertEqual(EmailApiMailbox.code_from_status(123456), "123456")
+
+    def test_codes_from_payload_supports_smbower_code_and_all_codes_shape(self):
+        self.assertEqual(
+            EmailApiMailbox.codes_from_payload({"status": 1, "code": "123456", "all_codes": []}),
+            ["123456"],
+        )
+        self.assertEqual(
+            EmailApiMailbox.codes_from_payload({"status": 1, "code": None, "all_codes": ["111111", "222222"]}),
+            ["222222", "111111"],
+        )
+        self.assertEqual(
+            EmailApiMailbox.codes_from_payload({"status": "333333", "code": "333333", "all_codes": ["222222"]}),
+            ["333333", "222222"],
+        )
 
     def test_parse_gmail_line_expands_original_and_one_dot_variant(self):
         candidates, errors = parse_email_api_lines(
@@ -93,6 +108,32 @@ class EmailApiMailboxTests(unittest.TestCase):
         self.assertEqual(before_ids, {"status:123456"})
         self.assertEqual(code, "654321")
         self.assertEqual(mailbox._last_verification_result["message_id"], "status:654321")
+
+    @patch("time.sleep", return_value=None)
+    @patch("requests.request")
+    def test_wait_for_code_reads_smbower_code_field_and_skips_all_codes_baseline(self, mock_request, _sleep):
+        mock_request.side_effect = [
+            _response({"status": 1, "code": None, "all_codes": ["111111"]}),
+            _response({"status": 1, "code": None, "all_codes": ["111111"]}),
+            _response({"status": 1, "code": "222222", "all_codes": ["111111", "222222"]}),
+        ]
+        mailbox = EmailApiMailbox(
+            email="name@gmail.com",
+            api_url="https://api.example.com/code?id=abc",
+            poll_interval_seconds=0.5,
+        )
+        account = MailboxAccount(
+            email="name@gmail.com",
+            account_id="name@gmail.com",
+            extra={"api_url": "https://api.example.com/code?id=abc"},
+        )
+
+        before_ids = mailbox.get_current_ids(account)
+        code = mailbox.wait_for_code(account, timeout=3, before_ids=before_ids)
+
+        self.assertEqual(before_ids, {"status:111111"})
+        self.assertEqual(code, "222222")
+        self.assertEqual(mailbox._last_verification_result["message_id"], "status:222222")
 
 
 def _response(payload, status_code=200):

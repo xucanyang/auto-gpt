@@ -111,6 +111,16 @@ class ChatGPTPlatform(BasePlatform):
             return engine.build_account(result)
 
         def _resolve_mailbox_timeout(requested_timeout: int) -> int:
+            # email_api 的 API 本身只是控制面轮询，真正的等待窗口应服从
+            # ChatGPT 状态机传入的 register/oauth OTP timeout。否则旧的全局
+            # email_otp_timeout_seconds=20 会把 600s 注册等待压成 20s。
+            if _mail_provider in {"email_api", "api_email", "email_otp_api", "mail_api_otp"}:
+                try:
+                    requested_seconds = int(requested_timeout)
+                except (TypeError, ValueError):
+                    requested_seconds = 0
+                if requested_seconds > 0:
+                    return requested_seconds
             candidates = (
                 extra_config.get("mailbox_otp_timeout_seconds"),
                 extra_config.get("email_otp_timeout_seconds"),

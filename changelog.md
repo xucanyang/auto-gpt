@@ -7,6 +7,18 @@
 ## [Unreleased] (未发布)
 
 
+
+## [1.3.6] - 2026-07-06
+### 修复 (Fixed)
+- **修复邮箱验证码 API 被全局邮箱等待秒数压成 20 秒的问题**：`services/chatgpt_core/plugin.py` 针对 `email_api` 改为服从 ChatGPT 注册/OAuth 状态机传入的等待窗口，避免 K12/注册链路已显示 `otp_wait_timeout=600s` 时仍被历史 `mailbox_otp_timeout_seconds=20` 提前中断，导致 `等待 Email API 验证码超时 (20s)`。
+- **兼容 smsbower 实际返回结构**：`core/base_mailbox.py` 的 `EmailApiMailbox` 新增 `codes_from_payload()`，除继续支持 `status` 直接返回验证码外，也支持 `status=1`、`code` 与 `all_codes` 承载验证码的响应形态；旧码基线会记录所有已有 code，轮询时只提交新出现且未排除的验证码。
+
+### 测试 (Tests)
+- **补充邮箱 API 回归用例**：`tests/test_email_api_mailbox.py` 覆盖 smsbower `code/all_codes` 响应、旧码跳过与新码返回；`tests/test_chatgpt_plugin.py` 固定 `email_api` 不会被全局 `mailbox_otp_timeout_seconds` 缩短状态机 timeout。
+
+### 优化 (Changed)
+- **同步前端版本号至 v1.3.6**：`frontend/src/app/AppShell.tsx` 侧边栏版本展示更新为 `v1.3.6`，用于上线后确认本次邮箱 API 超时与 smsbower 响应兼容修复已加载。
+
 ## [1.3.5] - 2026-07-05
 ### 新增 (Added)
 - **新增邮箱验证码 API 注册/登录收码 provider**：`core/base_mailbox.py` 新增独立 `email_api` 邮箱服务，并兼容 `api_email`、`email_otp_api`、`mail_api_otp` 别名；支持每行 `邮箱----API` 输入，自动补全无协议 API URL，轮询 JSON 响应中的 `status` 字段作为验证码来源。`status=0`、空值或非 4-8 位数字会按“尚未收到验证码”继续等待，收到有效验证码后复用现有 ChatGPT 注册与 OAuth 登录邮箱 OTP 流程。
@@ -403,4 +415,8 @@
 
 ## 2026-07-06 00:05:14 +0800
 - 新增邮箱验证码 API 注册登录能力
+- 发布模式: multi
+
+## 2026-07-06 00:26:39 +0800
+- 修复邮箱验证码 API 超时和 smsbower 响应解析
 - 发布模式: multi

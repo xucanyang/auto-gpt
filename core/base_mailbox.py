@@ -1095,6 +1095,51 @@ class EmailApiMailbox(BaseMailbox):
             return ""
         return raw if re.fullmatch(r"\d{4,8}", raw) else ""
 
+    @classmethod
+    def codes_from_payload(cls, payload: Any) -> list[str]:
+        """Extract candidate OTP codes from common email API response shapes.
+
+        The originally documented contract used ``status`` as the code field,
+        but smsbower's live response currently returns ``status=1`` with
+        ``code``/``all_codes`` carrying the actual OTP once available.  Keep
+        supporting both shapes and de-duplicate while preserving priority.
+        """
+
+        codes: list[str] = []
+
+        def add(value: Any) -> None:
+            code = cls.code_from_status(value)
+            if code and code not in codes:
+                codes.append(code)
+
+        if isinstance(payload, dict):
+            add(payload.get("status"))
+            for key in (
+                "code",
+                "otp",
+                "verification_code",
+                "verificationCode",
+                "email_code",
+                "emailCode",
+            ):
+                add(payload.get(key))
+            all_codes = payload.get("all_codes")
+            if all_codes is None:
+                all_codes = payload.get("allCodes")
+            if isinstance(all_codes, (list, tuple, set)):
+                for item in reversed(list(all_codes)):
+                    add(item)
+            else:
+                add(all_codes)
+            data = payload.get("data")
+            if isinstance(data, dict):
+                for code in cls.codes_from_payload(data):
+                    if code not in codes:
+                        codes.append(code)
+        else:
+            add(payload)
+        return codes
+
     def _normalized_candidates(self) -> list[dict[str, Any]]:
         if isinstance(self.candidates, list) and self.candidates:
             return [dict(item) for item in self.candidates if isinstance(item, dict)]
@@ -1172,7 +1217,8 @@ class EmailApiMailbox(BaseMailbox):
             if swallow_errors:
                 return ""
             raise RuntimeError(str(exc)) from exc
-        return self.code_from_status(payload.get("status"))
+        codes = self.codes_from_payload(payload)
+        return codes[0] if codes else ""
 
     def get_email(self) -> MailboxAccount:
         if self.email and self.api_url:
@@ -1215,8 +1261,12 @@ class EmailApiMailbox(BaseMailbox):
         return MailboxAccount(email=email, account_id=email, extra=extra)
 
     def get_current_ids(self, account: MailboxAccount) -> set:
-        code = self._poll_status_code(account, swallow_errors=True)
-        return {f"status:{code}"} if code else set()
+        api_url = self._account_api_url(account)
+        try:
+            payload = self._request_status_payload(api_url)
+        except Exception:
+            return set()
+        return {f"status:{code}" for code in self.codes_from_payload(payload)}
 
     def wait_for_code(
         self,
@@ -1242,11 +1292,19 @@ class EmailApiMailbox(BaseMailbox):
                     self._log(f"[EmailAPI] 收码接口暂未可用，继续轮询: {error_text[:240]}")
                 return None
 
-            code = self.code_from_status(payload.get("status"))
-            if not code:
+            codes = self.codes_from_payload(payload)
+            if not codes:
                 return None
-            message_id = f"status:{code}"
-            if message_id in seen or code in exclude_codes:
+            code = ""
+            message_id = ""
+            for candidate in codes:
+                candidate_message_id = f"status:{candidate}"
+                if candidate_message_id in seen or candidate in exclude_codes:
+                    continue
+                code = candidate
+                message_id = candidate_message_id
+                break
+            if not code or not message_id:
                 return None
             seen.add(message_id)
             self._record_verification_result(
