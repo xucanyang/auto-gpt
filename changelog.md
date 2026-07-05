@@ -12,6 +12,7 @@
 ### 修复 (Fixed)
 - **修复邮箱验证码 API 被全局邮箱等待秒数压成 20 秒的问题**：`services/chatgpt_core/plugin.py` 针对 `email_api` 改为服从 ChatGPT 注册/OAuth 状态机传入的等待窗口，避免 K12/注册链路已显示 `otp_wait_timeout=600s` 时仍被历史 `mailbox_otp_timeout_seconds=20` 提前中断，导致 `等待 Email API 验证码超时 (20s)`。
 - **兼容 smsbower 实际返回结构**：`core/base_mailbox.py` 的 `EmailApiMailbox` 新增 `codes_from_payload()`，除继续支持 `status` 直接返回验证码外，也支持 `status=1`、`code` 与 `all_codes` 承载验证码的响应形态；旧码基线会记录所有已有 code，轮询时只提交新出现且未排除的验证码。
+- **注册进入邮箱验证码页时主动触发发码**：`services/chatgpt_core/chatgpt_client.py` 在 authorize 后直接落到 `/email-verification` 且此前未调用过 `email-otp/send` 的场景下，会先主动请求发送注册验证码再进入邮箱 API 轮询，避免只停在验证码页等待但 smsbower 收件箱一直没有新邮件。
 
 ### 测试 (Tests)
 - **补充邮箱 API 回归用例**：`tests/test_email_api_mailbox.py` 覆盖 smsbower `code/all_codes` 响应、旧码跳过与新码返回；`tests/test_chatgpt_plugin.py` 固定 `email_api` 不会被全局 `mailbox_otp_timeout_seconds` 缩短状态机 timeout。
@@ -419,4 +420,8 @@
 
 ## 2026-07-06 00:26:39 +0800
 - 修复邮箱验证码 API 超时和 smsbower 响应解析
+- 发布模式: multi
+
+## 2026-07-06 00:34:09 +0800
+- 主动触发邮箱验证码 API 注册发码
 - 发布模式: multi

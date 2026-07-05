@@ -1088,6 +1088,16 @@ class ChatGPTClient:
                 continue
 
             if self._state_is_email_otp(state):
+                if otp_send_attempts <= 0:
+                    otp_send_attempts += 1
+                    self._log(f"进入邮箱验证码页，主动触发 email-otp/send: attempt={otp_send_attempts}")
+                    initial_send_ok = self.send_email_otp(
+                        referer=state.current_url or state.continue_url or f"{self.AUTH}/email-verification"
+                    )
+                    if initial_send_ok:
+                        self._log(f"发送注册验证码成功: attempt={otp_send_attempts}")
+                    else:
+                        self._log(f"发送注册验证码失败: attempt={otp_send_attempts}，继续等待邮箱中的验证码")
                 self._log("等待邮箱验证码...")
                 otp_code = skymail_client.wait_for_verification_code(
                     email,
