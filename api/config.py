@@ -638,6 +638,18 @@ def _build_config_response(*, local_only: bool = False) -> dict[str, Any]:
     return {k: all_cfg.get(k, "") for k in CONFIG_KEYS}
 
 
+def _build_shareable_local_snapshot() -> dict[str, str]:
+    """构造“本实例本地配置”视角的共享模板候选。
+
+    Settings 页只维护 CONFIG_KEYS，但历史/集成模块可能也通过 config_store 写入
+    其他全局 key。推送或对比共享模板时不能把这些非页面字段静默丢掉。
+    """
+    raw_local = config_store.get_local_all()
+    settings_view = _build_config_response(local_only=True)
+    merged = {**raw_local, **settings_view}
+    return filter_shareable_config(merged)
+
+
 @router.get("")
 def get_config():
     # 保持旧接口返回纯配置对象，避免破坏已有前端/任务入口。
@@ -664,7 +676,7 @@ def pull_shared_config_to_instance():
 def push_instance_config_to_shared(body: SharePushRequest):
     if not body.confirm:
         raise HTTPException(400, "需要 confirm=true 才能用当前实例配置覆盖共享模板")
-    data = _build_config_response(local_only=not config_store.shared_enabled())
+    data = _build_shareable_local_snapshot()
     try:
         result = config_store.push_to_shared(
             data,
@@ -680,7 +692,7 @@ def push_instance_config_to_shared(body: SharePushRequest):
 
 @router.get("/share/diff")
 def diff_instance_config_with_shared():
-    local = filter_shareable_config(_build_config_response(local_only=True))
+    local = _build_shareable_local_snapshot()
     shared = shared_config_store.get_all()
     keys = sorted(set(local) | set(shared))
     diffs = []
