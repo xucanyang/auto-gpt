@@ -20,6 +20,7 @@
 - 唯一源代码与主开发路径：`/opt/auto-gpt`（所有功能研发、Git提交、前端 npm build 均在此进行）
 - Plus 数据隔离路径：`/opt/auto-gpt-plus`（不再维护源码，仅保留 `data/`、`external_logs/`、`_ext_targets/` 与 `.env` 作数据驱动）
 - K12 数据隔离路径：`/opt/auto-k12`（不维护源码，仅保留 `data/`、`external_logs/`、`_ext_targets/` 与 `.env` 作数据驱动）
+- 共享配置路径：`/opt/auto-gpt/shared_config`（三实例共同挂载，仅保存共享全局配置模板、revision、审计和快照；严禁提交进 Git）
 - 统一镜像名称：`auto-gpt:latest`
 - 多实例编排配置：`docker-compose.multi.yml`
 - 三实例映射：
@@ -77,6 +78,7 @@
 - 前端改动：统一在 `/opt/auto-gpt/frontend/` build，再同步到容器实际静态目录；不要只停在 checkout。
 - 后端改动：确认容器内 `/app` 代码是否更新，必要时使用多实例编排重建镜像，并重启对应服务。
 - 数据库操作前：SQLite 用 `.backup`，然后 `PRAGMA integrity_check`；容器/镜像改动前优先 `docker commit` + `docker save`。操作时务必认清您修改的是主服务、Plus 服务还是 K12 服务的挂载目录。
+- 共享配置只允许通过 `shared_config/shared_config.db` 和 `core/config_store.py` 的模式开关同步；不要共用三个实例的 `account_manager.db`，也不要把 `shared_config/` 快照或 WAL 文件加入 Git。
 - 资源池语义必须分清来源、绑定、释放、失败原因、复用规则，不要把账号库存、源系统库存、兑换券库存混成一张表。
 - ChatGPT account 的 `used`、复制 AT、订阅、手机号绑定、邮箱绑定、auth 补抓状态要分开表达，不能因为一个动作误改另一个状态。
 - 跨项目接入 `/root/account-delivery` 或源系统时，保持本地解析/本地库存和上游状态边界，不要把 plaintext 账号复制成两份库存。

@@ -89,6 +89,8 @@ import re, sys
 patterns = [
     r"(^|/)\.env($|\.)",
     r"(^|/)data/",
+    r"(^|/)shared_config/",
+    r"(^|/)shared-config-bootstrap-backups/",
     r"(^|/)\.rollback-backups/",
     r"(^|/)_ext_targets/",
     r"(^|/)external_logs/",
@@ -116,6 +118,8 @@ out = pathlib.Path(sys.argv[1])
 patterns = [
     r"(^|/)\.env($|\.)",
     r"(^|/)data/",
+    r"(^|/)shared_config/",
+    r"(^|/)shared-config-bootstrap-backups/",
     r"(^|/)\.rollback-backups/",
     r"(^|/)_ext_targets/",
     r"(^|/)external_logs/",
@@ -277,6 +281,9 @@ create_backup() {
       sqlite_backup_or_copy "$data_root/$db" "$backup_root/${name}.${db}.before_deploy.bak" "$backup_root/${name}.${db}.quick_check.txt"
     done
   done
+  if [[ -d /opt/auto-gpt/shared_config ]]; then
+    tar -C /opt/auto-gpt -czf "$backup_root/shared_config.before_deploy.tgz" shared_config
+  fi
   find "$ROOT_DIR" -maxdepth 2 -type f \( -name '*.py' -o -name 'deploy.sh' -o -name 'docker-compose.multi.yml' -o -name 'Dockerfile' \) -print0 \
     | sort -z | xargs -0 sha256sum > "$backup_root/source.sha256sums.txt" || true
   log "备份完成: $backup_root"

@@ -6,6 +6,17 @@
 
 ## [Unreleased] (未发布)
 
+## [1.3.3] - 2026-07-05
+### 新增 (Added)
+- **新增三实例共享配置中心**：新增 `core/shared_config.py`，在 `/opt/auto-gpt/shared_config/shared_config.db` 中维护独立于账号/任务数据库的共享配置模板，使用 SQLite revision、审计记录和 JSON snapshots 替代裸文件互拷；`core/config_store.py` 按实例本地开关决定读写共享模板或本地 `configs` 表，避免共用 `account_manager.db` 导致账号、任务、日志和手机号池混库。
+- **新增共享配置管理接口**：`api/config.py` 增加 `/api/config/share-state`、`/api/config/share/pull`、`/api/config/share/push`、`/api/config/share/diff` 与 `/api/config/share/audit`，支持实例开启共享、关闭共享时复制当前模板为本地基线、从共享模板拉取、显式将本实例配置推送为共享模板以及查看变更审计；常规 `/api/config` 保持纯配置对象返回，兼容现有任务入口。
+
+### 优化 (Changed)
+- **Settings 页增加共享配置状态卡片**：`frontend/src/pages/Settings.tsx` 在全局配置页顶部展示当前实例、共享/本地模式、共享 revision、最后更新来源、本地保留 key 说明，并提供“从共享拉取 / 查看差异 / 本实例推送为共享模板”等显式操作；共享模式保存时会带上 base revision，后端检测到版本冲突时返回 409，避免多实例静默覆盖。
+- **三实例编排挂载共享配置目录**：`docker-compose.multi.yml` 为 `auto-gpt`、`auto-gpt-plus`、`auto-k12` 增加 `APP_INSTANCE_ID`、`SHARED_CONFIG_DB=/shared_config/shared_config.db` 与 `/opt/auto-gpt/shared_config` 挂载；`deploy.sh` 将 `shared_config/` 视为运行态敏感目录并纳入发布备份 tar，`.gitignore` 防止共享模板、密钥快照和 WAL 误入仓库。
+- **修正共享空值覆盖语义**：`core/shared_config.py` 增加存在性读取，`core/config_store.py` 在共享模式下即使共享模板中的值为空字符串也会按共享值返回，不再误回退到本实例旧本地值或环境变量，保证“清空某项配置”也能在共享实例间一致生效。
+- **同步前端版本号至 v1.3.3**：`frontend/src/app/AppShell.tsx` 侧边栏版本展示更新为 `v1.3.3`，用于上线后确认共享配置中心对应的静态资源已加载。
+
 ## [1.3.2] - 2026-07-05
 ### 新增 (Added)
 - **新增 K12 独立运行实例 `auto-k12`**：`docker-compose.multi.yml` 增加第三个服务，复用统一镜像 `auto-gpt:latest`，但使用 `/opt/auto-k12/data`、`/opt/auto-k12/_ext_targets` 与 `/opt/auto-k12/external_logs` 作为独立运行态挂载；对外业务端口为 `8002`，CLIProxyAPI 端口为 `8319`，Solver 仅本机暴露为 `8891`，避免与主服务 `auto-gpt` 和 Plus 实例 `auto-gpt-plus` 的数据、日志、插件目录混用。
@@ -342,4 +353,8 @@
 
 ## 2026-07-05 21:53:20 +0800
 - 新增 auto-k12 独立实例并纳入多实例发布
+- 发布模式: multi
+
+## 2026-07-05 22:33:13 +0800
+- 新增三实例共享配置中心
 - 发布模式: multi

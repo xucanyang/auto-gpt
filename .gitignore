@@ -73,6 +73,8 @@ tmp_*.py
 # 运行时挂载 / 外部工作区 / 敏感调试材料
 _ext_targets/
 external_logs/
+shared_config/
+shared-config-bootstrap-backups/
 *.har
 *.har.gz
 *.db-wal

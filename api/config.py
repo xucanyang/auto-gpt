@@ -1,9 +1,11 @@
 import os
 from pathlib import Path
+from typing import Any
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from core.config_store import config_store
+from core.shared_config import SharedConfigConflict, filter_shareable_config, shared_config_store
 
 router = APIRouter(prefix="/config", tags=["config"])
 
@@ -248,6 +250,18 @@ CONFIG_KEYS = [
 
 class ConfigUpdate(BaseModel):
     data: dict
+    base_revision: int | None = None
+
+
+class ShareStateUpdate(BaseModel):
+    enabled: bool
+    pull: bool = True
+
+
+class SharePushRequest(BaseModel):
+    base_revision: int | None = None
+    confirm: bool = False
+    note: str = ""
 
 
 class TempMailDomainsRequest(BaseModel):
@@ -382,9 +396,8 @@ def list_tempmail_domains(body: TempMailDomainsRequest | None = None):
     }
 
 
-@router.get("")
-def get_config():
-    all_cfg = config_store.get_all()
+def _build_config_response(*, local_only: bool = False) -> dict[str, Any]:
+    all_cfg = config_store.get_local_all() if local_only else config_store.get_all()
     if not all_cfg.get("mail_provider"):
         all_cfg["mail_provider"] = "luckmail"
     if not all_cfg.get("proxy_pool_cooldown_enabled"):
@@ -625,6 +638,76 @@ def get_config():
     return {k: all_cfg.get(k, "") for k in CONFIG_KEYS}
 
 
+@router.get("")
+def get_config():
+    # 保持旧接口返回纯配置对象，避免破坏已有前端/任务入口。
+    return _build_config_response()
+
+
+@router.get("/share-state")
+def get_config_share_state():
+    return config_store.get_share_state()
+
+
+@router.put("/share-state")
+def update_config_share_state(body: ShareStateUpdate):
+    return config_store.enable_shared(pull=body.pull) if body.enabled else config_store.disable_shared()
+
+
+@router.post("/share/pull")
+def pull_shared_config_to_instance():
+    result = config_store.pull_shared_to_local()
+    return {**result, "state": config_store.get_share_state()}
+
+
+@router.post("/share/push")
+def push_instance_config_to_shared(body: SharePushRequest):
+    if not body.confirm:
+        raise HTTPException(400, "需要 confirm=true 才能用当前实例配置覆盖共享模板")
+    data = _build_config_response(local_only=not config_store.shared_enabled())
+    try:
+        result = config_store.push_to_shared(
+            data,
+            replace=True,
+            base_revision=body.base_revision,
+            action="push",
+            note=body.note or "instance-push",
+        )
+    except SharedConfigConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {**result, "state": config_store.get_share_state()}
+
+
+@router.get("/share/diff")
+def diff_instance_config_with_shared():
+    local = filter_shareable_config(_build_config_response(local_only=True))
+    shared = shared_config_store.get_all()
+    keys = sorted(set(local) | set(shared))
+    diffs = []
+    for key in keys:
+        local_value = str(local.get(key, "") or "")
+        shared_value = str(shared.get(key, "") or "")
+        if local_value != shared_value:
+            diffs.append({
+                "key": key,
+                "local_present": bool(local_value),
+                "shared_present": bool(shared_value),
+                "local_length": len(local_value),
+                "shared_length": len(shared_value),
+            })
+    return {
+        "ok": True,
+        "state": config_store.get_share_state(),
+        "diff_count": len(diffs),
+        "diffs": diffs[:500],
+    }
+
+
+@router.get("/share/audit")
+def get_shared_config_audit(limit: int = 50):
+    return {"ok": True, "items": shared_config_store.audit(limit=limit)}
+
+
 @router.put("")
 def update_config(body: ConfigUpdate):
     # 只允许更新已知 key
@@ -636,7 +719,10 @@ def update_config(body: ConfigUpdate):
         safe.setdefault("task_proxy_url", dynamic_template)
     if dynamic_country:
         safe.setdefault("task_proxy_country_code", dynamic_country)
-    config_store.set_many(safe)
+    try:
+        config_store.set_many(safe, base_revision=body.base_revision)
+    except SharedConfigConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
     return {"ok": True, "updated": list(safe.keys())}
 
 

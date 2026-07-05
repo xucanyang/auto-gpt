@@ -21,6 +21,8 @@ services:
       APP_RELOAD: "0"
       APP_CONDA_ENV: docker
       APP_RUNTIME_DIR: /runtime
+      APP_INSTANCE_ID: auto-gpt
+      SHARED_CONFIG_DB: /shared_config/shared_config.db
       APP_ENABLE_SOLVER: "1"
       SOLVER_PORT: "8889"
       SOLVER_BIND_HOST: 0.0.0.0
@@ -36,6 +38,7 @@ services:
       - "${CLIPROXYAPI_PORT_BIND:-8317}:8317"
     volumes:
       - ./data:/runtime
+      - ./shared_config:/shared_config
       - ./_ext_targets:/_ext_targets
       - ./external_logs:/app/services/external_logs
       - /root/.openclaw/workspace/team-manage:/embedded-team-manager:ro
@@ -63,6 +66,8 @@ services:
       APP_RELOAD: "0"
       APP_CONDA_ENV: docker
       APP_RUNTIME_DIR: /runtime
+      APP_INSTANCE_ID: auto-gpt-plus
+      SHARED_CONFIG_DB: /shared_config/shared_config.db
       APP_ENABLE_SOLVER: "1"
       SOLVER_PORT: "8889"
       SOLVER_BIND_HOST: 0.0.0.0
@@ -78,6 +83,7 @@ services:
       - "${CLIPROXYAPI_PORT_BIND_PLUS:-8318}:8317"
     volumes:
       - /opt/auto-gpt-plus/data:/runtime
+      - /opt/auto-gpt/shared_config:/shared_config
       - /opt/auto-gpt-plus/_ext_targets:/_ext_targets
       - /opt/auto-gpt-plus/external_logs:/app/services/external_logs
       - /root/.openclaw/workspace/team-manage:/embedded-team-manager:ro
@@ -105,6 +111,8 @@ services:
       APP_RELOAD: "0"
       APP_CONDA_ENV: docker
       APP_RUNTIME_DIR: /runtime
+      APP_INSTANCE_ID: auto-k12
+      SHARED_CONFIG_DB: /shared_config/shared_config.db
       APP_ENABLE_SOLVER: "1"
       SOLVER_PORT: "8889"
       SOLVER_BIND_HOST: 0.0.0.0
@@ -120,6 +128,7 @@ services:
       - "${CLIPROXYAPI_PORT_BIND_K12:-8319}:8317"
     volumes:
       - /opt/auto-k12/data:/runtime
+      - /opt/auto-gpt/shared_config:/shared_config
       - /opt/auto-k12/_ext_targets:/_ext_targets
       - /opt/auto-k12/external_logs:/app/services/external_logs
       - /root/.openclaw/workspace/team-manage:/embedded-team-manager:ro

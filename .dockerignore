@@ -8,6 +8,8 @@ __pycache__/
 data/
 static/
 _ext_targets/
+external_logs/
+shared_config/
 services/external_logs/
 services/turnstile_solver/solver.log
 account_manager.db

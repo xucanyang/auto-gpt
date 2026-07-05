@@ -19,6 +19,23 @@ import { parseBooleanConfigValue } from '@/lib/configValueParsers'
 import { buildChatGPTK12ConfigData } from '@/lib/chatgptK12Config'
 import { apiFetch } from '@/lib/utils'
 
+type ConfigShareState = {
+  instance_id?: string
+  enabled?: boolean
+  mode?: string
+  baseline_revision?: string
+  detached_at?: string
+  last_pull_at?: string
+  shared?: {
+    revision?: number
+    updated_at?: string
+    updated_by?: string
+    keys?: number
+    exists?: boolean
+  }
+  local_only_keys?: string[]
+}
+
 const SELECT_FIELDS: Record<string, { label: string; value: string }[]> = {
   mail_provider: [
     { label: 'LuckMail（订单接码 / 已购邮箱）', value: 'luckmail' },
@@ -3455,6 +3472,8 @@ export default function Settings() {
   const [saved, setSaved] = useState(false)
   const [configLoaded, setConfigLoaded] = useState(false)
   const [configLoadError, setConfigLoadError] = useState('')
+  const [shareState, setShareState] = useState<ConfigShareState | null>(null)
+  const [shareBusy, setShareBusy] = useState(false)
   const [activeTab, setActiveTab] = useState('register')
   const [chatgptPinEditorOpen, setChatgptPinEditorOpen] = useState(false)
   const [chatgptPinnedSections, setChatgptPinnedSections] = useState<string[]>(loadChatgptPinnedSections)
@@ -3464,6 +3483,103 @@ export default function Settings() {
   const tempmailArchiveCleanupEnabled = parseBooleanConfigValue(Form.useWatch('tempmail_archive_cleanup_enabled', form))
   const isMobile = screens.md === false
 
+  const loadShareState = async () => {
+    const data = await apiFetch('/config/share-state') as ConfigShareState
+    setShareState(data || null)
+    return data
+  }
+
+  const reloadAfterShareChange = () => {
+    window.setTimeout(() => window.location.reload(), 350)
+  }
+
+  const toggleShareMode = (enabled: boolean) => {
+    const actionText = enabled ? '开启共享配置并拉取共享模板' : '关闭共享并转为本地配置'
+    Modal.confirm({
+      title: actionText,
+      content: enabled
+        ? '开启后，本页保存会更新共享配置，并影响所有开启共享的实例。当前实例本地配置会先被共享模板覆盖。'
+        : '关闭前会先把当前共享配置复制成本实例本地基线；之后本实例保存配置不会影响共享模板，也不会接收其他实例修改。',
+      okText: '确认',
+      cancelText: '取消',
+      onOk: async () => {
+        setShareBusy(true)
+        try {
+          const result = await apiFetch('/config/share-state', {
+            method: 'PUT',
+            body: JSON.stringify({ enabled, pull: true }),
+          }) as ConfigShareState
+          setShareState(result)
+          message.success(enabled ? '已开启共享配置' : '已关闭共享配置')
+          reloadAfterShareChange()
+        } finally {
+          setShareBusy(false)
+        }
+      },
+    })
+  }
+
+  const pullSharedConfig = async () => {
+    setShareBusy(true)
+    try {
+      await apiFetch('/config/share/pull', { method: 'POST' })
+      await loadShareState()
+      message.success('已从共享模板拉取到当前实例')
+      reloadAfterShareChange()
+    } finally {
+      setShareBusy(false)
+    }
+  }
+
+  const pushLocalConfigToShared = () => {
+    Modal.confirm({
+      title: '将本实例配置推送为共享模板',
+      content: '这是覆盖共享模板的危险操作，会影响所有开启共享配置的实例。建议仅在确认当前实例配置是最新母版时执行。',
+      okText: '确认覆盖共享模板',
+      okButtonProps: { danger: true },
+      cancelText: '取消',
+      onOk: async () => {
+        setShareBusy(true)
+        try {
+          const result = await apiFetch('/config/share/push', {
+            method: 'POST',
+            body: JSON.stringify({
+              confirm: true,
+              base_revision: shareState?.shared?.revision,
+              note: `ui-push:${shareState?.instance_id || 'unknown'}`,
+            }),
+          }) as { state?: ConfigShareState }
+          if (result?.state) setShareState(result.state)
+          message.success('已用本实例配置更新共享模板')
+          reloadAfterShareChange()
+        } finally {
+          setShareBusy(false)
+        }
+      },
+    })
+  }
+
+  const showShareDiff = async () => {
+    setShareBusy(true)
+    try {
+      const result = await apiFetch('/config/share/diff') as { diff_count?: number; diffs?: { key: string }[] }
+      const keys = (result.diffs || []).slice(0, 40).map((item) => item.key)
+      Modal.info({
+        title: `本地与共享差异：${result.diff_count || 0} 个 key`,
+        content: keys.length > 0
+          ? (
+              <div style={{ maxHeight: 360, overflow: 'auto' }}>
+                {keys.map((key) => <Tag key={key} style={{ marginBottom: 6 }}>{key}</Tag>)}
+                {(result.diff_count || 0) > keys.length ? <Typography.Text type="secondary">仅展示前 {keys.length} 个。</Typography.Text> : null}
+              </div>
+            )
+          : '当前本地配置与共享模板一致。',
+      })
+    } finally {
+      setShareBusy(false)
+    }
+  }
+
   useEffect(() => {
     if (typeof window === 'undefined') return
     window.localStorage.setItem(CHATGPT_PINNED_SECTIONS_STORAGE_KEY, JSON.stringify(chatgptPinnedSections))
@@ -3472,6 +3588,7 @@ export default function Settings() {
   useEffect(() => {
     setConfigLoaded(false)
     setConfigLoadError('')
+    loadShareState().catch(() => undefined)
     apiFetch('/config').then((data) => {
       if (!data || typeof data !== 'object' || Array.isArray(data)) {
         throw new Error('配置接口返回格式异常')
@@ -3916,7 +4033,16 @@ export default function Settings() {
       values.local_phone_gateway_max_resend_attempts = String(values.local_phone_gateway_max_resend_attempts || '20').trim() || '20'
       values.local_phone_gateway_resend_interval_seconds = String(values.local_phone_gateway_resend_interval_seconds || '30').trim() || '30'
 
-      await apiFetch('/config', { method: 'PUT', body: JSON.stringify({ data: values }) })
+      await apiFetch('/config', {
+        method: 'PUT',
+        body: JSON.stringify({
+          data: values,
+          base_revision: shareState?.enabled ? shareState?.shared?.revision : undefined,
+        }),
+      })
+      if (shareState?.enabled) {
+        await loadShareState().catch(() => undefined)
+      }
       form.setFieldsValue({
         cfworker_domains: domains,
         cfworker_enabled_domains: enabledDomains,
@@ -4086,6 +4212,50 @@ export default function Settings() {
       ) : !configLoaded ? (
         <Alert type="info" showIcon message="正在加载配置" description="加载完成前暂不允许保存，避免空表单覆盖现有配置。" />
       ) : null}
+
+      <Card size="small">
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
+          <Space direction="vertical" size={2}>
+            <Space size={8} wrap>
+              <Typography.Text strong>配置共享</Typography.Text>
+              <Tag color={shareState?.enabled ? 'green' : 'default'}>
+                {shareState?.enabled ? '共享模式' : '本地模式'}
+              </Tag>
+              <Tag>当前实例：{shareState?.instance_id || '-'}</Tag>
+              <Tag>共享版本：rev {shareState?.shared?.revision ?? 0}</Tag>
+            </Space>
+            <Typography.Text type="secondary">
+              {shareState?.enabled
+                ? `保存本页会更新共享模板，并影响所有开启共享的实例；最后更新：${shareState?.shared?.updated_by || '-'} / ${shareState?.shared?.updated_at || '-'}`
+                : `当前实例只使用本地配置；脱离基线：rev ${shareState?.baseline_revision || '0'}，脱离时间：${shareState?.detached_at || '-'}`}
+            </Typography.Text>
+            <Typography.Text type="secondary">
+              本地保留不共享：CLIProxyAPI、外部分发 API Token、GoPay 近期运行态等实例专属配置。
+            </Typography.Text>
+          </Space>
+          <Space size={8} wrap>
+            <Switch
+              checked={Boolean(shareState?.enabled)}
+              checkedChildren="共享"
+              unCheckedChildren="本地"
+              loading={shareBusy}
+              onChange={toggleShareMode}
+            />
+            <Button size="small" icon={<SyncOutlined />} loading={shareBusy} onClick={() => loadShareState()}>
+              刷新状态
+            </Button>
+            <Button size="small" loading={shareBusy} onClick={pullSharedConfig}>
+              从共享拉取
+            </Button>
+            <Button size="small" loading={shareBusy} onClick={showShareDiff}>
+              查看差异
+            </Button>
+            <Button size="small" danger loading={shareBusy} disabled={Boolean(shareState?.enabled)} onClick={pushLocalConfigToShared}>
+              本实例推送为共享模板
+            </Button>
+          </Space>
+        </div>
+      </Card>
 
       <div
         className="settings-body"
