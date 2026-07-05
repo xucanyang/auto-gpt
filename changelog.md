@@ -8,6 +8,16 @@
 
 
 
+## [1.3.9] - 2026-07-06
+### 修复 (Fixed)
+- **恢复普通邮箱注册的自动发码优先路径**：`services/chatgpt_core/chatgpt_client.py` 在 `Authorize -> /email-verification` 的注册分支中恢复旧行为，先等待 OpenAI 已自动发送到普通邮箱/邮箱 API 的验证码；只有首次等待窗口未收到时才触发 `email-otp/send` 补发，避免一进入验证码页就额外发码导致 OpenAI Auth session/OTP 状态被刷新，最终在 `/api/accounts/email-otp/validate` 返回 `409 invalid_state`、注册不能落库。
+
+### 测试 (Tests)
+- **补齐注册 OTP 状态机回归**：`tests/test_chatgpt_register.py` 新增直接进入 `/email-verification` 的两条用例，固定“秒收验证码不调用 `email-otp/send`”和“首次等待超时后才补发”的行为，防止后续为了邮箱 API 收码再破坏普通邮箱注册主链路。
+
+### 优化 (Changed)
+- **同步前端版本号至 v1.3.9**：`frontend/src/app/AppShell.tsx` 侧边栏版本展示更新为 `v1.3.9`，用于上线后确认普通邮箱注册回归修复已加载。
+
 ## [1.3.8] - 2026-07-06
 ### 修复 (Fixed)
 - **补齐无 RT/V2 注册引擎的邮箱 API 超时与重发配置**：`services/chatgpt_core/access_token_only_registration_engine.py` 的 V2 `EmailServiceAdapter` 现在同样会把邮箱 provider 的 `TimeoutError` 归一为未收到验证码，让 `ChatGPTClient.register_complete_flow()` 能执行 `email-otp/send` 重发；同时 V2 注册调用会读取并透传 `chatgpt_register_otp_wait_seconds` 与 `chatgpt_register_otp_resend_wait_seconds`，避免 K12/email_api 实际运行仍固定显示 `otp_wait_timeout=600s`、`otp_resend_wait_timeout=300s`。
@@ -453,4 +463,8 @@
 
 ## 2026-07-06 00:55:12 +0800
 - 补齐 V2 邮箱 API 重发和 OTP 等待配置
+- 发布模式: multi
+
+## 2026-07-06 01:49:32 +0800
+- 恢复普通邮箱注册验证码等待行为
 - 发布模式: multi

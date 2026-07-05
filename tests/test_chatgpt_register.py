@@ -939,6 +939,71 @@ class RefreshTokenRegistrationEngineTests(unittest.TestCase):
         mock_recover.assert_not_called()
 
 
+class ChatGPTClientRegistrationOtpTests(unittest.TestCase):
+    def _make_client_at_email_verification(self):
+        client = ChatGPTClient(verbose=False)
+        client.visit_homepage = mock.Mock(return_value=True)
+        client.get_csrf_token = mock.Mock(return_value="csrf-demo")
+        client.signin = mock.Mock(return_value="https://auth.openai.com/api/accounts/authorize?demo=1")
+        client.authorize = mock.Mock(return_value="https://auth.openai.com/email-verification")
+        client.send_email_otp = mock.Mock(return_value=True)
+        client.verify_email_otp = mock.Mock(
+            return_value=(
+                True,
+                FlowState(
+                    page_type="callback",
+                    current_url="https://chatgpt.com/",
+                    continue_url="https://chatgpt.com/",
+                ),
+            )
+        )
+        return client
+
+    def test_direct_email_verification_uses_existing_auto_sent_code_before_resend(self):
+        client = self._make_client_at_email_verification()
+        mailbox = mock.Mock()
+        mailbox.wait_for_verification_code.return_value = "123456"
+
+        success, message = client.register_complete_flow(
+            "user@example.com",
+            "Secret123!",
+            "Alice",
+            "Smith",
+            "1990-01-01",
+            mailbox,
+            otp_wait_timeout=30,
+            otp_resend_wait_timeout=30,
+        )
+
+        self.assertTrue(success, message)
+        client.send_email_otp.assert_not_called()
+        client.verify_email_otp.assert_called_once_with("123456", return_state=True)
+        self.assertEqual(mailbox.wait_for_verification_code.call_count, 1)
+
+    def test_direct_email_verification_only_sends_when_first_wait_times_out(self):
+        client = self._make_client_at_email_verification()
+        mailbox = mock.Mock()
+        mailbox.wait_for_verification_code.side_effect = [None, "654321"]
+
+        success, message = client.register_complete_flow(
+            "user@example.com",
+            "Secret123!",
+            "Alice",
+            "Smith",
+            "1990-01-01",
+            mailbox,
+            otp_wait_timeout=30,
+            otp_resend_wait_timeout=30,
+        )
+
+        self.assertTrue(success, message)
+        client.send_email_otp.assert_called_once_with(
+            referer="https://auth.openai.com/email-verification"
+        )
+        client.verify_email_otp.assert_called_once_with("654321", return_state=True)
+        self.assertEqual(mailbox.wait_for_verification_code.call_count, 2)
+
+
 class OAuthClientPasswordlessTests(unittest.TestCase):
     def _make_client(self):
         return OAuthClient({}, proxy="http://127.0.0.1:7890", verbose=False)
