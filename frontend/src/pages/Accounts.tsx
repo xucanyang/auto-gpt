@@ -1917,6 +1917,7 @@ export default function Accounts() {
   const [batchGopayNextRoundAt, setBatchGopayNextRoundAt] = useState<number | null>(null)
   const [accessTokenCopiedAccountIds, setAccessTokenCopiedAccountIds] = useState<Set<number>>(() => new Set())
   const [codexUsageRefreshingIds, setCodexUsageRefreshingIds] = useState<Set<number>>(() => new Set())
+  const [recapturingK12AccountId, setRecapturingK12AccountId] = useState<number | null>(null)
   const batchGopayStartingRef = useRef(false)
   const batchGopayCancelRequestedRef = useRef(false)
   const accountsQuery = useAccountsQuery({
@@ -2036,6 +2037,49 @@ export default function Accounts() {
       })
     }
   }, [accountsQuery.refetch])
+
+  const recaptureK12Workspaces = useCallback(async (record: any, values: Record<string, any>) => {
+    const accountId = Number(record?.id || 0)
+    if (!Number.isFinite(accountId) || accountId <= 0) throw new Error('账号 ID 无效')
+    setRecapturingK12AccountId(accountId)
+    try {
+      const payload = {
+        workspace_ids: String(values?.workspace_ids || '').trim(),
+        save_all_spaces: values?.save_all_spaces !== false,
+        strict_join: Boolean(values?.strict_join),
+        proxy: String(values?.proxy || '').trim(),
+        join_timeout_seconds: Number(values?.join_timeout_seconds || 60),
+        join_retry_count: Number(values?.join_retry_count || 2),
+        post_join_poll_seconds: String(values?.post_join_poll_seconds || '3,8,15').trim(),
+      }
+      const result = await apiFetch(`/chatgpt/${accountId}/k12-workspaces/recapture`, {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      })
+      const savedSpaces = Number(result?.summary?.saved_spaces || result?.artifacts?.length || 0)
+      const savedAccounts = Number(result?.saved_accounts?.length || 0)
+      if (result?.ok) {
+        message.success(`K12 / Workspace 已重新导出：${savedSpaces} 个空间，写入 ${savedAccounts} 个账号`)
+      } else {
+        message.warning(result?.summary?.accounts_check_error || 'K12 / Workspace 已执行，但存在部分失败')
+      }
+      await accountsQuery.refetch()
+      if (detailModalOpen && detailAccount?.id === accountId) {
+        try {
+          const latest = await apiFetch(`/accounts/${accountId}`)
+          setDetailAccount(normalizeAccount(latest))
+        } catch {
+          // 列表刷新已完成，详情刷新失败不阻断结果展示。
+        }
+      }
+      return result
+    } catch (e: any) {
+      message.error(e?.message || '重新进入/导出 K12 失败')
+      throw e
+    } finally {
+      setRecapturingK12AccountId(null)
+    }
+  }, [accountsQuery.refetch, detailAccount?.id, detailModalOpen])
 
   const loadConfigCache = useCallback(async (options: { force?: boolean } = {}) => {
     if (!options.force && configCache) return configCache
@@ -7648,6 +7692,8 @@ export default function Accounts() {
         onCopyAccessToken={copyAccessToken}
         onCopySecret={copyAccountSecret}
         onFetchSecret={fetchAccountSecrets}
+        onRecaptureK12={recaptureK12Workspaces}
+        recapturingK12AccountId={recapturingK12AccountId}
         isAccessTokenCopied={(record) => {
           const accountId = Number(record?.id || 0)
           return accountId > 0 && accessTokenCopiedAccountIds.has(accountId)

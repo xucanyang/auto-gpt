@@ -108,6 +108,16 @@ class CodexUsageBatchRefreshReq(BaseModel):
     email: str = ""
 
 
+class K12WorkspaceRecaptureReq(BaseModel):
+    workspace_ids: Any = None
+    save_all_spaces: bool = True
+    strict_join: bool = False
+    proxy: Optional[str] = None
+    join_timeout_seconds: Optional[int] = None
+    join_retry_count: Optional[int] = None
+    post_join_poll_seconds: Optional[str] = None
+
+
 def _get_account(account_id: int, session: Session) -> AccountModel:
     acc = session.get(AccountModel, account_id)
     if not acc or acc.platform != "chatgpt":
@@ -746,6 +756,60 @@ def refresh_token(account_id: int, proxy: Optional[str] = None,
         schedule_chatgpt_local_status_refresh_for_account_id(acc.id, proxy=proxy, reason="chatgpt_refresh_token")
         return {"ok": True, "access_token": result.access_token[:40] + "..."}
     raise HTTPException(400, result.error_message)
+
+
+@router.post("/{account_id}/k12-workspaces/recapture")
+def recapture_k12_workspaces(account_id: int, req: K12WorkspaceRecaptureReq,
+                             session: Session = Depends(get_session)):
+    """Reuse saved AT/cookies to re-join K12 targets and export current workspace variants."""
+    acc = _get_account(account_id, session)
+    try:
+        from core.config_store import config_store
+        from services.chatgpt_core.k12_recapture import (
+            K12_RECAPTURE_CONFIG_KEYS,
+            recapture_saved_account_k12_workspaces,
+        )
+        from services.chatgpt_core.k12_workspace import safe_k12_error
+
+        config = {key: config_store.get(key, "") for key in K12_RECAPTURE_CONFIG_KEYS}
+        if req.join_timeout_seconds is not None:
+            config["chatgpt_k12_join_timeout_seconds"] = max(5, min(int(req.join_timeout_seconds), 180))
+        if req.join_retry_count is not None:
+            config["chatgpt_k12_join_retry_count"] = max(0, min(int(req.join_retry_count), 5))
+        if req.post_join_poll_seconds is not None:
+            config["chatgpt_k12_post_join_poll_seconds"] = str(req.post_join_poll_seconds or "")
+        result = recapture_saved_account_k12_workspaces(
+            session=session,
+            account=acc,
+            config=config,
+            workspace_ids=req.workspace_ids,
+            save_all_spaces=req.save_all_spaces,
+            strict_join=req.strict_join,
+            proxy=str(req.proxy or "").strip(),
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        try:
+            from services.chatgpt_core.k12_workspace import safe_k12_error
+            detail = safe_k12_error(exc, 300)
+        except Exception:
+            detail = exc.__class__.__name__
+        raise HTTPException(500, f"K12 workspace 重新捕获失败: {detail}") from exc
+
+    for changed_id in result.get("changed_account_ids") or []:
+        try:
+            schedule_chatgpt_local_status_refresh_for_account_id(
+                int(changed_id),
+                proxy=str(req.proxy or "").strip() or None,
+                reason="k12_workspace_recapture",
+                delay_seconds=2.0,
+            )
+        except Exception:
+            pass
+    return result
 
 
 # ── 生成支付链接 ────────────────────────────────────────────

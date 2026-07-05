@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import type { ReactNode } from 'react'
-import { Alert, Button, Drawer, Form, Input, Select, Space, Tag, Typography, theme } from 'antd'
+import { Alert, Button, Checkbox, Drawer, Form, Input, InputNumber, Modal, Select, Space, Tag, Typography, theme } from 'antd'
 import { CopyOutlined } from '@ant-design/icons'
 
 const { Text } = Typography
@@ -13,6 +13,25 @@ type AccountSecretResponse = {
   secrets?: Record<string, string>
   present?: Record<string, boolean>
   lengths?: Record<string, number>
+}
+
+type K12RecaptureValues = {
+  workspace_ids?: string
+  save_all_spaces?: boolean
+  strict_join?: boolean
+  proxy?: string
+  join_timeout_seconds?: number
+  join_retry_count?: number
+  post_join_poll_seconds?: string
+}
+
+type K12RecaptureResult = {
+  ok?: boolean
+  summary?: Record<string, any>
+  artifacts?: any[]
+  saved_accounts?: any[]
+  changed_account_ids?: number[]
+  logs?: Array<{ level?: string; message?: string }>
 }
 
 function SummaryField({
@@ -405,6 +424,19 @@ function WorkspaceVariantsSummary({ variants }: { variants: WorkspaceVariantSumm
   )
 }
 
+function defaultK12WorkspaceIds(variants: WorkspaceVariantSummaryItem[]): string {
+  const seen = new Set<string>()
+  const ids: string[] = []
+  variants.forEach((variant) => {
+    const scope = String(variant.scope || '').toLowerCase()
+    const workspaceId = String(variant.workspaceId || '').trim()
+    if (scope !== 'k12' || !workspaceId || seen.has(workspaceId)) return
+    seen.add(workspaceId)
+    ids.push(workspaceId)
+  })
+  return ids.join('\n')
+}
+
 function explicitSecretFlag(...values: any[]): boolean | undefined {
   for (const value of values) {
     if (typeof value === 'boolean') return value
@@ -615,6 +647,8 @@ type AccountDetailModalProps = {
   onCopyAccessToken: (record: any) => Promise<void> | void
   onCopySecret: (record: any, field: AccountSecretField, label: string) => Promise<void> | void
   onFetchSecret: (accountId: number, fields: AccountSecretField[]) => Promise<AccountSecretResponse>
+  onRecaptureK12: (record: any, values: K12RecaptureValues) => Promise<K12RecaptureResult>
+  recapturingK12AccountId?: number | null
   isAccessTokenCopied: (record: any) => boolean
   canImportAccountToTeam: (record: any) => boolean
   authStateMeta: (state?: string) => { color: string; label: string }
@@ -636,12 +670,17 @@ export function AccountDetailModal({
   onCopyAccessToken,
   onCopySecret,
   onFetchSecret,
+  onRecaptureK12,
+  recapturingK12AccountId,
   isAccessTokenCopied,
   canImportAccountToTeam,
   authStateMeta,
   planMeta,
   codexStateMeta,
 }: AccountDetailModalProps) {
+  const [k12Form] = Form.useForm<K12RecaptureValues>()
+  const [k12ModalOpen, setK12ModalOpen] = useState(false)
+  const [k12Result, setK12Result] = useState<K12RecaptureResult | null>(null)
   const extra = parseAccountExtra(currentAccount)
   const workspace = currentAccount?.workspace && typeof currentAccount.workspace === 'object' ? currentAccount.workspace : {}
   const capabilities = currentAccount?.chatgptCapabilities && typeof currentAccount.chatgptCapabilities === 'object' ? currentAccount.chatgptCapabilities : {}
@@ -661,6 +700,26 @@ export function AccountDetailModal({
       ? currentAccount.codex
       : {}
   const workspaceVariants = collectWorkspaceVariants(currentAccount, extra, workspace, capabilities, authSummary)
+  const k12Recapturing = Boolean(currentAccount?.id && Number(recapturingK12AccountId || 0) === Number(currentAccount.id))
+  const openK12RecaptureModal = () => {
+    k12Form.setFieldsValue({
+      workspace_ids: defaultK12WorkspaceIds(workspaceVariants),
+      save_all_spaces: true,
+      strict_join: false,
+      proxy: '',
+      join_timeout_seconds: 60,
+      join_retry_count: 2,
+      post_join_poll_seconds: '3,8,15',
+    })
+    setK12Result(null)
+    setK12ModalOpen(true)
+  }
+  const submitK12Recapture = async () => {
+    if (!currentAccount) return
+    const values = await k12Form.validateFields()
+    const result = await onRecaptureK12(currentAccount, values)
+    setK12Result(result || {})
+  }
   const drawerTitle = currentAccount ? (
     <Space size={8} wrap>
       <span>账号详情</span>
@@ -732,7 +791,16 @@ export function AccountDetailModal({
 
           <DetailSection
             title="所有空间 / Workspace variants"
-            extra={<Text type="secondary" style={{ fontSize: 12 }}>仅展示空间摘要，不展开 token/cookies</Text>}
+            extra={(
+              <Space size={8} wrap>
+                <Text type="secondary" style={{ fontSize: 12 }}>仅展示空间摘要，不展开 token/cookies</Text>
+                {currentAccount?.platform === 'chatgpt' ? (
+                  <Button size="small" type="primary" loading={k12Recapturing} onClick={openK12RecaptureModal}>
+                    重新进入/导出 K12
+                  </Button>
+                ) : null}
+              </Space>
+            )}
           >
             <WorkspaceVariantsSummary variants={workspaceVariants} />
           </DetailSection>
@@ -849,6 +917,88 @@ export function AccountDetailModal({
           </DetailSection>
         </div>
       )}
+      <Modal
+        title="重新进入并导出 K12 / Workspace"
+        open={k12ModalOpen}
+        onOk={submitK12Recapture}
+        onCancel={() => setK12ModalOpen(false)}
+        confirmLoading={k12Recapturing}
+        okText="开始执行"
+        cancelText="关闭"
+        width={720}
+        destroyOnHidden
+      >
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+          <Alert
+            type="warning"
+            showIcon
+            message="将复用当前账号已保存的 AccessToken + cookies/session_token"
+            description="该操作会重新执行 K12 join、拉取 ChatGPT accounts/check 空间列表、为每个可进入空间交换新的 workspace AccessToken，并把结果写回当前账号与对应 workspace variant 账号。不会在弹窗中展示 token/cookies 原文。"
+          />
+          <Form form={k12Form} layout="vertical">
+            <Form.Item
+              name="workspace_ids"
+              label="目标 K12 workspace_id"
+              extra="留空时只导出当前可见空间；填写后会先重新 join 这些 K12 空间。多个 ID 支持换行、逗号或空格分隔。"
+            >
+              <Input.TextArea rows={4} placeholder={'ws_xxx\nws_yyy'} />
+            </Form.Item>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 12 }}>
+              <Form.Item name="save_all_spaces" valuePropName="checked">
+                <Checkbox>同时导出所有可见空间</Checkbox>
+              </Form.Item>
+              <Form.Item name="strict_join" valuePropName="checked">
+                <Checkbox>严格 join（失败即异常）</Checkbox>
+              </Form.Item>
+            </div>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 12 }}>
+              <Form.Item name="join_timeout_seconds" label="Join 超时秒数">
+                <InputNumber min={5} max={180} precision={0} style={{ width: '100%' }} />
+              </Form.Item>
+              <Form.Item name="join_retry_count" label="Join 重试次数">
+                <InputNumber min={0} max={5} precision={0} style={{ width: '100%' }} />
+              </Form.Item>
+              <Form.Item name="post_join_poll_seconds" label="Join 后轮询秒">
+                <Input placeholder="3,8,15" />
+              </Form.Item>
+            </div>
+            <Form.Item name="proxy" label="代理（可选）" extra="留空使用直连/运行态默认网络；需要指定出口时填 http/socks 代理。">
+              <Input placeholder="http://user:pass@host:port" />
+            </Form.Item>
+          </Form>
+          {k12Result ? (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                <Tag color={k12Result.ok ? 'success' : 'warning'}>{k12Result.ok ? '执行完成' : '部分完成/异常'}</Tag>
+                <Tag>{`导出空间: ${Number(k12Result.summary?.saved_spaces || k12Result.artifacts?.length || 0)}`}</Tag>
+                <Tag>{`写入账号: ${Number(k12Result.saved_accounts?.length || 0)}`}</Tag>
+                <Tag>{`变更ID: ${(k12Result.changed_account_ids || []).join(',') || '-'}`}</Tag>
+              </div>
+              <pre
+                style={{
+                  margin: 0,
+                  padding: '10px 12px',
+                  borderRadius: 8,
+                  background: '#0000000a',
+                  border: '1px solid #d9d9d9',
+                  maxHeight: 220,
+                  overflow: 'auto',
+                  whiteSpace: 'pre-wrap',
+                  wordBreak: 'break-word',
+                  fontSize: 12,
+                }}
+              >
+                {JSON.stringify({
+                  summary: k12Result.summary || {},
+                  artifacts: k12Result.artifacts || [],
+                  saved_accounts: k12Result.saved_accounts || [],
+                  logs: (k12Result.logs || []).slice(-20),
+                }, null, 2)}
+              </pre>
+            </div>
+          ) : null}
+        </div>
+      </Modal>
     </Drawer>
   )
 }

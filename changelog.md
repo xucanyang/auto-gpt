@@ -8,6 +8,21 @@
 
 
 
+## [1.3.11] - 2026-07-06
+### 新增 (Added)
+- **已保存 ChatGPT 凭证支持手动重跑 K12 / Workspace 捕获**：`api/chatgpt.py` 新增 `POST /api/chatgpt/{account_id}/k12-workspaces/recapture`，复用账号库中已保存的 `access_token`、`session_token` 与完整 `cookies`，重新执行 K12 workspace join、`accounts/check` 空间列表拉取与 workspace token exchange；用于原 K12 空间失效后重新进入新空间，并把当前可进入空间重新导出为 workspace variants。
+- **K12 重捕获持久化服务**：新增 `services/chatgpt_core/k12_recapture.py`，在保存重捕获结果时显式保护既有 `refresh_token`、支付状态与 Web session 材料，避免 AT-only artifact 覆盖已有 RT 账号；同时为新捕获到的 K12/workspace 创建或更新独立账号行，并刷新 `account_list_state` 与 `chatgpt_workspace_variants` 摘要。
+- **账号详情页新增 K12 重新进入/导出入口**：`frontend/src/features/accounts/components/AccountDetailModal.tsx` 在“所有空间 / Workspace variants”区增加“重新进入/导出 K12”按钮，可填写新的 workspace_id、选择是否导出所有可见空间、配置严格 join、重试、轮询和代理；执行结果只展示脱敏摘要，不把 token/cookies 展开到前端。
+
+### 修复 (Fixed)
+- **避免手动 K12 重跑污染主账号认证材料**：重跑保存路径会按 `chatgpt_workspace_variant_key` 精确匹配当前账号与 linked variant，更新 AT/cookies/session 的同时保留已有 RT，不再通过通用 `save_account` 把 free 主账号误降级成仅 AT 账号。
+
+### 测试 (Tests)
+- **补充 K12 重捕获回归测试**：`tests/test_chatgpt_k12_recapture.py` 覆盖 artifact 脱敏输出、当前账号合并时保留 RT 并更新 Web session，以及 workspace variants 摘要落库行为；继续复跑 `tests/test_chatgpt_k12_workspace.py` 确认原注册阶段 K12 捕获链路未回归。
+
+### 优化 (Changed)
+- **同步前端版本号至 v1.3.11**：`frontend/src/app/AppShell.tsx` 侧边栏版本展示更新为 `v1.3.11`，用于上线后确认 K12 重捕获入口已加载。
+
 ## [1.3.10] - 2026-07-06
 ### 新增 (Added)
 - **动态代理新增 Cliproxy IP 保留时长配置**：`api/config.py` 新增 `dynamic_proxy_ip_retention_minutes` 全局配置，默认 `5`，任务生成动态代理时会把用户名中的 `t-N` 统一覆盖为该值；模板没有 `t-N` 但包含 `sid-xxx` 时会自动补成 `sid-xxx-t-N`，让 `t-5` 这类 IP 保留时长不再只能写死在代理模板里。
@@ -489,4 +504,8 @@
 
 ## 2026-07-06 04:33:58 +0800
 - 固定动态代理 IP 保留时长空值默认值
+- 发布模式: multi
+
+## 2026-07-06 05:27:33 +0800
+- 新增已保存凭证重跑 K12 workspace 捕获
 - 发布模式: multi
