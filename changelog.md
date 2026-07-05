@@ -6,6 +6,14 @@
 
 ## [Unreleased] (未发布)
 
+## [1.2.10] - 2026-07-05
+### 修复 (Fixed)
+- **保留注册阶段已获取的 ChatGPT Web 会话材料**：`services/chatgpt_core/chatgpt_registration_mode_adapter.py` 在 RT 两阶段注册中新增第一阶段 Web session 继承逻辑，第二阶段只补 `refresh_token/id_token` 但没有拿到 NextAuth `session_token` 或完整 `cookies` 时，会沿用第一阶段 AT-only 注册已经落地的 `session_token/cookies`，并同步填充 free workspace artifact，避免完整 Auth 成功后反而把可用于后续 Web 会话复用的材料洗空。
+- **防止保存账号时空值覆盖已有 NextAuth 会话**：`core/db.py` 对 ChatGPT 账号更新增加 `session_token/cookies/cookie_header` 非空保护，新保存 payload 若这些字段为空会保留数据库旧值；补充 `tests/test_chatgpt_registration_mode_adapter.py` 与 `tests/test_save_account_web_session_preservation.py` 回归测试，固定两阶段注册和通用 `save_account()` 的持久化边界。
+
+### 优化 (Changed)
+- **同步前端版本号至 v1.2.10**：`frontend/src/app/AppShell.tsx` 侧边栏版本展示更新为 `v1.2.10`，用于上线后确认本次注册持久化修复对应的静态资源已加载。
+
 ## [1.2.9] - 2026-07-05
 ### 修复 (Fixed)
 - **修复账号处理流水线 OAIPay 上传开关无法拉取分组的问题**：`frontend/src/pages/IdeaOaiPayPipeline.tsx` 为 `/idea-oaipay-pipeline` 的“OAIPay 上传”阶段补齐分组读取状态，当启用上传开关、打开分组下拉或点击“刷新分组”时，会调用现有 `/api/integrations/oaipay-categories` 接口拉取 OAIPay 分类，并把分类 ID、名称与库存统计展示为可搜索下拉选项；接口失败时在配置卡片内直接提示全局 OAIPay API URL / API Key 检查方向，避免只看到开关无反应。
@@ -268,3 +276,7 @@
 ## 2026-07-05 07:24:34 +0800
 - 修复账号处理流水线 OAIPay 分组获取
 - 发布模式: hot
+
+## 2026-07-05 19:43:13 +0800
+- 保留注册阶段 ChatGPT Web session 材料
+- 发布模式: multi

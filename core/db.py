@@ -63,6 +63,22 @@ class AccountModel(SQLModel, table=True):
         self.extra_json = json.dumps(d, ensure_ascii=False)
 
 
+def _has_non_empty_text(value: Any) -> bool:
+    return bool(str(value or "").strip())
+
+
+def _preserve_chatgpt_web_session_material(incoming_extra: dict, existing_extra: dict) -> dict:
+    """保存 ChatGPT 账号时，禁止空 Web 会话材料覆盖已有非空值。"""
+    if not isinstance(incoming_extra, dict):
+        return {}
+    if not isinstance(existing_extra, dict):
+        return incoming_extra
+    for key in ("session_token", "cookies", "cookie_header"):
+        if not _has_non_empty_text(incoming_extra.get(key)) and _has_non_empty_text(existing_extra.get(key)):
+            incoming_extra[key] = existing_extra.get(key)
+    return incoming_extra
+
+
 class AccountListStateModel(SQLModel, table=True):
     """List-time derived state cache for account filters/sorts.
 
@@ -331,7 +347,7 @@ def save_account(account) -> 'AccountModel':
             pass
 
     with Session(engine) as session:
-        extra = account.extra or {}
+        extra = dict(account.extra or {}) if isinstance(account.extra, dict) else {}
         variant_key = str(extra.get("chatgpt_workspace_variant_key") or "").strip()
         candidates = session.exec(
             select(AccountModel)
@@ -362,6 +378,12 @@ def save_account(account) -> 'AccountModel':
             existing = legacy_candidate
 
         if existing:
+            if str(account.platform or "").strip().lower() == "chatgpt":
+                try:
+                    existing_extra = json.loads(existing.extra_json or "{}")
+                except Exception:
+                    existing_extra = {}
+                extra = _preserve_chatgpt_web_session_material(extra, existing_extra)
             existing.password = account.password
             existing.user_id = account.user_id or ""
             existing.region = account.region or ""

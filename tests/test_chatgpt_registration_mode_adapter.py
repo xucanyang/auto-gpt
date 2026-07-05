@@ -408,7 +408,7 @@ class ChatGPTRegistrationModeAdapterTests(unittest.TestCase):
                     id_token="",
                     session_token="session-stage1",
                     source="register",
-                    metadata={},
+                    metadata={"cookies": "oai-did=device; __Secure-next-auth.session-token=session-stage1"},
                     logs=["stage1-ok"],
                     workspace_artifacts=None,
                     error_message="",
@@ -465,7 +465,7 @@ class ChatGPTRegistrationModeAdapterTests(unittest.TestCase):
                     "access_token": "at-stage2",
                     "refresh_token": "rt-stage2",
                     "id_token": "id-stage2",
-                    "session_token": "session-stage2",
+                    "session_token": "",
                     "source": "workspace_capture_free",
                     "variant_key": "free:ws-stage2",
                 }
@@ -531,6 +531,10 @@ class ChatGPTRegistrationModeAdapterTests(unittest.TestCase):
         self.assertEqual(saved_accounts[0].extra["chatgpt_workspace_variant_key"], "free:acct-stage1")
         self.assertEqual(saved_accounts[1].extra["chatgpt_workspace_variant_key"], "free:acct-stage1")
         self.assertEqual(saved_accounts[1].extra["refresh_token"], "rt-stage2")
+        self.assertEqual(saved_accounts[1].extra["session_token"], "session-stage1")
+        self.assertEqual(saved_accounts[1].extra["cookies"], "oai-did=device; __Secure-next-auth.session-token=session-stage1")
+        self.assertTrue(saved_accounts[1].extra["registration_web_session_material_preserved"])
+        self.assertEqual(result.session_token, "session-stage1")
         self.assertEqual(saved_accounts[1].status.value, "registered")
         self.assertEqual(created["stage2"]["capture_kwargs"]["scope"], "free")
         self.assertEqual(created["stage2"]["capture_kwargs"]["device_id"], "device-stage1")

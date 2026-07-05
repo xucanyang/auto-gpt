@@ -224,6 +224,8 @@ class BaseChatGPTRegistrationModeAdapter(ABC):
                 "chatgpt_gopay_provider_link_payment_method_types",
                 "chatgpt_gopay_provider_link_phase",
                 "cookies",
+                "cookie_header",
+                "registration_web_session_material_preserved",
             ):
                 if key in metadata:
                     extra[key] = metadata.get(key)
@@ -473,6 +475,67 @@ class RefreshTokenChatGPTRegistrationAdapter(BaseChatGPTRegistrationModeAdapter)
                 }
             ]
 
+    @staticmethod
+    def _first_non_empty_string(*values: Any) -> str:
+        for value in values:
+            text = str(value or "").strip()
+            if text:
+                return text
+        return ""
+
+    def _inherit_stage1_web_session_material(self, target_result, stage1_result) -> None:
+        """第二阶段只补 OAuth/RT 时，保留第一阶段已落地的 ChatGPT Web 会话材料。"""
+        stage1_metadata = getattr(stage1_result, "metadata", None)
+        stage1_metadata = stage1_metadata if isinstance(stage1_metadata, dict) else {}
+        stage1_artifacts = [
+            item
+            for item in (getattr(stage1_result, "workspace_artifacts", None) or [])
+            if isinstance(item, dict)
+        ]
+        stage1_session_token = self._first_non_empty_string(
+            getattr(stage1_result, "session_token", ""),
+            *(item.get("session_token") for item in stage1_artifacts),
+        )
+        stage1_cookies = self._first_non_empty_string(
+            stage1_metadata.get("cookies"),
+            stage1_metadata.get("cookie_header"),
+        )
+        stage1_cookie_header = self._first_non_empty_string(stage1_metadata.get("cookie_header"))
+
+        if not stage1_session_token and not stage1_cookies and not stage1_cookie_header:
+            return
+
+        target_metadata = getattr(target_result, "metadata", None)
+        if not isinstance(target_metadata, dict):
+            target_metadata = {}
+            target_result.metadata = target_metadata
+
+        inherited = False
+        if stage1_session_token and not self._first_non_empty_string(getattr(target_result, "session_token", "")):
+            target_result.session_token = stage1_session_token
+            inherited = True
+
+        artifacts = [
+            item
+            for item in (getattr(target_result, "workspace_artifacts", None) or [])
+            if isinstance(item, dict)
+        ]
+        if stage1_session_token:
+            for artifact in artifacts:
+                if not self._first_non_empty_string(artifact.get("session_token")):
+                    artifact["session_token"] = stage1_session_token
+                    inherited = True
+
+        if stage1_cookies and not self._first_non_empty_string(target_metadata.get("cookies")):
+            target_metadata["cookies"] = stage1_cookies
+            inherited = True
+        if stage1_cookie_header and not self._first_non_empty_string(target_metadata.get("cookie_header")):
+            target_metadata["cookie_header"] = stage1_cookie_header
+            inherited = True
+
+        if inherited:
+            target_metadata["registration_web_session_material_preserved"] = True
+
     def _save_checkpoint_account(self, result, fallback_password: str):
         from core.db import save_account
 
@@ -590,6 +653,8 @@ class RefreshTokenChatGPTRegistrationAdapter(BaseChatGPTRegistrationModeAdapter)
                 "registration_context",
                 "registration_session_account_id",
                 "registration_session_workspace_id",
+                "cookies",
+                "cookie_header",
             }
         }
         result.metadata.update(
@@ -733,6 +798,7 @@ class RefreshTokenChatGPTRegistrationAdapter(BaseChatGPTRegistrationModeAdapter)
                 }
             )
             self._align_free_artifacts_to_checkpoint_variant(stage2_result, checkpoint_variant_key)
+            self._inherit_stage1_web_session_material(stage2_result, stage1_result)
             if not str(getattr(stage2_result, "email", "") or "").strip():
                 stage2_result.email = str(getattr(stage1_result, "email", "") or "")
             if not str(getattr(stage2_result, "password", "") or "").strip():
