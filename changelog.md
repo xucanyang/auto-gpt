@@ -15,7 +15,7 @@
 - **Settings 页增加共享配置状态卡片**：`frontend/src/pages/Settings.tsx` 在全局配置页顶部展示当前实例、共享/本地模式、共享 revision、最后更新来源、本地保留 key 说明，并提供“从共享拉取 / 查看差异 / 本实例推送为共享模板”等显式操作；共享模式保存时会带上 base revision，后端检测到版本冲突时返回 409，避免多实例静默覆盖。
 - **三实例编排挂载共享配置目录**：`docker-compose.multi.yml` 为 `auto-gpt`、`auto-gpt-plus`、`auto-k12` 增加 `APP_INSTANCE_ID`、`SHARED_CONFIG_DB=/shared_config/shared_config.db` 与 `/opt/auto-gpt/shared_config` 挂载；`deploy.sh` 将 `shared_config/` 视为运行态敏感目录并纳入发布备份 tar，`.gitignore` 与 `.dockerignore` 防止共享模板、启动备份、密钥快照和 WAL 误入仓库或 Docker build context。
 - **修正共享空值覆盖语义**：`core/shared_config.py` 增加存在性读取，`core/config_store.py` 在共享模式下即使共享模板中的值为空字符串也会按共享值返回，不再误回退到本实例旧本地值或环境变量，保证“清空某项配置”也能在共享实例间一致生效。
-- **保留非 Settings 页写入的共享 key**：`api/config.py` 的共享差异和“本实例推送为共享模板”改为基于本地 `configs` 全量快照，避免 `team_manager_*`、`grok2api_*` 等历史全局配置在人工推送模板时被静默删除，同时避免默认值展示层造成已同步实例仍显示大量伪差异。
+- **保留非 Settings 页写入的共享 key**：`api/config.py` 的共享差异和“本实例推送为共享模板”改为基于本地 `configs` 已保存全量快照，避免 `team_manager_*`、`grok2api_*` 等历史全局配置在人工推送模板时被静默删除，同时避免默认值展示层或环境变量兜底造成已同步实例仍显示大量伪差异。
 - **同步前端版本号至 v1.3.3**：`frontend/src/app/AppShell.tsx` 侧边栏版本展示更新为 `v1.3.3`，用于上线后确认共享配置中心对应的静态资源已加载。
 
 ## [1.3.2] - 2026-07-05
@@ -370,4 +370,8 @@
 
 ## 2026-07-05 22:47:31 +0800
 - 排除共享配置启动备份进入构建上下文
+- 发布模式: multi
+
+## 2026-07-05 22:55:06 +0800
+- 修正共享配置差异忽略环境变量兜底
 - 发布模式: multi

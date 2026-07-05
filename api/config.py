@@ -645,7 +645,7 @@ def _build_shareable_local_snapshot() -> dict[str, str]:
     其他全局 key。推送或对比共享模板时必须基于本地 configs 全量快照，
     避免丢掉非页面字段，也避免把默认值/布尔展示值当成真实差异。
     """
-    return filter_shareable_config(config_store.get_local_all())
+    return filter_shareable_config(config_store.get_saved_local_all())
 
 
 @router.get("")

@@ -225,8 +225,24 @@ class ConfigStore:
                 self._cache.pop(key, None)
 
     def get_local_all(self) -> dict:
-        """只读取本实例本地配置，不叠加共享模板。"""
+        """只读取本实例本地配置，不叠加共享模板；保留环境变量兜底。"""
         return self._get_all_local()
+
+    def get_saved_local_all(self) -> dict:
+        """只读取本实例 configs 表中已保存的值，不叠加环境变量兜底。"""
+        try:
+            with Session(engine) as s:
+                items = s.exec(select(ConfigItem)).all()
+                values = {i.key: i.value for i in items}
+                for key, value in values.items():
+                    text = str(value or "").strip()
+                    if text:
+                        self._cache[key] = text
+                    else:
+                        self._cache.pop(key, None)
+                return values
+        except OperationalError:
+            return dict(self._cache)
 
     def shared_enabled(self) -> bool:
         raw = self._get_local(CONFIG_SHARE_ENABLED_KEY, os.getenv("CONFIG_SHARE_ENABLED", "false"))
