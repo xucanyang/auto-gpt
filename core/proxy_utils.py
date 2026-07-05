@@ -394,6 +394,8 @@ def resolve_task_proxy_candidates(
         retention_minutes = params.get("dynamic_proxy_ip_retention_minutes")
         if retention_minutes in (None, ""):
             retention_minutes = _configured_value("dynamic_proxy_ip_retention_minutes", "5")
+        if retention_minutes in (None, ""):
+            retention_minutes = "5"
         return _dynamic_candidate_tuples(
             template=template,
             country_code=country_code,
