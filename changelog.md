@@ -6,6 +6,16 @@
 
 ## [Unreleased] (未发布)
 
+## [1.2.11] - 2026-07-05
+### 修复 (Fixed)
+- **补齐账号详情页 Web session 凭证查看能力**：`frontend/src/features/accounts/components/AccountDetailModal.tsx` 将原先拥挤的账号详情 Modal 重构为右侧 Drawer，并新增独立“凭证材料”区；Access Token、Refresh Token、ID Token、NextAuth `session_token`、完整 `cookies` 与登录密码现在都按字段显示“已保存/未保存”，默认隐藏，点击“显示/复制”时才通过 `/api/accounts/{id}/secrets` 拉取完整内容，避免把 `extra_json` 原始结构整块铺开，同时保留状态与主表 token 的基础编辑入口。
+- **扩展账号 secrets 接口覆盖注册阶段 Web 会话材料**：`api/accounts.py` 的 `/accounts/{account_id}/secrets` 新增 `cookies/cookie_header/id_token/session_token` 等字段别名与长度返回，并让详情序列化暴露 `credentials` 摘要，保证上一版注册阶段保存下来的完整 cookies/session token 能被详情页可靠发现和按需读取。
+- **收敛账号列表明文凭证泄漏边界**：`api/accounts.py` 的 compact 列表序列化不再返回 `token/access_token/refresh_token` 或嵌套 `extra.access_token/extra.refresh_token`，只返回 `has_access_token/has_refresh_token/has_session_token/has_cookies/has_id_token/password_present` 等布尔摘要；`tests/test_accounts_api_list_compact.py` 增加 Web session 材料回归测试，固定列表脱敏与 secrets 按需读取契约。
+
+### 优化 (Changed)
+- **账号列表复制动作改为按需读取 secret**：`frontend/src/pages/Accounts.tsx` 的 AT、RT、密码复制按钮不再依赖列表行里的明文值，而是调用 `/accounts/{id}/secrets` 获取对应字段；列表和移动端卡片继续按布尔摘要展示“有/无”，复制成功后仍保留“已复制AT”状态反馈。
+- **同步前端版本号至 v1.2.11**：`frontend/src/app/AppShell.tsx` 侧边栏版本展示更新为 `v1.2.11`，用于上线后确认账号详情凭证展示修复对应的静态资源已加载。
+
 ## [1.2.10] - 2026-07-05
 ### 修复 (Fixed)
 - **保留注册阶段已获取的 ChatGPT Web 会话材料**：`services/chatgpt_core/chatgpt_registration_mode_adapter.py` 在 RT 两阶段注册中新增第一阶段 Web session 继承逻辑，第二阶段只补 `refresh_token/id_token` 但没有拿到 NextAuth `session_token` 或完整 `cookies` 时，会沿用第一阶段 AT-only 注册已经落地的 `session_token/cookies`，并同步填充 free workspace artifact，避免完整 Auth 成功后反而把可用于后续 Web 会话复用的材料洗空。
@@ -279,4 +289,8 @@
 
 ## 2026-07-05 19:43:13 +0800
 - 保留注册阶段 ChatGPT Web session 材料
+- 发布模式: multi
+
+## 2026-07-05 20:05:33 +0800
+- 重构账号详情凭证展示并补齐 Web session 查看
 - 发布模式: multi

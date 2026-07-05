@@ -2,7 +2,7 @@ import json
 import unittest
 
 from core.db import AccountModel
-from api.accounts import _serialize_account_compact_item, _serialize_account_list_item
+from api.accounts import _serialize_account_compact_item, _serialize_account_list_item, get_account_secrets
 
 
 class AccountListCompactSerializationTests(unittest.TestCase):
@@ -12,6 +12,8 @@ class AccountListCompactSerializationTests(unittest.TestCase):
             "accessToken": "SECRET_EXTRA_AT_ALIAS",
             "refresh_token": "SECRET_RT",
             "session_token": "SECRET_SESSION",
+            "id_token": "SECRET_ID_TOKEN",
+            "cookies": "SECRET_COOKIE_A=1; SECRET_COOKIE_B=2",
             "chatgpt_mailbox_state": "x" * huge_size,
             "chatgpt_workspace_scope": "free",
             "chatgpt_workspace_label": "Free",
@@ -63,11 +65,11 @@ class AccountListCompactSerializationTests(unittest.TestCase):
         )
 
     def _assert_compact_payload(self, payload: dict):
-        forbidden_top = {"extra_json", "token", "password", "session_token"}
+        forbidden_top = {"extra_json", "token", "access_token", "refresh_token", "password", "session_token"}
         self.assertFalse(forbidden_top.intersection(payload.keys()))
 
         nested_extra = payload.get("extra") if isinstance(payload.get("extra"), dict) else {}
-        forbidden_nested = {"access_token", "refresh_token", "session_token", "token", "password"}
+        forbidden_nested = {"access_token", "refresh_token", "session_token", "id_token", "cookies", "token", "password"}
         self.assertFalse(forbidden_nested.intersection(nested_extra.keys()))
 
         raw = json.dumps(payload, ensure_ascii=False, default=str)
@@ -75,13 +77,29 @@ class AccountListCompactSerializationTests(unittest.TestCase):
         self.assertNotIn("SECRET_RT", raw)
         self.assertNotIn("SECRET_PASSWORD", raw)
         self.assertNotIn("SECRET_SESSION", raw)
+        self.assertNotIn("SECRET_ID_TOKEN", raw)
+        self.assertNotIn("SECRET_COOKIE", raw)
         self.assertNotIn("chatgpt_mailbox_state", raw)
         self.assertNotIn("raw_response", raw)
         self.assertNotIn("raw_usage", raw)
 
         self.assertTrue(payload["has_access_token"])
         self.assertTrue(payload["has_refresh_token"])
+        self.assertTrue(payload["has_session_token"])
+        self.assertTrue(payload["has_cookies"])
+        self.assertTrue(payload["has_id_token"])
         self.assertTrue(payload["password_present"])
+        self.assertEqual(
+            payload["credentials"],
+            {
+                "has_access_token": True,
+                "has_refresh_token": True,
+                "has_session_token": True,
+                "has_cookies": True,
+                "has_id_token": True,
+                "has_password": True,
+            },
+        )
         self.assertEqual(payload["auth_level"], "refresh_token")
         self.assertEqual(payload["subscription_plan"], "plus")
         self.assertEqual(payload["subscription_active_until"], "2026-12-31T00:00:00Z")
@@ -104,6 +122,25 @@ class AccountListCompactSerializationTests(unittest.TestCase):
         }
         raw = json.dumps(payload, ensure_ascii=False, default=str, separators=(",", ":")).encode()
         self.assertLess(len(raw), 500_000)
+
+    def test_account_secrets_endpoint_returns_web_session_materials(self):
+        account = self._account()
+
+        class DummySession:
+            def get(self, model, account_id):
+                return account if model is AccountModel and account_id == 1 else None
+
+        payload = get_account_secrets(
+            1,
+            fields="session_token,cookies,id_token,cookie_header",
+            session=DummySession(),
+        )
+        self.assertEqual(payload["secrets"]["session_token"], "SECRET_SESSION")
+        self.assertEqual(payload["secrets"]["cookies"], "SECRET_COOKIE_A=1; SECRET_COOKIE_B=2")
+        self.assertEqual(payload["secrets"]["id_token"], "SECRET_ID_TOKEN")
+        self.assertEqual(payload["secrets"]["cookie_header"], "SECRET_COOKIE_A=1; SECRET_COOKIE_B=2")
+        self.assertTrue(payload["present"]["cookies"])
+        self.assertEqual(payload["lengths"]["cookies"], len("SECRET_COOKIE_A=1; SECRET_COOKIE_B=2"))
 
 
 if __name__ == "__main__":

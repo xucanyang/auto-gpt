@@ -145,6 +145,10 @@ def _is_team_invite_source_removable(*, workspace_scope: str, invite_status: str
 def _serialize_account(account: AccountModel, *, team_invite_source: Optional[dict[str, Any]] = None) -> dict[str, Any]:
     data = account.model_dump(mode="json") if hasattr(account, "model_dump") else account.dict()
     extra = _safe_extra(account)
+    chatgpt_local = extra.get("chatgpt_local") if isinstance(extra.get("chatgpt_local"), dict) else {}
+    chatgpt_auth = chatgpt_local.get("auth") if isinstance(chatgpt_local.get("auth"), dict) else {}
+    chatgpt_capabilities = extra.get("chatgpt_capabilities") if isinstance(extra.get("chatgpt_capabilities"), dict) else {}
+    auth_summary = _build_auth_summary(account, extra, chatgpt_auth, chatgpt_capabilities)
     rate_limit = account_rate_limit_payload(account, extra=extra)
     data["rate_limit"] = rate_limit
     data["rate_limit_started_at"] = rate_limit["started_at"]
@@ -157,6 +161,22 @@ def _serialize_account(account: AccountModel, *, team_invite_source: Optional[di
     data["bound_phone_number"] = _safe_str(bound_phone.get("phone") or bound_phone.get("phone_number"))
     data["bound_phone_masked"] = _safe_str(bound_phone.get("masked") or bound_phone.get("masked_phone"))
     data["phone_challenge"] = phone_challenge
+    data["auth"] = auth_summary
+    data["has_access_token"] = bool(auth_summary["has_access_token"])
+    data["has_refresh_token"] = bool(auth_summary["has_refresh_token"])
+    data["has_session_token"] = bool(auth_summary["has_session_token"])
+    data["has_cookies"] = bool(auth_summary["has_cookies"])
+    data["has_id_token"] = bool(auth_summary["has_id_token"])
+    data["has_password"] = bool(auth_summary["password_present"])
+    data["password_present"] = bool(auth_summary["password_present"])
+    data["credentials"] = {
+        "has_access_token": bool(auth_summary["has_access_token"]),
+        "has_refresh_token": bool(auth_summary["has_refresh_token"]),
+        "has_session_token": bool(auth_summary["has_session_token"]),
+        "has_cookies": bool(auth_summary["has_cookies"]),
+        "has_id_token": bool(auth_summary["has_id_token"]),
+        "has_password": bool(auth_summary["password_present"]),
+    }
     if team_invite_source:
         data["team_invite_source"] = team_invite_source
     return data
@@ -383,8 +403,19 @@ def _iso_datetime(value: Any) -> str:
     return _safe_str(value)
 
 
+def _secret_to_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list, tuple)):
+        try:
+            return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        except Exception:
+            return str(value).strip()
+    return str(value or "").strip()
+
+
 def _has_secret_value(value: Any) -> bool:
-    return bool(_safe_str(value))
+    return bool(_secret_to_text(value))
 
 
 def _first_secret(account: AccountModel, extra: dict[str, Any], *names: str) -> str:
@@ -398,13 +429,21 @@ def _first_secret(account: AccountModel, extra: dict[str, Any], *names: str) -> 
             )
         elif name == "refresh_token":
             value = extra.get("refresh_token") or extra.get("refreshToken")
+        elif name == "session_token":
+            value = extra.get("session_token") or extra.get("sessionToken") or extra.get("nextauth_session_token")
+        elif name == "id_token":
+            value = extra.get("id_token") or extra.get("idToken")
+        elif name == "cookies":
+            value = extra.get("cookies") or extra.get("cookie") or extra.get("cookie_jar")
+        elif name == "cookie_header":
+            value = extra.get("cookie_header") or extra.get("cookieHeader") or extra.get("cookies")
         elif name == "password":
             value = getattr(account, "password", "")
         elif name == "token":
             value = getattr(account, "token", "")
         else:
             value = extra.get(name) or getattr(account, name, "")
-        text = _safe_str(value)
+        text = _secret_to_text(value)
         if text:
             return text
     return ""
@@ -560,6 +599,8 @@ def _build_auth_summary(
     has_access_token = _has_secret_value(_first_secret(account, extra, "access_token"))
     has_refresh_token = _has_secret_value(_first_secret(account, extra, "refresh_token"))
     has_session_token = _has_secret_value(_first_secret(account, extra, "session_token"))
+    has_cookies = _has_secret_value(_first_secret(account, extra, "cookies"))
+    has_id_token = _has_secret_value(_first_secret(account, extra, "id_token"))
     return {
         "level": _safe_str(capabilities.get("auth_level") or extra.get("auth_level")),
         "state": _safe_str(auth.get("state")),
@@ -572,6 +613,8 @@ def _build_auth_summary(
         "has_access_token": has_access_token,
         "has_refresh_token": has_refresh_token,
         "has_session_token": has_session_token,
+        "has_cookies": has_cookies,
+        "has_id_token": has_id_token,
         "password_present": _has_secret_value(account.password),
     }
 
@@ -672,9 +715,6 @@ def _serialize_account_compact_item(
         "id": account.id,
         "platform": account.platform,
         "email": account.email,
-        "token": account.token,
-        "access_token": account.token,
-        "refresh_token": _safe_str(extra.get("refresh_token")),
         "status": account.status,
         "created_at": _iso_datetime(account.created_at),
         "updated_at": _iso_datetime(account.updated_at),
@@ -711,8 +751,18 @@ def _serialize_account_compact_item(
         "has_access_token": bool(auth_summary["has_access_token"]),
         "has_refresh_token": bool(auth_summary["has_refresh_token"]),
         "has_session_token": bool(auth_summary["has_session_token"]),
+        "has_cookies": bool(auth_summary["has_cookies"]),
+        "has_id_token": bool(auth_summary["has_id_token"]),
         "has_password": bool(auth_summary["password_present"]),
         "password_present": bool(auth_summary["password_present"]),
+        "credentials": {
+            "has_access_token": bool(auth_summary["has_access_token"]),
+            "has_refresh_token": bool(auth_summary["has_refresh_token"]),
+            "has_session_token": bool(auth_summary["has_session_token"]),
+            "has_cookies": bool(auth_summary["has_cookies"]),
+            "has_id_token": bool(auth_summary["has_id_token"]),
+            "has_password": bool(auth_summary["password_present"]),
+        },
         "auth_level": _safe_str(auth_summary.get("level")),
         "subscription_plan": _safe_str(subscription_summary.get("plan")),
         "subscription_active_until": _safe_str(subscription_summary.get("active_until")),
@@ -764,8 +814,6 @@ def _serialize_account_compact_item(
         "cliproxySync": cliproxy_sync,
         "extra": {
             "manually_used": bool(extra.get("manually_used")),
-            "refresh_token": _safe_str(extra.get("refresh_token")),
-            "access_token": _safe_str(extra.get("access_token") or account.token),
             "chatgpt_workspace_label": _safe_str(extra.get("chatgpt_workspace_label")),
             "chatgpt_workspace_scope": _safe_str(extra.get("chatgpt_workspace_scope")),
             "chatgpt_workspace_display_name": _safe_str(extra.get("chatgpt_workspace_display_name")),
@@ -788,6 +836,16 @@ _SECRET_FIELD_ALIASES = {
     "rt": "refresh_token",
     "password": "password",
     "session_token": "session_token",
+    "session": "session_token",
+    "st": "session_token",
+    "nextauth_session_token": "session_token",
+    "cookies": "cookies",
+    "cookie": "cookies",
+    "web_cookies": "cookies",
+    "cookie_header": "cookie_header",
+    "cookieheader": "cookie_header",
+    "id_token": "id_token",
+    "idtoken": "id_token",
 }
 
 
@@ -1207,6 +1265,12 @@ def get_account_secrets(
             values[field] = _first_secret(acc, extra, "refresh_token")
         elif field == "session_token":
             values[field] = _first_secret(acc, extra, "session_token")
+        elif field == "cookies":
+            values[field] = _first_secret(acc, extra, "cookies")
+        elif field == "cookie_header":
+            values[field] = _first_secret(acc, extra, "cookie_header")
+        elif field == "id_token":
+            values[field] = _first_secret(acc, extra, "id_token")
         elif field == "password":
             values[field] = _first_secret(acc, extra, "password")
 
@@ -1215,6 +1279,7 @@ def get_account_secrets(
         "fields": requested,
         "secrets": values,
         "present": {field: bool(values.get(field)) for field in requested},
+        "lengths": {field: len(values.get(field) or "") for field in requested},
     }
 
 

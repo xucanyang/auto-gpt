@@ -1,7 +1,19 @@
-import { Button, Form, Input, Modal, Select, Tag, Typography, theme } from 'antd'
+import { useEffect, useMemo, useState } from 'react'
+import type { ReactNode } from 'react'
+import { Alert, Button, Drawer, Form, Input, Select, Space, Tag, Typography, theme } from 'antd'
 import { CopyOutlined } from '@ant-design/icons'
 
 const { Text } = Typography
+
+type AccountSecretField = 'access_token' | 'refresh_token' | 'id_token' | 'session_token' | 'cookies' | 'password'
+
+type AccountSecretResponse = {
+  account_id?: number
+  fields?: string[]
+  secrets?: Record<string, string>
+  present?: Record<string, boolean>
+  lengths?: Record<string, number>
+}
 
 function SummaryField({
   label,
@@ -60,7 +72,7 @@ function SummaryField({
   )
 }
 
-function DetailSection({ title, children }: { title: string; children: React.ReactNode }) {
+function DetailSection({ title, children, extra }: { title: string; children: ReactNode; extra?: ReactNode }) {
   const { token } = theme.useToken()
 
   return (
@@ -73,7 +85,10 @@ function DetailSection({ title, children }: { title: string; children: React.Rea
         background: token.colorFillAlter,
       }}
     >
-      <div style={{ marginBottom: 10, fontWeight: 600, color: token.colorText }}>{title}</div>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, marginBottom: 10 }}>
+        <div style={{ fontWeight: 600, color: token.colorText }}>{title}</div>
+        {extra}
+      </div>
       {children}
     </div>
   )
@@ -184,6 +199,225 @@ function Sub2ApiSyncSummary({ sync, formatSyncTime }: { sync: any; formatSyncTim
   )
 }
 
+function parseAccountExtra(record: any): Record<string, any> {
+  if (record?.extra && typeof record.extra === 'object') return record.extra
+  try {
+    const parsed = JSON.parse(record?.extra_json || '{}')
+    return parsed && typeof parsed === 'object' ? parsed : {}
+  } catch {
+    return {}
+  }
+}
+
+function firstText(...values: any[]): string {
+  for (const value of values) {
+    if (value === undefined || value === null) continue
+    if (typeof value === 'object') {
+      try {
+        const text = JSON.stringify(value)
+        if (text && text !== '{}' && text !== '[]') return text
+      } catch {
+        // Ignore malformed object values.
+      }
+      continue
+    }
+    const text = String(value || '').trim()
+    if (text) return text
+  }
+  return ''
+}
+
+function explicitSecretFlag(...values: any[]): boolean | undefined {
+  for (const value of values) {
+    if (typeof value === 'boolean') return value
+  }
+  return undefined
+}
+
+function accountHasSecret(
+  account: any,
+  field: AccountSecretField,
+  getAccessToken: (record: any) => string,
+  getRefreshToken: (record: any) => string,
+) {
+  const extra = parseAccountExtra(account)
+  const credentials = account?.credentials && typeof account.credentials === 'object' ? account.credentials : {}
+  if (field === 'access_token') {
+    const flag = explicitSecretFlag(account?.has_access_token, credentials.has_access_token, account?.auth?.has_access_token)
+    return flag !== undefined ? flag : Boolean(getAccessToken(account))
+  }
+  if (field === 'refresh_token') {
+    const flag = explicitSecretFlag(account?.has_refresh_token, credentials.has_refresh_token, account?.auth?.has_refresh_token)
+    return flag !== undefined ? flag : Boolean(getRefreshToken(account))
+  }
+  if (field === 'session_token') {
+    const flag = explicitSecretFlag(account?.has_session_token, credentials.has_session_token, account?.auth?.has_session_token)
+    return flag !== undefined ? flag : Boolean(firstText(account?.session_token, extra.session_token, extra.sessionToken, extra.nextauth_session_token))
+  }
+  if (field === 'cookies') {
+    const flag = explicitSecretFlag(account?.has_cookies, credentials.has_cookies, account?.auth?.has_cookies)
+    return flag !== undefined ? flag : Boolean(firstText(extra.cookies, extra.cookie, extra.cookie_jar, extra.cookie_header))
+  }
+  if (field === 'id_token') {
+    const flag = explicitSecretFlag(account?.has_id_token, credentials.has_id_token, account?.auth?.has_id_token)
+    return flag !== undefined ? flag : Boolean(firstText(extra.id_token, extra.idToken))
+  }
+  if (field === 'password') {
+    const flag = explicitSecretFlag(account?.has_password, account?.password_present, credentials.has_password, account?.auth?.password_present)
+    return flag !== undefined ? flag : Boolean(firstText(account?.password))
+  }
+  return false
+}
+
+function SecretMaterialPanel({
+  account,
+  getAccessToken,
+  getRefreshToken,
+  onFetchSecret,
+  onCopySecret,
+  isAccessTokenCopied,
+}: {
+  account: any
+  getAccessToken: (record: any) => string
+  getRefreshToken: (record: any) => string
+  onFetchSecret: (accountId: number, fields: AccountSecretField[]) => Promise<AccountSecretResponse>
+  onCopySecret: (record: any, field: AccountSecretField, label: string) => Promise<void> | void
+  isAccessTokenCopied: (record: any) => boolean
+}) {
+  const { token } = theme.useToken()
+  const [revealed, setRevealed] = useState<Record<string, string>>({})
+  const [loadingField, setLoadingField] = useState<string>('')
+  const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({})
+  const accountId = Number(account?.id || 0)
+
+  useEffect(() => {
+    setRevealed({})
+    setLoadingField('')
+    setFieldErrors({})
+  }, [accountId])
+
+  const items = useMemo(() => ([
+    { field: 'access_token' as const, label: 'Access Token', shortLabel: 'AT', hint: 'API / 后续同步常用凭证' },
+    { field: 'refresh_token' as const, label: 'Refresh Token', shortLabel: 'RT', hint: '刷新认证材料，优先于仅 AT 账号' },
+    { field: 'id_token' as const, label: 'ID Token', shortLabel: 'ID Token', hint: '完整注册/刷新流程补获的身份令牌' },
+    { field: 'session_token' as const, label: 'Session Token', shortLabel: 'Session Token', hint: 'NextAuth / ChatGPT Web 会话核心字段' },
+    { field: 'cookies' as const, label: '完整 Cookies', shortLabel: 'Cookies', hint: '注册阶段保存的完整 Web cookies 或 cookie jar' },
+    { field: 'password' as const, label: '登录密码', shortLabel: '密码', hint: '账号密码，仅按需显示或复制' },
+  ]), [])
+
+  const revealSecret = async (field: AccountSecretField) => {
+    if (!accountId) return
+    setLoadingField(field)
+    setFieldErrors((prev) => ({ ...prev, [field]: '' }))
+    try {
+      const data = await onFetchSecret(accountId, [field])
+      const value = String(data?.secrets?.[field] || '')
+      if (!value) {
+        setFieldErrors((prev) => ({ ...prev, [field]: '后端未返回该字段内容' }))
+        return
+      }
+      setRevealed((prev) => ({ ...prev, [field]: value }))
+    } catch (e: any) {
+      setFieldErrors((prev) => ({ ...prev, [field]: e?.message || '读取失败' }))
+    } finally {
+      setLoadingField('')
+    }
+  }
+
+  return (
+    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))', gap: 10 }}>
+      {items.map((item) => {
+        const present = accountHasSecret(account, item.field, getAccessToken, getRefreshToken)
+        const value = revealed[item.field] || ''
+        const isRevealed = Boolean(value)
+        const isLoading = loadingField === item.field
+        const error = fieldErrors[item.field] || ''
+        const copiedAt = item.field === 'access_token' && isAccessTokenCopied(account)
+        return (
+          <div
+            key={item.field}
+            style={{
+              border: `1px solid ${token.colorBorder}`,
+              borderRadius: token.borderRadiusLG,
+              background: token.colorBgContainer,
+              padding: 12,
+              minWidth: 0,
+            }}
+          >
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 8 }}>
+              <div style={{ minWidth: 0 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                  <Text strong>{item.label}</Text>
+                  <Tag color={present ? 'success' : 'default'} style={{ marginInlineEnd: 0 }}>{present ? '已保存' : '未保存'}</Tag>
+                  {copiedAt ? <Tag color="orange" style={{ marginInlineEnd: 0 }}>已复制AT</Tag> : null}
+                </div>
+                <Text type="secondary" style={{ display: 'block', fontSize: 12, marginTop: 3 }}>
+                  {item.hint}{isRevealed ? ` · ${value.length} 字符` : ''}
+                </Text>
+              </div>
+              <Space size={6} wrap>
+                <Button
+                  size="small"
+                  disabled={!present || !accountId}
+                  loading={isLoading}
+                  onClick={() => {
+                    if (isRevealed) {
+                      setRevealed((prev) => {
+                        const next = { ...prev }
+                        delete next[item.field]
+                        return next
+                      })
+                      return
+                    }
+                    void revealSecret(item.field)
+                  }}
+                >
+                  {isRevealed ? '隐藏' : '显示'}
+                </Button>
+                <Button
+                  size="small"
+                  icon={<CopyOutlined />}
+                  disabled={!present || !accountId}
+                  onClick={() => onCopySecret(account, item.field, item.shortLabel)}
+                >
+                  复制
+                </Button>
+              </Space>
+            </div>
+            {error ? (
+              <Text type="danger" style={{ display: 'block', marginTop: 8, fontSize: 12 }}>
+                {error}
+              </Text>
+            ) : null}
+            {isRevealed ? (
+              <pre
+                style={{
+                  margin: '10px 0 0',
+                  padding: '9px 10px',
+                  borderRadius: token.borderRadius,
+                  border: `1px solid ${token.colorBorder}`,
+                  background: token.colorFillAlter,
+                  color: token.colorText,
+                  fontFamily: 'SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace',
+                  fontSize: 12,
+                  lineHeight: 1.55,
+                  whiteSpace: 'pre-wrap',
+                  wordBreak: 'break-word',
+                  overflowWrap: 'anywhere',
+                  maxHeight: item.field === 'cookies' ? 240 : 160,
+                  overflow: 'auto',
+                }}
+              >
+                {value}
+              </pre>
+            ) : null}
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
 type AccountDetailModalProps = {
   open: boolean
   onClose: () => void
@@ -201,6 +435,8 @@ type AccountDetailModalProps = {
   getRefreshToken: (record: any) => string
   getAccessToken: (record: any) => string
   onCopyAccessToken: (record: any) => Promise<void> | void
+  onCopySecret: (record: any, field: AccountSecretField, label: string) => Promise<void> | void
+  onFetchSecret: (accountId: number, fields: AccountSecretField[]) => Promise<AccountSecretResponse>
   isAccessTokenCopied: (record: any) => boolean
   canImportAccountToTeam: (record: any) => boolean
   authStateMeta: (state?: string) => { color: string; label: string }
@@ -214,118 +450,190 @@ export function AccountDetailModal({
   onSave,
   currentAccount,
   detailForm,
-  token,
   importingTeamAccountId,
   onImportAccountToTeam,
   formatSyncTime,
   getRefreshToken,
   getAccessToken,
   onCopyAccessToken,
+  onCopySecret,
+  onFetchSecret,
   isAccessTokenCopied,
   canImportAccountToTeam,
   authStateMeta,
   planMeta,
   codexStateMeta,
 }: AccountDetailModalProps) {
+  const extra = parseAccountExtra(currentAccount)
+  const workspace = currentAccount?.workspace && typeof currentAccount.workspace === 'object' ? currentAccount.workspace : {}
+  const capabilities = currentAccount?.chatgptCapabilities && typeof currentAccount.chatgptCapabilities === 'object' ? currentAccount.chatgptCapabilities : {}
+  const authSummary = currentAccount?.chatgptLocal?.auth && typeof currentAccount.chatgptLocal.auth === 'object'
+    ? currentAccount.chatgptLocal.auth
+    : currentAccount?.auth && typeof currentAccount.auth === 'object'
+      ? currentAccount.auth
+      : {}
+  const subscriptionSummary = currentAccount?.chatgptLocal?.subscription && typeof currentAccount.chatgptLocal.subscription === 'object'
+    ? currentAccount.chatgptLocal.subscription
+    : currentAccount?.subscription && typeof currentAccount.subscription === 'object'
+      ? currentAccount.subscription
+      : {}
+  const codexSummary = currentAccount?.chatgptLocal?.codex && typeof currentAccount.chatgptLocal.codex === 'object'
+    ? currentAccount.chatgptLocal.codex
+    : currentAccount?.codex && typeof currentAccount.codex === 'object'
+      ? currentAccount.codex
+      : {}
+  const drawerTitle = currentAccount ? (
+    <Space size={8} wrap>
+      <span>账号详情</span>
+      <Text type="secondary" style={{ fontSize: 12 }}>{currentAccount.email || `ID ${currentAccount.id}`}</Text>
+    </Space>
+  ) : '账号详情'
+
   return (
-    <Modal
-      title="账号详情"
+    <Drawer
+      title={drawerTitle}
       open={open}
-      onCancel={onClose}
-      onOk={onSave}
+      onClose={onClose}
       maskClosable={false}
-      width={760}
-      styles={{ body: { maxHeight: '72vh', overflowY: 'auto' } }}
+      width="min(1040px, 100vw)"
+      styles={{
+        body: { paddingTop: 12, overflowY: 'auto' },
+        footer: { padding: '10px 16px' },
+      }}
+      footer={(
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12 }}>
+          <Text type="secondary" style={{ fontSize: 12 }}>
+            凭证内容只在点击“显示/复制”时从 secrets 接口读取，不使用列表缓存。
+          </Text>
+          <Space>
+            <Button onClick={onClose}>关闭</Button>
+            <Button type="primary" onClick={onSave}>保存基础信息</Button>
+          </Space>
+        </div>
+      )}
     >
       {currentAccount && (
-        <>
-          <Form form={detailForm} layout="vertical" initialValues={currentAccount}>
-            <Form.Item name="status" label="状态">
-              <Select
-                options={[
-                  { value: 'registered', label: '已注册' },
-                  { value: 'trial', label: '试用中' },
-                  { value: 'subscribed', label: '已订阅' },
-                  { value: 'expired', label: '已过期' },
-                  { value: 'invalid', label: '已失效' },
-                ]}
-              />
-            </Form.Item>
-            <Form.Item
-              name="token"
-              label={
-                <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-                  <span>Access Token</span>
-                  {getAccessToken(currentAccount) ? (
-                    <Button
-                      title="复制AT"
-                      type="link"
-                      size="small"
-                      icon={<CopyOutlined />}
-                      style={{ paddingInline: 0, height: 20 }}
-                      onClick={() => onCopyAccessToken(currentAccount)}
-                    >
-                      复制AT
-                    </Button>
-                  ) : null}
-                  {isAccessTokenCopied(currentAccount) ? <Tag color="orange" style={{ marginInlineEnd: 0 }}>已复制AT</Tag> : null}
-                </div>
-              }
-            >
-              <Input.TextArea rows={2} style={{ fontFamily: 'monospace' }} />
-            </Form.Item>
-          </Form>
-          {(() => {
-            const rt = getRefreshToken(currentAccount)
-            if (!rt) return null
-            return (
-              <div style={{ marginTop: 8 }}>
-                <div style={{ marginBottom: 4, fontWeight: 500, fontSize: 13 }}>Refresh Token</div>
-                <div
-                  style={{
-                    display: 'flex',
-                    alignItems: 'flex-start',
-                    gap: 8,
-                    background: token.colorFillAlter,
-                    border: `1px solid ${token.colorBorder}`,
-                    borderRadius: token.borderRadius,
-                    padding: '8px 10px',
-                  }}
-                >
-                  <Text
-                    style={{ fontFamily: 'monospace', fontSize: 11, wordBreak: 'break-all', flex: 1, userSelect: 'text' }}
-                    copyable={{ text: rt, tooltips: ['复制 RT', '已复制'] }}
-                  >
-                    {rt}
-                  </Text>
-                </div>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+          <DetailSection title="账号身份">
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+                <Tag color={authStateMeta(authSummary.state).color}>认证: {authStateMeta(authSummary.state).label}</Tag>
+                <Tag color={planMeta(subscriptionSummary.plan || currentAccount.subscription_plan).color}>
+                  套餐: {planMeta(subscriptionSummary.plan || currentAccount.subscription_plan).label}
+                </Tag>
+                <Tag color={codexStateMeta(codexSummary.state || currentAccount.codex_state).color}>
+                  Codex: {codexStateMeta(codexSummary.state || currentAccount.codex_state).label}
+                </Tag>
+                {currentAccount.auth_level ? <Tag>{`auth_level: ${currentAccount.auth_level}`}</Tag> : null}
               </div>
-            )
-          })()}
-          {canImportAccountToTeam(currentAccount) ? (
-            <div style={{ marginTop: 12 }}>
-              <Button
-                type="primary"
-                loading={importingTeamAccountId === currentAccount.id}
-                onClick={() => onImportAccountToTeam(currentAccount)}
-              >
-                设为 Team 母号
-              </Button>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: 10 }}>
+                <SummaryField label="邮箱" value={currentAccount.email} />
+                <SummaryField label="账号 ID" value={currentAccount.id ? String(currentAccount.id) : ''} />
+                <SummaryField label="OpenAI 用户" value={currentAccount.user_id || capabilities.account_id || workspace.account_id || ''} />
+                <SummaryField label="状态" value={currentAccount.status} />
+                <SummaryField label="Workspace" value={workspace.display_name || workspace.label || currentAccount.workspace_display_name || currentAccount.workspace_label || ''} />
+                <SummaryField label="Workspace ID" value={workspace.id || extra.workspace_id || extra.organization_id || capabilities.workspace_id || ''} />
+                <SummaryField label="Workspace Scope" value={workspace.scope || currentAccount.workspace_scope || extra.chatgpt_workspace_scope || ''} />
+                <SummaryField label="创建时间" value={currentAccount.created_at ? formatSyncTime(currentAccount.created_at) : ''} />
+                <SummaryField label="更新时间" value={currentAccount.updated_at ? formatSyncTime(currentAccount.updated_at) : ''} />
+              </div>
+              {canImportAccountToTeam(currentAccount) ? (
+                <div>
+                  <Button
+                    type="primary"
+                    loading={importingTeamAccountId === currentAccount.id}
+                    onClick={() => onImportAccountToTeam(currentAccount)}
+                  >
+                    设为 Team 母号
+                  </Button>
+                </div>
+              ) : null}
             </div>
-          ) : null}
+          </DetailSection>
+
+          <DetailSection
+            title="凭证材料"
+            extra={<Text type="secondary" style={{ fontSize: 12 }}>默认隐藏，按字段显示或复制</Text>}
+          >
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+              <Alert
+                type="info"
+                showIcon
+                message="Web session 材料已单独归档"
+                description="Session Token、完整 Cookies、ID Token 与 AT/RT 分开查看，避免把 extra_json 原始内容整块摊开。"
+              />
+              <SecretMaterialPanel
+                account={currentAccount}
+                getAccessToken={getAccessToken}
+                getRefreshToken={getRefreshToken}
+                onFetchSecret={onFetchSecret}
+                onCopySecret={onCopySecret}
+                isAccessTokenCopied={isAccessTokenCopied}
+              />
+            </div>
+          </DetailSection>
+
+          <DetailSection title="基础编辑">
+            <Form form={detailForm} layout="vertical" initialValues={currentAccount}>
+              <div style={{ display: 'grid', gridTemplateColumns: '220px minmax(0, 1fr)', gap: 12, alignItems: 'start' }}>
+                <Form.Item name="status" label="状态">
+                  <Select
+                    options={[
+                      { value: 'registered', label: '已注册' },
+                      { value: 'trial', label: '试用中' },
+                      { value: 'subscribed', label: '已订阅' },
+                      { value: 'expired', label: '已过期' },
+                      { value: 'invalid', label: '已失效' },
+                    ]}
+                  />
+                </Form.Item>
+                <Form.Item
+                  name="token"
+                  label={(
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                      <span>Access Token（手动覆盖）</span>
+                      {accountHasSecret(currentAccount, 'access_token', getAccessToken, getRefreshToken) ? (
+                        <Button
+                          title="复制AT"
+                          type="link"
+                          size="small"
+                          icon={<CopyOutlined />}
+                          style={{ paddingInline: 0, height: 20 }}
+                          onClick={(event) => {
+                            event.preventDefault()
+                            onCopyAccessToken(currentAccount)
+                          }}
+                        >
+                          复制AT
+                        </Button>
+                      ) : null}
+                      {isAccessTokenCopied(currentAccount) ? <Tag color="orange" style={{ marginInlineEnd: 0 }}>已复制AT</Tag> : null}
+                    </div>
+                  )}
+                  extra="这里只用于维护账号主表 token 字段；完整凭证优先在上方“凭证材料”中按需读取。"
+                >
+                  <Input.TextArea rows={2} style={{ fontFamily: 'monospace' }} />
+                </Form.Item>
+              </div>
+            </Form>
+          </DetailSection>
+
           {currentAccount.teamInviteSource ? (
             <DetailSection title="Business / Team Invite 来源">
-              <SummaryField label="母号邮箱" value={currentAccount.teamInviteSource.team_email} />
-              <SummaryField label="母号 Account ID" value={currentAccount.teamInviteSource.team_account_id || currentAccount.teamInviteSource.primary_account_id} />
-              <SummaryField label="母号名称" value={currentAccount.teamInviteSource.primary_account_name} />
-              <SummaryField label="Team 名称" value={currentAccount.teamInviteSource.team_name} />
-              <SummaryField label="Team ID" value={currentAccount.teamInviteSource.team_id ? String(currentAccount.teamInviteSource.team_id) : ''} />
-              <SummaryField label="Invite 状态" value={currentAccount.teamInviteSource.invite_status} />
-              <SummaryField label="邀请时间" value={currentAccount.teamInviteSource.invited_at ? formatSyncTime(currentAccount.teamInviteSource.invited_at) : ''} />
-              <SummaryField label="加入时间" value={currentAccount.teamInviteSource.joined_at ? formatSyncTime(currentAccount.teamInviteSource.joined_at) : ''} />
-              <SummaryField label="移除时间" value={currentAccount.teamInviteSource.removed_from_team_at ? formatSyncTime(currentAccount.teamInviteSource.removed_from_team_at) : ''} />
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                <SummaryField label="母号邮箱" value={currentAccount.teamInviteSource.team_email} />
+                <SummaryField label="母号 Account ID" value={currentAccount.teamInviteSource.team_account_id || currentAccount.teamInviteSource.primary_account_id} />
+                <SummaryField label="母号名称" value={currentAccount.teamInviteSource.primary_account_name} />
+                <SummaryField label="Team 名称" value={currentAccount.teamInviteSource.team_name} />
+                <SummaryField label="Team ID" value={currentAccount.teamInviteSource.team_id ? String(currentAccount.teamInviteSource.team_id) : ''} />
+                <SummaryField label="Invite 状态" value={currentAccount.teamInviteSource.invite_status} />
+                <SummaryField label="邀请时间" value={currentAccount.teamInviteSource.invited_at ? formatSyncTime(currentAccount.teamInviteSource.invited_at) : ''} />
+                <SummaryField label="加入时间" value={currentAccount.teamInviteSource.joined_at ? formatSyncTime(currentAccount.teamInviteSource.joined_at) : ''} />
+                <SummaryField label="移除时间" value={currentAccount.teamInviteSource.removed_from_team_at ? formatSyncTime(currentAccount.teamInviteSource.removed_from_team_at) : ''} />
+              </div>
             </DetailSection>
           ) : null}
+
           <DetailSection title="本地真实状态">
             {currentAccount.chatgptLocal && Object.keys(currentAccount.chatgptLocal).length > 0 ? (
               <LocalProbeSummary
@@ -353,8 +661,8 @@ export function AccountDetailModal({
               <Text type="secondary">尚未同步。可在“状态同步”里先执行一次 Sub2API 探测，或直接走补传。</Text>
             )}
           </DetailSection>
-        </>
+        </div>
       )}
-    </Modal>
+    </Drawer>
   )
 }

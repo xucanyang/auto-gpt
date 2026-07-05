@@ -1203,6 +1203,89 @@ function getAccessToken(record: any): string {
   }
 }
 
+type AccountSecretField = 'access_token' | 'refresh_token' | 'id_token' | 'session_token' | 'cookies' | 'password'
+
+type AccountSecretResponse = {
+  account_id?: number
+  fields?: string[]
+  secrets?: Record<string, string>
+  present?: Record<string, boolean>
+  lengths?: Record<string, number>
+}
+
+function accountExtraObject(record: any): Record<string, any> {
+  if (record?.extra && typeof record.extra === 'object') return record.extra
+  try {
+    const parsed = JSON.parse(record?.extra_json || '{}')
+    return parsed && typeof parsed === 'object' ? parsed : {}
+  } catch {
+    return {}
+  }
+}
+
+function boolFlag(...values: any[]): boolean | undefined {
+  for (const value of values) {
+    if (typeof value === 'boolean') return value
+  }
+  return undefined
+}
+
+function objectSecretToText(value: any): string {
+  if (value === undefined || value === null) return ''
+  if (typeof value === 'object') {
+    try {
+      const text = JSON.stringify(value)
+      return text === '{}' || text === '[]' ? '' : text
+    } catch {
+      return String(value || '').trim()
+    }
+  }
+  return String(value || '').trim()
+}
+
+function firstSecretText(...values: any[]): string {
+  for (const value of values) {
+    const text = objectSecretToText(value)
+    if (text) return text
+  }
+  return ''
+}
+
+function legacyAccountSecret(record: any, field: AccountSecretField): string {
+  const extra = accountExtraObject(record)
+  if (field === 'access_token') return getAccessToken(record)
+  if (field === 'refresh_token') return getRefreshToken(record)
+  if (field === 'session_token') return firstSecretText(record?.session_token, extra.session_token, extra.sessionToken, extra.nextauth_session_token)
+  if (field === 'cookies') return firstSecretText(extra.cookies, extra.cookie, extra.cookie_jar, extra.cookie_header)
+  if (field === 'id_token') return firstSecretText(extra.id_token, extra.idToken)
+  if (field === 'password') return firstSecretText(record?.password)
+  return ''
+}
+
+function hasAccountSecret(record: any, field: AccountSecretField): boolean {
+  const credentials = record?.credentials && typeof record.credentials === 'object' ? record.credentials : {}
+  const auth = record?.auth && typeof record.auth === 'object' ? record.auth : {}
+  const flag = (() => {
+    if (field === 'access_token') return boolFlag(record?.has_access_token, credentials.has_access_token, auth.has_access_token)
+    if (field === 'refresh_token') return boolFlag(record?.has_refresh_token, credentials.has_refresh_token, auth.has_refresh_token)
+    if (field === 'session_token') return boolFlag(record?.has_session_token, credentials.has_session_token, auth.has_session_token)
+    if (field === 'cookies') return boolFlag(record?.has_cookies, credentials.has_cookies, auth.has_cookies)
+    if (field === 'id_token') return boolFlag(record?.has_id_token, credentials.has_id_token, auth.has_id_token)
+    if (field === 'password') return boolFlag(record?.has_password, record?.password_present, credentials.has_password, auth.password_present)
+    return undefined
+  })()
+  return flag !== undefined ? flag : Boolean(legacyAccountSecret(record, field))
+}
+
+async function fetchAccountSecrets(accountId: number, fields: AccountSecretField[]): Promise<AccountSecretResponse> {
+  const normalizedFields = fields.filter(Boolean)
+  if (!accountId || normalizedFields.length === 0) {
+    return { account_id: accountId, fields: normalizedFields, secrets: {}, present: {}, lengths: {} }
+  }
+  const params = new URLSearchParams({ fields: normalizedFields.join(',') })
+  return apiFetch(`/accounts/${accountId}/secrets?${params.toString()}`)
+}
+
 function getTeamInviteOwnerLabel(source: any) {
   if (!source || typeof source !== 'object') return ''
   return String(
@@ -1476,10 +1559,9 @@ function authTypeValue(record: any) {
   const capabilities = record?.chatgptCapabilities || {}
   const authLevel = String(record?.auth_level || capabilities.auth_level || '').trim().toLowerCase()
   if (authLevel === 'refresh_token') return 'refresh_token'
-  const rt = getRefreshToken(record)
-  if (rt) return 'refresh_token'
+  if (hasAccountSecret(record, 'refresh_token')) return 'refresh_token'
   if (authLevel === 'access_token_only') return 'access_token_only'
-  if (String(record?.token || record?.extra?.access_token || '').trim()) return 'access_token_only'
+  if (hasAccountSecret(record, 'access_token')) return 'access_token_only'
   return 'unknown'
 }
 
@@ -2284,20 +2366,35 @@ export default function Accounts() {
     message.success('已取消已使用标记')
   }, [markAccountUsed])
 
-  const copyAccessToken = useCallback(async (record: any) => {
-    const accessToken = getAccessToken(record)
-    if (!accessToken) {
-      message.warning('当前账号没有 AT')
+  const copyAccountSecret = useCallback(async (record: any, field: AccountSecretField, label: string) => {
+    const accountId = Number(record?.id || 0)
+    let value = ''
+    try {
+      if (accountId) {
+        const data = await fetchAccountSecrets(accountId, [field])
+        value = String(data?.secrets?.[field] || '')
+      }
+    } catch (e: any) {
+      message.error(`读取${label}失败: ${e?.message || '未知错误'}`)
       return
     }
-    const ok = await copyText(accessToken)
+    if (!value) {
+      value = legacyAccountSecret(record, field)
+    }
+    if (!value) {
+      message.warning(`当前账号没有${label}`)
+      return
+    }
+    const ok = await copyText(value)
     if (!ok) return
-
-    const accountId = Number(record?.id || 0)
-    if (accountId) {
+    if (field === 'access_token' && accountId) {
       setAccessTokenCopiedAccountIds((prev) => new Set(prev).add(accountId))
     }
   }, [])
+
+  const copyAccessToken = useCallback(async (record: any) => {
+    await copyAccountSecret(record, 'access_token', 'AT')
+  }, [copyAccountSecret])
 
   const ensurePlatformActionsLoaded = useCallback(async () => {
     if (platformActionsLoading || platformActions.length > 0) return
@@ -2583,10 +2680,7 @@ export default function Accounts() {
   const canImportAccountToTeam = (record: any): boolean => {
     if (currentPlatform !== 'chatgpt') return false
     if (String(record?.workspace_scope || record?.extra?.chatgpt_workspace_scope || '').trim().toLowerCase() !== 'business') return false
-    const rt = getRefreshToken(record)
-    const accessToken = String(record?.token || '').trim()
-    const sessionToken = String(record?.session_token || record?.extra?.session_token || '').trim()
-    return Boolean(rt || accessToken || sessionToken)
+    return hasAccountSecret(record, 'refresh_token') || hasAccountSecret(record, 'access_token') || hasAccountSecret(record, 'session_token')
   }
 
   const exportCsv = async () => {
@@ -4536,13 +4630,13 @@ export default function Accounts() {
     )
   }
 
-  const renderPasswordState = (text: string) => {
-    const hasPassword = Boolean(String(text || '').trim())
+  const renderPasswordState = (_text: string, record: any) => {
+    const hasPassword = hasAccountSecret(record, 'password')
     return (
       <Space size={4} style={{ width: '100%', justifyContent: 'center' }}>
         <Tag color={hasPassword ? 'success' : 'default'} style={compactTagStyle}>{hasPassword ? '有密码' : '无密码'}</Tag>
         {hasPassword ? (
-          <Button title="复制密码" type="text" size="small" icon={<CopyOutlined />} onClick={() => copyText(text)} />
+          <Button title="复制密码" type="text" size="small" icon={<CopyOutlined />} onClick={() => copyAccountSecret(record, 'password', '密码')} />
         ) : null}
       </Space>
     )
@@ -4599,7 +4693,8 @@ export default function Accounts() {
 
   const renderAuthTypeState = (record: any) => {
     const meta = authTypeMeta(record)
-    const hasAccessToken = Boolean(getAccessToken(record))
+    const hasAccessToken = hasAccountSecret(record, 'access_token')
+    const hasRefreshToken = hasAccountSecret(record, 'refresh_token')
     const accountId = Number(record?.id || 0)
     const accessTokenCopied = accountId > 0 && accessTokenCopiedAccountIds.has(accountId)
     return (
@@ -4610,8 +4705,8 @@ export default function Accounts() {
             AT
           </Button>
         ) : null}
-        {authTypeValue(record) === 'refresh_token' ? (
-          <Button title="复制RT" type="text" size="small" icon={<CopyOutlined />} onClick={() => copyText(getRefreshToken(record))} />
+        {hasRefreshToken ? (
+          <Button title="复制RT" type="text" size="small" icon={<CopyOutlined />} onClick={() => copyAccountSecret(record, 'refresh_token', 'RT')} />
         ) : null}
         {accessTokenCopied ? <Tag color="orange" style={compactTagStyle}>已复制AT</Tag> : null}
       </Space>
@@ -5305,13 +5400,12 @@ export default function Accounts() {
       </span>
     )
     const authMetaForMobile = authTypeMeta(record)
-    const authTypeForMobile = authTypeValue(record)
-    const hasAccessTokenForMobile = Boolean(getAccessToken(record))
+    const hasAccessTokenForMobile = hasAccountSecret(record, 'access_token')
     const accessTokenCopiedForMobile = Number(record?.id || 0) > 0 && accessTokenCopiedAccountIds.has(Number(record.id || 0))
-    const hasRefreshTokenForMobile = Boolean(getRefreshToken(record))
+    const hasRefreshTokenForMobile = hasAccountSecret(record, 'refresh_token')
     const subscriptionMetaForMobile = subscriptionTypeMeta(record)
     const validityMetaForMobile = accountValidityMeta(record)
-    const hasPasswordForMobile = Boolean(String(record.password || '').trim())
+    const hasPasswordForMobile = hasAccountSecret(record, 'password')
     const mobileStatusItems = [
       isColumnVisible('auth_type') ? renderMobileStatusPill(
         'auth_type',
@@ -5323,8 +5417,8 @@ export default function Accounts() {
               AT
             </Button>
           ) : null}
-          {authTypeForMobile === 'refresh_token' && hasRefreshTokenForMobile ? (
-            <Button title="复制RT" type="text" size="small" icon={<CopyOutlined />} onClick={() => copyText(getRefreshToken(record))} />
+          {hasRefreshTokenForMobile ? (
+            <Button title="复制RT" type="text" size="small" icon={<CopyOutlined />} onClick={() => copyAccountSecret(record, 'refresh_token', 'RT')} />
           ) : null}
           {accessTokenCopiedForMobile ? <Tag color="orange" style={{ ...compactTagStyle, fontSize: 11 }}>已复制AT</Tag> : null}
         </>,
@@ -5340,7 +5434,7 @@ export default function Accounts() {
         'password',
         hasPasswordForMobile ? '有密码' : '无密码',
         hasPasswordForMobile ? 'success' : 'default',
-        hasPasswordForMobile ? <Button title="复制密码" type="text" size="small" icon={<CopyOutlined />} onClick={() => copyText(record.password)} /> : null,
+        hasPasswordForMobile ? <Button title="复制密码" type="text" size="small" icon={<CopyOutlined />} onClick={() => copyAccountSecret(record, 'password', '密码')} /> : null,
       ) : null,
       isChatgptPlatform && isColumnVisible('codex_usage') ? (
         <span key="codex_usage" style={{ minWidth: 180 }}>
@@ -5651,7 +5745,7 @@ export default function Accounts() {
       dataIndex: 'password',
       key: 'password',
       width: 96,
-      render: (text: string) => renderPasswordState(text),
+      render: (text: string, record: any) => renderPasswordState(text, record),
     },
     {
       title: '手机号/API',
@@ -7518,6 +7612,8 @@ export default function Accounts() {
         getRefreshToken={getRefreshToken}
         getAccessToken={getAccessToken}
         onCopyAccessToken={copyAccessToken}
+        onCopySecret={copyAccountSecret}
+        onFetchSecret={fetchAccountSecrets}
         isAccessTokenCopied={(record) => {
           const accountId = Number(record?.id || 0)
           return accountId > 0 && accessTokenCopiedAccountIds.has(accountId)
