@@ -1202,31 +1202,36 @@ def _import_manual_phone_entries_to_pool(
         next_item = dict(item)
         phone = str(next_item.get("phone") or "").strip()
         api_url = str(next_item.get("api_url") or "").strip()
-        before = repo.get(phone)
-        if before is None:
-            record = repo.add(
-                phone=phone,
-                api_url=api_url,
-                label="绑定面板导入",
-            )
-            if record is None:
-                skipped += 1
-            else:
-                imported += 1
-        else:
-            record = before
-            if api_url and str(getattr(before, "api_url", "") or "").strip() != api_url:
-                update = getattr(repo, "update", None)
-                if callable(update):
-                    updated_record = update(int(getattr(before, "id", 0) or 0), api_url=api_url)
-                    if updated_record is not None:
-                        record = updated_record
+        try:
+            before = repo.get(phone)
+            if before is None:
+                record = repo.add(
+                    phone=phone,
+                    api_url=api_url,
+                    label="绑定面板导入",
+                )
+                if record is None:
+                    skipped += 1
                 else:
-                    # 兼容旧仓库对象/测试桩：没有 update 时退回 add 的 upsert 语义。
-                    updated_record = repo.add(phone=phone, api_url=api_url, label="绑定面板导入")
-                    if updated_record is not None:
-                        record = updated_record
-            existing += 1
+                    imported += 1
+            else:
+                record = before
+                if api_url and str(getattr(before, "api_url", "") or "").strip() != api_url:
+                    update = getattr(repo, "update", None)
+                    if callable(update):
+                        updated_record = update(int(getattr(before, "id", 0) or 0), api_url=api_url)
+                        if updated_record is not None:
+                            record = updated_record
+                    else:
+                        # 兼容旧仓库对象/测试桩：没有 update 时退回 add 的 upsert 语义。
+                        updated_record = repo.add(phone=phone, api_url=api_url, label="绑定面板导入")
+                        if updated_record is not None:
+                            record = updated_record
+                existing += 1
+        except Exception as exc:
+            record = None
+            skipped += 1
+            next_item["pool_import_error"] = redact_log_text(exc)
 
         if record is not None:
             record_id = int(getattr(record, "id", 0) or 0)
@@ -4537,8 +4542,8 @@ def _task_timeline_log(
         task_id,
         line,
         level,
-        expose_phone=str(task or "").strip() in {"手机绑定", "手机号绑定"},
-        expose_otp=str(task or "").strip() in {"手机绑定", "手机号绑定"},
+        expose_phone=False,
+        expose_otp=False,
     )
     return line
 
@@ -9655,8 +9660,6 @@ def _run_phone_binding_test(
             task_id,
             _phone_binding_log_line(clean_phone_binding_message(message), stage_index=index, phase_label=label),
             level,
-            expose_phone=True,
-            expose_otp=True,
         )
 
     def phone_attempt_header(*, account_position: int, account_total: int, phone_index: int, phone_total_label: str, phone: str) -> None:
@@ -9668,8 +9671,6 @@ def _run_phone_binding_test(
                 f"手机号 {phone_index}/{phone_total_label} | "
                 f"{phone} --------"
             ),
-            expose_phone=True,
-            expose_otp=True,
         )
 
     def infer_phone_binding_stage(message: str) -> tuple[int | None, str]:
@@ -10750,7 +10751,7 @@ def _run_phone_binding_test(
                                 phase="account_failed",
                                 phase_label="OAuth登录",
                                 stage_index=3,
-                                message=f"手机号未被触碰：{account_reason}",
+                                message=f"账号前置失败，手机号未被触碰：{account_reason}",
                                 next_step="继续用下一个账号测试当前手机号",
                                 resource_touched=False,
                                 reset_started_at=True,
@@ -10873,7 +10874,7 @@ def _run_phone_binding_test(
                             phase="account_failed",
                             phase_label="OAuth登录",
                             stage_index=3,
-                            message=f"手机号未被触碰：{account_reason}",
+                            message=f"账号前置失败，手机号未被触碰：{account_reason}",
                             next_step="继续用下一个账号测试当前手机号",
                             resource_touched=False,
                             reset_started_at=True,
@@ -10976,7 +10977,7 @@ def _run_phone_binding_test(
             f"OpenAI 手机号绑定完成：成功 {success_count}/{len(account_ids)}，"
             f"手机号问题 {phone_issue_count}，账号问题 {account_issue_count}，跳过 {skipped_count}"
         )
-        _log(task_id, f"[SUMMARY] {summary_message}", expose_phone=True, expose_otp=True)
+        _log(task_id, f"[SUMMARY] {summary_message}")
         if runtime_results:
             phone_bucket_labels = {
                 "openai_rejected": "OpenAI 拒绝",
@@ -10994,7 +10995,7 @@ def _run_phone_binding_test(
                 if int(runtime_status_counts.get(status, 0))
             ]
             if phone_parts:
-                _log(task_id, f"[SUMMARY] 手机号结果：{'，'.join(phone_parts)}", expose_phone=True, expose_otp=True)
+                _log(task_id, f"[SUMMARY] 手机号结果：{'，'.join(phone_parts)}")
         if account_results:
             account_bucket_labels = {
                 "used_for_binding": "完成绑定",
@@ -11012,7 +11013,7 @@ def _run_phone_binding_test(
                 if int(account_status_counts.get(status, 0))
             ]
             if account_parts:
-                _log(task_id, f"[SUMMARY] 账号结果：{'，'.join(account_parts)}", expose_phone=True, expose_otp=True)
+                _log(task_id, f"[SUMMARY] 账号结果：{'，'.join(account_parts)}")
         if prefix_sample_enabled:
             prefix_summary = _build_phone_prefix_sample_summary(phone_items, runtime_results)
             _log(

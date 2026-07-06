@@ -393,8 +393,8 @@ class UploadedPhoneServiceTests(unittest.TestCase):
             with mock.patch("services.chatgpt_core.phone_service.time.sleep"):
                 self.assertEqual(service.wait_for_code(entries[0], timeout=10), "654321")
 
-        self.assertIn("忽略旧验证码 822496", "\n".join(logs))
-        self.assertIn("收到验证码 654321", "\n".join(logs))
+        self.assertIn("忽略旧验证码 otp=822496", "\n".join(logs))
+        self.assertIn("收到验证码 otp=654321", "\n".join(logs))
         self.assertEqual(service.last_code, "654321")
 
 
@@ -828,7 +828,8 @@ class OAuthPhoneBlacklistTests(unittest.TestCase):
         manual.assert_not_called()
         record_rejected.assert_called_once()
         self.assertIn("OpenAI 已拒绝发送 SMS", client.last_error)
-        self.assertIn("+18255850239", client.last_error)
+        self.assertIn("+1825***0239", client.last_error)
+        self.assertIn("phone-otp/send(sms)", client.last_error)
 
     def test_manual_phone_otp_disables_whatsapp_for_phone_pool_segment(self):
         captured = {}

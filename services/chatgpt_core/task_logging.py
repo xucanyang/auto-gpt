@@ -251,10 +251,18 @@ def _redact_otp_context(text: str) -> str:
         text,
         flags=re.I,
     )
-    # Longer authorization-code-like values.
+    # Longer authorization-code-like values.  Do not redact endpoint names such
+    # as ``phone-otp/send`` when they appear after a Chinese "验证码:" context in
+    # an error sentence; those are route diagnostics, not secrets.
+    def repl_long(match: re.Match[str]) -> str:
+        candidate = str(match.group(3) or "")
+        if "/" in candidate or "\\" in candidate:
+            return match.group(0)
+        return f"{match.group(1)}{match.group(2)}{REDACTED_OTP}"
+
     text = re.sub(
         rf"({contexts})(\s*[:：=]\s*)([A-Za-z0-9._~+/=-]{{8,}})(?:\.\.\.)?",
-        repl,
+        repl_long,
         text,
         flags=re.I,
     )
@@ -889,8 +897,8 @@ def format_task_timeline_log(
     """
 
     phone_binding_task = str(task or "").strip() in {"手机绑定", "手机号绑定"}
-    expose_phone = phone_binding_task
-    expose_otp = phone_binding_task
+    expose_phone = False
+    expose_otp = False
 
     def _pad(value: int, total_value: int) -> str:
         width = max(2, len(str(max(int(total_value or 0), 0))))

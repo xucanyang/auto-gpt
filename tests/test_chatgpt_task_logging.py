@@ -310,7 +310,7 @@ def test_format_task_timeline_log_builds_stable_human_timeline():
     assert line == "[邮箱测活][5/74][demo@example.com] 阶段 1/2：登录测活并抓取 AccessToken；开始执行"
 
 
-def test_format_phone_binding_timeline_log_is_plain_aligned_and_exposes_phone_otp():
+def test_format_phone_binding_timeline_log_is_plain_aligned_and_masks_phone_otp():
     line = format_task_timeline_log(
         "手机绑定",
         "状态：已获取｜验证码=123456，手机号=+12269023179",
@@ -321,8 +321,10 @@ def test_format_phone_binding_timeline_log_is_plain_aligned_and_exposes_phone_ot
     assert line.startswith("[步骤04/12 邮箱验证]")
     assert "[手机绑定]" not in line
     assert "已获取" in line
-    assert "验证码：123456" in line
-    assert "+12269023179" in line
+    assert "验证码：[REDACTED_OTP]" in line
+    assert "123456" not in line
+    assert "+12269023179" not in line
+    assert "+1226***3179" in line
 
 
 def test_build_task_current_state_masks_phone_and_keeps_stage_fields():
