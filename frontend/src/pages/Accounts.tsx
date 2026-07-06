@@ -2430,7 +2430,7 @@ export default function Accounts() {
     setDebouncedSearch('')
     setColumnFilters(EMPTY_ACCOUNT_FILTERS)
     setFilterStatus('')
-    setSubscriptionExpirySortOrder(null)
+    setSubscriptionExpirySortOrder('')
     setCurrentPage(1)
     setSelectedRowKeys([])
     setSelectedAccountSnapshots({})
