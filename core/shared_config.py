@@ -52,6 +52,7 @@ LOCAL_ONLY_KEYS = {
     "chatgpt_gopay_smsforwarder_recent_events",
     "chatgpt_gopay_batch_tasks",
     "chatgpt_gopay_active_batch_task_id",
+    "chatgpt_account_filter_presets",
     "chatgpt_auto_pipeline_config",
 }
 

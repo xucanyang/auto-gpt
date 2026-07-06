@@ -27,9 +27,15 @@ import type { CheckboxOptionType } from 'antd/es/checkbox/Group'
 import type { MenuProps } from 'antd'
 import {
   CopyOutlined,
+  DeleteOutlined,
   DownOutlined,
+  EditOutlined,
+  FilterOutlined,
   LinkOutlined,
   MoreOutlined,
+  PlusOutlined,
+  PushpinOutlined,
+  SaveOutlined,
   UploadOutlined,
   SyncOutlined,
   SettingOutlined,
@@ -314,6 +320,26 @@ const EMPTY_ACCOUNT_FILTERS: AccountColumnFilters = {
   oaipayState: [],
 }
 
+type AccountFilterPresetFilters = {
+  search?: string
+  status?: string[]
+  columnFilters?: Partial<Record<keyof AccountColumnFilters, string[] | string>>
+  sortOrder?: SubscriptionExpirySortOrder
+  pageSize?: number
+}
+
+type AccountFilterPreset = {
+  id: string
+  name: string
+  description?: string
+  summary?: string
+  filters: AccountFilterPresetFilters
+  pinned?: boolean
+  built_in?: boolean
+  created_at?: string
+  updated_at?: string
+}
+
 const STATUS_FILTER_OPTIONS = [
   { value: 'registered', text: '已注册' },
   { value: 'pending_payment', text: '待支付' },
@@ -384,6 +410,132 @@ const SUBSCRIPTION_EXPIRY_SORT_OPTIONS = [
   { value: 'asc', text: '到期最早' },
   { value: 'desc', text: '到期最晚' },
 ]
+
+const ACCOUNT_FILTER_PRESET_COLUMN_KEYS: Array<keyof AccountColumnFilters> = [
+  'email',
+  'status',
+  'manuallyUsed',
+  'authType',
+  'subscriptionType',
+  'accountValidity',
+  'codexState',
+  'sub2apiState',
+  'oaipayState',
+]
+
+function normalizePresetList(value: unknown): string[] {
+  const rawItems = Array.isArray(value) ? value : String(value || '').split(',')
+  const seen = new Set<string>()
+  const items: string[] = []
+  rawItems.forEach((item) => {
+    const text = String(item || '').trim()
+    if (!text || seen.has(text)) return
+    seen.add(text)
+    items.push(text)
+  })
+  return items
+}
+
+function cloneAccountColumnFilters(value?: Partial<Record<keyof AccountColumnFilters, unknown>>): AccountColumnFilters {
+  const source = value && typeof value === 'object' ? value : {}
+  const next: AccountColumnFilters = {
+    email: '',
+    status: [],
+    manuallyUsed: [],
+    authType: [],
+    subscriptionType: [],
+    accountValidity: [],
+    codexState: [],
+    sub2apiState: [],
+    oaipayState: [],
+  }
+  ACCOUNT_FILTER_PRESET_COLUMN_KEYS.forEach((key) => {
+    if (key === 'email') {
+      next.email = String(source.email || '').trim()
+    } else {
+      ;(next[key] as string[]) = normalizePresetList(source[key])
+    }
+  })
+  return next
+}
+
+function normalizeAccountFilterPresetFilters(filters?: AccountFilterPresetFilters): Required<AccountFilterPresetFilters> & { columnFilters: AccountColumnFilters } {
+  const source = filters && typeof filters === 'object' ? filters : {}
+  const sourceColumnFilters = source.columnFilters && typeof source.columnFilters === 'object' ? source.columnFilters : {}
+  const search = String(source.search || sourceColumnFilters.email || '').trim()
+  const columnFilters = cloneAccountColumnFilters(sourceColumnFilters)
+  columnFilters.email = search
+  const status = normalizePresetList(source.status && source.status.length ? source.status : columnFilters.status)
+  columnFilters.status = status
+  const sortOrder = source.sortOrder === 'asc' || source.sortOrder === 'desc' ? source.sortOrder : ''
+  const pageSize = ACCOUNT_PAGE_SIZE_OPTIONS.includes(Number(source.pageSize || 0))
+    ? Number(source.pageSize)
+    : DEFAULT_ACCOUNTS_PAGE_SIZE
+  return {
+    search,
+    status,
+    columnFilters,
+    sortOrder,
+    pageSize,
+  }
+}
+
+function buildAccountFilterPresetFilters(
+  search: string,
+  columnFilters: AccountColumnFilters,
+  sortOrder: SubscriptionExpirySortOrder,
+  pageSize: number,
+): AccountFilterPresetFilters {
+  const normalizedColumnFilters = cloneAccountColumnFilters(columnFilters)
+  const normalizedSearch = String(search || '').trim()
+  normalizedColumnFilters.email = normalizedSearch
+  const normalizedStatus = normalizePresetList(normalizedColumnFilters.status)
+  normalizedColumnFilters.status = normalizedStatus
+  return {
+    search: normalizedSearch,
+    status: normalizedStatus,
+    columnFilters: normalizedColumnFilters,
+    sortOrder,
+    pageSize: ACCOUNT_PAGE_SIZE_OPTIONS.includes(pageSize) ? pageSize : DEFAULT_ACCOUNTS_PAGE_SIZE,
+  }
+}
+
+function accountFilterPresetSignature(filters?: AccountFilterPresetFilters) {
+  const normalized = normalizeAccountFilterPresetFilters(filters)
+  return JSON.stringify({
+    search: normalized.search,
+    status: normalized.status,
+    columnFilters: normalized.columnFilters,
+    sortOrder: normalized.sortOrder,
+    pageSize: normalized.pageSize,
+  })
+}
+
+function labelForOption(options: Array<{ value: string; text: string }>, value: string) {
+  return options.find((item) => item.value === value)?.text || value
+}
+
+function summarizePresetValues(options: Array<{ value: string; text: string }>, values: string[]) {
+  if (values.length === 0) return ''
+  return values.map((value) => labelForOption(options, value)).join('/')
+}
+
+function buildAccountFilterPresetSummary(filters?: AccountFilterPresetFilters) {
+  const normalized = normalizeAccountFilterPresetFilters(filters)
+  const columnFilters = normalized.columnFilters
+  const parts = [
+    normalized.search ? `搜索：${normalized.search}` : '',
+    summarizePresetValues(STATUS_FILTER_OPTIONS, columnFilters.status) ? `状态：${summarizePresetValues(STATUS_FILTER_OPTIONS, columnFilters.status)}` : '',
+    summarizePresetValues(MANUAL_USE_FILTER_OPTIONS, columnFilters.manuallyUsed) ? `使用：${summarizePresetValues(MANUAL_USE_FILTER_OPTIONS, columnFilters.manuallyUsed)}` : '',
+    summarizePresetValues(AUTH_TYPE_FILTER_OPTIONS, columnFilters.authType) ? `认证：${summarizePresetValues(AUTH_TYPE_FILTER_OPTIONS, columnFilters.authType)}` : '',
+    summarizePresetValues(SUBSCRIPTION_TYPE_FILTER_OPTIONS, columnFilters.subscriptionType) ? `订阅：${summarizePresetValues(SUBSCRIPTION_TYPE_FILTER_OPTIONS, columnFilters.subscriptionType)}` : '',
+    summarizePresetValues(ACCOUNT_VALIDITY_FILTER_OPTIONS, columnFilters.accountValidity) ? `有效性：${summarizePresetValues(ACCOUNT_VALIDITY_FILTER_OPTIONS, columnFilters.accountValidity)}` : '',
+    summarizePresetValues(SUB2API_FILTER_OPTIONS, columnFilters.sub2apiState) ? `Sub2API：${summarizePresetValues(SUB2API_FILTER_OPTIONS, columnFilters.sub2apiState)}` : '',
+    summarizePresetValues(OAIPAY_FILTER_OPTIONS, columnFilters.oaipayState) ? `OAIPay：${summarizePresetValues(OAIPAY_FILTER_OPTIONS, columnFilters.oaipayState)}` : '',
+    normalized.sortOrder ? `到期：${labelForOption(SUBSCRIPTION_EXPIRY_SORT_OPTIONS, normalized.sortOrder)}` : '',
+  ].filter(Boolean)
+  return parts.length ? parts.join(' · ') : '无筛选条件'
+}
 
 function normalizeCheckoutCountry(value: unknown) {
   return String(value || DEFAULT_CHECKOUT_COUNTRY).trim().toUpperCase() || DEFAULT_CHECKOUT_COUNTRY
@@ -1808,6 +1960,14 @@ export default function Accounts() {
   const [subscriptionExpirySortOrder, setSubscriptionExpirySortOrder] = useState<SubscriptionExpirySortOrder>('')
   const [selectedRowKeys, setSelectedRowKeys] = useState<React.Key[]>([])
   const [selectedAccountSnapshots, setSelectedAccountSnapshots] = useState<Record<string, any>>({})
+  const [filterPresets, setFilterPresets] = useState<AccountFilterPreset[]>([])
+  const [filterPresetLoading, setFilterPresetLoading] = useState(false)
+  const [filterPresetSaving, setFilterPresetSaving] = useState(false)
+  const [activeFilterPresetId, setActiveFilterPresetId] = useState('')
+  const [filterPresetManageOpen, setFilterPresetManageOpen] = useState(false)
+  const [filterPresetEditorOpen, setFilterPresetEditorOpen] = useState(false)
+  const [filterPresetEditing, setFilterPresetEditing] = useState<AccountFilterPreset | null>(null)
+  const [filterPresetEditorMode, setFilterPresetEditorMode] = useState<'create-current' | 'edit-meta' | 'copy-preset'>('create-current')
 
   const [registerModalOpen, setRegisterModalOpen] = useState(false)
   const [taskModalMode, setTaskModalMode] = useState<'register' | 'resume_auth' | 'payment_link' | 'sub2api_upload' | 'oaipay_upload' | 'baxigpt_cdk' | 'paypal_bind' | 'probe_local_status' | 'k12_recapture'>('register')
@@ -1865,6 +2025,7 @@ export default function Accounts() {
   const [batchPaymentLinkConfigForm] = Form.useForm()
   const [batchProbeStatusConfigForm] = Form.useForm()
   const [batchK12RecaptureForm] = Form.useForm()
+  const [filterPresetForm] = Form.useForm()
   const phoneBindingUsePoolValue = Form.useWatch('use_pool', phoneBindingTestForm)
   const phoneBindingPoolModeValue = Form.useWatch('phone_pool_mode', phoneBindingTestForm)
   const phoneBindingSelectedPrefixesValue = Form.useWatch('selected_prefixes', phoneBindingTestForm)
@@ -1985,6 +2146,45 @@ export default function Accounts() {
       .sort((a, b) => a - b)
       .join(',')
   ), [visibleAccountIds, watchingBaxiAccountIds])
+  const currentFilterPresetFilters = useMemo(
+    () => buildAccountFilterPresetFilters(search, columnFilters, subscriptionExpirySortOrder, accountsPageSize),
+    [search, columnFilters, subscriptionExpirySortOrder, accountsPageSize],
+  )
+  const activeFilterPreset = useMemo(
+    () => filterPresets.find((item) => item.id === activeFilterPresetId) || null,
+    [activeFilterPresetId, filterPresets],
+  )
+  const activeFilterPresetDirty = useMemo(() => {
+    if (!activeFilterPreset) return false
+    return accountFilterPresetSignature(activeFilterPreset.filters) !== accountFilterPresetSignature(currentFilterPresetFilters)
+  }, [activeFilterPreset, currentFilterPresetFilters])
+  const pinnedFilterPresets = useMemo(() => {
+    const items = filterPresets.filter((item) => item.pinned || item.built_in)
+    return items.slice(0, isMobile ? 4 : 8)
+  }, [filterPresets, isMobile])
+
+  const loadFilterPresets = useCallback(async (silent = false) => {
+    setFilterPresetLoading(true)
+    try {
+      const data = await apiFetch('/accounts/filter-presets')
+      const items = Array.isArray(data?.items) ? data.items : []
+      setFilterPresets(items.map((item: any) => ({
+        id: String(item?.id || ''),
+        name: String(item?.name || ''),
+        description: String(item?.description || ''),
+        summary: String(item?.summary || ''),
+        filters: normalizeAccountFilterPresetFilters(item?.filters),
+        pinned: Boolean(item?.pinned),
+        built_in: Boolean(item?.built_in),
+        created_at: String(item?.created_at || ''),
+        updated_at: String(item?.updated_at || ''),
+      })).filter((item: AccountFilterPreset) => item.id && item.name))
+    } catch (e: any) {
+      if (!silent) message.error(e?.message || '读取筛选组合失败')
+    } finally {
+      setFilterPresetLoading(false)
+    }
+  }, [])
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -1992,6 +2192,10 @@ export default function Accounts() {
     }, 300)
     return () => window.clearTimeout(timer)
   }, [search])
+
+  useEffect(() => {
+    void loadFilterPresets(true)
+  }, [loadFilterPresets])
 
   useEffect(() => {
     setCurrentPage(1)
@@ -2203,6 +2407,173 @@ export default function Accounts() {
       window.localStorage.setItem(ACCOUNTS_PAGE_SIZE_STORAGE_KEY, String(nextPageSize))
     }
   }, [])
+
+  const applyFilterPreset = useCallback((preset: AccountFilterPreset, options?: { silent?: boolean }) => {
+    const filters = normalizeAccountFilterPresetFilters(preset.filters)
+    setSearch(filters.search)
+    setDebouncedSearch(filters.search)
+    setColumnFilters(filters.columnFilters)
+    setFilterStatus(filters.status.join(','))
+    setSubscriptionExpirySortOrder(filters.sortOrder)
+    handleAccountsPageSizeChange(filters.pageSize)
+    setCurrentPage(1)
+    setSelectedRowKeys([])
+    setSelectedAccountSnapshots({})
+    setActiveFilterPresetId(preset.id)
+    if (!options?.silent) {
+      message.success(`已应用筛选组合：${preset.name}`)
+    }
+  }, [handleAccountsPageSizeChange])
+
+  const openCreateCurrentFilterPreset = useCallback(() => {
+    setFilterPresetEditing(null)
+    setFilterPresetEditorMode('create-current')
+    filterPresetForm.setFieldsValue({
+      name: '',
+      description: buildAccountFilterPresetSummary(currentFilterPresetFilters),
+      pinned: true,
+    })
+    setFilterPresetEditorOpen(true)
+  }, [currentFilterPresetFilters, filterPresetForm])
+
+  const openCopyFilterPreset = useCallback((preset: AccountFilterPreset) => {
+    setFilterPresetEditing(preset)
+    setFilterPresetEditorMode('copy-preset')
+    filterPresetForm.setFieldsValue({
+      name: `${preset.name} 副本`,
+      description: preset.description || buildAccountFilterPresetSummary(preset.filters),
+      pinned: true,
+    })
+    setFilterPresetEditorOpen(true)
+  }, [filterPresetForm])
+
+  const openEditFilterPresetMeta = useCallback((preset: AccountFilterPreset) => {
+    setFilterPresetEditing(preset)
+    setFilterPresetEditorMode('edit-meta')
+    filterPresetForm.setFieldsValue({
+      name: preset.name,
+      description: preset.description || '',
+      pinned: Boolean(preset.pinned),
+    })
+    setFilterPresetEditorOpen(true)
+  }, [filterPresetForm])
+
+  const saveFilterPresetForm = useCallback(async () => {
+    const values = await filterPresetForm.validateFields()
+    const name = String(values.name || '').trim()
+    if (!name) {
+      message.warning('请输入筛选组合名称')
+      return
+    }
+    const editingPreset = filterPresetEditing
+    const isEditMeta = filterPresetEditorMode === 'edit-meta' && editingPreset && !editingPreset.built_in
+    const filters = isEditMeta
+      ? normalizeAccountFilterPresetFilters(editingPreset.filters)
+      : filterPresetEditorMode === 'copy-preset' && editingPreset
+        ? normalizeAccountFilterPresetFilters(editingPreset.filters)
+        : normalizeAccountFilterPresetFilters(currentFilterPresetFilters)
+    const body = {
+      name,
+      description: String(values.description || '').trim(),
+      pinned: Boolean(values.pinned),
+      filters,
+    }
+    setFilterPresetSaving(true)
+    try {
+      const endpoint = isEditMeta ? `/accounts/filter-presets/${editingPreset.id}` : '/accounts/filter-presets'
+      const data = await apiFetch(endpoint, {
+        method: isEditMeta ? 'PUT' : 'POST',
+        body: JSON.stringify(body),
+      })
+      const items = Array.isArray(data?.items) ? data.items : []
+      setFilterPresets(items.map((item: any) => ({
+        id: String(item?.id || ''),
+        name: String(item?.name || ''),
+        description: String(item?.description || ''),
+        summary: String(item?.summary || ''),
+        filters: normalizeAccountFilterPresetFilters(item?.filters),
+        pinned: Boolean(item?.pinned),
+        built_in: Boolean(item?.built_in),
+        created_at: String(item?.created_at || ''),
+        updated_at: String(item?.updated_at || ''),
+      })).filter((item: AccountFilterPreset) => item.id && item.name))
+      const saved = data?.item
+      if (saved?.id) {
+        setActiveFilterPresetId(String(saved.id))
+      }
+      setFilterPresetEditorOpen(false)
+      message.success(isEditMeta ? '筛选组合已更新' : '筛选组合已保存')
+    } catch (e: any) {
+      message.error(e?.message || '保存筛选组合失败')
+    } finally {
+      setFilterPresetSaving(false)
+    }
+  }, [currentFilterPresetFilters, filterPresetEditing, filterPresetEditorMode, filterPresetForm])
+
+  const overwriteActiveFilterPreset = useCallback(async () => {
+    if (!activeFilterPreset || activeFilterPreset.built_in) {
+      if (activeFilterPreset) openCopyFilterPreset(activeFilterPreset)
+      return
+    }
+    setFilterPresetSaving(true)
+    try {
+      const data = await apiFetch(`/accounts/filter-presets/${activeFilterPreset.id}`, {
+        method: 'PUT',
+        body: JSON.stringify({
+          name: activeFilterPreset.name,
+          description: activeFilterPreset.description || '',
+          pinned: Boolean(activeFilterPreset.pinned),
+          filters: normalizeAccountFilterPresetFilters(currentFilterPresetFilters),
+        }),
+      })
+      const items = Array.isArray(data?.items) ? data.items : []
+      setFilterPresets(items.map((item: any) => ({
+        id: String(item?.id || ''),
+        name: String(item?.name || ''),
+        description: String(item?.description || ''),
+        summary: String(item?.summary || ''),
+        filters: normalizeAccountFilterPresetFilters(item?.filters),
+        pinned: Boolean(item?.pinned),
+        built_in: Boolean(item?.built_in),
+        created_at: String(item?.created_at || ''),
+        updated_at: String(item?.updated_at || ''),
+      })).filter((item: AccountFilterPreset) => item.id && item.name))
+      message.success('已用当前筛选覆盖组合')
+    } catch (e: any) {
+      message.error(e?.message || '覆盖筛选组合失败')
+    } finally {
+      setFilterPresetSaving(false)
+    }
+  }, [activeFilterPreset, currentFilterPresetFilters, openCopyFilterPreset])
+
+  const deleteFilterPreset = useCallback(async (preset: AccountFilterPreset) => {
+    if (preset.built_in) {
+      message.info('内置筛选组合不能删除，可以复制后编辑自定义版本')
+      return
+    }
+    setFilterPresetSaving(true)
+    try {
+      const data = await apiFetch(`/accounts/filter-presets/${preset.id}`, { method: 'DELETE' })
+      const items = Array.isArray(data?.items) ? data.items : []
+      setFilterPresets(items.map((item: any) => ({
+        id: String(item?.id || ''),
+        name: String(item?.name || ''),
+        description: String(item?.description || ''),
+        summary: String(item?.summary || ''),
+        filters: normalizeAccountFilterPresetFilters(item?.filters),
+        pinned: Boolean(item?.pinned),
+        built_in: Boolean(item?.built_in),
+        created_at: String(item?.created_at || ''),
+        updated_at: String(item?.updated_at || ''),
+      })).filter((item: AccountFilterPreset) => item.id && item.name))
+      if (activeFilterPresetId === preset.id) setActiveFilterPresetId('')
+      message.success('筛选组合已删除')
+    } catch (e: any) {
+      message.error(e?.message || '删除筛选组合失败')
+    } finally {
+      setFilterPresetSaving(false)
+    }
+  }, [activeFilterPresetId])
 
   useEffect(() => {
     if (!accounts.length) return
@@ -5894,6 +6265,137 @@ export default function Accounts() {
     setSelectedAccountSnapshots({})
   }
 
+  const renderFilterPresetBar = () => {
+    const activeSummary = activeFilterPreset
+      ? (activeFilterPreset.summary || buildAccountFilterPresetSummary(activeFilterPreset.filters))
+      : ''
+    const currentSummary = buildAccountFilterPresetSummary(currentFilterPresetFilters)
+    return (
+      <div
+        style={{
+          flex: '0 0 auto',
+          marginBottom: isMobile ? 10 : 12,
+          padding: isMobile ? 10 : 12,
+          border: `1px solid ${token.colorBorderSecondary}`,
+          borderRadius: 12,
+          background: token.colorBgContainer,
+          boxShadow: token.boxShadowTertiary,
+        }}
+      >
+        <div
+          style={{
+            display: 'flex',
+            alignItems: isMobile ? 'stretch' : 'center',
+            justifyContent: 'space-between',
+            flexDirection: isMobile ? 'column' : 'row',
+            gap: 10,
+          }}
+        >
+          <Space size={8} wrap style={{ minWidth: 0 }}>
+            <Space size={6}>
+              <FilterOutlined style={{ color: token.colorPrimary }} />
+              <Text strong>筛选组合</Text>
+            </Space>
+            <Select
+              allowClear
+              showSearch
+              size="small"
+              placeholder={filterPresetLoading ? '读取组合中...' : '选择后立即应用'}
+              loading={filterPresetLoading}
+              value={activeFilterPresetId || undefined}
+              style={{ width: isMobile ? '100%' : 240 }}
+              optionFilterProp="label"
+              options={filterPresets.map((preset) => ({
+                value: preset.id,
+                label: `${preset.name}${preset.built_in ? ' · 内置' : ''}`,
+              }))}
+              onChange={(presetId) => {
+                const preset = filterPresets.find((item) => item.id === presetId)
+                if (preset) applyFilterPreset(preset)
+                else setActiveFilterPresetId('')
+              }}
+            />
+            <Button size="small" icon={<SaveOutlined />} onClick={openCreateCurrentFilterPreset}>
+              保存当前筛选
+            </Button>
+            <Button size="small" icon={<SettingOutlined />} onClick={() => setFilterPresetManageOpen(true)}>
+              管理
+            </Button>
+          </Space>
+          <Space size={8} wrap>
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              当前匹配 {total} 个
+            </Text>
+            <Button size="small" type="text" icon={<SyncOutlined spin={filterPresetLoading} />} onClick={() => void loadFilterPresets(false)}>
+              刷新组合
+            </Button>
+          </Space>
+        </div>
+
+        {pinnedFilterPresets.length > 0 ? (
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 10 }}>
+            {pinnedFilterPresets.map((preset) => {
+              const active = preset.id === activeFilterPresetId
+              return (
+                <Button
+                  key={preset.id}
+                  size="small"
+                  type={active ? 'primary' : 'default'}
+                  ghost={active}
+                  icon={preset.pinned && !preset.built_in ? <PushpinOutlined /> : undefined}
+                  onClick={() => applyFilterPreset(preset)}
+                >
+                  {preset.name}
+                </Button>
+              )
+            })}
+          </div>
+        ) : null}
+
+        {activeFilterPreset ? (
+          <div
+            style={{
+              display: 'flex',
+              flexWrap: 'wrap',
+              alignItems: 'center',
+              gap: 8,
+              marginTop: 10,
+              paddingTop: 10,
+              borderTop: `1px solid ${token.colorBorderSecondary}`,
+            }}
+          >
+            <Tag color={activeFilterPresetDirty ? 'warning' : 'processing'} style={{ marginInlineEnd: 0 }}>
+              当前组合：{activeFilterPreset.name}
+            </Tag>
+            {activeFilterPreset.built_in ? <Tag style={{ marginInlineEnd: 0 }}>内置</Tag> : null}
+            <Text type="secondary" style={{ flex: '1 1 260px', minWidth: 0, fontSize: 12 }}>
+              {activeSummary}
+            </Text>
+            {activeFilterPresetDirty ? (
+              <Space size={6} wrap>
+                {!activeFilterPreset.built_in ? (
+                  <Button size="small" loading={filterPresetSaving} onClick={() => void overwriteActiveFilterPreset()}>
+                    覆盖保存
+                  </Button>
+                ) : null}
+                <Button size="small" onClick={() => openCopyFilterPreset(activeFilterPreset)}>
+                  另存为
+                </Button>
+                <Button size="small" type="link" onClick={() => applyFilterPreset(activeFilterPreset)}>
+                  还原
+                </Button>
+              </Space>
+            ) : null}
+          </div>
+        ) : (
+          <Text type="secondary" style={{ display: 'block', marginTop: 8, fontSize: 12 }}>
+            当前条件：{currentSummary}
+          </Text>
+        )}
+      </div>
+    )
+  }
+
   const subscriptionExpiryTableSortOrder =
     subscriptionExpirySortOrder === 'asc'
       ? 'ascend'
@@ -6703,6 +7205,8 @@ export default function Accounts() {
         isMobile={isMobile}
       />
 
+      {renderFilterPresetBar()}
+
       {renderSelectedAccountsSummary()}
 
       <AccountsTable
@@ -6726,6 +7230,149 @@ export default function Accounts() {
           setDetailModalOpen(true)
         }}
       />
+
+      <Modal
+        title={filterPresetEditorMode === 'edit-meta' ? '编辑筛选组合' : filterPresetEditorMode === 'copy-preset' ? '复制筛选组合' : '保存当前筛选'}
+        open={filterPresetEditorOpen}
+        onOk={() => { void saveFilterPresetForm() }}
+        onCancel={() => setFilterPresetEditorOpen(false)}
+        okText={filterPresetEditorMode === 'edit-meta' ? '保存' : '创建组合'}
+        confirmLoading={filterPresetSaving}
+        destroyOnClose
+      >
+        <Space direction="vertical" size={12} style={{ width: '100%' }}>
+          <Alert
+            type="info"
+            showIcon
+            message="筛选组合只保存条件，不保存账号 ID"
+            description={
+              filterPresetEditorMode === 'edit-meta'
+                ? '本次只编辑名称、描述和置顶状态；如需改条件，请应用组合后调整筛选，再点“覆盖保存”。'
+                : '下次应用时会按这些条件重新匹配最新账号库存，适合 OAIPay 待补传、Plus 长效等日常组合。'
+            }
+          />
+          <Form form={filterPresetForm} layout="vertical" preserve={false}>
+            <Form.Item
+              name="name"
+              label="组合名称"
+              rules={[{ required: true, message: '请输入筛选组合名称' }, { max: 80, message: '名称最多 80 个字符' }]}
+            >
+              <Input placeholder="例如：Plus 长效未上传 OAIPay" />
+            </Form.Item>
+            <Form.Item name="description" label="描述" rules={[{ max: 240, message: '描述最多 240 个字符' }]}>
+              <Input.TextArea rows={3} placeholder="说明这组条件的用途，便于后续区分" />
+            </Form.Item>
+            <Form.Item name="pinned" valuePropName="checked">
+              <Checkbox>置顶到账号页快捷筛选</Checkbox>
+            </Form.Item>
+          </Form>
+          <div
+            style={{
+              padding: 10,
+              borderRadius: 10,
+              background: token.colorFillAlter,
+              border: `1px solid ${token.colorBorderSecondary}`,
+            }}
+          >
+            <Text type="secondary" style={{ display: 'block', fontSize: 12, marginBottom: 4 }}>
+              {filterPresetEditorMode === 'copy-preset' && filterPresetEditing ? '复制条件' : filterPresetEditorMode === 'edit-meta' ? '当前保存条件' : '将保存条件'}
+            </Text>
+            <Text style={{ fontSize: 12 }}>
+              {filterPresetEditorMode === 'copy-preset' && filterPresetEditing
+                ? buildAccountFilterPresetSummary(filterPresetEditing.filters)
+                : filterPresetEditorMode === 'edit-meta' && filterPresetEditing
+                  ? buildAccountFilterPresetSummary(filterPresetEditing.filters)
+                  : buildAccountFilterPresetSummary(currentFilterPresetFilters)}
+            </Text>
+          </div>
+        </Space>
+      </Modal>
+
+      <Modal
+        title="筛选组合管理"
+        open={filterPresetManageOpen}
+        onCancel={() => setFilterPresetManageOpen(false)}
+        footer={[
+          <Button key="refresh" icon={<SyncOutlined spin={filterPresetLoading} />} onClick={() => void loadFilterPresets(false)}>
+            刷新
+          </Button>,
+          <Button key="new" type="primary" icon={<PlusOutlined />} onClick={openCreateCurrentFilterPreset}>
+            保存当前筛选
+          </Button>,
+          <Button key="close" onClick={() => setFilterPresetManageOpen(false)}>
+            关闭
+          </Button>,
+        ]}
+        width={860}
+      >
+        <Space direction="vertical" size={10} style={{ width: '100%' }}>
+          {filterPresets.map((preset) => (
+            <div
+              key={preset.id}
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                gap: 12,
+                padding: '10px 12px',
+                border: `1px solid ${preset.id === activeFilterPresetId ? token.colorPrimaryBorder : token.colorBorderSecondary}`,
+                borderRadius: 12,
+                background: preset.id === activeFilterPresetId ? token.colorPrimaryBg : token.colorFillAlter,
+              }}
+            >
+              <div style={{ minWidth: 0, flex: 1 }}>
+                <Space size={6} wrap style={{ marginBottom: 4 }}>
+                  <Text strong>{preset.name}</Text>
+                  {preset.built_in ? <Tag style={{ marginInlineEnd: 0 }}>内置</Tag> : null}
+                  {preset.pinned ? <Tag color="processing" style={{ marginInlineEnd: 0 }}>置顶</Tag> : null}
+                  {preset.id === activeFilterPresetId ? <Tag color="success" style={{ marginInlineEnd: 0 }}>当前</Tag> : null}
+                </Space>
+                {preset.description ? (
+                  <Text type="secondary" style={{ display: 'block', fontSize: 12, marginBottom: 4 }}>
+                    {preset.description}
+                  </Text>
+                ) : null}
+                <Text type="secondary" style={{ display: 'block', fontSize: 12 }}>
+                  {preset.summary || buildAccountFilterPresetSummary(preset.filters)}
+                </Text>
+              </div>
+              <Space size={6} wrap>
+                <Button size="small" onClick={() => {
+                  applyFilterPreset(preset)
+                  setFilterPresetManageOpen(false)
+                }}>
+                  应用
+                </Button>
+                {preset.built_in ? (
+                  <Button size="small" icon={<CopyOutlined />} onClick={() => openCopyFilterPreset(preset)}>
+                    复制
+                  </Button>
+                ) : (
+                  <>
+                    <Button size="small" icon={<EditOutlined />} onClick={() => openEditFilterPresetMeta(preset)}>
+                      编辑
+                    </Button>
+                    <Button size="small" icon={<CopyOutlined />} onClick={() => openCopyFilterPreset(preset)}>
+                      复制
+                    </Button>
+                    <Popconfirm
+                      title={`确认删除筛选组合「${preset.name}」？`}
+                      onConfirm={() => { void deleteFilterPreset(preset) }}
+                    >
+                      <Button size="small" danger icon={<DeleteOutlined />} loading={filterPresetSaving}>
+                        删除
+                      </Button>
+                    </Popconfirm>
+                  </>
+                )}
+              </Space>
+            </div>
+          ))}
+          {!filterPresetLoading && filterPresets.length === 0 ? (
+            <Alert type="info" showIcon message="暂无筛选组合" description="点击“保存当前筛选”即可把当前账号列表条件保存为一组。" />
+          ) : null}
+        </Space>
+      </Modal>
 
       <BatchGopayWorkbench
         open={batchGopayOpen}

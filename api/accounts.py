@@ -1,7 +1,8 @@
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from fastapi.responses import StreamingResponse
 from sqlmodel import Session, select, func
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+from core.config_store import config_store
 from core.db import AccountListStateModel, AccountModel, PendingBusinessInviteModel, get_session
 from services.account_filters import (
     account_auth_type,
@@ -29,7 +30,7 @@ from services.chatgpt_core.local_status_refresh import schedule_chatgpt_local_st
 from services.team_lite import team_lite_service
 from typing import Any, Optional
 from datetime import datetime, timezone
-import io, csv, json, logging, threading, time
+import io, csv, json, logging, threading, time, uuid
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +84,389 @@ def _split_filter_values(value: Any) -> set[str]:
             result.update(_split_filter_values(item))
         return result
     return {item.strip().lower() for item in str(value).split(",") if item.strip()}
+
+
+ACCOUNT_FILTER_PRESETS_CONFIG_KEY = "chatgpt_account_filter_presets"
+ACCOUNT_FILTER_PRESET_MAX_CUSTOM_ITEMS = 80
+ACCOUNT_FILTER_PRESET_MAX_LIST_VALUES = 32
+ACCOUNT_FILTER_PRESET_PAGE_SIZES = {10, 20, 50}
+ACCOUNT_FILTER_PRESET_COLUMN_KEYS = (
+    "email",
+    "status",
+    "manuallyUsed",
+    "authType",
+    "subscriptionType",
+    "accountValidity",
+    "codexState",
+    "sub2apiState",
+    "oaipayState",
+)
+ACCOUNT_FILTER_PRESET_PENDING_OAIPAY_STATES = [
+    "unknown",
+    "not_found",
+    "deleted_exact_match",
+    "cross_workspace_only",
+]
+
+
+class AccountFilterPresetBody(BaseModel):
+    name: str
+    description: str = ""
+    filters: dict[str, Any] = Field(default_factory=dict)
+    pinned: bool = False
+
+
+def _utc_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _trim_text(value: Any, *, max_length: int = 160) -> str:
+    text = str(value or "").strip()
+    if len(text) > max_length:
+        text = text[:max_length].strip()
+    return text
+
+
+def _filter_value_list(value: Any) -> list[str]:
+    raw_items: list[Any]
+    if value is None:
+        raw_items = []
+    elif isinstance(value, (list, tuple, set)):
+        raw_items = list(value)
+    else:
+        raw_items = str(value or "").split(",")
+
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in raw_items:
+        text = _trim_text(item, max_length=80)
+        if not text:
+            continue
+        if text in seen:
+            continue
+        seen.add(text)
+        result.append(text)
+        if len(result) >= ACCOUNT_FILTER_PRESET_MAX_LIST_VALUES:
+            break
+    return result
+
+
+def _empty_filter_preset_payload() -> dict[str, Any]:
+    return {
+        "search": "",
+        "status": [],
+        "columnFilters": {key: [] for key in ACCOUNT_FILTER_PRESET_COLUMN_KEYS},
+        "sortOrder": "",
+        "pageSize": 20,
+    }
+
+
+def _normalize_filter_preset_filters(filters: Any) -> dict[str, Any]:
+    source = filters if isinstance(filters, dict) else {}
+    source_column_filters = source.get("columnFilters") if isinstance(source.get("columnFilters"), dict) else {}
+    clean = _empty_filter_preset_payload()
+
+    search = _trim_text(source.get("search") or source.get("email") or source_column_filters.get("email"), max_length=160)
+    clean["search"] = search
+    clean["columnFilters"]["email"] = search
+
+    status_values = _filter_value_list(source.get("status") or source.get("filterStatus") or source_column_filters.get("status"))
+    clean["status"] = status_values
+    clean["columnFilters"]["status"] = status_values
+
+    for key in ACCOUNT_FILTER_PRESET_COLUMN_KEYS:
+        if key in {"email", "status"}:
+            continue
+        clean["columnFilters"][key] = _filter_value_list(source_column_filters.get(key) or source.get(key))
+
+    sort_source = source.get("sort") if isinstance(source.get("sort"), dict) else {}
+    sort_order = _trim_text(
+        source.get("sortOrder")
+        or source.get("subscriptionExpirySortOrder")
+        or sort_source.get("sortOrder")
+        or sort_source.get("order"),
+        max_length=8,
+    ).lower()
+    clean["sortOrder"] = sort_order if sort_order in {"asc", "desc"} else ""
+
+    try:
+        page_size = int(source.get("pageSize") or source.get("page_size") or 20)
+    except Exception:
+        page_size = 20
+    clean["pageSize"] = page_size if page_size in ACCOUNT_FILTER_PRESET_PAGE_SIZES else 20
+    return clean
+
+
+def _filter_preset_summary(filters: dict[str, Any]) -> str:
+    column_filters = filters.get("columnFilters") if isinstance(filters.get("columnFilters"), dict) else {}
+    parts: list[str] = []
+    if filters.get("search"):
+        parts.append(f"搜索={filters.get('search')}")
+    summary_keys = [
+        ("status", "状态"),
+        ("subscriptionType", "订阅"),
+        ("authType", "认证"),
+        ("accountValidity", "有效性"),
+        ("manuallyUsed", "使用"),
+        ("sub2apiState", "Sub2API"),
+        ("oaipayState", "OAIPay"),
+    ]
+    for key, label in summary_keys:
+        values = _filter_value_list(column_filters.get(key))
+        if values:
+            parts.append(f"{label}={','.join(values[:4])}{'…' if len(values) > 4 else ''}")
+    if filters.get("sortOrder"):
+        parts.append("到期排序=" + ("最早" if filters.get("sortOrder") == "asc" else "最晚"))
+    return " · ".join(parts) or "无筛选条件"
+
+
+def _make_builtin_filter_preset(
+    *,
+    preset_id: str,
+    name: str,
+    description: str,
+    column_filters: dict[str, list[str]],
+    pinned: bool = True,
+) -> dict[str, Any]:
+    filters = _empty_filter_preset_payload()
+    for key, values in column_filters.items():
+        if key not in filters["columnFilters"]:
+            continue
+        normalized = _filter_value_list(values)
+        filters["columnFilters"][key] = normalized
+        if key == "status":
+            filters["status"] = normalized
+    now = "builtin"
+    return {
+        "id": preset_id,
+        "name": name,
+        "description": description,
+        "filters": filters,
+        "summary": _filter_preset_summary(filters),
+        "pinned": pinned,
+        "built_in": True,
+        "created_at": now,
+        "updated_at": now,
+    }
+
+
+BUILTIN_ACCOUNT_FILTER_PRESETS: list[dict[str, Any]] = [
+    _make_builtin_filter_preset(
+        preset_id="builtin_oaipay_pending",
+        name="OAIPay 待补传",
+        description="OAIPay 未同步、未发现、已删可重传或其他工作区已存在。",
+        column_filters={"oaipayState": ACCOUNT_FILTER_PRESET_PENDING_OAIPAY_STATES},
+    ),
+    _make_builtin_filter_preset(
+        preset_id="builtin_plus_rt_oaipay_pending",
+        name="Plus 长效未传",
+        description="Plus/Pro + 有 Refresh Token + 有效 + OAIPay 待补传。",
+        column_filters={
+            "subscriptionType": ["plus", "pro"],
+            "authType": ["refresh_token"],
+            "accountValidity": ["valid"],
+            "oaipayState": ACCOUNT_FILTER_PRESET_PENDING_OAIPAY_STATES,
+        },
+    ),
+    _make_builtin_filter_preset(
+        preset_id="builtin_plus_no_rt_oaipay_pending",
+        name="Plus 未接码未传",
+        description="Plus/Pro + 仅 AT/无认证材料 + 有效 + OAIPay 待补传。",
+        column_filters={
+            "subscriptionType": ["plus", "pro"],
+            "authType": ["access_token_only", "unknown"],
+            "accountValidity": ["valid"],
+            "oaipayState": ACCOUNT_FILTER_PRESET_PENDING_OAIPAY_STATES,
+        },
+    ),
+    _make_builtin_filter_preset(
+        preset_id="builtin_free_rt_oaipay_pending",
+        name="Free 带 RT 未传",
+        description="Free + 有 Refresh Token + 有效 + OAIPay 待补传。",
+        column_filters={
+            "subscriptionType": ["free"],
+            "authType": ["refresh_token"],
+            "accountValidity": ["valid"],
+            "oaipayState": ACCOUNT_FILTER_PRESET_PENDING_OAIPAY_STATES,
+        },
+    ),
+    _make_builtin_filter_preset(
+        preset_id="builtin_oaipay_attention",
+        name="OAIPay 异常待处理",
+        description="OAIPay 多候选或远端不可达，需要人工复查。",
+        column_filters={"oaipayState": ["ambiguous", "unreachable"]},
+    ),
+    _make_builtin_filter_preset(
+        preset_id="builtin_sub2api_exists_oaipay_pending",
+        name="Sub2API 已有但 OAIPay 未传",
+        description="Sub2API 已存在，但 OAIPay 仍处于待补传状态。",
+        column_filters={
+            "sub2apiState": ["exists"],
+            "oaipayState": ACCOUNT_FILTER_PRESET_PENDING_OAIPAY_STATES,
+        },
+    ),
+]
+
+
+def _normalize_custom_filter_preset(item: Any) -> dict[str, Any] | None:
+    if not isinstance(item, dict):
+        return None
+    name = _trim_text(item.get("name"), max_length=80)
+    if not name:
+        return None
+    preset_id = _trim_text(item.get("id"), max_length=80)
+    if not preset_id or preset_id.startswith("builtin_"):
+        preset_id = "preset_" + uuid.uuid4().hex[:12]
+    filters = _normalize_filter_preset_filters(item.get("filters"))
+    created_at = _trim_text(item.get("created_at"), max_length=40) or _utc_iso()
+    updated_at = _trim_text(item.get("updated_at"), max_length=40) or created_at
+    return {
+        "id": preset_id,
+        "name": name,
+        "description": _trim_text(item.get("description"), max_length=240),
+        "filters": filters,
+        "summary": _filter_preset_summary(filters),
+        "pinned": bool(item.get("pinned")),
+        "built_in": False,
+        "created_at": created_at,
+        "updated_at": updated_at,
+    }
+
+
+def _load_custom_filter_presets() -> list[dict[str, Any]]:
+    raw = str(config_store.get(ACCOUNT_FILTER_PRESETS_CONFIG_KEY, "") or "").strip()
+    if not raw:
+        return []
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        logger.warning("failed to parse account filter presets config", exc_info=True)
+        return []
+    if not isinstance(payload, list):
+        return []
+    items: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for raw_item in payload:
+        item = _normalize_custom_filter_preset(raw_item)
+        if not item:
+            continue
+        preset_id = str(item["id"])
+        if preset_id in seen_ids:
+            continue
+        seen_ids.add(preset_id)
+        items.append(item)
+        if len(items) >= ACCOUNT_FILTER_PRESET_MAX_CUSTOM_ITEMS:
+            break
+    return items
+
+
+def _save_custom_filter_presets(items: list[dict[str, Any]]) -> None:
+    safe_items = []
+    for item in items[:ACCOUNT_FILTER_PRESET_MAX_CUSTOM_ITEMS]:
+        normalized = _normalize_custom_filter_preset(item)
+        if normalized:
+            safe_items.append(normalized)
+    config_store.set(
+        ACCOUNT_FILTER_PRESETS_CONFIG_KEY,
+        json.dumps(safe_items, ensure_ascii=False, separators=(",", ":")),
+    )
+
+
+def _duplicate_filter_preset_name(items: list[dict[str, Any]], name: str, *, ignore_id: str = "") -> bool:
+    normalized = name.strip().lower()
+    for item in [*BUILTIN_ACCOUNT_FILTER_PRESETS, *items]:
+        if ignore_id and str(item.get("id") or "") == ignore_id:
+            continue
+        if str(item.get("name") or "").strip().lower() == normalized:
+            return True
+    return False
+
+
+def _build_filter_presets_response(items: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    custom = items if items is not None else _load_custom_filter_presets()
+    ordered_custom = sorted(
+        custom,
+        key=lambda item: (not bool(item.get("pinned")), str(item.get("updated_at") or "")),
+    )
+    return {
+        "ok": True,
+        "items": [*BUILTIN_ACCOUNT_FILTER_PRESETS, *ordered_custom],
+        "built_in_count": len(BUILTIN_ACCOUNT_FILTER_PRESETS),
+        "custom_count": len(custom),
+    }
+
+
+@router.get("/filter-presets")
+def list_account_filter_presets():
+    return _build_filter_presets_response()
+
+
+@router.post("/filter-presets")
+def create_account_filter_preset(body: AccountFilterPresetBody):
+    name = _trim_text(body.name, max_length=80)
+    if not name:
+        raise HTTPException(400, "筛选组合名称不能为空")
+    items = _load_custom_filter_presets()
+    if _duplicate_filter_preset_name(items, name):
+        raise HTTPException(400, "已存在同名筛选组合")
+    now = _utc_iso()
+    item = {
+        "id": "preset_" + uuid.uuid4().hex[:12],
+        "name": name,
+        "description": _trim_text(body.description, max_length=240),
+        "filters": _normalize_filter_preset_filters(body.filters),
+        "pinned": bool(body.pinned),
+        "built_in": False,
+        "created_at": now,
+        "updated_at": now,
+    }
+    item["summary"] = _filter_preset_summary(item["filters"])
+    items.append(item)
+    _save_custom_filter_presets(items)
+    return {"ok": True, "item": item, **_build_filter_presets_response(items)}
+
+
+@router.put("/filter-presets/{preset_id}")
+def update_account_filter_preset(preset_id: str, body: AccountFilterPresetBody):
+    preset_id = _trim_text(preset_id, max_length=80)
+    if preset_id.startswith("builtin_"):
+        raise HTTPException(400, "内置筛选组合不能直接覆盖，请复制后另存为自定义组合")
+    name = _trim_text(body.name, max_length=80)
+    if not name:
+        raise HTTPException(400, "筛选组合名称不能为空")
+    items = _load_custom_filter_presets()
+    index = next((idx for idx, item in enumerate(items) if str(item.get("id") or "") == preset_id), -1)
+    if index < 0:
+        raise HTTPException(404, "筛选组合不存在")
+    if _duplicate_filter_preset_name(items, name, ignore_id=preset_id):
+        raise HTTPException(400, "已存在同名筛选组合")
+    current = dict(items[index])
+    updated = {
+        **current,
+        "name": name,
+        "description": _trim_text(body.description, max_length=240),
+        "filters": _normalize_filter_preset_filters(body.filters),
+        "pinned": bool(body.pinned),
+        "built_in": False,
+        "updated_at": _utc_iso(),
+    }
+    updated["summary"] = _filter_preset_summary(updated["filters"])
+    items[index] = updated
+    _save_custom_filter_presets(items)
+    return {"ok": True, "item": updated, **_build_filter_presets_response(items)}
+
+
+@router.delete("/filter-presets/{preset_id}")
+def delete_account_filter_preset(preset_id: str):
+    preset_id = _trim_text(preset_id, max_length=80)
+    if preset_id.startswith("builtin_"):
+        raise HTTPException(400, "内置筛选组合不能删除")
+    items = _load_custom_filter_presets()
+    next_items = [item for item in items if str(item.get("id") or "") != preset_id]
+    if len(next_items) == len(items):
+        raise HTTPException(404, "筛选组合不存在")
+    _save_custom_filter_presets(next_items)
+    return _build_filter_presets_response(next_items)
 
 
 def _account_count_query(*, platform: Optional[str] = None, status: Any = None, email: Optional[str] = None):
