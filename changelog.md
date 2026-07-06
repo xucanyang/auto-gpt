@@ -7,6 +7,21 @@
 ## [Unreleased] (未发布)
 
 
+## [1.3.13] - 2026-07-06
+### 新增 (Added)
+- **K12 / Workspace 重跑改为可观察任务链路**：新增 `POST /api/tasks/chatgpt/k12-workspace-recapture` 与 `POST /api/tasks/chatgpt/k12-workspace-recapture/batch`，单账号和批量重跑都会创建 `k12_workspace_recapture` / `batch_k12_workspace_recapture` 任务，进入统一 `TaskLogPanel` 实时日志面板，可显示 join、`accounts/check`、workspace token exchange、代理候选和最终写回摘要，不再只在账号操作结果弹窗里同步等待。
+
+### 优化 (Changed)
+- **账号页 K12 重跑入口接入任务弹窗**：`frontend/src/features/accounts/components/AccountActionSurface.tsx` 的 `k12_workspace_recapture` 操作改为回调到账号页创建后台任务；`frontend/src/pages/Accounts.tsx` 的单账号 `K12重跑` 与工具栏“批量K12重跑”现在都会打开注册任务同款运行面板，并把任务 source 映射到 `k12_recapture` 标题，方便中途停止、看进度和回放历史。
+- **同步前端版本号至 v1.3.13**：`frontend/src/app/AppShell.tsx` 侧边栏版本展示更新为 `v1.3.13`，用于上线后确认 K12 重跑任务化与日志面板修复已加载。
+
+### 修复 (Fixed)
+- **修复 K12 重跑“join 成功但导出 0 个空间”仍显示成功的问题**：`services/chatgpt_core/k12_recapture.py` 将成功判定收敛为必须导出至少一个可写回的 workspace artifact；只有 join 结果、`accounts/check` 空间或失败摘要不再被当作成功，避免出现“完成：导出 0 个空间、写入 0 个账号”的误导状态。
+- **保留批量 K12 的筛选/代理/延时语义**：`api/tasks.py` 的批量任务复用账号筛选、代理四模式、动态代理保留时长、Join 超时/重试/轮询和账号间随机延时参数，并在任务日志中脱敏保存配置摘要，避免从旧同步批量接口迁移到任务接口后运行参数漂移。
+
+### 测试 (Tests)
+- **补充 K12 任务化回归测试**：扩展 `tests/test_chatgpt_k12_recapture.py`，覆盖“无 artifact 返回失败”以及单账号 K12 任务创建时会返回 `task_id`，固定日志面板入口和成功判定，防止后续又退回同步 action 路径。
+
 
 ## [1.3.12] - 2026-07-06
 ### 新增 (Added)
@@ -528,4 +543,8 @@
 
 ## 2026-07-06 05:48:35 +0800
 - 修正 K12 重捕获入口代理模式和批量操作
+- 发布模式: multi
+
+## 2026-07-06 12:44:25 +0800
+- 修复K12重跑任务日志面板和成功判定
 - 发布模式: multi

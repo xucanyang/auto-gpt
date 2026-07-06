@@ -75,6 +75,7 @@ type AccountActionSurfaceProps = {
   onInitialActionHandled?: () => void
   onResumeAuthTask?: (record: any) => Promise<void> | void
   onInvalidRecheckTask?: (record: any) => Promise<void> | void
+  onK12RecaptureTask?: (record: any, params?: Record<string, unknown>) => Promise<void> | void
   authStateMeta: (state?: string) => { color: string; label: string }
   planMeta: (plan?: string) => { color: string; label: string }
   codexStateMeta: (state?: string) => { color: string; label: string }
@@ -325,6 +326,7 @@ export function AccountActionSurface({
   onInitialActionHandled,
   onResumeAuthTask,
   onInvalidRecheckTask,
+  onK12RecaptureTask,
   authStateMeta,
   planMeta,
   codexStateMeta,
@@ -672,6 +674,10 @@ export function AccountActionSurface({
     }
     if (actionId === 'invalid_recheck' && onInvalidRecheckTask) {
       await onInvalidRecheckTask(acc)
+      return
+    }
+    if (actionId === 'k12_workspace_recapture' && onK12RecaptureTask) {
+      await onK12RecaptureTask(acc, params)
       return
     }
 

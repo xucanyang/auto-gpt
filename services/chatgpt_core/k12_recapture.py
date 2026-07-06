@@ -641,6 +641,8 @@ def recapture_saved_account_k12_workspaces(
     save_all_spaces: bool | None = None,
     strict_join: bool | None = None,
     proxy: str = "",
+    log_fn: Any = None,
+    stop_checker: Any = None,
 ) -> dict[str, Any]:
     if _safe_str(account.platform).lower() != "chatgpt":
         raise ValueError("只有 ChatGPT 账号支持 K12/workspace 重新捕获")
@@ -684,7 +686,16 @@ def recapture_saved_account_k12_workspaces(
     logs: list[dict[str, str]] = []
 
     def _log(message: str, level: str = "info") -> None:
-        logs.append({"level": _safe_str(level) or "info", "message": safe_k12_error(message, 240)})
+        if callable(stop_checker):
+            stop_checker()
+        level_text = _safe_str(level) or "info"
+        message_text = safe_k12_error(message, 240)
+        logs.append({"level": level_text, "message": message_text})
+        if callable(log_fn):
+            try:
+                log_fn(message_text, level_text)
+            except TypeError:
+                log_fn(message_text)
 
     try:
         capture = capture_k12_and_all_spaces(
@@ -702,6 +713,7 @@ def recapture_saved_account_k12_workspaces(
             proxy=_safe_str(proxy),
             config=config,
             log_fn=_log,
+            stop_checker=stop_checker,
         )
     finally:
         close = getattr(client, "close", None)
@@ -762,8 +774,17 @@ def recapture_saved_account_k12_workspaces(
             pass
 
     summary = capture.get("summary") if isinstance(capture.get("summary"), dict) else {}
+    exported_count = len(artifacts)
+    summary.setdefault("exported_artifacts", exported_count)
+    summary.setdefault("saved_artifacts", exported_count)
+    ok = not bool(summary.get("strict_join_failed")) and exported_count > 0
+    if not ok and exported_count <= 0:
+        summary.setdefault(
+            "error",
+            "K12 / Workspace 重跑未导出任何可写回的 workspace token；join 成功不等于导出成功",
+        )
     return {
-        "ok": not bool(summary.get("strict_join_failed")) and bool(artifacts or capture.get("spaces") or capture.get("join_results")),
+        "ok": ok,
         "account_id": int(account.id or 0),
         "email": _safe_str(account.email),
         "captured_at": captured_at,

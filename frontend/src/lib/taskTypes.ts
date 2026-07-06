@@ -8,6 +8,8 @@ export const TASK_SOURCE_LABELS: Record<string, string> = {
   batch_custom_email_recheck: '批量邮箱测活',
   invalid_recheck: '失效测活',
   batch_invalid_recheck: '批量失效测活',
+  k12_workspace_recapture: 'K12重跑',
+  batch_k12_workspace_recapture: '批量K12重跑',
   phone_binding_test: '手机号绑定',
   phone_signup: '手机号注册',
   batch_sub2api_upload: 'Sub2API上传',
@@ -114,6 +116,20 @@ export function taskOutcomeLabel(outcome?: string) {
       return '批量补抓失败'
     case 'batch_resume_subscription_auth_stopped':
       return '批量补抓停止'
+    case 'k12_workspace_recapture_success':
+      return 'K12重跑成功'
+    case 'k12_workspace_recapture_failed':
+      return 'K12重跑失败'
+    case 'k12_workspace_recapture_stopped':
+      return 'K12重跑停止'
+    case 'k12_workspace_recapture_skipped':
+      return 'K12重跑跳过'
+    case 'batch_k12_workspace_recapture_success':
+      return '批量K12重跑成功'
+    case 'batch_k12_workspace_recapture_failed':
+      return '批量K12重跑失败'
+    case 'batch_k12_workspace_recapture_stopped':
+      return '批量K12重跑停止'
     case 'chatgpt_paypal_bind_success':
       return 'PayPal绑定成功'
     case 'chatgpt_paypal_bind_failed':

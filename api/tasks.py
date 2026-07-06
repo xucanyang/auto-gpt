@@ -51,7 +51,7 @@ from services.chatgpt_core.task_logging import (
     sanitize_phone_result,
     sanitize_task_detail,
 )
-import time, json, asyncio, threading, logging, re
+import time, json, asyncio, threading, logging, re, random
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
 logger = logging.getLogger(__name__)
@@ -103,6 +103,38 @@ class VerificationActionRequest(BaseModel):
 class ResumeSubscriptionAuthTaskRequest(BaseModel):
     account_id: int
     allow_phone_verification: bool | None = None
+
+
+class K12WorkspaceRecaptureTaskRequest(BaseModel):
+    account_id: int
+    workspace_ids: Any = None
+    save_all_spaces: bool = True
+    strict_join: bool = False
+    proxy: Optional[str] = None
+    proxy_mode: str = "pool"
+    proxy_country_code: str = ""
+    proxy_failover: bool = True
+    proxy_max_candidates: int = 0
+    proxy_min_score: float = 0
+    dynamic_proxy_ip_retention_minutes: int = 0
+    join_timeout_seconds: Optional[int] = None
+    join_retry_count: Optional[int] = None
+    post_join_poll_seconds: Optional[str] = None
+
+
+class BatchK12WorkspaceRecaptureTaskRequest(BaseModel):
+    account_ids: list[int] = Field(default_factory=list)
+    all_filtered: bool = False
+    email: str = ""
+    status: str = ""
+    manually_used: str | None = None
+    auth_type: str = ""
+    subscription_type: str = ""
+    account_validity: str = ""
+    sub2api_state: str = ""
+    oaipay_state: str = ""
+    params: dict[str, Any] = Field(default_factory=dict)
+    limit: int = 0
 
 
 class BatchResumeSubscriptionAuthTaskRequest(BaseModel):
@@ -656,6 +688,139 @@ def enqueue_resume_subscription_auth_task(
     return task_id
 
 
+def _truthy_with_default(value: Any, default: bool = False) -> bool:
+    if value is None or value == "":
+        return bool(default)
+    return _is_truthy(value)
+
+
+def _k12_recapture_params_from_request(req: K12WorkspaceRecaptureTaskRequest) -> dict[str, Any]:
+    params: dict[str, Any] = {
+        "workspace_ids": req.workspace_ids,
+        "save_all_spaces": bool(req.save_all_spaces),
+        "strict_join": bool(req.strict_join),
+        "proxy": str(req.proxy or "").strip() or None,
+        "proxy_mode": str(req.proxy_mode or "pool").strip().lower() or "pool",
+        "proxy_country_code": str(req.proxy_country_code or "").strip().upper(),
+        "proxy_failover": bool(req.proxy_failover),
+        "proxy_max_candidates": int(req.proxy_max_candidates or 0),
+        "proxy_min_score": float(req.proxy_min_score or 0),
+        "dynamic_proxy_ip_retention_minutes": int(req.dynamic_proxy_ip_retention_minutes or 0),
+        "join_timeout_seconds": req.join_timeout_seconds,
+        "join_retry_count": req.join_retry_count,
+        "post_join_poll_seconds": str(req.post_join_poll_seconds or "").strip(),
+    }
+    return params
+
+
+def _normalize_k12_recapture_params(params: dict[str, Any] | None) -> dict[str, Any]:
+    raw = dict(params or {})
+    normalized: dict[str, Any] = {
+        "workspace_ids": raw.get("workspace_ids"),
+        "save_all_spaces": _truthy_with_default(raw.get("save_all_spaces"), True),
+        "strict_join": _truthy_with_default(raw.get("strict_join"), False),
+        "proxy": str(raw.get("proxy") or raw.get("proxy_url") or "").strip() or None,
+        "proxy_mode": str(raw.get("proxy_mode") or "pool").strip().lower() or "pool",
+        "proxy_country_code": str(raw.get("proxy_country_code") or "").strip().upper(),
+        "proxy_failover": _truthy_with_default(raw.get("proxy_failover"), True),
+        "proxy_max_candidates": int(float(raw.get("proxy_max_candidates") or 0)),
+        "proxy_min_score": float(raw.get("proxy_min_score") or 0),
+        "dynamic_proxy_ip_retention_minutes": int(float(raw.get("dynamic_proxy_ip_retention_minutes") or 0)),
+    }
+    for key in ("join_timeout_seconds", "join_retry_count"):
+        value = raw.get(key)
+        if value not in (None, ""):
+            normalized[key] = int(float(value))
+    for key in ("delay_seconds", "delay_max_seconds"):
+        value = raw.get(key)
+        if value not in (None, ""):
+            normalized[key] = max(0.0, float(value))
+    if raw.get("post_join_poll_seconds") not in (None, ""):
+        normalized["post_join_poll_seconds"] = str(raw.get("post_join_poll_seconds") or "").strip()
+    return normalized
+
+
+def _k12_recapture_meta_params(params: dict[str, Any]) -> dict[str, Any]:
+    return sanitize_task_detail(
+        {
+            "workspace_ids": params.get("workspace_ids"),
+            "save_all_spaces": params.get("save_all_spaces"),
+            "strict_join": params.get("strict_join"),
+            "proxy_mode": params.get("proxy_mode"),
+            "proxy_country_code": params.get("proxy_country_code"),
+            "proxy_failover": params.get("proxy_failover"),
+            "proxy_max_candidates": params.get("proxy_max_candidates"),
+            "proxy_min_score": params.get("proxy_min_score"),
+            "dynamic_proxy_ip_retention_minutes": params.get("dynamic_proxy_ip_retention_minutes"),
+            "join_timeout_seconds": params.get("join_timeout_seconds"),
+            "join_retry_count": params.get("join_retry_count"),
+            "post_join_poll_seconds": params.get("post_join_poll_seconds"),
+            "delay_seconds": params.get("delay_seconds"),
+            "delay_max_seconds": params.get("delay_max_seconds"),
+        }
+    )
+
+
+def enqueue_k12_workspace_recapture_task(
+    req: K12WorkspaceRecaptureTaskRequest,
+    *,
+    background_tasks: BackgroundTasks | None = None,
+) -> str:
+    account_id_value = int(req.account_id or 0)
+    if account_id_value <= 0:
+        raise HTTPException(400, "account_id 无效")
+    params = _normalize_k12_recapture_params(_k12_recapture_params_from_request(req))
+
+    with Session(engine) as session:
+        account = session.get(AccountModel, account_id_value)
+        if account is None or account.platform != "chatgpt":
+            raise HTTPException(404, "ChatGPT 账号不存在")
+        candidate_ok, candidate_reason = _is_k12_recapture_candidate(account)
+        if not candidate_ok:
+            raise HTTPException(400, candidate_reason or "账号缺少 K12 重跑所需凭证")
+        email = str(account.email or "")
+
+    task_id = f"task_{int(time.time() * 1000)}"
+    source = "k12_workspace_recapture"
+    meta = {
+        "account_id": account_id_value,
+        "email": email,
+        "params": _k12_recapture_meta_params(params),
+    }
+    _create_standalone_task_record(
+        task_id,
+        platform="chatgpt",
+        source=source,
+        total=1,
+        meta=meta,
+    )
+    _save_task_log(
+        "chatgpt",
+        email,
+        "running",
+        detail=_build_task_log_detail(
+            task_id,
+            {
+                "email": email,
+                "account_id": account_id_value,
+                "attempt_outcome": "task_created",
+                "source": source,
+                "meta": meta,
+            },
+        ),
+    )
+    if background_tasks is None:
+        thread = threading.Thread(
+            target=_run_k12_workspace_recapture,
+            args=(task_id, account_id_value, params),
+            daemon=True,
+        )
+        thread.start()
+    else:
+        background_tasks.add_task(_run_k12_workspace_recapture, task_id, account_id_value, params)
+    return task_id
+
+
 def _normalize_batch_account_ids(account_ids: list[int] | None) -> list[int]:
     normalized: list[int] = []
     seen: set[int] = set()
@@ -694,6 +859,7 @@ def _filtered_chatgpt_accounts(session: Session, req: Any) -> list[AccountModel]
         subscription_type=getattr(req, "subscription_type", ""),
         account_validity_filter=getattr(req, "account_validity", ""),
         sub2api_state=getattr(req, "sub2api_state", ""),
+        oaipay_state=getattr(req, "oaipay_state", ""),
     )
 
 
@@ -844,6 +1010,99 @@ def _resolve_batch_resume_auth_accounts(
                     "reason": "账号当前无需补抓 Auth",
                 }
             )
+    return eligible, [], skipped, matched
+
+
+def _is_k12_recapture_candidate(account: AccountModel) -> tuple[bool, str]:
+    try:
+        from services.chatgpt_core.k12_recapture import (
+            access_token_from_account,
+            cookies_from_account,
+            session_token_from_account,
+        )
+
+        extra = account.get_extra()
+        extra = extra if isinstance(extra, dict) else {}
+        if not access_token_from_account(account, extra):
+            return False, "账号缺少已保存 access_token"
+        if not cookies_from_account(account, extra) and not session_token_from_account(account, extra):
+            return False, "账号缺少已保存 cookies/session_token"
+        return True, ""
+    except Exception as exc:
+        return False, str(exc) or "账号凭证检查失败"
+
+
+def _resolve_batch_k12_recapture_accounts(
+    req: BatchK12WorkspaceRecaptureTaskRequest,
+) -> tuple[list[dict[str, Any]], list[int], list[dict[str, Any]], list[dict[str, Any]]]:
+    requested_ids = _normalize_batch_account_ids(req.account_ids)
+    limit = max(int(req.limit or 0), 0)
+
+    if requested_ids:
+        if len(requested_ids) > 1000:
+            raise HTTPException(400, "单次最多处理 1000 个账号")
+        with Session(engine) as session:
+            rows = session.exec(
+                select(AccountModel)
+                .where(AccountModel.platform == "chatgpt")
+                .where(AccountModel.id.in_(requested_ids))
+            ).all()
+        row_map = {int(row.id or 0): row for row in rows if int(row.id or 0) > 0}
+        eligible: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+        missing_ids: list[int] = []
+        for account_id in requested_ids:
+            account = row_map.get(account_id)
+            if account is None:
+                missing_ids.append(account_id)
+                continue
+            item = {
+                "account_id": account_id,
+                "email": str(account.email or ""),
+                "status": str(account.status or ""),
+            }
+            ok, reason = _is_k12_recapture_candidate(account)
+            if ok:
+                eligible.append(item)
+            else:
+                skipped.append({**item, "reason": reason or "账号缺少 K12 重跑所需凭证"})
+        if limit > 0:
+            overflow = eligible[limit:]
+            eligible = eligible[:limit]
+            skipped.extend({**item, "reason": f"超过本次限制 limit={limit}"} for item in overflow)
+        return eligible, missing_ids, skipped, []
+
+    if not bool(req.all_filtered):
+        raise HTTPException(400, "请提供 account_ids，或指定 all_filtered=true")
+
+    with Session(engine) as session:
+        rows = _filtered_chatgpt_accounts(session, req)
+
+    if len(rows) > 1000:
+        raise HTTPException(400, "单次最多处理 1000 个账号")
+
+    eligible = []
+    skipped = []
+    matched = []
+    for account in rows:
+        account_id = int(account.id or 0)
+        if account_id <= 0:
+            continue
+        item = {
+            "account_id": account_id,
+            "email": str(account.email or ""),
+            "status": str(account.status or ""),
+        }
+        matched.append(item)
+        ok, reason = _is_k12_recapture_candidate(account)
+        if ok:
+            eligible.append(item)
+        else:
+            skipped.append({**item, "reason": reason or "账号缺少 K12 重跑所需凭证"})
+    if limit > 0:
+        overflow = eligible[limit:]
+        eligible = eligible[:limit]
+        skipped.extend({**item, "reason": f"超过本次限制 limit={limit}"} for item in overflow)
     return eligible, [], skipped, matched
 
 
@@ -2841,6 +3100,94 @@ def enqueue_batch_resume_subscription_auth_task(
     }
 
 
+def enqueue_batch_k12_workspace_recapture_task(
+    req: BatchK12WorkspaceRecaptureTaskRequest,
+    *,
+    background_tasks: BackgroundTasks | None = None,
+) -> dict[str, Any]:
+    params = _normalize_k12_recapture_params(req.params)
+    eligible_accounts, missing_ids, skipped_accounts, matched_accounts = _resolve_batch_k12_recapture_accounts(req)
+    total_requested = len(_normalize_batch_account_ids(req.account_ids)) if req.account_ids else len(matched_accounts)
+
+    if not eligible_accounts:
+        return {
+            "task_id": "",
+            "total_requested": total_requested,
+            "matched": len(matched_accounts),
+            "eligible": 0,
+            "skipped": len(skipped_accounts),
+            "missing": len(missing_ids),
+            "items": [],
+            "skipped_items": skipped_accounts,
+            "missing_ids": missing_ids,
+        }
+
+    task_id = f"task_{int(time.time() * 1000)}"
+    source = "batch_k12_workspace_recapture"
+    meta = {
+        "total_requested": total_requested,
+        "matched": len(matched_accounts),
+        "eligible": len(eligible_accounts),
+        "missing_ids": list(missing_ids),
+        "account_ids": [int(item["account_id"]) for item in eligible_accounts],
+        "emails": [str(item["email"] or "") for item in eligible_accounts],
+        "filter": {
+            "all_filtered": bool(req.all_filtered),
+            "status": str(req.status or ""),
+            "email": str(req.email or ""),
+        },
+        "limit": int(req.limit or 0),
+        "skipped_items": list(skipped_accounts),
+        "params": _k12_recapture_meta_params(params),
+    }
+    _create_standalone_task_record(
+        task_id,
+        platform="chatgpt",
+        source=source,
+        total=max(len(eligible_accounts), 1),
+        meta=meta,
+    )
+
+    primary_email = str(eligible_accounts[0]["email"] or "") if eligible_accounts else ""
+    _save_task_log(
+        "chatgpt",
+        primary_email,
+        "running",
+        detail=_build_task_log_detail(
+            task_id,
+            {
+                "email": primary_email,
+                "attempt_outcome": "task_created",
+                "source": source,
+                "meta": meta,
+            },
+        ),
+    )
+
+    account_ids = [int(item["account_id"]) for item in eligible_accounts]
+    if background_tasks is None:
+        thread = threading.Thread(
+            target=_run_batch_k12_workspace_recapture,
+            args=(task_id, account_ids, params),
+            daemon=True,
+        )
+        thread.start()
+    else:
+        background_tasks.add_task(_run_batch_k12_workspace_recapture, task_id, account_ids, params)
+
+    return {
+        "task_id": task_id,
+        "total_requested": total_requested,
+        "matched": len(matched_accounts),
+        "eligible": len(eligible_accounts),
+        "skipped": len(skipped_accounts),
+        "missing": len(missing_ids),
+        "items": eligible_accounts,
+        "skipped_items": skipped_accounts,
+        "missing_ids": missing_ids,
+    }
+
+
 def enqueue_phone_binding_test_task(
     req: PhoneBindingTestTaskRequest,
     *,
@@ -4697,6 +5044,247 @@ def _run_resume_subscription_auth(
             errors=errors,
             error=error_text,
         )
+    finally:
+        _clear_task_current(task_id)
+        _task_store.cleanup()
+
+
+def _k12_recapture_result_message(result: dict[str, Any]) -> str:
+    data = result.get("data") if isinstance(result.get("data"), dict) else {}
+    if data.get("message"):
+        return str(data.get("message") or "")
+    summary = data.get("summary") if isinstance(data.get("summary"), dict) else {}
+    saved_spaces = int(summary.get("saved_spaces") or len(data.get("artifacts") or []) or 0)
+    saved_accounts = len(data.get("saved_accounts") or [])
+    changed_ids = len(data.get("changed_account_ids") or [])
+    if bool(result.get("ok")):
+        return f"K12 / Workspace 重跑完成：导出 {saved_spaces} 个空间，写入 {saved_accounts} 个账号，变更 {changed_ids} 个账号"
+    return str(result.get("error") or summary.get("error") or summary.get("accounts_check_error") or "K12 / Workspace 重跑失败")
+
+
+def _run_k12_workspace_recapture(task_id: str, account_id: int, params: dict[str, Any]):
+    from api.actions import (
+        _action_local_status_refresh_ids,
+        _execute_chatgpt_k12_workspace_recapture_action,
+    )
+
+    control = _task_store.control_for(task_id)
+    _task_store.mark_running(task_id)
+    _task_store.set_progress(task_id, "0/1")
+    email = ""
+    errors: list[str] = []
+    result: dict[str, Any] = {}
+    try:
+        control.checkpoint()
+        with Session(engine) as session:
+            account = session.get(AccountModel, int(account_id or 0))
+            if account is None or account.platform != "chatgpt":
+                raise ValueError("ChatGPT 账号不存在")
+            email = str(account.email or "")
+
+        _task_timeline_log(
+            task_id,
+            task="K12重跑",
+            email=email,
+            account_id=account_id,
+            phase="prepare",
+            phase_label="准备 K12 / Workspace 重跑",
+            stage_index=1,
+            stage_total=4,
+            message="开始：复用已保存 AccessToken + cookies/session_token",
+            next_step="重新 join 目标 workspace 并拉取 accounts/check",
+            reset_started_at=True,
+        )
+        attempt_id = control.start_attempt()
+        try:
+            control.checkpoint(attempt_id=attempt_id)
+            with Session(engine) as session:
+                account = session.get(AccountModel, int(account_id or 0))
+                if account is None or account.platform != "chatgpt":
+                    raise ValueError("ChatGPT 账号不存在")
+                _task_timeline_log(
+                    task_id,
+                    task="K12重跑",
+                    email=email,
+                    account_id=account_id,
+                    phase="capture",
+                    phase_label="Join / accounts/check / workspace token exchange",
+                    stage_index=2,
+                    stage_total=4,
+                    message="开始执行 K12 捕获",
+                    next_step="等待 workspace token 交换并写回账号",
+                    reset_started_at=True,
+                )
+
+                def _task_log_bridge(message: str, level: str = "info") -> None:
+                    _log(task_id, message, level)
+
+                result = _execute_chatgpt_k12_workspace_recapture_action(
+                    account,
+                    session,
+                    dict(params or {}),
+                    log_fn=_task_log_bridge,
+                    stop_checker=lambda: control.checkpoint(attempt_id=attempt_id),
+                )
+                try:
+                    session.commit()
+                except Exception:
+                    pass
+                refresh_ids = _action_local_status_refresh_ids("k12_workspace_recapture", result, account)
+                for account_id_value in dict.fromkeys(refresh_ids):
+                    schedule_chatgpt_local_status_refresh_for_account_id(
+                        account_id_value,
+                        reason="task:k12_workspace_recapture",
+                    )
+                if not bool(result.get("ok")):
+                    raise ValueError(_k12_recapture_result_message(result))
+            control.checkpoint(attempt_id=attempt_id)
+        finally:
+            control.finish_attempt(attempt_id)
+
+        data = result.get("data") if isinstance(result.get("data"), dict) else {}
+        summary = data.get("summary") if isinstance(data.get("summary"), dict) else {}
+        saved_spaces = int(summary.get("saved_spaces") or len(data.get("artifacts") or []) or 0)
+        saved_accounts = len(data.get("saved_accounts") or [])
+        changed_ids = list(data.get("changed_account_ids") or [])
+        _task_store.set_progress(task_id, "1/1")
+        _task_store.update_meta(
+            task_id,
+            {
+                "result": sanitize_task_detail(data),
+                "summary": {
+                    "saved_spaces": saved_spaces,
+                    "saved_accounts": saved_accounts,
+                    "changed_account_ids": changed_ids,
+                },
+            },
+        )
+        _task_timeline_log(
+            task_id,
+            task="K12重跑",
+            email=email,
+            account_id=account_id,
+            phase="done",
+            phase_label="K12 / Workspace 重跑完成",
+            stage_index=4,
+            stage_total=4,
+            message=f"导出 {saved_spaces} 个空间，写入 {saved_accounts} 个账号，变更 {len(changed_ids)} 个账号",
+            next_step="任务完成",
+            reset_started_at=True,
+        )
+        _save_task_log(
+            "chatgpt",
+            email,
+            "success",
+            detail=_build_task_log_detail(
+                task_id,
+                {
+                    "attempt_outcome": "k12_workspace_recapture_success",
+                    "email": email,
+                    "account_id": int(account_id or 0),
+                    "source": "k12_workspace_recapture",
+                    "result": sanitize_task_detail(data),
+                },
+            ),
+        )
+        _task_store.finish(task_id, status="done", success=1, skipped=0, errors=[])
+    except SkipCurrentAttemptRequested as exc:
+        _task_timeline_log(
+            task_id,
+            task="K12重跑",
+            email=email,
+            account_id=account_id,
+            phase="skipped",
+            phase_label="已跳过",
+            stage_index=4,
+            stage_total=4,
+            message=str(exc),
+            next_step="任务停止",
+            reset_started_at=True,
+        )
+        _save_task_log(
+            "chatgpt",
+            email,
+            "skipped",
+            error=str(exc),
+            detail=_build_task_log_detail(
+                task_id,
+                {
+                    "attempt_outcome": "k12_workspace_recapture_skipped",
+                    "email": email,
+                    "account_id": int(account_id or 0),
+                    "source": "k12_workspace_recapture",
+                },
+            ),
+        )
+        _task_store.finish(task_id, status="stopped", success=0, skipped=1, errors=[])
+    except StopTaskRequested as exc:
+        _log(task_id, f"[STOP] {exc}")
+        _task_timeline_log(
+            task_id,
+            task="K12重跑",
+            email=email,
+            account_id=account_id,
+            phase="stopped",
+            phase_label="已停止",
+            stage_index=4,
+            stage_total=4,
+            message=str(exc),
+            next_step="任务停止",
+            reset_started_at=True,
+        )
+        _save_task_log(
+            "chatgpt",
+            email,
+            "stopped",
+            error=str(exc),
+            detail=_build_task_log_detail(
+                task_id,
+                {
+                    "attempt_outcome": "k12_workspace_recapture_stopped",
+                    "email": email,
+                    "account_id": int(account_id or 0),
+                    "source": "k12_workspace_recapture",
+                },
+            ),
+        )
+        _task_store.finish(task_id, status="stopped", success=0, skipped=0, errors=[])
+    except Exception as exc:
+        error_text = str(exc) or "K12 / Workspace 重跑失败"
+        errors.append(error_text)
+        result_data = result.get("data") if isinstance(result.get("data"), dict) else {}
+        if result_data:
+            _task_store.update_meta(task_id, {"result": sanitize_task_detail(result_data)})
+        _task_timeline_log(
+            task_id,
+            task="K12重跑",
+            email=email,
+            account_id=account_id,
+            phase="failed",
+            phase_label="K12 / Workspace 重跑失败",
+            stage_index=4,
+            stage_total=4,
+            message=error_text,
+            next_step="查看运行日志和 Debug 详情",
+            reset_started_at=True,
+        )
+        _save_task_log(
+            "chatgpt",
+            email,
+            "failed",
+            error=error_text,
+            detail=_build_task_log_detail(
+                task_id,
+                {
+                    "attempt_outcome": "k12_workspace_recapture_failed",
+                    "email": email,
+                    "account_id": int(account_id or 0),
+                    "source": "k12_workspace_recapture",
+                    "result": sanitize_task_detail(result_data),
+                },
+            ),
+        )
+        _task_store.finish(task_id, status="failed", success=0, skipped=0, errors=errors, error=error_text)
     finally:
         _clear_task_current(task_id)
         _task_store.cleanup()
@@ -7981,6 +8569,274 @@ def _run_batch_resume_subscription_auth(
         _task_store.cleanup()
 
 
+def _run_batch_k12_workspace_recapture(task_id: str, account_ids: list[int], params: dict[str, Any]):
+    from api.actions import (
+        _action_local_status_refresh_ids,
+        _execute_chatgpt_k12_workspace_recapture_action,
+    )
+
+    control = _task_store.control_for(task_id)
+    total = max(len(account_ids), 1)
+    success_count = 0
+    skipped_count = 0
+    errors: list[str] = []
+    results: list[dict[str, Any]] = []
+    primary_email = ""
+    meta = dict(_task_store.snapshot(task_id).get("meta") or {})
+    skipped_items = list(meta.get("skipped_items") or [])
+    missing_ids = list(meta.get("missing_ids") or [])
+    delay_min = max(0.0, float((params or {}).get("delay_seconds") or 0))
+    delay_max = max(0.0, float((params or {}).get("delay_max_seconds") or 0))
+    next_start_time = 0.0
+
+    def task_log(message: str, level: str = "info") -> None:
+        control.checkpoint(consume_skip=False)
+        _log(task_id, message, level)
+
+    _task_store.mark_running(task_id)
+    _task_store.set_progress(task_id, f"0/{total}")
+
+    try:
+        for missing_id in missing_ids:
+            _log(task_id, f"[MISS] 账号不存在: account_id={missing_id}")
+            errors.append(f"account_id={missing_id}: 账号不存在")
+            results.append({"account_id": missing_id, "email": "", "status": "failed", "message": "账号不存在"})
+        for skipped in skipped_items:
+            skipped_count += 1
+            _log(task_id, f"[SKIP] {skipped.get('email') or skipped.get('account_id')} - {skipped.get('reason') or '已跳过'}")
+            results.append(
+                {
+                    "account_id": skipped.get("account_id"),
+                    "email": skipped.get("email") or "",
+                    "status": "skipped",
+                    "message": skipped.get("reason") or "已跳过",
+                }
+            )
+
+        for index, account_id in enumerate(account_ids, start=1):
+            control.checkpoint(consume_skip=False)
+            if (delay_min > 0 or delay_max > 0) and index > 1:
+                wait_seconds = max(0.0, next_start_time - time.time())
+                if wait_seconds > 0:
+                    _log(task_id, f"[K12] 等待账号间延时 {wait_seconds:.1f}s")
+                    end_time = time.time() + wait_seconds
+                    while time.time() < end_time:
+                        control.checkpoint(consume_skip=False)
+                        time.sleep(min(1.0, max(0.0, end_time - time.time())))
+            if delay_min > 0 or delay_max > 0:
+                chosen_delay = random.uniform(delay_min, delay_max) if delay_max > delay_min else delay_min
+                next_start_time = time.time() + chosen_delay
+
+            email = ""
+            attempt_id = control.start_attempt()
+            result: dict[str, Any] = {}
+            try:
+                with Session(engine) as session:
+                    account = session.get(AccountModel, int(account_id or 0))
+                    if account is None or account.platform != "chatgpt":
+                        raise ValueError("ChatGPT 账号不存在")
+                    email = str(account.email or "")
+                    if not primary_email:
+                        primary_email = email
+
+                _task_timeline_log(
+                    task_id,
+                    task="K12重跑",
+                    email=email,
+                    account_id=account_id,
+                    item_index=index,
+                    item_total=total,
+                    phase="capture",
+                    phase_label="Join / accounts/check / workspace token exchange",
+                    stage_index=1,
+                    stage_total=2,
+                    message="开始执行 K12 捕获",
+                    next_step="写回 workspace variants 后处理下一个账号",
+                    reset_started_at=True,
+                )
+                control.checkpoint(attempt_id=attempt_id)
+                with Session(engine) as session:
+                    account = session.get(AccountModel, int(account_id or 0))
+                    if account is None or account.platform != "chatgpt":
+                        raise ValueError("ChatGPT 账号不存在")
+                    result = _execute_chatgpt_k12_workspace_recapture_action(
+                        account,
+                        session,
+                        dict(params or {}),
+                        log_fn=task_log,
+                        stop_checker=lambda: control.checkpoint(attempt_id=attempt_id),
+                    )
+                    try:
+                        session.commit()
+                    except Exception:
+                        pass
+                    refresh_ids = _action_local_status_refresh_ids("k12_workspace_recapture", result, account)
+                    for account_id_value in dict.fromkeys(refresh_ids):
+                        schedule_chatgpt_local_status_refresh_for_account_id(
+                            account_id_value,
+                            reason="task:batch_k12_workspace_recapture",
+                        )
+                    if not bool(result.get("ok")):
+                        raise ValueError(_k12_recapture_result_message(result))
+
+                success_count += 1
+                message = _k12_recapture_result_message(result)
+                result_data = result.get("data") if isinstance(result.get("data"), dict) else {}
+                summary = result_data.get("summary") if isinstance(result_data.get("summary"), dict) else {}
+                results.append(
+                    {
+                        "account_id": account_id,
+                        "email": email,
+                        "status": "success",
+                        "message": message,
+                        "saved_spaces": int(summary.get("saved_spaces") or len(result_data.get("artifacts") or []) or 0),
+                        "saved_accounts": len(result_data.get("saved_accounts") or []),
+                        "changed_account_ids": list(result_data.get("changed_account_ids") or []),
+                    }
+                )
+                _task_timeline_log(
+                    task_id,
+                    task="K12重跑",
+                    email=email,
+                    account_id=account_id,
+                    item_index=index,
+                    item_total=total,
+                    phase="done",
+                    phase_label="重跑结果",
+                    stage_index=2,
+                    stage_total=2,
+                    message=message,
+                    next_step="处理下一个账号",
+                    reset_started_at=True,
+                )
+            except SkipCurrentAttemptRequested as exc:
+                skipped_count += 1
+                results.append({"account_id": account_id, "email": email, "status": "skipped", "message": str(exc)})
+                _task_timeline_log(
+                    task_id,
+                    task="K12重跑",
+                    email=email,
+                    account_id=account_id,
+                    item_index=index,
+                    item_total=total,
+                    phase="skipped",
+                    phase_label="已跳过",
+                    stage_index=2,
+                    stage_total=2,
+                    message=str(exc),
+                    next_step="处理下一个账号",
+                    reset_started_at=True,
+                )
+            except StopTaskRequested:
+                raise
+            except Exception as exc:
+                error_text = str(exc or "K12 / Workspace 重跑失败")
+                errors.append(f"{email or account_id}: {error_text}")
+                results.append({"account_id": account_id, "email": email, "status": "failed", "message": error_text})
+                _task_timeline_log(
+                    task_id,
+                    task="K12重跑",
+                    email=email,
+                    account_id=account_id,
+                    item_index=index,
+                    item_total=total,
+                    phase="failed",
+                    phase_label="重跑失败",
+                    stage_index=2,
+                    stage_total=2,
+                    message=error_text,
+                    next_step="查看运行日志和 Debug 详情",
+                    reset_started_at=True,
+                )
+            finally:
+                control.finish_attempt(attempt_id)
+                _task_store.set_progress(task_id, f"{index}/{total}")
+                _task_store.update_meta(task_id, {"runtime_results": sanitize_task_detail(results)})
+
+        summary_message = (
+            f"批量 K12 / Workspace 重跑完成: 成功 {success_count} 个，"
+            f"跳过 {skipped_count} 个，失败 {len(errors)} 个"
+        )
+        _log(task_id, f"[SUMMARY] {summary_message}")
+        log_status = "success" if not errors else "failed"
+        _save_task_log(
+            "chatgpt",
+            primary_email,
+            log_status,
+            error="" if log_status == "success" else summary_message,
+            detail=_build_task_log_detail(
+                task_id,
+                {
+                    "email": primary_email,
+                    "attempt_outcome": "batch_k12_workspace_recapture_success" if log_status == "success" else "batch_k12_workspace_recapture_failed",
+                    "source": "batch_k12_workspace_recapture",
+                    "meta": {
+                        **meta,
+                        "runtime_success": success_count,
+                        "runtime_skipped": skipped_count,
+                        "runtime_errors": errors,
+                        "runtime_results": sanitize_task_detail(results),
+                    },
+                },
+            ),
+        )
+        _task_store.finish(
+            task_id,
+            status="done" if not errors else "failed",
+            success=success_count,
+            skipped=skipped_count,
+            errors=errors,
+            error="" if not errors else summary_message,
+        )
+    except StopTaskRequested as exc:
+        _log(task_id, f"[STOP] {exc}")
+        _task_timeline_log(
+            task_id,
+            task="K12重跑",
+            item_index=total if total > 0 else None,
+            item_total=total if total > 0 else None,
+            phase="stopped",
+            phase_label="已停止",
+            stage_index=2,
+            stage_total=2,
+            message=str(exc),
+            next_step="任务停止",
+            reset_started_at=True,
+        )
+        _save_task_log(
+            "chatgpt",
+            primary_email,
+            "stopped",
+            error=str(exc),
+            detail=_build_task_log_detail(
+                task_id,
+                {
+                    "email": primary_email,
+                    "attempt_outcome": "batch_k12_workspace_recapture_stopped",
+                    "source": "batch_k12_workspace_recapture",
+                    "meta": {
+                        **meta,
+                        "runtime_success": success_count,
+                        "runtime_skipped": skipped_count,
+                        "runtime_errors": errors,
+                        "runtime_results": sanitize_task_detail(results),
+                    },
+                },
+            ),
+        )
+        _task_store.finish(
+            task_id,
+            status="stopped",
+            success=success_count,
+            skipped=skipped_count,
+            errors=errors,
+            error=str(exc),
+        )
+    finally:
+        _clear_task_current(task_id)
+        _task_store.cleanup()
+
+
 def _phone_binding_prefix4(value: Any) -> str:
     from services.chatgpt_core.phone_pool_repository import _phone_effective_digits
 
@@ -11245,6 +12101,29 @@ def create_batch_resume_subscription_auth_task(
     background_tasks: BackgroundTasks,
 ):
     return enqueue_batch_resume_subscription_auth_task(
+        req,
+        background_tasks=background_tasks,
+    )
+
+
+@router.post("/chatgpt/k12-workspace-recapture")
+def create_k12_workspace_recapture_task(
+    req: K12WorkspaceRecaptureTaskRequest,
+    background_tasks: BackgroundTasks,
+):
+    task_id = enqueue_k12_workspace_recapture_task(
+        req,
+        background_tasks=background_tasks,
+    )
+    return {"task_id": task_id}
+
+
+@router.post("/chatgpt/k12-workspace-recapture/batch")
+def create_batch_k12_workspace_recapture_task(
+    req: BatchK12WorkspaceRecaptureTaskRequest,
+    background_tasks: BackgroundTasks,
+):
+    return enqueue_batch_k12_workspace_recapture_task(
         req,
         background_tasks=background_tasks,
     )

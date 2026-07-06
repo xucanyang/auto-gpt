@@ -1730,7 +1730,7 @@ function shouldShowInvalidRecheckButton(record: any) {
   return String(record?.status || '').trim().toLowerCase() === 'invalid'
 }
 
-function taskModalModeFromSource(source: unknown): 'register' | 'resume_auth' | 'payment_link' | 'sub2api_upload' | 'oaipay_upload' | 'baxigpt_cdk' | 'paypal_bind' | 'probe_local_status' {
+function taskModalModeFromSource(source: unknown): 'register' | 'resume_auth' | 'payment_link' | 'sub2api_upload' | 'oaipay_upload' | 'baxigpt_cdk' | 'paypal_bind' | 'probe_local_status' | 'k12_recapture' {
   const normalized = String(source || '').trim().toLowerCase()
   if (normalized === 'baxigpt_cdk' || normalized === 'baxigpt_cdk_submit') return 'baxigpt_cdk'
   if (normalized === 'chatgpt_paypal_bind' || normalized === 'paypal_bind') return 'paypal_bind'
@@ -1740,6 +1740,7 @@ function taskModalModeFromSource(source: unknown): 'register' | 'resume_auth' | 
   if (normalized === 'batch_sub2api_upload') return 'sub2api_upload'
   if (normalized === 'batch_oaipay_upload') return 'oaipay_upload'
   if (normalized === 'invalid_recheck' || normalized === 'batch_invalid_recheck') return 'resume_auth'
+  if (normalized === 'k12_workspace_recapture' || normalized === 'batch_k12_workspace_recapture') return 'k12_recapture'
   if (normalized === 'payment_link' || normalized === 'batch_payment_link') return 'payment_link'
   return 'register'
 }
@@ -1784,7 +1785,7 @@ export default function Accounts() {
   const [selectedAccountSnapshots, setSelectedAccountSnapshots] = useState<Record<string, any>>({})
 
   const [registerModalOpen, setRegisterModalOpen] = useState(false)
-  const [taskModalMode, setTaskModalMode] = useState<'register' | 'resume_auth' | 'payment_link' | 'sub2api_upload' | 'oaipay_upload' | 'baxigpt_cdk' | 'paypal_bind' | 'probe_local_status'>('register')
+  const [taskModalMode, setTaskModalMode] = useState<'register' | 'resume_auth' | 'payment_link' | 'sub2api_upload' | 'oaipay_upload' | 'baxigpt_cdk' | 'paypal_bind' | 'probe_local_status' | 'k12_recapture'>('register')
   const [taskModalAccount, setTaskModalAccount] = useState<any>(null)
   const [addModalOpen, setAddModalOpen] = useState(false)
   const [importModalOpen, setImportModalOpen] = useState(false)
@@ -2801,6 +2802,37 @@ export default function Accounts() {
     }
   }
 
+  const handleK12WorkspaceRecapture = async (record: any, params: Record<string, unknown> = {}) => {
+    const accountId = Number(record?.id || 0)
+    if (!accountId) {
+      message.error('账号 ID 无效')
+      return
+    }
+    try {
+      const res = await apiFetch('/tasks/chatgpt/k12-workspace-recapture', {
+        method: 'POST',
+        body: JSON.stringify({
+          account_id: accountId,
+          ...params,
+        }),
+      })
+      if (!res?.task_id) {
+        throw new Error('任务创建失败：未返回 task_id')
+      }
+      const snapshot = await apiFetch(`/tasks/${res.task_id}`)
+      setTaskModalMode('k12_recapture')
+      setTaskModalAccount(record)
+      setTaskId(res.task_id)
+      setTaskSnapshot(snapshot)
+      setRegisterModalOpen(true)
+      setActiveTasksPanelOpen(true)
+      void activeTasksQuery.refetch()
+      message.success('K12 / Workspace 重跑任务已启动')
+    } catch (e: any) {
+      message.error(e?.message || 'K12 / Workspace 重跑任务创建失败')
+    }
+  }
+
   const openResumeAuthConfig = async (record: any) => {
     let defaults = { allow_phone_verification: false }
     try {
@@ -2933,21 +2965,40 @@ export default function Accounts() {
 
     setBatchK12RecaptureLoading(true)
     setBatchK12RecaptureOpen(false)
-    message.loading({ content: `${scopeLabel} K12 / Workspace 重跑中...`, key: toastKey, duration: 0 })
+    message.loading({ content: `${scopeLabel} K12 / Workspace 重跑任务创建中...`, key: toastKey, duration: 0 })
     try {
-      const result = await apiFetch('/actions/chatgpt/k12_workspace_recapture/batch', {
+      const result = await apiFetch('/tasks/chatgpt/k12-workspace-recapture/batch', {
         method: 'POST',
         body: JSON.stringify(body),
       })
-      if (!result.total) {
-        message.info({ content: '没有可处理的账号', key: toastKey })
-      } else if (!result.failed) {
-        message.success({ content: `${scopeLabel} K12 / Workspace 重跑完成：成功 ${result.success} / ${result.total}`, key: toastKey })
-      } else if (!result.success) {
-        message.error({ content: `${scopeLabel} K12 / Workspace 重跑失败：成功 ${result.success} / ${result.total}`, key: toastKey })
-      } else {
-        message.warning({ content: `${scopeLabel} K12 / Workspace 重跑部分完成：成功 ${result.success} / ${result.total}`, key: toastKey })
+      const eligible = Number(result?.eligible || 0)
+      const skipped = Number(result?.skipped || 0)
+      const missing = Number(result?.missing || 0)
+      const taskIdFromResponse = String(result?.task_id || '').trim()
+      if (!taskIdFromResponse) {
+        message.info({
+          content: `没有可执行 K12 重跑的账号。请求 ${result?.total_requested || 0} 个，跳过 ${skipped} 个${missing > 0 ? `，缺失 ${missing} 个` : ''}`,
+          key: toastKey,
+        })
+        showBatchActionResult(`${scopeLabel} K12 / Workspace 重跑结果`, result)
+        return
       }
+      const snapshot = await apiFetch(`/tasks/${taskIdFromResponse}`)
+      setTaskModalMode('k12_recapture')
+      setTaskModalAccount(
+        scope === 'selected'
+          ? null
+          : { email: `当前筛选 ${eligible} 个账号` },
+      )
+      setTaskId(taskIdFromResponse)
+      setTaskSnapshot(snapshot)
+      setRegisterModalOpen(true)
+      setActiveTasksPanelOpen(true)
+      void activeTasksQuery.refetch()
+      message.success({
+        content: `${scopeLabel} K12 / Workspace 重跑任务已启动：可执行 ${eligible} 个，跳过 ${skipped} 个${missing > 0 ? `，缺失 ${missing} 个` : ''}`,
+        key: toastKey,
+      })
       showBatchActionResult(`${scopeLabel} K12 / Workspace 重跑结果`, result)
       await load()
     } catch (e: any) {
@@ -7856,6 +7907,7 @@ export default function Accounts() {
         onInitialActionHandled={() => setActionSurfaceInitialActionId(null)}
         onResumeAuthTask={handleResumeSubscriptionAuth}
         onInvalidRecheckTask={handleInvalidRecheck}
+        onK12RecaptureTask={handleK12WorkspaceRecapture}
         authStateMeta={authStateMeta}
         planMeta={planMeta}
           codexStateMeta={codexStateMeta}

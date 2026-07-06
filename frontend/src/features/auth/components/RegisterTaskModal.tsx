@@ -56,7 +56,7 @@ function mailProviderLabel(provider: string) {
 type RegisterTaskModalProps = {
   open: boolean
   currentPlatform: string
-  taskModalMode: 'register' | 'resume_auth' | 'payment_link' | 'sub2api_upload' | 'oaipay_upload' | 'baxigpt_cdk' | 'paypal_bind' | 'probe_local_status'
+  taskModalMode: 'register' | 'resume_auth' | 'payment_link' | 'sub2api_upload' | 'oaipay_upload' | 'baxigpt_cdk' | 'paypal_bind' | 'probe_local_status' | 'k12_recapture'
   taskModalAccount: any
   taskId: string | null
   taskSnapshot: any
@@ -221,6 +221,11 @@ export function RegisterTaskModal({
         : Number(taskSnapshot?.meta?.eligible || 0) > 0
           ? `批量补抓Auth (${taskSnapshot?.meta?.eligible} 个)`
           : '补抓Auth'
+    }
+    if (taskModalMode === 'k12_recapture') {
+      const eligible = Number(taskSnapshot?.meta?.eligible || 0)
+      if (taskModalAccount?.email) return `K12重跑 ${taskModalAccount.email}`
+      return eligible > 0 ? `批量K12重跑 (${eligible} 个)` : 'K12重跑'
     }
     if (taskId && isPhoneSignupTask) {
       const count = registeredPhoneSuccessCount

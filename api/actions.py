@@ -446,6 +446,9 @@ def _execute_chatgpt_k12_workspace_recapture_action(
     acc_model: AccountModel,
     session: Session,
     params: dict | None = None,
+    *,
+    log_fn=None,
+    stop_checker=None,
 ) -> dict[str, Any]:
     from core.proxy_utils import is_proxy_error_text, resolve_probe_candidate_proxies
     from services.chatgpt_core.k12_recapture import recapture_saved_account_k12_workspaces
@@ -464,7 +467,17 @@ def _execute_chatgpt_k12_workspace_recapture_action(
     for idx, (proxy_url, proxy_pool, source) in enumerate(candidates):
         proxy_text = str(proxy_url or "").strip()
         source_text = str(source or ("specified" if proxy_text else "direct")).strip()
+        if callable(log_fn):
+            try:
+                log_fn(
+                    f"[K12] 使用代理候选 {idx + 1}/{len(candidates)}：source={source_text} mode={params.get('proxy_mode') or 'direct'}",
+                    "info",
+                )
+            except TypeError:
+                log_fn(f"[K12] 使用代理候选 {idx + 1}/{len(candidates)}：source={source_text} mode={params.get('proxy_mode') or 'direct'}")
         try:
+            if callable(stop_checker):
+                stop_checker()
             result = recapture_saved_account_k12_workspaces(
                 session=session,
                 account=acc_model,
@@ -473,7 +486,11 @@ def _execute_chatgpt_k12_workspace_recapture_action(
                 save_all_spaces=params.get("save_all_spaces") is not False,
                 strict_join=_to_bool(params.get("strict_join"), default=False),
                 proxy=proxy_text,
+                log_fn=log_fn,
+                stop_checker=stop_checker,
             )
+            if callable(stop_checker):
+                stop_checker()
             data = dict(result)
             data["proxy_source"] = source_text
             data["proxy_used"] = bool(proxy_text)
@@ -516,6 +533,8 @@ def _execute_chatgpt_k12_workspace_recapture_action(
                 "error": error_text,
             }
         except Exception as exc:
+            if exc.__class__.__name__ in {"StopTaskRequested", "SkipCurrentAttemptRequested"}:
+                raise
             error_text = safe_k12_error(exc, 300)
             if proxy_pool is not None and proxy_text and is_proxy_error_text(error_text):
                 try:
