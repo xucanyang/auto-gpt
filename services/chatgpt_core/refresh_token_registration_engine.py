@@ -23,6 +23,7 @@ from .chatgpt_client import ChatGPTClient
 from .oauth import OAuthManager
 from .oauth_client import OAuthClient
 from .otp_budget import RegistrationOtpBudget
+from .task_logging import classify_task_log_level
 from .utils import (
     decode_jwt_payload,
     generate_random_birthday,
@@ -263,124 +264,7 @@ class RefreshTokenRegistrationEngine:
 
     @staticmethod
     def _classify_log_level(message: str, level: str = "info") -> str:
-        normalized_level = str(level or "info").strip().lower() or "info"
-        if normalized_level in {"error", "warning", "debug"}:
-            return normalized_level
-
-        text = str(message or "").strip()
-        allowed_info_prefixes = ("[阶段]", "[账号]", "[主链路]", "[注册]", "[登录]", "[邮箱]", "[验证码]", "[邀请]", "[business]", "[free]", "[结果]", "[TempMailLocal]")
-        if text.startswith(allowed_info_prefixes):
-            return "info"
-        if text.startswith("[") and "]" in text:
-            return "debug"
-
-        normalized_text = text
-        while normalized_text.startswith("[") and "]" in normalized_text:
-            prefix, _, rest = normalized_text.partition("]")
-            if not rest:
-                break
-            normalized_text = rest.strip()
-        debug_prefixes = (
-            "开始 OAuth 登录流程...",
-            "OAuth 策略:",
-            "OAuth 状态起点:",
-            "注册状态起点:",
-            "注册状态推进:",
-            "状态步进[",
-            "follow[",
-            "workspace 解析入口:",
-            "workspace 候选:",
-            "workspace session 数据为空:",
-            "consent 页面请求 ->",
-            "consent HTML 中也未提取到 workspace 数据",
-            "Sentinel Browser 模式:",
-            "Sentinel Browser 启动:",
-            "Sentinel Browser 成功:",
-            "force_new_browser:",
-            "OAuth 指纹:",
-            "步骤1: Bootstrap OAuth session...",
-            "步骤2: POST /api/accounts/authorize/continue",
-            "步骤3: 命中 login_password，按新链路直接触发 passwordless OTP",
-            "步骤4: 检测到邮箱 OTP 验证",
-            "步骤5: 当前 about_you 属于既有账号恢复链路，跳过 create_account，直接转 consent/workspace",
-            "步骤6: 解析 Codex workspace / org / code",
-            "步骤7: POST /oauth/token",
-            "获取到 authorization code:",
-            "✅ OAuth 登录成功",
-            "换取 tokens 失败",
-            "business recovery:",
-            "Authorize →",
-            "请求模式:",
-            "实现策略:",
-            "流程策略:",
-            "验证码等待策略:",
-            "邮箱:",
-            "密码:",
-            "注册信息:",
-            "正在创建 ",
-            "生成固定域名邮箱:",
-            "命中验证码:",
-            "成功获取验证码（",
-            "正在等待邮箱 ",
-            "成功创建邮箱:",
-            "复用已登录 auth 会话抓取 workspace",
-            "复用会话状态步进[",
-            "复用会话遇到未支持的 OAuth 状态:",
-        )
-        debug_contains = (
-            "page=",
-            "method=GET next=",
-            "method=POST next=",
-            "workspace/select ->",
-            "organization/select ->",
-            "authorize_continue:",
-            "email_otp_validate:",
-            "passwordless OTP 已触发",
-            "OAuth OTP 等待窗口:",
-            "使用 wait_for_verification_code 进行阻塞式获取新验证码",
-            "/oauth/authorize ->",
-            "/authorize/continue ->",
-            "/passwordless/send-otp ->",
-            "/email-otp/validate ->",
-            "/email-otp/send ->",
-            "login_session: 已获取",
-            "authorize_continue 分支判定:",
-            "等待 OTP 异常:",
-            "已触发 email-otp 重发",
-            "暂未收到新的 OTP，继续等待",
-            "尝试 OTP:",
-            "session 中没有 workspace 信息",
-            "oai-client-auth-session 已存在，但其中没有 workspaces 字段",
-            "从 oai-client-auth-session cookie 读取到",
-            "选择 workspace:",
-            "选择 organization:",
-            "验证码发送状态:",
-            "触发发送验证码",
-            "发送注册验证码成功",
-            "等待邮箱验证码",
-            "验证 OTP 码:",
-            "完成账号创建:",
-            "username_password_create:",
-            "oauth_create_account:",
-            "create_account: 已生成 sentinel token",
-            "Session Account ID:",
-            "Session User ID:",
-            "步骤 1/4:",
-            "步骤 2/4:",
-            "步骤 3/4:",
-            "步骤 4/4:",
-            "Account ID:",
-            "Workspace ID:",
-            "复用会话 workspace/org 选择失败",
-            "复用已登录 auth 会话时仍回到了登录/OTP/about_you",
-        )
-        if text.startswith("="):
-            return "debug"
-        if text[:2].isdigit() and len(text) > 2 and text[2] == ".":
-            return "debug"
-        if normalized_text.startswith(debug_prefixes) or text.startswith(debug_prefixes) or any(marker in text for marker in debug_contains):
-            return "debug"
-        return "info"
+        return classify_task_log_level(message, level, flow="refresh_token_register")
 
     def _log(self, message: str, level: str = "info"):
         effective_level = self._classify_log_level(message, level)

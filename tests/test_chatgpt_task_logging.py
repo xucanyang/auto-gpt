@@ -9,6 +9,7 @@ from services.chatgpt_core.task_logging import (
     REDACTED_OTP,
     REDACTED_TOKEN,
     build_task_current_state,
+    classify_task_log_level,
     format_task_timeline_log,
     mask_phone_for_log,
     redact_log_text,
@@ -47,6 +48,7 @@ def test_redact_log_text_covers_otp_tokens_password_cookie_proxy_and_sms_url():
             "accessToken: at-secret sessionToken=st-secret refresh_token=rt-secret id_token=it-secret",
             "Cookie: oai-client-auth-session=secret; other=x",
             "password=super-secret",
+            "邮箱: demo@example.com, 密码: cn-secret",
             "proxy http://user:pass@1.2.3.4:8000",
             "+15551234567----https://sms.example.com/get?token=secret&key=abc",
         ]
@@ -64,12 +66,48 @@ def test_redact_log_text_covers_otp_tokens_password_cookie_proxy_and_sms_url():
     assert "rt-secret" not in safe
     assert "it-secret" not in safe
     assert "super-secret" not in safe
+    assert "cn-secret" not in safe
     assert "user:pass@" not in safe
     assert "token=secret" not in safe and "key=abc" not in safe
     assert REDACTED_OTP in safe
     assert REDACTED_TOKEN in safe
     assert REDACTED in safe
     assert "http://***:***@1.2.3.4:8000" in safe
+
+
+def test_classify_task_log_level_sends_low_level_register_noise_to_debug():
+    debug_lines = [
+        "访问 ChatGPT 首页...",
+        "获取 CSRF token...",
+        "CSRF token: deadbeefcafebabe1234...",
+        "提交邮箱: demo@example.com",
+        "获取到 authorize URL",
+        "访问 authorize URL...",
+        "重定向到: https://auth.openai.com/email-verification",
+        "Sentinel Browser 阶段: launch chromium",
+        "follow -> 200 https://chatgpt.com/",
+        "注册状态推进: step=1 state=page=email_otp_verification method=GET next=https://auth.openai.com/email-verification",
+        "验证码发送状态: 200",
+        "验证 OTP 码: 123456",
+        "create_account: 已生成 sentinel token",
+    ]
+    for line in debug_lines:
+        assert classify_task_log_level(line, flow="access_token_register") == "debug"
+
+    assert classify_task_log_level("[账号] -------- 尝试 1 / 目标成功 1 --------", flow="access_token_register") == "info"
+    assert classify_task_log_level("[验证码] 等待邮箱验证码：注册阶段邮箱验证码 timeout=600s", flow="access_token_register") == "info"
+    assert classify_task_log_level("[FAIL] 注册失败: 验证码失败: HTTP 403", flow="access_token_register") == "info"
+    assert classify_task_log_level("显式 debug", "debug", flow="access_token_register") == "debug"
+    assert classify_task_log_level("显式 warning", "warning", flow="access_token_register") == "warning"
+
+
+def test_classify_task_log_level_keeps_phone_binding_summary_visible():
+    assert classify_task_log_level("[手机号绑定] 同号连续绑定继续: +1555***0123", flow="phone_binding") == "info"
+    assert classify_task_log_level("[手机号池] 已回写号码状态：绑定成功", flow="phone_binding") == "info"
+    assert classify_task_log_level("[SUMMARY] OpenAI 手机号绑定完成：成功 2/3", flow="phone_binding") == "info"
+    assert classify_task_log_level("[号码测试] OpenAI 已接受并发送验证码: +15555550123", flow="phone_binding") == "debug"
+    assert classify_task_log_level("phone-otp/send -> 200 response={}", flow="phone_binding") == "debug"
+    assert classify_task_log_level("callback -> /api/auth/callback", flow="phone_binding") == "debug"
 
 
 def test_raw_line_and_phone_helpers_do_not_expose_sms_api_secret():

@@ -312,6 +312,11 @@ def _redact_key_value_text(text: str, *, expose_otp: bool = False) -> str:
         text,
     )
     text = re.sub(
+        r"(?i)(密码|登录密码|账号密码)(\s*[:：=]\s*)[^\s,，;；}\]\)]+",
+        rf"\1\2{REDACTED}",
+        text,
+    )
+    text = re.sub(
         rf"(?i)\b({cookie_keys})\b(\"?\s*[:=]\s*\"?).*?(?=$|\n|\r)",
         rf"\1\2{REDACTED}",
         text,
@@ -351,6 +356,234 @@ def redact_log_text(value: Any, *, expose_phone: bool = False, expose_otp: bool 
     """Free-text log redaction.  Safe to call at every task-log boundary."""
 
     return _redact_text_patterns(value, expose_phone=expose_phone, expose_otp=expose_otp)
+
+
+_COMMON_INFO_PREFIXES = (
+    "[SUMMARY]",
+    "[OK]",
+    "[FAIL]",
+    "[SKIP]",
+    "[STOP]",
+    "[ERROR]",
+    "[WARN]",
+    "[MISS]",
+    "[控制]",
+    "[代理]",
+    "[结果]",
+)
+
+_REGISTER_INFO_PREFIXES = (
+    "[阶段]",
+    "[账号]",
+    "[主链路]",
+    "[注册]",
+    "[登录]",
+    "[邮箱]",
+    "[验证码]",
+    "[邀请]",
+    "[business]",
+    "[free]",
+    "[K12]",
+    "[Workspace]",
+    "[TempMailLocal]",
+    "[iCloudHME]",
+    "[Auto Upload]",
+    "[SKIP_SAVE]",
+    "[升级链接]",
+    "[GoPay]",
+    "[OaiPay]",
+)
+
+_PHONE_SIGNUP_INFO_PREFIXES = (
+    "[手机号注册]",
+    "[手机号注册号段]",
+    "[接码网关]",
+    "[号码池]",
+)
+
+_PHONE_BINDING_INFO_PREFIXES = (
+    "[手机号绑定]",
+    "[手机号池]",
+    "[限定号段]",
+    "[号段抽样]",
+)
+
+_LOW_LEVEL_DEBUG_PREFIXES = (
+    "开始 OAuth 登录流程",
+    "OAuth 策略",
+    "OAuth 状态起点",
+    "OAuth 指纹",
+    "注册状态机参数",
+    "注册状态起点",
+    "注册状态推进",
+    "状态步进[",
+    "follow[",
+    "follow ->",
+    "follow state ->",
+    "workspace 解析入口",
+    "workspace 候选",
+    "workspace session 数据为空",
+    "consent 页面请求 ->",
+    "Sentinel Browser",
+    "Sentinel:",
+    "browser bootstrap",
+    "force_new_browser",
+    "Authorize →",
+    "authorize ->",
+    "authorize redirects ->",
+    "authorize_continue",
+    "访问 ChatGPT 首页",
+    "获取 CSRF token",
+    "CSRF token",
+    "提交邮箱:",
+    "获取到 authorize URL",
+    "访问 authorize URL",
+    "重定向到:",
+    "验证码发送状态:",
+    "验证码发送响应:",
+    "验证 OTP 码:",
+    "验证成功 ",
+    "完成账号创建:",
+    "create_account:",
+    "账号创建成功",
+    "Session Account ID:",
+    "Session User ID:",
+    "Session Workspace ID:",
+    "Account ID:",
+    "Workspace ID:",
+    "请求模式:",
+    "实现策略:",
+    "流程策略:",
+    "验证码等待策略:",
+    "邮箱:",
+    "密码:",
+    "注册信息:",
+    "正在创建 ",
+    "生成固定域名邮箱:",
+    "命中验证码:",
+    "成功获取验证码（",
+    "正在等待邮箱 ",
+    "复用已登录 auth 会话抓取 workspace",
+    "复用会话状态步进[",
+    "复用会话遇到未支持的 OAuth 状态",
+    "Plus 账单探测:",
+    "Plus checkout created:",
+    "Plus checkout amount:",
+    "GoPay 平台链接:",
+    "GoPay 平台链接已获取:",
+    "oauth_create_account:",
+    "username_password_create:",
+    "password/verify ->",
+    "user/register ->",
+    "phone-otp/send ->",
+    "resend ->",
+    "validate ->",
+    "callback ->",
+    "/me ->",
+    "home ->",
+    "providers ->",
+    "csrf ->",
+    "params ->",
+    "authorize_url ->",
+)
+
+_LOW_LEVEL_DEBUG_CONTAINS = (
+    "page=",
+    "method=GET next=",
+    "method=POST next=",
+    "workspace/select ->",
+    "organization/select ->",
+    "email_otp_validate:",
+    "passwordless OTP 已触发",
+    "OAuth OTP 等待窗口:",
+    "使用 wait_for_verification_code 进行阻塞式获取新验证码",
+    "/oauth/authorize ->",
+    "/authorize/continue ->",
+    "/passwordless/send-otp ->",
+    "/email-otp/validate ->",
+    "/email-otp/send ->",
+    "/phone-otp/",
+    "login_session: 已获取",
+    "authorize_continue 分支判定:",
+    "等待 OTP 异常:",
+    "已触发 email-otp 重发",
+    "暂未收到新的 OTP",
+    "尝试 OTP:",
+    "session 中没有 workspace 信息",
+    "oai-client-auth-session 已存在",
+    "从 oai-client-auth-session cookie 读取到",
+    "选择 workspace:",
+    "选择 organization:",
+    "response=",
+    "响应:",
+    "HTTP ",
+    "status=",
+    "route=",
+    "redirects=",
+)
+
+
+def _strip_leading_bracket_tags(text: str) -> str:
+    normalized = str(text or "").strip()
+    while normalized.startswith("[") and "]" in normalized:
+        _, _, rest = normalized.partition("]")
+        if not rest:
+            break
+        normalized = rest.strip()
+    return normalized
+
+
+def classify_task_log_level(
+    message: Any,
+    level: str = "info",
+    *,
+    flow: str = "",
+) -> str:
+    """Classify task logs into the UI-facing ``info`` or ``debug`` streams.
+
+    ``warning`` and ``error`` intentionally remain non-debug so operators see
+    failures in the default Info tab.  Low-level HTTP/OAuth/Sentinel/state-machine
+    chatter goes to Debug unless the caller explicitly marks it as a business
+    stage line.
+    """
+
+    normalized_level = str(level or "info").strip().lower() or "info"
+    if normalized_level == "warn":
+        normalized_level = "warning"
+    if normalized_level in {"debug", "warning", "error"}:
+        return normalized_level
+
+    text = str(message or "").strip()
+    if not text:
+        return "info"
+    upper = text.lstrip().upper()
+    if upper.startswith("[DEBUG]"):
+        return "debug"
+    if text.startswith("="):
+        return "debug"
+    if text[:2].isdigit() and len(text) > 2 and text[2] == ".":
+        return "debug"
+
+    flow_key = str(flow or "").strip().lower().replace("-", "_")
+    info_prefixes = list(_COMMON_INFO_PREFIXES)
+    if flow_key in {"register", "rt_register", "refresh_token_register", "access_token_register", "resume_auth", "k12"}:
+        info_prefixes.extend(_REGISTER_INFO_PREFIXES)
+    if flow_key in {"phone_signup", "phone_registration"}:
+        info_prefixes.extend(_PHONE_SIGNUP_INFO_PREFIXES)
+    if flow_key in {"phone_binding", "phone_binding_test"}:
+        info_prefixes.extend(_PHONE_BINDING_INFO_PREFIXES)
+
+    if text.startswith(tuple(info_prefixes)):
+        return "info"
+    if text.startswith("[") and "]" in text:
+        return "debug"
+
+    normalized_text = _strip_leading_bracket_tags(text)
+    if normalized_text.startswith(_LOW_LEVEL_DEBUG_PREFIXES) or text.startswith(_LOW_LEVEL_DEBUG_PREFIXES):
+        return "debug"
+    if any(marker in text for marker in _LOW_LEVEL_DEBUG_CONTAINS):
+        return "debug"
+    return "info"
 
 
 def sanitize_error_message(value: Any) -> str:

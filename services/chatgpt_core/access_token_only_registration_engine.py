@@ -14,6 +14,7 @@ from services.chatgpt_core.refresh_token_registration_engine import Registration
 
 from .chatgpt_client import ChatGPTClient
 from .otp_budget import RegistrationOtpBudget
+from .task_logging import classify_task_log_level
 from .utils import generate_random_name, generate_random_birthday
 
 logger = logging.getLogger(__name__)
@@ -628,53 +629,7 @@ class AccessTokenOnlyRegistrationEngine:
 
     @staticmethod
     def _classify_log_level(message: str, level: str = "info") -> str:
-        normalized_level = str(level or "info").strip().lower() or "info"
-        if normalized_level in {"error", "warning", "debug"}:
-            return normalized_level
-        text = str(message or "").strip()
-        normalized_text = text
-        while normalized_text.startswith("[") and "]" in normalized_text:
-            _, _, rest = normalized_text.partition("]")
-            if not rest:
-                break
-            normalized_text = rest.strip()
-        debug_prefixes = (
-            "开始 OAuth 登录流程...",
-            "OAuth 策略:",
-            "OAuth 状态起点:",
-            "注册状态起点:",
-            "注册状态推进:",
-            "状态步进[",
-            "follow[",
-            "workspace 解析入口:",
-            "workspace 候选:",
-            "workspace session 数据为空:",
-            "Sentinel Browser 模式:",
-            "Sentinel Browser 启动:",
-            "Sentinel Browser 成功:",
-            "business recovery:",
-            "Authorize →",
-            "请求模式:",
-            "实现策略:",
-            "流程策略:",
-            "验证码等待策略:",
-            "邮箱:",
-            "密码:",
-            "注册信息:",
-            "正在创建 ",
-            "生成固定域名邮箱:",
-            "命中验证码:",
-            "成功获取验证码（",
-            "正在等待邮箱 ",
-            "成功创建邮箱:",
-        )
-        if text.startswith("="):
-            return "debug"
-        if text[:2].isdigit() and len(text) > 2 and text[2] == ".":
-            return "debug"
-        if normalized_text.startswith(debug_prefixes) or text.startswith(debug_prefixes) or "page=" in text or "authorize_continue:" in text or "/oauth/authorize ->" in text or "login_session: 已获取" in text:
-            return "debug"
-        return "info"
+        return classify_task_log_level(message, level, flow="access_token_register")
 
     def _log(self, message: str, level: str = "info"):
         effective_level = self._classify_log_level(message, level)
@@ -682,7 +637,10 @@ class AccessTokenOnlyRegistrationEngine:
         log_message = f"[DEBUG] {clean_message}" if effective_level == "debug" else clean_message
         self.logs.append(log_message)
         if self.callback_logger:
-            self.callback_logger(log_message)
+            try:
+                self.callback_logger(log_message, effective_level)
+            except TypeError:
+                self.callback_logger(log_message)
         if effective_level == "error":
             logger.error(log_message)
         elif effective_level == "warning":

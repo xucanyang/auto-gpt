@@ -41,6 +41,7 @@ from services.chatgpt_core.local_status_refresh import (
 from services.chatgpt_core.task_logging import (
     REDACTION_VERSION,
     build_task_current_state,
+    classify_task_log_level,
     format_task_timeline_log,
     mask_phone_for_log,
     redact_log_text,
@@ -9715,7 +9716,7 @@ def _run_phone_binding_test(
     def stop_checker() -> None:
         control.checkpoint(consume_skip=False)
 
-    def task_log(message: str) -> None:
+    def task_log(message: str, level: str = "info") -> None:
         stop_checker()
         raw = str(message or "")
         stage_index, phase_label = infer_phone_binding_stage(raw)
@@ -9726,9 +9727,10 @@ def _run_phone_binding_test(
             int(stage_index or phone_log_context.get("stage_index") or 1),
             phase_label or str(phone_log_context.get("stage_label") or ""),
         )
+        effective_level = classify_task_log_level(raw, level, flow="phone_binding")
         phone_log(
             raw,
-            level="debug",
+            level="debug" if effective_level == "debug" else "info",
             stage_index=int(stage_index or phone_log_context.get("stage_index") or 1),
             phase_label=phase_label or str(phone_log_context.get("stage_label") or ""),
         )
@@ -11727,6 +11729,12 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                     merged_extra["chatgpt_registration_mode"] = "access_token_only"
                     merged_extra["chatgpt_has_refresh_token_solution"] = False
                     merged_extra["_target_success_count"] = target_successes
+
+                def _register_task_log(message: str, level: str = "info", *_args: Any) -> None:
+                    flow = "phone_signup" if phone_signup_entry else "access_token_register"
+                    effective_level = classify_task_log_level(message, level, flow=flow)
+                    _log(task_id, str(message or ""), effective_level)
+
                 if deferred_activation_enabled:
                     with deferred_team_ids_lock:
                         current_deferred_team_ids = list(deferred_team_ids)
@@ -11773,7 +11781,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                         _mailbox = None if phone_signup_entry else _build_mailbox(_proxy, runtime_extra)
                         _platform = PlatformCls(config=_config, mailbox=_mailbox)
                         _platform._task_attempt_token = attempt_id
-                        _platform._log_fn = lambda msg, level="info", *_: _log(task_id, msg, level)
+                        _platform._log_fn = _register_task_log
                         _platform.bind_task_control(control)
                         if getattr(_platform, "mailbox", None) is not None:
                             _platform.mailbox._task_attempt_token = attempt_id

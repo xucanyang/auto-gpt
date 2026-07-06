@@ -7,6 +7,20 @@
 ## [Unreleased] (未发布)
 
 
+## [1.3.19] - 2026-07-07
+### 优化 (Changed)
+- **注册 / 手机号注册任务日志按 Info 与 Debug 重新分层**：`services/chatgpt_core/task_logging.py` 新增统一的 `classify_task_log_level()` 分类器，`access_token_only_registration_engine.py` 与 `refresh_token_registration_engine.py` 改为复用同一套规则，把 ChatGPT 首页预热、CSRF、authorize 跳转、Sentinel Browser、注册状态机推进、HTTP 响应片段、OTP 提交、callback 与 session 探测等底层链路归入 Debug；默认 Info 视图保留账号尝试、代理出口、邮箱/验证码/注册/结果等操作员真正需要的阶段摘要，避免批量注册时 Info 被数千行技术流水刷屏。
+- **手机绑定上游日志保留阶段化 Info、原始链路进入 Debug**：`api/tasks.py` 的 `phone_binding_test` 日志桥接现在会继续提取“发送短信 / 接收短信 / 提交短信 / 确认绑定”等关键阶段作为 Info，同时根据统一分类器把补抓 Auth、OAuth、接口响应和低层登录链路作为 Debug 展示，减少默认视图里的重复和噪声。
+- **注册任务日志桥接保留上游 level 语义**：`api/tasks.py` 为注册任务接入统一分类桥接，`subscription_auth_capture.py` 调整回调顺序，优先向任务日志传递 `level`，再兼容旧的一参回调，确保 warning/error 仍留在默认 Info 视图，debug 细节进入 Debug 视图。
+- **同步前端版本号至 v1.3.19**：`frontend/src/app/AppShell.tsx` 侧边栏版本展示更新为 `v1.3.19`，用于上线后确认任务日志分层优化已加载。
+
+### 安全 (Security)
+- **补齐中文密码日志脱敏**：`services/chatgpt_core/task_logging.py` 的通用脱敏规则新增 `密码/登录密码/账号密码` 场景，避免注册链路中“邮箱: ...，密码: ...”这类中文字段被保存到实时任务日志、stdout 或历史 `task_logs.detail_json`。
+
+### 测试 (Tests)
+- **补充任务日志分层与脱敏回归测试**：`tests/test_chatgpt_task_logging.py` 增加注册低层日志归 Debug、业务阶段归 Info、warning/error 保持默认可见，以及中文密码字段脱敏的断言，防止后续新增日志重新污染 Info 视图或泄露密码。
+
+
 ## [1.3.18] - 2026-07-07
 ### 新增 (Added)
 - **新增账号筛选组合能力**：`api/accounts.py` 新增 `/api/accounts/filter-presets` 管理接口，通过本实例 `config_store` 保存自定义筛选组合，支持创建、更新、删除和读取；筛选组合只保存搜索、账号状态、使用状态、认证材料、订阅类型、账号有效性、Sub2API/OAIPay 状态、到期排序和每页数量等条件，不保存账号 ID，确保每次应用时按最新库存动态匹配。
@@ -644,4 +658,8 @@
 
 ## 2026-07-07 02:19:02 +0800
 - 新增账号筛选组合管理
+- 发布模式: multi
+
+## 2026-07-07 03:53:03 +0800
+- 优化注册与手机号绑定任务日志分层
 - 发布模式: multi

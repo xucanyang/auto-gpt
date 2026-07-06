@@ -288,9 +288,9 @@ def capture_subscription_auth_for_account(
         action_logs.append(text)
         if callable(log_fn):
             try:
-                log_fn(text)
-            except TypeError:
                 log_fn(text, level)
+            except TypeError:
+                log_fn(text)
 
     allow_phone_verification = _to_bool(allow_phone_verification, default=False)
     phone_sms_probe_only = _to_bool(phone_sms_probe_only, default=False)
