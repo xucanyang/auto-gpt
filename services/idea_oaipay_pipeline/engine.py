@@ -576,7 +576,7 @@ class IdeaOaiPayPipelineEngine:
             submit_interval_seconds=max(0, int(config.idea.submit_interval_seconds or 0)),
             auto_poll_status=config.idea.auto_poll_status,
             status_poll_interval_seconds=max(1, int(config.idea.status_poll_interval_seconds or 5)),
-            status_poll_timeout_seconds=max(1, int(config.idea.status_poll_timeout_seconds or 300)),
+            status_poll_timeout_seconds=max(1800, int(config.idea.status_poll_timeout_seconds or 1800)),
         )
         result = enqueue_baxigpt_cdk_submit_task(req)
         child_id = _safe_str((result or {}).get("task_id"))

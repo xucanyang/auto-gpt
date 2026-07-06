@@ -1,5 +1,5 @@
 import type { ReactNode } from 'react'
-import { Alert, Card, Descriptions, Space, Table, Tag, Typography } from 'antd'
+import { Alert, Card, Descriptions, Space, Tag, Typography } from 'antd'
 import IdeaSubmitSummary from '@/components/idea/IdeaSubmitSummary'
 import { PhoneBindingResultsTable } from '@/components/phone-binding/PhoneBindingResultsTable'
 import { ApprovalUrlResultsTable } from '@/components/approval-url/ApprovalUrlResultsTable'
@@ -132,38 +132,6 @@ function PaymentLinks({ urls }: { urls: unknown }) {
   )
 }
 
-function CdkPairs({ pairs }: { pairs: unknown }) {
-  const rows = asArray(pairs)
-  if (rows.length === 0) return <Text type="secondary">暂无账号/卡密配对</Text>
-  return (
-    <Table
-      size="small"
-      rowKey={(_, index) => String(index)}
-      pagination={false}
-      dataSource={rows}
-      columns={[
-        {
-          title: '账号',
-          dataIndex: 'email',
-          width: 260,
-          render: (value: string, record: any) => {
-            const text = String(value || record?.account || record?.username || '').trim()
-            return <Text copyable={Boolean(text)}>{text || '-'}</Text>
-          },
-        },
-        {
-          title: '卡密',
-          dataIndex: 'cdk',
-          render: (value: string, record: any) => {
-            const text = String(value || record?.code || record?.card_key || record?.code_masked || '').trim()
-            return <Text copyable={Boolean(text)} ellipsis={{ tooltip: text }}>{text || '-'}</Text>
-          },
-        },
-      ]}
-    />
-  )
-}
-
 function GenericSummary({ record, meta, errors }: { record: TaskDetailRecord; meta: Record<string, unknown>; errors: any[] }) {
   return (
     <Space direction="vertical" style={{ width: '100%' }} size={8}>
@@ -231,7 +199,7 @@ export function TaskDetailHeader({ record }: TaskDetailHeaderProps) {
       return (
         <Space direction="vertical" style={{ width: '100%' }} size={10}>
           {Object.keys(ideaSummary).length > 0 ? <IdeaSubmitSummary summary={ideaSummary} compact /> : null}
-          <CdkPairs pairs={meta.pairs} />
+          <Text type="secondary">提交账号的分类结果已在任务日志末尾按一行一个输出；历史详情不再展示卡密。</Text>
         </Space>
       )
     }

@@ -162,7 +162,7 @@ const DEFAULT_BAXIGPT_CDK_SETTINGS = {
   submit_interval_seconds: 5,
   auto_poll_status: true,
   status_poll_interval_seconds: 5,
-  status_poll_timeout_seconds: 300,
+  status_poll_timeout_seconds: 1800,
 }
 
 const DEFAULT_PAYPAL_BINDING_SETTINGS = {
@@ -807,7 +807,7 @@ function normalizeBaxiGptCdkSettings(value: unknown): BaxiGptCdkSettings {
     submit_interval_seconds: intWithDefault(raw.submit_interval_seconds, DEFAULT_BAXIGPT_CDK_SETTINGS.submit_interval_seconds, 0),
     auto_poll_status: raw.auto_poll_status === undefined ? DEFAULT_BAXIGPT_CDK_SETTINGS.auto_poll_status : Boolean(raw.auto_poll_status),
     status_poll_interval_seconds: intWithDefault(raw.status_poll_interval_seconds, DEFAULT_BAXIGPT_CDK_SETTINGS.status_poll_interval_seconds, 1),
-    status_poll_timeout_seconds: intWithDefault(raw.status_poll_timeout_seconds, DEFAULT_BAXIGPT_CDK_SETTINGS.status_poll_timeout_seconds, 5),
+    status_poll_timeout_seconds: intWithDefault(raw.status_poll_timeout_seconds, DEFAULT_BAXIGPT_CDK_SETTINGS.status_poll_timeout_seconds, 1800),
   }
 }
 
@@ -3482,7 +3482,7 @@ export default function Accounts() {
       submit_interval_seconds: Number(values.submit_interval_seconds || 0),
       auto_poll_status: values.auto_poll_status !== false,
       status_poll_interval_seconds: Number(values.status_poll_interval_seconds || 5),
-      status_poll_timeout_seconds: Number(values.status_poll_timeout_seconds || 300),
+      status_poll_timeout_seconds: Number(values.status_poll_timeout_seconds || 1800),
     }
     let requestedAccounts = total
     if (scope === 'selected') {
@@ -7901,15 +7901,15 @@ export default function Accounts() {
                 name="auto_poll_status"
                 label="自动轮询状态"
                 valuePropName="checked"
-                extra="不阻塞下一个账号提交；后台按 order_id 查询到 paid/failed 后同步卡密池和账号。"
+                extra="不阻塞下一个账号提交；后台按上游任务 ID 查询到 paid/failed 后同步卡密池和账号。"
               >
                 <Switch checkedChildren="开启" unCheckedChildren="关闭" />
               </Form.Item>
               <Form.Item name="status_poll_interval_seconds" label="轮询间隔">
                 <InputNumber min={1} max={3600} step={1} addonAfter="秒" style={{ width: '100%' }} />
               </Form.Item>
-              <Form.Item name="status_poll_timeout_seconds" label="轮询超时">
-                <InputNumber min={5} max={86400} step={5} addonAfter="秒" style={{ width: '100%' }} />
+              <Form.Item name="status_poll_timeout_seconds" label="未返回提醒" extra="到点只写提醒日志，任务会继续等待上游终态，不再提前结束。">
+                <InputNumber min={1800} max={86400} step={60} addonAfter="秒" style={{ width: '100%' }} />
               </Form.Item>
               <Form.Item name="precheck" label="提交前预查" valuePropName="checked">
                 <Switch checkedChildren="开启" unCheckedChildren="关闭" />

@@ -7,6 +7,20 @@
 ## [Unreleased] (未发布)
 
 
+## [1.3.15] - 2026-07-06
+### 优化 (Changed)
+- **Idea 批量提交改为等待上游终态再收口**：`api/tasks.py` 将 `baxigpt_cdk_submit` 的 5 分钟“轮询超时”改为 30 分钟未返回提醒，提醒只写日志并继续等待 `paid/failed` 终态；只有超过 24 小时安全上限仍无结果时才归入超时，避免 70 个账号这类批量任务在上游状态尚未全部返回时提前结束。
+- **Idea 最终结果改为日志分类逐行输出**：`api/tasks.py` 的最终 summary 现在先输出分类标题，再按 `[SUMMARY][成功账号/失败账号/超时账号/未提交账号]` 一行一个账号记录结果；日志只展示账号、上游任务 ID 和原因，不再拼接卡密或带卡密前缀的 order_id，方便直接复制排查。
+- **同步前端版本号至 v1.3.15**：`frontend/src/app/AppShell.tsx` 侧边栏版本展示更新为 `v1.3.15`，用于上线后确认 Idea 提交轮询和结果展示修复已加载。
+
+### 修复 (Fixed)
+- **修复 Idea 结果卡片在深色主题下白底突兀的问题**：`frontend/src/components/idea/IdeaSubmitSummary.tsx` 移除四个账号结果表格，改为深色主题一致的摘要提示；`frontend/src/components/TaskLogPanel.tsx` 的日志区域背景、边框和状态文字改为使用 Ant Design 主题 token，和项目深蓝底色保持一致。
+- **隐藏历史结果中的卡密展示**：`frontend/src/components/task-detail/TaskDetailHeader.tsx` 不再在 `baxigpt_cdk_submit` 历史详情里展示账号/卡密配对表，统一提示到任务日志末尾查看逐行分类结果，避免结果区继续暴露卡密信息。
+
+### 测试 (Tests)
+- **补充 Idea 提交结果脱敏回归测试**：`tests/test_baxigpt_submit_summary.py` 增加断言，确保结构化结果不再输出 `code_masked/order_id`，最终日志行会把 `卡密::任务ID` 清洗成纯上游任务 ID。
+
+
 ## [1.3.14] - 2026-07-06
 ### 新增 (Added)
 - **新增 Idea 提交不可用账号标记**：`services/chatgpt_core/baxigpt_cdk_repository.py` 在 Idea 上游返回账号级失败后，会在账号 `extra.idea_submit` 写入 `unavailable/reason/marked_at/source/cdk_id/order_id` 等专用标记，并保留 `idea_submit_unavailable*` 兼容字段；`api/accounts.py` 将该标记序列化为账号列表/详情可读的 `idea_submit` 摘要，避免只靠通用 `payment_failed` 或 `baxigpt_cdk.last_error_message` 反推。
@@ -567,4 +581,8 @@
 
 ## 2026-07-06 16:19:50 +0800
 - 改进 Idea 提交账号不可用标记和结果总结
+- 发布模式: multi
+
+## 2026-07-06 17:43:25 +0800
+- 修复 Idea 提交轮询和结果日志展示
 - 发布模式: multi

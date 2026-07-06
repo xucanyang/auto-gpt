@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { Badge, Button, Card, Descriptions, message, Segmented, Space, Tag } from 'antd'
+import { Badge, Button, Card, Descriptions, message, Segmented, Space, Tag, theme } from 'antd'
 import { CopyOutlined, FastForwardOutlined, StopOutlined } from '@ant-design/icons'
 
 import IdeaSubmitSummary from '@/components/idea/IdeaSubmitSummary'
@@ -43,6 +43,7 @@ function parseLogLine(rawLine: string) {
 }
 
 export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
+  const { token } = theme.useToken()
   const [lines, setLines] = useState<string[]>([])
   const [error, setError] = useState('')
   const [terminalStatus, setTerminalStatus] = useState<TaskTerminalStatus>('idle')
@@ -478,12 +479,13 @@ export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
           flex: 1,
           overflowY: 'auto',
           overflowX: 'auto',
-          background: '#fafafa',
-          border: '1px solid #f0f0f0',
+          background: token.colorBgContainer,
+          border: `1px solid ${token.colorBorderSecondary}`,
           borderRadius: 8,
           padding: 12,
           fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace',
           fontSize: 12,
+          color: token.colorText,
           minHeight: 240,
           maxHeight: 'calc(100vh - 320px)',
           userSelect: 'text',
@@ -494,7 +496,7 @@ export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
         }}
       >
         {visibleLines.length === 0 && !error && (
-          <div style={{ color: '#9ca3af' }}>
+          <div style={{ color: token.colorTextTertiary }}>
             {lines.length === 0 ? '等待日志...' : `当前 ${viewMode === 'debug' ? 'Debug' : 'Info'} 视图下没有可显示的日志`}
           </div>
         )}
@@ -507,18 +509,18 @@ export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
                 lineHeight: 1.65,
                 margin: line.isDebug ? '2px 0' : 0,
                 padding: line.isDebug ? '2px 8px' : 0,
-                borderLeft: line.isDebug ? '3px solid #8b5cf6' : '3px solid transparent',
+                border: line.isDebug ? `1px solid ${token.colorPrimaryBorder}` : '1px solid transparent',
                 borderRadius: line.isDebug ? 4 : 0,
-                background: line.isDebug ? '#f5f3ff' : 'transparent',
+                background: line.isDebug ? token.colorPrimaryBg : 'transparent',
                 color: line.isDebug
-                  ? '#5b21b6'
+                  ? token.colorPrimaryText
                   : line.text.includes('✓') || line.text.includes('成功')
-                    ? '#059669'
+                    ? token.colorSuccessText
                     : line.text.includes('✗') || line.text.includes('失败') || line.text.includes('错误')
-                      ? '#dc2626'
+                      ? token.colorErrorText
                       : line.text.includes('停止') || line.text.includes('跳过')
-                        ? '#d97706'
-                        : '#1f2937',
+                        ? token.colorWarningText
+                        : token.colorText,
               }}
             >
               {line.raw}

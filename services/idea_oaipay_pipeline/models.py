@@ -39,7 +39,7 @@ class IdeaStepConfig(BaseModel):
     submit_interval_seconds: int = 5
     auto_poll_status: bool = True
     status_poll_interval_seconds: int = 5
-    status_poll_timeout_seconds: int = 300
+    status_poll_timeout_seconds: int = 1800
     skip_if_subscription_in: list[str] = PydanticField(default_factory=lambda: ["plus", "pro", "team", "enterprise"])
 
 

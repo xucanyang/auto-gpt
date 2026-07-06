@@ -214,7 +214,7 @@ const DEFAULT_CONFIG: PipelineConfig = {
     submit_interval_seconds: 5,
     auto_poll_status: true,
     status_poll_interval_seconds: 5,
-    status_poll_timeout_seconds: 300,
+    status_poll_timeout_seconds: 1800,
     skip_if_subscription_in: ['plus', 'pro', 'team', 'enterprise'],
   },
   check: {
@@ -429,7 +429,7 @@ function buildConfigFromValues(values: Record<string, unknown>): PipelineConfig 
       failure_continue: Boolean(values.idea_failure_continue),
       submit_interval_seconds: Number(values.submit_interval_seconds || 0),
       status_poll_interval_seconds: Number(values.status_poll_interval_seconds || 5),
-      status_poll_timeout_seconds: Number(values.status_poll_timeout_seconds || 300),
+      status_poll_timeout_seconds: Number(values.status_poll_timeout_seconds || 1800),
       skip_if_subscription_in: Array.isArray(values.idea_skip_subs) ? values.idea_skip_subs as string[] : [],
     },
     check: {
@@ -986,8 +986,8 @@ function ConfigPanel({
               <Form.Item name="status_poll_interval_seconds" label="轮询间隔">
                 <InputNumber min={1} style={{ width: '100%' }} />
               </Form.Item>
-              <Form.Item name="status_poll_timeout_seconds" label="轮询超时" className="idea-oaipay-field-full">
-                <InputNumber min={30} style={{ width: '100%' }} />
+              <Form.Item name="status_poll_timeout_seconds" label="未返回提醒" className="idea-oaipay-field-full" extra="到点只写提醒日志，继续等待 paid/failed 终态。">
+                <InputNumber min={1800} step={60} style={{ width: '100%' }} />
               </Form.Item>
               <Form.Item name="idea_skip_subs" label="已有这些订阅时跳过 Idea" className="idea-oaipay-field-full">
                 <Select mode="multiple" options={subscriptionOptions} />
@@ -1027,7 +1027,7 @@ function ConfigPanel({
                 <TextArea rows={3} placeholder="+1xxx----https://...；为空则使用手机号池" />
               </Form.Item>
               <Form.Item name="phone_timeout_seconds" label="收码超时">
-                <InputNumber min={30} style={{ width: '100%' }} />
+                <InputNumber min={1800} step={60} style={{ width: '100%' }} />
               </Form.Item>
               <Form.Item name="phone_poll_interval_seconds" label="轮询间隔">
                 <InputNumber min={1} style={{ width: '100%' }} />

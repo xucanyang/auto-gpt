@@ -184,6 +184,10 @@ class PhoneBindingTestTaskRequest(BaseModel):
     proxy_min_score: float = 0
 
 
+IDEA_SUBMIT_DEFAULT_POLL_WARNING_SECONDS = 1800
+IDEA_SUBMIT_HARD_POLL_TIMEOUT_SECONDS = 24 * 3600
+
+
 class BaxiGptCdkSubmitTaskRequest(BaseModel):
     account_ids: list[int] = Field(default_factory=list)
     all_filtered: bool = False
@@ -201,7 +205,7 @@ class BaxiGptCdkSubmitTaskRequest(BaseModel):
     submit_interval_seconds: int = 5
     auto_poll_status: bool = True
     status_poll_interval_seconds: int = 5
-    status_poll_timeout_seconds: int = 300
+    status_poll_timeout_seconds: int = IDEA_SUBMIT_DEFAULT_POLL_WARNING_SECONDS
     limit: int = 0
 
 
@@ -3931,7 +3935,11 @@ def enqueue_baxigpt_cdk_submit_task(
     source = "baxigpt_cdk_submit"
     submit_interval_seconds = max(int(req.submit_interval_seconds or 0), 0)
     status_poll_interval_seconds = max(int(req.status_poll_interval_seconds or 5), 1)
-    status_poll_timeout_seconds = max(int(req.status_poll_timeout_seconds or 300), status_poll_interval_seconds)
+    status_poll_timeout_seconds = max(
+        int(req.status_poll_timeout_seconds or IDEA_SUBMIT_DEFAULT_POLL_WARNING_SECONDS),
+        status_poll_interval_seconds,
+        IDEA_SUBMIT_DEFAULT_POLL_WARNING_SECONDS,
+    )
     meta = {
         "total_requested_accounts": total_requested_accounts,
         "matched_accounts": len(matched_accounts),
@@ -6481,8 +6489,6 @@ def _idea_submit_compact_item(item: dict[str, Any] | None, *, fallback_status: s
         "status",
         "reason",
         "cdk_id",
-        "code_masked",
-        "order_id",
         "display_id",
         "finished_at",
         "idea_marked_unavailable",
@@ -6626,30 +6632,36 @@ def _idea_submit_log_item_text(item: dict[str, Any]) -> str:
     account_id = str(item.get("account_id") or "").strip()
     label = email or (f"account_id={account_id}" if account_id else "-")
     suffixes: list[str] = []
-    if item.get("code_masked"):
-        suffixes.append(str(item.get("code_masked")))
-    if item.get("order_id"):
-        suffixes.append(f"order={item.get('order_id')}")
+    display_id = str(item.get("display_id") or "").strip()
+    if not display_id:
+        order_id = str(item.get("order_id") or "").strip()
+        if "::" in order_id:
+            display_id = order_id.rsplit("::", 1)[-1].strip()
+        elif order_id and not any(marker in order_id.lower() for marker in ("cdk", "test-", "idea-")):
+            display_id = order_id
+    if display_id:
+        suffixes.append(f"task={display_id}")
     reason = str(item.get("reason") or "").strip()
     if reason:
         suffixes.append(reason[:120])
-    return f"{label} ({' / '.join(suffixes)})" if suffixes else label
+    return f"{label} | {' | '.join(suffixes)}" if suffixes else label
 
 
-def _log_idea_submit_group_summary(task_id: str, title: str, items: list[dict[str, Any]], *, limit: int = 80) -> None:
+def _log_idea_submit_group_summary(task_id: str, title: str, items: list[dict[str, Any]], *, limit: int = 500) -> None:
     count = len(items or [])
+    _log(task_id, f"[SUMMARY] {title} {count} 个")
     if count <= 0:
-        _log(task_id, f"[SUMMARY] {title} 0 个")
         return
     shown = items[:limit]
-    tail = f"；还有 {count - limit} 个未在日志展开，可在任务详情 JSON 查看" if count > limit else ""
-    _log(task_id, f"[SUMMARY] {title} {count} 个: " + "；".join(_idea_submit_log_item_text(item) for item in shown) + tail)
+    for item in shown:
+        _log(task_id, f"[SUMMARY][{title}] {_idea_submit_log_item_text(item)}")
+    if count > limit:
+        _log(task_id, f"[SUMMARY][{title}] 还有 {count - limit} 个未在日志展开，可在任务详情 JSON 查看")
 
 
 def _run_baxigpt_cdk_submit(task_id: str, pairs: list[dict[str, Any]], settings: dict[str, Any]):
     from services.chatgpt_core.baxigpt_cdk_repository import BaxiGptCdkRepository, STATUS_PAID
     from services.chatgpt_core.baxigpt_client import BaxiGptClient
-    from services.chatgpt_core.baxigpt_status_poller import enqueue_status_poll
 
     control = _task_store.control_for(task_id)
     repo = BaxiGptCdkRepository()
@@ -6667,7 +6679,11 @@ def _run_baxigpt_cdk_submit(task_id: str, pairs: list[dict[str, Any]], settings:
     submit_interval_seconds = max(int(settings.get("submit_interval_seconds") or 0), 0)
     auto_poll_status = settings.get("auto_poll_status") is None or _is_truthy(settings.get("auto_poll_status"))
     status_poll_interval_seconds = max(int(settings.get("status_poll_interval_seconds") or 5), 1)
-    status_poll_timeout_seconds = max(int(settings.get("status_poll_timeout_seconds") or 300), status_poll_interval_seconds)
+    status_poll_timeout_seconds = max(
+        int(settings.get("status_poll_timeout_seconds") or IDEA_SUBMIT_DEFAULT_POLL_WARNING_SECONDS),
+        status_poll_interval_seconds,
+        IDEA_SUBMIT_DEFAULT_POLL_WARNING_SECONDS,
+    )
 
     _task_store.mark_running(task_id)
     _task_store.set_progress(task_id, f"0/{total}")
@@ -6808,7 +6824,7 @@ def _run_baxigpt_cdk_submit(task_id: str, pairs: list[dict[str, Any]], settings:
             "task settings: "
             f"pairs={len(pairs)} precheck={precheck} failure_continue={failure_continue} "
             f"submit_interval={submit_interval_seconds}s auto_poll={auto_poll_status} "
-            f"poll_interval={status_poll_interval_seconds}s poll_timeout={status_poll_timeout_seconds}s "
+            f"poll_interval={status_poll_interval_seconds}s poll_warn={status_poll_timeout_seconds}s "
             f"code_source={meta.get('code_source') or '-'}"
         )
         for missing_id in missing_ids:
@@ -6966,6 +6982,7 @@ def _run_baxigpt_cdk_submit(task_id: str, pairs: list[dict[str, Any]], settings:
                                     "order_id": order_id,
                                     "display_id": display_id,
                                     "submitted_at": time.time(),
+                                    "timeout_warned": False,
                                 })
                                 _log(task_id, f"[Idea] 账号 {acc_item.get('email')} 提交成功，已加入后台轮询队列")
                                 
@@ -7077,6 +7094,7 @@ def _run_baxigpt_cdk_submit(task_id: str, pairs: list[dict[str, Any]], settings:
                             code_masked=rec.code_masked,
                             status="paid",
                             order_id=order_id,
+                            display_id=order["display_id"],
                             local_status_refresh=local_status_summary,
                         )
                         
@@ -7108,7 +7126,7 @@ def _run_baxigpt_cdk_submit(task_id: str, pairs: list[dict[str, Any]], settings:
                             _log(task_id, f"[Idea] 自动标记账号不可用于 Idea 提交: {vb['item'].get('email')} ({err_text})")
                         else:
                             _log(task_id, f"[Idea] 失败原因偏向上游/网络/卡密环境，未标记账号不可用于 Idea 提交: {vb['item'].get('email')} ({err_text})")
-                        append_result(account_id=vb["item"]["account_id"], email=vb["item"].get("email"), cdk_id=rec.id, code_masked=rec.code_masked, status="failed", reason=err_text, order_id=order_id, idea_marked_unavailable=should_mark_unavailable)
+                        append_result(account_id=vb["item"]["account_id"], email=vb["item"].get("email"), cdk_id=rec.id, code_masked=rec.code_masked, status="failed", reason=err_text, order_id=order_id, display_id=order["display_id"], idea_marked_unavailable=should_mark_unavailable)
                         
                         # 2. 提交失败则卡密额度未消耗，若有候选账号继续换额度提交
                         if failure_continue and pending_accounts:
@@ -7119,10 +7137,19 @@ def _run_baxigpt_cdk_submit(task_id: str, pairs: list[dict[str, Any]], settings:
                             _log(task_id, "[Idea] 失败后继续已关闭，停止后续账号提交")
                             pending_accounts.clear()
                             
-                    elif time.time() - order["submitted_at"] > status_poll_timeout_seconds:
+                    elif time.time() - order["submitted_at"] > IDEA_SUBMIT_HARD_POLL_TIMEOUT_SECONDS:
                         timeout_count += 1
-                        _log(task_id, f"[WARN] 轮询结果超时: {vb['item'].get('email')} (order_id={order_id})")
-                        append_result(account_id=vb["item"]["account_id"], email=vb["item"].get("email"), cdk_id=rec.id, code_masked=rec.code_masked, status="timeout", reason="轮询处理超时", order_id=order_id)
+                        _log(task_id, f"[WARN] 轮询安全上限超时，停止等待该账号: {vb['item'].get('email')} (task_id={order['display_id'] or order_id})")
+                        append_result(account_id=vb["item"]["account_id"], email=vb["item"].get("email"), cdk_id=rec.id, code_masked=rec.code_masked, status="timeout", reason="超过 24 小时仍未返回终态", order_id=order_id, display_id=order["display_id"])
+                    elif time.time() - order["submitted_at"] > status_poll_timeout_seconds:
+                        if not order.get("timeout_warned"):
+                            order["timeout_warned"] = True
+                            _log(
+                                task_id,
+                                f"[WAIT] Idea 状态暂未返回: {vb['item'].get('email')} "
+                                f"(task_id={order['display_id'] or order_id}) 已等待 {status_poll_timeout_seconds}s，继续轮询直到上游返回 paid/failed，不提前结束任务",
+                            )
+                        still_active.append(order)
                     else:
                         still_active.append(order)
                         
@@ -7152,7 +7179,7 @@ def _run_baxigpt_cdk_submit(task_id: str, pairs: list[dict[str, Any]], settings:
         elif errors:
             summary_message = f"{summary_message}；首个错误: {errors[0]}"
         elif timeout_accounts:
-            summary_message = f"{summary_message}；存在轮询超时，请按 order_id 复核上游状态"
+            summary_message = f"{summary_message}；存在超过 24 小时仍未返回终态的账号，请按上游任务 ID 复核"
         _log(task_id, f"[SUMMARY] {summary_message}")
         _log_idea_submit_group_summary(task_id, "成功账号", success_accounts)
         _log_idea_submit_group_summary(task_id, "失败账号", failed_accounts)

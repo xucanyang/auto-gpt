@@ -1,4 +1,4 @@
-import { Card, Space, Tag, Tooltip, Typography } from 'antd'
+import { Card, Space, Tag, Typography, theme } from 'antd'
 
 const { Text } = Typography
 
@@ -50,74 +50,8 @@ function accountLabel(item: IdeaSubmitAccount) {
   return String(item.email || (item.account_id ? `account_id=${item.account_id}` : '-')).trim()
 }
 
-function detailText(item: IdeaSubmitAccount) {
-  const parts = [
-    item.code_masked ? `卡密 ${item.code_masked}` : '',
-    item.order_id ? `order ${item.order_id}` : item.display_id ? `任务 ${item.display_id}` : '',
-    item.reason ? String(item.reason) : '',
-  ].filter(Boolean)
-  return parts.join(' · ')
-}
-
-function AccountGroup({
-  title,
-  count,
-  items,
-  color,
-  emptyText,
-}: {
-  title: string
-  count: number
-  items: IdeaSubmitAccount[]
-  color: string
-  emptyText: string
-}) {
-  const visible = items.slice(0, 8)
-  return (
-    <div
-      style={{
-        border: '1px solid #edf0f5',
-        borderRadius: 10,
-        padding: 10,
-        minWidth: 0,
-        background: '#fff',
-      }}
-    >
-      <Space size={6} wrap style={{ marginBottom: 8 }}>
-        <Tag color={color} style={{ marginInlineEnd: 0 }}>{title} {count}</Tag>
-      </Space>
-      {visible.length > 0 ? (
-        <Space direction="vertical" size={5} style={{ width: '100%' }}>
-          {visible.map((item, index) => {
-            const label = accountLabel(item)
-            const detail = detailText(item)
-            return (
-              <div key={`${title}-${index}-${label}`} style={{ minWidth: 0 }}>
-                <Text copyable={label !== '-' ? { text: label } : false} ellipsis={{ tooltip: label }} style={{ maxWidth: '100%' }}>
-                  {label}
-                </Text>
-                {detail ? (
-                  <Tooltip title={detail}>
-                    <Text type="secondary" ellipsis style={{ display: 'block', maxWidth: '100%', fontSize: 12 }}>
-                      {detail}
-                    </Text>
-                  </Tooltip>
-                ) : null}
-              </div>
-            )
-          })}
-          {items.length > visible.length ? (
-            <Text type="secondary" style={{ fontSize: 12 }}>还有 {items.length - visible.length} 个未展开，完整列表已写入任务详情 JSON。</Text>
-          ) : null}
-        </Space>
-      ) : (
-        <Text type="secondary" style={{ fontSize: 12 }}>{emptyText}</Text>
-      )}
-    </div>
-  )
-}
-
 export function IdeaSubmitSummary({ summary, compact = false }: IdeaSubmitSummaryProps) {
+  const { token } = theme.useToken()
   if (!summary || typeof summary !== 'object') return null
 
   const successAccounts = asArray(summary.success_accounts)
@@ -133,6 +67,13 @@ export function IdeaSubmitSummary({ summary, compact = false }: IdeaSubmitSummar
   const unsubmitted = numberValue(summary.unsubmitted ?? unsubmittedAccounts.length)
   const pending = numberValue(summary.pending)
   const unavailable = numberValue(summary.marked_unavailable ?? markedUnavailable.length)
+
+  const sampleAccounts = [
+    ...successAccounts,
+    ...failedAccounts,
+    ...timeoutAccounts,
+    ...unsubmittedAccounts,
+  ].slice(0, 3)
 
   return (
     <Card
@@ -154,15 +95,27 @@ export function IdeaSubmitSummary({ summary, compact = false }: IdeaSubmitSummar
 
       <div
         style={{
-          display: 'grid',
-          gridTemplateColumns: compact ? 'repeat(auto-fit, minmax(220px, 1fr))' : 'repeat(auto-fit, minmax(240px, 1fr))',
-          gap: 8,
+          border: `1px solid ${token.colorBorderSecondary}`,
+          borderRadius: 8,
+          padding: compact ? 8 : 10,
+          background: token.colorFillAlter,
         }}
       >
-        <AccountGroup title="成功账号" count={paid} items={successAccounts} color="success" emptyText="暂无成功账号" />
-        <AccountGroup title="失败账号" count={failed} items={failedAccounts} color="error" emptyText="暂无失败账号" />
-        <AccountGroup title="未提交账号" count={unsubmitted} items={unsubmittedAccounts} color="warning" emptyText="暂无未提交账号" />
-        {timeout > 0 ? <AccountGroup title="超时账号" count={timeout} items={timeoutAccounts} color="orange" emptyText="暂无超时账号" /> : null}
+        <Text type="secondary" style={{ display: 'block' }}>
+          分类明细已写入日志末尾，一行一个账号；结果区不再展示卡密或卡密派生的 order 前缀。
+        </Text>
+        {sampleAccounts.length > 0 ? (
+          <Space size={[6, 4]} wrap style={{ marginTop: 6 }}>
+            {sampleAccounts.map((item, index) => {
+              const label = accountLabel(item)
+              return (
+                <Tag key={`${label}-${index}`} style={{ marginInlineEnd: 0 }}>
+                  {label}
+                </Tag>
+              )
+            })}
+          </Space>
+        ) : null}
       </div>
     </Card>
   )
