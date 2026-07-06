@@ -179,12 +179,15 @@ const TAB_ITEMS = [
       },
       {
         title: '邮箱验证码 API',
-        desc: '每行 email----api。API 返回 JSON，status 字段为验证码；status=0/空/非 4-8 位数字表示未收到。Gmail 会自动展开为原地址和一个 dot 变体。',
+        desc: '每行 email----api。API 返回 JSON，status 字段为验证码；status=0/空/非 4-8 位数字表示未收到。Gmail 可展开为“原邮箱 + N-1 个随机变体”，默认规则包含 dot、plus、dot+plus 和 googlemail。',
         fields: [
           { key: 'email_api_lines', label: '邮箱 API 行', type: 'textarea', placeholder: 'name@gmail.com----api.example.com/get?id=xxx\nuser@example.com----https://api.example.com/code?u=2' },
           { key: 'email_api_poll_interval_seconds', label: '轮询间隔秒数', placeholder: '3' },
           { key: 'email_api_request_timeout_seconds', label: '单次请求超时秒数', placeholder: '15' },
-          { key: 'email_api_gmail_dot_variant_enabled', label: 'Gmail 生成 dot 变体', type: 'boolean' },
+          { key: 'email_api_gmail_dot_variant_enabled', label: '启用 Gmail 随机变体', type: 'boolean' },
+          { key: 'email_api_gmail_variant_count', label: '每个 Gmail 总身份数', placeholder: '2' },
+          { key: 'email_api_gmail_variant_rules', label: 'Gmail 变体规则', placeholder: 'all 或 dot,plus,dot_plus,googlemail' },
+          { key: 'email_api_gmail_plus_tag_template', label: 'Plus 标签模板', placeholder: 'r{rand}' },
           { key: 'email_api_default_scheme', label: '默认 URL 协议', placeholder: 'https' },
         ],
       },
@@ -745,7 +748,7 @@ function getMailboxProviderBrief(provider: string): string {
     case 'icloud_hme':
       return 'auto-gpt 直接管理 iCloud Cookie / HME 别名池 / 共享收件箱，适合导入池、实时创建和别名治理。'
     case 'email_api':
-      return '自带邮箱 + 外部 API 自动收码；Gmail 一行会展开为原地址和一个 dot 变体，共用同一 API。'
+      return '自带邮箱 + 外部 API 自动收码；Gmail 一行可展开为原邮箱 + N-1 个随机变体，共用同一 API。'
     case 'applemail':
       return '本地导入 Outlook/AppleMail 池，适合已有邮箱资产。'
     case 'tempmail_local':
@@ -3666,6 +3669,15 @@ export default function Settings() {
       if (data.email_api_gmail_dot_variant_enabled === undefined || data.email_api_gmail_dot_variant_enabled === '') {
         data.email_api_gmail_dot_variant_enabled = true
       }
+      if (!data.email_api_gmail_variant_count) {
+        data.email_api_gmail_variant_count = '2'
+      }
+      if (!data.email_api_gmail_variant_rules) {
+        data.email_api_gmail_variant_rules = 'all'
+      }
+      if (!data.email_api_gmail_plus_tag_template) {
+        data.email_api_gmail_plus_tag_template = 'r{rand}'
+      }
       if (!data.email_api_default_scheme) {
         data.email_api_default_scheme = 'https'
       }
@@ -4040,6 +4052,11 @@ export default function Settings() {
         ),
       )
       values.email_api_gmail_dot_variant_enabled = parseBooleanConfigValue(values.email_api_gmail_dot_variant_enabled)
+      values.email_api_gmail_variant_count = String(
+        Math.max(1, Math.min(500, Number.parseInt(String(values.email_api_gmail_variant_count || '2'), 10) || 2)),
+      )
+      values.email_api_gmail_variant_rules = String(values.email_api_gmail_variant_rules || 'all').trim() || 'all'
+      values.email_api_gmail_plus_tag_template = String(values.email_api_gmail_plus_tag_template || 'r{rand}').trim() || 'r{rand}'
       values.email_api_default_scheme = String(values.email_api_default_scheme || 'https').trim() || 'https'
       values.contribution_enabled = parseBooleanConfigValue(values.contribution_enabled)
       values.chatgpt_enable_team_invite = parseBooleanConfigValue(values.chatgpt_enable_team_invite)

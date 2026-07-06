@@ -429,9 +429,17 @@ def _prepare_register_request(req: RegisterTaskRequest) -> RegisterTaskRequest:
         from core.base_mailbox import parse_email_api_lines
 
         lines = prepared.extra.get("email_api_lines") or prepared.extra.get("email_api_accounts") or ""
+        gmail_variant_seed = str(
+            prepared.extra.get("email_api_gmail_variant_random_seed")
+            or f"{time.time_ns()}-{random.getrandbits(64):016x}"
+        ).strip()
         candidates, errors = parse_email_api_lines(
             lines,
             gmail_dot_variant_enabled=_is_truthy(prepared.extra.get("email_api_gmail_dot_variant_enabled", True)),
+            gmail_variant_count=prepared.extra.get("email_api_gmail_variant_count", 2),
+            gmail_variant_rules=prepared.extra.get("email_api_gmail_variant_rules", "all"),
+            gmail_plus_tag_template=prepared.extra.get("email_api_gmail_plus_tag_template", "r{rand}"),
+            gmail_variant_random_seed=gmail_variant_seed,
             default_scheme=str(prepared.extra.get("email_api_default_scheme") or "https"),
         )
         if errors:
@@ -440,7 +448,9 @@ def _prepare_register_request(req: RegisterTaskRequest) -> RegisterTaskRequest:
         if not candidates:
             raise HTTPException(400, "email_api 模式请至少提供一条 email----api")
         prepared.extra["mail_provider"] = "email_api"
+        prepared.extra["email_api_candidates"] = candidates
         prepared.extra["email_api_candidate_count"] = len(candidates)
+        prepared.extra["email_api_gmail_variant_random_seed"] = gmail_variant_seed
         if _is_truthy(prepared.extra.get("email_api_use_all_identities", True)):
             prepared.count = len(candidates)
         else:
@@ -12277,13 +12287,24 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
         initial_email_api_candidates = []
         if initial_email_api_entry:
             try:
-                from core.base_mailbox import parse_email_api_lines
+                if isinstance(initial_merged_extra.get("email_api_candidates"), list):
+                    initial_email_api_candidates = [
+                        dict(item)
+                        for item in initial_merged_extra.get("email_api_candidates") or []
+                        if isinstance(item, dict)
+                    ]
+                else:
+                    from core.base_mailbox import parse_email_api_lines
 
-                initial_email_api_candidates, _initial_email_api_errors = parse_email_api_lines(
-                    initial_merged_extra.get("email_api_lines") or initial_merged_extra.get("email_api_accounts") or "",
-                    gmail_dot_variant_enabled=_truthy(initial_merged_extra.get("email_api_gmail_dot_variant_enabled", True), default=True),
-                    default_scheme=str(initial_merged_extra.get("email_api_default_scheme") or "https"),
-                )
+                    initial_email_api_candidates, _initial_email_api_errors = parse_email_api_lines(
+                        initial_merged_extra.get("email_api_lines") or initial_merged_extra.get("email_api_accounts") or "",
+                        gmail_dot_variant_enabled=_truthy(initial_merged_extra.get("email_api_gmail_dot_variant_enabled", True), default=True),
+                        gmail_variant_count=initial_merged_extra.get("email_api_gmail_variant_count", 2),
+                        gmail_variant_rules=initial_merged_extra.get("email_api_gmail_variant_rules", "all"),
+                        gmail_plus_tag_template=initial_merged_extra.get("email_api_gmail_plus_tag_template", "r{rand}"),
+                        gmail_variant_random_seed=initial_merged_extra.get("email_api_gmail_variant_random_seed", ""),
+                        default_scheme=str(initial_merged_extra.get("email_api_default_scheme") or "https"),
+                    )
             except Exception:
                 initial_email_api_candidates = []
         configured_max_attempts = 0

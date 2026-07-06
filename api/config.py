@@ -66,6 +66,9 @@ CONFIG_KEYS = [
     "email_api_poll_interval_seconds",
     "email_api_request_timeout_seconds",
     "email_api_gmail_dot_variant_enabled",
+    "email_api_gmail_variant_count",
+    "email_api_gmail_variant_rules",
+    "email_api_gmail_plus_tag_template",
     "email_api_default_scheme",
     "icloud_hme_mode",
     "icloud_cookie",
@@ -467,6 +470,12 @@ def _build_config_response(*, local_only: bool = False) -> dict[str, Any]:
         all_cfg["email_api_request_timeout_seconds"] = "15"
     if not all_cfg.get("email_api_gmail_dot_variant_enabled"):
         all_cfg["email_api_gmail_dot_variant_enabled"] = "true"
+    if not all_cfg.get("email_api_gmail_variant_count"):
+        all_cfg["email_api_gmail_variant_count"] = "2"
+    if not all_cfg.get("email_api_gmail_variant_rules"):
+        all_cfg["email_api_gmail_variant_rules"] = "all"
+    if not all_cfg.get("email_api_gmail_plus_tag_template"):
+        all_cfg["email_api_gmail_plus_tag_template"] = "r{rand}"
     if not all_cfg.get("email_api_default_scheme"):
         all_cfg["email_api_default_scheme"] = "https"
     if not all_cfg.get("icloud_hme_mode"):

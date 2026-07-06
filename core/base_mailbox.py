@@ -771,6 +771,10 @@ class ManualEmailOtpMailbox(BaseMailbox):
 EMAIL_API_PROVIDER_VALUES = {"email_api", "api_email", "email_otp_api", "mail_api_otp"}
 _GMAIL_DOMAIN_TYPOS = {"gamil.com", "gmial.com", "gmai.com"}
 _EMAIL_API_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+_GMAIL_EQUIVALENT_DOMAINS = {"gmail.com", "googlemail.com"}
+_EMAIL_API_GMAIL_VARIANT_COUNT_MAX = 500
+DEFAULT_EMAIL_API_GMAIL_VARIANT_RULES = ("dot", "plus", "dot_plus", "googlemail")
+DEFAULT_EMAIL_API_GMAIL_PLUS_TAG_TEMPLATE = "r{rand}"
 
 
 def _email_api_truthy(value: Any, default: bool = False) -> bool:
@@ -794,6 +798,14 @@ def _email_api_positive_float(value: Any, default: float, minimum: float = 0.5, 
     except Exception:
         parsed = default
     return max(float(minimum), min(float(maximum), parsed))
+
+
+def _email_api_positive_int(value: Any, default: int, minimum: int = 1, maximum: int = 500) -> int:
+    try:
+        parsed = int(float(str(value).strip()))
+    except Exception:
+        parsed = int(default)
+    return max(int(minimum), min(int(maximum), parsed))
 
 
 def normalize_email_api_url(raw: Any, *, default_scheme: str = "https") -> str:
@@ -873,11 +885,134 @@ def _gmail_canonical_email(email: str) -> str:
     if "@" not in normalized:
         return normalized
     local, domain = normalized.rsplit("@", 1)
-    if domain != "gmail.com":
+    if domain not in _GMAIL_EQUIVALENT_DOMAINS:
         return normalized
     if "+" in local:
         local = local.split("+", 1)[0]
     return f"{local.replace('.', '')}@gmail.com"
+
+
+def _gmail_base_local(email: str) -> str:
+    normalized = str(email or "").strip().lower()
+    if "@" not in normalized:
+        return ""
+    local, domain = normalized.rsplit("@", 1)
+    if domain not in _GMAIL_EQUIVALENT_DOMAINS:
+        return ""
+    if "+" in local:
+        local = local.split("+", 1)[0]
+    return local.replace(".", "")
+
+
+def _parse_gmail_variant_rules(value: Any = None) -> list[str]:
+    if value in (None, ""):
+        return list(DEFAULT_EMAIL_API_GMAIL_VARIANT_RULES)
+    if isinstance(value, (list, tuple, set)):
+        raw_items = [str(item or "") for item in value]
+    else:
+        raw_items = re.split(r"[\s,;，；|/]+", str(value or ""))
+
+    rules: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_items:
+        item = str(raw or "").strip().lower().replace("-", "_")
+        if not item:
+            continue
+        if item in {"all", "*", "default", "全部", "所有"}:
+            expanded = list(DEFAULT_EMAIL_API_GMAIL_VARIANT_RULES)
+        elif item in {"dot", "dots", "gmail_dot", "point", "点号", "点"}:
+            expanded = ["dot"]
+        elif item in {"plus", "tag", "plus_tag", "gmail_plus", "+", "加号"}:
+            expanded = ["plus"]
+        elif item in {"mixed", "mix", "dot_plus", "dotplus", "dot+plus", "plus_dot", "gmail_dot_plus", "混合"}:
+            expanded = ["dot_plus"]
+        elif item in {"googlemail", "google_mail", "googlemail_domain", "domain", "域名"}:
+            expanded = ["googlemail"]
+        else:
+            continue
+        for rule in expanded:
+            if rule not in seen:
+                seen.add(rule)
+                rules.append(rule)
+    return rules or list(DEFAULT_EMAIL_API_GMAIL_VARIANT_RULES)
+
+
+def _gmail_variant_rng(seed: Any = None):
+    text = str(seed or "").strip()
+    if text:
+        return random.Random(text)
+    return random.SystemRandom()
+
+
+def _gmail_random_token(rng, length: int = 6) -> str:
+    alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
+    return "".join(rng.choice(alphabet) for _ in range(max(1, int(length or 1))))
+
+
+def _gmail_plus_tag(template: Any, *, index: int, base: str, rng) -> str:
+    tpl = str(template or DEFAULT_EMAIL_API_GMAIL_PLUS_TAG_TEMPLATE).strip() or DEFAULT_EMAIL_API_GMAIL_PLUS_TAG_TEMPLATE
+    rand = _gmail_random_token(rng, 6)
+    dynamic_markers = ("{index}", "{n}", "{rand}", "{hex}")
+    try:
+        tag = tpl.format(index=index, n=index, base=base, rand=rand, hex=rand)
+    except Exception:
+        tag = f"{tpl}{index}"
+    tag = re.sub(r"[^a-zA-Z0-9._-]+", "", str(tag or "").lower()).strip("._-")
+    if not any(marker in tpl for marker in dynamic_markers):
+        tag = f"{tag}{index}"
+    return tag or f"r{index}"
+
+
+def _gmail_local_from_dot_mask(compact: str, mask: int) -> str:
+    if len(compact) < 2:
+        return compact
+    chars: list[str] = []
+    for idx, ch in enumerate(compact):
+        chars.append(ch)
+        if idx < len(compact) - 1 and (mask & (1 << idx)):
+            chars.append(".")
+    return "".join(chars)
+
+
+def _gmail_random_dotted_local(compact: str, rng) -> str:
+    if len(compact) < 2:
+        return compact
+    # 每个字符间隙随机放点；mask=0 是无点原形，也是一种合法 dot 等价写法。
+    mask = 0
+    for idx in range(len(compact) - 1):
+        if rng.choice((False, True)):
+            mask |= 1 << idx
+    return _gmail_local_from_dot_mask(compact, mask)
+
+
+def _gmail_iter_dot_locals(compact: str, *, limit: int = 1024) -> list[str]:
+    compact = str(compact or "").strip().lower()
+    if not compact:
+        return []
+    if len(compact) < 2:
+        return [compact]
+    max_masks = 1 << min(len(compact) - 1, 20)
+    locals_: list[str] = []
+    seen: set[str] = set()
+
+    def add(mask: int) -> None:
+        if len(locals_) >= limit:
+            return
+        local = _gmail_local_from_dot_mask(compact, mask)
+        if local not in seen:
+            seen.add(local)
+            locals_.append(local)
+
+    # 先给可读性较好的单点位置，再补全多点组合。
+    preferred = 2 if len(compact) > 2 else 1
+    for pos in [preferred] + [pos for pos in range(1, len(compact)) if pos != preferred]:
+        add(1 << (pos - 1))
+    add(0)
+    for mask in range(1, max_masks):
+        add(mask)
+        if len(locals_) >= limit:
+            break
+    return locals_
 
 
 def build_gmail_dot_variant(email: Any) -> str:
@@ -911,16 +1046,152 @@ def build_gmail_dot_variant(email: Any) -> str:
     return ""
 
 
+def build_gmail_variants(
+    email: Any,
+    *,
+    count: Any = 2,
+    rules: Any = None,
+    plus_tag_template: Any = DEFAULT_EMAIL_API_GMAIL_PLUS_TAG_TEMPLATE,
+    include_original: bool = True,
+    random_seed: Any = None,
+) -> list[dict[str, str]]:
+    """Build one original Gmail identity plus random Gmail-equivalent variants.
+
+    Supported default rules are the public Gmail equivalences/operators we rely on:
+    dot aliases, plus tags, dot+plus mixed aliases, and the googlemail.com domain
+    equivalent.  The caller decides ``count`` as total identities per source Gmail
+    row; when not enough finite dot/googlemail-only variants exist, fewer rows are
+    returned instead of fabricating non-Gmail identities.
+    """
+
+    normalized = str(email or "").strip().lower()
+    if "@" not in normalized:
+        return []
+    local, domain = normalized.rsplit("@", 1)
+    if domain not in _GMAIL_EQUIVALENT_DOMAINS:
+        return [{"email": normalized, "variant": "original"}] if include_original and normalized else []
+    compact = _gmail_base_local(normalized)
+    if not compact:
+        return [{"email": normalized, "variant": "original"}] if include_original and normalized else []
+
+    desired = _email_api_positive_int(
+        count,
+        2,
+        minimum=1,
+        maximum=_EMAIL_API_GMAIL_VARIANT_COUNT_MAX,
+    )
+    enabled_rules = _parse_gmail_variant_rules(rules)
+    rng = _gmail_variant_rng(random_seed)
+    results: list[dict[str, str]] = []
+    seen: set[str] = set()
+
+    def add(candidate_local: str, candidate_domain: str, variant: str) -> bool:
+        candidate_local = str(candidate_local or "").strip(".").lower()
+        candidate_domain = str(candidate_domain or "gmail.com").strip().lower()
+        if not candidate_local or candidate_domain not in _GMAIL_EQUIVALENT_DOMAINS:
+            return False
+        candidate = f"{candidate_local}@{candidate_domain}"
+        if candidate in seen:
+            return False
+        seen.add(candidate)
+        results.append({"email": candidate, "variant": variant})
+        return True
+
+    if include_original:
+        add(local, domain, "original")
+    if len(results) >= desired:
+        return results[:desired]
+    if not enabled_rules:
+        return results[:desired]
+
+    plus_index = 1
+    attempts = max(200, desired * 120)
+    for _ in range(attempts):
+        if len(results) >= desired:
+            break
+        rule = rng.choice(enabled_rules)
+        if rule == "dot":
+            add(_gmail_random_dotted_local(compact, rng), "gmail.com", "gmail_dot")
+            continue
+        if rule == "plus":
+            tag = _gmail_plus_tag(plus_tag_template, index=plus_index, base=compact, rng=rng)
+            plus_index += 1
+            add(f"{compact}+{tag}", "gmail.com", "gmail_plus")
+            continue
+        if rule == "dot_plus":
+            tag = _gmail_plus_tag(plus_tag_template, index=plus_index, base=compact, rng=rng)
+            plus_index += 1
+            add(f"{_gmail_random_dotted_local(compact, rng)}+{tag}", "gmail.com", "gmail_dot_plus")
+            continue
+        if rule == "googlemail":
+            subrule = rng.choice(("base", "dot", "plus", "dot_plus"))
+            if subrule == "base":
+                add(compact, "googlemail.com", "googlemail")
+            elif subrule == "dot":
+                add(_gmail_random_dotted_local(compact, rng), "googlemail.com", "googlemail_dot")
+            elif subrule == "plus":
+                tag = _gmail_plus_tag(plus_tag_template, index=plus_index, base=compact, rng=rng)
+                plus_index += 1
+                add(f"{compact}+{tag}", "googlemail.com", "googlemail_plus")
+            else:
+                tag = _gmail_plus_tag(plus_tag_template, index=plus_index, base=compact, rng=rng)
+                plus_index += 1
+                add(f"{_gmail_random_dotted_local(compact, rng)}+{tag}", "googlemail.com", "googlemail_dot_plus")
+
+    if len(results) >= desired:
+        return results[:desired]
+
+    # Deterministic fallback fills gaps left by random duplicate hits and gives
+    # dot-only configurations every finite dot combination before stopping.
+    dot_locals = _gmail_iter_dot_locals(compact, limit=max(desired * 4, 64))
+    if "dot" in enabled_rules:
+        for dotted in dot_locals:
+            if len(results) >= desired:
+                break
+            add(dotted, "gmail.com", "gmail_dot")
+    if "plus" in enabled_rules:
+        while len(results) < desired:
+            tag = _gmail_plus_tag(plus_tag_template, index=plus_index, base=compact, rng=rng)
+            plus_index += 1
+            add(f"{compact}+{tag}", "gmail.com", "gmail_plus")
+    if "dot_plus" in enabled_rules:
+        tag_round = 0
+        while len(results) < desired:
+            tag_round += 1
+            tag = _gmail_plus_tag(plus_tag_template, index=plus_index, base=compact, rng=rng)
+            plus_index += 1
+            for dotted in dot_locals:
+                if len(results) >= desired:
+                    break
+                add(f"{dotted}+{tag}", "gmail.com", "gmail_dot_plus")
+            if tag_round > desired + 5:
+                break
+    if "googlemail" in enabled_rules:
+        for dotted in dot_locals:
+            if len(results) >= desired:
+                break
+            add(dotted, "googlemail.com", "googlemail_dot" if "." in dotted else "googlemail")
+        while len(results) < desired:
+            tag = _gmail_plus_tag(plus_tag_template, index=plus_index, base=compact, rng=rng)
+            plus_index += 1
+            add(f"{compact}+{tag}", "googlemail.com", "googlemail_plus")
+    return results[:desired]
+
+
 def parse_email_api_lines(
     lines: Any,
     *,
     gmail_dot_variant_enabled: bool = True,
+    gmail_variant_count: Any = 2,
+    gmail_variant_rules: Any = None,
+    gmail_plus_tag_template: Any = DEFAULT_EMAIL_API_GMAIL_PLUS_TAG_TEMPLATE,
+    gmail_variant_random_seed: Any = None,
     default_scheme: str = "https",
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Parse ``email----api`` rows into registration identities.
 
-    Gmail rows expand to the exact submitted address plus one dot-equivalent
-    address.  The exact ChatGPT account email is never canonicalized; the Gmail
+    Gmail rows expand to the exact submitted address plus random Gmail-equivalent
+    variants.  The exact ChatGPT account email is never canonicalized; the Gmail
     canonical address is only used for duplicate and lock detection.
     """
 
@@ -951,7 +1222,7 @@ def parse_email_api_lines(
             errors.append({"line": line_no, "raw": line, "reason": str(exc)})
             continue
 
-        is_gmail = email.endswith("@gmail.com")
+        is_gmail = bool(_gmail_base_local(email))
         gmail_root = _gmail_canonical_email(email) if is_gmail else ""
         if gmail_root:
             existing_api = gmail_api_by_root.get(gmail_root)
@@ -960,7 +1231,7 @@ def parse_email_api_lines(
                 continue
             gmail_api_by_root[gmail_root] = api_url
             if gmail_root in emitted_gmail_roots:
-                # 同一个 Gmail 根邮箱最多展开一次：原地址 + 一个 dot 变体。
+                # 同一个 Gmail 根邮箱最多展开一次：原地址 + N-1 个随机变体。
                 continue
             emitted_gmail_roots.add(gmail_root)
 
@@ -986,11 +1257,30 @@ def parse_email_api_lines(
                 }
             )
 
-        add(email, "original")
-        if gmail_dot_variant_enabled and is_gmail:
-            dot_variant = build_gmail_dot_variant(email)
-            if dot_variant:
-                add(dot_variant, "gmail_dot")
+        if is_gmail:
+            variant_enabled = _email_api_truthy(gmail_dot_variant_enabled, default=True)
+            identity_count = (
+                _email_api_positive_int(
+                    gmail_variant_count,
+                    2,
+                    minimum=1,
+                    maximum=_EMAIL_API_GMAIL_VARIANT_COUNT_MAX,
+                )
+                if variant_enabled
+                else 1
+            )
+            seed = f"{gmail_variant_random_seed}:{line_no}:{email}:{api_url}" if gmail_variant_random_seed not in (None, "") else None
+            for variant_item in build_gmail_variants(
+                email,
+                count=identity_count,
+                rules=gmail_variant_rules,
+                plus_tag_template=gmail_plus_tag_template,
+                include_original=True,
+                random_seed=seed,
+            ):
+                add(str(variant_item.get("email") or ""), str(variant_item.get("variant") or "gmail_variant"))
+        else:
+            add(email, "original")
     return candidates, errors
 
 
@@ -1059,6 +1349,10 @@ class EmailApiMailbox(BaseMailbox):
         poll_interval_seconds: Any = 3,
         request_timeout_seconds: Any = 15,
         gmail_dot_variant_enabled: Any = True,
+        gmail_variant_count: Any = 2,
+        gmail_variant_rules: Any = None,
+        gmail_plus_tag_template: Any = DEFAULT_EMAIL_API_GMAIL_PLUS_TAG_TEMPLATE,
+        gmail_variant_random_seed: Any = None,
         default_scheme: str = "https",
         pool_key: str = "",
         proxy: str | None = None,
@@ -1070,6 +1364,15 @@ class EmailApiMailbox(BaseMailbox):
         self.poll_interval_seconds = _email_api_positive_float(poll_interval_seconds, 3, minimum=0.5, maximum=60)
         self.request_timeout_seconds = _email_api_positive_float(request_timeout_seconds, 15, minimum=1, maximum=120)
         self.gmail_dot_variant_enabled = _email_api_truthy(gmail_dot_variant_enabled, default=True)
+        self.gmail_variant_count = _email_api_positive_int(
+            gmail_variant_count,
+            2,
+            minimum=1,
+            maximum=_EMAIL_API_GMAIL_VARIANT_COUNT_MAX,
+        )
+        self.gmail_variant_rules = str(gmail_variant_rules or "all").strip() or "all"
+        self.gmail_plus_tag_template = str(gmail_plus_tag_template or DEFAULT_EMAIL_API_GMAIL_PLUS_TAG_TEMPLATE).strip() or DEFAULT_EMAIL_API_GMAIL_PLUS_TAG_TEMPLATE
+        self.gmail_variant_random_seed = str(gmail_variant_random_seed or "").strip()
         self.default_scheme = str(default_scheme or "https").strip().lower() or "https"
         self.pool_key = str(pool_key or "").strip()
         self.proxy = build_requests_proxy_config(proxy)
@@ -1146,6 +1449,10 @@ class EmailApiMailbox(BaseMailbox):
         candidates, errors = parse_email_api_lines(
             self.raw_lines,
             gmail_dot_variant_enabled=self.gmail_dot_variant_enabled,
+            gmail_variant_count=self.gmail_variant_count,
+            gmail_variant_rules=self.gmail_variant_rules,
+            gmail_plus_tag_template=self.gmail_plus_tag_template,
+            gmail_variant_random_seed=self.gmail_variant_random_seed,
             default_scheme=self.default_scheme,
         )
         if errors:
@@ -1349,6 +1656,9 @@ class EmailApiMailbox(BaseMailbox):
             "email_api_poll_interval_seconds": self.poll_interval_seconds,
             "email_api_request_timeout_seconds": self.request_timeout_seconds,
             "email_api_gmail_dot_variant_enabled": self.gmail_dot_variant_enabled,
+            "email_api_gmail_variant_count": self.gmail_variant_count,
+            "email_api_gmail_variant_rules": self.gmail_variant_rules,
+            "email_api_gmail_plus_tag_template": self.gmail_plus_tag_template,
             "email_api_default_scheme": self.default_scheme,
         }
 
@@ -1411,6 +1721,10 @@ def create_mailbox(
             poll_interval_seconds=extra.get("email_api_poll_interval_seconds", 3),
             request_timeout_seconds=extra.get("email_api_request_timeout_seconds", 15),
             gmail_dot_variant_enabled=extra.get("email_api_gmail_dot_variant_enabled", True),
+            gmail_variant_count=extra.get("email_api_gmail_variant_count", 2),
+            gmail_variant_rules=extra.get("email_api_gmail_variant_rules", "all"),
+            gmail_plus_tag_template=extra.get("email_api_gmail_plus_tag_template", DEFAULT_EMAIL_API_GMAIL_PLUS_TAG_TEMPLATE),
+            gmail_variant_random_seed=extra.get("email_api_gmail_variant_random_seed", ""),
             default_scheme=extra.get("email_api_default_scheme", "https"),
             pool_key=extra.get("email_api_pool_key") or extra.get("_current_task_id") or "",
             proxy=email_api_proxy,

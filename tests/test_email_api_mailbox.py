@@ -5,6 +5,7 @@ from core.base_mailbox import (
     EmailApiMailbox,
     MailboxAccount,
     build_gmail_dot_variant,
+    build_gmail_variants,
     normalize_email_api_url,
     parse_email_api_lines,
 )
@@ -50,18 +51,105 @@ class EmailApiMailboxTests(unittest.TestCase):
             ["333333", "222222"],
         )
 
-    def test_parse_gmail_line_expands_original_and_one_dot_variant(self):
+    def test_parse_gmail_line_expands_original_and_random_default_variant(self):
         candidates, errors = parse_email_api_lines(
-            "name@gmail.com----smsbower.page/api/mail/getCodeBySignature?s=abc"
+            "name@gmail.com----smsbower.page/api/mail/getCodeBySignature?s=abc",
+            gmail_variant_random_seed="unit",
         )
 
         self.assertEqual(errors, [])
         self.assertEqual(len(candidates), 2)
         self.assertEqual(candidates[0]["email"], "name@gmail.com")
         self.assertNotEqual(candidates[1]["email"], "name@gmail.com")
-        self.assertTrue(candidates[1]["email"].endswith("@gmail.com"))
+        self.assertRegex(candidates[1]["email"], r"@(gmail|googlemail)\.com$")
         self.assertEqual(candidates[0]["api_url"], candidates[1]["api_url"])
-        self.assertEqual(candidates[1]["variant"], "gmail_dot")
+        self.assertIn(
+            candidates[1]["variant"],
+            {"gmail_dot", "gmail_plus", "gmail_dot_plus", "googlemail", "googlemail_dot", "googlemail_plus", "googlemail_dot_plus"},
+        )
+
+    def test_parse_gmail_line_honors_total_identity_count_and_freezes_lock_root(self):
+        candidates, errors = parse_email_api_lines(
+            "abcdef@gmail.com----smsbower.page/api/mail/getCodeBySignature?s=abc",
+            gmail_variant_count=5,
+            gmail_variant_rules="all",
+            gmail_variant_random_seed="unit-count",
+        )
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(candidates), 5)
+        self.assertEqual(candidates[0]["email"], "abcdef@gmail.com")
+        self.assertEqual({item["gmail_root"] for item in candidates}, {"abcdef@gmail.com"})
+        self.assertEqual(len({item["email"] for item in candidates}), 5)
+        for item in candidates:
+            self.assertIn("gmail:abcdef@gmail.com", item["lock_keys"])
+
+    def test_parse_gmail_line_can_disable_variants(self):
+        candidates, errors = parse_email_api_lines(
+            "abcdef@gmail.com----api.example.com/code",
+            gmail_dot_variant_enabled=False,
+            gmail_variant_count=10,
+            gmail_variant_random_seed="unit-disabled",
+        )
+
+        self.assertEqual(errors, [])
+        self.assertEqual([item["email"] for item in candidates], ["abcdef@gmail.com"])
+
+    def test_build_gmail_variants_supports_dot_plus_and_googlemail_rules(self):
+        variants = build_gmail_variants(
+            "abcdef@gmail.com",
+            count=8,
+            rules="all",
+            random_seed="unit-rules",
+        )
+
+        emails = [item["email"] for item in variants]
+        self.assertEqual(emails[0], "abcdef@gmail.com")
+        self.assertEqual(len(emails), 8)
+        self.assertEqual(len(set(emails)), 8)
+        self.assertTrue(any("+r" in email for email in emails))
+        self.assertTrue(any(email.endswith("@googlemail.com") for email in emails))
+
+    def test_googlemail_and_gmail_same_root_are_deduped(self):
+        candidates, errors = parse_email_api_lines(
+            "\n".join(
+                [
+                    "abcdef@gmail.com----api.example.com/code",
+                    "abc.def@googlemail.com----https://api.example.com/code",
+                ]
+            ),
+            gmail_variant_count=3,
+            gmail_variant_random_seed="unit-root",
+        )
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(candidates), 3)
+        self.assertEqual({item["gmail_root"] for item in candidates}, {"abcdef@gmail.com"})
+
+    def test_prepare_register_request_freezes_generated_email_api_candidates(self):
+        from api.tasks import RegisterTaskRequest, _prepare_register_request
+
+        prepared = _prepare_register_request(
+            RegisterTaskRequest(
+                platform="chatgpt",
+                count=1,
+                concurrency=1,
+                extra={
+                    "mail_provider": "email_api",
+                    "email_api_lines": "abcdef@gmail.com----api.example.com/code",
+                    "email_api_gmail_variant_count": 5,
+                    "email_api_gmail_variant_rules": "all",
+                    "email_api_gmail_variant_random_seed": "unit-freeze",
+                },
+            )
+        )
+
+        frozen = prepared.extra.get("email_api_candidates")
+        self.assertIsInstance(frozen, list)
+        self.assertEqual(len(frozen), 5)
+        self.assertEqual(prepared.count, 5)
+        self.assertEqual(prepared.extra.get("email_api_candidate_count"), 5)
+        self.assertEqual(prepared.extra.get("email_api_gmail_variant_random_seed"), "unit-freeze")
 
     def test_parse_supports_typo_gamil_dot_com_and_long_delimiter(self):
         candidates, errors = parse_email_api_lines(

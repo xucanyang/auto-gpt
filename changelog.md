@@ -7,6 +7,20 @@
 ## [Unreleased] (未发布)
 
 
+## [1.3.21] - 2026-07-07
+### 新增 (Added)
+- **邮箱 API 支持 Gmail 多身份随机变体**：`core/base_mailbox.py` 将原先“Gmail 原邮箱 + 1 个 dot 变体”的固定展开升级为 `build_gmail_variants()` 规则生成器；每行 Gmail 现在可通过 `email_api_gmail_variant_count` 指定总身份数，语义为“原邮箱 + N-1 个随机变体”，默认规则 `all` 覆盖 Gmail dot、plus tag、dot+plus 混合以及 `googlemail.com` 域名等价形式。`parse_email_api_lines()` 会继续保留实际提交给 ChatGPT 的邮箱地址，同时把所有 Gmail / Googlemail / dot / plus 形式归一到同一个 `gmail_root` 用于锁定。
+- **新增 Gmail 变体配置项**：`api/config.py`、注册页、账号页注册弹窗与 Settings 同步暴露 `email_api_gmail_variant_count`、`email_api_gmail_variant_rules`、`email_api_gmail_plus_tag_template`；默认值分别为 `2`、`all`、`r{rand}`。旧开关 `email_api_gmail_dot_variant_enabled` 保留兼容，但 UI 语义调整为“启用 Gmail 随机变体”，关闭后即使配置了较大的身份数也只使用原邮箱。
+
+### 优化 (Changed)
+- **冻结每个注册任务的随机邮箱候选集**：`api/tasks.py` 在创建邮箱 API 注册任务时生成并保存 `email_api_candidates` 与 `email_api_gmail_variant_random_seed`，后续运行、重试、attempt cap 和邮箱池分配都复用同一批候选，避免随机变体在任务创建、运行和日志统计阶段反复重算导致数量或邮箱不一致。
+- **保持 Gmail/API 串行锁防串码**：多身份变体仍沿用 `api:<url>` 与 `gmail:<canonical_root>` 两类锁；`gmail.com`、`googlemail.com`、dot 变体、plus 变体和 dot+plus 变体都会落到同一个 canonical root，防止同一收件箱同时收到多个 OpenAI 验证码后串码。
+- **同步前端版本号至 v1.3.21**：`frontend/src/app/AppShell.tsx` 侧边栏版本展示更新为 `v1.3.21`，用于上线后确认 Gmail 多身份随机变体配置已加载。
+
+### 测试 (Tests)
+- **补充邮箱 API Gmail 变体回归测试**：`tests/test_email_api_mailbox.py` 新增默认随机规则、指定总身份数、关闭变体、plus/googlemail 覆盖、Gmail 与 Googlemail 同 root 去重，以及注册任务候选集冻结的断言，防止后续把多规则随机生成退回成单一 dot 变体或运行期重算。
+
+
 ## [1.3.20] - 2026-07-07
 ### 优化 (Changed)
 - **手机号绑定 Info 日志保留 18 行粒度但统一字段格式**：`services/chatgpt_core/task_logging.py` 重写手机绑定任务时间线 formatter，继续保留准备、代理、OAuth、邮箱验证码、短信发送/接收、确认绑定、补抓 Auth、保存账号、回写号码池和汇总等完整 Info 事件，但不再使用空格表格和混乱中英文字段；日志统一输出为 `[手机号绑定][账号 x/y][号码 x/y][步骤NN/12 阶段] 状态｜字段=值`，方便前端换行、复制和后续解析。
@@ -683,4 +697,8 @@
 
 ## 2026-07-07 05:22:31 +0800
 - 统一手机号绑定任务日志信息格式
+- 发布模式: multi
+
+## 2026-07-07 06:38:22 +0800
+- 支持邮箱 API Gmail 多身份随机变体
 - 发布模式: multi

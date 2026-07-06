@@ -101,6 +101,9 @@ export default function RegisterTaskPage() {
         email_api_poll_interval_seconds: cfg.email_api_poll_interval_seconds || 3,
         email_api_request_timeout_seconds: cfg.email_api_request_timeout_seconds || 15,
         email_api_gmail_dot_variant_enabled: cfg.email_api_gmail_dot_variant_enabled === '' ? true : parseBooleanConfigValue(cfg.email_api_gmail_dot_variant_enabled),
+        email_api_gmail_variant_count: Number(cfg.email_api_gmail_variant_count || 2) || 2,
+        email_api_gmail_variant_rules: cfg.email_api_gmail_variant_rules || 'all',
+        email_api_gmail_plus_tag_template: cfg.email_api_gmail_plus_tag_template || 'r{rand}',
         email_api_default_scheme: cfg.email_api_default_scheme || 'https',
         applemail_base_url: cfg.applemail_base_url || 'https://www.appleemail.top',
         applemail_pool_dir: cfg.applemail_pool_dir || 'mail',
@@ -243,6 +246,9 @@ export default function RegisterTaskPage() {
       email_api_poll_interval_seconds: values.email_api_poll_interval_seconds,
       email_api_request_timeout_seconds: values.email_api_request_timeout_seconds,
       email_api_gmail_dot_variant_enabled: values.email_api_gmail_dot_variant_enabled,
+      email_api_gmail_variant_count: values.email_api_gmail_variant_count,
+      email_api_gmail_variant_rules: values.email_api_gmail_variant_rules,
+      email_api_gmail_plus_tag_template: values.email_api_gmail_plus_tag_template,
       email_api_default_scheme: values.email_api_default_scheme,
       email_api_use_all_identities: values.mail_provider === 'email_api' ? true : undefined,
       applemail_base_url: values.applemail_base_url,
@@ -639,6 +645,9 @@ export default function RegisterTaskPage() {
         email_api_poll_interval_seconds: 3,
         email_api_request_timeout_seconds: 15,
         email_api_gmail_dot_variant_enabled: true,
+        email_api_gmail_variant_count: 2,
+        email_api_gmail_variant_rules: 'all',
+        email_api_gmail_plus_tag_template: 'r{rand}',
         email_api_default_scheme: 'https',
         applemail_base_url: 'https://www.appleemail.top',
         applemail_pool_dir: 'mail',
@@ -1043,7 +1052,8 @@ export default function RegisterTaskPage() {
                   <div>
                     <div>每行格式：邮箱----验证码 API。API 可以省略 http/https，后端默认补 https://。</div>
                     <div>API 返回 JSON，status 字段为验证码；status=0、空或非 4-8 位数字会继续等待。</div>
-                    <div>Gmail 每行会自动展开为原邮箱和一个点号变体，共用同一个 API，并按 Gmail/API 串行发码。</div>
+                    <div>Gmail 每行按“总身份数”展开：原邮箱 + N-1 个随机变体；默认规则包含 dot、plus、dot+plus 和 googlemail。</div>
+                    <div>同一个 Gmail 根邮箱仍共用同一个 API，并按 Gmail/API 串行发码，避免验证码串号。</div>
                   </div>
                 }
               />
@@ -1064,7 +1074,32 @@ export default function RegisterTaskPage() {
                 </Form.Item>
               </Space>
               <Form.Item name="email_api_gmail_dot_variant_enabled" valuePropName="checked">
-                <Checkbox>Gmail 自动生成第二个点号变体</Checkbox>
+                <Checkbox>启用 Gmail 随机变体</Checkbox>
+              </Form.Item>
+              <Space align="start" style={{ width: '100%' }}>
+                <Form.Item
+                  name="email_api_gmail_variant_count"
+                  label="每个 Gmail 总身份数"
+                  tooltip="包含原邮箱；例如 5 = 原邮箱 + 4 个随机变体。关闭 Gmail 随机变体时强制只用原邮箱。"
+                  style={{ flex: 1 }}
+                >
+                  <InputNumber min={1} max={500} precision={0} style={{ width: '100%' }} />
+                </Form.Item>
+                <Form.Item
+                  name="email_api_gmail_variant_rules"
+                  label="Gmail 变体规则"
+                  extra="默认 all；可填 dot,plus,dot_plus,googlemail 的逗号组合。"
+                  style={{ flex: 1 }}
+                >
+                  <Input placeholder="all" />
+                </Form.Item>
+              </Space>
+              <Form.Item
+                name="email_api_gmail_plus_tag_template"
+                label="Plus 标签模板"
+                extra="用于 plus / dot_plus / googlemail_plus，支持 {rand}、{index}、{base}；默认 r{rand}。"
+              >
+                <Input placeholder="r{rand}" />
               </Form.Item>
             </>
           )}

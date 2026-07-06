@@ -477,7 +477,7 @@ export function RegisterTaskModal({
                 showIcon
                 style={{ marginBottom: 16 }}
                 message="当前注册将使用邮箱验证码 API"
-                description="每行 email----api；API 返回 JSON，status 字段为验证码。status=0/空/非 4-8 位数字会继续等待。Gmail 每行会自动展开为原邮箱和一个 dot 变体，共用同一个 API。"
+                description="每行 email----api；API 返回 JSON，status 字段为验证码。Gmail 每行按“原邮箱 + N-1 个随机变体”展开，默认规则包含 dot、plus、dot+plus 和 googlemail，并按 Gmail/API 串行发码。"
               />
               <Form.Item
                 name="email_api_lines"
@@ -486,6 +486,29 @@ export function RegisterTaskModal({
                 extra="API 可省略协议，后端会自动补 https://。"
               >
                 <Input.TextArea rows={6} placeholder={'name@gmail.com----api.example.com/get?id=xxx\nuser@example.com----https://api.example.com/code?u=2'} style={{ fontFamily: 'monospace' }} />
+              </Form.Item>
+              <Form.Item name="email_api_gmail_dot_variant_enabled" valuePropName="checked">
+                <Checkbox>启用 Gmail 随机变体</Checkbox>
+              </Form.Item>
+              <Space align="start" style={{ width: '100%' }}>
+                <Form.Item name="email_api_gmail_variant_count" label="每个 Gmail 总身份数" style={{ flex: 1 }}>
+                  <InputNumber min={1} max={500} precision={0} style={{ width: '100%' }} />
+                </Form.Item>
+                <Form.Item
+                  name="email_api_gmail_variant_rules"
+                  label="Gmail 变体规则"
+                  extra="默认 all；可填 dot,plus,dot_plus,googlemail。"
+                  style={{ flex: 1 }}
+                >
+                  <Input placeholder="all" />
+                </Form.Item>
+              </Space>
+              <Form.Item
+                name="email_api_gmail_plus_tag_template"
+                label="Plus 标签模板"
+                extra="支持 {rand}、{index}、{base}；默认 r{rand}。"
+              >
+                <Input placeholder="r{rand}" />
               </Form.Item>
             </>
           ) : null}
