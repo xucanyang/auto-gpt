@@ -462,6 +462,9 @@ def test_batch_oaipay_upload_task_logging_saves_attempt_outcome(tmp_path, monkey
                 "runtime_success": 5,
                 "runtime_skipped": 2,
                 "runtime_errors": [],
+                "category_mode": "auto",
+                "fallback_category_id": 2,
+                "runtime_category_counts": {"#2 PLUS--已接美国长效 [自动]": 5},
             },
         },
     )
@@ -482,6 +485,8 @@ def test_batch_oaipay_upload_task_logging_saves_attempt_outcome(tmp_path, monkey
     assert saved_detail["attempt_outcome"] == "batch_oaipay_upload_success"
     assert saved_detail["source"] == "batch_oaipay_upload"
     assert saved_detail["meta"]["runtime_success"] == 5
+    assert saved_detail["meta"]["category_mode"] == "auto"
+    assert saved_detail["meta"]["runtime_category_counts"]["#2 PLUS--已接美国长效 [自动]"] == 5
 
 
 def test_enqueue_batch_oaipay_upload_task_empty(tmp_path, monkeypatch):

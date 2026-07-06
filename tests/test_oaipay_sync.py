@@ -4,6 +4,7 @@ from unittest import mock
 from core.db import AccountModel
 from services.oaipay_sync import backfill_chatgpt_account_to_oaipay, probe_chatgpt_oaipay_status
 from services.chatgpt_core.oaipay_upload import upload_to_oaipay_detailed
+from services.chatgpt_core import oaipay_upload as oaipay_upload_module
 
 
 class FakeOaiPayResponse:
@@ -17,6 +18,12 @@ class FakeOaiPayResponse:
 
 
 class OaiPaySyncTests(unittest.TestCase):
+    def setUp(self):
+        oaipay_upload_module._CATEGORIES_CACHE = {}
+        oaipay_upload_module._CATEGORIES_ID_TO_NAME_CACHE = {}
+        oaipay_upload_module._CATEGORIES_CACHE_TIME = 0
+        oaipay_upload_module._CATEGORIES_CACHE_KEY = ""
+
     def _make_account(self) -> AccountModel:
         account = AccountModel(
             platform="chatgpt",
@@ -70,6 +77,59 @@ class OaiPaySyncTests(unittest.TestCase):
         self.assertTrue(outcome["ok"])
         self.assertTrue(outcome["uploaded"])
         mock_upload.assert_called_once()
+
+    def test_upload_auto_category_records_resolved_category(self):
+        account = self._make_account()
+        categories_response = FakeOaiPayResponse(
+            200,
+            [
+                {"id": 1, "name": "PLUS--未接码"},
+                {"id": 2, "name": "PLUS--已接美国长效"},
+            ],
+        )
+        upload_response = FakeOaiPayResponse(200, {"success": True, "imported": 1, "category_id": 2, "group": "2"})
+        with mock.patch("services.chatgpt_core.oaipay_upload.cffi_requests.get", return_value=categories_response):
+            with mock.patch("services.chatgpt_core.oaipay_upload.cffi_requests.post", return_value=upload_response) as mock_post:
+                result = upload_to_oaipay_detailed(
+                    account,
+                    api_url="https://gpt.cccy.me",
+                    api_key="upload-key",
+                    capabilities={"has_refresh_token": True, "has_paid_subscription": True},
+                )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["category_source"], "auto")
+        self.assertEqual(result["category_rule"], "paid_with_refresh_token")
+        self.assertEqual(result["category_id"], 2)
+        self.assertEqual(result["category_name"], "PLUS--已接美国长效")
+        self.assertEqual(mock_post.call_args.kwargs["json"]["group"], "2")
+
+    def test_upload_manual_category_overrides_auto_category(self):
+        account = self._make_account()
+        categories_response = FakeOaiPayResponse(
+            200,
+            [
+                {"id": 1, "name": "PLUS--未接码"},
+                {"id": 2, "name": "PLUS--已接美国长效"},
+            ],
+        )
+        upload_response = FakeOaiPayResponse(200, {"success": True, "imported": 1, "category_id": 1, "group": "1"})
+        with mock.patch("services.chatgpt_core.oaipay_upload.cffi_requests.get", return_value=categories_response):
+            with mock.patch("services.chatgpt_core.oaipay_upload.cffi_requests.post", return_value=upload_response) as mock_post:
+                result = upload_to_oaipay_detailed(
+                    account,
+                    api_url="https://gpt.cccy.me",
+                    api_key="upload-key",
+                    group_ids=[1],
+                    category_mode="manual",
+                    capabilities={"has_refresh_token": True, "has_paid_subscription": True},
+                )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["category_source"], "manual")
+        self.assertEqual(result["category_id"], 1)
+        self.assertEqual(result["category_name"], "PLUS--未接码")
+        self.assertEqual(mock_post.call_args.kwargs["json"]["group"], "1")
 
     def test_upload_401_surfaces_server_detail(self):
         account = self._make_account()

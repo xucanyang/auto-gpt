@@ -1058,8 +1058,8 @@ function ConfigPanel({
               </Form.Item>
               <Form.Item
                 name="oaipay_category_id"
-                label="上传分组"
-                tooltip="启用上传后会自动读取 OAIPay 分组；留空时后端按账号状态自动分类，自动分类失败再使用全局默认分组。"
+                label="自动分类兜底分组"
+                tooltip="启用上传后默认按账号状态自动分类；这里仅在自动规则未命中或远端分类不存在时作为兜底，不会覆盖已命中的自动分类。"
               >
                 <Select
                   allowClear
@@ -1068,7 +1068,7 @@ function ConfigPanel({
                   loading={oaipayCategoryLoading}
                   options={oaipayCategoryOptions}
                   optionFilterProp="label"
-                  placeholder={oaipayCategoryLoading ? '正在获取分组...' : '选择分组；留空走自动分类'}
+                  placeholder={oaipayCategoryLoading ? '正在获取分组...' : '可选：自动分类未命中时使用'}
                   onOpenChange={(open) => {
                     if (open) void onLoadOaipayCategories()
                   }}

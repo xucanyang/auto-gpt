@@ -587,7 +587,14 @@ def _execute_platform_action(
         outcome = backfill_chatgpt_account_to_sub2api(acc_model, session=session, commit=False)
     if platform == "chatgpt" and action_id == "upload_oaipay":
         category_id = params.get("category_id")
-        outcome = backfill_chatgpt_account_to_oaipay(acc_model, session=session, commit=False, category_id=category_id)
+        outcome = backfill_chatgpt_account_to_oaipay(
+            acc_model,
+            session=session,
+            commit=False,
+            category_id=category_id,
+            category_mode=str(params.get("category_mode") or "auto"),
+            fallback_category_id=params.get("fallback_category_id"),
+        )
         result = {
             "ok": bool(outcome.get("ok")),
             "data": {

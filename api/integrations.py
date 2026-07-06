@@ -49,6 +49,8 @@ class BackfillRequest(BaseModel):
     sub2api_state: str = ""
     oaipay_state: str = ""
     category_id: Optional[int] = None
+    category_mode: str = "auto"
+    fallback_category_id: Optional[int] = None
 
 
 def _optional_bool(value: Any) -> bool | None:
@@ -1575,7 +1577,14 @@ def backfill_integrations(body: BackfillRequest):
                         outcome = backfill_chatgpt_account_to_sub2api(row, session=s, commit=True)
                         default_name = "Sub2API"
                     elif destination == "oaipay":
-                        outcome = backfill_chatgpt_account_to_oaipay(row, session=s, commit=True, category_id=body.category_id)
+                        outcome = backfill_chatgpt_account_to_oaipay(
+                            row,
+                            session=s,
+                            commit=True,
+                            category_id=body.category_id,
+                            category_mode=body.category_mode,
+                            fallback_category_id=body.fallback_category_id,
+                        )
                         default_name = "OAIPay"
                     else:
                         outcome = backfill_chatgpt_account_to_cpa(row, session=s, commit=True)

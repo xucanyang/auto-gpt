@@ -170,6 +170,8 @@ def _collect_probe_candidates(rows: list[dict[str, Any]], identity: dict[str, st
             "id": row.get("id"),
             "name": row.get("name") or "",
             "status": row.get("status") or "",
+            "category_id": row.get("category_id"),
+            "category_name": row.get("category_name") or row.get("category") or "",
             "matched_by": matched_by,
             "updated_at": row.get("updated_at") or "",
         }
@@ -319,6 +321,9 @@ def _build_exists_state(candidate: dict[str, Any]) -> dict[str, Any]:
         "uploaded": True,
         "remote_account_id": candidate.get("id"),
         "status": candidate.get("status") or "",
+        "category_id": candidate.get("category_id"),
+        "category_name": candidate.get("category_name") or "",
+        "category_source": "remote_probe",
         "matched_by": ", ".join(candidate.get("matched_by") or []),
         "message": f"远端已存在 OAIPay 账号 (#{candidate.get('id')})",
         "checked_at": _utcnow_iso(),
@@ -435,10 +440,36 @@ def _last_upload(status: str, action: str, message: str, *, started_at: str, fin
     return payload
 
 
-def _build_upload_failure_state(message: str, *, started_at: str, initial_sync: dict[str, Any] | None = None) -> dict[str, Any]:
+def _upload_category_fields(source: dict[str, Any] | None) -> dict[str, Any]:
+    source = dict(source or {})
+    keys = (
+        "category_mode",
+        "category_source",
+        "category_rule",
+        "category_id",
+        "category_name",
+        "requested_category_id",
+        "fallback_category_id",
+        "auto_group_name",
+        "resolved_group",
+        "remote_category_id",
+        "remote_group",
+    )
+    return {key: source.get(key) for key in keys if source.get(key) not in (None, "")}
+
+
+def _build_upload_failure_state(
+    message: str,
+    *,
+    started_at: str,
+    initial_sync: dict[str, Any] | None = None,
+    upload_result: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     initial_sync = dict(initial_sync or {})
+    category_fields = _upload_category_fields(upload_result) or _upload_category_fields(initial_sync)
     return {
         **initial_sync,
+        **category_fields,
         "remote_state": _safe_str(initial_sync.get("remote_state")) or "not_found",
         "uploaded": False,
         "message": message,
@@ -450,16 +481,19 @@ def _build_upload_failure_state(message: str, *, started_at: str, initial_sync: 
             message,
             started_at=started_at,
             probe_before=initial_sync.get("remote_state") or "",
+            **category_fields,
         ),
     }
 
 
 def _build_upload_success_state(result: dict[str, Any], *, started_at: str, initial_sync: dict[str, Any] | None = None) -> dict[str, Any]:
     initial_sync = dict(initial_sync or {})
+    category_fields = _upload_category_fields(result) or _upload_category_fields(initial_sync)
     message = _safe_str(result.get("message")) or "上传成功"
     remote_account_id = result.get("remote_account_id") or initial_sync.get("remote_account_id")
     remote_status = _safe_str(result.get("remote_status")) or _safe_str(initial_sync.get("status"))
     return {
+        **category_fields,
         "remote_state": "uploaded",
         "uploaded": True,
         "remote_account_id": remote_account_id,
@@ -477,6 +511,7 @@ def _build_upload_success_state(result: dict[str, Any], *, started_at: str, init
             remote_status=remote_status,
             probe_before=initial_sync.get("remote_state") or "",
             probe_after="uploaded",
+            **category_fields,
         ),
     }
 
@@ -494,6 +529,8 @@ def backfill_chatgpt_account_to_oaipay(
     session: Session | None = None,
     commit: bool = True,
     category_id: int | None = None,
+    category_mode: str = "auto",
+    fallback_category_id: int | None = None,
 ) -> dict[str, Any]:
     results: list[dict[str, Any]] = []
     started_at = _utcnow_iso()
@@ -528,7 +565,7 @@ def backfill_chatgpt_account_to_oaipay(
         }
         _persist_and_finish(account, sync_state, session, commit)
         results.append({"name": "OAIPay API 探测", "ok": True, "msg": msg})
-        return {"ok": True, "uploaded": False, "skipped": True, "message": msg, "results": results}
+        return {"ok": True, "uploaded": False, "skipped": True, "message": msg, "results": results, **_upload_category_fields(sync_state)}
 
     if _remote_ambiguous(initial_sync):
         msg = initial_sync.get("message") or "远端匹配到多条记录，已跳过上传"
@@ -538,7 +575,7 @@ def backfill_chatgpt_account_to_oaipay(
         }
         _persist_and_finish(account, sync_state, session, commit)
         results.append({"name": "OAIPay API 探测", "ok": False, "msg": msg})
-        return {"ok": False, "uploaded": False, "skipped": True, "message": msg, "results": results}
+        return {"ok": False, "uploaded": False, "skipped": True, "message": msg, "results": results, **_upload_category_fields(sync_state)}
 
     initial_remote_state = _safe_str(initial_sync.get("remote_state")).lower()
     if initial_remote_state in {"cross_workspace_only", "deleted_exact_match"}:
@@ -569,16 +606,30 @@ def backfill_chatgpt_account_to_oaipay(
         }
         _persist_and_finish(account, blocked_sync_state, session, commit)
         results.append({"name": "本地状态探测", "ok": False, "msg": msg})
-        return {"ok": False, "uploaded": False, "skipped": False, "message": msg, "results": results}
+        return {"ok": False, "uploaded": False, "skipped": False, "message": msg, "results": results, **_upload_category_fields(blocked_sync_state)}
 
+    mode = str(category_mode or "auto").strip().lower() or "auto"
+    if mode not in {"auto", "manual"}:
+        mode = "auto"
     group_ids = [int(category_id)] if category_id else None
-    upload_result = upload_to_oaipay_detailed(sync_account, group_ids=group_ids, capabilities=_capabilities)
+    fallback_group_ids = [int(fallback_category_id)] if fallback_category_id else None
+    if mode == "auto" and fallback_group_ids is None and category_id:
+        # Backward compatibility: historical callers passed category_id as the
+        # fallback group while automatic classification still took precedence.
+        fallback_group_ids = [int(category_id)]
+    upload_result = upload_to_oaipay_detailed(
+        sync_account,
+        group_ids=group_ids,
+        fallback_group_ids=fallback_group_ids,
+        category_mode=mode,
+        capabilities=_capabilities,
+    )
     ok = bool(upload_result.get("ok"))
     msg = _safe_str(upload_result.get("message")) or ("上传成功" if ok else "上传失败")
     upload_state = (
         _build_upload_success_state(upload_result, started_at=started_at, initial_sync=initial_sync)
         if ok
-        else _build_upload_failure_state(msg, started_at=started_at, initial_sync=initial_sync)
+        else _build_upload_failure_state(msg, started_at=started_at, initial_sync=initial_sync, upload_result=upload_result)
     )
     update_account_model_oaipay_sync(account, upload_state, session=session, commit=False)
     results.append({"name": "OAIPay 上传", "ok": ok, "msg": msg})
@@ -587,11 +638,11 @@ def backfill_chatgpt_account_to_oaipay(
         if session is not None and commit:
             session.commit()
             session.refresh(account)
-        return {"ok": False, "uploaded": False, "skipped": False, "message": msg, "results": results}
+        return {"ok": False, "uploaded": False, "skipped": False, "message": msg, "results": results, **_upload_category_fields(upload_state)}
 
     verify_msg = upload_state.get("message") or "上传成功"
     results.append({"name": "OAIPay 确认", "ok": True, "msg": f"以上传接口返回为准：{verify_msg}"})
     if session is not None and commit:
         session.commit()
         session.refresh(account)
-    return {"ok": True, "uploaded": True, "skipped": False, "message": verify_msg, "results": results}
+    return {"ok": True, "uploaded": True, "skipped": False, "message": verify_msg, "results": results, **_upload_category_fields(upload_state)}

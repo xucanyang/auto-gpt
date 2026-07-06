@@ -7,6 +7,21 @@
 ## [Unreleased] (未发布)
 
 
+## [1.3.16] - 2026-07-06
+### 新增 (Added)
+- **OAIPay 上传新增显式分类策略**：`api/tasks.py`、`services/oaipay_sync.py` 与 `services/chatgpt_core/oaipay_upload.py` 增加 `category_mode=auto/manual` 语义，默认保留自动分类，固定分类模式会跳过自动规则并强制使用用户所选 OAIPay 分类；旧请求继续兼容为“自动分类 + category_id 兜底”，避免历史调用语义突变。
+
+### 优化 (Changed)
+- **账号页 OAIPay 上传弹窗改为可解释的自动/固定分类选择**：`frontend/src/pages/Accounts.tsx` 将原来“选择分组，留空默认”的模糊下拉改为“自动分类（推荐）/固定分类”两种策略，明确 Plus+RT、Plus 无 RT、Free+RT 三条自动规则，并提供自动未命中时的兜底分类，避免操作者误以为系统随机上传。
+- **OAIPay 上传结果写回最终分类并在账号列表展示**：上传成功、失败或跳过时会把 `category_id/category_name/category_source/category_rule` 写入 `sync_statuses.oaipay` 与 `last_upload`；`api/accounts.py` 将这些字段纳入账号列表安全摘要，`frontend/src/pages/Accounts.tsx` 的“OAIPay上传”列直接显示最近一次最终分类和来源。
+- **OAIPay 批量任务日志逐账号展示分类去向**：`api/tasks.py` 的批量 OAIPay 上传日志现在会先输出分类策略，随后在每个账号的成功/失败/跳过行追加 `-> #分类ID 分类名 [来源]`，最终 summary 输出分类分布，方便直接从实时日志判断哪个账号上传到了哪个分类。
+- **账号处理流水线 OAIPay 分组文案收敛为兜底语义**：`frontend/src/pages/IdeaOaiPayPipeline.tsx` 将“上传分组”改为“自动分类兜底分组”，后端 `services/idea_oaipay_pipeline/engine.py` 也按自动分类 + 兜底参数调用 OAIPay 上传，和账号页语义保持一致。
+- **同步前端版本号至 v1.3.16**：`frontend/src/app/AppShell.tsx` 侧边栏版本展示更新为 `v1.3.16`，用于上线后确认 OAIPay 分类策略与日志展示修复已加载。
+
+### 测试 (Tests)
+- **补充 OAIPay 分类策略回归测试**：`tests/test_oaipay_sync.py` 覆盖自动分类解析、固定分类覆盖自动规则与远端返回分类字段透传；`tests/test_accounts_api_list_compact.py` 覆盖账号列表安全摘要中的 OAIPay 分类字段；`tests/test_chatgpt_task_logging.py` 覆盖批量上传任务 meta 中的分类策略和分类分布记录。
+
+
 ## [1.3.15] - 2026-07-06
 ### 优化 (Changed)
 - **Idea 批量提交改为等待上游终态再收口**：`api/tasks.py` 将 `baxigpt_cdk_submit` 的 5 分钟“轮询超时”改为 30 分钟未返回提醒，提醒只写日志并继续等待 `paid/failed` 终态；只有超过 24 小时安全上限仍无结果时才归入超时，避免 70 个账号这类批量任务在上游状态尚未全部返回时提前结束。
@@ -585,4 +600,8 @@
 
 ## 2026-07-06 17:43:25 +0800
 - 修复 Idea 提交轮询和结果日志展示
+- 发布模式: multi
+
+## 2026-07-06 18:53:22 +0800
+- OAIPay 上传分类策略与日志可观测性修复
 - 发布模式: multi

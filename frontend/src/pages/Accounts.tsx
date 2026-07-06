@@ -18,6 +18,7 @@ import {
   theme,
   Grid,
   Segmented,
+  Radio,
   Steps,
   Switch,
   Progress,
@@ -1894,9 +1895,12 @@ export default function Accounts() {
   const [oaipayCategories, setOaipayCategories] = useState<{id: number, name: string}[]>([])
   const [oaipayCategoryLoading, setOaipayCategoryLoading] = useState(false)
   const [oaipaySelectedCategory, setOaipaySelectedCategory] = useState<number | undefined>()
+  const [oaipayFallbackCategory, setOaipayFallbackCategory] = useState<number | undefined>()
+  const [oaipayCategoryMode, setOaipayCategoryMode] = useState<'auto' | 'manual'>('auto')
 
   const openOaipayUploadModal = async (scope: 'selected' | 'pending') => {
     setOaipayUploadScope(scope)
+    setOaipayCategoryMode('auto')
     setOaipayUploadModalOpen(true)
     setOaipayCategoryLoading(true)
     try {
@@ -4430,7 +4434,11 @@ export default function Accounts() {
     })
   }
 
-  const handleBackfill = async (destination: 'cliproxyapi' | 'sub2api' | 'oaipay', mode: 'pending' | 'selected', categoryId?: number) => {
+  const handleBackfill = async (
+    destination: 'cliproxyapi' | 'sub2api' | 'oaipay',
+    mode: 'pending' | 'selected',
+    oaipayOptions?: { categoryMode?: 'auto' | 'manual'; categoryId?: number; fallbackCategoryId?: number },
+  ) => {
     if (currentPlatform !== 'chatgpt') return
 
     const destinationLabel = destination === 'oaipay' ? 'OAIPay' : destination === 'sub2api' ? 'Sub2API' : 'CLIProxyAPI'
@@ -4448,8 +4456,14 @@ export default function Accounts() {
         const body: Record<string, unknown> = {
           params: {},
         }
-        if (!isSub2Api && categoryId !== undefined) {
-          body.category_id = categoryId
+        if (!isSub2Api) {
+          const categoryMode = oaipayOptions?.categoryMode || 'auto'
+          body.category_mode = categoryMode
+          if (categoryMode === 'manual') {
+            if (oaipayOptions?.categoryId !== undefined) body.category_id = oaipayOptions.categoryId
+          } else if (oaipayOptions?.fallbackCategoryId !== undefined) {
+            body.fallback_category_id = oaipayOptions.fallbackCategoryId
+          }
         }
 
         if (mode === 'selected') {
@@ -4512,8 +4526,8 @@ export default function Accounts() {
           platforms: ['chatgpt'],
           destination,
         }
-        if (categoryId) {
-          body.category_id = categoryId
+        if (oaipayOptions?.categoryId) {
+          body.category_id = oaipayOptions.categoryId
         }
 
         if (mode === 'selected') {
@@ -5274,6 +5288,24 @@ export default function Accounts() {
     const messageText = String(lastUpload.message || sync.message || sync.last_message || '').trim()
     const timeText = formatSyncTime(lastUpload.finished_at || lastUpload.attempted_at || sync.uploaded_at || sync.last_attempt_at || sync.checked_at)
     const source = String(sync.probe_source || '').trim().toUpperCase()
+    const categoryId = lastUpload.category_id || sync.category_id || lastUpload.remote_category_id || sync.remote_category_id
+    const categoryName = String(lastUpload.category_name || sync.category_name || '').trim()
+    const categorySource = String(lastUpload.category_source || sync.category_source || '').trim()
+    const categorySourceLabel = ({
+      auto: '自动',
+      manual: '固定',
+      fallback: '兜底',
+      global_default: '全局',
+      remote_probe: '远端',
+    } as Record<string, string>)[categorySource] || categorySource
+    const categoryText = categoryId && categoryName
+      ? `#${categoryId} ${categoryName}`
+      : categoryName || (categoryId ? `#${categoryId}` : '')
+    const categoryTooltip = [
+      categoryText ? `最终分类：${categoryText}` : '',
+      categorySourceLabel ? `来源：${categorySourceLabel}` : '',
+      lastUpload.category_rule || sync.category_rule ? `规则：${lastUpload.category_rule || sync.category_rule}` : '',
+    ].filter(Boolean).join('；')
     const meta = (() => {
       if (status === 'success') return { color: 'success', label: '成功' }
       if (status === 'failed') return { color: 'error', label: '失败' }
@@ -5289,15 +5321,21 @@ export default function Accounts() {
     }
 
     return (
-      <Space direction="vertical" size={2} style={{ maxWidth: 180 }}>
+      <Space direction="vertical" size={2} style={{ maxWidth: 220 }}>
         <Space size={5} wrap>
           <Tag color={meta.color} style={compactTagStyle}>{meta.label}</Tag>
           {remoteId ? <Typography.Text style={{ fontSize: 12 }}>#{String(remoteId)}</Typography.Text> : null}
           {source ? <Tag style={{ ...compactTagStyle, fontSize: 11 }}>{source}</Tag> : null}
+          {categoryText ? (
+            <Tag color="blue" style={{ ...compactTagStyle, fontSize: 11 }} title={categoryTooltip || categoryText}>
+              {categoryText}
+            </Tag>
+          ) : null}
+          {categorySourceLabel && categoryText ? <Tag style={{ ...compactTagStyle, fontSize: 11 }}>{categorySourceLabel}</Tag> : null}
         </Space>
         {timeText ? <Typography.Text type="secondary" style={{ fontSize: 12 }}>{timeText}</Typography.Text> : null}
         {messageText ? (
-          <Typography.Text type={status === 'failed' || status === 'blocked' ? 'danger' : 'secondary'} ellipsis={{ tooltip: messageText }} style={{ fontSize: 12, maxWidth: 180 }}>
+          <Typography.Text type={status === 'failed' || status === 'blocked' ? 'danger' : 'secondary'} ellipsis={{ tooltip: messageText }} style={{ fontSize: 12, maxWidth: 220 }}>
             {messageText}
           </Typography.Text>
         ) : null}
@@ -7991,22 +8029,80 @@ export default function Accounts() {
         title={oaipayUploadScope === 'selected' ? `确认上传所选 ${selectedRowKeys.length} 个账号到 OAIPay` : `确认上传待补传账号到 OAIPay`}
         open={oaipayUploadModalOpen}
         onOk={() => {
+          if (oaipayCategoryMode === 'manual' && !oaipaySelectedCategory) {
+            message.warning('固定分类模式下请选择 OAIPay 分类')
+            return
+          }
           setOaipayUploadModalOpen(false)
-          void handleBackfill('oaipay', oaipayUploadScope, oaipaySelectedCategory)
+          void handleBackfill('oaipay', oaipayUploadScope, {
+            categoryMode: oaipayCategoryMode,
+            categoryId: oaipayCategoryMode === 'manual' ? oaipaySelectedCategory : undefined,
+            fallbackCategoryId: oaipayCategoryMode === 'auto' ? oaipayFallbackCategory : undefined,
+          })
         }}
         onCancel={() => setOaipayUploadModalOpen(false)}
-        okText="确定上传"
+        okText="开始上传"
       >
-        <div style={{ marginBottom: 16 }}>请选择要上传到的 OAIPay 分组（可选，留空使用全局默认分组）：</div>
-        <Select
-          style={{ width: '100%' }}
-          allowClear
-          placeholder="选择分组"
-          loading={oaipayCategoryLoading}
-          value={oaipaySelectedCategory}
-          onChange={(val) => setOaipaySelectedCategory(val)}
-          options={oaipayCategories.map(c => ({ label: `${c.id} - ${c.name}`, value: c.id }))}
-        />
+        <Space direction="vertical" size={14} style={{ width: '100%' }}>
+          <Alert
+            type="info"
+            showIcon
+            message="默认使用自动分类"
+            description="系统会按账号当前状态选择 OAIPay 分类，并在任务日志里逐账号记录最终分类；不是随机上传。"
+          />
+          <Radio.Group
+            value={oaipayCategoryMode}
+            onChange={(event) => setOaipayCategoryMode(event.target.value)}
+            style={{ width: '100%' }}
+          >
+            <Space direction="vertical" size={10} style={{ width: '100%' }}>
+              <Radio value="auto">
+                <Space direction="vertical" size={2}>
+                  <Typography.Text strong>自动分类（推荐）</Typography.Text>
+                  <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                    Plus + RT → PLUS--已接美国长效；Plus + 无 RT → PLUS--未接码；Free + RT → FREE--已接码带RT。
+                  </Typography.Text>
+                </Space>
+              </Radio>
+              <Radio value="manual">
+                <Space direction="vertical" size={2}>
+                  <Typography.Text strong>固定分类</Typography.Text>
+                  <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                    所有账号都上传到所选分类，不再按账号状态自动分流。
+                  </Typography.Text>
+                </Space>
+              </Radio>
+            </Space>
+          </Radio.Group>
+          {oaipayCategoryMode === 'manual' ? (
+            <Select
+              style={{ width: '100%' }}
+              showSearch
+              allowClear
+              optionFilterProp="label"
+              placeholder={oaipayCategoryLoading ? '正在获取 OAIPay 分类...' : '选择固定上传分类'}
+              loading={oaipayCategoryLoading}
+              value={oaipaySelectedCategory}
+              onChange={(val) => setOaipaySelectedCategory(val)}
+              options={oaipayCategories.map(c => ({ label: `${c.id} - ${c.name}`, value: c.id }))}
+            />
+          ) : (
+            <Select
+              style={{ width: '100%' }}
+              showSearch
+              allowClear
+              optionFilterProp="label"
+              placeholder={oaipayCategoryLoading ? '正在获取 OAIPay 分类...' : '可选：自动分类未命中时使用的兜底分类'}
+              loading={oaipayCategoryLoading}
+              value={oaipayFallbackCategory}
+              onChange={(val) => setOaipayFallbackCategory(val)}
+              options={oaipayCategories.map(c => ({ label: `${c.id} - ${c.name}`, value: c.id }))}
+            />
+          )}
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            上传完成后，任务日志和账号列表的“OAIPay上传”列会显示每个账号最终进入的分类。
+          </Typography.Text>
+        </Space>
       </Modal>
 
     </div>

@@ -278,6 +278,8 @@ class BatchOaipayUploadTaskRequest(BaseModel):
     account_ids: list[int] = Field(default_factory=list)
     all_filtered: bool = False
     category_id: int | None = None
+    category_mode: str = "auto"  # auto | manual；兼容旧请求：auto 模式下 category_id 作为兜底分类
+    fallback_category_id: int | None = None
     email: str = ""
     status: str = ""
     manually_used: str | None = None
@@ -1546,6 +1548,51 @@ def _oaipay_upload_item(account: AccountModel) -> dict[str, Any]:
         "account_id": int(account.id or 0),
         "email": str(account.email or ""),
         "status": str(account.status or ""),
+    }
+
+
+def _normalize_oaipay_category_mode(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if text in {"manual", "fixed", "force", "forced", "指定", "固定", "固定分类"}:
+        return "manual"
+    return "auto"
+
+
+def _oaipay_category_label_from_result(payload: dict[str, Any] | None) -> str:
+    payload = payload if isinstance(payload, dict) else {}
+    category_id = payload.get("category_id") or payload.get("remote_category_id")
+    category_name = str(payload.get("category_name") or "").strip()
+    source = str(payload.get("category_source") or "").strip()
+    source_label = {
+        "auto": "自动",
+        "manual": "固定",
+        "fallback": "兜底",
+        "global_default": "全局默认",
+        "remote_probe": "远端",
+    }.get(source, source)
+    if category_id and category_name:
+        text = f"#{category_id} {category_name}"
+    elif category_name:
+        text = category_name
+    elif category_id:
+        text = f"#{category_id}"
+    else:
+        text = ""
+    if text and source_label:
+        return f"{text} [{source_label}]"
+    return text or (f"[{source_label}]" if source_label else "")
+
+
+def _oaipay_category_strategy_meta(req: BatchOaipayUploadTaskRequest) -> dict[str, Any]:
+    mode = _normalize_oaipay_category_mode(req.category_mode)
+    fallback_category_id = req.fallback_category_id
+    if mode == "auto" and fallback_category_id is None and req.category_id is not None:
+        fallback_category_id = req.category_id
+    return {
+        "category_mode": mode,
+        "category_id": int(req.category_id) if req.category_id is not None else None,
+        "fallback_category_id": int(fallback_category_id) if fallback_category_id is not None else None,
+        "category_label": "固定分类" if mode == "manual" else "自动分类",
     }
 
 
@@ -3707,6 +3754,7 @@ def enqueue_batch_oaipay_upload_task(
 ) -> dict[str, Any]:
     eligible_accounts, missing_ids, skipped_accounts, matched_accounts = _resolve_batch_oaipay_upload_accounts(req)
     total_requested = len(_normalize_batch_account_ids(req.account_ids)) if req.account_ids else len(matched_accounts)
+    category_meta = _oaipay_category_strategy_meta(req)
 
     if not eligible_accounts:
         task_id = f"task_{int(time.time() * 1000)}"
@@ -3726,6 +3774,7 @@ def enqueue_batch_oaipay_upload_task(
             },
             "params": dict(req.params or {}),
             "limit": int(req.limit or 0),
+            **category_meta,
             "skipped_items": list(skipped_accounts),
         }
         _create_standalone_task_record(
@@ -3775,6 +3824,7 @@ def enqueue_batch_oaipay_upload_task(
             "items": [],
             "skipped_items": skipped_accounts,
             "missing_ids": missing_ids,
+            **category_meta,
         }
 
     task_id = f"task_{int(time.time() * 1000)}"
@@ -3794,6 +3844,7 @@ def enqueue_batch_oaipay_upload_task(
         },
         "params": dict(req.params or {}),
         "limit": int(req.limit or 0),
+        **category_meta,
         "skipped_items": list(skipped_accounts),
     }
     _create_standalone_task_record(
@@ -3824,12 +3875,12 @@ def enqueue_batch_oaipay_upload_task(
     if background_tasks is None:
         thread = threading.Thread(
             target=_run_batch_oaipay_upload,
-            args=(task_id, account_ids, req.category_id),
+            args=(task_id, account_ids, req.category_id, category_meta["category_mode"], category_meta["fallback_category_id"]),
             daemon=True,
         )
         thread.start()
     else:
-        background_tasks.add_task(_run_batch_oaipay_upload, task_id, account_ids, req.category_id)
+        background_tasks.add_task(_run_batch_oaipay_upload, task_id, account_ids, req.category_id, category_meta["category_mode"], category_meta["fallback_category_id"])
 
     return {
         "task_id": task_id,
@@ -3841,6 +3892,7 @@ def enqueue_batch_oaipay_upload_task(
         "items": eligible_accounts,
         "skipped_items": skipped_accounts,
         "missing_ids": missing_ids,
+        **category_meta,
     }
 
 
@@ -6288,7 +6340,13 @@ def _run_batch_sub2api_upload(task_id: str, account_ids: list[int]):
         _task_store.cleanup()
 
 
-def _run_batch_oaipay_upload(task_id: str, account_ids: list[int], category_id: int | None = None):
+def _run_batch_oaipay_upload(
+    task_id: str,
+    account_ids: list[int],
+    category_id: int | None = None,
+    category_mode: str = "auto",
+    fallback_category_id: int | None = None,
+):
     from services.oaipay_sync import backfill_chatgpt_account_to_oaipay
 
     control = _task_store.control_for(task_id)
@@ -6296,6 +6354,7 @@ def _run_batch_oaipay_upload(task_id: str, account_ids: list[int], category_id: 
     success_count = 0
     skipped_count = 0
     errors: list[str] = []
+    category_success_counts: dict[str, int] = {}
     primary_email = ""
 
     _task_store.mark_running(task_id)
@@ -6304,6 +6363,18 @@ def _run_batch_oaipay_upload(task_id: str, account_ids: list[int], category_id: 
     meta = dict(_task_store.snapshot(task_id).get("meta") or {})
     skipped_items = list(meta.get("skipped_items") or [])
     missing_ids = list(meta.get("missing_ids") or [])
+    mode = _normalize_oaipay_category_mode(category_mode or meta.get("category_mode") or "auto")
+    if fallback_category_id is None and meta.get("fallback_category_id") is not None:
+        try:
+            fallback_category_id = int(meta.get("fallback_category_id"))
+        except Exception:
+            fallback_category_id = None
+
+    if mode == "manual":
+        _log(task_id, f"[OAIPay] 分类策略: 固定分类 #{category_id or '-'}；所有账号按该分类上传")
+    else:
+        fallback_label = f"#{fallback_category_id}" if fallback_category_id else "全局默认分组"
+        _log(task_id, f"[OAIPay] 分类策略: 自动分类；未命中自动规则时使用兜底 {fallback_label}")
 
     try:
         for missing_id in missing_ids:
@@ -6328,20 +6399,31 @@ def _run_batch_oaipay_upload(task_id: str, account_ids: list[int], category_id: 
                         primary_email = email
 
                     _log(task_id, f"[OAIPay] {index}/{total} 开始上传: {email or account_id}")
-                    outcome = backfill_chatgpt_account_to_oaipay(account, session=session, commit=True, category_id=category_id)
+                    outcome = backfill_chatgpt_account_to_oaipay(
+                        account,
+                        session=session,
+                        commit=True,
+                        category_id=category_id,
+                        category_mode=mode,
+                        fallback_category_id=fallback_category_id,
+                    )
                     ok = bool(outcome.get("ok"))
                     uploaded = bool(outcome.get("uploaded"))
                     skipped = bool(outcome.get("skipped"))
                     message_text = str(outcome.get("message") or "")
+                    category_label = _oaipay_category_label_from_result(outcome)
+                    category_suffix = f" -> {category_label}" if category_label else ""
                     if ok and uploaded:
                         success_count += 1
-                        _log(task_id, f"[OK] OAIPay 上传成功: {email or account_id} - {message_text or '上传成功'}")
+                        if category_label:
+                            category_success_counts[category_label] = category_success_counts.get(category_label, 0) + 1
+                        _log(task_id, f"[OK] OAIPay 上传成功: {email or account_id}{category_suffix} - {message_text or '上传成功'}")
                     elif ok and skipped:
                         skipped_count += 1
-                        _log(task_id, f"[SKIP] OAIPay 已存在/跳过: {email or account_id} - {message_text or '已跳过'}")
+                        _log(task_id, f"[SKIP] OAIPay 已存在/跳过: {email or account_id}{category_suffix} - {message_text or '已跳过'}")
                     else:
                         errors.append(f"{email or account_id}: {message_text or '上传失败'}")
-                        _log(task_id, f"[FAIL] OAIPay 上传失败: {email or account_id} - {message_text or '上传失败'}")
+                        _log(task_id, f"[FAIL] OAIPay 上传失败: {email or account_id}{category_suffix} - {message_text or '上传失败'}")
             except SkipCurrentAttemptRequested as exc:
                 skipped_count += 1
                 _log(task_id, f"[SKIP] 已跳过 OAIPay 上传: {email or account_id} - {exc}")
@@ -6356,7 +6438,10 @@ def _run_batch_oaipay_upload(task_id: str, account_ids: list[int], category_id: 
                 _task_store.set_progress(task_id, f"{index}/{total}")
 
         final_status = "done"
-        summary_message = f"批量 OAIPay 上传完成: 成功 {success_count} 个，跳过 {skipped_count + len(skipped_items)} 个，失败 {len(errors)} 个"
+        category_summary = ""
+        if category_success_counts:
+            category_summary = "；分类分布: " + "，".join(f"{label}={count}" for label, count in category_success_counts.items())
+        summary_message = f"批量 OAIPay 上传完成: 成功 {success_count} 个，跳过 {skipped_count + len(skipped_items)} 个，失败 {len(errors)} 个{category_summary}"
         _log(task_id, f"[SUMMARY] {summary_message}")
         log_status = "success" if not errors else "failed"
         _save_task_log(
@@ -6375,6 +6460,7 @@ def _run_batch_oaipay_upload(task_id: str, account_ids: list[int], category_id: 
                         "runtime_success": success_count,
                         "runtime_skipped": skipped_count,
                         "runtime_errors": errors,
+                        "runtime_category_counts": category_success_counts,
                     },
                 },
             ),
@@ -6405,6 +6491,7 @@ def _run_batch_oaipay_upload(task_id: str, account_ids: list[int], category_id: 
                         "runtime_success": success_count,
                         "runtime_skipped": skipped_count,
                         "runtime_errors": errors,
+                        "runtime_category_counts": category_success_counts,
                     },
                 },
             ),

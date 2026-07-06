@@ -359,85 +359,218 @@ def _format_oaipay_upload_error(response: Any, detail: Any) -> str:
     return f"{base}: {detail_text}" if detail_text else base
 
 
-_CATEGORIES_CACHE = {}
+_CATEGORIES_CACHE: dict[str, str] = {}
+_CATEGORIES_ID_TO_NAME_CACHE: dict[str, str] = {}
 _CATEGORIES_CACHE_TIME = 0
+_CATEGORIES_CACHE_KEY = ""
+
+
+def _load_oaipay_categories(api_url: str, api_key: str) -> tuple[dict[str, str], dict[str, str]]:
+    global _CATEGORIES_CACHE, _CATEGORIES_ID_TO_NAME_CACHE, _CATEGORIES_CACHE_TIME, _CATEGORIES_CACHE_KEY
+    now = time.time()
+    base_url = str(api_url or "").split("/api/")[0].rstrip("/")
+    cache_key = f"{base_url}|{api_key}"
+    if _CATEGORIES_CACHE and _CATEGORIES_CACHE_KEY == cache_key and now - _CATEGORIES_CACHE_TIME <= 60:
+        return _CATEGORIES_CACHE, _CATEGORIES_ID_TO_NAME_CACHE
+
+    if not base_url or not api_key:
+        return _CATEGORIES_CACHE, _CATEGORIES_ID_TO_NAME_CACHE
+
+    try:
+        for path in ("/api/admin/cdk/categories", "/api/auto-gpt/categories"):
+            try:
+                res = cffi_requests.get(
+                    f"{base_url}{path}",
+                    headers={"Authorization": api_key},
+                    timeout=10,
+                    verify=False,
+                    impersonate="chrome110",
+                )
+                if res.status_code != 200:
+                    continue
+                data = res.json()
+                cats = data if isinstance(data, list) else data.get("data") or data.get("categories") or []
+                if not isinstance(cats, list):
+                    continue
+
+                name_to_id: dict[str, str] = {}
+                id_to_name: dict[str, str] = {}
+                for c in cats:
+                    if not isinstance(c, dict):
+                        continue
+                    cname = str(c.get("name") or "").strip()
+                    cid = str(c.get("id") or c.get("category_id") or "").strip()
+                    if cname and cid:
+                        name_to_id[cname] = cid
+                        id_to_name[cid] = cname
+                _CATEGORIES_CACHE = name_to_id
+                _CATEGORIES_ID_TO_NAME_CACHE = id_to_name
+                _CATEGORIES_CACHE_TIME = now
+                _CATEGORIES_CACHE_KEY = cache_key
+                break
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return _CATEGORIES_CACHE, _CATEGORIES_ID_TO_NAME_CACHE
+
 
 def _resolve_category_id(api_url: str, api_key: str, name: str) -> str:
-    global _CATEGORIES_CACHE, _CATEGORIES_CACHE_TIME
-    import time
-    now = time.time()
-    if now - _CATEGORIES_CACHE_TIME > 60:
-        try:
-            base_url = api_url.split("/api/")[0].rstrip("/")
-            for path in ("/api/admin/cdk/categories", "/api/auto-gpt/categories"):
-                try:
-                    res = cffi_requests.get(f"{base_url}{path}", headers={"Authorization": api_key}, timeout=10, verify=False, impersonate="chrome110")
-                    if res.status_code == 200:
-                        data = res.json()
-                        cats = data if isinstance(data, list) else data.get("data") or data.get("categories") or []
-                        if isinstance(cats, list):
-                            new_cache = {}
-                            for c in cats:
-                                if isinstance(c, dict):
-                                    cname = str(c.get("name") or "").strip()
-                                    cid = str(c.get("id") or "").strip()
-                                    if cname and cid:
-                                        new_cache[cname] = cid
-                            _CATEGORIES_CACHE = new_cache
-                            _CATEGORIES_CACHE_TIME = now
-                            break
-                except Exception:
-                    pass
-        except Exception:
-            pass
-    return _CATEGORIES_CACHE.get(name, "")
+    name_to_id, _ = _load_oaipay_categories(api_url, api_key)
+    return name_to_id.get(name, "")
+
+
+def _resolve_category_name(api_url: str, api_key: str, category_id: Any) -> str:
+    _, id_to_name = _load_oaipay_categories(api_url, api_key)
+    return id_to_name.get(str(category_id or "").strip(), "")
+
+
+def _normalize_category_mode(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if text in {"manual", "fixed", "force", "forced", "指定", "固定", "固定分类"}:
+        return "manual"
+    return "auto"
+
+
+def _first_group_value(values: list[int] | list[str] | tuple[Any, ...] | None) -> str:
+    if not values:
+        return ""
+    for value in values:
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _category_id_value(value: Any) -> Any:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return int(text)
+    except ValueError:
+        return text
+
+
+def _build_auto_category_name(capabilities: dict[str, Any]) -> tuple[str, str]:
+    has_rt = bool(capabilities.get("has_refresh_token"))
+    has_paid = bool(capabilities.get("has_paid_subscription"))
+    if has_paid:
+        if has_rt:
+            return "PLUS--已接美国长效", "paid_with_refresh_token"
+        return "PLUS--未接码", "paid_without_refresh_token"
+    if has_rt:
+        return "FREE--已接码带RT", "free_with_refresh_token"
+    return "", ""
+
+
+def _build_category_decision(
+    *,
+    api_url: str,
+    api_key: str,
+    capabilities: dict[str, Any],
+    category_mode: Any = "auto",
+    group_ids: list[int] | None = None,
+    fallback_group_ids: list[int] | None = None,
+) -> dict[str, Any]:
+    mode = _normalize_category_mode(category_mode)
+    requested_group = _first_group_value(group_ids)
+    fallback_group = _first_group_value(fallback_group_ids) or (requested_group if mode == "auto" else "")
+    global_group = _get_config_value("oaipay_group")
+    decision: dict[str, Any] = {
+        "category_mode": mode,
+        "category_source": "",
+        "category_rule": "",
+        "category_id": None,
+        "category_name": "",
+        "requested_category_id": _category_id_value(requested_group),
+        "fallback_category_id": _category_id_value(fallback_group),
+        "auto_group_name": "",
+        "resolved_group": "",
+    }
+
+    def use_group(group: str, source: str, rule: str = "", name: str = "") -> dict[str, Any]:
+        group_text = str(group or "").strip()
+        category_name = name or _resolve_category_name(api_url, api_key, group_text) or ("" if group_text.isdigit() else group_text)
+        decision.update(
+            {
+                "category_source": source,
+                "category_rule": rule,
+                "category_id": _category_id_value(group_text),
+                "category_name": category_name,
+                "resolved_group": group_text,
+            }
+        )
+        return decision
+
+    if mode == "manual":
+        if requested_group:
+            return use_group(requested_group, "manual")
+        if fallback_group:
+            return use_group(fallback_group, "fallback")
+        return use_group(global_group, "global_default")
+
+    auto_group_name, auto_rule = _build_auto_category_name(capabilities)
+    decision["auto_group_name"] = auto_group_name
+    if auto_group_name:
+        resolved_id = _resolve_category_id(api_url, api_key, auto_group_name)
+        if resolved_id:
+            return use_group(resolved_id, "auto", auto_rule, auto_group_name)
+
+    if fallback_group:
+        return use_group(fallback_group, "fallback", "auto_unmatched")
+    return use_group(global_group, "global_default", "auto_unmatched")
+
+
+def _category_fields_from_decision(decision: dict[str, Any]) -> dict[str, Any]:
+    keys = (
+        "category_mode",
+        "category_source",
+        "category_rule",
+        "category_id",
+        "category_name",
+        "requested_category_id",
+        "fallback_category_id",
+        "auto_group_name",
+        "resolved_group",
+        "remote_category_id",
+        "remote_group",
+    )
+    return {key: decision.get(key) for key in keys if decision.get(key) not in (None, "")}
 
 def upload_to_oaipay_detailed(
     account,
     api_url: str | None = None,
     api_key: str | None = None,
     group_ids: list[int] | None = None,
+    category_mode: str = "auto",
+    fallback_group_ids: list[int] | None = None,
     capabilities: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """上传单个账号到 OAIPay 管理后台，返回结构化结果。"""
     api_url = str(api_url or _get_config_value("oaipay_api_url")).strip()
     api_key = str(api_key or _get_config_value("oaipay_api_key")).strip()
-    
+    if not api_url:
+        return {"ok": False, "message": "OAIPay API URL 未配置"}
+    if not api_key:
+        return {"ok": False, "message": "OAIPay API Key 未配置"}
+
     if capabilities is None:
         from services.chatgpt_account_state import classify_chatgpt_capabilities
         caps = classify_chatgpt_capabilities(account)
     else:
         caps = capabilities
 
-    has_rt = bool(caps.get("has_refresh_token"))
-    has_paid = bool(caps.get("has_paid_subscription"))
-
-    auto_group_name = ""
-    if has_paid:
-        if has_rt:
-            auto_group_name = "PLUS--已接美国长效"
-        else:
-            auto_group_name = "PLUS--未接码"
-    else:
-        if has_rt:
-            auto_group_name = "FREE--已接码带RT"
-
-    group = ""
-    if auto_group_name:
-        resolved_id = _resolve_category_id(api_url, api_key, auto_group_name)
-        if resolved_id:
-            group = resolved_id
-            
-    if not group:
-        if group_ids and len(group_ids) > 0:
-            group = str(group_ids[0])
-        else:
-            group = _get_config_value("oaipay_group")
-
-    if not api_url:
-        return {"ok": False, "message": "OAIPay API URL 未配置"}
-    if not api_key:
-        return {"ok": False, "message": "OAIPay API Key 未配置"}
+    category_decision = _build_category_decision(
+        api_url=api_url,
+        api_key=api_key,
+        capabilities=caps,
+        category_mode=category_mode,
+        group_ids=group_ids,
+        fallback_group_ids=fallback_group_ids,
+    )
+    group = str(category_decision.get("resolved_group") or "").strip()
+    category_fields = _category_fields_from_decision(category_decision)
 
     email = getattr(account, "email", "")
     password = getattr(account, "password", "")
@@ -522,6 +655,21 @@ def upload_to_oaipay_detailed(
         "api-key": api_key,
     }
 
+    def category_fields_with_remote(detail: Any) -> dict[str, Any]:
+        fields = dict(category_fields)
+        data = _extract_oaipay_response_data(detail)
+        remote_category_id = data.get("category_id") or data.get("categoryId")
+        remote_group = data.get("group") or data.get("category") or data.get("category_name")
+        if remote_category_id not in (None, ""):
+            fields["remote_category_id"] = _category_id_value(remote_category_id)
+            fields["category_id"] = _category_id_value(remote_category_id)
+            fields["category_name"] = fields.get("category_name") or _resolve_category_name(api_url, api_key, remote_category_id)
+        if remote_group not in (None, ""):
+            fields["remote_group"] = str(remote_group)
+            if not fields.get("category_name") and not str(remote_group).isdigit():
+                fields["category_name"] = str(remote_group)
+        return {key: value for key, value in fields.items() if value not in (None, "")}
+
     last_error = "未知错误"
     last_detail: Any = {}
     for url in candidate_urls:
@@ -554,12 +702,14 @@ def upload_to_oaipay_detailed(
             )
             if is_success:
                 imported = detail.get("imported", 1)
+                upload_category_fields = category_fields_with_remote(detail)
                 return {
                     "ok": True,
                     "message": f"上传成功，导入 {imported} 个账号",
                     "remote_account_id": None,
                     "remote_status": "uploaded",
                     "response": detail,
+                    **upload_category_fields,
                 }
 
             if response.status_code in (404, 405):
@@ -593,21 +743,33 @@ def upload_to_oaipay_detailed(
                 )
                 if is_succ2:
                     imported = detail2.get("imported", 1)
+                    upload_category_fields = category_fields_with_remote(detail2)
                     return {
                         "ok": True,
                         "message": f"上传成功，导入 {imported} 个账号",
                         "remote_account_id": None,
                         "remote_status": "uploaded",
                         "response": detail2,
+                        **upload_category_fields,
                     }
 
             error_msg = _format_oaipay_upload_error(response, detail)
-            return {"ok": False, "message": error_msg, "response": detail if isinstance(detail, dict) else {}}
+            return {
+                "ok": False,
+                "message": error_msg,
+                "response": detail if isinstance(detail, dict) else {},
+                **category_fields_with_remote(detail),
+            }
         except Exception as exc:
             logger.error("OAIPay 上传尝试失败 (%s): %s", url, exc)
             last_error = f"上传异常: {exc}"
 
-    return {"ok": False, "message": last_error, "response": last_detail if isinstance(last_detail, dict) else {}}
+    return {
+        "ok": False,
+        "message": last_error,
+        "response": last_detail if isinstance(last_detail, dict) else {},
+        **category_fields_with_remote(last_detail),
+    }
 
 
 def upload_to_oaipay(

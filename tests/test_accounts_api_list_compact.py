@@ -43,6 +43,21 @@ class AccountListCompactSerializationTests(unittest.TestCase):
                     },
                     "raw_response": "x" * 10_000,
                 },
+                "oaipay": {
+                    "remote_state": "uploaded",
+                    "uploaded": True,
+                    "category_id": 2,
+                    "category_name": "PLUS--已接美国长效",
+                    "category_source": "auto",
+                    "last_upload": {
+                        "status": "success",
+                        "message": "ok",
+                        "category_id": 2,
+                        "category_name": "PLUS--已接美国长效",
+                        "category_source": "auto",
+                        "raw_request": "x" * 10_000,
+                    },
+                },
             },
             "chatgpt_local": {
                 "auth": {"state": "access_token_valid", "message": "ok"},
@@ -120,6 +135,9 @@ class AccountListCompactSerializationTests(unittest.TestCase):
         self.assertEqual(payload["subscription_plan"], "plus")
         self.assertEqual(payload["subscription_active_until"], "2026-12-31T00:00:00Z")
         self.assertEqual(payload["sub2api_remote_state"], "exists")
+        self.assertEqual(payload["oaipaySync"]["category_id"], 2)
+        self.assertEqual(payload["oaipaySync"]["category_name"], "PLUS--已接美国长效")
+        self.assertEqual(payload["oaipaySync"]["last_upload"]["category_source"], "auto")
         self.assertEqual(payload["codex_state"], "ok")
         self.assertEqual(payload["workspace_variants"][0]["scope"], "k12")
         variant = payload["workspace_variants"][0]

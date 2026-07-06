@@ -896,7 +896,13 @@ class IdeaOaiPayPipelineEngine:
                     self.state_store.update_item(int(item.id or 0), oaipay_stage="failed", overall_status="failed", oaipay_message="账号不存在", last_error="账号不存在")
                     continue
                 try:
-                    outcome = backfill_chatgpt_account_to_oaipay(account, session=session, commit=True, category_id=config.oaipay.category_id)
+                    outcome = backfill_chatgpt_account_to_oaipay(
+                        account,
+                        session=session,
+                        commit=True,
+                        category_mode="auto",
+                        fallback_category_id=config.oaipay.category_id,
+                    )
                     sync_state = get_oaipay_sync_state(account)
                     remote_state = _lower(sync_state.get("remote_state")) or ("uploaded" if outcome.get("uploaded") else "")
                     ok = bool(outcome.get("ok"))
