@@ -196,6 +196,9 @@ export default function RegisterTaskPage() {
             : cfg.chatgpt_save_registration_access_token_account === undefined
               ? true
               : parseBooleanConfigValue(cfg.chatgpt_save_registration_access_token_account),
+        chatgpt_register_otp_wait_seconds: cfg.chatgpt_register_otp_wait_seconds || 120,
+        chatgpt_register_otp_resend_wait_seconds: cfg.chatgpt_register_otp_resend_wait_seconds || 90,
+        chatgpt_register_otp_account_budget_seconds: cfg.chatgpt_register_otp_account_budget_seconds || 210,
       })
     })
   }, [form])
@@ -335,6 +338,12 @@ export default function RegisterTaskPage() {
             ? true
             : Boolean(values.chatgpt_save_registration_access_token_account))
           : undefined,
+      chatgpt_register_otp_wait_seconds:
+        platform === 'chatgpt' ? values.chatgpt_register_otp_wait_seconds : undefined,
+      chatgpt_register_otp_resend_wait_seconds:
+        platform === 'chatgpt' ? values.chatgpt_register_otp_resend_wait_seconds : undefined,
+      chatgpt_register_otp_account_budget_seconds:
+        platform === 'chatgpt' ? values.chatgpt_register_otp_account_budget_seconds : undefined,
       chatgpt_access_token_only_checkout_amount_check_enabled:
         platform === 'chatgpt'
           ? Boolean(values.chatgpt_access_token_only_checkout_amount_check_enabled)
@@ -1057,6 +1066,34 @@ export default function RegisterTaskPage() {
               <Form.Item name="email_api_gmail_dot_variant_enabled" valuePropName="checked">
                 <Checkbox>Gmail 自动生成第二个点号变体</Checkbox>
               </Form.Item>
+            </>
+          )}
+          {platform === 'chatgpt' && !isPhoneSignup && (
+            <>
+              <Alert
+                type="info"
+                showIcon
+                style={{ marginBottom: 16 }}
+                message="单账号注册邮箱验证码等待"
+                description="这里只限制当前账号在邮箱验证码阶段的累计等待，不限制整批任务总耗时；首轮未收到后才会触发一次 email-otp/send 补发。"
+              />
+              <Space align="start" style={{ width: '100%' }}>
+                <Form.Item name="chatgpt_register_otp_wait_seconds" label="首轮等待秒" initialValue={120} style={{ flex: 1 }}>
+                  <InputNumber min={30} max={3600} precision={0} style={{ width: '100%' }} />
+                </Form.Item>
+                <Form.Item name="chatgpt_register_otp_resend_wait_seconds" label="补发后等待秒" initialValue={90} style={{ flex: 1 }}>
+                  <InputNumber min={30} max={3600} precision={0} style={{ width: '100%' }} />
+                </Form.Item>
+                <Form.Item
+                  name="chatgpt_register_otp_account_budget_seconds"
+                  label="单账号总预算秒"
+                  initialValue={210}
+                  tooltip="累计预算从当前账号第一次进入邮箱验证码等待开始计时；耗尽后直接放弃当前账号，不继续消耗整批任务时间。"
+                  style={{ flex: 1 }}
+                >
+                  <InputNumber min={30} max={7200} precision={0} style={{ width: '100%' }} />
+                </Form.Item>
+              </Space>
             </>
           )}
           {mailProvider === 'tempmail_local' && (

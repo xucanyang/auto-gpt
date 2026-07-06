@@ -79,6 +79,34 @@ class AccessTokenOnlyCheckoutTests(unittest.TestCase):
         self.assertTrue(result.success)
         self.assertEqual(self._TrackingChatGPTClient.last_register_kwargs["otp_wait_timeout"], 45)
         self.assertEqual(self._TrackingChatGPTClient.last_register_kwargs["otp_resend_wait_timeout"], 35)
+        self.assertEqual(self._TrackingChatGPTClient.last_register_kwargs["otp_account_budget_timeout"], 80)
+
+    def test_v2_registration_uses_single_account_otp_defaults(self):
+        email_service = mock.Mock()
+        email_service.create_email.return_value = {"email": "buyer@example.com"}
+        engine = AccessTokenOnlyRegistrationEngine(
+            email_service=email_service,
+            proxy_url="http://proxy.local:8080",
+            extra_config={},
+        )
+        self._TrackingChatGPTClient.last_register_kwargs = {}
+
+        with (
+            mock.patch.object(engine, "_probe_homepage_before_email_creation", return_value=(True, "")),
+            mock.patch.object(engine, "_report_homepage_probe"),
+            mock.patch.object(engine, "_probe_plus_checkout_billing", return_value={}),
+            mock.patch.object(engine, "_capture_k12_workspace_artifacts", return_value=(True, "")),
+            mock.patch(
+                "services.chatgpt_core.access_token_only_registration_engine.ChatGPTClient",
+                self._TrackingChatGPTClient,
+            ),
+        ):
+            result = engine.run()
+
+        self.assertTrue(result.success)
+        self.assertEqual(self._TrackingChatGPTClient.last_register_kwargs["otp_wait_timeout"], 120)
+        self.assertEqual(self._TrackingChatGPTClient.last_register_kwargs["otp_resend_wait_timeout"], 90)
+        self.assertEqual(self._TrackingChatGPTClient.last_register_kwargs["otp_account_budget_timeout"], 210)
 
     def test_already_paid_metadata_fails_registration_without_saving(self):
         email_service = mock.Mock()

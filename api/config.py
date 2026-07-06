@@ -183,6 +183,9 @@ CONFIG_KEYS = [
     "chatgpt_capture_free_workspace",
     "chatgpt_capture_business_workspace",
     "chatgpt_save_registration_access_token_account",
+    "chatgpt_register_otp_wait_seconds",
+    "chatgpt_register_otp_resend_wait_seconds",
+    "chatgpt_register_otp_account_budget_seconds",
     "chatgpt_k12_enabled",
     "chatgpt_k12_workspace_ids",
     "chatgpt_k12_save_all_spaces",
@@ -452,6 +455,12 @@ def _build_config_response(*, local_only: bool = False) -> dict[str, Any]:
         all_cfg["dynamic_proxy_max_attempts"] = "5"
     if "chatgpt_save_registration_access_token_account" not in all_cfg:
         all_cfg["chatgpt_save_registration_access_token_account"] = "true"
+    if not all_cfg.get("chatgpt_register_otp_wait_seconds"):
+        all_cfg["chatgpt_register_otp_wait_seconds"] = "120"
+    if not all_cfg.get("chatgpt_register_otp_resend_wait_seconds"):
+        all_cfg["chatgpt_register_otp_resend_wait_seconds"] = "90"
+    if not all_cfg.get("chatgpt_register_otp_account_budget_seconds"):
+        all_cfg["chatgpt_register_otp_account_budget_seconds"] = "210"
     if not all_cfg.get("email_api_poll_interval_seconds"):
         all_cfg["email_api_poll_interval_seconds"] = "3"
     if not all_cfg.get("email_api_request_timeout_seconds"):

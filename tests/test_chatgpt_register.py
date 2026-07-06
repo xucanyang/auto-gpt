@@ -1003,6 +1003,30 @@ class ChatGPTClientRegistrationOtpTests(unittest.TestCase):
         client.verify_email_otp.assert_called_once_with("654321", return_state=True)
         self.assertEqual(mailbox.wait_for_verification_code.call_count, 2)
 
+    def test_direct_email_verification_does_not_resend_after_single_account_budget_exhausted(self):
+        client = self._make_client_at_email_verification()
+        mailbox = mock.Mock()
+        mailbox.wait_for_verification_code.return_value = None
+        mailbox.is_otp_wait_budget_exhausted.return_value = True
+
+        success, message = client.register_complete_flow(
+            "user@example.com",
+            "Secret123!",
+            "Alice",
+            "Smith",
+            "1990-01-01",
+            mailbox,
+            otp_wait_timeout=30,
+            otp_resend_wait_timeout=30,
+            otp_account_budget_timeout=30,
+        )
+
+        self.assertFalse(success)
+        self.assertIn("单账号验证码等待超时", message)
+        client.send_email_otp.assert_not_called()
+        client.verify_email_otp.assert_not_called()
+        self.assertEqual(mailbox.wait_for_verification_code.call_count, 1)
+
 
 class OAuthClientPasswordlessTests(unittest.TestCase):
     def _make_client(self):

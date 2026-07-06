@@ -7,6 +7,23 @@
 ## [Unreleased] (未发布)
 
 
+## [1.3.17] - 2026-07-06
+### 新增 (Added)
+- **新增单账号注册邮箱验证码等待预算**：`services/chatgpt_core/otp_budget.py` 增加 `RegistrationOtpBudget`，`access_token_only_registration_engine.py` 与 `refresh_token_registration_engine.py` 在每个账号注册链路中创建独立预算，只累计当前账号进入邮箱验证码阶段后的等待时间，不限制整批任务总耗时；预算耗尽后会直接结束当前账号，避免内部 retry 把同一个邮箱的验证码等待反复放大。
+- **配置面板和注册弹窗暴露单账号 OTP 参数**：`api/config.py`、`frontend/src/pages/Settings.tsx`、`frontend/src/pages/RegisterTaskPage.tsx` 与 `frontend/src/features/auth/components/RegisterTaskModal.tsx` 新增 `chatgpt_register_otp_wait_seconds`、`chatgpt_register_otp_resend_wait_seconds`、`chatgpt_register_otp_account_budget_seconds` 三项配置，文案明确“单账号”语义，避免误解成批量任务总时长限制。
+
+### 优化 (Changed)
+- **注册验证码默认等待从保守长窗改为批量友好窗口**：ChatGPT 注册邮箱 OTP 默认首轮等待从 `600s` 调整为 `120s`，补发后等待从 `300s` 调整为 `90s`，默认单账号累计预算为 `210s`；已有显式配置继续优先，仍可手动改回更长等待窗口。
+- **验证码等待日志展示有效等待和预算余量**：`EmailServiceAdapter` 在预算压缩本轮等待时会输出 `requested` 与 `single_account_remaining`，`ChatGPTClient.register_complete_flow()` 的状态机参数同步展示 `otp_account_budget_timeout`，便于从任务日志直接判断当前账号为何提前结束。
+- **同步前端版本号至 v1.3.17**：`frontend/src/app/AppShell.tsx` 侧边栏版本展示更新为 `v1.3.17`，用于上线后确认单账号验证码预算配置已加载。
+
+### 修复 (Fixed)
+- **避免验证码预算耗尽后继续补发或整流程重试**：`services/chatgpt_core/chatgpt_client.py` 在首轮等待已耗尽预算时不再触发 `email-otp/send`，V2 注册外层在预算耗尽导致的验证码失败后不再进入同账号整流程重试，防止单账号等待时间超过配置语义。
+
+### 测试 (Tests)
+- **补充注册 OTP 单账号预算回归测试**：`tests/test_chatgpt_register.py` 覆盖预算耗尽时不触发补发，`tests/test_access_token_only_checkout.py` 覆盖默认 `120/90/210` 与显式配置透传，防止后续把单账号预算退化成整批任务限制或旧的 `600/300` 长等待。
+
+
 ## [1.3.16] - 2026-07-06
 ### 新增 (Added)
 - **OAIPay 上传新增显式分类策略**：`api/tasks.py`、`services/oaipay_sync.py` 与 `services/chatgpt_core/oaipay_upload.py` 增加 `category_mode=auto/manual` 语义，默认保留自动分类，固定分类模式会跳过自动规则并强制使用用户所选 OAIPay 分类；旧请求继续兼容为“自动分类 + category_id 兜底”，避免历史调用语义突变。
@@ -604,4 +621,8 @@
 
 ## 2026-07-06 18:53:22 +0800
 - OAIPay 上传分类策略与日志可观测性修复
+- 发布模式: multi
+
+## 2026-07-06 20:19:35 +0800
+- 单账号注册验证码等待预算
 - 发布模式: multi

@@ -165,7 +165,16 @@ const TAB_ITEMS = [
         desc: '选择注册时使用的邮箱类型',
         fields: [
           { key: 'mail_provider', label: '邮箱服务', type: 'select' },
-          { key: 'mailbox_otp_timeout_seconds', label: '邮箱验证码等待秒数', placeholder: '例如 60 / 90 / 120' },
+          { key: 'mailbox_otp_timeout_seconds', label: '通用邮箱验证码等待秒数（非 ChatGPT 注册）', placeholder: '例如 60 / 90 / 120' },
+        ],
+      },
+      {
+        title: 'ChatGPT 注册验证码等待',
+        desc: '只限制单账号在注册邮箱验证码阶段的等待预算，不限制整批任务总耗时。',
+        fields: [
+          { key: 'chatgpt_register_otp_wait_seconds', label: '单账号首轮等待秒数', placeholder: '120' },
+          { key: 'chatgpt_register_otp_resend_wait_seconds', label: '单账号补发后等待秒数', placeholder: '90' },
+          { key: 'chatgpt_register_otp_account_budget_seconds', label: '单账号验证码总预算秒数', placeholder: '210' },
         ],
       },
       {
@@ -818,7 +827,7 @@ function MailboxOverviewPanel({
           <Space size={6} wrap>
             <Tag color="blue">当前：{providerLabel}</Tag>
             {selectedProvider === 'hme_ready_api' ? <Tag color="green">Helper Ready</Tag> : null}
-            <Tag>OTP 等待 {otpTimeout} 秒</Tag>
+            <Tag>通用 OTP 等待 {otpTimeout} 秒</Tag>
             <Tag>配置面板 {configPanelCount}</Tag>
           </Space>
         </div>
@@ -3645,6 +3654,15 @@ export default function Settings() {
       if (!data.email_api_request_timeout_seconds) {
         data.email_api_request_timeout_seconds = '15'
       }
+      if (!data.chatgpt_register_otp_wait_seconds) {
+        data.chatgpt_register_otp_wait_seconds = '120'
+      }
+      if (!data.chatgpt_register_otp_resend_wait_seconds) {
+        data.chatgpt_register_otp_resend_wait_seconds = '90'
+      }
+      if (!data.chatgpt_register_otp_account_budget_seconds) {
+        data.chatgpt_register_otp_account_budget_seconds = '210'
+      }
       if (data.email_api_gmail_dot_variant_enabled === undefined || data.email_api_gmail_dot_variant_enabled === '') {
         data.email_api_gmail_dot_variant_enabled = true
       }
@@ -4003,6 +4021,24 @@ export default function Settings() {
       values.email_api_lines = String(values.email_api_lines || '').trim()
       values.email_api_poll_interval_seconds = String(values.email_api_poll_interval_seconds || '3').trim() || '3'
       values.email_api_request_timeout_seconds = String(values.email_api_request_timeout_seconds || '15').trim() || '15'
+      values.chatgpt_register_otp_wait_seconds = String(
+        Math.max(
+          30,
+          Math.min(3600, Number.parseInt(String(values.chatgpt_register_otp_wait_seconds || '120'), 10) || 120),
+        ),
+      )
+      values.chatgpt_register_otp_resend_wait_seconds = String(
+        Math.max(
+          30,
+          Math.min(3600, Number.parseInt(String(values.chatgpt_register_otp_resend_wait_seconds || '90'), 10) || 90),
+        ),
+      )
+      values.chatgpt_register_otp_account_budget_seconds = String(
+        Math.max(
+          30,
+          Math.min(7200, Number.parseInt(String(values.chatgpt_register_otp_account_budget_seconds || '210'), 10) || 210),
+        ),
+      )
       values.email_api_gmail_dot_variant_enabled = parseBooleanConfigValue(values.email_api_gmail_dot_variant_enabled)
       values.email_api_default_scheme = String(values.email_api_default_scheme || 'https').trim() || 'https'
       values.contribution_enabled = parseBooleanConfigValue(values.contribution_enabled)

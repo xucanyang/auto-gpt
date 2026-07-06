@@ -22,6 +22,7 @@ from core.task_runtime import SkipCurrentAttemptRequested, TaskInterruption
 from .chatgpt_client import ChatGPTClient
 from .oauth import OAuthManager
 from .oauth_client import OAuthClient
+from .otp_budget import RegistrationOtpBudget
 from .utils import (
     decode_jwt_payload,
     generate_random_birthday,
@@ -93,13 +94,20 @@ class SignupFormResult:
 class EmailServiceAdapter:
     """将现有 email_service 适配给 ChatGPTClient / OAuthClient 状态机。"""
 
-    def __init__(self, email_service, email: str, log_fn: Callable[[str], None]):
+    def __init__(
+        self,
+        email_service,
+        email: str,
+        log_fn: Callable[[str], None],
+        otp_budget: RegistrationOtpBudget | None = None,
+    ):
         self.email_service = email_service
         self.email = email
         self.log_fn = log_fn
         self._used_codes_by_phase: dict[str, set[str]] = {}
         self._used_message_ids_by_phase: dict[str, set[str]] = {}
         self._last_verification_result_by_phase: dict[str, dict[str, Any]] = {}
+        self._otp_budget = otp_budget
 
     def _log(self, message: str, level: str = "info") -> None:
         try:
@@ -112,6 +120,10 @@ class EmailServiceAdapter:
         if isinstance(meta, dict):
             return dict(meta)
         return {}
+
+    def is_otp_wait_budget_exhausted(self) -> bool:
+        budget = self._otp_budget
+        return bool(budget and budget.is_exhausted())
 
     def _mark_message_processed(self, message_id: str) -> None:
         marker = getattr(self.email_service, "mark_verification_message_processed", None)
@@ -145,8 +157,27 @@ class EmailServiceAdapter:
             for code in (exclude_codes or set())
             if str(code or "").strip()
         }
-        deadline = time.monotonic() + max(int(timeout or 0), 1)
-        self._log(f"[验证码] 等待邮箱验证码：{phase_title} timeout={timeout}s")
+        wait_plan = self._otp_budget.plan_wait(timeout) if self._otp_budget else None
+        if wait_plan and wait_plan.exhausted:
+            self._log(
+                f"[验证码] {phase_title} 已超过单账号验证码等待预算 "
+                f"budget={self._otp_budget.total_seconds}s，停止等待当前账号"
+            )
+            return None
+        try:
+            fallback_timeout = max(int(timeout or 0), 1)
+        except (TypeError, ValueError):
+            fallback_timeout = 1
+        effective_timeout = wait_plan.timeout_seconds if wait_plan else fallback_timeout
+        deadline = time.monotonic() + effective_timeout
+        if wait_plan and wait_plan.clamped:
+            self._log(
+                f"[验证码] 等待邮箱验证码：{phase_title} "
+                f"timeout={effective_timeout}s requested={wait_plan.requested_seconds}s "
+                f"single_account_remaining={wait_plan.remaining_seconds}s"
+            )
+        else:
+            self._log(f"[验证码] 等待邮箱验证码：{phase_title} timeout={effective_timeout}s")
 
         while time.monotonic() < deadline:
             remaining = max(1, int(deadline - time.monotonic()))
@@ -1877,16 +1908,33 @@ class RefreshTokenRegistrationEngine:
         register_otp_wait_seconds = self._read_int_config(
             "chatgpt_register_otp_wait_seconds",
             fallback_keys=("chatgpt_otp_wait_seconds",),
-            default=600,
+            default=120,
             minimum=30,
             maximum=3600,
         )
         register_otp_resend_wait_seconds = self._read_int_config(
             "chatgpt_register_otp_resend_wait_seconds",
             fallback_keys=("chatgpt_register_otp_wait_seconds", "chatgpt_otp_wait_seconds"),
-            default=300,
+            default=90,
             minimum=30,
             maximum=3600,
+        )
+        register_otp_account_budget_seconds = self._read_int_config(
+            "chatgpt_register_otp_account_budget_seconds",
+            fallback_keys=("chatgpt_register_otp_single_account_budget_seconds",),
+            default=register_otp_wait_seconds + register_otp_resend_wait_seconds,
+            minimum=30,
+            maximum=7200,
+        )
+        register_otp_budget = RegistrationOtpBudget(
+            register_otp_account_budget_seconds,
+            label="单账号注册邮箱验证码",
+        )
+        self._log(
+            "验证码等待策略: "
+            f"scope=single_account first_wait={register_otp_wait_seconds}s "
+            f"resend_wait={register_otp_resend_wait_seconds}s "
+            f"budget={register_otp_account_budget_seconds}s"
         )
         save_registration_access_token_account = self._is_registration_access_token_save_enabled()
         registration_access_token_artifact: Optional[dict[str, Any]] = None
@@ -1938,6 +1986,7 @@ class RefreshTokenRegistrationEngine:
                 self.email_service,
                 result.email,
                 self._log,
+                otp_budget=register_otp_budget,
             )
 
             register_client = self._prepared_register_client or self._build_chatgpt_client()
@@ -2038,6 +2087,7 @@ class RefreshTokenRegistrationEngine:
                 stop_before_about_you_submission=False,
                 otp_wait_timeout=register_otp_wait_seconds,
                 otp_resend_wait_timeout=register_otp_resend_wait_seconds,
+                otp_account_budget_timeout=register_otp_account_budget_seconds,
             )
 
             if not registered:

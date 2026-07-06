@@ -956,8 +956,9 @@ class ChatGPTClient:
         birthdate,
         skymail_client,
         stop_before_about_you_submission=False,
-        otp_wait_timeout=600,
-        otp_resend_wait_timeout=300,
+        otp_wait_timeout=120,
+        otp_resend_wait_timeout=90,
+        otp_account_budget_timeout=None,
     ):
         """
         完整的注册流程（基于原版 run_register 方法）
@@ -978,17 +979,18 @@ class ChatGPTClient:
         self._log(
             "注册状态机参数: "
             f"stop_before_about_you_submission={'on' if stop_before_about_you_submission else 'off'}, "
-            f"otp_wait_timeout={otp_wait_timeout}s, otp_resend_wait_timeout={otp_resend_wait_timeout}s"
+            f"otp_wait_timeout={otp_wait_timeout}s, otp_resend_wait_timeout={otp_resend_wait_timeout}s, "
+            f"otp_account_budget_timeout={otp_account_budget_timeout if otp_account_budget_timeout is not None else 'off'}"
         )
 
         try:
-            otp_wait_timeout = max(30, int(otp_wait_timeout or 600))
+            otp_wait_timeout = max(30, int(otp_wait_timeout or 120))
         except Exception:
-            otp_wait_timeout = 600
+            otp_wait_timeout = 120
         try:
-            otp_resend_wait_timeout = max(30, int(otp_resend_wait_timeout or 300))
+            otp_resend_wait_timeout = max(30, int(otp_resend_wait_timeout or 90))
         except Exception:
-            otp_resend_wait_timeout = 300
+            otp_resend_wait_timeout = 90
 
         max_auth_attempts = 3
         final_url = ""
@@ -1058,6 +1060,15 @@ class ChatGPTClient:
 
         otp_send_attempts = 0
 
+        def _otp_wait_budget_exhausted() -> bool:
+            checker = getattr(skymail_client, "is_otp_wait_budget_exhausted", None)
+            if not callable(checker):
+                return False
+            try:
+                return checker() is True
+            except Exception:
+                return False
+
         for _ in range(12):
             signature = self._state_signature(state)
             seen_states[signature] = seen_states.get(signature, 0) + 1
@@ -1103,6 +1114,8 @@ class ChatGPTClient:
                     phase_label="注册阶段邮箱验证码",
                 )
                 if not otp_code:
+                    if _otp_wait_budget_exhausted():
+                        return False, "单账号验证码等待超时"
                     self._log(
                         "首次等待未收到验证码，尝试触发/重发一次 email-otp/send "
                         f"后再等待 {otp_resend_wait_timeout}s"
@@ -1122,6 +1135,8 @@ class ChatGPTClient:
                         phase_label="注册阶段邮箱验证码",
                     )
                 if not otp_code:
+                    if _otp_wait_budget_exhausted():
+                        return False, "单账号验证码等待超时"
                     return False, "未收到验证码"
 
                 success, next_state = self.verify_email_otp(otp_code, return_state=True)

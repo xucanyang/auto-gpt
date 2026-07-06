@@ -267,7 +267,7 @@ export function RegisterTaskModal({
       open={open}
       onCancel={onClose}
       footer={null}
-      width={taskId && (isPhoneBindingTest || isPhoneSignupTask) ? 980 : taskId ? 760 : isPhoneSignup ? 620 : 500}
+      width={taskId && (isPhoneBindingTest || isPhoneSignupTask) ? 980 : taskId ? 760 : currentPlatform === 'chatgpt' ? 620 : 500}
       maskClosable={false}
     >
       {!taskId ? (
@@ -487,6 +487,34 @@ export function RegisterTaskModal({
               >
                 <Input.TextArea rows={6} placeholder={'name@gmail.com----api.example.com/get?id=xxx\nuser@example.com----https://api.example.com/code?u=2'} style={{ fontFamily: 'monospace' }} />
               </Form.Item>
+            </>
+          ) : null}
+          {currentPlatform === 'chatgpt' && !isPhoneSignup ? (
+            <>
+              <Alert
+                type="info"
+                showIcon
+                style={{ marginBottom: 16 }}
+                message="单账号注册邮箱验证码等待"
+                description="只限制当前账号在邮箱验证码阶段的累计等待，不限制整批任务总耗时；首轮未收到才触发一次 email-otp/send 补发。"
+              />
+              <Space align="start" style={{ width: '100%' }}>
+                <Form.Item name="chatgpt_register_otp_wait_seconds" label="首轮等待秒" initialValue={120} style={{ flex: 1 }}>
+                  <InputNumber min={30} max={3600} precision={0} style={{ width: '100%' }} />
+                </Form.Item>
+                <Form.Item name="chatgpt_register_otp_resend_wait_seconds" label="补发后等待秒" initialValue={90} style={{ flex: 1 }}>
+                  <InputNumber min={30} max={3600} precision={0} style={{ width: '100%' }} />
+                </Form.Item>
+                <Form.Item
+                  name="chatgpt_register_otp_account_budget_seconds"
+                  label="单账号总预算秒"
+                  initialValue={210}
+                  tooltip="累计预算从当前账号第一次进入邮箱验证码等待开始计时；耗尽后直接放弃当前账号。"
+                  style={{ flex: 1 }}
+                >
+                  <InputNumber min={30} max={7200} precision={0} style={{ width: '100%' }} />
+                </Form.Item>
+              </Space>
             </>
           ) : null}
           <Form.Item name="count" label="注册数量" initialValue={1} rules={[{ required: true }]}>

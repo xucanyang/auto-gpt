@@ -13,17 +13,23 @@ from core.task_runtime import TaskInterruption
 from services.chatgpt_core.refresh_token_registration_engine import RegistrationResult
 
 from .chatgpt_client import ChatGPTClient
+from .otp_budget import RegistrationOtpBudget
 from .utils import generate_random_name, generate_random_birthday
 
 logger = logging.getLogger(__name__)
 
 class EmailServiceAdapter:
     """\u5c06 V1 \u7684 email_service \u9002\u914d\u6210 V2 \u6240\u9700\u7684\u63a5\u7801\u63a5\u53e3\u3002"""
-    def __init__(self, email_service, email, log_fn):
+    def __init__(self, email_service, email, log_fn, otp_budget: RegistrationOtpBudget | None = None):
         self.es = email_service
         self.email = email
         self.log_fn = log_fn
         self._used_codes_by_phase: dict[str, set[str]] = {}
+        self._otp_budget = otp_budget
+
+    def is_otp_wait_budget_exhausted(self) -> bool:
+        budget = self._otp_budget
+        return bool(budget and budget.is_exhausted())
 
     def wait_for_verification_code(
         self,
@@ -37,11 +43,30 @@ class EmailServiceAdapter:
         phase_key = str(phase or "email_otp").strip() or "email_otp"
         phase_title = str(phase_label or phase_key).strip() or phase_key
         used_codes = self._used_codes_by_phase.setdefault(phase_key, set())
-        msg = f"[验证码] 等待邮箱验证码：{phase_title} timeout={timeout}s"
+        wait_plan = self._otp_budget.plan_wait(timeout) if self._otp_budget else None
+        if wait_plan and wait_plan.exhausted:
+            self.log_fn(
+                f"[验证码] {phase_title} 已超过单账号验证码等待预算 "
+                f"budget={self._otp_budget.total_seconds}s，停止等待当前账号"
+            )
+            return None
+        try:
+            fallback_timeout = max(int(timeout or 0), 1)
+        except (TypeError, ValueError):
+            fallback_timeout = 1
+        effective_timeout = wait_plan.timeout_seconds if wait_plan else fallback_timeout
+        if wait_plan and wait_plan.clamped:
+            msg = (
+                f"[验证码] 等待邮箱验证码：{phase_title} "
+                f"timeout={effective_timeout}s requested={wait_plan.requested_seconds}s "
+                f"single_account_remaining={wait_plan.remaining_seconds}s"
+            )
+        else:
+            msg = f"[验证码] 等待邮箱验证码：{phase_title} timeout={effective_timeout}s"
         self.log_fn(msg)
         try:
             code = self.es.get_verification_code(
-                timeout=timeout,
+                timeout=effective_timeout,
                 otp_sent_at=otp_sent_at,
                 exclude_codes=set(exclude_codes or set()) | set(used_codes),
                 phase=phase_key,
@@ -824,16 +849,33 @@ class AccessTokenOnlyRegistrationEngine:
         register_otp_wait_seconds = self._read_int_config(
             "chatgpt_register_otp_wait_seconds",
             fallback_keys=("chatgpt_otp_wait_seconds",),
-            default=600,
+            default=120,
             minimum=30,
             maximum=3600,
         )
         register_otp_resend_wait_seconds = self._read_int_config(
             "chatgpt_register_otp_resend_wait_seconds",
             fallback_keys=("chatgpt_register_otp_wait_seconds", "chatgpt_otp_wait_seconds"),
-            default=300,
+            default=90,
             minimum=30,
             maximum=3600,
+        )
+        register_otp_account_budget_seconds = self._read_int_config(
+            "chatgpt_register_otp_account_budget_seconds",
+            fallback_keys=("chatgpt_register_otp_single_account_budget_seconds",),
+            default=register_otp_wait_seconds + register_otp_resend_wait_seconds,
+            minimum=30,
+            maximum=7200,
+        )
+        register_otp_budget = RegistrationOtpBudget(
+            register_otp_account_budget_seconds,
+            label="单账号注册邮箱验证码",
+        )
+        self._log(
+            "验证码等待策略: "
+            f"scope=single_account first_wait={register_otp_wait_seconds}s "
+            f"resend_wait={register_otp_resend_wait_seconds}s "
+            f"budget={register_otp_account_budget_seconds}s"
         )
         try:
             last_error = ""
@@ -885,7 +927,12 @@ class AccessTokenOnlyRegistrationEngine:
                     self._log(f"注册信息: {first_name} {last_name}, 生日: {birthdate}")
 
                     # 使用包装器为底层客户端提供接码服务
-                    skymail_adapter = EmailServiceAdapter(self.email_service, email_addr, self._log)
+                    skymail_adapter = EmailServiceAdapter(
+                        self.email_service,
+                        email_addr,
+                        self._log,
+                        otp_budget=register_otp_budget,
+                    )
 
                     # 2. 初始化 V2 客户端
                     chatgpt_client = self._prepared_register_client or ChatGPTClient(
@@ -957,12 +1004,17 @@ class AccessTokenOnlyRegistrationEngine:
                             skymail_adapter,
                             otp_wait_timeout=register_otp_wait_seconds,
                             otp_resend_wait_timeout=register_otp_resend_wait_seconds,
+                            otp_account_budget_timeout=register_otp_account_budget_seconds,
                         )
 
                     if not existing_account_capture:
                         if not success:
                             last_error = f"注册流失败: {msg}"
-                            if attempt < self.max_retries - 1 and self._should_retry(msg):
+                            if (
+                                attempt < self.max_retries - 1
+                                and not skymail_adapter.is_otp_wait_budget_exhausted()
+                                and self._should_retry(msg)
+                            ):
                                 self._log(f"注册流失败，准备整流程重试: {msg}")
                                 continue
                             result.error_message = last_error
