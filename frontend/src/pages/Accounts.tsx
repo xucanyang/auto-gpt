@@ -6283,124 +6283,96 @@ export default function Accounts() {
       <div
         style={{
           flex: '0 0 auto',
-          marginBottom: isMobile ? 10 : 12,
-          padding: isMobile ? 10 : 12,
+          marginBottom: isMobile ? 8 : 12,
+          padding: isMobile ? 8 : '4px 8px',
           border: `1px solid ${token.colorBorderSecondary}`,
-          borderRadius: 12,
+          borderRadius: 8,
           background: token.colorBgContainer,
           boxShadow: token.boxShadowTertiary,
+          display: 'flex',
+          alignItems: 'center',
+          flexWrap: 'wrap',
+          gap: 12,
         }}
       >
-        <div
-          style={{
-            display: 'flex',
-            alignItems: isMobile ? 'stretch' : 'center',
-            justifyContent: 'space-between',
-            flexDirection: isMobile ? 'column' : 'row',
-            gap: 10,
-          }}
-        >
-          <Space size={8} wrap style={{ minWidth: 0 }}>
-            <Space size={6}>
-              <FilterOutlined style={{ color: token.colorPrimary }} />
-              <Text strong>筛选组合</Text>
+        <Space size={8} wrap style={{ minWidth: 0 }}>
+          <Space size={6}>
+            <FilterOutlined style={{ color: token.colorPrimary }} />
+            <Text strong style={{ fontSize: 13 }}>筛选组合</Text>
+          </Space>
+          <Select
+            allowClear
+            showSearch
+            size="small"
+            placeholder={filterPresetLoading ? '读取中...' : '选择后应用'}
+            loading={filterPresetLoading}
+            value={activeFilterPresetId || undefined}
+            style={{ width: isMobile ? '100%' : 180 }}
+            optionFilterProp="label"
+            options={filterPresets.map((preset) => ({
+              value: preset.id,
+              label: `${preset.name}${preset.built_in ? ' · 内置' : ''}`,
+            }))}
+            onChange={(presetId) => {
+              const preset = filterPresets.find((item) => item.id === presetId)
+              if (preset) applyFilterPreset(preset)
+              else setActiveFilterPresetId('')
+            }}
+          />
+          {pinnedFilterPresets.length > 0 && !isMobile ? (
+            <Space size={6} wrap>
+              <div style={{ width: 1, height: 16, background: token.colorBorderSecondary, margin: '0 4px' }} />
+              {pinnedFilterPresets.map((preset) => {
+                const active = preset.id === activeFilterPresetId
+                return (
+                  <Button
+                    key={preset.id}
+                    size="small"
+                    type={active ? 'primary' : 'default'}
+                    ghost={active}
+                    icon={preset.pinned && !preset.built_in ? <PushpinOutlined /> : undefined}
+                    onClick={() => applyFilterPreset(preset)}
+                  >
+                    {preset.name}
+                  </Button>
+                )
+              })}
             </Space>
-            <Select
-              allowClear
-              showSearch
-              size="small"
-              placeholder={filterPresetLoading ? '读取组合中...' : '选择后立即应用'}
-              loading={filterPresetLoading}
-              value={activeFilterPresetId || undefined}
-              style={{ width: isMobile ? '100%' : 240 }}
-              optionFilterProp="label"
-              options={filterPresets.map((preset) => ({
-                value: preset.id,
-                label: `${preset.name}${preset.built_in ? ' · 内置' : ''}`,
-              }))}
-              onChange={(presetId) => {
-                const preset = filterPresets.find((item) => item.id === presetId)
-                if (preset) applyFilterPreset(preset)
-                else setActiveFilterPresetId('')
-              }}
-            />
-            <Button size="small" icon={<SaveOutlined />} onClick={openCreateCurrentFilterPreset}>
-              保存当前筛选
-            </Button>
-            <Button size="small" icon={<SettingOutlined />} onClick={() => setFilterPresetManageOpen(true)}>
-              管理
-            </Button>
-          </Space>
-          <Space size={8} wrap>
-            <Text type="secondary" style={{ fontSize: 12 }}>
-              当前匹配 {total} 个
-            </Text>
-            <Button size="small" type="text" icon={<SyncOutlined spin={filterPresetLoading} />} onClick={() => void loadFilterPresets(false)}>
-              刷新组合
-            </Button>
-          </Space>
-        </div>
-
-        {pinnedFilterPresets.length > 0 ? (
-          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 10 }}>
-            {pinnedFilterPresets.map((preset) => {
-              const active = preset.id === activeFilterPresetId
-              return (
-                <Button
-                  key={preset.id}
-                  size="small"
-                  type={active ? 'primary' : 'default'}
-                  ghost={active}
-                  icon={preset.pinned && !preset.built_in ? <PushpinOutlined /> : undefined}
-                  onClick={() => applyFilterPreset(preset)}
-                >
-                  {preset.name}
-                </Button>
-              )
-            })}
-          </div>
-        ) : null}
-
-        {activeFilterPreset ? (
-          <div
-            style={{
-              display: 'flex',
-              flexWrap: 'wrap',
-              alignItems: 'center',
-              gap: 8,
-              marginTop: 10,
-              paddingTop: 10,
-              borderTop: `1px solid ${token.colorBorderSecondary}`,
+          ) : null}
+          <Dropdown
+            menu={{
+              items: [
+                { key: 'save', icon: <SaveOutlined />, label: '保存当前筛选', onClick: openCreateCurrentFilterPreset },
+                { key: 'manage', icon: <SettingOutlined />, label: '管理筛选组合', onClick: () => setFilterPresetManageOpen(true) },
+                { type: 'divider' },
+                { key: 'refresh', icon: <SyncOutlined spin={filterPresetLoading} />, label: '刷新组合', onClick: () => void loadFilterPresets(false) },
+              ]
             }}
           >
-            <Tag color={activeFilterPresetDirty ? 'warning' : 'processing'} style={{ marginInlineEnd: 0 }}>
-              当前组合：{activeFilterPreset.name}
-            </Tag>
-            {activeFilterPreset.built_in ? <Tag style={{ marginInlineEnd: 0 }}>内置</Tag> : null}
-            <Text type="secondary" style={{ flex: '1 1 260px', minWidth: 0, fontSize: 12 }}>
-              {activeSummary}
-            </Text>
-            {activeFilterPresetDirty ? (
-              <Space size={6} wrap>
-                {!activeFilterPreset.built_in ? (
-                  <Button size="small" loading={filterPresetSaving} onClick={() => void overwriteActiveFilterPreset()}>
-                    覆盖保存
-                  </Button>
-                ) : null}
-                <Button size="small" onClick={() => openCopyFilterPreset(activeFilterPreset)}>
-                  另存为
-                </Button>
-                <Button size="small" type="link" onClick={() => applyFilterPreset(activeFilterPreset)}>
-                  还原
-                </Button>
-              </Space>
-            ) : null}
-          </div>
-        ) : (
-          <Text type="secondary" style={{ display: 'block', marginTop: 8, fontSize: 12 }}>
-            当前条件：{currentSummary}
+            <Button size="small" type="text" icon={<SettingOutlined />} />
+          </Dropdown>
+        </Space>
+
+        <div style={{ flex: '1 1 auto', minWidth: 0, display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 8 }}>
+          <Text type="secondary" style={{ fontSize: 12 }} ellipsis={{ tooltip: activeFilterPreset ? activeSummary : currentSummary }}>
+            {activeFilterPreset ? `当前组合：${activeFilterPreset.name}${activeFilterPreset.built_in ? ' (内置)' : ''}` : `匹配 ${total} 个`}
           </Text>
-        )}
+          {activeFilterPreset && activeFilterPresetDirty ? (
+            <Space size={4}>
+              {!activeFilterPreset.built_in ? (
+                <Button size="small" type="link" style={{ padding: 0 }} loading={filterPresetSaving} onClick={() => void overwriteActiveFilterPreset()}>
+                  覆盖保存
+                </Button>
+              ) : null}
+              <Button size="small" type="link" style={{ padding: 0 }} onClick={() => openCopyFilterPreset(activeFilterPreset)}>
+                另存为
+              </Button>
+              <Button size="small" type="link" danger style={{ padding: 0 }} onClick={() => applyFilterPreset(activeFilterPreset)}>
+                还原
+              </Button>
+            </Space>
+          ) : null}
+        </div>
       </div>
     )
   }
