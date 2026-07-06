@@ -2425,6 +2425,21 @@ export default function Accounts() {
     }
   }, [handleAccountsPageSizeChange])
 
+  const clearFilterPreset = useCallback((options?: { silent?: boolean }) => {
+    setSearch('')
+    setDebouncedSearch('')
+    setColumnFilters(EMPTY_ACCOUNT_FILTERS)
+    setFilterStatus('')
+    setSubscriptionExpirySortOrder(null)
+    setCurrentPage(1)
+    setSelectedRowKeys([])
+    setSelectedAccountSnapshots({})
+    setActiveFilterPresetId('')
+    if (!options?.silent) {
+      message.success('已释放所有筛选条件')
+    }
+  }, [])
+
   const openCreateCurrentFilterPreset = useCallback(() => {
     setFilterPresetEditing(null)
     setFilterPresetEditorMode('create-current')
@@ -6316,7 +6331,7 @@ export default function Accounts() {
             onChange={(presetId) => {
               const preset = filterPresets.find((item) => item.id === presetId)
               if (preset) applyFilterPreset(preset)
-              else setActiveFilterPresetId('')
+              else clearFilterPreset()
             }}
           />
           {pinnedFilterPresets.length > 0 && !isMobile ? (
@@ -6331,7 +6346,10 @@ export default function Accounts() {
                     type={active ? 'primary' : 'default'}
                     ghost={active}
                     icon={preset.pinned && !preset.built_in ? <PushpinOutlined /> : undefined}
-                    onClick={() => applyFilterPreset(preset)}
+                    onClick={() => {
+                      if (active) clearFilterPreset()
+                      else applyFilterPreset(preset)
+                    }}
                   >
                     {preset.name}
                   </Button>
