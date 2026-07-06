@@ -4455,6 +4455,8 @@ def _set_task_current(
     email: str = "",
     account_id: int | str | None = None,
     phone: str = "",
+    phone_index: int | str | None = None,
+    phone_total: int | str | None = None,
     phase: str = "",
     phase_label: str = "",
     stage_index: int | None = None,
@@ -4499,6 +4501,8 @@ def _task_timeline_log(
     email: str = "",
     account_id: int | str | None = None,
     phone: str = "",
+    phone_index: int | str | None = None,
+    phone_total: int | str | None = None,
     phase: str = "",
     phase_label: str = "",
     stage_index: int | None = None,
@@ -4516,6 +4520,8 @@ def _task_timeline_log(
         email=email,
         account_id=account_id,
         phone=phone,
+        phone_index=phone_index,
+        phone_total=phone_total,
         stage_index=stage_index,
         stage_total=stage_total,
         phase_label=phase_label,
@@ -9625,6 +9631,8 @@ def _run_phone_binding_test(
             email=str(phone_log_context.get("email") or ""),
             account_id=phone_log_context.get("account_id") or None,
             phone=str(phone_log_context.get("phone") or ""),
+            phone_index=phone_log_context.get("phone_index") or None,
+            phone_total=phone_log_context.get("phone_total_label") or phone_log_context.get("phone_total") or None,
             stage_index=index,
             stage_total=PHONE_BINDING_STAGE_TOTAL,
             phase_label=label,
@@ -9666,10 +9674,10 @@ def _run_phone_binding_test(
         _log(
             task_id,
             (
-                "[手机号绑定] -------- "
-                f"账号 {account_position}/{account_total} | "
-                f"手机号 {phone_index}/{phone_total_label} | "
-                f"{phone} --------"
+                "[手机号绑定]"
+                f"[账号 {account_position}/{account_total}]"
+                f"[号码 {phone_index}/{phone_total_label}] "
+                f"开始｜手机号={phone}"
             ),
         )
 
@@ -9806,6 +9814,8 @@ def _run_phone_binding_test(
             email=email,
             account_id=account_id,
             phone=phone,
+            phone_index=phone_log_context.get("phone_index") or None,
+            phone_total=phone_log_context.get("phone_total_label") or phone_log_context.get("phone_total") or None,
             item_index=account_index if account_index > 0 else None,
             item_total=len(account_ids) if account_ids else None,
             phase=phase,
@@ -9851,7 +9861,7 @@ def _run_phone_binding_test(
             if expired and hasattr(pool_repo, "update_api_expired_date"):
                 pool_repo.update_api_expired_date(phone, expired)
         except Exception as exc:
-            _log(task_id, f"[号码池] 状态回写失败: {item.get('phone') or '-'} - {exc}")
+            _log(task_id, f"[手机号绑定][号码池] 回写失败｜手机号={item.get('phone') or '-'}｜原因={exc}")
 
     def result_for_phone(
         item: dict[str, Any],
@@ -10011,7 +10021,7 @@ def _run_phone_binding_test(
             return
         remaining = (last_account_attempt_finished_at + account_interval_seconds) - time.monotonic()
         if remaining > 0:
-            _log(task_id, f"[手机号绑定] 等待账号/号码间隔 {remaining:.0f}s，降低 OpenAI too many request 风险")
+            _log(task_id, f"[手机号绑定][等待] 账号/号码间隔｜剩余={remaining:.0f}s｜原因=降低 OpenAI too many request 风险")
         while remaining > 0:
             control.checkpoint(attempt_id=attempt_id)
             chunk = min(1.0, remaining)
@@ -10117,17 +10127,17 @@ def _run_phone_binding_test(
                     "error": str(exc or "Auth/RT 重试失败"),
                     "data": {"message": str(exc or "Auth/RT 重试失败")},
                 }
-                _log(task_id, f"[手机号绑定] Auth/RT 重试 {retry_index}/{len(auth_retry_delays_seconds)} 异常: {latest_result['error']}")
+                _log(task_id, f"[手机号绑定][补抓Auth] 重试异常｜次数={retry_index}/{len(auth_retry_delays_seconds)}｜原因={latest_result['error']}")
 
             if bool(latest_result.get("ok")):
-                _log(task_id, f"[手机号绑定] 手机绑定后 Auth/RT 重试成功: {email or getattr(account, 'id', '')} ({retry_index}/{len(auth_retry_delays_seconds)})")
+                _log(task_id, f"[手机号绑定][补抓Auth] 手机绑定后 Auth/RT 重试成功｜账号={email or getattr(account, 'id', '')}｜次数={retry_index}/{len(auth_retry_delays_seconds)}")
                 return latest_result, retry_count, True
 
         return latest_result, retry_count, False
 
     try:
         for parse_error in parse_errors:
-            _log(task_id, f"[手机号绑定] 解析跳过: line={parse_error.get('line')} {parse_error.get('reason') or ''}")
+            _log(task_id, f"[手机号绑定][解析] 跳过｜行={parse_error.get('line')}｜原因={parse_error.get('reason') or ''}")
 
         phone_pool_import_meta = meta.get("phone_pool_import") if isinstance(meta.get("phone_pool_import"), dict) else {}
         imported_count = int((phone_pool_import_meta or {}).get("imported") or 0)
@@ -10136,9 +10146,8 @@ def _run_phone_binding_test(
         if imported_count or existing_count or skipped_import_count:
             _log(
                 task_id,
-                "[手机号池] 粘贴号码已在启动任务前 upsert 到手机号池："
-                f"新增 {imported_count}，已存在/已更新 {existing_count}，跳过 {skipped_import_count}；"
-                "运行结果将继续回写绑定/探测/失败状态",
+                "[手机号绑定][手机号池] 导入完成"
+                f"｜新增={imported_count}｜更新={existing_count}｜跳过={skipped_import_count}｜结果回写=启用",
             )
 
         for missing_id in missing_ids:
@@ -10148,9 +10157,9 @@ def _run_phone_binding_test(
             account_results.append({"account_id": int(missing_id or 0), "email": "", "status": "account_missing", "reason": "账号不存在"})
 
         if reuse_phone_until_unusable:
-            _log(task_id, "[手机号绑定] 同号连续绑定已开启：同一个手机号会复用到 OpenAI 或收码接口判定不可继续使用")
+            _log(task_id, "[手机号绑定][配置] 同号连续绑定已开启｜规则=复用到 OpenAI 或收码接口判定不可继续使用")
         if prefix_sms_probe_only:
-            _log(task_id, "[手机号绑定] 短信探测模式已开启：只验证 OpenAI 发码和收码 API 收码，不提交验证码、不完成手机号绑定")
+            _log(task_id, "[手机号绑定][配置] 短信探测模式已开启｜验证=OpenAI发码+收码API收码｜提交验证码=否｜完成绑定=否")
         if prefix_sample_enabled:
             prefix_count = int((meta.get("prefix_sample") or {}).get("prefix_count") or 0)
             sample_filter_label = (
@@ -10164,8 +10173,8 @@ def _run_phone_binding_test(
             )
             _log(
                 task_id,
-                f"[号段抽样] 已开启：{sample_filter_label}，按手机号前 4 位分组，每个号段最多测试 {prefix_sample_size} 个号码，"
-                f"共选中 {prefix_count} 个号段 / {len(phone_items)} 个号码",
+                f"[手机号绑定][号段抽样] 已开启｜范围={sample_filter_label}｜分组=手机号前4位"
+                f"｜每号段最多={prefix_sample_size}｜选中号段={prefix_count}｜选中号码={len(phone_items)}",
             )
         if prefix_bind_enabled:
             prefix_bind_meta = meta.get("prefix_bind") if isinstance(meta.get("prefix_bind"), dict) else {}
@@ -10173,8 +10182,8 @@ def _run_phone_binding_test(
             phone_count = int((prefix_bind_meta or {}).get("available_phone_count") or 0)
             _log(
                 task_id,
-                f"[限定号段] 已开启：只从 {','.join(selected_prefixes) or '-'} 取号，"
-                f"可用号码 {phone_count} 个 / 可覆盖账号 {slot_count} 个，不使用其他号段兜底",
+                f"[手机号绑定][限定号段] 已开启｜号段={','.join(selected_prefixes) or '-'}"
+                f"｜可用号码={phone_count}｜可覆盖账号={slot_count}｜兜底其他号段=否",
             )
         phone_cursor = 0
         total_phones = len(phone_items)
@@ -10232,14 +10241,14 @@ def _run_phone_binding_test(
             dynamic_phone_attempts += 1
             item = pool_record_to_item(selected, dynamic_phone_attempts)
             if preferred and item.get("phone") == preferred:
-                _log(task_id, f"[手机号绑定] 同号连续绑定继续: {preferred}")
+                _log(task_id, f"[手机号绑定][号码复用] 同号连续绑定继续｜手机号={preferred}")
             return item, dynamic_phone_attempts, "动态"
 
         def next_manual_item() -> tuple[dict[str, Any], int, str] | None:
             nonlocal phone_cursor, dynamic_phone_attempts, preferred_phone_item
             if reuse_phone_until_unusable and preferred_phone_item is not None:
                 dynamic_phone_attempts += 1
-                _log(task_id, f"[手机号绑定] 同号连续绑定继续: {preferred_phone_item.get('phone') or '-'}")
+                _log(task_id, f"[手机号绑定][号码复用] 同号连续绑定继续｜手机号={preferred_phone_item.get('phone') or '-'}")
                 return dict(preferred_phone_item), dynamic_phone_attempts, "动态"
             while phone_cursor < total_phones:
                 item = phone_items[phone_cursor]
@@ -10247,7 +10256,7 @@ def _run_phone_binding_test(
                 phone_cursor += 1
                 phone = str(item.get("phone") or "").strip()
                 if phone and phone in terminal_phones_this_run:
-                    _log(task_id, f"[SKIP] 手机号 {phone_index}/{total} | {phone} 已在本轮判定不可继续使用，跳过重复 slot")
+                    _log(task_id, f"[手机号绑定][跳过] 重复号码｜号码={phone_index}/{total}｜手机号={phone}｜原因=已在本轮判定不可继续使用，跳过重复 slot")
                     _task_store.set_progress(task_id, f"{min(phone_cursor, total)}/{total}")
                     continue
                 return item, phone_index, str(total)
@@ -10283,6 +10292,7 @@ def _run_phone_binding_test(
                     phone=phone,
                     phone_index=phone_index,
                     phone_total=total_phones,
+                    phone_total_label=phone_total_label,
                     attempt=account_attempts,
                     stage_index=1,
                     stage_label="准备",
@@ -10722,7 +10732,7 @@ def _run_phone_binding_test(
                                 resource_touched=phone_was_touched(phone_service),
                                 reset_started_at=True,
                             )
-                            _log(task_id, "[手机号绑定] 当前手机号不可继续使用，账号将继续尝试下一个手机号")
+                            _log(task_id, "[手机号绑定][号码] 不可继续｜处理=账号将继续尝试下一个手机号")
                             sync_meta()
                             continue
 
@@ -10847,7 +10857,7 @@ def _run_phone_binding_test(
                             resource_touched=phone_was_touched(phone_service),
                             reset_started_at=True,
                         )
-                        _log(task_id, "[手机号绑定] 当前手机号不可继续使用，账号将继续尝试下一个手机号")
+                        _log(task_id, "[手机号绑定][号码] 不可继续｜处理=账号将继续尝试下一个手机号")
                         sync_meta()
                         continue
                     if should_keep_phone_for_next_account(status, phone_service):
@@ -10977,7 +10987,14 @@ def _run_phone_binding_test(
             f"OpenAI 手机号绑定完成：成功 {success_count}/{len(account_ids)}，"
             f"手机号问题 {phone_issue_count}，账号问题 {account_issue_count}，跳过 {skipped_count}"
         )
-        _log(task_id, f"[SUMMARY] {summary_message}")
+        _log(
+            task_id,
+            "[手机号绑定][汇总] 完成"
+            f"｜成功={success_count}/{len(account_ids)}"
+            f"｜手机号问题={phone_issue_count}"
+            f"｜账号问题={account_issue_count}"
+            f"｜跳过={skipped_count}",
+        )
         if runtime_results:
             phone_bucket_labels = {
                 "openai_rejected": "OpenAI 拒绝",
@@ -10990,12 +11007,12 @@ def _run_phone_binding_test(
                 "sms_probe_received": "已收码未提交",
             }
             phone_parts = [
-                f"{label}{int(runtime_status_counts.get(status, 0))}"
+                f"{label}={int(runtime_status_counts.get(status, 0))}"
                 for status, label in phone_bucket_labels.items()
                 if int(runtime_status_counts.get(status, 0))
             ]
             if phone_parts:
-                _log(task_id, f"[SUMMARY] 手机号结果：{'，'.join(phone_parts)}")
+                _log(task_id, f"[手机号绑定][汇总] 手机号结果｜{'｜'.join(phone_parts)}")
         if account_results:
             account_bucket_labels = {
                 "used_for_binding": "完成绑定",
@@ -11008,37 +11025,38 @@ def _run_phone_binding_test(
                 "not_tested": "未测试",
             }
             account_parts = [
-                f"{label}{int(account_status_counts.get(status, 0))}"
+                f"{label}={int(account_status_counts.get(status, 0))}"
                 for status, label in account_bucket_labels.items()
                 if int(account_status_counts.get(status, 0))
             ]
             if account_parts:
-                _log(task_id, f"[SUMMARY] 账号结果：{'，'.join(account_parts)}")
+                _log(task_id, f"[手机号绑定][汇总] 账号结果｜{'｜'.join(account_parts)}")
         if prefix_sample_enabled:
             prefix_summary = _build_phone_prefix_sample_summary(phone_items, runtime_results)
             _log(
                 task_id,
-                "[号段抽样] 汇总: "
-                f"可用 {prefix_summary['available_prefix_count']}，"
-                f"不可用 {prefix_summary['unavailable_prefix_count']}，"
-                f"部分可用 {prefix_summary['partial_prefix_count']}，"
-                f"未测试 {prefix_summary['untested_prefix_count']}",
+                "[手机号绑定][号段抽样] 汇总"
+                f"｜可用={prefix_summary['available_prefix_count']}"
+                f"｜不可用={prefix_summary['unavailable_prefix_count']}"
+                f"｜部分可用={prefix_summary['partial_prefix_count']}"
+                f"｜未测试={prefix_summary['untested_prefix_count']}",
             )
             for prefix_item in prefix_summary["items"]:
                 _log(
                     task_id,
-                    "[号段抽样] "
-                    f"{prefix_item['prefix']} | {prefix_item['status']} | "
-                    f"可用 {prefix_item['available_count']} / "
-                    f"不可用 {prefix_item['unavailable_count']} / "
-                    f"未测试 {prefix_item['untested_count']}",
+                    "[手机号绑定][号段抽样] 号段结果"
+                    f"｜号段={prefix_item['prefix']}"
+                    f"｜状态={prefix_item['status']}"
+                    f"｜可用={prefix_item['available_count']}"
+                    f"｜不可用={prefix_item['unavailable_count']}"
+                    f"｜未测试={prefix_item['untested_count']}",
                 )
             if prefix_summary["unavailable_prefixes"]:
-                _log(task_id, f"[号段抽样] 不可用号段: {','.join(prefix_summary['unavailable_prefixes'])}")
+                _log(task_id, f"[手机号绑定][号段抽样] 不可用号段｜号段={','.join(prefix_summary['unavailable_prefixes'])}")
         if runtime_results:
-            _log(task_id, f"[SUMMARY] 手机绑定结果表已生成：共 {len(runtime_results)} 条，成功绑定 {len(bound_phone_results)} 条")
+            _log(task_id, f"[手机号绑定][汇总] 结果表已生成｜总数={len(runtime_results)}｜成功绑定={len(bound_phone_results)}")
         else:
-            _log(task_id, "[SUMMARY] 本次没有产生可展示的手机绑定结果")
+            _log(task_id, "[手机号绑定][汇总] 结果表已生成｜总数=0｜成功绑定=0")
         sync_meta()
         log_status = "success" if success_count > 0 and not errors else "failed"
         attempt_outcome = "phone_binding_test_success" if log_status == "success" else "phone_binding_test_failed"

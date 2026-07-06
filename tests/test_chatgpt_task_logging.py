@@ -318,10 +318,10 @@ def test_format_phone_binding_timeline_log_is_plain_aligned_and_masks_phone_otp(
         stage_total=12,
         phase_label="邮箱验证",
     )
-    assert line.startswith("[步骤04/12 邮箱验证]")
+    assert line.startswith("[手机号绑定][步骤04/12 邮箱验证]")
     assert "[手机绑定]" not in line
     assert "已获取" in line
-    assert "验证码：[REDACTED_OTP]" in line
+    assert "验证码=[REDACTED_OTP]" in line
     assert "123456" not in line
     assert "+12269023179" not in line
     assert "+1226***3179" in line

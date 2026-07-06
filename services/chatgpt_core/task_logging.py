@@ -7,7 +7,6 @@ only prepares display/log/history copies and must stay dependency-free.
 from __future__ import annotations
 
 import re
-import unicodedata
 from typing import Any, Mapping
 from urllib.parse import urlsplit, urlunsplit
 
@@ -763,15 +762,6 @@ _PHONE_BINDING_DETAIL_KEYS = (
 )
 
 
-def _display_width(value: Any) -> int:
-    return sum(2 if unicodedata.east_asian_width(ch) in {"F", "W"} else 1 for ch in str(value or ""))
-
-
-def _pad_display(value: Any, width: int) -> str:
-    text = str(value or "")
-    return text + (" " * max(int(width or 0) - _display_width(text), 0))
-
-
 def _clean_phone_binding_body(value: Any) -> str:
     text = str(value or "").strip()
     while True:
@@ -781,23 +771,155 @@ def _clean_phone_binding_body(value: Any) -> str:
         text = cleaned.strip()
 
 
+_PHONE_BINDING_FIELD_LABELS = {
+    "account_id": "账号ID",
+    "accountid": "账号ID",
+    "账号id": "账号ID",
+    "手机号序号": "号码序号",
+    "source": "来源",
+    "country": "目标国家",
+    "actual": "实际国家",
+    "actual_country": "实际国家",
+    "actualcountry": "实际国家",
+    "exit_ip": "出口IP",
+    "exitip": "出口IP",
+    "provider": "供应商",
+    "sid": "SID",
+    "probe": "探测",
+    "proxy": "代理",
+    "timeout": "超时",
+    "otp": "验证码",
+    "otp_received": "收码",
+    "otpreceived": "收码",
+    "otp_length": "长度",
+    "otplength": "长度",
+}
+
+
+def _phone_binding_field_label(key: Any) -> str:
+    raw = str(key or "").strip()
+    compact = re.sub(r"[^a-z0-9\u4e00-\u9fff]", "", raw.lower())
+    return _PHONE_BINDING_FIELD_LABELS.get(raw) or _PHONE_BINDING_FIELD_LABELS.get(compact) or raw
+
+
+def _phone_binding_field_value(value: Any) -> str:
+    text = str(value or "").strip()
+    lowered = text.lower()
+    if lowered == "true":
+        return "是"
+    if lowered == "false":
+        return "否"
+    if lowered == "ok":
+        return "正常"
+    return text
+
+
+def _join_phone_binding_fields(items: list[tuple[str, Any]]) -> str:
+    chunks: list[str] = []
+    for key, value in items:
+        label = _phone_binding_field_label(key)
+        safe_value = _phone_binding_field_value(value)
+        if not label or safe_value == "":
+            continue
+        chunks.append(f"{label}={safe_value}")
+    return "｜".join(chunks)
+
+
+def _phone_binding_search(pattern: str, text: str, *, flags: int = re.I) -> str:
+    match = re.search(pattern, text, flags)
+    return str(match.group(1) or "").strip() if match else ""
+
+
+def _normalize_phone_binding_key_values(text: str) -> str:
+    normalized = str(text or "").strip()
+    if not normalized:
+        return ""
+
+    normalized = normalized.replace("|", "｜")
+    normalized = re.sub(r"\s+(?=(?:country|actual|exit_ip|provider|sid|probe|source|proxy|timeout|otp|otp_received|otp_length)\s*[:：=])", "｜", normalized, flags=re.I)
+    normalized = re.sub(r"\s*[，,；;]\s*", "｜", normalized)
+    chunks: list[str] = []
+    for raw_part in normalized.split("｜"):
+        part = raw_part.strip()
+        if not part:
+            continue
+        match = re.match(r"^([^:：=\s]{1,24})\s*[:：=]\s*(.+)$", part)
+        if not match:
+            chunks.append(part)
+            continue
+        key = _phone_binding_field_label(match.group(1))
+        value = _phone_binding_field_value(match.group(2))
+        chunks.append(f"{key}={value}")
+    return "｜".join(chunks)
+
+
 def _normalize_phone_binding_detail(value: Any) -> str:
     text = _clean_phone_binding_body(value)
     if not text:
         return ""
     text = re.sub(r"^使用账号[:：]\s*([^，,｜|]+)", r"邮箱：\1", text)
-    text = re.sub(r"([A-Za-z0-9_\u4e00-\u9fa5]+)\s*=\s*", r"\1：", text)
-    for raw_key, label in {
-        "source": "来源",
-        "proxy": "代理",
-        "timeout": "超时",
-    }.items():
-        text = re.sub(rf"\b{raw_key}：", f"{label}：", text, flags=re.I)
-    key_pattern = "|".join(re.escape(key) for key in _PHONE_BINDING_DETAIL_KEYS)
-    text = re.sub(rf"\s*[，,]\s*(?=(?:{key_pattern})[:：])", "｜", text)
-    text = re.sub(rf"\s+(?=(?:{key_pattern})[:：])", "｜", text)
-    text = re.sub(r"\s+", " ", text)
-    return text.strip(" ｜|，,；;")
+
+    if text.startswith("使用代理") or "使用代理" in text:
+        fields = [
+            ("序号", _phone_binding_search(r"使用代理\s*([0-9]+/[0-9]+)", text)),
+            ("来源", _phone_binding_search(r"(?:来源|source)\s*[:：=]\s*([^｜\s,，;；]+)", text)),
+            ("目标国家", _phone_binding_search(r"\bcountry\s*[:：=]\s*([^｜\s,，;；]+)", text)),
+            ("实际国家", _phone_binding_search(r"\bactual\s*[:：=]\s*([^｜\s,，;；]+)", text)),
+            ("出口IP", _phone_binding_search(r"\bexit_ip\s*[:：=]\s*([^｜\s,，;；]+)", text)),
+            ("供应商", _phone_binding_search(r"\bprovider\s*[:：=]\s*([^｜\s,，;；]+)", text)),
+            ("SID", _phone_binding_search(r"\bsid\s*[:：=]\s*([^｜\s,，;；]+)", text)),
+            ("探测", _phone_binding_search(r"\bprobe\s*[:：=]\s*([^｜\s,，;；]+)", text)),
+            ("代理", _phone_binding_search(r"(?:代理|proxy)\s*[:：=]\s*([^｜\s,，;；]+)", text)),
+        ]
+        return _join_phone_binding_fields(fields) or _normalize_phone_binding_key_values(text)
+
+    proxy_attempt = _phone_binding_search(r"代理\s*([0-9]+/[0-9]+)", text)
+    if text.startswith("开始 OAuth 登录") and proxy_attempt:
+        return _join_phone_binding_fields([("代理序号", proxy_attempt)])
+
+    if text.startswith("等待邮箱验证码"):
+        phase = _phone_binding_search(r"等待邮箱验证码\s*[:：]\s*([^｜]+)", text)
+        timeout = _phone_binding_search(r"(?:超时|timeout)\s*[:：=]\s*([^｜\s]+)", text)
+        return _join_phone_binding_fields([("验证码类型", phase), ("超时", timeout)])
+
+    if text.startswith("验证码已获取"):
+        phase = _phone_binding_search(r"验证码已获取\s*[:：]\s*(.+)$", text)
+        return _join_phone_binding_fields([("验证码类型", phase)])
+
+    if text.startswith("OpenAI 已接受手机号"):
+        return _join_phone_binding_fields([("OpenAI", "已接受手机号"), ("下一步", "等待短信验证码")])
+
+    if "收到验证码" in text:
+        phone = _phone_binding_search(r"(\+\d[\d*]+)\s*收到验证码", text)
+        otp = REDACTED_OTP if REDACTED_OTP in text else _phone_binding_search(r"\botp\s*[:：=]\s*([^｜\s,，;；]+)", text)
+        received = _phone_binding_search(r"\botp_received\s*[:：=]\s*([^｜\s,，;；]+)", text)
+        length = _phone_binding_search(r"\botp_length\s*[:：=]\s*([^｜\s,，;；]+)", text)
+        code_time = _phone_binding_search(r"时间\s*([^，,｜]+)", text)
+        handling = "已提取6位" if "已提取" in text else ""
+        return _join_phone_binding_fields([
+            ("手机号", phone),
+            ("验证码", otp),
+            ("收码", received),
+            ("长度", length),
+            ("短信时间", code_time),
+            ("处理", handling),
+        ])
+
+    if "手机号验证码" in text and ("通过" in text or "绑定完成" in text):
+        return _join_phone_binding_fields([("验证码", "已通过"), ("OpenAI", "已绑定")])
+
+    if "Auth/RT 获取成功" in text:
+        return _join_phone_binding_fields([("Auth", "已获取"), ("RT", "已获取")])
+
+    if text.startswith("已写入账号绑定状态"):
+        field = _phone_binding_search(r"已写入账号绑定状态\s+(.+)$", text)
+        return _join_phone_binding_fields([("字段", field)])
+
+    if text.startswith("已回写号码池"):
+        result = _phone_binding_search(r"已回写号码池\s*[:：]\s*(.+)$", text)
+        return _join_phone_binding_fields([("结果", result)])
+
+    return _normalize_phone_binding_key_values(text).strip(" ｜|，,；;")
 
 
 def _remove_phone_binding_status_field(value: str) -> str:
@@ -827,14 +949,14 @@ def _infer_phone_binding_status(value: Any) -> str:
         return "失败"
     if "未收到" in text or "无码" in text or "暂无验证码" in text:
         return "未收到"
-    if "等待" in text:
-        return "等待"
     if "验证码已获取" in text or "已获取" in text:
         return "已获取"
     if "收到验证码" in text or "已收到" in text:
         return "已收到"
     if "已发码" in text or "已接受手机号" in text or "已接受并发送验证码" in text or "已请求绑定手机号短信验证码" in text:
         return "已发码"
+    if "等待" in text:
+        return "等待"
     if "准备提交" in text or "已提交" in text:
         return "已提交"
     if "已选择" in text or "使用代理" in text:
@@ -868,11 +990,9 @@ def _format_phone_binding_timeline_body(message: str, *, stage_tag: str) -> str:
         _normalize_phone_binding_detail(_remove_phone_binding_status_field(body)),
         status,
     )
-    step_column = _pad_display(stage_tag, 24)
-    status_column = _pad_display(status, 10)
     if detail:
-        return f"{step_column}  {status_column}  {detail}"
-    return f"{step_column}  {status}".rstrip()
+        return f"{stage_tag} {status}｜{detail}"
+    return f"{stage_tag} {status}".rstrip()
 
 
 def format_task_timeline_log(
@@ -884,6 +1004,8 @@ def format_task_timeline_log(
     email: str = "",
     account_id: int | str | None = None,
     phone: str = "",
+    phone_index: int | str | None = None,
+    phone_total: int | str | None = None,
     stage_index: int | None = None,
     stage_total: int | None = None,
     phase_label: str = "",
@@ -914,6 +1036,13 @@ def format_task_timeline_log(
     if phone_binding_task:
         normalized_stage_index = int(stage_index or 0)
         normalized_stage_total = int(stage_total or 0)
+        tags.append("手机号绑定")
+        if normalized_index > 0 and normalized_total > 0:
+            tags.append(f"账号 {normalized_index}/{normalized_total}")
+        phone_index_text = str(phone_index or "").strip()
+        phone_total_text = str(phone_total or "").strip()
+        if phone_index_text and phone_total_text:
+            tags.append(f"号码 {phone_index_text}/{phone_total_text}")
         normalized_phase_label = redact_log_text(
             phase_label,
             expose_phone=expose_phone,
@@ -930,7 +1059,7 @@ def format_task_timeline_log(
             expose_phone=expose_phone,
             expose_otp=expose_otp,
         ).strip()
-        stage_tag = f"[{tags[-1]}]" if tags else ""
+        stage_tag = "".join(f"[{tag}]" for tag in tags)
         if stage_tag:
             return _format_phone_binding_timeline_body(body, stage_tag=stage_tag)
         return body

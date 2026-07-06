@@ -7,6 +7,17 @@
 ## [Unreleased] (未发布)
 
 
+## [1.3.20] - 2026-07-07
+### 优化 (Changed)
+- **手机号绑定 Info 日志保留 18 行粒度但统一字段格式**：`services/chatgpt_core/task_logging.py` 重写手机绑定任务时间线 formatter，继续保留准备、代理、OAuth、邮箱验证码、短信发送/接收、确认绑定、补抓 Auth、保存账号、回写号码池和汇总等完整 Info 事件，但不再使用空格表格和混乱中英文字段；日志统一输出为 `[手机号绑定][账号 x/y][号码 x/y][步骤NN/12 阶段] 状态｜字段=值`，方便前端换行、复制和后续解析。
+- **手机号绑定周边事件改为同一日志语法**：`api/tasks.py` 将手机号池导入、同号复用、短信探测、号段抽样、限定号段、重复号码跳过、Auth/RT 重试、号码池回写失败和结果汇总等非步骤日志统一改成 `[手机号绑定][分类] 事件｜字段=值` 格式，保留原有关键短语以兼容历史排障与测试断言。
+- **手机号绑定详情字段语义化**：代理日志中的 `country/actual/exit_ip/provider/sid/probe` 会规范成 `目标国家/实际国家/出口IP/供应商/SID/探测`，接码日志中的 `otp_received/otp_length` 会规范成 `收码/长度`，验证码、手机号和代理凭据继续沿用统一脱敏规则。
+- **同步前端版本号至 v1.3.20**：`frontend/src/app/AppShell.tsx` 侧边栏版本展示更新为 `v1.3.20`，用于上线后确认手机号绑定日志格式重构已加载。
+
+### 测试 (Tests)
+- **更新手机号绑定日志格式回归测试**：`tests/test_chatgpt_task_logging.py` 与手机号绑定相关任务流测试同步断言新的 `[手机号绑定][步骤] 状态｜字段=值` 格式，并覆盖同号复用、短信探测、Auth/RT 重试、重复号码跳过和结果表汇总等兼容短语。
+
+
 ## [1.3.19] - 2026-07-07
 ### 优化 (Changed)
 - **注册 / 手机号注册任务日志按 Info 与 Debug 重新分层**：`services/chatgpt_core/task_logging.py` 新增统一的 `classify_task_log_level()` 分类器，`access_token_only_registration_engine.py` 与 `refresh_token_registration_engine.py` 改为复用同一套规则，把 ChatGPT 首页预热、CSRF、authorize 跳转、Sentinel Browser、注册状态机推进、HTTP 响应片段、OTP 提交、callback 与 session 探测等底层链路归入 Debug；默认 Info 视图保留账号尝试、代理出口、邮箱/验证码/注册/结果等操作员真正需要的阶段摘要，避免批量注册时 Info 被数千行技术流水刷屏。
@@ -668,4 +679,8 @@
 
 ## 2026-07-07 03:57:46 +0800
 - 补强手机号绑定日志脱敏与回归测试
+- 发布模式: multi
+
+## 2026-07-07 05:22:31 +0800
+- 统一手机号绑定任务日志信息格式
 - 发布模式: multi
