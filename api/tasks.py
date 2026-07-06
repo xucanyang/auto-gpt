@@ -873,6 +873,28 @@ def _chatgpt_account_access_token(account: AccountModel) -> str:
     return str(extra.get("access_token") or getattr(account, "token", "") or "").strip()
 
 
+def _idea_submit_unavailable_reason(account: AccountModel) -> str:
+    try:
+        extra = account.get_extra()
+    except Exception:
+        extra = {}
+    if not isinstance(extra, dict):
+        extra = {}
+    marker = extra.get("idea_submit") if isinstance(extra.get("idea_submit"), dict) else {}
+    if bool(marker.get("unavailable") or extra.get("idea_submit_unavailable")):
+        reason = str(marker.get("reason") or extra.get("idea_submit_unavailable_reason") or "").strip()
+        return f"账号已标记不可用于 Idea 提交{f': {reason}' if reason else ''}"
+
+    # Backward compatibility for rows written before the dedicated Idea marker:
+    # old failures only set generic chatgpt_account_unavailable plus a failed
+    # baxigpt_cdk snapshot.
+    baxigpt_cdk = extra.get("baxigpt_cdk") if isinstance(extra.get("baxigpt_cdk"), dict) else {}
+    if bool(extra.get("chatgpt_account_unavailable")) and str(baxigpt_cdk.get("status") or "").strip().lower() == "failed":
+        reason = str(extra.get("chatgpt_unavailable_reason") or baxigpt_cdk.get("last_error_message") or "").strip()
+        return f"账号已标记不可用于 Idea 提交{f': {reason}' if reason else ''}"
+    return ""
+
+
 PAYPAL_BIND_ALLOWED_SUBSCRIPTION_TYPES = {"free"}
 PAYPAL_BIND_BLOCKED_SUBSCRIPTION_TYPES = {"plus", "team", "pro", "enterprise"}
 PAYPAL_BIND_ALREADY_PAID_MARKERS = (
@@ -1298,7 +1320,10 @@ def _resolve_baxigpt_cdk_submit_accounts(
                 "status": str(account.status or ""),
             }
             matched.append(item)
-            if not _chatgpt_account_access_token(account):
+            idea_unavailable_reason = _idea_submit_unavailable_reason(account)
+            if idea_unavailable_reason:
+                skipped.append({**item, "reason": idea_unavailable_reason})
+            elif not _chatgpt_account_access_token(account):
                 skipped.append({**item, "reason": "账号缺少 Access Token"})
             else:
                 eligible.append(item)
@@ -1332,7 +1357,10 @@ def _resolve_baxigpt_cdk_submit_accounts(
             "status": str(account.status or ""),
         }
         matched.append(item)
-        if not _chatgpt_account_access_token(account):
+        idea_unavailable_reason = _idea_submit_unavailable_reason(account)
+        if idea_unavailable_reason:
+            skipped.append({**item, "reason": idea_unavailable_reason})
+        elif not _chatgpt_account_access_token(account):
             skipped.append({**item, "reason": "账号缺少 Access Token"})
         else:
             eligible.append(item)
@@ -4559,6 +4587,10 @@ def _task_log_meta_summary(detail: dict[str, Any]) -> dict[str, Any]:
 
 
 def _task_log_failed_count(detail: dict[str, Any]) -> int:
+    meta = detail.get("meta") if isinstance(detail.get("meta"), dict) else {}
+    idea_summary = meta.get("idea_submit_summary") if isinstance(meta.get("idea_submit_summary"), dict) else detail.get("idea_submit_summary")
+    if _task_log_source(detail) == "baxigpt_cdk_submit" and isinstance(idea_summary, dict):
+        return int(idea_summary.get("failed") or 0) + int(idea_summary.get("timeout") or 0)
     errors = detail.get("errors")
     if isinstance(errors, list):
         return len(errors)
@@ -6381,6 +6413,239 @@ def _run_batch_oaipay_upload(task_id: str, account_ids: list[int], category_id: 
         _task_store.cleanup()
 
 
+_IDEA_SUBMIT_SUCCESS_STATUSES = {"paid", "success", "completed"}
+_IDEA_SUBMIT_FAILED_STATUSES = {"failed", "fail", "error", "invalid", "expired", "cancelled", "canceled"}
+_IDEA_SUBMIT_UNSUBMITTED_STATUSES = {"skipped", "skip", "unsubmitted", "submit_failed", "missing"}
+_IDEA_ACCOUNT_UNAVAILABLE_MARKERS = (
+    "当前账号没有资格",
+    "账号没有资格",
+    "没有开通资格",
+    "没有资格",
+    "无资格",
+    "请换号",
+    "换号重试",
+    "no trial eligibility",
+    "not eligible",
+    "ineligible",
+    "eligibility",
+    "account unavailable",
+)
+_IDEA_NON_ACCOUNT_TRANSIENT_MARKERS = (
+    "节点网络异常",
+    "底层网络波动",
+    "tls",
+    "timeout",
+    "timed out",
+    "connection",
+    "网络繁忙",
+    "稍后再试",
+    "rate limit",
+    "429",
+    "502",
+    "503",
+    "504",
+)
+
+
+def _is_idea_account_unavailable_reason(reason: Any) -> bool:
+    text = str(reason or "").strip().lower()
+    if not text:
+        return False
+    if any(marker in text for marker in _IDEA_ACCOUNT_UNAVAILABLE_MARKERS):
+        return True
+    if any(marker in text for marker in _IDEA_NON_ACCOUNT_TRANSIENT_MARKERS):
+        return False
+    return False
+
+
+def _idea_submit_account_key(item: dict[str, Any] | None, fallback: str = "") -> str:
+    payload = item if isinstance(item, dict) else {}
+    try:
+        account_id = int(payload.get("account_id") or payload.get("id") or 0)
+    except Exception:
+        account_id = 0
+    if account_id > 0:
+        return f"id:{account_id}"
+    email = str(payload.get("email") or "").strip().lower()
+    if email:
+        return f"email:{email}"
+    return fallback
+
+
+def _idea_submit_compact_item(item: dict[str, Any] | None, *, fallback_status: str = "") -> dict[str, Any]:
+    payload = dict(item or {}) if isinstance(item, dict) else {}
+    compact: dict[str, Any] = {}
+    for key in (
+        "account_id",
+        "email",
+        "status",
+        "reason",
+        "cdk_id",
+        "code_masked",
+        "order_id",
+        "display_id",
+        "finished_at",
+        "idea_marked_unavailable",
+    ):
+        if key in payload and payload.get(key) not in (None, ""):
+            compact[key] = payload.get(key)
+    if fallback_status and not compact.get("status"):
+        compact["status"] = fallback_status
+    return compact
+
+
+def _normalize_idea_submit_result_status(value: Any) -> str:
+    status = str(value or "").strip().lower()
+    if status in _IDEA_SUBMIT_SUCCESS_STATUSES:
+        return "paid"
+    if status in _IDEA_SUBMIT_FAILED_STATUSES:
+        return "failed"
+    if status == "timeout":
+        return "timeout"
+    if status in _IDEA_SUBMIT_UNSUBMITTED_STATUSES:
+        return "unsubmitted"
+    if status in {"submitted", "processing", "polling"}:
+        return "pending"
+    return status or "pending"
+
+
+def _build_idea_submit_runtime_summary(
+    *,
+    pairs: list[dict[str, Any]],
+    missing_ids: list[int],
+    skipped_accounts: list[dict[str, Any]],
+    runtime_results: list[dict[str, Any]],
+    submitted_count: int = 0,
+    errors: list[str] | None = None,
+) -> dict[str, Any]:
+    """Build an operator-facing Idea submit summary with stable account groups.
+
+    `runtime_results` is append-only while the task runs.  This summary is the
+    canonical grouped view used by the final log, task history, and live panel:
+    success accounts, upstream failed accounts, timeout accounts, and accounts
+    that never received an upstream order.
+    """
+    by_key: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+
+    def put(item: dict[str, Any], *, status: str = "", reason: str = "", overwrite: bool = True) -> None:
+        key = _idea_submit_account_key(item, fallback=f"row:{len(order)}")
+        if not key:
+            key = f"row:{len(order)}"
+        if key not in by_key:
+            by_key[key] = {}
+            order.append(key)
+        if overwrite:
+            by_key[key].update({k: v for k, v in item.items() if v not in (None, "")})
+        else:
+            by_key[key] = {
+                **{k: v for k, v in item.items() if v not in (None, "")},
+                **by_key[key],
+            }
+        if status:
+            by_key[key]["status"] = status
+        if reason and not by_key[key].get("reason"):
+            by_key[key]["reason"] = reason
+
+    for pair in pairs or []:
+        put(dict(pair or {}), status="pending", overwrite=False)
+
+    for item in skipped_accounts or []:
+        reason = str((item or {}).get("reason") or "创建任务时已跳过").strip()
+        put(dict(item or {}), status="unsubmitted", reason=reason, overwrite=True)
+
+    for missing_id in missing_ids or []:
+        put(
+            {"account_id": int(missing_id or 0), "reason": "账号不存在"},
+            status="unsubmitted",
+            overwrite=True,
+        )
+
+    for result in runtime_results or []:
+        payload = dict(result or {})
+        normalized = _normalize_idea_submit_result_status(payload.get("status"))
+        if normalized == "unsubmitted" and not payload.get("reason"):
+            payload["reason"] = "未提交到上游"
+        put(payload, status=normalized, overwrite=True)
+
+    success_accounts: list[dict[str, Any]] = []
+    failed_accounts: list[dict[str, Any]] = []
+    timeout_accounts: list[dict[str, Any]] = []
+    unsubmitted_accounts: list[dict[str, Any]] = []
+    pending_accounts: list[dict[str, Any]] = []
+    marked_unavailable_accounts: list[dict[str, Any]] = []
+
+    for key in order:
+        item = by_key.get(key) or {}
+        normalized = _normalize_idea_submit_result_status(item.get("status"))
+        item["status"] = normalized
+        compact = _idea_submit_compact_item(item, fallback_status=normalized)
+        if normalized == "paid":
+            success_accounts.append(compact)
+        elif normalized == "failed":
+            failed_accounts.append(compact)
+            if bool(item.get("idea_marked_unavailable")):
+                marked_unavailable_accounts.append(compact)
+        elif normalized == "timeout":
+            timeout_accounts.append(compact)
+        elif normalized == "unsubmitted":
+            unsubmitted_accounts.append(compact)
+        else:
+            pending_accounts.append(compact)
+
+    total_accounts = len(order)
+    failed_total = len(failed_accounts)
+    timeout_total = len(timeout_accounts)
+    unsubmitted_total = len(unsubmitted_accounts)
+    paid_total = len(success_accounts)
+
+    return {
+        "source": "baxigpt_cdk_submit",
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "total_accounts": total_accounts,
+        "pair_count": len(pairs or []),
+        "submitted": int(submitted_count or 0),
+        "paid": paid_total,
+        "failed": failed_total,
+        "timeout": timeout_total,
+        "unsubmitted": unsubmitted_total,
+        "pending": len(pending_accounts),
+        "marked_unavailable": len(marked_unavailable_accounts),
+        "success_accounts": success_accounts,
+        "failed_accounts": failed_accounts,
+        "timeout_accounts": timeout_accounts,
+        "unsubmitted_accounts": unsubmitted_accounts,
+        "pending_accounts": pending_accounts,
+        "marked_unavailable_accounts": marked_unavailable_accounts,
+        "errors": list(errors or []),
+    }
+
+
+def _idea_submit_log_item_text(item: dict[str, Any]) -> str:
+    email = str(item.get("email") or "").strip()
+    account_id = str(item.get("account_id") or "").strip()
+    label = email or (f"account_id={account_id}" if account_id else "-")
+    suffixes: list[str] = []
+    if item.get("code_masked"):
+        suffixes.append(str(item.get("code_masked")))
+    if item.get("order_id"):
+        suffixes.append(f"order={item.get('order_id')}")
+    reason = str(item.get("reason") or "").strip()
+    if reason:
+        suffixes.append(reason[:120])
+    return f"{label} ({' / '.join(suffixes)})" if suffixes else label
+
+
+def _log_idea_submit_group_summary(task_id: str, title: str, items: list[dict[str, Any]], *, limit: int = 80) -> None:
+    count = len(items or [])
+    if count <= 0:
+        _log(task_id, f"[SUMMARY] {title} 0 个")
+        return
+    shown = items[:limit]
+    tail = f"；还有 {count - limit} 个未在日志展开，可在任务详情 JSON 查看" if count > limit else ""
+    _log(task_id, f"[SUMMARY] {title} {count} 个: " + "；".join(_idea_submit_log_item_text(item) for item in shown) + tail)
+
+
 def _run_baxigpt_cdk_submit(task_id: str, pairs: list[dict[str, Any]], settings: dict[str, Any]):
     from services.chatgpt_core.baxigpt_cdk_repository import BaxiGptCdkRepository, STATUS_PAID
     from services.chatgpt_core.baxigpt_client import BaxiGptClient
@@ -6412,6 +6677,14 @@ def _run_baxigpt_cdk_submit(task_id: str, pairs: list[dict[str, Any]], settings:
     skipped_accounts = list(meta.get("skipped_accounts") or [])
 
     def sync_meta() -> None:
+        summary = _build_idea_submit_runtime_summary(
+            pairs=pairs,
+            missing_ids=missing_ids,
+            skipped_accounts=skipped_accounts,
+            runtime_results=runtime_results,
+            submitted_count=submitted_count,
+            errors=errors,
+        )
         _task_store.update_meta(
             task_id,
             {
@@ -6421,6 +6694,7 @@ def _run_baxigpt_cdk_submit(task_id: str, pairs: list[dict[str, Any]], settings:
                 "runtime_timeout": timeout_count,
                 "runtime_skipped": skipped_count,
                 "runtime_errors": list(errors),
+                "idea_submit_summary": summary,
             },
         )
 
@@ -6643,14 +6917,14 @@ def _run_baxigpt_cdk_submit(task_id: str, pairs: list[dict[str, Any]], settings:
                                 acc = session.get(AccountModel, int(acc_item["account_id"]))
                                 if not acc or acc.platform != "chatgpt":
                                     skipped_count += 1
-                                    _log(task_id, f"[SKIP] 账号不存在或非 ChatGPT: {acc_item.get('email')}")
-                                    append_result(account_id=acc_item["account_id"], email=acc_item.get("email"), cdk_id=rec.id, code_masked=rec.code_masked, status="skipped", reason="账号不存在或非 ChatGPT")
+                                    _log(task_id, f"[UNSUBMITTED] 账号不存在或非 ChatGPT，未提交到 Idea: {acc_item.get('email')}")
+                                    append_result(account_id=acc_item["account_id"], email=acc_item.get("email"), cdk_id=rec.id, code_masked=rec.code_masked, status="unsubmitted", reason="账号不存在或非 ChatGPT")
                                     continue
                                 token = _chatgpt_account_access_token(acc)
                                 if not token:
                                     skipped_count += 1
-                                    _log(task_id, f"[SKIP] 账号缺少 Access Token: {acc_item.get('email')}")
-                                    append_result(account_id=acc_item["account_id"], email=acc_item.get("email"), cdk_id=rec.id, code_masked=rec.code_masked, status="skipped", reason="账号缺少 Access Token")
+                                    _log(task_id, f"[UNSUBMITTED] 账号缺少 Access Token，未提交到 Idea: {acc_item.get('email')}")
+                                    append_result(account_id=acc_item["account_id"], email=acc_item.get("email"), cdk_id=rec.id, code_masked=rec.code_masked, status="unsubmitted", reason="账号缺少 Access Token")
                                     continue
                                     
                             _log(task_id, f"[Idea] 提交上游 (单行模式): 账号 {acc_item.get('email')} -> 卡密 {rec.code_masked}")
@@ -6705,13 +6979,38 @@ def _run_baxigpt_cdk_submit(task_id: str, pairs: list[dict[str, Any]], settings:
                                 if not failure_continue:
                                     _log(task_id, "[Idea] 失败后继续已关闭，停止后续提交")
                                     errors.append(f"卡密 {rec.code_masked} 提交失败: {err_text}")
-                                    unassignable_accounts.append(acc_item)
-                                    unassignable_accounts.extend(pending_accounts)
+                                    skipped_count += 1
+                                    _log(task_id, f"[UNSUBMITTED] 未提交账号: {acc_item.get('email')} - {err_text}")
+                                    append_result(
+                                        account_id=acc_item["account_id"],
+                                        email=acc_item.get("email"),
+                                        cdk_id=rec.id,
+                                        code_masked=rec.code_masked,
+                                        status="unsubmitted",
+                                        reason=err_text,
+                                    )
+                                    for item in pending_accounts:
+                                        skipped_count += 1
+                                        append_result(
+                                            account_id=item["account_id"],
+                                            email=item.get("email"),
+                                            status="unsubmitted",
+                                            reason="失败后继续已关闭，本轮未提交",
+                                        )
                                     pending_accounts.clear()
+                                    unassignable_accounts.clear()
                                     break
                                 else:
-                                    _log(task_id, f"[Idea] 释放所占账号重回队列，准备其他账号/卡密额度重试...")
-                                    unassignable_accounts.append(acc_item)
+                                    skipped_count += 1
+                                    _log(task_id, f"[UNSUBMITTED] 提交失败，已跳过该账号避免重复刷屏: {acc_item.get('email')} - {err_text}")
+                                    append_result(
+                                        account_id=acc_item["account_id"],
+                                        email=acc_item.get("email"),
+                                        cdk_id=rec.id,
+                                        code_masked=rec.code_masked,
+                                        status="unsubmitted",
+                                        reason=err_text,
+                                    )
                                     
                         pending_accounts = unassignable_accounts
 
@@ -6723,8 +7022,16 @@ def _run_baxigpt_cdk_submit(task_id: str, pairs: list[dict[str, Any]], settings:
                         # 也没有可用卡密额度了，剩余账号放弃
                         for pa in pending_accounts:
                             skipped_count += 1
-                            _log(task_id, f"[SKIP] 剩余候选账号无可用卡密额度: {pa.get('email')}")
-                            append_result(account_id=pa["account_id"], email=pa.get("email"), status="skipped", reason="可用卡密额度不足或连续失败")
+                            reason = str(pa.get("last_unsubmitted_reason") or "可用卡密额度不足或连续失败")
+                            _log(task_id, f"[UNSUBMITTED] 未提交账号: {pa.get('email')} - {reason}")
+                            append_result(
+                                account_id=pa["account_id"],
+                                email=pa.get("email"),
+                                cdk_id=pa.get("last_cdk_id"),
+                                code_masked=pa.get("last_code_masked"),
+                                status="unsubmitted",
+                                reason=reason,
+                            )
                         pending_accounts.clear()
                         break
                     
@@ -6787,15 +7094,21 @@ def _run_baxigpt_cdk_submit(task_id: str, pairs: list[dict[str, Any]], settings:
                         }) or rec
                         order["record"] = failed_record
                         
-                        # 1. 本地标记提交失败的账号没有资格
-                        with Session(engine) as session:
-                            acc = session.get(AccountModel, vb["item"]["account_id"])
-                            if acc:
-                                repo.mark_account_ineligible(acc, failed_record, err_text)
-                                session.add(acc)
-                                session.commit()
-                        _log(task_id, f"[Idea] 自动标记账号没有资格: {vb['item'].get('email')} ({err_text})")
-                        append_result(account_id=vb["item"]["account_id"], email=vb["item"].get("email"), cdk_id=rec.id, code_masked=rec.code_masked, status="failed", reason=err_text, order_id=order_id)
+                        # 1. 只有上游明确反馈账号无资格/需换号时，才写入
+                        #    “不可用于 Idea 提交”专用标记；网络/TLS/限流类失败
+                        #    不污染账号级可用性。
+                        should_mark_unavailable = _is_idea_account_unavailable_reason(err_text)
+                        if should_mark_unavailable:
+                            with Session(engine) as session:
+                                acc = session.get(AccountModel, vb["item"]["account_id"])
+                                if acc:
+                                    repo.mark_account_ineligible(acc, failed_record, err_text)
+                                    session.add(acc)
+                                    session.commit()
+                            _log(task_id, f"[Idea] 自动标记账号不可用于 Idea 提交: {vb['item'].get('email')} ({err_text})")
+                        else:
+                            _log(task_id, f"[Idea] 失败原因偏向上游/网络/卡密环境，未标记账号不可用于 Idea 提交: {vb['item'].get('email')} ({err_text})")
+                        append_result(account_id=vb["item"]["account_id"], email=vb["item"].get("email"), cdk_id=rec.id, code_masked=rec.code_masked, status="failed", reason=err_text, order_id=order_id, idea_marked_unavailable=should_mark_unavailable)
                         
                         # 2. 提交失败则卡密额度未消耗，若有候选账号继续换额度提交
                         if failure_continue and pending_accounts:
@@ -6819,18 +7132,49 @@ def _run_baxigpt_cdk_submit(task_id: str, pairs: list[dict[str, Any]], settings:
             control.finish_attempt(attempt_id)
             _task_store.set_progress(task_id, f"{success_count}/{total}")
 
+        sync_meta()
+        latest_meta = dict(_task_store.snapshot(task_id).get("meta") or {})
+        idea_summary = latest_meta.get("idea_submit_summary") if isinstance(latest_meta.get("idea_submit_summary"), dict) else {}
+        failed_accounts = list(idea_summary.get("failed_accounts") or []) if isinstance(idea_summary, dict) else []
+        timeout_accounts = list(idea_summary.get("timeout_accounts") or []) if isinstance(idea_summary, dict) else []
+        unsubmitted_accounts = list(idea_summary.get("unsubmitted_accounts") or []) if isinstance(idea_summary, dict) else []
+        success_accounts = list(idea_summary.get("success_accounts") or []) if isinstance(idea_summary, dict) else []
+        marked_unavailable_accounts = list(idea_summary.get("marked_unavailable_accounts") or []) if isinstance(idea_summary, dict) else []
         summary_message = (
             "Idea 卡密提交完成: "
-            f"上游已受理 {submitted_count} 个，开通成功 {success_count} 个，"
-            f"跳过 {skipped_count} 个，失败 {len(errors)} 个，超时 {timeout_count} 个"
+            f"候选 {idea_summary.get('total_accounts', len(pairs)) if isinstance(idea_summary, dict) else len(pairs)} 个，"
+            f"上游已受理 {submitted_count} 个，开通成功 {len(success_accounts)} 个，"
+            f"失败 {len(failed_accounts)} 个，超时 {len(timeout_accounts)} 个，"
+            f"未提交 {len(unsubmitted_accounts)} 个"
         )
-        if errors:
-            summary_message = f"{summary_message}；首个失败: {errors[0]}"
-        elif timeout_count:
+        if failed_accounts:
+            summary_message = f"{summary_message}；首个失败: {_idea_submit_log_item_text(failed_accounts[0])}"
+        elif errors:
+            summary_message = f"{summary_message}；首个错误: {errors[0]}"
+        elif timeout_accounts:
             summary_message = f"{summary_message}；存在轮询超时，请按 order_id 复核上游状态"
         _log(task_id, f"[SUMMARY] {summary_message}")
+        _log_idea_submit_group_summary(task_id, "成功账号", success_accounts)
+        _log_idea_submit_group_summary(task_id, "失败账号", failed_accounts)
+        _log_idea_submit_group_summary(task_id, "超时账号", timeout_accounts)
+        _log_idea_submit_group_summary(task_id, "未提交账号", unsubmitted_accounts)
+        _log_idea_submit_group_summary(task_id, "已标记不可用于 Idea 提交", marked_unavailable_accounts)
+        sync_meta()
         latest_meta = dict(_task_store.snapshot(task_id).get("meta") or {})
-        log_status = "success" if success_count > 0 and not errors and timeout_count == 0 else "failed"
+        idea_summary = latest_meta.get("idea_submit_summary") if isinstance(latest_meta.get("idea_submit_summary"), dict) else idea_summary
+        failed_total = int((idea_summary or {}).get("failed") or 0)
+        timeout_total = int((idea_summary or {}).get("timeout") or 0)
+        unsubmitted_total = int((idea_summary or {}).get("unsubmitted") or 0)
+        log_status = "success" if success_count > 0 and not errors and failed_total == 0 and timeout_total == 0 else "failed"
+        finish_error = "" if log_status == "success" else summary_message
+        _task_store.finish(
+            task_id,
+            status="done" if log_status == "success" else "failed",
+            success=success_count,
+            skipped=unsubmitted_total,
+            errors=errors,
+            error=finish_error,
+        )
         _save_task_log(
             "chatgpt",
             primary_email,
@@ -6844,16 +7188,9 @@ def _run_baxigpt_cdk_submit(task_id: str, pairs: list[dict[str, Any]], settings:
                     "source": "baxigpt_cdk_submit",
                     "meta": latest_meta,
                     "runtime_results": list(runtime_results),
+                    "idea_submit_summary": idea_summary,
                 },
             ),
-        )
-        _task_store.finish(
-            task_id,
-            status="done" if log_status == "success" else "failed",
-            success=success_count,
-            skipped=skipped_count,
-            errors=errors,
-            error="" if not errors else summary_message,
         )
     except StopTaskRequested as exc:
         _log(task_id, f"[STOP] {exc}")

@@ -560,6 +560,41 @@ def _build_baxigpt_cdk_summary(cdk: dict[str, Any]) -> dict[str, Any]:
     )
 
 
+def _build_idea_submit_summary(extra: dict[str, Any], baxigpt_cdk: dict[str, Any]) -> dict[str, Any]:
+    marker = extra.get("idea_submit") if isinstance(extra.get("idea_submit"), dict) else {}
+    unavailable = bool(marker.get("unavailable") or extra.get("idea_submit_unavailable"))
+    if (
+        not unavailable
+        and bool(extra.get("chatgpt_account_unavailable"))
+        and _safe_str(baxigpt_cdk.get("status")).lower() == "failed"
+    ):
+        unavailable = True
+    reason = _safe_str(
+        marker.get("reason")
+        or extra.get("idea_submit_unavailable_reason")
+        or (extra.get("chatgpt_unavailable_reason") if unavailable else "")
+        or (baxigpt_cdk.get("last_error_message") if unavailable else "")
+    )
+    status = "unavailable" if unavailable else "available"
+    cdk_status = _safe_str(baxigpt_cdk.get("status")).lower()
+    if not unavailable and cdk_status in {"paid", "submitted", "processing", "failed"}:
+        status = cdk_status
+    return {
+        "status": status,
+        "available": not unavailable,
+        "unavailable": unavailable,
+        "reason": reason,
+        "marked_at": _safe_str(marker.get("marked_at") or extra.get("idea_submit_unavailable_at")),
+        "cleared_at": _safe_str(marker.get("cleared_at")),
+        "source": _safe_str(marker.get("source") or ("baxigpt_cdk_submit" if marker else "")),
+        "cdk_id": _safe_int(marker.get("cdk_id") or baxigpt_cdk.get("cdk_id")),
+        "code_masked": _safe_str(marker.get("code_masked") or baxigpt_cdk.get("code_masked")),
+        "task_id": _safe_str(marker.get("task_id") or baxigpt_cdk.get("task_id")),
+        "order_id": _safe_str(marker.get("order_id") or baxigpt_cdk.get("order_id")),
+        "display_id": _safe_str(marker.get("display_id") or baxigpt_cdk.get("display_id")),
+    }
+
+
 def _build_subscription_summary(
     subscription: dict[str, Any],
     capabilities: dict[str, Any],
@@ -774,6 +809,7 @@ def _serialize_account_compact_item(
     codex_summary = _build_codex_summary(codex, chatgpt_capabilities)
     validity_summary = _build_account_validity_summary(account, auth_summary, chatgpt_capabilities)
     baxigpt_cdk = _build_baxigpt_cdk_summary(extra.get("baxigpt_cdk") if isinstance(extra.get("baxigpt_cdk"), dict) else {})
+    idea_submit = _build_idea_submit_summary(extra, baxigpt_cdk)
     workspace_variants = _build_workspace_variants_summary(extra)
 
     payload = {
@@ -809,6 +845,7 @@ def _serialize_account_compact_item(
         "oaipay": oaipay_sync,
         "cliproxy": cliproxy_sync,
         "phone": _build_phone_summary(phone_binding, bound_phone, phone_challenge),
+        "idea_submit": idea_submit,
         "rate_limit": rate_limit,
         "rate_limit_started_at": rate_limit["started_at"],
         "rate_limit_recover_at": rate_limit["recover_at"],
@@ -875,6 +912,7 @@ def _serialize_account_compact_item(
         "phone_challenge": phone_challenge,
         "phone_binding": _build_phone_summary(phone_binding, bound_phone, phone_challenge)["binding"],
         "baxigpt_cdk": baxigpt_cdk,
+        "ideaSubmit": idea_submit,
         "sub2apiSync": sub2api_sync,
         "oaipaySync": oaipay_sync,
         "cliproxySync": cliproxy_sync,
@@ -888,6 +926,7 @@ def _serialize_account_compact_item(
             "chatgpt_bound_phone": bound_phone,
             "chatgpt_phone_challenge": phone_challenge,
             "baxigpt_cdk": baxigpt_cdk,
+            "idea_submit": idea_submit,
         },
     }
     if team_invite_source:

@@ -447,6 +447,24 @@ function accountHasSecret(
   return false
 }
 
+function parseIdeaSubmitSummary(account: any, extra: Record<string, any>) {
+  const topLevel = account?.idea_submit && typeof account.idea_submit === 'object' ? account.idea_submit : {}
+  if (Object.keys(topLevel).length > 0) return topLevel
+  const camel = account?.ideaSubmit && typeof account.ideaSubmit === 'object' ? account.ideaSubmit : {}
+  if (Object.keys(camel).length > 0) return camel
+  return extra.idea_submit && typeof extra.idea_submit === 'object' ? extra.idea_submit : {}
+}
+
+function ideaSubmitTag(summary: any) {
+  const unavailable = Boolean(summary?.unavailable) || String(summary?.status || '').trim().toLowerCase() === 'unavailable'
+  const status = String(summary?.status || '').trim().toLowerCase()
+  if (unavailable) return { color: 'error', label: 'Idea 不可用' }
+  if (status === 'paid') return { color: 'success', label: 'Idea 已开通' }
+  if (status === 'submitted' || status === 'processing') return { color: 'processing', label: 'Idea 处理中' }
+  if (status === 'failed') return { color: 'warning', label: 'Idea 失败' }
+  return { color: 'default', label: 'Idea 未提交' }
+}
+
 function SecretMaterialPanel({
   account,
   getAccessToken,
@@ -660,6 +678,8 @@ export function AccountDetailModal({
     : currentAccount?.codex && typeof currentAccount.codex === 'object'
       ? currentAccount.codex
       : {}
+  const ideaSubmitSummary = parseIdeaSubmitSummary(currentAccount, extra)
+  const ideaSubmitDisplay = ideaSubmitTag(ideaSubmitSummary)
   const workspaceVariants = collectWorkspaceVariants(currentAccount, extra, workspace, capabilities, authSummary)
   const drawerTitle = currentAccount ? (
     <Space size={8} wrap>
@@ -703,6 +723,9 @@ export function AccountDetailModal({
                 <Tag color={codexStateMeta(codexSummary.state || currentAccount.codex_state).color}>
                   Codex: {codexStateMeta(codexSummary.state || currentAccount.codex_state).label}
                 </Tag>
+                <Tag color={ideaSubmitDisplay.color}>
+                  {ideaSubmitDisplay.label}
+                </Tag>
                 {currentAccount.auth_level ? <Tag>{`auth_level: ${currentAccount.auth_level}`}</Tag> : null}
               </div>
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: 10 }}>
@@ -713,6 +736,10 @@ export function AccountDetailModal({
                 <SummaryField label="Workspace" value={workspace.display_name || workspace.label || currentAccount.workspace_display_name || currentAccount.workspace_label || ''} />
                 <SummaryField label="Workspace ID" value={workspace.id || extra.workspace_id || extra.organization_id || capabilities.workspace_id || ''} />
                 <SummaryField label="Workspace Scope" value={workspace.scope || currentAccount.workspace_scope || extra.chatgpt_workspace_scope || ''} />
+                <SummaryField label="Idea 标记" value={ideaSubmitDisplay.label} />
+                <SummaryField label="Idea 原因" value={String(ideaSubmitSummary.reason || '')} />
+                <SummaryField label="Idea 标记时间" value={ideaSubmitSummary.marked_at ? formatSyncTime(String(ideaSubmitSummary.marked_at)) : ''} />
+                <SummaryField label="Idea Order" value={String(ideaSubmitSummary.order_id || ideaSubmitSummary.display_id || '')} />
                 <SummaryField label="创建时间" value={currentAccount.created_at ? formatSyncTime(currentAccount.created_at) : ''} />
                 <SummaryField label="更新时间" value={currentAccount.updated_at ? formatSyncTime(currentAccount.updated_at) : ''} />
               </div>

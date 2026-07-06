@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { Badge, Button, Card, Descriptions, message, Segmented, Space, Tag } from 'antd'
 import { CopyOutlined, FastForwardOutlined, StopOutlined } from '@ant-design/icons'
 
+import IdeaSubmitSummary from '@/components/idea/IdeaSubmitSummary'
 import { API_BASE, apiFetch, getToken } from '@/lib/utils'
 
 interface TaskLogPanelProps {
@@ -45,6 +46,7 @@ export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
   const [lines, setLines] = useState<string[]>([])
   const [error, setError] = useState('')
   const [terminalStatus, setTerminalStatus] = useState<TaskTerminalStatus>('idle')
+  const [taskSnapshot, setTaskSnapshot] = useState<any>(null)
   const [current, setCurrent] = useState<TaskCurrentState | null>(null)
   const [currentNow, setCurrentNow] = useState(() => Date.now())
   const [pageVisible, setPageVisible] = useState(
@@ -157,6 +159,7 @@ export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
     setError('')
     setTerminalStatus('idle')
     setStopRequested(false)
+    setTaskSnapshot(null)
 
     const sleep = async (ms: number) =>
       new Promise((resolve) => setTimeout(resolve, ms))
@@ -185,6 +188,7 @@ export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
         }
         if (cancelled) return true
 
+        setTaskSnapshot(snapshot)
         const snapshotLines = Array.isArray(snapshot.logs) ? snapshot.logs : []
         setLines(snapshotLines)
         nextSinceRef.current = snapshotLines.length
@@ -257,6 +261,11 @@ export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
               }
               if (payload.done) {
                 setTerminalStatus(payload.status || 'done')
+                void apiFetch(`/tasks/${taskId}`)
+                  .then((snapshot) => {
+                    if (!cancelled) setTaskSnapshot(snapshot)
+                  })
+                  .catch(() => undefined)
                 // Notify the parent after the terminal state is visible so pages can refresh
                 // their business data without making the final log lines disappear first.
                 notifyTaskDone(payload.status || 'done')
@@ -332,6 +341,9 @@ export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
     const seconds = diff % 60
     return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`
   }, [current?.started_at, currentNow])
+
+  const ideaSubmitSummary = taskSnapshot?.meta?.idea_submit_summary
+  const showIdeaSubmitSummary = String(taskSnapshot?.source || taskSnapshot?.meta?.source || '').trim() === 'baxigpt_cdk_submit'
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', minHeight: 0 }}>
@@ -456,6 +468,8 @@ export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
           />
         </Card>
       ) : null}
+
+      {showIdeaSubmitSummary ? <IdeaSubmitSummary summary={ideaSubmitSummary} /> : null}
 
       <div
         ref={panelRef}

@@ -256,6 +256,7 @@ def _bound_account_payload(record: Any) -> dict[str, Any] | None:
         extra = account.get_extra()
         baxigpt_cdk = extra.get("baxigpt_cdk") if isinstance(extra.get("baxigpt_cdk"), dict) else {}
         history = extra.get("baxigpt_cdk_history") if isinstance(extra.get("baxigpt_cdk_history"), list) else []
+        idea_submit = extra.get("idea_submit") if isinstance(extra.get("idea_submit"), dict) else {}
         return {
             "id": int(account.id or 0),
             "email": str(account.email or ""),
@@ -265,6 +266,7 @@ def _bound_account_payload(record: Any) -> dict[str, Any] | None:
             "match_by": match_by,
             "baxigpt_cdk": baxigpt_cdk,
             "baxigpt_cdk_history": history[-10:],
+            "idea_submit": idea_submit,
         }
 
 

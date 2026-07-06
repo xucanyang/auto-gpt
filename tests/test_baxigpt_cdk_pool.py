@@ -411,6 +411,19 @@ CDK-AAAA-1111
             self.assertTrue(extra.get("chatgpt_account_unavailable"))
             self.assertEqual(extra.get("chatgpt_unavailable_reason"), "该账号没有开通资格")
             self.assertTrue(extra.get("chatgpt_skip_save_account"))
+            self.assertTrue(extra.get("idea_submit_unavailable"))
+            self.assertEqual(extra.get("idea_submit_unavailable_reason"), "该账号没有开通资格")
+            self.assertTrue(extra.get("idea_submit", {}).get("unavailable"))
+            self.assertEqual(extra.get("idea_submit", {}).get("source"), "baxigpt_cdk_submit")
+
+            repo.persist_account_binding_extra(account, rec2, status="paid")
+            session.add(account)
+            session.commit()
+            session.refresh(account)
+            extra = account.get_extra()
+            self.assertIsNone(extra.get("idea_submit_unavailable"))
+            self.assertFalse(extra.get("idea_submit", {}).get("unavailable"))
+            self.assertTrue(extra.get("idea_submit", {}).get("available"))
 
 
 class BaxiGptClientRetryTests(unittest.TestCase):

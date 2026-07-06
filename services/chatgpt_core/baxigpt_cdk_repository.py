@@ -20,6 +20,13 @@ STATUS_PAID = "paid"
 STATUS_FAILED = "failed"
 STATUS_DISABLED = "disabled"
 
+IDEA_SUBMIT_MARKER_KEY = "idea_submit"
+IDEA_SUBMIT_UNAVAILABLE_KEYS = (
+    "idea_submit_unavailable",
+    "idea_submit_unavailable_reason",
+    "idea_submit_unavailable_at",
+)
+
 ALL_STATUSES = {
     STATUS_AVAILABLE,
     STATUS_RESERVED,
@@ -108,6 +115,45 @@ def _clear_available_binding(model: BaxiGptCdkPoolModel) -> None:
     model.display_id = ""
     model.remote_email = ""
     model.upstream_status = ""
+
+
+def _idea_submit_marker_from_record(
+    record: BaxiGptCdkRecord,
+    *,
+    unavailable: bool,
+    reason: str = "",
+) -> dict[str, Any]:
+    return {
+        "available": not bool(unavailable),
+        "unavailable": bool(unavailable),
+        "reason": str(reason or "").strip(),
+        "marked_at": _now_text() if unavailable else "",
+        "cleared_at": "" if unavailable else _now_text(),
+        "source": "baxigpt_cdk_submit",
+        "cdk_id": int(record.id or 0),
+        "code_masked": str(record.code_masked or ""),
+        "task_id": str(record.task_id or ""),
+        "order_id": str(record.order_id or ""),
+        "display_id": str(record.display_id or ""),
+    }
+
+
+def _mark_idea_submit_unavailable(extra: dict[str, Any], record: BaxiGptCdkRecord, reason: str) -> None:
+    marker = _idea_submit_marker_from_record(record, unavailable=True, reason=reason)
+    extra[IDEA_SUBMIT_MARKER_KEY] = marker
+    extra["idea_submit_unavailable"] = True
+    extra["idea_submit_unavailable_reason"] = marker["reason"]
+    extra["idea_submit_unavailable_at"] = marker["marked_at"]
+
+
+def _clear_idea_submit_unavailable(extra: dict[str, Any], record: BaxiGptCdkRecord) -> None:
+    previous = extra.get(IDEA_SUBMIT_MARKER_KEY) if isinstance(extra.get(IDEA_SUBMIT_MARKER_KEY), dict) else {}
+    marker = _idea_submit_marker_from_record(record, unavailable=False)
+    if previous.get("reason"):
+        marker["previous_reason"] = str(previous.get("reason") or "")
+    extra[IDEA_SUBMIT_MARKER_KEY] = marker
+    for key in IDEA_SUBMIT_UNAVAILABLE_KEYS:
+        extra.pop(key, None)
 
 
 def _parse_import_lines(raw: str) -> tuple[list[tuple[int, str, str, str]], list[dict[str, Any]]]:
@@ -722,8 +768,10 @@ class BaxiGptCdkRepository:
         if not history or history_changed:
             history.append(payload)
         extra["baxigpt_cdk_history"] = history[-20:]
-        account.set_extra(extra)
         status_text = str(target_status or "").strip().lower()
+        if status_text == STATUS_PAID:
+            _clear_idea_submit_unavailable(extra, record)
+        account.set_extra(extra)
         if apply_payment_state:
             if status_text == STATUS_PAID:
                 mark_payment_succeeded(account, reason="baxigpt_cdk_paid")
@@ -744,6 +792,7 @@ class BaxiGptCdkRepository:
         extra["chatgpt_skip_save_reason"] = reason
         extra["chatgpt_invalid_registration_failure"] = True
         extra["chatgpt_invalid_registration_reason"] = reason
+        _mark_idea_submit_unavailable(extra, record, reason)
         account.set_extra(extra)
         self.persist_account_binding_extra(
             account,

@@ -244,6 +244,7 @@ type AccountColumnKey =
   | 'subscription_type'
   | 'subscription_active_until'
   | 'account_validity'
+  | 'idea_submit_status'
   | 'codex_usage'
   | 'sub2api_state'
   | 'sub2api_upload_record'
@@ -260,6 +261,7 @@ const ACCOUNT_COLUMN_OPTIONS: Array<{ value: AccountColumnKey; text: string; cha
   { value: 'subscription_type', text: '订阅类型', chatgptOnly: true },
   { value: 'subscription_active_until', text: '订阅到期', chatgptOnly: true },
   { value: 'account_validity', text: '账号有效性', chatgptOnly: true },
+  { value: 'idea_submit_status', text: 'Idea提交', chatgptOnly: true },
   { value: 'codex_usage', text: 'Codex用量', chatgptOnly: true },
   { value: 'sub2api_state', text: 'Sub2API', chatgptOnly: true },
   { value: 'sub2api_upload_record', text: 'Sub2API上传', chatgptOnly: true },
@@ -276,6 +278,7 @@ const DEFAULT_VISIBLE_ACCOUNT_COLUMNS: AccountColumnKey[] = [
   'subscription_type',
   'subscription_active_until',
   'account_validity',
+  'idea_submit_status',
   'codex_usage',
   'sub2api_state',
   'sub2api_upload_record',
@@ -1642,6 +1645,27 @@ function accountValidityMeta(record: any) {
   return accountValidityValue(record) === 'invalid'
     ? { color: 'error', label: '失效' }
     : { color: 'success', label: '有效' }
+}
+
+function getIdeaSubmitSummary(record: any) {
+  const topLevel = record?.idea_submit && typeof record.idea_submit === 'object' ? record.idea_submit : {}
+  if (Object.keys(topLevel).length > 0) return topLevel
+  const camel = record?.ideaSubmit && typeof record.ideaSubmit === 'object' ? record.ideaSubmit : {}
+  if (Object.keys(camel).length > 0) return camel
+  return record?.extra?.idea_submit && typeof record.extra.idea_submit === 'object' ? record.extra.idea_submit : {}
+}
+
+function ideaSubmitMeta(record: any) {
+  const summary = getIdeaSubmitSummary(record)
+  const unavailable = Boolean(summary?.unavailable)
+  const status = String(summary?.status || '').trim().toLowerCase()
+  if (unavailable || status === 'unavailable') {
+    return { color: 'error', label: 'Idea不可用', reason: String(summary?.reason || '').trim() }
+  }
+  if (status === 'paid') return { color: 'success', label: 'Idea已开通', reason: '' }
+  if (status === 'submitted' || status === 'processing') return { color: 'processing', label: 'Idea处理中', reason: '' }
+  if (status === 'failed') return { color: 'warning', label: 'Idea失败', reason: String(summary?.reason || '').trim() }
+  return { color: 'default', label: '未提交', reason: '' }
 }
 
 function isPaypalBindingEligibleAccount(record: any) {
@@ -4969,6 +4993,18 @@ export default function Accounts() {
     return <Tag color={meta.color} style={compactTagStyle}>{meta.label}</Tag>
   }
 
+  const renderIdeaSubmitState = (record: any) => {
+    const meta = ideaSubmitMeta(record)
+    const summary = getIdeaSubmitSummary(record)
+    const title = [
+      meta.reason ? `原因：${meta.reason}` : '',
+      summary?.marked_at ? `标记：${formatCompactDateTime(String(summary.marked_at))}` : '',
+      summary?.order_id ? `order：${summary.order_id}` : '',
+      summary?.code_masked ? `卡密：${summary.code_masked}` : '',
+    ].filter(Boolean).join('\n')
+    return <Tag color={meta.color} title={title || meta.label} style={compactTagStyle}>{meta.label}</Tag>
+  }
+
   const renderCodexUsageState = (record: any) => {
     const accountId = Number(record?.id || 0)
     const { codex, usage } = getCodexUsage(record)
@@ -5597,6 +5633,7 @@ export default function Accounts() {
     const hasRefreshTokenForMobile = hasAccountSecret(record, 'refresh_token')
     const subscriptionMetaForMobile = subscriptionTypeMeta(record)
     const validityMetaForMobile = accountValidityMeta(record)
+    const ideaMetaForMobile = ideaSubmitMeta(record)
     const hasPasswordForMobile = hasAccountSecret(record, 'password')
     const mobileStatusItems = [
       isColumnVisible('auth_type') ? renderMobileStatusPill(
@@ -5622,6 +5659,7 @@ export default function Accounts() {
       ) : null,
       isColumnVisible('subscription_type') ? renderMobileStatusPill('subscription_type', subscriptionMetaForMobile.label, subscriptionMetaForMobile.color) : null,
       isColumnVisible('account_validity') ? renderMobileStatusPill('account_validity', validityMetaForMobile.label, validityMetaForMobile.color) : null,
+      isColumnVisible('idea_submit_status') ? renderMobileStatusPill('idea_submit_status', ideaMetaForMobile.label, ideaMetaForMobile.color) : null,
       isColumnVisible('password') ? renderMobileStatusPill(
         'password',
         hasPasswordForMobile ? '有密码' : '无密码',
@@ -6005,6 +6043,12 @@ export default function Accounts() {
         key: 'account_validity',
         width: 116,
         render: (_: any, record: any) => renderAccountValidityState(record),
+      },
+      {
+        title: 'Idea提交',
+        key: 'idea_submit_status',
+        width: 128,
+        render: (_: any, record: any) => renderIdeaSubmitState(record),
       },
       {
         title: 'Codex用量',

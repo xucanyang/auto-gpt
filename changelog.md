@@ -7,6 +7,22 @@
 ## [Unreleased] (未发布)
 
 
+## [1.3.14] - 2026-07-06
+### 新增 (Added)
+- **新增 Idea 提交不可用账号标记**：`services/chatgpt_core/baxigpt_cdk_repository.py` 在 Idea 上游返回账号级失败后，会在账号 `extra.idea_submit` 写入 `unavailable/reason/marked_at/source/cdk_id/order_id` 等专用标记，并保留 `idea_submit_unavailable*` 兼容字段；`api/accounts.py` 将该标记序列化为账号列表/详情可读的 `idea_submit` 摘要，避免只靠通用 `payment_failed` 或 `baxigpt_cdk.last_error_message` 反推。
+
+### 优化 (Changed)
+- **Idea 批量提交日志增加最终分组总结**：`api/tasks.py` 为 `baxigpt_cdk_submit` 任务生成 `idea_submit_summary`，按成功账号、失败账号、超时账号、未提交账号和已标记不可用于 Idea 提交账号分组记录，并在最终日志中输出每组账号与原因；历史任务详情和实时 `TaskLogPanel` 通过 `frontend/src/components/idea/IdeaSubmitSummary.tsx` 直接展示同一份结构化总结，不再只显示零散流水日志。
+- **账号页直接展示 Idea 提交状态**：`frontend/src/pages/Accounts.tsx` 新增“Idea提交”列和移动端状态标签，账号详情抽屉 `frontend/src/features/accounts/components/AccountDetailModal.tsx` 同步展示 Idea 标记、原因、标记时间和 order 信息；已标记不可用的账号再次发起 Idea 批量提交时会在创建阶段跳过并说明原因。
+- **同步前端版本号至 v1.3.14**：`frontend/src/app/AppShell.tsx` 侧边栏版本展示更新为 `v1.3.14`，用于上线后确认 Idea 提交总结与账号标记前端资源已加载。
+
+### 修复 (Fixed)
+- **修复 Idea 提交统计把“未提交”混成跳过/失败的问题**：`api/tasks.py` 将缺少 AT、账号不存在、卡密额度不足、提交上游前失败等场景归入“未提交账号”，把上游已受理后返回 failed 的场景归入“失败账号”，并在任务结束前先写入最终 meta 再保存 `TaskLog`，避免历史详情里 `errors=[]`、summary 却显示失败的错乱状态。
+
+### 测试 (Tests)
+- **补充 Idea 提交标记与总结回归测试**：扩展 `tests/test_baxigpt_cdk_pool.py` 并新增 `tests/test_baxigpt_submit_summary.py`，覆盖账号不可用标记字段、成功后清理专用不可用标记，以及成功/失败/未提交/缺失账号的结构化汇总分组。
+
+
 ## [1.3.13] - 2026-07-06
 ### 新增 (Added)
 - **K12 / Workspace 重跑改为可观察任务链路**：新增 `POST /api/tasks/chatgpt/k12-workspace-recapture` 与 `POST /api/tasks/chatgpt/k12-workspace-recapture/batch`，单账号和批量重跑都会创建 `k12_workspace_recapture` / `batch_k12_workspace_recapture` 任务，进入统一 `TaskLogPanel` 实时日志面板，可显示 join、`accounts/check`、workspace token exchange、代理候选和最终写回摘要，不再只在账号操作结果弹窗里同步等待。
@@ -547,4 +563,8 @@
 
 ## 2026-07-06 12:44:25 +0800
 - 修复K12重跑任务日志面板和成功判定
+- 发布模式: multi
+
+## 2026-07-06 16:19:50 +0800
+- 改进 Idea 提交账号不可用标记和结果总结
 - 发布模式: multi

@@ -1,5 +1,6 @@
 import type { ReactNode } from 'react'
 import { Alert, Card, Descriptions, Space, Table, Tag, Typography } from 'antd'
+import IdeaSubmitSummary from '@/components/idea/IdeaSubmitSummary'
 import { PhoneBindingResultsTable } from '@/components/phone-binding/PhoneBindingResultsTable'
 import { ApprovalUrlResultsTable } from '@/components/approval-url/ApprovalUrlResultsTable'
 import {
@@ -154,7 +155,7 @@ function CdkPairs({ pairs }: { pairs: unknown }) {
           title: '卡密',
           dataIndex: 'cdk',
           render: (value: string, record: any) => {
-            const text = String(value || record?.code || record?.card_key || '').trim()
+            const text = String(value || record?.code || record?.card_key || record?.code_masked || '').trim()
             return <Text copyable={Boolean(text)} ellipsis={{ tooltip: text }}>{text || '-'}</Text>
           },
         },
@@ -225,7 +226,15 @@ export function TaskDetailHeader({ record }: TaskDetailHeaderProps) {
     }
     if (source === 'batch_payment_link') return <PaymentLinks urls={detail.cashier_urls} />
     if (source === 'chatgpt_oaipay_approval') return <ApprovalUrlResultsTable results={runtimeResults} />
-    if (source === 'baxigpt_cdk_submit') return <CdkPairs pairs={meta.pairs} />
+    if (source === 'baxigpt_cdk_submit') {
+      const ideaSummary = asRecord(meta.idea_submit_summary || detail.idea_submit_summary)
+      return (
+        <Space direction="vertical" style={{ width: '100%' }} size={10}>
+          {Object.keys(ideaSummary).length > 0 ? <IdeaSubmitSummary summary={ideaSummary} compact /> : null}
+          <CdkPairs pairs={meta.pairs} />
+        </Space>
+      )
+    }
     if (source === 'manual') return <ManualSummary meta={meta} />
     return <GenericSummary record={record} meta={meta} errors={errors} />
   })()
