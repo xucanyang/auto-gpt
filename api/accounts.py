@@ -100,6 +100,7 @@ ACCOUNT_FILTER_PRESET_COLUMN_KEYS = (
     "codexState",
     "sub2apiState",
     "oaipayState",
+    "ideaSubmitState",
 )
 ACCOUNT_FILTER_PRESET_PENDING_OAIPAY_STATES = [
     "unknown",
@@ -210,6 +211,7 @@ def _filter_preset_summary(filters: dict[str, Any]) -> str:
         ("manuallyUsed", "使用"),
         ("sub2apiState", "Sub2API"),
         ("oaipayState", "OAIPay"),
+        ("ideaSubmitState", "Idea提交"),
     ]
     for key, label in summary_keys:
         values = _filter_value_list(column_filters.get(key))
@@ -1666,6 +1668,7 @@ def list_accounts(
     account_validity: Optional[str] = None,
     sub2api_state: Optional[str] = None,
     oaipay_state: Optional[str] = None,
+    idea_submit_state: Optional[str] = None,
     revival_state: Optional[str] = None,
     sort_by: Optional[str] = None,
     sort_order: Optional[str] = None,
@@ -1686,6 +1689,7 @@ def list_accounts(
         account_validity_filter=account_validity,
         sub2api_state=sub2api_state,
         oaipay_state=oaipay_state,
+        idea_submit_state=idea_submit_state,
         revival_state=revival_state,
         sort_by=sort_by,
         sort_order=sort_order,
@@ -1704,7 +1708,8 @@ def list_accounts(
             subscription_type=subscription_type,
             account_validity_filter=account_validity,
             sub2api_state=sub2api_state,
-        oaipay_state=oaipay_state,
+            oaipay_state=oaipay_state,
+            idea_submit_state=idea_submit_state,
             revival_state=revival_state,
         )
         count_q = select(func.count()).select_from(q.subquery())

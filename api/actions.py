@@ -52,6 +52,7 @@ class BatchActionRequest(BaseModel):
     account_validity: str = ""
     sub2api_state: str = ""
     oaipay_state: str = ""
+    idea_submit_state: str = ""
     params: dict = {}
 
 
@@ -652,6 +653,7 @@ def _resolve_batch_accounts(platform: str, body: BatchActionRequest, session: Se
         account_validity_filter=body.account_validity,
         sub2api_state=body.sub2api_state,
         oaipay_state=body.oaipay_state,
+        idea_submit_state=body.idea_submit_state,
     )
     if len(rows) > 1000:
         raise HTTPException(400, "单次最多处理 1000 个账号")

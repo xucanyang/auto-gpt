@@ -7,6 +7,14 @@
 ## [Unreleased] (未发布)
 
 
+## [1.3.32] - 2026-07-08
+### 新增 (Added)
+- **账号列表新增“已标记不可用于 Idea 提交”筛选能力**：`services/account_filters.py` 在 `account_list_state` 派生筛选缓存中新增 `idea_submit_state` 非敏感索引列，并同步支持 `available / unavailable / paid / submitted / processing / failed` 状态筛选；`api/accounts.py` 的 `/api/accounts` 增加 `idea_submit_state` 查询参数，能够直接筛出 `extra.idea_submit.unavailable=true`、`extra.idea_submit_unavailable=true` 以及旧兼容标记 `chatgpt_account_unavailable=true + baxigpt_cdk.status=failed` 的账号，避免 Idea 批量提交失败后只能靠肉眼查看标签。
+- **账号页 Idea 提交列接入筛选下拉与筛选组合**：`frontend/src/pages/Accounts.tsx` 将“Idea提交”表头升级为可筛选列，移动端筛选区和筛选组合编辑弹窗同步新增 “Idea 提交”条件；`frontend/src/features/accounts/hooks/useAccountsQuery.ts` 会把当前条件作为 `idea_submit_state` 发送给后端，批量任务的“当前筛选账号”范围也会继承该条件，保证列表显示、筛选组合和批量操作口径一致。
+
+### 测试 (Tests)
+- **补充 Idea 提交状态筛选回归测试**：`tests/test_account_filters.py` 覆盖 Python 行过滤、SQL `account_list_state` 过滤、旧不可用标记兼容和缺失列自动升级；`tests/test_account_filter_presets.py` 覆盖筛选组合保存 `ideaSubmitState=["unavailable"]` 不被规范化逻辑丢弃。前端侧边栏版本号同步更新为 `v1.3.32`。
+
 ## [1.3.31] - 2026-07-08
 ### 优化 (Changed)
 - **统一 iCloud HME 验证码读取链路为 TempMail 转发箱轮询**：`core/base_mailbox.py` 将 `helper_ready_api` 模式下的新 HME Ready 出库账号也纳入 TempMail 转发收件箱扫描，Helper 只负责领取/出库 HME alias 与保留 lease 结果归档，不再通过 `/api/hme-ready/mailboxes/{lease_id}/wait-code` 承担验证码等待主链路；新账号优先使用 Helper 返回的 `forward_mailbox_id/forward_to`，缺失绑定时回退扫描当前配置的全部 `icloud_forward_to` 转发邮箱。
@@ -823,4 +831,8 @@
 
 ## 2026-07-08 05:13:57 +0800
 - 统一 HME 验证码读取到 TempMail 转发箱
+- 发布模式: multi
+
+## 2026-07-08 05:33:25 +0800
+- 增加 Idea 不可用账号筛选列
 - 发布模式: multi

@@ -8,6 +8,7 @@ try:
 
     from core.db import AccountListStateModel, AccountModel, engine, init_db
     from services.account_filters import (
+        account_idea_submit_state,
         account_revival_info,
         account_revival_state,
         apply_account_list_state_filters,
@@ -29,6 +30,7 @@ except ModuleNotFoundError as exc:
     Session = None
     engine = None
     init_db = None
+    account_idea_submit_state = None
     account_revival_info = None
     account_revival_state = None
     apply_account_list_state_filters = None
@@ -166,6 +168,43 @@ class AccountFilterSortTests(unittest.TestCase):
         recovery_new_rows = filter_account_rows([legacy_revived, recovery_new, normal], revival_state="recovery_new")
         self.assertEqual([row.id for row in recovery_new_rows], [21])
 
+    def test_filter_account_rows_supports_idea_submit_state(self):
+        unavailable = self._account(30)
+        unavailable.set_extra(
+            {
+                "idea_submit": {
+                    "unavailable": True,
+                    "reason": "该账号没有开通资格",
+                },
+                "idea_submit_unavailable": True,
+            }
+        )
+        paid = self._account(31)
+        paid.set_extra({"baxigpt_cdk": {"status": "paid"}})
+        legacy_unavailable = self._account(32)
+        legacy_unavailable.set_extra(
+            {
+                "chatgpt_account_unavailable": True,
+                "chatgpt_unavailable_reason": "legacy",
+                "baxigpt_cdk": {"status": "failed"},
+            }
+        )
+        available = self._account(33)
+
+        self.assertEqual(account_idea_submit_state(unavailable), "unavailable")
+        self.assertEqual(account_idea_submit_state(paid), "paid")
+        self.assertEqual(account_idea_submit_state(legacy_unavailable), "unavailable")
+        self.assertEqual(account_idea_submit_state(available), "available")
+
+        self.assertEqual(
+            [row.id for row in filter_account_rows([unavailable, paid, legacy_unavailable, available], idea_submit_state="unavailable")],
+            [30, 32],
+        )
+        self.assertEqual(
+            [row.id for row in filter_account_rows([unavailable, paid, legacy_unavailable, available], idea_submit_state="paid,available")],
+            [31, 33],
+        )
+
     def test_account_list_state_sql_filters_match_python_filters(self):
         init_db()
         rows = [
@@ -179,6 +218,8 @@ class AccountFilterSortTests(unittest.TestCase):
                 "refresh_token": "rt-101",
                 "chatgpt_capabilities": {"subscription_plan": "plus"},
                 "sync_statuses": {"sub2api": {"remote_state": "exists"}},
+                "idea_submit": {"unavailable": True},
+                "idea_submit_unavailable": True,
             }
         )
         rows[1].token = "at-102"
@@ -190,6 +231,7 @@ class AccountFilterSortTests(unittest.TestCase):
                 },
                 "sync_statuses": {"sub2api": {"remote_state": "not_found"}},
                 "chatgpt_last_revival": {"source": "custom_email_recheck", "mode": "create_new"},
+                "baxigpt_cdk": {"status": "paid"},
             }
         )
         rows[2].set_extra(
@@ -241,6 +283,14 @@ class AccountFilterSortTests(unittest.TestCase):
             self.assertEqual(
                 sql_ids(revival_state="recovery_new"),
                 [row.id for row in filter_account_rows(rows, revival_state="recovery_new")],
+            )
+            self.assertEqual(
+                sql_ids(idea_submit_state="unavailable"),
+                [row.id for row in filter_account_rows(rows, idea_submit_state="unavailable")],
+            )
+            self.assertEqual(
+                sql_ids(idea_submit_state="paid,available"),
+                [row.id for row in filter_account_rows(rows, idea_submit_state="paid,available")],
             )
 
     def test_subscription_filter_uses_current_confirmed_plan_not_stale_snapshot(self):
@@ -432,6 +482,7 @@ class AccountFilterSortTests(unittest.TestCase):
         self.assertEqual(refreshed, 1)
         self.assertIn("source_updated_at", columns)
         self.assertIn("subscription_active_until_ts", columns)
+        self.assertIn("idea_submit_state", columns)
         self.assertIn("derivation_version", columns)
         self.assertEqual(state.subscription_type, "plus")
 

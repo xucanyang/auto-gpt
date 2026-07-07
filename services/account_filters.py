@@ -15,7 +15,7 @@ from services.chatgpt_account_state import (
 )
 
 AUTO_DELETE_REVIVAL_TASK_ID = "icloud_hme_auto_delete"
-ACCOUNT_LIST_STATE_DERIVATION_VERSION = "subscription-current-v2"
+ACCOUNT_LIST_STATE_DERIVATION_VERSION = "idea-submit-state-v1"
 logger = logging.getLogger(__name__)
 
 
@@ -367,6 +367,21 @@ def account_oaipay_state(account: AccountModel, extra: dict[str, Any] | None = N
     return _lower_text(oaipay.get("remote_state")) or "unknown"
 
 
+def account_idea_submit_state(account: AccountModel, extra: dict[str, Any] | None = None) -> str:
+    extra = extra if isinstance(extra, dict) else _extra(account)
+    marker = extra.get("idea_submit") if isinstance(extra.get("idea_submit"), dict) else {}
+    baxigpt_cdk = extra.get("baxigpt_cdk") if isinstance(extra.get("baxigpt_cdk"), dict) else {}
+    cdk_status = _lower_text(baxigpt_cdk.get("status"))
+    unavailable = _truthy_value(marker.get("unavailable")) or _truthy_value(extra.get("idea_submit_unavailable"))
+    if not unavailable and _truthy_value(extra.get("chatgpt_account_unavailable")) and cdk_status == "failed":
+        unavailable = True
+    if unavailable:
+        return "unavailable"
+    if cdk_status in {"paid", "submitted", "processing", "failed"}:
+        return cdk_status
+    return "available"
+
+
 def account_subscription_active_until_timestamp(account: AccountModel, extra: dict[str, Any] | None = None) -> float | None:
     extra = extra if isinstance(extra, dict) else _extra(account)
     local_probe = extra.get("chatgpt_local") if isinstance(extra.get("chatgpt_local"), dict) else {}
@@ -400,6 +415,7 @@ def ensure_account_list_state_schema(session: Session) -> None:
                 subscription_type TEXT NOT NULL DEFAULT 'unknown',
                 account_validity TEXT NOT NULL DEFAULT 'valid',
                 sub2api_state TEXT NOT NULL DEFAULT 'unknown',
+                idea_submit_state TEXT NOT NULL DEFAULT 'available',
                 revival_state TEXT NOT NULL DEFAULT 'none',
                 revival_kind TEXT NOT NULL DEFAULT 'none',
                 subscription_active_until TEXT NOT NULL DEFAULT '',
@@ -420,6 +436,7 @@ def ensure_account_list_state_schema(session: Session) -> None:
         "account_validity": "TEXT NOT NULL DEFAULT 'valid'",
         "sub2api_state": "TEXT NOT NULL DEFAULT 'unknown'",
         "oaipay_state": "TEXT NOT NULL DEFAULT 'unknown'",
+        "idea_submit_state": "TEXT NOT NULL DEFAULT 'available'",
         "revival_state": "TEXT NOT NULL DEFAULT 'none'",
         "revival_kind": "TEXT NOT NULL DEFAULT 'none'",
         "subscription_active_until": "TEXT NOT NULL DEFAULT ''",
@@ -448,6 +465,7 @@ def ensure_account_list_state_schema(session: Session) -> None:
         "CREATE INDEX IF NOT EXISTS idx_account_list_state_account_validity ON account_list_state(account_validity)",
         "CREATE INDEX IF NOT EXISTS idx_account_list_state_sub2api_state ON account_list_state(sub2api_state)",
         "CREATE INDEX IF NOT EXISTS idx_account_list_state_oaipay_state ON account_list_state(oaipay_state)",
+        "CREATE INDEX IF NOT EXISTS idx_account_list_state_idea_submit_state ON account_list_state(idea_submit_state)",
         "CREATE INDEX IF NOT EXISTS idx_account_list_state_revival_state ON account_list_state(revival_state)",
         "CREATE INDEX IF NOT EXISTS idx_account_list_state_subscription_active_until_ts ON account_list_state(subscription_active_until_ts)",
         "CREATE INDEX IF NOT EXISTS idx_account_list_state_derivation_version ON account_list_state(derivation_version)",
@@ -628,6 +646,25 @@ def refresh_account_list_state(
                     lower(trim(coalesce(json_extract(extra, '$.chatgpt_workspace_scope'), ''))) AS workspace_scope,
                     lower(trim(coalesce(json_extract(extra, '$.sync_statuses.sub2api.remote_state'), ''))) AS sub2api_remote_state,
                     lower(trim(coalesce(json_extract(extra, '$.sync_statuses.oaipay.remote_state'), ''))) AS oaipay_remote_state,
+                    lower(trim(coalesce(json_extract(extra, '$.baxigpt_cdk.status'), ''))) AS baxigpt_cdk_status,
+                    CASE
+                        WHEN lower(trim(CAST(coalesce(json_extract(extra, '$.idea_submit.unavailable'), '') AS TEXT)))
+                             IN ('1', 'true', 'yes', 'on')
+                        THEN 1
+                        ELSE 0
+                    END AS idea_marker_unavailable,
+                    CASE
+                        WHEN lower(trim(CAST(coalesce(json_extract(extra, '$.idea_submit_unavailable'), '') AS TEXT)))
+                             IN ('1', 'true', 'yes', 'on')
+                        THEN 1
+                        ELSE 0
+                    END AS idea_submit_unavailable,
+                    CASE
+                        WHEN lower(trim(CAST(coalesce(json_extract(extra, '$.chatgpt_account_unavailable'), '') AS TEXT)))
+                             IN ('1', 'true', 'yes', 'on')
+                        THEN 1
+                        ELSE 0
+                    END AS chatgpt_account_unavailable,
                     coalesce(
                         nullif(trim(CAST(json_extract(extra, '$.chatgpt_local.subscription.subscription_active_until') AS TEXT)), ''),
                         nullif(trim(CAST(json_extract(extra, '$.chatgpt_local.subscription.subscription_expires_at_iso') AS TEXT)), ''),
@@ -801,6 +838,15 @@ def refresh_account_list_state(
                     CASE WHEN sub2api_remote_state != '' THEN sub2api_remote_state ELSE 'unknown' END AS sub2api_state,
                     CASE WHEN oaipay_remote_state != '' THEN oaipay_remote_state ELSE 'unknown' END AS oaipay_state,
                     CASE
+                        WHEN idea_marker_unavailable = 1
+                            OR idea_submit_unavailable = 1
+                            OR (chatgpt_account_unavailable = 1 AND baxigpt_cdk_status = 'failed')
+                        THEN 'unavailable'
+                        WHEN baxigpt_cdk_status IN ('paid', 'submitted', 'processing', 'failed')
+                        THEN baxigpt_cdk_status
+                        ELSE 'available'
+                    END AS idea_submit_state,
+                    CASE
                         WHEN derived_revival_kind IN ('invalid_recheck', 'auto_delete_recheck', 'custom_email_recheck', 'unknown') THEN 'revived'
                         WHEN derived_revival_kind = 'custom_email_recheck_new' THEN 'recovery_new'
                         ELSE 'none'
@@ -835,6 +881,7 @@ def refresh_account_list_state(
                 account_validity,
                 sub2api_state,
                 oaipay_state,
+                idea_submit_state,
                 revival_state,
                 revival_kind,
                 subscription_active_until,
@@ -853,6 +900,7 @@ def refresh_account_list_state(
                 account_validity,
                 sub2api_state,
                 oaipay_state,
+                idea_submit_state,
                 revival_state,
                 revival_kind,
                 subscription_active_until,
@@ -871,6 +919,7 @@ def refresh_account_list_state(
                 account_validity = excluded.account_validity,
                 sub2api_state = excluded.sub2api_state,
                 oaipay_state = excluded.oaipay_state,
+                idea_submit_state = excluded.idea_submit_state,
                 revival_state = excluded.revival_state,
                 revival_kind = excluded.revival_kind,
                 subscription_active_until = excluded.subscription_active_until,
@@ -986,6 +1035,7 @@ def should_use_account_list_state(
     account_validity_filter: Any = None,
     sub2api_state: Any = None,
     oaipay_state: Any = None,
+    idea_submit_state: Any = None,
     revival_state: Any = None,
     sort_by: Any = None,
     sort_order: Any = None,
@@ -998,6 +1048,7 @@ def should_use_account_list_state(
             bool(_split_values(account_validity_filter)),
             bool(_split_values(sub2api_state)),
             bool(_split_values(oaipay_state)),
+            bool(_split_values(idea_submit_state)),
             bool(_split_values(revival_state)),
             should_sort_account_rows(sort_by, sort_order),
         ]
@@ -1013,6 +1064,7 @@ def apply_account_list_state_filters(
     account_validity_filter: Any = None,
     sub2api_state: Any = None,
     oaipay_state: Any = None,
+    idea_submit_state: Any = None,
     revival_state: Any = None,
 ) -> Any:
     if manually_used is not None:
@@ -1037,6 +1089,10 @@ def apply_account_list_state_filters(
     oaipay_states = _split_values(oaipay_state)
     if oaipay_states:
         query = query.where(AccountListStateModel.oaipay_state.in_(sorted(oaipay_states)))
+
+    idea_submit_states = _split_values(idea_submit_state)
+    if idea_submit_states:
+        query = query.where(AccountListStateModel.idea_submit_state.in_(sorted(idea_submit_states)))
 
     revival_states = _split_values(revival_state)
     if revival_states:
@@ -1093,6 +1149,7 @@ def filter_account_rows(
     account_validity_filter: Any = None,
     sub2api_state: Any = None,
     oaipay_state: Any = None,
+    idea_submit_state: Any = None,
     revival_state: Any = None,
 ) -> list[AccountModel]:
     auth_types = _split_values(auth_type)
@@ -1100,6 +1157,7 @@ def filter_account_rows(
     validity_values = _split_values(account_validity_filter)
     sub2api_states = _split_values(sub2api_state)
     oaipay_states = _split_values(oaipay_state)
+    idea_submit_states = _split_values(idea_submit_state)
     revival_states = _split_values(revival_state)
 
     filtered: list[AccountModel] = []
@@ -1116,6 +1174,8 @@ def filter_account_rows(
         if sub2api_states and account_sub2api_state(row, extra) not in sub2api_states:
             continue
         if oaipay_states and account_oaipay_state(row, extra) not in oaipay_states:
+            continue
+        if idea_submit_states and account_idea_submit_state(row, extra) not in idea_submit_states:
             continue
         if revival_states and account_revival_state(row, extra) not in revival_states:
             continue

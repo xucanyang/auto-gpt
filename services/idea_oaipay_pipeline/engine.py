@@ -386,6 +386,7 @@ class IdeaOaiPayPipelineEngine:
                 subscription_type=source.subscription_type,
                 account_validity_filter=source.account_validity,
                 sub2api_state=source.sub2api_state,
+                idea_submit_state=source.idea_submit_state,
             )
             oaipay_filter = _lower(source.oaipay_state)
             if oaipay_filter:

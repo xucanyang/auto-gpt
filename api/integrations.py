@@ -48,6 +48,7 @@ class BackfillRequest(BaseModel):
     account_validity: str = ""
     sub2api_state: str = ""
     oaipay_state: str = ""
+    idea_submit_state: str = ""
     category_id: Optional[int] = None
     category_mode: str = "auto"
     fallback_category_id: Optional[int] = None
@@ -1543,6 +1544,7 @@ def backfill_integrations(body: BackfillRequest):
             account_validity_filter=body.account_validity,
             sub2api_state=body.sub2api_state,
             oaipay_state=body.oaipay_state,
+            idea_submit_state=body.idea_submit_state,
         )
         if body.pending_only:
             def _is_pending_target(row: AccountModel) -> bool:

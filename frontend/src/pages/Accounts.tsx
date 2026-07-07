@@ -305,6 +305,7 @@ type AccountColumnFilters = {
   codexState: string[]
   sub2apiState: string[]
   oaipayState: string[]
+  ideaSubmitState: string[]
 }
 
 const EMPTY_ACCOUNT_FILTERS: AccountColumnFilters = {
@@ -317,6 +318,7 @@ const EMPTY_ACCOUNT_FILTERS: AccountColumnFilters = {
   codexState: [],
   sub2apiState: [],
   oaipayState: [],
+  ideaSubmitState: [],
 }
 
 export type AccountFilterPresetFilters = {
@@ -407,6 +409,15 @@ const OAIPAY_FILTER_OPTIONS = [
   { value: 'unknown', text: '未同步' },
 ]
 
+const IDEA_SUBMIT_FILTER_OPTIONS = [
+  { value: 'unavailable', text: '已标记不可用' },
+  { value: 'available', text: '未标记不可用' },
+  { value: 'paid', text: 'Idea已开通' },
+  { value: 'submitted', text: '已提交' },
+  { value: 'processing', text: '处理中' },
+  { value: 'failed', text: '失败' },
+]
+
 const SUBSCRIPTION_EXPIRY_SORT_OPTIONS = [
   { value: 'asc', text: '到期最早' },
   { value: 'desc', text: '到期最晚' },
@@ -422,6 +433,7 @@ const ACCOUNT_FILTER_PRESET_COLUMN_KEYS: Array<keyof AccountColumnFilters> = [
   'codexState',
   'sub2apiState',
   'oaipayState',
+  'ideaSubmitState',
 ]
 
 function normalizePresetList(value: unknown): string[] {
@@ -449,6 +461,7 @@ function cloneAccountColumnFilters(value?: Partial<Record<keyof AccountColumnFil
     codexState: [],
     sub2apiState: [],
     oaipayState: [],
+    ideaSubmitState: [],
   }
   ACCOUNT_FILTER_PRESET_COLUMN_KEYS.forEach((key) => {
     if (key === 'email') {
@@ -533,6 +546,7 @@ export function buildAccountFilterPresetSummary(filters?: AccountFilterPresetFil
     summarizePresetValues(ACCOUNT_VALIDITY_FILTER_OPTIONS, columnFilters.accountValidity) ? `认证状态：${summarizePresetValues(ACCOUNT_VALIDITY_FILTER_OPTIONS, columnFilters.accountValidity)}` : '',
     summarizePresetValues(SUB2API_FILTER_OPTIONS, columnFilters.sub2apiState) ? `Sub2API：${summarizePresetValues(SUB2API_FILTER_OPTIONS, columnFilters.sub2apiState)}` : '',
     summarizePresetValues(OAIPAY_FILTER_OPTIONS, columnFilters.oaipayState) ? `OAIPay：${summarizePresetValues(OAIPAY_FILTER_OPTIONS, columnFilters.oaipayState)}` : '',
+    summarizePresetValues(IDEA_SUBMIT_FILTER_OPTIONS, columnFilters.ideaSubmitState) ? `Idea提交：${summarizePresetValues(IDEA_SUBMIT_FILTER_OPTIONS, columnFilters.ideaSubmitState)}` : '',
     normalized.sortOrder ? `到期：${labelForOption(SUBSCRIPTION_EXPIRY_SORT_OPTIONS, normalized.sortOrder)}` : '',
   ].filter(Boolean)
   return parts.length ? parts.join(' · ') : '无筛选条件'
@@ -2158,6 +2172,7 @@ export default function Accounts() {
     accountValidity: columnFilters.accountValidity.join(','),
     sub2apiState: columnFilters.sub2apiState.join(','),
     oaipayState: columnFilters.oaipayState.join(','),
+    ideaSubmitState: columnFilters.ideaSubmitState.join(','),
     sortBy: subscriptionExpirySortOrder ? SUBSCRIPTION_EXPIRY_SORT_FIELD : '',
     sortOrder: subscriptionExpirySortOrder,
     page: currentPage,
@@ -2233,7 +2248,7 @@ export default function Accounts() {
 
   useEffect(() => {
     setCurrentPage(1)
-  }, [debouncedSearch, filterStatus, columnFilters.manuallyUsed, columnFilters.authType, columnFilters.subscriptionType, columnFilters.accountValidity, columnFilters.sub2apiState, columnFilters.oaipayState, subscriptionExpirySortOrder])
+  }, [debouncedSearch, filterStatus, columnFilters.manuallyUsed, columnFilters.authType, columnFilters.subscriptionType, columnFilters.accountValidity, columnFilters.sub2apiState, columnFilters.oaipayState, columnFilters.ideaSubmitState, subscriptionExpirySortOrder])
 
   useEffect(() => {
     if (typeof document === 'undefined') return
@@ -2356,6 +2371,7 @@ export default function Accounts() {
     if (columnFilters.accountValidity.length) body.account_validity = columnFilters.accountValidity.join(',')
     if (columnFilters.sub2apiState.length) body.sub2api_state = columnFilters.sub2apiState.join(',')
     if (columnFilters.oaipayState.length) body.oaipay_state = columnFilters.oaipayState.join(',')
+    if (columnFilters.ideaSubmitState.length) body.idea_submit_state = columnFilters.ideaSubmitState.join(',')
   }
 
   const buildPaypalFilteredEligibleParams = useCallback(() => {
@@ -2376,6 +2392,7 @@ export default function Accounts() {
     if (body.account_validity) params.set('account_validity', String(body.account_validity))
     if (body.sub2api_state) params.set('sub2api_state', String(body.sub2api_state))
     if (body.oaipay_state) params.set('oaipay_state', String(body.oaipay_state))
+    if (body.idea_submit_state) params.set('idea_submit_state', String(body.idea_submit_state))
     return params
   }, [
     search,
@@ -2386,6 +2403,7 @@ export default function Accounts() {
     columnFilters.accountValidity,
     columnFilters.sub2apiState,
     columnFilters.oaipayState,
+    columnFilters.ideaSubmitState,
   ])
 
   useEffect(() => {
@@ -2485,6 +2503,7 @@ export default function Accounts() {
       codexState: normalized.columnFilters.codexState,
       sub2apiState: normalized.columnFilters.sub2apiState,
       oaipayState: normalized.columnFilters.oaipayState,
+      ideaSubmitState: normalized.columnFilters.ideaSubmitState,
       sortOrder: normalized.sortOrder || undefined,
       pageSize: normalized.pageSize,
     })
@@ -2549,6 +2568,7 @@ export default function Accounts() {
         codexState: values.codexState,
         sub2apiState: values.sub2apiState,
         oaipayState: values.oaipayState,
+        ideaSubmitState: values.ideaSubmitState,
       },
       sortOrder: values.sortOrder,
       pageSize: values.pageSize,
@@ -5697,6 +5717,14 @@ export default function Accounts() {
           <Select
             allowClear
             size="small"
+            placeholder="Idea提交"
+            value={columnFilters.ideaSubmitState[0]}
+            options={toSelectOptions(IDEA_SUBMIT_FILTER_OPTIONS)}
+            onChange={(value) => setColumnFilters((prev) => ({ ...prev, ideaSubmitState: value ? [value] : [] }))}
+          />
+          <Select
+            allowClear
+            size="small"
             placeholder="到期排序"
             value={subscriptionExpirySortOrder || undefined}
             options={toSelectOptions(SUBSCRIPTION_EXPIRY_SORT_OPTIONS)}
@@ -6495,7 +6523,12 @@ export default function Accounts() {
         render: (_: any, record: any) => renderAccountValidityState(record),
       },
       {
-        title: 'Idea提交',
+        title: renderColumnFilterTitle(
+          'Idea提交',
+          columnFilters.ideaSubmitState,
+          IDEA_SUBMIT_FILTER_OPTIONS,
+          (next) => setColumnFilters((prev) => ({ ...prev, ideaSubmitState: next })),
+        ),
         key: 'idea_submit_status',
         width: 128,
         render: (_: any, record: any) => renderIdeaSubmitState(record),
@@ -7220,6 +7253,9 @@ export default function Accounts() {
                 </Form.Item>
                 <Form.Item name="oaipayState" label="OAIPay 状态" style={{ marginBottom: 0 }}>
                   <Select mode="multiple" placeholder="全部 OAIPay 状态" options={OAIPAY_FILTER_OPTIONS} allowClear />
+                </Form.Item>
+                <Form.Item name="ideaSubmitState" label="Idea 提交" style={{ marginBottom: 0 }}>
+                  <Select mode="multiple" placeholder="全部 Idea 提交状态" options={IDEA_SUBMIT_FILTER_OPTIONS} allowClear />
                 </Form.Item>
                 <Form.Item name="sortOrder" label="到期时间排序" style={{ marginBottom: 0 }}>
                   <Select placeholder="默认排序" options={SUBSCRIPTION_EXPIRY_SORT_OPTIONS} allowClear />

@@ -134,6 +134,7 @@ class BatchK12WorkspaceRecaptureTaskRequest(BaseModel):
     account_validity: str = ""
     sub2api_state: str = ""
     oaipay_state: str = ""
+    idea_submit_state: str = ""
     params: dict[str, Any] = Field(default_factory=dict)
     limit: int = 0
 
@@ -148,6 +149,7 @@ class BatchResumeSubscriptionAuthTaskRequest(BaseModel):
     subscription_type: str = ""
     account_validity: str = ""
     sub2api_state: str = ""
+    idea_submit_state: str = ""
     allow_phone_verification: bool | None = None
 
 
@@ -161,6 +163,7 @@ class PhoneBindingTestTaskRequest(BaseModel):
     subscription_type: str = ""
     account_validity: str = ""
     sub2api_state: str = ""
+    idea_submit_state: str = ""
     phone_lines: str = ""
     use_pool: bool = False
     timeout_seconds: int = 180
@@ -199,6 +202,7 @@ class BaxiGptCdkSubmitTaskRequest(BaseModel):
     subscription_type: str = ""
     account_validity: str = ""
     sub2api_state: str = ""
+    idea_submit_state: str = ""
     code_lines: str = ""
     use_pool: bool = True
     precheck: bool = True
@@ -220,6 +224,7 @@ class ChatGptPaypalBindTaskRequest(BaseModel):
     subscription_type: str = ""
     account_validity: str = ""
     sub2api_state: str = ""
+    idea_submit_state: str = ""
     upstream: str = "plus_iceaix"
     base_url: str = ""
     proxy: str = ""
@@ -255,6 +260,7 @@ class BatchPaymentLinkTaskRequest(BaseModel):
     subscription_type: str = ""
     account_validity: str = ""
     sub2api_state: str = ""
+    idea_submit_state: str = ""
     params: dict[str, Any] = Field(default_factory=dict)
     skip_existing: bool = True
     force_refresh: bool = False
@@ -271,6 +277,7 @@ class BatchSub2ApiUploadTaskRequest(BaseModel):
     subscription_type: str = ""
     account_validity: str = ""
     sub2api_state: str = ""
+    idea_submit_state: str = ""
     params: dict[str, Any] = Field(default_factory=dict)
     limit: int = 0
 
@@ -288,6 +295,7 @@ class BatchOaipayUploadTaskRequest(BaseModel):
     subscription_type: str = ""
     account_validity: str = ""
     oaipay_state: str = ""
+    idea_submit_state: str = ""
     params: dict[str, Any] = Field(default_factory=dict)
     limit: int = 0
 
@@ -350,6 +358,7 @@ class BatchInvalidRecheckTaskRequest(BaseModel):
     auth_type: str = ""
     subscription_type: str = ""
     account_validity: str = ""
+    idea_submit_state: str = ""
     limit: int = 0
     params: dict[str, Any] = Field(default_factory=dict)
 
@@ -364,6 +373,7 @@ class BatchProbeLocalStatusTaskRequest(BaseModel):
     subscription_type: str = ""
     account_validity: str = ""
     sub2api_state: str = ""
+    idea_submit_state: str = ""
     limit: int = 0
     params: dict[str, Any] = Field(default_factory=dict)
 
@@ -877,6 +887,7 @@ def _filtered_chatgpt_accounts(session: Session, req: Any) -> list[AccountModel]
         account_validity_filter=getattr(req, "account_validity", ""),
         sub2api_state=getattr(req, "sub2api_state", ""),
         oaipay_state=getattr(req, "oaipay_state", ""),
+        idea_submit_state=getattr(req, "idea_submit_state", ""),
     )
 
 
@@ -1505,6 +1516,7 @@ def _resolve_batch_sub2api_upload_accounts(
             subscription_type=req.subscription_type,
             account_validity_filter=req.account_validity,
             sub2api_state="",
+            idea_submit_state=req.idea_submit_state,
         )
 
     matched: list[dict[str, Any]] = []
@@ -1636,6 +1648,7 @@ def _resolve_batch_oaipay_upload_accounts(
             subscription_type=req.subscription_type,
             account_validity_filter=req.account_validity,
             oaipay_state="",
+            idea_submit_state=req.idea_submit_state,
         )
 
     matched: list[dict[str, Any]] = []

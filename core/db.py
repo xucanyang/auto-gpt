@@ -97,6 +97,7 @@ class AccountListStateModel(SQLModel, table=True):
     account_validity: str = Field(default="valid", index=True)
     sub2api_state: str = Field(default="unknown", index=True)
     oaipay_state: str = Field(default="unknown", index=True)
+    idea_submit_state: str = Field(default="available", index=True)
     revival_state: str = Field(default="none", index=True)
     revival_kind: str = Field(default="none", index=True)
     subscription_active_until: str = ""
@@ -3316,6 +3317,7 @@ def _ensure_account_list_state_schema() -> None:
                 account_validity TEXT NOT NULL DEFAULT 'valid',
                 sub2api_state TEXT NOT NULL DEFAULT 'unknown',
                 oaipay_state TEXT NOT NULL DEFAULT 'unknown',
+                idea_submit_state TEXT NOT NULL DEFAULT 'available',
                 revival_state TEXT NOT NULL DEFAULT 'none',
                 revival_kind TEXT NOT NULL DEFAULT 'none',
                 subscription_active_until TEXT NOT NULL DEFAULT '',
@@ -3336,6 +3338,7 @@ def _ensure_account_list_state_schema() -> None:
             "account_validity": "TEXT NOT NULL DEFAULT 'valid'",
             "sub2api_state": "TEXT NOT NULL DEFAULT 'unknown'",
             "oaipay_state": "TEXT NOT NULL DEFAULT 'unknown'",
+            "idea_submit_state": "TEXT NOT NULL DEFAULT 'available'",
             "revival_state": "TEXT NOT NULL DEFAULT 'none'",
             "revival_kind": "TEXT NOT NULL DEFAULT 'none'",
             "subscription_active_until": "TEXT NOT NULL DEFAULT ''",
@@ -3381,6 +3384,10 @@ def _ensure_account_list_state_schema() -> None:
         conn.exec_driver_sql(
             "CREATE INDEX IF NOT EXISTS idx_account_list_state_oaipay_state "
             "ON account_list_state(oaipay_state)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_account_list_state_idea_submit_state "
+            "ON account_list_state(idea_submit_state)"
         )
         conn.exec_driver_sql(
             "CREATE INDEX IF NOT EXISTS idx_account_list_state_revival_state "

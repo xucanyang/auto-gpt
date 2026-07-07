@@ -10,6 +10,7 @@ export type AccountsQueryParams = {
   accountValidity?: string
   sub2apiState?: string
   oaipayState?: string
+  ideaSubmitState?: string
   revivalState?: string
   sortBy?: string
   sortOrder?: string
@@ -32,6 +33,7 @@ export function useAccountsQuery({
   accountValidity = '',
   sub2apiState = '',
   oaipayState = '',
+  ideaSubmitState = '',
   revivalState = '',
   sortBy = '',
   sortOrder = '',
@@ -39,7 +41,7 @@ export function useAccountsQuery({
   pageSize = 50,
 }: AccountsQueryParams) {
   return useQuery<AccountsQueryResult>({
-    queryKey: ['accounts', { email, status, manuallyUsed, authType, subscriptionType, accountValidity, sub2apiState, oaipayState, revivalState, sortBy, sortOrder, page, pageSize }],
+    queryKey: ['accounts', { email, status, manuallyUsed, authType, subscriptionType, accountValidity, sub2apiState, oaipayState, ideaSubmitState, revivalState, sortBy, sortOrder, page, pageSize }],
     queryFn: async ({ signal }) => {
       const params = new URLSearchParams({
         platform: 'chatgpt',
@@ -55,6 +57,7 @@ export function useAccountsQuery({
       if (accountValidity) params.set('account_validity', accountValidity)
       if (sub2apiState) params.set('sub2api_state', sub2apiState)
       if (oaipayState) params.set('oaipay_state', oaipayState)
+      if (ideaSubmitState) params.set('idea_submit_state', ideaSubmitState)
       if (revivalState) params.set('revival_state', revivalState)
       if (sortBy && sortOrder) {
         params.set('sort_by', sortBy)

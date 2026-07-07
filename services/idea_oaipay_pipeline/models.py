@@ -25,6 +25,7 @@ class AccountSourceConfig(BaseModel):
     account_validity: str = ""
     sub2api_state: str = ""
     oaipay_state: str = ""
+    idea_submit_state: str = ""
     limit: int = 0
     target_count: int = 0
     register_config: dict = PydanticField(default_factory=dict, alias="register")
