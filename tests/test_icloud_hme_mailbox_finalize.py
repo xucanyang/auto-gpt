@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from core.base_mailbox import IcloudHmeMailbox, MailboxAccount
 
@@ -97,6 +97,97 @@ class IcloudHmeMailboxFinalizeTests(unittest.TestCase):
         self.assertEqual(IcloudHmeMailbox._helper_lease_id(legacy), "")
         self.assertEqual(IcloudHmeMailbox._helper_lease_id(helper_with_explicit_lease), "lease-1")
         self.assertEqual(IcloudHmeMailbox._helper_lease_id(helper_provider_state), "lease-2")
+
+    def test_helper_ready_waits_code_from_tempmail_forward_mailbox(self):
+        mailbox = IcloudHmeMailbox(
+            icloud_hme_mode="helper_ready_api",
+            icloud_cookie="",
+            icloud_forward_to="global@example.com",
+            tempmail_api_url="http://tempmail-api-1:8080",
+            tempmail_api_key="test-key",
+            icloud_hme_helper_api_url="http://helper-api",
+            icloud_hme_helper_internal_key="helper-key",
+        )
+        account = MailboxAccount(
+            email="alias@icloud.com",
+            account_id="lease-1",
+            extra={
+                "provider": "icloud_hme",
+                "mode": "helper_ready_api",
+                "lease_id": "lease-1",
+                "forward_to": "specific@example.com",
+                "forward_mailbox_id": "specific-mbox",
+            },
+        )
+
+        mailbox._helper_client.wait_code = Mock(side_effect=AssertionError("helper wait-code must not be called"))
+        mailbox._tempmail_mailbox.ensure_mailbox_by_email = Mock(
+            side_effect=lambda email, force_lookup=False: MailboxAccount(
+                email=email,
+                account_id=f"mbox-{email}",
+            )
+        )
+        mailbox._tempmail_mailbox._list_emails = Mock(
+            side_effect=lambda mailbox_id: [{"id": "msg-1", "subject": "OpenAI verification"}]
+            if mailbox_id == "specific-mbox"
+            else []
+        )
+        mailbox._tempmail_mailbox._get_email_detail = Mock(
+            return_value={
+                "received_for": ["alias@icloud.com"],
+                "subject": "OpenAI verification",
+                "body_text": "Your verification code is 123456.",
+                "raw_message": "Delivered-To: alias@icloud.com",
+            }
+        )
+
+        code = mailbox.wait_for_code(account, timeout=1)
+
+        self.assertEqual(code, "123456")
+        mailbox._helper_client.wait_code.assert_not_called()
+        mailbox._tempmail_mailbox._list_emails.assert_any_call("specific-mbox")
+        self.assertEqual(mailbox._last_verification_result["provider"], "IcloudHmeTempMailForwardMailbox")
+        self.assertEqual(mailbox._last_verification_result["lease_id"], "lease-1")
+        self.assertEqual(mailbox._last_verification_result["matched_mailbox_id"], "specific-mbox")
+
+    def test_helper_ready_current_ids_reads_tempmail_not_helper(self):
+        mailbox = IcloudHmeMailbox(
+            icloud_hme_mode="helper_ready_api",
+            icloud_cookie="",
+            icloud_forward_to="global@example.com",
+            tempmail_api_url="http://tempmail-api-1:8080",
+            tempmail_api_key="test-key",
+            icloud_hme_helper_api_url="http://helper-api",
+            icloud_hme_helper_internal_key="helper-key",
+        )
+        account = MailboxAccount(
+            email="alias@icloud.com",
+            account_id="lease-1",
+            extra={
+                "provider": "icloud_hme",
+                "mode": "helper_ready_api",
+                "lease_id": "lease-1",
+                "forward_to": "specific@example.com",
+                "forward_mailbox_id": "specific-mbox",
+            },
+        )
+
+        mailbox._helper_client.list_emails = Mock(side_effect=AssertionError("helper list-emails must not be called"))
+        mailbox._tempmail_mailbox.ensure_mailbox_by_email = Mock(
+            side_effect=lambda email, force_lookup=False: MailboxAccount(
+                email=email,
+                account_id=f"mbox-{email}",
+            )
+        )
+        mailbox._tempmail_mailbox._list_emails = Mock(
+            side_effect=lambda mailbox_id: [{"id": "old-1"}] if mailbox_id == "specific-mbox" else []
+        )
+
+        ids = mailbox.get_current_ids(account)
+
+        self.assertIn("old-1", ids)
+        mailbox._helper_client.list_emails.assert_not_called()
+        mailbox._tempmail_mailbox._list_emails.assert_any_call("specific-mbox")
 
     def test_early_homepage_failure_still_releases_alias(self):
         mailbox = self._build_mailbox()

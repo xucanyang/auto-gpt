@@ -7,6 +7,14 @@
 ## [Unreleased] (未发布)
 
 
+## [1.3.31] - 2026-07-08
+### 优化 (Changed)
+- **统一 iCloud HME 验证码读取链路为 TempMail 转发箱轮询**：`core/base_mailbox.py` 将 `helper_ready_api` 模式下的新 HME Ready 出库账号也纳入 TempMail 转发收件箱扫描，Helper 只负责领取/出库 HME alias 与保留 lease 结果归档，不再通过 `/api/hme-ready/mailboxes/{lease_id}/wait-code` 承担验证码等待主链路；新账号优先使用 Helper 返回的 `forward_mailbox_id/forward_to`，缺失绑定时回退扫描当前配置的全部 `icloud_forward_to` 转发邮箱。
+- **保留旧账号与新出库账号一致的收码规则**：旧账号列表中的 iCloud HME alias 继续按已有邮箱地址去 TempMail 里匹配 `received_for` 或原始邮件头，带历史 `forward_mailbox_id` 时优先扫描该收件箱，避免账号测活依赖 Helper checkout 状态；新 Helper 出库账号同样只按当前 alias 匹配邮件验证码，防止跨转发箱误用其他账号邮件。
+
+### 测试 (Tests)
+- **补充 Helper Ready 转发箱读码回归测试**：`tests/test_icloud_hme_mailbox_finalize.py` 新增覆盖 `helper_ready_api` 模式下 `wait_for_code()` 与 `get_current_ids()` 均调用 TempMail 转发箱，而不会调用 Helper 的 `wait-code/list-emails` 读信接口；同步前端侧边栏版本号至 `v1.3.31` 便于上线确认。
+
 ## [1.3.30] - 2026-07-08
 ### 修复 (Fixed)
 - **修复旧 iCloud HME 账号复查误用 Helper Ready lease 导致验证码等待刷屏**：`services/chatgpt_core/pending_business_invites.py` 在恢复历史 `chatgpt_mailbox_state` 时识别旧 `icloud_hme` 状态中保存的 Apple anonymous_id，当前全局邮箱模式为 `helper_ready_api` 但账号没有明确 `lease_id/checkout_id` 时自动切回 `import_pool` 转发邮箱扫描，避免把 `m5...` 这类匿名 ID 当成 `/api/hme-ready/mailboxes/{lease_id}/wait-code` 的 checkout lease 使用。
@@ -811,4 +819,8 @@
 
 ## 2026-07-08 04:39:29 +0800
 - 修复旧 HME 账号验证码等待刷屏
+- 发布模式: multi
+
+## 2026-07-08 05:13:57 +0800
+- 统一 HME 验证码读取到 TempMail 转发箱
 - 发布模式: multi

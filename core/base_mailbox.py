@@ -2516,6 +2516,7 @@ class IcloudHmeMailbox(BaseMailbox):
         )
         self._forward_mailbox_account: MailboxAccount | None = None
         self._forward_mailbox_accounts: list[MailboxAccount] = []
+        self._forward_mailbox_by_email_cache: dict[str, MailboxAccount] = {}
 
     def _bind_runtime_state(self) -> None:
         self._tempmail_mailbox._log_fn = getattr(self, "_log_fn", None)
@@ -2529,6 +2530,8 @@ class IcloudHmeMailbox(BaseMailbox):
             raise RuntimeError("iCloud HME 未配置：请设置 icloud_forward_to")
         if self._icloud_hme_mode == "helper_ready_api":
             self._helper_client._ensure_config()
+            self._bind_runtime_state()
+            self._tempmail_mailbox._ensure_config()
             return
         if self._icloud_hme_mode == "live" and not self._icloud_cookie:
             raise RuntimeError("iCloud HME 未配置：请设置 icloud_cookie")
@@ -2618,6 +2621,87 @@ class IcloudHmeMailbox(BaseMailbox):
                 ))
         self._forward_mailbox_accounts = accounts
         return self._forward_mailbox_accounts
+
+    def _forward_to_candidates_from_account(self, account: MailboxAccount | None) -> list[str]:
+        extra = dict(getattr(account, "extra", None) or {}) if account is not None else {}
+        raw_values = [
+            extra.get("forward_to"),
+            extra.get("configured_forward_to"),
+            extra.get("configured_forward_tos"),
+        ]
+        nested_account = extra.get("account")
+        if isinstance(nested_account, dict):
+            nested_extra = nested_account.get("extra")
+            if isinstance(nested_extra, dict):
+                raw_values.append(nested_extra.get("forward_to"))
+        candidates: list[str] = []
+        seen: set[str] = set()
+
+        def append_raw(raw: Any) -> None:
+            if raw in (None, ""):
+                return
+            if isinstance(raw, (list, tuple, set)):
+                for item in raw:
+                    append_raw(item)
+                return
+            for item in re.split(r"[,;\s]+", str(raw or "")):
+                normalized = self._normalize_email(item)
+                if not normalized or normalized == "*" or "@" not in normalized or normalized in seen:
+                    continue
+                seen.add(normalized)
+                candidates.append(normalized)
+
+        for value in raw_values:
+            append_raw(value)
+        return candidates
+
+    def _candidate_forward_mailboxes_for_account(self, account: MailboxAccount | None) -> list[MailboxAccount]:
+        self._ensure_config()
+        extra = dict(getattr(account, "extra", None) or {}) if account is not None else {}
+        accounts: list[MailboxAccount] = []
+        seen_ids: set[str] = set()
+        seen_forward_to: set[str] = set()
+
+        def add_account(candidate: MailboxAccount | None) -> None:
+            if candidate is None:
+                return
+            mailbox_id = str(getattr(candidate, "account_id", "") or "").strip()
+            if not mailbox_id or mailbox_id in seen_ids:
+                return
+            seen_ids.add(mailbox_id)
+            accounts.append(candidate)
+
+        forward_candidates = self._forward_to_candidates_from_account(account)
+        bound_mailbox_id = str(extra.get("forward_mailbox_id") or "").strip()
+        if bound_mailbox_id:
+            add_account(
+                MailboxAccount(
+                    email=forward_candidates[0] if forward_candidates else self._icloud_forward_to,
+                    account_id=bound_mailbox_id,
+                    extra={"mailbox_action": "bound_forward_mailbox"},
+                )
+            )
+
+        for forward_to in forward_candidates:
+            if forward_to in seen_forward_to:
+                continue
+            seen_forward_to.add(forward_to)
+            cached = self._forward_mailbox_by_email_cache.get(forward_to)
+            if cached is not None:
+                add_account(cached)
+                continue
+            resolved = self._tempmail_mailbox.ensure_mailbox_by_email(
+                forward_to,
+                force_lookup=True,
+            )
+            self._forward_mailbox_by_email_cache[forward_to] = resolved
+            add_account(
+                resolved
+            )
+
+        for forward_account in self._resolve_all_forward_mailboxes():
+            add_account(forward_account)
+        return accounts
 
     def _shared_mailbox_id_for(self, account: MailboxAccount | None = None) -> str:
         if account is not None:
@@ -2859,7 +2943,7 @@ class IcloudHmeMailbox(BaseMailbox):
                 "mailbox_action": extra.get("mailbox_action") or "claimed_helper",
             }
         )
-        self._log(f"[iCloudHME] Helper 已领取别名: {email} lease={lease_id}")
+        self._log(f"[iCloudHME] Helper 已领取别名: {email} lease={lease_id}，验证码改由 TempMail 转发箱轮询")
         return MailboxAccount(email=email, account_id=lease_id, extra=extra)
 
     def get_email(self) -> MailboxAccount:
@@ -2876,24 +2960,11 @@ class IcloudHmeMailbox(BaseMailbox):
         return self.create_alias_for_import_pool()
 
     def get_current_ids(self, account: MailboxAccount) -> set:
-        if self._icloud_hme_mode == "helper_ready_api":
-            lease_id = self._helper_lease_id(account)
-            if not lease_id:
-                return set()
-            return {
-                self._message_id_from_helper_email(message, idx)
-                for idx, message in enumerate(self._helper_client.list_emails(lease_id))
-            }
-        
         all_ids = set()
-        mailbox_ids_to_check = {fwd_acc.account_id for fwd_acc in self._resolve_all_forward_mailboxes()}
-        
-        extra = dict(getattr(account, "extra", None) or {})
-        bound_mailbox_id = str(extra.get("forward_mailbox_id") or "").strip()
-        if bound_mailbox_id:
-            mailbox_ids_to_check.add(bound_mailbox_id)
-            
-        for m_id in mailbox_ids_to_check:
+        for forward_mailbox in self._candidate_forward_mailboxes_for_account(account):
+            m_id = str(getattr(forward_mailbox, "account_id", "") or "").strip()
+            if not m_id:
+                continue
             try:
                 mails = self._tempmail_mailbox._list_emails(m_id)
                 for idx, msg in enumerate(mails):
@@ -2915,53 +2986,12 @@ class IcloudHmeMailbox(BaseMailbox):
         from core.db import update_icloud_hme_alias_on_otp
 
         self._ensure_config()
-        if self._icloud_hme_mode == "helper_ready_api":
-            lease_id = self._helper_lease_id(account)
-            if not lease_id:
-                raise RuntimeError("icloud_hme helper_ready_api 当前任务缺少 lease_id")
-            self._helper_wait_started_leases.add(lease_id)
-            exclude_codes = {
-                str(code).strip()
-                for code in (kwargs.get("exclude_codes") or set())
-                if str(code or "").strip()
-            }
-            result = self._helper_client.wait_code(
-                lease_id,
-                timeout_seconds=max(int(timeout or self._wait_timeout_seconds), 1),
-                before_ids=before_ids or set(),
-                code_pattern=code_pattern or "",
-                otp_sent_at=kwargs.get("otp_sent_at"),
-                exclude_codes=exclude_codes,
-                phase=kwargs.get("phase") or "",
-            )
-            code = str((result or {}).get("code") or "").strip()
-            if not code:
-                message = str((result or {}).get("message") or (result or {}).get("error") or "等待验证码超时").strip()
-                raise TimeoutError(message)
-            mailbox_meta = dict((result or {}).get("mailbox") or {})
-            self._record_verification_result(
-                message_id=(result or {}).get("message_id") or "",
-                code=code,
-                phase=kwargs.get("phase") or "",
-                provider=(result or {}).get("provider") or "IcloudHmeReadyApiMailbox",
-                metadata={
-                    "received_for": list((result or {}).get("received_for") or []),
-                    "matched_alias": getattr(account, "email", "") or "",
-                    "mailbox": mailbox_meta,
-                    "lease_id": lease_id,
-                    "matched_forward_to": (result or {}).get("matched_forward_to") or mailbox_meta.get("matched_forward_to") or "",
-                    "matched_mailbox_id": (result or {}).get("matched_mailbox_id") or mailbox_meta.get("matched_mailbox_id") or "",
-                    "raw_message_id": (result or {}).get("raw_message_id") or "",
-                    "scan_targets": (result or {}).get("scan_targets") or [],
-                    "scan_errors": (result or {}).get("scan_errors") or [],
-                },
-            )
-            self._log(f"[iCloudHME] Helper 命中验证码: {code}")
-            return code
-
         alias = self._normalize_email(getattr(account, "email", "") or "")
         if not alias:
             raise RuntimeError("icloud_hme 当前任务缺少 alias 邮箱地址")
+        helper_lease_id = self._helper_lease_id(account)
+        if self._icloud_hme_mode == "helper_ready_api" and helper_lease_id:
+            self._helper_wait_started_leases.add(helper_lease_id)
 
         seen = set(before_ids or [])
         otp_sent_at = kwargs.get("otp_sent_at")
@@ -2971,15 +3001,11 @@ class IcloudHmeMailbox(BaseMailbox):
             if str(code or "").strip()
         }
 
-        extra = dict(getattr(account, "extra", None) or {})
-        bound_mailbox_id = str(extra.get("forward_mailbox_id") or "").strip()
-
         def poll_once() -> Optional[str]:
-            mailbox_ids_to_check = {fwd_acc.account_id for fwd_acc in self._resolve_all_forward_mailboxes()}
-            if bound_mailbox_id:
-                mailbox_ids_to_check.add(bound_mailbox_id)
-
-            for m_id in mailbox_ids_to_check:
+            for forward_mailbox in self._candidate_forward_mailboxes_for_account(account):
+                m_id = str(getattr(forward_mailbox, "account_id", "") or "").strip()
+                if not m_id:
+                    continue
                 try:
                     mails = self._tempmail_mailbox._list_emails(m_id)
                 except Exception as exc:
@@ -3035,20 +3061,21 @@ class IcloudHmeMailbox(BaseMailbox):
                             anonymous_id,
                             last_otp_at=self._utcnow_iso(),
                         )
-                    provider = "IcloudHmeReadyApiMailbox" if self._icloud_hme_mode == "helper_ready_api" else "IcloudHmeMailbox"
                     self._record_verification_result(
                         message_id=mid,
                         code=code,
                         phase=kwargs.get("phase") or "",
-                        provider=provider,
+                        provider="IcloudHmeTempMailForwardMailbox",
                         metadata={
                             "received_for": list(received_for or []),
                             "matched_alias": getattr(account, "email", "") or "",
                             "mailbox": {"id": m_id},
-                            "lease_id": lease_id if self._icloud_hme_mode == "helper_ready_api" else "",
+                            "lease_id": helper_lease_id if self._icloud_hme_mode == "helper_ready_api" else "",
+                            "matched_forward_to": str(getattr(forward_mailbox, "email", "") or ""),
+                            "matched_mailbox_id": m_id,
                         },
                     )
-                    self._log(f"[iCloudHME] 命中验证码: {code}")
+                    self._log(f"[iCloudHME] TempMail 转发箱命中验证码: {code}")
                     return code
             return None
 
