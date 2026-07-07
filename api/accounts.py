@@ -23,7 +23,7 @@ from services.account_rate_limit_recovery import (
     mark_account_rate_limited,
     reconcile_rate_limited_accounts,
 )
-from services.chatgpt_account_state import classify_chatgpt_capabilities
+from services.chatgpt_account_state import AUTH_INVALID_STATES, classify_chatgpt_capabilities, normalize_subscription_plan
 from services.chatgpt_core.bound_phone import chatgpt_bound_phone_payload, chatgpt_phone_challenge_payload
 from services.chatgpt_core.codex_usage import build_codex_usage_progress_from_extra
 from services.chatgpt_core.local_status_refresh import schedule_chatgpt_local_status_refresh_for_account_id
@@ -1001,18 +1001,86 @@ def _build_idea_submit_summary(extra: dict[str, Any], baxigpt_cdk: dict[str, Any
     }
 
 
+def _truthy_value(value: Any) -> bool:
+    return _safe_str(value).lower() in {"1", "true", "yes", "on"}
+
+
+def _current_subscription_plan(subscription: dict[str, Any], capabilities: dict[str, Any]) -> str:
+    local_plan = normalize_subscription_plan(subscription.get("plan"))
+    if local_plan != "unknown":
+        return local_plan
+    capabilities_plan = normalize_subscription_plan(capabilities.get("subscription_plan"))
+    if capabilities_plan != "unknown" and _truthy_value(capabilities.get("subscription_checked")):
+        return capabilities_plan
+    return "unknown"
+
+
+def _last_known_subscription_plan(
+    subscription: dict[str, Any],
+    capabilities: dict[str, Any],
+    extra: dict[str, Any],
+    current_plan: str,
+) -> str:
+    if current_plan != "unknown":
+        return current_plan
+    for candidate in (
+        capabilities.get("last_known_subscription_plan"),
+        subscription.get("last_known_plan"),
+        extra.get("last_known_subscription_plan"),
+        capabilities.get("subscription_plan"),
+        extra.get("chatgpt_plan_type"),
+        extra.get("chatgpt_subscription_plan"),
+    ):
+        resolved = normalize_subscription_plan(candidate)
+        if resolved != "unknown":
+            return resolved
+    return ""
+
+
+def _subscription_refresh_state(
+    subscription: dict[str, Any],
+    capabilities: dict[str, Any],
+    auth: dict[str, Any],
+    current_plan: str,
+    last_known_plan: str,
+) -> str:
+    explicit = _safe_str(capabilities.get("subscription_refresh_state")).lower()
+    if explicit:
+        return explicit
+    auth_level = _safe_str(capabilities.get("auth_level")).lower()
+    upload_gate = _safe_str(capabilities.get("upload_gate")).lower()
+    auth_state = _safe_str(auth.get("state")).lower()
+    if auth_level == "invalid" or upload_gate == "blocked_auth_invalid" or auth_state in AUTH_INVALID_STATES:
+        return "auth_invalid"
+    if current_plan != "unknown":
+        return "confirmed"
+    if auth_state == "probe_failed":
+        return "refresh_failed"
+    if last_known_plan and subscription:
+        return "refresh_failed"
+    if not auth_state:
+        return "not_checked"
+    if auth_state in {"unknown", "not_checked", "missing_refresh_token"}:
+        return "not_checked"
+    return "unknown_plan"
+
+
 def _build_subscription_summary(
     subscription: dict[str, Any],
     capabilities: dict[str, Any],
     extra: dict[str, Any],
+    auth: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    auth = auth if isinstance(auth, dict) else {}
+    current_plan = _current_subscription_plan(subscription, capabilities)
+    last_known_plan = _last_known_subscription_plan(subscription, capabilities, extra, current_plan)
+    refresh_state = _subscription_refresh_state(subscription, capabilities, auth, current_plan, last_known_plan)
+    stale = current_plan == "unknown" and bool(last_known_plan)
     return {
-        "plan": _safe_str(
-            capabilities.get("subscription_plan")
-            or subscription.get("plan")
-            or extra.get("chatgpt_plan_type")
-            or extra.get("chatgpt_subscription_plan")
-        ),
+        "plan": current_plan,
+        "last_known_plan": last_known_plan,
+        "refresh_state": refresh_state,
+        "stale": stale,
         "workspace_plan_type": _safe_str(subscription.get("workspace_plan_type")),
         "active_until": _safe_str(
             subscription.get("subscription_active_until")
@@ -1024,8 +1092,9 @@ def _build_subscription_summary(
         ),
         "checked_at": _safe_str(subscription.get("checked_at")),
         "source": _safe_str(subscription.get("source")),
-        "has_paid_subscription": bool(capabilities.get("has_paid_subscription")),
-        "subscription_checked": bool(capabilities.get("subscription_checked")),
+        "has_paid_subscription": current_plan in {"plus", "pro", "team", "enterprise"},
+        "last_known_has_paid_subscription": last_known_plan in {"plus", "pro", "team", "enterprise"},
+        "subscription_checked": current_plan != "unknown",
     }
 
 
@@ -1097,28 +1166,33 @@ def _build_account_validity_summary(
     account: AccountModel,
     auth_summary: dict[str, Any],
     capabilities: dict[str, Any],
+    codex_summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    codex_summary = codex_summary if isinstance(codex_summary, dict) else {}
     auth_level = _safe_str(auth_summary.get("level") or capabilities.get("auth_level")).lower()
     upload_gate = _safe_str(capabilities.get("upload_gate")).lower()
     auth_state = _safe_str(auth_summary.get("state")).lower()
-    invalid_states = {
-        "refresh_token_invalidated",
-        "access_token_invalidated",
-        "unauthorized",
-        "account_deactivated",
-        "banned_like",
-        "invalid",
-    }
-    valid = not (
+    codex_state = _safe_str(codex_summary.get("state") or capabilities.get("codex_state")).lower()
+    auth_http_status = _safe_int(auth_summary.get("http_status"))
+    codex_http_status = _safe_int(codex_summary.get("http_status"))
+    if (
         _safe_str(account.status).lower() == "invalid"
         or auth_level == "invalid"
         or upload_gate == "blocked_auth_invalid"
-        or auth_state in invalid_states
-    )
-    reason = ""
-    if not valid:
-        reason = "auth_invalid" if auth_level == "invalid" or auth_state in invalid_states else "status_invalid"
-    return {"state": "valid" if valid else "invalid", "valid": valid, "reason": reason}
+        or auth_state in AUTH_INVALID_STATES
+        or codex_state in AUTH_INVALID_STATES
+        or auth_http_status == 401
+        or codex_http_status == 401
+    ):
+        reason = "auth_invalid" if auth_level == "invalid" or auth_state in AUTH_INVALID_STATES else "status_invalid"
+        if codex_state in AUTH_INVALID_STATES or codex_http_status == 401:
+            reason = "codex_auth_invalid"
+        return {"state": "invalid", "valid": False, "reason": reason}
+    if auth_state == "probe_failed" or codex_state == "probe_failed":
+        return {"state": "refresh_failed", "valid": False, "reason": "probe_failed"}
+    if not auth_state and not auth_level:
+        return {"state": "not_checked", "valid": False, "reason": "not_checked"}
+    return {"state": "valid", "valid": True, "reason": ""}
 
 
 def _build_phone_summary(
@@ -1211,9 +1285,9 @@ def _serialize_account_compact_item(
     oaipay_sync = _build_sync_summary(sync_statuses.get("oaipay") if isinstance(sync_statuses.get("oaipay"), dict) else {})
     cliproxy_sync = _build_sync_summary(sync_statuses.get("cliproxyapi") if isinstance(sync_statuses.get("cliproxyapi"), dict) else {})
     auth_summary = _build_auth_summary(account, extra, auth, chatgpt_capabilities)
-    subscription_summary = _build_subscription_summary(chatgpt_subscription, chatgpt_capabilities, extra)
+    subscription_summary = _build_subscription_summary(chatgpt_subscription, chatgpt_capabilities, extra, auth)
     codex_summary = _build_codex_summary(codex, chatgpt_capabilities)
-    validity_summary = _build_account_validity_summary(account, auth_summary, chatgpt_capabilities)
+    validity_summary = _build_account_validity_summary(account, auth_summary, chatgpt_capabilities, codex_summary)
     baxigpt_cdk = _build_baxigpt_cdk_summary(extra.get("baxigpt_cdk") if isinstance(extra.get("baxigpt_cdk"), dict) else {})
     idea_submit = _build_idea_submit_summary(extra, baxigpt_cdk)
     workspace_variants = _build_workspace_variants_summary(extra)
@@ -1274,6 +1348,9 @@ def _serialize_account_compact_item(
         },
         "auth_level": _safe_str(auth_summary.get("level")),
         "subscription_plan": _safe_str(subscription_summary.get("plan")),
+        "last_known_subscription_plan": _safe_str(subscription_summary.get("last_known_plan")),
+        "subscription_refresh_state": _safe_str(subscription_summary.get("refresh_state")),
+        "subscription_plan_stale": bool(subscription_summary.get("stale")),
         "subscription_active_until": _safe_str(subscription_summary.get("active_until")),
         "codex_state": _safe_str(codex_summary.get("state")),
         "cliproxy_remote_state": _safe_str(cliproxy_sync.get("remote_state")),
@@ -1287,6 +1364,9 @@ def _serialize_account_compact_item(
             "auth": auth_summary,
             "subscription": {
                 "plan": subscription_summary["plan"],
+                "last_known_plan": subscription_summary["last_known_plan"],
+                "refresh_state": subscription_summary["refresh_state"],
+                "stale": subscription_summary["stale"],
                 "workspace_plan_type": subscription_summary["workspace_plan_type"],
                 "subscription_active_until": subscription_summary["active_until"],
                 "checked_at": subscription_summary["checked_at"],
@@ -1305,7 +1385,11 @@ def _serialize_account_compact_item(
                 "account_id",
                 "workspace_id",
                 "subscription_plan",
+                "last_known_subscription_plan",
+                "subscription_refresh_state",
+                "subscription_plan_stale",
                 "has_paid_subscription",
+                "last_known_has_paid_subscription",
                 "subscription_checked",
                 "codex_state",
                 "upload_gate",

@@ -262,11 +262,11 @@ const ACCOUNT_COLUMN_OPTIONS: Array<{ value: AccountColumnKey; text: string; cha
   { value: 'manually_used', text: '使用状态' },
   { value: 'phone_binding', text: '手机号/API', chatgptOnly: true },
   { value: 'password', text: '密码' },
-  { value: 'auth_type', text: '认证类型', chatgptOnly: true },
-  { value: 'status', text: '账号状态' },
-  { value: 'subscription_type', text: '订阅类型', chatgptOnly: true },
+  { value: 'auth_type', text: '认证材料', chatgptOnly: true },
+  { value: 'status', text: '业务状态' },
+  { value: 'subscription_type', text: '当前订阅', chatgptOnly: true },
   { value: 'subscription_active_until', text: '订阅到期', chatgptOnly: true },
-  { value: 'account_validity', text: '账号有效性', chatgptOnly: true },
+  { value: 'account_validity', text: '认证状态', chatgptOnly: true },
   { value: 'idea_submit_status', text: 'Idea提交', chatgptOnly: true },
   { value: 'codex_usage', text: 'Codex用量', chatgptOnly: true },
   { value: 'sub2api_state', text: 'Sub2API', chatgptOnly: true },
@@ -367,12 +367,14 @@ const SUBSCRIPTION_TYPE_FILTER_OPTIONS = [
   { value: 'team', text: 'Team / Business' },
   { value: 'pro', text: 'Pro' },
   { value: 'enterprise', text: 'Enterprise' },
-  { value: 'unknown', text: '未知' },
+  { value: 'unknown', text: '未知 / 待刷新' },
 ]
 
 const ACCOUNT_VALIDITY_FILTER_OPTIONS = [
-  { value: 'valid', text: '有效' },
-  { value: 'invalid', text: '失效' },
+  { value: 'valid', text: '认证通过' },
+  { value: 'invalid', text: '认证失效' },
+  { value: 'refresh_failed', text: '刷新失败' },
+  { value: 'not_checked', text: '未验证' },
 ]
 
 const CODEX_STATE_FILTER_OPTIONS = [
@@ -524,11 +526,11 @@ export function buildAccountFilterPresetSummary(filters?: AccountFilterPresetFil
   const columnFilters = normalized.columnFilters
   const parts = [
     normalized.search ? `搜索：${normalized.search}` : '',
-    summarizePresetValues(STATUS_FILTER_OPTIONS, columnFilters.status) ? `状态：${summarizePresetValues(STATUS_FILTER_OPTIONS, columnFilters.status)}` : '',
+    summarizePresetValues(STATUS_FILTER_OPTIONS, columnFilters.status) ? `业务状态：${summarizePresetValues(STATUS_FILTER_OPTIONS, columnFilters.status)}` : '',
     summarizePresetValues(MANUAL_USE_FILTER_OPTIONS, columnFilters.manuallyUsed) ? `使用：${summarizePresetValues(MANUAL_USE_FILTER_OPTIONS, columnFilters.manuallyUsed)}` : '',
-    summarizePresetValues(AUTH_TYPE_FILTER_OPTIONS, columnFilters.authType) ? `认证：${summarizePresetValues(AUTH_TYPE_FILTER_OPTIONS, columnFilters.authType)}` : '',
-    summarizePresetValues(SUBSCRIPTION_TYPE_FILTER_OPTIONS, columnFilters.subscriptionType) ? `订阅：${summarizePresetValues(SUBSCRIPTION_TYPE_FILTER_OPTIONS, columnFilters.subscriptionType)}` : '',
-    summarizePresetValues(ACCOUNT_VALIDITY_FILTER_OPTIONS, columnFilters.accountValidity) ? `有效性：${summarizePresetValues(ACCOUNT_VALIDITY_FILTER_OPTIONS, columnFilters.accountValidity)}` : '',
+    summarizePresetValues(AUTH_TYPE_FILTER_OPTIONS, columnFilters.authType) ? `材料：${summarizePresetValues(AUTH_TYPE_FILTER_OPTIONS, columnFilters.authType)}` : '',
+    summarizePresetValues(SUBSCRIPTION_TYPE_FILTER_OPTIONS, columnFilters.subscriptionType) ? `当前订阅：${summarizePresetValues(SUBSCRIPTION_TYPE_FILTER_OPTIONS, columnFilters.subscriptionType)}` : '',
+    summarizePresetValues(ACCOUNT_VALIDITY_FILTER_OPTIONS, columnFilters.accountValidity) ? `认证状态：${summarizePresetValues(ACCOUNT_VALIDITY_FILTER_OPTIONS, columnFilters.accountValidity)}` : '',
     summarizePresetValues(SUB2API_FILTER_OPTIONS, columnFilters.sub2apiState) ? `Sub2API：${summarizePresetValues(SUB2API_FILTER_OPTIONS, columnFilters.sub2apiState)}` : '',
     summarizePresetValues(OAIPAY_FILTER_OPTIONS, columnFilters.oaipayState) ? `OAIPay：${summarizePresetValues(OAIPAY_FILTER_OPTIONS, columnFilters.oaipayState)}` : '',
     normalized.sortOrder ? `到期：${labelForOption(SUBSCRIPTION_EXPIRY_SORT_OPTIONS, normalized.sortOrder)}` : '',
@@ -1694,8 +1696,19 @@ function mergeBaxiSnapshotIntoAccount(account: any, item: any) {
   }
 }
 
+function normalizeSubscriptionPlanValue(value?: unknown) {
+  const plan = String(value || '').trim().toLowerCase().replace('-', '_')
+  if (!plan) return 'unknown'
+  if (plan.includes('enterprise')) return 'enterprise'
+  if (plan.includes('team') || plan.includes('business')) return 'team'
+  if (plan.includes('pro')) return 'pro'
+  if (plan.includes('plus')) return 'plus'
+  if (plan.includes('free')) return 'free'
+  return 'unknown'
+}
+
 function planMeta(plan?: string) {
-  switch ((plan || '').toLowerCase()) {
+  switch (normalizeSubscriptionPlanValue(plan)) {
     case 'plus':
       return { color: 'success', label: 'Plus' }
     case 'team':
@@ -1735,42 +1748,55 @@ function authTypeMeta(record: any) {
 function subscriptionTypeValue(record: any) {
   const capabilities = record?.chatgptCapabilities || {}
   const localSubscription = record?.chatgptLocal?.subscription || {}
-  const workspaceScope = String(record?.workspace_scope || record?.extra?.chatgpt_workspace_scope || '').trim().toLowerCase()
-  const values = [
-    capabilities.subscription_plan,
-    record?.subscription_plan,
-    localSubscription.plan,
+  for (const value of [localSubscription.plan, record?.subscription_plan, capabilities.subscription_plan]) {
+    const plan = normalizeSubscriptionPlanValue(value)
+    if (plan !== 'unknown') return plan
+  }
+  return 'unknown'
+}
+
+function lastKnownSubscriptionTypeValue(record: any) {
+  const capabilities = record?.chatgptCapabilities || {}
+  const localSubscription = record?.chatgptLocal?.subscription || {}
+  for (const value of [
+    localSubscription.last_known_plan,
+    record?.last_known_subscription_plan,
+    capabilities.last_known_subscription_plan,
+    record?.extra?.last_known_subscription_plan,
     record?.extra?.chatgpt_plan_type,
     record?.extra?.chatgpt_subscription_plan,
-  ]
-  for (const value of values) {
-    const plan = String(value || '').trim().toLowerCase().replace('-', '_')
-    if (!plan) continue
-    if (plan.includes('enterprise')) return 'enterprise'
-    if (plan.includes('team') || plan.includes('business')) return 'team'
-    if (plan.includes('pro')) return 'pro'
-    if (plan.includes('plus')) return 'plus'
-    if (plan.includes('free')) return 'free'
+  ]) {
+    const plan = normalizeSubscriptionPlanValue(value)
+    if (plan !== 'unknown') return plan
   }
-  if (workspaceScope === 'business') return 'team'
-  if (workspaceScope === 'free') return 'free'
   return 'unknown'
 }
 
 function subscriptionTypeMeta(record: any) {
-  switch (subscriptionTypeValue(record)) {
+  const current = subscriptionTypeValue(record)
+  const lastKnown = lastKnownSubscriptionTypeValue(record)
+  const refreshState = String(record?.subscription_refresh_state || record?.chatgptLocal?.subscription?.refresh_state || record?.chatgptCapabilities?.subscription_refresh_state || '').trim().toLowerCase()
+  const stale = current === 'unknown' && lastKnown !== 'unknown'
+  if (stale) {
+    const last = planMeta(lastKnown)
+    if (accountValidityValue(record) === 'invalid' || refreshState === 'auth_invalid') {
+      return { color: 'error', label: '不可确认', subLabel: `上次 ${last.label}`, title: `当前订阅因认证失效不可确认；上次确认：${last.label}` }
+    }
+    return { color: 'warning', label: '待刷新', subLabel: `上次 ${last.label}`, title: `当前订阅未确认；上次确认：${last.label}` }
+  }
+  switch (current) {
     case 'free':
-      return { color: 'default', label: 'Free' }
+      return { color: 'default', label: 'Free', subLabel: '', title: '当前确认订阅：Free' }
     case 'plus':
-      return { color: 'success', label: 'Plus' }
+      return { color: 'success', label: 'Plus', subLabel: '', title: '当前确认订阅：Plus' }
     case 'team':
-      return { color: 'processing', label: 'Team' }
+      return { color: 'processing', label: 'Team', subLabel: '', title: '当前确认订阅：Team / Business' }
     case 'pro':
-      return { color: 'processing', label: 'Pro' }
+      return { color: 'processing', label: 'Pro', subLabel: '', title: '当前确认订阅：Pro' }
     case 'enterprise':
-      return { color: 'processing', label: 'Enterprise' }
+      return { color: 'processing', label: 'Enterprise', subLabel: '', title: '当前确认订阅：Enterprise' }
     default:
-      return { color: 'default', label: '未知' }
+      return { color: 'default', label: refreshState === 'not_checked' ? '未验证' : '未知', subLabel: '', title: '当前订阅未确认' }
   }
 }
 
@@ -1790,13 +1816,22 @@ function accountValidityValue(record: any) {
   if (String(record?.auth_level || capabilities.auth_level || '').trim().toLowerCase() === 'invalid') return 'invalid'
   if (String(capabilities.upload_gate || '').trim().toLowerCase() === 'blocked_auth_invalid') return 'invalid'
   if (invalidStates.has(authState) || invalidStates.has(codexState)) return 'invalid'
+  if (authState === 'probe_failed' || codexState === 'probe_failed') return 'refresh_failed'
+  if (!authState && !String(record?.auth_level || capabilities.auth_level || '').trim()) return 'not_checked'
   return 'valid'
 }
 
 function accountValidityMeta(record: any) {
-  return accountValidityValue(record) === 'invalid'
-    ? { color: 'error', label: '失效' }
-    : { color: 'success', label: '有效' }
+  switch (accountValidityValue(record)) {
+    case 'invalid':
+      return { color: 'error', label: '认证失效' }
+    case 'refresh_failed':
+      return { color: 'warning', label: '刷新失败' }
+    case 'not_checked':
+      return { color: 'default', label: '未验证' }
+    default:
+      return { color: 'success', label: '认证通过' }
+  }
 }
 
 function getIdeaSubmitSummary(record: any) {
@@ -5394,7 +5429,14 @@ export default function Accounts() {
 
   const renderSubscriptionTypeState = (record: any) => {
     const meta = subscriptionTypeMeta(record)
-    return <Tag color={meta.color} style={compactTagStyle}>{meta.label}</Tag>
+    return (
+      <div title={meta.title} style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 2, lineHeight: '16px' }}>
+        <Tag color={meta.color} style={compactTagStyle}>{meta.label}</Tag>
+        {meta.subLabel ? (
+          <Text type="secondary" style={{ fontSize: 11, whiteSpace: 'nowrap' }}>{meta.subLabel}</Text>
+        ) : null}
+      </div>
+    )
   }
 
   const renderAccountStatusState = (status: string, record?: any, options?: { inline?: boolean }) => {
@@ -5598,7 +5640,7 @@ export default function Accounts() {
           <Select
             allowClear
             size="small"
-            placeholder="账号状态"
+            placeholder="业务状态"
             value={columnFilters.status[0]}
             options={toSelectOptions(STATUS_FILTER_OPTIONS)}
             onChange={(value) => {
@@ -5610,7 +5652,7 @@ export default function Accounts() {
           <Select
             allowClear
             size="small"
-            placeholder="认证类型"
+            placeholder="认证材料"
             value={columnFilters.authType[0]}
             options={toSelectOptions(AUTH_TYPE_FILTER_OPTIONS)}
             onChange={(value) => setColumnFilters((prev) => ({ ...prev, authType: value ? [value] : [] }))}
@@ -5618,7 +5660,7 @@ export default function Accounts() {
           <Select
             allowClear
             size="small"
-            placeholder="订阅类型"
+            placeholder="当前订阅"
             value={columnFilters.subscriptionType[0]}
             options={toSelectOptions(SUBSCRIPTION_TYPE_FILTER_OPTIONS)}
             onChange={(value) => setColumnFilters((prev) => ({ ...prev, subscriptionType: value ? [value] : [] }))}
@@ -5626,7 +5668,7 @@ export default function Accounts() {
           <Select
             allowClear
             size="small"
-            placeholder="有效性"
+            placeholder="认证状态"
             value={columnFilters.accountValidity[0]}
             options={toSelectOptions(ACCOUNT_VALIDITY_FILTER_OPTIONS)}
             onChange={(value) => setColumnFilters((prev) => ({ ...prev, accountValidity: value ? [value] : [] }))}
@@ -6396,7 +6438,7 @@ export default function Accounts() {
     },
     {
       title: renderColumnFilterTitle(
-        '认证类型',
+        '认证材料',
         columnFilters.authType,
         AUTH_TYPE_FILTER_OPTIONS,
         (next) => setColumnFilters((prev) => ({ ...prev, authType: next })),
@@ -6407,7 +6449,7 @@ export default function Accounts() {
     },
     {
       title: renderColumnFilterTitle(
-        '状态',
+        '业务状态',
         columnFilters.status,
         STATUS_FILTER_OPTIONS,
         (next) => {
@@ -6426,7 +6468,7 @@ export default function Accounts() {
     columns.push(
       {
         title: renderColumnFilterTitle(
-          '订阅类型',
+          '当前订阅',
           columnFilters.subscriptionType,
           SUBSCRIPTION_TYPE_FILTER_OPTIONS,
           (next) => setColumnFilters((prev) => ({ ...prev, subscriptionType: next })),
@@ -6446,7 +6488,7 @@ export default function Accounts() {
       },
       {
         title: renderColumnFilterTitle(
-          '账号有效性',
+          '认证状态',
           columnFilters.accountValidity,
           ACCOUNT_VALIDITY_FILTER_OPTIONS,
           (next) => setColumnFilters((prev) => ({ ...prev, accountValidity: next })),
@@ -7161,17 +7203,17 @@ export default function Accounts() {
                 <Form.Item name="search" label="关键词搜索" style={{ marginBottom: 0 }}>
                   <Input placeholder="邮箱或关键词" allowClear />
                 </Form.Item>
-                <Form.Item name="status" label="账号状态" style={{ marginBottom: 0 }}>
-                  <Select mode="multiple" placeholder="全部状态" options={STATUS_FILTER_OPTIONS} allowClear />
+                <Form.Item name="status" label="业务状态" style={{ marginBottom: 0 }}>
+                  <Select mode="multiple" placeholder="全部业务状态" options={STATUS_FILTER_OPTIONS} allowClear />
                 </Form.Item>
                 <Form.Item name="authType" label="认证材料" style={{ marginBottom: 0 }}>
-                  <Select mode="multiple" placeholder="全部认证类型" options={AUTH_TYPE_FILTER_OPTIONS} allowClear />
+                  <Select mode="multiple" placeholder="全部认证材料" options={AUTH_TYPE_FILTER_OPTIONS} allowClear />
                 </Form.Item>
-                <Form.Item name="subscriptionType" label="订阅类型" style={{ marginBottom: 0 }}>
-                  <Select mode="multiple" placeholder="全部订阅类型" options={SUBSCRIPTION_TYPE_FILTER_OPTIONS} allowClear />
+                <Form.Item name="subscriptionType" label="当前订阅" style={{ marginBottom: 0 }}>
+                  <Select mode="multiple" placeholder="全部当前订阅" options={SUBSCRIPTION_TYPE_FILTER_OPTIONS} allowClear />
                 </Form.Item>
-                <Form.Item name="accountValidity" label="有效性" style={{ marginBottom: 0 }}>
-                  <Select mode="multiple" placeholder="全部时效" options={ACCOUNT_VALIDITY_FILTER_OPTIONS} allowClear />
+                <Form.Item name="accountValidity" label="认证状态" style={{ marginBottom: 0 }}>
+                  <Select mode="multiple" placeholder="全部认证状态" options={ACCOUNT_VALIDITY_FILTER_OPTIONS} allowClear />
                 </Form.Item>
                 <Form.Item name="codexState" label="Codex 状态" style={{ marginBottom: 0 }}>
                   <Select mode="multiple" placeholder="全部 Codex 状态" options={CODEX_STATE_FILTER_OPTIONS} allowClear />

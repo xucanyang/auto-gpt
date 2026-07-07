@@ -265,6 +265,34 @@ class ChatGPTAccountStateTests(unittest.TestCase):
         self.assertEqual(reason, "")
         self.assertEqual(account.status, "subscribed")
 
+    def test_unknown_probe_keeps_old_plan_only_as_last_known(self):
+        account = DummyAccount(
+            status="subscribed",
+            token="at-demo",
+            extra={
+                "access_token": "at-demo",
+                "chatgpt_capabilities": {
+                    "subscription_plan": "plus",
+                    "subscription_checked": True,
+                },
+            },
+        )
+
+        capabilities = classify_chatgpt_capabilities(
+            account,
+            local_probe={
+                "auth": {"state": "probe_failed", "http_status": 0},
+                "subscription": {"plan": "unknown"},
+            },
+        )
+
+        self.assertEqual(capabilities["subscription_plan"], "unknown")
+        self.assertEqual(capabilities["last_known_subscription_plan"], "plus")
+        self.assertTrue(capabilities["subscription_plan_stale"])
+        self.assertEqual(capabilities["subscription_refresh_state"], "refresh_failed")
+        self.assertFalse(capabilities["has_paid_subscription"])
+        self.assertTrue(capabilities["last_known_has_paid_subscription"])
+
     def test_mark_payment_succeeded_overrides_stale_invalid(self):
         account = DummyAccount(status="invalid")
         self.assertEqual(mark_payment_succeeded(account), "subscribed")

@@ -103,6 +103,7 @@ class AccountListStateModel(SQLModel, table=True):
     subscription_active_until_ts: Optional[float] = Field(default=None, index=True)
     source_updated_at: str = ""
     refreshed_at: str = ""
+    derivation_version: str = Field(default="", index=True)
 
 
 class ExternalSubscriptionClaimModel(SQLModel, table=True):
@@ -3321,6 +3322,7 @@ def _ensure_account_list_state_schema() -> None:
                 subscription_active_until_ts REAL,
                 source_updated_at TEXT NOT NULL DEFAULT '',
                 refreshed_at TEXT NOT NULL DEFAULT '',
+                derivation_version TEXT NOT NULL DEFAULT '',
                 FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
             )
             """
@@ -3340,6 +3342,7 @@ def _ensure_account_list_state_schema() -> None:
             "subscription_active_until_ts": "REAL",
             "source_updated_at": "TEXT NOT NULL DEFAULT ''",
             "refreshed_at": "TEXT NOT NULL DEFAULT ''",
+            "derivation_version": "TEXT NOT NULL DEFAULT ''",
         }
         existing_columns = {
             str(row[1])
@@ -3386,6 +3389,10 @@ def _ensure_account_list_state_schema() -> None:
         conn.exec_driver_sql(
             "CREATE INDEX IF NOT EXISTS idx_account_list_state_subscription_active_until_ts "
             "ON account_list_state(subscription_active_until_ts)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_account_list_state_derivation_version "
+            "ON account_list_state(derivation_version)"
         )
 
 

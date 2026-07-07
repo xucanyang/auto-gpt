@@ -243,6 +243,57 @@ class AccountFilterSortTests(unittest.TestCase):
                 [row.id for row in filter_account_rows(rows, revival_state="recovery_new")],
             )
 
+    def test_subscription_filter_uses_current_confirmed_plan_not_stale_snapshot(self):
+        init_db()
+        stale_plus = self._account(901)
+        stale_plus.set_extra(
+            {
+                "chatgpt_capabilities": {
+                    "subscription_plan": "plus",
+                    "subscription_checked": False,
+                },
+                "chatgpt_local": {
+                    "auth": {"state": "access_token_invalidated", "http_status": 401},
+                    "subscription": {"plan": "unknown"},
+                },
+            }
+        )
+        current_plus = self._account(902)
+        current_plus.set_extra(
+            {
+                "chatgpt_capabilities": {"subscription_plan": "plus", "subscription_checked": True},
+                "chatgpt_local": {
+                    "auth": {"state": "access_token_valid", "http_status": 200},
+                    "subscription": {"plan": "plus"},
+                },
+            }
+        )
+
+        with Session(engine) as session:
+            session.exec(text("DELETE FROM account_list_state"))
+            session.exec(text("DELETE FROM accounts"))
+            session.add(stale_plus)
+            session.add(current_plus)
+            session.commit()
+            refresh_account_list_state(session)
+
+            states = {
+                int(row[0]): (row[1], row[2])
+                for row in session.exec(
+                    text(
+                        """
+                        SELECT account_id, subscription_type, account_validity
+                        FROM account_list_state
+                        WHERE account_id IN (901, 902)
+                        ORDER BY account_id
+                        """
+                    )
+                ).all()
+            }
+
+        self.assertEqual(states[901], ("unknown", "invalid"))
+        self.assertEqual(states[902], ("plus", "valid"))
+
     def test_account_list_state_stale_refresh_only_updates_changed_rows(self):
         init_db()
         fresh = self._account(301)
@@ -285,7 +336,7 @@ class AccountFilterSortTests(unittest.TestCase):
             session.commit()
 
             stale_row = session.get(AccountModel, 302)
-            stale_row.set_extra({"chatgpt_capabilities": {"subscription_plan": "plus"}})
+            stale_row.set_extra({"chatgpt_local": {"subscription": {"plan": "plus"}}})
             stale_row.updated_at = datetime(2026, 6, 17, 12, 0, 0, tzinfo=timezone.utc)
             session.add(stale_row)
             session.commit()
@@ -351,7 +402,7 @@ class AccountFilterSortTests(unittest.TestCase):
     def test_account_list_state_schema_upgrade_adds_missing_columns(self):
         init_db()
         row = self._account(501)
-        row.set_extra({"chatgpt_capabilities": {"subscription_plan": "plus"}})
+        row.set_extra({"chatgpt_local": {"subscription": {"plan": "plus"}}})
 
         with Session(engine) as session:
             session.exec(text("DROP TABLE IF EXISTS account_list_state"))
@@ -381,6 +432,7 @@ class AccountFilterSortTests(unittest.TestCase):
         self.assertEqual(refreshed, 1)
         self.assertIn("source_updated_at", columns)
         self.assertIn("subscription_active_until_ts", columns)
+        self.assertIn("derivation_version", columns)
         self.assertEqual(state.subscription_type, "plus")
 
     def test_account_list_state_sql_sort_subscription_active_until_empty_last(self):

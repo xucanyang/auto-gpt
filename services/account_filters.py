@@ -8,9 +8,14 @@ from sqlalchemy import text
 from sqlmodel import Session, select
 
 from core.db import AccountListStateModel, AccountModel
-from services.chatgpt_account_state import AUTH_INVALID_STATES, classify_chatgpt_capabilities
+from services.chatgpt_account_state import (
+    AUTH_INVALID_STATES,
+    classify_chatgpt_capabilities,
+    normalize_subscription_plan,
+)
 
 AUTO_DELETE_REVIVAL_TASK_ID = "icloud_hme_auto_delete"
+ACCOUNT_LIST_STATE_DERIVATION_VERSION = "subscription-current-v2"
 logger = logging.getLogger(__name__)
 
 
@@ -301,20 +306,12 @@ def account_auth_type(account: AccountModel, extra: dict[str, Any] | None = None
     return "unknown"
 
 
-def _normalize_subscription_type(plan: Any, workspace_scope: Any = "") -> str:
-    normalized = _lower_text(plan).replace("-", "_")
-    scope = _lower_text(workspace_scope)
-    if "enterprise" in normalized:
-        return "enterprise"
-    if "team" in normalized or "business" in normalized or scope == "business":
-        return "team"
-    if "pro" in normalized:
-        return "pro"
-    if "plus" in normalized:
-        return "plus"
-    if "free" in normalized or scope == "free":
-        return "free"
-    return "unknown"
+def _normalize_subscription_type(plan: Any) -> str:
+    return normalize_subscription_plan(plan)
+
+
+def _truthy_value(value: Any) -> bool:
+    return _lower_text(value) in {"1", "true", "yes", "on"}
 
 
 def account_subscription_type(account: AccountModel, extra: dict[str, Any] | None = None) -> str:
@@ -322,21 +319,13 @@ def account_subscription_type(account: AccountModel, extra: dict[str, Any] | Non
     capabilities = _chatgpt_capabilities(account, extra)
     local_probe = extra.get("chatgpt_local") if isinstance(extra.get("chatgpt_local"), dict) else {}
     subscription = local_probe.get("subscription") if isinstance(local_probe.get("subscription"), dict) else {}
-    workspace_scope = extra.get("chatgpt_workspace_scope")
-    for candidate in (
-        capabilities.get("subscription_plan"),
-        subscription.get("plan"),
-        extra.get("chatgpt_plan_type"),
-        extra.get("chatgpt_subscription_plan"),
-    ):
-        # `workspace_scope=free` only describes the workspace/account scope; it
-        # is not a paid-plan source.  Do not let it turn an explicit
-        # `subscription_plan=unknown` into `free` before later durable markers
-        # such as `chatgpt_plan_type=plus` get a chance to win.
-        resolved = _normalize_subscription_type(candidate, "")
-        if resolved != "unknown":
-            return resolved
-    return _normalize_subscription_type("", workspace_scope)
+    local_plan = _normalize_subscription_type(subscription.get("plan"))
+    if local_plan != "unknown":
+        return local_plan
+    capabilities_plan = _normalize_subscription_type(capabilities.get("subscription_plan"))
+    if capabilities_plan != "unknown" and _truthy_value(capabilities.get("subscription_checked")):
+        return capabilities_plan
+    return "unknown"
 
 
 def account_validity(account: AccountModel, extra: dict[str, Any] | None = None) -> str:
@@ -356,6 +345,11 @@ def account_validity(account: AccountModel, extra: dict[str, Any] | None = None)
             return "invalid"
         if int(section.get("http_status") or 0) == 401:
             return "invalid"
+        if _lower_text(section.get("state")) == "probe_failed":
+            return "refresh_failed"
+    auth_section = local_probe.get("auth") if isinstance(local_probe.get("auth"), dict) else {}
+    if not _lower_text(auth_section.get("state")) and not _lower_text(capabilities.get("auth_level")):
+        return "not_checked"
     return "valid"
 
 
@@ -411,7 +405,8 @@ def ensure_account_list_state_schema(session: Session) -> None:
                 subscription_active_until TEXT NOT NULL DEFAULT '',
                 subscription_active_until_ts REAL,
                 source_updated_at TEXT NOT NULL DEFAULT '',
-                refreshed_at TEXT NOT NULL DEFAULT ''
+                refreshed_at TEXT NOT NULL DEFAULT '',
+                derivation_version TEXT NOT NULL DEFAULT ''
             )
             """
         )
@@ -431,6 +426,7 @@ def ensure_account_list_state_schema(session: Session) -> None:
         "subscription_active_until_ts": "REAL",
         "source_updated_at": "TEXT NOT NULL DEFAULT ''",
         "refreshed_at": "TEXT NOT NULL DEFAULT ''",
+        "derivation_version": "TEXT NOT NULL DEFAULT ''",
     }
     existing_columns: set[str] = set()
     for row in session.exec(text("PRAGMA table_info(account_list_state)")).all():
@@ -454,6 +450,7 @@ def ensure_account_list_state_schema(session: Session) -> None:
         "CREATE INDEX IF NOT EXISTS idx_account_list_state_oaipay_state ON account_list_state(oaipay_state)",
         "CREATE INDEX IF NOT EXISTS idx_account_list_state_revival_state ON account_list_state(revival_state)",
         "CREATE INDEX IF NOT EXISTS idx_account_list_state_subscription_active_until_ts ON account_list_state(subscription_active_until_ts)",
+        "CREATE INDEX IF NOT EXISTS idx_account_list_state_derivation_version ON account_list_state(derivation_version)",
     ):
         session.exec(text(index_sql))
 
@@ -506,8 +503,14 @@ def _account_list_state_target_where(
                     FROM account_list_state AS state
                     WHERE state.account_id = accounts.id
                 ), '') != CAST(accounts.updated_at AS TEXT)
+                OR coalesce((
+                    SELECT state.derivation_version
+                    FROM account_list_state AS state
+                    WHERE state.account_id = accounts.id
+                ), '') != '__ACCOUNT_LIST_STATE_DERIVATION_VERSION__'
             )
             """
+            .replace("__ACCOUNT_LIST_STATE_DERIVATION_VERSION__", ACCOUNT_LIST_STATE_DERIVATION_VERSION.replace("'", "''"))
         )
     return " AND ".join(terms)
 
@@ -613,6 +616,12 @@ def refresh_account_list_state(
                     lower(trim(coalesce(json_extract(extra, '$.chatgpt_local.codex.state'), ''))) AS codex_state,
                     CAST(coalesce(json_extract(extra, '$.chatgpt_local.codex.http_status'), 0) AS INTEGER) AS codex_http_status,
                     replace(lower(trim(coalesce(json_extract(extra, '$.chatgpt_capabilities.subscription_plan'), ''))), '-', '_') AS cap_subscription_plan,
+                    CASE
+                        WHEN lower(trim(CAST(coalesce(json_extract(extra, '$.chatgpt_capabilities.subscription_checked'), '') AS TEXT)))
+                             IN ('1', 'true', 'yes', 'on')
+                        THEN 1
+                        ELSE 0
+                    END AS cap_subscription_checked,
                     replace(lower(trim(coalesce(json_extract(extra, '$.chatgpt_local.subscription.plan'), ''))), '-', '_') AS local_subscription_plan,
                     replace(lower(trim(coalesce(json_extract(extra, '$.chatgpt_plan_type'), ''))), '-', '_') AS plan_type,
                     replace(lower(trim(coalesce(json_extract(extra, '$.chatgpt_subscription_plan'), ''))), '-', '_') AS extra_subscription_plan,
@@ -741,31 +750,25 @@ def refresh_account_list_state(
                             OR auth_http_status = 401
                             OR codex_http_status = 401
                         THEN 'invalid'
+                        WHEN auth_state = 'probe_failed' OR codex_state = 'probe_failed'
+                        THEN 'refresh_failed'
+                        WHEN account_status != 'invalid'
+                            AND auth_level = ''
+                            AND auth_state = ''
+                        THEN 'not_checked'
                         ELSE 'valid'
                     END AS derived_account_validity,
                     CASE
-                        WHEN cap_subscription_plan LIKE '%enterprise%' THEN 'enterprise'
-                        WHEN cap_subscription_plan LIKE '%team%' OR cap_subscription_plan LIKE '%business%' THEN 'team'
-                        WHEN cap_subscription_plan LIKE '%pro%' THEN 'pro'
-                        WHEN cap_subscription_plan LIKE '%plus%' THEN 'plus'
-                        WHEN cap_subscription_plan LIKE '%free%' THEN 'free'
                         WHEN local_subscription_plan LIKE '%enterprise%' THEN 'enterprise'
                         WHEN local_subscription_plan LIKE '%team%' OR local_subscription_plan LIKE '%business%' THEN 'team'
                         WHEN local_subscription_plan LIKE '%pro%' THEN 'pro'
                         WHEN local_subscription_plan LIKE '%plus%' THEN 'plus'
                         WHEN local_subscription_plan LIKE '%free%' THEN 'free'
-                        WHEN plan_type LIKE '%enterprise%' THEN 'enterprise'
-                        WHEN plan_type LIKE '%team%' OR plan_type LIKE '%business%' THEN 'team'
-                        WHEN plan_type LIKE '%pro%' THEN 'pro'
-                        WHEN plan_type LIKE '%plus%' THEN 'plus'
-                        WHEN plan_type LIKE '%free%' THEN 'free'
-                        WHEN extra_subscription_plan LIKE '%enterprise%' THEN 'enterprise'
-                        WHEN extra_subscription_plan LIKE '%team%' OR extra_subscription_plan LIKE '%business%' THEN 'team'
-                        WHEN extra_subscription_plan LIKE '%pro%' THEN 'pro'
-                        WHEN extra_subscription_plan LIKE '%plus%' THEN 'plus'
-                        WHEN extra_subscription_plan LIKE '%free%' THEN 'free'
-                        WHEN workspace_scope = 'business' THEN 'team'
-                        WHEN workspace_scope = 'free' THEN 'free'
+                        WHEN cap_subscription_checked = 1 AND cap_subscription_plan LIKE '%enterprise%' THEN 'enterprise'
+                        WHEN cap_subscription_checked = 1 AND (cap_subscription_plan LIKE '%team%' OR cap_subscription_plan LIKE '%business%') THEN 'team'
+                        WHEN cap_subscription_checked = 1 AND cap_subscription_plan LIKE '%pro%' THEN 'pro'
+                        WHEN cap_subscription_checked = 1 AND cap_subscription_plan LIKE '%plus%' THEN 'plus'
+                        WHEN cap_subscription_checked = 1 AND cap_subscription_plan LIKE '%free%' THEN 'free'
                         ELSE 'unknown'
                     END AS derived_subscription_type,
                     CASE
@@ -818,7 +821,8 @@ def refresh_account_list_state(
                         ELSE CAST(strftime('%s', replace(raw_subscription_active_until, 'Z', '+00:00')) AS REAL)
                     END AS subscription_active_until_ts,
                     source_updated_at,
-                    strftime('%Y-%m-%dT%H:%M:%fZ', 'now') AS refreshed_at
+                    strftime('%Y-%m-%dT%H:%M:%fZ', 'now') AS refreshed_at,
+                    '__ACCOUNT_LIST_STATE_DERIVATION_VERSION__' AS derivation_version
                 FROM derived
             )
             INSERT INTO account_list_state (
@@ -836,7 +840,8 @@ def refresh_account_list_state(
                 subscription_active_until,
                 subscription_active_until_ts,
                 source_updated_at,
-                refreshed_at
+                refreshed_at,
+                derivation_version
             )
             SELECT
                 account_id,
@@ -853,7 +858,8 @@ def refresh_account_list_state(
                 subscription_active_until,
                 subscription_active_until_ts,
                 source_updated_at,
-                refreshed_at
+                refreshed_at,
+                derivation_version
             FROM final_rows
             WHERE 1 = 1
             ON CONFLICT(account_id) DO UPDATE SET
@@ -870,8 +876,11 @@ def refresh_account_list_state(
                 subscription_active_until = excluded.subscription_active_until,
                 subscription_active_until_ts = excluded.subscription_active_until_ts,
                 source_updated_at = excluded.source_updated_at,
-                refreshed_at = excluded.refreshed_at
-            """.replace("__ACCOUNT_LIST_STATE_TARGET_WHERE__", target_where)
+                refreshed_at = excluded.refreshed_at,
+                derivation_version = excluded.derivation_version
+            """
+                .replace("__ACCOUNT_LIST_STATE_TARGET_WHERE__", target_where)
+                .replace("__ACCOUNT_LIST_STATE_DERIVATION_VERSION__", ACCOUNT_LIST_STATE_DERIVATION_VERSION.replace("'", "''"))
         )
     )
     if cleanup_orphans:

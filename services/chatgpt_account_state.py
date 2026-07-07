@@ -25,6 +25,7 @@ AUTH_INVALID_STATES = {
     "account_deactivated",
     "banned_like",
 }
+AUTH_VALID_STATES = {"refresh_token_valid", "access_token_valid"}
 
 
 def _get_extra(account: Any) -> dict[str, Any]:
@@ -56,7 +57,65 @@ def _first_text(*values: Any) -> str:
 
 
 def is_paid_subscription_plan(plan: Any) -> bool:
-    return _lower_text(plan) in PAID_PLAN_TYPES
+    return normalize_subscription_plan(plan) in PAID_PLAN_TYPES
+
+
+def normalize_subscription_plan(plan: Any) -> str:
+    normalized = _lower_text(plan).replace("-", "_")
+    if "enterprise" in normalized:
+        return "enterprise"
+    if "team" in normalized or "business" in normalized:
+        return "team"
+    if "pro" in normalized:
+        return "pro"
+    if "plus" in normalized:
+        return "plus"
+    if "free" in normalized:
+        return "free"
+    return "unknown"
+
+
+def _last_known_subscription_plan(extra: dict[str, Any], current_plan: str) -> str:
+    if current_plan and current_plan != "unknown":
+        return current_plan
+
+    old_caps = extra.get("chatgpt_capabilities") if isinstance(extra.get("chatgpt_capabilities"), dict) else {}
+    for candidate in (
+        old_caps.get("last_known_subscription_plan"),
+        extra.get("last_known_subscription_plan"),
+        old_caps.get("subscription_plan"),
+        extra.get("chatgpt_plan_type"),
+        extra.get("chatgpt_subscription_plan"),
+    ):
+        resolved = normalize_subscription_plan(candidate)
+        if resolved != "unknown":
+            return resolved
+    return ""
+
+
+def _subscription_refresh_state(
+    *,
+    probe_present: bool,
+    auth_level: str,
+    auth_state: str,
+    subscription_plan: str,
+    subscription_present: bool,
+    auth_reason: str,
+    remote_reason: str,
+) -> str:
+    if auth_level == "invalid" or auth_reason or remote_reason or auth_state in AUTH_INVALID_STATES:
+        return "auth_invalid"
+    if subscription_plan != "unknown":
+        return "confirmed"
+    if not probe_present:
+        return "not_checked"
+    if auth_state == "probe_failed":
+        return "refresh_failed"
+    if auth_state in AUTH_VALID_STATES and subscription_present:
+        return "unknown_plan"
+    if auth_state in {"", "unknown", "not_checked", "missing_refresh_token"}:
+        return "not_checked"
+    return "refresh_failed"
 
 
 def _payment_snapshot(account: Any) -> dict[str, Any]:
@@ -284,17 +343,20 @@ def classify_chatgpt_capabilities(
     else:
         auth_level = "unknown"
 
-    subscription_plan = _lower_text(subscription.get("plan")) or "unknown"
-    if subscription_plan == "unknown":
-        old_caps = extra.get("chatgpt_capabilities") if isinstance(extra.get("chatgpt_capabilities"), dict) else {}
-        old_plan = _lower_text(old_caps.get("subscription_plan"))
-        if old_plan and old_plan != "unknown":
-            subscription_plan = old_plan
-    subscription_checked = (
-        auth_state in {"refresh_token_valid", "access_token_valid"}
-        and isinstance(subscription, dict)
-        and bool(subscription)
+    subscription_plan = normalize_subscription_plan(subscription.get("plan"))
+    last_known_subscription_plan = _last_known_subscription_plan(extra, subscription_plan)
+    subscription_present = isinstance(subscription, dict) and bool(subscription)
+    subscription_checked = auth_state in AUTH_VALID_STATES and subscription_present and subscription_plan != "unknown"
+    subscription_refresh_state = _subscription_refresh_state(
+        probe_present=bool(probe),
+        auth_level=auth_level,
+        auth_state=auth_state,
+        subscription_plan=subscription_plan,
+        subscription_present=subscription_present,
+        auth_reason=auth_reason,
+        remote_reason=remote_reason,
     )
+    subscription_plan_stale = subscription_plan == "unknown" and bool(last_known_subscription_plan)
     codex_probe_state = _lower_text(codex.get("state"))
     if auth_level == "invalid":
         codex_state = "invalid"
@@ -325,7 +387,11 @@ def classify_chatgpt_capabilities(
         "account_id": account_id,
         "workspace_id": workspace_id,
         "subscription_plan": subscription_plan,
+        "last_known_subscription_plan": last_known_subscription_plan,
+        "subscription_refresh_state": subscription_refresh_state,
+        "subscription_plan_stale": subscription_plan_stale,
         "has_paid_subscription": is_paid_subscription_plan(subscription_plan),
+        "last_known_has_paid_subscription": is_paid_subscription_plan(last_known_subscription_plan),
         "subscription_checked": subscription_checked,
         "has_payment_success_marker": has_payment_success_marker(account),
         "has_payment_pending_marker": has_payment_pending_marker(account),

@@ -6,6 +6,17 @@
 
 ## [Unreleased] (未发布)
 
+## [1.3.28] - 2026-07-07
+### 优化 (Changed)
+- **重构账号列表中“当前订阅 / 历史订阅 / 认证状态”的语义边界**：`services/chatgpt_account_state.py` 不再把上一次 `chatgpt_capabilities.subscription_plan` 直接兜底写回当前订阅；当本次本地刷新结果为 `unknown`、探测失败或认证失效时，当前订阅保持 `unknown`，并单独输出 `last_known_subscription_plan`、`subscription_refresh_state` 与 `subscription_plan_stale`，避免历史 Plus 被误当作当前 Plus 参与筛选、交付或上传判断。
+- **账号筛选缓存改为只按当前确认订阅入库**：`services/account_filters.py` 的 `account_subscription_type()` 与 `account_list_state.subscription_type` 只接受当前刷新明确返回的订阅计划，或 `subscription_checked=true` 的确认快照；历史订阅、`workspace_scope=free/business` 与旧 `chatgpt_plan_type` 不再混入当前订阅筛选。`account_validity` 同步扩展为 `valid / invalid / refresh_failed / not_checked`，让网络失败、未验证和认证失效分开表达；`account_list_state.derivation_version` 会在语义规则升级后强制刷新旧缓存，避免线上旧 `Plus` 缓存继续污染筛选结果。
+- **账号列表 API 增加订阅刷新状态与上次确认订阅摘要**：`api/accounts.py` 的紧凑列表序列化新增 `last_known_subscription_plan`、`subscription_refresh_state`、`subscription_plan_stale`，并在 `subscription` 摘要中返回 `last_known_plan / refresh_state / stale`；`account_validity_summary` 现在会区分 `auth_invalid`、`codex_auth_invalid`、`probe_failed` 与 `not_checked`，前端和外部调用方可同时看到当前事实与历史线索。
+- **账号页列名与筛选文案按职责重命名**：`frontend/src/pages/Accounts.tsx` 将“认证类型”调整为“认证材料”、“账号状态”调整为“业务状态”、“订阅类型”调整为“当前订阅”、“账号有效性”调整为“认证状态”；订阅列在当前不可确认但存在历史订阅时显示“待刷新 / 不可确认”并附带“上次 Plus/Free”等副文本，筛选组合摘要和编辑弹窗同步使用新语义。
+- **同步前端版本号至 v1.3.28**：`frontend/src/app/AppShell.tsx` 侧边栏版本展示更新为 `v1.3.28`，用于上线后确认账号订阅状态语义修正已加载。
+
+### 测试 (Tests)
+- **补充订阅刷新语义回归测试**：`tests/test_chatgpt_account_state.py` 覆盖刷新失败时旧 Plus 只保留为 `last_known_subscription_plan`、不再晋升为当前付费订阅；`tests/test_account_filters.py` 覆盖 `account_list_state` 中认证失效的历史 Plus 会落为当前订阅 `unknown` 且认证状态 `invalid`，防止后续再次把历史状态混入当前筛选。
+
 ## [1.3.27] - 2026-07-07
 ### 新增 (Added)
 - **手机号绑定兼容宽松手机 API 输入与纯文本收码响应**：`services/chatgpt_core/phone_service.py` 将上传手机号行解析从固定 `手机号----收码API` 升级为 URL 优先识别，继续兼容四横杠格式，并新增 `手机号---https://...`、空格或逗号等宽松分隔输入；内部仍统一规范为 `+手机号` 与 `api_url`，保证手机号池 upsert、运行结果回写和绑定结果导出保持稳定。收码轮询新增 JSON / `YES|短信内容` / `NO|暂无短信` / 通用验证码文本解析链，`NO|暂无短信` 会按 pending 继续轮询，`YES|您的 OpenAI 验证代码是：421804` 会提取验证码并进入提交阶段，后续新增 API 形态只需扩展解析器而不改手机号绑定主流程。
@@ -768,4 +779,8 @@
 
 ## 2026-07-07 19:44:14 +0800
 - 兼容手机号绑定 API 格式并优化账号日志分组
+- 发布模式: multi
+
+## 2026-07-07 23:12:15 +0800
+- 修正账号订阅刷新语义与认证状态区分
 - 发布模式: multi
