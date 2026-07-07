@@ -22,6 +22,7 @@ import {
   Steps,
   Switch,
   Progress,
+  Popover,
 } from 'antd'
 import type { CheckboxOptionType } from 'antd/es/checkbox/Group'
 import type { MenuProps } from 'antd'
@@ -6404,77 +6405,77 @@ export default function Accounts() {
 
   const renderSelectedAccountsSummary = () => {
     if (selectedAccountItems.length === 0) return null
+
+    const accountTags = (
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, maxHeight: isMobile ? 180 : 240, overflow: 'auto', maxWidth: 400 }}>
+        {selectedAccountItems.map((account) => {
+          const id = String(account?.id || '')
+          const email = String(account?.email || '').trim()
+          const status = String(account?.status || '').trim()
+          const title = email || `账号 ${id}`
+          return (
+            <Tag
+              key={id}
+              closable
+              onClose={(event) => {
+                event.preventDefault()
+                removeSelectedAccount(id)
+              }}
+              color={STATUS_COLORS[status] || 'default'}
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: 4,
+                maxWidth: '100%',
+                marginInlineEnd: 0,
+                padding: '2px 6px',
+              }}
+            >
+              <span
+                title={title}
+                style={{
+                  display: 'inline-block',
+                  maxWidth: 210,
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                  verticalAlign: 'bottom',
+                }}
+              >
+                {title}
+              </span>
+              <Text type="secondary" style={{ fontSize: 11 }}>
+                ID {id}{status ? ` · ${statusLabel(status)}` : ''}
+              </Text>
+            </Tag>
+          )
+        })}
+      </div>
+    )
+
     return (
       <div
         style={{
           flex: '0 0 auto',
           marginBottom: isMobile ? 10 : 12,
-          padding: isMobile ? 10 : 12,
+          padding: '4px 12px',
           border: `1px solid ${token.colorBorderSecondary}`,
-          borderRadius: 12,
+          borderRadius: 8,
           background: token.colorFillAlter,
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'center',
+          gap: 10,
         }}
       >
-        <div
-          style={{
-            display: 'flex',
-            justifyContent: 'space-between',
-            alignItems: 'center',
-            gap: 10,
-            marginBottom: 8,
-          }}
-        >
-          <Space size={6} wrap>
-            <Text strong>已选账号</Text>
-            <Tag color="processing">{selectedAccountItems.length}</Tag>
-          </Space>
-          <Button size="small" type="link" onClick={clearSelectedAccounts}>
-            清空
-          </Button>
-        </div>
-        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, maxHeight: isMobile ? 180 : 92, overflow: 'auto' }}>
-          {selectedAccountItems.map((account) => {
-            const id = String(account?.id || '')
-            const email = String(account?.email || '').trim()
-            const status = String(account?.status || '').trim()
-            const title = email || `账号 ${id}`
-            return (
-              <Tag
-                key={id}
-                closable
-                onClose={(event) => {
-                  event.preventDefault()
-                  removeSelectedAccount(id)
-                }}
-                color={STATUS_COLORS[status] || 'default'}
-                style={{
-                  display: 'inline-flex',
-                  alignItems: 'center',
-                  gap: 4,
-                  maxWidth: isMobile ? '100%' : 360,
-                  marginInlineEnd: 0,
-                  padding: '4px 8px',
-                }}
-              >
-                <span
-                  title={title}
-                  style={{
-                    display: 'inline-block',
-                    maxWidth: isMobile ? 210 : 260,
-                    overflow: 'hidden',
-                    textOverflow: 'ellipsis',
-                    verticalAlign: 'bottom',
-                  }}
-                >
-                  {title}
-                </span>
-                <Text type="secondary" style={{ fontSize: 11 }}>
-                  ID {id}{status ? ` · ${statusLabel(status)}` : ''}
-                </Text>
-              </Tag>
-            )
-          })}
-        </div>
+        <Space size={6}>
+          <Text strong style={{ fontSize: 13 }}>已选账号</Text>
+          <Popover content={accountTags} title="已选账号列表" trigger="hover" placement="bottomLeft">
+            <Tag color="processing" style={{ cursor: 'pointer' }}>{selectedAccountItems.length} 个</Tag>
+          </Popover>
+        </Space>
+        <Button size="small" type="link" onClick={clearSelectedAccounts} style={{ padding: 0 }}>
+          清空
+        </Button>
       </div>
     )
   }
