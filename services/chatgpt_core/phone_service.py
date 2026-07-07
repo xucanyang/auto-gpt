@@ -471,6 +471,24 @@ class UploadedPhoneEntry:
     line_no: int = 0
 
 
+_UPLOADED_PHONE_API_URL_RE = re.compile(r"https?://[^\s'\"<>]+", re.I)
+_UPLOADED_SMS_PENDING_RE = re.compile(
+    r"(?:^|\b)NO\s*\||暂无(?:短信|验证码|信息)|未收到|没有(?:短信|验证码)|"
+    r"no\s+(?:sms|message|verification\s+code|code)|not\s+received|pending|waiting",
+    re.I,
+)
+_UPLOADED_SMS_ERROR_RE = re.compile(
+    r"(?:expired|invalid|forbidden|unauthorized|error|failed|exception|过期|失效|无效|错误|失败)",
+    re.I,
+)
+_UPLOADED_SMS_CODE_CONTEXT_RE = re.compile(
+    r"(?:验证码|验证代码|校验码|动态码|短信码|OpenAI|verification\s+code|verify\s+code|"
+    r"security\s+code|one[-\s]?time\s+code|otp|code(?:\s+is)?)"
+    r"[^0-9]{0,40}(\d{4,6})(?!\d)",
+    re.I,
+)
+
+
 def _normalize_uploaded_phone(raw_phone: Any) -> str:
     text = str(raw_phone or "").strip()
     if not text:
@@ -480,6 +498,23 @@ def _normalize_uploaded_phone(raw_phone: Any) -> str:
     if not digits:
         return ""
     return f"+{digits}" if has_plus or text.startswith("00") else f"+{digits}"
+
+
+def _split_uploaded_phone_api_line(raw_line: Any) -> tuple[str, str, str]:
+    line = str(raw_line or "").strip()
+    if not line:
+        return "", "", ""
+    match = _UPLOADED_PHONE_API_URL_RE.search(line)
+    if not match:
+        return "", "", "缺少有效 API URL（支持 手机号----https://... 或 手机号---https://...）"
+    phone = _normalize_uploaded_phone(line[: match.start()])
+    api_url = str(match.group(0) or "").strip().rstrip("，,；;")
+    if not phone:
+        return "", api_url, "手机号为空或格式无效"
+    parsed_url = urlparse(api_url)
+    if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:
+        return phone, api_url, "API URL 无效"
+    return phone, api_url, ""
 
 
 def parse_uploaded_phone_lines(raw_lines: Any) -> tuple[list[UploadedPhoneEntry], list[dict[str, Any]]]:
@@ -497,43 +532,41 @@ def parse_uploaded_phone_lines(raw_lines: Any) -> tuple[list[UploadedPhoneEntry]
         line = str(raw_line or "").strip()
         if not line:
             continue
-        if "----" not in line:
-            errors.append({"line": index, "raw": line, "reason": "缺少 ---- 分隔符"})
-            continue
-        phone_part, api_part = line.split("----", 1)
-        phone = _normalize_uploaded_phone(phone_part)
-        api_url = str(api_part or "").strip()
-        if not phone:
-            errors.append({"line": index, "raw": line, "reason": "手机号为空或格式无效"})
-            continue
-        parsed_url = urlparse(api_url)
-        if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:
-            errors.append({"line": index, "raw": line, "phone": phone, "reason": "API URL 无效"})
+        phone, api_url, error = _split_uploaded_phone_api_line(line)
+        if error:
+            item = {"line": index, "raw": line, "reason": error}
+            if phone:
+                item["phone"] = phone
+            errors.append(item)
             continue
         if phone in seen:
             errors.append({"line": index, "raw": line, "phone": phone, "reason": "手机号重复，本轮只保留第一次"})
             continue
         seen.add(phone)
-        digits = re.sub(r"\D", "", phone)
         entries.append(
             UploadedPhoneEntry(
                 country_slug="uploaded",
                 phone=phone,
                 detail_url=api_url,
                 api_url=api_url,
-                raw_line=line,
+                raw_line=f"{phone}----{api_url}",
                 line_no=index,
             )
         )
     return entries, errors
 
 
-def _extract_uploaded_sms_code(value: Any) -> str:
+def _extract_uploaded_sms_code(value: Any, *, require_context: bool = False) -> str:
     text = str(value or "").strip()
     if not text:
         return ""
     if re.fullmatch(r"\d{4,6}", text):
         return text
+    contextual = _UPLOADED_SMS_CODE_CONTEXT_RE.search(text)
+    if contextual:
+        return contextual.group(1)
+    if require_context:
+        return ""
     matches = re.findall(r"(?<!\d)(\d{6})(?!\d)", text)
     if matches:
         return matches[0]
@@ -541,6 +574,198 @@ def _extract_uploaded_sms_code(value: Any) -> str:
     if 4 <= len(digits) <= 6:
         return digits
     return ""
+
+
+def _safe_response_text(resp: Any) -> str:
+    text = getattr(resp, "text", "")
+    if isinstance(text, str):
+        return text
+    try:
+        content = getattr(resp, "content", b"")
+        if isinstance(content, bytes):
+            return content.decode(getattr(resp, "encoding", None) or "utf-8", "replace")
+    except Exception:
+        pass
+    return "" if text is None else str(text)
+
+
+def _response_status_code(resp: Any) -> int:
+    try:
+        return int(getattr(resp, "status_code", 0) or 0)
+    except Exception:
+        return 0
+
+
+def _parse_uploaded_sms_api_result(
+    *,
+    payload: dict[str, Any] | None = None,
+    text: str = "",
+    status_code: int = 0,
+) -> dict[str, Any]:
+    """Normalize uploaded phone API responses into code/pending/error semantics."""
+
+    safe_text = str(text or "").strip()
+    data = payload.get("data") if isinstance(payload, dict) and isinstance(payload.get("data"), dict) else {}
+    message = ""
+    expired_date = ""
+    code_time = ""
+    raw_code: Any = ""
+    parser = "generic_text"
+
+    if isinstance(payload, dict):
+        parser = "json_status"
+        expired_date = str(
+            data.get("expired_date")
+            or payload.get("expired_date")
+            or payload.get("expires_at")
+            or ""
+        ).strip()
+        code_time = str(data.get("code_time") or payload.get("code_time") or payload.get("received_at") or "").strip()
+        raw_code = (
+            data.get("code")
+            or data.get("verification_code")
+            or data.get("otp")
+            or payload.get("verification_code")
+            or payload.get("otp")
+            or ""
+        )
+        top_level_code = payload.get("code")
+        if not raw_code and str(top_level_code or "").strip() not in {"", "0"}:
+            maybe_code = _extract_uploaded_sms_code(top_level_code)
+            if maybe_code:
+                raw_code = top_level_code
+        message = str(
+            payload.get("msg")
+            or payload.get("message")
+            or payload.get("error")
+            or data.get("message")
+            or ""
+        ).strip()
+        code = _extract_uploaded_sms_code(raw_code)
+        if code:
+            return {
+                "status": "code",
+                "code": code,
+                "raw_code": str(raw_code or ""),
+                "code_time": code_time,
+                "expired_date": expired_date,
+                "message": message or "OK",
+                "parser": parser,
+                "payload": payload,
+                "raw_excerpt": _safe_response_snippet(safe_text or message, 240),
+            }
+        if str(raw_code or "").strip():
+            return {
+                "status": "error",
+                "code": "",
+                "raw_code": str(raw_code or ""),
+                "code_time": code_time,
+                "expired_date": expired_date,
+                "message": "收码 API 返回了验证码字段，但无法提取 6 位数字验证码",
+                "parser": parser,
+                "payload": payload,
+                "raw_excerpt": _safe_response_snippet(safe_text or str(raw_code), 240),
+            }
+        if status_code >= 400:
+            return {
+                "status": "error",
+                "code": "",
+                "raw_code": "",
+                "code_time": code_time,
+                "expired_date": expired_date,
+                "message": message or f"HTTP {status_code}",
+                "parser": parser,
+                "payload": payload,
+                "raw_excerpt": _safe_response_snippet(safe_text or message, 240),
+            }
+        return {
+            "status": "pending",
+            "code": "",
+            "raw_code": "",
+            "code_time": code_time,
+            "expired_date": expired_date,
+            "message": message or "No verification code",
+            "parser": parser,
+            "payload": payload,
+            "raw_excerpt": _safe_response_snippet(safe_text or message, 240),
+        }
+
+    upper_text = safe_text.upper()
+    if upper_text.startswith("NO|"):
+        return {
+            "status": "pending",
+            "code": "",
+            "raw_code": "",
+            "code_time": "",
+            "expired_date": "",
+            "message": safe_text.split("|", 1)[1].strip() or "暂无短信",
+            "parser": "plain_yes_no",
+            "payload": {},
+            "raw_excerpt": _safe_response_snippet(safe_text, 240),
+        }
+    if upper_text.startswith("YES|"):
+        body = safe_text.split("|", 1)[1].strip()
+        code = _extract_uploaded_sms_code(body)
+        return {
+            "status": "code" if code else "error",
+            "code": code,
+            "raw_code": body,
+            "code_time": "",
+            "expired_date": "",
+            "message": body if code else "YES 响应中未提取到 4-6 位验证码",
+            "parser": "plain_yes_no",
+            "payload": {},
+            "raw_excerpt": _safe_response_snippet(safe_text, 240),
+        }
+
+    code = _extract_uploaded_sms_code(safe_text, require_context=True)
+    if code:
+        return {
+            "status": "code",
+            "code": code,
+            "raw_code": safe_text,
+            "code_time": "",
+            "expired_date": "",
+            "message": safe_text,
+            "parser": "generic_text",
+            "payload": {},
+            "raw_excerpt": _safe_response_snippet(safe_text, 240),
+        }
+    if _UPLOADED_SMS_PENDING_RE.search(safe_text):
+        return {
+            "status": "pending",
+            "code": "",
+            "raw_code": "",
+            "code_time": "",
+            "expired_date": "",
+            "message": safe_text or "暂无短信",
+            "parser": "generic_text",
+            "payload": {},
+            "raw_excerpt": _safe_response_snippet(safe_text, 240),
+        }
+    if status_code >= 400 or _UPLOADED_SMS_ERROR_RE.search(safe_text):
+        return {
+            "status": "error",
+            "code": "",
+            "raw_code": safe_text,
+            "code_time": "",
+            "expired_date": "",
+            "message": safe_text or f"HTTP {status_code}",
+            "parser": "generic_text",
+            "payload": {},
+            "raw_excerpt": _safe_response_snippet(safe_text, 240),
+        }
+    return {
+        "status": "pending",
+        "code": "",
+        "raw_code": "",
+        "code_time": "",
+        "expired_date": "",
+        "message": safe_text or "No verification code",
+        "parser": "generic_text",
+        "payload": {},
+        "raw_excerpt": _safe_response_snippet(safe_text, 240),
+    }
 
 
 class UploadedPhoneService:
@@ -595,6 +820,8 @@ class UploadedPhoneService:
         self.last_code = ""
         self.last_code_time = ""
         self.last_code_was_extracted = False
+        self.last_api_parser = ""
+        self.last_api_raw_excerpt = ""
         self.last_sms_sent = False
         self.last_sms_sent_at = 0.0
         self._last_stale_code_key = ""
@@ -628,6 +855,8 @@ class UploadedPhoneService:
         self.last_code = ""
         self.last_code_time = ""
         self.last_code_was_extracted = False
+        self.last_api_parser = ""
+        self.last_api_raw_excerpt = ""
         self.last_sms_sent = False
         self.last_sms_sent_at = 0.0
         self._last_stale_code_key = ""
@@ -657,26 +886,30 @@ class UploadedPhoneService:
         if self.current_entry and self.current_entry.phone == str(phone or "").strip():
             self.cancel(self.current_entry, reason=reason or "OpenAI rejected uploaded phone")
 
-    def _fetch_api_payload(self, entry: UploadedPhoneEntry) -> dict[str, Any]:
+    def _fetch_api_poll_result(self, entry: UploadedPhoneEntry) -> dict[str, Any]:
         self._check_stop()
         try:
             resp = requests.get(entry.api_url, timeout=20)
         except Exception as exc:
             raise RuntimeError(f"收码 API 请求失败: {exc}") from exc
+        status_code = _response_status_code(resp)
+        response_text = _safe_response_text(resp)
+        payload: dict[str, Any] | None = None
         try:
-            payload = resp.json()
-        except Exception as exc:
-            raise RuntimeError(f"收码 API 响应不是 JSON: {_safe_response_snippet(resp.text, 200)}") from exc
-        if resp.status_code >= 400:
-            message = str(
-                payload.get("msg")
-                or payload.get("message")
-                or payload.get("error")
-                or _safe_response_snippet(resp.text, 200)
-                or f"HTTP {resp.status_code}"
-            )
+            raw_payload = resp.json()
+            if isinstance(raw_payload, dict):
+                payload = raw_payload
+        except Exception:
+            payload = None
+        result = _parse_uploaded_sms_api_result(
+            payload=payload,
+            text=response_text,
+            status_code=status_code,
+        )
+        if status_code >= 400 and result.get("status") != "code":
+            message = str(result.get("message") or result.get("raw_excerpt") or f"HTTP {status_code}")
             raise RuntimeError(f"收码 API 返回失败: {redact_log_text(message)}")
-        return payload if isinstance(payload, dict) else {}
+        return result
 
     def wait_for_code(self, entry: UploadedPhoneEntry, *, timeout: Optional[int] = None) -> Optional[str]:
         wait_seconds = _to_positive_int(timeout, self.otp_timeout_seconds, minimum=10)
@@ -688,8 +921,11 @@ class UploadedPhoneService:
             if remaining <= 0:
                 return None
             try:
-                payload = self._fetch_api_payload(entry)
+                poll_result = self._fetch_api_poll_result(entry)
+                payload = poll_result.get("payload") if isinstance(poll_result.get("payload"), dict) else {}
                 self.last_api_payload = payload
+                self.last_api_parser = str(poll_result.get("parser") or "")
+                self.last_api_raw_excerpt = str(poll_result.get("raw_excerpt") or "")
                 self.last_api_error = ""
             except TaskInterruption:
                 raise
@@ -698,14 +934,19 @@ class UploadedPhoneService:
                 self.log_fn(f"[号码测试] {entry.phone} 收码 API 异常: {redact_log_text(exc)}")
                 raise
 
-            data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
-            expired_date = str(data.get("expired_date") or "").strip()
+            expired_date = str(poll_result.get("expired_date") or "").strip()
             if expired_date:
                 self.last_expired_date = expired_date
-            raw_code = data.get("code") or payload.get("verification_code") or payload.get("otp") or ""
-            code = _extract_uploaded_sms_code(raw_code)
+            status = str(poll_result.get("status") or "").strip().lower()
+            raw_code = str(poll_result.get("raw_code") or "")
+            code = str(poll_result.get("code") or "").strip()
+            if status == "error":
+                error_message = str(poll_result.get("message") or "收码 API 响应无法识别")
+                self.last_api_error = error_message
+                self.log_fn(f"[号码测试] {entry.phone} 收码 API 异常: {redact_log_text(error_message)}")
+                raise RuntimeError(error_message)
             if code:
-                code_time = str(data.get("code_time") or "").strip()
+                code_time = str(poll_result.get("code_time") or "").strip()
                 if code_time:
                     self.last_code_time = code_time
                 code_timestamp = _parse_uploaded_sms_time(code_time)
@@ -730,16 +971,20 @@ class UploadedPhoneService:
                 self.log_fn(
                     f"[号码测试] {entry.phone} 收到验证码 "
                     f"otp={code} otp_received=true otp_length={len(code)}"
+                    f" source={self.last_api_parser or 'unknown'}"
                     f"{f'，时间 {code_time}' if code_time else ''}{extracted_hint}"
                 )
                 return code
             if str(raw_code or "").strip():
                 raise RuntimeError("收码 API 返回了验证码字段，但无法提取 6 位数字验证码")
 
-            message = str(payload.get("msg") or payload.get("message") or "No verification code").strip()
+            message = str(poll_result.get("message") or "No verification code").strip()
             status_text = f"{message}{f'，有效期至 {expired_date}' if expired_date else ''}"
             if status_text != last_message:
-                self.log_fn(f"[号码测试] {entry.phone} 暂无验证码: {redact_log_text(status_text)}")
+                self.log_fn(
+                    f"[号码测试] {entry.phone} 暂无验证码: {redact_log_text(status_text)} "
+                    f"source={self.last_api_parser or 'unknown'}"
+                )
                 last_message = status_text
             time.sleep(min(float(self.poll_interval_seconds), max(0.1, remaining)))
 

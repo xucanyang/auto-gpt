@@ -198,8 +198,9 @@ def redact_raw_phone_line(value: Any) -> str:
     text = str(value or "").strip()
     if not text:
         return ""
-    if "----" in text:
-        phone, api_url = text.split("----", 1)
+    parts = re.split(r"-{3,}", text, maxsplit=1)
+    if len(parts) == 2:
+        phone, api_url = parts
         return f"{mask_phone_for_log(phone)}----{redact_url(api_url)}"
     return _redact_text_patterns(text)
 
@@ -344,7 +345,7 @@ def _redact_text_patterns(value: Any, *, expose_phone: bool = False, expose_otp:
         return ""
     text = _PROXY_URL_RE.sub(lambda m: f"{m.group('scheme')}***:***@{m.group('host')}", text)
     text = re.sub(
-        r"(?<!\S)(\+?\d[\d().\s-]{6,}\d)----(https?://[^\s'\"<>]+)",
+        r"(?<!\S)(\+?\d[\d().\s-]{6,}\d)-{3,}(https?://[^\s'\"<>]+)",
         lambda m: redact_raw_phone_line(m.group(0)),
         text,
     )

@@ -1146,48 +1146,18 @@ def _resolve_batch_k12_recapture_accounts(
 
 
 def _parse_phone_binding_upload_lines(raw_lines: Any) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Parse +phone----api lines without importing the runtime phone service."""
-    import re
-    from urllib.parse import urlparse
+    """Parse pasted phone/API lines through the shared uploaded-phone parser."""
+    from services.chatgpt_core.phone_service import parse_uploaded_phone_lines
 
-    if isinstance(raw_lines, str):
-        lines = raw_lines.splitlines()
-    elif isinstance(raw_lines, list | tuple):
-        lines = [str(item or "") for item in raw_lines]
-    else:
-        lines = []
-
+    uploaded_entries, errors = parse_uploaded_phone_lines(raw_lines)
     entries: list[dict[str, Any]] = []
-    errors: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for index, raw_line in enumerate(lines, start=1):
-        line = str(raw_line or "").strip()
-        if not line:
-            continue
-        if "----" not in line:
-            errors.append({"line": index, "raw": line, "reason": "缺少 ---- 分隔符"})
-            continue
-        phone_part, api_part = line.split("----", 1)
-        digits = re.sub(r"\D", "", str(phone_part or ""))
-        phone = f"+{digits}" if digits else ""
-        api_url = str(api_part or "").strip()
-        if not phone:
-            errors.append({"line": index, "raw": line, "reason": "手机号为空或格式无效"})
-            continue
-        parsed_url = urlparse(api_url)
-        if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:
-            errors.append({"line": index, "raw": line, "phone": phone, "reason": "API URL 无效"})
-            continue
-        if phone in seen:
-            errors.append({"line": index, "raw": line, "phone": phone, "reason": "手机号重复，本轮只保留第一次"})
-            continue
-        seen.add(phone)
+    for entry in uploaded_entries:
         entries.append(
             {
-                "line_no": index,
-                "phone": phone,
-                "api_url": api_url,
-                "raw_line": line,
+                "line_no": int(entry.line_no or 0),
+                "phone": entry.phone,
+                "api_url": entry.api_url,
+                "raw_line": entry.raw_line or f"{entry.phone}----{entry.api_url}",
                 "pool_managed": False,
             }
         )

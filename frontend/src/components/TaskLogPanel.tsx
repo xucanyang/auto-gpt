@@ -39,7 +39,11 @@ function parseLogLine(rawLine: string) {
   const normalized = line.replace(/^\[\d{2}:\d{2}:\d{2}\]\s*/, '')
   const isDebug = /^\[[^\]]*DEBUG[^\]]*\]/i.test(normalized)
   const text = isDebug ? normalized.replace(/^\[[^\]]*DEBUG[^\]]*\]\s*/, '') : normalized
-  return { raw: line, text, isDebug, time }
+  const phoneBindingAccountMatch = text.match(/^\[手机号绑定\]\[账号\s+(\d+)\/(\d+)\]/)
+  const phoneBindingAccountKey = phoneBindingAccountMatch
+    ? `${phoneBindingAccountMatch[1]}/${phoneBindingAccountMatch[2]}`
+    : ''
+  return { raw: line, text, isDebug, time, phoneBindingAccountKey }
 }
 
 export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
@@ -76,10 +80,22 @@ export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
     () => parsedLines.filter((line) => (viewMode === 'debug' ? line.isDebug : !line.isDebug)),
     [parsedLines, viewMode],
   )
+  const groupedVisibleLines = useMemo(() => {
+    let lastPhoneBindingAccountKey = ''
+    return visibleLines.map((line) => {
+      const key = line.phoneBindingAccountKey
+      const accountGap = Boolean(key && lastPhoneBindingAccountKey && key !== lastPhoneBindingAccountKey)
+      if (key) lastPhoneBindingAccountKey = key
+      return { ...line, accountGap }
+    })
+  }, [visibleLines])
 
   const handleCopyAll = async () => {
     try {
-      await navigator.clipboard.writeText(visibleLines.map((line) => line.raw).join('\n'))
+      const text = groupedVisibleLines
+        .flatMap((line) => (line.accountGap ? ['', line.raw] : [line.raw]))
+        .join('\n')
+      await navigator.clipboard.writeText(text)
       message.success('日志已复制')
     } catch {
       message.error('复制失败')
@@ -501,13 +517,13 @@ export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
           </div>
         )}
         {error && <div style={{ color: '#dc2626' }}>{error}</div>}
-        {visibleLines.map((line, index) => {
+        {groupedVisibleLines.map((line, index) => {
           return (
             <div
               key={`${index}-${line.raw}`}
               style={{
                 lineHeight: 1.65,
-                margin: line.isDebug ? '2px 0' : 0,
+                margin: line.accountGap ? (line.isDebug ? '14px 0 2px' : '14px 0 0') : line.isDebug ? '2px 0' : 0,
                 padding: line.isDebug ? '2px 8px' : 0,
                 border: line.isDebug ? `1px solid ${token.colorPrimaryBorder}` : '1px solid transparent',
                 borderRadius: line.isDebug ? 4 : 0,

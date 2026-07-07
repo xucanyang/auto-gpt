@@ -103,7 +103,7 @@ class PhonePoolTaskIntegrationTests(unittest.TestCase):
 
         req = PhoneBindingTestTaskRequest(
             account_ids=[123],
-            phone_lines="+15551230002----https://relay.example.com/manual",
+            phone_lines="15551230002---https://relay.example.com/manual",
             use_pool=True,
             max_resend_attempts=2,
             resend_interval_seconds=45,
@@ -136,7 +136,9 @@ class PhonePoolTaskIntegrationTests(unittest.TestCase):
         self.assertTrue(created_meta["phone_items"][0]["pool_managed"])
         self.assertEqual(created_meta["phone_items"][0]["pool_id"], 77)
         self.assertEqual(created_meta["phone_items"][0]["phone"], "+15551230002")
+        self.assertEqual(created_meta["phone_items"][0]["raw_line"], "+1555***0002----https://relay.example.com/manual")
         self.assertEqual(background_tasks.calls[0][0][3][0]["phone"], "+15551230002")
+        self.assertEqual(background_tasks.calls[0][0][3][0]["raw_line"], "+15551230002----https://relay.example.com/manual")
         self.assertTrue(background_tasks.calls[0][0][3][0]["pool_managed"])
         self.assertEqual(background_tasks.calls[0][0][4]["max_resend_attempts"], 2)
 

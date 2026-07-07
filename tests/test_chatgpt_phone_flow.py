@@ -301,18 +301,22 @@ class UploadedPhoneServiceTests(unittest.TestCase):
             "\n".join(
                 [
                     "+13434832954----https://api.sms8.net/api/record?token=one",
+                    "17632154294---https://phonenum.smiley99627.asia/7632154294",
                     "+13434832954----https://api.sms8.net/api/record?token=duplicate",
                     "bad-line",
                 ]
             )
         )
 
-        self.assertEqual(len(entries), 1)
+        self.assertEqual(len(entries), 2)
         self.assertEqual(entries[0].phone, "+13434832954")
         self.assertEqual(entries[0].api_url, "https://api.sms8.net/api/record?token=one")
+        self.assertEqual(entries[1].phone, "+17632154294")
+        self.assertEqual(entries[1].api_url, "https://phonenum.smiley99627.asia/7632154294")
+        self.assertEqual(entries[1].raw_line, "+17632154294----https://phonenum.smiley99627.asia/7632154294")
         self.assertEqual(len(errors), 2)
         self.assertIn("重复", errors[0]["reason"])
-        self.assertIn("分隔符", errors[1]["reason"])
+        self.assertIn("API URL", errors[1]["reason"])
 
     def test_uploaded_phone_service_waits_until_sms8_code_field_is_present(self):
         entries, errors = parse_uploaded_phone_lines(
@@ -340,6 +344,25 @@ class UploadedPhoneServiceTests(unittest.TestCase):
                 self.assertEqual(service.wait_for_code(entries[0], timeout=10), "123456")
         self.assertEqual(service.last_expired_date, "2026-08-26 00:00:00")
         self.assertEqual(service.last_code_time, "2026-06-02 10:00:00")
+
+    def test_uploaded_phone_service_supports_plain_yes_no_sms_api(self):
+        entries, errors = parse_uploaded_phone_lines(
+            "17632154294---https://phonenum.smiley99627.asia/7632154294"
+        )
+        self.assertFalse(errors)
+        service = UploadedPhoneService(entries, {"uploaded_phone_poll_interval_seconds": "1"})
+        service.bind_entry(entries[0])
+
+        first = mock.Mock(status_code=200, text="NO|暂无短信")
+        first.json.side_effect = ValueError("not json")
+        second = mock.Mock(status_code=200, text="YES|您的 OpenAI 验证代码是：421804")
+        second.json.side_effect = ValueError("not json")
+
+        with mock.patch("services.chatgpt_core.phone_service.requests.get", side_effect=[first, second]):
+            with mock.patch("services.chatgpt_core.phone_service.time.sleep"):
+                self.assertEqual(service.wait_for_code(entries[0], timeout=10), "421804")
+        self.assertEqual(service.last_api_parser, "plain_yes_no")
+        self.assertTrue(service.last_code_was_extracted)
 
     def test_uploaded_phone_service_extracts_six_digit_code_from_sms_text(self):
         entries, errors = parse_uploaded_phone_lines(
