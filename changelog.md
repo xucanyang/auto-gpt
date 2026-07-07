@@ -5,6 +5,9 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，并且本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/) (语义化版本)。
 
 ## [Unreleased] (未发布)
+### 优化 (Changed)
+- **架构重构：拆分 Accounts 页面组件**：`frontend/src/pages/Accounts.tsx` 将原先庞大的文件中的 `FilterPresetBar` 和 `SelectedAccountsSummary` 独立提取为了可复用的独立组件，分别存放至 `frontend/src/features/accounts/components/FilterPresetBar.tsx` 与 `frontend/src/features/accounts/components/SelectedAccountsSummary.tsx`，显著提升了代码的可读性与维护性。
+- **同步前端版本号至 v1.3.25**：`frontend/src/app/AppShell.tsx` 侧边栏版本展示更新为 `v1.3.25`。
 
 ## [1.3.24] - 2026-07-07
 ### 优化 (Changed)
@@ -733,4 +736,8 @@
 
 ## 2026-07-07 08:31:49 +0800
 - UI: 极简压缩 Accounts 页面已选账号区域并升级至 v1.3.24
+- 发布模式: multi
+
+## 2026-07-07 09:07:01 +0800
+- 重构: 拆分 Accounts.tsx 中的 FilterPresetBar 与 SelectedAccountsSummary 组件
 - 发布模式: multi

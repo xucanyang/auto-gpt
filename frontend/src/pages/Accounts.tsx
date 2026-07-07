@@ -1,5 +1,7 @@
 import { lazy, Suspense, useEffect, useState, useCallback, useMemo, useRef } from 'react'
 import type { CSSProperties } from 'react'
+import { FilterPresetBar } from '../features/accounts/components/FilterPresetBar'
+import { SelectedAccountsSummary } from '../features/accounts/components/SelectedAccountsSummary'
 import {
   Button,
   Checkbox,
@@ -22,7 +24,6 @@ import {
   Steps,
   Switch,
   Progress,
-  Popover,
 } from 'antd'
 import type { CheckboxOptionType } from 'antd/es/checkbox/Group'
 import type { MenuProps } from 'antd'
@@ -31,12 +32,9 @@ import {
   DeleteOutlined,
   DownOutlined,
   EditOutlined,
-  FilterOutlined,
   LinkOutlined,
   MoreOutlined,
   PlusOutlined,
-  PushpinOutlined,
-  SaveOutlined,
   UploadOutlined,
   SyncOutlined,
   SettingOutlined,
@@ -321,7 +319,7 @@ const EMPTY_ACCOUNT_FILTERS: AccountColumnFilters = {
   oaipayState: [],
 }
 
-type AccountFilterPresetFilters = {
+export type AccountFilterPresetFilters = {
   search?: string
   status?: string[]
   columnFilters?: Partial<Record<keyof AccountColumnFilters, string[] | string>>
@@ -329,7 +327,7 @@ type AccountFilterPresetFilters = {
   pageSize?: number
 }
 
-type AccountFilterPreset = {
+export type AccountFilterPreset = {
   id: string
   name: string
   description?: string
@@ -521,7 +519,7 @@ function summarizePresetValues(options: Array<{ value: string; text: string }>, 
   return values.map((value) => labelForOption(options, value)).join('/')
 }
 
-function buildAccountFilterPresetSummary(filters?: AccountFilterPresetFilters) {
+export function buildAccountFilterPresetSummary(filters?: AccountFilterPresetFilters) {
   const normalized = normalizeAccountFilterPresetFilters(filters)
   const columnFilters = normalized.columnFilters
   const parts = [
@@ -747,7 +745,7 @@ function clearTaskModalStorage() {
   window.localStorage.removeItem(TASK_MODAL_STORAGE_KEY)
 }
 
-const STATUS_COLORS: Record<string, string> = {
+export const STATUS_COLORS: Record<string, string> = {
   registered: 'default',
   pending_payment: 'warning',
   payment_failed: 'error',
@@ -1609,7 +1607,7 @@ function formatCodexResetShort(resetAfter: unknown, resetAt: unknown) {
   return `${Math.max(1, minutes)}m`
 }
 
-function statusLabel(status?: string) {
+export function statusLabel(status?: string) {
   const normalized = String(status || '').trim()
   return STATUS_LABELS[normalized] || normalized || '未知'
 }
@@ -6290,111 +6288,7 @@ export default function Accounts() {
     setSelectedAccountSnapshots({})
   }
 
-  const renderFilterPresetBar = () => {
-    const activeSummary = activeFilterPreset
-      ? (activeFilterPreset.summary || buildAccountFilterPresetSummary(activeFilterPreset.filters))
-      : ''
-    const currentSummary = buildAccountFilterPresetSummary(currentFilterPresetFilters)
-    return (
-      <div
-        style={{
-          flex: '0 0 auto',
-          marginBottom: isMobile ? 8 : 12,
-          padding: isMobile ? 8 : '4px 8px',
-          border: `1px solid ${token.colorBorderSecondary}`,
-          borderRadius: 8,
-          background: token.colorBgContainer,
-          boxShadow: token.boxShadowTertiary,
-          display: 'flex',
-          alignItems: 'center',
-          flexWrap: 'wrap',
-          gap: 12,
-        }}
-      >
-        <Space size={8} wrap style={{ minWidth: 0 }}>
-          <Space size={6}>
-            <FilterOutlined style={{ color: token.colorPrimary }} />
-            <Text strong style={{ fontSize: 13 }}>筛选组合</Text>
-          </Space>
-          <Select
-            allowClear
-            showSearch
-            size="small"
-            placeholder={filterPresetLoading ? '读取中...' : '选择后应用'}
-            loading={filterPresetLoading}
-            value={activeFilterPresetId || undefined}
-            style={{ width: isMobile ? '100%' : 180 }}
-            optionFilterProp="label"
-            options={filterPresets.map((preset) => ({
-              value: preset.id,
-              label: `${preset.name}${preset.built_in ? ' · 内置' : ''}`,
-            }))}
-            onChange={(presetId) => {
-              const preset = filterPresets.find((item) => item.id === presetId)
-              if (preset) applyFilterPreset(preset)
-              else clearFilterPreset()
-            }}
-          />
-          {pinnedFilterPresets.length > 0 && !isMobile ? (
-            <Space size={6} wrap>
-              <div style={{ width: 1, height: 16, background: token.colorBorderSecondary, margin: '0 4px' }} />
-              {pinnedFilterPresets.map((preset) => {
-                const active = preset.id === activeFilterPresetId
-                return (
-                  <Button
-                    key={preset.id}
-                    size="small"
-                    type={active ? 'primary' : 'default'}
-                    ghost={active}
-                    icon={preset.pinned && !preset.built_in ? <PushpinOutlined /> : undefined}
-                    onClick={() => {
-                      if (active) clearFilterPreset()
-                      else applyFilterPreset(preset)
-                    }}
-                  >
-                    {preset.name}
-                  </Button>
-                )
-              })}
-            </Space>
-          ) : null}
-          <Dropdown
-            menu={{
-              items: [
-                { key: 'save', icon: <SaveOutlined />, label: '保存当前筛选', onClick: openCreateCurrentFilterPreset },
-                { key: 'manage', icon: <SettingOutlined />, label: '管理筛选组合', onClick: () => setFilterPresetManageOpen(true) },
-                { type: 'divider' },
-                { key: 'refresh', icon: <SyncOutlined spin={filterPresetLoading} />, label: '刷新组合', onClick: () => void loadFilterPresets(false) },
-              ]
-            }}
-          >
-            <Button size="small" type="text" icon={<SettingOutlined />} />
-          </Dropdown>
-        </Space>
 
-        <div style={{ flex: '1 1 auto', minWidth: 0, display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 8 }}>
-          <Text type="secondary" style={{ fontSize: 12 }} ellipsis={{ tooltip: activeFilterPreset ? activeSummary : currentSummary }}>
-            {activeFilterPreset ? `当前组合：${activeFilterPreset.name}${activeFilterPreset.built_in ? ' (内置)' : ''}` : `匹配 ${total} 个`}
-          </Text>
-          {activeFilterPreset && activeFilterPresetDirty ? (
-            <Space size={4}>
-              {!activeFilterPreset.built_in ? (
-                <Button size="small" type="link" style={{ padding: 0 }} loading={filterPresetSaving} onClick={() => void overwriteActiveFilterPreset()}>
-                  覆盖保存
-                </Button>
-              ) : null}
-              <Button size="small" type="link" style={{ padding: 0 }} onClick={() => openCopyFilterPreset(activeFilterPreset)}>
-                另存为
-              </Button>
-              <Button size="small" type="link" danger style={{ padding: 0 }} onClick={() => applyFilterPreset(activeFilterPreset)}>
-                还原
-              </Button>
-            </Space>
-          ) : null}
-        </div>
-      </div>
-    )
-  }
 
   const subscriptionExpiryTableSortOrder =
     subscriptionExpirySortOrder === 'asc'
@@ -6403,82 +6297,7 @@ export default function Accounts() {
         ? 'descend'
         : null
 
-  const renderSelectedAccountsSummary = () => {
-    if (selectedAccountItems.length === 0) return null
 
-    const accountTags = (
-      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, maxHeight: isMobile ? 180 : 240, overflow: 'auto', maxWidth: 400 }}>
-        {selectedAccountItems.map((account) => {
-          const id = String(account?.id || '')
-          const email = String(account?.email || '').trim()
-          const status = String(account?.status || '').trim()
-          const title = email || `账号 ${id}`
-          return (
-            <Tag
-              key={id}
-              closable
-              onClose={(event) => {
-                event.preventDefault()
-                removeSelectedAccount(id)
-              }}
-              color={STATUS_COLORS[status] || 'default'}
-              style={{
-                display: 'inline-flex',
-                alignItems: 'center',
-                gap: 4,
-                maxWidth: '100%',
-                marginInlineEnd: 0,
-                padding: '2px 6px',
-              }}
-            >
-              <span
-                title={title}
-                style={{
-                  display: 'inline-block',
-                  maxWidth: 210,
-                  overflow: 'hidden',
-                  textOverflow: 'ellipsis',
-                  verticalAlign: 'bottom',
-                }}
-              >
-                {title}
-              </span>
-              <Text type="secondary" style={{ fontSize: 11 }}>
-                ID {id}{status ? ` · ${statusLabel(status)}` : ''}
-              </Text>
-            </Tag>
-          )
-        })}
-      </div>
-    )
-
-    return (
-      <div
-        style={{
-          flex: '0 0 auto',
-          marginBottom: isMobile ? 10 : 12,
-          padding: '4px 12px',
-          border: `1px solid ${token.colorBorderSecondary}`,
-          borderRadius: 8,
-          background: token.colorFillAlter,
-          display: 'flex',
-          justifyContent: 'space-between',
-          alignItems: 'center',
-          gap: 10,
-        }}
-      >
-        <Space size={6}>
-          <Text strong style={{ fontSize: 13 }}>已选账号</Text>
-          <Popover content={accountTags} title="已选账号列表" trigger="hover" placement="bottomLeft">
-            <Tag color="processing" style={{ cursor: 'pointer' }}>{selectedAccountItems.length} 个</Tag>
-          </Popover>
-        </Space>
-        <Button size="small" type="link" onClick={clearSelectedAccounts} style={{ padding: 0 }}>
-          清空
-        </Button>
-      </div>
-    )
-  }
 
   const columns: any[] = [
     {
@@ -7205,9 +7024,34 @@ export default function Accounts() {
         isMobile={isMobile}
       />
 
-      {renderFilterPresetBar()}
+      <FilterPresetBar
+        isMobile={isMobile}
+        token={token}
+        filterPresetLoading={filterPresetLoading}
+        activeFilterPresetId={activeFilterPresetId}
+        filterPresets={filterPresets}
+        pinnedFilterPresets={pinnedFilterPresets}
+        activeFilterPreset={activeFilterPreset}
+        currentFilterPresetFilters={currentFilterPresetFilters}
+        total={total}
+        activeFilterPresetDirty={activeFilterPresetDirty}
+        filterPresetSaving={filterPresetSaving}
+        applyFilterPreset={applyFilterPreset}
+        clearFilterPreset={clearFilterPreset}
+        openCreateCurrentFilterPreset={openCreateCurrentFilterPreset}
+        setFilterPresetManageOpen={setFilterPresetManageOpen}
+        loadFilterPresets={loadFilterPresets}
+        overwriteActiveFilterPreset={overwriteActiveFilterPreset}
+        openCopyFilterPreset={openCopyFilterPreset}
+      />
 
-      {renderSelectedAccountsSummary()}
+      <SelectedAccountsSummary
+        isMobile={isMobile}
+        token={token}
+        selectedAccountItems={selectedAccountItems}
+        removeSelectedAccount={removeSelectedAccount}
+        clearSelectedAccounts={clearSelectedAccounts}
+      />
 
       <AccountsTable
         columns={visibleColumns}
