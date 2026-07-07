@@ -7,6 +7,14 @@
 ## [Unreleased] (未发布)
 
 
+## [1.3.33] - 2026-07-08
+### 修复 (Fixed)
+- **修正 Helper Ready 出库后的验证码监听范围**：`core/base_mailbox.py` 调整 `helper_ready_api` 模式下的 TempMail 转发箱候选选择逻辑；当 Helper 返回 `forward_mailbox_id` 或明确 `forward_to` 时，只监听该目标转发收件箱，不再继续追加扫描 `icloud_forward_to` 配置里的全部转发邮箱，避免单个注册任务制造不必要的多邮箱轮询和跨收件箱噪音。只有 Helper/历史账号状态缺失明确转发目标时，才回退扫描当前配置的全部转发邮箱。
+- **保留 Helper 任意池出库但区分监听目标**：`_helper_get_email()` 继续以 `forward_to="*"` 向 Helper 领取任意 ready alias，保证库存不被某个默认转发邮箱硬限制；领取结果中存在真实转发邮箱时会写入任务状态并在日志里显示目标，缺失时才标记为“回退扫描全部配置转发箱”，让出库范围与收码监听范围不再混淆。
+
+### 测试 (Tests)
+- **补充 HME Helper 转发箱范围回归测试**：`tests/test_icloud_hme_mailbox_finalize.py` 覆盖带 `forward_mailbox_id`、仅带 `forward_to`、以及完全缺失显式转发目标三种场景，确保有目标时只扫目标、无目标时才扫全部配置邮箱；前端侧边栏版本号同步更新为 `v1.3.33`。
+
 ## [1.3.32] - 2026-07-08
 ### 新增 (Added)
 - **账号列表新增“已标记不可用于 Idea 提交”筛选能力**：`services/account_filters.py` 在 `account_list_state` 派生筛选缓存中新增 `idea_submit_state` 非敏感索引列，并同步支持 `available / unavailable / paid / submitted / processing / failed` 状态筛选；`api/accounts.py` 的 `/api/accounts` 增加 `idea_submit_state` 查询参数，能够直接筛出 `extra.idea_submit.unavailable=true`、`extra.idea_submit_unavailable=true` 以及旧兼容标记 `chatgpt_account_unavailable=true + baxigpt_cdk.status=failed` 的账号，避免 Idea 批量提交失败后只能靠肉眼查看标签。
@@ -835,4 +843,8 @@
 
 ## 2026-07-08 05:33:25 +0800
 - 增加 Idea 不可用账号筛选列
+- 发布模式: multi
+
+## 2026-07-08 06:23:40 +0800
+- 修复 Helper Ready 有明确转发邮箱时误扫全部邮箱
 - 发布模式: multi

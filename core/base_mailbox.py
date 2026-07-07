@@ -2626,8 +2626,6 @@ class IcloudHmeMailbox(BaseMailbox):
         extra = dict(getattr(account, "extra", None) or {}) if account is not None else {}
         raw_values = [
             extra.get("forward_to"),
-            extra.get("configured_forward_to"),
-            extra.get("configured_forward_tos"),
         ]
         nested_account = extra.get("account")
         if isinstance(nested_account, dict):
@@ -2681,6 +2679,7 @@ class IcloudHmeMailbox(BaseMailbox):
                     extra={"mailbox_action": "bound_forward_mailbox"},
                 )
             )
+            return accounts
 
         for forward_to in forward_candidates:
             if forward_to in seen_forward_to:
@@ -2698,6 +2697,8 @@ class IcloudHmeMailbox(BaseMailbox):
             add_account(
                 resolved
             )
+        if accounts:
+            return accounts
 
         for forward_account in self._resolve_all_forward_mailboxes():
             add_account(forward_account)
@@ -2927,6 +2928,20 @@ class IcloudHmeMailbox(BaseMailbox):
             or ""
         ).strip()
         extra = dict(auto_gpt.get("extra") or {})
+        helper_forward_to = self._normalize_email(
+            extra.get("forward_to")
+            or mailbox.get("forward_to")
+            or mailbox.get("forwardTo")
+            or ""
+        )
+        if helper_forward_to == "*" or "@" not in helper_forward_to:
+            helper_forward_to = ""
+        helper_forward_mailbox_id = str(
+            extra.get("forward_mailbox_id")
+            or mailbox.get("forward_mailbox_id")
+            or mailbox.get("forwardMailboxId")
+            or ""
+        ).strip()
         if not email or not lease_id:
             raise RuntimeError(f"HME Ready API prepare 返回异常: {payload}")
         extra.update(
@@ -2937,13 +2952,23 @@ class IcloudHmeMailbox(BaseMailbox):
                 "lease_id": extra.get("lease_id") or lease_id,
                 "checkout_id": extra.get("checkout_id") or lease_id,
                 "hme": extra.get("hme") or email,
-                "forward_to": extra.get("forward_to") or self._icloud_forward_to,
                 "configured_forward_to": self._icloud_forward_to,
                 "configured_forward_tos": list(self._icloud_forward_tos),
                 "mailbox_action": extra.get("mailbox_action") or "claimed_helper",
             }
         )
-        self._log(f"[iCloudHME] Helper 已领取别名: {email} lease={lease_id}，验证码改由 TempMail 转发箱轮询")
+        if helper_forward_to:
+            extra["forward_to"] = helper_forward_to
+        else:
+            extra.pop("forward_to", None)
+        if helper_forward_mailbox_id:
+            extra["forward_mailbox_id"] = helper_forward_mailbox_id
+        listen_hint = (
+            f"监听转发箱 {helper_forward_to or '-'} mailbox_id={helper_forward_mailbox_id or '-'}"
+            if helper_forward_to or helper_forward_mailbox_id
+            else "未返回转发箱，验证码回退扫描配置的全部转发箱"
+        )
+        self._log(f"[iCloudHME] Helper 已领取别名: {email} lease={lease_id}，{listen_hint}")
         return MailboxAccount(email=email, account_id=lease_id, extra=extra)
 
     def get_email(self) -> MailboxAccount:

@@ -187,7 +187,94 @@ class IcloudHmeMailboxFinalizeTests(unittest.TestCase):
 
         self.assertIn("old-1", ids)
         mailbox._helper_client.list_emails.assert_not_called()
-        mailbox._tempmail_mailbox._list_emails.assert_any_call("specific-mbox")
+        self.assertEqual(
+            [call.args[0] for call in mailbox._tempmail_mailbox._list_emails.call_args_list],
+            ["specific-mbox"],
+        )
+        mailbox._tempmail_mailbox.ensure_mailbox_by_email.assert_not_called()
+
+    def test_helper_ready_forward_to_without_mailbox_id_scans_only_that_forward(self):
+        mailbox = IcloudHmeMailbox(
+            icloud_hme_mode="helper_ready_api",
+            icloud_cookie="",
+            icloud_forward_to="global@example.com, second@example.com",
+            tempmail_api_url="http://tempmail-api-1:8080",
+            tempmail_api_key="test-key",
+            icloud_hme_helper_api_url="http://helper-api",
+            icloud_hme_helper_internal_key="helper-key",
+        )
+        account = MailboxAccount(
+            email="alias@icloud.com",
+            account_id="lease-1",
+            extra={
+                "provider": "icloud_hme",
+                "mode": "helper_ready_api",
+                "lease_id": "lease-1",
+                "forward_to": "specific@example.com",
+            },
+        )
+
+        mailbox._tempmail_mailbox.ensure_mailbox_by_email = Mock(
+            side_effect=lambda email, force_lookup=False: MailboxAccount(
+                email=email,
+                account_id=f"mbox-{email}",
+            )
+        )
+        mailbox._tempmail_mailbox._list_emails = Mock(return_value=[])
+
+        ids = mailbox.get_current_ids(account)
+
+        self.assertEqual(ids, set())
+        self.assertEqual(
+            [call.args[0] for call in mailbox._tempmail_mailbox.ensure_mailbox_by_email.call_args_list],
+            ["specific@example.com"],
+        )
+        self.assertEqual(
+            [call.args[0] for call in mailbox._tempmail_mailbox._list_emails.call_args_list],
+            ["mbox-specific@example.com"],
+        )
+
+    def test_helper_ready_without_explicit_forward_target_scans_configured_forwards(self):
+        mailbox = IcloudHmeMailbox(
+            icloud_hme_mode="helper_ready_api",
+            icloud_cookie="",
+            icloud_forward_to="global@example.com, second@example.com",
+            tempmail_api_url="http://tempmail-api-1:8080",
+            tempmail_api_key="test-key",
+            icloud_hme_helper_api_url="http://helper-api",
+            icloud_hme_helper_internal_key="helper-key",
+        )
+        account = MailboxAccount(
+            email="alias@icloud.com",
+            account_id="lease-1",
+            extra={
+                "provider": "icloud_hme",
+                "mode": "helper_ready_api",
+                "lease_id": "lease-1",
+            },
+        )
+
+        mailbox._tempmail_mailbox.ensure_mailbox_by_email = Mock(
+            side_effect=lambda email, force_lookup=False: MailboxAccount(
+                email=email,
+                account_id=f"mbox-{email}",
+            )
+        )
+        mailbox._tempmail_mailbox._list_emails = Mock(
+            side_effect=lambda mailbox_id: [{"id": mailbox_id}]
+        )
+
+        ids = mailbox.get_current_ids(account)
+
+        self.assertEqual(ids, {"mbox-global@example.com", "mbox-second@example.com"})
+        self.assertEqual(
+            [call.args[0] for call in mailbox._tempmail_mailbox.ensure_mailbox_by_email.call_args_list],
+            ["global@example.com", "second@example.com"],
+        )
+        self.assertEqual(
+            [call.args[0] for call in mailbox._tempmail_mailbox._list_emails.call_args_list],
+            ["mbox-global@example.com", "mbox-second@example.com"],
+        )
 
     def test_early_homepage_failure_still_releases_alias(self):
         mailbox = self._build_mailbox()
