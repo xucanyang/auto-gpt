@@ -62,6 +62,42 @@ class IcloudHmeMailboxFinalizeTests(unittest.TestCase):
         self.assertTrue(forward_sink._permanent)
         self.assertGreaterEqual(forward_sink._ttl_minutes, 525600)
 
+    def test_forward_to_list_is_preserved_for_legacy_forward_scan(self):
+        mailbox = IcloudHmeMailbox(
+            icloud_hme_mode="import_pool",
+            icloud_cookie="",
+            icloud_forward_to="b@example.com, apple@example.com; ops@example.com",
+            tempmail_api_url="http://tempmail-api-1:8080",
+            tempmail_api_key="test-key",
+        )
+
+        self.assertEqual(mailbox._icloud_forward_to, "b@example.com")
+        self.assertEqual(
+            mailbox._icloud_forward_tos,
+            ["b@example.com", "apple@example.com", "ops@example.com"],
+        )
+
+    def test_helper_lease_id_does_not_treat_legacy_anonymous_id_as_checkout(self):
+        legacy = MailboxAccount(
+            email="legacy@icloud.com",
+            account_id="m5tbftxrk28215",
+            extra={"provider": "icloud_hme"},
+        )
+        helper_with_explicit_lease = MailboxAccount(
+            email="helper@icloud.com",
+            account_id="m5tbftxrk28215",
+            extra={"provider": "icloud_hme", "lease_id": "lease-1"},
+        )
+        helper_provider_state = MailboxAccount(
+            email="helper-provider@icloud.com",
+            account_id="lease-2",
+            extra={"provider": "hme_ready_api"},
+        )
+
+        self.assertEqual(IcloudHmeMailbox._helper_lease_id(legacy), "")
+        self.assertEqual(IcloudHmeMailbox._helper_lease_id(helper_with_explicit_lease), "lease-1")
+        self.assertEqual(IcloudHmeMailbox._helper_lease_id(helper_provider_state), "lease-2")
+
     def test_early_homepage_failure_still_releases_alias(self):
         mailbox = self._build_mailbox()
         account = MailboxAccount(email="alias@icloud.com", account_id="anon-2")

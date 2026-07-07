@@ -2459,9 +2459,15 @@ class IcloudHmeMailbox(BaseMailbox):
         self._icloud_hme_mode = str(icloud_hme_mode or "live").strip().lower() or "live"
         self._icloud_cookie = str(icloud_cookie or "").strip()
         self._icloud_domain_base = str(icloud_domain_base or "icloud.com").strip().lower() or "icloud.com"
-        self._icloud_forward_to = "*"
-        raw_forward_to = "*"
-        self._icloud_forward_tos = []
+        raw_forward_to = str(icloud_forward_to or "b@cccy.me").strip() or "b@cccy.me"
+        self._icloud_forward_tos = [
+            item.strip()
+            for item in re.split(r"[,;\s]+", raw_forward_to)
+            if item.strip()
+        ]
+        if not self._icloud_forward_tos:
+            self._icloud_forward_tos = ["b@cccy.me"]
+        self._icloud_forward_to = self._icloud_forward_tos[0]
         self._icloud_forward_mailbox_id = str(icloud_forward_mailbox_id or "").strip()
         self._wait_timeout_seconds = max(int(wait_timeout_seconds or 300), 1)
         helper_wait_timeout = str(icloud_hme_helper_wait_timeout_seconds or "").strip()
@@ -2784,13 +2790,27 @@ class IcloudHmeMailbox(BaseMailbox):
     @staticmethod
     def _helper_lease_id(account: MailboxAccount | None) -> str:
         extra = dict(getattr(account, "extra", None) or {}) if account is not None else {}
-        return str(
-            extra.get("lease_id")
-            or extra.get("checkout_id")
-            or extra.get("mailbox_id")
-            or getattr(account, "account_id", "")
-            or ""
-        ).strip()
+        explicit = str(extra.get("lease_id") or extra.get("checkout_id") or "").strip()
+        if explicit:
+            return explicit
+        helper_markers = {
+            str(extra.get("mode") or "").strip().lower(),
+            str(extra.get("provider") or "").strip().lower(),
+            str(extra.get("source") or "").strip().lower(),
+        }
+        is_helper_state = bool(
+            helper_markers
+            & {
+                "helper_ready_api",
+                "hme_ready_api",
+                "icloud_hme_ready",
+                "icloud_hme_helper_ready",
+                "icloud-hide-email-helper",
+            }
+        )
+        if not is_helper_state:
+            return ""
+        return str(extra.get("mailbox_id") or getattr(account, "account_id", "") or "").strip()
 
     def _helper_get_email(self) -> MailboxAccount:
         self._ensure_config()

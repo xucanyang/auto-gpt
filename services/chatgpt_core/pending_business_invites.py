@@ -119,6 +119,29 @@ def _has_value(value: Any) -> bool:
     return True
 
 
+def _mailbox_state_has_helper_lease(mailbox_state: dict[str, Any]) -> bool:
+    state = dict(mailbox_state or {})
+    account = dict(state.get("account") or {})
+    account_extra = dict(account.get("extra") or {})
+    if _has_value(account_extra.get("lease_id")) or _has_value(account_extra.get("checkout_id")):
+        return True
+
+    markers = {
+        str(state.get("provider") or "").strip().lower(),
+        str(account_extra.get("provider") or "").strip().lower(),
+        str(account_extra.get("mode") or "").strip().lower(),
+        str(account_extra.get("source") or "").strip().lower(),
+    }
+    helper_markers = {
+        "helper_ready_api",
+        "hme_ready_api",
+        "icloud_hme_ready",
+        "icloud_hme_helper_ready",
+        "icloud-hide-email-helper",
+    }
+    return bool((markers & helper_markers) and str(account.get("account_id") or "").strip())
+
+
 def _current_mailbox_config(keys: tuple[str, ...]) -> dict[str, Any]:
     try:
         global_config = config_store.get_all()
@@ -136,6 +159,7 @@ def _with_current_tempmail_config(mailbox_state: dict[str, Any]) -> dict[str, An
     provider = str(state.get("provider") or "").strip()
     if provider not in {"tempmail_local", "tempmail_api", *ICLOUD_HME_PROVIDER_VALUES}:
         return state
+    has_helper_lease = _mailbox_state_has_helper_lease(state)
 
     keys = ICLOUD_HME_STATE_CONFIG_KEYS if provider in ICLOUD_HME_PROVIDER_VALUES else TEMPMAIL_STATE_CONFIG_KEYS
     current_config = _current_mailbox_config(keys)
@@ -146,6 +170,13 @@ def _with_current_tempmail_config(mailbox_state: dict[str, Any]) -> dict[str, An
     config.update(current_config)
     if provider in {"hme_ready_api", "icloud_hme_ready", "icloud_hme_helper_ready"}:
         config["icloud_hme_mode"] = "helper_ready_api"
+    elif provider == "icloud_hme" and str(config.get("icloud_hme_mode") or "").strip().lower() == "helper_ready_api" and not has_helper_lease:
+        # Legacy iCloud HME account states store the Apple anonymous_id in
+        # account_id.  That value is not a HME Ready checkout/lease id.  When
+        # the current global mailbox mode is helper_ready_api, keep those
+        # restored old accounts on direct TempMail forward-mailbox scanning
+        # instead of sending anonymous_id to /api/hme-ready/.../wait-code.
+        config["icloud_hme_mode"] = "import_pool"
     current_forward_mailbox_id = current_config.get("icloud_forward_mailbox_id")
     if provider in ICLOUD_HME_PROVIDER_VALUES and not _has_value(current_forward_mailbox_id):
         # The persisted config value is not a durable service endpoint.  If the

@@ -3364,6 +3364,25 @@ class OAuthClient:
     @staticmethod
     def _is_fatal_mailbox_config_error(exc) -> bool:
         text = str(exc or "").lower()
+        if "helper_ready_api" in text and "lease_id" in text:
+            return True
+        if "hme ready api" in text:
+            return any(
+                marker in text
+                for marker in (
+                    "status=401",
+                    "status=403",
+                    "status=404",
+                    "invalid api_key",
+                    "missing api_key",
+                    "lease_not_found",
+                    "alias_not_found",
+                    "checkout_id",
+                    "alias_id",
+                    "当前任务缺少 lease_id",
+                    "helper ready api 未配置",
+                )
+            )
         if "tempmail ready api" in text:
             return (
                 "401" in text
@@ -5167,6 +5186,7 @@ class OAuthClient:
                         self._set_error(f"邮箱服务配置错误，停止等待 OTP: {str(e)[:240]}")
                         break
                     self._log(f"等待 OTP 异常: {e}")
+                    self._sleep_with_stop(min(2, wait_time))
                     code = None
                     current_message_id = ""
 

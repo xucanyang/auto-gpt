@@ -6,6 +6,17 @@
 
 ## [Unreleased] (未发布)
 
+
+## [1.3.30] - 2026-07-08
+### 修复 (Fixed)
+- **修复旧 iCloud HME 账号复查误用 Helper Ready lease 导致验证码等待刷屏**：`services/chatgpt_core/pending_business_invites.py` 在恢复历史 `chatgpt_mailbox_state` 时识别旧 `icloud_hme` 状态中保存的 Apple anonymous_id，当前全局邮箱模式为 `helper_ready_api` 但账号没有明确 `lease_id/checkout_id` 时自动切回 `import_pool` 转发邮箱扫描，避免把 `m5...` 这类匿名 ID 当成 `/api/hme-ready/mailboxes/{lease_id}/wait-code` 的 checkout lease 使用。
+- **HME Ready 缺失租约错误改为致命邮箱配置错误**：`services/chatgpt_core/oauth_client.py` 将 `HME Ready API status=404 checkout_id 或 alias_id 不存在`、`lease_not_found`、`alias_not_found` 与 `helper_ready_api 当前任务缺少 lease_id` 归类为不可重试错误，立即停止本轮 OTP 等待并输出明确失败原因；非致命邮箱异常增加短退避，防止远端即时错误把任务日志刷爆。
+- **恢复旧转发邮箱多目标扫描能力**：`core/base_mailbox.py` 重新保留 `icloud_forward_to` 的多地址列表，旧账号使用 `import_pool` 恢复收码时会按 `b@cccy.me,b@666800.xyz,...` 逐个解析并扫描对应 TempMail 收件箱，不再因构造器固定 `*` 而无法做本地转发邮箱扫描。
+
+### 测试 (Tests)
+- **补充 HME Ready / 旧 HME 状态回归测试**：`tests/test_pending_business_invites.py` 覆盖旧 `icloud_hme` 状态在全局 helper 模式下回退到 `import_pool`，以及带显式 lease 的 helper 状态继续走 Helper Ready；`tests/test_icloud_hme_mailbox_finalize.py` 覆盖多 forward 地址保留和旧 anonymous_id 不再被当作 helper lease；`tests/test_oauth_mailbox_errors.py` 覆盖 HME Ready 404 与缺失 lease 的致命错误判定。
+- **同步前端版本号至 v1.3.30**：`frontend/src/app/AppShell.tsx` 侧边栏版本展示更新为 `v1.3.30`，用于上线后确认验证码等待刷屏修复版本已加载。
+
 ## [1.3.29] - 2026-07-08
 ### 优化 (Changed)
 - **内置账号筛选组合允许直接维护**：`api/accounts.py` 将 `/api/accounts/filter-presets` 的内置组合从只读常量升级为“默认模板 + 本实例持久化覆盖”的模型，允许对 `builtin_*` 组合执行 `PUT` 修改名称、描述、置顶状态及完整筛选条件；同时支持 `DELETE` 将指定内置组合从当前实例隐藏，避免运营侧必须复制成自定义组合才能调整默认 OAIPay/Sub2API 快捷筛选。配置仍保存在本实例 `chatgpt_account_filter_presets`，新增 `version=2` 结构兼容旧的自定义组合列表，保留主服务、Plus、K12 三实例隔离语义。
@@ -796,4 +807,8 @@
 
 ## 2026-07-08 00:42:57 +0800
 - 允许内置账号筛选组合直接编辑删除
+- 发布模式: multi
+
+## 2026-07-08 04:39:29 +0800
+- 修复旧 HME 账号验证码等待刷屏
 - 发布模式: multi

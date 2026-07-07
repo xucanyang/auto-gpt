@@ -485,6 +485,65 @@ class PendingBusinessInviteRecoveryTests(unittest.TestCase):
         self.assertTrue(mailbox_state["recovered_from_account_config"])
         self.assertEqual(account_extra["chatgpt_mailbox_state"]["provider"], "tempmail_local")
 
+    def test_legacy_icloud_hme_state_uses_forward_scan_under_global_helper_mode(self):
+        state = {
+            "provider": "icloud_hme",
+            "email": "legacy-hme@icloud.com",
+            "account": {
+                "email": "legacy-hme@icloud.com",
+                "account_id": "m5tbftxrk28215",
+                "extra": {"provider": "icloud_hme", "forward_to": "b@cccy.me"},
+            },
+            "config": {"icloud_hme_mode": "live", "tempmail_api_url": "http://old"},
+        }
+
+        with mock.patch.object(
+            pending_business_invites.config_store,
+            "get_all",
+            return_value={
+                "icloud_hme_mode": "helper_ready_api",
+                "icloud_hme_helper_api_url": "http://helper",
+                "icloud_hme_helper_internal_key": "secret",
+                "icloud_forward_to": "b@cccy.me,b@666800.xyz",
+                "tempmail_api_url": "http://tempmail",
+                "tempmail_api_key": "test-key",
+            },
+        ):
+            restored = pending_business_invites._with_current_tempmail_config(state)
+
+        self.assertEqual(restored["config"]["icloud_hme_mode"], "import_pool")
+        self.assertEqual(restored["config"]["icloud_forward_to"], "b@cccy.me,b@666800.xyz")
+        self.assertEqual(restored["account"]["account_id"], "m5tbftxrk28215")
+
+    def test_icloud_hme_state_with_helper_lease_keeps_helper_mode(self):
+        state = {
+            "provider": "icloud_hme",
+            "email": "helper-hme@icloud.com",
+            "account": {
+                "email": "helper-hme@icloud.com",
+                "account_id": "lease-1",
+                "extra": {"provider": "icloud_hme", "lease_id": "lease-1"},
+            },
+            "config": {"icloud_hme_mode": "live"},
+        }
+
+        with mock.patch.object(
+            pending_business_invites.config_store,
+            "get_all",
+            return_value={
+                "icloud_hme_mode": "helper_ready_api",
+                "icloud_hme_helper_api_url": "http://helper",
+                "icloud_hme_helper_internal_key": "secret",
+                "icloud_forward_to": "b@cccy.me",
+                "tempmail_api_url": "http://tempmail",
+                "tempmail_api_key": "test-key",
+            },
+        ):
+            restored = pending_business_invites._with_current_tempmail_config(state)
+
+        self.assertEqual(restored["config"]["icloud_hme_mode"], "helper_ready_api")
+        self.assertEqual(restored["account"]["extra"]["lease_id"], "lease-1")
+
     def test_resume_subscription_auth_returns_logs(self):
         account_id = self._add_account(email="api-log@example.com")
         with Session(self.engine) as session:
