@@ -5,6 +5,15 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，并且本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/) (语义化版本)。
 
 ## [Unreleased] (未发布)
+
+## [1.3.26] - 2026-07-07
+### 新增 (Added)
+- **支持编辑和覆盖筛选组合的筛选条件**：`frontend/src/pages/Accounts.tsx` 针对用户反馈的“只能添加和删除筛选组合、无法修改条件”的问题进行了功能增强：
+  1. **弹窗直接编辑条件**：在编辑筛选组合、保存当前筛选或复制组合时，弹窗下方新增“筛选条件配置”专区，提供关键词搜索、账号状态、认证材料、订阅类型、有效性、Codex 状态、Sub2Api 状态、OAIPay 状态、排序方式及分页条数等全维度表单项，支持在弹窗内自由调整和修改任意维度的筛选条件。
+  2. **一键同步/覆盖条件**：编辑弹窗内新增“从当前页面筛选填充”按钮，一键将当前页面已选择的筛选条件带入表单；在“筛选组合管理”列表页中，针对自定义组合新增“覆盖条件”操作按钮，点击后可将当前页面已设置好的筛选条件直接覆盖保存到指定组合中。
+- **同步前端版本号至 v1.3.26**：`frontend/src/app/AppShell.tsx` 侧边栏版本展示更新为 `v1.3.26`。
+
+## [1.3.25] - 2026-07-07
 ### 优化 (Changed)
 - **架构重构：拆分 Accounts 页面组件**：`frontend/src/pages/Accounts.tsx` 将原先庞大的文件中的 `FilterPresetBar` 和 `SelectedAccountsSummary` 独立提取为了可复用的独立组件，分别存放至 `frontend/src/features/accounts/components/FilterPresetBar.tsx` 与 `frontend/src/features/accounts/components/SelectedAccountsSummary.tsx`，显著提升了代码的可读性与维护性。
 - **同步前端版本号至 v1.3.25**：`frontend/src/app/AppShell.tsx` 侧边栏版本展示更新为 `v1.3.25`。
@@ -740,4 +749,8 @@
 
 ## 2026-07-07 09:07:01 +0800
 - 重构: 拆分 Accounts.tsx 中的 FilterPresetBar 与 SelectedAccountsSummary 组件
+- 发布模式: multi
+
+## 2026-07-07 10:19:50 +0800
+- 新增: 支持编辑和覆盖筛选组合的筛选条件
 - 发布模式: multi

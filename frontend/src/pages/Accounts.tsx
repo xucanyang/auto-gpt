@@ -2439,6 +2439,22 @@ export default function Accounts() {
     }
   }, [])
 
+  const fillFilterFormFields = useCallback((filters?: AccountFilterPresetFilters) => {
+    const normalized = normalizeAccountFilterPresetFilters(filters)
+    filterPresetForm.setFieldsValue({
+      search: normalized.search,
+      status: normalized.status,
+      authType: normalized.columnFilters.authType,
+      subscriptionType: normalized.columnFilters.subscriptionType,
+      accountValidity: normalized.columnFilters.accountValidity,
+      codexState: normalized.columnFilters.codexState,
+      sub2apiState: normalized.columnFilters.sub2apiState,
+      oaipayState: normalized.columnFilters.oaipayState,
+      sortOrder: normalized.sortOrder || undefined,
+      pageSize: normalized.pageSize,
+    })
+  }, [filterPresetForm])
+
   const openCreateCurrentFilterPreset = useCallback(() => {
     setFilterPresetEditing(null)
     setFilterPresetEditorMode('create-current')
@@ -2447,8 +2463,9 @@ export default function Accounts() {
       description: buildAccountFilterPresetSummary(currentFilterPresetFilters),
       pinned: true,
     })
+    fillFilterFormFields(currentFilterPresetFilters)
     setFilterPresetEditorOpen(true)
-  }, [currentFilterPresetFilters, filterPresetForm])
+  }, [currentFilterPresetFilters, fillFilterFormFields, filterPresetForm])
 
   const openCopyFilterPreset = useCallback((preset: AccountFilterPreset) => {
     setFilterPresetEditing(preset)
@@ -2458,8 +2475,9 @@ export default function Accounts() {
       description: preset.description || buildAccountFilterPresetSummary(preset.filters),
       pinned: true,
     })
+    fillFilterFormFields(preset.filters)
     setFilterPresetEditorOpen(true)
-  }, [filterPresetForm])
+  }, [fillFilterFormFields, filterPresetForm])
 
   const openEditFilterPresetMeta = useCallback((preset: AccountFilterPreset) => {
     setFilterPresetEditing(preset)
@@ -2469,8 +2487,9 @@ export default function Accounts() {
       description: preset.description || '',
       pinned: Boolean(preset.pinned),
     })
+    fillFilterFormFields(preset.filters)
     setFilterPresetEditorOpen(true)
-  }, [filterPresetForm])
+  }, [fillFilterFormFields, filterPresetForm])
 
   const saveFilterPresetForm = useCallback(async () => {
     const values = await filterPresetForm.validateFields()
@@ -2481,11 +2500,20 @@ export default function Accounts() {
     }
     const editingPreset = filterPresetEditing
     const isEditMeta = filterPresetEditorMode === 'edit-meta' && editingPreset && !editingPreset.built_in
-    const filters = isEditMeta
-      ? normalizeAccountFilterPresetFilters(editingPreset.filters)
-      : filterPresetEditorMode === 'copy-preset' && editingPreset
-        ? normalizeAccountFilterPresetFilters(editingPreset.filters)
-        : normalizeAccountFilterPresetFilters(currentFilterPresetFilters)
+    const filters = normalizeAccountFilterPresetFilters({
+      search: values.search,
+      status: values.status,
+      columnFilters: {
+        authType: values.authType,
+        subscriptionType: values.subscriptionType,
+        accountValidity: values.accountValidity,
+        codexState: values.codexState,
+        sub2apiState: values.sub2apiState,
+        oaipayState: values.oaipayState,
+      },
+      sortOrder: values.sortOrder,
+      pageSize: values.pageSize,
+    })
     const body = {
       name,
       description: String(values.description || '').trim(),
@@ -2522,21 +2550,22 @@ export default function Accounts() {
     } finally {
       setFilterPresetSaving(false)
     }
-  }, [currentFilterPresetFilters, filterPresetEditing, filterPresetEditorMode, filterPresetForm])
+  }, [filterPresetEditing, filterPresetEditorMode, filterPresetForm])
 
-  const overwriteActiveFilterPreset = useCallback(async () => {
-    if (!activeFilterPreset || activeFilterPreset.built_in) {
-      if (activeFilterPreset) openCopyFilterPreset(activeFilterPreset)
+  const overwritePresetWithCurrent = useCallback(async (targetPreset?: AccountFilterPreset | null) => {
+    const target = targetPreset || activeFilterPreset
+    if (!target || target.built_in) {
+      if (target) openCopyFilterPreset(target)
       return
     }
     setFilterPresetSaving(true)
     try {
-      const data = await apiFetch(`/accounts/filter-presets/${activeFilterPreset.id}`, {
+      const data = await apiFetch(`/accounts/filter-presets/${target.id}`, {
         method: 'PUT',
         body: JSON.stringify({
-          name: activeFilterPreset.name,
-          description: activeFilterPreset.description || '',
-          pinned: Boolean(activeFilterPreset.pinned),
+          name: target.name,
+          description: target.description || '',
+          pinned: Boolean(target.pinned),
           filters: normalizeAccountFilterPresetFilters(currentFilterPresetFilters),
         }),
       })
@@ -2552,13 +2581,15 @@ export default function Accounts() {
         created_at: String(item?.created_at || ''),
         updated_at: String(item?.updated_at || ''),
       })).filter((item: AccountFilterPreset) => item.id && item.name))
-      message.success('已用当前筛选覆盖组合')
+      message.success(`已用当前筛选覆盖组合「${target.name}」`)
     } catch (e: any) {
       message.error(e?.message || '覆盖筛选组合失败')
     } finally {
       setFilterPresetSaving(false)
     }
   }, [activeFilterPreset, currentFilterPresetFilters, openCopyFilterPreset])
+
+  const overwriteActiveFilterPreset = useCallback(() => overwritePresetWithCurrent(activeFilterPreset), [activeFilterPreset, overwritePresetWithCurrent])
 
   const deleteFilterPreset = useCallback(async (preset: AccountFilterPreset) => {
     if (preset.built_in) {
@@ -7076,24 +7107,21 @@ export default function Accounts() {
       />
 
       <Modal
-        title={filterPresetEditorMode === 'edit-meta' ? '编辑筛选组合' : filterPresetEditorMode === 'copy-preset' ? '复制筛选组合' : '保存当前筛选'}
+        title={filterPresetEditorMode === 'edit-meta' ? '编辑筛选组合与条件' : filterPresetEditorMode === 'copy-preset' ? '复制筛选组合' : '保存当前筛选'}
         open={filterPresetEditorOpen}
         onOk={() => { void saveFilterPresetForm() }}
         onCancel={() => setFilterPresetEditorOpen(false)}
-        okText={filterPresetEditorMode === 'edit-meta' ? '保存' : '创建组合'}
+        okText={filterPresetEditorMode === 'edit-meta' ? '更新组合' : '创建组合'}
         confirmLoading={filterPresetSaving}
         destroyOnClose
+        width={700}
       >
         <Space direction="vertical" size={12} style={{ width: '100%' }}>
           <Alert
             type="info"
             showIcon
             message="筛选组合只保存条件，不保存账号 ID"
-            description={
-              filterPresetEditorMode === 'edit-meta'
-                ? '本次只编辑名称、描述和置顶状态；如需改条件，请应用组合后调整筛选，再点“覆盖保存”。'
-                : '下次应用时会按这些条件重新匹配最新账号库存，适合 OAIPay 待补传、Plus 长效等日常组合。'
-            }
+            description="您可以编辑名称、描述及置顶状态，也可以直接在下方配置修改筛选条件；点击右上角“从当前页面填充”可一键同步页面上当前的筛选状态。"
           />
           <Form form={filterPresetForm} layout="vertical" preserve={false}>
             <Form.Item
@@ -7104,31 +7132,65 @@ export default function Accounts() {
               <Input placeholder="例如：Plus 长效未上传 OAIPay" />
             </Form.Item>
             <Form.Item name="description" label="描述" rules={[{ max: 240, message: '描述最多 240 个字符' }]}>
-              <Input.TextArea rows={3} placeholder="说明这组条件的用途，便于后续区分" />
+              <Input.TextArea rows={2} placeholder="说明这组条件的用途，便于后续区分" />
             </Form.Item>
-            <Form.Item name="pinned" valuePropName="checked">
+            <Form.Item name="pinned" valuePropName="checked" style={{ marginBottom: 12 }}>
               <Checkbox>置顶到账号页快捷筛选</Checkbox>
             </Form.Item>
+            <div
+              style={{
+                padding: 14,
+                borderRadius: 10,
+                background: token.colorFillAlter,
+                border: `1px solid ${token.colorBorderSecondary}`,
+              }}
+            >
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
+                <Text strong style={{ fontSize: 13 }}>筛选条件配置（可自由修改）</Text>
+                <Button
+                  size="small"
+                  type="link"
+                  icon={<SyncOutlined />}
+                  onClick={() => fillFilterFormFields(currentFilterPresetFilters)}
+                  style={{ padding: 0 }}
+                >
+                  从当前页面筛选填充
+                </Button>
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: isMobile ? '1fr' : '1fr 1fr', gap: 12 }}>
+                <Form.Item name="search" label="关键词搜索" style={{ marginBottom: 0 }}>
+                  <Input placeholder="邮箱或关键词" allowClear />
+                </Form.Item>
+                <Form.Item name="status" label="账号状态" style={{ marginBottom: 0 }}>
+                  <Select mode="multiple" placeholder="全部状态" options={STATUS_FILTER_OPTIONS} allowClear />
+                </Form.Item>
+                <Form.Item name="authType" label="认证材料" style={{ marginBottom: 0 }}>
+                  <Select mode="multiple" placeholder="全部认证类型" options={AUTH_TYPE_FILTER_OPTIONS} allowClear />
+                </Form.Item>
+                <Form.Item name="subscriptionType" label="订阅类型" style={{ marginBottom: 0 }}>
+                  <Select mode="multiple" placeholder="全部订阅类型" options={SUBSCRIPTION_TYPE_FILTER_OPTIONS} allowClear />
+                </Form.Item>
+                <Form.Item name="accountValidity" label="有效性" style={{ marginBottom: 0 }}>
+                  <Select mode="multiple" placeholder="全部时效" options={ACCOUNT_VALIDITY_FILTER_OPTIONS} allowClear />
+                </Form.Item>
+                <Form.Item name="codexState" label="Codex 状态" style={{ marginBottom: 0 }}>
+                  <Select mode="multiple" placeholder="全部 Codex 状态" options={CODEX_STATE_FILTER_OPTIONS} allowClear />
+                </Form.Item>
+                <Form.Item name="sub2apiState" label="Sub2Api 状态" style={{ marginBottom: 0 }}>
+                  <Select mode="multiple" placeholder="全部 Sub2Api 状态" options={SUB2API_FILTER_OPTIONS} allowClear />
+                </Form.Item>
+                <Form.Item name="oaipayState" label="OAIPay 状态" style={{ marginBottom: 0 }}>
+                  <Select mode="multiple" placeholder="全部 OAIPay 状态" options={OAIPAY_FILTER_OPTIONS} allowClear />
+                </Form.Item>
+                <Form.Item name="sortOrder" label="到期时间排序" style={{ marginBottom: 0 }}>
+                  <Select placeholder="默认排序" options={SUBSCRIPTION_EXPIRY_SORT_OPTIONS} allowClear />
+                </Form.Item>
+                <Form.Item name="pageSize" label="每页条数" style={{ marginBottom: 0 }}>
+                  <Select options={ACCOUNT_PAGE_SIZE_OPTIONS.map((n) => ({ value: n, label: `${n} 条/页` }))} />
+                </Form.Item>
+              </div>
+            </div>
           </Form>
-          <div
-            style={{
-              padding: 10,
-              borderRadius: 10,
-              background: token.colorFillAlter,
-              border: `1px solid ${token.colorBorderSecondary}`,
-            }}
-          >
-            <Text type="secondary" style={{ display: 'block', fontSize: 12, marginBottom: 4 }}>
-              {filterPresetEditorMode === 'copy-preset' && filterPresetEditing ? '复制条件' : filterPresetEditorMode === 'edit-meta' ? '当前保存条件' : '将保存条件'}
-            </Text>
-            <Text style={{ fontSize: 12 }}>
-              {filterPresetEditorMode === 'copy-preset' && filterPresetEditing
-                ? buildAccountFilterPresetSummary(filterPresetEditing.filters)
-                : filterPresetEditorMode === 'edit-meta' && filterPresetEditing
-                  ? buildAccountFilterPresetSummary(filterPresetEditing.filters)
-                  : buildAccountFilterPresetSummary(currentFilterPresetFilters)}
-            </Text>
-          </div>
         </Space>
       </Modal>
 
@@ -7196,6 +7258,14 @@ export default function Accounts() {
                     <Button size="small" icon={<EditOutlined />} onClick={() => openEditFilterPresetMeta(preset)}>
                       编辑
                     </Button>
+                    <Popconfirm
+                      title={`确认将当前页面的筛选条件覆盖保存到「${preset.name}」？`}
+                      onConfirm={() => { void overwritePresetWithCurrent(preset) }}
+                    >
+                      <Button size="small" icon={<SyncOutlined />} loading={filterPresetSaving}>
+                        覆盖条件
+                      </Button>
+                    </Popconfirm>
                     <Button size="small" icon={<CopyOutlined />} onClick={() => openCopyFilterPreset(preset)}>
                       复制
                     </Button>
