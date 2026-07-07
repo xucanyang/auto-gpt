@@ -6,6 +6,15 @@
 
 ## [Unreleased] (未发布)
 
+## [1.3.29] - 2026-07-08
+### 优化 (Changed)
+- **内置账号筛选组合允许直接维护**：`api/accounts.py` 将 `/api/accounts/filter-presets` 的内置组合从只读常量升级为“默认模板 + 本实例持久化覆盖”的模型，允许对 `builtin_*` 组合执行 `PUT` 修改名称、描述、置顶状态及完整筛选条件；同时支持 `DELETE` 将指定内置组合从当前实例隐藏，避免运营侧必须复制成自定义组合才能调整默认 OAIPay/Sub2API 快捷筛选。配置仍保存在本实例 `chatgpt_account_filter_presets`，新增 `version=2` 结构兼容旧的自定义组合列表，保留主服务、Plus、K12 三实例隔离语义。
+- **账号页管理弹窗开放内置组合编辑/覆盖/删除**：`frontend/src/pages/Accounts.tsx` 取消内置组合只能复制的前端限制，“筛选组合管理”中所有组合统一提供“编辑 / 覆盖条件 / 复制 / 删除”；应用内置组合后如继续手动调整条件，`frontend/src/features/accounts/components/FilterPresetBar.tsx` 也会显示“覆盖保存”，直接回写该内置组合在当前实例的覆盖配置。内置组合的“置顶到账号页快捷筛选”现在按保存值生效，不再因 `built_in` 标记强制常驻快捷按钮。
+- **同步前端版本号至 v1.3.29**：`frontend/src/app/AppShell.tsx` 侧边栏版本展示更新为 `v1.3.29`，用于上线后确认内置筛选组合可维护版本已加载。
+
+### 测试 (Tests)
+- **补充内置筛选组合可维护回归测试**：`tests/test_account_filter_presets.py` 更新原先“内置不可变”的断言，覆盖内置组合可更新、删除后从列表隐藏、二次删除返回 404，并补充旧版纯列表配置仍可读取的兼容性测试。
+
 ## [1.3.28] - 2026-07-07
 ### 优化 (Changed)
 - **重构账号列表中“当前订阅 / 历史订阅 / 认证状态”的语义边界**：`services/chatgpt_account_state.py` 不再把上一次 `chatgpt_capabilities.subscription_plan` 直接兜底写回当前订阅；当本次本地刷新结果为 `unknown`、探测失败或认证失效时，当前订阅保持 `unknown`，并单独输出 `last_known_subscription_plan`、`subscription_refresh_state` 与 `subscription_plan_stale`，避免历史 Plus 被误当作当前 Plus 参与筛选、交付或上传判断。
@@ -783,4 +792,8 @@
 
 ## 2026-07-07 23:12:15 +0800
 - 修正账号订阅刷新语义与认证状态区分
+- 发布模式: multi
+
+## 2026-07-08 00:42:57 +0800
+- 允许内置账号筛选组合直接编辑删除
 - 发布模式: multi

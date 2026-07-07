@@ -2193,7 +2193,7 @@ export default function Accounts() {
     return accountFilterPresetSignature(activeFilterPreset.filters) !== accountFilterPresetSignature(currentFilterPresetFilters)
   }, [activeFilterPreset, currentFilterPresetFilters])
   const pinnedFilterPresets = useMemo(() => {
-    const items = filterPresets.filter((item) => item.pinned || item.built_in)
+    const items = filterPresets.filter((item) => item.pinned)
     return items.slice(0, isMobile ? 4 : 8)
   }, [filterPresets, isMobile])
 
@@ -2534,7 +2534,11 @@ export default function Accounts() {
       return
     }
     const editingPreset = filterPresetEditing
-    const isEditMeta = filterPresetEditorMode === 'edit-meta' && editingPreset && !editingPreset.built_in
+    if (filterPresetEditorMode === 'edit-meta' && !editingPreset) {
+      message.error('未找到要编辑的筛选组合')
+      return
+    }
+    const isEditMeta = filterPresetEditorMode === 'edit-meta'
     const filters = normalizeAccountFilterPresetFilters({
       search: values.search,
       status: values.status,
@@ -2557,7 +2561,7 @@ export default function Accounts() {
     }
     setFilterPresetSaving(true)
     try {
-      const endpoint = isEditMeta ? `/accounts/filter-presets/${editingPreset.id}` : '/accounts/filter-presets'
+      const endpoint = isEditMeta ? `/accounts/filter-presets/${editingPreset!.id}` : '/accounts/filter-presets'
       const data = await apiFetch(endpoint, {
         method: isEditMeta ? 'PUT' : 'POST',
         body: JSON.stringify(body),
@@ -2589,10 +2593,7 @@ export default function Accounts() {
 
   const overwritePresetWithCurrent = useCallback(async (targetPreset?: AccountFilterPreset | null) => {
     const target = targetPreset || activeFilterPreset
-    if (!target || target.built_in) {
-      if (target) openCopyFilterPreset(target)
-      return
-    }
+    if (!target) return
     setFilterPresetSaving(true)
     try {
       const data = await apiFetch(`/accounts/filter-presets/${target.id}`, {
@@ -2622,15 +2623,11 @@ export default function Accounts() {
     } finally {
       setFilterPresetSaving(false)
     }
-  }, [activeFilterPreset, currentFilterPresetFilters, openCopyFilterPreset])
+  }, [activeFilterPreset, currentFilterPresetFilters])
 
   const overwriteActiveFilterPreset = useCallback(() => overwritePresetWithCurrent(activeFilterPreset), [activeFilterPreset, overwritePresetWithCurrent])
 
   const deleteFilterPreset = useCallback(async (preset: AccountFilterPreset) => {
-    if (preset.built_in) {
-      message.info('内置筛选组合不能删除，可以复制后编辑自定义版本')
-      return
-    }
     setFilterPresetSaving(true)
     try {
       const data = await apiFetch(`/accounts/filter-presets/${preset.id}`, { method: 'DELETE' })
@@ -7291,36 +7288,28 @@ export default function Accounts() {
                 }}>
                   应用
                 </Button>
-                {preset.built_in ? (
-                  <Button size="small" icon={<CopyOutlined />} onClick={() => openCopyFilterPreset(preset)}>
-                    复制
+                <Button size="small" icon={<EditOutlined />} onClick={() => openEditFilterPresetMeta(preset)}>
+                  编辑
+                </Button>
+                <Popconfirm
+                  title={`确认将当前页面的筛选条件覆盖保存到「${preset.name}」？`}
+                  onConfirm={() => { void overwritePresetWithCurrent(preset) }}
+                >
+                  <Button size="small" icon={<SyncOutlined />} loading={filterPresetSaving}>
+                    覆盖条件
                   </Button>
-                ) : (
-                  <>
-                    <Button size="small" icon={<EditOutlined />} onClick={() => openEditFilterPresetMeta(preset)}>
-                      编辑
-                    </Button>
-                    <Popconfirm
-                      title={`确认将当前页面的筛选条件覆盖保存到「${preset.name}」？`}
-                      onConfirm={() => { void overwritePresetWithCurrent(preset) }}
-                    >
-                      <Button size="small" icon={<SyncOutlined />} loading={filterPresetSaving}>
-                        覆盖条件
-                      </Button>
-                    </Popconfirm>
-                    <Button size="small" icon={<CopyOutlined />} onClick={() => openCopyFilterPreset(preset)}>
-                      复制
-                    </Button>
-                    <Popconfirm
-                      title={`确认删除筛选组合「${preset.name}」？`}
-                      onConfirm={() => { void deleteFilterPreset(preset) }}
-                    >
-                      <Button size="small" danger icon={<DeleteOutlined />} loading={filterPresetSaving}>
-                        删除
-                      </Button>
-                    </Popconfirm>
-                  </>
-                )}
+                </Popconfirm>
+                <Button size="small" icon={<CopyOutlined />} onClick={() => openCopyFilterPreset(preset)}>
+                  复制
+                </Button>
+                <Popconfirm
+                  title={preset.built_in ? `确认删除内置筛选组合「${preset.name}」？删除后会在当前实例隐藏。` : `确认删除筛选组合「${preset.name}」？`}
+                  onConfirm={() => { void deleteFilterPreset(preset) }}
+                >
+                  <Button size="small" danger icon={<DeleteOutlined />} loading={filterPresetSaving}>
+                    删除
+                  </Button>
+                </Popconfirm>
               </Space>
             </div>
           ))}

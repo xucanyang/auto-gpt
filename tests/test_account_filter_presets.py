@@ -81,17 +81,51 @@ def test_account_filter_preset_crud_and_normalization(monkeypatch):
     assert deleted["custom_count"] == 0
 
 
-def test_builtin_filter_preset_cannot_be_mutated(monkeypatch):
+def test_builtin_filter_preset_can_be_updated_and_deleted(monkeypatch):
     store = DummyConfigStore()
     monkeypatch.setattr(accounts, "config_store", store)
 
-    with pytest.raises(HTTPException) as update_error:
-        accounts.update_account_filter_preset(
-            "builtin_oaipay_pending",
-            accounts.AccountFilterPresetBody(name="x", filters={}),
-        )
-    assert update_error.value.status_code == 400
+    initial = accounts.list_account_filter_presets()
+    initial_builtin_count = initial["built_in_count"]
+
+    updated = accounts.update_account_filter_preset(
+        "builtin_oaipay_pending",
+        accounts.AccountFilterPresetBody(
+            name="OAIPay 待补传（改）",
+            description="允许直接调整内置组合",
+            pinned=False,
+            filters={"columnFilters": {"oaipayState": ["not_found"]}, "pageSize": 50},
+        ),
+    )
+    assert updated["item"]["id"] == "builtin_oaipay_pending"
+    assert updated["item"]["built_in"] is True
+    assert updated["item"]["name"] == "OAIPay 待补传（改）"
+    assert updated["item"]["pinned"] is False
+    assert updated["item"]["filters"]["columnFilters"]["oaipayState"] == ["not_found"]
+    assert updated["built_in_count"] == initial_builtin_count
+    assert updated["builtin_override_count"] == 1
+
+    reloaded = accounts.list_account_filter_presets()
+    builtin = next(item for item in reloaded["items"] if item["id"] == "builtin_oaipay_pending")
+    assert builtin["name"] == "OAIPay 待补传（改）"
+
+    deleted = accounts.delete_account_filter_preset("builtin_oaipay_pending")
+    assert deleted["built_in_count"] == initial_builtin_count - 1
+    assert deleted["deleted_builtin_count"] == 1
+    assert all(item["id"] != "builtin_oaipay_pending" for item in deleted["items"])
 
     with pytest.raises(HTTPException) as delete_error:
         accounts.delete_account_filter_preset("builtin_oaipay_pending")
-    assert delete_error.value.status_code == 400
+    assert delete_error.value.status_code == 404
+
+
+def test_legacy_filter_preset_list_payload_still_loads(monkeypatch):
+    store = DummyConfigStore()
+    monkeypatch.setattr(accounts, "config_store", store)
+    store.value = (
+        '[{"id":"preset_legacy","name":"旧自定义组合","filters":{"columnFilters":{"oaipayState":["unknown"]}}}]'
+    )
+
+    listed = accounts.list_account_filter_presets()
+    assert listed["custom_count"] == 1
+    assert any(item["id"] == "preset_legacy" for item in listed["items"])

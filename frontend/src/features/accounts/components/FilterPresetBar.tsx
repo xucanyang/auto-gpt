@@ -104,7 +104,7 @@ export const FilterPresetBar: React.FC<FilterPresetBarProps> = ({
                   size="small"
                   type={active ? 'primary' : 'default'}
                   ghost={active}
-                  icon={preset.pinned && !preset.built_in ? <PushpinOutlined /> : undefined}
+                  icon={preset.pinned ? <PushpinOutlined /> : undefined}
                   onClick={() => {
                     if (active) clearFilterPreset()
                     else applyFilterPreset(preset)
@@ -136,11 +136,9 @@ export const FilterPresetBar: React.FC<FilterPresetBarProps> = ({
         </Text>
         {activeFilterPreset && activeFilterPresetDirty ? (
           <Space size={4}>
-            {!activeFilterPreset.built_in ? (
-              <Button size="small" type="link" style={{ padding: 0 }} loading={filterPresetSaving} onClick={() => void overwriteActiveFilterPreset()}>
-                覆盖保存
-              </Button>
-            ) : null}
+            <Button size="small" type="link" style={{ padding: 0 }} loading={filterPresetSaving} onClick={() => void overwriteActiveFilterPreset()}>
+              覆盖保存
+            </Button>
             <Button size="small" type="link" style={{ padding: 0 }} onClick={() => openCopyFilterPreset(activeFilterPreset)}>
               另存为
             </Button>
