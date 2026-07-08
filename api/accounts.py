@@ -152,6 +152,33 @@ def _filter_value_list(value: Any) -> list[str]:
     return result
 
 
+_IDEA_SUBMIT_FILTER_PRESET_ALIASES = {
+    "available": "unsubmitted",
+    "not_submitted": "unsubmitted",
+    "pending_submit": "unsubmitted",
+    "submitted": "submitting",
+    "processing": "submitting",
+    "pending": "submitting",
+    "polling": "submitting",
+    "success": "paid",
+    "completed": "paid",
+    "fail": "failed",
+    "error": "failed",
+}
+
+
+def _normalize_idea_submit_filter_values(values: Any) -> list[str]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for item in _filter_value_list(values):
+        value = _IDEA_SUBMIT_FILTER_PRESET_ALIASES.get(item.lower(), item)
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        normalized.append(value)
+    return normalized
+
+
 def _empty_filter_preset_payload() -> dict[str, Any]:
     return {
         "search": "",
@@ -178,7 +205,8 @@ def _normalize_filter_preset_filters(filters: Any) -> dict[str, Any]:
     for key in ACCOUNT_FILTER_PRESET_COLUMN_KEYS:
         if key in {"email", "status"}:
             continue
-        clean["columnFilters"][key] = _filter_value_list(source_column_filters.get(key) or source.get(key))
+        values = _filter_value_list(source_column_filters.get(key) or source.get(key))
+        clean["columnFilters"][key] = _normalize_idea_submit_filter_values(values) if key == "ideaSubmitState" else values
 
     sort_source = source.get("sort") if isinstance(source.get("sort"), dict) else {}
     sort_order = _trim_text(

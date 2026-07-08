@@ -190,6 +190,10 @@ class AccountFilterSortTests(unittest.TestCase):
             }
         )
         available = self._account(33)
+        submitted = self._account(34)
+        submitted.set_extra({"baxigpt_cdk": {"status": "submitted"}})
+        processing = self._account(35)
+        processing.set_extra({"baxigpt_cdk": {"status": "processing"}})
 
         self.assertEqual(account_idea_submit_state(unavailable), "unavailable")
         self.assertEqual(account_idea_submit_state(paid), "paid")
@@ -197,12 +201,20 @@ class AccountFilterSortTests(unittest.TestCase):
         self.assertEqual(account_idea_submit_state(available), "available")
 
         self.assertEqual(
-            [row.id for row in filter_account_rows([unavailable, paid, legacy_unavailable, available], idea_submit_state="unavailable")],
+            [row.id for row in filter_account_rows([unavailable, paid, legacy_unavailable, available, submitted, processing], idea_submit_state="unavailable")],
             [30, 32],
         )
         self.assertEqual(
-            [row.id for row in filter_account_rows([unavailable, paid, legacy_unavailable, available], idea_submit_state="paid,available")],
+            [row.id for row in filter_account_rows([unavailable, paid, legacy_unavailable, available, submitted, processing], idea_submit_state="paid,unsubmitted")],
             [31, 33],
+        )
+        self.assertEqual(
+            [row.id for row in filter_account_rows([unavailable, paid, legacy_unavailable, available, submitted, processing], idea_submit_state="submitting")],
+            [34, 35],
+        )
+        self.assertEqual(
+            [row.id for row in filter_account_rows([unavailable, paid, legacy_unavailable, available, submitted, processing], idea_submit_state="available,submitted")],
+            [33, 34],
         )
 
     def test_account_list_state_sql_filters_match_python_filters(self):
@@ -291,6 +303,10 @@ class AccountFilterSortTests(unittest.TestCase):
             self.assertEqual(
                 sql_ids(idea_submit_state="paid,available"),
                 [row.id for row in filter_account_rows(rows, idea_submit_state="paid,available")],
+            )
+            self.assertEqual(
+                sql_ids(idea_submit_state="paid,unsubmitted"),
+                [row.id for row in filter_account_rows(rows, idea_submit_state="paid,unsubmitted")],
             )
 
     def test_subscription_filter_uses_current_confirmed_plan_not_stale_snapshot(self):

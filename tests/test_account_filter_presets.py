@@ -43,7 +43,7 @@ def test_account_filter_preset_crud_and_normalization(monkeypatch):
                     "authType": ["refresh_token"],
                     "accountValidity": ["valid"],
                     "oaipayState": ["unknown", "not_found"],
-                    "ideaSubmitState": ["unavailable"],
+                    "ideaSubmitState": ["available", "submitted", "processing", "unavailable"],
                 },
                 "sortOrder": "asc",
                 "pageSize": 50,
@@ -55,7 +55,7 @@ def test_account_filter_preset_crud_and_normalization(monkeypatch):
     assert item["filters"]["search"] == "user@example.com"
     assert item["filters"]["status"] == ["registered", "subscribed"]
     assert item["filters"]["columnFilters"]["subscriptionType"] == ["plus", "pro"]
-    assert item["filters"]["columnFilters"]["ideaSubmitState"] == ["unavailable"]
+    assert item["filters"]["columnFilters"]["ideaSubmitState"] == ["unsubmitted", "submitting", "unavailable"]
     assert item["filters"]["sortOrder"] == "asc"
     assert item["filters"]["pageSize"] == 50
     assert created["custom_count"] == 1

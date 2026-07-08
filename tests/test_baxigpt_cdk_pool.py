@@ -1,10 +1,12 @@
 import unittest
 from unittest.mock import patch
 
+from fastapi import BackgroundTasks
 from sqlmodel import SQLModel, create_engine, Session
 
 from core import db as core_db
 from core.db import AccountModel
+from api import tasks as tasks_module
 from api import baxigpt_cdk_pool as api_module
 from services.chatgpt_core import baxigpt_cdk_repository as repo_module
 from services.chatgpt_core import baxigpt_client as client_module
@@ -18,8 +20,10 @@ class BaxiGptCdkRepositoryTests(unittest.TestCase):
         self.engine = create_engine("sqlite://")
         self.core_engine_patch = patch.object(core_db, "engine", self.engine)
         self.repo_engine_patch = patch.object(repo_module, "engine", self.engine)
+        self.tasks_engine_patch = patch.object(tasks_module, "engine", self.engine)
         self.core_engine_patch.start()
         self.repo_engine_patch.start()
+        self.tasks_engine_patch.start()
         SQLModel.metadata.create_all(self.engine)
         core_db._ensure_baxigpt_cdk_pool_schema()
 
@@ -27,6 +31,7 @@ class BaxiGptCdkRepositoryTests(unittest.TestCase):
         poller_module.stop()
         with poller_module._lock:
             poller_module._targets.clear()
+        self.tasks_engine_patch.stop()
         self.repo_engine_patch.stop()
         self.core_engine_patch.stop()
 
@@ -424,6 +429,38 @@ CDK-AAAA-1111
             self.assertIsNone(extra.get("idea_submit_unavailable"))
             self.assertFalse(extra.get("idea_submit", {}).get("unavailable"))
             self.assertTrue(extra.get("idea_submit", {}).get("available"))
+
+    def test_submit_task_can_use_selected_pool_cdks_only(self):
+        repo = BaxiGptCdkRepository()
+        selected_code = repo.add(code="CDK-SELECTED-1111")
+        other_code = repo.add(code="CDK-OTHER-2222")
+        self.assertIsNotNone(selected_code)
+        self.assertIsNotNone(other_code)
+        with Session(self.engine) as session:
+            account_1 = AccountModel(platform="chatgpt", email="one@example.com", password="pw", token="at-1")
+            account_2 = AccountModel(platform="chatgpt", email="two@example.com", password="pw", token="at-2")
+            session.add(account_1)
+            session.add(account_2)
+            session.commit()
+            session.refresh(account_1)
+            session.refresh(account_2)
+            account_ids = [int(account_1.id or 0), int(account_2.id or 0)]
+
+        result = tasks_module.enqueue_baxigpt_cdk_submit_task(
+            tasks_module.BaxiGptCdkSubmitTaskRequest(
+                account_ids=account_ids,
+                use_pool=True,
+                cdk_ids=[int(selected_code.id), 0, int(selected_code.id)],
+                auto_poll_status=False,
+            ),
+            background_tasks=BackgroundTasks(),
+        )
+
+        self.assertEqual(result["available_codes"], 1)
+        self.assertEqual(result["selected_cdk_ids"], [int(selected_code.id)])
+        self.assertEqual(result["pair_count"], 1)
+        self.assertEqual(result["pairs"][0]["cdk_id"], int(selected_code.id))
+        self.assertEqual(result["skipped_accounts"][0]["reason"], "可用卡密额度不足，本轮未提交")
 
 
 class BaxiGptClientRetryTests(unittest.TestCase):

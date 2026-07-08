@@ -194,6 +194,7 @@ IDEA_SUBMIT_HARD_POLL_TIMEOUT_SECONDS = 24 * 3600
 
 class BaxiGptCdkSubmitTaskRequest(BaseModel):
     account_ids: list[int] = Field(default_factory=list)
+    cdk_ids: list[int] = Field(default_factory=list)
     all_filtered: bool = False
     email: str = ""
     status: str = ""
@@ -3920,7 +3921,18 @@ def enqueue_baxigpt_cdk_submit_task(
         code_records = repo.list_by_ids(imported_ids)
         code_source = "import"
     elif bool(req.use_pool):
-        code_records = repo.list_available()
+        selected_cdk_ids = []
+        seen_cdk_ids: set[int] = set()
+        for value in req.cdk_ids or []:
+            try:
+                cdk_id = int(value or 0)
+            except Exception:
+                cdk_id = 0
+            if cdk_id > 0 and cdk_id not in seen_cdk_ids:
+                seen_cdk_ids.add(cdk_id)
+                selected_cdk_ids.append(cdk_id)
+        code_records = repo.list_available(ids=selected_cdk_ids or None)
+        code_source = "pool_selected" if selected_cdk_ids else "pool"
     else:
         raise HTTPException(400, "请粘贴卡密，或启用卡密池")
 
@@ -3974,6 +3986,7 @@ def enqueue_baxigpt_cdk_submit_task(
             "matched_accounts": len(matched_accounts),
             "eligible_accounts": len(account_items),
             "available_codes": len(code_records),
+            "selected_cdk_ids": [int(code.id) for code in code_records] if code_source == "pool_selected" else [],
             "pairs": [],
             "pair_count": 0,
             "spare_codes": len(spare_codes),
@@ -4000,6 +4013,7 @@ def enqueue_baxigpt_cdk_submit_task(
         "account_ids": [int(item["account_id"]) for item in account_items],
         "emails": [str(item["email"] or "") for item in account_items],
         "available_codes": len(code_records),
+        "selected_cdk_ids": [int(code.id) for code in code_records] if code_source == "pool_selected" else [],
         "pair_count": len(pairs),
         "pairs": list(pairs),
         "spare_codes": len(spare_codes),
@@ -4018,6 +4032,7 @@ def enqueue_baxigpt_cdk_submit_task(
             "status_poll_interval_seconds": status_poll_interval_seconds,
             "status_poll_timeout_seconds": status_poll_timeout_seconds,
             "use_pool": bool(req.use_pool),
+            "cdk_ids": [int(code.id) for code in code_records] if code_source == "pool_selected" else [],
         },
         "runtime_results": [],
     }
@@ -4061,6 +4076,7 @@ def enqueue_baxigpt_cdk_submit_task(
         "matched_accounts": len(matched_accounts),
         "eligible_accounts": len(account_items),
         "available_codes": len(code_records),
+        "selected_cdk_ids": [int(code.id) for code in code_records] if code_source == "pool_selected" else [],
         "pair_count": len(pairs),
         "spare_codes": len(spare_codes),
         "skipped_accounts": skipped_accounts,

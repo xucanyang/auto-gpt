@@ -69,6 +69,33 @@ def _split_values(value: Any) -> set[str]:
     return {item.strip().lower() for item in str(value).split(",") if item.strip()}
 
 
+_IDEA_SUBMIT_STATE_FILTER_ALIASES: dict[str, set[str]] = {
+    "unsubmitted": {"available"},
+    "available": {"available"},
+    "not_submitted": {"available"},
+    "pending_submit": {"available"},
+    "submitting": {"submitted", "processing"},
+    "pending": {"submitted", "processing"},
+    "polling": {"submitted", "processing"},
+    "submitted": {"submitted"},
+    "processing": {"processing"},
+    "paid": {"paid"},
+    "success": {"paid"},
+    "completed": {"paid"},
+    "failed": {"failed"},
+    "fail": {"failed"},
+    "error": {"failed"},
+    "unavailable": {"unavailable"},
+}
+
+
+def _split_idea_submit_filter_values(value: Any) -> set[str]:
+    expanded: set[str] = set()
+    for item in _split_values(value):
+        expanded.update(_IDEA_SUBMIT_STATE_FILTER_ALIASES.get(item, {item}))
+    return expanded
+
+
 def account_base_query(*, platform: str | None = None, status: Any = None, email: str | None = None):
     query = select(AccountModel)
     platform_value = _safe_str(platform)
@@ -1090,7 +1117,7 @@ def apply_account_list_state_filters(
     if oaipay_states:
         query = query.where(AccountListStateModel.oaipay_state.in_(sorted(oaipay_states)))
 
-    idea_submit_states = _split_values(idea_submit_state)
+    idea_submit_states = _split_idea_submit_filter_values(idea_submit_state)
     if idea_submit_states:
         query = query.where(AccountListStateModel.idea_submit_state.in_(sorted(idea_submit_states)))
 
@@ -1157,7 +1184,7 @@ def filter_account_rows(
     validity_values = _split_values(account_validity_filter)
     sub2api_states = _split_values(sub2api_state)
     oaipay_states = _split_values(oaipay_state)
-    idea_submit_states = _split_values(idea_submit_state)
+    idea_submit_states = _split_idea_submit_filter_values(idea_submit_state)
     revival_states = _split_values(revival_state)
 
     filtered: list[AccountModel] = []

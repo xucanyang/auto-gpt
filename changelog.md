@@ -5,6 +5,15 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，并且本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/) (语义化版本)。
 
 ## [Unreleased] (未发布)
+### 新增 (Added)
+- **Idea 批量提交窗口支持选择已保存卡密并展示剩余额度**：`frontend/src/pages/Accounts.tsx` 在账号页 “idea批量提交” 弹窗中新增“使用已保存卡密”多选区，读取 `/api/baxigpt-cdk-pool?status=available` 的可用卡密，直接展示卡密、备注、剩余额度与预计本轮提交后的剩余量；不选择时沿用全部可用卡密，选择后只使用指定卡密。`api/tasks.py` 的 `BaxiGptCdkSubmitTaskRequest` 新增 `cdk_ids`，提交任务创建阶段会调用 `BaxiGptCdkRepository.list_available(ids=...)` 限定卡密来源，避免运营在弹窗里选了卡密但后端仍从全池自动取用。
+- **Idea 批量提交窗口新增“保存到卡密池”动作**：`frontend/src/pages/Accounts.tsx` 的粘贴卡密区域增加独立保存按钮，调用 `/api/baxigpt-cdk-pool/import` 将卡密先入库并自动刷新库存/可选列表；保存成功后自动切换回卡密池模式并选中新入库卡密，避免关闭弹窗或下次打开时粘贴卡密丢失。直接点“开始提交”仍兼容原有“先导入再提交”的链路。
+
+### 优化 (Changed)
+- **简化账号列表 Idea 提交筛选语义**：`frontend/src/pages/Accounts.tsx` 将账号列表和筛选组合里的 Idea 提交状态收敛为 `未提交 / 不可用 / 提交中 / 已开通 / 提交失败` 五类，不再暴露 “未标记不可用 / 已提交 / 处理中” 这类容易混淆的内部状态。`services/account_filters.py` 对 `unsubmitted` 映射旧 `available`，对 `submitting` 同时映射 `submitted + processing`；`api/accounts.py` 同步规范化旧筛选组合里的 `available/submitted/processing`，保证历史组合继续可用但新界面只展示清晰分类。
+
+### 测试 (Tests)
+- **补充 Idea 筛选与指定卡密提交回归测试**：`tests/test_account_filters.py` 覆盖 `unsubmitted/submitting` 新语义在 Python 与 SQL `account_list_state` 过滤中的兼容性；`tests/test_account_filter_presets.py` 覆盖旧 `available/submitted/processing` 筛选组合自动归一；`tests/test_baxigpt_cdk_pool.py` 覆盖 `cdk_ids` 只使用选中卡密且库存不足时剩余账号进入未提交列表。
 
 
 ## [1.3.33] - 2026-07-08
@@ -847,4 +856,8 @@
 
 ## 2026-07-08 06:23:40 +0800
 - 修复 Helper Ready 有明确转发邮箱时误扫全部邮箱
+- 发布模式: multi
+
+## 2026-07-08 13:18:15 +0800
+- 优化 Idea 提交筛选与卡密池选择保存
 - 发布模式: multi
