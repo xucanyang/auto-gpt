@@ -29,6 +29,7 @@ from .registration_route_policy import (
     existing_account_login_route_enabled,
 )
 from .task_logging import classify_task_log_level
+from .account_fingerprint import build_browser_fingerprint_payload, fingerprint_signature
 from .utils import (
     decode_jwt_payload,
     generate_random_birthday,
@@ -1184,6 +1185,22 @@ class RefreshTokenRegistrationEngine:
             "birthdate": birthdate,
         })
 
+    def _attach_browser_fingerprint_metadata(
+        self,
+        metadata: dict[str, Any],
+        register_client: ChatGPTClient,
+        *,
+        source: str = "registration",
+    ) -> dict[str, Any]:
+        fingerprint = build_browser_fingerprint_payload(getattr(register_client, "fingerprint", None))
+        if not fingerprint:
+            return metadata
+        metadata["chatgpt_browser_fingerprint"] = fingerprint
+        metadata["chatgpt_browser_fingerprint_signature"] = fingerprint_signature(fingerprint)
+        metadata.setdefault("chatgpt_browser_fingerprint_source", source)
+        metadata.setdefault("chatgpt_browser_fingerprint_isolated", True)
+        return metadata
+
     def _export_mailbox_state(self, email_adapter) -> dict[str, Any]:
         email_service = getattr(email_adapter, "email_service", None)
         exporter = getattr(email_service, "export_state", None)
@@ -1973,6 +1990,7 @@ class RefreshTokenRegistrationEngine:
                     last_name=last_name,
                     birthdate=birthdate,
                 )
+                result.metadata = self._attach_browser_fingerprint_metadata(result.metadata, register_client)
                 result.metadata["mailbox_state"] = self._export_mailbox_state(email_adapter)
                 self._append_gopay_provider_link_metadata(result, tokens or {})
                 self._log(f"[结果] 成功，account_id={result.account_id or '-'} workspace_id={result.workspace_id or '-'}")
@@ -2058,6 +2076,7 @@ class RefreshTokenRegistrationEngine:
                     last_name=last_name,
                     birthdate=birthdate,
                 )
+                result.metadata = self._attach_browser_fingerprint_metadata(result.metadata, register_client)
                 result.metadata["mailbox_state"] = self._export_mailbox_state(email_adapter)
                 result.metadata["registration_stage_complete"] = True
                 result.metadata["registration_access_token_checkpoint_created"] = bool(registration_access_token_artifact)

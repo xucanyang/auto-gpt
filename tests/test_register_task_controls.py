@@ -3,6 +3,7 @@ import threading
 from unittest.mock import patch
 
 import api.actions as api_actions
+from fastapi import HTTPException
 from sqlmodel import Session, SQLModel, create_engine
 from core.task_runtime import StopTaskRequested
 from api.tasks import (
@@ -215,6 +216,44 @@ class EmailApiRegisterRequestTests(unittest.TestCase):
         self.assertEqual(prepared.concurrency, 2)
         self.assertEqual(prepared.extra["mail_provider"], "email_api")
         self.assertEqual(prepared.extra["email_api_candidate_count"], 2)
+
+    def test_prepare_register_rejects_unique_exit_ip_with_direct_proxy_mode(self):
+        req = RegisterTaskRequest(
+            platform="chatgpt",
+            count=2,
+            concurrency=2,
+            proxy_mode="direct",
+            extra={
+                "mail_provider": "fake",
+                "chatgpt_register_unique_exit_ip_enabled": True,
+            },
+        )
+
+        with self.assertRaises(HTTPException) as ctx:
+            _prepare_register_request(req)
+
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertIn("不能使用直连模式", str(ctx.exception.detail))
+
+    def test_prepare_register_rejects_unique_exit_ip_single_specified_proxy_for_batch(self):
+        req = RegisterTaskRequest(
+            platform="chatgpt",
+            count=2,
+            concurrency=2,
+            proxy_mode="specified",
+            proxy="http://proxy.example:8080",
+            proxy_failover=False,
+            extra={
+                "mail_provider": "fake",
+                "chatgpt_register_unique_exit_ip_enabled": True,
+            },
+        )
+
+        with self.assertRaises(HTTPException) as ctx:
+            _prepare_register_request(req)
+
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertIn("单个指定代理无法满足多个账号独立出口 IP", str(ctx.exception.detail))
 
     def test_prepare_email_api_non_gmail_line_uses_one_identity(self):
         req = RegisterTaskRequest(
@@ -438,12 +477,17 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
                 return {"ok": True, "exit_ip": "198.51.100.10", "latency_ms": 1}
             return {"ok": True, "exit_ip": "198.51.100.11", "latency_ms": 1}
 
+        saved_accounts = []
+        def fake_save_account(account):
+            saved_accounts.append(account)
+            return account
+
         with (
             patch("services.chatgpt_core.ChatGPTPlatform", _FakeChatGPTProxyFingerprintPlatform),
             patch("core.base_mailbox.create_mailbox", return_value=_FakeMailbox()),
             patch("core.proxy_utils.resolve_task_proxy_candidates", side_effect=fake_candidates),
             patch("services.proxy_scanner.probe_basic", side_effect=fake_probe),
-            patch("core.db.save_account", side_effect=lambda account: account),
+            patch("core.db.save_account", side_effect=fake_save_account),
             patch("api.tasks._save_task_log"),
         ):
             _run_register(task_id, req)
@@ -457,6 +501,14 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
         fingerprints = [item["fingerprint"] for item in seen]
         self.assertTrue(all(isinstance(item, dict) and item.get("device_id") for item in fingerprints))
         self.assertEqual(len({item["fingerprint_signature"] for item in seen}), 2)
+        self.assertEqual(len(saved_accounts), 2)
+        self.assertTrue(
+            all(
+                isinstance((account.extra or {}).get("chatgpt_browser_fingerprint"), dict)
+                and (account.extra or {}).get("chatgpt_browser_fingerprint", {}).get("device_id")
+                for account in saved_accounts
+            )
+        )
         unique_meta = dict((snapshot.get("meta") or {}).get("register_unique_exit_ip") or {})
         self.assertEqual(unique_meta.get("assigned_count"), 2)
         self.assertGreaterEqual(int(unique_meta.get("collision_count") or 0), 1)

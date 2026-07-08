@@ -23,6 +23,7 @@ from .registration_route_policy import (
 )
 from .task_logging import classify_task_log_level
 from .utils import generate_random_name, generate_random_birthday
+from .account_fingerprint import build_browser_fingerprint_payload, fingerprint_signature
 
 logger = logging.getLogger(__name__)
 
@@ -757,6 +758,37 @@ class AccessTokenOnlyRegistrationEngine:
             ),
         )
 
+    def _build_registration_context_payload(
+        self,
+        *,
+        chatgpt_client: ChatGPTClient,
+        first_name: str,
+        last_name: str,
+        birthdate: str,
+    ) -> dict[str, Any]:
+        fingerprint = build_browser_fingerprint_payload(getattr(chatgpt_client, "fingerprint", None))
+        return {
+            "device_id": getattr(chatgpt_client, "device_id", "") or "",
+            "user_agent": getattr(chatgpt_client, "ua", None),
+            "sec_ch_ua": getattr(chatgpt_client, "sec_ch_ua", None),
+            "impersonate": getattr(chatgpt_client, "impersonate", None),
+            "accept_language": getattr(chatgpt_client, "accept_language", None),
+            "browser_fingerprint": fingerprint or getattr(chatgpt_client, "fingerprint", None),
+            "first_name": first_name,
+            "last_name": last_name,
+            "birthdate": birthdate,
+        }
+
+    def _attach_browser_fingerprint_metadata(self, metadata: dict[str, Any], chatgpt_client: ChatGPTClient) -> dict[str, Any]:
+        fingerprint = build_browser_fingerprint_payload(getattr(chatgpt_client, "fingerprint", None))
+        if not fingerprint:
+            return metadata
+        metadata["chatgpt_browser_fingerprint"] = fingerprint
+        metadata["chatgpt_browser_fingerprint_signature"] = fingerprint_signature(fingerprint)
+        metadata.setdefault("chatgpt_browser_fingerprint_source", "registration")
+        metadata.setdefault("chatgpt_browser_fingerprint_isolated", True)
+        return metadata
+
     def _probe_homepage_before_email_creation(self) -> tuple[bool, str]:
         self._prepared_register_client = None
         client = self._build_chatgpt_client()
@@ -1123,7 +1155,14 @@ class AccessTokenOnlyRegistrationEngine:
                             "account": session_result.get("account") or {},
                             "cookies": session_result.get("cookies") or "",
                             "cookie_header": session_result.get("cookie_header") or session_result.get("cookies") or "",
+                            "registration_context": self._build_registration_context_payload(
+                                chatgpt_client=chatgpt_client,
+                                first_name=first_name,
+                                last_name=last_name,
+                                birthdate=birthdate,
+                            ),
                         }
+                        result.metadata = self._attach_browser_fingerprint_metadata(result.metadata, chatgpt_client)
                         if existing_account_login_route_event:
                             result.metadata["chatgpt_existing_account_login_route"] = existing_account_login_route_event
                             result.metadata["existing_account_login_routed"] = True

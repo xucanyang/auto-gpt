@@ -16,6 +16,11 @@ from services.chatgpt_core.phone_service import (
     parse_uploaded_phone_lines,
 )
 from services.chatgpt_core.task_logging import mask_phone_for_log, redact_log_text, redact_proxy_url, redact_raw_phone_line, sanitize_phone_result
+from services.chatgpt_core.account_fingerprint import (
+    build_browser_fingerprint_payload,
+    fingerprint_signature,
+    persist_account_browser_fingerprint,
+)
 from services.chatgpt_core.phone_signup_client import (
     AUTH_BASE,
     PhoneRegistrationRouteError,
@@ -610,6 +615,23 @@ class PhoneRegistrationEngine:
                     "proxy_used": self.proxy_url,
                     "proxy_used_redacted": redact_proxy_url(self.proxy_url),
                 }
+                browser_fingerprint = build_browser_fingerprint_payload(getattr(client, "fingerprint", None))
+                if browser_fingerprint:
+                    result.metadata["chatgpt_browser_fingerprint"] = browser_fingerprint
+                    result.metadata["chatgpt_browser_fingerprint_signature"] = fingerprint_signature(browser_fingerprint)
+                    result.metadata["chatgpt_browser_fingerprint_source"] = "phone_signup"
+                    result.metadata["chatgpt_browser_fingerprint_isolated"] = True
+                    result.metadata["registration_context"] = {
+                        "device_id": browser_fingerprint.get("device_id") or "",
+                        "user_agent": browser_fingerprint.get("user_agent") or "",
+                        "sec_ch_ua": browser_fingerprint.get("sec_ch_ua") or "",
+                        "impersonate": browser_fingerprint.get("impersonate") or "",
+                        "accept_language": browser_fingerprint.get("accept_language") or "",
+                        "browser_fingerprint": browser_fingerprint,
+                        "first_name": first,
+                        "last_name": last,
+                        "birthdate": birthdate,
+                    }
                 self._timeline(
                     f"[手机号注册] 结果：成功，phone:{mask_phone_for_log(phone)}，auth=access_token_only"
                 )
@@ -723,6 +745,23 @@ class PhoneRegistrationEngine:
             "chatgpt_phone_signup_results": panel_results,
             "phone_signup": phone_signup,
         }
+        if isinstance(result.metadata, dict):
+            for key in (
+                "chatgpt_browser_fingerprint",
+                "chatgpt_browser_fingerprint_signature",
+                "chatgpt_browser_fingerprint_source",
+                "chatgpt_browser_fingerprint_isolated",
+            ):
+                if key in result.metadata:
+                    extra[key] = result.metadata.get(key)
+            if isinstance(result.metadata.get("registration_context"), dict):
+                extra["chatgpt_registration_context"] = result.metadata.get("registration_context")
+            extra = persist_account_browser_fingerprint(
+                extra,
+                result.metadata.get("chatgpt_browser_fingerprint"),
+                source="phone_signup",
+                overwrite=False,
+            )
         return Account(
             platform="chatgpt",
             email=account_email,

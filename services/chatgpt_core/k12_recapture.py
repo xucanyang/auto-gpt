@@ -146,6 +146,11 @@ def _fingerprint_impersonate_from_user_agent(user_agent: str, fallback: str = ""
 
 
 def _account_browser_fingerprint(account: AccountModel, extra: dict[str, Any]) -> Any:
+    from services.chatgpt_core.account_fingerprint import resolve_account_browser_fingerprint
+
+    resolved = resolve_account_browser_fingerprint(extra)
+    if resolved:
+        return coerce_browser_fingerprint(resolved)
     registration_context = extra.get("chatgpt_registration_context")
     registration_context = registration_context if isinstance(registration_context, dict) else {}
     browser_fingerprint = registration_context.get("browser_fingerprint")

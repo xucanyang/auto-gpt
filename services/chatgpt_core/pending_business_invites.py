@@ -13,6 +13,7 @@ from core.base_mailbox import MailboxAccount, create_mailbox
 from core.config_store import config_store
 from core.db import AccountModel, PendingBusinessInviteModel, engine
 from services.chatgpt_account_state import apply_auth_capture_status
+from .account_fingerprint import inject_account_browser_fingerprint, resolve_account_browser_fingerprint
 from .business_workspace_recovery import BusinessWorkspaceRecovery
 from .refresh_token_registration_engine import (
     EmailServiceAdapter,
@@ -1120,6 +1121,11 @@ def _activate_subscription_auth_pending(
         account = session.get(AccountModel, pending_account_id)
         extra = account.get_extra() if account else {}
         merged_config.update({k: v for k, v in extra.items() if v not in (None, "")})
+    merged_config = inject_account_browser_fingerprint(
+        merged_config,
+        {**(extra or {}), "chatgpt_registration_context": registration_context or {}},
+        overwrite=False,
+    )
 
     merged_config["chatgpt_existing_account_capture"] = True
     capture_free, capture_business, inferred_plan = _infer_subscription_auth_capture_scope(
@@ -1321,6 +1327,11 @@ def activate_pending_invite(
             account = session.get(AccountModel, pending_account_id)
             extra = account.get_extra() if account else {}
             merged_config.update({k: v for k, v in extra.items() if v not in (None, "")})
+            merged_config = inject_account_browser_fingerprint(
+                merged_config,
+                {**(extra or {}), "chatgpt_registration_context": registration_context or {}},
+                overwrite=False,
+            )
             browser_mode = str((extra or {}).get("browser_mode") or merged_config.get("default_executor") or "protocol")
 
         email_service = RestoredEmailService(
@@ -1335,13 +1346,16 @@ def activate_pending_invite(
             log_fn=lambda msg, level="info": _log(msg, level),
         )
 
+        account_fingerprint = resolve_account_browser_fingerprint(
+            {**(extra or {}), "chatgpt_registration_context": registration_context or {}}
+        )
         register_client = SimpleNamespace(
-            device_id=str(registration_context.get("device_id") or ""),
-            ua=registration_context.get("user_agent"),
-            sec_ch_ua=registration_context.get("sec_ch_ua"),
-            impersonate=registration_context.get("impersonate"),
-            fingerprint=registration_context.get("browser_fingerprint"),
-            accept_language=registration_context.get("accept_language"),
+            device_id=str(registration_context.get("device_id") or account_fingerprint.get("device_id") or ""),
+            ua=registration_context.get("user_agent") or account_fingerprint.get("user_agent"),
+            sec_ch_ua=registration_context.get("sec_ch_ua") or account_fingerprint.get("sec_ch_ua"),
+            impersonate=registration_context.get("impersonate") or account_fingerprint.get("impersonate"),
+            fingerprint=account_fingerprint or registration_context.get("browser_fingerprint"),
+            accept_language=registration_context.get("accept_language") or account_fingerprint.get("accept_language"),
         )
 
         activation_result: dict[str, Any] | None = None

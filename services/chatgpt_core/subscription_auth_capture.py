@@ -15,6 +15,12 @@ from core.task_runtime import TaskInterruption
 from services.chatgpt_account_state import apply_auth_capture_status, classify_chatgpt_capabilities
 from services.chatgpt_core.task_logging import redact_log_text, redact_proxy_url, sanitize_error_message, sanitize_task_detail
 from .chatgpt_registration_mode_adapter import RefreshTokenChatGPTRegistrationAdapter
+from .account_fingerprint import (
+    build_browser_fingerprint_payload,
+    fingerprint_signature,
+    inject_account_browser_fingerprint,
+    persist_account_browser_fingerprint,
+)
 from .local_status_refresh import schedule_chatgpt_local_status_refresh_for_account_id
 from .pending_business_invites import RestoredEmailService, _mailbox_state_from_account
 from .refresh_token_registration_engine import (
@@ -238,6 +244,7 @@ def _persist_subscription_auth_result(
 
         extra = account.get_extra()
         extra.update(primary.extra or {})
+        extra = persist_account_browser_fingerprint(extra, source="subscription_auth_capture", overwrite=False)
         if mailbox_state:
             extra["chatgpt_mailbox_state"] = dict(mailbox_state)
         extra["chatgpt_last_auth_capture"] = dict(auth_capture)
@@ -356,6 +363,7 @@ def capture_subscription_auth_for_account(
 
     merged_config = config_store.get_all().copy()
     merged_config.update({k: v for k, v in extra.items() if v not in (None, "")})
+    merged_config = inject_account_browser_fingerprint(merged_config, extra, overwrite=False)
     merged_config["_current_account_id"] = account_id
     merged_config["_current_account_email"] = email
     merged_config["_current_task_id"] = str(merged_config.get("_current_task_id") or "")
@@ -505,6 +513,23 @@ def capture_subscription_auth_for_account(
                 "proxy": proxy_url or "direct",
                 "proxy_redacted": redact_proxy_url(proxy_url) or "direct",
             }
+            browser_fingerprint = build_browser_fingerprint_payload(getattr(register_client, "fingerprint", None))
+            if browser_fingerprint:
+                result.metadata["chatgpt_browser_fingerprint"] = browser_fingerprint
+                result.metadata["chatgpt_browser_fingerprint_signature"] = fingerprint_signature(browser_fingerprint)
+                result.metadata["chatgpt_browser_fingerprint_source"] = "account"
+                result.metadata["chatgpt_browser_fingerprint_isolated"] = True
+                result.metadata["registration_context"] = {
+                    "device_id": browser_fingerprint.get("device_id") or "",
+                    "user_agent": browser_fingerprint.get("user_agent") or "",
+                    "sec_ch_ua": browser_fingerprint.get("sec_ch_ua") or "",
+                    "impersonate": browser_fingerprint.get("impersonate") or "",
+                    "accept_language": browser_fingerprint.get("accept_language") or "",
+                    "browser_fingerprint": browser_fingerprint,
+                    "first_name": first_name,
+                    "last_name": last_name,
+                    "birthdate": birthdate,
+                }
 
             auth_capture = _build_auth_capture_payload(
                 result=result,

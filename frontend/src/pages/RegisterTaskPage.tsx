@@ -406,6 +406,16 @@ export default function RegisterTaskPage() {
           }),
         })
       }
+      if (platform === 'chatgpt') {
+        await apiFetch('/config', {
+          method: 'PUT',
+          body: JSON.stringify({
+            data: {
+              chatgpt_register_unique_exit_ip_enabled: values.chatgpt_register_unique_exit_ip_enabled ? 'true' : 'false',
+            },
+          }),
+        })
+      }
       validateTaskProxySettings(values)
       await saveTaskProxySettingsToConfig(values)
       const proxyPayload = buildTaskProxyPayload(values)
@@ -565,6 +575,7 @@ export default function RegisterTaskPage() {
   const proxyMode = Form.useWatch('proxy_mode', form)
   const proxyFailover = Form.useWatch('proxy_failover', form)
   const uniqueExitIpEnabled = Form.useWatch('chatgpt_register_unique_exit_ip_enabled', form)
+  const registerCount = Number(Form.useWatch('count', form) || 1)
   const manualEmail = Form.useWatch('email', form)
   const chatgptRegistrationEntry = Form.useWatch('chatgpt_registration_entry', form)
   const phoneSignupUsePool = Form.useWatch('chatgpt_phone_signup_use_pool', form)
@@ -815,6 +826,15 @@ export default function RegisterTaskPage() {
               style={{ marginBottom: 12 }}
               message="直连无法提供独立出口 IP"
               description="该开关需要动态代理、代理池或多个可切换代理；直连模式下多个账号会共用服务器出口。"
+            />
+          ) : null}
+          {uniqueExitIpEnabled && proxyMode === 'specified' && !proxyFailover && registerCount > 1 ? (
+            <Alert
+              type="error"
+              showIcon
+              style={{ marginBottom: 12 }}
+              message="单个指定代理不能支撑批量独立出口"
+              description="注册数量大于 1 时，请开启失败切换、改用代理池/动态代理，或把注册数量降为 1；后端会按同样规则拒绝创建任务。"
             />
           ) : null}
           <Alert

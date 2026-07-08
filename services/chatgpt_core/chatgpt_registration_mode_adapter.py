@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 from core.base_platform import Account, AccountStatus
+from services.chatgpt_core.account_fingerprint import persist_account_browser_fingerprint
 
 CHATGPT_REGISTRATION_MODE_REFRESH_TOKEN = "refresh_token"
 CHATGPT_REGISTRATION_MODE_ACCESS_TOKEN_ONLY = "access_token_only"
@@ -239,8 +240,11 @@ class BaseChatGPTRegistrationModeAdapter(ABC):
                 "existing_account_login_routed",
                 "chatgpt_register_unique_exit_ip_enabled",
                 "chatgpt_register_exit_ip",
+                "chatgpt_browser_fingerprint",
                 "chatgpt_browser_fingerprint_isolated",
                 "chatgpt_browser_fingerprint_signature",
+                "chatgpt_browser_fingerprint_source",
+                "chatgpt_browser_fingerprint_saved_at",
                 "chatgpt_checkout_plan",
                 "chatgpt_checkout_url",
                 "chatgpt_checkout_country",
@@ -331,6 +335,20 @@ class BaseChatGPTRegistrationModeAdapter(ABC):
                 extra["chatgpt_workspace_display_name"] = (
                     f"{email} [pending_activation]" if email else "[pending_activation]"
                 )
+        metadata_fingerprint = None
+        if isinstance(metadata, dict):
+            metadata_fingerprint = metadata.get("chatgpt_browser_fingerprint")
+            if not metadata_fingerprint and isinstance(metadata.get("registration_context"), dict):
+                metadata_fingerprint = (metadata.get("registration_context") or {}).get("browser_fingerprint")
+        if not metadata_fingerprint and isinstance(artifact.get("browser_fingerprint"), dict):
+            metadata_fingerprint = artifact.get("browser_fingerprint")
+        metadata_source = metadata if isinstance(metadata, dict) else {}
+        extra = persist_account_browser_fingerprint(
+            extra,
+            metadata_fingerprint,
+            source=str(metadata_source.get("chatgpt_browser_fingerprint_source") or "registration"),
+            overwrite=False,
+        )
         return extra
 
     def _build_workspace_accounts(self, result, fallback_password: str) -> list[Account]:

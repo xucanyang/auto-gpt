@@ -33,6 +33,13 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def get(platform: str):
+    """Compatibility hook for platform lookup used by older pipeline tests/extensions."""
+    if str(platform or "").strip().lower() == "chatgpt":
+        return ChatGPTPlatform
+    raise KeyError(f"unsupported platform: {platform}")
+
+
 class PaymentBatchScheduler:
     """Payment batch scheduler backed by the existing GoPay batch flow."""
 
@@ -138,7 +145,8 @@ class PaymentBatchScheduler:
     def _prepare_checkout_links(self, reserved_items: list[Any]) -> dict[str, Any]:
         ready_items: list[Any] = []
         failed_ids: list[int] = []
-        instance = ChatGPTPlatform(config=RegisterConfig(extra={}))
+        PlatformCls = get("chatgpt")
+        instance = PlatformCls(config=RegisterConfig(extra={}))
         config = self.config_store.load()
 
         with Session(engine) as session:

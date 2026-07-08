@@ -7,6 +7,21 @@
 ## [Unreleased] (未发布)
 
 
+## [1.3.38] - 2026-07-08
+### 新增 (Added)
+- **账号级浏览器指纹标准化持久化**：新增 `services/chatgpt_core/account_fingerprint.py`，将注册尝试中的 `chatgpt_browser_fingerprint` 统一提升为账号级字段，保存 `chatgpt_browser_fingerprint / signature / source / saved_at`；`api/tasks.py`、`services/chatgpt_core/chatgpt_registration_mode_adapter.py`、`access_token_only_registration_engine.py`、`refresh_token_registration_engine.py` 与 `phone_registration_engine.py` 均在账号保存前写入完整指纹，保证新注册账号不只保存签名而是保存可复用的完整浏览器画像。
+
+### 优化 (Changed)
+- **后续任务优先复用账号注册指纹**：`services/chatgpt_core/subscription_auth_capture.py`、`invalid_account_recheck.py`、`custom_email_recheck.py`、`pending_business_invites.py`、`k12_recapture.py` 和 `api/chatgpt.py` 统一从账号顶层字段或历史 `chatgpt_registration_context.browser_fingerprint` 解析指纹并注入运行配置；手机号绑定后的 Auth/RT 补抓、补抓 Auth、失效测活、自定义邮箱测活、pending invite 激活、K12 重跑和浏览器登录态捕获都遵循“账号间隔离、账号内稳定”的同一指纹语义。
+- **保存账号时防止指纹被后续更新冲掉**：`core/db.py::save_account()` 新增账号级指纹保护，更新同邮箱/同 workspace 账号时优先保留已存在的账号指纹；如果新 payload 缺少顶层指纹但历史上下文里已有指纹，会自动回填到顶层字段，避免补抓 Auth、测活或二阶段注册保存时把注册指纹抹掉。
+- **强制独立出口 IP 增加创建前硬校验**：`api/tasks.py::_prepare_register_request()` 在任务创建阶段拒绝 `强制独立出口 IP + 直连`，并拒绝 `批量注册 + 单个指定代理 + 未开启失败切换` 的组合；前端注册弹窗和独立注册页同步展示错误级提示，保存/提交注册配置时会把 `chatgpt_register_unique_exit_ip_enabled` 写入 `/config`，避免 UI 默认值与后端运行策略漂移。
+
+### 修复 (Fixed)
+- **恢复支付流水调度的平台查找兼容钩子**：`services/pipeline/payment_scheduler.py` 恢复 `get("chatgpt")` 形式的平台构造入口，保持支付链接准备流程与既有测试/扩展的 monkeypatch 约定兼容，避免全量回归中支付链接生成测试无法替换平台实例。
+
+### 测试 (Tests)
+- **补充账号级指纹与出口 IP 校验回归测试**：新增 `tests/test_account_fingerprint.py` 覆盖顶层持久化、历史 `registration_context` 回填、保存时保留已有账号指纹和运行配置注入；`tests/test_register_task_controls.py` 补充强制独立出口 IP 的非法代理组合校验，并确认注册任务保存账号时已写入完整 `chatgpt_browser_fingerprint`；全量 `pytest tests -q` 覆盖支付流水调度兼容回归。前端侧边栏版本号同步更新为 `v1.3.38`。
+
 ## [1.3.37] - 2026-07-08
 ### 新增 (Added)
 - **注册任务新增“强制独立出口 IP”开关**：`frontend/src/features/auth/components/RegisterTaskModal.tsx` 与 `frontend/src/pages/RegisterTaskPage.tsx` 在 ChatGPT 注册代理配置区新增 `chatgpt_register_unique_exit_ip_enabled`。开启后，`api/tasks.py` 会在每个注册尝试进入核心链路前探测真实出口 IP，并在同一注册任务内记录已分配出口；动态代理会自动扩大 sid 刷新候选，代理池会切换候选，撞到已分配 IP 时跳过当前候选并写入任务日志与 `register_unique_exit_ip` 任务 meta。
@@ -913,4 +928,8 @@
 
 ## 2026-07-08 18:45:43 +0800
 - 注册任务增加独立出口IP与浏览器指纹隔离
+- 发布模式: multi
+
+## 2026-07-08 19:23:14 +0800
+- 注册账号级指纹持久化与后续任务复用
 - 发布模式: multi

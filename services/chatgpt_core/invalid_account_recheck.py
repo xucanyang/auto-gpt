@@ -18,6 +18,7 @@ from services.chatgpt_account_state import (
     has_payment_pending_marker,
     is_account_deactivated_message,
 )
+from .account_fingerprint import inject_account_browser_fingerprint, persist_account_browser_fingerprint
 from .local_status_refresh import schedule_chatgpt_local_status_refresh_for_account_id
 from .pending_business_invites import RestoredEmailService, _mailbox_state_from_account
 from .refresh_token_registration_engine import EmailServiceAdapter, RefreshTokenRegistrationEngine
@@ -328,6 +329,7 @@ def _persist_recheck_success(
         recheck_payload["revival_marker"] = dict(revival_marker)
         extra["chatgpt_invalid_recheck"] = recheck_payload
         _append_revival_marker(extra, revival_marker)
+        extra = persist_account_browser_fingerprint(extra, source="invalid_account_recheck", overwrite=False)
 
         account.token = access_token
         account.set_extra(extra)
@@ -383,6 +385,7 @@ def _persist_recheck_failure(
         extra["chatgpt_invalid_recheck"] = payload
         if exported_mailbox_state:
             extra["chatgpt_mailbox_state"] = dict(exported_mailbox_state)
+        extra = persist_account_browser_fingerprint(extra, source="invalid_account_recheck", overwrite=False)
         account.status = "invalid"
         extra["chatgpt_capabilities"] = classify_chatgpt_capabilities(account)
         extra["chatgpt_capabilities"]["auth_level"] = "invalid"
@@ -652,6 +655,7 @@ def recheck_invalid_chatgpt_account(
 
     merged_config = config_store.get_all().copy()
     merged_config.update({key: value for key, value in extra.items() if value not in (None, "")})
+    merged_config = inject_account_browser_fingerprint(merged_config, extra, overwrite=False)
     merged_config["_current_account_id"] = account_id
     merged_config["_current_account_email"] = email
     merged_config["_current_task_id"] = task_id

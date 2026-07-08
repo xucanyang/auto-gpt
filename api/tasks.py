@@ -407,6 +407,43 @@ def _prepare_register_request(req: RegisterTaskRequest) -> RegisterTaskRequest:
     req_data["extra"] = deepcopy(req_data.get("extra") or {})
     prepared = RegisterTaskRequest(**req_data)
 
+    def _validate_unique_exit_ip_requirements() -> None:
+        if prepared.platform != "chatgpt":
+            return
+        effective_extra = config_store.get_all().copy()
+        effective_extra.update({k: v for k, v in prepared.extra.items() if v is not None and v != ""})
+        if not _is_truthy(effective_extra.get("chatgpt_register_unique_exit_ip_enabled")):
+            return
+        raw_proxy = str(
+            prepared.proxy
+            or effective_extra.get("proxy")
+            or effective_extra.get("proxy_url")
+            or effective_extra.get("task_proxy_url")
+            or effective_extra.get("dynamic_proxy_template")
+            or ""
+        ).strip()
+        mode = str(
+            prepared.proxy_mode
+            or effective_extra.get("proxy_mode")
+            or effective_extra.get("task_proxy_mode")
+            or ""
+        ).strip().lower()
+        if not mode:
+            mode = "specified" if raw_proxy else "direct"
+        if mode in {"none", "no_proxy", "direct", "直连"}:
+            raise HTTPException(400, "开启强制独立出口 IP 时不能使用直连模式；请改用动态代理、代理池或可切换的多代理。")
+        if mode in {"manual", "explicit"}:
+            mode = "specified"
+        failover_enabled = bool(prepared.proxy_failover) or _is_truthy(
+            effective_extra.get("proxy_failover")
+            or effective_extra.get("task_proxy_failover")
+        )
+        if mode == "specified" and int(prepared.count or 1) > 1 and not failover_enabled:
+            raise HTTPException(
+                400,
+                "单个指定代理无法满足多个账号独立出口 IP；请开启失败切换/代理池/动态代理，或把注册数量降为 1。",
+            )
+
     registration_entry = str(
         prepared.extra.get("chatgpt_registration_entry")
         or prepared.extra.get("registration_entry")
@@ -418,6 +455,7 @@ def _prepare_register_request(req: RegisterTaskRequest) -> RegisterTaskRequest:
         prepared.extra["chatgpt_has_refresh_token_solution"] = False
         # 手机号本身是注册标识；串行能避免同一个号池号码在并发任务里被重复领取。
         prepared.concurrency = 1
+        _validate_unique_exit_ip_requirements()
         return prepared
 
     mail_provider = prepared.extra.get("mail_provider") or config_store.get(
@@ -493,6 +531,7 @@ def _prepare_register_request(req: RegisterTaskRequest) -> RegisterTaskRequest:
     if mail_provider == "luckmail":
         prepared.extra["luckmail_project_code"] = "openai"
 
+    _validate_unique_exit_ip_requirements()
     return prepared
 
 
@@ -12281,6 +12320,15 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
 
                 current_email = account.email or current_email
                 if isinstance(account.extra, dict):
+                    if attempt_fingerprint_payload:
+                        from services.chatgpt_core.account_fingerprint import persist_account_browser_fingerprint
+
+                        account.extra = persist_account_browser_fingerprint(
+                            account.extra,
+                            attempt_fingerprint_payload,
+                            source="registration",
+                            overwrite=False,
+                        )
                     if attempt_fingerprint_signature:
                         account.extra.setdefault("chatgpt_browser_fingerprint_isolated", True)
                         account.extra.setdefault("chatgpt_browser_fingerprint_signature", attempt_fingerprint_signature)

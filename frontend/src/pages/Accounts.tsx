@@ -4832,6 +4832,16 @@ export default function Accounts() {
       validateTaskProxySettings(settingsPayload)
       saveRegisterFormSettings(currentPlatform, settingsPayload)
       await saveTaskProxySettingsToConfig(settingsPayload)
+      if (currentPlatform === 'chatgpt') {
+        await apiFetch('/config', {
+          method: 'PUT',
+          body: JSON.stringify({
+            data: {
+              chatgpt_register_unique_exit_ip_enabled: settingsPayload.chatgpt_register_unique_exit_ip_enabled ? 'true' : 'false',
+            },
+          }),
+        })
+      }
       await loadConfigCache({ force: true }).catch(() => null)
       if (settingsPayload.mail_provider_override === 'manual_email_otp' && settingsPayload.email) {
         window.localStorage.setItem('auto-chatgpt.manual_email_otp.email', settingsPayload.email)
@@ -5040,6 +5050,16 @@ export default function Accounts() {
       })
 
       await saveTaskProxySettingsToConfig(values)
+      if (currentPlatform === 'chatgpt') {
+        await apiFetch('/config', {
+          method: 'PUT',
+          body: JSON.stringify({
+            data: {
+              chatgpt_register_unique_exit_ip_enabled: values.chatgpt_register_unique_exit_ip_enabled ? 'true' : 'false',
+            },
+          }),
+        })
+      }
       await loadConfigCache({ force: true }).catch(() => null)
       const proxyPayload = buildTaskProxyPayload(values)
 

@@ -98,6 +98,7 @@ export function RegisterTaskModal({
   const proxyMode = Form.useWatch('proxy_mode', registerForm)
   const proxyFailover = Form.useWatch('proxy_failover', registerForm)
   const uniqueExitIpEnabled = Form.useWatch('chatgpt_register_unique_exit_ip_enabled', registerForm)
+  const registerCount = Number(Form.useWatch('count', registerForm) || 1)
   const k12Enabled = Form.useWatch('chatgpt_k12_enabled', registerForm)
   const k12SaveAllSpaces = Form.useWatch('chatgpt_k12_save_all_spaces', registerForm)
   const [tempmailDomains, setTempmailDomains] = useState<TempMailDomainOption[]>([])
@@ -630,6 +631,15 @@ export function RegisterTaskModal({
               style={{ marginBottom: 12 }}
               message="直连无法提供独立出口 IP"
               description="该开关需要动态代理、代理池或多个可切换代理；直连模式下多个账号会共用服务器出口。"
+            />
+          ) : null}
+          {uniqueExitIpEnabled && proxyMode === 'specified' && !proxyFailover && registerCount > 1 ? (
+            <Alert
+              type="error"
+              showIcon
+              style={{ marginBottom: 12 }}
+              message="单个指定代理不能支撑批量独立出口"
+              description="注册数量大于 1 时，请开启失败切换、改用代理池/动态代理，或把注册数量降为 1；后端会按同样规则拒绝创建任务。"
             />
           ) : null}
           <Alert

@@ -79,6 +79,31 @@ def _preserve_chatgpt_web_session_material(incoming_extra: dict, existing_extra:
     return incoming_extra
 
 
+def _preserve_chatgpt_account_browser_fingerprint(incoming_extra: dict, existing_extra: dict | None = None) -> dict:
+    """保存 ChatGPT 账号时，保持账号级浏览器指纹稳定。"""
+    if not isinstance(incoming_extra, dict):
+        return {}
+    try:
+        from services.chatgpt_core.account_fingerprint import (
+            merge_preserving_account_browser_fingerprint,
+            persist_account_browser_fingerprint,
+        )
+
+        if isinstance(existing_extra, dict) and existing_extra:
+            return merge_preserving_account_browser_fingerprint(
+                incoming_extra,
+                existing_extra,
+                source="save_account",
+            )
+        return persist_account_browser_fingerprint(
+            incoming_extra,
+            source="save_account",
+            overwrite=False,
+        )
+    except Exception:
+        return incoming_extra
+
+
 class AccountListStateModel(SQLModel, table=True):
     """List-time derived state cache for account filters/sorts.
 
@@ -350,6 +375,8 @@ def save_account(account) -> 'AccountModel':
 
     with Session(engine) as session:
         extra = dict(account.extra or {}) if isinstance(account.extra, dict) else {}
+        if str(account.platform or "").strip().lower() == "chatgpt":
+            extra = _preserve_chatgpt_account_browser_fingerprint(extra)
         variant_key = str(extra.get("chatgpt_workspace_variant_key") or "").strip()
         candidates = session.exec(
             select(AccountModel)
@@ -386,6 +413,7 @@ def save_account(account) -> 'AccountModel':
                 except Exception:
                     existing_extra = {}
                 extra = _preserve_chatgpt_web_session_material(extra, existing_extra)
+                extra = _preserve_chatgpt_account_browser_fingerprint(extra, existing_extra)
             existing.password = account.password
             existing.user_id = account.user_id or ""
             existing.region = account.region or ""

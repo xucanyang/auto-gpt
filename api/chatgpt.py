@@ -1309,7 +1309,24 @@ async def _browser_auth_snapshot_locked(state: _BrowserAuthSession) -> dict[str,
 
 
 def _account_browser_fingerprint(acc: AccountModel) -> dict[str, Any]:
+    from services.chatgpt_core.account_fingerprint import resolve_account_browser_fingerprint
+
     extra = acc.get_extra()
+    resolved = resolve_account_browser_fingerprint(extra)
+    if resolved:
+        return {
+            **resolved,
+            "user_agent": resolved.get("user_agent")
+            or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+               "(KHTML, like Gecko) Chrome/136.0.7103.92 Safari/537.36",
+            "accept_language": resolved.get("accept_language") or "en-US,en;q=0.9",
+            "sec_ch_ua": resolved.get("sec_ch_ua") or _sec_ch_ua_for_major(
+                int(resolved.get("chrome_major") or _infer_chrome_major(str(resolved.get("user_agent") or "")) or 136)
+            ),
+            "viewport_width": int(resolved.get("viewport_width") or 1365),
+            "viewport_height": int(resolved.get("viewport_height") or 900),
+            "device_id": str(resolved.get("device_id") or "").strip(),
+        }
     registration_context = extra.get("chatgpt_registration_context")
     if not isinstance(registration_context, dict):
         registration_context = {}
@@ -1469,6 +1486,17 @@ async def _browser_auth_capture_to_account(state: _BrowserAuthSession, acc: Acco
     if int(major or 0) >= 136:
         registration_context["impersonate"] = "chrome136"
     extra["chatgpt_registration_context"] = registration_context
+    try:
+        from services.chatgpt_core.account_fingerprint import persist_account_browser_fingerprint
+
+        extra = persist_account_browser_fingerprint(
+            extra,
+            browser_fingerprint,
+            source="browser_auth",
+            overwrite=True,
+        )
+    except Exception:
+        pass
     extra["chatgpt_browser_auth"] = {
         "captured_at": datetime.now(timezone.utc).isoformat(),
         "url": str(state.page.url if state.page is not None else ""),

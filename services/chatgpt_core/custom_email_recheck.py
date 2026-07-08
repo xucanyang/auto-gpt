@@ -26,6 +26,7 @@ from services.chatgpt_core.invalid_account_recheck import (
     _classify_recheck_error,
     _message_for_status,
 )
+from services.chatgpt_core.account_fingerprint import inject_account_browser_fingerprint, persist_account_browser_fingerprint
 from services.chatgpt_core.pending_business_invites import RestoredEmailService, _mailbox_state_from_account
 from services.chatgpt_core.local_status_refresh import schedule_chatgpt_local_status_refresh_for_account_id
 from services.chatgpt_core.refresh_token_registration_engine import (
@@ -1029,6 +1030,7 @@ def _upsert_custom_email_recheck_account(
             recheck_payload['revival_marker'] = dict(revival_marker)
             extra['chatgpt_custom_email_recheck'] = dict(recheck_payload)
             _append_revival_marker(extra, revival_marker)
+            extra = persist_account_browser_fingerprint(extra, source='custom_email_recheck', overwrite=False)
             existing.email = email
             if password:
                 existing.password = password
@@ -1111,6 +1113,7 @@ def _upsert_custom_email_recheck_account(
         recheck_payload['revival_marker'] = dict(revival_marker)
         current_extra['chatgpt_custom_email_recheck'] = dict(recheck_payload)
         _append_revival_marker(current_extra, revival_marker)
+        current_extra = persist_account_browser_fingerprint(current_extra, source='custom_email_recheck', overwrite=False)
         refreshed.set_extra(current_extra)
         apply_auth_capture_status(
             refreshed,
@@ -1192,6 +1195,17 @@ def recheck_custom_chatgpt_email(
                 merged_config['_current_account_id'] = resolved_account_id
         except Exception:
             pass
+    account_fingerprint_extra: dict[str, Any] = {}
+    if resolved_account_id > 0:
+        try:
+            with Session(engine) as session:
+                existing_account = session.get(AccountModel, resolved_account_id)
+                if existing_account is not None:
+                    account_fingerprint_extra = existing_account.get_extra()
+        except Exception:
+            account_fingerprint_extra = {}
+    if account_fingerprint_extra:
+        merged_config = inject_account_browser_fingerprint(merged_config, account_fingerprint_extra, overwrite=False)
     if task_control is not None:
         merged_config['_task_control'] = task_control
         merged_config['_task_attempt_id'] = attempt_id
@@ -1302,6 +1316,7 @@ def recheck_custom_chatgpt_email(
                     if row is not None:
                         extra = row.get_extra()
                         extra['chatgpt_custom_email_recheck'] = dict(stage1_payload)
+                        extra = persist_account_browser_fingerprint(extra, source='custom_email_recheck', overwrite=False)
                         row.set_extra(extra)
                         row.updated_at = _utcnow()
                         session.add(row)
@@ -1413,6 +1428,7 @@ def recheck_custom_chatgpt_email(
                 if row is not None:
                     extra = row.get_extra()
                     extra['chatgpt_custom_email_recheck'] = dict(payload)
+                    extra = persist_account_browser_fingerprint(extra, source='custom_email_recheck', overwrite=False)
                     row.set_extra(extra)
                     row.updated_at = _utcnow()
                     session.add(row)
@@ -1468,6 +1484,7 @@ def recheck_custom_chatgpt_email(
                     if row is not None:
                         extra = row.get_extra()
                         extra['chatgpt_custom_email_recheck'] = dict(payload)
+                        extra = persist_account_browser_fingerprint(extra, source='custom_email_recheck', overwrite=False)
                         row.set_extra(extra)
                         row.updated_at = _utcnow()
                         session.add(row)
