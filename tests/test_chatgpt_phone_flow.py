@@ -302,18 +302,22 @@ class UploadedPhoneServiceTests(unittest.TestCase):
                 [
                     "+13434832954----https://api.sms8.net/api/record?token=one",
                     "17632154294---https://phonenum.smiley99627.asia/7632154294",
+                    "+12082260171|https://sms24.uk/api/sms/recordText?token=demo&tpl=1",
                     "+13434832954----https://api.sms8.net/api/record?token=duplicate",
                     "bad-line",
                 ]
             )
         )
 
-        self.assertEqual(len(entries), 2)
+        self.assertEqual(len(entries), 3)
         self.assertEqual(entries[0].phone, "+13434832954")
         self.assertEqual(entries[0].api_url, "https://api.sms8.net/api/record?token=one")
         self.assertEqual(entries[1].phone, "+17632154294")
         self.assertEqual(entries[1].api_url, "https://phonenum.smiley99627.asia/7632154294")
         self.assertEqual(entries[1].raw_line, "+17632154294----https://phonenum.smiley99627.asia/7632154294")
+        self.assertEqual(entries[2].phone, "+12082260171")
+        self.assertEqual(entries[2].api_url, "https://sms24.uk/api/sms/recordText?token=demo&tpl=1")
+        self.assertEqual(entries[2].raw_line, "+12082260171----https://sms24.uk/api/sms/recordText?token=demo&tpl=1")
         self.assertEqual(len(errors), 2)
         self.assertIn("重复", errors[0]["reason"])
         self.assertIn("API URL", errors[1]["reason"])
@@ -362,6 +366,30 @@ class UploadedPhoneServiceTests(unittest.TestCase):
             with mock.patch("services.chatgpt_core.phone_service.time.sleep"):
                 self.assertEqual(service.wait_for_code(entries[0], timeout=10), "421804")
         self.assertEqual(service.last_api_parser, "plain_yes_no")
+        self.assertTrue(service.last_code_was_extracted)
+
+    def test_uploaded_phone_service_supports_sms24_json_pending_and_expire_time(self):
+        entries, errors = parse_uploaded_phone_lines(
+            "+12082260171|https://sms24.uk/api/sms/recordText?token=demo&tpl=1"
+        )
+        self.assertFalse(errors)
+        service = UploadedPhoneService(entries, {"uploaded_phone_poll_interval_seconds": "1"})
+        service.bind_entry(entries[0])
+
+        first = mock.Mock(status_code=200, text='{"code":false,"message":"暂无短信","expireTime":"2026-08-05 21:00:59"}')
+        first.json.return_value = {"code": False, "message": "暂无短信", "expireTime": "2026-08-05 21:00:59"}
+        second = mock.Mock(status_code=200, text='{"code":true,"message":"您的 OpenAI 验证代码是：421804","expireTime":"2026-08-05 21:00:59"}')
+        second.json.return_value = {
+            "code": True,
+            "message": "您的 OpenAI 验证代码是：421804",
+            "expireTime": "2026-08-05 21:00:59",
+        }
+
+        with mock.patch("services.chatgpt_core.phone_service.requests.get", side_effect=[first, second]):
+            with mock.patch("services.chatgpt_core.phone_service.time.sleep"):
+                self.assertEqual(service.wait_for_code(entries[0], timeout=10), "421804")
+        self.assertEqual(service.last_expired_date, "2026-08-05 21:00:59")
+        self.assertEqual(service.last_api_parser, "json_status")
         self.assertTrue(service.last_code_was_extracted)
 
     def test_uploaded_phone_service_extracts_six_digit_code_from_sms_text(self):

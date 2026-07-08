@@ -506,7 +506,7 @@ def _split_uploaded_phone_api_line(raw_line: Any) -> tuple[str, str, str]:
         return "", "", ""
     match = _UPLOADED_PHONE_API_URL_RE.search(line)
     if not match:
-        return "", "", "缺少有效 API URL（支持 手机号----https://... 或 手机号---https://...）"
+        return "", "", "缺少有效 API URL（支持 手机号----https://...、手机号---https://... 或 手机号|https://...）"
     phone = _normalize_uploaded_phone(line[: match.start()])
     api_url = str(match.group(0) or "").strip().rstrip("，,；;")
     if not phone:
@@ -618,6 +618,10 @@ def _parse_uploaded_sms_api_result(
             data.get("expired_date")
             or payload.get("expired_date")
             or payload.get("expires_at")
+            or data.get("expire_time")
+            or payload.get("expire_time")
+            or data.get("expireTime")
+            or payload.get("expireTime")
             or ""
         ).strip()
         code_time = str(data.get("code_time") or payload.get("code_time") or payload.get("received_at") or "").strip()
@@ -629,11 +633,6 @@ def _parse_uploaded_sms_api_result(
             or payload.get("otp")
             or ""
         )
-        top_level_code = payload.get("code")
-        if not raw_code and str(top_level_code or "").strip() not in {"", "0"}:
-            maybe_code = _extract_uploaded_sms_code(top_level_code)
-            if maybe_code:
-                raw_code = top_level_code
         message = str(
             payload.get("msg")
             or payload.get("message")
@@ -641,6 +640,20 @@ def _parse_uploaded_sms_api_result(
             or data.get("message")
             or ""
         ).strip()
+        top_level_code = payload.get("code")
+        if not raw_code and isinstance(top_level_code, bool):
+            if top_level_code is True:
+                maybe_code = _extract_uploaded_sms_code(message)
+                if maybe_code:
+                    raw_code = message
+        elif not raw_code and str(top_level_code or "").strip().lower() not in {"", "0", "false", "none", "null"}:
+            maybe_code = _extract_uploaded_sms_code(top_level_code)
+            if maybe_code:
+                raw_code = top_level_code
+        if not raw_code and message:
+            maybe_code = _extract_uploaded_sms_code(message, require_context=True)
+            if maybe_code:
+                raw_code = message
         code = _extract_uploaded_sms_code(raw_code)
         if code:
             return {

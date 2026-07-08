@@ -317,22 +317,22 @@ export function RegisterTaskModal({
               {!phoneSignupUsePool ? (
                 <Form.Item
                   name="chatgpt_phone_signup_phone_lines"
-                  label="手机号----收码API"
+                  label="手机号 / 收码API"
                   rules={[
                     {
                       validator: (_, value) => {
                         if (!isPhoneSignup || phoneSignupUsePool) return Promise.resolve()
                         return String(value || '').trim()
                           ? Promise.resolve()
-                          : Promise.reject(new Error('请输入手机号----收码API，或勾选使用手机号池'))
+                          : Promise.reject(new Error('请输入手机号----收码API / 手机号|收码API，或勾选使用手机号池'))
                       },
                     },
                   ]}
-                  extra="一行一个，格式与手机号绑定一致：手机号----收码API。注册数量大于 1 时会逐行使用。"
+                  extra="一行一个，格式与手机号绑定一致：手机号----收码API；也兼容 手机号|收码API。注册数量大于 1 时会逐行使用。"
                 >
                   <Input.TextArea
                     rows={5}
-                    placeholder={'+573234567890----https://example.com/sms?id=xxx'}
+                    placeholder={'+573234567890----https://example.com/sms?id=xxx\n+12082260171|https://sms24.uk/api/sms/recordText?token=xxx&tpl=1'}
                   />
                 </Form.Item>
               ) : null}

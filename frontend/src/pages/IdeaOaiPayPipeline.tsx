@@ -1024,7 +1024,7 @@ function ConfigPanel({
                 <Switch />
               </Form.Item>
               <Form.Item name="phone_lines" label="粘贴手机号/API" className="idea-oaipay-field-full">
-                <TextArea rows={3} placeholder="+1xxx----https://...；为空则使用手机号池" />
+                <TextArea rows={3} placeholder="+1xxx----https://... 或 +1xxx|https://...；为空则使用手机号池" />
               </Form.Item>
               <Form.Item name="phone_timeout_seconds" label="收码超时">
                 <InputNumber min={1800} step={60} style={{ width: '100%' }} />

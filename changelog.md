@@ -7,6 +7,17 @@
 ## [Unreleased] (未发布)
 
 
+## [1.3.39] - 2026-07-08
+### 新增 (Added)
+- **手机号/API 导入兼容管道分隔格式**：手机号池、手机号绑定、手机号注册和 Idea 提交流程的手工号码输入均兼容 `+手机号|https://...` 供应商原生格式，并继续统一保存为既有 `手机号----收码API` 规范行，避免新格式号码无法导入池或无法进入绑定/注册任务。
+
+### 修复 (Fixed)
+- **兼容 sms24.uk 收码 JSON 协议**：上传手机号收码轮询与手机号池 API 到期探测均支持 `expireTime` 字段；当接口返回 `{"code":false,"message":"暂无短信","expireTime":"..."}` 时按“暂无验证码”继续轮询并记录固定到期时间，当后续 `code=true` 且短信内容在 `message` 中时可提取 OpenAI 验证码。
+
+### 测试 (Tests)
+- **补充手机号/API 新格式回归测试**：`tests/test_chatgpt_phone_flow.py` 覆盖 `手机号|API` 解析、sms24 JSON 暂无短信与验证码提取；`tests/test_phone_pool.py` 覆盖手机号池导入管道分隔行和 `expireTime` 到期时间刷新。前端侧边栏版本号同步更新为 `v1.3.39`。
+
+
 ## [1.3.38] - 2026-07-08
 ### 新增 (Added)
 - **账号级浏览器指纹标准化持久化**：新增 `services/chatgpt_core/account_fingerprint.py`，将注册尝试中的 `chatgpt_browser_fingerprint` 统一提升为账号级字段，保存 `chatgpt_browser_fingerprint / signature / source / saved_at`；`api/tasks.py`、`services/chatgpt_core/chatgpt_registration_mode_adapter.py`、`access_token_only_registration_engine.py`、`refresh_token_registration_engine.py` 与 `phone_registration_engine.py` 均在账号保存前写入完整指纹，保证新注册账号不只保存签名而是保存可复用的完整浏览器画像。
@@ -932,4 +943,8 @@
 
 ## 2026-07-08 19:23:14 +0800
 - 注册账号级指纹持久化与后续任务复用
+- 发布模式: multi
+
+## 2026-07-08 20:58:24 +0800
+- 兼容 sms24 手机号 API 格式
 - 发布模式: multi

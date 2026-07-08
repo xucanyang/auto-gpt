@@ -237,7 +237,7 @@ export default function RegisterTaskPage() {
       return
     }
     if (phoneSignupEnabled && !values.chatgpt_phone_signup_use_pool && !String(values.chatgpt_phone_signup_phone_lines || '').trim()) {
-      message.error('手机号注册请粘贴 手机号----收码API，或勾选使用手机号池')
+      message.error('手机号注册请粘贴 手机号----收码API / 手机号|收码API，或勾选使用手机号池')
       return
     }
     if (!phoneSignupEnabled && values.platform === 'chatgpt' && values.mail_provider === 'email_api' && !String(values.email_api_lines || '').trim()) {
@@ -859,7 +859,7 @@ export default function RegisterTaskPage() {
                   showIcon
                   style={{ marginBottom: 12 }}
                   message="当前为手机号注册"
-                  description="手机号会作为 ChatGPT 登录标识；接码输入格式沿用手机号绑定的“手机号----收码API”。当前只执行注册阶段，并保存注册阶段 AccessToken 账号。"
+                  description="手机号会作为 ChatGPT 登录标识；接码输入格式沿用手机号绑定的“手机号----收码API”，并兼容“手机号|收码API”。当前只执行注册阶段，并保存注册阶段 AccessToken 账号。"
                 />
               ) : null}
               <Form.Item label="ChatGPT Token 方案">
@@ -1491,7 +1491,7 @@ export default function RegisterTaskPage() {
             {isPhoneSignup ? (
               <>
                 <Text type="secondary" style={{ display: 'block', marginBottom: 12 }}>
-                  手机号注册使用与手机号绑定一致的输入格式：每行 `手机号----收码API`。若号码已注册，会使用同一个密码走手机号登录短信验证。
+                  手机号注册使用与手机号绑定一致的输入格式：每行 `手机号----收码API`，也兼容 `手机号|收码API`。若号码已注册，会使用同一个密码走手机号登录短信验证。
                 </Text>
                 <Form.Item
                   name="login_password"
@@ -1507,20 +1507,20 @@ export default function RegisterTaskPage() {
                 {!phoneSignupUsePool ? (
                   <Form.Item
                     name="chatgpt_phone_signup_phone_lines"
-                    label="手机号----收码API"
+                    label="手机号 / 收码API"
                     rules={[
                       {
                         validator: (_, value) => {
                           if (!isPhoneSignup || phoneSignupUsePool) return Promise.resolve()
                           return String(value || '').trim()
                             ? Promise.resolve()
-                            : Promise.reject(new Error('请粘贴 手机号----收码API，或勾选使用手机号池'))
+                            : Promise.reject(new Error('请粘贴 手机号----收码API / 手机号|收码API，或勾选使用手机号池'))
                         },
                       },
                     ]}
-                    extra="示例：+573234567890----https://example.com/api/sms?id=xxx"
+                    extra="示例：+573234567890----https://example.com/api/sms?id=xxx；或 +12082260171|https://sms24.uk/api/sms/recordText?token=xxx&tpl=1"
                   >
-                    <Input.TextArea autoSize={{ minRows: 4, maxRows: 10 }} placeholder="+573234567890----https://example.com/api/sms?id=xxx" />
+                    <Input.TextArea autoSize={{ minRows: 4, maxRows: 10 }} placeholder={'+573234567890----https://example.com/api/sms?id=xxx\n+12082260171|https://sms24.uk/api/sms/recordText?token=xxx&tpl=1'} />
                   </Form.Item>
                 ) : (
                   <Alert

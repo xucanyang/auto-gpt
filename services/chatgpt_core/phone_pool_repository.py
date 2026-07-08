@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import json
+import re
 import threading
 import time
 from typing import Any
@@ -56,6 +57,8 @@ _PHONE_SIGNUP_PREFIX_LIMIT_MARKERS = (
     "相似号码",
 )
 
+_PHONE_POOL_API_URL_RE = re.compile(r"https?://[^\s'\"<>]+", re.I)
+
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -103,6 +106,34 @@ def _phone_prefix4(value: str) -> str:
     return digits[:4] if len(digits) >= 4 else ""
 
 
+def _split_import_phone_api_line(line: str) -> tuple[str, str, list[str]]:
+    """Split one operator pasted phone/API row.
+
+    Historical imports use ``手机号----API``.  Operators now also paste
+    supplier-native rows such as ``手机号|API``; keep the stored/raw shape
+    canonical while accepting both separators.
+    """
+    text = str(line or "").strip()
+    if not text:
+        return "", "", []
+    if "----" in text:
+        parts = text.split("----")
+        return parts[0], parts[1] if len(parts) > 1 else "", parts
+    if "|" in text:
+        phone_part, api_part = text.split("|", 1)
+        return phone_part, api_part, [phone_part, api_part]
+    if "---" in text:
+        parts = text.split("---")
+        return parts[0], parts[1] if len(parts) > 1 else "", parts
+    match = _PHONE_POOL_API_URL_RE.search(text)
+    if not match:
+        return "", "", []
+    return text[: match.start()], str(match.group(0) or "").rstrip("，,；;"), [
+        text[: match.start()],
+        str(match.group(0) or "").rstrip("，,；;"),
+    ]
+
+
 def _is_openai_rejected_record(record: "PhonePoolRecord") -> bool:
     if record.status != STATUS_CANNOT_SEND:
         return False
@@ -137,11 +168,10 @@ def _parse_import_lines(raw: str) -> tuple[list[tuple[int, str, str, str]], list
         line = str(raw_line or "").strip()
         if not line or line.startswith("#"):
             continue
-        parts = line.split("----")
+        phone_part, api_part, parts = _split_import_phone_api_line(line)
         if len(parts) < 2:
-            errors.append({"line": index, "raw": line, "reason": "缺少 ---- 分隔符"})
+            errors.append({"line": index, "raw": line, "reason": "缺少手机号/API 分隔符"})
             continue
-        phone_part, api_part = parts[0], parts[1]
         phone = normalize_phone(phone_part)
         api_url = str(api_part or "").strip()
         parsed = urlparse(api_url)
@@ -204,7 +234,7 @@ def _dump_email_list(values: list[str]) -> str:
 def _extract_expired_date_from_payload(payload: Any) -> str:
     """从收码 API 响应里提取固定有效期。
 
-    当前主协议是 data.expired_date；这里顺手兼容少量常见别名，避免上游字段
+    当前主协议是 data.expired_date；这里顺手兼容少量常见别名与 expireTime，避免上游字段
     命名略有差异时整批变成 missing。
     """
     if not isinstance(payload, dict):
@@ -215,10 +245,12 @@ def _extract_expired_date_from_payload(payload: Any) -> str:
         data.get("api_expired_date"),
         data.get("expires_at"),
         data.get("expire_time"),
+        data.get("expireTime"),
         payload.get("expired_date"),
         payload.get("api_expired_date"),
         payload.get("expires_at"),
         payload.get("expire_time"),
+        payload.get("expireTime"),
     )
     for value in candidates:
         text = str(value or "").strip()
@@ -272,7 +304,7 @@ def probe_phone_api_expiry(api_url: str, *, timeout: float = 12.0) -> dict[str, 
             "ok": False,
             "status": API_EXPIRY_STATUS_MISSING,
             "expired_date": "",
-            "error": "API 响应未包含 data.expired_date",
+            "error": "API 响应未包含 expired_date/expireTime",
         }
     return {
         "ok": True,

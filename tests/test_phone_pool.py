@@ -73,6 +73,17 @@ bad-line
         self.assertEqual(saved.api_expiry_checked_at, "")
 
 
+    def test_import_accepts_pipe_phone_api_lines(self):
+        repo = PhonePoolRepository()
+        summary = repo.import_lines("+12082260171|https://sms24.uk/api/sms/recordText?token=demo&tpl=1")
+
+        self.assertEqual(summary["added"], 1)
+        self.assertFalse(summary["errors"])
+        rec = repo.get("+12082260171")
+        self.assertEqual(rec.api_url, "https://sms24.uk/api/sms/recordText?token=demo&tpl=1")
+        self.assertEqual(repo.to_phone_items([rec])[0]["raw_line"], "+12082260171----https://sms24.uk/api/sms/recordText?token=demo&tpl=1")
+
+
     def test_import_duplicate_phone_uses_last_api_without_resetting_runtime_state(self):
         repo = PhonePoolRepository()
         rec = repo.add(phone="+15551230001", api_url="https://relay.example.com/old")
@@ -121,6 +132,25 @@ bad-line
         mock_get.assert_not_called()
         self.assertEqual(result["summary"]["skipped"], 1)
 
+    def test_refresh_api_expiry_accepts_sms24_expire_time(self):
+        repo = PhonePoolRepository()
+        rec = repo.add(phone="+12082260171", api_url="https://sms24.uk/api/sms/recordText?token=demo&tpl=1")
+
+        with patch.object(repo_module.requests, "get") as mock_get:
+            mock_get.return_value.status_code = 200
+            mock_get.return_value.json.return_value = {
+                "code": False,
+                "message": "暂无短信",
+                "expireTime": "2026-08-05 21:00:59",
+            }
+            result = repo.refresh_api_expiry_for_ids([rec.id])
+
+        self.assertEqual(result["summary"]["checked"], 1)
+        self.assertEqual(result["summary"]["success"], 1)
+        saved = repo.get("+12082260171")
+        self.assertEqual(saved.api_expired_date, "2026-08-05 21:00:59")
+        self.assertEqual(saved.api_expiry_status, "ok")
+
     def test_refresh_api_expiry_records_missing_or_error_once(self):
         repo = PhonePoolRepository()
         rec = repo.add(phone="+15551230002", api_url="https://relay.example.com/b")
@@ -133,7 +163,7 @@ bad-line
         self.assertEqual(result["summary"]["missing_expired_date"], 1)
         saved = repo.get("+15551230002")
         self.assertEqual(saved.api_expiry_status, "missing_expired_date")
-        self.assertIn("expired_date", saved.api_expiry_error)
+        self.assertIn("expireTime", saved.api_expiry_error)
 
     def test_import_returns_refresh_ids_for_blank_expiry(self):
         repo = PhonePoolRepository()

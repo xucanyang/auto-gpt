@@ -8355,7 +8355,7 @@ export default function Accounts() {
                     ? '限定号段绑定只使用手机号池；如需粘贴固定号码，请切回普通绑定。'
                     : phoneBindingPrefixSampleEnabled
                     ? '号段抽样测试只使用手机号池；如需粘贴固定号码，请切回普通绑定。'
-                    : '每行：手机号 + 收码API；推荐 +手机号----https://...，也兼容 手机号---https://...，会自动导入手机号池并回写结果。'}
+                    : '每行：手机号 + 收码API；推荐 +手机号----https://...，也兼容 手机号---https://... / 手机号|https://...，会自动导入手机号池并回写结果。'}
                 </Text>
               </div>
               <Button
@@ -8376,7 +8376,7 @@ export default function Accounts() {
               >
                 <Input.TextArea
                   autoSize={{ minRows: 4, maxRows: 10 }}
-                  placeholder={'+13434832954----https://api.sms8.net/api/record?token=...\n17632154294---https://phonenum.example.com/7632154294'}
+                  placeholder={'+13434832954----https://api.sms8.net/api/record?token=...\n17632154294---https://phonenum.example.com/7632154294\n+12082260171|https://sms24.uk/api/sms/recordText?token=...&tpl=1'}
                   style={{ fontFamily: 'monospace' }}
                 />
               </Form.Item>

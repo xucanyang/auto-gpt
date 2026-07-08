@@ -1323,11 +1323,11 @@ export default function PhonePool() {
               value={importText}
               onChange={(e) => setImportText(e.target.value)}
               autoSize={{ minRows: 4, maxRows: 10 }}
-              placeholder="+13434832954----https://api.sms8.net/api/record?token=xxx"
+              placeholder={'+13434832954----https://api.sms8.net/api/record?token=xxx\n+12082260171|https://sms24.uk/api/sms/recordText?token=xxx&tpl=1'}
               style={{ fontFamily: 'monospace' }}
             />
             <Typography.Text type="secondary">
-              每行一个：+手机号----收码API。相同手机号会替换新的 API/token，不会重置号码状态、绑定次数和历史记录；同批重复以后面的为准。
+              每行一个：+手机号----收码API，也兼容 +手机号|收码API。相同手机号会替换新的 API/token，不会重置号码状态、绑定次数和历史记录；同批重复以后面的为准。
             </Typography.Text>
             <div>
               <Button type="primary" icon={<UploadOutlined />} loading={importing} disabled={!importText.trim()} onClick={importPhones}>
