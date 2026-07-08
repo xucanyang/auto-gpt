@@ -9,6 +9,7 @@ import {
   Modal,
   Select,
   Space,
+  Tag,
   message,
 } from 'antd'
 import { ReloadOutlined } from '@ant-design/icons'
@@ -173,6 +174,11 @@ export function RegisterTaskModal({
   const boundPhoneResults = Array.isArray(taskSnapshot?.meta?.bound_phone_results) ? taskSnapshot.meta.bound_phone_results : []
   const registeredPhoneLines = Array.isArray(taskSnapshot?.meta?.registered_phone_lines) ? taskSnapshot.meta.registered_phone_lines : []
   const phoneResults = Array.isArray(taskSnapshot?.meta?.runtime_results) ? taskSnapshot.meta.runtime_results : []
+  const existingAccountLoginRoutes = Array.isArray(taskSnapshot?.meta?.existing_account_login_routes)
+    ? taskSnapshot.meta.existing_account_login_routes.filter((item: any) => item && typeof item === 'object')
+    : []
+  const existingAccountRoutedCount = existingAccountLoginRoutes.filter((item: any) => Boolean(item?.routed) && !item?.blocked).length
+  const existingAccountBlockedCount = existingAccountLoginRoutes.filter((item: any) => Boolean(item?.blocked)).length
   const registeredPhoneSuccessCount = registeredPhoneLines.length
     || phoneResults.filter((item: any) => String(item?.status || '') === 'registered_phone_signup').length
   const taskSource = String(taskSnapshot?.source || taskSnapshot?.meta?.source || '').trim()
@@ -644,6 +650,14 @@ export function RegisterTaskModal({
                 </Form.Item>
               ) : null}
               <Form.Item
+                name="chatgpt_existing_account_login_route_enabled"
+                valuePropName="checked"
+                initialValue={true}
+                extra="开启：注册状态机发现邮箱已存在或被 OpenAI 路由到登录时，继续登录恢复并保存；关闭：直接跳过该邮箱，不保存到库存，并写入任务日志。"
+              >
+                <Checkbox>遇到已注册邮箱时路由到登录</Checkbox>
+              </Form.Item>
+              <Form.Item
                 label="K12 / Workspace 加入"
                 extra="只保存 workspace variants 摘要与抓取策略；token/cookies 不会在列表或摘要中展开。"
               >
@@ -845,6 +859,30 @@ export function RegisterTaskModal({
               showIcon
               message="approvalUrl 提取结果"
               description={<ApprovalUrlResultsTable results={phoneResults} />}
+            />
+          ) : null}
+          {existingAccountLoginRoutes.length > 0 ? (
+            <Alert
+              type={existingAccountBlockedCount > 0 ? 'warning' : 'info'}
+              showIcon
+              message={`已注册邮箱处理：登录恢复 ${existingAccountRoutedCount} 个，跳过 ${existingAccountBlockedCount} 个`}
+              description={
+                <Space direction="vertical" size={4} style={{ width: '100%' }}>
+                  {existingAccountLoginRoutes.slice(-8).map((item: any, index: number) => (
+                    <div key={`${item?.email || index}-${item?.detected_at || index}`}>
+                      <Tag color={item?.blocked ? 'orange' : 'blue'}>
+                        {item?.blocked ? '已跳过' : '已路由'}
+                      </Tag>
+                      <span>{String(item?.email || '-')}</span>
+                      {item?.reason ? (
+                        <span style={{ color: '#6b7280', marginLeft: 8 }}>
+                          {String(item.reason).slice(0, 120)}
+                        </span>
+                      ) : null}
+                    </div>
+                  ))}
+                </Space>
+              }
             />
           ) : null}
           {taskSnapshot?.pending_verification ? (

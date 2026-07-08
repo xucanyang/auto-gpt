@@ -186,6 +186,7 @@ CONFIG_KEYS = [
     "chatgpt_capture_free_workspace",
     "chatgpt_capture_business_workspace",
     "chatgpt_save_registration_access_token_account",
+    "chatgpt_existing_account_login_route_enabled",
     "chatgpt_register_otp_wait_seconds",
     "chatgpt_register_otp_resend_wait_seconds",
     "chatgpt_register_otp_account_budget_seconds",

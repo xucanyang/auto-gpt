@@ -61,6 +61,7 @@ class ChatGPTClient:
 
         apply_browser_fingerprint(self.session, self.fingerprint)
         self.last_registration_state = FlowState()
+        self.last_registration_route_event = None
         self.last_homepage_probe = {
             "ok": False,
             "status_code": 0,
@@ -223,6 +224,14 @@ class ChatGPTClient:
             or "email-otp" in target
         )
 
+    def _state_is_existing_account_login_route(self, state: FlowState):
+        target = f"{state.continue_url} {state.current_url}".lower()
+        return (
+            state.page_type in {"login_password", "log_in_password"}
+            or "log-in/password" in target
+            or "login/password" in target
+        )
+
     def _state_is_about_you(self, state: FlowState):
         target = f"{state.continue_url} {state.current_url}".lower()
         return state.page_type == "about_you" or "about-you" in target
@@ -235,6 +244,36 @@ class ChatGPTClient:
         if state.continue_url and state.continue_url != state.current_url:
             return True
         return False
+
+    def _remember_existing_account_login_route(
+        self,
+        email,
+        state: FlowState,
+        *,
+        reason: str,
+        stage: str = "register_complete_flow",
+        allow_existing_account_login_route: bool = True,
+    ):
+        event = {
+            "email": str(email or "").strip(),
+            "stage": stage,
+            "reason": str(reason or "").strip(),
+            "state": describe_flow_state(state),
+            "page_type": str(state.page_type or ""),
+            "current_url": str(state.current_url or ""),
+            "continue_url": str(state.continue_url or ""),
+            "enabled": bool(allow_existing_account_login_route),
+            "routed": bool(allow_existing_account_login_route),
+            "blocked": not bool(allow_existing_account_login_route),
+            "action": "login_recovery" if allow_existing_account_login_route else "skip_save",
+        }
+        self.last_registration_route_event = event
+        self._log(
+            "[已有账号] 注册状态机检测到邮箱已进入登录恢复路径: "
+            f"email={event['email'] or '-'} reason={event['reason']} "
+            f"state={event['state']}"
+        )
+        return event
 
     def _follow_flow_state(self, state: FlowState, referer=None):
         """跟随服务端返回的 continue_url，推进注册状态机。"""
@@ -959,6 +998,7 @@ class ChatGPTClient:
         otp_wait_timeout=120,
         otp_resend_wait_timeout=90,
         otp_account_budget_timeout=None,
+        allow_existing_account_login_route=True,
     ):
         """
         完整的注册流程（基于原版 run_register 方法）
@@ -980,8 +1020,11 @@ class ChatGPTClient:
             "注册状态机参数: "
             f"stop_before_about_you_submission={'on' if stop_before_about_you_submission else 'off'}, "
             f"otp_wait_timeout={otp_wait_timeout}s, otp_resend_wait_timeout={otp_resend_wait_timeout}s, "
-            f"otp_account_budget_timeout={otp_account_budget_timeout if otp_account_budget_timeout is not None else 'off'}"
+            f"otp_account_budget_timeout={otp_account_budget_timeout if otp_account_budget_timeout is not None else 'off'}, "
+            f"existing_account_login_route={'on' if allow_existing_account_login_route else 'off'}"
         )
+
+        self.last_registration_route_event = None
 
         try:
             otp_wait_timeout = max(30, int(otp_wait_timeout or 120))
@@ -1079,8 +1122,29 @@ class ChatGPTClient:
             if seen_states[signature] > 2:
                 return False, f"注册状态卡住: {describe_flow_state(state)}"
 
+            if self._state_is_existing_account_login_route(state):
+                event = self._remember_existing_account_login_route(
+                    email,
+                    state,
+                    reason="login_password",
+                    allow_existing_account_login_route=allow_existing_account_login_route,
+                )
+                return False, f"user_already_exists: existing_account_login_route:{event.get('reason') or 'login_password'}"
+
             if self._is_registration_complete_state(state):
                 self.last_registration_state = state
+                if (not register_submitted) and (not account_created):
+                    event = self._remember_existing_account_login_route(
+                        email,
+                        state,
+                        reason=(
+                            "registration_completed_without_create_account_after_otp"
+                            if otp_verified
+                            else "registration_completed_without_create_account"
+                        ),
+                        allow_existing_account_login_route=allow_existing_account_login_route,
+                    )
+                    return False, f"user_already_exists: existing_account_login_route:{event.get('reason') or 'completed_without_create_account'}"
                 self._log("✅ 注册流程完成")
                 return True, "注册成功"
 

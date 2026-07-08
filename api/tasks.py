@@ -52,6 +52,12 @@ from services.chatgpt_core.task_logging import (
     sanitize_phone_result,
     sanitize_task_detail,
 )
+from services.chatgpt_core.registration_route_policy import (
+    LOGIN_ROUTE_EVENT_KEY,
+    LOGIN_ROUTE_TASK_META_KEY,
+    build_existing_account_login_route_event,
+    parse_bool as parse_route_bool,
+)
 import time, json, asyncio, threading, logging, re, random
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
@@ -501,6 +507,69 @@ def _create_task_record(
     )
 
 
+def _bool_config_default_true(value: Any) -> bool:
+    return parse_route_bool(value, default=True)
+
+
+def _coerce_existing_account_login_route_event(
+    value: Any,
+    *,
+    fallback_email: str = "",
+    default_blocked: bool = False,
+) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    routed = bool(value.get("routed"))
+    blocked = bool(value.get("blocked")) or bool(default_blocked)
+    enabled = parse_route_bool(value.get("enabled"), default=not blocked)
+    event = build_existing_account_login_route_event(
+        email=str(value.get("email") or fallback_email or "").strip(),
+        reason=value.get("reason") or value.get("message") or "",
+        stage=str(value.get("stage") or "register_complete_flow"),
+        enabled=enabled,
+        routed=routed,
+        blocked=blocked,
+        action=str(value.get("action") or ("skip_save" if blocked else "login_recovery" if routed else "")),
+        source=str(value.get("source") or "registration"),
+        base_event=value,
+    )
+    if fallback_email and not event.get("email"):
+        event["email"] = str(fallback_email).strip()
+    return event
+
+
+def _record_existing_account_login_route(task_id: str, event: dict[str, Any]) -> None:
+    route_event = _coerce_existing_account_login_route_event(event)
+    if not route_event:
+        return
+    try:
+        latest_meta = dict(_task_store.snapshot(task_id).get("meta") or {})
+        route_items = latest_meta.get(LOGIN_ROUTE_TASK_META_KEY)
+        if not isinstance(route_items, list):
+            route_items = []
+        email_key = str(route_event.get("email") or "").strip().lower()
+        action_key = str(route_event.get("action") or "").strip().lower()
+        reason_key = str(route_event.get("reason") or "").strip()[:120]
+        duplicate_index = -1
+        for idx, item in enumerate(route_items):
+            if not isinstance(item, dict):
+                continue
+            if (
+                str(item.get("email") or "").strip().lower() == email_key
+                and str(item.get("action") or "").strip().lower() == action_key
+                and str(item.get("reason") or "").strip()[:120] == reason_key
+            ):
+                duplicate_index = idx
+                break
+        if duplicate_index >= 0:
+            route_items[duplicate_index] = {**dict(route_items[duplicate_index]), **route_event}
+        else:
+            route_items.append(route_event)
+        _task_store.update_meta(task_id, {LOGIN_ROUTE_TASK_META_KEY: route_items[-500:]})
+    except Exception as exc:
+        _log(task_id, f"[WARN] 已注册邮箱路由记录写入任务快照失败: {exc}")
+
+
 def _create_standalone_task_record(
     task_id: str,
     *,
@@ -575,10 +644,13 @@ def enqueue_register_task(
                 "requested_delay_max_seconds": float(prepared.register_delay_max_seconds or 0),
                 "source": source,
                 "meta": dict(initial_meta or {}),
-                "extra_flags": {
-                    "mail_provider": str(prepared_extra.get("mail_provider") or ""),
-                    "existing_account_capture": _is_truthy(prepared_extra.get("chatgpt_existing_account_capture")),
-                    "capture_free_workspace": _is_truthy(prepared_extra.get("chatgpt_capture_free_workspace")),
+                    "extra_flags": {
+                        "mail_provider": str(prepared_extra.get("mail_provider") or ""),
+                        "existing_account_capture": _is_truthy(prepared_extra.get("chatgpt_existing_account_capture")),
+                        "existing_account_login_route_enabled": _bool_config_default_true(
+                            prepared_extra.get("chatgpt_existing_account_login_route_enabled")
+                        ),
+                        "capture_free_workspace": _is_truthy(prepared_extra.get("chatgpt_capture_free_workspace")),
                     "capture_business_workspace": _is_truthy(prepared_extra.get("chatgpt_capture_business_workspace")),
                     "enable_team_invite": _is_truthy(prepared_extra.get("chatgpt_enable_team_invite")),
                     "deferred_activation": _is_truthy(prepared_extra.get("chatgpt_team_invite_deferred_activation")),
@@ -11928,6 +12000,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                             "chatgpt_capture_free_workspace",
                             "chatgpt_capture_business_workspace",
                             "chatgpt_existing_account_capture",
+                            "chatgpt_existing_account_login_route_enabled",
                             "chatgpt_k12_enabled",
                             "chatgpt_k12_workspace_ids",
                             "chatgpt_k12_save_all_spaces",
@@ -11979,6 +12052,23 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                     account.extra = account_extra
                 if req.platform == "chatgpt" and isinstance(account.extra, dict):
                     account.extra["chatgpt_capabilities"] = classify_chatgpt_capabilities(account)
+                existing_account_route_event = {}
+                if req.platform == "chatgpt" and isinstance(account_extra, dict):
+                    existing_account_route_event = _coerce_existing_account_login_route_event(
+                        account_extra.get(LOGIN_ROUTE_EVENT_KEY),
+                        fallback_email=str(account.email or current_email or ""),
+                    )
+                    if existing_account_route_event:
+                        _record_existing_account_login_route(task_id, existing_account_route_event)
+                        action_label = (
+                            "已跳过"
+                            if existing_account_route_event.get("blocked")
+                            else "已路由到登录恢复"
+                        )
+                        _log(
+                            task_id,
+                            f"[已有账号] {action_label}: {existing_account_route_event.get('email') or account.email or '-'}",
+                        )
                 skip_save_account = req.platform == "chatgpt" and _is_truthy(account_extra.get("chatgpt_skip_save_account"))
                 checkout_amount_seen = "chatgpt_checkout_amount_is_zero" in account_extra
                 checkout_amount_is_zero = bool(account_extra.get("chatgpt_checkout_amount_is_zero"))
@@ -12037,6 +12127,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                                 "chatgpt_checkout_currency": currency_text,
                                 "chatgpt_checkout_amount_is_zero": checkout_amount_is_zero,
                                 "chatgpt_checkout_url": checkout_url,
+                                "existing_account_login_route": existing_account_route_event,
                                 "chatgpt_zero_amount_stop_enabled": chatgpt_zero_amount_stop_enabled,
                                 "chatgpt_zero_amount_stop_threshold": chatgpt_zero_amount_stop_threshold,
                                 "chatgpt_zero_amount_stop_triggered": should_stop_after_current_account,
@@ -12238,6 +12329,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                                 "attempt_outcome": "invite_saved_pending_activation",
                                 "email": account.email,
                                 "pending_invite_id": int(pending_invite.id or 0),
+                                "existing_account_login_route": existing_account_route_event,
                                 "chatgpt_zero_amount_stop_enabled": chatgpt_zero_amount_stop_enabled,
                                 "chatgpt_zero_amount_stop_threshold": chatgpt_zero_amount_stop_threshold,
                                 "chatgpt_zero_amount_stop_triggered": should_stop_after_current_account,
@@ -12266,6 +12358,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                         {
                             "attempt_outcome": "success",
                             "email": account.email,
+                            "existing_account_login_route": existing_account_route_event,
                             "chatgpt_zero_amount_stop_enabled": chatgpt_zero_amount_stop_enabled,
                             "chatgpt_zero_amount_stop_threshold": chatgpt_zero_amount_stop_threshold,
                             "chatgpt_zero_amount_stop_triggered": should_stop_after_current_account,
@@ -12275,6 +12368,19 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                 )
                 return AttemptResult.success()
             except SkipCurrentAttemptRequested as e:
+                route_event = _coerce_existing_account_login_route_event(
+                    getattr(e, "route_event", None),
+                    fallback_email=str(getattr(e, "email", "") or current_email or ""),
+                    default_blocked=bool(getattr(e, "route_event", None)),
+                )
+                if route_event:
+                    current_email = str(route_event.get("email") or current_email or "").strip()
+                    _record_existing_account_login_route(task_id, route_event)
+                    _log(
+                        task_id,
+                        f"[已有账号] 已按配置跳过且不保存: {current_email or '-'} reason={route_event.get('reason') or e}",
+                        "warning",
+                    )
                 _log(task_id, f"[SKIP] 已跳过当前账号: {e}")
                 _save_task_log(
                     req.platform,
@@ -12284,8 +12390,9 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                     detail=_build_task_log_detail(
                         task_id,
                         {
-                            "attempt_outcome": "skipped",
+                            "attempt_outcome": "existing_account_login_route_blocked" if route_event else "skipped",
                             "email": current_email,
+                            "existing_account_login_route": route_event,
                         },
                     ),
                 )

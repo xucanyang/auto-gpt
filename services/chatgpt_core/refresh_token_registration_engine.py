@@ -23,6 +23,11 @@ from .chatgpt_client import ChatGPTClient
 from .oauth import OAuthManager
 from .oauth_client import OAuthClient
 from .otp_budget import RegistrationOtpBudget
+from .registration_route_policy import (
+    ExistingAccountLoginRouteBlocked,
+    build_existing_account_login_route_event,
+    existing_account_login_route_enabled,
+)
 from .task_logging import classify_task_log_level
 from .utils import (
     decode_jwt_payload,
@@ -708,6 +713,9 @@ class RefreshTokenRegistrationEngine:
 
     def _is_existing_account_capture_enabled(self) -> bool:
         return self._read_bool_config("chatgpt_existing_account_capture", default=False)
+
+    def _is_existing_account_login_route_enabled(self) -> bool:
+        return existing_account_login_route_enabled(self.extra_config)
 
     def _should_capture_gopay_provider_link(self) -> bool:
         for key in (
@@ -1827,10 +1835,12 @@ class RefreshTokenRegistrationEngine:
         try:
             registration_message = ""
             source = "register"
+            existing_account_login_route_event: Optional[dict[str, Any]] = None
 
             self._log("[主链路] 开始 ChatGPT RT 主链路")
 
             existing_account_capture = self._is_existing_account_capture_enabled()
+            existing_account_login_route_allowed = self._is_existing_account_login_route_enabled()
             if existing_account_capture and not fixed_email:
                 result.error_message = "已有账号抓 auth 模式必须填写邮箱地址"
                 self._finalize_email_service_failure(result)
@@ -1840,6 +1850,11 @@ class RefreshTokenRegistrationEngine:
 
             self._log_stage("登录阶段" if existing_account_capture else "注册阶段")
             self._log("[登录] 开始准备已有账号登录" if existing_account_capture else "[注册] 开始预热首页并创建邮箱")
+            if not existing_account_capture:
+                self._log(
+                    "[已有账号] 注册阶段遇到已注册邮箱时"
+                    f"{'允许路由到登录恢复' if existing_account_login_route_allowed else '禁止路由到登录恢复，将跳过且不保存'}"
+                )
             if not existing_account_capture:
                 homepage_ok, homepage_error = self._probe_homepage_before_email_creation()
                 self._report_homepage_probe(homepage_ok, homepage_error)
@@ -1972,6 +1987,7 @@ class RefreshTokenRegistrationEngine:
                 otp_wait_timeout=register_otp_wait_seconds,
                 otp_resend_wait_timeout=register_otp_resend_wait_seconds,
                 otp_account_budget_timeout=register_otp_account_budget_seconds,
+                allow_existing_account_login_route=existing_account_login_route_allowed,
             )
 
             if not registered:
@@ -1981,8 +1997,38 @@ class RefreshTokenRegistrationEngine:
                     self._finalize_email_service_failure(result, fallback_error=last_error)
                     return result
 
+                existing_account_login_route_event = build_existing_account_login_route_event(
+                    email=result.email,
+                    reason=registration_message,
+                    stage="register_complete_flow",
+                    enabled=existing_account_login_route_allowed,
+                    routed=existing_account_login_route_allowed,
+                    blocked=not existing_account_login_route_allowed,
+                    action="login_recovery" if existing_account_login_route_allowed else "skip_save",
+                    source="refresh_token_registration",
+                    base_event=getattr(register_client, "last_registration_route_event", None),
+                )
+                if not existing_account_login_route_allowed:
+                    last_error = "注册阶段检测到该邮箱已存在，已按配置禁止路由到登录，账号未保存"
+                    result.error_message = last_error
+                    result.metadata = dict(result.metadata or {})
+                    result.metadata["chatgpt_existing_account_login_route"] = existing_account_login_route_event
+                    self._log(
+                        f"[已有账号] 已跳过并禁止保存: {result.email or '-'} reason={registration_message}",
+                        "warning",
+                    )
+                    self._finalize_email_service_failure(result, fallback_error=last_error)
+                    raise ExistingAccountLoginRouteBlocked(
+                        result.email,
+                        registration_message,
+                        existing_account_login_route_event,
+                    )
+
                 source = "login"
-                self._log("[主链路] 注册阶段命中可恢复终态，切换到登录恢复链路", "warning")
+                self._log(
+                    f"[主链路] 注册阶段命中已注册邮箱，切换到登录恢复链路: {result.email or '-'}",
+                    "warning",
+                )
             else:
                 self._log("[注册] 注册阶段已完成")
 
@@ -2214,6 +2260,10 @@ class RefreshTokenRegistrationEngine:
                             source=source,
                             register_client=register_client,
                         )
+                        if existing_account_login_route_event:
+                            result.metadata = dict(result.metadata or {})
+                            result.metadata["chatgpt_existing_account_login_route"] = existing_account_login_route_event
+                            result.metadata["existing_account_login_routed"] = True
                         if not result.success:
                             self._log(result.error_message or "business recovery 未获取到 refresh_token", "warning")
                             self._apply_phone_challenge_metadata(result)
@@ -2253,6 +2303,10 @@ class RefreshTokenRegistrationEngine:
                 source=source,
                 register_client=register_client,
             )
+            if existing_account_login_route_event:
+                result.metadata = dict(result.metadata or {})
+                result.metadata["chatgpt_existing_account_login_route"] = existing_account_login_route_event
+                result.metadata["existing_account_login_routed"] = True
             if not result.success:
                 self._log(result.error_message or "OAuth 主链路未获取到 refresh_token", "warning")
                 self._apply_phone_challenge_metadata(result)

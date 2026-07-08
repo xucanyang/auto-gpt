@@ -235,6 +235,8 @@ class BaseChatGPTRegistrationModeAdapter(ABC):
                 "registration_stage1_saved_account_id",
                 "auth_capture_stage",
                 "auth_capture_method",
+                "chatgpt_existing_account_login_route",
+                "existing_account_login_routed",
                 "chatgpt_checkout_plan",
                 "chatgpt_checkout_url",
                 "chatgpt_checkout_country",

@@ -199,6 +199,12 @@ export default function RegisterTaskPage() {
             : cfg.chatgpt_save_registration_access_token_account === undefined
               ? true
               : parseBooleanConfigValue(cfg.chatgpt_save_registration_access_token_account),
+        chatgpt_existing_account_login_route_enabled:
+          cfg.chatgpt_existing_account_login_route_enabled === ''
+            ? true
+            : cfg.chatgpt_existing_account_login_route_enabled === undefined
+              ? true
+              : parseBooleanConfigValue(cfg.chatgpt_existing_account_login_route_enabled),
         chatgpt_register_otp_wait_seconds: cfg.chatgpt_register_otp_wait_seconds || 120,
         chatgpt_register_otp_resend_wait_seconds: cfg.chatgpt_register_otp_resend_wait_seconds || 90,
         chatgpt_register_otp_account_budget_seconds: cfg.chatgpt_register_otp_account_budget_seconds || 210,
@@ -343,6 +349,12 @@ export default function RegisterTaskPage() {
           ? (values.chatgpt_save_registration_access_token_account === undefined
             ? true
             : Boolean(values.chatgpt_save_registration_access_token_account))
+          : undefined,
+      chatgpt_existing_account_login_route_enabled:
+        platform === 'chatgpt'
+          ? (values.chatgpt_existing_account_login_route_enabled === undefined
+            ? true
+            : Boolean(values.chatgpt_existing_account_login_route_enabled))
           : undefined,
       chatgpt_register_otp_wait_seconds:
         platform === 'chatgpt' ? values.chatgpt_register_otp_wait_seconds : undefined,
@@ -630,6 +642,12 @@ export default function RegisterTaskPage() {
 
   useEffect(() => () => stopPolling(), [])
 
+  const existingAccountLoginRoutes = Array.isArray(task?.meta?.existing_account_login_routes)
+    ? task.meta.existing_account_login_routes.filter((item: any) => item && typeof item === 'object')
+    : []
+  const existingAccountRoutedCount = existingAccountLoginRoutes.filter((item: any) => Boolean(item?.routed) && !item?.blocked).length
+  const existingAccountBlockedCount = existingAccountLoginRoutes.filter((item: any) => Boolean(item?.blocked)).length
+
   return (
     <div style={{ maxWidth: 800 }}>
       <div style={{ marginBottom: 24 }}>
@@ -854,6 +872,14 @@ export default function RegisterTaskPage() {
                   <Checkbox>保存注册阶段 AccessToken 账号</Checkbox>
                 </Form.Item>
               ) : null}
+              <Form.Item
+                name="chatgpt_existing_account_login_route_enabled"
+                valuePropName="checked"
+                initialValue={true}
+                extra="开启：注册状态机发现邮箱已存在或被 OpenAI 路由到登录时，继续登录恢复并保存；关闭：直接跳过该邮箱，不保存到库存，并写入任务日志。"
+              >
+                <Checkbox>遇到已注册邮箱时路由到登录</Checkbox>
+              </Form.Item>
               <>
                 <Form.Item
                   label="工作空间抓取"
@@ -1579,6 +1605,31 @@ export default function RegisterTaskPage() {
                 emptyText="任务结束后，这里会输出已完成手机号注册的手机号。"
               />
             </div>
+          ) : null}
+          {existingAccountLoginRoutes.length > 0 ? (
+            <Alert
+              style={{ marginTop: 16 }}
+              type={existingAccountBlockedCount > 0 ? 'warning' : 'info'}
+              showIcon
+              message={`已注册邮箱处理：登录恢复 ${existingAccountRoutedCount} 个，跳过 ${existingAccountBlockedCount} 个`}
+              description={
+                <Space direction="vertical" size={4} style={{ width: '100%' }}>
+                  {existingAccountLoginRoutes.slice(-8).map((item: any, index: number) => (
+                    <div key={`${item?.email || index}-${item?.detected_at || index}`}>
+                      <Tag color={item?.blocked ? 'orange' : 'blue'}>
+                        {item?.blocked ? '已跳过' : '已路由'}
+                      </Tag>
+                      <span>{String(item?.email || '-')}</span>
+                      {item?.reason ? (
+                        <Text type="secondary" style={{ marginLeft: 8 }}>
+                          {String(item.reason).slice(0, 120)}
+                        </Text>
+                      ) : null}
+                    </div>
+                  ))}
+                </Space>
+              }
+            />
           ) : null}
           {task.id ? (
             <div style={{ marginTop: 16 }}>

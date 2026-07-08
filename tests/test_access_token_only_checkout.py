@@ -6,6 +6,7 @@ from services.chatgpt_core.access_token_only_registration_engine import (
     EmailServiceAdapter,
 )
 from services.chatgpt_core.payment import CheckoutRequestError
+from services.chatgpt_core.registration_route_policy import ExistingAccountLoginRouteBlocked
 
 
 class AccessTokenOnlyCheckoutTests(unittest.TestCase):
@@ -33,6 +34,16 @@ class AccessTokenOnlyCheckoutTests(unittest.TestCase):
         def register_complete_flow(self, *args, **kwargs):
             type(self).last_register_kwargs = dict(kwargs)
             return True, "ok"
+
+    class _ExistingRouteChatGPTClient(_TrackingChatGPTClient):
+        def register_complete_flow(self, *args, **kwargs):
+            type(self).last_register_kwargs = dict(kwargs)
+            self.last_registration_route_event = {
+                "email": args[0] if args else "buyer@example.com",
+                "reason": "registration_completed_without_create_account_after_otp",
+                "stage": "register_complete_flow",
+            }
+            return False, "user_already_exists: existing_account_login_route"
 
     def test_v2_email_adapter_returns_none_on_mailbox_timeout_for_resend_path(self):
         email_service = mock.Mock()
@@ -80,6 +91,7 @@ class AccessTokenOnlyCheckoutTests(unittest.TestCase):
         self.assertEqual(self._TrackingChatGPTClient.last_register_kwargs["otp_wait_timeout"], 45)
         self.assertEqual(self._TrackingChatGPTClient.last_register_kwargs["otp_resend_wait_timeout"], 35)
         self.assertEqual(self._TrackingChatGPTClient.last_register_kwargs["otp_account_budget_timeout"], 80)
+        self.assertTrue(self._TrackingChatGPTClient.last_register_kwargs["allow_existing_account_login_route"])
 
     def test_v2_registration_uses_single_account_otp_defaults(self):
         email_service = mock.Mock()
@@ -107,6 +119,72 @@ class AccessTokenOnlyCheckoutTests(unittest.TestCase):
         self.assertEqual(self._TrackingChatGPTClient.last_register_kwargs["otp_wait_timeout"], 120)
         self.assertEqual(self._TrackingChatGPTClient.last_register_kwargs["otp_resend_wait_timeout"], 90)
         self.assertEqual(self._TrackingChatGPTClient.last_register_kwargs["otp_account_budget_timeout"], 210)
+        self.assertTrue(self._TrackingChatGPTClient.last_register_kwargs["allow_existing_account_login_route"])
+
+    def test_v2_registration_skips_existing_route_when_disabled(self):
+        email_service = mock.Mock()
+        email_service.create_email.return_value = {"email": "buyer@example.com"}
+        engine = AccessTokenOnlyRegistrationEngine(
+            email_service=email_service,
+            proxy_url="http://proxy.local:8080",
+            extra_config={"chatgpt_existing_account_login_route_enabled": False},
+        )
+        self._ExistingRouteChatGPTClient.last_register_kwargs = {}
+
+        with (
+            mock.patch.object(engine, "_probe_homepage_before_email_creation", return_value=(True, "")),
+            mock.patch.object(engine, "_report_homepage_probe"),
+            mock.patch(
+                "services.chatgpt_core.access_token_only_registration_engine.ChatGPTClient",
+                self._ExistingRouteChatGPTClient,
+            ),
+        ):
+            with self.assertRaises(ExistingAccountLoginRouteBlocked) as caught:
+                engine.run()
+
+        self.assertEqual(caught.exception.email, "buyer@example.com")
+        self.assertTrue(caught.exception.route_event["blocked"])
+        self.assertFalse(self._ExistingRouteChatGPTClient.last_register_kwargs["allow_existing_account_login_route"])
+
+    def test_v2_registration_routes_existing_account_to_login_when_enabled(self):
+        email_service = mock.Mock()
+        email_service.create_email.return_value = {"email": "buyer@example.com"}
+        engine = AccessTokenOnlyRegistrationEngine(
+            email_service=email_service,
+            proxy_url="http://proxy.local:8080",
+            extra_config={},
+        )
+        self._ExistingRouteChatGPTClient.last_register_kwargs = {}
+        oauth_client = mock.Mock()
+        oauth_client.login_and_get_tokens.return_value = {
+            "access_token": "at-existing",
+            "session_token": "session-existing",
+            "account_id": "acct-existing",
+            "workspace_id": "ws-existing",
+        }
+
+        with (
+            mock.patch.object(engine, "_probe_homepage_before_email_creation", return_value=(True, "")),
+            mock.patch.object(engine, "_report_homepage_probe"),
+            mock.patch.object(engine, "_probe_plus_checkout_billing", return_value={}),
+            mock.patch.object(engine, "_capture_k12_workspace_artifacts", return_value=(True, "")),
+            mock.patch(
+                "services.chatgpt_core.access_token_only_registration_engine.ChatGPTClient",
+                self._ExistingRouteChatGPTClient,
+            ),
+            mock.patch(
+                "services.chatgpt_core.oauth_client.OAuthClient",
+                return_value=oauth_client,
+            ),
+        ):
+            result = engine.run()
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.account_id, "acct-existing")
+        self.assertTrue(result.metadata["existing_account_login_routed"])
+        self.assertEqual(result.metadata["chatgpt_existing_account_login_route"]["action"], "login_recovery")
+        login_kwargs = oauth_client.login_and_get_tokens.call_args.kwargs
+        self.assertEqual(login_kwargs["login_source"], "access_token_only:existing_account_recovery")
 
     def test_already_paid_metadata_fails_registration_without_saving(self):
         email_service = mock.Mock()

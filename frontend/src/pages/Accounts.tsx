@@ -3230,6 +3230,13 @@ export default function Accounts() {
               : cfg.chatgpt_save_registration_access_token_account === undefined
                 ? true
                 : parseBooleanConfigValue(cfg.chatgpt_save_registration_access_token_account)),
+          chatgpt_existing_account_login_route_enabled:
+            savedSettings.chatgpt_existing_account_login_route_enabled
+            ?? (cfg.chatgpt_existing_account_login_route_enabled === ''
+              ? true
+              : cfg.chatgpt_existing_account_login_route_enabled === undefined
+                ? true
+                : parseBooleanConfigValue(cfg.chatgpt_existing_account_login_route_enabled)),
           chatgpt_register_otp_wait_seconds:
             savedSettings.chatgpt_register_otp_wait_seconds ?? cfg.chatgpt_register_otp_wait_seconds ?? 120,
           chatgpt_register_otp_resend_wait_seconds:
@@ -3263,6 +3270,7 @@ export default function Accounts() {
           chatgpt_capture_business_workspace: savedSettings.chatgpt_capture_business_workspace ?? false,
           chatgpt_capture_free_workspace: savedSettings.chatgpt_capture_free_workspace ?? true,
           chatgpt_save_registration_access_token_account: savedSettings.chatgpt_save_registration_access_token_account ?? true,
+          chatgpt_existing_account_login_route_enabled: savedSettings.chatgpt_existing_account_login_route_enabled ?? true,
           chatgpt_register_otp_wait_seconds: savedSettings.chatgpt_register_otp_wait_seconds ?? 120,
           chatgpt_register_otp_resend_wait_seconds: savedSettings.chatgpt_register_otp_resend_wait_seconds ?? 90,
           chatgpt_register_otp_account_budget_seconds: savedSettings.chatgpt_register_otp_account_budget_seconds ?? 210,
@@ -4803,6 +4811,10 @@ export default function Accounts() {
         values.chatgpt_save_registration_access_token_account === undefined
           ? true
           : Boolean(values.chatgpt_save_registration_access_token_account),
+      chatgpt_existing_account_login_route_enabled:
+        values.chatgpt_existing_account_login_route_enabled === undefined
+          ? true
+          : Boolean(values.chatgpt_existing_account_login_route_enabled),
       chatgpt_register_otp_wait_seconds: Number(values.chatgpt_register_otp_wait_seconds || 120) || 120,
       chatgpt_register_otp_resend_wait_seconds: Number(values.chatgpt_register_otp_resend_wait_seconds || 90) || 90,
       chatgpt_register_otp_account_budget_seconds: Number(values.chatgpt_register_otp_account_budget_seconds || 210) || 210,
@@ -4947,6 +4959,12 @@ export default function Accounts() {
               ? true
               : Boolean(values.chatgpt_save_registration_access_token_account))
             : undefined,
+        chatgpt_existing_account_login_route_enabled:
+          currentPlatform === 'chatgpt'
+            ? (values.chatgpt_existing_account_login_route_enabled === undefined
+              ? true
+              : Boolean(values.chatgpt_existing_account_login_route_enabled))
+            : undefined,
         chatgpt_register_otp_wait_seconds:
           currentPlatform === 'chatgpt' ? values.chatgpt_register_otp_wait_seconds : undefined,
         chatgpt_register_otp_resend_wait_seconds:
@@ -5002,6 +5020,10 @@ export default function Accounts() {
           values.chatgpt_save_registration_access_token_account === undefined
             ? true
             : Boolean(values.chatgpt_save_registration_access_token_account),
+        chatgpt_existing_account_login_route_enabled:
+          values.chatgpt_existing_account_login_route_enabled === undefined
+            ? true
+            : Boolean(values.chatgpt_existing_account_login_route_enabled),
         chatgpt_register_otp_wait_seconds: Number(values.chatgpt_register_otp_wait_seconds || 120) || 120,
         chatgpt_register_otp_resend_wait_seconds: Number(values.chatgpt_register_otp_resend_wait_seconds || 90) || 90,
         chatgpt_register_otp_account_budget_seconds: Number(values.chatgpt_register_otp_account_budget_seconds || 210) || 210,

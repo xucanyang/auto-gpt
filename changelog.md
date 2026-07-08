@@ -7,6 +7,18 @@
 ## [Unreleased] (未发布)
 
 
+## [1.3.36] - 2026-07-08
+### 新增 (Added)
+- **注册面板新增“遇到已注册邮箱时路由到登录”开关**：`frontend/src/features/auth/components/RegisterTaskModal.tsx` 与 `frontend/src/pages/RegisterTaskPage.tsx` 在 ChatGPT 注册配置区新增独立开关 `chatgpt_existing_account_login_route_enabled`，默认开启以兼容旧任务；关闭后，注册状态机发现邮箱已存在或被 OpenAI 推入登录路径时，会直接跳过当前邮箱、不保存到库存，避免 HME/邮箱池中的历史 OpenAI 账号混入“新注册”库存。
+- **任务结果记录已注册邮箱处理明细**：`api/tasks.py` 新增 `existing_account_login_routes` 任务 meta 记录，成功路由到登录恢复和被策略跳过的邮箱都会写入任务日志与任务快照；注册弹窗和独立注册页会显示“已路由 / 已跳过”的邮箱、数量和触发原因，便于回放排查。
+
+### 优化 (Changed)
+- **注册状态机显式识别“未创建账号却完成回调”的登录恢复路径**：`services/chatgpt_core/chatgpt_client.py` 在 `register_complete_flow()` 中记录 `last_registration_route_event`，当邮箱 OTP 后未经过密码注册/资料创建却直接回到 ChatGPT，或进入 `log-in/password` 时，不再把它当作干净新注册成功，而是返回 `user_already_exists` 标记交给上层策略处理。
+- **RT 与无 RT 注册链路统一已有账号策略**：`services/chatgpt_core/refresh_token_registration_engine.py` 和 `services/chatgpt_core/access_token_only_registration_engine.py` 统一读取新增开关；开启时继续走现有登录恢复并保存，关闭时抛出可识别的跳过中断，任务统计计入“跳过”而不是误报注册成功。
+
+### 测试 (Tests)
+- **补充已有账号路由策略回归测试**：`tests/test_chatgpt_register.py` 覆盖 RT 注册遇 `user_already_exists` 时默认登录恢复、关闭开关时跳过不调用 OAuth，以及邮箱 OTP 后未创建账号直接 callback 的识别；`tests/test_access_token_only_checkout.py` 覆盖无 RT 注册传递开关、关闭后跳过、开启后通过 OAuth 登录恢复并记录 metadata。前端侧边栏版本号同步更新为 `v1.3.36`。
+
 ## [1.3.35] - 2026-07-08
 ### 新增 (Added)
 - **Idea 批量提交窗口新增“查询全部剩余”按钮**：`frontend/src/pages/Accounts.tsx` 在账号页 “idea批量提交” 弹窗的卡密来源区域新增主动刷新动作，先读取 `/api/baxigpt-cdk-pool` 的全部 CDK，再分批调用 `/api/baxigpt-cdk-pool/quota` 执行 `code-info/query` 校验并回写本地库存；完成后自动刷新可用卡密列表、库存摘要和剩余额度展示，解决原“刷新库存”只读取本地缓存、不能实时查询所有 CDK 剩余次数的问题。
@@ -881,4 +893,8 @@
 
 ## 2026-07-08 13:38:04 +0800
 - 增强 Idea 提交 CDK 剩余额度刷新与目标成功数量
+- 发布模式: multi
+
+## 2026-07-08 18:18:15 +0800
+- 注册面板增加已注册邮箱登录路由控制与记录
 - 发布模式: multi

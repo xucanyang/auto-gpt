@@ -18,6 +18,7 @@ from services.chatgpt_core.refresh_token_registration_engine import (
     RefreshTokenRegistrationEngine,
     RegistrationResult,
 )
+from services.chatgpt_core.registration_route_policy import ExistingAccountLoginRouteBlocked
 from services.chatgpt_core.utils import FlowState
 from core.task_runtime import SkipCurrentAttemptRequested
 from services.chatgpt_core.chatgpt_client import ChatGPTClient
@@ -757,8 +758,54 @@ class RefreshTokenRegistrationEngineTests(unittest.TestCase):
         self.assertTrue(result.success)
         self.assertEqual(result.source, "login")
         self.assertEqual(result.account_id, "acct-existing")
+        self.assertTrue(result.metadata["existing_account_login_routed"])
+        self.assertEqual(
+            result.metadata["chatgpt_existing_account_login_route"]["action"],
+            "login_recovery",
+        )
         login_kwargs = oauth_client.login_and_get_tokens.call_args.kwargs
         self.assertEqual(login_kwargs["login_source"], "existing_account_recovery")
+        register_kwargs = register_client.register_complete_flow.call_args.kwargs
+        self.assertTrue(register_kwargs["allow_existing_account_login_route"])
+
+    @mock.patch("services.chatgpt_core.refresh_token_registration_engine.OAuthManager")
+    @mock.patch("services.chatgpt_core.refresh_token_registration_engine.OAuthClient")
+    @mock.patch("services.chatgpt_core.refresh_token_registration_engine.ChatGPTClient")
+    def test_run_skips_existing_account_when_login_route_disabled(
+        self,
+        mock_chatgpt_client_cls,
+        mock_oauth_client_cls,
+        mock_oauth_manager_cls,
+    ):
+        register_client = mock.Mock()
+        register_client.device_id = "device-fixed"
+        register_client.ua = "UA"
+        register_client.sec_ch_ua = '"Chromium";v="136"'
+        register_client.impersonate = "chrome136"
+        register_client.register_complete_flow.return_value = (
+            False,
+            "创建账号失败: HTTP 400: user_already_exists",
+        )
+        register_client.last_registration_route_event = {
+            "email": "user@example.com",
+            "reason": "user_already_exists",
+            "stage": "register_complete_flow",
+        }
+        mock_chatgpt_client_cls.return_value = register_client
+
+        engine = self._make_engine(
+            extra_config={"chatgpt_existing_account_login_route_enabled": False}
+        )
+
+        with self.assertRaises(ExistingAccountLoginRouteBlocked) as caught:
+            engine.run()
+
+        self.assertEqual(caught.exception.email, "user@example.com")
+        self.assertTrue(caught.exception.route_event["blocked"])
+        mock_oauth_client_cls.assert_not_called()
+        mock_oauth_manager_cls.assert_not_called()
+        register_kwargs = register_client.register_complete_flow.call_args.kwargs
+        self.assertFalse(register_kwargs["allow_existing_account_login_route"])
 
     @mock.patch("services.chatgpt_core.refresh_token_registration_engine.OAuthManager")
     @mock.patch("services.chatgpt_core.refresh_token_registration_engine.OAuthClient")
@@ -959,7 +1006,7 @@ class ChatGPTClientRegistrationOtpTests(unittest.TestCase):
         )
         return client
 
-    def test_direct_email_verification_uses_existing_auto_sent_code_before_resend(self):
+    def test_direct_email_verification_detects_existing_route_before_resend(self):
         client = self._make_client_at_email_verification()
         mailbox = mock.Mock()
         mailbox.wait_for_verification_code.return_value = "123456"
@@ -975,12 +1022,17 @@ class ChatGPTClientRegistrationOtpTests(unittest.TestCase):
             otp_resend_wait_timeout=30,
         )
 
-        self.assertTrue(success, message)
+        self.assertFalse(success)
+        self.assertIn("user_already_exists", message)
+        self.assertEqual(
+            client.last_registration_route_event["reason"],
+            "registration_completed_without_create_account_after_otp",
+        )
         client.send_email_otp.assert_not_called()
         client.verify_email_otp.assert_called_once_with("123456", return_state=True)
         self.assertEqual(mailbox.wait_for_verification_code.call_count, 1)
 
-    def test_direct_email_verification_only_sends_when_first_wait_times_out(self):
+    def test_direct_email_verification_only_sends_when_first_wait_times_out_then_detects_existing_route(self):
         client = self._make_client_at_email_verification()
         mailbox = mock.Mock()
         mailbox.wait_for_verification_code.side_effect = [None, "654321"]
@@ -996,7 +1048,8 @@ class ChatGPTClientRegistrationOtpTests(unittest.TestCase):
             otp_resend_wait_timeout=30,
         )
 
-        self.assertTrue(success, message)
+        self.assertFalse(success)
+        self.assertIn("user_already_exists", message)
         client.send_email_otp.assert_called_once_with(
             referer="https://auth.openai.com/email-verification"
         )
