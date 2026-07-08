@@ -212,6 +212,7 @@ class BaxiGptCdkSubmitTaskRequest(BaseModel):
     auto_poll_status: bool = True
     status_poll_interval_seconds: int = 5
     status_poll_timeout_seconds: int = IDEA_SUBMIT_DEFAULT_POLL_WARNING_SECONDS
+    target_success_count: int = 0
     limit: int = 0
 
 
@@ -3905,6 +3906,7 @@ def enqueue_baxigpt_cdk_submit_task(
 
     account_items, missing_ids, skipped_accounts, matched_accounts = _resolve_baxigpt_cdk_submit_accounts(req)
     total_requested_accounts = len(_normalize_batch_account_ids(req.account_ids)) if req.account_ids else len(matched_accounts)
+    requested_target_success_count = max(int(req.target_success_count or 0), 0)
     repo = BaxiGptCdkRepository()
     import_summary: dict[str, Any] = {"added": 0, "updated": 0, "skipped": 0, "errors": [], "items": []}
     code_records = []
@@ -3978,6 +3980,7 @@ def enqueue_baxigpt_cdk_submit_task(
         skipped_accounts.append({**item, "reason": "可用卡密额度不足，本轮未提交"})
 
     pair_count = len(pairs)
+    effective_target_success_count = min(requested_target_success_count, pair_count) if requested_target_success_count > 0 else 0
 
     if pair_count <= 0:
         return {
@@ -3989,6 +3992,8 @@ def enqueue_baxigpt_cdk_submit_task(
             "selected_cdk_ids": [int(code.id) for code in code_records] if code_source == "pool_selected" else [],
             "pairs": [],
             "pair_count": 0,
+            "target_success_count": requested_target_success_count,
+            "effective_target_success_count": 0,
             "spare_codes": len(spare_codes),
             "skipped_accounts": skipped_accounts,
             "missing_ids": missing_ids,
@@ -4015,6 +4020,8 @@ def enqueue_baxigpt_cdk_submit_task(
         "available_codes": len(code_records),
         "selected_cdk_ids": [int(code.id) for code in code_records] if code_source == "pool_selected" else [],
         "pair_count": len(pairs),
+        "target_success_count": requested_target_success_count,
+        "effective_target_success_count": effective_target_success_count,
         "pairs": list(pairs),
         "spare_codes": len(spare_codes),
         "code_source": code_source,
@@ -4031,6 +4038,8 @@ def enqueue_baxigpt_cdk_submit_task(
             "auto_poll_status": bool(req.auto_poll_status),
             "status_poll_interval_seconds": status_poll_interval_seconds,
             "status_poll_timeout_seconds": status_poll_timeout_seconds,
+            "target_success_count": effective_target_success_count,
+            "requested_target_success_count": requested_target_success_count,
             "use_pool": bool(req.use_pool),
             "cdk_ids": [int(code.id) for code in code_records] if code_source == "pool_selected" else [],
         },
@@ -4040,7 +4049,7 @@ def enqueue_baxigpt_cdk_submit_task(
         task_id,
         platform="chatgpt",
         source=source,
-        total=max(len(pairs), 1),
+        total=max(effective_target_success_count or len(pairs), 1),
         meta=meta,
     )
 
@@ -4078,6 +4087,8 @@ def enqueue_baxigpt_cdk_submit_task(
         "available_codes": len(code_records),
         "selected_cdk_ids": [int(code.id) for code in code_records] if code_source == "pool_selected" else [],
         "pair_count": len(pairs),
+        "target_success_count": requested_target_success_count,
+        "effective_target_success_count": effective_target_success_count,
         "spare_codes": len(spare_codes),
         "skipped_accounts": skipped_accounts,
         "missing_ids": missing_ids,
@@ -6630,6 +6641,7 @@ def _build_idea_submit_runtime_summary(
     skipped_accounts: list[dict[str, Any]],
     runtime_results: list[dict[str, Any]],
     submitted_count: int = 0,
+    target_success_count: int = 0,
     errors: list[str] | None = None,
 ) -> dict[str, Any]:
     """Build an operator-facing Idea submit summary with stable account groups.
@@ -6718,6 +6730,7 @@ def _build_idea_submit_runtime_summary(
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "total_accounts": total_accounts,
         "pair_count": len(pairs or []),
+        "target_success_count": int(target_success_count or 0),
         "submitted": int(submitted_count or 0),
         "paid": paid_total,
         "failed": failed_total,
@@ -6774,7 +6787,9 @@ def _run_baxigpt_cdk_submit(task_id: str, pairs: list[dict[str, Any]], settings:
     control = _task_store.control_for(task_id)
     repo = BaxiGptCdkRepository()
     client = BaxiGptClient()
-    total = max(len(pairs), 1)
+    requested_target_success_count = max(int(settings.get("target_success_count") or 0), 0)
+    target_success_count = min(requested_target_success_count, len(pairs)) if requested_target_success_count > 0 else 0
+    total = max(target_success_count or len(pairs), 1)
     submitted_count = 0
     success_count = 0
     timeout_count = 0
@@ -6807,6 +6822,7 @@ def _run_baxigpt_cdk_submit(task_id: str, pairs: list[dict[str, Any]], settings:
             skipped_accounts=skipped_accounts,
             runtime_results=runtime_results,
             submitted_count=submitted_count,
+            target_success_count=target_success_count,
             errors=errors,
         )
         _task_store.update_meta(
@@ -6933,6 +6949,7 @@ def _run_baxigpt_cdk_submit(task_id: str, pairs: list[dict[str, Any]], settings:
             f"pairs={len(pairs)} precheck={precheck} failure_continue={failure_continue} "
             f"submit_interval={submit_interval_seconds}s auto_poll={auto_poll_status} "
             f"poll_interval={status_poll_interval_seconds}s poll_warn={status_poll_timeout_seconds}s "
+            f"target_success={target_success_count or 'all'} "
             f"code_source={meta.get('code_source') or '-'}"
         )
         for missing_id in missing_ids:
@@ -6992,20 +7009,53 @@ def _run_baxigpt_cdk_submit(task_id: str, pairs: list[dict[str, Any]], settings:
         # 3. 逐一提交与处理结果轮询 (完全模拟单账号提交与动态查额度)
         active_orders: list[dict[str, Any]] = []
         attempt_id = control.start_attempt()
+        def target_reached() -> bool:
+            return target_success_count > 0 and success_count >= target_success_count
+
+        def submit_window_full() -> bool:
+            if target_success_count <= 0:
+                return False
+            remaining_needed = max(target_success_count - success_count, 0)
+            return len(active_orders) >= remaining_needed
+
         try:
             while pending_accounts or active_orders:
                 control.checkpoint(attempt_id=attempt_id)
+
+                if target_reached():
+                    if pending_accounts:
+                        reason = f"已达到本次目标成功数量 {target_success_count}，停止继续提交新账号"
+                        for pa in pending_accounts:
+                            skipped_count += 1
+                            _log(task_id, f"[UNSUBMITTED] 未提交账号: {pa.get('email')} - {reason}")
+                            append_result(
+                                account_id=pa["account_id"],
+                                email=pa.get("email"),
+                                cdk_id=pa.get("last_cdk_id"),
+                                code_masked=pa.get("last_code_masked"),
+                                status="unsubmitted",
+                                reason=reason,
+                            )
+                        pending_accounts.clear()
+                    if not active_orders:
+                        break
                 
                 # 1. 逐一提交 (完全模拟单账号提交与动态查额度)
-                if pending_accounts:
+                if pending_accounts and not target_reached():
                     last_pending_count = -1
                     # 在进入轮询前，尽可能把本轮能提交的全部提交完
-                    while pending_accounts and len(pending_accounts) != last_pending_count:
+                    while pending_accounts and len(pending_accounts) != last_pending_count and not target_reached() and not submit_window_full():
                         last_pending_count = len(pending_accounts)
                         unassignable_accounts = []
+                        deferred_for_target_window = False
                         
                         while pending_accounts:
                             control.checkpoint(attempt_id=attempt_id)
+                            if target_reached():
+                                break
+                            if submit_window_full():
+                                deferred_for_target_window = True
+                                break
                             acc_item = pending_accounts[0]
                             
                             assigned_cdk = None
@@ -7137,11 +7187,28 @@ def _run_baxigpt_cdk_submit(task_id: str, pairs: list[dict[str, Any]], settings:
                                         reason=err_text,
                                     )
                                     
+                        if deferred_for_target_window:
+                            break
                         pending_accounts = unassignable_accounts
 
                 # 2. 如果没有任何提交成功的任务正在处理，且也没待处理账号了，则结束
                 if not active_orders:
                     if not pending_accounts:
+                        break
+                    elif target_reached():
+                        reason = f"已达到本次目标成功数量 {target_success_count}，停止继续提交新账号"
+                        for pa in pending_accounts:
+                            skipped_count += 1
+                            _log(task_id, f"[UNSUBMITTED] 未提交账号: {pa.get('email')} - {reason}")
+                            append_result(
+                                account_id=pa["account_id"],
+                                email=pa.get("email"),
+                                cdk_id=pa.get("last_cdk_id"),
+                                code_masked=pa.get("last_code_masked"),
+                                status="unsubmitted",
+                                reason=reason,
+                            )
+                        pending_accounts.clear()
                         break
                     else:
                         # 也没有可用卡密额度了，剩余账号放弃

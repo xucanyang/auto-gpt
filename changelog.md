@@ -7,6 +7,17 @@
 ## [Unreleased] (未发布)
 
 
+## [1.3.35] - 2026-07-08
+### 新增 (Added)
+- **Idea 批量提交窗口新增“查询全部剩余”按钮**：`frontend/src/pages/Accounts.tsx` 在账号页 “idea批量提交” 弹窗的卡密来源区域新增主动刷新动作，先读取 `/api/baxigpt-cdk-pool` 的全部 CDK，再分批调用 `/api/baxigpt-cdk-pool/quota` 执行 `code-info/query` 校验并回写本地库存；完成后自动刷新可用卡密列表、库存摘要和剩余额度展示，解决原“刷新库存”只读取本地缓存、不能实时查询所有 CDK 剩余次数的问题。
+- **Idea 批量提交支持本次目标成功数量**：`frontend/src/pages/Accounts.tsx` 在弹窗顶部新增“本次目标成功数量”输入框，`api/tasks.py` 的 `BaxiGptCdkSubmitTaskRequest` 同步新增 `target_success_count`；任务运行时会按目标 paid 数控制新账号提交窗口，达到目标后停止继续提交剩余候选账号，并在任务 summary 中把未继续提交的账号标记为“已达到本次目标成功数量”，避免一次选择大量账号时超量开通。
+
+### 优化 (Changed)
+- **放大 Idea 提交卡密选择控件并强化目标/额度提示**：`frontend/src/pages/Accounts.tsx` 将 “使用已保存卡密” 多选框调整为 large 尺寸、提高下拉列表高度并放宽卡密/备注展示宽度；弹窗宽度同步从 820 调整到 900，并在选择区展示目标成功数量、可提交额度和本轮后预计剩余，减少长卡密与备注被截断导致的误选。
+
+### 测试 (Tests)
+- **补充目标成功数量回归测试**：`tests/test_baxigpt_cdk_pool.py` 覆盖 Idea 提交任务创建时保存 `target_success_count` / `effective_target_success_count`，以及运行时达到目标 paid 数后不再继续提交后续候选账号，防止后续调整再次出现目标数失效或超量提交。
+
 ## [1.3.34] - 2026-07-08
 ### 新增 (Added)
 - **Idea 批量提交窗口支持选择已保存卡密并展示剩余额度**：`frontend/src/pages/Accounts.tsx` 在账号页 “idea批量提交” 弹窗中新增“使用已保存卡密”多选区，读取 `/api/baxigpt-cdk-pool?status=available` 的可用卡密，直接展示卡密、备注、剩余额度与预计本轮提交后的剩余量；不选择时沿用全部可用卡密，选择后只使用指定卡密。`api/tasks.py` 的 `BaxiGptCdkSubmitTaskRequest` 新增 `cdk_ids`，提交任务创建阶段会调用 `BaxiGptCdkRepository.list_available(ids=...)` 限定卡密来源，避免运营在弹窗里选了卡密但后端仍从全池自动取用。
@@ -866,4 +877,8 @@
 
 ## 2026-07-08 13:20:30 +0800
 - 同步 Idea 提交优化版本号 v1.3.34
+- 发布模式: multi
+
+## 2026-07-08 13:38:04 +0800
+- 增强 Idea 提交 CDK 剩余额度刷新与目标成功数量
 - 发布模式: multi

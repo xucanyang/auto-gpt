@@ -2124,6 +2124,7 @@ export default function Accounts() {
   const [baxiCdkAdvancedOpen, setBaxiCdkAdvancedOpen] = useState(false)
   const [baxiCdkPoolItems, setBaxiCdkPoolItems] = useState<BaxiGptCdkPoolItem[]>([])
   const [baxiCdkPoolItemsLoading, setBaxiCdkPoolItemsLoading] = useState(false)
+  const [baxiCdkQuotaRefreshing, setBaxiCdkQuotaRefreshing] = useState(false)
   const [baxiCdkSavingToPool, setBaxiCdkSavingToPool] = useState(false)
   const [paypalBindingOpen, setPaypalBindingOpen] = useState(false)
   const [paypalBindingLoading, setPaypalBindingLoading] = useState(false)
@@ -2168,6 +2169,7 @@ export default function Accounts() {
   const baxiCdkUsePoolValue = Form.useWatch('use_pool', baxiCdkSubmitForm)
   const baxiCdkCodeLinesValue = Form.useWatch('code_lines', baxiCdkSubmitForm)
   const baxiCdkSelectedIdsValue = Form.useWatch('cdk_ids', baxiCdkSubmitForm)
+  const baxiCdkTargetSuccessValue = Form.useWatch('target_success_count', baxiCdkSubmitForm)
   const [registerMailProvider, setRegisterMailProvider] = useState('luckmail')
   const [configCache, setConfigCache] = useState<Record<string, any> | null>(null)
   const { mode: chatgptRegistrationMode, setMode: setChatgptRegistrationMode } =
@@ -2460,6 +2462,63 @@ export default function Accounts() {
       setBaxiCdkPoolItemsLoading(false)
     }
   }, [baxiCdkSubmitForm])
+
+  const refreshAllBaxiCdkQuota = useCallback(async () => {
+    if (baxiCdkQuotaRefreshing) return
+    const toastKey = 'baxigpt-cdk-quota-refresh'
+    setBaxiCdkQuotaRefreshing(true)
+    message.loading({ content: '正在查询全部 CDK 剩余额度...', key: toastKey, duration: 0 })
+    try {
+      const data = await apiFetch('/baxigpt-cdk-pool')
+      const allItems = Array.isArray(data?.items) ? data.items : []
+      const ids = normalizeBaxiCdkIdList(allItems.map((item: any) => item?.id))
+      if (ids.length <= 0) {
+        message.info({ content: '卡密池暂无可查询的 CDK', key: toastKey })
+        return
+      }
+
+      const chunks: number[][] = []
+      for (let index = 0; index < ids.length; index += 100) {
+        chunks.push(ids.slice(index, index + 100))
+      }
+      const rows: any[] = []
+      let failedChunks = 0
+      let lastError = ''
+      for (const chunk of chunks) {
+        try {
+          const result = await apiFetch('/baxigpt-cdk-pool/quota', {
+            method: 'POST',
+            body: JSON.stringify({ ids: chunk, limit: chunk.length, include_query: true }),
+          })
+          rows.push(...(Array.isArray(result?.items) ? result.items : []))
+        } catch (chunkError: any) {
+          failedChunks += 1
+          lastError = chunkError?.message || String(chunkError || '查询失败')
+        }
+      }
+      if (rows.length <= 0 && failedChunks > 0) {
+        throw new Error(lastError || '查询全部 CDK 剩余额度失败')
+      }
+      await Promise.all([loadBaxiCdkPoolSummary(true), loadBaxiCdkPoolItems(true)])
+      const okCount = rows.filter((item) => item?.ok).length
+      const nextItems = rows
+        .map((row) => (row?.item && typeof row.item === 'object' ? row.item : null))
+        .filter(Boolean)
+      const availableCount = nextItems.filter((item) => String(item?.status || '') === 'available').length
+      const remainingCapacity = nextItems
+        .filter((item) => String(item?.status || '') === 'available')
+        .reduce((sum, item) => sum + baxiCdkSubmitCapacity(item), 0)
+      const suffix = failedChunks > 0 ? `，${failedChunks} 批失败` : ''
+      message.success({
+        content: `CDK 剩余额度查询完成：查询 ${rows.length}/${ids.length} 个，成功 ${okCount} 个，可用 ${availableCount} 个，剩余额度 ${remainingCapacity}${suffix}`,
+        key: toastKey,
+      })
+    } catch (e: any) {
+      message.error({ content: e?.message || '查询全部 CDK 剩余额度失败', key: toastKey })
+    } finally {
+      setBaxiCdkQuotaRefreshing(false)
+    }
+  }, [baxiCdkQuotaRefreshing, loadBaxiCdkPoolItems, loadBaxiCdkPoolSummary])
 
   const applyCurrentFiltersToBody = (body: Record<string, unknown>) => {
     if (search) body.email = search
@@ -4038,6 +4097,7 @@ export default function Accounts() {
       ...savedSettings,
       code_lines: '',
       cdk_ids: [],
+      target_success_count: 0,
     })
     setBaxiCdkManualOpen(false)
     setBaxiCdkAdvancedOpen(false)
@@ -4109,6 +4169,7 @@ export default function Accounts() {
       auto_poll_status: values.auto_poll_status !== false,
       status_poll_interval_seconds: Number(values.status_poll_interval_seconds || 5),
       status_poll_timeout_seconds: Number(values.status_poll_timeout_seconds || 1800),
+      target_success_count: Math.max(Number(values.target_success_count || 0), 0),
     }
     if (usePool && selectedCdkIds.length > 0) body.cdk_ids = selectedCdkIds
     let requestedAccounts = total
@@ -4138,6 +4199,7 @@ export default function Accounts() {
       const eligible = Number(res?.eligible_accounts || 0)
       const availableCodes = Number(res?.available_codes || 0)
       const spareCodes = Number(res?.spare_codes || 0)
+      const targetSuccess = Number(res?.effective_target_success_count || 0)
       const importInfo = res?.cdk_pool_import && typeof res.cdk_pool_import === 'object' ? res.cdk_pool_import : {}
       const importErrors = Array.isArray(importInfo?.errors) ? importInfo.errors : []
 
@@ -4156,7 +4218,7 @@ export default function Accounts() {
       const snapshot = await apiFetch(`/tasks/${taskIdFromResponse}`)
       setBaxiCdkSubmitOpen(false)
       setTaskModalMode('baxigpt_cdk')
-      setTaskModalAccount({ email: `idea批量提交：${pairCount} 对 / 库存余 ${spareCodes}` })
+      setTaskModalAccount({ email: targetSuccess > 0 ? `idea批量提交：目标成功 ${targetSuccess} / 候选 ${pairCount}` : `idea批量提交：${pairCount} 对 / 库存余 ${spareCodes}` })
       setTaskId(taskIdFromResponse)
       setTaskSnapshot(snapshot)
       setRegisterModalOpen(true)
@@ -4164,7 +4226,7 @@ export default function Accounts() {
       void activeTasksQuery.refetch()
       void loadBaxiCdkPoolSummary()
       message.success({
-        content: `idea批量提交已启动：${pairCount} 对，候选账号 ${eligible} 个，可用卡密 ${availableCodes} 个${spareCodes > 0 ? `，剩余入库 ${spareCodes} 个` : ''}${importErrors.length > 0 ? `，解析跳过 ${importErrors.length} 行` : ''}`,
+        content: `idea批量提交已启动：${pairCount} 个候选配对${targetSuccess > 0 ? `，目标成功 ${targetSuccess} 个` : ''}，候选账号 ${eligible} 个，可用卡密 ${availableCodes} 个${spareCodes > 0 ? `，剩余入库 ${spareCodes} 个` : ''}${importErrors.length > 0 ? `，解析跳过 ${importErrors.length} 行` : ''}`,
         key: toastKey,
       })
       if (importErrors.length > 0) {
@@ -7149,6 +7211,10 @@ export default function Accounts() {
   const baxiCdkShowManualInput = baxiCdkManualOpen || Boolean(baxiCdkManualText) || !baxiCdkUsePool
   const baxiCdkSummary = baxiCdkPoolSummary || {}
   const baxiCdkTargetCount = baxiCdkSubmitScope === 'selected' ? selectedRowKeys.length : total
+  const baxiCdkTargetSuccessLimit = Math.max(Number(baxiCdkTargetSuccessValue || 0), 0)
+  const baxiCdkPlannedSuccessTarget = baxiCdkTargetSuccessLimit > 0 && baxiCdkTargetCount > 0
+    ? Math.min(baxiCdkTargetSuccessLimit, baxiCdkTargetCount)
+    : baxiCdkTargetCount
   const baxiCdkAvailable = Number(baxiCdkSummary.available || 0)
   const baxiCdkSubmitted = Number(baxiCdkSummary.submitted || 0) + Number(baxiCdkSummary.processing || 0)
   const baxiCdkPaid = Number(baxiCdkSummary.paid || 0)
@@ -7168,8 +7234,8 @@ export default function Accounts() {
   const baxiCdkEffectiveCapacity = baxiCdkSelectedIds.length > 0
     ? baxiCdkSelectedCapacity
     : (baxiCdkLoadedCapacity > 0 ? baxiCdkLoadedCapacity : baxiCdkAvailable)
-  const baxiCdkRemainingAfterSubmit = baxiCdkTargetCount > 0
-    ? Math.max(baxiCdkEffectiveCapacity - baxiCdkTargetCount, 0)
+  const baxiCdkRemainingAfterSubmit = baxiCdkPlannedSuccessTarget > 0
+    ? Math.max(baxiCdkEffectiveCapacity - baxiCdkPlannedSuccessTarget, 0)
     : baxiCdkEffectiveCapacity
   const baxiCdkPoolOptions = baxiCdkPoolItems.map((item) => {
     const codeText = String(item.code_value || item.code_masked || `#${item.id}`)
@@ -7180,9 +7246,9 @@ export default function Accounts() {
       value: Number(item.id),
       searchText: `${codeText} ${labelText} ${item.code_masked || ''}`.trim(),
       label: (
-        <Space size={6} wrap style={{ maxWidth: 640 }}>
-          <Text code ellipsis={{ tooltip: codeText }} style={{ maxWidth: 260 }}>{codeText}</Text>
-          {labelText ? <Text type="secondary" ellipsis={{ tooltip: labelText }} style={{ maxWidth: 150 }}>{labelText}</Text> : null}
+        <Space size={6} wrap style={{ maxWidth: 760 }}>
+          <Text code ellipsis={{ tooltip: codeText }} style={{ maxWidth: 340 }}>{codeText}</Text>
+          {labelText ? <Text type="secondary" ellipsis={{ tooltip: labelText }} style={{ maxWidth: 190 }}>{labelText}</Text> : null}
           <Tag color={baxiCdkRemainingValue(item) > 0 ? 'success' : 'default'}>{quotaText}</Tag>
           {errorText ? <Tag color="warning">有错误</Tag> : null}
         </Space>
@@ -7200,10 +7266,10 @@ export default function Accounts() {
   const baxiCdkPoolShortage =
     baxiCdkUsePool
     && !baxiCdkManualText
-    && baxiCdkTargetCount > 0
+    && baxiCdkPlannedSuccessTarget > 0
     && baxiCdkEffectiveCapacity > 0
-    && baxiCdkEffectiveCapacity < baxiCdkTargetCount
-  const baxiCdkManualOverflow = baxiCdkManualCount > 0 && baxiCdkTargetCount > 0 && baxiCdkManualCount > baxiCdkTargetCount
+    && baxiCdkEffectiveCapacity < baxiCdkPlannedSuccessTarget
+  const baxiCdkManualOverflow = baxiCdkManualCount > 0 && baxiCdkPlannedSuccessTarget > 0 && baxiCdkManualCount > baxiCdkPlannedSuccessTarget
   const paypalFilteredEligibleCountLabel = paypalFilteredEligibleLoading
     ? '统计中'
     : paypalFilteredEligibleCount === null
@@ -7930,7 +7996,7 @@ export default function Accounts() {
         confirmLoading={phoneBindingTestLoading}
         okText="开始绑定"
         cancelText="取消"
-        width={820}
+        width={900}
         maskClosable={false}
       >
         <Form
@@ -8601,16 +8667,39 @@ export default function Accounts() {
             }
             description="提交成功指上游 /api/submit 返回 ok 和 order_id；不会阻塞等待 paid，默认会把订单加入后台轮询，查到状态后同步卡密池和绑定账号。"
           />
-          <Form.Item name="scope" label="账号范围" initialValue={baxiCdkSubmitScope}>
-            <Select
-              value={baxiCdkSubmitScope}
-              onChange={(value) => setBaxiCdkSubmitScope(value)}
-              options={[
-                { value: 'selected', label: `当前选中账号（${selectedRowKeys.length}）`, disabled: selectedRowKeys.length === 0 },
-                { value: 'filtered', label: `当前筛选账号（${total}）` },
-              ]}
-            />
-          </Form.Item>
+          <div
+            style={{
+              display: 'grid',
+              gridTemplateColumns: isMobile ? '1fr' : 'minmax(0, 1.2fr) minmax(220px, 0.8fr)',
+              gap: 12,
+            }}
+          >
+            <Form.Item name="scope" label="账号范围" initialValue={baxiCdkSubmitScope}>
+              <Select
+                value={baxiCdkSubmitScope}
+                onChange={(value) => setBaxiCdkSubmitScope(value)}
+                options={[
+                  { value: 'selected', label: `当前选中账号（${selectedRowKeys.length}）`, disabled: selectedRowKeys.length === 0 },
+                  { value: 'filtered', label: `当前筛选账号（${total}）` },
+                ]}
+              />
+            </Form.Item>
+            <Form.Item
+              name="target_success_count"
+              label="本次目标成功数量"
+              extra="0 表示按账号范围尽量全部提交；填写后达到目标 paid 数就停止继续提交新账号。"
+            >
+              <InputNumber
+                min={0}
+                max={baxiCdkTargetCount > 0 ? baxiCdkTargetCount : undefined}
+                precision={0}
+                step={1}
+                addonAfter="个"
+                placeholder="0 = 不限制"
+                style={{ width: '100%' }}
+              />
+            </Form.Item>
+          </div>
 
           <Form.Item label="卡密来源">
             <div
@@ -8636,12 +8725,23 @@ export default function Accounts() {
                 <Button
                   size="small"
                   icon={baxiCdkPoolSummaryLoading ? <SyncOutlined spin /> : <SyncOutlined />}
+                  disabled={baxiCdkQuotaRefreshing}
                   onClick={() => {
                     void loadBaxiCdkPoolSummary(false)
                     void loadBaxiCdkPoolItems(false)
                   }}
                 >
                   刷新库存
+                </Button>
+                <Button
+                  size="small"
+                  type="primary"
+                  ghost
+                  icon={baxiCdkQuotaRefreshing ? <SyncOutlined spin /> : <SyncOutlined />}
+                  loading={baxiCdkQuotaRefreshing}
+                  onClick={() => void refreshAllBaxiCdkQuota()}
+                >
+                  查询全部剩余
                 </Button>
               </Space>
               <Space wrap size={[4, 6]}>
@@ -8676,6 +8776,7 @@ export default function Accounts() {
               >
                 <Select
                   mode="multiple"
+                  size="large"
                   allowClear
                   showSearch
                   loading={baxiCdkPoolItemsLoading}
@@ -8683,7 +8784,9 @@ export default function Accounts() {
                   options={baxiCdkPoolOptions}
                   optionFilterProp="searchText"
                   maxTagCount="responsive"
+                  listHeight={360}
                   popupMatchSelectWidth={false}
+                  style={{ width: '100%' }}
                   notFoundContent={baxiCdkPoolItemsLoading ? '正在读取...' : '暂无可用卡密'}
                 />
               </Form.Item>
@@ -8691,7 +8794,10 @@ export default function Accounts() {
                 <Tag color={baxiCdkSelectedIds.length > 0 ? 'blue' : 'default'}>
                   {baxiCdkSelectedIds.length > 0 ? `已选 ${baxiCdkEffectivePoolCount} 个` : `默认全部 ${baxiCdkEffectivePoolCount} 个`}
                 </Tag>
-                <Tag color={baxiCdkEffectiveCapacity >= baxiCdkTargetCount || baxiCdkTargetCount <= 0 ? 'success' : 'warning'}>
+                <Tag color={baxiCdkTargetSuccessLimit > 0 ? 'processing' : 'default'}>
+                  目标成功 {baxiCdkTargetSuccessLimit > 0 ? baxiCdkPlannedSuccessTarget : '不限'}
+                </Tag>
+                <Tag color={baxiCdkEffectiveCapacity >= baxiCdkPlannedSuccessTarget || baxiCdkPlannedSuccessTarget <= 0 ? 'success' : 'warning'}>
                   可提交额度 {baxiCdkEffectiveCapacity}
                 </Tag>
                 <Tag color={baxiCdkRemainingAfterSubmit > 0 ? 'cyan' : 'default'}>
@@ -8713,14 +8819,14 @@ export default function Accounts() {
               type="warning"
               showIcon
               style={{ marginBottom: 12 }}
-              message={`卡密池额度不足：当前范围 ${baxiCdkTargetCount} 个账号，可提交额度 ${baxiCdkEffectiveCapacity}，本轮会优先把可用额度全部提交。`}
+              message={`卡密池额度不足：本次计划目标 ${baxiCdkPlannedSuccessTarget} 个，可提交额度 ${baxiCdkEffectiveCapacity}，本轮会优先把可用额度全部提交。`}
             />
           ) : baxiCdkManualOverflow ? (
             <Alert
               type="info"
               showIcon
               style={{ marginBottom: 12 }}
-              message={`粘贴卡密多于账号：${baxiCdkManualCount} 个卡密 / ${baxiCdkTargetCount} 个账号，多余卡密会留在库存。`}
+              message={`粘贴卡密多于本次计划：${baxiCdkManualCount} 个卡密 / 目标 ${baxiCdkPlannedSuccessTarget} 个，多余卡密会留在库存。`}
             />
           ) : null}
 

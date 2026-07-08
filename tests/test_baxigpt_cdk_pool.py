@@ -462,6 +462,112 @@ CDK-AAAA-1111
         self.assertEqual(result["pairs"][0]["cdk_id"], int(selected_code.id))
         self.assertEqual(result["skipped_accounts"][0]["reason"], "可用卡密额度不足，本轮未提交")
 
+    def test_submit_task_stores_target_success_count(self):
+        repo = BaxiGptCdkRepository()
+        selected_code = repo.add(code="CDK-TARGET-1111")
+        repo.mark_code_info(selected_code.id, {"ok": True, "remaining": 3, "total": 3})
+        with Session(self.engine) as session:
+            accounts = [
+                AccountModel(platform="chatgpt", email=f"target-{index}@example.com", password="pw", token=f"at-{index}")
+                for index in range(3)
+            ]
+            session.add_all(accounts)
+            session.commit()
+            account_ids = []
+            for account in accounts:
+                session.refresh(account)
+                account_ids.append(int(account.id or 0))
+
+        result = tasks_module.enqueue_baxigpt_cdk_submit_task(
+            tasks_module.BaxiGptCdkSubmitTaskRequest(
+                account_ids=account_ids,
+                use_pool=True,
+                cdk_ids=[int(selected_code.id)],
+                target_success_count=2,
+                auto_poll_status=False,
+            ),
+            background_tasks=BackgroundTasks(),
+        )
+
+        self.assertEqual(result["pair_count"], 3)
+        self.assertEqual(result["target_success_count"], 2)
+        self.assertEqual(result["effective_target_success_count"], 2)
+        snapshot = tasks_module._task_store.snapshot(result["task_id"])
+        self.assertEqual(snapshot["progress"], "0/2")
+        self.assertEqual(snapshot["meta"]["settings"]["target_success_count"], 2)
+        self.assertEqual(snapshot["meta"]["settings"]["requested_target_success_count"], 2)
+
+    def test_submit_runtime_stops_after_target_success_count(self):
+        repo = BaxiGptCdkRepository()
+        selected_code = repo.add(code="CDK-RUNTIME-TARGET-1111")
+        repo.mark_code_info(selected_code.id, {"ok": True, "remaining": 3, "total": 3})
+        with Session(self.engine) as session:
+            accounts = [
+                AccountModel(platform="chatgpt", email=f"runtime-target-{index}@example.com", password="pw", token=f"at-{index}")
+                for index in range(3)
+            ]
+            session.add_all(accounts)
+            session.commit()
+            account_ids = []
+            for account in accounts:
+                session.refresh(account)
+                account_ids.append(int(account.id or 0))
+
+        result = tasks_module.enqueue_baxigpt_cdk_submit_task(
+            tasks_module.BaxiGptCdkSubmitTaskRequest(
+                account_ids=account_ids,
+                use_pool=True,
+                cdk_ids=[int(selected_code.id)],
+                target_success_count=1,
+                submit_interval_seconds=0,
+                status_poll_interval_seconds=1,
+                status_poll_timeout_seconds=1800,
+            ),
+            background_tasks=BackgroundTasks(),
+        )
+        task_id = result["task_id"]
+        snapshot = tasks_module._task_store.snapshot(task_id)
+        pairs = snapshot["meta"]["pairs"]
+        settings = snapshot["meta"]["settings"]
+
+        class FakeBaxiClient:
+            submit_calls: list[str] = []
+
+            def code_info(self, _code):
+                return {"ok": True, "remaining": 3, "total": 3}
+
+            def submit(self, code, access_token):
+                self.__class__.submit_calls.append(access_token)
+                return {
+                    "ok": True,
+                    "submitted_items": [
+                        {
+                            "order_id": f"{code}::task-{len(self.__class__.submit_calls)}",
+                            "display_id": f"task-{len(self.__class__.submit_calls)}",
+                            "status": "submitted",
+                        }
+                    ],
+                }
+
+            def status(self, _order_id):
+                return {"ok": True, "status": "paid"}
+
+        with patch("services.chatgpt_core.baxigpt_client.BaxiGptClient", FakeBaxiClient), \
+             patch.object(tasks_module, "sync_chatgpt_account_local_status", return_value={"status": "subscribed"}), \
+             patch.object(tasks_module, "summarize_status_refresh", return_value={"status": "subscribed"}), \
+             patch.object(tasks_module.time, "sleep", return_value=None):
+            tasks_module._run_baxigpt_cdk_submit(task_id, pairs, settings)
+
+        final_snapshot = tasks_module._task_store.snapshot(task_id)
+        summary = final_snapshot["meta"]["idea_submit_summary"]
+        self.assertEqual(len(FakeBaxiClient.submit_calls), 1)
+        self.assertEqual(final_snapshot["status"], "done")
+        self.assertEqual(final_snapshot["success"], 1)
+        self.assertEqual(summary["target_success_count"], 1)
+        self.assertEqual(summary["paid"], 1)
+        self.assertEqual(summary["unsubmitted"], 2)
+        self.assertIn("已达到本次目标成功数量 1", summary["unsubmitted_accounts"][0]["reason"])
+
 
 class BaxiGptClientRetryTests(unittest.TestCase):
     def test_code_info_retries_transient_request_error(self):
