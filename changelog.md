@@ -7,6 +7,18 @@
 ## [Unreleased] (未发布)
 
 
+## [1.3.37] - 2026-07-08
+### 新增 (Added)
+- **注册任务新增“强制独立出口 IP”开关**：`frontend/src/features/auth/components/RegisterTaskModal.tsx` 与 `frontend/src/pages/RegisterTaskPage.tsx` 在 ChatGPT 注册代理配置区新增 `chatgpt_register_unique_exit_ip_enabled`。开启后，`api/tasks.py` 会在每个注册尝试进入核心链路前探测真实出口 IP，并在同一注册任务内记录已分配出口；动态代理会自动扩大 sid 刷新候选，代理池会切换候选，撞到已分配 IP 时跳过当前候选并写入任务日志与 `register_unique_exit_ip` 任务 meta。
+- **注册结果面板展示独立出口 IP 分配状态**：任务快照新增 `register_unique_exit_ip.assigned_count / collision_count / failed_count / assigned_exit_ips / events`，注册弹窗和独立注册页会显示已分配出口数量与撞 IP 次数，方便确认并发注册时是否真的换到了不同出口。
+
+### 优化 (Changed)
+- **注册链路强制注入任务级独立浏览器指纹**：`api/tasks.py` 为每个 ChatGPT 注册尝试生成独立 `chatgpt_browser_fingerprint`，并通过 `services/chatgpt_core/refresh_token_registration_engine.py`、`access_token_only_registration_engine.py`、`phone_registration_engine.py` 和 `phone_signup_client.py` 传入底层客户端；同一账号流程内继续复用同一指纹，账号与账号之间避免复用 UA / viewport / Accept-Language / device_id 组合。
+- **动态代理注册参数补齐 retention 透传**：`RegisterTaskRequest` 新增 `dynamic_proxy_ip_retention_minutes`，注册任务现在会把前端动态代理保留时间传给 `core.proxy_utils.resolve_task_proxy_candidates()`，避免动态代理配置只在前端保存但注册链路未使用。
+
+### 测试 (Tests)
+- **补充并发注册出口隔离回归测试**：`tests/test_register_task_controls.py` 覆盖两个并发注册同时拿到相同首选动态代理候选时，第二个尝试会跳过重复出口并切到下一个候选，同时确认每个尝试都收到独立浏览器指纹；前端侧边栏版本号同步更新为 `v1.3.37`。
+
 ## [1.3.36] - 2026-07-08
 ### 新增 (Added)
 - **注册面板新增“遇到已注册邮箱时路由到登录”开关**：`frontend/src/features/auth/components/RegisterTaskModal.tsx` 与 `frontend/src/pages/RegisterTaskPage.tsx` 在 ChatGPT 注册配置区新增独立开关 `chatgpt_existing_account_login_route_enabled`，默认开启以兼容旧任务；关闭后，注册状态机发现邮箱已存在或被 OpenAI 推入登录路径时，会直接跳过当前邮箱、不保存到库存，避免 HME/邮箱池中的历史 OpenAI 账号混入“新注册”库存。
@@ -897,4 +909,8 @@
 
 ## 2026-07-08 18:18:15 +0800
 - 注册面板增加已注册邮箱登录路由控制与记录
+- 发布模式: multi
+
+## 2026-07-08 18:45:43 +0800
+- 注册任务增加独立出口IP与浏览器指纹隔离
 - 发布模式: multi

@@ -205,6 +205,10 @@ export default function RegisterTaskPage() {
             : cfg.chatgpt_existing_account_login_route_enabled === undefined
               ? true
               : parseBooleanConfigValue(cfg.chatgpt_existing_account_login_route_enabled),
+        chatgpt_register_unique_exit_ip_enabled:
+          cfg.chatgpt_register_unique_exit_ip_enabled === undefined
+            ? false
+            : parseBooleanConfigValue(cfg.chatgpt_register_unique_exit_ip_enabled),
         chatgpt_register_otp_wait_seconds: cfg.chatgpt_register_otp_wait_seconds || 120,
         chatgpt_register_otp_resend_wait_seconds: cfg.chatgpt_register_otp_resend_wait_seconds || 90,
         chatgpt_register_otp_account_budget_seconds: cfg.chatgpt_register_otp_account_budget_seconds || 210,
@@ -356,6 +360,8 @@ export default function RegisterTaskPage() {
             ? true
             : Boolean(values.chatgpt_existing_account_login_route_enabled))
           : undefined,
+      chatgpt_register_unique_exit_ip_enabled:
+        platform === 'chatgpt' ? Boolean(values.chatgpt_register_unique_exit_ip_enabled) : undefined,
       chatgpt_register_otp_wait_seconds:
         platform === 'chatgpt' ? values.chatgpt_register_otp_wait_seconds : undefined,
       chatgpt_register_otp_resend_wait_seconds:
@@ -558,6 +564,7 @@ export default function RegisterTaskPage() {
   const platform = Form.useWatch('platform', form)
   const proxyMode = Form.useWatch('proxy_mode', form)
   const proxyFailover = Form.useWatch('proxy_failover', form)
+  const uniqueExitIpEnabled = Form.useWatch('chatgpt_register_unique_exit_ip_enabled', form)
   const manualEmail = Form.useWatch('email', form)
   const chatgptRegistrationEntry = Form.useWatch('chatgpt_registration_entry', form)
   const phoneSignupUsePool = Form.useWatch('chatgpt_phone_signup_use_pool', form)
@@ -647,6 +654,11 @@ export default function RegisterTaskPage() {
     : []
   const existingAccountRoutedCount = existingAccountLoginRoutes.filter((item: any) => Boolean(item?.routed) && !item?.blocked).length
   const existingAccountBlockedCount = existingAccountLoginRoutes.filter((item: any) => Boolean(item?.blocked)).length
+  const uniqueExitIpMeta = task?.meta?.register_unique_exit_ip && typeof task.meta.register_unique_exit_ip === 'object'
+    ? task.meta.register_unique_exit_ip
+    : null
+  const uniqueExitIpAssignedCount = Number(uniqueExitIpMeta?.assigned_count || 0)
+  const uniqueExitIpCollisionCount = Number(uniqueExitIpMeta?.collision_count || 0)
 
   return (
     <div style={{ maxWidth: 800 }}>
@@ -785,6 +797,25 @@ export default function RegisterTaskPage() {
                 </>
               ) : null}
             </Space>
+          ) : null}
+          {platform === 'chatgpt' ? (
+            <Form.Item
+              name="chatgpt_register_unique_exit_ip_enabled"
+              valuePropName="checked"
+              initialValue={false}
+              extra="开启后每个注册尝试会先探测真实出口 IP；本任务内已分配过的 IP 不再复用。动态代理会扩大 sid 刷新候选，代理池会换候选；不足时当前尝试会失败/补尝试，速度会明显变慢。"
+            >
+              <Checkbox>注册任务内强制独立出口 IP</Checkbox>
+            </Form.Item>
+          ) : null}
+          {uniqueExitIpEnabled && proxyMode === 'direct' ? (
+            <Alert
+              type="warning"
+              showIcon
+              style={{ marginBottom: 12 }}
+              message="直连无法提供独立出口 IP"
+              description="该开关需要动态代理、代理池或多个可切换代理；直连模式下多个账号会共用服务器出口。"
+            />
           ) : null}
           <Alert
             type="info"
@@ -1605,6 +1636,15 @@ export default function RegisterTaskPage() {
                 emptyText="任务结束后，这里会输出已完成手机号注册的手机号。"
               />
             </div>
+          ) : null}
+          {uniqueExitIpMeta?.enabled ? (
+            <Alert
+              style={{ marginTop: 16 }}
+              type={uniqueExitIpCollisionCount > 0 ? 'warning' : 'info'}
+              showIcon
+              message={`独立出口 IP：已分配 ${uniqueExitIpAssignedCount} 个，撞 IP ${uniqueExitIpCollisionCount} 次`}
+              description="开启后同一注册任务内已分配过的出口 IP 不再复用；撞 IP 时会自动换候选/刷新 sid，候选不足会记录失败。"
+            />
           ) : null}
           {existingAccountLoginRoutes.length > 0 ? (
             <Alert

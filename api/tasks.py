@@ -87,6 +87,7 @@ class RegisterTaskRequest(BaseModel):
     proxy_failover: bool = False
     proxy_max_candidates: int = 0
     proxy_min_score: float = 0
+    dynamic_proxy_ip_retention_minutes: int = 0
     executor_type: str = "protocol"
     captcha_solver: str = "yescaptcha"
     extra: dict = Field(default_factory=dict)
@@ -649,6 +650,9 @@ def enqueue_register_task(
                         "existing_account_capture": _is_truthy(prepared_extra.get("chatgpt_existing_account_capture")),
                         "existing_account_login_route_enabled": _bool_config_default_true(
                             prepared_extra.get("chatgpt_existing_account_login_route_enabled")
+                        ),
+                        "register_unique_exit_ip_enabled": _is_truthy(
+                            prepared_extra.get("chatgpt_register_unique_exit_ip_enabled")
                         ),
                         "capture_free_workspace": _is_truthy(prepared_extra.get("chatgpt_capture_free_workspace")),
                     "capture_business_workspace": _is_truthy(prepared_extra.get("chatgpt_capture_business_workspace")),
@@ -11709,6 +11713,11 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
         chatgpt_checkout_amount_nonzero = 0
         chatgpt_zero_amount_stop_triggered = False
         chatgpt_checkout_amount_lock = threading.Lock()
+        unique_exit_ip_lock = threading.Lock()
+        unique_exit_ip_assigned: set[str] = set()
+        unique_exit_ip_events: list[dict[str, Any]] = []
+        browser_fingerprint_lock = threading.Lock()
+        browser_fingerprint_signatures: set[str] = set()
         deferred_team_ids: list[int] = []
         deferred_team_ids_lock = threading.Lock()
         deferred_phase_close_reason = ""
@@ -11755,10 +11764,12 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
         def _redact_proxy_for_log(proxy: Optional[str]) -> str:
             return redact_proxy_url(proxy) or "direct"
 
-        def _log_register_proxy_choice(proxy: str, source: str, index: int, total: int) -> None:
+        def _log_register_proxy_choice(proxy: str, source: str, index: int, total: int, exit_ip: str = "") -> None:
             label = str(source or "direct").strip() or "direct"
             ip_info = ""
-            if proxy:
+            if exit_ip:
+                ip_info = f" (出口IP: {exit_ip})"
+            elif proxy:
                 try:
                     from services.proxy_scanner import probe_basic
                     res = probe_basic(proxy, timeout_seconds=6)
@@ -11795,6 +11806,230 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                 parsed = default
             return max(minimum, min(maximum, parsed))
 
+        unique_exit_ip_enabled = (
+            req.platform == "chatgpt"
+            and _truthy(initial_merged_extra.get("chatgpt_register_unique_exit_ip_enabled"), default=False)
+        )
+        unique_exit_ip_refresh_budget_default = max(8, min(50, int(req.count or 1) * 2))
+        unique_exit_ip_max_refresh_attempts = _positive_int(
+            initial_merged_extra.get("chatgpt_register_unique_exit_ip_max_refresh_attempts")
+            or initial_merged_extra.get("register_unique_exit_ip_max_refresh_attempts")
+            or unique_exit_ip_refresh_budget_default,
+            default=unique_exit_ip_refresh_budget_default,
+            minimum=1,
+            maximum=100,
+        )
+        unique_exit_ip_probe_timeout_seconds = _positive_int(
+            initial_merged_extra.get("chatgpt_register_unique_exit_ip_probe_timeout_seconds")
+            or initial_merged_extra.get("dynamic_proxy_probe_timeout_seconds")
+            or 8,
+            default=8,
+            minimum=2,
+            maximum=60,
+        )
+        if unique_exit_ip_enabled:
+            _task_store.update_meta(
+                task_id,
+                {
+                    "register_unique_exit_ip": {
+                        "enabled": True,
+                        "assigned_count": 0,
+                        "collision_count": 0,
+                        "max_refresh_attempts": unique_exit_ip_max_refresh_attempts,
+                        "probe_timeout_seconds": unique_exit_ip_probe_timeout_seconds,
+                        "events": [],
+                    }
+                },
+            )
+            _log(
+                task_id,
+                "[代理] 已启用注册任务内强制独立出口 IP：每个尝试会先探测出口，已分配过的 IP 本任务内不再复用",
+            )
+
+        def _proxy_source_exit_ip(source: Any) -> str:
+            text = str(source or "")
+            for pattern in (
+                r"\bexit_ip\s*[:=]\s*([^｜\s,，;；)）]+)",
+                r"出口IP\s*[:：]\s*([^｜\s,，;；)）]+)",
+            ):
+                match = re.search(pattern, text, flags=re.I)
+                if match:
+                    return str(match.group(1) or "").strip()
+            return ""
+
+        def _record_unique_exit_ip_event(event: dict[str, Any]) -> None:
+            if not unique_exit_ip_enabled:
+                return
+            clean_event = sanitize_task_detail(event)
+            with unique_exit_ip_lock:
+                unique_exit_ip_events.append(clean_event)
+                recent_events = list(unique_exit_ip_events[-100:])
+                assigned_count = sum(1 for item in unique_exit_ip_events if str(item.get("status") or "") == "assigned")
+                collision_count = sum(1 for item in unique_exit_ip_events if str(item.get("status") or "") == "collision")
+                failed_count = sum(1 for item in unique_exit_ip_events if str(item.get("status") or "") == "failed")
+                assigned_ips = sorted(unique_exit_ip_assigned)
+            try:
+                _task_store.update_meta(
+                    task_id,
+                    {
+                        "register_unique_exit_ip": {
+                            "enabled": True,
+                            "assigned_count": assigned_count,
+                            "collision_count": collision_count,
+                            "failed_count": failed_count,
+                            "max_refresh_attempts": unique_exit_ip_max_refresh_attempts,
+                            "probe_timeout_seconds": unique_exit_ip_probe_timeout_seconds,
+                            "assigned_exit_ips": assigned_ips[-100:],
+                            "events": recent_events,
+                        }
+                    },
+                )
+            except Exception:
+                pass
+
+        def _probe_unique_exit_ip(proxy: str, source: str) -> tuple[str, str]:
+            source_exit_ip = _proxy_source_exit_ip(source)
+            source_text = str(source or "").strip().lower()
+            fresh_source_probe = bool(
+                source_exit_ip
+                and source_text.startswith("dynamic")
+                and ("probe=ok" in source_text or "probe=geo_unavailable" in source_text)
+            )
+            if not proxy:
+                return "", "直连模式没有可隔离的代理出口；请改用动态代理或代理池"
+            try:
+                from services.proxy_scanner import probe_basic
+
+                probe = probe_basic(proxy, timeout_seconds=unique_exit_ip_probe_timeout_seconds)
+                if probe.get("ok") and probe.get("exit_ip"):
+                    return str(probe.get("exit_ip") or "").strip(), "probe"
+                error = str(probe.get("error") or probe.get("error_code") or "出口 IP 探测失败").strip()
+                if fresh_source_probe:
+                    return source_exit_ip, f"dynamic_source_after_probe_failed:{error[:120]}"
+                return "", error
+            except Exception as exc:
+                if fresh_source_probe:
+                    return source_exit_ip, f"dynamic_source_after_probe_exception:{str(exc)[:120]}"
+                return "", str(exc or "出口 IP 探测异常")
+
+        def _claim_unique_register_exit_ip(
+            *,
+            attempt_index: int,
+            proxy: str,
+            source: str,
+            candidate_index: int,
+            candidate_total: int,
+        ) -> tuple[bool, str, str]:
+            exit_ip, probe_source = _probe_unique_exit_ip(proxy, source)
+            source_label = str(source or "direct").strip() or "direct"
+            if not exit_ip:
+                reason = f"无法确认候选代理出口 IP: {probe_source or source_label}"
+                _record_unique_exit_ip_event(
+                    {
+                        "attempt": attempt_index + 1,
+                        "candidate": candidate_index,
+                        "total": candidate_total,
+                        "status": "failed",
+                        "source": source_label,
+                        "reason": reason,
+                    }
+                )
+                return False, "", reason
+
+            with unique_exit_ip_lock:
+                if exit_ip in unique_exit_ip_assigned:
+                    collision = True
+                else:
+                    unique_exit_ip_assigned.add(exit_ip)
+                    collision = False
+            if collision:
+                reason = f"出口 IP 已在本注册任务内分配: {exit_ip}"
+                _record_unique_exit_ip_event(
+                    {
+                        "attempt": attempt_index + 1,
+                        "candidate": candidate_index,
+                        "total": candidate_total,
+                        "status": "collision",
+                        "exit_ip": exit_ip,
+                        "source": source_label,
+                        "probe_source": probe_source,
+                        "reason": reason,
+                    }
+                )
+                return False, exit_ip, reason
+
+            _record_unique_exit_ip_event(
+                {
+                    "attempt": attempt_index + 1,
+                    "candidate": candidate_index,
+                    "total": candidate_total,
+                    "status": "assigned",
+                    "exit_ip": exit_ip,
+                    "source": source_label,
+                    "probe_source": probe_source,
+                }
+            )
+            return True, exit_ip, ""
+
+        def _fingerprint_payload(fingerprint: Any) -> dict[str, Any]:
+            return {
+                "device_id": str(getattr(fingerprint, "device_id", "") or ""),
+                "accept_language": str(getattr(fingerprint, "accept_language", "") or ""),
+                "impersonate": str(getattr(fingerprint, "impersonate", "") or ""),
+                "chrome_major": int(getattr(fingerprint, "chrome_major", 0) or 0),
+                "chrome_full_version": str(getattr(fingerprint, "chrome_full_version", "") or ""),
+                "user_agent": str(getattr(fingerprint, "user_agent", "") or ""),
+                "sec_ch_ua": str(getattr(fingerprint, "sec_ch_ua", "") or ""),
+                "platform_version": str(getattr(fingerprint, "platform_version", "") or ""),
+                "viewport_width": int(getattr(fingerprint, "viewport_width", 0) or 0),
+                "viewport_height": int(getattr(fingerprint, "viewport_height", 0) or 0),
+            }
+
+        def _fingerprint_signature(payload: dict[str, Any], *, include_device: bool = False) -> str:
+            import hashlib
+
+            fields = [
+                payload.get("user_agent"),
+                payload.get("sec_ch_ua"),
+                payload.get("accept_language"),
+                payload.get("impersonate"),
+                payload.get("platform_version"),
+                payload.get("viewport_width"),
+                payload.get("viewport_height"),
+            ]
+            if include_device:
+                fields.append(payload.get("device_id"))
+            material = "|".join(str(item or "") for item in fields)
+            return hashlib.sha256(material.encode("utf-8", errors="ignore")).hexdigest()[:16]
+
+        def _build_register_attempt_fingerprint(attempt_index: int) -> tuple[dict[str, Any], str, str]:
+            from services.chatgpt_core.utils import generate_browser_fingerprint
+
+            selected_payload: dict[str, Any] = {}
+            selected_signature = ""
+            for _ in range(40):
+                payload = _fingerprint_payload(generate_browser_fingerprint())
+                signature = _fingerprint_signature(payload)
+                with browser_fingerprint_lock:
+                    if signature not in browser_fingerprint_signatures:
+                        browser_fingerprint_signatures.add(signature)
+                        selected_payload = payload
+                        selected_signature = signature
+                        break
+                selected_payload = payload
+                selected_signature = _fingerprint_signature(payload, include_device=True)
+            if not selected_payload:
+                payload = _fingerprint_payload(generate_browser_fingerprint())
+                selected_payload = payload
+                selected_signature = _fingerprint_signature(payload, include_device=True)
+            summary = (
+                f"device=*{str(selected_payload.get('device_id') or '')[-8:]} "
+                f"chrome={selected_payload.get('chrome_full_version') or selected_payload.get('chrome_major')} "
+                f"viewport={selected_payload.get('viewport_width')}x{selected_payload.get('viewport_height')} "
+                f"lang={selected_payload.get('accept_language')} sig={selected_signature}"
+            )
+            return selected_payload, selected_signature, summary
+
         def _build_register_candidate_proxies() -> list[tuple[str, object | None, str]]:
             from core.proxy_utils import resolve_task_proxy_candidates
 
@@ -11803,6 +12038,8 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
             params["proxy_mode"] = str(req.proxy_mode or params.get("proxy_mode") or "")
             params["proxy_country_code"] = str(req.proxy_country_code or params.get("proxy_country_code") or "")
             params["proxy_failover"] = bool(req.proxy_failover) if req.proxy_failover is not None else params.get("proxy_failover")
+            if req.dynamic_proxy_ip_retention_minutes:
+                params["dynamic_proxy_ip_retention_minutes"] = req.dynamic_proxy_ip_retention_minutes
             if req.proxy_max_candidates:
                 params["proxy_max_candidates"] = req.proxy_max_candidates
             elif params.get("proxy_max_candidates") is None:
@@ -11811,6 +12048,19 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                 params["proxy_min_score"] = req.proxy_min_score
             elif params.get("proxy_min_score") is None:
                 params.pop("proxy_min_score", None)
+            if unique_exit_ip_enabled:
+                mode = str(params.get("proxy_mode") or "").strip().lower()
+                if mode == "dynamic":
+                    params["proxy_failover"] = True
+                    params["dynamic_proxy_max_attempts"] = max(
+                        _positive_int(params.get("dynamic_proxy_max_attempts") or 0, default=0, minimum=0, maximum=100),
+                        unique_exit_ip_max_refresh_attempts,
+                    )
+                elif mode == "pool" or (mode in {"specified", "manual", "explicit"} and _truthy(params.get("proxy_failover"))):
+                    params["proxy_max_candidates"] = max(
+                        _positive_int(params.get("proxy_max_candidates") or 0, default=0, minimum=0, maximum=100),
+                        min(100, max(unique_exit_ip_max_refresh_attempts, int(req.count or 1) * 2)),
+                    )
 
             return resolve_task_proxy_candidates(
                 params,
@@ -11915,20 +12165,59 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                 _task_store.set_progress(task_id, f"{success}/{target_successes}")
                 _log(task_id, f"[账号] -------- 尝试 {i + 1} / 目标成功 {target_successes} --------")
                 _log(task_id, f"开始第 {i + 1} 次尝试，目标成功数 {target_successes}")
+                attempt_fingerprint_payload: dict[str, Any] = {}
+                attempt_fingerprint_signature = ""
+                if req.platform == "chatgpt":
+                    (
+                        attempt_fingerprint_payload,
+                        attempt_fingerprint_signature,
+                        attempt_fingerprint_summary,
+                    ) = _build_register_attempt_fingerprint(i)
+                    _log(task_id, f"[指纹] 已为第 {i + 1} 次尝试分配独立浏览器指纹：{attempt_fingerprint_summary}")
 
                 last_proxy_error = ""
                 last_proxy_error_email = current_email
+                selected_exit_ip = ""
+                selected_proxy_source = ""
                 for proxy_index, (candidate_proxy, candidate_proxy_pool, candidate_proxy_source) in enumerate(candidate_proxies, start=1):
                     _proxy = candidate_proxy
                     proxy_pool = candidate_proxy_pool
                     proxy_source = candidate_proxy_source
-                    _log_register_proxy_choice(_proxy, proxy_source, proxy_index, len(candidate_proxies))
 
                     try:
+                        allocated_exit_ip = ""
+                        if unique_exit_ip_enabled:
+                            allocation_ok, allocated_exit_ip, allocation_reason = _claim_unique_register_exit_ip(
+                                attempt_index=i,
+                                proxy=_proxy,
+                                source=proxy_source,
+                                candidate_index=proxy_index,
+                                candidate_total=len(candidate_proxies),
+                            )
+                            if not allocation_ok:
+                                last_proxy_error = allocation_reason
+                                _log(
+                                    task_id,
+                                    f"[代理] 独立出口 IP 检查未通过，跳过候选 {proxy_index}/{len(candidate_proxies)}：{allocation_reason}",
+                                )
+                                continue
+                            _log(
+                                task_id,
+                                f"[代理] 独立出口 IP 已锁定: {allocated_exit_ip} candidate={proxy_index}/{len(candidate_proxies)}",
+                            )
+                        _log_register_proxy_choice(_proxy, proxy_source, proxy_index, len(candidate_proxies), exit_ip=allocated_exit_ip)
                         runtime_extra = dict(merged_extra or {})
                         if not _proxy and str(proxy_source or "").strip().lower() == "direct":
                             runtime_extra["__register_proxy_mode"] = "direct"
                         runtime_extra["_current_task_id"] = task_id
+                        if attempt_fingerprint_payload:
+                            runtime_extra["chatgpt_browser_fingerprint"] = dict(attempt_fingerprint_payload)
+                            runtime_extra["chatgpt_browser_fingerprint_isolated"] = True
+                            runtime_extra["chatgpt_browser_fingerprint_signature"] = attempt_fingerprint_signature
+                        if unique_exit_ip_enabled:
+                            runtime_extra["chatgpt_register_unique_exit_ip_enabled"] = True
+                        if allocated_exit_ip:
+                            runtime_extra["chatgpt_register_exit_ip"] = allocated_exit_ip
                         if phone_signup_entry:
                             phone_lines_for_signup = str(runtime_extra.get("chatgpt_phone_signup_phone_lines") or "").strip()
                             if phone_lines_for_signup:
@@ -11957,6 +12246,8 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                             email=req.email or None,
                             password=req.password,
                         )
+                        selected_exit_ip = allocated_exit_ip
+                        selected_proxy_source = str(proxy_source or "")
                         break
                     except SkipCurrentAttemptRequested:
                         raise
@@ -11990,6 +12281,15 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
 
                 current_email = account.email or current_email
                 if isinstance(account.extra, dict):
+                    if attempt_fingerprint_signature:
+                        account.extra.setdefault("chatgpt_browser_fingerprint_isolated", True)
+                        account.extra.setdefault("chatgpt_browser_fingerprint_signature", attempt_fingerprint_signature)
+                    if unique_exit_ip_enabled:
+                        account.extra.setdefault("chatgpt_register_unique_exit_ip_enabled", True)
+                    if selected_exit_ip:
+                        account.extra.setdefault("chatgpt_register_exit_ip", selected_exit_ip)
+                    if selected_proxy_source:
+                        account.extra.setdefault("chatgpt_register_proxy_source", selected_proxy_source)
                     mail_provider = merged_extra.get("mail_provider", "")
                     if mail_provider:
                         account.extra.setdefault("mail_provider", mail_provider)
@@ -12001,6 +12301,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                             "chatgpt_capture_business_workspace",
                             "chatgpt_existing_account_capture",
                             "chatgpt_existing_account_login_route_enabled",
+                            "chatgpt_register_unique_exit_ip_enabled",
                             "chatgpt_k12_enabled",
                             "chatgpt_k12_workspace_ids",
                             "chatgpt_k12_save_all_spaces",

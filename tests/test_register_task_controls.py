@@ -1,4 +1,5 @@
 import unittest
+import threading
 from unittest.mock import patch
 
 import api.actions as api_actions
@@ -157,6 +158,40 @@ class _FakeChatGPTAlwaysFailPlatform(BasePlatform):
     def register(self, email: str, password: str = None) -> Account:
         type(self).calls += 1
         raise RuntimeError("fake phone signup failure")
+
+    def check_valid(self, account: Account) -> bool:
+        return True
+
+
+class _FakeChatGPTProxyFingerprintPlatform(BasePlatform):
+    name = "chatgpt"
+    display_name = "ChatGPT"
+    seen: list[dict] = []
+    _lock = threading.Lock()
+
+    def __init__(self, config=None, mailbox=None):
+        super().__init__(config)
+        self.mailbox = mailbox
+
+    def register(self, email: str, password: str = None) -> Account:
+        extra = dict(getattr(self.config, "extra", None) or {})
+        with self._lock:
+            index = len(type(self).seen) + 1
+            type(self).seen.append(
+                {
+                    "proxy": getattr(self.config, "proxy", ""),
+                    "exit_ip": extra.get("chatgpt_register_exit_ip"),
+                    "fingerprint": extra.get("chatgpt_browser_fingerprint"),
+                    "fingerprint_signature": extra.get("chatgpt_browser_fingerprint_signature"),
+                }
+            )
+        return Account(
+            platform="chatgpt",
+            email=f"unique-{index}@example.com",
+            password=password or "pw",
+            token=f"at-{index}",
+            extra={},
+        )
 
     def check_valid(self, account: Account) -> bool:
         return True
@@ -373,6 +408,58 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
         self.assertEqual(save_account.call_count, 1)
         self.assertTrue(any("注册未计成功且不保存账号" in line for line in snapshot["logs"]))
         self.assertTrue(any("failed_skip_save" in str(call) for call in save_log.call_args_list))
+
+    def test_register_unique_exit_ip_skips_duplicate_candidate_and_passes_isolated_fingerprint(self):
+        task_id = "task-register-unique-exit-ip"
+        req = RegisterTaskRequest(
+            platform="chatgpt",
+            count=2,
+            concurrency=2,
+            proxy_mode="dynamic",
+            proxy_country_code="US",
+            extra={
+                "mail_provider": "fake",
+                "chatgpt_register_unique_exit_ip_enabled": True,
+            },
+        )
+        _create_task_record(task_id, req, "manual", None)
+        _FakeChatGPTProxyFingerprintPlatform.seen = []
+
+        def fake_candidates(params=None, fallback_proxy=None, default_mode="direct", target="chatgpt"):
+            self.assertTrue(params.get("proxy_failover"))
+            self.assertGreaterEqual(int(params.get("dynamic_proxy_max_attempts") or 0), 8)
+            return [
+                ("http://proxy-a.local:8080", None, "dynamic country=US actual=US exit_ip=198.51.100.10 provider=test sid=refreshed probe=ok"),
+                ("http://proxy-b.local:8080", None, "dynamic country=US actual=US exit_ip=198.51.100.11 provider=test sid=refreshed probe=ok"),
+            ]
+
+        def fake_probe(proxy_url, timeout_seconds=8):
+            if "proxy-a" in proxy_url:
+                return {"ok": True, "exit_ip": "198.51.100.10", "latency_ms": 1}
+            return {"ok": True, "exit_ip": "198.51.100.11", "latency_ms": 1}
+
+        with (
+            patch("services.chatgpt_core.ChatGPTPlatform", _FakeChatGPTProxyFingerprintPlatform),
+            patch("core.base_mailbox.create_mailbox", return_value=_FakeMailbox()),
+            patch("core.proxy_utils.resolve_task_proxy_candidates", side_effect=fake_candidates),
+            patch("services.proxy_scanner.probe_basic", side_effect=fake_probe),
+            patch("core.db.save_account", side_effect=lambda account: account),
+            patch("api.tasks._save_task_log"),
+        ):
+            _run_register(task_id, req)
+
+        snapshot = _task_store.snapshot(task_id)
+        self.assertEqual(snapshot["status"], "done")
+        self.assertEqual(snapshot["success"], 2)
+        seen = list(_FakeChatGPTProxyFingerprintPlatform.seen)
+        self.assertEqual(len(seen), 2)
+        self.assertEqual({item["exit_ip"] for item in seen}, {"198.51.100.10", "198.51.100.11"})
+        fingerprints = [item["fingerprint"] for item in seen]
+        self.assertTrue(all(isinstance(item, dict) and item.get("device_id") for item in fingerprints))
+        self.assertEqual(len({item["fingerprint_signature"] for item in seen}), 2)
+        unique_meta = dict((snapshot.get("meta") or {}).get("register_unique_exit_ip") or {})
+        self.assertEqual(unique_meta.get("assigned_count"), 2)
+        self.assertGreaterEqual(int(unique_meta.get("collision_count") or 0), 1)
 
     def test_effective_register_extra_uses_access_token_checkout_defaults(self):
         req = RegisterTaskRequest(

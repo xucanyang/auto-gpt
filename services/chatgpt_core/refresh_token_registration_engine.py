@@ -565,6 +565,10 @@ class RefreshTokenRegistrationEngine:
             proxy=self.proxy_url,
             verbose=False,
             browser_mode=self.browser_mode,
+            fingerprint=(
+                self.extra_config.get("chatgpt_browser_fingerprint")
+                or self.extra_config.get("browser_fingerprint")
+            ),
         )
         client._log = lambda msg: self._log(f"[注册链路] {msg}")
         return client

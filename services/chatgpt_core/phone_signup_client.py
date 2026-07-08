@@ -112,12 +112,13 @@ class PhoneSignupClient:
         browser_mode: str = "protocol",
         log_fn=None,
         stop_checker=None,
+        fingerprint=None,
     ) -> None:
         self.proxy = str(proxy or "").strip()
         self.browser_mode = str(browser_mode or "protocol").strip() or "protocol"
         self.log_fn = log_fn or (lambda _msg: None)
         self.stop_checker = stop_checker
-        self.fingerprint = coerce_browser_fingerprint()
+        self.fingerprint = coerce_browser_fingerprint(fingerprint)
         self.device_id = self.fingerprint.device_id
         self.session = curl_requests.Session(impersonate=self.fingerprint.impersonate)
         if self.proxy:

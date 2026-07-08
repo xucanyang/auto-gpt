@@ -133,6 +133,15 @@ def coerce_browser_fingerprint(
     """将已有指纹 / 零散字段归一化成 BrowserFingerprint。"""
     if isinstance(fingerprint, BrowserFingerprint):
         return fingerprint
+    if isinstance(fingerprint, dict):
+        device_id = device_id or fingerprint.get("device_id")
+        user_agent = user_agent or fingerprint.get("user_agent")
+        sec_ch_ua = sec_ch_ua or fingerprint.get("sec_ch_ua")
+        impersonate = impersonate or fingerprint.get("impersonate")
+        accept_language = accept_language or fingerprint.get("accept_language")
+        platform_version = platform_version or fingerprint.get("platform_version")
+        viewport_width = viewport_width or fingerprint.get("viewport_width")
+        viewport_height = viewport_height or fingerprint.get("viewport_height")
 
     base = generate_browser_fingerprint(
         device_id=device_id,

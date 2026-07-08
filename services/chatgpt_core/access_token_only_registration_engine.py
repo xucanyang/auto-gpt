@@ -746,13 +746,20 @@ class AccessTokenOnlyRegistrationEngine:
             or "账号无效"
         ).strip()
 
-    def _probe_homepage_before_email_creation(self) -> tuple[bool, str]:
-        self._prepared_register_client = None
-        client = ChatGPTClient(
+    def _build_chatgpt_client(self) -> ChatGPTClient:
+        return ChatGPTClient(
             proxy=self.proxy_url,
             verbose=False,
             browser_mode=self.browser_mode,
+            fingerprint=(
+                self.extra_config.get("chatgpt_browser_fingerprint")
+                or self.extra_config.get("browser_fingerprint")
+            ),
         )
+
+    def _probe_homepage_before_email_creation(self) -> tuple[bool, str]:
+        self._prepared_register_client = None
+        client = self._build_chatgpt_client()
         client._log = self._log
         keep_client = False
         try:
@@ -911,11 +918,7 @@ class AccessTokenOnlyRegistrationEngine:
                     )
 
                     # 2. 初始化 V2 客户端
-                    chatgpt_client = self._prepared_register_client or ChatGPTClient(
-                        proxy=self.proxy_url,
-                        verbose=False,
-                        browser_mode=self.browser_mode,
-                    )
+                    chatgpt_client = self._prepared_register_client or self._build_chatgpt_client()
                     self._prepared_register_client = None
                     chatgpt_client._log = self._log
                     self._last_chatgpt_client = chatgpt_client

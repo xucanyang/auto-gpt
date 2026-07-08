@@ -487,6 +487,10 @@ class PhoneRegistrationEngine:
                     browser_mode=self.browser_mode,
                     log_fn=lambda msg, level="debug", *_: self._log(f"[手机号注册链路] {msg}", level),
                     stop_checker=self.stop_checker,
+                    fingerprint=(
+                        self.extra_config.get("chatgpt_browser_fingerprint")
+                        or self.extra_config.get("browser_fingerprint")
+                    ),
                 )
                 auth_route = client.warm_chatgpt_and_signin(phone)
                 route_path = urlsplit(str(getattr(auth_route, "final_url", "") or "")).path
