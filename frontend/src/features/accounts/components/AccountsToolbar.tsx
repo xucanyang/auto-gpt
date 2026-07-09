@@ -34,6 +34,16 @@ export type AccountsToolbarActionId =
 type AccountsToolbarDangerActionId = 'deleteInvalid' | 'batchDelete'
 type MoreMenuClickInfo = Parameters<NonNullable<MenuProps['onClick']>>[0]
 type ToolbarMenuItem = Exclude<NonNullable<MenuProps['items']>[number], null>
+type ActiveTaskSnapshot = {
+  id?: string | number
+  task_id?: string | number
+  source?: string
+  progress?: string | number
+  meta?: Record<string, unknown>
+  email?: string
+  platform?: string
+  [key: string]: unknown
+}
 
 const DEFAULT_PINNED_ACTION_IDS: AccountsToolbarActionId[] = ['statusSync', 'paymentLink']
 const MAX_PINNED_ACTIONS = 3
@@ -122,8 +132,8 @@ type AccountsToolbarProps = {
   accountsCount?: number
   selectedRowKeys: React.Key[]
   activeTasksLoading: boolean
-  activeTasks: any[]
-  onOpenTaskSnapshot: (snapshot: any) => void
+  activeTasks: ActiveTaskSnapshot[]
+  onOpenTaskSnapshot: (snapshot: ActiveTaskSnapshot) => void
   onRefreshActiveTasks: () => Promise<void> | void
   onActiveTasksOpen: () => void
   isChatgptPlatform: boolean

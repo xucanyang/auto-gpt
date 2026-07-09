@@ -1,15 +1,21 @@
 import type { ReactNode } from 'react'
 import { useEffect, useRef, useState } from 'react'
 import { Card, Checkbox, Empty, Pagination, Spin, Table } from 'antd'
+import type { TableColumnsType, TableProps } from 'antd'
 
 type MobileCardHelpers = {
   checked: boolean
   onCheckedChange: (checked: boolean) => void
 }
 
+type AccountTableRecord = {
+  id: React.Key
+  [key: string]: unknown
+}
+
 type AccountsTableProps = {
-  columns: any[]
-  accounts: any[]
+  columns: TableColumnsType<AccountTableRecord>
+  accounts: AccountTableRecord[]
   loading: boolean
   total: number
   currentPage: number
@@ -19,10 +25,10 @@ type AccountsTableProps = {
   pageSizeOptions?: number[]
   selectedRowKeys: React.Key[]
   setSelectedRowKeys: (keys: React.Key[]) => void
-  onOpenDetail: (record: any) => void
-  onTableChange?: (pagination: any, filters: Record<string, any>, sorter: any, extra: any) => void
+  onOpenDetail: (record: AccountTableRecord) => void
+  onTableChange?: TableProps<AccountTableRecord>['onChange']
   isMobile?: boolean
-  renderMobileCard?: (record: any, helpers: MobileCardHelpers) => ReactNode
+  renderMobileCard?: (record: AccountTableRecord, helpers: MobileCardHelpers) => ReactNode
 }
 
 export function AccountsTable({
@@ -169,7 +175,7 @@ export function AccountsTable({
   return (
     <div style={{ flex: '1 1 auto', minHeight: 0, minWidth: 0, display: 'flex', flexDirection: 'column' }}>
       <div ref={tableAreaRef} className="auto-chatgpt-accounts-table-scroll" style={{ flex: '1 1 auto', minHeight: 0, minWidth: 0, overflow: 'hidden' }}>
-        <Table
+        <Table<AccountTableRecord>
           className="auto-chatgpt-accounts-table"
           rowKey="id"
           columns={columns}

@@ -84,12 +84,6 @@ function AppContent({ hasPassword }: { hasPassword: boolean }) {
     localStorage.setItem('theme', themeMode)
   }, [themeMode])
 
-  useEffect(() => {
-    if (isMobile) {
-      setCollapsed(true)
-    }
-  }, [isMobile])
-
   const isLight = themeMode === 'light'
   const currentTheme = isLight ? lightTheme : darkTheme
 
@@ -149,6 +143,11 @@ function AppContent({ hasPassword }: { hasPassword: boolean }) {
             collapsedWidth={isMobile ? 0 : 64}
             collapsed={collapsed}
             onCollapse={setCollapsed}
+            onBreakpoint={(broken) => {
+              if (broken) {
+                setCollapsed(true)
+              }
+            }}
             style={{
               background: currentTheme.token?.colorBgContainer,
               borderRight: `1px solid ${currentTheme.token?.colorBorder}`,
@@ -247,7 +246,7 @@ function AppContent({ hasPassword }: { hasPassword: boolean }) {
                     marginTop: 4,
                   }}
                 >
-                  v1.3.44
+                  v1.3.45
                 </div>
               )}
             </div>

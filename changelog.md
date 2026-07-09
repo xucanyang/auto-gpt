@@ -6,6 +6,16 @@
 
 ## [Unreleased] (未发布)
 
+## [1.3.45] - 2026-07-10
+### 优化 (Changed)
+- **收敛账号页组件的类型边界**：`frontend/src/features/accounts/components/AccountsTable.tsx` 使用 Ant Design 表格泛型和账号记录类型替代表格列、账号记录、详情回调及表格变更回调上的隐式 `any`；`frontend/src/features/accounts/components/AccountsToolbar.tsx` 为运行中任务快照补充最小字段类型，保留未知扩展字段透传，降低账号页 UI 继续演进时的类型回归风险。
+
+### 修复 (Fixed)
+- **修复响应式侧栏的 effect lint 债务**：`frontend/src/app/AppShell.tsx` 移除移动断点变化时在 `useEffect` 中同步更新折叠状态的写法，改由 Ant Design `Sider` 的断点回调收起侧栏；移动端手动打开、菜单跳转后关闭和遮罩关闭行为保持不变，同时消除 `react-hooks/set-state-in-effect` 错误。
+
+### 测试 (Tests)
+- **完成前端 lint 与构建验证**：账号页目标组件 scoped ESLint 通过；全量 ESLint 从 `629 errors / 24 warnings` 降至 `618 errors / 24 warnings`，剩余问题为其他页面和历史模块债务；`cd frontend && npm run build` 通过，仅保留已有的 `page-accounts` 大 chunk 警告。
+
 ## [1.3.44] - 2026-07-10
 ### 优化 (Changed)
 - **收敛 ChatGPT 账号页工具栏分区**：`frontend/src/features/accounts/components/AccountsToolbar.tsx` 与 `frontend/src/index.css` 将批量操作和显示设置拆成稳定的上下两行；桌面端不再让设置按钮与批量操作争抢同一行，操作按钮空间不足时可以正常换行，移动端按两列网格展示并在超窄屏切换为单列。
@@ -1035,4 +1045,8 @@
 
 ## 2026-07-10 05:09:21 +0800
 - 修正 ChatGPT 账号页工具栏分区和统计摘要响应式布局
+- 发布模式: multi
+
+## 2026-07-10 06:06:44 +0800
+- 清理账号页组件 lint 债务并修复响应式侧栏状态同步
 - 发布模式: multi
