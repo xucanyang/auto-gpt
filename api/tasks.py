@@ -10698,11 +10698,23 @@ def _run_phone_binding_test_concurrent(
         _log(task_id, f"[STOP] {exc}")
         sync_meta()
         with state_lock:
+            success_snapshot = success_count
+            skipped_snapshot = skipped_count
+            errors_snapshot = list(errors)
             primary_email_snapshot = primary_email
             bound_phone_lines_snapshot = list(bound_phone_lines)
             bound_phone_results_snapshot = list(bound_phone_results)
             runtime_results_snapshot = list(runtime_results)
             account_results_snapshot = list(account_results)
+        _task_store.finish(
+            task_id,
+            status="stopped",
+            success=success_snapshot,
+            skipped=skipped_snapshot,
+            errors=errors_snapshot,
+            error=str(exc),
+        )
+        latest_meta = dict(_task_store.snapshot(task_id).get("meta") or {})
         _save_task_log(
             "chatgpt",
             primary_email_snapshot,
@@ -10714,7 +10726,7 @@ def _run_phone_binding_test_concurrent(
                     "email": primary_email_snapshot,
                     "attempt_outcome": "phone_binding_test_stopped",
                     "source": "phone_binding_test",
-                    "meta": dict(_task_store.snapshot(task_id).get("meta") or {}),
+                    "meta": latest_meta,
                     "bound_phone_lines": [redact_raw_phone_line(line) for line in bound_phone_lines_snapshot],
                     "bound_phone_results": [sanitize_phone_result(item) for item in bound_phone_results_snapshot],
                     "runtime_results": [sanitize_phone_result(item) for item in runtime_results_snapshot],
@@ -12293,6 +12305,15 @@ def _run_phone_binding_test(
     except StopTaskRequested as exc:
         _log(task_id, f"[STOP] {exc}")
         sync_meta()
+        _task_store.finish(
+            task_id,
+            status="stopped",
+            success=success_count,
+            skipped=skipped_count,
+            errors=list(errors),
+            error=str(exc),
+        )
+        latest_meta = dict(_task_store.snapshot(task_id).get("meta") or {})
         _save_task_log(
             "chatgpt",
             primary_email,
@@ -12304,7 +12325,7 @@ def _run_phone_binding_test(
                     "email": primary_email,
                     "attempt_outcome": "phone_binding_test_stopped",
                     "source": "phone_binding_test",
-                    "meta": dict(_task_store.snapshot(task_id).get("meta") or {}),
+                    "meta": latest_meta,
                     "bound_phone_lines": [redact_raw_phone_line(line) for line in bound_phone_lines],
                     "bound_phone_results": [sanitize_phone_result(item) for item in bound_phone_results],
                     "runtime_results": [sanitize_phone_result(item) for item in runtime_results],

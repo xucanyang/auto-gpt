@@ -7,6 +7,16 @@
 ## [Unreleased] (未发布)
 
 
+## [1.3.41] - 2026-07-09
+### 修复 (Fixed)
+- **修复手机号绑定任务手动停止后仍占用右上角运行中任务**：`api/tasks.py` 的手机号绑定串行与并发 runner 在捕获 `StopTaskRequested` 时现在会同步调用 `_task_store.finish(status="stopped")`，再写入任务历史；避免任务日志已经记录“任务已手动停止”，但内存任务快照仍保持 `running + stop_requested=true + active_attempts=0`，导致账号页右上角“正在运行任务”长期显示幽灵任务。
+- **修复 Idea 提交状态长期停在“提交中”**：`services/chatgpt_core/baxigpt_status_poller.py` 新增账号级 Idea 订单回填器，后台会扫描 `accounts.extra_json.baxigpt_cdk.status=submitted/processing` 且已过短暂冷却的账号，直接按账号保存的 `order_id`（或 `cdk_id + display_id` 回补出的订单号）查询上游终态，并把账号级 `baxigpt_cdk`、历史记录和 `account_list_state.idea_submit_state` 同步更新为 `paid / failed / processing`。这补齐了原来只按 `baxigpt_cdk_pool` 单行轮询的缺口：一个卡密可提交多个账号，但卡密池表只能保存最后一个订单，任务停止或重启后较早订单会失去 poller target，账号页就会错误地一直显示“提交中”。
+
+### 优化 (Changed)
+- **增强 BaxiGPT/Idea 轮询可观测性**：`/api/baxigpt-cdk-pool/poll` 的 poller 快照新增 `account_reconcile`，展示账号级回填器的下次执行时间、最近一次检查数、更新数、paid/failed/processing 分布和错误摘要，方便运营区分“上游仍在处理”和“本地漏同步”。
+- **同步前端版本号至 v1.3.41**：`frontend/src/app/AppShell.tsx` 侧边栏版本展示更新为 `v1.3.41`，用于上线后确认本次任务状态与 Idea 提交状态修复版本已加载。
+
+
 ## [1.3.40] - 2026-07-09
 ### 新增 (Added)
 - **手机号绑定任务支持账号级并发执行**：`api/tasks.py` 的 `PhoneBindingTestTaskRequest` 新增 `concurrency` 参数，手机号绑定任务会在 `concurrency > 1` 时启用并发 runner，同时处理多个账号；后端将请求并发数限制在 `1~5`，并在任务 `meta.settings`、`requested_concurrency`、`effective_concurrency` 中记录请求值、实际值和强制降级原因，方便任务详情回放。并发 runner 对手机号分配、结果列表、成功/跳过计数、任务快照同步使用线程锁，避免多个账号同时领取同一个上传号码或同一个手机号池候选。
@@ -963,4 +973,8 @@
 
 ## 2026-07-09 08:33:39 +0800
 - 手机号绑定任务支持账号级并发设置
+- 发布模式: multi
+
+## 2026-07-09 16:34:53 +0800
+- 修复 Idea 提交状态回填与停止任务幽灵显示
 - 发布模式: multi

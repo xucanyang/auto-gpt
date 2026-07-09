@@ -15,6 +15,8 @@ from sqlmodel import Session, select
 
 from core.db import AccountModel, engine
 from services.chatgpt_core.baxigpt_cdk_repository import (
+    IDEA_SUBMIT_MARKER_KEY,
+    IDEA_SUBMIT_UNAVAILABLE_KEYS,
     STATUS_DISABLED,
     STATUS_FAILED,
     STATUS_PAID,
@@ -35,6 +37,10 @@ POLLABLE_STATUSES = {STATUS_SUBMITTED, STATUS_PROCESSING}
 RESTORE_WINDOW_SECONDS = 24 * 3600
 DEFAULT_INTERVAL_SECONDS = 5
 DEFAULT_TIMEOUT_SECONDS = 300
+ACCOUNT_RECONCILE_INTERVAL_SECONDS = 60
+ACCOUNT_RECONCILE_BATCH_SIZE = 50
+ACCOUNT_RECONCILE_STALE_SECONDS = 120
+ACCOUNT_RECONCILE_STATUSES = {STATUS_SUBMITTED, STATUS_PROCESSING, "pending", "polling"}
 
 
 @dataclass(slots=True)
@@ -55,6 +61,17 @@ _lock = threading.Lock()
 _stop_event = threading.Event()
 _worker_thread: threading.Thread | None = None
 _targets: dict[int, BaxiGptStatusPollTarget] = {}
+_account_reconcile_next_due_at = 0.0
+_account_reconcile_last_result: dict[str, Any] = {
+    "checked": 0,
+    "updated": 0,
+    "paid": 0,
+    "failed": 0,
+    "processing": 0,
+    "skipped": 0,
+    "errors": [],
+    "finished_at": "",
+}
 
 
 def _positive_int(value: Any, default: int, *, minimum: int = 1, maximum: int = 86400) -> int:
@@ -95,6 +112,274 @@ def _recent_record(record: Any, *, max_age_seconds: int = RESTORE_WINDOW_SECONDS
     # 按需求只看“最近提交”或“最近查询”，不把 updated_at 当作恢复依据，避免历史 failed/reset 之类误入队列。
     candidates = (getattr(record, "submitted_at", ""), getattr(record, "last_checked_at", ""))
     return any(ts > 0 and now - ts <= max_age_seconds for ts in (_parse_time(value) for value in candidates))
+
+
+def _now_text() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _normalize_account_order_status(value: Any) -> str:
+    status = str(value or "").strip().lower()
+    if status in {"paid", "success", "completed"}:
+        return STATUS_PAID
+    if status in {"failed", "fail", "expired", "cancelled", "canceled", "invalid", "error", "used"}:
+        return STATUS_FAILED
+    if status in {"processing", "pending", "submitted", "polling", "extracting", "wait_scan", "wait-scan", "verifying"}:
+        return STATUS_PROCESSING
+    return STATUS_PROCESSING
+
+
+def _account_order_payload(account: AccountModel) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    try:
+        extra = account.get_extra()
+    except Exception:
+        extra = {}
+    if not isinstance(extra, dict):
+        extra = {}
+    payload = extra.get("baxigpt_cdk") if isinstance(extra.get("baxigpt_cdk"), dict) else {}
+    status = str(payload.get("status") or "").strip().lower()
+    if status not in ACCOUNT_RECONCILE_STATUSES:
+        return None
+    return extra, dict(payload)
+
+
+def _resolve_account_order_id(payload: dict[str, Any], *, repo: BaxiGptCdkRepository) -> tuple[str, str]:
+    """Return (poll_order_id, persisted_order_id).
+
+    历史账号 extra 里有些只保存了 display_id，没有保存 `cdk::task_id`。
+    轮询上游必须带卡密，所以这里按 cdk_id 回查卡密行临时拼出 order_id。
+    """
+
+    order_id = str(payload.get("order_id") or "").strip()
+    if "::" in order_id:
+        return order_id, order_id
+
+    display_id = str(payload.get("display_id") or "").strip()
+    if not display_id:
+        return "", order_id
+    try:
+        cdk_id = int(payload.get("cdk_id") or 0)
+    except Exception:
+        cdk_id = 0
+    if cdk_id <= 0:
+        return "", order_id
+    record = repo.get_by_id(cdk_id)
+    code = str(getattr(record, "code_value", "") or "").strip() if record is not None else ""
+    if not code:
+        return "", order_id
+    resolved = f"{code}::{display_id}"
+    return resolved, resolved
+
+
+def _upsert_account_order_history(extra: dict[str, Any], payload: dict[str, Any]) -> None:
+    history = extra.get("baxigpt_cdk_history")
+    if not isinstance(history, list):
+        history = []
+    last_history = history[-1] if history and isinstance(history[-1], dict) else {}
+    history_changed = any(
+        str(last_history.get(key) or "") != str(payload.get(key) or "")
+        for key in ("status", "upstream_status", "order_id", "display_id", "last_error_message")
+    )
+    if not history or history_changed:
+        history.append(dict(payload))
+    extra["baxigpt_cdk_history"] = history[-20:]
+
+
+def _clear_idea_unavailable_marker(extra: dict[str, Any]) -> None:
+    marker = extra.get(IDEA_SUBMIT_MARKER_KEY)
+    if isinstance(marker, dict):
+        marker = dict(marker)
+        marker["available"] = True
+        marker["unavailable"] = False
+        marker["cleared_at"] = _now_text()
+        marker.pop("reason", None)
+        extra[IDEA_SUBMIT_MARKER_KEY] = marker
+    for key in IDEA_SUBMIT_UNAVAILABLE_KEYS:
+        extra.pop(key, None)
+
+
+def _account_reconcile_candidate_rows(
+    *,
+    limit: int,
+    stale_seconds: int,
+    repo: BaxiGptCdkRepository,
+) -> tuple[list[dict[str, Any]], int]:
+    now = time.time()
+    candidates: list[dict[str, Any]] = []
+    skipped = 0
+    with Session(engine) as session:
+        accounts = session.exec(select(AccountModel).where(AccountModel.platform == "chatgpt")).all()
+        for account in accounts:
+            parsed = _account_order_payload(account)
+            if parsed is None:
+                continue
+            extra, payload = parsed
+            poll_order_id, persisted_order_id = _resolve_account_order_id(payload, repo=repo)
+            if not poll_order_id:
+                candidates.append(
+                    {
+                        "account_id": int(account.id or 0),
+                        "email": str(account.email or ""),
+                        "payload": payload,
+                        "poll_order_id": "",
+                        "persisted_order_id": persisted_order_id,
+                        "last_checked_ts": 0,
+                        "missing_order_id": True,
+                    }
+                )
+                continue
+            last_checked_ts = _parse_time(payload.get("last_checked_at") or payload.get("submitted_at"))
+            if stale_seconds > 0 and last_checked_ts > 0 and now - last_checked_ts < stale_seconds:
+                skipped += 1
+                continue
+            candidates.append(
+                {
+                    "account_id": int(account.id or 0),
+                    "email": str(account.email or ""),
+                    "payload": payload,
+                    "poll_order_id": poll_order_id,
+                    "persisted_order_id": persisted_order_id,
+                    "last_checked_ts": last_checked_ts,
+                    "missing_order_id": False,
+                }
+            )
+    candidates.sort(key=lambda item: (float(item.get("last_checked_ts") or 0), int(item.get("account_id") or 0)))
+    if limit > 0:
+        candidates = candidates[:limit]
+    return candidates, skipped
+
+
+def _apply_account_order_status(
+    *,
+    account_id: int,
+    payload: dict[str, Any],
+    response: dict[str, Any],
+    persisted_order_id: str = "",
+) -> str:
+    status = _normalize_account_order_status(response.get("status"))
+    now_text = _now_text()
+    message = str(response.get("message") or response.get("error") or response.get("detail") or "").strip()
+    with Session(engine) as session:
+        account = session.get(AccountModel, int(account_id or 0))
+        if account is None or account.platform != "chatgpt":
+            return "missing"
+        try:
+            extra = account.get_extra()
+        except Exception:
+            extra = {}
+        if not isinstance(extra, dict):
+            extra = {}
+        current_payload = extra.get("baxigpt_cdk") if isinstance(extra.get("baxigpt_cdk"), dict) else {}
+        # 不覆盖任务运行中刚写入的其他订单：只有同一 order/display/cdk 仍处于提交态才回填。
+        current_status = str(current_payload.get("status") or "").strip().lower()
+        if current_status not in ACCOUNT_RECONCILE_STATUSES:
+            return "not_pollable"
+        current_order = str(current_payload.get("order_id") or "").strip()
+        current_display = str(current_payload.get("display_id") or "").strip()
+        expected_order = str(payload.get("order_id") or persisted_order_id or "").strip()
+        expected_display = str(payload.get("display_id") or "").strip()
+        if expected_order and current_order and current_order != expected_order:
+            return "changed"
+        if expected_display and current_display and current_display != expected_display:
+            return "changed"
+
+        next_payload = dict(current_payload)
+        next_payload["status"] = status
+        next_payload["upstream_status"] = status
+        if persisted_order_id and not str(next_payload.get("order_id") or "").strip():
+            next_payload["order_id"] = persisted_order_id
+        if response.get("display_id"):
+            next_payload["display_id"] = str(response.get("display_id") or "")
+        if response.get("email"):
+            next_payload["remote_email"] = str(response.get("email") or "")
+        next_payload["last_checked_at"] = now_text
+        next_payload["last_error_message"] = message
+        if status == STATUS_PAID and not next_payload.get("paid_at"):
+            next_payload["paid_at"] = now_text
+        if status == STATUS_PAID:
+            next_payload["last_error_message"] = ""
+            _clear_idea_unavailable_marker(extra)
+
+        extra["baxigpt_cdk"] = next_payload
+        _upsert_account_order_history(extra, next_payload)
+        account.set_extra(extra)
+        account.updated_at = datetime.now(timezone.utc)
+        session.add(account)
+        session.commit()
+
+    with Session(engine) as session:
+        from services.account_filters import upsert_account_list_state_for_account_ids
+
+        upsert_account_list_state_for_account_ids(session, [int(account_id or 0)], commit=True)
+    return status
+
+
+def reconcile_pending_account_statuses_once(
+    *,
+    limit: int = ACCOUNT_RECONCILE_BATCH_SIZE,
+    stale_seconds: int = ACCOUNT_RECONCILE_STALE_SECONDS,
+) -> dict[str, Any]:
+    """Poll account-level Idea orders that are no longer represented by cdk_pool.
+
+    The cdk pool table stores one mutable row per card code, but a single card can
+    submit many account orders.  When a batch task is stopped/restarted, older
+    account orders can remain only in `accounts.extra_json.baxigpt_cdk`; this
+    reconciler polls those account-level order IDs directly and refreshes the
+    derived account-list cache.
+    """
+
+    repo = BaxiGptCdkRepository()
+    client = BaxiGptClient(timeout=15, retries=0)
+    candidates, skipped_fresh = _account_reconcile_candidate_rows(
+        limit=max(int(limit or 0), 0),
+        stale_seconds=max(int(stale_seconds or 0), 0),
+        repo=repo,
+    )
+    result: dict[str, Any] = {
+        "checked": 0,
+        "updated": 0,
+        "paid": 0,
+        "failed": 0,
+        "processing": 0,
+        "missing": 0,
+        "skipped": int(skipped_fresh or 0),
+        "errors": [],
+        "finished_at": _now_text(),
+    }
+    for candidate in candidates:
+        account_id = int(candidate.get("account_id") or 0)
+        email = str(candidate.get("email") or "")
+        poll_order_id = str(candidate.get("poll_order_id") or "")
+        persisted_order_id = str(candidate.get("persisted_order_id") or "")
+        payload = dict(candidate.get("payload") or {})
+        result["checked"] += 1
+        try:
+            if not poll_order_id:
+                response = {
+                    "ok": False,
+                    "status": STATUS_FAILED,
+                    "message": "缺少上游 order_id/display_id，不能继续轮询",
+                }
+            else:
+                response = client.status(poll_order_id)
+            applied = _apply_account_order_status(
+                account_id=account_id,
+                payload=payload,
+                response=response,
+                persisted_order_id=persisted_order_id,
+            )
+            if applied in {STATUS_PAID, STATUS_FAILED, STATUS_PROCESSING}:
+                result["updated"] += 1
+                result[applied] += 1
+            elif applied == "missing":
+                result["missing"] += 1
+            else:
+                result["skipped"] += 1
+        except Exception as exc:
+            errors = result.setdefault("errors", [])
+            if isinstance(errors, list) and len(errors) < 20:
+                errors.append({"account_id": account_id, "email": email, "error": str(exc)[:300]})
+    return result
 
 
 def _target_snapshot(target: BaxiGptStatusPollTarget) -> dict[str, Any]:
@@ -299,6 +584,10 @@ def snapshot() -> dict[str, Any]:
             "queued": len(_targets),
             "ids": sorted(_targets),
             "targets": targets,
+            "account_reconcile": {
+                "next_due_at": float(_account_reconcile_next_due_at or 0),
+                "last_result": dict(_account_reconcile_last_result),
+            },
         }
 
 
@@ -326,12 +615,46 @@ def _reschedule_target(target: BaxiGptStatusPollTarget) -> None:
         current.last_error = target.last_error
 
 
+def _account_reconcile_due(now: float) -> bool:
+    with _lock:
+        return now >= float(_account_reconcile_next_due_at or 0)
+
+
+def _run_account_reconcile_if_due(now: float) -> None:
+    global _account_reconcile_next_due_at, _account_reconcile_last_result
+    if not _account_reconcile_due(now):
+        return
+    with _lock:
+        # 先推进下次执行时间，避免本轮网络慢时被连续重入。
+        _account_reconcile_next_due_at = time.time() + ACCOUNT_RECONCILE_INTERVAL_SECONDS
+    try:
+        result = reconcile_pending_account_statuses_once(
+            limit=ACCOUNT_RECONCILE_BATCH_SIZE,
+            stale_seconds=ACCOUNT_RECONCILE_STALE_SECONDS,
+        )
+    except Exception as exc:
+        result = {
+            "checked": 0,
+            "updated": 0,
+            "paid": 0,
+            "failed": 0,
+            "processing": 0,
+            "skipped": 0,
+            "errors": [{"error": str(exc)[:300]}],
+            "finished_at": _now_text(),
+        }
+    with _lock:
+        _account_reconcile_last_result = dict(result)
+
+
 def _loop() -> None:
     repo = BaxiGptCdkRepository()
     client = BaxiGptClient()
     while not _stop_event.is_set():
-        due = _take_due_targets(time.time())
+        now = time.time()
+        due = _take_due_targets(now)
         if not due:
+            _run_account_reconcile_if_due(now)
             _stop_event.wait(0.5)
             continue
         for target in due:
