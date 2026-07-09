@@ -172,6 +172,7 @@ type AccountsToolbarProps = {
   backfillLoading: string
   pinnedActionIds?: string[]
   isMobile?: boolean
+  selectedAccountsControl?: ReactNode
   columnVisibilityControl?: ReactNode
   toolbarActionVisibilityControl?: ReactNode
 }
@@ -220,6 +221,7 @@ export function AccountsToolbar({
   backfillLoading,
   pinnedActionIds,
   isMobile = false,
+  selectedAccountsControl,
   columnVisibilityControl,
   toolbarActionVisibilityControl,
 }: AccountsToolbarProps) {
@@ -686,8 +688,10 @@ export function AccountsToolbar({
       </div>
 
       <div className="accounts-toolbar-action-row">
-        {showOperationGroups ? (
-          <div className="accounts-toolbar-ops">
+        <div className={`accounts-toolbar-ops${isMobile && !showOperationGroups ? ' accounts-toolbar-ops-controls-only' : ''}`}>
+          {!isMobile ? selectedAccountsControl : null}
+          {showOperationGroups ? (
+            <>
             {pinnedActionIdsToRender.map((actionId) => renderPinnedAction(actionId))}
             <Dropdown
               menu={{ items: moreOperationMenuItems, onClick: handleMoreOperationClick }}
@@ -698,11 +702,9 @@ export function AccountsToolbar({
                 更多操作 <DownOutlined />
               </Button>
             </Dropdown>
-          </div>
-        ) : null}
-        <div className="accounts-toolbar-settings" aria-label="账号显示设置">
-          <span className="accounts-toolbar-settings-label">显示设置</span>
-          <div className="accounts-toolbar-settings-controls">
+            </>
+          ) : null}
+          <div className="accounts-toolbar-inline-controls">
             {toolbarActionVisibilityControl}
             {columnVisibilityControl}
           </div>

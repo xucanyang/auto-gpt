@@ -6,6 +6,18 @@
 
 ## [Unreleased] (未发布)
 
+## [1.3.46] - 2026-07-10
+### 优化 (Changed)
+- **恢复 ChatGPT 账号页正确的信息归属**：`frontend/src/features/accounts/components/AccountsToolbar.tsx`、`frontend/src/pages/Accounts.tsx` 与 `frontend/src/index.css` 将 `总数 / 已选`移回状态同步所在的批量操作栏；桌面端依次展示统计、最多三个固定操作、更多操作、操作显示和显示字段，不再为显示控制创建独立卡片或额外纵向区块。跨页选中账号继续从 `selectedAccountSnapshots` 生成，已选 Popover、单项移除和清空选择语义保持不变。
+- **恢复邮箱列内搜索并保留移动端唯一入口**：桌面端邮箱列标题重新承载 `Input.Search`，复用原有 `search / columnFilters.email / debouncedSearch`、300ms debounce 和筛选组合序列化；`<992px` 的账号卡片视图没有桌面表头，因此邮箱搜索仅保留在移动筛选卡内，任一断点均不会出现重复搜索入口。
+- **压缩默认筛选区高度**：`frontend/src/features/accounts/components/FilterPresetBar.tsx` 在桌面无有效筛选时不再渲染“筛选：无筛选条件”空摘要，只保留筛选组合与置顶组合；存在有效筛选、已应用组合或组合 dirty 时仍展示摘要、覆盖保存、另存为与还原操作。
+
+### 修复 (Fixed)
+- **修复移动端显示控制伪装成独立设置卡的问题**：移动端批量操作折叠时，“操作显示”和“字段”仍可访问，但改为无边框的紧凑双按钮控制条；展开批量操作后继续使用既有两列/超窄单列操作网格，不产生标题为“显示设置”的独立面板。
+
+### 测试 (Tests)
+- **完成账号页浏览器回归**：通过临时真实数据预览验证 1440、1280、900、420px：桌面无 `.accounts-toolbar-settings`、邮箱表头仅一个搜索框、筛选组合卡无桌面搜索、统计在工具栏；移动端仅保留筛选卡邮箱搜索和紧凑控制条。桌面勾选一条账号后工具栏从 `已选：0` 更新为 `已选：1`，Popover 可展示选中邮箱；桌面与移动邮箱搜索均发起正确的 `/api/accounts?email=...` 查询。`npm run build`、组件 scoped ESLint、`git diff --check` 均通过；全量 ESLint 基线维持 `618 errors / 24 warnings`。
+
 ## [1.3.45] - 2026-07-10
 ### 优化 (Changed)
 - **收敛账号页组件的类型边界**：`frontend/src/features/accounts/components/AccountsTable.tsx` 使用 Ant Design 表格泛型和账号记录类型替代表格列、账号记录、详情回调及表格变更回调上的隐式 `any`；`frontend/src/features/accounts/components/AccountsToolbar.tsx` 为运行中任务快照补充最小字段类型，保留未知扩展字段透传，降低账号页 UI 继续演进时的类型回归风险。
@@ -1049,4 +1061,8 @@
 
 ## 2026-07-10 06:06:44 +0800
 - 清理账号页组件 lint 债务并修复响应式侧栏状态同步
+- 发布模式: multi
+
+## 2026-07-10 07:19:06 +0800
+- 重构 ChatGPT 账号页操作栏与邮箱列搜索布局
 - 发布模式: multi

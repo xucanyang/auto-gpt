@@ -219,7 +219,7 @@ body {
 
 .accounts-filter-preset-main-row {
   display: grid;
-  grid-template-columns: minmax(190px, 220px) minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr);
   gap: 8px;
   align-items: center;
   min-width: 0;
@@ -237,6 +237,7 @@ body {
 
 .accounts-filter-preset-main-controls {
   display: flex;
+  width: 100%;
   align-items: center;
   gap: 8px;
   white-space: nowrap;
@@ -322,6 +323,45 @@ body {
   align-items: center;
   gap: 6px;
   white-space: nowrap;
+}
+
+.accounts-filter-preset-mobile-selected-accounts {
+  width: 100%;
+}
+
+.accounts-selected-summary {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  white-space: nowrap;
+}
+
+.accounts-selected-summary-count {
+  cursor: pointer;
+  margin-inline-end: 0;
+}
+
+.accounts-selected-summary-clear {
+  padding: 0;
+}
+
+.accounts-selected-account-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  max-width: 430px;
+  max-height: 240px;
+  overflow: auto;
+}
+
+.accounts-selected-account-tag-email {
+  display: inline-block;
+  max-width: 230px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: bottom;
 }
 
 .accounts-mobile-filter-grid {
@@ -503,9 +543,7 @@ body {
 }
 
 .accounts-toolbar-action-row {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr);
-  gap: 10px;
+  display: block;
   width: 100%;
   min-width: 0;
 }
@@ -536,39 +574,21 @@ body {
   white-space: normal;
 }
 
-.accounts-toolbar-settings {
-  width: 100%;
+.accounts-toolbar-inline-controls {
+  display: inline-flex;
   flex: 0 0 auto;
-  display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  min-width: 0;
-  padding: 8px 12px;
-  border: 1px solid rgba(122, 139, 163, 0.20);
-  border-radius: 10px;
-  background: rgba(28, 31, 46, 0.20);
-  box-sizing: border-box;
-}
-
-.accounts-toolbar-settings-label {
-  flex: 0 0 auto;
-  color: oklch(0.64 0.035 265);
-  font-size: 12px;
-  font-weight: 650;
-  white-space: nowrap;
-}
-
-.accounts-toolbar-settings-controls {
-  display: flex;
-  flex: 1 1 auto;
-  align-items: center;
-  justify-content: flex-end;
   gap: 6px;
+  margin-left: auto;
   min-width: 0;
 }
 
-.accounts-toolbar-settings-controls .ant-btn {
+.accounts-toolbar-inline-controls > * {
+  flex: 0 0 auto;
+  min-width: 0;
+}
+
+.accounts-toolbar-inline-controls .ant-btn {
   white-space: nowrap;
 }
 
@@ -624,15 +644,6 @@ body {
 .light .accounts-toolbar-ops {
   background: rgba(241, 245, 249, 0.62);
   border-color: rgba(100, 116, 139, 0.18);
-}
-
-.light .accounts-toolbar-settings {
-  border-color: rgba(100, 116, 139, 0.18);
-  background: rgba(241, 245, 249, 0.34);
-}
-
-.light .accounts-toolbar-settings-label {
-  color: oklch(0.48 0.04 265);
 }
 
 .light .accounts-toolbar-total {
@@ -1011,6 +1022,12 @@ body {
     white-space: normal;
   }
 
+  .accounts-toolbar-ops-controls-only {
+    padding: 0;
+    border: 0;
+    background: transparent;
+  }
+
   .accounts-toolbar-ops > *,
   .accounts-toolbar-ops .ant-btn {
     width: 100%;
@@ -1287,6 +1304,21 @@ body {
     white-space: normal;
   }
 
+  .accounts-filter-preset-mobile-selected-accounts .accounts-selected-summary {
+    width: 100%;
+    flex-wrap: wrap;
+    white-space: normal;
+  }
+
+  .accounts-selected-account-tags {
+    max-width: 300px;
+    max-height: 180px;
+  }
+
+  .accounts-selected-account-tag-email {
+    max-width: 170px;
+  }
+
   .accounts-toolbar-head {
     grid-template-columns: 1fr;
     gap: 10px;
@@ -1298,9 +1330,7 @@ body {
   }
 
   .accounts-toolbar-action-row {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr);
-    gap: 8px;
+    display: block;
     width: 100%;
   }
 
@@ -1321,25 +1351,16 @@ body {
     min-width: 0;
   }
 
-  .accounts-toolbar-settings {
-    flex: 0 0 auto;
-    width: 100%;
-    justify-content: space-between;
-    padding: 8px;
-    border: 1px solid rgba(122, 139, 163, 0.20);
+  .accounts-toolbar-inline-controls {
+    display: contents;
+    margin-left: 0;
   }
 
-  .accounts-toolbar-settings-controls {
-    flex: 1 1 auto;
-    justify-content: flex-end;
-  }
-
-  .accounts-toolbar-settings-controls > * {
-    flex: 1 1 0;
+  .accounts-toolbar-inline-controls > * {
     min-width: 0;
   }
 
-  .accounts-toolbar-settings-controls .ant-btn {
+  .accounts-toolbar-inline-controls .ant-btn {
     width: 100%;
     min-width: 0;
   }
@@ -1350,13 +1371,8 @@ body {
     grid-template-columns: minmax(0, 1fr);
   }
 
-  .accounts-toolbar-settings {
-    align-items: flex-start;
+  .accounts-toolbar-ops-controls-only {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
-  .accounts-toolbar-settings-controls {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr);
-    align-items: stretch;
-  }
 }

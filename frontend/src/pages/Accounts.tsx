@@ -8,6 +8,7 @@ import {
   Input,
   InputNumber,
   Tag,
+  Popover,
   Space,
   Modal,
   Form,
@@ -6724,6 +6725,87 @@ export default function Accounts() {
     setSelectedAccountSnapshots({})
   }
 
+  const selectedAccountTags = (
+    <div className="accounts-selected-account-tags">
+      {selectedAccountItems.map((account) => {
+        const id = String(account?.id || '')
+        const email = String(account?.email || '').trim()
+        const status = String(account?.status || '').trim()
+        const title = email || `账号 ${id}`
+        return (
+          <Tag
+            key={id}
+            closable
+            onClose={(event) => {
+              event.preventDefault()
+              if (id) removeSelectedAccount(id)
+            }}
+            color={STATUS_COLORS[status] || 'default'}
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 4,
+              maxWidth: '100%',
+              marginInlineEnd: 0,
+              padding: '2px 6px',
+            }}
+          >
+            <span className="accounts-selected-account-tag-email" title={title}>
+              {title}
+            </span>
+            <Text type="secondary" style={{ fontSize: 11 }}>
+              ID {id}{status ? ` · ${statusLabel(status)}` : ''}
+            </Text>
+          </Tag>
+        )
+      })}
+      {selectedAccountItems.length === 0 ? <Text type="secondary">暂无选中账号</Text> : null}
+    </div>
+  )
+
+  const selectedAccountsControl = (
+    <div className="accounts-selected-summary">
+      <Text strong style={{ fontSize: 13 }}>总数：{total}</Text>
+      <Text type="secondary">/</Text>
+      {selectedAccountItems.length > 0 ? (
+        <>
+          <Popover content={selectedAccountTags} title="已选账号列表" trigger={['click']} placement={isMobile ? 'bottom' : 'bottomLeft'}>
+            <Tag color="processing" className="accounts-selected-summary-count">已选：{selectedAccountItems.length}</Tag>
+          </Popover>
+          <Button size="small" type="link" onClick={clearSelectedAccounts} className="accounts-selected-summary-clear">
+            清空选择
+          </Button>
+        </>
+      ) : (
+        <Text strong style={{ fontSize: 13 }}>已选：0</Text>
+      )}
+    </div>
+  )
+
+  const renderEmailColumnTitle = () => {
+    if (isMobile) return '邮箱'
+    return (
+      <Input.Search
+        allowClear
+        size="small"
+        placeholder="搜索邮箱"
+        value={search}
+        onChange={(event) => {
+          const value = event.target.value
+          setSearch(value)
+          setColumnFilters((prev) => ({ ...prev, email: value }))
+        }}
+        onSearch={(value) => {
+          const next = String(value || '').trim()
+          setSearch(next)
+          setColumnFilters((prev) => ({ ...prev, email: next }))
+          setDebouncedSearch(next)
+        }}
+        onClick={(event) => event.stopPropagation()}
+      />
+    )
+  }
+
 
 
   const subscriptionExpiryTableSortOrder =
@@ -6749,7 +6831,7 @@ export default function Accounts() {
       ),
     },
     {
-      title: '邮箱',
+      title: renderEmailColumnTitle(),
       dataIndex: 'email',
       key: 'email',
       width: isCompactDesktop ? 210 : 230,
@@ -7409,6 +7491,7 @@ export default function Accounts() {
         total={total}
         selectedRowKeys={selectedRowKeys}
         pinnedActionIds={pinnedToolbarActionIds}
+        selectedAccountsControl={selectedAccountsControl}
         columnVisibilityControl={renderColumnVisibilityControl()}
         toolbarActionVisibilityControl={renderToolbarActionVisibilityControl()}
         activeTasksLoading={activeTasksLoading}
@@ -7505,7 +7588,6 @@ export default function Accounts() {
         pinnedFilterPresets={pinnedFilterPresets}
         activeFilterPreset={activeFilterPreset}
         currentFilterPresetFilters={currentFilterPresetFilters}
-        total={total}
         activeFilterPresetDirty={activeFilterPresetDirty}
         filterPresetSaving={filterPresetSaving}
         applyFilterPreset={applyFilterPreset}
@@ -7515,9 +7597,7 @@ export default function Accounts() {
         loadFilterPresets={loadFilterPresets}
         overwriteActiveFilterPreset={overwriteActiveFilterPreset}
         openCopyFilterPreset={openCopyFilterPreset}
-        selectedAccountItems={selectedAccountItems}
-        removeSelectedAccount={removeSelectedAccount}
-        clearSelectedAccounts={clearSelectedAccounts}
+        selectedAccountsControl={selectedAccountsControl}
         mobileFilterControls={renderMobileFilterControls()}
       />
 
