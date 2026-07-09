@@ -519,9 +519,15 @@ def _resolve_chatgpt_proxy(proxy: Optional[str] = None) -> str:
 
 
 def _resolve_browser_auth_proxy(proxy: Optional[str] = None) -> str:
-    from core.proxy_utils import normalize_proxy_url
+    from core.proxy_utils import normalize_proxy_url, resolve_default_chatgpt_proxy
 
-    return normalize_proxy_url(proxy) or ""
+    explicit = normalize_proxy_url(proxy)
+    if explicit:
+        return explicit
+    try:
+        return resolve_default_chatgpt_proxy(None)
+    except Exception as exc:
+        raise HTTPException(400, f"默认代理解析失败: {exc}") from exc
 
 
 def _is_authenticated_socks_proxy(proxy: Optional[str]) -> bool:
