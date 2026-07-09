@@ -7,6 +7,18 @@
 ## [Unreleased] (未发布)
 
 
+## [1.3.40] - 2026-07-09
+### 新增 (Added)
+- **手机号绑定任务支持账号级并发执行**：`api/tasks.py` 的 `PhoneBindingTestTaskRequest` 新增 `concurrency` 参数，手机号绑定任务会在 `concurrency > 1` 时启用并发 runner，同时处理多个账号；后端将请求并发数限制在 `1~5`，并在任务 `meta.settings`、`requested_concurrency`、`effective_concurrency` 中记录请求值、实际值和强制降级原因，方便任务详情回放。并发 runner 对手机号分配、结果列表、成功/跳过计数、任务快照同步使用线程锁，避免多个账号同时领取同一个上传号码或同一个手机号池候选。
+
+### 优化 (Changed)
+- **保留手机号绑定既有串行语义并对冲高风险模式**：默认并发仍为 `1`，现有串行 `_run_phone_binding_test()` 路径不变；只有用户显式设置并发大于 `1` 才进入新并发路径。开启“尽量用满同一个手机号”时，后端会强制实际并发降为 `1`，避免同号连续绑定与并发账号抢号冲突；当手机号数量不足以支撑请求并发时，也会按可用手机号数自动降级。并发路径继续保留短信探测模式、限定号段、号段抽样、代理失败切换、绑定后 Auth/RT 三次补抓和 `chatgpt_phone_binding` 持久化语义。
+- **账号页手机号绑定弹窗新增并发配置**：`frontend/src/pages/Accounts.tsx` 在“手机号绑定 > 参数设置”里新增“并发数”输入，复用现有高密度表单风格，提示建议值 `2-3` 与后端硬上限 `5`；当“尽量用满同一个手机号”开启时，前端自动把并发锁定为 `1` 并禁用输入，避免界面允许提交后端必然降级的组合。侧边栏版本号同步更新为 `v1.3.40`。
+
+### 测试 (Tests)
+- **补充手机号绑定并发回归测试**：`tests/test_phone_pool_task_integration.py` 覆盖并发参数写入任务 meta、响应体回传和同号连续绑定强制串行降级；`tests/test_phone_binding_assignment.py` 新增并发 runner 测试，验证两个并发账号会领取不同的手动上传手机号并完整写入绑定结果。已通过 `tests/test_phone_pool.py`、`tests/test_phone_pool_task_integration.py`、`tests/test_phone_binding_assignment.py`、`tests/test_chatgpt_task_logging.py` 定向回归和前端 `npm run build`。
+
+
 ## [1.3.39] - 2026-07-08
 ### 新增 (Added)
 - **手机号/API 导入兼容管道分隔格式**：手机号池、手机号绑定、手机号注册和 Idea 提交流程的手工号码输入均兼容 `+手机号|https://...` 供应商原生格式，并继续统一保存为既有 `手机号----收码API` 规范行，避免新格式号码无法导入池或无法进入绑定/注册任务。
@@ -947,4 +959,8 @@
 
 ## 2026-07-08 20:58:24 +0800
 - 兼容 sms24 手机号 API 格式
+- 发布模式: multi
+
+## 2026-07-09 08:33:39 +0800
+- 手机号绑定任务支持账号级并发设置
 - 发布模式: multi

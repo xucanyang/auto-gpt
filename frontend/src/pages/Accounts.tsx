@@ -153,6 +153,7 @@ const DEFAULT_PHONE_BINDING_SETTINGS = {
   max_resend_attempts: 0,
   resend_interval_seconds: 30,
   account_interval_seconds: 60,
+  concurrency: 1,
   reuse_phone_until_unusable: false,
   proxy_mode: 'pool',
   proxy: '',
@@ -958,6 +959,7 @@ function uniquePhonePoolPrefixItems(values: unknown, fallbackStatus: PhonePoolPr
 function normalizePhoneBindingSettings(value: unknown): PhoneBindingSettings {
   const raw = value && typeof value === 'object' ? value as Record<string, unknown> : {}
   const phonePoolMode = normalizePhonePoolMode(raw.phone_pool_mode, raw)
+  const reusePhoneUntilUnusable = Boolean(raw.reuse_phone_until_unusable)
   return {
     use_pool: raw.use_pool === undefined ? DEFAULT_PHONE_BINDING_SETTINGS.use_pool : Boolean(raw.use_pool),
     phone_pool_mode: phonePoolMode,
@@ -976,7 +978,8 @@ function normalizePhoneBindingSettings(value: unknown): PhoneBindingSettings {
     max_resend_attempts: intWithDefault(raw.max_resend_attempts, DEFAULT_PHONE_BINDING_SETTINGS.max_resend_attempts, 0),
     resend_interval_seconds: intWithDefault(raw.resend_interval_seconds, DEFAULT_PHONE_BINDING_SETTINGS.resend_interval_seconds, 0),
     account_interval_seconds: intWithDefault(raw.account_interval_seconds, DEFAULT_PHONE_BINDING_SETTINGS.account_interval_seconds, 1),
-    reuse_phone_until_unusable: Boolean(raw.reuse_phone_until_unusable),
+    concurrency: reusePhoneUntilUnusable ? 1 : intWithDefault(raw.concurrency, DEFAULT_PHONE_BINDING_SETTINGS.concurrency, 1),
+    reuse_phone_until_unusable: reusePhoneUntilUnusable,
     proxy_mode: (() => {
       const value = String(raw.proxy_mode || DEFAULT_PHONE_BINDING_SETTINGS.proxy_mode).trim()
       return value === 'direct' || value === 'specified' || value === 'pool' || value === 'dynamic' ? value : 'pool'
@@ -3996,6 +3999,9 @@ export default function Accounts() {
     const rawPrefixSampleFilter = String(values.prefix_sample_filter || 'all')
     const prefixSampleFilter = rawPrefixSampleFilter === 'available' ? 'available' : rawPrefixSampleFilter === 'rejected' ? 'rejected' : 'all'
     const usePool = !phoneLines && (Boolean(values.use_pool) || prefixBindEnabled || prefixSampleEnabled)
+    const reusePhoneUntilUnusable = prefixSampleEnabled || smsProbeOnly ? false : Boolean(values.reuse_phone_until_unusable)
+    const requestedConcurrency = Math.max(1, Math.min(5, Number(values.concurrency || 1) || 1))
+    const effectiveConcurrency = reusePhoneUntilUnusable ? 1 : requestedConcurrency
     const normalizedValues = {
       ...values,
       phone_pool_mode: phonePoolMode,
@@ -4003,7 +4009,8 @@ export default function Accounts() {
       prefix_sample_enabled: prefixSampleEnabled,
       prefix_sms_probe_only: smsProbeOnly,
       sms_probe_only: smsProbeOnly,
-      reuse_phone_until_unusable: prefixSampleEnabled || smsProbeOnly ? false : Boolean(values.reuse_phone_until_unusable),
+      reuse_phone_until_unusable: reusePhoneUntilUnusable,
+      concurrency: effectiveConcurrency,
     }
     savePhoneBindingSettings(normalizedValues)
     await saveTaskProxySettingsToConfig(values)
@@ -4031,7 +4038,8 @@ export default function Accounts() {
       max_resend_attempts: Number(values.max_resend_attempts || 0),
       resend_interval_seconds: Number(values.resend_interval_seconds || 0),
       account_interval_seconds: Number(values.account_interval_seconds || 60),
-      reuse_phone_until_unusable: prefixSampleEnabled || smsProbeOnly ? false : Boolean(values.reuse_phone_until_unusable),
+      concurrency: effectiveConcurrency,
+      reuse_phone_until_unusable: reusePhoneUntilUnusable,
       ...buildTaskProxyPayload(values),
     }
     let requestedAccounts = total
@@ -8453,6 +8461,15 @@ export default function Accounts() {
                 <InputNumber min={1} max={3600} step={5} addonAfter="秒" style={{ width: '100%' }} />
               </Form.Item>
               <Form.Item
+                name="concurrency"
+                label="并发数"
+                extra={phoneBindingReusePhoneValue
+                  ? '同号连续绑定模式必须串行，避免多个账号抢同一个手机号。'
+                  : '同时处理的账号数；建议 2-3，后端硬上限 5。账号/号码间隔会作为初始启动错峰。'}
+              >
+                <InputNumber min={1} max={5} step={1} disabled={Boolean(phoneBindingReusePhoneValue)} style={{ width: '100%' }} />
+              </Form.Item>
+              <Form.Item
                 name="proxy_mode"
                 label="OpenAI 出口"
                 extra="控制 OAuth、add-phone、OTP 提交使用哪个出口。"
@@ -8524,7 +8541,16 @@ export default function Accounts() {
                   ? '只测发码/收码模式下固定关闭，避免同一号码重复探测。'
                   : '开启后，同一个号码会连续绑定多个账号，直到达到上限、限流、无法发码或接口异常。'}
               >
-                <Switch checkedChildren="开启" unCheckedChildren="关闭" disabled={phoneBindingPrefixSampleEnabled || Boolean(phoneBindingSmsProbeOnlyValue)} />
+                <Switch
+                  checkedChildren="开启"
+                  unCheckedChildren="关闭"
+                  disabled={phoneBindingPrefixSampleEnabled || Boolean(phoneBindingSmsProbeOnlyValue)}
+                  onChange={(checked) => {
+                    if (checked) {
+                      phoneBindingTestForm.setFieldsValue({ concurrency: 1 })
+                    }
+                  }}
+                />
               </Form.Item>
             </div>
           </div>

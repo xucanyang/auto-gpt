@@ -65,6 +65,7 @@ logger = logging.getLogger(__name__)
 
 MAX_FINISHED_TASKS = 200
 CLEANUP_THRESHOLD = 250
+PHONE_BINDING_MAX_CONCURRENCY = 5
 _task_store = RegisterTaskStore(
     max_finished_tasks=MAX_FINISHED_TASKS,
     cleanup_threshold=CLEANUP_THRESHOLD,
@@ -178,6 +179,7 @@ class PhoneBindingTestTaskRequest(BaseModel):
     max_resend_attempts: int = 0
     resend_interval_seconds: int = 30
     account_interval_seconds: int = 60
+    concurrency: int = 1
     reuse_phone_until_unusable: bool = False
     prefix_bind_enabled: bool = False
     prefix_sample_enabled: bool = False
@@ -3568,12 +3570,15 @@ def enqueue_phone_binding_test_task(
         phone_count = len(phone_items)
 
     if not account_items:
+        requested_concurrency_preview = _parse_positive_int(req.concurrency, 1)
         return {
             "task_id": "",
             "total_requested_accounts": total_requested_accounts,
             "matched_accounts": len(matched_accounts),
             "eligible_accounts": 0,
             "phone_count": phone_count,
+            "requested_concurrency": requested_concurrency_preview,
+            "effective_concurrency": 0,
             "phone_pool_import": dict(phone_pool_import_summary),
             "prefix_sample": dict(prefix_sample_meta),
             "prefix_bind": dict(prefix_bind_meta),
@@ -3593,12 +3598,24 @@ def enqueue_phone_binding_test_task(
         max_resend_attempts = 0
     resend_interval_seconds = _parse_positive_int(req.resend_interval_seconds, 30)
     account_interval_seconds = _parse_positive_int(req.account_interval_seconds, 60)
+    requested_concurrency = _parse_positive_int(req.concurrency, 1)
+    effective_concurrency = max(1, min(requested_concurrency, PHONE_BINDING_MAX_CONCURRENCY, len(account_items)))
+    concurrency_forced_serial_reason = ""
+    if reuse_phone_until_unusable and effective_concurrency > 1:
+        effective_concurrency = 1
+        concurrency_forced_serial_reason = "reuse_phone_until_unusable"
+    elif phone_count > 0 and effective_concurrency > phone_count:
+        effective_concurrency = max(1, phone_count)
+        concurrency_forced_serial_reason = "phone_capacity"
     runtime_settings = {
         "timeout_seconds": timeout_seconds,
         "poll_interval_seconds": poll_interval_seconds,
         "max_resend_attempts": max_resend_attempts,
         "resend_interval_seconds": resend_interval_seconds,
         "account_interval_seconds": account_interval_seconds,
+        "requested_concurrency": requested_concurrency,
+        "concurrency": effective_concurrency,
+        "concurrency_forced_serial_reason": concurrency_forced_serial_reason,
         "reuse_phone_until_unusable": reuse_phone_until_unusable,
         "use_pool": use_pool,
         "prefix_sample_enabled": prefix_sample_enabled,
@@ -3657,6 +3674,9 @@ def enqueue_phone_binding_test_task(
             "email": str(req.email or ""),
         },
         "settings": display_settings,
+        "requested_concurrency": requested_concurrency,
+        "effective_concurrency": effective_concurrency,
+        "concurrency_forced_serial_reason": concurrency_forced_serial_reason,
         "proxy": proxy_meta,
         "runtime_results": [],
         "bound_phone_lines": [],
@@ -3666,7 +3686,7 @@ def enqueue_phone_binding_test_task(
         task_id,
         platform="chatgpt",
         source=source,
-        total=max(len(account_items) if use_pool else len(phone_items), 1),
+        total=max(len(account_items) if (use_pool or effective_concurrency > 1) else len(phone_items), 1),
         meta=meta,
     )
 
@@ -3709,6 +3729,9 @@ def enqueue_phone_binding_test_task(
         "matched_accounts": len(matched_accounts),
         "eligible_accounts": len(account_items),
         "phone_count": phone_count,
+        "requested_concurrency": requested_concurrency,
+        "effective_concurrency": effective_concurrency,
+        "concurrency_forced_serial_reason": concurrency_forced_serial_reason,
         "phone_pool_import": dict(phone_pool_import_summary),
         "prefix_sample": dict(prefix_sample_meta),
         "prefix_bind": dict(prefix_bind_meta),
@@ -9757,12 +9780,998 @@ def _persist_phone_binding_result(
         pass
 
 
+def _run_phone_binding_test_concurrent(
+    task_id: str,
+    account_ids: list[int],
+    phone_items: list[dict[str, Any]],
+    settings: dict[str, Any],
+):
+    """Concurrent phone-binding runner.
+
+    The legacy runner below stays the source of truth for serial mode.  This
+    path only runs when the task explicitly requests concurrency > 1, and keeps
+    all mutable task state behind locks so multiple account workers cannot reuse
+    the same phone item or overwrite each other's result snapshots.
+    """
+    from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+
+    from api.actions import (
+        _apply_chatgpt_resume_auth_result,
+        _execute_chatgpt_resume_subscription_auth,
+    )
+    from core.proxy_utils import is_proxy_error_text
+    from services.chatgpt_core.phone_service import UploadedPhoneEntry, UploadedPhoneService
+
+    control = _task_store.control_for(task_id)
+    use_pool = _is_truthy(settings.get("use_pool"))
+    total_accounts = max(len(account_ids), 1)
+    requested_concurrency = _parse_positive_int(settings.get("requested_concurrency") or settings.get("concurrency"), 1)
+    effective_concurrency = max(1, min(_parse_positive_int(settings.get("concurrency"), 1), PHONE_BINDING_MAX_CONCURRENCY, total_accounts))
+    account_interval_seconds = max(_parse_positive_int(settings.get("account_interval_seconds"), 60), 0)
+    prefix_bind_enabled = _is_truthy(settings.get("prefix_bind_enabled"))
+    prefix_sample_enabled = _is_truthy(settings.get("prefix_sample_enabled"))
+    prefix_sample_filter = str(settings.get("prefix_sample_filter") or "all").strip().lower()
+    if prefix_sample_filter not in {"all", "available", "rejected"}:
+        prefix_sample_filter = "all"
+    prefix_sms_probe_only = _is_truthy(settings.get("prefix_sms_probe_only"))
+    selected_prefixes = [
+        str(prefix or "").strip()
+        for prefix in (settings.get("selected_prefixes") or [])
+        if str(prefix or "").strip()
+    ]
+
+    state_lock = threading.RLock()
+    allocation_lock = threading.RLock()
+    runtime_results: list[dict[str, Any]] = []
+    account_results: list[dict[str, Any]] = []
+    bound_phone_lines: list[str] = []
+    bound_phone_results: list[dict[str, Any]] = []
+    errors: list[str] = []
+    success_count = 0
+    skipped_count = 0
+    completed_accounts = 0
+    primary_email = ""
+    no_phone_available = False
+
+    phone_cursor = 0
+    dynamic_phone_attempts = 0
+    claimed_phones_this_run: set[str] = set()
+    terminal_phones_this_run: set[str] = set()
+    successful_phones_this_run: set[str] = set()
+
+    _task_store.mark_running(task_id)
+    _task_store.set_progress(task_id, f"0/{total_accounts}")
+    meta = dict(_task_store.snapshot(task_id).get("meta") or {})
+    missing_ids = list(meta.get("missing_ids") or [])
+    parse_errors = list(meta.get("parse_errors") or [])
+
+    pool_repo = None
+    if use_pool or any(bool(item.get("pool_managed")) for item in phone_items):
+        from services.chatgpt_core.phone_pool_repository import PhonePoolRepository
+
+        pool_repo = PhonePoolRepository()
+
+    def _safe_int(value: Any, default: int = 0) -> int:
+        try:
+            return int(value or 0)
+        except Exception:
+            return int(default or 0)
+
+    def _build_phone_binding_candidate_proxies() -> list[tuple[str, object | None, str]]:
+        from core.proxy_utils import resolve_task_proxy_candidates
+
+        return resolve_task_proxy_candidates(
+            dict(settings or {}),
+            fallback_proxy=None,
+            default_mode="direct",
+            target="chatgpt",
+        )
+
+    def _report_phone_proxy_success(proxy_pool: Any, proxy_url: str, phone_service: Any, result: dict[str, Any] | None = None) -> None:
+        if proxy_pool is None or not proxy_url:
+            return
+        if phone_was_touched(phone_service) or bool((result or {}).get("ok")):
+            try:
+                proxy_pool.report_success(proxy_url)
+            except Exception:
+                pass
+
+    def _report_phone_proxy_fail(proxy_pool: Any, proxy_url: str, error_text: str) -> None:
+        if proxy_pool is None or not proxy_url or not is_proxy_error_text(error_text):
+            return
+        try:
+            proxy_pool.report_fail(proxy_url)
+        except Exception:
+            pass
+
+    def phone_was_touched(phone_service: Any) -> bool:
+        return bool(
+            getattr(phone_service, "last_sms_sent", False)
+            or getattr(phone_service, "completed_entries", None)
+            or getattr(phone_service, "cancelled_entries", None)
+            or getattr(phone_service, "last_expired_date", "")
+            or getattr(phone_service, "last_code_time", "")
+        )
+
+    def result_for_phone(
+        item: dict[str, Any],
+        status: str,
+        *,
+        account_id: int = 0,
+        email: str = "",
+        reason: str = "",
+        code_received: bool = False,
+        phone_service: Any = None,
+    ) -> dict[str, Any]:
+        return {
+            "line_no": _safe_int(item.get("line_no")),
+            "phone": str(item.get("phone") or ""),
+            "prefix4": str(item.get("prefix4") or _phone_binding_prefix4(item.get("phone"))),
+            "api_url": str(item.get("api_url") or ""),
+            "raw_line": str(item.get("raw_line") or ""),
+            "status": status,
+            "status_label": _phone_binding_status_label(status),
+            "account_id": int(account_id or 0),
+            "email": str(email or ""),
+            "reason": str(reason or ""),
+            "code_received": bool(code_received),
+            "api_expired_date": str(getattr(phone_service, "last_expired_date", "") or ""),
+            "code_time": str(getattr(phone_service, "last_code_time", "") or ""),
+            "code_extracted": bool(getattr(phone_service, "last_code_was_extracted", False)),
+            "finished_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+    def sync_meta() -> None:
+        with state_lock:
+            safe_runtime_results = [sanitize_phone_result(item) for item in runtime_results]
+            safe_bound_phone_results = [sanitize_phone_result(item) for item in bound_phone_results]
+            updates = {
+                "runtime_results": safe_runtime_results,
+                "account_results": sanitize_task_detail(account_results),
+                "bound_phone_lines": [redact_raw_phone_line(line) for line in bound_phone_lines],
+                "bound_phone_results": safe_bound_phone_results,
+                "runtime_success": success_count,
+                "runtime_skipped": skipped_count,
+                "runtime_errors": [sanitize_error_message(err) for err in errors],
+                "no_phone_available": no_phone_available,
+                "completed_accounts": completed_accounts,
+                "requested_concurrency": requested_concurrency,
+                "effective_concurrency": effective_concurrency,
+            }
+            if prefix_sample_enabled:
+                updates["prefix_summary"] = _build_phone_prefix_sample_summary(phone_items, runtime_results)
+        _task_store.update_meta(task_id, updates)
+
+    def record_pool_result(item: dict[str, Any], status: str, *, reason: str = "", email: str = "", api_expired_date: str = "") -> None:
+        if pool_repo is None or not bool(item.get("pool_managed")):
+            return
+        phone = str(item.get("phone") or "")
+        try:
+            pool_repo.record_task_status(phone, status, reason=reason, email=email)
+            expired = str(api_expired_date or "").strip()
+            if expired and hasattr(pool_repo, "update_api_expired_date"):
+                pool_repo.update_api_expired_date(phone, expired)
+        except Exception as exc:
+            _log(task_id, f"[手机号绑定][号码池] 回写失败｜手机号={phone or '-'}｜原因={exc}")
+
+    def pool_record_to_item(record: Any, line_no: int) -> dict[str, Any]:
+        phone_value = str(getattr(record, "phone_e164", "") or "")
+        api_url_value = str(getattr(record, "api_url", "") or "")
+        return {
+            "id": _safe_int(getattr(record, "id", 0)),
+            "pool_id": _safe_int(getattr(record, "id", 0)),
+            "line_no": int(line_no or 0),
+            "phone": phone_value,
+            "api_url": api_url_value,
+            "raw_line": f"{phone_value}----{api_url_value}",
+            "pool_managed": True,
+            "prefix4": _phone_binding_prefix4(phone_value),
+        }
+
+    def claim_phone_item() -> tuple[dict[str, Any], int, str] | None:
+        nonlocal phone_cursor, dynamic_phone_attempts, no_phone_available
+        with allocation_lock:
+            excluded_phones = set(terminal_phones_this_run) | set(successful_phones_this_run) | set(claimed_phones_this_run)
+            if use_pool:
+                if pool_repo is None:
+                    no_phone_available = True
+                    return None
+                available_candidates = (
+                    pool_repo.list_available_by_prefixes(selected_prefixes)
+                    if prefix_bind_enabled and selected_prefixes and hasattr(pool_repo, "list_available_by_prefixes")
+                    else pool_repo.list_available()
+                )
+                selected = None
+                for candidate in available_candidates:
+                    phone_value = str(getattr(candidate, "phone_e164", "") or "")
+                    if not phone_value or phone_value in excluded_phones:
+                        continue
+                    if not str(getattr(candidate, "api_url", "") or ""):
+                        continue
+                    selected = candidate
+                    break
+                if selected is None:
+                    no_phone_available = True
+                    return None
+                dynamic_phone_attempts += 1
+                item = pool_record_to_item(selected, dynamic_phone_attempts)
+                claimed_phones_this_run.add(str(item.get("phone") or ""))
+                return item, dynamic_phone_attempts, "动态"
+
+            total_phones = len(phone_items)
+            while phone_cursor < total_phones:
+                item = dict(phone_items[phone_cursor] or {})
+                phone_index = phone_cursor + 1
+                phone_cursor += 1
+                phone = str(item.get("phone") or "").strip()
+                if phone and phone in excluded_phones:
+                    _log(task_id, f"[手机号绑定][跳过] 重复号码｜号码={phone_index}/{total_phones}｜手机号={phone}｜原因=已在本轮被占用或判定不可继续使用")
+                    continue
+                if phone:
+                    claimed_phones_this_run.add(phone)
+                return item, phone_index, str(total_phones)
+            no_phone_available = True
+            return None
+
+    def release_phone(item: dict[str, Any], *, terminal: bool = False, successful: bool = False, reusable: bool = False) -> None:
+        phone = str((item or {}).get("phone") or "").strip()
+        if not phone:
+            return
+        with allocation_lock:
+            claimed_phones_this_run.discard(phone)
+            if terminal:
+                terminal_phones_this_run.add(phone)
+            elif successful:
+                successful_phones_this_run.add(phone)
+            elif reusable:
+                successful_phones_this_run.discard(phone)
+                terminal_phones_this_run.discard(phone)
+
+    def result_error_text(result: dict[str, Any], default: str = "手机号绑定失败") -> str:
+        data = result.get("data") if isinstance(result.get("data"), dict) else {}
+        return str(result.get("error") or data.get("message") or default)
+
+    def should_keep_phone_for_next_account(status: str, phone_service: Any) -> bool:
+        return status in {"account_auth_error", "browser_error", "unknown"} and not phone_was_touched(phone_service)
+
+    def is_account_rate_limit_error(status: str, error_text: str) -> bool:
+        if status != "account_auth_error":
+            return False
+        lowered = str(error_text or "").strip().lower()
+        if not any(marker in lowered for marker in ("429", "rate limit", "too many request", "请求过快", "限流")):
+            return False
+        return any(
+            marker in lowered
+            for marker in (
+                "提交邮箱失败",
+                "authorize_continue",
+                "/authorize/continue",
+                "oauth",
+                "login_session",
+                "rate limit",
+                "too many request",
+                "请求过快",
+                "限流",
+            )
+        )
+
+    def mark_account_rate_limited_for_recovery(account_id: int, email: str, error_text: str) -> str:
+        if account_id <= 0:
+            return ""
+        try:
+            with Session(engine) as rate_session:
+                account = rate_session.get(AccountModel, account_id)
+                if account is None or account.platform != "chatgpt":
+                    return ""
+                mark_account_rate_limited(account)
+                recover_at = str(account_rate_limit_payload(account).get("recover_at") or "")
+                rate_session.add(account)
+                rate_session.commit()
+            _log(task_id, f"[限流] 账号已标记限流，预计恢复: {email or account_id} -> {recover_at or '1小时后'}")
+            return recover_at
+        except Exception as exc:
+            _log(task_id, f"[限流] 账号限流状态写入失败: {email or account_id} - {exc}")
+            return ""
+
+    def parse_auth_retry_delays(value: Any) -> list[int]:
+        default_delays = [5, 10, 20]
+        if value in (None, ""):
+            return default_delays
+        if isinstance(value, str):
+            candidates = value.replace("，", ",").replace(";", ",").split(",")
+        elif isinstance(value, (list, tuple, set)):
+            candidates = list(value)
+        else:
+            candidates = [value]
+        delays: list[int] = []
+        for item in candidates:
+            try:
+                delay = int(float(str(item).strip()))
+            except Exception:
+                continue
+            if delay < 0:
+                continue
+            delays.append(min(delay, 120))
+            if len(delays) >= 3:
+                break
+        return delays or default_delays
+
+    auth_retry_delays_seconds = parse_auth_retry_delays(
+        settings.get("phone_binding_auth_retry_delays_seconds")
+        if settings.get("phone_binding_auth_retry_delays_seconds") not in (None, "")
+        else settings.get("auth_retry_delays_seconds")
+    )
+
+    def wait_seconds(seconds: float, *, attempt_id: int | None = None) -> None:
+        remaining = max(float(seconds or 0), 0.0)
+        if remaining <= 0:
+            control.checkpoint(attempt_id=attempt_id)
+            return
+        while remaining > 0:
+            control.checkpoint(attempt_id=attempt_id)
+            chunk = min(1.0, remaining)
+            time.sleep(chunk)
+            remaining -= chunk
+
+    def retry_auth_capture_after_phone_completed(
+        *,
+        account: AccountModel,
+        session: Session,
+        first_result: dict[str, Any],
+        email: str,
+        account_position: int,
+        attempt_id: int | None,
+        proxy_url: str = "",
+    ) -> tuple[dict[str, Any], int, bool]:
+        latest_result = dict(first_result or {})
+        retry_count = 0
+        for retry_index, delay_seconds in enumerate(auth_retry_delays_seconds, start=1):
+            retry_count = retry_index
+            last_error = result_error_text(latest_result, "Auth/RT 获取失败")
+            _log(
+                task_id,
+                f"[手机号绑定][账号 {account_position}/{total_accounts}][补抓Auth] "
+                f"手机号已提交成功，但 Auth/RT 获取失败：{last_error[:180]}；"
+                f"{'等待 ' + str(delay_seconds) + 's 后' if delay_seconds > 0 else '立即'}重试 {retry_index}/{len(auth_retry_delays_seconds)}",
+            )
+            wait_seconds(delay_seconds, attempt_id=attempt_id)
+            try:
+                control.checkpoint(attempt_id=attempt_id)
+                retry_kwargs = {
+                    "allow_phone_verification": False,
+                    "log_fn": lambda message, _pos=account_position: _log(task_id, f"[手机号绑定][账号 {_pos}/{total_accounts}][补抓Auth] {message}"),
+                    "stop_checker": lambda: control.checkpoint(attempt_id=attempt_id),
+                    "retry_delays_seconds": [],
+                }
+                if proxy_url:
+                    retry_kwargs["proxy_url"] = proxy_url
+                retry_result = _execute_chatgpt_resume_subscription_auth(account, **retry_kwargs)
+                session.refresh(account)
+                _apply_chatgpt_resume_auth_result(account, retry_result, session)
+                latest_result = retry_result
+            except (SkipCurrentAttemptRequested, StopTaskRequested):
+                raise
+            except Exception as exc:
+                latest_result = {
+                    "ok": False,
+                    "error": str(exc or "Auth/RT 重试失败"),
+                    "data": {"message": str(exc or "Auth/RT 重试失败")},
+                }
+                _log(task_id, f"[手机号绑定][账号 {account_position}/{total_accounts}][补抓Auth] 重试异常｜次数={retry_index}/{len(auth_retry_delays_seconds)}｜原因={latest_result['error']}")
+            if bool(latest_result.get("ok")):
+                _log(task_id, f"[手机号绑定][账号 {account_position}/{total_accounts}][补抓Auth] 手机绑定后 Auth/RT 重试成功｜账号={email or getattr(account, 'id', '')}｜次数={retry_index}/{len(auth_retry_delays_seconds)}")
+                return latest_result, retry_count, True
+        return latest_result, retry_count, False
+
+    def clean_upstream_message(message: str) -> str:
+        text = str(message or "").strip()
+        while True:
+            cleaned = re.sub(
+                r"^\s*\[(?:验证码|手机号验证|号码测试|代理|邮箱|登录|阶段|主链路|注册|结果|TempMailLocal|DEBUG)\]\s*",
+                "",
+                text,
+                flags=re.I,
+            )
+            if cleaned == text:
+                return text
+            text = cleaned
+
+    def append_error(error_text: str) -> None:
+        with state_lock:
+            errors.append(str(error_text or ""))
+
+    def append_account_result(payload: dict[str, Any]) -> None:
+        with state_lock:
+            account_results.append(dict(payload or {}))
+
+    def append_runtime_result(payload: dict[str, Any]) -> None:
+        with state_lock:
+            runtime_results.append(dict(payload or {}))
+
+    def increment_success() -> None:
+        nonlocal success_count
+        with state_lock:
+            success_count += 1
+
+    def increment_skipped(value: int = 1) -> None:
+        nonlocal skipped_count
+        with state_lock:
+            skipped_count += int(value or 0)
+
+    def mark_account_completed() -> None:
+        nonlocal completed_accounts
+        with state_lock:
+            completed_accounts += 1
+            completed_snapshot = completed_accounts
+        _task_store.set_progress(task_id, f"{completed_snapshot}/{total_accounts}")
+
+    def set_primary_email_once(email: str) -> None:
+        nonlocal primary_email
+        value = str(email or "").strip()
+        if not value:
+            return
+        with state_lock:
+            if not primary_email:
+                primary_email = value
+
+    def task_log_for_attempt(*, account_position: int, account_id: int, email: str, phone: str, phone_index: int, phone_total_label: str, attempt_id: int | None = None):
+        def _task_log(message: str, level: str = "info") -> None:
+            control.checkpoint(attempt_id=attempt_id)
+            raw = str(message or "")
+            effective_level = classify_task_log_level(raw, level, flow="phone_binding")
+            _log(
+                task_id,
+                "[手机号绑定]"
+                f"[账号 {account_position}/{total_accounts}]"
+                f"[号码 {phone_index}/{phone_total_label}] "
+                f"{clean_upstream_message(raw)}",
+                level="debug" if effective_level == "debug" else "info",
+            )
+        return _task_log
+
+    def process_account(account_position: int, account_id_raw: int, *, start_delay: float = 0.0) -> dict[str, Any]:
+        account_id = int(account_id_raw or 0)
+        email = ""
+        if start_delay > 0:
+            _log(task_id, f"[手机号绑定][并发] 账号 {account_position}/{total_accounts} 延时 {start_delay:g}s 后启动｜原因=错峰降低 OpenAI 风控")
+            wait_seconds(start_delay)
+        account_attempts = 0
+        while True:
+            control.checkpoint(consume_skip=False)
+            next_item = claim_phone_item()
+            if next_item is None:
+                increment_skipped()
+                append_account_result({"account_id": account_id, "email": email, "status": "not_tested", "reason": "手机号池/列表当前没有可用号码，未完成绑定"})
+                sync_meta()
+                return {"status": "not_tested", "account_id": account_id, "email": email}
+            item, phone_index, phone_total_label = next_item
+            phone = str(item.get("phone") or "").strip()
+            raw_line = str(item.get("raw_line") or "").strip()
+            account_attempts += 1
+            attempt_id = control.start_attempt()
+            task_log = task_log_for_attempt(
+                account_position=account_position,
+                account_id=account_id,
+                email=email,
+                phone=phone,
+                phone_index=phone_index,
+                phone_total_label=phone_total_label,
+                attempt_id=attempt_id,
+            )
+            service_entry = UploadedPhoneEntry(
+                country_slug="uploaded",
+                phone=phone,
+                detail_url=str(item.get("api_url") or ""),
+                api_url=str(item.get("api_url") or ""),
+                raw_line=raw_line,
+                line_no=_safe_int(item.get("line_no")),
+            )
+            phone_service = UploadedPhoneService(
+                [service_entry],
+                {
+                    "_task_stop_checker": lambda _attempt_id=attempt_id: control.checkpoint(attempt_id=_attempt_id),
+                    "uploaded_phone_timeout_seconds": int(settings.get("timeout_seconds") or 180),
+                    "uploaded_phone_poll_interval_seconds": int(settings.get("poll_interval_seconds") or 5),
+                    "uploaded_phone_max_resend_attempts": int(settings.get("max_resend_attempts") or 0),
+                    "uploaded_phone_resend_interval_seconds": int(settings.get("resend_interval_seconds") or 30),
+                },
+                log_fn=task_log,
+            )
+            phone_service.bind_entry(service_entry)
+            try:
+                with Session(engine) as session:
+                    account = session.get(AccountModel, account_id)
+                    if account is None or account.platform != "chatgpt":
+                        raise ValueError("ChatGPT 账号不存在")
+                    email = str(account.email or "")
+                    set_primary_email_once(email)
+
+                _log(
+                    task_id,
+                    "[手机号绑定]"
+                    f"[账号 {account_position}/{total_accounts}]"
+                    f"[号码 {phone_index}/{phone_total_label}] "
+                    f"开始｜账号={email or account_id}｜手机号={phone}｜尝试={account_attempts}｜并发={effective_concurrency}",
+                )
+                candidate_proxies = _build_phone_binding_candidate_proxies()
+                with Session(engine) as session:
+                    account = session.get(AccountModel, account_id)
+                    if account is None or account.platform != "chatgpt":
+                        raise ValueError("ChatGPT 账号不存在")
+                    result: dict[str, Any] = {}
+                    selected_proxy_url = ""
+                    for proxy_index, (candidate_proxy, candidate_proxy_pool, candidate_proxy_source) in enumerate(candidate_proxies, start=1):
+                        selected_proxy_url = candidate_proxy
+                        proxy_label = redact_proxy_url(candidate_proxy) if candidate_proxy else "direct"
+                        _log(task_id, f"[手机号绑定][账号 {account_position}/{total_accounts}][号码 {phone_index}/{phone_total_label}] 使用代理 {proxy_index}/{len(candidate_proxies)}｜source={candidate_proxy_source}｜proxy={proxy_label}")
+                        try:
+                            resume_kwargs = {
+                                "allow_phone_verification": True,
+                                "log_fn": task_log,
+                                "shared_phone_service": phone_service,
+                                "stop_checker": lambda _attempt_id=attempt_id: control.checkpoint(attempt_id=_attempt_id),
+                                "retry_delays_seconds": [],
+                            }
+                            if prefix_sms_probe_only:
+                                resume_kwargs["phone_sms_probe_only"] = True
+                            if candidate_proxy:
+                                resume_kwargs["proxy_url"] = candidate_proxy
+                            result = _execute_chatgpt_resume_subscription_auth(account, **resume_kwargs)
+                            proxy_error_text = result_error_text(result, "") if not bool(result.get("ok")) else ""
+                            if (
+                                proxy_error_text
+                                and is_proxy_error_text(proxy_error_text)
+                                and not phone_was_touched(phone_service)
+                                and proxy_index < len(candidate_proxies)
+                            ):
+                                _report_phone_proxy_fail(candidate_proxy_pool, candidate_proxy, proxy_error_text)
+                                _log(task_id, f"[手机号绑定][账号 {account_position}/{total_accounts}] 当前代理疑似不可用且手机号未触碰，切换下一个代理：{proxy_error_text[:180]}")
+                                continue
+                            _report_phone_proxy_success(candidate_proxy_pool, candidate_proxy, phone_service, result)
+                            break
+                        except (SkipCurrentAttemptRequested, StopTaskRequested):
+                            raise
+                        except Exception as proxy_exc:
+                            proxy_error_text = str(proxy_exc or "手机号绑定失败")
+                            if (
+                                is_proxy_error_text(proxy_error_text)
+                                and not phone_was_touched(phone_service)
+                                and proxy_index < len(candidate_proxies)
+                            ):
+                                _report_phone_proxy_fail(candidate_proxy_pool, candidate_proxy, proxy_error_text)
+                                _log(task_id, f"[手机号绑定][账号 {account_position}/{total_accounts}] 当前代理异常且手机号未触碰，切换下一个代理：{proxy_error_text[:180]}")
+                                continue
+                            _report_phone_proxy_fail(candidate_proxy_pool, candidate_proxy, proxy_error_text)
+                            raise
+
+                    session.refresh(account)
+                    ok = bool(result.get("ok"))
+                    auth_retry_attempts = 0
+
+                    if prefix_sms_probe_only and phone_service.completed_entries:
+                        success_reason = "OpenAI 已发码，收码 API 已收到验证码；按设置未提交验证码，未完成手机号绑定"
+                        phone_result = result_for_phone(
+                            item,
+                            "sms_probe_received",
+                            account_id=account_id,
+                            email=email,
+                            reason=success_reason,
+                            code_received=True,
+                            phone_service=phone_service,
+                        )
+                        phone_result["verification_submitted"] = False
+                        phone_result["sms_probe_only"] = True
+                        record_pool_result(item, "sms_probe_received", reason=success_reason, api_expired_date=str(phone_result.get("api_expired_date") or ""))
+                        release_phone(item, successful=True)
+                        increment_success()
+                        with state_lock:
+                            runtime_results.append(phone_result)
+                            bound_phone_results.append({**phone_result, "raw_line": raw_line or f"{phone}----{item.get('api_url') or ''}"})
+                            account_results.append({"account_id": account_id, "email": email, "status": "sms_probe_received", "phone": phone, "reason": success_reason})
+                        _log(task_id, f"[手机号绑定][账号 {account_position}/{total_accounts}] 已收码未提交｜手机号={phone}｜结果=短信探测完成")
+                        sync_meta()
+                        return {"status": "sms_probe_received", "account_id": account_id, "email": email}
+
+                    try:
+                        session.commit()
+                    except Exception:
+                        session.rollback()
+                    try:
+                        session.refresh(account)
+                    except Exception:
+                        pass
+                    _apply_chatgpt_resume_auth_result(account, result, session)
+
+                    if (not ok) and phone_service.completed_entries:
+                        result, auth_retry_attempts, _ = retry_auth_capture_after_phone_completed(
+                            account=account,
+                            session=session,
+                            first_result=result,
+                            email=email,
+                            account_position=account_position,
+                            attempt_id=attempt_id,
+                            proxy_url=selected_proxy_url,
+                        )
+                        ok = bool(result.get("ok"))
+
+                    if phone_service.completed_entries:
+                        raw_result_line = raw_line or f"{phone}----{item.get('api_url') or ''}"
+                        auth_error_text = "" if ok else result_error_text(result, "Auth/RT 获取失败")
+                        success_reason = "验证码已提交 OpenAI，手机号绑定完成"
+                        if ok:
+                            success_reason = (
+                                f"{success_reason}，Auth/RT 已获取"
+                                if auth_retry_attempts <= 0
+                                else f"{success_reason}，Auth/RT 重试 {auth_retry_attempts} 次后已获取"
+                            )
+                        else:
+                            success_reason = f"{success_reason}；但 Auth/RT 重试 {auth_retry_attempts} 次仍失败: {auth_error_text[:180]}"
+                        phone_result = result_for_phone(
+                            item,
+                            "bound",
+                            account_id=account_id,
+                            email=email,
+                            reason=success_reason,
+                            code_received=True,
+                            phone_service=phone_service,
+                        )
+                        phone_result["auth_capture_ok"] = bool(ok)
+                        phone_result["auth_retry_attempts"] = int(auth_retry_attempts or 0)
+                        if auth_error_text:
+                            phone_result["auth_error"] = auth_error_text
+                            _log(task_id, f"[手机号绑定][账号 {account_position}/{total_accounts}] 手机号已绑定完成，但 Auth/RT 获取失败：{auth_error_text[:180]}")
+                        try:
+                            session.commit()
+                        except Exception:
+                            session.rollback()
+                        try:
+                            session.refresh(account)
+                        except Exception:
+                            pass
+                        _persist_phone_binding_result(account, phone_result, task_id=task_id, raw_line=raw_result_line)
+                        session.add(account)
+                        session.commit()
+                        from services.account_filters import upsert_account_list_state_for_account_ids
+
+                        upsert_account_list_state_for_account_ids(session, [account.id], commit=True)
+                        record_pool_result(item, "bound", reason=success_reason, email=email, api_expired_date=str(phone_result.get("api_expired_date") or ""))
+                        release_phone(item, successful=True)
+                        increment_success()
+                        with state_lock:
+                            bound_phone_lines.append(raw_result_line)
+                            runtime_results.append(phone_result)
+                            bound_phone_results.append({**phone_result, "raw_line": raw_result_line})
+                            if ok:
+                                account_results.append({"account_id": account_id, "email": email, "status": "used_for_binding", "phone": phone})
+                            else:
+                                account_results.append({"account_id": account_id, "email": email, "status": "used_for_binding_auth_failed", "phone": phone, "reason": auth_error_text})
+                                errors.append(f"{email or account_id}: 手机号已绑定，但 Auth/RT 获取失败: {auth_error_text}")
+                        _log(task_id, f"[手机号绑定][账号 {account_position}/{total_accounts}] 绑定完成｜手机号={phone}｜AuthRT={'ok' if ok else 'failed'}")
+                        sync_meta()
+                        return {"status": "bound", "account_id": account_id, "email": email}
+
+                    if ok and not phone_service.completed_entries:
+                        try:
+                            session.commit()
+                        except Exception:
+                            session.rollback()
+                        release_phone(item, reusable=True)
+                        increment_skipped()
+                        skip_reason = "账号已完成 Auth，未进入 add_phone；当前手机号未提交 OpenAI，留给其他账号继续测试"
+                        with state_lock:
+                            runtime_results.append(result_for_phone(item, "account_phone_bound", account_id=account_id, email=email, reason=skip_reason, phone_service=phone_service))
+                            account_results.append({"account_id": account_id, "email": email, "status": "account_phone_bound", "reason": skip_reason})
+                        _log(task_id, f"[手机号绑定][账号 {account_position}/{total_accounts}] 无需绑定｜账号已完成 Auth，当前手机号未消耗")
+                        sync_meta()
+                        return {"status": "account_phone_bound", "account_id": account_id, "email": email}
+
+                    error_text = result_error_text(result)
+                    status = _phone_binding_error_status(error_text)
+                    if status in {"openai_rejected", "openai_phone_limit", "phone_already_used", "api_no_code", "api_error", "rate_limited"}:
+                        increment_skipped()
+                        release_phone(item, terminal=True)
+                        phone_result = result_for_phone(item, status, account_id=account_id, email=email, reason=error_text, phone_service=phone_service)
+                        record_pool_result(item, status, reason=error_text, api_expired_date=str(phone_result.get("api_expired_date") or ""))
+                        append_runtime_result(phone_result)
+                        _log(task_id, f"[手机号绑定][账号 {account_position}/{total_accounts}] 当前手机号不可继续｜状态={_phone_binding_status_label(status)}｜原因={error_text[:180]}")
+                        sync_meta()
+                        continue
+
+                    if should_keep_phone_for_next_account(status, phone_service):
+                        release_phone(item, reusable=True)
+                        recover_at = mark_account_rate_limited_for_recovery(account_id, email, error_text) if is_account_rate_limit_error(status, error_text) else ""
+                        account_result_status = "rate_limited" if recover_at else status
+                        account_reason = f"{error_text}；账号限流预计恢复: {recover_at}" if recover_at else error_text
+                        append_error(f"{email or account_id}: {account_reason}")
+                        append_account_result({"account_id": account_id, "email": email, "status": account_result_status, "reason": account_reason})
+                        _log(task_id, f"[手机号绑定][账号 {account_position}/{total_accounts}] 账号前置失败，手机号未被触碰｜原因={account_reason[:180]}")
+                        sync_meta()
+                        return {"status": account_result_status, "account_id": account_id, "email": email}
+
+                    release_phone(item, successful=phone_was_touched(phone_service), reusable=not phone_was_touched(phone_service))
+                    phone_result = result_for_phone(item, status, account_id=account_id, email=email, reason=error_text, phone_service=phone_service)
+                    record_pool_result(item, status, reason=error_text, api_expired_date=str(phone_result.get("api_expired_date") or ""))
+                    append_runtime_result(phone_result)
+                    append_account_result({"account_id": account_id, "email": email, "status": status, "reason": error_text})
+                    append_error(f"{email or account_id}: {error_text}")
+                    _log(task_id, f"[手机号绑定][账号 {account_position}/{total_accounts}] 绑定失败｜状态={_phone_binding_status_label(status)}｜原因={error_text[:180]}")
+                    sync_meta()
+                    return {"status": status, "account_id": account_id, "email": email}
+            except SkipCurrentAttemptRequested as exc:
+                release_phone(item, reusable=not phone_was_touched(phone_service), successful=phone_was_touched(phone_service))
+                increment_skipped()
+                append_runtime_result(result_for_phone(item, "not_tested", account_id=account_id, email=email, reason=str(exc), phone_service=phone_service))
+                append_account_result({"account_id": account_id, "email": email, "status": "skipped", "reason": str(exc)})
+                _log(task_id, f"[手机号绑定][账号 {account_position}/{total_accounts}] 已跳过｜原因={exc}")
+                sync_meta()
+                return {"status": "skipped", "account_id": account_id, "email": email}
+            except StopTaskRequested:
+                release_phone(item, reusable=not phone_was_touched(phone_service), successful=phone_was_touched(phone_service))
+                raise
+            except Exception as exc:
+                error_text = str(exc or "手机号绑定失败")
+                status = _phone_binding_error_status(error_text)
+                if status in {"openai_rejected", "openai_phone_limit", "phone_already_used", "api_no_code", "api_error", "rate_limited"}:
+                    increment_skipped()
+                    release_phone(item, terminal=True)
+                    phone_result = result_for_phone(item, status, account_id=account_id, email=email, reason=error_text, phone_service=phone_service)
+                    record_pool_result(item, status, reason=error_text, api_expired_date=str(phone_result.get("api_expired_date") or ""))
+                    append_runtime_result(phone_result)
+                    _log(task_id, f"[手机号绑定][账号 {account_position}/{total_accounts}] 当前手机号不可继续｜状态={_phone_binding_status_label(status)}｜原因={error_text[:180]}")
+                    sync_meta()
+                    continue
+                if should_keep_phone_for_next_account(status, phone_service):
+                    release_phone(item, reusable=True)
+                    recover_at = mark_account_rate_limited_for_recovery(account_id, email, error_text) if is_account_rate_limit_error(status, error_text) else ""
+                    account_result_status = "rate_limited" if recover_at else status
+                    account_reason = f"{error_text}；账号限流预计恢复: {recover_at}" if recover_at else error_text
+                    append_error(f"{email or account_id}: {account_reason}")
+                    append_account_result({"account_id": account_id, "email": email, "status": account_result_status, "reason": account_reason})
+                    _log(task_id, f"[手机号绑定][账号 {account_position}/{total_accounts}] 账号前置失败，手机号未被触碰｜原因={account_reason[:180]}")
+                    sync_meta()
+                    return {"status": account_result_status, "account_id": account_id, "email": email}
+                release_phone(item, successful=phone_was_touched(phone_service), reusable=not phone_was_touched(phone_service))
+                phone_result = result_for_phone(item, status, account_id=account_id, email=email, reason=error_text, phone_service=phone_service)
+                record_pool_result(item, status, reason=error_text, api_expired_date=str(phone_result.get("api_expired_date") or ""))
+                append_runtime_result(phone_result)
+                append_account_result({"account_id": account_id, "email": email, "status": status, "reason": error_text})
+                append_error(f"{email or account_id}: {error_text}")
+                _log(task_id, f"[手机号绑定][账号 {account_position}/{total_accounts}] 绑定异常｜状态={_phone_binding_status_label(status)}｜原因={error_text[:180]}")
+                sync_meta()
+                return {"status": status, "account_id": account_id, "email": email}
+            finally:
+                control.finish_attempt(attempt_id)
+
+    try:
+        for parse_error in parse_errors:
+            _log(task_id, f"[手机号绑定][解析] 跳过｜行={parse_error.get('line')}｜原因={parse_error.get('reason') or ''}")
+        for missing_id in missing_ids:
+            message = f"account_id={missing_id}: 账号不存在"
+            _log(task_id, f"[MISS] {message}")
+            append_error(message)
+            append_account_result({"account_id": int(missing_id or 0), "email": "", "status": "account_missing", "reason": "账号不存在"})
+
+        _log(
+            task_id,
+            "[手机号绑定][配置] 并发已开启"
+            f"｜请求={requested_concurrency}｜实际={effective_concurrency}"
+            f"｜启动错峰={account_interval_seconds}s｜账号数={len(account_ids)}",
+        )
+        if prefix_sms_probe_only:
+            _log(task_id, "[手机号绑定][配置] 短信探测模式已开启｜验证=OpenAI发码+收码API收码｜提交验证码=否｜完成绑定=否")
+        if prefix_bind_enabled:
+            _log(task_id, f"[手机号绑定][限定号段] 已开启｜号段={','.join(selected_prefixes) or '-'}｜并发取号=任务内互斥")
+        if prefix_sample_enabled:
+            _log(task_id, f"[手机号绑定][号段抽样] 已开启｜范围={prefix_sample_filter}｜选中号码={len(phone_items)}｜并发取号=任务内互斥")
+
+        next_account_index = 0
+        in_flight: dict[Any, tuple[int, int]] = {}
+        launch_count = 0
+        ordered_accounts = [int(value or 0) for value in account_ids]
+        with ThreadPoolExecutor(max_workers=effective_concurrency) as pool:
+            while next_account_index < len(ordered_accounts) and len(in_flight) < effective_concurrency and not control.is_stop_requested():
+                account_position = next_account_index + 1
+                account_id = ordered_accounts[next_account_index]
+                start_delay = account_interval_seconds * min(launch_count, max(effective_concurrency - 1, 0))
+                future = pool.submit(process_account, account_position, account_id, start_delay=start_delay)
+                in_flight[future] = (account_position, account_id)
+                next_account_index += 1
+                launch_count += 1
+
+            while in_flight:
+                control.checkpoint(consume_skip=False)
+                done, _ = wait(tuple(in_flight.keys()), timeout=0.5, return_when=FIRST_COMPLETED)
+                if not done:
+                    continue
+                for future in done:
+                    account_position, account_id = in_flight.pop(future)
+                    try:
+                        future.result()
+                    except StopTaskRequested:
+                        control.request_stop()
+                        raise
+                    except Exception as exc:
+                        error_text = str(exc or "手机号绑定并发任务异常")
+                        append_error(f"{account_id}: {error_text}")
+                        append_account_result({"account_id": account_id, "email": "", "status": "unknown", "reason": error_text})
+                        _log(task_id, f"[手机号绑定][账号 {account_position}/{total_accounts}] 并发任务异常｜原因={error_text}")
+                    finally:
+                        mark_account_completed()
+                        sync_meta()
+
+                    if next_account_index < len(ordered_accounts) and not control.is_stop_requested():
+                        next_position = next_account_index + 1
+                        next_account_id = ordered_accounts[next_account_index]
+                        future = pool.submit(process_account, next_position, next_account_id, start_delay=0)
+                        in_flight[future] = (next_position, next_account_id)
+                        next_account_index += 1
+
+        final_status = "done"
+        try:
+            from collections import Counter
+
+            with state_lock:
+                runtime_status_counts = Counter(str(item.get("status") or "unknown") for item in runtime_results)
+                account_status_counts = Counter(str(item.get("status") or "unknown") for item in account_results)
+                success_snapshot = success_count
+                skipped_snapshot = skipped_count
+                errors_snapshot = list(errors)
+                runtime_results_snapshot = list(runtime_results)
+                account_results_snapshot = list(account_results)
+                bound_phone_lines_snapshot = list(bound_phone_lines)
+                bound_phone_results_snapshot = list(bound_phone_results)
+                primary_email_snapshot = primary_email
+        except Exception:
+            runtime_status_counts = {}
+            account_status_counts = {}
+            success_snapshot = success_count
+            skipped_snapshot = skipped_count
+            errors_snapshot = list(errors)
+            runtime_results_snapshot = list(runtime_results)
+            account_results_snapshot = list(account_results)
+            bound_phone_lines_snapshot = list(bound_phone_lines)
+            bound_phone_results_snapshot = list(bound_phone_results)
+            primary_email_snapshot = primary_email
+        phone_issue_count = sum(
+            int(runtime_status_counts.get(status, 0))
+            for status in (
+                "openai_rejected",
+                "openai_phone_limit",
+                "phone_already_used",
+                "api_no_code",
+                "api_error",
+                "rate_limited",
+            )
+        )
+        account_issue_count = sum(int(account_status_counts.get(status, 0)) for status in ("account_auth_error", "unknown", "rate_limited"))
+        summary_message = (
+            f"OpenAI 手机号绑定完成：成功 {success_snapshot}/{len(account_ids)}，"
+            f"手机号问题 {phone_issue_count}，账号问题 {account_issue_count}，跳过 {skipped_snapshot}，并发 {effective_concurrency}"
+        )
+        _log(
+            task_id,
+            "[手机号绑定][汇总] 完成"
+            f"｜成功={success_snapshot}/{len(account_ids)}"
+            f"｜手机号问题={phone_issue_count}"
+            f"｜账号问题={account_issue_count}"
+            f"｜跳过={skipped_snapshot}"
+            f"｜并发={effective_concurrency}",
+        )
+        if runtime_results_snapshot:
+            _log(task_id, f"[手机号绑定][汇总] 结果表已生成｜总数={len(runtime_results_snapshot)}｜成功绑定={len(bound_phone_results_snapshot)}")
+        else:
+            _log(task_id, "[手机号绑定][汇总] 结果表已生成｜总数=0｜成功绑定=0")
+        sync_meta()
+        log_status = "success" if success_snapshot > 0 and not errors_snapshot else "failed"
+        attempt_outcome = "phone_binding_test_success" if log_status == "success" else "phone_binding_test_failed"
+        if log_status != "success" and no_phone_available:
+            attempt_outcome = "phone_binding_test_no_phone_available"
+        _task_store.finish(
+            task_id,
+            status=final_status,
+            success=success_snapshot,
+            skipped=skipped_snapshot,
+            errors=errors_snapshot,
+            error="" if not errors_snapshot else summary_message,
+        )
+        latest_meta = dict(_task_store.snapshot(task_id).get("meta") or {})
+        _save_task_log(
+            "chatgpt",
+            primary_email_snapshot,
+            log_status,
+            error="" if log_status == "success" else summary_message,
+            detail=_build_task_log_detail(
+                task_id,
+                {
+                    "email": primary_email_snapshot,
+                    "attempt_outcome": attempt_outcome,
+                    "source": "phone_binding_test",
+                    "meta": latest_meta,
+                    "bound_phone_lines": [redact_raw_phone_line(line) for line in bound_phone_lines_snapshot],
+                    "bound_phone_results": [sanitize_phone_result(item) for item in bound_phone_results_snapshot],
+                    "runtime_results": [sanitize_phone_result(item) for item in runtime_results_snapshot],
+                    "account_results": sanitize_task_detail(account_results_snapshot),
+                },
+            ),
+        )
+    except StopTaskRequested as exc:
+        _log(task_id, f"[STOP] {exc}")
+        sync_meta()
+        with state_lock:
+            primary_email_snapshot = primary_email
+            bound_phone_lines_snapshot = list(bound_phone_lines)
+            bound_phone_results_snapshot = list(bound_phone_results)
+            runtime_results_snapshot = list(runtime_results)
+            account_results_snapshot = list(account_results)
+        _save_task_log(
+            "chatgpt",
+            primary_email_snapshot,
+            "stopped",
+            error=str(exc),
+            detail=_build_task_log_detail(
+                task_id,
+                {
+                    "email": primary_email_snapshot,
+                    "attempt_outcome": "phone_binding_test_stopped",
+                    "source": "phone_binding_test",
+                    "meta": dict(_task_store.snapshot(task_id).get("meta") or {}),
+                    "bound_phone_lines": [redact_raw_phone_line(line) for line in bound_phone_lines_snapshot],
+                    "bound_phone_results": [sanitize_phone_result(item) for item in bound_phone_results_snapshot],
+                    "runtime_results": [sanitize_phone_result(item) for item in runtime_results_snapshot],
+                    "account_results": sanitize_task_detail(account_results_snapshot),
+                },
+            ),
+        )
+    except Exception as exc:
+        error_text = str(exc or "手机号绑定并发任务异常退出")
+        append_error(error_text)
+        _log(task_id, f"[ERROR] 手机号绑定并发任务异常退出: {error_text}")
+        try:
+            sync_meta()
+        except Exception as sync_exc:
+            _log(task_id, f"[ERROR] 手机号绑定并发任务异常状态同步失败: {sync_exc}")
+        with state_lock:
+            success_snapshot = success_count
+            skipped_snapshot = skipped_count
+            errors_snapshot = list(errors)
+            primary_email_snapshot = primary_email
+            bound_phone_lines_snapshot = list(bound_phone_lines)
+            bound_phone_results_snapshot = list(bound_phone_results)
+            runtime_results_snapshot = list(runtime_results)
+            account_results_snapshot = list(account_results)
+        _task_store.finish(task_id, status="failed", success=success_snapshot, skipped=skipped_snapshot, errors=errors_snapshot, error=error_text)
+        latest_meta = dict(_task_store.snapshot(task_id).get("meta") or {})
+        _save_task_log(
+            "chatgpt",
+            primary_email_snapshot,
+            "failed",
+            error=error_text,
+            detail=_build_task_log_detail(
+                task_id,
+                {
+                    "email": primary_email_snapshot,
+                    "attempt_outcome": "phone_binding_test_exception",
+                    "source": "phone_binding_test",
+                    "meta": latest_meta,
+                    "bound_phone_lines": [redact_raw_phone_line(line) for line in bound_phone_lines_snapshot],
+                    "bound_phone_results": [sanitize_phone_result(item) for item in bound_phone_results_snapshot],
+                    "runtime_results": [sanitize_phone_result(item) for item in runtime_results_snapshot],
+                    "account_results": sanitize_task_detail(account_results_snapshot),
+                },
+            ),
+        )
+    finally:
+        _task_store.cleanup()
+
 def _run_phone_binding_test(
     task_id: str,
     account_ids: list[int],
     phone_items: list[dict[str, Any]],
     settings: dict[str, Any],
 ):
+    if _parse_positive_int((settings or {}).get("concurrency"), 1) > 1:
+        return _run_phone_binding_test_concurrent(task_id, account_ids, phone_items, settings)
+
     from api.actions import (
         _apply_chatgpt_resume_auth_result,
         _execute_chatgpt_resume_subscription_auth,

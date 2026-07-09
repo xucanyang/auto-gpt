@@ -71,6 +71,115 @@ class PhonePoolTaskIntegrationTests(unittest.TestCase):
         self.assertEqual(created_meta["phone_items"], [])
         self.assertEqual(background_tasks.calls[0][0][3], [])
 
+    def test_phone_binding_task_records_effective_concurrency(self):
+        created_meta = {}
+
+        class _BackgroundTasks:
+            def __init__(self):
+                self.calls = []
+
+            def add_task(self, *args, **kwargs):
+                self.calls.append((args, kwargs))
+
+        req = PhoneBindingTestTaskRequest(
+            account_ids=[123, 124, 125],
+            phone_lines="\n".join(
+                [
+                    "+15551230001----https://relay.example.com/a",
+                    "+15551230002----https://relay.example.com/b",
+                    "+15551230003----https://relay.example.com/c",
+                ]
+            ),
+            concurrency=3,
+        )
+
+        def _fake_create_task(_task_id, *, platform, source, total, meta):
+            created_meta.update(meta)
+
+        with (
+            patch(
+                "api.tasks._resolve_phone_binding_test_accounts",
+                return_value=(
+                    [
+                        {"account_id": 123, "email": "one@example.com", "status": "pending_payment"},
+                        {"account_id": 124, "email": "two@example.com", "status": "pending_payment"},
+                        {"account_id": 125, "email": "three@example.com", "status": "pending_payment"},
+                    ],
+                    [],
+                    [],
+                    [],
+                ),
+            ),
+            patch("api.tasks._import_manual_phone_entries_to_pool", side_effect=lambda entries: (entries, {"imported": len(entries), "existing": 0, "skipped": 0})),
+            patch("api.tasks._create_standalone_task_record", side_effect=_fake_create_task),
+            patch("api.tasks._save_task_log"),
+        ):
+            result = enqueue_phone_binding_test_task(req, background_tasks=_BackgroundTasks())
+
+        self.assertEqual(result["requested_concurrency"], 3)
+        self.assertEqual(result["effective_concurrency"], 3)
+        self.assertEqual(created_meta["requested_concurrency"], 3)
+        self.assertEqual(created_meta["effective_concurrency"], 3)
+        self.assertEqual(created_meta["settings"]["concurrency"], 3)
+        self.assertEqual(created_meta["settings"]["requested_concurrency"], 3)
+
+    def test_phone_binding_concurrency_forces_serial_when_reusing_same_phone(self):
+        created_meta = {}
+
+        class _BackgroundTasks:
+            def __init__(self):
+                self.calls = []
+
+            def add_task(self, *args, **kwargs):
+                self.calls.append((args, kwargs))
+
+        class _Record:
+            id = 9
+            phone_e164 = "+15551230001"
+            api_url = "https://relay.example.com/a"
+            remaining_capacity = 3
+
+        class _FakeRepo:
+            def list_available(self):
+                return [_Record()]
+
+        def _fake_create_task(_task_id, *, platform, source, total, meta):
+            created_meta.update(meta)
+
+        req = PhoneBindingTestTaskRequest(
+            account_ids=[123, 124, 125],
+            phone_lines="",
+            use_pool=True,
+            concurrency=3,
+            reuse_phone_until_unusable=True,
+        )
+
+        with (
+            patch(
+                "api.tasks._resolve_phone_binding_test_accounts",
+                return_value=(
+                    [
+                        {"account_id": 123, "email": "one@example.com", "status": "pending_payment"},
+                        {"account_id": 124, "email": "two@example.com", "status": "pending_payment"},
+                        {"account_id": 125, "email": "three@example.com", "status": "pending_payment"},
+                    ],
+                    [],
+                    [],
+                    [],
+                ),
+            ),
+            patch("services.chatgpt_core.phone_pool_repository.PhonePoolRepository", _FakeRepo),
+            patch("api.tasks._create_standalone_task_record", side_effect=_fake_create_task),
+            patch("api.tasks._save_task_log"),
+        ):
+            result = enqueue_phone_binding_test_task(req, background_tasks=_BackgroundTasks())
+
+        self.assertEqual(result["requested_concurrency"], 3)
+        self.assertEqual(result["effective_concurrency"], 1)
+        self.assertEqual(result["concurrency_forced_serial_reason"], "reuse_phone_until_unusable")
+        self.assertEqual(created_meta["settings"]["concurrency"], 1)
+        self.assertEqual(created_meta["settings"]["requested_concurrency"], 3)
+
     def test_manual_phone_lines_import_new_phone_to_pool_but_do_not_use_dynamic_pool(self):
         created_meta = {}
 

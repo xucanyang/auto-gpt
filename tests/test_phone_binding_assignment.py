@@ -1,3 +1,4 @@
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -577,6 +578,117 @@ class PhoneBindingAssignmentTests(unittest.TestCase):
         self.assertNotIn("chatgpt_phone_binding", accounts_by_id[456].extra)
         self.assertTrue(any("已收码未提交" in line for line in snapshot["logs"]))
         self.assertTrue(any("短信探测模式已开启" in line for line in snapshot["logs"]))
+
+    def test_concurrent_phone_binding_claims_distinct_manual_phones(self):
+        task_id = "task-phone-concurrent-distinct-phones"
+        _create_standalone_task_record(
+            task_id,
+            platform="chatgpt",
+            source="phone_binding_test",
+            total=2,
+            meta={
+                "missing_ids": [],
+                "parse_errors": [],
+                "requested_concurrency": 2,
+                "effective_concurrency": 2,
+            },
+        )
+        phone_items = [
+            {
+                "line_no": 1,
+                "phone": "+15550000001",
+                "api_url": "https://example.com/api/one",
+                "raw_line": "+15550000001----https://example.com/api/one",
+            },
+            {
+                "line_no": 2,
+                "phone": "+15550000002",
+                "api_url": "https://example.com/api/two",
+                "raw_line": "+15550000002----https://example.com/api/two",
+            },
+        ]
+
+        class _FakeAccount:
+            def __init__(self, account_id: int):
+                self.id = account_id
+                self.platform = "chatgpt"
+                self.email = f"concurrent{account_id}@example.com"
+                self.extra = {}
+
+            def get_extra(self):
+                return dict(self.extra)
+
+            def set_extra(self, extra):
+                self.extra = dict(extra or {})
+
+        accounts_by_id = {}
+
+        class _FakeSession:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def get(self, _model, account_id):
+                account_id_value = int(account_id or 0)
+                if account_id_value not in accounts_by_id:
+                    accounts_by_id[account_id_value] = _FakeAccount(account_id_value)
+                return accounts_by_id[account_id_value]
+
+            def refresh(self, _account):
+                return None
+
+            def add(self, _account):
+                return None
+
+            def commit(self):
+                return None
+
+            def rollback(self):
+                return None
+
+        attempts = []
+        attempts_lock = threading.Lock()
+        barrier = threading.Barrier(2, timeout=3)
+
+        def _fake_execute(account, allow_phone_verification=False, log_fn=None, shared_phone_service=None, stop_checker=None, retry_delays_seconds=None, proxy_url=None, phone_sms_probe_only=False):
+            entry = shared_phone_service.current_entry
+            with attempts_lock:
+                attempts.append((int(account.id or 0), entry.phone))
+            barrier.wait(timeout=3)
+            shared_phone_service.mark_sms_sent(entry)
+            shared_phone_service.last_code_time = "2026-07-09 00:00:00"
+            shared_phone_service.complete(entry)
+            return {"ok": True, "data": {"message": "done"}}
+
+        with (
+            patch("api.tasks.Session", return_value=_FakeSession()),
+            patch.object(api_actions, "_execute_chatgpt_resume_subscription_auth", side_effect=_fake_execute),
+            patch.object(api_actions, "_apply_chatgpt_resume_auth_result"),
+            patch("api.tasks._save_task_log"),
+        ):
+            _run_phone_binding_test(
+                task_id,
+                [456, 457],
+                phone_items,
+                {
+                    "timeout_seconds": 180,
+                    "poll_interval_seconds": 5,
+                    "max_resend_attempts": 0,
+                    "resend_interval_seconds": 0,
+                    "account_interval_seconds": 1,
+                    "proxy_mode": "direct",
+                    "requested_concurrency": 2,
+                    "concurrency": 2,
+                },
+            )
+
+        snapshot = _task_store.snapshot(task_id)
+        self.assertEqual(snapshot["success"], 2)
+        self.assertEqual({phone for _account_id, phone in attempts}, {"+15550000001", "+15550000002"})
+        self.assertEqual(len(snapshot["meta"]["runtime_results"]), 2)
+        self.assertTrue(any("并发已开启" in line for line in snapshot["logs"]))
 
 
 if __name__ == "__main__":
