@@ -803,7 +803,7 @@ class RefreshTokenRegistrationEngine:
             "chatgpt_gopay_provider_link_error": "",
         }
         try:
-            from core.proxy_utils import iter_enabled_runtime_proxies
+            from core.proxy_utils import resolve_default_chatgpt_proxy
             from services.chatgpt_core.gopay_flow import create_gopay_provider_link
             from services.chatgpt_core.payment import generate_plus_link
 
@@ -833,14 +833,9 @@ class RefreshTokenRegistrationEngine:
             country, currency = self._checkout_country_currency()
             billing = self._checkout_billing_config(country=country, currency=currency, email_addr=account.email)
             billing = {**billing, "country": country, "currency": currency}
-            proxy_candidates = [
-                str(item or "").strip()
-                for item in iter_enabled_runtime_proxies(self.proxy_url)
-                if str(item or "").strip()
-            ]
-            if not proxy_candidates:
+            checkout_proxy = resolve_default_chatgpt_proxy(self.proxy_url)
+            if not checkout_proxy:
                 raise RuntimeError("当前没有可用代理，无法生成 GoPay 平台链接")
-            checkout_proxy = proxy_candidates[0]
             self._log(f"[GoPay] 开始生成注册后平台链接 country={country} currency={currency}")
             checkout_url = generate_plus_link(
                 account,

@@ -155,7 +155,7 @@ const DEFAULT_PHONE_BINDING_SETTINGS = {
   account_interval_seconds: 60,
   concurrency: 1,
   reuse_phone_until_unusable: false,
-  proxy_mode: 'pool',
+  proxy_mode: 'dynamic',
   proxy: '',
   proxy_country_code: '',
   proxy_failover: true,
@@ -3609,7 +3609,7 @@ export default function Accounts() {
       post_join_poll_seconds: '3,8,15',
       delay_seconds: 0,
       delay_max_seconds: 0,
-      ...taskProxySettingsFromConfig(cfg || {}, { proxy_mode: 'pool', proxy_failover: true }),
+      ...taskProxySettingsFromConfig(cfg || {}, { proxy_mode: 'dynamic', proxy_failover: true }),
     })
     setBatchK12RecaptureOpen(true)
   }
@@ -4806,7 +4806,7 @@ export default function Accounts() {
         count: Number(values.count || 1) || 1,
         concurrency: Number(values.concurrency || 1) || 1,
         register_delay_seconds: Number(values.register_delay_seconds || 0) || 0,
-        proxy_mode: String(values.proxy_mode || 'pool'),
+        proxy_mode: String(values.proxy_mode || 'dynamic'),
         proxy: String(values.proxy || '').trim(),
         proxy_country_code: String(values.proxy_country_code || '').trim().toUpperCase(),
         proxy_failover: Boolean(values.proxy_failover),
@@ -5029,7 +5029,7 @@ export default function Accounts() {
         count: Number(values.count || 1) || 1,
         concurrency: Number(values.concurrency || 1) || 1,
         register_delay_seconds: Number(values.register_delay_seconds || 0) || 0,
-        proxy_mode: String(values.proxy_mode || 'pool'),
+        proxy_mode: String(values.proxy_mode || 'dynamic'),
         proxy: String(values.proxy || '').trim(),
         proxy_country_code: String(values.proxy_country_code || '').trim().toUpperCase(),
         proxy_failover: Boolean(values.proxy_failover),
@@ -7874,7 +7874,7 @@ export default function Accounts() {
             </Space>
           </Form.Item>
 
-          <Form.Item label="代理模式" name="proxy_mode" initialValue="pool">
+          <Form.Item label="代理模式" name="proxy_mode" initialValue="dynamic">
             <Select style={{ width: 260 }}>
               <Select.Option value="pool">代理池自动选取</Select.Option>
               <Select.Option value="specified">手动指定代理</Select.Option>
@@ -7998,7 +7998,7 @@ export default function Accounts() {
               <span style={{ color: '#888', marginLeft: 8 }}>（都填 0 为无延时，填不同数值则在区间内随机）</span>
             </Space>
           </Form.Item>
-          <Form.Item label="代理模式" name="proxy_mode" initialValue="pool">
+          <Form.Item label="代理模式" name="proxy_mode" initialValue="dynamic">
             <Select style={{ width: 260 }}>
               <Select.Option value="pool">代理池自动选取</Select.Option>
               <Select.Option value="specified">手动指定代理</Select.Option>

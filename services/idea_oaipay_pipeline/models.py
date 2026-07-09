@@ -66,7 +66,7 @@ class PhoneStepConfig(BaseModel):
     resend_interval_seconds: int = 30
     account_interval_seconds: int = 60
     proxy: str | None = None
-    proxy_mode: str = "pool"
+    proxy_mode: str = ""
     proxy_country_code: str = ""
     proxy_failover: bool = True
     proxy_max_candidates: int = 0

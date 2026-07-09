@@ -63,7 +63,13 @@ def account_has_local_status_auth_material(account: Any) -> bool:
     return bool(refresh_token or access_token)
 
 
-def sync_chatgpt_account_local_status(session: Session, account: AccountModel, *, proxy: str = "") -> dict[str, Any]:
+def sync_chatgpt_account_local_status(
+    session: Session,
+    account: AccountModel,
+    *,
+    proxy: str | None = None,
+    use_default_proxy: bool = True,
+) -> dict[str, Any]:
     """Probe ChatGPT locally and persist status/capabilities onto ``account``.
 
     The caller owns the SQLModel session. This function commits and refreshes the
@@ -90,7 +96,11 @@ def sync_chatgpt_account_local_status(session: Session, account: AccountModel, *
         workspace_id=str(extra.get("workspace_id") or "").strip(),
         extra=extra,
     )
-    probe = probe_local_chatgpt_status(probe_account, proxy=proxy)
+    probe = probe_local_chatgpt_status(
+        probe_account,
+        proxy=proxy,
+        use_default_proxy=use_default_proxy,
+    )
     try:
         session.commit()
     except Exception:
@@ -128,6 +138,7 @@ def schedule_chatgpt_local_status_refresh_for_account_id(
     account_id: Any,
     *,
     proxy: str | None = None,
+    use_default_proxy: bool = True,
     reason: str = "account_saved",
     delay_seconds: float = 0.0,
 ) -> bool:
@@ -159,7 +170,12 @@ def schedule_chatgpt_local_status_refresh_for_account_id(
                     return
                 if not account_has_local_status_auth_material(account):
                     return
-                sync_chatgpt_account_local_status(session, account, proxy=str(proxy or ""))
+                sync_chatgpt_account_local_status(
+                    session,
+                    account,
+                    proxy=proxy,
+                    use_default_proxy=use_default_proxy,
+                )
         except Exception as exc:
             logger.warning(
                 "ChatGPT local status auto-refresh failed account_id=%s reason=%s error=%s",

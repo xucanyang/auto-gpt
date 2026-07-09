@@ -189,9 +189,14 @@ def _refresh_access_token(extra: dict[str, Any], *, proxy: str = "") -> dict[str
     if not refresh_token:
         return {"ok": False, "message": "账号缺少 refresh_token"}
     client_id = str(extra.get("client_id") or "app_EMoamEEZ73f0CkXaXp7hrann").strip()
+    from core.proxy_utils import resolve_default_chatgpt_proxy
     from services.chatgpt_core.token_refresh import TokenRefreshManager
 
-    result = TokenRefreshManager(proxy_url=proxy or None).refresh_by_oauth_token(
+    try:
+        proxy_url = resolve_default_chatgpt_proxy(proxy)
+    except Exception as exc:
+        return {"ok": False, "message": f"默认代理解析失败: {exc}"}
+    result = TokenRefreshManager(proxy_url=proxy_url or None).refresh_by_oauth_token(
         refresh_token=refresh_token,
         client_id=client_id or None,
     )

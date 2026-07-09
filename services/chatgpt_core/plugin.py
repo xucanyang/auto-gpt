@@ -6,7 +6,7 @@ import string
 
 from core.base_mailbox import BaseMailbox
 from core.base_platform import Account, BasePlatform, RegisterConfig
-from core.proxy_utils import normalize_proxy_url, resolve_runtime_proxy
+from core.proxy_utils import normalize_proxy_url, resolve_default_chatgpt_proxy
 from services.chatgpt_core.chatgpt_registration_mode_adapter import (
     ChatGPTRegistrationContext,
     build_chatgpt_registration_mode_adapter,
@@ -33,7 +33,8 @@ class ChatGPTPlatform(BasePlatform):
             extra = account.extra or {}
             a.access_token = extra.get("access_token") or account.token
             a.cookies = extra.get("cookies", "")
-            status = check_subscription_status(a, proxy=self.config.proxy if self.config else None)
+            proxy = resolve_default_chatgpt_proxy(self.config.proxy if self.config else None)
+            status = check_subscription_status(a, proxy=proxy)
             return status not in ("expired", "invalid", "banned", None)
         except Exception:
             return False
@@ -64,7 +65,7 @@ class ChatGPTPlatform(BasePlatform):
         elif explicit_proxy:
             proxy = explicit_proxy
         else:
-            proxy = resolve_runtime_proxy(self.config.proxy if self.config else None)
+            proxy = resolve_default_chatgpt_proxy(self.config.proxy if self.config else None)
         if proxy:
             proxy_label = proxy
             if "://" in proxy_label:
@@ -593,12 +594,16 @@ class ChatGPTPlatform(BasePlatform):
             candidates = resolve_probe_candidate_proxies(
                 params,
                 fallback_proxy=None,
-                default_mode="direct",
+                default_mode="global",
             )
             last_error = None
             for i, (proxy_url, proxy_pool, source) in enumerate(candidates):
                 try:
-                    probe_result = probe_local_chatgpt_status(a, proxy=proxy_url)
+                    probe_result = probe_local_chatgpt_status(
+                        a,
+                        proxy=proxy_url,
+                        use_default_proxy=False,
+                    )
                     auth_state = str(probe_result.get("auth", {}).get("state") or "").strip()
                     if auth_state == "probe_failed" and i < len(candidates) - 1:
                         if proxy_pool is not None and proxy_url:
@@ -640,8 +645,6 @@ class ChatGPTPlatform(BasePlatform):
                         raise
             if last_error:
                 raise last_error
-
-        proxy = resolve_runtime_proxy(self.config.proxy if self.config else None)
 
         if action_id == "sync_cliproxyapi_status":
             from services.cliproxyapi_sync import sync_chatgpt_cliproxyapi_status
@@ -717,6 +720,7 @@ class ChatGPTPlatform(BasePlatform):
         if action_id == "refresh_token":
             from services.chatgpt_core.token_refresh import TokenRefreshManager
 
+            proxy = resolve_default_chatgpt_proxy(self.config.proxy if self.config else None)
             manager = TokenRefreshManager(proxy_url=proxy)
             result = manager.refresh_account(a)
             if result.success:
@@ -742,7 +746,7 @@ class ChatGPTPlatform(BasePlatform):
                 plan = "plus"
             country = str(params.get("country") or "ID").strip().upper() or "ID"
             currency = str(params.get("currency") or "IDR").strip().upper() or "IDR"
-            payment_proxy = normalize_proxy_url(params.get("proxy")) or ""
+            payment_proxy = resolve_default_chatgpt_proxy(normalize_proxy_url(params.get("proxy")) or None)
             payment_link_format = normalize_payment_link_output_format(params.get("payment_link_format"))
             promo_code = str(params.get("promo_code") or "").strip()
             save_defaults = params.get("save_defaults") is not False

@@ -567,7 +567,7 @@ export function RegisterTaskModal({
               <InputNumber min={0} precision={1} step={0.5} style={{ width: '100%' }} placeholder="0 = 固定延迟" />
             </Form.Item>
           </Space>
-          <Form.Item name="proxy_mode" label="代理模式" initialValue="pool">
+          <Form.Item name="proxy_mode" label="代理模式" initialValue="dynamic">
             <Select
               options={[
                 { value: 'direct', label: '直连' },

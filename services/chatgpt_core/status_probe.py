@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from curl_cffi import requests as cffi_requests
+from core.proxy_utils import normalize_proxy_url, resolve_default_chatgpt_proxy_with_metadata
 from services.chatgpt_account_state import is_account_deactivated_message
 from .token_refresh import TokenRefreshManager
 
@@ -276,6 +277,46 @@ def _probe_codex_usage(access_token: str, account_id: str, proxy: Optional[str])
     return _perform_get(CODEX_USAGE_URL, headers=headers, proxy=proxy)
 
 
+def _resolve_effective_probe_proxy(
+    proxy: Optional[str],
+    *,
+    use_default_proxy: bool = True,
+) -> tuple[str, str]:
+    explicit_proxy = normalize_proxy_url(proxy) or ""
+    if explicit_proxy:
+        return explicit_proxy, "explicit"
+    if not use_default_proxy:
+        return "", "direct"
+    resolved, _pool, source = resolve_default_chatgpt_proxy_with_metadata(None)
+    return str(resolved or "").strip(), str(source or ("proxy" if resolved else "direct")).strip()
+
+
+def _apply_proxy_resolution_failure(result: dict[str, Any], exc: Exception) -> dict[str, Any]:
+    message = f"默认代理解析失败: {_probe_exception_message(exc)}"
+    result.setdefault("network", {}).update(
+        {
+            "proxy_used": False,
+            "proxy_source": "resolve_failed",
+            "proxy_error": message,
+        }
+    )
+    result["auth"].update(
+        {
+            "state": "probe_failed",
+            "http_status": 0,
+            "error_code": "proxy_resolve_failed",
+            "message": message,
+        }
+    )
+    result["codex"].update(
+        {
+            "state": "not_checked",
+            "message": "默认代理解析失败，未执行 Codex 探测",
+        }
+    )
+    return result
+
+
 def _extract_accounts_check_plan_type(acct: dict[str, Any]) -> str:
     account = acct.get("account") if isinstance(acct.get("account"), dict) else {}
     plan_type = str(account.get("plan_type") or "").strip()
@@ -434,7 +475,12 @@ def _resolve_probe_access_token(
     }
 
 
-def probe_local_chatgpt_status(account: Any, proxy: Optional[str] = None) -> dict[str, Any]:
+def probe_local_chatgpt_status(
+    account: Any,
+    proxy: Optional[str] = None,
+    *,
+    use_default_proxy: bool = True,
+) -> dict[str, Any]:
     checked_at = _utcnow_iso()
     extra = getattr(account, "extra", {}) or {}
     refresh_token = str(extra.get("refresh_token") or getattr(account, "refresh_token", "") or "").strip()
@@ -480,13 +526,46 @@ def probe_local_chatgpt_status(account: Any, proxy: Optional[str] = None) -> dic
             "message": "",
             "chatgpt_account_id": account_id,
         },
+        "network": {
+            "proxy_used": False,
+            "proxy_source": "direct",
+        },
     }
+
+    if not refresh_token and not access_token:
+        result["auth"].update(
+            {
+                "state": "missing_refresh_token",
+                "source": "refresh_token",
+                "message": "账号缺少 refresh_token 且没有可用 access_token",
+            }
+        )
+        result["subscription"]["source"] = "refresh_token"
+        result["codex"].update(
+            {
+                "source": "refresh_token",
+                "state": "skipped_auth_invalid",
+                "message": "本地 refresh_token 未通过校验，跳过 Codex 探测",
+            }
+        )
+        return result
+
+    try:
+        effective_proxy, proxy_source = _resolve_effective_probe_proxy(proxy, use_default_proxy=use_default_proxy)
+    except Exception as exc:
+        return _apply_proxy_resolution_failure(result, exc)
+    result["network"].update(
+        {
+            "proxy_used": bool(effective_proxy),
+            "proxy_source": proxy_source or ("proxy" if effective_proxy else "direct"),
+        }
+    )
 
     token_resolution = _resolve_probe_access_token(
         refresh_token=refresh_token,
         access_token=access_token,
         client_id=client_id,
-        proxy=proxy,
+        proxy=effective_proxy,
     )
     token_source = str(token_resolution.get("source") or "refresh_token").strip() or "refresh_token"
     result["auth"]["source"] = token_source
@@ -531,7 +610,7 @@ def probe_local_chatgpt_status(account: Any, proxy: Optional[str] = None) -> dic
 
     probe_access_token = str(token_resolution.get("access_token") or "").strip()
     try:
-        me_result = _probe_backend_me(probe_access_token, proxy=proxy)
+        me_result = _probe_backend_me(probe_access_token, proxy=effective_proxy)
     except Exception as exc:
         me_result = _failed_probe_result(exc)
     result["auth"].update(
@@ -566,7 +645,7 @@ def probe_local_chatgpt_status(account: Any, proxy: Optional[str] = None) -> dic
 
         if normalized_plan == "unknown" or not subscription_active_until:
             try:
-                accounts_check = _probe_accounts_check(probe_access_token, proxy=proxy)
+                accounts_check = _probe_accounts_check(probe_access_token, proxy=effective_proxy)
             except Exception as exc:
                 accounts_check = _failed_probe_result(exc)
             if accounts_check.status_code == 200 and accounts_check.body_json:
@@ -607,7 +686,7 @@ def probe_local_chatgpt_status(account: Any, proxy: Optional[str] = None) -> dic
             return result
 
         try:
-            codex_result = _probe_codex_usage(probe_access_token, account_id=account_id, proxy=proxy)
+            codex_result = _probe_codex_usage(probe_access_token, account_id=account_id, proxy=effective_proxy)
         except Exception as exc:
             codex_result = _failed_probe_result(exc)
         result["codex"].update(

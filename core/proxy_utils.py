@@ -105,6 +105,29 @@ def _configured_value(key: str, default: Any = "") -> Any:
         return default
 
 
+_GLOBAL_TASK_PROXY_DEFAULT_MODES = {"global", "config", "task", "task_proxy", "default"}
+
+
+def _is_global_task_proxy_default(default_mode: Any) -> bool:
+    return str(default_mode or "").strip().lower() in _GLOBAL_TASK_PROXY_DEFAULT_MODES
+
+
+def _global_task_proxy_mode(default: str = "dynamic") -> str:
+    mode = str(_configured_value("task_proxy_mode", default) or default).strip().lower()
+    return mode or default
+
+
+def _global_task_proxy_url() -> str:
+    return str(_configured_value("task_proxy_url", "") or "").strip()
+
+
+def _global_task_proxy_country(default: str = "") -> str:
+    country = str(_configured_value("task_proxy_country_code", "") or "").strip().upper()
+    if country:
+        return country
+    return str(default or "").strip().upper()
+
+
 def _safe_source_text(value: Any, limit: int = 240) -> str:
     text = str(value or "")
     try:
@@ -280,14 +303,27 @@ def resolve_task_proxy_candidates(
     if params is None or not isinstance(params, dict):
         params = {}
 
-    raw_proxy_value = _param_first(
+    use_global_defaults = _is_global_task_proxy_default(default_mode)
+    global_mode = _global_task_proxy_mode("dynamic") if use_global_defaults else ""
+    global_proxy = _global_task_proxy_url() if use_global_defaults else ""
+
+    raw_proxy_param_value = _param_first(
         params,
         "proxy",
         "proxy_url",
         "register_proxy",
         "probe_proxy",
         "dynamic_proxy_template",
-        default=fallback_proxy,
+        default=None,
+    )
+    has_explicit_proxy_param = raw_proxy_param_value not in (None, "")
+    has_fallback_proxy = fallback_proxy not in (None, "")
+    raw_proxy_value = (
+        raw_proxy_param_value
+        if has_explicit_proxy_param
+        else fallback_proxy
+        if has_fallback_proxy
+        else global_proxy
     )
     raw_proxy = str(raw_proxy_value or "").strip()
     explicit_proxy = normalize_proxy_url(raw_proxy) or ""
@@ -303,14 +339,17 @@ def resolve_task_proxy_candidates(
     ).strip().lower()
 
     if not mode:
-        mode = "specified" if raw_proxy else default_mode
+        if (has_explicit_proxy_param or has_fallback_proxy) and raw_proxy:
+            mode = "specified"
+        else:
+            mode = global_mode if use_global_defaults else default_mode
 
     if mode in {"none", "no_proxy", "direct", "直连"}:
         return [("", None, "direct")]
     if mode in {"manual", "explicit"}:
         mode = "specified"
     if mode not in {"specified", "pool", "dynamic"}:
-        mode = "specified" if explicit_proxy else default_mode
+        mode = "specified" if explicit_proxy else (global_mode if use_global_defaults else default_mode)
     if mode == "direct":
         return [("", None, "direct")]
 
@@ -320,7 +359,7 @@ def resolve_task_proxy_candidates(
             "proxy_country_code",
             "register_proxy_country_code",
             "probe_proxy_country_code",
-            default="",
+            default=_global_task_proxy_country("") if use_global_defaults else "",
         )
         or ""
     ).strip().upper()
@@ -332,7 +371,7 @@ def resolve_task_proxy_candidates(
         "proxy_failover",
         "register_proxy_failover",
         "probe_proxy_failover",
-        default=None,
+        default=_configured_value("task_proxy_failover", "") if use_global_defaults else None,
     )
     failover = _truthy(raw_failover, default=False)
 
@@ -342,7 +381,14 @@ def resolve_task_proxy_candidates(
             "proxy_max_candidates",
             "register_proxy_max_candidates",
             "probe_proxy_max_candidates",
-            default=_configured_value("proxy_pool_max_candidates", "5"),
+            default=(
+                _configured_value(
+                    "task_proxy_max_candidates",
+                    _configured_value("proxy_pool_max_candidates", "5"),
+                )
+                if use_global_defaults
+                else _configured_value("proxy_pool_max_candidates", "5")
+            ),
         ),
         default=5,
         minimum=1,
@@ -354,7 +400,14 @@ def resolve_task_proxy_candidates(
             "proxy_min_score",
             "register_proxy_min_score",
             "probe_proxy_min_score",
-            default=_configured_value("proxy_scan_min_score", "50"),
+            default=(
+                _configured_value(
+                    "task_proxy_min_score",
+                    _configured_value("proxy_scan_min_score", "50"),
+                )
+                if use_global_defaults
+                else _configured_value("proxy_scan_min_score", "50")
+            ),
         ),
         default=50,
         minimum=0,
@@ -429,7 +482,7 @@ def resolve_task_proxy_candidates(
 def resolve_probe_candidate_proxies(
     params: Optional[dict] = None,
     fallback_proxy: Optional[str] = None,
-    default_mode: str = "direct",
+    default_mode: str = "global",
 ) -> list[tuple[str, Any, str]]:
     """为批量本地状态探测（或其他 Action）解析候选代理列表，支持参考注册的代理配置语义。"""
     return resolve_task_proxy_candidates(
@@ -438,6 +491,33 @@ def resolve_probe_candidate_proxies(
         default_mode=default_mode,
         target="chatgpt",
     )
+
+
+def resolve_default_chatgpt_proxy_with_metadata(
+    proxy_url: Optional[str] = None,
+) -> tuple[str, object | None, str]:
+    """解析 ChatGPT/OpenAI 账号网络动作的默认出口。
+
+    规则：
+    - 显式传入 proxy_url 时优先使用；
+    - 未传时读取全局任务代理配置；
+    - 全局未配置 task_proxy_mode 时默认走 dynamic。
+    """
+    explicit_proxy = normalize_proxy_url(proxy_url)
+    if explicit_proxy:
+        return explicit_proxy, None, "explicit"
+    candidates = resolve_task_proxy_candidates(
+        {},
+        fallback_proxy=None,
+        default_mode="global",
+        target="chatgpt",
+    )
+    return candidates[0] if candidates else ("", None, "direct")
+
+
+def resolve_default_chatgpt_proxy(proxy_url: Optional[str] = None) -> str:
+    resolved, _, _ = resolve_default_chatgpt_proxy_with_metadata(proxy_url)
+    return resolved
 
 
 def build_requests_proxy_config(proxy_url: Optional[str]) -> Optional[dict[str, str]]:

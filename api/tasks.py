@@ -83,7 +83,7 @@ class RegisterTaskRequest(BaseModel):
     register_delay_seconds: float = 0
     register_delay_max_seconds: float = 0
     proxy: Optional[str] = None
-    proxy_mode: str = ""  # direct | specified | pool | dynamic；空值保持旧语义：有 proxy 用指定代理，无 proxy 直连
+    proxy_mode: str = ""  # direct | specified | pool | dynamic；空值使用全局账号网络默认出口
     proxy_country_code: str = ""
     proxy_failover: bool = False
     proxy_max_candidates: int = 0
@@ -120,7 +120,7 @@ class K12WorkspaceRecaptureTaskRequest(BaseModel):
     save_all_spaces: bool = True
     strict_join: bool = False
     proxy: Optional[str] = None
-    proxy_mode: str = "pool"
+    proxy_mode: str = ""
     proxy_country_code: str = ""
     proxy_failover: bool = True
     proxy_max_candidates: int = 0
@@ -190,7 +190,7 @@ class PhoneBindingTestTaskRequest(BaseModel):
     prefix_sms_probe_only: bool = False
     limit: int = 0
     proxy: Optional[str] = None
-    proxy_mode: str = "pool"  # direct | specified | pool | dynamic
+    proxy_mode: str = ""  # direct | specified | pool | dynamic；空值使用全局账号网络默认出口
     proxy_country_code: str = ""
     proxy_failover: bool = True
     proxy_max_candidates: int = 0
@@ -320,7 +320,7 @@ class CustomEmailRecheckTaskRequest(BaseModel):
     password: str = ""
     save_on_success: bool = True
     proxy: Optional[str] = None
-    proxy_mode: str = ""  # direct | specified | pool | dynamic；空值保持旧 API 语义：有 proxy 用指定代理，无 proxy 直连
+    proxy_mode: str = ""  # direct | specified | pool | dynamic；空值使用全局账号网络默认出口
     proxy_country_code: str = ""
     proxy_failover: bool = False
     proxy_max_candidates: int = 0
@@ -337,7 +337,7 @@ class BatchCustomEmailRecheckTaskRequest(BaseModel):
     save_on_success: bool = True
     limit: int = 200
     proxy: Optional[str] = None
-    proxy_mode: str = ""  # direct | specified | pool | dynamic；空值保持旧 API 语义：有 proxy 用指定代理，无 proxy 直连
+    proxy_mode: str = ""  # direct | specified | pool | dynamic；空值使用全局账号网络默认出口
     proxy_country_code: str = ""
     proxy_failover: bool = False
     proxy_max_candidates: int = 0
@@ -353,7 +353,7 @@ class IcloudHmeRecheckBatchTaskRequest(BaseModel):
     include_retry: bool = False
     save_on_success: bool = True
     proxy: Optional[str] = None
-    proxy_mode: str = "pool"
+    proxy_mode: str = ""
     proxy_country_code: str = ""
     proxy_failover: bool = False
     proxy_max_candidates: int = 0
@@ -431,7 +431,7 @@ def _prepare_register_request(req: RegisterTaskRequest) -> RegisterTaskRequest:
             or ""
         ).strip().lower()
         if not mode:
-            mode = "specified" if raw_proxy else "direct"
+            mode = str(effective_extra.get("task_proxy_mode") or "dynamic").strip().lower() or "dynamic"
         if mode in {"none", "no_proxy", "direct", "直连"}:
             raise HTTPException(400, "开启强制独立出口 IP 时不能使用直连模式；请改用动态代理、代理池或可切换的多代理。")
         if mode in {"manual", "explicit"}:
@@ -846,7 +846,7 @@ def _k12_recapture_params_from_request(req: K12WorkspaceRecaptureTaskRequest) ->
         "save_all_spaces": bool(req.save_all_spaces),
         "strict_join": bool(req.strict_join),
         "proxy": str(req.proxy or "").strip() or None,
-        "proxy_mode": str(req.proxy_mode or "pool").strip().lower() or "pool",
+        "proxy_mode": str(req.proxy_mode or "").strip().lower(),
         "proxy_country_code": str(req.proxy_country_code or "").strip().upper(),
         "proxy_failover": bool(req.proxy_failover),
         "proxy_max_candidates": int(req.proxy_max_candidates or 0),
@@ -866,7 +866,7 @@ def _normalize_k12_recapture_params(params: dict[str, Any] | None) -> dict[str, 
         "save_all_spaces": _truthy_with_default(raw.get("save_all_spaces"), True),
         "strict_join": _truthy_with_default(raw.get("strict_join"), False),
         "proxy": str(raw.get("proxy") or raw.get("proxy_url") or "").strip() or None,
-        "proxy_mode": str(raw.get("proxy_mode") or "pool").strip().lower() or "pool",
+        "proxy_mode": str(raw.get("proxy_mode") or "").strip().lower(),
         "proxy_country_code": str(raw.get("proxy_country_code") or "").strip().upper(),
         "proxy_failover": _truthy_with_default(raw.get("proxy_failover"), True),
         "proxy_max_candidates": int(float(raw.get("proxy_max_candidates") or 0)),
@@ -2137,13 +2137,13 @@ def _custom_email_proxy_settings(req: CustomEmailRecheckTaskRequest | BatchCusto
     explicit_proxy = normalize_proxy_url(getattr(req, "proxy", None)) or ""
     mode = str(getattr(req, "proxy_mode", "") or "").strip().lower()
     if not mode:
-        mode = "specified" if explicit_proxy else "direct"
+        mode = "specified" if explicit_proxy else ""
     if mode in {"none", "no_proxy", "direct", "直连"}:
         mode = "direct"
     elif mode in {"manual", "explicit"}:
         mode = "specified"
     elif mode not in {"specified", "pool", "dynamic"}:
-        mode = "specified" if explicit_proxy else "direct"
+        mode = "specified" if explicit_proxy else ""
 
     country_code = str(getattr(req, "proxy_country_code", "") or "").strip().upper()
     if mode == "dynamic" and not country_code:
@@ -2160,7 +2160,7 @@ def _custom_email_proxy_settings(req: CustomEmailRecheckTaskRequest | BatchCusto
 
 
 def _custom_email_proxy_meta(settings: dict[str, Any]) -> dict[str, Any]:
-    mode = str(settings.get("proxy_mode") or "").strip().lower() or "direct"
+    mode = str(settings.get("proxy_mode") or "").strip().lower() or "global"
     meta = {
         "mode": mode,
         "country_code": str(settings.get("proxy_country_code") or "").strip().upper(),
@@ -2192,7 +2192,7 @@ def _build_custom_email_recheck_candidate_proxies(settings: dict[str, Any] | Non
     return resolve_task_proxy_candidates(
         dict(settings or {}),
         fallback_proxy=None,
-        default_mode="direct",
+        default_mode="global",
         target="chatgpt",
     )
 
@@ -3625,7 +3625,7 @@ def enqueue_phone_binding_test_task(
         "selected_prefixes": list(requested_prefixes),
         "prefix_sms_probe_only": prefix_sms_probe_only,
         "proxy": str(req.proxy or ""),
-        "proxy_mode": str(req.proxy_mode or "pool"),
+        "proxy_mode": str(req.proxy_mode or ""),
         "proxy_country_code": str(req.proxy_country_code or "").strip().upper(),
         "proxy_failover": bool(req.proxy_failover),
         "proxy_max_candidates": int(req.proxy_max_candidates or 0),
@@ -3634,7 +3634,7 @@ def enqueue_phone_binding_test_task(
     display_settings = dict(runtime_settings)
     display_settings["proxy"] = redact_proxy_url(runtime_settings.get("proxy"))
     display_settings["proxy_redacted"] = display_settings["proxy"]
-    display_proxy_mode = str(display_settings.get("proxy_mode") or "pool").strip().lower()
+    display_proxy_mode = str(display_settings.get("proxy_mode") or "global").strip().lower()
     if display_proxy_mode == "dynamic":
         display_settings.pop("proxy_max_candidates", None)
         display_settings.pop("proxy_min_score", None)
@@ -9863,7 +9863,7 @@ def _run_phone_binding_test_concurrent(
         return resolve_task_proxy_candidates(
             dict(settings or {}),
             fallback_proxy=None,
-            default_mode="direct",
+            default_mode="global",
             target="chatgpt",
         )
 
@@ -11151,7 +11151,7 @@ def _run_phone_binding_test(
         return resolve_task_proxy_candidates(
             dict(settings or {}),
             fallback_proxy=None,
-            default_mode="direct",
+            default_mode="global",
             target="chatgpt",
         )
 
@@ -12597,7 +12597,7 @@ def _run_batch_probe_local_status(task_id: str, account_ids: list[int], params: 
                 candidates = resolve_probe_candidate_proxies(
                     params,
                     fallback_proxy="",
-                    default_mode="direct",
+                    default_mode="global",
                 )
                 success_probe = False
                 last_err = ""
@@ -12605,7 +12605,12 @@ def _run_batch_probe_local_status(task_id: str, account_ids: list[int], params: 
                     proxy_display = redact_proxy_url(proxy_url) or "直连"
                     task_log(f" -> [尝试 {attempt_idx}/{len(candidates)}] \n    使用代理: {proxy_display}\n    代理信息: {source}")
                     try:
-                        res = sync_chatgpt_account_local_status(session, acc, proxy=proxy_url)
+                        res = sync_chatgpt_account_local_status(
+                            session,
+                            acc,
+                            proxy=proxy_url,
+                            use_default_proxy=False,
+                        )
                         plan = res.get("probe", {}).get("subscription", {}).get("plan", "unknown")
                         task_log(f" -> [成功] 账号 {email} 本地状态同步完成｜当前订阅计划: {plan}")
                         if proxy_pool is not None and proxy_url:
@@ -13134,7 +13139,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
             return resolve_task_proxy_candidates(
                 params,
                 fallback_proxy=None,
-                default_mode="direct",
+                default_mode="global",
                 target="chatgpt",
             )
 
@@ -13161,8 +13166,6 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
             try:
                 from core.proxy_utils import (
                     is_proxy_error_text,
-                    iter_enabled_runtime_proxies,
-                    resolve_runtime_proxy_with_metadata,
                 )
 
                 control.checkpoint()

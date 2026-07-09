@@ -7,6 +7,22 @@
 ## [Unreleased] (未发布)
 
 
+## [1.3.42] - 2026-07-09
+### 新增 (Added)
+- **全局设置新增账号网络默认出口**：`frontend/src/pages/Settings.tsx` 在注册设置中新增“账号网络默认出口”，统一维护 `task_proxy_mode / task_proxy_url / task_proxy_country_code / task_proxy_failover / task_proxy_max_candidates / task_proxy_min_score`；运营可在全局把 ChatGPT/OpenAI 账号网络动作切换为 `dynamic` 动态代理、`pool` 代理池、`specified` 指定代理或 `direct` 直连，默认值改为动态代理并优先使用 `dynamic_proxy_template` 与默认国家。
+
+### 优化 (Changed)
+- **账号网络动作默认从直连改为全局动态代理**：`core/proxy_utils.py` 新增 `resolve_default_chatgpt_proxy_with_metadata()` / `resolve_default_chatgpt_proxy()`，并让 `resolve_probe_candidate_proxies()` 默认读取全局 `task_proxy_*` 配置；显式传入代理时仍优先使用显式代理，避免旧 API 传 `proxy` 被全局动态代理覆盖。
+- **单账号状态刷新与 Codex 额度刷新统一走默认出口**：`services/chatgpt_core/status_probe.py` 与 `services/chatgpt_core/codex_usage.py` 会在执行 RT 刷 AT、`/backend-api/me`、`accounts/check`、`wham/usage`、`codex/responses` 前解析全局默认代理，并在返回结构中写入 `network.proxy_used / proxy_source / proxy_error`，代理解析失败时返回 `proxy_resolve_failed` 而不是静默直连。
+- **批量/自动账号状态同步沿用同一代理策略**：`services/chatgpt_core/local_status_refresh.py`、`api/tasks.py`、`api/actions.py`、`api/chatgpt.py`、`api/external_access_tokens.py` 将自动状态刷新、批量本地状态同步、K12 workspace 重跑、RT 刷新、订阅链接/GoPay 链接、外部 AT 预检等 ChatGPT/OpenAI 账号网络动作切到全局默认出口；候选代理循环已显式传 `use_default_proxy=False`，避免同一次尝试二次解析代理。
+- **注册、手机号绑定和邮箱测活默认跟随全局出口**：`api/tasks.py`、`services/chatgpt_core/plugin.py`、`services/chatgpt_core/access_token_only_registration_engine.py`、`services/chatgpt_core/refresh_token_registration_engine.py` 与 `services/idea_oaipay_pipeline/models.py` 不再把空代理模式落到直连/代理池，默认使用全局账号网络出口；注册后的 checkout/GoPay 链接也复用当前默认代理，不再绕回旧代理池路径。
+- **前端任务代理默认值同步为动态代理**：`frontend/src/lib/taskProxySettings.ts`、`frontend/src/pages/Accounts.tsx`、`frontend/src/features/accounts/components/AccountActionSurface.tsx`、`frontend/src/pages/CustomEmailRecheckPage.tsx`、`frontend/src/pages/IdeaOaiPayPipeline.tsx` 与 `frontend/src/features/auth/components/RegisterTaskModal.tsx` 将状态同步、K12 重跑、注册、手机号绑定、邮箱测活等表单默认代理模式调整为动态代理，并继续从全局设置回填国家、候选数量和失败切换配置。
+- **同步前端版本号至 v1.3.42**：`frontend/src/app/AppShell.tsx` 侧边栏版本展示更新为 `v1.3.42`，用于上线后确认默认账号网络出口改造版本已加载。
+
+### 测试 (Tests)
+- **补充默认代理回归覆盖**：`tests/test_dynamic_proxy.py` 新增全局动态代理、全局直连关闭和显式代理优先级测试；`tests/test_chatgpt_status_probe.py`、`tests/test_chatgpt_codex_usage.py`、`tests/test_chatgpt_plugin.py`、`tests/test_register_task_controls.py` 与 `tests/test_chatgpt_phone_registration.py` 更新测试夹具，覆盖状态探测、Codex 用量、单账号 Action、注册与手机号绑定在新默认代理语义下的行为。已通过 159 条定向回归、前端构建与 Python 语法检查。
+
+
 ## [1.3.41] - 2026-07-09
 ### 修复 (Fixed)
 - **修复手机号绑定任务手动停止后仍占用右上角运行中任务**：`api/tasks.py` 的手机号绑定串行与并发 runner 在捕获 `StopTaskRequested` 时现在会同步调用 `_task_store.finish(status="stopped")`，再写入任务历史；避免任务日志已经记录“任务已手动停止”，但内存任务快照仍保持 `running + stop_requested=true + active_attempts=0`，导致账号页右上角“正在运行任务”长期显示幽灵任务。
@@ -977,4 +993,8 @@
 
 ## 2026-07-09 16:34:53 +0800
 - 修复 Idea 提交状态回填与停止任务幽灵显示
+- 发布模式: multi
+
+## 2026-07-09 17:19:04 +0800
+- 默认账号网络动作走全局动态代理
 - 发布模式: multi

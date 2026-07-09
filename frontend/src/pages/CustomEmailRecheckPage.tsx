@@ -268,7 +268,7 @@ export default function CustomEmailRecheckPage() {
   const taskRef = useRef<any>(null)
 
   const watchedEmail = Form.useWatch('email', form)
-  const proxyMode = String(Form.useWatch('proxy_mode', form) || 'pool') as ProxyMode
+  const proxyMode = String(Form.useWatch('proxy_mode', form) || 'dynamic') as ProxyMode
   const proxyFailover = Boolean(Form.useWatch('proxy_failover', form))
   const bulkParse = useMemo(() => parseBulkEmails(bulkEmailsText), [bulkEmailsText])
   const sub2apiPreview = useMemo(() => parseSub2ApiImportPreview(sub2apiImportText), [sub2apiImportText])

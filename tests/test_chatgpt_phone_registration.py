@@ -416,7 +416,10 @@ class PhoneRegistrationEngineTests(unittest.TestCase):
         with mock.patch(
             "services.chatgpt_core.phone_registration_engine.PhoneRegistrationEngine",
             return_value=fake_engine,
-        ) as engine_cls:
+        ) as engine_cls, mock.patch(
+            "services.chatgpt_core.plugin.resolve_default_chatgpt_proxy",
+            return_value="",
+        ):
             account = platform.register(password="Secret123!A1")
 
         self.assertIs(account, fake_account)

@@ -433,7 +433,7 @@ def _build_config_response(*, local_only: bool = False) -> dict[str, Any]:
     if not all_cfg.get("proxy_pool_max_candidates"):
         all_cfg["proxy_pool_max_candidates"] = "5"
     if not all_cfg.get("task_proxy_mode"):
-        all_cfg["task_proxy_mode"] = "pool"
+        all_cfg["task_proxy_mode"] = "dynamic"
     if not all_cfg.get("task_proxy_url"):
         all_cfg["task_proxy_url"] = ""
     if not all_cfg.get("task_proxy_country_code"):

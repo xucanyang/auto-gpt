@@ -72,6 +72,16 @@ def _codex_response(headers):
 
 
 class CodexUsageTests(unittest.TestCase):
+    def setUp(self):
+        self.proxy_patcher = mock.patch(
+            "services.chatgpt_core.codex_usage._resolve_effective_probe_proxy",
+            return_value=("", "direct"),
+        )
+        self.proxy_patcher.start()
+
+    def tearDown(self):
+        self.proxy_patcher.stop()
+
     def test_header_parser_normalizes_primary_7d_secondary_5h(self):
         snapshot = parse_codex_rate_limit_headers(
             {

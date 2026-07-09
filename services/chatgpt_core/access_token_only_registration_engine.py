@@ -353,7 +353,7 @@ class AccessTokenOnlyRegistrationEngine:
             normalize_checkout_country,
             normalize_checkout_currency,
         )
-        from core.proxy_utils import iter_enabled_runtime_proxies
+        from core.proxy_utils import resolve_default_chatgpt_proxy
 
         class _CheckoutAccount:
             pass
@@ -397,10 +397,9 @@ class AccessTokenOnlyRegistrationEngine:
         if gopay_provider_link_enabled:
             billing = {**billing, "country": country, "currency": currency}
 
-        proxy_candidates = [str(item or "").strip() for item in iter_enabled_runtime_proxies(self.proxy_url) if str(item or "").strip()]
-        if not proxy_candidates:
+        checkout_proxy = resolve_default_chatgpt_proxy(self.proxy_url)
+        if not checkout_proxy:
             raise RuntimeError("当前没有可用代理，无法生成订阅链接")
-        checkout_proxy = proxy_candidates[0]
 
         self._log(f"Plus 账单探测: 生成订阅链接 country={country} currency={currency}")
         try:

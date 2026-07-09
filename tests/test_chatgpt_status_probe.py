@@ -33,8 +33,14 @@ class ChatGPTStatusProbeTests(unittest.TestCase):
             return_value=_empty_accounts_check_result(),
         )
         self.accounts_check_patcher.start()
+        self.proxy_patcher = mock.patch(
+            "services.chatgpt_core.status_probe._resolve_effective_probe_proxy",
+            return_value=("", "direct"),
+        )
+        self.proxy_patcher.start()
 
     def tearDown(self):
+        self.proxy_patcher.stop()
         self.accounts_check_patcher.stop()
 
     def test_probe_marks_missing_refresh_token(self):

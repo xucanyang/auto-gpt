@@ -513,9 +513,9 @@ def _ensure_gopay_snapshot_account(snapshot: dict, account_id: int) -> None:
 
 
 def _resolve_chatgpt_proxy(proxy: Optional[str] = None) -> str:
-    from core.proxy_utils import resolve_runtime_proxy
+    from core.proxy_utils import resolve_default_chatgpt_proxy
 
-    return resolve_runtime_proxy(proxy)
+    return resolve_default_chatgpt_proxy(proxy)
 
 
 def _resolve_browser_auth_proxy(proxy: Optional[str] = None) -> str:
@@ -553,32 +553,42 @@ async def _browser_auth_goto(state: Any, url: Optional[str]) -> None:
 
 
 def _resolve_optional_checkout_proxy(proxy: Optional[str] = None) -> str:
-    from core.proxy_utils import normalize_proxy_url
+    from core.proxy_utils import resolve_default_chatgpt_proxy
 
-    return normalize_proxy_url(proxy) or ""
+    return resolve_default_chatgpt_proxy(proxy)
 
 
 def _iter_chatgpt_candidate_proxies(proxy: Optional[str] = None) -> list[str]:
-    from core.proxy_utils import iter_enabled_runtime_proxies, normalize_proxy_url, resolve_runtime_proxy
+    from core.proxy_utils import normalize_proxy_url, resolve_task_proxy_candidates
 
     results: list[str] = []
     seen: set[str] = set()
-    for item in iter_enabled_runtime_proxies(proxy):
-        value = normalize_proxy_url(item) or ""
-        if not value or value in seen:
-            continue
-        seen.add(value)
-        results.append(value)
-    fallback = normalize_proxy_url(resolve_runtime_proxy(proxy)) or ""
-    if fallback and fallback not in seen:
-        results.append(fallback)
+    explicit = normalize_proxy_url(proxy)
+    if explicit:
+        results.append(explicit)
+        seen.add(explicit)
+    else:
+        for item, _pool, _source in resolve_task_proxy_candidates(
+            {},
+            fallback_proxy=None,
+            default_mode="global",
+            target="chatgpt",
+        ):
+            value = normalize_proxy_url(item) or ""
+            if not value or value in seen:
+                continue
+            seen.add(value)
+            results.append(value)
     if not results:
         results.append("")
     return results
 
 
 def _resolve_required_checkout_proxy(proxy: Optional[str] = None) -> str:
-    candidates = [item for item in _iter_chatgpt_candidate_proxies(proxy) if str(item or "").strip()]
+    try:
+        candidates = [item for item in _iter_chatgpt_candidate_proxies(proxy) if str(item or "").strip()]
+    except Exception as exc:
+        raise HTTPException(400, f"当前没有可用代理，无法生成订阅链接: {exc}") from exc
     if not candidates:
         raise HTTPException(400, "当前没有可用代理，无法生成订阅链接")
     return str(candidates[0]).strip()
@@ -739,7 +749,8 @@ def refresh_token(account_id: int, proxy: Optional[str] = None,
     codex_acc = _to_codex_account(acc)
 
     from services.chatgpt_core.token_refresh import TokenRefreshManager
-    manager = TokenRefreshManager(proxy_url=proxy)
+    resolved_proxy = _resolve_chatgpt_proxy(proxy)
+    manager = TokenRefreshManager(proxy_url=resolved_proxy or None)
     result = manager.refresh_account(codex_acc)
 
     if result.success:
@@ -753,7 +764,11 @@ def refresh_token(account_id: int, proxy: Optional[str] = None,
         acc.updated_at = datetime.utcnow()
         session.add(acc)
         session.commit()
-        schedule_chatgpt_local_status_refresh_for_account_id(acc.id, proxy=proxy, reason="chatgpt_refresh_token")
+        schedule_chatgpt_local_status_refresh_for_account_id(
+            acc.id,
+            proxy=resolved_proxy,
+            reason="chatgpt_refresh_token",
+        )
         return {"ok": True, "access_token": result.access_token[:40] + "..."}
     raise HTTPException(400, result.error_message)
 
@@ -2921,7 +2936,7 @@ def submit_gopay_batch_payment_pin(batch_id: str, account_id: int, req: GoPayPin
 def list_payment_countries(proxy: Optional[str] = None):
     from services.chatgpt_core.payment import fetch_checkout_countries
 
-    return {"countries": fetch_checkout_countries(proxy=proxy)}
+    return {"countries": fetch_checkout_countries(proxy=_resolve_optional_checkout_proxy(proxy))}
 
 
 @router.get("/payment-config/{country_code}")

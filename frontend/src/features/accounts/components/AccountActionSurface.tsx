@@ -1317,7 +1317,7 @@ export function AccountActionSurface({
         join_timeout_seconds: 60,
         join_retry_count: 2,
         post_join_poll_seconds: '3,8,15',
-        ...taskProxySettingsFromConfig(cfg || {}, { proxy_mode: 'pool', proxy_failover: true }),
+        ...taskProxySettingsFromConfig(cfg || {}, { proxy_mode: 'dynamic', proxy_failover: true }),
       })
       setActionOpen(true)
       return
@@ -1588,7 +1588,7 @@ export function AccountActionSurface({
     }
 
     if (activeAction.id === 'k12_workspace_recapture') {
-      const proxyMode = String(actionProxyModeValue || actionForm.getFieldValue('proxy_mode') || 'pool')
+      const proxyMode = String(actionProxyModeValue || actionForm.getFieldValue('proxy_mode') || 'dynamic')
       const proxyFailover = Boolean(actionProxyFailoverValue)
       return (
         <>

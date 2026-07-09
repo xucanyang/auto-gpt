@@ -13,9 +13,9 @@ export type TaskProxySettings = {
 }
 
 const DEFAULT_TASK_PROXY_SETTINGS: TaskProxySettings = {
-  proxy_mode: 'pool',
+  proxy_mode: 'dynamic',
   proxy: '',
-  proxy_country_code: '',
+  proxy_country_code: 'JP',
   proxy_failover: false,
   proxy_max_candidates: 5,
   proxy_min_score: 50,
@@ -57,7 +57,7 @@ function numberWithDefault(value: unknown, fallback: number, minimum: number, ma
   return Math.max(minimum, Math.min(maximum, Math.floor(parsed)))
 }
 
-export function normalizeTaskProxyMode(value: unknown, fallback: TaskProxyMode = 'pool'): TaskProxyMode {
+export function normalizeTaskProxyMode(value: unknown, fallback: TaskProxyMode = 'dynamic'): TaskProxyMode {
   const normalized = String(value || '').trim().toLowerCase() as TaskProxyMode
   return VALID_PROXY_MODES.has(normalized) ? normalized : fallback
 }

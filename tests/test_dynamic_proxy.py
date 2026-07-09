@@ -2,7 +2,12 @@ import pytest
 from fastapi import HTTPException
 
 from core.dynamic_proxy import declared_proxy_region, resolve_dynamic_proxy_template
-from core.proxy_utils import _dynamic_probe_source, normalize_proxy_url, resolve_probe_candidate_proxies
+from core.proxy_utils import (
+    _dynamic_probe_source,
+    normalize_proxy_url,
+    resolve_default_chatgpt_proxy_with_metadata,
+    resolve_probe_candidate_proxies,
+)
 from services.chatgpt_core.task_logging import sanitize_task_detail
 
 
@@ -200,6 +205,58 @@ def test_dynamic_proxy_uses_config_default_country_when_task_country_empty(monke
     assert len(candidates) == 1
     assert "region-US" in candidates[0][0]
     assert "dynamic country=US" in candidates[0][2]
+
+
+def test_default_chatgpt_proxy_uses_global_dynamic_config(monkeypatch):
+    def fake_configured_value(key, default=""):
+        values = {
+            "task_proxy_mode": "dynamic",
+            "task_proxy_country_code": "US",
+            "dynamic_proxy_template": RAND_TEMPLATE,
+            "dynamic_proxy_probe_enabled": "false",
+            "dynamic_proxy_ip_retention_minutes": "9",
+        }
+        return values.get(key, default)
+
+    monkeypatch.setattr("core.proxy_utils._configured_value", fake_configured_value)
+    proxy_url, proxy_pool, source = resolve_default_chatgpt_proxy_with_metadata()
+
+    assert proxy_pool is None
+    assert proxy_url.startswith("socks5h://")
+    assert "region-US-sid-" in proxy_url
+    assert "-t-9" in proxy_url
+    assert "dynamic country=US" in source
+
+
+def test_default_chatgpt_proxy_can_be_disabled_by_global_direct(monkeypatch):
+    def fake_configured_value(key, default=""):
+        if key == "task_proxy_mode":
+            return "direct"
+        if key == "dynamic_proxy_template":
+            return RAND_TEMPLATE
+        return default
+
+    monkeypatch.setattr("core.proxy_utils._configured_value", fake_configured_value)
+    proxy_url, proxy_pool, source = resolve_default_chatgpt_proxy_with_metadata()
+
+    assert proxy_url == ""
+    assert proxy_pool is None
+    assert source == "direct"
+
+
+def test_explicit_task_proxy_still_wins_over_global_dynamic(monkeypatch):
+    def fake_configured_value(key, default=""):
+        values = {
+            "task_proxy_mode": "dynamic",
+            "dynamic_proxy_template": RAND_TEMPLATE,
+            "dynamic_proxy_probe_enabled": "false",
+        }
+        return values.get(key, default)
+
+    monkeypatch.setattr("core.proxy_utils._configured_value", fake_configured_value)
+    candidates = resolve_probe_candidate_proxies({"proxy": "http://proxy.local:8080"})
+
+    assert candidates == [("http://proxy.local:8080", None, "specified")]
 
 
 def test_dynamic_probe_accepts_cliproxy_declared_country_when_geo_is_unavailable(monkeypatch):

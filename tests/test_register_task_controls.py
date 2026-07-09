@@ -950,6 +950,7 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
             patch.object(api_actions, "_execute_chatgpt_resume_subscription_auth", side_effect=_fake_execute),
             patch.object(api_actions, "_apply_chatgpt_resume_auth_result"),
             patch("api.tasks._save_task_log"),
+            patch("core.proxy_utils.resolve_task_proxy_candidates", return_value=[("", None, "direct")]),
             patch("api.tasks.time.monotonic", side_effect=[100.0, 200.0, 300.0]),
         ):
             _run_phone_binding_test(
@@ -1063,6 +1064,7 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
             patch.object(api_actions, "_execute_chatgpt_resume_subscription_auth", side_effect=_fake_execute),
             patch.object(api_actions, "_apply_chatgpt_resume_auth_result"),
             patch("api.tasks._save_task_log"),
+            patch("core.proxy_utils.resolve_task_proxy_candidates", return_value=[("", None, "direct")]),
             patch("api.tasks.time.monotonic", side_effect=[100.0, 200.0, 300.0, 400.0, 500.0]),
         ):
             _run_phone_binding_test(
@@ -1176,6 +1178,7 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
             patch.object(api_actions, "_execute_chatgpt_resume_subscription_auth", side_effect=_fake_execute),
             patch.object(api_actions, "_apply_chatgpt_resume_auth_result"),
             patch("api.tasks._save_task_log"),
+            patch("core.proxy_utils.resolve_task_proxy_candidates", return_value=[("", None, "direct")]),
             patch("api.tasks.time.monotonic", side_effect=[100.0, 200.0, 300.0]),
         ):
             _run_phone_binding_test(

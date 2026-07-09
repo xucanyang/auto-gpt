@@ -25,6 +25,8 @@ from services.chatgpt_core.status_probe import (
     _parse_header_error_json,
     _parse_loose_json,
     _probe_codex_usage,
+    _probe_exception_message,
+    _resolve_effective_probe_proxy,
     _resolve_probe_access_token,
     extract_chatgpt_account_id,
 )
@@ -568,6 +570,7 @@ def probe_codex_usage_window(
     *,
     force: bool = True,
     model: str = "",
+    use_default_proxy: bool = True,
 ) -> dict[str, Any]:
     """Actively query Codex 5h/7d usage windows for one ChatGPT account.
 
@@ -588,13 +591,53 @@ def probe_codex_usage_window(
         "chatgpt_account_id": account_id,
         "usage": {},
         "force": bool(force),
+        "network": {
+            "proxy_used": False,
+            "proxy_source": "direct",
+        },
     }
+
+    if not refresh_token and not access_token:
+        result.update(
+            {
+                "state": "missing_auth",
+                "source": "refresh_token",
+                "message": "账号缺少 refresh_token 且没有可用 access_token",
+            }
+        )
+        return result
+
+    try:
+        effective_proxy, proxy_source = _resolve_effective_probe_proxy(proxy, use_default_proxy=use_default_proxy)
+    except Exception as exc:
+        message = f"默认代理解析失败: {_probe_exception_message(exc)}"
+        result.update(
+            {
+                "state": "probe_failed",
+                "error_code": "proxy_resolve_failed",
+                "message": message,
+            }
+        )
+        result["network"].update(
+            {
+                "proxy_used": False,
+                "proxy_source": "resolve_failed",
+                "proxy_error": message,
+            }
+        )
+        return result
+    result["network"].update(
+        {
+            "proxy_used": bool(effective_proxy),
+            "proxy_source": proxy_source or ("proxy" if effective_proxy else "direct"),
+        }
+    )
 
     token_resolution = _resolve_probe_access_token(
         refresh_token=refresh_token,
         access_token=access_token,
         client_id=client_id,
-        proxy=proxy,
+        proxy=effective_proxy,
     )
     token_source = str(token_resolution.get("source") or "refresh_token").strip() or "refresh_token"
     result["source"] = token_source
@@ -631,7 +674,7 @@ def probe_codex_usage_window(
         )
         return result
 
-    codex_result = _probe_codex_usage(probe_access_token, account_id=account_id, proxy=proxy)
+    codex_result = _probe_codex_usage(probe_access_token, account_id=account_id, proxy=effective_proxy)
     result.update(
         {
             "http_status": codex_result.status_code,
@@ -654,7 +697,7 @@ def probe_codex_usage_window(
         responses_result = _probe_codex_responses(
             probe_access_token,
             account_id=account_id,
-            proxy=proxy,
+            proxy=effective_proxy,
             model=model or CODEX_PROBE_MODEL,
         )
         snapshot = parse_codex_rate_limit_headers(responses_result.headers, updated_at=checked_at)

@@ -460,7 +460,7 @@ def _execute_chatgpt_k12_workspace_recapture_action(
     candidates = resolve_probe_candidate_proxies(
         params,
         fallback_proxy=None,
-        default_mode="direct",
+        default_mode="global",
     )
     last_error = ""
     last_data: dict[str, Any] = {}

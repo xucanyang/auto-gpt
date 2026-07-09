@@ -90,6 +90,12 @@ const SELECT_FIELDS: Record<string, { label: string; value: string }[]> = {
     { label: '关闭', value: '0' },
     { label: '开启', value: '1' },
   ],
+  task_proxy_mode: [
+    { label: '动态代理（默认）', value: 'dynamic' },
+    { label: '代理池自动选取', value: 'pool' },
+    { label: '手动指定代理', value: 'specified' },
+    { label: '直连（不使用代理）', value: 'direct' },
+  ],
   codex_proxy_upload_type: [
     { label: 'AT（Access Token，推荐）', value: 'at' },
     { label: 'RT（Refresh Token）', value: 'rt' },
@@ -119,9 +125,15 @@ const TAB_ITEMS = [
         ],
       },
       {
-        title: '动态代理',
-        desc: '按任务出口国家改写 region、刷新 sid 并覆盖 t-N',
+        title: '账号网络默认出口',
+        desc: '所有 ChatGPT/OpenAI 账号网络动作默认使用这里的出口；单项任务显式传代理时优先使用单项配置。',
         fields: [
+          { key: 'task_proxy_mode', label: '默认出口模式', type: 'select' },
+          { key: 'task_proxy_url', label: '指定/动态代理地址', secret: true, placeholder: '动态模式可留空使用下方模板；指定模式必填 http:// 或 socks5://...' },
+          { key: 'task_proxy_country_code', label: '任务默认出口国家', placeholder: 'JP' },
+          { key: 'task_proxy_failover', label: '失败后尝试候选代理', type: 'boolean' },
+          { key: 'task_proxy_max_candidates', label: '代理池候选数量', placeholder: '5' },
+          { key: 'task_proxy_min_score', label: '代理池最低健康分', placeholder: '50' },
           { key: 'dynamic_proxy_template', label: '默认动态代理模板', secret: true, placeholder: 'socks5://user-region-Rand-sid-xxxx-t-5:pass@host:port' },
           { key: 'dynamic_proxy_default_country', label: '默认出口国家', placeholder: 'JP' },
           { key: 'dynamic_proxy_ip_retention_minutes', label: 'IP 保留分钟数（t-N）', placeholder: '5' },
@@ -1121,7 +1133,19 @@ function ConfigField({ field }: { field: FieldConfig }) {
   const options = SELECT_FIELDS[field.key]
   const isBooleanField = field.type === 'boolean'
   const helpText =
-    field.key === 'dynamic_proxy_template'
+    field.key === 'task_proxy_mode'
+      ? '默认用于单账号状态刷新、Codex 额度刷新、自动状态刷新、订阅链接、上传前套餐探测等 ChatGPT/OpenAI 账号网络动作；如需直连可在这里改为直连。'
+      : field.key === 'task_proxy_url'
+        ? '默认出口模式为“手动指定代理”时必填；动态代理模式下可留空并使用下方默认动态代理模板，也可填入本项作为覆盖模板。'
+      : field.key === 'task_proxy_country_code'
+        ? '任务级默认出口国家。动态代理模式下优先使用这里；留空则使用下方动态代理默认出口国家。'
+      : field.key === 'task_proxy_failover'
+        ? '开启后，代理池会返回多个候选，动态代理会在失败后刷新 sid 重试；关闭时只取首个默认出口。'
+      : field.key === 'task_proxy_max_candidates'
+        ? '代理池或指定代理 failover 时最多尝试的候选数量。'
+      : field.key === 'task_proxy_min_score'
+        ? '代理池候选的最低健康分；低于此分数不会被默认账号网络动作选中。'
+      : field.key === 'dynamic_proxy_template'
       ? '可选全局模板。支持 region-JP/region-US 等固定国家，也支持 Cliproxy 生成的 region-Rand；动态代理模式会先按任务出口国家改写完整 region token，再刷新 sid；展示和日志只保存脱敏地址。'
       : field.key === 'dynamic_proxy_default_country'
         ? '任务未填写出口国家时使用的两位 ISO 国家码，例如 JP、US、SG。'
@@ -3839,6 +3863,19 @@ export default function Settings() {
           ? true
           : parseBooleanConfigValue(data.tempmail_archive_cleanup_pause_active_tasks)
       data.proxy_pool_cooldown_enabled = data.proxy_pool_cooldown_enabled === '' ? true : parseBooleanConfigValue(data.proxy_pool_cooldown_enabled)
+      if (!data.task_proxy_mode) {
+        data.task_proxy_mode = 'dynamic'
+      }
+      if (!data.task_proxy_country_code) {
+        data.task_proxy_country_code = data.dynamic_proxy_default_country || 'JP'
+      }
+      if (!data.task_proxy_max_candidates) {
+        data.task_proxy_max_candidates = data.proxy_pool_max_candidates || '5'
+      }
+      if (!data.task_proxy_min_score) {
+        data.task_proxy_min_score = data.proxy_scan_min_score || '50'
+      }
+      data.task_proxy_failover = data.task_proxy_failover === '' ? false : parseBooleanConfigValue(data.task_proxy_failover)
       if (!data.dynamic_proxy_default_country) {
         data.dynamic_proxy_default_country = 'JP'
       }
@@ -4013,6 +4050,19 @@ export default function Settings() {
         values.tempmail_archive_cleanup_backup_path || '/runtime/tempmail_email_backups.db',
       ).trim() || '/runtime/tempmail_email_backups.db'
       values.proxy_pool_cooldown_enabled = parseBooleanConfigValue(values.proxy_pool_cooldown_enabled)
+      values.task_proxy_mode = String(values.task_proxy_mode || 'dynamic').trim().toLowerCase() || 'dynamic'
+      if (!['dynamic', 'pool', 'specified', 'direct'].includes(values.task_proxy_mode)) {
+        values.task_proxy_mode = 'dynamic'
+      }
+      values.task_proxy_url = String(values.task_proxy_url || '').trim()
+      values.task_proxy_country_code = String(values.task_proxy_country_code || '').trim().toUpperCase().slice(0, 2)
+      values.task_proxy_failover = parseBooleanConfigValue(values.task_proxy_failover)
+      values.task_proxy_max_candidates = String(
+        Math.max(1, Math.min(100, Number.parseInt(String(values.task_proxy_max_candidates || '5'), 10) || 5)),
+      )
+      values.task_proxy_min_score = String(
+        Math.max(0, Math.min(100, Number.parseInt(String(values.task_proxy_min_score || '50'), 10) || 50)),
+      )
       values.dynamic_proxy_template = String(values.dynamic_proxy_template || '').trim()
       values.dynamic_proxy_default_country = String(values.dynamic_proxy_default_country || 'JP').trim().toUpperCase() || 'JP'
       values.dynamic_proxy_require_country_match = parseBooleanConfigValue(values.dynamic_proxy_require_country_match)
@@ -4172,6 +4222,12 @@ export default function Settings() {
         tempmail_archive_cleanup_pause_active_tasks: values.tempmail_archive_cleanup_pause_active_tasks,
         tempmail_archive_cleanup_mailbox: values.tempmail_archive_cleanup_mailbox,
         tempmail_archive_cleanup_backup_path: values.tempmail_archive_cleanup_backup_path,
+        task_proxy_mode: values.task_proxy_mode,
+        task_proxy_url: values.task_proxy_url,
+        task_proxy_country_code: values.task_proxy_country_code,
+        task_proxy_failover: values.task_proxy_failover,
+        task_proxy_max_candidates: values.task_proxy_max_candidates,
+        task_proxy_min_score: values.task_proxy_min_score,
         dynamic_proxy_template: values.dynamic_proxy_template,
         dynamic_proxy_default_country: values.dynamic_proxy_default_country,
         dynamic_proxy_require_country_match: values.dynamic_proxy_require_country_match,

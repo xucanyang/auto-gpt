@@ -103,6 +103,16 @@ class _CaptureContextAdapter:
 
 
 class ChatGPTPluginTests(unittest.TestCase):
+    def setUp(self):
+        self.default_proxy_patcher = mock.patch(
+            "services.chatgpt_core.plugin.resolve_default_chatgpt_proxy",
+            return_value="",
+        )
+        self.default_proxy = self.default_proxy_patcher.start()
+
+    def tearDown(self):
+        self.default_proxy_patcher.stop()
+
     def test_custom_provider_rejects_blank_email(self):
         platform = ChatGPTPlatform(
             config=RegisterConfig(extra={"chatgpt_registration_mode": "refresh_token"}),
@@ -195,7 +205,7 @@ class ChatGPTPluginTests(unittest.TestCase):
 
         self.assertIn("resume_subscription_auth", {action["id"] for action in actions})
 
-    def test_probe_local_status_uses_direct_connection(self):
+    def test_probe_local_status_uses_global_candidate_proxy(self):
         account = mock.Mock(
             email="demo@example.com",
             token="at-demo",
@@ -205,9 +215,9 @@ class ChatGPTPluginTests(unittest.TestCase):
         platform = ChatGPTPlatform(config=RegisterConfig(proxy="http://proxy.example:8080", extra={}))
 
         with mock.patch(
-            "services.chatgpt_core.plugin.resolve_runtime_proxy",
-            return_value="http://proxy.example:8080",
-        ) as resolve_proxy, mock.patch(
+            "core.proxy_utils.resolve_probe_candidate_proxies",
+            return_value=[("http://global.proxy:8080", None, "dynamic country=JP")],
+        ) as resolve_candidates, mock.patch(
             "services.chatgpt_core.status_probe.probe_local_chatgpt_status",
             return_value={
                 "auth": {"state": "access_token_valid"},
@@ -218,9 +228,10 @@ class ChatGPTPluginTests(unittest.TestCase):
             result = platform.execute_action("probe_local_status", account, {})
 
         self.assertTrue(result["ok"])
-        resolve_proxy.assert_not_called()
+        resolve_candidates.assert_called_once()
         probe.assert_called_once()
-        self.assertEqual(probe.call_args.kwargs.get("proxy"), "")
+        self.assertEqual(probe.call_args.kwargs.get("proxy"), "http://global.proxy:8080")
+        self.assertFalse(probe.call_args.kwargs.get("use_default_proxy"))
 
     def test_custom_provider_reuses_existing_mailbox_on_second_create_call(self):
         mailbox = _ReuseThenCreateFailMailbox()
@@ -274,7 +285,7 @@ class ChatGPTPluginTests(unittest.TestCase):
             "services.chatgpt_core.plugin.build_chatgpt_registration_mode_adapter",
             return_value=adapter,
         ), mock.patch(
-            "services.chatgpt_core.plugin.resolve_runtime_proxy",
+            "services.chatgpt_core.plugin.resolve_default_chatgpt_proxy",
             return_value="http://proxy.example:8080",
         ) as resolve_proxy:
             result = platform.register()
