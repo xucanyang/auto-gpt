@@ -38,8 +38,7 @@ export interface FilterPresetBarProps {
   selectedAccountItems?: FilterPresetSelectedAccountItem[];
   removeSelectedAccount?: (id: string) => void;
   clearSelectedAccounts?: () => void;
-  columnVisibilityControl?: React.ReactNode;
-  toolbarActionVisibilityControl?: React.ReactNode;
+  mobileFilterControls?: React.ReactNode;
 }
 
 export const FilterPresetBar: React.FC<FilterPresetBarProps> = ({
@@ -67,8 +66,7 @@ export const FilterPresetBar: React.FC<FilterPresetBarProps> = ({
   selectedAccountItems = [],
   removeSelectedAccount,
   clearSelectedAccounts,
-  columnVisibilityControl,
-  toolbarActionVisibilityControl,
+  mobileFilterControls,
 }) => {
   const activeSummary = activeFilterPreset
     ? (activeFilterPreset.summary || buildAccountFilterPresetSummary(activeFilterPreset.filters))
@@ -124,6 +122,7 @@ export const FilterPresetBar: React.FC<FilterPresetBarProps> = ({
 
   return (
     <div
+      className={`accounts-filter-preset-bar ${isMobile ? 'accounts-filter-preset-bar-mobile' : ''}`}
       style={{
         flex: '0 0 auto',
         marginBottom: isMobile ? 8 : 12,
@@ -137,29 +136,32 @@ export const FilterPresetBar: React.FC<FilterPresetBarProps> = ({
         gap: 8,
       }}
     >
-      <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 8, minWidth: 0 }}>
-        <Input.Search
-          allowClear
-          size="small"
-          placeholder="搜索邮箱"
-          value={search}
-          style={{ width: isMobile ? '100%' : 220 }}
-          onChange={(event) => onSearchChange(event.target.value)}
-          onSearch={(value) => onSearchSubmit(String(value || '').trim())}
-        />
-        <Space size={8} wrap style={{ minWidth: 0, flex: '1 1 auto' }}>
-          <Space size={6}>
+      <div className="accounts-filter-preset-main-row">
+        <div className="accounts-filter-preset-search">
+          <Input.Search
+            allowClear
+            size="small"
+            placeholder="搜索邮箱"
+            value={search}
+            style={{ width: '100%' }}
+            onChange={(event) => onSearchChange(event.target.value)}
+            onSearch={(value) => onSearchSubmit(String(value || '').trim())}
+          />
+        </div>
+        <div className="accounts-filter-preset-main-controls">
+          <div className="accounts-filter-preset-label">
             <FilterOutlined style={{ color: token.colorPrimary }} />
             <Text strong style={{ fontSize: 13 }}>筛选组合</Text>
-          </Space>
+          </div>
           <Select
+            className="accounts-filter-preset-select"
             allowClear
             showSearch
             size="small"
             placeholder={filterPresetLoading ? '读取中...' : '选择后应用'}
             loading={filterPresetLoading}
             value={activeFilterPresetId || undefined}
-            style={{ width: isMobile ? '100%' : 180 }}
+            style={{ width: 180 }}
             optionFilterProp="label"
             options={filterPresets.map((preset) => ({
               value: preset.id,
@@ -171,29 +173,6 @@ export const FilterPresetBar: React.FC<FilterPresetBarProps> = ({
               else clearFilterPreset()
             }}
           />
-          {pinnedFilterPresets.length > 0 && !isMobile ? (
-            <Space size={6} wrap>
-              <div style={{ width: 1, height: 16, background: token.colorBorderSecondary, margin: '0 4px' }} />
-              {pinnedFilterPresets.map((preset) => {
-                const active = preset.id === activeFilterPresetId
-                return (
-                  <Button
-                    key={preset.id}
-                    size="small"
-                    type={active ? 'primary' : 'default'}
-                    ghost={active}
-                    icon={preset.pinned ? <PushpinOutlined /> : undefined}
-                    onClick={() => {
-                      if (active) clearFilterPreset()
-                      else applyFilterPreset(preset)
-                    }}
-                  >
-                    {preset.name}
-                  </Button>
-                )
-              })}
-            </Space>
-          ) : null}
           <Dropdown
             menu={{
               items: [
@@ -204,40 +183,81 @@ export const FilterPresetBar: React.FC<FilterPresetBarProps> = ({
               ]
             }}
           >
-            <Button size="small" type="text" icon={<SettingOutlined />} />
+            <Button
+              className="accounts-filter-preset-manage"
+              size="small"
+              type="text"
+              icon={<SettingOutlined />}
+              title="管理筛选组合"
+              aria-label="管理筛选组合"
+            />
           </Dropdown>
-        </Space>
-        <Space size={8} wrap style={{ marginLeft: 'auto' }}>
-          {toolbarActionVisibilityControl}
-          {columnVisibilityControl}
-        </Space>
+        </div>
       </div>
 
-      <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 8, minWidth: 0 }}>
-        <Text type="secondary" style={{ fontSize: 12 }} ellipsis={{ tooltip: activeFilterPreset ? activeSummary : currentSummary }}>
-          {activeFilterPreset
-            ? `当前组合：${activeFilterPreset.name}${activeFilterPreset.built_in ? ' (内置)' : ''}${activeFilterPresetDirty ? ' · 已修改' : ''}`
-            : `筛选：${currentSummary}`}
-        </Text>
-        {activeFilterPreset && activeFilterPresetDirty ? (
-          <Space size={4}>
-            <Button size="small" type="link" style={{ padding: 0 }} loading={filterPresetSaving} onClick={() => void overwriteActiveFilterPreset()}>
-              覆盖保存
-            </Button>
-            <Button size="small" type="link" style={{ padding: 0 }} onClick={() => openCopyFilterPreset(activeFilterPreset)}>
-              另存为
-            </Button>
-            <Button size="small" type="link" danger style={{ padding: 0 }} onClick={() => applyFilterPreset(activeFilterPreset)}>
-              还原
-            </Button>
-          </Space>
-        ) : null}
-        <div style={{ flex: '1 1 auto', minWidth: 8 }} />
-        <Space size={4} wrap>
+      {pinnedFilterPresets.length > 0 && !isMobile ? (
+        <div className="accounts-filter-preset-pinned-row">
+          <div className="accounts-filter-preset-pinned-label">
+            <PushpinOutlined />
+            <Text type="secondary">置顶</Text>
+          </div>
+          <div className="accounts-filter-preset-pinned-scroll">
+            {pinnedFilterPresets.map((preset) => {
+              const active = preset.id === activeFilterPresetId
+              return (
+                <Button
+                  key={preset.id}
+                  className="accounts-filter-preset-pinned-button"
+                  size="small"
+                  type={active ? 'primary' : 'default'}
+                  ghost={active}
+                  icon={preset.pinned ? <PushpinOutlined /> : undefined}
+                  onClick={() => {
+                    if (active) clearFilterPreset()
+                    else applyFilterPreset(preset)
+                  }}
+                >
+                  {preset.name}
+                </Button>
+              )
+            })}
+          </div>
+        </div>
+      ) : null}
+
+      {mobileFilterControls}
+
+      <div className="accounts-filter-preset-summary-row">
+        <div className="accounts-filter-preset-summary-left">
+          <Text
+            className="accounts-filter-preset-summary-copy"
+            type="secondary"
+            style={{ fontSize: 12 }}
+            ellipsis={{ tooltip: activeFilterPreset ? activeSummary : currentSummary }}
+          >
+            {activeFilterPreset
+              ? `当前组合：${activeFilterPreset.name}${activeFilterPreset.built_in ? ' (内置)' : ''}${activeFilterPresetDirty ? ' · 已修改' : ''}`
+              : `筛选：${currentSummary}`}
+          </Text>
+          {activeFilterPreset && activeFilterPresetDirty ? (
+            <Space className="accounts-filter-preset-summary-actions" size={4}>
+              <Button size="small" type="link" style={{ padding: 0 }} loading={filterPresetSaving} onClick={() => void overwriteActiveFilterPreset()}>
+                覆盖保存
+              </Button>
+              <Button size="small" type="link" style={{ padding: 0 }} onClick={() => openCopyFilterPreset(activeFilterPreset)}>
+                另存为
+              </Button>
+              <Button size="small" type="link" danger style={{ padding: 0 }} onClick={() => applyFilterPreset(activeFilterPreset)}>
+                还原
+              </Button>
+            </Space>
+          ) : null}
+        </div>
+        <div className="accounts-filter-preset-summary-right">
           <Text strong style={{ fontSize: 13 }}>总数：{total}</Text>
+          <Text type="secondary">/</Text>
           {selectedCount > 0 ? (
             <>
-              <Text type="secondary">/</Text>
               <Popover content={accountTags} title="已选账号列表" trigger={['click']} placement="bottomRight">
                 <Tag color="processing" style={{ cursor: 'pointer', marginInlineEnd: 0 }}>已选：{selectedCount}</Tag>
               </Popover>
@@ -245,8 +265,10 @@ export const FilterPresetBar: React.FC<FilterPresetBarProps> = ({
                 清空选择
               </Button>
             </>
-          ) : null}
-        </Space>
+          ) : (
+            <Text strong style={{ fontSize: 13 }}>已选：0</Text>
+          )}
+        </div>
       </div>
     </div>
   )

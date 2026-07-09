@@ -36,6 +36,7 @@ type MoreMenuClickInfo = Parameters<NonNullable<MenuProps['onClick']>>[0]
 type ToolbarMenuItem = Exclude<NonNullable<MenuProps['items']>[number], null>
 
 const DEFAULT_PINNED_ACTION_IDS: AccountsToolbarActionId[] = ['statusSync', 'paymentLink']
+const MAX_PINNED_ACTIONS = 3
 const CHATGPT_SYNC_ACTION_IDS: AccountsToolbarActionId[] = ['statusSync', 'resumeAuth', 'backfill']
 const CHATGPT_BATCH_ACTION_IDS: AccountsToolbarActionId[] = [
   'invalidRecheck',
@@ -70,7 +71,7 @@ const normalizePinnedActionIds = (actionIds: string[]): AccountsToolbarActionId[
     normalized.push(actionId)
   }
 
-  return normalized
+  return normalized.slice(0, MAX_PINNED_ACTIONS)
 }
 
 const makeMoreMenuChildKey = (actionId: AccountsToolbarActionId, key: React.Key) => (
@@ -161,6 +162,8 @@ type AccountsToolbarProps = {
   backfillLoading: string
   pinnedActionIds?: string[]
   isMobile?: boolean
+  columnVisibilityControl?: ReactNode
+  toolbarActionVisibilityControl?: ReactNode
 }
 
 export function AccountsToolbar({
@@ -207,10 +210,15 @@ export function AccountsToolbar({
   backfillLoading,
   pinnedActionIds,
   isMobile = false,
+  columnVisibilityControl,
+  toolbarActionVisibilityControl,
 }: AccountsToolbarProps) {
   const [mobileOpsOpen, setMobileOpsOpen] = useState(false)
   const buttonStyle: CSSProperties = isMobile
     ? { flex: '1 1 calc(50% - 4px)', minWidth: 132 }
+    : {}
+  const operationButtonStyle: CSSProperties = isMobile
+    ? { flex: '1 1 0', width: '100%', minWidth: 0 }
     : {}
   const activeTasksStyle: CSSProperties = isMobile
     ? { flex: '1 1 100%', width: '100%', minWidth: 0 }
@@ -492,7 +500,7 @@ export function AccountsToolbar({
           <Dropdown key={actionId} menu={{ items: statusSyncMenuItems, onClick: onStatusSyncClick }}>
             <Button
               block={isMobile}
-              style={buttonStyle}
+              style={operationButtonStyle}
               loading={statusSyncLoading !== ''}
               icon={statusSyncLoading !== '' ? <SyncOutlined spin /> : <ReloadOutlined />}
             >
@@ -505,7 +513,7 @@ export function AccountsToolbar({
           <Dropdown key={actionId} menu={{ items: resumeAuthMenuItems, onClick: onResumeAuthClick }}>
             <Button
               block={isMobile}
-              style={buttonStyle}
+              style={operationButtonStyle}
               loading={resumeAuthLoading !== ''}
               icon={resumeAuthLoading !== '' ? <SyncOutlined spin /> : <ReloadOutlined />}
             >
@@ -518,7 +526,7 @@ export function AccountsToolbar({
           <Dropdown key={actionId} menu={{ items: backfillMenuItems, onClick: onBackfillClick }}>
             <Button
               block={isMobile}
-              style={buttonStyle}
+              style={operationButtonStyle}
               loading={backfillLoading !== ''}
               icon={backfillLoading !== '' ? <SyncOutlined spin /> : <UploadOutlined />}
             >
@@ -531,7 +539,7 @@ export function AccountsToolbar({
           <Button
             key={actionId}
             block={isMobile}
-            style={buttonStyle}
+            style={operationButtonStyle}
             icon={batchInvalidRecheckLoading ? <SyncOutlined spin /> : <SafetyCertificateOutlined />}
             loading={batchInvalidRecheckLoading}
             onClick={onBatchInvalidRecheck}
@@ -544,7 +552,7 @@ export function AccountsToolbar({
           <Button
             key={actionId}
             block={isMobile}
-            style={buttonStyle}
+            style={operationButtonStyle}
             icon={batchK12RecaptureLoading ? <SyncOutlined spin /> : <SyncOutlined />}
             loading={batchK12RecaptureLoading}
             disabled={batchK12RecaptureDisabled}
@@ -558,7 +566,7 @@ export function AccountsToolbar({
           <Button
             key={actionId}
             block={isMobile}
-            style={buttonStyle}
+            style={operationButtonStyle}
             icon={phoneBindingTestLoading ? <SyncOutlined spin /> : <MobileOutlined />}
             loading={phoneBindingTestLoading}
             onClick={onOpenPhoneBindingTest}
@@ -571,7 +579,7 @@ export function AccountsToolbar({
           <Button
             key={actionId}
             block={isMobile}
-            style={buttonStyle}
+            style={operationButtonStyle}
             icon={paypalBindingLoading ? <SyncOutlined spin /> : <CreditCardOutlined />}
             loading={paypalBindingLoading}
             onClick={onOpenPaypalBinding}
@@ -584,7 +592,7 @@ export function AccountsToolbar({
           <Button
             key={actionId}
             block={isMobile}
-            style={buttonStyle}
+            style={operationButtonStyle}
             icon={baxiCdkSubmitLoading ? <SyncOutlined spin /> : <DatabaseOutlined />}
             loading={baxiCdkSubmitLoading}
             onClick={onOpenBaxiCdkSubmit}
@@ -604,7 +612,7 @@ export function AccountsToolbar({
           >
             <Button
               block={isMobile}
-              style={buttonStyle}
+              style={operationButtonStyle}
               icon={<LinkOutlined />}
               loading={batchPaymentLinkLoading}
               disabled={paymentLinkDisabled}
@@ -618,7 +626,7 @@ export function AccountsToolbar({
           <Button
             key={actionId}
             block={isMobile}
-            style={buttonStyle}
+            style={operationButtonStyle}
             icon={<LinkOutlined />}
             loading={batchGopayLoading}
             onClick={onOpenBatchGopay}
@@ -628,7 +636,7 @@ export function AccountsToolbar({
         )
       case 'businessDeferred':
         return (
-          <Button key={actionId} block={isMobile} style={buttonStyle} icon={<LinkOutlined />} onClick={onOpenBusinessDeferred}>
+          <Button key={actionId} block={isMobile} style={operationButtonStyle} icon={<LinkOutlined />} onClick={onOpenBusinessDeferred}>
             Business 补激活
           </Button>
         )
@@ -667,20 +675,29 @@ export function AccountsToolbar({
         </div>
       </div>
 
-      {showOperationGroups ? (
-        <div className="accounts-toolbar-ops">
-          {pinnedActionIdsToRender.map((actionId) => renderPinnedAction(actionId))}
-          <Dropdown
-            menu={{ items: moreOperationMenuItems, onClick: handleMoreOperationClick }}
-            trigger={['click']}
-            disabled={!moreOperationMenuItems.length}
-          >
-            <Button block={isMobile} style={buttonStyle}>
-              更多操作 <DownOutlined />
-            </Button>
-          </Dropdown>
+      <div className="accounts-toolbar-action-row">
+        {showOperationGroups ? (
+          <div className="accounts-toolbar-ops">
+            {pinnedActionIdsToRender.map((actionId) => renderPinnedAction(actionId))}
+            <Dropdown
+              menu={{ items: moreOperationMenuItems, onClick: handleMoreOperationClick }}
+              trigger={['click']}
+              disabled={!moreOperationMenuItems.length}
+            >
+              <Button block={isMobile} style={operationButtonStyle}>
+                更多操作 <DownOutlined />
+              </Button>
+            </Dropdown>
+          </div>
+        ) : null}
+        <div className="accounts-toolbar-settings" aria-label="账号显示设置">
+          <span className="accounts-toolbar-settings-label">显示设置</span>
+          <div className="accounts-toolbar-settings-controls">
+            {toolbarActionVisibilityControl}
+            {columnVisibilityControl}
+          </div>
         </div>
-      ) : null}
+      </div>
     </div>
   )
 }

@@ -6,6 +6,17 @@
 
 ## [Unreleased] (未发布)
 
+## [1.3.44] - 2026-07-10
+### 优化 (Changed)
+- **收敛 ChatGPT 账号页工具栏分区**：`frontend/src/features/accounts/components/AccountsToolbar.tsx` 与 `frontend/src/index.css` 将批量操作和显示设置拆成稳定的上下两行；桌面端不再让设置按钮与批量操作争抢同一行，操作按钮空间不足时可以正常换行，移动端按两列网格展示并在超窄屏切换为单列。
+- **稳定账号列表统计摘要**：`frontend/src/features/accounts/components/FilterPresetBar.tsx` 固定展示 `总数 / 已选`，即使没有选择账号也显示 `已选：0`；仅在存在选择时提供已选账号 Popover 与清空入口，移动端脏筛选组合操作与统计区改为上下排列，避免互相挤压。
+
+### 修复 (Fixed)
+- **修复账号页响应式断点覆盖**：统一处理 `max-width: 768px` 与 `max-width: 991px` 下的批量操作规则，移除横向滚动和 `nowrap` 对操作按钮的隐藏风险，保持移动端批量操作折叠时显示设置仍可用。
+
+### 测试 (Tests)
+- **完成账号页 UI 回归验证**：通过 `cd frontend && npm run build`；使用 Chromium 检查 checkout preview 的 1440、1280、1024、900、768、420、390 宽度，确认桌面上下分区、移动端网格/单列、统计摘要和表格区域无新增横向溢出。
+
 
 ## [1.3.43] - 2026-07-09
 ### 优化 (Changed)
@@ -1020,4 +1031,8 @@
 
 ## 2026-07-09 18:57:18 +0800
 - 重构 ChatGPT 账号页筛选与操作工具栏
+- 发布模式: multi
+
+## 2026-07-10 05:09:21 +0800
+- 修正 ChatGPT 账号页工具栏分区和统计摘要响应式布局
 - 发布模式: multi

@@ -116,6 +116,7 @@ const EMPTY_LIST: any[] = []
 const SUBSCRIPTION_EXPIRY_SORT_FIELD = 'subscription_active_until'
 
 const DEFAULT_PINNED_ACCOUNT_TOOLBAR_ACTIONS: AccountToolbarActionId[] = ['statusSync', 'paymentLink']
+const MAX_PINNED_ACCOUNT_TOOLBAR_ACTIONS = 3
 
 const ACCOUNT_TOOLBAR_ACTION_OPTIONS: Array<{ value: AccountToolbarActionId; text: string }> = [
   { value: 'statusSync', text: '状态同步' },
@@ -1173,7 +1174,7 @@ function normalizePinnedToolbarActions(value: unknown): AccountToolbarActionId[]
   const normalized = value
     .map((item) => String(item || '').trim())
     .filter((item): item is AccountToolbarActionId => allowed.has(item as AccountToolbarActionId))
-  return Array.from(new Set(normalized))
+  return Array.from(new Set(normalized)).slice(0, MAX_PINNED_ACCOUNT_TOOLBAR_ACTIONS)
 }
 
 function loadPinnedToolbarActions() {
@@ -5574,6 +5575,12 @@ export default function Accounts() {
   }
 
   const renderToolbarActionVisibilityControl = () => {
+    const pinnedActionSet = new Set(pinnedToolbarActionIds)
+    const toolbarActionOptions = toCheckboxOptions(ACCOUNT_TOOLBAR_ACTION_OPTIONS).map((option) => ({
+      ...option,
+      disabled: pinnedToolbarActionIds.length >= MAX_PINNED_ACCOUNT_TOOLBAR_ACTIONS
+        && !pinnedActionSet.has(String(option.value) as AccountToolbarActionId),
+    }))
     const overlay = (
       <div
         onClick={(event) => event.stopPropagation()}
@@ -5587,11 +5594,11 @@ export default function Accounts() {
         }}
       >
         <Text type="secondary" style={{ display: 'block', fontSize: 12, marginBottom: 10 }}>
-          勾选后固定在工具栏；未勾选的仍可在“更多操作”中使用。危险操作始终收在更多里。
+          最多固定 3 个操作；未勾选的仍可在“更多操作”中使用。危险操作始终收在更多里。
         </Text>
         <Checkbox.Group
           value={pinnedToolbarActionIds}
-          options={toCheckboxOptions(ACCOUNT_TOOLBAR_ACTION_OPTIONS)}
+          options={toolbarActionOptions}
           onChange={(checkedValues) => updatePinnedToolbarActions(checkedValues.map((item) => String(item)))}
           style={{
             display: 'grid',
@@ -5600,8 +5607,11 @@ export default function Accounts() {
           }}
         />
         <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 12 }}>
-          <Button size="small" onClick={() => updatePinnedToolbarActions(ACCOUNT_TOOLBAR_ACTION_OPTIONS.map((option) => option.value))}>
-            全选
+          <Button
+            size="small"
+            onClick={() => updatePinnedToolbarActions(ACCOUNT_TOOLBAR_ACTION_OPTIONS.slice(0, MAX_PINNED_ACCOUNT_TOOLBAR_ACTIONS).map((option) => option.value))}
+          >
+            固定前三项
           </Button>
           <Button size="small" onClick={resetPinnedToolbarActions}>
             默认
@@ -5975,17 +5985,7 @@ export default function Accounts() {
   const renderMobileFilterControls = () => {
     if (!isMobile) return null
     return (
-      <div
-        style={{
-          display: 'grid',
-          gap: 8,
-          padding: 10,
-          border: `1px solid ${token.colorBorderSecondary}`,
-          borderRadius: 8,
-          background: token.colorBgContainer,
-        }}
-      >
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 8 }}>
+      <div className="accounts-mobile-filter-grid">
           <Select
             allowClear
             mode="multiple"
@@ -6069,7 +6069,6 @@ export default function Accounts() {
             options={toSelectOptions(SUBSCRIPTION_EXPIRY_SORT_OPTIONS)}
             onChange={(value) => applySubscriptionExpirySortOrder((value || '') as SubscriptionExpirySortOrder)}
           />
-        </div>
       </div>
     )
   }
@@ -6750,26 +6749,7 @@ export default function Accounts() {
       ),
     },
     {
-      title: (
-        <Input.Search
-          allowClear
-          size="small"
-          placeholder="搜索邮箱"
-          value={search}
-          onChange={(event) => {
-            const value = event.target.value
-            setSearch(value)
-            setColumnFilters((prev) => ({ ...prev, email: value }))
-          }}
-          onSearch={(value) => {
-            const next = String(value || '').trim()
-            setSearch(next)
-            setColumnFilters((prev) => ({ ...prev, email: next }))
-            setDebouncedSearch(next)
-          }}
-          onClick={(event) => event.stopPropagation()}
-        />
-      ),
+      title: '邮箱',
       dataIndex: 'email',
       key: 'email',
       width: isCompactDesktop ? 210 : 230,
@@ -7429,6 +7409,8 @@ export default function Accounts() {
         total={total}
         selectedRowKeys={selectedRowKeys}
         pinnedActionIds={pinnedToolbarActionIds}
+        columnVisibilityControl={renderColumnVisibilityControl()}
+        toolbarActionVisibilityControl={renderToolbarActionVisibilityControl()}
         activeTasksLoading={activeTasksLoading}
         activeTasks={activeTasks}
         onOpenTaskSnapshot={openTaskFromSnapshot}
@@ -7536,8 +7518,7 @@ export default function Accounts() {
         selectedAccountItems={selectedAccountItems}
         removeSelectedAccount={removeSelectedAccount}
         clearSelectedAccounts={clearSelectedAccounts}
-        columnVisibilityControl={renderColumnVisibilityControl()}
-        toolbarActionVisibilityControl={renderToolbarActionVisibilityControl()}
+        mobileFilterControls={renderMobileFilterControls()}
       />
 
       <AccountsTable
@@ -7553,7 +7534,6 @@ export default function Accounts() {
         selectedRowKeys={selectedRowKeys}
         setSelectedRowKeys={setSelectedRowKeys}
         onTableChange={handleAccountsTableChange}
-        filterSummary={renderMobileFilterControls()}
         isMobile={isMobile}
         renderMobileCard={renderAccountMobileCard}
         onOpenDetail={(record) => {

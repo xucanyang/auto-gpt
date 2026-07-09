@@ -1,6 +1,6 @@
 import type { ReactNode } from 'react'
 import { useEffect, useRef, useState } from 'react'
-import { Card, Checkbox, Empty, Pagination, Spin, Table, Typography } from 'antd'
+import { Card, Checkbox, Empty, Pagination, Spin, Table } from 'antd'
 
 type MobileCardHelpers = {
   checked: boolean
@@ -21,7 +21,6 @@ type AccountsTableProps = {
   setSelectedRowKeys: (keys: React.Key[]) => void
   onOpenDetail: (record: any) => void
   onTableChange?: (pagination: any, filters: Record<string, any>, sorter: any, extra: any) => void
-  filterSummary?: ReactNode
   isMobile?: boolean
   renderMobileCard?: (record: any, helpers: MobileCardHelpers) => ReactNode
 }
@@ -40,7 +39,6 @@ export function AccountsTable({
   setSelectedRowKeys,
   onOpenDetail,
   onTableChange,
-  filterSummary,
   isMobile = false,
   renderMobileCard,
 }: AccountsTableProps) {
@@ -50,6 +48,8 @@ export function AccountsTable({
   const pageKeys = accounts.map((record) => record.id as React.Key)
   const selectedOnPage = pageKeys.filter((key) => selectedKeySet.has(key))
   const totalPages = Math.max(1, Math.ceil(total / Math.max(pageSize, 1)))
+  const mobileRangeStart = accounts.length > 0 ? (currentPage - 1) * pageSize + 1 : 0
+  const mobileRangeEnd = accounts.length > 0 ? mobileRangeStart + accounts.length - 1 : 0
 
   const updateRecordSelection = (key: React.Key, checked: boolean) => {
     if (checked) {
@@ -116,16 +116,7 @@ export function AccountsTable({
     return (
       <Spin spinning={loading}>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 10, minWidth: 0 }}>
-          {filterSummary}
-          <div
-            style={{
-              display: 'flex',
-              justifyContent: 'space-between',
-              alignItems: 'center',
-              gap: 8,
-              padding: '0 2px',
-            }}
-          >
+          <div className="accounts-mobile-selection-bar">
             <Checkbox
               checked={accounts.length > 0 && selectedOnPage.length === accounts.length}
               indeterminate={selectedOnPage.length > 0 && selectedOnPage.length < accounts.length}
@@ -141,9 +132,9 @@ export function AccountsTable({
             >
               选择本页
             </Checkbox>
-            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-              已选 {selectedRowKeys.length} 个
-            </Typography.Text>
+            <span className="accounts-mobile-selection-range">
+              {accounts.length > 0 ? `本页 ${mobileRangeStart}-${mobileRangeEnd} / 共 ${total}` : `共 ${total} 条`}
+            </span>
           </div>
 
           {accounts.length > 0 ? (
@@ -177,7 +168,6 @@ export function AccountsTable({
 
   return (
     <div style={{ flex: '1 1 auto', minHeight: 0, minWidth: 0, display: 'flex', flexDirection: 'column' }}>
-      {filterSummary}
       <div ref={tableAreaRef} className="auto-chatgpt-accounts-table-scroll" style={{ flex: '1 1 auto', minHeight: 0, minWidth: 0, overflow: 'hidden' }}>
         <Table
           className="auto-chatgpt-accounts-table"
