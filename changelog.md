@@ -7,6 +7,21 @@
 ## [Unreleased] (未发布)
 
 
+## [1.3.43] - 2026-07-09
+### 优化 (Changed)
+- **重构 ChatGPT 账号页顶部信息架构**：`frontend/src/features/accounts/components/FilterPresetBar.tsx` 升级为账号列表的查询与视图控制条，将邮箱搜索、筛选组合、操作显示、显示字段以及列表状态集中到同一层；原独立“已选账号”横条不再单独占用表格上方空间，选中账号数量改为与列表总数合并展示为 `总数 / 已选`，并保留点击查看已选账号、逐个移除与清空选择能力，避免跨页选择后无法确认或释放选中范围。
+- **账号页批量操作支持按需固定与更多操作收纳**：`frontend/src/features/accounts/components/AccountsToolbar.tsx` 不再把状态同步、补抓 Auth、远端补传、K12 重跑、手机号/PayPal 绑定、Idea 提交、GoPay、Business 补激活和危险删除动作全部平铺在总数行；默认仅固定“状态同步”和“批量订阅链接”，其余动作进入“更多操作”菜单，并新增 `frontend/src/pages/Accounts.tsx` 的浏览器本地 `auto-chatgpt.accounts.toolbar-actions.v1` 偏好，让运营可像配置显示字段一样调整一级工具栏固定动作。
+- **显示字段从批量操作区迁入视图控制区**：`frontend/src/pages/Accounts.tsx` 将原“列显示”入口迁到筛选组合旁并改名为“显示字段/字段”，面板补充“ID / 邮箱 / 操作固定显示”的说明，继续沿用 `auto-chatgpt.accounts.visible-columns.v2` 本地偏好，不写入筛选组合、不触发组合 dirty，保持筛选集合与浏览器视图偏好的边界。
+- **移动端账号筛选避免与桌面语义漂移**：移动端筛选面板移除重复邮箱搜索，并把使用状态、业务状态、认证材料、订阅、认证状态、Sub2API、OAIPay、Idea 提交统一改为多选，避免桌面表头多选筛选在小屏只显示第一个值造成误解。
+
+### 修复 (Fixed)
+- **隐藏未完整接通的 Codex 状态筛选入口**：`frontend/src/pages/Accounts.tsx` 暂时移除移动端与筛选组合编辑弹窗中的 `Codex 状态`筛选项，并在筛选组合归一化时不再应用旧 payload 中的 `codexState`，避免界面展示“可筛选”但 `/api/accounts` 与当前筛选批量任务实际未携带 `codex_state` 的假筛选风险；Codex 用量列与状态展示本身不受影响。
+- **同步前端版本号至 v1.3.43**：`frontend/src/app/AppShell.tsx` 侧边栏版本展示更新为 `v1.3.43`，用于上线后确认账号页 UI 收敛版本已加载。
+
+### 测试 (Tests)
+- **完成账号页前端构建验证**：已执行 `cd frontend && npm run build`，通过 TypeScript 编译与 Vite 产物构建；新增的查询/视图控制条、工具栏动作固定配置和移动端多选筛选均通过前端类型检查。
+
+
 ## [1.3.42] - 2026-07-09
 ### 新增 (Added)
 - **全局设置新增账号网络默认出口**：`frontend/src/pages/Settings.tsx` 在注册设置中新增“账号网络默认出口”，统一维护 `task_proxy_mode / task_proxy_url / task_proxy_country_code / task_proxy_failover / task_proxy_max_candidates / task_proxy_min_score`；运营可在全局把 ChatGPT/OpenAI 账号网络动作切换为 `dynamic` 动态代理、`pool` 代理池、`specified` 指定代理或 `direct` 直连，默认值改为动态代理并优先使用 `dynamic_proxy_template` 与默认国家。
@@ -1001,4 +1016,8 @@
 
 ## 2026-07-09 17:24:28 +0800
 - 浏览器登录态捕获同步使用全局账号代理
+- 发布模式: multi
+
+## 2026-07-09 18:57:18 +0800
+- 重构 ChatGPT 账号页筛选与操作工具栏
 - 发布模式: multi

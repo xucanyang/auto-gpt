@@ -1,7 +1,6 @@
 import { lazy, Suspense, useEffect, useState, useCallback, useMemo, useRef } from 'react'
 import type { CSSProperties } from 'react'
 import { FilterPresetBar } from '../features/accounts/components/FilterPresetBar'
-import { SelectedAccountsSummary } from '../features/accounts/components/SelectedAccountsSummary'
 import {
   Button,
   Checkbox,
@@ -45,6 +44,7 @@ import { AddAccountModal } from '@/features/accounts/components/AddAccountModal'
 import { AccountsTable } from '@/features/accounts/components/AccountsTable'
 import { AccountDetailModal } from '@/features/accounts/components/AccountDetailModal'
 import { AccountsToolbar } from '@/features/accounts/components/AccountsToolbar'
+import type { AccountsToolbarActionId as AccountToolbarActionId } from '@/features/accounts/components/AccountsToolbar'
 import { BatchGopayWorkbench } from '@/features/accounts/components/BatchGopayWorkbench'
 import { ImportAccountsModal } from '@/features/accounts/components/ImportAccountsModal'
 import { PendingInvitesModal } from '@/features/accounts/components/PendingInvitesModal'
@@ -109,10 +109,27 @@ const PAYMENT_LINK_FORMAT_OPTIONS = [
 ]
 const DEFAULT_GOPAY_OTP_AUTO_RESEND_DELAY_SECONDS = 120
 const ACCOUNTS_PAGE_SIZE_STORAGE_KEY = 'auto-chatgpt.accounts.page-size.v1'
+const ACCOUNT_TOOLBAR_ACTION_VISIBILITY_STORAGE_KEY = 'auto-chatgpt.accounts.toolbar-actions.v1'
 const DEFAULT_ACCOUNTS_PAGE_SIZE = 20
 const ACCOUNT_PAGE_SIZE_OPTIONS = [10, 20, 50]
 const EMPTY_LIST: any[] = []
 const SUBSCRIPTION_EXPIRY_SORT_FIELD = 'subscription_active_until'
+
+const DEFAULT_PINNED_ACCOUNT_TOOLBAR_ACTIONS: AccountToolbarActionId[] = ['statusSync', 'paymentLink']
+
+const ACCOUNT_TOOLBAR_ACTION_OPTIONS: Array<{ value: AccountToolbarActionId; text: string }> = [
+  { value: 'statusSync', text: '状态同步' },
+  { value: 'paymentLink', text: '批量订阅链接' },
+  { value: 'resumeAuth', text: '批量补抓Auth' },
+  { value: 'backfill', text: '远端补传' },
+  { value: 'invalidRecheck', text: '批量失效测活' },
+  { value: 'k12Recapture', text: '批量K12重跑' },
+  { value: 'phoneBindingTest', text: '手机号绑定' },
+  { value: 'paypalBinding', text: 'PayPal绑定' },
+  { value: 'baxiCdkSubmit', text: 'idea批量提交' },
+  { value: 'gopay', text: '批量 GoPay' },
+  { value: 'businessDeferred', text: 'Business 补激活' },
+]
 
 type PhonePoolMode = 'normal' | 'prefix_limited' | 'prefix_sample'
 type PhonePoolPrefixStatus = 'available' | 'unavailable' | 'temporary' | 'exhausted'
@@ -394,16 +411,6 @@ const ACCOUNT_VALIDITY_FILTER_OPTIONS = [
   { value: 'not_checked', text: '未验证' },
 ]
 
-const CODEX_STATE_FILTER_OPTIONS = [
-  { value: 'usable', text: '可用' },
-  { value: 'quota_exhausted', text: '额度耗尽' },
-  { value: 'account_deactivated', text: '已失效' },
-  { value: 'refresh_token_invalidated', text: 'RT失效' },
-  { value: 'access_token_invalidated', text: 'AT失效' },
-  { value: 'unauthorized', text: '未授权' },
-  { value: 'payment_required', text: '需付费/权限' },
-]
-
 const SUB2API_FILTER_OPTIONS = [
   { value: 'exists', text: '已存在' },
   { value: 'not_found', text: '未发现' },
@@ -463,7 +470,6 @@ const ACCOUNT_FILTER_PRESET_COLUMN_KEYS: Array<keyof AccountColumnFilters> = [
   'authType',
   'subscriptionType',
   'accountValidity',
-  'codexState',
   'sub2apiState',
   'oaipayState',
   'ideaSubmitState',
@@ -1159,6 +1165,31 @@ function loadVisibleAccountColumnKeys() {
 function saveVisibleAccountColumnKeys(keys: AccountColumnKey[]) {
   if (typeof window === 'undefined') return
   window.localStorage.setItem(ACCOUNT_COLUMN_VISIBILITY_STORAGE_KEY, JSON.stringify(normalizeVisibleAccountColumns(keys)))
+}
+
+function normalizePinnedToolbarActions(value: unknown): AccountToolbarActionId[] {
+  if (!Array.isArray(value)) return [...DEFAULT_PINNED_ACCOUNT_TOOLBAR_ACTIONS]
+  const allowed = new Set(ACCOUNT_TOOLBAR_ACTION_OPTIONS.map((item) => item.value))
+  const normalized = value
+    .map((item) => String(item || '').trim())
+    .filter((item): item is AccountToolbarActionId => allowed.has(item as AccountToolbarActionId))
+  return Array.from(new Set(normalized))
+}
+
+function loadPinnedToolbarActions() {
+  if (typeof window === 'undefined') return [...DEFAULT_PINNED_ACCOUNT_TOOLBAR_ACTIONS]
+  try {
+    const raw = window.localStorage.getItem(ACCOUNT_TOOLBAR_ACTION_VISIBILITY_STORAGE_KEY)
+    if (!raw) return [...DEFAULT_PINNED_ACCOUNT_TOOLBAR_ACTIONS]
+    return normalizePinnedToolbarActions(JSON.parse(raw))
+  } catch {
+    return [...DEFAULT_PINNED_ACCOUNT_TOOLBAR_ACTIONS]
+  }
+}
+
+function savePinnedToolbarActions(keys: AccountToolbarActionId[]) {
+  if (typeof window === 'undefined') return
+  window.localStorage.setItem(ACCOUNT_TOOLBAR_ACTION_VISIBILITY_STORAGE_KEY, JSON.stringify(normalizePinnedToolbarActions(keys)))
 }
 
 function normalizeAccount(account: any) {
@@ -2224,6 +2255,7 @@ export default function Accounts() {
   const [batchPaymentLinkLoading, setBatchPaymentLinkLoading] = useState(false)
   const [batchInvalidRecheckLoading, setBatchInvalidRecheckLoading] = useState(false)
   const [visibleColumnKeys, setVisibleColumnKeys] = useState<AccountColumnKey[]>(() => loadVisibleAccountColumnKeys())
+  const [pinnedToolbarActionIds, setPinnedToolbarActionIds] = useState<AccountToolbarActionId[]>(() => loadPinnedToolbarActions())
   const [statusSyncLoading, setStatusSyncLoading] = useState<
     'probe_selected' | 'probe_all' | 'remote_selected' | 'remote_all' | 'sub2api_selected' | 'sub2api_all' | ''
   >('')
@@ -2662,7 +2694,6 @@ export default function Accounts() {
       authType: normalized.columnFilters.authType,
       subscriptionType: normalized.columnFilters.subscriptionType,
       accountValidity: normalized.columnFilters.accountValidity,
-      codexState: normalized.columnFilters.codexState,
       sub2apiState: normalized.columnFilters.sub2apiState,
       oaipayState: normalized.columnFilters.oaipayState,
       ideaSubmitState: normalized.columnFilters.ideaSubmitState,
@@ -2727,7 +2758,6 @@ export default function Accounts() {
         authType: values.authType,
         subscriptionType: values.subscriptionType,
         accountValidity: values.accountValidity,
-        codexState: values.codexState,
         sub2apiState: values.sub2apiState,
         oaipayState: values.oaipayState,
         ideaSubmitState: values.ideaSubmitState,
@@ -5532,6 +5562,62 @@ export default function Accounts() {
     setVisibleColumnKeys(defaults)
     saveVisibleAccountColumnKeys(defaults)
   }
+  const updatePinnedToolbarActions = (next: string[]) => {
+    const normalized = normalizePinnedToolbarActions(next)
+    setPinnedToolbarActionIds(normalized)
+    savePinnedToolbarActions(normalized)
+  }
+  const resetPinnedToolbarActions = () => {
+    const defaults = normalizePinnedToolbarActions(DEFAULT_PINNED_ACCOUNT_TOOLBAR_ACTIONS)
+    setPinnedToolbarActionIds(defaults)
+    savePinnedToolbarActions(defaults)
+  }
+
+  const renderToolbarActionVisibilityControl = () => {
+    const overlay = (
+      <div
+        onClick={(event) => event.stopPropagation()}
+        style={{
+          minWidth: isMobile ? 240 : 300,
+          maxWidth: isMobile ? 'calc(100vw - 48px)' : 340,
+          padding: 12,
+          borderRadius: 8,
+          background: token.colorBgElevated,
+          boxShadow: token.boxShadowSecondary,
+        }}
+      >
+        <Text type="secondary" style={{ display: 'block', fontSize: 12, marginBottom: 10 }}>
+          勾选后固定在工具栏；未勾选的仍可在“更多操作”中使用。危险操作始终收在更多里。
+        </Text>
+        <Checkbox.Group
+          value={pinnedToolbarActionIds}
+          options={toCheckboxOptions(ACCOUNT_TOOLBAR_ACTION_OPTIONS)}
+          onChange={(checkedValues) => updatePinnedToolbarActions(checkedValues.map((item) => String(item)))}
+          style={{
+            display: 'grid',
+            gridTemplateColumns: isMobile ? '1fr' : 'repeat(2, minmax(0, 1fr))',
+            gap: 8,
+          }}
+        />
+        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 12 }}>
+          <Button size="small" onClick={() => updatePinnedToolbarActions(ACCOUNT_TOOLBAR_ACTION_OPTIONS.map((option) => option.value))}>
+            全选
+          </Button>
+          <Button size="small" onClick={resetPinnedToolbarActions}>
+            默认
+          </Button>
+        </div>
+      </div>
+    )
+
+    return (
+      <Dropdown dropdownRender={() => overlay} trigger={['click']}>
+        <Button size="small" icon={<SettingOutlined />}>
+          操作显示
+        </Button>
+      </Dropdown>
+    )
+  }
 
   const renderColumnVisibilityControl = () => {
     const overlay = (
@@ -5546,6 +5632,9 @@ export default function Accounts() {
           boxShadow: token.boxShadowSecondary,
         }}
       >
+        <Text type="secondary" style={{ display: 'block', fontSize: 12, marginBottom: 10 }}>
+          ID / 邮箱 / 操作固定显示；这里仅控制额外字段。
+        </Text>
         <Checkbox.Group
           value={visibleColumnKeys}
           options={toCheckboxOptions(columnVisibilityOptions)}
@@ -5570,7 +5659,7 @@ export default function Accounts() {
     return (
       <Dropdown dropdownRender={() => overlay} trigger={['click']}>
         <Button size="small" icon={<SettingOutlined />}>
-          列显示
+          {isMobile ? '字段' : '显示字段'}
         </Button>
       </Dropdown>
     )
@@ -5896,93 +5985,81 @@ export default function Accounts() {
           background: token.colorBgContainer,
         }}
       >
-        <Input.Search
-          allowClear
-          size="small"
-          placeholder="搜索邮箱"
-          value={search}
-          onChange={(event) => {
-            setSearch(event.target.value)
-            setColumnFilters((prev) => ({ ...prev, email: event.target.value }))
-          }}
-          onSearch={(value) => setDebouncedSearch(String(value || '').trim())}
-        />
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 8 }}>
           <Select
             allowClear
+            mode="multiple"
             size="small"
             placeholder="使用状态"
-            value={columnFilters.manuallyUsed[0]}
+            value={columnFilters.manuallyUsed}
             options={toSelectOptions(MANUAL_USE_FILTER_OPTIONS)}
-            onChange={(value) => setColumnFilters((prev) => ({ ...prev, manuallyUsed: value ? [value] : [] }))}
+            onChange={(value) => setColumnFilters((prev) => ({ ...prev, manuallyUsed: value }))}
           />
           <Select
             allowClear
+            mode="multiple"
             size="small"
             placeholder="业务状态"
-            value={columnFilters.status[0]}
+            value={columnFilters.status}
             options={toSelectOptions(STATUS_FILTER_OPTIONS)}
             onChange={(value) => {
-              const next = value ? [value] : []
-              setColumnFilters((prev) => ({ ...prev, status: next }))
-              setFilterStatus(next.join(','))
+              setColumnFilters((prev) => ({ ...prev, status: value }))
+              setFilterStatus(value.join(','))
             }}
           />
           <Select
             allowClear
+            mode="multiple"
             size="small"
             placeholder="认证材料"
-            value={columnFilters.authType[0]}
+            value={columnFilters.authType}
             options={toSelectOptions(AUTH_TYPE_FILTER_OPTIONS)}
-            onChange={(value) => setColumnFilters((prev) => ({ ...prev, authType: value ? [value] : [] }))}
+            onChange={(value) => setColumnFilters((prev) => ({ ...prev, authType: value }))}
           />
           <Select
             allowClear
+            mode="multiple"
             size="small"
             placeholder="当前订阅"
-            value={columnFilters.subscriptionType[0]}
+            value={columnFilters.subscriptionType}
             options={toSelectOptions(SUBSCRIPTION_TYPE_FILTER_OPTIONS)}
-            onChange={(value) => setColumnFilters((prev) => ({ ...prev, subscriptionType: value ? [value] : [] }))}
+            onChange={(value) => setColumnFilters((prev) => ({ ...prev, subscriptionType: value }))}
           />
           <Select
             allowClear
+            mode="multiple"
             size="small"
             placeholder="认证状态"
-            value={columnFilters.accountValidity[0]}
+            value={columnFilters.accountValidity}
             options={toSelectOptions(ACCOUNT_VALIDITY_FILTER_OPTIONS)}
-            onChange={(value) => setColumnFilters((prev) => ({ ...prev, accountValidity: value ? [value] : [] }))}
+            onChange={(value) => setColumnFilters((prev) => ({ ...prev, accountValidity: value }))}
           />
           <Select
             allowClear
-            size="small"
-            placeholder="Codex状态"
-            value={columnFilters.codexState[0]}
-            options={toSelectOptions(CODEX_STATE_FILTER_OPTIONS)}
-            onChange={(value) => setColumnFilters((prev) => ({ ...prev, codexState: value ? [value] : [] }))}
-          />
-          <Select
-            allowClear
+            mode="multiple"
             size="small"
             placeholder="Sub2API"
-            value={columnFilters.sub2apiState[0]}
+            value={columnFilters.sub2apiState}
             options={toSelectOptions(SUB2API_FILTER_OPTIONS)}
-            onChange={(value) => setColumnFilters((prev) => ({ ...prev, sub2apiState: value ? [value] : [] }))}
+            onChange={(value) => setColumnFilters((prev) => ({ ...prev, sub2apiState: value }))}
           />
           <Select
             allowClear
+            mode="multiple"
             size="small"
             placeholder="OAIPay"
-            value={columnFilters.oaipayState[0]}
+            value={columnFilters.oaipayState}
             options={toSelectOptions(OAIPAY_FILTER_OPTIONS)}
-            onChange={(value) => setColumnFilters((prev) => ({ ...prev, oaipayState: value ? [value] : [] }))}
+            onChange={(value) => setColumnFilters((prev) => ({ ...prev, oaipayState: value }))}
           />
           <Select
             allowClear
+            mode="multiple"
             size="small"
             placeholder="Idea提交"
-            value={columnFilters.ideaSubmitState[0]}
+            value={columnFilters.ideaSubmitState}
             options={toSelectOptions(IDEA_SUBMIT_FILTER_OPTIONS)}
-            onChange={(value) => setColumnFilters((prev) => ({ ...prev, ideaSubmitState: value ? [value] : [] }))}
+            onChange={(value) => setColumnFilters((prev) => ({ ...prev, ideaSubmitState: value }))}
           />
           <Select
             allowClear
@@ -7351,7 +7428,7 @@ export default function Accounts() {
       <AccountsToolbar
         total={total}
         selectedRowKeys={selectedRowKeys}
-        columnVisibilityControl={renderColumnVisibilityControl()}
+        pinnedActionIds={pinnedToolbarActionIds}
         activeTasksLoading={activeTasksLoading}
         activeTasks={activeTasks}
         onOpenTaskSnapshot={openTaskFromSnapshot}
@@ -7429,6 +7506,17 @@ export default function Accounts() {
       <FilterPresetBar
         isMobile={isMobile}
         token={token}
+        search={search}
+        onSearchChange={(value) => {
+          setSearch(value)
+          setColumnFilters((prev) => ({ ...prev, email: value }))
+        }}
+        onSearchSubmit={(value) => {
+          const next = String(value || '').trim()
+          setSearch(next)
+          setColumnFilters((prev) => ({ ...prev, email: next }))
+          setDebouncedSearch(next)
+        }}
         filterPresetLoading={filterPresetLoading}
         activeFilterPresetId={activeFilterPresetId}
         filterPresets={filterPresets}
@@ -7445,14 +7533,11 @@ export default function Accounts() {
         loadFilterPresets={loadFilterPresets}
         overwriteActiveFilterPreset={overwriteActiveFilterPreset}
         openCopyFilterPreset={openCopyFilterPreset}
-      />
-
-      <SelectedAccountsSummary
-        isMobile={isMobile}
-        token={token}
         selectedAccountItems={selectedAccountItems}
         removeSelectedAccount={removeSelectedAccount}
         clearSelectedAccounts={clearSelectedAccounts}
+        columnVisibilityControl={renderColumnVisibilityControl()}
+        toolbarActionVisibilityControl={renderToolbarActionVisibilityControl()}
       />
 
       <AccountsTable
@@ -7543,9 +7628,6 @@ export default function Accounts() {
                 </Form.Item>
                 <Form.Item name="accountValidity" label="认证状态" style={{ marginBottom: 0 }}>
                   <Select mode="multiple" placeholder="全部认证状态" options={ACCOUNT_VALIDITY_FILTER_OPTIONS} allowClear />
-                </Form.Item>
-                <Form.Item name="codexState" label="Codex 状态" style={{ marginBottom: 0 }}>
-                  <Select mode="multiple" placeholder="全部 Codex 状态" options={CODEX_STATE_FILTER_OPTIONS} allowClear />
                 </Form.Item>
                 <Form.Item name="sub2apiState" label="Sub2Api 状态" style={{ marginBottom: 0 }}>
                   <Select mode="multiple" placeholder="全部 Sub2Api 状态" options={SUB2API_FILTER_OPTIONS} allowClear />
