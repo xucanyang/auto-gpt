@@ -3,6 +3,7 @@ import type { CSSProperties } from 'react'
 import { FilterPresetBar } from '../features/accounts/components/FilterPresetBar'
 import {
   Button,
+  App,
   Checkbox,
   Dropdown,
   Input,
@@ -2128,6 +2129,7 @@ const accountActionTextStyles: Record<string, CSSProperties> = {
 }
 
 export default function Accounts() {
+  const { message: appMessage } = App.useApp()
   const { token } = theme.useToken()
   const screens = Grid.useBreakpoint()
   const isMobile = screens.lg === false
@@ -2638,7 +2640,7 @@ export default function Accounts() {
     if (options.scope === 'selected') {
       const accountIds = normalizeAccountIds(options.selectedIds ?? selectedRowKeys)
       if (accountIds.length === 0) {
-        message.warning(options.emptySelectedMessage || '请先选择要处理的账号')
+        appMessage.warning(options.emptySelectedMessage || '请先选择要处理的账号')
         return null
       }
       body.account_ids = accountIds
@@ -2646,7 +2648,7 @@ export default function Accounts() {
     }
 
     if (!currentFilterScopeReady) {
-      message.warning('账号列表正在更新，请等待当前筛选数量刷新后再启动任务')
+      appMessage.warning('账号列表正在更新，请等待当前筛选数量刷新后再启动任务')
       return null
     }
 
@@ -2654,7 +2656,7 @@ export default function Accounts() {
     body[options.filteredMarker || 'all_filtered'] = true
     body.expected_total = currentFilteredTotal
     return currentFilteredTotal
-  }, [currentAccountFilterBody, currentFilterScopeReady, currentFilteredTotal, selectedRowKeys])
+  }, [appMessage, currentAccountFilterBody, currentFilterScopeReady, currentFilteredTotal, selectedRowKeys])
 
   const postAccountScopeRequest = useCallback(async (
     path: string,
@@ -2669,11 +2671,11 @@ export default function Accounts() {
     } catch (error) {
       const scopeChangedMessage = getFilterScopeChangedMessage(error)
       if (!scopeChangedMessage) throw error
-      message.error({ content: scopeChangedMessage, key: toastKey, duration: 6 })
+      appMessage.error({ content: scopeChangedMessage, key: toastKey, duration: 6 })
       void refetchAccounts()
       return null
     }
-  }, [refetchAccounts])
+  }, [appMessage, refetchAccounts])
 
   const buildPaypalFilteredEligibleParams = useCallback(() => {
     const body: Record<string, unknown> = { ...currentAccountFilterBody }

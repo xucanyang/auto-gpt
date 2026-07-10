@@ -15,7 +15,7 @@
 - **修复账号页筛选任务静默扩大范围**：`services/account_filters.py` 新增九字段共享请求契约和统一 SQL resolver，`api/accounts.py`、`api/tasks.py`、`api/actions.py` 与 `api/integrations.py` 现在对邮箱、业务状态、使用状态、认证材料、订阅、认证状态、Sub2API、OAIPay、Idea 提交使用同一集合语义。前端 filtered 请求携带页面 `expected_total`，后端在任务创建、线程启动、手机号/CDK 导入和外部调用前校验；数量变化返回 `409 FILTER_SCOPE_CHANGED`，不会自动重试。selected 请求只按显式 `account_ids` 执行，不受残留筛选字段影响。
 - **冻结并审计批量任务账号集合**：手机号绑定、补抓 Auth、K12 重跑、订阅链接、失效测活、本地/远端状态同步、Sub2API/OAIPay/CLIProxyAPI 补传、PayPal 绑定和 Idea 提交均先冻结完整匹配账号 ID，再让任务自身资格与 `limit` 只缩小集合；任务 meta 新增规范化筛选、expected/matched 数量、resolver 版本、完整匹配 ID 哈希和最终执行 ID 哈希，便于事故回放。
 - **统一限流账号恢复与范围校验时序**：列表、filtered task/action 和同步补传入口都在解析筛选集合前归一化已到期的 `rate_limited` 状态，避免账号按旧状态通过数量校验后再改变状态；若恢复导致页面数量失效，将直接 409 要求重新确认。
-- **保留 OAIPay 范围冲突确认现场**：OAIPay 上传确认框只在后端成功接受请求后关闭；发生 `FILTER_SCOPE_CHANGED` 时保留弹窗、刷新账号列表并提示重新确认，不会把失败请求伪装成已启动任务。
+- **保留 OAIPay 范围冲突确认现场**：OAIPay 上传确认框只在后端成功接受请求后关闭；发生 `FILTER_SCOPE_CHANGED` 时保留弹窗、刷新账号列表并通过 `AntdApp` 消息实例提示重新确认，不会静默吞掉拦截结果，也不会把失败请求伪装成已启动任务。
 
 ### 测试 (Tests)
 - **补充筛选范围与只上传回归覆盖**：新增 `tests/test_filtered_task_scope.py`、`tests/test_integrations_backfill_scope.py`，并更新 `tests/test_sub2api_sync.py`、`tests/test_oaipay_sync.py`，覆盖九字段 schema、列表/任务集合一致、错误 expected_total 无任务副作用、限流恢复、selected 残留筛选隔离、pending-only 只缩小集合、上传不调用远端/本地探测及上传结果写回。统一定向回归 `122 passed`，前端 TypeScript/Vite 构建与 scoped ESLint 通过。
@@ -1084,3 +1084,7 @@
 ## 2026-07-10 10:18:26 +0800
 - 修复筛选任务范围并简化外部账号上传流程
 - 发布模式: multi
+
+## 2026-07-10 10:33:55 +0800
+- 修复筛选范围冲突提示上下文
+- 发布模式: hot
