@@ -3680,17 +3680,59 @@ def _query_chatgpt_export_accounts(
 
 def _access_token_for_export(acc: AccountModel) -> str:
     """Read both current and legacy saved AT fields without exposing other secrets."""
-    extra = acc.get_extra()
+    return _access_token_from_stored_values(acc.token, acc.extra_json)
+
+
+def _access_token_from_stored_values(token_value: Any, extra_json: Any) -> str:
+    try:
+        extra = json.loads(str(extra_json or "{}"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        extra = {}
+    if not isinstance(extra, dict):
+        extra = {}
     for value in (
         extra.get("access_token"),
         extra.get("accessToken"),
         extra.get("webAccessToken"),
-        acc.token,
+        token_value,
     ):
         token = str(value or "").strip()
         if token:
             return token
     return ""
+
+
+def _query_chatgpt_export_access_tokens(
+    *,
+    session: Session,
+    status: Optional[str] = None,
+    selected_ids: list[int] | None = None,
+) -> list[str]:
+    """Read only token storage columns; account detail JSON can be very large."""
+    q = select(AccountModel.token, AccountModel.extra_json).where(AccountModel.platform == "chatgpt")
+    if status:
+        q = q.where(AccountModel.status == status)
+    if selected_ids:
+        q = q.where(AccountModel.id.in_(selected_ids))
+    q = q.order_by(AccountModel.id)
+    return [
+        token
+        for token_value, extra_json in session.exec(q).all()
+        if (token := _access_token_from_stored_values(token_value, extra_json))
+    ]
+
+
+def _build_access_token_export_content(access_tokens: list[str]) -> tuple[str, str, str, str]:
+    tokens = [str(token or "").strip() for token in access_tokens]
+    tokens = [token for token in tokens if token]
+    if not tokens:
+        raise HTTPException(400, "所选账号没有可导出的 AccessToken")
+    return (
+        "\n".join(tokens) + "\n",
+        "text/plain; charset=utf-8",
+        "chatgpt-access-token",
+        "txt",
+    )
 
 
 def _build_chatgpt_export_content(
@@ -3707,14 +3749,7 @@ def _build_chatgpt_export_content(
             for acc in accounts
             if (token := _access_token_for_export(acc))
         ]
-        if not access_tokens:
-            raise HTTPException(400, "所选账号没有可导出的 AccessToken")
-        return (
-            "\n".join(access_tokens) + "\n",
-            "text/plain; charset=utf-8",
-            "chatgpt-access-token",
-            "txt",
-        )
+        return _build_access_token_export_content(access_tokens)
 
     from datetime import datetime, timezone
     from services.chatgpt_core.sub2api_upload import build_sub2api_export_account_payload
@@ -3747,15 +3782,24 @@ def _build_sub2api_export_response(
 ) -> StreamingResponse:
     from datetime import datetime, timezone
     mode = _normalize_chatgpt_export_mode(export_mode)
-    accounts = _query_chatgpt_export_accounts(
-        session=session,
-        status=status,
-        selected_ids=selected_ids,
-    )
-    body, media_type, filename_prefix, extension = _build_chatgpt_export_content(
-        accounts=accounts,
-        export_mode=mode,
-    )
+    if mode == CHATGPT_EXPORT_MODE_ACCESS_TOKEN:
+        body, media_type, filename_prefix, extension = _build_access_token_export_content(
+            _query_chatgpt_export_access_tokens(
+                session=session,
+                status=status,
+                selected_ids=selected_ids,
+            )
+        )
+    else:
+        accounts = _query_chatgpt_export_accounts(
+            session=session,
+            status=status,
+            selected_ids=selected_ids,
+        )
+        body, media_type, filename_prefix, extension = _build_chatgpt_export_content(
+            accounts=accounts,
+            export_mode=mode,
+        )
     return StreamingResponse(
         iter([body]),
         media_type=media_type,
@@ -3785,22 +3829,10 @@ def upload_sub2api(account_id: int, req: Sub2ApiUploadReq,
 @router.post("/export-sub2api-ticket")
 def create_chatgpt_accounts_sub2api_export_ticket(
     req: Sub2ApiExportTicketReq,
-    session: Session = Depends(get_session),
 ):
     mode = _normalize_chatgpt_export_mode(req.mode)
     selected_ids = _parse_export_ids(id_list=req.ids)
     status = str(req.status or "").strip()
-    accounts = _query_chatgpt_export_accounts(
-        session=session,
-        status=status or None,
-        selected_ids=selected_ids,
-    )
-    exportable_count = len(accounts)
-    if mode == CHATGPT_EXPORT_MODE_ACCESS_TOKEN:
-        exportable_count = sum(bool(_access_token_for_export(acc)) for acc in accounts)
-        if not exportable_count:
-            raise HTTPException(400, "所选账号没有可导出的 AccessToken")
-
     now = time.time()
     ticket = uuid.uuid4().hex
     with _SUB2API_EXPORT_TICKET_LOCK:
@@ -3821,8 +3853,6 @@ def create_chatgpt_accounts_sub2api_export_ticket(
         "ticket": ticket,
         "expires_in": 300,
         "mode": mode,
-        "matched_count": len(accounts),
-        "exportable_count": exportable_count,
     }
 
 

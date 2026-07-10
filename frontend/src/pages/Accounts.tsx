@@ -3552,10 +3552,6 @@ export default function Accounts() {
         if (!ticket) {
           throw new Error('导出失败：后端未返回下载票据')
         }
-        if (exportMode === 'access_token') {
-          const exportableCount = Number(data?.exportable_count || 0)
-          message.success(`已生成 ${exportableCount} 个 AccessToken（每行一个）`)
-        }
         window.location.assign(`/api/chatgpt/export-sub2api-download?ticket=${encodeURIComponent(ticket)}`)
         return
       } catch (e: any) {

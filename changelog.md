@@ -4,6 +4,11 @@
 
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，并且本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/) (语义化版本)。
 
+## [1.3.50] - 2026-07-10
+
+### 修复 (Fixed)
+- **消除全库 AT 导出的双重全表扫描**：`api/chatgpt.py` 的导出票据恢复为只保存筛选条件和模式，不再在创建票据时提前加载全量账号及解析完整 `extra_json`。实际下载阶段针对纯 AT 模式只查询 `token / extra_json` 两列并执行一次有序扫描，避免账号历史扩展字段较大时票据创建超时，同时维持非空 AT 一行一个和无 AT 明确报错。
+
 ## [1.3.49] - 2026-07-10
 
 ### 新增 (Added)
@@ -1116,3 +1121,7 @@
 ## 2026-07-10 18:23:20 +0800
 - 新增 ChatGPT AccessToken 纯文本导出模式
 - 发布模式: multi
+
+## 2026-07-10 18:43:13 +0800
+- 优化 AccessToken 全库导出性能
+- 发布模式: hot
