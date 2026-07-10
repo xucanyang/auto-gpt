@@ -289,9 +289,10 @@ export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
                 done?: boolean
                 status?: string
               }
-              if (payload.line) {
+              const logLine = payload.line
+              if (typeof logLine === 'string') {
                 nextSinceRef.current += 1
-                setLines((previous) => [...previous, payload.line!])
+                setLines((previous) => [...previous, logLine])
               }
               if (payload.done) {
                 const terminal = getTaskTerminalStatus(payload.status) || 'done'
@@ -543,6 +544,7 @@ export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
               key={`${index}-${line.raw}`}
               style={{
                 lineHeight: 1.65,
+                minHeight: line.raw === '' ? '1.65em' : undefined,
                 margin: line.accountGap ? (line.isDebug ? '14px 0 2px' : '14px 0 0') : line.isDebug ? '2px 0' : 0,
                 padding: line.isDebug ? '2px 8px' : 0,
                 border: line.isDebug ? `1px solid ${token.colorPrimaryBorder}` : '1px solid transparent',

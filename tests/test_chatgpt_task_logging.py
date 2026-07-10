@@ -1,3 +1,4 @@
+import asyncio
 import json
 
 from sqlmodel import SQLModel, Session, create_engine, select
@@ -94,7 +95,7 @@ def test_classify_task_log_level_sends_low_level_register_noise_to_debug():
     for line in debug_lines:
         assert classify_task_log_level(line, flow="access_token_register") == "debug"
 
-    assert classify_task_log_level("[账号] -------- 尝试 1 / 目标成功 1 --------", flow="access_token_register") == "info"
+    assert classify_task_log_level("[账号] -------- 尝试 1 / 目标成功 1 / 当前成功数 0 --------", flow="access_token_register") == "info"
     assert classify_task_log_level("[验证码] 等待邮箱验证码：注册阶段邮箱验证码 timeout=600s", flow="access_token_register") == "info"
     assert classify_task_log_level("[FAIL] 注册失败: 验证码失败: HTTP 403", flow="access_token_register") == "info"
     assert classify_task_log_level("显式 debug", "debug", flow="access_token_register") == "debug"
@@ -477,6 +478,33 @@ def test_api_tasks_log_and_save_task_log_are_redaction_backstops(monkeypatch, tm
     assert "654321" not in dumped
     assert "eyJabcdefghijk" not in row.error
     assert "secret" not in row.error
+
+
+def test_api_tasks_preserves_blank_log_lines_in_sse(monkeypatch):
+    from api import tasks
+    from core.task_runtime import RegisterTaskStore
+
+    task_id = "task_blank_log_sse"
+    store = RegisterTaskStore()
+    store.create(task_id, platform="chatgpt", total=1, source="unit")
+    monkeypatch.setattr(tasks, "_task_store", store)
+    tasks._log(task_id, "")
+    store.finish(task_id, status="done", success=1, skipped=0, errors=[])
+
+    async def collect_events():
+        response = await tasks.stream_logs(task_id)
+        events = []
+        async for chunk in response.body_iterator:
+            text = chunk.decode() if isinstance(chunk, bytes) else chunk
+            for line in text.splitlines():
+                if line.startswith("data: "):
+                    events.append(json.loads(line[6:]))
+        return events
+
+    events = asyncio.run(collect_events())
+
+    assert events[0] == {"line": ""}
+    assert events[-1] == {"done": True, "status": "done"}
 
 
 def test_batch_oaipay_upload_task_logging_saves_attempt_outcome(tmp_path, monkeypatch):

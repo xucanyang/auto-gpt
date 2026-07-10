@@ -332,6 +332,42 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
         self.assertEqual(snapshot["skipped"], 0)
         self.assertEqual(snapshot["errors"], [])
 
+    def test_serial_register_logs_current_success_and_blank_separator(self):
+        task_id = "task-control-log-current-success"
+        req = RegisterTaskRequest(
+            platform="chatgpt",
+            count=2,
+            concurrency=1,
+            proxy="http://proxy.local:8080",
+            extra={"mail_provider": "fake"},
+        )
+        _create_task_record(task_id, req, "manual", None)
+
+        with (
+            patch("services.chatgpt_core.ChatGPTPlatform", _FakePlatform),
+            patch("core.base_mailbox.create_mailbox", return_value=_FakeMailbox()),
+            patch("core.db.save_account", side_effect=lambda account: account),
+            patch("api.tasks._save_task_log"),
+        ):
+            _run_register(task_id, req)
+
+        snapshot = _task_store.snapshot(task_id)
+        logs = snapshot["logs"]
+        headers = [line for line in logs if "[账号] -------- 尝试 " in line]
+
+        self.assertEqual(snapshot["status"], "done")
+        self.assertEqual(snapshot["success"], 2)
+        self.assertEqual(len(headers), 2)
+        self.assertIn("尝试 1 / 目标成功 2 / 当前成功数 0", headers[0])
+        self.assertIn("尝试 2 / 目标成功 2 / 当前成功数 1", headers[1])
+        first_success_index = next(index for index, line in enumerate(logs) if "注册成功" in line)
+        separator_index = logs.index("", first_success_index + 1)
+        second_header_index = logs.index(headers[1])
+        self.assertLess(first_success_index, separator_index)
+        self.assertLess(separator_index, second_header_index)
+        self.assertEqual(logs[second_header_index - 1], "")
+        self.assertFalse(any("开始第 " in line and "目标成功数" in line for line in logs))
+
     def test_chatgpt_nonzero_checkout_amount_counts_failure_without_saving_and_continues(self):
         task_id = "task-chatgpt-skip-save"
         req = RegisterTaskRequest(

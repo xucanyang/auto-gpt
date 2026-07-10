@@ -4683,6 +4683,12 @@ def _log(
     level=debug 的日志会统一加 [DEBUG] 前缀，前端据此拆分 Info/Debug 视图；
     已经带 [DEBUG] 的上游日志不重复加前缀。
     """
+    # An explicit empty message is a visual separator, not a timestamped log event.
+    if msg == "":
+        _task_store.append_log(task_id, "")
+        print()
+        return
+
     ts = time.strftime("%H:%M:%S")
     text = str(msg or "")
     normalized_level = str(level or "info").strip().lower() or "info"
@@ -13348,8 +13354,10 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                     merged_extra["chatgpt_deferred_invite_team_id"] = current_deferred_team_ids[0]
 
                 _task_store.set_progress(task_id, f"{success}/{target_successes}")
-                _log(task_id, f"[账号] -------- 尝试 {i + 1} / 目标成功 {target_successes} --------")
-                _log(task_id, f"开始第 {i + 1} 次尝试，目标成功数 {target_successes}")
+                _log(
+                    task_id,
+                    f"[账号] -------- 尝试 {i + 1} / 目标成功 {target_successes} / 当前成功数 {success} --------",
+                )
                 attempt_fingerprint_payload: dict[str, Any] = {}
                 attempt_fingerprint_signature = ""
                 if req.platform == "chatgpt":
@@ -14072,6 +14080,9 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                                 f"[控制] 已达到注册最大尝试次数 {attempt_cap}，停止补尝试",
                             )
                             continue
+                        # Only a serial task has a deterministic account-to-account boundary.
+                        if max_workers == 1:
+                            _log(task_id, "")
                         future = pool.submit(_do_one, next_attempt_index)
                         in_flight[future] = next_attempt_index
                         next_attempt_index += 1
