@@ -27,6 +27,11 @@ from services.chatgpt_core.invalid_account_recheck import (
     _message_for_status,
 )
 from services.chatgpt_core.account_fingerprint import inject_account_browser_fingerprint, persist_account_browser_fingerprint
+from services.chatgpt_core.mailbox_state import (
+    build_mailbox_state,
+    mailbox_state_summary,
+    sanitize_mailbox_state,
+)
 from services.chatgpt_core.pending_business_invites import RestoredEmailService, _mailbox_state_from_account
 from services.chatgpt_core.local_status_refresh import schedule_chatgpt_local_status_refresh_for_account_id
 from services.chatgpt_core.refresh_token_registration_engine import (
@@ -851,18 +856,16 @@ class ManualTaskEmailService:
         return code
 
     def export_state(self) -> dict[str, Any]:
-        return {
-            'provider': 'manual_email_otp',
-            'email': self.email,
-            'account': {
-                'email': str(getattr(self._acct, 'email', '') or self.email),
-                'account_id': str(getattr(self._acct, 'account_id', '') or self.email),
-                'extra': getattr(self._acct, 'extra', None) or {},
-            },
-            'before_ids': sorted(self._before_ids),
-            'config': dict(self._extra or {}),
-            'proxy': self._proxy,
-        }
+        return build_mailbox_state(
+            provider='manual_email_otp',
+            email=self.email,
+            account_email=str(getattr(self._acct, 'email', '') or self.email),
+            account_id=str(getattr(self._acct, 'account_id', '') or self.email),
+            account_extra=getattr(self._acct, 'extra', None) or {},
+            before_ids=self._before_ids,
+            config=self._extra,
+            proxy=self._proxy,
+        )
 
     def finalize_success(self, account_email: str = '', task_id: str = ''):
         finalize = getattr(self._mailbox, 'finalize_success', None)
@@ -909,7 +912,7 @@ def _build_success_payload(
         'has_refresh_token': bool(has_refresh_token),
     }
     if mailbox_state:
-        payload['mailbox_state'] = dict(mailbox_state)
+        payload['mailbox_state'] = mailbox_state_summary(mailbox_state, account_email=email)
     return payload
 
 
@@ -942,7 +945,7 @@ def _build_failure_payload(
         payload['cooldown_seconds'] = cooldown_seconds
         payload['cooldown_until'] = (_utcnow() + timedelta(seconds=cooldown_seconds)).isoformat()
     if mailbox_state:
-        payload['mailbox_state'] = dict(mailbox_state)
+        payload['mailbox_state'] = mailbox_state_summary(mailbox_state, account_email=email)
     return payload
 
 
@@ -1016,7 +1019,9 @@ def _upsert_custom_email_recheck_account(
             if workspace_id:
                 extra['workspace_id'] = workspace_id
             if mailbox_state:
-                extra['chatgpt_mailbox_state'] = dict(mailbox_state)
+                cleaned_mailbox_state = sanitize_mailbox_state(mailbox_state, account_email=email)
+                if cleaned_mailbox_state:
+                    extra['chatgpt_mailbox_state'] = cleaned_mailbox_state
             revival_marker = _build_revival_marker(
                 source='custom_email_recheck',
                 mode='revive_existing',
@@ -1080,7 +1085,9 @@ def _upsert_custom_email_recheck_account(
     if workspace_id:
         extra['workspace_id'] = workspace_id
     if mailbox_state:
-        extra['chatgpt_mailbox_state'] = dict(mailbox_state)
+        cleaned_mailbox_state = sanitize_mailbox_state(mailbox_state, account_email=email)
+        if cleaned_mailbox_state:
+            extra['chatgpt_mailbox_state'] = cleaned_mailbox_state
 
     account = Account(
         platform='chatgpt',

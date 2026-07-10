@@ -98,6 +98,30 @@ class IcloudHmeMailboxFinalizeTests(unittest.TestCase):
         self.assertEqual(IcloudHmeMailbox._helper_lease_id(helper_with_explicit_lease), "lease-1")
         self.assertEqual(IcloudHmeMailbox._helper_lease_id(helper_provider_state), "lease-2")
 
+    def test_helper_ready_export_is_minimal_and_has_no_icloud_cookie(self):
+        mailbox = IcloudHmeMailbox(
+            mail_provider_name="hme_ready_api",
+            icloud_hme_mode="helper_ready_api",
+            icloud_cookie="apple-cookie-must-not-be-exported",
+            icloud_forward_to="global@example.com",
+            icloud_forward_mailbox_id="global-mailbox",
+            tempmail_api_url="http://tempmail-api-1:8080",
+            tempmail_api_key="tempmail-key",
+            tempmail_api_key_header="X-TempMail-Key",
+            icloud_hme_helper_api_url="http://helper-api",
+            icloud_hme_helper_internal_key="helper-key",
+            icloud_hme_helper_api_key_header="X-Internal-Key",
+            icloud_hme_helper_consumer="auto-gpt/test",
+        )
+
+        exported = mailbox.export_state_config()
+
+        self.assertEqual(exported["icloud_hme_mode"], "helper_ready_api")
+        self.assertEqual(exported["icloud_hme_helper_api_url"], "http://helper-api")
+        self.assertEqual(exported["tempmail_api_url"], "http://tempmail-api-1:8080")
+        self.assertNotIn("icloud_cookie", exported)
+        self.assertNotIn("chatgpt_gopay_batch_tasks", exported)
+
     def test_helper_ready_waits_code_from_tempmail_forward_mailbox(self):
         mailbox = IcloudHmeMailbox(
             icloud_hme_mode="helper_ready_api",

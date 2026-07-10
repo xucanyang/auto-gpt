@@ -10,6 +10,7 @@ from platforms.chatgpt.chatgpt_registration_mode_adapter import (
     ChatGPTRegistrationContext,
     build_chatgpt_registration_mode_adapter,
 )
+from services.chatgpt_core.mailbox_state import build_mailbox_state, export_mailbox_state_config
 
 
 @register
@@ -180,18 +181,24 @@ class ChatGPTPlatform(BasePlatform):
                     return code
 
                 def export_state(self):
-                    return {
-                        "provider": _mail_provider,
-                        "email": str(self._email or getattr(self._acct, "email", "") or "").strip(),
-                        "account": {
-                            "email": str(getattr(self._acct, "email", "") or "").strip(),
-                            "account_id": str(getattr(self._acct, "account_id", "") or "").strip(),
-                            "extra": getattr(self._acct, "extra", None) or {},
-                        },
-                        "before_ids": sorted(self._before_ids),
-                        "config": dict(extra_config or {}),
-                        "proxy": proxy,
-                    }
+                    exporter = getattr(_mailbox, "export_state_config", None)
+                    if callable(exporter):
+                        try:
+                            config = exporter(self._acct, extra_config)
+                        except TypeError:
+                            config = exporter()
+                    else:
+                        config = export_mailbox_state_config(_mail_provider, extra_config)
+                    return build_mailbox_state(
+                        provider=_mail_provider,
+                        email=str(self._email or getattr(self._acct, "email", "") or "").strip(),
+                        account_email=str(getattr(self._acct, "email", "") or "").strip(),
+                        account_id=str(getattr(self._acct, "account_id", "") or "").strip(),
+                        account_extra=getattr(self._acct, "extra", None) or {},
+                        before_ids=self._before_ids,
+                        config=config,
+                        proxy=proxy,
+                    )
 
                 def update_status(self, success, error=None):
                     pass
@@ -287,18 +294,16 @@ class ChatGPTPlatform(BasePlatform):
                     return code
 
                 def export_state(self):
-                    return {
-                        "provider": "tempmail_lol",
-                        "email": str(getattr(self._acct, "email", "") or "").strip(),
-                        "account": {
-                            "email": str(getattr(self._acct, "email", "") or "").strip(),
-                            "account_id": str(getattr(self._acct, "account_id", "") or "").strip(),
-                            "extra": getattr(self._acct, "extra", None) or {},
-                        },
-                        "before_ids": sorted(self._before_ids),
-                        "config": dict(extra_config or {}),
-                        "proxy": proxy,
-                    }
+                    return build_mailbox_state(
+                        provider="tempmail_lol",
+                        email=str(getattr(self._acct, "email", "") or "").strip(),
+                        account_email=str(getattr(self._acct, "email", "") or "").strip(),
+                        account_id=str(getattr(self._acct, "account_id", "") or "").strip(),
+                        account_extra=getattr(self._acct, "extra", None) or {},
+                        before_ids=self._before_ids,
+                        config={},
+                        proxy=proxy,
+                    )
 
                 def update_status(self, success, error=None):
                     pass

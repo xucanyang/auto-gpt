@@ -11,6 +11,10 @@ from services.chatgpt_core.chatgpt_registration_mode_adapter import (
     ChatGPTRegistrationContext,
     build_chatgpt_registration_mode_adapter,
 )
+from services.chatgpt_core.mailbox_state import (
+    build_mailbox_state,
+    export_mailbox_state_config,
+)
 
 
 class ChatGPTPlatform(BasePlatform):
@@ -166,23 +170,20 @@ class ChatGPTPlatform(BasePlatform):
                     except TypeError:
                         export_config = state_config_exporter()
                 else:
-                    export_config = {
-                        key: value
-                        for key, value in dict(extra_config or {}).items()
-                        if key not in {"_task_control"} and not callable(value)
-                    }
-                return {
-                    "provider": _mail_provider,
-                    "email": str(_fixed_email or getattr(acct, "email", "") or "").strip(),
-                    "account": {
-                        "email": str(getattr(acct, "email", "") or "").strip(),
-                        "account_id": str(getattr(acct, "account_id", "") or "").strip(),
-                        "extra": account_extra,
-                    },
-                    "before_ids": sorted(before_ids or set()),
-                    "config": export_config,
-                    "proxy": proxy,
-                }
+                    # Never persist the registration/global config wholesale.
+                    # It contains unrelated and potentially unbounded runtime
+                    # state (GoPay batches, phone pools, pipelines, filters).
+                    export_config = export_mailbox_state_config(_mail_provider, extra_config)
+                return build_mailbox_state(
+                    provider=_mail_provider,
+                    email=str(_fixed_email or getattr(acct, "email", "") or "").strip(),
+                    account_email=str(getattr(acct, "email", "") or "").strip(),
+                    account_id=str(getattr(acct, "account_id", "") or "").strip(),
+                    account_extra=account_extra,
+                    before_ids=before_ids,
+                    config=export_config,
+                    proxy=proxy,
+                )
 
             def _sync_hme_rerun_result(acct, *, success: bool, error_message: str = "", task_id: str = ""):
                 if _mail_provider != "icloud_hme" or acct is None:
@@ -434,18 +435,16 @@ class ChatGPTPlatform(BasePlatform):
                     return code
 
                 def export_state(self):
-                    return {
-                        "provider": "tempmail_lol",
-                        "email": str(getattr(self._acct, "email", "") or "").strip(),
-                        "account": {
-                            "email": str(getattr(self._acct, "email", "") or "").strip(),
-                            "account_id": str(getattr(self._acct, "account_id", "") or "").strip(),
-                            "extra": getattr(self._acct, "extra", None) or {},
-                        },
-                        "before_ids": sorted(self._before_ids),
-                        "config": dict(extra_config or {}),
-                        "proxy": proxy,
-                    }
+                    return build_mailbox_state(
+                        provider="tempmail_lol",
+                        email=str(getattr(self._acct, "email", "") or "").strip(),
+                        account_email=str(getattr(self._acct, "email", "") or "").strip(),
+                        account_id=str(getattr(self._acct, "account_id", "") or "").strip(),
+                        account_extra=getattr(self._acct, "extra", None) or {},
+                        before_ids=self._before_ids,
+                        config={},
+                        proxy=proxy,
+                    )
 
                 def update_status(self, success, error=None):
                     pass

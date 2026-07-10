@@ -4,6 +4,21 @@
 
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，并且本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/) (语义化版本)。
 
+## [1.3.51] - 2026-07-11
+
+### 修复 (Fixed)
+- **根除 HME 邮箱恢复状态的全局配置复制**：`services/chatgpt_core/mailbox_state.py` 新增唯一的 v2 mailbox-state 契约，`services/chatgpt_core/plugin.py`、`core/base_mailbox.py` 的 `IcloudHmeMailbox.export_state_config()` 与旧 `platforms/chatgpt` 兼容入口均改为 provider/account 双层显式白名单。`hme_ready_api` 只保留 alias、lease/checkout、转发邮箱与 Helper/TempMail 恢复参数，强制排除 `icloud_cookie`、GoPay 批量任务、手机号池、筛选组合、流水线和任意未知全局配置；`before_ids` 同时限制为最多 128 项和 16 KiB，恢复前仍优先从实时邮箱刷新基线。
+- **封死二次写入与嵌套复制面**：注册模式适配器、订阅 Auth 补抓、失效测活、手动邮箱测活、待激活邀请以及 iCloud HME 重跑队列在持久化前统一 sanitize；`chatgpt_invalid_recheck` / `chatgpt_custom_email_recheck` 结果只保存 provider/email/schema/before-count 摘要，不再把完整邮箱恢复状态复制进结果对象。`ManualTaskEmailService.export_state()` 不再把合并后的运行配置直接写入账号。
+- **提供可审计的历史压缩迁移**：新增 `scripts/migrate_hme_mailbox_state.py` 与回归测试。脚本默认 dry-run、逐行 keyset 处理、拒绝在线 apply；正式 apply 会先完整 integrity check 和 SQLite 一致性备份，再在单事务/CAS 保护下将账户收敛为唯一 `chatgpt_mailbox_state`（缺失时从 legacy/invalid/custom 状态按优先级恢复），删除可安全识别的旧副本，最后 checkpoint、可选 VACUUM 和完整性复核。`pending_business_invites.mailbox_state_json` 继续保留一份受限的延迟激活快照。
+- **终态任务轮询真正停止**：`frontend/src/pages/Accounts.tsx`、`frontend/src/components/TaskLogPanel.tsx` 与新增 `frontend/src/lib/taskStatus.ts` 统一状态归一化。终态 `done/failed/stopped/cancelled/completed/...` 不再重建任务详情 effect、不再重复拉取 active-summary，也会从账号快照监听集合移除；隐藏页面、关闭弹窗、切换任务和终态时会清理 timer、SSE 与 AbortController 请求，修复完成任务仍以 1–3 次/秒请求的根因。
+- **降低无关全表读取的峰值**：`api/accounts.py` 的 `/api/accounts/stats` 改为 SQL 聚合，不再把每个 `accounts.extra_json` ORM 物化到 Python 仅为统计平台和状态数量。
+
+### 安全 (Security)
+- **多实例运行时资源护栏**：`docker-compose.multi.yml` 为主、Plus、Plus2、K12 容器设置 `mem_limit=2560m`、`mem_reservation=768m`、`memswap_limit=3072m`、`mem_swappiness=10` 和 `pids_limit=512`。这是数据修复后的隔离保险丝，不替代邮箱状态压缩；不会禁用 OOM killer，也未在未压测前压缩浏览器所需的 1 GiB shared memory。
+
+### 测试 (Tests)
+- **补齐污染与恢复回归覆盖**：新增 `tests/test_mailbox_state.py`、`tests/test_migrate_hme_mailbox_state.py`；扩展 `tests/test_chatgpt_plugin.py`、`tests/test_icloud_hme_mailbox_finalize.py`。覆盖 1 MiB 级 GoPay/手机号池/流水线污染不进入新状态、Helper 无 iCloud Cookie、身份字段与转发目标保留、before_ids 双上限、四个历史账户路径与 pending 表迁移、dry-run 零写入、备份/回滚/幂等/事务失败回滚及真实 HME exporter。
+
 ## [1.3.50] - 2026-07-10
 
 ### 修复 (Fixed)
@@ -1125,3 +1140,7 @@
 ## 2026-07-10 18:43:13 +0800
 - 优化 AccessToken 全库导出性能
 - 发布模式: hot
+
+## 2026-07-11 01:13:35 +0800
+- P0 修复 HME 邮箱状态污染、终态轮询与 OOM 护栏
+- 发布模式: multi

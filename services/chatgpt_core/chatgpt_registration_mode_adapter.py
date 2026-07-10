@@ -8,6 +8,7 @@ from typing import Any, Callable, Optional
 
 from core.base_platform import Account, AccountStatus
 from services.chatgpt_core.account_fingerprint import persist_account_browser_fingerprint
+from services.chatgpt_core.mailbox_state import sanitize_mailbox_state
 
 CHATGPT_REGISTRATION_MODE_REFRESH_TOKEN = "refresh_token"
 CHATGPT_REGISTRATION_MODE_ACCESS_TOKEN_ONLY = "access_token_only"
@@ -298,7 +299,9 @@ class BaseChatGPTRegistrationModeAdapter(ABC):
                 )
             mailbox_state = metadata.get("mailbox_state") or metadata.get("chatgpt_mailbox_state")
             if mailbox_state:
-                extra["chatgpt_mailbox_state"] = mailbox_state
+                cleaned_mailbox_state = sanitize_mailbox_state(mailbox_state, account_email=str(email or ""))
+                if cleaned_mailbox_state:
+                    extra["chatgpt_mailbox_state"] = cleaned_mailbox_state
             if metadata.get("registration_context"):
                 extra["chatgpt_registration_context"] = metadata.get("registration_context")
             if metadata.get("pending_business_invite"):

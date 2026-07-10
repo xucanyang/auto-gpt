@@ -102,6 +102,47 @@ class _CaptureContextAdapter:
         return {"success": True, "password": fallback_password}
 
 
+class _StateCaptureAdapter:
+    def run(self, context):
+        context.email_service.create_email()
+        return mock.Mock(success=True, mailbox_state=context.email_service.export_state())
+
+    def build_account(self, result, fallback_password):
+        return {
+            "success": True,
+            "password": fallback_password,
+            "mailbox_state": result.mailbox_state,
+        }
+
+
+class _HmeReadyStateMailbox:
+    def __init__(self):
+        self.account = MailboxAccount(
+            email="alias@icloud.com",
+            account_id="lease-123",
+            extra={
+                "provider": "hme_ready_api",
+                "mode": "helper_ready_api",
+                "source": "icloud-hide-email-helper",
+                "lease_id": "lease-123",
+                "checkout_id": "checkout-123",
+                "hme": "alias@icloud.com",
+                "forward_to": "forward@example.com",
+                "forward_mailbox_id": "mailbox-123",
+                "unrelated_runtime_dump": "x" * 100_000,
+            },
+        )
+
+    def get_email(self):
+        return self.account
+
+    def get_current_ids(self, account):
+        return {f"message-{index:04d}" for index in range(600)}
+
+    def wait_for_code(self, *args, **kwargs):
+        return "123456"
+
+
 class ChatGPTPluginTests(unittest.TestCase):
     def setUp(self):
         self.default_proxy_patcher = mock.patch(
@@ -197,6 +238,43 @@ class ChatGPTPluginTests(unittest.TestCase):
 
         _, kwargs = mailbox.wait_call
         self.assertEqual(kwargs.get("timeout"), 30)
+
+    def test_hme_ready_state_export_never_copies_global_runtime_config(self):
+        mailbox = _HmeReadyStateMailbox()
+        platform = ChatGPTPlatform(
+            config=RegisterConfig(
+                extra={
+                    "mail_provider": "hme_ready_api",
+                    "icloud_hme_helper_api_url": "http://helper.internal",
+                    "icloud_hme_helper_internal_key": "helper-secret",
+                    "tempmail_api_url": "http://tempmail.internal",
+                    "tempmail_api_key": "tempmail-secret",
+                    "chatgpt_gopay_batch_tasks": "g" * 750_000,
+                    "chatgpt_gopay_phone_pool": ["+10000000000"] * 10_000,
+                    "idea_oaipay_pipeline_state": {"items": ["x"] * 10_000},
+                }
+            ),
+            mailbox=mailbox,
+        )
+
+        with mock.patch(
+            "services.chatgpt_core.plugin.build_chatgpt_registration_mode_adapter",
+            return_value=_StateCaptureAdapter(),
+        ):
+            result = platform.register()
+
+        state = result["mailbox_state"]
+        self.assertEqual(state["schema_version"], 2)
+        self.assertEqual(state["provider"], "hme_ready_api")
+        self.assertEqual(state["account"]["extra"]["lease_id"], "lease-123")
+        self.assertEqual(state["account"]["extra"]["forward_mailbox_id"], "mailbox-123")
+        self.assertNotIn("unrelated_runtime_dump", state["account"]["extra"])
+        self.assertEqual(state["config"]["icloud_hme_mode"], "helper_ready_api")
+        self.assertEqual(state["config"]["icloud_hme_helper_api_url"], "http://helper.internal")
+        self.assertNotIn("chatgpt_gopay_batch_tasks", state["config"])
+        self.assertNotIn("chatgpt_gopay_phone_pool", state["config"])
+        self.assertNotIn("idea_oaipay_pipeline_state", state["config"])
+        self.assertLessEqual(len(state["before_ids"]), 128)
 
     def test_resume_subscription_auth_action_is_exposed(self):
         platform = ChatGPTPlatform(config=RegisterConfig(extra={}))

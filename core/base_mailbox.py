@@ -3261,6 +3261,43 @@ class IcloudHmeMailbox(BaseMailbox):
             task_id=resolved_task_id,
         )
 
+    def export_state_config(
+        self,
+        account: MailboxAccount | None = None,
+        extra_config: dict | None = None,
+    ) -> dict[str, Any]:
+        """Export only the provider settings needed to reopen this mailbox.
+
+        The registration config also carries unrelated global runtime state.
+        Reading attributes from the constructed mailbox keeps this contract
+        independent from that unbounded object.
+        """
+
+        config: dict[str, Any] = {
+            "icloud_hme_mode": self._icloud_hme_mode,
+            "icloud_domain_base": self._icloud_domain_base,
+            "icloud_forward_to": ",".join(self._icloud_forward_tos),
+            "icloud_forward_mailbox_id": self._icloud_forward_mailbox_id,
+            "icloud_hme_helper_api_url": self._helper_client.api_url,
+            "icloud_hme_helper_internal_key": self._helper_client.api_key,
+            "icloud_hme_helper_api_key_header": self._helper_client.api_key_header,
+            "icloud_hme_helper_consumer": self._helper_consumer,
+            "icloud_hme_helper_checkout_ttl_seconds": self._helper_checkout_ttl_seconds,
+            "icloud_hme_helper_wait_timeout_seconds": self._wait_timeout_seconds,
+            "icloud_hme_helper_max_cache_age_seconds": self._helper_max_cache_age_seconds,
+            "tempmail_api_url": self._tempmail_mailbox.api,
+            "tempmail_api_key": self._tempmail_mailbox.api_key,
+            "tempmail_api_key_header": self._tempmail_mailbox.api_key_header,
+            "tempmail_wait_timeout_seconds": self._wait_timeout_seconds,
+        }
+        if self._icloud_hme_mode != "helper_ready_api":
+            config["icloud_cookie"] = self._icloud_cookie
+        return {
+            key: value
+            for key, value in config.items()
+            if value not in (None, "")
+        }
+
 
 class AppleMailMailbox(BaseMailbox):
     """小苹果取件邮箱服务，基于本地邮箱池文件轮转邮箱账号"""

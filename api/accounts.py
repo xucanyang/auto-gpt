@@ -1741,13 +1741,24 @@ def create_account(body: AccountCreate, session: Session = Depends(get_session))
 def get_stats(session: Session = Depends(get_session)):
     """统计各平台账号数量和状态分布"""
     reconcile_rate_limited_accounts(session)
-    accounts = session.exec(select(AccountModel)).all()
     platforms: dict = {}
     statuses: dict = {}
-    for acc in accounts:
-        platforms[acc.platform] = platforms.get(acc.platform, 0) + 1
-        statuses[acc.status] = statuses.get(acc.status, 0) + 1
-    return {"total": len(accounts), "by_platform": platforms, "by_status": statuses}
+    rows = session.exec(
+        select(
+            AccountModel.platform,
+            AccountModel.status,
+            func.count().label("count"),
+        ).group_by(AccountModel.platform, AccountModel.status)
+    ).all()
+    total = 0
+    for platform_value, status_value, count_value in rows:
+        count = int(count_value or 0)
+        platform_key = _safe_str(platform_value)
+        status_key = _safe_str(status_value)
+        total += count
+        platforms[platform_key] = platforms.get(platform_key, 0) + count
+        statuses[status_key] = statuses.get(status_key, 0) + count
+    return {"total": total, "by_platform": platforms, "by_status": statuses}
 
 
 @router.get("/overview")

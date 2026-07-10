@@ -72,6 +72,7 @@ import {
 import { apiFetch } from '@/lib/utils'
 import { buildTaskProxyPayload, saveTaskProxySettingsToConfig, taskProxySettingsFromConfig, validateTaskProxySettings } from '@/lib/taskProxySettings'
 import { normalizeExecutorForPlatform } from '@/lib/platformExecutorOptions'
+import { isActiveTaskStatus, normalizeTaskStatus } from '@/lib/taskStatus'
 
 const { Text } = Typography
 
@@ -856,20 +857,6 @@ function reassignBatchGopayPhones(items: BatchGopayItem[], phones: GopayPhoneCan
     batchIndex: index + 1,
     round: Math.floor(index / phones.length) + 1,
   }))
-}
-
-function normalizeTaskStatus(value: unknown) {
-  const normalized = String(value || '').trim().toLowerCase()
-  if (normalized === 'success') return 'done'
-  if (normalized === 'skipped') return 'stopped'
-  if (normalized === 'pending' || normalized === 'running' || normalized === 'done' || normalized === 'failed' || normalized === 'stopped') {
-    return normalized
-  }
-  return 'pending'
-}
-
-function isActiveTaskStatus(value: unknown) {
-  return !['done', 'failed', 'stopped'].includes(normalizeTaskStatus(value))
 }
 
 function clearTaskModalStorage() {
@@ -2366,6 +2353,7 @@ export default function Accounts() {
   const refetchAccounts = accountsQuery.refetch
   const accountDetailQuery = useAccountDetailQuery(detailAccount?.id ? Number(detailAccount.id) : null, detailModalOpen)
   const activeTasksQuery = useActiveTasksQuery(activeTasksPanelOpen)
+  const refetchActiveTasks = activeTasksQuery.refetch
   const pendingInvitesQuery = usePendingInvitesQuery(businessDeferredModalOpen && currentPlatform === 'chatgpt')
   const activeTasks = activeTasksQuery.data ?? EMPTY_LIST
   const activeTasksLoading = activeTasksQuery.isLoading || activeTasksQuery.isFetching
@@ -2968,48 +2956,32 @@ export default function Accounts() {
   }, [activeFilterPresetId])
 
   useEffect(() => {
-    if (!accounts.length) return
-    setWatchingBaxiAccountIds((prev) => {
-      const next = new Set(prev)
-      let changed = false
-      accounts.forEach((record) => {
-        const accountId = Number(record?.id || 0)
-        if (!Number.isFinite(accountId) || accountId <= 0) return
-        if (isBaxiGptWatchTerminal(record)) {
-          if (next.delete(accountId)) changed = true
-          return
-        }
-        if (isBaxiGptPendingOrder(record) && !next.has(accountId)) {
-          next.add(accountId)
-          changed = true
-        }
-      })
-      return changed ? next : prev
-    })
-  }, [accounts])
-
-  useEffect(() => {
     const ids = new Set<number>()
-    collectBaxiPollingAccountIdsFromTaskSnapshot(taskSnapshot).forEach((id) => ids.add(id))
+    accounts.forEach((record) => {
+      const accountId = Number(record?.id || 0)
+      if (!Number.isFinite(accountId) || accountId <= 0) return
+      if (isBaxiGptPendingOrder(record) && !isBaxiGptWatchTerminal(record)) {
+        ids.add(accountId)
+      }
+    })
+    const taskStatus = taskSnapshot?.status || taskSnapshot?.status_snapshot
+    if (isActiveTaskStatus(taskStatus)) {
+      collectBaxiPollingAccountIdsFromTaskSnapshot(taskSnapshot).forEach((id) => ids.add(id))
+    }
     activeTasks.forEach((task: any) => {
-      collectBaxiPollingAccountIdsFromTaskSnapshot(task).forEach((id) => ids.add(id))
+      if (isActiveTaskStatus(task?.status || task?.status_snapshot)) {
+        collectBaxiPollingAccountIdsFromTaskSnapshot(task).forEach((id) => ids.add(id))
+      }
     })
-    if (ids.size === 0) return
     setWatchingBaxiAccountIds((prev) => {
-      const next = new Set(prev)
-      let changed = false
-      ids.forEach((id) => {
-        if (!next.has(id)) {
-          next.add(id)
-          changed = true
-        }
-      })
-      return changed ? next : prev
+      if (prev.size === ids.size && Array.from(ids).every((id) => prev.has(id))) return prev
+      return ids
     })
-  }, [taskSnapshot, activeTasks])
+  }, [accounts, taskSnapshot, activeTasks])
 
   useEffect(() => {
     if (!pageVisible || !watchingBaxiAccountIdsKey) return
+    const controller = new AbortController()
     let cancelled = false
     let timer: number | null = null
     const pull = async () => {
@@ -3022,6 +2994,7 @@ export default function Accounts() {
         const data = await apiFetch('/accounts/snapshot', {
           method: 'POST',
           body: JSON.stringify({ ids }),
+          signal: controller.signal,
         })
         if (cancelled) return
         const items = Array.isArray(data?.items) ? data.items : []
@@ -3068,9 +3041,10 @@ export default function Accounts() {
           })
         }
       } catch {
+        if (controller.signal.aborted) return
         // 后端 snapshot 接口可能还没上线，或者字段临时缺失；账号页不要因此中断。
       } finally {
-        if (!cancelled) {
+        if (!cancelled && !controller.signal.aborted) {
           timer = window.setTimeout(pull, 4000)
         }
       }
@@ -3078,6 +3052,7 @@ export default function Accounts() {
     void pull()
     return () => {
       cancelled = true
+      controller.abort()
       if (timer != null) window.clearTimeout(timer)
     }
   }, [pageVisible, watchingBaxiAccountIdsKey])
@@ -3214,8 +3189,8 @@ export default function Accounts() {
 
   const refreshActiveTasks = useCallback(async () => {
     setActiveTasksPanelOpen(true)
-    await activeTasksQuery.refetch()
-  }, [activeTasksQuery])
+    await refetchActiveTasks()
+  }, [refetchActiveTasks])
 
   const openTaskFromSnapshot = (snapshot: any) => {
     const id = String(snapshot?.id || snapshot?.task_id || '').trim()
@@ -3425,24 +3400,26 @@ export default function Accounts() {
       setTaskSnapshot(null)
       return
     }
+    if (!pageVisible) return
 
+    const controller = new AbortController()
     let cancelled = false
     let timer: number | null = null
 
     const pull = async () => {
       try {
-        const snapshot = await apiFetch(`/tasks/${taskId}`)
+        const snapshot = await apiFetch(`/tasks/${taskId}`, { signal: controller.signal })
         if (cancelled) return
         setTaskSnapshot(snapshot)
         setActiveTasksPanelOpen(true)
-        void activeTasksQuery.refetch()
-        if (isActiveTaskStatus(snapshot?.status)) {
+        if (isActiveTaskStatus(snapshot?.status || snapshot?.status_snapshot)) {
           timer = window.setTimeout(pull, 1000)
         } else {
           clearTaskModalStorage()
+          void refetchActiveTasks()
         }
       } catch {
-        if (cancelled) return
+        if (cancelled || controller.signal.aborted) return
         clearTaskModalStorage()
         timer = window.setTimeout(pull, 1500)
       }
@@ -3452,11 +3429,12 @@ export default function Accounts() {
 
     return () => {
       cancelled = true
+      controller.abort()
       if (timer != null) {
         window.clearTimeout(timer)
       }
     }
-  }, [taskId, registerModalOpen, refreshActiveTasks])
+  }, [taskId, registerModalOpen, pageVisible, refetchActiveTasks])
 
   useEffect(() => {
     if (typeof window === 'undefined') return

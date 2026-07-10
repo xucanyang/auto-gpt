@@ -20,6 +20,7 @@ from services.chatgpt_account_state import (
 )
 from .account_fingerprint import inject_account_browser_fingerprint, persist_account_browser_fingerprint
 from .local_status_refresh import schedule_chatgpt_local_status_refresh_for_account_id
+from .mailbox_state import mailbox_state_summary, sanitize_mailbox_state
 from .pending_business_invites import RestoredEmailService, _mailbox_state_from_account
 from .refresh_token_registration_engine import EmailServiceAdapter, RefreshTokenRegistrationEngine
 from .utils import decode_jwt_payload, generate_random_birthday, generate_random_name
@@ -222,7 +223,10 @@ def _build_recheck_payload(
     if allow_existing_phone_verification is not None:
         payload["allow_existing_phone_verification"] = bool(allow_existing_phone_verification)
     if exported_mailbox_state:
-        payload["mailbox_state"] = dict(exported_mailbox_state)
+        payload["mailbox_state"] = mailbox_state_summary(
+            exported_mailbox_state,
+            account_email=email,
+        )
     return payload
 
 
@@ -302,7 +306,12 @@ def _persist_recheck_success(
         extra["chatgpt_registration_mode"] = "access_token_only"
         extra["chatgpt_token_source"] = "invalid_account_recheck"
         if exported_mailbox_state:
-            extra["chatgpt_mailbox_state"] = dict(exported_mailbox_state)
+            cleaned_mailbox_state = sanitize_mailbox_state(
+                exported_mailbox_state,
+                account_email=email,
+            )
+            if cleaned_mailbox_state:
+                extra["chatgpt_mailbox_state"] = cleaned_mailbox_state
 
         revival_marker = _build_revival_marker(
             source="invalid_account_recheck",
@@ -384,7 +393,12 @@ def _persist_recheck_failure(
         extra = account.get_extra()
         extra["chatgpt_invalid_recheck"] = payload
         if exported_mailbox_state:
-            extra["chatgpt_mailbox_state"] = dict(exported_mailbox_state)
+            cleaned_mailbox_state = sanitize_mailbox_state(
+                exported_mailbox_state,
+                account_email=email,
+            )
+            if cleaned_mailbox_state:
+                extra["chatgpt_mailbox_state"] = cleaned_mailbox_state
         extra = persist_account_browser_fingerprint(extra, source="invalid_account_recheck", overwrite=False)
         account.status = "invalid"
         extra["chatgpt_capabilities"] = classify_chatgpt_capabilities(account)

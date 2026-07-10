@@ -2579,7 +2579,17 @@ def sync_icloud_hme_rerun_result(
             "last_rerun_at": now_text,
         })
         if mailbox_state:
-            details["mailbox_state"] = dict(mailbox_state or {})
+            # Queue details are audit metadata, not a second mailbox-recovery
+            # store.  Persist only the bounded summary so a rerun cannot
+            # duplicate global registration configuration into this table.
+            try:
+                from services.chatgpt_core.mailbox_state import mailbox_state_summary
+
+                summary = mailbox_state_summary(mailbox_state, account_email=normalized_hme)
+            except Exception:
+                summary = {}
+            if summary:
+                details["mailbox_state"] = summary
         row.set_details(details)
         session.add(row)
 

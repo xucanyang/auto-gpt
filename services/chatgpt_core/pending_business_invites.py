@@ -15,6 +15,7 @@ from core.db import AccountModel, PendingBusinessInviteModel, engine
 from services.chatgpt_account_state import apply_auth_capture_status
 from .account_fingerprint import inject_account_browser_fingerprint, resolve_account_browser_fingerprint
 from .business_workspace_recovery import BusinessWorkspaceRecovery
+from .mailbox_state import sanitize_mailbox_state
 from .refresh_token_registration_engine import (
     EmailServiceAdapter,
     RefreshTokenRegistrationEngine,
@@ -156,7 +157,9 @@ def _current_mailbox_config(keys: tuple[str, ...]) -> dict[str, Any]:
 
 
 def _with_current_tempmail_config(mailbox_state: dict[str, Any]) -> dict[str, Any]:
-    state = dict(mailbox_state or {})
+    state = sanitize_mailbox_state(mailbox_state)
+    if not state:
+        return {}
     provider = str(state.get("provider") or "").strip()
     if provider not in {"tempmail_local", "tempmail_api", *ICLOUD_HME_PROVIDER_VALUES}:
         return state
@@ -206,7 +209,7 @@ def _with_current_tempmail_config(mailbox_state: dict[str, Any]) -> dict[str, An
         state["account"] = account
 
     state["config_refreshed_from_current"] = True
-    return state
+    return sanitize_mailbox_state(state)
 
 
 def _mailbox_state_from_account(account: AccountModel, *, extra: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -277,7 +280,7 @@ def _mailbox_state_from_account(account: AccountModel, *, extra: dict[str, Any] 
         if any(not _has_value(mailbox_config.get(key)) for key in required_keys):
             return {}
 
-        return {
+        return sanitize_mailbox_state({
             "provider": "icloud_hme",
             "email": email,
             "account": {
@@ -293,7 +296,7 @@ def _mailbox_state_from_account(account: AccountModel, *, extra: dict[str, Any] 
             "config": mailbox_config,
             "proxy": str(account_extra.get("proxy") or account_extra.get("proxy_url") or "").strip(),
             "recovered_from_account_config": True,
-        }
+        }, account_email=email)
     if provider in {"email_api", "api_email", "email_otp_api", "mail_api_otp"}:
         email = str(getattr(account, "email", "") or account_extra.get("email") or "").strip()
         raw_api_url = str(
@@ -310,7 +313,7 @@ def _mailbox_state_from_account(account: AccountModel, *, extra: dict[str, Any] 
             api_url = normalize_email_api_url(raw_api_url)
         except Exception:
             return {}
-        return {
+        return sanitize_mailbox_state({
             "provider": "email_api",
             "email": email,
             "account": {
@@ -332,7 +335,7 @@ def _mailbox_state_from_account(account: AccountModel, *, extra: dict[str, Any] 
             },
             "proxy": str(account_extra.get("email_api_proxy") or account_extra.get("proxy") or account_extra.get("proxy_url") or "").strip(),
             "recovered_from_account_config": True,
-        }
+        }, account_email=email)
 
     if provider not in {"tempmail_local", "tempmail_api"}:
         return {}
@@ -357,7 +360,7 @@ def _mailbox_state_from_account(account: AccountModel, *, extra: dict[str, Any] 
     if not _has_value(mailbox_config.get("tempmail_api_url")) or not _has_value(mailbox_config.get("tempmail_api_key")):
         return {}
 
-    return {
+    return sanitize_mailbox_state({
         "provider": provider,
         "email": email,
         "account": {
@@ -369,7 +372,7 @@ def _mailbox_state_from_account(account: AccountModel, *, extra: dict[str, Any] 
         "config": mailbox_config,
         "proxy": str(account_extra.get("proxy") or account_extra.get("proxy_url") or "").strip(),
         "recovered_from_account_config": True,
-    }
+    }, account_email=email)
 
 
 def _persist_account_mailbox_state_if_missing(
@@ -377,6 +380,7 @@ def _persist_account_mailbox_state_if_missing(
     account_id: int,
     mailbox_state: dict[str, Any],
 ) -> None:
+    mailbox_state = sanitize_mailbox_state(mailbox_state)
     if not account_id or not mailbox_state:
         return
     account_db = session.get(AccountModel, int(account_id))
@@ -718,7 +722,7 @@ class RestoredEmailService:
             self._before_ids.add(normalized)
 
     def export_state(self) -> dict[str, Any]:
-        return {
+        return sanitize_mailbox_state({
             **dict(self._state),
             "provider": self._provider,
             "email": str(self._email or getattr(self._acct, "email", "") or "").strip(),
@@ -730,7 +734,7 @@ class RestoredEmailService:
             "before_ids": sorted(self._before_ids),
             "config": dict(self._config or {}),
             "proxy": self._proxy,
-        }
+        })
 
 
 def upsert_pending_invite_from_account(account: AccountModel) -> PendingBusinessInviteModel | None:
@@ -739,7 +743,10 @@ def upsert_pending_invite_from_account(account: AccountModel) -> PendingBusiness
     if not pending:
         return None
 
-    mailbox_state = _mailbox_state_from_account(account, extra=extra)
+    mailbox_state = sanitize_mailbox_state(
+        _mailbox_state_from_account(account, extra=extra),
+        account_email=str(getattr(account, "email", "") or ""),
+    )
     registration_context = dict(extra.get("chatgpt_registration_context") or {})
 
     with Session(engine) as session:
@@ -794,7 +801,10 @@ def upsert_pending_subscription_auth_from_account(
     currency: str = "",
 ) -> SimpleNamespace:
     extra = account.get_extra()
-    mailbox_state = _mailbox_state_from_account(account, extra=extra)
+    mailbox_state = sanitize_mailbox_state(
+        _mailbox_state_from_account(account, extra=extra),
+        account_email=str(getattr(account, "email", "") or ""),
+    )
     registration_context = dict(extra.get("chatgpt_registration_context") or {})
     activation_context = {
         **registration_context,

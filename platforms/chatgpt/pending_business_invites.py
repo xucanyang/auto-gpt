@@ -12,6 +12,7 @@ from sqlmodel import Session, select
 from core.base_mailbox import MailboxAccount, create_mailbox
 from core.config_store import config_store
 from core.db import AccountModel, PendingBusinessInviteModel, engine
+from services.chatgpt_core.mailbox_state import sanitize_mailbox_state
 from .business_workspace_recovery import BusinessWorkspaceRecovery
 from .refresh_token_registration_engine import (
     EmailServiceAdapter,
@@ -353,7 +354,7 @@ class RestoredEmailService:
         return code
 
     def export_state(self) -> dict[str, Any]:
-        return dict(self._state)
+        return sanitize_mailbox_state(self._state, account_email=str(self._email or ""))
 
 
 def upsert_pending_invite_from_account(account: AccountModel) -> PendingBusinessInviteModel | None:
@@ -362,7 +363,10 @@ def upsert_pending_invite_from_account(account: AccountModel) -> PendingBusiness
     if not pending:
         return None
 
-    mailbox_state = dict(extra.get("chatgpt_mailbox_state") or {})
+    mailbox_state = sanitize_mailbox_state(
+        extra.get("chatgpt_mailbox_state") or {},
+        account_email=str(getattr(account, "email", "") or ""),
+    )
     registration_context = dict(extra.get("chatgpt_registration_context") or {})
 
     with Session(engine) as session:
@@ -416,7 +420,10 @@ def upsert_pending_subscription_auth_from_account(
     currency: str = "",
 ) -> SimpleNamespace:
     extra = account.get_extra()
-    mailbox_state = dict(extra.get("chatgpt_mailbox_state") or {})
+    mailbox_state = sanitize_mailbox_state(
+        extra.get("chatgpt_mailbox_state") or {},
+        account_email=str(getattr(account, "email", "") or ""),
+    )
     registration_context = dict(extra.get("chatgpt_registration_context") or {})
     activation_context = {
         **registration_context,

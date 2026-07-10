@@ -22,6 +22,7 @@ from .account_fingerprint import (
     persist_account_browser_fingerprint,
 )
 from .local_status_refresh import schedule_chatgpt_local_status_refresh_for_account_id
+from .mailbox_state import sanitize_mailbox_state
 from .pending_business_invites import RestoredEmailService, _mailbox_state_from_account
 from .refresh_token_registration_engine import (
     EmailServiceAdapter,
@@ -246,7 +247,12 @@ def _persist_subscription_auth_result(
         extra.update(primary.extra or {})
         extra = persist_account_browser_fingerprint(extra, source="subscription_auth_capture", overwrite=False)
         if mailbox_state:
-            extra["chatgpt_mailbox_state"] = dict(mailbox_state)
+            cleaned_mailbox_state = sanitize_mailbox_state(
+                mailbox_state,
+                account_email=str(getattr(account, "email", "") or ""),
+            )
+            if cleaned_mailbox_state:
+                extra["chatgpt_mailbox_state"] = cleaned_mailbox_state
         extra["chatgpt_last_auth_capture"] = dict(auth_capture)
         extra["chatgpt_subscription_auth_result"] = dict(auth_capture)
         account.set_extra(extra)

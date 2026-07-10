@@ -54,6 +54,13 @@ services:
       - tempmail_internal
       - team_manage_default
     shm_size: "1gb"
+    # Hard host-safety guard.  The mailbox-state migration removes the former
+    # multi-GiB JSON amplification before this limit is applied.
+    mem_limit: "2560m"
+    mem_reservation: "768m"
+    memswap_limit: "3072m"
+    mem_swappiness: 10
+    pids_limit: 512
 
   auto-gpt-plus:
     image: ${APP_IMAGE:-auto-gpt:latest}
@@ -106,6 +113,13 @@ services:
       - tempmail_internal
       - team_manage_default
     shm_size: "1gb"
+    # Hard host-safety guard.  See services/chatgpt_core/mailbox_state.py and
+    # scripts/migrate_hme_mailbox_state.py for the data-side root fix.
+    mem_limit: "2560m"
+    mem_reservation: "768m"
+    memswap_limit: "3072m"
+    mem_swappiness: 10
+    pids_limit: 512
 
   auto-plus2:
     image: ${APP_IMAGE:-auto-gpt:latest}
@@ -151,6 +165,11 @@ services:
       - tempmail_internal
       - team_manage_default
     shm_size: "1gb"
+    mem_limit: "2560m"
+    mem_reservation: "768m"
+    memswap_limit: "3072m"
+    mem_swappiness: 10
+    pids_limit: 512
 
   auto-k12:
     image: ${APP_IMAGE:-auto-gpt:latest}
@@ -199,6 +218,11 @@ services:
       - tempmail_internal
       - team_manage_default
     shm_size: "1gb"
+    mem_limit: "2560m"
+    mem_reservation: "768m"
+    memswap_limit: "3072m"
+    mem_swappiness: 10
+    pids_limit: 512
 
 networks:
   default:

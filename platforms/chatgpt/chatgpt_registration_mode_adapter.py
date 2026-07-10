@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 from core.base_platform import Account, AccountStatus
+from services.chatgpt_core.mailbox_state import sanitize_mailbox_state
 
 CHATGPT_REGISTRATION_MODE_REFRESH_TOKEN = "refresh_token"
 CHATGPT_REGISTRATION_MODE_ACCESS_TOKEN_ONLY = "access_token_only"
@@ -180,7 +181,12 @@ class BaseChatGPTRegistrationModeAdapter(ABC):
         metadata = getattr(result, "metadata", None) or {}
         if isinstance(metadata, dict):
             if metadata.get("mailbox_state"):
-                extra["chatgpt_mailbox_state"] = metadata.get("mailbox_state")
+                cleaned_mailbox_state = sanitize_mailbox_state(
+                    metadata.get("mailbox_state"),
+                    account_email=str(getattr(result, "email", "") or ""),
+                )
+                if cleaned_mailbox_state:
+                    extra["chatgpt_mailbox_state"] = cleaned_mailbox_state
             if metadata.get("registration_context"):
                 extra["chatgpt_registration_context"] = metadata.get("registration_context")
             if metadata.get("pending_business_invite"):

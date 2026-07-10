@@ -4,13 +4,14 @@ import { CopyOutlined, FastForwardOutlined, StopOutlined } from '@ant-design/ico
 
 import IdeaSubmitSummary from '@/components/idea/IdeaSubmitSummary'
 import { API_BASE, apiFetch, getToken } from '@/lib/utils'
+import { getTaskTerminalStatus, type TaskTerminalStatus } from '@/lib/taskStatus'
 
 interface TaskLogPanelProps {
   taskId: string
   onDone?: () => Promise<void> | void
 }
 
-type TaskTerminalStatus = 'idle' | 'done' | 'failed' | 'stopped'
+type TaskPanelStatus = 'idle' | TaskTerminalStatus
 type LogViewMode = 'info' | 'debug'
 type TaskCurrentState = {
   task?: string
@@ -50,7 +51,7 @@ export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
   const { token } = theme.useToken()
   const [lines, setLines] = useState<string[]>([])
   const [error, setError] = useState('')
-  const [terminalStatus, setTerminalStatus] = useState<TaskTerminalStatus>('idle')
+  const [terminalStatus, setTerminalStatus] = useState<TaskPanelStatus>('idle')
   const [taskSnapshot, setTaskSnapshot] = useState<any>(null)
   const [current, setCurrent] = useState<TaskCurrentState | null>(null)
   const [currentNow, setCurrentNow] = useState(() => Date.now())
@@ -160,15 +161,16 @@ export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
   }, [])
 
   useEffect(() => {
-    if (!current?.started_at) return
+    if (!current?.started_at || terminalStatus !== 'idle' || !pageVisible) return
     const timer = window.setInterval(() => setCurrentNow(Date.now()), 1000)
     return () => window.clearInterval(timer)
-  }, [current?.started_at])
+  }, [current?.started_at, pageVisible, terminalStatus])
 
   useEffect(() => {
     if (!taskId || !pageVisible) return
     const controller = new AbortController()
     let cancelled = false
+    const timers = new Set<number>()
     const baseRetryMs = 1000
     const maxRetryMs = 8000
     nextSinceRef.current = 0
@@ -178,28 +180,42 @@ export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
     setStopRequested(false)
     setTaskSnapshot(null)
 
-    const sleep = async (ms: number) =>
-      new Promise((resolve) => setTimeout(resolve, ms))
+    const sleep = (ms: number) => new Promise<void>((resolve) => {
+      let settled = false
+      const finish = () => {
+        if (settled) return
+        settled = true
+        timers.delete(timer)
+        controller.signal.removeEventListener('abort', finish)
+        resolve()
+      }
+      const timer = window.setTimeout(finish, ms)
+      timers.add(timer)
+      controller.signal.addEventListener('abort', finish, { once: true })
+    })
 
     const notifyTaskDone = (status?: TaskTerminalStatus | string) => {
       const key = `${taskId}:done`
       if (doneCallbackNotifyRef.current === key) return
       doneCallbackNotifyRef.current = key
 
-      window.setTimeout(() => {
+      const timer = window.setTimeout(() => {
+        timers.delete(timer)
         if (cancelled) return
         void Promise.resolve(onDoneRef.current?.()).catch((error_: unknown) => {
           const detail = error_ instanceof Error ? error_.message : '刷新页面状态失败'
           message.warning(`任务已结束，但刷新页面状态失败：${detail}`)
         })
       }, status === 'failed' ? 0 : 500)
+      timers.add(timer)
     }
 
     const initSnapshot = async (): Promise<boolean> => {
       try {
-        const snapshot = await apiFetch(`/tasks/${taskId}`) as {
+        const snapshot = await apiFetch(`/tasks/${taskId}`, { signal: controller.signal }) as {
           logs?: string[]
           status?: TaskTerminalStatus | string
+          status_snapshot?: string
           control?: { stop_requested?: boolean }
           meta?: { current?: TaskCurrentState }
         }
@@ -212,15 +228,16 @@ export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
         setStopRequested(Boolean(snapshot.control?.stop_requested))
         setCurrent(snapshot?.meta?.current && typeof snapshot.meta.current === 'object' ? snapshot.meta.current : null)
 
-        if (snapshot.status === 'done' || snapshot.status === 'failed' || snapshot.status === 'stopped') {
-          setTerminalStatus(snapshot.status)
+        const terminal = getTaskTerminalStatus(snapshot.status || snapshot.status_snapshot)
+        if (terminal) {
+          setTerminalStatus(terminal)
           // Keep the completed task's snapshot logs visible. The SSE stream immediately ends
           // for terminal tasks and otherwise would leave the panel looking empty.
-          notifyTaskDone(snapshot.status)
+          notifyTaskDone(terminal)
           return true
         }
       } catch (error_: unknown) {
-        if (!cancelled) {
+        if (!cancelled && !controller.signal.aborted) {
           const detail = error_ instanceof Error ? error_.message : '获取任务快照失败'
           setError(detail)
         }
@@ -270,22 +287,23 @@ export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
               const payload = JSON.parse(match[1]) as {
                 line?: string
                 done?: boolean
-                status?: TaskTerminalStatus
+                status?: string
               }
               if (payload.line) {
                 nextSinceRef.current += 1
                 setLines((previous) => [...previous, payload.line!])
               }
               if (payload.done) {
-                setTerminalStatus(payload.status || 'done')
-                void apiFetch(`/tasks/${taskId}`)
+                const terminal = getTaskTerminalStatus(payload.status) || 'done'
+                setTerminalStatus(terminal)
+                void apiFetch(`/tasks/${taskId}`, { signal: controller.signal })
                   .then((snapshot) => {
                     if (!cancelled) setTaskSnapshot(snapshot)
                   })
                   .catch(() => undefined)
                 // Notify the parent after the terminal state is visible so pages can refresh
                 // their business data without making the final log lines disappear first.
-                notifyTaskDone(payload.status || 'done')
+                notifyTaskDone(terminal)
                 return true
               }
             } catch {
@@ -324,6 +342,8 @@ export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
     return () => {
       cancelled = true
       controller.abort()
+      timers.forEach((timer) => window.clearTimeout(timer))
+      timers.clear()
     }
   }, [taskId, pageVisible])
 
