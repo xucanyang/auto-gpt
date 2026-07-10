@@ -4,6 +4,12 @@
 
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，并且本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/) (语义化版本)。
 
+## [1.3.52] - 2026-07-11
+
+### 修复 (Fixed)
+- **服务重启后的旧页面轮询熔断**：`api/tasks.py` 对已因进程重启丢失的 `task_*` 运行时任务返回短时可缓存的 `stopped` tombstone，而不是让旧版页面把 404 误判为临时网络失败并无限重试；已结束的内存任务同样返回私有缓存响应。任意非运行时格式的未知 ID 继续维持 404，任务控制与日志流的权限/存在性边界不变。新增 `tests/test_tasks_terminal_tombstone.py` 覆盖重启 tombstone、终态缓存和普通未知 ID 404。
+- **前端版本号同步至 v1.3.52**：`frontend/src/app/AppShell.tsx` 更新侧边栏版本，用于确认终态轮询修复 bundle 已加载。
+
 ## [1.3.51] - 2026-07-11
 
 ### 修复 (Fixed)
@@ -1143,4 +1149,8 @@
 
 ## 2026-07-11 01:13:35 +0800
 - P0 修复 HME 邮箱状态污染、终态轮询与 OOM 护栏
+- 发布模式: multi
+
+## 2026-07-11 01:18:47 +0800
+- 修复服务重启后旧任务页面的轮询重试
 - 发布模式: multi

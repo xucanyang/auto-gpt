@@ -1,5 +1,5 @@
 from fastapi import APIRouter, BackgroundTasks, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlmodel import Session, select
 from typing import Any, Optional
@@ -315,6 +315,30 @@ class BatchProbeLocalStatusTaskRequest(AccountFilterRequestMixin):
 def _ensure_task_exists(task_id: str) -> None:
     if not _task_store.exists(task_id):
         raise HTTPException(404, "任务不存在")
+
+
+def _expired_task_snapshot(task_id: str) -> dict[str, Any]:
+    """Terminal tombstone for an in-memory task lost during a service restart.
+
+    Task snapshots deliberately live in process memory.  A browser tab running
+    an older bundle otherwise treats a post-restart 404 as a transient error
+    and retries forever.  Returning a terminal snapshot lets both old and new
+    clients release their pollers without pretending the task is still active.
+    """
+
+    return {
+        "id": task_id,
+        "task_id": task_id,
+        "status": "stopped",
+        "progress": "",
+        "logs": [],
+        "success": 0,
+        "skipped": 0,
+        "errors": [],
+        "error": "任务运行时快照已因服务重启过期，已停止轮询",
+        "control": {"stop_requested": True},
+        "expired": True,
+    }
 
 
 def _ensure_task_mutable(task_id: str) -> None:
@@ -14504,8 +14528,26 @@ def list_active_task_summaries():
 
 @router.get("/{task_id}")
 def get_task(task_id: str):
-    _ensure_task_exists(task_id)
-    return sanitize_task_detail(_task_store.snapshot(task_id))
+    if not _task_store.exists(task_id):
+        # Keep the normal 404 contract for arbitrary IDs.  Runtime-generated
+        # task_* IDs receive a short cacheable terminal tombstone so an old
+        # browser bundle cannot turn a restart into a permanent 1–3 Hz retry.
+        if str(task_id or "").startswith("task_"):
+            return JSONResponse(
+                content=_expired_task_snapshot(task_id),
+                headers={"Cache-Control": "private, max-age=300"},
+            )
+        _ensure_task_exists(task_id)
+
+    snapshot = sanitize_task_detail(_task_store.snapshot(task_id))
+    if str(snapshot.get("status") or "").strip().lower() in {"done", "failed", "stopped"}:
+        # Terminal task IDs are immutable.  Private caching protects the API
+        # from stale clients even if their old React effect keeps rendering.
+        return JSONResponse(
+            content=snapshot,
+            headers={"Cache-Control": "private, max-age=300"},
+        )
+    return snapshot
 
 
 @router.get("")
