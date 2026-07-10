@@ -9,7 +9,11 @@ from typing import Any
 from core.db import AccountModel, get_session
 from core.base_platform import RegisterConfig
 from core.config_store import config_store
-from services.account_filters import account_base_query, filter_account_rows
+from services.account_filters import (
+    AccountFilterRequestMixin,
+    AccountFilterScopeChangedError,
+    resolve_filtered_accounts,
+)
 from services.account_rate_limit_recovery import reconcile_rate_limited_accounts
 from services.chatgpt_account_state import apply_chatgpt_status_policy, classify_chatgpt_capabilities, mark_payment_pending
 from services.chatgpt_core import ChatGPTPlatform
@@ -41,18 +45,9 @@ class ActionRequest(BaseModel):
     params: dict = {}
 
 
-class BatchActionRequest(BaseModel):
+class BatchActionRequest(AccountFilterRequestMixin):
     account_ids: list[int] = []
     all_filtered: bool = False
-    email: str = ""
-    status: str = ""
-    manually_used: str | None = None
-    auth_type: str = ""
-    subscription_type: str = ""
-    account_validity: str = ""
-    sub2api_state: str = ""
-    oaipay_state: str = ""
-    idea_submit_state: str = ""
     params: dict = {}
 
 
@@ -76,19 +71,6 @@ def _to_bool(value: Any, *, default: bool = False) -> bool:
     if text in {"0", "false", "no", "off"}:
         return False
     return default
-
-
-def _optional_bool(value: Any) -> bool | None:
-    if value is None:
-        return None
-    text = str(value or "").strip().lower()
-    if not text:
-        return None
-    if text in {"1", "true", "yes", "on", "used"}:
-        return True
-    if text in {"0", "false", "no", "off", "unused"}:
-        return False
-    return None
 
 
 def _resolve_resume_auth_allow_phone_verification(value: Any = None) -> bool:
@@ -644,17 +626,16 @@ def _resolve_batch_accounts(platform: str, body: BatchActionRequest, session: Se
         raise HTTPException(400, "请提供 account_ids，或指定 all_filtered=true")
 
     reconcile_rate_limited_accounts(session, platform=platform)
-    query = account_base_query(platform=platform, status=body.status, email=body.email)
-    rows = filter_account_rows(
-        session.exec(query).all(),
-        manually_used=_optional_bool(body.manually_used),
-        auth_type=body.auth_type,
-        subscription_type=body.subscription_type,
-        account_validity_filter=body.account_validity,
-        sub2api_state=body.sub2api_state,
-        oaipay_state=body.oaipay_state,
-        idea_submit_state=body.idea_submit_state,
-    )
+    try:
+        resolution = resolve_filtered_accounts(
+            session,
+            platform=platform,
+            filter_source=body,
+            verify_expected_total=True,
+        )
+    except AccountFilterScopeChangedError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+    rows = list(resolution.rows)
     if len(rows) > 1000:
         raise HTTPException(400, "单次最多处理 1000 个账号")
     return rows, []
@@ -819,8 +800,8 @@ def execute_batch_action(
 ):
     if platform != "chatgpt":
         raise HTTPException(404, "平台不存在")
-    instance = ChatGPTPlatform(config=RegisterConfig(extra=config_store.get_all()))
     accounts, missing_ids = _resolve_batch_accounts(platform, body, session)
+    instance = ChatGPTPlatform(config=RegisterConfig(extra=config_store.get_all()))
 
     if not accounts and not missing_ids:
         return {"total": 0, "success": 0, "failed": 0, "items": []}

@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
+import hashlib
+import json
 import logging
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
+from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlmodel import Session, select
 
@@ -16,7 +20,62 @@ from services.chatgpt_account_state import (
 
 AUTO_DELETE_REVIVAL_TASK_ID = "icloud_hme_auto_delete"
 ACCOUNT_LIST_STATE_DERIVATION_VERSION = "idea-submit-state-v1"
+ACCOUNT_FILTER_RESOLVER_VERSION = "account-list-state-v1"
+ACCOUNT_FILTER_FIELD_NAMES = (
+    "email",
+    "status",
+    "manually_used",
+    "auth_type",
+    "subscription_type",
+    "account_validity",
+    "sub2api_state",
+    "oaipay_state",
+    "idea_submit_state",
+)
 logger = logging.getLogger(__name__)
+
+
+class AccountFilterRequestMixin(BaseModel):
+    """Flat account-filter contract shared by task and action requests."""
+
+    email: str = ""
+    status: str = ""
+    manually_used: str | None = None
+    auth_type: str = ""
+    subscription_type: str = ""
+    account_validity: str = ""
+    sub2api_state: str = ""
+    oaipay_state: str = ""
+    idea_submit_state: str = ""
+    expected_total: int | None = Field(default=None, ge=0)
+
+
+class AccountFilterScopeChangedError(ValueError):
+    status_code = 409
+
+    def __init__(self, *, expected_total: int, matched_total: int):
+        message = (
+            f"筛选结果已变化：页面确认 {expected_total} 个账号，当前匹配 {matched_total} 个账号。"
+            "请刷新列表并重新确认任务范围。"
+        )
+        self.detail = {
+            "code": "FILTER_SCOPE_CHANGED",
+            "expected_total": int(expected_total),
+            "matched_total": int(matched_total),
+            "message": message,
+        }
+        super().__init__(message)
+
+
+@dataclass(frozen=True)
+class AccountFilterResolution:
+    rows: tuple[AccountModel, ...]
+    account_ids: tuple[int, ...]
+    normalized_filter: dict[str, Any]
+    matched_total: int
+    expected_total: int | None
+    verified: bool
+    audit: dict[str, Any]
 
 
 def _safe_str(value: Any) -> str:
@@ -94,6 +153,90 @@ def _split_idea_submit_filter_values(value: Any) -> set[str]:
     for item in _split_values(value):
         expanded.update(_IDEA_SUBMIT_STATE_FILTER_ALIASES.get(item, {item}))
     return expanded
+
+
+def normalize_optional_bool(value: Any) -> bool | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        return value
+    normalized = _lower_text(value)
+    if normalized in {"1", "true", "yes", "on", "used"}:
+        return True
+    if normalized in {"0", "false", "no", "off", "unused"}:
+        return False
+    return None
+
+
+def _filter_source_value(source: Any, field_name: str) -> Any:
+    if isinstance(source, Mapping):
+        return source.get(field_name)
+    return getattr(source, field_name, None)
+
+
+def _normalize_filter_values(value: Any, *, idea_submit: bool = False) -> str:
+    values = _split_idea_submit_filter_values(value) if idea_submit else _split_values(value)
+    return ",".join(sorted(values))
+
+
+def normalize_account_filter(source: Any) -> dict[str, Any]:
+    """Return the canonical nine-field filter represented by a flat request."""
+
+    return {
+        "email": _safe_str(_filter_source_value(source, "email")),
+        "status": _normalize_filter_values(_filter_source_value(source, "status")),
+        "manually_used": normalize_optional_bool(_filter_source_value(source, "manually_used")),
+        "auth_type": _normalize_filter_values(_filter_source_value(source, "auth_type")),
+        "subscription_type": _normalize_filter_values(_filter_source_value(source, "subscription_type")),
+        "account_validity": _normalize_filter_values(_filter_source_value(source, "account_validity")),
+        "sub2api_state": _normalize_filter_values(_filter_source_value(source, "sub2api_state")),
+        "oaipay_state": _normalize_filter_values(_filter_source_value(source, "oaipay_state")),
+        "idea_submit_state": _normalize_filter_values(
+            _filter_source_value(source, "idea_submit_state"),
+            idea_submit=True,
+        ),
+    }
+
+
+def _normalized_account_ids(account_ids: Iterable[Any]) -> list[int]:
+    normalized: set[int] = set()
+    for raw in account_ids:
+        try:
+            account_id = int(raw or 0)
+        except (TypeError, ValueError):
+            continue
+        if account_id > 0:
+            normalized.add(account_id)
+    return sorted(normalized)
+
+
+def build_account_filter_audit(
+    source: Any,
+    account_ids: Iterable[Any],
+    *,
+    matched_total: int | None = None,
+    matched_account_ids: Iterable[Any] | None = None,
+    all_filtered: bool | None = None,
+) -> dict[str, Any]:
+    frozen_ids = _normalized_account_ids(account_ids)
+    matched_ids = _normalized_account_ids(matched_account_ids) if matched_account_ids is not None else frozen_ids
+    total = len(matched_ids) if matched_total is None else max(int(matched_total), 0)
+    raw_expected_total = _filter_source_value(source, "expected_total")
+    expected_total = int(raw_expected_total) if raw_expected_total is not None else None
+    filtered = bool(_filter_source_value(source, "all_filtered")) if all_filtered is None else bool(all_filtered)
+    digest_payload = json.dumps(frozen_ids, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+    matched_digest_payload = json.dumps(matched_ids, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+    return {
+        "filter": normalize_account_filter(source),
+        "expected_total": expected_total,
+        "matched_total": total,
+        "verified": bool(filtered and expected_total is not None and expected_total == total),
+        "account_ids_sha256": hashlib.sha256(digest_payload).hexdigest(),
+        "account_ids_count": len(frozen_ids),
+        "matched_account_ids_sha256": hashlib.sha256(matched_digest_payload).hexdigest(),
+        "matched_account_ids_count": len(matched_ids),
+        "resolver_version": ACCOUNT_FILTER_RESOLVER_VERSION,
+    }
 
 
 def account_base_query(*, platform: str | None = None, status: Any = None, email: str | None = None):
@@ -1126,6 +1269,100 @@ def apply_account_list_state_filters(
         query = query.where(AccountListStateModel.revival_state.in_(sorted(revival_states)))
 
     return query
+
+
+def account_filtered_query(
+    session: Session,
+    *,
+    platform: str | None,
+    filter_source: Any,
+    refresh_state: bool = True,
+) -> tuple[Any, bool, dict[str, Any]]:
+    """Build the canonical account-list query used by list and batch scopes."""
+
+    normalized = normalize_account_filter(filter_source)
+    revival_state = _normalize_filter_values(_filter_source_value(filter_source, "revival_state"))
+    sort_by = _filter_source_value(filter_source, "sort_by")
+    sort_order = _filter_source_value(filter_source, "sort_order")
+    use_list_state = should_use_account_list_state(
+        manually_used=normalized["manually_used"],
+        auth_type=normalized["auth_type"],
+        subscription_type=normalized["subscription_type"],
+        account_validity_filter=normalized["account_validity"],
+        sub2api_state=normalized["sub2api_state"],
+        oaipay_state=normalized["oaipay_state"],
+        idea_submit_state=normalized["idea_submit_state"],
+        revival_state=revival_state,
+        sort_by=sort_by,
+        sort_order=sort_order,
+    )
+    if use_list_state and refresh_state:
+        refresh_stale_account_list_state(session, platform=platform)
+
+    query = account_base_query(
+        platform=platform,
+        status=normalized["status"],
+        email=normalized["email"],
+    )
+    if not use_list_state:
+        return query, False, normalized
+
+    query = query.join(
+        AccountListStateModel,
+        AccountListStateModel.account_id == AccountModel.id,
+    )
+    query = apply_account_list_state_filters(
+        query,
+        manually_used=normalized["manually_used"],
+        auth_type=normalized["auth_type"],
+        subscription_type=normalized["subscription_type"],
+        account_validity_filter=normalized["account_validity"],
+        sub2api_state=normalized["sub2api_state"],
+        oaipay_state=normalized["oaipay_state"],
+        idea_submit_state=normalized["idea_submit_state"],
+        revival_state=revival_state,
+    )
+    return query, True, normalized
+
+
+def resolve_filtered_accounts(
+    session: Session,
+    *,
+    platform: str,
+    filter_source: Any,
+    verify_expected_total: bool = False,
+) -> AccountFilterResolution:
+    query, _, normalized = account_filtered_query(
+        session,
+        platform=platform,
+        filter_source=filter_source,
+    )
+    rows = tuple(session.exec(query.order_by(AccountModel.id.asc())).all())
+    account_ids = tuple(int(row.id or 0) for row in rows if int(row.id or 0) > 0)
+    matched_total = len(account_ids)
+    raw_expected_total = _filter_source_value(filter_source, "expected_total")
+    expected_total = int(raw_expected_total) if raw_expected_total is not None else None
+    if verify_expected_total and expected_total is not None and expected_total != matched_total:
+        raise AccountFilterScopeChangedError(
+            expected_total=expected_total,
+            matched_total=matched_total,
+        )
+
+    audit = build_account_filter_audit(
+        filter_source,
+        account_ids,
+        matched_total=matched_total,
+        all_filtered=verify_expected_total,
+    )
+    return AccountFilterResolution(
+        rows=rows,
+        account_ids=account_ids,
+        normalized_filter=normalized,
+        matched_total=matched_total,
+        expected_total=expected_total,
+        verified=bool(audit["verified"]),
+        audit=audit,
+    )
 
 
 def apply_account_list_state_sort(

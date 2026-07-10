@@ -275,6 +275,69 @@ type BaxiGptCdkPoolItem = {
 
 type SubscriptionExpirySortOrder = '' | 'asc' | 'desc'
 
+type AccountFilterRequestBody = {
+  email: string
+  status: string
+  manually_used: string
+  auth_type: string
+  subscription_type: string
+  account_validity: string
+  sub2api_state: string
+  oaipay_state: string
+  idea_submit_state: string
+}
+
+type AccountTaskScope = 'selected' | 'filtered'
+type FilteredScopeMarker = 'all_filtered' | 'pending_only'
+
+const ACCOUNT_FILTER_REQUEST_KEYS: Array<keyof AccountFilterRequestBody> = [
+  'email',
+  'status',
+  'manually_used',
+  'auth_type',
+  'subscription_type',
+  'account_validity',
+  'sub2api_state',
+  'oaipay_state',
+  'idea_submit_state',
+]
+
+function normalizeAccountIds(values: Iterable<unknown>): number[] {
+  const result: number[] = []
+  const seen = new Set<number>()
+  for (const value of values) {
+    const accountId = Number(value)
+    if (!Number.isInteger(accountId) || accountId <= 0 || seen.has(accountId)) continue
+    seen.add(accountId)
+    result.push(accountId)
+  }
+  return result
+}
+
+function getFilterScopeChangedMessage(error: unknown): string {
+  const errorRecord = error !== null && typeof error === 'object'
+    ? error as Record<string, unknown>
+    : null
+  const detail = errorRecord?.detail
+  const detailRecord = detail !== null && typeof detail === 'object' && !Array.isArray(detail)
+    ? detail as Record<string, unknown>
+    : null
+  const code = String(errorRecord?.code || detailRecord?.code || '').trim()
+  if (Number(errorRecord?.status || 0) !== 409 || code !== 'FILTER_SCOPE_CHANGED') return ''
+
+  const backendMessage = String(detailRecord?.message || errorRecord?.message || '').trim()
+  if (backendMessage) {
+    return `${backendMessage.replace(/[\s。；;,，.]+$/, '')}。账号列表已刷新，请确认后重新提交。`
+  }
+
+  const expectedTotal = Number(detailRecord?.expected_total)
+  const matchedTotal = Number(detailRecord?.matched_total)
+  const countText = Number.isFinite(expectedTotal) && Number.isFinite(matchedTotal)
+    ? `（页面 ${expectedTotal} 个，当前匹配 ${matchedTotal} 个）`
+    : ''
+  return `当前筛选范围已变化${countText}。账号列表已刷新，请确认后重新提交。`
+}
+
 type AccountColumnKey =
   | 'manually_used'
   | 'phone_binding'
@@ -2017,37 +2080,6 @@ function sub2apiStateMeta(sync: any) {
   return { color: 'default', label: '未同步' }
 }
 
-function summarizeSub2ApiStates(items: any[]) {
-  const summary = { exists: 0, notFound: 0, crossWorkspace: 0, deletedExact: 0, ambiguous: 0, unreachable: 0, unknown: 0, pending: 0 }
-  for (const item of items || []) {
-    const sync = item?.sub2apiSync || {}
-    const remoteState = String(sync?.remote_state || '').trim().toLowerCase()
-    if (!sync || Object.keys(sync).length === 0) {
-      summary.unknown += 1
-      summary.pending += 1
-    } else if (remoteState === 'exists') {
-      summary.exists += 1
-    } else if (remoteState === 'not_found') {
-      summary.notFound += 1
-      summary.pending += 1
-    } else if (remoteState === 'cross_workspace_only') {
-      summary.crossWorkspace += 1
-      summary.pending += 1
-    } else if (remoteState === 'deleted_exact_match') {
-      summary.deletedExact += 1
-      summary.pending += 1
-    } else if (remoteState === 'ambiguous') {
-      summary.ambiguous += 1
-    } else if (remoteState === 'unreachable') {
-      summary.unreachable += 1
-    } else {
-      summary.unknown += 1
-      summary.pending += 1
-    }
-  }
-  return summary
-}
-
 function shouldShowResumeAuthButton(record: any) {
   const capabilities = record?.chatgptCapabilities || {}
   const authLevel = String(record?.auth_level || capabilities.auth_level || '').trim().toLowerCase()
@@ -2295,6 +2327,37 @@ export default function Accounts() {
     page: currentPage,
     pageSize: accountsPageSize,
   })
+  const currentAccountFilterBody = useMemo<AccountFilterRequestBody>(() => ({
+    email: debouncedSearch.trim(),
+    status: filterStatus,
+    manually_used: columnFilters.manuallyUsed.join(','),
+    auth_type: columnFilters.authType.join(','),
+    subscription_type: columnFilters.subscriptionType.join(','),
+    account_validity: columnFilters.accountValidity.join(','),
+    sub2api_state: columnFilters.sub2apiState.join(','),
+    oaipay_state: columnFilters.oaipayState.join(','),
+    idea_submit_state: columnFilters.ideaSubmitState.join(','),
+  }), [
+    debouncedSearch,
+    filterStatus,
+    columnFilters.manuallyUsed,
+    columnFilters.authType,
+    columnFilters.subscriptionType,
+    columnFilters.accountValidity,
+    columnFilters.sub2apiState,
+    columnFilters.oaipayState,
+    columnFilters.ideaSubmitState,
+  ])
+  const currentFilteredTotalValue = Number(accountsQuery.data?.total ?? 0)
+  const currentFilteredTotal = Number.isFinite(currentFilteredTotalValue)
+    ? Math.max(0, currentFilteredTotalValue)
+    : 0
+  const currentFilterScopeReady = Boolean(accountsQuery.data)
+    && !accountsQuery.isFetching
+    && !accountsQuery.isPlaceholderData
+    && !accountsQuery.isError
+    && search.trim() === debouncedSearch
+  const refetchAccounts = accountsQuery.refetch
   const accountDetailQuery = useAccountDetailQuery(detailAccount?.id ? Number(detailAccount.id) : null, detailModalOpen)
   const activeTasksQuery = useActiveTasksQuery(activeTasksPanelOpen)
   const pendingInvitesQuery = usePendingInvitesQuery(businessDeferredModalOpen && currentPlatform === 'chatgpt')
@@ -2557,21 +2620,63 @@ export default function Accounts() {
     }
   }, [baxiCdkQuotaRefreshing, loadBaxiCdkPoolItems, loadBaxiCdkPoolSummary])
 
-  const applyCurrentFiltersToBody = (body: Record<string, unknown>) => {
-    if (search) body.email = search
-    if (filterStatus) body.status = filterStatus
-    if (columnFilters.manuallyUsed.length) body.manually_used = columnFilters.manuallyUsed.join(',')
-    if (columnFilters.authType.length) body.auth_type = columnFilters.authType.join(',')
-    if (columnFilters.subscriptionType.length) body.subscription_type = columnFilters.subscriptionType.join(',')
-    if (columnFilters.accountValidity.length) body.account_validity = columnFilters.accountValidity.join(',')
-    if (columnFilters.sub2apiState.length) body.sub2api_state = columnFilters.sub2apiState.join(',')
-    if (columnFilters.oaipayState.length) body.oaipay_state = columnFilters.oaipayState.join(',')
-    if (columnFilters.ideaSubmitState.length) body.idea_submit_state = columnFilters.ideaSubmitState.join(',')
-  }
+  const applyAccountTaskScopeToBody = useCallback((
+    body: Record<string, unknown>,
+    options: {
+      scope: AccountTaskScope
+      selectedIds?: Iterable<unknown>
+      emptySelectedMessage?: string
+      filteredMarker?: FilteredScopeMarker
+    },
+  ): number | null => {
+    for (const key of ACCOUNT_FILTER_REQUEST_KEYS) delete body[key]
+    delete body.account_ids
+    delete body.all_filtered
+    delete body.pending_only
+    delete body.expected_total
+
+    if (options.scope === 'selected') {
+      const accountIds = normalizeAccountIds(options.selectedIds ?? selectedRowKeys)
+      if (accountIds.length === 0) {
+        message.warning(options.emptySelectedMessage || '请先选择要处理的账号')
+        return null
+      }
+      body.account_ids = accountIds
+      return accountIds.length
+    }
+
+    if (!currentFilterScopeReady) {
+      message.warning('账号列表正在更新，请等待当前筛选数量刷新后再启动任务')
+      return null
+    }
+
+    Object.assign(body, currentAccountFilterBody)
+    body[options.filteredMarker || 'all_filtered'] = true
+    body.expected_total = currentFilteredTotal
+    return currentFilteredTotal
+  }, [currentAccountFilterBody, currentFilterScopeReady, currentFilteredTotal, selectedRowKeys])
+
+  const postAccountScopeRequest = useCallback(async (
+    path: string,
+    body: Record<string, unknown>,
+    toastKey: string,
+  ) => {
+    try {
+      return await apiFetch(path, {
+        method: 'POST',
+        body: JSON.stringify(body),
+      })
+    } catch (error) {
+      const scopeChangedMessage = getFilterScopeChangedMessage(error)
+      if (!scopeChangedMessage) throw error
+      message.error({ content: scopeChangedMessage, key: toastKey, duration: 6 })
+      void refetchAccounts()
+      return null
+    }
+  }, [refetchAccounts])
 
   const buildPaypalFilteredEligibleParams = useCallback(() => {
-    const body: Record<string, unknown> = {}
-    applyCurrentFiltersToBody(body)
+    const body: Record<string, unknown> = { ...currentAccountFilterBody }
     applyPaypalBindingEligibilityFilters(body)
     const params = new URLSearchParams({
       platform: 'chatgpt',
@@ -2589,17 +2694,7 @@ export default function Accounts() {
     if (body.oaipay_state) params.set('oaipay_state', String(body.oaipay_state))
     if (body.idea_submit_state) params.set('idea_submit_state', String(body.idea_submit_state))
     return params
-  }, [
-    search,
-    filterStatus,
-    columnFilters.manuallyUsed,
-    columnFilters.authType,
-    columnFilters.subscriptionType,
-    columnFilters.accountValidity,
-    columnFilters.sub2apiState,
-    columnFilters.oaipayState,
-    columnFilters.ideaSubmitState,
-  ])
+  }, [currentAccountFilterBody])
 
   useEffect(() => {
     if (!phoneBindingTestOpen) return
@@ -3668,28 +3763,17 @@ export default function Accounts() {
     const scopeLabel = scope === 'selected' ? '所选账号' : '当前筛选账号'
     const toastKey = `k12-recapture:${scope}`
 
-    if (scope === 'selected') {
-      const accountIds = Array.from(selectedRowKeys)
-        .map((value) => Number(value))
-        .filter((value) => Number.isInteger(value) && value > 0)
-      if (accountIds.length === 0) {
-        message.warning('请先选择要重新进入/导出 K12 的账号，或切换为当前筛选范围')
-        return
-      }
-      body.account_ids = accountIds
-    } else {
-      body.all_filtered = true
-      applyCurrentFiltersToBody(body)
-    }
+    if (applyAccountTaskScopeToBody(body, {
+      scope,
+      emptySelectedMessage: '请先选择要重新进入/导出 K12 的账号，或切换为当前筛选范围',
+    }) === null) return
 
     setBatchK12RecaptureLoading(true)
-    setBatchK12RecaptureOpen(false)
     message.loading({ content: `${scopeLabel} K12 / Workspace 重跑任务创建中...`, key: toastKey, duration: 0 })
     try {
-      const result = await apiFetch('/tasks/chatgpt/k12-workspace-recapture/batch', {
-        method: 'POST',
-        body: JSON.stringify(body),
-      })
+      const result = await postAccountScopeRequest('/tasks/chatgpt/k12-workspace-recapture/batch', body, toastKey)
+      if (!result) return
+      setBatchK12RecaptureOpen(false)
       const eligible = Number(result?.eligible || 0)
       const skipped = Number(result?.skipped || 0)
       const missing = Number(result?.missing || 0)
@@ -3730,11 +3814,6 @@ export default function Accounts() {
 
   const getResumeAuthScope = (): 'selected' | 'filtered' => (selectedRowKeys.length > 0 ? 'selected' : 'filtered')
 
-  const getResumeAuthSelectedIds = () =>
-    Array.from(selectedRowKeys)
-      .map((value) => Number(value))
-      .filter((value) => Number.isInteger(value) && value > 0)
-
   const buildResumeAuthMenuLabel = (useTemporaryConfig = false) => {
     const scope = getResumeAuthScope()
     const base = scope === 'selected'
@@ -3749,29 +3828,18 @@ export default function Accounts() {
     if (typeof allowPhoneVerification === 'boolean') {
       body.allow_phone_verification = allowPhoneVerification
     }
-    let requestedCount = total
-
-    if (scope === 'selected') {
-      const accountIds = getResumeAuthSelectedIds()
-      if (accountIds.length === 0) {
-        message.warning('请先选择要补抓的账号')
-        return
-      }
-      requestedCount = accountIds.length
-      body.account_ids = accountIds
-    } else {
-      body.all_filtered = true
-      applyCurrentFiltersToBody(body)
-    }
+    const requestedCount = applyAccountTaskScopeToBody(body, {
+      scope,
+      emptySelectedMessage: '请先选择要补抓的账号',
+    })
+    if (requestedCount === null) return
 
     const loadingKey = `${scope}${allowPhoneVerification ? '_phone' : ''}` as 'selected' | 'filtered' | 'selected_phone' | 'filtered_phone'
     setBatchResumeAuthLoading(loadingKey)
     message.loading({ content: '批量补抓Auth任务创建中...', key: toastKey, duration: 0 })
     try {
-      const res = await apiFetch('/tasks/chatgpt/resume-subscription-auth/batch', {
-        method: 'POST',
-        body: JSON.stringify(body),
-      })
+      const res = await postAccountScopeRequest('/tasks/chatgpt/resume-subscription-auth/batch', body, toastKey)
+      if (!res) return
 
       const eligible = Number(res?.eligible || 0)
       const skipped = Number(res?.skipped || 0)
@@ -3843,31 +3911,18 @@ export default function Accounts() {
       },
     }
     const actionLabel = forceRefresh ? '强制重新生成订阅链接' : '批量订阅链接'
-    let requestedCount = total
-
-    if (scope === 'selected') {
-      const accountIds = Array.from(selectedRowKeys)
-        .map((value) => Number(value))
-        .filter((value) => Number.isInteger(value) && value > 0)
-      if (accountIds.length === 0) {
-        message.warning(`请先选择要${forceRefresh ? '强制重新生成' : '生成'}订阅链接的账号`)
-        return
-      }
-      requestedCount = accountIds.length
-      body.account_ids = accountIds
-    } else {
-      body.all_filtered = true
-      applyCurrentFiltersToBody(body)
-    }
+    const requestedCount = applyAccountTaskScopeToBody(body, {
+      scope,
+      emptySelectedMessage: `请先选择要${forceRefresh ? '强制重新生成' : '生成'}订阅链接的账号`,
+    })
+    if (requestedCount === null) return
 
     setBatchPaymentLinkLoading(true)
-    setBatchPaymentLinkConfigOpen(false)
     message.loading({ content: `${actionLabel}任务创建中...`, key: toastKey, duration: 0 })
     try {
-      const res = await apiFetch('/tasks/chatgpt/payment-links/batch', {
-        method: 'POST',
-        body: JSON.stringify(body),
-      })
+      const res = await postAccountScopeRequest('/tasks/chatgpt/payment-links/batch', body, toastKey)
+      if (!res) return
+      setBatchPaymentLinkConfigOpen(false)
 
       const eligible = Number(res?.eligible || 0)
       const skipped = Number(res?.skipped || 0)
@@ -3937,30 +3992,17 @@ export default function Accounts() {
     const scope: 'selected' | 'filtered' = selectedRowKeys.length > 0 ? 'selected' : 'filtered'
     const toastKey = `invalid-recheck:${scope}`
     const body: Record<string, unknown> = {}
-    let requestedCount = total
-
-    if (scope === 'selected') {
-      const accountIds = Array.from(selectedRowKeys)
-        .map((value) => Number(value))
-        .filter((value) => Number.isInteger(value) && value > 0)
-      if (accountIds.length === 0) {
-        message.warning('请先选择要测活的失效账号')
-        return
-      }
-      requestedCount = accountIds.length
-      body.account_ids = accountIds
-    } else {
-      body.all_filtered = true
-      applyCurrentFiltersToBody(body)
-    }
+    const requestedCount = applyAccountTaskScopeToBody(body, {
+      scope,
+      emptySelectedMessage: '请先选择要测活的失效账号',
+    })
+    if (requestedCount === null) return
 
     setBatchInvalidRecheckLoading(true)
     message.loading({ content: '批量失效测活任务创建中...', key: toastKey, duration: 0 })
     try {
-      const res = await apiFetch('/tasks/chatgpt/invalid-recheck/batch', {
-        method: 'POST',
-        body: JSON.stringify(body),
-      })
+      const res = await postAccountScopeRequest('/tasks/chatgpt/invalid-recheck/batch', body, toastKey)
+      if (!res) return
 
       const eligible = Number(res?.eligible || 0)
       const skipped = Number(res?.skipped || 0)
@@ -4074,28 +4116,18 @@ export default function Accounts() {
       reuse_phone_until_unusable: reusePhoneUntilUnusable,
       ...buildTaskProxyPayload(values),
     }
-    let requestedAccounts = total
-    if (scope === 'selected') {
-      const accountIds = getResumeAuthSelectedIds()
-      if (accountIds.length === 0) {
-        message.warning('请先选择用于手机号绑定的账号，或切换为当前筛选范围')
-        return
-      }
-      requestedAccounts = accountIds.length
-      body.account_ids = accountIds
-    } else {
-      body.all_filtered = true
-      applyCurrentFiltersToBody(body)
-    }
+    const requestedAccounts = applyAccountTaskScopeToBody(body, {
+      scope,
+      emptySelectedMessage: '请先选择用于手机号绑定的账号，或切换为当前筛选范围',
+    })
+    if (requestedAccounts === null) return
 
     const toastKey = `phone-binding-test:${scope}`
     setPhoneBindingTestLoading(true)
     message.loading({ content: '手机号绑定任务创建中...', key: toastKey, duration: 0 })
     try {
-      const res = await apiFetch('/tasks/chatgpt/phone-binding-test', {
-        method: 'POST',
-        body: JSON.stringify(body),
-      })
+      const res = await postAccountScopeRequest('/tasks/chatgpt/phone-binding-test', body, toastKey)
+      if (!res) return
       const taskIdFromResponse = String(res?.task_id || '').trim()
       const eligible = Number(res?.eligible_accounts || 0)
       const phoneCount = Number(res?.phone_count || 0)
@@ -4226,28 +4258,18 @@ export default function Accounts() {
       target_success_count: Math.max(Number(values.target_success_count || 0), 0),
     }
     if (usePool && selectedCdkIds.length > 0) body.cdk_ids = selectedCdkIds
-    let requestedAccounts = total
-    if (scope === 'selected') {
-      const accountIds = getResumeAuthSelectedIds()
-      if (accountIds.length === 0) {
-        message.warning('请先选择用于 idea批量提交的账号，或切换为当前筛选范围')
-        return
-      }
-      requestedAccounts = accountIds.length
-      body.account_ids = accountIds
-    } else {
-      body.all_filtered = true
-      applyCurrentFiltersToBody(body)
-    }
+    const requestedAccounts = applyAccountTaskScopeToBody(body, {
+      scope,
+      emptySelectedMessage: '请先选择用于 idea批量提交的账号，或切换为当前筛选范围',
+    })
+    if (requestedAccounts === null) return
 
     const toastKey = `baxigpt-cdk-submit:${scope}`
     setBaxiCdkSubmitLoading(true)
     message.loading({ content: 'idea批量提交任务创建中...', key: toastKey, duration: 0 })
     try {
-      const res = await apiFetch('/tasks/chatgpt/baxigpt-cdk-submit', {
-        method: 'POST',
-        body: JSON.stringify(body),
-      })
+      const res = await postAccountScopeRequest('/tasks/chatgpt/baxigpt-cdk-submit', body, toastKey)
+      if (!res) return
       const taskIdFromResponse = String(res?.task_id || '').trim()
       const pairCount = Number(res?.pair_count || 0)
       const eligible = Number(res?.eligible_accounts || 0)
@@ -4338,27 +4360,18 @@ export default function Accounts() {
       account_interval_seconds: Number(values.account_interval_seconds || 0),
       failure_continue: values.failure_continue !== false,
     }
-    if (scope === 'selected') {
-      const accountIds = getPaypalBindingSelectedIds()
-      if (accountIds.length === 0) {
-        message.warning('当前选中账号里没有未订阅且有效的账号，请重新选择或切换为当前筛选范围')
-        return
-      }
-      body.account_ids = accountIds
-    } else {
-      body.all_filtered = true
-      applyCurrentFiltersToBody(body)
-      applyPaypalBindingEligibilityFilters(body)
-    }
+    if (applyAccountTaskScopeToBody(body, {
+      scope,
+      selectedIds: scope === 'selected' ? getPaypalBindingSelectedIds() : undefined,
+      emptySelectedMessage: '当前选中账号里没有未订阅且有效的账号，请重新选择或切换为当前筛选范围',
+    }) === null) return
 
     const toastKey = `paypal-binding:${scope}`
     setPaypalBindingLoading(true)
     message.loading({ content: 'PayPal绑定任务创建中...', key: toastKey, duration: 0 })
     try {
-      const res = await apiFetch('/tasks/chatgpt/paypal-bind', {
-        method: 'POST',
-        body: JSON.stringify(body),
-      })
+      const res = await postAccountScopeRequest('/tasks/chatgpt/paypal-bind', body, toastKey)
+      if (!res) return
       const taskIdFromResponse = String(res?.task_id || '').trim()
       const eligible = Number(res?.eligible_accounts || 0)
       const skipped = Array.isArray(res?.skipped_accounts) ? res.skipped_accounts.length : 0
@@ -5258,34 +5271,18 @@ export default function Accounts() {
           }
         }
 
-        if (mode === 'selected') {
-          const accountIds = Array.from(selectedRowKeys)
-            .map((value) => Number(value))
-            .filter((value) => Number.isInteger(value) && value > 0)
-
-          if (accountIds.length === 0) {
-            message.warning('请先选择要上传的账号')
-            return
-          }
-          body.account_ids = accountIds
-        } else {
-          body.all_filtered = true
-          applyCurrentFiltersToBody(body)
-
-          if (isSub2Api) {
-            const pendingSub2ApiStates = ['unknown', 'not_found', 'cross_workspace_only', 'deleted_exact_match']
-            body.sub2api_state = pendingSub2ApiStates.join(',')
-          } else {
-            const pendingOaipayStates = ['unknown', 'not_found', 'cross_workspace_only', 'deleted_exact_match']
-            body.oaipay_state = pendingOaipayStates.join(',')
-          }
+        if (applyAccountTaskScopeToBody(body, {
+          scope: mode === 'selected' ? 'selected' : 'filtered',
+          emptySelectedMessage: '请先选择要上传的账号',
+        }) === null) {
+          message.destroy(toastKey)
+          return
         }
 
         const endpoint = isSub2Api ? '/tasks/chatgpt/sub2api-upload/batch' : '/tasks/chatgpt/oaipay-upload/batch'
-        const taskResult = await apiFetch(endpoint, {
-          method: 'POST',
-          body: JSON.stringify(body),
-        })
+        const taskResult = await postAccountScopeRequest(endpoint, body, toastKey)
+        if (!taskResult) return
+        if (!isSub2Api) setOaipayUploadModalOpen(false)
         const startedTaskId = String(taskResult?.task_id || '').trim()
         if (!startedTaskId) {
           message.info({ content: '没有可处理的账号', key: toastKey })
@@ -5322,25 +5319,17 @@ export default function Accounts() {
           body.category_id = oaipayOptions.categoryId
         }
 
-        if (mode === 'selected') {
-          const accountIds = Array.from(selectedRowKeys)
-            .map((value) => Number(value))
-            .filter((value) => Number.isInteger(value) && value > 0)
-
-          if (accountIds.length === 0) {
-            message.warning('请先选择要上传的账号')
-            return
-          }
-          body.account_ids = accountIds
-        } else {
-          body.pending_only = true
-          applyCurrentFiltersToBody(body)
+        if (applyAccountTaskScopeToBody(body, {
+          scope: mode === 'selected' ? 'selected' : 'filtered',
+          emptySelectedMessage: '请先选择要上传的账号',
+          filteredMarker: 'pending_only',
+        }) === null) {
+          message.destroy(toastKey)
+          return
         }
 
-        result = await apiFetch('/integrations/backfill', {
-          method: 'POST',
-          body: JSON.stringify(body),
-        })
+        result = await postAccountScopeRequest('/integrations/backfill', body, toastKey)
+        if (!result) return
       }
 
       const total = Number(result?.total || 0)
@@ -5407,29 +5396,17 @@ export default function Accounts() {
       params: customParams || {},
     }
 
-    if (scope === 'selected') {
-      const accountIds = Array.from(selectedRowKeys)
-        .map((value) => Number(value))
-        .filter((value) => Number.isInteger(value) && value > 0)
-
-      if (accountIds.length === 0) {
-        message.warning('请先选择要同步的账号')
-        return
-      }
-      body.account_ids = accountIds
-    } else {
-      body.all_filtered = true
-      applyCurrentFiltersToBody(body)
-    }
+    if (applyAccountTaskScopeToBody(body, {
+      scope: scope === 'selected' ? 'selected' : 'filtered',
+      emptySelectedMessage: '请先选择要同步的账号',
+    }) === null) return
 
     setStatusSyncLoading(loadingKey)
     message.loading({ content: `${scopeLabel}${actionLabel}进行中...`, key: toastKey, duration: 0 })
     try {
       if (kind === 'probe') {
-        const res = await apiFetch('/tasks/chatgpt/probe-local-status/batch', {
-          method: 'POST',
-          body: JSON.stringify(body),
-        })
+        const res = await postAccountScopeRequest('/tasks/chatgpt/probe-local-status/batch', body, toastKey)
+        if (!res) return
         const eligible = Number(res?.eligible || 0)
         const skipped = Number(res?.skipped || 0)
         const missing = Number(res?.missing || 0)
@@ -5463,10 +5440,8 @@ export default function Accounts() {
         return
       }
 
-      const result = await apiFetch(`/actions/${currentPlatform}/${actionId}/batch`, {
-        method: 'POST',
-        body: JSON.stringify(body),
-      })
+      const result = await postAccountScopeRequest(`/actions/${currentPlatform}/${actionId}/batch`, body, toastKey)
+      if (!result) return
 
       if (!result.total) {
         message.info({ content: '没有可处理的账号', key: toastKey })
@@ -5491,31 +5466,13 @@ export default function Accounts() {
 
   const getBackfillScope = (): 'selected' | 'pending' => (selectedRowKeys.length > 0 ? 'selected' : 'pending')
 
-  const getPendingBackfillCount = (destination: 'cliproxyapi' | 'sub2api' | 'oaipay') => {
-    if (destination === 'sub2api') {
-      return summarizeSub2ApiStates(accounts).pending
-    }
-    if (destination === 'oaipay') {
-      return accounts.filter((item: any) => {
-        const sync = item?.oaipaySync || {}
-        if (!sync || Object.keys(sync).length === 0) return true
-        return String(sync?.remote_state || '').trim().toLowerCase() === 'not_found'
-      }).length
-    }
-    return accounts.filter((item: any) => {
-      const sync = item?.cliproxySync || {}
-      if (!sync || Object.keys(sync).length === 0) return true
-      return String(sync?.remote_state || '').trim().toLowerCase() === 'not_found'
-    }).length
-  }
-
   const buildBackfillLabel = (destination: 'cliproxyapi' | 'sub2api' | 'oaipay') => {
     const scope = getBackfillScope()
-    const count = scope === 'selected' ? selectedRowKeys.length : getPendingBackfillCount(destination)
+    const count = scope === 'selected' ? selectedRowKeys.length : total
     const destinationLabel = destination === 'oaipay' ? 'OAIPay' : destination === 'sub2api' ? 'Sub2API' : 'CLIProxyAPI'
     return scope === 'selected'
       ? `补传所选到 ${destinationLabel} (${count})`
-      : `补传 ${destinationLabel} 待补传 (${count})`
+      : `补传 ${destinationLabel} 待补传（筛选 ${count}）`
   }
 
   const isBackfillActionLoading = (destination: 'cliproxyapi' | 'sub2api' | 'oaipay', scope: 'selected' | 'pending') => backfillLoading === `${destination}_${scope}`
@@ -7073,7 +7030,7 @@ export default function Accounts() {
   const backfillScope = getBackfillScope()
   const cliproxyapiBackfillDisabled = backfillScope === 'selected'
     ? selectedRowKeys.length === 0
-    : getPendingBackfillCount('cliproxyapi') === 0
+    : total === 0
   const sub2apiBackfillDisabled = backfillScope === 'selected' ? selectedRowKeys.length === 0 : total === 0
   const oaipayBackfillDisabled = backfillScope === 'selected' ? selectedRowKeys.length === 0 : total === 0
   const backfillMenuItems: MenuProps['items'] = [
@@ -8722,7 +8679,7 @@ export default function Accounts() {
             message={
               paypalBindingScope === 'selected'
                 ? `范围：当前选中 ${selectedRowKeys.length} 个账号，可提交 ${getPaypalBindingSelectedIds().length} 个`
-                : `范围：当前筛选可提交 ${paypalFilteredEligibleCountLabel} 个账号`
+                : `范围：当前筛选 ${total} 个账号，可提交 ${paypalFilteredEligibleCountLabel} 个`
             }
             description="PayPal绑定只会提交账号有效且订阅状态明确为 Free 的账号；已订阅、失效、订阅未知的账号不会提交给外部 plus.iceaix.com。外部返回 otp_needed 时，本地任务面板会等待你输入 PayPal 短信 OTP。"
           />
@@ -8737,7 +8694,7 @@ export default function Accounts() {
                   label: `当前选中账号（${selectedRowKeys.length}，可提交 ${getPaypalBindingSelectedIds().length}）`,
                   disabled: selectedRowKeys.length === 0,
                 },
-                { value: 'filtered', label: `当前筛选账号（可提交 ${paypalFilteredEligibleCountLabel}）` },
+                { value: 'filtered', label: `当前筛选账号（${total}，可提交 ${paypalFilteredEligibleCountLabel}）` },
               ]}
             />
           </Form.Item>
@@ -9241,7 +9198,6 @@ export default function Accounts() {
             message.warning('固定分类模式下请选择 OAIPay 分类')
             return
           }
-          setOaipayUploadModalOpen(false)
           void handleBackfill('oaipay', oaipayUploadScope, {
             categoryMode: oaipayCategoryMode,
             categoryId: oaipayCategoryMode === 'manual' ? oaipaySelectedCategory : undefined,

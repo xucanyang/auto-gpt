@@ -13,7 +13,6 @@ from typing import Any, Tuple
 from curl_cffi import requests as cffi_requests
 
 from services.chatgpt_core.cpa_upload import generate_token_json
-from services.chatgpt_core.status_probe import probe_local_chatgpt_status
 
 logger = logging.getLogger(__name__)
 
@@ -92,7 +91,16 @@ def _extract_organization_id(id_token_payload: dict[str, Any]) -> str:
 
 
 def _get_account_extra(account) -> dict[str, Any]:
+    if hasattr(account, "get_extra"):
+        try:
+            extra = account.get_extra()
+            if isinstance(extra, dict):
+                return extra
+        except Exception:
+            pass
     extra = getattr(account, "extra", {}) or {}
+    if callable(extra):
+        extra = extra()
     return extra if isinstance(extra, dict) else {}
 
 
@@ -291,20 +299,22 @@ def build_sub2api_lookup_payload(account) -> dict[str, Any]:
 def build_sub2api_account_payload(account, group_ids: list[int] | None = None) -> dict[str, Any]:
     payload = build_sub2api_lookup_payload(account)
     credentials = payload.get("credentials") if isinstance(payload.get("credentials"), dict) else {}
-
-    # 上传前做一次本地套餐探测，尽量把 plan_type / subscription_expires_at 一起带到 Sub2API。
-    try:
-        probe = probe_local_chatgpt_status(account)
-        subscription = probe.get("subscription") if isinstance(probe.get("subscription"), dict) else {}
-        plan_type = str(subscription.get("plan") or "").strip().lower()
-        if plan_type and plan_type != "unknown":
-            credentials["plan_type"] = plan_type
-        subscription_active_until = str(subscription.get("subscription_active_until") or "").strip()
-        if subscription_active_until:
-            credentials["subscription_expires_at"] = subscription_active_until
-    except Exception as exc:
-        logger.warning("Sub2API 上传前套餐探测失败: %s", exc)
-
+    extra = _get_account_extra(account)
+    subscription = _subscription_from_extra(extra)
+    plan_type = _first_text(
+        subscription.get("plan") if str(subscription.get("plan") or "").strip().lower() != "unknown" else "",
+        extra.get("plan_type"),
+        extra.get("chatgpt_plan_type"),
+    ).lower()
+    subscription_expires_at = _first_text(
+        subscription.get("subscription_active_until"),
+        extra.get("subscription_expires_at"),
+        extra.get("chatgpt_subscription_active_until"),
+    )
+    if plan_type:
+        credentials["plan_type"] = plan_type
+    if subscription_expires_at:
+        credentials["subscription_expires_at"] = subscription_expires_at
     payload["credentials"] = credentials
     payload["group_ids"] = _parse_group_ids(group_ids)
     return payload

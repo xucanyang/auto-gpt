@@ -19,7 +19,11 @@ from sqlmodel import Session, select
 from core.base_platform import Account, AccountStatus
 from core.config_store import config_store
 from core.db import AccountModel, engine
-from services.account_filters import filter_account_rows
+from services.account_filters import (
+    AccountFilterRequestMixin,
+    AccountFilterScopeChangedError,
+    resolve_filtered_accounts,
+)
 from services.account_rate_limit_recovery import reconcile_rate_limited_accounts
 from services.external_apps import install, list_status, start, start_all, stop, stop_all
 from services.chatgpt_sync import backfill_chatgpt_account_to_cpa, get_cliproxy_sync_state
@@ -35,36 +39,14 @@ from services.chatgpt_core.gopay_phone import (
 router = APIRouter(prefix="/integrations", tags=["integrations"])
 
 
-class BackfillRequest(BaseModel):
+class BackfillRequest(AccountFilterRequestMixin):
     platforms: list[str] = Field(default_factory=lambda: ["chatgpt"])
     account_ids: list[int] = Field(default_factory=list)
     destination: str = "cliproxyapi"
     pending_only: bool = False
-    status: Optional[str] = None
-    email: Optional[str] = None
-    manually_used: Optional[str] = None
-    auth_type: str = ""
-    subscription_type: str = ""
-    account_validity: str = ""
-    sub2api_state: str = ""
-    oaipay_state: str = ""
-    idea_submit_state: str = ""
     category_id: Optional[int] = None
     category_mode: str = "auto"
     fallback_category_id: Optional[int] = None
-
-
-def _optional_bool(value: Any) -> bool | None:
-    if value is None:
-        return None
-    text = str(value or "").strip().lower()
-    if not text:
-        return None
-    if text in {"1", "true", "yes", "on", "used"}:
-        return True
-    if text in {"0", "false", "no", "off", "unused"}:
-        return False
-    return None
 
 
 class GoPayOtpUidBinding(BaseModel):
@@ -1516,37 +1498,46 @@ def stop_service(name: str):
 @router.post("/backfill")
 def backfill_integrations(body: BackfillRequest):
     summary = {"total": 0, "success": 0, "failed": 0, "skipped": 0, "items": []}
-    targets = set(body.platforms or [])
+    target_list = list(dict.fromkeys(str(platform or "").strip() for platform in body.platforms or []))
+    target_list = [platform for platform in target_list if platform]
+    targets = set(target_list)
     destination = str(body.destination or "cliproxyapi").strip().lower() or "cliproxyapi"
 
     with Session(engine) as s:
-        reconcile_rate_limited_accounts(s)
-        q = select(AccountModel)
+        filtered_scope = not bool(body.account_ids)
         if body.account_ids:
-            q = q.where(AccountModel.id.in_(body.account_ids))
+            q = select(AccountModel).where(AccountModel.id.in_(body.account_ids))
+            # Selected mode is intentionally isolated from stale list filters.
+            # Only the explicit IDs and requested platforms define its scope.
             if targets:
                 q = q.where(AccountModel.platform.in_(targets))
-        elif targets:
-            q = q.where(AccountModel.platform.in_(targets))
+            rows = list(s.exec(q).all())
+            reconcile_rate_limited_accounts(s, accounts=rows)
+        elif target_list:
+            try:
+                rows = []
+                for platform in target_list:
+                    reconcile_rate_limited_accounts(s, platform=platform)
+                for platform in target_list:
+                    resolution = resolve_filtered_accounts(
+                        s,
+                        platform=platform,
+                        filter_source=body,
+                        verify_expected_total=False,
+                    )
+                    rows.extend(resolution.rows)
+
+                if body.expected_total is not None and body.expected_total != len(rows):
+                    raise AccountFilterScopeChangedError(
+                        expected_total=body.expected_total,
+                        matched_total=len(rows),
+                    )
+            except AccountFilterScopeChangedError as exc:
+                raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
         else:
             return summary
 
-        if body.status:
-            q = q.where(AccountModel.status == body.status)
-        if body.email:
-            q = q.where(AccountModel.email.contains(body.email))
-
-        rows = filter_account_rows(
-            s.exec(q).all(),
-            manually_used=_optional_bool(body.manually_used),
-            auth_type=body.auth_type,
-            subscription_type=body.subscription_type,
-            account_validity_filter=body.account_validity,
-            sub2api_state=body.sub2api_state,
-            oaipay_state=body.oaipay_state,
-            idea_submit_state=body.idea_submit_state,
-        )
-        if body.pending_only:
+        if filtered_scope and body.pending_only:
             def _is_pending_target(row: AccountModel) -> bool:
                 if row.platform != "chatgpt":
                     return False

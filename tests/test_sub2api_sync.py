@@ -3,6 +3,7 @@ from unittest import mock
 
 from core.db import AccountModel
 from services.sub2api_sync import backfill_chatgpt_account_to_sub2api, probe_chatgpt_sub2api_status
+from services.chatgpt_core.sub2api_upload import build_sub2api_account_payload
 
 
 class Sub2ApiSyncTests(unittest.TestCase):
@@ -140,50 +141,27 @@ class Sub2ApiSyncTests(unittest.TestCase):
         self.assertEqual(result["probe_source"], "api")
         self.assertIn("Sub2API API 不可用", result["message"])
 
-    def test_backfill_skips_when_remote_already_exists_and_persists_last_upload(self):
+    def test_backfill_uploads_once_without_remote_or_local_probe_even_when_cached_exists(self):
         account = self._make_account()
-
-        with mock.patch(
-            "services.sub2api_sync.probe_chatgpt_sub2api_status",
-            return_value={
+        extra = account.get_extra()
+        extra["sync_statuses"] = {
+            "sub2api": {
                 "remote_state": "exists",
                 "uploaded": True,
                 "remote_account_id": 321,
-                "matched_by": "email",
-                "message": "远端已存在",
+                "message": "cached exists",
                 "probe_source": "api",
-            },
-        ) as probe_mock:
-            with mock.patch("services.sub2api_sync.upload_to_sub2api_detailed") as upload_mock:
-                result = backfill_chatgpt_account_to_sub2api(account, commit=False)
-
-        self.assertTrue(result["ok"])
-        self.assertTrue(result["skipped"])
-        self.assertFalse(result["uploaded"])
-        state = account.get_extra()["sync_statuses"]["sub2api"]
-        self.assertEqual(state["last_upload"]["status"], "skipped")
-        probe_mock.assert_called_once()
-        upload_mock.assert_not_called()
-
-    def test_backfill_uploads_and_accepts_api_success_when_remote_missing(self):
-        account = self._make_account()
+            }
+        }
+        account.set_extra(extra)
 
         with mock.patch(
             "services.sub2api_sync.probe_chatgpt_sub2api_status",
-            return_value={
-                "remote_state": "not_found",
-                "uploaded": False,
-                "message": "远端未发现",
-                "probe_source": "api",
-            },
-        ) as probe_mock:
+            side_effect=AssertionError("remote probe must not run"),
+        ):
             with mock.patch(
-                "services.sub2api_sync.probe_local_chatgpt_status",
-                return_value={
-                    "auth": {"state": "refresh_token_valid", "message": "ok"},
-                    "subscription": {"plan": "free"},
-                    "codex": {"state": "usable"},
-                },
+                "services.chatgpt_core.status_probe.probe_local_chatgpt_status",
+                side_effect=AssertionError("local probe must not run"),
             ):
                 with mock.patch(
                     "services.sub2api_sync.upload_to_sub2api_detailed",
@@ -194,194 +172,74 @@ class Sub2ApiSyncTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertTrue(result["uploaded"])
         self.assertFalse(result["skipped"])
-        self.assertEqual(result["message"], "上传成功")
+        upload_mock.assert_called_once()
         state = account.get_extra()["sync_statuses"]["sub2api"]
+        self.assertEqual(state["remote_state"], "uploaded")
+        self.assertEqual(state["probe_source"], "upload")
         self.assertEqual(state["last_upload"]["status"], "success")
         self.assertEqual(state["last_upload"]["remote_account_id"], 889)
-        self.assertEqual(probe_mock.call_count, 1)
-        upload_mock.assert_called_once()
 
-    def test_backfill_uploads_when_only_other_workspace_matches(self):
+    def test_backfill_failure_without_cache_uses_unknown_upload_attempt_state(self):
         account = self._make_account()
-
         with mock.patch(
-            "services.sub2api_sync.probe_chatgpt_sub2api_status",
-            return_value={
-                "remote_state": "cross_workspace_only",
-                "uploaded": False,
-                "matched_by": "email, chatgpt_user_id",
-                "message": "仅命中同邮箱/同用户的其他 workspace，可为当前 workspace 补传",
-                "candidate_count": 1,
-                "candidates": [{"id": 777}],
-                "probe_source": "api",
-            },
-        ) as probe_mock:
-            with mock.patch(
-                "services.sub2api_sync.probe_local_chatgpt_status",
-                return_value={
-                    "auth": {"state": "refresh_token_valid", "message": "ok"},
-                    "subscription": {"plan": "free"},
-                    "codex": {"state": "usable"},
-                },
-            ):
-                with mock.patch(
-                    "services.sub2api_sync.upload_to_sub2api_detailed",
-                    return_value={"ok": True, "message": "上传成功"},
-                ) as upload_mock:
-                    result = backfill_chatgpt_account_to_sub2api(account, commit=False)
-
-        self.assertTrue(result["ok"])
-        self.assertTrue(result["uploaded"])
-        self.assertFalse(result["skipped"])
-        self.assertEqual(probe_mock.call_count, 1)
-        upload_mock.assert_called_once()
-
-    def test_backfill_reprobes_when_cached_state_is_not_found(self):
-        account = self._make_account()
-        account.set_extra(
-            {
-                "access_token": "",
-                "refresh_token": "",
-                "id_token": "",
-                "sync_statuses": {
-                    "sub2api": {
-                        "remote_state": "not_found",
-                        "uploaded": False,
-                        "message": "缓存未发现",
-                    }
-                },
-            }
-        )
-
-        with mock.patch(
-            "services.sub2api_sync.probe_chatgpt_sub2api_status",
-            return_value={
-                "remote_state": "exists",
-                "uploaded": True,
-                "remote_account_id": 888,
-                "matched_by": "organization_account",
-                "message": "远端已存在",
-                "probe_source": "api",
-            },
-        ) as probe_mock:
-            with mock.patch("services.sub2api_sync.upload_to_sub2api_detailed") as upload_mock:
-                result = backfill_chatgpt_account_to_sub2api(account, commit=False)
-
-        self.assertTrue(result["ok"])
-        self.assertTrue(result["skipped"])
-        self.assertFalse(result["uploaded"])
-        probe_mock.assert_called_once()
-        upload_mock.assert_not_called()
-
-    def test_backfill_persists_blocked_message_when_local_probe_invalid(self):
-        account = self._make_account()
-
-        with mock.patch(
-            "services.sub2api_sync.probe_chatgpt_sub2api_status",
-            return_value={
-                "remote_state": "not_found",
-                "uploaded": False,
-                "message": "远端 API 未发现 Sub2API 账号",
-                "probe_source": "api",
-            },
-        ):
-            with mock.patch(
-                "services.sub2api_sync.probe_local_chatgpt_status",
-                return_value={
-                    "auth": {
-                        "state": "access_token_invalidated",
-                        "message": "token invalidated",
-                    },
-                    "subscription": {"plan": "unknown"},
-                    "codex": {"state": "skipped_auth_invalid"},
-                },
-            ):
-                result = backfill_chatgpt_account_to_sub2api(account, commit=False)
+            "services.sub2api_sync.upload_to_sub2api_detailed",
+            return_value={"ok": False, "message": "upload rejected"},
+        ) as upload_mock:
+            result = backfill_chatgpt_account_to_sub2api(account, commit=False)
 
         self.assertFalse(result["ok"])
-        self.assertFalse(result["uploaded"])
+        upload_mock.assert_called_once()
+        state = account.get_extra()["sync_statuses"]["sub2api"]
+        self.assertEqual(state["remote_state"], "unknown")
+        self.assertEqual(state["probe_source"], "upload")
+        self.assertEqual(state["last_upload"]["status"], "failed")
+
+    def test_backfill_failure_preserves_cached_remote_exists_fact(self):
+        account = self._make_account()
         extra = account.get_extra()
-        state = extra["sync_statuses"]["sub2api"]
-        self.assertEqual(state["remote_state"], "not_found")
-        self.assertEqual(state["last_upload"]["status"], "blocked")
-        self.assertIn("当前无法补传", state["message"])
-        self.assertIn("认证已失效", state["message"])
-
-    def test_backfill_reprobes_when_cached_state_is_ambiguous(self):
-        account = self._make_account()
-        account.set_extra(
-            {
-                "access_token": "",
-                "refresh_token": "",
-                "id_token": "",
-                "sync_statuses": {
-                    "sub2api": {
-                        "remote_state": "ambiguous",
-                        "uploaded": False,
-                        "message": "缓存多候选",
-                    }
-                },
-            }
-        )
-
-        with mock.patch(
-            "services.sub2api_sync.probe_chatgpt_sub2api_status",
-            return_value={
+        extra["sync_statuses"] = {
+            "sub2api": {
                 "remote_state": "exists",
                 "uploaded": True,
-                "remote_account_id": 889,
-                "matched_by": "organization_account",
-                "message": "远端已存在",
+                "remote_account_id": 654,
                 "probe_source": "api",
-            },
-        ) as probe_mock:
-            with mock.patch("services.sub2api_sync.upload_to_sub2api_detailed") as upload_mock:
-                result = backfill_chatgpt_account_to_sub2api(account, commit=False)
-
-        self.assertTrue(result["ok"])
-        self.assertTrue(result["skipped"])
-        self.assertFalse(result["uploaded"])
-        probe_mock.assert_called_once()
-        upload_mock.assert_not_called()
-
-    def test_backfill_reprobes_when_cached_exists_contains_candidate_residue(self):
-        account = self._make_account()
-        account.set_extra(
-            {
-                "access_token": "",
-                "refresh_token": "",
-                "id_token": "",
-                "sync_statuses": {
-                    "sub2api": {
-                        "remote_state": "exists",
-                        "uploaded": True,
-                        "message": "远端已存在",
-                        "candidate_count": 2,
-                        "candidates": [{"id": 1}, {"id": 2}],
-                    }
-                },
             }
-        )
+        }
+        account.set_extra(extra)
 
         with mock.patch(
-            "services.sub2api_sync.probe_chatgpt_sub2api_status",
-            return_value={
-                "remote_state": "exists",
-                "uploaded": True,
-                "remote_account_id": 890,
-                "matched_by": "organization_account",
-                "message": "远端已存在",
-                "probe_source": "api",
-            },
-        ) as probe_mock:
-            with mock.patch("services.sub2api_sync.upload_to_sub2api_detailed") as upload_mock:
-                result = backfill_chatgpt_account_to_sub2api(account, commit=False)
+            "services.sub2api_sync.upload_to_sub2api_detailed",
+            return_value={"ok": False, "message": "temporary failure"},
+        ):
+            result = backfill_chatgpt_account_to_sub2api(account, commit=False)
 
-        self.assertTrue(result["ok"])
-        self.assertTrue(result["skipped"])
-        self.assertFalse(result["uploaded"])
-        probe_mock.assert_called_once()
-        upload_mock.assert_not_called()
+        self.assertFalse(result["ok"])
+        state = account.get_extra()["sync_statuses"]["sub2api"]
+        self.assertEqual(state["remote_state"], "exists")
+        self.assertTrue(state["uploaded"])
+        self.assertEqual(state["remote_account_id"], 654)
+        self.assertEqual(state["last_upload"]["status"], "failed")
+
+    def test_payload_uses_saved_subscription_without_local_probe(self):
+        account = self._make_account()
+        extra = account.get_extra()
+        extra["chatgpt_local"] = {
+            "subscription": {
+                "plan": "plus",
+                "subscription_active_until": "2030-01-02T03:04:05Z",
+            }
+        }
+        account.set_extra(extra)
+
+        with mock.patch(
+            "services.chatgpt_core.status_probe.probe_local_chatgpt_status",
+            side_effect=AssertionError("payload construction must not probe"),
+        ):
+            payload = build_sub2api_account_payload(account, group_ids=[7])
+
+        self.assertEqual(payload["group_ids"], [7])
+        self.assertEqual(payload["credentials"]["plan_type"], "plus")
+        self.assertEqual(payload["credentials"]["subscription_expires_at"], "2030-01-02T03:04:05Z")
 
 
 if __name__ == "__main__":

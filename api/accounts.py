@@ -3,17 +3,14 @@ from fastapi.responses import StreamingResponse
 from sqlmodel import Session, select, func
 from pydantic import BaseModel, Field
 from core.config_store import config_store
-from core.db import AccountListStateModel, AccountModel, PendingBusinessInviteModel, get_session
+from core.db import AccountModel, PendingBusinessInviteModel, get_session
 from services.account_filters import (
     account_auth_type,
-    account_base_query,
+    account_filtered_query,
     account_revival_info,
     account_subscription_type,
-    apply_account_list_state_filters,
     apply_account_list_state_sort,
     delete_account_list_state_for_account_ids,
-    refresh_stale_account_list_state,
-    should_use_account_list_state,
     upsert_account_list_state_for_account_ids,
 )
 from services.account_rate_limit_recovery import (
@@ -52,38 +49,12 @@ def _safe_str(value: Any) -> str:
     return str(value or "").strip()
 
 
-def _parse_optional_bool(value: Any) -> bool | None:
-    if value is None:
-        return None
-    if isinstance(value, bool):
-        return value
-    text = str(value or "").strip().lower()
-    if not text:
-        return None
-    if text in {"1", "true", "yes", "on", "used"}:
-        return True
-    if text in {"0", "false", "no", "off", "unused"}:
-        return False
-    return None
-
-
 def _safe_extra(account: AccountModel) -> dict[str, Any]:
     try:
         extra = account.get_extra()
     except Exception:
         return {}
     return extra if isinstance(extra, dict) else {}
-
-
-def _split_filter_values(value: Any) -> set[str]:
-    if value is None:
-        return set()
-    if isinstance(value, (list, tuple, set)):
-        result: set[str] = set()
-        for item in value:
-            result.update(_split_filter_values(item))
-        return result
-    return {item.strip().lower() for item in str(value).split(",") if item.strip()}
 
 
 ACCOUNT_FILTER_PRESETS_CONFIG_KEY = "chatgpt_account_filter_presets"
@@ -695,24 +666,6 @@ def delete_account_filter_preset(preset_id: str):
     state["custom"] = next_items
     state = _save_filter_preset_state(state)
     return _build_filter_presets_response(state)
-
-
-def _account_count_query(*, platform: Optional[str] = None, status: Any = None, email: Optional[str] = None):
-    query = select(func.count(AccountModel.id))
-    platform_value = _safe_str(platform)
-    if platform_value:
-        query = query.where(AccountModel.platform == platform_value)
-
-    status_values = _split_filter_values(status)
-    if len(status_values) == 1:
-        query = query.where(AccountModel.status == next(iter(status_values)))
-    elif len(status_values) > 1:
-        query = query.where(AccountModel.status.in_(sorted(status_values)))
-
-    email_value = _safe_str(email)
-    if email_value:
-        query = query.where(AccountModel.email.contains(email_value))
-    return query
 
 
 def _maybe_reconcile_rate_limited_accounts(session: Session, *, platform: Optional[str] = None) -> None:
@@ -1709,45 +1662,31 @@ def list_accounts(
     _maybe_reconcile_rate_limited_accounts(session, platform=platform)
     page_value = max(1, int(page or 1))
     page_size_value = max(1, min(int(page_size or 20), 200))
-    manually_used_filter = _parse_optional_bool(manually_used)
-    use_list_state = should_use_account_list_state(
-        manually_used=manually_used_filter,
-        auth_type=auth_type,
-        subscription_type=subscription_type,
-        account_validity_filter=account_validity,
-        sub2api_state=sub2api_state,
-        oaipay_state=oaipay_state,
-        idea_submit_state=idea_submit_state,
-        revival_state=revival_state,
-        sort_by=sort_by,
-        sort_order=sort_order,
+    q, use_list_state, _ = account_filtered_query(
+        session,
+        platform=platform,
+        filter_source={
+            "email": email,
+            "status": status,
+            "manually_used": manually_used,
+            "auth_type": auth_type,
+            "subscription_type": subscription_type,
+            "account_validity": account_validity,
+            "sub2api_state": sub2api_state,
+            "oaipay_state": oaipay_state,
+            "idea_submit_state": idea_submit_state,
+            "revival_state": revival_state,
+            "sort_by": sort_by,
+            "sort_order": sort_order,
+        },
     )
-
+    count_q = select(func.count()).select_from(q.subquery())
+    total = int(session.exec(count_q).one())
     if use_list_state:
-        refresh_stale_account_list_state(session, platform=platform)
-        q = account_base_query(platform=platform, status=status, email=email).join(
-            AccountListStateModel,
-            AccountListStateModel.account_id == AccountModel.id,
-        )
-        q = apply_account_list_state_filters(
-            q,
-            manually_used=manually_used_filter,
-            auth_type=auth_type,
-            subscription_type=subscription_type,
-            account_validity_filter=account_validity,
-            sub2api_state=sub2api_state,
-            oaipay_state=oaipay_state,
-            idea_submit_state=idea_submit_state,
-            revival_state=revival_state,
-        )
-        count_q = select(func.count()).select_from(q.subquery())
-        total = int(session.exec(count_q).one())
         q = apply_account_list_state_sort(q, sort_by=sort_by, sort_order=sort_order)
-        items = session.exec(q.offset((page_value - 1) * page_size_value).limit(page_size_value)).all()
     else:
-        q = account_base_query(platform=platform, status=status, email=email).order_by(AccountModel.id.desc())
-        total = int(session.exec(_account_count_query(platform=platform, status=status, email=email)).one())
-        items = session.exec(q.offset((page_value - 1) * page_size_value).limit(page_size_value)).all()
+        q = q.order_by(AccountModel.id.desc())
+    items = session.exec(q.offset((page_value - 1) * page_size_value).limit(page_size_value)).all()
     extras_by_id = {
         int(item.id or 0): _safe_extra(item)
         for item in items

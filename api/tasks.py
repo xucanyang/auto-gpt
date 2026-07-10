@@ -14,10 +14,12 @@ from core.task_runtime import (
     StopTaskRequested,
 )
 from services.account_filters import (
-    account_base_query,
+    AccountFilterRequestMixin,
+    AccountFilterScopeChangedError,
     account_subscription_type,
     account_validity,
-    filter_account_rows,
+    build_account_filter_audit,
+    resolve_filtered_accounts,
 )
 from services.account_rate_limit_recovery import (
     account_rate_limit_payload,
@@ -131,47 +133,22 @@ class K12WorkspaceRecaptureTaskRequest(BaseModel):
     post_join_poll_seconds: Optional[str] = None
 
 
-class BatchK12WorkspaceRecaptureTaskRequest(BaseModel):
+class BatchK12WorkspaceRecaptureTaskRequest(AccountFilterRequestMixin):
     account_ids: list[int] = Field(default_factory=list)
     all_filtered: bool = False
-    email: str = ""
-    status: str = ""
-    manually_used: str | None = None
-    auth_type: str = ""
-    subscription_type: str = ""
-    account_validity: str = ""
-    sub2api_state: str = ""
-    oaipay_state: str = ""
-    idea_submit_state: str = ""
     params: dict[str, Any] = Field(default_factory=dict)
     limit: int = 0
 
 
-class BatchResumeSubscriptionAuthTaskRequest(BaseModel):
+class BatchResumeSubscriptionAuthTaskRequest(AccountFilterRequestMixin):
     account_ids: list[int] = Field(default_factory=list)
     all_filtered: bool = False
-    email: str = ""
-    status: str = ""
-    manually_used: str | None = None
-    auth_type: str = ""
-    subscription_type: str = ""
-    account_validity: str = ""
-    sub2api_state: str = ""
-    idea_submit_state: str = ""
     allow_phone_verification: bool | None = None
 
 
-class PhoneBindingTestTaskRequest(BaseModel):
+class PhoneBindingTestTaskRequest(AccountFilterRequestMixin):
     account_ids: list[int] = Field(default_factory=list)
     all_filtered: bool = False
-    email: str = ""
-    status: str = ""
-    manually_used: str | None = None
-    auth_type: str = ""
-    subscription_type: str = ""
-    account_validity: str = ""
-    sub2api_state: str = ""
-    idea_submit_state: str = ""
     phone_lines: str = ""
     use_pool: bool = False
     timeout_seconds: int = 180
@@ -201,18 +178,10 @@ IDEA_SUBMIT_DEFAULT_POLL_WARNING_SECONDS = 1800
 IDEA_SUBMIT_HARD_POLL_TIMEOUT_SECONDS = 24 * 3600
 
 
-class BaxiGptCdkSubmitTaskRequest(BaseModel):
+class BaxiGptCdkSubmitTaskRequest(AccountFilterRequestMixin):
     account_ids: list[int] = Field(default_factory=list)
     cdk_ids: list[int] = Field(default_factory=list)
     all_filtered: bool = False
-    email: str = ""
-    status: str = ""
-    manually_used: str | None = None
-    auth_type: str = ""
-    subscription_type: str = ""
-    account_validity: str = ""
-    sub2api_state: str = ""
-    idea_submit_state: str = ""
     code_lines: str = ""
     use_pool: bool = True
     precheck: bool = True
@@ -225,17 +194,9 @@ class BaxiGptCdkSubmitTaskRequest(BaseModel):
     limit: int = 0
 
 
-class ChatGptPaypalBindTaskRequest(BaseModel):
+class ChatGptPaypalBindTaskRequest(AccountFilterRequestMixin):
     account_ids: list[int] = Field(default_factory=list)
     all_filtered: bool = False
-    email: str = ""
-    status: str = ""
-    manually_used: str | None = None
-    auth_type: str = ""
-    subscription_type: str = ""
-    account_validity: str = ""
-    sub2api_state: str = ""
-    idea_submit_state: str = ""
     upstream: str = "plus_iceaix"
     base_url: str = ""
     proxy: str = ""
@@ -261,52 +222,28 @@ class ChatGptPaypalBindTaskRequest(BaseModel):
     limit: int = 0
 
 
-class BatchPaymentLinkTaskRequest(BaseModel):
+class BatchPaymentLinkTaskRequest(AccountFilterRequestMixin):
     account_ids: list[int] = Field(default_factory=list)
     all_filtered: bool = False
-    email: str = ""
-    status: str = ""
-    manually_used: str | None = None
-    auth_type: str = ""
-    subscription_type: str = ""
-    account_validity: str = ""
-    sub2api_state: str = ""
-    idea_submit_state: str = ""
     params: dict[str, Any] = Field(default_factory=dict)
     skip_existing: bool = True
     force_refresh: bool = False
     limit: int = 0
 
 
-class BatchSub2ApiUploadTaskRequest(BaseModel):
+class BatchSub2ApiUploadTaskRequest(AccountFilterRequestMixin):
     account_ids: list[int] = Field(default_factory=list)
     all_filtered: bool = False
-    email: str = ""
-    status: str = ""
-    manually_used: str | None = None
-    auth_type: str = ""
-    subscription_type: str = ""
-    account_validity: str = ""
-    sub2api_state: str = ""
-    idea_submit_state: str = ""
     params: dict[str, Any] = Field(default_factory=dict)
     limit: int = 0
 
 
-class BatchOaipayUploadTaskRequest(BaseModel):
+class BatchOaipayUploadTaskRequest(AccountFilterRequestMixin):
     account_ids: list[int] = Field(default_factory=list)
     all_filtered: bool = False
     category_id: int | None = None
     category_mode: str = "auto"  # auto | manual；兼容旧请求：auto 模式下 category_id 作为兜底分类
     fallback_category_id: int | None = None
-    email: str = ""
-    status: str = ""
-    manually_used: str | None = None
-    auth_type: str = ""
-    subscription_type: str = ""
-    account_validity: str = ""
-    oaipay_state: str = ""
-    idea_submit_state: str = ""
     params: dict[str, Any] = Field(default_factory=dict)
     limit: int = 0
 
@@ -360,31 +297,16 @@ class IcloudHmeRecheckBatchTaskRequest(BaseModel):
     proxy_min_score: float = 0
     account_delay_seconds: float = 0
 
-class BatchInvalidRecheckTaskRequest(BaseModel):
+class BatchInvalidRecheckTaskRequest(AccountFilterRequestMixin):
     account_ids: list[int] = Field(default_factory=list)
     all_filtered: bool = False
-    email: str = ""
-    status: str = ""
-    manually_used: str | None = None
-    auth_type: str = ""
-    subscription_type: str = ""
-    account_validity: str = ""
-    idea_submit_state: str = ""
     limit: int = 0
     params: dict[str, Any] = Field(default_factory=dict)
 
 
-class BatchProbeLocalStatusTaskRequest(BaseModel):
+class BatchProbeLocalStatusTaskRequest(AccountFilterRequestMixin):
     account_ids: list[int] = Field(default_factory=list)
     all_filtered: bool = False
-    email: str = ""
-    status: str = ""
-    manually_used: str | None = None
-    auth_type: str = ""
-    subscription_type: str = ""
-    account_validity: str = ""
-    sub2api_state: str = ""
-    idea_submit_state: str = ""
     limit: int = 0
     params: dict[str, Any] = Field(default_factory=dict)
 
@@ -982,32 +904,50 @@ def _normalize_batch_account_ids(account_ids: list[int] | None) -> list[int]:
     return normalized
 
 
-def _optional_bool(value: Any) -> bool | None:
-    if value is None:
-        return None
-    text = str(value or "").strip().lower()
-    if not text:
-        return None
-    if text in {"1", "true", "yes", "on", "used"}:
-        return True
-    if text in {"0", "false", "no", "off", "unused"}:
-        return False
-    return None
-
-
 def _filtered_chatgpt_accounts(session: Session, req: Any) -> list[AccountModel]:
+    # Match the status normalization used by GET /accounts before freezing IDs.
+    # No task, resource import, or external action has started at this point.
     reconcile_rate_limited_accounts(session, platform="chatgpt")
-    query = account_base_query(platform="chatgpt", status=getattr(req, "status", ""), email=getattr(req, "email", ""))
-    return filter_account_rows(
-        session.exec(query).all(),
-        manually_used=_optional_bool(getattr(req, "manually_used", None)),
-        auth_type=getattr(req, "auth_type", ""),
-        subscription_type=getattr(req, "subscription_type", ""),
-        account_validity_filter=getattr(req, "account_validity", ""),
-        sub2api_state=getattr(req, "sub2api_state", ""),
-        oaipay_state=getattr(req, "oaipay_state", ""),
-        idea_submit_state=getattr(req, "idea_submit_state", ""),
+    try:
+        resolution = resolve_filtered_accounts(
+            session,
+            platform="chatgpt",
+            filter_source=req,
+            verify_expected_total=bool(getattr(req, "all_filtered", False)),
+        )
+    except AccountFilterScopeChangedError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+    return list(resolution.rows)
+
+
+def _task_account_filter_audit(
+    req: AccountFilterRequestMixin,
+    *,
+    matched_accounts: list[dict[str, Any]],
+    eligible_accounts: list[dict[str, Any]],
+    skipped_accounts: list[dict[str, Any]],
+) -> dict[str, Any]:
+    matched_items = matched_accounts if bool(req.all_filtered) else [
+        *matched_accounts,
+        *eligible_accounts,
+        *skipped_accounts,
+    ]
+    matched_ids = [int(item.get("account_id") or 0) for item in matched_items if isinstance(item, dict)]
+    frozen_ids = [int(item.get("account_id") or 0) for item in eligible_accounts if isinstance(item, dict)]
+    return build_account_filter_audit(
+        req,
+        frozen_ids,
+        matched_total=len({account_id for account_id in matched_ids if account_id > 0}),
+        matched_account_ids=matched_ids,
+        all_filtered=bool(req.all_filtered),
     )
+
+
+def _task_filter_meta(req: AccountFilterRequestMixin, audit: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "all_filtered": bool(req.all_filtered),
+        **dict(audit.get("filter") or {}),
+    }
 
 
 def _chatgpt_account_access_token(account: AccountModel) -> str:
@@ -1392,11 +1332,6 @@ def _resolve_phone_binding_test_accounts(
     with Session(engine) as session:
         rows = _filtered_chatgpt_accounts(session, req)
 
-    if limit > 0:
-        rows = rows[:limit]
-    if len(rows) > 1000:
-        raise HTTPException(400, "单次最多处理 1000 个账号")
-
     matched: list[dict[str, Any]] = []
     for account in rows:
         account_id = int(account.id or 0)
@@ -1409,7 +1344,15 @@ def _resolve_phone_binding_test_accounts(
                 "status": str(account.status or ""),
             }
         )
-    return matched, [], [], matched
+    eligible = list(matched)
+    skipped: list[dict[str, Any]] = []
+    if limit > 0:
+        overflow = eligible[limit:]
+        eligible = eligible[:limit]
+        skipped.extend({**item, "reason": f"超过本次限制 limit={limit}"} for item in overflow)
+    if len(eligible) > 1000:
+        raise HTTPException(400, "单次最多处理 1000 个账号")
+    return eligible, [], skipped, matched
 
 
 def _resolve_baxigpt_cdk_submit_accounts(
@@ -1461,11 +1404,6 @@ def _resolve_baxigpt_cdk_submit_accounts(
     with Session(engine) as session:
         rows = _filtered_chatgpt_accounts(session, req)
 
-    if limit > 0:
-        rows = rows[:limit]
-    if len(rows) > 1000:
-        raise HTTPException(400, "单次最多处理 1000 个账号")
-
     matched: list[dict[str, Any]] = []
     eligible: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
@@ -1486,6 +1424,12 @@ def _resolve_baxigpt_cdk_submit_accounts(
             skipped.append({**item, "reason": "账号缺少 Access Token"})
         else:
             eligible.append(item)
+    if limit > 0:
+        overflow = eligible[limit:]
+        eligible = eligible[:limit]
+        skipped.extend({**item, "reason": f"超过本次限制 limit={limit}"} for item in overflow)
+    if len(eligible) > 1000:
+        raise HTTPException(400, "单次最多处理 1000 个账号")
     return eligible, [], skipped, matched
 
 
@@ -1550,11 +1494,6 @@ def _resolve_chatgpt_paypal_bind_accounts(
     with Session(engine) as session:
         rows = _filtered_chatgpt_accounts(session, req)
 
-    if limit > 0:
-        rows = rows[:limit]
-    if len(rows) > 1000:
-        raise HTTPException(400, "单次最多处理 1000 个账号")
-
     matched: list[dict[str, Any]] = []
     eligible: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
@@ -1570,6 +1509,12 @@ def _resolve_chatgpt_paypal_bind_accounts(
             skipped.append({**item, "reason": reason})
         else:
             eligible.append(item)
+    if limit > 0:
+        overflow = eligible[limit:]
+        eligible = eligible[:limit]
+        skipped.extend({**item, "reason": f"超过本次限制 limit={limit}"} for item in overflow)
+    if len(eligible) > 1000:
+        raise HTTPException(400, "单次最多处理 1000 个账号")
     return eligible, [], skipped, matched
 
 
@@ -1627,16 +1572,7 @@ def _resolve_batch_sub2api_upload_accounts(
         raise HTTPException(400, "请提供 account_ids，或指定 all_filtered=true")
 
     with Session(engine) as session:
-        query = account_base_query(platform="chatgpt", status=req.status, email=req.email)
-        rows = filter_account_rows(
-            session.exec(query).all(),
-            manually_used=_optional_bool(req.manually_used),
-            auth_type=req.auth_type,
-            subscription_type=req.subscription_type,
-            account_validity_filter=req.account_validity,
-            sub2api_state="",
-            idea_submit_state=req.idea_submit_state,
-        )
+        rows = _filtered_chatgpt_accounts(session, req)
 
     matched: list[dict[str, Any]] = []
     eligible: list[dict[str, Any]] = []
@@ -1759,16 +1695,7 @@ def _resolve_batch_oaipay_upload_accounts(
         raise HTTPException(400, "请提供 account_ids，或指定 all_filtered=true")
 
     with Session(engine) as session:
-        query = account_base_query(platform="chatgpt", status=req.status, email=req.email)
-        rows = filter_account_rows(
-            session.exec(query).all(),
-            manually_used=_optional_bool(req.manually_used),
-            auth_type=req.auth_type,
-            subscription_type=req.subscription_type,
-            account_validity_filter=req.account_validity,
-            oaipay_state="",
-            idea_submit_state=req.idea_submit_state,
-        )
+        rows = _filtered_chatgpt_accounts(session, req)
 
     matched: list[dict[str, Any]] = []
     eligible: list[dict[str, Any]] = []
@@ -1920,11 +1847,6 @@ def _resolve_batch_payment_link_accounts(
     with Session(engine) as session:
         rows = _filtered_chatgpt_accounts(session, req)
 
-    if limit > 0:
-        rows = rows[:limit]
-    if len(rows) > 1000:
-        raise HTTPException(400, "单次最多处理 1000 个账号")
-
     eligible = []
     skipped = []
     matched = []
@@ -1943,6 +1865,12 @@ def _resolve_batch_payment_link_accounts(
             skipped.append({**item, "reason": reason})
         else:
             eligible.append(item)
+    if limit > 0:
+        overflow = eligible[limit:]
+        eligible = eligible[:limit]
+        skipped.extend({**item, "reason": f"超过本次限制 limit={limit}"} for item in overflow)
+    if len(eligible) > 1000:
+        raise HTTPException(400, "单次最多处理 1000 个账号")
     return eligible, [], skipped, matched
 
 
@@ -3029,6 +2957,12 @@ def enqueue_batch_invalid_recheck_task(
 ) -> dict[str, Any]:
     eligible_accounts, missing_ids, skipped_accounts, matched_accounts = _resolve_batch_invalid_recheck_accounts(req)
     total_requested = len(_normalize_batch_account_ids(req.account_ids)) if req.account_ids else len(matched_accounts)
+    filter_audit = _task_account_filter_audit(
+        req,
+        matched_accounts=matched_accounts,
+        eligible_accounts=eligible_accounts,
+        skipped_accounts=skipped_accounts,
+    )
 
     if not eligible_accounts:
         return {
@@ -3052,11 +2986,8 @@ def enqueue_batch_invalid_recheck_task(
         "missing_ids": list(missing_ids),
         "account_ids": [int(item["account_id"]) for item in eligible_accounts],
         "emails": [str(item["email"] or "") for item in eligible_accounts],
-        "filter": {
-            "all_filtered": bool(req.all_filtered),
-            "status": str(req.status or ""),
-            "email": str(req.email or ""),
-        },
+        "filter": _task_filter_meta(req, filter_audit),
+        "filter_audit": filter_audit,
         "limit": int(req.limit or 0),
         "skipped_items": list(skipped_accounts),
     }
@@ -3115,6 +3046,12 @@ def enqueue_batch_probe_local_status_task(
 ) -> dict[str, Any]:
     eligible_accounts, missing_ids, skipped_accounts, matched_accounts = _resolve_batch_probe_local_status_accounts(req)
     total_requested = len(_normalize_batch_account_ids(req.account_ids)) if req.account_ids else len(matched_accounts)
+    filter_audit = _task_account_filter_audit(
+        req,
+        matched_accounts=matched_accounts,
+        eligible_accounts=eligible_accounts,
+        skipped_accounts=skipped_accounts,
+    )
 
     if not eligible_accounts:
         return {
@@ -3138,11 +3075,8 @@ def enqueue_batch_probe_local_status_task(
         "missing_ids": list(missing_ids),
         "account_ids": [int(item["account_id"]) for item in eligible_accounts],
         "emails": [str(item["email"] or "") for item in eligible_accounts],
-        "filter": {
-            "all_filtered": bool(req.all_filtered),
-            "status": str(req.status or ""),
-            "email": str(req.email or ""),
-        },
+        "filter": _task_filter_meta(req, filter_audit),
+        "filter_audit": filter_audit,
         "limit": int(req.limit or 0),
         "skipped_items": list(skipped_accounts),
         "params": sanitize_task_detail(dict(req.params or {})),
@@ -3205,6 +3139,12 @@ def enqueue_batch_resume_subscription_auth_task(
     resolved_allow_phone_verification = resolved_modes["allow_phone_verification"]
     eligible_accounts, missing_ids, skipped_accounts, matched_accounts = _resolve_batch_resume_auth_accounts(req)
     total_requested = len(_normalize_batch_account_ids(req.account_ids)) if req.account_ids else len(matched_accounts)
+    filter_audit = _task_account_filter_audit(
+        req,
+        matched_accounts=matched_accounts,
+        eligible_accounts=eligible_accounts,
+        skipped_accounts=skipped_accounts,
+    )
 
     if not eligible_accounts:
         return {
@@ -3231,11 +3171,8 @@ def enqueue_batch_resume_subscription_auth_task(
         "missing_ids": list(missing_ids),
         "account_ids": [int(item["account_id"]) for item in eligible_accounts],
         "emails": [str(item["email"] or "") for item in eligible_accounts],
-        "filter": {
-            "all_filtered": bool(req.all_filtered),
-            "status": str(req.status or ""),
-            "email": str(req.email or ""),
-        },
+        "filter": _task_filter_meta(req, filter_audit),
+        "filter_audit": filter_audit,
         "allow_phone_verification": resolved_allow_phone_verification,
         "allow_add_phone_verification": resolved_modes["allow_add_phone_verification"],
         "allow_existing_phone_verification": resolved_modes["allow_existing_phone_verification"],
@@ -3305,6 +3242,12 @@ def enqueue_batch_k12_workspace_recapture_task(
     params = _normalize_k12_recapture_params(req.params)
     eligible_accounts, missing_ids, skipped_accounts, matched_accounts = _resolve_batch_k12_recapture_accounts(req)
     total_requested = len(_normalize_batch_account_ids(req.account_ids)) if req.account_ids else len(matched_accounts)
+    filter_audit = _task_account_filter_audit(
+        req,
+        matched_accounts=matched_accounts,
+        eligible_accounts=eligible_accounts,
+        skipped_accounts=skipped_accounts,
+    )
 
     if not eligible_accounts:
         return {
@@ -3328,11 +3271,8 @@ def enqueue_batch_k12_workspace_recapture_task(
         "missing_ids": list(missing_ids),
         "account_ids": [int(item["account_id"]) for item in eligible_accounts],
         "emails": [str(item["email"] or "") for item in eligible_accounts],
-        "filter": {
-            "all_filtered": bool(req.all_filtered),
-            "status": str(req.status or ""),
-            "email": str(req.email or ""),
-        },
+        "filter": _task_filter_meta(req, filter_audit),
+        "filter_audit": filter_audit,
         "limit": int(req.limit or 0),
         "skipped_items": list(skipped_accounts),
         "params": _k12_recapture_meta_params(params),
@@ -3390,6 +3330,14 @@ def enqueue_phone_binding_test_task(
     *,
     background_tasks: BackgroundTasks | None = None,
 ) -> dict[str, Any]:
+    account_items, missing_ids, skipped_accounts, matched_accounts = _resolve_phone_binding_test_accounts(req)
+    total_requested_accounts = len(_normalize_batch_account_ids(req.account_ids)) if req.account_ids else len(matched_accounts)
+    filter_audit = _task_account_filter_audit(
+        req,
+        matched_accounts=matched_accounts,
+        eligible_accounts=account_items,
+        skipped_accounts=skipped_accounts,
+    )
     manual_phone_lines = str(req.phone_lines or "").strip()
     # 手动粘贴的号码/API 优先于默认号池开关，避免用户粘贴后仍误用空号池。
     prefix_bind_enabled = bool(req.prefix_bind_enabled) and not manual_phone_lines
@@ -3437,9 +3385,6 @@ def enqueue_phone_binding_test_task(
             raise HTTPException(400, "单次最多上传 1000 个手机号")
         phone_entries, phone_pool_import_summary = _import_manual_phone_entries_to_pool(phone_entries)
     safe_parse_errors = sanitize_task_detail(parse_errors)
-
-    account_items, missing_ids, skipped_accounts, matched_accounts = _resolve_phone_binding_test_accounts(req)
-    total_requested_accounts = len(_normalize_batch_account_ids(req.account_ids)) if req.account_ids else len(matched_accounts)
 
     prefix_sample_meta: dict[str, Any] = {
         "enabled": prefix_sample_enabled,
@@ -3668,11 +3613,8 @@ def enqueue_phone_binding_test_task(
         "sms_probe_only": prefix_sms_probe_only,
         "prefix_summary": _build_phone_prefix_sample_summary(phone_items, []),
         "parse_errors": safe_parse_errors,
-        "filter": {
-            "all_filtered": bool(req.all_filtered),
-            "status": str(req.status or ""),
-            "email": str(req.email or ""),
-        },
+        "filter": _task_filter_meta(req, filter_audit),
+        "filter_audit": filter_audit,
         "settings": display_settings,
         "requested_concurrency": requested_concurrency,
         "effective_concurrency": effective_concurrency,
@@ -3749,6 +3691,12 @@ def enqueue_batch_sub2api_upload_task(
 ) -> dict[str, Any]:
     eligible_accounts, missing_ids, skipped_accounts, matched_accounts = _resolve_batch_sub2api_upload_accounts(req)
     total_requested = len(_normalize_batch_account_ids(req.account_ids)) if req.account_ids else len(matched_accounts)
+    filter_audit = _task_account_filter_audit(
+        req,
+        matched_accounts=matched_accounts,
+        eligible_accounts=eligible_accounts,
+        skipped_accounts=skipped_accounts,
+    )
 
     if not eligible_accounts:
         task_id = f"task_{int(time.time() * 1000)}"
@@ -3760,12 +3708,8 @@ def enqueue_batch_sub2api_upload_task(
             "missing_ids": list(missing_ids),
             "account_ids": [],
             "emails": [],
-            "filter": {
-                "all_filtered": bool(req.all_filtered),
-                "status": str(req.status or ""),
-                "email": str(req.email or ""),
-                "sub2api_state": str(req.sub2api_state or ""),
-            },
+            "filter": _task_filter_meta(req, filter_audit),
+            "filter_audit": filter_audit,
             "params": dict(req.params or {}),
             "limit": int(req.limit or 0),
             "skipped_items": list(skipped_accounts),
@@ -3828,12 +3772,8 @@ def enqueue_batch_sub2api_upload_task(
         "missing_ids": list(missing_ids),
         "account_ids": [int(item["account_id"]) for item in eligible_accounts],
         "emails": [str(item["email"] or "") for item in eligible_accounts],
-        "filter": {
-            "all_filtered": bool(req.all_filtered),
-            "status": str(req.status or ""),
-            "email": str(req.email or ""),
-            "sub2api_state": str(req.sub2api_state or ""),
-        },
+        "filter": _task_filter_meta(req, filter_audit),
+        "filter_audit": filter_audit,
         "params": dict(req.params or {}),
         "limit": int(req.limit or 0),
         "skipped_items": list(skipped_accounts),
@@ -3893,6 +3833,12 @@ def enqueue_batch_oaipay_upload_task(
 ) -> dict[str, Any]:
     eligible_accounts, missing_ids, skipped_accounts, matched_accounts = _resolve_batch_oaipay_upload_accounts(req)
     total_requested = len(_normalize_batch_account_ids(req.account_ids)) if req.account_ids else len(matched_accounts)
+    filter_audit = _task_account_filter_audit(
+        req,
+        matched_accounts=matched_accounts,
+        eligible_accounts=eligible_accounts,
+        skipped_accounts=skipped_accounts,
+    )
     category_meta = _oaipay_category_strategy_meta(req)
 
     if not eligible_accounts:
@@ -3905,12 +3851,8 @@ def enqueue_batch_oaipay_upload_task(
             "missing_ids": list(missing_ids),
             "account_ids": [],
             "emails": [],
-            "filter": {
-                "all_filtered": bool(req.all_filtered),
-                "status": str(req.status or ""),
-                "email": str(req.email or ""),
-                "oaipay_state": str(req.oaipay_state or ""),
-            },
+            "filter": _task_filter_meta(req, filter_audit),
+            "filter_audit": filter_audit,
             "params": dict(req.params or {}),
             "limit": int(req.limit or 0),
             **category_meta,
@@ -3975,12 +3917,8 @@ def enqueue_batch_oaipay_upload_task(
         "missing_ids": list(missing_ids),
         "account_ids": [int(item["account_id"]) for item in eligible_accounts],
         "emails": [str(item["email"] or "") for item in eligible_accounts],
-        "filter": {
-            "all_filtered": bool(req.all_filtered),
-            "status": str(req.status or ""),
-            "email": str(req.email or ""),
-            "oaipay_state": str(req.oaipay_state or ""),
-        },
+        "filter": _task_filter_meta(req, filter_audit),
+        "filter_audit": filter_audit,
         "params": dict(req.params or {}),
         "limit": int(req.limit or 0),
         **category_meta,
@@ -4044,6 +3982,12 @@ def enqueue_baxigpt_cdk_submit_task(
 
     account_items, missing_ids, skipped_accounts, matched_accounts = _resolve_baxigpt_cdk_submit_accounts(req)
     total_requested_accounts = len(_normalize_batch_account_ids(req.account_ids)) if req.account_ids else len(matched_accounts)
+    filter_audit = _task_account_filter_audit(
+        req,
+        matched_accounts=matched_accounts,
+        eligible_accounts=account_items,
+        skipped_accounts=skipped_accounts,
+    )
     requested_target_success_count = max(int(req.target_success_count or 0), 0)
     repo = BaxiGptCdkRepository()
     import_summary: dict[str, Any] = {"added": 0, "updated": 0, "skipped": 0, "errors": [], "items": []}
@@ -4164,11 +4108,8 @@ def enqueue_baxigpt_cdk_submit_task(
         "spare_codes": len(spare_codes),
         "code_source": code_source,
         "cdk_pool_import": import_summary,
-        "filter": {
-            "all_filtered": bool(req.all_filtered),
-            "status": str(req.status or ""),
-            "email": str(req.email or ""),
-        },
+        "filter": _task_filter_meta(req, filter_audit),
+        "filter_audit": filter_audit,
         "settings": {
             "precheck": bool(req.precheck),
             "failure_continue": bool(req.failure_continue),
@@ -4263,6 +4204,12 @@ def enqueue_chatgpt_paypal_bind_task(
 
     eligible_accounts, missing_ids, skipped_accounts, matched_accounts = _resolve_chatgpt_paypal_bind_accounts(req)
     total_requested_accounts = len(_normalize_batch_account_ids(req.account_ids)) if req.account_ids else len(matched_accounts)
+    filter_audit = _task_account_filter_audit(
+        req,
+        matched_accounts=matched_accounts,
+        eligible_accounts=eligible_accounts,
+        skipped_accounts=skipped_accounts,
+    )
 
     if not eligible_accounts:
         return {
@@ -4307,11 +4254,8 @@ def enqueue_chatgpt_paypal_bind_task(
         "skipped_accounts": list(skipped_accounts),
         "account_ids": [int(item["account_id"]) for item in eligible_accounts],
         "emails": [str(item["email"] or "") for item in eligible_accounts],
-        "filter": {
-            "all_filtered": bool(req.all_filtered),
-            "status": str(req.status or ""),
-            "email": str(req.email or ""),
-        },
+        "filter": _task_filter_meta(req, filter_audit),
+        "filter_audit": filter_audit,
         "settings": public_settings,
         "runtime_results": [],
     }
@@ -4369,6 +4313,12 @@ def enqueue_batch_payment_link_task(
 ) -> dict[str, Any]:
     eligible_accounts, missing_ids, skipped_accounts, matched_accounts = _resolve_batch_payment_link_accounts(req)
     total_requested = len(_normalize_batch_account_ids(req.account_ids)) if req.account_ids else len(matched_accounts)
+    filter_audit = _task_account_filter_audit(
+        req,
+        matched_accounts=matched_accounts,
+        eligible_accounts=eligible_accounts,
+        skipped_accounts=skipped_accounts,
+    )
 
     task_id = f"task_{int(time.time() * 1000)}"
     source = "batch_payment_link"
@@ -4380,11 +4330,8 @@ def enqueue_batch_payment_link_task(
         "missing_ids": list(missing_ids),
         "account_ids": [int(item["account_id"]) for item in eligible_accounts],
         "emails": [str(item["email"] or "") for item in eligible_accounts],
-        "filter": {
-            "all_filtered": bool(req.all_filtered),
-            "status": str(req.status or ""),
-            "email": str(req.email or ""),
-        },
+        "filter": _task_filter_meta(req, filter_audit),
+        "filter_audit": filter_audit,
         "params": dict(request_params),
         "skip_existing": bool(req.skip_existing),
         "force_refresh": bool(req.force_refresh),
@@ -4469,6 +4416,12 @@ def enqueue_chatgpt_oaipay_approval_task(
 
     eligible_accounts, missing_ids, skipped_accounts, matched_accounts = _resolve_chatgpt_paypal_bind_accounts(req)
     total_requested_accounts = len(_normalize_batch_account_ids(req.account_ids)) if req.account_ids else len(matched_accounts)
+    filter_audit = _task_account_filter_audit(
+        req,
+        matched_accounts=matched_accounts,
+        eligible_accounts=eligible_accounts,
+        skipped_accounts=skipped_accounts,
+    )
 
     if not eligible_accounts:
         return {
@@ -4513,11 +4466,8 @@ def enqueue_chatgpt_oaipay_approval_task(
         "skipped_accounts": list(skipped_accounts),
         "account_ids": [int(item["account_id"]) for item in eligible_accounts],
         "emails": [str(item["email"] or "") for item in eligible_accounts],
-        "filter": {
-            "all_filtered": bool(req.all_filtered),
-            "status": str(req.status or ""),
-            "email": str(req.email or ""),
-        },
+        "filter": _task_filter_meta(req, filter_audit),
+        "filter_audit": filter_audit,
         "settings": public_settings,
         "runtime_results": [],
         "approval_urls": [],

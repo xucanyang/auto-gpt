@@ -8,10 +8,9 @@ from sqlmodel import Session
 
 from core.config_store import config_store
 from core.db import AccountModel
-from services.chatgpt_core.status_probe import probe_local_chatgpt_status
 from services.chatgpt_core.oaipay_upload import build_oaipay_lookup_payload, upload_to_oaipay_detailed
-from services.chatgpt_account_state import classify_chatgpt_capabilities, is_chatgpt_upload_ready
-from services.chatgpt_sync import build_chatgpt_sync_account, update_account_model_local_probe
+from services.chatgpt_account_state import classify_chatgpt_capabilities
+from services.chatgpt_sync import build_chatgpt_sync_account
 
 SUB2API_SYNC_NAME = "oaipay"
 
@@ -420,14 +419,6 @@ def probe_chatgpt_oaipay_status(account: Any) -> dict[str, Any]:
     return _build_exists_state(candidates[0])
 
 
-def _remote_exists(sync_result: dict[str, Any]) -> bool:
-    return _safe_str(sync_result.get("remote_state")).lower() == "exists"
-
-
-def _remote_ambiguous(sync_result: dict[str, Any]) -> bool:
-    return _safe_str(sync_result.get("remote_state")).lower() == "ambiguous"
-
-
 def _last_upload(status: str, action: str, message: str, *, started_at: str, finished_at: str | None = None, **extra: Any) -> dict[str, Any]:
     payload = {
         "status": status,
@@ -467,14 +458,15 @@ def _build_upload_failure_state(
 ) -> dict[str, Any]:
     initial_sync = dict(initial_sync or {})
     category_fields = _upload_category_fields(upload_result) or _upload_category_fields(initial_sync)
+    remote_state = _safe_str(initial_sync.get("remote_state")).lower() or "unknown"
     return {
         **initial_sync,
         **category_fields,
-        "remote_state": _safe_str(initial_sync.get("remote_state")) or "not_found",
-        "uploaded": False,
+        "remote_state": remote_state,
+        "uploaded": bool(initial_sync.get("uploaded")) or remote_state in {"exists", "uploaded"},
         "message": message,
-        "checked_at": _utcnow_iso(),
-        "probe_source": _safe_str(initial_sync.get("probe_source")) or "api",
+        "checked_at": _safe_str(initial_sync.get("checked_at")) or _utcnow_iso(),
+        "probe_source": _safe_str(initial_sync.get("probe_source")) or "upload",
         "last_upload": _last_upload(
             "failed",
             "upload",
@@ -501,7 +493,7 @@ def _build_upload_success_state(result: dict[str, Any], *, started_at: str, init
         "message": message,
         "checked_at": _utcnow_iso(),
         "uploaded_at": _utcnow_iso(),
-        "probe_source": "api",
+        "probe_source": "upload",
         "last_upload": _last_upload(
             "success",
             "upload",
@@ -516,13 +508,6 @@ def _build_upload_success_state(result: dict[str, Any], *, started_at: str, init
     }
 
 
-def _persist_and_finish(account: AccountModel, sync_state: dict[str, Any], session: Session | None, commit: bool) -> None:
-    update_account_model_oaipay_sync(account, sync_state, session=session, commit=False)
-    if session is not None and commit:
-        session.commit()
-        session.refresh(account)
-
-
 def backfill_chatgpt_account_to_oaipay(
     account: AccountModel,
     *,
@@ -535,79 +520,7 @@ def backfill_chatgpt_account_to_oaipay(
     results: list[dict[str, Any]] = []
     started_at = _utcnow_iso()
     cached_sync = get_oaipay_sync_state(account)
-    remote_state = _safe_str(cached_sync.get("remote_state")).lower()
-    use_cached = (
-        bool(cached_sync)
-        and remote_state == "exists"
-        and not cached_sync.get("candidate_count")
-        and not cached_sync.get("candidates")
-    )
-
-    initial_sync = cached_sync if use_cached else probe_chatgpt_oaipay_status(account)
-    update_account_model_oaipay_sync(account, initial_sync, session=session, commit=False)
-
-    if _safe_str(initial_sync.get("remote_state")).lower() == "unreachable":
-        msg = initial_sync.get("message") or "OAIPay API 探测不可连接，继续尝试直接上传"
-        results.append({"name": "OAIPay API 探测", "ok": True, "msg": msg})
-
-    if _remote_exists(initial_sync):
-        msg = f"远端已存在 ({initial_sync.get('matched_by') or '已命中'})，跳过上传"
-        sync_state = {
-            **dict(initial_sync),
-            "last_upload": _last_upload(
-                "skipped",
-                "probe_skip",
-                msg,
-                started_at=started_at,
-                remote_account_id=initial_sync.get("remote_account_id"),
-                probe_before=initial_sync.get("remote_state") or "exists",
-            ),
-        }
-        _persist_and_finish(account, sync_state, session, commit)
-        results.append({"name": "OAIPay API 探测", "ok": True, "msg": msg})
-        return {"ok": True, "uploaded": False, "skipped": True, "message": msg, "results": results, **_upload_category_fields(sync_state)}
-
-    if _remote_ambiguous(initial_sync):
-        msg = initial_sync.get("message") or "远端匹配到多条记录，已跳过上传"
-        sync_state = {
-            **dict(initial_sync),
-            "last_upload": _last_upload("skipped", "probe_skip", msg, started_at=started_at, probe_before="ambiguous"),
-        }
-        _persist_and_finish(account, sync_state, session, commit)
-        results.append({"name": "OAIPay API 探测", "ok": False, "msg": msg})
-        return {"ok": False, "uploaded": False, "skipped": True, "message": msg, "results": results, **_upload_category_fields(sync_state)}
-
-    initial_remote_state = _safe_str(initial_sync.get("remote_state")).lower()
-    if initial_remote_state in {"cross_workspace_only", "deleted_exact_match"}:
-        msg = initial_sync.get("message") or (
-            "仅命中其他 workspace，允许为当前 workspace 补传"
-            if initial_remote_state == "cross_workspace_only"
-            else "远端存在已删除的精确 OAIPay 记录，可重新补传"
-        )
-        results.append({"name": "OAIPay API 探测", "ok": True, "msg": msg})
-
     sync_account = build_chatgpt_sync_account(account)
-    probe = probe_local_chatgpt_status(sync_account, proxy=None)
-    update_account_model_local_probe(account, probe, session=session, commit=False)
-    ready, gate_msg, _capabilities = is_chatgpt_upload_ready(account, local_probe=probe)
-    if str(_capabilities.get("auth_level") or "") != "invalid":
-        ready = True
-        gate_msg = ""
-    if not ready:
-        auth = probe.get("auth") if isinstance(probe.get("auth"), dict) else {}
-        msg = gate_msg or auth.get("message") or f"本地状态不可上传: {auth.get('state') or 'unknown'}"
-        blocked_sync_state = {
-            **dict(initial_sync or {}),
-            "uploaded": False,
-            "message": f"{initial_sync.get('message') or '远端 API 未发现 OAIPay 账号'}；但当前无法补传：{msg}",
-            "checked_at": _utcnow_iso(),
-            "probe_source": _safe_str(initial_sync.get("probe_source")) or "api",
-            "last_upload": _last_upload("blocked", "upload", msg, started_at=started_at, probe_before=initial_sync.get("remote_state") or ""),
-        }
-        _persist_and_finish(account, blocked_sync_state, session, commit)
-        results.append({"name": "本地状态探测", "ok": False, "msg": msg})
-        return {"ok": False, "uploaded": False, "skipped": False, "message": msg, "results": results, **_upload_category_fields(blocked_sync_state)}
-
     mode = str(category_mode or "auto").strip().lower() or "auto"
     if mode not in {"auto", "manual"}:
         mode = "auto"
@@ -617,19 +530,23 @@ def backfill_chatgpt_account_to_oaipay(
         # Backward compatibility: historical callers passed category_id as the
         # fallback group while automatic classification still took precedence.
         fallback_group_ids = [int(category_id)]
-    upload_result = upload_to_oaipay_detailed(
-        sync_account,
-        group_ids=group_ids,
-        fallback_group_ids=fallback_group_ids,
-        category_mode=mode,
-        capabilities=_capabilities,
-    )
+    capabilities = classify_chatgpt_capabilities(account)
+    try:
+        upload_result = upload_to_oaipay_detailed(
+            sync_account,
+            group_ids=group_ids,
+            fallback_group_ids=fallback_group_ids,
+            category_mode=mode,
+            capabilities=capabilities,
+        )
+    except Exception as exc:
+        upload_result = {"ok": False, "message": f"上传异常: {exc}"}
     ok = bool(upload_result.get("ok"))
     msg = _safe_str(upload_result.get("message")) or ("上传成功" if ok else "上传失败")
     upload_state = (
-        _build_upload_success_state(upload_result, started_at=started_at, initial_sync=initial_sync)
+        _build_upload_success_state(upload_result, started_at=started_at, initial_sync=cached_sync)
         if ok
-        else _build_upload_failure_state(msg, started_at=started_at, initial_sync=initial_sync, upload_result=upload_result)
+        else _build_upload_failure_state(msg, started_at=started_at, initial_sync=cached_sync, upload_result=upload_result)
     )
     update_account_model_oaipay_sync(account, upload_state, session=session, commit=False)
     results.append({"name": "OAIPay 上传", "ok": ok, "msg": msg})
