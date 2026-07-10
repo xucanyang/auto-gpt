@@ -95,6 +95,7 @@ export function RegisterTaskModal({
   const chatgptRegistrationEntry = Form.useWatch('chatgpt_registration_entry', registerForm)
   const phoneSignupUsePool = Form.useWatch('chatgpt_phone_signup_use_pool', registerForm)
   const selectedTempMailDomains = Form.useWatch('tempmail_fixed_domains', registerForm) || []
+  const selectedTempMailMode = String(Form.useWatch('tempmail_mode', registerForm) || '').trim().toLowerCase()
   const proxyMode = Form.useWatch('proxy_mode', registerForm)
   const proxyFailover = Form.useWatch('proxy_failover', registerForm)
   const uniqueExitIpEnabled = Form.useWatch('chatgpt_register_unique_exit_ip_enabled', registerForm)
@@ -109,6 +110,8 @@ export function RegisterTaskModal({
       ? registerProviderOverride
       : registerMailProvider
   const effectiveTempMailProvider = effectiveRegisterMailProvider === 'tempmail_local' || effectiveRegisterMailProvider === 'tempmail_api'
+  const tempmailRequiresFixedDomain = effectiveTempMailProvider && selectedTempMailMode === 'fixed_domain'
+  const tempmailUsesTaskSubdomain = effectiveTempMailProvider && selectedTempMailMode === 'task_subdomain'
   const normalizedSelectedTempMailDomains = normalizeDomainList(selectedTempMailDomains)
   const tempmailDomainOptions = useMemo(() => {
     const byDomain = new Map<string, TempMailDomainOption>()
@@ -144,9 +147,9 @@ export function RegisterTaskModal({
   }
 
   useEffect(() => {
-    if (!open || !effectiveTempMailProvider) return
+    if (!open || !tempmailRequiresFixedDomain) return
     void loadTempMailDomains(true)
-  }, [open, effectiveTempMailProvider])
+  }, [open, tempmailRequiresFixedDomain])
 
   useEffect(() => {
     if (!open || !isPhoneSignup) return
@@ -268,9 +271,14 @@ export function RegisterTaskModal({
   const handleRegister = async () => {
     try {
       await persistChatGPTK12Config()
-      await onRegister()
     } catch (error: any) {
       message.error(error?.message || '保存 K12 配置失败')
+      return
+    }
+    try {
+      await onRegister()
+    } catch (error: any) {
+      message.error(error?.message || '创建注册任务失败')
     }
   }
 
@@ -285,6 +293,12 @@ export function RegisterTaskModal({
     >
       {!taskId ? (
         <Form form={registerForm} layout="vertical" onFinish={handleRegister}>
+          <Form.Item name="tempmail_mode" hidden>
+            <Input />
+          </Form.Item>
+          <Form.Item name="tempmail_primary_domain" hidden>
+            <Input />
+          </Form.Item>
           {currentPlatform === 'chatgpt' ? (
             <Form.Item name="chatgpt_registration_entry" label="注册入口" initialValue="email_signup">
               <Select
@@ -396,44 +410,49 @@ export function RegisterTaskModal({
                 showIcon
                 style={{ marginBottom: 16 }}
                 message="当前注册将使用 TempMail Ready API"
-                description="固定域名建箱。可单选或多选域名；多选时每个新邮箱会从候选域名中随机选择一个。"
+                description={tempmailRequiresFixedDomain
+                  ? '固定域名建箱。可单选或多选域名；多选时每个新邮箱会从候选域名中随机选择一个。'
+                  : tempmailUsesTaskSubdomain
+                    ? '随机子域 Ready 建箱。每个任务由 TempMail API 分配子域邮箱，不需要选择固定域名。'
+                    : '正在读取 TempMail 建箱配置...'}
               />
-              <Space align="start" style={{ width: '100%' }}>
-                <Form.Item
-                  name="tempmail_fixed_domains"
-                  label="TempMail 可用域名"
-                  style={{ flex: 1 }}
-                  rules={[
-                    {
-                      validator: (_, value) => {
-                        if (!effectiveTempMailProvider) return Promise.resolve()
-                        return normalizeDomainList(value).length > 0
-                          ? Promise.resolve()
-                          : Promise.reject(new Error('请选择至少一个 TempMail 可用域名'))
+              {tempmailRequiresFixedDomain ? (
+                <Space align="start" style={{ width: '100%' }}>
+                  <Form.Item
+                    name="tempmail_fixed_domains"
+                    label="TempMail 可用域名"
+                    style={{ flex: 1 }}
+                    rules={[
+                      {
+                        validator: (_, value) => (
+                          normalizeDomainList(value).length > 0
+                            ? Promise.resolve()
+                            : Promise.reject(new Error('请选择至少一个 TempMail 可用域名'))
+                        ),
                       },
-                    },
-                  ]}
-                  extra="固定域名模式必选。选择多个域名时，注册任务会自动分散使用。"
-                >
-                  <Select
-                    mode="multiple"
-                    allowClear
-                    showSearch
+                    ]}
+                    extra="固定域名模式必选。选择多个域名时，注册任务会自动分散使用。"
+                  >
+                    <Select
+                      mode="multiple"
+                      allowClear
+                      showSearch
+                      loading={tempmailDomainsLoading}
+                      placeholder={tempmailDomainsLoading ? '正在加载域名...' : '请选择一个或多个可用域名'}
+                      options={tempmailDomainOptions}
+                      optionFilterProp="label"
+                    />
+                  </Form.Item>
+                  <Button
+                    icon={<ReloadOutlined />}
                     loading={tempmailDomainsLoading}
-                    placeholder={tempmailDomainsLoading ? '正在加载域名...' : '请选择一个或多个可用域名'}
-                    options={tempmailDomainOptions}
-                    optionFilterProp="label"
-                  />
-                </Form.Item>
-                <Button
-                  icon={<ReloadOutlined />}
-                  loading={tempmailDomainsLoading}
-                  onClick={() => { void loadTempMailDomains(false) }}
-                  style={{ marginTop: 30 }}
-                >
-                  刷新
-                </Button>
-              </Space>
+                    onClick={() => { void loadTempMailDomains(false) }}
+                    style={{ marginTop: 30 }}
+                  >
+                    刷新
+                  </Button>
+                </Space>
+              ) : null}
             </>
           ) : null}
           {currentPlatform === 'chatgpt' && !isPhoneSignup && effectiveRegisterMailProvider === 'manual_email_otp' ? (

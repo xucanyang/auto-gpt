@@ -4,6 +4,17 @@
 
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，并且本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/) (语义化版本)。
 
+## [1.3.57] - 2026-07-11
+
+### 修复 (Fixed)
+- **修复账号页 TempMail Ready 注册任务无法创建**：`frontend/src/pages/Accounts.tsx` 现在在打开注册弹窗时从共享配置回填 `tempmail_mode`、`tempmail_fixed_domains` 和兼容的主域名；提交时会规范化并把用户选择的全部固定域名写入 `extra.tempmail_fixed_domains`，再用首个候选域名同步 `tempmail_primary_domain`。此前账号页虽然显示了域名选择器，但请求只携带空的旧单域名字段，固定域名模式会在 `/api/tasks/register` 入队前被 `400` 拒绝。
+- **按建箱模式收敛 TempMail 弹窗门禁**：`frontend/src/features/auth/components/RegisterTaskModal.tsx` 仅在 `fixed_domain` 模式加载、展示并校验可用域名；`task_subdomain` / Ready 随机子域模式不再被固定域名必填项阻断，界面会明确说明无需选择域名。注册提交与 K12 配置保存的异常也被分开呈现，避免把注册字段错误误报为“保存 K12 配置失败”。
+- **为旧客户端增加后端兼容回退**：`api/tasks.py` 在 TempMail 固定域名请求缺少候选域名时，会回退读取共享 `tempmail_fixed_domains`，并始终写回确定的 `tempmail_primary_domain`。这保留了旧弹窗/旧 bundle 的可用性，同时请求中显式传入的多域名仍优先于全局默认值。
+
+### 测试 (Tests)
+- **覆盖 TempMail 注册参数契约**：新增 `tests/test_tempmail_register_request.py`，验证全局多域名回退、请求多域名优先且完整保留，以及 `task_subdomain` 在无固定域名时可通过请求准备层；同时执行既有 `tests/test_register_task_controls.py`，确认相邻注册控制逻辑未回归。
+- **发布前完成构建和多实例 smoke**：执行 Python 语法检查、定向 pytest、前端 TypeScript/Vite 生产构建，并在发布后验证 Plus 与 auto-plus2 的新静态包、健康接口和 TempMail 请求准备路径。
+
 ## [1.3.56] - 2026-07-11
 
 ### 优化 (Changed)
@@ -1208,4 +1219,8 @@
 
 ## 2026-07-11 02:54:29 +0800
 - 优化账号页筛选组合与操作显示
+- 发布模式: multi
+
+## 2026-07-11 04:31:58 +0800
+- 修复账号页 TempMail Ready 注册域名丢失
 - 发布模式: multi

@@ -63,6 +63,7 @@ import { parseBooleanConfigValue } from '@/lib/configValueParsers'
 import { buildChatGPTRegistrationRequestAdapter } from '@/lib/chatgptRegistrationRequestAdapter'
 import { CHATGPT_REGISTRATION_MODE_REFRESH_TOKEN } from '@/lib/chatgptRegistrationMode'
 import { buildChatGPTK12Payload } from '@/lib/chatgptK12Config'
+import { normalizeDomainList, parseStoredDomainList } from '@/lib/domainList'
 import {
   DEFAULT_GOPAY_PHONE_COUNTRY_CODE,
   normalizeGopayPhonePart,
@@ -3300,12 +3301,20 @@ export default function Accounts() {
 
   useEffect(() => {
     if (!registerModalOpen) return
+    let cancelled = false
     loadConfigCache()
       .then((cfg) => {
+        if (cancelled) return
         const provider = String(cfg?.mail_provider || 'luckmail').trim() || 'luckmail'
         const savedSettings = loadRegisterFormSettings(currentPlatform)
         const proxySettings = taskProxySettingsFromConfig(cfg, savedSettings)
         const savedEmail = window.localStorage.getItem('auto-chatgpt.manual_email_otp.email') || ''
+        const configuredTempMailMode = String(cfg?.tempmail_mode || 'fixed_domain').trim().toLowerCase()
+        const tempmailMode = configuredTempMailMode === 'task_subdomain' ? 'task_subdomain' : 'fixed_domain'
+        const tempmailFixedDomains = normalizeDomainList([
+          ...parseStoredDomainList(cfg?.tempmail_fixed_domains),
+          cfg?.tempmail_primary_domain,
+        ])
         setRegisterMailProvider(provider)
         registerForm.setFieldsValue({
           count: Number(savedSettings.count || 1) || 1,
@@ -3320,6 +3329,9 @@ export default function Accounts() {
           email_api_gmail_variant_count: Number(cfg.email_api_gmail_variant_count || 2) || 2,
           email_api_gmail_variant_rules: cfg.email_api_gmail_variant_rules || 'all',
           email_api_gmail_plus_tag_template: cfg.email_api_gmail_plus_tag_template || 'r{rand}',
+          tempmail_mode: tempmailMode,
+          tempmail_primary_domain: tempmailFixedDomains[0] || '',
+          tempmail_fixed_domains: tempmailFixedDomains,
           email: String(savedSettings.email || savedEmail || '').trim(),
           login_password: String(cfg.chatgpt_existing_account_login_password || '').trim(),
           chatgpt_existing_account_capture: savedSettings.chatgpt_existing_account_capture ?? false,
@@ -3361,6 +3373,7 @@ export default function Accounts() {
         })
       })
       .catch(() => {
+        if (cancelled) return
         setRegisterMailProvider('luckmail')
         const savedSettings = loadRegisterFormSettings(currentPlatform)
         const savedEmail = window.localStorage.getItem('auto-chatgpt.manual_email_otp.email') || ''
@@ -3377,6 +3390,9 @@ export default function Accounts() {
           email_api_gmail_variant_count: 2,
           email_api_gmail_variant_rules: 'all',
           email_api_gmail_plus_tag_template: 'r{rand}',
+          tempmail_mode: 'fixed_domain',
+          tempmail_primary_domain: '',
+          tempmail_fixed_domains: [],
           email: String(savedSettings.email || savedEmail || '').trim(),
           login_password: '',
           chatgpt_existing_account_capture: savedSettings.chatgpt_existing_account_capture ?? false,
@@ -3392,6 +3408,9 @@ export default function Accounts() {
           chatgpt_register_otp_account_budget_seconds: savedSettings.chatgpt_register_otp_account_budget_seconds ?? 210,
         })
       })
+    return () => {
+      cancelled = true
+    }
   }, [registerModalOpen, currentPlatform, registerForm, loadConfigCache])
 
   useEffect(() => {
@@ -4891,9 +4910,9 @@ export default function Accounts() {
   }
 
   const handleRegister = async () => {
-    const values = await registerForm.validateFields()
-    setRegisterLoading(true)
     try {
+      const values = await registerForm.validateFields()
+      setRegisterLoading(true)
       setTaskModalMode('register')
       setTaskModalAccount(null)
       const cfg = await loadConfigCache({ force: true })
@@ -4913,6 +4932,13 @@ export default function Accounts() {
       if (existingAccountCapture && !values.chatgpt_capture_business_workspace && !values.chatgpt_capture_free_workspace) {
         throw new Error('已有账号抓 auth 模式至少要选择一个工作空间')
       }
+      const configuredTempMailMode = String(values.tempmail_mode || cfg.tempmail_mode || 'fixed_domain').trim().toLowerCase()
+      const tempmailMode = configuredTempMailMode === 'task_subdomain' ? 'task_subdomain' : 'fixed_domain'
+      const tempmailFixedDomains = normalizeDomainList(values.tempmail_fixed_domains)
+      const tempmailPrimaryDomain = tempmailFixedDomains[0]
+        || (tempmailMode === 'task_subdomain'
+          ? String(values.tempmail_primary_domain || cfg.tempmail_primary_domain || '').trim().replace(/^[@.]+/, '')
+          : '')
       const registerExtra = {
         mail_provider: resolvedMailProvider,
         email_api_lines: resolvedMailProvider === 'email_api' ? String(values.email_api_lines || cfg.email_api_lines || '').trim() : undefined,
@@ -4946,8 +4972,9 @@ export default function Accounts() {
         tempmail_api_url: cfg.tempmail_api_url,
         tempmail_api_key: cfg.tempmail_api_key,
         tempmail_api_key_header: cfg.tempmail_api_key_header,
-        tempmail_mode: cfg.tempmail_mode,
-        tempmail_primary_domain: cfg.tempmail_primary_domain,
+        tempmail_mode: tempmailMode,
+        tempmail_primary_domain: tempmailPrimaryDomain,
+        tempmail_fixed_domains: tempmailFixedDomains,
         tempmail_wait_timeout_seconds: cfg.tempmail_wait_timeout_seconds,
         tempmail_ttl_minutes: cfg.tempmail_ttl_minutes,
         tempmail_reuse_window_minutes: cfg.tempmail_reuse_window_minutes,
@@ -5119,6 +5146,7 @@ export default function Accounts() {
       })
       setTaskId(res.task_id)
     } catch (e: any) {
+      if (Array.isArray(e?.errorFields)) return
       message.error(e?.message || '创建注册任务失败')
     } finally {
       setRegisterLoading(false)

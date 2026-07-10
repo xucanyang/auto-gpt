@@ -592,6 +592,8 @@ def _prepare_register_request(req: RegisterTaskRequest) -> RegisterTaskRequest:
         mode = str(prepared.extra.get("tempmail_mode") or config_store.get("tempmail_mode", "fixed_domain") or "fixed_domain").strip().lower()
         if mode == "fixed_domain":
             domains = _normalize_domain_list(prepared.extra.get("tempmail_fixed_domains"))
+            if not domains:
+                domains = _normalize_domain_list(config_store.get("tempmail_fixed_domains", ""))
             primary_domain = str(prepared.extra.get("tempmail_primary_domain") or config_store.get("tempmail_primary_domain", "") or "").strip().lstrip("@.")
             if primary_domain and primary_domain not in domains:
                 domains.append(primary_domain)
@@ -599,7 +601,7 @@ def _prepare_register_request(req: RegisterTaskRequest) -> RegisterTaskRequest:
                 raise HTTPException(400, "固定域名模式下请至少选择一个 TempMail 可用域名")
             prepared.extra["tempmail_mode"] = "fixed_domain"
             prepared.extra["tempmail_fixed_domains"] = domains
-            prepared.extra.setdefault("tempmail_primary_domain", domains[0])
+            prepared.extra["tempmail_primary_domain"] = primary_domain or domains[0]
 
     if mail_provider == "luckmail":
         prepared.extra["luckmail_project_code"] = "openai"
