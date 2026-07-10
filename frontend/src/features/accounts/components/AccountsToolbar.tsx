@@ -48,7 +48,6 @@ type ActiveTaskSnapshot = {
 }
 
 const DEFAULT_PINNED_ACTION_IDS: AccountsToolbarActionId[] = ['statusSync', 'paymentLink']
-const MAX_PINNED_ACTIONS = 3
 const CHATGPT_SYNC_ACTION_IDS: AccountsToolbarActionId[] = ['statusSync', 'resumeAuth', 'backfill']
 const CHATGPT_BATCH_ACTION_IDS: AccountsToolbarActionId[] = [
   'invalidRecheck',
@@ -83,7 +82,7 @@ const normalizePinnedActionIds = (actionIds: string[]): AccountsToolbarActionId[
     normalized.push(actionId)
   }
 
-  return normalized.slice(0, MAX_PINNED_ACTIONS)
+  return normalized
 }
 
 const makeMoreMenuChildKey = (actionId: AccountsToolbarActionId, key: React.Key) => (

@@ -263,9 +263,10 @@ body {
 
 .accounts-filter-preset-pinned-row {
   display: flex;
+  flex: 1 1 240px;
   align-items: center;
   gap: 8px;
-  width: 100%;
+  min-width: 0;
 }
 
 .accounts-filter-preset-pinned-label {

@@ -122,7 +122,6 @@ const EMPTY_LIST: any[] = []
 const SUBSCRIPTION_EXPIRY_SORT_FIELD = 'subscription_active_until'
 
 const DEFAULT_PINNED_ACCOUNT_TOOLBAR_ACTIONS: AccountToolbarActionId[] = ['statusSync', 'paymentLink']
-const MAX_PINNED_ACCOUNT_TOOLBAR_ACTIONS = 3
 
 const ACCOUNT_TOOLBAR_ACTION_OPTIONS: Array<{ value: AccountToolbarActionId; text: string }> = [
   { value: 'statusSync', text: '状态同步' },
@@ -1230,7 +1229,7 @@ function normalizePinnedToolbarActions(value: unknown): AccountToolbarActionId[]
   const normalized = value
     .map((item) => String(item || '').trim())
     .filter((item): item is AccountToolbarActionId => allowed.has(item as AccountToolbarActionId))
-  return Array.from(new Set(normalized)).slice(0, MAX_PINNED_ACCOUNT_TOOLBAR_ACTIONS)
+  return Array.from(new Set(normalized))
 }
 
 function loadPinnedToolbarActions() {
@@ -5517,12 +5516,7 @@ export default function Accounts() {
   }
 
   const renderToolbarActionVisibilityControl = () => {
-    const pinnedActionSet = new Set(pinnedToolbarActionIds)
-    const toolbarActionOptions = toCheckboxOptions(ACCOUNT_TOOLBAR_ACTION_OPTIONS).map((option) => ({
-      ...option,
-      disabled: pinnedToolbarActionIds.length >= MAX_PINNED_ACCOUNT_TOOLBAR_ACTIONS
-        && !pinnedActionSet.has(String(option.value) as AccountToolbarActionId),
-    }))
+    const toolbarActionOptions = toCheckboxOptions(ACCOUNT_TOOLBAR_ACTION_OPTIONS)
     const overlay = (
       <div
         onClick={(event) => event.stopPropagation()}
@@ -5536,7 +5530,7 @@ export default function Accounts() {
         }}
       >
         <Text type="secondary" style={{ display: 'block', fontSize: 12, marginBottom: 10 }}>
-          最多固定 3 个操作；未勾选的仍可在“更多操作”中使用。危险操作始终收在更多里。
+          勾选的操作会直接显示；未勾选的仍可在“更多操作”中使用。危险操作始终收在更多里。
         </Text>
         <Checkbox.Group
           value={pinnedToolbarActionIds}
@@ -5551,9 +5545,9 @@ export default function Accounts() {
         <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 12 }}>
           <Button
             size="small"
-            onClick={() => updatePinnedToolbarActions(ACCOUNT_TOOLBAR_ACTION_OPTIONS.slice(0, MAX_PINNED_ACCOUNT_TOOLBAR_ACTIONS).map((option) => option.value))}
+            onClick={() => updatePinnedToolbarActions(ACCOUNT_TOOLBAR_ACTION_OPTIONS.map((option) => option.value))}
           >
-            固定前三项
+            全部固定
           </Button>
           <Button size="small" onClick={resetPinnedToolbarActions}>
             默认

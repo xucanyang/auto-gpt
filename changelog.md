@@ -4,6 +4,16 @@
 
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，并且本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/) (语义化版本)。
 
+## [1.3.55] - 2026-07-11
+
+### 优化 (Changed)
+- **筛选组合收敛为紧凑单行**：`frontend/src/features/accounts/components/FilterPresetBar.tsx` 将桌面端置顶筛选组合快捷项并入“筛选组合”选择器、管理入口所在的同一操作行；`frontend/src/index.css` 让快捷项只占用下拉框后的剩余空间并在组合过多时保留该区域的横向滚动，避免固定 180px 的选择框下方再产生独立空行。移动端原有筛选和组合展示逻辑不变。
+- **批量操作显示取消三项上限**：`frontend/src/pages/Accounts.tsx` 不再在浏览器本地偏好读取、保存或勾选面板中截断固定操作；`frontend/src/features/accounts/components/AccountsToolbar.tsx` 同步移除渲染层二次截断。运营可直接固定任意数量的普通批量操作，桌面工具栏按既有换行规则承载，未固定操作仍在“更多操作”中可用，危险删除操作继续只留在该菜单中。
+- **前端版本同步至 v1.3.55**：`frontend/src/app/AppShell.tsx` 更新侧栏版本，便于确认已加载本次账号页布局与操作偏好修复的静态资源。
+
+### 测试 (Tests)
+- **完成前端生产构建与改动检查**：`frontend npm run build` 已通过 TypeScript 编译和 Vite 静态资源构建，`git diff --check` 无空白错误。账号页历史 `Accounts.tsx` 仍存在既有 ESLint 债务；本次涉及的筛选组合、工具栏和侧栏组件未新增 ESLint 报错。
+
 ## [1.3.54] - 2026-07-11
 
 ### 优化 (Changed)
@@ -1185,4 +1195,8 @@
 
 ## 2026-07-11 02:25:52 +0800
 - 合并全局动态代理配置并清除旧覆盖字段
+- 发布模式: multi
+
+## 2026-07-11 02:54:29 +0800
+- 优化账号页筛选组合与操作显示
 - 发布模式: multi

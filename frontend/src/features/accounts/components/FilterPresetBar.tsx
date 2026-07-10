@@ -138,38 +138,37 @@ export const FilterPresetBar: React.FC<FilterPresetBarProps> = ({
               aria-label="管理筛选组合"
             />
           </Dropdown>
+          {pinnedFilterPresets.length > 0 && !isMobile ? (
+            <div className="accounts-filter-preset-pinned-row">
+              <div className="accounts-filter-preset-pinned-label">
+                <PushpinOutlined />
+                <Text type="secondary">置顶</Text>
+              </div>
+              <div className="accounts-filter-preset-pinned-scroll">
+                {pinnedFilterPresets.map((preset) => {
+                  const active = preset.id === activeFilterPresetId
+                  return (
+                    <Button
+                      key={preset.id}
+                      className="accounts-filter-preset-pinned-button"
+                      size="small"
+                      type={active ? 'primary' : 'default'}
+                      ghost={active}
+                      icon={preset.pinned ? <PushpinOutlined /> : undefined}
+                      onClick={() => {
+                        if (active) clearFilterPreset()
+                        else applyFilterPreset(preset)
+                      }}
+                    >
+                      {preset.name}
+                    </Button>
+                  )
+                })}
+              </div>
+            </div>
+          ) : null}
         </div>
       </div>
-
-      {pinnedFilterPresets.length > 0 && !isMobile ? (
-        <div className="accounts-filter-preset-pinned-row">
-          <div className="accounts-filter-preset-pinned-label">
-            <PushpinOutlined />
-            <Text type="secondary">置顶</Text>
-          </div>
-          <div className="accounts-filter-preset-pinned-scroll">
-            {pinnedFilterPresets.map((preset) => {
-              const active = preset.id === activeFilterPresetId
-              return (
-                <Button
-                  key={preset.id}
-                  className="accounts-filter-preset-pinned-button"
-                  size="small"
-                  type={active ? 'primary' : 'default'}
-                  ghost={active}
-                  icon={preset.pinned ? <PushpinOutlined /> : undefined}
-                  onClick={() => {
-                    if (active) clearFilterPreset()
-                    else applyFilterPreset(preset)
-                  }}
-                >
-                  {preset.name}
-                </Button>
-              )
-            })}
-          </div>
-        </div>
-      ) : null}
 
       {mobileFilterControls}
 
