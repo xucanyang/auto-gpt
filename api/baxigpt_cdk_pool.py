@@ -164,14 +164,31 @@ def _cleanup_import_jobs() -> None:
 
 
 @router.get("")
-def list_baxigpt_cdk_pool(status: str = "", search: str = ""):
-    records = _repo.list(status=status, search=search)
+def list_baxigpt_cdk_pool(status: str = "", search: str = "", for_submit: bool = False):
+    # Idea 提交需要按真实剩余额度选候选；多额度卡的最后一个订单可能已经
+    # paid/failed，但仍有额度，任务会在真正提交前再次 code-info 校验。
+    records = _repo.list_submit_candidates() if for_submit else _repo.list(status=status, search=search)
+    if for_submit and str(search or "").strip():
+        query = str(search or "").strip().lower()
+        records = [
+            item
+            for item in records
+            if query in item.code_value.lower()
+            or query in item.code_masked.lower()
+            or query in item.bound_account_email.lower()
+            or query in item.order_id.lower()
+            or query in item.display_id.lower()
+            or query in item.label.lower()
+        ]
     all_records = _repo.list()
+    summary = _repo.summarize(all_records)
+    if for_submit:
+        summary["submit_candidates"] = len(records)
     return {
         "items": [item.to_dict(include_code=True) for item in records],
         "total": len(records),
-        "available": _repo.summarize(all_records).get("available", 0),
-        "summary": _repo.summarize(all_records),
+        "available": summary.get("submit_candidates", summary.get("available", 0)),
+        "summary": summary,
         "poller": poller_snapshot(),
     }
 

@@ -6,6 +6,14 @@
 
 ## [Unreleased] (未发布)
 
+## [1.3.48] - 2026-07-10
+### 修复 (Fixed)
+- **修复 Idea 多额度卡密被最后一笔订单状态锁死**：`services/chatgpt_core/baxigpt_cdk_repository.py` 新增提交候选读取规则，除普通 `available` 卡密外，会把本地仍记录 `remaining > 0` 的 `paid / failed` 终态卡密重新交给任务执行上游 `code-info` 校验；`api/tasks.py` 的 Idea 批量提交不再只按单行状态取卡，避免一张多额度卡最后一次订单写成 paid/failed 后，剩余额度在卡密池和任务中被永久忽略。`api/baxigpt_cdk_pool.py` 与账号页提交弹窗同步使用该候选集合，因此库存选择与实际任务取卡一致。
+- **明确粘贴卡密被上游拒绝的真实原因**：Idea 预校验发现 `can_submit=false`、额度耗尽等情况时，`api/tasks.py` 现在把卡密掩码和上游原因写入任务错误及未提交账号原因，不再只显示泛化的“可用卡密额度不足”。例如“该卡密失败次数过多，已被风控限制”会直接可见，避免误判为粘贴内容没有读取。
+
+### 测试 (Tests)
+- **补齐可复用终态卡密回归覆盖**：`tests/test_baxigpt_cdk_pool.py` 覆盖 paid/failed 但仍有剩余额度的卡密进入 Idea 候选、已耗尽/人工停用卡密仍被排除，以及任务创建能使用终态但有余额的多额度卡。
+
 ## [1.3.47] - 2026-07-10
 ### 优化 (Changed)
 - **Sub2API 与 OAIPay 补传改为只上传、不检测**：`services/sub2api_sync.py`、`services/oaipay_sync.py` 以及 `services/chatgpt_core/sub2api_upload.py`、`services/chatgpt_core/oaipay_upload.py` 移除上传前的远端存在探测、本地 ChatGPT 状态刷新、上传就绪 gate 和套餐网络探测；补传现在直接调用目标系统上传接口，由 Sub2API/OAIPay 自身完成最终账号检测。独立“状态同步”操作及 `probe_chatgpt_*_status()` 保持不变，上传成功/失败仍写回 `sync_statuses.last_upload`；无缓存失败使用 `remote_state=unknown`，单次上传失败不会抹掉已有远端存在记录。
@@ -1088,3 +1096,7 @@
 ## 2026-07-10 10:33:55 +0800
 - 修复筛选范围冲突提示上下文
 - 发布模式: hot
+
+## 2026-07-10 11:10:07 +0800
+- 修复 Idea 卡密候选与上游拒绝原因
+- 发布模式: multi

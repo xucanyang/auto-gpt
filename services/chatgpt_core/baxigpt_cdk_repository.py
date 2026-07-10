@@ -397,6 +397,26 @@ class BaxiGptCdkRepository:
             items = session.exec(stmt).all()
         return [_to_record(item) for item in items]
 
+    def list_submit_candidates(self, *, ids: list[int] | None = None) -> list[BaxiGptCdkRecord]:
+        """返回可交给 Idea 再次 code-info 校验的卡密。
+
+        一张多额度卡密会依次绑定多个订单，单行状态会被最后一个订单写成
+        ``paid`` 或 ``failed``。这只是最后一次订单的终态，不等于整张卡已
+        无额度；如果本地已知 remaining>0，仍要让下次任务重新向上游校验。
+        ``submitted/processing/reserved`` 保持排除，避免抢正在使用的卡密；
+        ``disabled`` 仍然是人工硬禁用。
+        """
+        records = self.list_by_ids(ids) if ids else self.list()
+        return [
+            record
+            for record in records
+            if record.status == STATUS_AVAILABLE
+            or (
+                record.status in {STATUS_PAID, STATUS_FAILED}
+                and int(record.code_info_remaining or 0) > 0
+            )
+        ]
+
     def list_by_ids(self, ids: list[int]) -> list[BaxiGptCdkRecord]:
         normalized_ids = [int(value) for value in ids if int(value or 0) > 0]
         if not normalized_ids:

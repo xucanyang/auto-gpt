@@ -253,6 +253,7 @@ type PhonePoolSummary = {
 type BaxiGptCdkPoolSummary = {
   total?: number
   available?: number
+  submit_candidates?: number
   reserved?: number
   submitted?: number
   processing?: number
@@ -2547,7 +2548,7 @@ export default function Accounts() {
   const loadBaxiCdkPoolItems = useCallback(async (silent = true) => {
     setBaxiCdkPoolItemsLoading(true)
     try {
-      const data = await apiFetch('/baxigpt-cdk-pool?status=available')
+      const data = await apiFetch('/baxigpt-cdk-pool?for_submit=true')
       const nextItems = Array.isArray(data?.items) ? data.items : []
       setBaxiCdkPoolItems(nextItems)
       setBaxiCdkPoolSummary((prev) => {
@@ -7373,7 +7374,7 @@ export default function Accounts() {
   const baxiCdkPlannedSuccessTarget = baxiCdkTargetSuccessLimit > 0 && baxiCdkTargetCount > 0
     ? Math.min(baxiCdkTargetSuccessLimit, baxiCdkTargetCount)
     : baxiCdkTargetCount
-  const baxiCdkAvailable = Number(baxiCdkSummary.available || 0)
+  const baxiCdkAvailable = Number(baxiCdkSummary.submit_candidates ?? baxiCdkSummary.available ?? 0)
   const baxiCdkSubmitted = Number(baxiCdkSummary.submitted || 0) + Number(baxiCdkSummary.processing || 0)
   const baxiCdkPaid = Number(baxiCdkSummary.paid || 0)
   const baxiCdkFailed = Number(baxiCdkSummary.failed || 0)

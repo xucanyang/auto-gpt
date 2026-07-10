@@ -4015,7 +4015,9 @@ def enqueue_baxigpt_cdk_submit_task(
             if cdk_id > 0 and cdk_id not in seen_cdk_ids:
                 seen_cdk_ids.add(cdk_id)
                 selected_cdk_ids.append(cdk_id)
-        code_records = repo.list_available(ids=selected_cdk_ids or None)
+        # 多额度卡的单行状态会随最后一个订单落到 paid/failed；只按 status=available
+        # 取卡会把仍有额度的卡永久漏掉。候选在 runner 内会再做 code-info 真校验。
+        code_records = repo.list_submit_candidates(ids=selected_cdk_ids or None)
         code_source = "pool_selected" if selected_cdk_ids else "pool"
     else:
         raise HTTPException(400, "请粘贴卡密，或启用卡密池")
@@ -7069,6 +7071,7 @@ def _run_baxigpt_cdk_submit(task_id: str, pairs: list[dict[str, Any]], settings:
 
         # 2. 预查卡密获取真实可用额度
         active_cdks: dict[int, dict[str, Any]] = {}
+        unavailable_cdk_reasons: list[str] = []
         for cid in candidate_cdk_ids:
             control.checkpoint()
             rec = repo.get_by_id(cid)
@@ -7086,6 +7089,9 @@ def _run_baxigpt_cdk_submit(task_id: str, pairs: list[dict[str, Any]], settings:
                     err_msg = upstream_message(info, f"卡密不可用 remaining={rem}")
                     _log(task_id, f"[SKIP] 卡密不可用: {rec.code_masked} ({err_msg})")
                     repo.mark_failure(rec.id, error_code="code_info_failed", error_message=err_msg, response=info)
+                    reason = f"卡密 {rec.code_masked} 不可用: {err_msg}"
+                    unavailable_cdk_reasons.append(reason)
+                    errors.append(reason)
                     continue
                 cap = rem if rem > 0 else max(len(pending_accounts), 1)
                 _log(task_id, f"[Idea] 卡密可用: {rec.code_masked} | 可用额度={cap} 总额度={info.get('total', cap)}")
@@ -7093,6 +7099,13 @@ def _run_baxigpt_cdk_submit(task_id: str, pairs: list[dict[str, Any]], settings:
             except Exception as exc:
                 _log(task_id, f"[WARN] 预查卡密异常: {rec.code_masked} ({exc})")
                 active_cdks[rec.id] = {"record": rec, "remaining": max(len(pending_accounts), 1)}
+
+        if not active_cdks and unavailable_cdk_reasons:
+            # 原先这里最终只会显示“额度不足”，把上游明确的禁用原因吞掉，
+            # 运营看起来就像卡密池/粘贴都没有被读取。
+            reason = unavailable_cdk_reasons[0]
+            for account in pending_accounts:
+                account["last_unsubmitted_reason"] = reason
 
         # 3. 逐一提交与处理结果轮询 (完全模拟单账号提交与动态查额度)
         active_orders: list[dict[str, Any]] = []

@@ -295,6 +295,24 @@ CDK-AAAA-1111
         self.assertEqual(records[0].status, "failed")
         self.assertEqual(records[0].last_error_message, "卡密配额已用完")
 
+    def test_submit_candidates_reuse_terminal_cards_with_remaining_quota(self):
+        repo = BaxiGptCdkRepository()
+        paid = repo.add(code="CDK-PAID-REMAINING-1111")
+        failed = repo.add(code="CDK-FAILED-REMAINING-2222")
+        exhausted = repo.add(code="CDK-FAILED-EMPTY-3333")
+        disabled = repo.add(code="CDK-DISABLED-4444")
+
+        repo.mark_code_info(paid.id, {"ok": True, "remaining": 2, "total": 3})
+        repo.mark_status_response(paid.id, {"ok": True, "status": "paid"})
+        repo.mark_code_info(failed.id, {"ok": True, "remaining": 1, "total": 3})
+        repo.mark_failure(failed.id, error_code="submit_error", error_message="账号临时失败")
+        repo.mark_code_info(exhausted.id, {"ok": False, "remaining": 0, "total": 1, "msg": "额度已用完"})
+        repo.set_status(disabled.id, "disabled")
+
+        candidates = repo.list_submit_candidates()
+        self.assertEqual([record.id for record in candidates], [paid.id, failed.id])
+        self.assertEqual([record.id for record in repo.list_submit_candidates(ids=[failed.id, paid.id])], [failed.id, paid.id])
+
     def test_code_info_remaining_keeps_reserved(self):
         repo = BaxiGptCdkRepository()
         record = repo.add(code="CDK-AAAA-1111")
@@ -462,6 +480,31 @@ CDK-AAAA-1111
         self.assertEqual(result["pairs"][0]["cdk_id"], int(selected_code.id))
         self.assertEqual(result["skipped_accounts"][0]["reason"], "可用卡密额度不足，本轮未提交")
 
+    def test_submit_task_uses_terminal_card_when_it_still_has_quota(self):
+        repo = BaxiGptCdkRepository()
+        record = repo.add(code="CDK-TERMINAL-REMAINING-1111")
+        repo.mark_code_info(record.id, {"ok": True, "remaining": 2, "total": 3})
+        repo.mark_status_response(record.id, {"ok": True, "status": "paid"})
+        with Session(self.engine) as session:
+            account = AccountModel(platform="chatgpt", email="reusable@example.com", password="pw", token="at")
+            session.add(account)
+            session.commit()
+            session.refresh(account)
+            account_id = int(account.id or 0)
+
+        result = tasks_module.enqueue_baxigpt_cdk_submit_task(
+            tasks_module.BaxiGptCdkSubmitTaskRequest(
+                account_ids=[account_id],
+                use_pool=True,
+                auto_poll_status=False,
+            ),
+            background_tasks=BackgroundTasks(),
+        )
+
+        self.assertEqual(result["available_codes"], 1)
+        self.assertEqual(result["pair_count"], 1)
+        self.assertEqual(result["pairs"][0]["cdk_id"], int(record.id))
+
     def test_submit_task_stores_target_success_count(self):
         repo = BaxiGptCdkRepository()
         selected_code = repo.add(code="CDK-TARGET-1111")
@@ -567,6 +610,45 @@ CDK-AAAA-1111
         self.assertEqual(summary["paid"], 1)
         self.assertEqual(summary["unsubmitted"], 2)
         self.assertIn("已达到本次目标成功数量 1", summary["unsubmitted_accounts"][0]["reason"])
+
+    def test_submit_runtime_surfaces_upstream_card_rejection_reason(self):
+        repo = BaxiGptCdkRepository()
+        record = repo.add(code="CDK-UPSTREAM-BLOCKED-1111")
+        with Session(self.engine) as session:
+            account = AccountModel(platform="chatgpt", email="blocked@example.com", password="pw", token="at")
+            session.add(account)
+            session.commit()
+            session.refresh(account)
+            account_id = int(account.id or 0)
+
+        result = tasks_module.enqueue_baxigpt_cdk_submit_task(
+            tasks_module.BaxiGptCdkSubmitTaskRequest(
+                account_ids=[account_id],
+                code_lines="CDK-UPSTREAM-BLOCKED-1111",
+                use_pool=False,
+                auto_poll_status=False,
+            ),
+            background_tasks=BackgroundTasks(),
+        )
+        snapshot = tasks_module._task_store.snapshot(result["task_id"])
+
+        class FakeBaxiClient:
+            def code_info(self, _code):
+                return {
+                    "ok": False,
+                    "remaining": 990,
+                    "total": 1000,
+                    "message": "该卡密失败次数过多，已被风控限制",
+                }
+
+        with patch("services.chatgpt_core.baxigpt_client.BaxiGptClient", FakeBaxiClient):
+            tasks_module._run_baxigpt_cdk_submit(result["task_id"], snapshot["meta"]["pairs"], snapshot["meta"]["settings"])
+
+        final_snapshot = tasks_module._task_store.snapshot(result["task_id"])
+        summary = final_snapshot["meta"]["idea_submit_summary"]
+        self.assertEqual(final_snapshot["status"], "failed")
+        self.assertIn("该卡密失败次数过多，已被风控限制", final_snapshot["errors"][0])
+        self.assertIn("该卡密失败次数过多，已被风控限制", summary["unsubmitted_accounts"][0]["reason"])
 
 
 class BaxiGptClientRetryTests(unittest.TestCase):
