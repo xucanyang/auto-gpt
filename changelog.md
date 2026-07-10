@@ -6,6 +6,12 @@
 
 ## [Unreleased] (未发布)
 
+### 新增 (Added)
+- **新增独立的 Plus 副本实例 `auto-plus2`**：`docker-compose.multi.yml` 增加 `auto-plus2` 服务，复用 `auto-gpt:latest`、共享全局设置库、TempMail 与 Team Manager 网络，但使用独立的 `/opt/auto-plus2/{data,_ext_targets,external_logs}` 运行态目录与 `APP_INSTANCE_ID=auto-plus2`。服务固定映射 `8003 -> 8000`、`127.0.0.1:8892 -> 8889`、`8320 -> 8317`，避免与现有 Plus 实例的端口、SQLite 数据和运行日志混用。
+
+### 优化 (Changed)
+- **发布拓扑切换为双 Plus 常驻**：`deploy.sh` 现在只构建和升级 `auto-gpt-plus`、`auto-plus2`，并分别做 `8001/8003` 的健康检查和首页检查；显式保留 `auto-gpt`、`auto-k12` 为 standby 容器，发布完成后只停止它们，不删除容器、数据目录或挂载卷。热更新与可选发布前备份清单也同步覆盖 `auto-plus2`，避免后续发布再次误启动已下线实例。
+
 ## [1.3.48] - 2026-07-10
 ### 修复 (Fixed)
 - **修复 Idea 多额度卡密被最后一笔订单状态锁死**：`services/chatgpt_core/baxigpt_cdk_repository.py` 新增提交候选读取规则，除普通 `available` 卡密外，会把本地仍记录 `remaining > 0` 的 `paid / failed` 终态卡密重新交给任务执行上游 `code-info` 校验；`api/tasks.py` 的 Idea 批量提交不再只按单行状态取卡，避免一张多额度卡最后一次订单写成 paid/failed 后，剩余额度在卡密池和任务中被永久忽略。`api/baxigpt_cdk_pool.py` 与账号页提交弹窗同步使用该候选集合，因此库存选择与实际任务取卡一致。
@@ -1099,4 +1105,8 @@
 
 ## 2026-07-10 11:10:07 +0800
 - 修复 Idea 卡密候选与上游拒绝原因
+- 发布模式: multi
+
+## 2026-07-10 12:24:08 +0800
+- 新增 auto-plus2 独立 Plus 实例并下线主服务与 K12 常驻容器
 - 发布模式: multi

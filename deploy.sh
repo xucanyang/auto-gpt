@@ -6,7 +6,8 @@ set -Eeuo pipefail
 # - Git 变更自动写入 changelog.md 并提交
 # - 禁止把运行态/密钥/抓包/依赖产物提交进仓库
 # - 默认不再创建发布前备份；如需临时备份，显式追加 --backup
-# - 发布后校验 /api/health 与首页
+# - 当前常驻拓扑：auto-gpt-plus / auto-plus2；auto-gpt / auto-k12 保持已停止的 standby 容器
+# - 发布后只校验常驻实例，绝不因发布意外重新拉起 standby 实例
 # ==============================================================================
 
 EXPECTED_ROOT="/opt/auto-gpt"
@@ -20,6 +21,9 @@ MODE="multi"      # multi / image / hot
 DRY_RUN=0
 PUSH=0
 BACKUP="${AUTO_GPT_DEPLOY_BACKUP:-0}"
+ACTIVE_SERVICES=(auto-gpt-plus auto-plus2)
+STANDBY_SERVICES=(auto-gpt auto-k12)
+ALL_SERVICES=("${ACTIVE_SERVICES[@]}" "${STANDBY_SERVICES[@]}")
 
 usage() {
   cat <<USAGE
@@ -27,7 +31,7 @@ Usage:
   $0 "本次变更说明" [--mode=multi|image|hot] [--dry-run] [--push] [--backup]
 
 Modes:
-  --mode=multi    默认：docker-compose.multi.yml 构建 auto-gpt:latest 并重启 auto-gpt / auto-gpt-plus / auto-k12
+  --mode=multi    默认：构建 auto-gpt:latest 并升级 auto-gpt-plus / auto-plus2；auto-gpt / auto-k12 保持停止
   --mode=image    调用 scripts/deploy-image-release.sh --apply
   --mode=hot      调用 scripts/deploy-to-auto-gpt-container.sh 对多容器做热同步，仅适合静态/Python 小补丁
   --backup        本次发布前额外创建 .rollback-backups/deploy-<timestamp> 运行态备份；默认关闭
@@ -278,12 +282,12 @@ create_backup() {
   git rev-parse HEAD > "$backup_root/git-head.before.txt"
   git status --short --ignored > "$backup_root/git-status.before.txt" || true
   compose_multi config > "$backup_root/docker-compose.multi.rendered.yml"
-  for service in auto-gpt auto-gpt-plus auto-k12; do
+  for service in "${ALL_SERVICES[@]}"; do
     if docker inspect "$service" >/dev/null 2>&1; then
       docker inspect "$service" > "$backup_root/${service}.inspect.before.json"
     fi
   done
-  for data_root in /opt/auto-gpt/data /opt/auto-gpt-plus/data /opt/auto-k12/data; do
+  for data_root in /opt/auto-gpt/data /opt/auto-gpt-plus/data /opt/auto-plus2/data /opt/auto-k12/data; do
     [[ -d "$data_root" ]] || continue
     name="$(basename "$(dirname "$data_root")")"
     for db in account_manager.db team_manage.db; do
@@ -313,13 +317,28 @@ smoke_url() {
 
 smoke_after_deploy() {
   log "运行容器状态"
-  docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' | grep -E 'NAMES|auto-gpt|auto-k12' || true
-  smoke_url "auto-gpt health" "http://127.0.0.1:8000/api/health"
+  docker ps -a --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' | grep -E 'NAMES|auto-gpt|auto-k12|auto-plus2' || true
   smoke_url "auto-gpt-plus health" "http://127.0.0.1:8001/api/health"
-  smoke_url "auto-k12 health" "http://127.0.0.1:8002/api/health"
-  smoke_url "auto-gpt index" "http://127.0.0.1:8000/"
+  smoke_url "auto-plus2 health" "http://127.0.0.1:8003/api/health"
   smoke_url "auto-gpt-plus index" "http://127.0.0.1:8001/"
-  smoke_url "auto-k12 index" "http://127.0.0.1:8002/"
+  smoke_url "auto-plus2 index" "http://127.0.0.1:8003/"
+}
+
+stop_standby_services() {
+  local service state
+  for service in "${STANDBY_SERVICES[@]}"; do
+    if ! docker inspect "$service" >/dev/null 2>&1; then
+      log "standby ${service}: 容器不存在，跳过"
+      continue
+    fi
+    state="$(docker inspect -f '{{.State.Status}}' "$service")"
+    if [[ "$state" == "running" ]]; then
+      log "停止 standby ${service}（保留容器和全部数据卷）"
+      docker stop "$service" >/dev/null
+    else
+      log "standby ${service}: 已停止（state=${state}）"
+    fi
+  done
 }
 
 log "root=$ROOT_DIR mode=$MODE dry_run=$DRY_RUN backup=$BACKUP compose=${COMPOSE_CMD[*]}"
@@ -368,22 +387,15 @@ case "$MODE" in
   multi)
     log "Compose build: $COMPOSE_FILE"
     compose_multi build
-    log "Compose up -d --remove-orphans"
-    compose_multi up -d --remove-orphans
+    log "Compose up -d --remove-orphans: ${ACTIVE_SERVICES[*]}"
+    compose_multi up -d --remove-orphans "${ACTIVE_SERVICES[@]}"
+    stop_standby_services
     ;;
   image)
     log "调用 scripts/deploy-image-release.sh --apply"
     scripts/deploy-image-release.sh --apply
     ;;
   hot)
-    log "热同步 auto-gpt"
-    if [[ "$BACKUP" == "1" ]]; then
-      BACKUP_ROOT="$backup_root/auto-gpt-hot" CONTAINER=auto-gpt SMOKE_URL=http://127.0.0.1:8000/api/health \
-        scripts/deploy-to-auto-gpt-container.sh --apply --backend --restart --commit-image
-    else
-      SKIP_BACKUP=1 CONTAINER=auto-gpt SMOKE_URL=http://127.0.0.1:8000/api/health \
-        scripts/deploy-to-auto-gpt-container.sh --apply --backend --restart
-    fi
     log "热同步 auto-gpt-plus"
     if [[ "$BACKUP" == "1" ]]; then
       BACKUP_ROOT="$backup_root/auto-gpt-plus-hot" CONTAINER=auto-gpt-plus SMOKE_URL=http://127.0.0.1:8001/api/health \
@@ -392,14 +404,15 @@ case "$MODE" in
       SKIP_BACKUP=1 CONTAINER=auto-gpt-plus SMOKE_URL=http://127.0.0.1:8001/api/health \
         scripts/deploy-to-auto-gpt-container.sh --apply --backend --restart
     fi
-    log "热同步 auto-k12"
+    log "热同步 auto-plus2"
     if [[ "$BACKUP" == "1" ]]; then
-      BACKUP_ROOT="$backup_root/auto-k12-hot" CONTAINER=auto-k12 SMOKE_URL=http://127.0.0.1:8002/api/health \
+      BACKUP_ROOT="$backup_root/auto-plus2-hot" CONTAINER=auto-plus2 SMOKE_URL=http://127.0.0.1:8003/api/health \
         scripts/deploy-to-auto-gpt-container.sh --apply --backend --restart --commit-image
     else
-      SKIP_BACKUP=1 CONTAINER=auto-k12 SMOKE_URL=http://127.0.0.1:8002/api/health \
+      SKIP_BACKUP=1 CONTAINER=auto-plus2 SMOKE_URL=http://127.0.0.1:8003/api/health \
         scripts/deploy-to-auto-gpt-container.sh --apply --backend --restart
     fi
+    stop_standby_services
     ;;
 esac
 
