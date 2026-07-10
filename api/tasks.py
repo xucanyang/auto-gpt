@@ -1,4 +1,7 @@
-from fastapi import APIRouter, BackgroundTasks, HTTPException
+from collections import deque
+import hashlib
+
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlmodel import Session, select
@@ -74,6 +77,128 @@ _task_store = RegisterTaskStore(
 )
 
 _TASK_STAGE_STARTED_AT: dict[tuple[str, str], str] = {}
+
+
+# A page that was already open while a new frontend is deployed continues to
+# execute its old JavaScript.  The v1 task modal had an effect dependency loop
+# which could keep fetching ``/active-summary`` after a terminal task.  The
+# current frontend advertises this protocol marker from ``apiFetch`` and no
+# longer has that loop.  Keep a narrowly scoped breaker for the stale clients:
+# it only fires when the whole runtime has no pending/running task and the same
+# legacy browser session hammers *this one endpoint*.  Returning 401 is
+# deliberate: every supported legacy ``apiFetch`` implementation clears its
+# token and navigates to /login, whose SPA response is no-store and therefore
+# loads the current bundle instead of retrying forever in an already-open tab.
+TASK_POLL_PROTOCOL_HEADER = "x-auto-gpt-task-poll-protocol"
+TASK_POLL_PROTOCOL_VERSION = "2"
+_LEGACY_EMPTY_SUMMARY_WINDOW_SECONDS = 10.0
+_LEGACY_EMPTY_SUMMARY_REQUEST_LIMIT = 40
+_LEGACY_EMPTY_SUMMARY_COOLDOWN_SECONDS = 300.0
+_LEGACY_EMPTY_SUMMARY_MAX_CLIENTS = 512
+
+
+class _LegacyEmptyTaskSummaryPollGuard:
+    """Bounded one-shot refresh fuse for stale terminal-task browser bundles.
+
+    This is not a general API rate limiter and must not affect current clients
+    or an actually running task.  ``X-Real-IP`` is set by our nginx vhosts;
+    direct-port callers are still isolated by a digest of their bearer token.
+    Raw tokens are never stored in this in-memory guard.
+    """
+
+    def __init__(
+        self,
+        *,
+        window_seconds: float = _LEGACY_EMPTY_SUMMARY_WINDOW_SECONDS,
+        request_limit: int = _LEGACY_EMPTY_SUMMARY_REQUEST_LIMIT,
+        cooldown_seconds: float = _LEGACY_EMPTY_SUMMARY_COOLDOWN_SECONDS,
+        max_clients: int = _LEGACY_EMPTY_SUMMARY_MAX_CLIENTS,
+    ) -> None:
+        self.window_seconds = max(float(window_seconds), 0.1)
+        self.request_limit = max(int(request_limit), 1)
+        self.cooldown_seconds = max(float(cooldown_seconds), 0.1)
+        self.max_clients = max(int(max_clients), 1)
+        self._history: dict[str, deque[float]] = {}
+        self._blocked_until: dict[str, float] = {}
+        self._last_seen: dict[str, float] = {}
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _client_key(request: Request) -> str:
+        headers = request.headers
+        # Never accept X-Forwarded-For here: clients can supply its left-hand
+        # values themselves. nginx overwrites X-Real-IP from $remote_addr.
+        real_ip = str(headers.get("x-real-ip") or "").strip()[:128]
+        authorization = str(headers.get("authorization") or "")
+        token_digest = hashlib.sha256(authorization.encode("utf-8")).hexdigest()[:24]
+        if not real_ip and not authorization:
+            return ""
+        return f"{real_ip or 'direct'}:{token_digest}"
+
+    def _forget_locked(self, key: str) -> None:
+        self._history.pop(key, None)
+        self._blocked_until.pop(key, None)
+        self._last_seen.pop(key, None)
+
+    def _prune_locked(self, now: float) -> None:
+        oldest_allowed = now - max(self.window_seconds, self.cooldown_seconds)
+        for key, last_seen in list(self._last_seen.items()):
+            if last_seen < oldest_allowed and self._blocked_until.get(key, 0.0) <= now:
+                self._forget_locked(key)
+        overflow = len(self._last_seen) - self.max_clients
+        if overflow > 0:
+            for key, _ in sorted(self._last_seen.items(), key=lambda item: item[1])[:overflow]:
+                self._forget_locked(key)
+
+    def should_force_refresh(
+        self,
+        request: Request,
+        *,
+        has_runtime_active_task: bool,
+        now: float | None = None,
+    ) -> bool:
+        """Return true once for a proven stale request storm.
+
+        A current client opts out with the protocol header.  Seeing a true
+        runtime active state also clears any old counter, so a legitimate old
+        task is never logged out merely for its normal progress polling.
+        """
+
+        if str(request.headers.get(TASK_POLL_PROTOCOL_HEADER) or "").strip() == TASK_POLL_PROTOCOL_VERSION:
+            return False
+        key = self._client_key(request)
+        if not key:
+            return False
+        current = time.monotonic() if now is None else float(now)
+        with self._lock:
+            self._prune_locked(current)
+            if has_runtime_active_task:
+                self._forget_locked(key)
+                return False
+            if self._blocked_until.get(key, 0.0) > current:
+                # The first 401 is enough to make a legacy apiFetch leave the
+                # page. Avoid repeatedly returning 401 to any in-flight calls.
+                return False
+
+            if key not in self._last_seen and len(self._last_seen) >= self.max_clients:
+                oldest_key = min(self._last_seen, key=self._last_seen.get)
+                self._forget_locked(oldest_key)
+
+            history = self._history.setdefault(key, deque())
+            cutoff = current - self.window_seconds
+            while history and history[0] <= cutoff:
+                history.popleft()
+            history.append(current)
+            self._last_seen[key] = current
+            if len(history) < self.request_limit:
+                return False
+
+            self._blocked_until[key] = current + self.cooldown_seconds
+            history.clear()
+            return True
+
+
+_legacy_empty_task_summary_poll_guard = _LegacyEmptyTaskSummaryPollGuard()
 
 
 class RegisterTaskRequest(BaseModel):
@@ -14496,8 +14621,12 @@ async def stream_logs(task_id: str, since: int = 0):
 
 
 @router.get("/active-summary")
-def list_active_task_summaries():
+def list_active_task_summaries(request: Request):
     snapshots = _task_store.list_snapshots()
+    has_runtime_active_task = any(
+        str(item.get("status") or "").strip().lower() in {"pending", "running"}
+        for item in snapshots
+    )
     active_items = []
     for item in snapshots:
         status = str(item.get("status") or "").strip().lower()
@@ -14522,6 +14651,20 @@ def list_active_task_summaries():
                 "control": dict(item.get("control") or {}),
                 "pending_verification": sanitize_task_detail(item.get("pending_verification")),
             }
+        )
+    if _legacy_empty_task_summary_poll_guard.should_force_refresh(
+        request,
+        has_runtime_active_task=has_runtime_active_task,
+    ):
+        return JSONResponse(
+            status_code=401,
+            content={
+                "detail": {
+                    "code": "CLIENT_REFRESH_REQUIRED",
+                    "message": "检测到已失效任务页面的异常轮询，已要求重新加载当前版本。",
+                }
+            },
+            headers={"Cache-Control": "no-store"},
         )
     return active_items
 

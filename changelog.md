@@ -4,6 +4,15 @@
 
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，并且本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/) (语义化版本)。
 
+## [1.3.53] - 2026-07-11
+
+### 修复 (Fixed)
+- **陈旧终态任务页面的强制换代兜底**：`api/tasks.py` 为 `GET /api/tasks/active-summary` 增加有界、一次性的 legacy-poll fuse。当前前端统一通过 `apiFetch` 发送 task-poll protocol `2`；只有未携带该协议的旧 bundle、同一 `X-Real-IP + Bearer token` 摘要在 10 秒内连续请求 40 次以上、且运行时不存在任何 `pending/running` 任务时，服务端才返回一次 `401 CLIENT_REFRESH_REQUIRED`。旧版 `apiFetch` 会清理本地令牌并跳转到无缓存 `/login`，因此重新登录必然加载新 bundle，而不是让内存中的旧 React effect 无限打空摘要。计数器只保存 token SHA-256 截断摘要、5 分钟冷却并最多保留 512 个客户端；正常新页面、真实运行任务和普通 API 调用不受影响。
+- **前端版本号同步至 v1.3.53**：`frontend/src/app/AppShell.tsx` 显示当前已包含终态轮询协议与陈旧页面熔断兼容的版本。
+
+### 测试 (Tests)
+- **覆盖旧页面轮询熔断边界**：新增 `tests/test_tasks_legacy_poll_guard.py`，验证门限触发只返回一次强制刷新、当前协议客户端和真实运行任务不受影响、不同 Bearer 会话隔离，以及 endpoint 返回的 `401/no-store` 契约。
+
 ## [1.3.52] - 2026-07-11
 
 ### 修复 (Fixed)
@@ -1153,4 +1162,8 @@
 
 ## 2026-07-11 01:18:47 +0800
 - 修复服务重启后旧任务页面的轮询重试
+- 发布模式: multi
+
+## 2026-07-11 01:37:52 +0800
+- P0 熔断陈旧终态任务页面的摘要轮询
 - 发布模式: multi

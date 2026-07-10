@@ -1,6 +1,11 @@
 export const API = '/api'
 export const API_BASE = '/api'
 
+// Protocol 2 means the task UI has the terminal-state polling fix.  The
+// backend uses it only to distinguish a freshly deployed bundle from a stale
+// tab which is still executing the pre-fix task modal code.
+export const TASK_POLL_PROTOCOL_VERSION = '2'
+
 export function getToken(): string {
   return localStorage.getItem('auth_token') || ''
 }
@@ -60,7 +65,10 @@ function buildApiError(res: Response, text: string): ApiError {
 
 export async function apiFetch(path: string, opts?: RequestInit) {
   const token = getToken()
-  const baseHeaders: Record<string, string> = { 'Content-Type': 'application/json' }
+  const baseHeaders: Record<string, string> = {
+    'Content-Type': 'application/json',
+    'X-Auto-Gpt-Task-Poll-Protocol': TASK_POLL_PROTOCOL_VERSION,
+  }
   if (token) baseHeaders['Authorization'] = `Bearer ${token}`
   const res = await fetch(API + path, {
     ...opts,
