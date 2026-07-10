@@ -46,7 +46,10 @@ import { AddAccountModal } from '@/features/accounts/components/AddAccountModal'
 import { AccountsTable } from '@/features/accounts/components/AccountsTable'
 import { AccountDetailModal } from '@/features/accounts/components/AccountDetailModal'
 import { AccountsToolbar } from '@/features/accounts/components/AccountsToolbar'
-import type { AccountsToolbarActionId as AccountToolbarActionId } from '@/features/accounts/components/AccountsToolbar'
+import type {
+  AccountExportMode,
+  AccountsToolbarActionId as AccountToolbarActionId,
+} from '@/features/accounts/components/AccountsToolbar'
 import { BatchGopayWorkbench } from '@/features/accounts/components/BatchGopayWorkbench'
 import { ImportAccountsModal } from '@/features/accounts/components/ImportAccountsModal'
 import { PendingInvitesModal } from '@/features/accounts/components/PendingInvitesModal'
@@ -3516,7 +3519,7 @@ export default function Accounts() {
     return hasAccountSecret(record, 'refresh_token') || hasAccountSecret(record, 'access_token') || hasAccountSecret(record, 'session_token')
   }
 
-  const exportCsv = async () => {
+  const exportCsv = async (exportMode: AccountExportMode = 'sub2api') => {
     if (currentPlatform === 'chatgpt') {
       try {
         const token = localStorage.getItem('auth_token') || ''
@@ -3532,7 +3535,7 @@ export default function Accounts() {
             Authorization: `Bearer ${token}`,
             'Content-Type': 'application/json',
           },
-          body: JSON.stringify({ ids: selectedIds }),
+          body: JSON.stringify({ ids: selectedIds, mode: exportMode }),
         })
         if (!res.ok) {
           let detail = ''
@@ -3548,6 +3551,10 @@ export default function Accounts() {
         const ticket = String(data?.ticket || '').trim()
         if (!ticket) {
           throw new Error('导出失败：后端未返回下载票据')
+        }
+        if (exportMode === 'access_token') {
+          const exportableCount = Number(data?.exportable_count || 0)
+          message.success(`已生成 ${exportableCount} 个 AccessToken（每行一个）`)
         }
         window.location.assign(`/api/chatgpt/export-sub2api-download?ticket=${encodeURIComponent(ticket)}`)
         return

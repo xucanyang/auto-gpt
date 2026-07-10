@@ -4,9 +4,11 @@
 
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，并且本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/) (语义化版本)。
 
-## [Unreleased] (未发布)
+## [1.3.49] - 2026-07-10
 
 ### 新增 (Added)
+- **账号页导出新增纯 AccessToken 模式**：`frontend/src/features/accounts/components/AccountsToolbar.tsx` 将 ChatGPT 账号页“导出”改为保留原 Sub2API JSON 默认行为的模式菜单，新增“仅 AccessToken（每行一个）”。选中账号时只导出这些账号；未选中时沿用原有全库导出语义，方便直接批量交付 AT 文本。
+- **导出接口支持 AT 文本与旧数据字段兼容**：`api/chatgpt.py` 的导出票据、直连和下载接口新增 `mode=access_token`，服务端只输出非空 AT、无标题/账号信息/其他凭证，每个账号一个独立文本行，并兼容 `access_token`、`accessToken`、`webAccessToken` 与旧主表 `token` 存储字段。无任何可用 AT 时在下载前直接返回明确错误；原 `sub2api` JSON 模式、票据时效和一次性下载语义不变。
 - **新增独立的 Plus 副本实例 `auto-plus2`**：`docker-compose.multi.yml` 增加 `auto-plus2` 服务，复用 `auto-gpt:latest`、共享全局设置库、TempMail 与 Team Manager 网络，但使用独立的 `/opt/auto-plus2/{data,_ext_targets,external_logs}` 运行态目录与 `APP_INSTANCE_ID=auto-plus2`。服务固定映射 `8003 -> 8000`、`127.0.0.1:8892 -> 8889`、`8320 -> 8317`，避免与现有 Plus 实例的端口、SQLite 数据和运行日志混用。
 
 ### 优化 (Changed)
@@ -1109,4 +1111,8 @@
 
 ## 2026-07-10 12:24:08 +0800
 - 新增 auto-plus2 独立 Plus 实例并下线主服务与 K12 常驻容器
+- 发布模式: multi
+
+## 2026-07-10 18:23:20 +0800
+- 新增 ChatGPT AccessToken 纯文本导出模式
 - 发布模式: multi

@@ -1,6 +1,6 @@
 import type { CSSProperties, ReactNode } from 'react'
 import { useState } from 'react'
-import { Button, Dropdown, Modal } from 'antd'
+import { Button, Dropdown, Modal, Space } from 'antd'
 import type { MenuProps } from 'antd'
 import {
   DeleteOutlined,
@@ -30,6 +30,8 @@ export type AccountsToolbarActionId =
   | 'paymentLink'
   | 'gopay'
   | 'businessDeferred'
+
+export type AccountExportMode = 'sub2api' | 'access_token'
 
 type AccountsToolbarDangerActionId = 'deleteInvalid' | 'batchDelete'
 type MoreMenuClickInfo = Parameters<NonNullable<MenuProps['onClick']>>[0]
@@ -156,7 +158,7 @@ type AccountsToolbarProps = {
   onDeleteInvalid: () => Promise<void> | void
   onBatchDelete: () => Promise<void> | void
   onOpenImport: () => void
-  onExportCsv: () => void
+  onExportCsv: (mode?: AccountExportMode) => void
   onOpenAdd: () => void
   loading: boolean
   onRefresh: () => Promise<void> | void
@@ -238,6 +240,13 @@ export function AccountsToolbar({
   const hasNoSelectedAndNoResults = selectedRowKeys.length === 0 && total === 0
   const paymentLinkDisabled = hasNoSelectedAndNoResults
   const batchK12RecaptureDisabled = hasNoSelectedAndNoResults
+  const exportMenuItems: MenuProps['items'] = [
+    { key: 'sub2api', label: 'Sub2API JSON（默认）' },
+    { key: 'access_token', label: '仅 AccessToken（每行一个）' },
+  ]
+  const handleExportMenuClick: MenuProps['onClick'] = ({ key }) => {
+    onExportCsv(String(key) === 'access_token' ? 'access_token' : 'sub2api')
+  }
   const paymentLinkMenuItems: MenuProps['items'] = [
     {
       key: 'normal',
@@ -667,7 +676,23 @@ export function AccountsToolbar({
           <Button block={isMobile} style={buttonStyle} type="primary" icon={<PlusOutlined />} onClick={onOpenRegister}>注册</Button>
           <Button block={isMobile} style={buttonStyle} icon={<PlusOutlined />} onClick={onOpenAdd}>新增</Button>
           <Button block={isMobile} style={buttonStyle} icon={<UploadOutlined />} onClick={onOpenImport}>导入</Button>
-          <Button block={isMobile} style={buttonStyle} icon={<DownloadOutlined />} onClick={onExportCsv} disabled={total === 0}>导出</Button>
+          {isChatgptPlatform ? (
+            <Space.Compact block={isMobile} style={buttonStyle}>
+              <Button
+                block={isMobile}
+                icon={<DownloadOutlined />}
+                onClick={() => onExportCsv('sub2api')}
+                disabled={total === 0}
+              >
+                导出
+              </Button>
+              <Dropdown menu={{ items: exportMenuItems, onClick: handleExportMenuClick }} trigger={['click']}>
+                <Button aria-label="选择导出模式" icon={<DownOutlined />} disabled={total === 0} />
+              </Dropdown>
+            </Space.Compact>
+          ) : (
+            <Button block={isMobile} style={buttonStyle} icon={<DownloadOutlined />} onClick={() => onExportCsv()} disabled={total === 0}>导出</Button>
+          )}
           <Button block={isMobile} style={buttonStyle} icon={<ReloadOutlined spin={loading} />} onClick={onRefresh}>
             {isMobile ? '刷新' : null}
           </Button>

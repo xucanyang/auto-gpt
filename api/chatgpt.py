@@ -2,7 +2,6 @@
 import asyncio
 import base64
 import hashlib
-import io
 import re
 import threading
 import time
@@ -79,6 +78,12 @@ _GOPAY_BATCH_LOCK = threading.RLock()
 _GOPAY_BATCH_WORKERS: set[str] = set()
 _SUB2API_EXPORT_TICKET_LOCK = threading.Lock()
 _SUB2API_EXPORT_TICKETS: dict[str, dict[str, Any]] = {}
+CHATGPT_EXPORT_MODE_SUB2API = "sub2api"
+CHATGPT_EXPORT_MODE_ACCESS_TOKEN = "access_token"
+CHATGPT_EXPORT_MODES = frozenset({
+    CHATGPT_EXPORT_MODE_SUB2API,
+    CHATGPT_EXPORT_MODE_ACCESS_TOKEN,
+})
 
 
 class UploadRequest(BaseModel):
@@ -90,6 +95,8 @@ class UploadRequest(BaseModel):
 class Sub2ApiExportTicketReq(BaseModel):
     ids: list[int] = Field(default_factory=list)
     status: str = ""
+    # Keep the original Sub2API JSON export as the default for old callers.
+    mode: str = CHATGPT_EXPORT_MODE_SUB2API
 
 
 class CodexUsageRefreshReq(BaseModel):
@@ -3647,22 +3654,70 @@ def _parse_export_ids(ids: Optional[str] = None, id_list: list[int] | None = Non
     return list(dict.fromkeys(selected_ids))
 
 
-def _build_sub2api_export_response(
+def _normalize_chatgpt_export_mode(value: Optional[str]) -> str:
+    mode = str(value or CHATGPT_EXPORT_MODE_SUB2API).strip().lower()
+    if mode not in CHATGPT_EXPORT_MODES:
+        raise HTTPException(400, "不支持的导出模式")
+    return mode
+
+
+def _query_chatgpt_export_accounts(
     *,
     session: Session,
     status: Optional[str] = None,
     selected_ids: list[int] | None = None,
-) -> StreamingResponse:
-    from sqlmodel import select
-    from datetime import datetime, timezone
-    from services.chatgpt_core.sub2api_upload import build_sub2api_export_account_payload
-
+) -> list[AccountModel]:
     q = select(AccountModel).where(AccountModel.platform == "chatgpt")
     if status:
         q = q.where(AccountModel.status == status)
     if selected_ids:
         q = q.where(AccountModel.id.in_(selected_ids))
-    accounts = session.exec(q).all()
+    # A deterministic order makes AccessToken-only exports stable and keeps one
+    # account represented by exactly one predictable line.
+    q = q.order_by(AccountModel.id)
+    return session.exec(q).all()
+
+
+def _access_token_for_export(acc: AccountModel) -> str:
+    """Read both current and legacy saved AT fields without exposing other secrets."""
+    extra = acc.get_extra()
+    for value in (
+        extra.get("access_token"),
+        extra.get("accessToken"),
+        extra.get("webAccessToken"),
+        acc.token,
+    ):
+        token = str(value or "").strip()
+        if token:
+            return token
+    return ""
+
+
+def _build_chatgpt_export_content(
+    *,
+    accounts: list[AccountModel],
+    export_mode: str,
+) -> tuple[str, str, str, str]:
+    """Return body, MIME type, ASCII filename prefix and extension for an export."""
+    if export_mode == CHATGPT_EXPORT_MODE_ACCESS_TOKEN:
+        # Deliberately omit accounts without an AT: blank lines would break the
+        # stated one-account/one-token-line contract for downstream importers.
+        access_tokens = [
+            token
+            for acc in accounts
+            if (token := _access_token_for_export(acc))
+        ]
+        if not access_tokens:
+            raise HTTPException(400, "所选账号没有可导出的 AccessToken")
+        return (
+            "\n".join(access_tokens) + "\n",
+            "text/plain; charset=utf-8",
+            "chatgpt-access-token",
+            "txt",
+        )
+
+    from datetime import datetime, timezone
+    from services.chatgpt_core.sub2api_upload import build_sub2api_export_account_payload
 
     exported_accounts: list[dict[str, Any]] = []
     for acc in accounts:
@@ -3670,20 +3725,45 @@ def _build_sub2api_export_response(
         item = build_sub2api_export_account_payload(codex_acc)
         exported_accounts.append(item)
 
-    exported_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     payload = {
-        "exported_at": exported_at,
+        "exported_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "proxies": [],
         "accounts": exported_accounts,
     }
+    return (
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        "application/json",
+        "sub2api-account",
+        "json",
+    )
 
-    output = io.StringIO()
-    output.write(json.dumps(payload, ensure_ascii=False, indent=2))
-    output.seek(0)
+
+def _build_sub2api_export_response(
+    *,
+    session: Session,
+    status: Optional[str] = None,
+    selected_ids: list[int] | None = None,
+    export_mode: str = CHATGPT_EXPORT_MODE_SUB2API,
+) -> StreamingResponse:
+    from datetime import datetime, timezone
+    mode = _normalize_chatgpt_export_mode(export_mode)
+    accounts = _query_chatgpt_export_accounts(
+        session=session,
+        status=status,
+        selected_ids=selected_ids,
+    )
+    body, media_type, filename_prefix, extension = _build_chatgpt_export_content(
+        accounts=accounts,
+        export_mode=mode,
+    )
     return StreamingResponse(
-        iter([output.getvalue()]),
-        media_type="application/json",
-        headers={"Content-Disposition": f"attachment; filename=sub2api-account-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}.json"},
+        iter([body]),
+        media_type=media_type,
+        headers={
+            "Content-Disposition": (
+                f"attachment; filename={filename_prefix}-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}.{extension}"
+            ),
+        },
     )
 
 
@@ -3703,7 +3783,24 @@ def upload_sub2api(account_id: int, req: Sub2ApiUploadReq,
 
 
 @router.post("/export-sub2api-ticket")
-def create_chatgpt_accounts_sub2api_export_ticket(req: Sub2ApiExportTicketReq):
+def create_chatgpt_accounts_sub2api_export_ticket(
+    req: Sub2ApiExportTicketReq,
+    session: Session = Depends(get_session),
+):
+    mode = _normalize_chatgpt_export_mode(req.mode)
+    selected_ids = _parse_export_ids(id_list=req.ids)
+    status = str(req.status or "").strip()
+    accounts = _query_chatgpt_export_accounts(
+        session=session,
+        status=status or None,
+        selected_ids=selected_ids,
+    )
+    exportable_count = len(accounts)
+    if mode == CHATGPT_EXPORT_MODE_ACCESS_TOKEN:
+        exportable_count = sum(bool(_access_token_for_export(acc)) for acc in accounts)
+        if not exportable_count:
+            raise HTTPException(400, "所选账号没有可导出的 AccessToken")
+
     now = time.time()
     ticket = uuid.uuid4().hex
     with _SUB2API_EXPORT_TICKET_LOCK:
@@ -3715,23 +3812,32 @@ def create_chatgpt_accounts_sub2api_export_ticket(req: Sub2ApiExportTicketReq):
         for key in expired:
             _SUB2API_EXPORT_TICKETS.pop(key, None)
         _SUB2API_EXPORT_TICKETS[ticket] = {
-            "ids": _parse_export_ids(id_list=req.ids),
-            "status": str(req.status or "").strip(),
+            "ids": selected_ids,
+            "status": status,
+            "mode": mode,
             "expires_at": now + 300,
         }
-    return {"ticket": ticket, "expires_in": 300}
+    return {
+        "ticket": ticket,
+        "expires_in": 300,
+        "mode": mode,
+        "matched_count": len(accounts),
+        "exportable_count": exportable_count,
+    }
 
 
 @router.get("/export-sub2api")
 def export_chatgpt_accounts_sub2api(
     status: Optional[str] = None,
     ids: Optional[str] = None,
+    mode: str = CHATGPT_EXPORT_MODE_SUB2API,
     session: Session = Depends(get_session),
 ):
     return _build_sub2api_export_response(
         session=session,
         status=status,
         selected_ids=_parse_export_ids(ids=ids),
+        export_mode=mode,
     )
 
 
@@ -3751,4 +3857,5 @@ def download_chatgpt_accounts_sub2api_export(
         session=session,
         status=str(payload.get("status") or "").strip() or None,
         selected_ids=list(payload.get("ids") or []),
+        export_mode=str(payload.get("mode") or CHATGPT_EXPORT_MODE_SUB2API),
     )
