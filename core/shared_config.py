@@ -71,6 +71,18 @@ _SECRET_KEY_PARTS = (
     "auth",
 )
 
+# 代理 URL 常包含用户名/密码，但 key 名通常不会命中上面的 secret 词表。
+# 不要把所有包含 proxy 的普通扫描参数都当敏感，只有承载 URL/模板的键需要
+# 脱敏；这样审计仍能保留候选数、超时等非秘密配置的可读性。
+_PROXY_CREDENTIAL_KEYS = {
+    "proxy",
+    "proxy_url",
+    "proxy_template",
+    "task_proxy_url",
+    "dynamic_proxy_template",
+    "codex_proxy_url",
+}
+
 
 class SharedConfigConflict(RuntimeError):
     """共享配置版本冲突。"""
@@ -122,10 +134,23 @@ def _hash_config(data: dict[str, str]) -> str:
     return hashlib.sha256(blob).hexdigest()
 
 
+def _is_proxy_credential_key(key: str) -> bool:
+    normalized = str(key or "").strip().lower().replace("-", "_")
+    return bool(
+        normalized in _PROXY_CREDENTIAL_KEYS
+        or normalized.endswith("_proxy_url")
+        or normalized.endswith("_proxy_template")
+    )
+
+
+def _is_sensitive_config_key(key: str) -> bool:
+    lower = str(key or "").lower()
+    return any(part in lower for part in _SECRET_KEY_PARTS) or _is_proxy_credential_key(lower)
+
+
 def _redact_value(key: str, value: Any) -> dict[str, Any] | str:
     text = "" if value is None else str(value)
-    lower = str(key or "").lower()
-    if any(part in lower for part in _SECRET_KEY_PARTS):
+    if _is_sensitive_config_key(key):
         return {
             "present": bool(text),
             "length": len(text),
@@ -134,6 +159,50 @@ def _redact_value(key: str, value: Any) -> dict[str, Any] | str:
     if len(text) > 180:
         return text[:80] + f"...<len={len(text)}>"
     return text
+
+
+def _is_redacted_summary(value: Any) -> bool:
+    return isinstance(value, dict) and {"present", "length", "sha256"}.issubset(value)
+
+
+def _sanitize_audit_value(key: str, value: Any) -> Any:
+    """重新读取历史审计时也不把旧代理凭据回传给 API。"""
+    if not _is_sensitive_config_key(key):
+        return value
+    if _is_redacted_summary(value):
+        return {
+            "present": bool(value.get("present")),
+            "length": int(value.get("length") or 0),
+            "sha256": str(value.get("sha256") or ""),
+        }
+    return _redact_value(key, value)
+
+
+def _sanitize_audit_diff(diff: Any) -> dict[str, Any]:
+    """按配置 key 脱敏审计 diff，兼容历史字符串和当前 before/after 结构。"""
+    if not isinstance(diff, dict):
+        return {}
+    result: dict[str, Any] = {}
+    for raw_key, raw_change in diff.items():
+        key = str(raw_key or "")
+        if isinstance(raw_change, dict) and ("before" in raw_change or "after" in raw_change):
+            change = dict(raw_change)
+            if "before" in change:
+                change["before"] = _sanitize_audit_value(key, change.get("before"))
+            if "after" in change:
+                change["after"] = _sanitize_audit_value(key, change.get("after"))
+            result[key] = change
+        else:
+            result[key] = _sanitize_audit_value(key, raw_change)
+    return result
+
+
+def _load_audit_diff(raw: Any) -> dict[str, Any]:
+    try:
+        decoded = json.loads(str(raw or "{}"))
+    except Exception:
+        return {}
+    return decoded if isinstance(decoded, dict) else {}
 
 
 def _redacted_diff(before: dict[str, str], after: dict[str, str], keys: list[str]) -> dict[str, Any]:
@@ -419,6 +488,7 @@ class SharedConfigStore:
             ).fetchall()
         result = []
         for row in rows:
+            diff = _sanitize_audit_diff(_load_audit_diff(row["diff_json"]))
             result.append({
                 "revision": int(row["revision"]),
                 "base_revision": int(row["base_revision"]),
@@ -428,10 +498,35 @@ class SharedConfigStore:
                 "changed_keys": json.loads(row["changed_keys_json"] or "[]"),
                 "before_hash": row["before_hash"],
                 "after_hash": row["after_hash"],
-                "diff": json.loads(row["diff_json"] or "{}"),
+                "diff": diff,
                 "note": row["note"],
             })
         return result
+
+    def redact_legacy_audit(self) -> dict[str, int]:
+        """物理覆写历史审计中的明文敏感值，不改变配置 revision。"""
+        scanned = 0
+        redacted = 0
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                rows = conn.execute("SELECT id, diff_json FROM shared_config_audit").fetchall()
+                for row in rows:
+                    scanned += 1
+                    original = _load_audit_diff(row["diff_json"])
+                    cleaned = _sanitize_audit_diff(original)
+                    if cleaned == original:
+                        continue
+                    conn.execute(
+                        "UPDATE shared_config_audit SET diff_json = ? WHERE id = ?",
+                        (json.dumps(cleaned, ensure_ascii=False, sort_keys=True), int(row["id"])),
+                    )
+                    redacted += 1
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        return {"scanned": scanned, "redacted": redacted}
 
 
 shared_config_store = SharedConfigStore()

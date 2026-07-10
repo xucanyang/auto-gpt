@@ -81,17 +81,18 @@ export function taskProxySettingsFromConfig(config: unknown, fallback?: Partial<
   const cfg = config && typeof config === 'object' ? config as Record<string, unknown> : {}
   const base = normalizeTaskProxySettings(fallback || {})
   const mode = normalizeTaskProxyMode(cfg.task_proxy_mode, base.proxy_mode)
-  const taskProxyUrl = stringWithDefault(cfg.task_proxy_url, base.proxy)
-  const globalDynamicTemplate = stringWithDefault(cfg.dynamic_proxy_template, '')
+  const legacyTaskProxyUrl = stringWithDefault(cfg.task_proxy_url, '')
+  const taskProxyUrl = stringWithDefault(legacyTaskProxyUrl, base.proxy)
+  const globalDynamicTemplate = stringWithDefault(cfg.dynamic_proxy_template, legacyTaskProxyUrl)
   const proxy = mode === 'dynamic'
     ? (globalDynamicTemplate ? '' : taskProxyUrl)
     : taskProxyUrl
-  const country = countryCode(
-    cfg.task_proxy_country_code,
-    mode === 'dynamic'
-      ? countryCode(cfg.dynamic_proxy_default_country, base.proxy_country_code || 'JP')
-      : base.proxy_country_code,
-  )
+  const country = mode === 'dynamic'
+    ? countryCode(
+      cfg.dynamic_proxy_default_country,
+      countryCode(cfg.task_proxy_country_code, base.proxy_country_code || 'JP'),
+    )
+    : countryCode(cfg.task_proxy_country_code, base.proxy_country_code)
   return {
     proxy_mode: mode,
     proxy,
@@ -142,25 +143,33 @@ export function validateTaskProxySettings(values: unknown) {
 
 export async function saveTaskProxySettingsToConfig(values: unknown) {
   const settings = normalizeTaskProxySettings(values)
-  const data: Record<string, string> = {
-    task_proxy_mode: settings.proxy_mode,
-    task_proxy_url: settings.proxy,
-    task_proxy_country_code: settings.proxy_country_code,
-    task_proxy_failover: settings.proxy_failover ? 'true' : 'false',
-    task_proxy_max_candidates: String(settings.proxy_max_candidates),
-    task_proxy_min_score: String(settings.proxy_min_score),
-  }
+  const data: Record<string, string> = { task_proxy_mode: settings.proxy_mode }
 
-  if (settings.proxy_mode === 'dynamic' && settings.proxy) {
-    data.dynamic_proxy_template = settings.proxy
-  }
   if (settings.proxy_mode === 'dynamic') {
-    data.dynamic_proxy_ip_retention_minutes = String(settings.dynamic_proxy_ip_retention_minutes)
-  }
-  if (settings.proxy_country_code) {
+    // 任务弹窗动态模式的空 proxy 表示“沿用全局模板”，绝不能反向清空它。
+    // 同时主动清掉旧字段，防止历史 URL/国家重新覆盖 canonical dynamic 配置。
+    data.task_proxy_url = ''
+    data.task_proxy_country_code = ''
+    data.task_proxy_failover = settings.proxy_failover ? 'true' : 'false'
     data.dynamic_proxy_default_country = settings.proxy_country_code
-  }
-  if (taskProxyUsesPoolSelector(settings)) {
+    data.dynamic_proxy_ip_retention_minutes = String(settings.dynamic_proxy_ip_retention_minutes)
+    if (settings.proxy) {
+      data.dynamic_proxy_template = settings.proxy
+    }
+  } else if (settings.proxy_mode === 'specified') {
+    data.task_proxy_url = settings.proxy
+    data.task_proxy_failover = settings.proxy_failover ? 'true' : 'false'
+    if (taskProxyUsesPoolSelector(settings)) {
+      data.task_proxy_country_code = settings.proxy_country_code
+      data.task_proxy_max_candidates = String(settings.proxy_max_candidates)
+      data.task_proxy_min_score = String(settings.proxy_min_score)
+      data.proxy_pool_max_candidates = String(settings.proxy_max_candidates)
+      data.proxy_scan_min_score = String(settings.proxy_min_score)
+    }
+  } else if (settings.proxy_mode === 'pool') {
+    data.task_proxy_country_code = settings.proxy_country_code
+    data.task_proxy_max_candidates = String(settings.proxy_max_candidates)
+    data.task_proxy_min_score = String(settings.proxy_min_score)
     data.proxy_pool_max_candidates = String(settings.proxy_max_candidates)
     data.proxy_scan_min_score = String(settings.proxy_min_score)
   }

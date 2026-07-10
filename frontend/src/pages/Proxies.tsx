@@ -687,7 +687,7 @@ export default function Proxies() {
         proxy_max_candidates: poolMaxCandidates,
         proxy_min_score: scanMinScore,
       })
-      message.success('动态代理已保存为所有任务默认代理')
+      message.success('已保存到全局动态代理配置')
       await load()
     } catch (error) {
       message.error(error instanceof Error ? error.message : '保存动态代理设置失败')
@@ -1154,7 +1154,7 @@ export default function Proxies() {
               预览动态出口
             </Button>
             <Button loading={dynamicSaving} onClick={() => void saveDynamicProxySettings()}>
-              保存为任务默认
+              保存到全局动态配置
             </Button>
           </Space>
           {dynamicPreviewResult ? (

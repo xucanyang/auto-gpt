@@ -2208,8 +2208,7 @@ def _redact_proxy_for_task_log(proxy: Optional[str]) -> str:
 
 
 def _custom_email_proxy_settings(req: CustomEmailRecheckTaskRequest | BatchCustomEmailRecheckTaskRequest) -> dict[str, Any]:
-    from core.config_store import config_store
-    from core.proxy_utils import normalize_proxy_url
+    from core.proxy_utils import get_global_dynamic_proxy_country, normalize_proxy_url
 
     explicit_proxy = normalize_proxy_url(getattr(req, "proxy", None)) or ""
     mode = str(getattr(req, "proxy_mode", "") or "").strip().lower()
@@ -2224,7 +2223,7 @@ def _custom_email_proxy_settings(req: CustomEmailRecheckTaskRequest | BatchCusto
 
     country_code = str(getattr(req, "proxy_country_code", "") or "").strip().upper()
     if mode == "dynamic" and not country_code:
-        country_code = str(config_store.get("dynamic_proxy_default_country", "") or "").strip().upper()
+        country_code = get_global_dynamic_proxy_country("")
 
     return {
         "proxy": explicit_proxy,

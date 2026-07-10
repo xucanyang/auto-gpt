@@ -373,10 +373,10 @@ def get_proxy_candidates(body: ProxyCandidateRequest):
 def dynamic_proxy_preview(body: DynamicProxyPreviewRequest):
     from core.config_store import config_store
     from core.dynamic_proxy import resolve_dynamic_proxy_template, redact_proxy_url
-    from core.proxy_utils import normalize_proxy_url
+    from core.proxy_utils import get_global_dynamic_proxy_country, get_global_dynamic_proxy_template, normalize_proxy_url
 
-    template = str(body.proxy or config_store.get("dynamic_proxy_template", "") or "").strip()
-    country_code = str(body.country_code or config_store.get("dynamic_proxy_default_country", "") or "").strip().upper()
+    template = str(body.proxy or get_global_dynamic_proxy_template() or "").strip()
+    country_code = str(body.country_code or get_global_dynamic_proxy_country("") or "").strip().upper()
     retention_minutes = (
         body.retention_minutes
         if body.retention_minutes is not None

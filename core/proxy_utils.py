@@ -128,6 +128,22 @@ def _global_task_proxy_country(default: str = "") -> str:
     return str(default or "").strip().upper()
 
 
+def get_global_dynamic_proxy_template() -> str:
+    """读取动态代理的唯一 canonical 模板，并兼容尚未迁移的旧字段。"""
+    template = str(_configured_value("dynamic_proxy_template", "") or "").strip()
+    if template:
+        return template
+    return _global_task_proxy_url()
+
+
+def get_global_dynamic_proxy_country(default: str = "JP") -> str:
+    """读取动态代理的唯一 canonical 国家，并兼容尚未迁移的旧字段。"""
+    country = str(_configured_value("dynamic_proxy_default_country", "") or "").strip().upper()
+    if country:
+        return country
+    return _global_task_proxy_country(default)
+
+
 def _safe_source_text(value: Any, limit: int = 240) -> str:
     text = str(value or "")
     try:
@@ -305,7 +321,10 @@ def resolve_task_proxy_candidates(
 
     use_global_defaults = _is_global_task_proxy_default(default_mode)
     global_mode = _global_task_proxy_mode("dynamic") if use_global_defaults else ""
-    global_proxy = _global_task_proxy_url() if use_global_defaults else ""
+    # ``task_proxy_url`` 只属于全局 specified 模式。动态模式的旧值由
+    # get_global_dynamic_proxy_template() 作为最后兼容回退，绝不能抢在
+    # canonical dynamic_proxy_template 前面。
+    global_proxy = _global_task_proxy_url() if use_global_defaults and global_mode == "specified" else ""
 
     raw_proxy_param_value = _param_first(
         params,
@@ -353,18 +372,21 @@ def resolve_task_proxy_candidates(
     if mode == "direct":
         return [("", None, "direct")]
 
-    country_code = str(
-        _param_first(
-            params,
-            "proxy_country_code",
-            "register_proxy_country_code",
-            "probe_proxy_country_code",
-            default=_global_task_proxy_country("") if use_global_defaults else "",
-        )
-        or ""
-    ).strip().upper()
-    if mode == "dynamic" and not country_code:
-        country_code = str(_configured_value("dynamic_proxy_default_country", "JP") or "JP").strip().upper()
+    explicit_country = _param_first(
+        params,
+        "proxy_country_code",
+        "register_proxy_country_code",
+        "probe_proxy_country_code",
+        default=None,
+    )
+    if explicit_country not in (None, ""):
+        country_code = str(explicit_country).strip().upper()
+    elif mode == "dynamic":
+        country_code = get_global_dynamic_proxy_country("JP")
+    elif use_global_defaults:
+        country_code = _global_task_proxy_country("")
+    else:
+        country_code = ""
 
     raw_failover = _param_first(
         params,
@@ -423,7 +445,13 @@ def resolve_task_proxy_candidates(
             return candidates
 
     if mode == "dynamic":
-        template = raw_proxy or str(_configured_value("dynamic_proxy_template", "") or "").strip()
+        # 单任务显式 proxy / fallback 仍是一次性覆盖；没有覆盖时才读取
+        # canonical 动态模板（并仅在 canonical 为空时兼容 legacy URL）。
+        template = (
+            raw_proxy
+            if (has_explicit_proxy_param or has_fallback_proxy) and raw_proxy
+            else get_global_dynamic_proxy_template()
+        )
         dynamic_max_attempts = _positive_int(
             params.get("dynamic_proxy_max_attempts") or _configured_value("dynamic_proxy_max_attempts", "5"),
             default=5,

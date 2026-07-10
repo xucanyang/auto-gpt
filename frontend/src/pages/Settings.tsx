@@ -126,16 +126,16 @@ const TAB_ITEMS = [
       },
       {
         title: '账号网络默认出口',
-        desc: '所有 ChatGPT/OpenAI 账号网络动作默认使用这里的出口；单项任务显式传代理时优先使用单项配置。',
+        desc: '动态模式只使用“动态代理模板 + 动态代理出口国家”；指定代理和代理池字段仅在对应模式显示。单项任务显式传代理时仍可覆盖本次任务。',
         fields: [
           { key: 'task_proxy_mode', label: '默认出口模式', type: 'select' },
-          { key: 'task_proxy_url', label: '指定/动态代理地址', secret: true, placeholder: '动态模式可留空使用下方模板；指定模式必填 http:// 或 socks5://...' },
-          { key: 'task_proxy_country_code', label: '任务默认出口国家', placeholder: 'JP' },
-          { key: 'task_proxy_failover', label: '失败后尝试候选代理', type: 'boolean' },
+          { key: 'task_proxy_url', label: '指定代理地址', secret: true, placeholder: 'http:// 或 socks5://...' },
+          { key: 'task_proxy_country_code', label: '候选出口国家', placeholder: 'JP（可留空）' },
+          { key: 'task_proxy_failover', label: '失败后刷新 / 切换代理', type: 'boolean' },
           { key: 'task_proxy_max_candidates', label: '代理池候选数量', placeholder: '5' },
           { key: 'task_proxy_min_score', label: '代理池最低健康分', placeholder: '50' },
-          { key: 'dynamic_proxy_template', label: '默认动态代理模板', secret: true, placeholder: 'socks5://user-region-Rand-sid-xxxx-t-5:pass@host:port' },
-          { key: 'dynamic_proxy_default_country', label: '默认出口国家', placeholder: 'JP' },
+          { key: 'dynamic_proxy_template', label: '动态代理模板', secret: true, placeholder: 'socks5://user-region-Rand-sid-xxxx-t-5:pass@host:port' },
+          { key: 'dynamic_proxy_default_country', label: '动态代理出口国家', placeholder: 'JP' },
           { key: 'dynamic_proxy_ip_retention_minutes', label: 'IP 保留分钟数（t-N）', placeholder: '5' },
           { key: 'dynamic_proxy_require_country_match', label: '要求实测国家匹配', type: 'boolean' },
           { key: 'dynamic_proxy_probe_enabled', label: '运行前探测出口', type: 'boolean' },
@@ -637,6 +637,61 @@ interface SectionConfig {
   fields: FieldConfig[]
 }
 
+const TASK_PROXY_SECTION_TITLE = '账号网络默认出口'
+
+function taskProxyFieldsForMode(
+  fields: FieldConfig[],
+  rawMode: unknown,
+  failoverEnabled: boolean,
+): FieldConfig[] {
+  const mode = String(rawMode || 'dynamic').trim().toLowerCase()
+  const byKey = new Map(fields.map((field) => [field.key, field]))
+  const pick = (...keys: string[]) => keys
+    .map((key) => byKey.get(key))
+    .filter((field): field is FieldConfig => Boolean(field))
+
+  if (mode === 'specified') {
+    const result = pick('task_proxy_mode', 'task_proxy_url', 'task_proxy_failover')
+    const failover = byKey.get('task_proxy_failover')
+    if (failover) {
+      result[result.findIndex((field) => field.key === failover.key)] = {
+        ...failover,
+        label: '失败后切换代理池',
+      }
+    }
+    return failoverEnabled
+      ? [...result, ...pick('task_proxy_country_code', 'task_proxy_max_candidates', 'task_proxy_min_score')]
+      : result
+  }
+
+  if (mode === 'pool') {
+    return pick('task_proxy_mode', 'task_proxy_country_code', 'task_proxy_max_candidates', 'task_proxy_min_score')
+  }
+
+  if (mode === 'direct') {
+    return pick('task_proxy_mode')
+  }
+
+  const result = pick(
+    'task_proxy_mode',
+    'dynamic_proxy_template',
+    'dynamic_proxy_default_country',
+    'task_proxy_failover',
+    'dynamic_proxy_ip_retention_minutes',
+    'dynamic_proxy_require_country_match',
+    'dynamic_proxy_probe_enabled',
+    'dynamic_proxy_probe_timeout_seconds',
+  )
+  const failover = byKey.get('task_proxy_failover')
+  if (failover) {
+    result[result.findIndex((field) => field.key === failover.key)] = {
+      ...failover,
+      label: '失败后刷新 SID 重试',
+    }
+  }
+  return result
+}
+
 const CHATGPT_PINNED_SECTIONS_STORAGE_KEY = 'any-auto-register.settings.chatgpt.pinned-sections'
 
 const CHATGPT_PIN_GROUPS = [
@@ -1136,19 +1191,19 @@ function ConfigField({ field }: { field: FieldConfig }) {
     field.key === 'task_proxy_mode'
       ? '默认用于单账号状态刷新、Codex 额度刷新、自动状态刷新、订阅链接、上传前套餐探测等 ChatGPT/OpenAI 账号网络动作；如需直连可在这里改为直连。'
       : field.key === 'task_proxy_url'
-        ? '默认出口模式为“手动指定代理”时必填；动态代理模式下可留空并使用下方默认动态代理模板，也可填入本项作为覆盖模板。'
+        ? '仅用于“手动指定代理”模式；动态代理模式不会读取本项。'
       : field.key === 'task_proxy_country_code'
-        ? '任务级默认出口国家。动态代理模式下优先使用这里；留空则使用下方动态代理默认出口国家。'
+        ? '仅用于代理池筛选，或“手动指定代理 + 失败切换代理池”；动态代理模式不会读取本项。'
       : field.key === 'task_proxy_failover'
-        ? '开启后，代理池会返回多个候选，动态代理会在失败后刷新 sid 重试；关闭时只取首个默认出口。'
+        ? '动态模式开启后会刷新 sid 生成下一个出口；手动指定代理开启后会回退到代理池候选。'
       : field.key === 'task_proxy_max_candidates'
         ? '代理池或指定代理 failover 时最多尝试的候选数量。'
       : field.key === 'task_proxy_min_score'
         ? '代理池候选的最低健康分；低于此分数不会被默认账号网络动作选中。'
       : field.key === 'dynamic_proxy_template'
-      ? '可选全局模板。支持 region-JP/region-US 等固定国家，也支持 Cliproxy 生成的 region-Rand；动态代理模式会先按任务出口国家改写完整 region token，再刷新 sid；展示和日志只保存脱敏地址。'
+      ? '动态模式唯一的全局模板。支持 region-JP/region-US 等固定国家，也支持 Cliproxy 生成的 region-Rand；任务会按本项出口国家改写完整 region token，再刷新 sid；展示和日志只保存脱敏地址。'
       : field.key === 'dynamic_proxy_default_country'
-        ? '任务未填写出口国家时使用的两位 ISO 国家码，例如 JP、US、SG。'
+        ? '动态模式唯一的默认出口国家。任务未填写出口国家时使用两位 ISO 国家码，例如 JP、US、SG。'
       : field.key === 'dynamic_proxy_ip_retention_minutes'
         ? '覆盖 Cliproxy 用户名里的 t-N 字段，例如填 5 会生成 t-5；模板没有 t-N 但包含 sid 时会自动补到 sid 后。范围 1-1440 分钟。'
       : field.key === 'dynamic_proxy_require_country_match'
@@ -1288,10 +1343,12 @@ function ConfigField({ field }: { field: FieldConfig }) {
 
 function ConfigSection({
   section,
+  fields,
   defaultCollapsed = false,
   autoExpand = false,
 }: {
   section: SectionConfig
+  fields?: FieldConfig[]
   defaultCollapsed?: boolean
   autoExpand?: boolean
 }) {
@@ -1348,7 +1405,7 @@ function ConfigSection({
               )}
             </div>
           ) : null}
-          {section.fields.map((field) => (
+          {(fields || section.fields).map((field) => (
             <ConfigField key={field.key} field={field} />
           ))}
         </>
@@ -3534,6 +3591,8 @@ export default function Settings() {
   const [chatgptPinEditorOpen, setChatgptPinEditorOpen] = useState(false)
   const [chatgptPinnedSections, setChatgptPinnedSections] = useState<string[]>(loadChatgptPinnedSections)
   const selectedMailProvider = Form.useWatch('mail_provider', form) || 'luckmail'
+  const taskProxyMode = String(Form.useWatch('task_proxy_mode', form) || 'dynamic').trim().toLowerCase()
+  const taskProxyFailover = parseBooleanConfigValue(Form.useWatch('task_proxy_failover', form))
   const icloudAutoCreateEnabled = parseBooleanConfigValue(Form.useWatch('icloud_hme_auto_create_enabled', form))
   const icloudAutoDeleteEnabled = parseBooleanConfigValue(Form.useWatch('icloud_hme_auto_delete_enabled', form))
   const tempmailArchiveCleanupEnabled = parseBooleanConfigValue(Form.useWatch('tempmail_archive_cleanup_enabled', form))
@@ -3866,9 +3925,6 @@ export default function Settings() {
       if (!data.task_proxy_mode) {
         data.task_proxy_mode = 'dynamic'
       }
-      if (!data.task_proxy_country_code) {
-        data.task_proxy_country_code = data.dynamic_proxy_default_country || 'JP'
-      }
       if (!data.task_proxy_max_candidates) {
         data.task_proxy_max_candidates = data.proxy_pool_max_candidates || '5'
       }
@@ -3876,6 +3932,15 @@ export default function Settings() {
         data.task_proxy_min_score = data.proxy_scan_min_score || '50'
       }
       data.task_proxy_failover = data.task_proxy_failover === '' ? false : parseBooleanConfigValue(data.task_proxy_failover)
+      if (String(data.task_proxy_mode).trim().toLowerCase() === 'dynamic') {
+        // 只在内存中兼容旧配置，访问 Settings 不会因此改共享 revision。
+        if (!data.dynamic_proxy_template && data.task_proxy_url) {
+          data.dynamic_proxy_template = data.task_proxy_url
+        }
+        if (!data.dynamic_proxy_default_country && data.task_proxy_country_code) {
+          data.dynamic_proxy_default_country = data.task_proxy_country_code
+        }
+      }
       if (!data.dynamic_proxy_default_country) {
         data.dynamic_proxy_default_country = 'JP'
       }
@@ -4064,7 +4129,28 @@ export default function Settings() {
         Math.max(0, Math.min(100, Number.parseInt(String(values.task_proxy_min_score || '50'), 10) || 50)),
       )
       values.dynamic_proxy_template = String(values.dynamic_proxy_template || '').trim()
-      values.dynamic_proxy_default_country = String(values.dynamic_proxy_default_country || 'JP').trim().toUpperCase() || 'JP'
+      const dynamicProxyCountry = String(values.dynamic_proxy_default_country || '').trim().toUpperCase()
+      if (values.task_proxy_mode === 'dynamic') {
+        if (!values.dynamic_proxy_template) {
+          setActiveTab('register')
+          message.error('动态代理模式必须填写动态代理模板')
+          return
+        }
+        if (!/^[A-Z]{2}$/.test(dynamicProxyCountry)) {
+          setActiveTab('register')
+          message.error('动态代理出口国家必须填写两位 ISO 国家码，例如 JP')
+          return
+        }
+        // 隐藏字段仍会被 Ant Design 保留；动态模式保存必须主动清掉它们，
+        // 否则历史 task_proxy_* 会再次覆盖 canonical dynamic 配置。
+        values.task_proxy_url = ''
+        values.task_proxy_country_code = ''
+      } else if (values.task_proxy_mode === 'specified' && !values.task_proxy_url) {
+        setActiveTab('register')
+        message.error('手动指定代理模式必须填写指定代理地址')
+        return
+      }
+      values.dynamic_proxy_default_country = dynamicProxyCountry || 'JP'
       values.dynamic_proxy_require_country_match = parseBooleanConfigValue(values.dynamic_proxy_require_country_match)
       values.dynamic_proxy_probe_enabled = parseBooleanConfigValue(values.dynamic_proxy_probe_enabled)
       values.dynamic_proxy_probe_timeout_seconds = String(
@@ -4578,6 +4664,11 @@ export default function Settings() {
                         <ConfigSection
                           key={`${activeTab}:${section.title}`}
                           section={section}
+                          fields={
+                            section.title === TASK_PROXY_SECTION_TITLE
+                              ? taskProxyFieldsForMode(section.fields, taskProxyMode, taskProxyFailover)
+                              : undefined
+                          }
                           defaultCollapsed={activeTab === 'chatgpt' || mailboxCollapseState.defaultCollapsed}
                           autoExpand={
                             (activeTab === 'chatgpt' && normalizedChatgptPinnedSections.includes(section.title))

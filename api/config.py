@@ -6,6 +6,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from core.config_store import config_store
 from core.shared_config import SharedConfigConflict, filter_shareable_config, shared_config_store
+from core.task_proxy_config import normalize_dynamic_proxy_update
 
 router = APIRouter(prefix="/config", tags=["config"])
 
@@ -444,6 +445,13 @@ def _build_config_response(*, local_only: bool = False) -> dict[str, Any]:
         all_cfg["task_proxy_max_candidates"] = all_cfg.get("proxy_pool_max_candidates") or "5"
     if not all_cfg.get("task_proxy_min_score"):
         all_cfg["task_proxy_min_score"] = all_cfg.get("proxy_scan_min_score") or "50"
+    # GET 只做内存兼容展示，绝不偷偷写库。旧 dynamic 配置仍可能只有
+    # task_proxy_*；下一次受控保存/迁移会把它们归一化成 canonical 字段。
+    if str(all_cfg.get("task_proxy_mode") or "dynamic").strip().lower() == "dynamic":
+        if not all_cfg.get("dynamic_proxy_template") and all_cfg.get("task_proxy_url"):
+            all_cfg["dynamic_proxy_template"] = all_cfg.get("task_proxy_url")
+        if not all_cfg.get("dynamic_proxy_default_country") and all_cfg.get("task_proxy_country_code"):
+            all_cfg["dynamic_proxy_default_country"] = all_cfg.get("task_proxy_country_code")
     if not all_cfg.get("dynamic_proxy_template"):
         all_cfg["dynamic_proxy_template"] = ""
     if not all_cfg.get("dynamic_proxy_default_country"):
@@ -758,8 +766,7 @@ def get_shared_config_audit(limit: int = 50):
 def update_config(body: ConfigUpdate):
     # 只允许更新已知 key
     safe = {k: v for k, v in body.data.items() if k in CONFIG_KEYS}
-    dynamic_template = str(safe.get("dynamic_proxy_template") or "").strip()
-    dynamic_country = str(safe.get("dynamic_proxy_default_country") or "").strip().upper()
+    safe = normalize_dynamic_proxy_update(safe, config_store.get_all())
     if "dynamic_proxy_ip_retention_minutes" in safe:
         try:
             from core.dynamic_proxy import normalize_retention_minutes
@@ -769,11 +776,6 @@ def update_config(body: ConfigUpdate):
             )
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
-    if dynamic_template:
-        safe.setdefault("task_proxy_mode", "dynamic")
-        safe.setdefault("task_proxy_url", dynamic_template)
-    if dynamic_country:
-        safe.setdefault("task_proxy_country_code", dynamic_country)
     try:
         config_store.set_many(safe, base_revision=body.base_revision)
     except SharedConfigConflict as exc:

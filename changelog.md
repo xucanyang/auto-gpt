@@ -4,6 +4,21 @@
 
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，并且本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/) (语义化版本)。
 
+## [1.3.54] - 2026-07-11
+
+### 优化 (Changed)
+- **全局动态代理收敛为唯一配置源**：`core/proxy_utils.py` 将动态模式的正式配置固定为 `dynamic_proxy_template` 与 `dynamic_proxy_default_country`。显式单任务代理仍优先；历史 `task_proxy_url` / `task_proxy_country_code` 只在 canonical 字段为空时作为兼容回退，不再能悄悄覆盖动态模板或动态国家。`specified`、`pool`、`direct` 的原有后端语义保留。
+- **全局设置按出口模式显示真实需要的字段**：`frontend/src/pages/Settings.tsx` 在动态模式只展示“动态代理模板 + 动态代理出口国家”及动态探测/SID 参数；指定代理和代理池字段只在相应模式显示。动态模式保存会校验模板与两位国家码，并明确清空历史 `task_proxy_*` 动态副本，防止条件隐藏字段继续随表单提交。
+- **所有任务入口统一写入语义**：`frontend/src/lib/taskProxySettings.ts`、注册、账号批量同步、K12、手机号绑定、邮箱测活和代理页现在动态模式只写 canonical 动态字段。动态任务输入留空继续表示“沿用全局模板”，不会把正常模板清空；指定代理/代理池不再污染动态默认国家。相关页面文案同步为“全局默认”，不再把实际持久化行为伪称为仅本次覆盖。
+- **受控历史迁移工具**：新增 `core/task_proxy_config.py` 与 `scripts/migrate_dynamic_proxy_config.py`。脚本默认 dry-run；apply 前执行共享 SQLite 完整性检查和在线备份，按 revision/CAS 归一化旧字段。若历史两组字段冲突，迁移保留升级前真正的 runtime 优先值，避免上线时无声切换出口；输出仅包含字段、长度和哈希摘要。
+
+### 安全 (Security)
+- **共享配置审计脱敏代理凭据**：`core/shared_config.py` 将 `task_proxy_url`、`dynamic_proxy_template` 及明确的代理 URL/模板字段纳入敏感值脱敏，审计 API 只返回存在性、长度和 SHA-256；历史 `diff_json` 在读取时立即遮蔽，并可由迁移脚本物理重写，避免代理用户名、密码和完整 URL 经 `/api/config/share/audit` 泄露。
+
+### 测试 (Tests)
+- **覆盖动态代理 canonical 优先、legacy fallback 与四模式兼容**：扩展 `tests/test_dynamic_proxy.py`，验证全局 dynamic 不再被旧 `task_proxy_*` 覆盖、旧配置仍可运行、specified 语义不回归、动态预览和自定义邮箱测活使用相同 fallback。
+- **覆盖归一化和审计安全边界**：新增 `tests/test_task_proxy_config.py`、`tests/test_shared_config_proxy_redaction.py`，验证 legacy 提升、冲突保留旧 runtime、幂等迁移、非动态模式不误删，以及新旧共享审计均不回传代理凭据。
+
 ## [1.3.53] - 2026-07-11
 
 ### 修复 (Fixed)
@@ -1166,4 +1181,8 @@
 
 ## 2026-07-11 01:37:52 +0800
 - P0 熔断陈旧终态任务页面的摘要轮询
+- 发布模式: multi
+
+## 2026-07-11 02:25:52 +0800
+- 合并全局动态代理配置并清除旧覆盖字段
 - 发布模式: multi

@@ -211,8 +211,10 @@ def test_default_chatgpt_proxy_uses_global_dynamic_config(monkeypatch):
     def fake_configured_value(key, default=""):
         values = {
             "task_proxy_mode": "dynamic",
-            "task_proxy_country_code": "US",
+            "task_proxy_url": "socks5://legacy-region-CA-sid-oldsid-t-1:secret@legacy.example:3010",
+            "task_proxy_country_code": "CA",
             "dynamic_proxy_template": RAND_TEMPLATE,
+            "dynamic_proxy_default_country": "US",
             "dynamic_proxy_probe_enabled": "false",
             "dynamic_proxy_ip_retention_minutes": "9",
         }
@@ -226,6 +228,111 @@ def test_default_chatgpt_proxy_uses_global_dynamic_config(monkeypatch):
     assert "region-US-sid-" in proxy_url
     assert "-t-9" in proxy_url
     assert "dynamic country=US" in source
+
+
+def test_global_dynamic_canonical_template_wins_over_legacy_task_proxy_url(monkeypatch):
+    canonical_template = "socks5://canonical-region-Rand-sid-oldsid-t-1:secret@canonical.example:3010"
+    legacy_template = "socks5://legacy-region-Rand-sid-oldsid-t-1:secret@legacy.example:3010"
+
+    def fake_configured_value(key, default=""):
+        values = {
+            "task_proxy_mode": "dynamic",
+            "task_proxy_url": legacy_template,
+            "task_proxy_country_code": "CA",
+            "dynamic_proxy_template": canonical_template,
+            "dynamic_proxy_default_country": "US",
+            "dynamic_proxy_probe_enabled": "false",
+        }
+        return values.get(key, default)
+
+    monkeypatch.setattr("core.proxy_utils._configured_value", fake_configured_value)
+    proxy_url, proxy_pool, source = resolve_default_chatgpt_proxy_with_metadata()
+
+    assert proxy_pool is None
+    assert "canonical.example" in proxy_url
+    assert "legacy.example" not in proxy_url
+    assert "region-US" in proxy_url
+    assert "dynamic country=US" in source
+
+
+def test_global_dynamic_legacy_task_proxy_fields_remain_a_compatibility_fallback(monkeypatch):
+    legacy_template = "socks5://legacy-region-Rand-sid-oldsid-t-1:secret@legacy.example:3010"
+
+    def fake_configured_value(key, default=""):
+        values = {
+            "task_proxy_mode": "dynamic",
+            "task_proxy_url": legacy_template,
+            "task_proxy_country_code": "SG",
+            "dynamic_proxy_template": "",
+            "dynamic_proxy_default_country": "",
+            "dynamic_proxy_probe_enabled": "false",
+        }
+        return values.get(key, default)
+
+    monkeypatch.setattr("core.proxy_utils._configured_value", fake_configured_value)
+    proxy_url, proxy_pool, source = resolve_default_chatgpt_proxy_with_metadata()
+
+    assert proxy_pool is None
+    assert "legacy.example" in proxy_url
+    assert "region-SG" in proxy_url
+    assert "dynamic country=SG" in source
+
+
+def test_global_specified_mode_keeps_task_proxy_url_semantics(monkeypatch):
+    specified_proxy = "http://user:pass@specified.example:8080"
+
+    def fake_configured_value(key, default=""):
+        values = {
+            "task_proxy_mode": "specified",
+            "task_proxy_url": specified_proxy,
+            "dynamic_proxy_template": RAND_TEMPLATE,
+        }
+        return values.get(key, default)
+
+    monkeypatch.setattr("core.proxy_utils._configured_value", fake_configured_value)
+    proxy_url, proxy_pool, source = resolve_default_chatgpt_proxy_with_metadata()
+
+    assert proxy_url == specified_proxy
+    assert proxy_pool is None
+    assert source == "specified"
+
+
+def test_dynamic_preview_uses_legacy_global_dynamic_fields_as_fallback(monkeypatch):
+    from api.proxies import DynamicProxyPreviewRequest, dynamic_proxy_preview
+
+    def fake_configured_value(key, default=""):
+        values = {
+            "task_proxy_url": RAND_TEMPLATE,
+            "task_proxy_country_code": "SG",
+            "dynamic_proxy_template": "",
+            "dynamic_proxy_default_country": "",
+        }
+        return values.get(key, default)
+
+    monkeypatch.setattr("core.proxy_utils._configured_value", fake_configured_value)
+    result = dynamic_proxy_preview(DynamicProxyPreviewRequest(probe=False, refresh_sid=False))
+
+    assert result["ok"] is True
+    assert result["expected_country"] == "SG"
+    assert "secret" not in str(result)
+
+
+def test_custom_email_dynamic_country_prefers_canonical_global_default(monkeypatch):
+    from api.tasks import CustomEmailRecheckTaskRequest, _custom_email_proxy_settings
+
+    def fake_configured_value(key, default=""):
+        values = {
+            "dynamic_proxy_default_country": "US",
+            "task_proxy_country_code": "JP",
+        }
+        return values.get(key, default)
+
+    monkeypatch.setattr("core.proxy_utils._configured_value", fake_configured_value)
+    settings = _custom_email_proxy_settings(
+        CustomEmailRecheckTaskRequest(email="test@example.com", proxy_mode="dynamic")
+    )
+
+    assert settings["proxy_country_code"] == "US"
 
 
 def test_default_chatgpt_proxy_can_be_disabled_by_global_direct(monkeypatch):
