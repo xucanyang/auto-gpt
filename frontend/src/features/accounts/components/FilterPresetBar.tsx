@@ -56,13 +56,11 @@ export const FilterPresetBar: React.FC<FilterPresetBarProps> = ({
   selectedAccountsControl,
   mobileFilterControls,
 }) => {
-  const activeSummary = activeFilterPreset
-    ? (activeFilterPreset.summary || buildAccountFilterPresetSummary(activeFilterPreset.filters))
-    : ''
   const currentSummary = buildAccountFilterPresetSummary(currentFilterPresetFilters)
   const hasCurrentFilter = currentSummary !== '无筛选条件'
-  const shouldRenderSummaryDetails = hasCurrentFilter || Boolean(activeFilterPreset)
-  const shouldRenderSummary = isMobile || shouldRenderSummaryDetails
+  const shouldRenderFilterSummary = !activeFilterPreset && hasCurrentFilter
+  const shouldRenderDirtyActions = Boolean(activeFilterPreset && activeFilterPresetDirty)
+  const shouldRenderSummary = isMobile || shouldRenderFilterSummary || shouldRenderDirtyActions
 
   return (
     <div
@@ -174,18 +172,18 @@ export const FilterPresetBar: React.FC<FilterPresetBarProps> = ({
 
       {shouldRenderSummary ? (
         <div className="accounts-filter-preset-summary-row">
-          {shouldRenderSummaryDetails ? (
+          {shouldRenderFilterSummary || shouldRenderDirtyActions ? (
             <div className="accounts-filter-preset-summary-left">
-              <Text
-                className="accounts-filter-preset-summary-copy"
-                type="secondary"
-                style={{ fontSize: 12 }}
-                ellipsis={{ tooltip: activeFilterPreset ? activeSummary : currentSummary }}
-              >
-                {activeFilterPreset
-                  ? `当前组合：${activeFilterPreset.name}${activeFilterPreset.built_in ? ' (内置)' : ''}${activeFilterPresetDirty ? ' · 已修改' : ''}`
-                  : `筛选：${currentSummary}`}
-              </Text>
+              {shouldRenderFilterSummary ? (
+                <Text
+                  className="accounts-filter-preset-summary-copy"
+                  type="secondary"
+                  style={{ fontSize: 12 }}
+                  ellipsis={{ tooltip: currentSummary }}
+                >
+                  {`筛选：${currentSummary}`}
+                </Text>
+              ) : null}
               {activeFilterPreset && activeFilterPresetDirty ? (
                 <Space className="accounts-filter-preset-summary-actions" size={4}>
                   <Button size="small" type="link" style={{ padding: 0 }} loading={filterPresetSaving} onClick={() => void overwriteActiveFilterPreset()}>

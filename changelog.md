@@ -4,6 +4,15 @@
 
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，并且本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/) (语义化版本)。
 
+## [1.3.56] - 2026-07-11
+
+### 优化 (Changed)
+- **移除已选筛选组合的重复状态行**：`frontend/src/features/accounts/components/FilterPresetBar.tsx` 在选择了未修改的筛选组合时，不再于选择器下方重复显示“当前组合：名称”；下拉框和置顶快捷项原有的选中态继续作为唯一状态提示。未关联组合的手动筛选摘要、组合被改动后的“覆盖保存 / 另存为 / 还原”操作，以及移动端已选账号信息均保留，避免压缩布局时损失可执行操作或移动端上下文。
+- **前端版本同步至 v1.3.56**：`frontend/src/app/AppShell.tsx` 更新侧栏版本，便于确认浏览器已加载账号页筛选组合布局收敛后的静态资源。
+
+### 测试 (Tests)
+- **完成前端生产构建与静态改动检查**：本次仅调整筛选组合摘要的渲染条件；发布前执行 TypeScript/Vite 生产构建和 `git diff --check`，确认无类型或空白错误。
+
 ## [1.3.55] - 2026-07-11
 
 ### 优化 (Changed)
