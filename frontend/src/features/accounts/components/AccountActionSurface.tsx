@@ -1673,6 +1673,27 @@ export function AccountActionSurface({
       )
     }
 
+    if (activeAction.id === 'logout_web_session') {
+      return (
+        <>
+          <Alert
+            type="warning"
+            showIcon
+            style={{ marginBottom: 12 }}
+            message="退出当前账号保存的 ChatGPT 网页会话"
+            description="按浏览器退出流程使用 cookies + CSRF 发起 signout；成功后会清除本系统保存的 cookies/session_token。AccessToken 和 RefreshToken 不会撤销，也不会被删除。"
+          />
+          <Form.Item
+            name="confirm_logout"
+            valuePropName="checked"
+            rules={[{ validator: (_, value) => value ? Promise.resolve() : Promise.reject(new Error('请勾选确认后再退出')) }]}
+          >
+            <Checkbox>我确认退出该账号的网页 Cookie 会话</Checkbox>
+          </Form.Item>
+        </>
+      )
+    }
+
     return (activeAction.params || []).map((param: any) => (
       <Form.Item
         key={param.key}

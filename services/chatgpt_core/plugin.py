@@ -500,6 +500,18 @@ class ChatGPTPlatform(BasePlatform):
             {"id": "sync_oaipay_status", "label": "同步 OAIPay 状态", "params": []},
             {"id": "refresh_token", "label": "刷新 Token", "params": []},
             {
+                "id": "logout_web_session",
+                "label": "退出 ChatGPT 网页会话",
+                "params": [
+                    {
+                        "key": "confirm_logout",
+                        "label": "我确认只退出当前账号保存的 ChatGPT 网页 Cookie 会话",
+                        "type": "boolean",
+                        "default": False,
+                    }
+                ],
+            },
+            {
                 "id": "payment_link",
                 "label": "生成订阅链接",
                 "params": [
@@ -731,6 +743,48 @@ class ChatGPTPlatform(BasePlatform):
                     },
                 }
             return {"ok": False, "error": result.error_message}
+
+        if action_id == "logout_web_session":
+            if params.get("confirm_logout") is not True:
+                return {"ok": False, "error": "请确认退出当前账号的 ChatGPT 网页会话"}
+
+            from datetime import datetime, timezone
+            from services.chatgpt_core.account_fingerprint import resolve_account_browser_fingerprint
+            from services.chatgpt_core.web_logout import logout_chatgpt_web_session
+
+            fingerprint = resolve_account_browser_fingerprint(extra) or {}
+            proxy = resolve_default_chatgpt_proxy(self.config.proxy if self.config else None)
+            result = logout_chatgpt_web_session(
+                cookies=str(extra.get("cookies") or extra.get("cookie_header") or ""),
+                session_token=str(extra.get("session_token") or extra.get("sessionToken") or ""),
+                proxy_url=proxy,
+                user_agent=str(fingerprint.get("user_agent") or ""),
+                accept_language=str(fingerprint.get("accept_language") or ""),
+            )
+            if not result.success:
+                return {"ok": False, "error": result.error_message}
+            return {
+                "ok": True,
+                "data": {
+                    "message": "ChatGPT 网页会话已退出；本地 cookies/session 已清除，RT 与 AT 未改动",
+                    "status_code": result.status_code,
+                },
+                "account_extra_remove": [
+                    "cookies",
+                    "cookie_header",
+                    "cookie",
+                    "cookie_jar",
+                    "session_token",
+                    "sessionToken",
+                    "nextauth_session_token",
+                ],
+                "account_extra_patch": {
+                    "chatgpt_web_logout": {
+                        "at": datetime.now(timezone.utc).isoformat(),
+                        "status_code": result.status_code,
+                    }
+                },
+            }
 
         if action_id == "payment_link":
             from services.chatgpt_core.payment import generate_plus_link, generate_team_link

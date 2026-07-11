@@ -100,6 +100,21 @@ def _apply_action_result(
     result: dict[str, Any],
     session: Session,
 ) -> None:
+    extra_remove = result.get("account_extra_remove")
+    if isinstance(extra_remove, list):
+        extra = acc_model.get_extra()
+        changed = False
+        for key in extra_remove:
+            normalized_key = str(key or "").strip()
+            if normalized_key and normalized_key in extra:
+                extra.pop(normalized_key, None)
+                changed = True
+        if changed:
+            acc_model.set_extra(extra)
+            from datetime import datetime, timezone
+
+            acc_model.updated_at = datetime.now(timezone.utc)
+            session.add(acc_model)
     if platform == "chatgpt":
         data = result.get("data") if isinstance(result.get("data"), dict) else {}
         status_reason = ""

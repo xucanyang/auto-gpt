@@ -4,6 +4,16 @@
 
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，并且本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/) (语义化版本)。
 
+## [1.3.59] - 2026-07-11
+
+### 新增 (Added)
+- **ChatGPT 账号列表增加网页会话退出操作**：`services/chatgpt_core/web_logout.py` 按实际浏览器抓包实现 `GET /auth/logout.data?account_switch_action=logout` 后 `POST /api/auth/signout` 的完整退出链路。请求只携带已保存的 ChatGPT cookies 与 NextAuth CSRF token，不发送 AccessToken 或 RefreshToken；成功后 `api/actions.py` 原子移除当前账号本地 `cookies`、`session_token` 及兼容别名，同时保留 AT/RT，避免把“退出网页会话”误做成 OAuth 凭证撤销。
+- **账号行“更多”动作增加显式确认**：`frontend/src/features/accounts/components/AccountActionSurface.tsx` 为“退出 ChatGPT 网页会话”提供不可跳过的确认弹窗，明确标注影响范围：网页 Cookie 会话会退出并清理本地副本，AccessToken/RefreshToken 不会被撤销或删除；失败时保留本地凭证，便于排障或重试。
+- **前端版本同步至 v1.3.59**：`frontend/src/app/AppShell.tsx` 更新侧栏版本，用于确认浏览器已加载新的账号退出入口。
+
+### 测试 (Tests)
+- **覆盖退出接口凭证边界与请求顺序**：新增 `tests/test_chatgpt_web_logout.py`，验证完整 cookie + CSRF 才可执行、session token 仅作旧记录兼容、请求先走 logout data route 再走 signout，且 POST body 不包含 AT/RT。
+
 ## [1.3.58] - 2026-07-11
 
 ### 优化 (Changed)
@@ -1237,4 +1247,8 @@
 
 ## 2026-07-11 04:55:27 +0800
 - 优化注册日志当前成功数与账号间分隔
+- 发布模式: multi
+
+## 2026-07-11 18:13:19 +0800
+- feat(chatgpt): add browser web-session logout action
 - 发布模式: multi
