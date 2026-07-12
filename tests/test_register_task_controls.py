@@ -1536,6 +1536,60 @@ class BatchPaymentLinkTaskTests(unittest.TestCase):
         self.assertEqual(snapshot["success"], 1)
         self.assertEqual(snapshot["skipped"], 0)
 
+    def test_batch_payment_link_paypal_prefetches_and_pins_profile(self):
+        task_id = "task-batch-payment-paypal-profile"
+        account_id = self._add_account(email="paypal-profile@example.com")
+        self._create_payment_link_task(
+            task_id,
+            account_id,
+            "paypal-profile@example.com",
+            force_refresh=True,
+            params={"payment_source": "long_link_paypal"},
+        )
+        calls = []
+        paypal_client = unittest.mock.Mock()
+        paypal_client.get_profile.return_value = {
+            "profile_hash": "profile-hash-123",
+            "country": "GB",
+            "currency": "GBP",
+            "profile": {},
+        }
+
+        def _fake_execute(_instance, _platform, _account, _action, params, _session):
+            calls.append(dict(params))
+            return {
+                "ok": True,
+                "data": {
+                    "url": "https://www.paypal.com/agreements/approve?ba_token=BA-123",
+                    "payment_link_format": "paypal_url",
+                    "payment_source": "long_link_paypal",
+                    "profile_hash": "profile-hash-123",
+                    "cache_reused": False,
+                },
+            }
+
+        with (
+            patch("services.chatgpt_core.ChatGPTPlatform"),
+            patch("core.config_store.config_store.get_all", return_value={}),
+            patch("core.config_store.config_store.get", return_value=""),
+            patch(
+                "services.chatgpt_core.long_link_paypal_client.LongLinkPayPalClient.from_env",
+                return_value=paypal_client,
+            ),
+            patch.object(api_actions, "_execute_platform_action", side_effect=_fake_execute),
+            patch("api.tasks._save_task_log"),
+        ):
+            _run_batch_payment_links(task_id, [account_id])
+
+        paypal_client.get_profile.assert_called_once_with(force_refresh=True)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["payment_source"], "long_link_paypal")
+        self.assertEqual(calls[0]["payment_link_format"], "paypal_url")
+        self.assertEqual(calls[0]["profile_hash"], "profile-hash-123")
+        self.assertEqual(calls[0]["country"], "GB")
+        self.assertEqual(calls[0]["currency"], "GBP")
+        self.assertEqual(calls[0]["request_id"], f"auto-gpt:{task_id}:{account_id}")
+
     def test_enqueue_batch_payment_link_force_refresh_still_skips_invalid_accounts(self):
         valid_id = self._add_account(email="force-valid@example.com", status="registered")
         invalid_id = self._add_account(email="force-invalid@example.com", status="invalid")

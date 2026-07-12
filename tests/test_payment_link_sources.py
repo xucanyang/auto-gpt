@@ -1,0 +1,199 @@
+import unittest
+from unittest import mock
+
+from api.actions import _apply_action_result
+from core.base_platform import Account, RegisterConfig
+from core.db import AccountModel
+from services.chatgpt_core.payment_link_cache import (
+    build_payment_link_cache_payload,
+    normalize_payment_link_params,
+    payment_link_cache_matches,
+)
+from services.chatgpt_core.plugin import ChatGPTPlatform
+
+
+PROFILE_HASH = "profile-hash-123"
+PAYPAL_URL = "https://www.paypal.com/agreements/approve?ba_token=BA-123"
+
+
+class PaymentLinkSourceTests(unittest.TestCase):
+    def test_action_persistence_mirrors_paypal_cache(self):
+        account = AccountModel(
+            platform="chatgpt",
+            email="paypal@example.com",
+            password="pw",
+            status="registered",
+        )
+        session = mock.Mock()
+        result = {
+            "ok": True,
+            "data": {
+                "url": PAYPAL_URL,
+                "paypal_url": PAYPAL_URL,
+                "provider_redirect_url": PAYPAL_URL,
+                "plan": "plus",
+                "country": "GB",
+                "currency": "GBP",
+                "payment_link_format": "paypal_url",
+                "payment_source": "long_link_paypal",
+                "profile_hash": PROFILE_HASH,
+                "cache_source": "long_link_paypal",
+            },
+        }
+
+        _apply_action_result("chatgpt", "payment_link", account, result, session)
+
+        extra = account.get_extra()
+        self.assertEqual(account.cashier_url, PAYPAL_URL)
+        self.assertEqual(extra["chatgpt_last_payment_link"]["paypal_url"], PAYPAL_URL)
+        self.assertEqual(extra["chatgpt_paypal_url"]["url"], PAYPAL_URL)
+        self.assertEqual(extra["chatgpt_paypal_url"]["profile_hash"], PROFILE_HASH)
+        self.assertEqual(account.status, "pending_payment")
+
+    def test_paypal_cache_requires_matching_payment_source_and_profile(self):
+        cached = build_payment_link_cache_payload(
+            {
+                "url": PAYPAL_URL,
+                "paypal_url": PAYPAL_URL,
+                "provider_redirect_url": PAYPAL_URL,
+                "plan": "plus",
+                "country": "GB",
+                "currency": "GBP",
+                "payment_link_format": "paypal_url",
+                "payment_source": "long_link_paypal",
+                "profile_hash": PROFILE_HASH,
+                "cs_id": "cs_live_123",
+            },
+            source="long_link_paypal",
+        )
+        expected = normalize_payment_link_params(
+            {
+                "plan": "plus",
+                "country": "GB",
+                "currency": "GBP",
+                "payment_source": "long_link_paypal",
+                "profile_hash": PROFILE_HASH,
+            }
+        )
+
+        self.assertTrue(payment_link_cache_matches(cached, expected))
+        self.assertEqual(cached["paypal_url"], PAYPAL_URL)
+        self.assertEqual(cached["provider_redirect_url"], PAYPAL_URL)
+        self.assertEqual(cached["cs_id"], "cs_live_123")
+        self.assertFalse(payment_link_cache_matches(cached, {**expected, "profile_hash": "changed"}))
+        self.assertFalse(
+            payment_link_cache_matches(
+                cached,
+                {"plan": "plus", "country": "GB", "currency": "GBP", "payment_source": "chatgpt_hosted"},
+            )
+        )
+
+    def test_paypal_cache_does_not_inherit_hosted_proxy(self):
+        cached = build_payment_link_cache_payload(
+            {
+                "url": PAYPAL_URL,
+                "plan": "plus",
+                "country": "GB",
+                "currency": "GBP",
+                "payment_link_format": "paypal_url",
+                "payment_source": "long_link_paypal",
+                "profile_hash": PROFILE_HASH,
+                "proxy": "",
+            },
+            source="long_link_paypal",
+            fallback={
+                "url": "https://pay.openai.com/c/pay/cs_live_old#fid_real",
+                "payment_link_format": "long_hosted",
+                "payment_source": "chatgpt_hosted",
+                "proxy": "http://old-proxy.example:8080",
+            },
+        )
+
+        self.assertEqual(cached["proxy"], "")
+
+    def test_legacy_hosted_cache_still_matches(self):
+        cached = {
+            "url": "https://pay.openai.com/c/pay/cs_live_123#fid_real",
+            "plan": "plus",
+            "country": "ID",
+            "currency": "IDR",
+            "proxy": "",
+            "payment_link_format": "long_hosted",
+        }
+        self.assertTrue(
+            payment_link_cache_matches(
+                cached,
+                {"plan": "plus", "country": "ID", "currency": "IDR", "payment_link_format": "long_hosted"},
+            )
+        )
+
+    def test_plugin_routes_long_link_paypal_without_calling_hosted_generator(self):
+        account = Account(
+            platform="chatgpt",
+            email="paypal@example.com",
+            password="pw",
+            token="access-token-secret",
+        )
+        client = mock.Mock()
+        client.get_profile.return_value = {
+            "profile_hash": PROFILE_HASH,
+            "country": "GB",
+            "currency": "GBP",
+            "profile": {},
+        }
+        client.generate_paypal_link.return_value = {
+            "url": PAYPAL_URL,
+            "paypal_url": PAYPAL_URL,
+            "provider_redirect_url": PAYPAL_URL,
+            "payment_source": "long_link_paypal",
+            "payment_link_format": "paypal_url",
+            "profile_hash": PROFILE_HASH,
+            "currency": "GBP",
+            "cs_id": "cs_live_123",
+        }
+        platform = ChatGPTPlatform(config=RegisterConfig(extra={}))
+
+        with mock.patch(
+            "services.chatgpt_core.long_link_paypal_client.LongLinkPayPalClient.from_env",
+            return_value=client,
+        ), mock.patch("services.chatgpt_core.payment.generate_plus_link") as hosted_plus, mock.patch(
+            "services.chatgpt_core.payment.generate_team_link"
+        ) as hosted_team:
+            result = platform.execute_action(
+                "payment_link",
+                account,
+                {
+                    "plan": "plus",
+                    "payment_source": "long_link_paypal",
+                    "request_id": "batch-1:42",
+                },
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["data"]["url"], PAYPAL_URL)
+        self.assertEqual(result["data"]["payment_link_format"], "paypal_url")
+        self.assertEqual(result["data"]["profile_hash"], PROFILE_HASH)
+        client.generate_paypal_link.assert_called_once_with(
+            access_token="access-token-secret",
+            request_id="batch-1:42",
+            expected_profile_hash=PROFILE_HASH,
+        )
+        hosted_plus.assert_not_called()
+        hosted_team.assert_not_called()
+
+    def test_plugin_rejects_team_for_long_link_paypal(self):
+        account = Account(platform="chatgpt", email="team@example.com", password="pw", token="access-token-secret")
+        platform = ChatGPTPlatform(config=RegisterConfig(extra={}))
+
+        result = platform.execute_action(
+            "payment_link",
+            account,
+            {"plan": "team", "payment_source": "long_link_paypal"},
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertIn("仅支持 Plus", result["error"])
+
+
+if __name__ == "__main__":
+    unittest.main()

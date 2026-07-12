@@ -109,7 +109,14 @@ function gopayPhaseMeta(phase?: string) {
 const REGISTER_FORM_SETTINGS_STORAGE_PREFIX = 'auto-chatgpt.register-form-settings.'
 const DEFAULT_CHECKOUT_COUNTRY = 'ID'
 const DEFAULT_CHECKOUT_CURRENCY = 'IDR'
+const DEFAULT_PAYMENT_SOURCE = 'local_hosted'
+const LONG_LINK_PAYPAL_SOURCE = 'long_link_paypal'
 const DEFAULT_PAYMENT_LINK_FORMAT = 'long_hosted'
+const PAYPAL_PAYMENT_LINK_FORMAT = 'paypal_url'
+const PAYMENT_SOURCE_OPTIONS = [
+  { label: '本地 Hosted', value: DEFAULT_PAYMENT_SOURCE },
+  { label: 'PayPal API（使用 long-link 当前配置）', value: LONG_LINK_PAYPAL_SOURCE },
+]
 const PAYMENT_LINK_FORMAT_OPTIONS = [
   { label: '长支付链接', value: 'long_hosted' },
   { label: '短连接路径', value: 'short_chatgpt' },
@@ -679,13 +686,32 @@ function normalizeCheckoutCurrency(value: unknown) {
 
 function normalizePaymentLinkFormat(value: unknown) {
   const normalized = String(value || '').trim().toLowerCase().replace(/-/g, '_')
+  if (normalized === PAYPAL_PAYMENT_LINK_FORMAT || normalized === 'paypal') return PAYPAL_PAYMENT_LINK_FORMAT
   return normalized === 'short' || normalized === 'short_chatgpt' || normalized === 'chatgpt' || normalized === 'custom'
     ? 'short_chatgpt'
     : DEFAULT_PAYMENT_LINK_FORMAT
 }
 
 function paymentLinkFormatLabel(value: unknown) {
-  return normalizePaymentLinkFormat(value) === 'short_chatgpt' ? '短连接路径' : '长支付链接'
+  const normalized = normalizePaymentLinkFormat(value)
+  if (normalized === PAYPAL_PAYMENT_LINK_FORMAT) return 'PayPal 链接'
+  return normalized === 'short_chatgpt' ? '短连接路径' : '长支付链接'
+}
+
+function normalizePaymentSource(value: unknown, paymentLinkFormat?: unknown) {
+  const normalized = String(value || '').trim().toLowerCase().replace(/-/g, '_')
+  if (normalized === DEFAULT_PAYMENT_SOURCE) return DEFAULT_PAYMENT_SOURCE
+  if (normalized === LONG_LINK_PAYPAL_SOURCE || normalizePaymentLinkFormat(paymentLinkFormat) === PAYPAL_PAYMENT_LINK_FORMAT) {
+    return LONG_LINK_PAYPAL_SOURCE
+  }
+  return DEFAULT_PAYMENT_SOURCE
+}
+
+function paymentSourceLabel(value: unknown, paymentLinkFormat?: unknown) {
+  const normalized = String(value || '').trim().toLowerCase().replace(/-/g, '_')
+  if (normalized === LONG_LINK_PAYPAL_SOURCE) return 'PayPal API'
+  if (normalizePaymentLinkFormat(paymentLinkFormat) === PAYPAL_PAYMENT_LINK_FORMAT) return 'PayPal 链接'
+  return '本地 Hosted'
 }
 
 function normalizeGopayOtpAutoResendDelay(value: unknown) {
@@ -3892,8 +3918,12 @@ export default function Accounts() {
     } catch {
       defaults = {}
     }
+    const paymentSource = normalizePaymentSource(defaults.payment_source, defaults.payment_link_format)
     batchPaymentLinkConfigForm.setFieldsValue({
-      payment_link_format: normalizePaymentLinkFormat(defaults.payment_link_format),
+      payment_source: paymentSource,
+      payment_link_format: paymentSource === LONG_LINK_PAYPAL_SOURCE
+        ? DEFAULT_PAYMENT_LINK_FORMAT
+        : normalizePaymentLinkFormat(defaults.payment_link_format),
     })
     setBatchPaymentLinkForceRefresh(forceRefresh)
     setBatchPaymentLinkConfigOpen(true)
@@ -3903,13 +3933,19 @@ export default function Accounts() {
     const values = await batchPaymentLinkConfigForm.validateFields()
     const scope: 'selected' | 'filtered' = selectedRowKeys.length > 0 ? 'selected' : 'filtered'
     const forceRefresh = Boolean(batchPaymentLinkForceRefresh)
-    const paymentLinkFormat = normalizePaymentLinkFormat(values.payment_link_format)
+    const paymentSource = normalizePaymentSource(values.payment_source, values.payment_link_format)
+    const isPayPalApi = paymentSource === LONG_LINK_PAYPAL_SOURCE
+    const paymentLinkFormat = isPayPalApi
+      ? PAYPAL_PAYMENT_LINK_FORMAT
+      : normalizePaymentLinkFormat(values.payment_link_format)
     const toastKey = `payment-link:${scope}:${forceRefresh ? 'force' : 'normal'}`
     const body: Record<string, unknown> = {
-      skip_existing: !forceRefresh,
-      force_refresh: forceRefresh,
+      skip_existing: isPayPalApi ? false : !forceRefresh,
+      force_refresh: isPayPalApi ? true : forceRefresh,
       params: {
+        payment_source: paymentSource,
         payment_link_format: paymentLinkFormat,
+        ...(isPayPalApi ? { reuse_cached_link: false } : {}),
       },
     }
     const actionLabel = forceRefresh ? '强制重新生成订阅链接' : '批量订阅链接'
@@ -3951,7 +3987,7 @@ export default function Accounts() {
       setActiveTasksPanelOpen(true)
       void activeTasksQuery.refetch()
       message.success({
-        content: `${actionLabel}任务已启动：${paymentLinkFormatLabel(paymentLinkFormat)}，可执行 ${eligible} 个，跳过 ${skipped} 个${missing > 0 ? `，缺失 ${missing} 个` : ''}`,
+        content: `${actionLabel}任务已启动：${paymentSourceLabel(paymentSource, paymentLinkFormat)} · ${paymentLinkFormatLabel(paymentLinkFormat)}，可执行 ${eligible} 个，跳过 ${skipped} 个${missing > 0 ? `，缺失 ${missing} 个` : ''}`,
         key: toastKey,
       })
       showBatchActionResult(`${actionLabel}结果`, res)
@@ -7898,17 +7934,43 @@ export default function Accounts() {
             }
             description={
               batchPaymentLinkForceRefresh
-                ? '会绕过已有缓存重新生成，但账号已失效时仍会跳过。其他支付参数继续沿用全局或账号默认配置。'
-                : '默认可复用缓存；如果缓存参数不匹配，会按这里选择的路径重新生成。其他支付参数继续沿用全局或账号默认配置。'
+                ? '会绕过已有缓存重新生成，但账号已失效时仍会跳过。'
+                : '本地 Hosted 可按账号缓存跳过；PayPal API 始终为每个可执行账号创建新链接。'
             }
           />
           <Form.Item
-            name="payment_link_format"
-            label="生成路径"
-            initialValue={DEFAULT_PAYMENT_LINK_FORMAT}
-            rules={[{ required: true, message: '请选择生成路径' }]}
+            name="payment_source"
+            label="生成方式"
+            initialValue={DEFAULT_PAYMENT_SOURCE}
+            rules={[{ required: true, message: '请选择生成方式' }]}
           >
-            <Select options={PAYMENT_LINK_FORMAT_OPTIONS} />
+            <Select options={PAYMENT_SOURCE_OPTIONS} />
+          </Form.Item>
+          <Form.Item noStyle shouldUpdate={(prev, next) => prev.payment_source !== next.payment_source}>
+            {({ getFieldValue }) => {
+              const paymentSource = normalizePaymentSource(getFieldValue('payment_source'))
+              if (paymentSource === LONG_LINK_PAYPAL_SOURCE) {
+                return (
+                  <Alert
+                    type="info"
+                    showIcon
+                    style={{ marginBottom: 12, overflowWrap: 'anywhere' }}
+                    message="PayPal API · 使用 long-link 当前配置"
+                    description="使用 long-link 已保存的 PayPal 国家、货币和代理链；不读取本地 Hosted 的套餐、国家、货币、代理或缓存参数。批量任务按账号处理。"
+                  />
+                )
+              }
+              return (
+                <Form.Item
+                  name="payment_link_format"
+                  label="生成路径"
+                  initialValue={DEFAULT_PAYMENT_LINK_FORMAT}
+                  rules={[{ required: true, message: '请选择生成路径' }]}
+                >
+                  <Select options={PAYMENT_LINK_FORMAT_OPTIONS} />
+                </Form.Item>
+              )
+            }}
           </Form.Item>
         </Form>
       </Modal>

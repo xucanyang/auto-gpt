@@ -19,7 +19,13 @@ from services.chatgpt_account_state import apply_chatgpt_status_policy, classify
 from services.chatgpt_core import ChatGPTPlatform
 from services.chatgpt_core.local_status_refresh import schedule_chatgpt_local_status_refresh_for_account_id
 from services.chatgpt_core.invalid_account_recheck import recheck_invalid_chatgpt_account
-from services.chatgpt_core.payment_link_cache import build_payment_link_cache_payload
+from services.chatgpt_core.payment_link_cache import (
+    PAYMENT_LINK_FORMAT_PAYPAL,
+    PAYMENT_SOURCE_LONG_LINK_PAYPAL,
+    build_payment_link_cache_payload,
+    normalize_payment_link_output_format,
+    normalize_payment_link_source,
+)
 from services.chatgpt_sync import update_account_model_cliproxy_sync
 from services.sub2api_sync import backfill_chatgpt_account_to_sub2api, probe_chatgpt_sub2api_status, update_account_model_sub2api_sync
 from services.oaipay_sync import backfill_chatgpt_account_to_oaipay, probe_chatgpt_oaipay_status, update_account_model_oaipay_sync
@@ -150,11 +156,19 @@ def _apply_action_result(
             extra = acc_model.get_extra()
             acc_model.cashier_url = checkout_url
             existing_cache = extra.get("chatgpt_last_payment_link") if isinstance(extra.get("chatgpt_last_payment_link"), dict) else {}
-            extra["chatgpt_last_payment_link"] = build_payment_link_cache_payload(
+            cache_payload = build_payment_link_cache_payload(
                 data,
                 source=str(data.get("cache_source") or "payment_link_action"),
                 fallback=existing_cache,
             )
+            extra["chatgpt_last_payment_link"] = cache_payload
+            if (
+                normalize_payment_link_output_format(cache_payload.get("payment_link_format")) == PAYMENT_LINK_FORMAT_PAYPAL
+                or normalize_payment_link_source(cache_payload.get("payment_source")) == PAYMENT_SOURCE_LONG_LINK_PAYPAL
+            ):
+                paypal_payload = dict(cache_payload)
+                paypal_payload["paypal_url"] = str(paypal_payload.get("paypal_url") or checkout_url).strip()
+                extra["chatgpt_paypal_url"] = paypal_payload
             acc_model.set_extra(extra)
             mark_payment_pending(acc_model, reason="payment_link_generated")
             from datetime import datetime, timezone

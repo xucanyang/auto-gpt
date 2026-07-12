@@ -4,6 +4,25 @@
 
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，并且本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/) (语义化版本)。
 
+## [1.4.0] - 2026-07-13
+
+### 新增 (Added)
+- **接入 long-link 当前 PayPal 配置作为独立支付链接来源**：新增 `services/chatgpt_core/long_link_paypal_client.py`，通过 Docker 内网调用 `/opt/openai-pay-long-link` 的内部 profile、任务启动和任务轮询 API。auto-gpt 只提交账号 AccessToken、幂等请求 ID 与预期 profile hash；PayPal 国家、货币、代理链、浏览器指纹、账单地址和重试策略继续由 long-link 管理端当前配置统一决定，不在本项目复制协议代码或敏感配置。
+- **单账号和批量提链统一支持 PayPal API**：`services/chatgpt_core/plugin.py`、`api/actions.py` 与 `api/tasks.py` 增加 `payment_source=long_link_paypal` 分流。账号动作弹窗和账号页批量弹窗可在“本地 Hosted / PayPal API”之间选择；选中账号和当前筛选范围均可创建后台批量任务。PayPal 批量保持串行处理，启动时冻结一次 profile，并为每个账号生成带实例命名空间的稳定幂等 ID，避免 Plus 与 Plus2 同时运行时发生跨实例碰撞。
+- **PayPal 结果写入现有通用支付链接契约**：生成成功后写入 `cashier_url`、`extra.chatgpt_last_payment_link` 和 `extra.chatgpt_paypal_url`，并沿用 `pending_payment` 状态语义；不修改订阅结果、`used`、手机号/邮箱绑定或 Auth 捕获状态。PayPal API 只支持 Plus，Team 仍明确走本地 Hosted 生成器。
+
+### 优化 (Changed)
+- **按来源和配置版本隔离支付链接缓存**：`services/chatgpt_core/payment_link_cache.py` 为缓存加入 `payment_source` 与 `profile_hash`。PayPal API 链接不继承历史 Hosted 的代理、账单或来源元数据，profile 发生变化时旧链接不会被错误复用；批量 PayPal 默认强制生成新链接，本地 Hosted 的既有缓存、金额探测和 Team 行为保持不变。
+- **前端按来源收敛参数和历史显示**：`AccountActionSurface.tsx` 与 `Accounts.tsx` 在 PayPal API 模式隐藏 Hosted 专属套餐、国家、货币、代理和 promo 参数，切回 Hosted 时恢复对应字段；历史 OaiPay 等 `paypal_url` 仅标记为“PayPal 链接”，不会冒充本次 long-link 的“PayPal API”来源。侧栏版本同步至 `v1.4.0`。
+
+### 安全 (Security)
+- **内部 Provider 使用独立密钥与漂移保护**：调用只使用 `OPENAI_PAY_LONG_LINK_API_KEY`，不复用 long-link 管理 Cookie、AES 密钥或管理员密码。每次任务要求匹配服务端 SHA-256 profile hash，客户端错误文本会遮蔽 AccessToken；远端任务默认最长等待 1800 秒，避免长流程被普通 HTTP 短超时提前切断。
+- **幂等请求绑定实例和账号身份**：批量请求 ID 包含 `APP_INSTANCE_ID + task_id + account_id`；long-link 服务端同时校验不可逆 AccessToken 摘要与 profile hash。同 ID 被另一账号或另一配置误用时返回 `409`，不返回已有 PayPal 链接。
+
+### 测试 (Tests)
+- **覆盖 Provider 客户端、来源隔离和批量参数契约**：新增 `tests/test_long_link_paypal_client.py`、`tests/test_payment_link_sources.py`，并扩展 `tests/test_register_task_controls.py`，验证内部 API 轮询、错误脱敏、PayPal URL 校验、profile 缓存、Hosted/PayPal 缓存隔离、数据库写入边界、Team 拒绝、批量 profile 固定及实例级幂等 ID。
+- **完成前端生产构建与后端回归**：覆盖单账号和批量 PayPal API 分流，同时保留本地 Hosted、注册任务控制和外部 PayPal 领取契约的既有行为；前端 TypeScript/Vite 构建用于验证来源切换及响应式弹窗未引入编译回归。
+
 ## [1.3.59] - 2026-07-11
 
 ### 新增 (Added)
@@ -1251,4 +1270,8 @@
 
 ## 2026-07-11 18:13:19 +0800
 - feat(chatgpt): add browser web-session logout action
+- 发布模式: multi
+
+## 2026-07-13 07:42:21 +0800
+- 接入当前 PayPal API 单账号与批量提链
 - 发布模式: multi

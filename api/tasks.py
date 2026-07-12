@@ -1,5 +1,6 @@
 from collections import deque
 import hashlib
+import os
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -1892,6 +1893,9 @@ def _filtered_payment_link_request_params(params: dict[str, Any] | None) -> dict
         "currency",
         "proxy",
         "payment_link_format",
+        "payment_source",
+        "profile_hash",
+        "payment_profile_hash",
         "promo_code",
         "workspace_name",
         "seat_quantity",
@@ -8933,6 +8937,33 @@ def _run_batch_payment_links(task_id: str, account_ids: list[int]):
         for item in skipped_items:
             _log(task_id, f"[SKIP] {item.get('email') or item.get('account_id') or '-'} - {item.get('reason') or '已跳过'}")
 
+        from services.chatgpt_core.payment_link_cache import (
+            PAYMENT_LINK_FORMAT_PAYPAL,
+            PAYMENT_SOURCE_LONG_LINK_PAYPAL,
+            normalize_payment_link_source,
+        )
+
+        if normalize_payment_link_source(request_params.get("payment_source")) == PAYMENT_SOURCE_LONG_LINK_PAYPAL:
+            from services.chatgpt_core.long_link_paypal_client import LongLinkPayPalClient
+
+            profile = LongLinkPayPalClient.from_env().get_profile(force_refresh=True)
+            request_params.update(
+                {
+                    "plan": "plus",
+                    "country": str(profile.get("country") or request_params.get("country") or "ID").strip().upper(),
+                    "currency": str(profile.get("currency") or request_params.get("currency") or "IDR").strip().upper(),
+                    "payment_link_format": PAYMENT_LINK_FORMAT_PAYPAL,
+                    "payment_source": PAYMENT_SOURCE_LONG_LINK_PAYPAL,
+                    "payment_profile_hash": str(profile.get("profile_hash") or "").strip(),
+                }
+            )
+            _log(
+                task_id,
+                "[订阅链接] 已冻结 PayPal 提链配置 "
+                f"profile={str(profile.get('profile_hash') or '')[:12]} "
+                f"country={request_params['country']} currency={request_params['currency']}",
+            )
+
         for index, account_id in enumerate(account_ids, start=1):
             control.checkpoint(consume_skip=False)
             email = ""
@@ -8954,6 +8985,9 @@ def _run_batch_payment_links(task_id: str, account_ids: list[int]):
                         continue
 
                     params = _build_batch_payment_link_params(account, request_params)
+                    if params.get("payment_source") == PAYMENT_SOURCE_LONG_LINK_PAYPAL:
+                        instance_id = str(os.getenv("APP_INSTANCE_ID") or "auto-gpt").strip() or "auto-gpt"
+                        params["request_id"] = f"{instance_id}:{task_id}:{int(account_id or 0)}"
                     params["save_defaults"] = False
                     if force_refresh:
                         params["reuse_cached_link"] = False
@@ -9006,13 +9040,16 @@ def _run_batch_payment_links(task_id: str, account_ids: list[int]):
                         _log(task_id, f"[SKIP] 已有可复用订阅链接: {email or account_id}")
                         continue
 
-                    proxy_label = "直连" if not str(params.get("proxy") or "").strip() else "指定代理"
+                    proxy_label = "上游配置" if params.get("payment_source") == PAYMENT_SOURCE_LONG_LINK_PAYPAL else (
+                        "直连" if not str(params.get("proxy") or "").strip() else "指定代理"
+                    )
                     _log(
                         task_id,
                         "[订阅链接] "
                         f"{index}/{total} {email or account_id} "
                         f"plan={params.get('plan')} country={params.get('country')} "
-                        f"currency={params.get('currency')} link_format={params.get('payment_link_format')} proxy={proxy_label}",
+                        f"currency={params.get('currency')} link_format={params.get('payment_link_format')} "
+                        f"source={params.get('payment_source')} proxy={proxy_label}",
                     )
                     result = _execute_platform_action(
                         instance,

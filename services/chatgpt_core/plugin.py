@@ -788,19 +788,43 @@ class ChatGPTPlatform(BasePlatform):
 
         if action_id == "payment_link":
             from services.chatgpt_core.payment import generate_plus_link, generate_team_link
+            from services.chatgpt_core.long_link_paypal_client import LongLinkPayPalClient
             from services.chatgpt_core.payment_link_cache import (
+                PAYMENT_LINK_FORMAT_PAYPAL,
+                PAYMENT_SOURCE_LONG_LINK_PAYPAL,
                 normalize_payment_link_output_format,
+                normalize_payment_link_params,
+                normalize_payment_link_source,
                 normalize_payment_link_url,
+                payment_link_cache_matches,
                 payment_link_url_requires_regeneration,
             )
 
             plan = str(params.get("plan") or "plus").strip().lower()
             if plan not in {"plus", "team"}:
                 plan = "plus"
-            country = str(params.get("country") or "ID").strip().upper() or "ID"
-            currency = str(params.get("currency") or "IDR").strip().upper() or "IDR"
-            payment_proxy = resolve_default_chatgpt_proxy(normalize_proxy_url(params.get("proxy")) or None)
-            payment_link_format = normalize_payment_link_output_format(params.get("payment_link_format"))
+            payment_source = normalize_payment_link_source(params.get("payment_source"))
+            paypal_client = None
+            payment_profile: dict = {}
+            payment_profile_hash = str(params.get("payment_profile_hash") or params.get("profile_hash") or "").strip()
+            if payment_source == PAYMENT_SOURCE_LONG_LINK_PAYPAL:
+                if plan != "plus":
+                    return {"ok": False, "error": "long_link_paypal 仅支持 Plus 套餐"}
+                paypal_client = LongLinkPayPalClient.from_env()
+                payment_profile = paypal_client.get_profile()
+                current_profile_hash = str(payment_profile.get("profile_hash") or "").strip()
+                if payment_profile_hash and payment_profile_hash != current_profile_hash:
+                    return {"ok": False, "error": "PayPal 提链配置已变化，请重新发起任务"}
+                payment_profile_hash = current_profile_hash
+                country = str(payment_profile.get("country") or params.get("country") or "ID").strip().upper() or "ID"
+                currency = str(payment_profile.get("currency") or params.get("currency") or "IDR").strip().upper() or "IDR"
+                payment_proxy = ""
+                payment_link_format = PAYMENT_LINK_FORMAT_PAYPAL
+            else:
+                country = str(params.get("country") or "ID").strip().upper() or "ID"
+                currency = str(params.get("currency") or "IDR").strip().upper() or "IDR"
+                payment_proxy = resolve_default_chatgpt_proxy(normalize_proxy_url(params.get("proxy")) or None)
+                payment_link_format = normalize_payment_link_output_format(params.get("payment_link_format"))
             promo_code = str(params.get("promo_code") or "").strip()
             save_defaults = params.get("save_defaults") is not False
             reuse_cached_link = params.get("reuse_cached_link") is not False
@@ -808,10 +832,6 @@ class ChatGPTPlatform(BasePlatform):
             cached_format = normalize_payment_link_output_format(cached_link.get("payment_link_format") or "long_hosted")
             cached_url = normalize_payment_link_url(cached_link.get("url"), cached_format)
             cached_url_needs_regeneration = payment_link_url_requires_regeneration(cached_link.get("url"), cached_format)
-            cached_plan = str(cached_link.get("plan") or "").strip().lower()
-            cached_country = str(cached_link.get("country") or "").strip().upper()
-            cached_currency = str(cached_link.get("currency") or "").strip().upper()
-            cached_proxy = normalize_proxy_url(cached_link.get("proxy")) or ""
             billing = {
                 "name": str(params.get("billing_name") or "").strip(),
                 "email": str(params.get("billing_email") or getattr(a, "email", "") or "").strip(),
@@ -830,6 +850,8 @@ class ChatGPTPlatform(BasePlatform):
                         "currency": currency,
                         "proxy": payment_proxy,
                         "payment_link_format": payment_link_format,
+                        "payment_source": payment_source,
+                        "profile_hash": payment_profile_hash,
                         "promo_code": promo_code,
                         "workspace_name": str(params.get("workspace_name") or "MyTeam").strip() or "MyTeam",
                         "seat_quantity": max(2, int(params.get("seat_quantity", 5) or 5)),
@@ -839,32 +861,72 @@ class ChatGPTPlatform(BasePlatform):
                 if save_defaults
                 else {}
             )
+            normalized_cache_params = normalize_payment_link_params(
+                {
+                    **params,
+                    "plan": plan,
+                    "country": country,
+                    "currency": currency,
+                    "proxy": payment_proxy,
+                    "payment_link_format": payment_link_format,
+                    "payment_source": payment_source,
+                    "profile_hash": payment_profile_hash,
+                }
+            )
             should_reuse_cached_link = (
                 reuse_cached_link
                 and bool(cached_url)
                 and not cached_url_needs_regeneration
-                and cached_plan == plan
-                and cached_country == country
-                and cached_currency == currency
-                and cached_proxy == payment_proxy
-                and cached_format == payment_link_format
+                and payment_link_cache_matches(cached_link, normalized_cache_params)
             )
             if should_reuse_cached_link:
-                return {
-                    "ok": True,
-                    "data": {
+                cached_data = dict(cached_link)
+                cached_data.update(
+                    {
                         "url": cached_url,
                         "plan": plan,
                         "country": country,
                         "currency": currency,
                         "proxy": payment_proxy,
                         "payment_link_format": payment_link_format,
+                        "payment_source": payment_source,
+                        "profile_hash": payment_profile_hash,
                         "promo_code": str(cached_link.get("promo_code") or promo_code).strip(),
                         "billing": cached_billing or billing,
                         "cache_reused": True,
                         "cache_source": str(cached_link.get("source") or "cached_payment_link"),
                         "message": "已复用缓存订阅链接",
-                    },
+                    }
+                )
+                return {
+                    "ok": True,
+                    "data": cached_data,
+                    "account_extra_patch": defaults_patch,
+                }
+            if payment_source == PAYMENT_SOURCE_LONG_LINK_PAYPAL:
+                assert paypal_client is not None
+                generated = paypal_client.generate_paypal_link(
+                    access_token=str(a.access_token or ""),
+                    request_id=str(params.get("request_id") or "").strip(),
+                    expected_profile_hash=payment_profile_hash,
+                )
+                data = {
+                    **generated,
+                    "plan": "plus",
+                    "country": country,
+                    "currency": str(generated.get("currency") or currency).strip().upper(),
+                    "proxy": "",
+                    "payment_link_format": PAYMENT_LINK_FORMAT_PAYPAL,
+                    "payment_source": PAYMENT_SOURCE_LONG_LINK_PAYPAL,
+                    "profile_hash": payment_profile_hash,
+                    "promo_code": "",
+                    "billing": billing,
+                    "cache_reused": False,
+                    "cache_source": PAYMENT_SOURCE_LONG_LINK_PAYPAL,
+                }
+                return {
+                    "ok": bool(generated.get("url")),
+                    "data": data,
                     "account_extra_patch": defaults_patch,
                 }
             if plan == "plus":
@@ -898,6 +960,8 @@ class ChatGPTPlatform(BasePlatform):
                     "currency": currency,
                     "proxy": payment_proxy,
                     "payment_link_format": payment_link_format,
+                    "payment_source": payment_source,
+                    "profile_hash": payment_profile_hash,
                     "promo_code": promo_code,
                     "billing": billing,
                     "cache_reused": False,

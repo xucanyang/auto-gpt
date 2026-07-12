@@ -30,6 +30,9 @@ PAYMENT_LINK_REGENERATE_STATUSES = {
     "precheck_failed",
 }
 PAYMENT_LINK_STATUS_SYNC_STATUSES = {"already_paid"}
+PAYMENT_LINK_FORMAT_PAYPAL = "paypal_url"
+PAYMENT_SOURCE_CHATGPT_HOSTED = "chatgpt_hosted"
+PAYMENT_SOURCE_LONG_LINK_PAYPAL = "long_link_paypal"
 
 
 def normalize_payment_link_plan(value: Any) -> str:
@@ -42,7 +45,23 @@ def normalize_payment_link_status(value: Any) -> str:
 
 
 def normalize_payment_link_output_format(value: Any) -> str:
+    text = str(value or "").strip().lower().replace("-", "_")
+    if text in {"paypal", "paypal_url", "paypal_approval", "provider_url"}:
+        return PAYMENT_LINK_FORMAT_PAYPAL
     return normalize_payment_link_format(value)
+
+
+def normalize_payment_link_source(value: Any) -> str:
+    text = str(value or "").strip().lower().replace("-", "_")
+    if text in {
+        "long_link_paypal",
+        "longlink_paypal",
+        "openai_pay_long_link",
+        "openai_pay_long_link_api",
+        "paypal",
+    }:
+        return PAYMENT_SOURCE_LONG_LINK_PAYPAL
+    return PAYMENT_SOURCE_CHATGPT_HOSTED
 
 
 def payment_link_status_label(value: Any) -> str:
@@ -64,6 +83,8 @@ def payment_link_requires_status_sync(cached: dict[str, Any] | None) -> bool:
 
 def payment_link_url_requires_regeneration(value: Any, link_format: Any = None) -> bool:
     normalized_format = normalize_payment_link_output_format(link_format or DEFAULT_PAYMENT_LINK_FORMAT)
+    if normalized_format == PAYMENT_LINK_FORMAT_PAYPAL:
+        return False
     if normalized_format != PAYMENT_LINK_FORMAT_LONG:
         return False
     return is_default_hosted_checkout_fragment(value)
@@ -82,12 +103,19 @@ def normalize_payment_link_params(params: dict[str, Any] | None) -> dict[str, An
     plan = normalize_payment_link_plan(source.get("plan"))
     country = normalize_checkout_country(source.get("country"))
     currency = normalize_checkout_currency(source.get("currency"), country)
+    payment_source = normalize_payment_link_source(source.get("payment_source"))
+    payment_link_format = normalize_payment_link_output_format(source.get("payment_link_format"))
+    if payment_source == PAYMENT_SOURCE_LONG_LINK_PAYPAL:
+        plan = "plus"
+        payment_link_format = PAYMENT_LINK_FORMAT_PAYPAL
     return {
         "plan": plan,
         "country": country,
         "currency": currency,
-        "proxy": normalize_proxy_url(source.get("proxy")) or "",
-        "payment_link_format": normalize_payment_link_output_format(source.get("payment_link_format")),
+        "proxy": "" if payment_source == PAYMENT_SOURCE_LONG_LINK_PAYPAL else normalize_proxy_url(source.get("proxy")) or "",
+        "payment_link_format": payment_link_format,
+        "payment_source": payment_source,
+        "profile_hash": str(source.get("profile_hash") or source.get("payment_profile_hash") or "").strip(),
         "promo_code": str(source.get("promo_code") or "").strip(),
         "workspace_name": str(source.get("workspace_name") or "MyTeam").strip() or "MyTeam",
         "seat_quantity": max(2, _positive_int(source.get("seat_quantity", 5), 5)),
@@ -107,19 +135,33 @@ def payment_link_cache_matches(
     cached_currency = normalize_checkout_currency(cached.get("currency"), cached_country)
     cached_proxy = normalize_proxy_url(cached.get("proxy")) or ""
     cached_format = normalize_payment_link_output_format(cached.get("payment_link_format") or PAYMENT_LINK_FORMAT_LONG)
+    cached_source = normalize_payment_link_source(
+        cached.get("payment_source")
+        or (PAYMENT_SOURCE_LONG_LINK_PAYPAL if cached_format == PAYMENT_LINK_FORMAT_PAYPAL else "")
+    )
+    cached_profile_hash = str(cached.get("profile_hash") or cached.get("payment_profile_hash") or "").strip()
     if payment_link_url_requires_regeneration(cached.get("url"), cached_format):
         return False
-    return (
+    matches = (
         cached_plan == expected["plan"]
         and cached_country == expected["country"]
         and cached_currency == expected["currency"]
         and cached_proxy == expected["proxy"]
         and cached_format == expected["payment_link_format"]
+        and cached_source == expected["payment_source"]
     )
+    if not matches:
+        return False
+    if expected["payment_source"] == PAYMENT_SOURCE_LONG_LINK_PAYPAL:
+        return bool(expected["profile_hash"]) and cached_profile_hash == expected["profile_hash"]
+    return True
 
 
 def normalize_payment_link_url(value: Any, link_format: Any = None) -> str:
-    return normalize_checkout_url_for_link_format(value, link_format or DEFAULT_PAYMENT_LINK_FORMAT)
+    normalized_format = normalize_payment_link_output_format(link_format or DEFAULT_PAYMENT_LINK_FORMAT)
+    if normalized_format == PAYMENT_LINK_FORMAT_PAYPAL:
+        return str(value or "").strip()
+    return normalize_checkout_url_for_link_format(value, normalized_format)
 
 
 def build_payment_link_cache_payload(
@@ -135,12 +177,32 @@ def build_payment_link_cache_payload(
         or fallback_source.get("payment_link_format")
         or DEFAULT_PAYMENT_LINK_FORMAT
     )
+    raw_payment_source = payload_source.get("payment_source")
+    if not str(raw_payment_source or "").strip() and link_format == PAYMENT_LINK_FORMAT_PAYPAL:
+        raw_payment_source = PAYMENT_SOURCE_LONG_LINK_PAYPAL
+    payment_source = normalize_payment_link_source(raw_payment_source or fallback_source.get("payment_source"))
+    fallback_format = normalize_payment_link_output_format(
+        fallback_source.get("payment_link_format") or DEFAULT_PAYMENT_LINK_FORMAT
+    )
+    fallback_payment_source = normalize_payment_link_source(
+        fallback_source.get("payment_source")
+        or (PAYMENT_SOURCE_LONG_LINK_PAYPAL if fallback_format == PAYMENT_LINK_FORMAT_PAYPAL else "")
+    )
+    metadata_fallback = (
+        fallback_source
+        if fallback_format == link_format and fallback_payment_source == payment_source
+        else {}
+    )
     url = str(
         payload_source.get("url")
+        or payload_source.get("paypal_url")
+        or payload_source.get("provider_redirect_url")
         or payload_source.get("checkout_url")
         or payload_source.get("cashier_url")
         or payload_source.get("chatgpt_checkout_url")
         or fallback_source.get("url")
+        or fallback_source.get("paypal_url")
+        or fallback_source.get("provider_redirect_url")
         or fallback_source.get("checkout_url")
         or fallback_source.get("cashier_url")
         or fallback_source.get("chatgpt_checkout_url")
@@ -153,20 +215,20 @@ def build_payment_link_cache_payload(
     plan = normalize_payment_link_plan(
         payload_source.get("plan")
         or payload_source.get("chatgpt_checkout_plan")
-        or fallback_source.get("plan")
-        or fallback_source.get("chatgpt_checkout_plan")
+        or metadata_fallback.get("plan")
+        or metadata_fallback.get("chatgpt_checkout_plan")
     )
     country = normalize_checkout_country(
         payload_source.get("country")
         or payload_source.get("chatgpt_checkout_country")
-        or fallback_source.get("country")
-        or fallback_source.get("chatgpt_checkout_country")
+        or metadata_fallback.get("country")
+        or metadata_fallback.get("chatgpt_checkout_country")
     )
     currency = normalize_checkout_currency(
         payload_source.get("currency")
         or payload_source.get("chatgpt_checkout_currency")
-        or fallback_source.get("currency")
-        or fallback_source.get("chatgpt_checkout_currency"),
+        or metadata_fallback.get("currency")
+        or metadata_fallback.get("chatgpt_checkout_currency"),
         country,
     )
 
@@ -175,18 +237,30 @@ def build_payment_link_cache_payload(
         "plan": plan,
         "country": country,
         "currency": currency,
-        "proxy": normalize_proxy_url(payload_source.get("proxy") or fallback_source.get("proxy")) or "",
+        "proxy": (
+            ""
+            if payment_source == PAYMENT_SOURCE_LONG_LINK_PAYPAL
+            else normalize_proxy_url(payload_source.get("proxy") or metadata_fallback.get("proxy")) or ""
+        ),
         "payment_link_format": link_format,
-        "promo_code": str(payload_source.get("promo_code") or fallback_source.get("promo_code") or "").strip(),
-        "source": str(source or payload_source.get("source") or fallback_source.get("source") or "").strip(),
+        "payment_source": payment_source,
+        "profile_hash": str(
+            payload_source.get("profile_hash")
+            or payload_source.get("payment_profile_hash")
+            or metadata_fallback.get("profile_hash")
+            or metadata_fallback.get("payment_profile_hash")
+            or ""
+        ).strip(),
+        "promo_code": str(payload_source.get("promo_code") or metadata_fallback.get("promo_code") or "").strip(),
+        "source": str(source or payload_source.get("source") or metadata_fallback.get("source") or "").strip(),
         "created_at": str(
             payload_source.get("created_at")
-            or fallback_source.get("created_at")
+            or metadata_fallback.get("created_at")
             or datetime.now(timezone.utc).isoformat()
         ),
     }
 
-    billing = payload_source.get("billing") if isinstance(payload_source.get("billing"), dict) else fallback_source.get("billing")
+    billing = payload_source.get("billing") if isinstance(payload_source.get("billing"), dict) else metadata_fallback.get("billing")
     if isinstance(billing, dict):
         payload["billing"] = billing
 
@@ -196,7 +270,7 @@ def build_payment_link_cache_payload(
         else payload_source.get("chatgpt_checkout_amount")
     )
     if amount is None:
-        amount = fallback_source.get("checkout_amount")
+        amount = metadata_fallback.get("checkout_amount")
     if amount is not None:
         payload["checkout_amount"] = amount
 
@@ -206,7 +280,7 @@ def build_payment_link_cache_payload(
         else payload_source.get("chatgpt_checkout_amount_is_zero")
     )
     if amount_is_zero is None:
-        amount_is_zero = fallback_source.get("checkout_amount_is_zero")
+        amount_is_zero = metadata_fallback.get("checkout_amount_is_zero")
     if amount_is_zero is not None:
         payload["checkout_amount_is_zero"] = bool(amount_is_zero)
 
@@ -216,9 +290,35 @@ def build_payment_link_cache_payload(
         else payload_source.get("chatgpt_checkout_probe")
     )
     if not isinstance(probe, dict):
-        probe = fallback_source.get("checkout_probe")
+        probe = metadata_fallback.get("checkout_probe")
     if isinstance(probe, dict):
         payload["checkout_probe"] = probe
+
+    if link_format == PAYMENT_LINK_FORMAT_PAYPAL:
+        payload["paypal_url"] = str(payload_source.get("paypal_url") or metadata_fallback.get("paypal_url") or url).strip()
+
+    for key in (
+        "link_type",
+        "provider_redirect_url",
+        "long_url",
+        "stripe_redirect_url",
+        "stripe_hosted_url",
+        "cs_id",
+        "payment_method_id",
+        "payment_method_type",
+        "processor_entity",
+        "remote_job_id",
+        "remote_request_id",
+        "billing_country",
+        "payment_locale",
+        "amount_display",
+        "cs_count",
+    ):
+        value = payload_source.get(key)
+        if value is None or value == "":
+            value = metadata_fallback.get(key)
+        if value is not None and value != "":
+            payload[key] = value
 
     return payload
 
