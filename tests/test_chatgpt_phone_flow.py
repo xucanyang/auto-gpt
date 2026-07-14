@@ -6,6 +6,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import requests
+
 from core.task_runtime import SkipCurrentAttemptRequested
 from services.chatgpt_core.oauth_client import OAuthClient
 from services.chatgpt_core.phone_service import (
@@ -296,6 +298,52 @@ class LocalPhoneGatewayServiceTests(unittest.TestCase):
 
 
 class UploadedPhoneServiceTests(unittest.TestCase):
+    def test_uploaded_phone_service_requests_forwarded_url_and_keeps_source(self):
+        entries, errors = parse_uploaded_phone_lines(
+            "+13434832954----https://supplier.example/api/code?token=secret&x=1"
+        )
+        self.assertFalse(errors)
+        service = UploadedPhoneService(entries)
+        service.bind_entry(entries[0])
+        resolution = mock.Mock(
+            request_api_url="https://phone-api.aa8.pl/api/code?token=secret&x=1",
+            forwarded=True,
+        )
+        response = mock.Mock(status_code=200, text='{"code":"123456"}', headers={})
+        response.json.return_value = {"code": "123456"}
+
+        with mock.patch("services.chatgpt_core.phone_service.resolve_phone_api_url", return_value=resolution):
+            with mock.patch("services.chatgpt_core.phone_service.requests.get", return_value=response) as request:
+                service._fetch_api_poll_result(entries[0])
+
+        request.assert_called_once_with(
+            "https://phone-api.aa8.pl/api/code?token=secret&x=1",
+            timeout=20,
+        )
+        resolved = service.resolved_entry(entries[0])
+        self.assertEqual(resolved.source_api_url, "https://supplier.example/api/code?token=secret&x=1")
+        self.assertEqual(resolved.api_url, "https://phone-api.aa8.pl/api/code?token=secret&x=1")
+
+    def test_forward_connection_error_does_not_leak_query_token(self):
+        entries, _ = parse_uploaded_phone_lines(
+            "+13434832954----https://supplier.example/api/code?token=top-secret"
+        )
+        service = UploadedPhoneService(entries)
+        service.bind_entry(entries[0])
+        resolution = mock.Mock(
+            request_api_url="https://phone-api.aa8.pl/api/code?token=top-secret",
+            forwarded=True,
+        )
+        with mock.patch("services.chatgpt_core.phone_service.resolve_phone_api_url", return_value=resolution):
+            with mock.patch(
+                "services.chatgpt_core.phone_service.requests.get",
+                side_effect=requests.ConnectionError("failed https://phone-api.aa8.pl/api/code?token=top-secret"),
+            ):
+                with self.assertRaisesRegex(Exception, "api_forward_error") as raised:
+                    service._fetch_api_poll_result(entries[0])
+
+        self.assertNotIn("top-secret", str(raised.exception))
+
     def test_parse_uploaded_phone_lines_accepts_phone_api_pairs_and_dedupes(self):
         entries, errors = parse_uploaded_phone_lines(
             "\n".join(

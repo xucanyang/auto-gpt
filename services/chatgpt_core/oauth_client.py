@@ -1107,6 +1107,17 @@ class OAuthClient:
                 self._raise_stop(exc)
             self._log(f"[手机号验证] 记录手机号池 OpenAI 拒绝状态失败: {exc}")
 
+    def _record_existing_phone_pool_forward_error(self, phone: str, reason: str) -> None:
+        """Keep the number active while retaining a task-level Relay failure."""
+        try:
+            from services.chatgpt_core.phone_pool_repository import PhonePoolRepository
+
+            PhonePoolRepository().record_task_status(phone, "api_forward_error", reason=reason)
+        except Exception as exc:
+            if self._is_stop_exception(exc):
+                self._raise_stop(exc)
+            self._log(f"[手机号验证] 记录 API 转发临时失败状态失败: {exc}")
+
     def _handle_existing_phone_otp_verification(
         self,
         device_id,
@@ -1231,8 +1242,8 @@ class OAuthClient:
             self._set_error(pool_message)
             return None
 
-        api_url = str(getattr(record, "api_url", "") or "").strip()
-        if not api_url:
+        source_api_url = str(getattr(record, "api_url", "") or "").strip()
+        if not source_api_url:
             if self._manual_phone_otp_enabled():
                 detail = f"手机号 {phone} 命中手机号池但缺少 API URL，无法自动验证"
                 self._log(f"[手机号验证] {detail}，切换为人工输入验证码")
@@ -1252,6 +1263,17 @@ class OAuthClient:
             return None
 
         try:
+            from services.chatgpt_core.phone_api_forwarding import PhoneApiForwardError, resolve_phone_api_url
+
+            resolution = resolve_phone_api_url(source_api_url, strict=True)
+            api_url = str(resolution.request_api_url or "").strip()
+        except PhoneApiForwardError as exc:
+            detail = f"api_forward_error: 已绑定手机号 {phone} API 转发暂时不可用: {exc}"
+            self._record_existing_phone_pool_forward_error(phone, detail)
+            self._set_error(detail)
+            return None
+
+        try:
             from services.chatgpt_core.phone_service import UploadedPhoneEntry, UploadedPhoneService
         except Exception as exc:
             self._set_error(f"加载上传手机号接码服务失败: {exc}")
@@ -1264,6 +1286,7 @@ class OAuthClient:
             api_url=api_url,
             raw_line=f"{phone}----{api_url}",
             line_no=0,
+            source_api_url=source_api_url,
         )
         phone_service = UploadedPhoneService(
             [service_entry],
@@ -1347,7 +1370,13 @@ class OAuthClient:
         self._log(f"[手机号验证] 已请求绑定手机号短信验证码: {phone}")
         phone_service.mark_sms_sent(service_entry)
 
-        code = phone_service.wait_for_code(service_entry)
+        try:
+            code = phone_service.wait_for_code(service_entry)
+        except PhoneApiForwardError as exc:
+            detail = f"api_forward_error: 已绑定手机号 {phone} API 转发暂时不可用: {exc}"
+            self._record_existing_phone_pool_forward_error(phone, detail)
+            self._set_error(detail)
+            return None
         max_resends = int(getattr(phone_service, "max_resend_attempts", 1) or 1)
         resend_interval_seconds = int(getattr(phone_service, "resend_interval_seconds", 0) or 0)
         for resend_attempt in range(1, max_resends + 1):
@@ -1369,7 +1398,13 @@ class OAuthClient:
                 self._set_error(f"已绑定手机号 {phone} 验证短信重发失败: {resend_detail}")
                 return None
             phone_service.mark_sms_sent(service_entry)
-            code = phone_service.wait_for_code(service_entry)
+            try:
+                code = phone_service.wait_for_code(service_entry)
+            except PhoneApiForwardError as exc:
+                detail = f"api_forward_error: 已绑定手机号 {phone} API 转发暂时不可用: {exc}"
+                self._record_existing_phone_pool_forward_error(phone, detail)
+                self._set_error(detail)
+                return None
 
         if not code:
             if self._manual_phone_otp_enabled():

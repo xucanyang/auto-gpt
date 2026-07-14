@@ -351,15 +351,30 @@ class PhonePoolRecord:
     def remaining_capacity(self) -> int:
         return max(int(self.max_accounts or 0) - int(self.bound_count or 0), 0)
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self, *, forwarding_config: dict[str, Any] | None = None) -> dict[str, Any]:
         def iso(dt: datetime | None) -> str | None:
             return dt.isoformat() if dt else None
 
+        try:
+            from services.chatgpt_core.phone_api_forwarding import serialize_forwarding_fields
+
+            forwarding = serialize_forwarding_fields(self.api_url, config=forwarding_config)
+        except Exception as exc:
+            forwarding = {
+                "source_api_url": self.api_url,
+                "source_api_host": self.api_host,
+                "forwarded_api_url": "",
+                "forwarded_api_host": "",
+                "api_forwarded": False,
+                "forward_status": "unavailable",
+                "forward_error": str(exc)[:240],
+            }
         return {
             "id": self.id,
             "phone_e164": self.phone_e164,
             "api_url": self.api_url,
             "api_host": self.api_host,
+            **forwarding,
             "api_expired_date": self.api_expired_date,
             "api_expiry_checked_at": self.api_expiry_checked_at,
             "api_expiry_status": self.api_expiry_status,
@@ -593,7 +608,7 @@ def _self_unavailable_reason(record: PhonePoolRecord) -> str:
         code = str(record.last_error_code or "").strip().lower()
         if code == "openai_rejected":
             return "openai_rejected"
-        if code in {"api_no_code", "api_error"}:
+        if code in {"api_no_code", "api_error", "api_forward_error"}:
             return code
         return "cannot_send"
     if status == STATUS_RATE_LIMITED:
@@ -655,6 +670,22 @@ def serialize_phone_pool_records(
     """
     universe = list(all_records) if all_records is not None else list(records)
     prefix_map = _build_prefix_health_map(universe)
+    # Fetch the Relay control-plane snapshot once for the complete response.
+    # ``to_dict`` remains backwards compatible for standalone callers, while
+    # list/snapshot endpoints avoid one Admin request per phone row.
+    try:
+        from services.chatgpt_core.phone_api_forwarding import get_forwarding_config
+
+        forwarding_config = get_forwarding_config(strict=False)
+    except Exception as exc:
+        forwarding_config = {
+            "enabled": False,
+            "active_origin": "",
+            "previous_origins": [],
+            "relay_configured": True,
+            "forward_status": "unavailable",
+            "relay_error": "手机号 API Relay 暂时不可达",
+        }
     items: list[dict[str, Any]] = []
     for record in records:
         prefix = _phone_prefix4(record.phone_e164)
@@ -663,7 +694,7 @@ def serialize_phone_pool_records(
         self_available = not self_reason
         block_reason = _ordinary_task_block_reason(record, prefix_item)
         prefix_status = str((prefix_item or {}).get("status") or "unknown")
-        item = record.to_dict()
+        item = record.to_dict(forwarding_config=forwarding_config)
         item.update(
             {
                 "prefix": prefix,
@@ -1164,7 +1195,43 @@ class PhonePoolRepository:
                 if max_items and len(items) >= max_items:
                     return items
                 line_no += 1
-                raw_line = f"{record.phone_e164}----{record.api_url}"
+                try:
+                    from services.chatgpt_core.phone_api_forwarding import (
+                        PhoneApiForwardError,
+                        resolve_phone_api_url,
+                    )
+
+                    resolution = resolve_phone_api_url(record.api_url, strict=True)
+                    request_api_url = resolution.request_api_url or record.api_url
+                    forwarding_fields = {
+                        "source_api_url": record.api_url,
+                        "source_api_host": resolution.source_api_host or record.api_host,
+                        "forwarded_api_url": request_api_url if resolution.forwarded else "",
+                        "forwarded_api_host": resolution.forwarded_api_host,
+                        "api_forwarded": resolution.forwarded,
+                        "forward_status": resolution.status,
+                    }
+                except PhoneApiForwardError:
+                    # A strict business path must never turn Relay failure into
+                    # an empty API URL that the caller silently skips (or falls
+                    # back to the supplier host).  Preserve the dedicated
+                    # error class for task-level ``api_forward_error`` status.
+                    raise
+                except Exception as exc:
+                    request_api_url = ""
+                    forwarding_fields = {
+                        "source_api_url": record.api_url,
+                        "source_api_host": record.api_host,
+                        "forwarded_api_url": "",
+                        "forwarded_api_host": "",
+                        "api_forwarded": False,
+                        "forward_status": "error",
+                        "forward_error": str(exc)[:240],
+                        "forward_error_code": str(
+                            getattr(exc, "code", "api_forward_error") or "api_forward_error"
+                        )[:64],
+                    }
+                raw_line = f"{record.phone_e164}----{request_api_url}"
                 if record.api_expired_date:
                     raw_line = f"{raw_line}----{record.api_expired_date}"
                 items.append({
@@ -1172,7 +1239,8 @@ class PhonePoolRepository:
                     "pool_id": record.id,
                     "line_no": line_no,
                     "phone": record.phone_e164,
-                    "api_url": record.api_url,
+                    "api_url": request_api_url,
+                    **forwarding_fields,
                     "api_expired_date": record.api_expired_date,
                     "raw_line": raw_line,
                     "pool_managed": True,
@@ -1265,7 +1333,19 @@ class PhonePoolRepository:
                 results.append({"id": record_id, "status": API_EXPIRY_STATUS_ERROR, "error": "API URL 为空", "item": record.to_dict()})
                 continue
 
-            probe = probe_phone_api_expiry(record.api_url, timeout=timeout)
+            try:
+                from services.chatgpt_core.phone_api_forwarding import resolve_phone_api_url
+
+                probe_url = resolve_phone_api_url(record.api_url, strict=True).request_api_url
+            except Exception as exc:
+                probe = {
+                    "ok": False,
+                    "status": API_EXPIRY_STATUS_ERROR,
+                    "expired_date": "",
+                    "error": f"api_forward_error: {str(exc)[:240]}",
+                }
+            else:
+                probe = probe_phone_api_expiry(probe_url, timeout=timeout)
             checked_at = _now_text()
             with Session(engine) as session:
                 model = session.get(PhonePoolModel, int(record_id))
@@ -1401,6 +1481,12 @@ class PhonePoolRepository:
                 model.cooldown_until = (now + timedelta(seconds=int(cooldown_seconds))).isoformat().replace("+00:00", "Z")
             if target != STATUS_ACTIVE:
                 model.status = target
+            elif str(error_code or "").strip() == "api_forward_error":
+                # Relay/DNS/TLS failures are transient infrastructure faults;
+                # explicitly restore usability even when the previous attempt
+                # left a temporary status or cooldown on this number.
+                model.status = STATUS_ACTIVE
+                model.cooldown_until = ""
             model.updated_at = now
             session.add(model)
             session.commit()
@@ -1500,6 +1586,15 @@ class PhonePoolRepository:
             return self.record_failure(phone, status=STATUS_EXHAUSTED, error_code=status, error_message=reason)
         if status in {"api_no_code", "api_error", "openai_rejected"}:
             return self.record_failure(phone, status=STATUS_CANNOT_SEND, error_code=status, error_message=reason)
+        if status == "api_forward_error":
+            # Relay/DNS/TLS/registry failures are infrastructure failures, not
+            # evidence that the phone or supplier API is unusable.
+            return self.record_failure(
+                phone,
+                status=STATUS_ACTIVE,
+                error_code=status,
+                error_message=reason,
+            )
         if status == "rate_limited":
             return self.record_failure(phone, status=STATUS_RATE_LIMITED, error_code=status, error_message=reason, cooldown_seconds=600)
         if status in {"account_phone_bound", "not_tested"}:
@@ -1531,7 +1626,7 @@ class PhonePoolRepository:
                     account_emails.setdefault(phone, [])
                     if email not in account_emails[phone]:
                         account_emails[phone].append(email)
-                api_url = str(binding.get("api_url") or "").strip()
+                api_url = str(binding.get("source_api_url") or binding.get("api_url") or "").strip()
                 if api_url and phone not in api_urls:
                     api_urls[phone] = api_url
         updated = created = 0

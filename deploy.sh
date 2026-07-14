@@ -6,7 +6,7 @@ set -Eeuo pipefail
 # - Git 变更自动写入 changelog.md 并提交
 # - 禁止把运行态/密钥/抓包/依赖产物提交进仓库
 # - 默认不再创建发布前备份；如需临时备份，显式追加 --backup
-# - 当前常驻拓扑：auto-gpt-plus / auto-plus2；auto-gpt 保持已停止的 standby 容器
+# - 当前常驻拓扑：phone-api-relay / auto-gpt-plus / auto-plus2；auto-gpt 保持已停止的 standby 容器
 # - 发布后只校验常驻实例，绝不因发布意外重新拉起 standby 实例
 # ==============================================================================
 
@@ -21,7 +21,7 @@ MODE="multi"      # multi / hot
 DRY_RUN=0
 PUSH=0
 BACKUP="${AUTO_GPT_DEPLOY_BACKUP:-0}"
-ACTIVE_SERVICES=(auto-gpt-plus auto-plus2)
+ACTIVE_SERVICES=(phone-api-relay auto-gpt-plus auto-plus2)
 STANDBY_SERVICES=(auto-gpt)
 ALL_SERVICES=("${ACTIVE_SERVICES[@]}" "${STANDBY_SERVICES[@]}")
 
@@ -31,7 +31,7 @@ Usage:
   $0 "本次变更说明" [--mode=multi|hot] [--dry-run] [--push] [--backup]
 
 Modes:
-  --mode=multi    默认：构建 auto-gpt:latest 并升级 auto-gpt-plus / auto-plus2；auto-gpt 保持停止
+  --mode=multi    默认：构建 auto-gpt:latest 并升级 phone-api-relay / auto-gpt-plus / auto-plus2；auto-gpt 保持停止
   --mode=hot      调用 scripts/deploy-to-auto-gpt-container.sh 对多容器做热同步，仅适合静态/Python 小补丁
   --backup        本次发布前额外创建 .rollback-backups/deploy-<timestamp> 运行态备份；默认关闭
 
@@ -218,6 +218,9 @@ for item in raw.split(b"\0"):
     if not item:
         continue
     path = item.decode("utf-8", "replace")
+    if path == "services/phone_api_relay.py":
+        blocked.append(path + " (必须使用 --mode=multi 以更新独立 Relay 容器)")
+        continue
     if path in allowed_files or path.startswith(allowed_prefixes):
         continue
     blocked.append(path)
@@ -250,9 +253,10 @@ append_changelog_if_needed() {
 }
 
 run_checks() {
-  log "语法检查: deploy.sh / main.py / api/system.py"
+  log "语法检查: deploy.sh / main.py / api/system.py / services/phone_api_relay.py"
   bash -n deploy.sh
-  python3 -m py_compile main.py api/system.py
+  python3 -m py_compile main.py api/system.py services/phone_api_relay.py
+  compose_multi config >/dev/null
 }
 
 sqlite_backup_or_copy() {
@@ -266,6 +270,7 @@ sqlite_backup_or_copy() {
     cp -a "$src" "$dst"
     printf 'sqlite3 not found; copied raw file without integrity check\n' > "$integrity"
   fi
+  chmod 600 "$dst" "$integrity"
 }
 
 create_backup() {
@@ -278,12 +283,40 @@ create_backup() {
     return 0
   fi
   mkdir -p "$backup_root"
+  chmod 700 "$backup_root"
   git rev-parse HEAD > "$backup_root/git-head.before.txt"
   git status --short --ignored > "$backup_root/git-status.before.txt" || true
   compose_multi config > "$backup_root/docker-compose.multi.rendered.yml"
+  python3 - "$backup_root/docker-compose.multi.rendered.yml" <<'PY'
+from pathlib import Path
+import re, sys
+p = Path(sys.argv[1])
+s = p.read_text(errors="replace")
+s = re.sub(r"(?im)^(\s*(?:[A-Z0-9_]*(?:TOKEN|KEY|PASSWORD|SECRET)[A-Z0-9_]*):\s*).*$", r"\1<redacted>", s)
+p.write_text(s)
+PY
   for service in "${ALL_SERVICES[@]}"; do
     if docker inspect "$service" >/dev/null 2>&1; then
       docker inspect "$service" > "$backup_root/${service}.inspect.before.json"
+      python3 - "$backup_root/${service}.inspect.before.json" <<'PY'
+from pathlib import Path
+import json, re, sys
+p = Path(sys.argv[1])
+try:
+    data = json.loads(p.read_text())
+except Exception:
+    raise SystemExit(0)
+secret = re.compile(r"(?:TOKEN|KEY|PASSWORD|SECRET)", re.I)
+def scrub(value):
+    if isinstance(value, dict):
+        return {k: ("<redacted>" if secret.search(str(k)) else scrub(v)) for k, v in value.items()}
+    if isinstance(value, list):
+        return [scrub(v) for v in value]
+    if isinstance(value, str) and any(marker in value.upper() for marker in ("TOKEN=", "KEY=", "PASSWORD=", "SECRET=")):
+        return "<redacted>"
+    return value
+p.write_text(json.dumps(scrub(data), ensure_ascii=False, indent=2) + "\n")
+PY
     fi
   done
   for data_root in /opt/auto-gpt/data /opt/auto-gpt-plus/data /opt/auto-plus2/data; do
@@ -295,6 +328,11 @@ create_backup() {
   done
   if [[ -d /opt/auto-gpt/shared_config ]]; then
     tar -C /opt/auto-gpt -czf "$backup_root/shared_config.before_deploy.tgz" shared_config
+  fi
+  if [[ -s /opt/auto-gpt-relay/phone_api_relay.db ]]; then
+    sqlite_backup_or_copy /opt/auto-gpt-relay/phone_api_relay.db \
+      "$backup_root/phone_api_relay.db.before_deploy.bak" \
+      "$backup_root/phone_api_relay.db.integrity_check.txt"
   fi
   find "$ROOT_DIR" -maxdepth 2 -type f \( -name '*.py' -o -name 'deploy.sh' -o -name 'docker-compose.multi.yml' -o -name 'Dockerfile' \) -print0 \
     | sort -z | xargs -0 sha256sum > "$backup_root/source.sha256sums.txt" || true
@@ -316,7 +354,8 @@ smoke_url() {
 
 smoke_after_deploy() {
   log "运行容器状态"
-  docker ps -a --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' | grep -E 'NAMES|auto-gpt|auto-plus2' || true
+  docker ps -a --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' | grep -E 'NAMES|phone-api-relay|auto-gpt|auto-plus2' || true
+  smoke_url "phone-api-relay health" "http://127.0.0.1:8893/health"
   smoke_url "auto-gpt-plus health" "http://127.0.0.1:8001/api/health"
   smoke_url "auto-plus2 health" "http://127.0.0.1:8003/api/health"
   smoke_url "auto-gpt-plus index" "http://127.0.0.1:8001/"

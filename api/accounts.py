@@ -1199,6 +1199,7 @@ def _build_phone_summary(
         (
             "phone",
             "api_url",
+            "source_api_url",
             "status",
             "status_label",
             "api_expired_date",

@@ -233,6 +233,30 @@ async def lifespan(app: FastAPI):
     _print_runtime_info()
     init_db()
     print("[OK] 数据库初始化完成")
+    try:
+        from services.chatgpt_core.phone_api_forwarding import (
+            relay_is_configured,
+            sync_phone_pool_inventory,
+        )
+        if relay_is_configured():
+            from api.phone_pool import _repo as phone_pool_repo
+            relay_sync = sync_phone_pool_inventory(
+                phone_pool_repo.list(),
+                trigger="startup",
+            )
+            if str(relay_sync.get("status") or "") == "synced":
+                print(
+                    "[PhonePool] API Relay 启动库存同步完成: "
+                    f"inventory={int(relay_sync.get('inventory_count') or 0)} "
+                    f"routes={int(relay_sync.get('route_count') or 0)}"
+                )
+            else:
+                print(
+                    "[WARN] 手机号池 API Relay 启动库存同步失败: "
+                    f"{relay_sync.get('last_error') or relay_sync.get('status') or 'unknown'}"
+                )
+    except Exception as exc:
+        print(f"[WARN] 手机号池 API Relay 启动库存同步失败: {exc}")
     print(f"[OK] 已加载核心模块: {[ChatGPTPlatform.name]}")
     from core.scheduler import scheduler
     scheduler.start()

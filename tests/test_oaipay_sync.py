@@ -1,3 +1,4 @@
+import json
 import unittest
 from unittest import mock
 
@@ -277,6 +278,126 @@ class OaiPaySyncTests(unittest.TestCase):
         self.assertIn("HTTP 401", result["message"])
         self.assertIn("上传密钥无效", result["message"])
 
+    def test_upload_phone_api_uses_forwarded_url_and_retains_source(self):
+        account = self._make_account()
+        extra = account.get_extra()
+        extra["chatgpt_phone_binding"] = {
+            "status": "bound",
+            "phone": "+15551230001",
+            "api_url": "https://phone-api.aa8.pl/api/code?token=demo",
+            "source_api_url": "https://supplier.example/api/code?token=demo",
+        }
+        account.set_extra(extra)
+        resolution = mock.Mock(
+            request_api_url="https://phone-api.aa8.pl/api/code?token=demo",
+            forwarded=True,
+        )
+        response = FakeOaiPayResponse(200, {"success": True, "imported": 1})
+        category = {"resolved_group": "2", "category_mode": "manual", "category_source": "manual"}
+        with mock.patch("services.chatgpt_core.oaipay_upload._build_category_decision", return_value=category):
+            with mock.patch("services.chatgpt_core.phone_api_forwarding.resolve_phone_api_url", return_value=resolution):
+                with mock.patch("services.chatgpt_core.oaipay_upload.cffi_requests.post", return_value=response) as post:
+                    result = upload_to_oaipay_detailed(
+                        account,
+                        api_url="https://gpt.cccy.me",
+                        api_key="upload-key",
+                        capabilities={"has_refresh_token": True, "has_paid_subscription": True},
+                    )
+
+        self.assertTrue(result["ok"])
+        uploaded = post.call_args.kwargs["json"]["accounts"][0]
+        self.assertEqual(uploaded["phone_api"], "https://phone-api.aa8.pl/api/code?token=demo")
+        self.assertEqual(uploaded["source_api_url"], "https://supplier.example/api/code?token=demo")
+        token_data = json.loads(uploaded["extra_info"])
+        self.assertEqual(token_data["api_url"], uploaded["phone_api"])
+        self.assertEqual(token_data["source_api_url"], uploaded["source_api_url"])
+
+    def test_upload_phone_api_fails_closed_when_relay_unavailable(self):
+        from services.chatgpt_core.phone_api_forwarding import PhoneApiForwardError
+
+        account = self._make_account()
+        extra = account.get_extra()
+        extra["chatgpt_phone_binding"] = {
+            "status": "bound",
+            "phone": "+15551230001",
+            "source_api_url": "https://supplier.example/api/code?token=demo",
+        }
+        account.set_extra(extra)
+        category = {"resolved_group": "2", "category_mode": "manual", "category_source": "manual"}
+        with mock.patch("services.chatgpt_core.oaipay_upload._build_category_decision", return_value=category):
+            with mock.patch(
+                "services.chatgpt_core.phone_api_forwarding.resolve_phone_api_url",
+                side_effect=PhoneApiForwardError("Relay unavailable", code="relay_unavailable"),
+            ):
+                with mock.patch("services.chatgpt_core.oaipay_upload.cffi_requests.post") as post:
+                    result = upload_to_oaipay_detailed(
+                        account,
+                        api_url="https://gpt.cccy.me",
+                        api_key="upload-key",
+                        capabilities={"has_refresh_token": True, "has_paid_subscription": True},
+                    )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error_code"], "api_forward_error")
+        post.assert_not_called()
+
+    def test_historical_relay_only_phone_url_is_not_relabelled_as_supplier(self):
+        saved_relay_url = "https://relay-old.example/api/code?token=demo"
+        current_relay_url = "https://phone-api.aa8.pl/api/code?token=demo"
+        extra = {
+            "chatgpt_bound_phone": {
+                "phone": "+15551230001",
+                "api_url": saved_relay_url,
+            }
+        }
+        resolution = mock.Mock(request_api_url=current_relay_url, forwarded=True)
+        with mock.patch(
+            "services.chatgpt_core.phone_pool_repository.PhonePoolRepository.get",
+            return_value=None,
+        ):
+            with mock.patch(
+                "services.chatgpt_core.phone_api_forwarding.get_forwarding_config",
+                return_value={
+                    "enabled": True,
+                    "active_origin": "https://phone-api.aa8.pl",
+                    "previous_origins": ["https://relay-old.example"],
+                },
+            ):
+                with mock.patch(
+                    "services.chatgpt_core.phone_api_forwarding.resolve_phone_api_url",
+                    return_value=resolution,
+                ) as resolve:
+                    delivery = oaipay_upload_module._resolve_bound_phone_delivery(extra)
+
+        self.assertEqual(delivery["api_url"], current_relay_url)
+        self.assertEqual(delivery["source_api_url"], "")
+        resolve.assert_called_once_with(saved_relay_url, strict=True)
+
+    def test_historical_relay_only_phone_url_fails_when_relay_is_disabled(self):
+        from services.chatgpt_core.phone_api_forwarding import PhoneApiForwardError
+
+        saved_relay_url = "https://phone-api.aa8.pl/api/code?token=demo"
+        extra = {
+            "chatgpt_bound_phone": {
+                "phone": "+15551230001",
+                "api_url": saved_relay_url,
+            }
+        }
+        with mock.patch(
+            "services.chatgpt_core.phone_pool_repository.PhonePoolRepository.get",
+            return_value=None,
+        ):
+            with mock.patch(
+                "services.chatgpt_core.phone_api_forwarding.get_forwarding_config",
+                return_value={
+                    "enabled": False,
+                    "active_origin": "https://phone-api.aa8.pl",
+                    "previous_origins": [],
+                },
+            ):
+                with self.assertRaisesRegex(PhoneApiForwardError, "无法恢复供应商 API"):
+                    oaipay_upload_module._resolve_bound_phone_delivery(extra)
+
     def test_probe_401_surfaces_server_detail(self):
         response = FakeOaiPayResponse(401, {"detail": "上传密钥无效"}, '{"detail":"上传密钥无效"}')
 
@@ -297,3 +418,46 @@ class OaiPaySyncTests(unittest.TestCase):
         self.assertEqual(result["remote_state"], "unreachable")
         self.assertIn("HTTP 401", result["message"])
         self.assertIn("上传密钥无效", result["message"])
+
+    def test_upload_uses_forwarded_phone_api_and_keeps_supplier_url(self):
+        import json
+
+        account = self._make_account()
+        extra = account.get_extra()
+        extra["chatgpt_bound_phone"] = {
+            "phone": "+15551230001",
+            "api_url": "https://supplier.example/api?token=secret",
+            "source_api_url": "https://supplier.example/api?token=secret",
+        }
+        extra["chatgpt_phone_binding"] = dict(extra["chatgpt_bound_phone"])
+        account.set_extra(extra)
+        forwarded = "https://phone-api.aa8.pl/api?token=secret"
+        with mock.patch(
+            "services.chatgpt_core.phone_api_forwarding.resolve_phone_api_url",
+            return_value=mock.Mock(
+                request_api_url=forwarded,
+                source_api_url=extra["chatgpt_bound_phone"]["source_api_url"],
+                forwarded=True,
+            ),
+        ):
+            with mock.patch(
+                "services.chatgpt_core.oaipay_upload.cffi_requests.post",
+                return_value=FakeOaiPayResponse(200, {"success": True, "imported": 1}),
+            ) as mock_post:
+                result = upload_to_oaipay_detailed(
+                    account,
+                    api_url="https://gpt.cccy.me",
+                    api_key="upload-key",
+                    group_ids=[1],
+                    category_mode="manual",
+                    capabilities={"has_refresh_token": True, "has_paid_subscription": True},
+                )
+
+        self.assertTrue(result["ok"])
+        payload = mock_post.call_args.kwargs["json"]
+        uploaded = payload["accounts"][0]
+        self.assertEqual(uploaded["phone_api"], forwarded)
+        self.assertEqual(uploaded["source_api_url"], extra["chatgpt_bound_phone"]["source_api_url"])
+        extra_info = json.loads(uploaded["extra_info"])
+        self.assertEqual(extra_info["api_url"], forwarded)
+        self.assertEqual(extra_info["source_api_url"], extra["chatgpt_bound_phone"]["source_api_url"])

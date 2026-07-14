@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import re
@@ -12,6 +12,7 @@ from urllib.parse import urlparse
 import requests
 
 from core.task_runtime import TaskInterruption
+from services.chatgpt_core.phone_api_forwarding import PhoneApiForwardError, resolve_phone_api_url
 from services.chatgpt_core.task_logging import mask_phone_for_log, redact_log_text
 
 from smstome_tool import (
@@ -469,6 +470,61 @@ class UploadedPhoneEntry:
     api_url: str
     raw_line: str = ""
     line_no: int = 0
+    # ``source_api_url`` is the supplier URL persisted in phone_pool. ``api_url``
+    # remains the effective request URL for backwards compatibility with the
+    # existing phone-service call sites and OAIPay/binding result payloads.
+    source_api_url: str = ""
+
+    @property
+    def request_api_url(self) -> str:
+        return str(self.api_url or "").strip()
+
+
+def _phone_api_forward_exception(exc: PhoneApiForwardError) -> PhoneApiForwardError:
+    text = str(exc or "手机号 API Relay 暂时不可用").strip()
+    if "api_forward_error" not in text.lower():
+        text = f"api_forward_error: {text}"
+    return PhoneApiForwardError(text, code=getattr(exc, "code", "api_forward_error"))
+
+
+def resolve_uploaded_phone_entry(entry: UploadedPhoneEntry) -> UploadedPhoneEntry:
+    """Freeze one uploaded/pool entry to the currently configured request URL.
+
+    The supplier URL is never replaced: it is retained in ``source_api_url``.
+    When Relay is enabled, failure to read its config is fatal and must not
+    silently fall back to the supplier domain.
+    """
+
+    source_api_url = str(
+        getattr(entry, "source_api_url", "")
+        or getattr(entry, "api_url", "")
+        or getattr(entry, "detail_url", "")
+        or ""
+    ).strip()
+    if not source_api_url:
+        return entry
+    try:
+        resolution = resolve_phone_api_url(source_api_url, strict=True)
+    except PhoneApiForwardError as exc:
+        raise _phone_api_forward_exception(exc) from exc
+    request_api_url = str(resolution.request_api_url or "").strip()
+    if not request_api_url:
+        raise PhoneApiForwardError(
+            "api_forward_error: 手机号 API Relay 未返回可用请求地址",
+            code="relay_url_missing",
+        )
+    raw_line = str(getattr(entry, "raw_line", "") or "").strip()
+    if raw_line and source_api_url in raw_line:
+        raw_line = raw_line.replace(source_api_url, request_api_url, 1)
+    elif not raw_line:
+        raw_line = f"{entry.phone}----{request_api_url}"
+    return replace(
+        entry,
+        detail_url=request_api_url,
+        api_url=request_api_url,
+        raw_line=raw_line,
+        source_api_url=source_api_url,
+    )
 
 
 _UPLOADED_PHONE_API_URL_RE = re.compile(r"https?://[^\s'\"<>]+", re.I)
@@ -551,6 +607,7 @@ def parse_uploaded_phone_lines(raw_lines: Any) -> tuple[list[UploadedPhoneEntry]
                 api_url=api_url,
                 raw_line=f"{phone}----{api_url}",
                 line_no=index,
+                source_api_url=api_url,
             )
         )
     return entries, errors
@@ -838,6 +895,31 @@ class UploadedPhoneService:
         self.last_sms_sent = False
         self.last_sms_sent_at = 0.0
         self._last_stale_code_key = ""
+        self._resolved_entries: dict[tuple[str, str], UploadedPhoneEntry] = {}
+
+    @staticmethod
+    def _entry_key(entry: UploadedPhoneEntry) -> tuple[str, str]:
+        source_api_url = str(
+            getattr(entry, "source_api_url", "")
+            or getattr(entry, "api_url", "")
+            or getattr(entry, "detail_url", "")
+            or ""
+        ).strip()
+        return str(getattr(entry, "phone", "") or "").strip(), source_api_url
+
+    def resolved_entry(self, entry: UploadedPhoneEntry | None = None) -> UploadedPhoneEntry | None:
+        candidate = entry or self.current_entry
+        if candidate is None:
+            return None
+        key = self._entry_key(candidate)
+        cached = self._resolved_entries.get(key)
+        if cached is not None:
+            return cached
+        resolved = resolve_uploaded_phone_entry(candidate)
+        self._resolved_entries[key] = resolved
+        if self.current_entry is not None and self._entry_key(self.current_entry) == key:
+            self.current_entry = resolved
+        return resolved
 
     def _check_stop(self) -> None:
         if callable(self.stop_checker):
@@ -886,13 +968,15 @@ class UploadedPhoneService:
         return True
 
     def complete(self, entry: UploadedPhoneEntry) -> None:
-        self.completed_entries.append(entry)
-        if self.current_entry == entry:
+        resolved = self.resolved_entry(entry) or entry
+        self.completed_entries.append(resolved)
+        if self.current_entry == entry or self._entry_key(self.current_entry) == self._entry_key(entry):
             self.current_entry = None
 
     def cancel(self, entry: UploadedPhoneEntry, *, reason: str = "") -> None:
-        self.cancelled_entries.append((entry, str(reason or "")))
-        if self.current_entry == entry:
+        resolved = self._resolved_entries.get(self._entry_key(entry), entry)
+        self.cancelled_entries.append((resolved, str(reason or "")))
+        if self.current_entry == entry or self._entry_key(self.current_entry) == self._entry_key(entry):
             self.current_entry = None
 
     def mark_blacklisted(self, phone: str, *, reason: str = "") -> None:
@@ -902,9 +986,26 @@ class UploadedPhoneService:
     def _fetch_api_poll_result(self, entry: UploadedPhoneEntry) -> dict[str, Any]:
         self._check_stop()
         try:
-            resp = requests.get(entry.api_url, timeout=20)
-        except Exception as exc:
+            request_entry = self.resolved_entry(entry) or entry
+        except PhoneApiForwardError:
+            raise
+        try:
+            resp = requests.get(request_entry.request_api_url, timeout=20)
+        except requests.RequestException as exc:
+            if str(request_entry.source_api_url or "").strip() and request_entry.request_api_url != request_entry.source_api_url:
+                raise PhoneApiForwardError(
+                    "api_forward_error: 手机号 API Relay 连接或 TLS 请求失败",
+                    code="relay_request_failed",
+                ) from exc
             raise RuntimeError(f"收码 API 请求失败: {exc}") from exc
+        response_headers = getattr(resp, "headers", {})
+        relay_error_value = response_headers.get("X-Phone-Relay-Error") if hasattr(response_headers, "get") else ""
+        relay_error_code = str(relay_error_value or "").strip() if isinstance(relay_error_value, str) else ""
+        if relay_error_code:
+            raise PhoneApiForwardError(
+                f"api_forward_error: 手机号 API Relay 返回 {relay_error_code}（HTTP {_response_status_code(resp)}）",
+                code=relay_error_code,
+            )
         status_code = _response_status_code(resp)
         response_text = _safe_response_text(resp)
         payload: dict[str, Any] | None = None
@@ -925,6 +1026,12 @@ class UploadedPhoneService:
         return result
 
     def wait_for_code(self, entry: UploadedPhoneEntry, *, timeout: Optional[int] = None) -> Optional[str]:
+        try:
+            entry = self.resolved_entry(entry) or entry
+        except PhoneApiForwardError as exc:
+            self.last_api_error = str(exc)
+            self.log_fn(f"[号码测试] {entry.phone} API 转发异常: {redact_log_text(exc)}")
+            raise
         wait_seconds = _to_positive_int(timeout, self.otp_timeout_seconds, minimum=10)
         deadline = time.monotonic() + wait_seconds
         last_message = ""
@@ -941,6 +1048,10 @@ class UploadedPhoneService:
                 self.last_api_raw_excerpt = str(poll_result.get("raw_excerpt") or "")
                 self.last_api_error = ""
             except TaskInterruption:
+                raise
+            except PhoneApiForwardError as exc:
+                self.last_api_error = str(exc)
+                self.log_fn(f"[号码测试] {entry.phone} API 转发异常: {redact_log_text(exc)}")
                 raise
             except Exception as exc:
                 self.last_api_error = str(exc)

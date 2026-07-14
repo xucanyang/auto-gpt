@@ -11,6 +11,13 @@ from sqlmodel import Session, select
 
 from core.db import AccountModel, engine
 from services.chatgpt_core.phone_pool_repository import PhonePoolRecord, PhonePoolRepository, normalize_phone, serialize_phone_pool_records
+from services.chatgpt_core.phone_api_forwarding import (
+    PhoneApiForwardError,
+    get_forwarding_config,
+    get_inventory_status,
+    set_forwarding_config,
+    sync_phone_pool_inventory,
+)
 
 router = APIRouter(prefix="/phone-pool", tags=["phone-pool"])
 _repo = PhonePoolRepository()
@@ -43,6 +50,12 @@ class PhonePoolSnapshotRequest(BaseModel):
 class PhonePoolApiExpiryRefreshRequest(BaseModel):
     ids: list[int] = Field(default_factory=list)
     force: bool = False
+
+
+class PhonePoolForwardingRequest(BaseModel):
+    enabled: bool = False
+    active_origin: str = ""
+    previous_origins: list[str] = Field(default_factory=list)
 
 
 def _parse_time(value: Any) -> datetime | None:
@@ -137,6 +150,7 @@ def _matched_bound_accounts(phone: str) -> list[dict[str, Any]]:
                 "account_status": str(account.status or ""),
                 "binding_status": str(binding.get("status") or ""),
                 "api_url": str(binding.get("api_url") or ""),
+                "source_api_url": str(binding.get("source_api_url") or binding.get("api_url") or ""),
                 "task_id": str(binding.get("task_id") or ""),
                 "bound_at": str(binding.get("bound_at") or binding.get("updated_at") or binding.get("created_at") or ""),
                 "error": str(binding.get("error") or binding.get("reason") or ""),
@@ -159,6 +173,12 @@ def _phone_diagnostics(record: PhonePoolRecord) -> dict[str, Any]:
 
     if not str(record.api_url or "").strip():
         add_note("error", "missing_api_url", "这个号码没有收码 API，自动绑定任务不会选它。")
+    if str(item.get("forward_status") or "").lower() in {"unavailable", "conflict", "error", "failed"}:
+        add_note(
+            "error",
+            "api_forward_error",
+            f"API 转发当前不可用：{item.get('forward_error') or item.get('forward_status') or '-'}；号码保持可用，不会回退原域名直连。",
+        )
     if str(record.api_expiry_status or "") == "error":
         add_note("warning", "api_expiry_probe_failed", f"API 到期时间获取失败：{record.api_expiry_error or '-'}")
     if str(record.api_expiry_status or "") == "missing_expired_date":
@@ -207,6 +227,72 @@ def _phone_diagnostics(record: PhonePoolRecord) -> dict[str, Any]:
     }
 
 
+def _forwarding_overview(*, force_remote: bool = False) -> dict[str, Any]:
+    records = _repo.list()
+    config = get_forwarding_config(force=force_remote, strict=False)
+    sync = get_inventory_status(force_remote=force_remote)
+    source_hosts = {
+        str(getattr(record, "api_host", "") or "").strip().lower()
+        for record in records
+        if str(getattr(record, "api_host", "") or "").strip()
+    }
+    return {
+        **config,
+        "affected_records": len(records),
+        "source_host_count": len(source_hosts),
+        "registry": {
+            "status": str(sync.get("status") or "idle"),
+            "last_error": str(sync.get("last_error") or ""),
+        },
+        "sync": sync,
+    }
+
+
+def _sync_forwarding_inventory(*, trigger: str, raise_on_error: bool = False) -> dict[str, Any]:
+    return sync_phone_pool_inventory(_repo.list(), trigger=trigger, raise_on_error=raise_on_error)
+
+
+@router.get("/forwarding")
+def get_phone_pool_forwarding():
+    return _forwarding_overview(force_remote=True)
+
+
+@router.put("/forwarding")
+def update_phone_pool_forwarding(body: PhonePoolForwardingRequest):
+    previous = get_forwarding_config(force=True, strict=False)
+    try:
+        set_forwarding_config(
+            enabled=bool(body.enabled),
+            active_origin=body.active_origin,
+            previous_origins=body.previous_origins,
+        )
+        _sync_forwarding_inventory(trigger="config-save", raise_on_error=True)
+    except PhoneApiForwardError as exc:
+        # Do not leave a newly activated origin with an empty/stale registry.
+        try:
+            if previous.get("relay_configured"):
+                set_forwarding_config(
+                    enabled=bool(previous.get("enabled")),
+                    active_origin=str(previous.get("active_origin") or ""),
+                    previous_origins=previous.get("previous_origins") or [],
+                )
+        except Exception:
+            pass
+        status_code = 409 if exc.code == "route_conflict" else 503
+        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+    return _forwarding_overview(force_remote=True)
+
+
+@router.post("/forwarding/sync")
+def sync_phone_pool_forwarding():
+    try:
+        _sync_forwarding_inventory(trigger="manual", raise_on_error=True)
+    except PhoneApiForwardError as exc:
+        status_code = 409 if exc.code == "route_conflict" else 503
+        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+    return _forwarding_overview(force_remote=True)
+
+
 @router.get("")
 def list_phone_pool(status: str = ""):
     records = _repo.list(status=status)
@@ -252,7 +338,10 @@ def add_phone_pool_item(body: PhonePoolAddRequest):
     )
     if not record:
         raise HTTPException(400, "phone 为空或 API URL 非法（需 http(s):// 开头）")
-    return _serialize_phone_record(record)
+    sync = _sync_forwarding_inventory(trigger="add")
+    payload = _serialize_phone_record(record)
+    payload["forwarding_sync"] = sync
+    return payload
 
 
 @router.post("/import")
@@ -261,6 +350,7 @@ def import_phone_pool(body: PhonePoolImportRequest, background_tasks: Background
     refresh_ids = [int(value or 0) for value in result.get("refresh_ids", []) if int(value or 0) > 0]
     if refresh_ids:
         background_tasks.add_task(_repo.refresh_api_expiry_for_ids, refresh_ids, force=False)
+    result["forwarding_sync"] = _sync_forwarding_inventory(trigger="import")
     return result
 
 
@@ -296,7 +386,10 @@ def update_phone_pool_item(record_id: int, body: PhonePoolUpdateRequest):
     )
     if not record:
         raise HTTPException(404, "号码不存在或 API URL 非法")
-    return _serialize_phone_record(record)
+    sync = _sync_forwarding_inventory(trigger="update")
+    payload = _serialize_phone_record(record)
+    payload["forwarding_sync"] = sync
+    return payload
 
 
 @router.post("/{record_id}/reset")
@@ -328,9 +421,11 @@ def delete_phone_pool_item(record_id: int):
     ok = _repo.delete(record_id)
     if not ok:
         raise HTTPException(404, "号码不存在")
-    return {"ok": True, "id": record_id}
+    return {"ok": True, "id": record_id, "forwarding_sync": _sync_forwarding_inventory(trigger="delete")}
 
 
 @router.post("/reconcile")
 def reconcile_phone_pool():
-    return _repo.reconcile_from_accounts()
+    result = _repo.reconcile_from_accounts()
+    result["forwarding_sync"] = _sync_forwarding_inventory(trigger="reconcile")
+    return result

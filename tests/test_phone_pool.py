@@ -6,12 +6,25 @@ from sqlmodel import SQLModel, create_engine
 
 from core import db as core_db
 from core.db import AccountModel
+from services.chatgpt_core import phone_api_forwarding as forwarding
 from services.chatgpt_core import phone_pool_repository as repo_module
 from services.chatgpt_core.phone_pool_repository import PhonePoolRepository, serialize_phone_pool_records
 
 
 class PhonePoolRepositoryTests(unittest.TestCase):
     def setUp(self):
+        self.forwarding_state_before = dict(forwarding._SYNC_STATE)
+        with forwarding._LOCK:
+            forwarding._SYNC_STATE.update({
+                "status": "idle",
+                "last_attempt_at": "",
+                "last_success_at": "",
+                "last_error": "",
+                "inventory_count": 0,
+                "route_count": 0,
+                "owner_count": 0,
+                "trigger": "",
+            })
         self.engine = create_engine("sqlite://")
         self.core_engine_patch = patch.object(core_db, "engine", self.engine)
         self.repo_engine_patch = patch.object(repo_module, "engine", self.engine)
@@ -23,6 +36,9 @@ class PhonePoolRepositoryTests(unittest.TestCase):
     def tearDown(self):
         self.repo_engine_patch.stop()
         self.core_engine_patch.stop()
+        with forwarding._LOCK:
+            forwarding._SYNC_STATE.clear()
+            forwarding._SYNC_STATE.update(self.forwarding_state_before)
 
     def test_import_pick_and_record_success(self):
         repo = PhonePoolRepository()
@@ -260,6 +276,28 @@ bad-line
         self.assertEqual(rec.status, "rate_limited")
         self.assertTrue(rec.cooldown_until)
 
+    def test_api_forward_error_keeps_phone_active(self):
+        repo = PhonePoolRepository()
+        repo.add(phone="+15551230009", api_url="https://supplier.example/api?token=demo")
+        repo.record_failure(
+            "+15551230009",
+            status="rate_limited",
+            error_code="rate_limited",
+            error_message="temporary",
+            cooldown_seconds=600,
+        )
+
+        rec = repo.record_task_status(
+            "+15551230009",
+            "api_forward_error",
+            reason="api_forward_error: relay unavailable",
+        )
+
+        self.assertEqual(rec.status, "active")
+        self.assertTrue(rec.available)
+        self.assertEqual(rec.cooldown_until, "")
+        self.assertEqual(rec.last_error_code, "api_forward_error")
+
     def test_summary_keeps_exhausted_and_disabled_separate(self):
         repo = PhonePoolRepository()
         repo.add(phone="+15551230001", api_url="https://relay.example.com/a")
@@ -350,6 +388,75 @@ bad-line
         self.assertEqual(healthy_row["ordinary_task_block_reason"], "")
 
         self.assertEqual([item.phone_e164 for item in repo.list_available()], [active_in_bad_prefix.phone_e164, healthy.phone_e164])
+
+    def test_serialized_rows_fetch_forwarding_config_once_and_keep_source_contract(self):
+        repo = PhonePoolRepository()
+        source_a = "https://supplier-a.example/api/code?token=a"
+        source_b = "https://supplier-b.example/v1/otp?token=b&x=1"
+        first = repo.add(phone="+13430000001", api_url=source_a)
+        second = repo.add(phone="+12260000001", api_url=source_b)
+        config = {
+            "enabled": True,
+            "active_origin": "https://phone-api.aa8.pl",
+            "previous_origins": [],
+            "relay_configured": True,
+            "forward_status": "active",
+        }
+
+        # This unittest module shares the process with Relay integration tests;
+        # clear a previous inventory-conflict marker before asserting the
+        # pure serialization contract.
+        with forwarding._LOCK:
+            previous_sync_state = dict(forwarding._SYNC_STATE)
+            forwarding._SYNC_STATE.update(
+                {
+                    "status": "synced",
+                    "last_attempt_at": "2026-07-14T00:00:00Z",
+                    "last_error": "",
+                }
+            )
+        try:
+            with patch.object(forwarding, "get_forwarding_config", return_value=config) as get_config:
+                rows = serialize_phone_pool_records([first, second], all_records=[first, second])
+        finally:
+            with forwarding._LOCK:
+                forwarding._SYNC_STATE.clear()
+                forwarding._SYNC_STATE.update(previous_sync_state)
+
+        self.assertEqual(get_config.call_count, 1)
+        by_phone = {row["phone_e164"]: row for row in rows}
+        row_a = by_phone[first.phone_e164]
+        self.assertEqual(row_a["api_url"], source_a)
+        self.assertEqual(row_a["source_api_url"], source_a)
+        self.assertEqual(row_a["forwarded_api_url"], "https://phone-api.aa8.pl/api/code?token=a")
+        self.assertEqual(row_a["forwarded_api_host"], "phone-api.aa8.pl")
+        row_b = by_phone[second.phone_e164]
+        self.assertEqual(row_b["api_url"], source_b)
+        self.assertEqual(row_b["source_api_url"], source_b)
+        self.assertEqual(row_b["forwarded_api_url"], "https://phone-api.aa8.pl/v1/otp?token=b&x=1")
+
+    def test_serialized_rows_relay_unavailable_do_not_retry_per_record(self):
+        repo = PhonePoolRepository()
+        records = [
+            repo.add(phone="+13430000001", api_url="https://supplier.example/a?token=a"),
+            repo.add(phone="+13430000002", api_url="https://supplier.example/b?token=b"),
+            repo.add(phone="+12260000001", api_url="https://supplier.example/c?token=c"),
+        ]
+        unavailable = {
+            "enabled": False,
+            "active_origin": "",
+            "previous_origins": [],
+            "relay_configured": True,
+            "forward_status": "unavailable",
+            "relay_error": "手机号 API Relay 暂时不可达",
+        }
+        with patch.object(forwarding, "get_forwarding_config", return_value=unavailable) as get_config:
+            rows = serialize_phone_pool_records(records, all_records=records)
+
+        self.assertEqual(get_config.call_count, 1)
+        self.assertEqual(len(rows), 3)
+        self.assertTrue(all(row["forward_status"] == "unavailable" for row in rows))
+        self.assertTrue(all(row["forwarded_api_url"] == "" for row in rows))
 
     def test_sample_testable_by_prefix_covers_each_prefix_before_second_sample(self):
         repo = PhonePoolRepository()

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { Alert, Card, Checkbox, Descriptions, Drawer, Empty, Grid, Table, Button, Input, Tag, Space, Popconfirm, message, Typography, Tooltip, Select, Pagination, theme } from 'antd'
+import { Alert, Card, Checkbox, Descriptions, Drawer, Empty, Grid, Table, Button, Input, Tag, Space, Popconfirm, message, Typography, Tooltip, Select, Pagination, Skeleton, Switch, theme } from 'antd'
 import {
   UploadOutlined,
   ReloadOutlined,
@@ -10,16 +10,24 @@ import {
   DatabaseOutlined,
   CopyOutlined,
   BugOutlined,
+  CloudSyncOutlined,
   SyncOutlined,
+  SwapOutlined,
   DownloadOutlined,
 } from '@ant-design/icons'
-import { apiFetch } from '@/lib/utils'
+import { ApiError, apiFetch } from '@/lib/utils'
 
 type PhonePoolItem = {
   id: number
   phone_e164: string
   api_url: string
   api_host: string
+  source_api_url?: string
+  source_api_host?: string
+  forwarded_api_url?: string
+  forwarded_api_host?: string
+  api_forwarded?: boolean
+  forward_status?: string
   api_expired_date: string
   api_expiry_checked_at: string
   api_expiry_status: string
@@ -135,6 +143,35 @@ type PhonePoolDiagnostics = {
   }>
 }
 
+type PhonePoolForwardSync = {
+  status?: string
+  last_attempt_at?: string
+  last_success_at?: string
+  last_error?: string
+  inventory_count?: number
+  route_count?: number
+  owner_count?: number
+  trigger?: string
+}
+
+type PhonePoolForwardRegistry = {
+  status?: string
+  last_error?: string
+  [key: string]: unknown
+}
+
+type PhonePoolForwardingConfig = {
+  enabled: boolean
+  active_origin: string
+  previous_origins: string[]
+  relay_configured?: boolean
+  forward_status?: string
+  affected_records?: number
+  source_host_count?: number
+  registry?: PhonePoolForwardRegistry
+  sync?: PhonePoolForwardSync
+}
+
 const STATUS_META: Record<string, { color: string; label: string }> = {
   active: { color: 'success', label: '可用' },
   cannot_send: { color: 'error', label: '不可用' },
@@ -190,6 +227,7 @@ const SELF_REASON_LABELS: Record<string, string> = {
   openai_rejected: 'OpenAI 拒绝',
   api_no_code: 'API 无码',
   api_error: 'API 异常',
+  api_forward_error: '转发临时故障',
   cannot_send: '不可发码',
   rate_limited: '限流中',
   cooldown: '冷却中',
@@ -208,6 +246,7 @@ const TASK_BLOCK_REASON_LABELS: Record<string, string> = {
   openai_rejected: 'OpenAI 拒绝',
   api_no_code: 'API 无码',
   api_error: 'API 异常',
+  api_forward_error: '转发临时故障',
   cannot_send: '不可发码',
   rate_limited: '限流中',
   cooldown: '冷却中',
@@ -351,6 +390,193 @@ function noteAlertType(severity?: string): 'success' | 'info' | 'warning' | 'err
   return 'info'
 }
 
+const FORWARD_STATUS_META: Record<string, { color: string; label: string }> = {
+  active: { color: 'success', label: '已启用' },
+  ready: { color: 'success', label: '已就绪' },
+  synced: { color: 'success', label: '已同步' },
+  forwarded: { color: 'success', label: '已转发' },
+  ok: { color: 'success', label: '正常' },
+  syncing: { color: 'processing', label: '同步中' },
+  pending: { color: 'processing', label: '待同步' },
+  degraded: { color: 'warning', label: '部分异常' },
+  stale: { color: 'warning', label: '待刷新' },
+  disabled: { color: 'default', label: '未启用' },
+  direct: { color: 'default', label: '直连' },
+  bypassed: { color: 'default', label: '直连' },
+  not_configured: { color: 'warning', label: '未配置' },
+  unavailable: { color: 'error', label: '不可达' },
+  conflict: { color: 'error', label: '冲突' },
+  error: { color: 'error', label: '异常' },
+  failed: { color: 'error', label: '失败' },
+}
+
+const EMPTY_FORWARDING_CONFIG: PhonePoolForwardingConfig = {
+  enabled: false,
+  active_origin: '',
+  previous_origins: [],
+  relay_configured: false,
+  forward_status: 'disabled',
+  sync: {},
+}
+
+function forwardStatusTag(status?: string, fallback: 'forwarded' | 'direct' | 'unknown' = 'unknown') {
+  const key = String(status || '').trim().toLowerCase()
+  const meta = FORWARD_STATUS_META[key]
+    || (fallback === 'forwarded'
+      ? FORWARD_STATUS_META.forwarded
+      : fallback === 'direct'
+        ? FORWARD_STATUS_META.direct
+        : { color: 'default', label: key || '未知' })
+  return <Tag color={meta.color}>{meta.label}</Tag>
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null
+}
+
+function normalizeForwardingConfig(value: unknown, fallback: PhonePoolForwardingConfig = EMPTY_FORWARDING_CONFIG): PhonePoolForwardingConfig {
+  const envelope = asRecord(value)
+  const data = asRecord(envelope?.forwarding) || envelope || {}
+  const previousOrigins = Array.isArray(data.previous_origins)
+    ? data.previous_origins.map((item: unknown) => String(item || '').trim()).filter(Boolean)
+    : fallback.previous_origins
+  const sync = data.sync && typeof data.sync === 'object'
+    ? data.sync as PhonePoolForwardSync
+    : fallback.sync
+  const registry = data.registry && typeof data.registry === 'object'
+    ? data.registry as PhonePoolForwardRegistry
+    : fallback.registry
+  const affectedRecords = Number(data.affected_records)
+  const sourceHostCount = Number(data.source_host_count)
+  return {
+    enabled: typeof data.enabled === 'boolean' ? data.enabled : fallback.enabled,
+    active_origin: String(data.active_origin ?? fallback.active_origin ?? '').trim(),
+    previous_origins: Array.from(new Set(previousOrigins)),
+    relay_configured: typeof data.relay_configured === 'boolean' ? data.relay_configured : fallback.relay_configured,
+    forward_status: String(data.forward_status ?? fallback.forward_status ?? '').trim(),
+    affected_records: Number.isFinite(affectedRecords) ? affectedRecords : fallback.affected_records,
+    source_host_count: Number.isFinite(sourceHostCount) ? sourceHostCount : fallback.source_host_count,
+    registry,
+    sync,
+  }
+}
+
+function normalizeForwardOrigin(value: string, label: string) {
+  const text = String(value || '').trim()
+  if (!text) return ''
+  let parsed: URL
+  try {
+    parsed = new URL(text)
+  } catch {
+    throw new Error(`${label}必须是完整的 http(s) Origin`)
+  }
+  if (!['http:', 'https:'].includes(parsed.protocol) || !parsed.hostname) {
+    throw new Error(`${label}必须是完整的 http(s) Origin`)
+  }
+  if (parsed.username || parsed.password || parsed.search || parsed.hash || (parsed.pathname && parsed.pathname !== '/')) {
+    throw new Error(`${label}只能填写协议、域名和端口，不能包含路径、参数或账号信息`)
+  }
+  return parsed.origin
+}
+
+function parsePreviousOrigins(value: string, activeOrigin: string) {
+  const entries = String(value || '')
+    .split(/[\n,]+/)
+    .map((item) => item.trim())
+    .filter(Boolean)
+  const normalized: string[] = []
+  const seen = new Set<string>()
+  entries.forEach((entry, index) => {
+    const origin = normalizeForwardOrigin(entry, `兼容旧域名第 ${index + 1} 项`)
+    const key = origin.toLowerCase()
+    if (!origin || key === activeOrigin.toLowerCase() || seen.has(key)) return
+    seen.add(key)
+    normalized.push(origin)
+  })
+  return normalized
+}
+
+function apiUrlHost(value?: string | null) {
+  const text = String(value || '').trim()
+  if (!text) return ''
+  try {
+    return new URL(text).host
+  } catch {
+    return ''
+  }
+}
+
+function sourceApiUrl(record: Pick<PhonePoolItem, 'source_api_url' | 'api_url'>) {
+  return String(record.source_api_url || record.api_url || '').trim()
+}
+
+function forwardedApiUrl(record: Pick<PhonePoolItem, 'forwarded_api_url'>) {
+  return String(record.forwarded_api_url || '').trim()
+}
+
+function effectiveApiUrl(record: Pick<PhonePoolItem, 'source_api_url' | 'api_url' | 'forwarded_api_url' | 'forward_status'>) {
+  const forwarded = forwardedApiUrl(record)
+  if (forwarded) return forwarded
+  const status = String(record.forward_status || '').trim().toLowerCase()
+  if (['unavailable', 'conflict', 'error', 'failed'].includes(status)) return ''
+  return sourceApiUrl(record)
+}
+
+function missingForwardedApiText(status?: string) {
+  const value = String(status || '').trim().toLowerCase()
+  if (['unavailable', 'conflict', 'error', 'failed'].includes(value)) {
+    return '转发当前不可用，已禁止回退原始 API'
+  }
+  if (['syncing', 'pending', 'stale'].includes(value)) {
+    return '转发路由尚未生成'
+  }
+  if (['disabled', 'direct', 'bypassed', 'not_configured', ''].includes(value)) {
+    return '转发未启用，当前使用原始 API'
+  }
+  return '转发路由尚未生成'
+}
+
+function sourceApiHost(record: Pick<PhonePoolItem, 'source_api_url' | 'source_api_host' | 'api_url' | 'api_host'>) {
+  return String(record.source_api_host || record.api_host || apiUrlHost(sourceApiUrl(record)) || '').trim()
+}
+
+function forwardedApiHost(record: Pick<PhonePoolItem, 'forwarded_api_url' | 'forwarded_api_host'>) {
+  return String(record.forwarded_api_host || apiUrlHost(forwardedApiUrl(record)) || '').trim()
+}
+
+function recordUsesForwarding(record: Pick<PhonePoolItem, 'source_api_url' | 'api_url' | 'forwarded_api_url' | 'api_forwarded'>) {
+  const source = sourceApiUrl(record)
+  const forwarded = forwardedApiUrl(record)
+  return Boolean(forwarded && (record.api_forwarded !== false || forwarded !== source))
+}
+
+function apiRoutePath(value?: string | null) {
+  const text = String(value || '').trim()
+  if (!text) return '-'
+  try {
+    const parsed = new URL(text)
+    return `${parsed.pathname || '/'}${parsed.search || ''}`
+  } catch {
+    return text
+  }
+}
+
+function errorMessage(error: unknown) {
+  if (error instanceof Error) return String(error.message || '').trim()
+  const record = asRecord(error)
+  return typeof record?.message === 'string' ? record.message.trim() : ''
+}
+
+function forwardingRequestError(error: unknown, fallback: string) {
+  const detail = errorMessage(error)
+  const status = error instanceof ApiError ? error.status : Number(asRecord(error)?.status || 0)
+  if (status === 409) return detail ? `域名冲突：${detail}` : '域名与现有来源或后缀冲突'
+  if (status === 503) return detail ? `转发服务不可用：${detail}` : '转发服务未配置或当前不可达'
+  return detail || fallback
+}
+
 async function copyTextToClipboard(text: string) {
   if (navigator.clipboard?.writeText) {
     try {
@@ -374,21 +600,29 @@ async function copyTextToClipboard(text: string) {
   }
 }
 
-function phoneApiCopyText(record: Pick<PhonePoolItem, 'phone_e164' | 'api_url'>) {
+function phoneApiCopyText(
+  record: Pick<PhonePoolItem, 'phone_e164' | 'source_api_url' | 'api_url' | 'forwarded_api_url' | 'forward_status'>,
+  mode: 'effective' | 'source' = 'effective',
+) {
   const phone = String(record.phone_e164 || '').trim()
-  const apiUrl = String(record.api_url || '').trim()
+  const apiUrl = mode === 'source' ? sourceApiUrl(record) : effectiveApiUrl(record)
   return apiUrl ? `${phone}----${apiUrl}` : phone
 }
 
-async function copyPhoneApiLine(record: Pick<PhonePoolItem, 'phone_e164' | 'api_url'>) {
-  const text = phoneApiCopyText(record)
+async function copyPhoneApiLine(
+  record: Pick<PhonePoolItem, 'phone_e164' | 'source_api_url' | 'api_url' | 'forwarded_api_url' | 'forward_status'>,
+  mode: 'effective' | 'source' = 'effective',
+) {
+  const text = phoneApiCopyText(record, mode)
   if (!text) {
     message.info('暂无可复制内容')
     return
   }
   const ok = await copyTextToClipboard(text)
   if (ok) {
-    message.success(record.api_url ? '已复制完整API' : '已复制手机号')
+    const apiUrl = mode === 'source' ? sourceApiUrl(record) : effectiveApiUrl(record)
+    const forwarded = mode === 'effective' && Boolean(forwardedApiUrl(record))
+    message.success(apiUrl ? mode === 'source' ? '已复制原始API' : forwarded ? '已复制转发API' : '已复制完整API' : '已复制手机号')
     return
   }
   message.error('复制失败')
@@ -429,6 +663,41 @@ export default function PhonePool() {
   const [diagnosticsLoading, setDiagnosticsLoading] = useState(false)
   const [diagnosticsRecordId, setDiagnosticsRecordId] = useState<number | null>(null)
   const [diagnostics, setDiagnostics] = useState<PhonePoolDiagnostics | null>(null)
+  const [forwardingOpen, setForwardingOpen] = useState(false)
+  const [forwardingLoading, setForwardingLoading] = useState(false)
+  const [forwardingSaving, setForwardingSaving] = useState(false)
+  const [forwardingSyncing, setForwardingSyncing] = useState(false)
+  const [forwardingError, setForwardingError] = useState('')
+  const [forwardingConfig, setForwardingConfig] = useState<PhonePoolForwardingConfig | null>(null)
+  const [forwardingDraftEnabled, setForwardingDraftEnabled] = useState(false)
+  const [forwardingDraftOrigin, setForwardingDraftOrigin] = useState('')
+  const [forwardingDraftPrevious, setForwardingDraftPrevious] = useState('')
+
+  const applyForwardingDraft = useCallback((config: PhonePoolForwardingConfig) => {
+    setForwardingDraftEnabled(Boolean(config.enabled))
+    setForwardingDraftOrigin(String(config.active_origin || ''))
+    setForwardingDraftPrevious((config.previous_origins || []).join('\n'))
+  }, [])
+
+  const loadForwarding = useCallback(async (silent = false) => {
+    setForwardingLoading(true)
+    if (!silent) setForwardingError('')
+    try {
+      const data = await apiFetch('/phone-pool/forwarding')
+      const next = normalizeForwardingConfig(data)
+      setForwardingConfig(next)
+      applyForwardingDraft(next)
+      setForwardingError('')
+      return next
+    } catch (error: unknown) {
+      const detail = forwardingRequestError(error, '读取 API 转发配置失败')
+      setForwardingError(detail)
+      if (!silent) message.error(detail)
+      return null
+    } finally {
+      setForwardingLoading(false)
+    }
+  }, [applyForwardingDraft])
 
   const load = useCallback(async (nextStatus = statusFilter) => {
     setLoading(true)
@@ -454,6 +723,10 @@ export default function PhonePool() {
   useEffect(() => {
     void load()
   }, [load])
+
+  useEffect(() => {
+    void loadForwarding(true)
+  }, [loadForwarding])
 
   const applyPhoneItems = useCallback((records: PhonePoolItem[], missing: number[] = []) => {
     const missingIds = new Set(missing.map((id) => Number(id)).filter((id) => Number.isFinite(id)))
@@ -498,6 +771,82 @@ export default function PhonePool() {
       setSummary(data.summary)
     }
   }, [])
+
+  const openForwardingSettings = () => {
+    setForwardingOpen(true)
+    setForwardingError('')
+    if (forwardingConfig) {
+      applyForwardingDraft(forwardingConfig)
+      return
+    }
+    void loadForwarding(false)
+  }
+
+  const saveForwardingSettings = async () => {
+    setForwardingError('')
+    let activeOrigin = ''
+    let previousOrigins: string[] = []
+    try {
+      activeOrigin = normalizeForwardOrigin(forwardingDraftOrigin, '当前主域名')
+      if (forwardingDraftEnabled && !activeOrigin) {
+        throw new Error('启用转发前必须填写当前主域名')
+      }
+      previousOrigins = parsePreviousOrigins(forwardingDraftPrevious, activeOrigin)
+    } catch (error: unknown) {
+      const detail = errorMessage(error) || '转发域名格式无效'
+      setForwardingError(detail)
+      message.error(detail)
+      return
+    }
+
+    setForwardingSaving(true)
+    try {
+      const data = await apiFetch('/phone-pool/forwarding', {
+        method: 'PUT',
+        body: JSON.stringify({
+          enabled: forwardingDraftEnabled,
+          active_origin: activeOrigin,
+          previous_origins: previousOrigins,
+        }),
+      })
+      const next = normalizeForwardingConfig(data, {
+        ...EMPTY_FORWARDING_CONFIG,
+        enabled: forwardingDraftEnabled,
+        active_origin: activeOrigin,
+        previous_origins: previousOrigins,
+      })
+      setForwardingConfig(next)
+      applyForwardingDraft(next)
+      setForwardingError('')
+      message.success(next.enabled ? 'API 转发配置已保存' : 'API 转发已关闭')
+      await load()
+    } catch (error: unknown) {
+      const detail = forwardingRequestError(error, '保存 API 转发配置失败')
+      setForwardingError(detail)
+      message.error(detail)
+    } finally {
+      setForwardingSaving(false)
+    }
+  }
+
+  const retryForwardingSync = async () => {
+    setForwardingSyncing(true)
+    setForwardingError('')
+    try {
+      const data = await apiFetch('/phone-pool/forwarding/sync', { method: 'POST' })
+      const next = normalizeForwardingConfig(data, forwardingConfig || EMPTY_FORWARDING_CONFIG)
+      setForwardingConfig(next)
+      applyForwardingDraft(next)
+      message.success('转发路由同步已触发')
+      await load()
+    } catch (error: unknown) {
+      const detail = forwardingRequestError(error, '重试转发路由同步失败')
+      setForwardingError(detail)
+      message.error(detail)
+    } finally {
+      setForwardingSyncing(false)
+    }
+  }
 
   const refreshPhoneRows = useCallback(async (ids: number[]) => {
     const rowIds = ids.map((id) => Number(id)).filter((id) => Number.isFinite(id) && id > 0)
@@ -777,6 +1126,14 @@ export default function PhonePool() {
   const exhaustedCount = Number(summary.exhausted || 0)
   const disabledCount = Number(summary.disabled || 0)
   const rejectedPhoneCount = Number(summary.rejected_phone_count || 0)
+  const loadedSourceHostCount = useMemo(() => new Set(
+    items.map((item) => sourceApiHost(item)).filter(Boolean),
+  ).size, [items])
+  const forwardingAffectedRecords = Number(forwardingConfig?.affected_records ?? totalCount)
+  const forwardingSourceHostCount = Number(forwardingConfig?.source_host_count ?? loadedSourceHostCount)
+  const forwardingSync = forwardingConfig?.sync || {}
+  const forwardingRegistryStatus = String(forwardingConfig?.registry?.status || '').trim()
+  const forwardingStatus = String(forwardingConfig?.forward_status || (forwardingConfig?.enabled ? 'pending' : 'disabled')).trim()
   const normalizePrefixItems = useCallback((raw: PhonePoolPrefixItem[] | undefined) => {
     const items = Array.isArray(raw) ? raw : []
     return items
@@ -949,6 +1306,60 @@ export default function PhonePool() {
     )
   }
 
+  const renderApiRouteCell = (record: PhonePoolItem, compact = false) => {
+    const sourceUrl = sourceApiUrl(record)
+    const forwardedUrl = forwardedApiUrl(record)
+    const effectiveUrl = effectiveApiUrl(record)
+    const sourceHost = sourceApiHost(record)
+    const relayHost = forwardedApiHost(record)
+    const forwarded = recordUsesForwarding(record)
+    const routeTooltip = (
+      <div style={{ maxWidth: 520 }}>
+        <div>原始：{sourceUrl || '-'}</div>
+        <div>实际：{effectiveUrl || '-'}</div>
+      </div>
+    )
+    return (
+      <div style={{ minWidth: 0, maxWidth: compact ? '100%' : 320 }}>
+        <Space size={5} style={{ display: 'flex', minWidth: 0 }}>
+          <Typography.Text
+            ellipsis={{ tooltip: sourceHost || sourceUrl || '-' }}
+            style={{ maxWidth: compact ? 112 : 126, fontSize: compact ? 12 : 13 }}
+          >
+            {sourceHost || '-'}
+          </Typography.Text>
+          {forwarded ? <SwapOutlined style={{ flex: '0 0 auto', color: token.colorTextTertiary }} /> : null}
+          {forwarded ? (
+            <Typography.Text
+              ellipsis={{ tooltip: relayHost || forwardedUrl }}
+              strong
+              style={{ maxWidth: compact ? 112 : 126, fontSize: compact ? 12 : 13 }}
+            >
+              {relayHost || '-'}
+            </Typography.Text>
+          ) : null}
+          {forwardStatusTag(record.forward_status, forwarded ? 'forwarded' : 'direct')}
+        </Space>
+        <Space size={3} style={{ display: 'flex', minWidth: 0, marginTop: 2 }}>
+          <Tooltip title={routeTooltip}>
+            <Typography.Text
+              type="secondary"
+              ellipsis
+              style={{ display: 'block', minWidth: 0, flex: '1 1 auto', maxWidth: compact ? 240 : 282, fontSize: 11 }}
+            >
+              {apiRoutePath(effectiveUrl)}
+            </Typography.Text>
+          </Tooltip>
+          {effectiveUrl ? (
+            <Tooltip title={forwarded ? '复制转发API' : '复制完整API'}>
+              <Button type="text" size="small" icon={<CopyOutlined />} onClick={() => void copyPhoneApiLine(record)} />
+            </Tooltip>
+          ) : null}
+        </Space>
+      </div>
+    )
+  }
+
   const renderPhoneMobileCards = () => {
     if (!paginatedItems.length) {
       return <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={phoneSearch.replace(/\D/g, '') ? '未找到匹配手机号' : '暂无手机号'} />
@@ -973,7 +1384,7 @@ export default function PhonePool() {
                   }}
                 />
                 <div className="mobile-record-main">
-                  <Typography.Text code copyable={{ text: phoneApiCopyText(record), tooltips: [record.api_url ? '复制完整API' : '复制手机号', '已复制'] }} className="mobile-record-title">
+                  <Typography.Text code copyable={{ text: phoneApiCopyText(record), tooltips: [effectiveApiUrl(record) ? forwardedApiUrl(record) ? '复制转发API' : '复制完整API' : '复制手机号', '已复制'] }} className="mobile-record-title">
                     {record.phone_e164}
                   </Typography.Text>
                   <div className="mobile-record-meta">
@@ -988,16 +1399,7 @@ export default function PhonePool() {
               <div className="mobile-record-section">
                 <div className="mobile-record-field">
                   <span className="mobile-record-label">收码 API</span>
-                  <Space size={4} className="mobile-record-value" style={{ minWidth: 0 }}>
-                    <Typography.Text ellipsis={{ tooltip: record.api_url || record.api_host }} style={{ maxWidth: 220 }}>
-                      {record.api_url || record.api_host || '-'}
-                    </Typography.Text>
-                    {record.api_url ? (
-                      <Tooltip title="复制完整API">
-                        <Button type="text" size="small" icon={<CopyOutlined />} onClick={() => void copyPhoneApiLine(record)} />
-                      </Tooltip>
-                    ) : null}
-                  </Space>
+                  <span className="mobile-record-value">{renderApiRouteCell(record, true)}</span>
                 </div>
                 <div className="mobile-record-field">
                   <span className="mobile-record-label">API到期</span>
@@ -1051,7 +1453,7 @@ export default function PhonePool() {
       key: 'phone_e164',
       render: (value: string, record: PhonePoolItem) => (
         <Space direction="vertical" size={2}>
-          <Typography.Text code copyable={{ text: phoneApiCopyText(record), tooltips: [record.api_url ? '复制完整API' : '复制手机号', '已复制'] }}>{value}</Typography.Text>
+          <Typography.Text code copyable={{ text: phoneApiCopyText(record), tooltips: [effectiveApiUrl(record) ? forwardedApiUrl(record) ? '复制转发API' : '复制完整API' : '复制手机号', '已复制'] }}>{value}</Typography.Text>
           {record.label ? <Typography.Text type="secondary" style={{ fontSize: 12 }}>{record.label}</Typography.Text> : null}
         </Space>
       ),
@@ -1060,24 +1462,8 @@ export default function PhonePool() {
       title: '收码 API',
       dataIndex: 'api_url',
       key: 'api_url',
-      render: (value: string, record: PhonePoolItem) => value ? (
-        <Space size={4} style={{ maxWidth: 292 }}>
-          <Typography.Text
-            ellipsis={{ tooltip: value }}
-            style={{ display: 'block', maxWidth: 260 }}
-          >
-            {value}
-          </Typography.Text>
-          <Tooltip title="复制完整API">
-            <Button
-              type="text"
-              size="small"
-              icon={<CopyOutlined />}
-              onClick={() => void copyPhoneApiLine(record)}
-            />
-          </Tooltip>
-        </Space>
-      ) : <Typography.Text type="secondary">-</Typography.Text>,
+      width: 344,
+      render: (_value: string, record: PhonePoolItem) => renderApiRouteCell(record),
     },
     {
       title: 'API到期',
@@ -1225,6 +1611,18 @@ export default function PhonePool() {
           </p>
         </div>
         <Space wrap>
+          <Space size={4}>
+            <Button
+              icon={<SwapOutlined />}
+              onClick={openForwardingSettings}
+              loading={forwardingLoading && !forwardingConfig}
+            >
+              API 转发
+            </Button>
+            {forwardingError && !forwardingConfig
+              ? <Tag color="error">状态未知</Tag>
+              : forwardStatusTag(forwardingStatus, forwardingConfig?.enabled ? 'forwarded' : 'direct')}
+          </Space>
           <Button icon={<UploadOutlined />} onClick={() => setImportOpen((open) => !open)}>
             {importOpen ? '收起导入' : '导入号码'}
           </Button>
@@ -1493,6 +1891,157 @@ export default function PhonePool() {
       </Card>
 
       <Drawer
+        title="手机号 API 转发"
+        width={isMobile ? '100%' : 540}
+        open={forwardingOpen}
+        maskClosable={!forwardingSaving}
+        keyboard={!forwardingSaving}
+        onClose={() => {
+          if (forwardingSaving) return
+          setForwardingOpen(false)
+          setForwardingError('')
+          if (forwardingConfig) applyForwardingDraft(forwardingConfig)
+        }}
+        footer={(
+          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+            <Button
+              disabled={forwardingSaving}
+              onClick={() => {
+                setForwardingOpen(false)
+                setForwardingError('')
+                if (forwardingConfig) applyForwardingDraft(forwardingConfig)
+              }}
+            >
+              取消
+            </Button>
+            <Button
+              type="primary"
+              loading={forwardingSaving}
+              disabled={forwardingLoading || forwardingSyncing || (forwardingDraftEnabled && !forwardingDraftOrigin.trim())}
+              onClick={() => void saveForwardingSettings()}
+            >
+              保存配置
+            </Button>
+          </div>
+        )}
+      >
+        {forwardingLoading && !forwardingConfig ? (
+          <Skeleton active paragraph={{ rows: 8 }} />
+        ) : (
+          <Space direction="vertical" size={14} style={{ width: '100%' }}>
+            {forwardingError ? (
+              <Alert
+                type="error"
+                showIcon
+                message={forwardingError}
+                action={(
+                  <Button size="small" loading={forwardingLoading} onClick={() => void loadForwarding(false)}>
+                    重新读取
+                  </Button>
+                )}
+              />
+            ) : null}
+
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 16 }}>
+              <div style={{ minWidth: 0 }}>
+                <Typography.Text strong>启用 API 转发</Typography.Text>
+                <Typography.Text type="secondary" style={{ display: 'block', marginTop: 2, fontSize: 12 }}>
+                  关闭后号码继续使用原始接码 API。
+                </Typography.Text>
+              </div>
+              <Switch
+                checked={forwardingDraftEnabled}
+                disabled={forwardingLoading || forwardingSaving || forwardingSyncing}
+                onChange={setForwardingDraftEnabled}
+              />
+            </div>
+
+            <div>
+              <Typography.Text strong>当前主域名</Typography.Text>
+              <Input
+                value={forwardingDraftOrigin}
+                disabled={forwardingLoading || forwardingSaving}
+                placeholder="https://relay.example.com"
+                style={{ marginTop: 6 }}
+                onChange={(event) => setForwardingDraftOrigin(event.target.value)}
+              />
+            </div>
+
+            <div>
+              <Space size={6}>
+                <Typography.Text strong>兼容旧域名</Typography.Text>
+                <Tag>{String(forwardingDraftPrevious || '').split(/[\n,]+/).filter((item) => item.trim()).length}</Tag>
+              </Space>
+              <Input.TextArea
+                value={forwardingDraftPrevious}
+                disabled={forwardingLoading || forwardingSaving}
+                autoSize={{ minRows: 2, maxRows: 6 }}
+                placeholder={'https://relay-old.example.com\nhttps://relay-legacy.example.com'}
+                style={{ marginTop: 6, fontFamily: 'monospace' }}
+                onChange={(event) => setForwardingDraftPrevious(event.target.value)}
+              />
+            </div>
+
+            <Alert
+              type="info"
+              showIcon
+              message="域名变更后，新链接使用当前主域名；旧域名还需同步配置 DNS、证书和 Nginx 指向本 Relay。"
+            />
+
+            <div>
+              <Typography.Text strong>影响范围</Typography.Text>
+              <Descriptions size="small" bordered column={isMobile ? 1 : 2} style={{ marginTop: 6 }}>
+                <Descriptions.Item label="手机号">{forwardingAffectedRecords}</Descriptions.Item>
+                <Descriptions.Item label="来源域名">{forwardingSourceHostCount}</Descriptions.Item>
+                <Descriptions.Item label="转发状态">
+                  {forwardStatusTag(forwardingStatus, forwardingConfig?.enabled ? 'forwarded' : 'direct')}
+                </Descriptions.Item>
+                <Descriptions.Item label="Relay">
+                  <Tag color={forwardingConfig?.relay_configured ? 'success' : 'warning'}>
+                    {forwardingConfig?.relay_configured ? '已配置' : '未配置'}
+                  </Tag>
+                </Descriptions.Item>
+                {forwardingRegistryStatus ? (
+                  <Descriptions.Item label="Registry" span={isMobile ? 1 : 2}>
+                    {forwardStatusTag(forwardingRegistryStatus)}
+                  </Descriptions.Item>
+                ) : null}
+              </Descriptions>
+            </div>
+
+            <div>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12 }}>
+                <Space size={6} wrap>
+                  <Typography.Text strong>同步状态</Typography.Text>
+                  {forwardStatusTag(forwardingSync.status, forwardingConfig?.enabled ? 'unknown' : 'direct')}
+                </Space>
+                <Button
+                  size="small"
+                  icon={<CloudSyncOutlined />}
+                  loading={forwardingSyncing}
+                  disabled={forwardingLoading || forwardingSaving || !forwardingConfig?.relay_configured}
+                  onClick={() => void retryForwardingSync()}
+                >
+                  重试同步
+                </Button>
+              </div>
+              <Descriptions size="small" column={1} style={{ marginTop: 6 }}>
+                <Descriptions.Item label="最近尝试">{formatBeijingTime(forwardingSync.last_attempt_at)}</Descriptions.Item>
+                <Descriptions.Item label="最近成功">{formatBeijingTime(forwardingSync.last_success_at)}</Descriptions.Item>
+                <Descriptions.Item label="路由 / 归属 / 库存">
+                  {Number(forwardingSync.route_count || 0)} / {Number(forwardingSync.owner_count || 0)} / {Number(forwardingSync.inventory_count || 0)}
+                </Descriptions.Item>
+                {forwardingSync.trigger ? <Descriptions.Item label="触发来源">{forwardingSync.trigger}</Descriptions.Item> : null}
+              </Descriptions>
+              {forwardingSync.last_error ? (
+                <Alert type="error" showIcon message={forwardingSync.last_error} style={{ marginTop: 6 }} />
+              ) : null}
+            </div>
+          </Space>
+        )}
+      </Drawer>
+
+      <Drawer
         title="手机号状态诊断"
         width={680}
         open={diagnosticsOpen}
@@ -1547,14 +2096,25 @@ export default function PhonePool() {
             )}
 
             <Descriptions size="small" bordered column={1}>
-              <Descriptions.Item label="收码 API">
-                {diagnosticItem.api_url ? (
-                  <Typography.Text copyable={{ text: phoneApiCopyText(diagnosticItem), tooltips: ['复制完整API', '已复制'] }} ellipsis={{ tooltip: diagnosticItem.api_url }}>
-                    {diagnosticItem.api_url}
+              <Descriptions.Item label="原始 API">
+                {sourceApiUrl(diagnosticItem) ? (
+                  <Typography.Text ellipsis={{ tooltip: sourceApiUrl(diagnosticItem) }}>
+                    {sourceApiUrl(diagnosticItem)}
                   </Typography.Text>
                 ) : '-'}
               </Descriptions.Item>
-              <Descriptions.Item label="API Host">{diagnosticItem.api_host || '-'}</Descriptions.Item>
+              <Descriptions.Item label="转发 API">
+                {forwardedApiUrl(diagnosticItem) ? (
+                  <Typography.Text copyable={{ text: phoneApiCopyText(diagnosticItem), tooltips: ['复制转发API', '已复制'] }} ellipsis={{ tooltip: forwardedApiUrl(diagnosticItem) }}>
+                    {forwardedApiUrl(diagnosticItem)}
+                  </Typography.Text>
+                ) : <Typography.Text type="secondary">{missingForwardedApiText(diagnosticItem.forward_status)}</Typography.Text>}
+              </Descriptions.Item>
+              <Descriptions.Item label="原始 Host">{sourceApiHost(diagnosticItem) || '-'}</Descriptions.Item>
+              <Descriptions.Item label="转发 Host">{forwardedApiHost(diagnosticItem) || '-'}</Descriptions.Item>
+              <Descriptions.Item label="转发状态">
+                {forwardStatusTag(diagnosticItem.forward_status, recordUsesForwarding(diagnosticItem) ? 'forwarded' : 'direct')}
+              </Descriptions.Item>
               <Descriptions.Item label="API到期">{renderApiExpiryCell(diagnosticItem)}</Descriptions.Item>
               <Descriptions.Item label="号码自身">{selfStatusDetail(diagnosticItem)}</Descriptions.Item>
               <Descriptions.Item label="号段状态">{prefixStatusTag(diagnosticItem)}</Descriptions.Item>
@@ -1580,6 +2140,13 @@ export default function PhonePool() {
             </Descriptions>
 
             <Space wrap>
+              <Button
+                icon={<CopyOutlined />}
+                disabled={!sourceApiUrl(diagnosticItem)}
+                onClick={() => void copyPhoneApiLine(diagnosticItem, 'source')}
+              >
+                复制原始API
+              </Button>
               <Button
                 icon={<ReloadOutlined />}
                 loading={apiExpiryLoading === 'record'}

@@ -4,6 +4,27 @@
 
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，并且本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/) (语义化版本)。
 
+## [2.1.0] - 2026-07-14
+
+### 新增 (Added)
+- **新增独立 Phone API Relay**：在 `services/phone_api_relay.py` 提供独立的 Registry-backed 转发服务，公开 Origin 为 `https://phone-api.aa8.pl`，仅接受 `GET/HEAD`，以完整 raw `path + query` 的 SHA-256 作为路由键，使不同供应商域名可以共用同一转发域名而不改动原 API 路径。
+- **手机号池保存源地址并生成实际请求地址**：数据库继续保存供应商 `api_url`，列表、诊断、绑定记录、注册记录、OAuth 二次验证和 OAIPay 输出同时提供 `source_api_url` 与 Relay 地址；Plus、Plus2 和 standby 启动/增删改/导入后同步各自库存 Registry。
+- **Relay 管理与诊断界面**：`frontend/src/pages/PhonePool.tsx` 增加主域名、兼容旧域名、启停开关、Registry 同步状态、冲突提示、源域名/转发域名统计和默认复制实际 API 的抽屉配置。
+
+### 优化 (Changed)
+- **业务链路统一走转发地址**：OTP 轮询、API 到期探测、手机号注册、已绑定手机号 OAuth 二次验证、手工粘贴号码和动态号码池均在请求冻结时解析 Relay URL，保持原始路径、重复参数和编码字节不变。
+- **手机号池列表整批复用转发配置快照**：`serialize_phone_pool_records()` 每个响应只读取一次 Relay Admin 配置，再为全部行派生源地址与转发地址；Relay 不可达时列表快速返回统一的 `unavailable` 状态，不再按号码数量串行累计控制面超时。严格注册/绑定路径继续独立解析并抛出 `api_forward_error`，不会把展示层快照当成“转发关闭”后回源。
+- **兼容仅保存历史 Relay URL 的 OAIPay 记录**：`services/chatgpt_core/oaipay_upload.py` 会识别当前和兼容旧 Origin，将旧 Relay 链接迁移为当前主域名而不冒充供应商 `source_api_url`；如果转发已关闭且无法从手机号池恢复源地址则明确失败，避免双转发或错误回源。
+- **多实例发布拓扑接入 Relay**：`docker-compose.multi.yml` 新增 `phone-api-relay` 服务（`127.0.0.1:8893`），Plus/Plus2 依赖 Relay healthy；`auto-gpt` standby 保留独立恢复能力；`deploy.sh` 增加 Relay 构建与健康检查。
+
+### 安全 (Security)
+- **Relay 关闭危险回源行为**：Relay 不可用、路由冲突、库存同步失败时不再静默直连供应商；以独立 `api_forward_error` 分类失败，号码保持 `active`，不污染 `cannot_send` 或号段不可用判断。
+- **加入 SSRF 与协议边界**：注册源地址时阻断 loopback、RFC1918、link-local、metadata 和 Relay 自递归地址；连接时固定解析 IP、保留 HTTPS SNI、禁止上游重定向、限制超时和响应大小；日志只写 route hash、状态和耗时，不记录 query/token。
+- **外部入口隔离**：Nginx `phone-api.aa8.pl` 仅公开 Relay 转发路径，`/admin` 管理接口直接 404，清空外部 Authorization/Cookie，仅允许 GET/HEAD 并关闭缓存。
+
+### 测试 (Tests)
+- **覆盖 Relay 与业务集成**：新增 `tests/test_phone_api_relay.py`、`tests/test_phone_api_forwarding.py`，并扩展手机号池、注册、绑定、OAuth、OAIPay 和任务集成测试；锁定批量列表单次读取配置、公共字段源/转发契约、注册 Relay 故障不误报空池、历史 Relay-only OAIPay 记录迁移与关闭时失败语义。完成 Python 编译、前端生产构建、Compose 渲染和 `git diff --check` 验证，前端和 ChatGPT 运行时版本同步至 `v2.1.0`。
+
 ## [2.0.0] - 2026-07-14
 
 ### 移除 (Removed)
@@ -1300,4 +1321,8 @@
 
 ## 2026-07-14 08:42:49 +0800
 - 移除 K12、Workspace、Business 与 Team 产品能力并退役 auto-k12 实例
+- 发布模式: multi
+
+## 2026-07-14 12:37:27 +0800
+- 新增手机号池 API 域名转发 Relay
 - 发布模式: multi

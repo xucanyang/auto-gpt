@@ -6,6 +6,8 @@ from fastapi import HTTPException
 from api.tasks import (
     PhoneBindingTestTaskRequest,
     _create_standalone_task_record,
+    _phone_binding_error_status,
+    _phone_binding_status_label,
     _phone_binding_prefix4,
     _build_phone_prefix_sample_summary,
     _run_phone_binding_test,
@@ -16,6 +18,13 @@ from services.chatgpt_core.phone_pool_repository import _phone_prefix4
 
 
 class PhonePoolTaskIntegrationTests(unittest.TestCase):
+    def test_phone_api_forward_error_has_dedicated_temporary_status(self):
+        self.assertEqual(
+            _phone_binding_error_status("api_forward_error: 手机号 API Relay 暂时不可达"),
+            "api_forward_error",
+        )
+        self.assertEqual(_phone_binding_status_label("api_forward_error"), "API 转发暂时不可用")
+
     def test_phone_pool_prefix4_uses_local_number_digits(self):
         self.assertEqual(_phone_prefix4("+12532241242"), "1253")
         self.assertEqual(_phone_prefix4("+12509870220"), "1250")

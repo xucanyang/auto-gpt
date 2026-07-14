@@ -2,6 +2,7 @@ import unittest
 from unittest import mock
 
 from core.base_platform import AccountStatus, RegisterConfig
+from services.chatgpt_core.phone_api_forwarding import PhoneApiForwardError
 from services.chatgpt_core.phone_registration_engine import PhoneRegistrationEngine
 from services.chatgpt_core.plugin import ChatGPTPlatform
 
@@ -325,6 +326,30 @@ class PhoneRegistrationEngineTests(unittest.TestCase):
         self.assertEqual(engine._uploaded_entries[0].phone, "+14438041780")
         self.assertEqual(calls[0], ("list_available_by_prefixes", ["4438"]))
         self.assertEqual(calls[1][0], "to_phone_items")
+
+    def test_phone_signup_pool_relay_error_is_not_treated_as_empty_pool(self):
+        class FailingPhonePoolRepository:
+            def list_available(self):
+                return ["record-1"]
+
+            def to_phone_items(self, records, *, limit_accounts=0, expand_capacity=False):
+                raise PhoneApiForwardError("手机号 API Relay 暂时不可达", code="relay_unavailable")
+
+        engine = PhoneRegistrationEngine(
+            extra_config={"chatgpt_phone_signup_use_pool": True},
+            callback_logger=lambda msg, *_: None,
+            client_factory=FakePhoneSignupClient,
+        )
+        with mock.patch(
+            "services.chatgpt_core.phone_pool_repository.PhonePoolRepository",
+            return_value=FailingPhonePoolRepository(),
+        ):
+            with self.assertRaises(PhoneApiForwardError) as raised:
+                engine.run()
+
+        self.assertEqual(raised.exception.code, "relay_unavailable")
+        self.assertIn("api_forward_error", str(raised.exception))
+        self.assertNotIn("手机号池没有可用号码", str(raised.exception))
 
     def test_phone_signup_prefix_sample_loads_all_sample_candidates(self):
         calls = []

@@ -9,6 +9,11 @@ from urllib.parse import urlsplit
 
 from core.base_platform import Account, AccountStatus
 from core.task_runtime import TaskInterruption
+from services.chatgpt_core.phone_api_forwarding import (
+    PhoneApiForwardError,
+    get_forwarding_config,
+    sync_phone_pool_inventory,
+)
 from services.chatgpt_core.phone_service import (
     UploadedPhoneEntry,
     UploadedPhoneService,
@@ -130,6 +135,7 @@ def _status_label(status: str) -> str:
         "already_registered": "号码已注册",
         "api_no_code": "OpenAI 已发码但 API 未收到",
         "api_error": "收码 API 异常",
+        "api_forward_error": "API 转发暂时不可用",
         "invalid_otp": "短信验证码错误",
         "browser_error": "浏览器/网络异常",
         "session_failed": "注册完成但 Session 获取失败",
@@ -141,6 +147,18 @@ def _error_status(error_text: str) -> str:
     lowered = str(error_text or "").strip().lower()
     if not lowered:
         return "unknown"
+    if any(
+        marker in lowered
+        for marker in (
+            "api_forward_error",
+            "手机号 api relay",
+            "手机号 api 转发",
+            "route_not_registered",
+            "host_not_registered",
+            "upstream_unavailable",
+        )
+    ):
+        return "api_forward_error"
     if any(
         marker in lowered
         for marker in (
@@ -326,6 +344,23 @@ class PhoneRegistrationEngine:
         for item in items:
             phone = str(item.get("phone") or "").strip()
             api_url = str(item.get("api_url") or "").strip()
+            forward_status = str(item.get("forward_status") or "").strip().lower()
+            if (
+                forward_status in {"error", "unavailable", "conflict", "failed", "degraded"}
+                and (not api_url or not bool(item.get("api_forwarded")))
+            ):
+                # Keep compatibility with older/custom repositories that may
+                # return a diagnostic item instead of raising from
+                # ``to_phone_items``.  Never let such an item turn into the
+                # misleading "pool is empty" result.
+                detail = str(
+                    item.get("forward_error")
+                    or item.get("forward_error_code")
+                    or "手机号 API Relay 暂时不可用"
+                ).strip()
+                code = str(item.get("forward_error_code") or "api_forward_error").strip() or "api_forward_error"
+                raise PhoneApiForwardError(f"api_forward_error: {detail}", code=code)
+            source_api_url = str(item.get("source_api_url") or api_url).strip()
             if not phone or not api_url:
                 continue
             entry = UploadedPhoneEntry(
@@ -335,6 +370,7 @@ class PhoneRegistrationEngine:
                 api_url=api_url,
                 raw_line=str(item.get("raw_line") or f"{phone}----{api_url}"),
                 line_no=int(item.get("line_no") or len(entries) + 1),
+                source_api_url=source_api_url,
             )
             entries.append(entry)
             self._pool_managed_by_phone[phone] = dict(item)
@@ -361,6 +397,30 @@ class PhoneRegistrationEngine:
                 self._log(f"[手机号注册] 收码行解析跳过 {len(errors)} 条无效记录")
             if not entries:
                 raise RuntimeError("手机号注册需要至少一条有效的 手机号----收码API")
+            forwarding = get_forwarding_config(strict=True)
+            if bool(forwarding.get("enabled")):
+                # Public relay routes are registry-backed. Manual signup rows
+                # must join the same inventory before their forwarded URL can
+                # be requested; the supplier URL remains what is persisted.
+                from services.chatgpt_core.phone_pool_repository import PhonePoolRepository
+
+                repo = PhonePoolRepository()
+                for entry in entries:
+                    source_api_url = str(entry.source_api_url or entry.api_url)
+                    existing = repo.get(entry.phone)
+                    if existing is None:
+                        repo.add(
+                            phone=entry.phone,
+                            api_url=source_api_url,
+                            label="手机号注册面板导入",
+                        )
+                    elif str(getattr(existing, "api_url", "") or "").strip() != source_api_url:
+                        repo.update(int(getattr(existing, "id", 0) or 0), api_url=source_api_url)
+                sync_phone_pool_inventory(
+                    repo.list(),
+                    trigger="phone-signup-manual",
+                    raise_on_error=True,
+                )
             self._uploaded_entries = entries
             service = UploadedPhoneService(entries, cfg, log_fn=self._log)
             return service
@@ -426,14 +486,26 @@ class PhoneRegistrationEngine:
         code_received: bool = False,
         service: Any = None,
     ) -> dict[str, Any]:
-        phone = str(getattr(entry, "phone", "") or "").strip()
-        api_url = str(getattr(entry, "api_url", "") or getattr(entry, "detail_url", "") or "").strip()
+        effective_entry = entry
+        if service is not None:
+            candidates = list(getattr(service, "completed_entries", None) or [])
+            current = getattr(service, "current_entry", None)
+            if current is not None:
+                candidates.append(current)
+            for candidate in reversed(candidates):
+                if str(getattr(candidate, "phone", "") or "").strip() == str(getattr(entry, "phone", "") or "").strip():
+                    effective_entry = candidate
+                    break
+        phone = str(getattr(effective_entry, "phone", "") or "").strip()
+        api_url = str(getattr(effective_entry, "api_url", "") or getattr(effective_entry, "detail_url", "") or "").strip()
+        source_api_url = str(getattr(effective_entry, "source_api_url", "") or getattr(entry, "source_api_url", "") or api_url).strip()
         return {
-            "line_no": int(getattr(entry, "line_no", 0) or 0),
+            "line_no": int(getattr(effective_entry, "line_no", 0) or 0),
             "phone": phone,
             "prefix4": _phone_prefix4(phone),
             "api_url": api_url,
-            "raw_line": str(getattr(entry, "raw_line", "") or (f"{phone}----{api_url}" if api_url else phone)).strip(),
+            "source_api_url": source_api_url,
+            "raw_line": str(getattr(effective_entry, "raw_line", "") or (f"{phone}----{api_url}" if api_url else phone)).strip(),
             "status": status,
             "status_label": _status_label(status),
             "account_id": 0,
@@ -448,7 +520,16 @@ class PhoneRegistrationEngine:
 
     def run(self) -> PhoneSignupResult:
         result = PhoneSignupResult(success=False)
-        service = self._build_phone_service()
+        try:
+            service = self._build_phone_service()
+        except PhoneApiForwardError as exc:
+            # Loading a pool item is part of the business request, not a
+            # best-effort UI read.  Preserve the typed failure and add the
+            # stable marker consumed by task aggregation/log classification.
+            message = str(exc or "手机号 API Relay 暂时不可用").strip()
+            if "api_forward_error" not in message.lower():
+                message = f"api_forward_error: {message}"
+            raise PhoneApiForwardError(message, code=getattr(exc, "code", "api_forward_error")) from exc
         if not getattr(service, "enabled", False):
             result.error_message = "未配置可用的接码服务或手机号注册号码"
             return result
@@ -664,6 +745,12 @@ class PhoneRegistrationEngine:
                         )
                         self.panel_results.append(failure_result)
                         self._record_pool_status(phone, status, reason=last_error)
+                        if status == "api_forward_error":
+                            self._log(
+                                "[手机号注册] API 转发暂时不可用，号码保持可用并停止本轮注册，禁止切换源域名直连",
+                                "debug",
+                            )
+                            raise
                         if status == "browser_error" and not bool(getattr(service, "last_sms_sent", False)):
                             self._log(
                                 "[手机号注册] 发码前浏览器/代理失败，停止消耗当前手机号池，交给外层切换代理重试",
@@ -692,6 +779,7 @@ class PhoneRegistrationEngine:
         phone_binding = {
             "phone": phone,
             "api_url": str(panel_result.get("api_url") or ""),
+            "source_api_url": str(panel_result.get("source_api_url") or panel_result.get("api_url") or ""),
             "raw_line": str(panel_result.get("raw_line") or ""),
             "account_id": 0,
             "email": account_email,
@@ -724,6 +812,8 @@ class PhoneRegistrationEngine:
             "chatgpt_bound_phone": {
                 "phone": phone,
                 "phone_number": phone,
+                "api_url": str(panel_result.get("api_url") or ""),
+                "source_api_url": str(panel_result.get("source_api_url") or panel_result.get("api_url") or ""),
                 "masked": "",
                 "masked_phone": "",
                 "source": "phone_signup",

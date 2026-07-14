@@ -9,6 +9,7 @@ import json
 import logging
 import time
 from typing import Any, Tuple
+from urllib.parse import urlsplit
 
 from curl_cffi import requests as cffi_requests
 
@@ -27,6 +28,105 @@ def _get_config_value(key: str) -> str:
         return str(config_store.get(key, "") or "").strip()
     except Exception:
         return ""
+
+
+def _url_origin_key(value: Any) -> tuple[str, str, int] | None:
+    """Return a normalized origin key without retaining URL path/query data."""
+    try:
+        parsed = urlsplit(str(value or "").strip())
+        scheme = str(parsed.scheme or "").lower()
+        host = str(parsed.hostname or "").lower().rstrip(".")
+        if scheme not in {"http", "https"} or not host:
+            return None
+        port = int(parsed.port or (443 if scheme == "https" else 80))
+    except (TypeError, ValueError):
+        return None
+    return scheme, host, port
+
+
+def _resolve_bound_phone_delivery(extra: dict[str, Any]) -> dict[str, str]:
+    """Resolve persisted phone metadata to the current delivery URL.
+
+    New records retain both URLs. For historical records, the phone-pool row
+    is the authoritative supplier URL when available. Relay failures are
+    propagated so OAIPay never receives a silent direct-source fallback.
+    """
+    bound_phone = extra.get("chatgpt_bound_phone") if isinstance(extra.get("chatgpt_bound_phone"), dict) else {}
+    binding = extra.get("chatgpt_phone_binding") if isinstance(extra.get("chatgpt_phone_binding"), dict) else {}
+    phone = str(
+        bound_phone.get("phone")
+        or bound_phone.get("phone_number")
+        or binding.get("phone")
+        or binding.get("phone_number")
+        or extra.get("chatgpt_bound_phone_number")
+        or extra.get("phone")
+        or ""
+    ).strip()
+    saved_api_url = str(bound_phone.get("api_url") or binding.get("api_url") or "").strip()
+    source_api_url = str(
+        bound_phone.get("source_api_url")
+        or binding.get("source_api_url")
+        or ""
+    ).strip()
+    api_token = str(bound_phone.get("api_token") or binding.get("api_token") or "").strip()
+    if not source_api_url and phone:
+        try:
+            from services.chatgpt_core.phone_pool_repository import PhonePoolRepository
+
+            pool_record = PhonePoolRepository().get(phone)
+            source_api_url = str(getattr(pool_record, "api_url", "") or "").strip()
+        except Exception:
+            source_api_url = ""
+    request_api_url = saved_api_url
+    if source_api_url:
+        from services.chatgpt_core.phone_api_forwarding import resolve_phone_api_url
+
+        request_api_url = str(resolve_phone_api_url(source_api_url, strict=True).request_api_url or "").strip()
+    elif saved_api_url:
+        # Some transitional records only retained the effective Relay URL. Do
+        # not relabel that URL as a supplier source or feed it back into future
+        # inventory sync. When it belongs to the configured Relay, resolve it
+        # only as an already-forwarded compatibility value (which also moves a
+        # previous origin to the current active origin). A disabled Relay cannot
+        # safely recover the missing supplier URL, so fail closed.
+        from services.chatgpt_core.phone_api_forwarding import (
+            PhoneApiForwardError,
+            get_forwarding_config,
+            resolve_phone_api_url,
+        )
+
+        forwarding = get_forwarding_config(strict=True)
+        relay_origins = [
+            str(forwarding.get("active_origin") or ""),
+            *[str(item or "") for item in forwarding.get("previous_origins") or []],
+        ]
+        saved_origin = _url_origin_key(saved_api_url)
+        is_saved_relay_url = bool(
+            saved_origin
+            and any(saved_origin == _url_origin_key(origin) for origin in relay_origins if origin)
+        )
+        if is_saved_relay_url:
+            if not bool(forwarding.get("enabled")):
+                raise PhoneApiForwardError(
+                    "历史手机号记录仅保存了 Relay URL，转发关闭时无法恢复供应商 API",
+                    code="relay_source_missing",
+                )
+            request_api_url = str(
+                resolve_phone_api_url(saved_api_url, strict=True).request_api_url or ""
+            ).strip()
+        else:
+            # Pre-Relay records stored the supplier URL only. Keep that legacy
+            # interpretation and derive the current effective URL normally.
+            source_api_url = saved_api_url
+            request_api_url = str(
+                resolve_phone_api_url(source_api_url, strict=True).request_api_url or ""
+            ).strip()
+    return {
+        "phone": phone,
+        "api_url": request_api_url,
+        "source_api_url": source_api_url,
+        "api_token": api_token,
+    }
 
 
 def _parse_group_ids(raw: Any, fallback: list[int] | None = None) -> list[int]:
@@ -597,21 +697,26 @@ def upload_to_oaipay_detailed(
     token_data = generate_token_json(account)
     token = token_data.get("access_token", "")
 
-    extra = getattr(account, "extra", {})
-    if callable(extra):
-        extra = extra()
-    if not isinstance(extra, dict) and hasattr(account, "get_extra"):
-        try:
-            extra = account.get_extra()
-        except Exception:
-            pass
+    extra = _get_account_extra(account)
+    phone_delivery = {"phone": "", "api_url": "", "source_api_url": "", "api_token": ""}
     if isinstance(extra, dict):
-        bound_phone = extra.get("chatgpt_bound_phone") or extra.get("chatgpt_phone_binding") or {}
-        if isinstance(bound_phone, dict):
-            api_url_val = bound_phone.get("api_url", "")
-            if api_url_val:
-                token_data["api_url"] = api_url_val
-                token_data["phone"] = bound_phone.get("phone", "")
+        try:
+            phone_delivery = _resolve_bound_phone_delivery(extra)
+        except Exception as exc:
+            from services.chatgpt_core.phone_api_forwarding import PhoneApiForwardError
+
+            if isinstance(exc, PhoneApiForwardError):
+                return {
+                    "ok": False,
+                    "message": f"api_forward_error: OAIPay 手机号 API 转发准备失败: {exc}",
+                    "error_code": "api_forward_error",
+                    **category_fields,
+                }
+            raise
+        if phone_delivery.get("api_url"):
+            token_data["api_url"] = phone_delivery["api_url"]
+            token_data["source_api_url"] = phone_delivery.get("source_api_url") or ""
+            token_data["phone"] = phone_delivery.get("phone") or ""
 
     import json
     extra_info_json = json.dumps(token_data, ensure_ascii=False, separators=(',', ':'))
@@ -622,26 +727,19 @@ def upload_to_oaipay_detailed(
         "extra_info": extra_info_json,
     }
     if isinstance(extra, dict):
-        bound_phone = extra.get("chatgpt_bound_phone") or extra.get("chatgpt_phone_binding") or {}
-        phone_val = ""
-        api_url_val = ""
-        api_token_val = ""
-        
-        if isinstance(bound_phone, dict):
-            api_url_val = bound_phone.get("api_url", "")
-            api_token_val = bound_phone.get("api_token", "")
-            phone_val = bound_phone.get("phone", "")
-            
-        if not phone_val:
-            phone_val = str(extra.get("chatgpt_bound_phone_number") or extra.get("phone") or "")
-            
+        phone_val = str(phone_delivery.get("phone") or "")
+        api_url_val = str(phone_delivery.get("api_url") or "")
+        source_api_url_val = str(phone_delivery.get("source_api_url") or "")
+        api_token_val = str(phone_delivery.get("api_token") or "")
         if not api_url_val:
             api_url_val = _get_config_value("local_phone_gateway_url")
             api_token_val = _get_config_value("local_phone_gateway_token")
-            
+
         if phone_val or api_url_val:
             acc_dict["phone"] = phone_val
             acc_dict["phone_api"] = api_url_val
+            if source_api_url_val:
+                acc_dict["source_api_url"] = source_api_url_val
             if api_token_val:
                 acc_dict["phone_token"] = api_token_val
 

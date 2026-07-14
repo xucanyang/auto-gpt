@@ -1118,16 +1118,52 @@ def _parse_phone_binding_upload_lines(raw_lines: Any) -> tuple[list[dict[str, An
     uploaded_entries, errors = parse_uploaded_phone_lines(raw_lines)
     entries: list[dict[str, Any]] = []
     for entry in uploaded_entries:
+        source_api_url = str(getattr(entry, "source_api_url", "") or entry.api_url).strip()
         entries.append(
             {
                 "line_no": int(entry.line_no or 0),
                 "phone": entry.phone,
                 "api_url": entry.api_url,
+                "source_api_url": source_api_url,
                 "raw_line": entry.raw_line or f"{entry.phone}----{entry.api_url}",
                 "pool_managed": False,
             }
         )
     return entries, errors
+
+
+def _resolve_phone_binding_item_api(item: dict[str, Any]) -> dict[str, Any]:
+    """Freeze one task item to the effective Relay/direct URL.
+
+    ``source_api_url`` always remains the supplier URL. ``api_url`` and the
+    canonical raw line are the actual URL used by polling/copy/OAIPay output.
+    """
+    from services.chatgpt_core.phone_api_forwarding import resolve_phone_api_url
+
+    resolved_item = dict(item or {})
+    source_api_url = str(
+        resolved_item.get("source_api_url")
+        or resolved_item.get("api_url")
+        or ""
+    ).strip()
+    resolution = resolve_phone_api_url(source_api_url, strict=True)
+    request_api_url = str(resolution.request_api_url or "").strip()
+    raw_line = str(resolved_item.get("raw_line") or "").strip()
+    if raw_line and source_api_url and source_api_url in raw_line:
+        raw_line = raw_line.replace(source_api_url, request_api_url, 1)
+    elif not raw_line:
+        raw_line = f"{str(resolved_item.get('phone') or '').strip()}----{request_api_url}"
+    resolved_item.update(
+        {
+            "source_api_url": source_api_url,
+            "api_url": request_api_url,
+            "forwarded_api_url": request_api_url if resolution.forwarded else "",
+            "api_forwarded": bool(resolution.forwarded),
+            "forward_status": resolution.status,
+            "raw_line": raw_line,
+        }
+    )
+    return resolved_item
 
 
 def _import_manual_phone_entries_to_pool(
@@ -1147,7 +1183,8 @@ def _import_manual_phone_entries_to_pool(
     for item in phone_entries:
         next_item = dict(item)
         phone = str(next_item.get("phone") or "").strip()
-        api_url = str(next_item.get("api_url") or "").strip()
+        api_url = str(next_item.get("source_api_url") or next_item.get("api_url") or "").strip()
+        next_item["source_api_url"] = api_url
         try:
             before = repo.get(phone)
             if before is None:
@@ -3187,6 +3224,24 @@ def enqueue_phone_binding_test_task(
         if len(phone_entries) > 1000:
             raise HTTPException(400, "单次最多上传 1000 个手机号")
         phone_entries, phone_pool_import_summary = _import_manual_phone_entries_to_pool(phone_entries)
+        try:
+            from services.chatgpt_core.phone_api_forwarding import (
+                PhoneApiForwardError,
+                relay_is_configured,
+                sync_phone_pool_inventory,
+            )
+            from services.chatgpt_core.phone_pool_repository import PhonePoolRepository
+
+            if relay_is_configured():
+                sync_phone_pool_inventory(
+                    PhonePoolRepository().list(),
+                    trigger="phone-binding-manual",
+                    raise_on_error=True,
+                )
+            phone_entries = [_resolve_phone_binding_item_api(item) for item in phone_entries]
+        except PhoneApiForwardError as exc:
+            status_code = 409 if getattr(exc, "code", "") == "route_conflict" else 503
+            raise HTTPException(status_code, f"手机号 API 转发准备失败: {exc}") from exc
     safe_parse_errors = sanitize_task_detail(parse_errors)
 
     prefix_sample_meta: dict[str, Any] = {
@@ -3227,7 +3282,15 @@ def enqueue_phone_binding_test_task(
             sampled_records = pool_repo.restore_prefix_sample_records(
                 [int(getattr(record, "id", 0) or 0) for record in sampled_records]
             )
-        phone_items = pool_repo.to_phone_items(sampled_records)
+        try:
+            phone_items = [_resolve_phone_binding_item_api(item) for item in pool_repo.to_phone_items(sampled_records)]
+        except Exception as exc:
+            from services.chatgpt_core.phone_api_forwarding import PhoneApiForwardError
+
+            if isinstance(exc, PhoneApiForwardError):
+                status_code = 409 if getattr(exc, "code", "") == "route_conflict" else 503
+                raise HTTPException(status_code, f"手机号 API 转发准备失败: {exc}") from exc
+            raise
         selected_counts: dict[str, int] = {}
         for item in phone_items:
             item["prefix_sample"] = True
@@ -8829,6 +8892,22 @@ def _phone_binding_error_status(error_text: str) -> str:
     if any(
         marker in lowered
         for marker in (
+            "api_forward_error",
+            "手机号 api relay",
+            "手机号 api 转发",
+            "route_not_registered",
+            "host_not_registered",
+            "redirect_blocked",
+            "response_too_large",
+            "upstream_unavailable",
+            "relay_unavailable",
+            "relay_request_failed",
+        )
+    ):
+        return "api_forward_error"
+    if any(
+        marker in lowered
+        for marker in (
             "phone number already in use",
             "phone_number_in_use",
             "手机号已被使用",
@@ -8920,6 +8999,7 @@ def _phone_binding_status_label(status: str) -> str:
         "phone_already_used": "手机号已被使用",
         "api_no_code": "OpenAI 已发码但 API 未收到",
         "api_error": "收码 API 异常",
+        "api_forward_error": "API 转发暂时不可用",
         "rate_limited": "OpenAI 限流",
         "browser_error": "浏览器/网络异常",
         "account_auth_error": "账号 Auth 异常",
@@ -8927,6 +9007,45 @@ def _phone_binding_status_label(status: str) -> str:
         "not_tested": "未测试",
         "unknown": "未知",
     }.get(str(status or ""), str(status or "unknown"))
+
+
+def _phone_binding_effective_api_fields(
+    item: dict[str, Any],
+    phone_service: Any = None,
+) -> tuple[str, str, str]:
+    """Return request URL, supplier URL, and request raw line for a result."""
+    phone = str((item or {}).get("phone") or "").strip()
+    candidates: list[Any] = []
+    if phone_service is not None:
+        candidates.extend(list(getattr(phone_service, "completed_entries", None) or []))
+        current = getattr(phone_service, "current_entry", None)
+        if current is not None:
+            candidates.append(current)
+        for cancelled in list(getattr(phone_service, "cancelled_entries", None) or []):
+            candidate = cancelled[0] if isinstance(cancelled, (tuple, list)) and cancelled else cancelled
+            if candidate is not None:
+                candidates.append(candidate)
+    effective_entry = None
+    for candidate in reversed(candidates):
+        if str(getattr(candidate, "phone", "") or "").strip() == phone:
+            effective_entry = candidate
+            break
+    request_api_url = str(
+        getattr(effective_entry, "api_url", "")
+        or (item or {}).get("api_url")
+        or ""
+    ).strip()
+    source_api_url = str(
+        getattr(effective_entry, "source_api_url", "")
+        or (item or {}).get("source_api_url")
+        or request_api_url
+    ).strip()
+    raw_line = str(
+        getattr(effective_entry, "raw_line", "")
+        or (item or {}).get("raw_line")
+        or (f"{phone}----{request_api_url}" if request_api_url else phone)
+    ).strip()
+    return request_api_url, source_api_url, raw_line
 
 
 def _persist_phone_binding_result(
@@ -8938,6 +9057,7 @@ def _persist_phone_binding_result(
 ) -> None:
     phone = str(phone_result.get("phone") or "").strip()
     api_url = str(phone_result.get("api_url") or "").strip()
+    source_api_url = str(phone_result.get("source_api_url") or api_url).strip()
     if not phone and not api_url:
         return
 
@@ -8951,6 +9071,7 @@ def _persist_phone_binding_result(
     binding = {
         "phone": phone,
         "api_url": api_url,
+        "source_api_url": source_api_url,
         "raw_line": str(raw_line or phone_result.get("raw_line") or "").strip(),
         "account_id": int(phone_result.get("account_id") or getattr(account, "id", 0) or 0),
         "email": str(phone_result.get("email") or getattr(account, "email", "") or "").strip(),
@@ -8969,6 +9090,7 @@ def _persist_phone_binding_result(
             "phone": phone,
             "phone_number": phone,
             "api_url": api_url,
+            "source_api_url": source_api_url,
             "source": "phone_binding_test",
             "updated_at": binding["bound_at"],
             "status": "bound",
@@ -9111,12 +9233,14 @@ def _run_phone_binding_test_concurrent(
         code_received: bool = False,
         phone_service: Any = None,
     ) -> dict[str, Any]:
+        api_url, source_api_url, result_raw_line = _phone_binding_effective_api_fields(item, phone_service)
         return {
             "line_no": _safe_int(item.get("line_no")),
             "phone": str(item.get("phone") or ""),
             "prefix4": str(item.get("prefix4") or _phone_binding_prefix4(item.get("phone"))),
-            "api_url": str(item.get("api_url") or ""),
-            "raw_line": str(item.get("raw_line") or ""),
+            "api_url": api_url,
+            "source_api_url": source_api_url,
+            "raw_line": result_raw_line,
             "status": status,
             "status_label": _phone_binding_status_label(status),
             "account_id": int(account_id or 0),
@@ -9171,6 +9295,7 @@ def _run_phone_binding_test_concurrent(
             "line_no": int(line_no or 0),
             "phone": phone_value,
             "api_url": api_url_value,
+            "source_api_url": api_url_value,
             "raw_line": f"{phone_value}----{api_url_value}",
             "pool_managed": True,
             "prefix4": _phone_binding_prefix4(phone_value),
@@ -9473,6 +9598,7 @@ def _run_phone_binding_test_concurrent(
                 api_url=str(item.get("api_url") or ""),
                 raw_line=raw_line,
                 line_no=_safe_int(item.get("line_no")),
+                source_api_url=str(item.get("source_api_url") or item.get("api_url") or ""),
             )
             phone_service = UploadedPhoneService(
                 [service_entry],
@@ -9574,7 +9700,7 @@ def _run_phone_binding_test_concurrent(
                         increment_success()
                         with state_lock:
                             runtime_results.append(phone_result)
-                            bound_phone_results.append({**phone_result, "raw_line": raw_line or f"{phone}----{item.get('api_url') or ''}"})
+                            bound_phone_results.append(dict(phone_result))
                             account_results.append({"account_id": account_id, "email": email, "status": "sms_probe_received", "phone": phone, "reason": success_reason})
                         _log(task_id, f"[手机号绑定][账号 {account_position}/{total_accounts}] 已收码未提交｜手机号={phone}｜结果=短信探测完成")
                         sync_meta()
@@ -9603,7 +9729,6 @@ def _run_phone_binding_test_concurrent(
                         ok = bool(result.get("ok"))
 
                     if phone_service.completed_entries:
-                        raw_result_line = raw_line or f"{phone}----{item.get('api_url') or ''}"
                         auth_error_text = "" if ok else result_error_text(result, "Auth/RT 获取失败")
                         success_reason = "验证码已提交 OpenAI，手机号绑定完成"
                         if ok:
@@ -9623,6 +9748,7 @@ def _run_phone_binding_test_concurrent(
                             code_received=True,
                             phone_service=phone_service,
                         )
+                        raw_result_line = str(phone_result.get("raw_line") or raw_line or f"{phone}----{item.get('api_url') or ''}")
                         phone_result["auth_capture_ok"] = bool(ok)
                         phone_result["auth_retry_attempts"] = int(auth_retry_attempts or 0)
                         if auth_error_text:
@@ -9851,16 +9977,19 @@ def _run_phone_binding_test_concurrent(
                 "rate_limited",
             )
         )
+        forward_issue_count = int(runtime_status_counts.get("api_forward_error", 0))
         account_issue_count = sum(int(account_status_counts.get(status, 0)) for status in ("account_auth_error", "unknown", "rate_limited"))
         summary_message = (
             f"OpenAI 手机号绑定完成：成功 {success_snapshot}/{len(account_ids)}，"
-            f"手机号问题 {phone_issue_count}，账号问题 {account_issue_count}，跳过 {skipped_snapshot}，并发 {effective_concurrency}"
+            f"手机号问题 {phone_issue_count}，转发问题 {forward_issue_count}，"
+            f"账号问题 {account_issue_count}，跳过 {skipped_snapshot}，并发 {effective_concurrency}"
         )
         _log(
             task_id,
             "[手机号绑定][汇总] 完成"
             f"｜成功={success_snapshot}/{len(account_ids)}"
             f"｜手机号问题={phone_issue_count}"
+            f"｜转发问题={forward_issue_count}"
             f"｜账号问题={account_issue_count}"
             f"｜跳过={skipped_snapshot}"
             f"｜并发={effective_concurrency}",
@@ -10293,12 +10422,14 @@ def _run_phone_binding_test(
         code_received: bool = False,
         phone_service: Any = None,
     ) -> dict[str, Any]:
+        api_url, source_api_url, result_raw_line = _phone_binding_effective_api_fields(item, phone_service)
         return {
             "line_no": int(item.get("line_no") or 0),
             "phone": str(item.get("phone") or ""),
             "prefix4": str(item.get("prefix4") or _phone_binding_prefix4(item.get("phone"))),
-            "api_url": str(item.get("api_url") or ""),
-            "raw_line": str(item.get("raw_line") or ""),
+            "api_url": api_url,
+            "source_api_url": source_api_url,
+            "raw_line": result_raw_line,
             "status": status,
             "status_label": _phone_binding_status_label(status),
             "account_id": int(account_id or 0),
@@ -10621,6 +10752,7 @@ def _run_phone_binding_test(
                 "line_no": int(line_no or 0),
                 "phone": phone_value,
                 "api_url": api_url_value,
+                "source_api_url": api_url_value,
                 "raw_line": f"{phone_value}----{api_url_value}",
                 "pool_managed": True,
                 "prefix4": _phone_binding_prefix4(phone_value),
@@ -10752,6 +10884,7 @@ def _run_phone_binding_test(
                     api_url=str(item.get("api_url") or ""),
                     raw_line=raw_line,
                     line_no=int(item.get("line_no") or 0),
+                    source_api_url=str(item.get("source_api_url") or item.get("api_url") or ""),
                 )
                 phone_service = UploadedPhoneService(
                     [service_entry],
@@ -10862,7 +10995,6 @@ def _run_phone_binding_test(
 
                         if prefix_sms_probe_only and phone_service.completed_entries:
                             success_count += 1
-                            raw_result_line = raw_line or f"{phone}----{item.get('api_url') or ''}"
                             success_reason = "OpenAI 已发码，收码 API 已收到验证码；按设置未提交验证码，未完成手机号绑定"
                             phone_result = result_for_phone(
                                 item,
@@ -10875,6 +11007,7 @@ def _run_phone_binding_test(
                             )
                             phone_result["verification_submitted"] = False
                             phone_result["sms_probe_only"] = True
+                            raw_result_line = str(phone_result.get("raw_line") or raw_line or f"{phone}----{item.get('api_url') or ''}")
                             session.commit()
                             runtime_results.append(phone_result)
                             record_pool_result(item, "sms_probe_received", reason=success_reason, api_expired_date=str(phone_result.get("api_expired_date") or ""))
@@ -10936,8 +11069,6 @@ def _run_phone_binding_test(
 
                         if phone_service.completed_entries:
                             success_count += 1
-                            raw_result_line = raw_line or f"{phone}----{item.get('api_url') or ''}"
-                            bound_phone_lines.append(raw_result_line)
                             auth_error_text = "" if ok else result_error_text(result, "Auth/RT 获取失败")
                             success_reason = "验证码已提交 OpenAI，手机号绑定完成"
                             if ok:
@@ -10960,6 +11091,8 @@ def _run_phone_binding_test(
                                 code_received=True,
                                 phone_service=phone_service,
                             )
+                            raw_result_line = str(phone_result.get("raw_line") or raw_line or f"{phone}----{item.get('api_url') or ''}")
+                            bound_phone_lines.append(raw_result_line)
                             phone_result["auth_capture_ok"] = bool(ok)
                             phone_result["auth_retry_attempts"] = int(auth_retry_attempts or 0)
                             if auth_error_text:
@@ -11399,19 +11532,22 @@ def _run_phone_binding_test(
                 "rate_limited",
             )
         )
+        forward_issue_count = int(runtime_status_counts.get("api_forward_error", 0))
         account_issue_count = sum(
             int(account_status_counts.get(status, 0))
             for status in ("account_auth_error", "unknown", "rate_limited")
         )
         summary_message = (
             f"OpenAI 手机号绑定完成：成功 {success_count}/{len(account_ids)}，"
-            f"手机号问题 {phone_issue_count}，账号问题 {account_issue_count}，跳过 {skipped_count}"
+            f"手机号问题 {phone_issue_count}，转发问题 {forward_issue_count}，"
+            f"账号问题 {account_issue_count}，跳过 {skipped_count}"
         )
         _log(
             task_id,
             "[手机号绑定][汇总] 完成"
             f"｜成功={success_count}/{len(account_ids)}"
             f"｜手机号问题={phone_issue_count}"
+            f"｜转发问题={forward_issue_count}"
             f"｜账号问题={account_issue_count}"
             f"｜跳过={skipped_count}",
         )
@@ -11422,6 +11558,7 @@ def _run_phone_binding_test(
                 "phone_already_used": "手机号已被使用",
                 "api_no_code": "已发码但未收码",
                 "api_error": "收码 API 异常",
+                "api_forward_error": "API 转发暂时不可用",
                 "rate_limited": "OpenAI 限流",
                 "bound": "绑定成功",
                 "sms_probe_received": "已收码未提交",

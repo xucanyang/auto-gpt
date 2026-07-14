@@ -1,6 +1,35 @@
 name: auto-gpt
 
 services:
+  phone-api-relay:
+    image: ${APP_IMAGE:-auto-gpt:latest}
+    container_name: phone-api-relay
+    init: true
+    restart: unless-stopped
+    entrypoint: ["python", "-m", "services.phone_api_relay"]
+    environment:
+      PHONE_API_RELAY_HOST: 0.0.0.0
+      PHONE_API_RELAY_PORT: "8787"
+      PHONE_API_RELAY_DB: /runtime/phone_api_relay.db
+      PHONE_API_RELAY_ADMIN_TOKEN: ${PHONE_API_RELAY_ADMIN_TOKEN:?PHONE_API_RELAY_ADMIN_TOKEN is required}
+      PHONE_API_RELAY_PUBLIC_ORIGIN: ${PHONE_API_RELAY_PUBLIC_ORIGIN:-https://phone-api.aa8.pl}
+      PHONE_API_RELAY_ENABLED: ${PHONE_API_RELAY_ENABLED:-1}
+    ports:
+      - "127.0.0.1:8893:8787"
+    volumes:
+      - /opt/auto-gpt-relay:/runtime
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8787/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 3s
+    networks:
+      - default
+    mem_limit: "256m"
+    mem_reservation: "64m"
+    pids_limit: 128
+
   auto-gpt:
     image: ${APP_IMAGE:-auto-gpt:latest}
     build:
@@ -25,6 +54,8 @@ services:
       APP_CONDA_ENV: docker
       APP_RUNTIME_DIR: /runtime
       APP_INSTANCE_ID: auto-gpt
+      PHONE_API_RELAY_INTERNAL_URL: http://phone-api-relay:8787
+      PHONE_API_RELAY_ADMIN_TOKEN: ${PHONE_API_RELAY_ADMIN_TOKEN:?PHONE_API_RELAY_ADMIN_TOKEN is required}
       SHARED_CONFIG_DB: /shared_config/shared_config.db
       APP_ENABLE_SOLVER: "1"
       SOLVER_PORT: "8889"
@@ -78,6 +109,8 @@ services:
       APP_CONDA_ENV: docker
       APP_RUNTIME_DIR: /runtime
       APP_INSTANCE_ID: auto-gpt-plus
+      PHONE_API_RELAY_INTERNAL_URL: http://phone-api-relay:8787
+      PHONE_API_RELAY_ADMIN_TOKEN: ${PHONE_API_RELAY_ADMIN_TOKEN:?PHONE_API_RELAY_ADMIN_TOKEN is required}
       SHARED_CONFIG_DB: /shared_config/shared_config.db
       APP_ENABLE_SOLVER: "1"
       SOLVER_PORT: "8889"
@@ -85,6 +118,9 @@ services:
       LOCAL_SOLVER_URL: http://127.0.0.1:8889
       SOLVER_BROWSER_TYPE: ${SOLVER_BROWSER_TYPE:-camoufox}
       PLAYWRIGHT_HEADLESS: ${PLAYWRIGHT_HEADLESS:-}
+    depends_on:
+      phone-api-relay:
+        condition: service_healthy
     ports:
       - "8001:8000"
       - "127.0.0.1:8890:8889"
@@ -124,6 +160,8 @@ services:
       APP_CONDA_ENV: docker
       APP_RUNTIME_DIR: /runtime
       APP_INSTANCE_ID: auto-plus2
+      PHONE_API_RELAY_INTERNAL_URL: http://phone-api-relay:8787
+      PHONE_API_RELAY_ADMIN_TOKEN: ${PHONE_API_RELAY_ADMIN_TOKEN:?PHONE_API_RELAY_ADMIN_TOKEN is required}
       SHARED_CONFIG_DB: /shared_config/shared_config.db
       APP_ENABLE_SOLVER: "1"
       SOLVER_PORT: "8889"
@@ -131,6 +169,9 @@ services:
       LOCAL_SOLVER_URL: http://127.0.0.1:8889
       SOLVER_BROWSER_TYPE: ${SOLVER_BROWSER_TYPE:-camoufox}
       PLAYWRIGHT_HEADLESS: ${PLAYWRIGHT_HEADLESS:-}
+    depends_on:
+      phone-api-relay:
+        condition: service_healthy
     ports:
       - "8003:8000"
       - "127.0.0.1:8892:8889"
