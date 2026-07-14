@@ -269,10 +269,15 @@ async def lifespan(app: FastAPI):
     from services.account_rate_limit_recovery import start as start_account_rate_limit_recovery
     start_account_rate_limit_recovery()
     try:
-        from services.chatgpt_core.phone_pool_repository import start_phone_pool_api_expiry_autofill
+        from services.chatgpt_core.phone_pool_repository import (
+            start_phone_pool_api_expiry_autofill,
+            start_phone_pool_maintenance,
+        )
+
+        start_phone_pool_maintenance()
         start_phone_pool_api_expiry_autofill(delay_seconds=30, limit=50)
     except Exception as exc:
-        print(f"[WARN] 手机号池 API 到期时间后台补全启动失败: {exc}")
+        print(f"[WARN] 手机号池后台维护启动失败: {exc}")
     from services.proxy_scan_scheduler import start as start_proxy_scan_scheduler
     start_proxy_scan_scheduler()
     from services.chatgpt_core.baxigpt_status_poller import (
@@ -305,6 +310,8 @@ async def lifespan(app: FastAPI):
     stop_icloud_hme_auto_delete()
     from services.account_rate_limit_recovery import stop as stop_account_rate_limit_recovery
     stop_account_rate_limit_recovery()
+    from services.chatgpt_core.phone_pool_repository import stop_phone_pool_maintenance
+    stop_phone_pool_maintenance()
     from services.proxy_scan_scheduler import stop as stop_proxy_scan_scheduler
     stop_proxy_scan_scheduler()
     from services.chatgpt_core.baxigpt_status_poller import stop as stop_baxigpt_status_poller

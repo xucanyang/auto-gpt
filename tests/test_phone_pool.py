@@ -1,3 +1,4 @@
+from datetime import timedelta
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -275,6 +276,70 @@ bad-line
         rec = repo.record_task_status("+15551230001", "rate_limited", reason="429")
         self.assertEqual(rec.status, "rate_limited")
         self.assertTrue(rec.cooldown_until)
+        recover_at = repo_module._parse_time(rec.cooldown_until)
+        self.assertIsNotNone(recover_at)
+        self.assertGreater((recover_at - repo_module._utcnow()).total_seconds(), 3500)
+
+        recovered = repo.recover_expired_temporary_statuses(now=recover_at + timedelta(seconds=1))
+        self.assertEqual(recovered, 1)
+        rec = repo.get("+15551230001")
+        self.assertEqual(rec.status, "active")
+        self.assertEqual(rec.cooldown_until, "")
+        self.assertEqual(rec.last_error_code, "")
+
+    def test_prefix_failure_and_success_write_back_all_recoverable_numbers(self):
+        repo = PhonePoolRepository()
+        rejected = repo.add(phone="+13430000001", api_url="https://relay.example.com/rejected")
+        peer = repo.add(phone="+13430000002", api_url="https://relay.example.com/peer")
+        full = repo.add(phone="+13430000003", api_url="https://relay.example.com/full", max_accounts=1)
+        disabled = repo.add(phone="+13430000004", api_url="https://relay.example.com/disabled")
+        repo.record_success(full.phone_e164)
+        repo.set_enabled(disabled.id, False)
+
+        repo.record_task_status(rejected.phone_e164, "openai_rejected", reason="OpenAI 拒绝")
+        self.assertEqual(repo.get(rejected.phone_e164).status, "cannot_send")
+        self.assertEqual(repo.get(peer.phone_e164).status, "cannot_send")
+        self.assertEqual(repo.get(full.phone_e164).status, "exhausted")
+        self.assertEqual(repo.get(disabled.phone_e164).status, "disabled")
+
+        restored = repo.record_task_status(peer.phone_e164, "sms_probe_received", reason="发码并收码成功")
+        self.assertEqual(restored.status, "active")
+        self.assertEqual(repo.get(rejected.phone_e164).status, "active")
+        self.assertFalse(repo.get(rejected.phone_e164).last_error_code)
+        self.assertEqual(repo.get(full.phone_e164).status, "exhausted")
+        self.assertEqual(repo.get(disabled.phone_e164).status, "disabled")
+
+    def test_prefix_reconciliation_repairs_legacy_mixed_rows(self):
+        repo = PhonePoolRepository()
+        active = repo.add(phone="+13430000001", api_url="https://relay.example.com/active")
+        stale = repo.add(phone="+13430000002", api_url="https://relay.example.com/stale")
+        repo.record_failure(
+            stale.phone_e164,
+            status="cannot_send",
+            error_code="openai_rejected",
+            error_message="legacy state",
+        )
+
+        result = repo.reconcile_prefix_availability()
+
+        self.assertEqual(result, {"prefixes": 1, "records": 1})
+        self.assertEqual(repo.get(active.phone_e164).status, "active")
+        repaired = repo.get(stale.phone_e164)
+        self.assertEqual(repaired.status, "active")
+        self.assertFalse(repaired.last_error_code)
+
+    def test_terminal_api_failure_marks_the_whole_prefix_unavailable(self):
+        repo = PhonePoolRepository()
+        failed = repo.add(phone="+14160000001", api_url="https://relay.example.com/failed")
+        peer = repo.add(phone="+14160000002", api_url="https://relay.example.com/peer")
+
+        repo.record_task_status(failed.phone_e164, "api_no_code", reason="收码 API 无验证码")
+
+        self.assertEqual(repo.get(failed.phone_e164).status, "cannot_send")
+        self.assertEqual(repo.get(peer.phone_e164).status, "cannot_send")
+        summary = repo.summarize(repo.list())
+        self.assertEqual(summary["prefix_health"]["unavailable"][0]["prefix"], "1416")
+        self.assertEqual(summary["rejected_prefix_count"], 0)
 
     def test_api_forward_error_keeps_phone_active(self):
         repo = PhonePoolRepository()
@@ -300,15 +365,15 @@ bad-line
 
     def test_summary_keeps_exhausted_and_disabled_separate(self):
         repo = PhonePoolRepository()
-        repo.add(phone="+15551230001", api_url="https://relay.example.com/a")
-        repo.add(phone="+15551230002", api_url="https://relay.example.com/b")
-        repo.add(phone="+15551230003", api_url="https://relay.example.com/c")
-        repo.add(phone="+15551230004", api_url="https://relay.example.com/d")
+        repo.add(phone="+12261230001", api_url="https://relay.example.com/a")
+        repo.add(phone="+13431230002", api_url="https://relay.example.com/b")
+        repo.add(phone="+14161230003", api_url="https://relay.example.com/c")
+        repo.add(phone="+15871230004", api_url="https://relay.example.com/d")
 
         for _ in range(3):
-            repo.record_success("+15551230002")
-        repo.record_task_status("+15551230003", "api_no_code", reason="未收到短信验证码")
-        disabled = repo.get("+15551230004")
+            repo.record_success("+13431230002")
+        repo.record_task_status("+14161230003", "api_no_code", reason="未收到短信验证码")
+        disabled = repo.get("+15871230004")
         repo.set_enabled(disabled.id, False)
 
         summary = repo.summarize(repo.list())
@@ -323,12 +388,12 @@ bad-line
         repo.add(phone="+13434832962", api_url="https://relay.example.com/a")
         repo.add(phone="+13434832712", api_url="https://relay.example.com/b")
         repo.add(phone="+12269013018", api_url="https://relay.example.com/c")
-        repo.add(phone="+12269023650", api_url="https://relay.example.com/d")
+        repo.add(phone="+14169023650", api_url="https://relay.example.com/d")
 
         repo.record_task_status("+13434832962", "openai_rejected", reason="detected suspicious behavior from phone numbers")
         repo.record_task_status("+13434832712", "openai_rejected", reason="detected suspicious behavior from phone numbers")
         repo.record_task_status("+12269013018", "openai_rejected", reason="detected suspicious behavior from phone numbers")
-        repo.record_task_status("+12269023650", "api_no_code", reason="未收到短信验证码")
+        repo.record_task_status("+14169023650", "api_no_code", reason="未收到短信验证码")
 
         summary = repo.summarize(repo.list())
 
@@ -353,18 +418,18 @@ bad-line
 
         summary = repo.summarize(repo.list())
 
-        self.assertEqual(summary["available_prefix_count"], 2)
+        self.assertEqual(summary["available_prefix_count"], 1)
         self.assertEqual(
             [(item["prefix"], item["available_count"], item["remaining_capacity"], item["status"]) for item in summary["available_prefixes"]],
-            [("1343", 2, 4, "available"), ("1226", 1, 3, "available")],
+            [("1343", 2, 4, "available")],
         )
-        self.assertEqual(summary["rejected_prefix_count"], 0)
-        self.assertEqual(summary["available"], 3)
-        self.assertEqual(summary["number_available"], 3)
-        self.assertEqual([item.phone_e164 for item in repo.list_available()], ["+13434832962", "+12269013018", "+13434832712"])
+        self.assertEqual(summary["rejected_prefix_count"], 1)
+        self.assertEqual(summary["available"], 2)
+        self.assertEqual(summary["number_available"], 2)
+        self.assertEqual([item.phone_e164 for item in repo.list_available()], ["+13434832962", "+13434832712"])
 
 
-    def test_serialized_rows_split_self_prefix_and_task_eligibility(self):
+    def test_serialized_rows_show_prefix_wide_openai_rejection(self):
         repo = PhonePoolRepository()
         active_in_bad_prefix = repo.add(phone="+13430000001", api_url="https://relay.example.com/active")
         rejected_same_prefix = repo.add(phone="+13430000002", api_url="https://relay.example.com/rejected")
@@ -376,10 +441,10 @@ bad-line
         by_phone = {row["phone_e164"]: row for row in rows}
 
         bad_prefix_active = by_phone[active_in_bad_prefix.phone_e164]
-        self.assertTrue(bad_prefix_active["self_available"])
-        self.assertEqual(bad_prefix_active["prefix_status"], "available")
-        self.assertTrue(bad_prefix_active["ordinary_task_eligible"])
-        self.assertEqual(bad_prefix_active["ordinary_task_block_reason"], "")
+        self.assertFalse(bad_prefix_active["self_available"])
+        self.assertEqual(bad_prefix_active["prefix_status"], "unavailable")
+        self.assertFalse(bad_prefix_active["ordinary_task_eligible"])
+        self.assertEqual(bad_prefix_active["ordinary_task_block_reason"], "openai_rejected")
 
         healthy_row = by_phone[healthy.phone_e164]
         self.assertTrue(healthy_row["self_available"])
@@ -387,7 +452,7 @@ bad-line
         self.assertTrue(healthy_row["ordinary_task_eligible"])
         self.assertEqual(healthy_row["ordinary_task_block_reason"], "")
 
-        self.assertEqual([item.phone_e164 for item in repo.list_available()], [active_in_bad_prefix.phone_e164, healthy.phone_e164])
+        self.assertEqual([item.phone_e164 for item in repo.list_available()], [healthy.phone_e164])
 
     def test_serialized_rows_fetch_forwarding_config_once_and_keep_source_contract(self):
         repo = PhonePoolRepository()
@@ -588,9 +653,8 @@ bad-line
 
         items = repo.list_available_by_prefixes(["1343"])
 
-        self.assertEqual([item.phone_e164 for item in items], [healthy.phone_e164])
+        self.assertEqual([item.phone_e164 for item in items], [healthy.phone_e164, rejected.phone_e164])
         self.assertNotIn(other.phone_e164, [item.phone_e164 for item in items])
-        self.assertNotIn(rejected.phone_e164, [item.phone_e164 for item in items])
         self.assertNotIn(exhausted.phone_e164, [item.phone_e164 for item in items])
 
     def test_sms_probe_success_restores_phone_and_prefix_availability(self):

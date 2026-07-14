@@ -22,6 +22,12 @@ STATUS_COOLDOWN = "cooldown"
 STATUS_EXHAUSTED = "exhausted"
 STATUS_DISABLED = "disabled"
 
+# Phone-rate limits are transient.  Keep the duration aligned with the
+# account-level rate-limit recovery policy instead of leaving a phone blocked
+# indefinitely after its cooldown timestamp passes.
+PHONE_POOL_RATE_LIMIT_RECOVERY_SECONDS = 60 * 60
+PHONE_POOL_MAINTENANCE_INTERVAL_SECONDS = 60
+
 ALL_STATUSES = {
     STATUS_ACTIVE,
     STATUS_CANNOT_SEND,
@@ -104,6 +110,35 @@ def _phone_effective_digits(value: str) -> str:
 def _phone_prefix4(value: str) -> str:
     digits = _phone_effective_digits(value)
     return digits[:4] if len(digits) >= 4 else ""
+
+
+def _model_has_prefix_recovery_capacity(model: PhonePoolModel) -> bool:
+    """Whether a row may follow a prefix-level availability decision."""
+    if str(getattr(model, "status", "") or "") == STATUS_DISABLED:
+        return False
+    if not str(getattr(model, "api_url", "") or "").strip():
+        return False
+    max_accounts = max(int(getattr(model, "max_accounts", 0) or 3), 1)
+    return int(getattr(model, "bound_count", 0) or 0) < max_accounts
+
+
+def _model_is_active_prefix_signal(model: PhonePoolModel, *, now: datetime) -> bool:
+    if str(getattr(model, "status", "") or "") != STATUS_ACTIVE:
+        return False
+    if not _model_has_prefix_recovery_capacity(model):
+        return False
+    cooldown = _parse_time(getattr(model, "cooldown_until", ""))
+    return not cooldown or cooldown <= now
+
+
+def _temporary_status_recover_at(model: PhonePoolModel) -> datetime | None:
+    cooldown = _parse_time(getattr(model, "cooldown_until", ""))
+    if cooldown is not None:
+        return cooldown
+    started_at = _parse_time(getattr(model, "last_used_at", "")) or _parse_time(getattr(model, "updated_at", None))
+    if started_at is None:
+        return None
+    return started_at + timedelta(seconds=PHONE_POOL_RATE_LIMIT_RECOVERY_SECONDS)
 
 
 def _split_import_phone_api_line(line: str) -> tuple[str, str, list[str]]:
@@ -566,12 +601,13 @@ def _build_prefix_health(records: list[PhonePoolRecord]) -> dict[str, list[dict[
     }
     for stats in stats_by_prefix.values():
         rejected_count = int(stats.get("rejected_count") or 0)
+        cannot_send_count = int(stats.get("cannot_send_count") or 0)
         available_count = int(stats.get("available_count") or 0)
         total = int(stats.get("total") or 0)
         bind_limit_count = int(stats.get("bind_limit_count") or 0)
         if available_count > 0:
             status = "available"
-        elif rejected_count > 0:
+        elif cannot_send_count > 0:
             status = "unavailable"
         elif total > 0 and bind_limit_count >= total:
             status = "exhausted"
@@ -725,7 +761,7 @@ class PhonePoolRepository:
         rejected_prefix_counts = {
             str(item.get("prefix") or ""): int(item.get("rejected_count") or 0)
             for item in unavailable_prefixes
-            if str(item.get("prefix") or "")
+            if str(item.get("prefix") or "") and int(item.get("rejected_count") or 0) > 0
         }
         prefix_sample_candidate_counts: dict[str, int] = {}
         for record in records:
@@ -745,6 +781,7 @@ class PhonePoolRepository:
                 "count": int(item.get("rejected_count") or 0),
             }
             for item in unavailable_prefixes
+            if int(item.get("rejected_count") or 0) > 0
         ]
         phone_signup_prefix_health = _build_phone_signup_prefix_health()
         phone_signup_available_prefixes = list(phone_signup_prefix_health.get(PREFIX_STATUS_AVAILABLE) or [])
@@ -799,6 +836,7 @@ class PhonePoolRepository:
         }
 
     def list(self, *, status: str = "") -> list[PhonePoolRecord]:
+        self.recover_expired_temporary_statuses()
         with Session(engine) as session:
             stmt = select(PhonePoolModel)
             if status:
@@ -811,6 +849,7 @@ class PhonePoolRepository:
         phone_norm = normalize_phone(phone)
         if not phone_norm:
             return None
+        self.recover_expired_temporary_statuses()
         with Session(engine) as session:
             model = session.exec(
                 select(PhonePoolModel).where(PhonePoolModel.phone_e164 == phone_norm)
@@ -972,6 +1011,170 @@ class PhonePoolRepository:
             session.refresh(model)
             return _to_record(model)
 
+    @staticmethod
+    def _restore_prefix_models(
+        session: Session,
+        *,
+        prefix: str,
+        now: datetime,
+        preserve_phone: str = "",
+    ) -> int:
+        """Restore all capacity-bearing rows in a verified usable prefix."""
+        if not prefix:
+            return 0
+        preserve_phone = normalize_phone(preserve_phone)
+        restored = 0
+        models = session.exec(select(PhonePoolModel).order_by(PhonePoolModel.id)).all()
+        for model in models:
+            if _phone_prefix4(str(model.phone_e164 or "")) != prefix:
+                continue
+            if preserve_phone and str(model.phone_e164 or "") == preserve_phone:
+                continue
+            if not _model_has_prefix_recovery_capacity(model):
+                continue
+            changed = (
+                str(model.status or "") != STATUS_ACTIVE
+                or bool(str(model.cooldown_until or ""))
+                or bool(str(model.last_error_code or ""))
+                or bool(str(model.last_error_message or ""))
+            )
+            if not changed:
+                continue
+            model.status = STATUS_ACTIVE
+            model.cooldown_until = ""
+            model.last_error_code = ""
+            model.last_error_message = ""
+            model.updated_at = now
+            session.add(model)
+            restored += 1
+        return restored
+
+    def restore_prefix_after_success(self, phone: str, *, preserve_phone: bool = False) -> int:
+        """Apply the operator-defined success rule to one phone prefix.
+
+        A successful bind or SMS probe proves this prefix is currently usable.
+        Restore every non-disabled row that still has local binding capacity;
+        rows that are manually disabled or actually full remain untouched.
+        """
+        phone_norm = normalize_phone(phone)
+        prefix = _phone_prefix4(phone_norm)
+        if not prefix:
+            return 0
+        now = _utcnow()
+        with Session(engine) as session:
+            restored = self._restore_prefix_models(
+                session,
+                prefix=prefix,
+                now=now,
+                preserve_phone=phone_norm if preserve_phone else "",
+            )
+            if restored:
+                session.commit()
+        return restored
+
+    def record_prefix_unavailable(
+        self,
+        phone: str,
+        *,
+        error_code: str,
+        reason: str = "",
+    ) -> PhonePoolRecord | None:
+        """Apply a terminal phone failure to every recoverable member of its prefix."""
+        phone_norm = normalize_phone(phone)
+        prefix = _phone_prefix4(phone_norm)
+        error_code = str(error_code or "cannot_send")[:64]
+        if not phone_norm or not prefix:
+            return self.record_failure(
+                phone,
+                status=STATUS_CANNOT_SEND,
+                error_code=error_code,
+                error_message=reason,
+            )
+
+        now = _utcnow()
+        with Session(engine) as session:
+            target = session.exec(
+                select(PhonePoolModel).where(PhonePoolModel.phone_e164 == phone_norm)
+            ).first()
+            if target is None:
+                return None
+
+            target.fail_count = int(target.fail_count or 0) + 1
+            target.last_used_at = _now_text()
+            target.last_error_code = error_code
+            target.last_error_message = str(reason or "")[:500]
+            target.updated_at = now
+            session.add(target)
+
+            models = session.exec(select(PhonePoolModel).order_by(PhonePoolModel.id)).all()
+            for model in models:
+                if _phone_prefix4(str(model.phone_e164 or "")) != prefix:
+                    continue
+                if not _model_has_prefix_recovery_capacity(model):
+                    continue
+                model.status = STATUS_CANNOT_SEND
+                model.cooldown_until = ""
+                model.last_error_code = error_code
+                model.last_error_message = str(reason or "")[:500]
+                model.updated_at = now
+                session.add(model)
+            session.commit()
+            session.refresh(target)
+            return _to_record(target)
+
+    def record_prefix_openai_rejection(self, phone: str, *, reason: str = "") -> PhonePoolRecord | None:
+        """Backward-compatible wrapper for an OpenAI prefix rejection."""
+        return self.record_prefix_unavailable(
+            phone,
+            error_code="openai_rejected",
+            reason=reason,
+        )
+
+    def reconcile_prefix_availability(self) -> dict[str, int]:
+        """Repair legacy rows where an active phone did not restore its prefix."""
+        now = _utcnow()
+        with Session(engine) as session:
+            models = session.exec(select(PhonePoolModel).order_by(PhonePoolModel.id)).all()
+            active_prefixes = {
+                _phone_prefix4(str(model.phone_e164 or ""))
+                for model in models
+                if _model_is_active_prefix_signal(model, now=now)
+            }
+            active_prefixes.discard("")
+            restored = 0
+            restored_prefixes = 0
+            for prefix in sorted(active_prefixes):
+                changed = self._restore_prefix_models(session, prefix=prefix, now=now)
+                if changed:
+                    restored += changed
+                    restored_prefixes += 1
+            if restored:
+                session.commit()
+        return {"prefixes": restored_prefixes, "records": restored}
+
+    def recover_expired_temporary_statuses(self, *, now: datetime | None = None) -> int:
+        """Return expired rate-limited/cooldown phones to the active pool."""
+        now = now or _utcnow()
+        recovered = 0
+        with Session(engine) as session:
+            models = session.exec(
+                select(PhonePoolModel).where(PhonePoolModel.status.in_([STATUS_RATE_LIMITED, STATUS_COOLDOWN]))
+            ).all()
+            for model in models:
+                recover_at = _temporary_status_recover_at(model)
+                if recover_at is not None and recover_at > now:
+                    continue
+                model.status = STATUS_ACTIVE
+                model.cooldown_until = ""
+                model.last_error_code = ""
+                model.last_error_message = ""
+                model.updated_at = now
+                session.add(model)
+                recovered += 1
+            if recovered:
+                session.commit()
+        return recovered
+
     def delete(self, record_id: int) -> bool:
         with Session(engine) as session:
             model = session.get(PhonePoolModel, int(record_id))
@@ -987,6 +1190,7 @@ class PhonePoolRepository:
         号段恢复规则改为“同号段只要有一个自身可用号码，整段恢复可用”，
         所以普通绑定不再因为同 prefix 有历史 rejected 样本而跳过整段。
         """
+        self.recover_expired_temporary_statuses()
         now = _utcnow()
         with Session(engine) as session:
             candidates = session.exec(
@@ -1023,6 +1227,7 @@ class PhonePoolRepository:
         selected = {prefix for prefix in selected if len(prefix) == 4}
         if not selected:
             return []
+        self.recover_expired_temporary_statuses()
         now = _utcnow()
         with Session(engine) as session:
             candidates = session.exec(
@@ -1431,6 +1636,11 @@ class PhonePoolRepository:
                 model.status = STATUS_ACTIVE
             model.updated_at = now
             session.add(model)
+            self._restore_prefix_models(
+                session,
+                prefix=_phone_prefix4(phone_norm),
+                now=now,
+            )
             session.commit()
             session.refresh(model)
             return _to_record(model)
@@ -1514,6 +1724,11 @@ class PhonePoolRepository:
             model.cooldown_until = ""
             model.updated_at = now
             session.add(model)
+            self._restore_prefix_models(
+                session,
+                prefix=_phone_prefix4(phone_norm),
+                now=now,
+            )
             session.commit()
             session.refresh(model)
             return _to_record(model)
@@ -1583,9 +1798,16 @@ class PhonePoolRepository:
         if status == "openai_phone_limit":
             return self.record_failure(phone, status=STATUS_EXHAUSTED, error_code=status, error_message=reason)
         if status == "phone_already_used":
-            return self.record_failure(phone, status=STATUS_EXHAUSTED, error_code=status, error_message=reason)
-        if status in {"api_no_code", "api_error", "openai_rejected"}:
-            return self.record_failure(phone, status=STATUS_CANNOT_SEND, error_code=status, error_message=reason)
+            result = self.record_failure(phone, status=STATUS_EXHAUSTED, error_code=status, error_message=reason)
+            # The current number cannot be reused, but OpenAI accepted the
+            # prefix far enough to report an already-used phone.  Reopen its
+            # capacity-bearing peers without changing this exhausted row.
+            self.restore_prefix_after_success(phone, preserve_phone=True)
+            return self.get(phone) or result
+        if status == "openai_rejected":
+            return self.record_prefix_openai_rejection(phone, reason=reason)
+        if status in {"api_no_code", "api_error"}:
+            return self.record_prefix_unavailable(phone, error_code=status, reason=reason)
         if status == "api_forward_error":
             # Relay/DNS/TLS/registry failures are infrastructure failures, not
             # evidence that the phone or supplier API is unusable.
@@ -1596,7 +1818,13 @@ class PhonePoolRepository:
                 error_message=reason,
             )
         if status == "rate_limited":
-            return self.record_failure(phone, status=STATUS_RATE_LIMITED, error_code=status, error_message=reason, cooldown_seconds=600)
+            return self.record_failure(
+                phone,
+                status=STATUS_RATE_LIMITED,
+                error_code=status,
+                error_message=reason,
+                cooldown_seconds=PHONE_POOL_RATE_LIMIT_RECOVERY_SECONDS,
+            )
         if status in {"account_phone_bound", "not_tested"}:
             return None
         if status in {"browser_error", "account_auth_error", "unknown"}:
@@ -1650,6 +1878,59 @@ class PhonePoolRepository:
                         session.commit()
                         updated += 1
         return {"counted_phones": len(counts), "created": created, "updated": updated}
+
+
+_phone_pool_maintenance_lock = threading.Lock()
+_phone_pool_maintenance_stop_event = threading.Event()
+_phone_pool_maintenance_thread: threading.Thread | None = None
+_phone_pool_maintenance_running = False
+
+
+def _phone_pool_maintenance_loop() -> None:
+    global _phone_pool_maintenance_running
+    while not _phone_pool_maintenance_stop_event.is_set():
+        try:
+            repo = PhonePoolRepository()
+            recovered = repo.recover_expired_temporary_statuses()
+            reconciled = repo.reconcile_prefix_availability()
+            restored = int(reconciled.get("records") or 0)
+            if recovered or restored:
+                print(
+                    "[PhonePoolMaintenance] 状态维护完成: "
+                    f"限流恢复={recovered} 号段恢复={restored}"
+                )
+        except Exception as exc:
+            print(f"[PhonePoolMaintenance] 调度错误: {exc}")
+        _phone_pool_maintenance_stop_event.wait(PHONE_POOL_MAINTENANCE_INTERVAL_SECONDS)
+
+    with _phone_pool_maintenance_lock:
+        _phone_pool_maintenance_running = False
+
+
+def start_phone_pool_maintenance() -> None:
+    """Maintain expiring phone limits and legacy prefix state every minute."""
+    global _phone_pool_maintenance_thread, _phone_pool_maintenance_running
+    with _phone_pool_maintenance_lock:
+        if _phone_pool_maintenance_running:
+            return
+        _phone_pool_maintenance_running = True
+    _phone_pool_maintenance_stop_event.clear()
+    _phone_pool_maintenance_thread = threading.Thread(
+        target=_phone_pool_maintenance_loop,
+        daemon=True,
+        name="phone-pool-maintenance",
+    )
+    _phone_pool_maintenance_thread.start()
+    print("[PhonePoolMaintenance] 已启动")
+
+
+def stop_phone_pool_maintenance() -> None:
+    global _phone_pool_maintenance_thread
+    _phone_pool_maintenance_stop_event.set()
+    thread = _phone_pool_maintenance_thread
+    if thread and thread.is_alive():
+        thread.join(timeout=5)
+    _phone_pool_maintenance_thread = None
 
 
 _expiry_autofill_started = False
