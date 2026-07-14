@@ -862,8 +862,8 @@ CDK-AAAA-1111
             def submit_pix(self, *, pix_cdk, access_token):
                 self.__class__.calls += 1
                 raise BaxiGptRequestError(
-                    f"transport interrupted after submit {pix_cdk}",
-                    request_outcome_unknown=True,
+                    f"upstream unavailable after submit {pix_cdk}",
+                    http_status=502,
                 )
 
         with patch("services.chatgpt_core.baxigpt_client.BaxiGptClient", FakeBaxiClient), \
@@ -885,6 +885,8 @@ CDK-AAAA-1111
             extra = account.get_extra()
         self.assertEqual(extra["baxigpt_cdk"]["status"], "timeout")
         self.assertEqual(extra["idea_submit"]["status"], "timeout")
+        fingerprint = self.pix_usage_store.fingerprint(pix_cdk)
+        self.assertEqual(self.pix_usage_store.states_for([fingerprint])[fingerprint].state, "uncertain")
 
 
 class BaxiGptClientRetryTests(unittest.TestCase):

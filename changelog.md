@@ -4,6 +4,14 @@
 
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，并且本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/) (语义化版本)。
 
+## [2.1.3] - 2026-07-15
+
+### 修复 (Fixed)
+- **PIX 5xx 不再错误释放 CDK**：`api/tasks.py` 将上游 HTTP `5xx` 与传输中断统一归类为提交结果未知，写为待人工复核并保留跨实例占用；此前这类响应可能在上游已受理任务后被误判为明确失败并允许复用。`tests/test_baxigpt_cdk_pool.py` 锁定 502 场景，确认 CDK 状态为 `uncertain`。
+
+### 优化 (Changed)
+- **前端版本同步至 v2.1.3**：`frontend/src/app/AppShell.tsx` 更新侧栏版本，区分已上线的多 CDK 初版和本次失败关闭修复。
+
 ## [2.1.2] - 2026-07-15
 
 ### 新增 (Added)
@@ -1368,4 +1376,8 @@
 
 ## 2026-07-15 03:38:31 +0800
 - 新增 PIX 多 CDK 成功核销锁定
+- 发布模式: multi
+
+## 2026-07-15 03:41:50 +0800
+- 修复 PIX 上游 5xx 错误释放 CDK
 - 发布模式: multi

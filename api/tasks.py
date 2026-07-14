@@ -7123,7 +7123,7 @@ def _run_pix_submit(
                         wait_with_control(submit_interval_seconds, attempt_id)
                 except BaxiGptRequestError as exc:
                     reason = safe_text(exc)
-                    if bool(exc.request_outcome_unknown):
+                    if bool(exc.request_outcome_unknown) or int(getattr(exc, "http_status", 0) or 0) >= 500:
                         timeout_count += 1
                         reason = "PIX 上游提交结果未知，请按账号人工复核；系统未自动重投"
                         errors.append(f"{email or account_id}: {reason}")
