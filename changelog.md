@@ -4,6 +4,24 @@
 
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，并且本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/) (语义化版本)。
 
+## [2.1.1] - 2026-07-15
+
+### 新增 (Added)
+- **账号页 iDEAL / PIX 批量提交切换**：`frontend/src/pages/Accounts.tsx` 在原 iDEAL 批量提交窗口增加支付通道分段选择。PIX 模式按账号范围提交一次性 PIX CDK，复用现有目标成功数、失败继续和任务面板；iDEAL 仍使用原有卡密池、已保存卡密与手工导入流程。任务类型、工具栏、任务弹窗和结果汇总同步显示具体通道，避免将 PIX 当作 iDEAL 卡密订单。
+- **对接 openai-pay-submit PIX 自动提链协议**：`services/chatgpt_core/baxigpt_client.py` 增加 `submit_pix()` 与 `pix_status()`，严格使用 `POST /api/task/submit` 的 `submitMode=pix_auto_extract`、单账号 `accounts` 和 `pixCdk` 请求体，再以 `GET /api/pix/tasks/status?task_id=&status_token=` 轮询上游终态。
+- **PIX 独立异步执行器**：`api/tasks.py` 增加 `enqueue_pix_submit_task()` 与 `_run_pix_submit()`。每个账号只创建一个上游 PIX 任务，已受理任务可并行轮询；确认 paid 后仍以本地 ChatGPT 状态刷新结果作为账号主状态来源，并同步 `account_list_state`，不把上游 paid 直接伪装成订阅已确认。
+
+### 安全 (Security)
+- **PIX CDK 与轮询令牌不落盘**：PIX CDK 只在 API 入队到后台执行器的内存调用栈中传递；任务元数据、TaskLog、运行结果、`extra.baxigpt_cdk`、`extra.idea_submit`、历史字段和浏览器 localStorage 只保留固定 `PIX CDK` 标签及脱敏的任务 ID，绝不保存原始 CDK 或 `status_token`。账号页切换/关闭后不会复用密码字段。
+- **不确定提交结果失败关闭**：网络中断、非 JSON 回应或上游未返回可轮询凭据时，任务和账号提交状态都标记为 `timeout` 待人工复核，不会自动以同一账号/CDK 重投；上游明确的账号资格失败才会写入现有 Idea 不可用标记，网络和临时错误不污染账号可用性。
+
+### 优化 (Changed)
+- **iDEAL 卡密池边界收敛**：导航和 `BaxiGptCdkPool` 页面明确为“iDEAL 卡密池”，PIX 模式隐藏库存、卡密选择、导入和额度告警，也不会调用 `BaxiGptCdkRepository` 或写入 `baxigpt_cdk_pool`。
+- **前端版本同步至 v2.1.1**：`frontend/src/app/AppShell.tsx` 更新侧栏版本，便于确认浏览器已经加载 PIX 提交入口。
+
+### 测试 (Tests)
+- **覆盖 PIX 契约与敏感值边界**：扩展 `tests/test_baxigpt_cdk_pool.py`，验证 PIX 请求体和状态查询路径、每次提交仅携带一个 Access Token、成功后账号状态快照与结果汇总写入 `payment_channel=pix`，以及 PIX CDK、`status_token` 不出现在任务快照、TaskLog 或账号扩展字段；同时验证未知提交结果不会自动重投。
+
 ## [2.1.0] - 2026-07-14
 
 ### 新增 (Added)
@@ -1325,4 +1343,8 @@
 
 ## 2026-07-14 12:37:27 +0800
 - 新增手机号池 API 域名转发 Relay
+- 发布模式: multi
+
+## 2026-07-15 03:10:42 +0800
+- 新增 iDEAL 批量提交 PIX 通道
 - 发布模式: multi

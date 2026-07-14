@@ -283,6 +283,7 @@ function ideaSubmitTag(summary: any) {
   if (status === 'paid') return { color: 'success', label: 'Idea 已开通' }
   if (status === 'submitted' || status === 'processing') return { color: 'processing', label: 'Idea 处理中' }
   if (status === 'failed') return { color: 'warning', label: 'Idea 失败' }
+  if (status === 'timeout') return { color: 'warning', label: 'Idea 待人工复核' }
   return { color: 'default', label: 'Idea 未提交' }
 }
 

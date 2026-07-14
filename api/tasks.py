@@ -1,4 +1,5 @@
 from collections import deque
+from datetime import datetime, timezone
 import hashlib
 import os
 
@@ -24,6 +25,7 @@ from services.account_filters import (
     account_validity,
     build_account_filter_audit,
     resolve_filtered_accounts,
+    upsert_account_list_state_for_account_ids,
 )
 from services.account_rate_limit_recovery import (
     account_rate_limit_payload,
@@ -281,11 +283,22 @@ IDEA_SUBMIT_DEFAULT_POLL_WARNING_SECONDS = 1800
 IDEA_SUBMIT_HARD_POLL_TIMEOUT_SECONDS = 24 * 3600
 
 
+def _normalize_baxigpt_payment_channel(value: Any) -> str:
+    channel = str(value or "ideal").strip().lower()
+    if channel not in {"ideal", "pix"}:
+        raise HTTPException(400, "payment_channel 仅支持 ideal 或 pix")
+    return channel
+
+
 class BaxiGptCdkSubmitTaskRequest(AccountFilterRequestMixin):
     account_ids: list[int] = Field(default_factory=list)
     cdk_ids: list[int] = Field(default_factory=list)
     all_filtered: bool = False
+    payment_channel: str = "ideal"  # ideal | pix
     code_lines: str = ""
+    # PIX CDK only survives in the task-start call stack; it must never enter
+    # task snapshots, logs, account extras, or the iDEAL CDK pool.
+    pix_cdk: str = ""
     use_pool: bool = True
     precheck: bool = True
     failure_continue: bool = True
@@ -3839,11 +3852,167 @@ def enqueue_batch_oaipay_upload_task(
     }
 
 
+def enqueue_pix_submit_task(
+    req: BaxiGptCdkSubmitTaskRequest,
+    *,
+    background_tasks: BackgroundTasks | None = None,
+) -> dict[str, Any]:
+    """Queue PIX auto-extract without using the iDEAL CDK pool.
+
+    ``pix_cdk`` intentionally remains a local value and is passed straight to
+    the background runner.  All persisted task metadata uses only the fixed
+    ``PIX CDK`` label, never the submitted credential or status token.
+    """
+
+    pix_cdk = str(req.pix_cdk or "").strip()
+    if not pix_cdk:
+        raise HTTPException(400, "请输入 PIX CDK")
+    if len(pix_cdk) > 4096:
+        raise HTTPException(400, "PIX CDK 长度超限")
+
+    account_items, missing_ids, skipped_accounts, matched_accounts = _resolve_baxigpt_cdk_submit_accounts(req)
+    total_requested_accounts = len(_normalize_batch_account_ids(req.account_ids)) if req.account_ids else len(matched_accounts)
+    filter_audit = _task_account_filter_audit(
+        req,
+        matched_accounts=matched_accounts,
+        eligible_accounts=account_items,
+        skipped_accounts=skipped_accounts,
+    )
+    requested_target_success_count = max(int(req.target_success_count or 0), 0)
+    pairs = [
+        {
+            "account_id": int(account["account_id"]),
+            "email": str(account.get("email") or ""),
+            "cdk_id": 0,
+            "code_masked": "PIX CDK",
+            "payment_channel": "pix",
+        }
+        for account in account_items
+    ]
+    pair_count = len(pairs)
+    effective_target_success_count = min(requested_target_success_count, pair_count) if requested_target_success_count > 0 else 0
+    if pair_count <= 0:
+        return {
+            "task_id": "",
+            "payment_channel": "pix",
+            "total_requested_accounts": total_requested_accounts,
+            "matched_accounts": len(matched_accounts),
+            "eligible_accounts": len(account_items),
+            "available_codes": 0,
+            "selected_cdk_ids": [],
+            "pairs": [],
+            "pair_count": 0,
+            "target_success_count": requested_target_success_count,
+            "effective_target_success_count": 0,
+            "spare_codes": 0,
+            "skipped_accounts": skipped_accounts,
+            "missing_ids": missing_ids,
+            "cdk_pool_import": {"added": 0, "updated": 0, "skipped": 0, "errors": [], "items": []},
+        }
+
+    task_id = f"task_{int(time.time() * 1000)}"
+    source = "baxigpt_cdk_submit"
+    submit_interval_seconds = max(int(req.submit_interval_seconds or 0), 0)
+    status_poll_interval_seconds = max(int(req.status_poll_interval_seconds or 5), 1)
+    status_poll_timeout_seconds = max(
+        int(req.status_poll_timeout_seconds or IDEA_SUBMIT_DEFAULT_POLL_WARNING_SECONDS),
+        status_poll_interval_seconds,
+        IDEA_SUBMIT_DEFAULT_POLL_WARNING_SECONDS,
+    )
+    meta = {
+        "payment_channel": "pix",
+        "total_requested_accounts": total_requested_accounts,
+        "matched_accounts": len(matched_accounts),
+        "eligible_accounts": len(account_items),
+        "missing_ids": list(missing_ids),
+        "skipped_accounts": list(skipped_accounts),
+        "account_ids": [int(item["account_id"]) for item in account_items],
+        "emails": [str(item["email"] or "") for item in account_items],
+        "available_codes": 0,
+        "selected_cdk_ids": [],
+        "pair_count": pair_count,
+        "target_success_count": requested_target_success_count,
+        "effective_target_success_count": effective_target_success_count,
+        "pairs": list(pairs),
+        "spare_codes": 0,
+        "code_source": "pix",
+        "cdk_pool_import": {"added": 0, "updated": 0, "skipped": 0, "errors": [], "items": []},
+        "filter": _task_filter_meta(req, filter_audit),
+        "filter_audit": filter_audit,
+        "settings": {
+            "payment_channel": "pix",
+            "pix_cdk_configured": True,
+            "failure_continue": bool(req.failure_continue),
+            "submit_interval_seconds": submit_interval_seconds,
+            "auto_poll_status": True,
+            "status_poll_interval_seconds": status_poll_interval_seconds,
+            "status_poll_timeout_seconds": status_poll_timeout_seconds,
+            "target_success_count": effective_target_success_count,
+            "requested_target_success_count": requested_target_success_count,
+        },
+        "runtime_results": [],
+    }
+    _create_standalone_task_record(
+        task_id,
+        platform="chatgpt",
+        source=source,
+        total=max(effective_target_success_count or pair_count, 1),
+        meta=meta,
+    )
+
+    primary_email = str(pairs[0]["email"] or "") if pairs else ""
+    _save_task_log(
+        "chatgpt",
+        primary_email,
+        "running",
+        detail=_build_task_log_detail(
+            task_id,
+            {
+                "email": primary_email,
+                "attempt_outcome": "pix_submit_task_created",
+                "source": source,
+                "meta": meta,
+            },
+        ),
+    )
+
+    if background_tasks is None:
+        thread = threading.Thread(
+            target=_run_pix_submit,
+            args=(task_id, pairs, dict(meta["settings"]), pix_cdk),
+            daemon=True,
+        )
+        thread.start()
+    else:
+        background_tasks.add_task(_run_pix_submit, task_id, pairs, dict(meta["settings"]), pix_cdk)
+
+    return {
+        "task_id": task_id,
+        "payment_channel": "pix",
+        "total_requested_accounts": total_requested_accounts,
+        "matched_accounts": len(matched_accounts),
+        "eligible_accounts": len(account_items),
+        "available_codes": 0,
+        "selected_cdk_ids": [],
+        "pair_count": pair_count,
+        "target_success_count": requested_target_success_count,
+        "effective_target_success_count": effective_target_success_count,
+        "spare_codes": 0,
+        "skipped_accounts": skipped_accounts,
+        "missing_ids": missing_ids,
+        "cdk_pool_import": {"added": 0, "updated": 0, "skipped": 0, "errors": [], "items": []},
+        "pairs": pairs,
+    }
+
+
 def enqueue_baxigpt_cdk_submit_task(
     req: BaxiGptCdkSubmitTaskRequest,
     *,
     background_tasks: BackgroundTasks | None = None,
 ) -> dict[str, Any]:
+    if _normalize_baxigpt_payment_channel(req.payment_channel) == "pix":
+        return enqueue_pix_submit_task(req, background_tasks=background_tasks)
+
     from services.chatgpt_core.baxigpt_cdk_repository import BaxiGptCdkRepository
 
     account_items, missing_ids, skipped_accounts, matched_accounts = _resolve_baxigpt_cdk_submit_accounts(req)
@@ -6276,6 +6445,7 @@ def _build_idea_submit_runtime_summary(
     submitted_count: int = 0,
     target_success_count: int = 0,
     errors: list[str] | None = None,
+    payment_channel: str = "ideal",
 ) -> dict[str, Any]:
     """Build an operator-facing Idea submit summary with stable account groups.
 
@@ -6360,6 +6530,7 @@ def _build_idea_submit_runtime_summary(
 
     return {
         "source": "baxigpt_cdk_submit",
+        "payment_channel": _normalize_baxigpt_payment_channel(payment_channel),
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "total_accounts": total_accounts,
         "pair_count": len(pairs or []),
@@ -6411,6 +6582,656 @@ def _log_idea_submit_group_summary(task_id: str, title: str, items: list[dict[st
         _log(task_id, f"[SUMMARY][{title}] {_idea_submit_log_item_text(item)}")
     if count > limit:
         _log(task_id, f"[SUMMARY][{title}] 还有 {count - limit} 个未在日志展开，可在任务详情 JSON 查看")
+
+
+def _run_pix_submit(
+    task_id: str,
+    pairs: list[dict[str, Any]],
+    settings: dict[str, Any],
+    pix_cdk: str,
+) -> None:
+    """Run PIX auto-extract tasks while keeping the CDK and status tokens in memory.
+
+    The upstream requires one account per PIX request and returns a one-time
+    status token. Persisting that token would make it an account/task secret;
+    losing it after a process restart is preferable to persisting it in any
+    operator-visible store. Unknown submit outcomes are never retried.
+    """
+
+    from services.chatgpt_core.baxigpt_client import BaxiGptClient, BaxiGptRequestError
+
+    control = _task_store.control_for(task_id)
+    client = BaxiGptClient()
+    requested_target_success_count = max(int(settings.get("target_success_count") or 0), 0)
+    target_success_count = min(requested_target_success_count, len(pairs)) if requested_target_success_count > 0 else 0
+    total = max(target_success_count or len(pairs), 1)
+    submitted_count = 0
+    success_count = 0
+    timeout_count = 0
+    skipped_count = 0
+    errors: list[str] = []
+    runtime_results: list[dict[str, Any]] = []
+    primary_email = ""
+    failure_continue = _is_truthy(settings.get("failure_continue"))
+    submit_interval_seconds = max(int(settings.get("submit_interval_seconds") or 0), 0)
+    status_poll_interval_seconds = max(int(settings.get("status_poll_interval_seconds") or 5), 1)
+    status_poll_timeout_seconds = max(
+        int(settings.get("status_poll_timeout_seconds") or IDEA_SUBMIT_DEFAULT_POLL_WARNING_SECONDS),
+        status_poll_interval_seconds,
+        IDEA_SUBMIT_DEFAULT_POLL_WARNING_SECONDS,
+    )
+
+    def safe_text(value: Any, *status_tokens: Any) -> str:
+        text = str(value or "")
+        for secret in (pix_cdk, *status_tokens):
+            secret_text = str(secret or "").strip()
+            if secret_text:
+                text = text.replace(secret_text, "[REDACTED]")
+        return redact_log_text(text)[:1000]
+
+    _task_store.mark_running(task_id)
+    _task_store.set_progress(task_id, f"0/{total}")
+    meta = dict(_task_store.snapshot(task_id).get("meta") or {})
+    missing_ids = list(meta.get("missing_ids") or [])
+    skipped_accounts = list(meta.get("skipped_accounts") or [])
+
+    def sync_meta() -> None:
+        summary = _build_idea_submit_runtime_summary(
+            pairs=pairs,
+            missing_ids=missing_ids,
+            skipped_accounts=skipped_accounts,
+            runtime_results=runtime_results,
+            submitted_count=submitted_count,
+            target_success_count=target_success_count,
+            errors=errors,
+            payment_channel="pix",
+        )
+        _task_store.update_meta(
+            task_id,
+            {
+                "runtime_results": list(runtime_results),
+                "runtime_submitted": submitted_count,
+                "runtime_success": success_count,
+                "runtime_timeout": timeout_count,
+                "runtime_skipped": skipped_count,
+                "runtime_errors": list(errors),
+                "idea_submit_summary": summary,
+            },
+        )
+
+    def append_result(**payload: Any) -> None:
+        safe_payload = {
+            "finished_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            **payload,
+        }
+        if "reason" in safe_payload:
+            safe_payload["reason"] = safe_text(safe_payload.get("reason"))
+        # The runner never includes status_token in a result. Keep this guard
+        # so a later refactor cannot accidentally leak it through task meta.
+        safe_payload.pop("status_token", None)
+        runtime_results.append(safe_payload)
+        sync_meta()
+
+    def persist_account_state(
+        account_id: int,
+        *,
+        status: str,
+        order_id: str = "",
+        display_id: str = "",
+        reason: str = "",
+        mark_unavailable: bool = False,
+        local_status_refresh: dict[str, Any] | None = None,
+    ) -> None:
+        status_value = _normalize_idea_submit_result_status(status)
+        if status_value == "pending":
+            status_value = "submitted"
+        safe_reason = safe_text(reason)
+        now = datetime.now(timezone.utc).isoformat()
+        with Session(engine) as session:
+            account = session.get(AccountModel, int(account_id or 0))
+            if account is None or account.platform != "chatgpt":
+                return
+            try:
+                extra = account.get_extra()
+            except Exception:
+                extra = {}
+            if not isinstance(extra, dict):
+                extra = {}
+            existing = extra.get("baxigpt_cdk") if isinstance(extra.get("baxigpt_cdk"), dict) else {}
+            payload = {
+                "status": status_value,
+                "upstream_status": status_value,
+                "payment_channel": "pix",
+                "code_masked": "PIX CDK",
+                "cdk_id": 0,
+                "order_id": str(order_id or existing.get("order_id") or "").strip(),
+                "display_id": str(display_id or existing.get("display_id") or "").strip(),
+                "remote_email": str(account.email or ""),
+                "task_id": task_id,
+                "submitted_at": str(existing.get("submitted_at") or now),
+                "paid_at": now if status_value == "paid" else str(existing.get("paid_at") or ""),
+                "last_checked_at": now,
+                "last_error_message": safe_reason if safe_reason else "",
+            }
+            if isinstance(local_status_refresh, dict):
+                payload["local_status_refresh"] = dict(local_status_refresh)
+            elif isinstance(existing.get("local_status_refresh"), dict):
+                payload["local_status_refresh"] = dict(existing["local_status_refresh"])
+            extra["baxigpt_cdk"] = payload
+
+            history = extra.get("baxigpt_cdk_history")
+            if not isinstance(history, list):
+                history = []
+            previous = history[-1] if history and isinstance(history[-1], dict) else {}
+            if not history or any(
+                str(previous.get(key) or "") != str(payload.get(key) or "")
+                for key in ("status", "upstream_status", "order_id", "display_id", "last_error_message")
+            ):
+                history.append(dict(payload))
+            extra["baxigpt_cdk_history"] = history[-20:]
+
+            previous_marker = extra.get("idea_submit") if isinstance(extra.get("idea_submit"), dict) else {}
+            marker = {
+                "available": not bool(mark_unavailable),
+                "unavailable": bool(mark_unavailable),
+                "reason": safe_reason if mark_unavailable else "",
+                "marked_at": now if mark_unavailable else "",
+                "cleared_at": now if status_value == "paid" else "",
+                "source": "baxigpt_cdk_submit",
+                "payment_channel": "pix",
+                "cdk_id": 0,
+                "code_masked": "PIX CDK",
+                "task_id": task_id,
+                "order_id": payload["order_id"],
+                "display_id": payload["display_id"],
+                "status": status_value,
+            }
+            if status_value == "paid" and previous_marker.get("reason"):
+                marker["previous_reason"] = safe_text(previous_marker.get("reason"))
+            extra["idea_submit"] = marker
+            if mark_unavailable:
+                extra["chatgpt_account_unavailable"] = True
+                extra["chatgpt_unavailable_reason"] = safe_reason
+                extra["chatgpt_skip_save_account"] = True
+                extra["chatgpt_skip_save_reason"] = safe_reason
+                extra["chatgpt_invalid_registration_failure"] = True
+                extra["chatgpt_invalid_registration_reason"] = safe_reason
+                extra["idea_submit_unavailable"] = True
+                extra["idea_submit_unavailable_reason"] = safe_reason
+                extra["idea_submit_unavailable_at"] = now
+            elif status_value == "paid":
+                for key in ("idea_submit_unavailable", "idea_submit_unavailable_reason", "idea_submit_unavailable_at"):
+                    extra.pop(key, None)
+
+            account.set_extra(extra)
+            account.updated_at = datetime.now(timezone.utc)
+            session.add(account)
+            upsert_account_list_state_for_account_ids(session, [account.id], commit=False)
+            session.commit()
+
+    def refresh_paid_account_local_status(account_id: int, order_id: str, display_id: str) -> dict[str, Any] | None:
+        with Session(engine) as session:
+            account = session.get(AccountModel, int(account_id or 0))
+            if account is None or account.platform != "chatgpt":
+                _log(task_id, f"[PIX][WARN] paid 后本地状态刷新跳过: account_id={account_id} 不存在")
+                return None
+            try:
+                refresh_result = sync_chatgpt_account_local_status(session, account)
+                summary = summarize_status_refresh(refresh_result, trigger="pix_submit_paid")
+            except Exception as exc:
+                summary = {
+                    "trigger": "pix_submit_paid",
+                    "refreshed_at": datetime.now(timezone.utc).isoformat(),
+                    "status": str(getattr(account, "status", "") or ""),
+                    "error": safe_text(exc),
+                }
+            # sync_chatgpt_account_local_status owns a commit; open a fresh
+            # persistence write below so the PIX state remains the newest extra.
+        persist_account_state(
+            account_id,
+            status="paid",
+            order_id=order_id,
+            display_id=display_id,
+            local_status_refresh=summary,
+        )
+        return summary
+
+    def wait_with_control(seconds: int, attempt_id: int) -> None:
+        remaining = float(max(seconds, 0))
+        while remaining > 0:
+            control.checkpoint(attempt_id=attempt_id)
+            chunk = min(1.0, remaining)
+            time.sleep(chunk)
+            remaining -= chunk
+
+    def mark_remaining_unsubmitted(pending_accounts: list[dict[str, Any]], reason: str) -> None:
+        nonlocal skipped_count
+        while pending_accounts:
+            item = pending_accounts.pop(0)
+            skipped_count += 1
+            _log(task_id, f"[UNSUBMITTED][PIX] {item.get('email') or item.get('account_id')} - {reason}")
+            append_result(
+                account_id=item["account_id"],
+                email=item.get("email"),
+                cdk_id=0,
+                code_masked="PIX CDK",
+                payment_channel="pix",
+                status="unsubmitted",
+                reason=reason,
+            )
+
+    _log(
+        task_id,
+        "[PIX] 自动提链任务启动: "
+        f"候选 {len(pairs)} 个，目标成功 {target_success_count or '不限'}，"
+        f"提交间隔 {submit_interval_seconds}s，轮询间隔 {status_poll_interval_seconds}s",
+    )
+    for missing_id in missing_ids:
+        _log(task_id, f"[MISS] 账号不存在: account_id={missing_id}")
+        errors.append(f"account_id={missing_id}: 账号不存在")
+    for item in skipped_accounts:
+        _log(task_id, f"[SKIP] {item.get('email') or item.get('account_id') or '-'} - {item.get('reason') or '已跳过'}")
+
+    pending_accounts = [dict(pair) for pair in pairs]
+    active_orders: list[dict[str, Any]] = []
+    stop_new_submissions = False
+    attempt_id: int | None = None
+    try:
+        attempt_id = control.start_attempt()
+        while pending_accounts or active_orders:
+            control.checkpoint(attempt_id=attempt_id)
+            target_reached = target_success_count > 0 and success_count >= target_success_count
+            if target_reached and pending_accounts:
+                mark_remaining_unsubmitted(
+                    pending_accounts,
+                    f"已达到本次目标成功数量 {target_success_count}，停止继续提交新账号",
+                )
+            if stop_new_submissions and pending_accounts:
+                mark_remaining_unsubmitted(pending_accounts, "失败后继续已关闭，停止后续 PIX 提交")
+
+            # A target count is a submit window: do not create more in-flight
+            # PIX tasks than can still contribute to the target.
+            while pending_accounts and not stop_new_submissions and not target_reached:
+                if target_success_count > 0 and len(active_orders) >= max(target_success_count - success_count, 0):
+                    break
+                control.checkpoint(attempt_id=attempt_id)
+                item = pending_accounts.pop(0)
+                account_id = int(item.get("account_id") or 0)
+                email = str(item.get("email") or "")
+                if not primary_email and email:
+                    primary_email = email
+                with Session(engine) as session:
+                    account = session.get(AccountModel, account_id)
+                    if account is None or account.platform != "chatgpt":
+                        account = None
+                        token = ""
+                        skip_reason = "账号不存在或非 ChatGPT"
+                    else:
+                        skip_reason = _idea_submit_unavailable_reason(account)
+                        token = "" if skip_reason else _chatgpt_account_access_token(account)
+                        if not skip_reason and not token:
+                            skip_reason = "账号缺少 Access Token"
+                if skip_reason:
+                    skipped_count += 1
+                    _log(task_id, f"[UNSUBMITTED][PIX] {email or account_id} - {skip_reason}")
+                    append_result(
+                        account_id=account_id,
+                        email=email,
+                        cdk_id=0,
+                        code_masked="PIX CDK",
+                        payment_channel="pix",
+                        status="unsubmitted",
+                        reason=skip_reason,
+                    )
+                    continue
+
+                _log(task_id, f"[PIX] 提交上游: {email or account_id}")
+                try:
+                    submit_result = client.submit_pix(pix_cdk=pix_cdk, access_token=token)
+                    if not bool(submit_result.get("ok")):
+                        reason = safe_text(submit_result.get("message") or "PIX 上游提交失败")
+                        unknown = bool(submit_result.get("submission_unknown"))
+                        if unknown:
+                            timeout_count += 1
+                            errors.append(f"{email or account_id}: {reason}")
+                            persist_account_state(
+                                account_id,
+                                status="timeout",
+                                reason=reason,
+                            )
+                            _log(task_id, f"[TIMEOUT][PIX] {email or account_id} - {reason}")
+                            append_result(
+                                account_id=account_id,
+                                email=email,
+                                cdk_id=0,
+                                code_masked="PIX CDK",
+                                payment_channel="pix",
+                                status="timeout",
+                                reason=reason,
+                            )
+                        else:
+                            errors.append(f"{email or account_id}: {reason}")
+                            should_mark_unavailable = _is_idea_account_unavailable_reason(reason)
+                            persist_account_state(
+                                account_id,
+                                status="failed",
+                                reason=reason,
+                                mark_unavailable=should_mark_unavailable,
+                            )
+                            _log(task_id, f"[FAIL][PIX] {email or account_id} - {reason}")
+                            append_result(
+                                account_id=account_id,
+                                email=email,
+                                cdk_id=0,
+                                code_masked="PIX CDK",
+                                payment_channel="pix",
+                                status="failed",
+                                reason=reason,
+                                idea_marked_unavailable=should_mark_unavailable,
+                            )
+                        if not failure_continue:
+                            stop_new_submissions = True
+                        continue
+                    submitted_count += 1
+                    order_id = str(submit_result.get("order_id") or submit_result.get("task_id") or "").strip()
+                    display_id = str(submit_result.get("display_id") or order_id).strip()
+                    status_token = str(submit_result.get("status_token") or "").strip()
+                    if not order_id or not status_token:
+                        raise BaxiGptRequestError("PIX 上游未返回完整轮询凭据", request_outcome_unknown=True)
+                    persist_account_state(
+                        account_id,
+                        status="submitted",
+                        order_id=order_id,
+                        display_id=display_id,
+                    )
+                    append_result(
+                        account_id=account_id,
+                        email=email,
+                        cdk_id=0,
+                        code_masked="PIX CDK",
+                        payment_channel="pix",
+                        status="submitted",
+                        order_id=order_id,
+                        display_id=display_id,
+                    )
+                    active_orders.append(
+                        {
+                            "account_id": account_id,
+                            "email": email,
+                            "order_id": order_id,
+                            "display_id": display_id,
+                            "status_token": status_token,
+                            "submitted_at": time.time(),
+                            "timeout_warned": False,
+                        }
+                    )
+                    _log(task_id, f"[PIX] 上游已受理: {email or account_id} task={display_id}")
+                    if pending_accounts and submit_interval_seconds > 0:
+                        wait_with_control(submit_interval_seconds, attempt_id)
+                except BaxiGptRequestError as exc:
+                    reason = safe_text(exc)
+                    if bool(exc.request_outcome_unknown):
+                        timeout_count += 1
+                        reason = "PIX 上游提交结果未知，请按账号人工复核；系统未自动重投"
+                        errors.append(f"{email or account_id}: {reason}")
+                        persist_account_state(
+                            account_id,
+                            status="timeout",
+                            reason=reason,
+                        )
+                        _log(task_id, f"[TIMEOUT][PIX] {email or account_id} - {reason}")
+                        append_result(
+                            account_id=account_id,
+                            email=email,
+                            cdk_id=0,
+                            code_masked="PIX CDK",
+                            payment_channel="pix",
+                            status="timeout",
+                            reason=reason,
+                        )
+                    else:
+                        errors.append(f"{email or account_id}: {reason}")
+                        should_mark_unavailable = _is_idea_account_unavailable_reason(reason)
+                        persist_account_state(
+                            account_id,
+                            status="failed",
+                            reason=reason,
+                            mark_unavailable=should_mark_unavailable,
+                        )
+                        _log(task_id, f"[FAIL][PIX] {email or account_id} - {reason}")
+                        append_result(
+                            account_id=account_id,
+                            email=email,
+                            cdk_id=0,
+                            code_masked="PIX CDK",
+                            payment_channel="pix",
+                            status="failed",
+                            reason=reason,
+                            idea_marked_unavailable=should_mark_unavailable,
+                        )
+                    if not failure_continue:
+                        stop_new_submissions = True
+                except Exception as exc:
+                    reason = safe_text(exc or "PIX 提交失败")
+                    errors.append(f"{email or account_id}: {reason}")
+                    should_mark_unavailable = _is_idea_account_unavailable_reason(reason)
+                    persist_account_state(
+                        account_id,
+                        status="failed",
+                        reason=reason,
+                        mark_unavailable=should_mark_unavailable,
+                    )
+                    _log(task_id, f"[FAIL][PIX] {email or account_id} - {reason}")
+                    append_result(
+                        account_id=account_id,
+                        email=email,
+                        cdk_id=0,
+                        code_masked="PIX CDK",
+                        payment_channel="pix",
+                        status="failed",
+                        reason=reason,
+                        idea_marked_unavailable=should_mark_unavailable,
+                    )
+                    if not failure_continue:
+                        stop_new_submissions = True
+
+            if not active_orders:
+                continue
+            _log(task_id, f"[PIX] 等待上游处理结果: 当前轮询 {len(active_orders)} 个任务")
+            wait_with_control(status_poll_interval_seconds, attempt_id)
+            still_active: list[dict[str, Any]] = []
+            for order in active_orders:
+                control.checkpoint(attempt_id=attempt_id)
+                account_id = int(order["account_id"])
+                email = str(order.get("email") or "")
+                order_id = str(order["order_id"])
+                display_id = str(order.get("display_id") or order_id)
+                status_token = str(order["status_token"])
+                try:
+                    status_result = client.pix_status(task_id=order_id, status_token=status_token)
+                except BaxiGptRequestError as exc:
+                    _log(task_id, f"[WAIT][PIX] {email or account_id} 状态查询异常，继续等待: {safe_text(exc, status_token)}")
+                    still_active.append(order)
+                    continue
+                if not bool(status_result.get("ok")):
+                    still_active.append(order)
+                    continue
+                status_value = _normalize_idea_submit_result_status(status_result.get("status"))
+                reason = safe_text(status_result.get("message"), status_token)
+                if status_value == "paid":
+                    success_count += 1
+                    local_status_summary = refresh_paid_account_local_status(account_id, order_id, display_id)
+                    _log(task_id, f"[OK][PIX] 开通成功: {email or account_id} task={display_id}")
+                    append_result(
+                        account_id=account_id,
+                        email=email,
+                        cdk_id=0,
+                        code_masked="PIX CDK",
+                        payment_channel="pix",
+                        status="paid",
+                        order_id=order_id,
+                        display_id=display_id,
+                        local_status_refresh=local_status_summary,
+                    )
+                elif status_value == "failed":
+                    reason = reason or "PIX 上游处理失败"
+                    errors.append(f"{email or account_id}: {reason}")
+                    should_mark_unavailable = _is_idea_account_unavailable_reason(reason)
+                    persist_account_state(
+                        account_id,
+                        status="failed",
+                        order_id=order_id,
+                        display_id=display_id,
+                        reason=reason,
+                        mark_unavailable=should_mark_unavailable,
+                    )
+                    _log(task_id, f"[FAIL][PIX] {email or account_id} - {reason}")
+                    append_result(
+                        account_id=account_id,
+                        email=email,
+                        cdk_id=0,
+                        code_masked="PIX CDK",
+                        payment_channel="pix",
+                        status="failed",
+                        order_id=order_id,
+                        display_id=display_id,
+                        reason=reason,
+                        idea_marked_unavailable=should_mark_unavailable,
+                    )
+                    if not failure_continue:
+                        stop_new_submissions = True
+                elif time.time() - float(order["submitted_at"]) > IDEA_SUBMIT_HARD_POLL_TIMEOUT_SECONDS:
+                    timeout_count += 1
+                    reason = "超过 24 小时仍未返回终态，请按上游任务 ID 人工复核"
+                    errors.append(f"{email or account_id}: {reason}")
+                    persist_account_state(
+                        account_id,
+                        status="timeout",
+                        order_id=order_id,
+                        display_id=display_id,
+                        reason=reason,
+                    )
+                    _log(task_id, f"[TIMEOUT][PIX] {email or account_id} task={display_id}")
+                    append_result(
+                        account_id=account_id,
+                        email=email,
+                        cdk_id=0,
+                        code_masked="PIX CDK",
+                        payment_channel="pix",
+                        status="timeout",
+                        order_id=order_id,
+                        display_id=display_id,
+                        reason=reason,
+                    )
+                else:
+                    if time.time() - float(order["submitted_at"]) > status_poll_timeout_seconds and not order.get("timeout_warned"):
+                        order["timeout_warned"] = True
+                        _log(
+                            task_id,
+                            f"[WAIT][PIX] {email or account_id} task={display_id} 已等待 {status_poll_timeout_seconds}s，继续轮询",
+                        )
+                    still_active.append(order)
+            active_orders = still_active
+            _task_store.set_progress(task_id, f"{success_count}/{total}")
+
+        sync_meta()
+        latest_meta = dict(_task_store.snapshot(task_id).get("meta") or {})
+        summary = latest_meta.get("idea_submit_summary") if isinstance(latest_meta.get("idea_submit_summary"), dict) else {}
+        success_accounts = list(summary.get("success_accounts") or [])
+        failed_accounts = list(summary.get("failed_accounts") or [])
+        timeout_accounts = list(summary.get("timeout_accounts") or [])
+        unsubmitted_accounts = list(summary.get("unsubmitted_accounts") or [])
+        summary_message = (
+            "PIX 提交完成: "
+            f"候选 {summary.get('total_accounts', len(pairs))} 个，上游已受理 {submitted_count} 个，"
+            f"开通成功 {len(success_accounts)} 个，失败 {len(failed_accounts)} 个，"
+            f"超时 {len(timeout_accounts)} 个，未提交 {len(unsubmitted_accounts)} 个"
+        )
+        if failed_accounts:
+            summary_message = f"{summary_message}；首个失败: {_idea_submit_log_item_text(failed_accounts[0])}"
+        elif timeout_accounts:
+            summary_message = f"{summary_message}；存在需人工复核的账号"
+        _log(task_id, f"[SUMMARY] {summary_message}")
+        _log_idea_submit_group_summary(task_id, "成功账号", success_accounts)
+        _log_idea_submit_group_summary(task_id, "失败账号", failed_accounts)
+        _log_idea_submit_group_summary(task_id, "超时账号", timeout_accounts)
+        _log_idea_submit_group_summary(task_id, "未提交账号", unsubmitted_accounts)
+
+        failed_total = int(summary.get("failed") or 0)
+        timeout_total = int(summary.get("timeout") or 0)
+        unsubmitted_total = int(summary.get("unsubmitted") or 0)
+        log_status = "success" if success_count > 0 and not errors and failed_total == 0 and timeout_total == 0 else "failed"
+        finish_error = "" if log_status == "success" else summary_message
+        _task_store.finish(
+            task_id,
+            status="done" if log_status == "success" else "failed",
+            success=success_count,
+            skipped=unsubmitted_total,
+            errors=errors,
+            error=finish_error,
+        )
+        _save_task_log(
+            "chatgpt",
+            primary_email,
+            log_status,
+            error=finish_error,
+            detail=_build_task_log_detail(
+                task_id,
+                {
+                    "email": primary_email,
+                    "attempt_outcome": "pix_submit_success" if log_status == "success" else "pix_submit_failed",
+                    "source": "baxigpt_cdk_submit",
+                    "meta": dict(_task_store.snapshot(task_id).get("meta") or {}),
+                    "runtime_results": list(runtime_results),
+                    "idea_submit_summary": summary,
+                },
+            ),
+        )
+    except StopTaskRequested as exc:
+        _log(task_id, f"[STOP][PIX] {exc}")
+        sync_meta()
+        _task_store.finish(
+            task_id,
+            status="stopped",
+            success=success_count,
+            skipped=skipped_count,
+            errors=errors,
+            error=str(exc),
+        )
+    except Exception as exc:
+        error_text = safe_text(exc or "PIX 提交任务异常")
+        errors.append(error_text)
+        _log(task_id, f"[FAIL][PIX] 任务异常: {error_text}")
+        sync_meta()
+        _task_store.finish(
+            task_id,
+            status="failed",
+            success=success_count,
+            skipped=skipped_count,
+            errors=errors,
+            error=error_text,
+        )
+        _save_task_log(
+            "chatgpt",
+            primary_email,
+            "failed",
+            error=error_text,
+            detail=_build_task_log_detail(
+                task_id,
+                {
+                    "email": primary_email,
+                    "attempt_outcome": "pix_submit_failed",
+                    "source": "baxigpt_cdk_submit",
+                    "meta": dict(_task_store.snapshot(task_id).get("meta") or {}),
+                    "runtime_results": list(runtime_results),
+                },
+            ),
+        )
+    finally:
+        if attempt_id is not None:
+            control.finish_attempt(attempt_id)
+        _clear_task_current(task_id)
+        _task_store.cleanup()
 
 
 def _run_baxigpt_cdk_submit(task_id: str, pairs: list[dict[str, Any]], settings: dict[str, Any]):

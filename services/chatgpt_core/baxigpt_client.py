@@ -15,7 +15,13 @@ DEFAULT_WORKER_TOKEN = os.environ.get("OAIPAY_WORKER_TOKEN", "xucanyang")
 
 
 class BaxiGptRequestError(RuntimeError):
-    pass
+    """Upstream request failure with submit-retry safety information."""
+
+    def __init__(self, message: str, *, request_outcome_unknown: bool = False):
+        super().__init__(message)
+        # A transport failure can happen after the upstream has accepted a PIX
+        # task. Callers must not submit the same account/CDK pair again.
+        self.request_outcome_unknown = bool(request_outcome_unknown)
 
 
 def _email_from_jwt(token: str) -> str:
@@ -66,6 +72,15 @@ def _normalize_task_status(value: Any) -> str:
     if raw in {"pending", "processing", "submitted", "extracting", "wait_scan", "verifying", "wait-scan"}:
         return "processing"
     return raw or "processing"
+
+
+def _redact_sensitive_text(value: Any, *secrets: Any) -> str:
+    text = str(value or "")
+    for secret in secrets:
+        raw = str(secret or "").strip()
+        if raw:
+            text = text.replace(raw, "[REDACTED]")
+    return text
 
 
 class BaxiGptClient:
@@ -131,7 +146,10 @@ class BaxiGptClient:
                 if attempt < attempts:
                     self._sleep_before_retry(attempt)
                     continue
-                raise BaxiGptRequestError(f"请求上游失败: {exc}") from exc
+                raise BaxiGptRequestError(
+                    f"请求上游失败: {exc}",
+                    request_outcome_unknown=True,
+                ) from exc
 
             if response.status_code >= 400:
                 text = str(getattr(response, "text", "") or "")[:500]
@@ -150,18 +168,27 @@ class BaxiGptClient:
                 if attempt < attempts:
                     self._sleep_before_retry(attempt)
                     continue
-                raise BaxiGptRequestError(f"上游响应不是 JSON: {text}") from exc
+                raise BaxiGptRequestError(
+                    f"上游响应不是 JSON: {text}",
+                    request_outcome_unknown=True,
+                ) from exc
             
             if not isinstance(data, dict):
                 last_error = BaxiGptRequestError("上游响应不是对象")
                 if attempt < attempts:
                     self._sleep_before_retry(attempt)
                     continue
-                raise last_error
+                raise BaxiGptRequestError(
+                    str(last_error),
+                    request_outcome_unknown=True,
+                )
             return data
         
         if last_error is not None:
-            raise BaxiGptRequestError(str(last_error)) from last_error
+            raise BaxiGptRequestError(
+                str(last_error),
+                request_outcome_unknown=bool(getattr(last_error, "request_outcome_unknown", False)),
+            ) from last_error
         raise BaxiGptRequestError("请求上游失败")
 
     def code_info(self, code: str) -> dict[str, Any]:
@@ -297,6 +324,110 @@ class BaxiGptClient:
                 }
                 
         return {"ok": False, "status": "processing", "message": "Task not found in status list yet"}
+
+    def submit_pix(self, *, pix_cdk: str, access_token: str) -> dict[str, Any]:
+        """Create exactly one PIX auto-extract task.
+
+        The PIX endpoint returns a one-time ``status_token``. It is deliberately
+        returned only to the in-process caller; this client never emits a raw
+        response that could accidentally persist the token or PIX CDK.
+        """
+
+        cdk = str(pix_cdk or "").strip()
+        token = str(access_token or "").strip()
+        if not cdk:
+            return {"ok": False, "status": "failed", "message": "PIX CDK 不能为空"}
+        if not token:
+            return {"ok": False, "status": "failed", "message": "账号缺少 Access Token"}
+
+        payload = {
+            "submitMode": "pix_auto_extract",
+            "pixCdk": cdk,
+            "accounts": [token],
+        }
+        try:
+            res = self._request(
+                "POST",
+                "/api/task/submit",
+                payload=payload,
+                timeout=self.submit_timeout,
+                retries=self.submit_retries,
+            )
+        except BaxiGptRequestError as exc:
+            raise BaxiGptRequestError(
+                _redact_sensitive_text(exc, cdk),
+                request_outcome_unknown=exc.request_outcome_unknown,
+            ) from exc
+
+        created_tasks = [
+            item
+            for item in (
+                res.get("created_tasks")
+                if isinstance(res.get("created_tasks"), list)
+                else res.get("tasks")
+                if isinstance(res.get("tasks"), list)
+                else []
+            )
+            if isinstance(item, dict)
+        ]
+        task = created_tasks[0] if created_tasks else {}
+        task_id = str(task.get("task_id") or task.get("id") or "").strip()
+        status_token = str(task.get("status_token") or task.get("statusToken") or "").strip()
+        if not task_id or not status_token:
+            # A response without the polling credential may still have created
+            # the task. Never retry the same account/CDK automatically.
+            return {
+                "ok": False,
+                "status": "unresolved",
+                "message": "PIX 上游已响应但未返回可轮询任务凭据，请人工复核",
+                "submission_unknown": True,
+            }
+        return {
+            "ok": True,
+            "status": _normalize_task_status(task.get("status")),
+            "order_id": task_id,
+            "display_id": task_id,
+            "task_id": task_id,
+            "status_token": status_token,
+        }
+
+    def pix_status(self, *, task_id: str, status_token: str) -> dict[str, Any]:
+        """Poll a PIX task without exposing its one-time status credential."""
+
+        task_id_value = str(task_id or "").strip()
+        token = str(status_token or "").strip()
+        if not task_id_value or not token:
+            return {"ok": False, "status": "failed", "message": "PIX 轮询凭据不完整"}
+        try:
+            res = self._request(
+                "GET",
+                "/api/pix/tasks/status",
+                params={"task_id": task_id_value, "status_token": token},
+            )
+        except BaxiGptRequestError as exc:
+            raise BaxiGptRequestError(
+                _redact_sensitive_text(exc, token),
+                request_outcome_unknown=exc.request_outcome_unknown,
+            ) from exc
+
+        tasks = res.get("tasks") if isinstance(res.get("tasks"), list) else []
+        task = next(
+            (
+                item for item in tasks
+                if isinstance(item, dict)
+                and str(item.get("task_id") or item.get("id") or "").strip() == task_id_value
+            ),
+            None,
+        )
+        if not isinstance(task, dict):
+            return {"ok": False, "status": "processing", "message": "PIX 任务暂未返回状态"}
+        return {
+            "ok": True,
+            "status": _normalize_task_status(task.get("status")),
+            "display_id": str(task.get("task_id") or task.get("id") or task_id_value),
+            "email": str(task.get("email") or task.get("account") or ""),
+            "message": _redact_sensitive_text(_task_message(task), token),
+        }
 
     def query(self, code: str) -> dict[str, Any]:
         res = self._request("GET", "/api/task/status", params={"cdk": str(code or "")})

@@ -136,7 +136,7 @@ const ACCOUNT_TOOLBAR_ACTION_OPTIONS: Array<{ value: AccountToolbarActionId; tex
   { value: 'invalidRecheck', text: '批量失效测活' },
   { value: 'phoneBindingTest', text: '手机号绑定' },
   { value: 'paypalBinding', text: 'PayPal绑定' },
-  { value: 'baxiCdkSubmit', text: 'idea批量提交' },
+  { value: 'baxiCdkSubmit', text: 'iDEAL / PIX 批量提交' },
   { value: 'gopay', text: '批量 GoPay' },
 ]
 
@@ -190,6 +190,7 @@ const DEFAULT_PHONE_BINDING_SETTINGS = {
 }
 
 const DEFAULT_BAXIGPT_CDK_SETTINGS = {
+  payment_channel: 'ideal',
   use_pool: true,
   precheck: true,
   failure_continue: true,
@@ -510,6 +511,7 @@ const IDEA_SUBMIT_FILTER_OPTIONS = [
   { value: 'submitting', text: '提交中' },
   { value: 'paid', text: '已开通' },
   { value: 'failed', text: '提交失败' },
+  { value: 'timeout', text: '待人工复核' },
 ]
 
 const IDEA_SUBMIT_FILTER_VALUE_ALIASES: Record<string, string> = {
@@ -522,6 +524,8 @@ const IDEA_SUBMIT_FILTER_VALUE_ALIASES: Record<string, string> = {
   polling: 'submitting',
   success: 'paid',
   completed: 'paid',
+  manual_review: 'timeout',
+  unknown_submit: 'timeout',
   fail: 'failed',
   error: 'failed',
 }
@@ -1058,6 +1062,7 @@ function savePhoneBindingSettings(values: Record<string, unknown>) {
 function normalizeBaxiGptCdkSettings(value: unknown): BaxiGptCdkSettings {
   const raw = value && typeof value === 'object' ? value as Record<string, unknown> : {}
   return {
+    payment_channel: raw.payment_channel === 'pix' ? 'pix' : 'ideal',
     use_pool: raw.use_pool === undefined ? DEFAULT_BAXIGPT_CDK_SETTINGS.use_pool : Boolean(raw.use_pool),
     precheck: raw.precheck === undefined ? DEFAULT_BAXIGPT_CDK_SETTINGS.precheck : Boolean(raw.precheck),
     failure_continue: raw.failure_continue === undefined ? DEFAULT_BAXIGPT_CDK_SETTINGS.failure_continue : Boolean(raw.failure_continue),
@@ -1999,6 +2004,7 @@ function ideaSubmitMeta(record: any) {
   if (status === 'paid') return { color: 'success', label: '已开通', reason: '' }
   if (status === 'submitted' || status === 'processing') return { color: 'processing', label: '提交中', reason: '' }
   if (status === 'failed') return { color: 'warning', label: '提交失败', reason: String(summary?.reason || '').trim() }
+  if (status === 'timeout') return { color: 'warning', label: '待人工复核', reason: String(summary?.reason || '').trim() }
   return { color: 'default', label: '未提交', reason: '' }
 }
 
@@ -2190,6 +2196,7 @@ export default function Accounts() {
   const baxiCdkCodeLinesValue = Form.useWatch('code_lines', baxiCdkSubmitForm)
   const baxiCdkSelectedIdsValue = Form.useWatch('cdk_ids', baxiCdkSubmitForm)
   const baxiCdkTargetSuccessValue = Form.useWatch('target_success_count', baxiCdkSubmitForm)
+  const baxiPaymentChannelValue = Form.useWatch('payment_channel', baxiCdkSubmitForm)
   const [registerMailProvider, setRegisterMailProvider] = useState('luckmail')
   const [configCache, setConfigCache] = useState<Record<string, any> | null>(null)
   const { mode: chatgptRegistrationMode, setMode: setChatgptRegistrationMode } =
@@ -3900,6 +3907,7 @@ export default function Accounts() {
       scope,
       ...savedSettings,
       code_lines: '',
+      pix_cdk: '',
       cdk_ids: [],
       target_success_count: 0,
     })
@@ -3951,40 +3959,54 @@ export default function Accounts() {
     try {
       values = await baxiCdkSubmitForm.validateFields()
     } catch (e) {
-      console.error('Validation failed:', e)
+      // Validation details can contain the transient PIX CDK field. Do not
+      // forward the form object into browser devtools/local diagnostics.
+      console.error('Baxi submit validation failed')
       message.error('表单参数有误，请检查（展开高级参数查看详细错误）')
       return
     }
     saveBaxiGptCdkSettings(values)
     const scope = (values.scope === 'filtered' ? 'filtered' : 'selected') as 'selected' | 'filtered'
+    const paymentChannel = values.payment_channel === 'pix' ? 'pix' : 'ideal'
+    const pixCdk = String(values.pix_cdk || '').trim()
     const codeLines = String(values.code_lines || '').trim()
-    const usePool = !codeLines && Boolean(values.use_pool)
+    const usePool = paymentChannel === 'ideal' && !codeLines && Boolean(values.use_pool)
     const selectedCdkIds = normalizeBaxiCdkIdList(values.cdk_ids)
-    if (!usePool && !codeLines) {
+    if (paymentChannel === 'pix' && !pixCdk) {
+      message.warning('请输入 PIX CDK')
+      return
+    }
+    if (paymentChannel === 'ideal' && !usePool && !codeLines) {
       message.warning('请粘贴卡密，或启用卡密池')
       return
     }
     const body: Record<string, unknown> = {
-      code_lines: codeLines,
-      use_pool: usePool,
-      precheck: Boolean(values.precheck),
+      payment_channel: paymentChannel,
       failure_continue: Boolean(values.failure_continue),
       submit_interval_seconds: Number(values.submit_interval_seconds || 0),
-      auto_poll_status: values.auto_poll_status !== false,
       status_poll_interval_seconds: Number(values.status_poll_interval_seconds || 5),
       status_poll_timeout_seconds: Number(values.status_poll_timeout_seconds || 1800),
       target_success_count: Math.max(Number(values.target_success_count || 0), 0),
     }
-    if (usePool && selectedCdkIds.length > 0) body.cdk_ids = selectedCdkIds
+    if (paymentChannel === 'pix') {
+      body.pix_cdk = pixCdk
+      body.auto_poll_status = true
+    } else {
+      body.code_lines = codeLines
+      body.use_pool = usePool
+      body.precheck = Boolean(values.precheck)
+      body.auto_poll_status = values.auto_poll_status !== false
+      if (usePool && selectedCdkIds.length > 0) body.cdk_ids = selectedCdkIds
+    }
     const requestedAccounts = applyAccountTaskScopeToBody(body, {
       scope,
-      emptySelectedMessage: '请先选择用于 idea批量提交的账号，或切换为当前筛选范围',
+      emptySelectedMessage: '请先选择用于 iDEAL / PIX 批量提交的账号，或切换为当前筛选范围',
     })
     if (requestedAccounts === null) return
 
     const toastKey = `baxigpt-cdk-submit:${scope}`
     setBaxiCdkSubmitLoading(true)
-    message.loading({ content: 'idea批量提交任务创建中...', key: toastKey, duration: 0 })
+    message.loading({ content: `${paymentChannel === 'pix' ? 'PIX' : 'iDEAL'} 批量提交任务创建中...`, key: toastKey, duration: 0 })
     try {
       const res = await postAccountScopeRequest('/tasks/chatgpt/baxigpt-cdk-submit', body, toastKey)
       if (!res) return
@@ -3999,35 +4021,49 @@ export default function Accounts() {
 
       if (!taskIdFromResponse) {
         message.info({
-          content: `没有可提交的卡密/账号配对。请求 ${requestedAccounts} 个账号，可用卡密 ${availableCodes} 个`,
+          content: paymentChannel === 'pix'
+            ? `没有可提交的 PIX 账号。请求 ${requestedAccounts} 个账号。`
+            : `没有可提交的卡密/账号配对。请求 ${requestedAccounts} 个账号，可用卡密 ${availableCodes} 个`,
           key: toastKey,
         })
         if (res && typeof res === 'object') {
-          showBatchActionResult('idea批量提交结果', res)
+          showBatchActionResult(`${paymentChannel === 'pix' ? 'PIX' : 'iDEAL'} 批量提交结果`, res)
         }
-        await loadBaxiCdkPoolSummary()
+        if (paymentChannel === 'ideal') await loadBaxiCdkPoolSummary()
         return
       }
 
       const snapshot = await apiFetch(`/tasks/${taskIdFromResponse}`)
       setBaxiCdkSubmitOpen(false)
       setTaskModalMode('baxigpt_cdk')
-      setTaskModalAccount({ email: targetSuccess > 0 ? `idea批量提交：目标成功 ${targetSuccess} / 候选 ${pairCount}` : `idea批量提交：${pairCount} 对 / 库存余 ${spareCodes}` })
+      setTaskModalAccount({
+        email: targetSuccess > 0
+          ? `${paymentChannel === 'pix' ? 'PIX' : 'iDEAL'} 批量提交：目标成功 ${targetSuccess} / 候选 ${pairCount}`
+          : paymentChannel === 'pix'
+            ? `PIX 批量提交：${pairCount} 个候选账号`
+            : `iDEAL 批量提交：${pairCount} 对 / 库存余 ${spareCodes}`,
+      })
       setTaskId(taskIdFromResponse)
       setTaskSnapshot(snapshot)
       setRegisterModalOpen(true)
       setActiveTasksPanelOpen(true)
       void activeTasksQuery.refetch()
-      void loadBaxiCdkPoolSummary()
+      if (paymentChannel === 'ideal') void loadBaxiCdkPoolSummary()
       message.success({
-        content: `idea批量提交已启动：${pairCount} 个候选配对${targetSuccess > 0 ? `，目标成功 ${targetSuccess} 个` : ''}，候选账号 ${eligible} 个，可用卡密 ${availableCodes} 个${spareCodes > 0 ? `，剩余入库 ${spareCodes} 个` : ''}${importErrors.length > 0 ? `，解析跳过 ${importErrors.length} 行` : ''}`,
+        content: paymentChannel === 'pix'
+          ? `PIX 批量提交已启动：${pairCount} 个候选账号${targetSuccess > 0 ? `，目标成功 ${targetSuccess} 个` : ''}，账号将逐个提交并集中轮询。`
+          : `iDEAL 批量提交已启动：${pairCount} 个候选配对${targetSuccess > 0 ? `，目标成功 ${targetSuccess} 个` : ''}，候选账号 ${eligible} 个，可用卡密 ${availableCodes} 个${spareCodes > 0 ? `，剩余入库 ${spareCodes} 个` : ''}${importErrors.length > 0 ? `，解析跳过 ${importErrors.length} 行` : ''}`,
         key: toastKey,
       })
-      if (importErrors.length > 0) {
+      if (paymentChannel === 'ideal' && importErrors.length > 0) {
         showBatchActionResult('卡密解析结果', { items: importErrors, total: importErrors.length })
       }
     } catch (e: any) {
-      message.error({ content: `idea批量提交失败: ${e.message}`, key: toastKey })
+      const rawError = String(e?.message || '请求失败')
+      const safeError = paymentChannel === 'pix' && pixCdk
+        ? rawError.split(pixCdk).join('[REDACTED]')
+        : rawError
+      message.error({ content: `${paymentChannel === 'pix' ? 'PIX' : 'iDEAL'} 批量提交失败: ${safeError}`, key: toastKey })
     } finally {
       setBaxiCdkSubmitLoading(false)
     }
@@ -7023,8 +7059,9 @@ export default function Accounts() {
     && (phoneBindingPrefixBindEnabled
       ? phoneBindingSelectedPrefixes.length > 0 && phoneBindingLimitedCapacity > 0 && phoneBindingLimitedCapacity < phoneBindingTargetCount
       : phoneBindingSummaryRemaining > 0 && phoneBindingSummaryRemaining < phoneBindingTargetCount)
-  const baxiCdkManualText = String(baxiCdkCodeLinesValue || '').trim()
-  const baxiCdkUsePool = !baxiCdkManualText && baxiCdkUsePoolValue !== false
+  const baxiIsPix = baxiPaymentChannelValue === 'pix'
+  const baxiCdkManualText = baxiIsPix ? '' : String(baxiCdkCodeLinesValue || '').trim()
+  const baxiCdkUsePool = !baxiIsPix && !baxiCdkManualText && baxiCdkUsePoolValue !== false
   const baxiCdkShowManualInput = baxiCdkManualOpen || Boolean(baxiCdkManualText) || !baxiCdkUsePool
   const baxiCdkSummary = baxiCdkPoolSummary || {}
   const baxiCdkTargetCount = baxiCdkSubmitScope === 'selected' ? selectedRowKeys.length : total
@@ -8352,7 +8389,7 @@ export default function Accounts() {
       </Modal>
 
       <Modal
-        title="idea批量提交"
+        title="iDEAL / PIX 批量提交"
         open={baxiCdkSubmitOpen}
         onCancel={() => setBaxiCdkSubmitOpen(false)}
         onOk={submitBaxiCdkSubmit}
@@ -8376,7 +8413,9 @@ export default function Accounts() {
                 ? `范围：当前选中 ${selectedRowKeys.length} 个账号`
                 : `范围：当前筛选结果 ${total} 个账号`
             }
-            description="提交成功指上游 /api/submit 返回 ok 和 order_id；不会阻塞等待 paid，默认会把订单加入后台轮询，查到状态后同步卡密池和绑定账号。"
+            description={baxiIsPix
+              ? 'PIX 按账号逐个提交到上游并集中轮询；PIX CDK 仅用于本次任务，不写入卡密池或账号记录。'
+              : 'iDEAL 提交成功指上游 /api/submit 返回 ok 和 order_id；不会阻塞等待 paid，默认会把订单加入后台轮询，查到状态后同步卡密池和绑定账号。'}
           />
           <div
             style={{
@@ -8412,6 +8451,48 @@ export default function Accounts() {
             </Form.Item>
           </div>
 
+          <Form.Item name="payment_channel" label="支付通道" style={{ marginBottom: 12 }}>
+            <Segmented
+              block
+              options={[
+                { label: 'iDEAL', value: 'ideal' },
+                { label: 'PIX', value: 'pix' },
+              ]}
+              onChange={() => {
+                baxiCdkSubmitForm.setFieldValue('pix_cdk', '')
+                setBaxiCdkManualOpen(false)
+              }}
+            />
+          </Form.Item>
+
+          {baxiIsPix ? (
+            <div
+              style={{
+                border: `1px solid ${token.colorBorderSecondary}`,
+                borderRadius: token.borderRadiusLG,
+                padding: 12,
+                marginBottom: 12,
+                background: token.colorFillAlter,
+              }}
+            >
+              <Form.Item
+                name="pix_cdk"
+                label="PIX CDK"
+                rules={[{ required: true, whitespace: true, message: '请输入 PIX CDK' }]}
+                style={{ marginBottom: 0 }}
+                extra="本次提交结束后不会保存在浏览器、本地卡密池、任务详情或账号字段。"
+              >
+                <Input.Password
+                  autoComplete="off"
+                  placeholder="输入本次 PIX CDK"
+                  visibilityToggle
+                />
+              </Form.Item>
+            </div>
+          ) : null}
+
+          {!baxiIsPix ? (
+            <>
           <Form.Item label="卡密来源">
             <div
               style={{
@@ -8595,6 +8676,8 @@ export default function Accounts() {
               </Form.Item>
             ) : null}
           </div>
+            </>
+          ) : null}
 
           <div
             style={{
@@ -8630,32 +8713,38 @@ export default function Accounts() {
               <Form.Item
                 name="submit_interval_seconds"
                 label="提交间隔"
-                extra="只在上一个账号 /api/submit 成功后等待；预查失败、无配额或提交失败不会等待。"
+                extra={baxiIsPix
+                  ? 'PIX 每次仅提交一个账号；上游未确认的提交不会自动重投。'
+                  : '只在上一个账号 /api/submit 成功后等待；预查失败、无配额或提交失败不会等待。'}
               >
                 <InputNumber min={0} max={3600} step={1} addonAfter="秒" style={{ width: '100%' }} />
               </Form.Item>
-              <Form.Item
-                name="auto_poll_status"
-                label="自动轮询状态"
-                valuePropName="checked"
-                extra="不阻塞下一个账号提交；后台按上游任务 ID 查询到 paid/failed 后同步卡密池和账号。"
-              >
-                <Switch checkedChildren="开启" unCheckedChildren="关闭" />
-              </Form.Item>
+              {!baxiIsPix ? (
+                <Form.Item
+                  name="auto_poll_status"
+                  label="自动轮询状态"
+                  valuePropName="checked"
+                  extra="不阻塞下一个账号提交；后台按上游任务 ID 查询到 paid/failed 后同步卡密池和账号。"
+                >
+                  <Switch checkedChildren="开启" unCheckedChildren="关闭" />
+                </Form.Item>
+              ) : null}
               <Form.Item name="status_poll_interval_seconds" label="轮询间隔">
                 <InputNumber min={1} max={3600} step={1} addonAfter="秒" style={{ width: '100%' }} />
               </Form.Item>
               <Form.Item name="status_poll_timeout_seconds" label="未返回提醒" extra="到点只写提醒日志，任务会继续等待上游终态，不再提前结束。">
                 <InputNumber min={1800} max={86400} step={60} addonAfter="秒" style={{ width: '100%' }} />
               </Form.Item>
-              <Form.Item name="precheck" label="提交前预查" valuePropName="checked">
-                <Switch checkedChildren="开启" unCheckedChildren="关闭" />
-              </Form.Item>
+              {!baxiIsPix ? (
+                <Form.Item name="precheck" label="提交前预查" valuePropName="checked">
+                  <Switch checkedChildren="开启" unCheckedChildren="关闭" />
+                </Form.Item>
+              ) : null}
               <Form.Item
                 name="failure_continue"
                 label="失败后继续"
                 valuePropName="checked"
-                extra="开启后，单个卡密或账号失败不会阻断后续配对。"
+                extra={baxiIsPix ? '开启后，单个账号明确失败不会阻断后续 PIX 提交。' : '开启后，单个卡密或账号失败不会阻断后续配对。'}
               >
                 <Switch checkedChildren="继续" unCheckedChildren="停止" />
               </Form.Item>

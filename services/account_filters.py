@@ -144,6 +144,9 @@ _IDEA_SUBMIT_STATE_FILTER_ALIASES: dict[str, set[str]] = {
     "failed": {"failed"},
     "fail": {"failed"},
     "error": {"failed"},
+    "timeout": {"timeout"},
+    "manual_review": {"timeout"},
+    "unknown_submit": {"timeout"},
     "unavailable": {"unavailable"},
 }
 
@@ -547,7 +550,7 @@ def account_idea_submit_state(account: AccountModel, extra: dict[str, Any] | Non
         unavailable = True
     if unavailable:
         return "unavailable"
-    if cdk_status in {"paid", "submitted", "processing", "failed"}:
+    if cdk_status in {"paid", "submitted", "processing", "failed", "timeout"}:
         return cdk_status
     return "available"
 
@@ -1012,7 +1015,7 @@ def refresh_account_list_state(
                             OR idea_submit_unavailable = 1
                             OR (chatgpt_account_unavailable = 1 AND baxigpt_cdk_status = 'failed')
                         THEN 'unavailable'
-                        WHEN baxigpt_cdk_status IN ('paid', 'submitted', 'processing', 'failed')
+                        WHEN baxigpt_cdk_status IN ('paid', 'submitted', 'processing', 'failed', 'timeout')
                         THEN baxigpt_cdk_status
                         ELSE 'available'
                     END AS idea_submit_state,

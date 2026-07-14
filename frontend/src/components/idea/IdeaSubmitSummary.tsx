@@ -16,6 +16,7 @@ type IdeaSubmitAccount = {
 }
 
 type IdeaSubmitSummaryValue = {
+  payment_channel?: string
   total_accounts?: number
   pair_count?: number
   submitted?: number
@@ -67,6 +68,7 @@ export function IdeaSubmitSummary({ summary, compact = false }: IdeaSubmitSummar
   const unsubmitted = numberValue(summary.unsubmitted ?? unsubmittedAccounts.length)
   const pending = numberValue(summary.pending)
   const unavailable = numberValue(summary.marked_unavailable ?? markedUnavailable.length)
+  const isPix = String(summary.payment_channel || '').trim().toLowerCase() === 'pix'
 
   const sampleAccounts = [
     ...successAccounts,
@@ -78,8 +80,8 @@ export function IdeaSubmitSummary({ summary, compact = false }: IdeaSubmitSummar
   return (
     <Card
       size="small"
-      title="Idea 提交结果总结"
-      extra={unavailable > 0 ? <Tag color="error">已标记不可用于 Idea 提交 {unavailable}</Tag> : null}
+      title={isPix ? 'PIX 提交结果总结' : 'iDEAL 提交结果总结'}
+      extra={unavailable > 0 ? <Tag color="error">已标记不可用于 iDEAL / PIX 提交 {unavailable}</Tag> : null}
       style={{ marginBottom: compact ? 0 : 8 }}
       bodyStyle={{ padding: compact ? 10 : 12 }}
     >
@@ -102,7 +104,7 @@ export function IdeaSubmitSummary({ summary, compact = false }: IdeaSubmitSummar
         }}
       >
         <Text type="secondary" style={{ display: 'block' }}>
-          分类明细已写入日志末尾，一行一个账号；结果区不再展示卡密或卡密派生的 order 前缀。
+          分类明细已写入日志末尾，一行一个账号；结果区不展示卡密、PIX CDK 或任务轮询凭据。
         </Text>
         {sampleAccounts.length > 0 ? (
           <Space size={[6, 4]} wrap style={{ marginTop: 6 }}>

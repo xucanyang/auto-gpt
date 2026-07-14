@@ -1127,9 +1127,9 @@ export default function BaxiGptCdkPool() {
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
         <div>
-          <h1 style={{ fontSize: 24, fontWeight: 'bold', margin: 0 }}>idea批量提交</h1>
+          <h1 style={{ fontSize: 24, fontWeight: 'bold', margin: 0 }}>iDEAL 卡密池</h1>
           <p style={{ color: token.colorTextSecondary, marginTop: 4, marginBottom: 0 }}>
-            卡密库存、账号绑定和订单状态查询。ChatGPT 页面提交任务会自动从这里取可用卡密。
+            iDEAL 卡密库存、账号绑定和订单状态查询。PIX 提交不使用或写入此卡密池。
           </p>
         </div>
         <Space wrap>

@@ -343,7 +343,7 @@ export function AccountsToolbar({
       case 'baxiCdkSubmit':
         return {
           key: actionId,
-          label: 'idea批量提交',
+          label: 'iDEAL / PIX 批量提交',
           icon: baxiCdkSubmitLoading ? <SyncOutlined spin /> : <DatabaseOutlined />,
           disabled: baxiCdkSubmitLoading,
         } as ToolbarMenuItem
@@ -573,7 +573,7 @@ export function AccountsToolbar({
             loading={baxiCdkSubmitLoading}
             onClick={onOpenBaxiCdkSubmit}
           >
-            idea批量提交
+            iDEAL / PIX 批量提交
           </Button>
         )
       case 'paymentLink':
