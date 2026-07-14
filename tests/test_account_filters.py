@@ -239,7 +239,7 @@ class AccountFilterSortTests(unittest.TestCase):
             {
                 "chatgpt_local": {
                     "auth": {"state": "unauthorized"},
-                    "subscription": {"plan": "team", "subscription_active_until": "1781089634000"},
+                    "subscription": {"plan": "free", "subscription_active_until": "1781089634000"},
                 },
                 "sync_statuses": {"sub2api": {"remote_state": "not_found"}},
                 "chatgpt_last_revival": {"source": "custom_email_recheck", "mode": "create_new"},
@@ -249,7 +249,7 @@ class AccountFilterSortTests(unittest.TestCase):
         rows[2].set_extra(
             {
                 "manually_used": True,
-                "chatgpt_workspace_scope": "free",
+                "chatgpt_capabilities": {"subscription_plan": "free", "subscription_checked": True},
                 "chatgpt_invalid_recheck": {
                     "status": "recovered_access_token",
                     "source": "invalid_account_recheck",
@@ -281,8 +281,8 @@ class AccountFilterSortTests(unittest.TestCase):
                 [row.id for row in filter_account_rows(rows, auth_type="refresh_token")],
             )
             self.assertEqual(
-                sql_ids(subscription_type="team,free"),
-                [row.id for row in filter_account_rows(rows, subscription_type="team,free")],
+                sql_ids(subscription_type="plus,free"),
+                [row.id for row in filter_account_rows(rows, subscription_type="plus,free")],
             )
             self.assertEqual(
                 sql_ids(account_validity_filter="invalid"),

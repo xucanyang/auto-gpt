@@ -79,7 +79,6 @@ class AccessTokenOnlyCheckoutTests(unittest.TestCase):
             mock.patch.object(engine, "_probe_homepage_before_email_creation", return_value=(True, "")),
             mock.patch.object(engine, "_report_homepage_probe"),
             mock.patch.object(engine, "_probe_plus_checkout_billing", return_value={}),
-            mock.patch.object(engine, "_capture_k12_workspace_artifacts", return_value=(True, "")),
             mock.patch(
                 "services.chatgpt_core.access_token_only_registration_engine.ChatGPTClient",
                 self._TrackingChatGPTClient,
@@ -107,7 +106,6 @@ class AccessTokenOnlyCheckoutTests(unittest.TestCase):
             mock.patch.object(engine, "_probe_homepage_before_email_creation", return_value=(True, "")),
             mock.patch.object(engine, "_report_homepage_probe"),
             mock.patch.object(engine, "_probe_plus_checkout_billing", return_value={}),
-            mock.patch.object(engine, "_capture_k12_workspace_artifacts", return_value=(True, "")),
             mock.patch(
                 "services.chatgpt_core.access_token_only_registration_engine.ChatGPTClient",
                 self._TrackingChatGPTClient,
@@ -167,7 +165,6 @@ class AccessTokenOnlyCheckoutTests(unittest.TestCase):
             mock.patch.object(engine, "_probe_homepage_before_email_creation", return_value=(True, "")),
             mock.patch.object(engine, "_report_homepage_probe"),
             mock.patch.object(engine, "_probe_plus_checkout_billing", return_value={}),
-            mock.patch.object(engine, "_capture_k12_workspace_artifacts", return_value=(True, "")),
             mock.patch(
                 "services.chatgpt_core.access_token_only_registration_engine.ChatGPTClient",
                 self._ExistingRouteChatGPTClient,

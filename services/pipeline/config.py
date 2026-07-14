@@ -54,6 +54,8 @@ class PipelineConfigStore:
 
         if str(config.platform or "").strip().lower() != "chatgpt":
             errors.append("platform 必须为 chatgpt")
+        if str(config.gopay_plan or "plus").strip().lower() != "plus":
+            errors.append("gopay_plan 仅支持 plus")
 
         return errors
 

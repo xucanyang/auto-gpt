@@ -256,66 +256,6 @@ def upload_to_cpa(
             mime.close()
 
 
-def upload_to_team_manager(
-    account,
-    api_url: str = None,
-    api_key: str = None,
-) -> Tuple[bool, str]:
-    """上传单账号到 Team Manager（直连，不走代理）。
-    api_url / api_key 为空时自动从 ConfigStore 读取。"""
-    if not api_url:
-        api_url = _get_config_value("team_manager_url")
-    if not api_key:
-        api_key = _get_config_value("team_manager_key")
-    if not api_url:
-        return False, "Team Manager API URL 未配置"
-    if not api_key:
-        return False, "Team Manager API Key 未配置"
-
-    email = getattr(account, "email", "")
-    access_token = getattr(account, "access_token", "")
-    if not access_token:
-        return False, "账号缺少 access_token"
-
-    url = api_url.rstrip("/") + "/api/accounts/import"
-    headers = {
-        "X-API-Key": api_key,
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "import_type": "single",
-        "email": email,
-        "access_token": access_token,
-        "session_token": getattr(account, "session_token", ""),
-        "refresh_token": getattr(account, "refresh_token", ""),
-        "client_id": getattr(account, "client_id", ""),
-    }
-
-    try:
-        resp = cffi_requests.post(
-            url,
-            headers=headers,
-            json=payload,
-            proxies=None,
-            verify=False,
-            timeout=30,
-            impersonate="chrome110",
-        )
-        if resp.status_code in (200, 201):
-            return True, "上传成功"
-        error_msg = f"上传失败: HTTP {resp.status_code}"
-        try:
-            detail = resp.json()
-            if isinstance(detail, dict):
-                error_msg = detail.get("message", error_msg)
-        except Exception:
-            error_msg = f"{error_msg} - {resp.text[:200]}"
-        return False, error_msg
-    except Exception as e:
-        logger.error(f"Team Manager 上传异常: {e}")
-        return False, f"上传异常: {str(e)}"
-
-
 def upload_to_codex_proxy(
     account,
     api_url: str = None,

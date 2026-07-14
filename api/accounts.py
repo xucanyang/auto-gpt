@@ -3,7 +3,7 @@ from fastapi.responses import StreamingResponse
 from sqlmodel import Session, select, func
 from pydantic import BaseModel, Field
 from core.config_store import config_store
-from core.db import AccountModel, PendingBusinessInviteModel, get_session
+from core.db import AccountModel, get_session
 from services.account_filters import (
     account_auth_type,
     account_filtered_query,
@@ -24,7 +24,6 @@ from services.chatgpt_account_state import AUTH_INVALID_STATES, classify_chatgpt
 from services.chatgpt_core.bound_phone import chatgpt_bound_phone_payload, chatgpt_phone_challenge_payload
 from services.chatgpt_core.codex_usage import build_codex_usage_progress_from_extra
 from services.chatgpt_core.local_status_refresh import schedule_chatgpt_local_status_refresh_for_account_id
-from services.team_lite import team_lite_service
 from typing import Any, Optional
 from datetime import datetime, timezone
 import io, csv, json, logging, threading, time, uuid
@@ -681,33 +680,7 @@ def _maybe_reconcile_rate_limited_accounts(session: Session, *, platform: Option
     reconcile_rate_limited_accounts(session, platform=platform)
 
 
-def _is_team_invite_source_visible(*, workspace_scope: str, invite_status: str, team_id: int) -> bool:
-    """Return whether an account should expose Team invite/removal metadata.
-
-    Free workspace rows may still have historical PendingBusinessInvite rows because
-    the same registration flow used the pending table as a staging area.  Those
-    rows must not make the UI show "移除队伍" for a free-only account.
-    """
-    scope = _safe_str(workspace_scope).lower()
-    status = _safe_str(invite_status).lower()
-    if scope in {"business", "pending_activation"}:
-        return True
-    if team_id > 0 and status and status not in {"completed", "abandoned", "failed", "failed_terminal"}:
-        return True
-    return False
-
-
-def _is_team_invite_source_removable(*, workspace_scope: str, invite_status: str, team_id: int, removed_from_team_at: str) -> bool:
-    if team_id <= 0 or _safe_str(removed_from_team_at):
-        return False
-    return _is_team_invite_source_visible(
-        workspace_scope=workspace_scope,
-        invite_status=invite_status,
-        team_id=team_id,
-    )
-
-
-def _serialize_account(account: AccountModel, *, team_invite_source: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+def _serialize_account(account: AccountModel) -> dict[str, Any]:
     data = account.model_dump(mode="json") if hasattr(account, "model_dump") else account.dict()
     extra = _safe_extra(account)
     chatgpt_local = extra.get("chatgpt_local") if isinstance(extra.get("chatgpt_local"), dict) else {}
@@ -742,9 +715,6 @@ def _serialize_account(account: AccountModel, *, team_invite_source: Optional[di
         "has_id_token": bool(auth_summary["has_id_token"]),
         "has_password": bool(auth_summary["password_present"]),
     }
-    if team_invite_source:
-        data["team_invite_source"] = team_invite_source
-
     # Detail endpoints must follow the same secret boundary as compact lists:
     # raw credentials stay behind /accounts/{id}/secrets, while detail responses
     # only expose booleans and curated summaries.  Historically this serializer
@@ -753,7 +723,6 @@ def _serialize_account(account: AccountModel, *, team_invite_source: Optional[di
     compact = _serialize_account_compact_item(
         account,
         extra=extra,
-        team_invite_source=team_invite_source,
     )
     data.update(compact)
     for secret_key in (
@@ -783,7 +752,6 @@ def _serialize_account(account: AccountModel, *, team_invite_source: Optional[di
 def _serialize_account_list_item(
     account: AccountModel,
     *,
-    team_invite_source: Optional[dict[str, Any]] = None,
     extra: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """Backward-compatible name for the compact list serializer."""
@@ -791,162 +759,7 @@ def _serialize_account_list_item(
     return _serialize_account_compact_item(
         account,
         extra=extra,
-        team_invite_source=team_invite_source,
     )
-
-
-def _build_team_invite_sources(
-    accounts: list[AccountModel],
-    session: Session,
-    *,
-    include_team_brief: bool = True,
-) -> dict[int, dict[str, Any]]:
-    chatgpt_accounts = [account for account in accounts if account.platform == "chatgpt" and int(account.id or 0) > 0]
-    if not chatgpt_accounts:
-        return {}
-
-    account_ids = [int(account.id or 0) for account in chatgpt_accounts]
-    pending_rows = session.exec(
-        select(PendingBusinessInviteModel).where(PendingBusinessInviteModel.account_id.in_(account_ids))
-    ).all()
-    pending_by_account = {
-        int(row.account_id or 0): row
-        for row in pending_rows
-        if int(row.account_id or 0) > 0
-    }
-
-    sources: dict[int, dict[str, Any]] = {}
-    team_ids: list[int] = []
-    seen_team_ids: set[int] = set()
-
-    for account in chatgpt_accounts:
-        account_id = int(account.id or 0)
-        extra = account.get_extra()
-        pending_payload = dict(extra.get("chatgpt_pending_business_invite") or {})
-        pending_row = pending_by_account.get(account_id)
-
-        team_id = _safe_int(getattr(pending_row, "team_id", 0) if pending_row else pending_payload.get("team_id"))
-        invite_status = _safe_str(getattr(pending_row, "status", "") if pending_row else pending_payload.get("status"))
-        workspace_scope = _safe_str(extra.get("chatgpt_workspace_scope"))
-        team_name = _safe_str(getattr(pending_row, "team_name", "") if pending_row else pending_payload.get("team_name"))
-        invited_at = _safe_str(getattr(pending_row, "invited_at", "") if pending_row else pending_payload.get("invite_sent_at") or pending_payload.get("invited_at"))
-        joined_at = _safe_str(getattr(pending_row, "joined_at", "") if pending_row else pending_payload.get("joined_at"))
-        removed_from_team_at = _safe_str(extra.get("chatgpt_team_invite_removed_at"))
-
-        if not _is_team_invite_source_visible(
-            workspace_scope=workspace_scope,
-            invite_status=invite_status,
-            team_id=team_id,
-        ):
-            continue
-
-        source = {
-            "team_id": team_id,
-            "team_name": team_name,
-            "invite_status": invite_status,
-            "workspace_scope": workspace_scope,
-            "invited_at": invited_at,
-            "joined_at": joined_at,
-            "removed_from_team_at": removed_from_team_at,
-            "removable": _is_team_invite_source_removable(
-                workspace_scope=workspace_scope,
-                invite_status=invite_status,
-                team_id=team_id,
-                removed_from_team_at=removed_from_team_at,
-            ),
-        }
-        sources[account_id] = source
-        if team_id > 0 and team_id not in seen_team_ids:
-            seen_team_ids.add(team_id)
-            team_ids.append(team_id)
-
-    if not sources or not include_team_brief:
-        return {}
-
-    team_briefs = team_lite_service.get_team_db_briefs(team_ids)
-    for source in sources.values():
-        team_id = _safe_int(source.get("team_id"))
-        if team_id <= 0:
-            continue
-        team_brief = team_briefs.get(team_id) or {}
-        primary_account = dict(team_brief.get("primary_account") or {})
-        source.update(
-            {
-                "team_email": _safe_str(team_brief.get("email")),
-                "team_account_id": _safe_str(team_brief.get("account_id")),
-                "team_status": _safe_str(team_brief.get("status")),
-                "primary_account_id": _safe_str(primary_account.get("account_id")),
-                "primary_account_name": _safe_str(primary_account.get("account_name")),
-            }
-        )
-        if not source.get("team_name"):
-            source["team_name"] = _safe_str(team_brief.get("team_name"))
-
-    return sources
-
-
-def _build_team_invite_source_summaries(
-    accounts: list[AccountModel],
-    session: Session,
-    *,
-    extras_by_id: Optional[dict[int, dict[str, Any]]] = None,
-) -> dict[int, dict[str, Any]]:
-    chatgpt_accounts = [account for account in accounts if account.platform == "chatgpt" and int(account.id or 0) > 0]
-    if not chatgpt_accounts:
-        return {}
-
-    account_ids = [int(account.id or 0) for account in chatgpt_accounts]
-    pending_rows = session.exec(
-        select(PendingBusinessInviteModel).where(PendingBusinessInviteModel.account_id.in_(account_ids))
-    ).all()
-    pending_by_account = {
-        int(row.account_id or 0): row
-        for row in pending_rows
-        if int(row.account_id or 0) > 0
-    }
-
-    sources: dict[int, dict[str, Any]] = {}
-    for account in chatgpt_accounts:
-        account_id = int(account.id or 0)
-        extra = (
-            extras_by_id.get(account_id)
-            if isinstance(extras_by_id, dict) and isinstance(extras_by_id.get(account_id), dict)
-            else _safe_extra(account)
-        )
-        pending_payload = dict(extra.get("chatgpt_pending_business_invite") or {})
-        pending_row = pending_by_account.get(account_id)
-
-        team_id = _safe_int(getattr(pending_row, "team_id", 0) if pending_row else pending_payload.get("team_id"))
-        invite_status = _safe_str(getattr(pending_row, "status", "") if pending_row else pending_payload.get("status"))
-        workspace_scope = _safe_str(extra.get("chatgpt_workspace_scope"))
-        team_name = _safe_str(getattr(pending_row, "team_name", "") if pending_row else pending_payload.get("team_name"))
-        invited_at = _safe_str(getattr(pending_row, "invited_at", "") if pending_row else pending_payload.get("invite_sent_at") or pending_payload.get("invited_at"))
-        joined_at = _safe_str(getattr(pending_row, "joined_at", "") if pending_row else pending_payload.get("joined_at"))
-        removed_from_team_at = _safe_str(extra.get("chatgpt_team_invite_removed_at"))
-
-        if not _is_team_invite_source_visible(
-            workspace_scope=workspace_scope,
-            invite_status=invite_status,
-            team_id=team_id,
-        ):
-            continue
-
-        sources[account_id] = {
-            "team_id": team_id,
-            "team_name": team_name,
-            "invite_status": invite_status,
-            "workspace_scope": workspace_scope,
-            "invited_at": invited_at,
-            "joined_at": joined_at,
-            "removed_from_team_at": removed_from_team_at,
-            "removable": _is_team_invite_source_removable(
-                workspace_scope=workspace_scope,
-                invite_status=invite_status,
-                team_id=team_id,
-                removed_from_team_at=removed_from_team_at,
-            ),
-        }
-    return sources
 
 
 class AccountCreate(BaseModel):
@@ -1409,42 +1222,10 @@ def _build_phone_summary(
     }
 
 
-def _build_workspace_variants_summary(extra: dict[str, Any]) -> list[dict[str, Any]]:
-    raw_items = extra.get("chatgpt_workspace_variants")
-    if not isinstance(raw_items, list):
-        return []
-    variants: list[dict[str, Any]] = []
-    seen: set[tuple[str, str, str]] = set()
-    for item in raw_items:
-        if not isinstance(item, dict):
-            continue
-        variant = {
-            "scope": _safe_str(item.get("scope")),
-            "label": _safe_str(item.get("label")),
-            "workspace_id": _safe_str(item.get("workspace_id")),
-            "account_id": _safe_str(item.get("account_id")),
-            "display_name": _safe_str(item.get("display_name")),
-            "source": _safe_str(item.get("source")),
-            "auth_level": _safe_str(item.get("auth_level")),
-            "partial_auth": bool(item.get("partial_auth")),
-        }
-        key = (
-            variant["scope"],
-            variant["workspace_id"],
-            variant["account_id"],
-        )
-        if key in seen:
-            continue
-        seen.add(key)
-        variants.append(variant)
-    return variants[:50]
-
-
 def _serialize_account_compact_item(
     account: AccountModel,
     *,
     extra: dict[str, Any] | None = None,
-    team_invite_source: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     extra = extra if isinstance(extra, dict) else _safe_get_extra(account)
     sync_statuses = extra.get("sync_statuses") if isinstance(extra.get("sync_statuses"), dict) else {}
@@ -1471,8 +1252,6 @@ def _serialize_account_compact_item(
     validity_summary = _build_account_validity_summary(account, auth_summary, chatgpt_capabilities, codex_summary)
     baxigpt_cdk = _build_baxigpt_cdk_summary(extra.get("baxigpt_cdk") if isinstance(extra.get("baxigpt_cdk"), dict) else {})
     idea_submit = _build_idea_submit_summary(extra, baxigpt_cdk)
-    workspace_variants = _build_workspace_variants_summary(extra)
-
     payload = {
         "id": account.id,
         "platform": account.platform,
@@ -1485,16 +1264,9 @@ def _serialize_account_compact_item(
         "cashier_url": account.cashier_url,
         "manually_used": bool(extra.get("manually_used")),
         "workspace": {
-            "scope": _safe_str(extra.get("chatgpt_workspace_scope")),
-            "label": _safe_str(extra.get("chatgpt_workspace_label")),
-            "display_name": _safe_str(extra.get("chatgpt_workspace_display_name")),
             "id": _safe_str(extra.get("workspace_id") or extra.get("organization_id") or chatgpt_capabilities.get("workspace_id")),
             "account_id": _safe_str(chatgpt_capabilities.get("account_id") or account.user_id),
         },
-        "workspace_scope": _safe_str(extra.get("chatgpt_workspace_scope")),
-        "workspace_label": _safe_str(extra.get("chatgpt_workspace_label")),
-        "workspace_display_name": _safe_str(extra.get("chatgpt_workspace_display_name")),
-        "workspace_variants": workspace_variants,
         "auth": auth_summary,
         "subscription": subscription_summary,
         "account_validity": _safe_str(validity_summary.get("state")),
@@ -1537,7 +1309,6 @@ def _serialize_account_compact_item(
         "cliproxy_remote_state": _safe_str(cliproxy_sync.get("remote_state")),
         "sub2api_remote_state": _safe_str(sub2api_sync.get("remote_state")),
         "oaipay_remote_state": _safe_str(oaipay_sync.get("remote_state")),
-        "team_invite_status": _safe_str(team_invite_source.get("invite_status") if team_invite_source else ""),
         # Backward-compatible summary aliases: keep object names that the list UI
         # already reads, but make them compact rather than returning full nested
         # probes / sync records / token-bearing extra.
@@ -1589,10 +1360,6 @@ def _serialize_account_compact_item(
         "cliproxySync": cliproxy_sync,
         "extra": {
             "manually_used": bool(extra.get("manually_used")),
-            "chatgpt_workspace_label": _safe_str(extra.get("chatgpt_workspace_label")),
-            "chatgpt_workspace_scope": _safe_str(extra.get("chatgpt_workspace_scope")),
-            "chatgpt_workspace_display_name": _safe_str(extra.get("chatgpt_workspace_display_name")),
-            "chatgpt_workspace_variants": workspace_variants,
             "chatgpt_phone_binding": _build_phone_summary(phone_binding, bound_phone, phone_challenge)["binding"],
             "chatgpt_bound_phone": bound_phone,
             "chatgpt_phone_challenge": phone_challenge,
@@ -1600,8 +1367,6 @@ def _serialize_account_compact_item(
             "idea_submit": idea_submit,
         },
     }
-    if team_invite_source:
-        payload["team_invite_source"] = team_invite_source
     return payload
 
 
@@ -1656,7 +1421,6 @@ def list_accounts(
     page: int = 1,
     page_size: int = 20,
     detail: bool = False,
-    include_team_brief: bool = False,
     session: Session = Depends(get_session),
 ):
     _maybe_reconcile_rate_limited_accounts(session, platform=platform)
@@ -1692,22 +1456,16 @@ def list_accounts(
         for item in items
         if int(item.id or 0) > 0
     }
-    team_invite_sources = (
-        _build_team_invite_sources(items, session, include_team_brief=True)
-        if detail or include_team_brief
-        else _build_team_invite_source_summaries(items, session, extras_by_id=extras_by_id)
-    )
     return {
         "total": total,
         "page": page_value,
         "items": [
             (
-                _serialize_account(item, team_invite_source=team_invite_sources.get(int(item.id or 0)))
+                _serialize_account(item)
                 if detail
                 else _serialize_account_compact_item(
                     item,
                     extra=extras_by_id.get(int(item.id or 0)),
-                    team_invite_source=team_invite_sources.get(int(item.id or 0)),
                 )
             )
             for item in items
@@ -1781,24 +1539,17 @@ def get_accounts_overview(
     by_status: dict[str, int] = {}
     by_platform: dict[str, int] = {}
     manually_used = 0
-    workspace_scope_counts: dict[str, int] = {}
-
     for acc in accounts:
         by_status[acc.status] = by_status.get(acc.status, 0) + 1
         by_platform[acc.platform] = by_platform.get(acc.platform, 0) + 1
         extra = acc.get_extra()
         if bool(extra.get("manually_used")):
             manually_used += 1
-        scope = _safe_str(extra.get("chatgpt_workspace_scope"))
-        if scope:
-            workspace_scope_counts[scope] = workspace_scope_counts.get(scope, 0) + 1
-
     return {
         "total": len(accounts),
         "by_status": by_status,
         "by_platform": by_platform,
         "manually_used": manually_used,
-        "workspace_scope_counts": workspace_scope_counts,
     }
 
 
@@ -2016,8 +1767,7 @@ def get_account(account_id: int, session: Session = Depends(get_session)):
         raise HTTPException(404, "账号不存在")
     reconcile_rate_limited_accounts(session, accounts=[acc])
     session.refresh(acc)
-    team_invite_source = _build_team_invite_sources([acc], session, include_team_brief=True).get(int(acc.id or 0))
-    return _serialize_account(acc, team_invite_source=team_invite_source)
+    return _serialize_account(acc)
 
 
 @router.get("/{account_id}/secrets")
@@ -2057,103 +1807,6 @@ def get_account_secrets(
         "secrets": values,
         "present": {field: bool(values.get(field)) for field in requested},
         "lengths": {field: len(values.get(field) or "") for field in requested},
-    }
-
-
-@router.get("/{account_id}/team-source")
-def get_account_team_source(account_id: int, session: Session = Depends(get_session)):
-    acc = session.get(AccountModel, account_id)
-    if not acc:
-        raise HTTPException(404, "账号不存在")
-    team_invite_source = _build_team_invite_sources([acc], session, include_team_brief=True).get(int(acc.id or 0))
-    return {
-        "account_id": int(acc.id or 0),
-        "team_invite_source": team_invite_source,
-    }
-
-
-@router.post("/{account_id}/chatgpt-team-remove")
-def remove_chatgpt_team_member(account_id: int, session: Session = Depends(get_session)):
-    acc = session.get(AccountModel, account_id)
-    if not acc:
-        raise HTTPException(404, "账号不存在")
-    if acc.platform != "chatgpt":
-        raise HTTPException(400, "只有 ChatGPT 账号支持移除队伍")
-
-    team_invite_source = _build_team_invite_sources([acc], session).get(int(acc.id or 0))
-    if not team_invite_source:
-        raise HTTPException(400, "当前账号没有 Team Invite 来源信息")
-
-    team_id = _safe_int(team_invite_source.get("team_id"))
-    if team_id <= 0:
-        raise HTTPException(400, "当前账号未关联可操作的 Team")
-
-    email = _safe_str(acc.email).lower()
-    if not email:
-        raise HTTPException(400, "当前账号缺少邮箱")
-
-    try:
-        member_result = team_lite_service.check_member(team_id, email, force=True)
-    except Exception as exc:
-        raise HTTPException(400, f"检查 Team 成员失败: {exc}") from exc
-
-    member = dict(member_result.get("member") or {})
-    member_status = _safe_str(member_result.get("status") or member.get("status")).lower()
-    matched = bool(member_result.get("matched"))
-
-    try:
-        if matched and member_status == "joined":
-            role = _safe_str(member.get("role")).lower()
-            if role == "account-owner":
-                raise HTTPException(400, "这是 Team 母号，不能直接从自己的 Team 中移除")
-            user_id = _safe_str(member.get("user_id"))
-            if not user_id:
-                raise HTTPException(400, "命中了已加入成员，但缺少 user_id，无法删除")
-            result = team_lite_service.delete_member(team_id, user_id)
-            action = "delete_member"
-            message_text = "已从 Team 中删除成员"
-        elif matched and member_status == "invited":
-            result = team_lite_service.revoke_invite(team_id, email)
-            action = "revoke_invite"
-            message_text = "已撤销 Team 邀请"
-        elif _safe_str(team_invite_source.get("invite_status")) and _safe_str(team_invite_source.get("invite_status")) != "completed":
-            result = team_lite_service.revoke_invite(team_id, email)
-            action = "revoke_invite"
-            message_text = "已按 pending invite 撤销 Team 邀请"
-        else:
-            # 如果 Team 已经没有该账号，视为“已移除”，记录本地移除时间以便前端更新按钮态
-            action = "noop"
-            result = None
-            message_text = "Team 中未找到该账号，可能已经被移除"
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(400, f"移除队伍失败: {exc}") from exc
-
-    extra = acc.get_extra()
-    extra["chatgpt_team_invite_removed_at"] = datetime.now(timezone.utc).isoformat()
-    acc.set_extra(extra)
-    acc.updated_at = datetime.now(timezone.utc)
-    session.add(acc)
-    upsert_account_list_state_for_account_ids(session, [acc.id], commit=False)
-    session.commit()
-    session.refresh(acc)
-
-    if action == "noop" and not team_invite_source.get("removed_from_team_at"):
-        # 为了让前端“移除队伍”按钮立即消失，未匹配到成员时也直接写本地移除时间
-        team_invite_source["removed_from_team_at"] = extra["chatgpt_team_invite_removed_at"]
-        team_invite_source["removable"] = False
-
-    refreshed_source = _build_team_invite_sources([acc], session).get(int(acc.id or 0)) or team_invite_source
-    if not action == "noop":
-        # 明确刷新成功执行动作后再同步一次，避免因列表查询延迟导致前端刷新后又出现按钮
-        refreshed_source = _build_team_invite_sources([acc], session).get(int(acc.id or 0)) or team_invite_source
-    return {
-        "ok": True,
-        "action": action,
-        "message": message_text,
-        "result": result,
-        "team_invite_source": refreshed_source,
     }
 
 

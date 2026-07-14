@@ -215,7 +215,7 @@ const DEFAULT_CONFIG: PipelineConfig = {
     auto_poll_status: true,
     status_poll_interval_seconds: 5,
     status_poll_timeout_seconds: 1800,
-    skip_if_subscription_in: ['plus', 'pro', 'team', 'enterprise'],
+    skip_if_subscription_in: ['plus', 'pro'],
   },
   check: {
     enabled: true,
@@ -1109,7 +1109,7 @@ function ConfigPanel({
   )
 }
 
-const subscriptionOptions = ['free', 'plus', 'pro', 'team', 'enterprise'].map((value) => ({ value, label: value }))
+const subscriptionOptions = ['free', 'plus', 'pro'].map((value) => ({ value, label: value }))
 
 function LogsPanel({ task, logs, onOpenTask }: { task: PipelineTask | null; logs: string[]; onOpenTask: (taskId: string) => void }) {
   return (

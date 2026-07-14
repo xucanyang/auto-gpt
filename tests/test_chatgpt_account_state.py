@@ -102,11 +102,11 @@ class ChatGPTAccountStateTests(unittest.TestCase):
         self.assertIn("refresh_token", message)
         self.assertEqual(account.status, "pending_payment")
 
-    def test_refresh_token_with_workspace_is_upload_ready(self):
+    def test_refresh_token_with_current_account_identity_is_upload_ready(self):
         account = DummyAccount(
             status="pending_payment",
             token="at-demo",
-            extra={"access_token": "at-demo", "refresh_token": "rt-demo", "workspace_id": "ws-demo"},
+            extra={"access_token": "at-demo", "refresh_token": "rt-demo", "workspace_id": "acct-demo"},
         )
         account.user_id = "acct-demo"
 

@@ -401,14 +401,14 @@ export default function GoPayOtpAdapter() {
     return normalizedPhone.phone_number
   }
 
-  const startByUid = async (values: { account_id: number; uid: string; pin?: string; plan?: string; force?: boolean }) => {
+  const startByUid = async (values: { account_id: number; uid: string; pin?: string; force?: boolean }) => {
     const data = await apiFetch('/integrations/gopay-otp/start-by-uid', {
       method: 'POST',
       body: JSON.stringify({
         account_id: Number(values.account_id),
         uid: values.uid,
         pin: values.pin || '',
-        plan: values.plan || 'plus',
+        plan: 'plus',
         force: Boolean(values.force),
       }),
     })
@@ -523,17 +523,12 @@ export default function GoPayOtpAdapter() {
                   <Input placeholder="99910283" />
                 </Form.Item>
               </Col>
-              <Col span={12}>
+              <Col span={16}>
                 <Form.Item name="pin" label="GoPay PIN">
                   <Input.Password placeholder="可选，留空则用默认值" />
                 </Form.Item>
               </Col>
               <Col span={8}>
-                <Form.Item name="plan" label="Plan" initialValue="plus">
-                  <Input />
-                </Form.Item>
-              </Col>
-              <Col span={4}>
                 <Form.Item name="force" label="覆盖" valuePropName="checked">
                   <Switch />
                 </Form.Item>

@@ -558,18 +558,27 @@ def upload_to_oaipay_detailed(
     capabilities: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """上传单个账号到 OAIPay 管理后台，返回结构化结果。"""
+    if capabilities is None:
+        from services.chatgpt_account_state import classify_chatgpt_capabilities
+        caps = classify_chatgpt_capabilities(account)
+    else:
+        caps = capabilities
+    from services.chatgpt_account_state import RETIRED_SUBSCRIPTION_TYPES, effective_subscription_plan
+
+    subscription_plan = effective_subscription_plan(caps)
+    if subscription_plan in RETIRED_SUBSCRIPTION_TYPES:
+        return {
+            "ok": False,
+            "skipped": True,
+            "message": f"订阅类型 {subscription_plan} 已退役，禁止上传 OAIPay",
+        }
+
     api_url = str(api_url or _get_config_value("oaipay_api_url")).strip()
     api_key = str(api_key or _get_config_value("oaipay_api_key")).strip()
     if not api_url:
         return {"ok": False, "message": "OAIPay API URL 未配置"}
     if not api_key:
         return {"ok": False, "message": "OAIPay API Key 未配置"}
-
-    if capabilities is None:
-        from services.chatgpt_account_state import classify_chatgpt_capabilities
-        caps = classify_chatgpt_capabilities(account)
-    else:
-        caps = capabilities
 
     category_decision = _build_category_decision(
         api_url=api_url,

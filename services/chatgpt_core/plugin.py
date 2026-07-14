@@ -467,15 +467,7 @@ class ChatGPTPlatform(BasePlatform):
             extra_config=extra_config,
         )
         result = adapter.run(context)
-        metadata = (getattr(result, "metadata", None) or {}) if result else {}
-        is_deferred_pending = bool(
-            result
-            and isinstance(metadata, dict)
-            and metadata.get("deferred_activation")
-            and str(metadata.get("deferred_activation_status") or "") == "invite_sent_pending_activation"
-            and metadata.get("registration_stage_complete")
-        )
-        if not result or (not result.success and not is_deferred_pending):
+        if not result or not result.success:
             raise RuntimeError(result.error_message if result else "注册失败")
 
         return adapter.build_account(result, password)
@@ -483,18 +475,6 @@ class ChatGPTPlatform(BasePlatform):
     def get_platform_actions(self) -> list:
         return [
             {"id": "probe_local_status", "label": "探测本地状态", "params": []},
-            {
-                "id": "k12_workspace_recapture",
-                "label": "重新进入/导出 K12",
-                "params": [
-                    {
-                        "key": "workspace_ids",
-                        "label": "目标 K12 workspace_id",
-                        "type": "textarea",
-                        "default": "",
-                    }
-                ],
-            },
             {"id": "sync_cliproxyapi_status", "label": "同步 CLIProxyAPI 状态", "params": []},
             {"id": "sync_sub2api_status", "label": "同步 Sub2API 状态", "params": []},
             {"id": "sync_oaipay_status", "label": "同步 OAIPay 状态", "params": []},
@@ -515,7 +495,7 @@ class ChatGPTPlatform(BasePlatform):
                 "id": "payment_link",
                 "label": "生成订阅链接",
                 "params": [
-                    {"key": "plan", "label": "套餐", "type": "select", "options": ["plus", "team"]},
+                    {"key": "plan", "label": "套餐", "type": "select", "options": ["plus"]},
                     {"key": "country", "label": "地区", "type": "checkout_country", "default": "ID"},
                     {"key": "currency", "label": "货币", "type": "text", "default": "IDR"},
                     {
@@ -553,14 +533,6 @@ class ChatGPTPlatform(BasePlatform):
                 "params": [
                     {"key": "api_url", "label": "Sub2API API URL", "type": "text"},
                     {"key": "api_key", "label": "Sub2API API Key", "type": "text"},
-                ],
-            },
-            {
-                "id": "upload_tm",
-                "label": "上传 Team Manager",
-                "params": [
-                    {"key": "api_url", "label": "TM API URL", "type": "text"},
-                    {"key": "api_key", "label": "TM API Key", "type": "text"},
                 ],
             },
             {
@@ -787,7 +759,7 @@ class ChatGPTPlatform(BasePlatform):
             }
 
         if action_id == "payment_link":
-            from services.chatgpt_core.payment import generate_plus_link, generate_team_link
+            from services.chatgpt_core.payment import generate_plus_link
             from services.chatgpt_core.long_link_paypal_client import LongLinkPayPalClient
             from services.chatgpt_core.payment_link_cache import (
                 PAYMENT_LINK_FORMAT_PAYPAL,
@@ -801,8 +773,8 @@ class ChatGPTPlatform(BasePlatform):
             )
 
             plan = str(params.get("plan") or "plus").strip().lower()
-            if plan not in {"plus", "team"}:
-                plan = "plus"
+            if plan != "plus":
+                return {"ok": False, "error": "Only the Plus payment plan is supported"}
             payment_source = normalize_payment_link_source(params.get("payment_source"))
             paypal_client = None
             payment_profile: dict = {}
@@ -825,7 +797,6 @@ class ChatGPTPlatform(BasePlatform):
                 currency = str(params.get("currency") or "IDR").strip().upper() or "IDR"
                 payment_proxy = resolve_default_chatgpt_proxy(normalize_proxy_url(params.get("proxy")) or None)
                 payment_link_format = normalize_payment_link_output_format(params.get("payment_link_format"))
-            promo_code = str(params.get("promo_code") or "").strip()
             save_defaults = params.get("save_defaults") is not False
             reuse_cached_link = params.get("reuse_cached_link") is not False
             cached_link = extra.get("chatgpt_last_payment_link") if isinstance(extra.get("chatgpt_last_payment_link"), dict) else {}
@@ -852,10 +823,6 @@ class ChatGPTPlatform(BasePlatform):
                         "payment_link_format": payment_link_format,
                         "payment_source": payment_source,
                         "profile_hash": payment_profile_hash,
-                        "promo_code": promo_code,
-                        "workspace_name": str(params.get("workspace_name") or "MyTeam").strip() or "MyTeam",
-                        "seat_quantity": max(2, int(params.get("seat_quantity", 5) or 5)),
-                        "price_interval": str(params.get("price_interval") or "month").strip().lower() or "month",
                     },
                 }
                 if save_defaults
@@ -891,7 +858,6 @@ class ChatGPTPlatform(BasePlatform):
                         "payment_link_format": payment_link_format,
                         "payment_source": payment_source,
                         "profile_hash": payment_profile_hash,
-                        "promo_code": str(cached_link.get("promo_code") or promo_code).strip(),
                         "billing": cached_billing or billing,
                         "cache_reused": True,
                         "cache_source": str(cached_link.get("source") or "cached_payment_link"),
@@ -919,7 +885,6 @@ class ChatGPTPlatform(BasePlatform):
                     "payment_link_format": PAYMENT_LINK_FORMAT_PAYPAL,
                     "payment_source": PAYMENT_SOURCE_LONG_LINK_PAYPAL,
                     "profile_hash": payment_profile_hash,
-                    "promo_code": "",
                     "billing": billing,
                     "cache_reused": False,
                     "cache_source": PAYMENT_SOURCE_LONG_LINK_PAYPAL,
@@ -929,28 +894,14 @@ class ChatGPTPlatform(BasePlatform):
                     "data": data,
                     "account_extra_patch": defaults_patch,
                 }
-            if plan == "plus":
-                url = generate_plus_link(
-                    a,
-                    proxy=payment_proxy,
-                    country=country,
-                    currency=currency,
-                    billing=billing,
-                    link_format=payment_link_format,
-                )
-            else:
-                url = generate_team_link(
-                    a,
-                    workspace_name=params.get("workspace_name", "MyTeam"),
-                    price_interval=params.get("price_interval", "month"),
-                    seat_quantity=int(params.get("seat_quantity", 5) or 5),
-                    promo_code=promo_code,
-                    proxy=payment_proxy,
-                    country=country,
-                    currency=currency,
-                    billing=billing,
-                    link_format=payment_link_format,
-                )
+            url = generate_plus_link(
+                a,
+                proxy=payment_proxy,
+                country=country,
+                currency=currency,
+                billing=billing,
+                link_format=payment_link_format,
+            )
             return {
                 "ok": bool(url),
                 "data": {
@@ -962,7 +913,6 @@ class ChatGPTPlatform(BasePlatform):
                     "payment_link_format": payment_link_format,
                     "payment_source": payment_source,
                     "profile_hash": payment_profile_hash,
-                    "promo_code": promo_code,
                     "billing": billing,
                     "cache_reused": False,
                     "cache_source": "payment_link_action",
@@ -1013,21 +963,6 @@ class ChatGPTPlatform(BasePlatform):
                 return {"ok": False, "data": gate_msg, "error": gate_msg}
 
             ok, msg = upload_to_sub2api(
-                a,
-                api_url=params.get("api_url"),
-                api_key=params.get("api_key"),
-            )
-            return {"ok": ok, "data": msg}
-
-        if action_id == "upload_tm":
-            from services.chatgpt_core.cpa_upload import upload_to_team_manager
-            from services.chatgpt_account_state import is_chatgpt_upload_ready
-
-            ready, gate_msg, _capabilities = is_chatgpt_upload_ready(a)
-            if not ready:
-                return {"ok": False, "data": gate_msg, "error": gate_msg}
-
-            ok, msg = upload_to_team_manager(
                 a,
                 api_url=params.get("api_url"),
                 api_key=params.get("api_key"),

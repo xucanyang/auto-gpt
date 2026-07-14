@@ -172,35 +172,6 @@ class ChatGPTPaymentTests(unittest.TestCase):
             + payment.PAY_OPENAI_CHECKOUT_FRAGMENT,
         )
 
-    def test_generate_team_short_link_uses_custom_checkout_and_returns_hosted_url(self):
-        checkout_response = _response(
-            {
-                "checkout_session_id": "cs_live_team_short123",
-                "processor_entity": "openai_llc",
-                "publishable_key": payment.OPENAI_STRIPE_PK,
-                "url": None,
-            }
-        )
-        stripe_response = _response(
-            {
-                "stripe_hosted_url": "https://checkout.stripe.com/c/pay/cs_live_team_short123#fid_team",
-            }
-        )
-
-        with mock.patch.object(payment.cffi_requests, "post", side_effect=[checkout_response, stripe_response]) as post_mock:
-            url = payment.generate_team_link(
-                DummyAccount(),
-                country="US",
-                currency="USD",
-                link_format=payment.PAYMENT_LINK_FORMAT_SHORT,
-            )
-
-        self.assertEqual(url, "https://pay.openai.com/c/pay/cs_live_team_short123#fid_team")
-        payload = post_mock.call_args_list[0].kwargs["json"]
-        self.assertEqual(payload["checkout_ui_mode"], "custom")
-        init_payload = post_mock.call_args_list[1].kwargs["data"]
-        self.assertEqual(init_payload["elements_session_client[elements_init_source]"], "custom_checkout")
-
     def test_generate_plus_short_link_uses_fallback_publishable_key(self):
         checkout_response = _response(
             {
@@ -258,51 +229,6 @@ class ChatGPTPaymentTests(unittest.TestCase):
             + payment.PAY_OPENAI_CHECKOUT_FRAGMENT,
         )
 
-    def test_generate_team_link_builds_pay_openai_url_from_checkout_session_id_by_default(self):
-        checkout_response = _response({"checkout_session_id": "cs_live_team123"})
-        stripe_response = _response(
-            {
-                "stripe_hosted_url": "https://checkout.stripe.com/c/pay/cs_live_team123#fid_team_hosted",
-            }
-        )
-
-        with mock.patch.object(payment.cffi_requests, "post", side_effect=[checkout_response, stripe_response]) as post_mock:
-            url = payment.generate_team_link(DummyAccount(), country="US", currency="USD")
-
-        self.assertEqual(url, "https://pay.openai.com/c/pay/cs_live_team123#fid_team_hosted")
-        payload = post_mock.call_args_list[0].kwargs["json"]
-        self.assertEqual(payload["checkout_ui_mode"], "hosted")
-
-    def test_generate_team_link_matches_har_payload_and_returns_hosted_url(self):
-        response = mock.Mock()
-        response.status_code = 200
-        response.json.return_value = {"url": "https://chatgpt.com/checkout/openai_llc/long-team-url"}
-        response.raise_for_status.return_value = None
-
-        with mock.patch.object(payment.cffi_requests, "post", return_value=response) as post_mock, \
-            mock.patch.object(payment.cffi_requests, "get") as get_mock:
-            url = payment.generate_team_link(
-                DummyAccount(),
-                workspace_name="TeamDemo",
-                price_interval="year",
-                seat_quantity=3,
-                country="JP",
-                currency="JPY",
-            )
-
-        self.assertEqual(url, "https://chatgpt.com/checkout/openai_llc/long-team-url")
-        get_mock.assert_not_called()
-        payload = post_mock.call_args.kwargs["json"]
-        self.assertEqual(payload["billing_details"], {"country": "JP", "currency": "JPY"})
-        self.assertEqual(payload["plan_name"], "chatgptteamplan")
-        self.assertEqual(payload["team_plan_data"]["workspace_name"], "TeamDemo")
-        self.assertEqual(payload["team_plan_data"]["seat_quantity"], 3)
-        self.assertNotIn("existing_workspace_id", payload["team_plan_data"])
-        self.assertEqual(payload["checkout_ui_mode"], "hosted")
-        headers = post_mock.call_args.kwargs["headers"]
-        self.assertNotIn("chatgpt-account-id", headers)
-        self.assertEqual(payload["cancel_url"], "https://chatgpt.com/?promoCode=STRIPEATLASGPT4BIZ050126")
-
     def test_checkout_config_summary_extracts_currency(self):
         summary = payment.summarize_checkout_pricing_config(
             {
@@ -311,7 +237,6 @@ class ChatGPTPaymentTests(unittest.TestCase):
                 "symbol": "€",
                 "currency_config": {
                     "plus": {"month": {"amount": 23}},
-                    "business": {"month": {"amount": 26}},
                 },
             }
         )

@@ -1,5 +1,8 @@
 # Auto ChatGPT Performance Optimization Closeout
 
+> Historical closeout. K12, multi-Workspace, Business and Team references below
+> describe the pre-v2.0.0 system and are not current product capabilities.
+
 ## Scope
 
 This note captures the current end state of the performance optimization work

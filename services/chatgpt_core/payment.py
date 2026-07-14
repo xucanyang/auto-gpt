@@ -1,5 +1,5 @@
 """
-支付核心逻辑 — 生成 Plus/Team 支付链接、无痕打开浏览器、检测订阅状态
+支付核心逻辑 — 生成 Plus 支付链接、无痕打开浏览器、检测订阅状态
 """
 
 from __future__ import annotations
@@ -21,17 +21,15 @@ from core.proxy_utils import build_requests_proxy_config
 logger = logging.getLogger(__name__)
 
 PAYMENT_CHECKOUT_URL = "https://chatgpt.com/backend-api/payments/checkout"
-TEAM_CHECKOUT_BASE_URL = "https://chatgpt.com/checkout/openai_llc/"
+CHATGPT_CHECKOUT_BASE_URL = "https://chatgpt.com/checkout/openai_llc/"
 PAY_OPENAI_CHECKOUT_BASE_URL = "https://pay.openai.com/c/pay/"
 PAY_OPENAI_CHECKOUT_FRAGMENT = (
     "#fidnandhYHdWcXxpYCc%2FJ2FgY2RwaXEnKSdpamZkaWAnPyd%2FbScpJ3ZwZ3Zmd2x1cWxqa1BrbHRwYGtgdnZAa2RnaWBhJz9jZGl2YCknYnBkZmRoamlgU2R3bGRrcSc%2FJ2Zqa3F3amknKSdkdWxOYHwnPyd1blppbHNgWjA0TUp3VnJGM200a31Cakw2aVFEYldvXFN3fzFhUDZjU0pkZ3xGZk5XNnVnQE9icEZTRGl0Rn1hfUZQc2pXbTRdUnJXZGZTbGpzUDZuSU5zdW5vbTJMdG5SNTVsXVR2b2o2aycpJ2N3amhWYHdzYHcnP3F3cGApJ2dkZm5id2pwa2FGamlqdyc%2FJyZjY2NjY2MnKSdpZHxqcHFRfHVgJz8ndmxrYmlgWmxxYGgnKSdga2RnaWBVaWRmYG1qaWFgd3YnP3F3cGB4JSUl"
 )
-ACCOUNTS_CHECK_URL = "https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27"
 CHECKOUT_PRICING_COUNTRIES_URL = "https://chatgpt.com/backend-api/checkout_pricing_config/countries"
 CHECKOUT_PRICING_CONFIG_URL = "https://chatgpt.com/backend-api/checkout_pricing_config/configs/{country_code}"
 DEFAULT_CHECKOUT_COUNTRY = "ID"
 DEFAULT_CHECKOUT_CURRENCY = "IDR"
-DEFAULT_CHECKOUT_PROMO_CODE = "STRIPEATLASGPT4BIZ050126"
 DEFAULT_STRIPE_PK = "pk_live_51Pj377KslHRdbaPgTJYjThzH3f5dt1N1vK7LUp0qh0yNSarhfZ6nfbG7FFlh8KLxVkvdMWN5o6Mc4Vda6NHaSnaV00C2Sbl8Zs"
 OPENAI_STRIPE_PK = "pk_live_51HOrSwC6h1nxGoI3lTAgRjYVrz4dU3fVOabyCcKR3pbEJguCVAlqCxdxCUvoRh1XWwRacViovU3kLKvpkjh7IqkW00iXQsjo3n"
 STRIPE_API = "https://api.stripe.com"
@@ -183,7 +181,6 @@ def summarize_checkout_pricing_config(config: dict[str, Any]) -> dict[str, Any]:
         "symbol": str((config or {}).get("symbol") or ""),
         "minor_unit_exponent": (config or {}).get("minor_unit_exponent"),
         "plus": currency_config.get("plus") or {},
-        "business": currency_config.get("business") or {},
         "tax_type": (config or {}).get("tax_type"),
         "tax_percent": (config or {}).get("tax_percent"),
     }
@@ -489,54 +486,6 @@ def _checkout_billing_details(
     return details
 
 
-def _fetch_checkout_workspace_context(account: Any, proxy: Optional[str] = None) -> tuple[str, str]:
-    """模仿脚本里的 accounts/check 逻辑，找到 workspace 账号 ID 和名称。"""
-    headers = {
-        "Authorization": f"Bearer {account.access_token}",
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "Origin": "https://chatgpt.com",
-        "Referer": "https://chatgpt.com/",
-    }
-    if account.cookies:
-        headers["cookie"] = account.cookies
-
-    response = cffi_requests.get(
-        f"{ACCOUNTS_CHECK_URL}?timezone_offset_min={_local_timezone_offset_minutes()}",
-        headers=headers,
-        proxies=_build_proxies(proxy),
-        timeout=30,
-        impersonate="chrome110",
-    )
-    response.raise_for_status()
-    data = response.json()
-    if not isinstance(data, dict):
-        return "", ""
-
-    accounts = data.get("accounts") if isinstance(data.get("accounts"), dict) else {}
-    account_ordering = data.get("account_ordering") if isinstance(data.get("account_ordering"), list) else []
-
-    def _pick_name(item: dict[str, Any]) -> str:
-        account_info = item.get("account") if isinstance(item.get("account"), dict) else {}
-        return str(account_info.get("name") or "").strip() or "My Workspace"
-
-    for key, item in accounts.items():
-        account_key = str(key or "").strip()
-        if not account_key or account_key == "default" or not isinstance(item, dict):
-            continue
-        account_info = item.get("account") if isinstance(item.get("account"), dict) else {}
-        if str(account_info.get("structure") or "").strip().lower() == "workspace":
-            return account_key, _pick_name(item)
-
-    for raw_key in account_ordering:
-        key = str(raw_key or "").strip()
-        item = accounts.get(key)
-        if key and isinstance(item, dict):
-            return key, _pick_name(item)
-
-    return "", ""
-
-
 def _generate_checkout_url(
     *,
     account: Any,
@@ -687,53 +636,6 @@ def generate_plus_short_link(
         currency=currency,
         billing=billing,
         link_format=PAYMENT_LINK_FORMAT_SHORT,
-    )
-
-
-def generate_team_link(
-    account: Any,
-    workspace_name: str = "MyTeam",
-    price_interval: str = "month",
-    seat_quantity: int = 5,
-    promo_code: Optional[str] = None,
-    proxy: Optional[str] = None,
-    country: str = DEFAULT_CHECKOUT_COUNTRY,
-    currency: Optional[str] = DEFAULT_CHECKOUT_CURRENCY,
-    billing: Optional[dict[str, Any]] = None,
-    link_format: Any = DEFAULT_PAYMENT_LINK_FORMAT,
-) -> str:
-    """生成 Team 支付链接。默认长 hosted 链接，可按参数返回 ChatGPT 短链接。"""
-    if not account.access_token:
-        raise ValueError("账号缺少 access_token")
-
-    country = normalize_checkout_country(country)
-    currency = normalize_checkout_currency(currency, country)
-    resolved_promo_code = str(promo_code or DEFAULT_CHECKOUT_PROMO_CODE).strip() or DEFAULT_CHECKOUT_PROMO_CODE
-    resolved_link_format = normalize_payment_link_format(link_format)
-
-    payload = {
-        "entry_point": "team_workspace_purchase_modal",
-        "plan_name": "chatgptteamplan",
-        "team_plan_data": {
-            "workspace_name": workspace_name,
-            "price_interval": price_interval,
-            "seat_quantity": seat_quantity,
-        },
-        "billing_details": _checkout_billing_details(
-            billing,
-            country=country,
-            currency=currency,
-            email=str(getattr(account, "email", "") or ""),
-        ),
-        "promo_code": resolved_promo_code,
-        "cancel_url": f"https://chatgpt.com/?promoCode={resolved_promo_code}",
-        "checkout_ui_mode": checkout_ui_mode_for_link_format(resolved_link_format),
-    }
-    return _generate_checkout_url(
-        account=account,
-        payload=payload,
-        proxy=proxy,
-        link_format=resolved_link_format,
     )
 
 

@@ -21,7 +21,7 @@ from services.chatgpt_account_state import (
 from .account_fingerprint import inject_account_browser_fingerprint, persist_account_browser_fingerprint
 from .local_status_refresh import schedule_chatgpt_local_status_refresh_for_account_id
 from .mailbox_state import mailbox_state_summary, sanitize_mailbox_state
-from .pending_business_invites import RestoredEmailService, _mailbox_state_from_account
+from .restored_email_service import RestoredEmailService, mailbox_state_from_account
 from .refresh_token_registration_engine import EmailServiceAdapter, RefreshTokenRegistrationEngine
 from .utils import decode_jwt_payload, generate_random_birthday, generate_random_name
 
@@ -66,11 +66,6 @@ AT_ONLY_CLEAR_EXTRA_KEYS = (
     "session_token",
     "workspace_id",
     "organization_id",
-    "chatgpt_workspace_variants",
-    "chatgpt_workspace_scope",
-    "chatgpt_workspace_label",
-    "chatgpt_workspace_display_name",
-    "chatgpt_workspace_variant_key",
     "chatgpt_has_refresh_token_solution",
     "partial_auth",
 )
@@ -630,7 +625,7 @@ def recheck_invalid_chatgpt_account(
         email = str(account.email or "").strip()
         password = str(account.password or "")
         extra = account.get_extra()
-        mailbox_state = _mailbox_state_from_account(account, extra=extra)
+        mailbox_state = mailbox_state_from_account(account, extra=extra)
 
     if status != "invalid":
         return {

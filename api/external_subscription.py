@@ -27,7 +27,6 @@ from services.chatgpt_account_state import (
 )
 from services.chatgpt_core.payment_link_cache import (
     normalize_payment_link_params,
-    normalize_payment_link_plan,
     payment_link_status_label,
 )
 
@@ -232,13 +231,16 @@ def _payment_link_from_account(account: AccountModel) -> dict[str, Any]:
         or ""
     ).strip()
     if paypal_url:
+        explicit_plan = str(paypal.get("plan") or cached.get("plan") or "").strip().lower()
+        if explicit_plan != "plus":
+            return {}
         amount_text = str(paypal.get("checkout_amount") or legacy_approval.get("checkout_amount") or cached.get("checkout_amount") or "").strip()
         currency = str(paypal.get("currency") or legacy_approval.get("currency") or cached.get("currency") or _currency_from_amount_text(amount_text) or SENDABLE_CURRENCY).strip().upper()
         source = str(paypal.get("source") or legacy_approval.get("upstream") or legacy_approval.get("source") or cached.get("source") or "").strip()
         payload: dict[str, Any] = {
             "url": paypal_url,
             "paypal_url": paypal_url,
-            "plan": normalize_payment_link_plan(paypal.get("plan") or cached.get("plan") or "plus"),
+            "plan": explicit_plan,
             "country": str(paypal.get("country") or paypal.get("billing_country") or legacy_approval.get("billing_country") or cached.get("country") or "US").strip().upper() or "US",
             "currency": currency or SENDABLE_CURRENCY,
             "proxy": str(paypal.get("proxy") or cached.get("proxy") or "").strip(),
@@ -296,11 +298,14 @@ def _payment_link_from_account(account: AccountModel) -> dict[str, Any]:
     ).strip()
     if not url:
         return {}
+    explicit_plan = str(cached.get("plan") or "").strip().lower()
+    if explicit_plan != "plus":
+        return {}
     params = normalize_payment_link_params(cached)
     payload: dict[str, Any] = {
         "url": url,
         "paypal_url": str(cached.get("paypal_url") or "").strip(),
-        "plan": normalize_payment_link_plan(cached.get("plan")),
+        "plan": explicit_plan,
         "country": params["country"],
         "currency": params["currency"],
         "proxy": params["proxy"],
@@ -477,7 +482,10 @@ def _claim_subscription_link_preflight(account: AccountModel, link: dict[str, An
 
 
 def _claim_matches_filters(link: dict[str, Any], req: ClaimSubscriptionLinksRequest) -> bool:
-    if req.plan and normalize_payment_link_plan(req.plan) != normalize_payment_link_plan(link.get("plan")):
+    requested_plan = str(req.plan or "").strip().lower()
+    if requested_plan and requested_plan != "plus":
+        return False
+    if str(link.get("plan") or "").strip().lower() != "plus":
         return False
     if req.country:
         expected = normalize_payment_link_params({
@@ -1207,6 +1215,9 @@ def _run_due_local_verifications(session: Session, now: datetime) -> int:
 
 @router.post("/claim", dependencies=[Depends(_require_external_api_token)])
 def claim_subscription_links(req: ClaimSubscriptionLinksRequest, session: Session = Depends(get_session)):
+    requested_plan = str(req.plan or "").strip().lower()
+    if requested_plan and requested_plan != "plus":
+        raise HTTPException(status_code=400, detail="外部订阅链接只支持 Plus 套餐")
     now = _utcnow()
     _schedule_due_local_verifications(session, now)
     _expire_stale_claims(session, now)

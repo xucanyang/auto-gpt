@@ -33,11 +33,35 @@ PAYMENT_LINK_STATUS_SYNC_STATUSES = {"already_paid"}
 PAYMENT_LINK_FORMAT_PAYPAL = "paypal_url"
 PAYMENT_SOURCE_CHATGPT_HOSTED = "chatgpt_hosted"
 PAYMENT_SOURCE_LONG_LINK_PAYPAL = "long_link_paypal"
+RETIRED_PAYMENT_REQUEST_KEYS = frozenset({
+    "promo_code",
+    "workspace_name",
+    "seat_quantity",
+    "price_interval",
+})
 
 
 def normalize_payment_link_plan(value: Any) -> str:
-    plan = str(value or "plus").strip().lower()
-    return plan if plan in {"plus", "team"} else "plus"
+    return "plus"
+
+
+def _is_supported_raw_payment_link_plan(value: Any) -> bool:
+    raw_plan = str(value or "").strip().lower()
+    return not raw_plan or raw_plan == "plus"
+
+
+def validate_plus_payment_request_params(params: dict[str, Any] | None) -> None:
+    """Reject retired product inputs before any account, task, or cache work."""
+    if params is None:
+        return
+    if not isinstance(params, dict):
+        raise ValueError("支付参数必须是对象")
+    raw_plan = str(params.get("plan") or "").strip().lower()
+    if raw_plan and raw_plan != "plus":
+        raise ValueError("当前仅支持 Plus 支付计划")
+    retired_keys = sorted(RETIRED_PAYMENT_REQUEST_KEYS.intersection(params))
+    if retired_keys:
+        raise ValueError(f"已下线的 Team 支付参数: {', '.join(retired_keys)}")
 
 
 def normalize_payment_link_status(value: Any) -> str:
@@ -90,14 +114,6 @@ def payment_link_url_requires_regeneration(value: Any, link_format: Any = None) 
     return is_default_hosted_checkout_fragment(value)
 
 
-def _positive_int(value: Any, default: int) -> int:
-    try:
-        parsed = int(value)
-    except Exception:
-        parsed = default
-    return max(1, parsed)
-
-
 def normalize_payment_link_params(params: dict[str, Any] | None) -> dict[str, Any]:
     source = params if isinstance(params, dict) else {}
     plan = normalize_payment_link_plan(source.get("plan"))
@@ -116,10 +132,6 @@ def normalize_payment_link_params(params: dict[str, Any] | None) -> dict[str, An
         "payment_link_format": payment_link_format,
         "payment_source": payment_source,
         "profile_hash": str(source.get("profile_hash") or source.get("payment_profile_hash") or "").strip(),
-        "promo_code": str(source.get("promo_code") or "").strip(),
-        "workspace_name": str(source.get("workspace_name") or "MyTeam").strip() or "MyTeam",
-        "seat_quantity": max(2, _positive_int(source.get("seat_quantity", 5), 5)),
-        "price_interval": str(source.get("price_interval") or "month").strip().lower() or "month",
     }
 
 
@@ -128,6 +140,10 @@ def payment_link_cache_matches(
     params: dict[str, Any] | None,
 ) -> bool:
     if not isinstance(cached, dict) or not normalize_payment_link_url(cached.get("url")):
+        return False
+    if not _is_supported_raw_payment_link_plan(cached.get("plan")):
+        return False
+    if isinstance(params, dict) and not _is_supported_raw_payment_link_plan(params.get("plan")):
         return False
     expected = normalize_payment_link_params(params)
     cached_plan = normalize_payment_link_plan(cached.get("plan"))
@@ -193,6 +209,20 @@ def build_payment_link_cache_payload(
         if fallback_format == link_format and fallback_payment_source == payment_source
         else {}
     )
+    payload_raw_plan_values = (
+        payload_source.get("plan"),
+        payload_source.get("chatgpt_checkout_plan"),
+    )
+    fallback_raw_plan_values = (
+        metadata_fallback.get("plan"),
+        metadata_fallback.get("chatgpt_checkout_plan"),
+    )
+    explicit_payload_plans = [value for value in payload_raw_plan_values if str(value or "").strip()]
+    plans_to_validate = explicit_payload_plans or [
+        value for value in fallback_raw_plan_values if str(value or "").strip()
+    ]
+    if any(not _is_supported_raw_payment_link_plan(value) for value in plans_to_validate):
+        return {}
     url = str(
         payload_source.get("url")
         or payload_source.get("paypal_url")
@@ -251,7 +281,6 @@ def build_payment_link_cache_payload(
             or metadata_fallback.get("payment_profile_hash")
             or ""
         ).strip(),
-        "promo_code": str(payload_source.get("promo_code") or metadata_fallback.get("promo_code") or "").strip(),
         "source": str(source or payload_source.get("source") or metadata_fallback.get("source") or "").strip(),
         "created_at": str(
             payload_source.get("created_at")

@@ -24,12 +24,6 @@ import {
 } from '@/lib/chatgptRegistrationMode'
 import { apiFetch } from '@/lib/utils'
 import { normalizeDomainList } from '@/lib/domainList'
-import {
-  CHATGPT_K12_FIELD_NAMES,
-  buildChatGPTK12ConfigData,
-  chatgptK12InitialValues,
-  normalizeK12WorkspaceIds,
-} from '@/lib/chatgptK12Config'
 
 
 type TempMailDomainOption = {
@@ -57,7 +51,7 @@ function mailProviderLabel(provider: string) {
 type RegisterTaskModalProps = {
   open: boolean
   currentPlatform: string
-  taskModalMode: 'register' | 'resume_auth' | 'payment_link' | 'sub2api_upload' | 'oaipay_upload' | 'baxigpt_cdk' | 'paypal_bind' | 'probe_local_status' | 'k12_recapture'
+  taskModalMode: 'register' | 'resume_auth' | 'payment_link' | 'sub2api_upload' | 'oaipay_upload' | 'baxigpt_cdk' | 'paypal_bind' | 'probe_local_status'
   taskModalAccount: any
   taskId: string | null
   taskSnapshot: any
@@ -100,8 +94,6 @@ export function RegisterTaskModal({
   const proxyFailover = Form.useWatch('proxy_failover', registerForm)
   const uniqueExitIpEnabled = Form.useWatch('chatgpt_register_unique_exit_ip_enabled', registerForm)
   const registerCount = Number(Form.useWatch('count', registerForm) || 1)
-  const k12Enabled = Form.useWatch('chatgpt_k12_enabled', registerForm)
-  const k12SaveAllSpaces = Form.useWatch('chatgpt_k12_save_all_spaces', registerForm)
   const [tempmailDomains, setTempmailDomains] = useState<TempMailDomainOption[]>([])
   const [tempmailDomainsLoading, setTempmailDomainsLoading] = useState(false)
   const isPhoneSignup = currentPlatform === 'chatgpt' && chatgptRegistrationEntry === 'phone_signup'
@@ -155,24 +147,6 @@ export function RegisterTaskModal({
     if (!open || !isPhoneSignup) return
     registerForm.setFieldsValue({ concurrency: 1 })
   }, [open, isPhoneSignup, registerForm])
-
-  useEffect(() => {
-    if (!open || currentPlatform !== 'chatgpt') return
-    let cancelled = false
-    apiFetch('/config')
-      .then((cfg) => {
-        if (cancelled) return
-        const isTouched = typeof registerForm.isFieldsTouched === 'function'
-          ? registerForm.isFieldsTouched(CHATGPT_K12_FIELD_NAMES, false)
-          : false
-        if (isTouched) return
-        registerForm.setFieldsValue(chatgptK12InitialValues(cfg))
-      })
-      .catch(() => null)
-    return () => {
-      cancelled = true
-    }
-  }, [currentPlatform, open, registerForm])
 
   const isPhoneBindingTest = String(taskSnapshot?.source || '').trim() === 'phone_binding_test'
   const boundPhoneLines = Array.isArray(taskSnapshot?.meta?.bound_phone_lines) ? taskSnapshot.meta.bound_phone_lines : []
@@ -238,11 +212,6 @@ export function RegisterTaskModal({
           ? `批量补抓Auth (${taskSnapshot?.meta?.eligible} 个)`
           : '补抓Auth'
     }
-    if (taskModalMode === 'k12_recapture') {
-      const eligible = Number(taskSnapshot?.meta?.eligible || 0)
-      if (taskModalAccount?.email) return `K12重跑 ${taskModalAccount.email}`
-      return eligible > 0 ? `批量K12重跑 (${eligible} 个)` : 'K12重跑'
-    }
     if (taskId && isPhoneSignupTask) {
       const count = registeredPhoneSuccessCount
       return count > 0 ? `手机号注册 (${count} 个)` : '手机号注册'
@@ -250,31 +219,15 @@ export function RegisterTaskModal({
     return `注册 ${currentPlatform}`
   }
 
-  const persistChatGPTK12Config = async () => {
-    if (currentPlatform !== 'chatgpt') return
-    const values = registerForm.getFieldsValue(true)
-    await apiFetch('/config', {
-      method: 'PUT',
-      body: JSON.stringify({ data: buildChatGPTK12ConfigData(values) }),
-    })
-  }
-
   const handleSaveRegisterSettings = async () => {
     try {
-      await persistChatGPTK12Config()
       await onSaveRegisterSettings()
     } catch (error: any) {
-      message.error(error?.message || '保存 K12 配置失败')
+      message.error(error?.message || '保存注册设置失败')
     }
   }
 
   const handleRegister = async () => {
-    try {
-      await persistChatGPTK12Config()
-    } catch (error: any) {
-      message.error(error?.message || '保存 K12 配置失败')
-      return
-    }
     try {
       await onRegister()
     } catch (error: any) {
@@ -462,7 +415,7 @@ export function RegisterTaskModal({
                 showIcon
                 style={{ marginBottom: 16 }}
                 message="当前注册将使用手动邮箱模式"
-                description="请先填写你的邮箱地址。默认仍走原始“注册新号”逻辑；若开启“已有账号抓 auth”，则会跳过注册状态机，直接登录并抓取 workspace auth。真正需要验证码时，弹窗会切到任务日志面板，再出现验证码输入卡片。"
+                description="请先填写你的邮箱地址。默认仍走原始“注册新号”逻辑；若开启“已有账号抓 auth”，则会跳过注册状态机，直接登录并抓取认证信息。真正需要验证码时，弹窗会切到任务日志面板，再出现验证码输入卡片。"
               />
               <Form.Item
                 name="email"
@@ -478,7 +431,7 @@ export function RegisterTaskModal({
                     name="chatgpt_existing_account_capture"
                     valuePropName="checked"
                     initialValue={false}
-                    extra="开启后：跳过注册状态机，直接登录已有账号抓取 auth / workspace。关闭则保持原始手动注册新号逻辑。"
+                    extra="开启后：跳过注册状态机，直接登录已有账号抓取认证信息。关闭则保持原始手动注册新号逻辑。"
                   >
                     <Checkbox>已有账号抓 auth</Checkbox>
                   </Form.Item>
@@ -674,7 +627,7 @@ export function RegisterTaskModal({
               showIcon
               style={{ marginBottom: 12 }}
               message="手机号注册固定保存 AccessToken-only"
-              description="这条链路只负责手机号注册阶段，不进入邮箱注册、team invite、full-auth 或 refresh_token 补抓。"
+              description="这条链路只负责手机号注册阶段，不进入邮箱注册、full-auth 或 refresh_token 补抓。"
             />
           ) : currentPlatform === 'chatgpt' ? (
             <>
@@ -684,21 +637,12 @@ export function RegisterTaskModal({
                   onChange={setChatgptRegistrationMode}
                 />
               </Form.Item>
-              {chatgptRegistrationMode !== CHATGPT_REGISTRATION_MODE_REFRESH_TOKEN ? (
-                <Alert
-                  type="warning"
-                  showIcon
-                  style={{ marginBottom: 12 }}
-                  message="当前为无 RT 方案"
-                  description="team invite / 延迟激活配置会保留，但无 RT 方案下可能无法完整生效。"
-                />
-              ) : null}
               {chatgptRegistrationMode === CHATGPT_REGISTRATION_MODE_REFRESH_TOKEN ? (
                 <Form.Item
                   name="chatgpt_save_registration_access_token_account"
                   valuePropName="checked"
                   initialValue={true}
-                  extra="默认开启：注册阶段已拿到 AccessToken，但后续 refresh_token / 工作空间抓取失败时，也会保存一个 AccessToken-only 账号，避免真实注册成功却没有入库。"
+                  extra="默认开启：注册阶段已拿到 AccessToken，但后续 refresh_token 获取失败时，也会保存一个 AccessToken-only 账号，避免真实注册成功却没有入库。"
                 >
                   <Checkbox>保存注册阶段 AccessToken 账号</Checkbox>
                 </Form.Item>
@@ -710,145 +654,6 @@ export function RegisterTaskModal({
                 extra="开启：注册状态机发现邮箱已存在或被 OpenAI 路由到登录时，继续登录恢复并保存；关闭：直接跳过该邮箱，不保存到库存，并写入任务日志。"
               >
                 <Checkbox>遇到已注册邮箱时路由到登录</Checkbox>
-              </Form.Item>
-              <Form.Item
-                label="K12 / Workspace 加入"
-                extra="只保存 workspace variants 摘要与抓取策略；token/cookies 不会在列表或摘要中展开。"
-              >
-                <Space direction="vertical" size={8} style={{ width: '100%' }}>
-                  <Space size={16} wrap>
-                    <Form.Item name="chatgpt_k12_enabled" valuePropName="checked" initialValue={false} noStyle>
-                      <Checkbox>启用 K12</Checkbox>
-                    </Form.Item>
-                    <Form.Item name="chatgpt_k12_save_all_spaces" valuePropName="checked" initialValue={true} noStyle>
-                      <Checkbox disabled={!k12Enabled}>保存所有空间 variants</Checkbox>
-                    </Form.Item>
-                    <Form.Item name="chatgpt_k12_strict_join" valuePropName="checked" initialValue={false} noStyle>
-                      <Checkbox disabled={!k12Enabled}>严格 join</Checkbox>
-                    </Form.Item>
-                    <Form.Item name="chatgpt_k12_capture_refresh_tokens" valuePropName="checked" initialValue={false} noStyle>
-                      <Checkbox disabled>抓取 RT variants（预留）</Checkbox>
-                    </Form.Item>
-                  </Space>
-                  <Form.Item
-                    name="chatgpt_k12_workspace_ids"
-                    label="Workspace IDs"
-                    initialValue={[]}
-                    rules={[
-                      {
-                        validator: (_, value) => {
-                          if (!k12Enabled || k12SaveAllSpaces || normalizeK12WorkspaceIds(value).length > 0) {
-                            return Promise.resolve()
-                          }
-                          return Promise.reject(new Error('启用 K12 且未保存所有空间时，请至少填写一个 workspace_id'))
-                        },
-                      },
-                    ]}
-                    extra="可粘贴多个 workspace_id，逗号、空格或回车分隔；勾选保存所有空间时可留空。"
-                  >
-                    <Select
-                      mode="tags"
-                      open={false}
-                      allowClear
-                      disabled={!k12Enabled || k12SaveAllSpaces}
-                      tokenSeparators={[',', ' ', '\n']}
-                      placeholder="ws_xxx / org_xxx"
-                      style={{ width: '100%' }}
-                    />
-                  </Form.Item>
-                  <Space align="start" style={{ width: '100%' }}>
-                    <Form.Item name="chatgpt_k12_join_timeout_seconds" label="超时秒数" initialValue={60} style={{ flex: 1 }}>
-                      <InputNumber disabled={!k12Enabled} min={30} max={3600} precision={0} style={{ width: '100%' }} />
-                    </Form.Item>
-                    <Form.Item name="chatgpt_k12_join_retry_count" label="重试次数" initialValue={2} style={{ flex: 1 }}>
-                      <InputNumber disabled={!k12Enabled} min={0} max={20} precision={0} style={{ width: '100%' }} />
-                    </Form.Item>
-                    <Form.Item name="chatgpt_k12_post_join_poll_seconds" label="轮询间隔秒" initialValue="3,8,15" style={{ flex: 1 }}>
-                      <Input disabled={!k12Enabled} placeholder="3,8,15" />
-                    </Form.Item>
-                  </Space>
-                </Space>
-              </Form.Item>
-              <Form.Item
-                noStyle
-                shouldUpdate={(prev, next) => (
-                  prev.chatgpt_existing_account_capture !== next.chatgpt_existing_account_capture
-                  || prev.chatgpt_enable_team_invite !== next.chatgpt_enable_team_invite
-                )}
-              >
-                {({ getFieldValue }) => {
-                  const existingAccountCapture = Boolean(getFieldValue('chatgpt_existing_account_capture'))
-                  const teamInviteEnabled = Boolean(getFieldValue('chatgpt_enable_team_invite'))
-                  return existingAccountCapture ? (
-                    <>
-                      <Form.Item
-                        label="工作空间抓取"
-                        extra="默认只抓 free；只有确认是 Team/Business 或你明确勾选时才抓 business，避免普通账号保存重复工作空间。"
-                      >
-                        <Space direction="vertical" size={6}>
-                          <Form.Item name="chatgpt_capture_business_workspace" valuePropName="checked" noStyle>
-                            <Checkbox>抓取 business 工作空间</Checkbox>
-                          </Form.Item>
-                          <Form.Item name="chatgpt_capture_free_workspace" valuePropName="checked" noStyle>
-                            <Checkbox>抓取 free 工作空间</Checkbox>
-                          </Form.Item>
-                        </Space>
-                      </Form.Item>
-                      <Alert
-                        type="info"
-                        showIcon
-                        message="当前使用已有账号抓 auth"
-                        description="这条链路不会进入注册 / team invite；会直接登录已有账号，并按上方勾选范围抓取工作空间。"
-                      />
-                    </>
-                  ) : (
-                    <>
-                      <Form.Item
-                        label="工作空间抓取"
-                        extra="free 勾选独立生效；business 依赖 team invite。若两项都勾，会分别获取并按名称区分保存。"
-                      >
-                        <Space direction="vertical" size={6}>
-                          <Form.Item name="chatgpt_capture_free_workspace" valuePropName="checked" noStyle>
-                            <Checkbox>抓取 free 工作空间</Checkbox>
-                          </Form.Item>
-                        </Space>
-                      </Form.Item>
-                      <Form.Item
-                        name="chatgpt_enable_team_invite"
-                        valuePropName="checked"
-                        label="Business Team Invite"
-                        extra="关闭时走原始注册/登录链路；开启后才会进入 business recovery / team invite。"
-                      >
-                        <Checkbox>启用 team invite / business 恢复</Checkbox>
-                      </Form.Item>
-                      {teamInviteEnabled ? (
-                        <>
-                          <Form.Item
-                            name="chatgpt_team_invite_deferred_activation"
-                            valuePropName="checked"
-                            extra="开启后：先完成全部账号注册并发出邀请，再统一进入激活阶段；不会在单账号刚注册完时立刻进入 business/free。窗口里的“Business 延迟邀请”只作为补救/重试入口。"
-                          >
-                            <Checkbox>延迟邀请（先统一发邀请，再统一激活）</Checkbox>
-                          </Form.Item>
-                          <Form.Item>
-                            <Space direction="vertical" size={6}>
-                              <Form.Item name="chatgpt_capture_business_workspace" valuePropName="checked" noStyle>
-                                <Checkbox>抓取 business 工作空间</Checkbox>
-                              </Form.Item>
-                            </Space>
-                          </Form.Item>
-                        </>
-                      ) : (
-                        <Alert
-                          type="info"
-                          showIcon
-                          message="当前关闭 team invite"
-                          description="普通模式下会直接走 free 主链；business 与延迟邀请配置在开启 team invite 后才生效。"
-                        />
-                      )}
-                    </>
-                  )
-                }}
               </Form.Item>
             </>
           ) : null}

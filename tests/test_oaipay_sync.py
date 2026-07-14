@@ -42,6 +42,57 @@ class OaiPaySyncTests(unittest.TestCase):
         account.user_id = "acct-oai-demo"
         return account
 
+    def test_backfill_rejects_retired_subscription_before_upload(self):
+        for plan in ("team", "business", "enterprise"):
+            with self.subTest(plan=plan):
+                account = self._make_account()
+                extra = account.get_extra()
+                extra["chatgpt_local"] = {"subscription": {"plan": plan}}
+                account.set_extra(extra)
+
+                with mock.patch(
+                    "services.oaipay_sync.upload_to_oaipay_detailed",
+                    side_effect=AssertionError("retired subscription reached remote upload"),
+                ) as upload:
+                    outcome = backfill_chatgpt_account_to_oaipay(account, commit=False)
+
+                self.assertFalse(outcome["ok"])
+                self.assertTrue(outcome["skipped"])
+                self.assertIn("已退役", outcome["message"])
+                upload.assert_not_called()
+
+    def test_direct_upload_rejects_retired_subscription_before_config_or_network(self):
+        account = self._make_account()
+        capabilities = {
+            "subscription_plan": "enterprise",
+            "last_known_subscription_plan": "enterprise",
+            "has_paid_subscription": True,
+        }
+
+        with mock.patch(
+            "services.chatgpt_core.oaipay_upload._get_config_value",
+            side_effect=AssertionError("retired subscription reached OAIPay config/network path"),
+        ) as get_config:
+            outcome = upload_to_oaipay_detailed(account, capabilities=capabilities)
+
+        self.assertFalse(outcome["ok"])
+        self.assertTrue(outcome["skipped"])
+        self.assertIn("已退役", outcome["message"])
+        get_config.assert_not_called()
+
+    def test_backfill_rejects_stale_last_known_retired_subscription(self):
+        account = self._make_account()
+        extra = account.get_extra()
+        extra["last_known_subscription_plan"] = "business"
+        account.set_extra(extra)
+
+        with mock.patch("services.oaipay_sync.upload_to_oaipay_detailed") as upload:
+            outcome = backfill_chatgpt_account_to_oaipay(account, commit=False)
+
+        self.assertFalse(outcome["ok"])
+        self.assertTrue(outcome["skipped"])
+        upload.assert_not_called()
+
     def test_probe_reports_existing_remote_account(self):
         account = self._make_account()
         rows = [

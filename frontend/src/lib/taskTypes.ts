@@ -8,8 +8,8 @@ export const TASK_SOURCE_LABELS: Record<string, string> = {
   batch_custom_email_recheck: '批量邮箱测活',
   invalid_recheck: '失效测活',
   batch_invalid_recheck: '批量失效测活',
-  k12_workspace_recapture: 'K12重跑',
-  batch_k12_workspace_recapture: '批量K12重跑',
+  k12_workspace_recapture: '历史 K12 重跑（已退役）',
+  batch_k12_workspace_recapture: '历史批量 K12 重跑（已退役）',
   phone_binding_test: '手机号绑定',
   phone_signup: '手机号注册',
   batch_sub2api_upload: 'Sub2API上传',
@@ -25,8 +25,8 @@ export const TASK_SOURCE_LABELS: Record<string, string> = {
 export const TASK_SOURCE_OPTIONS = Object.entries(TASK_SOURCE_LABELS).map(([value, label]) => ({ value, label }))
 
 export const SPECIAL_OUTCOME_LABELS: Record<string, string> = {
-  invite_saved_pending_activation: '待激活',
-  invite_exhausted_stop_phase: '邀请耗尽',
+  invite_saved_pending_activation: '历史待激活（已退役）',
+  invite_exhausted_stop_phase: '历史邀请耗尽（已退役）',
   success_skip_save: '成功不保存',
   phone_binding_test_no_phone_available: '无可用号码',
 }
@@ -71,7 +71,7 @@ export function statusTagColor(status?: TaskStatus) {
   const normalized = String(status || '').trim().toLowerCase()
   if (normalized === 'running') return 'processing'
   if (normalized === 'success') return 'success'
-  if (normalized === 'pending_activation') return 'processing'
+  if (normalized === 'pending_activation') return 'default'
   if (normalized === 'skipped') return 'warning'
   if (normalized === 'stopped') return 'warning'
   return 'error'
@@ -81,7 +81,7 @@ export function statusLabel(status?: TaskStatus) {
   const normalized = String(status || '').trim().toLowerCase()
   if (normalized === 'running') return '运行中'
   if (normalized === 'success') return '成功'
-  if (normalized === 'pending_activation') return '待激活'
+  if (normalized === 'pending_activation') return '历史待激活（已退役）'
   if (normalized === 'skipped') return '跳过'
   if (normalized === 'stopped') return '已停止'
   if (normalized === 'failed') return '失败'
@@ -97,11 +97,11 @@ export function taskOutcomeLabel(outcome?: string) {
     case 'success_skip_save':
       return '成功不保存'
     case 'invite_saved_pending_activation':
-      return '待激活'
+      return '历史待激活（已退役）'
     case 'activation_success':
-      return '激活成功'
+      return '历史激活成功（已退役）'
     case 'activation_failed':
-      return '激活失败'
+      return '历史激活失败（已退役）'
     case 'resume_subscription_auth_success':
       return '补抓成功'
     case 'resume_subscription_auth_failed':
@@ -117,19 +117,19 @@ export function taskOutcomeLabel(outcome?: string) {
     case 'batch_resume_subscription_auth_stopped':
       return '批量补抓停止'
     case 'k12_workspace_recapture_success':
-      return 'K12重跑成功'
+      return '历史 K12 重跑成功（已退役）'
     case 'k12_workspace_recapture_failed':
-      return 'K12重跑失败'
+      return '历史 K12 重跑失败（已退役）'
     case 'k12_workspace_recapture_stopped':
-      return 'K12重跑停止'
+      return '历史 K12 重跑停止（已退役）'
     case 'k12_workspace_recapture_skipped':
-      return 'K12重跑跳过'
+      return '历史 K12 重跑跳过（已退役）'
     case 'batch_k12_workspace_recapture_success':
-      return '批量K12重跑成功'
+      return '历史批量 K12 重跑成功（已退役）'
     case 'batch_k12_workspace_recapture_failed':
-      return '批量K12重跑失败'
+      return '历史批量 K12 重跑失败（已退役）'
     case 'batch_k12_workspace_recapture_stopped':
-      return '批量K12重跑停止'
+      return '历史批量 K12 重跑停止（已退役）'
     case 'chatgpt_paypal_bind_success':
       return 'PayPal绑定成功'
     case 'chatgpt_paypal_bind_failed':
@@ -147,7 +147,7 @@ export function taskOutcomeLabel(outcome?: string) {
     case 'failed':
       return '失败'
     case 'invite_exhausted_stop_phase':
-      return '邀请耗尽'
+      return '历史邀请耗尽（已退役）'
     case 'phone_binding_test_no_phone_available':
       return '无可用号码'
     case 'phone_signup_success':

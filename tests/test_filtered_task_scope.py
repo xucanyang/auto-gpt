@@ -13,7 +13,6 @@ from services.account_rate_limit_recovery import reconcile_rate_limited_accounts
 
 
 FILTERED_TASK_REQUESTS = (
-    tasks.BatchK12WorkspaceRecaptureTaskRequest,
     tasks.BatchResumeSubscriptionAuthTaskRequest,
     tasks.PhoneBindingTestTaskRequest,
     tasks.BaxiGptCdkSubmitTaskRequest,

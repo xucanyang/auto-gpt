@@ -14,6 +14,7 @@ from fastapi import APIRouter, HTTPException, Request, Depends
 from core.db import get_session
 from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, Field
+from pydantic.json_schema import SkipJsonSchema
 from sqlmodel import Session, select
 
 from core.base_platform import Account, AccountStatus
@@ -107,7 +108,7 @@ class GoPayOtpStartByUidRequest(BaseModel):
     country: str = "ID"
     currency: str = "IDR"
     proxy: Optional[str] = None
-    checkout_url: Optional[str] = None
+    checkout_url: SkipJsonSchema[Optional[str]] = None
     force: bool = False
     save_defaults: bool = True
 
@@ -1695,6 +1696,10 @@ def update_gopay_otp_adapter_settings(body: GoPayOtpSettingsRequest):
 
 @router.post("/gopay-otp/start-by-uid")
 def start_gopay_payment_by_uid(body: GoPayOtpStartByUidRequest):
+    if str(body.plan or "plus").strip().lower() != "plus":
+        raise HTTPException(400, "GoPay 当前仅支持 Plus 订阅")
+    if str(body.checkout_url or "").strip():
+        raise HTTPException(400, "GoPay 公共入口不接受外部 checkout_url，请由系统生成 Plus 支付链接")
     uid = str(body.uid or "").strip()
     binding = _find_uid_binding(uid)
     if not binding:
@@ -1717,11 +1722,11 @@ def start_gopay_payment_by_uid(body: GoPayOtpStartByUidRequest):
     req = GoPayStartReq(
         phone_country_code=binding["phone_country_code"],
         phone_number=binding["phone_number"],
-        plan=body.plan,
+        plan="plus",
         country=body.country,
         currency=body.currency,
         proxy=body.proxy,
-        checkout_url=body.checkout_url,
+        checkout_url=None,
         pin=effective_pin,
         pin_source=pin_source,
         save_defaults=body.save_defaults if requested_pin or not pool_pin else False,

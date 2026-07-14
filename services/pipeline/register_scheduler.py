@@ -80,7 +80,6 @@ class RegisterRefillScheduler:
                 "chatgpt_access_token_only_checkout_amount_check_enabled": False,
                 # Pipeline registration only needs a payable account.
                 # Free workspace auth capture should happen after payment succeeds.
-                "chatgpt_capture_free_workspace": False,
             },
         )
         meta = {

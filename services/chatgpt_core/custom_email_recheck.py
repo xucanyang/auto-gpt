@@ -32,7 +32,7 @@ from services.chatgpt_core.mailbox_state import (
     mailbox_state_summary,
     sanitize_mailbox_state,
 )
-from services.chatgpt_core.pending_business_invites import RestoredEmailService, _mailbox_state_from_account
+from services.chatgpt_core.restored_email_service import RestoredEmailService, mailbox_state_from_account
 from services.chatgpt_core.local_status_refresh import schedule_chatgpt_local_status_refresh_for_account_id
 from services.chatgpt_core.refresh_token_registration_engine import (
     EmailServiceAdapter,
@@ -704,7 +704,7 @@ def _resolve_custom_email_service(
     existing = _find_existing_chatgpt_account(email, preferred_account_id=preferred_account_id)
     existing_state: dict[str, Any] = {}
     if existing is not None:
-        existing_state = _mailbox_state_from_account(existing)
+        existing_state = mailbox_state_from_account(existing)
         if existing_state and str(existing_state.get('provider') or '').strip() not in {'', 'manual_email_otp'}:
             if callable(log_fn):
                 log_fn(f"[邮箱测活] 复用账号池邮箱通道: account_id={existing.id} provider={existing_state.get('provider')}")
@@ -996,16 +996,6 @@ def _upsert_custom_email_recheck_account(
             extra['partial_auth'] = True
             extra['chatgpt_registration_mode'] = 'access_token_only'
             extra['chatgpt_token_source'] = 'custom_email_recheck'
-            extra['chatgpt_workspace_scope'] = 'free'
-            extra['chatgpt_workspace_label'] = 'custom_email_recheck'
-            extra['chatgpt_workspace_variant_key'] = str(
-                extra.get('chatgpt_workspace_variant_key')
-                or (
-                    f"free:{workspace_id or token_account_id or email}"
-                    if refresh_token
-                    else f"custom_email_recheck:{token_account_id or email}"
-                )
-            ).strip()
             extra['mail_provider'] = str((mailbox_state or {}).get('provider') or extra.get('mail_provider') or 'manual_email_otp').strip() or 'manual_email_otp'
             if refresh_token:
                 extra['refresh_token'] = refresh_token
@@ -1064,13 +1054,6 @@ def _upsert_custom_email_recheck_account(
         'chatgpt_registration_mode': 'access_token_only',
         'chatgpt_token_source': 'custom_email_recheck',
         'chatgpt_custom_email_recheck': dict(recheck_payload),
-        'chatgpt_workspace_scope': 'free',
-        'chatgpt_workspace_label': 'custom_email_recheck',
-        'chatgpt_workspace_variant_key': (
-            f"free:{workspace_id or token_account_id or email}"
-            if refresh_token
-            else f"custom_email_recheck:{token_account_id or email}"
-        ),
         'mail_provider': str((mailbox_state or {}).get('provider') or 'manual_email_otp').strip() or 'manual_email_otp',
     }
     if refresh_token:
@@ -1184,8 +1167,6 @@ def recheck_custom_chatgpt_email(
     merged_config.update({
         'manual_email_address': normalized_email,
         'chatgpt_existing_account_capture': True,
-        'chatgpt_capture_free_workspace': True,
-        'chatgpt_capture_business_workspace': False,
         'chatgpt_save_registration_access_token_account': True,
         'chatgpt_registration_mode': 'refresh_token',
         '_current_account_email': normalized_email,

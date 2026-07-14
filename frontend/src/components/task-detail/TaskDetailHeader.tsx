@@ -96,19 +96,12 @@ function renderStatsTags(record: TaskDetailRecord) {
   return tags.length > 0 ? <Space size={4} wrap>{tags}</Space> : <Text type="secondary">-</Text>
 }
 
-function BooleanMark({ value }: { value: unknown }) {
-  return <Tag color={value ? 'success' : 'default'}>{value ? '✓' : '✗'}</Tag>
-}
-
 function ManualSummary({ meta }: { meta: Record<string, unknown> }) {
   const flags = asRecord(meta.extra_flags)
   const rows: { key: string; label: string; value: ReactNode }[] = [
     { key: 'requested_count', label: '请求数量', value: String(meta.requested_count ?? meta.email_count ?? '-') },
     { key: 'requested_concurrency', label: '并发', value: String(meta.requested_concurrency ?? meta.concurrency ?? '-') },
     { key: 'mail_provider', label: '邮箱服务', value: String(meta.mail_provider || flags.mail_provider || '-') },
-    { key: 'team_invite', label: 'Team invite', value: <BooleanMark value={meta.team_invite_enabled ?? flags.team_invite_enabled ?? flags.team_invite} /> },
-    { key: 'business_workspace', label: 'Business 工作空间', value: <BooleanMark value={meta.capture_business_workspace ?? flags.capture_business_workspace} /> },
-    { key: 'deferred_activation', label: '延迟激活', value: <BooleanMark value={meta.deferred_activation ?? flags.deferred_activation} /> },
   ]
 
   return (

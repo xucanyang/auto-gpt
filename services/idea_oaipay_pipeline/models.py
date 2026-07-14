@@ -3,12 +3,25 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Optional
 
-from pydantic import BaseModel, ConfigDict, Field as PydanticField
+from pydantic import BaseModel, ConfigDict, Field as PydanticField, field_validator
 from sqlmodel import Field, SQLModel
+
+from services.chatgpt_account_state import ACTIVE_SUBSCRIPTION_TYPES
 
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _active_subscription_types(value: object) -> list[str]:
+    if not isinstance(value, (list, tuple, set, frozenset)):
+        return []
+    normalized: list[str] = []
+    for item in value:
+        plan = str(item or "").strip().lower()
+        if plan in ACTIVE_SUBSCRIPTION_TYPES and plan not in normalized:
+            normalized.append(plan)
+    return normalized
 
 
 class AccountSourceConfig(BaseModel):
@@ -41,13 +54,23 @@ class IdeaStepConfig(BaseModel):
     auto_poll_status: bool = True
     status_poll_interval_seconds: int = 5
     status_poll_timeout_seconds: int = 1800
-    skip_if_subscription_in: list[str] = PydanticField(default_factory=lambda: ["plus", "pro", "team", "enterprise"])
+    skip_if_subscription_in: list[str] = PydanticField(default_factory=lambda: ["plus", "pro"])
+
+    @field_validator("skip_if_subscription_in", mode="before")
+    @classmethod
+    def filter_skip_subscription_types(cls, value: object) -> list[str]:
+        return _active_subscription_types(value)
 
 
 class StatusGateConfig(BaseModel):
     enabled: bool = True
     mode: str = "account_valid"  # none | account_valid | subscription_in | upload_ready
     allowed_subscription_types: list[str] = PydanticField(default_factory=list)
+
+    @field_validator("allowed_subscription_types", mode="before")
+    @classmethod
+    def filter_allowed_subscription_types(cls, value: object) -> list[str]:
+        return _active_subscription_types(value)
 
 
 class CheckStepConfig(BaseModel):
@@ -79,6 +102,11 @@ class OaiPayStepConfig(BaseModel):
     exists_as_success: bool = True
     require_phone_bound: bool = False
     require_subscription_in: list[str] = PydanticField(default_factory=list)
+
+    @field_validator("require_subscription_in", mode="before")
+    @classmethod
+    def filter_required_subscription_types(cls, value: object) -> list[str]:
+        return _active_subscription_types(value)
 
 
 class IdeaOaiPayPipelineConfig(BaseModel):

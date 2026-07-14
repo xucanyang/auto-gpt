@@ -13,6 +13,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from sqlmodel import Session, select
 from pydantic import BaseModel, Field
+from pydantic.json_schema import SkipJsonSchema
 from core.db import AccountModel, get_session
 from services.chatgpt_account_state import (
     apply_chatgpt_status_policy,
@@ -32,6 +33,7 @@ from services.chatgpt_core.codex_usage import (
     probe_codex_usage_window,
 )
 from services.chatgpt_core.local_status_refresh import schedule_chatgpt_local_status_refresh_for_account_id
+from services.chatgpt_core.payment_link_cache import validate_plus_payment_request_params
 import json, sys
 
 
@@ -113,16 +115,6 @@ class CodexUsageBatchRefreshReq(BaseModel):
     model: str = ""
     status: str = ""
     email: str = ""
-
-
-class K12WorkspaceRecaptureReq(BaseModel):
-    workspace_ids: Any = None
-    save_all_spaces: bool = True
-    strict_join: bool = False
-    proxy: Optional[str] = None
-    join_timeout_seconds: Optional[int] = None
-    join_retry_count: Optional[int] = None
-    post_join_poll_seconds: Optional[str] = None
 
 
 def _get_account(account_id: int, session: Session) -> AccountModel:
@@ -786,70 +778,12 @@ def refresh_token(account_id: int, proxy: Optional[str] = None,
     raise HTTPException(400, result.error_message)
 
 
-@router.post("/{account_id}/k12-workspaces/recapture")
-def recapture_k12_workspaces(account_id: int, req: K12WorkspaceRecaptureReq,
-                             session: Session = Depends(get_session)):
-    """Reuse saved AT/cookies to re-join K12 targets and export current workspace variants."""
-    acc = _get_account(account_id, session)
-    try:
-        from core.config_store import config_store
-        from services.chatgpt_core.k12_recapture import (
-            K12_RECAPTURE_CONFIG_KEYS,
-            recapture_saved_account_k12_workspaces,
-        )
-        from services.chatgpt_core.k12_workspace import safe_k12_error
-
-        config = {key: config_store.get(key, "") for key in K12_RECAPTURE_CONFIG_KEYS}
-        if req.join_timeout_seconds is not None:
-            config["chatgpt_k12_join_timeout_seconds"] = max(5, min(int(req.join_timeout_seconds), 180))
-        if req.join_retry_count is not None:
-            config["chatgpt_k12_join_retry_count"] = max(0, min(int(req.join_retry_count), 5))
-        if req.post_join_poll_seconds is not None:
-            config["chatgpt_k12_post_join_poll_seconds"] = str(req.post_join_poll_seconds or "")
-        result = recapture_saved_account_k12_workspaces(
-            session=session,
-            account=acc,
-            config=config,
-            workspace_ids=req.workspace_ids,
-            save_all_spaces=req.save_all_spaces,
-            strict_join=req.strict_join,
-            proxy=str(req.proxy or "").strip(),
-        )
-    except ValueError as exc:
-        raise HTTPException(400, str(exc)) from exc
-    except HTTPException:
-        raise
-    except Exception as exc:
-        try:
-            from services.chatgpt_core.k12_workspace import safe_k12_error
-            detail = safe_k12_error(exc, 300)
-        except Exception:
-            detail = exc.__class__.__name__
-        raise HTTPException(500, f"K12 workspace 重新捕获失败: {detail}") from exc
-
-    for changed_id in result.get("changed_account_ids") or []:
-        try:
-            schedule_chatgpt_local_status_refresh_for_account_id(
-                int(changed_id),
-                proxy=str(req.proxy or "").strip() or None,
-                reason="k12_workspace_recapture",
-                delay_seconds=2.0,
-            )
-        except Exception:
-            pass
-    return result
-
-
 # ── 生成支付链接 ────────────────────────────────────────────
 class PaymentReq(BaseModel):
-    plan: str = "plus"  # plus | team
+    plan: str = "plus"
     country: str = "ID"
     currency: str = "IDR"
     proxy: Optional[str] = None
-    promo_code: Optional[str] = None
-    workspace_name: str = "MyTeam"
-    seat_quantity: int = 5
-    price_interval: str = "month"
     payment_link_format: str = "long_hosted"
     save_defaults: bool = True
 
@@ -862,7 +796,7 @@ class GoPayStartReq(BaseModel):
     country: str = "ID"
     currency: str = "IDR"
     proxy: Optional[str] = None
-    checkout_url: Optional[str] = None
+    checkout_url: SkipJsonSchema[Optional[str]] = None
     pin: Optional[str] = None
     pin_source: Optional[str] = None
     save_defaults: bool = True
@@ -2771,6 +2705,29 @@ def _build_gopay_batch_item(req_item: GoPayBatchItemReq, acc: AccountModel) -> d
 @router.post("/gopay/batch/start")
 def start_gopay_batch_payment(req: GoPayBatchStartReq,
                               session: Session = Depends(get_session)):
+    try:
+        validate_plus_payment_request_params(req.defaults)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    allowed_default_keys = {
+        "pin",
+        "access_token",
+        "proxy",
+        "country",
+        "currency",
+        "billing_name",
+        "billing_email",
+        "billing_country",
+        "billing_line1",
+        "billing_city",
+        "billing_state",
+        "billing_postal_code",
+    }
+    batch_defaults = {
+        key: value
+        for key, value in dict(req.defaults or {}).items()
+        if key in allowed_default_keys and value is not None
+    }
     active = _active_gopay_batch_task()
     if active:
         return active
@@ -2805,7 +2762,7 @@ def start_gopay_batch_payment(req: GoPayBatchStartReq,
         "round_interval_seconds": max(0, min(int(req.round_interval_seconds or 0), 600)),
         "current_round": 1,
         "next_round_at": None,
-        "defaults": dict(req.defaults or {}),
+        "defaults": batch_defaults,
         "items": items,
         "total": len(items),
         "success": 0,
@@ -3231,39 +3188,25 @@ def generate_payment_link(account_id: int, req: PaymentReq,
 
     from services.chatgpt_core.payment import (
         generate_plus_link,
-        generate_team_link,
         normalize_checkout_country,
         normalize_checkout_currency,
         normalize_payment_link_format,
     )
 
     plan = str(req.plan or "plus").strip().lower()
-    if plan not in {"plus", "team"}:
-        plan = "plus"
+    if plan != "plus":
+        raise HTTPException(400, "Only the Plus payment plan is supported")
     country = normalize_checkout_country(req.country)
     currency = normalize_checkout_currency(req.currency, country)
     payment_link_format = normalize_payment_link_format(req.payment_link_format)
     proxy = _resolve_optional_checkout_proxy(req.proxy)
-    if plan == "plus":
-        url = generate_plus_link(
-            codex_acc,
-            proxy=proxy,
-            country=country,
-            currency=currency,
-            link_format=payment_link_format,
-        )
-    else:
-        url = generate_team_link(
-            codex_acc,
-            workspace_name=req.workspace_name,
-            price_interval=req.price_interval,
-            seat_quantity=req.seat_quantity,
-            promo_code=req.promo_code,
-            proxy=proxy,
-            country=country,
-            currency=currency,
-            link_format=payment_link_format,
-        )
+    url = generate_plus_link(
+        codex_acc,
+        proxy=proxy,
+        country=country,
+        currency=currency,
+        link_format=payment_link_format,
+    )
     acc.cashier_url = str(url or "")
     mark_payment_pending(acc, reason="payment_link_generated")
     extra = acc.get_extra()
@@ -3282,10 +3225,6 @@ def generate_payment_link(account_id: int, req: PaymentReq,
             "currency": currency,
             "proxy": proxy,
             "payment_link_format": payment_link_format,
-            "promo_code": str(req.promo_code or "").strip(),
-            "workspace_name": str(req.workspace_name or "MyTeam").strip() or "MyTeam",
-            "seat_quantity": max(2, int(req.seat_quantity or 5)),
-            "price_interval": str(req.price_interval or "month").strip().lower() or "month",
         }
         extra["chatgpt_payment_link_defaults"] = defaults_payload
         try:
@@ -3304,13 +3243,16 @@ def generate_payment_link(account_id: int, req: PaymentReq,
         "currency": currency,
         "proxy": proxy,
         "payment_link_format": payment_link_format,
-        "promo_code": str(req.promo_code or "").strip(),
     }
 
 
 @router.post("/{account_id}/gopay/start")
 def start_gopay_payment(account_id: int, req: GoPayStartReq,
                         session: Session = Depends(get_session)):
+    if str(req.plan or "plus").strip().lower() != "plus":
+        raise HTTPException(400, "GoPay 当前仅支持 Plus 订阅")
+    if str(req.checkout_url or "").strip():
+        raise HTTPException(400, "GoPay 公共入口不接受外部 checkout_url，请由系统生成 Plus 支付链接")
     acc = _get_account(account_id, session)
     custom_access_token = str(req.access_token or "").strip()
     codex_acc = _to_gopay_account(acc, custom_access_token)
@@ -3342,13 +3284,13 @@ def start_gopay_payment(account_id: int, req: GoPayStartReq,
         snapshot = create_gopay_session(
             account_id,
             codex_acc,
-            plan=req.plan,
+            plan="plus",
             country=country,
             currency=currency,
             proxy=proxy,
             phone_country_code=normalized_phone["phone_country_code"],
             phone_number=normalized_phone["phone_number"],
-            checkout_url=str(req.checkout_url or ""),
+            checkout_url="",
             default_pin=default_pin,
             billing=billing,
             otp_auto_resend_delay_seconds=_load_gopay_otp_auto_resend_delay_seconds(),
@@ -3389,6 +3331,8 @@ def start_gopay_payment(account_id: int, req: GoPayStartReq,
                 })
             _save_global_gopay_defaults(defaults_payload)
         return _persist_gopay_snapshot(acc, snapshot, session)
+    except HTTPException:
+        raise
     except GoPayFlowError as exc:
         mark_payment_failed(acc, reason="gopay_start_failed")
         acc.updated_at = datetime.now(timezone.utc)
@@ -3555,61 +3499,6 @@ def probe_local_status(account_id: int, proxy: Optional[str] = None,
     probe = probe_local_chatgpt_status(codex_acc, proxy=proxy)
     _persist_local_probe(acc, probe, session)
     return {"ok": True, "email": acc.email, "probe": probe}
-
-
-class PendingBusinessInviteActivateReq(BaseModel):
-    pass
-
-
-class PendingBusinessInviteBatchActivateReq(BaseModel):
-    invite_ids: list[int] = []
-    limit: int = 200
-
-
-class PendingBusinessInviteAbandonReq(BaseModel):
-    pass
-
-
-@router.get("/pending-business-invites")
-def list_pending_business_invites(status: Optional[str] = None, limit: int = 200):
-    from services.chatgpt_core.pending_business_invites import list_pending_invites
-
-    items = list_pending_invites(status=(status or "").strip() or None, limit=limit)
-    return {
-        "ok": True,
-        "count": len(items),
-        "items": items,
-    }
-
-
-@router.post("/pending-business-invites/{invite_id}/activate")
-def activate_pending_business_invite(invite_id: int, req: PendingBusinessInviteActivateReq):
-    from services.chatgpt_core.pending_business_invites import activate_pending_invite
-
-    try:
-        return activate_pending_invite(invite_id)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-
-@router.post("/pending-business-invites/batch-activate")
-def activate_pending_business_invites(req: PendingBusinessInviteBatchActivateReq):
-    from services.chatgpt_core.pending_business_invites import activate_pending_invites
-
-    try:
-        return activate_pending_invites(invite_ids=req.invite_ids or None, limit=req.limit)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-
-@router.post("/pending-business-invites/{invite_id}/abandon")
-def abandon_pending_business_invite(invite_id: int, req: PendingBusinessInviteAbandonReq):
-    from services.chatgpt_core.pending_business_invites import abandon_pending_invite
-
-    try:
-        return abandon_pending_invite(invite_id)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 # ── CPA 上传 ────────────────────────────────────────────────

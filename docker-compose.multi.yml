@@ -32,9 +32,6 @@ services:
       LOCAL_SOLVER_URL: http://127.0.0.1:8889
       SOLVER_BROWSER_TYPE: ${SOLVER_BROWSER_TYPE:-camoufox}
       PLAYWRIGHT_HEADLESS: ${PLAYWRIGHT_HEADLESS:-}
-      TEAM_MANAGER_CODE_PATH: /embedded-team-manager
-      TEAM_MANAGER_DB_PATH: /runtime/team_manage.db
-      TEAM_MANAGER_SEED_DB_PATH: /team-manage-seed-data/team_manage.db
     ports:
       - "8000:8000"
       - "127.0.0.1:8889:8889"
@@ -44,15 +41,12 @@ services:
       - ./shared_config:/shared_config
       - ./_ext_targets:/_ext_targets
       - ./external_logs:/app/services/external_logs
-      - /root/.openclaw/workspace/team-manage:/embedded-team-manager:ro
-      - /root/.openclaw/workspace/team-manage/data:/team-manage-seed-data:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
       - "openai-pay-submit:host-gateway"
     networks:
       - default
       - tempmail_internal
-      - team_manage_default
     shm_size: "1gb"
     # Hard host-safety guard.  The mailbox-state migration removes the former
     # multi-GiB JSON amplification before this limit is applied.
@@ -91,9 +85,6 @@ services:
       LOCAL_SOLVER_URL: http://127.0.0.1:8889
       SOLVER_BROWSER_TYPE: ${SOLVER_BROWSER_TYPE:-camoufox}
       PLAYWRIGHT_HEADLESS: ${PLAYWRIGHT_HEADLESS:-}
-      TEAM_MANAGER_CODE_PATH: /embedded-team-manager
-      TEAM_MANAGER_DB_PATH: /runtime/team_manage.db
-      TEAM_MANAGER_SEED_DB_PATH: /team-manage-seed-data/team_manage.db
     ports:
       - "8001:8000"
       - "127.0.0.1:8890:8889"
@@ -103,15 +94,12 @@ services:
       - /opt/auto-gpt/shared_config:/shared_config
       - /opt/auto-gpt-plus/_ext_targets:/_ext_targets
       - /opt/auto-gpt-plus/external_logs:/app/services/external_logs
-      - /root/.openclaw/workspace/team-manage:/embedded-team-manager:ro
-      - /root/.openclaw/workspace/team-manage/data:/team-manage-seed-data:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
       - "openai-pay-submit:host-gateway"
     networks:
       - default
       - tempmail_internal
-      - team_manage_default
     shm_size: "1gb"
     # Hard host-safety guard.  See services/chatgpt_core/mailbox_state.py and
     # scripts/migrate_hme_mailbox_state.py for the data-side root fix.
@@ -143,9 +131,6 @@ services:
       LOCAL_SOLVER_URL: http://127.0.0.1:8889
       SOLVER_BROWSER_TYPE: ${SOLVER_BROWSER_TYPE:-camoufox}
       PLAYWRIGHT_HEADLESS: ${PLAYWRIGHT_HEADLESS:-}
-      TEAM_MANAGER_CODE_PATH: /embedded-team-manager
-      TEAM_MANAGER_DB_PATH: /runtime/team_manage.db
-      TEAM_MANAGER_SEED_DB_PATH: /team-manage-seed-data/team_manage.db
     ports:
       - "8003:8000"
       - "127.0.0.1:8892:8889"
@@ -155,68 +140,12 @@ services:
       - /opt/auto-gpt/shared_config:/shared_config
       - /opt/auto-plus2/_ext_targets:/_ext_targets
       - /opt/auto-plus2/external_logs:/app/services/external_logs
-      - /root/.openclaw/workspace/team-manage:/embedded-team-manager:ro
-      - /root/.openclaw/workspace/team-manage/data:/team-manage-seed-data:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
       - "openai-pay-submit:host-gateway"
     networks:
       - default
       - tempmail_internal
-      - team_manage_default
-    shm_size: "1gb"
-    mem_limit: "2560m"
-    mem_reservation: "768m"
-    memswap_limit: "3072m"
-    mem_swappiness: 10
-    pids_limit: 512
-
-  auto-k12:
-    image: ${APP_IMAGE:-auto-gpt:latest}
-    container_name: auto-k12
-    # K12 实例保留为可手动恢复的 standby；默认发布不再自动拉起它。
-    profiles:
-      - standby
-    init: true
-    restart: unless-stopped
-    env_file:
-      - /root/.openclaw/workspace/sub2api-account-center/.env
-      - /opt/auto-k12/.env
-    environment:
-      HOST: 0.0.0.0
-      PORT: "8000"
-      APP_RELOAD: "0"
-      APP_CONDA_ENV: docker
-      APP_RUNTIME_DIR: /runtime
-      APP_INSTANCE_ID: auto-k12
-      SHARED_CONFIG_DB: /shared_config/shared_config.db
-      APP_ENABLE_SOLVER: "1"
-      SOLVER_PORT: "8889"
-      SOLVER_BIND_HOST: 0.0.0.0
-      LOCAL_SOLVER_URL: http://127.0.0.1:8889
-      SOLVER_BROWSER_TYPE: ${SOLVER_BROWSER_TYPE:-camoufox}
-      PLAYWRIGHT_HEADLESS: ${PLAYWRIGHT_HEADLESS:-}
-      TEAM_MANAGER_CODE_PATH: /embedded-team-manager
-      TEAM_MANAGER_DB_PATH: /runtime/team_manage.db
-      TEAM_MANAGER_SEED_DB_PATH: /team-manage-seed-data/team_manage.db
-    ports:
-      - "8002:8000"
-      - "127.0.0.1:8891:8889"
-      - "${CLIPROXYAPI_PORT_BIND_K12:-8319}:8317"
-    volumes:
-      - /opt/auto-k12/data:/runtime
-      - /opt/auto-gpt/shared_config:/shared_config
-      - /opt/auto-k12/_ext_targets:/_ext_targets
-      - /opt/auto-k12/external_logs:/app/services/external_logs
-      - /root/.openclaw/workspace/team-manage:/embedded-team-manager:ro
-      - /root/.openclaw/workspace/team-manage/data:/team-manage-seed-data:ro
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-      - "openai-pay-submit:host-gateway"
-    networks:
-      - default
-      - tempmail_internal
-      - team_manage_default
     shm_size: "1gb"
     mem_limit: "2560m"
     mem_reservation: "768m"
@@ -233,6 +162,3 @@ networks:
         - subnet: 2604:a880:2:d1:2::/80
   tempmail_internal:
     external: true
-  team_manage_default:
-    external: true
-    name: team-manage_default

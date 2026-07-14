@@ -23,13 +23,11 @@ export type AccountsToolbarActionId =
   | 'resumeAuth'
   | 'backfill'
   | 'invalidRecheck'
-  | 'k12Recapture'
   | 'phoneBindingTest'
   | 'paypalBinding'
   | 'baxiCdkSubmit'
   | 'paymentLink'
   | 'gopay'
-  | 'businessDeferred'
 
 export type AccountExportMode = 'sub2api' | 'access_token'
 
@@ -51,13 +49,11 @@ const DEFAULT_PINNED_ACTION_IDS: AccountsToolbarActionId[] = ['statusSync', 'pay
 const CHATGPT_SYNC_ACTION_IDS: AccountsToolbarActionId[] = ['statusSync', 'resumeAuth', 'backfill']
 const CHATGPT_BATCH_ACTION_IDS: AccountsToolbarActionId[] = [
   'invalidRecheck',
-  'k12Recapture',
   'phoneBindingTest',
   'paypalBinding',
   'baxiCdkSubmit',
   'paymentLink',
   'gopay',
-  'businessDeferred',
 ]
 const CHATGPT_ACTION_IDS: AccountsToolbarActionId[] = [
   ...CHATGPT_SYNC_ACTION_IDS,
@@ -141,18 +137,15 @@ type AccountsToolbarProps = {
   batchGopayLoading: boolean
   batchPaymentLinkLoading: boolean
   batchInvalidRecheckLoading: boolean
-  batchK12RecaptureLoading: boolean
   phoneBindingTestLoading: boolean
   paypalBindingLoading: boolean
   baxiCdkSubmitLoading: boolean
   onBatchPaymentLink: (options?: { forceRefresh?: boolean }) => void
   onBatchInvalidRecheck: () => void
-  onOpenBatchK12Recapture: () => void
   onOpenPhoneBindingTest: () => void
   onOpenPaypalBinding: () => void
   onOpenBaxiCdkSubmit: () => void
   onOpenBatchGopay: () => void
-  onOpenBusinessDeferred: () => void
   deleteInvalidLoading: boolean
   onDeleteInvalid: () => Promise<void> | void
   onBatchDelete: () => Promise<void> | void
@@ -190,18 +183,15 @@ export function AccountsToolbar({
   batchGopayLoading,
   batchPaymentLinkLoading,
   batchInvalidRecheckLoading,
-  batchK12RecaptureLoading,
   phoneBindingTestLoading,
   paypalBindingLoading,
   baxiCdkSubmitLoading,
   onBatchPaymentLink,
   onBatchInvalidRecheck,
-  onOpenBatchK12Recapture,
   onOpenPhoneBindingTest,
   onOpenPaypalBinding,
   onOpenBaxiCdkSubmit,
   onOpenBatchGopay,
-  onOpenBusinessDeferred,
   deleteInvalidLoading,
   onDeleteInvalid,
   onBatchDelete,
@@ -238,7 +228,6 @@ export function AccountsToolbar({
     : { minWidth: 210 }
   const hasNoSelectedAndNoResults = selectedRowKeys.length === 0 && total === 0
   const paymentLinkDisabled = hasNoSelectedAndNoResults
-  const batchK12RecaptureDisabled = hasNoSelectedAndNoResults
   const exportMenuItems: MenuProps['items'] = [
     { key: 'sub2api', label: 'Sub2API JSON（默认）' },
     { key: 'access_token', label: '仅 AccessToken（每行一个）' },
@@ -337,13 +326,6 @@ export function AccountsToolbar({
           icon: batchInvalidRecheckLoading ? <SyncOutlined spin /> : <SafetyCertificateOutlined />,
           disabled: batchInvalidRecheckLoading,
         } as ToolbarMenuItem
-      case 'k12Recapture':
-        return {
-          key: actionId,
-          label: '批量K12重跑',
-          icon: batchK12RecaptureLoading ? <SyncOutlined spin /> : <SyncOutlined />,
-          disabled: batchK12RecaptureLoading || batchK12RecaptureDisabled,
-        } as ToolbarMenuItem
       case 'phoneBindingTest':
         return {
           key: actionId,
@@ -379,12 +361,6 @@ export function AccountsToolbar({
           label: '批量 GoPay',
           icon: batchGopayLoading ? <SyncOutlined spin /> : <LinkOutlined />,
           disabled: batchGopayLoading,
-        } as ToolbarMenuItem
-      case 'businessDeferred':
-        return {
-          key: actionId,
-          label: 'Business 补激活',
-          icon: <LinkOutlined />,
         } as ToolbarMenuItem
       default:
         return null
@@ -476,9 +452,6 @@ export function AccountsToolbar({
       case 'invalidRecheck':
         onBatchInvalidRecheck()
         return
-      case 'k12Recapture':
-        onOpenBatchK12Recapture()
-        return
       case 'phoneBindingTest':
         onOpenPhoneBindingTest()
         return
@@ -490,9 +463,6 @@ export function AccountsToolbar({
         return
       case 'gopay':
         onOpenBatchGopay()
-        return
-      case 'businessDeferred':
-        onOpenBusinessDeferred()
         return
       case 'deleteInvalid':
         if (!deleteInvalidLoading && total > 0) {
@@ -567,20 +537,6 @@ export function AccountsToolbar({
             批量失效测活
           </Button>
         )
-      case 'k12Recapture':
-        return (
-          <Button
-            key={actionId}
-            block={isMobile}
-            style={operationButtonStyle}
-            icon={batchK12RecaptureLoading ? <SyncOutlined spin /> : <SyncOutlined />}
-            loading={batchK12RecaptureLoading}
-            disabled={batchK12RecaptureDisabled}
-            onClick={onOpenBatchK12Recapture}
-          >
-            批量K12重跑
-          </Button>
-        )
       case 'phoneBindingTest':
         return (
           <Button
@@ -652,12 +608,6 @@ export function AccountsToolbar({
             onClick={onOpenBatchGopay}
           >
             批量 GoPay
-          </Button>
-        )
-      case 'businessDeferred':
-        return (
-          <Button key={actionId} block={isMobile} style={operationButtonStyle} icon={<LinkOutlined />} onClick={onOpenBusinessDeferred}>
-            Business 补激活
           </Button>
         )
       default:

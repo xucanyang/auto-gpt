@@ -23,7 +23,6 @@ export default defineConfig({
 
           if (id.includes('/src/pages/Accounts')) return 'page-accounts'
           if (id.includes('/src/pages/RegisterTaskPage')) return 'page-register'
-          if (id.includes('/src/pages/Teams')) return 'page-teams'
           if (id.includes('/src/pages/Pipeline')) return 'page-pipeline'
           if (id.includes('/src/pages/GoPayOtpAdapter')) return 'page-gopay'
           if (id.includes('/src/pages/Settings')) return 'page-settings'

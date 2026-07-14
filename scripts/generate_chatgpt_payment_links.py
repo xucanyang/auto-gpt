@@ -90,30 +90,8 @@ def main() -> None:
         return
 
     selected = choose_account(accounts)
-    plan = input("套餐 [plus/team]，默认 plus: ").strip().lower() or "plus"
-    if plan not in {"plus", "team"}:
-        print("不支持的套餐。")
-        return
-
     country = input("地区代码，默认 US: ").strip().upper() or "US"
-
-    params: dict[str, object] = {"plan": plan, "country": country}
-    if plan == "team":
-        workspace_name = input("Workspace 名称，默认 MyTeam: ").strip() or "MyTeam"
-        price_interval = input("周期 [month/year]，默认 month: ").strip().lower() or "month"
-        seat_quantity_raw = input("席位数，默认 5: ").strip() or "5"
-        try:
-            seat_quantity = int(seat_quantity_raw)
-        except ValueError:
-            print("席位数必须是整数。")
-            return
-        params.update(
-            {
-                "workspace_name": workspace_name,
-                "price_interval": price_interval,
-                "seat_quantity": seat_quantity,
-            }
-        )
+    params: dict[str, object] = {"plan": "plus", "country": country}
 
     account = to_account_model(selected)
     print(f"\n使用账号 id={selected.id} email={selected.email}")

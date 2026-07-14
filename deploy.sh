@@ -6,7 +6,7 @@ set -Eeuo pipefail
 # - Git 变更自动写入 changelog.md 并提交
 # - 禁止把运行态/密钥/抓包/依赖产物提交进仓库
 # - 默认不再创建发布前备份；如需临时备份，显式追加 --backup
-# - 当前常驻拓扑：auto-gpt-plus / auto-plus2；auto-gpt / auto-k12 保持已停止的 standby 容器
+# - 当前常驻拓扑：auto-gpt-plus / auto-plus2；auto-gpt 保持已停止的 standby 容器
 # - 发布后只校验常驻实例，绝不因发布意外重新拉起 standby 实例
 # ==============================================================================
 
@@ -17,22 +17,21 @@ BACKUP_BASE="${ROOT_DIR}/.rollback-backups"
 CHANGELOG_FILE="${ROOT_DIR}/changelog.md"
 
 MSG=""
-MODE="multi"      # multi / image / hot
+MODE="multi"      # multi / hot
 DRY_RUN=0
 PUSH=0
 BACKUP="${AUTO_GPT_DEPLOY_BACKUP:-0}"
 ACTIVE_SERVICES=(auto-gpt-plus auto-plus2)
-STANDBY_SERVICES=(auto-gpt auto-k12)
+STANDBY_SERVICES=(auto-gpt)
 ALL_SERVICES=("${ACTIVE_SERVICES[@]}" "${STANDBY_SERVICES[@]}")
 
 usage() {
   cat <<USAGE
 Usage:
-  $0 "本次变更说明" [--mode=multi|image|hot] [--dry-run] [--push] [--backup]
+  $0 "本次变更说明" [--mode=multi|hot] [--dry-run] [--push] [--backup]
 
 Modes:
-  --mode=multi    默认：构建 auto-gpt:latest 并升级 auto-gpt-plus / auto-plus2；auto-gpt / auto-k12 保持停止
-  --mode=image    调用 scripts/deploy-image-release.sh --apply
+  --mode=multi    默认：构建 auto-gpt:latest 并升级 auto-gpt-plus / auto-plus2；auto-gpt 保持停止
   --mode=hot      调用 scripts/deploy-to-auto-gpt-container.sh 对多容器做热同步，仅适合静态/Python 小补丁
   --backup        本次发布前额外创建 .rollback-backups/deploy-<timestamp> 运行态备份；默认关闭
 
@@ -69,7 +68,7 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
-[[ "$MODE" =~ ^(multi|image|hot)$ ]] || fatal "错误的模式: $MODE，可选值 multi|image|hot"
+[[ "$MODE" =~ ^(multi|hot)$ ]] || fatal "错误的模式: $MODE，可选值 multi|hot"
 [[ "$BACKUP" =~ ^(0|1|false|true|no|yes|off|on)$ ]] || fatal "错误的备份开关: $BACKUP，可选 0/1/true/false"
 case "${BACKUP,,}" in
   1|true|yes|on) BACKUP=1 ;;
@@ -228,7 +227,7 @@ PY
   if [[ -s "$tmp" ]]; then
     cat "$tmp" >&2
     rm -f "$tmp"
-    fatal "hot 模式只允许 Python/静态资源小补丁；以上路径需走 multi/image 构建发布"
+    fatal "hot 模式只允许 Python/静态资源小补丁；以上路径需走 multi 构建发布"
   fi
   rm -f "$tmp"
 }
@@ -257,15 +256,15 @@ run_checks() {
 }
 
 sqlite_backup_or_copy() {
-  local src="$1" dst="$2" quick="$3"
+  local src="$1" dst="$2" integrity="$3"
   [[ -s "$src" ]] || return 0
   mkdir -p "$(dirname "$dst")"
   if command -v sqlite3 >/dev/null 2>&1; then
-    sqlite3 "$src" "PRAGMA quick_check;" > "$quick"
     sqlite3 "$src" ".backup '$dst'"
+    sqlite3 "$dst" "PRAGMA integrity_check;" > "$integrity"
   else
     cp -a "$src" "$dst"
-    printf 'sqlite3 not found; copied raw file\n' > "$quick"
+    printf 'sqlite3 not found; copied raw file without integrity check\n' > "$integrity"
   fi
 }
 
@@ -287,11 +286,11 @@ create_backup() {
       docker inspect "$service" > "$backup_root/${service}.inspect.before.json"
     fi
   done
-  for data_root in /opt/auto-gpt/data /opt/auto-gpt-plus/data /opt/auto-plus2/data /opt/auto-k12/data; do
+  for data_root in /opt/auto-gpt/data /opt/auto-gpt-plus/data /opt/auto-plus2/data; do
     [[ -d "$data_root" ]] || continue
     name="$(basename "$(dirname "$data_root")")"
     for db in account_manager.db team_manage.db; do
-      sqlite_backup_or_copy "$data_root/$db" "$backup_root/${name}.${db}.before_deploy.bak" "$backup_root/${name}.${db}.quick_check.txt"
+      sqlite_backup_or_copy "$data_root/$db" "$backup_root/${name}.${db}.before_deploy.bak" "$backup_root/${name}.${db}.integrity_check.txt"
     done
   done
   if [[ -d /opt/auto-gpt/shared_config ]]; then
@@ -317,7 +316,7 @@ smoke_url() {
 
 smoke_after_deploy() {
   log "运行容器状态"
-  docker ps -a --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' | grep -E 'NAMES|auto-gpt|auto-k12|auto-plus2' || true
+  docker ps -a --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' | grep -E 'NAMES|auto-gpt|auto-plus2' || true
   smoke_url "auto-gpt-plus health" "http://127.0.0.1:8001/api/health"
   smoke_url "auto-plus2 health" "http://127.0.0.1:8003/api/health"
   smoke_url "auto-gpt-plus index" "http://127.0.0.1:8001/"
@@ -390,10 +389,6 @@ case "$MODE" in
     log "Compose up -d --remove-orphans: ${ACTIVE_SERVICES[*]}"
     compose_multi up -d --remove-orphans "${ACTIVE_SERVICES[@]}"
     stop_standby_services
-    ;;
-  image)
-    log "调用 scripts/deploy-image-release.sh --apply"
-    scripts/deploy-image-release.sh --apply
     ;;
   hot)
     log "热同步 auto-gpt-plus"

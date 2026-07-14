@@ -15,21 +15,16 @@ class AccountListCompactSerializationTests(unittest.TestCase):
             "id_token": "SECRET_ID_TOKEN",
             "cookies": "SECRET_COOKIE_A=1; SECRET_COOKIE_B=2",
             "chatgpt_mailbox_state": "x" * huge_size,
-            "chatgpt_workspace_scope": "free",
-            "chatgpt_workspace_label": "Free",
             "chatgpt_workspace_variants": [
                 {
-                    "scope": "k12",
-                    "label": "School Lab",
-                    "workspace_id": "ws-k12",
-                    "account_id": "acct-k12",
-                    "display_name": "School Lab",
-                    "source": "k12_workspace_join",
-                    "auth_level": "access_token_only",
-                    "partial_auth": True,
-                    "access_token": "SECRET_VARIANT_AT",
-                    "session_token": "SECRET_VARIANT_SESSION",
-                    "cookies": "SECRET_VARIANT_COOKIE=1",
+                    "scope": "business",
+                    "workspace_id": "legacy-workspace",
+                    "account_id": "legacy-account",
+                    "access_token": "SECRET_LEGACY_VARIANT_AT",
+                    "refresh_token": "SECRET_LEGACY_VARIANT_RT",
+                    "session_token": "SECRET_LEGACY_VARIANT_SESSION",
+                    "cookies": "SECRET_LEGACY_VARIANT_COOKIE=1",
+                    "cookie_header": "SECRET_LEGACY_VARIANT_COOKIE_HEADER=1",
                 }
             ],
             "sync_statuses": {
@@ -109,7 +104,7 @@ class AccountListCompactSerializationTests(unittest.TestCase):
         self.assertNotIn("SECRET_SESSION", raw)
         self.assertNotIn("SECRET_ID_TOKEN", raw)
         self.assertNotIn("SECRET_COOKIE", raw)
-        self.assertNotIn("SECRET_VARIANT", raw)
+        self.assertNotIn("SECRET_LEGACY_VARIANT", raw)
         self.assertNotIn("chatgpt_mailbox_state", raw)
         self.assertNotIn("raw_response", raw)
         self.assertNotIn("raw_usage", raw)
@@ -139,11 +134,6 @@ class AccountListCompactSerializationTests(unittest.TestCase):
         self.assertEqual(payload["oaipaySync"]["category_name"], "PLUS--已接美国长效")
         self.assertEqual(payload["oaipaySync"]["last_upload"]["category_source"], "auto")
         self.assertEqual(payload["codex_state"], "ok")
-        self.assertEqual(payload["workspace_variants"][0]["scope"], "k12")
-        variant = payload["workspace_variants"][0]
-        self.assertNotIn("access_token", variant)
-        self.assertNotIn("session_token", variant)
-        self.assertNotIn("cookies", variant)
 
     def test_compact_serializer_does_not_return_raw_extra_or_secrets(self):
         payload = _serialize_account_compact_item(self._account())
@@ -166,13 +156,9 @@ class AccountListCompactSerializationTests(unittest.TestCase):
         self.assertNotIn("SECRET_SESSION", raw)
         self.assertNotIn("SECRET_ID_TOKEN", raw)
         self.assertNotIn("SECRET_COOKIE", raw)
-        self.assertNotIn("SECRET_VARIANT", raw)
+        self.assertNotIn("SECRET_LEGACY_VARIANT", raw)
 
         safe_extra = json.loads(payload.get("extra_json") or "{}")
-        self.assertEqual(
-            safe_extra.get("chatgpt_workspace_variants"),
-            payload.get("workspace_variants"),
-        )
         self.assertNotIn("access_token", safe_extra)
         self.assertNotIn("refresh_token", safe_extra)
         self.assertNotIn("session_token", safe_extra)

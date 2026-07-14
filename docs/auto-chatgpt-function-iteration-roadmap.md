@@ -1,6 +1,6 @@
 # Auto ChatGPT 功能迭代与运营闭环方案
 
-更新时间：2026-06-07
+更新时间：2026-07-14
 
 ## 1. 当前定位
 
@@ -11,7 +11,7 @@
 3. 管理账号池、账号状态、订阅状态和 Auth 状态。
 4. 生成订阅链接，执行 GoPay 或外部支付。
 5. 补抓 Auth，验证订阅状态。
-6. 上传 CPA、Sub2API、CodexProxy、Team Manager 等下游系统。
+6. 上传 CPA、Sub2API、CodexProxy 等下游系统。
 7. 维护邮箱池、iCloud HME、TempMail、手机号池、代理池。
 8. 通过自动流水线持续补货、支付、补抓和归档。
 

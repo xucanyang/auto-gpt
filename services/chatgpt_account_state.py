@@ -11,7 +11,9 @@ PENDING_PAYMENT_STATUS = "pending_payment"
 PAYMENT_FAILED_STATUS = "payment_failed"
 SUBSCRIBED_ACCOUNT_STATUS = "subscribed"
 
-PAID_PLAN_TYPES = {"plus", "pro", "team", "business", "enterprise"}
+ACTIVE_SUBSCRIPTION_TYPES = frozenset({"free", "plus", "pro"})
+RETIRED_SUBSCRIPTION_TYPES = frozenset({"team", "business", "enterprise"})
+PAID_PLAN_TYPES = {"plus", "pro", *RETIRED_SUBSCRIPTION_TYPES}
 PAYMENT_ACTIVE_PHASES = {"created", "starting", "waiting_otp", "waiting_link_pin", "waiting_payment_pin", "verifying"}
 PAYMENT_ACTIVE_STATUSES = {"active", "started", "running"}
 PAYMENT_FAILED_PHASES = {"failed", "cancelled"}
@@ -73,6 +75,15 @@ def normalize_subscription_plan(plan: Any) -> str:
     if "free" in normalized:
         return "free"
     return "unknown"
+
+
+def effective_subscription_plan(capabilities: dict[str, Any] | None) -> str:
+    """Prefer the current probe, then the last known plan for fail-closed gates."""
+    values = capabilities if isinstance(capabilities, dict) else {}
+    current = normalize_subscription_plan(values.get("subscription_plan"))
+    if current != "unknown":
+        return current
+    return normalize_subscription_plan(values.get("last_known_subscription_plan"))
 
 
 def _last_known_subscription_plan(extra: dict[str, Any], current_plan: str) -> str:

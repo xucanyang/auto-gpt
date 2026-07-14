@@ -26,9 +26,6 @@ services:
       LOCAL_SOLVER_URL: http://127.0.0.1:8889
       SOLVER_BROWSER_TYPE: ${SOLVER_BROWSER_TYPE:-camoufox}
       PLAYWRIGHT_HEADLESS: ${PLAYWRIGHT_HEADLESS:-}
-      TEAM_MANAGER_CODE_PATH: /embedded-team-manager
-      TEAM_MANAGER_DB_PATH: /runtime/team_manage.db
-      TEAM_MANAGER_SEED_DB_PATH: /team-manage-seed-data/team_manage.db
     ports:
       - "8000:8000"
       - "127.0.0.1:8889:8889"
@@ -37,14 +34,11 @@ services:
       - ${APP_RUNTIME_BIND:-./data}:/runtime
       - ${APP_EXT_TARGETS_BIND:-./_ext_targets}:/_ext_targets
       - ${APP_EXTERNAL_LOGS_BIND:-./external_logs}:/app/services/external_logs
-      - /root/.openclaw/workspace/team-manage:/embedded-team-manager:ro
-      - /root/.openclaw/workspace/team-manage/data:/team-manage-seed-data:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks:
       - default
       - tempmail_internal
-      - team_manage_default
     shm_size: "1gb"
 
 networks:
@@ -56,6 +50,3 @@ networks:
         - subnet: 2604:a880:2:d1:2::/80
   tempmail_internal:
     external: true
-  team_manage_default:
-    external: true
-    name: team-manage_default

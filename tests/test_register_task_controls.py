@@ -25,7 +25,7 @@ from api.tasks import (
     _run_resume_subscription_auth,
     _task_store,
 )
-from core.db import AccountModel, PendingBusinessInviteModel
+from core.db import AccountModel
 from core.base_mailbox import BaseMailbox, MailboxAccount
 from core.base_platform import Account, BasePlatform
 from core import db as core_db
@@ -1639,18 +1639,6 @@ class BatchResumeAuthTaskCreationTests(unittest.TestCase):
             session.refresh(row)
             return int(row.id or 0)
 
-    def _add_pending(self, *, account_id: int, email: str, status: str) -> int:
-        with Session(self.engine) as session:
-            row = PendingBusinessInviteModel(
-                account_id=account_id,
-                email=email,
-                status=status,
-            )
-            session.add(row)
-            session.commit()
-            session.refresh(row)
-            return int(row.id or 0)
-
     def test_enqueue_batch_resume_auth_creates_task_for_eligible_accounts_only(self):
         eligible_id = self._add_account(
             email="eligible@example.com",
@@ -1704,23 +1692,6 @@ class BatchResumeAuthTaskCreationTests(unittest.TestCase):
         self.assertEqual(result["eligible"], 0)
         self.assertEqual(result["skipped"], 1)
         thread_cls.assert_not_called()
-
-    def test_enqueue_batch_resume_auth_ignores_pending_subscription_rows(self):
-        account_id = self._add_account(
-            email="pending@example.com",
-            status="registered",
-            extra={"chatgpt_capabilities": {"auth_level": "refresh_token", "upload_gate": "ready"}},
-        )
-        self._add_pending(account_id=account_id, email="pending@example.com", status="subscription_pending_auth")
-
-        req = BatchResumeSubscriptionAuthTaskRequest(account_ids=[account_id])
-        with patch("api.tasks.threading.Thread") as thread_cls:
-            result = enqueue_batch_resume_subscription_auth_task(req)
-
-        self.assertEqual(result["eligible"], 0)
-        self.assertEqual(result["skipped"], 1)
-        thread_cls.assert_not_called()
-
 
 if __name__ == "__main__":
     unittest.main()

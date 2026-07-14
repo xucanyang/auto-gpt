@@ -375,7 +375,7 @@ export default function TaskHistory() {
               { value: 'failed', label: '失败' },
               { value: 'stopped', label: '已停止' },
               { value: 'skipped', label: '跳过' },
-              { value: 'pending_activation', label: '待激活' },
+              { value: 'pending_activation', label: '历史待激活（已退役）' },
             ]}
             onChange={(value) => setStatusFilter(value)}
           />

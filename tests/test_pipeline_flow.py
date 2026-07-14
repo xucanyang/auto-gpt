@@ -239,7 +239,6 @@ class RegisterSchedulerTests(unittest.TestCase):
         self.assertEqual(req.count, 3)
         self.assertEqual(req.extra["chatgpt_registration_mode"], "access_token_only")
         self.assertFalse(req.extra["chatgpt_access_token_only_checkout_amount_check_enabled"])
-        self.assertFalse(req.extra["chatgpt_capture_free_workspace"])
         self.assertEqual(enqueue_mock.call_args.kwargs["source"], "pipeline")
         self.assertEqual(enqueue_mock.call_args.kwargs["meta"]["pipeline_task_id"], 9)
         self.assertEqual(enqueue_mock.call_args.kwargs["meta"]["pipeline_key"], "pipe-9")

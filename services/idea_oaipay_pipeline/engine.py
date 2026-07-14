@@ -17,7 +17,11 @@ from services.account_filters import (
     account_validity,
     filter_account_rows,
 )
-from services.chatgpt_account_state import classify_chatgpt_capabilities, is_chatgpt_upload_ready
+from services.chatgpt_account_state import (
+    RETIRED_SUBSCRIPTION_TYPES,
+    classify_chatgpt_capabilities,
+    is_chatgpt_upload_ready,
+)
 from services.chatgpt_core.local_status_refresh import summarize_status_refresh, sync_chatgpt_account_local_status
 from services.oaipay_sync import backfill_chatgpt_account_to_oaipay, get_oaipay_sync_state
 
@@ -220,9 +224,12 @@ class IdeaOaiPayPipelineEngine:
             }
         summary = self.state_store.update_task_summary(int(task.id or 0))
         task = self.state_store.get_task(int(task.id or 0)) or task
+        config = IdeaOaiPayPipelineConfig.model_validate(
+            self.state_store.task_config(task)
+        ).model_dump(by_alias=True)
         return {
             "task": self._task_to_dict(task),
-            "config": self.state_store.task_config(task),
+            "config": config,
             "summary": summary,
             "items": [self._item_to_dict(item) for item in self.state_store.list_items(int(task.id or 0), limit=item_limit)],
             "logs": self.state_store.list_task_logs(int(task.id or 0)),
@@ -411,7 +418,6 @@ class IdeaOaiPayPipelineEngine:
                 "mail_provider": _safe_str(config.source.register_config.get("mail_provider") or register_extra.get("mail_provider") or ""),
                 "chatgpt_registration_mode": register_extra.get("chatgpt_registration_mode") or "access_token_only",
                 "chatgpt_access_token_only_checkout_amount_check_enabled": False,
-                "chatgpt_capture_free_workspace": False,
             }
         )
         req = RegisterTaskRequest(
@@ -552,7 +558,9 @@ class IdeaOaiPayPipelineEngine:
                     self.state_store.update_item(int(item.id or 0), idea_stage="failed", overall_status="failed", idea_error="账号不存在", last_error="账号不存在")
                     continue
                 sub = account_subscription_type(account)
-                if sub in {_lower(value) for value in config.idea.skip_if_subscription_in}:
+                if sub in RETIRED_SUBSCRIPTION_TYPES or sub in {
+                    _lower(value) for value in config.idea.skip_if_subscription_in
+                }:
                     self.state_store.update_item(
                         int(item.id or 0),
                         idea_stage="skipped",
@@ -682,7 +690,18 @@ class IdeaOaiPayPipelineEngine:
         task_id = int(task.id or 0)
         if not config.check.enabled:
             for item in self.state_store.list_items_by_statuses(task_id, check_stages=["pending"], limit=limit):
-                self.state_store.update_item(int(item.id or 0), check_stage="skipped", gate_stage="skipped")
+                subscription_type = _lower(item.subscription_type_after or item.subscription_type_before)
+                if subscription_type in RETIRED_SUBSCRIPTION_TYPES:
+                    reason = f"订阅类型 {subscription_type} 已退役"
+                    self.state_store.update_item(
+                        int(item.id or 0),
+                        check_stage="skipped",
+                        gate_stage="blocked",
+                        overall_status="manual_required",
+                        last_error=reason,
+                    )
+                else:
+                    self.state_store.update_item(int(item.id or 0), check_stage="skipped", gate_stage="skipped")
             return
         candidates = [
             item for item in self.state_store.list_items_by_statuses(task_id, check_stages=["pending"], limit=limit)
@@ -727,9 +746,11 @@ class IdeaOaiPayPipelineEngine:
 
     def _evaluate_status_gate(self, account: AccountModel, config: IdeaOaiPayPipelineConfig) -> tuple[bool, str]:
         gate = config.check.gate
+        sub = account_subscription_type(account)
+        if sub in RETIRED_SUBSCRIPTION_TYPES:
+            return False, f"订阅类型 {sub} 已退役"
         if not gate.enabled or _lower(gate.mode) == "none":
             return True, ""
-        sub = account_subscription_type(account)
         validity = account_validity(account)
         mode = _lower(gate.mode)
         if mode == "account_valid":
@@ -824,7 +845,7 @@ class IdeaOaiPayPipelineEngine:
         if apply_to == "free":
             return sub == "free"
         if apply_to == "plus":
-            return sub in {"plus", "pro", "team", "enterprise"}
+            return sub in {"plus", "pro"}
         return True
 
     def _poll_phone_task(self, task: IdeaOaiPayPipelineTask, config: IdeaOaiPayPipelineConfig) -> None:
@@ -948,8 +969,19 @@ class IdeaOaiPayPipelineEngine:
         return item.phone_stage in {"success", "failed", "skipped", "disabled"}
 
     def _oaipay_requirements_pass(self, item: IdeaOaiPayPipelineItem, config: IdeaOaiPayPipelineConfig) -> bool:
+        subscription_type = _lower(item.subscription_type_after or item.subscription_type_before)
+        if subscription_type in RETIRED_SUBSCRIPTION_TYPES:
+            reason = f"订阅类型 {subscription_type} 已退役，禁止上传 OAIPay"
+            self.state_store.update_item(
+                int(item.id or 0),
+                oaipay_stage="skipped",
+                overall_status="manual_required",
+                oaipay_message=reason,
+                last_error=reason,
+            )
+            return False
         required_subs = {_lower(value) for value in config.oaipay.require_subscription_in if _safe_str(value)}
-        if required_subs and _lower(item.subscription_type_after or item.subscription_type_before) not in required_subs:
+        if required_subs and subscription_type not in required_subs:
             reason = f"OAIPay 上传要求订阅类型 {','.join(sorted(required_subs))}"
             self.state_store.update_item(int(item.id or 0), oaipay_stage="skipped", overall_status="manual_required", oaipay_message=reason, last_error=reason)
             return False

@@ -2,16 +2,16 @@
 set -Eeuo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-COMPOSE_FILE="${COMPOSE_FILE:-$ROOT_DIR/docker-compose.yml}"
+COMPOSE_FILE="${COMPOSE_FILE:-$ROOT_DIR/docker-compose.multi.yml}"
 PROJECT_NAME="${PROJECT_NAME:-auto-gpt}"
-SERVICE="${SERVICE:-app}"
-CONTAINER="${CONTAINER:-auto-gpt}"
+SERVICE="${SERVICE:-auto-gpt-plus}"
+CONTAINER="${CONTAINER:-auto-gpt-plus}"
 IMAGE_REPO="${IMAGE_REPO:-auto-gpt}"
 STAMP="${RELEASE_TAG:-$(date +%Y%m%dT%H%M%SZ)}"
 IMAGE="${IMAGE:-$IMAGE_REPO:$STAMP}"
 ROLLBACK_IMAGE="${ROLLBACK_IMAGE:-$IMAGE_REPO:rollback-$STAMP}"
 BACKUP_ROOT="${BACKUP_ROOT:-$ROOT_DIR/.rollback-backups/image-release-$STAMP}"
-SMOKE_URL="${SMOKE_URL:-http://127.0.0.1:8000/}"
+SMOKE_URL="${SMOKE_URL:-http://127.0.0.1:8001/api/health}"
 CAMOUFOX_VERSION="${CAMOUFOX_VERSION:-135.0.1}"
 CAMOUFOX_RELEASE="${CAMOUFOX_RELEASE:-beta.24}"
 
@@ -180,15 +180,16 @@ backup_sqlite_db() {
   log "backing up $source_path"
   docker exec "$CONTAINER" sh -lc "rm -f '$tmp_path' && sqlite3 '$source_path' \".backup '$tmp_path'\""
   docker cp "$CONTAINER:$tmp_path" "$BACKUP_ROOT/$name.db"
+  sqlite3 "$BACKUP_ROOT/$name.db" "PRAGMA integrity_check;" > "$BACKUP_ROOT/$name.integrity_check.txt"
   docker exec "$CONTAINER" sh -lc "rm -f '$tmp_path'"
 }
 
 if [[ "$BACKUP_DB" == "1" ]]; then
   if [[ "$APPLY" == "1" && "$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null || true)" == "true" ]]; then
     backup_sqlite_db "/runtime/account_manager.db" "account_manager"
-    backup_sqlite_db "/runtime/team_manage.db" "team_manage"
+    backup_sqlite_db "/runtime/team_manage.db" "team_manage.historical"
   else
-    log "+ sqlite .backup /runtime/account_manager.db and /runtime/team_manage.db"
+    log "+ sqlite .backup /runtime/account_manager.db and historical /runtime/team_manage.db"
   fi
 fi
 

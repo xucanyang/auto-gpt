@@ -325,8 +325,8 @@ class ChatGPTStatusProbeTests(unittest.TestCase):
             return_value=ProbeHTTPResult(
                 status_code=200,
                 headers={},
-                body_text='{"plan_type":"chatgptteamplan"}',
-                body_json={"plan_type": "chatgptteamplan"},
+                body_text='{"plan_type":"chatgptplusplan"}',
+                body_json={"plan_type": "chatgptplusplan"},
                 error_code="",
                 message="ok",
             ),
@@ -344,7 +344,7 @@ class ChatGPTStatusProbeTests(unittest.TestCase):
             result = probe_local_chatgpt_status(account)
 
         self.assertEqual(result["auth"]["state"], "refresh_token_valid")
-        self.assertEqual(result["subscription"]["plan"], "team")
+        self.assertEqual(result["subscription"]["plan"], "plus")
         self.assertEqual(result["codex"]["state"], "usable")
         self.assertEqual(result["auth"]["source"], "refresh_token")
 
@@ -359,8 +359,8 @@ class ChatGPTStatusProbeTests(unittest.TestCase):
             return_value=ProbeHTTPResult(
                 status_code=200,
                 headers={},
-                body_text='{"plan_type":"chatgptteamplan"}',
-                body_json={"plan_type": "chatgptteamplan"},
+                body_text='{"plan_type":"chatgptplusplan"}',
+                body_json={"plan_type": "chatgptplusplan"},
                 error_code="",
                 message="ok",
             ),
@@ -380,22 +380,27 @@ class ChatGPTStatusProbeTests(unittest.TestCase):
         self.assertEqual(result["codex"]["state"], "refresh_token_invalidated")
         self.assertEqual(result["codex"]["source"], "refresh_token")
 
-    def test_probe_falls_back_to_accounts_check_for_subscription_plan(self):
+    def test_probe_falls_back_to_accounts_check_for_plus_subscription(self):
         account = DummyAccount(
             refresh_token="rt-token",
-            user_id="acct-rt",
-            extra={"organization_id": "org-1"},
+            user_id="acct-personal",
+            extra={"workspace_id": "ws-personal"},
         )
 
         with mock.patch(
             "services.chatgpt_core.status_probe.TokenRefreshManager.refresh_by_oauth_token",
-            return_value=mock.Mock(success=True, access_token="fresh-access-token", refresh_token="rt-token-2", error_message=""),
+            return_value=mock.Mock(
+                success=True,
+                access_token="fresh-access-token",
+                refresh_token="rt-token-2",
+                error_message="",
+            ),
         ), mock.patch(
             "services.chatgpt_core.status_probe._probe_backend_me",
             return_value=ProbeHTTPResult(
                 status_code=200,
                 headers={},
-                body_text='{}',
+                body_text="{}",
                 body_json={},
                 error_code="",
                 message="ok",
@@ -405,12 +410,18 @@ class ChatGPTStatusProbeTests(unittest.TestCase):
             return_value=ProbeHTTPResult(
                 status_code=200,
                 headers={},
-                body_text='{}',
+                body_text="{}",
                 body_json={
                     "accounts": {
-                        "org-1": {
-                            "account": {"plan_type": "chatgptteamplan", "is_default": True},
-                            "entitlement": {"expires_at": "2026-05-01T00:00:00+00:00"},
+                        "ws-personal": {
+                            "account": {
+                                "plan_type": "chatgptplusplan",
+                                "is_default": True,
+                            },
+                            "entitlement": {
+                                "subscription_plan": "chatgptplusplan",
+                                "expires_at": "2026-08-01T00:00:00+00:00",
+                            },
                         }
                     }
                 },
@@ -430,9 +441,76 @@ class ChatGPTStatusProbeTests(unittest.TestCase):
         ):
             result = probe_local_chatgpt_status(account)
 
-        self.assertEqual(result["subscription"]["plan"], "team")
+        self.assertEqual(result["auth"]["state"], "refresh_token_valid")
+        self.assertEqual(result["subscription"]["plan"], "plus")
         self.assertEqual(result["subscription"]["source"], "accounts_check")
-        self.assertEqual(result["subscription"]["subscription_active_until"], "2026-05-01T00:00:00+00:00")
+        self.assertEqual(
+            result["subscription"]["subscription_active_until"],
+            "2026-08-01T00:00:00+00:00",
+        )
+
+    def test_probe_prefers_current_workspace_id_over_default_account_entry(self):
+        account = DummyAccount(
+            access_token="cached-access-token",
+            user_id="acct-personal",
+            extra={"workspace_id": "ws-personal"},
+        )
+
+        with mock.patch(
+            "services.chatgpt_core.status_probe._probe_backend_me",
+            return_value=ProbeHTTPResult(
+                status_code=200,
+                headers={},
+                body_text="{}",
+                body_json={},
+                error_code="",
+                message="ok",
+            ),
+        ), mock.patch(
+            "services.chatgpt_core.status_probe._probe_accounts_check",
+            return_value=ProbeHTTPResult(
+                status_code=200,
+                headers={},
+                body_text="{}",
+                body_json={
+                    "accounts": {
+                        "acct-personal": {
+                            "account": {"plan_type": "free", "is_default": True},
+                            "entitlement": {
+                                "subscription_plan": "chatgptfreeplan"
+                            },
+                        },
+                        "ws-personal": {
+                            "account": {"plan_type": "chatgptplusplan"},
+                            "entitlement": {
+                                "subscription_plan": "chatgptplusplan",
+                                "expires_at": "2026-09-01T00:00:00+00:00",
+                            },
+                        },
+                    }
+                },
+                error_code="",
+                message="ok",
+            ),
+        ), mock.patch(
+            "services.chatgpt_core.status_probe._probe_codex_usage",
+            return_value=ProbeHTTPResult(
+                status_code=200,
+                headers={},
+                body_text='{"ok":true}',
+                body_json={"ok": True},
+                error_code="",
+                message="ok",
+            ),
+        ):
+            result = probe_local_chatgpt_status(account)
+
+        self.assertEqual(result["subscription"]["plan"], "plus")
+        self.assertEqual(result["subscription"]["source"], "accounts_check")
+        self.assertEqual(
+            result["subscription"]["subscription_active_until"],
+            "2026-09-01T00:00:00+00:00",
+        )
 
     def test_probe_backfills_subscription_expiry_when_me_has_paid_plan_without_expiry(self):
         account = DummyAccount(
@@ -487,67 +565,6 @@ class ChatGPTStatusProbeTests(unittest.TestCase):
         self.assertEqual(result["subscription"]["plan"], "plus")
         self.assertEqual(result["subscription"]["source"], "accounts_check")
         self.assertEqual(result["subscription"]["subscription_active_until"], "1781089634")
-
-    def test_probe_prefers_workspace_id_match_for_free_scope(self):
-        account = DummyAccount(
-            access_token="cached-access-token",
-            extra={
-                "workspace_id": "ws-free",
-                "chatgpt_workspace_scope": "free",
-            },
-        )
-
-        with mock.patch(
-            "services.chatgpt_core.status_probe._probe_backend_me",
-            return_value=ProbeHTTPResult(
-                status_code=200,
-                headers={},
-                body_text='{}',
-                body_json={},
-                error_code="",
-                message="ok",
-            ),
-        ), mock.patch(
-            "services.chatgpt_core.status_probe._probe_accounts_check",
-            return_value=ProbeHTTPResult(
-                status_code=200,
-                headers={},
-                body_text='{}',
-                body_json={
-                    "accounts": {
-                        "ws-team": {
-                            "account": {"plan_type": "chatgptteamplan"},
-                            "entitlement": {"subscription_plan": "chatgptteamplan", "expires_at": "2026-05-01T00:00:00+00:00"},
-                        },
-                        "ws-free": {
-                            "account": {"plan_type": "free", "is_default": True},
-                            "entitlement": {"subscription_plan": "chatgptfreeplan"},
-                        },
-                        "default": {
-                            "account": {"plan_type": "free", "is_default": True},
-                            "entitlement": {"subscription_plan": "chatgptfreeplan"},
-                        },
-                    }
-                },
-                error_code="",
-                message="ok",
-            ),
-        ), mock.patch(
-            "services.chatgpt_core.status_probe._probe_codex_usage",
-            return_value=ProbeHTTPResult(
-                status_code=200,
-                headers={},
-                body_text='{"ok":true}',
-                body_json={"ok": True},
-                error_code="",
-                message="ok",
-            ),
-        ):
-            result = probe_local_chatgpt_status(account)
-
-        self.assertEqual(result["subscription"]["plan"], "free")
-        self.assertEqual(result["subscription"]["source"], "accounts_check")
-
 
 if __name__ == "__main__":
     unittest.main()

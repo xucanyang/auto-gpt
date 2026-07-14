@@ -35,7 +35,6 @@ class SaveAccountWebSessionPreservationTests(unittest.TestCase):
                 status="registered",
                 extra_json=json.dumps(
                     {
-                        "chatgpt_workspace_variant_key": "free:acct-demo",
                         "access_token": "at-old",
                         "session_token": "session-old",
                         "cookies": "old-cookies",
@@ -54,7 +53,6 @@ class SaveAccountWebSessionPreservationTests(unittest.TestCase):
             token="at-new",
             status=AccountStatus.REGISTERED,
             extra={
-                "chatgpt_workspace_variant_key": "free:acct-demo",
                 "access_token": "at-new",
                 "refresh_token": "rt-new",
                 "session_token": "",

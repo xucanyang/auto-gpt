@@ -303,7 +303,7 @@ export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
                   })
                   .catch(() => undefined)
                 // Notify the parent after the terminal state is visible so pages can refresh
-                // their business data without making the final log lines disappear first.
+                // their page data without making the final log lines disappear first.
                 notifyTaskDone(terminal)
                 return true
               }

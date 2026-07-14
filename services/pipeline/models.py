@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from pydantic import BaseModel, Field as PydanticField
+from pydantic.json_schema import SkipJsonSchema
 from sqlmodel import Field, SQLModel
 
 
@@ -30,7 +31,7 @@ class PipelineConfig(BaseModel):
     register_extra: dict = PydanticField(default_factory=dict)
     gopay_country: str = "ID"
     gopay_currency: str = "IDR"
-    gopay_plan: str = "plus"
+    gopay_plan: SkipJsonSchema[str] = PydanticField(default="plus", exclude=True)
 
 
 class PipelineTask(SQLModel, table=True):

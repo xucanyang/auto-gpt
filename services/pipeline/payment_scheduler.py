@@ -181,7 +181,7 @@ class PaymentBatchScheduler:
                     account,
                     "payment_link",
                     {
-                        "plan": str(config.gopay_plan or "plus"),
+                        "plan": "plus",
                         "country": str(config.gopay_country or "ID"),
                         "currency": str(config.gopay_currency or "IDR"),
                     },

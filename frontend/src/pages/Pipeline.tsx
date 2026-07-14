@@ -55,7 +55,6 @@ type PipelineConfig = {
   register_extra: Record<string, unknown>
   gopay_country: string
   gopay_currency: string
-  gopay_plan: string
 }
 
 type PipelineTask = {
@@ -151,7 +150,6 @@ const DEFAULT_CONFIG: PipelineConfig = {
   register_extra: {},
   gopay_country: 'ID',
   gopay_currency: 'IDR',
-  gopay_plan: 'plus',
 }
 
 const STATUS_META: Record<string, { label: string; color: string }> = {
@@ -421,7 +419,9 @@ export default function Pipeline() {
     setConfigLoading(true)
     try {
       const config = await apiFetch('/pipeline/config')
-      form.setFieldsValue({ ...DEFAULT_CONFIG, ...(config || {}) })
+      const supportedConfig = { ...(config || {}) }
+      delete supportedConfig.gopay_plan
+      form.setFieldsValue({ ...DEFAULT_CONFIG, ...supportedConfig })
     } catch (error: any) {
       message.error(error?.message || '加载流水线配置失败')
     } finally {
@@ -443,7 +443,7 @@ export default function Pipeline() {
     try {
       await apiFetch('/pipeline/config', {
         method: 'PUT',
-        body: JSON.stringify({ config: values }),
+        body: JSON.stringify({ config: { ...values, gopay_plan: 'plus' } }),
       })
       message.success('流水线配置已保存')
       await loadStatus()
@@ -923,7 +923,6 @@ export default function Pipeline() {
                           Auth 补抓 {statusData?.config?.enable_auth_capture ? '已开启' : '已关闭'}
                         </Tag>
                         <Tag>平台 {statusData?.config?.platform || '-'}</Tag>
-                        <Tag>方案 {statusData?.config?.gopay_plan || '-'}</Tag>
                         <Tag>国家 {statusData?.config?.gopay_country || '-'}</Tag>
                         <Tag>币种 {statusData?.config?.gopay_currency || '-'}</Tag>
                       </Space>
@@ -1108,11 +1107,6 @@ export default function Pipeline() {
                           </Col>
                           <Col span={12}>
                             <Form.Item name="gopay_currency" label="GoPay 币种">
-                              <Input disabled />
-                            </Form.Item>
-                          </Col>
-                          <Col span={12}>
-                            <Form.Item name="gopay_plan" label="GoPay 套餐">
                               <Input disabled />
                             </Form.Item>
                           </Col>

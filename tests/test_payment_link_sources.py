@@ -156,9 +156,7 @@ class PaymentLinkSourceTests(unittest.TestCase):
         with mock.patch(
             "services.chatgpt_core.long_link_paypal_client.LongLinkPayPalClient.from_env",
             return_value=client,
-        ), mock.patch("services.chatgpt_core.payment.generate_plus_link") as hosted_plus, mock.patch(
-            "services.chatgpt_core.payment.generate_team_link"
-        ) as hosted_team:
+        ), mock.patch("services.chatgpt_core.payment.generate_plus_link") as hosted_plus:
             result = platform.execute_action(
                 "payment_link",
                 account,
@@ -179,20 +177,6 @@ class PaymentLinkSourceTests(unittest.TestCase):
             expected_profile_hash=PROFILE_HASH,
         )
         hosted_plus.assert_not_called()
-        hosted_team.assert_not_called()
-
-    def test_plugin_rejects_team_for_long_link_paypal(self):
-        account = Account(platform="chatgpt", email="team@example.com", password="pw", token="access-token-secret")
-        platform = ChatGPTPlatform(config=RegisterConfig(extra={}))
-
-        result = platform.execute_action(
-            "payment_link",
-            account,
-            {"plan": "team", "payment_source": "long_link_paypal"},
-        )
-
-        self.assertFalse(result["ok"])
-        self.assertIn("仅支持 Plus", result["error"])
 
 
 if __name__ == "__main__":

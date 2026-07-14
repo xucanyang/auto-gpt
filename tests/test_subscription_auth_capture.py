@@ -101,33 +101,6 @@ class SubscriptionAuthCaptureTests(unittest.TestCase):
                     result.success = False
                     result.error_message = "OAuth 登录成功但未获取 refresh_token"
 
-            def _build_workspace_artifact(self, *, tokens, oauth_client, source, scope_hint=""):
-                return {
-                    "scope": scope_hint or "free",
-                    "label": scope_hint or "free",
-                    "account_id": "acct-new",
-                    "workspace_id": "ws-new",
-                    "access_token": tokens.get("access_token", ""),
-                    "refresh_token": tokens.get("refresh_token", ""),
-                    "id_token": tokens.get("id_token", ""),
-                    "session_token": "session-new",
-                    "source": source,
-                    "variant_key": f"{scope_hint or 'free'}:ws-new",
-                }
-
-            def _artifact_has_refresh_token(self, artifact):
-                return bool(artifact.get("refresh_token"))
-
-            def _apply_workspace_artifact_to_result(self, result, artifact):
-                result.success = True
-                result.access_token = artifact.get("access_token", "")
-                result.refresh_token = artifact.get("refresh_token", "")
-                result.id_token = artifact.get("id_token", "")
-                result.session_token = artifact.get("session_token", "")
-                result.account_id = artifact.get("account_id", "")
-                result.workspace_id = artifact.get("workspace_id", "")
-                result.source = artifact.get("source", "")
-
         return (
             login_calls,
             mock.patch.object(subscription_auth_capture, "RestoredEmailService", _FakeEmailService),
@@ -147,7 +120,7 @@ class SubscriptionAuthCaptureTests(unittest.TestCase):
                 retry_delays_seconds=[],
             )
 
-        self.assertTrue(result["ok"])
+        self.assertTrue(result["ok"], result)
         self.assertEqual(len(login_calls), 1)
         self.assertTrue(login_calls[0]["allow_phone_verification"])
         self.assertFalse(login_calls[0]["allow_add_phone_session_recovery"])
@@ -158,7 +131,7 @@ class SubscriptionAuthCaptureTests(unittest.TestCase):
         self.assertEqual(account.token, "at-new")
         self.assertEqual(extra["refresh_token"], "rt-new")
         self.assertEqual(extra["workspace_id"], "ws-new")
-        self.assertEqual(extra["chatgpt_last_auth_capture"]["source"], "subscription_auth_capture_free")
+        self.assertEqual(extra["chatgpt_last_auth_capture"]["source"], "subscription_auth_capture")
 
     def test_add_phone_without_phone_verification_retries_short_path(self):
         account_id = self._add_account(status="pending_payment")

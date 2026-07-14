@@ -23,7 +23,7 @@ from .account_fingerprint import (
 )
 from .local_status_refresh import schedule_chatgpt_local_status_refresh_for_account_id
 from .mailbox_state import sanitize_mailbox_state
-from .pending_business_invites import RestoredEmailService, _mailbox_state_from_account
+from .restored_email_service import RestoredEmailService, mailbox_state_from_account
 from .refresh_token_registration_engine import (
     EmailServiceAdapter,
     RefreshTokenRegistrationEngine,
@@ -144,36 +144,11 @@ def _classify_capture_error(error_text: str, *, allow_phone_verification: bool) 
     return "auth_capture_failed", False
 
 
-def _resolve_capture_scope(extra: dict[str, Any]) -> str:
-    explicit = str(extra.get("chatgpt_subscription_auth_capture_scope") or "").strip().lower()
-    if explicit in {"free", "personal", "personal_free"}:
-        return "free"
-    if explicit in {"business", "team", "workspace", "enterprise"}:
-        return "business"
-
-    link = extra.get("chatgpt_last_payment_link") if isinstance(extra.get("chatgpt_last_payment_link"), dict) else {}
-    registration_context = (
-        extra.get("chatgpt_registration_context")
-        if isinstance(extra.get("chatgpt_registration_context"), dict)
-        else {}
-    )
-    plan = str(
-        link.get("plan")
-        or extra.get("chatgpt_checkout_plan")
-        or registration_context.get("plan")
-        or ""
-    ).strip().lower()
-    if plan in {"team", "business", "enterprise"}:
-        return "business"
-    return "free"
-
-
 def _build_auth_capture_payload(
     *,
     result: RegistrationResult,
     allow_phone_verification: bool,
     attempts: int,
-    scope: str,
     allow_add_phone_verification: bool | None = None,
     allow_existing_phone_verification: bool | None = None,
 ) -> dict[str, Any]:
@@ -183,7 +158,6 @@ def _build_auth_capture_payload(
         "account_id": str(result.account_id or ""),
         "workspace_id": str(result.workspace_id or ""),
         "source": str(result.source or "subscription_auth_capture"),
-        "scope": str(scope or ""),
         "has_access_token": bool(result.access_token),
         "has_refresh_token": bool(result.refresh_token),
         "allow_phone_verification": bool(allow_phone_verification),
@@ -191,17 +165,6 @@ def _build_auth_capture_payload(
         "allow_existing_phone_verification": bool(allow_existing_phone_verification) if allow_existing_phone_verification is not None else bool(allow_phone_verification),
         "attempts": int(attempts or 0),
         "captured_at": _utcnow().isoformat(),
-        "workspace_artifacts": [
-            {
-                "scope": str(item.get("scope") or ""),
-                "label": str(item.get("label") or ""),
-                "account_id": str(item.get("account_id") or ""),
-                "workspace_id": str(item.get("workspace_id") or ""),
-                "source": str(item.get("source") or ""),
-            }
-            for item in (result.workspace_artifacts or [])
-            if isinstance(item, dict)
-        ],
     }
 
 
@@ -235,11 +198,7 @@ def _persist_subscription_auth_result(
             raise ValueError("ChatGPT 账号不存在")
 
         adapter = RefreshTokenChatGPTRegistrationAdapter()
-        accounts = adapter._build_workspace_accounts(result, account.password)
-        if not accounts:
-            raise ValueError("补抓 Auth 成功但未生成账号材料")
-
-        primary = accounts[0]
+        primary = adapter.build_account(result, account.password)
         account.user_id = primary.user_id or account.user_id
         account.token = primary.token or account.token
 
@@ -340,7 +299,7 @@ def capture_subscription_auth_for_account(
         email = str(account.email or "").strip()
         password = str(account.password or "")
         extra = account.get_extra()
-        mailbox_state = _mailbox_state_from_account(account, extra=extra)
+        mailbox_state = mailbox_state_from_account(account, extra=extra)
 
     if not email:
         return {
@@ -401,12 +360,11 @@ def capture_subscription_auth_for_account(
         or merged_config.get("default_executor")
         or "protocol"
     ).strip().lower() or "protocol"
-    scope = _resolve_capture_scope(extra)
     retry_delays = _retry_delays_from_config(merged_config, retry_delays_seconds)
     max_attempts = 1 + len(retry_delays)
 
     _log(
-        f"[补抓] 账号级 Auth 捕获开始：{email}，scope={scope}，"
+        f"[补抓] 账号级 Auth 捕获开始：{email}，"
         f"allow_phone_verification={'true' if allow_phone_verification else 'false'}，"
         f"allow_add_phone={'true' if allow_add_phone_verification else 'false'}，"
         f"allow_existing_phone_otp={'true' if allow_existing_phone_verification else 'false'}，"
@@ -478,7 +436,6 @@ def capture_subscription_auth_for_account(
                 birthdate=birthdate,
                 login_source="subscription_auth_capture",
                 stop_after_login=False,
-                workspace_scope_preference=scope,
                 allow_add_phone_session_recovery=False,
             )
             if not tokens:
@@ -490,29 +447,18 @@ def capture_subscription_auth_for_account(
                 tokens=tokens,
                 oauth_client=oauth_client,
                 registration_message="subscription_auth_capture:ok",
-                source=f"subscription_auth_capture_{scope}",
+                source="subscription_auth_capture",
                 register_client=register_client,
             )
             if not result.success:
                 raise RuntimeError(result.error_message or "OAuth 登录成功但未获取 refresh_token")
 
-            artifact = engine_instance._build_workspace_artifact(
-                tokens=tokens,
-                oauth_client=oauth_client,
-                source=f"subscription_auth_capture_{scope}",
-                scope_hint=scope,
-            )
-            if not engine_instance._artifact_has_refresh_token(artifact):
-                raise RuntimeError("OAuth 登录成功但未获取 refresh_token")
-            engine_instance._apply_workspace_artifact_to_result(result, artifact)
-            result.workspace_artifacts = [artifact]
             exported_mailbox_state = email_service.export_state()
             result.metadata = {
                 **dict(result.metadata or {}),
                 "token_flow": "oauth_client.login_and_get_tokens",
                 "registration_flow": "subscription_auth_capture",
                 "mailbox_state": exported_mailbox_state,
-                "selected_workspace_scopes": [scope],
                 "allow_phone_verification": allow_phone_verification,
                 "allow_add_phone_verification": allow_add_phone_verification,
                 "allow_existing_phone_verification": allow_existing_phone_verification,
@@ -543,7 +489,6 @@ def capture_subscription_auth_for_account(
                 allow_add_phone_verification=allow_add_phone_verification,
                 allow_existing_phone_verification=allow_existing_phone_verification,
                 attempts=attempt,
-                scope=scope,
             )
             persist_result = _persist_subscription_auth_result(
                 account_id,
@@ -607,7 +552,6 @@ def capture_subscription_auth_for_account(
                 "ok": False,
                 "email": email,
                 "source": "subscription_auth_capture",
-                "scope": scope,
                 "allow_phone_verification": allow_phone_verification,
                 "allow_add_phone_verification": allow_add_phone_verification,
                 "allow_existing_phone_verification": allow_existing_phone_verification,

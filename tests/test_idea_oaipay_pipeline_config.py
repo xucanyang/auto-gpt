@@ -14,6 +14,22 @@ from core.db import AccountModel
 
 
 class IdeaOaiPayPipelineConfigTests(unittest.TestCase):
+    def test_retired_subscription_types_are_filtered_from_legacy_config(self):
+        config = IdeaOaiPayPipelineConfig.model_validate(
+            {
+                "idea": {"skip_if_subscription_in": ["plus", "team", "business", "enterprise", "plus"]},
+                "check": {"gate": {"allowed_subscription_types": ["free", "team", "unknown"]}},
+                "oaipay": {"require_subscription_in": ["pro", "business"]},
+            }
+        )
+
+        self.assertEqual(config.idea.skip_if_subscription_in, ["plus"])
+        self.assertEqual(config.check.gate.allowed_subscription_types, ["free"])
+        self.assertEqual(config.oaipay.require_subscription_in, ["pro"])
+
+    def test_default_idea_skip_list_only_contains_active_paid_plans(self):
+        self.assertEqual(IdeaOaiPayPipelineConfig().idea.skip_if_subscription_in, ["plus", "pro"])
+
     def test_source_register_alias_round_trips_as_register(self):
         config = IdeaOaiPayPipelineConfig.model_validate(
             {
@@ -128,6 +144,69 @@ class DummyRetryStateStore:
 
 
 class IdeaOaiPayPipelineEngineTests(unittest.TestCase):
+    def test_disabled_check_still_blocks_retired_subscription(self):
+        engine = IdeaOaiPayPipelineEngine()
+        item = IdeaOaiPayPipelineItem(
+            id=1,
+            pipeline_task_id=9,
+            account_id=101,
+            subscription_type_before="business",
+            check_stage="pending",
+            gate_stage="pending",
+            overall_status="pending",
+        )
+        state_store = DummyStateStore([item])
+        engine.state_store = state_store  # type: ignore[assignment]
+        task = IdeaOaiPayPipelineTask(id=9, task_key="retired", status="running")
+        config = IdeaOaiPayPipelineConfig.model_validate({"check": {"enabled": False}})
+
+        engine._run_check_step(task, config, limit=3)
+
+        self.assertEqual(item.check_stage, "skipped")
+        self.assertEqual(item.gate_stage, "blocked")
+        self.assertEqual(item.overall_status, "manual_required")
+        self.assertIn("已退役", item.last_error)
+
+    def test_retired_subscription_is_rejected_by_gate_even_when_gate_is_disabled(self):
+        engine = IdeaOaiPayPipelineEngine()
+        account = AccountModel(platform="chatgpt", email="retired@example.com", password="x")
+        account.set_extra({"chatgpt_local": {"subscription": {"plan": "business"}}})
+        config = IdeaOaiPayPipelineConfig.model_validate(
+            {"check": {"gate": {"enabled": False, "mode": "none"}}}
+        )
+
+        allowed, message = engine._evaluate_status_gate(account, config)
+
+        self.assertFalse(allowed)
+        self.assertIn("已退役", message)
+
+    def test_retired_subscription_is_rejected_by_oaipay_requirements(self):
+        engine = IdeaOaiPayPipelineEngine()
+        item = IdeaOaiPayPipelineItem(
+            id=1,
+            pipeline_task_id=9,
+            account_id=101,
+            subscription_type_after="team",
+            oaipay_stage="pending",
+        )
+        state_store = DummyStateStore([item])
+        engine.state_store = state_store  # type: ignore[assignment]
+
+        allowed = engine._oaipay_requirements_pass(item, IdeaOaiPayPipelineConfig())
+
+        self.assertFalse(allowed)
+        self.assertEqual(item.oaipay_stage, "skipped")
+        self.assertIn("禁止上传", item.oaipay_message)
+
+    def test_plus_phone_scope_does_not_include_retired_products(self):
+        engine = IdeaOaiPayPipelineEngine()
+        config = IdeaOaiPayPipelineConfig.model_validate({"phone": {"apply_to": "plus"}})
+        retired = IdeaOaiPayPipelineItem(pipeline_task_id=1, subscription_type_after="enterprise")
+        active = IdeaOaiPayPipelineItem(pipeline_task_id=1, subscription_type_after="plus")
+
+        self.assertFalse(engine._phone_applies(retired, config))
+        self.assertTrue(engine._phone_applies(active, config))
+
     def test_local_source_with_zero_matched_accounts_finishes_failed_without_worker(self):
         engine = IdeaOaiPayPipelineEngine()
         state_store = DummyStartStateStore()

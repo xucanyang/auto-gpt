@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Optional
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlsplit
 
 from curl_cffi import requests as cffi_requests
 
@@ -29,7 +29,7 @@ from services.chatgpt_core.payment import (
     DEFAULT_CHECKOUT_CURRENCY,
     DEFAULT_STRIPE_PK,
     PAYMENT_CHECKOUT_URL,
-    TEAM_CHECKOUT_BASE_URL,
+    CHATGPT_CHECKOUT_BASE_URL,
     _extract_oai_did,
     normalize_checkout_country,
     normalize_checkout_currency,
@@ -613,6 +613,30 @@ def _raise_for_gopay_status(resp: Any, context: str) -> None:
 
 def parse_checkout_url(raw: str) -> tuple[str, str]:
     raw = str(raw or "").strip()
+    parsed = urlsplit(raw)
+    retired_plans = {"team", "business", "enterprise"}
+    path_segments = {
+        segment.strip().lower()
+        for segment in str(parsed.path or "").split("/")
+        if segment.strip()
+    }
+    query = {
+        str(key or "").strip().lower(): str(value or "").strip().lower()
+        for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+    }
+    explicit_plan = next(
+        (
+            query[key]
+            for key in ("plan", "plan_type", "plan_name", "subscription_plan")
+            if key in query
+        ),
+        "",
+    )
+    if path_segments.intersection(retired_plans) or explicit_plan in retired_plans:
+        raise GoPayFlowError("GoPay 不接受 Team、Business 或 Enterprise checkout")
+    lowered = raw.lower()
+    if "chatgptteamplan" in lowered or "team_workspace_purchase" in lowered:
+        raise GoPayFlowError("GoPay 不接受 Team、Business 或 Enterprise checkout")
     if raw.startswith("http://") or raw.startswith("https://"):
         if "checkout.stripe.com" in raw:
             match = re.search(r"(cs_(?:live|test)_[A-Za-z0-9]+)", raw)
@@ -932,7 +956,7 @@ class GoPayRunner:
             self.s.cs_id = cs_id
             self.s.stripe_checkout_url = stripe_url
             if not self.s.checkout_url:
-                self.s.checkout_url = TEAM_CHECKOUT_BASE_URL + cs_id
+                self.s.checkout_url = CHATGPT_CHECKOUT_BASE_URL + cs_id
             self.s.processor_entity = _extract_processor_entity(self.s.checkout_url, default=self._processor_entity())
             _safe_log(self.s, f"Using checkout session: {cs_id}")
             return cs_id

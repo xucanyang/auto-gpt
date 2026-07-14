@@ -7,7 +7,7 @@ from fastapi import HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
-from core.db import init_db, recover_stuck_pending_business_invites
+from core.db import init_db
 from api.accounts import router as accounts_router
 from api.chatgpt import router as chatgpt_router
 from api.tasks import router as tasks_router
@@ -18,7 +18,6 @@ from api.integrations import router as integrations_router
 from api.auth import router as auth_router
 from api.outlook import router as outlook_router
 from api.contribution import router as contribution_router
-from api.team_lite import router as team_lite_router
 from api.icloud_hme import router as icloud_hme_router
 from api.tempmail_archive import router as tempmail_archive_router
 from api.pipeline import router as pipeline_router
@@ -233,10 +232,7 @@ def _print_runtime_info() -> None:
 async def lifespan(app: FastAPI):
     _print_runtime_info()
     init_db()
-    recovered_pending = recover_stuck_pending_business_invites()
     print("[OK] 数据库初始化完成")
-    if recovered_pending:
-        print(f"[OK] 已恢复 {recovered_pending} 条中断的 pending invite 激活记录")
     print(f"[OK] 已加载核心模块: {[ChatGPTPlatform.name]}")
     from core.scheduler import scheduler
     scheduler.start()
@@ -359,7 +355,6 @@ app.include_router(integrations_router, prefix="/api")
 app.include_router(auth_router, prefix="/api")
 app.include_router(outlook_router, prefix="/api")
 app.include_router(contribution_router, prefix="/api")
-app.include_router(team_lite_router, prefix="/api")
 app.include_router(icloud_hme_router, prefix="/api")
 app.include_router(tempmail_archive_router, prefix="/api")
 app.include_router(pipeline_router, prefix="/api")

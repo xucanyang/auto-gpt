@@ -30,7 +30,6 @@ import {
   splitGopayPhoneInput,
 } from '@/lib/gopayPhone'
 import { apiFetch } from '@/lib/utils'
-import { buildTaskProxyPayload, taskProxySettingsFromConfig, validateTaskProxySettings } from '@/lib/taskProxySettings'
 
 const { Text } = Typography
 
@@ -82,7 +81,6 @@ type AccountActionSurfaceProps = {
   onInitialActionHandled?: () => void
   onResumeAuthTask?: (record: any) => Promise<void> | void
   onInvalidRecheckTask?: (record: any) => Promise<void> | void
-  onK12RecaptureTask?: (record: any, params?: Record<string, unknown>) => Promise<void> | void
   authStateMeta: (state?: string) => { color: string; label: string }
   planMeta: (plan?: string) => { color: string; label: string }
   codexStateMeta: (state?: string) => { color: string; label: string }
@@ -351,7 +349,6 @@ export function AccountActionSurface({
   onInitialActionHandled,
   onResumeAuthTask,
   onInvalidRecheckTask,
-  onK12RecaptureTask,
   authStateMeta,
   planMeta,
   codexStateMeta,
@@ -395,7 +392,6 @@ export function AccountActionSurface({
   const [gopayResendingOtp, setGopayResendingOtp] = useState(false)
   const [gopayOtpDelaySaving, setGopayOtpDelaySaving] = useState(false)
   const [gopayStatusWarningShown, setGopayStatusWarningShown] = useState(false)
-  const [gopayCheckoutUrl, setGopayCheckoutUrl] = useState('')
   const [gopayOtpAutoResendDelay, setGopayOtpAutoResendDelay] = useState(DEFAULT_GOPAY_OTP_AUTO_RESEND_DELAY_SECONDS)
   const [gopayGlobalDefaults, setGopayGlobalDefaults] = useState<Record<string, any>>({})
   const [gopayPhoneCandidates, setGopayPhoneCandidates] = useState<GopayPhoneCandidate[]>([])
@@ -408,8 +404,6 @@ export function AccountActionSurface({
   const [browserAuthText, setBrowserAuthText] = useState('')
   const [browserAuthProxy, setBrowserAuthProxy] = useState('')
   const [browserAuthFreshProfile, setBrowserAuthFreshProfile] = useState(true)
-  const actionProxyModeValue = Form.useWatch('proxy_mode', actionForm)
-  const actionProxyFailoverValue = Form.useWatch('proxy_failover', actionForm)
   const paymentSourceValue = Form.useWatch('payment_source', actionForm)
   const autoHandledActionRef = useRef('')
   const paymentLinkRefreshTimerRef = useRef<number | null>(null)
@@ -420,7 +414,6 @@ export function AccountActionSurface({
   useEffect(() => {
     if (!open || gopayOpen) return
     setGopaySnapshot(acc.chatgptGopay || null)
-    setGopayCheckoutUrl('')
     setGopayConfigCollapsed(false)
     setActionOpen(false)
     setResultOpen(false)
@@ -702,11 +695,6 @@ export function AccountActionSurface({
       await onInvalidRecheckTask(acc)
       return
     }
-    if (actionId === 'k12_workspace_recapture' && onK12RecaptureTask) {
-      await onK12RecaptureTask(acc, params)
-      return
-    }
-
     try {
       setRunningActionId(actionId)
       const r = await apiFetch(`/actions/${acc.platform}/${acc.id}/${actionId}`, {
@@ -806,22 +794,16 @@ export function AccountActionSurface({
       || checkoutCurrencyByCountry[initialCountry]
       || DEFAULT_CHECKOUT_CURRENCY,
     )
-    const normalizedPlan = String(defaults.plan || 'plus').trim().toLowerCase() === 'team' ? 'team' : 'plus'
     const paymentSource = normalizePaymentSource(defaults.payment_source, defaults.payment_link_format)
-    const seatQuantity = Number(defaults.seat_quantity)
     return {
       payment_source: paymentSource,
-      plan: normalizedPlan,
+      plan: 'plus',
       country: initialCountry,
       currency: initialCurrency,
       proxy: String(defaults.proxy || '').trim(),
       payment_link_format: paymentSource === LONG_LINK_PAYPAL_SOURCE
         ? PAYPAL_PAYMENT_LINK_FORMAT
         : normalizePaymentLinkFormat(defaults.payment_link_format),
-      promo_code: String(defaults.promo_code || 'STRIPEATLASGPT4BIZ050126').trim(),
-      workspace_name: String(defaults.workspace_name || 'MyTeam').trim() || 'MyTeam',
-      seat_quantity: Number.isFinite(seatQuantity) ? Math.max(2, Math.trunc(seatQuantity)) : 5,
-      price_interval: String(defaults.price_interval || 'month').trim().toLowerCase() === 'year' ? 'year' : 'month',
       save_defaults: defaults.save_defaults !== false,
     }
   }
@@ -885,19 +867,14 @@ export function AccountActionSurface({
   const savePaymentLinkGlobalDefaults = async (values: Record<string, any>) => {
     const paymentSource = normalizePaymentSource(values.payment_source, values.payment_link_format)
     const payload = {
-      ...paymentLinkGlobalDefaults,
       payment_source: paymentSource,
-      plan: String(values.plan || 'plus').trim().toLowerCase() === 'team' ? 'team' : 'plus',
+      plan: 'plus',
       country: normalizeCheckoutCountry(values.country),
       currency: normalizeCheckoutCurrency(values.currency),
       proxy: String(values.proxy || '').trim(),
       payment_link_format: paymentSource === LONG_LINK_PAYPAL_SOURCE
         ? PAYPAL_PAYMENT_LINK_FORMAT
         : normalizePaymentLinkFormat(values.payment_link_format),
-      promo_code: String(values.promo_code || '').trim(),
-      workspace_name: String(values.workspace_name || 'MyTeam').trim() || 'MyTeam',
-      seat_quantity: Math.max(2, Math.trunc(Number(values.seat_quantity || 5) || 5)),
-      price_interval: String(values.price_interval || 'month').trim().toLowerCase() === 'year' ? 'year' : 'month',
     }
     await apiFetch('/config', {
       method: 'PUT',
@@ -930,7 +907,7 @@ export function AccountActionSurface({
     return (
       normalizePaymentSource(cachedLink.payment_source || cachedLink.source, cachedLink.payment_link_format) === paymentSource
       &&
-      String(cachedLink.plan || '').trim().toLowerCase() === String(values.plan || 'plus').trim().toLowerCase()
+      String(cachedLink.plan || '').trim().toLowerCase() === 'plus'
       && normalizeCheckoutCountry(cachedLink.country || DEFAULT_CHECKOUT_COUNTRY) === normalizeCheckoutCountry(values.country)
       && normalizeCheckoutCurrency(cachedLink.currency || DEFAULT_CHECKOUT_CURRENCY) === normalizeCheckoutCurrency(values.currency)
       && String(cachedLink.proxy || '').trim() === String(values.proxy || '').trim()
@@ -958,7 +935,6 @@ export function AccountActionSurface({
       plan: 'plus',
       country: initialCountry,
       currency: initialCurrency,
-      checkout_url: '',
       billing_name: String(mergedDefaults.billing_name || 'John Doe').trim(),
       billing_email: String(mergedDefaults.billing_email || acc.email || 'buyer@example.com').trim(),
       billing_country: String(mergedDefaults.billing_country || 'US').trim() || 'US',
@@ -1085,7 +1061,6 @@ export function AccountActionSurface({
       billing_city: String(values.billing_city || '').trim(),
       billing_state: String(values.billing_state || '').trim(),
       billing_postal_code: String(values.billing_postal_code || '').trim(),
-      checkout_url: '',
     }
   }
 
@@ -1175,9 +1150,7 @@ export function AccountActionSurface({
     ])
     const defaults = { ...(acc.chatgptGopayDefaults || {}), ...globalDefaults }
     const formValues = buildGopayFormValues(defaults, gopaySnapshot)
-    formValues.checkout_url = ''
     formValues.access_token = ''
-    setGopayCheckoutUrl('')
     gopayForm.setFieldsValue(formValues)
     gopayInputForm.resetFields()
     setGopayStatusWarningShown(false)
@@ -1191,7 +1164,6 @@ export function AccountActionSurface({
     try {
       await saveGopayOtpAutoResendDelay(gopayOtpAutoResendDelay, { notify: false, throwOnError: true })
       const country = normalizeCheckoutCountry(values.country)
-      const checkoutUrl = String(values.checkout_url || '').trim()
       const normalizedPhone = splitGopayPhoneInput(
         values.phone_country_code,
         values.phone_number,
@@ -1211,7 +1183,6 @@ export function AccountActionSurface({
           plan: 'plus',
           country,
           currency: normalizeCheckoutCurrency(values.currency),
-          checkout_url: checkoutUrl,
           billing_name: String(values.billing_name || '').trim(),
           billing_email: String(values.billing_email || '').trim(),
           billing_country: String(values.billing_country || '').trim(),
@@ -1236,13 +1207,11 @@ export function AccountActionSurface({
           billing_city: String(values.billing_city || '').trim(),
           billing_state: String(values.billing_state || '').trim(),
           billing_postal_code: String(values.billing_postal_code || '').trim(),
-          checkout_url: '',
         })
       }
       await rememberCurrentGopayPhone(values)
       setGopaySnapshot(data)
       setGopayStatusWarningShown(false)
-      setGopayCheckoutUrl('')
       setGopayConfigCollapsed(true)
       message.success('GoPay 支付流程已启动')
       await onRefresh()
@@ -1258,10 +1227,8 @@ export function AccountActionSurface({
     gopayInputForm.resetFields()
     const defaults = { ...(acc.chatgptGopayDefaults || {}), ...gopayGlobalDefaults }
     const formValues = buildGopayFormValues(defaults, null)
-    formValues.checkout_url = ''
     formValues.access_token = ''
     gopayForm.resetFields()
-    setGopayCheckoutUrl('')
     gopayForm.setFieldsValue(formValues)
     setGopayConfigCollapsed(false)
     setGopayStatusWarningShown(false)
@@ -1344,25 +1311,6 @@ export function AccountActionSurface({
       setActionOpen(true)
       return
     }
-    if (action.id === 'k12_workspace_recapture') {
-      let cfg: Record<string, any> = {}
-      try {
-        cfg = await apiFetch('/config')
-      } catch {
-        cfg = {}
-      }
-      actionForm.setFieldsValue({
-        workspace_ids: '',
-        save_all_spaces: true,
-        strict_join: false,
-        join_timeout_seconds: 60,
-        join_retry_count: 2,
-        post_join_poll_seconds: '3,8,15',
-        ...taskProxySettingsFromConfig(cfg || {}, { proxy_mode: 'dynamic', proxy_failover: true }),
-      })
-      setActionOpen(true)
-      return
-    }
     const initialValues: Record<string, any> = {}
     for (const param of action.params || []) {
       if (param.default !== undefined) initialValues[param.key] = param.default
@@ -1390,32 +1338,20 @@ export function AccountActionSurface({
       if (params.payment_source === LONG_LINK_PAYPAL_SOURCE) {
         params.payment_link_format = PAYPAL_PAYMENT_LINK_FORMAT
         params.reuse_cached_link = false
-        for (const key of ['plan', 'country', 'currency', 'proxy', 'promo_code', 'workspace_name', 'seat_quantity', 'price_interval']) {
+        for (const key of ['plan', 'country', 'currency', 'proxy']) {
           delete params[key]
         }
       } else {
-        params.plan = String(params.plan || 'plus').trim().toLowerCase() || 'plus'
+        params.plan = 'plus'
         params.country = normalizeCheckoutCountry(params.country)
         params.currency = normalizeCheckoutCurrency(params.currency)
         params.proxy = String(params.proxy || '').trim()
         params.payment_link_format = normalizePaymentLinkFormat(params.payment_link_format)
-        params.promo_code = String(params.promo_code || '').trim()
         params.reuse_cached_link = params.reuse_cached_link !== false
       }
       if (params.save_defaults) {
         await savePaymentLinkGlobalDefaults({ ...values, ...params })
       }
-    }
-    if (activeAction.id === 'k12_workspace_recapture') {
-      validateTaskProxySettings(values)
-      Object.assign(params, buildTaskProxyPayload(values), {
-        workspace_ids: String(values.workspace_ids || '').trim(),
-        save_all_spaces: values.save_all_spaces !== false,
-        strict_join: Boolean(values.strict_join),
-        join_timeout_seconds: Number(values.join_timeout_seconds || 60),
-        join_retry_count: Number(values.join_retry_count || 2),
-        post_join_poll_seconds: String(values.post_join_poll_seconds || '3,8,15').trim(),
-      })
     }
     setActionOpen(false)
     await runAction(activeAction, params)
@@ -1428,21 +1364,20 @@ export function AccountActionSurface({
     const params = {
       ...values,
       payment_source: paymentSource,
-      plan: String(values.plan || 'plus').trim().toLowerCase() || 'plus',
+      plan: 'plus',
       country: normalizeCheckoutCountry(values.country),
       currency: normalizeCheckoutCurrency(values.currency),
       proxy: String(values.proxy || '').trim(),
       payment_link_format: paymentSource === LONG_LINK_PAYPAL_SOURCE
         ? PAYPAL_PAYMENT_LINK_FORMAT
         : normalizePaymentLinkFormat(values.payment_link_format),
-      promo_code: String(values.promo_code || '').trim(),
       reuse_cached_link: paymentSource === LONG_LINK_PAYPAL_SOURCE || options.forceRegenerate
         ? false
         : canReusePaymentLinkCache(values),
       save_defaults: false,
     }
     if (paymentSource === LONG_LINK_PAYPAL_SOURCE) {
-      for (const key of ['plan', 'country', 'currency', 'proxy', 'promo_code', 'workspace_name', 'seat_quantity', 'price_interval']) {
+      for (const key of ['plan', 'country', 'currency', 'proxy']) {
         delete (params as Record<string, any>)[key]
       }
     }
@@ -1504,7 +1439,7 @@ export function AccountActionSurface({
       const selectedCountry = normalizeCheckoutCountry(actionForm.getFieldValue('country'))
       const selectedCurrency = normalizeCheckoutCurrency(actionForm.getFieldValue('currency'))
       const selectedProxy = String(actionForm.getFieldValue('proxy') || '').trim()
-      const selectedPlan = String(actionForm.getFieldValue('plan') || 'plus').trim().toLowerCase()
+      const selectedPlan = 'plus'
       const selectedPaymentLinkFormat = normalizePaymentLinkFormat(actionForm.getFieldValue('payment_link_format'))
       const cachedLink = acc.chatgptLastPaymentLink && typeof acc.chatgptLastPaymentLink === 'object'
         ? acc.chatgptLastPaymentLink
@@ -1558,14 +1493,6 @@ export function AccountActionSurface({
             />
           ) : (
             <>
-              <Form.Item name="plan" label="套餐" initialValue="plus" rules={[{ required: true }]}>
-                <Select
-                  options={[
-                    { label: 'Plus', value: 'plus' },
-                    { label: 'Team', value: 'team' },
-                  ]}
-                />
-              </Form.Item>
               <Form.Item name="payment_link_format" label="生成路径" initialValue={DEFAULT_PAYMENT_LINK_FORMAT} rules={[{ required: true }]}>
                 <Select options={PAYMENT_LINK_FORMAT_OPTIONS} />
               </Form.Item>
@@ -1643,126 +1570,11 @@ export function AccountActionSurface({
               >
                 <Checkbox disabled={!cacheMatchesCurrentSelection}>优先复用缓存订阅链接</Checkbox>
               </Form.Item>
-              <Form.Item
-                name="promo_code"
-                label="Promo Code"
-                extra="可选。Team 订阅链接会使用这里的 promo code；保存后下次打开会自动带出。"
-              >
-                <Input placeholder="STRIPEATLASGPT4BIZ050126" />
-              </Form.Item>
-              <Form.Item noStyle shouldUpdate={(prev, next) => prev.plan !== next.plan}>
-                {({ getFieldValue }) =>
-                  getFieldValue('plan') === 'team' ? (
-                    <>
-                      <Form.Item name="workspace_name" label="Team 名称" initialValue="MyTeam">
-                        <Input />
-                      </Form.Item>
-                      <Form.Item name="seat_quantity" label="席位数量" initialValue={5}>
-                        <InputNumber min={2} style={{ width: '100%' }} />
-                      </Form.Item>
-                      <Form.Item name="price_interval" label="计费周期" initialValue="month">
-                        <Select
-                          options={[
-                            { label: '月付', value: 'month' },
-                            { label: '年付', value: 'year' },
-                          ]}
-                        />
-                      </Form.Item>
-                    </>
-                  ) : null
-                }
-              </Form.Item>
             </>
           )}
           <Form.Item name="save_defaults" valuePropName="checked" style={{ marginBottom: 0 }}>
             <Checkbox>保存本次订阅链接配置</Checkbox>
           </Form.Item>
-        </>
-      )
-    }
-
-    if (activeAction.id === 'k12_workspace_recapture') {
-      const proxyMode = String(actionProxyModeValue || actionForm.getFieldValue('proxy_mode') || 'dynamic')
-      const proxyFailover = Boolean(actionProxyFailoverValue)
-      return (
-        <>
-          <Alert
-            type="warning"
-            showIcon
-            style={{ marginBottom: 12 }}
-            message="复用当前账号已保存的 AccessToken + cookies/session_token"
-            description="会重新执行 K12 join、拉取 accounts/check 空间列表并交换 workspace AccessToken；结果写回当前账号与 workspace variant 账号，弹窗结果只展示脱敏摘要。"
-          />
-          <Form.Item
-            name="workspace_ids"
-            label="目标 K12 workspace_id"
-            extra="留空时只导出当前可见空间；多个 ID 支持换行、逗号或空格分隔。"
-          >
-            <Input.TextArea rows={4} placeholder={'ws_xxx\nws_yyy'} />
-          </Form.Item>
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 12 }}>
-            <Form.Item name="save_all_spaces" valuePropName="checked">
-              <Checkbox>同时导出所有可见空间</Checkbox>
-            </Form.Item>
-            <Form.Item name="strict_join" valuePropName="checked">
-              <Checkbox>严格 join（失败即异常）</Checkbox>
-            </Form.Item>
-          </div>
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 12 }}>
-            <Form.Item name="join_timeout_seconds" label="Join 超时秒数">
-              <InputNumber min={5} max={180} precision={0} style={{ width: '100%' }} />
-            </Form.Item>
-            <Form.Item name="join_retry_count" label="Join 重试次数">
-              <InputNumber min={0} max={5} precision={0} style={{ width: '100%' }} />
-            </Form.Item>
-            <Form.Item name="post_join_poll_seconds" label="Join 后轮询秒">
-              <Input placeholder="3,8,15" />
-            </Form.Item>
-          </div>
-          <Form.Item label="代理模式" name="proxy_mode">
-            <Select style={{ width: 260 }}>
-              <Select.Option value="pool">代理池自动选取</Select.Option>
-              <Select.Option value="specified">手动指定代理</Select.Option>
-              <Select.Option value="dynamic">动态代理</Select.Option>
-              <Select.Option value="direct">直连 (不使用代理)</Select.Option>
-            </Select>
-          </Form.Item>
-          {(proxyMode === 'specified' || proxyMode === 'dynamic') && (
-            <Form.Item
-              label={proxyMode === 'dynamic' ? '动态代理模板（可选覆盖）' : '代理地址'}
-              name="proxy"
-              rules={proxyMode === 'specified' ? [{ required: true, message: '请输入代理地址' }] : undefined}
-              extra={proxyMode === 'dynamic' ? '留空使用全局动态代理模板；填写后仅本次重跑覆盖全局模板。' : undefined}
-            >
-              <Input placeholder={proxyMode === 'dynamic' ? '可留空；或填 socks5://user-region-JP-sid-xxxx-t-15:pass@host:port' : 'http://user:pass@host:port 或 socks5://...'} />
-            </Form.Item>
-          )}
-          {(proxyMode === 'pool' || proxyMode === 'dynamic' || (proxyMode === 'specified' && proxyFailover)) && (
-            <Space style={{ display: 'flex', flexWrap: 'wrap', gap: 16 }} align="baseline">
-              <Form.Item
-                label="目标国家 (ISO 缩写)"
-                name="proxy_country_code"
-                rules={proxyMode === 'dynamic' ? [{ required: true, message: '请输入动态代理出口国家' }] : undefined}
-              >
-                <Input style={{ width: 140 }} placeholder={proxyMode === 'dynamic' ? '必填，如 US' : '如 US, JP, 不填则不限'} />
-              </Form.Item>
-              {proxyMode !== 'dynamic' ? (
-                <>
-                  <Form.Item label="最低健康度分数" name="proxy_min_score">
-                    <InputNumber min={0} max={100} step={5} style={{ width: 140 }} />
-                  </Form.Item>
-                  <Form.Item label="候选代理数量" name="proxy_max_candidates">
-                    <InputNumber min={1} max={20} step={1} style={{ width: 140 }} />
-                  </Form.Item>
-                </>
-              ) : null}
-            </Space>
-          )}
-          {proxyMode !== 'direct' && (
-            <Form.Item name="proxy_failover" valuePropName="checked">
-              <Checkbox>{proxyMode === 'dynamic' ? '失败后刷新 sid 重试' : '使用多个候选代理，遇到网络失败时自动切换'}</Checkbox>
-            </Form.Item>
-          )}
         </>
       )
     }
@@ -2157,18 +1969,6 @@ export function AccountActionSurface({
             >
               <Input.Password placeholder="留空则使用当前账号 access token" />
             </Form.Item>
-            <Form.Item name="checkout_url" label="订阅链接 / checkout session">
-              <Input
-                placeholder="推荐留空：每次重新创建 checkout；被拒绝后不要复用旧 cs_live"
-                onChange={(event) => setGopayCheckoutUrl(event.target.value)}
-              />
-            </Form.Item>
-            <Alert
-              type={gopayCheckoutUrl ? 'success' : 'info'}
-              showIcon
-              message={gopayCheckoutUrl ? '将复用上方 checkout；如果该页面已被拒绝，请清空后重试' : '开始时会在同一 GoPay 会话内创建新的 Plus checkout'}
-              style={{ marginBottom: 12 }}
-            />
           </Form>
         ) : null}
         {renderGopayCurrentInput()}

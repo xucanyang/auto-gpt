@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 from sqlmodel import Session, select
 from typing import Any, Optional
 from copy import deepcopy
-from core.db import AccountModel, PendingBusinessInviteModel, TaskLog, engine
+from core.db import AccountModel, TaskLog, engine
 from core.task_runtime import (
     AttemptOutcome,
     AttemptResult,
@@ -38,6 +38,7 @@ from services.chatgpt_core.payment_link_cache import (
     payment_link_status_label,
     normalize_payment_link_url,
     normalize_payment_link_params,
+    validate_plus_payment_request_params,
 )
 from services.chatgpt_core.local_status_refresh import (
     schedule_chatgpt_local_status_refresh_for_account_id,
@@ -240,30 +241,6 @@ class VerificationActionRequest(BaseModel):
 class ResumeSubscriptionAuthTaskRequest(BaseModel):
     account_id: int
     allow_phone_verification: bool | None = None
-
-
-class K12WorkspaceRecaptureTaskRequest(BaseModel):
-    account_id: int
-    workspace_ids: Any = None
-    save_all_spaces: bool = True
-    strict_join: bool = False
-    proxy: Optional[str] = None
-    proxy_mode: str = ""
-    proxy_country_code: str = ""
-    proxy_failover: bool = True
-    proxy_max_candidates: int = 0
-    proxy_min_score: float = 0
-    dynamic_proxy_ip_retention_minutes: int = 0
-    join_timeout_seconds: Optional[int] = None
-    join_retry_count: Optional[int] = None
-    post_join_poll_seconds: Optional[str] = None
-
-
-class BatchK12WorkspaceRecaptureTaskRequest(AccountFilterRequestMixin):
-    account_ids: list[int] = Field(default_factory=list)
-    all_filtered: bool = False
-    params: dict[str, Any] = Field(default_factory=dict)
-    limit: int = 0
 
 
 class BatchResumeSubscriptionAuthTaskRequest(AccountFilterRequestMixin):
@@ -769,13 +746,6 @@ def enqueue_register_task(
                         "register_unique_exit_ip_enabled": _is_truthy(
                             prepared_extra.get("chatgpt_register_unique_exit_ip_enabled")
                         ),
-                        "capture_free_workspace": _is_truthy(prepared_extra.get("chatgpt_capture_free_workspace")),
-                    "capture_business_workspace": _is_truthy(prepared_extra.get("chatgpt_capture_business_workspace")),
-                    "enable_team_invite": _is_truthy(prepared_extra.get("chatgpt_enable_team_invite")),
-                    "deferred_activation": _is_truthy(prepared_extra.get("chatgpt_team_invite_deferred_activation")),
-                    "k12_enabled": _is_truthy(prepared_extra.get("chatgpt_k12_enabled")),
-                    "k12_workspace_count": len([item for item in re.split(r"[\s,;，；]+", str(prepared_extra.get("chatgpt_k12_workspace_ids") or "").strip()) if item]),
-                    "k12_save_all_spaces": _is_truthy(prepared_extra.get("chatgpt_k12_save_all_spaces", True)),
                     "zero_amount_stop_enabled": _is_truthy(
                         prepared_extra.get("chatgpt_access_token_only_zero_amount_stop_enabled")
                     ),
@@ -905,139 +875,6 @@ def enqueue_resume_subscription_auth_task(
             account_id_value,
             resolved_allow_phone_verification,
         )
-    return task_id
-
-
-def _truthy_with_default(value: Any, default: bool = False) -> bool:
-    if value is None or value == "":
-        return bool(default)
-    return _is_truthy(value)
-
-
-def _k12_recapture_params_from_request(req: K12WorkspaceRecaptureTaskRequest) -> dict[str, Any]:
-    params: dict[str, Any] = {
-        "workspace_ids": req.workspace_ids,
-        "save_all_spaces": bool(req.save_all_spaces),
-        "strict_join": bool(req.strict_join),
-        "proxy": str(req.proxy or "").strip() or None,
-        "proxy_mode": str(req.proxy_mode or "").strip().lower(),
-        "proxy_country_code": str(req.proxy_country_code or "").strip().upper(),
-        "proxy_failover": bool(req.proxy_failover),
-        "proxy_max_candidates": int(req.proxy_max_candidates or 0),
-        "proxy_min_score": float(req.proxy_min_score or 0),
-        "dynamic_proxy_ip_retention_minutes": int(req.dynamic_proxy_ip_retention_minutes or 0),
-        "join_timeout_seconds": req.join_timeout_seconds,
-        "join_retry_count": req.join_retry_count,
-        "post_join_poll_seconds": str(req.post_join_poll_seconds or "").strip(),
-    }
-    return params
-
-
-def _normalize_k12_recapture_params(params: dict[str, Any] | None) -> dict[str, Any]:
-    raw = dict(params or {})
-    normalized: dict[str, Any] = {
-        "workspace_ids": raw.get("workspace_ids"),
-        "save_all_spaces": _truthy_with_default(raw.get("save_all_spaces"), True),
-        "strict_join": _truthy_with_default(raw.get("strict_join"), False),
-        "proxy": str(raw.get("proxy") or raw.get("proxy_url") or "").strip() or None,
-        "proxy_mode": str(raw.get("proxy_mode") or "").strip().lower(),
-        "proxy_country_code": str(raw.get("proxy_country_code") or "").strip().upper(),
-        "proxy_failover": _truthy_with_default(raw.get("proxy_failover"), True),
-        "proxy_max_candidates": int(float(raw.get("proxy_max_candidates") or 0)),
-        "proxy_min_score": float(raw.get("proxy_min_score") or 0),
-        "dynamic_proxy_ip_retention_minutes": int(float(raw.get("dynamic_proxy_ip_retention_minutes") or 0)),
-    }
-    for key in ("join_timeout_seconds", "join_retry_count"):
-        value = raw.get(key)
-        if value not in (None, ""):
-            normalized[key] = int(float(value))
-    for key in ("delay_seconds", "delay_max_seconds"):
-        value = raw.get(key)
-        if value not in (None, ""):
-            normalized[key] = max(0.0, float(value))
-    if raw.get("post_join_poll_seconds") not in (None, ""):
-        normalized["post_join_poll_seconds"] = str(raw.get("post_join_poll_seconds") or "").strip()
-    return normalized
-
-
-def _k12_recapture_meta_params(params: dict[str, Any]) -> dict[str, Any]:
-    return sanitize_task_detail(
-        {
-            "workspace_ids": params.get("workspace_ids"),
-            "save_all_spaces": params.get("save_all_spaces"),
-            "strict_join": params.get("strict_join"),
-            "proxy_mode": params.get("proxy_mode"),
-            "proxy_country_code": params.get("proxy_country_code"),
-            "proxy_failover": params.get("proxy_failover"),
-            "proxy_max_candidates": params.get("proxy_max_candidates"),
-            "proxy_min_score": params.get("proxy_min_score"),
-            "dynamic_proxy_ip_retention_minutes": params.get("dynamic_proxy_ip_retention_minutes"),
-            "join_timeout_seconds": params.get("join_timeout_seconds"),
-            "join_retry_count": params.get("join_retry_count"),
-            "post_join_poll_seconds": params.get("post_join_poll_seconds"),
-            "delay_seconds": params.get("delay_seconds"),
-            "delay_max_seconds": params.get("delay_max_seconds"),
-        }
-    )
-
-
-def enqueue_k12_workspace_recapture_task(
-    req: K12WorkspaceRecaptureTaskRequest,
-    *,
-    background_tasks: BackgroundTasks | None = None,
-) -> str:
-    account_id_value = int(req.account_id or 0)
-    if account_id_value <= 0:
-        raise HTTPException(400, "account_id 无效")
-    params = _normalize_k12_recapture_params(_k12_recapture_params_from_request(req))
-
-    with Session(engine) as session:
-        account = session.get(AccountModel, account_id_value)
-        if account is None or account.platform != "chatgpt":
-            raise HTTPException(404, "ChatGPT 账号不存在")
-        candidate_ok, candidate_reason = _is_k12_recapture_candidate(account)
-        if not candidate_ok:
-            raise HTTPException(400, candidate_reason or "账号缺少 K12 重跑所需凭证")
-        email = str(account.email or "")
-
-    task_id = f"task_{int(time.time() * 1000)}"
-    source = "k12_workspace_recapture"
-    meta = {
-        "account_id": account_id_value,
-        "email": email,
-        "params": _k12_recapture_meta_params(params),
-    }
-    _create_standalone_task_record(
-        task_id,
-        platform="chatgpt",
-        source=source,
-        total=1,
-        meta=meta,
-    )
-    _save_task_log(
-        "chatgpt",
-        email,
-        "running",
-        detail=_build_task_log_detail(
-            task_id,
-            {
-                "email": email,
-                "account_id": account_id_value,
-                "attempt_outcome": "task_created",
-                "source": source,
-                "meta": meta,
-            },
-        ),
-    )
-    if background_tasks is None:
-        thread = threading.Thread(
-            target=_run_k12_workspace_recapture,
-            args=(task_id, account_id_value, params),
-            daemon=True,
-        )
-        thread.start()
-    else:
-        background_tasks.add_task(_run_k12_workspace_recapture, task_id, account_id_value, params)
     return task_id
 
 
@@ -1271,99 +1108,6 @@ def _resolve_batch_resume_auth_accounts(
                     "reason": "账号当前无需补抓 Auth",
                 }
             )
-    return eligible, [], skipped, matched
-
-
-def _is_k12_recapture_candidate(account: AccountModel) -> tuple[bool, str]:
-    try:
-        from services.chatgpt_core.k12_recapture import (
-            access_token_from_account,
-            cookies_from_account,
-            session_token_from_account,
-        )
-
-        extra = account.get_extra()
-        extra = extra if isinstance(extra, dict) else {}
-        if not access_token_from_account(account, extra):
-            return False, "账号缺少已保存 access_token"
-        if not cookies_from_account(account, extra) and not session_token_from_account(account, extra):
-            return False, "账号缺少已保存 cookies/session_token"
-        return True, ""
-    except Exception as exc:
-        return False, str(exc) or "账号凭证检查失败"
-
-
-def _resolve_batch_k12_recapture_accounts(
-    req: BatchK12WorkspaceRecaptureTaskRequest,
-) -> tuple[list[dict[str, Any]], list[int], list[dict[str, Any]], list[dict[str, Any]]]:
-    requested_ids = _normalize_batch_account_ids(req.account_ids)
-    limit = max(int(req.limit or 0), 0)
-
-    if requested_ids:
-        if len(requested_ids) > 1000:
-            raise HTTPException(400, "单次最多处理 1000 个账号")
-        with Session(engine) as session:
-            rows = session.exec(
-                select(AccountModel)
-                .where(AccountModel.platform == "chatgpt")
-                .where(AccountModel.id.in_(requested_ids))
-            ).all()
-        row_map = {int(row.id or 0): row for row in rows if int(row.id or 0) > 0}
-        eligible: list[dict[str, Any]] = []
-        skipped: list[dict[str, Any]] = []
-        missing_ids: list[int] = []
-        for account_id in requested_ids:
-            account = row_map.get(account_id)
-            if account is None:
-                missing_ids.append(account_id)
-                continue
-            item = {
-                "account_id": account_id,
-                "email": str(account.email or ""),
-                "status": str(account.status or ""),
-            }
-            ok, reason = _is_k12_recapture_candidate(account)
-            if ok:
-                eligible.append(item)
-            else:
-                skipped.append({**item, "reason": reason or "账号缺少 K12 重跑所需凭证"})
-        if limit > 0:
-            overflow = eligible[limit:]
-            eligible = eligible[:limit]
-            skipped.extend({**item, "reason": f"超过本次限制 limit={limit}"} for item in overflow)
-        return eligible, missing_ids, skipped, []
-
-    if not bool(req.all_filtered):
-        raise HTTPException(400, "请提供 account_ids，或指定 all_filtered=true")
-
-    with Session(engine) as session:
-        rows = _filtered_chatgpt_accounts(session, req)
-
-    if len(rows) > 1000:
-        raise HTTPException(400, "单次最多处理 1000 个账号")
-
-    eligible = []
-    skipped = []
-    matched = []
-    for account in rows:
-        account_id = int(account.id or 0)
-        if account_id <= 0:
-            continue
-        item = {
-            "account_id": account_id,
-            "email": str(account.email or ""),
-            "status": str(account.status or ""),
-        }
-        matched.append(item)
-        ok, reason = _is_k12_recapture_candidate(account)
-        if ok:
-            eligible.append(item)
-        else:
-            skipped.append({**item, "reason": reason or "账号缺少 K12 重跑所需凭证"})
-    if limit > 0:
-        overflow = eligible[limit:]
-        eligible = eligible[:limit]
-        skipped.extend({**item, "reason": f"超过本次限制 limit={limit}"} for item in overflow)
     return eligible, [], skipped, matched
 
 
@@ -1896,10 +1640,6 @@ def _filtered_payment_link_request_params(params: dict[str, Any] | None) -> dict
         "payment_source",
         "profile_hash",
         "payment_profile_hash",
-        "promo_code",
-        "workspace_name",
-        "seat_quantity",
-        "price_interval",
         "billing_name",
         "billing_email",
         "billing_country",
@@ -3388,97 +3128,6 @@ def enqueue_batch_resume_subscription_auth_task(
     }
 
 
-def enqueue_batch_k12_workspace_recapture_task(
-    req: BatchK12WorkspaceRecaptureTaskRequest,
-    *,
-    background_tasks: BackgroundTasks | None = None,
-) -> dict[str, Any]:
-    params = _normalize_k12_recapture_params(req.params)
-    eligible_accounts, missing_ids, skipped_accounts, matched_accounts = _resolve_batch_k12_recapture_accounts(req)
-    total_requested = len(_normalize_batch_account_ids(req.account_ids)) if req.account_ids else len(matched_accounts)
-    filter_audit = _task_account_filter_audit(
-        req,
-        matched_accounts=matched_accounts,
-        eligible_accounts=eligible_accounts,
-        skipped_accounts=skipped_accounts,
-    )
-
-    if not eligible_accounts:
-        return {
-            "task_id": "",
-            "total_requested": total_requested,
-            "matched": len(matched_accounts),
-            "eligible": 0,
-            "skipped": len(skipped_accounts),
-            "missing": len(missing_ids),
-            "items": [],
-            "skipped_items": skipped_accounts,
-            "missing_ids": missing_ids,
-        }
-
-    task_id = f"task_{int(time.time() * 1000)}"
-    source = "batch_k12_workspace_recapture"
-    meta = {
-        "total_requested": total_requested,
-        "matched": len(matched_accounts),
-        "eligible": len(eligible_accounts),
-        "missing_ids": list(missing_ids),
-        "account_ids": [int(item["account_id"]) for item in eligible_accounts],
-        "emails": [str(item["email"] or "") for item in eligible_accounts],
-        "filter": _task_filter_meta(req, filter_audit),
-        "filter_audit": filter_audit,
-        "limit": int(req.limit or 0),
-        "skipped_items": list(skipped_accounts),
-        "params": _k12_recapture_meta_params(params),
-    }
-    _create_standalone_task_record(
-        task_id,
-        platform="chatgpt",
-        source=source,
-        total=max(len(eligible_accounts), 1),
-        meta=meta,
-    )
-
-    primary_email = str(eligible_accounts[0]["email"] or "") if eligible_accounts else ""
-    _save_task_log(
-        "chatgpt",
-        primary_email,
-        "running",
-        detail=_build_task_log_detail(
-            task_id,
-            {
-                "email": primary_email,
-                "attempt_outcome": "task_created",
-                "source": source,
-                "meta": meta,
-            },
-        ),
-    )
-
-    account_ids = [int(item["account_id"]) for item in eligible_accounts]
-    if background_tasks is None:
-        thread = threading.Thread(
-            target=_run_batch_k12_workspace_recapture,
-            args=(task_id, account_ids, params),
-            daemon=True,
-        )
-        thread.start()
-    else:
-        background_tasks.add_task(_run_batch_k12_workspace_recapture, task_id, account_ids, params)
-
-    return {
-        "task_id": task_id,
-        "total_requested": total_requested,
-        "matched": len(matched_accounts),
-        "eligible": len(eligible_accounts),
-        "skipped": len(skipped_accounts),
-        "missing": len(missing_ids),
-        "items": eligible_accounts,
-        "skipped_items": skipped_accounts,
-        "missing_ids": missing_ids,
-    }
-
-
 def enqueue_phone_binding_test_task(
     req: PhoneBindingTestTaskRequest,
     *,
@@ -4467,6 +4116,11 @@ def enqueue_batch_payment_link_task(
     *,
     background_tasks: BackgroundTasks | None = None,
 ) -> dict[str, Any]:
+    try:
+        validate_plus_payment_request_params(req.params)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    request_params = _filtered_payment_link_request_params(req.params)
     eligible_accounts, missing_ids, skipped_accounts, matched_accounts = _resolve_batch_payment_link_accounts(req)
     total_requested = len(_normalize_batch_account_ids(req.account_ids)) if req.account_ids else len(matched_accounts)
     filter_audit = _task_account_filter_audit(
@@ -4478,7 +4132,6 @@ def enqueue_batch_payment_link_task(
 
     task_id = f"task_{int(time.time() * 1000)}"
     source = "batch_payment_link"
-    request_params = _filtered_payment_link_request_params(req.params)
     meta = {
         "total_requested": total_requested,
         "matched": len(matched_accounts),
@@ -5123,98 +4776,6 @@ def _build_effective_register_extra(req: RegisterTaskRequest) -> dict:
     return merged_extra
 
 
-def _should_precheck_chatgpt_deferred_invite(
-    req: RegisterTaskRequest,
-    merged_extra: dict | None = None,
-) -> bool:
-    effective_extra = merged_extra or _build_effective_register_extra(req)
-    return (
-        req.platform == "chatgpt"
-        and _is_truthy(effective_extra.get("chatgpt_enable_team_invite"))
-        and _is_truthy(effective_extra.get("chatgpt_team_invite_deferred_activation"))
-    )
-
-
-def _check_chatgpt_deferred_invite_availability(
-    req: RegisterTaskRequest,
-    *,
-    merged_extra: dict | None = None,
-    log_fn=None,
-) -> tuple[bool, str]:
-    effective_extra = merged_extra or _build_effective_register_extra(req)
-    if not _should_precheck_chatgpt_deferred_invite(req, effective_extra):
-        return True, ""
-
-    try:
-        from services.chatgpt_core.business_workspace_recovery import BusinessWorkspaceRecovery
-        from services.team_embedded_backend import team_embedded_backend
-
-        recovery = BusinessWorkspaceRecovery(
-            effective_extra,
-            proxy=req.proxy,
-            browser_mode=req.executor_type or effective_extra.get("default_executor") or "protocol",
-            log_fn=(lambda message, *_args: log_fn(message)) if callable(log_fn) else None,
-        )
-        if not recovery.is_enabled():
-            return False, "本地 Team 运行时不可用，无法执行延迟邀请"
-        teams = recovery.list_available_teams()
-        if not teams:
-            return False, "当前没有可邀请 team，延迟邀请任务终止"
-
-        candidate_team_ids = []
-        for item in teams:
-            try:
-                team_id = int((item or {}).get("id") or 0)
-            except Exception:
-                team_id = 0
-            if team_id > 0 and team_id not in candidate_team_ids:
-                candidate_team_ids.append(team_id)
-
-        # 预检查不能只看旧 DB 状态；先强制刷新候选 Team，剔除 token 失效/已满/过期项。
-        verified_team_ids = []
-        for team_id in candidate_team_ids:
-            try:
-                sync_result = team_embedded_backend.sync_team_info(team_id, force_refresh=True)
-            except Exception as exc:
-                if callable(log_fn):
-                    log_fn(f"[邀请] 预检查刷新 team={team_id} 失败: {exc}")
-                continue
-            if bool((sync_result or {}).get("success")):
-                verified_team_ids.append(team_id)
-                continue
-            if callable(log_fn):
-                error_text = str((sync_result or {}).get("error") or "unknown").strip() or "unknown"
-                log_fn(f"[邀请] 预检查剔除 team={team_id}: {error_text}")
-
-        if not verified_team_ids:
-            return False, "预检查刷新后候选 Team 全部不可用，延迟邀请任务终止"
-
-        teams = recovery.list_available_teams()
-        if not teams:
-            return False, "预检查刷新后没有可邀请 team，延迟邀请任务终止"
-
-        team_ids = []
-        verified_team_id_set = set(verified_team_ids)
-        for item in teams:
-            try:
-                team_id = int((item or {}).get("id") or 0)
-            except Exception:
-                team_id = 0
-            if team_id <= 0 or team_id not in verified_team_id_set:
-                continue
-            if team_id not in team_ids:
-                team_ids.append(team_id)
-        if isinstance(effective_extra, dict) and team_ids:
-            effective_extra["chatgpt_deferred_invite_team_ids"] = list(team_ids)
-            effective_extra["chatgpt_deferred_invite_team_id"] = team_ids[0]
-        if team_ids:
-            available_text = ",".join(str(team_id) for team_id in team_ids)
-            return True, f"延迟邀请预检查通过，可用 team_id={available_text}"
-        return False, "预检查刷新后候选 Team 全部不可用，延迟邀请任务终止"
-    except Exception as exc:
-        return False, f"延迟邀请预检查失败: {exc}"
-
-
 def _run_resume_subscription_auth(
     task_id: str,
     account_id: int,
@@ -5418,247 +4979,6 @@ def _run_resume_subscription_auth(
             errors=errors,
             error=error_text,
         )
-    finally:
-        _clear_task_current(task_id)
-        _task_store.cleanup()
-
-
-def _k12_recapture_result_message(result: dict[str, Any]) -> str:
-    data = result.get("data") if isinstance(result.get("data"), dict) else {}
-    if data.get("message"):
-        return str(data.get("message") or "")
-    summary = data.get("summary") if isinstance(data.get("summary"), dict) else {}
-    saved_spaces = int(summary.get("saved_spaces") or len(data.get("artifacts") or []) or 0)
-    saved_accounts = len(data.get("saved_accounts") or [])
-    changed_ids = len(data.get("changed_account_ids") or [])
-    if bool(result.get("ok")):
-        return f"K12 / Workspace 重跑完成：导出 {saved_spaces} 个空间，写入 {saved_accounts} 个账号，变更 {changed_ids} 个账号"
-    return str(result.get("error") or summary.get("error") or summary.get("accounts_check_error") or "K12 / Workspace 重跑失败")
-
-
-def _run_k12_workspace_recapture(task_id: str, account_id: int, params: dict[str, Any]):
-    from api.actions import (
-        _action_local_status_refresh_ids,
-        _execute_chatgpt_k12_workspace_recapture_action,
-    )
-
-    control = _task_store.control_for(task_id)
-    _task_store.mark_running(task_id)
-    _task_store.set_progress(task_id, "0/1")
-    email = ""
-    errors: list[str] = []
-    result: dict[str, Any] = {}
-    try:
-        control.checkpoint()
-        with Session(engine) as session:
-            account = session.get(AccountModel, int(account_id or 0))
-            if account is None or account.platform != "chatgpt":
-                raise ValueError("ChatGPT 账号不存在")
-            email = str(account.email or "")
-
-        _task_timeline_log(
-            task_id,
-            task="K12重跑",
-            email=email,
-            account_id=account_id,
-            phase="prepare",
-            phase_label="准备 K12 / Workspace 重跑",
-            stage_index=1,
-            stage_total=4,
-            message="开始：复用已保存 AccessToken + cookies/session_token",
-            next_step="重新 join 目标 workspace 并拉取 accounts/check",
-            reset_started_at=True,
-        )
-        attempt_id = control.start_attempt()
-        try:
-            control.checkpoint(attempt_id=attempt_id)
-            with Session(engine) as session:
-                account = session.get(AccountModel, int(account_id or 0))
-                if account is None or account.platform != "chatgpt":
-                    raise ValueError("ChatGPT 账号不存在")
-                _task_timeline_log(
-                    task_id,
-                    task="K12重跑",
-                    email=email,
-                    account_id=account_id,
-                    phase="capture",
-                    phase_label="Join / accounts/check / workspace token exchange",
-                    stage_index=2,
-                    stage_total=4,
-                    message="开始执行 K12 捕获",
-                    next_step="等待 workspace token 交换并写回账号",
-                    reset_started_at=True,
-                )
-
-                def _task_log_bridge(message: str, level: str = "info") -> None:
-                    _log(task_id, message, level)
-
-                result = _execute_chatgpt_k12_workspace_recapture_action(
-                    account,
-                    session,
-                    dict(params or {}),
-                    log_fn=_task_log_bridge,
-                    stop_checker=lambda: control.checkpoint(attempt_id=attempt_id),
-                )
-                try:
-                    session.commit()
-                except Exception:
-                    pass
-                refresh_ids = _action_local_status_refresh_ids("k12_workspace_recapture", result, account)
-                for account_id_value in dict.fromkeys(refresh_ids):
-                    schedule_chatgpt_local_status_refresh_for_account_id(
-                        account_id_value,
-                        reason="task:k12_workspace_recapture",
-                    )
-                if not bool(result.get("ok")):
-                    raise ValueError(_k12_recapture_result_message(result))
-            control.checkpoint(attempt_id=attempt_id)
-        finally:
-            control.finish_attempt(attempt_id)
-
-        data = result.get("data") if isinstance(result.get("data"), dict) else {}
-        summary = data.get("summary") if isinstance(data.get("summary"), dict) else {}
-        saved_spaces = int(summary.get("saved_spaces") or len(data.get("artifacts") or []) or 0)
-        saved_accounts = len(data.get("saved_accounts") or [])
-        changed_ids = list(data.get("changed_account_ids") or [])
-        _task_store.set_progress(task_id, "1/1")
-        _task_store.update_meta(
-            task_id,
-            {
-                "result": sanitize_task_detail(data),
-                "summary": {
-                    "saved_spaces": saved_spaces,
-                    "saved_accounts": saved_accounts,
-                    "changed_account_ids": changed_ids,
-                },
-            },
-        )
-        _task_timeline_log(
-            task_id,
-            task="K12重跑",
-            email=email,
-            account_id=account_id,
-            phase="done",
-            phase_label="K12 / Workspace 重跑完成",
-            stage_index=4,
-            stage_total=4,
-            message=f"导出 {saved_spaces} 个空间，写入 {saved_accounts} 个账号，变更 {len(changed_ids)} 个账号",
-            next_step="任务完成",
-            reset_started_at=True,
-        )
-        _save_task_log(
-            "chatgpt",
-            email,
-            "success",
-            detail=_build_task_log_detail(
-                task_id,
-                {
-                    "attempt_outcome": "k12_workspace_recapture_success",
-                    "email": email,
-                    "account_id": int(account_id or 0),
-                    "source": "k12_workspace_recapture",
-                    "result": sanitize_task_detail(data),
-                },
-            ),
-        )
-        _task_store.finish(task_id, status="done", success=1, skipped=0, errors=[])
-    except SkipCurrentAttemptRequested as exc:
-        _task_timeline_log(
-            task_id,
-            task="K12重跑",
-            email=email,
-            account_id=account_id,
-            phase="skipped",
-            phase_label="已跳过",
-            stage_index=4,
-            stage_total=4,
-            message=str(exc),
-            next_step="任务停止",
-            reset_started_at=True,
-        )
-        _save_task_log(
-            "chatgpt",
-            email,
-            "skipped",
-            error=str(exc),
-            detail=_build_task_log_detail(
-                task_id,
-                {
-                    "attempt_outcome": "k12_workspace_recapture_skipped",
-                    "email": email,
-                    "account_id": int(account_id or 0),
-                    "source": "k12_workspace_recapture",
-                },
-            ),
-        )
-        _task_store.finish(task_id, status="stopped", success=0, skipped=1, errors=[])
-    except StopTaskRequested as exc:
-        _log(task_id, f"[STOP] {exc}")
-        _task_timeline_log(
-            task_id,
-            task="K12重跑",
-            email=email,
-            account_id=account_id,
-            phase="stopped",
-            phase_label="已停止",
-            stage_index=4,
-            stage_total=4,
-            message=str(exc),
-            next_step="任务停止",
-            reset_started_at=True,
-        )
-        _save_task_log(
-            "chatgpt",
-            email,
-            "stopped",
-            error=str(exc),
-            detail=_build_task_log_detail(
-                task_id,
-                {
-                    "attempt_outcome": "k12_workspace_recapture_stopped",
-                    "email": email,
-                    "account_id": int(account_id or 0),
-                    "source": "k12_workspace_recapture",
-                },
-            ),
-        )
-        _task_store.finish(task_id, status="stopped", success=0, skipped=0, errors=[])
-    except Exception as exc:
-        error_text = str(exc) or "K12 / Workspace 重跑失败"
-        errors.append(error_text)
-        result_data = result.get("data") if isinstance(result.get("data"), dict) else {}
-        if result_data:
-            _task_store.update_meta(task_id, {"result": sanitize_task_detail(result_data)})
-        _task_timeline_log(
-            task_id,
-            task="K12重跑",
-            email=email,
-            account_id=account_id,
-            phase="failed",
-            phase_label="K12 / Workspace 重跑失败",
-            stage_index=4,
-            stage_total=4,
-            message=error_text,
-            next_step="查看运行日志和 Debug 详情",
-            reset_started_at=True,
-        )
-        _save_task_log(
-            "chatgpt",
-            email,
-            "failed",
-            error=error_text,
-            detail=_build_task_log_detail(
-                task_id,
-                {
-                    "attempt_outcome": "k12_workspace_recapture_failed",
-                    "email": email,
-                    "account_id": int(account_id or 0),
-                    "source": "k12_workspace_recapture",
-                    "result": sanitize_task_detail(result_data),
-                },
-            ),
-        )
-        _task_store.finish(task_id, status="failed", success=0, skipped=0, errors=errors, error=error_text)
     finally:
         _clear_task_current(task_id)
         _task_store.cleanup()
@@ -9402,274 +8722,6 @@ def _run_batch_resume_subscription_auth(
         _task_store.cleanup()
 
 
-def _run_batch_k12_workspace_recapture(task_id: str, account_ids: list[int], params: dict[str, Any]):
-    from api.actions import (
-        _action_local_status_refresh_ids,
-        _execute_chatgpt_k12_workspace_recapture_action,
-    )
-
-    control = _task_store.control_for(task_id)
-    total = max(len(account_ids), 1)
-    success_count = 0
-    skipped_count = 0
-    errors: list[str] = []
-    results: list[dict[str, Any]] = []
-    primary_email = ""
-    meta = dict(_task_store.snapshot(task_id).get("meta") or {})
-    skipped_items = list(meta.get("skipped_items") or [])
-    missing_ids = list(meta.get("missing_ids") or [])
-    delay_min = max(0.0, float((params or {}).get("delay_seconds") or 0))
-    delay_max = max(0.0, float((params or {}).get("delay_max_seconds") or 0))
-    next_start_time = 0.0
-
-    def task_log(message: str, level: str = "info") -> None:
-        control.checkpoint(consume_skip=False)
-        _log(task_id, message, level)
-
-    _task_store.mark_running(task_id)
-    _task_store.set_progress(task_id, f"0/{total}")
-
-    try:
-        for missing_id in missing_ids:
-            _log(task_id, f"[MISS] 账号不存在: account_id={missing_id}")
-            errors.append(f"account_id={missing_id}: 账号不存在")
-            results.append({"account_id": missing_id, "email": "", "status": "failed", "message": "账号不存在"})
-        for skipped in skipped_items:
-            skipped_count += 1
-            _log(task_id, f"[SKIP] {skipped.get('email') or skipped.get('account_id')} - {skipped.get('reason') or '已跳过'}")
-            results.append(
-                {
-                    "account_id": skipped.get("account_id"),
-                    "email": skipped.get("email") or "",
-                    "status": "skipped",
-                    "message": skipped.get("reason") or "已跳过",
-                }
-            )
-
-        for index, account_id in enumerate(account_ids, start=1):
-            control.checkpoint(consume_skip=False)
-            if (delay_min > 0 or delay_max > 0) and index > 1:
-                wait_seconds = max(0.0, next_start_time - time.time())
-                if wait_seconds > 0:
-                    _log(task_id, f"[K12] 等待账号间延时 {wait_seconds:.1f}s")
-                    end_time = time.time() + wait_seconds
-                    while time.time() < end_time:
-                        control.checkpoint(consume_skip=False)
-                        time.sleep(min(1.0, max(0.0, end_time - time.time())))
-            if delay_min > 0 or delay_max > 0:
-                chosen_delay = random.uniform(delay_min, delay_max) if delay_max > delay_min else delay_min
-                next_start_time = time.time() + chosen_delay
-
-            email = ""
-            attempt_id = control.start_attempt()
-            result: dict[str, Any] = {}
-            try:
-                with Session(engine) as session:
-                    account = session.get(AccountModel, int(account_id or 0))
-                    if account is None or account.platform != "chatgpt":
-                        raise ValueError("ChatGPT 账号不存在")
-                    email = str(account.email or "")
-                    if not primary_email:
-                        primary_email = email
-
-                _task_timeline_log(
-                    task_id,
-                    task="K12重跑",
-                    email=email,
-                    account_id=account_id,
-                    item_index=index,
-                    item_total=total,
-                    phase="capture",
-                    phase_label="Join / accounts/check / workspace token exchange",
-                    stage_index=1,
-                    stage_total=2,
-                    message="开始执行 K12 捕获",
-                    next_step="写回 workspace variants 后处理下一个账号",
-                    reset_started_at=True,
-                )
-                control.checkpoint(attempt_id=attempt_id)
-                with Session(engine) as session:
-                    account = session.get(AccountModel, int(account_id or 0))
-                    if account is None or account.platform != "chatgpt":
-                        raise ValueError("ChatGPT 账号不存在")
-                    result = _execute_chatgpt_k12_workspace_recapture_action(
-                        account,
-                        session,
-                        dict(params or {}),
-                        log_fn=task_log,
-                        stop_checker=lambda: control.checkpoint(attempt_id=attempt_id),
-                    )
-                    try:
-                        session.commit()
-                    except Exception:
-                        pass
-                    refresh_ids = _action_local_status_refresh_ids("k12_workspace_recapture", result, account)
-                    for account_id_value in dict.fromkeys(refresh_ids):
-                        schedule_chatgpt_local_status_refresh_for_account_id(
-                            account_id_value,
-                            reason="task:batch_k12_workspace_recapture",
-                        )
-                    if not bool(result.get("ok")):
-                        raise ValueError(_k12_recapture_result_message(result))
-
-                success_count += 1
-                message = _k12_recapture_result_message(result)
-                result_data = result.get("data") if isinstance(result.get("data"), dict) else {}
-                summary = result_data.get("summary") if isinstance(result_data.get("summary"), dict) else {}
-                results.append(
-                    {
-                        "account_id": account_id,
-                        "email": email,
-                        "status": "success",
-                        "message": message,
-                        "saved_spaces": int(summary.get("saved_spaces") or len(result_data.get("artifacts") or []) or 0),
-                        "saved_accounts": len(result_data.get("saved_accounts") or []),
-                        "changed_account_ids": list(result_data.get("changed_account_ids") or []),
-                    }
-                )
-                _task_timeline_log(
-                    task_id,
-                    task="K12重跑",
-                    email=email,
-                    account_id=account_id,
-                    item_index=index,
-                    item_total=total,
-                    phase="done",
-                    phase_label="重跑结果",
-                    stage_index=2,
-                    stage_total=2,
-                    message=message,
-                    next_step="处理下一个账号",
-                    reset_started_at=True,
-                )
-            except SkipCurrentAttemptRequested as exc:
-                skipped_count += 1
-                results.append({"account_id": account_id, "email": email, "status": "skipped", "message": str(exc)})
-                _task_timeline_log(
-                    task_id,
-                    task="K12重跑",
-                    email=email,
-                    account_id=account_id,
-                    item_index=index,
-                    item_total=total,
-                    phase="skipped",
-                    phase_label="已跳过",
-                    stage_index=2,
-                    stage_total=2,
-                    message=str(exc),
-                    next_step="处理下一个账号",
-                    reset_started_at=True,
-                )
-            except StopTaskRequested:
-                raise
-            except Exception as exc:
-                error_text = str(exc or "K12 / Workspace 重跑失败")
-                errors.append(f"{email or account_id}: {error_text}")
-                results.append({"account_id": account_id, "email": email, "status": "failed", "message": error_text})
-                _task_timeline_log(
-                    task_id,
-                    task="K12重跑",
-                    email=email,
-                    account_id=account_id,
-                    item_index=index,
-                    item_total=total,
-                    phase="failed",
-                    phase_label="重跑失败",
-                    stage_index=2,
-                    stage_total=2,
-                    message=error_text,
-                    next_step="查看运行日志和 Debug 详情",
-                    reset_started_at=True,
-                )
-            finally:
-                control.finish_attempt(attempt_id)
-                _task_store.set_progress(task_id, f"{index}/{total}")
-                _task_store.update_meta(task_id, {"runtime_results": sanitize_task_detail(results)})
-
-        summary_message = (
-            f"批量 K12 / Workspace 重跑完成: 成功 {success_count} 个，"
-            f"跳过 {skipped_count} 个，失败 {len(errors)} 个"
-        )
-        _log(task_id, f"[SUMMARY] {summary_message}")
-        log_status = "success" if not errors else "failed"
-        _save_task_log(
-            "chatgpt",
-            primary_email,
-            log_status,
-            error="" if log_status == "success" else summary_message,
-            detail=_build_task_log_detail(
-                task_id,
-                {
-                    "email": primary_email,
-                    "attempt_outcome": "batch_k12_workspace_recapture_success" if log_status == "success" else "batch_k12_workspace_recapture_failed",
-                    "source": "batch_k12_workspace_recapture",
-                    "meta": {
-                        **meta,
-                        "runtime_success": success_count,
-                        "runtime_skipped": skipped_count,
-                        "runtime_errors": errors,
-                        "runtime_results": sanitize_task_detail(results),
-                    },
-                },
-            ),
-        )
-        _task_store.finish(
-            task_id,
-            status="done" if not errors else "failed",
-            success=success_count,
-            skipped=skipped_count,
-            errors=errors,
-            error="" if not errors else summary_message,
-        )
-    except StopTaskRequested as exc:
-        _log(task_id, f"[STOP] {exc}")
-        _task_timeline_log(
-            task_id,
-            task="K12重跑",
-            item_index=total if total > 0 else None,
-            item_total=total if total > 0 else None,
-            phase="stopped",
-            phase_label="已停止",
-            stage_index=2,
-            stage_total=2,
-            message=str(exc),
-            next_step="任务停止",
-            reset_started_at=True,
-        )
-        _save_task_log(
-            "chatgpt",
-            primary_email,
-            "stopped",
-            error=str(exc),
-            detail=_build_task_log_detail(
-                task_id,
-                {
-                    "email": primary_email,
-                    "attempt_outcome": "batch_k12_workspace_recapture_stopped",
-                    "source": "batch_k12_workspace_recapture",
-                    "meta": {
-                        **meta,
-                        "runtime_success": success_count,
-                        "runtime_skipped": skipped_count,
-                        "runtime_errors": errors,
-                        "runtime_results": sanitize_task_detail(results),
-                    },
-                },
-            ),
-        )
-        _task_store.finish(
-            task_id,
-            status="stopped",
-            success=success_count,
-            skipped=skipped_count,
-            errors=errors,
-            error=str(exc),
-        )
-    finally:
-        _clear_task_current(task_id)
-        _task_store.cleanup()
-
-
 def _phone_binding_prefix4(value: Any) -> str:
     from services.chatgpt_core.phone_pool_repository import _phone_effective_digits
 
@@ -12927,7 +11979,6 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
         PlatformCls = ChatGPTPlatform
 
         initial_merged_extra = _build_effective_register_extra(req)
-        deferred_activation_enabled = _should_precheck_chatgpt_deferred_invite(req, initial_merged_extra)
         chatgpt_zero_amount_stop_enabled = (
             req.platform == "chatgpt"
             and _is_truthy(initial_merged_extra.get("chatgpt_access_token_only_zero_amount_stop_enabled"))
@@ -12936,9 +11987,6 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
             initial_merged_extra.get("chatgpt_access_token_only_zero_amount_stop_threshold"),
             default=1,
         )
-        pending_invite_ids: list[int] = []
-        pending_invite_lock = threading.Lock()
-        registration_success = 0
         chatgpt_checkout_amount_zero = 0
         chatgpt_checkout_amount_nonzero = 0
         chatgpt_zero_amount_stop_triggered = False
@@ -12948,40 +11996,6 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
         unique_exit_ip_events: list[dict[str, Any]] = []
         browser_fingerprint_lock = threading.Lock()
         browser_fingerprint_signatures: set[str] = set()
-        deferred_team_ids: list[int] = []
-        deferred_team_ids_lock = threading.Lock()
-        deferred_phase_close_reason = ""
-        deferred_phase_close_marker = "__deferred_invite_phase_close__"
-        registration_phase_close_event = threading.Event()
-        if deferred_activation_enabled:
-            ok, check_message = _check_chatgpt_deferred_invite_availability(
-                req,
-                merged_extra=initial_merged_extra,
-                log_fn=lambda message: _log(task_id, message),
-            )
-            if isinstance(initial_merged_extra.get("chatgpt_deferred_invite_team_ids"), list):
-                deferred_team_ids = [
-                    int(team_id)
-                    for team_id in initial_merged_extra.get("chatgpt_deferred_invite_team_ids")
-                    if str(team_id).strip().isdigit() and int(team_id) > 0
-                ]
-                if deferred_team_ids:
-                    req.extra["chatgpt_deferred_invite_team_ids"] = list(deferred_team_ids)
-                    req.extra["chatgpt_deferred_invite_team_id"] = deferred_team_ids[0]
-            if ok and check_message:
-                _log(task_id, f"[邀请] {check_message}")
-            if not ok:
-                _log(task_id, f"[邀请] {check_message}")
-                _task_store.finish(
-                    task_id,
-                    status="failed",
-                    success=success,
-                    skipped=skipped,
-                    errors=[check_message],
-                    error=check_message,
-                )
-                _task_store.cleanup()
-                return
 
         def _build_mailbox(proxy: Optional[str], runtime_extra: dict | None = None):
             merged_extra = dict(runtime_extra or _build_effective_register_extra(req))
@@ -13314,7 +12328,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
             return lines[attempt_index]
 
         def _do_one(i: int):
-            nonlocal next_start_time, deferred_phase_close_reason
+            nonlocal next_start_time
             nonlocal chatgpt_checkout_amount_zero, chatgpt_checkout_amount_nonzero
             nonlocal chatgpt_zero_amount_stop_triggered
             current_email = req.email or ""
@@ -13352,10 +12366,6 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                             
                         next_start_time = time.time() + chosen_delay
                 control.checkpoint(attempt_id=attempt_id)
-                if registration_phase_close_event.is_set():
-                    return AttemptResult.stopped(
-                        f"{deferred_phase_close_marker}{deferred_phase_close_reason or '当前所有可用 team 都已不可邀请，结束注册阶段并进入激活阶段'}"
-                    )
                 candidate_proxies = _build_register_candidate_proxies()
 
                 merged_extra = _build_effective_register_extra(req)
@@ -13379,16 +12389,6 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                     flow = "phone_signup" if phone_signup_entry else "access_token_register"
                     effective_level = classify_task_log_level(message, level, flow=flow)
                     _log(task_id, str(message or ""), effective_level)
-
-                if deferred_activation_enabled:
-                    with deferred_team_ids_lock:
-                        current_deferred_team_ids = list(deferred_team_ids)
-                    if not current_deferred_team_ids:
-                        return AttemptResult.stopped(
-                            f"{deferred_phase_close_marker}当前所有可用 team 都已不可邀请，结束注册阶段并进入激活阶段"
-                        )
-                    merged_extra["chatgpt_deferred_invite_team_ids"] = current_deferred_team_ids
-                    merged_extra["chatgpt_deferred_invite_team_id"] = current_deferred_team_ids[0]
 
                 _task_store.set_progress(task_id, f"{success}/{target_successes}")
                 _log(
@@ -13534,23 +12534,9 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                         account.extra.setdefault("mail_provider", mail_provider)
                     if req.platform == "chatgpt":
                         for key in (
-                            "chatgpt_enable_team_invite",
-                            "chatgpt_team_invite_deferred_activation",
-                            "chatgpt_capture_free_workspace",
-                            "chatgpt_capture_business_workspace",
                             "chatgpt_existing_account_capture",
                             "chatgpt_existing_account_login_route_enabled",
                             "chatgpt_register_unique_exit_ip_enabled",
-                            "chatgpt_k12_enabled",
-                            "chatgpt_k12_workspace_ids",
-                            "chatgpt_k12_save_all_spaces",
-                            "chatgpt_k12_strict_join",
-                            "chatgpt_k12_join_timeout_seconds",
-                            "chatgpt_k12_join_retry_count",
-                            "chatgpt_k12_post_join_poll_seconds",
-                            "chatgpt_k12_capture_refresh_tokens",
-                            "chatgpt_deferred_invite_team_id",
-                            "chatgpt_deferred_invite_team_ids",
                         ):
                             if key in merged_extra:
                                 account.extra[key] = merged_extra.get(key)
@@ -13577,12 +12563,6 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                                 "luckmail_base_url",
                                 merged_extra.get("luckmail_base_url"),
                             )
-                additional_accounts_payload = []
-                saved_linked_accounts = []
-                if isinstance(account.extra, dict):
-                    payload = account.extra.pop("_linked_accounts_to_save", None)
-                    if isinstance(payload, list):
-                        additional_accounts_payload = [item for item in payload if isinstance(item, dict)]
                 account_extra = account.extra if isinstance(account.extra, dict) else {}
                 account_extra = _cache_chatgpt_checkout_link(
                     account_extra,
@@ -13783,108 +12763,13 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                             )
                     except Exception as sync_exc:
                         _log(task_id, f"[iCloudHME] 重跑结果写回失败: {sync_exc}")
-                pending_invite = None
-                if req.platform == "chatgpt" and saved_account is not None:
-                    try:
-                        from services.chatgpt_core.pending_business_invites import upsert_pending_invite_from_account
-
-                        pending_invite = upsert_pending_invite_from_account(saved_account)
-                        if pending_invite is not None:
-                            pending_payload = {}
-                            if isinstance(saved_account.get_extra(), dict):
-                                pending_payload = dict(saved_account.get_extra().get("chatgpt_pending_business_invite") or {})
-                            exhausted_team_ids = []
-                            for raw in (pending_payload.get("exhausted_team_ids") or []):
-                                try:
-                                    exhausted_team_id = int(raw)
-                                except Exception:
-                                    exhausted_team_id = 0
-                                if exhausted_team_id > 0 and exhausted_team_id not in exhausted_team_ids:
-                                    exhausted_team_ids.append(exhausted_team_id)
-                            if deferred_activation_enabled and exhausted_team_ids:
-                                with deferred_team_ids_lock:
-                                    before_team_ids = list(deferred_team_ids)
-                                    deferred_team_ids[:] = [team_id for team_id in deferred_team_ids if team_id not in exhausted_team_ids]
-                                    req.extra["chatgpt_deferred_invite_team_ids"] = list(deferred_team_ids)
-                                    if deferred_team_ids:
-                                        req.extra["chatgpt_deferred_invite_team_id"] = deferred_team_ids[0]
-                                    else:
-                                        req.extra.pop("chatgpt_deferred_invite_team_id", None)
-                                remaining_text = ",".join(str(team_id) for team_id in deferred_team_ids) or "无"
-                                removed_text = ",".join(str(team_id) for team_id in exhausted_team_ids)
-                                if before_team_ids != deferred_team_ids:
-                                    _log(task_id, f"[邀请] team_id={removed_text} 已不可邀请，剩余 team_id={remaining_text}")
-                            _log(task_id, f"[邀请] 已保存 pending invite id={pending_invite.id} team={pending_invite.team_id}")
-                            if deferred_activation_enabled:
-                                with pending_invite_lock:
-                                    pending_invite_ids.append(int(pending_invite.id))
-                    except Exception as pending_exc:
-                        _log(task_id, f"[邀请] 保存 pending invite 失败: {pending_exc}")
-                if additional_accounts_payload:
-                    from core.base_platform import Account, AccountStatus
-
-                    for extra_account_payload in additional_accounts_payload:
-                        try:
-                            linked_account = Account(
-                                platform=str(extra_account_payload.get("platform") or req.platform),
-                                email=str(extra_account_payload.get("email") or account.email or ""),
-                                password=str(extra_account_payload.get("password") or account.password or ""),
-                                user_id=str(extra_account_payload.get("user_id") or ""),
-                                region=str(extra_account_payload.get("region") or ""),
-                                token=str(extra_account_payload.get("token") or ""),
-                                status=AccountStatus(str(extra_account_payload.get("status") or "registered")),
-                                extra=dict(extra_account_payload.get("extra") or {}),
-                            )
-                            if linked_account.platform == "chatgpt" and isinstance(linked_account.extra, dict):
-                                linked_account.extra["chatgpt_capabilities"] = classify_chatgpt_capabilities(linked_account)
-                            saved_linked = save_account(linked_account)
-                            if saved_linked is not None:
-                                saved_linked_accounts.append(saved_linked)
-                                if linked_account.platform == "chatgpt":
-                                    schedule_chatgpt_local_status_refresh_for_account_id(
-                                        int(getattr(saved_linked, "id", 0) or 0),
-                                        reason="registration_linked_saved",
-                                        delay_seconds=2.0,
-                                    )
-                            if isinstance(linked_account.extra, dict):
-                                scope_label = str(linked_account.extra.get("chatgpt_workspace_label") or "").strip()
-                                if scope_label:
-                                    _log(task_id, f"[OK] 已保存附加工作空间: {linked_account.email} [{scope_label}]")
-                        except Exception as save_exc:
-                            _log(task_id, f"[WARN] 保存附加工作空间失败: {sanitize_error_message(save_exc)}")
                 if _proxy and proxy_pool is not None and str(proxy_source or "").startswith("pool"):
                     proxy_pool.report_success(_proxy)
-                if deferred_activation_enabled and pending_invite is not None:
-                    if should_stop_after_current_account and zero_amount_stop_reason:
-                        control.request_stop()
-                        _log(task_id, f"[STOP] {zero_amount_stop_reason}")
-                    _log(task_id, f"[OK] 注册完成并已发送邀请: {account.email}")
-                    _save_task_log(
-                        req.platform,
-                        account.email,
-                        "pending_activation",
-                        detail=_build_task_log_detail(
-                            task_id,
-                            {
-                                "attempt_outcome": "invite_saved_pending_activation",
-                                "email": account.email,
-                                "pending_invite_id": int(pending_invite.id or 0),
-                                "existing_account_login_route": existing_account_route_event,
-                                "chatgpt_zero_amount_stop_enabled": chatgpt_zero_amount_stop_enabled,
-                                "chatgpt_zero_amount_stop_threshold": chatgpt_zero_amount_stop_threshold,
-                                "chatgpt_zero_amount_stop_triggered": should_stop_after_current_account,
-                                "chatgpt_zero_amount_stop_reason": zero_amount_stop_reason,
-                            },
-                        ),
-                    )
-                    return AttemptResult.success()
                 if should_stop_after_current_account and zero_amount_stop_reason:
                     control.request_stop()
                     _log(task_id, f"[STOP] {zero_amount_stop_reason}")
                 _log(task_id, f"[OK] 注册成功: {account.email}")
                 _auto_upload_integrations(task_id, saved_account or account)
-                for linked_saved_account in saved_linked_accounts:
-                    _auto_upload_integrations(task_id, linked_saved_account)
                 cashier_url = (account.extra or {}).get("cashier_url", "")
                 if cashier_url:
                     _log(task_id, f"  [升级链接] {cashier_url}")
@@ -13942,27 +12827,6 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                 return AttemptResult.stopped(str(e))
             except Exception as e:
                 error_text = str(e)
-                if deferred_activation_enabled and (
-                    "所有可用 team 都已不可邀请" in error_text
-                    or "预选 team_id 列表当前不可用" in error_text
-                ):
-                    registration_phase_close_event.set()
-                    deferred_phase_close_reason = error_text
-                    _log(task_id, f"[邀请] {error_text}")
-                    _save_task_log(
-                        req.platform,
-                        current_email,
-                        "failed",
-                        error=error_text,
-                        detail=_build_task_log_detail(
-                            task_id,
-                            {
-                                "attempt_outcome": "invite_exhausted_stop_phase",
-                                "email": current_email,
-                            },
-                        ),
-                    )
-                    return AttemptResult.stopped(f"{deferred_phase_close_marker}{error_text}")
                 _log(task_id, f"[FAIL] 注册失败: {e}")
                 _save_task_log(
                     req.platform,
@@ -14047,7 +12911,6 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
             _log(task_id, f"[控制] 注册最大尝试次数: {attempt_cap}")
         max_workers = min(req.concurrency, target_successes, attempt_cap or target_successes, 5)
         stopped = False
-        registration_phase_closed_for_activation = False
         attempt_limit_reached = False
         next_attempt_index = 0
         in_flight: dict[Any, int] = {}
@@ -14057,7 +12920,6 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                 next_attempt_index < (attempt_cap or target_successes)
                 and len(in_flight) < max_workers
                 and not stopped
-                and not registration_phase_closed_for_activation
                 and not control.is_stop_requested()
             ):
                 future = pool.submit(_do_one, next_attempt_index)
@@ -14079,17 +12941,10 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
 
                     if result.outcome == AttemptOutcome.SUCCESS:
                         success += 1
-                        registration_success += 1
                     elif result.outcome == AttemptOutcome.SKIPPED:
                         skipped += 1
                     elif result.outcome == AttemptOutcome.STOPPED:
-                        if result.message.startswith(deferred_phase_close_marker):
-                            registration_phase_closed_for_activation = True
-                            deferred_phase_close_reason = result.message[len(deferred_phase_close_marker):].strip()
-                            if deferred_phase_close_reason:
-                                errors.append(deferred_phase_close_reason)
-                        else:
-                            stopped = True
+                        stopped = True
                     else:
                         errors.append(result.message)
 
@@ -14103,7 +12958,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                         in_flight.clear()
                         break
 
-                    if registration_phase_closed_for_activation or stopped or control.is_stop_requested():
+                    if stopped or control.is_stop_requested():
                         for pending in list(in_flight.keys()):
                             pending.cancel()
                         in_flight.clear()
@@ -14124,77 +12979,6 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                         in_flight[future] = next_attempt_index
                         next_attempt_index += 1
 
-        if deferred_activation_enabled and (registration_phase_closed_for_activation or not (control.is_stop_requested() or stopped)):
-            from core.db import AccountModel
-            from services.chatgpt_core.pending_business_invites import activate_pending_invites
-
-            pending_ids = list(pending_invite_ids)
-            if registration_phase_closed_for_activation and deferred_phase_close_reason:
-                _log(task_id, f"[邀请] {deferred_phase_close_reason}")
-            _log(task_id, "[阶段] ================ 统一激活阶段 ================")
-            _log(task_id, f"[激活] 注册/邀请阶段完成，准备统一激活 {len(pending_ids)} 个账号")
-
-            def _upload_activation_accounts(item: dict[str, Any]) -> None:
-                local_account_id = int(item.get("local_account_id") or 0)
-                linked_account_ids = [int(x) for x in item.get("linked_account_ids", []) if x]
-                email = str(item.get("email") or "")
-                upload_ids = [acc_id for acc_id in [local_account_id] + linked_account_ids if acc_id > 0]
-
-                for index, acc_id in enumerate(upload_ids, start=1):
-                    with Session(engine) as s:
-                        account_to_upload = s.get(AccountModel, acc_id)
-                    if account_to_upload is None:
-                        _log(task_id, f"[激活上传] {email} {index}/{len(upload_ids)} 跳过：本地账号不存在 id={acc_id}")
-                        continue
-                    _log(task_id, f"[激活上传] {email} {index}/{len(upload_ids)} 开始上传")
-                    _auto_upload_integrations(task_id, account_to_upload)
-
-            activation_result = activate_pending_invites(
-                invite_ids=pending_ids,
-                log_fn=lambda message: _log(task_id, message),
-                on_success=_upload_activation_accounts,
-            )
-            success = int(activation_result.get("success") or 0)
-            failed_items = [item for item in (activation_result.get("errors") or []) if isinstance(item, dict)]
-            for item in failed_items:
-                email = str(item.get("email") or "") or f"invite#{item.get('invite_id') or '-'}"
-                error_message = str(item.get("error") or "激活失败")
-                errors.append(error_message)
-                _save_task_log(
-                    req.platform,
-                    email,
-                    "failed",
-                    error=error_message,
-                    detail=_build_task_log_detail(
-                        task_id,
-                        {
-                            "attempt_outcome": "activation_failed",
-                            "email": email,
-                            "invite_id": int(item.get("invite_id") or 0),
-                        },
-                    ),
-                )
-            for item in [entry for entry in (activation_result.get("results") or []) if isinstance(entry, dict)]:
-                local_account_id = int(item.get("local_account_id") or 0)
-                linked_account_ids = [int(x) for x in item.get("linked_account_ids", []) if x]
-                email = str(item.get("email") or "")
-                upload_ids = [acc_id for acc_id in [local_account_id] + linked_account_ids if acc_id > 0]
-
-                _save_task_log(
-                    req.platform,
-                    email,
-                    "success",
-                    detail=_build_task_log_detail(
-                        task_id,
-                        {
-                            "attempt_outcome": "activation_success",
-                            "email": email,
-                            "invite_id": int(item.get("invite_id") or 0),
-                            "uploaded_count": len([x for x in upload_ids if x > 0]),
-                        },
-                    ),
-                )
-            _log(task_id, f"[激活] 统一激活完成：成功 {success} / {len(pending_ids)}")
     except Exception as e:
         _log(task_id, f"致命错误: {e}")
         _task_store.finish(
@@ -14225,16 +13009,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
         final_status = "stopped"
     else:
         final_status = "done"
-    if deferred_activation_enabled:
-        if final_status == "stopped":
-            summary = (
-                f"任务已停止: 注册完成 {registration_success} 个, 激活成功 {success} 个, 跳过 {skipped} 个, 失败 {len(errors)} 个"
-            )
-        elif final_status == "failed":
-            summary = f"失败: 注册完成 {registration_success} 个, 激活成功 {success} 个, 跳过 {skipped} 个, 失败 {len(errors)} 个"
-        else:
-            summary = f"完成: 注册完成 {registration_success} 个, 激活成功 {success} 个, 跳过 {skipped} 个, 失败 {len(errors)} 个"
-    elif final_status == "stopped":
+    if final_status == "stopped":
         summary = (
             f"任务已停止: 成功 {success} 个, 跳过 {skipped} 个, 失败 {len(errors)} 个"
         )
@@ -14316,29 +13091,6 @@ def create_batch_resume_subscription_auth_task(
     background_tasks: BackgroundTasks,
 ):
     return enqueue_batch_resume_subscription_auth_task(
-        req,
-        background_tasks=background_tasks,
-    )
-
-
-@router.post("/chatgpt/k12-workspace-recapture")
-def create_k12_workspace_recapture_task(
-    req: K12WorkspaceRecaptureTaskRequest,
-    background_tasks: BackgroundTasks,
-):
-    task_id = enqueue_k12_workspace_recapture_task(
-        req,
-        background_tasks=background_tasks,
-    )
-    return {"task_id": task_id}
-
-
-@router.post("/chatgpt/k12-workspace-recapture/batch")
-def create_batch_k12_workspace_recapture_task(
-    req: BatchK12WorkspaceRecaptureTaskRequest,
-    background_tasks: BackgroundTasks,
-):
-    return enqueue_batch_k12_workspace_recapture_task(
         req,
         background_tasks=background_tasks,
     )

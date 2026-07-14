@@ -29,7 +29,6 @@ import { usePersistentChatGPTRegistrationMode } from '@/hooks/usePersistentChatG
 import { parseBooleanConfigValue } from '@/lib/configValueParsers'
 import { buildChatGPTRegistrationRequestAdapter } from '@/lib/chatgptRegistrationRequestAdapter'
 import { CHATGPT_REGISTRATION_MODE_REFRESH_TOKEN } from '@/lib/chatgptRegistrationMode'
-import { buildChatGPTK12Payload, chatgptK12InitialValues, normalizeK12WorkspaceIds } from '@/lib/chatgptK12Config'
 import { getExecutorOptions, normalizeExecutorForPlatform } from '@/lib/platformExecutorOptions'
 import { apiFetch } from '@/lib/utils'
 import { buildTaskProxyPayload, saveTaskProxySettingsToConfig, taskProxySettingsFromConfig, validateTaskProxySettings } from '@/lib/taskProxySettings'
@@ -179,11 +178,6 @@ export default function RegisterTaskPage() {
         luckmail_api_key: cfg.luckmail_api_key || '',
         luckmail_email_type: cfg.luckmail_email_type || '',
         luckmail_domain: cfg.luckmail_domain || '',
-        chatgpt_enable_team_invite: parseBooleanConfigValue(cfg.chatgpt_enable_team_invite),
-        chatgpt_team_invite_deferred_activation: parseBooleanConfigValue(cfg.chatgpt_team_invite_deferred_activation),
-        chatgpt_capture_business_workspace: cfg.chatgpt_capture_business_workspace === '' ? true : parseBooleanConfigValue(cfg.chatgpt_capture_business_workspace),
-        chatgpt_capture_free_workspace: cfg.chatgpt_capture_free_workspace === '' ? true : parseBooleanConfigValue(cfg.chatgpt_capture_free_workspace),
-        ...chatgptK12InitialValues(cfg),
         chatgpt_access_token_only_checkout_amount_check_enabled:
           cfg.chatgpt_access_token_only_checkout_amount_check_enabled === ''
             ? true
@@ -335,19 +329,6 @@ export default function RegisterTaskPage() {
       luckmail_domain: values.luckmail_domain,
       yescaptcha_key: values.yescaptcha_key,
       solver_url: values.solver_url,
-      chatgpt_enable_team_invite: platform === 'chatgpt' ? Boolean(values.chatgpt_enable_team_invite) : undefined,
-      chatgpt_capture_free_workspace:
-        platform === 'chatgpt'
-          ? Boolean(values.chatgpt_capture_free_workspace)
-          : undefined,
-      chatgpt_capture_business_workspace:
-        platform === 'chatgpt' && values.chatgpt_enable_team_invite
-          ? values.chatgpt_capture_business_workspace
-          : undefined,
-      chatgpt_team_invite_deferred_activation:
-        platform === 'chatgpt' && values.chatgpt_enable_team_invite
-          ? Boolean(values.chatgpt_team_invite_deferred_activation)
-          : undefined,
       chatgpt_save_registration_access_token_account:
         platform === 'chatgpt'
           ? (values.chatgpt_save_registration_access_token_account === undefined
@@ -384,7 +365,6 @@ export default function RegisterTaskPage() {
         platform === 'chatgpt'
           ? Boolean(values.chatgpt_access_token_only_gopay_provider_link_enabled)
           : undefined,
-      ...(platform === 'chatgpt' ? buildChatGPTK12Payload(values) : {}),
     }
     const chatgptRegistrationRequestAdapter =
       buildChatGPTRegistrationRequestAdapter(
@@ -703,18 +683,6 @@ export default function RegisterTaskPage() {
         tempmail_reuse_window_minutes: 20,
         tempmail_platform: 'chatgpt',
         tempmail_permanent: false,
-        chatgpt_enable_team_invite: false,
-        chatgpt_team_invite_deferred_activation: false,
-        chatgpt_capture_business_workspace: true,
-        chatgpt_capture_free_workspace: true,
-        chatgpt_k12_enabled: false,
-        chatgpt_k12_workspace_ids: [],
-        chatgpt_k12_save_all_spaces: true,
-        chatgpt_k12_strict_join: false,
-        chatgpt_k12_join_timeout_seconds: 60,
-        chatgpt_k12_join_retry_count: 2,
-        chatgpt_k12_post_join_poll_seconds: '3,8,15',
-        chatgpt_k12_capture_refresh_tokens: false,
         chatgpt_save_registration_access_token_account: true,
         chatgpt_registration_entry: 'email_signup',
         chatgpt_phone_signup_use_pool: false,
@@ -869,15 +837,6 @@ export default function RegisterTaskPage() {
                 />
               </Form.Item>
               {!isRefreshTokenMode ? (
-                <Alert
-                  type="warning"
-                  showIcon
-                  style={{ marginBottom: 12 }}
-                  message="当前为无 RT 方案"
-                  description="team invite / 延迟激活相关配置会保留，但无 RT 方案下可能无法完整生效。"
-                />
-              ) : null}
-              {!isRefreshTokenMode ? (
                 <Form.Item
                   name="chatgpt_access_token_only_checkout_amount_check_enabled"
                   valuePropName="checked"
@@ -918,7 +877,7 @@ export default function RegisterTaskPage() {
                   name="chatgpt_save_registration_access_token_account"
                   valuePropName="checked"
                   initialValue={true}
-                  extra="默认开启：注册阶段已拿到 AccessToken，但后续 refresh_token / 工作空间抓取失败时，也会保存一个 AccessToken-only 账号，避免真实注册成功却没有入库。"
+                  extra="默认开启：注册阶段已拿到 AccessToken，但后续 refresh_token 获取失败时，也会保存一个 AccessToken-only 账号，避免真实注册成功却没有入库。"
                 >
                   <Checkbox>保存注册阶段 AccessToken 账号</Checkbox>
                 </Form.Item>
@@ -931,131 +890,6 @@ export default function RegisterTaskPage() {
               >
                 <Checkbox>遇到已注册邮箱时路由到登录</Checkbox>
               </Form.Item>
-              <>
-                <Form.Item
-                  label="工作空间抓取"
-                  extra="free 勾选独立生效；business 依赖 team invite。若两项都勾，会分别获取并按名称区分保存。"
-                >
-                  <Space direction="vertical" size={6}>
-                    <Form.Item name="chatgpt_capture_free_workspace" valuePropName="checked" noStyle>
-                      <Checkbox>抓取 free 工作空间</Checkbox>
-                    </Form.Item>
-                  </Space>
-                </Form.Item>
-                <Form.Item
-                  name="chatgpt_enable_team_invite"
-                  valuePropName="checked"
-                  label="Business Team Invite"
-                  extra="关闭时走原始注册/登录链路；开启后才会进入 business recovery / team invite。"
-                >
-                  <Checkbox>启用 team invite / business 恢复</Checkbox>
-                </Form.Item>
-                <Form.Item
-                  noStyle
-                  shouldUpdate={(prev, next) => prev.chatgpt_enable_team_invite !== next.chatgpt_enable_team_invite}
-                >
-                  {({ getFieldValue }) => {
-                    const teamInviteEnabled = getFieldValue('chatgpt_enable_team_invite')
-                    return (
-                      <>
-                        <Form.Item
-                          name="chatgpt_team_invite_deferred_activation"
-                          valuePropName="checked"
-                          extra="开启后：先完成全部账号注册并发出邀请，再统一进入激活阶段；不会在单账号刚注册完时立刻进入 business/free。"
-                        >
-                          <Checkbox disabled={!teamInviteEnabled}>延迟邀请（先统一发邀请，再统一激活）</Checkbox>
-                        </Form.Item>
-                        <Form.Item>
-                          <Space direction="vertical" size={6}>
-                            <Form.Item name="chatgpt_capture_business_workspace" valuePropName="checked" noStyle>
-                              <Checkbox disabled={!teamInviteEnabled}>抓取 business 工作空间</Checkbox>
-                            </Form.Item>
-                          </Space>
-                        </Form.Item>
-                        {!teamInviteEnabled ? (
-                          <Alert
-                            type="info"
-                            showIcon
-                            message="当前关闭 team invite"
-                            description="普通模式下会直接走 free 主链；business 与延迟邀请配置在开启 team invite 后才生效。"
-                          />
-                        ) : null}
-                      </>
-                    )
-                  }}
-                </Form.Item>
-                <Form.Item
-                  noStyle
-                  shouldUpdate={(prev, next) => (
-                    prev.chatgpt_k12_enabled !== next.chatgpt_k12_enabled
-                    || prev.chatgpt_k12_save_all_spaces !== next.chatgpt_k12_save_all_spaces
-                  )}
-                >
-                  {({ getFieldValue }) => {
-                    const k12Enabled = Boolean(getFieldValue('chatgpt_k12_enabled'))
-                    const saveAllSpaces = Boolean(getFieldValue('chatgpt_k12_save_all_spaces'))
-                    return (
-                      <Form.Item
-                        label="K12 / Workspace 加入"
-                        extra="只提交 workspace 元信息与抓取策略；token/cookies 不会在列表或摘要里展开。"
-                      >
-                        <Space direction="vertical" size={8} style={{ width: '100%' }}>
-                          <Space size={16} wrap>
-                            <Form.Item name="chatgpt_k12_enabled" valuePropName="checked" noStyle>
-                              <Checkbox>启用 K12</Checkbox>
-                            </Form.Item>
-                            <Form.Item name="chatgpt_k12_save_all_spaces" valuePropName="checked" noStyle>
-                              <Checkbox disabled={!k12Enabled}>保存所有空间 variants</Checkbox>
-                            </Form.Item>
-                            <Form.Item name="chatgpt_k12_strict_join" valuePropName="checked" noStyle>
-                              <Checkbox disabled={!k12Enabled}>严格 join</Checkbox>
-                            </Form.Item>
-                            <Form.Item name="chatgpt_k12_capture_refresh_tokens" valuePropName="checked" noStyle>
-                              <Checkbox disabled>抓取 RT variants（预留）</Checkbox>
-                            </Form.Item>
-                          </Space>
-                          <Form.Item
-                            name="chatgpt_k12_workspace_ids"
-                            label="Workspace IDs"
-                            rules={[
-                              {
-                                validator: (_, value) => {
-                                  if (!k12Enabled || saveAllSpaces || normalizeK12WorkspaceIds(value).length > 0) {
-                                    return Promise.resolve()
-                                  }
-                                  return Promise.reject(new Error('启用 K12 且未保存所有空间时，请至少填写一个 workspace_id'))
-                                },
-                              },
-                            ]}
-                            extra="可粘贴多个 workspace_id，逗号、空格或回车分隔；勾选保存所有空间时可留空。"
-                          >
-                            <Select
-                              mode="tags"
-                              open={false}
-                              allowClear
-                              disabled={!k12Enabled || saveAllSpaces}
-                              tokenSeparators={[',', ' ', '\n']}
-                              placeholder="ws_xxx / org_xxx"
-                              style={{ width: '100%' }}
-                            />
-                          </Form.Item>
-                          <Space align="start" style={{ width: '100%' }}>
-                            <Form.Item name="chatgpt_k12_join_timeout_seconds" label="超时秒数" style={{ flex: 1 }}>
-                              <InputNumber disabled={!k12Enabled} min={30} max={3600} precision={0} style={{ width: '100%' }} />
-                            </Form.Item>
-                            <Form.Item name="chatgpt_k12_join_retry_count" label="重试次数" style={{ flex: 1 }}>
-                              <InputNumber disabled={!k12Enabled} min={0} max={20} precision={0} style={{ width: '100%' }} />
-                            </Form.Item>
-                            <Form.Item name="chatgpt_k12_post_join_poll_seconds" label="轮询间隔秒" style={{ flex: 1 }}>
-                              <Input disabled={!k12Enabled} placeholder="3,8,15" />
-                            </Form.Item>
-                          </Space>
-                        </Space>
-                      </Form.Item>
-                    )
-                  }}
-                </Form.Item>
-              </>
             </>
           )}
         </Card>

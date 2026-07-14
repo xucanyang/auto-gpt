@@ -9,7 +9,11 @@ from sqlmodel import Session
 from core.config_store import config_store
 from core.db import AccountModel
 from services.chatgpt_core.oaipay_upload import build_oaipay_lookup_payload, upload_to_oaipay_detailed
-from services.chatgpt_account_state import classify_chatgpt_capabilities
+from services.chatgpt_account_state import (
+    RETIRED_SUBSCRIPTION_TYPES,
+    classify_chatgpt_capabilities,
+    effective_subscription_plan,
+)
 from services.chatgpt_sync import build_chatgpt_sync_account
 
 SUB2API_SYNC_NAME = "oaipay"
@@ -520,7 +524,6 @@ def backfill_chatgpt_account_to_oaipay(
     results: list[dict[str, Any]] = []
     started_at = _utcnow_iso()
     cached_sync = get_oaipay_sync_state(account)
-    sync_account = build_chatgpt_sync_account(account)
     mode = str(category_mode or "auto").strip().lower() or "auto"
     if mode not in {"auto", "manual"}:
         mode = "auto"
@@ -531,6 +534,26 @@ def backfill_chatgpt_account_to_oaipay(
         # fallback group while automatic classification still took precedence.
         fallback_group_ids = [int(category_id)]
     capabilities = classify_chatgpt_capabilities(account)
+    subscription_plan = effective_subscription_plan(capabilities)
+    if subscription_plan in RETIRED_SUBSCRIPTION_TYPES:
+        message = f"订阅类型 {subscription_plan} 已退役，禁止上传 OAIPay"
+        upload_state = _build_upload_failure_state(
+            message,
+            started_at=started_at,
+            initial_sync=cached_sync,
+        )
+        update_account_model_oaipay_sync(account, upload_state, session=session, commit=False)
+        if session is not None and commit:
+            session.commit()
+            session.refresh(account)
+        return {
+            "ok": False,
+            "uploaded": False,
+            "skipped": True,
+            "message": message,
+            "results": [{"name": "OAIPay 上传", "ok": False, "msg": message}],
+        }
+    sync_account = build_chatgpt_sync_account(account)
     try:
         upload_result = upload_to_oaipay_detailed(
             sync_account,

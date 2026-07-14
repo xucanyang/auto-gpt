@@ -4,7 +4,6 @@ import { ReloadOutlined, SyncOutlined, UploadOutlined } from '@ant-design/icons'
 type OaipayOverview = {
   exists: number
   notFound: number
-  crossWorkspace: number
   deletedExact: number
   ambiguous: number
   unreachable: number

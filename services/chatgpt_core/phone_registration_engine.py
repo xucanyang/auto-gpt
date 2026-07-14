@@ -719,10 +719,6 @@ class PhoneRegistrationEngine:
             "chatgpt_has_refresh_token_solution": False,
             "chatgpt_phone_auth_flow": flow,
             "chatgpt_token_source": "phone_existing_login" if flow == "phone_existing_login" else "phone_signup_registration",
-            "chatgpt_workspace_scope": "free",
-            "chatgpt_workspace_label": flow,
-            "chatgpt_workspace_display_name": f"{account_email} [{flow}]",
-            "chatgpt_workspace_variant_key": f"{flow}:{result.account_id or phone}",
             "chatgpt_phone_number": phone,
             "chatgpt_bound_phone_number": phone,
             "chatgpt_bound_phone": {

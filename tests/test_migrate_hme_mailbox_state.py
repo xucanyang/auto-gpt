@@ -53,7 +53,7 @@ def _state_at_path(root: dict, path: tuple[str, ...]) -> dict:
 def _account_extra_with_all_paths(email: str = "alias@icloud.com") -> dict:
     return {
         "access_token": "account-secret-that-must-not-change",
-        "business_metadata": {"keep": True},
+        "unrelated_metadata": {"keep": True},
         "chatgpt_mailbox_state": _polluted_state(email, "lease-direct"),
         "mailbox_state": _polluted_state(email, "lease-legacy"),
         "chatgpt_invalid_recheck": {
@@ -67,7 +67,7 @@ def _account_extra_with_all_paths(email: str = "alias@icloud.com") -> dict:
     }
 
 
-def _create_database(path: Path, *, account_count: int = 1, include_pending: bool = True) -> None:
+def _create_database(path: Path, *, account_count: int = 1) -> None:
     connection = sqlite3.connect(path)
     try:
         connection.executescript(
@@ -81,16 +81,6 @@ def _create_database(path: Path, *, account_count: int = 1, include_pending: boo
             );
             """
         )
-        if include_pending:
-            connection.executescript(
-                """
-                CREATE TABLE pending_business_invites (
-                    id INTEGER PRIMARY KEY,
-                    email TEXT NOT NULL,
-                    mailbox_state_json TEXT NOT NULL
-                );
-                """
-            )
         for index in range(1, account_count + 1):
             email = f"alias-{index}@icloud.com"
             connection.execute(
@@ -106,16 +96,35 @@ def _create_database(path: Path, *, account_count: int = 1, include_pending: boo
             "INSERT INTO accounts(id, platform, email, extra_json) VALUES (?, ?, ?, ?)",
             (10_000, "other", "other@example.com", '{"untouched": true}'),
         )
-        if include_pending:
-            connection.execute(
-                "INSERT INTO pending_business_invites(id, email, mailbox_state_json) "
-                "VALUES (?, ?, ?)",
-                (
-                    1,
-                    "pending@icloud.com",
-                    json.dumps(_polluted_state("pending@icloud.com", "lease-pending"), ensure_ascii=False),
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _add_legacy_pending_table(path: Path) -> None:
+    connection = sqlite3.connect(path)
+    try:
+        connection.executescript(
+            """
+            CREATE TABLE pending_business_invites (
+                id INTEGER PRIMARY KEY,
+                email TEXT NOT NULL,
+                mailbox_state_json TEXT NOT NULL
+            );
+            """
+        )
+        connection.execute(
+            "INSERT INTO pending_business_invites(id, email, mailbox_state_json) "
+            "VALUES (?, ?, ?)",
+            (
+                1,
+                "legacy@icloud.com",
+                json.dumps(
+                    _polluted_state("legacy@icloud.com", "lease-legacy-row"),
+                    ensure_ascii=False,
                 ),
-            )
+            ),
+        )
         connection.commit()
     finally:
         connection.close()
@@ -133,14 +142,16 @@ def _read_account_raw(path: Path, account_id: int = 1) -> str:
         connection.close()
 
 
-def _read_pending_raw(path: Path, pending_id: int = 1) -> str:
+def _read_legacy_pending_rows(path: Path) -> list[tuple[int, str, str]]:
     connection = sqlite3.connect(path)
     try:
-        row = connection.execute(
-            "SELECT mailbox_state_json FROM pending_business_invites WHERE id = ?", (pending_id,)
-        ).fetchone()
-        assert row is not None
-        return str(row[0])
+        return [
+            (int(row[0]), str(row[1]), str(row[2]))
+            for row in connection.execute(
+                "SELECT id, email, mailbox_state_json "
+                "FROM pending_business_invites ORDER BY id"
+            ).fetchall()
+        ]
     finally:
         connection.close()
 
@@ -166,7 +177,7 @@ def test_account_compaction_uses_runtime_sanitizer_for_all_historical_paths():
         "chatgpt_custom_email_recheck.mailbox_state",
     ]
     assert cleaned["access_token"] == original["access_token"]
-    assert cleaned["business_metadata"] == {"keep": True}
+    assert cleaned["unrelated_metadata"] == {"keep": True}
     assert cleaned["chatgpt_invalid_recheck"]["status"] == "pending"
     assert cleaned["chatgpt_custom_email_recheck"]["status"] == "pending"
     assert "mailbox_state" not in cleaned
@@ -275,11 +286,10 @@ def test_present_providerless_canonical_is_never_overwritten_by_fallback():
     assert meta.sanitizable_state_objects == 1
 
 
-def test_dry_run_is_read_only_and_reports_accounts_pending_and_bounded_batches(tmp_path: Path):
+def test_dry_run_is_read_only_and_reports_accounts_and_bounded_batches(tmp_path: Path):
     database = tmp_path / "account_manager.db"
     _create_database(database, account_count=5)
     account_before = _read_account_raw(database)
-    pending_before = _read_pending_raw(database)
 
     report = migration.run_migration(
         database,
@@ -293,11 +303,11 @@ def test_dry_run_is_read_only_and_reports_accounts_pending_and_bounded_batches(t
     assert stats["scanned_account_rows"] == 5
     assert stats["target_account_rows"] == 5
     assert stats["changed_account_rows"] == 5
-    assert stats["pending_table_present"] is True
-    assert stats["scanned_pending_rows"] == 1
-    assert stats["changed_pending_rows"] == 1
-    assert stats["state_objects_sanitized"] == 21
-    assert stats["removed_config_keys"]["chatgpt_gopay_batch_tasks"] == 21
+    assert stats["pending_table_present"] is False
+    assert stats["scanned_pending_rows"] == 0
+    assert stats["changed_pending_rows"] == 0
+    assert stats["state_objects_sanitized"] == 20
+    assert stats["removed_config_keys"]["chatgpt_gopay_batch_tasks"] == 20
     assert stats["canonical_promoted_account_rows"] == 0
     assert stats["removed_noncanonical_state_objects"] == 15
     assert stats["removed_noncanonical_paths"] == {
@@ -308,8 +318,28 @@ def test_dry_run_is_read_only_and_reports_accounts_pending_and_bounded_batches(t
     assert stats["max_batch_rows"] <= 2
     assert stats["net_bytes_removed"] > 0
     assert _read_account_raw(database) == account_before
-    assert _read_pending_raw(database) == pending_before
     assert not (tmp_path / "migration-backups").exists()
+
+
+def test_dry_run_compacts_legacy_pending_table_in_memory_without_mutating_it(tmp_path: Path):
+    database = tmp_path / "account_manager.db"
+    _create_database(database)
+    _add_legacy_pending_table(database)
+    rows_before = _read_legacy_pending_rows(database)
+
+    report = migration.run_migration(
+        database,
+        batch_size=1,
+        limits=migration.CompactionLimits(max_before_ids=16, max_before_id_bytes=2048),
+    )
+
+    stats = report["stats"]
+    assert report["mode"] == "dry-run"
+    assert report["backup_path"] == ""
+    assert stats["pending_table_present"] is True
+    assert stats["scanned_pending_rows"] == 1
+    assert stats["changed_pending_rows"] == 1
+    assert _read_legacy_pending_rows(database) == rows_before
 
 
 def test_apply_creates_verified_original_backup_updates_atomically_and_is_idempotent(tmp_path: Path):
@@ -317,7 +347,6 @@ def test_apply_creates_verified_original_backup_updates_atomically_and_is_idempo
     backup_dir = tmp_path / "backups"
     _create_database(database, account_count=2)
     account_before = _read_account_raw(database)
-    pending_before = _read_pending_raw(database)
 
     report = migration.run_migration(
         database,
@@ -332,18 +361,14 @@ def test_apply_creates_verified_original_backup_updates_atomically_and_is_idempo
     assert backup_path.is_file()
     assert backup_path.stat().st_mode & 0o777 == 0o600
     assert _read_account_raw(backup_path) == account_before
-    assert _read_pending_raw(backup_path) == pending_before
 
     account_after = json.loads(_read_account_raw(database))
-    pending_after = json.loads(_read_pending_raw(database))
     state = account_after["chatgpt_mailbox_state"]
     assert state["schema_version"] == 2
     assert "chatgpt_gopay_batch_tasks" not in state["config"]
     assert "mailbox_state" not in account_after
     assert "mailbox_state" not in account_after["chatgpt_invalid_recheck"]
     assert "mailbox_state" not in account_after["chatgpt_custom_email_recheck"]
-    assert pending_after["schema_version"] == 2
-    assert "chatgpt_gopay_batch_tasks" not in pending_after["config"]
 
     connection = sqlite3.connect(database)
     try:
@@ -357,11 +382,52 @@ def test_apply_creates_verified_original_backup_updates_atomically_and_is_idempo
     assert second["stats"]["net_bytes_removed"] == 0
 
 
+def test_apply_backs_up_and_compacts_legacy_pending_table_without_deleting_rows(
+    tmp_path: Path,
+):
+    database = tmp_path / "account_manager.db"
+    backup_dir = tmp_path / "backups"
+    _create_database(database)
+    _add_legacy_pending_table(database)
+    rows_before = _read_legacy_pending_rows(database)
+
+    report = migration.run_migration(
+        database,
+        apply=True,
+        backup_dir=backup_dir,
+        batch_size=1,
+    )
+
+    backup_path = Path(report["backup_path"])
+    assert _read_legacy_pending_rows(backup_path) == rows_before
+
+    rows_after = _read_legacy_pending_rows(database)
+    assert [(row[0], row[1]) for row in rows_after] == [
+        (row[0], row[1]) for row in rows_before
+    ]
+    assert len(rows_after) == len(rows_before) == 1
+    compacted_state = json.loads(rows_after[0][2])
+    assert compacted_state["schema_version"] == 2
+    assert "chatgpt_gopay_batch_tasks" not in compacted_state["config"]
+
+    connection = sqlite3.connect(database)
+    try:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'pending_business_invites'"
+        ).fetchone() == (1,)
+        assert connection.execute(
+            "SELECT COUNT(*) FROM pending_business_invites"
+        ).fetchone() == (1,)
+    finally:
+        connection.close()
+
+
 def test_apply_rolls_back_all_rows_if_sanitizer_fails_mid_transaction(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     database = tmp_path / "account_manager.db"
-    _create_database(database, account_count=2, include_pending=False)
+    _create_database(database, account_count=2)
     before_one = _read_account_raw(database, 1)
     before_two = _read_account_raw(database, 2)
     original_sanitizer = migration.sanitize_mailbox_state

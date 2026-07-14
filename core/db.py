@@ -290,35 +290,6 @@ class ProxyModel(SQLModel, table=True):
     last_probe_json: str = "{}"
 
 
-class PendingBusinessInviteModel(SQLModel, table=True):
-    __tablename__ = "pending_business_invites"
-
-    id: Optional[int] = Field(default=None, primary_key=True)
-    account_id: int = Field(index=True)
-    email: str = Field(index=True)
-    status: str = Field(default="invited_pending", index=True)
-    team_id: int = 0
-    team_name: str = ""
-    invite_url: str = ""
-    invite_workspace_id: str = ""
-    invite_message_id: str = ""
-    mail_provider: str = ""
-    mailbox_state_json: str = "{}"
-    registration_context_json: str = "{}"
-    invited_at: str = ""
-    join_consumed_at: str = ""
-    joined_at: str = ""
-    last_error: str = ""
-    last_error_code: str = ""
-    last_checkpoint: str = ""
-    activation_attempt_count: int = 0
-    last_attempt_at: str = ""
-    activation_run_id: str = ""
-    abandoned_at: str = ""
-    created_at: datetime = Field(default_factory=_utcnow)
-    updated_at: datetime = Field(default_factory=_utcnow)
-
-
 class IcloudHmeAliasModel(SQLModel, table=True):
     __tablename__ = "icloud_hme_alias"
 
@@ -348,7 +319,7 @@ class IcloudHmeAliasModel(SQLModel, table=True):
 
 
 def save_account(account) -> 'AccountModel':
-    """从 base_platform.Account 存入数据库（支持同邮箱多工作空间变体并存）"""
+    """Store the current account in one canonical row and retain legacy variants."""
     def _schedule_local_status_refresh(saved: 'AccountModel', *, reason: str) -> None:
         try:
             if str(getattr(saved, "platform", "") or "").strip().lower() != "chatgpt":
@@ -377,34 +348,28 @@ def save_account(account) -> 'AccountModel':
         extra = dict(account.extra or {}) if isinstance(account.extra, dict) else {}
         if str(account.platform or "").strip().lower() == "chatgpt":
             extra = _preserve_chatgpt_account_browser_fingerprint(extra)
-        variant_key = str(extra.get("chatgpt_workspace_variant_key") or "").strip()
         candidates = session.exec(
             select(AccountModel)
             .where(AccountModel.platform == account.platform)
             .where(AccountModel.email == account.email)
+            .order_by(AccountModel.updated_at.desc(), AccountModel.id.desc())
         ).all()
 
         existing = None
-        legacy_candidate = None
         for candidate in candidates:
             try:
                 candidate_extra = json.loads(candidate.extra_json or "{}")
             except Exception:
                 candidate_extra = {}
-            candidate_variant_key = str(candidate_extra.get("chatgpt_workspace_variant_key") or "").strip()
-            if variant_key:
-                if candidate_variant_key == variant_key:
-                    existing = candidate
-                    break
-                if not candidate_variant_key and legacy_candidate is None:
-                    legacy_candidate = candidate
-            else:
-                if not candidate_variant_key:
-                    existing = candidate
-                    break
-
-        if existing is None and variant_key and legacy_candidate is not None and len(candidates) == 1:
-            existing = legacy_candidate
+            variant_key = str(candidate_extra.get("chatgpt_workspace_variant_key") or "").strip()
+            workspace_scope = str(candidate_extra.get("chatgpt_workspace_scope") or "").strip().lower()
+            if workspace_scope in {"free", "personal", "personal_free"}:
+                existing = candidate
+                break
+            if variant_key or workspace_scope:
+                continue
+            existing = candidate
+            break
 
         if existing:
             if str(account.platform or "").strip().lower() == "chatgpt":
@@ -709,29 +674,6 @@ class DeliveryRedeemApiLogModel(SQLModel, table=True):
     message: str = ""
     duration_ms: int = 0
     created_at: datetime = Field(default_factory=_utcnow)
-
-
-def _ensure_pending_business_invite_schema() -> None:
-    required_columns = {
-        "last_error_code": "TEXT NOT NULL DEFAULT ''",
-        "last_checkpoint": "TEXT NOT NULL DEFAULT ''",
-        "activation_attempt_count": "INTEGER NOT NULL DEFAULT 0",
-        "last_attempt_at": "TEXT NOT NULL DEFAULT ''",
-        "activation_run_id": "TEXT NOT NULL DEFAULT ''",
-        "abandoned_at": "TEXT NOT NULL DEFAULT ''",
-    }
-
-    with engine.begin() as conn:
-        existing_columns = {
-            str(row[1])
-            for row in conn.exec_driver_sql("PRAGMA table_info(pending_business_invites)").fetchall()
-        }
-        for column_name, ddl in required_columns.items():
-            if column_name in existing_columns:
-                continue
-            conn.exec_driver_sql(
-                f"ALTER TABLE pending_business_invites ADD COLUMN {column_name} {ddl}"
-            )
 
 
 def _ensure_proxy_schema() -> None:
@@ -2992,58 +2934,6 @@ def mark_icloud_hme_alias_used(
         return _row_to_icloud_hme_alias_payload(row)
 
 
-def recover_stuck_pending_business_invites() -> int:
-    activation_statuses = (
-        "activation_fetching_invite_mail",
-        "activation_auth_login",
-        "activation_consuming_invite",
-        "activation_capturing_workspace",
-        "subscription_pending_auth",
-    )
-    recovered = 0
-    now = _utcnow()
-    placeholders = ", ".join("?" for _ in activation_statuses)
-
-    with engine.begin() as conn:
-        rows = conn.exec_driver_sql(
-            f"""
-            SELECT id, status, last_checkpoint, last_error, last_error_code
-            FROM pending_business_invites
-            WHERE status IN ({placeholders})
-            """,
-            activation_statuses,
-        ).fetchall()
-
-        for row in rows:
-            checkpoint = str(row[2] or row[1] or "activation_auth_login")
-            last_error = str(row[3] or "").strip() or "上次激活被中断，可重新启动激活流程"
-            last_error_code = str(row[4] or "").strip() or "activation_interrupted"
-            conn.execute(
-                text(
-                    """
-                    UPDATE pending_business_invites
-                    SET status = :status,
-                        last_checkpoint = :checkpoint,
-                        last_error = :last_error,
-                        last_error_code = :last_error_code,
-                        updated_at = :updated_at
-                    WHERE id = :invite_id
-                    """
-                ),
-                {
-                    "status": "failed_retryable",
-                    "checkpoint": checkpoint,
-                    "last_error": last_error,
-                    "last_error_code": last_error_code,
-                    "updated_at": now,
-                    "invite_id": int(row[0] or 0),
-                },
-            )
-            recovered += 1
-
-    return recovered
-
-
 def _ensure_phone_pool_schema() -> None:
     """创建/补齐 relay 自有手机号池表。"""
     required_columns = {
@@ -3452,7 +3342,6 @@ def init_db():
     _ensure_delivery_card_schema()
     _ensure_task_log_schema()
     _ensure_proxy_schema()
-    _ensure_pending_business_invite_schema()
     _ensure_external_subscription_claim_schema()
     _ensure_external_access_token_claim_schema()
     _ensure_pipeline_schema()

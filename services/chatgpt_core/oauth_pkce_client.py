@@ -417,7 +417,7 @@ class OAuthPkceClient:
     # ══════════════════════════════════════════════════════════════════
 
     def extract_workspace_id(self) -> str:
-        """从 oai-client-auth-session Cookie（JWT）中解析 workspace_id。"""
+        """从 Cookie 中解析明确属于 personal/free 的 workspace_id。"""
         auth_cookie = self.session.cookies.get("oai-client-auth-session") or ""
         if not auth_cookie:
             raise RuntimeError("未找到 oai-client-auth-session Cookie")
@@ -427,16 +427,38 @@ class OAuthPkceClient:
         for i in range(min(len(segments), 2)):
             data = _decode_jwt_segment(segments[i])
             workspaces = data.get("workspaces") or []
-            if workspaces:
-                wid = str((workspaces[0] or {}).get("id") or "").strip()
+            for workspace in workspaces:
+                if not isinstance(workspace, dict):
+                    continue
+                values = " ".join(
+                    str(workspace.get(key) or "").strip().lower()
+                    for key in (
+                        "kind",
+                        "type",
+                        "plan_type",
+                        "workspace_type",
+                        "subscription_plan",
+                        "name",
+                        "title",
+                        "display_name",
+                    )
+                )
+                if any(marker in values for marker in ("team", "business", "enterprise")):
+                    continue
+                if not (
+                    workspace.get("is_default") is True
+                    or any(marker in values for marker in ("free", "personal", "individual"))
+                ):
+                    continue
+                wid = str(workspace.get("id") or "").strip()
                 if wid:
-                    self._log(f"成功解析 workspace_id: {wid}")
+                    self._log(f"成功解析 personal workspace_id: {wid}")
                     return wid
 
         # 调试信息
         first_data = _decode_jwt_segment(segments[0]) if segments else {}
         self._log(f"Cookie 字段: {list(first_data.keys())}")
-        raise RuntimeError("无法从 Cookie 中解析 workspace_id")
+        raise RuntimeError("Cookie 中没有可用的 personal workspace_id")
 
     # ══════════════════════════════════════════════════════════════════
     # 步骤 11：选择 workspace

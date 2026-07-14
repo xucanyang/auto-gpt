@@ -52,17 +52,14 @@ import type {
 } from '@/features/accounts/components/AccountsToolbar'
 import { BatchGopayWorkbench } from '@/features/accounts/components/BatchGopayWorkbench'
 import { ImportAccountsModal } from '@/features/accounts/components/ImportAccountsModal'
-import { PendingInvitesModal } from '@/features/accounts/components/PendingInvitesModal'
 import { useAccountDetailQuery } from '@/features/accounts/hooks/useAccountDetailQuery'
 import { useActiveTasksQuery } from '@/features/accounts/hooks/useActiveTasksQuery'
 import { RegisterTaskModal } from '@/features/auth/components/RegisterTaskModal'
 import { useAccountsQuery } from '@/features/accounts/hooks/useAccountsQuery'
-import { usePendingInvitesQuery } from '@/features/accounts/hooks/usePendingInvitesQuery'
 import { usePersistentChatGPTRegistrationMode } from '@/hooks/usePersistentChatGPTRegistrationMode'
 import { parseBooleanConfigValue } from '@/lib/configValueParsers'
 import { buildChatGPTRegistrationRequestAdapter } from '@/lib/chatgptRegistrationRequestAdapter'
 import { CHATGPT_REGISTRATION_MODE_REFRESH_TOKEN } from '@/lib/chatgptRegistrationMode'
-import { buildChatGPTK12Payload } from '@/lib/chatgptK12Config'
 import { normalizeDomainList, parseStoredDomainList } from '@/lib/domainList'
 import {
   DEFAULT_GOPAY_PHONE_COUNTRY_CODE,
@@ -137,12 +134,10 @@ const ACCOUNT_TOOLBAR_ACTION_OPTIONS: Array<{ value: AccountToolbarActionId; tex
   { value: 'resumeAuth', text: '批量补抓Auth' },
   { value: 'backfill', text: '远端补传' },
   { value: 'invalidRecheck', text: '批量失效测活' },
-  { value: 'k12Recapture', text: '批量K12重跑' },
   { value: 'phoneBindingTest', text: '手机号绑定' },
   { value: 'paypalBinding', text: 'PayPal绑定' },
   { value: 'baxiCdkSubmit', text: 'idea批量提交' },
   { value: 'gopay', text: '批量 GoPay' },
-  { value: 'businessDeferred', text: 'Business 补激活' },
 ]
 
 type PhonePoolMode = 'normal' | 'prefix_limited' | 'prefix_sample'
@@ -492,7 +487,7 @@ const ACCOUNT_VALIDITY_FILTER_OPTIONS = [
 const SUB2API_FILTER_OPTIONS = [
   { value: 'exists', text: '已存在' },
   { value: 'not_found', text: '未发现' },
-  { value: 'cross_workspace_only', text: '其他工作区已存在' },
+  { value: 'cross_workspace_only', text: '远端其他记录已存在' },
   { value: 'deleted_exact_match', text: '已删可重传' },
   { value: 'ambiguous', text: '多候选' },
   { value: 'unreachable', text: '不可达' },
@@ -502,7 +497,7 @@ const SUB2API_FILTER_OPTIONS = [
 const OAIPAY_FILTER_OPTIONS = [
   { value: 'exists', text: '已存在' },
   { value: 'not_found', text: '未发现' },
-  { value: 'cross_workspace_only', text: '其他工作区已存在' },
+  { value: 'cross_workspace_only', text: '远端其他记录已存在' },
   { value: 'deleted_exact_match', text: '已删可重传' },
   { value: 'ambiguous', text: '多候选' },
   { value: 'unreachable', text: '不可达' },
@@ -912,43 +907,6 @@ const STATUS_LABELS: Record<string, string> = {
   invalid: '已失效',
 }
 
-function pendingInviteStatusMeta(status?: string) {
-  switch (status) {
-    case 'completed':
-      return { color: 'success', label: '已完成' }
-    case 'failed_retryable':
-    case 'failed':
-      return { color: 'warning', label: '可重试失败' }
-    case 'failed_terminal':
-      return { color: 'error', label: '终止失败' }
-    case 'abandoned':
-      return { color: 'default', label: '已放弃' }
-    case 'subscription_pending_auth':
-      return { color: 'blue', label: '订阅待补抓' }
-    case 'activation_fetching_invite_mail':
-      return { color: 'processing', label: '拉取邀请邮件' }
-    case 'activation_auth_login':
-      return { color: 'processing', label: '登录准备中' }
-    case 'activation_consuming_invite':
-      return { color: 'processing', label: '消费邀请中' }
-    case 'activation_capturing_workspace':
-      return { color: 'processing', label: '抓取空间中' }
-    case 'invite_sent_pending_activation':
-      return { color: 'blue', label: '待激活' }
-    default:
-      return { color: 'default', label: status || '未知' }
-  }
-}
-
-function pendingActivationKindMeta(kind?: string) {
-  switch (String(kind || '').trim()) {
-    case 'subscription_auth':
-      return { color: 'purple', label: '订阅补抓' }
-    default:
-      return { color: 'cyan', label: '邀请激活' }
-  }
-}
-
 function parseExtraJson(raw: string | undefined) {
   if (!raw) return {}
   try {
@@ -1309,9 +1267,6 @@ function normalizeAccount(account: any) {
   const chatgptPaymentLinkDefaults = extra.chatgpt_payment_link_defaults && typeof extra.chatgpt_payment_link_defaults === 'object'
     ? extra.chatgpt_payment_link_defaults
     : {}
-  const teamInviteSource = account.team_invite_source && typeof account.team_invite_source === 'object'
-    ? account.team_invite_source
-    : null
   const accountRateLimit = account.rate_limit && typeof account.rate_limit === 'object'
     ? account.rate_limit
     : {}
@@ -1339,7 +1294,6 @@ function normalizeAccount(account: any) {
     rate_limit_started_at: rateLimit.started_at,
     rate_limit_recover_at: rateLimit.recover_at,
     rate_limit_previous_status: rateLimit.previous_status,
-    teamInviteSource,
     manuallyUsed: account.manually_used !== undefined ? Boolean(account.manually_used) : Boolean(extra.manually_used),
   }
 }
@@ -1647,18 +1601,6 @@ async function fetchAccountSecrets(accountId: number, fields: AccountSecretField
   }
   const params = new URLSearchParams({ fields: normalizedFields.join(',') })
   return apiFetch(`/accounts/${accountId}/secrets?${params.toString()}`)
-}
-
-function getTeamInviteOwnerLabel(source: any) {
-  if (!source || typeof source !== 'object') return ''
-  return String(
-    source.team_email
-    || source.primary_account_name
-    || source.primary_account_id
-    || source.team_account_id
-    || source.team_name
-    || ''
-  ).trim()
 }
 
 function authStateMeta(state?: string) {
@@ -2078,7 +2020,7 @@ function sub2apiStateMeta(sync: any) {
     return { color: 'warning', label: '多条候选' }
   }
   if (sync.remote_state === 'cross_workspace_only') {
-    return { color: 'processing', label: '其他工作区已存在' }
+    return { color: 'processing', label: '远端其他记录已存在' }
   }
   if (sync.remote_state === 'deleted_exact_match') {
     return { color: 'warning', label: '已删可重传' }
@@ -2115,7 +2057,7 @@ function shouldShowInvalidRecheckButton(record: any) {
   return String(record?.status || '').trim().toLowerCase() === 'invalid'
 }
 
-function taskModalModeFromSource(source: unknown): 'register' | 'resume_auth' | 'payment_link' | 'sub2api_upload' | 'oaipay_upload' | 'baxigpt_cdk' | 'paypal_bind' | 'probe_local_status' | 'k12_recapture' {
+function taskModalModeFromSource(source: unknown): 'register' | 'resume_auth' | 'payment_link' | 'sub2api_upload' | 'oaipay_upload' | 'baxigpt_cdk' | 'paypal_bind' | 'probe_local_status' {
   const normalized = String(source || '').trim().toLowerCase()
   if (normalized === 'baxigpt_cdk' || normalized === 'baxigpt_cdk_submit') return 'baxigpt_cdk'
   if (normalized === 'chatgpt_paypal_bind' || normalized === 'paypal_bind') return 'paypal_bind'
@@ -2125,7 +2067,6 @@ function taskModalModeFromSource(source: unknown): 'register' | 'resume_auth' | 
   if (normalized === 'batch_sub2api_upload') return 'sub2api_upload'
   if (normalized === 'batch_oaipay_upload') return 'oaipay_upload'
   if (normalized === 'invalid_recheck' || normalized === 'batch_invalid_recheck') return 'resume_auth'
-  if (normalized === 'k12_workspace_recapture' || normalized === 'batch_k12_workspace_recapture') return 'k12_recapture'
   if (normalized === 'payment_link' || normalized === 'batch_payment_link') return 'payment_link'
   return 'register'
 }
@@ -2179,18 +2120,16 @@ export default function Accounts() {
   const [filterPresetEditorMode, setFilterPresetEditorMode] = useState<'create-current' | 'edit-meta' | 'copy-preset'>('create-current')
 
   const [registerModalOpen, setRegisterModalOpen] = useState(false)
-  const [taskModalMode, setTaskModalMode] = useState<'register' | 'resume_auth' | 'payment_link' | 'sub2api_upload' | 'oaipay_upload' | 'baxigpt_cdk' | 'paypal_bind' | 'probe_local_status' | 'k12_recapture'>('register')
+  const [taskModalMode, setTaskModalMode] = useState<'register' | 'resume_auth' | 'payment_link' | 'sub2api_upload' | 'oaipay_upload' | 'baxigpt_cdk' | 'paypal_bind' | 'probe_local_status'>('register')
   const [taskModalAccount, setTaskModalAccount] = useState<any>(null)
   const [addModalOpen, setAddModalOpen] = useState(false)
   const [importModalOpen, setImportModalOpen] = useState(false)
   const [detailModalOpen, setDetailModalOpen] = useState(false)
   const [actionSurfaceOpen, setActionSurfaceOpen] = useState(false)
-  const [businessDeferredModalOpen, setBusinessDeferredModalOpen] = useState(false)
   const [detailAccount, setDetailAccount] = useState<any>(null)
   const [actionAccount, setActionAccount] = useState<any>(null)
   const [actionSurfaceInitialActionId, setActionSurfaceInitialActionId] = useState<string | null>(null)
   const [actionSurfaceInitialActionMode, setActionSurfaceInitialActionMode] = useState<'direct' | 'dialog'>('dialog')
-  const [importingTeamAccountId, setImportingTeamAccountId] = useState<number | null>(null)
   const [resumeAuthAccountId, setResumeAuthAccountId] = useState<number | null>(null)
   const [resumeAuthConfigOpen, setResumeAuthConfigOpen] = useState(false)
   const [resumeAuthConfigMode, setResumeAuthConfigMode] = useState<'single' | 'batch'>('single')
@@ -2224,9 +2163,6 @@ export default function Accounts() {
   const [batchPaymentLinkForceRefresh, setBatchPaymentLinkForceRefresh] = useState(false)
   const [batchProbeStatusConfigOpen, setBatchProbeStatusConfigOpen] = useState(false)
   const [batchProbeStatusConfigScope, setBatchProbeStatusConfigScope] = useState<'selected' | 'all'>('selected')
-  const [batchK12RecaptureOpen, setBatchK12RecaptureOpen] = useState(false)
-  const [batchK12RecaptureScope, setBatchK12RecaptureScope] = useState<'selected' | 'filtered'>('selected')
-  const [batchK12RecaptureLoading, setBatchK12RecaptureLoading] = useState(false)
 
   const [registerForm] = Form.useForm()
   const [addForm] = Form.useForm()
@@ -2237,7 +2173,6 @@ export default function Accounts() {
   const [paypalBindingForm] = Form.useForm()
   const [batchPaymentLinkConfigForm] = Form.useForm()
   const [batchProbeStatusConfigForm] = Form.useForm()
-  const [batchK12RecaptureForm] = Form.useForm()
   const [filterPresetForm] = Form.useForm()
   const phoneBindingUsePoolValue = Form.useWatch('use_pool', phoneBindingTestForm)
   const phoneBindingPoolModeValue = Form.useWatch('phone_pool_mode', phoneBindingTestForm)
@@ -2251,8 +2186,6 @@ export default function Accounts() {
   const phoneBindingProxyFailoverValue = Form.useWatch('proxy_failover', phoneBindingTestForm)
   const probeProxyModeValue = Form.useWatch('proxy_mode', batchProbeStatusConfigForm)
   const probeProxyFailoverValue = Form.useWatch('proxy_failover', batchProbeStatusConfigForm)
-  const batchK12ProxyModeValue = Form.useWatch('proxy_mode', batchK12RecaptureForm)
-  const batchK12ProxyFailoverValue = Form.useWatch('proxy_failover', batchK12RecaptureForm)
   const baxiCdkUsePoolValue = Form.useWatch('use_pool', baxiCdkSubmitForm)
   const baxiCdkCodeLinesValue = Form.useWatch('code_lines', baxiCdkSubmitForm)
   const baxiCdkSelectedIdsValue = Form.useWatch('cdk_ids', baxiCdkSubmitForm)
@@ -2299,10 +2232,6 @@ export default function Accounts() {
   const [activeTasksPanelOpen, setActiveTasksPanelOpen] = useState(false)
   const [registerLoading, setRegisterLoading] = useState(false)
   const [registerSettingsSaving, setRegisterSettingsSaving] = useState(false)
-  const [selectedPendingInviteRowKeys, setSelectedPendingInviteRowKeys] = useState<React.Key[]>([])
-  const [activatingPendingInviteId, setActivatingPendingInviteId] = useState<number | null>(null)
-  const [abandoningPendingInviteId, setAbandoningPendingInviteId] = useState<number | null>(null)
-  const [activatingAllPendingInvites, setActivatingAllPendingInvites] = useState(false)
   const [backfillLoading, setBackfillLoading] = useState<'' | 'cliproxyapi_pending' | 'cliproxyapi_selected' | 'sub2api_pending' | 'sub2api_selected'>('')
   const [batchResumeAuthLoading, setBatchResumeAuthLoading] = useState<'' | 'selected' | 'filtered' | 'selected_phone' | 'filtered_phone'>('')
   const [batchPaymentLinkLoading, setBatchPaymentLinkLoading] = useState(false)
@@ -2380,11 +2309,8 @@ export default function Accounts() {
   const accountDetailQuery = useAccountDetailQuery(detailAccount?.id ? Number(detailAccount.id) : null, detailModalOpen)
   const activeTasksQuery = useActiveTasksQuery(activeTasksPanelOpen)
   const refetchActiveTasks = activeTasksQuery.refetch
-  const pendingInvitesQuery = usePendingInvitesQuery(businessDeferredModalOpen && currentPlatform === 'chatgpt')
   const activeTasks = activeTasksQuery.data ?? EMPTY_LIST
   const activeTasksLoading = activeTasksQuery.isLoading || activeTasksQuery.isFetching
-  const pendingBusinessInvites = pendingInvitesQuery.data ?? EMPTY_LIST
-  const pendingBusinessInvitesLoading = pendingInvitesQuery.isLoading || pendingInvitesQuery.isFetching
   const loading = accountsQuery.isLoading || accountsQuery.isFetching
   const visibleAccountIds = useMemo(() => new Set(
     accounts.map((account) => Number(account?.id || 0)).filter((id) => Number.isFinite(id) && id > 0),
@@ -3235,97 +3161,6 @@ export default function Accounts() {
   }
 
   useEffect(() => {
-    setSelectedPendingInviteRowKeys((prev) => {
-      const next = prev.filter((key) => pendingBusinessInvites.some((item: any) => item.id === key))
-      if (next.length === prev.length && next.every((value, index) => value === prev[index])) {
-        return prev
-      }
-      return next
-    })
-  }, [pendingBusinessInvites])
-
-  const handleActivatePendingInvite = async (inviteId: number) => {
-    setActivatingPendingInviteId(inviteId)
-    try {
-      const res = await apiFetch(`/chatgpt/pending-business-invites/${inviteId}/activate`, {
-        method: 'POST',
-        body: JSON.stringify({}),
-      })
-      message.success(`激活成功：${res.email || inviteId}`)
-      await pendingInvitesQuery.refetch()
-      load()
-    } catch (e: any) {
-      message.error(`激活失败: ${e.message}`)
-      await pendingInvitesQuery.refetch()
-    } finally {
-      setActivatingPendingInviteId(null)
-    }
-  }
-
-  const getSelectedPendingInviteIds = () =>
-    Array.from(selectedPendingInviteRowKeys)
-      .map((value) => Number(value))
-      .filter((value) => Number.isInteger(value) && value > 0)
-
-  const getRetryablePendingInviteIds = () =>
-    pendingBusinessInvites
-      .filter((item: any) => item.can_activate !== false)
-      .map((item: any) => Number(item.id))
-      .filter((value: number) => Number.isInteger(value) && value > 0)
-
-  const handleBatchActivatePendingInvites = async (inviteIds?: number[]) => {
-    const resolvedIds = (inviteIds || []).filter((value) => Number.isInteger(value) && value > 0)
-    if (resolvedIds.length === 0) {
-      message.info('没有可补激活的记录')
-      return
-    }
-    setActivatingAllPendingInvites(true)
-    try {
-      const res = await apiFetch('/chatgpt/pending-business-invites/batch-activate', {
-        method: 'POST',
-        body: JSON.stringify({ invite_ids: resolvedIds, limit: 200 }),
-      })
-      message.success(`批量激活完成：成功 ${res.success || 0} / ${res.total || 0}`)
-      await pendingInvitesQuery.refetch()
-      load()
-    } catch (e: any) {
-      message.error(`批量激活失败: ${e.message}`)
-      await pendingInvitesQuery.refetch()
-    } finally {
-      setActivatingAllPendingInvites(false)
-    }
-  }
-
-  const handleActivateAllPendingInvites = async () => {
-    await handleBatchActivatePendingInvites(getRetryablePendingInviteIds())
-  }
-
-  const handleActivateSelectedPendingInvites = async () => {
-    const inviteIds = getSelectedPendingInviteIds()
-    if (inviteIds.length === 0) {
-      message.warning('请先选择要补激活的记录')
-      return
-    }
-    await handleBatchActivatePendingInvites(inviteIds)
-  }
-
-  const handleAbandonPendingInvite = async (inviteId: number) => {
-    setAbandoningPendingInviteId(inviteId)
-    try {
-      await apiFetch(`/chatgpt/pending-business-invites/${inviteId}/abandon`, {
-        method: 'POST',
-        body: JSON.stringify({}),
-      })
-      message.success(`已标记放弃：${inviteId}`)
-      await pendingInvitesQuery.refetch()
-    } catch (e: any) {
-      message.error(`标记放弃失败: ${e.message}`)
-    } finally {
-      setAbandoningPendingInviteId(null)
-    }
-  }
-
-  useEffect(() => {
     if (!registerModalOpen) return
     let cancelled = false
     loadConfigCache()
@@ -3361,16 +3196,6 @@ export default function Accounts() {
           email: String(savedSettings.email || savedEmail || '').trim(),
           login_password: String(cfg.chatgpt_existing_account_login_password || '').trim(),
           chatgpt_existing_account_capture: savedSettings.chatgpt_existing_account_capture ?? false,
-          chatgpt_enable_team_invite:
-            savedSettings.chatgpt_enable_team_invite ?? parseBooleanConfigValue(cfg.chatgpt_enable_team_invite),
-          chatgpt_team_invite_deferred_activation:
-            savedSettings.chatgpt_team_invite_deferred_activation ?? parseBooleanConfigValue(cfg.chatgpt_team_invite_deferred_activation),
-          chatgpt_capture_business_workspace:
-            savedSettings.chatgpt_capture_business_workspace
-            ?? (cfg.chatgpt_capture_business_workspace === '' ? false : parseBooleanConfigValue(cfg.chatgpt_capture_business_workspace)),
-          chatgpt_capture_free_workspace:
-            savedSettings.chatgpt_capture_free_workspace
-            ?? (cfg.chatgpt_capture_free_workspace === '' ? true : parseBooleanConfigValue(cfg.chatgpt_capture_free_workspace)),
           chatgpt_save_registration_access_token_account:
             savedSettings.chatgpt_save_registration_access_token_account
             ?? (cfg.chatgpt_save_registration_access_token_account === ''
@@ -3422,10 +3247,6 @@ export default function Accounts() {
           email: String(savedSettings.email || savedEmail || '').trim(),
           login_password: '',
           chatgpt_existing_account_capture: savedSettings.chatgpt_existing_account_capture ?? false,
-          chatgpt_enable_team_invite: savedSettings.chatgpt_enable_team_invite ?? false,
-          chatgpt_team_invite_deferred_activation: savedSettings.chatgpt_team_invite_deferred_activation ?? false,
-          chatgpt_capture_business_workspace: savedSettings.chatgpt_capture_business_workspace ?? false,
-          chatgpt_capture_free_workspace: savedSettings.chatgpt_capture_free_workspace ?? true,
           chatgpt_save_registration_access_token_account: savedSettings.chatgpt_save_registration_access_token_account ?? true,
           chatgpt_existing_account_login_route_enabled: savedSettings.chatgpt_existing_account_login_route_enabled ?? true,
           chatgpt_register_unique_exit_ip_enabled: savedSettings.chatgpt_register_unique_exit_ip_enabled ?? false,
@@ -3535,12 +3356,6 @@ export default function Accounts() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  const canImportAccountToTeam = (record: any): boolean => {
-    if (currentPlatform !== 'chatgpt') return false
-    if (String(record?.workspace_scope || record?.extra?.chatgpt_workspace_scope || '').trim().toLowerCase() !== 'business') return false
-    return hasAccountSecret(record, 'refresh_token') || hasAccountSecret(record, 'access_token') || hasAccountSecret(record, 'session_token')
-  }
-
   const exportCsv = async (exportMode: AccountExportMode = 'sub2api') => {
     if (currentPlatform === 'chatgpt') {
       try {
@@ -3596,18 +3411,6 @@ export default function Accounts() {
     window.setTimeout(() => URL.revokeObjectURL(url), 1000)
   }
 
-  const handleImportAccountToTeam = async (record: any) => {
-    setImportingTeamAccountId(record.id)
-    try {
-      const res = await apiFetch(`/team-lite/teams/import-from-account/${record.id}`, { method: 'POST' })
-      message.success(res.message || '已导入 Team 列表')
-    } catch (e: any) {
-      message.error(e.message || '导入 Team 失败')
-    } finally {
-      setImportingTeamAccountId(null)
-    }
-  }
-
   const getResumeAuthGlobalDefaults = async () => {
     const cfg = await loadConfigCache({ force: true })
     return {
@@ -3638,40 +3441,8 @@ export default function Accounts() {
       message.success('补抓Auth任务已启动')
     } catch (e: any) {
       message.error(e?.message || '补抓 Auth 失败')
-      await pendingInvitesQuery.refetch()
     } finally {
       setResumeAuthAccountId(null)
-    }
-  }
-
-  const handleK12WorkspaceRecapture = async (record: any, params: Record<string, unknown> = {}) => {
-    const accountId = Number(record?.id || 0)
-    if (!accountId) {
-      message.error('账号 ID 无效')
-      return
-    }
-    try {
-      const res = await apiFetch('/tasks/chatgpt/k12-workspace-recapture', {
-        method: 'POST',
-        body: JSON.stringify({
-          account_id: accountId,
-          ...params,
-        }),
-      })
-      if (!res?.task_id) {
-        throw new Error('任务创建失败：未返回 task_id')
-      }
-      const snapshot = await apiFetch(`/tasks/${res.task_id}`)
-      setTaskModalMode('k12_recapture')
-      setTaskModalAccount(record)
-      setTaskId(res.task_id)
-      setTaskSnapshot(snapshot)
-      setRegisterModalOpen(true)
-      setActiveTasksPanelOpen(true)
-      void activeTasksQuery.refetch()
-      message.success('K12 / Workspace 重跑任务已启动')
-    } catch (e: any) {
-      message.error(e?.message || 'K12 / Workspace 重跑任务创建失败')
     }
   }
 
@@ -3747,97 +3518,6 @@ export default function Accounts() {
       delay_max_seconds: Number(values.register_delay_max_seconds ?? 0),
     }
     await handleBatchStatusSync('probe', batchProbeStatusConfigScope, customParams)
-  }
-
-  const openBatchK12Recapture = async () => {
-    const cfg = await loadConfigCache({ force: true }).catch(() => configCache || {})
-    const scope: 'selected' | 'filtered' = selectedRowKeys.length > 0 ? 'selected' : 'filtered'
-    setBatchK12RecaptureScope(scope)
-    batchK12RecaptureForm.resetFields()
-    batchK12RecaptureForm.setFieldsValue({
-      scope,
-      workspace_ids: '',
-      save_all_spaces: true,
-      strict_join: false,
-      join_timeout_seconds: 60,
-      join_retry_count: 2,
-      post_join_poll_seconds: '3,8,15',
-      delay_seconds: 0,
-      delay_max_seconds: 0,
-      ...taskProxySettingsFromConfig(cfg || {}, { proxy_mode: 'dynamic', proxy_failover: true }),
-    })
-    setBatchK12RecaptureOpen(true)
-  }
-
-  const submitBatchK12Recapture = async () => {
-    const values = await batchK12RecaptureForm.validateFields()
-    validateTaskProxySettings(values)
-    await saveTaskProxySettingsToConfig(values)
-    await loadConfigCache({ force: true }).catch(() => null)
-    const scope = (values.scope === 'filtered' ? 'filtered' : 'selected') as 'selected' | 'filtered'
-    const body: Record<string, unknown> = {
-      params: {
-        ...buildTaskProxyPayload(values),
-        workspace_ids: String(values.workspace_ids || '').trim(),
-        save_all_spaces: values.save_all_spaces !== false,
-        strict_join: Boolean(values.strict_join),
-        join_timeout_seconds: Number(values.join_timeout_seconds || 60),
-        join_retry_count: Number(values.join_retry_count || 2),
-        post_join_poll_seconds: String(values.post_join_poll_seconds || '3,8,15').trim(),
-        delay_seconds: Number(values.delay_seconds || 0),
-        delay_max_seconds: Number(values.delay_max_seconds || 0),
-      },
-    }
-    const scopeLabel = scope === 'selected' ? '所选账号' : '当前筛选账号'
-    const toastKey = `k12-recapture:${scope}`
-
-    if (applyAccountTaskScopeToBody(body, {
-      scope,
-      emptySelectedMessage: '请先选择要重新进入/导出 K12 的账号，或切换为当前筛选范围',
-    }) === null) return
-
-    setBatchK12RecaptureLoading(true)
-    message.loading({ content: `${scopeLabel} K12 / Workspace 重跑任务创建中...`, key: toastKey, duration: 0 })
-    try {
-      const result = await postAccountScopeRequest('/tasks/chatgpt/k12-workspace-recapture/batch', body, toastKey)
-      if (!result) return
-      setBatchK12RecaptureOpen(false)
-      const eligible = Number(result?.eligible || 0)
-      const skipped = Number(result?.skipped || 0)
-      const missing = Number(result?.missing || 0)
-      const taskIdFromResponse = String(result?.task_id || '').trim()
-      if (!taskIdFromResponse) {
-        message.info({
-          content: `没有可执行 K12 重跑的账号。请求 ${result?.total_requested || 0} 个，跳过 ${skipped} 个${missing > 0 ? `，缺失 ${missing} 个` : ''}`,
-          key: toastKey,
-        })
-        showBatchActionResult(`${scopeLabel} K12 / Workspace 重跑结果`, result)
-        return
-      }
-      const snapshot = await apiFetch(`/tasks/${taskIdFromResponse}`)
-      setTaskModalMode('k12_recapture')
-      setTaskModalAccount(
-        scope === 'selected'
-          ? null
-          : { email: `当前筛选 ${eligible} 个账号` },
-      )
-      setTaskId(taskIdFromResponse)
-      setTaskSnapshot(snapshot)
-      setRegisterModalOpen(true)
-      setActiveTasksPanelOpen(true)
-      void activeTasksQuery.refetch()
-      message.success({
-        content: `${scopeLabel} K12 / Workspace 重跑任务已启动：可执行 ${eligible} 个，跳过 ${skipped} 个${missing > 0 ? `，缺失 ${missing} 个` : ''}`,
-        key: toastKey,
-      })
-      showBatchActionResult(`${scopeLabel} K12 / Workspace 重跑结果`, result)
-      await load()
-    } catch (e: any) {
-      message.error({ content: `K12 / Workspace 重跑失败: ${e.message}`, key: toastKey })
-      setBatchK12RecaptureOpen(true)
-    } finally {
-      setBatchK12RecaptureLoading(false)
-    }
   }
 
   const getResumeAuthScope = (): 'selected' | 'filtered' => (selectedRowKeys.length > 0 ? 'selected' : 'filtered')
@@ -4639,7 +4319,6 @@ export default function Accounts() {
       plan: 'plus',
       country: normalizeCheckoutCountry(batchGopayDefaults.country || DEFAULT_CHECKOUT_COUNTRY),
       currency: normalizeCheckoutCurrency(batchGopayDefaults.currency || DEFAULT_CHECKOUT_CURRENCY),
-      checkout_url: '',
       billing_name: String(batchGopayDefaults.billing_name || '').trim(),
       billing_email: accountEmail || String(batchGopayDefaults.billing_email || '').trim(),
       billing_country: String(batchGopayDefaults.billing_country || 'US').trim(),
@@ -4898,12 +4577,6 @@ export default function Accounts() {
         mail_provider_override: String(values.mail_provider_override || '__global__'),
       email: String(values.email || '').trim(),
       chatgpt_existing_account_capture: Boolean(values.chatgpt_existing_account_capture),
-      chatgpt_enable_team_invite: Boolean(values.chatgpt_enable_team_invite),
-      chatgpt_team_invite_deferred_activation: Boolean(values.chatgpt_team_invite_deferred_activation),
-      chatgpt_capture_free_workspace:
-        values.chatgpt_capture_free_workspace === undefined ? true : Boolean(values.chatgpt_capture_free_workspace),
-      chatgpt_capture_business_workspace:
-        values.chatgpt_capture_business_workspace === undefined ? false : Boolean(values.chatgpt_capture_business_workspace),
       chatgpt_save_registration_access_token_account:
         values.chatgpt_save_registration_access_token_account === undefined
           ? true
@@ -4965,9 +4638,6 @@ export default function Accounts() {
         && resolvedMailProvider === 'manual_email_otp'
         && Boolean(values.chatgpt_existing_account_capture)
       const normalizedLoginPassword = String(values.login_password || '').trim()
-      if (existingAccountCapture && !values.chatgpt_capture_business_workspace && !values.chatgpt_capture_free_workspace) {
-        throw new Error('已有账号抓 auth 模式至少要选择一个工作空间')
-      }
       const configuredTempMailMode = String(values.tempmail_mode || cfg.tempmail_mode || 'fixed_domain').trim().toLowerCase()
       const tempmailMode = configuredTempMailMode === 'task_subdomain' ? 'task_subdomain' : 'fixed_domain'
       const tempmailFixedDomains = normalizeDomainList(values.tempmail_fixed_domains)
@@ -5053,22 +4723,6 @@ export default function Accounts() {
         luckmail_email_type: cfg.luckmail_email_type,
         luckmail_domain: cfg.luckmail_domain,
         chatgpt_existing_account_capture: currentPlatform === 'chatgpt' ? existingAccountCapture : undefined,
-        chatgpt_enable_team_invite:
-          currentPlatform === 'chatgpt'
-            ? (existingAccountCapture ? false : Boolean(values.chatgpt_enable_team_invite))
-            : undefined,
-        chatgpt_capture_free_workspace:
-          currentPlatform === 'chatgpt'
-            ? Boolean(values.chatgpt_capture_free_workspace)
-            : undefined,
-        chatgpt_capture_business_workspace:
-          currentPlatform === 'chatgpt' && (values.chatgpt_enable_team_invite || existingAccountCapture)
-            ? values.chatgpt_capture_business_workspace
-            : undefined,
-        chatgpt_team_invite_deferred_activation:
-          currentPlatform === 'chatgpt' && values.chatgpt_enable_team_invite && !existingAccountCapture
-            ? Boolean(values.chatgpt_team_invite_deferred_activation)
-            : undefined,
         chatgpt_save_registration_access_token_account:
           currentPlatform === 'chatgpt'
             ? (values.chatgpt_save_registration_access_token_account === undefined
@@ -5089,7 +4743,6 @@ export default function Accounts() {
           currentPlatform === 'chatgpt' ? values.chatgpt_register_otp_resend_wait_seconds : undefined,
         chatgpt_register_otp_account_budget_seconds:
           currentPlatform === 'chatgpt' ? values.chatgpt_register_otp_account_budget_seconds : undefined,
-        ...(currentPlatform === 'chatgpt' ? buildChatGPTK12Payload(values) : {}),
       }
       const chatgptRegistrationRequestAdapter =
         buildChatGPTRegistrationRequestAdapter(
@@ -5129,11 +4782,6 @@ export default function Accounts() {
         mail_provider_override: selectedProviderOverride || '__global__',
         email: String(values.email || '').trim(),
         chatgpt_existing_account_capture: Boolean(values.chatgpt_existing_account_capture),
-        chatgpt_enable_team_invite: Boolean(values.chatgpt_enable_team_invite),
-        chatgpt_team_invite_deferred_activation: Boolean(values.chatgpt_team_invite_deferred_activation),
-        chatgpt_capture_free_workspace: Boolean(values.chatgpt_capture_free_workspace),
-        chatgpt_capture_business_workspace:
-          values.chatgpt_capture_business_workspace === undefined ? false : Boolean(values.chatgpt_capture_business_workspace),
         chatgpt_save_registration_access_token_account:
           values.chatgpt_save_registration_access_token_account === undefined
             ? true
@@ -6259,11 +5907,9 @@ export default function Accounts() {
     const commonActions = Array.isArray(platformActions) ? platformActions : []
     const paymentLinkAction = commonActions.find((action: any) => String(action?.id || '').trim().toLowerCase() === 'payment_link')
     const invalidRecheckAction = commonActions.find((action: any) => String(action?.id || '').trim().toLowerCase() === 'invalid_recheck')
-    const k12RecaptureAction = commonActions.find((action: any) => String(action?.id || '').trim().toLowerCase() === 'k12_workspace_recapture')
     const hiddenIds = new Set([
       paymentLinkAction ? String(paymentLinkAction.id) : '',
       invalidRecheckAction ? String(invalidRecheckAction.id) : '',
-      k12RecaptureAction ? String(k12RecaptureAction.id) : '',
       'probe_local_status',
       'resume_subscription_auth',
     ].filter(Boolean))
@@ -6324,7 +5970,6 @@ export default function Accounts() {
   const renderAccountActions = (record: any, compact = false) => {
     const commonActions = Array.isArray(platformActions) ? platformActions : []
     const paymentLinkAction = commonActions.find((action: any) => String(action?.id || '').trim().toLowerCase() === 'payment_link')
-    const k12RecaptureAction = commonActions.find((action: any) => String(action?.id || '').trim().toLowerCase() === 'k12_workspace_recapture')
     const showResumeAuth = isChatgptPlatform && shouldShowResumeAuthButton(record)
     const showInvalidRecheck = isChatgptPlatform && shouldShowInvalidRecheckButton(record)
     const moreMenuItems = buildAccountMoreMenuItems(record)
@@ -6365,11 +6010,6 @@ export default function Accounts() {
           {showInvalidRecheck ? (
             <Button size="small" style={mobileActionButtonStyle(accountActionTextStyles.resume)} onClick={() => handleInvalidRecheck(record)}>
               失效测活
-            </Button>
-          ) : null}
-          {k12RecaptureAction ? (
-            <Button size="small" style={mobileActionButtonStyle(accountActionTextStyles.refresh)} onClick={() => openAccountInlineAction(record, 'k12_workspace_recapture', 'dialog')}>
-              K12重跑
             </Button>
           ) : null}
           <Dropdown
@@ -6440,16 +6080,6 @@ export default function Accounts() {
               失效测活
             </Button>
           ) : null}
-          {k12RecaptureAction ? (
-            <Button
-              type="link"
-              size="small"
-              style={accountActionTextStyles.refresh}
-              onClick={() => openAccountInlineAction(record, 'k12_workspace_recapture', 'dialog')}
-            >
-              K12重跑
-            </Button>
-          ) : null}
           <Dropdown
             menu={{
               items: moreMenuItems,
@@ -6475,11 +6105,6 @@ export default function Accounts() {
     const formatted = formatCreatedAt(record.created_at)
     const subscriptionExpiry = formatSubscriptionExpiry(record)
     const email = String(record.email || '').trim()
-    const teamInviteOwner = getTeamInviteOwnerLabel(record.teamInviteSource)
-    const teamInviteMeta = [
-      record.teamInviteSource?.team_name ? `Team: ${record.teamInviteSource.team_name}` : '',
-      record.teamInviteSource?.team_id ? `#${record.teamInviteSource.team_id}` : '',
-    ].filter(Boolean).join(' · ')
     const phoneBinding = getPhoneBinding(record)
     const hasPhoneBinding = Boolean(phoneBinding.phone || phoneBinding.apiUrl)
     const rawPhoneLine = phoneBinding.rawLine || [phoneBinding.phone, phoneBinding.apiUrl].filter(Boolean).join('----')
@@ -6613,12 +6238,6 @@ export default function Accounts() {
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, paddingLeft: 22 }}>
           {renderAccountStatusState(record.status, record, { inline: true })}
         </div>
-
-        {teamInviteOwner ? (
-          <Text type="secondary" style={{ paddingLeft: 22, fontSize: 11, lineHeight: '18px' }} ellipsis={{ tooltip: `${teamInviteOwner}${teamInviteMeta ? ` · ${teamInviteMeta}` : ''}` }}>
-            {`${teamInviteOwner}${teamInviteMeta ? ` · ${teamInviteMeta}` : ''}`}
-          </Text>
-        ) : null}
 
         <div
           style={{
@@ -7502,18 +7121,15 @@ export default function Accounts() {
         batchGopayLoading={batchGopayLoading}
         batchPaymentLinkLoading={batchPaymentLinkLoading}
         batchInvalidRecheckLoading={batchInvalidRecheckLoading}
-        batchK12RecaptureLoading={batchK12RecaptureLoading}
         phoneBindingTestLoading={phoneBindingTestLoading}
         paypalBindingLoading={paypalBindingLoading}
         baxiCdkSubmitLoading={baxiCdkSubmitLoading}
         onBatchPaymentLink={handleBatchPaymentLink}
         onBatchInvalidRecheck={handleBatchInvalidRecheck}
-        onOpenBatchK12Recapture={() => { void openBatchK12Recapture() }}
         onOpenPhoneBindingTest={() => { void openPhoneBindingTest() }}
         onOpenPaypalBinding={openPaypalBinding}
         onOpenBaxiCdkSubmit={openBaxiCdkSubmit}
         onOpenBatchGopay={openBatchGopayWorkbench}
-        onOpenBusinessDeferred={() => setBusinessDeferredModalOpen(true)}
         deleteInvalidLoading={deleteInvalidLoading}
         onDeleteInvalid={handleDeleteInvalid}
         onBatchDelete={handleBatchDelete}
@@ -7834,31 +7450,6 @@ export default function Accounts() {
         activePhaseMatcher={(item) => Boolean(item.snapshot?.session_id && GOPAY_ACTIVE_PHASES.has(String(item.snapshot?.phase || '')))}
       />
 
-      <PendingInvitesModal
-        open={businessDeferredModalOpen}
-        onClose={() => {
-          setBusinessDeferredModalOpen(false)
-          setSelectedPendingInviteRowKeys([])
-        }}
-        loading={pendingBusinessInvitesLoading}
-        items={pendingBusinessInvites}
-        selectedRowKeys={selectedPendingInviteRowKeys}
-        onSelectedRowKeysChange={setSelectedPendingInviteRowKeys}
-        activatingAll={activatingAllPendingInvites}
-        activatingId={activatingPendingInviteId}
-        abandoningId={abandoningPendingInviteId}
-        onRefresh={async () => {
-          await pendingInvitesQuery.refetch()
-        }}
-        onActivateSelected={handleActivateSelectedPendingInvites}
-        onActivateAll={handleActivateAllPendingInvites}
-        onActivateOne={handleActivatePendingInvite}
-        onAbandonOne={handleAbandonPendingInvite}
-        pendingActivationKindMeta={pendingActivationKindMeta}
-        pendingInviteStatusMeta={pendingInviteStatusMeta}
-        formatSyncTime={formatSyncTime}
-      />
-
       <RegisterTaskModal
         open={registerModalOpen}
         currentPlatform={currentPlatform}
@@ -7886,7 +7477,6 @@ export default function Accounts() {
         onTaskDone={() => {
           clearTaskModalStorage()
           load()
-          pendingInvitesQuery.refetch()
         }}
       />
 
@@ -8086,130 +7676,6 @@ export default function Accounts() {
           {probeProxyModeValue !== 'direct' && (
             <Form.Item name="proxy_failover" valuePropName="checked" initialValue={false}>
               <Checkbox>{probeProxyModeValue === 'dynamic' ? '失败后刷新 sid 重试' : '使用多个候选代理，遇到网络失败时自动切换'}</Checkbox>
-            </Form.Item>
-          )}
-        </Form>
-      </Modal>
-
-      <Modal
-        title="批量重新进入并导出 K12 / Workspace"
-        open={batchK12RecaptureOpen}
-        onCancel={() => setBatchK12RecaptureOpen(false)}
-        onOk={submitBatchK12Recapture}
-        confirmLoading={batchK12RecaptureLoading}
-        okText="开始重跑"
-        cancelText="取消"
-        width={760}
-        maskClosable={false}
-      >
-        <Form form={batchK12RecaptureForm} layout="vertical">
-          <Alert
-            type="warning"
-            showIcon
-            style={{ marginBottom: 16 }}
-            message={
-              batchK12RecaptureScope === 'selected'
-                ? `范围：当前选中 ${selectedRowKeys.length} 个账号`
-                : `范围：当前筛选结果 ${total} 个账号`
-            }
-            description="复用每个账号已保存的 AccessToken + cookies/session_token，重新 join K12、拉取 accounts/check 空间并写回 workspace variants；不会在结果里展示 token/cookies 原文。"
-          />
-          <Form.Item name="scope" label="账号范围" initialValue={batchK12RecaptureScope}>
-            <Select
-              value={batchK12RecaptureScope}
-              onChange={(value) => {
-                setBatchK12RecaptureScope(value)
-                batchK12RecaptureForm.setFieldsValue({ scope: value })
-              }}
-              options={[
-                { value: 'selected', label: `当前选中账号（${selectedRowKeys.length}）`, disabled: selectedRowKeys.length === 0 },
-                { value: 'filtered', label: `当前筛选账号（${total}）` },
-              ]}
-            />
-          </Form.Item>
-          <Form.Item
-            name="workspace_ids"
-            label="目标 K12 workspace_id"
-            extra="留空时只导出当前可见空间；多个 ID 支持换行、逗号或空格分隔。"
-          >
-            <Input.TextArea rows={4} placeholder={'ws_xxx\nws_yyy'} />
-          </Form.Item>
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 12 }}>
-            <Form.Item name="save_all_spaces" valuePropName="checked">
-              <Checkbox>同时导出所有可见空间</Checkbox>
-            </Form.Item>
-            <Form.Item name="strict_join" valuePropName="checked">
-              <Checkbox>严格 join（失败即异常）</Checkbox>
-            </Form.Item>
-          </div>
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 12 }}>
-            <Form.Item name="join_timeout_seconds" label="Join 超时秒数">
-              <InputNumber min={5} max={180} precision={0} style={{ width: '100%' }} />
-            </Form.Item>
-            <Form.Item name="join_retry_count" label="Join 重试次数">
-              <InputNumber min={0} max={5} precision={0} style={{ width: '100%' }} />
-            </Form.Item>
-            <Form.Item name="post_join_poll_seconds" label="Join 后轮询秒">
-              <Input placeholder="3,8,15" />
-            </Form.Item>
-          </div>
-          <Form.Item label="账号间延时 (秒)">
-            <Space style={{ display: 'flex' }}>
-              <Form.Item name="delay_seconds" noStyle initialValue={0}>
-                <InputNumber min={0} max={3600} step={1} style={{ width: 140 }} placeholder="最小延时" />
-              </Form.Item>
-              <span>至</span>
-              <Form.Item name="delay_max_seconds" noStyle initialValue={0}>
-                <InputNumber min={0} max={3600} step={1} style={{ width: 140 }} placeholder="最大延时" />
-              </Form.Item>
-              <span style={{ color: '#888', marginLeft: 8 }}>（都填 0 为无延时，填不同数值则在区间内随机）</span>
-            </Space>
-          </Form.Item>
-          <Form.Item label="代理模式" name="proxy_mode" initialValue="dynamic">
-            <Select style={{ width: 260 }}>
-              <Select.Option value="pool">代理池自动选取</Select.Option>
-              <Select.Option value="specified">手动指定代理</Select.Option>
-              <Select.Option value="dynamic">动态代理</Select.Option>
-              <Select.Option value="direct">直连 (不使用代理)</Select.Option>
-            </Select>
-          </Form.Item>
-
-          {(batchK12ProxyModeValue === 'specified' || batchK12ProxyModeValue === 'dynamic') && (
-            <Form.Item
-              label={batchK12ProxyModeValue === 'dynamic' ? '动态代理模板（全局默认）' : '代理地址'}
-              name="proxy"
-              rules={batchK12ProxyModeValue === 'specified' ? [{ required: true, message: '请输入代理地址' }] : undefined}
-              extra={batchK12ProxyModeValue === 'dynamic' ? '留空使用全局动态代理模板；填写后会更新所有任务的全局动态代理模板。' : undefined}
-            >
-              <Input placeholder={batchK12ProxyModeValue === 'dynamic' ? '可留空；或填 socks5://user-region-JP-sid-xxxx-t-15:pass@host:port' : 'http://user:pass@host:port 或 socks5://...'} />
-            </Form.Item>
-          )}
-
-          {(batchK12ProxyModeValue === 'pool' || batchK12ProxyModeValue === 'dynamic' || (batchK12ProxyModeValue === 'specified' && batchK12ProxyFailoverValue)) && (
-            <Space style={{ display: 'flex', flexWrap: 'wrap', gap: 16 }} align="baseline">
-              <Form.Item
-                label="目标国家 (ISO 缩写)"
-                name="proxy_country_code"
-                rules={batchK12ProxyModeValue === 'dynamic' ? [{ required: true, message: '请输入动态代理出口国家' }] : undefined}
-              >
-                <Input style={{ width: 140 }} placeholder={batchK12ProxyModeValue === 'dynamic' ? '必填，如 US' : '如 US, JP, 不填则不限'} />
-              </Form.Item>
-              {batchK12ProxyModeValue !== 'dynamic' ? (
-                <>
-                  <Form.Item label="最低健康度分数" name="proxy_min_score" initialValue={50}>
-                    <InputNumber min={0} max={100} step={5} style={{ width: 140 }} />
-                  </Form.Item>
-                  <Form.Item label="候选代理数量" name="proxy_max_candidates" initialValue={5}>
-                    <InputNumber min={1} max={20} step={1} style={{ width: 140 }} />
-                  </Form.Item>
-                </>
-              ) : null}
-            </Space>
-          )}
-
-          {batchK12ProxyModeValue !== 'direct' && (
-            <Form.Item name="proxy_failover" valuePropName="checked" initialValue={true}>
-              <Checkbox>{batchK12ProxyModeValue === 'dynamic' ? '失败后刷新 sid 重试' : '使用多个候选代理，遇到网络失败时自动切换'}</Checkbox>
             </Form.Item>
           )}
         </Form>
@@ -9222,7 +8688,6 @@ export default function Accounts() {
         onInitialActionHandled={() => setActionSurfaceInitialActionId(null)}
         onResumeAuthTask={handleResumeSubscriptionAuth}
         onInvalidRecheckTask={handleInvalidRecheck}
-        onK12RecaptureTask={handleK12WorkspaceRecapture}
         authStateMeta={authStateMeta}
         planMeta={planMeta}
           codexStateMeta={codexStateMeta}
@@ -9240,8 +8705,6 @@ export default function Accounts() {
         currentAccount={detailAccount}
         detailForm={detailForm}
         token={token}
-        importingTeamAccountId={importingTeamAccountId}
-        onImportAccountToTeam={handleImportAccountToTeam}
         formatSyncTime={formatSyncTime}
         getRefreshToken={getRefreshToken}
         getAccessToken={getAccessToken}
@@ -9252,7 +8715,6 @@ export default function Accounts() {
           const accountId = Number(record?.id || 0)
           return accountId > 0 && accessTokenCopiedAccountIds.has(accountId)
         }}
-        canImportAccountToTeam={canImportAccountToTeam}
         authStateMeta={authStateMeta}
         planMeta={planMeta}
         codexStateMeta={codexStateMeta}

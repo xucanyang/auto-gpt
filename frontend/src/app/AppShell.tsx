@@ -10,7 +10,6 @@ import {
   SunOutlined,
   MoonOutlined,
   LogoutOutlined,
-  TeamOutlined,
   MobileOutlined,
   RocketOutlined,
   ApartmentOutlined,
@@ -92,7 +91,6 @@ function AppContent({ hasPassword }: { hasPassword: boolean }) {
     if (path === '/') return ['/']
     if (path.startsWith('/chatgpt') || path.startsWith('/accounts')) return ['/chatgpt']
     if (path === '/custom-email-recheck') return ['/custom-email-recheck']
-    if (path.startsWith('/teams')) return ['/teams']
     if (path === '/pipeline') return ['/pipeline']
     if (path === '/idea-oaipay-pipeline') return ['/idea-oaipay-pipeline']
     if (path === '/gopay-otp') return ['/gopay-otp']
@@ -109,7 +107,6 @@ function AppContent({ hasPassword }: { hasPassword: boolean }) {
     { key: '/', icon: <DashboardOutlined />, label: '仪表盘' },
     { key: '/chatgpt', icon: <UserOutlined />, label: 'ChatGPT' },
     { key: '/custom-email-recheck', icon: <ExperimentOutlined />, label: '邮箱登录测活' },
-    { key: '/teams', icon: <TeamOutlined />, label: 'Team' },
     { key: '/gopay-otp', icon: <MobileOutlined />, label: 'GoPay OTP' },
     { key: '/pipeline', icon: <RocketOutlined />, label: '自动流水线' },
     { key: '/idea-oaipay-pipeline', icon: <ApartmentOutlined />, label: '账号处理流水线' },
@@ -246,7 +243,7 @@ function AppContent({ hasPassword }: { hasPassword: boolean }) {
                     marginTop: 4,
                   }}
                 >
-                  v1.4.0
+                  v2.0.0
                 </div>
               )}
             </div>

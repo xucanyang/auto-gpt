@@ -952,27 +952,6 @@ class OAuthClient:
         target = f"{state.continue_url} {state.current_url}".lower()
         return state.page_type == "about_you" or "about-you" in target
 
-    @staticmethod
-    def _should_skip_create_account_for_login_source(login_source):
-        source = str(login_source or "").strip().lower()
-        if not source:
-            return False
-        return any(
-            marker in source
-            for marker in (
-                "post_register_workspace_recovery",
-                "business_workspace_recovery",
-                "workspace_capture_",
-                "existing_account_after_about_you",
-            )
-        )
-
-    @staticmethod
-    def _should_retry_fresh_oauth_after_about_you(login_source, workspace_scope_preference):
-        source = str(login_source or "").strip().lower()
-        scope = OAuthClient._normalize_workspace_scope_preference(workspace_scope_preference)
-        return scope == "free" and "workspace_capture_free" in source
-
     def _state_requires_navigation(self, state: FlowState):
         method = (state.method or "GET").upper()
         if method != "GET":
@@ -2394,7 +2373,7 @@ class OAuthClient:
         birthdate="",
         login_source="",
         stop_after_login=False,
-        workspace_scope_preference=None,
+        workspace_scope_preference="free",
         allow_add_phone_session_recovery=True,
         _recovery_depth=0,
     ):
@@ -2708,13 +2687,7 @@ class OAuthClient:
                     impersonate,
                     skymail_client,
                     state,
-                    scope_log_prefix=(
-                        "[business]"
-                        if self._normalize_workspace_scope_preference(workspace_scope_preference) == "business"
-                        else "[free]"
-                        if self._normalize_workspace_scope_preference(workspace_scope_preference) == "free"
-                        else ""
-                    ),
+                    scope_log_prefix="[free]",
                 )
                 if not next_state:
                     if not self.last_error:
@@ -2728,72 +2701,8 @@ class OAuthClient:
                     self.last_state = next_state
                     self._set_error("登录链路已完成，按要求停止")
                     return None
-                if self._state_is_about_you(next_state) and self._should_retry_fresh_oauth_after_about_you(
-                    login_source,
-                    workspace_scope_preference,
-                ):
-                    if _recovery_depth < 1:
-                        self._log(
-                            "free 工作空间链路在邮箱 OTP 后回到 about_you；"
-                            "判定本次登录态无效，重开全新 OAuth session 再试一次"
-                        )
-                        return self.login_and_get_tokens(
-                            email,
-                            password,
-                            device_id,
-                            user_agent=user_agent,
-                            sec_ch_ua=sec_ch_ua,
-                            impersonate=impersonate,
-                            browser_fingerprint=self.browser_fingerprint,
-                            skymail_client=skymail_client,
-                            prefer_passwordless_login=prefer_passwordless_login,
-                            allow_phone_verification=allow_phone_verification,
-                            allow_add_phone_verification=allow_add_phone_verification,
-                            allow_existing_phone_verification=allow_existing_phone_verification,
-                            phone_sms_probe_only=phone_sms_probe_only,
-                            force_new_browser=True,
-                            force_password_login=force_password_login,
-                            force_chatgpt_entry=force_chatgpt_entry,
-                            screen_hint=screen_hint,
-                            complete_about_you_if_needed=complete_about_you_if_needed,
-                            first_name=first_name,
-                            last_name=last_name,
-                            birthdate=birthdate,
-                            login_source=f"{login_source}:retry_after_invalid_about_you",
-                            stop_after_login=stop_after_login,
-                            workspace_scope_preference=workspace_scope_preference,
-                            allow_add_phone_session_recovery=allow_add_phone_session_recovery,
-                            _recovery_depth=_recovery_depth + 1,
-                        )
-                    self._set_error(
-                        "free 工作空间链路在 OTP 后再次回到 about_you，判定登录态无效"
-                    )
-                    return None
-                if (
-                    complete_about_you_if_needed
-                    and self._should_skip_create_account_for_login_source(login_source)
-                    and self._state_is_about_you(next_state)
-                ):
-                    self._about_you_should_skip_create_account = True
-                    self._log(
-                        "恢复链路在邮箱 OTP 后直接回到 about_you；"
-                        "后续将跳过 create_account，按既有账号恢复路径继续"
-                    )
                 referer = state.current_url or referer
                 state = next_state
-                continue
-
-            if self._state_is_about_you(state) and (
-                self._about_you_should_skip_create_account
-                or self._should_skip_create_account_for_login_source(login_source)
-            ):
-                self._log(
-                    "步骤5: 当前 about_you 属于既有账号恢复链路，跳过 create_account，直接转 consent/workspace"
-                )
-                referer = state.current_url or referer
-                state = self._state_from_url(
-                    f"{self.oauth_issuer}/sign-in-with-chatgpt/codex/consent"
-                )
                 continue
 
             if complete_about_you_if_needed and self._state_is_about_you(state):
@@ -3017,143 +2926,6 @@ class OAuthClient:
         except Exception:
             return None
 
-    def capture_workspace_tokens_from_authenticated_session(
-        self,
-        *,
-        device_id,
-        user_agent=None,
-        sec_ch_ua=None,
-        impersonate=None,
-        workspace_scope_preference=None,
-    ):
-        """基于已登录的 OAuth 会话做一次 workspace 预热抓取；失败时仅返回 None。"""
-        self.last_error = ""
-        self.last_workspace_id = ""
-        self.last_workspace_candidates = []
-        self.last_organization_candidates = []
-        self.last_organization_continue_url = ""
-        self.last_state = FlowState()
-        self._log(
-            "复用已登录 auth 会话抓取 workspace"
-            + (
-                f" (target={str(workspace_scope_preference or 'auto').strip() or 'auto'})"
-                if workspace_scope_preference
-                else ""
-            )
-        )
-
-        user_agent, sec_ch_ua, impersonate = self._ensure_oauth_fingerprint(
-            user_agent,
-            sec_ch_ua,
-            impersonate,
-            device_id=device_id,
-        )
-        seed_oai_device_cookie(self.session, device_id)
-
-        code_verifier, code_challenge = generate_pkce()
-        oauth_state = secrets.token_urlsafe(32)
-        authorize_params = {
-            "response_type": "code",
-            "client_id": self.oauth_client_id,
-            "redirect_uri": self.oauth_redirect_uri,
-            "scope": "openid profile email offline_access",
-            "code_challenge": code_challenge,
-            "code_challenge_method": "S256",
-            "state": oauth_state,
-        }
-        authorize_url = f"{self.oauth_issuer}/oauth/authorize"
-
-        authorize_final_url = self._bootstrap_oauth_session(
-            authorize_url,
-            authorize_params,
-            device_id=device_id,
-            user_agent=user_agent,
-            sec_ch_ua=sec_ch_ua,
-            impersonate=impersonate,
-        )
-        if not authorize_final_url:
-            if not self.last_error:
-                self._set_error("复用会话 bootstrap 失败")
-            return None
-
-        state = self._state_from_url(authorize_final_url)
-        referer = authorize_final_url if authorize_final_url.startswith(self.oauth_issuer) else authorize_url
-
-        for step in range(10):
-            self.last_state = state
-            self._log(f"复用会话状态步进[{step + 1}/10]: {describe_flow_state(state)}")
-
-            code = self._extract_code_from_state(state)
-            if code:
-                self._log("获取到 authorization code: [REDACTED_OTP]")
-                self._log("步骤7: POST /oauth/token")
-                tokens = self._exchange_code_for_tokens(code, code_verifier, user_agent, impersonate)
-                if tokens:
-                    self._log("✅ OAuth 登录成功")
-                else:
-                    self._log("换取 tokens 失败")
-                return tokens
-
-            if self._state_supports_workspace_resolution(state):
-                code, next_state = self.resolve_codex_workspace(
-                    state,
-                    device_id,
-                    user_agent,
-                    impersonate,
-                    workspace_scope_preference=workspace_scope_preference,
-                    authorize_url=authorize_url,
-                    authorize_params=authorize_params,
-                )
-                if code:
-                    self._log("获取到 authorization code: [REDACTED_OTP]")
-                    self._log("步骤7: POST /oauth/token")
-                    tokens = self._exchange_code_for_tokens(code, code_verifier, user_agent, impersonate)
-                    if tokens:
-                        self._log("✅ OAuth 登录成功")
-                    else:
-                        self._log("换取 tokens 失败")
-                    return tokens
-                if next_state:
-                    referer = state.current_url or referer
-                    state = next_state
-                    continue
-                if not self.last_error:
-                    self._set_error("复用会话 workspace/org 选择失败")
-                return None
-
-            if self._state_requires_navigation(state):
-                code, next_state = self._follow_flow_state(
-                    state,
-                    referer=referer,
-                    user_agent=user_agent,
-                    impersonate=impersonate,
-                )
-                if code:
-                    self._log("获取到 authorization code: [REDACTED_OTP]")
-                    self._log("步骤7: POST /oauth/token")
-                    tokens = self._exchange_code_for_tokens(code, code_verifier, user_agent, impersonate)
-                    if tokens:
-                        self._log("✅ OAuth 登录成功")
-                    else:
-                        self._log("换取 tokens 失败")
-                    return tokens
-                if next_state:
-                    referer = state.current_url or referer
-                    state = next_state
-                    continue
-
-            if self._state_is_login_password(state) or self._state_is_email_otp(state) or self._state_is_about_you(state):
-                self._set_error(
-                    "复用已登录 auth 会话时仍回到了登录/OTP/about_you，无法直接解析目标 workspace"
-                )
-                return None
-
-            self._set_error(f"复用会话遇到未支持的 OAuth 状态: {describe_flow_state(state)}")
-            return None
-
-        self._set_error("复用已登录 auth 会话超出最大步数")
-        return None
-
     def _oauth_follow_for_code(
         self, start_url, referer, user_agent, impersonate, max_hops=16
     ):
@@ -3172,8 +2944,6 @@ class OAuthClient:
         normalized = str(value or "").strip().lower().replace("-", "_")
         if normalized in {"free", "personal", "default", "personal_free"}:
             return "free"
-        if normalized in {"business", "team", "workspace", "org", "enterprise"}:
-            return "business"
         return ""
 
     def _classify_workspace_candidate(self, workspace):
@@ -3210,33 +2980,14 @@ class OAuthClient:
         return ""
 
     def _pick_workspace_candidate(self, workspaces, scope_preference):
-        preferred_scope = self._normalize_workspace_scope_preference(scope_preference)
         items = list(workspaces or [])
         if not items:
             return None
-
-        if not preferred_scope:
-            return items[0]
-
         classified = [(item, self._classify_workspace_candidate(item)) for item in items]
-
-        if preferred_scope == "free":
-            for item, scope in classified:
-                if scope == "free":
-                    return item
-            for item in items:
-                if isinstance(item, dict) and item.get("is_default") is True:
-                    return item
-            if len(items) >= 2:
-                return items[-1]
-            return items[0]
-
         for item, scope in classified:
-            if scope == "business":
+            if scope == "free":
                 return item
-        if len(items) >= 2:
-            return items[0]
-        return items[0]
+        return None
 
     def resolve_codex_workspace(
         self,
@@ -3244,7 +2995,7 @@ class OAuthClient:
         device_id,
         user_agent,
         impersonate,
-        workspace_scope_preference=None,
+        workspace_scope_preference="free",
         authorize_url=None,
         authorize_params=None,
     ):
@@ -3653,8 +3404,6 @@ class OAuthClient:
         if organization_url:
             self.last_organization_continue_url = str(organization_url)
         self._log(f"选择 organization: {org_id}")
-        if scope_log_prefix == "[business]":
-            self._log("[business] 已选择 organization")
 
         org_body = {"org_id": org_id}
         if project_id:
@@ -3820,7 +3569,7 @@ class OAuthClient:
         user_agent,
         impersonate,
         max_retries=3,
-        workspace_scope_preference=None,
+        workspace_scope_preference="free",
         authorize_url=None,
         authorize_params=None,
     ):
@@ -3862,10 +3611,9 @@ class OAuthClient:
             self._set_error("session 中没有 workspace 信息")
             return None, None
 
-        preferred_scope = self._normalize_workspace_scope_preference(workspace_scope_preference)
-        scope_log_prefix = "[business]" if preferred_scope == "business" else "[free]" if preferred_scope == "free" else ""
-        if scope_log_prefix:
-            self._log(f"{scope_log_prefix} 已读取 {len(workspaces)} 个 workspace")
+        preferred_scope = "free"
+        scope_log_prefix = "[free]"
+        self._log(f"{scope_log_prefix} 已读取 {len(workspaces)} 个 workspace")
         selected_workspace = self._pick_workspace_candidate(workspaces, preferred_scope)
         workspace_id = str((selected_workspace or {}).get("id") or "").strip()
         if not workspace_id:
@@ -3895,11 +3643,7 @@ class OAuthClient:
             )
         else:
             self._log(f"选择 workspace: {workspace_id}")
-        if scope_log_prefix:
-            if preferred_scope == "business":
-                self._log("[business] 已选择 organization workspace")
-            elif preferred_scope == "free":
-                self._log("[free] 已选择 free workspace")
+        self._log("[free] 已选择 personal workspace")
 
         headers = self._headers(
             f"{self.oauth_issuer}/api/accounts/workspace/select",

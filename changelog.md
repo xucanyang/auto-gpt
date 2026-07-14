@@ -4,6 +4,28 @@
 
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，并且本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/) (语义化版本)。
 
+## [2.0.0] - 2026-07-14
+
+### 移除 (Removed)
+- **下线 K12 产品能力与专用实例**：删除 K12 注册加入、空间抓取/重抓、批量任务、配置项、API、账号动作和前端设置，并从 `docker-compose.multi.yml`、`deploy.sh` 与运行拓扑中移除 `auto-k12` 及其 `8002/8319/8891` 端口。退役前已归档容器元数据、镜像、Compose 定义和 SQLite 一致性备份；`/opt/auto-k12` 原始数据继续作为冷数据保留，不做表删除或历史账号清理。
+- **下线多 Workspace 与 Business 工作流**：移除 workspace variants/linked accounts、多空间抓取、Business workspace recovery、Team invite、延迟激活、pending invite API/任务和相关前端入口。普通 ChatGPT OAuth、支付与状态探测仍保留当前单账号必需的协议级 `account_id/workspace_id`，但不再枚举、加入或保存多个产品空间。
+- **下线 Team 产品与支付能力**：删除 Team 页面、Team-lite API/服务、Team Manager 上传与内嵌运行时、Team 支付链接、席位/工作区名称/promo 参数及对应容器挂载和网络。主支付、GoPay、批量支付和流水线统一只允许 Plus；独立 `team-manage-app` 服务不属于本项目，继续独立运行。
+
+### 优化 (Changed)
+- **注册与账号持久化收敛为单账号契约**：ChatGPT 注册适配器和 RT/Auth 捕获不再生成 workspace artifacts 或额外账号变体；同一平台和邮箱只更新当前账号记录，不主动删除历史重复行。历史 `extra_json`、pending invite 表与旧 Team 数据库保持原样，仅停止被运行代码读取或写入。
+- **Idea/OAIPay 流水线只保留当前套餐**：可编辑的跳过、Gate 与上传订阅列表仅保留 `free/plus/pro`；历史 Team/Business/Enterprise 账号由后端固定跳过 Idea、拒绝 Gate/手机号 Plus 分流，并在 OAIPay 统一写入边界于网络请求前失败关闭。旧配置载入时会过滤退役值，不修改任务历史或账号状态记录。
+- **多实例发布拓扑同步收口**：常驻发布目标固定为 `auto-gpt-plus:8001` 与 `auto-plus2:8003`，`auto-gpt:8000` 保持停止的 standby；主发布入口移除会复活单实例的旧 image 模式，发布健康检查不再包含 K12。显式 `--backup` 仍只读备份现存历史 `team_manage.db`，但 Compose、启动逻辑和运行网络不再挂载或使用它。`auto-k12.cccy.me` 的 Nginx vhost 与 Cloudflare A 记录同步退役，独立 `k12.cccy.me` 和 `ex.cccy.me` 不受影响。
+- **历史记录改为只读兼容展示**：账号详情只保留当前 OAuth 协议身份诊断；旧 K12/Business 任务仍可在历史页按“已退役”标签识别，但不提供重试、激活或管理操作，避免保留历史数据时被误判为当前能力。
+
+### 安全 (Security)
+- **封闭旧客户端绕过入口**：账号 Action、批量任务、GoPay 主/UID/批量入口和流水线均在账号扫描或任务调度前执行 Plus-only 校验，公共 GoPay 不再接受外部 `checkout_url`，历史 `team/business/enterprise` 缓存链接也不会被重标为 Plus 后复用。OAuth workspace 选择仅接受明确的 personal/free 候选，找不到时失败关闭，同时保留个人账号后续必需的 organization/project 协议步骤。OpenAPI 与共享配置允许列表不再暴露 K12、pending invite、Team-lite、Business capture 或延迟激活入口。
+- **支付领取与 OAIPay 写入改为显式套餐证明**：外部领取接口只接收缓存元数据明确标记为 Plus 的 Hosted/PayPal 链接，裸 `cashier_url` 或缺失套餐元数据的历史记录不再默认归类为 Plus；OAIPay 的直接上传与所有上层入口共同拒绝当前或最后已知套餐属于 Team/Business/Enterprise 的账号。
+- **解除 Team Manager 运行时耦合**：三个 Compose 入口均移除 Team Manager 代码/数据库只读挂载、外部网络和启动时数据库 bootstrap；Docker 构建上下文同步排除本机 `.bak*` 旧源码备份，避免已下线能力继续被带入发布镜像或通过容器内部依赖意外恢复。
+
+### 测试 (Tests)
+- **新增退役能力负向契约测试**：`tests/test_retired_capabilities_contract.py` 锁定 OpenAPI 路由、共享配置键、支付计划归一化与 GoPay UID 入口，防止 K12、Business、Team 或多 Workspace 产品面被后续改动误加回来；既有注册测试同步改为单账号 two-stage/Auth 契约。
+- **覆盖构建、静态检查与 live smoke**：发布门禁包含 Python compileall、后端 pytest、前端 TypeScript/Vite 生产构建、Compose 渲染、Shell 语法和 diff 检查；上线后分别验证 Plus、Plus2、退役端口、OpenAPI、DNS 以及独立 K12/Team 服务边界。前端版本同步至 `v2.0.0`。
+
 ## [1.4.0] - 2026-07-13
 
 ### 新增 (Added)
@@ -1274,4 +1296,8 @@
 
 ## 2026-07-13 07:42:21 +0800
 - 接入当前 PayPal API 单账号与批量提链
+- 发布模式: multi
+
+## 2026-07-14 08:42:49 +0800
+- 移除 K12、Workspace、Business 与 Team 产品能力并退役 auto-k12 实例
 - 发布模式: multi

@@ -16,7 +16,6 @@ import {
   CopyOutlined,
 } from '@ant-design/icons'
 import { parseBooleanConfigValue } from '@/lib/configValueParsers'
-import { buildChatGPTK12ConfigData } from '@/lib/chatgptK12Config'
 import { apiFetch } from '@/lib/utils'
 
 type ConfigShareState = {
@@ -140,29 +139,6 @@ const TAB_ITEMS = [
           { key: 'dynamic_proxy_require_country_match', label: '要求实测国家匹配', type: 'boolean' },
           { key: 'dynamic_proxy_probe_enabled', label: '运行前探测出口', type: 'boolean' },
           { key: 'dynamic_proxy_probe_timeout_seconds', label: '探测超时秒数', placeholder: '8' },
-        ],
-      },
-      {
-        title: 'K12 / Workspace',
-        desc: '注册阶段加入 K12 工作空间并保存 workspace variants',
-        help: {
-          title: 'K12 配置说明',
-          lines: [
-            'enabled 控制是否在注册链路启用 K12 join；workspace_ids 是目标 workspace_id 列表。',
-            'save_all_spaces 开启后保存本次会话可见的所有空间 variants；关闭时只处理 workspace_ids。',
-            'strict_join 开启后 join/capture 未达预期会让任务显式失败；关闭时只记录部分成功。',
-            'capture_refresh_tokens 是后续精确 RT 捕获预留项；当前稳定链路先保存 AT-only workspace variants。',
-          ],
-        },
-        fields: [
-          { key: 'chatgpt_k12_enabled', label: '启用 K12', type: 'boolean' },
-          { key: 'chatgpt_k12_workspace_ids', label: 'Workspace IDs', type: 'stringList', placeholder: 'ws_xxx，多个用回车/逗号分隔' },
-          { key: 'chatgpt_k12_save_all_spaces', label: '保存所有空间 variants', type: 'boolean' },
-          { key: 'chatgpt_k12_strict_join', label: '严格 join', type: 'boolean' },
-          { key: 'chatgpt_k12_join_timeout_seconds', label: 'Join 超时秒数', placeholder: '60' },
-          { key: 'chatgpt_k12_join_retry_count', label: 'Join 重试次数', placeholder: '2' },
-          { key: 'chatgpt_k12_post_join_poll_seconds', label: 'Join 后轮询秒数', placeholder: '3,8,15' },
-          { key: 'chatgpt_k12_capture_refresh_tokens', label: '抓取 Refresh Token variants（预留）', type: 'boolean', disabled: true },
         ],
       },
     ],
@@ -460,13 +436,9 @@ const TAB_ITEMS = [
         ],
       },
       {
-        title: 'Business / 工作空间',
-        desc: '控制 ChatGPT 注册后是否走 team invite，以及默认抓取哪些工作空间',
+        title: '账号登录凭据',
+        desc: '配置手机号注册、手机号登录和已有账号补抓认证时使用的默认密码',
         fields: [
-          { key: 'chatgpt_enable_team_invite', label: '启用 team invite / business 恢复', type: 'boolean' },
-          { key: 'chatgpt_team_invite_deferred_activation', label: '默认延迟邀请', type: 'boolean' },
-          { key: 'chatgpt_capture_free_workspace', label: '默认抓取 free 工作空间', type: 'boolean' },
-          { key: 'chatgpt_capture_business_workspace', label: '默认抓取 business 工作空间', type: 'boolean' },
           { key: 'chatgpt_phone_signup_password', label: '手机号注册/登录固定密码', secret: true, placeholder: '新手机号注册和已注册手机号登录共用' },
           { key: 'chatgpt_existing_account_login_password', label: '已有账号抓 auth 默认密码', secret: true, placeholder: '可留空，任务里仍可临时覆盖' },
         ],
@@ -701,7 +673,7 @@ const CHATGPT_PIN_GROUPS = [
   },
   {
     label: '账号订阅',
-    titles: ['Business / 工作空间', 'GoPay 账单地址 LLM', '无 RT / Access Token Only', '外部 ChatGPT 分发 API'],
+    titles: ['账号登录凭据', 'GoPay 账单地址 LLM', '无 RT / Access Token Only', '外部 ChatGPT 分发 API'],
   },
   {
     label: '维护验证',
@@ -1212,20 +1184,6 @@ function ConfigField({ field }: { field: FieldConfig }) {
         ? '开启后任务生成动态代理候选时先探测出口 IP/国家；关闭后只做模板改写和 sid 刷新。'
       : field.key === 'dynamic_proxy_probe_timeout_seconds'
         ? '动态代理出口探测超时，建议 6-12 秒。'
-      : field.key === 'chatgpt_k12_workspace_ids'
-        ? '多个 workspace_id 用逗号、空格或回车分隔；启用 K12 且未保存所有空间时必填。'
-      : field.key === 'chatgpt_k12_save_all_spaces'
-        ? '开启后保存本次 OAuth/session 可见的所有 workspace variants，而不只处理指定 workspace_id。'
-      : field.key === 'chatgpt_k12_strict_join'
-        ? '开启后 K12 join 或指定 workspace capture 未达预期会让任务显式失败；关闭时允许部分成功并保存可用 variants。'
-      : field.key === 'chatgpt_k12_join_timeout_seconds'
-        ? 'K12 join 请求超时，默认 60 秒。'
-      : field.key === 'chatgpt_k12_join_retry_count'
-        ? 'K12 join / capture 失败后的重试次数；填 0 表示不重试。'
-      : field.key === 'chatgpt_k12_post_join_poll_seconds'
-        ? 'Join 后重新读取 workspace 列表的等待秒数，支持逗号分隔，例如 3,8,15。'
-      : field.key === 'chatgpt_k12_capture_refresh_tokens'
-        ? '预留开关。当前版本不为每个 K12 workspace 强制重新登录抓 RT，先稳定保存 AT-only variants。'
       : field.key === 'default_executor'
       ? '当前仅对 ChatGPT 生效；支持纯协议、无头浏览器和有头浏览器模式。'
       : field.key === 'icloud_cookie'
@@ -3956,11 +3914,6 @@ export default function Settings() {
       data.cfworker_enabled_domains = parseStoredDomainList(data.cfworker_enabled_domains)
       data.cfworker_random_subdomain = parseBooleanConfigValue(data.cfworker_random_subdomain)
       data.contribution_enabled = parseBooleanConfigValue(data.contribution_enabled)
-      data.chatgpt_enable_team_invite = parseBooleanConfigValue(data.chatgpt_enable_team_invite)
-      data.chatgpt_team_invite_deferred_activation = parseBooleanConfigValue(data.chatgpt_team_invite_deferred_activation)
-      data.chatgpt_capture_free_workspace = data.chatgpt_capture_free_workspace === '' ? true : parseBooleanConfigValue(data.chatgpt_capture_free_workspace)
-      data.chatgpt_capture_business_workspace = data.chatgpt_capture_business_workspace === '' ? true : parseBooleanConfigValue(data.chatgpt_capture_business_workspace)
-      Object.assign(data, buildChatGPTK12ConfigData(data))
       data.chatgpt_gopay_billing_llm_enabled = data.chatgpt_gopay_billing_llm_enabled === '' ? true : parseBooleanConfigValue(data.chatgpt_gopay_billing_llm_enabled)
       data.chatgpt_access_token_only_checkout_amount_check_enabled =
         data.chatgpt_access_token_only_checkout_amount_check_enabled === ''
@@ -4195,11 +4148,6 @@ export default function Settings() {
       values.email_api_gmail_plus_tag_template = String(values.email_api_gmail_plus_tag_template || 'r{rand}').trim() || 'r{rand}'
       values.email_api_default_scheme = String(values.email_api_default_scheme || 'https').trim() || 'https'
       values.contribution_enabled = parseBooleanConfigValue(values.contribution_enabled)
-      values.chatgpt_enable_team_invite = parseBooleanConfigValue(values.chatgpt_enable_team_invite)
-      values.chatgpt_team_invite_deferred_activation = parseBooleanConfigValue(values.chatgpt_team_invite_deferred_activation)
-      values.chatgpt_capture_free_workspace = parseBooleanConfigValue(values.chatgpt_capture_free_workspace)
-      values.chatgpt_capture_business_workspace = parseBooleanConfigValue(values.chatgpt_capture_business_workspace)
-      Object.assign(values, buildChatGPTK12ConfigData(values))
       values.chatgpt_gopay_billing_llm_enabled = parseBooleanConfigValue(values.chatgpt_gopay_billing_llm_enabled)
       values.chatgpt_access_token_only_checkout_amount_check_enabled = parseBooleanConfigValue(
         values.chatgpt_access_token_only_checkout_amount_check_enabled,
@@ -4321,18 +4269,6 @@ export default function Settings() {
         dynamic_proxy_probe_timeout_seconds: values.dynamic_proxy_probe_timeout_seconds,
         dynamic_proxy_ip_retention_minutes: values.dynamic_proxy_ip_retention_minutes,
         contribution_enabled: values.contribution_enabled,
-        chatgpt_enable_team_invite: values.chatgpt_enable_team_invite,
-        chatgpt_team_invite_deferred_activation: values.chatgpt_team_invite_deferred_activation,
-        chatgpt_capture_free_workspace: values.chatgpt_capture_free_workspace,
-        chatgpt_capture_business_workspace: values.chatgpt_capture_business_workspace,
-        chatgpt_k12_enabled: values.chatgpt_k12_enabled,
-        chatgpt_k12_workspace_ids: values.chatgpt_k12_workspace_ids,
-        chatgpt_k12_save_all_spaces: values.chatgpt_k12_save_all_spaces,
-        chatgpt_k12_strict_join: values.chatgpt_k12_strict_join,
-        chatgpt_k12_join_timeout_seconds: values.chatgpt_k12_join_timeout_seconds,
-        chatgpt_k12_join_retry_count: values.chatgpt_k12_join_retry_count,
-        chatgpt_k12_post_join_poll_seconds: values.chatgpt_k12_post_join_poll_seconds,
-        chatgpt_k12_capture_refresh_tokens: values.chatgpt_k12_capture_refresh_tokens,
         chatgpt_gopay_billing_llm_enabled: values.chatgpt_gopay_billing_llm_enabled,
         chatgpt_access_token_only_checkout_amount_check_enabled: values.chatgpt_access_token_only_checkout_amount_check_enabled,
         chatgpt_access_token_only_checkout_country: values.chatgpt_access_token_only_checkout_country,

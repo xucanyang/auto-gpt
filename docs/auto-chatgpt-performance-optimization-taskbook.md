@@ -1,5 +1,9 @@
 # Auto ChatGPT Performance Optimization Taskbook
 
+> Historical implementation plan. K12, multi-Workspace, Business and Team product
+> capabilities referenced below were retired in v2.0.0 and are no longer part of
+> the supported product surface.
+
 ## Scope
 
 This taskbook defines the full optimization plan for the current `auto-chatgpt`
@@ -24,7 +28,6 @@ The plan assumes we keep the current functional scope:
 
 - ChatGPT registration
 - GoPay single/batch payment
-- Team workflows
 - Pipeline workflows
 - Sub2API / CLIProxyAPI / CPA / contribution sync
 - mailbox integrations
