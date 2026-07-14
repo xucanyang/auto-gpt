@@ -1,7 +1,9 @@
 import unittest
 from unittest.mock import patch
+import tempfile
+from pathlib import Path
 
-from fastapi import BackgroundTasks
+from fastapi import BackgroundTasks, HTTPException
 from sqlmodel import SQLModel, create_engine, Session, select
 
 from core import db as core_db
@@ -13,17 +15,22 @@ from services.chatgpt_core import baxigpt_client as client_module
 from services.chatgpt_core import baxigpt_status_poller as poller_module
 from services.chatgpt_core.baxigpt_client import BaxiGptClient, BaxiGptRequestError
 from services.chatgpt_core.baxigpt_cdk_repository import BaxiGptCdkRepository, mask_code
+from core.pix_cdk_usage import PixCdkUsageStore, STATE_PAID
 
 
 class BaxiGptCdkRepositoryTests(unittest.TestCase):
     def setUp(self):
         self.engine = create_engine("sqlite://")
+        self.pix_usage_tmp = tempfile.TemporaryDirectory(prefix="auto-gpt-pix-cdk-usage-")
+        self.pix_usage_store = PixCdkUsageStore(Path(self.pix_usage_tmp.name) / "shared_config.db")
         self.core_engine_patch = patch.object(core_db, "engine", self.engine)
         self.repo_engine_patch = patch.object(repo_module, "engine", self.engine)
         self.tasks_engine_patch = patch.object(tasks_module, "engine", self.engine)
+        self.pix_usage_store_patch = patch.object(tasks_module, "_pix_cdk_usage_store", self.pix_usage_store)
         self.core_engine_patch.start()
         self.repo_engine_patch.start()
         self.tasks_engine_patch.start()
+        self.pix_usage_store_patch.start()
         SQLModel.metadata.create_all(self.engine)
         core_db._ensure_baxigpt_cdk_pool_schema()
 
@@ -34,6 +41,8 @@ class BaxiGptCdkRepositoryTests(unittest.TestCase):
         self.tasks_engine_patch.stop()
         self.repo_engine_patch.stop()
         self.core_engine_patch.stop()
+        self.pix_usage_store_patch.stop()
+        self.pix_usage_tmp.cleanup()
 
     def test_import_keeps_extra_codes_available(self):
         repo = BaxiGptCdkRepository()
@@ -730,6 +739,101 @@ CDK-AAAA-1111
         self.assertIsNotNone(task_log)
         self.assertNotIn(pix_cdk, str(task_log.detail_json))
         self.assertNotIn(status_token, str(task_log.detail_json))
+
+    def test_pix_multiple_cdks_reuse_after_failure_and_lock_after_paid(self):
+        pix_cdk_a = "PIX-MULTI-ALPHA"
+        pix_cdk_b = "PIX-MULTI-BRAVO"
+        with Session(self.engine) as session:
+            account_ids = []
+            for index in range(1, 4):
+                account = AccountModel(
+                    platform="chatgpt",
+                    email=f"pix-multi-{index}@example.com",
+                    password="pw",
+                    token=f"at-pix-multi-{index}",
+                )
+                session.add(account)
+                session.commit()
+                session.refresh(account)
+                account_ids.append(int(account.id or 0))
+
+        result = tasks_module.enqueue_baxigpt_cdk_submit_task(
+            tasks_module.BaxiGptCdkSubmitTaskRequest(
+                account_ids=account_ids,
+                payment_channel="pix",
+                pix_cdk_lines=f"{pix_cdk_a}\n{pix_cdk_b}",
+                submit_interval_seconds=0,
+                status_poll_interval_seconds=1,
+            ),
+            background_tasks=BackgroundTasks(),
+        )
+        snapshot = tasks_module._task_store.snapshot(result["task_id"])
+        self.assertEqual(result["pix_cdk_count"], 2)
+        self.assertEqual(snapshot["meta"]["pix_cdk_input"]["accepted"], 2)
+        self.assertNotIn(pix_cdk_a, str(snapshot))
+        self.assertNotIn(pix_cdk_b, str(snapshot))
+
+        class FakeBaxiClient:
+            submit_calls: list[tuple[str, str]] = []
+
+            def submit_pix(self, *, pix_cdk, access_token):
+                self.__class__.submit_calls.append((pix_cdk, access_token))
+                return {
+                    "ok": True,
+                    "order_id": f"order-{access_token}",
+                    "display_id": f"order-{access_token}",
+                    "status_token": f"status-{access_token}",
+                }
+
+            def pix_status(self, *, task_id, status_token):
+                return {
+                    "ok": True,
+                    "status": "failed" if task_id == "order-at-pix-multi-1" else "paid",
+                    "message": "trial unavailable" if task_id == "order-at-pix-multi-1" else "",
+                }
+
+        runtime_cdks = [
+            {"code": pix_cdk_a, "fingerprint": self.pix_usage_store.fingerprint(pix_cdk_a)},
+            {"code": pix_cdk_b, "fingerprint": self.pix_usage_store.fingerprint(pix_cdk_b)},
+        ]
+        with patch("services.chatgpt_core.baxigpt_client.BaxiGptClient", FakeBaxiClient), \
+             patch.object(tasks_module, "sync_chatgpt_account_local_status", return_value={"status": "subscribed"}), \
+             patch.object(tasks_module, "summarize_status_refresh", return_value={"status": "subscribed"}), \
+             patch.object(tasks_module.time, "sleep", return_value=None):
+            tasks_module._run_pix_submit(
+                result["task_id"],
+                snapshot["meta"]["pairs"],
+                snapshot["meta"]["settings"],
+                runtime_cdks,
+            )
+
+        final_snapshot = tasks_module._task_store.snapshot(result["task_id"])
+        self.assertEqual(final_snapshot["status"], "done")
+        self.assertEqual(final_snapshot["meta"]["idea_submit_summary"]["paid"], 2)
+        self.assertEqual(final_snapshot["meta"]["idea_submit_summary"]["failed"], 1)
+        self.assertEqual(
+            FakeBaxiClient.submit_calls,
+            [
+                (pix_cdk_a, "at-pix-multi-1"),
+                (pix_cdk_b, "at-pix-multi-2"),
+                (pix_cdk_a, "at-pix-multi-3"),
+            ],
+        )
+        states = self.pix_usage_store.states_for([item["fingerprint"] for item in runtime_cdks])
+        self.assertTrue(all(item.state == STATE_PAID for item in states.values()))
+        self.assertNotIn(pix_cdk_a, str(final_snapshot))
+        self.assertNotIn(pix_cdk_b, str(final_snapshot))
+
+        with self.assertRaises(HTTPException) as ctx:
+            tasks_module.enqueue_baxigpt_cdk_submit_task(
+                tasks_module.BaxiGptCdkSubmitTaskRequest(
+                    account_ids=[account_ids[0]],
+                    payment_channel="pix",
+                    pix_cdk_lines=f"{pix_cdk_a}\n{pix_cdk_b}",
+                ),
+                background_tasks=BackgroundTasks(),
+            )
+        self.assertEqual(ctx.exception.status_code, 409)
 
     def test_pix_unknown_submit_outcome_is_not_retried(self):
         pix_cdk = "PIX-SENSITIVE-NO-RETRY"

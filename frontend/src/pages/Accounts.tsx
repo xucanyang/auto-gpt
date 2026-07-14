@@ -3908,6 +3908,7 @@ export default function Accounts() {
       ...savedSettings,
       code_lines: '',
       pix_cdk: '',
+      pix_cdk_lines: '',
       cdk_ids: [],
       target_success_count: 0,
     })
@@ -3968,12 +3969,12 @@ export default function Accounts() {
     saveBaxiGptCdkSettings(values)
     const scope = (values.scope === 'filtered' ? 'filtered' : 'selected') as 'selected' | 'filtered'
     const paymentChannel = values.payment_channel === 'pix' ? 'pix' : 'ideal'
-    const pixCdk = String(values.pix_cdk || '').trim()
+    const pixCdkLines = String(values.pix_cdk_lines || values.pix_cdk || '').trim()
     const codeLines = String(values.code_lines || '').trim()
     const usePool = paymentChannel === 'ideal' && !codeLines && Boolean(values.use_pool)
     const selectedCdkIds = normalizeBaxiCdkIdList(values.cdk_ids)
-    if (paymentChannel === 'pix' && !pixCdk) {
-      message.warning('请输入 PIX CDK')
+    if (paymentChannel === 'pix' && !pixCdkLines) {
+      message.warning('请每行输入一个 PIX CDK')
       return
     }
     if (paymentChannel === 'ideal' && !usePool && !codeLines) {
@@ -3989,7 +3990,7 @@ export default function Accounts() {
       target_success_count: Math.max(Number(values.target_success_count || 0), 0),
     }
     if (paymentChannel === 'pix') {
-      body.pix_cdk = pixCdk
+      body.pix_cdk_lines = pixCdkLines
       body.auto_poll_status = true
     } else {
       body.code_lines = codeLines
@@ -4016,6 +4017,7 @@ export default function Accounts() {
       const availableCodes = Number(res?.available_codes || 0)
       const spareCodes = Number(res?.spare_codes || 0)
       const targetSuccess = Number(res?.effective_target_success_count || 0)
+      const pixCdkCount = Number(res?.pix_cdk_count || 0)
       const importInfo = res?.cdk_pool_import && typeof res.cdk_pool_import === 'object' ? res.cdk_pool_import : {}
       const importErrors = Array.isArray(importInfo?.errors) ? importInfo.errors : []
 
@@ -4029,18 +4031,20 @@ export default function Accounts() {
         if (res && typeof res === 'object') {
           showBatchActionResult(`${paymentChannel === 'pix' ? 'PIX' : 'iDEAL'} 批量提交结果`, res)
         }
+        if (paymentChannel === 'pix') baxiCdkSubmitForm.setFieldValue('pix_cdk_lines', '')
         if (paymentChannel === 'ideal') await loadBaxiCdkPoolSummary()
         return
       }
 
       const snapshot = await apiFetch(`/tasks/${taskIdFromResponse}`)
+      if (paymentChannel === 'pix') baxiCdkSubmitForm.setFieldValue('pix_cdk_lines', '')
       setBaxiCdkSubmitOpen(false)
       setTaskModalMode('baxigpt_cdk')
       setTaskModalAccount({
         email: targetSuccess > 0
           ? `${paymentChannel === 'pix' ? 'PIX' : 'iDEAL'} 批量提交：目标成功 ${targetSuccess} / 候选 ${pairCount}`
           : paymentChannel === 'pix'
-            ? `PIX 批量提交：${pairCount} 个候选账号`
+            ? `PIX 批量提交：${pairCount} 个候选账号 / ${pixCdkCount} 个 CDK`
             : `iDEAL 批量提交：${pairCount} 对 / 库存余 ${spareCodes}`,
       })
       setTaskId(taskIdFromResponse)
@@ -4051,7 +4055,7 @@ export default function Accounts() {
       if (paymentChannel === 'ideal') void loadBaxiCdkPoolSummary()
       message.success({
         content: paymentChannel === 'pix'
-          ? `PIX 批量提交已启动：${pairCount} 个候选账号${targetSuccess > 0 ? `，目标成功 ${targetSuccess} 个` : ''}，账号将逐个提交并集中轮询。`
+          ? `PIX 批量提交已启动：${pairCount} 个候选账号，${pixCdkCount} 个 CDK${targetSuccess > 0 ? `，目标成功 ${targetSuccess} 个` : ''}。明确失败会释放 CDK，成功核销后不再复用。`
           : `iDEAL 批量提交已启动：${pairCount} 个候选配对${targetSuccess > 0 ? `，目标成功 ${targetSuccess} 个` : ''}，候选账号 ${eligible} 个，可用卡密 ${availableCodes} 个${spareCodes > 0 ? `，剩余入库 ${spareCodes} 个` : ''}${importErrors.length > 0 ? `，解析跳过 ${importErrors.length} 行` : ''}`,
         key: toastKey,
       })
@@ -4060,8 +4064,11 @@ export default function Accounts() {
       }
     } catch (e: any) {
       const rawError = String(e?.message || '请求失败')
-      const safeError = paymentChannel === 'pix' && pixCdk
-        ? rawError.split(pixCdk).join('[REDACTED]')
+      const safeError = paymentChannel === 'pix'
+        ? pixCdkLines.split(/\r?\n/).map((item) => item.trim()).filter(Boolean).reduce(
+          (text, cdk) => text.split(cdk).join('[REDACTED]'),
+          rawError,
+        )
         : rawError
       message.error({ content: `${paymentChannel === 'pix' ? 'PIX' : 'iDEAL'} 批量提交失败: ${safeError}`, key: toastKey })
     } finally {
@@ -8391,7 +8398,10 @@ export default function Accounts() {
       <Modal
         title="iDEAL / PIX 批量提交"
         open={baxiCdkSubmitOpen}
-        onCancel={() => setBaxiCdkSubmitOpen(false)}
+        onCancel={() => {
+          baxiCdkSubmitForm.setFieldsValue({ pix_cdk: '', pix_cdk_lines: '' })
+          setBaxiCdkSubmitOpen(false)
+        }}
         onOk={submitBaxiCdkSubmit}
         confirmLoading={baxiCdkSubmitLoading}
         okText="开始提交"
@@ -8414,7 +8424,7 @@ export default function Accounts() {
                 : `范围：当前筛选结果 ${total} 个账号`
             }
             description={baxiIsPix
-              ? 'PIX 按账号逐个提交到上游并集中轮询；PIX CDK 仅用于本次任务，不写入卡密池或账号记录。'
+              ? 'PIX 每行一个 CDK。明确失败会释放该 CDK 继续尝试，成功核销后全局不再复用；未知结果保持待复核锁定。'
               : 'iDEAL 提交成功指上游 /api/submit 返回 ok 和 order_id；不会阻塞等待 paid，默认会把订单加入后台轮询，查到状态后同步卡密池和绑定账号。'}
           />
           <div
@@ -8437,7 +8447,9 @@ export default function Accounts() {
             <Form.Item
               name="target_success_count"
               label="本次目标成功数量"
-              extra="0 表示按账号范围尽量全部提交；填写后达到目标 paid 数就停止继续提交新账号。"
+              extra={baxiIsPix
+                ? '0 表示每个可用 PIX CDK 最多核销成功一次；填写后达到目标 paid 数就停止继续提交新账号。'
+                : '0 表示按账号范围尽量全部提交；填写后达到目标 paid 数就停止继续提交新账号。'}
             >
               <InputNumber
                 min={0}
@@ -8460,6 +8472,7 @@ export default function Accounts() {
               ]}
               onChange={() => {
                 baxiCdkSubmitForm.setFieldValue('pix_cdk', '')
+                baxiCdkSubmitForm.setFieldValue('pix_cdk_lines', '')
                 setBaxiCdkManualOpen(false)
               }}
             />
@@ -8476,16 +8489,17 @@ export default function Accounts() {
               }}
             >
               <Form.Item
-                name="pix_cdk"
-                label="PIX CDK"
-                rules={[{ required: true, whitespace: true, message: '请输入 PIX CDK' }]}
+                name="pix_cdk_lines"
+                label="PIX CDK（每行一个）"
+                rules={[{ required: true, whitespace: true, message: '请每行输入一个 PIX CDK' }]}
                 style={{ marginBottom: 0 }}
-                extra="本次提交结束后不会保存在浏览器、本地卡密池、任务详情或账号字段。"
+                extra="最多 100 个。明确失败会释放 CDK 继续尝试；支付成功、处理中或待复核的 CDK 不会再次提交。"
               >
-                <Input.Password
+                <Input.TextArea
                   autoComplete="off"
-                  placeholder="输入本次 PIX CDK"
-                  visibilityToggle
+                  placeholder={'PIX-CDK-1\nPIX-CDK-2'}
+                  autoSize={{ minRows: 4, maxRows: 10 }}
+                  spellCheck={false}
                 />
               </Form.Item>
             </div>

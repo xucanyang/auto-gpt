@@ -17,11 +17,12 @@ DEFAULT_WORKER_TOKEN = os.environ.get("OAIPAY_WORKER_TOKEN", "xucanyang")
 class BaxiGptRequestError(RuntimeError):
     """Upstream request failure with submit-retry safety information."""
 
-    def __init__(self, message: str, *, request_outcome_unknown: bool = False):
+    def __init__(self, message: str, *, request_outcome_unknown: bool = False, http_status: int = 0):
         super().__init__(message)
         # A transport failure can happen after the upstream has accepted a PIX
         # task. Callers must not submit the same account/CDK pair again.
         self.request_outcome_unknown = bool(request_outcome_unknown)
+        self.http_status = int(http_status or 0)
 
 
 def _email_from_jwt(token: str) -> str:
@@ -153,7 +154,10 @@ class BaxiGptClient:
 
             if response.status_code >= 400:
                 text = str(getattr(response, "text", "") or "")[:500]
-                error = BaxiGptRequestError(f"上游 HTTP {response.status_code}: {text}")
+                error = BaxiGptRequestError(
+                    f"上游 HTTP {response.status_code}: {text}",
+                    http_status=int(response.status_code or 0),
+                )
                 last_error = error
                 if attempt < attempts and response.status_code in {408, 425, 429, 500, 502, 503, 504}:
                     self._sleep_before_retry(attempt)
@@ -357,6 +361,7 @@ class BaxiGptClient:
             raise BaxiGptRequestError(
                 _redact_sensitive_text(exc, cdk),
                 request_outcome_unknown=exc.request_outcome_unknown,
+                http_status=exc.http_status,
             ) from exc
 
         created_tasks = [
@@ -408,6 +413,7 @@ class BaxiGptClient:
             raise BaxiGptRequestError(
                 _redact_sensitive_text(exc, token),
                 request_outcome_unknown=exc.request_outcome_unknown,
+                http_status=exc.http_status,
             ) from exc
 
         tasks = res.get("tasks") if isinstance(res.get("tasks"), list) else []

@@ -10,6 +10,12 @@ from sqlmodel import Session, select
 from typing import Any, Optional
 from copy import deepcopy
 from core.db import AccountModel, TaskLog, engine
+from core.pix_cdk_usage import (
+    STATE_BLOCKED as PIX_CDK_STATE_BLOCKED,
+    STATE_PAID as PIX_CDK_STATE_PAID,
+    STATE_RESERVED as PIX_CDK_STATE_RESERVED,
+    PixCdkUsageStore,
+)
 from core.task_runtime import (
     AttemptOutcome,
     AttemptResult,
@@ -79,6 +85,7 @@ _task_store = RegisterTaskStore(
     max_finished_tasks=MAX_FINISHED_TASKS,
     cleanup_threshold=CLEANUP_THRESHOLD,
 )
+_pix_cdk_usage_store = PixCdkUsageStore()
 
 _TASK_STAGE_STARTED_AT: dict[tuple[str, str], str] = {}
 
@@ -298,7 +305,8 @@ class BaxiGptCdkSubmitTaskRequest(AccountFilterRequestMixin):
     code_lines: str = ""
     # PIX CDK only survives in the task-start call stack; it must never enter
     # task snapshots, logs, account extras, or the iDEAL CDK pool.
-    pix_cdk: str = ""
+    pix_cdk: str = ""  # Legacy single-value field.
+    pix_cdk_lines: str = ""  # PIX only: one CDK per line.
     use_pool: bool = True
     precheck: bool = True
     failure_continue: bool = True
@@ -3852,6 +3860,74 @@ def enqueue_batch_oaipay_upload_task(
     }
 
 
+PIX_CDK_MAX_LINES = 100
+PIX_CDK_MAX_LINE_LENGTH = 512
+
+
+def _parse_pix_cdk_lines(req: BaxiGptCdkSubmitTaskRequest) -> tuple[list[dict[str, str]], dict[str, int]]:
+    """Parse transient PIX CDKs without letting their plaintext reach task data."""
+    raw = str(req.pix_cdk_lines or req.pix_cdk or "")
+    if len(raw) > PIX_CDK_MAX_LINES * (PIX_CDK_MAX_LINE_LENGTH + 2):
+        raise HTTPException(400, "PIX CDK 输入长度超限")
+
+    parsed: list[dict[str, str]] = []
+    seen: set[str] = set()
+    non_empty = duplicate_count = invalid_count = 0
+    for line in raw.splitlines() or [raw]:
+        code = str(line or "").strip()
+        if not code:
+            continue
+        non_empty += 1
+        if len(code) > PIX_CDK_MAX_LINE_LENGTH:
+            invalid_count += 1
+            continue
+        fingerprint = _pix_cdk_usage_store.fingerprint(code)
+        if not fingerprint:
+            invalid_count += 1
+            continue
+        if fingerprint in seen:
+            duplicate_count += 1
+            continue
+        seen.add(fingerprint)
+        parsed.append({"code": code, "fingerprint": fingerprint})
+
+    if non_empty <= 0:
+        raise HTTPException(400, "请每行输入一个 PIX CDK")
+    if len(parsed) > PIX_CDK_MAX_LINES:
+        raise HTTPException(400, f"单次最多输入 {PIX_CDK_MAX_LINES} 个 PIX CDK")
+
+    existing = _pix_cdk_usage_store.states_for([item["fingerprint"] for item in parsed])
+    accepted: list[dict[str, str]] = []
+    paid = occupied = blocked = 0
+    for item in parsed:
+        usage = existing.get(item["fingerprint"])
+        state = str(usage.state if usage else "")
+        if state == PIX_CDK_STATE_PAID:
+            paid += 1
+        elif state in {PIX_CDK_STATE_RESERVED, "uncertain"}:
+            occupied += 1
+        elif state == PIX_CDK_STATE_BLOCKED:
+            blocked += 1
+        else:
+            accepted.append(item)
+
+    stats = {
+        "input": non_empty,
+        "accepted": len(accepted),
+        "duplicate": duplicate_count,
+        "invalid": invalid_count,
+        "paid": paid,
+        "occupied": occupied,
+        "blocked": blocked,
+    }
+    if not accepted:
+        raise HTTPException(
+            409,
+            "没有可使用的 PIX CDK：已成功核销、处理中或待人工复核的 CDK 不能再次提交",
+        )
+    return accepted, stats
+
+
 def enqueue_pix_submit_task(
     req: BaxiGptCdkSubmitTaskRequest,
     *,
@@ -3859,16 +3935,13 @@ def enqueue_pix_submit_task(
 ) -> dict[str, Any]:
     """Queue PIX auto-extract without using the iDEAL CDK pool.
 
-    ``pix_cdk`` intentionally remains a local value and is passed straight to
-    the background runner.  All persisted task metadata uses only the fixed
-    ``PIX CDK`` label, never the submitted credential or status token.
+    The plaintext CDKs exist only in ``pix_cdks`` and the worker call stack.
+    A keyed fingerprint is registered only after the upstream confirms paid;
+    explicit failures release the reservation so that CDK can serve another
+    account in the same or a later task.
     """
 
-    pix_cdk = str(req.pix_cdk or "").strip()
-    if not pix_cdk:
-        raise HTTPException(400, "请输入 PIX CDK")
-    if len(pix_cdk) > 4096:
-        raise HTTPException(400, "PIX CDK 长度超限")
+    pix_cdks, pix_cdk_input = _parse_pix_cdk_lines(req)
 
     account_items, missing_ids, skipped_accounts, matched_accounts = _resolve_baxigpt_cdk_submit_accounts(req)
     total_requested_accounts = len(_normalize_batch_account_ids(req.account_ids)) if req.account_ids else len(matched_accounts)
@@ -3890,7 +3963,13 @@ def enqueue_pix_submit_task(
         for account in account_items
     ]
     pair_count = len(pairs)
-    effective_target_success_count = min(requested_target_success_count, pair_count) if requested_target_success_count > 0 else 0
+    pix_cdk_count = len(pix_cdks)
+    max_success_count = min(pair_count, pix_cdk_count)
+    effective_target_success_count = (
+        min(requested_target_success_count, max_success_count)
+        if requested_target_success_count > 0
+        else max_success_count
+    )
     if pair_count <= 0:
         return {
             "task_id": "",
@@ -3899,6 +3978,8 @@ def enqueue_pix_submit_task(
             "matched_accounts": len(matched_accounts),
             "eligible_accounts": len(account_items),
             "available_codes": 0,
+            "pix_cdk_input": pix_cdk_input,
+            "pix_cdk_count": pix_cdk_count,
             "selected_cdk_ids": [],
             "pairs": [],
             "pair_count": 0,
@@ -3929,6 +4010,8 @@ def enqueue_pix_submit_task(
         "account_ids": [int(item["account_id"]) for item in account_items],
         "emails": [str(item["email"] or "") for item in account_items],
         "available_codes": 0,
+        "pix_cdk_input": dict(pix_cdk_input),
+        "pix_cdk_count": pix_cdk_count,
         "selected_cdk_ids": [],
         "pair_count": pair_count,
         "target_success_count": requested_target_success_count,
@@ -3942,6 +4025,8 @@ def enqueue_pix_submit_task(
         "settings": {
             "payment_channel": "pix",
             "pix_cdk_configured": True,
+            "pix_cdk_count": pix_cdk_count,
+            "pix_cdk_input": dict(pix_cdk_input),
             "failure_continue": bool(req.failure_continue),
             "submit_interval_seconds": submit_interval_seconds,
             "auto_poll_status": True,
@@ -3979,12 +4064,12 @@ def enqueue_pix_submit_task(
     if background_tasks is None:
         thread = threading.Thread(
             target=_run_pix_submit,
-            args=(task_id, pairs, dict(meta["settings"]), pix_cdk),
+            args=(task_id, pairs, dict(meta["settings"]), pix_cdks),
             daemon=True,
         )
         thread.start()
     else:
-        background_tasks.add_task(_run_pix_submit, task_id, pairs, dict(meta["settings"]), pix_cdk)
+        background_tasks.add_task(_run_pix_submit, task_id, pairs, dict(meta["settings"]), pix_cdks)
 
     return {
         "task_id": task_id,
@@ -3993,6 +4078,8 @@ def enqueue_pix_submit_task(
         "matched_accounts": len(matched_accounts),
         "eligible_accounts": len(account_items),
         "available_codes": 0,
+        "pix_cdk_input": pix_cdk_input,
+        "pix_cdk_count": pix_cdk_count,
         "selected_cdk_ids": [],
         "pair_count": pair_count,
         "target_success_count": requested_target_success_count,
@@ -6588,14 +6675,14 @@ def _run_pix_submit(
     task_id: str,
     pairs: list[dict[str, Any]],
     settings: dict[str, Any],
-    pix_cdk: str,
+    pix_cdks: list[dict[str, str]],
 ) -> None:
     """Run PIX auto-extract tasks while keeping the CDK and status tokens in memory.
 
     The upstream requires one account per PIX request and returns a one-time
-    status token. Persisting that token would make it an account/task secret;
-    losing it after a process restart is preferable to persisting it in any
-    operator-visible store. Unknown submit outcomes are never retried.
+    status token. Each CDK has at most one paid terminal outcome; explicit
+    failures release it for another account, while uncertain outcomes remain
+    locked for manual reconciliation.
     """
 
     from services.chatgpt_core.baxigpt_client import BaxiGptClient, BaxiGptRequestError
@@ -6603,8 +6690,23 @@ def _run_pix_submit(
     control = _task_store.control_for(task_id)
     client = BaxiGptClient()
     requested_target_success_count = max(int(settings.get("target_success_count") or 0), 0)
-    target_success_count = min(requested_target_success_count, len(pairs)) if requested_target_success_count > 0 else 0
-    total = max(target_success_count or len(pairs), 1)
+    raw_pix_cdks = (
+        [{"code": str(pix_cdks or "").strip(), "fingerprint": _pix_cdk_usage_store.fingerprint(pix_cdks)}]
+        if isinstance(pix_cdks, str)
+        else list(pix_cdks or [])
+    )
+    pix_cdk_label_count = len(raw_pix_cdks)
+    pix_cdks = [
+        {
+            "code": str(item.get("code") or "").strip(),
+            "fingerprint": str(item.get("fingerprint") or "").strip(),
+            "label": f"PIX CDK #{index}" if pix_cdk_label_count > 1 else "PIX CDK",
+        }
+        for index, item in enumerate(raw_pix_cdks, start=1)
+        if str(item.get("code") or "").strip() and str(item.get("fingerprint") or "").strip()
+    ]
+    target_success_count = min(requested_target_success_count, len(pairs), len(pix_cdks)) if requested_target_success_count > 0 else min(len(pairs), len(pix_cdks))
+    total = max(target_success_count, 1)
     submitted_count = 0
     success_count = 0
     timeout_count = 0
@@ -6623,7 +6725,7 @@ def _run_pix_submit(
 
     def safe_text(value: Any, *status_tokens: Any) -> str:
         text = str(value or "")
-        for secret in (pix_cdk, *status_tokens):
+        for secret in ([item["code"] for item in pix_cdks], *status_tokens):
             secret_text = str(secret or "").strip()
             if secret_text:
                 text = text.replace(secret_text, "[REDACTED]")
@@ -6804,6 +6906,36 @@ def _run_pix_submit(
             time.sleep(chunk)
             remaining -= chunk
 
+    def release_cdk(cdk: dict[str, str], account_id: int, *, reusable: bool, requeue: bool) -> None:
+        """Release only an explicitly failed CDK reservation back to this run."""
+        try:
+            if reusable:
+                _pix_cdk_usage_store.release(
+                    cdk["fingerprint"], task_id=task_id, account_id=account_id,
+                )
+                if requeue:
+                    available_cdks.append(cdk)
+            else:
+                _pix_cdk_usage_store.mark_blocked(
+                    cdk["fingerprint"], task_id=task_id, account_id=account_id,
+                )
+        except Exception as exc:
+            _log(task_id, f"[PIX][WARN] CDK 状态同步失败: {safe_text(exc)}")
+
+    def lock_cdk_for_review(cdk: dict[str, str], account_id: int, *, order_id: str = "") -> None:
+        try:
+            _pix_cdk_usage_store.mark_uncertain(
+                cdk["fingerprint"], task_id=task_id, account_id=account_id, order_id=order_id,
+            )
+        except Exception as exc:
+            _log(task_id, f"[PIX][WARN] CDK 待复核锁定失败: {safe_text(exc)}")
+
+    def cdk_error_is_terminal(reason: str) -> bool:
+        lower = str(reason or "").lower()
+        return any(marker in lower for marker in (
+            "cdk_used", "cdk_invalid", "cdk_disabled", "卡密已使用", "卡密无效", "卡密已禁用",
+        ))
+
     def mark_remaining_unsubmitted(pending_accounts: list[dict[str, Any]], reason: str) -> None:
         nonlocal skipped_count
         while pending_accounts:
@@ -6823,7 +6955,7 @@ def _run_pix_submit(
     _log(
         task_id,
         "[PIX] 自动提链任务启动: "
-        f"候选 {len(pairs)} 个，目标成功 {target_success_count or '不限'}，"
+        f"候选 {len(pairs)} 个，CDK {len(pix_cdks)} 个，目标成功 {target_success_count} 个，"
         f"提交间隔 {submit_interval_seconds}s，轮询间隔 {status_poll_interval_seconds}s",
     )
     for missing_id in missing_ids:
@@ -6833,6 +6965,7 @@ def _run_pix_submit(
         _log(task_id, f"[SKIP] {item.get('email') or item.get('account_id') or '-'} - {item.get('reason') or '已跳过'}")
 
     pending_accounts = [dict(pair) for pair in pairs]
+    available_cdks = list(pix_cdks)
     active_orders: list[dict[str, Any]] = []
     stop_new_submissions = False
     attempt_id: int | None = None
@@ -6848,14 +6981,16 @@ def _run_pix_submit(
                 )
             if stop_new_submissions and pending_accounts:
                 mark_remaining_unsubmitted(pending_accounts, "失败后继续已关闭，停止后续 PIX 提交")
+            if pending_accounts and not active_orders and not available_cdks:
+                mark_remaining_unsubmitted(pending_accounts, "没有可继续使用的 PIX CDK")
 
             # A target count is a submit window: do not create more in-flight
             # PIX tasks than can still contribute to the target.
-            while pending_accounts and not stop_new_submissions and not target_reached:
+            while pending_accounts and available_cdks and not stop_new_submissions and not target_reached:
                 if target_success_count > 0 and len(active_orders) >= max(target_success_count - success_count, 0):
                     break
                 control.checkpoint(attempt_id=attempt_id)
-                item = pending_accounts.pop(0)
+                item = pending_accounts[0]
                 account_id = int(item.get("account_id") or 0)
                 email = str(item.get("email") or "")
                 if not primary_email and email:
@@ -6872,6 +7007,7 @@ def _run_pix_submit(
                         if not skip_reason and not token:
                             skip_reason = "账号缺少 Access Token"
                 if skip_reason:
+                    pending_accounts.pop(0)
                     skipped_count += 1
                     _log(task_id, f"[UNSUBMITTED][PIX] {email or account_id} - {skip_reason}")
                     append_result(
@@ -6885,9 +7021,17 @@ def _run_pix_submit(
                     )
                     continue
 
+                cdk = available_cdks.pop(0)
+                usage = _pix_cdk_usage_store.reserve(
+                    cdk["fingerprint"], task_id=task_id, account_id=account_id,
+                )
+                if usage.state != PIX_CDK_STATE_RESERVED or usage.task_id != task_id or usage.account_id != account_id:
+                    _log(task_id, f"[SKIP][PIX] {cdk['label']} 已成功核销、处理中或待复核，跳过该 CDK")
+                    continue
+                pending_accounts.pop(0)
                 _log(task_id, f"[PIX] 提交上游: {email or account_id}")
                 try:
-                    submit_result = client.submit_pix(pix_cdk=pix_cdk, access_token=token)
+                    submit_result = client.submit_pix(pix_cdk=cdk["code"], access_token=token)
                     if not bool(submit_result.get("ok")):
                         reason = safe_text(submit_result.get("message") or "PIX 上游提交失败")
                         unknown = bool(submit_result.get("submission_unknown"))
@@ -6904,11 +7048,12 @@ def _run_pix_submit(
                                 account_id=account_id,
                                 email=email,
                                 cdk_id=0,
-                                code_masked="PIX CDK",
+                                code_masked=cdk["label"],
                                 payment_channel="pix",
                                 status="timeout",
                                 reason=reason,
                             )
+                            lock_cdk_for_review(cdk, account_id)
                         else:
                             errors.append(f"{email or account_id}: {reason}")
                             should_mark_unavailable = _is_idea_account_unavailable_reason(reason)
@@ -6923,11 +7068,18 @@ def _run_pix_submit(
                                 account_id=account_id,
                                 email=email,
                                 cdk_id=0,
-                                code_masked="PIX CDK",
+                                code_masked=cdk["label"],
                                 payment_channel="pix",
                                 status="failed",
                                 reason=reason,
                                 idea_marked_unavailable=should_mark_unavailable,
+                            )
+                            terminal_cdk_error = cdk_error_is_terminal(reason)
+                            release_cdk(
+                                cdk,
+                                account_id,
+                                reusable=not terminal_cdk_error,
+                                requeue=failure_continue and not terminal_cdk_error,
                             )
                         if not failure_continue:
                             stop_new_submissions = True
@@ -6948,7 +7100,7 @@ def _run_pix_submit(
                         account_id=account_id,
                         email=email,
                         cdk_id=0,
-                        code_masked="PIX CDK",
+                        code_masked=cdk["label"],
                         payment_channel="pix",
                         status="submitted",
                         order_id=order_id,
@@ -6961,6 +7113,7 @@ def _run_pix_submit(
                             "order_id": order_id,
                             "display_id": display_id,
                             "status_token": status_token,
+                            "cdk": cdk,
                             "submitted_at": time.time(),
                             "timeout_warned": False,
                         }
@@ -6984,11 +7137,12 @@ def _run_pix_submit(
                             account_id=account_id,
                             email=email,
                             cdk_id=0,
-                            code_masked="PIX CDK",
+                            code_masked=cdk["label"],
                             payment_channel="pix",
                             status="timeout",
                             reason=reason,
                         )
+                        lock_cdk_for_review(cdk, account_id)
                     else:
                         errors.append(f"{email or account_id}: {reason}")
                         should_mark_unavailable = _is_idea_account_unavailable_reason(reason)
@@ -7003,35 +7157,45 @@ def _run_pix_submit(
                             account_id=account_id,
                             email=email,
                             cdk_id=0,
-                            code_masked="PIX CDK",
+                            code_masked=cdk["label"],
                             payment_channel="pix",
                             status="failed",
                             reason=reason,
                             idea_marked_unavailable=should_mark_unavailable,
+                        )
+                        terminal_cdk_error = cdk_error_is_terminal(reason)
+                        release_cdk(
+                            cdk,
+                            account_id,
+                            reusable=not terminal_cdk_error,
+                            requeue=failure_continue and not terminal_cdk_error,
                         )
                     if not failure_continue:
                         stop_new_submissions = True
                 except Exception as exc:
                     reason = safe_text(exc or "PIX 提交失败")
                     errors.append(f"{email or account_id}: {reason}")
-                    should_mark_unavailable = _is_idea_account_unavailable_reason(reason)
+                    # An untyped exception may have happened after the request
+                    # left this process; keep this CDK locked rather than risk
+                    # a duplicate charge.
                     persist_account_state(
                         account_id,
                         status="failed",
                         reason=reason,
-                        mark_unavailable=should_mark_unavailable,
+                        mark_unavailable=False,
                     )
                     _log(task_id, f"[FAIL][PIX] {email or account_id} - {reason}")
                     append_result(
                         account_id=account_id,
                         email=email,
                         cdk_id=0,
-                        code_masked="PIX CDK",
+                        code_masked=cdk["label"],
                         payment_channel="pix",
                         status="failed",
                         reason=reason,
-                        idea_marked_unavailable=should_mark_unavailable,
+                        idea_marked_unavailable=False,
                     )
+                    lock_cdk_for_review(cdk, account_id)
                     if not failure_continue:
                         stop_new_submissions = True
 
@@ -7047,6 +7211,7 @@ def _run_pix_submit(
                 order_id = str(order["order_id"])
                 display_id = str(order.get("display_id") or order_id)
                 status_token = str(order["status_token"])
+                cdk = dict(order.get("cdk") or {})
                 try:
                     status_result = client.pix_status(task_id=order_id, status_token=status_token)
                 except BaxiGptRequestError as exc:
@@ -7059,6 +7224,15 @@ def _run_pix_submit(
                 status_value = _normalize_idea_submit_result_status(status_result.get("status"))
                 reason = safe_text(status_result.get("message"), status_token)
                 if status_value == "paid":
+                    try:
+                        _pix_cdk_usage_store.mark_paid(
+                            cdk["fingerprint"], task_id=task_id, account_id=account_id, order_id=order_id,
+                        )
+                    except Exception as exc:
+                        # The upstream is already paid. Keep this CDK locked
+                        # instead of creating a reuse opportunity on a DB hiccup.
+                        lock_cdk_for_review(cdk, account_id, order_id=order_id)
+                        _log(task_id, f"[PIX][WARN] 成功 CDK 核销登记异常: {safe_text(exc)}")
                     success_count += 1
                     local_status_summary = refresh_paid_account_local_status(account_id, order_id, display_id)
                     _log(task_id, f"[OK][PIX] 开通成功: {email or account_id} task={display_id}")
@@ -7066,7 +7240,7 @@ def _run_pix_submit(
                         account_id=account_id,
                         email=email,
                         cdk_id=0,
-                        code_masked="PIX CDK",
+                        code_masked=str(cdk.get("label") or "PIX CDK"),
                         payment_channel="pix",
                         status="paid",
                         order_id=order_id,
@@ -7090,13 +7264,19 @@ def _run_pix_submit(
                         account_id=account_id,
                         email=email,
                         cdk_id=0,
-                        code_masked="PIX CDK",
+                        code_masked=str(cdk.get("label") or "PIX CDK"),
                         payment_channel="pix",
                         status="failed",
                         order_id=order_id,
                         display_id=display_id,
                         reason=reason,
                         idea_marked_unavailable=should_mark_unavailable,
+                    )
+                    release_cdk(
+                        cdk,
+                        account_id,
+                        reusable=True,
+                        requeue=failure_continue,
                     )
                     if not failure_continue:
                         stop_new_submissions = True
@@ -7116,13 +7296,14 @@ def _run_pix_submit(
                         account_id=account_id,
                         email=email,
                         cdk_id=0,
-                        code_masked="PIX CDK",
+                        code_masked=str(cdk.get("label") or "PIX CDK"),
                         payment_channel="pix",
                         status="timeout",
                         order_id=order_id,
                         display_id=display_id,
                         reason=reason,
                     )
+                    lock_cdk_for_review(cdk, account_id, order_id=order_id)
                 else:
                     if time.time() - float(order["submitted_at"]) > status_poll_timeout_seconds and not order.get("timeout_warned"):
                         order["timeout_warned"] = True
@@ -7160,7 +7341,8 @@ def _run_pix_submit(
         failed_total = int(summary.get("failed") or 0)
         timeout_total = int(summary.get("timeout") or 0)
         unsubmitted_total = int(summary.get("unsubmitted") or 0)
-        log_status = "success" if success_count > 0 and not errors and failed_total == 0 and timeout_total == 0 else "failed"
+        target_completed = target_success_count > 0 and success_count >= target_success_count
+        log_status = "success" if target_completed and timeout_total == 0 else "failed"
         finish_error = "" if log_status == "success" else summary_message
         _task_store.finish(
             task_id,
@@ -7228,6 +7410,14 @@ def _run_pix_submit(
             ),
         )
     finally:
+        for order in active_orders:
+            cdk = order.get("cdk") if isinstance(order.get("cdk"), dict) else {}
+            if cdk:
+                lock_cdk_for_review(
+                    dict(cdk),
+                    int(order.get("account_id") or 0),
+                    order_id=str(order.get("order_id") or ""),
+                )
         if attempt_id is not None:
             control.finish_attempt(attempt_id)
         _clear_task_current(task_id)
