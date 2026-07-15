@@ -116,6 +116,7 @@ type PhonePoolBatchAction = 'delete' | 'reset' | 'disable'
 type ApiExpiryRefreshScope = 'selected' | 'page' | 'record' | 'all'
 type ApiExpiryFilter = '' | 'unchecked' | 'ok' | 'missing' | 'error' | 'expired' | 'soon7' | 'soon30'
 type TaskEligibilityFilter = '' | 'eligible' | 'prefix_blocked' | 'self_blocked'
+type PhoneBindingFilter = '' | 'bound' | 'unbound'
 
 type PhonePoolDiagnostics = {
   item?: PhonePoolItem
@@ -213,6 +214,12 @@ const TASK_ELIGIBILITY_FILTER_OPTIONS = [
   { value: 'prefix_blocked', label: '号段跳过' },
   { value: 'self_blocked', label: '自身不可用' },
 ] as const
+
+const PHONE_BINDING_FILTER_OPTIONS = [
+  { value: '', label: '全部绑定情况' },
+  { value: 'bound', label: '已绑定' },
+  { value: 'unbound', label: '未绑定' },
+]
 
 const PREFIX_STATUS_META: Record<string, { color: string; label: string }> = {
   available: { color: 'success', label: '号段可用' },
@@ -324,6 +331,18 @@ function matchesApiExpiryFilter(record: PhonePoolItem, filter: ApiExpiryFilter) 
   if (filter === 'soon30') return meta.key === 'soon7' || meta.key === 'soon30'
   if (filter === 'ok') return Boolean(String(record.api_expired_date || '').trim())
   return meta.key === filter
+}
+
+function isPhoneBound(record: PhonePoolItem) {
+  if (Number(record.bound_count || 0) > 0) return true
+  return Array.isArray(record.bound_account_emails)
+    && record.bound_account_emails.some((email) => Boolean(String(email || '').trim()))
+}
+
+function matchesPhoneBindingFilter(record: PhonePoolItem, filter: PhoneBindingFilter) {
+  if (!filter) return true
+  const bound = isPhoneBound(record)
+  return filter === 'bound' ? bound : !bound
 }
 
 function statusTag(status: string, tooltip?: string) {
@@ -649,6 +668,7 @@ export default function PhonePool() {
   const [statusFilter, setStatusFilter] = useState('')
   const [apiExpiryFilter, setApiExpiryFilter] = useState<ApiExpiryFilter>('')
   const [taskEligibilityFilter, setTaskEligibilityFilter] = useState<TaskEligibilityFilter>('')
+  const [phoneBindingFilter, setPhoneBindingFilter] = useState<PhoneBindingFilter>('')
   const [phoneSearch, setPhoneSearch] = useState('')
   const [currentPage, setCurrentPage] = useState(1)
   const [selectedRowKeys, setSelectedRowKeys] = useState<number[]>([])
@@ -1186,22 +1206,35 @@ export default function PhonePool() {
     const query = phoneSearch.replace(/\D/g, '')
     return items.filter((item) => {
       if (query && !String(item.phone_e164 || '').replace(/\D/g, '').includes(query)) return false
+      if (!matchesPhoneBindingFilter(item, phoneBindingFilter)) return false
       if (!matchesApiExpiryFilter(item, apiExpiryFilter)) return false
       if (taskEligibilityFilter === 'eligible') return Boolean(item.ordinary_task_eligible)
       if (taskEligibilityFilter === 'prefix_blocked') return Boolean(item.self_available) && String(item.ordinary_task_block_reason || '').startsWith('prefix_')
       if (taskEligibilityFilter === 'self_blocked') return !item.self_available
       return true
     })
-  }, [apiExpiryFilter, items, phoneSearch, taskEligibilityFilter])
+  }, [apiExpiryFilter, items, phoneBindingFilter, phoneSearch, taskEligibilityFilter])
   const paginatedItems = useMemo(() => {
     const start = (currentPage - 1) * PHONE_POOL_PAGE_SIZE
     return filteredItems.slice(start, start + PHONE_POOL_PAGE_SIZE)
   }, [currentPage, filteredItems])
+  const hasActiveFilters = Boolean(
+    phoneSearch.replace(/\D/g, '')
+    || statusFilter
+    || phoneBindingFilter
+    || taskEligibilityFilter
+    || apiExpiryFilter,
+  )
+  const phonePoolEmptyText = phoneSearch.replace(/\D/g, '')
+    ? '未找到匹配手机号'
+    : hasActiveFilters
+      ? '没有符合当前筛选条件的手机号'
+      : '暂无手机号'
 
   useEffect(() => {
     setCurrentPage(1)
     setSelectedRowKeys([])
-  }, [apiExpiryFilter, phoneSearch, statusFilter, taskEligibilityFilter])
+  }, [apiExpiryFilter, phoneBindingFilter, phoneSearch, statusFilter, taskEligibilityFilter])
 
   useEffect(() => {
     const maxPage = Math.max(1, Math.ceil(filteredItems.length / PHONE_POOL_PAGE_SIZE))
@@ -1362,7 +1395,7 @@ export default function PhonePool() {
 
   const renderPhoneMobileCards = () => {
     if (!paginatedItems.length) {
-      return <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={phoneSearch.replace(/\D/g, '') ? '未找到匹配手机号' : '暂无手机号'} />
+      return <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={phonePoolEmptyText} />
     }
     return (
       <div className="mobile-card-list">
@@ -1755,6 +1788,12 @@ export default function PhonePool() {
               onChange={(value) => setStatusFilter(value)}
             />
             <Select
+              value={phoneBindingFilter}
+              options={PHONE_BINDING_FILTER_OPTIONS}
+              style={{ width: 132 }}
+              onChange={(value) => setPhoneBindingFilter(value as PhoneBindingFilter)}
+            />
+            <Select
               value={taskEligibilityFilter}
               options={TASK_ELIGIBILITY_FILTER_OPTIONS as any}
               style={{ width: 148 }}
@@ -1871,7 +1910,7 @@ export default function PhonePool() {
               onChange: (keys) => setSelectedRowKeys(keys.map((key) => Number(key))),
             }}
             pagination={false}
-            locale={{ emptyText: phoneSearch.replace(/\D/g, '') ? '未找到匹配手机号' : '暂无手机号' }}
+            locale={{ emptyText: phonePoolEmptyText }}
             scroll={{ x: 1680, y: 520 }}
             sticky
           />
