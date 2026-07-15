@@ -17,6 +17,7 @@
 
 ### 优化 (Changed)
 - **GoPay 批量状态脱离浏览器计时器**：`frontend/src/pages/Accounts.tsx` 与 `frontend/src/features/accounts/components/BatchGopayWorkbench.tsx` 改为读取、恢复和轮询服务端批任务；关闭或刷新工作台不会丢失当前批次、停止模式或后续派发闸门。
+- **多实例发布正确识别 standby 容器**：`deploy.sh` 的 standby 检查改用 `docker container inspect`，不再把同名 `auto-gpt` 镜像误判为容器并在状态模板解析处中断发布自检；不存在的 standby 继续保持不启动。
 - **前端版本同步至 v2.1.5**：`frontend/src/app/AppShell.tsx` 更新侧栏版本，便于确认浏览器已加载停止模式、日志持久化和 GoPay 调度修复。
 
 ### 测试 (Tests)
@@ -1420,4 +1421,8 @@
 
 ## 2026-07-15 18:35:54 +0800
 - 新增全任务完成当前后停止并持久化停止日志
+- 发布模式: multi
+
+## 2026-07-15 18:37:48 +0800
+- 修复多实例发布的 standby 容器检查
 - 发布模式: multi

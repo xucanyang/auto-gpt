@@ -365,11 +365,13 @@ smoke_after_deploy() {
 stop_standby_services() {
   local service state
   for service in "${STANDBY_SERVICES[@]}"; do
-    if ! docker inspect "$service" >/dev/null 2>&1; then
+    # `docker inspect` also resolves an image with the same name.  Standby
+    # services are containers, so avoid treating the auto-gpt image as one.
+    if ! docker container inspect "$service" >/dev/null 2>&1; then
       log "standby ${service}: 容器不存在，跳过"
       continue
     fi
-    state="$(docker inspect -f '{{.State.Status}}' "$service")"
+    state="$(docker container inspect -f '{{.State.Status}}' "$service")"
     if [[ "$state" == "running" ]]; then
       log "停止 standby ${service}（保留容器和全部数据卷）"
       docker stop "$service" >/dev/null
