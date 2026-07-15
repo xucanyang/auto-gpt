@@ -9,6 +9,7 @@ try:
     from core.db import AccountListStateModel, AccountModel, engine, init_db
     from services.account_filters import (
         account_idea_submit_state,
+        account_payment_link_platform,
         account_phone_binding_state,
         account_revival_info,
         account_revival_state,
@@ -32,6 +33,7 @@ except ModuleNotFoundError as exc:
     engine = None
     init_db = None
     account_idea_submit_state = None
+    account_payment_link_platform = None
     account_phone_binding_state = None
     account_revival_info = None
     account_revival_state = None
@@ -309,6 +311,132 @@ class AccountFilterSortTests(unittest.TestCase):
 
             self.assertEqual(sql_ids(phone_binding_state="confirmed"), [501])
             self.assertEqual(sql_ids(phone_binding_state="unbound"), [502, 503, 504])
+
+    def test_payment_link_platform_filter_keeps_pix_paypal_and_no_link_distinct(self):
+        init_db()
+        pix = self._account(511)
+        pix.set_extra(
+            {
+                "chatgpt_last_payment_link": {
+                    "url": "https://payments.stripe.com/qr/instructions/pix-511",
+                    "link_type": "pix",
+                    "payment_link_format": "long_link",
+                },
+            }
+        )
+        legacy_paypal = self._account(512)
+        legacy_paypal.set_extra(
+            {
+                "chatgpt_paypal_url": {
+                    "approval_url": "https://www.paypal.com/agreements/approve?ba_token=BA-512",
+                },
+            }
+        )
+        hosted = self._account(513)
+        hosted.set_extra(
+            {
+                "chatgpt_last_payment_link": {
+                    "url": "https://chatgpt.com/checkout/openai_llc/cs_513",
+                    "link_type": "hosted",
+                    "payment_link_format": "long_hosted",
+                },
+            }
+        )
+        other = self._account(514)
+        other.set_extra(
+            {
+                "chatgpt_last_payment_link": {
+                    "url": "https://pay.example.test/checkout/514",
+                    "link_type": "ideal",
+                    "payment_link_format": "ideal_url",
+                },
+            }
+        )
+        no_link = self._account(515)
+        malformed = self._account(516)
+        malformed.set_extra(
+            {
+                "chatgpt_last_payment_link": {
+                    "url": "javascript:alert('not-a-payment-link')",
+                    "link_type": "pix",
+                },
+            }
+        )
+        malformed_newer_with_legacy_paypal = self._account(517)
+        malformed_newer_with_legacy_paypal.set_extra(
+            {
+                "chatgpt_last_payment_link": {
+                    "url": "javascript:alert('bad-newer-cache')",
+                    "link_type": "pix",
+                },
+                "chatgpt_paypal_url": {
+                    "approval_url": "https://www.paypal.com/agreements/approve?ba_token=BA-517",
+                },
+            }
+        )
+        rows = [pix, legacy_paypal, hosted, other, no_link, malformed, malformed_newer_with_legacy_paypal]
+
+        self.assertEqual(account_payment_link_platform(pix), "pix")
+        self.assertEqual(account_payment_link_platform(legacy_paypal), "paypal")
+        self.assertEqual(account_payment_link_platform(hosted), "chatgpt")
+        self.assertEqual(account_payment_link_platform(other), "other")
+        self.assertEqual(account_payment_link_platform(no_link), "none")
+        self.assertEqual(account_payment_link_platform(malformed), "none")
+        self.assertEqual(account_payment_link_platform(malformed_newer_with_legacy_paypal), "paypal")
+        self.assertEqual(
+            [row.id for row in filter_account_rows(rows, payment_link_platform="pix,paypal")],
+            [511, 512, 517],
+        )
+        self.assertEqual(
+            [row.id for row in filter_account_rows(rows, payment_link_platform="no_payment_link")],
+            [515, 516],
+        )
+
+        with Session(engine) as session:
+            session.exec(text("DELETE FROM account_list_state"))
+            session.exec(text("DELETE FROM accounts"))
+            for row in rows:
+                session.add(row)
+            session.commit()
+            refresh_account_list_state(session)
+
+            state_rows = {
+                int(row[0]): str(row[1])
+                for row in session.exec(
+                    text(
+                        """
+                        SELECT account_id, payment_link_platform
+                        FROM account_list_state
+                        WHERE account_id BETWEEN 511 AND 517
+                        ORDER BY account_id
+                        """
+                    )
+                ).all()
+            }
+            self.assertEqual(
+                state_rows,
+                {
+                    511: "pix",
+                    512: "paypal",
+                    513: "chatgpt",
+                    514: "other",
+                    515: "none",
+                    516: "none",
+                    517: "paypal",
+                },
+            )
+
+            def sql_ids(**filters):
+                q = select(AccountModel).join(
+                    AccountListStateModel,
+                    AccountListStateModel.account_id == AccountModel.id,
+                )
+                q = apply_account_list_state_filters(q, **filters)
+                q = q.order_by(AccountModel.id.asc())
+                return [int(row.id or 0) for row in session.exec(q).all()]
+
+            self.assertEqual(sql_ids(payment_link_platform="pix,paypal"), [511, 512, 517])
+            self.assertEqual(sql_ids(payment_link_platform="none"), [515, 516])
 
     def test_account_list_state_sql_filters_match_python_filters(self):
         init_db()
@@ -593,6 +721,7 @@ class AccountFilterSortTests(unittest.TestCase):
         self.assertIn("subscription_active_until_ts", columns)
         self.assertIn("idea_submit_state", columns)
         self.assertIn("phone_binding_state", columns)
+        self.assertIn("payment_link_platform", columns)
         self.assertIn("derivation_version", columns)
         self.assertEqual(state.subscription_type, "plus")
 

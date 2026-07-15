@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 from typing import Any, Iterable, Mapping
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, Field
 from sqlalchemy import text
@@ -19,14 +20,15 @@ from services.chatgpt_account_state import (
 )
 
 AUTO_DELETE_REVIVAL_TASK_ID = "icloud_hme_auto_delete"
-ACCOUNT_LIST_STATE_DERIVATION_VERSION = "phone-binding-state-v1"
-ACCOUNT_FILTER_RESOLVER_VERSION = "account-list-state-v2"
+ACCOUNT_LIST_STATE_DERIVATION_VERSION = "payment-link-platform-v1"
+ACCOUNT_FILTER_RESOLVER_VERSION = "account-list-state-v3"
 ACCOUNT_FILTER_FIELD_NAMES = (
     "email",
     "status",
     "manually_used",
     "auth_type",
     "phone_binding_state",
+    "payment_link_platform",
     "subscription_type",
     "account_validity",
     "sub2api_state",
@@ -44,6 +46,7 @@ class AccountFilterRequestMixin(BaseModel):
     manually_used: str | None = None
     auth_type: str = ""
     phone_binding_state: str = ""
+    payment_link_platform: str = ""
     subscription_type: str = ""
     account_validity: str = ""
     sub2api_state: str = ""
@@ -162,6 +165,21 @@ _PHONE_BINDING_STATE_FILTER_ALIASES: dict[str, set[str]] = {
     "unknown": {"unknown"},
 }
 
+_PAYMENT_LINK_PLATFORM_FILTER_ALIASES: dict[str, set[str]] = {
+    "none": {"none"},
+    "no_link": {"none"},
+    "no_payment_link": {"none"},
+    "without_link": {"none"},
+    "missing": {"none"},
+    "pix": {"pix"},
+    "paypal": {"paypal"},
+    "paypal_url": {"paypal"},
+    "chatgpt": {"chatgpt"},
+    "hosted": {"chatgpt"},
+    "chatgpt_hosted": {"chatgpt"},
+    "other": {"other"},
+}
+
 
 def _split_idea_submit_filter_values(value: Any) -> set[str]:
     expanded: set[str] = set()
@@ -174,6 +192,13 @@ def _split_phone_binding_state_filter_values(value: Any) -> set[str]:
     expanded: set[str] = set()
     for item in _split_values(value):
         expanded.update(_PHONE_BINDING_STATE_FILTER_ALIASES.get(item, {item}))
+    return expanded
+
+
+def _split_payment_link_platform_filter_values(value: Any) -> set[str]:
+    expanded: set[str] = set()
+    for item in _split_values(value):
+        expanded.update(_PAYMENT_LINK_PLATFORM_FILTER_ALIASES.get(item, {item}))
     return expanded
 
 
@@ -201,11 +226,14 @@ def _normalize_filter_values(
     *,
     idea_submit: bool = False,
     phone_binding_state: bool = False,
+    payment_link_platform: bool = False,
 ) -> str:
     if idea_submit:
         values = _split_idea_submit_filter_values(value)
     elif phone_binding_state:
         values = _split_phone_binding_state_filter_values(value)
+    elif payment_link_platform:
+        values = _split_payment_link_platform_filter_values(value)
     else:
         values = _split_values(value)
     return ",".join(sorted(values))
@@ -222,6 +250,10 @@ def normalize_account_filter(source: Any) -> dict[str, Any]:
         "phone_binding_state": _normalize_filter_values(
             _filter_source_value(source, "phone_binding_state"),
             phone_binding_state=True,
+        ),
+        "payment_link_platform": _normalize_filter_values(
+            _filter_source_value(source, "payment_link_platform"),
+            payment_link_platform=True,
         ),
         "subscription_type": _normalize_filter_values(_filter_source_value(source, "subscription_type")),
         "account_validity": _normalize_filter_values(_filter_source_value(source, "account_validity")),
@@ -526,6 +558,137 @@ def account_phone_binding_state(account: AccountModel, extra: dict[str, Any] | N
     return state if state in {"confirmed", "unconfirmed", "unknown"} else "unknown"
 
 
+_PAYMENT_LINK_URL_FIELDS = (
+    "url",
+    "paypal_url",
+    "provider_redirect_url",
+    "approval_url",
+    "checkout_url",
+    "cashier_url",
+)
+
+
+def _validated_payment_link_url(value: Any) -> str:
+    """Return only a bounded browser-openable URL from persisted link metadata."""
+
+    url = _safe_str(value)
+    if not url or len(url) > 8192:
+        return ""
+    try:
+        parsed = urlsplit(url)
+    except (TypeError, ValueError):
+        return ""
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+        return ""
+    return url
+
+
+def _account_payment_link_payload(
+    account: AccountModel,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Find the current generated link while retaining legacy PayPal compatibility.
+
+    ``cashier_url`` is intentionally not used as an account-level fallback:
+    it predates the generated-link cache and is also used for unrelated trial
+    checkout records.  A row is therefore "无支付链接" until a supported
+    generated-link cache exists.
+    """
+
+    extra = extra if isinstance(extra, dict) else _extra(account)
+    last_link = extra.get("chatgpt_last_payment_link")
+    legacy_paypal = extra.get("chatgpt_paypal_url")
+    candidates = [
+        last_link if isinstance(last_link, dict) else {},
+        legacy_paypal if isinstance(legacy_paypal, dict) else {},
+    ]
+    for candidate in candidates:
+        for field_name in _PAYMENT_LINK_URL_FIELDS:
+            url = _validated_payment_link_url(candidate.get(field_name))
+            if not url:
+                continue
+            payload = dict(candidate)
+            payload["url"] = url
+            if candidate is legacy_paypal and not _safe_str(payload.get("link_type")):
+                payload["link_type"] = "paypal"
+            return payload
+    return {}
+
+
+def _payment_link_platform_from_payload(payload: dict[str, Any]) -> str:
+    url = _validated_payment_link_url(payload.get("url"))
+    if not url:
+        return "none"
+
+    link_type = _lower_text(payload.get("link_type"))
+    payment_method_type = _lower_text(payload.get("payment_method_type"))
+    link_format = _lower_text(payload.get("payment_link_format")).replace("-", "_")
+    payment_source = _lower_text(payload.get("payment_source")).replace("-", "_")
+    try:
+        host = (urlsplit(url).hostname or "").lower()
+    except (TypeError, ValueError):
+        host = ""
+
+    if link_type == "pix" or payment_method_type == "pix":
+        return "pix"
+    if (
+        "paypal" in link_type
+        or "paypal" in payment_method_type
+        or link_format in {"paypal", "paypal_url", "paypal_approval", "provider_url"}
+        or "paypal" in payment_source
+        or host == "paypal.com"
+        or host.endswith(".paypal.com")
+    ):
+        return "paypal"
+    if (
+        link_type in {"hosted", "chatgpt", "chatgpt_hosted", "stripe_hosted"}
+        or link_format in {"short", "short_chatgpt", "long", "long_hosted", "hosted", "hosted_checkout", "pay_openai", "stripe_hosted"}
+        or payment_source == "chatgpt_hosted"
+        or host == "chatgpt.com"
+        or host.endswith(".chatgpt.com")
+        or host == "pay.openai.com"
+        or host.endswith(".openai.com")
+    ):
+        return "chatgpt"
+    return "other"
+
+
+def account_payment_link_platform(account: AccountModel, extra: dict[str, Any] | None = None) -> str:
+    """Classify generated payment links by payment platform, not transport source."""
+
+    extra = extra if isinstance(extra, dict) else _extra(account)
+    return _payment_link_platform_from_payload(_account_payment_link_payload(account, extra))
+
+
+def account_payment_link_summary(account: AccountModel, extra: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Return the non-secret payment-link subset required by the account list."""
+
+    extra = extra if isinstance(extra, dict) else _extra(account)
+    payload = _account_payment_link_payload(account, extra)
+    platform = _payment_link_platform_from_payload(payload)
+    if platform == "none":
+        return {"platform": "none"}
+
+    summary: dict[str, Any] = {
+        "platform": platform,
+        "url": _validated_payment_link_url(payload.get("url")),
+    }
+    for key, max_length in (
+        ("link_type", 64),
+        ("link_status", 64),
+        ("payment_link_format", 64),
+        ("generated_at", 128),
+        ("created_at", 128),
+    ):
+        value = _safe_str(payload.get(key))
+        if value:
+            summary[key] = value[:max_length]
+    expires_at = payload.get("link_expires_at")
+    if isinstance(expires_at, (int, float)) and not isinstance(expires_at, bool) and expires_at > 0:
+        summary["link_expires_at"] = int(expires_at)
+    return summary
+
+
 def _normalize_subscription_type(plan: Any) -> str:
     return normalize_subscription_plan(plan)
 
@@ -632,6 +795,7 @@ def ensure_account_list_state_schema(session: Session) -> None:
                 manually_used INTEGER NOT NULL DEFAULT 0,
                 auth_type TEXT NOT NULL DEFAULT 'unknown',
                 phone_binding_state TEXT NOT NULL DEFAULT 'unknown',
+                payment_link_platform TEXT NOT NULL DEFAULT 'none',
                 auth_level TEXT NOT NULL DEFAULT '',
                 subscription_type TEXT NOT NULL DEFAULT 'unknown',
                 account_validity TEXT NOT NULL DEFAULT 'valid',
@@ -653,6 +817,7 @@ def ensure_account_list_state_schema(session: Session) -> None:
         "manually_used": "INTEGER NOT NULL DEFAULT 0",
         "auth_type": "TEXT NOT NULL DEFAULT 'unknown'",
         "phone_binding_state": "TEXT NOT NULL DEFAULT 'unknown'",
+        "payment_link_platform": "TEXT NOT NULL DEFAULT 'none'",
         "auth_level": "TEXT NOT NULL DEFAULT ''",
         "subscription_type": "TEXT NOT NULL DEFAULT 'unknown'",
         "account_validity": "TEXT NOT NULL DEFAULT 'valid'",
@@ -684,6 +849,7 @@ def ensure_account_list_state_schema(session: Session) -> None:
         "CREATE INDEX IF NOT EXISTS idx_account_list_state_manually_used ON account_list_state(manually_used)",
         "CREATE INDEX IF NOT EXISTS idx_account_list_state_auth_type ON account_list_state(auth_type)",
         "CREATE INDEX IF NOT EXISTS idx_account_list_state_phone_binding_state ON account_list_state(phone_binding_state)",
+        "CREATE INDEX IF NOT EXISTS idx_account_list_state_payment_link_platform ON account_list_state(payment_link_platform)",
         "CREATE INDEX IF NOT EXISTS idx_account_list_state_subscription_type ON account_list_state(subscription_type)",
         "CREATE INDEX IF NOT EXISTS idx_account_list_state_account_validity ON account_list_state(account_validity)",
         "CREATE INDEX IF NOT EXISTS idx_account_list_state_sub2api_state ON account_list_state(sub2api_state)",
@@ -866,6 +1032,42 @@ def refresh_account_list_state(
                     trim(coalesce(json_extract(extra, '$.chatgpt_bound_phone_number'), '')) AS bound_phone_number,
                     trim(coalesce(json_extract(extra, '$.chatgpt_bound_phone_masked'), '')) AS bound_phone_masked,
                     CASE WHEN json_type(extra, '$.chatgpt_phone_challenge') = 'object' THEN 1 ELSE 0 END AS phone_challenge_present,
+                    trim(coalesce(
+                        nullif(trim(CAST(json_extract(extra, '$.chatgpt_last_payment_link.url') AS TEXT)), ''),
+                        nullif(trim(CAST(json_extract(extra, '$.chatgpt_last_payment_link.paypal_url') AS TEXT)), ''),
+                        nullif(trim(CAST(json_extract(extra, '$.chatgpt_last_payment_link.provider_redirect_url') AS TEXT)), ''),
+                        nullif(trim(CAST(json_extract(extra, '$.chatgpt_last_payment_link.approval_url') AS TEXT)), ''),
+                        nullif(trim(CAST(json_extract(extra, '$.chatgpt_last_payment_link.checkout_url') AS TEXT)), ''),
+                        nullif(trim(CAST(json_extract(extra, '$.chatgpt_last_payment_link.cashier_url') AS TEXT)), ''),
+                        ''
+                    )) AS last_payment_link_url,
+                    trim(coalesce(
+                        nullif(trim(CAST(json_extract(extra, '$.chatgpt_paypal_url.url') AS TEXT)), ''),
+                        nullif(trim(CAST(json_extract(extra, '$.chatgpt_paypal_url.paypal_url') AS TEXT)), ''),
+                        nullif(trim(CAST(json_extract(extra, '$.chatgpt_paypal_url.approval_url') AS TEXT)), ''),
+                        ''
+                    )) AS legacy_paypal_link_url,
+                    lower(trim(coalesce(
+                        nullif(trim(CAST(json_extract(extra, '$.chatgpt_last_payment_link.link_type') AS TEXT)), ''),
+                        nullif(trim(CAST(json_extract(extra, '$.chatgpt_paypal_url.link_type') AS TEXT)), ''),
+                        CASE WHEN json_type(extra, '$.chatgpt_paypal_url') = 'object' THEN 'paypal' ELSE '' END,
+                        ''
+                    ))) AS payment_link_type,
+                    lower(trim(coalesce(
+                        nullif(trim(CAST(json_extract(extra, '$.chatgpt_last_payment_link.payment_method_type') AS TEXT)), ''),
+                        nullif(trim(CAST(json_extract(extra, '$.chatgpt_paypal_url.payment_method_type') AS TEXT)), ''),
+                        ''
+                    ))) AS payment_link_method_type,
+                    replace(lower(trim(coalesce(
+                        nullif(trim(CAST(json_extract(extra, '$.chatgpt_last_payment_link.payment_link_format') AS TEXT)), ''),
+                        nullif(trim(CAST(json_extract(extra, '$.chatgpt_paypal_url.payment_link_format') AS TEXT)), ''),
+                        ''
+                    ))), '-', '_') AS payment_link_format,
+                    replace(lower(trim(coalesce(
+                        nullif(trim(CAST(json_extract(extra, '$.chatgpt_last_payment_link.payment_source') AS TEXT)), ''),
+                        nullif(trim(CAST(json_extract(extra, '$.chatgpt_paypal_url.payment_source') AS TEXT)), ''),
+                        ''
+                    ))), '-', '_') AS payment_link_source,
                     lower(trim(coalesce(
                         json_extract(extra, '$.chatgpt_capabilities.auth_level'),
                         json_extract(extra, '$.auth_level'),
@@ -966,6 +1168,21 @@ def refresh_account_list_state(
             revival_inputs AS (
                 SELECT
                     *,
+                    trim(coalesce(
+                        nullif(last_payment_link_url, ''),
+                        nullif(legacy_paypal_link_url, ''),
+                        ''
+                    )) AS payment_link_url,
+                    CASE
+                        WHEN lower(last_payment_link_url) NOT LIKE 'http://%'
+                             AND lower(last_payment_link_url) NOT LIKE 'https://%'
+                             AND (
+                                 lower(legacy_paypal_link_url) LIKE 'http://%'
+                                 OR lower(legacy_paypal_link_url) LIKE 'https://%'
+                             )
+                        THEN 1
+                        ELSE 0
+                    END AS payment_link_uses_legacy_paypal,
                     CASE
                         WHEN last_revival_present = 1 THEN 1
                         WHEN invalid_marker_present = 1 THEN 1
@@ -1100,6 +1317,30 @@ def refresh_account_list_state(
                         THEN 'unconfirmed'
                         ELSE 'unknown'
                     END AS phone_binding_state,
+                    CASE
+                        WHEN payment_link_uses_legacy_paypal = 1
+                        THEN 'paypal'
+                        WHEN lower(payment_link_url) NOT LIKE 'http://%'
+                             AND lower(payment_link_url) NOT LIKE 'https://%'
+                        THEN 'none'
+                        WHEN payment_link_type = 'pix' OR payment_link_method_type = 'pix'
+                        THEN 'pix'
+                        WHEN payment_link_type LIKE '%paypal%'
+                             OR payment_link_method_type LIKE '%paypal%'
+                             OR payment_link_format IN ('paypal', 'paypal_url', 'paypal_approval', 'provider_url')
+                             OR payment_link_source LIKE '%paypal%'
+                             OR lower(payment_link_url) LIKE '%paypal.com/%'
+                        THEN 'paypal'
+                        WHEN payment_link_type IN ('hosted', 'chatgpt', 'chatgpt_hosted', 'stripe_hosted')
+                             OR payment_link_format IN ('short', 'short_chatgpt', 'long', 'long_hosted', 'hosted', 'hosted_checkout', 'pay_openai', 'stripe_hosted')
+                             OR payment_link_source = 'chatgpt_hosted'
+                             OR lower(payment_link_url) LIKE 'https://chatgpt.com/%'
+                             OR lower(payment_link_url) LIKE 'https://%.chatgpt.com/%'
+                             OR lower(payment_link_url) LIKE 'https://pay.openai.com/%'
+                             OR lower(payment_link_url) LIKE 'https://%.openai.com/%'
+                        THEN 'chatgpt'
+                        ELSE 'other'
+                    END AS payment_link_platform,
                     auth_level,
                     derived_subscription_type AS subscription_type,
                     derived_account_validity AS account_validity,
@@ -1145,6 +1386,7 @@ def refresh_account_list_state(
                 manually_used,
                 auth_type,
                 phone_binding_state,
+                payment_link_platform,
                 auth_level,
                 subscription_type,
                 account_validity,
@@ -1165,6 +1407,7 @@ def refresh_account_list_state(
                 manually_used,
                 auth_type,
                 phone_binding_state,
+                payment_link_platform,
                 auth_level,
                 subscription_type,
                 account_validity,
@@ -1185,6 +1428,7 @@ def refresh_account_list_state(
                 manually_used = excluded.manually_used,
                 auth_type = excluded.auth_type,
                 phone_binding_state = excluded.phone_binding_state,
+                payment_link_platform = excluded.payment_link_platform,
                 auth_level = excluded.auth_level,
                 subscription_type = excluded.subscription_type,
                 account_validity = excluded.account_validity,
@@ -1303,6 +1547,7 @@ def should_use_account_list_state(
     manually_used: bool | None = None,
     auth_type: Any = None,
     phone_binding_state: Any = None,
+    payment_link_platform: Any = None,
     subscription_type: Any = None,
     account_validity_filter: Any = None,
     sub2api_state: Any = None,
@@ -1317,6 +1562,7 @@ def should_use_account_list_state(
             manually_used is not None,
             bool(_split_values(auth_type)),
             bool(_split_phone_binding_state_filter_values(phone_binding_state)),
+            bool(_split_payment_link_platform_filter_values(payment_link_platform)),
             bool(_split_values(subscription_type)),
             bool(_split_values(account_validity_filter)),
             bool(_split_values(sub2api_state)),
@@ -1334,6 +1580,7 @@ def apply_account_list_state_filters(
     manually_used: bool | None = None,
     auth_type: Any = None,
     phone_binding_state: Any = None,
+    payment_link_platform: Any = None,
     subscription_type: Any = None,
     account_validity_filter: Any = None,
     sub2api_state: Any = None,
@@ -1351,6 +1598,10 @@ def apply_account_list_state_filters(
     phone_binding_states = _split_phone_binding_state_filter_values(phone_binding_state)
     if phone_binding_states:
         query = query.where(AccountListStateModel.phone_binding_state.in_(sorted(phone_binding_states)))
+
+    payment_link_platforms = _split_payment_link_platform_filter_values(payment_link_platform)
+    if payment_link_platforms:
+        query = query.where(AccountListStateModel.payment_link_platform.in_(sorted(payment_link_platforms)))
 
     subscription_types = _split_values(subscription_type)
     if subscription_types:
@@ -1396,6 +1647,7 @@ def account_filtered_query(
         manually_used=normalized["manually_used"],
         auth_type=normalized["auth_type"],
         phone_binding_state=normalized["phone_binding_state"],
+        payment_link_platform=normalized["payment_link_platform"],
         subscription_type=normalized["subscription_type"],
         account_validity_filter=normalized["account_validity"],
         sub2api_state=normalized["sub2api_state"],
@@ -1425,6 +1677,7 @@ def account_filtered_query(
         manually_used=normalized["manually_used"],
         auth_type=normalized["auth_type"],
         phone_binding_state=normalized["phone_binding_state"],
+        payment_link_platform=normalized["payment_link_platform"],
         subscription_type=normalized["subscription_type"],
         account_validity_filter=normalized["account_validity"],
         sub2api_state=normalized["sub2api_state"],
@@ -1520,6 +1773,7 @@ def filter_account_rows(
     manually_used: bool | None = None,
     auth_type: Any = None,
     phone_binding_state: Any = None,
+    payment_link_platform: Any = None,
     subscription_type: Any = None,
     account_validity_filter: Any = None,
     sub2api_state: Any = None,
@@ -1529,6 +1783,7 @@ def filter_account_rows(
 ) -> list[AccountModel]:
     auth_types = _split_values(auth_type)
     phone_binding_states = _split_phone_binding_state_filter_values(phone_binding_state)
+    payment_link_platforms = _split_payment_link_platform_filter_values(payment_link_platform)
     subscription_types = _split_values(subscription_type)
     validity_values = _split_values(account_validity_filter)
     sub2api_states = _split_values(sub2api_state)
@@ -1544,6 +1799,8 @@ def filter_account_rows(
         if auth_types and account_auth_type(row, extra) not in auth_types:
             continue
         if phone_binding_states and account_phone_binding_state(row, extra) not in phone_binding_states:
+            continue
+        if payment_link_platforms and account_payment_link_platform(row, extra) not in payment_link_platforms:
             continue
         if subscription_types and account_subscription_type(row, extra) not in subscription_types:
             continue

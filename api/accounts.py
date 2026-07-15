@@ -7,6 +7,7 @@ from core.db import AccountModel, get_session
 from services.account_filters import (
     account_auth_type,
     account_filtered_query,
+    account_payment_link_summary,
     account_revival_info,
     account_subscription_type,
     apply_account_list_state_sort,
@@ -66,6 +67,7 @@ ACCOUNT_FILTER_PRESET_COLUMN_KEYS = (
     "manuallyUsed",
     "authType",
     "phoneBindingState",
+    "paymentLinkPlatform",
     "subscriptionType",
     "accountValidity",
     "codexState",
@@ -207,6 +209,7 @@ def _filter_preset_summary(filters: dict[str, Any]) -> str:
         ("subscriptionType", "订阅"),
         ("authType", "认证"),
         ("phoneBindingState", "手机号"),
+        ("paymentLinkPlatform", "支付链接"),
         ("accountValidity", "有效性"),
         ("manuallyUsed", "使用"),
         ("sub2apiState", "Sub2API"),
@@ -1258,6 +1261,7 @@ def _serialize_account_compact_item(
     validity_summary = _build_account_validity_summary(account, auth_summary, chatgpt_capabilities, codex_summary)
     baxigpt_cdk = _build_baxigpt_cdk_summary(extra.get("baxigpt_cdk") if isinstance(extra.get("baxigpt_cdk"), dict) else {})
     idea_submit = _build_idea_submit_summary(extra, baxigpt_cdk)
+    payment_link = account_payment_link_summary(account, extra)
     payload = {
         "id": account.id,
         "platform": account.platform,
@@ -1268,6 +1272,8 @@ def _serialize_account_compact_item(
         "user_id": account.user_id,
         "region": account.region,
         "cashier_url": account.cashier_url,
+        "payment_link": payment_link,
+        "payment_link_platform": _safe_str(payment_link.get("platform")) or "none",
         "manually_used": bool(extra.get("manually_used")),
         "workspace": {
             "id": _safe_str(extra.get("workspace_id") or extra.get("organization_id") or chatgpt_capabilities.get("workspace_id")),
@@ -1419,6 +1425,7 @@ def list_accounts(
     manually_used: Optional[str] = None,
     auth_type: Optional[str] = None,
     phone_binding_state: Optional[str] = None,
+    payment_link_platform: Optional[str] = None,
     subscription_type: Optional[str] = None,
     account_validity: Optional[str] = None,
     sub2api_state: Optional[str] = None,
@@ -1444,6 +1451,7 @@ def list_accounts(
             "manually_used": manually_used,
             "auth_type": auth_type,
             "phone_binding_state": phone_binding_state,
+            "payment_link_platform": payment_link_platform,
             "subscription_type": subscription_type,
             "account_validity": account_validity,
             "sub2api_state": sub2api_state,

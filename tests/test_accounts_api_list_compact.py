@@ -78,6 +78,16 @@ class AccountListCompactSerializationTests(unittest.TestCase):
                 "phone": "+10000000000",
                 "api_url": "https://sms.example.test/order/1",
             },
+            "chatgpt_last_payment_link": {
+                "url": "https://payments.example.test/checkout/pix-1",
+                "link_type": "pix",
+                "link_status": "active",
+                "payment_link_format": "long_link",
+                "generated_at": "2026-07-16T00:00:00Z",
+                "profile_hash": "SECRET_PAYMENT_PROFILE",
+                "proxy": "https://SECRET_PAYMENT_PROXY.example.test",
+                "remote_batch_id": "SECRET_REMOTE_BATCH",
+            },
         }
         return AccountModel(
             id=1,
@@ -105,6 +115,9 @@ class AccountListCompactSerializationTests(unittest.TestCase):
         self.assertNotIn("SECRET_ID_TOKEN", raw)
         self.assertNotIn("SECRET_COOKIE", raw)
         self.assertNotIn("SECRET_LEGACY_VARIANT", raw)
+        self.assertNotIn("SECRET_PAYMENT_PROFILE", raw)
+        self.assertNotIn("SECRET_PAYMENT_PROXY", raw)
+        self.assertNotIn("SECRET_REMOTE_BATCH", raw)
         self.assertNotIn("chatgpt_mailbox_state", raw)
         self.assertNotIn("raw_response", raw)
         self.assertNotIn("raw_usage", raw)
@@ -136,6 +149,18 @@ class AccountListCompactSerializationTests(unittest.TestCase):
         self.assertEqual(payload["codex_state"], "ok")
         self.assertFalse(payload["chatgptCapabilities"]["has_confirmed_phone_binding"])
         self.assertEqual(payload["chatgptCapabilities"]["phone_binding_state"], "unconfirmed")
+        self.assertEqual(payload["payment_link_platform"], "pix")
+        self.assertEqual(
+            payload["payment_link"],
+            {
+                "platform": "pix",
+                "url": "https://payments.example.test/checkout/pix-1",
+                "link_type": "pix",
+                "link_status": "active",
+                "payment_link_format": "long_link",
+                "generated_at": "2026-07-16T00:00:00Z",
+            },
+        )
 
     def test_compact_serializer_does_not_return_raw_extra_or_secrets(self):
         payload = _serialize_account_compact_item(self._account())

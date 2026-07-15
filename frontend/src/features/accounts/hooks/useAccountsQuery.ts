@@ -7,6 +7,7 @@ export type AccountsQueryParams = {
   manuallyUsed?: string
   authType?: string
   phoneBindingState?: string
+  paymentLinkPlatform?: string
   subscriptionType?: string
   accountValidity?: string
   sub2apiState?: string
@@ -31,6 +32,7 @@ export function useAccountsQuery({
   manuallyUsed = '',
   authType = '',
   phoneBindingState = '',
+  paymentLinkPlatform = '',
   subscriptionType = '',
   accountValidity = '',
   sub2apiState = '',
@@ -43,7 +45,7 @@ export function useAccountsQuery({
   pageSize = 50,
 }: AccountsQueryParams) {
   return useQuery<AccountsQueryResult>({
-    queryKey: ['accounts', { email, status, manuallyUsed, authType, phoneBindingState, subscriptionType, accountValidity, sub2apiState, oaipayState, ideaSubmitState, revivalState, sortBy, sortOrder, page, pageSize }],
+    queryKey: ['accounts', { email, status, manuallyUsed, authType, phoneBindingState, paymentLinkPlatform, subscriptionType, accountValidity, sub2apiState, oaipayState, ideaSubmitState, revivalState, sortBy, sortOrder, page, pageSize }],
     queryFn: async ({ signal }) => {
       const params = new URLSearchParams({
         platform: 'chatgpt',
@@ -56,6 +58,7 @@ export function useAccountsQuery({
       if (manuallyUsed) params.set('manually_used', manuallyUsed)
       if (authType) params.set('auth_type', authType)
       if (phoneBindingState) params.set('phone_binding_state', phoneBindingState)
+      if (paymentLinkPlatform) params.set('payment_link_platform', paymentLinkPlatform)
       if (subscriptionType) params.set('subscription_type', subscriptionType)
       if (accountValidity) params.set('account_validity', accountValidity)
       if (sub2apiState) params.set('sub2api_state', sub2apiState)

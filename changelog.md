@@ -4,6 +4,19 @@
 
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，并且本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/) (语义化版本)。
 
+## [2.2.5] - 2026-07-16
+
+### 新增 (Added)
+- **账号列表支付链接列与平台筛选**：`frontend/src/pages/Accounts.tsx` 的“支付链接”列表头现在与“手机号/API”列使用同一筛选交互，支持 `PIX`、`PayPal`、`ChatGPT 结账`、其他支付链接和“无支付链接”。移动端筛选栏、筛选组合保存/恢复及组合编辑器同步提供该条件；对“当前筛选结果”执行支付链接生成、补抓、手机号绑定、状态同步或上传等批量操作时，服务端会使用同一平台范围而非当前分页数据。
+
+### 优化 (Changed)
+- **支付链接平台建立可索引的派生事实**：`services/account_filters.py` 与 `account_list_state` 新增 `payment_link_platform`，从通用 `chatgpt_last_payment_link` 缓存识别 PIX、PayPal、ChatGPT Hosted Checkout 和其他有效链接；无有效 HTTP(S) 链接、畸形链接或仅有旧 `cashier_url` 的账号归入“无支付链接”。旧 `chatgpt_paypal_url` 缓存继续兼容识别为 PayPal，避免历史账号被漏筛。
+- **账号列表实际返回可操作的链接摘要**：`api/accounts.py` 的紧凑列表响应新增 `payment_link` 与 `payment_link_platform`，账号页可直接显示平台、生成状态并复制或打开链接。仅返回 URL、平台、类型、状态、格式和时间；代理、profile hash、远端批次/任务 ID 等内部字段仍不出现在列表响应。
+- **版本同步**：侧栏版本更新为 `v2.2.5`，用于确认浏览器已加载支付链接列与筛选能力。
+
+### 测试 (Tests)
+- **锁定平台判定与全范围一致性**：覆盖 PIX、旧 PayPal 缓存、Hosted Checkout、未知未来平台、无链接及 `javascript:` 畸形值，验证 Python 回退路径与 SQLite 索引筛选一致；同时覆盖紧凑响应脱敏、筛选预设保存和账号列表与批量任务范围完全一致。
+
 ## [2.2.4] - 2026-07-16
 
 ### 新增 (Added)
@@ -1565,4 +1578,8 @@
 
 ## 2026-07-16 06:10:42 +0800
 - 账号列表增加手机号绑定情况筛选
+- 发布模式: multi
+
+## 2026-07-16 06:55:41 +0800
+- 账号列表增加支付链接平台筛选
 - 发布模式: multi

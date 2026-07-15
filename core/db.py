@@ -159,6 +159,7 @@ class AccountListStateModel(SQLModel, table=True):
     manually_used: bool = Field(default=False, index=True)
     auth_type: str = Field(default="unknown", index=True)
     phone_binding_state: str = Field(default="unknown", index=True)
+    payment_link_platform: str = Field(default="none", index=True)
     auth_level: str = Field(default="", index=True)
     subscription_type: str = Field(default="unknown", index=True)
     account_validity: str = Field(default="valid", index=True)
@@ -3283,6 +3284,7 @@ def _ensure_account_list_state_schema() -> None:
                 manually_used INTEGER NOT NULL DEFAULT 0,
                 auth_type TEXT NOT NULL DEFAULT 'unknown',
                 phone_binding_state TEXT NOT NULL DEFAULT 'unknown',
+                payment_link_platform TEXT NOT NULL DEFAULT 'none',
                 auth_level TEXT NOT NULL DEFAULT '',
                 subscription_type TEXT NOT NULL DEFAULT 'unknown',
                 account_validity TEXT NOT NULL DEFAULT 'valid',
@@ -3305,6 +3307,7 @@ def _ensure_account_list_state_schema() -> None:
             "manually_used": "INTEGER NOT NULL DEFAULT 0",
             "auth_type": "TEXT NOT NULL DEFAULT 'unknown'",
             "phone_binding_state": "TEXT NOT NULL DEFAULT 'unknown'",
+            "payment_link_platform": "TEXT NOT NULL DEFAULT 'none'",
             "auth_level": "TEXT NOT NULL DEFAULT ''",
             "subscription_type": "TEXT NOT NULL DEFAULT 'unknown'",
             "account_validity": "TEXT NOT NULL DEFAULT 'valid'",
@@ -3344,6 +3347,10 @@ def _ensure_account_list_state_schema() -> None:
         conn.exec_driver_sql(
             "CREATE INDEX IF NOT EXISTS idx_account_list_state_phone_binding_state "
             "ON account_list_state(phone_binding_state)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_account_list_state_payment_link_platform "
+            "ON account_list_state(payment_link_platform)"
         )
         conn.exec_driver_sql(
             "CREATE INDEX IF NOT EXISTS idx_account_list_state_subscription_type "

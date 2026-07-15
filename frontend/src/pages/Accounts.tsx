@@ -280,6 +280,7 @@ type AccountFilterRequestBody = {
   manually_used: string
   auth_type: string
   phone_binding_state: string
+  payment_link_platform: string
   subscription_type: string
   account_validity: string
   sub2api_state: string
@@ -296,6 +297,7 @@ const ACCOUNT_FILTER_REQUEST_KEYS: Array<keyof AccountFilterRequestBody> = [
   'manually_used',
   'auth_type',
   'phone_binding_state',
+  'payment_link_platform',
   'subscription_type',
   'account_validity',
   'sub2api_state',
@@ -421,6 +423,7 @@ type AccountColumnFilters = {
   manuallyUsed: string[]
   authType: string[]
   phoneBindingState: string[]
+  paymentLinkPlatform: string[]
   subscriptionType: string[]
   accountValidity: string[]
   codexState: string[]
@@ -435,6 +438,7 @@ const EMPTY_ACCOUNT_FILTERS: AccountColumnFilters = {
   manuallyUsed: [],
   authType: [],
   phoneBindingState: [],
+  paymentLinkPlatform: [],
   subscriptionType: [],
   accountValidity: [],
   codexState: [],
@@ -482,6 +486,14 @@ const MANUAL_USE_FILTER_OPTIONS = [
 const PHONE_BINDING_STATE_FILTER_OPTIONS = [
   { value: 'confirmed', text: '已绑定' },
   { value: 'unbound', text: '未绑定' },
+]
+
+const PAYMENT_LINK_PLATFORM_FILTER_OPTIONS = [
+  { value: 'pix', text: 'PIX' },
+  { value: 'paypal', text: 'PayPal' },
+  { value: 'chatgpt', text: 'ChatGPT 结账' },
+  { value: 'other', text: '其他支付链接' },
+  { value: 'none', text: '无支付链接' },
 ]
 
 const AUTH_TYPE_FILTER_OPTIONS = [
@@ -567,6 +579,7 @@ const ACCOUNT_FILTER_PRESET_COLUMN_KEYS: Array<keyof AccountColumnFilters> = [
   'manuallyUsed',
   'authType',
   'phoneBindingState',
+  'paymentLinkPlatform',
   'subscriptionType',
   'accountValidity',
   'sub2apiState',
@@ -595,6 +608,7 @@ function cloneAccountColumnFilters(value?: Partial<Record<keyof AccountColumnFil
     manuallyUsed: [],
     authType: [],
     phoneBindingState: [],
+    paymentLinkPlatform: [],
     subscriptionType: [],
     accountValidity: [],
     codexState: [],
@@ -689,6 +703,7 @@ export function buildAccountFilterPresetSummary(filters?: AccountFilterPresetFil
     summarizePresetValues(MANUAL_USE_FILTER_OPTIONS, columnFilters.manuallyUsed) ? `使用：${summarizePresetValues(MANUAL_USE_FILTER_OPTIONS, columnFilters.manuallyUsed)}` : '',
     summarizePresetValues(AUTH_TYPE_FILTER_OPTIONS, columnFilters.authType) ? `材料：${summarizePresetValues(AUTH_TYPE_FILTER_OPTIONS, columnFilters.authType)}` : '',
     summarizePresetValues(PHONE_BINDING_STATE_FILTER_OPTIONS, columnFilters.phoneBindingState) ? `手机号：${summarizePresetValues(PHONE_BINDING_STATE_FILTER_OPTIONS, columnFilters.phoneBindingState)}` : '',
+    summarizePresetValues(PAYMENT_LINK_PLATFORM_FILTER_OPTIONS, columnFilters.paymentLinkPlatform) ? `支付链接：${summarizePresetValues(PAYMENT_LINK_PLATFORM_FILTER_OPTIONS, columnFilters.paymentLinkPlatform)}` : '',
     summarizePresetValues(SUBSCRIPTION_TYPE_FILTER_OPTIONS, columnFilters.subscriptionType) ? `当前订阅：${summarizePresetValues(SUBSCRIPTION_TYPE_FILTER_OPTIONS, columnFilters.subscriptionType)}` : '',
     summarizePresetValues(ACCOUNT_VALIDITY_FILTER_OPTIONS, columnFilters.accountValidity) ? `认证状态：${summarizePresetValues(ACCOUNT_VALIDITY_FILTER_OPTIONS, columnFilters.accountValidity)}` : '',
     summarizePresetValues(SUB2API_FILTER_OPTIONS, columnFilters.sub2apiState) ? `Sub2API：${summarizePresetValues(SUB2API_FILTER_OPTIONS, columnFilters.sub2apiState)}` : '',
@@ -1265,9 +1280,15 @@ function normalizeAccount(account: any) {
     : {}
   const chatgptGopay = extra.chatgpt_gopay && typeof extra.chatgpt_gopay === 'object' ? extra.chatgpt_gopay : null
   const chatgptGopayDefaults = extra.chatgpt_gopay_defaults && typeof extra.chatgpt_gopay_defaults === 'object' ? extra.chatgpt_gopay_defaults : {}
-  const chatgptLastPaymentLink = extra.chatgpt_last_payment_link && typeof extra.chatgpt_last_payment_link === 'object'
-    ? extra.chatgpt_last_payment_link
-    : {}
+  const paymentLink = account.paymentLink && typeof account.paymentLink === 'object'
+    ? account.paymentLink
+    : account.payment_link && typeof account.payment_link === 'object'
+      ? account.payment_link
+      : account.chatgptLastPaymentLink && typeof account.chatgptLastPaymentLink === 'object'
+        ? account.chatgptLastPaymentLink
+        : extra.chatgpt_last_payment_link && typeof extra.chatgpt_last_payment_link === 'object'
+          ? extra.chatgpt_last_payment_link
+          : {}
   const chatgptPaymentLinkDefaults = extra.chatgpt_payment_link_defaults && typeof extra.chatgpt_payment_link_defaults === 'object'
     ? extra.chatgpt_payment_link_defaults
     : {}
@@ -1290,7 +1311,9 @@ function normalizeAccount(account: any) {
     chatgptPendingSubscriptionAuth,
     chatgptGopay,
     chatgptGopayDefaults,
-    chatgptLastPaymentLink,
+    chatgptLastPaymentLink: paymentLink,
+    paymentLink,
+    paymentLinkPlatform: String(account.payment_link_platform || paymentLink.platform || '').trim().toLowerCase(),
     chatgptPaymentLinkDefaults,
     phoneBinding,
     rateLimit,
@@ -2274,6 +2297,7 @@ export default function Accounts() {
     manuallyUsed: columnFilters.manuallyUsed.join(','),
     authType: columnFilters.authType.join(','),
     phoneBindingState: columnFilters.phoneBindingState.join(','),
+    paymentLinkPlatform: columnFilters.paymentLinkPlatform.join(','),
     subscriptionType: columnFilters.subscriptionType.join(','),
     accountValidity: columnFilters.accountValidity.join(','),
     sub2apiState: columnFilters.sub2apiState.join(','),
@@ -2290,6 +2314,7 @@ export default function Accounts() {
     manually_used: columnFilters.manuallyUsed.join(','),
     auth_type: columnFilters.authType.join(','),
     phone_binding_state: columnFilters.phoneBindingState.join(','),
+    payment_link_platform: columnFilters.paymentLinkPlatform.join(','),
     subscription_type: columnFilters.subscriptionType.join(','),
     account_validity: columnFilters.accountValidity.join(','),
     sub2api_state: columnFilters.sub2apiState.join(','),
@@ -2301,6 +2326,7 @@ export default function Accounts() {
     columnFilters.manuallyUsed,
     columnFilters.authType,
     columnFilters.phoneBindingState,
+    columnFilters.paymentLinkPlatform,
     columnFilters.subscriptionType,
     columnFilters.accountValidity,
     columnFilters.sub2apiState,
@@ -2385,7 +2411,7 @@ export default function Accounts() {
 
   useEffect(() => {
     setCurrentPage(1)
-  }, [debouncedSearch, filterStatus, columnFilters.manuallyUsed, columnFilters.authType, columnFilters.phoneBindingState, columnFilters.subscriptionType, columnFilters.accountValidity, columnFilters.sub2apiState, columnFilters.oaipayState, columnFilters.ideaSubmitState, subscriptionExpirySortOrder])
+  }, [debouncedSearch, filterStatus, columnFilters.manuallyUsed, columnFilters.authType, columnFilters.phoneBindingState, columnFilters.paymentLinkPlatform, columnFilters.subscriptionType, columnFilters.accountValidity, columnFilters.sub2apiState, columnFilters.oaipayState, columnFilters.ideaSubmitState, subscriptionExpirySortOrder])
 
   useEffect(() => {
     if (typeof document === 'undefined') return
@@ -2646,6 +2672,7 @@ export default function Accounts() {
     if (body.manually_used) params.set('manually_used', String(body.manually_used))
     if (body.auth_type) params.set('auth_type', String(body.auth_type))
     if (body.phone_binding_state) params.set('phone_binding_state', String(body.phone_binding_state))
+    if (body.payment_link_platform) params.set('payment_link_platform', String(body.payment_link_platform))
     if (body.subscription_type) params.set('subscription_type', String(body.subscription_type))
     if (body.account_validity) params.set('account_validity', String(body.account_validity))
     if (body.sub2api_state) params.set('sub2api_state', String(body.sub2api_state))
@@ -2748,6 +2775,7 @@ export default function Accounts() {
       status: normalized.status,
       authType: normalized.columnFilters.authType,
       phoneBindingState: normalized.columnFilters.phoneBindingState,
+      paymentLinkPlatform: normalized.columnFilters.paymentLinkPlatform,
       subscriptionType: normalized.columnFilters.subscriptionType,
       accountValidity: normalized.columnFilters.accountValidity,
       sub2apiState: normalized.columnFilters.sub2apiState,
@@ -2813,6 +2841,7 @@ export default function Accounts() {
       columnFilters: {
         authType: values.authType,
         phoneBindingState: values.phoneBindingState,
+        paymentLinkPlatform: values.paymentLinkPlatform,
         subscriptionType: values.subscriptionType,
         accountValidity: values.accountValidity,
         sub2apiState: values.sub2apiState,
@@ -5762,6 +5791,15 @@ export default function Accounts() {
             allowClear
             mode="multiple"
             size="small"
+            placeholder="支付链接"
+            value={columnFilters.paymentLinkPlatform}
+            options={toSelectOptions(PAYMENT_LINK_PLATFORM_FILTER_OPTIONS)}
+            onChange={(value) => setColumnFilters((prev) => ({ ...prev, paymentLinkPlatform: value }))}
+          />
+          <Select
+            allowClear
+            mode="multiple"
+            size="small"
             placeholder="当前订阅"
             value={columnFilters.subscriptionType}
             options={toSelectOptions(SUBSCRIPTION_TYPE_FILTER_OPTIONS)}
@@ -5874,15 +5912,26 @@ export default function Accounts() {
   }
 
   const renderPaymentLinkState = (record: any) => {
-    const link = record?.chatgptLastPaymentLink && typeof record.chatgptLastPaymentLink === 'object'
-      ? record.chatgptLastPaymentLink
-      : record?.extra?.chatgpt_last_payment_link && typeof record.extra.chatgpt_last_payment_link === 'object'
-        ? record.extra.chatgpt_last_payment_link
-        : {}
+    const link = record?.paymentLink && typeof record.paymentLink === 'object'
+      ? record.paymentLink
+      : record?.payment_link && typeof record.payment_link === 'object'
+        ? record.payment_link
+        : record?.chatgptLastPaymentLink && typeof record.chatgptLastPaymentLink === 'object'
+          ? record.chatgptLastPaymentLink
+          : record?.extra?.chatgpt_last_payment_link && typeof record.extra.chatgpt_last_payment_link === 'object'
+            ? record.extra.chatgpt_last_payment_link
+            : {}
     const url = String(link.url || '').trim()
     const status = String(link.link_status || '').trim().toLowerCase()
     const format = String(link.payment_link_format || '').trim().toLowerCase()
-    const linkType = String(link.link_type || '').trim().toUpperCase()
+    const platform = String(record?.paymentLinkPlatform || record?.payment_link_platform || link.platform || '').trim().toLowerCase()
+    const platformLabel = ({
+      pix: 'PIX',
+      paypal: 'PAYPAL',
+      chatgpt: 'CHATGPT',
+      other: '其他',
+    } as Record<string, string>)[platform]
+    const linkType = platformLabel || String(link.link_type || '').trim().toUpperCase()
       || (format === 'paypal_url' ? 'PAYPAL' : format === 'long_link' ? 'LONG-LINK' : '历史')
     const generatedAt = formatCompactDateTime(String(link.generated_at || link.created_at || '').trim())
     const statusMeta = (() => {
@@ -6714,9 +6763,14 @@ export default function Accounts() {
         render: (_: any, record: any) => renderIdeaSubmitState(record),
       },
       {
-        title: '支付链接',
+        title: renderColumnFilterTitle(
+          '支付链接',
+          columnFilters.paymentLinkPlatform,
+          PAYMENT_LINK_PLATFORM_FILTER_OPTIONS,
+          (next) => setColumnFilters((prev) => ({ ...prev, paymentLinkPlatform: next })),
+        ),
         key: 'payment_link',
-        width: 176,
+        width: 184,
         render: (_: any, record: any) => renderPaymentLinkState(record),
       },
       {
@@ -7468,6 +7522,9 @@ export default function Accounts() {
                 </Form.Item>
                 <Form.Item name="phoneBindingState" label="手机号绑定" style={{ marginBottom: 0 }}>
                   <Select mode="multiple" placeholder="全部绑定情况" options={PHONE_BINDING_STATE_FILTER_OPTIONS} allowClear />
+                </Form.Item>
+                <Form.Item name="paymentLinkPlatform" label="支付链接" style={{ marginBottom: 0 }}>
+                  <Select mode="multiple" placeholder="全部支付链接平台" options={PAYMENT_LINK_PLATFORM_FILTER_OPTIONS} allowClear />
                 </Form.Item>
                 <Form.Item name="subscriptionType" label="当前订阅" style={{ marginBottom: 0 }}>
                   <Select mode="multiple" placeholder="全部当前订阅" options={SUBSCRIPTION_TYPE_FILTER_OPTIONS} allowClear />
