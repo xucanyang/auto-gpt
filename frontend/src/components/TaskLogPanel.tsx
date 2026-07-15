@@ -13,6 +13,7 @@ interface TaskLogPanelProps {
 
 type TaskPanelStatus = 'idle' | TaskTerminalStatus
 type LogViewMode = 'info' | 'debug'
+type StopMode = 'none' | 'after_current' | 'immediate'
 type TaskCurrentState = {
   task?: string
   task_label?: string
@@ -60,7 +61,7 @@ export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
   )
   const [skipLoading, setSkipLoading] = useState(false)
   const [stopLoading, setStopLoading] = useState(false)
-  const [stopRequested, setStopRequested] = useState(false)
+  const [stopMode, setStopMode] = useState<StopMode>('none')
   const [viewMode, setViewMode] = useState<LogViewMode>(() => {
     if (typeof window === 'undefined') return 'info'
     const saved = window.localStorage.getItem(LOG_VIEW_STORAGE_KEY)
@@ -72,7 +73,12 @@ export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
   const terminalNotifyRef = useRef('')
   const doneCallbackNotifyRef = useRef('')
 
-  const isFinished = terminalStatus !== 'idle' || stopRequested
+  const isFinished = terminalStatus !== 'idle'
+  const interactionLocked = isFinished || stopMode !== 'none'
+  const supportsStopAfterCurrent = Boolean(
+    taskSnapshot?.capabilities?.stop_after_current
+      || taskSnapshot?.capabilities?.stop_modes?.includes?.('after_current'),
+  )
 
   const parsedLines = useMemo(() => lines.map(parseLogLine), [lines])
   const infoCount = useMemo(() => parsedLines.filter((line) => !line.isDebug).length, [parsedLines])
@@ -104,7 +110,7 @@ export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
   }
 
   const handleSkipCurrent = async () => {
-    if (isFinished) return
+    if (interactionLocked) return
     setSkipLoading(true)
     try {
       const response = await apiFetch(`/tasks/${taskId}/skip-current`, { method: 'POST' }) as {
@@ -124,13 +130,35 @@ export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
     }
   }
 
-  const handleStopTask = async () => {
-    if (isFinished) return
+  const handleStopTask = async (mode: Exclude<StopMode, 'none'>) => {
+    if (isFinished || stopLoading || (mode === 'after_current' && stopMode !== 'none') || (mode === 'immediate' && stopMode === 'immediate')) return
     setStopLoading(true)
     try {
-      await apiFetch(`/tasks/${taskId}/stop`, { method: 'POST' })
-      setStopRequested(true)
-      message.success('已发送停止任务请求，正在停止进行中的线程')
+      const response = await apiFetch(`/tasks/${taskId}/stop`, {
+        method: 'POST',
+        body: JSON.stringify({ mode }),
+      }) as {
+        control?: {
+          stop_mode?: StopMode
+          stop_requested?: boolean
+          stop_after_current_requested?: boolean
+        }
+      }
+      const returnedMode = response.control?.stop_mode
+      setStopMode(
+        returnedMode === 'after_current' || returnedMode === 'immediate'
+          ? returnedMode
+          : response.control?.stop_requested
+            ? 'immediate'
+            : response.control?.stop_after_current_requested
+              ? 'after_current'
+              : mode,
+      )
+      if (mode === 'after_current') {
+        message.success('已停止后续账号投递；当前执行中的账号会正常完成，日志已保存')
+      } else {
+        message.success('已请求立即停止；已运行日志已保存，正在等待任务收口')
+      }
     } catch (error_: unknown) {
       const detail = error_ instanceof Error ? error_.message : '请求失败'
       message.error(detail)
@@ -177,7 +205,7 @@ export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
     setLines([])
     setError('')
     setTerminalStatus('idle')
-    setStopRequested(false)
+    setStopMode('none')
     setTaskSnapshot(null)
 
     const sleep = (ms: number) => new Promise<void>((resolve) => {
@@ -216,7 +244,12 @@ export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
           logs?: string[]
           status?: TaskTerminalStatus | string
           status_snapshot?: string
-          control?: { stop_requested?: boolean }
+          control?: {
+            stop_requested?: boolean
+            stop_after_current_requested?: boolean
+            after_current_requested?: boolean
+            stop_mode?: StopMode
+          }
           meta?: { current?: TaskCurrentState }
         }
         if (cancelled) return true
@@ -225,7 +258,16 @@ export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
         const snapshotLines = Array.isArray(snapshot.logs) ? snapshot.logs : []
         setLines(snapshotLines)
         nextSinceRef.current = snapshotLines.length
-        setStopRequested(Boolean(snapshot.control?.stop_requested))
+        const snapshotStopMode = snapshot.control?.stop_mode
+        setStopMode(
+          snapshotStopMode === 'after_current' || snapshotStopMode === 'immediate'
+            ? snapshotStopMode
+            : snapshot.control?.stop_requested
+              ? 'immediate'
+              : snapshot.control?.stop_after_current_requested || snapshot.control?.after_current_requested
+                ? 'after_current'
+                : 'none',
+        )
         setCurrent(snapshot?.meta?.current && typeof snapshot.meta.current === 'object' ? snapshot.meta.current : null)
 
         const terminal = getTaskTerminalStatus(snapshot.status || snapshot.status_snapshot)
@@ -392,19 +434,29 @@ export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
             icon={<FastForwardOutlined />}
             onClick={handleSkipCurrent}
             loading={skipLoading}
-            disabled={isFinished}
+            disabled={interactionLocked}
           >
             跳过当前账号
           </Button>
+          {supportsStopAfterCurrent ? (
+            <Button
+              size="small"
+              onClick={() => handleStopTask('after_current')}
+              loading={stopLoading && stopMode === 'none'}
+              disabled={isFinished || stopMode !== 'none'}
+            >
+              完成当前后停止
+            </Button>
+          ) : null}
           <Button
             size="small"
             danger
             icon={<StopOutlined />}
-            onClick={handleStopTask}
+            onClick={() => handleStopTask('immediate')}
             loading={stopLoading}
-            disabled={isFinished}
+            disabled={isFinished || stopMode === 'immediate'}
           >
-            停止任务
+            立即停止
           </Button>
         </Space>
         <Space>

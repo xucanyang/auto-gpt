@@ -7,7 +7,7 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlmodel import Session, select
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 from copy import deepcopy
 from core.db import AccountModel, TaskLog, engine
 from core.pix_cdk_usage import (
@@ -245,6 +245,10 @@ class VerificationActionRequest(BaseModel):
     challenge_id: str
     action: str
     payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class StopTaskRequest(BaseModel):
+    mode: Literal["immediate", "after_current"] = "immediate"
 
 
 class ResumeSubscriptionAuthTaskRequest(BaseModel):
@@ -618,6 +622,8 @@ def _create_task_record(
         total=req.count,
         source=source,
         meta=meta,
+        # Only the registration runner can safely drain active account attempts.
+        supports_after_current=True,
     )
 
 
@@ -691,6 +697,7 @@ def _create_standalone_task_record(
     source: str,
     total: int = 1,
     meta: dict | None = None,
+    supports_after_current: bool = True,
 ) -> None:
     _task_store.create(
         task_id,
@@ -698,6 +705,10 @@ def _create_standalone_task_record(
         total=max(int(total or 1), 1),
         source=source,
         meta=meta,
+        # Most standalone records are account/order batches and use the same
+        # dispatch gate.  One-account external sessions (for example GoPay)
+        # opt out explicitly because "完成当前后停止" has no next item.
+        supports_after_current=supports_after_current,
     )
 
 
@@ -2641,7 +2652,7 @@ def _run_icloud_hme_recheck_batch(
                 results.append({"email": email, "ok": False, "status": "skipped", "message": "队列项缺少 id/email"})
                 continue
 
-            attempt_id = control.start_attempt()
+            attempt_id = _claim_next_task_attempt(control)
             try:
                 control.checkpoint(attempt_id=attempt_id)
                 _log(task_id, f"[HME复测] -------- {index}/{total} | {email} --------")
@@ -4676,6 +4687,40 @@ def _log(
     print(entry)
 
 
+def _claim_next_task_attempt(control) -> int:
+    """Claim one new account/phone/order at a graceful-stop boundary.
+
+    Every batch runner calls this immediately before it begins a new unit of
+    work.  ``RegisterTaskControl.start_attempt`` returns ``None`` only after
+    an after-current request (or an immediate request racing a dispatcher).
+    Convert that into the existing cooperative stop path for serial runners;
+    already claimed attempts never call this helper again and therefore finish
+    normally under graceful mode.
+    """
+    attempt_id = control.start_attempt()
+    if attempt_id is None:
+        raise StopTaskRequested("已完成当前执行单元，停止后续任务")
+    return attempt_id
+
+
+def _sleep_with_task_control(
+    control,
+    seconds: float,
+    *,
+    attempt_id: int | None = None,
+    interval_seconds: float = 0.5,
+) -> None:
+    """Sleep in bounded slices so immediate stop is never delayed by a timer."""
+    remaining = max(float(seconds or 0), 0.0)
+    interval = max(min(float(interval_seconds or 0.5), 1.0), 0.05)
+    while remaining > 0:
+        control.checkpoint(attempt_id=attempt_id)
+        chunk = min(interval, remaining)
+        time.sleep(chunk)
+        remaining -= chunk
+    control.checkpoint(attempt_id=attempt_id)
+
+
 def _clear_task_current(task_id: str) -> None:
     task_key = str(task_id or "").strip()
     stale_keys = [key for key in _TASK_STAGE_STARTED_AT if key[0] == task_key]
@@ -4797,7 +4842,11 @@ def _task_timeline_log(
 
 
 def _save_task_log(
-    platform: str, email: str, status: str, error: str = "", detail: dict = None
+    platform: str | None,
+    email: str | None,
+    status: str,
+    error: str = "",
+    detail: dict | None = None,
 ):
     """Write or update one TaskLog record per task_id."""
     raw_detail = detail or {}
@@ -4828,15 +4877,29 @@ def _save_task_log(
             log = TaskLog(
                 task_id=task_id,
                 platform=platform,
-                email=email,
+                # Control snapshots often precede selection of the first
+                # account.  TaskLog.email is NOT NULL, while ``None`` on an
+                # existing row intentionally means preserve its email.
+                email=email if email is not None else "",
                 status=status,
                 error=safe_error,
                 detail_json=json.dumps(safe_detail, ensure_ascii=False),
             )
             s.add(log)
         else:
-            log.platform = platform
-            log.email = email
+            # Control/terminal snapshots do not have a meaningful "current"
+            # email for random-mail registrations.  Do not erase the email
+            # recorded by an earlier account-level snapshot with an empty
+            # control action.
+            if platform is not None:
+                log.platform = platform
+            if email is not None:
+                log.email = email
+            # A terminal callback may win the race with a stop-click
+            # checkpoint.  Never turn a completed history row back into
+            # running merely because the click was processed concurrently.
+            if log.status in {"done", "failed", "stopped"} and status == "running":
+                return
             log.status = status
             log.error = safe_error
             log.detail_json = json.dumps(safe_detail, ensure_ascii=False)
@@ -4844,11 +4907,17 @@ def _save_task_log(
         s.commit()
 
 
-def _build_task_log_detail(task_id: str, extra: dict | None = None) -> dict:
-    try:
-        snapshot = _task_store.snapshot(task_id)
-    except Exception:
-        snapshot = {}
+def _build_task_log_detail(
+    task_id: str,
+    extra: dict | None = None,
+    *,
+    snapshot: dict[str, Any] | None = None,
+) -> dict:
+    if snapshot is None:
+        try:
+            snapshot = _task_store.snapshot(task_id)
+        except Exception:
+            snapshot = {}
     detail = {
         "task_id": task_id,
         "status_snapshot": str(snapshot.get("status") or ""),
@@ -4860,10 +4929,90 @@ def _build_task_log_detail(task_id: str, extra: dict | None = None) -> dict:
         "source": str(snapshot.get("source") or ""),
         "meta": dict(snapshot.get("meta") or {}),
         "logs": list(snapshot.get("logs") or []),
+        "control": dict(snapshot.get("control") or {}),
+        "capabilities": dict(snapshot.get("capabilities") or {}),
     }
     if extra:
         detail.update(extra)
     return detail
+
+
+def _persist_task_snapshot(
+    task_id: str,
+    *,
+    status: str | None = None,
+    attempt_outcome: str,
+    error: str = "",
+    snapshot: dict[str, Any] | None = None,
+) -> None:
+    """Upsert the complete in-memory task snapshot into TaskLog.
+
+    Task logs are intentionally not synchronously written for every line: a
+    registration can emit a high volume of polling/debug lines and SQLite lock
+    contention would make the runner less reliable.  A control action and the
+    final task state are durable boundaries, so persist a full snapshot at both
+    points.  This protects all log lines emitted before a user clicks stop and
+    all lines emitted while the runner drains/interupts afterwards.
+    """
+    if snapshot is None:
+        snapshot = _task_store.snapshot(task_id)
+    meta = snapshot.get("meta") if isinstance(snapshot.get("meta"), dict) else {}
+    snapshot_email = str(meta.get("email") or "").strip()
+    if not snapshot_email:
+        emails = meta.get("emails")
+        if isinstance(emails, list) and emails:
+            snapshot_email = str(emails[0] or "").strip()
+    _save_task_log(
+        str(snapshot.get("platform") or ""),
+        # ``None`` preserves an existing TaskLog.email; _save_task_log writes
+        # an empty value only when this is the first control snapshot.
+        snapshot_email or None,
+        str(status or snapshot.get("status") or "running"),
+        error=error or str(snapshot.get("error") or ""),
+        detail=_build_task_log_detail(
+            task_id,
+            {
+                "attempt_outcome": attempt_outcome,
+                "stop_mode": str((snapshot.get("control") or {}).get("stop_mode") or ""),
+            },
+            snapshot=snapshot,
+        ),
+    )
+
+
+def _persist_terminal_task_snapshot(task_id: str, snapshot: dict[str, Any]) -> None:
+    """Store callback: terminal runners always leave a complete TaskLog row."""
+    terminal_status = str(snapshot.get("status") or "stopped")
+    _persist_task_snapshot(
+        task_id,
+        status=terminal_status,
+        attempt_outcome=f"task_{terminal_status}",
+        error=str(snapshot.get("error") or ""),
+        snapshot=snapshot,
+    )
+
+
+# Keep all task implementations honest: many historical runners wrote their
+# own per-account TaskLog rows but did not persist a final in-memory snapshot
+# after an interrupt.  The store callback covers normal completion, failures
+# and either stop mode without forcing high-frequency SQLite writes in _log().
+_task_store.set_terminal_callback(_persist_terminal_task_snapshot)
+
+
+def _persist_register_task_snapshot(
+    task_id: str,
+    req: RegisterTaskRequest,
+    *,
+    attempt_outcome: str,
+    error: str = "",
+) -> None:
+    """Compatibility wrapper for registration runner persistence points."""
+    del req
+    _persist_task_snapshot(
+        task_id,
+        attempt_outcome=attempt_outcome,
+        error=error,
+    )
 
 
 TASK_LOG_META_SUMMARY_KEYS = {
@@ -5132,7 +5281,7 @@ def _run_resume_subscription_auth(
             next_step="恢复邮箱状态并进入 OAuth 登录",
             reset_started_at=True,
         )
-        attempt_id = control.start_attempt()
+        attempt_id = _claim_next_task_attempt(control)
         try:
             control.checkpoint(attempt_id=attempt_id)
             with Session(engine) as session:
@@ -5318,7 +5467,7 @@ def _run_custom_email_recheck(
     _task_store.set_progress(task_id, "0/1")
     errors: list[str] = []
     try:
-        attempt_id = control.start_attempt()
+        attempt_id = _claim_next_task_attempt(control)
         try:
             control.checkpoint(attempt_id=attempt_id)
             candidate_proxies = _build_custom_email_recheck_candidate_proxies(proxy_settings)
@@ -5621,7 +5770,7 @@ def _run_batch_custom_email_recheck(
                     "results": results,
                 },
             )
-            attempt_id = control.start_attempt()
+            attempt_id = _claim_next_task_attempt(control)
             try:
                 control.checkpoint(attempt_id=attempt_id)
                 _task_timeline_log(
@@ -5951,7 +6100,7 @@ def _run_invalid_recheck(task_id: str, account_id: int):
             next_step="无 RT 登录测活并抓取 AccessToken",
             reset_started_at=True,
         )
-        attempt_id = control.start_attempt()
+        attempt_id = _claim_next_task_attempt(control)
         try:
             control.checkpoint(attempt_id=attempt_id)
             with Session(engine) as session:
@@ -6156,7 +6305,7 @@ def _run_batch_sub2api_upload(task_id: str, account_ids: list[int]):
         for index, account_id in enumerate(account_ids, start=1):
             control.checkpoint(consume_skip=False)
             email = ""
-            attempt_id = control.start_attempt()
+            attempt_id = _claim_next_task_attempt(control)
             try:
                 control.checkpoint(attempt_id=attempt_id)
                 with Session(engine) as session:
@@ -6308,7 +6457,7 @@ def _run_batch_oaipay_upload(
         for index, account_id in enumerate(account_ids, start=1):
             control.checkpoint(consume_skip=False)
             email = ""
-            attempt_id = control.start_attempt()
+            attempt_id = _claim_next_task_attempt(control)
             try:
                 control.checkpoint(attempt_id=attempt_id)
                 with Session(engine) as session:
@@ -6970,9 +7119,15 @@ def _run_pix_submit(
     stop_new_submissions = False
     attempt_id: int | None = None
     try:
-        attempt_id = control.start_attempt()
+        attempt_id = _claim_next_task_attempt(control)
         while pending_accounts or active_orders:
             control.checkpoint(attempt_id=attempt_id)
+            if control.is_stop_after_current_requested() and pending_accounts:
+                stop_new_submissions = True
+                mark_remaining_unsubmitted(
+                    pending_accounts,
+                    "已请求完成当前后停止；不再预留 CDK 或提交新的 PIX 订单",
+                )
             target_reached = target_success_count > 0 and success_count >= target_success_count
             if target_reached and pending_accounts:
                 mark_remaining_unsubmitted(
@@ -6987,6 +7142,13 @@ def _run_pix_submit(
             # A target count is a submit window: do not create more in-flight
             # PIX tasks than can still contribute to the target.
             while pending_accounts and available_cdks and not stop_new_submissions and not target_reached:
+                if control.is_stop_after_current_requested():
+                    stop_new_submissions = True
+                    mark_remaining_unsubmitted(
+                        pending_accounts,
+                        "已请求完成当前后停止；不再预留 CDK 或提交新的 PIX 订单",
+                    )
+                    break
                 if target_success_count > 0 and len(active_orders) >= max(target_success_count - success_count, 0):
                     break
                 control.checkpoint(attempt_id=attempt_id)
@@ -7022,15 +7184,46 @@ def _run_pix_submit(
                     continue
 
                 cdk = available_cdks.pop(0)
+                if control.is_stop_after_current_requested():
+                    # No reservation was made yet.  Restore the in-memory
+                    # candidate and leave the account for the unsubmitted
+                    # drain record below.
+                    available_cdks.insert(0, cdk)
+                    stop_new_submissions = True
+                    mark_remaining_unsubmitted(
+                        pending_accounts,
+                        "已请求完成当前后停止；不再预留 CDK 或提交新的 PIX 订单",
+                    )
+                    break
                 usage = _pix_cdk_usage_store.reserve(
                     cdk["fingerprint"], task_id=task_id, account_id=account_id,
                 )
                 if usage.state != PIX_CDK_STATE_RESERVED or usage.task_id != task_id or usage.account_id != account_id:
                     _log(task_id, f"[SKIP][PIX] {cdk['label']} 已成功核销、处理中或待复核，跳过该 CDK")
                     continue
+                if control.is_stop_after_current_requested():
+                    # The reservation is task-local and no upstream call has
+                    # happened, so release it before recording this account
+                    # as deliberately unsubmitted.
+                    release_cdk(cdk, account_id, reusable=True, requeue=True)
+                    stop_new_submissions = True
+                    mark_remaining_unsubmitted(
+                        pending_accounts,
+                        "已请求完成当前后停止；不再预留 CDK 或提交新的 PIX 订单",
+                    )
+                    break
                 pending_accounts.pop(0)
                 _log(task_id, f"[PIX] 提交上游: {email or account_id}")
                 try:
+                    if control.is_stop_after_current_requested():
+                        pending_accounts.insert(0, item)
+                        release_cdk(cdk, account_id, reusable=True, requeue=True)
+                        stop_new_submissions = True
+                        mark_remaining_unsubmitted(
+                            pending_accounts,
+                            "已请求完成当前后停止；不再预留 CDK 或提交新的 PIX 订单",
+                        )
+                        break
                     submit_result = client.submit_pix(pix_cdk=cdk["code"], access_token=token)
                     if not bool(submit_result.get("ok")):
                         reason = safe_text(submit_result.get("message") or "PIX 上游提交失败")
@@ -7352,10 +7545,11 @@ def _run_pix_submit(
             errors=errors,
             error=finish_error,
         )
+        terminal_status = str(_task_store.snapshot(task_id).get("status") or log_status)
         _save_task_log(
             "chatgpt",
             primary_email,
-            log_status,
+            terminal_status,
             error=finish_error,
             detail=_build_task_log_detail(
                 task_id,
@@ -7502,6 +7696,22 @@ def _run_baxigpt_cdk_submit(task_id: str, pairs: list[dict[str, Any]], settings:
         )
         sync_meta()
 
+    def mark_remaining_unsubmitted(reason: str) -> None:
+        """Drain accounts that have not entered an upstream Idea order."""
+        nonlocal skipped_count
+        while pending_accounts:
+            item = pending_accounts.pop(0)
+            skipped_count += 1
+            _log(task_id, f"[UNSUBMITTED] 未提交账号: {item.get('email')} - {reason}")
+            append_result(
+                account_id=item["account_id"],
+                email=item.get("email"),
+                cdk_id=item.get("last_cdk_id") or item.get("cdk_id"),
+                code_masked=item.get("last_code_masked"),
+                status="unsubmitted",
+                reason=reason,
+            )
+
     def log_debug(message: str) -> None:
         _log(task_id, f"[DEBUG][Idea] {message}")
 
@@ -7628,6 +7838,8 @@ def _run_baxigpt_cdk_submit(task_id: str, pairs: list[dict[str, Any]], settings:
         unavailable_cdk_reasons: list[str] = []
         for cid in candidate_cdk_ids:
             control.checkpoint()
+            if control.is_stop_after_current_requested():
+                break
             rec = repo.get_by_id(cid)
             if not rec:
                 _log(task_id, f"[SKIP] 卡密不存在: cdk_id={cid}")
@@ -7663,7 +7875,8 @@ def _run_baxigpt_cdk_submit(task_id: str, pairs: list[dict[str, Any]], settings:
 
         # 3. 逐一提交与处理结果轮询 (完全模拟单账号提交与动态查额度)
         active_orders: list[dict[str, Any]] = []
-        attempt_id = control.start_attempt()
+        stop_new_submissions = False
+        attempt_id = _claim_next_task_attempt(control)
         def target_reached() -> bool:
             return target_success_count > 0 and success_count >= target_success_count
 
@@ -7676,6 +7889,10 @@ def _run_baxigpt_cdk_submit(task_id: str, pairs: list[dict[str, Any]], settings:
         try:
             while pending_accounts or active_orders:
                 control.checkpoint(attempt_id=attempt_id)
+
+                if control.is_stop_after_current_requested() and pending_accounts:
+                    stop_new_submissions = True
+                    mark_remaining_unsubmitted("已请求完成当前后停止；不再预查卡密或提交新的 Idea 订单")
 
                 if target_reached():
                     if pending_accounts:
@@ -7696,7 +7913,7 @@ def _run_baxigpt_cdk_submit(task_id: str, pairs: list[dict[str, Any]], settings:
                         break
                 
                 # 1. 逐一提交 (完全模拟单账号提交与动态查额度)
-                if pending_accounts and not target_reached():
+                if pending_accounts and not stop_new_submissions and not target_reached():
                     last_pending_count = -1
                     # 在进入轮询前，尽可能把本轮能提交的全部提交完
                     while pending_accounts and len(pending_accounts) != last_pending_count and not target_reached() and not submit_window_full():
@@ -7706,6 +7923,10 @@ def _run_baxigpt_cdk_submit(task_id: str, pairs: list[dict[str, Any]], settings:
                         
                         while pending_accounts:
                             control.checkpoint(attempt_id=attempt_id)
+                            if control.is_stop_after_current_requested():
+                                stop_new_submissions = True
+                                mark_remaining_unsubmitted("已请求完成当前后停止；不再预查卡密或提交新的 Idea 订单")
+                                break
                             if target_reached():
                                 break
                             if submit_window_full():
@@ -7717,6 +7938,9 @@ def _run_baxigpt_cdk_submit(task_id: str, pairs: list[dict[str, Any]], settings:
                             for cid, cdk_data in list(active_cdks.items()):
                                 rec = cdk_data["record"]
                                 try:
+                                    if control.is_stop_after_current_requested():
+                                        stop_new_submissions = True
+                                        break
                                     log_debug(f"提交前查验卡密: {rec.code_masked}")
                                     info = client.code_info(rec.code_value)
                                     ok = bool(info.get("ok"))
@@ -7733,6 +7957,9 @@ def _run_baxigpt_cdk_submit(task_id: str, pairs: list[dict[str, Any]], settings:
                                     cdk_data["remaining"] = 0
                                     continue
                                     
+                            if stop_new_submissions:
+                                mark_remaining_unsubmitted("已请求完成当前后停止；不再预查卡密或提交新的 Idea 订单")
+                                break
                             if not assigned_cdk:
                                 _log(task_id, f"[Idea] 卡密池已无可用额度，本轮剩余 {len(pending_accounts)} 个排队账号等待中...")
                                 unassignable_accounts.extend(pending_accounts)
@@ -7741,6 +7968,11 @@ def _run_baxigpt_cdk_submit(task_id: str, pairs: list[dict[str, Any]], settings:
                                 
                             rec = assigned_cdk["record"]
                             pending_accounts.pop(0)
+                            if control.is_stop_after_current_requested():
+                                pending_accounts.insert(0, acc_item)
+                                stop_new_submissions = True
+                                mark_remaining_unsubmitted("已请求完成当前后停止；不再提交新的 Idea 订单")
+                                break
                             
                             with Session(engine) as session:
                                 acc = session.get(AccountModel, int(acc_item["account_id"]))
@@ -7758,6 +7990,11 @@ def _run_baxigpt_cdk_submit(task_id: str, pairs: list[dict[str, Any]], settings:
                                     
                             _log(task_id, f"[Idea] 提交上游 (单行模式): 账号 {acc_item.get('email')} -> 卡密 {rec.code_masked}")
                             try:
+                                if control.is_stop_after_current_requested():
+                                    pending_accounts.insert(0, acc_item)
+                                    stop_new_submissions = True
+                                    mark_remaining_unsubmitted("已请求完成当前后停止；不再提交新的 Idea 订单")
+                                    break
                                 res = client.submit(code=rec.code_value, access_token=token)
                                 log_debug(f"submit response {rec.code_masked}: {response_brief(res)}")
                                 if not bool(res.get("ok")):
@@ -7883,7 +8120,11 @@ def _run_baxigpt_cdk_submit(task_id: str, pairs: list[dict[str, Any]], settings:
                         break
                     
                 _log(task_id, f"[Idea] 等待上游处理结果中，当前监控处理中订单: {len(active_orders)} 个 (轮询间隔: {status_poll_interval_seconds}s)...")
-                time.sleep(status_poll_interval_seconds)
+                _sleep_with_task_control(
+                    control,
+                    status_poll_interval_seconds,
+                    attempt_id=attempt_id,
+                )
                 
                 still_active = []
                 for order in active_orders:
@@ -7959,10 +8200,10 @@ def _run_baxigpt_cdk_submit(task_id: str, pairs: list[dict[str, Any]], settings:
                         append_result(account_id=vb["item"]["account_id"], email=vb["item"].get("email"), cdk_id=rec.id, code_masked=rec.code_masked, status="failed", reason=err_text, order_id=order_id, display_id=order["display_id"], idea_marked_unavailable=should_mark_unavailable)
                         
                         # 2. 提交失败则卡密额度未消耗，若有候选账号继续换额度提交
-                        if failure_continue and pending_accounts:
-                            next_item = pending_accounts.pop(0)
-                            _log(task_id, f"[Idea] 账号 {vb['item'].get('email')} 失败释放 1 个卡密额度，自动取出候补账号 {next_item.get('email')} 继续提交...")
-                            pending_accounts.insert(0, next_item)
+                        if failure_continue and pending_accounts and not control.is_stop_after_current_requested():
+                            _log(task_id, f"[Idea] 账号 {vb['item'].get('email')} 失败，保留候补账号等待下一轮提交")
+                        elif control.is_stop_after_current_requested() and pending_accounts:
+                            mark_remaining_unsubmitted("已请求完成当前后停止；失败订单不再换候补账号提交")
                         elif not failure_continue:
                             _log(task_id, "[Idea] 失败后继续已关闭，停止后续账号提交")
                             pending_accounts.clear()
@@ -8032,10 +8273,11 @@ def _run_baxigpt_cdk_submit(task_id: str, pairs: list[dict[str, Any]], settings:
             errors=errors,
             error=finish_error,
         )
+        terminal_status = str(_task_store.snapshot(task_id).get("status") or log_status)
         _save_task_log(
             "chatgpt",
             primary_email,
-            log_status,
+            terminal_status,
             error="" if log_status == "success" else summary_message,
             detail=_build_task_log_detail(
                 task_id,
@@ -8320,13 +8562,25 @@ def _run_chatgpt_oaipay_approval(task_id: str, account_ids: list[int], settings:
 
     def run_one(index: int, account_id: int, *, start_delay: float = 0.0) -> dict[str, Any]:
         nonlocal primary_email
-        attempt_id = control.start_attempt()
+        # A Future may have been accepted just before a graceful request but
+        # not actually begun.  It is not an active account and must quietly
+        # drain without escalating graceful stop into an immediate interrupt.
+        attempt_id: int | None = None
         email = ""
         try:
-            control.checkpoint(attempt_id=attempt_id)
+            control.checkpoint()
             if start_delay > 0:
                 _log(task_id, f"[OaiPay] {index}/{len(account_ids)} 延时 {start_delay:g}s 后提交")
-                wait_seconds(start_delay, attempt_id=attempt_id)
+                # Delay is queueing, not an already-started account.  It
+                # remains interruptible for immediate stop only; graceful is
+                # checked immediately before the upstream work is claimed.
+                wait_seconds(start_delay)
+            attempt_id = control.start_attempt()
+            if attempt_id is None:
+                if control.is_stop_requested():
+                    raise StopTaskRequested()
+                return {"account_id": account_id, "status": "not_started"}
+            control.checkpoint(attempt_id=attempt_id)
             email, access_token = load_account(account_id)
             if not primary_email and email:
                 primary_email = email
@@ -8498,11 +8752,20 @@ def _run_chatgpt_oaipay_approval(task_id: str, account_ids: list[int], settings:
         if submit_mode == "batch":
             _log(task_id, f"[OaiPay] 批量提交模式: max_workers={batch_max_workers} start_delay={submit_delay_seconds:g}s")
             completed = 0
-            with ThreadPoolExecutor(max_workers=min(batch_max_workers, max(len(account_ids), 1))) as executor:
-                pending = {
-                    executor.submit(run_one, index, account_id, start_delay=(index - 1) * submit_delay_seconds): (index, account_id)
-                    for index, account_id in enumerate(account_ids, start=1)
-                }
+            max_workers = min(batch_max_workers, max(len(account_ids), 1))
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                pending: dict[Any, tuple[int, int]] = {}
+                next_index = 0
+                while (
+                    next_index < len(account_ids)
+                    and len(pending) < max_workers
+                    and not control.should_stop_starting_new_attempts()
+                ):
+                    index = next_index + 1
+                    account_id = account_ids[next_index]
+                    future = executor.submit(run_one, index, account_id, start_delay=(index - 1) * submit_delay_seconds)
+                    pending[future] = (index, account_id)
+                    next_index += 1
                 while pending:
                     control.checkpoint(consume_skip=False)
                     done, _ = wait(pending, timeout=0.5, return_when=FIRST_COMPLETED)
@@ -8521,9 +8784,26 @@ def _run_chatgpt_oaipay_approval(task_id: str, account_ids: list[int], settings:
                         _task_store.set_progress(task_id, f"{completed}/{total}")
                         if errors and not failure_continue:
                             _log(task_id, "[OaiPay] 已出现失败；批量模式下已派发的请求会等待结束")
+                        if (
+                            next_index < len(account_ids)
+                            and not control.should_stop_starting_new_attempts()
+                        ):
+                            next_position = next_index + 1
+                            next_account_id = account_ids[next_index]
+                            next_future = executor.submit(
+                                run_one,
+                                next_position,
+                                next_account_id,
+                                start_delay=0,
+                            )
+                            pending[next_future] = (next_position, next_account_id)
+                            next_index += 1
                     sync_meta()
         else:
             for index, account_id in enumerate(account_ids, start=1):
+                if control.is_stop_after_current_requested():
+                    _log(task_id, "[CONTROL] 已完成当前账号，停止后续 OaiPay 提交")
+                    break
                 control.checkpoint(consume_skip=False)
                 result = run_one(index, account_id)
                 if str(result.get("status") or "") == "failed":
@@ -8936,7 +9216,7 @@ def _run_chatgpt_paypal_bind(task_id: str, account_ids: list[int], settings: dic
     try:
         for index, account_id in enumerate(account_ids, start=1):
             control.checkpoint(consume_skip=False)
-            attempt_id = control.start_attempt()
+            attempt_id = _claim_next_task_attempt(control)
             email = ""
             job_id = ""
             external_state_discovery = ""
@@ -9361,7 +9641,7 @@ def _run_batch_payment_links(task_id: str, account_ids: list[int]):
         for index, account_id in enumerate(account_ids, start=1):
             control.checkpoint(consume_skip=False)
             email = ""
-            attempt_id = control.start_attempt()
+            attempt_id = _claim_next_task_attempt(control)
             try:
                 control.checkpoint(attempt_id=attempt_id)
                 with Session(engine) as session:
@@ -9609,7 +9889,7 @@ def _run_batch_resume_subscription_auth(
         for index, account_id in enumerate(account_ids, start=1):
             control.checkpoint(consume_skip=False)
             email = ""
-            attempt_id = control.start_attempt()
+            attempt_id = _claim_next_task_attempt(control)
             try:
                 with Session(engine) as session:
                     account = session.get(AccountModel, int(account_id or 0))
@@ -10576,23 +10856,33 @@ def _run_phone_binding_test_concurrent(
     def process_account(account_position: int, account_id_raw: int, *, start_delay: float = 0.0) -> dict[str, Any]:
         account_id = int(account_id_raw or 0)
         email = ""
+        if control.should_stop_starting_new_attempts():
+            return {"status": "not_started", "account_id": account_id, "email": email}
         if start_delay > 0:
             _log(task_id, f"[手机号绑定][并发] 账号 {account_position}/{total_accounts} 延时 {start_delay:g}s 后启动｜原因=错峰降低 OpenAI 风控")
             wait_seconds(start_delay)
+        account_attempt_id = control.start_attempt()
+        if account_attempt_id is None:
+            return {"status": "not_started", "account_id": account_id, "email": email}
         account_attempts = 0
         while True:
+            control.resume_attempt(account_attempt_id)
             control.checkpoint(consume_skip=False)
             next_item = claim_phone_item()
             if next_item is None:
                 increment_skipped()
                 append_account_result({"account_id": account_id, "email": email, "status": "not_tested", "reason": "手机号池/列表当前没有可用号码，未完成绑定"})
                 sync_meta()
+                control.finish_attempt(account_attempt_id)
                 return {"status": "not_tested", "account_id": account_id, "email": email}
             item, phone_index, phone_total_label = next_item
             phone = str(item.get("phone") or "").strip()
             raw_line = str(item.get("raw_line") or "").strip()
             account_attempts += 1
-            attempt_id = control.start_attempt()
+            # One account may try more than one phone.  It remains the same
+            # already-started account under graceful mode; do not re-claim a
+            # new attempt between phone candidates.
+            attempt_id = account_attempt_id
             task_log = task_log_for_attempt(
                 account_position=account_position,
                 account_id=account_id,
@@ -10914,7 +11204,11 @@ def _run_phone_binding_test_concurrent(
         launch_count = 0
         ordered_accounts = [int(value or 0) for value in account_ids]
         with ThreadPoolExecutor(max_workers=effective_concurrency) as pool:
-            while next_account_index < len(ordered_accounts) and len(in_flight) < effective_concurrency and not control.is_stop_requested():
+            while (
+                next_account_index < len(ordered_accounts)
+                and len(in_flight) < effective_concurrency
+                and not control.should_stop_starting_new_attempts()
+            ):
                 account_position = next_account_index + 1
                 account_id = ordered_accounts[next_account_index]
                 start_delay = account_interval_seconds * min(launch_count, max(effective_concurrency - 1, 0))
@@ -10944,7 +11238,10 @@ def _run_phone_binding_test_concurrent(
                         mark_account_completed()
                         sync_meta()
 
-                    if next_account_index < len(ordered_accounts) and not control.is_stop_requested():
+                    if (
+                        next_account_index < len(ordered_accounts)
+                        and not control.should_stop_starting_new_attempts()
+                    ):
                         next_position = next_account_index + 1
                         next_account_id = ordered_accounts[next_account_index]
                         future = pool.submit(process_account, next_position, next_account_id, start_delay=0)
@@ -11022,11 +11319,12 @@ def _run_phone_binding_test_concurrent(
             errors=errors_snapshot,
             error="" if not errors_snapshot else summary_message,
         )
+        terminal_status = str(_task_store.snapshot(task_id).get("status") or log_status)
         latest_meta = dict(_task_store.snapshot(task_id).get("meta") or {})
         _save_task_log(
             "chatgpt",
             primary_email_snapshot,
-            log_status,
+            terminal_status,
             error="" if log_status == "success" else summary_message,
             detail=_build_task_log_detail(
                 task_id,
@@ -11831,15 +12129,21 @@ def _run_phone_binding_test(
         for account_position, account_id_raw in enumerate(account_ids, start=1):
             control.checkpoint(consume_skip=False)
             account_id = int(account_id_raw or 0)
+            # The execution unit is one account, not one candidate phone.  A
+            # graceful request after this claim lets the account exhaust its
+            # normal retry/OTP path, but blocks the next account at this gate.
+            account_attempt_id = _claim_next_task_attempt(control)
             email = ""
             account_done = False
             account_attempts = 0
 
             while not account_done:
                 control.checkpoint(consume_skip=False)
+                control.resume_attempt(account_attempt_id)
                 next_item = next_phone_item()
                 if next_item is None:
                     no_phone_available = True
+                    control.finish_attempt(account_attempt_id)
                     break
                 item, phone_index, phone_total_label = next_item
                 phone = str(item.get("phone") or "").strip()
@@ -11887,7 +12191,7 @@ def _run_phone_binding_test(
                 else:
                     _task_store.set_progress(task_id, f"{max(phone_index - 1, 0)}/{total}")
 
-                attempt_id = control.start_attempt()
+                attempt_id = account_attempt_id
                 service_entry = UploadedPhoneEntry(
                     country_slug="uploaded",
                     phone=phone,
@@ -12482,6 +12786,7 @@ def _run_phone_binding_test(
                     control.finish_attempt(attempt_id)
                     last_account_attempt_finished_at = time.monotonic()
 
+            control.finish_attempt(account_attempt_id)
             if not account_done:
                 remaining_start = account_position if account_id in accounts_with_phone_terminal_result else account_position - 1
                 remaining_account_ids = [int(value or 0) for value in account_ids[remaining_start:] if int(value or 0) > 0]
@@ -12638,11 +12943,12 @@ def _run_phone_binding_test(
             errors=errors,
             error="" if not errors else summary_message,
         )
+        terminal_status = str(_task_store.snapshot(task_id).get("status") or log_status)
         latest_meta = dict(_task_store.snapshot(task_id).get("meta") or {})
         _save_task_log(
             "chatgpt",
             primary_email,
-            log_status,
+            terminal_status,
             error="" if log_status == "success" else summary_message,
             detail=_build_task_log_detail(
                 task_id,
@@ -12768,7 +13074,7 @@ def _run_batch_invalid_recheck(task_id: str, account_ids: list[int]):
         for index, account_id in enumerate(account_ids, start=1):
             control.checkpoint(consume_skip=False)
             email = ""
-            attempt_id = control.start_attempt()
+            attempt_id = _claim_next_task_attempt(control)
             try:
                 with Session(engine) as session:
                     account = session.get(AccountModel, int(account_id or 0))
@@ -12906,6 +13212,7 @@ def _run_batch_probe_local_status(task_id: str, account_ids: list[int], params: 
     skipped_count = 0
     errors: list[str] = []
     primary_email = ""
+    current_attempt_id: int | None = None
 
     _task_store.mark_running(task_id)
     _task_store.set_progress(task_id, f"0/{total}")
@@ -12929,6 +13236,10 @@ def _run_batch_probe_local_status(task_id: str, account_ids: list[int], params: 
 
         for index, account_id in enumerate(account_ids, start=1):
             control.checkpoint(consume_skip=False)
+            # Claim before delays, proxy selection and local probing.  The
+            # helper raises only at the next-account boundary for graceful
+            # stop, while an already claimed account keeps running normally.
+            current_attempt_id = _claim_next_task_attempt(control)
             _task_store.set_progress(task_id, f"{index - 1}/{total}")
 
             delay_min = float(params.get("delay_seconds") or params.get("probe_delay_seconds") or 0.0)
@@ -12937,13 +13248,19 @@ def _run_batch_probe_local_status(task_id: str, account_ids: list[int], params: 
                 wait_sec = random.uniform(min(delay_min, delay_max), max(delay_min, delay_max)) if delay_max > delay_min else delay_min
                 if wait_sec > 0:
                     task_log(f"--- [等候] 随机延时等待 {wait_sec:.1f} 秒... ---")
-                    time.sleep(wait_sec)
+                    _sleep_with_task_control(
+                        control,
+                        wait_sec,
+                        attempt_id=current_attempt_id,
+                    )
 
             with Session(engine) as session:
                 acc = session.get(AccountModel, account_id)
                 if not acc:
                     task_log(f"[{index}/{total}] 账号不存在 ID={account_id}，已跳过")
                     skipped_count += 1
+                    control.finish_attempt(current_attempt_id)
+                    current_attempt_id = None
                     continue
                 email = str(acc.email or "")
                 if not primary_email:
@@ -12991,6 +13308,8 @@ def _run_batch_probe_local_status(task_id: str, account_ids: list[int], params: 
                     task_log(f" -> [异常] 账号 {email} 本地状态全部失败: {last_err or '探测失败'}")
 
             _task_store.set_progress(task_id, f"{index}/{total}")
+            control.finish_attempt(current_attempt_id)
+            current_attempt_id = None
 
         final_status = "done"
         summary_message = (
@@ -13027,7 +13346,9 @@ def _run_batch_probe_local_status(task_id: str, account_ids: list[int], params: 
             error="" if not errors else summary_message,
         )
     except StopTaskRequested as exc:
-        task_log(f"[STOP] {exc}")
+        # task_log calls checkpoint(), which would immediately re-raise for
+        # an immediate stop and skip this durable terminal path.
+        _log(task_id, f"[STOP] {exc}")
         _save_task_log(
             "chatgpt",
             primary_email,
@@ -13089,6 +13410,7 @@ def _run_batch_probe_local_status(task_id: str, account_ids: list[int], params: 
             error=error_text,
         )
     finally:
+        control.finish_attempt(current_attempt_id)
         _task_store.cleanup()
 
 
@@ -13487,11 +13809,13 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                 )
 
                 control.checkpoint()
-                attempt_id = control.start_attempt()
-                control.checkpoint(attempt_id=attempt_id)
                 if req.register_delay_seconds > 0 or req.register_delay_max_seconds > 0:
                     with start_gate_lock:
-                        control.checkpoint(attempt_id=attempt_id)
+                        # A future waiting for the shared start interval has
+                        # not started an account yet.  Check immediate stop
+                        # here, then claim only after the delay to ensure a
+                        # graceful request cannot leak a queued registration.
+                        control.checkpoint()
                         now = time.time()
                         wait_seconds = max(0.0, next_start_time - now)
                         if wait_seconds > 0:
@@ -13501,7 +13825,6 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                             )
                             _sleep_with_control(
                                 wait_seconds,
-                                attempt_id=attempt_id,
                             )
                         
                         delay_min = req.register_delay_seconds
@@ -13513,6 +13836,11 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                             chosen_delay = delay_min
                             
                         next_start_time = time.time() + chosen_delay
+                attempt_id = control.start_attempt()
+                if attempt_id is None:
+                    if control.is_stop_requested():
+                        raise StopTaskRequested()
+                    return AttemptResult.not_started()
                 control.checkpoint(attempt_id=attempt_id)
                 candidate_proxies = _build_register_candidate_proxies()
 
@@ -14068,7 +14396,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                 next_attempt_index < (attempt_cap or target_successes)
                 and len(in_flight) < max_workers
                 and not stopped
-                and not control.is_stop_requested()
+                and not control.should_stop_starting_new_attempts()
             ):
                 future = pool.submit(_do_one, next_attempt_index)
                 in_flight[future] = next_attempt_index
@@ -14093,7 +14421,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                         skipped += 1
                     elif result.outcome == AttemptOutcome.STOPPED:
                         stopped = True
-                    else:
+                    elif result.outcome == AttemptOutcome.FAILED:
                         errors.append(result.message)
 
                     _task_store.set_progress(task_id, f"{success}/{target_successes}")
@@ -14111,6 +14439,10 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                             pending.cancel()
                         in_flight.clear()
                         break
+
+                    if control.is_stop_after_current_requested():
+                        # Graceful stop deliberately drains already started futures.
+                        continue
 
                     if success < target_successes:
                         if attempt_cap > 0 and next_attempt_index >= attempt_cap:
@@ -14137,6 +14469,12 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
             errors=errors,
             error=str(e),
         )
+        _persist_register_task_snapshot(
+            task_id,
+            req,
+            attempt_outcome="task_failed",
+            error=str(e),
+        )
         if 'initial_email_api_entry' in locals() and initial_email_api_entry:
             try:
                 from core.base_mailbox import EmailApiMailbox
@@ -14151,9 +14489,13 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
         errors.append(f"已达到注册最大尝试次数 {attempt_cap}，成功 {success}/{target_successes}")
     if success >= target_successes:
         final_status = "done"
-    elif errors and not (control.is_stop_requested() or stopped):
+    elif errors and not (
+        control.is_stop_requested()
+        or control.is_stop_after_current_requested()
+        or stopped
+    ):
         final_status = "failed"
-    elif control.is_stop_requested() or stopped:
+    elif control.is_stop_requested() or control.is_stop_after_current_requested() or stopped:
         final_status = "stopped"
     else:
         final_status = "done"
@@ -14200,6 +14542,17 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
         success=success,
         skipped=skipped,
         errors=errors,
+    )
+    _persist_register_task_snapshot(
+        task_id,
+        req,
+        attempt_outcome=(
+            "register_stopped"
+            if final_status == "stopped"
+            else "register_completed"
+            if final_status == "done"
+            else "register_failed"
+        ),
     )
     if 'initial_email_api_entry' in locals() and initial_email_api_entry:
         try:
@@ -14439,11 +14792,43 @@ def skip_current_account(task_id: str):
 
 
 @router.post("/{task_id}/stop")
-def stop_task(task_id: str):
-    _ensure_task_mutable(task_id)
-    control = _task_store.request_stop(task_id)
-    _log(task_id, "收到手动停止任务请求")
-    return {"ok": True, "task_id": task_id, "control": control}
+def stop_task(task_id: str, body: StopTaskRequest | None = None):
+    mode = body.mode if body is not None else "immediate"
+    try:
+        if mode == "after_current":
+            control = _task_store.request_stop_after_current(task_id)
+            if control.get("changed"):
+                _log(task_id, "[CONTROL] 已请求完成当前执行单元后停止；不会启动后续账号、手机号或订单")
+            attempt_outcome = "stop_after_current_requested"
+        else:
+            control = _task_store.request_stop(task_id)
+            if control.get("changed"):
+                _log(task_id, "[CONTROL] 已请求立即停止；正在中断进行中的任务")
+            attempt_outcome = "immediate_stop_requested"
+    except KeyError as exc:
+        raise HTTPException(404, "任务不存在") from exc
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+    # Persist before returning the control response.  A process restart or a
+    # worker exception after the click must not lose logs already seen in the
+    # live panel.  A second terminal snapshot is written by each runner.
+    _persist_task_snapshot(
+        task_id,
+        # The store request and its snapshot are atomic.  A runner may have
+        # finalized immediately after the lock was released, so use the latest
+        # terminal state if it already exists instead of resurrecting history
+        # as running.
+        status=str(_task_store.snapshot(task_id).get("status") or "running"),
+        attempt_outcome=attempt_outcome,
+    )
+    return {
+        "ok": True,
+        "task_id": task_id,
+        "mode": mode,
+        "changed": bool(control.get("changed")),
+        "control": control,
+    }
 
 
 @router.get("/logs")

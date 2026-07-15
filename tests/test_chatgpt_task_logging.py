@@ -480,6 +480,58 @@ def test_api_tasks_log_and_save_task_log_are_redaction_backstops(monkeypatch, tm
     assert "secret" not in row.error
 
 
+def test_stop_task_persists_click_and_terminal_snapshots(monkeypatch, tmp_path):
+    """The stop response is a durable boundary, not only an SSE event."""
+    from api import tasks
+    from core.db import TaskLog, SQLModel
+
+    test_engine = create_engine(
+        f"sqlite:///{tmp_path / 'stop_task_logs.db'}",
+        connect_args={"check_same_thread": False},
+    )
+    SQLModel.metadata.create_all(test_engine)
+    monkeypatch.setattr(tasks, "engine", test_engine)
+
+    task_id = "task_stop_snapshot_unit"
+    tasks._task_store.create(
+        task_id,
+        platform="chatgpt",
+        total=2,
+        source="unit",
+        supports_after_current=True,
+    )
+    tasks._task_store.mark_running(task_id)
+    tasks._log(task_id, "before-stop log line")
+
+    response = tasks.stop_task(task_id)
+    assert response["mode"] == "immediate"
+    assert response["changed"] is True
+
+    with Session(test_engine) as session:
+        row = session.exec(select(TaskLog).where(TaskLog.task_id == task_id)).one()
+        detail = json.loads(row.detail_json)
+    assert row.status == "running"
+    assert detail["attempt_outcome"] == "immediate_stop_requested"
+    assert any("before-stop log line" in line for line in detail["logs"])
+    assert any("已请求立即停止" in line for line in detail["logs"])
+
+    tasks._task_store.append_log(task_id, "[00:00:00] terminal drain log")
+    tasks._task_store.finish(
+        task_id,
+        status="stopped",
+        success=0,
+        skipped=0,
+        errors=[],
+        error="任务已手动停止",
+    )
+    with Session(test_engine) as session:
+        row = session.exec(select(TaskLog).where(TaskLog.task_id == task_id)).one()
+        detail = json.loads(row.detail_json)
+    assert row.status == "stopped"
+    assert detail["control"]["stop_mode"] == "immediate"
+    assert any("terminal drain log" in line for line in detail["logs"])
+
+
 def test_api_tasks_preserves_blank_log_lines_in_sse(monkeypatch):
     from api import tasks
     from core.task_runtime import RegisterTaskStore

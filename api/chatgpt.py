@@ -7,7 +7,7 @@ import threading
 import time
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
@@ -69,7 +69,7 @@ DEFAULT_GOPAY_OTP_AUTO_RESEND_DELAY_SECONDS = 120
 GOPAY_BATCH_TASKS_KEY = "chatgpt_gopay_batch_tasks"
 GOPAY_BATCH_ACTIVE_TASK_KEY = "chatgpt_gopay_active_batch_task_id"
 GOPAY_BATCH_ACTIVE_STATUSES = {"queued", "running"}
-GOPAY_BATCH_TERMINAL_STATUSES = {"done", "failed", "cancelled"}
+GOPAY_BATCH_TERMINAL_STATUSES = {"done", "failed", "cancelled", "stopped"}
 GOPAY_BATCH_CONSUMED_PHONE_PHASES = {"waiting_otp", "waiting_link_pin", "waiting_payment_pin", "verifying", "succeeded"}
 
 _GOPAY_TASK_LOCK = threading.Lock()
@@ -203,6 +203,16 @@ def _append_gopay_task_entry(task_api, task_id: str, entry: str) -> None:
         pass
 
 
+def _persist_gopay_task_control_snapshot(task_api, task_id: str, outcome: str) -> None:
+    persist = getattr(task_api, "_persist_task_snapshot", None)
+    if not callable(persist):
+        return
+    try:
+        persist(task_id, attempt_outcome=outcome)
+    except Exception:
+        pass
+
+
 def _build_gopay_task_detail(task_api, task_id: str, acc: AccountModel, snapshot: dict, extra: dict | None = None) -> dict:
     payload = {
         "email": acc.email,
@@ -272,6 +282,8 @@ def _create_gopay_task_record(task_api, task_id: str, acc: AccountModel, snapsho
             source=GOPAY_TASK_SOURCE,
             total=1,
             meta=meta,
+            # A one-account GoPay payment has no next account to drain into.
+            supports_after_current=False,
         )
     elif store is not None:
         store.create(
@@ -306,10 +318,112 @@ def _create_gopay_task_record(task_api, task_id: str, acc: AccountModel, snapsho
     )
 
 
+def _cancel_gopay_task_after_immediate_stop(task_api, task_id: str, snapshot: dict) -> None:
+    """Cancel the real GoPay session after TaskLogPanel requests an immediate stop.
+
+    The generic task store only owns cooperative runners.  GoPay sessions are
+    external state machines, so their task record carries the account/session
+    mapping needed to terminate the underlying session as well.
+    """
+    meta = snapshot.get("meta") if isinstance(snapshot.get("meta"), dict) else {}
+    account_id = int(meta.get("account_id") or 0)
+    session_id = str(meta.get("gopay_session_id") or "").strip()
+    if not account_id or not session_id:
+        message = "GoPay 任务缺少账号或会话映射，无法确认已取消支付会话"
+        _append_gopay_task_entry(task_api, task_id, _gopay_task_line(message))
+        _persist_gopay_task_control_snapshot(task_api, task_id, "gopay_immediate_stop_mapping_missing")
+        raise HTTPException(409, message)
+
+    try:
+        from core.db import engine
+
+        with Session(engine) as db:
+            acc = db.get(AccountModel, account_id)
+            if acc is None:
+                raise RuntimeError("GoPay 账号不存在")
+            saved = acc.get_extra().get("chatgpt_gopay")
+            if not isinstance(saved, dict):
+                raise RuntimeError("GoPay 会话记录不存在")
+            if (
+                str(saved.get("task_id") or "").strip() != str(task_id)
+                or str(saved.get("session_id") or "").strip() != session_id
+            ):
+                raise RuntimeError("GoPay 任务与会话映射不匹配")
+
+            _append_gopay_task_entry(
+                task_api,
+                task_id,
+                _gopay_task_line("收到立即停止请求，正在取消 GoPay 支付会话"),
+            )
+            cancel_gopay_payment(account_id, session_id, session=db)
+    except Exception as exc:
+        _append_gopay_task_entry(
+            task_api,
+            task_id,
+            _gopay_task_line(f"GoPay 支付会话取消失败: {str(exc) or type(exc).__name__}"),
+        )
+        _persist_gopay_task_control_snapshot(task_api, task_id, "gopay_immediate_stop_failed")
+        # Do not acknowledge a TaskLogPanel stop as successful when the real
+        # provider session is still live.  The generic endpoint surfaces this
+        # as a concrete HTTP failure while retaining the diagnostic log line.
+        raise HTTPException(409, f"GoPay 支付会话取消失败: {str(exc) or type(exc).__name__}") from exc
+
+
+def _install_gopay_task_stop_hook(task_api) -> None:
+    """Attach one post-store hook so generic immediate stop reaches GoPay."""
+    store = getattr(task_api, "_task_store", None)
+    if store is None or getattr(store, "_gopay_immediate_stop_hook_installed", False):
+        return
+    original_request_stop = getattr(store, "request_stop", None)
+    if not callable(original_request_stop):
+        return
+    cancelled_task_ids: set[str] = set()
+
+    def request_stop_with_gopay_cancel(task_id: str):
+        try:
+            snapshot = store.snapshot(task_id)
+        except Exception:
+            snapshot = {}
+        normalized_task_id = str(task_id)
+        if (
+            str(snapshot.get("source") or "") == GOPAY_TASK_SOURCE
+            and normalized_task_id not in cancelled_task_ids
+        ):
+            # External cancellation must succeed before mutating the generic
+            # control.  Otherwise a failed provider call would make retries
+            # impossible because RegisterTaskControl is intentionally sticky.
+            _cancel_gopay_task_after_immediate_stop(task_api, normalized_task_id, snapshot)
+            cancelled_task_ids.add(normalized_task_id)
+            try:
+                return original_request_stop(task_id)
+            except ValueError:
+                # cancel_gopay_payment persists a terminal task synchronously;
+                # at this point the stop action succeeded even though the
+                # generic control no longer accepts a terminal record.
+                terminal_snapshot = store.snapshot(task_id)
+                return {
+                    **dict(terminal_snapshot.get("control") or {}),
+                    "changed": True,
+                    "task_snapshot": terminal_snapshot,
+                }
+        return original_request_stop(task_id)
+
+    try:
+        # The original store releases its lock before this wrapper performs
+        # SQLite/session work, preventing a terminal GoPay snapshot from
+        # deadlocking while it finishes the task record.
+        setattr(store, "request_stop", request_stop_with_gopay_cancel)
+        setattr(store, "_gopay_immediate_stop_hook_installed", True)
+    except Exception as exc:
+        raise RuntimeError("无法安装 GoPay 立即停止钩子") from exc
+
+
 def _ensure_gopay_task_record(acc: AccountModel, snapshot: dict) -> tuple[Any, str, bool]:
     task_api = _get_tasks_api()
     if task_api is None or not snapshot.get("session_id"):
         return None, "", False
+
+    _install_gopay_task_stop_hook(task_api)
 
     task_id = str(snapshot.get("task_id") or "").strip()
     if not task_id:
@@ -833,6 +947,11 @@ class GoPayBatchStartReq(BaseModel):
     round_interval_seconds: int = 60
     defaults: dict[str, Any] = Field(default_factory=dict)
     otp_auto_resend_delay_seconds: Optional[int] = None
+
+
+class GoPayBatchStopRequest(BaseModel):
+    # Omitted body remains the legacy immediate-cancel operation.
+    mode: Literal["immediate", "after_current"] = "immediate"
 
 
 class GoPayGenerateBillingReq(BaseModel):
@@ -2236,6 +2355,7 @@ def _gopay_batch_recalculate(task: dict) -> dict:
     task["success"] = sum(1 for item in items if str(item.get("status") or "") == "done")
     task["failed"] = sum(1 for item in items if str(item.get("status") or "") == "failed")
     task["cancelled"] = sum(1 for item in items if str(item.get("status") or "") == "cancelled")
+    task["stopped"] = sum(1 for item in items if str(item.get("status") or "") == "stopped")
     task["updated_at"] = _utcnow_iso()
     return task
 
@@ -2347,6 +2467,8 @@ def _gopay_batch_released_phone_items(items: list[dict]) -> list[dict]:
 
 
 def _gopay_batch_promote_with_released_phones(task: dict) -> list[int]:
+    if str(task.get("stop_mode") or ""):
+        return []
     items = [item for item in (task.get("items") or []) if isinstance(item, dict)]
     released = _gopay_batch_released_phone_items(items)
     queued = [item for item in items if str(item.get("status") or "") == "queued"]
@@ -2460,6 +2582,16 @@ def _start_gopay_batch_item(task_id: str, account_id: int) -> None:
         item = _find_gopay_batch_item(task, account_id)
         if str(item.get("status") or "") != "queued":
             return
+        stop_mode = str(task.get("stop_mode") or "")
+        if stop_mode:
+            item["status"] = "stopped" if stop_mode == "after_current" else "cancelled"
+            item["error"] = (
+                "已请求完成当前后停止，未启动 GoPay 会话"
+                if stop_mode == "after_current"
+                else "已请求立即停止，未启动 GoPay 会话"
+            )
+            item["updated_at"] = _utcnow_iso()
+            return
         item["status"] = "starting"
         item["error"] = ""
         item["started_at"] = _utcnow_iso()
@@ -2467,19 +2599,41 @@ def _start_gopay_batch_item(task_id: str, account_id: int) -> None:
 
     _mutate_gopay_batch_task(task_id, mark_starting)
     try:
-        task = _load_gopay_batch_task(task_id)
-        item = _find_gopay_batch_item(task, account_id)
-        if str(item.get("status") or "") != "starting":
-            return
-        req = _build_gopay_batch_start_request(task, item)
-        with Session(engine) as db:
-            snapshot = start_gopay_payment(account_id, req, session=db)
+        # Take the batch lock across the final stop check and session creation.
+        # If a graceful request wins this lock first the account is stopped; if
+        # creation wins first it has already become an active session and is
+        # allowed to finish normally.
+        with _GOPAY_BATCH_LOCK:
+            task = _load_gopay_batch_task(task_id)
+            item = _find_gopay_batch_item(task, account_id)
+            if str(item.get("status") or "") != "starting":
+                return
+            stop_mode = str(task.get("stop_mode") or "")
+            if stop_mode:
+                def mark_stopped(next_task: dict) -> None:
+                    next_item = _find_gopay_batch_item(next_task, account_id)
+                    if str(next_item.get("status") or "") == "starting":
+                        next_item["status"] = "stopped" if stop_mode == "after_current" else "cancelled"
+                        next_item["error"] = (
+                            "已请求完成当前后停止，未启动 GoPay 会话"
+                            if stop_mode == "after_current"
+                            else "已请求立即停止，未启动 GoPay 会话"
+                        )
+                        next_item["updated_at"] = _utcnow_iso()
+
+                _mutate_gopay_batch_task(task_id, mark_stopped)
+                return
+            req = _build_gopay_batch_start_request(task, item)
+            with Session(engine) as db:
+                snapshot = start_gopay_payment(account_id, req, session=db)
 
         def mark_running(next_task: dict) -> None:
             next_item = _find_gopay_batch_item(next_task, account_id)
             if str(next_task.get("status") or "") == "cancelled":
                 next_item["status"] = "cancelled"
                 return
+            # A session admitted before graceful stop won the lock is active
+            # and must be allowed to drain; record its snapshot normally.
             next_item["snapshot"] = _compact_gopay_snapshot(snapshot)
             next_item["status"] = _gopay_batch_item_status_from_snapshot(snapshot)
             next_item["error"] = str((snapshot or {}).get("last_error") or "")
@@ -2510,6 +2664,8 @@ def _start_gopay_batch_item(task_id: str, account_id: int) -> None:
 
 def _start_gopay_batch_round(task_id: str, round_number: int) -> None:
     task = _load_gopay_batch_task(task_id)
+    if str(task.get("stop_mode") or ""):
+        return
     account_ids = [
         int(item.get("account_id") or 0)
         for item in (task.get("items") or [])
@@ -2519,6 +2675,8 @@ def _start_gopay_batch_round(task_id: str, round_number: int) -> None:
     ]
     threads: list[threading.Thread] = []
     for account_id in account_ids:
+        if str(_load_gopay_batch_task(task_id).get("stop_mode") or ""):
+            break
         thread = threading.Thread(target=_start_gopay_batch_item, args=(task_id, account_id), daemon=True)
         thread.start()
         threads.append(thread)
@@ -2527,15 +2685,48 @@ def _start_gopay_batch_round(task_id: str, round_number: int) -> None:
 
 
 def _finalize_gopay_batch_if_complete(task: dict) -> dict:
+    stop_mode = str(task.get("stop_mode") or "")
+    if stop_mode == "after_current":
+        return _finalize_gopay_batch_after_current(task)
     items = [item for item in (task.get("items") or []) if isinstance(item, dict)]
     if not items or not _gopay_batch_all_terminal(items):
         return task
+    if stop_mode == "immediate":
+        task["status"] = "cancelled"
+        task["current_round"] = 0
+        task["next_round_at"] = None
+        task["message"] = "GoPay 批量支付任务已停止"
+        return _save_gopay_batch_task(task)
     if str(task.get("status") or "") == "cancelled":
         return _save_gopay_batch_task(task)
     task["status"] = "done"
     task["current_round"] = 0
     task["next_round_at"] = None
     task["message"] = "GoPay 批量支付任务已完成"
+    return _save_gopay_batch_task(task)
+
+
+def _finalize_gopay_batch_after_current(task: dict) -> dict:
+    """Close a graceful-stop batch only after already started sessions drain."""
+    if str(task.get("stop_mode") or "") != "after_current":
+        return task
+    items = [item for item in (task.get("items") or []) if isinstance(item, dict)]
+    if any(_gopay_batch_item_is_active(item) for item in items):
+        task["status"] = "running"
+        task["next_round_at"] = None
+        task["message"] = "当前已启动 GoPay 会话收尾中，后续账号不会启动"
+        return _save_gopay_batch_task(task)
+
+    for item in items:
+        if str(item.get("status") or "") in GOPAY_BATCH_TERMINAL_STATUSES:
+            continue
+        item["status"] = "stopped"
+        item["error"] = "已请求完成当前后停止，未启动 GoPay 会话"
+        item["updated_at"] = _utcnow_iso()
+    task["status"] = "stopped"
+    task["current_round"] = 0
+    task["next_round_at"] = None
+    task["message"] = "已完成当前 GoPay 会话，后续账号未启动"
     return _save_gopay_batch_task(task)
 
 
@@ -2554,6 +2745,14 @@ def _run_gopay_batch_worker(task_id: str) -> None:
             task = _finalize_gopay_batch_if_complete(task)
             if str(task.get("status") or "") not in GOPAY_BATCH_ACTIVE_STATUSES:
                 break
+
+            if str(task.get("stop_mode") or ""):
+                # Both stop modes close the dispatch gate.  Graceful mode
+                # drains active sessions; an immediate cancellation failure
+                # also remains drain-only so it can be retried without
+                # starting an unrelated queued account.
+                time.sleep(1.0)
+                continue
 
             items = [item for item in (task.get("items") or []) if isinstance(item, dict)]
             promoted_account_ids = _gopay_batch_promote_with_released_phones(task)
@@ -2768,6 +2967,8 @@ def start_gopay_batch_payment(req: GoPayBatchStartReq,
         "success": 0,
         "failed": 0,
         "cancelled": 0,
+        "stopped": 0,
+        "stop_mode": "",
         "message": "GoPay 批量支付任务已创建",
     }
     saved = _save_gopay_batch_task(task)
@@ -2795,8 +2996,39 @@ def get_gopay_batch_payment(batch_id: str):
 
 
 @router.post("/gopay/batch/{batch_id}/cancel")
-def cancel_gopay_batch_payment(batch_id: str):
-    task = _load_gopay_batch_task(batch_id)
+def cancel_gopay_batch_payment(batch_id: str, req: GoPayBatchStopRequest | None = None):
+    mode = req.mode if req is not None else "immediate"
+    if mode == "after_current":
+        def request_after_current(task: dict) -> None:
+            status = str(task.get("status") or "")
+            if status in GOPAY_BATCH_TERMINAL_STATUSES:
+                return
+            task["stop_mode"] = "after_current"
+            task["status"] = "running"
+            task["next_round_at"] = None
+            task["message"] = "当前已启动 GoPay 会话收尾中，后续账号不会启动"
+
+        task = _mutate_gopay_batch_task(batch_id, request_after_current)
+        task = _finalize_gopay_batch_after_current(task)
+        _ensure_gopay_batch_worker(batch_id)
+        return task
+
+    def request_immediate_stop(task: dict) -> None:
+        status = str(task.get("status") or "")
+        if status in GOPAY_BATCH_TERMINAL_STATUSES:
+            return
+        # Close every start path before touching external sessions.  If one
+        # provider cancellation fails, the user can retry without a queued
+        # account being admitted in the meantime.
+        task["stop_mode"] = "immediate"
+        task["status"] = "running"
+        task["next_round_at"] = None
+        task["message"] = "正在立即停止 GoPay 批量支付任务"
+
+    task = _mutate_gopay_batch_task(batch_id, request_immediate_stop)
+    if str(task.get("status") or "") in GOPAY_BATCH_TERMINAL_STATUSES:
+        return task
+    cancel_errors: list[str] = []
     for item in task.get("items") or []:
         if not isinstance(item, dict):
             continue
@@ -2810,13 +3042,27 @@ def cancel_gopay_batch_payment(batch_id: str):
                 with Session(engine) as db:
                     latest = cancel_gopay_payment(int(item.get("account_id") or 0), session_id, session=db)
                 item["snapshot"] = _compact_gopay_snapshot(latest)
-            except Exception:
-                pass
+            except Exception as exc:
+                message = str(getattr(exc, "detail", "") or str(exc) or "取消 GoPay 会话失败")
+                item["error"] = message
+                item["updated_at"] = _utcnow_iso()
+                cancel_errors.append(f"{item.get('email') or item.get('account_id')}: {message}")
+                # Preserve the real active status so a later retry knows the
+                # session was not cancelled instead of falsely showing it done.
+                continue
         if status not in GOPAY_BATCH_TERMINAL_STATUSES:
             item["status"] = "cancelled"
+            item["error"] = ""
             item["updated_at"] = _utcnow_iso()
-    task["status"] = "cancelled"
+    task["stop_mode"] = "immediate"
     task["next_round_at"] = None
+    if cancel_errors:
+        task["status"] = "running"
+        task["message"] = "部分 GoPay 会话立即停止失败，可再次点击立即停止重试"
+        _save_gopay_batch_task(task)
+        raise HTTPException(409, task["message"] + ": " + "; ".join(cancel_errors[:5]))
+
+    task["status"] = "cancelled"
     task["message"] = "GoPay 批量支付任务已取消"
     return _save_gopay_batch_task(task)
 

@@ -13,6 +13,7 @@ type BatchGopayWorkbenchProps = {
   loading: boolean
   phoneSaving: boolean
   started: boolean
+  stopMode: string
   roundInterval: number
   otpAutoResendDelay: number
   otpDelaySaving: boolean
@@ -24,6 +25,7 @@ type BatchGopayWorkbenchProps = {
   onSaveOtpDelay: () => Promise<unknown> | unknown
   onRefreshConfig: () => Promise<unknown> | unknown
   onStart: () => Promise<void> | void
+  onStopAfterCurrent: () => Promise<void> | void
   onCancelAll: () => Promise<void> | void
   onAddPhone: () => Promise<void> | void
   onMovePhone: (phoneId: string, direction: 'up' | 'down' | 'top' | 'bottom') => Promise<void> | void
@@ -48,6 +50,7 @@ export function BatchGopayWorkbench({
   loading,
   phoneSaving,
   started,
+  stopMode,
   roundInterval,
   otpAutoResendDelay,
   otpDelaySaving,
@@ -59,6 +62,7 @@ export function BatchGopayWorkbench({
   onSaveOtpDelay,
   onRefreshConfig,
   onStart,
+  onStopAfterCurrent,
   onCancelAll,
   onAddPhone,
   onMovePhone,
@@ -71,6 +75,9 @@ export function BatchGopayWorkbench({
   normalizeGopayOtpAutoResendDelay,
   activePhaseMatcher,
 }: BatchGopayWorkbenchProps) {
+  const hasCancellableItems = items.some((item) => ['queued', 'starting', 'running'].includes(item.status) || activePhaseMatcher(item))
+  const drainingAfterCurrent = stopMode === 'after_current'
+
   return (
     <Modal
       title="GoPay 批量支付工作台"
@@ -138,12 +145,19 @@ export function BatchGopayWorkbench({
               开始批量 GoPay
             </Button>
             <Button
+              key="stop-after-current"
+              disabled={!started || !hasCancellableItems || drainingAfterCurrent}
+              onClick={onStopAfterCurrent}
+            >
+              完成当前后停止
+            </Button>
+            <Button
               key="cancel-all"
               danger
-              disabled={!items.some((item) => ['queued', 'starting', 'running'].includes(item.status) || activePhaseMatcher(item))}
+              disabled={!hasCancellableItems}
               onClick={onCancelAll}
             >
-              批量取消支付
+              立即停止
             </Button>
           </Space>
         </div>
@@ -152,6 +166,13 @@ export function BatchGopayWorkbench({
           showIcon
           message="批量模式按手机号池可用数量自动限制并发，并按轮次依次启动。批量启动不会写入全局 GoPay 默认手机号。"
         />
+        {drainingAfterCurrent ? (
+          <Alert
+            type="warning"
+            showIcon
+            message="当前已启动会话收尾中，后续账号不会启动"
+          />
+        ) : null}
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center' }}>
           <Text type="secondary">手机号池录入</Text>
           <Input

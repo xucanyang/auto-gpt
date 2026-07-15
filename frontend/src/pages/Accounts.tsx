@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useState, useCallback, useMemo, useRef } from 'react'
+import { lazy, Suspense, useEffect, useState, useCallback, useMemo } from 'react'
 import type { CSSProperties } from 'react'
 import { FilterPresetBar } from '../features/accounts/components/FilterPresetBar'
 import {
@@ -97,6 +97,7 @@ const GOPAY_PHASE_META: Record<string, { title: string; description: string; ste
   succeeded: { title: '完成', description: '订阅支付已完成', step: 4, status: 'finish' },
   failed: { title: '失败', description: '支付流程失败', step: 4, status: 'error' },
   cancelled: { title: '已取消', description: '支付流程已取消', step: 4, status: 'error' },
+  stopped: { title: '已停止', description: '未启动后续 GoPay 会话', step: 4, status: 'wait' },
 }
 
 function gopayPhaseMeta(phase?: string) {
@@ -747,7 +748,7 @@ type BatchGopayItem = {
   phone: GopayPhoneCandidate
   batchIndex: number
   round: number
-  status: 'queued' | 'starting' | 'running' | 'done' | 'failed' | 'cancelled'
+  status: 'queued' | 'starting' | 'running' | 'done' | 'failed' | 'cancelled' | 'stopped'
   snapshot?: any
   error?: string
   logsOpen?: boolean
@@ -2259,14 +2260,14 @@ export default function Accounts() {
   const [batchGopayRecognizedCountryCodes, setBatchGopayRecognizedCountryCodes] = useState<string[]>([DEFAULT_GOPAY_PHONE_COUNTRY_CODE])
   const [batchGopayPhoneSaving, setBatchGopayPhoneSaving] = useState(false)
   const [batchGopayStarted, setBatchGopayStarted] = useState(false)
+  const [batchGopayTaskId, setBatchGopayTaskId] = useState('')
+  const [batchGopayStopMode, setBatchGopayStopMode] = useState('')
   const [batchGopayRoundInterval, setBatchGopayRoundInterval] = useState(60)
   const [batchGopayOtpAutoResendDelay, setBatchGopayOtpAutoResendDelay] = useState(DEFAULT_GOPAY_OTP_AUTO_RESEND_DELAY_SECONDS)
   const [batchGopayOtpDelaySaving, setBatchGopayOtpDelaySaving] = useState(false)
   const [batchGopayNextRoundAt, setBatchGopayNextRoundAt] = useState<number | null>(null)
   const [accessTokenCopiedAccountIds, setAccessTokenCopiedAccountIds] = useState<Set<number>>(() => new Set())
   const [codexUsageRefreshingIds, setCodexUsageRefreshingIds] = useState<Set<number>>(() => new Set())
-  const batchGopayStartingRef = useRef(false)
-  const batchGopayCancelRequestedRef = useRef(false)
   const accountsQuery = useAccountsQuery({
     email: debouncedSearch,
     status: filterStatus,
@@ -4271,7 +4272,8 @@ export default function Accounts() {
 
   const openBatchGopayWorkbench = async () => {
     const selectedAccounts = getSelectedChatgptAccounts()
-    if (selectedAccounts.length === 0) {
+    const active = await apiFetch('/chatgpt/gopay/batch/active').catch(() => ({ task: null }))
+    if (selectedAccounts.length === 0 && !active?.task) {
       message.warning('请先选择要批量支付的 ChatGPT 账号')
       return
     }
@@ -4285,9 +4287,15 @@ export default function Accounts() {
     setBatchGopayPhones([])
     setBatchGopayDefaults({})
     setBatchGopayStarted(false)
+    setBatchGopayTaskId('')
+    setBatchGopayStopMode('')
     setBatchGopayNextRoundAt(null)
     try {
       const { phones } = await loadGopayBatchConfig()
+      if (active?.task) {
+        applyGopayBatchTask(active.task)
+        return
+      }
       if (phones.length === 0) {
         message.warning('手机号池为空，请先在单账号 GoPay 中保存手机号候选')
         return
@@ -4348,6 +4356,42 @@ export default function Accounts() {
     )))
   }
 
+  const applyGopayBatchTask = (task: any) => {
+    if (!task || typeof task !== 'object') return
+    const status = String(task.status || '')
+    const items = Array.isArray(task.items) ? task.items : []
+    setBatchGopayTaskId(String(task.task_id || '').trim())
+    setBatchGopayStopMode(String(task.stop_mode || '').trim())
+    setBatchGopayStarted(['queued', 'running'].includes(status))
+    const nextRoundAt = Number(task.next_round_at || 0)
+    setBatchGopayNextRoundAt(Number.isFinite(nextRoundAt) && nextRoundAt > 0 ? nextRoundAt * 1000 : null)
+    setBatchGopayItems((previous) => {
+      const localState = new Map(previous.map((item) => [Number(item.account?.id || 0), item]))
+      return items.map((raw: any, index: number) => {
+        const accountId = Number(raw?.account_id || raw?.account?.id || 0)
+        const local = localState.get(accountId)
+        const remoteStatus = String(raw?.status || 'queued')
+        const statusValue: BatchGopayItem['status'] = (
+          ['queued', 'starting', 'running', 'done', 'failed', 'cancelled', 'stopped'].includes(remoteStatus)
+            ? remoteStatus
+            : 'failed'
+        ) as BatchGopayItem['status']
+        return {
+          account: raw?.account || local?.account || { id: accountId, email: raw?.email || '' },
+          phone: raw?.phone || local?.phone,
+          batchIndex: Number(raw?.batchIndex || raw?.batch_index || index + 1),
+          round: Math.max(1, Number(raw?.round || 1)),
+          status: statusValue,
+          snapshot: raw?.snapshot || {},
+          error: String(raw?.error || ''),
+          logsOpen: local?.logsOpen || false,
+          configOpen: local?.configOpen || false,
+          submitting: local?.submitting || false,
+        }
+      })
+    })
+  }
+
   const buildBatchGopayPayload = (item: BatchGopayItem) => {
     const accountEmail = String(item.account.email || '').trim()
     const phoneCountryCode = String(item.phone.phone_country_code || '').trim()
@@ -4379,126 +4423,87 @@ export default function Accounts() {
     }
   }
 
-  const startBatchGopayItem = async (item: BatchGopayItem) => {
-    if (batchGopayCancelRequestedRef.current) {
-      updateBatchGopayItem(item.account.id, { status: 'cancelled', error: '' })
-      return null
-    }
-    updateBatchGopayItem(item.account.id, { status: 'starting', error: '' })
-    try {
-      const data = await apiFetch(`/chatgpt/${item.account.id}/gopay/start`, {
-        method: 'POST',
-        body: JSON.stringify(buildBatchGopayPayload(item)),
-      })
-      if (batchGopayCancelRequestedRef.current) {
-        const cancelled = await apiFetch(`/chatgpt/${item.account.id}/gopay/${encodeURIComponent(data.session_id)}/cancel`, {
-          method: 'POST',
-        })
-        updateBatchGopayItem(item.account.id, { status: 'cancelled', snapshot: cancelled, error: '' })
-        return cancelled
-      }
-      updateBatchGopayItem(item.account.id, { status: 'running', snapshot: data, error: '' })
-      return data
-    } catch (e: any) {
-      updateBatchGopayItem(item.account.id, { status: 'failed', error: e?.message || '启动失败' })
-      return null
-    }
-  }
-
-  const startBatchGopayRound = async (round: number) => {
-    if (batchGopayStartingRef.current) return
-    batchGopayStartingRef.current = true
-    try {
-      const roundItems = batchGopayItems.filter((item) => item.round === round && item.status === 'queued')
-      await Promise.all(roundItems.map((item) => startBatchGopayItem(item)))
-    } finally {
-      batchGopayStartingRef.current = false
-    }
-  }
-
   const startBatchGopay = async () => {
-    if (batchGopayItems.length === 0) return
+    const items = batchGopayItems.filter((item) => item.status === 'queued')
+    if (items.length === 0) return
     try {
       await saveBatchGopayOtpAutoResendDelay(batchGopayOtpAutoResendDelay, { notify: false, throwOnError: true })
-      batchGopayCancelRequestedRef.current = false
-      setBatchGopayStarted(true)
-      setBatchGopayNextRoundAt(null)
-      await startBatchGopayRound(1)
+      const defaults = buildBatchGopayPayload(items[0])
+      const task = await apiFetch('/chatgpt/gopay/batch/start', {
+        method: 'POST',
+        body: JSON.stringify({
+          items: items.map((item) => ({
+            account_id: Number(item.account.id),
+            phone: {
+              id: String(item.phone.id || ''),
+              label: String(item.phone.label || ''),
+              phone_country_code: String(item.phone.phone_country_code || ''),
+              phone_number: String(item.phone.phone_number || ''),
+            },
+            batchIndex: item.batchIndex,
+            round: item.round,
+          })),
+          round_interval_seconds: batchGopayRoundInterval,
+          otp_auto_resend_delay_seconds: batchGopayOtpAutoResendDelay,
+          defaults: {
+            pin: defaults.pin,
+            access_token: String(batchGopayDefaults.access_token || '').trim(),
+            proxy: defaults.proxy,
+            country: defaults.country,
+            currency: defaults.currency,
+            billing_name: defaults.billing_name,
+            billing_email: String(batchGopayDefaults.billing_email || '').trim(),
+            billing_country: defaults.billing_country,
+            billing_line1: defaults.billing_line1,
+            billing_city: defaults.billing_city,
+            billing_state: defaults.billing_state,
+            billing_postal_code: defaults.billing_postal_code,
+          },
+        }),
+      })
+      applyGopayBatchTask(task)
+      message.success(`已创建 GoPay 批量任务：${items.length} 个账号`)
     } catch (e: any) {
       message.error(e?.message || '启动批量 GoPay 失败')
     }
   }
 
-  const batchGopayActiveItems = batchGopayItems.filter((item) => {
-    const phase = String(item.snapshot?.phase || '')
-    return item.snapshot?.session_id && GOPAY_ACTIVE_PHASES.has(phase)
-  })
-
   useEffect(() => {
-    if (!pageVisible || !batchGopayOpen || batchGopayActiveItems.length === 0) return
-    const timer = window.setInterval(async () => {
-      await Promise.all(batchGopayActiveItems.map(async (item) => {
-        try {
-          const data = await apiFetch(`/chatgpt/${item.account.id}/gopay/${encodeURIComponent(item.snapshot.session_id)}`)
-          const phase = String(data.phase || '')
-          updateBatchGopayItem(item.account.id, {
-            snapshot: data,
-            status: phase === 'succeeded' ? 'done' : phase === 'failed' ? 'failed' : phase === 'cancelled' ? 'cancelled' : 'running',
-            error: data.last_error || '',
-          })
-        } catch (e: any) {
-          updateBatchGopayItem(item.account.id, { error: e?.message || '刷新状态失败' })
-        }
-      }))
-    }, 3000)
-    return () => window.clearInterval(timer)
-  }, [pageVisible, batchGopayOpen, batchGopayActiveItems.map((item) => `${item.account.id}:${item.snapshot?.session_id}:${item.snapshot?.phase}`).join('|')])
-
-  useEffect(() => {
-    if (!batchGopayOpen || !batchGopayStarted || batchGopayItems.length === 0) return
-    const rounds = Array.from(new Set(batchGopayItems.map((item) => item.round))).sort((a, b) => a - b)
-    const currentRound = rounds.find((round) => batchGopayItems.some((item) => item.round === round && ['queued', 'starting', 'running'].includes(item.status)))
-    if (!currentRound) return
-    const currentItems = batchGopayItems.filter((item) => item.round === currentRound)
-    const hasQueuedCurrent = currentItems.some((item) => item.status === 'queued')
-    const hasActiveCurrent = currentItems.some((item) => item.status === 'starting' || item.status === 'running')
-    if (hasQueuedCurrent && !hasActiveCurrent && batchGopayNextRoundAt == null && currentRound === 1) {
-      startBatchGopayRound(currentRound)
-      return
-    }
-    if (hasQueuedCurrent || hasActiveCurrent) return
-    const nextRound = rounds.find((round) => round > currentRound && batchGopayItems.some((item) => item.round === round && item.status === 'queued'))
-    if (!nextRound) return
-    if (batchGopayNextRoundAt == null) {
-      setBatchGopayNextRoundAt(Date.now() + Math.max(0, Number(batchGopayRoundInterval || 0)) * 1000)
-    }
-  }, [batchGopayOpen, batchGopayStarted, batchGopayItems, batchGopayNextRoundAt, batchGopayRoundInterval])
-
-  useEffect(() => {
-    if (!batchGopayOpen || !batchGopayStarted || batchGopayNextRoundAt == null) return
-    const delay = Math.max(0, batchGopayNextRoundAt - Date.now())
-    const timer = window.setTimeout(async () => {
-      const next = Math.min(...batchGopayItems.filter((item) => item.status === 'queued').map((item) => item.round))
-      setBatchGopayNextRoundAt(null)
-      if (Number.isFinite(next)) {
-        await startBatchGopayRound(next)
+    if (!pageVisible || !batchGopayOpen || !batchGopayStarted || !batchGopayTaskId) return
+    let cancelled = false
+    const refresh = async () => {
+      try {
+        const task = await apiFetch(`/chatgpt/gopay/batch/${encodeURIComponent(batchGopayTaskId)}`)
+        if (!cancelled) applyGopayBatchTask(task)
+      } catch (e: any) {
+        if (!cancelled) message.warning(e?.message || '刷新 GoPay 批量任务失败')
       }
-    }, delay)
-    return () => window.clearTimeout(timer)
-  }, [batchGopayOpen, batchGopayStarted, batchGopayNextRoundAt, batchGopayItems])
+    }
+    void refresh()
+    const timer = window.setInterval(() => { void refresh() }, 3000)
+    return () => {
+      cancelled = true
+      window.clearInterval(timer)
+    }
+  }, [pageVisible, batchGopayOpen, batchGopayStarted, batchGopayTaskId])
 
   const submitBatchGopayInput = async (item: BatchGopayItem, value: string) => {
-    if (!item.snapshot?.session_id) return
+    if (!batchGopayTaskId || !item.snapshot?.session_id) return
     const phase = String(item.snapshot.phase || '')
     const path = phase === 'waiting_otp' ? 'otp' : 'pin'
     const key = phase === 'waiting_otp' ? 'otp' : 'pin'
     updateBatchGopayItem(item.account.id, { submitting: true })
     try {
-      const data = await apiFetch(`/chatgpt/${item.account.id}/gopay/${encodeURIComponent(item.snapshot.session_id)}/${path}`, {
+      const data = await apiFetch(`/chatgpt/gopay/batch/${encodeURIComponent(batchGopayTaskId)}/items/${item.account.id}/${path}`, {
         method: 'POST',
         body: JSON.stringify({ [key]: String(value || '').trim() }),
       })
-      updateBatchGopayItem(item.account.id, { snapshot: data, submitting: false, error: '' })
+      updateBatchGopayItem(item.account.id, {
+        snapshot: data?.snapshot || item.snapshot,
+        status: String(data?.status || item.status) as BatchGopayItem['status'],
+        submitting: false,
+        error: String(data?.error || ''),
+      })
       message.success(`已提交 ${item.account.email}`)
     } catch (e: any) {
       updateBatchGopayItem(item.account.id, { submitting: false, error: e?.message || '提交失败' })
@@ -4507,13 +4512,18 @@ export default function Accounts() {
   }
 
   const resendBatchGopayOtp = async (item: BatchGopayItem) => {
-    if (!item.snapshot?.session_id) return
+    if (!batchGopayTaskId || !item.snapshot?.session_id) return
     updateBatchGopayItem(item.account.id, { submitting: true, error: '' })
     try {
-      const data = await apiFetch(`/chatgpt/${item.account.id}/gopay/${encodeURIComponent(item.snapshot.session_id)}/resend-otp`, {
+      const data = await apiFetch(`/chatgpt/gopay/batch/${encodeURIComponent(batchGopayTaskId)}/items/${item.account.id}/resend-otp`, {
         method: 'POST',
       })
-      updateBatchGopayItem(item.account.id, { snapshot: data, submitting: false, error: '' })
+      updateBatchGopayItem(item.account.id, {
+        snapshot: data?.snapshot || item.snapshot,
+        status: String(data?.status || item.status) as BatchGopayItem['status'],
+        submitting: false,
+        error: String(data?.error || ''),
+      })
       message.success(`GoPay OTP 重发请求已提交：${item.account.email}`)
     } catch (e: any) {
       updateBatchGopayItem(item.account.id, { submitting: false, error: e?.message || '重发 OTP 失败' })
@@ -4522,15 +4532,19 @@ export default function Accounts() {
   }
 
   const cancelBatchGopayItem = async (item: BatchGopayItem) => {
-    if (!item.snapshot?.session_id) {
+    if (!batchGopayTaskId) {
       updateBatchGopayItem(item.account.id, { status: 'cancelled' })
       return
     }
     try {
-      const data = await apiFetch(`/chatgpt/${item.account.id}/gopay/${encodeURIComponent(item.snapshot.session_id)}/cancel`, {
+      const data = await apiFetch(`/chatgpt/gopay/batch/${encodeURIComponent(batchGopayTaskId)}/items/${item.account.id}/cancel`, {
         method: 'POST',
       })
-      updateBatchGopayItem(item.account.id, { status: 'cancelled', snapshot: data })
+      updateBatchGopayItem(item.account.id, {
+        status: String(data?.status || 'cancelled') as BatchGopayItem['status'],
+        snapshot: data?.snapshot || item.snapshot,
+        error: String(data?.error || ''),
+      })
     } catch (e: any) {
       message.error(e?.message || '取消 GoPay 会话失败')
     }
@@ -4545,11 +4559,31 @@ export default function Accounts() {
       message.info('当前没有可取消的批量支付任务')
       return
     }
-    batchGopayCancelRequestedRef.current = true
-    setBatchGopayStarted(false)
-    setBatchGopayNextRoundAt(null)
-    await Promise.all(cancellableItems.map((item) => cancelBatchGopayItem(item)))
+    if (!batchGopayTaskId) {
+      await Promise.all(cancellableItems.map((item) => cancelBatchGopayItem(item)))
+      message.success(`已取消 ${cancellableItems.length} 个待启动批量支付任务`)
+      return
+    }
+    const task = await apiFetch(`/chatgpt/gopay/batch/${encodeURIComponent(batchGopayTaskId)}/cancel`, { method: 'POST' })
+    applyGopayBatchTask(task)
     message.success(`已取消 ${cancellableItems.length} 个批量支付任务`)
+  }
+
+  const stopBatchGopayAfterCurrent = async () => {
+    if (!batchGopayTaskId) {
+      message.info('请先启动批量 GoPay 任务')
+      return
+    }
+    try {
+      const task = await apiFetch(`/chatgpt/gopay/batch/${encodeURIComponent(batchGopayTaskId)}/cancel`, {
+        method: 'POST',
+        body: JSON.stringify({ mode: 'after_current' }),
+      })
+      applyGopayBatchTask(task)
+      message.success('已停止后续账号启动，当前 GoPay 会话会正常完成')
+    } catch (e: any) {
+      message.error(e?.message || '请求完成当前后停止失败')
+    }
   }
 
   const handleDeleteInvalid = async () => {
@@ -6773,7 +6807,7 @@ export default function Accounts() {
     const meta = gopayPhaseMeta(phase)
     const needsInput = phase === 'waiting_otp' || phase === 'waiting_link_pin' || phase === 'waiting_payment_pin'
     const canResendOtp = phase === 'waiting_otp' && Boolean(item.snapshot?.session_id)
-    const isTerminal = ['done', 'failed', 'cancelled'].includes(item.status) || ['succeeded', 'failed', 'cancelled'].includes(phase)
+    const isTerminal = ['done', 'failed', 'cancelled', 'stopped'].includes(item.status) || ['succeeded', 'failed', 'cancelled', 'stopped'].includes(phase)
     return (
       <div
         key={item.account.id}
@@ -6790,7 +6824,7 @@ export default function Accounts() {
             <Tag color="blue">第 {item.round} 轮</Tag>
             <Tag>{formatGopayPhoneLabel(item.phone)}</Tag>
             {formatGopayPhoneExpiryLabel(item.phone) ? <Tag color="processing">有效期 {formatGopayPhoneExpiryLabel(item.phone)}</Tag> : <Tag>有效期 -</Tag>}
-            <Tag color={isTerminal ? (phase === 'succeeded' || item.status === 'done' ? 'success' : item.status === 'cancelled' ? 'default' : 'error') : 'processing'}>
+            <Tag color={isTerminal ? (phase === 'succeeded' || item.status === 'done' ? 'success' : ['cancelled', 'stopped'].includes(item.status) ? 'default' : 'error') : 'processing'}>
               {meta.title}
             </Tag>
           </Space>
@@ -7470,6 +7504,7 @@ export default function Accounts() {
         loading={batchGopayLoading}
         phoneSaving={batchGopayPhoneSaving}
         started={batchGopayStarted}
+        stopMode={batchGopayStopMode}
         roundInterval={batchGopayRoundInterval}
         otpAutoResendDelay={batchGopayOtpAutoResendDelay}
         otpDelaySaving={batchGopayOtpDelaySaving}
@@ -7481,6 +7516,7 @@ export default function Accounts() {
         onSaveOtpDelay={() => saveBatchGopayOtpAutoResendDelay(batchGopayOtpAutoResendDelay)}
         onRefreshConfig={loadGopayBatchConfig}
         onStart={startBatchGopay}
+        onStopAfterCurrent={stopBatchGopayAfterCurrent}
         onCancelAll={cancelBatchGopayAll}
         onAddPhone={addBatchGopayPhoneToPool}
         onMovePhone={moveBatchGopayPhone}

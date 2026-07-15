@@ -4,9 +4,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+import logging
 import threading
 import time
-from typing import Any
+from typing import Any, Callable
+
+
+logger = logging.getLogger(__name__)
 
 
 class TaskInterruption(RuntimeError):
@@ -32,6 +36,7 @@ class AttemptOutcome(str, Enum):
     FAILED = "failed"
     SKIPPED = "skipped"
     STOPPED = "stopped"
+    NOT_STARTED = "not_started"
 
 
 @dataclass(slots=True)
@@ -54,6 +59,11 @@ class AttemptResult:
     @classmethod
     def stopped(cls, message: str) -> "AttemptResult":
         return cls(AttemptOutcome.STOPPED, message)
+
+    @classmethod
+    def not_started(cls) -> "AttemptResult":
+        """A queued attempt was prevented from starting by graceful stop."""
+        return cls(AttemptOutcome.NOT_STARTED)
 
 
 @dataclass(slots=True)
@@ -97,12 +107,13 @@ class VerificationChallenge:
 
 
 class RegisterTaskControl:
-    """协作式任务控制器：支持停止整个任务、跳过一个当前账号，并处理人工验证码等待。"""
+    """协作式任务控制器：支持立即停止、排空当前尝试、跳过和人工验证码等待。"""
 
     def __init__(self):
         self._lock = threading.RLock()
         self._condition = threading.Condition(self._lock)
         self._stop_requested = False
+        self._after_current_requested = False
         self._pending_skip_requests = 0
         self._next_attempt_id = 1
         self._next_challenge_id = 1
@@ -118,11 +129,31 @@ class RegisterTaskControl:
         challenge.cancel_reason = str(reason or "cancelled")
         self._condition.notify_all()
 
-    def request_stop(self) -> None:
+    def request_stop(self) -> bool:
+        """Request an immediate cooperative interruption.
+
+        ``True`` means this call changed the control state.  The return value
+        lets the API keep repeated clicks idempotent without writing duplicate
+        control lines to the persisted task history.
+        """
         with self._condition:
+            changed = not self._stop_requested
+            # Immediate stop always wins over an earlier graceful request.
             self._stop_requested = True
+            self._after_current_requested = False
             self._cancel_pending_verification("stop_requested")
             self._condition.notify_all()
+            return changed
+
+    def request_stop_after_current(self) -> bool:
+        """Stop scheduling new attempts while allowing active attempts to finish."""
+        with self._condition:
+            if self._stop_requested:
+                return False
+            changed = not self._after_current_requested
+            self._after_current_requested = True
+            self._condition.notify_all()
+            return changed
 
     def request_skip_current(self) -> None:
         with self._condition:
@@ -133,8 +164,13 @@ class RegisterTaskControl:
             self._cancel_pending_verification("skip_requested")
             self._condition.notify_all()
 
-    def start_attempt(self) -> int:
+    def start_attempt(self) -> int | None:
         with self._condition:
+            # This second gate closes the race between dispatcher submission and
+            # worker execution: a future accepted before graceful stop cannot
+            # begin a new account after the request is received.
+            if self._stop_requested or self._after_current_requested:
+                return None
             attempt_id = self._next_attempt_id
             self._next_attempt_id += 1
             self._active_attempt_ids.add(attempt_id)
@@ -153,6 +189,25 @@ class RegisterTaskControl:
                 and challenge.status == "pending"
             ):
                 self._cancel_pending_verification("attempt_finished")
+            self._condition.notify_all()
+
+    def resume_attempt(self, attempt_id: int | None) -> None:
+        """Restore an already-claimed account around an internal retry.
+
+        Phone binding may consume several phone candidates for one account.
+        Its per-phone cleanup must release skip/verification state, while a
+        graceful request must still allow that same account to continue.  This
+        method never allocates a new id and therefore deliberately remains
+        valid after ``after_current``; immediate stop still interrupts it.
+        """
+        if attempt_id is None:
+            return
+        with self._condition:
+            if self._stop_requested:
+                self._active_attempt_ids.discard(attempt_id)
+                self._skip_active_attempt_ids.discard(attempt_id)
+                raise StopTaskRequested()
+            self._active_attempt_ids.add(attempt_id)
             self._condition.notify_all()
 
     def checkpoint(
@@ -178,6 +233,20 @@ class RegisterTaskControl:
     def is_stop_requested(self) -> bool:
         with self._lock:
             return self._stop_requested
+
+    def is_stop_after_current_requested(self) -> bool:
+        with self._lock:
+            return self._after_current_requested
+
+    def should_stop_starting_new_attempts(self) -> bool:
+        """Whether a dispatcher must not begin another account attempt.
+
+        This intentionally differs from :meth:`checkpoint`: graceful stop is
+        a scheduling boundary, never an interruption signal for an already
+        active account (including an OTP wait).
+        """
+        with self._lock:
+            return self._stop_requested or self._after_current_requested
 
     def current_verification_snapshot(self) -> dict[str, Any] | None:
         with self._lock:
@@ -405,6 +474,18 @@ class RegisterTaskControl:
         with self._lock:
             return {
                 "stop_requested": self._stop_requested,
+                # Keep both names while clients transition.  The explicit
+                # stop_after_current_requested key is the public API name;
+                # after_current_requested preserves the initial rollout shape.
+                "stop_after_current_requested": self._after_current_requested,
+                "after_current_requested": self._after_current_requested,
+                "stop_mode": (
+                    "immediate"
+                    if self._stop_requested
+                    else "after_current"
+                    if self._after_current_requested
+                    else ""
+                ),
                 "pending_skip_requests": self._pending_skip_requests,
                 "active_attempts": len(self._active_attempt_ids),
                 "targeted_skip_attempts": len(self._skip_active_attempt_ids),
@@ -417,6 +498,7 @@ class RegisterTaskRecord:
     platform: str
     source: str
     total: int
+    supports_after_current: bool = False
     meta: dict[str, Any] = field(default_factory=dict)
     status: str = "pending"
     progress: str = "0/0"
@@ -446,6 +528,14 @@ class RegisterTaskRecord:
             "skipped": self.skipped,
             "errors": list(self.errors),
             "control": self.control.snapshot(),
+            "capabilities": {
+                "stop_after_current": self.supports_after_current,
+                "stop_modes": (
+                    ["immediate", "after_current"]
+                    if self.supports_after_current
+                    else ["immediate"]
+                )
+            },
         }
         pending_verification = self.control.current_verification_snapshot()
         if pending_verification:
@@ -465,11 +555,27 @@ class RegisterTaskStore:
         *,
         max_finished_tasks: int = 200,
         cleanup_threshold: int = 250,
+        on_terminal: Callable[[str, dict[str, Any]], None] | None = None,
     ):
         self._lock = threading.Lock()
         self._records: dict[str, RegisterTaskRecord] = {}
         self.max_finished_tasks = max_finished_tasks
         self.cleanup_threshold = cleanup_threshold
+        self._on_terminal = on_terminal
+
+    def set_terminal_callback(
+        self,
+        callback: Callable[[str, dict[str, Any]], None] | None,
+    ) -> None:
+        """Install the durable-boundary hook used by the API task store.
+
+        The callback is deliberately invoked after releasing the store lock so
+        SQLite I/O cannot block task log append/progress updates or deadlock
+        with a snapshot read.  It is a best-effort observer: a history write
+        failure must never prevent a runner from becoming terminal.
+        """
+        with self._lock:
+            self._on_terminal = callback
 
     def create(
         self,
@@ -479,6 +585,7 @@ class RegisterTaskStore:
         total: int,
         source: str,
         meta: dict[str, Any] | None = None,
+        supports_after_current: bool = False,
     ) -> RegisterTaskRecord:
         with self._lock:
             record = RegisterTaskRecord(
@@ -488,6 +595,7 @@ class RegisterTaskStore:
                 source=source,
                 meta=dict(meta or {}),
                 progress=f"0/{total}",
+                supports_after_current=bool(supports_after_current),
             )
             self._records[task_id] = record
             return record
@@ -518,9 +626,32 @@ class RegisterTaskStore:
             return self._records[task_id].control
 
     def request_stop(self, task_id: str) -> dict[str, Any]:
-        control = self.control_for(task_id)
-        control.request_stop()
-        return control.snapshot()
+        with self._lock:
+            record = self._records[task_id]
+            if record.status in {"done", "failed", "stopped"}:
+                raise ValueError("任务已结束")
+            changed = record.control.request_stop()
+            snapshot = record.to_dict()
+        return {
+            **dict(snapshot.get("control") or {}),
+            "changed": changed,
+            "task_snapshot": snapshot,
+        }
+
+    def request_stop_after_current(self, task_id: str) -> dict[str, Any]:
+        with self._lock:
+            record = self._records[task_id]
+            if record.status in {"done", "failed", "stopped"}:
+                raise ValueError("任务已结束")
+            if not record.supports_after_current:
+                raise ValueError("当前任务不支持完成当前后停止")
+            changed = record.control.request_stop_after_current()
+            snapshot = record.to_dict()
+        return {
+            **dict(snapshot.get("control") or {}),
+            "changed": changed,
+            "task_snapshot": snapshot,
+        }
 
     def request_skip_current(self, task_id: str) -> dict[str, Any]:
         control = self.control_for(task_id)
@@ -570,14 +701,47 @@ class RegisterTaskStore:
         errors: list[str],
         error: str = "",
     ) -> None:
+        terminal_snapshot: dict[str, Any] | None = None
+        callback: Callable[[str, dict[str, Any]], None] | None = None
         with self._lock:
             record = self._records[task_id]
-            record.status = status
+            # A graceful request is only a dispatch gate.  Runners report
+            # their usual natural result after draining; normalize that final
+            # state here so every TaskLogPanel-backed runner gets the same
+            # terminal contract without depending on dozens of hand-written
+            # final-status branches.
+            final_status = status
+            if (
+                record.control.is_stop_after_current_requested()
+                and status in {"done", "failed"}
+            ):
+                final_status = "stopped"
+            record.status = final_status
             record.success = success
             record.skipped = skipped
             record.errors = list(errors)
             record.error = error
             record.updated_at = time.time()
+            if final_status in {"done", "failed", "stopped"}:
+                terminal_snapshot = record.to_dict()
+                callback = self._on_terminal
+
+        if callback is not None and terminal_snapshot is not None:
+            # SQLite can briefly be locked by an account/state update just
+            # ahead of task finalization.  A bounded retry preserves the
+            # terminal log without ever rolling the worker state back.
+            for retry_index in range(3):
+                try:
+                    callback(task_id, terminal_snapshot)
+                    break
+                except Exception:
+                    logger.exception(
+                        "task terminal snapshot persistence failed task_id=%s retry=%s",
+                        task_id,
+                        retry_index + 1,
+                    )
+                    if retry_index < 2:
+                        time.sleep(0.05 * (retry_index + 1))
 
     def snapshot(self, task_id: str) -> dict[str, Any]:
         with self._lock:

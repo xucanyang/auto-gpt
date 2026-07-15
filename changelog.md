@@ -4,6 +4,25 @@
 
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，并且本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/) (语义化版本)。
 
+## [2.1.5] - 2026-07-15
+
+### 新增 (Added)
+- **所有任务面板提供两种明确的停止模式**：`core/task_runtime.py`、`api/tasks.py` 与 `frontend/src/components/TaskLogPanel.tsx` 将停止控制统一为“完成当前后停止”和“立即停止”。支持排空的任务在 API 快照中声明 capability；前端仅对支持该能力的 `TaskLogPanel` 展示“完成当前后停止”，旧客户端不带请求体调用 `POST /api/tasks/{task_id}/stop` 仍保持立即停止语义。
+- **停止控制日志在点击和终态两次持久化**：停止请求在返回前将当时完整日志、控制状态和任务快照 upsert 到 `TaskLog`；`RegisterTaskStore.finish()` 再以终态快照持久化收尾日志。这样注册、手机绑定、邮箱复测、上传、提链、Auth 补抓、PIX、Idea/Baxi、本地状态探测等任务即使中途停止或进程异常，也不会丢失用户已经看到的运行日志。
+
+### 修复 (Fixed)
+- **完成当前后停止不再偷跑下一个执行单元**：`api/tasks.py` 在账号、手机号账号单元、订单和并发任务真正开始前统一领取 attempt；注册与 OaiPay 在排队延迟结束、上游调用前二次检查，手机绑定允许已领取账号继续其内部号码重试，PIX/Idea 保持已提交订单轮询但停止新的 CDK/订单提交。任务最终状态统一收敛为 `stopped`，不新增前端无法识别的终态。
+- **立即停止的日志与外部会话一致**：`api/chatgpt.py` 的单账号 GoPay 会先取消真实支付会话，再推进通用停止状态；取消失败会返回 `409`、保存诊断日志且允许再次重试。GoPay 批量任务改由后端持久化调度，`after_current` 会排空已启动会话并阻断后续轮次、手机号递延和新会话；立即停止任一会话取消失败时不再错误显示为已取消，也不会再派发后续账号。
+- **修复两个长等待对立即停止不响应**：`api/tasks.py` 新增受控制的分段等待，Idea/Baxi 活跃订单轮询和批量本地状态探测的随机延时最多每 0.5 秒检查一次立即停止，避免任务卡在原生 `sleep()` 到计时结束才停止。
+
+### 优化 (Changed)
+- **GoPay 批量状态脱离浏览器计时器**：`frontend/src/pages/Accounts.tsx` 与 `frontend/src/features/accounts/components/BatchGopayWorkbench.tsx` 改为读取、恢复和轮询服务端批任务；关闭或刷新工作台不会丢失当前批次、停止模式或后续派发闸门。
+- **前端版本同步至 v2.1.5**：`frontend/src/app/AppShell.tsx` 更新侧栏版本，便于确认浏览器已加载停止模式、日志持久化和 GoPay 调度修复。
+
+### 测试 (Tests)
+- **覆盖控制语义与持久化边界**：扩展 `tests/test_task_runtime.py`、`tests/test_chatgpt_task_logging.py`，验证 graceful/immediate 优先级、同账号内部重试、停止响应前日志落库、终态日志保留，以及长等待在首个切片后响应立即停止。
+- **覆盖 GoPay 停止契约**：新增 `tests/test_gopay_batch_stop_modes.py`，验证单会话真实取消、失败重试、批量排空、启动闸门、批量立即停止失败不假报取消和旧版无 body cancel 兼容。
+
 ## [2.1.4] - 2026-07-15
 
 ### 修复 (Fixed)
@@ -1397,4 +1416,8 @@
 
 ## 2026-07-15 06:35:14 +0800
 - 修复手机号池号段状态回写与限流自动恢复
+- 发布模式: multi
+
+## 2026-07-15 18:35:54 +0800
+- 新增全任务完成当前后停止并持久化停止日志
 - 发布模式: multi
