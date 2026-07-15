@@ -4,6 +4,19 @@
 
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，并且本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/) (语义化版本)。
 
+## [2.1.6] - 2026-07-15
+
+### 修复 (Fixed)
+- **HME tag 地址直接从 TempMail 原始投递头精确收码**：`core/base_mailbox.py` 保持 Helper 仅负责 HME lease/状态、业务实例直接按 `forward_mailbox_id` 读取 TempMail 的既有边界；当逻辑地址为 `+gptN` tag 时，provider 只在邮件 header block 中匹配完整 logical 地址或 Apple 在 `Return-Path` 中使用的 `local+tag=domain_at_...` transport token。此前 Apple 会将可见 `To` 与 `X-ICLOUD-HME p=` 归一化为 physical HME alias，导致实际已投递的 OTP 被误判为“不属于当前邮箱”。tag 分支明确禁止回退 physical alias，也不将正文中的引用地址作为归属证据，避免同一 physical HME 的 gpt1/gpt2/gpt3/gpt4 槽位串码或 gpt1/gpt10 前缀误命中。
+- **HME Ready 的实际 OTP 等待时间不再被旧全局 20 秒配置截断**：`services/chatgpt_core/plugin.py` 让 `hme_ready_api`（及显式 `helper_ready_api` 模式）与既有 `email_api` 一样遵从 ChatGPT 注册状态机传入的首次/重发等待窗口，并继续受单账号总预算控制。此前日志会显示等待 60/90 秒，底层却优先读取 `mailbox_otp_timeout_seconds=20` 并在 20 秒超时，造成慢投递邮件和重发阶段被提前放弃。
+
+### 优化 (Changed)
+- **保留直查 TempMail 的 HME Ready 架构并补齐诊断字段**：命中 OTP 后的 verification metadata 新增 `alias_match_source`，可区分 tag transport-header 路由与旧 `received_for/raw` 路径；未改为 Helper `wait-code` 中转，避免把共享转发箱轮询 I/O 回灌到 HME 控制面。
+- **前端版本同步至 v2.1.6**：`frontend/src/app/AppShell.tsx` 更新侧栏版本，便于确认当前浏览器对应 HME tag 收码与 OTP 等待修复版本。
+
+### 测试 (Tests)
+- **锁定 tag 隔离和等待窗口契约**：`tests/test_icloud_hme_mailbox_finalize.py` 覆盖真实 Apple `Return-Path` 编码、physical `received_for`、sibling tag、gpt1/gpt10 前缀冲突及正文伪地址，确认仍由 auto-gpt 直查 TempMail 且不会调用 Helper 读信；`tests/test_chatgpt_plugin.py` 覆盖 HME Ready 不被 `mailbox_otp_timeout_seconds` 静默缩短。
+
 ## [2.1.5] - 2026-07-15
 
 ### 新增 (Added)
@@ -1425,4 +1438,8 @@
 
 ## 2026-07-15 18:37:48 +0800
 - 修复多实例发布的 standby 容器检查
+- 发布模式: multi
+
+## 2026-07-15 21:36:50 +0800
+- 修复 HME tag 直查收码与 OTP 等待窗口
 - 发布模式: multi

@@ -174,6 +174,82 @@ class IcloudHmeMailboxFinalizeTests(unittest.TestCase):
         self.assertEqual(mailbox._last_verification_result["lease_id"], "lease-1")
         self.assertEqual(mailbox._last_verification_result["matched_mailbox_id"], "specific-mbox")
 
+    def test_helper_ready_reads_tagged_hme_otp_from_tempmail_return_path(self):
+        mailbox = IcloudHmeMailbox(
+            icloud_hme_mode="helper_ready_api",
+            icloud_cookie="",
+            icloud_forward_to="global@example.com",
+            tempmail_api_url="http://tempmail-api-1:8080",
+            tempmail_api_key="test-key",
+            icloud_hme_helper_api_url="http://helper-api",
+            icloud_hme_helper_internal_key="helper-key",
+        )
+        account = MailboxAccount(
+            email="reviser.smiths_2f+gpt1@icloud.com",
+            account_id="lease-tag-1",
+            extra={
+                "provider": "hme_ready_api",
+                "mode": "helper_ready_api",
+                "lease_id": "lease-tag-1",
+                "forward_to": "specific@example.com",
+                "forward_mailbox_id": "specific-mbox",
+            },
+        )
+
+        mailbox._helper_client.wait_code = Mock(side_effect=AssertionError("helper wait-code must not be called"))
+        mailbox._tempmail_mailbox._list_emails = Mock(
+            return_value=[{"id": "tagged-msg-1", "subject": "OpenAI verification"}]
+        )
+        mailbox._tempmail_mailbox._get_email_detail = Mock(
+            return_value={
+                # Apple-visible recipient metadata is deliberately physical.
+                "received_for": ["reviser.smiths_2f@icloud.com"],
+                "subject": "OpenAI verification",
+                "body_text": "Your verification code is 123456.",
+                "raw_message": (
+                    "Return-Path: <bounce+abc-reviser.smiths_2f+gpt1=icloud.com_at_tm1_openai_com_abc@icloud.com>\r\n"
+                    "To: Hide My Email <reviser.smiths_2f@icloud.com>\r\n"
+                    "X-ICLOUD-HME: p=reviser.smiths_2f@icloud.com; f=specific@example.com;\r\n\r\n"
+                    "Your verification code is 123456."
+                ),
+            }
+        )
+
+        code = mailbox.wait_for_code(account, timeout=1)
+
+        self.assertEqual(code, "123456")
+        mailbox._helper_client.wait_code.assert_not_called()
+        self.assertEqual(mailbox._last_verification_result["alias_match_source"], "tagged_hme_transport_header")
+
+    def test_tagged_hme_transport_match_never_falls_back_or_prefix_matches(self):
+        expected = "reviser.smiths_2f+gpt1@icloud.com"
+
+        self.assertTrue(
+            IcloudHmeMailbox._tagged_hme_headers_match_alias(
+                "Return-Path: <bounce+abc-reviser.smiths_2f+gpt1=icloud.com_at_tm1_openai_com_abc@icloud.com>\r\n",
+                expected,
+            )
+        )
+        self.assertFalse(
+            IcloudHmeMailbox._tagged_hme_headers_match_alias(
+                "Return-Path: <bounce+abc-reviser.smiths_2f+gpt2=icloud.com_at_tm1_openai_com_abc@icloud.com>\r\n",
+                expected,
+            )
+        )
+        self.assertFalse(
+            IcloudHmeMailbox._tagged_hme_headers_match_alias(
+                "Return-Path: <bounce+abc-reviser.smiths_2f+gpt10=icloud.com_at_tm1_openai_com_abc@icloud.com>\r\n",
+                expected,
+            )
+        )
+        self.assertFalse(
+            IcloudHmeMailbox._tagged_hme_headers_match_alias(
+                "X-ICLOUD-HME: p=reviser.smiths_2f@icloud.com;\r\n\r\n"
+                "quoted body reviser.smiths_2f+gpt1=icloud.com_at_tm1_openai_com",
+                expected,
+            )
+        )
+
     def test_helper_ready_current_ids_reads_tempmail_not_helper(self):
         mailbox = IcloudHmeMailbox(
             icloud_hme_mode="helper_ready_api",

@@ -2545,6 +2545,53 @@ class IcloudHmeMailbox(BaseMailbox):
         return str(value or "").strip().lower()
 
     @staticmethod
+    def _is_tagged_hme_alias(alias: str) -> bool:
+        """Return whether an HME logical address uses an iCloud ``+tag`` slot."""
+        normalized = IcloudHmeMailbox._normalize_email(alias)
+        local, separator, domain = normalized.rpartition("@")
+        return bool(separator and local and domain and "+" in local)
+
+    @staticmethod
+    def _raw_header_block(raw_message: str) -> str:
+        """Keep transport headers separate from an untrusted message body."""
+        return re.split(r"\r?\n\r?\n", str(raw_message or ""), maxsplit=1)[0]
+
+    @classmethod
+    def _tagged_hme_headers_match_alias(cls, raw_message: str, alias: str) -> bool:
+        """Match a tagged HME only through trusted transport-header tokens.
+
+        Apple normalizes the visible ``To`` and ``X-ICLOUD-HME p=`` values to
+        the physical HME alias.  The logical ``+gptN`` destination survives in
+        ``Return-Path`` as ``local+tag=domain_at_...``.  Matching the physical
+        alias would let sibling tag leases consume each other's OTP, and
+        searching the body would turn quoted addresses into routing evidence.
+        """
+        normalized = cls._normalize_email(alias)
+        if not cls._is_tagged_hme_alias(normalized):
+            return False
+
+        headers = cls._raw_header_block(raw_message).lower()
+        if not headers:
+            return False
+
+        def contains_transport_token(token: str) -> bool:
+            escaped = re.escape(token)
+            return bool(
+                re.search(
+                    rf"(?:^|[<\s:;=,\-]){escaped}(?=$|[\s_@>;,)])",
+                    headers,
+                    flags=re.IGNORECASE,
+                )
+            )
+
+        # Keep the literal address form for providers that preserve it, then
+        # accept Apple's transport-safe @ -> = representation.  The boundary
+        # rejects gpt1/gpt10 prefix collisions and only considers headers.
+        return contains_transport_token(normalized) or contains_transport_token(
+            normalized.replace("@", "=", 1)
+        )
+
+    @staticmethod
     def _utcnow_iso() -> str:
         return datetime.now(timezone.utc).isoformat()
 
@@ -3049,20 +3096,29 @@ class IcloudHmeMailbox(BaseMailbox):
 
                     detail = self._tempmail_mailbox._get_email_detail(m_id, mid)
                     received_for = detail.get("received_for") if isinstance(detail, dict) else []
-                    normalized_targets = {
-                        self._normalize_email(value)
-                        for value in (received_for if isinstance(received_for, list) else [])
-                        if str(value or "").strip()
-                    }
                     raw_message = str(detail.get("raw_message") or "")
-                    raw_lower = raw_message.lower()
-                    alias_header_hit = (
-                        f"for <{alias}>" in raw_lower
-                        or f"delivered-to: {alias}" in raw_lower
-                        or f"x-original-to: {alias}" in raw_lower
-                        or alias in raw_lower
-                    )
-                    if alias not in normalized_targets and not alias_header_hit:
+                    if self._is_tagged_hme_alias(alias):
+                        # A tagged lease must never fall back to its physical
+                        # HME address in received_for / X-ICLOUD-HME p=.
+                        # Those fields intentionally omit +gptN after Apple
+                        # forwarding and would cross-deliver sibling OTPs.
+                        matched_alias = self._tagged_hme_headers_match_alias(raw_message, alias)
+                        match_source = "tagged_hme_transport_header"
+                    else:
+                        normalized_targets = {
+                            self._normalize_email(value)
+                            for value in (received_for if isinstance(received_for, list) else [])
+                            if str(value or "").strip()
+                        }
+                        raw_lower = raw_message.lower()
+                        matched_alias = alias in normalized_targets or (
+                            f"for <{alias}>" in raw_lower
+                            or f"delivered-to: {alias}" in raw_lower
+                            or f"x-original-to: {alias}" in raw_lower
+                            or alias in raw_lower
+                        )
+                        match_source = "legacy_received_for_or_raw"
+                    if not matched_alias:
                         seen.add(mid)
                         continue
 
@@ -3094,6 +3150,7 @@ class IcloudHmeMailbox(BaseMailbox):
                         metadata={
                             "received_for": list(received_for or []),
                             "matched_alias": getattr(account, "email", "") or "",
+                            "alias_match_source": match_source,
                             "mailbox": {"id": m_id},
                             "lease_id": helper_lease_id if self._icloud_hme_mode == "helper_ready_api" else "",
                             "matched_forward_to": str(getattr(forward_mailbox, "email", "") or ""),

@@ -116,10 +116,20 @@ class ChatGPTPlatform(BasePlatform):
             return engine.build_account(result)
 
         def _resolve_mailbox_timeout(requested_timeout: int) -> int:
-            # email_api 的 API 本身只是控制面轮询，真正的等待窗口应服从
-            # ChatGPT 状态机传入的 register/oauth OTP timeout。否则旧的全局
-            # email_otp_timeout_seconds=20 会把 600s 注册等待压成 20s。
-            if _mail_provider in {"email_api", "api_email", "email_otp_api", "mail_api_otp"}:
+            # email_api 与 HME Ready 都只是邮箱控制面：实际的 OTP 等待窗口
+            # 必须服从 ChatGPT 状态机传入的 register/oauth timeout。否则旧的
+            # mailbox_otp_timeout_seconds=20 会把首次/重发的 60/90s 等待静默
+            # 压成 20s，日志显示的等待时长也会与实际不一致。
+            provider_uses_state_machine_timeout = _mail_provider in {
+                "email_api",
+                "api_email",
+                "email_otp_api",
+                "mail_api_otp",
+                "hme_ready_api",
+                "icloud_hme_ready",
+                "icloud_hme_helper_ready",
+            } or str(extra_config.get("icloud_hme_mode") or "").strip().lower() == "helper_ready_api"
+            if provider_uses_state_machine_timeout:
                 try:
                     requested_seconds = int(requested_timeout)
                 except (TypeError, ValueError):
