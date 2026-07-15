@@ -157,6 +157,36 @@ def test_accounts_list_and_task_resolver_return_the_same_scope(filter_engine):
     assert {item["id"] for item in listed["items"]} == set(resolution.account_ids) == {1}
 
 
+def test_phone_binding_filter_keeps_list_and_task_scope_identical(filter_engine):
+    with Session(filter_engine) as session:
+        state = session.get(AccountListStateModel, 4)
+        assert state is not None
+        state.phone_binding_state = "confirmed"
+        session.add(state)
+        session.commit()
+
+        request = tasks.PhoneBindingTestTaskRequest(
+            all_filtered=True,
+            phone_binding_state="confirmed",
+        )
+        resolution = account_filters.resolve_filtered_accounts(
+            session,
+            platform="chatgpt",
+            filter_source=request,
+            verify_expected_total=True,
+        )
+        listed = accounts.list_accounts(
+            platform="chatgpt",
+            phone_binding_state="confirmed",
+            page=1,
+            page_size=200,
+            session=session,
+        )
+
+    assert listed["total"] == resolution.matched_total == 1
+    assert {item["id"] for item in listed["items"]} == set(resolution.account_ids) == {4}
+
+
 def test_expected_total_mismatch_has_no_task_thread_background_or_phone_pool_side_effect(filter_engine, monkeypatch):
     create_task = mock.Mock()
     import_phones = mock.Mock()

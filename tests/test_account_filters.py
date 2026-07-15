@@ -9,6 +9,7 @@ try:
     from core.db import AccountListStateModel, AccountModel, engine, init_db
     from services.account_filters import (
         account_idea_submit_state,
+        account_phone_binding_state,
         account_revival_info,
         account_revival_state,
         apply_account_list_state_filters,
@@ -31,6 +32,7 @@ except ModuleNotFoundError as exc:
     engine = None
     init_db = None
     account_idea_submit_state = None
+    account_phone_binding_state = None
     account_revival_info = None
     account_revival_state = None
     apply_account_list_state_filters = None
@@ -216,6 +218,97 @@ class AccountFilterSortTests(unittest.TestCase):
             [row.id for row in filter_account_rows([unavailable, paid, legacy_unavailable, available, submitted, processing], idea_submit_state="available,submitted")],
             [33, 34],
         )
+
+    def test_phone_binding_filter_uses_confirmed_binding_not_rt_or_phone_hint(self):
+        init_db()
+        confirmed = self._account(501)
+        confirmed.set_extra(
+            {
+                "refresh_token": "rt-confirmed",
+                "chatgpt_phone_binding": {
+                    "status": "bound",
+                    "phone": "+1 (613) 465-5704",
+                },
+            }
+        )
+        observed_only = self._account(502)
+        observed_only.set_extra(
+            {
+                "refresh_token": "rt-observed-only",
+                "chatgpt_bound_phone": {
+                    "phone": "+16134655704",
+                    "verification_status": "required",
+                },
+            }
+        )
+        malformed = self._account(503)
+        malformed.set_extra(
+            {
+                "chatgpt_phone_binding": {
+                    "status": "success",
+                    "phone": "5704",
+                },
+            }
+        )
+        no_phone_record = self._account(504)
+        no_phone_record.set_extra({"refresh_token": "rt-without-phone"})
+        rows = [confirmed, observed_only, malformed, no_phone_record]
+
+        self.assertEqual(account_phone_binding_state(confirmed), "confirmed")
+        self.assertEqual(account_phone_binding_state(observed_only), "unconfirmed")
+        self.assertEqual(account_phone_binding_state(malformed), "unconfirmed")
+        self.assertEqual(account_phone_binding_state(no_phone_record), "unknown")
+        self.assertEqual(
+            [row.id for row in filter_account_rows(rows, phone_binding_state="confirmed")],
+            [501],
+        )
+        self.assertEqual(
+            [row.id for row in filter_account_rows(rows, phone_binding_state="unbound")],
+            [502, 503, 504],
+        )
+
+        with Session(engine) as session:
+            session.exec(text("DELETE FROM account_list_state"))
+            session.exec(text("DELETE FROM accounts"))
+            for row in rows:
+                session.add(row)
+            session.commit()
+            refresh_account_list_state(session)
+
+            state_rows = {
+                int(row[0]): str(row[1])
+                for row in session.exec(
+                    text(
+                        """
+                        SELECT account_id, phone_binding_state
+                        FROM account_list_state
+                        WHERE account_id BETWEEN 501 AND 504
+                        ORDER BY account_id
+                        """
+                    )
+                ).all()
+            }
+            self.assertEqual(
+                state_rows,
+                {
+                    501: "confirmed",
+                    502: "unconfirmed",
+                    503: "unconfirmed",
+                    504: "unknown",
+                },
+            )
+
+            def sql_ids(**filters):
+                q = select(AccountModel).join(
+                    AccountListStateModel,
+                    AccountListStateModel.account_id == AccountModel.id,
+                )
+                q = apply_account_list_state_filters(q, **filters)
+                q = q.order_by(AccountModel.id.asc())
+                return [int(row.id or 0) for row in session.exec(q).all()]
+
+            self.assertEqual(sql_ids(phone_binding_state="confirmed"), [501])
+            self.assertEqual(sql_ids(phone_binding_state="unbound"), [502, 503, 504])
 
     def test_account_list_state_sql_filters_match_python_filters(self):
         init_db()
@@ -499,6 +592,7 @@ class AccountFilterSortTests(unittest.TestCase):
         self.assertIn("source_updated_at", columns)
         self.assertIn("subscription_active_until_ts", columns)
         self.assertIn("idea_submit_state", columns)
+        self.assertIn("phone_binding_state", columns)
         self.assertIn("derivation_version", columns)
         self.assertEqual(state.subscription_type, "plus")
 

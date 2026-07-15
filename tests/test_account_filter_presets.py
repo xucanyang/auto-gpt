@@ -41,6 +41,7 @@ def test_account_filter_preset_crud_and_normalization(monkeypatch):
                 "columnFilters": {
                     "subscriptionType": ["plus", "pro", "plus"],
                     "authType": ["refresh_token"],
+                    "phoneBindingState": ["unbound"],
                     "accountValidity": ["valid"],
                     "oaipayState": ["unknown", "not_found"],
                     "ideaSubmitState": ["available", "submitted", "processing", "unavailable"],
@@ -55,6 +56,7 @@ def test_account_filter_preset_crud_and_normalization(monkeypatch):
     assert item["filters"]["search"] == "user@example.com"
     assert item["filters"]["status"] == ["registered", "subscribed"]
     assert item["filters"]["columnFilters"]["subscriptionType"] == ["plus", "pro"]
+    assert item["filters"]["columnFilters"]["phoneBindingState"] == ["unbound"]
     assert item["filters"]["columnFilters"]["ideaSubmitState"] == ["unsubmitted", "submitting", "unavailable"]
     assert item["filters"]["sortOrder"] == "asc"
     assert item["filters"]["pageSize"] == 50

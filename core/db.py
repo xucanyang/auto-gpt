@@ -158,6 +158,7 @@ class AccountListStateModel(SQLModel, table=True):
     platform: str = Field(default="", index=True)
     manually_used: bool = Field(default=False, index=True)
     auth_type: str = Field(default="unknown", index=True)
+    phone_binding_state: str = Field(default="unknown", index=True)
     auth_level: str = Field(default="", index=True)
     subscription_type: str = Field(default="unknown", index=True)
     account_validity: str = Field(default="valid", index=True)
@@ -3281,6 +3282,7 @@ def _ensure_account_list_state_schema() -> None:
                 platform TEXT NOT NULL DEFAULT '',
                 manually_used INTEGER NOT NULL DEFAULT 0,
                 auth_type TEXT NOT NULL DEFAULT 'unknown',
+                phone_binding_state TEXT NOT NULL DEFAULT 'unknown',
                 auth_level TEXT NOT NULL DEFAULT '',
                 subscription_type TEXT NOT NULL DEFAULT 'unknown',
                 account_validity TEXT NOT NULL DEFAULT 'valid',
@@ -3302,6 +3304,7 @@ def _ensure_account_list_state_schema() -> None:
             "platform": "TEXT NOT NULL DEFAULT ''",
             "manually_used": "INTEGER NOT NULL DEFAULT 0",
             "auth_type": "TEXT NOT NULL DEFAULT 'unknown'",
+            "phone_binding_state": "TEXT NOT NULL DEFAULT 'unknown'",
             "auth_level": "TEXT NOT NULL DEFAULT ''",
             "subscription_type": "TEXT NOT NULL DEFAULT 'unknown'",
             "account_validity": "TEXT NOT NULL DEFAULT 'valid'",
@@ -3337,6 +3340,10 @@ def _ensure_account_list_state_schema() -> None:
         conn.exec_driver_sql(
             "CREATE INDEX IF NOT EXISTS idx_account_list_state_auth_type "
             "ON account_list_state(auth_type)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_account_list_state_phone_binding_state "
+            "ON account_list_state(phone_binding_state)"
         )
         conn.exec_driver_sql(
             "CREATE INDEX IF NOT EXISTS idx_account_list_state_subscription_type "

@@ -19,13 +19,14 @@ from services.chatgpt_account_state import (
 )
 
 AUTO_DELETE_REVIVAL_TASK_ID = "icloud_hme_auto_delete"
-ACCOUNT_LIST_STATE_DERIVATION_VERSION = "idea-submit-state-v1"
-ACCOUNT_FILTER_RESOLVER_VERSION = "account-list-state-v1"
+ACCOUNT_LIST_STATE_DERIVATION_VERSION = "phone-binding-state-v1"
+ACCOUNT_FILTER_RESOLVER_VERSION = "account-list-state-v2"
 ACCOUNT_FILTER_FIELD_NAMES = (
     "email",
     "status",
     "manually_used",
     "auth_type",
+    "phone_binding_state",
     "subscription_type",
     "account_validity",
     "sub2api_state",
@@ -42,6 +43,7 @@ class AccountFilterRequestMixin(BaseModel):
     status: str = ""
     manually_used: str | None = None
     auth_type: str = ""
+    phone_binding_state: str = ""
     subscription_type: str = ""
     account_validity: str = ""
     sub2api_state: str = ""
@@ -150,11 +152,28 @@ _IDEA_SUBMIT_STATE_FILTER_ALIASES: dict[str, set[str]] = {
     "unavailable": {"unavailable"},
 }
 
+_PHONE_BINDING_STATE_FILTER_ALIASES: dict[str, set[str]] = {
+    "bound": {"confirmed"},
+    "confirmed": {"confirmed"},
+    "unbound": {"unconfirmed", "unknown"},
+    "not_bound": {"unconfirmed", "unknown"},
+    "not_confirmed": {"unconfirmed", "unknown"},
+    "unconfirmed": {"unconfirmed"},
+    "unknown": {"unknown"},
+}
+
 
 def _split_idea_submit_filter_values(value: Any) -> set[str]:
     expanded: set[str] = set()
     for item in _split_values(value):
         expanded.update(_IDEA_SUBMIT_STATE_FILTER_ALIASES.get(item, {item}))
+    return expanded
+
+
+def _split_phone_binding_state_filter_values(value: Any) -> set[str]:
+    expanded: set[str] = set()
+    for item in _split_values(value):
+        expanded.update(_PHONE_BINDING_STATE_FILTER_ALIASES.get(item, {item}))
     return expanded
 
 
@@ -177,19 +196,33 @@ def _filter_source_value(source: Any, field_name: str) -> Any:
     return getattr(source, field_name, None)
 
 
-def _normalize_filter_values(value: Any, *, idea_submit: bool = False) -> str:
-    values = _split_idea_submit_filter_values(value) if idea_submit else _split_values(value)
+def _normalize_filter_values(
+    value: Any,
+    *,
+    idea_submit: bool = False,
+    phone_binding_state: bool = False,
+) -> str:
+    if idea_submit:
+        values = _split_idea_submit_filter_values(value)
+    elif phone_binding_state:
+        values = _split_phone_binding_state_filter_values(value)
+    else:
+        values = _split_values(value)
     return ",".join(sorted(values))
 
 
 def normalize_account_filter(source: Any) -> dict[str, Any]:
-    """Return the canonical nine-field filter represented by a flat request."""
+    """Return the canonical account filter represented by a flat request."""
 
     return {
         "email": _safe_str(_filter_source_value(source, "email")),
         "status": _normalize_filter_values(_filter_source_value(source, "status")),
         "manually_used": normalize_optional_bool(_filter_source_value(source, "manually_used")),
         "auth_type": _normalize_filter_values(_filter_source_value(source, "auth_type")),
+        "phone_binding_state": _normalize_filter_values(
+            _filter_source_value(source, "phone_binding_state"),
+            phone_binding_state=True,
+        ),
         "subscription_type": _normalize_filter_values(_filter_source_value(source, "subscription_type")),
         "account_validity": _normalize_filter_values(_filter_source_value(source, "account_validity")),
         "sub2api_state": _normalize_filter_values(_filter_source_value(source, "sub2api_state")),
@@ -479,6 +512,20 @@ def account_auth_type(account: AccountModel, extra: dict[str, Any] | None = None
     return "unknown"
 
 
+def account_phone_binding_state(account: AccountModel, extra: dict[str, Any] | None = None) -> str:
+    """Classify only locally confirmed full phone bindings.
+
+    The classifier deliberately ignores RT presence and passive phone hints so
+    list filtering follows the same fail-closed rule as account serialization.
+    """
+
+    extra = extra if isinstance(extra, dict) else _extra(account)
+    local_probe = extra.get("chatgpt_local") if isinstance(extra.get("chatgpt_local"), dict) else {}
+    capabilities = classify_chatgpt_capabilities(account, local_probe=local_probe)
+    state = _lower_text(capabilities.get("phone_binding_state"))
+    return state if state in {"confirmed", "unconfirmed", "unknown"} else "unknown"
+
+
 def _normalize_subscription_type(plan: Any) -> str:
     return normalize_subscription_plan(plan)
 
@@ -584,6 +631,7 @@ def ensure_account_list_state_schema(session: Session) -> None:
                 platform TEXT NOT NULL DEFAULT '',
                 manually_used INTEGER NOT NULL DEFAULT 0,
                 auth_type TEXT NOT NULL DEFAULT 'unknown',
+                phone_binding_state TEXT NOT NULL DEFAULT 'unknown',
                 auth_level TEXT NOT NULL DEFAULT '',
                 subscription_type TEXT NOT NULL DEFAULT 'unknown',
                 account_validity TEXT NOT NULL DEFAULT 'valid',
@@ -604,6 +652,7 @@ def ensure_account_list_state_schema(session: Session) -> None:
         "platform": "TEXT NOT NULL DEFAULT ''",
         "manually_used": "INTEGER NOT NULL DEFAULT 0",
         "auth_type": "TEXT NOT NULL DEFAULT 'unknown'",
+        "phone_binding_state": "TEXT NOT NULL DEFAULT 'unknown'",
         "auth_level": "TEXT NOT NULL DEFAULT ''",
         "subscription_type": "TEXT NOT NULL DEFAULT 'unknown'",
         "account_validity": "TEXT NOT NULL DEFAULT 'valid'",
@@ -634,6 +683,7 @@ def ensure_account_list_state_schema(session: Session) -> None:
         "CREATE INDEX IF NOT EXISTS idx_account_list_state_platform ON account_list_state(platform)",
         "CREATE INDEX IF NOT EXISTS idx_account_list_state_manually_used ON account_list_state(manually_used)",
         "CREATE INDEX IF NOT EXISTS idx_account_list_state_auth_type ON account_list_state(auth_type)",
+        "CREATE INDEX IF NOT EXISTS idx_account_list_state_phone_binding_state ON account_list_state(phone_binding_state)",
         "CREATE INDEX IF NOT EXISTS idx_account_list_state_subscription_type ON account_list_state(subscription_type)",
         "CREATE INDEX IF NOT EXISTS idx_account_list_state_account_validity ON account_list_state(account_validity)",
         "CREATE INDEX IF NOT EXISTS idx_account_list_state_sub2api_state ON account_list_state(sub2api_state)",
@@ -796,6 +846,26 @@ def refresh_account_list_state(
                         THEN 1
                         ELSE 0
                     END AS manually_used,
+                    CASE
+                        WHEN json_type(extra, '$.chatgpt_phone_binding') = 'object'
+                             AND trim(CAST(json_extract(extra, '$.chatgpt_phone_binding') AS TEXT)) NOT IN ('', '{}')
+                        THEN 1
+                        ELSE 0
+                    END AS phone_binding_present,
+                    lower(trim(coalesce(
+                        nullif(trim(CAST(json_extract(extra, '$.chatgpt_phone_binding.status') AS TEXT)), ''),
+                        nullif(trim(CAST(json_extract(extra, '$.chatgpt_phone_binding.result') AS TEXT)), ''),
+                        ''
+                    ))) AS phone_binding_status,
+                    coalesce(
+                        nullif(trim(CAST(json_extract(extra, '$.chatgpt_phone_binding.phone') AS TEXT)), ''),
+                        nullif(trim(CAST(json_extract(extra, '$.chatgpt_phone_binding.phone_number') AS TEXT)), ''),
+                        ''
+                    ) AS phone_binding_phone,
+                    CASE WHEN json_type(extra, '$.chatgpt_bound_phone') = 'object' THEN 1 ELSE 0 END AS bound_phone_present,
+                    trim(coalesce(json_extract(extra, '$.chatgpt_bound_phone_number'), '')) AS bound_phone_number,
+                    trim(coalesce(json_extract(extra, '$.chatgpt_bound_phone_masked'), '')) AS bound_phone_masked,
+                    CASE WHEN json_type(extra, '$.chatgpt_phone_challenge') = 'object' THEN 1 ELSE 0 END AS phone_challenge_present,
                     lower(trim(coalesce(
                         json_extract(extra, '$.chatgpt_capabilities.auth_level'),
                         json_extract(extra, '$.auth_level'),
@@ -939,6 +1009,18 @@ def refresh_account_list_state(
                         WHEN access_token_value != '' THEN 'access_token_only'
                         ELSE 'unknown'
                     END AS derived_auth_type,
+                    (
+                        length(phone_binding_phone) - length(replace(phone_binding_phone, '0', ''))
+                        + length(phone_binding_phone) - length(replace(phone_binding_phone, '1', ''))
+                        + length(phone_binding_phone) - length(replace(phone_binding_phone, '2', ''))
+                        + length(phone_binding_phone) - length(replace(phone_binding_phone, '3', ''))
+                        + length(phone_binding_phone) - length(replace(phone_binding_phone, '4', ''))
+                        + length(phone_binding_phone) - length(replace(phone_binding_phone, '5', ''))
+                        + length(phone_binding_phone) - length(replace(phone_binding_phone, '6', ''))
+                        + length(phone_binding_phone) - length(replace(phone_binding_phone, '7', ''))
+                        + length(phone_binding_phone) - length(replace(phone_binding_phone, '8', ''))
+                        + length(phone_binding_phone) - length(replace(phone_binding_phone, '9', ''))
+                    ) AS phone_binding_digit_count,
                     CASE
                         WHEN account_status = 'invalid'
                             OR auth_level = 'invalid'
@@ -1005,6 +1087,19 @@ def refresh_account_list_state(
                     platform,
                     manually_used,
                     derived_auth_type AS auth_type,
+                    CASE
+                        WHEN phone_binding_present = 1
+                             AND phone_binding_status IN ('bound', 'success', 'completed')
+                             AND phone_binding_digit_count >= 8
+                        THEN 'confirmed'
+                        WHEN phone_binding_present = 1
+                             OR bound_phone_present = 1
+                             OR bound_phone_number != ''
+                             OR bound_phone_masked != ''
+                             OR phone_challenge_present = 1
+                        THEN 'unconfirmed'
+                        ELSE 'unknown'
+                    END AS phone_binding_state,
                     auth_level,
                     derived_subscription_type AS subscription_type,
                     derived_account_validity AS account_validity,
@@ -1049,6 +1144,7 @@ def refresh_account_list_state(
                 platform,
                 manually_used,
                 auth_type,
+                phone_binding_state,
                 auth_level,
                 subscription_type,
                 account_validity,
@@ -1068,6 +1164,7 @@ def refresh_account_list_state(
                 platform,
                 manually_used,
                 auth_type,
+                phone_binding_state,
                 auth_level,
                 subscription_type,
                 account_validity,
@@ -1087,6 +1184,7 @@ def refresh_account_list_state(
                 platform = excluded.platform,
                 manually_used = excluded.manually_used,
                 auth_type = excluded.auth_type,
+                phone_binding_state = excluded.phone_binding_state,
                 auth_level = excluded.auth_level,
                 subscription_type = excluded.subscription_type,
                 account_validity = excluded.account_validity,
@@ -1204,6 +1302,7 @@ def should_use_account_list_state(
     *,
     manually_used: bool | None = None,
     auth_type: Any = None,
+    phone_binding_state: Any = None,
     subscription_type: Any = None,
     account_validity_filter: Any = None,
     sub2api_state: Any = None,
@@ -1217,6 +1316,7 @@ def should_use_account_list_state(
         [
             manually_used is not None,
             bool(_split_values(auth_type)),
+            bool(_split_phone_binding_state_filter_values(phone_binding_state)),
             bool(_split_values(subscription_type)),
             bool(_split_values(account_validity_filter)),
             bool(_split_values(sub2api_state)),
@@ -1233,6 +1333,7 @@ def apply_account_list_state_filters(
     *,
     manually_used: bool | None = None,
     auth_type: Any = None,
+    phone_binding_state: Any = None,
     subscription_type: Any = None,
     account_validity_filter: Any = None,
     sub2api_state: Any = None,
@@ -1246,6 +1347,10 @@ def apply_account_list_state_filters(
     auth_types = _split_values(auth_type)
     if auth_types:
         query = query.where(AccountListStateModel.auth_type.in_(sorted(auth_types)))
+
+    phone_binding_states = _split_phone_binding_state_filter_values(phone_binding_state)
+    if phone_binding_states:
+        query = query.where(AccountListStateModel.phone_binding_state.in_(sorted(phone_binding_states)))
 
     subscription_types = _split_values(subscription_type)
     if subscription_types:
@@ -1290,6 +1395,7 @@ def account_filtered_query(
     use_list_state = should_use_account_list_state(
         manually_used=normalized["manually_used"],
         auth_type=normalized["auth_type"],
+        phone_binding_state=normalized["phone_binding_state"],
         subscription_type=normalized["subscription_type"],
         account_validity_filter=normalized["account_validity"],
         sub2api_state=normalized["sub2api_state"],
@@ -1318,6 +1424,7 @@ def account_filtered_query(
         query,
         manually_used=normalized["manually_used"],
         auth_type=normalized["auth_type"],
+        phone_binding_state=normalized["phone_binding_state"],
         subscription_type=normalized["subscription_type"],
         account_validity_filter=normalized["account_validity"],
         sub2api_state=normalized["sub2api_state"],
@@ -1412,6 +1519,7 @@ def filter_account_rows(
     *,
     manually_used: bool | None = None,
     auth_type: Any = None,
+    phone_binding_state: Any = None,
     subscription_type: Any = None,
     account_validity_filter: Any = None,
     sub2api_state: Any = None,
@@ -1420,6 +1528,7 @@ def filter_account_rows(
     revival_state: Any = None,
 ) -> list[AccountModel]:
     auth_types = _split_values(auth_type)
+    phone_binding_states = _split_phone_binding_state_filter_values(phone_binding_state)
     subscription_types = _split_values(subscription_type)
     validity_values = _split_values(account_validity_filter)
     sub2api_states = _split_values(sub2api_state)
@@ -1433,6 +1542,8 @@ def filter_account_rows(
         if manually_used is not None and bool(extra.get("manually_used")) is not manually_used:
             continue
         if auth_types and account_auth_type(row, extra) not in auth_types:
+            continue
+        if phone_binding_states and account_phone_binding_state(row, extra) not in phone_binding_states:
             continue
         if subscription_types and account_subscription_type(row, extra) not in subscription_types:
             continue

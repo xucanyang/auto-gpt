@@ -279,6 +279,7 @@ type AccountFilterRequestBody = {
   status: string
   manually_used: string
   auth_type: string
+  phone_binding_state: string
   subscription_type: string
   account_validity: string
   sub2api_state: string
@@ -294,6 +295,7 @@ const ACCOUNT_FILTER_REQUEST_KEYS: Array<keyof AccountFilterRequestBody> = [
   'status',
   'manually_used',
   'auth_type',
+  'phone_binding_state',
   'subscription_type',
   'account_validity',
   'sub2api_state',
@@ -418,6 +420,7 @@ type AccountColumnFilters = {
   status: string[]
   manuallyUsed: string[]
   authType: string[]
+  phoneBindingState: string[]
   subscriptionType: string[]
   accountValidity: string[]
   codexState: string[]
@@ -431,6 +434,7 @@ const EMPTY_ACCOUNT_FILTERS: AccountColumnFilters = {
   status: [],
   manuallyUsed: [],
   authType: [],
+  phoneBindingState: [],
   subscriptionType: [],
   accountValidity: [],
   codexState: [],
@@ -473,6 +477,11 @@ const STATUS_FILTER_OPTIONS = [
 const MANUAL_USE_FILTER_OPTIONS = [
   { value: 'true', text: '已使用' },
   { value: 'false', text: '未使用' },
+]
+
+const PHONE_BINDING_STATE_FILTER_OPTIONS = [
+  { value: 'confirmed', text: '已绑定' },
+  { value: 'unbound', text: '未绑定' },
 ]
 
 const AUTH_TYPE_FILTER_OPTIONS = [
@@ -557,6 +566,7 @@ const ACCOUNT_FILTER_PRESET_COLUMN_KEYS: Array<keyof AccountColumnFilters> = [
   'status',
   'manuallyUsed',
   'authType',
+  'phoneBindingState',
   'subscriptionType',
   'accountValidity',
   'sub2apiState',
@@ -584,6 +594,7 @@ function cloneAccountColumnFilters(value?: Partial<Record<keyof AccountColumnFil
     status: [],
     manuallyUsed: [],
     authType: [],
+    phoneBindingState: [],
     subscriptionType: [],
     accountValidity: [],
     codexState: [],
@@ -677,6 +688,7 @@ export function buildAccountFilterPresetSummary(filters?: AccountFilterPresetFil
     summarizePresetValues(STATUS_FILTER_OPTIONS, columnFilters.status) ? `业务状态：${summarizePresetValues(STATUS_FILTER_OPTIONS, columnFilters.status)}` : '',
     summarizePresetValues(MANUAL_USE_FILTER_OPTIONS, columnFilters.manuallyUsed) ? `使用：${summarizePresetValues(MANUAL_USE_FILTER_OPTIONS, columnFilters.manuallyUsed)}` : '',
     summarizePresetValues(AUTH_TYPE_FILTER_OPTIONS, columnFilters.authType) ? `材料：${summarizePresetValues(AUTH_TYPE_FILTER_OPTIONS, columnFilters.authType)}` : '',
+    summarizePresetValues(PHONE_BINDING_STATE_FILTER_OPTIONS, columnFilters.phoneBindingState) ? `手机号：${summarizePresetValues(PHONE_BINDING_STATE_FILTER_OPTIONS, columnFilters.phoneBindingState)}` : '',
     summarizePresetValues(SUBSCRIPTION_TYPE_FILTER_OPTIONS, columnFilters.subscriptionType) ? `当前订阅：${summarizePresetValues(SUBSCRIPTION_TYPE_FILTER_OPTIONS, columnFilters.subscriptionType)}` : '',
     summarizePresetValues(ACCOUNT_VALIDITY_FILTER_OPTIONS, columnFilters.accountValidity) ? `认证状态：${summarizePresetValues(ACCOUNT_VALIDITY_FILTER_OPTIONS, columnFilters.accountValidity)}` : '',
     summarizePresetValues(SUB2API_FILTER_OPTIONS, columnFilters.sub2apiState) ? `Sub2API：${summarizePresetValues(SUB2API_FILTER_OPTIONS, columnFilters.sub2apiState)}` : '',
@@ -2261,6 +2273,7 @@ export default function Accounts() {
     status: filterStatus,
     manuallyUsed: columnFilters.manuallyUsed.join(','),
     authType: columnFilters.authType.join(','),
+    phoneBindingState: columnFilters.phoneBindingState.join(','),
     subscriptionType: columnFilters.subscriptionType.join(','),
     accountValidity: columnFilters.accountValidity.join(','),
     sub2apiState: columnFilters.sub2apiState.join(','),
@@ -2276,6 +2289,7 @@ export default function Accounts() {
     status: filterStatus,
     manually_used: columnFilters.manuallyUsed.join(','),
     auth_type: columnFilters.authType.join(','),
+    phone_binding_state: columnFilters.phoneBindingState.join(','),
     subscription_type: columnFilters.subscriptionType.join(','),
     account_validity: columnFilters.accountValidity.join(','),
     sub2api_state: columnFilters.sub2apiState.join(','),
@@ -2286,6 +2300,7 @@ export default function Accounts() {
     filterStatus,
     columnFilters.manuallyUsed,
     columnFilters.authType,
+    columnFilters.phoneBindingState,
     columnFilters.subscriptionType,
     columnFilters.accountValidity,
     columnFilters.sub2apiState,
@@ -2370,7 +2385,7 @@ export default function Accounts() {
 
   useEffect(() => {
     setCurrentPage(1)
-  }, [debouncedSearch, filterStatus, columnFilters.manuallyUsed, columnFilters.authType, columnFilters.subscriptionType, columnFilters.accountValidity, columnFilters.sub2apiState, columnFilters.oaipayState, columnFilters.ideaSubmitState, subscriptionExpirySortOrder])
+  }, [debouncedSearch, filterStatus, columnFilters.manuallyUsed, columnFilters.authType, columnFilters.phoneBindingState, columnFilters.subscriptionType, columnFilters.accountValidity, columnFilters.sub2apiState, columnFilters.oaipayState, columnFilters.ideaSubmitState, subscriptionExpirySortOrder])
 
   useEffect(() => {
     if (typeof document === 'undefined') return
@@ -2630,6 +2645,7 @@ export default function Accounts() {
     if (body.status) params.set('status', String(body.status))
     if (body.manually_used) params.set('manually_used', String(body.manually_used))
     if (body.auth_type) params.set('auth_type', String(body.auth_type))
+    if (body.phone_binding_state) params.set('phone_binding_state', String(body.phone_binding_state))
     if (body.subscription_type) params.set('subscription_type', String(body.subscription_type))
     if (body.account_validity) params.set('account_validity', String(body.account_validity))
     if (body.sub2api_state) params.set('sub2api_state', String(body.sub2api_state))
@@ -2731,6 +2747,7 @@ export default function Accounts() {
       search: normalized.search,
       status: normalized.status,
       authType: normalized.columnFilters.authType,
+      phoneBindingState: normalized.columnFilters.phoneBindingState,
       subscriptionType: normalized.columnFilters.subscriptionType,
       accountValidity: normalized.columnFilters.accountValidity,
       sub2apiState: normalized.columnFilters.sub2apiState,
@@ -2795,6 +2812,7 @@ export default function Accounts() {
       status: values.status,
       columnFilters: {
         authType: values.authType,
+        phoneBindingState: values.phoneBindingState,
         subscriptionType: values.subscriptionType,
         accountValidity: values.accountValidity,
         sub2apiState: values.sub2apiState,
@@ -5735,6 +5753,15 @@ export default function Accounts() {
             allowClear
             mode="multiple"
             size="small"
+            placeholder="手机号绑定"
+            value={columnFilters.phoneBindingState}
+            options={toSelectOptions(PHONE_BINDING_STATE_FILTER_OPTIONS)}
+            onChange={(value) => setColumnFilters((prev) => ({ ...prev, phoneBindingState: value }))}
+          />
+          <Select
+            allowClear
+            mode="multiple"
+            size="small"
             placeholder="当前订阅"
             value={columnFilters.subscriptionType}
             options={toSelectOptions(SUBSCRIPTION_TYPE_FILTER_OPTIONS)}
@@ -6604,7 +6631,12 @@ export default function Accounts() {
       render: (text: string, record: any) => renderPasswordState(text, record),
     },
     {
-      title: '手机号/API',
+      title: renderColumnFilterTitle(
+        '手机号/API',
+        columnFilters.phoneBindingState,
+        PHONE_BINDING_STATE_FILTER_OPTIONS,
+        (next) => setColumnFilters((prev) => ({ ...prev, phoneBindingState: next })),
+      ),
       key: 'phone_binding',
       width: 280,
       render: (_: any, record: any) => renderPhoneBindingState(record),
@@ -7433,6 +7465,9 @@ export default function Accounts() {
                 </Form.Item>
                 <Form.Item name="authType" label="认证材料" style={{ marginBottom: 0 }}>
                   <Select mode="multiple" placeholder="全部认证材料" options={AUTH_TYPE_FILTER_OPTIONS} allowClear />
+                </Form.Item>
+                <Form.Item name="phoneBindingState" label="手机号绑定" style={{ marginBottom: 0 }}>
+                  <Select mode="multiple" placeholder="全部绑定情况" options={PHONE_BINDING_STATE_FILTER_OPTIONS} allowClear />
                 </Form.Item>
                 <Form.Item name="subscriptionType" label="当前订阅" style={{ marginBottom: 0 }}>
                   <Select mode="multiple" placeholder="全部当前订阅" options={SUBSCRIPTION_TYPE_FILTER_OPTIONS} allowClear />
