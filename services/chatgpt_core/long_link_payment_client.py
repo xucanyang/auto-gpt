@@ -18,6 +18,8 @@ from typing import Any, Callable, Iterable
 
 import requests
 
+from services.chatgpt_core.payment_link_cache import normalize_payment_link_expires_at
+
 
 DEFAULT_BASE_URL = "http://openai-pay-long-link:8788"
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 20.0
@@ -136,6 +138,9 @@ def payment_link_from_remote_job(
         "generated_at": completed_at,
         "created_at": completed_at or datetime.now(timezone.utc).isoformat(),
     }
+    link_expires_at = normalize_payment_link_expires_at(result.get("link_expires_at"))
+    if link_expires_at is not None:
+        output["link_expires_at"] = link_expires_at
     if link_type == "paypal":
         output["paypal_url"] = _http_url(result.get("paypal_url")) or url
     for key in (

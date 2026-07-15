@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import re
+import time
 from typing import Any
 
 from core.proxy_utils import normalize_proxy_url
@@ -35,6 +37,8 @@ PAYMENT_LINK_FORMAT_LONG_LINK = "long_link"
 PAYMENT_SOURCE_CHATGPT_HOSTED = "chatgpt_hosted"
 PAYMENT_SOURCE_LONG_LINK_PAYPAL = "long_link_paypal"
 PAYMENT_SOURCE_LONG_LINK = "long_link"
+MAX_PAYMENT_LINK_EXPIRES_AT_EPOCH = 253_402_300_799
+PIX_LINK_REUSE_GUARD_SECONDS = 60
 RETIRED_PAYMENT_REQUEST_KEYS = frozenset({
     "promo_code",
     "workspace_name",
@@ -99,10 +103,42 @@ def payment_link_status_label(value: Any) -> str:
     return PAYMENT_LINK_STATUS_LABELS.get(status, status)
 
 
+def normalize_payment_link_expires_at(value: Any) -> int | None:
+    """Accept only an explicit provider-issued Unix timestamp."""
+    if isinstance(value, bool):
+        return None
+    text = str(value or "").strip()
+    if not re.fullmatch(r"\d{1,12}", text):
+        return None
+    epoch = int(text)
+    if epoch <= 0 or epoch > MAX_PAYMENT_LINK_EXPIRES_AT_EPOCH:
+        return None
+    return epoch
+
+
+def payment_link_expires_soon(cached: dict[str, Any] | None, *, now: float | None = None) -> bool:
+    """PIX is reusable only while its upstream QR deadline remains safely ahead."""
+    if not isinstance(cached, dict):
+        return False
+    if str(cached.get("link_type") or "").strip().lower() != "pix":
+        return False
+    expires_at = normalize_payment_link_expires_at(cached.get("link_expires_at"))
+    if expires_at is None:
+        return False
+    try:
+        current = float(time.time() if now is None else now)
+    except (TypeError, ValueError):
+        return False
+    return expires_at <= current + PIX_LINK_REUSE_GUARD_SECONDS
+
+
 def payment_link_requires_regeneration(cached: dict[str, Any] | None) -> bool:
     if not isinstance(cached, dict):
         return False
-    return normalize_payment_link_status(cached.get("link_status")) in PAYMENT_LINK_REGENERATE_STATUSES
+    return (
+        normalize_payment_link_status(cached.get("link_status")) in PAYMENT_LINK_REGENERATE_STATUSES
+        or payment_link_expires_soon(cached)
+    )
 
 
 def payment_link_requires_status_sync(cached: dict[str, Any] | None) -> bool:
@@ -171,6 +207,8 @@ def payment_link_cache_matches(
     )
     cached_profile_hash = str(cached.get("profile_hash") or cached.get("payment_profile_hash") or "").strip()
     if payment_link_url_requires_regeneration(cached.get("url"), cached_format):
+        return False
+    if payment_link_expires_soon(cached):
         return False
     matches = (
         cached_plan == expected["plan"]
@@ -316,6 +354,14 @@ def build_payment_link_cache_payload(
             or datetime.now(timezone.utc).isoformat()
         ),
     }
+
+    if payload["link_type"] == "pix":
+        raw_expires_at = payload_source.get("link_expires_at")
+        if raw_expires_at is None or raw_expires_at == "":
+            raw_expires_at = metadata_fallback.get("link_expires_at")
+        link_expires_at = normalize_payment_link_expires_at(raw_expires_at)
+        if link_expires_at is not None:
+            payload["link_expires_at"] = link_expires_at
 
     billing = payload_source.get("billing") if isinstance(payload_source.get("billing"), dict) else metadata_fallback.get("billing")
     if isinstance(billing, dict):

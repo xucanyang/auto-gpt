@@ -8,6 +8,7 @@ from services.chatgpt_core.payment_link_cache import (
     build_payment_link_cache_payload,
     normalize_payment_link_params,
     payment_link_cache_matches,
+    payment_link_requires_regeneration,
 )
 from services.chatgpt_core.plugin import ChatGPTPlatform
 
@@ -126,6 +127,40 @@ class PaymentLinkSourceTests(unittest.TestCase):
                 {"plan": "plus", "country": "ID", "currency": "IDR", "payment_link_format": "long_hosted"},
             )
         )
+
+    def test_pix_cache_preserves_provider_expiry_and_rejects_imminent_expiry(self):
+        cached = build_payment_link_cache_payload(
+            {
+                "url": "https://payments.stripe.com/qr/instructions/pix-cache",
+                "plan": "plus",
+                "country": "BR",
+                "currency": "BRL",
+                "link_type": "pix",
+                "link_expires_at": 1_784_170_800,
+                "payment_link_format": "long_link",
+                "payment_source": "long_link",
+                "profile_hash": PROFILE_HASH,
+            },
+            source="long_link",
+        )
+        expected = normalize_payment_link_params(
+            {
+                "plan": "plus",
+                "country": "BR",
+                "currency": "BRL",
+                "payment_link_format": "long_link",
+                "payment_source": "long_link",
+                "profile_hash": PROFILE_HASH,
+            }
+        )
+
+        self.assertEqual(cached["link_expires_at"], 1_784_170_800)
+        with mock.patch("services.chatgpt_core.payment_link_cache.time.time", return_value=1_784_170_000):
+            self.assertTrue(payment_link_cache_matches(cached, expected))
+            self.assertFalse(payment_link_requires_regeneration(cached))
+        with mock.patch("services.chatgpt_core.payment_link_cache.time.time", return_value=1_784_170_741):
+            self.assertFalse(payment_link_cache_matches(cached, expected))
+            self.assertTrue(payment_link_requires_regeneration(cached))
 
     def test_plugin_uses_active_long_link_profile_without_calling_hosted_generator(self):
         account = Account(

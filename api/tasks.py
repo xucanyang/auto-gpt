@@ -45,6 +45,7 @@ from services.chatgpt_core.payment_link_cache import (
     PAYMENT_SOURCE_LONG_LINK,
     cache_checkout_link_in_extra,
     payment_link_cache_matches,
+    payment_link_expires_soon,
     payment_link_requires_regeneration,
     payment_link_requires_status_sync,
     payment_link_status_label,
@@ -1756,6 +1757,7 @@ _PAYMENT_LINK_HISTORY_RESULT_FIELDS = (
     "payment_link_format",
     "payment_source",
     "link_type",
+    "link_expires_at",
     "profile_hash",
     "remote_batch_id",
     "remote_job_id",
@@ -9930,7 +9932,9 @@ def _run_batch_payment_links(task_id: str, account_ids: list[int]):
                         skipped_count += 1
                         _log(task_id, f"[SYNC] 账号状态同步完成: {email or account_id}")
                         continue
-                    if cached_url and not force_refresh and payment_link_requires_regeneration(cached):
+                    if cached_url and not force_refresh and payment_link_expires_soon(cached):
+                        _log(task_id, f"[REGEN] 缓存 PIX 支付链接已过期或将于 60 秒内到期，重新生成: {email or account_id}")
+                    elif cached_url and not force_refresh and payment_link_requires_regeneration(cached):
                         status_label = payment_link_status_label(cached.get("link_status"))
                         _log(task_id, f"[REGEN] 缓存支付链接{status_label}，重新生成: {email or account_id}")
                     if skip_existing and not force_refresh and payment_link_cache_matches(cached, params):

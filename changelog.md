@@ -4,6 +4,21 @@
 
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，并且本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/) (语义化版本)。
 
+## [2.2.2] - 2026-07-16
+
+### 新增 (Added)
+- **PIX 上游二维码有效期透传与展示**：`services/chatgpt_core/long_link_payment_client.py` 接收 long-link 通用批次结果中的 `link_expires_at`，并通过账号 `chatgpt_last_payment_link` 缓存和 `payment_link_generations.result_json` 持久化。账号详情的当前支付链接与最近生成历史会显示上游明确返回的绝对到期时间、剩余时间或已过期状态；历史记录没有该字段时保持“未知”，不使用 Checkout Session 到期时间猜测。
+
+### 优化 (Changed)
+- **PIX 缓存复用按真实二维码时限收敛**：`services/chatgpt_core/payment_link_cache.py` 仅对 `link_type=pix` 且具有合法上游 epoch 的链接执行有效期判断；已过期或将在 60 秒内到期的缓存不会被单账号或批量“支付链接生成”复用，会重新提交至 long-link。旧缓存、非 PIX 链接和没有上游时限的记录维持原有兼容行为。
+- **版本同步**：侧栏版本更新为 `v2.2.2`，用于确认浏览器已加载 PIX 有效期展示和缓存失效规则。
+
+### 修复 (Fixed)
+- **兼容单账号接口的生成历史保留有效期**：`api/actions.py` 与 `api/tasks.py` 的安全结果字段白名单加入 `link_expires_at`，使旧 `POST /api/chatgpt/{account_id}/payment-link`、平台 action 和批量任务都不会在落库前丢失该非敏感字段。
+
+### 测试 (Tests)
+- **补齐有效期回归覆盖**：覆盖 long-link PIX 结果标准化、账号缓存持久化、临近到期缓存拒绝复用、历史接口安全返回以及兼容单账号接口的结果落库。
+
 ## [2.2.1] - 2026-07-16
 
 ### 修复 (Fixed)
@@ -1518,4 +1533,8 @@
 
 ## 2026-07-16 04:58:42 +0800
 - 修复 Plus RT 与手机号绑定分类
+- 发布模式: multi
+
+## 2026-07-16 05:09:35 +0800
+- 透传 PIX 上游二维码有效期并防止过期链接复用
 - 发布模式: multi

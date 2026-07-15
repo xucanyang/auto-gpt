@@ -204,6 +204,7 @@ def _apply_action_result(
                             "url",
                             "paypal_url",
                             "link_type",
+                            "link_expires_at",
                             "profile_hash",
                             "remote_batch_id",
                             "remote_job_id",

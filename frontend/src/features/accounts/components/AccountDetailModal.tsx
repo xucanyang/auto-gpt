@@ -30,6 +30,7 @@ type PaymentLinkGeneration = {
   generated_at?: string
   persisted_at?: string
   error?: string
+  result?: Record<string, unknown>
 }
 
 function paymentLinkStatusMeta(value: unknown) {
@@ -49,6 +50,31 @@ function paymentLinkTypeLabel(value: unknown, format?: unknown) {
   if (normalizedFormat === 'paypal_url') return 'PAYPAL'
   if (normalizedFormat === 'long_link') return 'LONG-LINK'
   return '历史链接'
+}
+
+function paymentLinkExpiryMeta(
+  linkType: unknown,
+  value: unknown,
+  formatSyncTime: (value?: string) => string,
+) {
+  if (String(linkType || '').trim().toLowerCase() !== 'pix' || typeof value === 'boolean') return null
+  const text = String(value || '').trim()
+  if (!/^\d{1,12}$/.test(text)) return null
+  const expiresAt = Number(text)
+  if (!Number.isSafeInteger(expiresAt) || expiresAt <= 0 || expiresAt > 253402300799) return null
+
+  const deadline = formatSyncTime(new Date(expiresAt * 1000).toISOString())
+  const remainingSeconds = expiresAt - Math.floor(Date.now() / 1000)
+  if (remainingSeconds <= 0) return { color: 'error', label: `PIX 已过期（${deadline}）` }
+
+  const days = Math.floor(remainingSeconds / 86400)
+  const hours = Math.floor((remainingSeconds % 86400) / 3600)
+  const minutes = Math.max(1, Math.floor((remainingSeconds % 3600) / 60))
+  const remaining = days > 0 ? `${days}天${hours}小时` : hours > 0 ? `${hours}小时${minutes}分钟` : `${minutes}分钟`
+  return {
+    color: remainingSeconds <= 300 ? 'warning' : 'success',
+    label: `PIX 有效至 ${deadline}（剩余 ${remaining}）`,
+  }
 }
 
 function SummaryField({
@@ -552,6 +578,11 @@ export function AccountDetailModal({
         : {}
   const currentPaymentLinkUrl = String(currentPaymentLink.url || currentPaymentLink.paypal_url || '').trim()
   const currentPaymentLinkStatus = paymentLinkStatusMeta(currentPaymentLink.link_status || (currentPaymentLinkUrl ? 'succeeded' : ''))
+  const currentPaymentLinkExpiry = paymentLinkExpiryMeta(
+    currentPaymentLink.link_type,
+    currentPaymentLink.link_expires_at,
+    formatSyncTime,
+  )
   const authSummary = currentAccount?.chatgptLocal?.auth && typeof currentAccount.chatgptLocal.auth === 'object'
     ? currentAccount.chatgptLocal.auth
     : currentAccount?.auth && typeof currentAccount.auth === 'object'
@@ -679,6 +710,7 @@ export function AccountDetailModal({
                           生成于 {formatSyncTime(currentPaymentLink.generated_at || currentPaymentLink.created_at)}
                         </Text>
                       ) : null}
+                      {currentPaymentLinkExpiry ? <Tag color={currentPaymentLinkExpiry.color}>{currentPaymentLinkExpiry.label}</Tag> : null}
                     </Space>
                     <Space size={6} wrap style={{ width: '100%' }}>
                       <Text copyable={{ text: currentPaymentLinkUrl }} style={{ minWidth: 0, overflowWrap: 'anywhere' }}>
@@ -711,6 +743,7 @@ export function AccountDetailModal({
                     const status = paymentLinkStatusMeta(item.status)
                     const generatedAt = item.generated_at || item.persisted_at || item.submitted_at
                     const url = String(item.url || '').trim()
+                    const expiry = paymentLinkExpiryMeta(item.link_type, item.result?.link_expires_at, formatSyncTime)
                     return (
                       <div
                         key={String(item.id || `${item.task_id || 'payment-link'}:${index}`)}
@@ -721,6 +754,7 @@ export function AccountDetailModal({
                             <Tag color="blue">{paymentLinkTypeLabel(item.link_type, 'long_link')}</Tag>
                             <Tag color={status.color}>{status.label}</Tag>
                             {generatedAt ? <Text type="secondary" style={{ fontSize: 12 }}>{formatSyncTime(generatedAt)}</Text> : null}
+                            {expiry ? <Tag color={expiry.color}>{expiry.label}</Tag> : null}
                             {item.profile_hash ? <Text code title={item.profile_hash}>{item.profile_hash.slice(0, 12)}</Text> : null}
                           </Space>
                           {url ? (

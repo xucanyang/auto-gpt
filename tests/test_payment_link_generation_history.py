@@ -39,6 +39,7 @@ class PaymentLinkGenerationHistoryTests(unittest.TestCase):
                 result={
                     "url": "https://pay.example.test/one",
                     "payment_source": "long_link",
+                    "link_expires_at": 1_784_170_800,
                     "access_token": "token-must-not-persist",
                     "proxy": "socks5://secret@proxy.test:1080",
                 },
@@ -68,6 +69,7 @@ class PaymentLinkGenerationHistoryTests(unittest.TestCase):
         self.assertNotIn("token-must-not-persist", serialized)
         self.assertNotIn("socks5://secret", serialized)
         self.assertEqual(second_page["items"][0]["result"]["payment_source"], "long_link")
+        self.assertEqual(second_page["items"][0]["result"]["link_expires_at"], 1_784_170_800)
 
     def test_profile_view_is_redacted_before_it_reaches_the_browser(self):
         client = Mock()

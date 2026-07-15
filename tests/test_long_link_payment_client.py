@@ -173,6 +173,28 @@ class LongLinkPaymentClientTests(unittest.TestCase):
         self.assertEqual(result["currency"], "GBP")
         self.assertTrue(result["generated_at"].endswith("+00:00"))
 
+    def test_pix_result_preserves_provider_qr_expiry(self):
+        result = payment_link_from_remote_job(
+            {
+                "batch_id": "batch_" + "e" * 32,
+                "job_id": "job-pix",
+                "request_id": "task:pix",
+                "status": "done",
+                "profile_hash": PROFILE_HASH,
+                "completed_at": 1_720_000_000,
+                "result": {
+                    "long_url": "https://payments.stripe.com/qr/instructions/pix-test",
+                    "link_type": "pix",
+                    "billing_country": "BR",
+                    "currency": "BRL",
+                    "link_expires_at": 1_784_170_800,
+                },
+            },
+            profile={"profile_hash": PROFILE_HASH, "link_type": "pix", "country": "BR", "currency": "BRL"},
+        )
+
+        self.assertEqual(result["link_expires_at"], 1_784_170_800)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -42,6 +42,7 @@ class _LongLinkClient:
                         "link_type": "pix",
                         "billing_country": "BR",
                         "currency": "BRL",
+                        "link_expires_at": 1_784_170_800,
                     },
                 }
             ],
@@ -99,7 +100,9 @@ class ChatGPTPaymentLinkEndpointTests(unittest.TestCase):
         self.assertEqual(client.submissions[0][1], client.profile_hash)
         self.assertFalse(client.submissions[0][0][0].get("country"))
         self.assertEqual(account.get_extra()["chatgpt_last_payment_link"]["payment_source"], "long_link")
+        self.assertEqual(account.get_extra()["chatgpt_last_payment_link"]["link_expires_at"], 1_784_170_800)
         self.assertEqual(generation.status, "succeeded")
+        self.assertEqual(generation.get_result()["link_expires_at"], 1_784_170_800)
         local_generator.assert_not_called()
 
 
