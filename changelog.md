@@ -4,6 +4,21 @@
 
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，并且本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/) (语义化版本)。
 
+## [2.2.6] - 2026-07-16
+
+### 新增 (Added)
+- **long-link 历史订阅链接补齐工具**：新增 `scripts/sync_long_link_payment_history.py` 与 `services/long_link_history_sync.py`，可从 `/opt/openai-pay-long-link/app/data/tasks.db` 的 `long_link_success_history` 将已成功生成的链接回填到活跃 Auto-GPT 实例。同步使用管理员历史中已解析的账号邮箱和本地账号唯一匹配，不读取或复制 Access Token、代理或 long-link 配置；内部批次已存在的 `remote_job_id` 会优先作为既有归属核验。
+- **可审计且幂等的支付链接迁移**：每条历史链接以 `long-link-history:<job_id>` 写入 `payment_link_generations`，重复执行不会重复建历史；同一账号的所有成功链接都会保留为生成历史，只有完成时间最新的一条在未被更新本地链接覆盖时写入 `chatgpt_last_payment_link` 与 `cashier_url`。账户订阅状态、`used`、手机号、邮箱和认证材料均不修改。
+
+### 安全 (Security)
+- **跨库同步保护**：默认 dry-run；apply 前对每个目标 SQLite 运行完整性检查并创建权限为 `0600` 的 `.backup`，每库用独立即时事务提交后再次校验完整性。邮箱重复、目标账号缺失、远端任务归属冲突、无效 URL 和损坏 `extra_json` 都会跳过并以聚合计数报告，不会猜测或覆盖错误账号。
+
+### 测试 (Tests)
+- **覆盖历史回填边界**：新增回归验证 dry-run 不写库、同账号多条历史只提升最新链接、旧历史不覆盖更新的当前链接、跨实例重复邮箱拒绝同步、重复运行幂等，以及历史和当前缓存均不携带源端敏感输入。
+
+### 优化 (Changed)
+- **版本同步**：侧栏版本更新为 `v2.2.6`，用于确认已加载 long-link 历史同步能力对应的发布版本。
+
 ## [2.2.5] - 2026-07-16
 
 ### 新增 (Added)
@@ -1582,4 +1597,8 @@
 
 ## 2026-07-16 06:55:41 +0800
 - 账号列表增加支付链接平台筛选
+- 发布模式: multi
+
+## 2026-07-16 07:19:38 +0800
+- 同步 long-link 管理端历史订阅链接
 - 发布模式: multi
