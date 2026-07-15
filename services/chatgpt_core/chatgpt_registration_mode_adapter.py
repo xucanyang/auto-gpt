@@ -252,6 +252,10 @@ class BaseChatGPTRegistrationModeAdapter(ABC):
                 extra["chatgpt_phone_challenge"] = metadata.get("chatgpt_phone_challenge")
             if metadata.get("chatgpt_phone_challenge_history"):
                 extra["chatgpt_phone_challenge_history"] = metadata.get("chatgpt_phone_challenge_history")
+            if metadata.get("chatgpt_phone_binding"):
+                extra["chatgpt_phone_binding"] = metadata.get("chatgpt_phone_binding")
+            if metadata.get("chatgpt_phone_binding_history"):
+                extra["chatgpt_phone_binding_history"] = metadata.get("chatgpt_phone_binding_history")
             if metadata.get("chatgpt_bound_phone"):
                 extra["chatgpt_bound_phone"] = metadata.get("chatgpt_bound_phone")
             if metadata.get("chatgpt_bound_phone_number"):

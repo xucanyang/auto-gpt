@@ -629,6 +629,72 @@ class OAuthPhoneBlacklistTests(unittest.TestCase):
         self.assertIn("maximum number of accounts", reason)
         phone_service.cancel.assert_not_called()
 
+    def test_handle_add_phone_records_confirmed_binding_before_completing_number(self):
+        client = OAuthClient(
+            config={"_current_account_id": 42, "_current_account_email": "bound@example.com"},
+            verbose=False,
+        )
+        client._log = lambda _msg: None
+        entry = PhoneEntry(
+            country_slug="united-states",
+            phone="+16134655704",
+            detail_url="https://example.com/phone/confirmed",
+        )
+        phone_service = mock.Mock()
+        phone_service.enabled = True
+        phone_service.max_attempts = 1
+        phone_service.max_resend_attempts = 0
+        phone_service.resend_interval_seconds = 0
+        phone_service.acquire_phone.return_value = entry
+        phone_service.prefix_hint.return_value = "+161346"
+        phone_service.wait_for_code.return_value = "123456"
+        next_state = FlowState(
+            page_type="phone_otp_verification",
+            continue_url="https://auth.openai.com/phone-verification",
+        )
+        done_state = FlowState(page_type="done", current_url="https://chatgpt.com/")
+        persisted: list[dict] = []
+
+        def record_binding(**kwargs):
+            phone_service.complete.assert_not_called()
+            persisted.append(kwargs)
+            return {
+                "updated": True,
+                "phone_binding": {
+                    "phone": entry.phone,
+                    "status": "bound",
+                    "source": "oauth_add_phone",
+                    "bound_at": "2026-07-16T00:00:00+00:00",
+                },
+            }
+
+        with mock.patch("services.chatgpt_core.oauth_client.create_phone_service", return_value=phone_service):
+            with mock.patch.object(client, "_send_phone_number", return_value=(True, next_state, "")):
+                with mock.patch.object(
+                    client,
+                    "_decode_oauth_session_cookie",
+                    return_value={"phone_verification_channel": "sms", "phone_number": entry.phone},
+                ):
+                    with mock.patch.object(client, "_validate_phone_otp", return_value=(True, done_state, "")):
+                        with mock.patch(
+                            "services.chatgpt_core.bound_phone.record_chatgpt_confirmed_phone_binding",
+                            side_effect=record_binding,
+                        ):
+                            state = client._handle_add_phone_verification(
+                                "device-id",
+                                "Mozilla/5.0",
+                                None,
+                                None,
+                                FlowState(page_type="add_phone"),
+                                email="bound@example.com",
+                            )
+
+        self.assertEqual(state, done_state)
+        self.assertEqual(persisted[0]["account_id"], 42)
+        self.assertEqual(persisted[0]["phone"], entry.phone)
+        self.assertEqual(client._phone_binding_events[-1]["status"], "bound")
+        phone_service.complete.assert_called_once_with(entry)
+
     def test_handle_add_phone_preserves_rejected_phone_reason_when_next_number_unavailable(self):
         client = OAuthClient(config={}, verbose=False)
         client._log = lambda _msg: None

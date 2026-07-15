@@ -4,6 +4,19 @@
 
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，并且本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/) (语义化版本)。
 
+## [2.2.1] - 2026-07-16
+
+### 修复 (Fixed)
+- **RT 与手机号绑定事实分离**：`services/chatgpt_core/oauth_client.py` 在 OpenAI `phone-otp/validate` 明确成功后才记录确认绑定；`services/chatgpt_core/bound_phone.py` 统一写入 `chatgpt_phone_binding`、历史、`chatgpt_bound_phone` 及号码别名。新注册账号尚未创建本地行时，确认事件会随 RT 注册结果透传，由注册适配器保存，避免“真实绑号成功但账号没有绑定记录”。
+- **阻止 add_phone 继续地址绕过本地确认流程**：passwordless OAuth 命中 `add_phone` 时，只有显式关闭自动新绑才保留历史 continue-url 兼容路径；当前允许新绑的配置必须进入标准发码、收码和 OTP 校验流程，不能仅因获得 authorization code 就把账号当作已完成手机号步骤。
+- **OAIPay Plus 分类改为失败关闭**：账号能力新增 `has_confirmed_phone_binding` 和 `phone_binding_state`；仅 Plus、RT 和完整已确认绑定同时成立时才进入 `PLUS--已接美国长效`。Plus + RT 但本地无确认绑定记录统一落入 `PLUS--未接码`，不再把 RT 当作手机号绑定证明。账号列表 API 会为旧能力快照实时补算该字段。
+
+### 优化 (Changed)
+- **自动分类提示与版本同步**：账号页 OAIPay 自动分类说明明确“已确认手机号绑定”前提，侧栏版本更新为 `v2.2.1`，便于确认浏览器已加载修复。
+
+### 测试 (Tests)
+- **补齐绑定与分类回归**：覆盖 OTP 成功后的确认绑定持久化、新注册 metadata 透传、允许新绑时不走 add_phone continue-url 快捷路径、未确认绑定的 Plus + RT 分类降级，以及账号列表能力字段的兼容输出。
+
 ## [2.2.0] - 2026-07-16
 
 ### 新增 (Added)
@@ -1501,4 +1514,8 @@
 
 ## 2026-07-16 03:59:03 +0800
 - 统一支付链接生成至 long-link 管理端配置并支持批量持久化
+- 发布模式: multi
+
+## 2026-07-16 04:58:42 +0800
+- 修复 Plus RT 与手机号绑定分类
 - 发布模式: multi

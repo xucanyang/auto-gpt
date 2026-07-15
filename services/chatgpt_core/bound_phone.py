@@ -259,6 +259,206 @@ def upsert_chatgpt_bound_phone(
         return {"updated": False, "reason": str(exc or "persist_failed")}
 
 
+def _build_confirmed_phone_binding_payload(
+    *,
+    account_id: int = 0,
+    email: str = "",
+    phone: Any = "",
+    api_url: Any = "",
+    source_api_url: Any = "",
+    raw_line: Any = "",
+    task_id: Any = "",
+    source: Any = "",
+    flow: Any = "",
+    bound_at: Any = "",
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Build the durable payload emitted only after OpenAI accepted a phone OTP."""
+    normalized_phone = normalize_bound_phone(phone)
+    if not normalized_phone:
+        return {}, {}
+
+    now = _safe_text(bound_at, max_len=80) or _utcnow_iso()
+    api_url_text = _safe_text(api_url, max_len=4096)
+    source_api_url_text = _safe_text(source_api_url, max_len=4096)
+    if not source_api_url_text and api_url_text:
+        source_api_url_text = api_url_text
+    source_text = _safe_text(source, max_len=120) or "oauth_add_phone"
+    binding = {
+        "phone": normalized_phone,
+        "phone_number": normalized_phone,
+        "api_url": api_url_text,
+        "source_api_url": source_api_url_text,
+        "raw_line": _safe_text(raw_line, max_len=4096),
+        "account_id": int(account_id or 0),
+        "email": _safe_text(email, max_len=320),
+        "task_id": _safe_text(task_id, max_len=240),
+        "source": source_text,
+        "flow": _safe_text(flow, max_len=120) or "add_phone",
+        "status": "bound",
+        "status_label": "手机号验证成功",
+        "verification_status": "verified",
+        "bound_at": now,
+        "detected_at": now,
+        "updated_at": now,
+    }
+    bound_phone = {
+        "phone": normalized_phone,
+        "phone_number": normalized_phone,
+        "masked": "",
+        "masked_phone": "",
+        "api_url": api_url_text,
+        "source_api_url": source_api_url_text,
+        "source": source_text,
+        "detected_at": now,
+        "updated_at": now,
+        "last_seen_reason": "add_phone_otp_validated",
+        "verification_status": "verified",
+        "status": "bound",
+        "display": normalized_phone,
+        "is_masked": False,
+    }
+    return binding, bound_phone
+
+
+def record_chatgpt_confirmed_phone_binding(
+    *,
+    account_id: int = 0,
+    email: str = "",
+    phone: Any = "",
+    api_url: Any = "",
+    source_api_url: Any = "",
+    raw_line: Any = "",
+    task_id: Any = "",
+    source: Any = "",
+    flow: Any = "",
+    bound_at: Any = "",
+    log_fn: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    """Persist a phone binding that OpenAI has explicitly confirmed by OTP.
+
+    ``chatgpt_bound_phone`` remains useful for passive existing-phone
+    observations. This helper is deliberately narrower: callers must invoke it
+    only after ``phone-otp/validate`` succeeds, so the binding can safely drive
+    downstream delivery classification.
+    """
+    binding, bound_phone = _build_confirmed_phone_binding_payload(
+        account_id=account_id,
+        email=email,
+        phone=phone,
+        api_url=api_url,
+        source_api_url=source_api_url,
+        raw_line=raw_line,
+        task_id=task_id,
+        source=source,
+        flow=flow,
+        bound_at=bound_at,
+    )
+    if not binding:
+        return {"updated": False, "reason": "empty_phone"}
+
+    try:
+        with Session(core_db.engine) as session:
+            account = _find_account(session, account_id=account_id, email=email)
+            if account is None:
+                # New registrations do not have a local account row yet. The
+                # caller carries this payload through RegistrationResult.metadata.
+                return {
+                    "updated": False,
+                    "reason": "account_not_found",
+                    "phone_binding": binding,
+                    "bound_phone": bound_phone,
+                }
+
+            try:
+                extra = account.get_extra()
+            except Exception:
+                extra = {}
+            if not isinstance(extra, dict):
+                extra = {}
+
+            binding["account_id"] = int(account.id or 0)
+            binding["email"] = str(account.email or "")
+
+            binding_history = extra.get("chatgpt_phone_binding_history")
+            if not isinstance(binding_history, list):
+                binding_history = []
+            binding_history = [dict(item) for item in binding_history if isinstance(item, dict)]
+            binding_history.append(dict(binding))
+
+            existing_bound_phone = (
+                extra.get("chatgpt_bound_phone")
+                if isinstance(extra.get("chatgpt_bound_phone"), dict)
+                else {}
+            )
+            bound_phone_history = extra.get("chatgpt_bound_phone_history")
+            if not isinstance(bound_phone_history, list):
+                bound_phone_history = []
+            bound_phone_history = [dict(item) for item in bound_phone_history if isinstance(item, dict)]
+            old_phone = normalize_bound_phone(
+                existing_bound_phone.get("phone") or existing_bound_phone.get("phone_number")
+            )
+            if existing_bound_phone and old_phone and old_phone != binding["phone"]:
+                old_entry = _history_entry(existing_bound_phone)
+                if old_entry.get("phone") or old_entry.get("masked"):
+                    bound_phone_history.append(old_entry)
+
+            extra["chatgpt_phone_binding"] = binding
+            extra["chatgpt_phone_binding_history"] = binding_history[-20:]
+            extra["chatgpt_bound_phone"] = bound_phone
+            extra["chatgpt_bound_phone_history"] = bound_phone_history[-5:]
+            extra["chatgpt_bound_phone_number"] = binding["phone"]
+
+            challenge = extra.get("chatgpt_phone_challenge")
+            if isinstance(challenge, dict) and str(
+                challenge.get("type") or challenge.get("challenge_type") or ""
+            ).strip() == "add_phone":
+                challenge_history = extra.get("chatgpt_phone_challenge_history")
+                if not isinstance(challenge_history, list):
+                    challenge_history = []
+                challenge_history = [dict(item) for item in challenge_history if isinstance(item, dict)]
+                challenge_history.append(dict(challenge))
+                resolved_challenge = {
+                    "type": "add_phone",
+                    "challenge_type": "add_phone",
+                    "status": "bound",
+                    "phone": binding["phone"],
+                    "phone_number": binding["phone"],
+                    "masked": "",
+                    "masked_phone": "",
+                    "source": binding["source"],
+                    "message": "OpenAI 手机号 OTP 验证成功",
+                    "seen_at": binding["bound_at"],
+                    "updated_at": binding["bound_at"],
+                    "display": binding["phone"],
+                }
+                extra["chatgpt_phone_challenge"] = resolved_challenge
+                extra["chatgpt_phone_challenge_history"] = challenge_history[-5:]
+
+            account.set_extra(extra)
+            account.updated_at = datetime.now(timezone.utc)
+            session.add(account)
+            session.commit()
+
+            if callable(log_fn):
+                log_fn(f"[手机号验证] 已确认并保存手机号绑定: account_id={account.id}")
+            return {
+                "updated": True,
+                "account_id": int(account.id or 0),
+                "email": str(account.email or ""),
+                "phone_binding": binding,
+                "bound_phone": bound_phone,
+            }
+    except Exception as exc:
+        if callable(log_fn):
+            log_fn(f"[手机号验证] 保存已确认手机号绑定失败: {exc}")
+        return {
+            "updated": False,
+            "reason": str(exc or "persist_failed"),
+            "phone_binding": binding,
+            "bound_phone": bound_phone,
+        }
+
+
 def upsert_chatgpt_phone_challenge(
     *,
     account_id: int = 0,

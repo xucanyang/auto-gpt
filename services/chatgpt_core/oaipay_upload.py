@@ -566,8 +566,11 @@ def _build_auto_category_name(capabilities: dict[str, Any]) -> tuple[str, str]:
     has_rt = bool(capabilities.get("has_refresh_token"))
     has_paid = bool(capabilities.get("has_paid_subscription"))
     if has_paid:
-        if has_rt:
+        has_confirmed_phone_binding = bool(capabilities.get("has_confirmed_phone_binding"))
+        if has_rt and has_confirmed_phone_binding:
             return "PLUS--已接美国长效", "paid_with_refresh_token"
+        if has_rt:
+            return "PLUS--未接码", "paid_with_refresh_token_phone_unverified"
         return "PLUS--未接码", "paid_without_refresh_token"
     if has_rt:
         return "FREE--已接码带RT", "free_with_refresh_token"

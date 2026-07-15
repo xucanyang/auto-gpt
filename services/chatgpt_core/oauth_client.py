@@ -78,6 +78,7 @@ class OAuthClient:
         self.task_control = self.config.get("_task_control")
         self.task_attempt_id = self.config.get("_task_attempt_id")
         self._phone_challenge_events = []
+        self._phone_binding_events = []
 
         # 创建 session
         self.session = curl_requests.Session()
@@ -204,6 +205,46 @@ class OAuthClient:
             )
         except Exception as exc:
             self._log(f"[手机号验证] 记录手机号挑战失败: {exc}")
+
+    def _record_confirmed_phone_binding_event(self, *, entry, email: str = "") -> None:
+        """Record a successful add-phone OTP without treating RT as proof.
+
+        Existing accounts are persisted immediately. New registrations have no
+        database row at this point, so the same payload is kept for the
+        registration engine to attach when it creates the account.
+        """
+        account_id = self.config.get("_current_account_id") or self.config.get("account_id") or 0
+        account_email = (
+            str(email or "").strip()
+            or str(self.config.get("_current_account_email") or self.config.get("email") or "").strip()
+        )
+        if not account_id and not account_email:
+            return
+
+        try:
+            from services.chatgpt_core.bound_phone import record_chatgpt_confirmed_phone_binding
+
+            result = record_chatgpt_confirmed_phone_binding(
+                account_id=account_id,
+                email=account_email,
+                phone=getattr(entry, "phone", ""),
+                # Only UploadedPhoneEntry exposes a reusable API URL. Gateway
+                # and SMSToMe detail URLs are not fabricated as delivery APIs.
+                api_url=getattr(entry, "api_url", ""),
+                source_api_url=getattr(entry, "source_api_url", ""),
+                raw_line=getattr(entry, "raw_line", ""),
+                task_id=self.config.get("_current_task_id") or self.config.get("task_id") or "",
+                source="oauth_add_phone",
+                flow="add_phone",
+                log_fn=self._log,
+            )
+        except Exception as exc:
+            self._log(f"[手机号验证] 生成已确认手机号绑定事件失败: {exc}")
+            return
+
+        payload = result.get("phone_binding") if isinstance(result, dict) else None
+        if isinstance(payload, dict) and payload.get("phone"):
+            self._phone_binding_events.append(dict(payload))
 
     @staticmethod
     def _coerce_bool(value, *, default=False):
@@ -2686,6 +2727,7 @@ class OAuthClient:
                 prefer_passwordless_login
                 and self._state_is_add_phone(state)
                 and self._state_requires_navigation(state)
+                and not allow_add_phone_verification
             ):
                 self._log("步骤5: OTP 后命中 add_phone，先实际访问 continue_url 争取重签 workspace Cookie")
                 code, next_state = self._follow_flow_state(
@@ -2710,7 +2752,10 @@ class OAuthClient:
                 state = next_state
                 continue
 
-            if self._state_is_email_otp(state):
+            # add_phone responses may retain the preceding email-otp URL in
+            # current_url. Once OpenAI declares add_phone, that explicit state
+            # must win over the stale URL marker.
+            if self._state_is_email_otp(state) and not self._state_is_add_phone(state):
                 if not skymail_client:
                     self._set_error("当前流程需要邮箱 OTP，但缺少接码客户端")
                     return None
@@ -4687,6 +4732,7 @@ class OAuthClient:
                 continue
 
             self._check_stop()
+            self._record_confirmed_phone_binding_event(entry=entry, email=email)
             phone_service.complete(entry)
             return validated_state
 

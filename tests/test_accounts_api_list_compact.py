@@ -134,6 +134,8 @@ class AccountListCompactSerializationTests(unittest.TestCase):
         self.assertEqual(payload["oaipaySync"]["category_name"], "PLUS--已接美国长效")
         self.assertEqual(payload["oaipaySync"]["last_upload"]["category_source"], "auto")
         self.assertEqual(payload["codex_state"], "ok")
+        self.assertFalse(payload["chatgptCapabilities"]["has_confirmed_phone_binding"])
+        self.assertEqual(payload["chatgptCapabilities"]["phone_binding_state"], "unconfirmed")
 
     def test_compact_serializer_does_not_return_raw_extra_or_secrets(self):
         payload = _serialize_account_compact_item(self._account())

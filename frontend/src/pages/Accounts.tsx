@@ -8961,7 +8961,7 @@ export default function Accounts() {
                 <Space direction="vertical" size={2}>
                   <Typography.Text strong>自动分类（推荐）</Typography.Text>
                   <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                    Plus + RT → PLUS--已接美国长效；Plus + 无 RT → PLUS--未接码；Free + RT → FREE--已接码带RT。
+                    Plus + RT + 已确认手机号绑定 → PLUS--已接美国长效；Plus 缺少 RT 或绑定未确认 → PLUS--未接码；Free + RT → FREE--已接码带RT。
                   </Typography.Text>
                 </Space>
               </Radio>

@@ -1235,8 +1235,11 @@ def _serialize_account_compact_item(
     chatgpt_subscription = chatgpt_local.get("subscription") if isinstance(chatgpt_local.get("subscription"), dict) else {}
     codex = chatgpt_local.get("codex") if isinstance(chatgpt_local.get("codex"), dict) else {}
     chatgpt_capabilities = extra.get("chatgpt_capabilities") if isinstance(extra.get("chatgpt_capabilities"), dict) else {}
-    if account.platform == "chatgpt" and not chatgpt_capabilities:
-        # Older rows may have tokens/workspace IDs but no derived capability snapshot yet.
+    if account.platform == "chatgpt" and (
+        not chatgpt_capabilities or "has_confirmed_phone_binding" not in chatgpt_capabilities
+    ):
+        # Older rows may have tokens/workspace IDs but no derived capability
+        # snapshot for the confirmed-phone classification gate yet.
         chatgpt_capabilities = classify_chatgpt_capabilities(account, local_probe=chatgpt_local)
 
     phone_binding = extra.get("chatgpt_phone_binding") if isinstance(extra.get("chatgpt_phone_binding"), dict) else {}
@@ -1344,6 +1347,8 @@ def _serialize_account_compact_item(
                 "has_paid_subscription",
                 "last_known_has_paid_subscription",
                 "subscription_checked",
+                "has_confirmed_phone_binding",
+                "phone_binding_state",
                 "codex_state",
                 "upload_gate",
             )

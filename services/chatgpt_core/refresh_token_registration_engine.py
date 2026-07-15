@@ -254,6 +254,7 @@ class RefreshTokenRegistrationEngine:
         self.logs: list[str] = []
         self._last_auth_capture_error: str = ""
         self._last_phone_challenge_events: list[dict[str, Any]] = []
+        self._last_phone_binding_events: list[dict[str, Any]] = []
         self._prepared_register_client: ChatGPTClient | None = None
 
     @staticmethod
@@ -420,43 +421,84 @@ class RefreshTokenRegistrationEngine:
 
     def _remember_oauth_phone_challenge_events(self, oauth_client: Optional[OAuthClient]) -> None:
         events = getattr(oauth_client, "_phone_challenge_events", None) if oauth_client is not None else None
+        if isinstance(events, (list, tuple)) and events:
+            for event in events:
+                if not isinstance(event, dict):
+                    continue
+                safe_event = self._to_json_safe(dict(event))
+                if isinstance(safe_event, dict):
+                    self._last_phone_challenge_events.append(safe_event)
+            self._last_phone_challenge_events = self._last_phone_challenge_events[-10:]
+        self._remember_oauth_phone_binding_events(oauth_client)
+
+    def _remember_oauth_phone_binding_events(self, oauth_client: Optional[OAuthClient]) -> None:
+        events = getattr(oauth_client, "_phone_binding_events", None) if oauth_client is not None else None
         if not isinstance(events, (list, tuple)) or not events:
             return
         for event in events:
             if not isinstance(event, dict):
                 continue
             safe_event = self._to_json_safe(dict(event))
-            if isinstance(safe_event, dict):
-                self._last_phone_challenge_events.append(safe_event)
-        self._last_phone_challenge_events = self._last_phone_challenge_events[-10:]
+            if isinstance(safe_event, dict) and safe_event.get("phone"):
+                self._last_phone_binding_events.append(safe_event)
+        self._last_phone_binding_events = self._last_phone_binding_events[-20:]
 
-    def _apply_phone_challenge_metadata(self, result: RegistrationResult) -> None:
-        events = [dict(item) for item in (self._last_phone_challenge_events or []) if isinstance(item, dict)]
+    def _apply_phone_binding_metadata(self, result: RegistrationResult) -> None:
+        events = [dict(item) for item in (self._last_phone_binding_events or []) if isinstance(item, dict)]
         if not events:
             return
         result.metadata = result.metadata or {}
-        last_event = dict(events[-1])
-        result.metadata["chatgpt_phone_challenge"] = last_event
-        result.metadata["chatgpt_phone_challenge_history"] = events[-5:]
-        if str(last_event.get("type") or last_event.get("challenge_type") or "") == "existing_phone_otp":
-            phone = str(last_event.get("phone") or last_event.get("phone_number") or "").strip()
-            masked = str(last_event.get("masked") or last_event.get("masked_phone") or "").strip()
-            if phone or masked:
-                result.metadata["chatgpt_bound_phone"] = {
-                    "phone": phone,
-                    "phone_number": phone,
-                    "masked": masked,
-                    "masked_phone": masked,
-                    "source": str(last_event.get("source") or "registration_full_auth").strip(),
-                    "detected_at": str(last_event.get("seen_at") or "").strip(),
-                    "updated_at": str(last_event.get("updated_at") or last_event.get("seen_at") or "").strip(),
-                    "last_seen_reason": "existing_phone_otp",
-                    "verification_status": str(last_event.get("status") or "required").strip() or "required",
-                }
-                if phone:
-                    result.metadata["chatgpt_bound_phone_number"] = phone
-                elif masked:
-                    result.metadata["chatgpt_bound_phone_masked"] = masked
+        binding = dict(events[-1])
+        phone = str(binding.get("phone") or binding.get("phone_number") or "").strip()
+        if not phone:
+            return
+        result.metadata["chatgpt_phone_binding"] = binding
+        result.metadata["chatgpt_phone_binding_history"] = events[-20:]
+        result.metadata["chatgpt_bound_phone"] = {
+            "phone": phone,
+            "phone_number": phone,
+            "masked": "",
+            "masked_phone": "",
+            "api_url": str(binding.get("api_url") or "").strip(),
+            "source_api_url": str(binding.get("source_api_url") or binding.get("api_url") or "").strip(),
+            "source": str(binding.get("source") or "oauth_add_phone").strip(),
+            "detected_at": str(binding.get("bound_at") or binding.get("detected_at") or "").strip(),
+            "updated_at": str(binding.get("updated_at") or binding.get("bound_at") or "").strip(),
+            "last_seen_reason": "add_phone_otp_validated",
+            "verification_status": "verified",
+            "status": "bound",
+            "display": phone,
+            "is_masked": False,
+        }
+        result.metadata["chatgpt_bound_phone_number"] = phone
+
+    def _apply_phone_challenge_metadata(self, result: RegistrationResult) -> None:
+        events = [dict(item) for item in (self._last_phone_challenge_events or []) if isinstance(item, dict)]
+        if events:
+            result.metadata = result.metadata or {}
+            last_event = dict(events[-1])
+            result.metadata["chatgpt_phone_challenge"] = last_event
+            result.metadata["chatgpt_phone_challenge_history"] = events[-5:]
+            if str(last_event.get("type") or last_event.get("challenge_type") or "") == "existing_phone_otp":
+                phone = str(last_event.get("phone") or last_event.get("phone_number") or "").strip()
+                masked = str(last_event.get("masked") or last_event.get("masked_phone") or "").strip()
+                if phone or masked:
+                    result.metadata["chatgpt_bound_phone"] = {
+                        "phone": phone,
+                        "phone_number": phone,
+                        "masked": masked,
+                        "masked_phone": masked,
+                        "source": str(last_event.get("source") or "registration_full_auth").strip(),
+                        "detected_at": str(last_event.get("seen_at") or "").strip(),
+                        "updated_at": str(last_event.get("updated_at") or last_event.get("seen_at") or "").strip(),
+                        "last_seen_reason": "existing_phone_otp",
+                        "verification_status": str(last_event.get("status") or "required").strip() or "required",
+                    }
+                    if phone:
+                        result.metadata["chatgpt_bound_phone_number"] = phone
+                    elif masked:
+                        result.metadata["chatgpt_bound_phone_masked"] = masked
+        self._apply_phone_binding_metadata(result)
 
     def _build_chatgpt_client(self) -> ChatGPTClient:
         client = ChatGPTClient(
@@ -913,6 +955,7 @@ class RefreshTokenRegistrationEngine:
             for key in ("auth_provider", "expires", "user_id", "user", "account", "cookies"):
                 if key in session_tokens and key not in result.metadata:
                     result.metadata[key] = session_tokens.get(key)
+        self._apply_phone_challenge_metadata(result)
         self._log(
             f"[注册] 第二阶段未获取 RT，保留第一阶段 AT-only，不改账号: {self._compact_error_text(reason)}",
             "warning",
@@ -1204,6 +1247,7 @@ class RefreshTokenRegistrationEngine:
         save_registration_access_token_account = self._is_registration_access_token_save_enabled()
         registration_access_token_payload: Optional[dict[str, Any]] = None
         self._last_phone_challenge_events = []
+        self._last_phone_binding_events = []
 
         try:
             registration_message = ""

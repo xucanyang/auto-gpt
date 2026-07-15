@@ -205,6 +205,37 @@ class ChatGPTRegistrationModeAdapterTests(unittest.TestCase):
         )
         self.assertEqual(account.extra["chatgpt_phone_challenge"]["type"], "add_phone")
 
+    def test_build_account_carries_confirmed_phone_binding_metadata(self):
+        adapter = build_chatgpt_registration_mode_adapter(
+            {"chatgpt_registration_mode": "refresh_token"}
+        )
+        binding = {
+            "phone": "+16134655704",
+            "status": "bound",
+            "source": "oauth_add_phone",
+            "bound_at": "2026-07-16T00:00:00+00:00",
+        }
+
+        account = adapter.build_account(
+            _result(
+                refresh_token="rt-demo",
+                metadata={
+                    "chatgpt_phone_binding": binding,
+                    "chatgpt_phone_binding_history": [binding],
+                    "chatgpt_bound_phone": {
+                        "phone": "+16134655704",
+                        "verification_status": "verified",
+                    },
+                    "chatgpt_bound_phone_number": "+16134655704",
+                },
+            ),
+            fallback_password="fallback",
+        )
+
+        self.assertEqual(account.extra["chatgpt_phone_binding"]["status"], "bound")
+        self.assertEqual(account.extra["chatgpt_phone_binding_history"][-1]["phone"], "+16134655704")
+        self.assertEqual(account.extra["chatgpt_bound_phone_number"], "+16134655704")
+
     def test_access_token_only_adapter_passes_runtime_context_to_engine(self):
         created = {}
 

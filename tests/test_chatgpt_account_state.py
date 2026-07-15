@@ -131,6 +131,43 @@ class ChatGPTAccountStateTests(unittest.TestCase):
         self.assertEqual(capabilities["upload_gate"], "ready")
         self.assertEqual(account.status, "subscribed")
 
+    def test_confirmed_phone_binding_requires_bound_status_and_full_phone(self):
+        confirmed = DummyAccount(
+            extra={
+                "chatgpt_phone_binding": {
+                    "status": "bound",
+                    "phone": "+16134655704",
+                }
+            }
+        )
+        observed_only = DummyAccount(
+            extra={
+                "chatgpt_bound_phone": {
+                    "phone": "+16134655704",
+                    "verification_status": "required",
+                }
+            }
+        )
+        malformed = DummyAccount(
+            extra={
+                "chatgpt_phone_binding": {
+                    "status": "bound",
+                    "phone": "5704",
+                }
+            }
+        )
+
+        confirmed_caps = classify_chatgpt_capabilities(confirmed)
+        observed_caps = classify_chatgpt_capabilities(observed_only)
+        malformed_caps = classify_chatgpt_capabilities(malformed)
+
+        self.assertTrue(confirmed_caps["has_confirmed_phone_binding"])
+        self.assertEqual(confirmed_caps["phone_binding_state"], "confirmed")
+        self.assertFalse(observed_caps["has_confirmed_phone_binding"])
+        self.assertEqual(observed_caps["phone_binding_state"], "unconfirmed")
+        self.assertFalse(malformed_caps["has_confirmed_phone_binding"])
+        self.assertEqual(malformed_caps["phone_binding_state"], "unconfirmed")
+
     def test_payment_pending_helper_preserves_subscribed_and_invalid(self):
         account = DummyAccount(status="registered")
         self.assertEqual(mark_payment_pending(account), "pending_payment")

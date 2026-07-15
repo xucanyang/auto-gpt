@@ -116,6 +116,43 @@ class BoundPhonePersistenceTests(unittest.TestCase):
         self.assertEqual(payload["display"], "未绑定手机号")
         self.assertNotIn("chatgpt_bound_phone", extra)
 
+    def test_records_confirmed_add_phone_binding_with_delivery_metadata(self):
+        account_id = self._add_account()
+
+        result = bound_phone.record_chatgpt_confirmed_phone_binding(
+            account_id=account_id,
+            phone="+1 (613) 465-5704",
+            api_url="https://phone-api.example.test/read?id=1",
+            source_api_url="https://supplier.example.test/read?id=1",
+            raw_line="+16134655704----https://phone-api.example.test/read?id=1",
+            task_id="task-phone-bound",
+            source="oauth_add_phone",
+            flow="add_phone",
+        )
+
+        self.assertTrue(result["updated"])
+        extra = self._extra(account_id)
+        binding = extra["chatgpt_phone_binding"]
+        self.assertEqual(binding["status"], "bound")
+        self.assertEqual(binding["phone"], "+16134655704")
+        self.assertEqual(binding["source_api_url"], "https://supplier.example.test/read?id=1")
+        self.assertEqual(binding["task_id"], "task-phone-bound")
+        self.assertEqual(extra["chatgpt_phone_binding_history"][-1]["phone"], "+16134655704")
+        self.assertEqual(extra["chatgpt_bound_phone_number"], "+16134655704")
+        self.assertEqual(extra["chatgpt_bound_phone"]["verification_status"], "verified")
+
+    def test_confirmed_binding_event_is_retained_before_new_account_exists(self):
+        result = bound_phone.record_chatgpt_confirmed_phone_binding(
+            email="not-created-yet@example.com",
+            phone="+1 613 465 5704",
+            source="oauth_add_phone",
+        )
+
+        self.assertFalse(result["updated"])
+        self.assertEqual(result["reason"], "account_not_found")
+        self.assertEqual(result["phone_binding"]["status"], "bound")
+        self.assertEqual(result["phone_binding"]["phone"], "+16134655704")
+
 
 if __name__ == "__main__":
     unittest.main()

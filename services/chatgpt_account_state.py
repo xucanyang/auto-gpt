@@ -58,6 +58,27 @@ def _first_text(*values: Any) -> str:
     return ""
 
 
+def _confirmed_phone_binding_state(extra: dict[str, Any]) -> tuple[bool, str]:
+    """Return whether this account has a locally confirmed full phone binding.
+
+    A refresh token, a masked phone hint, and a passive existing-phone
+    observation are useful diagnostics but cannot prove that this deployment
+    completed an OTP binding with a deliverable number.
+    """
+    binding = extra.get("chatgpt_phone_binding") if isinstance(extra.get("chatgpt_phone_binding"), dict) else {}
+    status = _lower_text(binding.get("status") or binding.get("result"))
+    phone = _first_text(binding.get("phone"), binding.get("phone_number"))
+    digits = "".join(char for char in phone if char.isdigit())
+    if status in {"bound", "success", "completed"} and len(digits) >= 8:
+        return True, "confirmed"
+
+    has_phone_signal = bool(binding)
+    has_phone_signal = has_phone_signal or isinstance(extra.get("chatgpt_bound_phone"), dict)
+    has_phone_signal = has_phone_signal or bool(_first_text(extra.get("chatgpt_bound_phone_number"), extra.get("chatgpt_bound_phone_masked")))
+    has_phone_signal = has_phone_signal or isinstance(extra.get("chatgpt_phone_challenge"), dict)
+    return False, "unconfirmed" if has_phone_signal else "unknown"
+
+
 def is_paid_subscription_plan(plan: Any) -> bool:
     return normalize_subscription_plan(plan) in PAID_PLAN_TYPES
 
@@ -368,6 +389,7 @@ def classify_chatgpt_capabilities(
         remote_reason=remote_reason,
     )
     subscription_plan_stale = subscription_plan == "unknown" and bool(last_known_subscription_plan)
+    has_confirmed_phone_binding, phone_binding_state = _confirmed_phone_binding_state(extra)
     codex_probe_state = _lower_text(codex.get("state"))
     if auth_level == "invalid":
         codex_state = "invalid"
@@ -406,6 +428,8 @@ def classify_chatgpt_capabilities(
         "subscription_checked": subscription_checked,
         "has_payment_success_marker": has_payment_success_marker(account),
         "has_payment_pending_marker": has_payment_pending_marker(account),
+        "has_confirmed_phone_binding": has_confirmed_phone_binding,
+        "phone_binding_state": phone_binding_state,
         "codex_state": codex_state,
         "upload_gate": upload_gate,
     }

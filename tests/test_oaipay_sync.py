@@ -225,7 +225,11 @@ class OaiPaySyncTests(unittest.TestCase):
                     account,
                     api_url="https://gpt.cccy.me",
                     api_key="upload-key",
-                    capabilities={"has_refresh_token": True, "has_paid_subscription": True},
+                    capabilities={
+                        "has_refresh_token": True,
+                        "has_paid_subscription": True,
+                        "has_confirmed_phone_binding": True,
+                    },
                 )
 
         self.assertTrue(result["ok"])
@@ -234,6 +238,35 @@ class OaiPaySyncTests(unittest.TestCase):
         self.assertEqual(result["category_id"], 2)
         self.assertEqual(result["category_name"], "PLUS--已接美国长效")
         self.assertEqual(mock_post.call_args.kwargs["json"]["group"], "2")
+
+    def test_upload_auto_category_downgrades_plus_rt_without_confirmed_phone_binding(self):
+        account = self._make_account()
+        categories_response = FakeOaiPayResponse(
+            200,
+            [
+                {"id": 1, "name": "PLUS--未接码"},
+                {"id": 2, "name": "PLUS--已接美国长效"},
+            ],
+        )
+        upload_response = FakeOaiPayResponse(200, {"success": True, "imported": 1, "category_id": 1, "group": "1"})
+        with mock.patch("services.chatgpt_core.oaipay_upload.cffi_requests.get", return_value=categories_response):
+            with mock.patch("services.chatgpt_core.oaipay_upload.cffi_requests.post", return_value=upload_response) as mock_post:
+                result = upload_to_oaipay_detailed(
+                    account,
+                    api_url="https://gpt.cccy.me",
+                    api_key="upload-key",
+                    capabilities={
+                        "has_refresh_token": True,
+                        "has_paid_subscription": True,
+                        "has_confirmed_phone_binding": False,
+                    },
+                )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["category_rule"], "paid_with_refresh_token_phone_unverified")
+        self.assertEqual(result["category_id"], 1)
+        self.assertEqual(result["category_name"], "PLUS--未接码")
+        self.assertEqual(mock_post.call_args.kwargs["json"]["group"], "1")
 
     def test_upload_manual_category_overrides_auto_category(self):
         account = self._make_account()

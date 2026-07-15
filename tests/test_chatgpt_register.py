@@ -16,6 +16,7 @@ from services.chatgpt_core.chatgpt_client import ChatGPTClient
 from services.chatgpt_core.oauth_client import OAuthClient
 from services.chatgpt_core.refresh_token_registration_engine import (
     EmailServiceAdapter,
+    RegistrationResult,
     RefreshTokenRegistrationEngine,
 )
 from services.chatgpt_core.registration_route_policy import (
@@ -88,6 +89,32 @@ class RefreshTokenRegistrationEngineTests(unittest.TestCase):
             max_retries=1,
             **kwargs,
         )
+
+    def test_confirmed_phone_binding_event_is_attached_to_registration_result(self):
+        engine = self._make_engine()
+        oauth_client = mock.Mock()
+        oauth_client._phone_challenge_events = []
+        oauth_client._phone_binding_events = [
+            {
+                "phone": "+16134655704",
+                "phone_number": "+16134655704",
+                "status": "bound",
+                "source": "oauth_add_phone",
+                "api_url": "https://phone-api.example.test/read?id=1",
+                "source_api_url": "https://supplier.example.test/read?id=1",
+                "bound_at": "2026-07-16T00:00:00+00:00",
+                "updated_at": "2026-07-16T00:00:00+00:00",
+            }
+        ]
+        result = RegistrationResult(success=True, metadata={})
+
+        engine._remember_oauth_phone_challenge_events(oauth_client)
+        engine._apply_phone_challenge_metadata(result)
+
+        self.assertEqual(result.metadata["chatgpt_phone_binding"]["status"], "bound")
+        self.assertEqual(result.metadata["chatgpt_phone_binding_history"][-1]["phone"], "+16134655704")
+        self.assertEqual(result.metadata["chatgpt_bound_phone"]["verification_status"], "verified")
+        self.assertEqual(result.metadata["chatgpt_bound_phone_number"], "+16134655704")
 
     @staticmethod
     def _registered_client():
@@ -760,6 +787,69 @@ class OAuthClientPasswordlessTests(unittest.TestCase):
         self.assertEqual(tokens["access_token"], "at")
         follow_state.assert_called_once()
         handle_phone.assert_not_called()
+
+    def test_login_handles_add_phone_before_oauth_resolution_when_new_binding_is_enabled(self):
+        client = self._make_client()
+        add_phone_state = FlowState(
+            page_type="add_phone",
+            continue_url="https://auth.openai.com/add-phone",
+            current_url="https://auth.openai.com/api/accounts/email-otp/validate",
+            source="api",
+        )
+        consent_state = FlowState(
+            page_type="consent",
+            continue_url="https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+            current_url="https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+        )
+        transitions: list[str] = []
+
+        def handle_phone_transition(*_args, **_kwargs):
+            transitions.append("handle_phone")
+            return consent_state
+
+        def follow_state_transition(*_args, **_kwargs):
+            transitions.append("follow_state")
+            return None, consent_state
+
+        with mock.patch.object(
+            client,
+            "_bootstrap_oauth_session",
+            return_value="https://auth.openai.com/log-in",
+        ), mock.patch.object(
+            client,
+            "_submit_authorize_continue",
+            return_value=add_phone_state,
+        ), mock.patch.object(
+            client,
+            "_handle_add_phone_verification",
+            side_effect=handle_phone_transition,
+        ) as handle_phone, mock.patch.object(
+            client,
+            "_follow_flow_state",
+            side_effect=follow_state_transition,
+        ) as follow_state, mock.patch.object(
+            client,
+            "_oauth_submit_workspace_and_org",
+            return_value=("auth-code", None),
+        ), mock.patch.object(
+            client,
+            "_exchange_code_for_tokens",
+            return_value={"access_token": "at"},
+        ):
+            tokens = client.login_and_get_tokens(
+                "user@example.com",
+                "Secret123!",
+                "device-fixed",
+                prefer_passwordless_login=True,
+                allow_phone_verification=True,
+                allow_add_phone_verification=True,
+            )
+
+        self.assertEqual(tokens["access_token"], "at")
+        handle_phone.assert_called_once()
+        self.assertEqual(transitions[0], "handle_phone")
+        if "follow_state" in transitions:
+            self.assertGreater(transitions.index("follow_state"), transitions.index("handle_phone"))
 
     def test_login_uses_canonical_consent_url_for_personal_oauth_resolution(self):
         client = self._make_client()
