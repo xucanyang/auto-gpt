@@ -2247,6 +2247,11 @@ class HmeReadyApiClient:
     """Client for icloud-hide-email-helper HME Ready API."""
 
     REQUEST_TIMEOUT_SECONDS = 20
+    # HME prepare mutates a single shared Helper ledger.  Serializing it inside
+    # one auto-gpt process keeps registration workers from simultaneously
+    # queueing the same control-plane endpoint; the lock wait happens before
+    # the HTTP read timeout starts.
+    _PREPARE_LOCK = threading.Lock()
 
     def __init__(
         self,
@@ -2362,7 +2367,8 @@ class HmeReadyApiClient:
             body["ttl_ms"] = int(ttl_ms)
         if max_cache_age_ms:
             body["max_cache_age_ms"] = int(max_cache_age_ms)
-        return self._request("POST", "/api/hme-ready/mailboxes/prepare", payload=body)
+        with self._PREPARE_LOCK:
+            return self._request("POST", "/api/hme-ready/mailboxes/prepare", payload=body)
 
     def list_emails(self, lease_id: str, *, page: int = 1, size: int = 100) -> list[dict[str, Any]]:
         payload = self._request(

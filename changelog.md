@@ -4,6 +4,17 @@
 
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，并且本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/) (语义化版本)。
 
+## [2.1.8] - 2026-07-15
+
+### 修复 (Fixed)
+- **并发注册不再同时压垮 HME lease 控制面**：`core/base_mailbox.py` 为 `HmeReadyApiClient.prepare()` 增加进程内共享闸门；同一 auto-gpt 实例的注册 worker 会在发起 HTTP 前串行领取 HME lease，而不是让多个请求同时在 Helper 的单一账本锁后排队并各自触发 20 秒 read timeout。锁等待不占用 HTTP read timeout，OTP 读取仍保持并发且仍由 auto-gpt 直连 TempMail。
+
+### 优化 (Changed)
+- **前端版本同步至 v2.1.8**：`frontend/src/app/AppShell.tsx` 更新侧栏版本，便于确认浏览器已加载 HME prepare 并发闸门。
+
+### 测试 (Tests)
+- **延续 HME lease 边界回归覆盖**：保留 v2.1.7 中父任务归属、无 Helper 转发邮箱 ID 时的 TempMail 直查兼容，以及 HME 控制面错误不误切代理的用例；本次闸门只包围 lease prepare，不改变 OTP 轮询与 finalize 契约。
+
 ## [2.1.7] - 2026-07-15
 
 ### 修复 (Fixed)
@@ -1458,4 +1469,8 @@
 
 ## 2026-07-15 22:31:36 +0800
 - 修复 HME prepare 控制面直连与任务归属
+- 发布模式: multi
+
+## 2026-07-15 22:41:10 +0800
+- 串行 HME prepare 避免并发控制面超时
 - 发布模式: multi
