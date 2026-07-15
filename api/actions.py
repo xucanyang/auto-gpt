@@ -6,7 +6,7 @@ import json
 import random
 import time
 from typing import Any
-from core.db import AccountModel, get_session
+from core.db import AccountModel, PaymentLinkGenerationModel, get_session
 from core.base_platform import RegisterConfig
 from core.config_store import config_store
 from services.account_filters import (
@@ -162,7 +162,8 @@ def _apply_action_result(
             )
             extra["chatgpt_last_payment_link"] = cache_payload
             if (
-                normalize_payment_link_output_format(cache_payload.get("payment_link_format")) == PAYMENT_LINK_FORMAT_PAYPAL
+                str(data.get("link_type") or cache_payload.get("link_type") or "").strip().lower() == "paypal"
+                or normalize_payment_link_output_format(cache_payload.get("payment_link_format")) == PAYMENT_LINK_FORMAT_PAYPAL
                 or normalize_payment_link_source(cache_payload.get("payment_source")) == PAYMENT_SOURCE_LONG_LINK_PAYPAL
             ):
                 paypal_payload = dict(cache_payload)
@@ -174,6 +175,51 @@ def _apply_action_result(
 
             acc_model.updated_at = datetime.now(timezone.utc)
             session.add(acc_model)
+            remote_request_id = str(data.get("remote_request_id") or data.get("request_id") or "").strip()
+            if remote_request_id:
+                history = session.exec(
+                    select(PaymentLinkGenerationModel).where(
+                        PaymentLinkGenerationModel.request_id == remote_request_id
+                    )
+                ).first()
+                if history is None:
+                    history = PaymentLinkGenerationModel(
+                        account_id=int(acc_model.id or 0),
+                        request_id=remote_request_id,
+                    )
+                history.account_id = int(acc_model.id or 0)
+                history.status = "succeeded"
+                history.remote_batch_id = str(data.get("remote_batch_id") or history.remote_batch_id or "")[:128]
+                history.remote_job_id = str(data.get("remote_job_id") or history.remote_job_id or "")[:128]
+                history.profile_hash = str(data.get("profile_hash") or history.profile_hash or "")[:128]
+                history.link_type = str(data.get("link_type") or history.link_type or "")[:64]
+                history.url = checkout_url[:10_000]
+                history.generated_at = str(data.get("generated_at") or history.generated_at or datetime.now(timezone.utc).isoformat())[:64]
+                history.persisted_at = datetime.now(timezone.utc).isoformat()
+                history.sanitized_error = ""
+                history.set_result(
+                    {
+                        key: data[key]
+                        for key in (
+                            "url",
+                            "paypal_url",
+                            "link_type",
+                            "profile_hash",
+                            "remote_batch_id",
+                            "remote_job_id",
+                            "remote_request_id",
+                            "generated_at",
+                            "country",
+                            "currency",
+                            "provider_redirect_url",
+                            "long_url",
+                            "cs_id",
+                        )
+                        if key in data and data[key] is not None and data[key] != ""
+                    }
+                )
+                history.updated_at = datetime.now(timezone.utc)
+                session.add(history)
         data["auth_capture_required"] = True
         result["data"] = data
 

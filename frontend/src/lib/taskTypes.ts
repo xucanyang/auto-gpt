@@ -17,7 +17,7 @@ export const TASK_SOURCE_LABELS: Record<string, string> = {
   baxigpt_cdk_submit: 'iDEAL / PIX 批量提交',
   chatgpt_paypal_bind: 'PayPal绑定',
   chatgpt_oaipay_approval: 'OaiPay授权链接',
-  batch_payment_link: '批量支付链接',
+  batch_payment_link: '批量支付链接生成',
   gopay_payment: 'GoPay支付',
   idea_oaipay_pipeline: '账号处理流水线',
 }
@@ -74,6 +74,8 @@ export function statusTagColor(status?: TaskStatus) {
   if (normalized === 'pending_activation') return 'default'
   if (normalized === 'skipped') return 'warning'
   if (normalized === 'stopped') return 'warning'
+  if (normalized === 'partial') return 'warning'
+  if (normalized === 'interrupted') return 'warning'
   return 'error'
 }
 
@@ -84,6 +86,8 @@ export function statusLabel(status?: TaskStatus) {
   if (normalized === 'pending_activation') return '历史待激活（已退役）'
   if (normalized === 'skipped') return '跳过'
   if (normalized === 'stopped') return '已停止'
+  if (normalized === 'partial') return '部分失败'
+  if (normalized === 'interrupted') return '远端中断'
   if (normalized === 'failed') return '失败'
   return normalized || '-'
 }

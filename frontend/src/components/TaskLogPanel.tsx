@@ -396,11 +396,17 @@ export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
   }, [lines])
 
   useEffect(() => {
-    if (!taskId || terminalStatus !== 'failed') return
-    const key = `${taskId}:failed`
+    if (!taskId || !['failed', 'partial', 'interrupted'].includes(terminalStatus)) return
+    const key = `${taskId}:${terminalStatus}`
     if (terminalNotifyRef.current === key) return
     terminalNotifyRef.current = key
-    message.error('任务失败，请查看日志里的失败原因')
+    if (terminalStatus === 'partial') {
+      message.warning('任务部分失败，请查看日志里的失败原因')
+    } else if (terminalStatus === 'interrupted') {
+      message.warning('远端任务中断或结果未知，请查看日志里的失败原因')
+    } else {
+      message.error('任务失败，请查看日志里的失败原因')
+    }
   }, [taskId, terminalStatus])
 
   const footerText =
@@ -408,6 +414,10 @@ export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
       ? { text: '任务完成', color: '#10b981' }
       : terminalStatus === 'stopped'
         ? { text: '任务已停止', color: '#d97706' }
+        : terminalStatus === 'partial'
+          ? { text: '部分失败', color: '#d97706' }
+          : terminalStatus === 'interrupted'
+            ? { text: '远端中断', color: '#d97706' }
         : terminalStatus === 'failed'
           ? { text: '任务失败', color: '#dc2626' }
           : null

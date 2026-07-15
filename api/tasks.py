@@ -6,10 +6,11 @@ import os
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
+from sqlalchemy import func
 from sqlmodel import Session, select
 from typing import Any, Literal, Optional
 from copy import deepcopy
-from core.db import AccountModel, TaskLog, engine
+from core.db import AccountModel, PaymentLinkGenerationModel, TaskLog, engine
 from core.pix_cdk_usage import (
     STATE_BLOCKED as PIX_CDK_STATE_BLOCKED,
     STATE_PAID as PIX_CDK_STATE_PAID,
@@ -21,6 +22,7 @@ from core.task_runtime import (
     AttemptResult,
     RegisterTaskStore,
     SkipCurrentAttemptRequested,
+    TERMINAL_TASK_STATUSES,
     TaskInterruption,
     StopTaskRequested,
 )
@@ -39,6 +41,8 @@ from services.account_rate_limit_recovery import (
     reconcile_rate_limited_accounts,
 )
 from services.chatgpt_core.payment_link_cache import (
+    PAYMENT_LINK_FORMAT_LONG_LINK,
+    PAYMENT_SOURCE_LONG_LINK,
     cache_checkout_link_in_extra,
     payment_link_cache_matches,
     payment_link_requires_regeneration,
@@ -472,7 +476,7 @@ def _expired_task_snapshot(task_id: str) -> dict[str, Any]:
 def _ensure_task_mutable(task_id: str) -> None:
     _ensure_task_exists(task_id)
     snapshot = _task_store.snapshot(task_id)
-    if snapshot.get("status") in {"done", "failed", "stopped"}:
+    if snapshot.get("status") in TERMINAL_TASK_STATUSES:
         raise HTTPException(409, "任务已结束，无法再执行控制操作")
 
 
@@ -1698,63 +1702,42 @@ def _json_object_from_config(value: Any) -> dict[str, Any]:
 
 
 def _filtered_payment_link_request_params(params: dict[str, Any] | None) -> dict[str, Any]:
-    if not isinstance(params, dict):
-        return {}
-    allowed_keys = {
-        "plan",
-        "country",
-        "currency",
-        "proxy",
-        "payment_link_format",
-        "payment_source",
-        "profile_hash",
-        "payment_profile_hash",
-        "billing_name",
-        "billing_email",
-        "billing_country",
-        "billing_line1",
-        "billing_city",
-        "billing_state",
-        "billing_postal_code",
-        "reuse_cached_link",
+    """Keep the public task contract while removing local checkout controls.
+
+    Country, currency, provider, proxy chain and runtime strategy now belong to
+    openai-pay-long-link's active admin profile.  Ignoring retired form fields
+    is safer than letting a stale browser silently choose a different route.
+    """
+
+    source = params if isinstance(params, dict) else {}
+    return {
+        "plan": "plus",
+        "payment_source": PAYMENT_SOURCE_LONG_LINK,
+        "payment_link_format": PAYMENT_LINK_FORMAT_LONG_LINK,
+        "reuse_cached_link": source.get("reuse_cached_link") is not False,
     }
-    return {key: value for key, value in params.items() if key in allowed_keys and value is not None}
 
 
 def _build_batch_payment_link_params(account: AccountModel, request_params: dict[str, Any]) -> dict[str, Any]:
-    from core.config_store import config_store
-
-    global_defaults = _json_object_from_config(config_store.get("chatgpt_payment_link_defaults", ""))
-    extra = account.get_extra()
-    account_defaults = extra.get("chatgpt_payment_link_defaults") if isinstance(extra.get("chatgpt_payment_link_defaults"), dict) else {}
-    merged = {
-        **global_defaults,
-        **account_defaults,
-        **_filtered_payment_link_request_params(request_params),
-    }
-    params = normalize_payment_link_params(merged)
-    for key in (
-        "billing_name",
-        "billing_email",
-        "billing_country",
-        "billing_line1",
-        "billing_city",
-        "billing_state",
-        "billing_postal_code",
-    ):
-        if key in merged:
-            params[key] = str(merged.get(key) or "").strip()
+    del account
+    params = _filtered_payment_link_request_params(request_params)
+    # These values are frozen from the long-link profile above, never accepted
+    # from the batch request.  They are needed only to decide whether an
+    # existing generic link belongs to this exact profile.
+    params["country"] = str(request_params.get("country") or "").strip().upper()
+    params["currency"] = str(request_params.get("currency") or "").strip().upper()
+    params["profile_hash"] = str(request_params.get("profile_hash") or "").strip()
     return params
 
 
 def _payment_link_skip_reason(account: AccountModel, *, force_refresh: bool = False) -> str:
     status = str(getattr(account, "status", "") or "").strip().lower()
     if status == "invalid":
-        return "账号已失效，不能生成订阅链接" if bool(force_refresh) else "账号已失效，默认不预生成订阅链接"
+        return "账号已失效，不能生成支付链接" if bool(force_refresh) else "账号已失效，默认不预生成支付链接"
     if bool(force_refresh):
         return ""
     if status == "subscribed":
-        return "账号已订阅，默认不预生成订阅链接"
+        return "账号已订阅，默认不预生成支付链接"
     return ""
 
 
@@ -1762,6 +1745,104 @@ def _sync_payment_link_account_status(session: Session, account: AccountModel) -
     from services.chatgpt_core.local_status_refresh import sync_chatgpt_account_local_status
 
     return sync_chatgpt_account_local_status(session, account)
+
+
+_PAYMENT_LINK_HISTORY_RESULT_FIELDS = (
+    "url",
+    "paypal_url",
+    "plan",
+    "country",
+    "currency",
+    "payment_link_format",
+    "payment_source",
+    "link_type",
+    "profile_hash",
+    "remote_batch_id",
+    "remote_job_id",
+    "remote_request_id",
+    "generated_at",
+    "created_at",
+    "provider_redirect_url",
+    "long_url",
+    "stripe_redirect_url",
+    "stripe_hosted_url",
+    "cs_id",
+    "payment_method_id",
+    "payment_method_type",
+    "processor_entity",
+    "billing_country",
+    "payment_locale",
+    "amount",
+    "amount_display",
+    "cs_count",
+)
+
+
+def _payment_link_history_result(value: dict[str, Any] | None) -> dict[str, Any]:
+    source = value if isinstance(value, dict) else {}
+    return {
+        key: source[key]
+        for key in _PAYMENT_LINK_HISTORY_RESULT_FIELDS
+        if key in source and source[key] is not None and source[key] != ""
+    }
+
+
+def _upsert_payment_link_generation(
+    session: Session,
+    *,
+    account_id: int,
+    task_id: str,
+    request_id: str,
+    status: str,
+    profile_hash: str = "",
+    link_type: str = "",
+    remote_batch_id: str = "",
+    remote_job_id: str = "",
+    submitted_at: str = "",
+    started_at: str = "",
+    generated_at: str = "",
+    url: str = "",
+    error: str = "",
+    result: dict[str, Any] | None = None,
+) -> PaymentLinkGenerationModel:
+    row = session.exec(
+        select(PaymentLinkGenerationModel).where(PaymentLinkGenerationModel.request_id == str(request_id))
+    ).first()
+    if row is None:
+        row = PaymentLinkGenerationModel(
+            account_id=int(account_id),
+            task_id=str(task_id),
+            request_id=str(request_id),
+        )
+    row.account_id = int(account_id)
+    row.task_id = str(task_id)
+    row.status = str(status or "unknown")[:48]
+    if profile_hash:
+        row.profile_hash = str(profile_hash)[:128]
+    if link_type:
+        row.link_type = str(link_type)[:64]
+    if remote_batch_id:
+        row.remote_batch_id = str(remote_batch_id)[:128]
+    if remote_job_id:
+        row.remote_job_id = str(remote_job_id)[:128]
+    if submitted_at:
+        row.submitted_at = str(submitted_at)[:64]
+    if started_at:
+        row.started_at = str(started_at)[:64]
+    if generated_at:
+        row.generated_at = str(generated_at)[:64]
+    if url:
+        row.url = str(url)[:10_000]
+    if error:
+        row.sanitized_error = sanitize_error_message(error)[:1600]
+    elif status in {"succeeded", "queued", "running", "submitting"}:
+        row.sanitized_error = ""
+    if result is not None:
+        row.set_result(_payment_link_history_result(result))
+    row.persisted_at = datetime.now(timezone.utc).isoformat()
+    row.updated_at = datetime.now(timezone.utc)
+    session.add(row)
+    return row
 
 
 def _resolve_batch_payment_link_accounts(
@@ -4898,7 +4979,7 @@ def _save_task_log(
             # A terminal callback may win the race with a stop-click
             # checkpoint.  Never turn a completed history row back into
             # running merely because the click was processed concurrently.
-            if log.status in {"done", "failed", "stopped"} and status == "running":
+            if log.status in TERMINAL_TASK_STATUSES and status == "running":
                 return
             log.status = status
             log.error = safe_error
@@ -9579,18 +9660,26 @@ def _run_chatgpt_paypal_bind(task_id: str, account_ids: list[int], settings: dic
 
 
 def _run_batch_payment_links(task_id: str, account_ids: list[int]):
-    from api.actions import _execute_platform_action
-    from core.base_platform import RegisterConfig
-    from core.config_store import config_store
-    from services.chatgpt_core import ChatGPTPlatform
-    from datetime import datetime, timezone
+    """Submit all eligible accounts once, then poll long-link batches in bulk."""
+
+    from api.actions import _apply_action_result
+    from services.chatgpt_core.long_link_payment_client import (
+        LongLinkPaymentClient,
+        LongLinkPaymentError,
+        payment_link_from_remote_job,
+    )
 
     control = _task_store.control_for(task_id)
     total = max(len(account_ids), 1)
     success_count = 0
     skipped_count = 0
+    remote_interrupted_count = 0
     errors: list[str] = []
     primary_email = ""
+    prepared: list[dict[str, Any]] = []
+    submitted_request_ids: set[str] = set()
+    terminal_request_ids: set[str] = set()
+    stop_after_submit_noted = False
 
     _task_store.mark_running(task_id)
     _task_store.set_progress(task_id, f"0/{total}")
@@ -9598,78 +9687,232 @@ def _run_batch_payment_links(task_id: str, account_ids: list[int]):
     meta = dict(_task_store.snapshot(task_id).get("meta") or {})
     skipped_items = list(meta.get("skipped_items") or [])
     missing_ids = list(meta.get("missing_ids") or [])
-    request_params = dict(meta.get("params") or {})
+    request_params = _filtered_payment_link_request_params(dict(meta.get("params") or {}))
     skip_existing = bool(meta.get("skip_existing", True))
     force_refresh = bool(meta.get("force_refresh", False))
-    instance = ChatGPTPlatform(config=RegisterConfig(extra=config_store.get_all()))
+    profile: dict[str, Any] = {}
+
+    def _remote_time(value: Any) -> str:
+        try:
+            timestamp = float(value)
+        except (TypeError, ValueError):
+            return ""
+        if timestamp <= 0:
+            return ""
+        try:
+            return datetime.fromtimestamp(timestamp, timezone.utc).isoformat()
+        except (OverflowError, OSError, ValueError):
+            return ""
+
+    def _account_access_token(account: AccountModel) -> str:
+        extra = account.get_extra()
+        return str(extra.get("access_token") or account.token or "").strip()
+
+    def _record_remote_items(items: list[dict[str, Any]]) -> None:
+        nonlocal success_count, remote_interrupted_count
+        item_by_request = {
+            str(item.get("request_id") or "").strip(): item
+            for item in items
+            if isinstance(item, dict) and str(item.get("request_id") or "").strip()
+        }
+        if not item_by_request:
+            return
+        with Session(engine) as session:
+            changed = False
+            for pending in prepared:
+                request_id = str(pending["request_id"])
+                remote = item_by_request.get(request_id)
+                if remote is None:
+                    continue
+                remote_status = str(remote.get("status") or "unknown").strip().lower()
+                remote_batch_id = str(remote.get("batch_id") or "").strip()
+                remote_job_id = str(remote.get("job_id") or "").strip()
+                submitted_at = _remote_time(remote.get("created_at"))
+                started_at = _remote_time(remote.get("started_at"))
+                if remote_status in {"queued", "running"}:
+                    _upsert_payment_link_generation(
+                        session,
+                        account_id=int(pending["account_id"]),
+                        task_id=task_id,
+                        request_id=request_id,
+                        status=remote_status,
+                        profile_hash=str(profile.get("profile_hash") or ""),
+                        link_type=str(profile.get("link_type") or ""),
+                        remote_batch_id=remote_batch_id,
+                        remote_job_id=remote_job_id,
+                        submitted_at=submitted_at,
+                        started_at=started_at,
+                    )
+                    changed = True
+                    continue
+                if request_id in terminal_request_ids:
+                    continue
+                email = str(pending.get("email") or pending.get("account_id") or "")
+                if remote_status == "done":
+                    try:
+                        data = payment_link_from_remote_job(remote, profile=profile)
+                        account = session.get(AccountModel, int(pending["account_id"]))
+                        if account is None or account.platform != "chatgpt":
+                            raise ValueError("ChatGPT 账号在远端任务完成前已不存在")
+                        _apply_action_result(
+                            "chatgpt",
+                            "payment_link",
+                            account,
+                            {"ok": True, "data": data},
+                            session,
+                        )
+                        _upsert_payment_link_generation(
+                            session,
+                            account_id=int(pending["account_id"]),
+                            task_id=task_id,
+                            request_id=request_id,
+                            status="succeeded",
+                            profile_hash=str(data.get("profile_hash") or profile.get("profile_hash") or ""),
+                            link_type=str(data.get("link_type") or profile.get("link_type") or ""),
+                            remote_batch_id=str(data.get("remote_batch_id") or remote_batch_id),
+                            remote_job_id=str(data.get("remote_job_id") or remote_job_id),
+                            submitted_at=submitted_at,
+                            started_at=started_at,
+                            generated_at=str(data.get("generated_at") or _remote_time(remote.get("completed_at"))),
+                            url=str(data.get("url") or ""),
+                            result=data,
+                        )
+                        _task_store.add_cashier_url(task_id, str(data.get("url") or ""))
+                        success_count += 1
+                        _log(task_id, f"[OK] 支付链接已生成并保存: {email}")
+                    except Exception as exc:
+                        error_text = sanitize_error_message(exc)[:1600]
+                        errors.append(f"{email}: {error_text}")
+                        _upsert_payment_link_generation(
+                            session,
+                            account_id=int(pending["account_id"]),
+                            task_id=task_id,
+                            request_id=request_id,
+                            status="failed",
+                            profile_hash=str(profile.get("profile_hash") or ""),
+                            link_type=str(profile.get("link_type") or ""),
+                            remote_batch_id=remote_batch_id,
+                            remote_job_id=remote_job_id,
+                            submitted_at=submitted_at,
+                            started_at=started_at,
+                            generated_at=_remote_time(remote.get("completed_at")),
+                            error=error_text,
+                        )
+                        _log(task_id, f"[FAIL] 支付链接保存失败: {email} - {error_text}")
+                else:
+                    interruption = remote_status == "interrupted"
+                    error_text = sanitize_error_message(remote.get("error") or "支付链接生成失败")[:1600]
+                    errors.append(f"{email}: {error_text}")
+                    if interruption:
+                        remote_interrupted_count += 1
+                    _upsert_payment_link_generation(
+                        session,
+                        account_id=int(pending["account_id"]),
+                        task_id=task_id,
+                        request_id=request_id,
+                        status="interrupted" if interruption else "failed",
+                        profile_hash=str(profile.get("profile_hash") or ""),
+                        link_type=str(profile.get("link_type") or ""),
+                        remote_batch_id=remote_batch_id,
+                        remote_job_id=remote_job_id,
+                        submitted_at=submitted_at,
+                        started_at=started_at,
+                        generated_at=_remote_time(remote.get("completed_at")),
+                        error=error_text,
+                    )
+                    label = "远端任务中断" if interruption else "支付链接生成失败"
+                    _log(task_id, f"[FAIL] {label}: {email} - {error_text}")
+                terminal_request_ids.add(request_id)
+                changed = True
+            if changed:
+                session.commit()
+
+    def _mark_unresolved_interrupted(reason: str) -> None:
+        nonlocal remote_interrupted_count
+        with Session(engine) as session:
+            changed = False
+            for pending in prepared:
+                request_id = str(pending["request_id"])
+                if request_id in terminal_request_ids:
+                    continue
+                _upsert_payment_link_generation(
+                    session,
+                    account_id=int(pending["account_id"]),
+                    task_id=task_id,
+                    request_id=request_id,
+                    status="interrupted",
+                    profile_hash=str(profile.get("profile_hash") or ""),
+                    link_type=str(profile.get("link_type") or ""),
+                    error=reason,
+                )
+                errors.append(f"{pending.get('email') or pending.get('account_id')}: {reason}")
+                terminal_request_ids.add(request_id)
+                remote_interrupted_count += 1
+                changed = True
+            if changed:
+                session.commit()
 
     try:
+        client = LongLinkPaymentClient.from_env()
+        profile = client.get_profile(force_refresh=True)
+        profile_hash = str(profile.get("profile_hash") or "").strip()
+        if not profile_hash:
+            raise LongLinkPaymentError("支付链接生成服务未返回配置哈希")
+        request_params.update(
+            {
+                "profile_hash": profile_hash,
+                "country": str(profile.get("country") or "").strip().upper(),
+                "currency": str(profile.get("currency") or "").strip().upper(),
+            }
+        )
+        _task_store.update_meta(
+            task_id,
+            {
+                "payment_link_profile": {
+                    "link_type": str(profile.get("link_type") or ""),
+                    "country": request_params["country"],
+                    "currency": request_params["currency"],
+                    "profile_hash": profile_hash,
+                    "effective_concurrency": int(profile.get("effective_concurrency") or 0),
+                },
+                "payment_link_state": "preparing",
+            },
+        )
+        _log(
+            task_id,
+            "[支付链接生成] 已冻结 long-link 管理端配置 "
+            f"type={profile.get('link_type') or '-'} profile={profile_hash[:12]} "
+            f"country={request_params['country'] or '-'} currency={request_params['currency'] or '-'} "
+            f"concurrency={profile.get('effective_concurrency') or '-'}",
+        )
+
         for missing_id in missing_ids:
             _log(task_id, f"[MISS] 账号不存在: account_id={missing_id}")
             errors.append(f"account_id={missing_id}: 账号不存在")
-
         for item in skipped_items:
             _log(task_id, f"[SKIP] {item.get('email') or item.get('account_id') or '-'} - {item.get('reason') or '已跳过'}")
 
-        from services.chatgpt_core.payment_link_cache import (
-            PAYMENT_LINK_FORMAT_PAYPAL,
-            PAYMENT_SOURCE_LONG_LINK_PAYPAL,
-            normalize_payment_link_source,
-        )
-
-        if normalize_payment_link_source(request_params.get("payment_source")) == PAYMENT_SOURCE_LONG_LINK_PAYPAL:
-            from services.chatgpt_core.long_link_paypal_client import LongLinkPayPalClient
-
-            profile = LongLinkPayPalClient.from_env().get_profile(force_refresh=True)
-            request_params.update(
-                {
-                    "plan": "plus",
-                    "country": str(profile.get("country") or request_params.get("country") or "ID").strip().upper(),
-                    "currency": str(profile.get("currency") or request_params.get("currency") or "IDR").strip().upper(),
-                    "payment_link_format": PAYMENT_LINK_FORMAT_PAYPAL,
-                    "payment_source": PAYMENT_SOURCE_LONG_LINK_PAYPAL,
-                    "payment_profile_hash": str(profile.get("profile_hash") or "").strip(),
-                }
-            )
-            _log(
-                task_id,
-                "[订阅链接] 已冻结 PayPal 提链配置 "
-                f"profile={str(profile.get('profile_hash') or '')[:12]} "
-                f"country={request_params['country']} currency={request_params['currency']}",
-            )
-
-        for index, account_id in enumerate(account_ids, start=1):
-            control.checkpoint(consume_skip=False)
-            email = ""
-            attempt_id = _claim_next_task_attempt(control)
-            try:
-                control.checkpoint(attempt_id=attempt_id)
-                with Session(engine) as session:
+        instance_id = str(os.getenv("APP_INSTANCE_ID") or "auto-gpt").strip() or "auto-gpt"
+        with Session(engine) as session:
+            for index, account_id in enumerate(account_ids, start=1):
+                control.checkpoint(consume_skip=False)
+                email = ""
+                attempt_id = _claim_next_task_attempt(control)
+                try:
+                    control.checkpoint(attempt_id=attempt_id)
                     account = session.get(AccountModel, int(account_id or 0))
                     if account is None or account.platform != "chatgpt":
                         raise ValueError("ChatGPT 账号不存在")
                     email = str(account.email or "")
                     if not primary_email:
                         primary_email = email
-
                     skip_reason = _payment_link_skip_reason(account, force_refresh=force_refresh)
                     if skip_reason:
                         skipped_count += 1
-                        _log(task_id, f"[SKIP] 订阅链接跳过: {email or account_id} - {skip_reason}")
+                        _log(task_id, f"[SKIP] 支付链接生成跳过: {email or account_id} - {skip_reason}")
                         continue
 
                     params = _build_batch_payment_link_params(account, request_params)
-                    if params.get("payment_source") == PAYMENT_SOURCE_LONG_LINK_PAYPAL:
-                        instance_id = str(os.getenv("APP_INSTANCE_ID") or "auto-gpt").strip() or "auto-gpt"
-                        params["request_id"] = f"{instance_id}:{task_id}:{int(account_id or 0)}"
-                    params["save_defaults"] = False
-                    if force_refresh:
-                        params["reuse_cached_link"] = False
-                    elif "reuse_cached_link" in request_params:
-                        params["reuse_cached_link"] = request_params.get("reuse_cached_link") is not False
-                    else:
-                        params["reuse_cached_link"] = True
-
                     extra = account.get_extra()
                     cached = extra.get("chatgpt_last_payment_link") if isinstance(extra.get("chatgpt_last_payment_link"), dict) else {}
                     raw_cached_url = str(cached.get("url") or "").strip()
@@ -9679,110 +9922,178 @@ def _run_batch_payment_links(task_id: str, account_ids: list[int]):
                         cached = {**cached, "url": cached_url}
                         extra["chatgpt_last_payment_link"] = cached
                         account.set_extra(extra)
-                    cache_matches = payment_link_cache_matches(cached, params)
+                        session.add(account)
                     if cached_url and not force_refresh and payment_link_requires_status_sync(cached):
                         status_label = payment_link_status_label(cached.get("link_status"))
                         _log(task_id, f"[SYNC] {status_label}，开始同步账号状态: {email or account_id}")
-                        try:
-                            sync_result = _sync_payment_link_account_status(session, account)
-                            skipped_count += 1
-                            _log(
-                                task_id,
-                                "[SYNC] "
-                                f"账号状态同步完成: {email or account_id} "
-                                f"status={sync_result.get('status') or account.status}",
-                            )
-                        except Exception as sync_exc:
-                            session.rollback()
-                            raise ValueError(f"{status_label}，账号状态同步失败: {sync_exc}") from sync_exc
+                        _sync_payment_link_account_status(session, account)
+                        skipped_count += 1
+                        _log(task_id, f"[SYNC] 账号状态同步完成: {email or account_id}")
                         continue
-
                     if cached_url and not force_refresh and payment_link_requires_regeneration(cached):
                         status_label = payment_link_status_label(cached.get("link_status"))
-                        params["reuse_cached_link"] = False
-                        _log(task_id, f"[REGEN] 缓存订阅链接{status_label}，重新生成: {email or account_id}")
-
-                    if skip_existing and not force_refresh and cache_matches and params.get("reuse_cached_link") is not False:
-                        if cached_url:
-                            if str(account.cashier_url or "").strip() != cached_url or cached_url != raw_cached_url:
-                                account.cashier_url = cached_url
-                                account.updated_at = datetime.now(timezone.utc)
-                                session.add(account)
-                                session.commit()
-                            _task_store.add_cashier_url(task_id, cached_url)
+                        _log(task_id, f"[REGEN] 缓存支付链接{status_label}，重新生成: {email or account_id}")
+                    if skip_existing and not force_refresh and payment_link_cache_matches(cached, params):
+                        if str(account.cashier_url or "").strip() != cached_url:
+                            account.cashier_url = cached_url
+                            account.updated_at = datetime.now(timezone.utc)
+                            session.add(account)
+                        _task_store.add_cashier_url(task_id, cached_url)
                         skipped_count += 1
-                        _log(task_id, f"[SKIP] 已有可复用订阅链接: {email or account_id}")
+                        _log(task_id, f"[SKIP] 已有可复用支付链接: {email or account_id}")
                         continue
 
-                    proxy_label = "上游配置" if params.get("payment_source") == PAYMENT_SOURCE_LONG_LINK_PAYPAL else (
-                        "直连" if not str(params.get("proxy") or "").strip() else "指定代理"
-                    )
-                    _log(
-                        task_id,
-                        "[订阅链接] "
-                        f"{index}/{total} {email or account_id} "
-                        f"plan={params.get('plan')} country={params.get('country')} "
-                        f"currency={params.get('currency')} link_format={params.get('payment_link_format')} "
-                        f"source={params.get('payment_source')} proxy={proxy_label}",
-                    )
-                    result = _execute_platform_action(
-                        instance,
-                        "chatgpt",
-                        account,
-                        "payment_link",
-                        params,
+                    token = _account_access_token(account)
+                    if not token:
+                        raise ValueError("账号缺少 Access Token")
+                    request_id = f"{instance_id}:{task_id}:{int(account_id or 0)}"
+                    _upsert_payment_link_generation(
                         session,
+                        account_id=int(account_id),
+                        task_id=task_id,
+                        request_id=request_id,
+                        status="submitting",
+                        profile_hash=profile_hash,
+                        link_type=str(profile.get("link_type") or ""),
                     )
-                    ok = bool(result.get("ok"))
-                    data = result.get("data") if isinstance(result.get("data"), dict) else {}
-                    checkout_url = str(data.get("url") or data.get("checkout_url") or data.get("cashier_url") or "").strip()
-                    if not ok or not checkout_url:
-                        session.rollback()
-                        raise ValueError(str(result.get("error") or data.get("message") or "订阅链接生成失败"))
+                    prepared.append(
+                        {
+                            "account_id": int(account_id),
+                            "email": email,
+                            "request_id": request_id,
+                            "access_token": token,
+                        }
+                    )
+                    _log(task_id, f"[SUBMIT] 已准备 {index}/{total}: {email or account_id}")
+                except SkipCurrentAttemptRequested as exc:
+                    skipped_count += 1
+                    _log(task_id, f"[SKIP] 已跳过支付链接生成: {email or account_id} - {exc}")
+                except StopTaskRequested:
+                    raise
+                except Exception as exc:
+                    error_text = sanitize_error_message(exc)[:1600]
+                    errors.append(f"{email or account_id}: {error_text}")
+                    _log(task_id, f"[FAIL] 支付链接准备失败: {email or account_id} - {error_text}")
+                finally:
+                    control.finish_attempt(attempt_id)
+                    _task_store.set_progress(task_id, f"{index}/{total}")
+            session.commit()
 
-                    session.commit()
-                    _task_store.add_cashier_url(task_id, checkout_url)
-                    success_count += 1
-                    if data.get("cache_reused"):
-                        _log(task_id, f"[OK] 已复用缓存订阅链接: {email or account_id}")
+        if prepared:
+            control.checkpoint(consume_skip=False)
+            _task_store.update_meta(task_id, {"payment_link_state": "submitting", "payment_link_submitted": 0})
+            response = client.submit_batch(items=prepared, expected_profile_hash=profile_hash)
+            remote_items = response.get("items") if isinstance(response.get("items"), list) else []
+            submitted_request_ids = {str(item["request_id"]) for item in prepared}
+            _record_remote_items([item for item in remote_items if isinstance(item, dict)])
+            batch_ids = sorted(
+                {
+                    str(candidate or "").strip()
+                    for candidate in [
+                        response.get("batch_id"),
+                        *(response.get("batch_ids") if isinstance(response.get("batch_ids"), list) else []),
+                        *[
+                            item.get("batch_id")
+                            for item in remote_items
+                            if isinstance(item, dict)
+                        ],
+                    ]
+                    if str(candidate or "").strip()
+                }
+            )
+            if submitted_request_ids - terminal_request_ids and not batch_ids:
+                raise LongLinkPaymentError("支付链接生成服务未返回可轮询的远端批次 ID")
+            _task_store.update_meta(
+                task_id,
+                {
+                    "payment_link_state": "queued",
+                    "payment_link_submitted": len(prepared),
+                    "payment_link_batch_ids": batch_ids,
+                    "payment_link_remote_summary": dict(response.get("summary") or {}),
+                },
+            )
+            _log(task_id, f"[SUBMIT] 已批量提交 {len(prepared)} 个账号，开始统一轮询 {len(batch_ids)} 个远端批次")
+
+            poll_interval = max(float(os.getenv("OPENAI_PAY_LONG_LINK_POLL_INTERVAL_SECONDS") or 2.0), 0.2)
+            job_timeout = max(float(os.getenv("OPENAI_PAY_LONG_LINK_JOB_TIMEOUT_SECONDS") or 1800.0), 5.0)
+            deadline = time.monotonic() + job_timeout
+            last_poll_error = ""
+            while submitted_request_ids - terminal_request_ids:
+                if control.should_stop_starting_new_attempts() and not stop_after_submit_noted:
+                    stop_after_submit_noted = True
+                    _log(task_id, "[STOP] 远端批次已全部受理，停止请求不会取消远端任务；继续轮询并保存终态")
+                if time.monotonic() >= deadline:
+                    _mark_unresolved_interrupted("远端批次轮询超时，结果状态未知")
+                    _log(task_id, "[INTERRUPTED] 远端批次轮询超时，未完成项已标记为中断")
+                    break
+                poll_failed = False
+                for batch_id in batch_ids:
+                    try:
+                        batch = client.get_batch(batch_id)
+                        batch_items = batch.get("items") if isinstance(batch.get("items"), list) else []
+                        _record_remote_items([item for item in batch_items if isinstance(item, dict)])
+                        _task_store.update_meta(
+                            task_id,
+                            {
+                                "payment_link_state": str(batch.get("status") or "running"),
+                                "payment_link_remote_summary": dict(batch.get("summary") or {}),
+                            },
+                        )
+                    except LongLinkPaymentError as exc:
+                        poll_failed = True
+                        error_text = sanitize_error_message(exc)[:600]
+                        if error_text != last_poll_error:
+                            _log(task_id, f"[WARN] 远端批次查询失败，将重试: {error_text}")
+                            last_poll_error = error_text
+                completed_count = len(terminal_request_ids) + skipped_count + len(skipped_items)
+                _task_store.set_progress(task_id, f"{min(completed_count, total)}/{total}")
+                if submitted_request_ids - terminal_request_ids:
+                    if poll_failed:
+                        time.sleep(min(max(poll_interval, 1.0), 5.0))
                     else:
-                        _log(task_id, f"[OK] 订阅链接已生成并保存: {email or account_id}")
-            except SkipCurrentAttemptRequested as exc:
-                skipped_count += 1
-                _log(task_id, f"[SKIP] 已跳过订阅链接生成: {email or account_id} - {exc}")
-            except StopTaskRequested:
-                raise
-            except Exception as exc:
-                error_text = str(exc or "订阅链接生成失败")
-                errors.append(f"{email or account_id}: {error_text}")
-                _log(task_id, f"[FAIL] 订阅链接生成失败: {email or account_id} - {error_text}")
-            finally:
-                control.finish_attempt(attempt_id)
-                _task_store.set_progress(task_id, f"{index}/{total}")
+                        time.sleep(poll_interval)
 
-        final_status = "done"
+        if remote_interrupted_count:
+            final_status = "interrupted"
+            aggregate = "remote_interrupted"
+        elif errors and success_count:
+            final_status = "partial"
+            aggregate = "partial_failure"
+        elif errors:
+            final_status = "failed"
+            aggregate = "total_failure"
+        else:
+            final_status = "done"
+            aggregate = "completed_success"
+        total_skipped = skipped_count + len(skipped_items)
         summary_message = (
-            f"批量订阅链接完成: 成功 {success_count} 个，跳过 {skipped_count + len(skipped_items)} 个，失败 {len(errors)} 个"
+            f"批量支付链接生成完成: 成功 {success_count} 个，跳过 {total_skipped} 个，"
+            f"失败 {len(errors)} 个，中断 {remote_interrupted_count} 个"
+        )
+        _task_store.update_meta(
+            task_id,
+            {
+                "payment_link_state": aggregate,
+                "payment_link_aggregate_status": aggregate,
+                "runtime_success": success_count,
+                "runtime_skipped": skipped_count,
+                "runtime_errors": list(errors),
+                "runtime_interrupted": remote_interrupted_count,
+            },
         )
         _log(task_id, f"[SUMMARY] {summary_message}")
-        log_status = "success" if not errors else "failed"
         _save_task_log(
             "chatgpt",
             primary_email,
-            log_status,
-            error="" if log_status == "success" else summary_message,
+            final_status,
+            error="" if final_status == "done" else summary_message,
             detail=_build_task_log_detail(
                 task_id,
                 {
                     "email": primary_email,
-                    "attempt_outcome": "batch_payment_link_success" if log_status == "success" else "batch_payment_link_failed",
+                    "attempt_outcome": f"batch_payment_link_{aggregate}",
                     "source": "batch_payment_link",
-                    "meta": {
-                        **meta,
-                        "runtime_success": success_count,
-                        "runtime_skipped": skipped_count,
-                        "runtime_errors": errors,
-                    },
+                    "meta": dict(_task_store.snapshot(task_id).get("meta") or {}),
                 },
             ),
         )
@@ -9790,11 +10101,12 @@ def _run_batch_payment_links(task_id: str, account_ids: list[int]):
             task_id,
             status=final_status,
             success=success_count,
-            skipped=skipped_count + len(skipped_items),
+            skipped=total_skipped,
             errors=errors,
-            error="" if not errors else summary_message,
+            error="" if final_status == "done" else summary_message,
         )
     except StopTaskRequested as exc:
+        _mark_unresolved_interrupted("任务在远端批次提交前停止")
         _log(task_id, f"[STOP] {exc}")
         _save_task_log(
             "chatgpt",
@@ -9807,12 +10119,7 @@ def _run_batch_payment_links(task_id: str, account_ids: list[int]):
                     "email": primary_email,
                     "attempt_outcome": "batch_payment_link_stopped",
                     "source": "batch_payment_link",
-                    "meta": {
-                        **meta,
-                        "runtime_success": success_count,
-                        "runtime_skipped": skipped_count,
-                        "runtime_errors": errors,
-                    },
+                    "meta": dict(_task_store.snapshot(task_id).get("meta") or {}),
                 },
             ),
         )
@@ -9823,6 +10130,33 @@ def _run_batch_payment_links(task_id: str, account_ids: list[int]):
             skipped=skipped_count + len(skipped_items),
             errors=errors,
             error=str(exc),
+        )
+    except Exception as exc:
+        error_text = sanitize_error_message(exc)[:1600]
+        _mark_unresolved_interrupted(error_text)
+        _log(task_id, f"[FAIL] 批量支付链接生成失败: {error_text}")
+        _save_task_log(
+            "chatgpt",
+            primary_email,
+            "interrupted" if prepared else "failed",
+            error=error_text,
+            detail=_build_task_log_detail(
+                task_id,
+                {
+                    "email": primary_email,
+                    "attempt_outcome": "batch_payment_link_remote_interrupted" if prepared else "batch_payment_link_failed",
+                    "source": "batch_payment_link",
+                    "meta": dict(_task_store.snapshot(task_id).get("meta") or {}),
+                },
+            ),
+        )
+        _task_store.finish(
+            task_id,
+            status="interrupted" if prepared else "failed",
+            success=success_count,
+            skipped=skipped_count + len(skipped_items),
+            errors=errors or [error_text],
+            error=error_text,
         )
     finally:
         _task_store.cleanup()
@@ -14743,6 +15077,106 @@ def create_batch_payment_link_task(
     )
 
 
+def _payment_link_profile_view(profile: dict[str, Any]) -> dict[str, Any]:
+    """Expose only the operator-safe part of the long-link admin profile."""
+
+    source = profile if isinstance(profile, dict) else {}
+    raw_profile = source.get("profile") if isinstance(source.get("profile"), dict) else {}
+    raw_regions = raw_profile.get("regions") if isinstance(raw_profile.get("regions"), dict) else {}
+    raw_pix = raw_profile.get("pix") if isinstance(raw_profile.get("pix"), dict) else {}
+
+    def text(key: str, *, default: str = "", upper: bool = False, limit: int = 128) -> str:
+        value = str(source.get(key) or raw_profile.get(key) or default).strip()[:limit]
+        return value.upper() if upper else value
+
+    return {
+        "link_type": text("link_type", default="hosted", limit=64).lower(),
+        "country": text("country", upper=True, limit=16),
+        "billing_country": text("billing_country", upper=True, limit=16),
+        "currency": text("currency", upper=True, limit=16),
+        "checkout_ui_mode": text("checkout_ui_mode", limit=64),
+        "payment_locale": text("payment_locale", limit=32),
+        "client_fingerprint": text("client_fingerprint", limit=64),
+        "proxy_chain_strategy": text("proxy_chain_strategy", limit=64),
+        "regions": {
+            key: str(raw_regions.get(key) or "").strip()[:64]
+            for key in ("checkout", "promotion", "provider", "approve")
+        },
+        "proxy_configured": bool(raw_profile.get("proxy_configured")),
+        "pix": {
+            "request_preset": str(raw_pix.get("request_preset") or "").strip()[:64],
+            "seed_pool_configured": bool(raw_pix.get("seed_pool_configured")),
+        },
+        "effective_concurrency": max(int(source.get("effective_concurrency") or 0), 0),
+        "profile_hash": text("profile_hash", limit=128),
+    }
+
+
+@router.get("/chatgpt/payment-links/profile")
+def get_chatgpt_payment_link_profile():
+    """Read the active long-link profile through the server-side credential."""
+
+    from services.chatgpt_core.long_link_payment_client import LongLinkPaymentClient, LongLinkPaymentError
+
+    try:
+        return _payment_link_profile_view(LongLinkPaymentClient.from_env().get_profile(force_refresh=True))
+    except LongLinkPaymentError as exc:
+        raise HTTPException(503, sanitize_error_message(exc)[:600]) from exc
+
+
+@router.get("/chatgpt/payment-links/history")
+def list_chatgpt_payment_link_history(
+    account_id: int = 0,
+    task_id: str = "",
+    limit: int = 100,
+    offset: int = 0,
+):
+    bounded_limit = min(max(int(limit or 0), 1), 200)
+    bounded_offset = max(int(offset or 0), 0)
+    with Session(engine) as session:
+        statement = select(PaymentLinkGenerationModel)
+        if int(account_id or 0) > 0:
+            statement = statement.where(PaymentLinkGenerationModel.account_id == int(account_id))
+        if str(task_id or "").strip():
+            statement = statement.where(PaymentLinkGenerationModel.task_id == str(task_id).strip())
+        rows = session.exec(
+            statement.order_by(PaymentLinkGenerationModel.id.desc()).offset(bounded_offset).limit(bounded_limit)
+        ).all()
+        total_statement = select(func.count()).select_from(PaymentLinkGenerationModel)
+        if int(account_id or 0) > 0:
+            total_statement = total_statement.where(PaymentLinkGenerationModel.account_id == int(account_id))
+        if str(task_id or "").strip():
+            total_statement = total_statement.where(PaymentLinkGenerationModel.task_id == str(task_id).strip())
+        total = int(session.exec(total_statement).one())
+    return {
+        "items": [
+            {
+                "id": row.id,
+                "account_id": row.account_id,
+                "task_id": row.task_id,
+                "request_id": row.request_id,
+                "remote_batch_id": row.remote_batch_id,
+                "remote_job_id": row.remote_job_id,
+                "profile_hash": row.profile_hash,
+                "link_type": row.link_type,
+                "status": row.status,
+                "url": row.url,
+                "submitted_at": row.submitted_at,
+                "started_at": row.started_at,
+                "generated_at": row.generated_at,
+                "persisted_at": row.persisted_at,
+                "error": row.sanitized_error,
+                "result": row.get_result(),
+            }
+            for row in rows
+        ],
+        "total": total,
+        "limit": bounded_limit,
+        "offset": bounded_offset,
+        "has_more": bounded_offset + len(rows) < total,
+    }
+
+
 @router.post("/{task_id}/submit-verification")
 def submit_verification(task_id: str, body: SubmitVerificationRequest):
     _ensure_task_mutable(task_id)
@@ -14944,7 +15378,7 @@ async def stream_logs(task_id: str, since: int = 0):
             while sent < len(logs):
                 yield f"data: {json.dumps({'line': logs[sent]})}\n\n"
                 sent += 1
-            if status in ("done", "failed", "stopped"):
+            if status in TERMINAL_TASK_STATUSES:
                 yield f"data: {json.dumps({'done': True, 'status': status})}\n\n"
                 break
             await asyncio.sleep(0.5)
@@ -15022,7 +15456,7 @@ def get_task(task_id: str):
         _ensure_task_exists(task_id)
 
     snapshot = sanitize_task_detail(_task_store.snapshot(task_id))
-    if str(snapshot.get("status") or "").strip().lower() in {"done", "failed", "stopped"}:
+    if str(snapshot.get("status") or "").strip().lower() in TERMINAL_TASK_STATUSES:
         # Terminal task IDs are immutable.  Private caching protects the API
         # from stale clients even if their old React effect keeps rendering.
         return JSONResponse(

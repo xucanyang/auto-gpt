@@ -200,7 +200,7 @@ export function RegisterTaskModal({
     }
     if (taskModalMode === 'payment_link') {
       const eligible = Number(taskSnapshot?.meta?.eligible || 0)
-      return eligible > 0 ? `批量订阅链接 (${eligible} 个)` : '批量订阅链接'
+      return eligible > 0 ? `支付链接生成 (${eligible} 个)` : '支付链接生成'
     }
     if (taskModalMode === 'resume_auth') {
       if (isPhoneBindingTest) {

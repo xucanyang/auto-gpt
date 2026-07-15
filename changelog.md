@@ -4,6 +4,30 @@
 
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，并且本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/) (语义化版本)。
 
+## [2.2.0] - 2026-07-16
+
+### 新增 (Added)
+- **通用 long-link 支付链接内部协议**：新增 `services/chatgpt_core/long_link_payment_client.py`，Auto-GPT 只向 `/api/internal/payment-links/profile`、`/batches` 和 `/batches/{batch_id}` 传递 Access Token、稳定请求 ID 与预期 profile hash。支付类型、账单国家/币种、Checkout 模式、浏览器指纹、代理链和全局并发均由 `/opt/openai-pay-long-link` 管理端当前配置冻结并执行。
+- **批量提交后统一轮询与可审计历史**：`api/tasks.py` 的批量支付链接任务会先持久化所有待处理账号并一次性提交远端批次，再按远端 `batch_id` 统一轮询；新增 `payment_link_generations`，持久化账号、任务、远端批次/任务 ID、profile hash、支付类型、状态、链接、提交/开始/生成/落库时间及脱敏错误。账号详情新增最近生成记录，账号表新增支付链接列。
+- **管理端配置只读摘要**：新增 `GET /api/tasks/chatgpt/payment-links/profile` 与历史查询接口。浏览器只读取支付类型、国家/币种、Checkout 模式、指纹名称、代理已配置状态、区域/PIX 摘要、有效并发和 profile hash，不暴露代理、密钥或 Access Token。
+
+### 优化 (Changed)
+- **支付链接生成统一到 long-link**：账号动作、批量工具栏、任务弹窗及兼容单账号 URL `POST /api/chatgpt/{account_id}/payment-link` 全部使用 long-link 当前管理端配置。原有本地 Hosted、短链接、国家、币种、代理和 PayPal 专用来源参数不再出现在界面或影响执行；旧客户端继续可发送这些字段，但服务端忽略它们以保持请求兼容。
+- **缓存按配置版本收敛**：仅 `payment_source=long_link`、`payment_link_format=long_link` 且 profile hash、国家、币种一致的缓存可在普通模式复用；强制重新生成跳过缓存。历史 Hosted、短链和 PayPal 缓存仍可读、可展示，但不会误复用为当前管理端配置生成的链接。
+- **状态与命名一致**：任务运行时与前端补充 `partial`、`interrupted` 终态；所有操作入口统一显示“支付链接生成”，侧栏版本同步至 `v2.2.0`。
+
+### 修复 (Fixed)
+- **PayPal 返回兼容旧字段而不恢复旧执行器**：当 long-link 当前类型为 `paypal` 时，通用结果仍镜像写入 `extra.chatgpt_paypal_url`，同时使用通用 `chatgpt_last_payment_link` 与历史记录，避免外部交付读取历史 PayPal 字段时断裂。
+- **批次终态与重启审计正确落库**：`/opt/openai-pay-long-link/app/app.py` 的内部批次在每个 job 状态变化和服务重启恢复后都会聚合状态并写入 `completed_at`；不会再出现所有 job 已终态但批次审计记录仍显示未完成的情况。
+- **兼容单账号 action 适配器**：`api/chatgpt.py` 的 `_to_codex_account()` 补齐标准 `token` 属性，使旧 URL 通过平台 action 复用通用 long-link 执行器，而不会因鸭子类型缺字段失败。
+
+### 安全 (Security)
+- **严格保持敏感值边界**：批量请求、任务元数据、TaskLog、生成历史和前端 profile 摘要均不保存或回传 Access Token、管理端代理凭证或内部 API 密钥。客户端验证远端回传的请求 ID 与提交集合完全一致，避免错误批次句柄被映射到本地账号。
+
+### 测试 (Tests)
+- **覆盖通用协议与回归边界**：新增 `tests/test_long_link_payment_client.py`、`tests/test_payment_link_generation_history.py`、`tests/test_chatgpt_payment_link_endpoint.py`；扩展支付来源和批量任务测试，覆盖先全量提交后批次轮询、profile 缓存隔离、强制刷新、PIX/PayPal 结果、PayPal 旧字段镜像、远端中断、历史脱敏/分页及旧 URL 不再调用本地 Hosted/短链生成器。
+- **完成构建与跨模块回归**：验证 Python 编译、前端 TypeScript/Vite 生产构建、long-link 内部 API/调度测试，以及外部订阅交付和退役能力契约，确保既有历史链接读取不被本次收敛破坏。
+
 ## [2.1.8] - 2026-07-15
 
 ### 修复 (Fixed)
@@ -1473,4 +1497,8 @@
 
 ## 2026-07-15 22:41:10 +0800
 - 串行 HME prepare 避免并发控制面超时
+- 发布模式: multi
+
+## 2026-07-16 03:59:03 +0800
+- 统一支付链接生成至 long-link 管理端配置并支持批量持久化
 - 发布模式: multi

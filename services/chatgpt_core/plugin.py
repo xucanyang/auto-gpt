@@ -503,19 +503,8 @@ class ChatGPTPlatform(BasePlatform):
             },
             {
                 "id": "payment_link",
-                "label": "生成订阅链接",
-                "params": [
-                    {"key": "plan", "label": "套餐", "type": "select", "options": ["plus"]},
-                    {"key": "country", "label": "地区", "type": "checkout_country", "default": "ID"},
-                    {"key": "currency", "label": "货币", "type": "text", "default": "IDR"},
-                    {
-                        "key": "payment_link_format",
-                        "label": "生成路径",
-                        "type": "select",
-                        "options": ["long_hosted", "short_chatgpt"],
-                        "default": "long_hosted",
-                    },
-                ],
+                "label": "支付链接生成",
+                "params": [],
             },
             {
                 "id": "resume_subscription_auth",
@@ -769,91 +758,51 @@ class ChatGPTPlatform(BasePlatform):
             }
 
         if action_id == "payment_link":
-            from services.chatgpt_core.payment import generate_plus_link
-            from services.chatgpt_core.long_link_paypal_client import LongLinkPayPalClient
+            import os
+            import time
+            import uuid
+
+            from services.chatgpt_core.long_link_payment_client import (
+                LongLinkPaymentClient,
+                LongLinkPaymentError,
+                payment_link_from_remote_job,
+            )
             from services.chatgpt_core.payment_link_cache import (
-                PAYMENT_LINK_FORMAT_PAYPAL,
-                PAYMENT_SOURCE_LONG_LINK_PAYPAL,
-                normalize_payment_link_output_format,
+                PAYMENT_LINK_FORMAT_LONG_LINK,
+                PAYMENT_SOURCE_LONG_LINK,
                 normalize_payment_link_params,
-                normalize_payment_link_source,
                 normalize_payment_link_url,
                 payment_link_cache_matches,
-                payment_link_url_requires_regeneration,
             )
 
             plan = str(params.get("plan") or "plus").strip().lower()
             if plan != "plus":
                 return {"ok": False, "error": "Only the Plus payment plan is supported"}
-            payment_source = normalize_payment_link_source(params.get("payment_source"))
-            paypal_client = None
-            payment_profile: dict = {}
-            payment_profile_hash = str(params.get("payment_profile_hash") or params.get("profile_hash") or "").strip()
-            if payment_source == PAYMENT_SOURCE_LONG_LINK_PAYPAL:
-                if plan != "plus":
-                    return {"ok": False, "error": "long_link_paypal 仅支持 Plus 套餐"}
-                paypal_client = LongLinkPayPalClient.from_env()
-                payment_profile = paypal_client.get_profile()
-                current_profile_hash = str(payment_profile.get("profile_hash") or "").strip()
-                if payment_profile_hash and payment_profile_hash != current_profile_hash:
-                    return {"ok": False, "error": "PayPal 提链配置已变化，请重新发起任务"}
-                payment_profile_hash = current_profile_hash
-                country = str(payment_profile.get("country") or params.get("country") or "ID").strip().upper() or "ID"
-                currency = str(payment_profile.get("currency") or params.get("currency") or "IDR").strip().upper() or "IDR"
-                payment_proxy = ""
-                payment_link_format = PAYMENT_LINK_FORMAT_PAYPAL
-            else:
-                country = str(params.get("country") or "ID").strip().upper() or "ID"
-                currency = str(params.get("currency") or "IDR").strip().upper() or "IDR"
-                payment_proxy = resolve_default_chatgpt_proxy(normalize_proxy_url(params.get("proxy")) or None)
-                payment_link_format = normalize_payment_link_output_format(params.get("payment_link_format"))
-            save_defaults = params.get("save_defaults") is not False
+            client = LongLinkPaymentClient.from_env()
+            payment_profile = client.get_profile()
+            payment_profile_hash = str(payment_profile.get("profile_hash") or "").strip()
+            expected_profile_hash = str(params.get("payment_profile_hash") or params.get("profile_hash") or "").strip()
+            if expected_profile_hash and expected_profile_hash != payment_profile_hash:
+                return {"ok": False, "error": "支付链接管理端配置已变化，请重新发起任务"}
+            country = str(payment_profile.get("country") or "").strip().upper()
+            currency = str(payment_profile.get("currency") or "").strip().upper()
             reuse_cached_link = params.get("reuse_cached_link") is not False
             cached_link = extra.get("chatgpt_last_payment_link") if isinstance(extra.get("chatgpt_last_payment_link"), dict) else {}
-            cached_format = normalize_payment_link_output_format(cached_link.get("payment_link_format") or "long_hosted")
+            cached_format = str(cached_link.get("payment_link_format") or "long_hosted")
             cached_url = normalize_payment_link_url(cached_link.get("url"), cached_format)
-            cached_url_needs_regeneration = payment_link_url_requires_regeneration(cached_link.get("url"), cached_format)
-            billing = {
-                "name": str(params.get("billing_name") or "").strip(),
-                "email": str(params.get("billing_email") or getattr(a, "email", "") or "").strip(),
-                "country": str(params.get("billing_country") or country).strip().upper() or country,
-                "line1": str(params.get("billing_line1") or "").strip(),
-                "city": str(params.get("billing_city") or "").strip(),
-                "state": str(params.get("billing_state") or "").strip(),
-                "postal_code": str(params.get("billing_postal_code") or "").strip(),
-            }
-            cached_billing = cached_link.get("billing") if isinstance(cached_link.get("billing"), dict) else {}
-            defaults_patch = (
-                {
-                    "chatgpt_payment_link_defaults": {
-                        "plan": plan,
-                        "country": country,
-                        "currency": currency,
-                        "proxy": payment_proxy,
-                        "payment_link_format": payment_link_format,
-                        "payment_source": payment_source,
-                        "profile_hash": payment_profile_hash,
-                    },
-                }
-                if save_defaults
-                else {}
-            )
             normalized_cache_params = normalize_payment_link_params(
                 {
-                    **params,
                     "plan": plan,
                     "country": country,
                     "currency": currency,
-                    "proxy": payment_proxy,
-                    "payment_link_format": payment_link_format,
-                    "payment_source": payment_source,
+                    "payment_link_format": PAYMENT_LINK_FORMAT_LONG_LINK,
+                    "payment_source": PAYMENT_SOURCE_LONG_LINK,
                     "profile_hash": payment_profile_hash,
                 }
             )
             should_reuse_cached_link = (
                 reuse_cached_link
                 and bool(cached_url)
-                and not cached_url_needs_regeneration
                 and payment_link_cache_matches(cached_link, normalized_cache_params)
             )
             if should_reuse_cached_link:
@@ -864,70 +813,81 @@ class ChatGPTPlatform(BasePlatform):
                         "plan": plan,
                         "country": country,
                         "currency": currency,
-                        "proxy": payment_proxy,
-                        "payment_link_format": payment_link_format,
-                        "payment_source": payment_source,
+                        "proxy": "",
+                        "payment_link_format": PAYMENT_LINK_FORMAT_LONG_LINK,
+                        "payment_source": PAYMENT_SOURCE_LONG_LINK,
                         "profile_hash": payment_profile_hash,
-                        "billing": cached_billing or billing,
                         "cache_reused": True,
                         "cache_source": str(cached_link.get("source") or "cached_payment_link"),
-                        "message": "已复用缓存订阅链接",
+                        "message": "已复用缓存支付链接",
                     }
                 )
                 return {
                     "ok": True,
                     "data": cached_data,
-                    "account_extra_patch": defaults_patch,
+                    "account_extra_patch": {},
                 }
-            if payment_source == PAYMENT_SOURCE_LONG_LINK_PAYPAL:
-                assert paypal_client is not None
-                generated = paypal_client.generate_paypal_link(
-                    access_token=str(a.access_token or ""),
-                    request_id=str(params.get("request_id") or "").strip(),
-                    expected_profile_hash=payment_profile_hash,
+            request_id = str(params.get("request_id") or "").strip() or f"direct:{uuid.uuid4().hex}"
+            access_token = str(a.access_token or "").strip()
+            if not access_token:
+                return {"ok": False, "error": "账号缺少 Access Token"}
+            submitted = client.submit_batch(
+                items=[{"access_token": access_token, "request_id": request_id}],
+                expected_profile_hash=payment_profile_hash,
+            )
+            remote_items = submitted.get("items") if isinstance(submitted.get("items"), list) else []
+            remote = next(
+                (
+                    item
+                    for item in remote_items
+                    if isinstance(item, dict) and str(item.get("request_id") or "").strip() == request_id
+                ),
+                {},
+            )
+            if not remote:
+                return {"ok": False, "error": "支付链接生成服务未返回当前账号任务"}
+            deadline = time.monotonic() + max(float(os.getenv("OPENAI_PAY_LONG_LINK_JOB_TIMEOUT_SECONDS") or 1800), 5.0)
+            while str(remote.get("status") or "").strip().lower() in {"queued", "running"}:
+                batch_id = str(remote.get("batch_id") or submitted.get("batch_id") or "").strip()
+                if not batch_id:
+                    return {"ok": False, "error": "支付链接生成服务未返回远端批次 ID"}
+                if time.monotonic() >= deadline:
+                    return {"ok": False, "error": "支付链接远端任务轮询超时，结果状态未知"}
+                time.sleep(max(float(os.getenv("OPENAI_PAY_LONG_LINK_POLL_INTERVAL_SECONDS") or 2.0), 0.2))
+                batch = client.get_batch(batch_id)
+                remote = next(
+                    (
+                        item
+                        for item in (batch.get("items") if isinstance(batch.get("items"), list) else [])
+                        if isinstance(item, dict) and str(item.get("request_id") or "").strip() == request_id
+                    ),
+                    {},
                 )
-                data = {
-                    **generated,
+                if not remote:
+                    return {"ok": False, "error": "支付链接远端批次未返回当前账号任务"}
+            remote_status = str(remote.get("status") or "").strip().lower()
+            if remote_status != "done":
+                detail = str(remote.get("error") or "支付链接生成失败").strip()
+                if remote_status == "interrupted":
+                    detail = f"远端任务中断: {detail}"
+                return {"ok": False, "error": detail}
+            try:
+                data = payment_link_from_remote_job(remote, profile=payment_profile)
+            except LongLinkPaymentError as exc:
+                return {"ok": False, "error": str(exc)}
+            data.update(
+                {
                     "plan": "plus",
-                    "country": country,
-                    "currency": str(generated.get("currency") or currency).strip().upper(),
-                    "proxy": "",
-                    "payment_link_format": PAYMENT_LINK_FORMAT_PAYPAL,
-                    "payment_source": PAYMENT_SOURCE_LONG_LINK_PAYPAL,
-                    "profile_hash": payment_profile_hash,
-                    "billing": billing,
+                    "country": str(data.get("country") or country).strip().upper(),
+                    "currency": str(data.get("currency") or currency).strip().upper(),
                     "cache_reused": False,
-                    "cache_source": PAYMENT_SOURCE_LONG_LINK_PAYPAL,
+                    "cache_source": PAYMENT_SOURCE_LONG_LINK,
                 }
-                return {
-                    "ok": bool(generated.get("url")),
-                    "data": data,
-                    "account_extra_patch": defaults_patch,
-                }
-            url = generate_plus_link(
-                a,
-                proxy=payment_proxy,
-                country=country,
-                currency=currency,
-                billing=billing,
-                link_format=payment_link_format,
             )
             return {
-                "ok": bool(url),
-                "data": {
-                    "url": url,
-                    "plan": plan,
-                    "country": country,
-                    "currency": currency,
-                    "proxy": payment_proxy,
-                    "payment_link_format": payment_link_format,
-                    "payment_source": payment_source,
-                    "profile_hash": payment_profile_hash,
-                    "billing": billing,
-                    "cache_reused": False,
-                    "cache_source": "payment_link_action",
-                },
-                "account_extra_patch": defaults_patch,
+                "ok": bool(data.get("url")),
+                "data": data,
+                "account_extra_patch": {},
             }
 
         if action_id == "resume_subscription_auth":

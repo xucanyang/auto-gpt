@@ -31,8 +31,10 @@ PAYMENT_LINK_REGENERATE_STATUSES = {
 }
 PAYMENT_LINK_STATUS_SYNC_STATUSES = {"already_paid"}
 PAYMENT_LINK_FORMAT_PAYPAL = "paypal_url"
+PAYMENT_LINK_FORMAT_LONG_LINK = "long_link"
 PAYMENT_SOURCE_CHATGPT_HOSTED = "chatgpt_hosted"
 PAYMENT_SOURCE_LONG_LINK_PAYPAL = "long_link_paypal"
+PAYMENT_SOURCE_LONG_LINK = "long_link"
 RETIRED_PAYMENT_REQUEST_KEYS = frozenset({
     "promo_code",
     "workspace_name",
@@ -70,6 +72,8 @@ def normalize_payment_link_status(value: Any) -> str:
 
 def normalize_payment_link_output_format(value: Any) -> str:
     text = str(value or "").strip().lower().replace("-", "_")
+    if text in {"long_link", "longlink", "admin_long_link", "configured_long_link"}:
+        return PAYMENT_LINK_FORMAT_LONG_LINK
     if text in {"paypal", "paypal_url", "paypal_approval", "provider_url"}:
         return PAYMENT_LINK_FORMAT_PAYPAL
     return normalize_payment_link_format(value)
@@ -77,6 +81,8 @@ def normalize_payment_link_output_format(value: Any) -> str:
 
 def normalize_payment_link_source(value: Any) -> str:
     text = str(value or "").strip().lower().replace("-", "_")
+    if text in {"long_link", "longlink_config", "admin_long_link", "configured_long_link"}:
+        return PAYMENT_SOURCE_LONG_LINK
     if text in {
         "long_link_paypal",
         "longlink_paypal",
@@ -121,14 +127,22 @@ def normalize_payment_link_params(params: dict[str, Any] | None) -> dict[str, An
     currency = normalize_checkout_currency(source.get("currency"), country)
     payment_source = normalize_payment_link_source(source.get("payment_source"))
     payment_link_format = normalize_payment_link_output_format(source.get("payment_link_format"))
-    if payment_source == PAYMENT_SOURCE_LONG_LINK_PAYPAL:
+    if payment_source in {PAYMENT_SOURCE_LONG_LINK, PAYMENT_SOURCE_LONG_LINK_PAYPAL}:
         plan = "plus"
-        payment_link_format = PAYMENT_LINK_FORMAT_PAYPAL
+        payment_link_format = (
+            PAYMENT_LINK_FORMAT_LONG_LINK
+            if payment_source == PAYMENT_SOURCE_LONG_LINK
+            else PAYMENT_LINK_FORMAT_PAYPAL
+        )
     return {
         "plan": plan,
         "country": country,
         "currency": currency,
-        "proxy": "" if payment_source == PAYMENT_SOURCE_LONG_LINK_PAYPAL else normalize_proxy_url(source.get("proxy")) or "",
+        "proxy": (
+            ""
+            if payment_source in {PAYMENT_SOURCE_LONG_LINK, PAYMENT_SOURCE_LONG_LINK_PAYPAL}
+            else normalize_proxy_url(source.get("proxy")) or ""
+        ),
         "payment_link_format": payment_link_format,
         "payment_source": payment_source,
         "profile_hash": str(source.get("profile_hash") or source.get("payment_profile_hash") or "").strip(),
@@ -168,14 +182,14 @@ def payment_link_cache_matches(
     )
     if not matches:
         return False
-    if expected["payment_source"] == PAYMENT_SOURCE_LONG_LINK_PAYPAL:
+    if expected["payment_source"] in {PAYMENT_SOURCE_LONG_LINK, PAYMENT_SOURCE_LONG_LINK_PAYPAL}:
         return bool(expected["profile_hash"]) and cached_profile_hash == expected["profile_hash"]
     return True
 
 
 def normalize_payment_link_url(value: Any, link_format: Any = None) -> str:
     normalized_format = normalize_payment_link_output_format(link_format or DEFAULT_PAYMENT_LINK_FORMAT)
-    if normalized_format == PAYMENT_LINK_FORMAT_PAYPAL:
+    if normalized_format in {PAYMENT_LINK_FORMAT_PAYPAL, PAYMENT_LINK_FORMAT_LONG_LINK}:
         return str(value or "").strip()
     return normalize_checkout_url_for_link_format(value, normalized_format)
 
@@ -196,6 +210,8 @@ def build_payment_link_cache_payload(
     raw_payment_source = payload_source.get("payment_source")
     if not str(raw_payment_source or "").strip() and link_format == PAYMENT_LINK_FORMAT_PAYPAL:
         raw_payment_source = PAYMENT_SOURCE_LONG_LINK_PAYPAL
+    if not str(raw_payment_source or "").strip() and link_format == PAYMENT_LINK_FORMAT_LONG_LINK:
+        raw_payment_source = PAYMENT_SOURCE_LONG_LINK
     payment_source = normalize_payment_link_source(raw_payment_source or fallback_source.get("payment_source"))
     fallback_format = normalize_payment_link_output_format(
         fallback_source.get("payment_link_format") or DEFAULT_PAYMENT_LINK_FORMAT
@@ -267,9 +283,14 @@ def build_payment_link_cache_payload(
         "plan": plan,
         "country": country,
         "currency": currency,
+        "link_type": str(
+            payload_source.get("link_type")
+            or metadata_fallback.get("link_type")
+            or ""
+        ).strip().lower(),
         "proxy": (
             ""
-            if payment_source == PAYMENT_SOURCE_LONG_LINK_PAYPAL
+            if payment_source in {PAYMENT_SOURCE_LONG_LINK, PAYMENT_SOURCE_LONG_LINK_PAYPAL}
             else normalize_proxy_url(payload_source.get("proxy") or metadata_fallback.get("proxy")) or ""
         ),
         "payment_link_format": link_format,
@@ -284,6 +305,13 @@ def build_payment_link_cache_payload(
         "source": str(source or payload_source.get("source") or metadata_fallback.get("source") or "").strip(),
         "created_at": str(
             payload_source.get("created_at")
+            or metadata_fallback.get("created_at")
+            or datetime.now(timezone.utc).isoformat()
+        ),
+        "generated_at": str(
+            payload_source.get("generated_at")
+            or metadata_fallback.get("generated_at")
+            or payload_source.get("created_at")
             or metadata_fallback.get("created_at")
             or datetime.now(timezone.utc).isoformat()
         ),
@@ -338,6 +366,7 @@ def build_payment_link_cache_payload(
         "processor_entity",
         "remote_job_id",
         "remote_request_id",
+        "generated_at",
         "billing_country",
         "payment_locale",
         "amount_display",

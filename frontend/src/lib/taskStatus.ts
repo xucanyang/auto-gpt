@@ -1,5 +1,5 @@
-export type NormalizedTaskStatus = 'pending' | 'running' | 'done' | 'failed' | 'stopped' | 'unknown'
-export type TaskTerminalStatus = Extract<NormalizedTaskStatus, 'done' | 'failed' | 'stopped'>
+export type NormalizedTaskStatus = 'pending' | 'running' | 'done' | 'failed' | 'stopped' | 'partial' | 'interrupted' | 'unknown'
+export type TaskTerminalStatus = Extract<NormalizedTaskStatus, 'done' | 'failed' | 'stopped' | 'partial' | 'interrupted'>
 
 const PENDING_TASK_STATUSES = new Set(['pending', 'queued', 'created', 'waiting'])
 const RUNNING_TASK_STATUSES = new Set([
@@ -15,6 +15,8 @@ const RUNNING_TASK_STATUSES = new Set([
 ])
 const DONE_TASK_STATUSES = new Set(['done', 'success', 'succeeded', 'complete', 'completed'])
 const FAILED_TASK_STATUSES = new Set(['failed', 'failure', 'error'])
+const PARTIAL_TASK_STATUSES = new Set(['partial', 'partial_failure'])
+const INTERRUPTED_TASK_STATUSES = new Set(['interrupted', 'remote_interrupted'])
 const STOPPED_TASK_STATUSES = new Set([
   'stopped',
   'cancelled',
@@ -30,6 +32,8 @@ export function normalizeTaskStatus(value: unknown): NormalizedTaskStatus {
   if (RUNNING_TASK_STATUSES.has(normalized)) return 'running'
   if (DONE_TASK_STATUSES.has(normalized)) return 'done'
   if (FAILED_TASK_STATUSES.has(normalized)) return 'failed'
+  if (PARTIAL_TASK_STATUSES.has(normalized)) return 'partial'
+  if (INTERRUPTED_TASK_STATUSES.has(normalized)) return 'interrupted'
   if (STOPPED_TASK_STATUSES.has(normalized)) return 'stopped'
   return 'unknown'
 }
@@ -43,5 +47,7 @@ export function isActiveTaskStatus(value: unknown): boolean {
 
 export function getTaskTerminalStatus(value: unknown): TaskTerminalStatus | null {
   const status = normalizeTaskStatus(value)
-  return status === 'done' || status === 'failed' || status === 'stopped' ? status : null
+  return status === 'done' || status === 'failed' || status === 'stopped' || status === 'partial' || status === 'interrupted'
+    ? status
+    : null
 }

@@ -238,12 +238,12 @@ export function AccountsToolbar({
   const paymentLinkMenuItems: MenuProps['items'] = [
     {
       key: 'normal',
-      label: '生成订阅链接（可复用缓存）',
+      label: '支付链接生成（可复用缓存）',
       disabled: paymentLinkDisabled,
     },
     {
       key: 'force',
-      label: '强制重新生成订阅链接',
+      label: '强制重新生成',
       disabled: paymentLinkDisabled,
     },
   ]
@@ -350,7 +350,7 @@ export function AccountsToolbar({
       case 'paymentLink':
         return buildNestedMenuItem(
           actionId,
-          '批量订阅链接',
+          '支付链接生成',
           batchPaymentLinkLoading ? <SyncOutlined spin /> : <LinkOutlined />,
           paymentLinkMenuItems,
           paymentLinkDisabled || batchPaymentLinkLoading,
@@ -593,7 +593,7 @@ export function AccountsToolbar({
               loading={batchPaymentLinkLoading}
               disabled={paymentLinkDisabled}
             >
-              批量订阅链接 <DownOutlined />
+              支付链接生成 <DownOutlined />
             </Button>
           </Dropdown>
         )

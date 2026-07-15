@@ -127,7 +127,7 @@ class PaymentLinkSourceTests(unittest.TestCase):
             )
         )
 
-    def test_plugin_routes_long_link_paypal_without_calling_hosted_generator(self):
+    def test_plugin_uses_active_long_link_profile_without_calling_hosted_generator(self):
         account = Account(
             platform="chatgpt",
             email="paypal@example.com",
@@ -137,24 +137,34 @@ class PaymentLinkSourceTests(unittest.TestCase):
         client = mock.Mock()
         client.get_profile.return_value = {
             "profile_hash": PROFILE_HASH,
+            "link_type": "paypal",
             "country": "GB",
             "currency": "GBP",
             "profile": {},
         }
-        client.generate_paypal_link.return_value = {
-            "url": PAYPAL_URL,
-            "paypal_url": PAYPAL_URL,
-            "provider_redirect_url": PAYPAL_URL,
-            "payment_source": "long_link_paypal",
-            "payment_link_format": "paypal_url",
-            "profile_hash": PROFILE_HASH,
-            "currency": "GBP",
-            "cs_id": "cs_live_123",
+        client.submit_batch.return_value = {
+            "batch_id": "batch_" + "a" * 32,
+            "items": [
+                {
+                    "batch_id": "batch_" + "a" * 32,
+                    "job_id": "job-1",
+                    "request_id": "batch-1:42",
+                    "profile_hash": PROFILE_HASH,
+                    "status": "done",
+                    "completed_at": 1_720_000_000,
+                    "result": {
+                        "provider_redirect_url": PAYPAL_URL,
+                        "link_type": "paypal",
+                        "currency": "GBP",
+                        "cs_id": "cs_live_123",
+                    },
+                }
+            ],
         }
         platform = ChatGPTPlatform(config=RegisterConfig(extra={}))
 
         with mock.patch(
-            "services.chatgpt_core.long_link_paypal_client.LongLinkPayPalClient.from_env",
+            "services.chatgpt_core.long_link_payment_client.LongLinkPaymentClient.from_env",
             return_value=client,
         ), mock.patch("services.chatgpt_core.payment.generate_plus_link") as hosted_plus:
             result = platform.execute_action(
@@ -162,20 +172,26 @@ class PaymentLinkSourceTests(unittest.TestCase):
                 account,
                 {
                     "plan": "plus",
-                    "payment_source": "long_link_paypal",
+                    "payment_source": "chatgpt_hosted",
+                    "payment_link_format": "short_chatgpt",
+                    "country": "ID",
                     "request_id": "batch-1:42",
                 },
             )
 
         self.assertTrue(result["ok"])
         self.assertEqual(result["data"]["url"], PAYPAL_URL)
-        self.assertEqual(result["data"]["payment_link_format"], "paypal_url")
+        self.assertEqual(result["data"]["payment_link_format"], "long_link")
+        self.assertEqual(result["data"]["payment_source"], "long_link")
+        self.assertEqual(result["data"]["link_type"], "paypal")
+        self.assertEqual(result["data"]["paypal_url"], PAYPAL_URL)
         self.assertEqual(result["data"]["profile_hash"], PROFILE_HASH)
-        client.generate_paypal_link.assert_called_once_with(
-            access_token="access-token-secret",
-            request_id="batch-1:42",
+        client.get_profile.assert_called_once_with()
+        client.submit_batch.assert_called_once_with(
+            items=[{"access_token": "access-token-secret", "request_id": "batch-1:42"}],
             expected_profile_hash=PROFILE_HASH,
         )
+        client.get_batch.assert_not_called()
         hosted_plus.assert_not_called()
 
 

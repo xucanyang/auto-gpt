@@ -82,7 +82,8 @@ const AccountActionSurface = lazy(() =>
 
 const GOPAY_ACTIVE_PHASES = new Set(['created', 'starting', 'waiting_otp', 'waiting_link_pin', 'waiting_payment_pin', 'verifying'])
 const TASK_MODAL_STORAGE_KEY = 'auto-chatgpt.accounts.task-modal.current-task'
-const ACCOUNT_COLUMN_VISIBILITY_STORAGE_KEY = 'auto-chatgpt.accounts.visible-columns.v2'
+const ACCOUNT_COLUMN_VISIBILITY_STORAGE_KEY = 'auto-chatgpt.accounts.visible-columns.v3'
+const LEGACY_ACCOUNT_COLUMN_VISIBILITY_STORAGE_KEY = 'auto-chatgpt.accounts.visible-columns.v2'
 const PHONE_BINDING_SETTINGS_STORAGE_KEY = 'auto-chatgpt.accounts.phone-binding-settings.v1'
 const BAXIGPT_CDK_SETTINGS_STORAGE_KEY = 'auto-chatgpt.accounts.baxigpt-cdk-settings.v1'
 const PAYPAL_BINDING_SETTINGS_STORAGE_KEY = 'auto-chatgpt.accounts.paypal-binding-settings.v1'
@@ -107,18 +108,6 @@ function gopayPhaseMeta(phase?: string) {
 const REGISTER_FORM_SETTINGS_STORAGE_PREFIX = 'auto-chatgpt.register-form-settings.'
 const DEFAULT_CHECKOUT_COUNTRY = 'ID'
 const DEFAULT_CHECKOUT_CURRENCY = 'IDR'
-const DEFAULT_PAYMENT_SOURCE = 'local_hosted'
-const LONG_LINK_PAYPAL_SOURCE = 'long_link_paypal'
-const DEFAULT_PAYMENT_LINK_FORMAT = 'long_hosted'
-const PAYPAL_PAYMENT_LINK_FORMAT = 'paypal_url'
-const PAYMENT_SOURCE_OPTIONS = [
-  { label: '本地 Hosted', value: DEFAULT_PAYMENT_SOURCE },
-  { label: 'PayPal API（使用 long-link 当前配置）', value: LONG_LINK_PAYPAL_SOURCE },
-]
-const PAYMENT_LINK_FORMAT_OPTIONS = [
-  { label: '长支付链接', value: 'long_hosted' },
-  { label: '短连接路径', value: 'short_chatgpt' },
-]
 const DEFAULT_GOPAY_OTP_AUTO_RESEND_DELAY_SECONDS = 120
 const ACCOUNTS_PAGE_SIZE_STORAGE_KEY = 'auto-chatgpt.accounts.page-size.v1'
 const ACCOUNT_TOOLBAR_ACTION_VISIBILITY_STORAGE_KEY = 'auto-chatgpt.accounts.toolbar-actions.v1'
@@ -131,7 +120,7 @@ const DEFAULT_PINNED_ACCOUNT_TOOLBAR_ACTIONS: AccountToolbarActionId[] = ['statu
 
 const ACCOUNT_TOOLBAR_ACTION_OPTIONS: Array<{ value: AccountToolbarActionId; text: string }> = [
   { value: 'statusSync', text: '状态同步' },
-  { value: 'paymentLink', text: '批量订阅链接' },
+  { value: 'paymentLink', text: '支付链接生成' },
   { value: 'resumeAuth', text: '批量补抓Auth' },
   { value: 'backfill', text: '远端补传' },
   { value: 'invalidRecheck', text: '批量失效测活' },
@@ -358,12 +347,32 @@ type AccountColumnKey =
   | 'subscription_active_until'
   | 'account_validity'
   | 'idea_submit_status'
+  | 'payment_link'
   | 'codex_usage'
   | 'sub2api_state'
   | 'sub2api_upload_record'
   | 'oaipay_state'
   | 'oaipay_upload_record'
   | 'created_at'
+
+type PaymentLinkProfile = {
+  link_type?: string
+  country?: string
+  billing_country?: string
+  currency?: string
+  checkout_ui_mode?: string
+  payment_locale?: string
+  client_fingerprint?: string
+  proxy_chain_strategy?: string
+  effective_concurrency?: number
+  profile_hash?: string
+  proxy_configured?: boolean
+  regions?: Record<string, string>
+  pix?: {
+    request_preset?: string
+    seed_pool_configured?: boolean
+  }
+}
 
 const ACCOUNT_COLUMN_OPTIONS: Array<{ value: AccountColumnKey; text: string; chatgptOnly?: boolean }> = [
   { value: 'manually_used', text: '使用状态' },
@@ -375,6 +384,7 @@ const ACCOUNT_COLUMN_OPTIONS: Array<{ value: AccountColumnKey; text: string; cha
   { value: 'subscription_active_until', text: '订阅到期', chatgptOnly: true },
   { value: 'account_validity', text: '认证状态', chatgptOnly: true },
   { value: 'idea_submit_status', text: 'Idea提交', chatgptOnly: true },
+  { value: 'payment_link', text: '支付链接', chatgptOnly: true },
   { value: 'codex_usage', text: 'Codex用量', chatgptOnly: true },
   { value: 'sub2api_state', text: 'Sub2API', chatgptOnly: true },
   { value: 'sub2api_upload_record', text: 'Sub2API上传', chatgptOnly: true },
@@ -392,6 +402,7 @@ const DEFAULT_VISIBLE_ACCOUNT_COLUMNS: AccountColumnKey[] = [
   'subscription_active_until',
   'account_validity',
   'idea_submit_status',
+  'payment_link',
   'codex_usage',
   'sub2api_state',
   'sub2api_upload_record',
@@ -682,36 +693,6 @@ function normalizeCheckoutCountry(value: unknown) {
 
 function normalizeCheckoutCurrency(value: unknown) {
   return String(value || DEFAULT_CHECKOUT_CURRENCY).trim().toUpperCase() || DEFAULT_CHECKOUT_CURRENCY
-}
-
-function normalizePaymentLinkFormat(value: unknown) {
-  const normalized = String(value || '').trim().toLowerCase().replace(/-/g, '_')
-  if (normalized === PAYPAL_PAYMENT_LINK_FORMAT || normalized === 'paypal') return PAYPAL_PAYMENT_LINK_FORMAT
-  return normalized === 'short' || normalized === 'short_chatgpt' || normalized === 'chatgpt' || normalized === 'custom'
-    ? 'short_chatgpt'
-    : DEFAULT_PAYMENT_LINK_FORMAT
-}
-
-function paymentLinkFormatLabel(value: unknown) {
-  const normalized = normalizePaymentLinkFormat(value)
-  if (normalized === PAYPAL_PAYMENT_LINK_FORMAT) return 'PayPal 链接'
-  return normalized === 'short_chatgpt' ? '短连接路径' : '长支付链接'
-}
-
-function normalizePaymentSource(value: unknown, paymentLinkFormat?: unknown) {
-  const normalized = String(value || '').trim().toLowerCase().replace(/-/g, '_')
-  if (normalized === DEFAULT_PAYMENT_SOURCE) return DEFAULT_PAYMENT_SOURCE
-  if (normalized === LONG_LINK_PAYPAL_SOURCE || normalizePaymentLinkFormat(paymentLinkFormat) === PAYPAL_PAYMENT_LINK_FORMAT) {
-    return LONG_LINK_PAYPAL_SOURCE
-  }
-  return DEFAULT_PAYMENT_SOURCE
-}
-
-function paymentSourceLabel(value: unknown, paymentLinkFormat?: unknown) {
-  const normalized = String(value || '').trim().toLowerCase().replace(/-/g, '_')
-  if (normalized === LONG_LINK_PAYPAL_SOURCE) return 'PayPal API'
-  if (normalizePaymentLinkFormat(paymentLinkFormat) === PAYPAL_PAYMENT_LINK_FORMAT) return 'PayPal 链接'
-  return '本地 Hosted'
 }
 
 function normalizeGopayOtpAutoResendDelay(value: unknown) {
@@ -1198,11 +1179,16 @@ function normalizeVisibleAccountColumns(value: unknown): AccountColumnKey[] {
   return Array.from(new Set(normalized))
 }
 
-function loadVisibleAccountColumnKeys() {
+function loadVisibleAccountColumnKeys(): AccountColumnKey[] {
   if (typeof window === 'undefined') return [...DEFAULT_VISIBLE_ACCOUNT_COLUMNS]
   try {
     const raw = window.localStorage.getItem(ACCOUNT_COLUMN_VISIBILITY_STORAGE_KEY)
-    if (!raw) return [...DEFAULT_VISIBLE_ACCOUNT_COLUMNS]
+    if (!raw) {
+      const legacyRaw = window.localStorage.getItem(LEGACY_ACCOUNT_COLUMN_VISIBILITY_STORAGE_KEY)
+      if (!legacyRaw) return [...DEFAULT_VISIBLE_ACCOUNT_COLUMNS]
+      const legacyColumns = normalizeVisibleAccountColumns(JSON.parse(legacyRaw))
+      return legacyColumns.includes('payment_link') ? legacyColumns : [...legacyColumns, 'payment_link'] as AccountColumnKey[]
+    }
     return normalizeVisibleAccountColumns(JSON.parse(raw))
   } catch {
     return [...DEFAULT_VISIBLE_ACCOUNT_COLUMNS]
@@ -2168,6 +2154,9 @@ export default function Accounts() {
   const [baxiCdkPoolSummaryLoading, setBaxiCdkPoolSummaryLoading] = useState(false)
   const [batchPaymentLinkConfigOpen, setBatchPaymentLinkConfigOpen] = useState(false)
   const [batchPaymentLinkForceRefresh, setBatchPaymentLinkForceRefresh] = useState(false)
+  const [batchPaymentLinkProfile, setBatchPaymentLinkProfile] = useState<PaymentLinkProfile | null>(null)
+  const [batchPaymentLinkProfileLoading, setBatchPaymentLinkProfileLoading] = useState(false)
+  const [batchPaymentLinkProfileError, setBatchPaymentLinkProfileError] = useState('')
   const [batchProbeStatusConfigOpen, setBatchProbeStatusConfigOpen] = useState(false)
   const [batchProbeStatusConfigScope, setBatchProbeStatusConfigScope] = useState<'selected' | 'all'>('selected')
 
@@ -2178,7 +2167,6 @@ export default function Accounts() {
   const [phoneBindingTestForm] = Form.useForm()
   const [baxiCdkSubmitForm] = Form.useForm()
   const [paypalBindingForm] = Form.useForm()
-  const [batchPaymentLinkConfigForm] = Form.useForm()
   const [batchProbeStatusConfigForm] = Form.useForm()
   const [filterPresetForm] = Form.useForm()
   const phoneBindingUsePoolValue = Form.useWatch('use_pool', phoneBindingTestForm)
@@ -3597,49 +3585,51 @@ export default function Accounts() {
     }
   }
 
-  const handleBatchPaymentLink = async (options: { forceRefresh?: boolean } = {}) => {
-    const forceRefresh = Boolean(options.forceRefresh)
-    let defaults: Record<string, any> = {}
+  const loadBatchPaymentLinkProfile = async (): Promise<PaymentLinkProfile | null> => {
+    setBatchPaymentLinkProfileLoading(true)
+    setBatchPaymentLinkProfileError('')
     try {
-      const cfg = await loadConfigCache({ force: true })
-      defaults = parseMaybeJsonObject(cfg.chatgpt_payment_link_defaults)
-    } catch {
-      defaults = {}
+      const profile = await apiFetch('/tasks/chatgpt/payment-links/profile') as PaymentLinkProfile
+      if (!profile || !String(profile.profile_hash || '').trim()) {
+        throw new Error('long-link 未返回当前配置标识')
+      }
+      setBatchPaymentLinkProfile(profile)
+      return profile
+    } catch (e: any) {
+      const detail = String(e?.message || '无法读取 long-link 管理端当前配置')
+      setBatchPaymentLinkProfile(null)
+      setBatchPaymentLinkProfileError(detail)
+      return null
+    } finally {
+      setBatchPaymentLinkProfileLoading(false)
     }
-    const paymentSource = normalizePaymentSource(defaults.payment_source, defaults.payment_link_format)
-    batchPaymentLinkConfigForm.setFieldsValue({
-      payment_source: paymentSource,
-      payment_link_format: paymentSource === LONG_LINK_PAYPAL_SOURCE
-        ? DEFAULT_PAYMENT_LINK_FORMAT
-        : normalizePaymentLinkFormat(defaults.payment_link_format),
-    })
-    setBatchPaymentLinkForceRefresh(forceRefresh)
+  }
+
+  const handleBatchPaymentLink = (options: { forceRefresh?: boolean } = {}) => {
+    setBatchPaymentLinkForceRefresh(Boolean(options.forceRefresh))
+    setBatchPaymentLinkProfile(null)
+    setBatchPaymentLinkProfileError('')
     setBatchPaymentLinkConfigOpen(true)
+    void loadBatchPaymentLinkProfile()
   }
 
   const submitBatchPaymentLinkConfig = async () => {
-    const values = await batchPaymentLinkConfigForm.validateFields()
+    const profile = await loadBatchPaymentLinkProfile()
+    if (!profile) return
     const scope: 'selected' | 'filtered' = selectedRowKeys.length > 0 ? 'selected' : 'filtered'
     const forceRefresh = Boolean(batchPaymentLinkForceRefresh)
-    const paymentSource = normalizePaymentSource(values.payment_source, values.payment_link_format)
-    const isPayPalApi = paymentSource === LONG_LINK_PAYPAL_SOURCE
-    const paymentLinkFormat = isPayPalApi
-      ? PAYPAL_PAYMENT_LINK_FORMAT
-      : normalizePaymentLinkFormat(values.payment_link_format)
     const toastKey = `payment-link:${scope}:${forceRefresh ? 'force' : 'normal'}`
     const body: Record<string, unknown> = {
-      skip_existing: isPayPalApi ? false : !forceRefresh,
-      force_refresh: isPayPalApi ? true : forceRefresh,
+      skip_existing: !forceRefresh,
+      force_refresh: forceRefresh,
       params: {
-        payment_source: paymentSource,
-        payment_link_format: paymentLinkFormat,
-        ...(isPayPalApi ? { reuse_cached_link: false } : {}),
+        reuse_cached_link: !forceRefresh,
       },
     }
-    const actionLabel = forceRefresh ? '强制重新生成订阅链接' : '批量订阅链接'
+    const actionLabel = forceRefresh ? '强制重新生成支付链接' : '支付链接生成'
     const requestedCount = applyAccountTaskScopeToBody(body, {
       scope,
-      emptySelectedMessage: `请先选择要${forceRefresh ? '强制重新生成' : '生成'}订阅链接的账号`,
+      emptySelectedMessage: `请先选择要${forceRefresh ? '强制重新生成' : '生成'}支付链接的账号`,
     })
     if (requestedCount === null) return
 
@@ -3657,7 +3647,7 @@ export default function Accounts() {
 
       if (!taskIdFromResponse) {
         message.info({
-          content: `没有可${forceRefresh ? '重新生成' : '生成'}订阅链接的账号。请求 ${requestedCount} 个，跳过 ${skipped} 个${missing > 0 ? `，缺失 ${missing} 个` : ''}`,
+          content: `没有可${forceRefresh ? '重新生成' : '生成'}支付链接的账号。请求 ${requestedCount} 个，跳过 ${skipped} 个${missing > 0 ? `，缺失 ${missing} 个` : ''}`,
           key: toastKey,
         })
         if (res && typeof res === 'object') {
@@ -3675,7 +3665,7 @@ export default function Accounts() {
       setActiveTasksPanelOpen(true)
       void activeTasksQuery.refetch()
       message.success({
-        content: `${actionLabel}任务已启动：${paymentSourceLabel(paymentSource, paymentLinkFormat)} · ${paymentLinkFormatLabel(paymentLinkFormat)}，可执行 ${eligible} 个，跳过 ${skipped} 个${missing > 0 ? `，缺失 ${missing} 个` : ''}`,
+        content: `${actionLabel}任务已启动：${String(profile.link_type || 'long-link').toUpperCase()} · ${(profile.country || profile.billing_country || '-').toUpperCase()} / ${(profile.currency || '-').toUpperCase()} · 并发 ${profile.effective_concurrency || '-'}，可执行 ${eligible} 个，跳过 ${skipped} 个${missing > 0 ? `，缺失 ${missing} 个` : ''}`,
         key: toastKey,
       })
       showBatchActionResult(`${actionLabel}结果`, res)
@@ -5856,6 +5846,67 @@ export default function Accounts() {
     return <Tag color={meta.color} style={compactTagStyle}>{meta.label}</Tag>
   }
 
+  const renderPaymentLinkState = (record: any) => {
+    const link = record?.chatgptLastPaymentLink && typeof record.chatgptLastPaymentLink === 'object'
+      ? record.chatgptLastPaymentLink
+      : record?.extra?.chatgpt_last_payment_link && typeof record.extra.chatgpt_last_payment_link === 'object'
+        ? record.extra.chatgpt_last_payment_link
+        : {}
+    const url = String(link.url || '').trim()
+    const status = String(link.link_status || '').trim().toLowerCase()
+    const format = String(link.payment_link_format || '').trim().toLowerCase()
+    const linkType = String(link.link_type || '').trim().toUpperCase()
+      || (format === 'paypal_url' ? 'PAYPAL' : format === 'long_link' ? 'LONG-LINK' : '历史')
+    const generatedAt = formatCompactDateTime(String(link.generated_at || link.created_at || '').trim())
+    const statusMeta = (() => {
+      if (status === 'invalid' || status === 'precheck_failed') return { color: 'error', label: status === 'invalid' ? '无效' : '校验失败' }
+      if (status === 'already_paid' || status === 'paid') return { color: 'success', label: '已支付' }
+      if (status === 'leased') return { color: 'processing', label: '已领取' }
+      if (status) return { color: 'default', label: status }
+      return { color: url ? 'success' : 'default', label: url ? '已生成' : '无记录' }
+    })()
+
+    if (!url && !status) return <Text type="secondary">-</Text>
+
+    return (
+      <Space direction="vertical" size={2} style={{ maxWidth: 172 }}>
+        <Space size={5} wrap>
+          <Tag color="blue" style={compactTagStyle}>{linkType}</Tag>
+          <Tag color={statusMeta.color} style={compactTagStyle}>{statusMeta.label}</Tag>
+        </Space>
+        {generatedAt ? (
+          <Text type="secondary" style={{ fontSize: 11 }} title={`生成时间: ${generatedAt.title}`}>
+            {generatedAt.compact}
+          </Text>
+        ) : null}
+        {url ? (
+          <Space size={0}>
+            <Button
+              title="复制支付链接"
+              type="text"
+              size="small"
+              icon={<CopyOutlined />}
+              onClick={(event) => {
+                event.stopPropagation()
+                void copyText(url)
+              }}
+            />
+            <Button
+              title="打开支付链接"
+              type="text"
+              size="small"
+              icon={<LinkOutlined />}
+              onClick={(event) => {
+                event.stopPropagation()
+                window.open(url, '_blank', 'noopener,noreferrer')
+              }}
+            />
+          </Space>
+        ) : null}
+      </Space>
+    )
+  }
+
   const renderOaipayUploadRecord = (record: any) => {
     const sync = record.oaipaySync && typeof record.oaipaySync === 'object' ? record.oaipaySync : {}
     const lastUpload = sync.last_upload && typeof sync.last_upload === 'object' ? sync.last_upload : {}
@@ -5994,8 +6045,8 @@ export default function Accounts() {
 
     return [
       { key: '__detail__', label: '账号详情' },
-      ...(paymentLinkAction ? [{ key: '__payment_link_config__', label: '订阅链接配置' }] : []),
-      ...(paymentLinkAction ? [{ key: '__payment_link_regenerate__', label: '重新生成订阅链接' }] : []),
+      ...(paymentLinkAction ? [{ key: '__payment_link_config__', label: '支付链接生成' }] : []),
+      ...(paymentLinkAction ? [{ key: '__payment_link_regenerate__', label: '强制重新生成' }] : []),
       ...(isChatgptPlatform && shouldShowResumeAuthButton(record) ? [{ key: '__resume_auth_config__', label: '补抓Auth临时配置' }] : []),
       ...moreActions.map((action: any) => ({
         key: String(action.id),
@@ -6063,7 +6114,7 @@ export default function Accounts() {
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 8 }}>
           {paymentLinkAction ? (
             <Button size="small" style={mobileActionButtonStyle(accountActionTextStyles.payment)} onClick={() => openAccountPaymentLinkAction(record)}>
-              订阅链接
+              支付链接生成
             </Button>
           ) : null}
           <Button size="small" style={mobileActionButtonStyle(accountActionTextStyles.refresh)} onClick={() => openAccountProbeStatusAction(record)}>
@@ -6113,7 +6164,7 @@ export default function Accounts() {
               style={accountActionTextStyles.payment}
               onClick={() => openAccountPaymentLinkAction(record)}
             >
-              订阅链接
+              支付链接生成
             </Button>
           ) : null}
           <Button
@@ -6266,6 +6317,7 @@ export default function Accounts() {
       isChatgptPlatform && isColumnVisible('sub2api_upload_record') ? renderSub2ApiUploadRecord(record) : null,
       isChatgptPlatform && isColumnVisible('oaipay_state') ? renderOaipayState(record) : null,
       isChatgptPlatform && isColumnVisible('oaipay_upload_record') ? renderOaipayUploadRecord(record) : null,
+      isChatgptPlatform && isColumnVisible('payment_link') ? renderPaymentLinkState(record) : null,
     ].filter(Boolean)
 
     return (
@@ -6628,6 +6680,12 @@ export default function Accounts() {
         key: 'idea_submit_status',
         width: 128,
         render: (_: any, record: any) => renderIdeaSubmitState(record),
+      },
+      {
+        title: '支付链接',
+        key: 'payment_link',
+        width: 176,
+        render: (_: any, record: any) => renderPaymentLinkState(record),
       },
       {
         title: 'Codex用量',
@@ -7583,20 +7641,20 @@ export default function Accounts() {
       />
 
       <Modal
-        title={batchPaymentLinkForceRefresh ? '强制重新生成订阅链接' : '批量生成订阅链接'}
+        title={batchPaymentLinkForceRefresh ? '强制重新生成支付链接' : '支付链接生成'}
         open={batchPaymentLinkConfigOpen}
         onCancel={() => setBatchPaymentLinkConfigOpen(false)}
         onOk={submitBatchPaymentLinkConfig}
         confirmLoading={batchPaymentLinkLoading}
+        okButtonProps={{ disabled: batchPaymentLinkProfileLoading || Boolean(batchPaymentLinkProfileError) }}
         okText={batchPaymentLinkForceRefresh ? '开始重新生成' : '开始生成'}
         cancelText="取消"
         maskClosable={false}
       >
-        <Form form={batchPaymentLinkConfigForm} layout="vertical">
+        <Space direction="vertical" size={12} style={{ width: '100%' }}>
           <Alert
             type="info"
             showIcon
-            style={{ marginBottom: 12 }}
             message={
               selectedRowKeys.length > 0
                 ? `范围：当前选中 ${selectedRowKeys.length} 个账号`
@@ -7604,45 +7662,55 @@ export default function Accounts() {
             }
             description={
               batchPaymentLinkForceRefresh
-                ? '会绕过已有缓存重新生成，但账号已失效时仍会跳过。'
-                : '本地 Hosted 可按账号缓存跳过；PayPal API 始终为每个可执行账号创建新链接。'
+                ? '全部账号会先提交给 long-link，再统一轮询远端批次；已有同配置缓存不会复用。'
+                : '全部账号会先提交给 long-link，再统一轮询远端批次；仅当前管理端配置哈希相同的缓存可复用。'
             }
           />
-          <Form.Item
-            name="payment_source"
-            label="生成方式"
-            initialValue={DEFAULT_PAYMENT_SOURCE}
-            rules={[{ required: true, message: '请选择生成方式' }]}
-          >
-            <Select options={PAYMENT_SOURCE_OPTIONS} />
-          </Form.Item>
-          <Form.Item noStyle shouldUpdate={(prev, next) => prev.payment_source !== next.payment_source}>
-            {({ getFieldValue }) => {
-              const paymentSource = normalizePaymentSource(getFieldValue('payment_source'))
-              if (paymentSource === LONG_LINK_PAYPAL_SOURCE) {
-                return (
-                  <Alert
-                    type="info"
-                    showIcon
-                    style={{ marginBottom: 12, overflowWrap: 'anywhere' }}
-                    message="PayPal API · 使用 long-link 当前配置"
-                    description="使用 long-link 已保存的 PayPal 国家、货币和代理链；不读取本地 Hosted 的套餐、国家、货币、代理或缓存参数。批量任务按账号处理。"
-                  />
-                )
-              }
-              return (
-                <Form.Item
-                  name="payment_link_format"
-                  label="生成路径"
-                  initialValue={DEFAULT_PAYMENT_LINK_FORMAT}
-                  rules={[{ required: true, message: '请选择生成路径' }]}
-                >
-                  <Select options={PAYMENT_LINK_FORMAT_OPTIONS} />
-                </Form.Item>
-              )
-            }}
-          </Form.Item>
-        </Form>
+          {batchPaymentLinkProfileLoading ? (
+            <Alert type="info" showIcon message="正在读取 long-link 管理端当前配置..." />
+          ) : null}
+          {batchPaymentLinkProfileError ? (
+            <Space direction="vertical" size={8} style={{ width: '100%' }}>
+              <Alert type="error" showIcon message="无法读取 long-link 管理端配置" description={batchPaymentLinkProfileError} />
+              <Button size="small" style={{ alignSelf: 'flex-start' }} onClick={() => void loadBatchPaymentLinkProfile()}>
+                重新读取
+              </Button>
+            </Space>
+          ) : null}
+          {batchPaymentLinkProfile ? (
+            <>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 10 }}>
+                <div>
+                  <Text type="secondary" style={{ display: 'block', fontSize: 12 }}>支付类型</Text>
+                  <Tag color="blue" style={{ marginTop: 4 }}>{String(batchPaymentLinkProfile.link_type || 'hosted').toUpperCase()}</Tag>
+                </div>
+                <div>
+                  <Text type="secondary" style={{ display: 'block', fontSize: 12 }}>国家 / 币种</Text>
+                  <Text>{`${batchPaymentLinkProfile.country || batchPaymentLinkProfile.billing_country || '-'} / ${batchPaymentLinkProfile.currency || '-'}`}</Text>
+                </div>
+                <div>
+                  <Text type="secondary" style={{ display: 'block', fontSize: 12 }}>有效并发</Text>
+                  <Text>{batchPaymentLinkProfile.effective_concurrency || '-'}</Text>
+                </div>
+                <div>
+                  <Text type="secondary" style={{ display: 'block', fontSize: 12 }}>Checkout 模式</Text>
+                  <Text>{batchPaymentLinkProfile.checkout_ui_mode || '-'}</Text>
+                </div>
+                <div>
+                  <Text type="secondary" style={{ display: 'block', fontSize: 12 }}>代理链</Text>
+                  <Text>{batchPaymentLinkProfile.proxy_configured ? '已配置' : '未配置'}</Text>
+                </div>
+                <div>
+                  <Text type="secondary" style={{ display: 'block', fontSize: 12 }}>配置哈希</Text>
+                  <Text code title={batchPaymentLinkProfile.profile_hash}>{String(batchPaymentLinkProfile.profile_hash || '-').slice(0, 16)}</Text>
+                </div>
+              </div>
+              <Text type="secondary" style={{ fontSize: 12 }}>
+                long-link 在任务启动时再次冻结当前配置；代理、指纹和密钥不会暴露到本页。
+              </Text>
+            </>
+          ) : null}
+        </Space>
       </Modal>
 
       <Modal

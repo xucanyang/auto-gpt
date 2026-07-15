@@ -134,6 +134,8 @@ def _to_codex_account(acc: AccountModel):
     a = _Acc()
     a.email = acc.email
     a.access_token = extra.get("access_token") or acc.token
+    # Keep the legacy adapter compatible with the platform Account contract.
+    a.token = a.access_token
     a.refresh_token = extra.get("refresh_token", "")
     a.id_token = extra.get("id_token", "")
     a.session_token = extra.get("session_token", "")
@@ -892,14 +894,11 @@ def refresh_token(account_id: int, proxy: Optional[str] = None,
     raise HTTPException(400, result.error_message)
 
 
-# ── 生成支付链接 ────────────────────────────────────────────
+# ── 支付链接生成 ────────────────────────────────────────────
 class PaymentReq(BaseModel):
     plan: str = "plus"
-    country: str = "ID"
-    currency: str = "IDR"
-    proxy: Optional[str] = None
-    payment_link_format: str = "long_hosted"
-    save_defaults: bool = True
+    reuse_cached_link: bool = True
+    force_refresh: bool = False
 
 
 class GoPayStartReq(BaseModel):
@@ -3429,67 +3428,43 @@ async def close_browser_auth(account_id: int, capture_id: str, req: BrowserAuthC
 @router.post("/{account_id}/payment-link")
 def generate_payment_link(account_id: int, req: PaymentReq,
                           session: Session = Depends(get_session)):
-    acc = _get_account(account_id, session)
-    codex_acc = _to_codex_account(acc)
+    """Compatibility URL for single-account payment-link generation.
 
-    from services.chatgpt_core.payment import (
-        generate_plus_link,
-        normalize_checkout_country,
-        normalize_checkout_currency,
-        normalize_payment_link_format,
-    )
+    The request deliberately exposes no local checkout controls.  Older
+    clients may still send country/currency/proxy/format fields, but Pydantic
+    ignores them and the active long-link admin profile is authoritative.
+    """
+
+    acc = _get_account(account_id, session)
+    from api.actions import _apply_action_result
+    from core.base_platform import RegisterConfig
+    from services.chatgpt_core import ChatGPTPlatform
+    from services.chatgpt_core.long_link_payment_client import LongLinkPaymentError
 
     plan = str(req.plan or "plus").strip().lower()
     if plan != "plus":
         raise HTTPException(400, "Only the Plus payment plan is supported")
-    country = normalize_checkout_country(req.country)
-    currency = normalize_checkout_currency(req.currency, country)
-    payment_link_format = normalize_payment_link_format(req.payment_link_format)
-    proxy = _resolve_optional_checkout_proxy(req.proxy)
-    url = generate_plus_link(
-        codex_acc,
-        proxy=proxy,
-        country=country,
-        currency=currency,
-        link_format=payment_link_format,
-    )
-    acc.cashier_url = str(url or "")
-    mark_payment_pending(acc, reason="payment_link_generated")
-    extra = acc.get_extra()
-    extra["chatgpt_last_payment_link"] = {
-        "url": str(url or ""),
-        "plan": plan,
-        "country": country,
-        "currency": currency,
-        "proxy": proxy,
-        "payment_link_format": payment_link_format,
-    }
-    if req.save_defaults:
-        defaults_payload = {
-            "plan": plan,
-            "country": country,
-            "currency": currency,
-            "proxy": proxy,
-            "payment_link_format": payment_link_format,
-        }
-        extra["chatgpt_payment_link_defaults"] = defaults_payload
-        try:
-            config_store.set("chatgpt_payment_link_defaults", json.dumps(defaults_payload, ensure_ascii=False))
-        except Exception:
-            pass
-    acc.set_extra(extra)
-    from datetime import datetime, timezone
-    acc.updated_at = datetime.now(timezone.utc)
-    session.add(acc)
+
+    try:
+        result = ChatGPTPlatform(config=RegisterConfig(extra={})).execute_action(
+            "payment_link",
+            _to_codex_account(acc),
+            {
+                "plan": "plus",
+                "reuse_cached_link": bool(req.reuse_cached_link) and not bool(req.force_refresh),
+            },
+        )
+    except LongLinkPaymentError as exc:
+        raise HTTPException(503, str(exc)[:600]) from exc
+    except Exception as exc:
+        raise HTTPException(502, f"支付链接生成失败: {str(exc)[:600]}") from exc
+
+    if not result.get("ok"):
+        raise HTTPException(502, str(result.get("error") or "支付链接生成失败")[:600])
+    _apply_action_result("chatgpt", "payment_link", acc, result, session)
     session.commit()
-    return {
-        "url": url,
-        "plan": plan,
-        "country": country,
-        "currency": currency,
-        "proxy": proxy,
-        "payment_link_format": payment_link_format,
-    }
+    data = result.get("data") if isinstance(result.get("data"), dict) else {}
+    return data
 
 
 @router.post("/{account_id}/gopay/start")

@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 import api.actions as api_actions
 from fastapi import HTTPException
-from sqlmodel import Session, SQLModel, create_engine
+from sqlmodel import Session, SQLModel, create_engine, select
 from core.task_runtime import StopTaskRequested
 from api.tasks import (
     BatchPaymentLinkTaskRequest,
@@ -25,7 +25,7 @@ from api.tasks import (
     _run_resume_subscription_auth,
     _task_store,
 )
-from core.db import AccountModel
+from core.db import AccountModel, PaymentLinkGenerationModel
 from core.base_mailbox import BaseMailbox, MailboxAccount
 from core.base_platform import Account, BasePlatform
 from core import db as core_db
@@ -1243,6 +1243,95 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
         self.assertNotIn("+13333333333", "\n".join(snapshot["logs"]))
 
 
+class _FakeLongLinkPaymentClient:
+    batch_id = "batch_" + "a" * 32
+
+    def __init__(
+        self,
+        *,
+        profile: dict | None = None,
+        submitted_status: str = "queued",
+        polled_status: str = "done",
+    ):
+        self.profile = dict(
+            profile
+            or {
+                "profile_hash": "profile-hash-brl",
+                "link_type": "pix",
+                "country": "BR",
+                "currency": "BRL",
+                "effective_concurrency": 4,
+                "profile": {},
+            }
+        )
+        self.submitted_status = submitted_status
+        self.polled_status = polled_status
+        self.events: list[tuple] = []
+        self.submissions: list[dict] = []
+        self._items: list[dict] = []
+
+    def get_profile(self, *, force_refresh: bool = False):
+        self.events.append(("profile", force_refresh))
+        return dict(self.profile)
+
+    def _remote_item(self, item: dict, index: int, status: str) -> dict:
+        terminal = status not in {"queued", "running"}
+        remote = {
+            "batch_id": self.batch_id,
+            "job_id": f"job-{index}",
+            "request_id": str(item["request_id"]),
+            "profile_hash": str(self.profile["profile_hash"]),
+            "status": status,
+            "created_at": 1_720_000_000,
+            "started_at": 1_720_000_001 if status != "queued" else None,
+            "completed_at": 1_720_000_002 if terminal else None,
+        }
+        if status == "done":
+            remote["result"] = {
+                "url": f"https://pay.example.test/{index}",
+                "link_type": str(self.profile["link_type"]),
+                "billing_country": str(self.profile["country"]),
+                "currency": str(self.profile["currency"]),
+            }
+        elif terminal:
+            remote["error"] = "remote task interrupted" if status == "interrupted" else "remote task failed"
+        return remote
+
+    def submit_batch(self, *, items: list[dict], expected_profile_hash: str):
+        self.events.append(("submit", len(items)))
+        self.submissions.append(
+            {
+                "items": [dict(item) for item in items],
+                "expected_profile_hash": expected_profile_hash,
+            }
+        )
+        self._items = [self._remote_item(item, index, self.submitted_status) for index, item in enumerate(items, start=1)]
+        return {
+            "batch_id": self.batch_id,
+            "batch_ids": [self.batch_id],
+            "items": [dict(item) for item in self._items],
+            "summary": {"total": len(self._items), "status": self.submitted_status},
+        }
+
+    def get_batch(self, batch_id: str):
+        self.events.append(("poll", batch_id))
+        assert batch_id == self.batch_id
+        items = [
+            self._remote_item(
+                {"request_id": item["request_id"]},
+                index,
+                self.polled_status,
+            )
+            for index, item in enumerate(self._items, start=1)
+        ]
+        return {
+            "batch_id": self.batch_id,
+            "status": self.polled_status,
+            "summary": {"total": len(items), "status": self.polled_status},
+            "items": items,
+        }
+
+
 class BatchPaymentLinkTaskTests(unittest.TestCase):
     def setUp(self):
         self.engine = create_engine("sqlite://")
@@ -1261,27 +1350,17 @@ class BatchPaymentLinkTaskTests(unittest.TestCase):
         *,
         email: str,
         status: str = "registered",
-        link_status: str = "",
-        cached_url: str = "https://pay.example.test/cached",
-        country: str = "US",
-        currency: str = "USD",
+        token: str | None = None,
+        cached: dict | None = None,
     ) -> int:
-        extra = {
-            "chatgpt_last_payment_link": {
-                "url": cached_url,
-                "plan": "plus",
-                "country": country,
-                "currency": currency,
-                "proxy": "",
-                "link_status": link_status,
-            }
-        }
+        extra = {"chatgpt_last_payment_link": dict(cached)} if isinstance(cached, dict) else {}
         with Session(self.engine) as session:
             row = AccountModel(
                 platform="chatgpt",
                 email=email,
                 password="pw",
                 status=status,
+                token=token if token is not None else f"access-token-{email}",
             )
             row.set_extra(extra)
             session.add(row)
@@ -1314,281 +1393,249 @@ class BatchPaymentLinkTaskTests(unittest.TestCase):
             },
         )
 
-    def test_batch_payment_link_regenerates_invalid_cached_link(self):
-        task_id = "task-batch-payment-invalid-cache"
-        account_id = self._add_account(email="invalid-cache@example.com", link_status="invalid")
-        self._create_payment_link_task(task_id, account_id, "invalid-cache@example.com")
-        calls = []
-
-        def _fake_execute(_instance, _platform, _account, _action, params, _session):
-            calls.append(dict(params))
-            return {
-                "ok": True,
-                "data": {
-                    "url": "https://pay.example.test/new",
-                    "plan": "plus",
-                    "country": "US",
-                    "currency": "USD",
-                    "cache_reused": False,
-                },
-            }
-
-        class _FakeChatGPTPlatform:
-            def __init__(self, config=None):
-                self.config = config
-
-        with (
-            patch("services.chatgpt_core.ChatGPTPlatform", _FakeChatGPTPlatform),
-            patch("core.config_store.config_store.get_all", return_value={}),
-            patch.object(api_actions, "_execute_platform_action", side_effect=_fake_execute),
-            patch("api.tasks._save_task_log"),
-        ):
-            _run_batch_payment_links(task_id, [account_id])
-
-        self.assertEqual(len(calls), 1)
-        self.assertIs(calls[0]["reuse_cached_link"], False)
-        snapshot = _task_store.snapshot(task_id)
-        self.assertEqual(snapshot["success"], 1)
-        self.assertTrue(any("缓存订阅链接无效，重新生成" in line for line in snapshot["logs"]))
-
-    def test_batch_payment_link_syncs_already_paid_instead_of_generating(self):
-        task_id = "task-batch-payment-already-paid"
-        account_id = self._add_account(email="already-paid-link@example.com", link_status="already_paid")
-        self._create_payment_link_task(task_id, account_id, "already-paid-link@example.com")
-
-        with (
-            patch("services.chatgpt_core.ChatGPTPlatform"),
-            patch("core.config_store.config_store.get_all", return_value={}),
-            patch.object(api_actions, "_execute_platform_action") as execute_action,
-            patch("api.tasks._sync_payment_link_account_status", return_value={"status": "subscribed"}) as sync_status,
-            patch("api.tasks._save_task_log"),
-        ):
-            _run_batch_payment_links(task_id, [account_id])
-
-        execute_action.assert_not_called()
-        sync_status.assert_called_once()
-        snapshot = _task_store.snapshot(task_id)
-        self.assertEqual(snapshot["success"], 0)
-        self.assertEqual(snapshot["skipped"], 1)
-        self.assertTrue(any("已经支付过，开始同步账号状态" in line for line in snapshot["logs"]))
-
-    def test_batch_payment_link_regenerates_legacy_fixed_fragment_cache(self):
-        task_id = "task-batch-payment-regenerate-legacy-cache"
-        account_id = self._add_account(
-            email="legacy-cache@example.com",
-            cached_url="https://chatgpt.com/checkout/openai_llc/cs_live_cached123",
-            country="US",
-            currency="USD",
-        )
+    def test_batch_payment_link_submits_all_accounts_before_bulk_poll_and_persists_results(self):
+        task_id = "task-batch-payment-submit-then-poll"
+        first_id = self._add_account(email="first@example.com")
+        second_id = self._add_account(email="second@example.com")
         _create_standalone_task_record(
             task_id,
             platform="chatgpt",
             source="batch_payment_link",
-            total=1,
+            total=2,
             meta={
-                "account_ids": [account_id],
-                "emails": ["legacy-cache@example.com"],
-                "params": {"country": "US", "currency": "USD"},
+                "account_ids": [first_id, second_id],
+                "emails": ["first@example.com", "second@example.com"],
+                "params": {},
                 "skip_existing": True,
                 "force_refresh": False,
                 "skipped_items": [],
                 "missing_ids": [],
             },
         )
-        calls = []
+        client = _FakeLongLinkPaymentClient()
 
-        def _fake_execute(_instance, _platform, _account, _action, params, _session):
-            calls.append(dict(params))
-            url = "https://pay.openai.com/c/pay/cs_live_regenerated#fid_real"
-            extra = _account.get_extra()
-            extra["chatgpt_last_payment_link"] = {
-                "url": url,
+        with (
+            patch(
+                "services.chatgpt_core.long_link_payment_client.LongLinkPaymentClient.from_env",
+                return_value=client,
+            ),
+            patch("api.tasks._save_task_log"),
+        ):
+            _run_batch_payment_links(task_id, [first_id, second_id])
+
+        self.assertEqual(client.events, [("profile", True), ("submit", 2), ("poll", client.batch_id)])
+        self.assertEqual(len(client.submissions), 1)
+        submission = client.submissions[0]
+        self.assertEqual(submission["expected_profile_hash"], "profile-hash-brl")
+        self.assertEqual(
+            submission["items"],
+            [
+                {"account_id": first_id, "email": "first@example.com", "request_id": f"auto-gpt:{task_id}:{first_id}", "access_token": "access-token-first@example.com"},
+                {"account_id": second_id, "email": "second@example.com", "request_id": f"auto-gpt:{task_id}:{second_id}", "access_token": "access-token-second@example.com"},
+            ],
+        )
+        snapshot = _task_store.snapshot(task_id)
+        self.assertEqual(snapshot["status"], "done")
+        self.assertEqual(snapshot["success"], 2)
+        self.assertEqual(snapshot["meta"]["payment_link_batch_ids"], [client.batch_id])
+
+        with Session(self.engine) as session:
+            generations = session.exec(select(PaymentLinkGenerationModel).order_by(PaymentLinkGenerationModel.account_id)).all()
+            first = session.get(AccountModel, first_id)
+            second = session.get(AccountModel, second_id)
+        self.assertEqual(len(generations), 2)
+        self.assertTrue(all(row.status == "succeeded" for row in generations))
+        self.assertTrue(all(row.remote_batch_id == client.batch_id for row in generations))
+        self.assertTrue(all(row.generated_at for row in generations))
+        for account in (first, second):
+            cache = account.get_extra()["chatgpt_last_payment_link"]
+            self.assertEqual(cache["payment_source"], "long_link")
+            self.assertEqual(cache["payment_link_format"], "long_link")
+            self.assertEqual(cache["link_type"], "pix")
+            self.assertEqual(cache["profile_hash"], "profile-hash-brl")
+            self.assertTrue(cache["generated_at"])
+
+    def test_batch_payment_link_syncs_already_paid_instead_of_generating(self):
+        task_id = "task-batch-payment-already-paid"
+        account_id = self._add_account(
+            email="already-paid-link@example.com",
+            cached={
+                "url": "https://pay.example.test/already-paid",
+                "plan": "plus",
+                "country": "BR",
+                "currency": "BRL",
+                "payment_link_format": "long_link",
+                "payment_source": "long_link",
+                "profile_hash": "profile-hash-brl",
+                "link_status": "already_paid",
+            },
+        )
+        self._create_payment_link_task(task_id, account_id, "already-paid-link@example.com")
+        client = _FakeLongLinkPaymentClient()
+
+        with (
+            patch(
+                "services.chatgpt_core.long_link_payment_client.LongLinkPaymentClient.from_env",
+                return_value=client,
+            ),
+            patch("api.tasks._sync_payment_link_account_status", return_value={"status": "subscribed"}) as sync_status,
+            patch("api.tasks._save_task_log"),
+        ):
+            _run_batch_payment_links(task_id, [account_id])
+
+        self.assertEqual(client.submissions, [])
+        sync_status.assert_called_once()
+        snapshot = _task_store.snapshot(task_id)
+        self.assertEqual(snapshot["success"], 0)
+        self.assertEqual(snapshot["skipped"], 1)
+        self.assertTrue(any("已经支付过，开始同步账号状态" in line for line in snapshot["logs"]))
+
+    def test_batch_payment_link_replaces_legacy_hosted_cache_with_active_profile_link(self):
+        task_id = "task-batch-payment-regenerate-legacy-cache"
+        account_id = self._add_account(
+            email="legacy-cache@example.com",
+            cached={
+                "url": "https://chatgpt.com/checkout/openai_llc/cs_live_cached123",
                 "plan": "plus",
                 "country": "US",
                 "currency": "USD",
                 "payment_link_format": "long_hosted",
-            }
-            _account.cashier_url = url
-            _account.set_extra(extra)
-            _session.add(_account)
-            return {
-                "ok": True,
-                "data": {
-                    "url": url,
-                    "plan": "plus",
-                    "country": "US",
-                    "currency": "USD",
-                    "payment_link_format": "long_hosted",
-                    "cache_reused": False,
-                },
-            }
+                "payment_source": "chatgpt_hosted",
+            },
+        )
+        self._create_payment_link_task(task_id, account_id, "legacy-cache@example.com")
+        client = _FakeLongLinkPaymentClient()
 
         with (
-            patch("services.chatgpt_core.ChatGPTPlatform"),
-            patch("core.config_store.config_store.get_all", return_value={}),
-            patch("core.config_store.config_store.get", return_value=""),
-            patch.object(api_actions, "_execute_platform_action", side_effect=_fake_execute),
+            patch(
+                "services.chatgpt_core.long_link_payment_client.LongLinkPaymentClient.from_env",
+                return_value=client,
+            ),
             patch("api.tasks._save_task_log"),
         ):
             _run_batch_payment_links(task_id, [account_id])
 
-        self.assertEqual(len(calls), 1)
-        self.assertIs(calls[0]["reuse_cached_link"], True)
+        self.assertEqual(len(client.submissions), 1)
         snapshot = _task_store.snapshot(task_id)
         self.assertEqual(snapshot["success"], 1)
         self.assertEqual(snapshot["skipped"], 0)
-        self.assertEqual(snapshot["cashier_urls"], ["https://pay.openai.com/c/pay/cs_live_regenerated#fid_real"])
 
         with Session(self.engine) as session:
             row = session.get(AccountModel, account_id)
-        self.assertEqual(row.cashier_url, "https://pay.openai.com/c/pay/cs_live_regenerated#fid_real")
-        self.assertEqual(row.get_extra()["chatgpt_last_payment_link"]["url"], "https://pay.openai.com/c/pay/cs_live_regenerated#fid_real")
+        cache = row.get_extra()["chatgpt_last_payment_link"]
+        self.assertEqual(cache["payment_source"], "long_link")
+        self.assertEqual(cache["payment_link_format"], "long_link")
+        self.assertEqual(cache["country"], "BR")
+        self.assertEqual(cache["currency"], "BRL")
 
-    def test_batch_payment_link_short_format_does_not_reuse_long_cached_link(self):
-        task_id = "task-batch-payment-short-format"
+    def test_batch_payment_link_reuses_matching_profile_cache_unless_force_refresh(self):
         account_id = self._add_account(
-            email="short-format@example.com",
-            cached_url="https://pay.openai.com/c/pay/cs_live_cached_long",
-            country="US",
-            currency="USD",
+            email="reuse-profile@example.com",
+            cached={
+                "url": "https://pay.example.test/cached-profile",
+                "plan": "plus",
+                "country": "BR",
+                "currency": "BRL",
+                "payment_link_format": "long_link",
+                "payment_source": "long_link",
+                "profile_hash": "profile-hash-brl",
+                "link_type": "pix",
+            },
         )
-        self._create_payment_link_task(
-            task_id,
-            account_id,
-            "short-format@example.com",
-            params={"country": "US", "currency": "USD", "payment_link_format": "short_chatgpt"},
-        )
-        calls = []
-
-        def _fake_execute(_instance, _platform, _account, _action, params, _session):
-            calls.append(dict(params))
-            return {
-                "ok": True,
-                "data": {
-                    "url": "https://chatgpt.com/checkout/openai_llc/cs_live_short_new",
-                    "plan": "plus",
-                    "country": "US",
-                    "currency": "USD",
-                    "payment_link_format": "short_chatgpt",
-                    "cache_reused": False,
-                },
-            }
-
-        class _FakeChatGPTPlatform:
-            def __init__(self, config=None):
-                self.config = config
+        cached_task_id = "task-batch-payment-reuse-profile"
+        self._create_payment_link_task(cached_task_id, account_id, "reuse-profile@example.com")
+        cached_client = _FakeLongLinkPaymentClient()
 
         with (
-            patch("services.chatgpt_core.ChatGPTPlatform", _FakeChatGPTPlatform),
-            patch("core.config_store.config_store.get_all", return_value={}),
-            patch("core.config_store.config_store.get", return_value=""),
-            patch.object(api_actions, "_execute_platform_action", side_effect=_fake_execute),
+            patch(
+                "services.chatgpt_core.long_link_payment_client.LongLinkPaymentClient.from_env",
+                return_value=cached_client,
+            ),
             patch("api.tasks._save_task_log"),
         ):
-            _run_batch_payment_links(task_id, [account_id])
+            _run_batch_payment_links(cached_task_id, [account_id])
 
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0]["payment_link_format"], "short_chatgpt")
-        self.assertIs(calls[0]["reuse_cached_link"], True)
-        snapshot = _task_store.snapshot(task_id)
-        self.assertEqual(snapshot["success"], 1)
-        self.assertEqual(snapshot["skipped"], 0)
+        self.assertEqual(cached_client.events, [("profile", True)])
+        cached_snapshot = _task_store.snapshot(cached_task_id)
+        self.assertEqual(cached_snapshot["success"], 0)
+        self.assertEqual(cached_snapshot["skipped"], 1)
 
-    def test_batch_payment_link_force_refresh_regenerates_existing_link(self):
-        task_id = "task-batch-payment-force-refresh"
-        account_id = self._add_account(email="force-refresh@example.com")
+        fresh_task_id = "task-batch-payment-force-refresh"
         self._create_payment_link_task(
-            task_id,
+            fresh_task_id,
             account_id,
-            "force-refresh@example.com",
+            "reuse-profile@example.com",
             force_refresh=True,
         )
-        calls = []
-
-        def _fake_execute(_instance, _platform, _account, _action, params, _session):
-            calls.append(dict(params))
-            return {
-                "ok": True,
-                "data": {
-                    "url": "https://pay.example.test/fresh",
-                    "plan": "plus",
-                    "country": "US",
-                    "currency": "USD",
-                    "cache_reused": False,
-                },
-            }
-
-        class _FakeChatGPTPlatform:
-            def __init__(self, config=None):
-                self.config = config
-
+        fresh_client = _FakeLongLinkPaymentClient()
         with (
-            patch("services.chatgpt_core.ChatGPTPlatform", _FakeChatGPTPlatform),
-            patch("core.config_store.config_store.get_all", return_value={}),
-            patch.object(api_actions, "_execute_platform_action", side_effect=_fake_execute),
+            patch(
+                "services.chatgpt_core.long_link_payment_client.LongLinkPaymentClient.from_env",
+                return_value=fresh_client,
+            ),
             patch("api.tasks._save_task_log"),
         ):
-            _run_batch_payment_links(task_id, [account_id])
+            _run_batch_payment_links(fresh_task_id, [account_id])
 
-        self.assertEqual(len(calls), 1)
-        self.assertIs(calls[0]["reuse_cached_link"], False)
-        snapshot = _task_store.snapshot(task_id)
-        self.assertEqual(snapshot["success"], 1)
-        self.assertEqual(snapshot["skipped"], 0)
+        self.assertEqual(len(fresh_client.submissions), 1)
+        self.assertEqual(_task_store.snapshot(fresh_task_id)["success"], 1)
 
-    def test_batch_payment_link_paypal_prefetches_and_pins_profile(self):
-        task_id = "task-batch-payment-paypal-profile"
-        account_id = self._add_account(email="paypal-profile@example.com")
-        self._create_payment_link_task(
-            task_id,
-            account_id,
-            "paypal-profile@example.com",
-            force_refresh=True,
-            params={"payment_source": "long_link_paypal"},
-        )
-        calls = []
-        paypal_client = unittest.mock.Mock()
-        paypal_client.get_profile.return_value = {
-            "profile_hash": "profile-hash-123",
+    def test_batch_payment_link_mirrors_paypal_result_and_marks_remote_interruption(self):
+        paypal_profile = {
+            "profile_hash": "profile-hash-paypal",
+            "link_type": "paypal",
             "country": "GB",
             "currency": "GBP",
+            "effective_concurrency": 2,
             "profile": {},
         }
-
-        def _fake_execute(_instance, _platform, _account, _action, params, _session):
-            calls.append(dict(params))
-            return {
-                "ok": True,
-                "data": {
-                    "url": "https://www.paypal.com/agreements/approve?ba_token=BA-123",
-                    "payment_link_format": "paypal_url",
-                    "payment_source": "long_link_paypal",
-                    "profile_hash": "profile-hash-123",
-                    "cache_reused": False,
-                },
-            }
+        paypal_task_id = "task-batch-payment-paypal-result"
+        paypal_account_id = self._add_account(email="paypal-profile@example.com")
+        self._create_payment_link_task(paypal_task_id, paypal_account_id, "paypal-profile@example.com")
+        paypal_client = _FakeLongLinkPaymentClient(profile=paypal_profile)
 
         with (
-            patch("services.chatgpt_core.ChatGPTPlatform"),
-            patch("core.config_store.config_store.get_all", return_value={}),
-            patch("core.config_store.config_store.get", return_value=""),
             patch(
-                "services.chatgpt_core.long_link_paypal_client.LongLinkPayPalClient.from_env",
+                "services.chatgpt_core.long_link_payment_client.LongLinkPaymentClient.from_env",
                 return_value=paypal_client,
             ),
-            patch.object(api_actions, "_execute_platform_action", side_effect=_fake_execute),
             patch("api.tasks._save_task_log"),
         ):
-            _run_batch_payment_links(task_id, [account_id])
+            _run_batch_payment_links(paypal_task_id, [paypal_account_id])
 
-        paypal_client.get_profile.assert_called_once_with(force_refresh=True)
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0]["payment_source"], "long_link_paypal")
-        self.assertEqual(calls[0]["payment_link_format"], "paypal_url")
-        self.assertEqual(calls[0]["profile_hash"], "profile-hash-123")
-        self.assertEqual(calls[0]["country"], "GB")
-        self.assertEqual(calls[0]["currency"], "GBP")
-        self.assertEqual(calls[0]["request_id"], f"auto-gpt:{task_id}:{account_id}")
+        with Session(self.engine) as session:
+            paypal_account = session.get(AccountModel, paypal_account_id)
+            paypal_history = session.exec(
+                select(PaymentLinkGenerationModel).where(PaymentLinkGenerationModel.account_id == paypal_account_id)
+            ).one()
+        paypal_extra = paypal_account.get_extra()
+        self.assertEqual(paypal_extra["chatgpt_last_payment_link"]["link_type"], "paypal")
+        self.assertEqual(paypal_extra["chatgpt_paypal_url"]["paypal_url"], "https://pay.example.test/1")
+        self.assertEqual(paypal_history.status, "succeeded")
+        self.assertEqual(paypal_history.link_type, "paypal")
+
+        interrupted_task_id = "task-batch-payment-interrupted"
+        interrupted_account_id = self._add_account(email="interrupted@example.com")
+        self._create_payment_link_task(interrupted_task_id, interrupted_account_id, "interrupted@example.com")
+        interrupted_client = _FakeLongLinkPaymentClient(submitted_status="interrupted")
+        with (
+            patch(
+                "services.chatgpt_core.long_link_payment_client.LongLinkPaymentClient.from_env",
+                return_value=interrupted_client,
+            ),
+            patch("api.tasks._save_task_log"),
+        ):
+            _run_batch_payment_links(interrupted_task_id, [interrupted_account_id])
+
+        interrupted_snapshot = _task_store.snapshot(interrupted_task_id)
+        self.assertEqual(interrupted_client.events, [("profile", True), ("submit", 1)])
+        self.assertEqual(interrupted_snapshot["status"], "interrupted")
+        self.assertEqual(interrupted_snapshot["meta"]["payment_link_aggregate_status"], "remote_interrupted")
+        with Session(self.engine) as session:
+            interrupted_history = session.exec(
+                select(PaymentLinkGenerationModel).where(PaymentLinkGenerationModel.account_id == interrupted_account_id)
+            ).one()
+        self.assertEqual(interrupted_history.status, "interrupted")
 
     def test_enqueue_batch_payment_link_force_refresh_still_skips_invalid_accounts(self):
         valid_id = self._add_account(email="force-valid@example.com", status="registered")
@@ -1607,7 +1654,7 @@ class BatchPaymentLinkTaskTests(unittest.TestCase):
         self.assertEqual(result["skipped"], 1)
         self.assertEqual([item["account_id"] for item in result["items"]], [valid_id])
         self.assertEqual([item["account_id"] for item in result["skipped_items"]], [invalid_id])
-        self.assertIn("不能生成订阅链接", result["skipped_items"][0]["reason"])
+        self.assertIn("不能生成支付链接", result["skipped_items"][0]["reason"])
         thread_cls.assert_called_once()
 
 

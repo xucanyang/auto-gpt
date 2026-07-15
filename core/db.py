@@ -63,6 +63,47 @@ class AccountModel(SQLModel, table=True):
         self.extra_json = json.dumps(d, ensure_ascii=False)
 
 
+class PaymentLinkGenerationModel(SQLModel, table=True):
+    """Durable, source-neutral history for generated ChatGPT payment links.
+
+    The table deliberately stores only redacted upstream identifiers and the
+    returned link.  Access tokens, proxies and long-link admin configuration
+    secrets remain outside the account database.
+    """
+
+    __tablename__ = "payment_link_generations"
+    __table_args__ = (UniqueConstraint("request_id", name="uq_payment_link_generations_request_id"),)
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    account_id: int = Field(index=True)
+    task_id: str = Field(default="", index=True)
+    request_id: str = Field(default="", index=True)
+    remote_batch_id: str = Field(default="", index=True)
+    remote_job_id: str = Field(default="", index=True)
+    profile_hash: str = Field(default="", index=True)
+    link_type: str = Field(default="", index=True)
+    status: str = Field(default="submitting", index=True)
+    url: str = ""
+    submitted_at: str = ""
+    started_at: str = ""
+    generated_at: str = ""
+    persisted_at: str = ""
+    sanitized_error: str = ""
+    result_json: str = "{}"
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
+
+    def get_result(self) -> dict:
+        try:
+            value = json.loads(self.result_json or "{}")
+        except (TypeError, ValueError):
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    def set_result(self, value: dict | None) -> None:
+        self.result_json = json.dumps(value if isinstance(value, dict) else {}, ensure_ascii=False)
+
+
 def _has_non_empty_text(value: Any) -> bool:
     return bool(str(value or "").strip())
 

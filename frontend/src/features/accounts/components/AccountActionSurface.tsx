@@ -36,18 +36,6 @@ const { Text } = Typography
 const GOPAY_ACTIVE_PHASES = new Set(['created', 'starting', 'waiting_otp', 'waiting_link_pin', 'waiting_payment_pin', 'verifying'])
 const DEFAULT_CHECKOUT_COUNTRY = 'ID'
 const DEFAULT_CHECKOUT_CURRENCY = 'IDR'
-const DEFAULT_PAYMENT_SOURCE = 'local_hosted'
-const LONG_LINK_PAYPAL_SOURCE = 'long_link_paypal'
-const DEFAULT_PAYMENT_LINK_FORMAT = 'long_hosted'
-const PAYPAL_PAYMENT_LINK_FORMAT = 'paypal_url'
-const PAYMENT_SOURCE_OPTIONS = [
-  { label: '本地 Hosted', value: DEFAULT_PAYMENT_SOURCE },
-  { label: 'PayPal API（使用 long-link 当前配置）', value: LONG_LINK_PAYPAL_SOURCE },
-]
-const PAYMENT_LINK_FORMAT_OPTIONS = [
-  { label: '长支付链接', value: 'long_hosted' },
-  { label: '短连接路径', value: 'short_chatgpt' },
-]
 const DEFAULT_GOPAY_OTP_AUTO_RESEND_DELAY_SECONDS = 120
 const PAYMENT_LINK_REFRESH_DELAY_MS = 20_000
 const CHECKOUT_COUNTRY_LABEL_OVERRIDES: Record<string, string> = {
@@ -109,36 +97,6 @@ function normalizeCheckoutCountry(value: unknown) {
 
 function normalizeCheckoutCurrency(value: unknown) {
   return String(value || DEFAULT_CHECKOUT_CURRENCY).trim().toUpperCase() || DEFAULT_CHECKOUT_CURRENCY
-}
-
-function normalizePaymentLinkFormat(value: unknown) {
-  const normalized = String(value || '').trim().toLowerCase().replace(/-/g, '_')
-  if (normalized === PAYPAL_PAYMENT_LINK_FORMAT || normalized === 'paypal') return PAYPAL_PAYMENT_LINK_FORMAT
-  return normalized === 'short' || normalized === 'short_chatgpt' || normalized === 'chatgpt' || normalized === 'custom'
-    ? 'short_chatgpt'
-    : DEFAULT_PAYMENT_LINK_FORMAT
-}
-
-function paymentLinkFormatLabel(value: unknown) {
-  const normalized = normalizePaymentLinkFormat(value)
-  if (normalized === PAYPAL_PAYMENT_LINK_FORMAT) return 'PayPal 链接'
-  return normalized === 'short_chatgpt' ? '短连接路径' : '长支付链接'
-}
-
-function normalizePaymentSource(value: unknown, paymentLinkFormat?: unknown) {
-  const normalized = String(value || '').trim().toLowerCase().replace(/-/g, '_')
-  if (normalized === DEFAULT_PAYMENT_SOURCE) return DEFAULT_PAYMENT_SOURCE
-  if (normalized === LONG_LINK_PAYPAL_SOURCE || normalizePaymentLinkFormat(paymentLinkFormat) === PAYPAL_PAYMENT_LINK_FORMAT) {
-    return LONG_LINK_PAYPAL_SOURCE
-  }
-  return DEFAULT_PAYMENT_SOURCE
-}
-
-function paymentSourceLabel(value: unknown, paymentLinkFormat?: unknown) {
-  const normalized = String(value || '').trim().toLowerCase().replace(/-/g, '_')
-  if (normalized === LONG_LINK_PAYPAL_SOURCE) return 'PayPal API'
-  if (normalizePaymentLinkFormat(paymentLinkFormat) === PAYPAL_PAYMENT_LINK_FORMAT) return 'PayPal 链接'
-  return '本地 Hosted'
 }
 
 function normalizeGopayOtpAutoResendDelay(value: unknown) {
@@ -322,18 +280,6 @@ function formatActionResultText(data: any, fallback: string) {
   return messageText || fallback
 }
 
-function formatCachedPaymentLinkSummary(link: any) {
-  if (!link || typeof link !== 'object') return ''
-  const url = String(link.url || '').trim()
-  if (!url) return ''
-  const plan = String(link.plan || '').trim().toUpperCase() || 'PLUS'
-  const country = String(link.country || '').trim().toUpperCase() || '-'
-  const currency = String(link.currency || '').trim().toUpperCase() || '-'
-  const linkFormat = paymentLinkFormatLabel(link.payment_link_format)
-  const source = paymentSourceLabel(link.payment_source || link.source, link.payment_link_format)
-  return `${source} · ${plan} · ${country} / ${currency} · ${linkFormat}`
-}
-
 export function AccountActionSurface({
   account,
   open,
@@ -374,11 +320,6 @@ export function AccountActionSurface({
   })
   const [checkoutCountriesLoading, setCheckoutCountriesLoading] = useState(false)
   const [checkoutConfigLoading, setCheckoutConfigLoading] = useState(false)
-  const [paymentLinkGlobalDefaults, setPaymentLinkGlobalDefaults] = useState<Record<string, any>>({})
-  const [paymentLinkProxyOptions, setPaymentLinkProxyOptions] = useState<Array<{ label: string; value: string }>>([
-    { label: '不使用代理（直连）', value: '' },
-  ])
-  const [paymentLinkProxyLoading, setPaymentLinkProxyLoading] = useState(false)
   const [gopayForm] = Form.useForm()
   const [gopayInputForm] = Form.useForm()
   const gopayPhoneCountryCode = Form.useWatch('phone_country_code', gopayForm)
@@ -404,7 +345,6 @@ export function AccountActionSurface({
   const [browserAuthText, setBrowserAuthText] = useState('')
   const [browserAuthProxy, setBrowserAuthProxy] = useState('')
   const [browserAuthFreshProfile, setBrowserAuthFreshProfile] = useState(true)
-  const paymentSourceValue = Form.useWatch('payment_source', actionForm)
   const autoHandledActionRef = useRef('')
   const paymentLinkRefreshTimerRef = useRef<number | null>(null)
   const initialActionKey = String(initialActionId || '').trim()
@@ -470,22 +410,6 @@ export function AccountActionSurface({
     setResultOpen(true)
   }
 
-  const cachedPaymentLink = () => (
-    acc.chatgptLastPaymentLink && typeof acc.chatgptLastPaymentLink === 'object'
-      ? acc.chatgptLastPaymentLink
-      : {}
-  )
-
-  const showCachedPaymentLinkResult = (action: any) => {
-    const cachedLink = cachedPaymentLink()
-    const cachedUrl = String(cachedLink.url || '').trim()
-    if (!cachedUrl) return false
-    const label = action?.label || '订阅链接'
-    message.success('已复用缓存订阅链接')
-    showResult(label, 'success', '已复用账号数据中的缓存订阅链接。', cachedUrl)
-    return true
-  }
-
   const copyResultUrl = async () => {
     if (!resultUrl) return
     try {
@@ -507,7 +431,7 @@ export function AccountActionSurface({
     paymentLinkRefreshTimerRef.current = window.setTimeout(() => {
       paymentLinkRefreshTimerRef.current = null
       void Promise.resolve(onRefresh()).catch((e: any) => {
-        message.warning(e?.message || '订阅链接已生成，但刷新账号列表失败')
+        message.warning(e?.message || '支付链接已生成，但刷新账号列表失败')
       })
     }, PAYMENT_LINK_REFRESH_DELAY_MS)
   }
@@ -785,134 +709,6 @@ export function AccountActionSurface({
     } finally {
       setCheckoutConfigLoading(false)
     }
-  }
-
-  const buildPaymentLinkFormValues = (defaults: Record<string, any> = {}) => {
-    const initialCountry = normalizeCheckoutCountry(defaults.country || DEFAULT_CHECKOUT_COUNTRY)
-    const initialCurrency = normalizeCheckoutCurrency(
-      defaults.currency
-      || checkoutCurrencyByCountry[initialCountry]
-      || DEFAULT_CHECKOUT_CURRENCY,
-    )
-    const paymentSource = normalizePaymentSource(defaults.payment_source, defaults.payment_link_format)
-    return {
-      payment_source: paymentSource,
-      plan: 'plus',
-      country: initialCountry,
-      currency: initialCurrency,
-      proxy: String(defaults.proxy || '').trim(),
-      payment_link_format: paymentSource === LONG_LINK_PAYPAL_SOURCE
-        ? PAYPAL_PAYMENT_LINK_FORMAT
-        : normalizePaymentLinkFormat(defaults.payment_link_format),
-      save_defaults: defaults.save_defaults !== false,
-    }
-  }
-
-  const loadPaymentLinkGlobalDefaults = async (force = false) => {
-    if (!force && Object.keys(paymentLinkGlobalDefaults).length > 0) return paymentLinkGlobalDefaults
-    try {
-      const data = await apiFetch('/config')
-      const defaults = parseMaybeJsonObject(data.chatgpt_payment_link_defaults)
-      setPaymentLinkGlobalDefaults(defaults)
-      return defaults
-    } catch {
-      setPaymentLinkGlobalDefaults({})
-      return {}
-    }
-  }
-
-  const loadPaymentLinkProxyOptions = async (force = false, preservedProxy = '') => {
-    if (!force && paymentLinkProxyOptions.length > 1) return paymentLinkProxyOptions
-    setPaymentLinkProxyLoading(true)
-    try {
-      const data = await apiFetch('/proxies')
-      const items = Array.isArray(data) ? data : []
-      const options = [
-        { label: '不使用代理（直连）', value: '' },
-        ...items
-          .filter((item: any) => item && item.is_active !== false && String(item.url || '').trim())
-          .map((item: any) => {
-            const url = String(item.url || '').trim()
-            const region = String(item.region || '').trim()
-            return {
-              label: region ? `${region} · ${url}` : url,
-              value: url,
-            }
-          }),
-      ]
-      const normalizedPreserved = String(preservedProxy || '').trim()
-      if (normalizedPreserved && !options.some((item) => item.value === normalizedPreserved)) {
-        options.push({
-          label: `历史代理 · ${normalizedPreserved}`,
-          value: normalizedPreserved,
-        })
-      }
-      setPaymentLinkProxyOptions(options)
-      return options
-    } catch {
-      const normalizedPreserved = String(preservedProxy || '').trim()
-      const fallbackOptions = normalizedPreserved
-        ? [
-            { label: '不使用代理（直连）', value: '' },
-            { label: `历史代理 · ${normalizedPreserved}`, value: normalizedPreserved },
-          ]
-        : [{ label: '不使用代理（直连）', value: '' }]
-      setPaymentLinkProxyOptions(fallbackOptions)
-      return fallbackOptions
-    } finally {
-      setPaymentLinkProxyLoading(false)
-    }
-  }
-
-  const savePaymentLinkGlobalDefaults = async (values: Record<string, any>) => {
-    const paymentSource = normalizePaymentSource(values.payment_source, values.payment_link_format)
-    const payload = {
-      payment_source: paymentSource,
-      plan: 'plus',
-      country: normalizeCheckoutCountry(values.country),
-      currency: normalizeCheckoutCurrency(values.currency),
-      proxy: String(values.proxy || '').trim(),
-      payment_link_format: paymentSource === LONG_LINK_PAYPAL_SOURCE
-        ? PAYPAL_PAYMENT_LINK_FORMAT
-        : normalizePaymentLinkFormat(values.payment_link_format),
-    }
-    await apiFetch('/config', {
-      method: 'PUT',
-      body: JSON.stringify({
-        data: {
-          chatgpt_payment_link_defaults: JSON.stringify(payload),
-        },
-      }),
-    })
-    setPaymentLinkGlobalDefaults(payload)
-    return payload
-  }
-
-  const buildPaymentLinkDefaults = async () => {
-    const globalDefaults = await loadPaymentLinkGlobalDefaults(true)
-    const accountDefaults = acc.chatgptPaymentLinkDefaults && typeof acc.chatgptPaymentLinkDefaults === 'object'
-      ? acc.chatgptPaymentLinkDefaults
-      : {}
-    return buildPaymentLinkFormValues({ ...globalDefaults, ...accountDefaults })
-  }
-
-  const canReusePaymentLinkCache = (values: Record<string, any>) => {
-    const cachedLink = acc.chatgptLastPaymentLink && typeof acc.chatgptLastPaymentLink === 'object'
-      ? acc.chatgptLastPaymentLink
-      : {}
-    const cachedUrl = String(cachedLink.url || '').trim()
-    if (!cachedUrl) return false
-    const paymentSource = normalizePaymentSource(values.payment_source, values.payment_link_format)
-    if (paymentSource === LONG_LINK_PAYPAL_SOURCE) return false
-    return (
-      normalizePaymentSource(cachedLink.payment_source || cachedLink.source, cachedLink.payment_link_format) === paymentSource
-      &&
-      String(cachedLink.plan || '').trim().toLowerCase() === 'plus'
-      && normalizeCheckoutCountry(cachedLink.country || DEFAULT_CHECKOUT_COUNTRY) === normalizeCheckoutCountry(values.country)
-      && normalizeCheckoutCurrency(cachedLink.currency || DEFAULT_CHECKOUT_CURRENCY) === normalizeCheckoutCurrency(values.currency)
-      && String(cachedLink.proxy || '').trim() === String(values.proxy || '').trim()
-      && normalizePaymentLinkFormat(cachedLink.payment_link_format) === normalizePaymentLinkFormat(values.payment_link_format)
-    )
   }
 
   const buildGopayFormValues = (defaults: Record<string, any>, snapshot: Record<string, any> | null = null) => {
@@ -1299,18 +1095,6 @@ export function AccountActionSurface({
   const openActionDialog = async (action: any) => {
     setActiveAction(action)
     actionForm.resetFields()
-    if (action.id === 'payment_link') {
-      const initialValues = await buildPaymentLinkDefaults()
-      if (normalizePaymentSource(initialValues.payment_source, initialValues.payment_link_format) !== LONG_LINK_PAYPAL_SOURCE) {
-        await loadPaymentLinkProxyOptions(true, String(initialValues.proxy || '').trim())
-      }
-      actionForm.setFieldsValue({
-        ...initialValues,
-        reuse_cached_link: canReusePaymentLinkCache(initialValues),
-      })
-      setActionOpen(true)
-      return
-    }
     const initialValues: Record<string, any> = {}
     for (const param of action.params || []) {
       if (param.default !== undefined) initialValues[param.key] = param.default
@@ -1331,57 +1115,8 @@ export function AccountActionSurface({
   const submitActionDialog = async () => {
     if (!activeAction) return
     const values = await actionForm.validateFields()
-    const params = { ...values }
-    if (activeAction.id === 'payment_link') {
-      params.payment_source = normalizePaymentSource(params.payment_source, params.payment_link_format)
-      params.save_defaults = params.save_defaults !== false
-      if (params.payment_source === LONG_LINK_PAYPAL_SOURCE) {
-        params.payment_link_format = PAYPAL_PAYMENT_LINK_FORMAT
-        params.reuse_cached_link = false
-        for (const key of ['plan', 'country', 'currency', 'proxy']) {
-          delete params[key]
-        }
-      } else {
-        params.plan = 'plus'
-        params.country = normalizeCheckoutCountry(params.country)
-        params.currency = normalizeCheckoutCurrency(params.currency)
-        params.proxy = String(params.proxy || '').trim()
-        params.payment_link_format = normalizePaymentLinkFormat(params.payment_link_format)
-        params.reuse_cached_link = params.reuse_cached_link !== false
-      }
-      if (params.save_defaults) {
-        await savePaymentLinkGlobalDefaults({ ...values, ...params })
-      }
-    }
     setActionOpen(false)
-    await runAction(activeAction, params)
-  }
-
-  const runPaymentLinkWithDefaults = async (action: any, options: { forceRegenerate?: boolean } = {}) => {
-    const values = await buildPaymentLinkDefaults()
-    const paymentSource = normalizePaymentSource(values.payment_source, values.payment_link_format)
-    if (!options.forceRegenerate && canReusePaymentLinkCache(values) && showCachedPaymentLinkResult(action)) return
-    const params = {
-      ...values,
-      payment_source: paymentSource,
-      plan: 'plus',
-      country: normalizeCheckoutCountry(values.country),
-      currency: normalizeCheckoutCurrency(values.currency),
-      proxy: String(values.proxy || '').trim(),
-      payment_link_format: paymentSource === LONG_LINK_PAYPAL_SOURCE
-        ? PAYPAL_PAYMENT_LINK_FORMAT
-        : normalizePaymentLinkFormat(values.payment_link_format),
-      reuse_cached_link: paymentSource === LONG_LINK_PAYPAL_SOURCE || options.forceRegenerate
-        ? false
-        : canReusePaymentLinkCache(values),
-      save_defaults: false,
-    }
-    if (paymentSource === LONG_LINK_PAYPAL_SOURCE) {
-      for (const key of ['plan', 'country', 'currency', 'proxy']) {
-        delete (params as Record<string, any>)[key]
-      }
-    }
-    await runAction(action, params)
+    await runAction(activeAction, values)
   }
 
   useEffect(() => {
@@ -1406,7 +1141,7 @@ export function AccountActionSurface({
     autoHandledActionRef.current = signature
     const runInitialAction = async () => {
       if (resolvedInitialActionId === 'payment_link' && initialActionMode === 'direct') {
-        await runPaymentLinkWithDefaults(matchedAction, { forceRegenerate: shouldForceRegeneratePaymentLink })
+        await runAction(matchedAction, { reuse_cached_link: !shouldForceRegeneratePaymentLink })
         return
       }
       await handleAction(resolvedInitialActionId)
@@ -1433,152 +1168,6 @@ export function AccountActionSurface({
 
   const renderActionFields = () => {
     if (!activeAction) return null
-    if (activeAction.id === 'payment_link') {
-      const selectedPaymentSource = normalizePaymentSource(paymentSourceValue, actionForm.getFieldValue('payment_link_format'))
-      const isPayPalApi = selectedPaymentSource === LONG_LINK_PAYPAL_SOURCE
-      const selectedCountry = normalizeCheckoutCountry(actionForm.getFieldValue('country'))
-      const selectedCurrency = normalizeCheckoutCurrency(actionForm.getFieldValue('currency'))
-      const selectedProxy = String(actionForm.getFieldValue('proxy') || '').trim()
-      const selectedPlan = 'plus'
-      const selectedPaymentLinkFormat = normalizePaymentLinkFormat(actionForm.getFieldValue('payment_link_format'))
-      const cachedLink = acc.chatgptLastPaymentLink && typeof acc.chatgptLastPaymentLink === 'object'
-        ? acc.chatgptLastPaymentLink
-        : {}
-      const cachedUrl = String(cachedLink.url || '').trim()
-      const cachedPlan = String(cachedLink.plan || '').trim().toLowerCase()
-      const cachedCountry = normalizeCheckoutCountry(cachedLink.country || DEFAULT_CHECKOUT_COUNTRY)
-      const cachedCurrency = normalizeCheckoutCurrency(cachedLink.currency || DEFAULT_CHECKOUT_CURRENCY)
-      const cachedProxy = String(cachedLink.proxy || '').trim()
-      const cachedPaymentLinkFormat = normalizePaymentLinkFormat(cachedLink.payment_link_format)
-      const cacheMatchesCurrentSelection = Boolean(
-        !isPayPalApi
-        && cachedUrl
-        && normalizePaymentSource(cachedLink.payment_source || cachedLink.source, cachedLink.payment_link_format) === selectedPaymentSource
-        && cachedPlan === selectedPlan
-        && cachedCountry === selectedCountry
-        && cachedCurrency === selectedCurrency
-        && cachedProxy === selectedProxy
-        && cachedPaymentLinkFormat === selectedPaymentLinkFormat
-      )
-      const countryOptions = (checkoutCountries.length ? checkoutCountries : [DEFAULT_CHECKOUT_COUNTRY]).map((code) => {
-        const currency = checkoutCurrencyByCountry[code]
-        return { label: checkoutCountryLabel(code, currency), value: code }
-      })
-      return (
-        <>
-          <Form.Item name="payment_source" label="生成方式" initialValue={DEFAULT_PAYMENT_SOURCE} rules={[{ required: true }]}>
-            <Select
-              options={PAYMENT_SOURCE_OPTIONS}
-              onChange={(value) => {
-                if (value === LONG_LINK_PAYPAL_SOURCE) {
-                  actionForm.setFieldsValue({
-                    payment_link_format: PAYPAL_PAYMENT_LINK_FORMAT,
-                    reuse_cached_link: false,
-                  })
-                  return
-                }
-                if (normalizePaymentLinkFormat(actionForm.getFieldValue('payment_link_format')) === PAYPAL_PAYMENT_LINK_FORMAT) {
-                  actionForm.setFieldValue('payment_link_format', DEFAULT_PAYMENT_LINK_FORMAT)
-                }
-              }}
-            />
-          </Form.Item>
-          {isPayPalApi ? (
-            <Alert
-              type="info"
-              showIcon
-              style={{ marginBottom: 12, overflowWrap: 'anywhere' }}
-              message="PayPal API · 使用 long-link 当前配置"
-              description="仅提交当前账号凭证，由 long-link 服务使用已保存的 PayPal 国家、货币与代理链生成新链接；不会复用本地 Hosted 缓存。"
-            />
-          ) : (
-            <>
-              <Form.Item name="payment_link_format" label="生成路径" initialValue={DEFAULT_PAYMENT_LINK_FORMAT} rules={[{ required: true }]}>
-                <Select options={PAYMENT_LINK_FORMAT_OPTIONS} />
-              </Form.Item>
-              <Form.Item label="国家" required>
-                <Space.Compact style={{ width: '100%' }}>
-                  <Form.Item name="country" noStyle rules={[{ required: true, message: '请选择国家' }]}>
-                    <Select
-                      showSearch
-                      loading={checkoutCountriesLoading}
-                      optionFilterProp="label"
-                      options={countryOptions}
-                      onDropdownVisibleChange={(open) => {
-                        if (open) loadCheckoutCountries(false, String(actionForm.getFieldValue('proxy') || '').trim())
-                      }}
-                      onChange={(value) => loadCheckoutConfig(value, actionForm, String(actionForm.getFieldValue('proxy') || '').trim())}
-                    />
-                  </Form.Item>
-                  <Button loading={checkoutCountriesLoading} onClick={() => loadCheckoutCountries(true, String(actionForm.getFieldValue('proxy') || '').trim())}>
-                    刷新
-                  </Button>
-                </Space.Compact>
-              </Form.Item>
-              <Form.Item name="currency" label="货币" initialValue={DEFAULT_CHECKOUT_CURRENCY} rules={[{ required: true }]}>
-                <Input readOnly suffix={checkoutConfigLoading ? <SyncOutlined spin /> : null} />
-              </Form.Item>
-              <Alert
-                type="info"
-                showIcon
-                style={{ marginBottom: 12, overflowWrap: 'anywhere' }}
-                message={`当前选择：${checkoutCountryLabel(selectedCountry, selectedCurrency)}`}
-                description={`生成路径：${paymentLinkFormatLabel(selectedPaymentLinkFormat)}。国家列表和货币只在打开选择器、刷新或切换国家时更新；生成链接时只使用这里显示的国家和货币。当前代理：${selectedProxy || '直连（不使用代理）'}`}
-              />
-              {cachedUrl ? (
-                <Alert
-                  type={cacheMatchesCurrentSelection ? 'success' : 'warning'}
-                  showIcon
-                  style={{ marginBottom: 12, overflowWrap: 'anywhere' }}
-                  message={cacheMatchesCurrentSelection ? '检测到可直接复用的缓存订阅链接' : '检测到历史订阅链接，但当前参数与缓存不完全一致'}
-                  description={
-                    <>
-                      <div>{formatCachedPaymentLinkSummary(cachedLink)}</div>
-                      <div style={{ marginTop: 4, wordBreak: 'break-all' }}>{cachedUrl}</div>
-                    </>
-                  }
-                />
-              ) : null}
-              <Form.Item
-                name="proxy"
-                label="支付代理节点"
-                extra="可选。默认可直连生成订阅链接；如果 checkout 页面异常，再切换到某个代理节点重新生成。"
-              >
-                <Select
-                  showSearch
-                  allowClear
-                  optionFilterProp="label"
-                  placeholder="选择代理节点，留空为直连"
-                  loading={paymentLinkProxyLoading}
-                  options={paymentLinkProxyOptions}
-                  onDropdownVisibleChange={(open) => {
-                    if (open) loadPaymentLinkProxyOptions(false, String(actionForm.getFieldValue('proxy') || '').trim())
-                  }}
-                  onChange={async (value) => {
-                    await loadCheckoutConfig(
-                      String(actionForm.getFieldValue('country') || DEFAULT_CHECKOUT_COUNTRY),
-                      actionForm,
-                      String(value || '').trim(),
-                    )
-                  }}
-                />
-              </Form.Item>
-              <Form.Item
-                name="reuse_cached_link"
-                valuePropName="checked"
-                extra="勾选后，若当前套餐/国家/货币/代理与缓存一致，则直接复用注册或上次生成时缓存的订阅链接；取消勾选则强制重新生成。"
-              >
-                <Checkbox disabled={!cacheMatchesCurrentSelection}>优先复用缓存订阅链接</Checkbox>
-              </Form.Item>
-            </>
-          )}
-          <Form.Item name="save_defaults" valuePropName="checked" style={{ marginBottom: 0 }}>
-            <Checkbox>保存本次订阅链接配置</Checkbox>
-          </Form.Item>
-        </>
-      )
-    }
-
     if (activeAction.id === 'logout_web_session') {
       return (
         <>
@@ -2144,7 +1733,7 @@ export function AccountActionSurface({
                 loading={runningActionId === 'payment_link'}
                 onClick={() => handleAction('payment_link')}
               >
-                订阅链接
+                支付链接生成
               </Button>
             ) : null,
             acc?.platform === 'chatgpt' ? (
@@ -2197,7 +1786,7 @@ export function AccountActionSurface({
               </Text>
               {paymentLinkAction ? (
                 <Button block loading={runningActionId === 'payment_link'} onClick={() => handleAction('payment_link')}>
-                  订阅链接
+                  支付链接生成
                 </Button>
               ) : null}
               {acc?.platform === 'chatgpt' ? (

@@ -31,6 +31,9 @@ class SkipCurrentAttemptRequested(TaskInterruption):
         super().__init__(message)
 
 
+TERMINAL_TASK_STATUSES = frozenset({"done", "failed", "stopped", "partial", "interrupted"})
+
+
 class AttemptOutcome(str, Enum):
     SUCCESS = "success"
     FAILED = "failed"
@@ -628,7 +631,7 @@ class RegisterTaskStore:
     def request_stop(self, task_id: str) -> dict[str, Any]:
         with self._lock:
             record = self._records[task_id]
-            if record.status in {"done", "failed", "stopped"}:
+            if record.status in TERMINAL_TASK_STATUSES:
                 raise ValueError("任务已结束")
             changed = record.control.request_stop()
             snapshot = record.to_dict()
@@ -641,7 +644,7 @@ class RegisterTaskStore:
     def request_stop_after_current(self, task_id: str) -> dict[str, Any]:
         with self._lock:
             record = self._records[task_id]
-            if record.status in {"done", "failed", "stopped"}:
+            if record.status in TERMINAL_TASK_STATUSES:
                 raise ValueError("任务已结束")
             if not record.supports_after_current:
                 raise ValueError("当前任务不支持完成当前后停止")
@@ -722,7 +725,7 @@ class RegisterTaskStore:
             record.errors = list(errors)
             record.error = error
             record.updated_at = time.time()
-            if final_status in {"done", "failed", "stopped"}:
+            if final_status in TERMINAL_TASK_STATUSES:
                 terminal_snapshot = record.to_dict()
                 callback = self._on_terminal
 
@@ -763,7 +766,7 @@ class RegisterTaskStore:
             finished = [
                 (task_id, record)
                 for task_id, record in self._records.items()
-                if record.status in ("done", "failed", "stopped")
+                if record.status in TERMINAL_TASK_STATUSES
             ]
             if len(finished) <= self.max_finished_tasks:
                 return
@@ -782,5 +785,6 @@ __all__ = [
     "SkipCurrentAttemptRequested",
     "StopTaskRequested",
     "TaskInterruption",
+    "TERMINAL_TASK_STATUSES",
     "VerificationChallenge",
 ]

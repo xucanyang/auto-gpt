@@ -1,7 +1,8 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import type { ReactNode } from 'react'
 import { Alert, Button, Drawer, Form, Input, Select, Space, Tag, Typography, theme } from 'antd'
-import { CopyOutlined } from '@ant-design/icons'
+import { CopyOutlined, LinkOutlined, ReloadOutlined } from '@ant-design/icons'
+import { apiFetch } from '@/lib/utils'
 
 const { Text } = Typography
 
@@ -13,6 +14,41 @@ type AccountSecretResponse = {
   secrets?: Record<string, string>
   present?: Record<string, boolean>
   lengths?: Record<string, number>
+}
+
+type PaymentLinkGeneration = {
+  id?: number
+  task_id?: string
+  remote_batch_id?: string
+  remote_job_id?: string
+  profile_hash?: string
+  link_type?: string
+  status?: string
+  url?: string
+  submitted_at?: string
+  started_at?: string
+  generated_at?: string
+  persisted_at?: string
+  error?: string
+}
+
+function paymentLinkStatusMeta(value: unknown) {
+  const status = String(value || '').trim().toLowerCase()
+  if (status === 'succeeded' || status === 'done') return { color: 'success', label: '已生成' }
+  if (status === 'queued') return { color: 'default', label: '已提交' }
+  if (status === 'running') return { color: 'processing', label: '生成中' }
+  if (status === 'interrupted') return { color: 'warning', label: '远端中断' }
+  if (status === 'failed' || status === 'error') return { color: 'error', label: '失败' }
+  return { color: 'default', label: status || '无记录' }
+}
+
+function paymentLinkTypeLabel(value: unknown, format?: unknown) {
+  const direct = String(value || '').trim().toUpperCase()
+  if (direct) return direct
+  const normalizedFormat = String(format || '').trim().toLowerCase()
+  if (normalizedFormat === 'paypal_url') return 'PAYPAL'
+  if (normalizedFormat === 'long_link') return 'LONG-LINK'
+  return '历史链接'
 }
 
 function SummaryField({
@@ -476,7 +512,46 @@ export function AccountDetailModal({
   planMeta,
   codexStateMeta,
 }: AccountDetailModalProps) {
+  const { token } = theme.useToken()
   const extra = parseAccountExtra(currentAccount)
+  const accountId = Number(currentAccount?.id || 0)
+  const [paymentLinkHistory, setPaymentLinkHistory] = useState<PaymentLinkGeneration[]>([])
+  const [paymentLinkHistoryLoading, setPaymentLinkHistoryLoading] = useState(false)
+  const [paymentLinkHistoryError, setPaymentLinkHistoryError] = useState('')
+  const loadPaymentLinkHistory = useCallback(async () => {
+    if (!accountId) {
+      setPaymentLinkHistory([])
+      return
+    }
+    setPaymentLinkHistoryLoading(true)
+    setPaymentLinkHistoryError('')
+    try {
+      const payload = await apiFetch(`/tasks/chatgpt/payment-links/history?account_id=${encodeURIComponent(String(accountId))}&limit=12`) as {
+        items?: PaymentLinkGeneration[]
+      }
+      setPaymentLinkHistory(Array.isArray(payload?.items) ? payload.items : [])
+    } catch (e: any) {
+      setPaymentLinkHistory([])
+      setPaymentLinkHistoryError(String(e?.message || '读取支付链接历史失败'))
+    } finally {
+      setPaymentLinkHistoryLoading(false)
+    }
+  }, [accountId])
+
+  useEffect(() => {
+    if (!open) return
+    void loadPaymentLinkHistory()
+  }, [open, loadPaymentLinkHistory])
+
+  const currentPaymentLink = currentAccount?.chatgptLastPaymentLink && typeof currentAccount.chatgptLastPaymentLink === 'object'
+    ? currentAccount.chatgptLastPaymentLink
+    : extra.chatgpt_last_payment_link && typeof extra.chatgpt_last_payment_link === 'object'
+      ? extra.chatgpt_last_payment_link
+      : extra.chatgpt_paypal_url && typeof extra.chatgpt_paypal_url === 'object'
+        ? extra.chatgpt_paypal_url
+        : {}
+  const currentPaymentLinkUrl = String(currentPaymentLink.url || currentPaymentLink.paypal_url || '').trim()
+  const currentPaymentLinkStatus = paymentLinkStatusMeta(currentPaymentLink.link_status || (currentPaymentLinkUrl ? 'succeeded' : ''))
   const authSummary = currentAccount?.chatgptLocal?.auth && typeof currentAccount.chatgptLocal.auth === 'object'
     ? currentAccount.chatgptLocal.auth
     : currentAccount?.auth && typeof currentAccount.auth === 'object'
@@ -575,6 +650,105 @@ export function AccountDetailModal({
                 <SummaryField label="创建时间" value={currentAccount.created_at ? formatSyncTime(currentAccount.created_at) : ''} />
                 <SummaryField label="更新时间" value={currentAccount.updated_at ? formatSyncTime(currentAccount.updated_at) : ''} />
               </div>
+            </div>
+          </DetailSection>
+
+          <DetailSection
+            title="支付链接"
+            extra={(
+              <Button
+                type="text"
+                size="small"
+                title="刷新支付链接历史"
+                icon={<ReloadOutlined spin={paymentLinkHistoryLoading} />}
+                loading={paymentLinkHistoryLoading}
+                onClick={() => void loadPaymentLinkHistory()}
+              />
+            )}
+          >
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+              {currentPaymentLinkUrl ? (
+                <div style={{ display: 'grid', gridTemplateColumns: '104px minmax(0, 1fr)', gap: 12, alignItems: 'start' }}>
+                  <Text type="secondary" style={{ fontSize: 12, lineHeight: '20px' }}>当前链接</Text>
+                  <div style={{ minWidth: 0 }}>
+                    <Space size={6} wrap style={{ marginBottom: 4 }}>
+                      <Tag color="blue">{paymentLinkTypeLabel(currentPaymentLink.link_type, currentPaymentLink.payment_link_format)}</Tag>
+                      <Tag color={currentPaymentLinkStatus.color}>{currentPaymentLinkStatus.label}</Tag>
+                      {currentPaymentLink.generated_at || currentPaymentLink.created_at ? (
+                        <Text type="secondary" style={{ fontSize: 12 }}>
+                          生成于 {formatSyncTime(currentPaymentLink.generated_at || currentPaymentLink.created_at)}
+                        </Text>
+                      ) : null}
+                    </Space>
+                    <Space size={6} wrap style={{ width: '100%' }}>
+                      <Text copyable={{ text: currentPaymentLinkUrl }} style={{ minWidth: 0, overflowWrap: 'anywhere' }}>
+                        {currentPaymentLinkUrl}
+                      </Text>
+                      <Button
+                        title="打开支付链接"
+                        type="text"
+                        size="small"
+                        icon={<LinkOutlined />}
+                        href={currentPaymentLinkUrl}
+                        target="_blank"
+                        rel="noreferrer"
+                      />
+                    </Space>
+                  </div>
+                </div>
+              ) : (
+                <Text type="secondary">尚未生成支付链接。</Text>
+              )}
+
+              {paymentLinkHistoryError ? (
+                <Alert type="warning" showIcon message="支付链接历史读取失败" description={paymentLinkHistoryError} />
+              ) : null}
+
+              {paymentLinkHistory.length > 0 ? (
+                <div style={{ borderTop: `1px solid ${token.colorBorder}`, paddingTop: 10, display: 'flex', flexDirection: 'column', gap: 8 }}>
+                  <Text type="secondary" style={{ fontSize: 12 }}>最近生成记录</Text>
+                  {paymentLinkHistory.map((item, index) => {
+                    const status = paymentLinkStatusMeta(item.status)
+                    const generatedAt = item.generated_at || item.persisted_at || item.submitted_at
+                    const url = String(item.url || '').trim()
+                    return (
+                      <div
+                        key={String(item.id || `${item.task_id || 'payment-link'}:${index}`)}
+                        style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) auto', gap: 10, alignItems: 'start' }}
+                      >
+                        <div style={{ minWidth: 0 }}>
+                          <Space size={6} wrap>
+                            <Tag color="blue">{paymentLinkTypeLabel(item.link_type, 'long_link')}</Tag>
+                            <Tag color={status.color}>{status.label}</Tag>
+                            {generatedAt ? <Text type="secondary" style={{ fontSize: 12 }}>{formatSyncTime(generatedAt)}</Text> : null}
+                            {item.profile_hash ? <Text code title={item.profile_hash}>{item.profile_hash.slice(0, 12)}</Text> : null}
+                          </Space>
+                          {url ? (
+                            <Text copyable={{ text: url }} style={{ display: 'block', marginTop: 4, overflowWrap: 'anywhere' }}>
+                              {url}
+                            </Text>
+                          ) : item.error ? (
+                            <Text type="danger" style={{ display: 'block', marginTop: 4, overflowWrap: 'anywhere' }}>{item.error}</Text>
+                          ) : null}
+                        </div>
+                        {url ? (
+                          <Button
+                            title="打开支付链接"
+                            type="text"
+                            size="small"
+                            icon={<LinkOutlined />}
+                            href={url}
+                            target="_blank"
+                            rel="noreferrer"
+                          />
+                        ) : null}
+                      </div>
+                    )
+                  })}
+                </div>
+              ) : !paymentLinkHistoryLoading ? (
+                <Text type="secondary" style={{ fontSize: 12 }}>暂无持久化生成记录。</Text>
+              ) : null}
             </div>
           </DetailSection>
 
