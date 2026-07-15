@@ -581,6 +581,12 @@ def is_proxy_error_text(error_text: Optional[str]) -> bool:
     text = str(error_text or "").strip().lower()
     if not text:
         return False
+    # HME Ready is an internal mailbox control-plane request.  Its timeout or
+    # 5xx must never rotate/report a ChatGPT registration proxy: doing so turns
+    # one Helper incident into repeated prepare calls against the same control
+    # plane.  This guard intentionally precedes the generic timeout markers.
+    if "hme ready api" in text or "icloud hme helper" in text:
+        return False
     account_state_markers = (
         "account_deactivated",
         "account_deleted",

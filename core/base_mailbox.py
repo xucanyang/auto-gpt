@@ -2347,6 +2347,7 @@ class HmeReadyApiClient:
         *,
         forward_to: str,
         request_id: str = "",
+        task_id: str = "",
         consumer: str = "",
         ttl_ms: int | None = None,
         max_cache_age_ms: int | None = None,
@@ -2354,6 +2355,7 @@ class HmeReadyApiClient:
         body = {
             "forward_to": str(forward_to or "").strip(),
             "request_id": str(request_id or "").strip(),
+            "task_id": str(task_id or "").strip(),
             "consumer": str(consumer or "").strip(),
         }
         if ttl_ms:
@@ -2947,11 +2949,16 @@ class IcloudHmeMailbox(BaseMailbox):
     def _helper_get_email(self) -> MailboxAccount:
         self._ensure_config()
         self._log("[iCloudHME] 使用 Helper Ready API 出池")
-        task_id = str(getattr(self, "_task_attempt_token", "") or "").strip()
+        # request_id is an attempt-scoped idempotency key.  Keep the durable
+        # parent task id separate so the Helper can associate a checkout even
+        # when the caller times out before it receives the prepare response.
+        attempt_id = str(getattr(self, "_task_attempt_token", "") or "").strip()
+        parent_task_id = str(getattr(self, "_registration_task_id", "") or "").strip()
         ttl_ms = self._helper_checkout_ttl_seconds * 1000 if self._helper_checkout_ttl_seconds else None
         payload = self._helper_client.prepare(
             forward_to="*",
-            request_id=task_id,
+            request_id=attempt_id,
+            task_id=parent_task_id,
             consumer=self._helper_consumer,
             ttl_ms=ttl_ms,
             max_cache_age_ms=self._helper_max_cache_age_seconds * 1000,

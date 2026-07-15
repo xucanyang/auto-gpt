@@ -122,6 +122,54 @@ class IcloudHmeMailboxFinalizeTests(unittest.TestCase):
         self.assertNotIn("icloud_cookie", exported)
         self.assertNotIn("chatgpt_gopay_batch_tasks", exported)
 
+    def test_helper_ready_prepare_sends_parent_task_id_separately_from_attempt_key(self):
+        mailbox = IcloudHmeMailbox(
+            mail_provider_name="hme_ready_api",
+            icloud_hme_mode="helper_ready_api",
+            icloud_cookie="",
+            icloud_forward_to="global@example.com",
+            tempmail_api_url="http://tempmail-api-1:8080",
+            tempmail_api_key="tempmail-key",
+            icloud_hme_helper_api_url="http://helper-api",
+            icloud_hme_helper_internal_key="helper-key",
+            icloud_hme_helper_consumer="auto-gpt/test",
+        )
+        mailbox._task_attempt_token = "attempt-uuid-1"
+        mailbox._registration_task_id = "task-parent-1"
+        mailbox._helper_client.prepare = Mock(
+            return_value={
+                "auto_gpt": {
+                    "email": "alias+gpt1@icloud.com",
+                    "account_id": "ck-1",
+                    "extra": {
+                        "lease_id": "ck-1",
+                        "checkout_id": "ck-1",
+                        "forward_to": "specific@example.com",
+                    },
+                },
+                "mailbox": {
+                    "email": "alias+gpt1@icloud.com",
+                    "forward_to": "specific@example.com",
+                    "forward_mailbox_id": "",
+                },
+                "lease": {"id": "ck-1"},
+            }
+        )
+
+        account = mailbox.get_email()
+
+        mailbox._helper_client.prepare.assert_called_once_with(
+            forward_to="*",
+            request_id="attempt-uuid-1",
+            task_id="task-parent-1",
+            consumer="auto-gpt/test",
+            ttl_ms=None,
+            max_cache_age_ms=86400000,
+        )
+        self.assertEqual(account.email, "alias+gpt1@icloud.com")
+        self.assertEqual(account.extra["forward_to"], "specific@example.com")
+        self.assertNotIn("forward_mailbox_id", account.extra)
+
     def test_helper_ready_waits_code_from_tempmail_forward_mailbox(self):
         mailbox = IcloudHmeMailbox(
             icloud_hme_mode="helper_ready_api",

@@ -13947,6 +13947,11 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                         _platform.bind_task_control(control)
                         if getattr(_platform, "mailbox", None) is not None:
                             _platform.mailbox._task_attempt_token = attempt_id
+                            # Keep the parent task id distinct from the attempt
+                            # idempotency token.  HME Helper persists it at
+                            # checkout time, so a client-side prepare timeout is
+                            # still attributable and recoverable.
+                            _platform.mailbox._registration_task_id = task_id
                             _platform.mailbox._log_fn = _platform._log_fn
                         account = _platform.register(
                             email=req.email or None,

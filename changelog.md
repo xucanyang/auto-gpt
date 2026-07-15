@@ -4,6 +4,18 @@
 
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，并且本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/) (语义化版本)。
 
+## [2.1.7] - 2026-07-15
+
+### 修复 (Fixed)
+- **HME Ready prepare 明确归属父注册任务且不再误切代理**：`core/base_mailbox.py` 的 Helper Ready 客户端将 attempt 级 `request_id` 与父 `task_id` 分开传给 HME Helper；`api/tasks.py` 在创建邮箱实例时注入真实注册任务 ID。这样即使 prepare 客户端超时，Helper 中已写入的 checkout 仍可按父任务审计、回收或对账。`core/proxy_utils.py` 同时把 `HME Ready API` / iCloud Helper 控制面异常排除出代理失败判定，避免内部邮箱服务超时被当成代理故障并触发无意义的换代理、重复 prepare 放大。
+- **保持 auto-gpt 作为 TempMail 邮件数据面唯一读取方**：Helper prepare 未返回 `forward_mailbox_id` 时，现有 `IcloudHmeMailbox` 会继续只按 lease 的 `forward_to` 直连 TempMail 解析邮箱并读取 OTP；tag 地址仍只通过原始投递头精确匹配，不会退回 Helper 收件/转发中转。
+
+### 优化 (Changed)
+- **前端版本同步至 v2.1.7**：`frontend/src/app/AppShell.tsx` 更新侧栏版本，便于确认浏览器已加载 HME 控制面与代理错误分类修复。
+
+### 测试 (Tests)
+- **锁定 HME lease 审计与重试边界**：`tests/test_icloud_hme_mailbox_finalize.py` 覆盖 attempt idempotency key 与父 task ID 的独立传递及无 `forward_mailbox_id` 响应兼容；新增 `tests/test_proxy_utils.py`，确认 HME Helper timeout 不再被误判为代理 timeout，而真实 SOCKS 连接超时仍会走代理失败语义。
+
 ## [2.1.6] - 2026-07-15
 
 ### 修复 (Fixed)
@@ -1442,4 +1454,8 @@
 
 ## 2026-07-15 21:36:50 +0800
 - 修复 HME tag 直查收码与 OTP 等待窗口
+- 发布模式: multi
+
+## 2026-07-15 22:31:36 +0800
+- 修复 HME prepare 控制面直连与任务归属
 - 发布模式: multi
