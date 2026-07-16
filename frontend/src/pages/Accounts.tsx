@@ -2270,7 +2270,7 @@ const accountActionTextStyles: Record<string, CSSProperties> = {
 }
 
 export default function Accounts() {
-  const { message: appMessage } = App.useApp()
+  const { message: appMessage, modal: appModal } = App.useApp()
   const { token } = theme.useToken()
   const screens = Grid.useBreakpoint()
   const isMobile = screens.lg === false
@@ -3926,8 +3926,7 @@ export default function Accounts() {
       return
     }
 
-    setPixLinkCleanupLoading(true)
-    Modal.confirm({
+    appModal.confirm({
       title: `清理 ${expired} 条过期 PIX 链接？`,
       content: (
         <Space direction="vertical" size={6} style={{ width: '100%' }}>

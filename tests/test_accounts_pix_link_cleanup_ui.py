@@ -1,4 +1,5 @@
 from pathlib import Path
+import re
 
 
 ACCOUNTS_PAGE = Path(__file__).resolve().parents[1] / "frontend" / "src" / "pages" / "Accounts.tsx"
@@ -22,6 +23,9 @@ def test_expired_pix_link_cleanup_is_previewed_confirmed_and_refetched():
     assert "onCleanupExpiredPixLinks" in toolbar
     assert "/tasks/chatgpt/payment-links/pix-cleanup/preview" in page
     assert "/tasks/chatgpt/payment-links/pix-cleanup" in page
+    assert "const { message: appMessage, modal: appModal } = App.useApp()" in page
+    assert "appModal.confirm({" in page
+    assert re.search(r"(?<![A-Za-z0-9_.])Modal\.confirm\(", page) is None
     assert "只清理账号当前 PIX 链接" in page
     assert "不会删除账号、支付生成历史、PIX CDK 或提交结果" in page
     assert "await accountsQuery.refetch()" in page

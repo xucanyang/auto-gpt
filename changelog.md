@@ -4,6 +4,15 @@
 
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，并且本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/) (语义化版本)。
 
+## [2.2.13] - 2026-07-17
+
+### 修复 (Fixed)
+- **修复过期 PIX 链接清理确认弹窗不执行**：`frontend/src/pages/Accounts.tsx` 不再调用 antd 的静态 `Modal.confirm`，改用 `App.useApp()` 提供的上下文 `appModal.confirm`。当前运行时使用 React 19，静态 Modal 依赖的旧 `react-dom.render/createRoot` 入口不会渲染确认框，导致用户只能完成预览请求而永远不会触发清理 POST；修复后确认按钮会正常调用 `/api/tasks/chatgpt/payment-links/pix-cleanup`，保留服务端重新计算、原子事务、历史保留和并发跳过边界。
+
+### 测试 (Tests)
+- **补强清理前端合同断言**：`tests/test_accounts_pix_link_cleanup_ui.py` 锁定页面使用上下文 Modal、禁止回退到静态确认 API，并继续验证预览、确认后的清理请求和列表刷新契约。
+- **前端生产构建验证**：`frontend` 的 TypeScript 检查与 Vite 构建通过，确保 React 19 下的 Modal 调用可以随线上 bundle 发布。
+
 ## [2.2.12] - 2026-07-17
 
 ### 新增 (Added)
@@ -1740,4 +1749,8 @@
 
 ## 2026-07-17 01:52:44 +0800
 - feat: unify submission filters and enable multi-credit PIX batch submission
+- 发布模式: multi
+
+## 2026-07-17 02:32:15 +0800
+- 修复 React 19 下过期 PIX 链接清理确认弹窗并延后 loading
 - 发布模式: multi
