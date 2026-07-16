@@ -396,6 +396,95 @@ class BaxiGptClient:
             "status_token": status_token,
         }
 
+    def public_submit_options(self) -> dict[str, bool]:
+        """Read only the PIX switches needed before a direct-link submission."""
+
+        response = self._request(
+            "GET",
+            "/api/public/submit-options",
+            timeout=self.timeout,
+        )
+
+        def as_bool(value: Any) -> bool:
+            if isinstance(value, bool):
+                return value
+            return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+        return {
+            "pix_channel_enabled": as_bool(response.get("pix_channel_enabled")),
+            "pix_user_link_enabled": as_bool(
+                response.get("pix_user_link_enabled", response.get("user_pix_link_enabled"))
+            ),
+        }
+
+    def submit_pix_user_link(self, *, pix_cdk: str, pix_pay_link: str) -> dict[str, Any]:
+        """Submit one persisted Stripe PIX instruction link without an AT.
+
+        Both the PIX CDK and the link are transient caller input.  The returned
+        status token is kept by the task runner only and never persisted by the
+        client.
+        """
+
+        cdk = str(pix_cdk or "").strip()
+        pay_link = str(pix_pay_link or "").strip()
+        if not cdk:
+            return {"ok": False, "status": "failed", "message": "PIX CDK 不能为空"}
+        if not pay_link:
+            return {"ok": False, "status": "failed", "message": "PIX 支付链接不能为空"}
+
+        payload = {
+            "submitMode": "pix_user_link",
+            "pixCdk": cdk,
+            "pixPayLink": pay_link,
+            "accounts": [],
+        }
+        try:
+            res = self._request(
+                "POST",
+                "/api/task/submit",
+                payload=payload,
+                timeout=self.submit_timeout,
+                retries=self.submit_retries,
+            )
+        except BaxiGptRequestError as exc:
+            raise BaxiGptRequestError(
+                _redact_sensitive_text(exc, cdk, pay_link),
+                request_outcome_unknown=exc.request_outcome_unknown,
+                http_status=exc.http_status,
+            ) from exc
+
+        created_tasks = [
+            item
+            for item in (
+                res.get("created_tasks")
+                if isinstance(res.get("created_tasks"), list)
+                else res.get("tasks")
+                if isinstance(res.get("tasks"), list)
+                else []
+            )
+            if isinstance(item, dict)
+        ]
+        task = created_tasks[0] if created_tasks else {}
+        task_id = str(task.get("task_id") or task.get("id") or "").strip()
+        status_token = str(task.get("status_token") or task.get("statusToken") or "").strip()
+        if not task_id or not status_token:
+            # The remote side might already have accepted this pair.  The
+            # caller must keep the CDK locked instead of retrying blindly.
+            return {
+                "ok": False,
+                "status": "unresolved",
+                "message": "PIX 上游已响应但未返回可轮询任务凭据，请人工复核",
+                "submission_unknown": True,
+            }
+        return {
+            "ok": True,
+            "status": _normalize_task_status(task.get("status")),
+            "order_id": task_id,
+            "display_id": task_id,
+            "task_id": task_id,
+            "status_token": status_token,
+        }
+
     def pix_status(self, *, task_id: str, status_token: str) -> dict[str, Any]:
         """Poll a PIX task without exposing its one-time status credential."""
 

@@ -888,6 +888,153 @@ CDK-AAAA-1111
         fingerprint = self.pix_usage_store.fingerprint(pix_cdk)
         self.assertEqual(self.pix_usage_store.states_for([fingerprint])[fingerprint].state, "uncertain")
 
+    def test_pix_user_link_uses_saved_stripe_link_without_access_token_and_keeps_it_transient(self):
+        pix_cdk = "PIX-USER-LINK-SENSITIVE-CDK"
+        pix_link = "https://payments.stripe.com/qr/instructions/pix-user-link-sensitive"
+        status_token = "pix-user-link-status-token-sensitive"
+        with Session(self.engine) as session:
+            account = AccountModel(platform="chatgpt", email="pix-link@example.com", password="pw", token="")
+            account.set_extra({
+                "chatgpt_last_payment_link": {
+                    "url": pix_link,
+                    "link_type": "pix",
+                    "link_expires_at": 4_102_444_800,
+                }
+            })
+            session.add(account)
+            session.commit()
+            session.refresh(account)
+            account_id = int(account.id or 0)
+
+        with patch.object(tasks_module, "_assert_pix_user_link_submission_enabled"):
+            result = tasks_module.enqueue_baxigpt_cdk_submit_task(
+                tasks_module.BaxiGptCdkSubmitTaskRequest(
+                    account_ids=[account_id],
+                    payment_channel="pix",
+                    pix_submit_mode="user_link",
+                    pix_cdk=pix_cdk,
+                    submit_interval_seconds=0,
+                    status_poll_interval_seconds=1,
+                ),
+                background_tasks=BackgroundTasks(),
+            )
+        snapshot = tasks_module._task_store.snapshot(result["task_id"])
+        self.assertEqual(result["pix_submit_mode"], "user_link")
+        self.assertEqual(snapshot["meta"]["settings"]["pix_submit_mode"], "user_link")
+        self.assertNotIn(pix_cdk, str(snapshot))
+        self.assertNotIn(pix_link, str(snapshot))
+
+        class FakeBaxiClient:
+            submit_calls: list[tuple[str, str]] = []
+
+            def submit_pix_user_link(self, *, pix_cdk, pix_pay_link):
+                self.__class__.submit_calls.append((pix_cdk, pix_pay_link))
+                return {
+                    "ok": True,
+                    "task_id": "pix-user-link-task-1",
+                    "order_id": "pix-user-link-task-1",
+                    "display_id": "pix-user-link-task-1",
+                    "status_token": status_token,
+                }
+
+            def pix_status(self, *, task_id, status_token):
+                if task_id != "pix-user-link-task-1" or status_token != "pix-user-link-status-token-sensitive":
+                    raise AssertionError("unexpected PIX user-link poll credential")
+                return {"ok": True, "status": "paid"}
+
+        with patch("services.chatgpt_core.baxigpt_client.BaxiGptClient", FakeBaxiClient), \
+             patch.object(tasks_module, "sync_chatgpt_account_local_status", return_value={"status": "subscribed"}), \
+             patch.object(tasks_module, "summarize_status_refresh", return_value={"status": "subscribed"}), \
+             patch.object(tasks_module.time, "sleep", return_value=None):
+            tasks_module._run_pix_submit(
+                result["task_id"],
+                snapshot["meta"]["pairs"],
+                snapshot["meta"]["settings"],
+                pix_cdk,
+            )
+
+        final_snapshot = tasks_module._task_store.snapshot(result["task_id"])
+        self.assertEqual(FakeBaxiClient.submit_calls, [(pix_cdk, pix_link)])
+        self.assertEqual(final_snapshot["status"], "done")
+        self.assertNotIn(pix_cdk, str(final_snapshot))
+        self.assertNotIn(pix_link, str(final_snapshot))
+        self.assertNotIn(status_token, str(final_snapshot))
+        with Session(self.engine) as session:
+            account = session.get(AccountModel, account_id)
+            extra = account.get_extra()
+            task_log = session.exec(select(TaskLog).where(TaskLog.task_id == result["task_id"])).first()
+        self.assertEqual(extra["baxigpt_cdk"]["pix_submit_mode"], "user_link")
+        self.assertEqual(extra["idea_submit"]["pix_submit_mode"], "user_link")
+        self.assertIsNotNone(task_log)
+        self.assertNotIn(pix_cdk, str(task_log.detail_json))
+        self.assertNotIn(pix_link, str(task_log.detail_json))
+        self.assertNotIn(status_token, str(task_log.detail_json))
+
+    def test_pix_user_link_resolution_allows_no_at_and_rejects_incompatible_or_expiring_links(self):
+        with Session(self.engine) as session:
+            good = AccountModel(platform="chatgpt", email="pix-good@example.com", password="pw", token="")
+            good.set_extra({"chatgpt_last_payment_link": {
+                "url": "https://payments.stripe.com/qr/instructions/good-link",
+                "link_type": "pix",
+                "link_expires_at": 4_102_444_800,
+            }})
+            incompatible = AccountModel(platform="chatgpt", email="pix-bad@example.com", password="pw", token="")
+            incompatible.set_extra({"chatgpt_last_payment_link": {
+                "url": "https://payments.stripe.com/checkout/bad-link",
+                "link_type": "pix",
+            }})
+            expiring = AccountModel(platform="chatgpt", email="pix-expiring@example.com", password="pw", token="")
+            expiring.set_extra({"chatgpt_last_payment_link": {
+                "url": "https://payments.stripe.com/qr/instructions/expiring-link",
+                "link_type": "pix",
+                "link_expires_at": 1,
+            }})
+            session.add_all([good, incompatible, expiring])
+            session.commit()
+            session.refresh(good)
+            session.refresh(incompatible)
+            session.refresh(expiring)
+
+        request = tasks_module.BaxiGptCdkSubmitTaskRequest(
+            account_ids=[int(good.id), int(incompatible.id), int(expiring.id)],
+            payment_channel="pix",
+            pix_submit_mode="user_link",
+        )
+        eligible, missing_ids, skipped, matched = tasks_module._resolve_baxigpt_cdk_submit_accounts(
+            request,
+            require_access_token=False,
+            require_saved_pix_link=True,
+        )
+
+        self.assertEqual([item["account_id"] for item in matched], [int(good.id), int(incompatible.id), int(expiring.id)])
+        self.assertEqual([item["account_id"] for item in eligible], [int(good.id)])
+        self.assertEqual(missing_ids, [])
+        reasons = "\n".join(str(item.get("reason") or "") for item in skipped)
+        self.assertIn("不是可上传的 Stripe PIX 指令链接", reasons)
+        self.assertIn("即将到期", reasons)
+
+    def test_pix_user_link_closed_channel_rejects_before_creating_task(self):
+        class ClosedChannelClient:
+            def public_submit_options(self):
+                return {"pix_channel_enabled": True, "pix_user_link_enabled": False}
+
+        with patch("services.chatgpt_core.baxigpt_client.BaxiGptClient", ClosedChannelClient), \
+             patch.object(tasks_module, "_create_standalone_task_record") as create_task:
+            with self.assertRaises(HTTPException) as raised:
+                tasks_module.enqueue_baxigpt_cdk_submit_task(
+                    tasks_module.BaxiGptCdkSubmitTaskRequest(
+                        account_ids=[1],
+                        payment_channel="pix",
+                        pix_submit_mode="user_link",
+                        pix_cdk="PIX-CLOSED-CHANNEL-CDK",
+                    ),
+                    background_tasks=BackgroundTasks(),
+                )
+
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertIn("尚未开启 PIX 链接上传", str(raised.exception.detail))
+        create_task.assert_not_called()
+
 
 class BaxiGptClientRetryTests(unittest.TestCase):
     def test_code_info_retries_transient_request_error(self):
@@ -976,6 +1123,63 @@ class BaxiGptClientRetryTests(unittest.TestCase):
             "task_id": "pix-task-1",
             "status_token": "pix-status-token-1",
         })
+        self.assertNotIn("status_token", status)
+
+    def test_pix_user_link_submit_uses_dedicated_upstream_contract_and_status_token(self):
+        requests: list[tuple[str, str, dict]] = []
+        pix_link = "https://payments.stripe.com/qr/instructions/pix-link-secret"
+
+        class FakeResponse:
+            status_code = 200
+            text = "{}"
+
+            def __init__(self, data):
+                self._data = data
+
+            def json(self):
+                return self._data
+
+        def fake_request(method, url, **kwargs):
+            requests.append((method, url, kwargs))
+            if url.endswith("/api/task/submit"):
+                return FakeResponse({
+                    "status": "ok",
+                    "created_tasks": [{
+                        "task_id": "pix-link-task-1",
+                        "status": "PENDING",
+                        "status_token": "pix-link-status-token-1",
+                    }],
+                })
+            self.assertTrue(url.endswith("/api/pix/tasks/status"))
+            return FakeResponse({
+                "tasks": [{"task_id": "pix-link-task-1", "status": "SUCCESS"}],
+                "channel": "pix",
+            })
+
+        with patch.object(client_module.cffi_requests, "request", fake_request):
+            client = BaxiGptClient(base_url="https://submit.example.test")
+            submitted = client.submit_pix_user_link(
+                pix_cdk="PIX-CDK-SECRET",
+                pix_pay_link=pix_link,
+            )
+            status = client.pix_status(task_id=submitted["task_id"], status_token=submitted["status_token"])
+
+        self.assertTrue(submitted["ok"])
+        self.assertEqual(submitted["task_id"], "pix-link-task-1")
+        self.assertEqual(status["status"], "paid")
+        submit_method, submit_url, submit_kwargs = requests[0]
+        self.assertEqual((submit_method, submit_url), ("POST", "https://submit.example.test/api/task/submit"))
+        self.assertEqual(submit_kwargs["json"], {
+            "submitMode": "pix_user_link",
+            "pixCdk": "PIX-CDK-SECRET",
+            "pixPayLink": pix_link,
+            "accounts": [],
+        })
+        self.assertEqual(requests[1][2]["params"], {
+            "task_id": "pix-link-task-1",
+            "status_token": "pix-link-status-token-1",
+        })
+        self.assertNotIn(pix_link, str(submitted))
         self.assertNotIn("status_token", status)
 
     def test_batch_submit_with_multiple_accounts(self):

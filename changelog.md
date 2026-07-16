@@ -4,6 +4,25 @@
 
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，并且本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/) (语义化版本)。
 
+## [2.2.7] - 2026-07-16
+
+### 新增 (Added)
+- **账号库直传已保存 PIX 链接**：`frontend/src/pages/Accounts.tsx` 的既有“iDEAL / PIX 批量提交”弹窗在 PIX 通道新增“上传已保存 PIX 链接”方式。它可直接对选中账号或当前筛选范围发起任务，按账号顺序使用已同步到 `chatgpt_last_payment_link` 的支付链接；无需重新提取 Access Token。运营可先用账号列表的 `支付链接 = PIX` 筛选收敛范围，避免把 PayPal、Hosted Checkout 或无链接账号混入。
+- **服务端直连提交合同**：`services/chatgpt_core/baxigpt_client.py` 增加 `submit_pix_user_link()`，仅在内存中向支付提交服务发送 `submitMode=pix_user_link`、`pixCdk`、`pixPayLink` 和空账号数组；任务继续复用现有 PIX 状态令牌轮询、明确失败释放、成功核销、未知结果锁定与本地订阅状态刷新链路。
+
+### 修复 (Fixed)
+- **链接与账号资格在执行前双重收敛**：`api/tasks.py` 仅接收账户缓存内 HTTPS `payments.stripe.com/qr/instructions/...` 的 Stripe PIX 指令链接，并拒绝缺链接、错误平台、非指令链接、临近到期链接、已标记不可提交账号或范围变化后的账号。直传模式不再要求账号保有 Access Token；运行时会重新从账号缓存读取链接，因此 URL 不写入任务元数据、运行结果或任务日志。
+- **提交开关失败关闭**：创建直传任务前会读取支付提交服务的公开通道状态；PIX 总通道或“自带链接”子通道未开启时返回明确错误且不创建任务、不预留 CDK。该保护不改写本地 iDEAL 卡密池或其后续校验路由。
+
+### 安全 (Security)
+- **敏感值不持久化**：PIX CDK、支付链接和上游一次性状态令牌均只在任务调用栈中存在。错误、任务摘要、账号提交标记和 `TaskLog` 会继续脱敏；账号只保存提交方式标识，不复制链接或 CDK。
+
+### 测试 (Tests)
+- **覆盖直传边界与兼容性**：新增测试验证无 AT 的已保存 Stripe PIX 链接可以提交、非兼容或临近到期链接被跳过、关闭的远端开关不会创建任务、上游请求体严格使用 `pix_user_link` 合同，以及 CDK、链接、状态令牌不进入快照或日志。
+
+### 优化 (Changed)
+- **版本同步**：侧栏版本更新为 `v2.2.7`，用于确认浏览器已加载 PIX 已保存链接上传入口。
+
 ## [2.2.6] - 2026-07-16
 
 ### 新增 (Added)
@@ -1601,4 +1620,8 @@
 
 ## 2026-07-16 07:19:38 +0800
 - 同步 long-link 管理端历史订阅链接
+- 发布模式: multi
+
+## 2026-07-16 08:50:51 +0800
+- 账号库支持上传已保存PIX支付链接
 - 发布模式: multi

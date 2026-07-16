@@ -217,6 +217,44 @@ def test_payment_link_platform_filter_keeps_list_and_task_scope_identical(filter
     assert {item["id"] for item in listed["items"]} == set(resolution.account_ids) == {2}
 
 
+def test_pix_user_link_filtered_scope_uses_saved_links_without_access_token(filter_engine):
+    with Session(filter_engine) as session:
+        account = session.get(AccountModel, 2)
+        assert account is not None
+        extra = account.get_extra()
+        extra.pop("access_token", None)
+        extra["chatgpt_last_payment_link"] = {
+            "url": "https://payments.stripe.com/qr/instructions/filtered-pix-link",
+            "link_type": "pix",
+            "link_expires_at": 4_102_444_800,
+        }
+        account.token = ""
+        account.set_extra(extra)
+        state = session.get(AccountListStateModel, 2)
+        assert state is not None
+        state.payment_link_platform = "pix"
+        session.add(account)
+        session.add(state)
+        session.commit()
+
+    request = tasks.BaxiGptCdkSubmitTaskRequest(
+        all_filtered=True,
+        payment_channel="pix",
+        pix_submit_mode="user_link",
+        payment_link_platform="pix",
+    )
+    eligible, missing_ids, skipped, matched = tasks._resolve_baxigpt_cdk_submit_accounts(
+        request,
+        require_access_token=False,
+        require_saved_pix_link=True,
+    )
+
+    assert [item["account_id"] for item in matched] == [2]
+    assert [item["account_id"] for item in eligible] == [2]
+    assert missing_ids == []
+    assert skipped == []
+
+
 def test_expected_total_mismatch_has_no_task_thread_background_or_phone_pool_side_effect(filter_engine, monkeypatch):
     create_task = mock.Mock()
     import_phones = mock.Mock()

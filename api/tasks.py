@@ -2,6 +2,7 @@ from collections import deque
 from datetime import datetime, timezone
 import hashlib
 import os
+from urllib.parse import urlsplit
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -29,6 +30,7 @@ from core.task_runtime import (
 from services.account_filters import (
     AccountFilterRequestMixin,
     AccountFilterScopeChangedError,
+    account_payment_link_summary,
     account_subscription_type,
     account_validity,
     build_account_filter_audit,
@@ -297,6 +299,10 @@ class PhoneBindingTestTaskRequest(AccountFilterRequestMixin):
 
 IDEA_SUBMIT_DEFAULT_POLL_WARNING_SECONDS = 1800
 IDEA_SUBMIT_HARD_POLL_TIMEOUT_SECONDS = 24 * 3600
+PIX_SUBMIT_MODE_AUTO_EXTRACT = "auto_extract"
+PIX_SUBMIT_MODE_USER_LINK = "user_link"
+PIX_USER_LINK_HOST = "payments.stripe.com"
+PIX_USER_LINK_PATH_PREFIX = "/qr/instructions/"
 
 
 def _normalize_baxigpt_payment_channel(value: Any) -> str:
@@ -306,11 +312,27 @@ def _normalize_baxigpt_payment_channel(value: Any) -> str:
     return channel
 
 
+def _normalize_pix_submit_mode(value: Any) -> str:
+    mode = str(value or PIX_SUBMIT_MODE_AUTO_EXTRACT).strip().lower().replace("-", "_")
+    aliases = {
+        "auto_extract": PIX_SUBMIT_MODE_AUTO_EXTRACT,
+        "pix_auto_extract": PIX_SUBMIT_MODE_AUTO_EXTRACT,
+        "user_link": PIX_SUBMIT_MODE_USER_LINK,
+        "pix_user_link": PIX_SUBMIT_MODE_USER_LINK,
+    }
+    normalized = aliases.get(mode)
+    if normalized is None:
+        raise HTTPException(400, "PIX 提交方式仅支持自动提链或上传已保存链接")
+    return normalized
+
+
 class BaxiGptCdkSubmitTaskRequest(AccountFilterRequestMixin):
     account_ids: list[int] = Field(default_factory=list)
     cdk_ids: list[int] = Field(default_factory=list)
     all_filtered: bool = False
     payment_channel: str = "ideal"  # ideal | pix
+    # PIX only: preserve auto extraction as the old-client default.
+    pix_submit_mode: str = PIX_SUBMIT_MODE_AUTO_EXTRACT  # auto_extract | user_link
     code_lines: str = ""
     # PIX CDK only survives in the task-start call stack; it must never enter
     # task snapshots, logs, account extras, or the iDEAL CDK pool.
@@ -1325,8 +1347,38 @@ def _resolve_phone_binding_test_accounts(
     return eligible, [], skipped, matched
 
 
+def _saved_stripe_pix_user_link(account: AccountModel) -> tuple[str, str]:
+    """Return a currently uploadable PIX link without copying it into task meta."""
+
+    try:
+        extra = account.get_extra()
+    except Exception:
+        extra = {}
+    summary = account_payment_link_summary(account, extra if isinstance(extra, dict) else {})
+    if str(summary.get("platform") or "").strip().lower() != "pix":
+        return "", "账号没有已保存的 PIX 支付链接"
+
+    pay_link = str(summary.get("url") or "").strip()
+    try:
+        parsed = urlsplit(pay_link)
+    except (TypeError, ValueError):
+        return "", "已保存的 PIX 支付链接格式无效"
+    if (
+        parsed.scheme.lower() != "https"
+        or (parsed.hostname or "").lower() != PIX_USER_LINK_HOST
+        or not str(parsed.path or "").startswith(PIX_USER_LINK_PATH_PREFIX)
+    ):
+        return "", "已保存的 PIX 链接不是可上传的 Stripe PIX 指令链接"
+    if payment_link_expires_soon(summary):
+        return "", "已保存的 PIX 支付链接即将到期，请先重新生成"
+    return pay_link, ""
+
+
 def _resolve_baxigpt_cdk_submit_accounts(
     req: BaxiGptCdkSubmitTaskRequest,
+    *,
+    require_access_token: bool = True,
+    require_saved_pix_link: bool = False,
 ) -> tuple[list[dict[str, Any]], list[int], list[dict[str, Any]], list[dict[str, Any]]]:
     requested_ids = _normalize_batch_account_ids(req.account_ids)
     limit = max(int(req.limit or 0), 0)
@@ -1358,10 +1410,16 @@ def _resolve_baxigpt_cdk_submit_accounts(
             idea_unavailable_reason = _idea_submit_unavailable_reason(account)
             if idea_unavailable_reason:
                 skipped.append({**item, "reason": idea_unavailable_reason})
-            elif not _chatgpt_account_access_token(account):
+                continue
+            if require_saved_pix_link:
+                _, link_reason = _saved_stripe_pix_user_link(account)
+                if link_reason:
+                    skipped.append({**item, "reason": link_reason})
+                    continue
+            if require_access_token and not _chatgpt_account_access_token(account):
                 skipped.append({**item, "reason": "账号缺少 Access Token"})
-            else:
-                eligible.append(item)
+                continue
+            eligible.append(item)
         if limit > 0:
             overflow = eligible[limit:]
             eligible = eligible[:limit]
@@ -1390,10 +1448,16 @@ def _resolve_baxigpt_cdk_submit_accounts(
         idea_unavailable_reason = _idea_submit_unavailable_reason(account)
         if idea_unavailable_reason:
             skipped.append({**item, "reason": idea_unavailable_reason})
-        elif not _chatgpt_account_access_token(account):
+            continue
+        if require_saved_pix_link:
+            _, link_reason = _saved_stripe_pix_user_link(account)
+            if link_reason:
+                skipped.append({**item, "reason": link_reason})
+                continue
+        if require_access_token and not _chatgpt_account_access_token(account):
             skipped.append({**item, "reason": "账号缺少 Access Token"})
-        else:
-            eligible.append(item)
+            continue
+        eligible.append(item)
     if limit > 0:
         overflow = eligible[limit:]
         eligible = eligible[:limit]
@@ -3958,6 +4022,24 @@ PIX_CDK_MAX_LINES = 100
 PIX_CDK_MAX_LINE_LENGTH = 512
 
 
+def _assert_pix_user_link_submission_enabled() -> None:
+    """Fail before creating a local task when the remote upload mode is closed."""
+
+    from services.chatgpt_core.baxigpt_client import BaxiGptClient, BaxiGptRequestError
+
+    try:
+        options = BaxiGptClient().public_submit_options()
+    except BaxiGptRequestError as exc:
+        logger.warning("cannot confirm PIX user-link channel before task creation: %s", exc)
+        raise HTTPException(503, "无法确认 PIX 链接上传通道，请稍后重试") from exc
+    except Exception as exc:
+        logger.warning("unexpected PIX user-link option lookup failure: %s", exc)
+        raise HTTPException(503, "无法确认 PIX 链接上传通道，请稍后重试") from exc
+
+    if not options.get("pix_channel_enabled") or not options.get("pix_user_link_enabled"):
+        raise HTTPException(409, "支付提交服务尚未开启 PIX 链接上传")
+
+
 def _parse_pix_cdk_lines(req: BaxiGptCdkSubmitTaskRequest) -> tuple[list[dict[str, str]], dict[str, int]]:
     """Parse transient PIX CDKs without letting their plaintext reach task data."""
     raw = str(req.pix_cdk_lines or req.pix_cdk or "")
@@ -4035,9 +4117,18 @@ def enqueue_pix_submit_task(
     account in the same or a later task.
     """
 
+    pix_submit_mode = _normalize_pix_submit_mode(req.pix_submit_mode)
+    use_saved_pix_link = pix_submit_mode == PIX_SUBMIT_MODE_USER_LINK
+    if use_saved_pix_link:
+        _assert_pix_user_link_submission_enabled()
+
     pix_cdks, pix_cdk_input = _parse_pix_cdk_lines(req)
 
-    account_items, missing_ids, skipped_accounts, matched_accounts = _resolve_baxigpt_cdk_submit_accounts(req)
+    account_items, missing_ids, skipped_accounts, matched_accounts = _resolve_baxigpt_cdk_submit_accounts(
+        req,
+        require_access_token=not use_saved_pix_link,
+        require_saved_pix_link=use_saved_pix_link,
+    )
     total_requested_accounts = len(_normalize_batch_account_ids(req.account_ids)) if req.account_ids else len(matched_accounts)
     filter_audit = _task_account_filter_audit(
         req,
@@ -4053,6 +4144,7 @@ def enqueue_pix_submit_task(
             "cdk_id": 0,
             "code_masked": "PIX CDK",
             "payment_channel": "pix",
+            "pix_submit_mode": pix_submit_mode,
         }
         for account in account_items
     ]
@@ -4068,6 +4160,7 @@ def enqueue_pix_submit_task(
         return {
             "task_id": "",
             "payment_channel": "pix",
+            "pix_submit_mode": pix_submit_mode,
             "total_requested_accounts": total_requested_accounts,
             "matched_accounts": len(matched_accounts),
             "eligible_accounts": len(account_items),
@@ -4096,6 +4189,7 @@ def enqueue_pix_submit_task(
     )
     meta = {
         "payment_channel": "pix",
+        "pix_submit_mode": pix_submit_mode,
         "total_requested_accounts": total_requested_accounts,
         "matched_accounts": len(matched_accounts),
         "eligible_accounts": len(account_items),
@@ -4118,6 +4212,7 @@ def enqueue_pix_submit_task(
         "filter_audit": filter_audit,
         "settings": {
             "payment_channel": "pix",
+            "pix_submit_mode": pix_submit_mode,
             "pix_cdk_configured": True,
             "pix_cdk_count": pix_cdk_count,
             "pix_cdk_input": dict(pix_cdk_input),
@@ -4168,6 +4263,7 @@ def enqueue_pix_submit_task(
     return {
         "task_id": task_id,
         "payment_channel": "pix",
+        "pix_submit_mode": pix_submit_mode,
         "total_requested_accounts": total_requested_accounts,
         "matched_accounts": len(matched_accounts),
         "eligible_accounts": len(account_items),
@@ -6909,10 +7005,11 @@ def _run_pix_submit(
     settings: dict[str, Any],
     pix_cdks: list[dict[str, str]],
 ) -> None:
-    """Run PIX auto-extract tasks while keeping the CDK and status tokens in memory.
+    """Run PIX tasks while keeping CDKs, links, and status tokens in memory.
 
-    The upstream requires one account per PIX request and returns a one-time
-    status token. Each CDK has at most one paid terminal outcome; explicit
+    User-link mode reads the already persisted account link only at execution
+    time.  It never copies that URL into task metadata, runtime results, or
+    task logs.  Each CDK has at most one paid terminal outcome; explicit
     failures release it for another account, while uncertain outcomes remain
     locked for manual reconciliation.
     """
@@ -6921,6 +7018,8 @@ def _run_pix_submit(
 
     control = _task_store.control_for(task_id)
     client = BaxiGptClient()
+    pix_submit_mode = _normalize_pix_submit_mode(settings.get("pix_submit_mode"))
+    use_saved_pix_link = pix_submit_mode == PIX_SUBMIT_MODE_USER_LINK
     requested_target_success_count = max(int(settings.get("target_success_count") or 0), 0)
     raw_pix_cdks = (
         [{"code": str(pix_cdks or "").strip(), "fingerprint": _pix_cdk_usage_store.fingerprint(pix_cdks)}]
@@ -6954,10 +7053,11 @@ def _run_pix_submit(
         status_poll_interval_seconds,
         IDEA_SUBMIT_DEFAULT_POLL_WARNING_SECONDS,
     )
+    sensitive_pix_links: set[str] = set()
 
     def safe_text(value: Any, *status_tokens: Any) -> str:
         text = str(value or "")
-        for secret in ([item["code"] for item in pix_cdks], *status_tokens):
+        for secret in ([item["code"] for item in pix_cdks], *sensitive_pix_links, *status_tokens):
             secret_text = str(secret or "").strip()
             if secret_text:
                 text = text.replace(secret_text, "[REDACTED]")
@@ -7036,6 +7136,7 @@ def _run_pix_submit(
                 "status": status_value,
                 "upstream_status": status_value,
                 "payment_channel": "pix",
+                "pix_submit_mode": pix_submit_mode,
                 "code_masked": "PIX CDK",
                 "cdk_id": 0,
                 "order_id": str(order_id or existing.get("order_id") or "").strip(),
@@ -7073,6 +7174,7 @@ def _run_pix_submit(
                 "cleared_at": now if status_value == "paid" else "",
                 "source": "baxigpt_cdk_submit",
                 "payment_channel": "pix",
+                "pix_submit_mode": pix_submit_mode,
                 "cdk_id": 0,
                 "code_masked": "PIX CDK",
                 "task_id": task_id,
@@ -7186,7 +7288,7 @@ def _run_pix_submit(
 
     _log(
         task_id,
-        "[PIX] 自动提链任务启动: "
+        f"[PIX] {'上传已保存链接' if use_saved_pix_link else '自动提链'}任务启动: "
         f"候选 {len(pairs)} 个，CDK {len(pix_cdks)} 个，目标成功 {target_success_count} 个，"
         f"提交间隔 {submit_interval_seconds}s，轮询间隔 {status_poll_interval_seconds}s",
     )
@@ -7245,12 +7347,20 @@ def _run_pix_submit(
                     if account is None or account.platform != "chatgpt":
                         account = None
                         token = ""
+                        pix_pay_link = ""
                         skip_reason = "账号不存在或非 ChatGPT"
                     else:
                         skip_reason = _idea_submit_unavailable_reason(account)
-                        token = "" if skip_reason else _chatgpt_account_access_token(account)
-                        if not skip_reason and not token:
-                            skip_reason = "账号缺少 Access Token"
+                        if use_saved_pix_link:
+                            token = ""
+                            pix_pay_link, link_reason = _saved_stripe_pix_user_link(account)
+                            if not skip_reason and link_reason:
+                                skip_reason = link_reason
+                        else:
+                            pix_pay_link = ""
+                            token = "" if skip_reason else _chatgpt_account_access_token(account)
+                            if not skip_reason and not token:
+                                skip_reason = "账号缺少 Access Token"
                 if skip_reason:
                     pending_accounts.pop(0)
                     skipped_count += 1
@@ -7265,6 +7375,9 @@ def _run_pix_submit(
                         reason=skip_reason,
                     )
                     continue
+
+                if pix_pay_link:
+                    sensitive_pix_links.add(pix_pay_link)
 
                 cdk = available_cdks.pop(0)
                 if control.is_stop_after_current_requested():
@@ -7307,7 +7420,13 @@ def _run_pix_submit(
                             "已请求完成当前后停止；不再预留 CDK 或提交新的 PIX 订单",
                         )
                         break
-                    submit_result = client.submit_pix(pix_cdk=cdk["code"], access_token=token)
+                    if use_saved_pix_link:
+                        submit_result = client.submit_pix_user_link(
+                            pix_cdk=cdk["code"],
+                            pix_pay_link=pix_pay_link,
+                        )
+                    else:
+                        submit_result = client.submit_pix(pix_cdk=cdk["code"], access_token=token)
                     if not bool(submit_result.get("ok")):
                         reason = safe_text(submit_result.get("message") or "PIX 上游提交失败")
                         unknown = bool(submit_result.get("submission_unknown"))
