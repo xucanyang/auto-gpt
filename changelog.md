@@ -4,7 +4,21 @@
 
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，并且本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/) (语义化版本)。
 
-## [2.2.13] - 2026-07-17
+## [2.2.14] - 2026-07-16
+
+### 新增 (Added)
+- **过期 PIX 链接清理任务日志弹窗**：`api/tasks.py` 新增 `/api/tasks/chatgpt/payment-links/pix-cleanup/task` 后台任务入口，确认清理后立即返回 `task_id`，并通过现有任务快照、SSE 日志流和 `TaskLog` 持久化完整展示重新扫描、缺少时间安全保留、SQLite 备份校验、事务清理、列表索引刷新及并发变化跳过过程。旧同步清理接口继续保留，兼容部署前已经打开的页面。
+- **固定终态清理汇总**：成功任务最后一条日志统一输出 `[SUMMARY] 总：N；保留：N；过期：N`；“保留”包含有效链接及缺少时间而未清理的链接，实际清理数、并发跳过数、索引刷新数和备份结果在上一条明细日志中单独记录。没有过期链接时仍生成成功任务与 `过期：0` 汇总，执行失败则以明确的 `[FAIL]` 终态结束，不伪造成功总结。
+
+### 优化 (Changed)
+- **清理任务复用与操作边界**：同一实例已有 `pending/running` 的 PIX 清理任务时复用原 `task_id`，避免多标签页并发创建重复数据库备份；清理日志弹窗隐藏不适用于原子数据库操作的“跳过当前账号 / 完成当前后停止 / 立即停止”按钮，保留 Info/Debug 切换和复制日志。
+- **任务完成后统一刷新账号列表**：`frontend/src/pages/Accounts.tsx` 将清理执行切换到现有任务弹窗与活动任务面板；任务终态继续走统一 `onTaskDone -> load()` 刷新账号列表和派生筛选，不再依赖同步接口返回后即时刷新。`frontend/src/app/AppShell.tsx` 侧栏版本同步为 `v2.2.14`。
+
+### 测试 (Tests)
+- **后台任务与前端合同回归**：新增 `tests/test_pix_payment_link_cleanup_task.py`，覆盖独立 POST 路由、请求线程不执行清理、活动任务并发复用、成功/零过期/失败终态、最后一行汇总及完整 `TaskLog` 持久化；扩展 `tests/test_accounts_pix_link_cleanup_ui.py`，锁定 React 19 上下文确认框、任务 source/mode、日志弹窗和清理任务控制按钮隐藏。
+- **清理服务与历史保护回归**：定向执行 PIX 清理服务、后台任务、前端合同及 long-link 历史同步测试，继续验证 SQLite 备份完整性、原子清理、列表索引刷新、历史保留和 tombstone 防复活边界。
+
+## [2.2.13] - 2026-07-16
 
 ### 修复 (Fixed)
 - **修复过期 PIX 链接清理确认弹窗不执行**：`frontend/src/pages/Accounts.tsx` 不再调用 antd 的静态 `Modal.confirm`，改用 `App.useApp()` 提供的上下文 `appModal.confirm`。当前运行时使用 React 19，静态 Modal 依赖的旧 `react-dom.render/createRoot` 入口不会渲染确认框，导致用户只能完成预览请求而永远不会触发清理 POST；修复后确认按钮会正常调用 `/api/tasks/chatgpt/payment-links/pix-cleanup`，保留服务端重新计算、原子事务、历史保留和并发跳过边界。
@@ -13,7 +27,7 @@
 - **补强清理前端合同断言**：`tests/test_accounts_pix_link_cleanup_ui.py` 锁定页面使用上下文 Modal、禁止回退到静态确认 API，并继续验证预览、确认后的清理请求和列表刷新契约。
 - **前端生产构建验证**：`frontend` 的 TypeScript 检查与 Vite 构建通过，确保 React 19 下的 Modal 调用可以随线上 bundle 发布。
 
-## [2.2.12] - 2026-07-17
+## [2.2.12] - 2026-07-16
 
 ### 新增 (Added)
 - **通用提交状态与真实提交证据筛选**：`services/account_filters.py`、`core/db.py`、`api/accounts.py` 与账号页新增 `submit_state` / `has_submitted`，将原“Idea提交”列统一为“提交状态”。结果状态与“是否真正提交过”可组合筛选；`chatgpt_last_payment_link.link_status=pix_submitted` 会被识别为 PIX 已提交证据，因此“已提交但处理失败/待复核/账号不可用”可以同时表达，不再把 Idea 与 PIX 拆成两套可见列。旧 `idea_submit_state` API、响应别名和筛选预设继续兼容，旧预设加载后迁移到通用状态且不会凭失败记录猜测已提交。
@@ -1753,4 +1767,8 @@
 
 ## 2026-07-17 02:32:15 +0800
 - 修复 React 19 下过期 PIX 链接清理确认弹窗并延后 loading
+- 发布模式: multi
+
+## 2026-07-17 04:09:25 +0800
+- 增加过期 PIX 清理任务日志与终态汇总
 - 发布模式: multi

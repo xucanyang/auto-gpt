@@ -397,6 +397,13 @@ type PixLinkCleanupReport = {
   concurrent_skipped_links?: number
 }
 
+type PixLinkCleanupTaskResponse = {
+  task_id?: string
+  source?: string
+  instance_id?: string
+  already_running?: boolean
+}
+
 const ACCOUNT_COLUMN_OPTIONS: Array<{ value: AccountColumnKey; text: string; chatgptOnly?: boolean }> = [
   { value: 'manually_used', text: '使用状态' },
   { value: 'phone_binding', text: '手机号/API', chatgptOnly: true },
@@ -2240,7 +2247,7 @@ function shouldShowInvalidRecheckButton(record: any) {
   return String(record?.status || '').trim().toLowerCase() === 'invalid'
 }
 
-function taskModalModeFromSource(source: unknown): 'register' | 'resume_auth' | 'payment_link' | 'sub2api_upload' | 'oaipay_upload' | 'baxigpt_cdk' | 'paypal_bind' | 'probe_local_status' {
+function taskModalModeFromSource(source: unknown): 'register' | 'resume_auth' | 'payment_link' | 'pix_cleanup' | 'sub2api_upload' | 'oaipay_upload' | 'baxigpt_cdk' | 'paypal_bind' | 'probe_local_status' {
   const normalized = String(source || '').trim().toLowerCase()
   if (normalized === 'baxigpt_cdk' || normalized === 'baxigpt_cdk_submit') return 'baxigpt_cdk'
   if (normalized === 'chatgpt_paypal_bind' || normalized === 'paypal_bind') return 'paypal_bind'
@@ -2251,6 +2258,7 @@ function taskModalModeFromSource(source: unknown): 'register' | 'resume_auth' | 
   if (normalized === 'batch_oaipay_upload') return 'oaipay_upload'
   if (normalized === 'invalid_recheck' || normalized === 'batch_invalid_recheck') return 'resume_auth'
   if (normalized === 'payment_link' || normalized === 'batch_payment_link') return 'payment_link'
+  if (normalized === 'pix_cleanup' || normalized === 'pix_payment_link_cleanup') return 'pix_cleanup'
   return 'register'
 }
 
@@ -2303,7 +2311,7 @@ export default function Accounts() {
   const [filterPresetEditorMode, setFilterPresetEditorMode] = useState<'create-current' | 'edit-meta' | 'copy-preset'>('create-current')
 
   const [registerModalOpen, setRegisterModalOpen] = useState(false)
-  const [taskModalMode, setTaskModalMode] = useState<'register' | 'resume_auth' | 'payment_link' | 'sub2api_upload' | 'oaipay_upload' | 'baxigpt_cdk' | 'paypal_bind' | 'probe_local_status'>('register')
+  const [taskModalMode, setTaskModalMode] = useState<'register' | 'resume_auth' | 'payment_link' | 'pix_cleanup' | 'sub2api_upload' | 'oaipay_upload' | 'baxigpt_cdk' | 'paypal_bind' | 'probe_local_status'>('register')
   const [taskModalAccount, setTaskModalAccount] = useState<any>(null)
   const [addModalOpen, setAddModalOpen] = useState(false)
   const [importModalOpen, setImportModalOpen] = useState(false)
@@ -3881,22 +3889,34 @@ export default function Accounts() {
   const executeExpiredPixLinkCleanup = async () => {
     setPixLinkCleanupLoading(true)
     try {
-      const result = await apiFetch('/tasks/chatgpt/payment-links/pix-cleanup', {
+      const result = await apiFetch('/tasks/chatgpt/payment-links/pix-cleanup/task', {
         method: 'POST',
-      }) as PixLinkCleanupReport
-      const cleaned = Number(result?.cleaned_links || 0)
-      const skipped = Number(result?.concurrent_skipped_links || 0)
-      const instanceId = String(result?.instance_id || '当前实例')
-      if (cleaned > 0) {
-        appMessage.success(
-          `${instanceId} 已清理 ${cleaned} 条过期 PIX 链接${skipped > 0 ? `，并发变化跳过 ${skipped} 条` : ''}`,
-        )
-      } else {
-        appMessage.info(`${instanceId} 当前没有需要清理的过期 PIX 链接`)
+      }) as PixLinkCleanupTaskResponse
+      const taskIdFromResponse = String(result?.task_id || '').trim()
+      if (!taskIdFromResponse) {
+        throw new Error('清理任务未返回 task_id')
       }
-      await accountsQuery.refetch()
+      const instanceId = String(result?.instance_id || '当前实例')
+      setTaskModalMode('pix_cleanup')
+      setTaskModalAccount(null)
+      setTaskId(taskIdFromResponse)
+      setTaskSnapshot({
+        id: taskIdFromResponse,
+        task_id: taskIdFromResponse,
+        source: String(result?.source || 'pix_payment_link_cleanup'),
+        status: result?.already_running ? 'running' : 'pending',
+        meta: { instance_id: instanceId },
+      })
+      setRegisterModalOpen(true)
+      setActiveTasksPanelOpen(true)
+      void activeTasksQuery.refetch()
+      if (result?.already_running) {
+        appMessage.info(`${instanceId} 已有清理任务在运行，已打开现有任务日志`)
+      } else {
+        appMessage.success(`${instanceId} 过期 PIX 链接清理任务已启动`)
+      }
     } catch (e: any) {
-      appMessage.error(e?.message || '过期 PIX 支付链接清理失败')
+      appMessage.error(e?.message || '过期 PIX 支付链接清理任务启动失败')
       throw e
     } finally {
       setPixLinkCleanupLoading(false)
@@ -3920,9 +3940,7 @@ export default function Accounts() {
     const instanceId = String(preview?.instance_id || '当前实例')
     const cutoff = String(preview?.cutoff_display || '最近一个北京时间 11:00')
     if (expired <= 0) {
-      appMessage.info(
-        `${instanceId} 当前没有已过期 PIX 链接${missing > 0 ? `；另有 ${missing} 条缺少时间信息，已安全跳过` : ''}`,
-      )
+      void executeExpiredPixLinkCleanup()
       return
     }
 

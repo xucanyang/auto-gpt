@@ -9,6 +9,7 @@ import { getTaskTerminalStatus, type TaskTerminalStatus } from '@/lib/taskStatus
 interface TaskLogPanelProps {
   taskId: string
   onDone?: () => Promise<void> | void
+  showTaskControls?: boolean
 }
 
 type TaskPanelStatus = 'idle' | TaskTerminalStatus
@@ -48,7 +49,7 @@ function parseLogLine(rawLine: string) {
   return { raw: line, text, isDebug, time, phoneBindingAccountKey }
 }
 
-export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
+export function TaskLogPanel({ taskId, onDone, showTaskControls = true }: TaskLogPanelProps) {
   const { token } = theme.useToken()
   const [lines, setLines] = useState<string[]>([])
   const [error, setError] = useState('')
@@ -437,38 +438,40 @@ export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', minHeight: 0 }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap', marginBottom: 8 }}>
-        <Space>
-          <Button
-            size="small"
-            icon={<FastForwardOutlined />}
-            onClick={handleSkipCurrent}
-            loading={skipLoading}
-            disabled={interactionLocked}
-          >
-            跳过当前账号
-          </Button>
-          {supportsStopAfterCurrent ? (
+      <div style={{ display: 'flex', justifyContent: showTaskControls ? 'space-between' : 'flex-end', gap: 8, flexWrap: 'wrap', marginBottom: 8 }}>
+        {showTaskControls ? (
+          <Space>
             <Button
               size="small"
-              onClick={() => handleStopTask('after_current')}
-              loading={stopLoading && stopMode === 'none'}
-              disabled={isFinished || stopMode !== 'none'}
+              icon={<FastForwardOutlined />}
+              onClick={handleSkipCurrent}
+              loading={skipLoading}
+              disabled={interactionLocked}
             >
-              完成当前后停止
+              跳过当前账号
             </Button>
-          ) : null}
-          <Button
-            size="small"
-            danger
-            icon={<StopOutlined />}
-            onClick={() => handleStopTask('immediate')}
-            loading={stopLoading}
-            disabled={isFinished || stopMode === 'immediate'}
-          >
-            立即停止
-          </Button>
-        </Space>
+            {supportsStopAfterCurrent ? (
+              <Button
+                size="small"
+                onClick={() => handleStopTask('after_current')}
+                loading={stopLoading && stopMode === 'none'}
+                disabled={isFinished || stopMode !== 'none'}
+              >
+                完成当前后停止
+              </Button>
+            ) : null}
+            <Button
+              size="small"
+              danger
+              icon={<StopOutlined />}
+              onClick={() => handleStopTask('immediate')}
+              loading={stopLoading}
+              disabled={isFinished || stopMode === 'immediate'}
+            >
+              立即停止
+            </Button>
+          </Space>
+        ) : null}
         <Space>
           <Segmented
             size="small"
