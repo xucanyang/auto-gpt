@@ -433,8 +433,11 @@ class BaxiGptClient:
             return {"ok": False, "status": "failed", "message": "PIX 支付链接不能为空"}
 
         payload = {
-            "submitMode": "pix_user_link",
-            "pixCdk": cdk,
+            # The upstream classifies the code itself: a locally issued
+            # multi-credit CDK goes through IDEA, while an external PIX CDK
+            # keeps its one-success PIX-worker contract.
+            "submitMode": "pix_unified_user_link",
+            "cdk": cdk,
             "pixPayLink": pay_link,
             "accounts": [],
         }
@@ -476,6 +479,12 @@ class BaxiGptClient:
                 "message": "PIX 上游已响应但未返回可轮询任务凭据，请人工复核",
                 "submission_unknown": True,
             }
+        reuse_policy = str(res.get("cdk_reuse_policy") or "").strip().lower()
+        if reuse_policy not in {"after_paid", "one_success"}:
+            # Older submit services never returned the capability. Default to
+            # the safe legacy contract; do not accidentally reuse an external
+            # upstream CDK merely because the response was old or incomplete.
+            reuse_policy = "one_success"
         return {
             "ok": True,
             "status": _normalize_task_status(task.get("status")),
@@ -483,6 +492,7 @@ class BaxiGptClient:
             "display_id": task_id,
             "task_id": task_id,
             "status_token": status_token,
+            "cdk_reuse_policy": reuse_policy,
         }
 
     def pix_status(self, *, task_id: str, status_token: str) -> dict[str, Any]:

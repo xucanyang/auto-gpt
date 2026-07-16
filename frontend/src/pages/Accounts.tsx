@@ -48,6 +48,7 @@ import { AccountDetailModal } from '@/features/accounts/components/AccountDetail
 import { AccountsToolbar } from '@/features/accounts/components/AccountsToolbar'
 import type {
   AccountExportMode,
+  AccountExportScope,
   AccountsToolbarActionId as AccountToolbarActionId,
 } from '@/features/accounts/components/AccountsToolbar'
 import { BatchGopayWorkbench } from '@/features/accounts/components/BatchGopayWorkbench'
@@ -3402,7 +3403,10 @@ export default function Accounts() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  const exportCsv = async (exportMode: AccountExportMode = 'sub2api') => {
+  const exportCsv = async (
+    exportMode: AccountExportMode = 'sub2api',
+    exportScope: AccountExportScope = 'selected',
+  ) => {
     if (currentPlatform === 'chatgpt') {
       try {
         const token = localStorage.getItem('auth_token') || ''
@@ -3412,19 +3416,44 @@ export default function Accounts() {
         const selectedIds = selectedRowKeys
           .map((key) => Number(key))
           .filter((id) => Number.isFinite(id) && id > 0)
+        const body: Record<string, unknown> = {
+          ids: selectedIds,
+          mode: exportMode,
+        }
+        if (exportMode === 'pix_payment_links') {
+          if (exportScope === 'filtered') {
+            if (!currentFilterScopeReady) {
+              appMessage.warning('账号列表正在更新，请等待当前筛选数量刷新后再导出 PIX 支付链接')
+              return
+            }
+            body.ids = []
+            Object.assign(body, currentAccountFilterBody, {
+              all_filtered: true,
+              expected_total: currentFilteredTotal,
+            })
+          } else if (selectedIds.length === 0) {
+            appMessage.warning('请先选择要导出 PIX 支付链接的账号')
+            return
+          }
+        }
         const res = await fetch('/api/chatgpt/export-sub2api-ticket', {
           method: 'POST',
           headers: {
             Authorization: `Bearer ${token}`,
             'Content-Type': 'application/json',
           },
-          body: JSON.stringify({ ids: selectedIds, mode: exportMode }),
+          body: JSON.stringify(body),
         })
         if (!res.ok) {
           let detail = ''
           try {
             const data = await res.json()
-            detail = String(data?.detail || data?.message || '')
+            const errorDetail = data?.detail
+            detail = typeof errorDetail === 'string'
+              ? errorDetail
+              : errorDetail && typeof errorDetail === 'object'
+                ? String((errorDetail as { message?: unknown }).message || '')
+                : String(data?.message || '')
           } catch {
             detail = await res.text()
           }
@@ -4099,7 +4128,7 @@ export default function Accounts() {
       if (paymentChannel === 'ideal') void loadBaxiCdkPoolSummary()
       message.success({
         content: paymentChannel === 'pix'
-          ? `${pixSubmissionLabel}已启动：${pairCount} 个候选账号，${pixCdkCount} 个 CDK${targetSuccess > 0 ? `，目标成功 ${targetSuccess} 个` : ''}。明确失败会释放 CDK，成功核销后不再复用。`
+          ? `${pixSubmissionLabel}已启动：${pairCount} 个候选账号，${pixCdkCount} 个 CDK${targetSuccess > 0 ? `，目标成功 ${targetSuccess} 个` : ''}。本站多额度 CDK 仅在确认 paid 后串行复用；外部 PIX CDK 成功后不复用；未知结果继续锁定人工复核。`
           : `iDEAL 批量提交已启动：${pairCount} 个候选配对${targetSuccess > 0 ? `，目标成功 ${targetSuccess} 个` : ''}，候选账号 ${eligible} 个，可用卡密 ${availableCodes} 个${spareCodes > 0 ? `，剩余入库 ${spareCodes} 个` : ''}${importErrors.length > 0 ? `，解析跳过 ${importErrors.length} 行` : ''}`,
         key: toastKey,
       })
@@ -8628,8 +8657,8 @@ export default function Accounts() {
             }
             description={baxiIsPix
               ? baxiPixUsesSavedLink
-                ? '按账号范围读取已保存的 Stripe PIX 指令链接直接上传；不读取 Access Token。PIX CDK 明确失败会释放，成功或未知结果继续按既有规则锁定。'
-                : 'PIX 自动提链：每行一个 CDK，提交时读取账号 Access Token。明确失败会释放该 CDK 继续尝试，成功核销后全局不再复用；未知结果保持待复核锁定。'
+                ? '按账号范围读取已保存的 Stripe PIX 指令链接直接上传；不读取 Access Token。本站多额度 CDK 按剩余额度串行复用，同卡绝不并发，只有确认 paid 后才进入下一账号；明确失败会释放，余额不足仅停止本轮使用，网络、5xx、缺少轮询凭据或未知结果继续锁定人工复核。外部 PIX CDK 保持一次性规则。'
+                : 'PIX 自动提链：每行一个外部 PIX CDK，提交时读取账号 Access Token。明确失败会释放该 CDK 继续尝试；支付成功、处理中或未知结果不会再次使用同一外部 CDK。'
               : 'iDEAL 提交成功指上游 /api/submit 返回 ok 和 order_id；不会阻塞等待 paid，默认会把订单加入后台轮询，查到状态后同步卡密池和绑定账号。'}
           />
           <div
@@ -8652,9 +8681,7 @@ export default function Accounts() {
             <Form.Item
               name="target_success_count"
               label="本次目标成功数量"
-              extra={baxiIsPix
-                ? '0 表示每个可用 PIX CDK 最多核销成功一次；填写后达到目标 paid 数就停止继续提交新账号。'
-                : '0 表示按账号范围尽量全部提交；填写后达到目标 paid 数就停止继续提交新账号。'}
+              extra="0 表示按账号范围尽量全部提交；填写后达到目标 paid 数就停止继续提交新账号。"
             >
               <InputNumber
                 min={0}
@@ -8662,7 +8689,7 @@ export default function Accounts() {
                 precision={0}
                 step={1}
                 addonAfter="个"
-                placeholder="0 = 不限制"
+                placeholder="0 = 按账号范围全部提交"
                 style={{ width: '100%' }}
               />
             </Form.Item>
@@ -8707,12 +8734,12 @@ export default function Accounts() {
             >
               <Form.Item
                 name="pix_cdk_lines"
-                label="PIX CDK（每行一个）"
+                label="PIX CDK / 本站额度 CDK（每行一个）"
                 rules={[{ required: true, whitespace: true, message: '请每行输入一个 PIX CDK' }]}
                 style={{ marginBottom: 0 }}
                 extra={baxiPixUsesSavedLink
-                  ? '当前提交服务仍要求外部 PIX CDK。每个可上传链接按账号顺序配对；明确失败会释放 CDK，支付成功、处理中或待复核的 CDK 不会再次提交。'
-                  : '最多 100 个。明确失败会释放 CDK 继续尝试；支付成功、处理中或待复核的 CDK 不会再次提交。'}
+                  ? '可填本站多额度 CDK 或外部 PIX CDK。本站卡按余额串行复用，确认 paid 后才释放下一额度；外部卡成功后不复用。最多 100 个；同一输入只保留一次，避免并发使用同卡。'
+                  : '最多 100 个外部 PIX CDK。明确失败会释放 CDK 继续尝试；支付成功、处理中或待复核的 CDK 不会再次提交。'}
               >
                 <Input.TextArea
                   autoComplete="off"
@@ -8947,7 +8974,7 @@ export default function Accounts() {
                 name="submit_interval_seconds"
                 label="提交间隔"
                 extra={baxiIsPix
-                  ? 'PIX 每次仅提交一个账号；上游未确认的提交不会自动重投。'
+                  ? '同一 CDK 始终串行；上游未确认的提交不会自动重投。不同 CDK 可各自处理一笔。'
                   : '只在上一个账号 /api/submit 成功后等待；预查失败、无配额或提交失败不会等待。'}
               >
                 <InputNumber min={0} max={3600} step={1} addonAfter="秒" style={{ width: '100%' }} />

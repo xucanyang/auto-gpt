@@ -29,7 +29,8 @@ export type AccountsToolbarActionId =
   | 'paymentLink'
   | 'gopay'
 
-export type AccountExportMode = 'sub2api' | 'access_token'
+export type AccountExportMode = 'sub2api' | 'access_token' | 'pix_payment_links'
+export type AccountExportScope = 'selected' | 'filtered'
 
 type AccountsToolbarDangerActionId = 'deleteInvalid' | 'batchDelete'
 type MoreMenuClickInfo = Parameters<NonNullable<MenuProps['onClick']>>[0]
@@ -150,7 +151,7 @@ type AccountsToolbarProps = {
   onDeleteInvalid: () => Promise<void> | void
   onBatchDelete: () => Promise<void> | void
   onOpenImport: () => void
-  onExportCsv: (mode?: AccountExportMode) => void
+  onExportCsv: (mode?: AccountExportMode, scope?: AccountExportScope) => void
   onOpenAdd: () => void
   loading: boolean
   onRefresh: () => Promise<void> | void
@@ -231,9 +232,29 @@ export function AccountsToolbar({
   const exportMenuItems: MenuProps['items'] = [
     { key: 'sub2api', label: 'Sub2API JSON（默认）' },
     { key: 'access_token', label: '仅 AccessToken（每行一个）' },
+    { type: 'divider' },
+    {
+      key: 'pix_selected',
+      label: `PIX 支付链接（已选账号 ${selectedRowKeys.length}）`,
+      disabled: selectedRowKeys.length === 0,
+    },
+    {
+      key: 'pix_filtered',
+      label: `PIX 支付链接（当前筛选 ${total}）`,
+      disabled: total === 0,
+    },
   ]
   const handleExportMenuClick: MenuProps['onClick'] = ({ key }) => {
-    onExportCsv(String(key) === 'access_token' ? 'access_token' : 'sub2api')
+    const exportKey = String(key)
+    if (exportKey === 'pix_selected') {
+      onExportCsv('pix_payment_links', 'selected')
+      return
+    }
+    if (exportKey === 'pix_filtered') {
+      onExportCsv('pix_payment_links', 'filtered')
+      return
+    }
+    onExportCsv(exportKey === 'access_token' ? 'access_token' : 'sub2api')
   }
   const paymentLinkMenuItems: MenuProps['items'] = [
     {

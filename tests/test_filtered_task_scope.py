@@ -6,7 +6,7 @@ import pytest
 from fastapi import HTTPException
 from sqlmodel import SQLModel, Session, create_engine
 
-from api import accounts, actions, tasks
+from api import accounts, actions, chatgpt, tasks
 from core.db import AccountListStateModel, AccountModel
 from services import account_filters
 from services.account_rate_limit_recovery import reconcile_rate_limited_accounts as real_reconcile_rate_limited_accounts
@@ -215,6 +215,58 @@ def test_payment_link_platform_filter_keeps_list_and_task_scope_identical(filter
 
     assert listed["total"] == resolution.matched_total == 1
     assert {item["id"] for item in listed["items"]} == set(resolution.account_ids) == {2}
+
+
+def test_filtered_pix_export_scope_freezes_only_saved_pix_links(filter_engine):
+    with Session(filter_engine) as session:
+        account = session.get(AccountModel, 2)
+        assert account is not None
+        extra = account.get_extra()
+        extra["chatgpt_last_payment_link"] = {
+            "url": "https://payments.example.test/filtered-pix-link",
+            "link_type": "pix",
+        }
+        account.set_extra(extra)
+        state = session.get(AccountListStateModel, 2)
+        assert state is not None
+        state.payment_link_platform = "pix"
+        session.add(account)
+        session.add(state)
+        session.commit()
+
+        request = chatgpt.Sub2ApiExportTicketReq(
+            mode=chatgpt.CHATGPT_EXPORT_MODE_PIX_PAYMENT_LINKS,
+            all_filtered=True,
+            payment_link_platform="pix",
+            expected_total=1,
+        )
+        account_ids = chatgpt._resolve_pix_payment_link_export_account_ids(
+            req=request,
+            session=session,
+        )
+
+    assert account_ids == [2]
+
+
+def test_filtered_pix_export_rejects_a_stale_scope_before_ticket_creation(filter_engine):
+    with Session(filter_engine) as session:
+        state = session.get(AccountListStateModel, 2)
+        assert state is not None
+        state.payment_link_platform = "pix"
+        session.add(state)
+        session.commit()
+
+        request = chatgpt.Sub2ApiExportTicketReq(
+            mode=chatgpt.CHATGPT_EXPORT_MODE_PIX_PAYMENT_LINKS,
+            all_filtered=True,
+            payment_link_platform="pix",
+            expected_total=2,
+        )
+        with pytest.raises(HTTPException) as raised:
+            chatgpt._resolve_pix_payment_link_export_account_ids(req=request, session=session)
+
+    assert raised.value.status_code == 409
+    assert raised.value.detail["code"] == "FILTER_SCOPE_CHANGED"
 
 
 def test_pix_user_link_filtered_scope_uses_saved_links_without_access_token(filter_engine):

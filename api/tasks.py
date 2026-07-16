@@ -4150,7 +4150,9 @@ def enqueue_pix_submit_task(
     ]
     pair_count = len(pairs)
     pix_cdk_count = len(pix_cdks)
-    max_success_count = min(pair_count, pix_cdk_count)
+    # A site-issued PIX CDK can carry multiple credits. The number of entered
+    # CDKs limits parallelism, not the eventual number of paid accounts.
+    max_success_count = pair_count
     effective_target_success_count = (
         min(requested_target_success_count, max_success_count)
         if requested_target_success_count > 0
@@ -7008,10 +7010,11 @@ def _run_pix_submit(
     """Run PIX tasks while keeping CDKs, links, and status tokens in memory.
 
     User-link mode reads the already persisted account link only at execution
-    time.  It never copies that URL into task metadata, runtime results, or
-    task logs.  Each CDK has at most one paid terminal outcome; explicit
-    failures release it for another account, while uncertain outcomes remain
-    locked for manual reconciliation.
+    time. It never copies that URL into task metadata, runtime results, or
+    task logs. A local multi-credit CDK is reused strictly serially after a
+    confirmed paid result; external one-success CDKs remain blocked. Explicit
+    failures release a reservation, while uncertain outcomes remain locked for
+    manual reconciliation.
     """
 
     from services.chatgpt_core.baxigpt_client import BaxiGptClient, BaxiGptRequestError
@@ -7032,11 +7035,19 @@ def _run_pix_submit(
             "code": str(item.get("code") or "").strip(),
             "fingerprint": str(item.get("fingerprint") or "").strip(),
             "label": f"PIX CDK #{index}" if pix_cdk_label_count > 1 else "PIX CDK",
+            # Unknown/legacy upstream responses must be treated as external
+            # one-success credentials until the direct-link submit response
+            # explicitly grants the local balance-CDK capability.
+            "reuse_policy": str(item.get("reuse_policy") or "one_success").strip().lower(),
         }
         for index, item in enumerate(raw_pix_cdks, start=1)
         if str(item.get("code") or "").strip() and str(item.get("fingerprint") or "").strip()
     ]
-    target_success_count = min(requested_target_success_count, len(pairs), len(pix_cdks)) if requested_target_success_count > 0 else min(len(pairs), len(pix_cdks))
+    target_success_count = (
+        min(requested_target_success_count, len(pairs))
+        if requested_target_success_count > 0
+        else len(pairs)
+    )
     total = max(target_success_count, 1)
     submitted_count = 0
     success_count = 0
@@ -7240,21 +7251,26 @@ def _run_pix_submit(
             time.sleep(chunk)
             remaining -= chunk
 
-    def release_cdk(cdk: dict[str, str], account_id: int, *, reusable: bool, requeue: bool) -> None:
-        """Release only an explicitly failed CDK reservation back to this run."""
+    def release_cdk(cdk: dict[str, str], account_id: int, *, reusable: bool, requeue: bool) -> bool:
+        """Release an explicit failure; requeue only after durable release."""
         try:
             if reusable:
-                _pix_cdk_usage_store.release(
+                released = _pix_cdk_usage_store.release(
                     cdk["fingerprint"], task_id=task_id, account_id=account_id,
                 )
-                if requeue:
+                if released and requeue:
                     available_cdks.append(cdk)
+                elif not released:
+                    _log(task_id, f"[PIX][WARN] {cdk['label']} 当前占用已变化，未重新加入可用队列")
+                return bool(released)
             else:
                 _pix_cdk_usage_store.mark_blocked(
                     cdk["fingerprint"], task_id=task_id, account_id=account_id,
                 )
+                return True
         except Exception as exc:
             _log(task_id, f"[PIX][WARN] CDK 状态同步失败: {safe_text(exc)}")
+            return False
 
     def lock_cdk_for_review(cdk: dict[str, str], account_id: int, *, order_id: str = "") -> None:
         try:
@@ -7269,6 +7285,16 @@ def _run_pix_submit(
         return any(marker in lower for marker in (
             "cdk_used", "cdk_invalid", "cdk_disabled", "卡密已使用", "卡密无效", "卡密已禁用",
         ))
+
+    def cdk_error_is_capacity_exhausted(reason: str) -> bool:
+        lower = str(reason or "").lower()
+        return any(marker in lower for marker in (
+            "cdk余额不足", "当前剩余: 0", "额度已耗尽", "余额不足",
+            "insufficient balance", "balance exhausted", "no remaining balance",
+        ))
+
+    def cdk_reuse_after_paid(cdk: dict[str, str]) -> bool:
+        return str(cdk.get("reuse_policy") or "").strip().lower() == "after_paid"
 
     def mark_remaining_unsubmitted(pending_accounts: list[dict[str, Any]], reason: str) -> None:
         nonlocal skipped_count
@@ -7470,15 +7496,25 @@ def _run_pix_submit(
                                 idea_marked_unavailable=should_mark_unavailable,
                             )
                             terminal_cdk_error = cdk_error_is_terminal(reason)
+                            capacity_exhausted = cdk_error_is_capacity_exhausted(reason)
                             release_cdk(
                                 cdk,
                                 account_id,
                                 reusable=not terminal_cdk_error,
-                                requeue=failure_continue and not terminal_cdk_error,
+                                requeue=(
+                                    failure_continue
+                                    and not terminal_cdk_error
+                                    and not capacity_exhausted
+                                ),
                             )
+                            if capacity_exhausted:
+                                _log(task_id, f"[PIX] {cdk['label']} 本站余额不足，本轮停止使用该卡；充值后可再次提交")
                         if not failure_continue:
                             stop_new_submissions = True
                         continue
+                    remote_reuse_policy = str(submit_result.get("cdk_reuse_policy") or "").strip().lower()
+                    if remote_reuse_policy in {"after_paid", "one_success"}:
+                        cdk["reuse_policy"] = remote_reuse_policy
                     submitted_count += 1
                     order_id = str(submit_result.get("order_id") or submit_result.get("task_id") or "").strip()
                     display_id = str(submit_result.get("display_id") or order_id).strip()
@@ -7559,12 +7595,19 @@ def _run_pix_submit(
                             idea_marked_unavailable=should_mark_unavailable,
                         )
                         terminal_cdk_error = cdk_error_is_terminal(reason)
+                        capacity_exhausted = cdk_error_is_capacity_exhausted(reason)
                         release_cdk(
                             cdk,
                             account_id,
                             reusable=not terminal_cdk_error,
-                            requeue=failure_continue and not terminal_cdk_error,
+                            requeue=(
+                                failure_continue
+                                and not terminal_cdk_error
+                                and not capacity_exhausted
+                            ),
                         )
+                        if capacity_exhausted:
+                            _log(task_id, f"[PIX] {cdk['label']} 本站余额不足，本轮停止使用该卡；充值后可再次提交")
                     if not failure_continue:
                         stop_new_submissions = True
                 except Exception as exc:
@@ -7619,10 +7662,16 @@ def _run_pix_submit(
                 status_value = _normalize_idea_submit_result_status(status_result.get("status"))
                 reason = safe_text(status_result.get("message"), status_token)
                 if status_value == "paid":
+                    paid_usage_recorded = False
                     try:
                         _pix_cdk_usage_store.mark_paid(
-                            cdk["fingerprint"], task_id=task_id, account_id=account_id, order_id=order_id,
+                            cdk["fingerprint"],
+                            task_id=task_id,
+                            account_id=account_id,
+                            order_id=order_id,
+                            retain_block=not cdk_reuse_after_paid(cdk),
                         )
+                        paid_usage_recorded = True
                     except Exception as exc:
                         # The upstream is already paid. Keep this CDK locked
                         # instead of creating a reuse opportunity on a DB hiccup.
@@ -7642,6 +7691,17 @@ def _run_pix_submit(
                         display_id=display_id,
                         local_status_refresh=local_status_summary,
                     )
+                    # One fingerprint never has more than one current
+                    # reservation. Only a durable paid-history write releases
+                    # a site balance CDK, and only then may the next account
+                    # reserve it. External/legacy CDKs keep their blocked row.
+                    if (
+                        paid_usage_recorded
+                        and cdk_reuse_after_paid(cdk)
+                        and not control.is_stop_after_current_requested()
+                        and not (target_success_count > 0 and success_count >= target_success_count)
+                    ):
+                        available_cdks.append(cdk)
                 elif status_value == "failed":
                     reason = reason or "PIX 上游处理失败"
                     errors.append(f"{email or account_id}: {reason}")
@@ -7667,12 +7727,20 @@ def _run_pix_submit(
                         reason=reason,
                         idea_marked_unavailable=should_mark_unavailable,
                     )
+                    terminal_cdk_error = cdk_error_is_terminal(reason)
+                    capacity_exhausted = cdk_error_is_capacity_exhausted(reason)
                     release_cdk(
                         cdk,
                         account_id,
-                        reusable=True,
-                        requeue=failure_continue,
+                        reusable=not terminal_cdk_error,
+                        requeue=(
+                            failure_continue
+                            and not terminal_cdk_error
+                            and not capacity_exhausted
+                        ),
                     )
+                    if capacity_exhausted:
+                        _log(task_id, f"[PIX] {cdk['label']} 本站余额不足，本轮停止使用该卡；充值后可再次提交")
                     if not failure_continue:
                         stop_new_submissions = True
                 elif time.time() - float(order["submitted_at"]) > IDEA_SUBMIT_HARD_POLL_TIMEOUT_SECONDS:

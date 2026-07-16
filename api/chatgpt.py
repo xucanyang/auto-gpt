@@ -15,6 +15,12 @@ from sqlmodel import Session, select
 from pydantic import BaseModel, Field
 from pydantic.json_schema import SkipJsonSchema
 from core.db import AccountModel, get_session
+from services.account_filters import (
+    AccountFilterRequestMixin,
+    AccountFilterScopeChangedError,
+    account_payment_link_summary,
+    resolve_filtered_accounts,
+)
 from services.chatgpt_account_state import (
     apply_chatgpt_status_policy,
     apply_payment_snapshot_status,
@@ -82,9 +88,11 @@ _SUB2API_EXPORT_TICKET_LOCK = threading.Lock()
 _SUB2API_EXPORT_TICKETS: dict[str, dict[str, Any]] = {}
 CHATGPT_EXPORT_MODE_SUB2API = "sub2api"
 CHATGPT_EXPORT_MODE_ACCESS_TOKEN = "access_token"
+CHATGPT_EXPORT_MODE_PIX_PAYMENT_LINKS = "pix_payment_links"
 CHATGPT_EXPORT_MODES = frozenset({
     CHATGPT_EXPORT_MODE_SUB2API,
     CHATGPT_EXPORT_MODE_ACCESS_TOKEN,
+    CHATGPT_EXPORT_MODE_PIX_PAYMENT_LINKS,
 })
 
 
@@ -94,11 +102,13 @@ class UploadRequest(BaseModel):
     cpa_api_token: Optional[str] = None
 
 
-class Sub2ApiExportTicketReq(BaseModel):
+class Sub2ApiExportTicketReq(AccountFilterRequestMixin):
+    """Legacy export ticket request plus the filtered PIX-link export scope."""
+
     ids: list[int] = Field(default_factory=list)
-    status: str = ""
     # Keep the original Sub2API JSON export as the default for old callers.
     mode: str = CHATGPT_EXPORT_MODE_SUB2API
+    all_filtered: bool = False
 
 
 class CodexUsageRefreshReq(BaseModel):
@@ -3845,6 +3855,37 @@ def _build_access_token_export_content(access_tokens: list[str]) -> tuple[str, s
     )
 
 
+def _pix_payment_link_rows(accounts: list[AccountModel]) -> list[tuple[int, str]]:
+    """Return one validated saved PIX URL for each account in deterministic order."""
+
+    rows: list[tuple[int, str]] = []
+    for account in accounts:
+        account_id = int(account.id or 0)
+        if account_id <= 0:
+            continue
+        payment_link = account_payment_link_summary(account)
+        if str(payment_link.get("platform") or "").strip().lower() != "pix":
+            continue
+        url = str(payment_link.get("url") or "").strip()
+        if url.lower().startswith("https://"):
+            rows.append((account_id, url))
+    return rows
+
+
+def _build_pix_payment_link_export_content(accounts: list[AccountModel]) -> tuple[str, str, str, str]:
+    """Export only the persisted, validated PIX URLs without account credentials."""
+
+    urls = [url for _, url in _pix_payment_link_rows(accounts)]
+    if not urls:
+        raise HTTPException(400, "所选范围没有可导出的 PIX 支付链接")
+    return (
+        "\n".join(urls) + "\n",
+        "text/plain; charset=utf-8",
+        "chatgpt-pix-payment-links",
+        "txt",
+    )
+
+
 def _build_chatgpt_export_content(
     *,
     accounts: list[AccountModel],
@@ -3860,6 +3901,8 @@ def _build_chatgpt_export_content(
             if (token := _access_token_for_export(acc))
         ]
         return _build_access_token_export_content(access_tokens)
+    if export_mode == CHATGPT_EXPORT_MODE_PIX_PAYMENT_LINKS:
+        return _build_pix_payment_link_export_content(accounts)
 
     from datetime import datetime, timezone
     from services.chatgpt_core.sub2api_upload import build_sub2api_export_account_payload
@@ -3917,8 +3960,45 @@ def _build_sub2api_export_response(
             "Content-Disposition": (
                 f"attachment; filename={filename_prefix}-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}.{extension}"
             ),
+            "Cache-Control": "no-store, private",
+            "Pragma": "no-cache",
         },
     )
+
+
+def _resolve_pix_payment_link_export_account_ids(
+    *,
+    req: Sub2ApiExportTicketReq,
+    session: Session,
+) -> list[int]:
+    """Freeze the requested PIX-link scope before issuing a download ticket."""
+
+    selected_ids = _parse_export_ids(id_list=req.ids)
+    if req.all_filtered:
+        if selected_ids:
+            raise HTTPException(400, "PIX 链接导出不能同时指定已选账号和当前筛选范围")
+        try:
+            resolution = resolve_filtered_accounts(
+                session,
+                platform="chatgpt",
+                filter_source=req,
+                verify_expected_total=True,
+            )
+        except AccountFilterScopeChangedError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+        candidates = list(resolution.rows)
+    else:
+        if not selected_ids:
+            raise HTTPException(400, "请先选择要导出 PIX 支付链接的账号，或使用当前筛选范围导出")
+        candidates = _query_chatgpt_export_accounts(
+            session=session,
+            selected_ids=selected_ids,
+        )
+
+    account_ids = [account_id for account_id, _ in _pix_payment_link_rows(candidates)]
+    if not account_ids:
+        raise HTTPException(400, "所选范围没有可导出的 PIX 支付链接")
+    return account_ids
 
 
 @router.post("/{account_id}/upload-sub2api")
@@ -3939,10 +4019,15 @@ def upload_sub2api(account_id: int, req: Sub2ApiUploadReq,
 @router.post("/export-sub2api-ticket")
 def create_chatgpt_accounts_sub2api_export_ticket(
     req: Sub2ApiExportTicketReq,
+    session: Session = Depends(get_session),
 ):
     mode = _normalize_chatgpt_export_mode(req.mode)
-    selected_ids = _parse_export_ids(id_list=req.ids)
-    status = str(req.status or "").strip()
+    if mode == CHATGPT_EXPORT_MODE_PIX_PAYMENT_LINKS:
+        selected_ids = _resolve_pix_payment_link_export_account_ids(req=req, session=session)
+        status = ""
+    else:
+        selected_ids = _parse_export_ids(id_list=req.ids)
+        status = str(req.status or "").strip()
     now = time.time()
     ticket = uuid.uuid4().hex
     with _SUB2API_EXPORT_TICKET_LOCK:
@@ -3963,6 +4048,7 @@ def create_chatgpt_accounts_sub2api_export_ticket(
         "ticket": ticket,
         "expires_in": 300,
         "mode": mode,
+        "account_count": len(selected_ids),
     }
 
 

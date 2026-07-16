@@ -4,6 +4,31 @@
 
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，并且本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/) (语义化版本)。
 
+## [2.2.8] - 2026-07-16
+
+### 新增 (Added)
+- **本站多额度 PIX CDK 成功历史**：`core/pix_cdk_usage.py` 将跨 Plus / Plus2 实例共享的 PIX 使用表拆分为“当前占用”和 `pix_cdk_usage_history`。每一笔已确认 paid 都以不可逆、无明文卡密的指纹审计记录保存；本站多额度 CDK 在写入历史成功后删除当前 reservation，下一账号才能重新预约同一张卡。旧版本残留的 `state=paid` 当前锁在首次读取/预约时会原子迁移到历史表，不会因为升级永久堵住已充值卡。
+- **统一已保存链接合同**：`services/chatgpt_core/baxigpt_client.py` 的 `submit_pix_user_link()` 切换为 `submitMode=pix_unified_user_link + cdk`，并读取上游返回的 `cdk_reuse_policy`。`after_paid` 表示本站余额卡可在 paid 后串行复用；缺字段或 `one_success` 一律按外部一次性 PIX 卡处理，兼容旧支付服务而不冒险重复扣款。
+- **PIX 支付链接定向导出**：账号页“导出”菜单新增“PIX 支付链接（已选账号）”和“PIX 支付链接（当前筛选）”。`api/chatgpt.py` 通过既有单次下载票据增加 `mode=pix_payment_links`，只输出每行一个已保存、已校验的 PIX HTTPS 链接；当前筛选导出会携带完整筛选条件与页面总数，服务端校验后冻结账号范围，避免分页或刷新导致导出范围漂移。
+
+### 优化 (Changed)
+- **按账号范围计算 PIX 目标**：`api/tasks.py` 不再把默认目标成功数压缩为 CDK 行数。`target_success_count=0` 现在和 iDEAL 一致，表示按所选/筛选账号范围尽量全部提交；多张卡仍只影响并行槽位，不再限制本站多额度卡能处理的账号总数。
+- **同卡严格串行调度**：PIX runner 只在远端轮询明确 `paid`、本地 paid 历史事务完成、且未达到本次目标/未请求停止后，才把本站卡放回当前可用队列。任何时刻同一 fingerprint 只能有一个 reservation 或在途上游订单；不同 CDK 可以各自处理一笔，吞吐量不会被单卡保护牺牲。
+- **账号页说明同步**：`frontend/src/pages/Accounts.tsx` 明确区分本站多额度 CDK 与外部一次性 PIX CDK，说明已保存链接无需 AT、本站卡的 paid 后串行复用、余额不足仅停止本轮、以及目标数量 0 的账号范围语义。侧栏版本同步为 `v2.2.8`。
+
+### 修复 (Fixed)
+- **已保存 Stripe PIX 链接可使用本站 CDK**：对接统一上游入口后，账号库不会再把本站 CDK 错当成外部 `pixCdk` 提交并收到“本站 CDK 不能作为外部 PIX CDK 使用”。上游会按本地余额扣减并由 IDEA 处理，Auto-GPT 保留现有状态令牌轮询链路。
+- **余额不足不再永久封卡**：上游明确返回“CDK余额不足 / 当前剩余 0 / 额度已耗尽”等容量错误时，runner 只释放当前 reservation、不把卡重新塞回本轮队列，也不写 `blocked`。后续充值后可重新创建任务；卡无效、禁用、归档或已使用仍保持 blocked。
+- **未知结果继续 fail-closed**：网络异常、5xx、提交响应缺少 `task_id + status_token`、轮询超时或无法解释的异常都保留为 `uncertain` 人工复核，不会因为多额度支持而自动复用或重投。
+
+### 安全 (Security)
+- **敏感边界保持不变**：新历史表只保存 HMAC fingerprint、任务/账号 ID、订单 ID 与时间，不写原始 CDK、Stripe URL 或状态令牌；任务快照、账号 `extra_json`、运行结果和 `TaskLog` 继续只保留脱敏 CDK 标识及非敏感结果。
+- **链接导出最小化**：导出仅接受 `account_payment_link_summary()` 认可的当前 PIX 缓存，不回退旧 `cashier_url`，也不携带邮箱、密码、AccessToken、代理或内部任务字段；下载响应增加 `Cache-Control: no-store, private`，票据仍为五分钟内单次消费。
+
+### 测试 (Tests)
+- **回归覆盖多额度与兼容边界**：`tests/test_baxigpt_cdk_pool.py` 覆盖单张本站 CDK 连续处理三个已保存链接且提交/轮询严格交替、旧 paid 锁迁移、本站余额耗尽后可再次准入、外部卡 paid 后保持 blocked、5xx 保持 uncertain，以及统一直传请求体和敏感值不落盘。
+- **导出范围与内容回归**：新增 PIX 链接导出测试，覆盖仅输出有效 PIX 链接、排除 PayPal/畸形/旧 `cashier_url`、不泄露 AT，以及“当前筛选”账号范围冻结和筛选总数变化时返回 `409 FILTER_SCOPE_CHANGED`。
+
 ## [2.2.7] - 2026-07-16
 
 ### 新增 (Added)
@@ -1624,4 +1649,8 @@
 
 ## 2026-07-16 08:50:51 +0800
 - 账号库支持上传已保存PIX支付链接
+- 发布模式: multi
+
+## 2026-07-16 10:31:11 +0800
+- 支持按已选或当前筛选导出PIX支付链接，并完善PIX CDK复用
 - 发布模式: multi
