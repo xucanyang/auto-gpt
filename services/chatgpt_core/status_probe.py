@@ -200,14 +200,78 @@ def _failed_probe_result(exc: Exception) -> ProbeHTTPResult:
     )
 
 
-def _perform_get(url: str, headers: dict[str, str], proxy: Optional[str]) -> ProbeHTTPResult:
+def _probe_browser_identity(account: Any) -> tuple[dict[str, Any], str]:
     try:
+        from services.chatgpt_core.account_fingerprint import (
+            fingerprint_signature,
+            resolve_account_browser_fingerprint,
+        )
+
+        extra = getattr(account, "extra", {}) or {}
+        fingerprint = resolve_account_browser_fingerprint(extra)
+        if fingerprint:
+            return fingerprint, fingerprint_signature(fingerprint, include_device=True)
+    except Exception:
+        pass
+    return {}, ""
+
+
+def _apply_probe_browser_headers(
+    headers: dict[str, str],
+    browser_fingerprint: Optional[dict[str, Any]],
+) -> dict[str, str]:
+    """Reuse an account's persisted browser headers without generating a new profile."""
+    fingerprint = browser_fingerprint if isinstance(browser_fingerprint, dict) else {}
+    if not fingerprint:
+        return dict(headers)
+
+    merged = dict(headers)
+    user_agent = str(fingerprint.get("user_agent") or "").strip()
+    accept_language = str(fingerprint.get("accept_language") or "").strip()
+    sec_ch_ua = str(fingerprint.get("sec_ch_ua") or "").strip()
+    platform_version = str(fingerprint.get("platform_version") or "").strip()
+    chrome_full_version = str(fingerprint.get("chrome_full_version") or "").strip()
+    if user_agent:
+        merged["User-Agent"] = user_agent
+    if accept_language:
+        merged["Accept-Language"] = accept_language
+    if sec_ch_ua:
+        merged["sec-ch-ua"] = sec_ch_ua
+        merged["sec-ch-ua-mobile"] = "?0"
+        merged["sec-ch-ua-platform"] = '"Windows"'
+    if platform_version:
+        merged["sec-ch-ua-platform-version"] = f'"{platform_version.strip(chr(34))}"'
+    if chrome_full_version:
+        merged["sec-ch-ua-full-version"] = f'"{chrome_full_version.strip(chr(34))}"'
+    return merged
+
+
+def _probe_browser_request_kwargs(browser_fingerprint: Optional[dict[str, Any]]) -> dict[str, str]:
+    fingerprint = browser_fingerprint if isinstance(browser_fingerprint, dict) else {}
+    impersonate = str(fingerprint.get("impersonate") or "").strip() or "chrome110"
+    device_id = str(fingerprint.get("device_id") or "").strip()
+    return {"impersonate": impersonate, "device_id": device_id}
+
+
+def _perform_get(
+    url: str,
+    headers: dict[str, str],
+    proxy: Optional[str],
+    *,
+    impersonate: str = "chrome110",
+    device_id: str = "",
+) -> ProbeHTTPResult:
+    try:
+        request_kwargs: dict[str, Any] = {}
+        if device_id:
+            request_kwargs["cookies"] = {"oai-did": device_id}
         response = cffi_requests.get(
             url,
             headers=headers,
             proxies=_build_proxies(proxy),
             timeout=STATUS_PROBE_TIMEOUT_SECONDS,
-            impersonate="chrome110",
+            impersonate=impersonate or "chrome110",
+            **request_kwargs,
         )
     except Exception as exc:
         return _failed_probe_result(exc)
@@ -243,17 +307,32 @@ def _normalize_plan_type(plan_type: str, workspace_plan_type: str) -> str:
     return plan_type.strip().lower() or workspace_plan_type.strip().lower() or "unknown"
 
 
-def _probe_backend_me(access_token: str, proxy: Optional[str]) -> ProbeHTTPResult:
+def _probe_backend_me(
+    access_token: str,
+    proxy: Optional[str],
+    *,
+    browser_fingerprint: Optional[dict[str, Any]] = None,
+) -> ProbeHTTPResult:
     headers = {
         "Authorization": f"Bearer {access_token}",
         "Accept": "application/json, text/plain, */*",
         "Content-Type": "application/json",
         "User-Agent": CODEX_USER_AGENT,
     }
-    return _perform_get(CHATGPT_ME_URL, headers=headers, proxy=proxy)
+    return _perform_get(
+        CHATGPT_ME_URL,
+        headers=_apply_probe_browser_headers(headers, browser_fingerprint),
+        proxy=proxy,
+        **_probe_browser_request_kwargs(browser_fingerprint),
+    )
 
 
-def _probe_accounts_check(access_token: str, proxy: Optional[str]) -> ProbeHTTPResult:
+def _probe_accounts_check(
+    access_token: str,
+    proxy: Optional[str],
+    *,
+    browser_fingerprint: Optional[dict[str, Any]] = None,
+) -> ProbeHTTPResult:
     headers = {
         "Authorization": f"Bearer {access_token}",
         "Accept": "application/json, text/plain, */*",
@@ -262,10 +341,21 @@ def _probe_accounts_check(access_token: str, proxy: Optional[str]) -> ProbeHTTPR
         "Referer": "https://chatgpt.com/",
         "User-Agent": CODEX_USER_AGENT,
     }
-    return _perform_get(CHATGPT_ACCOUNTS_CHECK_URL, headers=headers, proxy=proxy)
+    return _perform_get(
+        CHATGPT_ACCOUNTS_CHECK_URL,
+        headers=_apply_probe_browser_headers(headers, browser_fingerprint),
+        proxy=proxy,
+        **_probe_browser_request_kwargs(browser_fingerprint),
+    )
 
 
-def _probe_codex_usage(access_token: str, account_id: str, proxy: Optional[str]) -> ProbeHTTPResult:
+def _probe_codex_usage(
+    access_token: str,
+    account_id: str,
+    proxy: Optional[str],
+    *,
+    browser_fingerprint: Optional[dict[str, Any]] = None,
+) -> ProbeHTTPResult:
     headers = {
         "Authorization": f"Bearer {access_token}",
         "Accept": "application/json, text/plain, */*",
@@ -274,7 +364,12 @@ def _probe_codex_usage(access_token: str, account_id: str, proxy: Optional[str])
     }
     if account_id:
         headers["Chatgpt-Account-Id"] = account_id
-    return _perform_get(CODEX_USAGE_URL, headers=headers, proxy=proxy)
+    return _perform_get(
+        CODEX_USAGE_URL,
+        headers=_apply_probe_browser_headers(headers, browser_fingerprint),
+        proxy=proxy,
+        **_probe_browser_request_kwargs(browser_fingerprint),
+    )
 
 
 def _resolve_effective_probe_proxy(
@@ -411,8 +506,12 @@ def _resolve_probe_access_token(
     access_token: str,
     client_id: str,
     proxy: Optional[str],
+    browser_fingerprint: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
-    manager = TokenRefreshManager(proxy_url=proxy)
+    manager = TokenRefreshManager(
+        proxy_url=proxy,
+        browser_fingerprint=browser_fingerprint,
+    )
     refresh_token = str(refresh_token or "").strip()
     access_token = str(access_token or "").strip()
 
@@ -495,6 +594,7 @@ def probe_local_chatgpt_status(
     organization_id = extract_chatgpt_organization_id(account)
     workspace_id = str(extra.get("workspace_id") or getattr(account, "workspace_id", "") or "").strip()
     workspace_scope = str(extra.get("chatgpt_workspace_scope") or getattr(account, "workspace_scope", "") or "").strip()
+    browser_fingerprint, fingerprint_signature = _probe_browser_identity(account)
 
     result: dict[str, Any] = {
         "version": 1,
@@ -529,6 +629,11 @@ def probe_local_chatgpt_status(
         "network": {
             "proxy_used": False,
             "proxy_source": "direct",
+            "browser_fingerprint": {
+                "source": "account" if browser_fingerprint else "legacy_default",
+                "isolated": bool(browser_fingerprint),
+                "signature": fingerprint_signature,
+            },
         },
     }
 
@@ -566,6 +671,7 @@ def probe_local_chatgpt_status(
         access_token=access_token,
         client_id=client_id,
         proxy=effective_proxy,
+        browser_fingerprint=browser_fingerprint,
     )
     token_source = str(token_resolution.get("source") or "refresh_token").strip() or "refresh_token"
     result["auth"]["source"] = token_source
@@ -610,7 +716,11 @@ def probe_local_chatgpt_status(
 
     probe_access_token = str(token_resolution.get("access_token") or "").strip()
     try:
-        me_result = _probe_backend_me(probe_access_token, proxy=effective_proxy)
+        me_result = _probe_backend_me(
+            probe_access_token,
+            proxy=effective_proxy,
+            browser_fingerprint=browser_fingerprint,
+        )
     except Exception as exc:
         me_result = _failed_probe_result(exc)
     result["auth"].update(
@@ -645,7 +755,11 @@ def probe_local_chatgpt_status(
 
         if normalized_plan == "unknown" or not subscription_active_until:
             try:
-                accounts_check = _probe_accounts_check(probe_access_token, proxy=effective_proxy)
+                accounts_check = _probe_accounts_check(
+                    probe_access_token,
+                    proxy=effective_proxy,
+                    browser_fingerprint=browser_fingerprint,
+                )
             except Exception as exc:
                 accounts_check = _failed_probe_result(exc)
             if accounts_check.status_code == 200 and accounts_check.body_json:
@@ -686,7 +800,12 @@ def probe_local_chatgpt_status(
             return result
 
         try:
-            codex_result = _probe_codex_usage(probe_access_token, account_id=account_id, proxy=effective_proxy)
+            codex_result = _probe_codex_usage(
+                probe_access_token,
+                account_id=account_id,
+                proxy=effective_proxy,
+                browser_fingerprint=browser_fingerprint,
+            )
         except Exception as exc:
             codex_result = _failed_probe_result(exc)
         result["codex"].update(

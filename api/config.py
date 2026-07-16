@@ -185,6 +185,8 @@ CONFIG_KEYS = [
     "chatgpt_save_registration_access_token_account",
     "chatgpt_existing_account_login_route_enabled",
     "chatgpt_register_unique_exit_ip_enabled",
+    "chatgpt_local_status_probe_concurrency",
+    "chatgpt_local_status_probe_unique_exit_ip_enabled",
     "chatgpt_register_otp_wait_seconds",
     "chatgpt_register_otp_resend_wait_seconds",
     "chatgpt_register_otp_account_budget_seconds",
@@ -454,6 +456,10 @@ def _build_config_response(*, local_only: bool = False) -> dict[str, Any]:
         all_cfg["dynamic_proxy_probe_enabled"] = "true"
     if not all_cfg.get("dynamic_proxy_max_attempts"):
         all_cfg["dynamic_proxy_max_attempts"] = "5"
+    if not all_cfg.get("chatgpt_local_status_probe_concurrency"):
+        all_cfg["chatgpt_local_status_probe_concurrency"] = "1"
+    if not all_cfg.get("chatgpt_local_status_probe_unique_exit_ip_enabled"):
+        all_cfg["chatgpt_local_status_probe_unique_exit_ip_enabled"] = "true"
     if "chatgpt_save_registration_access_token_account" not in all_cfg:
         all_cfg["chatgpt_save_registration_access_token_account"] = "true"
     if not all_cfg.get("chatgpt_register_otp_wait_seconds"):

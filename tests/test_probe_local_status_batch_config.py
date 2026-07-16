@@ -1,9 +1,12 @@
 import time
+import threading
 import unittest
 from unittest import mock
+from fastapi import HTTPException
 from core.proxy_utils import resolve_probe_candidate_proxies
 from services.chatgpt_core.plugin import ChatGPTPlatform
 from core.base_platform import RegisterConfig
+from core.task_runtime import RegisterTaskStore
 
 
 class DummyAccount:
@@ -12,6 +15,48 @@ class DummyAccount:
         self.user_id = user_id
         self.token = "at-test"
         self.extra = dict(extra or {"access_token": "at-test"})
+
+
+def _browser_fingerprint(device_id: str) -> dict:
+    return {
+        "device_id": device_id,
+        "accept_language": "en-US,en;q=0.9",
+        "impersonate": "chrome136",
+        "chrome_major": 136,
+        "chrome_full_version": "136.0.7103.92",
+        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.7103.92 Safari/537.36",
+        "sec_ch_ua": '"Chromium";v="136", "Google Chrome";v="136", "Not.A/Brand";v="99"',
+        "platform_version": "15.0.0",
+        "viewport_width": 1440,
+        "viewport_height": 900,
+    }
+
+
+class _RunnerAccount:
+    platform = "chatgpt"
+
+    def __init__(self, account_id: int, *, extra: dict | None = None):
+        self.id = account_id
+        self.email = f"account-{account_id}@example.com"
+        self.status = "ok"
+        self.extra = dict(extra or {})
+
+    def get_extra(self):
+        return dict(self.extra)
+
+
+class _RunnerSession:
+    def __init__(self, accounts: dict[int, _RunnerAccount]):
+        self.accounts = accounts
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def get(self, _model, account_id):
+        return self.accounts.get(int(account_id))
 
 
 class ProbeLocalStatusBatchConfigTests(unittest.TestCase):
@@ -116,10 +161,172 @@ class ProbeLocalStatusBatchConfigTests(unittest.TestCase):
             [],
             [{"account_id": 10, "email": "a10@example.com", "status": "ok"}],
         )
-        req = BatchProbeLocalStatusTaskRequest(account_ids=[10])
+        req = BatchProbeLocalStatusTaskRequest(
+            account_ids=[10],
+            params={"proxy_mode": "direct", "concurrency": 2, "unique_exit_ip_enabled": False},
+        )
         res = create_batch_probe_local_status_task(req, background_tasks=mock.Mock())
         self.assertIn("task_id", res)
         self.assertEqual(res["eligible"], 1)
+        self.assertEqual(res["requested_concurrency"], 2)
+        self.assertEqual(res["effective_concurrency"], 1)
+
+    def test_prepare_batch_probe_freezes_concurrency_and_expands_dynamic_candidates(self):
+        from api.tasks import _prepare_batch_probe_local_status_params
+
+        with mock.patch(
+            "core.config_store.config_store.get_all",
+            return_value={
+                "task_proxy_mode": "dynamic",
+                "dynamic_proxy_max_attempts": "2",
+                "chatgpt_local_status_probe_unique_exit_ip_enabled": "true",
+            },
+        ):
+            params, settings = _prepare_batch_probe_local_status_params(
+                {"concurrency": 4, "proxy_mode": "dynamic"},
+                eligible_count=6,
+            )
+
+        self.assertEqual(params["concurrency"], 4)
+        self.assertTrue(params["unique_exit_ip_enabled"])
+        self.assertTrue(params["proxy_failover"])
+        self.assertGreaterEqual(params["dynamic_proxy_max_attempts"], 8)
+        self.assertEqual(settings["requested_concurrency"], 4)
+        self.assertEqual(settings["effective_concurrency"], 4)
+
+    def test_prepare_batch_probe_rejects_direct_mode_with_unique_exit_requirement(self):
+        from api.tasks import _prepare_batch_probe_local_status_params
+
+        with self.assertRaises(HTTPException) as error:
+            _prepare_batch_probe_local_status_params(
+                {"concurrency": 2, "proxy_mode": "direct", "unique_exit_ip_enabled": True},
+                eligible_count=2,
+            )
+
+        self.assertEqual(error.exception.status_code, 400)
+        self.assertIn("独立出口 IP", str(error.exception.detail))
+
+    def test_run_batch_probe_uses_distinct_sessions_and_parallelizes_distinct_fingerprints(self):
+        from api.tasks import _run_batch_probe_local_status
+
+        accounts = {
+            1: _RunnerAccount(1, extra={"chatgpt_browser_fingerprint": _browser_fingerprint("device-1")}),
+            2: _RunnerAccount(2, extra={"chatgpt_browser_fingerprint": _browser_fingerprint("device-2")}),
+        }
+        store = RegisterTaskStore()
+        store.create("task_parallel", platform="chatgpt", total=2, source="batch_probe_local_status", meta={})
+        state_lock = threading.Lock()
+        active = 0
+        max_active = 0
+        sessions = set()
+        both_started = threading.Event()
+
+        def fake_sync(session, account, **_kwargs):
+            nonlocal active, max_active
+            with state_lock:
+                active += 1
+                sessions.add(id(session))
+                max_active = max(max_active, active)
+                if active == 2:
+                    both_started.set()
+            both_started.wait(timeout=1)
+            time.sleep(0.03)
+            with state_lock:
+                active -= 1
+            return {"probe": {"subscription": {"plan": "plus"}}}
+
+        with mock.patch("api.tasks._task_store", store), mock.patch(
+            "api.tasks.Session",
+            side_effect=lambda *_args, **_kwargs: _RunnerSession(accounts),
+        ), mock.patch(
+            "services.chatgpt_core.local_status_refresh.sync_chatgpt_account_local_status",
+            side_effect=fake_sync,
+        ), mock.patch("api.tasks._save_task_log"):
+            _run_batch_probe_local_status(
+                "task_parallel",
+                [1, 2],
+                {"proxy_mode": "direct", "concurrency": 2, "unique_exit_ip_enabled": False},
+            )
+
+        snapshot = store.snapshot("task_parallel")
+        self.assertEqual(snapshot["status"], "done")
+        self.assertEqual(snapshot["success"], 2)
+        self.assertEqual(max_active, 2)
+        self.assertEqual(len(sessions), 2)
+
+    def test_run_batch_probe_serializes_legacy_fingerprint_fallback(self):
+        from api.tasks import _run_batch_probe_local_status
+
+        accounts = {1: _RunnerAccount(1), 2: _RunnerAccount(2)}
+        store = RegisterTaskStore()
+        store.create("task_legacy_fingerprint", platform="chatgpt", total=2, source="batch_probe_local_status", meta={})
+        state_lock = threading.Lock()
+        active = 0
+        max_active = 0
+
+        def fake_sync(_session, _account, **_kwargs):
+            nonlocal active, max_active
+            with state_lock:
+                active += 1
+                max_active = max(max_active, active)
+            time.sleep(0.04)
+            with state_lock:
+                active -= 1
+            return {"probe": {"subscription": {"plan": "free"}}}
+
+        with mock.patch("api.tasks._task_store", store), mock.patch(
+            "api.tasks.Session",
+            side_effect=lambda *_args, **_kwargs: _RunnerSession(accounts),
+        ), mock.patch(
+            "services.chatgpt_core.local_status_refresh.sync_chatgpt_account_local_status",
+            side_effect=fake_sync,
+        ), mock.patch("api.tasks._save_task_log"):
+            _run_batch_probe_local_status(
+                "task_legacy_fingerprint",
+                [1, 2],
+                {"proxy_mode": "direct", "concurrency": 2, "unique_exit_ip_enabled": False},
+            )
+
+        snapshot = store.snapshot("task_legacy_fingerprint")
+        self.assertEqual(snapshot["success"], 2)
+        self.assertEqual(max_active, 1)
+        self.assertEqual(snapshot["meta"]["fingerprint_isolation"]["legacy_fallback_count"], 2)
+
+    def test_run_batch_probe_records_and_blocks_duplicate_exit_ip(self):
+        from api.tasks import _run_batch_probe_local_status
+
+        accounts = {
+            1: _RunnerAccount(1, extra={"chatgpt_browser_fingerprint": _browser_fingerprint("device-1")}),
+            2: _RunnerAccount(2, extra={"chatgpt_browser_fingerprint": _browser_fingerprint("device-2")}),
+        }
+        store = RegisterTaskStore()
+        store.create("task_exit_collision", platform="chatgpt", total=2, source="batch_probe_local_status", meta={})
+        sync = mock.Mock(return_value={"probe": {"subscription": {"plan": "plus"}}})
+
+        with mock.patch("api.tasks._task_store", store), mock.patch(
+            "api.tasks.Session",
+            side_effect=lambda *_args, **_kwargs: _RunnerSession(accounts),
+        ), mock.patch(
+            "services.chatgpt_core.local_status_refresh.sync_chatgpt_account_local_status",
+            sync,
+        ), mock.patch(
+            "core.proxy_utils.resolve_probe_candidate_proxies",
+            return_value=[("http://proxy.example:8080", None, "specified")],
+        ), mock.patch(
+            "services.proxy_scanner.probe_basic",
+            return_value={"ok": True, "exit_ip": "198.51.100.20"},
+        ), mock.patch("api.tasks._save_task_log"):
+            _run_batch_probe_local_status(
+                "task_exit_collision",
+                [1, 2],
+                {"proxy_mode": "specified", "concurrency": 2, "unique_exit_ip_enabled": True},
+            )
+
+        snapshot = store.snapshot("task_exit_collision")
+        self.assertEqual(sync.call_count, 1)
+        self.assertEqual(snapshot["success"], 1)
+        self.assertEqual(len(snapshot["errors"]), 1)
+        self.assertEqual(snapshot["meta"]["unique_exit_ip"]["collision_count"], 1)
 
     @mock.patch("api.tasks._save_task_log")
     @mock.patch("api.tasks._task_store")
@@ -162,5 +369,3 @@ class ProbeLocalStatusBatchConfigTests(unittest.TestCase):
         finish_kwargs = mock_store.finish.call_args.kwargs
         self.assertEqual(finish_kwargs.get("status"), "failed")
         self.assertIn("region-XX", finish_kwargs.get("error", ""))
-
-

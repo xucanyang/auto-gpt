@@ -88,6 +88,7 @@ logger = logging.getLogger(__name__)
 MAX_FINISHED_TASKS = 200
 CLEANUP_THRESHOLD = 250
 PHONE_BINDING_MAX_CONCURRENCY = 5
+LOCAL_STATUS_PROBE_MAX_CONCURRENCY = 10
 _task_store = RegisterTaskStore(
     max_finished_tasks=MAX_FINISHED_TASKS,
     cleanup_threshold=CLEANUP_THRESHOLD,
@@ -3209,6 +3210,139 @@ def enqueue_batch_invalid_recheck_task(
     }
 
 
+def _coerce_batch_probe_positive_int(value: Any, *, default: int, maximum: int) -> int:
+    try:
+        parsed = int(float(str(value).strip()))
+    except (TypeError, ValueError):
+        parsed = default
+    return max(1, min(parsed, maximum))
+
+
+def _coerce_batch_probe_bool(value: Any, *, default: bool) -> bool:
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on", "y", "是", "开启", "启用"}:
+        return True
+    if text in {"0", "false", "no", "off", "n", "否", "关闭", "禁用"}:
+        return False
+    return default
+
+
+def _first_batch_probe_param(params: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        value = params.get(key)
+        if value is not None and value != "":
+            return value
+    return None
+
+
+def _prepare_batch_probe_local_status_params(
+    raw_params: dict[str, Any] | None,
+    *,
+    eligible_count: int,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Freeze bounded concurrency and isolation rules before a batch starts."""
+    from core.config_store import config_store
+
+    params = dict(raw_params or {}) if isinstance(raw_params, dict) else {}
+    config = config_store.get_all()
+    requested_concurrency = _coerce_batch_probe_positive_int(
+        _first_batch_probe_param(params, "concurrency", "probe_concurrency", "local_status_probe_concurrency")
+        or config.get("chatgpt_local_status_probe_concurrency")
+        or 1,
+        default=1,
+        maximum=LOCAL_STATUS_PROBE_MAX_CONCURRENCY,
+    )
+    account_count = max(int(eligible_count or 0), 0)
+    effective_concurrency = min(requested_concurrency, max(account_count, 1))
+
+    raw_unique_exit_ip = _first_batch_probe_param(
+        params,
+        "unique_exit_ip_enabled",
+        "require_unique_exit_ip",
+        "probe_unique_exit_ip_enabled",
+    )
+    unique_exit_ip_requested = _coerce_batch_probe_bool(
+        raw_unique_exit_ip,
+        default=(
+            requested_concurrency > 1
+            and _coerce_batch_probe_bool(
+                config.get("chatgpt_local_status_probe_unique_exit_ip_enabled"),
+                default=True,
+            )
+        ),
+    )
+    unique_exit_ip_enabled = bool(unique_exit_ip_requested and account_count > 1)
+
+    mode = str(
+        _first_batch_probe_param(params, "proxy_mode", "probe_proxy_mode")
+        or config.get("task_proxy_mode")
+        or "dynamic"
+    ).strip().lower()
+    if mode in {"none", "no_proxy", "direct", "直连"}:
+        mode = "direct"
+    elif mode in {"manual", "explicit"}:
+        mode = "specified"
+    elif mode not in {"specified", "pool", "dynamic"}:
+        mode = "dynamic"
+
+    failover = _coerce_batch_probe_bool(
+        _first_batch_probe_param(params, "proxy_failover", "probe_proxy_failover"),
+        default=_coerce_batch_probe_bool(config.get("task_proxy_failover"), default=False),
+    )
+    if unique_exit_ip_enabled:
+        if mode == "direct":
+            raise HTTPException(
+                400,
+                "开启强制独立出口 IP 时不能使用直连模式；请改用动态代理、代理池或可切换的多代理。",
+            )
+        if mode == "specified" and not failover:
+            raise HTTPException(
+                400,
+                "单个指定代理无法满足多个账号独立出口 IP；请开启失败切换、改用代理池/动态代理，或关闭独立出口要求。",
+            )
+
+        candidate_floor = min(20, max(3, effective_concurrency * 2))
+        if mode == "dynamic":
+            params["proxy_failover"] = True
+            params["dynamic_proxy_max_attempts"] = max(
+                _coerce_batch_probe_positive_int(
+                    params.get("dynamic_proxy_max_attempts") or config.get("dynamic_proxy_max_attempts") or 1,
+                    default=1,
+                    maximum=100,
+                ),
+                candidate_floor,
+            )
+        elif mode == "pool" or (mode == "specified" and failover):
+            params["proxy_max_candidates"] = max(
+                _coerce_batch_probe_positive_int(
+                    params.get("proxy_max_candidates")
+                    or config.get("task_proxy_max_candidates")
+                    or config.get("proxy_pool_max_candidates")
+                    or 1,
+                    default=1,
+                    maximum=100,
+                ),
+                candidate_floor,
+            )
+
+    params["concurrency"] = requested_concurrency
+    params["unique_exit_ip_enabled"] = unique_exit_ip_enabled
+    params.setdefault("proxy_mode", mode)
+    settings = {
+        "requested_concurrency": requested_concurrency,
+        "effective_concurrency": effective_concurrency,
+        "unique_exit_ip_requested": unique_exit_ip_requested,
+        "unique_exit_ip_enabled": unique_exit_ip_enabled,
+        "proxy_mode": mode,
+        "fingerprint_policy": "reuse_account_profile; serialize_shared_or_missing",
+    }
+    return params, settings
+
+
 def enqueue_batch_probe_local_status_task(
     req: BatchProbeLocalStatusTaskRequest,
     *,
@@ -3236,6 +3370,10 @@ def enqueue_batch_probe_local_status_task(
             "missing_ids": missing_ids,
         }
 
+    effective_params, execution_settings = _prepare_batch_probe_local_status_params(
+        req.params,
+        eligible_count=len(eligible_accounts),
+    )
     task_id = f"task_{int(time.time() * 1000)}"
     source = "batch_probe_local_status"
     meta = {
@@ -3249,7 +3387,8 @@ def enqueue_batch_probe_local_status_task(
         "filter_audit": filter_audit,
         "limit": int(req.limit or 0),
         "skipped_items": list(skipped_accounts),
-        "params": sanitize_task_detail(dict(req.params or {})),
+        "params": sanitize_task_detail(effective_params),
+        "settings": execution_settings,
     }
     _create_standalone_task_record(
         task_id,
@@ -3279,12 +3418,12 @@ def enqueue_batch_probe_local_status_task(
     if background_tasks is None:
         thread = threading.Thread(
             target=_run_batch_probe_local_status,
-            args=(task_id, account_ids, dict(req.params or {})),
+            args=(task_id, account_ids, effective_params),
             daemon=True,
         )
         thread.start()
     else:
-        background_tasks.add_task(_run_batch_probe_local_status, task_id, account_ids, dict(req.params or {}))
+        background_tasks.add_task(_run_batch_probe_local_status, task_id, account_ids, effective_params)
 
     return {
         "task_id": task_id,
@@ -3296,6 +3435,9 @@ def enqueue_batch_probe_local_status_task(
         "items": eligible_accounts,
         "skipped_items": skipped_accounts,
         "missing_ids": missing_ids,
+        "requested_concurrency": execution_settings["requested_concurrency"],
+        "effective_concurrency": execution_settings["effective_concurrency"],
+        "unique_exit_ip_enabled": execution_settings["unique_exit_ip_enabled"],
     }
 
 
@@ -13819,210 +13961,644 @@ def _run_batch_invalid_recheck(task_id: str, account_ids: list[int]):
 
 
 def _run_batch_probe_local_status(task_id: str, account_ids: list[int], params: dict[str, Any]):
+    from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
     from core.db import AccountModel, engine
+    from core.proxy_utils import is_proxy_error_text, resolve_probe_candidate_proxies
+    from services.chatgpt_core.account_fingerprint import (
+        fingerprint_signature,
+        resolve_account_browser_fingerprint,
+    )
     from services.chatgpt_core.local_status_refresh import sync_chatgpt_account_local_status
-    from core.proxy_utils import resolve_probe_candidate_proxies, is_proxy_error_text
-    import random
 
+    runtime_params = dict(params or {}) if isinstance(params, dict) else {}
     control = _task_store.control_for(task_id)
-
-    def stop_checker() -> None:
-        control.checkpoint(consume_skip=False)
-
-    def task_log(message: str) -> None:
-        stop_checker()
-        _log(task_id, message)
-
     total = max(len(account_ids), 1)
+    requested_concurrency = _coerce_batch_probe_positive_int(
+        runtime_params.get("concurrency"),
+        default=1,
+        maximum=LOCAL_STATUS_PROBE_MAX_CONCURRENCY,
+    )
+    effective_concurrency = min(requested_concurrency, total)
+    unique_exit_ip_enabled = _coerce_batch_probe_bool(
+        runtime_params.get("unique_exit_ip_enabled"),
+        default=False,
+    ) and len(account_ids) > 1
+
+    def _coerce_delay(value: Any) -> float:
+        try:
+            return max(float(value or 0), 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    delay_min = _coerce_delay(runtime_params.get("delay_seconds") or runtime_params.get("probe_delay_seconds"))
+    delay_max = _coerce_delay(runtime_params.get("delay_max_seconds") or runtime_params.get("probe_delay_max_seconds"))
+    delay_low, delay_high = min(delay_min, delay_max), max(delay_min, delay_max)
+
+    state_lock = threading.RLock()
+    unique_exit_ip_lock = threading.Lock()
+    fingerprint_gate_lock = threading.Lock()
+    start_gate_lock = threading.Lock()
+    next_start_at = time.monotonic()
+    unique_exit_ips: set[str] = set()
+    unique_exit_events: list[dict[str, Any]] = []
+    fingerprint_gates: dict[str, threading.Lock] = {}
+    fingerprint_seen: set[str] = set()
+    fingerprint_stats = {
+        "account_profile_count": 0,
+        "legacy_fallback_count": 0,
+        "shared_profile_serialized_count": 0,
+    }
     success_count = 0
     skipped_count = 0
     errors: list[str] = []
     primary_email = ""
-    current_attempt_id: int | None = None
+    fatal_configuration_errors: list[str] = []
 
     _task_store.mark_running(task_id)
     _task_store.set_progress(task_id, f"0/{total}")
-
     meta = dict(_task_store.snapshot(task_id).get("meta") or {})
     skipped_items = list(meta.get("skipped_items") or [])
     missing_ids = list(meta.get("missing_ids") or [])
-    if not primary_email:
-        meta_emails = meta.get("emails")
-        if isinstance(meta_emails, list) and meta_emails:
-            primary_email = str(meta_emails[0] or "")
+    meta_emails = meta.get("emails")
+    if isinstance(meta_emails, list) and meta_emails:
+        primary_email = str(meta_emails[0] or "")
 
+    def task_log(message: str, *, attempt_id: int | None = None, check_stop: bool = True) -> None:
+        if check_stop:
+            control.checkpoint(consume_skip=False, attempt_id=attempt_id)
+        _log(task_id, message)
 
-    try:
-        for missing_id in missing_ids:
-            task_log(f"[MISS] 账号不存在: account_id={missing_id}")
-            errors.append(f"account_id={missing_id}: 账号不存在")
+    def current_runtime_meta() -> dict[str, Any]:
+        latest = dict(_task_store.snapshot(task_id).get("meta") or meta)
+        with state_lock:
+            latest.update(
+                {
+                    "runtime_success": success_count,
+                    "runtime_skipped": skipped_count,
+                    "runtime_errors": list(errors),
+                }
+            )
+        return latest
 
-        for item in skipped_items:
-            task_log(f"[SKIP] {item.get('email') or item.get('account_id') or '-'} - {item.get('reason') or '已跳过'}")
+    def record_unique_exit_ip_event(event: dict[str, Any]) -> None:
+        if not unique_exit_ip_enabled:
+            return
+        clean_event = sanitize_task_detail(event)
+        with unique_exit_ip_lock:
+            unique_exit_events.append(clean_event)
+            assigned_count = sum(1 for item in unique_exit_events if item.get("status") == "assigned")
+            collision_count = sum(1 for item in unique_exit_events if item.get("status") == "collision")
+            failed_count = sum(1 for item in unique_exit_events if item.get("status") == "failed")
+            runtime_meta = {
+                "enabled": True,
+                "assigned_count": assigned_count,
+                "collision_count": collision_count,
+                "failed_count": failed_count,
+                "assigned_exit_ips": sorted(unique_exit_ips)[-100:],
+                "events": list(unique_exit_events[-100:]),
+            }
+        try:
+            _task_store.update_meta(task_id, {"unique_exit_ip": runtime_meta})
+        except Exception:
+            pass
 
-        for index, account_id in enumerate(account_ids, start=1):
-            control.checkpoint(consume_skip=False)
-            # Claim before delays, proxy selection and local probing.  The
-            # helper raises only at the next-account boundary for graceful
-            # stop, while an already claimed account keeps running normally.
-            current_attempt_id = _claim_next_task_attempt(control)
-            _task_store.set_progress(task_id, f"{index - 1}/{total}")
+    def record_fingerprint_state(*, source: str, shared: bool) -> None:
+        with state_lock:
+            if source == "account":
+                fingerprint_stats["account_profile_count"] += 1
+            else:
+                fingerprint_stats["legacy_fallback_count"] += 1
+            if shared:
+                fingerprint_stats["shared_profile_serialized_count"] += 1
+            runtime_meta = {
+                "policy": "reuse_account_profile; serialize_shared_or_missing",
+                **dict(fingerprint_stats),
+            }
+        try:
+            _task_store.update_meta(task_id, {"fingerprint_isolation": runtime_meta})
+        except Exception:
+            pass
 
-            delay_min = float(params.get("delay_seconds") or params.get("probe_delay_seconds") or 0.0)
-            delay_max = float(params.get("delay_max_seconds") or params.get("probe_delay_max_seconds") or 0.0)
-            if (delay_min > 0 or delay_max > 0) and index > 1:
-                wait_sec = random.uniform(min(delay_min, delay_max), max(delay_min, delay_max)) if delay_max > delay_min else delay_min
-                if wait_sec > 0:
-                    task_log(f"--- [等候] 随机延时等待 {wait_sec:.1f} 秒... ---")
-                    _sleep_with_task_control(
-                        control,
-                        wait_sec,
-                        attempt_id=current_attempt_id,
-                    )
+    def source_exit_ip(source: Any) -> str:
+        text = str(source or "")
+        for pattern in (
+            r"\bexit_ip\s*[:=]\s*([^｜\s,，;；)）]+)",
+            r"出口IP\s*[:：]\s*([^｜\s,，;；)）]+)",
+        ):
+            match = re.search(pattern, text, flags=re.I)
+            if match:
+                return str(match.group(1) or "").strip()
+        return ""
+
+    def candidate_network_label(proxy_url: str, source: Any) -> str:
+        """Return a log-safe transport label without retaining proxy endpoint data."""
+        if not str(proxy_url or "").strip():
+            return "直连"
+        source_text = str(source or "").strip().lower()
+        if source_text.startswith("dynamic"):
+            return "动态代理"
+        if source_text.startswith("pool"):
+            return "代理池"
+        if source_text.startswith("specified"):
+            return "指定代理"
+        return "已配置代理"
+
+    def probe_exit_ip(proxy_url: str, source: str) -> tuple[str, str]:
+        source_ip = source_exit_ip(source)
+        source_text = str(source or "").strip().lower()
+        source_is_fresh_dynamic_probe = bool(
+            source_ip
+            and source_text.startswith("dynamic")
+            and ("probe=ok" in source_text or "probe=geo_unavailable" in source_text)
+        )
+        if not proxy_url:
+            return "", "直连模式没有可隔离的代理出口"
+        try:
+            from services.proxy_scanner import probe_basic
+
+            result = probe_basic(proxy_url, timeout_seconds=8)
+            if result.get("ok") and result.get("exit_ip"):
+                return str(result.get("exit_ip") or "").strip(), "probe"
+            if source_is_fresh_dynamic_probe:
+                return source_ip, "dynamic_source_after_probe_failed"
+            return "", "probe_failed"
+        except Exception:
+            if source_is_fresh_dynamic_probe:
+                return source_ip, "dynamic_source_after_probe_exception"
+            return "", "probe_exception"
+
+    def claim_unique_exit_ip(
+        *,
+        account_position: int,
+        account_id: int,
+        candidate_index: int,
+        candidate_total: int,
+        proxy_url: str,
+        source: str,
+    ) -> tuple[bool, str, str]:
+        exit_ip, probe_source = probe_exit_ip(proxy_url, source)
+        source_label = candidate_network_label(proxy_url, source)
+        if not exit_ip:
+            reason = f"无法确认候选代理出口 IP（{source_label}）"
+            record_unique_exit_ip_event(
+                {
+                    "account_position": account_position,
+                    "account_id": account_id,
+                    "candidate": candidate_index,
+                    "total": candidate_total,
+                    "status": "failed",
+                    "source": source_label,
+                    "reason": reason,
+                }
+            )
+            return False, "", reason
+
+        with unique_exit_ip_lock:
+            if exit_ip in unique_exit_ips:
+                collision = True
+            else:
+                unique_exit_ips.add(exit_ip)
+                collision = False
+        if collision:
+            reason = f"出口 IP 已在本批量任务内分配: {exit_ip}"
+            record_unique_exit_ip_event(
+                {
+                    "account_position": account_position,
+                    "account_id": account_id,
+                    "candidate": candidate_index,
+                    "total": candidate_total,
+                    "status": "collision",
+                    "exit_ip": exit_ip,
+                    "source": source_label,
+                    "probe_source": probe_source,
+                    "reason": reason,
+                }
+            )
+            return False, exit_ip, reason
+
+        record_unique_exit_ip_event(
+            {
+                "account_position": account_position,
+                "account_id": account_id,
+                "candidate": candidate_index,
+                "total": candidate_total,
+                "status": "assigned",
+                "exit_ip": exit_ip,
+                "source": source_label,
+                "probe_source": probe_source,
+            }
+        )
+        return True, exit_ip, ""
+
+    def fingerprint_gate_for_account(account: Any) -> tuple[threading.Lock, str, bool]:
+        try:
+            extra = account.get_extra() if hasattr(account, "get_extra") else getattr(account, "extra", {})
+        except Exception:
+            extra = getattr(account, "extra", {})
+        fingerprint = resolve_account_browser_fingerprint(extra)
+        signature = fingerprint_signature(fingerprint, include_device=True) if fingerprint else ""
+        source = "account" if signature else "legacy_default"
+        gate_key = f"account:{signature}" if signature else "legacy_default"
+        with fingerprint_gate_lock:
+            shared = gate_key in fingerprint_seen
+            fingerprint_seen.add(gate_key)
+            gate = fingerprint_gates.setdefault(gate_key, threading.Lock())
+        record_fingerprint_state(source=source, shared=shared)
+        return gate, source, shared
+
+    def acquire_fingerprint_gate(gate: threading.Lock, *, attempt_id: int) -> None:
+        while not gate.acquire(timeout=0.25):
+            control.checkpoint(attempt_id=attempt_id)
+
+    def reserve_start_delay(position: int) -> float:
+        nonlocal next_start_at
+        if position <= 1 or delay_high <= 0:
+            return 0.0
+        interval = random.uniform(delay_low, delay_high) if delay_high > delay_low else delay_low
+        if interval <= 0:
+            return 0.0
+        with start_gate_lock:
+            now = time.monotonic()
+            next_start_at = max(next_start_at, now) + interval
+            return max(next_start_at - now, 0.0)
+
+    def process_account(
+        account_position: int,
+        account_id: int,
+        attempt_id: int,
+        start_delay: float,
+    ) -> dict[str, Any]:
+        fingerprint_gate: threading.Lock | None = None
+        fingerprint_gate_acquired = False
+        email = ""
+        try:
+            if start_delay > 0:
+                task_log(
+                    f"[{account_position}/{total}] 等候启动错峰 {start_delay:.1f} 秒",
+                    attempt_id=attempt_id,
+                )
+                _sleep_with_task_control(control, start_delay, attempt_id=attempt_id)
+            control.checkpoint(attempt_id=attempt_id)
 
             with Session(engine) as session:
-                acc = session.get(AccountModel, account_id)
-                if not acc:
-                    task_log(f"[{index}/{total}] 账号不存在 ID={account_id}，已跳过")
-                    skipped_count += 1
-                    control.finish_attempt(current_attempt_id)
-                    current_attempt_id = None
-                    continue
-                email = str(acc.email or "")
-                if not primary_email:
-                    primary_email = email
-                task_log(f"[{index}/{total}] 开始同步本地状态 账号ID：{account_id}｜邮箱：{email}")
+                account = session.get(AccountModel, account_id)
+                if account is None:
+                    task_log(
+                        f"[{account_position}/{total}] 账号不存在 ID={account_id}，已跳过",
+                        attempt_id=attempt_id,
+                    )
+                    return {"status": "skipped", "account_id": account_id, "email": ""}
 
-                candidates = resolve_probe_candidate_proxies(
-                    params,
-                    fallback_proxy="",
-                    default_mode="global",
+                email = str(account.email or "")
+                fingerprint_gate, fingerprint_source, fingerprint_shared = fingerprint_gate_for_account(account)
+                acquire_fingerprint_gate(fingerprint_gate, attempt_id=attempt_id)
+                fingerprint_gate_acquired = True
+                if fingerprint_source == "legacy_default":
+                    task_log(
+                        f"[{account_position}/{total}] 账号未保存浏览器指纹，已按兼容指纹串行化",
+                        attempt_id=attempt_id,
+                    )
+                elif fingerprint_shared:
+                    task_log(
+                        f"[{account_position}/{total}] 检测到重复账号浏览器指纹，已串行化该身份",
+                        attempt_id=attempt_id,
+                    )
+                task_log(
+                    f"[{account_position}/{total}] 开始同步本地状态 账号ID：{account_id}｜邮箱：{email}",
+                    attempt_id=attempt_id,
                 )
-                success_probe = False
-                last_err = ""
-                for attempt_idx, (proxy_url, proxy_pool, source) in enumerate(candidates, start=1):
-                    proxy_display = redact_proxy_url(proxy_url) or "直连"
-                    task_log(f" -> [尝试 {attempt_idx}/{len(candidates)}] \n    使用代理: {proxy_display}\n    代理信息: {source}")
+
+                try:
+                    candidates = resolve_probe_candidate_proxies(
+                        runtime_params,
+                        fallback_proxy="",
+                        default_mode="global",
+                    )
+                except Exception as exc:
+                    error_text = sanitize_error_message(str(exc) or "代理配置解析失败")
+                    task_log(
+                        f" -> [失败] 代理配置解析失败: {error_text}",
+                        attempt_id=attempt_id,
+                    )
+                    return {
+                        "status": "failed",
+                        "account_id": account_id,
+                        "email": email,
+                        "error": error_text,
+                        "fatal_configuration": True,
+                    }
+
+                last_error = ""
+                for candidate_index, (proxy_url, proxy_pool, source) in enumerate(candidates, start=1):
+                    control.checkpoint(attempt_id=attempt_id)
+                    network_label = candidate_network_label(proxy_url, source)
+                    exit_ip = ""
+                    if unique_exit_ip_enabled:
+                        claimed, exit_ip, claim_error = claim_unique_exit_ip(
+                            account_position=account_position,
+                            account_id=account_id,
+                            candidate_index=candidate_index,
+                            candidate_total=len(candidates),
+                            proxy_url=proxy_url,
+                            source=source,
+                        )
+                        if not claimed:
+                            last_error = claim_error
+                            task_log(
+                                f" -> [跳过候选] {claim_error}",
+                                attempt_id=attempt_id,
+                            )
+                            continue
+
+                    exit_note = f"｜出口IP: {exit_ip}" if exit_ip else ""
+                    task_log(
+                        f" -> [尝试 {candidate_index}/{len(candidates)}] 网络方式: {network_label}{exit_note}",
+                        attempt_id=attempt_id,
+                    )
                     try:
-                        res = sync_chatgpt_account_local_status(
+                        result = sync_chatgpt_account_local_status(
                             session,
-                            acc,
+                            account,
                             proxy=proxy_url,
                             use_default_proxy=False,
                         )
-                        plan = res.get("probe", {}).get("subscription", {}).get("plan", "unknown")
-                        task_log(f" -> [成功] 账号 {email} 本地状态同步完成｜当前订阅计划: {plan}")
+                        plan = result.get("probe", {}).get("subscription", {}).get("plan", "unknown")
+                        task_log(
+                            f" -> [成功] 账号 {email} 本地状态同步完成｜当前订阅计划: {plan}",
+                            attempt_id=attempt_id,
+                        )
                         if proxy_pool is not None and proxy_url:
                             try:
                                 proxy_pool.report_success(proxy_url)
                             except Exception:
                                 pass
-                        success_probe = True
-                        success_count += 1
-                        break
+                        return {"status": "success", "account_id": account_id, "email": email}
                     except Exception as exc:
-                        last_err = str(exc)
-                        task_log(f" -> [失败] 代理 {source} 探测异常: {exc}")
-                        if attempt_idx < len(candidates) and proxy_pool is not None and proxy_url:
-                            if is_proxy_error_text(last_err):
+                        last_error = sanitize_error_message(str(exc) or "探测失败")
+                        task_log(
+                            f" -> [失败] {network_label} 探测异常: {last_error}",
+                            attempt_id=attempt_id,
+                        )
+                        if candidate_index < len(candidates) and proxy_pool is not None and proxy_url:
+                            if is_proxy_error_text(last_error):
                                 try:
                                     proxy_pool.report_fail(proxy_url)
                                 except Exception:
                                     pass
-                if not success_probe:
-                    errors.append(f"{email}: {last_err or '探测失败'}")
-                    task_log(f" -> [异常] 账号 {email} 本地状态全部失败: {last_err or '探测失败'}")
 
-            _task_store.set_progress(task_id, f"{index}/{total}")
-            control.finish_attempt(current_attempt_id)
-            current_attempt_id = None
+                error_text = last_error or "探测失败"
+                task_log(
+                    f" -> [异常] 账号 {email or account_id} 本地状态全部失败: {error_text}",
+                    attempt_id=attempt_id,
+                )
+                return {"status": "failed", "account_id": account_id, "email": email, "error": error_text}
+        except SkipCurrentAttemptRequested as exc:
+            task_log(
+                f"[{account_position}/{total}] 已跳过 {email or account_id}: {exc}",
+                attempt_id=attempt_id,
+                check_stop=False,
+            )
+            return {"status": "skipped", "account_id": account_id, "email": email, "error": str(exc)}
+        except StopTaskRequested:
+            raise
+        except Exception as exc:
+            error_text = sanitize_error_message(str(exc) or exc.__class__.__name__)
+            task_log(
+                f"[{account_position}/{total}] 本地状态同步异常: {email or account_id} - {error_text}",
+                attempt_id=attempt_id,
+                check_stop=False,
+            )
+            return {"status": "failed", "account_id": account_id, "email": email, "error": error_text}
+        finally:
+            if fingerprint_gate_acquired and fingerprint_gate is not None:
+                fingerprint_gate.release()
+            control.finish_attempt(attempt_id)
 
-        final_status = "done"
-        summary_message = (
-            f"批量同步本地状态完成: 成功 {success_count} 个，跳过 {skipped_count + len(skipped_items)} 个，失败 {len(errors)} 个"
+    def apply_result(result: dict[str, Any]) -> None:
+        nonlocal success_count, skipped_count, primary_email
+        status = str(result.get("status") or "failed")
+        email = str(result.get("email") or "")
+        error_text = str(result.get("error") or "").strip()
+        with state_lock:
+            if email and not primary_email:
+                primary_email = email
+            if status == "success":
+                success_count += 1
+            elif status == "skipped":
+                skipped_count += 1
+            else:
+                errors.append(f"{email or result.get('account_id') or '-'}: {error_text or '探测失败'}")
+                if result.get("fatal_configuration"):
+                    fatal_configuration_errors.append(error_text or "代理配置解析失败")
+
+    try:
+        for missing_id in missing_ids:
+            task_log(f"[MISS] 账号不存在: account_id={missing_id}")
+            errors.append(f"account_id={missing_id}: 账号不存在")
+        for item in skipped_items:
+            task_log(f"[SKIP] {item.get('email') or item.get('account_id') or '-'} - {item.get('reason') or '已跳过'}")
+
+        _task_store.update_meta(
+            task_id,
+            {
+                "settings": {
+                    **dict(meta.get("settings") or {}),
+                    "requested_concurrency": requested_concurrency,
+                    "effective_concurrency": effective_concurrency,
+                    "unique_exit_ip_enabled": unique_exit_ip_enabled,
+                    "fingerprint_policy": "reuse_account_profile; serialize_shared_or_missing",
+                },
+                "fingerprint_isolation": {
+                    "policy": "reuse_account_profile; serialize_shared_or_missing",
+                    **dict(fingerprint_stats),
+                },
+            },
         )
-        task_log(f"[SUMMARY] {summary_message}")
-        log_status = "success" if not errors else "failed"
+        if unique_exit_ip_enabled:
+            _task_store.update_meta(
+                task_id,
+                {
+                    "unique_exit_ip": {
+                        "enabled": True,
+                        "assigned_count": 0,
+                        "collision_count": 0,
+                        "failed_count": 0,
+                        "assigned_exit_ips": [],
+                        "events": [],
+                    }
+                },
+            )
+            task_log("[代理] 已启用任务内强制独立出口 IP：撞 IP 时会换候选，候选不足会明确失败")
+        task_log(
+            "[配置] 批量本地状态同步"
+            f"｜请求并发={requested_concurrency}｜实际并发={effective_concurrency}"
+            f"｜独立出口IP={'开启' if unique_exit_ip_enabled else '关闭'}"
+            "｜指纹=复用账号已保存指纹，缺失或重复时串行化",
+        )
+
+        ordered_account_ids = [int(account_id or 0) for account_id in account_ids if int(account_id or 0) > 0]
+        next_account_index = 0
+        completed_count = 0
+        in_flight: dict[Any, tuple[int, int]] = {}
+
+        def should_stop_starting_new_attempts() -> bool:
+            value = control.should_stop_starting_new_attempts()
+            # The real task control always returns bool.  Treat foreign/legacy
+            # control stubs as "continue" instead of letting a truthy mock
+            # silently prevent all workers from being scheduled.
+            return value if isinstance(value, bool) else False
+
+        def launch_next_account(pool: ThreadPoolExecutor) -> bool:
+            nonlocal next_account_index
+            if next_account_index >= len(ordered_account_ids):
+                return False
+            if should_stop_starting_new_attempts():
+                return False
+            account_position = next_account_index + 1
+            account_id = ordered_account_ids[next_account_index]
+            try:
+                attempt_id = _claim_next_task_attempt(control)
+            except StopTaskRequested:
+                if control.is_stop_requested():
+                    raise
+                return False
+            start_delay = reserve_start_delay(account_position)
+            future = pool.submit(process_account, account_position, account_id, attempt_id, start_delay)
+            in_flight[future] = (account_position, account_id)
+            next_account_index += 1
+            return True
+
+        with ThreadPoolExecutor(max_workers=effective_concurrency) as pool:
+            while len(in_flight) < effective_concurrency and launch_next_account(pool):
+                pass
+
+            while in_flight:
+                control.checkpoint(consume_skip=False)
+                done, _ = wait(tuple(in_flight.keys()), timeout=0.5, return_when=FIRST_COMPLETED)
+                if not done:
+                    continue
+                for future in done:
+                    account_position, account_id = in_flight.pop(future)
+                    try:
+                        result = future.result()
+                    except StopTaskRequested:
+                        raise
+                    except Exception as exc:
+                        result = {
+                            "status": "failed",
+                            "account_id": account_id,
+                            "email": "",
+                            "error": sanitize_error_message(str(exc) or "并发 worker 异常"),
+                        }
+                        task_log(
+                            f"[{account_position}/{total}] 并发 worker 异常: {result['error']}",
+                            check_stop=False,
+                        )
+                    apply_result(result)
+                    completed_count += 1
+                    _task_store.set_progress(task_id, f"{completed_count}/{total}")
+
+                    while len(in_flight) < effective_concurrency and launch_next_account(pool):
+                        pass
+
+        with state_lock:
+            summary_message = (
+                f"批量同步本地状态完成: 成功 {success_count} 个，"
+                f"跳过 {skipped_count + len(skipped_items)} 个，失败 {len(errors)} 个，"
+                f"并发 {effective_concurrency}"
+            )
+            if control.is_stop_after_current_requested():
+                summary_message = f"批量同步本地状态已完成当前执行单元后停止: 成功 {success_count} 个，跳过 {skipped_count + len(skipped_items)} 个，失败 {len(errors)} 个"
+            runtime_success = success_count
+            runtime_skipped = skipped_count
+            runtime_errors = list(errors)
+            final_primary_email = primary_email
+
+        task_log(f"[SUMMARY] {summary_message}", check_stop=not control.is_stop_after_current_requested())
+        final_status = "failed" if fatal_configuration_errors and runtime_success == 0 else "done"
+        log_status = "success" if final_status == "done" and not runtime_errors else "failed"
+        final_error = (
+            fatal_configuration_errors[0]
+            if final_status == "failed" and fatal_configuration_errors
+            else "" if not runtime_errors else summary_message
+        )
+        final_meta = current_runtime_meta()
         _save_task_log(
             "chatgpt",
-            primary_email,
+            final_primary_email,
             log_status,
-            error="" if log_status == "success" else summary_message,
+            error="" if log_status == "success" else final_error or summary_message,
             detail=_build_task_log_detail(
                 task_id,
                 {
-                    "email": primary_email,
+                    "email": final_primary_email,
                     "attempt_outcome": "batch_probe_local_status_success" if log_status == "success" else "batch_probe_local_status_failed",
                     "source": "batch_probe_local_status",
-                    "meta": {
-                        **meta,
-                        "runtime_success": success_count,
-                        "runtime_skipped": skipped_count,
-                        "runtime_errors": errors,
-                    },
+                    "meta": final_meta,
                 },
             ),
         )
         _task_store.finish(
             task_id,
             status=final_status,
-            success=success_count,
-            skipped=skipped_count + len(skipped_items),
-            errors=errors,
-            error="" if not errors else summary_message,
+            success=runtime_success,
+            skipped=runtime_skipped + len(skipped_items),
+            errors=runtime_errors,
+            error=final_error,
         )
     except StopTaskRequested as exc:
-        # task_log calls checkpoint(), which would immediately re-raise for
-        # an immediate stop and skip this durable terminal path.
         _log(task_id, f"[STOP] {exc}")
+        with state_lock:
+            runtime_success = success_count
+            runtime_skipped = skipped_count
+            runtime_errors = list(errors)
+            final_primary_email = primary_email
         _save_task_log(
             "chatgpt",
-            primary_email,
+            final_primary_email,
             "stopped",
             error=str(exc),
             detail=_build_task_log_detail(
                 task_id,
                 {
-                    "email": primary_email,
+                    "email": final_primary_email,
                     "attempt_outcome": "batch_probe_local_status_stopped",
                     "source": "batch_probe_local_status",
-                    "meta": {
-                        **meta,
-                        "runtime_success": success_count,
-                        "runtime_skipped": skipped_count,
-                        "runtime_errors": errors,
-                    },
+                    "meta": current_runtime_meta(),
                 },
             ),
         )
         _task_store.finish(
             task_id,
             status="stopped",
-            success=success_count,
-            skipped=skipped_count + len(skipped_items),
-            errors=errors,
+            success=runtime_success,
+            skipped=runtime_skipped + len(skipped_items),
+            errors=runtime_errors,
             error=str(exc),
         )
     except Exception as exc:
         error_text = sanitize_error_message(str(exc) or exc.__class__.__name__)
         logger.exception("批量同步本地状态任务异常 task_id=%s error=%s", task_id, error_text)
         _log(task_id, f"[FAIL] 批量同步本地状态异常: {error_text}")
+        with state_lock:
+            runtime_success = success_count
+            runtime_skipped = skipped_count
+            runtime_errors = list(errors) + [error_text]
+            final_primary_email = primary_email
         _save_task_log(
             "chatgpt",
-            primary_email,
+            final_primary_email,
             "failed",
             error=error_text,
             detail=_build_task_log_detail(
                 task_id,
                 {
-                    "email": primary_email,
+                    "email": final_primary_email,
                     "attempt_outcome": "batch_probe_local_status_failed",
                     "source": "batch_probe_local_status",
                     "meta": {
-                        **meta,
-                        "runtime_success": success_count,
-                        "runtime_skipped": skipped_count,
-                        "runtime_errors": errors + [error_text],
+                        **current_runtime_meta(),
+                        "runtime_errors": runtime_errors,
                     },
                 },
             ),
@@ -14030,13 +14606,12 @@ def _run_batch_probe_local_status(task_id: str, account_ids: list[int], params: 
         _task_store.finish(
             task_id,
             status="failed",
-            success=success_count,
-            skipped=skipped_count + len(skipped_items),
-            errors=errors + [error_text],
+            success=runtime_success,
+            skipped=runtime_skipped + len(skipped_items),
+            errors=runtime_errors,
             error=error_text,
         )
     finally:
-        control.finish_attempt(current_attempt_id)
         _task_store.cleanup()
 
 

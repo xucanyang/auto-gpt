@@ -2219,6 +2219,8 @@ export default function Accounts() {
   const phoneBindingProxyFailoverValue = Form.useWatch('proxy_failover', phoneBindingTestForm)
   const probeProxyModeValue = Form.useWatch('proxy_mode', batchProbeStatusConfigForm)
   const probeProxyFailoverValue = Form.useWatch('proxy_failover', batchProbeStatusConfigForm)
+  const probeConcurrencyValue = Form.useWatch('concurrency', batchProbeStatusConfigForm)
+  const probeUniqueExitIpValue = Form.useWatch('unique_exit_ip_enabled', batchProbeStatusConfigForm)
   const baxiCdkUsePoolValue = Form.useWatch('use_pool', baxiCdkSubmitForm)
   const baxiCdkCodeLinesValue = Form.useWatch('code_lines', baxiCdkSubmitForm)
   const baxiCdkSelectedIdsValue = Form.useWatch('cdk_ids', baxiCdkSubmitForm)
@@ -3572,6 +3574,11 @@ export default function Accounts() {
     batchProbeStatusConfigForm.setFieldsValue({
       register_delay_seconds: 0,
       register_delay_max_seconds: 0,
+      concurrency: Math.max(1, Math.min(10, Math.floor(Number(cfg?.chatgpt_local_status_probe_concurrency || 1) || 1))),
+      unique_exit_ip_enabled:
+        cfg?.chatgpt_local_status_probe_unique_exit_ip_enabled === '' || cfg?.chatgpt_local_status_probe_unique_exit_ip_enabled === undefined
+          ? true
+          : parseBooleanConfigValue(cfg.chatgpt_local_status_probe_unique_exit_ip_enabled),
       ...taskProxySettingsFromConfig(cfg || {}),
     })
     setBatchProbeStatusConfigOpen(true)
@@ -3579,8 +3586,26 @@ export default function Accounts() {
 
   const submitBatchProbeStatusConfig = async () => {
     const values = await batchProbeStatusConfigForm.validateFields()
-    validateTaskProxySettings(values)
+    const proxySettings = validateTaskProxySettings(values)
+    const concurrency = Math.max(1, Math.min(10, Math.floor(Number(values.concurrency || 1) || 1)))
+    const uniqueExitIpEnabled = Boolean(values.unique_exit_ip_enabled)
+    const scopeCount = batchProbeStatusConfigScope === 'selected' ? selectedRowKeys.length : total
+    if (uniqueExitIpEnabled && scopeCount > 1 && proxySettings.proxy_mode === 'direct') {
+      throw new Error('强制独立出口 IP 不能使用直连模式')
+    }
+    if (uniqueExitIpEnabled && scopeCount > 1 && proxySettings.proxy_mode === 'specified' && !proxySettings.proxy_failover) {
+      throw new Error('单个指定代理不能满足多个账号的独立出口 IP')
+    }
     await saveTaskProxySettingsToConfig(values)
+    await apiFetch('/config', {
+      method: 'PUT',
+      body: JSON.stringify({
+        data: {
+          chatgpt_local_status_probe_concurrency: String(concurrency),
+          chatgpt_local_status_probe_unique_exit_ip_enabled: uniqueExitIpEnabled ? 'true' : 'false',
+        },
+      }),
+    })
     await loadConfigCache({ force: true }).catch(() => null)
     setBatchProbeStatusConfigOpen(false)
     const customParams: Record<string, unknown> = {
@@ -3591,6 +3616,8 @@ export default function Accounts() {
       probe_delay_max_seconds: Number(values.register_delay_max_seconds ?? 0),
       delay_seconds: Number(values.register_delay_seconds ?? 0),
       delay_max_seconds: Number(values.register_delay_max_seconds ?? 0),
+      concurrency,
+      unique_exit_ip_enabled: uniqueExitIpEnabled,
     }
     await handleBatchStatusSync('probe', batchProbeStatusConfigScope, customParams)
   }
@@ -7928,6 +7955,46 @@ export default function Accounts() {
               <span style={{ color: '#888', marginLeft: 8 }}>（都填 0 为无延时，填不同数值则在区间内随机）</span>
             </Space>
           </Form.Item>
+
+          <Space style={{ display: 'flex', flexWrap: 'wrap', gap: 16 }} align="baseline">
+            <Form.Item label="并发账号数" name="concurrency" initialValue={1}>
+              <InputNumber min={1} max={10} step={1} style={{ width: 140 }} />
+            </Form.Item>
+            <Form.Item
+              name="unique_exit_ip_enabled"
+              valuePropName="checked"
+              initialValue
+              extra="按实际出口 IP 分配；撞 IP 时会换候选，候选不足的账号会明确失败。"
+            >
+              <Checkbox>任务内强制独立出口 IP</Checkbox>
+            </Form.Item>
+          </Space>
+
+          {probeUniqueExitIpValue && probeProxyModeValue === 'direct' && (batchProbeStatusConfigScope === 'selected' ? selectedRowKeys.length : total) > 1 ? (
+            <Alert
+              type="error"
+              showIcon
+              style={{ marginBottom: 16 }}
+              message="直连不能提供多个独立出口 IP"
+            />
+          ) : null}
+          {probeUniqueExitIpValue && probeProxyModeValue === 'specified' && !probeProxyFailoverValue && (batchProbeStatusConfigScope === 'selected' ? selectedRowKeys.length : total) > 1 ? (
+            <Alert
+              type="error"
+              showIcon
+              style={{ marginBottom: 16 }}
+              message="单个指定代理不能满足多个独立出口 IP"
+            />
+          ) : null}
+          {Number(probeConcurrencyValue || 1) > 1 ? (
+            <Alert
+              type="info"
+              showIcon
+              style={{ marginBottom: 16 }}
+              message={`并发 ${Math.min(10, Math.max(1, Number(probeConcurrencyValue || 1)))} 个账号`}
+              description="每个 worker 使用独立数据库会话；账号已保存的浏览器指纹会被复用，缺失或重复指纹会自动串行化。"
+            />
+          ) : null}
 
           <Form.Item label="代理模式" name="proxy_mode" initialValue="dynamic">
             <Select style={{ width: 260 }}>

@@ -49,7 +49,12 @@ class TokenRefreshManager:
     SESSION_URL = "https://chatgpt.com/api/auth/session"
     TOKEN_URL = "https://auth.openai.com/oauth/token"
 
-    def __init__(self, proxy_url: Optional[str] = None):
+    def __init__(
+        self,
+        proxy_url: Optional[str] = None,
+        *,
+        browser_fingerprint: Optional[Dict[str, Any]] = None,
+    ):
         """
         初始化 Token 刷新管理器
 
@@ -57,13 +62,75 @@ class TokenRefreshManager:
             proxy_url: 代理 URL
         """
         self.proxy_url = proxy_url
+        # Status refreshes must not silently manufacture a new browser
+        # identity.  Only an already persisted account fingerprint is used.
+        self.browser_fingerprint = (
+            dict(browser_fingerprint)
+            if isinstance(browser_fingerprint, dict) and browser_fingerprint
+            else {}
+        )
         from .constants import OAUTH_CLIENT_ID, OAUTH_REDIRECT_URI
         self._oauth_client_id = OAUTH_CLIENT_ID
         self._oauth_redirect_uri = OAUTH_REDIRECT_URI
 
+    def _browser_fingerprint_object(self):
+        """Build a curl-cffi-compatible identity without filling missing data."""
+        payload = self.browser_fingerprint
+        if not payload:
+            return None
+
+        device_id = str(payload.get("device_id") or "").strip()
+        user_agent = str(payload.get("user_agent") or "").strip()
+        impersonate = str(payload.get("impersonate") or "").strip()
+        if not (device_id and user_agent and impersonate):
+            return None
+
+        try:
+            chrome_major = int(payload.get("chrome_major") or 0)
+        except (TypeError, ValueError):
+            chrome_major = 0
+        chrome_full_version = str(payload.get("chrome_full_version") or "").strip()
+        if not chrome_major and chrome_full_version:
+            try:
+                chrome_major = int(chrome_full_version.split(".", 1)[0])
+            except (TypeError, ValueError):
+                chrome_major = 0
+
+        try:
+            from .utils import BrowserFingerprint
+
+            return BrowserFingerprint(
+                device_id=device_id,
+                accept_language=str(payload.get("accept_language") or "en-US,en;q=0.9").strip(),
+                impersonate=impersonate,
+                chrome_major=chrome_major,
+                chrome_full_version=chrome_full_version,
+                user_agent=user_agent,
+                sec_ch_ua=str(payload.get("sec_ch_ua") or "").strip(),
+                platform_version=str(payload.get("platform_version") or "").strip(),
+                viewport_width=int(payload.get("viewport_width") or 0),
+                viewport_height=int(payload.get("viewport_height") or 0),
+            )
+        except Exception:
+            return None
+
     def _create_session(self) -> cffi_requests.Session:
         """创建 HTTP 会话"""
-        session = cffi_requests.Session(impersonate="chrome120", proxy=self.proxy_url)
+        fingerprint = self._browser_fingerprint_object()
+        impersonate = fingerprint.impersonate if fingerprint else "chrome120"
+        try:
+            session = cffi_requests.Session(impersonate=impersonate, proxy=self.proxy_url)
+        except Exception:
+            # A malformed legacy value must not make a token refresh unusable.
+            session = cffi_requests.Session(impersonate="chrome120", proxy=self.proxy_url)
+            fingerprint = None
+        if fingerprint is not None:
+            try:
+                from .utils import apply_browser_fingerprint
+
+                apply_browser_fingerprint(session, fingerprint)
+            except Exception:
+                pass
         return session
 
     def refresh_by_session_token(self, session_token: str) -> TokenRefreshResult:

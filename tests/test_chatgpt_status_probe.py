@@ -168,6 +168,55 @@ class ChatGPTStatusProbeTests(unittest.TestCase):
         self.assertEqual(result["auth"]["source"], "access_token")
         self.assertEqual(result["subscription"]["plan"], "free")
 
+    def test_probe_reuses_persisted_account_browser_fingerprint(self):
+        fingerprint = {
+            "device_id": "device-unique-1",
+            "accept_language": "en-US,en;q=0.9",
+            "impersonate": "chrome136",
+            "chrome_major": 136,
+            "chrome_full_version": "136.0.7103.92",
+            "user_agent": "Mozilla/5.0 Chrome/136.0.7103.92",
+            "sec_ch_ua": '"Chromium";v="136", "Google Chrome";v="136", "Not.A/Brand";v="99"',
+            "platform_version": "15.0.0",
+            "viewport_width": 1440,
+            "viewport_height": 900,
+        }
+        account = DummyAccount(
+            access_token="cached-access-token",
+            user_id="acct-fingerprint",
+            extra={"chatgpt_browser_fingerprint": fingerprint},
+        )
+
+        with mock.patch(
+            "services.chatgpt_core.status_probe.TokenRefreshManager",
+        ) as manager_cls, mock.patch(
+            "services.chatgpt_core.status_probe._probe_backend_me",
+            return_value=ProbeHTTPResult(
+                status_code=200,
+                headers={},
+                body_text='{"plan_type":"chatgptplusplan"}',
+                body_json={"plan_type": "chatgptplusplan"},
+                error_code="",
+                message="ok",
+            ),
+        ) as probe_me, mock.patch(
+            "services.chatgpt_core.status_probe._probe_codex_usage",
+            return_value=ProbeHTTPResult(
+                status_code=200,
+                headers={},
+                body_text='{"ok":true}',
+                body_json={"ok": True},
+                error_code="",
+                message="ok",
+            ),
+        ):
+            result = probe_local_chatgpt_status(account)
+
+        manager_cls.assert_called_once_with(proxy_url="", browser_fingerprint=fingerprint)
+        self.assertEqual(probe_me.call_args.kwargs["browser_fingerprint"], fingerprint)
+        self.assertEqual(result["network"]["browser_fingerprint"]["source"], "account")
+        self.assertTrue(result["network"]["browser_fingerprint"]["isolated"])
+
     def test_probe_backend_me_timeout_returns_structured_probe_failure(self):
         account = DummyAccount(
             access_token="cached-access-token",

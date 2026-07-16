@@ -4,6 +4,23 @@
 
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，并且本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/) (语义化版本)。
 
+## [2.2.10] - 2026-07-16
+
+### 新增 (Added)
+- **批量本地状态同步并发配置**：`frontend/src/pages/Accounts.tsx` 的“批量同步本地状态配置”新增 `1-10` 个账号的并发数与“任务内强制独立出口 IP”开关；这两个值保存到 `/config`，再次打开弹窗会恢复。创建任务时会把请求并发、实际并发和隔离规则冻结进任务元数据，任务回放不会被后续全局配置修改影响。
+- **任务内出口 IP 领取审计**：`api/tasks.py` 为并发 worker 增加真实出口 IP 探测和原子领取。相同出口 IP 不会被同一批任务的两个账号静默复用；runner 会尝试下一个代理候选，候选耗尽时将该账号明确记为失败，并在任务元数据保存已分配、撞 IP 与探测失败的聚合审计。
+
+### 优化 (Changed)
+- **账号级浏览器身份复用与并发隔离**：`services/chatgpt_core/status_probe.py` 和 `services/chatgpt_core/token_refresh.py` 让本地状态探测、OAuth 刷新和 ChatGPT API 请求复用账号保存的 UA、Client Hints、`oai-did` 与 curl-cffi TLS profile。`api/tasks.py` 按完整账号指纹加锁：不同稳定指纹可并发，相同指纹会串行；缺少历史指纹的旧账号统一退化为串行，避免伪装成安全并发。
+- **并发运行边界清晰化**：每个本地状态 worker 使用独立 SQLModel `Session`，调度线程统一处理进度、停止后不再启动新账号、失败记录和最终任务归档；动态代理在独立出口模式下自动增加候选数量，直连或单指定代理会在创建任务时被拒绝。
+
+### 修复 (Fixed)
+- **代理日志递归脱敏**：批量同步日志不再写入代理 URL 或原始候选内容，只写“动态代理 / 代理池 / 指定代理”等安全网络标签与已验证出口 IP，修复 URL 进入旧脱敏链路时可能导致任务 worker 异常的递归问题，同时避免代理端点落入任务历史。
+- **前端版本同步至 v2.2.10**：`frontend/src/app/AppShell.tsx` 更新侧栏版本，用于确认浏览器已加载并发与隔离控制。
+
+### 测试 (Tests)
+- **并发与身份隔离回归覆盖**：`tests/test_probe_local_status_batch_config.py` 覆盖并发参数冻结、动态候选扩容、独立出口下直连拒绝、独立数据库会话、不同指纹真实并发、旧账号指纹缺失时串行，以及出口 IP 冲突阻断；`tests/test_chatgpt_status_probe.py` 覆盖已保存账号指纹传入 Token Refresh 与本地 API 探测。
+
 ## [2.2.9] - 2026-07-16
 
 ### 优化 (Changed)
@@ -1672,4 +1689,8 @@
 
 ## 2026-07-16 10:51:23 +0800
 - 修复已保存PIX链接上传重复投递和任务无反馈
+- 发布模式: multi
+
+## 2026-07-16 11:32:25 +0800
+- 增加批量同步本地状态并发与账号隔离保护
 - 发布模式: multi
