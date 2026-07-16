@@ -39,9 +39,7 @@ services:
         CAMOUFOX_VERSION: ${CAMOUFOX_VERSION:-135.0.1}
         CAMOUFOX_RELEASE: ${CAMOUFOX_RELEASE:-beta.24}
     container_name: auto-gpt
-    # 主实例保留为可手动恢复的 standby；默认发布不再自动拉起它。
-    profiles:
-      - standby
+    # 主实例承载 auto-gpt.cccy.me，必须与 Plus / Plus2 一样常驻发布。
     init: true
     restart: unless-stopped
     env_file:
@@ -89,7 +87,7 @@ services:
 
   auto-gpt-plus:
     image: ${APP_IMAGE:-auto-gpt:latest}
-    # 常驻实例承担镜像构建，standby profile 未启用时发布仍能更新同一镜像。
+    # 三个业务实例共用统一镜像，运行数据仍由各自 bind mount 隔离。
     build:
       context: .
       dockerfile: Dockerfile

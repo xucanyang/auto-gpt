@@ -4,6 +4,18 @@
 
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，并且本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/) (语义化版本)。
 
+## [2.2.16] - 2026-07-17
+
+### 优化 (Changed)
+- **主实例恢复为常驻发布拓扑**：`docker-compose.multi.yml` 移除 `auto-gpt` 的 `standby` profile，`deploy.sh` 将主实例加入 `ACTIVE_SERVICES`；后续 multi 发布会与 Plus、Plus2 一并重建并保持运行，不再在发布结尾主动执行 `docker stop auto-gpt`。
+- **三个业务实例发布路径对齐**：hot 发布现在依次同步 `auto-gpt`、`auto-gpt-plus` 和 `auto-plus2`，multi/hot 发布后的 smoke 同时验证三个实例的 `/api/health` 与首页，避免只验证 Plus 系列而遗漏公网主站。
+
+### 修复 (Fixed)
+- **修复主站发布后 502**：恢复 `127.0.0.1:8000` 的持久监听，使 nginx 的 `auto-gpt.cccy.me` 上游与真实运行拓扑重新一致；主实例不再因历史 standby 规则收到人为 `SIGTERM`，并保留独立 `/opt/auto-gpt/data` 运行数据边界。
+
+### 测试 (Tests)
+- **发布拓扑合同与在线烟测**：新增 `tests/test_deploy_topology_contract.py`，锁定主实例无 profile、四个活动服务、三个实例 hot 同步及 8000/8001/8003 健康检查；发布前执行 shell 语法、Compose 配置、定向 pytest 与前端生产构建，发布后验证三个本地实例及 `auto-gpt.cccy.me` 公网入口。
+
 ## [2.2.15] - 2026-07-17
 
 ### 新增 (Added)
@@ -1791,4 +1803,8 @@
 
 ## 2026-07-17 04:46:35 +0800
 - 修复手机号池单号状态与限定号段绑定语义
+- 发布模式: multi
+
+## 2026-07-17 05:47:00 +0800
+- 恢复主实例常驻发布拓扑并补齐三实例发布烟测
 - 发布模式: multi
