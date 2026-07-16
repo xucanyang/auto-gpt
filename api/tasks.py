@@ -303,6 +303,8 @@ PIX_SUBMIT_MODE_AUTO_EXTRACT = "auto_extract"
 PIX_SUBMIT_MODE_USER_LINK = "user_link"
 PIX_USER_LINK_HOST = "payments.stripe.com"
 PIX_USER_LINK_PATH_PREFIX = "/qr/instructions/"
+PIX_SAVED_LINK_SUBMITTED_STATUS = "pix_submitted"
+PIX_SAVED_LINK_SUBMITTED_REASON = "已保存的 PIX 支付链接已提交至管理端，请先重新同步或生成新链接"
 
 
 def _normalize_baxigpt_payment_channel(value: Any) -> str:
@@ -1357,6 +1359,8 @@ def _saved_stripe_pix_user_link(account: AccountModel) -> tuple[str, str]:
     summary = account_payment_link_summary(account, extra if isinstance(extra, dict) else {})
     if str(summary.get("platform") or "").strip().lower() != "pix":
         return "", "账号没有已保存的 PIX 支付链接"
+    if str(summary.get("link_status") or "").strip().lower() == PIX_SAVED_LINK_SUBMITTED_STATUS:
+        return "", PIX_SAVED_LINK_SUBMITTED_REASON
 
     pay_link = str(summary.get("url") or "").strip()
     try:
@@ -1372,6 +1376,62 @@ def _saved_stripe_pix_user_link(account: AccountModel) -> tuple[str, str]:
     if payment_link_expires_soon(summary):
         return "", "已保存的 PIX 支付链接即将到期，请先重新生成"
     return pay_link, ""
+
+
+def _mark_saved_pix_user_link_submitted(
+    account_id: int,
+    *,
+    pix_pay_link: str,
+    duplicate: bool = False,
+) -> bool:
+    """Mark only the exact saved PIX link consumed by the submission service.
+
+    The remote service treats one Stripe PIX instruction URL as single-use.
+    Keep that fact on the link cache instead of marking the whole account
+    unavailable: a subsequent long-link sync or a newly generated URL remains
+    usable. The exact-URL comparison prevents a late task result from changing
+    a newer link that was synced while the task was running.
+    """
+
+    expected_url = str(pix_pay_link or "").strip()
+    if not expected_url:
+        return False
+
+    with Session(engine) as session:
+        account = session.get(AccountModel, int(account_id or 0))
+        if account is None or account.platform != "chatgpt":
+            return False
+        try:
+            extra = account.get_extra()
+        except Exception:
+            extra = {}
+        if not isinstance(extra, dict):
+            return False
+        cached = extra.get("chatgpt_last_payment_link")
+        if not isinstance(cached, dict):
+            return False
+        summary = account_payment_link_summary(account, extra)
+        if (
+            str(summary.get("platform") or "").strip().lower() != "pix"
+            or str(summary.get("url") or "").strip() != expected_url
+        ):
+            return False
+
+        now = datetime.now(timezone.utc).isoformat()
+        cached["link_status"] = PIX_SAVED_LINK_SUBMITTED_STATUS
+        cached["link_status_reason"] = (
+            "PIX 管理端已存在该支付链接"
+            if duplicate
+            else "已提交至 PIX 管理端，等待支付结果"
+        )
+        cached["link_status_updated_at"] = now
+        cached["pix_submitted_at"] = now
+        extra["chatgpt_last_payment_link"] = cached
+        account.set_extra(extra)
+        account.updated_at = datetime.now(timezone.utc)
+        session.add(account)
+        session.commit()
+    return True
 
 
 def _resolve_baxigpt_cdk_submit_accounts(
@@ -6793,6 +6853,21 @@ _IDEA_NON_ACCOUNT_TRANSIENT_MARKERS = (
 )
 
 
+def _is_saved_pix_user_link_already_submitted_reason(reason: Any) -> bool:
+    """Recognize only a remote duplicate *link* response, never a CDK error."""
+
+    text = str(reason or "").strip().lower()
+    if not text:
+        return False
+    chinese_link = any(marker in text for marker in ("pix 支付链接", "pix支付链接", "支付链接", "付款链接"))
+    chinese_duplicate = any(marker in text for marker in ("已被提交", "已提交过", "重复提交", "请勿重复使用"))
+    english_link = any(marker in text for marker in ("pix payment link", "pix pay link", "payment link"))
+    english_duplicate = any(marker in text for marker in (
+        "already submitted", "has been submitted", "duplicate submission", "do not reuse",
+    ))
+    return (chinese_link and chinese_duplicate) or (english_link and english_duplicate)
+
+
 def _is_idea_account_unavailable_reason(reason: Any) -> bool:
     text = str(reason or "").strip().lower()
     if not text:
@@ -7243,6 +7318,22 @@ def _run_pix_submit(
         )
         return summary
 
+    def mark_saved_pix_link_submitted(account_id: int, pix_pay_link: str, *, duplicate: bool = False) -> bool:
+        if not use_saved_pix_link:
+            return False
+        try:
+            marked = _mark_saved_pix_user_link_submitted(
+                account_id,
+                pix_pay_link=pix_pay_link,
+                duplicate=duplicate,
+            )
+        except Exception as exc:
+            _log(task_id, f"[PIX][WARN] 已保存链接提交状态写回失败: {safe_text(exc)}")
+            return False
+        if not marked:
+            _log(task_id, "[PIX][DEBUG] 已保存链接已在任务执行期间更新，保留新链接状态", "debug")
+        return marked
+
     def wait_with_control(seconds: int, attempt_id: int) -> None:
         remaining = float(max(seconds, 0))
         while remaining > 0:
@@ -7476,6 +7567,10 @@ def _run_pix_submit(
                             )
                             lock_cdk_for_review(cdk, account_id)
                         else:
+                            link_already_submitted = use_saved_pix_link and _is_saved_pix_user_link_already_submitted_reason(reason)
+                            if link_already_submitted:
+                                mark_saved_pix_link_submitted(account_id, pix_pay_link, duplicate=True)
+                                reason = PIX_SAVED_LINK_SUBMITTED_REASON
                             errors.append(f"{email or account_id}: {reason}")
                             should_mark_unavailable = _is_idea_account_unavailable_reason(reason)
                             persist_account_state(
@@ -7521,6 +7616,8 @@ def _run_pix_submit(
                     status_token = str(submit_result.get("status_token") or "").strip()
                     if not order_id or not status_token:
                         raise BaxiGptRequestError("PIX 上游未返回完整轮询凭据", request_outcome_unknown=True)
+                    if use_saved_pix_link:
+                        mark_saved_pix_link_submitted(account_id, pix_pay_link)
                     persist_account_state(
                         account_id,
                         status="submitted",
@@ -7575,6 +7672,10 @@ def _run_pix_submit(
                         )
                         lock_cdk_for_review(cdk, account_id)
                     else:
+                        link_already_submitted = use_saved_pix_link and _is_saved_pix_user_link_already_submitted_reason(reason)
+                        if link_already_submitted:
+                            mark_saved_pix_link_submitted(account_id, pix_pay_link, duplicate=True)
+                            reason = PIX_SAVED_LINK_SUBMITTED_REASON
                         errors.append(f"{email or account_id}: {reason}")
                         should_mark_unavailable = _is_idea_account_unavailable_reason(reason)
                         persist_account_state(

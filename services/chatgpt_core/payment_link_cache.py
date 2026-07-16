@@ -24,12 +24,16 @@ PAYMENT_LINK_STATUS_LABELS = {
     "amount_not_zero": "非0元订单",
     "not_usd": "非指定区域订单",
     "precheck_failed": "支付链接核验失败",
+    "pix_submitted": "已提交 PIX 管理端",
 }
 PAYMENT_LINK_REGENERATE_STATUSES = {
     "invalid",
     "amount_not_zero",
     "not_usd",
     "precheck_failed",
+    # A Stripe PIX instruction link is single-use from the management
+    # service's perspective, even while its QR deadline has not elapsed.
+    "pix_submitted",
 }
 PAYMENT_LINK_STATUS_SYNC_STATUSES = {"already_paid"}
 PAYMENT_LINK_FORMAT_PAYPAL = "paypal_url"
@@ -208,7 +212,7 @@ def payment_link_cache_matches(
     cached_profile_hash = str(cached.get("profile_hash") or cached.get("payment_profile_hash") or "").strip()
     if payment_link_url_requires_regeneration(cached.get("url"), cached_format):
         return False
-    if payment_link_expires_soon(cached):
+    if payment_link_requires_regeneration(cached):
         return False
     matches = (
         cached_plan == expected["plan"]
@@ -354,6 +358,27 @@ def build_payment_link_cache_payload(
             or datetime.now(timezone.utc).isoformat()
         ),
     }
+
+    fallback_url = normalize_payment_link_url(
+        fallback_source.get("url")
+        or fallback_source.get("paypal_url")
+        or fallback_source.get("provider_redirect_url")
+        or fallback_source.get("checkout_url")
+        or fallback_source.get("cashier_url"),
+        link_format,
+    )
+    status_source: dict[str, Any] = {}
+    if str(payload_source.get("link_status") or "").strip():
+        status_source = payload_source
+    elif fallback_url and fallback_url == url:
+        # Normalizing an unchanged cache must retain its operational status.
+        # A newly returned URL must start clean, rather than inheriting the old
+        # PIX single-use marker from fallback metadata.
+        status_source = metadata_fallback
+    for key in ("link_status", "link_status_reason", "link_status_updated_at", "pix_submitted_at"):
+        value = status_source.get(key)
+        if value is not None and value != "":
+            payload[key] = value
 
     if payload["link_type"] == "pix":
         raw_expires_at = payload_source.get("link_expires_at")

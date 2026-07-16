@@ -970,10 +970,91 @@ CDK-AAAA-1111
             task_log = session.exec(select(TaskLog).where(TaskLog.task_id == result["task_id"])).first()
         self.assertEqual(extra["baxigpt_cdk"]["pix_submit_mode"], "user_link")
         self.assertEqual(extra["idea_submit"]["pix_submit_mode"], "user_link")
+        self.assertEqual(extra["chatgpt_last_payment_link"]["link_status"], "pix_submitted")
+        request = tasks_module.BaxiGptCdkSubmitTaskRequest(
+            account_ids=[account_id],
+            payment_channel="pix",
+            pix_submit_mode="user_link",
+        )
+        eligible, _, skipped, _ = tasks_module._resolve_baxigpt_cdk_submit_accounts(
+            request,
+            require_access_token=False,
+            require_saved_pix_link=True,
+        )
+        self.assertEqual(eligible, [])
+        self.assertIn("已提交至管理端", str(skipped[0].get("reason") or ""))
         self.assertIsNotNone(task_log)
         self.assertNotIn(pix_cdk, str(task_log.detail_json))
         self.assertNotIn(pix_link, str(task_log.detail_json))
         self.assertNotIn(status_token, str(task_log.detail_json))
+
+    def test_pix_user_link_duplicate_response_marks_link_non_reusable(self):
+        pix_cdk = "PIX-USER-LINK-DUPLICATE-CDK"
+        pix_link = "https://payments.stripe.com/qr/instructions/pix-user-link-duplicate"
+        with Session(self.engine) as session:
+            account = AccountModel(platform="chatgpt", email="pix-link-duplicate@example.com", password="pw", token="")
+            account.set_extra({
+                "chatgpt_last_payment_link": {
+                    "url": pix_link,
+                    "link_type": "pix",
+                    "link_expires_at": 4_102_444_800,
+                }
+            })
+            session.add(account)
+            session.commit()
+            session.refresh(account)
+            account_id = int(account.id or 0)
+
+        with patch.object(tasks_module, "_assert_pix_user_link_submission_enabled"):
+            result = tasks_module.enqueue_baxigpt_cdk_submit_task(
+                tasks_module.BaxiGptCdkSubmitTaskRequest(
+                    account_ids=[account_id],
+                    payment_channel="pix",
+                    pix_submit_mode="user_link",
+                    pix_cdk=pix_cdk,
+                    submit_interval_seconds=0,
+                ),
+                background_tasks=BackgroundTasks(),
+            )
+        snapshot = tasks_module._task_store.snapshot(result["task_id"])
+
+        class FakeBaxiClient:
+            def submit_pix_user_link(self, *, pix_cdk, pix_pay_link):
+                raise BaxiGptRequestError(
+                    "上游 HTTP 409: {\"detail\":\"该 PIX 支付链接已被提交，请勿重复使用\"}",
+                    http_status=409,
+                )
+
+        with patch("services.chatgpt_core.baxigpt_client.BaxiGptClient", FakeBaxiClient), \
+             patch.object(tasks_module.time, "sleep", return_value=None):
+            tasks_module._run_pix_submit(
+                result["task_id"],
+                snapshot["meta"]["pairs"],
+                snapshot["meta"]["settings"],
+                pix_cdk,
+            )
+
+        final_snapshot = tasks_module._task_store.snapshot(result["task_id"])
+        self.assertEqual(final_snapshot["status"], "failed")
+        self.assertIn("已提交至管理端", str(final_snapshot["meta"]["runtime_results"]))
+        self.assertNotIn(pix_cdk, str(final_snapshot))
+        self.assertNotIn(pix_link, str(final_snapshot))
+        with Session(self.engine) as session:
+            account = session.get(AccountModel, account_id)
+            extra = account.get_extra()
+        self.assertEqual(extra["chatgpt_last_payment_link"]["link_status"], "pix_submitted")
+        request = tasks_module.BaxiGptCdkSubmitTaskRequest(
+            account_ids=[account_id],
+            payment_channel="pix",
+            pix_submit_mode="user_link",
+        )
+        eligible, _, skipped, _ = tasks_module._resolve_baxigpt_cdk_submit_accounts(
+            request,
+            require_access_token=False,
+            require_saved_pix_link=True,
+        )
+        self.assertEqual(eligible, [])
+        self.assertIn("已提交至管理端", str(skipped[0].get("reason") or ""))
 
     def test_site_multi_credit_pix_cdk_reuses_only_after_each_paid_result(self):
         """One local CDK processes three saved links serially, never concurrently."""

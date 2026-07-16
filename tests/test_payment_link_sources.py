@@ -162,6 +162,50 @@ class PaymentLinkSourceTests(unittest.TestCase):
             self.assertFalse(payment_link_cache_matches(cached, expected))
             self.assertTrue(payment_link_requires_regeneration(cached))
 
+    def test_pix_link_already_submitted_to_management_is_not_reused(self):
+        cached = build_payment_link_cache_payload(
+            {
+                "url": "https://payments.stripe.com/qr/instructions/pix-submitted",
+                "plan": "plus",
+                "country": "BR",
+                "currency": "BRL",
+                "link_type": "pix",
+                "link_status": "pix_submitted",
+                "payment_link_format": "long_link",
+                "payment_source": "long_link",
+                "profile_hash": PROFILE_HASH,
+            },
+            source="long_link",
+        )
+        expected = normalize_payment_link_params(
+            {
+                "plan": "plus",
+                "country": "BR",
+                "currency": "BRL",
+                "payment_link_format": "long_link",
+                "payment_source": "long_link",
+                "profile_hash": PROFILE_HASH,
+            }
+        )
+
+        self.assertTrue(payment_link_requires_regeneration(cached))
+        self.assertFalse(payment_link_cache_matches(cached, expected))
+        refreshed = build_payment_link_cache_payload(
+            {
+                "url": "https://payments.stripe.com/qr/instructions/pix-fresh",
+                "plan": "plus",
+                "country": "BR",
+                "currency": "BRL",
+                "link_type": "pix",
+                "payment_link_format": "long_link",
+                "payment_source": "long_link",
+                "profile_hash": PROFILE_HASH,
+            },
+            source="long_link",
+            fallback=cached,
+        )
+        self.assertNotIn("link_status", refreshed)
+
     def test_plugin_uses_active_long_link_profile_without_calling_hosted_generator(self):
         account = Account(
             platform="chatgpt",

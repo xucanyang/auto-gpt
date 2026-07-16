@@ -4093,11 +4093,15 @@ export default function Accounts() {
       const pixCdkCount = Number(res?.pix_cdk_count || 0)
       const importInfo = res?.cdk_pool_import && typeof res.cdk_pool_import === 'object' ? res.cdk_pool_import : {}
       const importErrors = Array.isArray(importInfo?.errors) ? importInfo.errors : []
+      const skippedAccounts = Array.isArray(res?.skipped_accounts) ? res.skipped_accounts : []
+      const submittedLinkSkipped = paymentChannel === 'pix' && pixSubmitMode === 'user_link'
+        ? skippedAccounts.filter((item: any) => String(item?.reason || '').includes('已提交至管理端')).length
+        : 0
 
       if (!taskIdFromResponse) {
         message.info({
           content: paymentChannel === 'pix'
-            ? `没有可提交的 ${pixSubmissionLabel}账号。请求 ${requestedAccounts} 个账号。`
+            ? `没有可提交的 ${pixSubmissionLabel}账号。请求 ${requestedAccounts} 个账号。${submittedLinkSkipped > 0 ? `其中 ${submittedLinkSkipped} 个链接已提交至管理端，请先重新同步或生成新链接。` : ''}`
             : `没有可提交的卡密/账号配对。请求 ${requestedAccounts} 个账号，可用卡密 ${availableCodes} 个`,
           key: toastKey,
         })
@@ -4109,7 +4113,6 @@ export default function Accounts() {
         return
       }
 
-      const snapshot = await apiFetch(`/tasks/${taskIdFromResponse}`)
       if (paymentChannel === 'pix') baxiCdkSubmitForm.setFieldValue('pix_cdk_lines', '')
       setBaxiCdkSubmitOpen(false)
       setTaskModalMode('baxigpt_cdk')
@@ -4121,11 +4124,30 @@ export default function Accounts() {
             : `iDEAL 批量提交：${pairCount} 对 / 库存余 ${spareCodes}`,
       })
       setTaskId(taskIdFromResponse)
-      setTaskSnapshot(snapshot)
+      setTaskSnapshot({
+        task_id: taskIdFromResponse,
+        status: 'pending',
+        source: 'baxigpt_cdk_submit',
+        meta: {
+          payment_channel: paymentChannel,
+          pix_submit_mode: pixSubmitMode,
+          pair_count: pairCount,
+          eligible_accounts: eligible,
+          pix_cdk_count: pixCdkCount,
+        },
+      })
       setRegisterModalOpen(true)
       setActiveTasksPanelOpen(true)
       void activeTasksQuery.refetch()
       if (paymentChannel === 'ideal') void loadBaxiCdkPoolSummary()
+      void apiFetch(`/tasks/${taskIdFromResponse}`)
+        .then((snapshot) => setTaskSnapshot(snapshot))
+        .catch(() => {
+          message.warning({
+            content: '任务已创建，任务快照暂不可读；日志面板会自动重试。',
+            key: toastKey,
+          })
+        })
       message.success({
         content: paymentChannel === 'pix'
           ? `${pixSubmissionLabel}已启动：${pairCount} 个候选账号，${pixCdkCount} 个 CDK${targetSuccess > 0 ? `，目标成功 ${targetSuccess} 个` : ''}。本站多额度 CDK 仅在确认 paid 后串行复用；外部 PIX CDK 成功后不复用；未知结果继续锁定人工复核。`

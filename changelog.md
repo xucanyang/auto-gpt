@@ -4,6 +4,21 @@
 
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，并且本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/) (语义化版本)。
 
+## [2.2.9] - 2026-07-16
+
+### 优化 (Changed)
+- **PIX 链接状态成为可执行边界**：`api/tasks.py` 将“已保存 Stripe PIX 链接已被管理端提交”的事实写回对应 `chatgpt_last_payment_link.link_status=pix_submitted`，且只在任务执行期读取到的 URL 与当前缓存仍一致时更新，避免晚到的任务结果覆盖新同步链接。该状态只封存旧链接，不把账号标记为不可用；重新同步或重新生成的新链接仍可继续提交。
+- **支付链接缓存可自动换新**：`services/chatgpt_core/payment_link_cache.py` 将 `pix_submitted` 显示为“已提交 PIX 管理端”，并纳入需要重新生成的链接状态，避免后续支付链接任务误复用已被远端占用的二维码。
+- **任务面板先于快照打开**：`frontend/src/pages/Accounts.tsx` 在创建 iDEAL / PIX 任务拿到 `task_id` 后立即打开日志面板，再异步刷新快照。短任务、瞬时失败或快照请求暂不可用都不会阻塞操作反馈；面板会自动重试读取任务。
+
+### 修复 (Fixed)
+- **已保存 PIX 链接重复投递**：管理端返回“该 PIX 支付链接已被提交，请勿重复使用”时，runner 识别为链接级终态并转换为明确的“请先重新同步或生成新链接”结果。后续批量提交会在创建任务前跳过这些链接并显示数量，不再反复发送同一 URL、消耗操作时间或让快速失败看起来像点击无响应。
+- **任务标题与结果语义**：已保存链接模式的任务窗口明确显示“PIX 链接上传”；无可投递账号时，弹窗直接说明被管理端占用的链接数量及下一步，而不是只给出泛化的空任务提示。
+- **前端版本同步至 v2.2.9**：`frontend/src/app/AppShell.tsx` 更新侧栏版本，便于确认浏览器已加载本次任务反馈与重复链接保护。
+
+### 测试 (Tests)
+- **重复链接回归覆盖**：`tests/test_baxigpt_cdk_pool.py` 覆盖上游 HTTP 409 的已提交链接、状态写回、后续 admission 跳过及敏感值不落入快照；`tests/test_accounts_pix_link_upload_ui.py` 锁定“任务已创建即打开面板”的前端契约。
+
 ## [2.2.8] - 2026-07-16
 
 ### 新增 (Added)
@@ -1653,4 +1668,8 @@
 
 ## 2026-07-16 10:31:11 +0800
 - 支持按已选或当前筛选导出PIX支付链接，并完善PIX CDK复用
+- 发布模式: multi
+
+## 2026-07-16 10:51:23 +0800
+- 修复已保存PIX链接上传重复投递和任务无反馈
 - 发布模式: multi

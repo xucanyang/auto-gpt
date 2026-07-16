@@ -191,7 +191,10 @@ export function RegisterTaskModal({
     if (taskModalMode === 'baxigpt_cdk') {
       const count = Number(taskSnapshot?.meta?.pair_count || 0)
       const channel = String(taskSnapshot?.meta?.payment_channel || '').trim().toLowerCase() === 'pix' ? 'PIX' : 'iDEAL'
-      return count > 0 ? `${channel} 批量提交 (${count} 个)` : `${channel} 批量提交`
+      const isSavedPixLinkUpload = channel === 'PIX'
+        && String(taskSnapshot?.meta?.pix_submit_mode || '').trim().toLowerCase() === 'user_link'
+      const label = isSavedPixLinkUpload ? 'PIX 链接上传' : `${channel} 批量提交`
+      return count > 0 ? `${label} (${count} 个)` : label
     }
     if (taskModalMode === 'paypal_bind') {
       const count = Number(taskSnapshot?.meta?.eligible_accounts || taskSnapshot?.meta?.eligible || 0)

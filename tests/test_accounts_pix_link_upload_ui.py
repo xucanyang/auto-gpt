@@ -13,3 +13,5 @@ def test_pix_saved_link_upload_mode_is_wired_to_the_batch_submit_contract():
     assert "body.pix_submit_mode = pixSubmitMode" in source
     assert "PIX 链接上传" in source
     assert "不读取 Access Token" in source
+    assert "任务已创建，任务快照暂不可读；日志面板会自动重试。" in source
+    assert "void apiFetch(`/tasks/${taskIdFromResponse}`)" in source
