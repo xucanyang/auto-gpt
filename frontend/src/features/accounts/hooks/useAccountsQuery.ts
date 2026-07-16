@@ -12,6 +12,9 @@ export type AccountsQueryParams = {
   accountValidity?: string
   sub2apiState?: string
   oaipayState?: string
+  submitState?: string
+  hasSubmitted?: string
+  /** Legacy caller alias; migrated callers should use submitState. */
   ideaSubmitState?: string
   revivalState?: string
   sortBy?: string
@@ -37,6 +40,8 @@ export function useAccountsQuery({
   accountValidity = '',
   sub2apiState = '',
   oaipayState = '',
+  submitState = '',
+  hasSubmitted = '',
   ideaSubmitState = '',
   revivalState = '',
   sortBy = '',
@@ -44,8 +49,9 @@ export function useAccountsQuery({
   page = 1,
   pageSize = 50,
 }: AccountsQueryParams) {
+  const canonicalSubmitState = submitState || ''
   return useQuery<AccountsQueryResult>({
-    queryKey: ['accounts', { email, status, manuallyUsed, authType, phoneBindingState, paymentLinkPlatform, subscriptionType, accountValidity, sub2apiState, oaipayState, ideaSubmitState, revivalState, sortBy, sortOrder, page, pageSize }],
+    queryKey: ['accounts', { email, status, manuallyUsed, authType, phoneBindingState, paymentLinkPlatform, subscriptionType, accountValidity, sub2apiState, oaipayState, submitState: canonicalSubmitState, hasSubmitted, ideaSubmitState, revivalState, sortBy, sortOrder, page, pageSize }],
     queryFn: async ({ signal }) => {
       const params = new URLSearchParams({
         platform: 'chatgpt',
@@ -63,7 +69,11 @@ export function useAccountsQuery({
       if (accountValidity) params.set('account_validity', accountValidity)
       if (sub2apiState) params.set('sub2api_state', sub2apiState)
       if (oaipayState) params.set('oaipay_state', oaipayState)
-      if (ideaSubmitState) params.set('idea_submit_state', ideaSubmitState)
+      if (canonicalSubmitState) params.set('submit_state', canonicalSubmitState)
+      if (hasSubmitted) params.set('has_submitted', hasSubmitted)
+      // Compatibility for external callers that still explicitly pass the
+      // legacy alias. Accounts.tsx uses canonical submitState exclusively.
+      if (!canonicalSubmitState && ideaSubmitState) params.set('idea_submit_state', ideaSubmitState)
       if (revivalState) params.set('revival_state', revivalState)
       if (sortBy && sortOrder) {
         params.set('sort_by', sortBy)

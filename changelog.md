@@ -4,6 +4,28 @@
 
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，并且本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/) (语义化版本)。
 
+## [2.2.12] - 2026-07-17
+
+### 新增 (Added)
+- **通用提交状态与真实提交证据筛选**：`services/account_filters.py`、`core/db.py`、`api/accounts.py` 与账号页新增 `submit_state` / `has_submitted`，将原“Idea提交”列统一为“提交状态”。结果状态与“是否真正提交过”可组合筛选；`chatgpt_last_payment_link.link_status=pix_submitted` 会被识别为 PIX 已提交证据，因此“已提交但处理失败/待复核/账号不可用”可以同时表达，不再把 Idea 与 PIX 拆成两套可见列。旧 `idea_submit_state` API、响应别名和筛选预设继续兼容，旧预设加载后迁移到通用状态且不会凭失败记录猜测已提交。
+- **PIX CDK 只读预检与精确额度批量调度**：`services/chatgpt_core/baxigpt_client.py` 接入 `/api/pix/cdks/preflight`，在发送账号前识别本站余额卡与外部一次性卡。本站 `site_cdk` 只有在上游明确返回权威、精确额度后才获得多额度能力；runner 在跨实例任务级 lease 内按账号串行创建订单，每次上游原子扣 1 额度，完成本批订单创建后再统一轮询。每个 paid 结果独立写入无明文卡密的 `pix_cdk_usage_history`，同一订单的历史写入保持幂等。
+
+### 优化 (Changed)
+- **PIX 批次从逐单等待改为先提交后轮询**：`api/tasks.py` 将本站多额度卡的执行顺序改为 `preflight -> submit 1..N -> poll 1..N`，不再为每个账号先等待一次终态才提交下一个账号。预检额度在每次任务创建成功后立即在内存扣减，处理失败不会错误返还已由上游消费的额度，也不会超过预检余额继续投递；外部 PIX 卡仍维持一次只有一个有效占用，明确安全失败后才允许下一账号重新预约。
+- **轮询间隔使用创建时冻结配置**：`frontend/src/pages/Accounts.tsx` 将状态轮询间隔统一为默认 5 秒、可配置范围 `1..3600` 秒，并在 LocalStorage 恢复、表单提交和请求体创建时使用同一归一化逻辑。界面明确说明运行中的旧任务继续使用创建时参数，新设置只作用于新任务；PIX 批次按该间隔统一轮询，不再表现为固定 30 秒。
+- **前端版本同步至 v2.2.12**：`frontend/src/app/AppShell.tsx` 更新侧栏版本，用于确认浏览器是否已加载通用提交筛选、PIX 预检和批量调度逻辑。
+
+### 修复 (Fixed)
+- **已保存 PIX 链接不再受 Idea 不可用标记阻断**：PIX `user_link` 在任务准入和实际执行两层均跳过历史 Idea eligibility gate；成功、失败或超时只更新 `baxigpt_cdk` 与支付链接状态，不创建、不覆盖、不清除 `idea_submit`、`idea_submit_unavailable*` 或 `chatgpt_account_unavailable`。自动提链/Idea 路径继续保留既有账号不可用判定。
+- **链接已提交提示消除支付成功歧义**：重复链接仍写为 `pix_submitted` 并禁止再次投递，但错误文案现在明确“不可重复使用且不代表支付成功”；运营必须重新同步或生成新链接，而不是重试旧 Stripe PIX 指令链接。
+- **预检与占用异常全面失败关闭**：预检响应的模式、索引、布尔字段、来源、权威性和额度组合会严格校验；整体失败、缺项、重复/越界索引或矛盾能力均不会进入提交。网络/5xx、缺少轮询凭据、轮询硬超时及无法解释的异常会优先设置 `release_forbidden` 并锁定人工复核；即使 `mark_uncertain` 写库失败，清理流程及同卡其他结果也不能释放、重排或阻断覆盖这笔 reservation。
+
+### 安全 (Security)
+- **敏感值仍只存在于调用栈**：PIX 原始 CDK、已保存 Stripe 链接和一次性 `status_token` 不写入任务快照、运行结果、账号提交摘要或 `TaskLog`。预检元数据只保存脱敏标签、来源、额度和状态；共享占用与 paid 历史继续只保存 HMAC fingerprint、任务/账号 ID、订单 ID 和时间。
+
+### 测试 (Tests)
+- **提交筛选与 PIX 调度回归**：扩展 `tests/test_account_filters.py`、`tests/test_filtered_task_scope.py`、`tests/test_account_filter_presets.py` 与新增的提交摘要/前端合同测试，覆盖 SQL 索引和 Python fallback 一致性、PIX 已提交证据、旧预设迁移及 filtered task 范围。`tests/test_baxigpt_cdk_pool.py` 覆盖本站三额度先全量提交后统一轮询、精确额度不超投、外部卡 paid 后 blocked、明确失败复用、非权威预检零提交、未知结果写库失败仍保留 lease、Idea marker 隔离、paid 历史幂等及敏感值不落盘。
+
 ## [2.2.11] - 2026-07-16
 
 ### 新增 (Added)
@@ -1714,4 +1736,8 @@
 
 ## 2026-07-16 12:40:03 +0800
 - feat: add one-click expired PIX payment link cleanup
+- 发布模式: multi
+
+## 2026-07-17 01:52:44 +0800
+- feat: unify submission filters and enable multi-credit PIX batch submission
 - 发布模式: multi

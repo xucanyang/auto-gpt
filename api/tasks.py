@@ -309,7 +309,10 @@ PIX_SUBMIT_MODE_USER_LINK = "user_link"
 PIX_USER_LINK_HOST = "payments.stripe.com"
 PIX_USER_LINK_PATH_PREFIX = "/qr/instructions/"
 PIX_SAVED_LINK_SUBMITTED_STATUS = "pix_submitted"
-PIX_SAVED_LINK_SUBMITTED_REASON = "已保存的 PIX 支付链接已提交至管理端，请先重新同步或生成新链接"
+PIX_SAVED_LINK_SUBMITTED_REASON = (
+    "已保存的 PIX 支付链接已提交至管理端且不可重复使用（不代表支付成功），"
+    "本次不会重复投递；请先重新同步或生成新链接"
+)
 
 
 def _normalize_baxigpt_payment_channel(value: Any) -> str:
@@ -1472,7 +1475,12 @@ def _resolve_baxigpt_cdk_submit_accounts(
                 "status": str(account.status or ""),
             }
             matched.append(item)
-            idea_unavailable_reason = _idea_submit_unavailable_reason(account)
+            # Uploading an already saved Stripe PIX link is independent of
+            # the account's historical Idea eligibility marker.  Auto-extract
+            # still uses the existing Idea gate.
+            idea_unavailable_reason = (
+                "" if require_saved_pix_link else _idea_submit_unavailable_reason(account)
+            )
             if idea_unavailable_reason:
                 skipped.append({**item, "reason": idea_unavailable_reason})
                 continue
@@ -1510,7 +1518,9 @@ def _resolve_baxigpt_cdk_submit_accounts(
             "status": str(account.status or ""),
         }
         matched.append(item)
-        idea_unavailable_reason = _idea_submit_unavailable_reason(account)
+        idea_unavailable_reason = (
+            "" if require_saved_pix_link else _idea_submit_unavailable_reason(account)
+        )
         if idea_unavailable_reason:
             skipped.append({**item, "reason": idea_unavailable_reason})
             continue
@@ -7232,10 +7242,11 @@ def _run_pix_submit(
 
     User-link mode reads the already persisted account link only at execution
     time. It never copies that URL into task metadata, runtime results, or
-    task logs. A local multi-credit CDK is reused strictly serially after a
-    confirmed paid result; external one-success CDKs remain blocked. Explicit
-    failures release a reservation, while uncertain outcomes remain locked for
-    manual reconciliation.
+    task logs. A preflight-authorized site CDK is consumed one unit at a time
+    while this task holds a cross-instance lease; accepted orders are then
+    polled as a batch. External one-success CDKs remain blocked after paid.
+    Explicit failures may be reused only when their outcome is known safe;
+    uncertain outcomes remain locked for manual reconciliation.
     """
 
     from services.chatgpt_core.baxigpt_client import BaxiGptClient, BaxiGptRequestError
@@ -7256,9 +7267,21 @@ def _run_pix_submit(
             "code": str(item.get("code") or "").strip(),
             "fingerprint": str(item.get("fingerprint") or "").strip(),
             "label": f"PIX CDK #{index}" if pix_cdk_label_count > 1 else "PIX CDK",
+            # Preflight fills these fields before the first submission.  A
+            # missing preflight method is kept as a legacy compatibility path
+            # for older test/development clients and remains one-success by
+            # default.
+            "source": str(item.get("source") or "").strip().lower(),
+            "capacity_exact": bool(item.get("capacity_exact")),
+            "available_uses": max(int(item.get("available_uses") or 0), 0),
+            "preflight_state": str(item.get("preflight_state") or "").strip().lower(),
+            "preflight_message": str(item.get("preflight_message") or "").strip(),
+            "preflight_required": True,
+            "lease_held": False,
+            "task_lease": False,
+            "release_forbidden": False,
             # Unknown/legacy upstream responses must be treated as external
-            # one-success credentials until the direct-link submit response
-            # explicitly grants the local balance-CDK capability.
+            # one-success credentials until preflight says otherwise.
             "reuse_policy": str(item.get("reuse_policy") or "one_success").strip().lower(),
         }
         for index, item in enumerate(raw_pix_cdks, start=1)
@@ -7295,11 +7318,161 @@ def _run_pix_submit(
                 text = text.replace(secret_text, "[REDACTED]")
         return redact_log_text(text)[:1000]
 
+    def sync_preflight_meta() -> None:
+        _task_store.update_meta(
+            task_id,
+            {
+                "pix_cdk_preflight": [
+                    {
+                        "label": str(item.get("label") or "PIX CDK"),
+                        "source": str(item.get("source") or ""),
+                        "capacity_exact": bool(item.get("capacity_exact")),
+                        "available_uses": max(int(item.get("available_uses") or 0), 0),
+                        "state": str(item.get("preflight_state") or ""),
+                        "can_submit": bool(item.get("can_submit")),
+                    }
+                    for item in pix_cdks
+                ],
+            },
+        )
+
+    def run_pix_preflight() -> tuple[bool, str]:
+        """Populate in-memory CDK capabilities before any reservation.
+
+        The raw CDK values remain in this function's local objects only.  A
+        missing method is tolerated for old fakes, but a real client failure
+        stops the batch rather than guessing a multi-credit capacity.
+        """
+        method = getattr(client, "preflight_pix_cdks", None)
+        if not callable(method):
+            # Legacy development clients do not know the read-only endpoint.
+            # Preserve their explicit response hint, otherwise one-success.
+            for item in pix_cdks:
+                item["preflight_required"] = False
+                item["can_submit"] = True
+                item["source"] = item.get("source") or "legacy"
+                item["preflight_state"] = item.get("preflight_state") or "legacy"
+                item["available_uses"] = max(int(item.get("available_uses") or 0), 1)
+                item["capacity_exact"] = bool(item.get("capacity_exact"))
+            sync_preflight_meta()
+            return True, ""
+
+        submit_mode = "pix_unified_user_link" if use_saved_pix_link else "pix_unified_auto_extract"
+        codes = [str(item.get("code") or "") for item in pix_cdks]
+        try:
+            result = method(cdks=codes, submit_mode=submit_mode)
+        except Exception as exc:
+            # Do not include the exception's raw request payload in task data.
+            message = safe_text(exc)
+            for item in pix_cdks:
+                item["can_submit"] = False
+                item["preflight_state"] = "preflight_error"
+                item["preflight_message"] = "PIX CDK 预检失败，请稍后重试"
+            sync_preflight_meta()
+            return False, message or "PIX CDK 预检失败"
+
+        raw_items = result.get("items") if isinstance(result, dict) and isinstance(result.get("items"), list) else []
+        by_index: dict[int, dict[str, Any]] = {}
+        valid_preflight = isinstance(result, dict) and result.get("ok") is True
+
+        def strict_bool(value: Any) -> tuple[bool, bool]:
+            if isinstance(value, bool):
+                return value, True
+            if isinstance(value, int) and value in {0, 1}:
+                return bool(value), True
+            text = str(value or "").strip().lower()
+            if text in {"true", "1", "yes", "on"}:
+                return True, True
+            if text in {"false", "0", "no", "off"}:
+                return False, True
+            return False, False
+
+        for raw in raw_items:
+            if not isinstance(raw, dict):
+                continue
+            try:
+                index = int(raw.get("index") or 0)
+            except (TypeError, ValueError):
+                index = 0
+            if index <= 0 or index in by_index:
+                valid_preflight = False
+                continue
+            source = str(raw.get("source") or "").strip().lower()
+            authoritative, source_authoritative_ok = strict_bool(raw.get("authoritative"))
+            can_submit_hint, source_can_submit_ok = strict_bool(raw.get("can_submit"))
+            capacity_hint, source_capacity_ok = strict_bool(raw.get("capacity_exact"))
+            try:
+                available_hint = max(int(raw.get("available_uses") or 0), 0)
+                available_hint_ok = True
+            except (TypeError, ValueError):
+                available_hint = 0
+                available_hint_ok = False
+            if (
+                not source_authoritative_ok
+                or not source_can_submit_ok
+                or not source_capacity_ok
+                or not available_hint_ok
+                or (
+                    source == "site_cdk"
+                    and (not authoritative or not capacity_hint)
+                )
+                or (
+                    source == "external_pix_cdk"
+                    and (authoritative or capacity_hint or (can_submit_hint and available_hint != 1))
+                )
+                or (
+                    source not in {"site_cdk", "external_pix_cdk"}
+                    and (authoritative or can_submit_hint or capacity_hint or available_hint > 0)
+                )
+            ):
+                valid_preflight = False
+            if index > 0:
+                by_index[index] = raw
+        if len(raw_items) != len(pix_cdks) or set(by_index) != set(range(1, len(pix_cdks) + 1)):
+            valid_preflight = False
+        if not valid_preflight:
+            for item in pix_cdks:
+                item["can_submit"] = False
+                item["preflight_state"] = "preflight_invalid"
+                item["preflight_message"] = "PIX CDK 预检响应不完整，请稍后重试"
+            sync_preflight_meta()
+            return False, "PIX CDK 预检响应不完整"
+        for position, item in enumerate(pix_cdks, start=1):
+            raw = by_index.get(position) or {}
+            item["source"] = str(raw.get("source") or "").strip().lower()
+            item["capacity_exact"], capacity_exact_ok = strict_bool(raw.get("capacity_exact"))
+            try:
+                item["available_uses"] = max(int(raw.get("available_uses") or 0), 0)
+            except (TypeError, ValueError):
+                item["available_uses"] = 0
+                item["preflight_state"] = "preflight_invalid"
+                valid_preflight = False
+            item["can_submit"], can_submit_ok = strict_bool(raw.get("can_submit"))
+            item["can_submit"] = item["can_submit"] and item["available_uses"] > 0
+            item["preflight_state"] = str(raw.get("state") or "missing").strip().lower()
+            item["preflight_message"] = safe_text(raw.get("message") or "")
+            item["preflight_required"] = True
+            # A malformed source/capability response is not safe to reuse.
+            if not item["source"] or not item["can_submit"]:
+                item["can_submit"] = False
+            if not (capacity_exact_ok and can_submit_ok):
+                item["can_submit"] = False
+            item["reuse_policy"] = (
+                "after_paid"
+                if item["capacity_exact"] and item["source"] == "site_cdk"
+                else "one_success"
+            )
+        sync_preflight_meta()
+        return True, ""
+
     _task_store.mark_running(task_id)
     _task_store.set_progress(task_id, f"0/{total}")
     meta = dict(_task_store.snapshot(task_id).get("meta") or {})
     missing_ids = list(meta.get("missing_ids") or [])
     skipped_accounts = list(meta.get("skipped_accounts") or [])
+    preflight_ok, preflight_error = run_pix_preflight()
+    if not preflight_ok:
+        _log(task_id, f"[PIX][PREFLIGHT] {preflight_error or '预检失败，停止新的提交'}")
 
     def sync_meta() -> None:
         summary = _build_idea_submit_runtime_summary(
@@ -7347,7 +7520,12 @@ def _run_pix_submit(
         reason: str = "",
         mark_unavailable: bool = False,
         local_status_refresh: dict[str, Any] | None = None,
+        persist_idea_state: bool | None = None,
     ) -> None:
+        if persist_idea_state is None:
+            # A saved PIX link is a payment-resource operation, not an Idea
+            # eligibility check.  Keep any existing Idea marker untouched.
+            persist_idea_state = not use_saved_pix_link
         status_value = _normalize_idea_submit_result_status(status)
         if status_value == "pending":
             status_value = "submitted"
@@ -7397,39 +7575,40 @@ def _run_pix_submit(
                 history.append(dict(payload))
             extra["baxigpt_cdk_history"] = history[-20:]
 
-            previous_marker = extra.get("idea_submit") if isinstance(extra.get("idea_submit"), dict) else {}
-            marker = {
-                "available": not bool(mark_unavailable),
-                "unavailable": bool(mark_unavailable),
-                "reason": safe_reason if mark_unavailable else "",
-                "marked_at": now if mark_unavailable else "",
-                "cleared_at": now if status_value == "paid" else "",
-                "source": "baxigpt_cdk_submit",
-                "payment_channel": "pix",
-                "pix_submit_mode": pix_submit_mode,
-                "cdk_id": 0,
-                "code_masked": "PIX CDK",
-                "task_id": task_id,
-                "order_id": payload["order_id"],
-                "display_id": payload["display_id"],
-                "status": status_value,
-            }
-            if status_value == "paid" and previous_marker.get("reason"):
-                marker["previous_reason"] = safe_text(previous_marker.get("reason"))
-            extra["idea_submit"] = marker
-            if mark_unavailable:
-                extra["chatgpt_account_unavailable"] = True
-                extra["chatgpt_unavailable_reason"] = safe_reason
-                extra["chatgpt_skip_save_account"] = True
-                extra["chatgpt_skip_save_reason"] = safe_reason
-                extra["chatgpt_invalid_registration_failure"] = True
-                extra["chatgpt_invalid_registration_reason"] = safe_reason
-                extra["idea_submit_unavailable"] = True
-                extra["idea_submit_unavailable_reason"] = safe_reason
-                extra["idea_submit_unavailable_at"] = now
-            elif status_value == "paid":
-                for key in ("idea_submit_unavailable", "idea_submit_unavailable_reason", "idea_submit_unavailable_at"):
-                    extra.pop(key, None)
+            if persist_idea_state:
+                previous_marker = extra.get("idea_submit") if isinstance(extra.get("idea_submit"), dict) else {}
+                marker = {
+                    "available": not bool(mark_unavailable),
+                    "unavailable": bool(mark_unavailable),
+                    "reason": safe_reason if mark_unavailable else "",
+                    "marked_at": now if mark_unavailable else "",
+                    "cleared_at": now if status_value == "paid" else "",
+                    "source": "baxigpt_cdk_submit",
+                    "payment_channel": "pix",
+                    "pix_submit_mode": pix_submit_mode,
+                    "cdk_id": 0,
+                    "code_masked": "PIX CDK",
+                    "task_id": task_id,
+                    "order_id": payload["order_id"],
+                    "display_id": payload["display_id"],
+                    "status": status_value,
+                }
+                if status_value == "paid" and previous_marker.get("reason"):
+                    marker["previous_reason"] = safe_text(previous_marker.get("reason"))
+                extra["idea_submit"] = marker
+                if mark_unavailable:
+                    extra["chatgpt_account_unavailable"] = True
+                    extra["chatgpt_unavailable_reason"] = safe_reason
+                    extra["chatgpt_skip_save_account"] = True
+                    extra["chatgpt_skip_save_reason"] = safe_reason
+                    extra["chatgpt_invalid_registration_failure"] = True
+                    extra["chatgpt_invalid_registration_reason"] = safe_reason
+                    extra["idea_submit_unavailable"] = True
+                    extra["idea_submit_unavailable_reason"] = safe_reason
+                    extra["idea_submit_unavailable_at"] = now
+                elif status_value == "paid":
+                    for key in ("idea_submit_unavailable", "idea_submit_unavailable_reason", "idea_submit_unavailable_at"):
+                        extra.pop(key, None)
 
             account.set_extra(extra)
             account.updated_at = datetime.now(timezone.utc)
@@ -7488,13 +7667,97 @@ def _run_pix_submit(
             time.sleep(chunk)
             remaining -= chunk
 
-    def release_cdk(cdk: dict[str, str], account_id: int, *, reusable: bool, requeue: bool) -> bool:
-        """Release an explicit failure; requeue only after durable release."""
+    def cdk_owner_account_id(cdk: dict[str, Any], account_id: int) -> int:
+        return int(cdk.get("lease_account_id") or 0) if bool(cdk.get("lease_held")) else int(account_id or 0)
+
+    def acquire_cdk_lease(cdk: dict[str, Any], account_id: int) -> bool:
+        """Reserve a site card for the task or an external card for one account."""
+        if bool(cdk.get("release_forbidden")):
+            return False
+        if bool(cdk.get("lease_held")):
+            return True
+        task_lease = bool(
+            cdk.get("capacity_exact")
+            and str(cdk.get("source") or "").strip().lower() == "site_cdk"
+        )
+        owner_account_id = 0 if task_lease else int(account_id or 0)
         try:
+            usage = _pix_cdk_usage_store.reserve(
+                cdk["fingerprint"], task_id=task_id, account_id=owner_account_id,
+            )
+            if (
+                usage.state != PIX_CDK_STATE_RESERVED
+                or usage.task_id != task_id
+                or int(usage.account_id or 0) != owner_account_id
+            ):
+                _log(task_id, f"[SKIP][PIX] {cdk.get('label') or 'PIX CDK'} 已被其他任务占用或待复核")
+                return False
+            cdk["lease_held"] = True
+            cdk["task_lease"] = task_lease
+            cdk["lease_account_id"] = owner_account_id
+            return True
+        except Exception as exc:
+            _log(task_id, f"[PIX][WARN] CDK 预留失败: {safe_text(exc)}")
+            return False
+
+    def cdk_has_active_order(cdk: dict[str, Any], *, exclude_order_id: str = "") -> bool:
+        fingerprint = str(cdk.get("fingerprint") or "")
+        for active in active_orders:
+            if str(active.get("order_id") or "") == str(exclude_order_id or ""):
+                continue
+            active_cdk = active.get("cdk") if isinstance(active.get("cdk"), dict) else {}
+            if fingerprint and str(active_cdk.get("fingerprint") or "") == fingerprint:
+                return True
+        return False
+
+    def release_cdk(
+        cdk: dict[str, Any],
+        account_id: int,
+        *,
+        reusable: bool,
+        requeue: bool,
+        exclude_order_id: str = "",
+    ) -> bool:
+        """Release an explicit failure; keep a task lease while requeueing."""
+        # An upstream outcome that is unknown/manual-review must be treated as
+        # authoritative for this CDK.  Other concurrent orders may report a
+        # known failure, but they must not release, requeue, or block the same
+        # reservation after one path has marked it unsafe to reuse.
+        if bool(cdk.get("release_forbidden")):
+            _log(task_id, f"[PIX][WARN] {cdk.get('label') or 'PIX CDK'} 已标记待复核，拒绝释放/重排/阻断")
+            return False
+        try:
+            owner_account_id = cdk_owner_account_id(cdk, account_id)
             if reusable:
+                if (
+                    requeue
+                    and bool(cdk.get("task_lease"))
+                    and int(cdk.get("available_uses") or 0) <= 0
+                ):
+                    # The upstream already accepted the final exact-capacity
+                    # unit. A later task failure does not refund that unit.
+                    requeue = False
+                if (
+                    bool(cdk.get("lease_held"))
+                    and not requeue
+                    and bool(cdk.get("task_lease"))
+                    and cdk_has_active_order(cdk, exclude_order_id=exclude_order_id)
+                ):
+                    # Keep the task lease until all already accepted orders
+                    # using this fingerprint have reached a known state.
+                    cdk["deferred_release"] = True
+                    return True
+                # A requeued item stays under this task's lease. This prevents
+                # another instance from interleaving submissions between two
+                # exact-quota uses of the same CDK.
+                if bool(cdk.get("lease_held")) and bool(cdk.get("task_lease")) and requeue:
+                    if cdk not in available_cdks:
+                        available_cdks.append(cdk)
+                    return True
                 released = _pix_cdk_usage_store.release(
-                    cdk["fingerprint"], task_id=task_id, account_id=account_id,
+                    cdk["fingerprint"], task_id=task_id, account_id=owner_account_id,
                 )
+                cdk["lease_held"] = False
                 if released and requeue:
                     available_cdks.append(cdk)
                 elif not released:
@@ -7502,20 +7765,46 @@ def _run_pix_submit(
                 return bool(released)
             else:
                 _pix_cdk_usage_store.mark_blocked(
-                    cdk["fingerprint"], task_id=task_id, account_id=account_id,
+                    cdk["fingerprint"], task_id=task_id, account_id=owner_account_id,
                 )
+                cdk["lease_held"] = False
                 return True
         except Exception as exc:
+            cdk["release_forbidden"] = True
             _log(task_id, f"[PIX][WARN] CDK 状态同步失败: {safe_text(exc)}")
             return False
 
-    def lock_cdk_for_review(cdk: dict[str, str], account_id: int, *, order_id: str = "") -> None:
+    def lock_cdk_for_review(cdk: dict[str, Any], account_id: int, *, order_id: str = "") -> None:
+        # Even if the database write below fails, cleanup must not release a
+        # reservation whose upstream outcome is unknown.
+        cdk["release_forbidden"] = True
+        available_cdks[:] = [item for item in available_cdks if item is not cdk]
         try:
+            owner_account_id = cdk_owner_account_id(cdk, account_id)
             _pix_cdk_usage_store.mark_uncertain(
-                cdk["fingerprint"], task_id=task_id, account_id=account_id, order_id=order_id,
+                cdk["fingerprint"], task_id=task_id, account_id=owner_account_id, order_id=order_id,
             )
+            cdk["lease_held"] = False
         except Exception as exc:
             _log(task_id, f"[PIX][WARN] CDK 待复核锁定失败: {safe_text(exc)}")
+
+    def release_idle_cdk_leases(*, include_external: bool = False) -> None:
+        """Release task leases that no longer need another submission."""
+        for cdk in pix_cdks:
+            if not bool(cdk.get("lease_held")):
+                continue
+            if bool(cdk.get("release_forbidden")):
+                continue
+            if not include_external and not bool(cdk.get("capacity_exact")):
+                continue
+            try:
+                released = _pix_cdk_usage_store.release(
+                    cdk["fingerprint"], task_id=task_id, account_id=cdk_owner_account_id(cdk, 0),
+                )
+                if released:
+                    cdk["lease_held"] = False
+            except Exception as exc:
+                _log(task_id, f"[PIX][WARN] 任务级 CDK 释放失败: {safe_text(exc)}")
 
     def cdk_error_is_terminal(reason: str) -> bool:
         lower = str(reason or "").lower()
@@ -7562,7 +7851,11 @@ def _run_pix_submit(
         _log(task_id, f"[SKIP] {item.get('email') or item.get('account_id') or '-'} - {item.get('reason') or '已跳过'}")
 
     pending_accounts = [dict(pair) for pair in pairs]
-    available_cdks = list(pix_cdks)
+    available_cdks = [item for item in pix_cdks if bool(item.get("can_submit"))]
+    for item in pix_cdks:
+        if not bool(item.get("can_submit")):
+            message = str(item.get("preflight_message") or item.get("preflight_state") or "预检不允许提交")
+            _log(task_id, f"[PREFLIGHT][SKIP] {item.get('label') or 'PIX CDK'} - {safe_text(message)}")
     active_orders: list[dict[str, Any]] = []
     stop_new_submissions = False
     attempt_id: int | None = None
@@ -7613,7 +7906,7 @@ def _run_pix_submit(
                         pix_pay_link = ""
                         skip_reason = "账号不存在或非 ChatGPT"
                     else:
-                        skip_reason = _idea_submit_unavailable_reason(account)
+                        skip_reason = "" if use_saved_pix_link else _idea_submit_unavailable_reason(account)
                         if use_saved_pix_link:
                             token = ""
                             pix_pay_link, link_reason = _saved_stripe_pix_user_link(account)
@@ -7654,10 +7947,7 @@ def _run_pix_submit(
                         "已请求完成当前后停止；不再预留 CDK 或提交新的 PIX 订单",
                     )
                     break
-                usage = _pix_cdk_usage_store.reserve(
-                    cdk["fingerprint"], task_id=task_id, account_id=account_id,
-                )
-                if usage.state != PIX_CDK_STATE_RESERVED or usage.task_id != task_id or usage.account_id != account_id:
+                if not acquire_cdk_lease(cdk, account_id):
                     _log(task_id, f"[SKIP][PIX] {cdk['label']} 已成功核销、处理中或待复核，跳过该 CDK")
                     continue
                 if control.is_stop_after_current_requested():
@@ -7718,7 +8008,10 @@ def _run_pix_submit(
                                 mark_saved_pix_link_submitted(account_id, pix_pay_link, duplicate=True)
                                 reason = PIX_SAVED_LINK_SUBMITTED_REASON
                             errors.append(f"{email or account_id}: {reason}")
-                            should_mark_unavailable = _is_idea_account_unavailable_reason(reason)
+                            should_mark_unavailable = (
+                                not use_saved_pix_link
+                                and _is_idea_account_unavailable_reason(reason)
+                            )
                             persist_account_state(
                                 account_id,
                                 status="failed",
@@ -7754,7 +8047,10 @@ def _run_pix_submit(
                             stop_new_submissions = True
                         continue
                     remote_reuse_policy = str(submit_result.get("cdk_reuse_policy") or "").strip().lower()
-                    if remote_reuse_policy in {"after_paid", "one_success"}:
+                    if (
+                        not bool(cdk.get("preflight_required"))
+                        and remote_reuse_policy in {"after_paid", "one_success"}
+                    ):
                         cdk["reuse_policy"] = remote_reuse_policy
                     submitted_count += 1
                     order_id = str(submit_result.get("order_id") or submit_result.get("task_id") or "").strip()
@@ -7788,10 +8084,24 @@ def _run_pix_submit(
                             "display_id": display_id,
                             "status_token": status_token,
                             "cdk": cdk,
+                            "history_only": bool(cdk.get("task_lease")),
                             "submitted_at": time.time(),
                             "timeout_warned": False,
                         }
                     )
+                    if bool(cdk.get("task_lease")):
+                        # The upstream has already atomically consumed one
+                        # site-CDK unit. Keep the task lease and immediately
+                        # make the next exact-capacity unit available; paid
+                        # status is intentionally not a prerequisite.
+                        cdk["available_uses"] = max(int(cdk.get("available_uses") or 0) - 1, 0)
+                        if (
+                            cdk["available_uses"] > 0
+                            and not control.is_stop_after_current_requested()
+                            and not (target_success_count > 0 and len(active_orders) >= max(target_success_count - success_count, 0))
+                            and cdk not in available_cdks
+                        ):
+                            available_cdks.append(cdk)
                     _log(task_id, f"[PIX] 上游已受理: {email or account_id} task={display_id}")
                     if pending_accounts and submit_interval_seconds > 0:
                         wait_with_control(submit_interval_seconds, attempt_id)
@@ -7823,7 +8133,10 @@ def _run_pix_submit(
                             mark_saved_pix_link_submitted(account_id, pix_pay_link, duplicate=True)
                             reason = PIX_SAVED_LINK_SUBMITTED_REASON
                         errors.append(f"{email or account_id}: {reason}")
-                        should_mark_unavailable = _is_idea_account_unavailable_reason(reason)
+                        should_mark_unavailable = (
+                            not use_saved_pix_link
+                            and _is_idea_account_unavailable_reason(reason)
+                        )
                         persist_account_state(
                             account_id,
                             status="failed",
@@ -7896,7 +8209,7 @@ def _run_pix_submit(
                 order_id = str(order["order_id"])
                 display_id = str(order.get("display_id") or order_id)
                 status_token = str(order["status_token"])
-                cdk = dict(order.get("cdk") or {})
+                cdk = order.get("cdk") if isinstance(order.get("cdk"), dict) else {}
                 try:
                     status_result = client.pix_status(task_id=order_id, status_token=status_token)
                 except BaxiGptRequestError as exc:
@@ -7911,13 +8224,26 @@ def _run_pix_submit(
                 if status_value == "paid":
                     paid_usage_recorded = False
                     try:
-                        _pix_cdk_usage_store.mark_paid(
-                            cdk["fingerprint"],
-                            task_id=task_id,
-                            account_id=account_id,
-                            order_id=order_id,
-                            retain_block=not cdk_reuse_after_paid(cdk),
-                        )
+                        if bool(order.get("history_only")):
+                            _pix_cdk_usage_store.record_paid_history(
+                                cdk["fingerprint"],
+                                task_id=task_id,
+                                account_id=account_id,
+                                order_id=order_id,
+                            )
+                        else:
+                            _pix_cdk_usage_store.mark_paid(
+                                cdk["fingerprint"],
+                                task_id=task_id,
+                                account_id=account_id,
+                                order_id=order_id,
+                                retain_block=not cdk_reuse_after_paid(cdk),
+                                reservation_account_id=cdk_owner_account_id(cdk, account_id),
+                            )
+                            # Legacy after-paid CDKs release the reservation
+                            # as part of mark_paid; the next use must acquire a
+                            # fresh task lease before submitting.
+                            cdk["lease_held"] = False
                         paid_usage_recorded = True
                     except Exception as exc:
                         # The upstream is already paid. Keep this CDK locked
@@ -7938,12 +8264,13 @@ def _run_pix_submit(
                         display_id=display_id,
                         local_status_refresh=local_status_summary,
                     )
-                    # One fingerprint never has more than one current
-                    # reservation. Only a durable paid-history write releases
-                    # a site balance CDK, and only then may the next account
-                    # reserve it. External/legacy CDKs keep their blocked row.
+                    # Legacy after-paid cards reserve again only after a durable
+                    # paid write. Exact-capacity site cards already submitted
+                    # their whole window under one task lease; external cards
+                    # keep their one-success blocked row.
                     if (
                         paid_usage_recorded
+                        and not bool(order.get("history_only"))
                         and cdk_reuse_after_paid(cdk)
                         and not control.is_stop_after_current_requested()
                         and not (target_success_count > 0 and success_count >= target_success_count)
@@ -7952,7 +8279,10 @@ def _run_pix_submit(
                 elif status_value == "failed":
                     reason = reason or "PIX 上游处理失败"
                     errors.append(f"{email or account_id}: {reason}")
-                    should_mark_unavailable = _is_idea_account_unavailable_reason(reason)
+                    should_mark_unavailable = (
+                        not use_saved_pix_link
+                        and _is_idea_account_unavailable_reason(reason)
+                    )
                     persist_account_state(
                         account_id,
                         status="failed",
@@ -7983,8 +8313,9 @@ def _run_pix_submit(
                         requeue=(
                             failure_continue
                             and not terminal_cdk_error
-                            and not capacity_exhausted
-                        ),
+                                and not capacity_exhausted
+                            ),
+                        exclude_order_id=order_id,
                     )
                     if capacity_exhausted:
                         _log(task_id, f"[PIX] {cdk['label']} 本站余额不足，本轮停止使用该卡；充值后可再次提交")
@@ -8025,6 +8356,7 @@ def _run_pix_submit(
             active_orders = still_active
             _task_store.set_progress(task_id, f"{success_count}/{total}")
 
+        release_idle_cdk_leases(include_external=True)
         sync_meta()
         latest_meta = dict(_task_store.snapshot(task_id).get("meta") or {})
         summary = latest_meta.get("idea_submit_summary") if isinstance(latest_meta.get("idea_submit_summary"), dict) else {}
@@ -8125,10 +8457,11 @@ def _run_pix_submit(
             cdk = order.get("cdk") if isinstance(order.get("cdk"), dict) else {}
             if cdk:
                 lock_cdk_for_review(
-                    dict(cdk),
+                    cdk,
                     int(order.get("account_id") or 0),
                     order_id=str(order.get("order_id") or ""),
                 )
+        release_idle_cdk_leases(include_external=True)
         if attempt_id is not None:
             control.finish_attempt(attempt_id)
         _clear_task_current(task_id)

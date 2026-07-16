@@ -2,8 +2,9 @@
 
 Raw CDKs never leave the request/worker memory path.  The shared SQLite file
 stores only a keyed fingerprint and separates a *current* cross-instance lock
-from immutable paid history: a locally issued multi-credit CDK can be reused
-serially after paid, while an external one-success CDK remains blocked.
+from immutable paid history: a locally issued multi-credit CDK can be consumed
+under one task lease while paid history is recorded independently, while an
+external one-success CDK remains blocked.
 """
 from __future__ import annotations
 
@@ -283,6 +284,88 @@ class PixCdkUsageStore:
                 conn.rollback()
                 raise
 
+    @staticmethod
+    def _paid_history_exists_locked(
+        conn: sqlite3.Connection,
+        *,
+        fingerprint: str,
+        task_id: str,
+        account_id: int,
+        order_id: str,
+    ) -> bool:
+        row = conn.execute(
+            """
+            SELECT 1
+            FROM pix_cdk_usage_history
+            WHERE fingerprint = ? AND task_id = ? AND account_id = ? AND order_id = ?
+            LIMIT 1
+            """,
+            (fingerprint, task_id, int(account_id or 0), order_id),
+        ).fetchone()
+        return row is not None
+
+    @staticmethod
+    def _insert_paid_history_locked(
+        conn: sqlite3.Connection,
+        *,
+        fingerprint: str,
+        task_id: str,
+        account_id: int,
+        order_id: str,
+        paid_at: str,
+    ) -> None:
+        """Insert one immutable paid event, idempotently."""
+        if PixCdkUsageStore._paid_history_exists_locked(
+            conn,
+            fingerprint=fingerprint,
+            task_id=task_id,
+            account_id=account_id,
+            order_id=order_id,
+        ):
+            return
+        conn.execute(
+            """
+            INSERT INTO pix_cdk_usage_history(
+                fingerprint, task_id, account_id, order_id, paid_at, created_at
+            ) VALUES(?, ?, ?, ?, ?, ?)
+            """,
+            (fingerprint, task_id, int(account_id or 0), order_id, paid_at, paid_at),
+        )
+
+    def record_paid_history(
+        self,
+        fingerprint: str,
+        *,
+        task_id: str,
+        account_id: int,
+        order_id: str,
+        paid_at: str = "",
+    ) -> PixCdkUsage:
+        """Record one paid order independently of the current task lease."""
+        now = str(paid_at or "").strip() or _now()
+        value = str(fingerprint or "").strip()
+        task_value = str(task_id or "")
+        account_value = int(account_id or 0)
+        order_value = str(order_id or "")
+        if not value or not task_value or not order_value:
+            raise ValueError("PIX paid history requires fingerprint, task_id and order_id")
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._insert_paid_history_locked(
+                    conn,
+                    fingerprint=value,
+                    task_id=task_value,
+                    account_id=account_value,
+                    order_id=order_value,
+                    paid_at=now,
+                )
+                conn.commit()
+                return PixCdkUsage(value, STATE_PAID, task_value, account_value, order_value, now)
+            except Exception:
+                conn.rollback()
+                raise
+
     def mark_paid(
         self,
         fingerprint: str,
@@ -291,6 +374,7 @@ class PixCdkUsageStore:
         account_id: int,
         order_id: str,
         retain_block: bool = False,
+        reservation_account_id: int | None = None,
     ) -> PixCdkUsage:
         """Record paid atomically, then free or permanently block the lock.
 
@@ -302,6 +386,9 @@ class PixCdkUsageStore:
         value = str(fingerprint or "")
         task_value = str(task_id or "")
         account_value = int(account_id or 0)
+        reservation_account_value = (
+            account_value if reservation_account_id is None else int(reservation_account_id or 0)
+        )
         order_value = str(order_id or "")
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -315,16 +402,16 @@ class PixCdkUsageStore:
                     usage is None
                     or usage.state != STATE_RESERVED
                     or usage.task_id != task_value
-                    or usage.account_id != account_value
+                    or usage.account_id != reservation_account_value
                 ):
                     raise RuntimeError("PIX CDK 当前占用不存在或已变化，拒绝释放复用")
-                conn.execute(
-                    """
-                    INSERT INTO pix_cdk_usage_history(
-                        fingerprint, task_id, account_id, order_id, paid_at, created_at
-                    ) VALUES(?, ?, ?, ?, ?, ?)
-                    """,
-                    (value, task_value, account_value, order_value, now, now),
+                self._insert_paid_history_locked(
+                    conn,
+                    fingerprint=value,
+                    task_id=task_value,
+                    account_id=account_value,
+                    order_id=order_value,
+                    paid_at=now,
                 )
                 if retain_block:
                     updated = conn.execute(
@@ -333,7 +420,7 @@ class PixCdkUsageStore:
                         SET state = ?, order_id = ?, updated_at = ?, paid_at = ?
                         WHERE fingerprint = ? AND state = ? AND task_id = ? AND account_id = ?
                         """,
-                        (STATE_BLOCKED, order_value, now, now, value, STATE_RESERVED, task_value, account_value),
+                        (STATE_BLOCKED, order_value, now, now, value, STATE_RESERVED, task_value, reservation_account_value),
                     )
                     result = PixCdkUsage(value, STATE_BLOCKED, task_value, account_value, order_value, now)
                 else:
@@ -342,7 +429,7 @@ class PixCdkUsageStore:
                         DELETE FROM pix_cdk_usage
                         WHERE fingerprint = ? AND state = ? AND task_id = ? AND account_id = ?
                         """,
-                        (value, STATE_RESERVED, task_value, account_value),
+                        (value, STATE_RESERVED, task_value, reservation_account_value),
                     )
                     result = PixCdkUsage(value, STATE_PAID, task_value, account_value, order_value, now)
                 if updated.rowcount != 1:
@@ -358,7 +445,7 @@ class PixCdkUsageStore:
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
-                conn.execute(
+                updated = conn.execute(
                     """
                     UPDATE pix_cdk_usage
                     SET state = ?, order_id = ?, updated_at = ?
@@ -374,6 +461,33 @@ class PixCdkUsageStore:
                         int(account_id or 0),
                     ),
                 )
+                # Exact-quota reservations are released immediately after a
+                # complete upstream acceptance. If that later order becomes
+                # uncertain, create a durable review lock even though there is
+                # no longer a RESERVED row to update. Never overwrite a
+                # different live reservation owned by another order.
+                if updated.rowcount != 1:
+                    existing_row = conn.execute(
+                        "SELECT fingerprint, state, task_id, account_id, order_id FROM pix_cdk_usage WHERE fingerprint = ?",
+                        (str(fingerprint or ""),),
+                    ).fetchone()
+                    if existing_row is None:
+                        conn.execute(
+                            """
+                            INSERT INTO pix_cdk_usage(
+                                fingerprint, state, task_id, account_id, order_id, created_at, updated_at
+                            ) VALUES(?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                str(fingerprint or ""),
+                                STATE_UNCERTAIN,
+                                str(task_id or ""),
+                                int(account_id or 0),
+                                str(order_id or ""),
+                                now,
+                                now,
+                            ),
+                        )
                 row = conn.execute(
                     "SELECT fingerprint, state, task_id, account_id, order_id FROM pix_cdk_usage WHERE fingerprint = ?",
                     (str(fingerprint or ""),),

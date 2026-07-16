@@ -344,9 +344,13 @@ class BaxiGptClient:
         if not token:
             return {"ok": False, "status": "failed", "message": "账号缺少 Access Token"}
 
+        # The upstream unified route is source-aware: a local site CDK is
+        # deducted atomically from the site's balance, while an unknown code
+        # is routed to the external PIX worker.  The legacy ``pixCdk`` field
+        # bypasses that routing and can therefore lose multi-credit capacity.
         payload = {
-            "submitMode": "pix_auto_extract",
-            "pixCdk": cdk,
+            "submitMode": "pix_unified_auto_extract",
+            "cdk": cdk,
             "accounts": [token],
         }
         try:
@@ -394,6 +398,129 @@ class BaxiGptClient:
             "display_id": task_id,
             "task_id": task_id,
             "status_token": status_token,
+        }
+
+    def preflight_pix_cdks(
+        self,
+        *,
+        cdks: list[str],
+        submit_mode: str = "pix_unified_auto_extract",
+    ) -> dict[str, Any]:
+        """Classify PIX CDKs without reserving or consuming them.
+
+        Only non-sensitive capability fields are returned.  In particular,
+        the upstream response is never copied into task metadata because it
+        may contain diagnostic text or echoed credentials.
+        """
+
+        values = [str(value or "").strip() for value in list(cdks or []) if str(value or "").strip()]
+        if not values:
+            return {"ok": False, "items": [], "message": "PIX CDK 不能为空"}
+        mode = str(submit_mode or "pix_unified_auto_extract").strip().lower()
+        if mode in {"auto_extract", "pix_auto_extract"}:
+            mode = "pix_unified_auto_extract"
+        elif mode in {"user_link", "pix_user_link", "user_pix_link"}:
+            mode = "pix_unified_user_link"
+        if mode not in {"pix_unified_auto_extract", "pix_unified_user_link"}:
+            return {"ok": False, "items": [], "message": "不支持的 PIX 提交方式"}
+
+        try:
+            response = self._request(
+                "POST",
+                "/api/pix/cdks/preflight",
+                payload={"submitMode": mode, "cdks": values},
+                timeout=self.timeout,
+                retries=self.retries,
+            )
+        except BaxiGptRequestError as exc:
+            # _request normally does not echo request JSON, but redact all
+            # submitted codes defensively before handing the error to the
+            # worker, logs, or task result.
+            raise BaxiGptRequestError(
+                _redact_sensitive_text(exc, *values),
+                request_outcome_unknown=exc.request_outcome_unknown,
+                http_status=exc.http_status,
+            ) from exc
+
+        raw_items = response.get("items") if isinstance(response.get("items"), list) else []
+        items: list[dict[str, Any]] = []
+        malformed = not isinstance(response.get("items"), list)
+        response_mode = str(response.get("submit_mode") or "").strip().lower()
+        if response_mode in {"auto_extract", "pix_auto_extract"}:
+            response_mode = "pix_unified_auto_extract"
+        elif response_mode in {"user_link", "pix_user_link", "user_pix_link"}:
+            response_mode = "pix_unified_user_link"
+        if response_mode != mode:
+            malformed = True
+        seen_indexes: set[int] = set()
+
+        def strict_bool(value: Any) -> tuple[bool, bool]:
+            if isinstance(value, bool):
+                return value, True
+            if isinstance(value, int) and value in {0, 1}:
+                return bool(value), True
+            text = str(value or "").strip().lower()
+            if text in {"true", "1", "yes", "on"}:
+                return True, True
+            if text in {"false", "0", "no", "off"}:
+                return False, True
+            return False, False
+
+        for position, raw in enumerate(raw_items, start=1):
+            if not isinstance(raw, dict):
+                malformed = True
+                continue
+            # Keep the shape deliberately small and non-sensitive.  The
+            # caller already owns the code/fingerprint mapping by index.
+            message = _redact_sensitive_text(raw.get("message"), *values)
+            authoritative, authoritative_ok = strict_bool(raw.get("authoritative"))
+            can_submit, can_submit_ok = strict_bool(raw.get("can_submit"))
+            capacity_exact, capacity_exact_ok = strict_bool(raw.get("capacity_exact"))
+            try:
+                available_uses = max(int(raw.get("available_uses") or 0), 0)
+            except (TypeError, ValueError):
+                available_uses = 0
+                malformed = True
+            if not (authoritative_ok and can_submit_ok and capacity_exact_ok):
+                malformed = True
+            if "index" not in raw:
+                index = position
+            else:
+                try:
+                    index = int(raw.get("index"))
+                except (TypeError, ValueError):
+                    index = 0
+                    malformed = True
+            if index <= 0 or index > len(values) or index in seen_indexes:
+                malformed = True
+            else:
+                seen_indexes.add(index)
+            item = {
+                "index": index,
+                "source": str(raw.get("source") or "").strip().lower(),
+                "authoritative": authoritative,
+                "can_submit": can_submit,
+                "available_uses": available_uses,
+                "capacity_exact": capacity_exact,
+                "state": str(raw.get("state") or "").strip().lower(),
+                "message": message[:500],
+            }
+            # These fields are useful for operator diagnostics but contain no
+            # raw credential; retain them only when they are scalar values.
+            for key in ("balance", "failed_count", "failed_limit"):
+                if key in raw:
+                    try:
+                        item[key] = max(int(raw.get(key) or 0), 0)
+                    except (TypeError, ValueError):
+                        pass
+            items.append(item)
+        if len(raw_items) != len(values) or seen_indexes != set(range(1, len(values) + 1)):
+            malformed = True
+        return {
+            "ok": str(response.get("status") or "").strip().lower() == "ok" and not malformed,
+            "submit_mode": mode,
+            "items": items,
+            "message": _redact_sensitive_text(response.get("message"), *values)[:500],
         }
 
     def public_submit_options(self) -> dict[str, bool]:
@@ -479,21 +606,21 @@ class BaxiGptClient:
                 "message": "PIX 上游已响应但未返回可轮询任务凭据，请人工复核",
                 "submission_unknown": True,
             }
-        reuse_policy = str(res.get("cdk_reuse_policy") or "").strip().lower()
-        if reuse_policy not in {"after_paid", "one_success"}:
-            # Older submit services never returned the capability. Default to
-            # the safe legacy contract; do not accidentally reuse an external
-            # upstream CDK merely because the response was old or incomplete.
-            reuse_policy = "one_success"
-        return {
+        result = {
             "ok": True,
             "status": _normalize_task_status(task.get("status")),
             "order_id": task_id,
             "display_id": task_id,
             "task_id": task_id,
             "status_token": status_token,
-            "cdk_reuse_policy": reuse_policy,
         }
+        # Older test/development servers may still advertise this field. Keep
+        # it as a compatibility hint, but never use it as the primary source
+        # of multi-credit capability; preflight is authoritative for that.
+        reuse_policy = str(res.get("cdk_reuse_policy") or "").strip().lower()
+        if reuse_policy in {"after_paid", "one_success"}:
+            result["cdk_reuse_policy"] = reuse_policy
+        return result
 
     def pix_status(self, *, task_id: str, status_token: str) -> dict[str, Any]:
         """Poll a PIX task without exposing its one-time status credential."""

@@ -180,6 +180,10 @@ const DEFAULT_PHONE_BINDING_SETTINGS = {
   proxy_min_score: 50,
 }
 
+const DEFAULT_BAXIGPT_STATUS_POLL_INTERVAL_SECONDS = 5
+const BAXIGPT_STATUS_POLL_INTERVAL_MIN_SECONDS = 1
+const BAXIGPT_STATUS_POLL_INTERVAL_MAX_SECONDS = 3600
+
 const DEFAULT_BAXIGPT_CDK_SETTINGS = {
   payment_channel: 'ideal',
   pix_submit_mode: 'auto_extract' as 'auto_extract' | 'user_link',
@@ -188,7 +192,7 @@ const DEFAULT_BAXIGPT_CDK_SETTINGS = {
   failure_continue: true,
   submit_interval_seconds: 5,
   auto_poll_status: true,
-  status_poll_interval_seconds: 5,
+  status_poll_interval_seconds: DEFAULT_BAXIGPT_STATUS_POLL_INTERVAL_SECONDS,
   status_poll_timeout_seconds: 1800,
 }
 
@@ -287,7 +291,8 @@ type AccountFilterRequestBody = {
   account_validity: string
   sub2api_state: string
   oaipay_state: string
-  idea_submit_state: string
+  submit_state: string
+  has_submitted: string
 }
 
 type AccountTaskScope = 'selected' | 'filtered'
@@ -304,7 +309,8 @@ const ACCOUNT_FILTER_REQUEST_KEYS: Array<keyof AccountFilterRequestBody> = [
   'account_validity',
   'sub2api_state',
   'oaipay_state',
-  'idea_submit_state',
+  'submit_state',
+  'has_submitted',
 ]
 
 function normalizeAccountIds(values: Iterable<unknown>): number[] {
@@ -400,7 +406,7 @@ const ACCOUNT_COLUMN_OPTIONS: Array<{ value: AccountColumnKey; text: string; cha
   { value: 'subscription_type', text: '当前订阅', chatgptOnly: true },
   { value: 'subscription_active_until', text: '订阅到期', chatgptOnly: true },
   { value: 'account_validity', text: '认证状态', chatgptOnly: true },
-  { value: 'idea_submit_status', text: 'Idea提交', chatgptOnly: true },
+  { value: 'idea_submit_status', text: '提交状态', chatgptOnly: true },
   { value: 'payment_link', text: '支付链接', chatgptOnly: true },
   { value: 'codex_usage', text: 'Codex用量', chatgptOnly: true },
   { value: 'sub2api_state', text: 'Sub2API', chatgptOnly: true },
@@ -442,7 +448,8 @@ type AccountColumnFilters = {
   codexState: string[]
   sub2apiState: string[]
   oaipayState: string[]
-  ideaSubmitState: string[]
+  submitState: string[]
+  hasSubmitted: string[]
 }
 
 const EMPTY_ACCOUNT_FILTERS: AccountColumnFilters = {
@@ -457,13 +464,18 @@ const EMPTY_ACCOUNT_FILTERS: AccountColumnFilters = {
   codexState: [],
   sub2apiState: [],
   oaipayState: [],
-  ideaSubmitState: [],
+  submitState: [],
+  hasSubmitted: [],
 }
 
 export type AccountFilterPresetFilters = {
   search?: string
   status?: string[]
-  columnFilters?: Partial<Record<keyof AccountColumnFilters, string[] | string>>
+  columnFilters?: Partial<Record<keyof AccountColumnFilters, string[] | string>> & {
+    // Old saved presets used this camel-case key. Keep it as an input-only
+    // compatibility alias and migrate it to submitState when loading.
+    ideaSubmitState?: string[] | string
+  }
   sortOrder?: SubscriptionExpirySortOrder
   pageSize?: number
 }
@@ -551,13 +563,18 @@ const OAIPAY_FILTER_OPTIONS = [
   { value: 'unknown', text: '未同步' },
 ]
 
-const IDEA_SUBMIT_FILTER_OPTIONS = [
+const SUBMISSION_STATE_FILTER_OPTIONS = [
   { value: 'unsubmitted', text: '未提交' },
   { value: 'unavailable', text: '不可用' },
   { value: 'submitting', text: '提交中' },
-  { value: 'paid', text: '已开通' },
+  { value: 'paid', text: '已完成' },
   { value: 'failed', text: '提交失败' },
   { value: 'timeout', text: '待人工复核' },
+]
+
+const HAS_SUBMITTED_FILTER_OPTIONS = [
+  { value: 'true', text: '已提交' },
+  { value: 'false', text: '未提交' },
 ]
 
 const IDEA_SUBMIT_FILTER_VALUE_ALIASES: Record<string, string> = {
@@ -576,9 +593,16 @@ const IDEA_SUBMIT_FILTER_VALUE_ALIASES: Record<string, string> = {
   error: 'failed',
 }
 
-function normalizeIdeaSubmitFilterValue(value: unknown) {
+function normalizeSubmissionStateFilterValue(value: unknown) {
   const text = String(value || '').trim().toLowerCase()
   return IDEA_SUBMIT_FILTER_VALUE_ALIASES[text] || text
+}
+
+function normalizeHasSubmittedFilterValue(value: unknown) {
+  const text = String(value || '').trim().toLowerCase()
+  if (['true', '1', 'yes', 'on', 'submitted'].includes(text)) return 'true'
+  if (['false', '0', 'no', 'off', 'unsubmitted', 'not_submitted'].includes(text)) return 'false'
+  return ''
 }
 
 const SUBSCRIPTION_EXPIRY_SORT_OPTIONS = [
@@ -597,7 +621,8 @@ const ACCOUNT_FILTER_PRESET_COLUMN_KEYS: Array<keyof AccountColumnFilters> = [
   'accountValidity',
   'sub2apiState',
   'oaipayState',
-  'ideaSubmitState',
+  'submitState',
+  'hasSubmitted',
 ]
 
 function normalizePresetList(value: unknown): string[] {
@@ -627,22 +652,47 @@ function cloneAccountColumnFilters(value?: Partial<Record<keyof AccountColumnFil
     codexState: [],
     sub2apiState: [],
     oaipayState: [],
-    ideaSubmitState: [],
+    submitState: [],
+    hasSubmitted: [],
   }
   ACCOUNT_FILTER_PRESET_COLUMN_KEYS.forEach((key) => {
     if (key === 'email') {
       next.email = String(source.email || '').trim()
-    } else {
-      const values = normalizePresetList(source[key])
-      ;(next[key] as string[]) = key === 'ideaSubmitState'
-        ? values.reduce((acc, item) => {
-            const normalized = normalizeIdeaSubmitFilterValue(item)
-            if (normalized && !acc.includes(normalized)) acc.push(normalized)
-            return acc
-          }, [] as string[])
-        : values
+      return
     }
+    const values = normalizePresetList(source[key])
+    if (key === 'submitState') {
+      next.submitState = values.reduce((acc, item) => {
+        const normalized = normalizeSubmissionStateFilterValue(item)
+        if (normalized && !acc.includes(normalized)) acc.push(normalized)
+        return acc
+      }, [] as string[])
+      return
+    }
+    if (key === 'hasSubmitted') {
+      next.hasSubmitted = values.reduce((acc, item) => {
+        const normalized = normalizeHasSubmittedFilterValue(item)
+        if (normalized && !acc.includes(normalized)) acc.push(normalized)
+        return acc
+      }, [] as string[])
+      return
+    }
+    ;(next[key] as string[]) = values
   })
+
+  // Older presets stored `ideaSubmitState`; migrate it only when no canonical
+  // submitState was supplied. Do not copy it back into the legacy request key.
+  const legacyValues = normalizePresetList(
+    (source as Record<string, unknown>).ideaSubmitState
+      ?? (source as Record<string, unknown>).idea_submit_state,
+  )
+  if (next.submitState.length === 0 && legacyValues.length > 0) {
+    next.submitState = legacyValues.reduce((acc, item) => {
+      const normalized = normalizeSubmissionStateFilterValue(item)
+      if (normalized && !acc.includes(normalized)) acc.push(normalized)
+      return acc
+    }, [] as string[])
+  }
   return next
 }
 
@@ -721,7 +771,8 @@ export function buildAccountFilterPresetSummary(filters?: AccountFilterPresetFil
     summarizePresetValues(ACCOUNT_VALIDITY_FILTER_OPTIONS, columnFilters.accountValidity) ? `认证状态：${summarizePresetValues(ACCOUNT_VALIDITY_FILTER_OPTIONS, columnFilters.accountValidity)}` : '',
     summarizePresetValues(SUB2API_FILTER_OPTIONS, columnFilters.sub2apiState) ? `Sub2API：${summarizePresetValues(SUB2API_FILTER_OPTIONS, columnFilters.sub2apiState)}` : '',
     summarizePresetValues(OAIPAY_FILTER_OPTIONS, columnFilters.oaipayState) ? `OAIPay：${summarizePresetValues(OAIPAY_FILTER_OPTIONS, columnFilters.oaipayState)}` : '',
-    summarizePresetValues(IDEA_SUBMIT_FILTER_OPTIONS, columnFilters.ideaSubmitState) ? `Idea提交：${summarizePresetValues(IDEA_SUBMIT_FILTER_OPTIONS, columnFilters.ideaSubmitState)}` : '',
+    summarizePresetValues(SUBMISSION_STATE_FILTER_OPTIONS, columnFilters.submitState) ? `提交状态：${summarizePresetValues(SUBMISSION_STATE_FILTER_OPTIONS, columnFilters.submitState)}` : '',
+    summarizePresetValues(HAS_SUBMITTED_FILTER_OPTIONS, columnFilters.hasSubmitted) ? `已提交：${summarizePresetValues(HAS_SUBMITTED_FILTER_OPTIONS, columnFilters.hasSubmitted)}` : '',
     normalized.sortOrder ? `到期：${labelForOption(SUBSCRIPTION_EXPIRY_SORT_OPTIONS, normalized.sortOrder)}` : '',
   ].filter(Boolean)
   return parts.length ? parts.join(' · ') : '无筛选条件'
@@ -970,6 +1021,17 @@ function intWithDefault(value: unknown, fallback: number, min = 0) {
   return Math.max(Math.floor(next), min)
 }
 
+function normalizeBaxiStatusPollInterval(value: unknown) {
+  return Math.min(
+    intWithDefault(
+      value,
+      DEFAULT_BAXIGPT_STATUS_POLL_INTERVAL_SECONDS,
+      BAXIGPT_STATUS_POLL_INTERVAL_MIN_SECONDS,
+    ),
+    BAXIGPT_STATUS_POLL_INTERVAL_MAX_SECONDS,
+  )
+}
+
 function normalizePhonePoolMode(value: unknown, raw?: Record<string, unknown>): PhonePoolMode {
   const mode = String(value || '').trim()
   if (mode === 'prefix_limited' || mode === 'prefix_sample' || mode === 'normal') {
@@ -1091,7 +1153,7 @@ function normalizeBaxiGptCdkSettings(value: unknown): BaxiGptCdkSettings {
     failure_continue: raw.failure_continue === undefined ? DEFAULT_BAXIGPT_CDK_SETTINGS.failure_continue : Boolean(raw.failure_continue),
     submit_interval_seconds: intWithDefault(raw.submit_interval_seconds, DEFAULT_BAXIGPT_CDK_SETTINGS.submit_interval_seconds, 0),
     auto_poll_status: raw.auto_poll_status === undefined ? DEFAULT_BAXIGPT_CDK_SETTINGS.auto_poll_status : Boolean(raw.auto_poll_status),
-    status_poll_interval_seconds: intWithDefault(raw.status_poll_interval_seconds, DEFAULT_BAXIGPT_CDK_SETTINGS.status_poll_interval_seconds, 1),
+    status_poll_interval_seconds: normalizeBaxiStatusPollInterval(raw.status_poll_interval_seconds),
     status_poll_timeout_seconds: intWithDefault(raw.status_poll_timeout_seconds, DEFAULT_BAXIGPT_CDK_SETTINGS.status_poll_timeout_seconds, 1800),
   }
 }
@@ -2022,26 +2084,105 @@ function accountValidityMeta(record: any) {
   }
 }
 
-function getIdeaSubmitSummary(record: any) {
-  const topLevel = record?.idea_submit && typeof record.idea_submit === 'object' ? record.idea_submit : {}
-  if (Object.keys(topLevel).length > 0) return topLevel
-  const camel = record?.ideaSubmit && typeof record.ideaSubmit === 'object' ? record.ideaSubmit : {}
-  if (Object.keys(camel).length > 0) return camel
-  return record?.extra?.idea_submit && typeof record.extra.idea_submit === 'object' ? record.extra.idea_submit : {}
+type SubmissionTag = { color: string; label: string }
+
+function getSubmissionRecord(value: unknown): Record<string, any> {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, any>
+    : {}
+}
+
+function getSubmissionSummary(record: any): Record<string, any> {
+  // New generic fields win, but merge legacy fields underneath so a partially
+  // migrated list response still renders its order/reason metadata.
+  const candidates = [
+    record?.extra?.idea_submit,
+    record?.ideaSubmit,
+    record?.idea_submit,
+    record?.extra?.submission_summary,
+    record?.submission_summary,
+    record?.submissionSummary,
+    record?.extra?.submission,
+    record?.submission,
+  ].map(getSubmissionRecord)
+  const merged = candidates.reduce<Record<string, any>>((result, item) => ({ ...result, ...item }), {})
+  if (record?.submit_state !== undefined && merged.state === undefined && merged.status === undefined) {
+    merged.state = record.submit_state
+  }
+  if (record?.has_submitted !== undefined && merged.has_submitted === undefined) {
+    merged.has_submitted = record.has_submitted
+  }
+  return merged
+}
+
+function parseSubmissionBoolean(value: unknown): boolean | null {
+  if (typeof value === 'boolean') return value
+  const text = String(value ?? '').trim().toLowerCase()
+  if (['true', '1', 'yes', 'on'].includes(text)) return true
+  if (['false', '0', 'no', 'off', ''].includes(text)) return text === '' ? null : false
+  return null
+}
+
+function submissionStateValue(record: any, summary: Record<string, any>) {
+  const raw = String(
+    summary.state
+      ?? summary.status
+      ?? summary.final_state
+      ?? summary.result_state
+      ?? record?.submit_state
+      ?? '',
+  ).trim().toLowerCase()
+  return normalizeSubmissionStateFilterValue(raw)
+}
+
+function submissionHasSubmitted(record: any, summary: Record<string, any>, state: string) {
+  const explicit = parseSubmissionBoolean(summary.has_submitted ?? record?.has_submitted)
+  if (explicit !== null) return explicit
+  const linkSubmitted = parseSubmissionBoolean(summary.link_submitted)
+  if (linkSubmitted !== null) return linkSubmitted
+  const linkStatus = String(summary.link_status || '').trim().toLowerCase()
+  if (['pix_submitted', 'submitted', 'consumed', 'used'].includes(linkStatus)) return true
+  if (String(summary.order_id || summary.orderId || summary.display_id || summary.displayId || '').trim()) return true
+  return ['submitting', 'paid'].includes(state)
+}
+
+function submissionMeta(record: any) {
+  const summary = getSubmissionSummary(record)
+  const state = submissionStateValue(record, summary)
+  const hasSubmitted = submissionHasSubmitted(record, summary, state)
+  const unavailable = Boolean(
+    parseSubmissionBoolean(summary.unavailable)
+      || state === 'unavailable'
+      || String(summary.eligibility_state || '').trim().toLowerCase() === 'unavailable',
+  )
+  const tags: SubmissionTag[] = []
+  if (hasSubmitted) tags.push({ color: 'processing', label: '已提交' })
+  if (unavailable) tags.push({ color: 'error', label: '不可用' })
+  if (state === 'paid') {
+    tags.push({ color: 'success', label: '已完成' })
+  } else if (state === 'failed') {
+    tags.push({ color: 'warning', label: '提交失败' })
+  } else if (state === 'timeout') {
+    tags.push({ color: 'warning', label: '待人工复核' })
+  } else if (state === 'submitting') {
+    tags.push({ color: 'processing', label: '处理中' })
+  } else if (!hasSubmitted && !unavailable) {
+    tags.push({ color: 'default', label: '未提交' })
+  }
+  if (tags.length === 0) tags.push({ color: 'default', label: '未提交' })
+  return {
+    summary,
+    state,
+    hasSubmitted,
+    tags,
+    color: tags[tags.length - 1]?.color || 'default',
+    label: tags.map((tag) => tag.label).join(' · '),
+    reason: String(summary.reason || '').trim(),
+  }
 }
 
 function ideaSubmitMeta(record: any) {
-  const summary = getIdeaSubmitSummary(record)
-  const unavailable = Boolean(summary?.unavailable)
-  const status = String(summary?.status || '').trim().toLowerCase()
-  if (unavailable || status === 'unavailable') {
-    return { color: 'error', label: '不可用', reason: String(summary?.reason || '').trim() }
-  }
-  if (status === 'paid') return { color: 'success', label: '已开通', reason: '' }
-  if (status === 'submitted' || status === 'processing') return { color: 'processing', label: '提交中', reason: '' }
-  if (status === 'failed') return { color: 'warning', label: '提交失败', reason: String(summary?.reason || '').trim() }
-  if (status === 'timeout') return { color: 'warning', label: '待人工复核', reason: String(summary?.reason || '').trim() }
-  return { color: 'default', label: '未提交', reason: '' }
+  return submissionMeta(record)
 }
 
 function isPaypalBindingEligibleAccount(record: any) {
@@ -2320,7 +2461,8 @@ export default function Accounts() {
     accountValidity: columnFilters.accountValidity.join(','),
     sub2apiState: columnFilters.sub2apiState.join(','),
     oaipayState: columnFilters.oaipayState.join(','),
-    ideaSubmitState: columnFilters.ideaSubmitState.join(','),
+    submitState: columnFilters.submitState.join(','),
+    hasSubmitted: columnFilters.hasSubmitted.join(','),
     sortBy: subscriptionExpirySortOrder ? SUBSCRIPTION_EXPIRY_SORT_FIELD : '',
     sortOrder: subscriptionExpirySortOrder,
     page: currentPage,
@@ -2337,7 +2479,8 @@ export default function Accounts() {
     account_validity: columnFilters.accountValidity.join(','),
     sub2api_state: columnFilters.sub2apiState.join(','),
     oaipay_state: columnFilters.oaipayState.join(','),
-    idea_submit_state: columnFilters.ideaSubmitState.join(','),
+    submit_state: columnFilters.submitState.join(','),
+    has_submitted: columnFilters.hasSubmitted.join(','),
   }), [
     debouncedSearch,
     filterStatus,
@@ -2349,7 +2492,8 @@ export default function Accounts() {
     columnFilters.accountValidity,
     columnFilters.sub2apiState,
     columnFilters.oaipayState,
-    columnFilters.ideaSubmitState,
+    columnFilters.submitState,
+    columnFilters.hasSubmitted,
   ])
   const currentFilteredTotalValue = Number(accountsQuery.data?.total ?? 0)
   const currentFilteredTotal = Number.isFinite(currentFilteredTotalValue)
@@ -2429,7 +2573,7 @@ export default function Accounts() {
 
   useEffect(() => {
     setCurrentPage(1)
-  }, [debouncedSearch, filterStatus, columnFilters.manuallyUsed, columnFilters.authType, columnFilters.phoneBindingState, columnFilters.paymentLinkPlatform, columnFilters.subscriptionType, columnFilters.accountValidity, columnFilters.sub2apiState, columnFilters.oaipayState, columnFilters.ideaSubmitState, subscriptionExpirySortOrder])
+  }, [debouncedSearch, filterStatus, columnFilters.manuallyUsed, columnFilters.authType, columnFilters.phoneBindingState, columnFilters.paymentLinkPlatform, columnFilters.subscriptionType, columnFilters.accountValidity, columnFilters.sub2apiState, columnFilters.oaipayState, columnFilters.submitState, columnFilters.hasSubmitted, subscriptionExpirySortOrder])
 
   useEffect(() => {
     if (typeof document === 'undefined') return
@@ -2695,7 +2839,8 @@ export default function Accounts() {
     if (body.account_validity) params.set('account_validity', String(body.account_validity))
     if (body.sub2api_state) params.set('sub2api_state', String(body.sub2api_state))
     if (body.oaipay_state) params.set('oaipay_state', String(body.oaipay_state))
-    if (body.idea_submit_state) params.set('idea_submit_state', String(body.idea_submit_state))
+    if (body.submit_state) params.set('submit_state', String(body.submit_state))
+    if (body.has_submitted) params.set('has_submitted', String(body.has_submitted))
     return params
   }, [currentAccountFilterBody])
 
@@ -2798,7 +2943,8 @@ export default function Accounts() {
       accountValidity: normalized.columnFilters.accountValidity,
       sub2apiState: normalized.columnFilters.sub2apiState,
       oaipayState: normalized.columnFilters.oaipayState,
-      ideaSubmitState: normalized.columnFilters.ideaSubmitState,
+      submitState: normalized.columnFilters.submitState,
+      hasSubmitted: normalized.columnFilters.hasSubmitted,
       sortOrder: normalized.sortOrder || undefined,
       pageSize: normalized.pageSize,
     })
@@ -2864,7 +3010,8 @@ export default function Accounts() {
         accountValidity: values.accountValidity,
         sub2apiState: values.sub2apiState,
         oaipayState: values.oaipayState,
-        ideaSubmitState: values.ideaSubmitState,
+        submitState: values.submitState,
+        hasSubmitted: values.hasSubmitted,
       },
       sortOrder: values.sortOrder,
       pageSize: values.pageSize,
@@ -4165,7 +4312,7 @@ export default function Accounts() {
       payment_channel: paymentChannel,
       failure_continue: Boolean(values.failure_continue),
       submit_interval_seconds: Number(values.submit_interval_seconds || 0),
-      status_poll_interval_seconds: Number(values.status_poll_interval_seconds || 5),
+      status_poll_interval_seconds: normalizeBaxiStatusPollInterval(values.status_poll_interval_seconds),
       status_poll_timeout_seconds: Number(values.status_poll_timeout_seconds || 1800),
       target_success_count: Math.max(Number(values.target_success_count || 0), 0),
     }
@@ -5802,14 +5949,23 @@ export default function Accounts() {
 
   const renderIdeaSubmitState = (record: any) => {
     const meta = ideaSubmitMeta(record)
-    const summary = getIdeaSubmitSummary(record)
+    const summary = meta.summary
     const title = [
       meta.reason ? `原因：${meta.reason}` : '',
       summary?.marked_at ? `标记：${formatCompactDateTime(String(summary.marked_at))}` : '',
+      summary?.submitted_at ? `提交：${formatCompactDateTime(String(summary.submitted_at))}` : '',
+      summary?.paid_at ? `完成：${formatCompactDateTime(String(summary.paid_at))}` : '',
+      summary?.last_checked_at ? `检查：${formatCompactDateTime(String(summary.last_checked_at))}` : '',
       summary?.order_id ? `order：${summary.order_id}` : '',
       summary?.code_masked ? `卡密：${summary.code_masked}` : '',
     ].filter(Boolean).join('\n')
-    return <Tag color={meta.color} title={title || meta.label} style={compactTagStyle}>{meta.label}</Tag>
+    return (
+      <Space size={[4, 4]} wrap title={title || meta.label}>
+        {meta.tags.map((tag, index) => (
+          <Tag key={`${tag.label}-${index}`} color={tag.color} style={compactTagStyle}>{tag.label}</Tag>
+        ))}
+      </Space>
+    )
   }
 
   const renderCodexUsageState = (record: any) => {
@@ -6001,10 +6157,18 @@ export default function Accounts() {
             allowClear
             mode="multiple"
             size="small"
-            placeholder="Idea提交"
-            value={columnFilters.ideaSubmitState}
-            options={toSelectOptions(IDEA_SUBMIT_FILTER_OPTIONS)}
-            onChange={(value) => setColumnFilters((prev) => ({ ...prev, ideaSubmitState: value }))}
+            placeholder="提交状态"
+            value={columnFilters.submitState}
+            options={toSelectOptions(SUBMISSION_STATE_FILTER_OPTIONS)}
+            onChange={(value) => setColumnFilters((prev) => ({ ...prev, submitState: value }))}
+          />
+          <Select
+            allowClear
+            size="small"
+            placeholder="是否已提交"
+            value={columnFilters.hasSubmitted[0] || undefined}
+            options={toSelectOptions(HAS_SUBMITTED_FILTER_OPTIONS)}
+            onChange={(value) => setColumnFilters((prev) => ({ ...prev, hasSubmitted: value ? [String(value)] : [] }))}
           />
           <Select
             allowClear
@@ -6216,8 +6380,14 @@ export default function Accounts() {
     values: string[],
     options: Array<{ value: string; text: string }>,
     onChange: (next: string[]) => void,
+    secondary?: {
+      label: string
+      values: string[]
+      options: Array<{ value: string; text: string }>
+      onChange: (next: string[]) => void
+    },
   ) => {
-    const selectedCount = values.length
+    const selectedCount = values.length + (secondary?.values.length || 0)
     const overlay = (
       <div
         onClick={(event) => event.stopPropagation()}
@@ -6235,8 +6405,27 @@ export default function Accounts() {
           onChange={(checkedValues) => onChange(checkedValues.map((item) => String(item)))}
           style={{ display: 'grid', gap: 8 }}
         />
+        {secondary ? (
+          <>
+            <Text type="secondary" style={{ display: 'block', marginTop: 10, marginBottom: 6, fontSize: 12 }}>
+              {secondary.label}
+            </Text>
+            <Checkbox.Group
+              value={secondary.values}
+              options={toCheckboxOptions(secondary.options)}
+              onChange={(checkedValues) => secondary.onChange(checkedValues.map((item) => String(item)))}
+              style={{ display: 'grid', gap: 8 }}
+            />
+          </>
+        ) : null}
         <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 10 }}>
-          <Button size="small" onClick={() => onChange([])}>
+          <Button
+            size="small"
+            onClick={() => {
+              onChange([])
+              secondary?.onChange([])
+            }}
+          >
             清空
           </Button>
         </div>
@@ -6542,7 +6731,13 @@ export default function Accounts() {
       ) : null,
       isColumnVisible('subscription_type') ? renderMobileStatusPill('subscription_type', subscriptionMetaForMobile.label, subscriptionMetaForMobile.color) : null,
       isColumnVisible('account_validity') ? renderMobileStatusPill('account_validity', validityMetaForMobile.label, validityMetaForMobile.color) : null,
-      isColumnVisible('idea_submit_status') ? renderMobileStatusPill('idea_submit_status', ideaMetaForMobile.label, ideaMetaForMobile.color) : null,
+      isColumnVisible('idea_submit_status') ? (
+        <span key="idea_submit_status" style={{ display: 'inline-flex', alignItems: 'center', gap: 4, flexWrap: 'wrap' }}>
+          {ideaMetaForMobile.tags.map((tag, index) => (
+            <Tag key={`${tag.label}-${index}`} color={tag.color} style={mobileStatusPillStyle}>{tag.label}</Tag>
+          ))}
+        </span>
+      ) : null,
       isColumnVisible('password') ? renderMobileStatusPill(
         'password',
         hasPasswordForMobile ? '有密码' : '无密码',
@@ -6918,10 +7113,16 @@ export default function Accounts() {
       },
       {
         title: renderColumnFilterTitle(
-          'Idea提交',
-          columnFilters.ideaSubmitState,
-          IDEA_SUBMIT_FILTER_OPTIONS,
-          (next) => setColumnFilters((prev) => ({ ...prev, ideaSubmitState: next })),
+          '提交状态',
+          columnFilters.submitState,
+          SUBMISSION_STATE_FILTER_OPTIONS,
+          (next) => setColumnFilters((prev) => ({ ...prev, submitState: next })),
+          {
+            label: '是否已提交',
+            values: columnFilters.hasSubmitted,
+            options: HAS_SUBMITTED_FILTER_OPTIONS,
+            onChange: (next) => setColumnFilters((prev) => ({ ...prev, hasSubmitted: next })),
+          },
         ),
         key: 'idea_submit_status',
         width: 128,
@@ -7706,8 +7907,11 @@ export default function Accounts() {
                 <Form.Item name="oaipayState" label="OAIPay 状态" style={{ marginBottom: 0 }}>
                   <Select mode="multiple" placeholder="全部 OAIPay 状态" options={OAIPAY_FILTER_OPTIONS} allowClear />
                 </Form.Item>
-                <Form.Item name="ideaSubmitState" label="Idea 提交" style={{ marginBottom: 0 }}>
-                  <Select mode="multiple" placeholder="全部 Idea 提交状态" options={IDEA_SUBMIT_FILTER_OPTIONS} allowClear />
+                <Form.Item name="submitState" label="提交状态" style={{ marginBottom: 0 }}>
+                  <Select mode="multiple" placeholder="全部提交状态" options={SUBMISSION_STATE_FILTER_OPTIONS} allowClear />
+                </Form.Item>
+                <Form.Item name="hasSubmitted" label="是否已提交" style={{ marginBottom: 0 }}>
+                  <Select placeholder="不限" options={HAS_SUBMITTED_FILTER_OPTIONS} allowClear />
                 </Form.Item>
                 <Form.Item name="sortOrder" label="到期时间排序" style={{ marginBottom: 0 }}>
                   <Select placeholder="默认排序" options={SUBSCRIPTION_EXPIRY_SORT_OPTIONS} allowClear />
@@ -9161,8 +9365,20 @@ export default function Accounts() {
                   <Switch checkedChildren="开启" unCheckedChildren="关闭" />
                 </Form.Item>
               ) : null}
-              <Form.Item name="status_poll_interval_seconds" label="轮询间隔">
-                <InputNumber min={1} max={3600} step={1} addonAfter="秒" style={{ width: '100%' }} />
+              <Form.Item
+                name="status_poll_interval_seconds"
+                label="状态轮询间隔"
+                extra={baxiIsPix
+                  ? '新任务按此值统一轮询；运行中的旧任务保持创建时参数。批量提交先串行创建订单，再统一轮询；后端默认 5 秒。'
+                  : '新任务按此值轮询；运行中的旧任务保持创建时参数；后端默认 5 秒。'}
+              >
+                <InputNumber
+                  min={BAXIGPT_STATUS_POLL_INTERVAL_MIN_SECONDS}
+                  max={BAXIGPT_STATUS_POLL_INTERVAL_MAX_SECONDS}
+                  step={1}
+                  addonAfter="秒"
+                  style={{ width: '100%' }}
+                />
               </Form.Item>
               <Form.Item name="status_poll_timeout_seconds" label="未返回提醒" extra="到点只写提醒日志，任务会继续等待上游终态，不再提前结束。">
                 <InputNumber min={1800} max={86400} step={60} addonAfter="秒" style={{ width: '100%' }} />

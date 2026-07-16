@@ -46,6 +46,8 @@ def test_account_filter_preset_crud_and_normalization(monkeypatch):
                     "accountValidity": ["valid"],
                     "oaipayState": ["unknown", "not_found"],
                     "ideaSubmitState": ["available", "submitted", "processing", "unavailable"],
+                    "submitState": ["available", "submitted", "processing", "timeout"],
+                    "hasSubmitted": ["true"],
                 },
                 "sortOrder": "asc",
                 "pageSize": 50,
@@ -60,6 +62,8 @@ def test_account_filter_preset_crud_and_normalization(monkeypatch):
     assert item["filters"]["columnFilters"]["phoneBindingState"] == ["unbound"]
     assert item["filters"]["columnFilters"]["paymentLinkPlatform"] == ["pix", "none"]
     assert item["filters"]["columnFilters"]["ideaSubmitState"] == ["unsubmitted", "submitting", "unavailable"]
+    assert item["filters"]["columnFilters"]["submitState"] == ["unsubmitted", "submitting", "timeout"]
+    assert item["filters"]["columnFilters"]["hasSubmitted"] == ["true"]
     assert item["filters"]["sortOrder"] == "asc"
     assert item["filters"]["pageSize"] == 50
     assert created["custom_count"] == 1
@@ -129,9 +133,10 @@ def test_legacy_filter_preset_list_payload_still_loads(monkeypatch):
     store = DummyConfigStore()
     monkeypatch.setattr(accounts, "config_store", store)
     store.value = (
-        '[{"id":"preset_legacy","name":"旧自定义组合","filters":{"columnFilters":{"oaipayState":["unknown"]}}}]'
+        '[{"id":"preset_legacy","name":"旧自定义组合","filters":{"columnFilters":{"oaipayState":["unknown"],"ideaSubmitState":["submitted","unavailable"]}}}]'
     )
 
     listed = accounts.list_account_filter_presets()
     assert listed["custom_count"] == 1
-    assert any(item["id"] == "preset_legacy" for item in listed["items"])
+    item = next(item for item in listed["items"] if item["id"] == "preset_legacy")
+    assert item["filters"]["columnFilters"]["ideaSubmitState"] == ["submitting", "unavailable"]

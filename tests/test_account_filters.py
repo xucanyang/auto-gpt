@@ -8,11 +8,14 @@ try:
 
     from core.db import AccountListStateModel, AccountModel, engine, init_db
     from services.account_filters import (
+        account_has_submitted,
         account_idea_submit_state,
         account_payment_link_platform,
         account_phone_binding_state,
         account_revival_info,
         account_revival_state,
+        account_submission_info,
+        account_submit_state,
         apply_account_list_state_filters,
         apply_account_list_state_sort,
         delete_account_list_state_for_account_ids,
@@ -33,10 +36,13 @@ except ModuleNotFoundError as exc:
     engine = None
     init_db = None
     account_idea_submit_state = None
+    account_has_submitted = None
     account_payment_link_platform = None
     account_phone_binding_state = None
     account_revival_info = None
     account_revival_state = None
+    account_submission_info = None
+    account_submit_state = None
     apply_account_list_state_filters = None
     apply_account_list_state_sort = None
     delete_account_list_state_for_account_ids = None
@@ -219,6 +225,68 @@ class AccountFilterSortTests(unittest.TestCase):
         self.assertEqual(
             [row.id for row in filter_account_rows([unavailable, paid, legacy_unavailable, available, submitted, processing], idea_submit_state="available,submitted")],
             [33, 34],
+        )
+
+    def test_generic_submission_state_keeps_outcome_and_submission_evidence_independent(self):
+        pix_failed = self._account(36)
+        pix_failed.set_extra(
+            {
+                "idea_submit": {"status": "failed", "unavailable": True, "order_id": "pix-order"},
+                "idea_submit_unavailable": True,
+                "baxigpt_cdk": {"status": "failed", "order_id": "pix-order"},
+                "chatgpt_last_payment_link": {"link_status": "pix_submitted"},
+            }
+        )
+        pix_link_only = self._account(37)
+        pix_link_only.set_extra(
+            {"chatgpt_last_payment_link": {"link_status": "pix_submitted"}}
+        )
+        timeout = self._account(38)
+        timeout.set_extra(
+            {"baxigpt_cdk": {"status": "timeout", "display_id": "timeout-order"}}
+        )
+        unavailable_only = self._account(39)
+        unavailable_only.set_extra(
+            {"idea_submit": {"unavailable": True}, "idea_submit_unavailable": True}
+        )
+        failed_before_submit = self._account(40)
+        failed_before_submit.set_extra({"baxigpt_cdk": {"status": "failed"}})
+        available = self._account(41)
+        rows = [pix_failed, pix_link_only, timeout, unavailable_only, failed_before_submit, available]
+
+        self.assertEqual(account_idea_submit_state(pix_failed), "unavailable")
+        self.assertEqual(account_submit_state(pix_failed), "failed")
+        self.assertTrue(account_has_submitted(pix_failed))
+        self.assertEqual(
+            account_submission_info(pix_failed),
+            {
+                "state": "failed",
+                "has_submitted": True,
+                "link_submitted": True,
+                "link_status": "pix_submitted",
+                "unavailable": True,
+            },
+        )
+        self.assertEqual(account_submit_state(pix_link_only), "submitted")
+        self.assertTrue(account_has_submitted(pix_link_only))
+        self.assertEqual(account_submit_state(timeout), "timeout")
+        self.assertTrue(account_has_submitted(timeout))
+        self.assertEqual(account_submit_state(unavailable_only), "unavailable")
+        self.assertFalse(account_has_submitted(unavailable_only))
+        self.assertEqual(account_submit_state(failed_before_submit), "failed")
+        self.assertFalse(account_has_submitted(failed_before_submit))
+
+        self.assertEqual(
+            [row.id for row in filter_account_rows(rows, submit_state="submitting")],
+            [37],
+        )
+        self.assertEqual(
+            [row.id for row in filter_account_rows(rows, has_submitted=True)],
+            [36, 37, 38],
+        )
+        self.assertEqual(
+            [row.id for row in filter_account_rows(rows, has_submitted=False)],
+            [39, 40, 41],
         )
 
     def test_phone_binding_filter_uses_confirmed_binding_not_rt_or_phone_hint(self):
@@ -530,6 +598,72 @@ class AccountFilterSortTests(unittest.TestCase):
                 [row.id for row in filter_account_rows(rows, idea_submit_state="paid,unsubmitted")],
             )
 
+    def test_account_list_state_sql_generic_submission_matches_python_fallback(self):
+        init_db()
+        pix_failed = self._account(111)
+        pix_failed.set_extra(
+            {
+                "idea_submit": {"status": "failed", "unavailable": True, "order_id": "pix-order"},
+                "idea_submit_unavailable": True,
+                "baxigpt_cdk": {"status": "failed", "order_id": "pix-order"},
+                "chatgpt_last_payment_link": {"link_status": "pix_submitted"},
+            }
+        )
+        pix_link_only = self._account(112)
+        pix_link_only.set_extra(
+            {"chatgpt_last_payment_link": {"link_status": "pix_submitted"}}
+        )
+        unavailable_only = self._account(113)
+        unavailable_only.set_extra(
+            {"idea_submit": {"unavailable": True}, "idea_submit_unavailable": True}
+        )
+        failed_before_submit = self._account(114)
+        failed_before_submit.set_extra({"baxigpt_cdk": {"status": "failed"}})
+        rows = [pix_failed, pix_link_only, unavailable_only, failed_before_submit]
+
+        with Session(engine) as session:
+            session.exec(text("DELETE FROM account_list_state"))
+            session.exec(text("DELETE FROM accounts"))
+            for row in rows:
+                session.add(row)
+            session.commit()
+            refresh_account_list_state(session)
+
+            cached = {
+                int(item.account_id): (
+                    item.idea_submit_state,
+                    item.submit_state,
+                    bool(item.has_submitted),
+                )
+                for item in session.exec(
+                    select(AccountListStateModel).order_by(AccountListStateModel.account_id)
+                ).all()
+            }
+            self.assertEqual(cached[111], ("unavailable", "failed", True))
+            self.assertEqual(cached[112], ("available", "submitted", True))
+            self.assertEqual(cached[113], ("unavailable", "unavailable", False))
+            self.assertEqual(cached[114], ("failed", "failed", False))
+
+            def sql_ids(**filters):
+                query = select(AccountModel).join(
+                    AccountListStateModel,
+                    AccountListStateModel.account_id == AccountModel.id,
+                )
+                query = apply_account_list_state_filters(query, **filters)
+                query = query.order_by(AccountModel.id.asc())
+                return [int(row.id or 0) for row in session.exec(query).all()]
+
+            for filters in (
+                {"submit_state": "failed"},
+                {"submit_state": "submitting"},
+                {"has_submitted": True},
+                {"has_submitted": False},
+            ):
+                self.assertEqual(
+                    sql_ids(**filters),
+                    [row.id for row in filter_account_rows(rows, **filters)],
+                )
+
     def test_subscription_filter_uses_current_confirmed_plan_not_stale_snapshot(self):
         init_db()
         stale_plus = self._account(901)
@@ -720,6 +854,8 @@ class AccountFilterSortTests(unittest.TestCase):
         self.assertIn("source_updated_at", columns)
         self.assertIn("subscription_active_until_ts", columns)
         self.assertIn("idea_submit_state", columns)
+        self.assertIn("submit_state", columns)
+        self.assertIn("has_submitted", columns)
         self.assertIn("phone_binding_state", columns)
         self.assertIn("payment_link_platform", columns)
         self.assertIn("derivation_version", columns)

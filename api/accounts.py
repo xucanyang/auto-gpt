@@ -9,6 +9,7 @@ from services.account_filters import (
     account_filtered_query,
     account_payment_link_summary,
     account_revival_info,
+    account_submission_info,
     account_subscription_type,
     apply_account_list_state_sort,
     delete_account_list_state_for_account_ids,
@@ -74,6 +75,8 @@ ACCOUNT_FILTER_PRESET_COLUMN_KEYS = (
     "sub2apiState",
     "oaipayState",
     "ideaSubmitState",
+    "submitState",
+    "hasSubmitted",
 )
 ACCOUNT_FILTER_PRESET_PENDING_OAIPAY_STATES = [
     "unknown",
@@ -135,6 +138,8 @@ _IDEA_SUBMIT_FILTER_PRESET_ALIASES = {
     "polling": "submitting",
     "success": "paid",
     "completed": "paid",
+    "manual_review": "timeout",
+    "unknown_submit": "timeout",
     "fail": "failed",
     "error": "failed",
 }
@@ -179,7 +184,11 @@ def _normalize_filter_preset_filters(filters: Any) -> dict[str, Any]:
         if key in {"email", "status"}:
             continue
         values = _filter_value_list(source_column_filters.get(key) or source.get(key))
-        clean["columnFilters"][key] = _normalize_idea_submit_filter_values(values) if key == "ideaSubmitState" else values
+        clean["columnFilters"][key] = (
+            _normalize_idea_submit_filter_values(values)
+            if key in {"ideaSubmitState", "submitState"}
+            else values
+        )
 
     sort_source = source.get("sort") if isinstance(source.get("sort"), dict) else {}
     sort_order = _trim_text(
@@ -215,6 +224,8 @@ def _filter_preset_summary(filters: dict[str, Any]) -> str:
         ("sub2apiState", "Sub2API"),
         ("oaipayState", "OAIPay"),
         ("ideaSubmitState", "Idea提交"),
+        ("submitState", "提交状态"),
+        ("hasSubmitted", "已提交"),
     ]
     for key, label in summary_keys:
         values = _filter_value_list(column_filters.get(key))
@@ -982,8 +993,10 @@ def _build_idea_submit_summary(extra: dict[str, Any], baxigpt_cdk: dict[str, Any
     )
     status = "unavailable" if unavailable else "available"
     cdk_status = _safe_str(baxigpt_cdk.get("status")).lower()
-    if not unavailable and cdk_status in {"paid", "submitted", "processing", "failed"}:
-        status = cdk_status
+    marker_status = _safe_str(marker.get("status")).lower()
+    current_status = cdk_status if cdk_status in {"paid", "submitted", "processing", "failed", "timeout"} else marker_status
+    if not unavailable and current_status in {"paid", "submitted", "processing", "failed", "timeout"}:
+        status = current_status
     return {
         "status": status,
         "available": not unavailable,
@@ -997,6 +1010,65 @@ def _build_idea_submit_summary(extra: dict[str, Any], baxigpt_cdk: dict[str, Any
         "task_id": _safe_str(marker.get("task_id") or baxigpt_cdk.get("task_id")),
         "order_id": _safe_str(marker.get("order_id") or baxigpt_cdk.get("order_id")),
         "display_id": _safe_str(marker.get("display_id") or baxigpt_cdk.get("display_id")),
+    }
+
+
+def _build_submission_summary(
+    extra: dict[str, Any],
+    baxigpt_cdk: dict[str, Any],
+    submission_info: dict[str, Any],
+) -> dict[str, Any]:
+    """Build the non-secret channel-neutral submission list payload."""
+
+    marker = extra.get("idea_submit") if isinstance(extra.get("idea_submit"), dict) else {}
+    raw_cdk = extra.get("baxigpt_cdk") if isinstance(extra.get("baxigpt_cdk"), dict) else {}
+    payment_link = (
+        extra.get("chatgpt_last_payment_link")
+        if isinstance(extra.get("chatgpt_last_payment_link"), dict)
+        else {}
+    )
+    legacy = _build_idea_submit_summary(extra, baxigpt_cdk)
+    state = _safe_str(submission_info.get("state")).lower() or "available"
+    link_is_pix = bool(
+        submission_info.get("link_submitted")
+        or _safe_str(payment_link.get("link_type")).lower() == "pix"
+        or _safe_str(payment_link.get("payment_method_type")).lower() == "pix"
+    )
+    payment_channel = _safe_str(marker.get("payment_channel") or raw_cdk.get("payment_channel")).lower()
+    if link_is_pix:
+        payment_channel = "pix"
+    elif not payment_channel and (marker or raw_cdk):
+        payment_channel = "ideal"
+    reason = _safe_str(
+        marker.get("reason")
+        or raw_cdk.get("last_error_message")
+        or legacy.get("reason")
+    )
+    source = _safe_str(marker.get("source") or legacy.get("source"))
+    if not source and raw_cdk:
+        source = "baxigpt_cdk_submit"
+    return {
+        "status": state,
+        "state": state,
+        "has_submitted": bool(submission_info.get("has_submitted")),
+        "link_submitted": bool(submission_info.get("link_submitted")),
+        "link_status": _safe_str(submission_info.get("link_status")).lower(),
+        "unavailable": bool(submission_info.get("unavailable")),
+        "eligibility_state": "unavailable" if submission_info.get("unavailable") else "available",
+        "reason": reason,
+        "source": source,
+        "payment_channel": payment_channel,
+        "pix_submit_mode": _safe_str(marker.get("pix_submit_mode") or raw_cdk.get("pix_submit_mode")),
+        "cdk_id": _safe_int(marker.get("cdk_id") or baxigpt_cdk.get("cdk_id")),
+        "code_masked": _safe_str(marker.get("code_masked") or baxigpt_cdk.get("code_masked")),
+        "task_id": _safe_str(marker.get("task_id") or baxigpt_cdk.get("task_id")),
+        "order_id": _safe_str(marker.get("order_id") or baxigpt_cdk.get("order_id")),
+        "display_id": _safe_str(marker.get("display_id") or baxigpt_cdk.get("display_id")),
+        "submitted_at": _safe_str(raw_cdk.get("submitted_at")),
+        "paid_at": _safe_str(raw_cdk.get("paid_at")),
+        "last_checked_at": _safe_str(raw_cdk.get("last_checked_at")),
+        "pix_submitted_at": _safe_str(payment_link.get("pix_submitted_at")),
+        "link_status_updated_at": _safe_str(payment_link.get("link_status_updated_at")),
     }
 
 
@@ -1261,6 +1333,8 @@ def _serialize_account_compact_item(
     validity_summary = _build_account_validity_summary(account, auth_summary, chatgpt_capabilities, codex_summary)
     baxigpt_cdk = _build_baxigpt_cdk_summary(extra.get("baxigpt_cdk") if isinstance(extra.get("baxigpt_cdk"), dict) else {})
     idea_submit = _build_idea_submit_summary(extra, baxigpt_cdk)
+    submission_info = account_submission_info(account, extra)
+    submission = _build_submission_summary(extra, baxigpt_cdk, submission_info)
     payment_link = account_payment_link_summary(account, extra)
     payload = {
         "id": account.id,
@@ -1291,6 +1365,9 @@ def _serialize_account_compact_item(
         "cliproxy": cliproxy_sync,
         "phone": _build_phone_summary(phone_binding, bound_phone, phone_challenge),
         "idea_submit": idea_submit,
+        "submission": submission,
+        "submit_state": submission["state"],
+        "has_submitted": bool(submission["has_submitted"]),
         "rate_limit": rate_limit,
         "rate_limit_started_at": rate_limit["started_at"],
         "rate_limit_recover_at": rate_limit["recover_at"],
@@ -1369,6 +1446,8 @@ def _serialize_account_compact_item(
         "phone_binding": _build_phone_summary(phone_binding, bound_phone, phone_challenge)["binding"],
         "baxigpt_cdk": baxigpt_cdk,
         "ideaSubmit": idea_submit,
+        "submitState": submission["state"],
+        "hasSubmitted": bool(submission["has_submitted"]),
         "sub2apiSync": sub2api_sync,
         "oaipaySync": oaipay_sync,
         "cliproxySync": cliproxy_sync,
@@ -1379,6 +1458,7 @@ def _serialize_account_compact_item(
             "chatgpt_phone_challenge": phone_challenge,
             "baxigpt_cdk": baxigpt_cdk,
             "idea_submit": idea_submit,
+            "submission": submission,
         },
     }
     return payload
@@ -1431,6 +1511,8 @@ def list_accounts(
     sub2api_state: Optional[str] = None,
     oaipay_state: Optional[str] = None,
     idea_submit_state: Optional[str] = None,
+    submit_state: Optional[str] = None,
+    has_submitted: Optional[str] = None,
     revival_state: Optional[str] = None,
     sort_by: Optional[str] = None,
     sort_order: Optional[str] = None,
@@ -1457,6 +1539,8 @@ def list_accounts(
             "sub2api_state": sub2api_state,
             "oaipay_state": oaipay_state,
             "idea_submit_state": idea_submit_state,
+            "submit_state": submit_state,
+            "has_submitted": has_submitted,
             "revival_state": revival_state,
             "sort_by": sort_by,
             "sort_order": sort_order,

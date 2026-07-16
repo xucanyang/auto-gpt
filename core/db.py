@@ -166,6 +166,8 @@ class AccountListStateModel(SQLModel, table=True):
     sub2api_state: str = Field(default="unknown", index=True)
     oaipay_state: str = Field(default="unknown", index=True)
     idea_submit_state: str = Field(default="available", index=True)
+    submit_state: str = Field(default="available", index=True)
+    has_submitted: bool = Field(default=False, index=True)
     revival_state: str = Field(default="none", index=True)
     revival_kind: str = Field(default="none", index=True)
     subscription_active_until: str = ""
@@ -3291,6 +3293,8 @@ def _ensure_account_list_state_schema() -> None:
                 sub2api_state TEXT NOT NULL DEFAULT 'unknown',
                 oaipay_state TEXT NOT NULL DEFAULT 'unknown',
                 idea_submit_state TEXT NOT NULL DEFAULT 'available',
+                submit_state TEXT NOT NULL DEFAULT 'available',
+                has_submitted INTEGER NOT NULL DEFAULT 0,
                 revival_state TEXT NOT NULL DEFAULT 'none',
                 revival_kind TEXT NOT NULL DEFAULT 'none',
                 subscription_active_until TEXT NOT NULL DEFAULT '',
@@ -3314,6 +3318,8 @@ def _ensure_account_list_state_schema() -> None:
             "sub2api_state": "TEXT NOT NULL DEFAULT 'unknown'",
             "oaipay_state": "TEXT NOT NULL DEFAULT 'unknown'",
             "idea_submit_state": "TEXT NOT NULL DEFAULT 'available'",
+            "submit_state": "TEXT NOT NULL DEFAULT 'available'",
+            "has_submitted": "INTEGER NOT NULL DEFAULT 0",
             "revival_state": "TEXT NOT NULL DEFAULT 'none'",
             "revival_kind": "TEXT NOT NULL DEFAULT 'none'",
             "subscription_active_until": "TEXT NOT NULL DEFAULT ''",
@@ -3371,6 +3377,14 @@ def _ensure_account_list_state_schema() -> None:
         conn.exec_driver_sql(
             "CREATE INDEX IF NOT EXISTS idx_account_list_state_idea_submit_state "
             "ON account_list_state(idea_submit_state)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_account_list_state_submit_state "
+            "ON account_list_state(submit_state)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_account_list_state_has_submitted "
+            "ON account_list_state(has_submitted)"
         )
         conn.exec_driver_sql(
             "CREATE INDEX IF NOT EXISTS idx_account_list_state_revival_state "
