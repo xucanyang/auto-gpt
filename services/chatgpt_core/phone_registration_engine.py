@@ -323,17 +323,13 @@ class PhoneRegistrationEngine:
                 mode_text = f"指定号段 {','.join(selected_prefixes)}"
             elif prefix_filter == "rejected":
                 records = repo.sample_rejected_by_prefix(prefix_sample_size)
-                mode_text = "仅 OpenAI 拒绝号段"
+                mode_text = "仅 OpenAI 拒绝号码"
             elif prefix_filter == "available":
                 records = repo.sample_available_by_prefix(prefix_sample_size)
-                mode_text = "仅可用号段"
+                mode_text = "仅号码自身可用"
             else:
                 records = repo.sample_testable_by_prefix(prefix_sample_size)
                 mode_text = "全部号段"
-            if records:
-                records = repo.restore_prefix_sample_records(
-                    [int(getattr(record, "id", 0) or 0) for record in records]
-                )
             self._log(f"[手机号注册] 使用号段抽样手机号池: {mode_text}，每段 {prefix_sample_size} 个，候选 {len(records)} 个")
         else:
             records = repo.list_available()

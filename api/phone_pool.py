@@ -208,9 +208,7 @@ def _phone_diagnostics(record: PhonePoolRecord) -> dict[str, Any]:
             f"本地已绑数 {int(record.bound_count or 0)}，账号记录中 bound 数 {len(bound_matches)}，建议同步已绑定数。",
         )
     if item.get("ordinary_task_eligible"):
-        add_note("success", "ready", "号码自身可用，号段也可用，普通绑定任务会选它。")
-    elif item.get("self_available") and item.get("ordinary_task_block_reason") == "prefix_unavailable":
-        add_note("warning", "prefix_unavailable", "号码自身可用，但所属号段已被 OpenAI 拒绝样本判定为不可用，普通绑定任务会跳过。")
+        add_note("success", "ready", "号码自身可用，普通绑定任务会选它；号段统计不会覆盖单号状态。")
 
     return {
         "ok": True,

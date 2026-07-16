@@ -132,7 +132,7 @@ const ACCOUNT_TOOLBAR_ACTION_OPTIONS: Array<{ value: AccountToolbarActionId; tex
 ]
 
 type PhonePoolMode = 'normal' | 'prefix_limited' | 'prefix_sample'
-type PhonePoolPrefixStatus = 'available' | 'unavailable' | 'temporary' | 'exhausted'
+type PhonePoolPrefixStatus = 'available' | 'partial' | 'unavailable' | 'temporary' | 'exhausted'
 type PhonePoolPrefixItem = {
   prefix: string
   status: PhonePoolPrefixStatus | string
@@ -230,6 +230,8 @@ type PhonePoolSummary = {
   exhausted?: number
   disabled?: number
   available_prefix_count?: number
+  healthy_prefix_count?: number
+  partial_prefix_count?: number
   available_prefix_sample_1?: number
   available_prefix_sample_2?: number
   prefix_sample_prefix_count?: number
@@ -240,6 +242,8 @@ type PhonePoolSummary = {
   rejected_prefix_sample_1?: number
   rejected_prefix_sample_2?: number
   available_prefixes?: Array<Record<string, unknown>>
+  healthy_prefixes?: Array<Record<string, unknown>>
+  partial_prefixes?: Array<Record<string, unknown>>
   rejected_prefixes?: Array<Record<string, unknown>>
   exhausted_prefix_count?: number
   exhausted_prefixes?: Array<Record<string, unknown>>
@@ -247,6 +251,7 @@ type PhonePoolSummary = {
   temporary_prefixes?: Array<Record<string, unknown>>
   prefix_health?: {
     available?: Array<Record<string, unknown>>
+    partial?: Array<Record<string, unknown>>
     unavailable?: Array<Record<string, unknown>>
     exhausted?: Array<Record<string, unknown>>
     temporary?: Array<Record<string, unknown>>
@@ -4227,7 +4232,7 @@ export default function Accounts() {
         content: prefixBind?.enabled
           ? `限定号段绑定已启动：${Number(prefixBind.prefix_count || 0)} 个号段，${phoneCount} 个号码，${eligible} 个账号${smsProbeOnly ? '，仅测发码/收码' : ''}`
           : prefixSample?.enabled
-            ? `号段抽样已启动：${Array.isArray(prefixSample.requested_prefixes) && prefixSample.requested_prefixes.length > 0 ? '指定号段，' : String(prefixSample.filter || 'all') === 'rejected' ? '仅不可用号段，' : ''}${Number(prefixSample.prefix_count || 0)} 个号段，${phoneCount} 个号码，${eligible} 个账号${smsProbeOnly ? '，仅测发码/收码' : ''}`
+            ? `号段抽样已启动：${Array.isArray(prefixSample.requested_prefixes) && prefixSample.requested_prefixes.length > 0 ? '指定号段，' : String(prefixSample.filter || 'all') === 'rejected' ? '仅失败样本，' : ''}${Number(prefixSample.prefix_count || 0)} 个号段，${phoneCount} 个号码，${eligible} 个账号${smsProbeOnly ? '，仅测发码/收码' : ''}`
             : `${smsProbeOnly ? '手机号发码/收码探测已启动' : '手机号绑定已启动'}：${phoneCount} 个号码，${eligible} 个账号${parseErrors.length > 0 ? `，解析跳过 ${parseErrors.length} 行` : ''}`,
         key: toastKey,
       })
@@ -7499,11 +7504,17 @@ export default function Accounts() {
         key: 'available' as const,
         label: '可用',
         color: 'success',
-        items: uniquePhonePoolPrefixItems(health.available || summary.available_prefixes, 'available'),
+        items: uniquePhonePoolPrefixItems(health.available || summary.healthy_prefixes || summary.available_prefixes, 'available'),
+      },
+      {
+        key: 'partial' as const,
+        label: '部分可用',
+        color: 'cyan',
+        items: uniquePhonePoolPrefixItems(health.partial || summary.partial_prefixes, 'partial'),
       },
       {
         key: 'unavailable' as const,
-        label: '不可用',
+        label: '无可用号码',
         color: 'error',
         items: uniquePhonePoolPrefixItems(health.unavailable || summary.rejected_prefixes, 'unavailable'),
       },
@@ -8473,7 +8484,7 @@ export default function Accounts() {
                 </Space>
                 <Text type="secondary" style={{ fontSize: 12 }}>
                   {phoneBindingPrefixBindEnabled
-                    ? `只使用所选号段正式绑定；当前选择 ${phoneBindingSelectedPrefixes.length} 个号段，可覆盖 ${phoneBindingLimitedCapacity} 个账号`
+                    ? `已选 ${phoneBindingSelectedPrefixes.length} 个号段，实际可用 ${phoneBindingLimitedAvailablePhones} 个号码，可分配 ${phoneBindingLimitedCapacity} 个账号`
                     : phoneBindingPrefixSampleEnabled
                       ? phoneBindingSelectedPrefixes.length > 0
                         ? `按所选号段抽样，预计测试 ${phoneBindingSummarySampleCount} 个号码`
@@ -8603,8 +8614,8 @@ export default function Accounts() {
                       disabled={phoneBindingSelectedPrefixes.length > 0}
                       options={[
                         { label: '全部号段', value: 'all' },
-                        { label: '测试可用号段', value: 'available' },
-                        { label: '仅不可用号段', value: 'rejected' },
+                        { label: '抽样可用号码', value: 'available' },
+                        { label: '仅失败样本', value: 'rejected' },
                       ]}
                     />
                   </Form.Item>
@@ -8612,9 +8623,9 @@ export default function Accounts() {
                     {phoneBindingSelectedPrefixes.length > 0
                       ? '已手动选择号段，抽样范围筛选本次不参与。'
                       : phoneBindingPrefixSampleFilter === 'available'
-                        ? '只从当前可用号段每段抽 1/2 个号码。'
+                        ? '只从号码自身可用的候选中每段抽 1/2 个号码。'
                         : phoneBindingPrefixSampleFilter === 'rejected'
-                          ? '只复测 OpenAI 拒绝过的号段。'
+                          ? '只复测有 OpenAI 拒绝记录的号码。'
                           : '从全部号段按每段 1/2 个号码抽样。'}
                   </Text>
                 </div>
@@ -8629,12 +8640,12 @@ export default function Accounts() {
               style={{ marginBottom: 12 }}
               message={phoneBindingPrefixSampleEnabled
                 ? phoneBindingPrefixSampleFilter === 'available'
-                  ? '手机号池没有可测试的可用号段，请先启用/导入不含 OpenAI 拒绝记录的号码。'
+                  ? '手机号池没有可测试的可用号码，请先启用或导入号码。'
                   : phoneBindingPrefixSampleFilter === 'rejected'
-                  ? '手机号池没有可复测的 OpenAI 拒绝号段，请先确认存在被 OpenAI 明确拒绝的号码。'
+                  ? '手机号池没有可复测的 OpenAI 拒绝号码。'
                   : '手机号池没有可用于号段抽样的号码，请先启用/导入带 API 且未绑满的号码。'
                 : phoneBindingPrefixBindEnabled
-                ? '所选号段当前没有可用绑定容量；可以继续提交让后端按实时数据判定，或改选其他号段。'
+                ? '所选号段当前没有单号可用绑定容量。'
                 : '手机号池没有可用绑定容量，请先导入/重置号码，或展开临时粘贴号码。'}
             />
           ) : phoneBindingPoolShortage ? (
@@ -8643,7 +8654,7 @@ export default function Accounts() {
               showIcon
               style={{ marginBottom: 12 }}
               message={phoneBindingPrefixBindEnabled
-                ? `所选号段容量可能不足：当前范围 ${phoneBindingTargetCount} 个账号，所选号段可覆盖 ${phoneBindingLimitedCapacity}`
+                ? `所选号段容量不足：当前范围 ${phoneBindingTargetCount} 个账号，单号实际可分配 ${phoneBindingLimitedCapacity}`
                 : `手机号池容量不足：当前范围 ${phoneBindingTargetCount} 个账号，剩余绑定容量 ${phoneBindingSummaryRemaining}`}
             />
           ) : null}

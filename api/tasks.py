@@ -3674,10 +3674,6 @@ def enqueue_phone_binding_test_task(
             sampled_records = pool_repo.sample_available_by_prefix(prefix_sample_size)
         else:
             sampled_records = pool_repo.sample_testable_by_prefix(prefix_sample_size)
-        if account_items and sampled_records:
-            sampled_records = pool_repo.restore_prefix_sample_records(
-                [int(getattr(record, "id", 0) or 0) for record in sampled_records]
-            )
         try:
             phone_items = [_resolve_phone_binding_item_api(item) for item in pool_repo.to_phone_items(sampled_records)]
         except Exception as exc:
@@ -3713,9 +3709,9 @@ def enqueue_phone_binding_test_task(
                 f"指定号段没有可抽样号码：{','.join(requested_prefixes)}。请确认这些号段存在未停用、未绑满且带 API 的手机号。"
                 if requested_prefixes
                 else
-                "手机号池没有可用于复测的 OpenAI 拒绝号段。请先在手机号池确认存在 OpenAI 拒绝记录。"
+                "手机号池没有可用于复测的 OpenAI 拒绝号码。请先在手机号池确认存在单号拒绝记录。"
                 if prefix_sample_filter == "rejected"
-                else "手机号池没有可测试的可用号段，请先启用/导入不含 OpenAI 拒绝记录的号码。"
+                else "手机号池没有可测试的自身可用号码，请先启用或导入号码。"
                 if prefix_sample_filter == "available"
                 else "手机号池没有可用于号段抽样的号码（当前号码可能已停用、缺少 API 或已达到本地绑定容量）。请先在手机号池启用/导入可测试号码。"
             )
@@ -3751,7 +3747,7 @@ def enqueue_phone_binding_test_task(
             raise HTTPException(
                 400,
                 f"指定号段没有可用绑定号码：{','.join(requested_prefixes)}。"
-                "请确认这些号段存在未停用、未绑满、带 API 且未被普通绑定策略跳过的手机号。",
+                "请确认这些号段存在自身 active、未冷却、未绑满且带 API 的手机号。",
             )
         if account_items and available_slot_count < len(account_items):
             raise HTTPException(
@@ -11233,33 +11229,35 @@ def _build_phone_prefix_sample_summary(
             elif status in unavailable_statuses:
                 outcomes[phone] = "unavailable"
 
-    status_counts = {
-        "available": 0,
-        "unavailable": 0,
-        "partial": 0,
+    assessment_counts = {
+        "positive_sample": 0,
+        "negative_sample": 0,
+        "mixed_sample": 0,
         "untested": 0,
     }
     items: list[dict[str, Any]] = []
-    unavailable_prefixes: list[str] = []
+    negative_sample_prefixes: list[str] = []
     for prefix in sorted(selected_by_prefix):
         phones = selected_by_prefix[prefix]
         available_count = sum(1 for phone in phones if outcomes.get(phone) == "available")
         unavailable_count = sum(1 for phone in phones if outcomes.get(phone) == "unavailable")
         untested_count = max(len(phones) - available_count - unavailable_count, 0)
         if available_count > 0 and unavailable_count > 0:
-            status = "partial"
+            assessment = "mixed_sample"
         elif available_count > 0:
-            status = "available"
+            assessment = "positive_sample"
         elif unavailable_count > 0:
-            status = "unavailable"
-            unavailable_prefixes.append(prefix)
+            assessment = "negative_sample"
+            negative_sample_prefixes.append(prefix)
         else:
-            status = "untested"
-        status_counts[status] += 1
+            assessment = "untested"
+        assessment_counts[assessment] += 1
         items.append(
             {
                 "prefix": prefix,
-                "status": status,
+                "status": assessment,
+                "assessment": assessment,
+                "sample_only": True,
                 "selected_count": len(phones),
                 "tested_count": available_count + unavailable_count,
                 "available_count": available_count,
@@ -11269,15 +11267,25 @@ def _build_phone_prefix_sample_summary(
             }
         )
 
+    positive_count = assessment_counts["positive_sample"]
+    negative_count = assessment_counts["negative_sample"]
+    mixed_count = assessment_counts["mixed_sample"]
     return {
+        "sample_only": True,
         "prefix_count": len(items),
         "selected_phone_count": len(selected_phones),
         "tested_phone_count": sum(1 for phone in selected_phones if phone in outcomes),
-        "available_prefix_count": status_counts["available"],
-        "unavailable_prefix_count": status_counts["unavailable"],
-        "partial_prefix_count": status_counts["partial"],
-        "untested_prefix_count": status_counts["untested"],
-        "unavailable_prefixes": unavailable_prefixes,
+        "positive_sample_prefix_count": positive_count,
+        "negative_sample_prefix_count": negative_count,
+        "mixed_sample_prefix_count": mixed_count,
+        "untested_prefix_count": assessment_counts["untested"],
+        "negative_sample_prefixes": negative_sample_prefixes,
+        # Compatibility aliases for historical task-detail readers. These are
+        # sample outcomes, not authoritative prefix eligibility decisions.
+        "available_prefix_count": positive_count,
+        "unavailable_prefix_count": negative_count,
+        "partial_prefix_count": mixed_count,
+        "unavailable_prefixes": negative_sample_prefixes,
         "items": items,
     }
 
@@ -13131,9 +13139,9 @@ def _run_phone_binding_test(
             sample_filter_label = (
                 f"指定号段 {','.join(selected_prefixes)}"
                 if selected_prefixes
-                else "测试可用号段"
+                else "抽样号码自身可用候选"
                 if prefix_sample_filter == "available"
-                else "仅复测 OpenAI 拒绝号段"
+                else "仅复测 OpenAI 拒绝号码"
                 if prefix_sample_filter == "rejected"
                 else "全部号段"
             )
@@ -14015,23 +14023,35 @@ def _run_phone_binding_test(
             _log(
                 task_id,
                 "[手机号绑定][号段抽样] 汇总"
-                f"｜可用={prefix_summary['available_prefix_count']}"
-                f"｜不可用={prefix_summary['unavailable_prefix_count']}"
-                f"｜部分可用={prefix_summary['partial_prefix_count']}"
+                f"｜成功样本={prefix_summary['positive_sample_prefix_count']}"
+                f"｜失败样本={prefix_summary['negative_sample_prefix_count']}"
+                f"｜结果混合={prefix_summary['mixed_sample_prefix_count']}"
                 f"｜未测试={prefix_summary['untested_prefix_count']}",
             )
+            assessment_labels = {
+                "positive_sample": "样本成功",
+                "negative_sample": "样本失败",
+                "mixed_sample": "样本混合",
+                "untested": "未测试",
+            }
             for prefix_item in prefix_summary["items"]:
+                assessment = str(prefix_item.get("assessment") or prefix_item.get("status") or "untested")
                 _log(
                     task_id,
-                    "[手机号绑定][号段抽样] 号段结果"
+                    "[手机号绑定][号段抽样] 样本结果"
                     f"｜号段={prefix_item['prefix']}"
-                    f"｜状态={prefix_item['status']}"
-                    f"｜可用={prefix_item['available_count']}"
-                    f"｜不可用={prefix_item['unavailable_count']}"
+                    f"｜状态={assessment_labels.get(assessment, assessment)}"
+                    f"｜成功={prefix_item['available_count']}"
+                    f"｜失败={prefix_item['unavailable_count']}"
                     f"｜未测试={prefix_item['untested_count']}",
                 )
-            if prefix_summary["unavailable_prefixes"]:
-                _log(task_id, f"[手机号绑定][号段抽样] 不可用号段｜号段={','.join(prefix_summary['unavailable_prefixes'])}")
+            if prefix_summary["negative_sample_prefixes"]:
+                _log(
+                    task_id,
+                    "[手机号绑定][号段抽样] 失败样本号段"
+                    f"｜号段={','.join(prefix_summary['negative_sample_prefixes'])}"
+                    "｜结论=仅代表本次抽样号码",
+                )
         if runtime_results:
             _log(task_id, f"[手机号绑定][汇总] 结果表已生成｜总数={len(runtime_results)}｜成功绑定={len(bound_phone_results)}")
         else:
@@ -16070,14 +16090,19 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                 _log(
                     task_id,
                     "[手机号注册号段] 汇总: "
-                    f"可注册 {int(prefix_summary.get('available_prefix_count') or 0)}，"
-                    f"不可注册 {int(prefix_summary.get('unavailable_prefix_count') or 0)}，"
-                    f"部分 {int(prefix_summary.get('partial_prefix_count') or 0)}，"
+                    f"成功样本 {int(prefix_summary.get('positive_sample_prefix_count') or 0)}，"
+                    f"失败样本 {int(prefix_summary.get('negative_sample_prefix_count') or 0)}，"
+                    f"结果混合 {int(prefix_summary.get('mixed_sample_prefix_count') or 0)}，"
                     f"未测试 {int(prefix_summary.get('untested_prefix_count') or 0)}；"
                     "仅更新注册号段状态，不改手机号自身状态",
                 )
-                if prefix_summary.get("unavailable_prefixes"):
-                    _log(task_id, f"[手机号注册号段] 不可注册号段: {','.join(prefix_summary.get('unavailable_prefixes') or [])}")
+                if prefix_summary.get("negative_sample_prefixes"):
+                    _log(
+                        task_id,
+                        "[手机号注册号段] 失败样本号段: "
+                        f"{','.join(prefix_summary.get('negative_sample_prefixes') or [])}；"
+                        "仅代表本次抽样号码",
+                    )
         except Exception as prefix_exc:
             _log(task_id, f"[手机号注册号段] 汇总日志失败: {prefix_exc}", "debug")
     _task_store.finish(

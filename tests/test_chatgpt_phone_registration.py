@@ -360,10 +360,6 @@ class PhoneRegistrationEngineTests(unittest.TestCase):
                 calls.append(("sample_testable_by_prefix", size))
                 return records
 
-            def restore_prefix_sample_records(self, record_ids):
-                calls.append(("restore_prefix_sample_records", record_ids))
-                return records
-
             def to_phone_items(self, sample_records, *, limit_accounts=0, expand_capacity=False):
                 calls.append(("to_phone_items", list(sample_records), limit_accounts, expand_capacity))
                 return [
@@ -396,8 +392,13 @@ class PhoneRegistrationEngineTests(unittest.TestCase):
 
         self.assertTrue(service.enabled)
         self.assertEqual(len(engine._uploaded_entries), 3)
-        self.assertEqual(calls[0], ("sample_testable_by_prefix", 2))
-        self.assertEqual(calls[-1], ("to_phone_items", records, 0, False))
+        self.assertEqual(
+            calls,
+            [
+                ("sample_testable_by_prefix", 2),
+                ("to_phone_items", records, 0, False),
+            ],
+        )
 
     def test_phone_signup_browser_error_before_sms_bubbles_for_proxy_failover(self):
         class CsrfBlockedClient(FakePhoneSignupClient):

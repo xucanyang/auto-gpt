@@ -519,7 +519,7 @@ class PhonePoolTaskIntegrationTests(unittest.TestCase):
         self.assertTrue(queued_settings["prefix_sms_probe_only"])
         self.assertFalse(queued_settings["reuse_phone_until_unusable"])
 
-    def test_prefix_sample_mode_uses_fixed_pool_items_and_disables_phone_reuse(self):
+    def test_prefix_sample_mode_uses_fixed_pool_items_without_pre_restore(self):
         created_meta = {}
 
         class _BackgroundTasks:
@@ -546,10 +546,6 @@ class PhonePoolTaskIntegrationTests(unittest.TestCase):
         class _FakeRepo:
             def sample_testable_by_prefix(self, sample_size):
                 self.sample_size = sample_size
-                return sampled_records
-
-            def restore_prefix_sample_records(self, record_ids):
-                self.record_ids = record_ids
                 return sampled_records
 
             def to_phone_items(self, records):
@@ -643,10 +639,6 @@ class PhonePoolTaskIntegrationTests(unittest.TestCase):
                 self.sample_size = sample_size
                 return sampled_records
 
-            def restore_prefix_sample_records(self, record_ids):
-                self.record_ids = record_ids
-                return sampled_records
-
             def to_phone_items(self, records):
                 return [
                     {
@@ -733,10 +725,6 @@ class PhonePoolTaskIntegrationTests(unittest.TestCase):
             def sample_rejected_by_prefix(self, sample_size):
                 calls["rejected"] += 1
                 return []
-
-            def restore_prefix_sample_records(self, record_ids):
-                self.record_ids = record_ids
-                return sampled_records
 
             def to_phone_items(self, records):
                 return [
@@ -828,10 +816,6 @@ class PhonePoolTaskIntegrationTests(unittest.TestCase):
                 calls["selected"] += 1
                 self.prefixes = prefixes
                 self.sample_size = sample_size
-                return sampled_records
-
-            def restore_prefix_sample_records(self, record_ids):
-                self.record_ids = record_ids
                 return sampled_records
 
             def to_phone_items(self, records):
@@ -1053,7 +1037,7 @@ class PhonePoolTaskIntegrationTests(unittest.TestCase):
 
         snapshot = _task_store.snapshot(task_id)
         self.assertEqual(snapshot["status"], "done")
-        self.assertTrue(any("仅复测 OpenAI 拒绝号段" in line for line in snapshot["logs"]))
+        self.assertTrue(any("仅复测 OpenAI 拒绝号码" in line for line in snapshot["logs"]))
 
 
     def test_prefix_sample_summary_treats_phone_signup_success_as_available(self):
@@ -1063,9 +1047,10 @@ class PhonePoolTaskIntegrationTests(unittest.TestCase):
             phone_signup=True,
         )
 
-        self.assertEqual(summary["available_prefix_count"], 1)
-        self.assertEqual(summary["unavailable_prefix_count"], 0)
-        self.assertEqual(summary["items"][0]["status"], "available")
+        self.assertTrue(summary["sample_only"])
+        self.assertEqual(summary["positive_sample_prefix_count"], 1)
+        self.assertEqual(summary["negative_sample_prefix_count"], 0)
+        self.assertEqual(summary["items"][0]["status"], "positive_sample")
 
     def test_phone_signup_prefix_summary_only_treats_fraud_guard_as_unavailable(self):
         phone_items = [
@@ -1093,10 +1078,10 @@ class PhonePoolTaskIntegrationTests(unittest.TestCase):
 
         summary = _build_phone_prefix_sample_summary(phone_items, runtime_results, phone_signup=True)
 
-        self.assertEqual(summary["available_prefix_count"], 0)
-        self.assertEqual(summary["unavailable_prefix_count"], 1)
+        self.assertEqual(summary["positive_sample_prefix_count"], 0)
+        self.assertEqual(summary["negative_sample_prefix_count"], 1)
         self.assertEqual(summary["untested_prefix_count"], 2)
-        self.assertEqual(summary["unavailable_prefixes"], ["1437"])
+        self.assertEqual(summary["negative_sample_prefixes"], ["1437"])
 
     def test_prefix_sample_summary_distinguishes_all_four_prefix_states(self):
         phone_items = [
@@ -1118,20 +1103,20 @@ class PhonePoolTaskIntegrationTests(unittest.TestCase):
 
         summary = _build_phone_prefix_sample_summary(phone_items, runtime_results)
 
-        self.assertEqual(summary["available_prefix_count"], 2)
-        self.assertEqual(summary["unavailable_prefix_count"], 1)
-        self.assertEqual(summary["partial_prefix_count"], 0)
+        self.assertEqual(summary["positive_sample_prefix_count"], 2)
+        self.assertEqual(summary["negative_sample_prefix_count"], 1)
+        self.assertEqual(summary["mixed_sample_prefix_count"], 0)
         self.assertEqual(summary["untested_prefix_count"], 1)
-        self.assertEqual(summary["unavailable_prefixes"], ["1343"])
+        self.assertEqual(summary["negative_sample_prefixes"], ["1343"])
         self.assertEqual(summary["tested_phone_count"], 5)
 
         partial = _build_phone_prefix_sample_summary(
             phone_items,
             runtime_results + [{"phone": "+13430000002", "status": "bound"}],
         )
-        self.assertEqual(partial["unavailable_prefix_count"], 0)
-        self.assertEqual(partial["partial_prefix_count"], 1)
-        self.assertEqual(partial["unavailable_prefixes"], [])
+        self.assertEqual(partial["negative_sample_prefix_count"], 0)
+        self.assertEqual(partial["mixed_sample_prefix_count"], 1)
+        self.assertEqual(partial["negative_sample_prefixes"], [])
 
 
 if __name__ == "__main__":

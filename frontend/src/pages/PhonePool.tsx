@@ -69,6 +69,10 @@ type PhonePoolSummary = {
   cooldown?: number
   exhausted?: number
   disabled?: number
+  healthy_prefix_count?: number
+  healthy_prefixes?: PhonePoolPrefixItem[]
+  partial_prefix_count?: number
+  partial_prefixes?: PhonePoolPrefixItem[]
   available_prefixes?: PhonePoolPrefixItem[]
   rejected_phone_count?: number
   rejected_prefix_count?: number
@@ -79,6 +83,7 @@ type PhonePoolSummary = {
   temporary_prefixes?: PhonePoolPrefixItem[]
   prefix_health?: {
     available?: PhonePoolPrefixItem[]
+    partial?: PhonePoolPrefixItem[]
     unavailable?: PhonePoolPrefixItem[]
     exhausted?: PhonePoolPrefixItem[]
     temporary?: PhonePoolPrefixItem[]
@@ -115,7 +120,7 @@ type PhonePoolPrefixItem = {
 type PhonePoolBatchAction = 'delete' | 'reset' | 'disable'
 type ApiExpiryRefreshScope = 'selected' | 'page' | 'record' | 'all'
 type ApiExpiryFilter = '' | 'unchecked' | 'ok' | 'missing' | 'error' | 'expired' | 'soon7' | 'soon30'
-type TaskEligibilityFilter = '' | 'eligible' | 'prefix_blocked' | 'self_blocked'
+type TaskEligibilityFilter = '' | 'eligible' | 'self_blocked'
 type PhoneBindingFilter = '' | 'bound' | 'unbound'
 
 type PhonePoolDiagnostics = {
@@ -211,7 +216,6 @@ const API_EXPIRY_FILTER_OPTIONS = [
 const TASK_ELIGIBILITY_FILTER_OPTIONS = [
   { value: '', label: '全部任务状态' },
   { value: 'eligible', label: '普通任务可选' },
-  { value: 'prefix_blocked', label: '号段跳过' },
   { value: 'self_blocked', label: '自身不可用' },
 ] as const
 
@@ -223,7 +227,8 @@ const PHONE_BINDING_FILTER_OPTIONS = [
 
 const PREFIX_STATUS_META: Record<string, { color: string; label: string }> = {
   available: { color: 'success', label: '号段可用' },
-  unavailable: { color: 'error', label: '号段不可用' },
+  partial: { color: 'cyan', label: '号段部分可用' },
+  unavailable: { color: 'error', label: '号段暂无可用号' },
   exhausted: { color: 'default', label: '号段绑满' },
   temporary: { color: 'warning', label: '暂不可用' },
   unknown: { color: 'default', label: '号段未知' },
@@ -389,12 +394,12 @@ function taskEligibilityBlock(record: PhonePoolItem, compact = false) {
   const reasonLabel = TASK_BLOCK_REASON_LABELS[reason] || reason || ''
   return (
     <Space direction="vertical" size={compact ? 1 : 2}>
-      <Tag color={eligible ? 'success' : reason.startsWith('prefix_') ? 'warning' : 'default'}>
+      <Tag color={eligible ? 'success' : 'default'}>
         {eligible ? '普通可选' : '普通跳过'}
       </Tag>
       {!eligible || !compact ? (
-        <Typography.Text type={eligible ? 'secondary' : reason.startsWith('prefix_') ? 'warning' : 'secondary'} style={{ fontSize: compact ? 11 : 12, lineHeight: '16px' }}>
-          {eligible ? '号段可用 + 自身可用' : reasonLabel || '暂不选择'}
+        <Typography.Text type="secondary" style={{ fontSize: compact ? 11 : 12, lineHeight: '16px' }}>
+          {eligible ? '号码自身可用' : reasonLabel || '暂不选择'}
         </Typography.Text>
       ) : null}
     </Space>
@@ -1177,11 +1182,15 @@ export default function PhonePool() {
       .filter((item) => item.prefix.length === 4 && (item.count > 0 || item.total > 0 || item.available_count > 0 || item.rejected_count > 0 || item.success_count > 0 || item.failure_count > 0))
   }, [])
   const availablePrefixes = useMemo(() => {
-    const raw = summary.prefix_health?.available || summary.available_prefixes
+    const raw = summary.prefix_health?.available || summary.healthy_prefixes || summary.available_prefixes
     return raw
       ? normalizePrefixItems(raw)
       : []
-  }, [normalizePrefixItems, summary.available_prefixes, summary.prefix_health?.available])
+  }, [normalizePrefixItems, summary.available_prefixes, summary.healthy_prefixes, summary.prefix_health?.available])
+  const partialPrefixes = useMemo(() => {
+    const raw = summary.prefix_health?.partial || summary.partial_prefixes
+    return raw ? normalizePrefixItems(raw) : []
+  }, [normalizePrefixItems, summary.partial_prefixes, summary.prefix_health?.partial])
   const rejectedPrefixes = useMemo(() => {
     const raw = summary.prefix_health?.unavailable || summary.rejected_prefixes
     return raw ? normalizePrefixItems(raw) : []
@@ -1209,7 +1218,6 @@ export default function PhonePool() {
       if (!matchesPhoneBindingFilter(item, phoneBindingFilter)) return false
       if (!matchesApiExpiryFilter(item, apiExpiryFilter)) return false
       if (taskEligibilityFilter === 'eligible') return Boolean(item.ordinary_task_eligible)
-      if (taskEligibilityFilter === 'prefix_blocked') return Boolean(item.self_available) && String(item.ordinary_task_block_reason || '').startsWith('prefix_')
       if (taskEligibilityFilter === 'self_blocked') return !item.self_available
       return true
     })
@@ -1676,18 +1684,30 @@ export default function PhonePool() {
         border: token.colorSuccessBorder,
         background: token.colorSuccessBg,
         tagColor: 'green',
-        summary: `普通绑定可用容量 ${remainingCapacity}`,
+        summary: '单号可用 ' + availableCount + '，可分配容量 ' + remainingCapacity,
         empty: '暂无健康可用号段',
-        renderDetail: (item) => `可用 ${item.available_count} / 容量 ${item.remaining_capacity}`,
+        renderDetail: (item) => '可用 ' + item.available_count + ' / 容量 ' + item.remaining_capacity,
       })}
 
-      {renderPrefixBlock('不可用号段', rejectedPrefixes, {
+      {partialPrefixes.length > 0 ? renderPrefixBlock('部分可用号段', partialPrefixes, {
+        border: token.colorInfoBorder,
+        background: token.colorInfoBg,
+        tagColor: 'cyan',
+        summary: '单号状态混合：可用 '
+          + partialPrefixes.reduce((sum, item) => sum + Number(item.available_count || 0), 0)
+          + '，拒绝 '
+          + partialPrefixes.reduce((sum, item) => sum + Number(item.rejected_count || 0), 0),
+        empty: '暂无部分可用号段',
+        renderDetail: (item) => '可用 ' + item.available_count + ' / 拒绝 ' + item.rejected_count + ' / 容量 ' + item.remaining_capacity,
+      }) : null}
+
+      {renderPrefixBlock('暂无可用号码的号段', rejectedPrefixes, {
         border: token.colorErrorBorder,
         background: token.colorErrorBg,
         tagColor: 'red',
-        summary: `OpenAI 拒绝 ${rejectedPhoneCount} 个号码，普通绑定已跳过这些号段`,
-        empty: '暂无 OpenAI 拒绝号段',
-        renderDetail: (item) => `拒绝 ${item.rejected_count} / 号码可用 ${item.available_count} / 容量 ${item.remaining_capacity}`,
+        summary: '全池当前有 ' + rejectedPhoneCount + ' 个 OpenAI 单号拒绝记录',
+        empty: '暂无无可用号码的号段',
+        renderDetail: (item) => '单号拒绝 ' + item.rejected_count + ' / 实际可用 ' + item.available_count + ' / 容量 ' + item.remaining_capacity,
       })}
 
       {signupAvailablePrefixes.length > 0 ? renderPrefixBlock('可注册号段', signupAvailablePrefixes, {

@@ -62,9 +62,9 @@ function phoneStatusColor(status: string) {
 }
 
 function prefixStatusMeta(status: string) {
-  if (status === 'available') return { label: '可用', color: 'success' }
-  if (status === 'unavailable') return { label: '不可用', color: 'error' }
-  if (status === 'partial') return { label: '部分可用', color: 'warning' }
+  if (status === 'positive_sample' || status === 'available') return { label: '样本成功', color: 'success' }
+  if (status === 'negative_sample' || status === 'unavailable') return { label: '样本失败', color: 'error' }
+  if (status === 'mixed_sample' || status === 'partial') return { label: '样本混合', color: 'warning' }
   return { label: '未测试', color: 'default' }
 }
 
@@ -137,7 +137,7 @@ const prefixSummaryColumns = [
     render: (value: string) => <Text copyable>{value || '-'}</Text>,
   },
   {
-    title: '结论',
+    title: '样本结果',
     dataIndex: 'status',
     width: 100,
     render: (value: string) => {
@@ -146,8 +146,8 @@ const prefixSummaryColumns = [
     },
   },
   { title: '抽样', dataIndex: 'selected_count', width: 70 },
-  { title: '可用', dataIndex: 'available_count', width: 70 },
-  { title: '不可用', dataIndex: 'unavailable_count', width: 80 },
+  { title: '成功', dataIndex: 'available_count', width: 70 },
+  { title: '失败', dataIndex: 'unavailable_count', width: 70 },
   { title: '未测试', dataIndex: 'untested_count', width: 80 },
   {
     title: '抽样号码',
@@ -190,12 +190,14 @@ export function PhoneBindingResultsTable({
   const safeResults = Array.isArray(results) ? results : []
   const safeSummary = prefixSummary && typeof prefixSummary === 'object' ? prefixSummary : {}
   const prefixSummaryItems = Array.isArray(safeSummary?.items) ? safeSummary.items : []
-  const availablePrefixes = prefixSummaryItems
-    .filter((item: any) => String(item?.status || '') === 'available')
+  const positiveSamplePrefixes = prefixSummaryItems
+    .filter((item: any) => ['positive_sample', 'available'].includes(String(item?.assessment || item?.status || '')))
     .map((item: any) => String(item?.prefix || '').trim())
     .filter(Boolean)
-  const unavailablePrefixes = Array.isArray(safeSummary?.unavailable_prefixes)
-    ? safeSummary.unavailable_prefixes.map((value: unknown) => String(value || '').trim()).filter(Boolean)
+  const negativeSamplePrefixes = Array.isArray(safeSummary?.negative_sample_prefixes)
+    ? safeSummary.negative_sample_prefixes.map((value: unknown) => String(value || '').trim()).filter(Boolean)
+    : Array.isArray(safeSummary?.unavailable_prefixes)
+      ? safeSummary.unavailable_prefixes.map((value: unknown) => String(value || '').trim()).filter(Boolean)
     : []
   const successfulPhones = safeResults
     .filter((item: any) => ['bound', 'registered_phone_signup'].includes(String(item?.status || '')) && String(item?.phone || '').trim())
@@ -217,25 +219,25 @@ export function PhoneBindingResultsTable({
       {hasPrefixSummary ? (
         <>
           <Space wrap size={[4, 6]}>
-            <Tag color="success">可用 {Number(safeSummary?.available_prefix_count || 0)}</Tag>
-            <Tag color="error">不可用 {Number(safeSummary?.unavailable_prefix_count || 0)}</Tag>
-            <Tag color="warning">部分可用 {Number(safeSummary?.partial_prefix_count || 0)}</Tag>
+            <Tag color="success">成功样本 {Number(safeSummary?.positive_sample_prefix_count ?? safeSummary?.available_prefix_count ?? 0)}</Tag>
+            <Tag color="error">失败样本 {Number(safeSummary?.negative_sample_prefix_count ?? safeSummary?.unavailable_prefix_count ?? 0)}</Tag>
+            <Tag color="warning">样本混合 {Number(safeSummary?.mixed_sample_prefix_count ?? safeSummary?.partial_prefix_count ?? 0)}</Tag>
             <Tag>未测试 {Number(safeSummary?.untested_prefix_count || 0)}</Tag>
             <Button
               size="small"
               icon={<CopyOutlined />}
-              disabled={availablePrefixes.length === 0}
-              onClick={() => copyText(availablePrefixes.join(','), '可用号段（逗号分隔）')}
+              disabled={positiveSamplePrefixes.length === 0}
+              onClick={() => copyText(positiveSamplePrefixes.join(','), '有成功样本的号段（逗号分隔）')}
             >
-              复制可用号段
+              复制成功样本号段
             </Button>
             <Button
               size="small"
               icon={<CopyOutlined />}
-              disabled={unavailablePrefixes.length === 0}
-              onClick={() => copyText(unavailablePrefixes.join(','), '不可用号段（逗号分隔）')}
+              disabled={negativeSamplePrefixes.length === 0}
+              onClick={() => copyText(negativeSamplePrefixes.join(','), '有失败样本的号段（逗号分隔）')}
             >
-              复制不可用号段
+              复制失败样本号段
             </Button>
           </Space>
           {prefixSummaryItems.length > 0 ? (

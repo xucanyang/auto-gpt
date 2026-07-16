@@ -4,6 +4,22 @@
 
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，并且本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/) (语义化版本)。
 
+## [2.2.15] - 2026-07-17
+
+### 新增 (Added)
+- **号段部分可用状态**：`services/chatgpt_core/phone_pool_repository.py` 的四位号段统计新增 `partial` 分组，明确展示同段内同时存在可用、拒绝或临时受限单号的真实混合状态。手机号池页与账号页绑定面板同步展示“部分可用”，并分别列出实际可用单号数、拒绝记录数和剩余账号容量。
+
+### 优化 (Changed)
+- **号段只作为相关性统计**：普通绑定和限定号段绑定的资格统一按具体号码判断，只接收自身为 `active`、未冷却、未绑满且带有效 API 的号码。限定号段模式仍严格限制在运营所选的前四位范围内，但同段其他号码的成功或失败不再覆盖当前号码状态；账号页按真实单号数及是否允许复用计算可分配账号容量。
+- **抽样结果改为样本口径**：`api/tasks.py` 与 `PhoneBindingResultsTable.tsx` 将号段抽样结果统一为“成功样本 / 失败样本 / 样本混合 / 未测试”，并保留旧字段别名供历史任务详情兼容读取。抽样日志和复制按钮不再把一两个号码的结果描述成整个号段确定可用或不可用。
+
+### 修复 (Fixed)
+- **阻止单号结果污染整段库存**：`record_prefix_unavailable()` 保留兼容入口，但只回写本次真实测试号码；绑定成功、短信探测成功、`phone_already_used` 和每分钟维护任务也不再批量恢复同号段其他记录。号段统计不再成为普通任务的隐藏跳过条件。
+- **修复号段抽样提前恢复污染**：手机号绑定任务排队和手机号注册抽样加载不再在实际测试前把历史 `cannot_send` / `rate_limited` 号码改为 `active`。兼容的 `restore_prefix_sample_records()` 已改为只读返回；只有具体号码产生真实任务结果后，才通过 `record_task_status()` 更新该号码，任务停止、账号前置失败或未触碰号码时原状态保持不变。
+
+### 测试 (Tests)
+- **单号隔离与面板合同回归**：扩展 `tests/test_phone_pool.py`、`tests/test_phone_pool_task_integration.py` 和 `tests/test_chatgpt_phone_registration.py`，覆盖同段失败不误伤健康号码、同段成功不复活失败号码、混合号段归入 `partial`、限定号段只返回真实可用单号、抽样排队不预恢复以及新旧摘要字段兼容；新增 `tests/test_phone_prefix_ui_contract.py` 锁定账号页、手机号池页和任务结果表的单号/样本文案。
+
 ## [2.2.14] - 2026-07-16
 
 ### 新增 (Added)
@@ -1771,4 +1787,8 @@
 
 ## 2026-07-17 04:09:25 +0800
 - 增加过期 PIX 清理任务日志与终态汇总
+- 发布模式: multi
+
+## 2026-07-17 04:46:35 +0800
+- 修复手机号池单号状态与限定号段绑定语义
 - 发布模式: multi

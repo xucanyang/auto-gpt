@@ -112,25 +112,6 @@ def _phone_prefix4(value: str) -> str:
     return digits[:4] if len(digits) >= 4 else ""
 
 
-def _model_has_prefix_recovery_capacity(model: PhonePoolModel) -> bool:
-    """Whether a row may follow a prefix-level availability decision."""
-    if str(getattr(model, "status", "") or "") == STATUS_DISABLED:
-        return False
-    if not str(getattr(model, "api_url", "") or "").strip():
-        return False
-    max_accounts = max(int(getattr(model, "max_accounts", 0) or 3), 1)
-    return int(getattr(model, "bound_count", 0) or 0) < max_accounts
-
-
-def _model_is_active_prefix_signal(model: PhonePoolModel, *, now: datetime) -> bool:
-    if str(getattr(model, "status", "") or "") != STATUS_ACTIVE:
-        return False
-    if not _model_has_prefix_recovery_capacity(model):
-        return False
-    cooldown = _parse_time(getattr(model, "cooldown_until", ""))
-    return not cooldown or cooldown <= now
-
-
 def _temporary_status_recover_at(model: PhonePoolModel) -> datetime | None:
     cooldown = _parse_time(getattr(model, "cooldown_until", ""))
     if cooldown is not None:
@@ -574,6 +555,10 @@ def _build_prefix_health(records: list[PhonePoolRecord]) -> dict[str, list[dict[
                 "remaining_capacity": 0,
                 "rejected_count": 0,
                 "bind_limit_count": 0,
+                "successful_phone_count": 0,
+                "failed_phone_count": 0,
+                "success_event_count": 0,
+                "failure_event_count": 0,
                 "active_count": 0,
                 "cannot_send_count": 0,
                 "rate_limited_count": 0,
@@ -585,6 +570,14 @@ def _build_prefix_health(records: list[PhonePoolRecord]) -> dict[str, list[dict[
         status = str(record.status or STATUS_ACTIVE)
         stats["total"] += 1
         stats[f"{status}_count"] = int(stats.get(f"{status}_count", 0)) + 1
+        success_count = int(record.success_count or 0)
+        failure_count = int(record.fail_count or 0)
+        stats["success_event_count"] += success_count
+        stats["failure_event_count"] += failure_count
+        if success_count > 0:
+            stats["successful_phone_count"] += 1
+        if failure_count > 0:
+            stats["failed_phone_count"] += 1
         if record.available:
             stats["available_count"] += 1
             stats["remaining_capacity"] += int(record.remaining_capacity or 0)
@@ -595,17 +588,20 @@ def _build_prefix_health(records: list[PhonePoolRecord]) -> dict[str, list[dict[
 
     groups: dict[str, list[dict[str, Any]]] = {
         "available": [],
+        "partial": [],
         "unavailable": [],
         "exhausted": [],
         "temporary": [],
     }
     for stats in stats_by_prefix.values():
-        rejected_count = int(stats.get("rejected_count") or 0)
         cannot_send_count = int(stats.get("cannot_send_count") or 0)
+        temporary_count = int(stats.get("rate_limited_count") or 0) + int(stats.get("cooldown_count") or 0)
         available_count = int(stats.get("available_count") or 0)
         total = int(stats.get("total") or 0)
         bind_limit_count = int(stats.get("bind_limit_count") or 0)
-        if available_count > 0:
+        if available_count > 0 and (cannot_send_count > 0 or temporary_count > 0):
+            status = "partial"
+        elif available_count > 0:
             status = "available"
         elif cannot_send_count > 0:
             status = "unavailable"
@@ -619,7 +615,7 @@ def _build_prefix_health(records: list[PhonePoolRecord]) -> dict[str, list[dict[
     def sort_key(item: dict[str, Any]) -> tuple[int, int, str]:
         if item.get("status") == "unavailable":
             primary = int(item.get("rejected_count") or 0)
-        elif item.get("status") == "available":
+        elif item.get("status") in {"available", "partial"}:
             primary = int(item.get("remaining_capacity") or 0)
         elif item.get("status") == "exhausted":
             primary = int(item.get("bind_limit_count") or 0)
@@ -679,19 +675,10 @@ def _build_prefix_health_map(records: list[PhonePoolRecord]) -> dict[str, dict[s
 
 
 def _ordinary_task_block_reason(record: PhonePoolRecord, prefix_item: dict[str, Any] | None) -> str:
-    self_reason = _self_unavailable_reason(record)
-    if self_reason:
-        return self_reason
-    prefix_status = str((prefix_item or {}).get("status") or "unknown")
-    if prefix_status == "available":
-        return ""
-    if prefix_status == "unavailable":
-        return "prefix_unavailable"
-    if prefix_status == "exhausted":
-        return "prefix_exhausted"
-    if prefix_status == "temporary":
-        return "prefix_temporary"
-    return "prefix_unknown"
+    # Prefix health is correlated evidence for operators, not an eligibility
+    # gate. A task may use an active phone even when peers in the same prefix
+    # failed, and a peer success must not reactivate this phone.
+    return _self_unavailable_reason(record)
 
 
 def serialize_phone_pool_records(
@@ -754,13 +741,15 @@ class PhonePoolRepository:
     def summarize(records: list[PhonePoolRecord]) -> dict[str, Any]:
         by_status = {status: 0 for status in ALL_STATUSES}
         prefix_health = _build_prefix_health(records)
-        available_prefixes = list(prefix_health["available"])
+        healthy_prefixes = list(prefix_health["available"])
+        partial_prefixes = list(prefix_health["partial"])
+        available_prefixes = [*healthy_prefixes, *partial_prefixes]
         unavailable_prefixes = list(prefix_health["unavailable"])
         exhausted_prefixes = list(prefix_health["exhausted"])
         temporary_prefixes = list(prefix_health["temporary"])
         rejected_prefix_counts = {
             str(item.get("prefix") or ""): int(item.get("rejected_count") or 0)
-            for item in unavailable_prefixes
+            for item in [*partial_prefixes, *unavailable_prefixes]
             if str(item.get("prefix") or "") and int(item.get("rejected_count") or 0) > 0
         }
         prefix_sample_candidate_counts: dict[str, int] = {}
@@ -775,14 +764,14 @@ class PhonePoolRepository:
         remaining_capacity = sum(int(item.get("remaining_capacity") or 0) for item in available_prefixes)
         number_available = sum(1 for record in records if record.available)
         number_remaining_capacity = sum(int(record.remaining_capacity or 0) for record in records if record.available)
-        rejected_prefixes = [
+        rejected_prefixes = sorted([
             {
                 **item,
                 "count": int(item.get("rejected_count") or 0),
             }
-            for item in unavailable_prefixes
+            for item in [*partial_prefixes, *unavailable_prefixes]
             if int(item.get("rejected_count") or 0) > 0
-        ]
+        ], key=lambda item: (-int(item.get("rejected_count") or 0), str(item.get("prefix") or "")))
         phone_signup_prefix_health = _build_phone_signup_prefix_health()
         phone_signup_available_prefixes = list(phone_signup_prefix_health.get(PREFIX_STATUS_AVAILABLE) or [])
         phone_signup_unavailable_prefixes = list(phone_signup_prefix_health.get(PREFIX_STATUS_UNAVAILABLE) or [])
@@ -802,6 +791,10 @@ class PhonePoolRepository:
             "active": by_status.get(STATUS_ACTIVE, 0),
             "available_prefix_count": len(available_prefixes),
             "available_prefixes": available_prefixes,
+            "healthy_prefix_count": len(healthy_prefixes),
+            "healthy_prefixes": healthy_prefixes,
+            "partial_prefix_count": len(partial_prefixes),
+            "partial_prefixes": partial_prefixes,
             "available_prefix_sample_1": sum(min(int(item.get("available_count") or 0), 1) for item in available_prefixes),
             "available_prefix_sample_2": sum(min(int(item.get("available_count") or 0), 2) for item in available_prefixes),
             "prefix_sample_prefix_count": len(prefix_sample_candidate_counts),
@@ -818,7 +811,8 @@ class PhonePoolRepository:
             "temporary_prefix_count": len(temporary_prefixes),
             "temporary_prefixes": temporary_prefixes,
             "prefix_health": {
-                "available": available_prefixes,
+                "available": healthy_prefixes,
+                "partial": partial_prefixes,
                 "unavailable": unavailable_prefixes,
                 "exhausted": exhausted_prefixes,
                 "temporary": temporary_prefixes,
@@ -1011,67 +1005,6 @@ class PhonePoolRepository:
             session.refresh(model)
             return _to_record(model)
 
-    @staticmethod
-    def _restore_prefix_models(
-        session: Session,
-        *,
-        prefix: str,
-        now: datetime,
-        preserve_phone: str = "",
-    ) -> int:
-        """Restore all capacity-bearing rows in a verified usable prefix."""
-        if not prefix:
-            return 0
-        preserve_phone = normalize_phone(preserve_phone)
-        restored = 0
-        models = session.exec(select(PhonePoolModel).order_by(PhonePoolModel.id)).all()
-        for model in models:
-            if _phone_prefix4(str(model.phone_e164 or "")) != prefix:
-                continue
-            if preserve_phone and str(model.phone_e164 or "") == preserve_phone:
-                continue
-            if not _model_has_prefix_recovery_capacity(model):
-                continue
-            changed = (
-                str(model.status or "") != STATUS_ACTIVE
-                or bool(str(model.cooldown_until or ""))
-                or bool(str(model.last_error_code or ""))
-                or bool(str(model.last_error_message or ""))
-            )
-            if not changed:
-                continue
-            model.status = STATUS_ACTIVE
-            model.cooldown_until = ""
-            model.last_error_code = ""
-            model.last_error_message = ""
-            model.updated_at = now
-            session.add(model)
-            restored += 1
-        return restored
-
-    def restore_prefix_after_success(self, phone: str, *, preserve_phone: bool = False) -> int:
-        """Apply the operator-defined success rule to one phone prefix.
-
-        A successful bind or SMS probe proves this prefix is currently usable.
-        Restore every non-disabled row that still has local binding capacity;
-        rows that are manually disabled or actually full remain untouched.
-        """
-        phone_norm = normalize_phone(phone)
-        prefix = _phone_prefix4(phone_norm)
-        if not prefix:
-            return 0
-        now = _utcnow()
-        with Session(engine) as session:
-            restored = self._restore_prefix_models(
-                session,
-                prefix=prefix,
-                now=now,
-                preserve_phone=phone_norm if preserve_phone else "",
-            )
-            if restored:
-                session.commit()
-        return restored
-
     def record_prefix_unavailable(
         self,
         phone: str,
@@ -1079,51 +1012,21 @@ class PhonePoolRepository:
         error_code: str,
         reason: str = "",
     ) -> PhonePoolRecord | None:
-        """Apply a terminal phone failure to every recoverable member of its prefix."""
-        phone_norm = normalize_phone(phone)
-        prefix = _phone_prefix4(phone_norm)
-        error_code = str(error_code or "cannot_send")[:64]
-        if not phone_norm or not prefix:
-            return self.record_failure(
-                phone,
-                status=STATUS_CANNOT_SEND,
-                error_code=error_code,
-                error_message=reason,
-            )
+        """Backward-compatible name that records only the observed phone.
 
-        now = _utcnow()
-        with Session(engine) as session:
-            target = session.exec(
-                select(PhonePoolModel).where(PhonePoolModel.phone_e164 == phone_norm)
-            ).first()
-            if target is None:
-                return None
-
-            target.fail_count = int(target.fail_count or 0) + 1
-            target.last_used_at = _now_text()
-            target.last_error_code = error_code
-            target.last_error_message = str(reason or "")[:500]
-            target.updated_at = now
-            session.add(target)
-
-            models = session.exec(select(PhonePoolModel).order_by(PhonePoolModel.id)).all()
-            for model in models:
-                if _phone_prefix4(str(model.phone_e164 or "")) != prefix:
-                    continue
-                if not _model_has_prefix_recovery_capacity(model):
-                    continue
-                model.status = STATUS_CANNOT_SEND
-                model.cooldown_until = ""
-                model.last_error_code = error_code
-                model.last_error_message = str(reason or "")[:500]
-                model.updated_at = now
-                session.add(model)
-            session.commit()
-            session.refresh(target)
-            return _to_record(target)
+        Prefixes are correlated, not atomic. A direct failure is evidence for
+        the tested number and contributes to prefix statistics, but must never
+        rewrite sibling inventory rows.
+        """
+        return self.record_failure(
+            phone,
+            status=STATUS_CANNOT_SEND,
+            error_code=str(error_code or "cannot_send")[:64],
+            error_message=reason,
+        )
 
     def record_prefix_openai_rejection(self, phone: str, *, reason: str = "") -> PhonePoolRecord | None:
-        """Backward-compatible wrapper for an OpenAI prefix rejection."""
+        """Backward-compatible wrapper for one phone's OpenAI rejection."""
         return self.record_prefix_unavailable(
             phone,
             error_code="openai_rejected",
@@ -1131,26 +1034,8 @@ class PhonePoolRepository:
         )
 
     def reconcile_prefix_availability(self) -> dict[str, int]:
-        """Repair legacy rows where an active phone did not restore its prefix."""
-        now = _utcnow()
-        with Session(engine) as session:
-            models = session.exec(select(PhonePoolModel).order_by(PhonePoolModel.id)).all()
-            active_prefixes = {
-                _phone_prefix4(str(model.phone_e164 or ""))
-                for model in models
-                if _model_is_active_prefix_signal(model, now=now)
-            }
-            active_prefixes.discard("")
-            restored = 0
-            restored_prefixes = 0
-            for prefix in sorted(active_prefixes):
-                changed = self._restore_prefix_models(session, prefix=prefix, now=now)
-                if changed:
-                    restored += changed
-                    restored_prefixes += 1
-            if restored:
-                session.commit()
-        return {"prefixes": restored_prefixes, "records": restored}
+        """Compatibility no-op; prefix observations no longer rewrite rows."""
+        return {"prefixes": 0, "records": 0}
 
     def recover_expired_temporary_statuses(self, *, now: datetime | None = None) -> int:
         """Return expired rate-limited/cooldown phones to the active pool."""
@@ -1185,11 +1070,7 @@ class PhonePoolRepository:
             return True
 
     def list_available(self) -> list[PhonePoolRecord]:
-        """返回当前普通绑定可用号码。
-
-        号段恢复规则改为“同号段只要有一个自身可用号码，整段恢复可用”，
-        所以普通绑定不再因为同 prefix 有历史 rejected 样本而跳过整段。
-        """
+        """返回当前号码自身可用的普通绑定候选。"""
         self.recover_expired_temporary_statuses()
         now = _utcnow()
         with Session(engine) as session:
@@ -1215,10 +1096,8 @@ class PhonePoolRepository:
     def list_available_by_prefixes(self, prefixes: list[str]) -> list[PhonePoolRecord]:
         """返回指定号段内号码自身可用的绑定候选。
 
-        限定号段绑定表达的是“用户明确要这个号段”，所以不再用整段健康
-        状态拦截。即使某个号段因为历史 OpenAI 拒绝被归到不可用号段，只要
-        该号段内仍有自身 active、未冷却、未绑满且带 API 的号码，就允许
-        本次任务使用。
+        号段状态只用于展示相关性；限定模式仍逐号要求 active、未冷却、
+        未绑满且带 API，不会因为同段其他号码成功或失败而改变候选资格。
         """
         selected = {
             "".join(ch for ch in str(prefix or "") if ch.isdigit())[:4]
@@ -1278,11 +1157,11 @@ class PhonePoolRepository:
         return self._sample_records_by_prefix(self.list_prefix_sample_candidates(), sample_size=sample_size)
 
     def sample_available_by_prefix(self, sample_size: int = 1) -> list[PhonePoolRecord]:
-        """按手机号前 4 位抽样，只测试健康可用号段。"""
+        """按手机号前 4 位抽样，只测试号码自身可用的候选。"""
         return self._sample_records_by_prefix(self.list_available(), sample_size=sample_size)
 
     def sample_rejected_by_prefix(self, sample_size: int = 1) -> list[PhonePoolRecord]:
-        """只从 OpenAI 明确拒绝过的号段/号码中抽样，用于复测不可用号段。"""
+        """只从 OpenAI 明确拒绝过的号码中按号段抽样复测。"""
         return self._sample_records_by_prefix(
             [record for record in self.list() if _is_prefix_sample_candidate_record(record) and _is_openai_rejected_record(record)],
             sample_size=sample_size,
@@ -1340,7 +1219,11 @@ class PhonePoolRepository:
         return selected
 
     def restore_prefix_sample_records(self, record_ids: list[int]) -> list[PhonePoolRecord]:
-        """恢复本次号段抽样选中的号码，让旧失败/限流号码可重新进入测试。"""
+        """兼容旧调用：只读返回抽样号码，不再提前修改库存状态。
+
+        固定 phone_items 可以直接测试历史失败或限流号码。只有该号码得到
+        真实任务结果后，record_task_status 才能改变它的状态。
+        """
         ids = [int(value or 0) for value in record_ids if int(value or 0) > 0]
         if not ids:
             return []
@@ -1352,9 +1235,7 @@ class PhonePoolRepository:
             seen.add(record_id)
             ordered_ids.append(record_id)
 
-        now = _utcnow()
-        restored_ids: set[int] = set()
-        restored_by_id: dict[int, PhonePoolRecord] = {}
+        records_by_id: dict[int, PhonePoolRecord] = {}
         with Session(engine) as session:
             for record_id in ordered_ids:
                 model = session.get(PhonePoolModel, record_id)
@@ -1363,21 +1244,8 @@ class PhonePoolRepository:
                 record = _to_record(model)
                 if not _is_prefix_sample_candidate_record(record):
                     continue
-                model.status = STATUS_ACTIVE
-                model.cooldown_until = ""
-                model.last_error_code = ""
-                model.last_error_message = ""
-                model.updated_at = now
-                session.add(model)
-                restored_ids.add(record_id)
-            session.commit()
-            for record_id in ordered_ids:
-                if record_id not in restored_ids:
-                    continue
-                model = session.get(PhonePoolModel, record_id)
-                if model is not None:
-                    restored_by_id[record_id] = _to_record(model)
-        return [restored_by_id[record_id] for record_id in ordered_ids if record_id in restored_by_id]
+                records_by_id[record_id] = record
+        return [records_by_id[record_id] for record_id in ordered_ids if record_id in records_by_id]
 
     def to_phone_items(
         self,
@@ -1636,11 +1504,6 @@ class PhonePoolRepository:
                 model.status = STATUS_ACTIVE
             model.updated_at = now
             session.add(model)
-            self._restore_prefix_models(
-                session,
-                prefix=_phone_prefix4(phone_norm),
-                now=now,
-            )
             session.commit()
             session.refresh(model)
             return _to_record(model)
@@ -1706,8 +1569,8 @@ class PhonePoolRepository:
     def record_probe_success(self, phone: str, *, reason: str = "") -> PhonePoolRecord | None:
         """短信探测成功：证明 OpenAI 已发码且收码 API 正常。
 
-        这不是完整绑定，所以不增加 bound_count；但它足以恢复该号码自身状态，
-        并通过号段聚合规则让该号段重新进入可用集合。
+        这不是完整绑定，所以不增加 bound_count；只恢复本次实际探测号码，
+        同号段其他号码继续保留各自最近一次真实结果。
         """
         phone_norm = normalize_phone(phone)
         now = _utcnow()
@@ -1724,11 +1587,6 @@ class PhonePoolRepository:
             model.cooldown_until = ""
             model.updated_at = now
             session.add(model)
-            self._restore_prefix_models(
-                session,
-                prefix=_phone_prefix4(phone_norm),
-                now=now,
-            )
             session.commit()
             session.refresh(model)
             return _to_record(model)
@@ -1798,12 +1656,7 @@ class PhonePoolRepository:
         if status == "openai_phone_limit":
             return self.record_failure(phone, status=STATUS_EXHAUSTED, error_code=status, error_message=reason)
         if status == "phone_already_used":
-            result = self.record_failure(phone, status=STATUS_EXHAUSTED, error_code=status, error_message=reason)
-            # The current number cannot be reused, but OpenAI accepted the
-            # prefix far enough to report an already-used phone.  Reopen its
-            # capacity-bearing peers without changing this exhausted row.
-            self.restore_prefix_after_success(phone, preserve_phone=True)
-            return self.get(phone) or result
+            return self.record_failure(phone, status=STATUS_EXHAUSTED, error_code=status, error_message=reason)
         if status == "openai_rejected":
             return self.record_prefix_openai_rejection(phone, reason=reason)
         if status in {"api_no_code", "api_error"}:
@@ -1892,12 +1745,10 @@ def _phone_pool_maintenance_loop() -> None:
         try:
             repo = PhonePoolRepository()
             recovered = repo.recover_expired_temporary_statuses()
-            reconciled = repo.reconcile_prefix_availability()
-            restored = int(reconciled.get("records") or 0)
-            if recovered or restored:
+            if recovered:
                 print(
                     "[PhonePoolMaintenance] 状态维护完成: "
-                    f"限流恢复={recovered} 号段恢复={restored}"
+                    f"限流恢复={recovered}"
                 )
         except Exception as exc:
             print(f"[PhonePoolMaintenance] 调度错误: {exc}")
@@ -1908,7 +1759,7 @@ def _phone_pool_maintenance_loop() -> None:
 
 
 def start_phone_pool_maintenance() -> None:
-    """Maintain expiring phone limits and legacy prefix state every minute."""
+    """Maintain expiring per-phone temporary limits every minute."""
     global _phone_pool_maintenance_thread, _phone_pool_maintenance_running
     with _phone_pool_maintenance_lock:
         if _phone_pool_maintenance_running:
