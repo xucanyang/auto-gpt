@@ -4,6 +4,23 @@
 
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，并且本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/) (语义化版本)。
 
+## [2.2.11] - 2026-07-16
+
+### 新增 (Added)
+- **当前实例一键清理过期 PIX 链接**：账号页“支付链接生成”下拉菜单新增“清理过期 PIX 链接”。`frontend/src/pages/Accounts.tsx` 会先调用 `/api/tasks/chatgpt/payment-links/pix-cleanup/preview` 展示当前实例、北京时间截止点、可清理数量和缺少时间信息的安全跳过数量；运营确认后再调用清理接口，并刷新账号列表和支付链接平台筛选，不受当前勾选、分页或筛选范围限制。
+- **北京时间 11:00 到期模型**：新增 `services/chatgpt_core/pix_payment_link_cleanup.py`。新链接优先采用 Stripe 明确返回的 `link_expires_at`；旧链接缺少上游时限时，按北京时间生成时刻推导，当天 11:00 前生成的链接在当天 11:00 到期，11:00 及之后生成的链接在次日 11:00 到期。恰好 11:00 归入新周期，缺少两类时间证据的记录保持不动。
+
+### 优化 (Changed)
+- **低内存、可回滚的单事务清理**：清理预览通过 SQLite JSON 函数只提取账号当前支付链接小对象，不把账号完整 `extra_json` 批量加载进 Python。执行阶段在确有过期候选时先为当前实例创建权限 `0600` 的在线 SQLite 备份并执行完整性校验，再使用 `BEGIN IMMEDIATE` 重新计算资格并原子写入；只在 `accounts.cashier_url` 与被清 URL 完全一致时置空，提交后再次执行完整性校验，同时刷新对应 `account_list_state.payment_link_platform`，避免账号页 PIX 筛选保留陈旧数量。
+- **审计边界保持清晰**：过期当前链接改写为不含 URL 的 `expired_cleaned` tombstone，保留生成时间、实际/推导到期时间、清理时间和旧链接状态。账号业务状态、订阅状态、支付生成历史、PIX CDK 占用/核销、PIX 提交结果及任务日志均不修改；重复执行保持幂等。
+
+### 修复 (Fixed)
+- **阻止历史同步复活已清链接**：`services/long_link_history_sync.py` 识别 PIX 清理 tombstone 及 `pix_cleanup_through_at` 截止点，仍将旧成功记录保存在 `payment_link_generations` 审计历史中，但不会重新写回已清理的当前 URL；只有截止点之后真正生成的新链接才能覆盖 tombstone。
+- **前端版本同步至 v2.2.11**：`frontend/src/app/AppShell.tsx` 更新侧栏版本，用于确认浏览器已加载过期 PIX 链接清理入口与确认交互。
+
+### 测试 (Tests)
+- **PIX 清理边界回归覆盖**：新增 `tests/test_pix_payment_link_cleanup.py`，覆盖 10:59:59、11:00:00、新旧周期、上游到期优先、旧数据推导、缺时间跳过、非 PIX 隔离、`cashier_url` 精确匹配、账号状态不变、派生筛选刷新、历史保留和重复清理幂等；`tests/test_long_link_history_sync.py` 增加 tombstone 防回填用例，`tests/test_accounts_pix_link_cleanup_ui.py` 锁定预览、确认、执行和列表刷新合同。
+
 ## [2.2.10] - 2026-07-16
 
 ### 新增 (Added)
@@ -1693,4 +1710,8 @@
 
 ## 2026-07-16 11:32:25 +0800
 - 增加批量同步本地状态并发与账号隔离保护
+- 发布模式: multi
+
+## 2026-07-16 12:40:03 +0800
+- feat: add one-click expired PIX payment link cleanup
 - 发布模式: multi

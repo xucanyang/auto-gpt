@@ -234,6 +234,52 @@ def test_existing_newer_current_link_is_not_overwritten_but_history_is_imported(
     assert json.loads(extra_json)["chatgpt_last_payment_link"]["url"] == "https://pay.example.test/current"
 
 
+def test_expired_cleanup_tombstone_blocks_old_history_from_restoring_current_url(tmp_path: Path):
+    source = tmp_path / "tasks.db"
+    target = tmp_path / "account_manager.db"
+    completed_at = 1_700_000_000
+    _create_source(
+        source,
+        [_source_row("job-cleaned", "one@example.test", completed_at=completed_at, url="https://pay.example.test/expired")],
+    )
+    _create_target(
+        target,
+        [
+            {
+                "id": 1,
+                "email": "one@example.test",
+                "extra": {
+                    "chatgpt_last_payment_link": {
+                        "link_type": "pix",
+                        "link_status": "expired_cleaned",
+                        "generated_at": "2023-11-14T22:13:20+00:00",
+                        "pix_cleanup_through_at": "2023-11-15T03:00:00+00:00",
+                        "cleaned_at": "2023-11-15T04:00:00+00:00",
+                    }
+                },
+            }
+        ],
+    )
+
+    report = synchronize_long_link_success_history(
+        source_database=source,
+        target_databases=[target],
+        apply=True,
+        backup_dir=tmp_path / "backups",
+    )
+
+    assert report["targets"][0]["stats"]["current_link_retained"] == 1
+    with sqlite3.connect(target) as connection:
+        cashier_url, extra_json = connection.execute(
+            "SELECT cashier_url, extra_json FROM accounts WHERE id = 1"
+        ).fetchone()
+        assert connection.execute("SELECT COUNT(*) FROM payment_link_generations").fetchone()[0] == 1
+    assert cashier_url == ""
+    marker = json.loads(extra_json)["chatgpt_last_payment_link"]
+    assert marker["link_status"] == "expired_cleaned"
+    assert "url" not in marker
+
+
 def test_duplicate_global_email_is_skipped_and_rerun_is_idempotent(tmp_path: Path):
     source = tmp_path / "tasks.db"
     plus = tmp_path / "plus.db"

@@ -137,11 +137,13 @@ type AccountsToolbarProps = {
   isChatgptPlatform: boolean
   batchGopayLoading: boolean
   batchPaymentLinkLoading: boolean
+  pixLinkCleanupLoading: boolean
   batchInvalidRecheckLoading: boolean
   phoneBindingTestLoading: boolean
   paypalBindingLoading: boolean
   baxiCdkSubmitLoading: boolean
   onBatchPaymentLink: (options?: { forceRefresh?: boolean }) => void
+  onCleanupExpiredPixLinks: () => void
   onBatchInvalidRecheck: () => void
   onOpenPhoneBindingTest: () => void
   onOpenPaypalBinding: () => void
@@ -183,11 +185,13 @@ export function AccountsToolbar({
   isChatgptPlatform,
   batchGopayLoading,
   batchPaymentLinkLoading,
+  pixLinkCleanupLoading,
   batchInvalidRecheckLoading,
   phoneBindingTestLoading,
   paypalBindingLoading,
   baxiCdkSubmitLoading,
   onBatchPaymentLink,
+  onCleanupExpiredPixLinks,
   onBatchInvalidRecheck,
   onOpenPhoneBindingTest,
   onOpenPaypalBinding,
@@ -267,7 +271,16 @@ export function AccountsToolbar({
       label: '强制重新生成',
       disabled: paymentLinkDisabled,
     },
+    { type: 'divider' },
+    {
+      key: 'pix_cleanup',
+      label: '清理过期 PIX 链接',
+      icon: <DeleteOutlined />,
+      danger: true,
+      disabled: pixLinkCleanupLoading,
+    },
   ]
+  const paymentLinkActionLoading = batchPaymentLinkLoading || pixLinkCleanupLoading
   const showOperationGroups = !isMobile || mobileOpsOpen
   const pinnedActionIdsToRender = normalizePinnedActionIds(pinnedActionIds ?? DEFAULT_PINNED_ACTION_IDS)
   const pinnedActionIdSet = new Set<string>(pinnedActionIdsToRender)
@@ -372,9 +385,9 @@ export function AccountsToolbar({
         return buildNestedMenuItem(
           actionId,
           '支付链接生成',
-          batchPaymentLinkLoading ? <SyncOutlined spin /> : <LinkOutlined />,
+          paymentLinkActionLoading ? <SyncOutlined spin /> : <LinkOutlined />,
           paymentLinkMenuItems,
-          paymentLinkDisabled || batchPaymentLinkLoading,
+          paymentLinkActionLoading,
         )
       case 'gopay':
         return {
@@ -464,6 +477,10 @@ export function AccountsToolbar({
         return
       }
       if (actionId === 'paymentLink') {
+        if (originalKey === 'pix_cleanup') {
+          onCleanupExpiredPixLinks()
+          return
+        }
         onBatchPaymentLink({ forceRefresh: originalKey === 'force' })
       }
       return
@@ -601,18 +618,23 @@ export function AccountsToolbar({
         return (
           <Dropdown
             key={actionId}
-            disabled={paymentLinkDisabled || batchPaymentLinkLoading}
+            disabled={paymentLinkActionLoading}
             menu={{
               items: paymentLinkMenuItems,
-              onClick: ({ key }) => onBatchPaymentLink({ forceRefresh: String(key) === 'force' }),
+              onClick: ({ key }) => {
+                if (String(key) === 'pix_cleanup') {
+                  onCleanupExpiredPixLinks()
+                  return
+                }
+                onBatchPaymentLink({ forceRefresh: String(key) === 'force' })
+              },
             }}
           >
             <Button
               block={isMobile}
               style={operationButtonStyle}
               icon={<LinkOutlined />}
-              loading={batchPaymentLinkLoading}
-              disabled={paymentLinkDisabled}
+              loading={paymentLinkActionLoading}
             >
               支付链接生成 <DownOutlined />
             </Button>

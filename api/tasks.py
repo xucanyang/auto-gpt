@@ -55,6 +55,10 @@ from services.chatgpt_core.payment_link_cache import (
     normalize_payment_link_params,
     validate_plus_payment_request_params,
 )
+from services.chatgpt_core.pix_payment_link_cleanup import (
+    clean_expired_pix_payment_links,
+    preview_expired_pix_payment_links,
+)
 from services.chatgpt_core.local_status_refresh import (
     schedule_chatgpt_local_status_refresh_for_account_id,
     summarize_status_refresh,
@@ -15989,6 +15993,35 @@ def get_chatgpt_payment_link_profile():
         return _payment_link_profile_view(LongLinkPaymentClient.from_env().get_profile(force_refresh=True))
     except LongLinkPaymentError as exc:
         raise HTTPException(503, sanitize_error_message(exc)[:600]) from exc
+
+
+@router.get("/chatgpt/payment-links/pix-cleanup/preview")
+def preview_chatgpt_expired_pix_payment_links():
+    """Return a server-calculated, current-instance PIX cleanup preview."""
+
+    with Session(engine) as session:
+        return preview_expired_pix_payment_links(session)
+
+
+@router.post("/chatgpt/payment-links/pix-cleanup")
+def cleanup_chatgpt_expired_pix_payment_links():
+    """Clear expired current PIX links without touching history or CDKs."""
+
+    try:
+        with Session(engine) as session:
+            result = clean_expired_pix_payment_links(session)
+    except Exception as exc:
+        logger.exception("Expired PIX payment-link cleanup failed")
+        raise HTTPException(500, "过期 PIX 支付链接清理失败，请检查服务日志") from exc
+    logger.info(
+        "Expired PIX payment links cleaned instance=%s eligible=%s cleaned=%s skipped=%s backup=%s",
+        result.get("instance_id"),
+        result.get("expired_links"),
+        result.get("cleaned_links"),
+        result.get("concurrent_skipped_links"),
+        result.get("backup_created"),
+    )
+    return result
 
 
 @router.get("/chatgpt/payment-links/history")

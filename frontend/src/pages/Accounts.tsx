@@ -380,6 +380,17 @@ type PaymentLinkProfile = {
   }
 }
 
+type PixLinkCleanupReport = {
+  instance_id?: string
+  cutoff_display?: string
+  current_pix_links?: number
+  expired_links?: number
+  active_links?: number
+  missing_expiry_links?: number
+  cleaned_links?: number
+  concurrent_skipped_links?: number
+}
+
 const ACCOUNT_COLUMN_OPTIONS: Array<{ value: AccountColumnKey; text: string; chatgptOnly?: boolean }> = [
   { value: 'manually_used', text: '使用状态' },
   { value: 'phone_binding', text: '手机号/API', chatgptOnly: true },
@@ -2272,6 +2283,7 @@ export default function Accounts() {
   const [backfillLoading, setBackfillLoading] = useState<'' | 'cliproxyapi_pending' | 'cliproxyapi_selected' | 'sub2api_pending' | 'sub2api_selected'>('')
   const [batchResumeAuthLoading, setBatchResumeAuthLoading] = useState<'' | 'selected' | 'filtered' | 'selected_phone' | 'filtered_phone'>('')
   const [batchPaymentLinkLoading, setBatchPaymentLinkLoading] = useState(false)
+  const [pixLinkCleanupLoading, setPixLinkCleanupLoading] = useState(false)
   const [batchInvalidRecheckLoading, setBatchInvalidRecheckLoading] = useState(false)
   const [visibleColumnKeys, setVisibleColumnKeys] = useState<AccountColumnKey[]>(() => loadVisibleAccountColumnKeys())
   const [pinnedToolbarActionIds, setPinnedToolbarActionIds] = useState<AccountToolbarActionId[]>(() => loadPinnedToolbarActions())
@@ -3717,6 +3729,75 @@ export default function Accounts() {
     setBatchPaymentLinkProfileError('')
     setBatchPaymentLinkConfigOpen(true)
     void loadBatchPaymentLinkProfile()
+  }
+
+  const executeExpiredPixLinkCleanup = async () => {
+    setPixLinkCleanupLoading(true)
+    try {
+      const result = await apiFetch('/tasks/chatgpt/payment-links/pix-cleanup', {
+        method: 'POST',
+      }) as PixLinkCleanupReport
+      const cleaned = Number(result?.cleaned_links || 0)
+      const skipped = Number(result?.concurrent_skipped_links || 0)
+      const instanceId = String(result?.instance_id || '当前实例')
+      if (cleaned > 0) {
+        appMessage.success(
+          `${instanceId} 已清理 ${cleaned} 条过期 PIX 链接${skipped > 0 ? `，并发变化跳过 ${skipped} 条` : ''}`,
+        )
+      } else {
+        appMessage.info(`${instanceId} 当前没有需要清理的过期 PIX 链接`)
+      }
+      await accountsQuery.refetch()
+    } catch (e: any) {
+      appMessage.error(e?.message || '过期 PIX 支付链接清理失败')
+      throw e
+    } finally {
+      setPixLinkCleanupLoading(false)
+    }
+  }
+
+  const handleCleanupExpiredPixLinks = async () => {
+    setPixLinkCleanupLoading(true)
+    let preview: PixLinkCleanupReport
+    try {
+      preview = await apiFetch('/tasks/chatgpt/payment-links/pix-cleanup/preview') as PixLinkCleanupReport
+    } catch (e: any) {
+      appMessage.error(e?.message || '读取过期 PIX 链接数量失败')
+      return
+    } finally {
+      setPixLinkCleanupLoading(false)
+    }
+
+    const expired = Number(preview?.expired_links || 0)
+    const missing = Number(preview?.missing_expiry_links || 0)
+    const instanceId = String(preview?.instance_id || '当前实例')
+    const cutoff = String(preview?.cutoff_display || '最近一个北京时间 11:00')
+    if (expired <= 0) {
+      appMessage.info(
+        `${instanceId} 当前没有已过期 PIX 链接${missing > 0 ? `；另有 ${missing} 条缺少时间信息，已安全跳过` : ''}`,
+      )
+      return
+    }
+
+    setPixLinkCleanupLoading(true)
+    Modal.confirm({
+      title: `清理 ${expired} 条过期 PIX 链接？`,
+      content: (
+        <Space direction="vertical" size={6} style={{ width: '100%' }}>
+          <Text>实例：{instanceId}</Text>
+          <Text>当前清理截止点：{cutoff}（北京时间）</Text>
+          <Text type="secondary">
+            只清理账号当前 PIX 链接及其完全相同的 cashier_url；不会删除账号、支付生成历史、PIX CDK 或提交结果。
+          </Text>
+          {missing > 0 ? <Text type="warning">另有 {missing} 条缺少有效时间信息，本次不会清理。</Text> : null}
+        </Space>
+      ),
+      okText: '确认清理',
+      cancelText: '取消',
+      okButtonProps: { danger: true },
+      onOk: executeExpiredPixLinkCleanup,
+      onCancel: () => setPixLinkCleanupLoading(false),
+    })
   }
 
   const submitBatchPaymentLinkConfig = async () => {
@@ -7427,11 +7508,13 @@ export default function Accounts() {
         isChatgptPlatform={currentPlatform === 'chatgpt'}
         batchGopayLoading={batchGopayLoading}
         batchPaymentLinkLoading={batchPaymentLinkLoading}
+        pixLinkCleanupLoading={pixLinkCleanupLoading}
         batchInvalidRecheckLoading={batchInvalidRecheckLoading}
         phoneBindingTestLoading={phoneBindingTestLoading}
         paypalBindingLoading={paypalBindingLoading}
         baxiCdkSubmitLoading={baxiCdkSubmitLoading}
         onBatchPaymentLink={handleBatchPaymentLink}
+        onCleanupExpiredPixLinks={() => { void handleCleanupExpiredPixLinks() }}
         onBatchInvalidRecheck={handleBatchInvalidRecheck}
         onOpenPhoneBindingTest={() => { void openPhoneBindingTest() }}
         onOpenPaypalBinding={openPaypalBinding}
