@@ -51,6 +51,9 @@ def test_pix_link_scan_lists_exclusive_buckets_and_cleanup_is_confirmed():
     assert "扫描 PIX 链接" in toolbar
     assert "pix_scan" in toolbar
     assert "onScanPixLinks" in toolbar
+    assert "setPaymentLinkMenuOpen(false)" in toolbar
+    assert "setMoreOperationMenuOpen(false)" in toolbar
+    assert "window.setTimeout(onScanPixLinks, 0)" in toolbar
     assert "清理过期 PIX 链接" not in toolbar
     assert "清理已支付 PIX 链接" not in toolbar
     assert "清理支付已取消 PIX 链接" not in toolbar

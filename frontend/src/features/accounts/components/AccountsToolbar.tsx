@@ -222,6 +222,8 @@ export function AccountsToolbar({
   toolbarActionVisibilityControl,
 }: AccountsToolbarProps) {
   const [mobileOpsOpen, setMobileOpsOpen] = useState(false)
+  const [paymentLinkMenuOpen, setPaymentLinkMenuOpen] = useState(false)
+  const [moreOperationMenuOpen, setMoreOperationMenuOpen] = useState(false)
   const buttonStyle: CSSProperties = isMobile
     ? { flex: '1 1 calc(50% - 4px)', minWidth: 132 }
     : {}
@@ -283,6 +285,12 @@ export function AccountsToolbar({
   const showOperationGroups = !isMobile || mobileOpsOpen
   const pinnedActionIdsToRender = normalizePinnedActionIds(pinnedActionIds ?? DEFAULT_PINNED_ACTION_IDS)
   const pinnedActionIdSet = new Set<string>(pinnedActionIdsToRender)
+
+  const openPixLinkScan = () => {
+    setPaymentLinkMenuOpen(false)
+    setMoreOperationMenuOpen(false)
+    window.setTimeout(onScanPixLinks, 0)
+  }
 
   const buildConfirmDeleteInvalid = () => {
     Modal.confirm({
@@ -477,7 +485,7 @@ export function AccountsToolbar({
       }
       if (actionId === 'paymentLink') {
         if (originalKey === 'pix_scan') {
-          onScanPixLinks()
+          openPixLinkScan()
           return
         }
         onBatchPaymentLink({ forceRefresh: originalKey === 'force' })
@@ -618,11 +626,14 @@ export function AccountsToolbar({
           <Dropdown
             key={actionId}
             disabled={paymentLinkActionLoading}
+            open={paymentLinkMenuOpen}
+            onOpenChange={setPaymentLinkMenuOpen}
+            trigger={['click']}
             menu={{
               items: paymentLinkMenuItems,
               onClick: ({ key }) => {
                 if (String(key) === 'pix_scan') {
-                  onScanPixLinks()
+                  openPixLinkScan()
                   return
                 }
                 onBatchPaymentLink({ forceRefresh: String(key) === 'force' })
@@ -710,6 +721,8 @@ export function AccountsToolbar({
             <>
             {pinnedActionIdsToRender.map((actionId) => renderPinnedAction(actionId))}
             <Dropdown
+              open={moreOperationMenuOpen}
+              onOpenChange={setMoreOperationMenuOpen}
               menu={{ items: moreOperationMenuItems, onClick: handleMoreOperationClick }}
               trigger={['click']}
               disabled={!moreOperationMenuItems.length}
