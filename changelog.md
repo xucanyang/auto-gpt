@@ -4,6 +4,15 @@
 
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，并且本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/) (语义化版本)。
 
+## [2.3.2] - 2026-07-17
+
+### 修复 (Fixed)
+- **历史日志脱敏验证改为幂等**：`scripts/redact-nginx-query-tokens.py` 不再把已经写成 `access_token=<redacted>` 的安全占位符继续识别为待脱敏凭据。重复执行 `--apply` 不会无意义重写压缩日志，后续 dry-run 可以可靠返回 `files_with_matches=0 redacted_values=0`，区分真实残留令牌与已经完成的脱敏记录。
+- **前端版本同步至 v2.3.2**：`frontend/src/app/AppShell.tsx` 更新侧栏版本，用于确认三实例已经加载包含最终日志脱敏修复的发布产物。
+
+### 测试 (Tests)
+- **脱敏重复执行回归**：扩展 `tests/test_redact_nginx_query_tokens.py`，在普通与 gzip 日志完成脱敏后立即再次扫描，锁定原始令牌已消失且安全占位符不会产生误报。
+
 ## [2.3.1] - 2026-07-17
 
 ### 优化 (Changed)
@@ -1851,4 +1860,8 @@
 
 ## 2026-07-17 09:50:51 +0800
 - 修复 v2.3.1：统一多实例镜像单次构建并完成认证安全发布
+- 发布模式: multi
+
+## 2026-07-17 10:02:16 +0800
+- 修复 v2.3.2：让 nginx 查询令牌脱敏校验可重复执行
 - 发布模式: multi

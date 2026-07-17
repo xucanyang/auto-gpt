@@ -13,7 +13,9 @@ from datetime import datetime
 from pathlib import Path
 
 
-TOKEN_PATTERN = re.compile(rb"(?i)(access_token=)[^&\s\"']+")
+TOKEN_PATTERN = re.compile(
+    rb"(?i)(access_token=)(?!<redacted>(?:[&\s\"']|$))[^&\s\"']+"
+)
 
 
 def _candidate_files(root: Path) -> list[Path]:

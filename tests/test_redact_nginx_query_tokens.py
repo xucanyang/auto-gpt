@@ -45,6 +45,10 @@ def test_redacts_plain_and_gzip_logs_without_copying_token_to_summary(tmp_path):
     assert payload["files_with_matches"] == 2
     assert payload["redacted_values"] == 2
 
+    assert MODULE.main(["--root", str(tmp_path)]) == 0
+    assert token not in plain.read_text()
+    assert "access_token=<redacted>" in plain.read_text()
+
 
 def test_dry_run_reports_but_does_not_rewrite(tmp_path):
     log = tmp_path / "access.log"
