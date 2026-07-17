@@ -21,15 +21,18 @@
 - Plus 数据隔离路径：`/opt/auto-gpt-plus`（不再维护源码，仅保留 `data/`、`external_logs/`、`_ext_targets/` 与 `.env` 作数据驱动）
 - Plus2 数据隔离路径：`/opt/auto-plus2`（不维护源码，仅保留 `data/`、`external_logs/`、`_ext_targets/` 与 `.env` 作数据驱动）
 - 退役 K12 冷数据：`/opt/auto-k12`（禁止作为源码或运行实例重新接入；历史数据库、日志和 `.env` 只用于审计/回滚）
-- 共享配置路径：`/opt/auto-gpt/shared_config`（常驻实例与主服务 standby 共同挂载，仅保存共享全局配置模板、revision、审计和快照；严禁提交进 Git）
+- 共享配置路径：`/opt/auto-gpt/shared_config`（三个常驻业务实例共同挂载，仅保存共享全局配置模板、revision、审计和快照；严禁提交进 Git）
 - 统一镜像名称：`auto-gpt:latest`
 - 多实例编排配置：`docker-compose.multi.yml`
 - 实例映射：
-  - **Plus 常驻实例 (`auto-gpt-plus`)**：端口 `0.0.0.0:8001->8000/tcp`，`0.0.0.0:8318->8317/tcp`，`127.0.0.1:8890->8889/tcp`
+  - **主服务常驻实例 (`auto-gpt`)**：端口 `127.0.0.1:8000->8000/tcp`，`127.0.0.1:8317->8317/tcp`，`127.0.0.1:8889->8889/tcp`
+    - 数据卷：`/opt/auto-gpt/data -> /runtime` 等
+  - **Plus 常驻实例 (`auto-gpt-plus`)**：端口 `127.0.0.1:8001->8000/tcp`，`127.0.0.1:8318->8317/tcp`，`127.0.0.1:8890->8889/tcp`
     - 数据卷：`/opt/auto-gpt-plus/data -> /runtime` 等
-  - **Plus2 常驻实例 (`auto-plus2`)**：端口 `0.0.0.0:8003->8000/tcp`，`0.0.0.0:8320->8317/tcp`，`127.0.0.1:8892->8889/tcp`
+  - **Plus2 常驻实例 (`auto-plus2`)**：端口 `127.0.0.1:8003->8000/tcp`，`127.0.0.1:8320->8317/tcp`，`127.0.0.1:8892->8889/tcp`
     - 数据卷：`/opt/auto-plus2/data -> /runtime` 等
-  - **主服务 standby (`auto-gpt`)**：默认不启动；手动启用 `standby` profile 时使用 `8000/8317/8889` 与 `/opt/auto-gpt/data`
+
+`auto-gpt`、`auto-gpt-plus`、`auto-plus2` 都是常驻业务实例。常规发布、热更新和故障恢复后必须确认三者全部处于运行状态；禁止在发布结束后手动停止任一业务实例。只有退役的 `auto-k12` 必须保持停止且不得重新接入编排。
 
 本地文件修改不会自动影响容器里的代码或静态资源。需要明确部署到容器、重启或重建镜像，并做 live smoke。
 
@@ -45,12 +48,12 @@
    ```bash
    /opt/auto-gpt/deploy.sh "<清晰明确的 Git Commit 描述>" --mode=multi
    ```
-   * 脚本会自动执行 `git add -A` + `git commit`，通过 `docker-compose.multi.yml` 编译更新 `auto-gpt:latest` 镜像，并平滑升级 `auto-gpt-plus` (`8001`) 与 `auto-plus2` (`8003`)；`auto-gpt` 继续保持 standby 停止状态。
+   * 脚本会自动执行 `git add -A` + `git commit`，通过 `docker-compose.multi.yml` 编译更新 `auto-gpt:latest` 镜像，并平滑升级 `auto-gpt` (`8000`)、`auto-gpt-plus` (`8001`)、`auto-plus2` (`8003`) 与 `phone-api-relay`；发布完成后不得再手动停止任一业务实例。
 2. **极其紧急且轻微的 Python/前端逻辑热补丁**（秒级热更新）：
    ```bash
    /opt/auto-gpt/deploy.sh "<热补丁修复说明>" --mode=hot
    ```
-   * 脚本在完成 Git 存档后，将直接调用底层热更新脚本把变动文件注入两个常驻容器并重启对应后端，无需重新构建 Docker 镜像。
+   * 脚本在完成 Git 存档后，将直接调用底层热更新脚本把变动文件注入三个常驻业务容器并重启对应后端，无需重新构建 Docker 镜像。
 3. **如需自动推送到远程分支**：在命令参数尾部追加 `--push` 即可。
 
 ## Changelog 更新维护约定（Agent 强制记录）
@@ -77,7 +80,7 @@
 - **文档与日志更新**：发生代码或配置修改时，必须在 `/opt/auto-gpt/changelog.md` 对应分类下追加本次改动的详细说明。
 - 前端改动：统一在 `/opt/auto-gpt/frontend/` build，再同步到容器实际静态目录；不要只停在 checkout。
 - 后端改动：确认容器内 `/app` 代码是否更新，必要时使用多实例编排重建镜像，并重启对应服务。
-- 数据库操作前：SQLite 用 `.backup`，然后 `PRAGMA integrity_check`；容器/镜像改动前优先 `docker commit` + `docker save`。操作时务必认清修改的是主服务 standby、Plus 还是 Plus2 的挂载目录。
+- 数据库操作前：SQLite 用 `.backup`，然后 `PRAGMA integrity_check`；容器/镜像改动前优先 `docker commit` + `docker save`。操作时务必认清修改的是主服务、Plus 还是 Plus2 的独立挂载目录。
 - 共享配置只允许通过 `shared_config/shared_config.db` 和 `core/config_store.py` 的模式开关同步；不要共用不同实例的 `account_manager.db`，也不要把 `shared_config/` 快照或 WAL 文件加入 Git。
 - 资源池语义必须分清来源、绑定、释放、失败原因、复用规则，不要把账号库存、源系统库存、兑换券库存混成一张表。
 - ChatGPT account 的 `used`、复制 AT、订阅、手机号绑定、邮箱绑定、auth 补抓状态要分开表达，不能因为一个动作误改另一个状态。
@@ -85,7 +88,7 @@
 
 ## 汇报口径
 
-默认用中文简洁汇报：做了什么、现在运行态怎样、验证结果、还剩什么风险。不要主动粘贴长代码、长命令输出或大段日志；涉及主服务 standby、Plus、Plus2 或退役 K12 冷数据时必须明确写清对象，避免混报。
+默认用中文简洁汇报：做了什么、现在运行态怎样、验证结果、还剩什么风险。不要主动粘贴长代码、长命令输出或大段日志；涉及主服务、Plus、Plus2 或退役 K12 冷数据时必须明确写清对象，避免混报。每次部署汇报必须明确确认三个常驻业务实例均在运行。
 
 ## 推荐验证
 
@@ -94,13 +97,14 @@ cd /opt/auto-gpt
 pytest tests -q || true
 cd frontend && npm run build
 
-# 使用多实例编排构建并查看状态
+# 使用多实例编排构建并查看三个常驻业务实例状态
 docker compose -f docker-compose.multi.yml build
-docker ps | grep -E 'auto-gpt-plus|auto-plus2'
+test "$(docker ps --format '{{.Names}}' | grep -Ec '^(auto-gpt|auto-gpt-plus|auto-plus2)$')" -eq 3
 
-# 分别验证两个常驻实例网页的连通性，并确认退役端口未恢复
-curl -fsS http://127.0.0.1:8001/ >/dev/null || true
-curl -fsS http://127.0.0.1:8003/ >/dev/null || true
+# 分别验证三个常驻实例网页的连通性，并确认退役端口未恢复
+curl -fsS http://127.0.0.1:8000/ >/dev/null
+curl -fsS http://127.0.0.1:8001/ >/dev/null
+curl -fsS http://127.0.0.1:8003/ >/dev/null
 ! curl -fsS --max-time 2 http://127.0.0.1:8002/ >/dev/null
 ```
 
