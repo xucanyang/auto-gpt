@@ -6,7 +6,7 @@ from sqlmodel import SQLModel, Session, create_engine
 
 import api.tasks as tasks_api
 from core import db as core_db
-from core.db import PaymentLinkGenerationModel
+from core.db import AccountModel, PaymentLinkGenerationModel
 
 
 class PaymentLinkGenerationHistoryTests(unittest.TestCase):
@@ -24,6 +24,13 @@ class PaymentLinkGenerationHistoryTests(unittest.TestCase):
 
     def test_history_is_paginated_and_contains_only_persisted_safe_result_fields(self):
         with Session(self.engine) as session:
+            account = AccountModel(
+                id=11,
+                platform="chatgpt",
+                email="history@example.com",
+                password="pw",
+            )
+            session.add(account)
             tasks_api._upsert_payment_link_generation(
                 session,
                 account_id=11,

@@ -8,6 +8,7 @@ export type AccountsQueryParams = {
   authType?: string
   phoneBindingState?: string
   paymentLinkPlatform?: string
+  paymentLinkGenerated?: string
   subscriptionType?: string
   accountValidity?: string
   sub2apiState?: string
@@ -36,6 +37,7 @@ export function useAccountsQuery({
   authType = '',
   phoneBindingState = '',
   paymentLinkPlatform = '',
+  paymentLinkGenerated = '',
   subscriptionType = '',
   accountValidity = '',
   sub2apiState = '',
@@ -51,7 +53,7 @@ export function useAccountsQuery({
 }: AccountsQueryParams) {
   const canonicalSubmitState = submitState || ''
   return useQuery<AccountsQueryResult>({
-    queryKey: ['accounts', { email, status, manuallyUsed, authType, phoneBindingState, paymentLinkPlatform, subscriptionType, accountValidity, sub2apiState, oaipayState, submitState: canonicalSubmitState, hasSubmitted, ideaSubmitState, revivalState, sortBy, sortOrder, page, pageSize }],
+    queryKey: ['accounts', { email, status, manuallyUsed, authType, phoneBindingState, paymentLinkPlatform, paymentLinkGenerated, subscriptionType, accountValidity, sub2apiState, oaipayState, submitState: canonicalSubmitState, hasSubmitted, ideaSubmitState, revivalState, sortBy, sortOrder, page, pageSize }],
     queryFn: async ({ signal }) => {
       const params = new URLSearchParams({
         platform: 'chatgpt',
@@ -65,6 +67,7 @@ export function useAccountsQuery({
       if (authType) params.set('auth_type', authType)
       if (phoneBindingState) params.set('phone_binding_state', phoneBindingState)
       if (paymentLinkPlatform) params.set('payment_link_platform', paymentLinkPlatform)
+      if (paymentLinkGenerated) params.set('payment_link_generated', paymentLinkGenerated)
       if (subscriptionType) params.set('subscription_type', subscriptionType)
       if (accountValidity) params.set('account_validity', accountValidity)
       if (sub2apiState) params.set('sub2api_state', sub2apiState)

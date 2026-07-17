@@ -20,8 +20,8 @@ from services.chatgpt_account_state import (
 )
 
 AUTO_DELETE_REVIVAL_TASK_ID = "icloud_hme_auto_delete"
-ACCOUNT_LIST_STATE_DERIVATION_VERSION = "integration-upload-state-v1"
-ACCOUNT_FILTER_RESOLVER_VERSION = "account-list-state-v4"
+ACCOUNT_LIST_STATE_DERIVATION_VERSION = "integration-upload-state-v1-payment-link-history-v1"
+ACCOUNT_FILTER_RESOLVER_VERSION = "account-list-state-v5-payment-link-history"
 ACCOUNT_FILTER_FIELD_NAMES = (
     "email",
     "status",
@@ -29,6 +29,7 @@ ACCOUNT_FILTER_FIELD_NAMES = (
     "auth_type",
     "phone_binding_state",
     "payment_link_platform",
+    "payment_link_generated",
     "subscription_type",
     "account_validity",
     "sub2api_state",
@@ -49,6 +50,7 @@ class AccountFilterRequestMixin(BaseModel):
     auth_type: str = ""
     phone_binding_state: str = ""
     payment_link_platform: str = ""
+    payment_link_generated: str | None = None
     subscription_type: str = ""
     account_validity: str = ""
     sub2api_state: str = ""
@@ -184,6 +186,12 @@ _PAYMENT_LINK_PLATFORM_FILTER_ALIASES: dict[str, set[str]] = {
     "other": {"other"},
 }
 
+_PAYMENT_LINK_CLEANED_STATUSES = frozenset({
+    "expired_cleaned",
+    "paid_cleaned",
+    "cancelled_cleaned",
+})
+
 _INTEGRATION_UPLOAD_STATE_FILTER_ALIASES: dict[str, str] = {
     "true": "uploaded",
     "uploaded": "uploaded",
@@ -237,9 +245,9 @@ def normalize_optional_bool(value: Any) -> bool | None:
     if isinstance(value, bool):
         return value
     normalized = _lower_text(value)
-    if normalized in {"1", "true", "yes", "on", "used"}:
+    if normalized in {"1", "true", "yes", "on", "used", "generated", "succeeded"}:
         return True
-    if normalized in {"0", "false", "no", "off", "unused"}:
+    if normalized in {"0", "false", "no", "off", "unused", "not_generated", "never"}:
         return False
     return None
 
@@ -286,6 +294,9 @@ def normalize_account_filter(source: Any) -> dict[str, Any]:
         "payment_link_platform": _normalize_filter_values(
             _filter_source_value(source, "payment_link_platform"),
             payment_link_platform=True,
+        ),
+        "payment_link_generated": normalize_optional_bool(
+            _filter_source_value(source, "payment_link_generated")
         ),
         "subscription_type": _normalize_filter_values(_filter_source_value(source, "subscription_type")),
         "account_validity": _normalize_filter_values(_filter_source_value(source, "account_validity")),
@@ -645,6 +656,10 @@ def _account_payment_link_payload(
         last_link if isinstance(last_link, dict) else {},
         legacy_paypal if isinstance(legacy_paypal, dict) else {},
     ]
+    if isinstance(last_link, dict) and _lower_text(last_link.get("link_status")) in _PAYMENT_LINK_CLEANED_STATUSES:
+        # The newest cleanup tombstone is terminal for the current-link view;
+        # do not resurrect an older legacy PayPal cache beneath it.
+        return {}
     for candidate in candidates:
         for field_name in _PAYMENT_LINK_URL_FIELDS:
             url = _validated_payment_link_url(candidate.get(field_name))
@@ -703,25 +718,81 @@ def account_payment_link_platform(account: AccountModel, extra: dict[str, Any] |
     return _payment_link_platform_from_payload(_account_payment_link_payload(account, extra))
 
 
+def _account_payment_link_metadata_payload(
+    account: AccountModel,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return the latest non-secret link marker even after its URL is cleaned.
+
+    Cleanup intentionally removes every URL field from the marker while
+    retaining lifecycle metadata.  This helper must never be used as a source
+    of an openable URL; it exists only so list consumers can explain why the
+    current-link platform is ``none``.
+    """
+
+    extra = extra if isinstance(extra, dict) else _extra(account)
+    last_link = extra.get("chatgpt_last_payment_link")
+    if isinstance(last_link, dict):
+        return dict(last_link)
+    legacy_paypal = extra.get("chatgpt_paypal_url")
+    if isinstance(legacy_paypal, dict):
+        payload = dict(legacy_paypal)
+        if not _safe_str(payload.get("link_type")):
+            payload["link_type"] = "paypal"
+        return payload
+    return {}
+
+
+def account_payment_link_generated(
+    account: AccountModel,
+    extra: dict[str, Any] | None = None,
+    *,
+    persisted_history: bool | None = None,
+) -> bool:
+    """Return whether an account has durable evidence of a successful link.
+
+    ``persisted_history`` is supplied by the SQL list-state projection when a
+    ``payment_link_generations`` row exists.  The pure-Python fallback still
+    recognizes current URLs and cleaned PIX tombstones without doing a
+    per-account database lookup.
+    """
+
+    extra = extra if isinstance(extra, dict) else _extra(account)
+    if _validated_payment_link_url(_account_payment_link_payload(account, extra).get("url")):
+        return True
+    marker = _account_payment_link_metadata_payload(account, extra)
+    if _lower_text(marker.get("link_status")) in _PAYMENT_LINK_CLEANED_STATUSES:
+        return True
+    return bool(persisted_history)
+
+
 def account_payment_link_summary(account: AccountModel, extra: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Return the non-secret payment-link subset required by the account list."""
+    """Return a redacted payment-link summary, including cleaned tombstones."""
 
     extra = extra if isinstance(extra, dict) else _extra(account)
     payload = _account_payment_link_payload(account, extra)
-    platform = _payment_link_platform_from_payload(payload)
-    if platform == "none":
-        return {"platform": "none"}
-
-    summary: dict[str, Any] = {
-        "platform": platform,
-        "url": _validated_payment_link_url(payload.get("url")),
-    }
+    current_url = _validated_payment_link_url(payload.get("url"))
+    if _lower_text(payload.get("link_status")) in _PAYMENT_LINK_CLEANED_STATUSES:
+        current_url = ""
+    if not payload:
+        payload = _account_payment_link_metadata_payload(account, extra)
+    platform = _payment_link_platform_from_payload(payload) if current_url else "none"
+    summary: dict[str, Any] = {"platform": platform}
+    if current_url:
+        summary["url"] = current_url
     for key, max_length in (
         ("link_type", 64),
         ("link_status", 64),
+        ("link_status_reason", 128),
         ("payment_link_format", 64),
         ("generated_at", 128),
         ("created_at", 128),
+        ("link_status_updated_at", 128),
+        ("cleaned_at", 128),
+        ("expired_at", 128),
+        ("pix_cleanup_mode", 64),
+        ("link_expiry_source", 64),
+        ("previous_link_status", 64),
     ):
         value = _safe_str(payload.get(key))
         if value:
@@ -934,6 +1005,7 @@ def ensure_account_list_state_schema(session: Session) -> None:
                 auth_type TEXT NOT NULL DEFAULT 'unknown',
                 phone_binding_state TEXT NOT NULL DEFAULT 'unknown',
                 payment_link_platform TEXT NOT NULL DEFAULT 'none',
+                payment_link_generated INTEGER NOT NULL DEFAULT 0,
                 auth_level TEXT NOT NULL DEFAULT '',
                 subscription_type TEXT NOT NULL DEFAULT 'unknown',
                 account_validity TEXT NOT NULL DEFAULT 'valid',
@@ -958,6 +1030,7 @@ def ensure_account_list_state_schema(session: Session) -> None:
         "auth_type": "TEXT NOT NULL DEFAULT 'unknown'",
         "phone_binding_state": "TEXT NOT NULL DEFAULT 'unknown'",
         "payment_link_platform": "TEXT NOT NULL DEFAULT 'none'",
+        "payment_link_generated": "INTEGER NOT NULL DEFAULT 0",
         "auth_level": "TEXT NOT NULL DEFAULT ''",
         "subscription_type": "TEXT NOT NULL DEFAULT 'unknown'",
         "account_validity": "TEXT NOT NULL DEFAULT 'valid'",
@@ -992,6 +1065,7 @@ def ensure_account_list_state_schema(session: Session) -> None:
         "CREATE INDEX IF NOT EXISTS idx_account_list_state_auth_type ON account_list_state(auth_type)",
         "CREATE INDEX IF NOT EXISTS idx_account_list_state_phone_binding_state ON account_list_state(phone_binding_state)",
         "CREATE INDEX IF NOT EXISTS idx_account_list_state_payment_link_platform ON account_list_state(payment_link_platform)",
+        "CREATE INDEX IF NOT EXISTS idx_account_list_state_payment_link_generated ON account_list_state(payment_link_generated)",
         "CREATE INDEX IF NOT EXISTS idx_account_list_state_subscription_type ON account_list_state(subscription_type)",
         "CREATE INDEX IF NOT EXISTS idx_account_list_state_account_validity ON account_list_state(account_validity)",
         "CREATE INDEX IF NOT EXISTS idx_account_list_state_sub2api_state ON account_list_state(sub2api_state)",
@@ -1059,6 +1133,34 @@ def _account_list_state_target_where(
                     FROM account_list_state AS state
                     WHERE state.account_id = accounts.id
                 ), '') != '__ACCOUNT_LIST_STATE_DERIVATION_VERSION__'
+                OR (
+                    coalesce((
+                        SELECT state.payment_link_generated
+                        FROM account_list_state AS state
+                        WHERE state.account_id = accounts.id
+                    ), 0) = 0
+                    AND EXISTS (
+                        SELECT 1
+                        FROM payment_link_generations AS generation
+                        WHERE generation.account_id = accounts.id
+                          AND lower(trim(coalesce(generation.account_email, ''))) = lower(trim(coalesce(accounts.email, '')))
+                          AND trim(coalesce(generation.account_created_at, '')) = trim(CAST(accounts.created_at AS TEXT))
+                          AND lower(trim(coalesce(generation.status, ''))) = 'succeeded'
+                          AND length(trim(coalesce(generation.url, ''))) BETWEEN 8 AND 8192
+                          AND (
+                              (
+                                  lower(trim(generation.url)) LIKE 'http://%'
+                                  AND substr(lower(trim(generation.url)), 8, 1) NOT IN ('', '/', '?', '#')
+                                  AND trim(generation.url) NOT LIKE '% %'
+                              )
+                              OR (
+                                  lower(trim(generation.url)) LIKE 'https://%'
+                                  AND substr(lower(trim(generation.url)), 9, 1) NOT IN ('', '/', '?', '#')
+                                  AND trim(generation.url) NOT LIKE '% %'
+                              )
+                          )
+                    )
+                )
             )
             """
             .replace("__ACCOUNT_LIST_STATE_DERIVATION_VERSION__", ACCOUNT_LIST_STATE_DERIVATION_VERSION.replace("'", "''"))
@@ -1122,6 +1224,8 @@ def refresh_account_list_state(
                 SELECT
                     id AS account_id,
                     platform,
+                    lower(trim(coalesce(email, ''))) AS account_email,
+                    trim(CAST(created_at AS TEXT)) AS account_created_at,
                     status,
                     token,
                     CAST(updated_at AS TEXT) AS source_updated_at,
@@ -1177,38 +1281,116 @@ def refresh_account_list_state(
                     trim(coalesce(json_extract(extra, '$.chatgpt_bound_phone_masked'), '')) AS bound_phone_masked,
                     CASE WHEN json_type(extra, '$.chatgpt_phone_challenge') = 'object' THEN 1 ELSE 0 END AS phone_challenge_present,
                     trim(coalesce(
-                        nullif(trim(CAST(json_extract(extra, '$.chatgpt_last_payment_link.url') AS TEXT)), ''),
-                        nullif(trim(CAST(json_extract(extra, '$.chatgpt_last_payment_link.paypal_url') AS TEXT)), ''),
-                        nullif(trim(CAST(json_extract(extra, '$.chatgpt_last_payment_link.provider_redirect_url') AS TEXT)), ''),
-                        nullif(trim(CAST(json_extract(extra, '$.chatgpt_last_payment_link.approval_url') AS TEXT)), ''),
-                        nullif(trim(CAST(json_extract(extra, '$.chatgpt_last_payment_link.checkout_url') AS TEXT)), ''),
-                        nullif(trim(CAST(json_extract(extra, '$.chatgpt_last_payment_link.cashier_url') AS TEXT)), ''),
+                        (
+                            SELECT trim(CAST(value AS TEXT))
+                            FROM json_each(
+                                CASE
+                                    WHEN json_type(extra, '$.chatgpt_last_payment_link') = 'object'
+                                    THEN json_extract(extra, '$.chatgpt_last_payment_link')
+                                    ELSE '{}'
+                                END
+                            )
+                            WHERE key IN ('url', 'paypal_url', 'provider_redirect_url', 'approval_url', 'checkout_url', 'cashier_url')
+                              AND lower(trim(coalesce(json_extract(extra, '$.chatgpt_last_payment_link.link_status'), ''))) NOT IN ('expired_cleaned', 'paid_cleaned', 'cancelled_cleaned')
+                              AND (
+                                  (
+                                      lower(trim(CAST(value AS TEXT))) LIKE 'http://%'
+                                      AND length(trim(CAST(value AS TEXT))) BETWEEN 8 AND 8192
+                                      AND substr(lower(trim(CAST(value AS TEXT))), 8, 1) NOT IN ('', '/', '?', '#')
+                                      AND trim(CAST(value AS TEXT)) NOT LIKE '% %'
+                                  )
+                                  OR (
+                                      lower(trim(CAST(value AS TEXT))) LIKE 'https://%'
+                                      AND length(trim(CAST(value AS TEXT))) BETWEEN 9 AND 8192
+                                      AND substr(lower(trim(CAST(value AS TEXT))), 9, 1) NOT IN ('', '/', '?', '#')
+                                      AND trim(CAST(value AS TEXT)) NOT LIKE '% %'
+                                  )
+                              )
+                            ORDER BY CASE key
+                                WHEN 'url' THEN 1
+                                WHEN 'paypal_url' THEN 2
+                                WHEN 'provider_redirect_url' THEN 3
+                                WHEN 'approval_url' THEN 4
+                                WHEN 'checkout_url' THEN 5
+                                WHEN 'cashier_url' THEN 6
+                                ELSE 99
+                            END
+                            LIMIT 1
+                        ),
                         ''
                     )) AS last_payment_link_url,
                     trim(coalesce(
-                        nullif(trim(CAST(json_extract(extra, '$.chatgpt_paypal_url.url') AS TEXT)), ''),
-                        nullif(trim(CAST(json_extract(extra, '$.chatgpt_paypal_url.paypal_url') AS TEXT)), ''),
-                        nullif(trim(CAST(json_extract(extra, '$.chatgpt_paypal_url.approval_url') AS TEXT)), ''),
+                        (
+                            SELECT trim(CAST(value AS TEXT))
+                            FROM json_each(
+                                CASE
+                                    WHEN json_type(extra, '$.chatgpt_paypal_url') = 'object'
+                                    THEN json_extract(extra, '$.chatgpt_paypal_url')
+                                    ELSE '{}'
+                                END
+                            )
+                            WHERE key IN ('url', 'paypal_url', 'provider_redirect_url', 'approval_url', 'checkout_url', 'cashier_url')
+                              AND (
+                                  (
+                                      lower(trim(CAST(value AS TEXT))) LIKE 'http://%'
+                                      AND length(trim(CAST(value AS TEXT))) BETWEEN 8 AND 8192
+                                      AND substr(lower(trim(CAST(value AS TEXT))), 8, 1) NOT IN ('', '/', '?', '#')
+                                      AND trim(CAST(value AS TEXT)) NOT LIKE '% %'
+                                  )
+                                  OR (
+                                      lower(trim(CAST(value AS TEXT))) LIKE 'https://%'
+                                      AND length(trim(CAST(value AS TEXT))) BETWEEN 9 AND 8192
+                                      AND substr(lower(trim(CAST(value AS TEXT))), 9, 1) NOT IN ('', '/', '?', '#')
+                                      AND trim(CAST(value AS TEXT)) NOT LIKE '% %'
+                                  )
+                              )
+                            ORDER BY CASE key
+                                WHEN 'url' THEN 1
+                                WHEN 'paypal_url' THEN 2
+                                WHEN 'provider_redirect_url' THEN 3
+                                WHEN 'approval_url' THEN 4
+                                WHEN 'checkout_url' THEN 5
+                                WHEN 'cashier_url' THEN 6
+                                ELSE 99
+                            END
+                            LIMIT 1
+                        ),
                         ''
                     )) AS legacy_paypal_link_url,
                     lower(trim(coalesce(
-                        nullif(trim(CAST(json_extract(extra, '$.chatgpt_last_payment_link.link_type') AS TEXT)), ''),
+                        nullif(trim(CAST(CASE
+                            WHEN lower(trim(coalesce(json_extract(extra, '$.chatgpt_last_payment_link.link_status'), ''))) IN ('expired_cleaned', 'paid_cleaned', 'cancelled_cleaned')
+                            THEN NULL
+                            ELSE json_extract(extra, '$.chatgpt_last_payment_link.link_type')
+                        END AS TEXT)), ''),
                         nullif(trim(CAST(json_extract(extra, '$.chatgpt_paypal_url.link_type') AS TEXT)), ''),
                         CASE WHEN json_type(extra, '$.chatgpt_paypal_url') = 'object' THEN 'paypal' ELSE '' END,
                         ''
                     ))) AS payment_link_type,
                     lower(trim(coalesce(
-                        nullif(trim(CAST(json_extract(extra, '$.chatgpt_last_payment_link.payment_method_type') AS TEXT)), ''),
+                        nullif(trim(CAST(CASE
+                            WHEN lower(trim(coalesce(json_extract(extra, '$.chatgpt_last_payment_link.link_status'), ''))) IN ('expired_cleaned', 'paid_cleaned', 'cancelled_cleaned')
+                            THEN NULL
+                            ELSE json_extract(extra, '$.chatgpt_last_payment_link.payment_method_type')
+                        END AS TEXT)), ''),
                         nullif(trim(CAST(json_extract(extra, '$.chatgpt_paypal_url.payment_method_type') AS TEXT)), ''),
                         ''
                     ))) AS payment_link_method_type,
                     replace(lower(trim(coalesce(
-                        nullif(trim(CAST(json_extract(extra, '$.chatgpt_last_payment_link.payment_link_format') AS TEXT)), ''),
+                        nullif(trim(CAST(CASE
+                            WHEN lower(trim(coalesce(json_extract(extra, '$.chatgpt_last_payment_link.link_status'), ''))) IN ('expired_cleaned', 'paid_cleaned', 'cancelled_cleaned')
+                            THEN NULL
+                            ELSE json_extract(extra, '$.chatgpt_last_payment_link.payment_link_format')
+                        END AS TEXT)), ''),
                         nullif(trim(CAST(json_extract(extra, '$.chatgpt_paypal_url.payment_link_format') AS TEXT)), ''),
                         ''
                     ))), '-', '_') AS payment_link_format,
                     replace(lower(trim(coalesce(
-                        nullif(trim(CAST(json_extract(extra, '$.chatgpt_last_payment_link.payment_source') AS TEXT)), ''),
+                        nullif(trim(CAST(CASE
+                            WHEN lower(trim(coalesce(json_extract(extra, '$.chatgpt_last_payment_link.link_status'), ''))) IN ('expired_cleaned', 'paid_cleaned', 'cancelled_cleaned')
+                            THEN NULL
+                            ELSE json_extract(extra, '$.chatgpt_last_payment_link.payment_source')
+                        END AS TEXT)), ''),
                         nullif(trim(CAST(json_extract(extra, '$.chatgpt_paypal_url.payment_source') AS TEXT)), ''),
                         ''
                     ))), '-', '_') AS payment_link_source,
@@ -1216,6 +1398,30 @@ def refresh_account_list_state(
                         nullif(trim(CAST(json_extract(extra, '$.chatgpt_last_payment_link.link_status') AS TEXT)), ''),
                         ''
                     ))) AS payment_link_status,
+                    CASE
+                        WHEN EXISTS (
+                            SELECT 1
+                            FROM payment_link_generations AS generation
+                            WHERE generation.account_id = account_json.account_id
+                              AND lower(trim(coalesce(generation.account_email, ''))) = account_json.account_email
+                              AND trim(coalesce(generation.account_created_at, '')) = account_json.account_created_at
+                              AND lower(trim(coalesce(generation.status, ''))) = 'succeeded'
+                              AND length(trim(coalesce(generation.url, ''))) BETWEEN 8 AND 8192
+                              AND (
+                                  (
+                                      lower(trim(generation.url)) LIKE 'http://%'
+                                      AND substr(lower(trim(generation.url)), 8, 1) NOT IN ('', '/', '?', '#')
+                                      AND trim(generation.url) NOT LIKE '% %'
+                                  )
+                                  OR (
+                                      lower(trim(generation.url)) LIKE 'https://%'
+                                      AND substr(lower(trim(generation.url)), 9, 1) NOT IN ('', '/', '?', '#')
+                                      AND trim(generation.url) NOT LIKE '% %'
+                                  )
+                              )
+                        ) THEN 1
+                        ELSE 0
+                    END AS payment_generation_succeeded,
                     lower(trim(coalesce(
                         json_extract(extra, '$.chatgpt_capabilities.auth_level'),
                         json_extract(extra, '$.auth_level'),
@@ -1331,11 +1537,38 @@ def refresh_account_list_state(
                         ''
                     )) AS payment_link_url,
                     CASE
+                        WHEN (
+                            (
+                                lower(trim(coalesce(nullif(last_payment_link_url, ''), nullif(legacy_paypal_link_url, ''), ''))) LIKE 'http://%'
+                                AND length(trim(coalesce(nullif(last_payment_link_url, ''), nullif(legacy_paypal_link_url, ''), ''))) BETWEEN 8 AND 8192
+                                AND substr(lower(trim(coalesce(nullif(last_payment_link_url, ''), nullif(legacy_paypal_link_url, ''), ''))), 8, 1) NOT IN ('', '/', '?', '#')
+                                AND trim(coalesce(nullif(last_payment_link_url, ''), nullif(legacy_paypal_link_url, ''), '')) NOT LIKE '% %'
+                            )
+                            OR (
+                                lower(trim(coalesce(nullif(last_payment_link_url, ''), nullif(legacy_paypal_link_url, ''), ''))) LIKE 'https://%'
+                                AND length(trim(coalesce(nullif(last_payment_link_url, ''), nullif(legacy_paypal_link_url, ''), ''))) BETWEEN 9 AND 8192
+                                AND substr(lower(trim(coalesce(nullif(last_payment_link_url, ''), nullif(legacy_paypal_link_url, ''), ''))), 9, 1) NOT IN ('', '/', '?', '#')
+                                AND trim(coalesce(nullif(last_payment_link_url, ''), nullif(legacy_paypal_link_url, ''), '')) NOT LIKE '% %'
+                            )
+                        ) THEN 1
+                        ELSE 0
+                    END AS payment_link_url_valid,
+                    CASE
                         WHEN lower(last_payment_link_url) NOT LIKE 'http://%'
                              AND lower(last_payment_link_url) NOT LIKE 'https://%'
                              AND (
-                                 lower(legacy_paypal_link_url) LIKE 'http://%'
-                                 OR lower(legacy_paypal_link_url) LIKE 'https://%'
+                                 (
+                                     lower(legacy_paypal_link_url) LIKE 'http://%'
+                                     AND length(trim(legacy_paypal_link_url)) BETWEEN 8 AND 8192
+                                     AND substr(lower(trim(legacy_paypal_link_url)), 8, 1) NOT IN ('', '/', '?', '#')
+                                     AND trim(legacy_paypal_link_url) NOT LIKE '% %'
+                                 )
+                                 OR (
+                                     lower(legacy_paypal_link_url) LIKE 'https://%'
+                                     AND length(trim(legacy_paypal_link_url)) BETWEEN 9 AND 8192
+                                     AND substr(lower(trim(legacy_paypal_link_url)), 9, 1) NOT IN ('', '/', '?', '#')
+                                     AND trim(legacy_paypal_link_url) NOT LIKE '% %'
+                                 )
                              )
                         THEN 1
                         ELSE 0
@@ -1475,10 +1708,43 @@ def refresh_account_list_state(
                         ELSE 'unknown'
                     END AS phone_binding_state,
                     CASE
+                        WHEN (
+                            (
+                                lower(payment_link_url) LIKE 'http://%'
+                                AND length(trim(payment_link_url)) BETWEEN 8 AND 8192
+                                AND substr(lower(trim(payment_link_url)), 8, 1) NOT IN ('', '/', '?', '#')
+                                AND trim(payment_link_url) NOT LIKE '% %'
+                            )
+                            OR (
+                                lower(payment_link_url) LIKE 'https://%'
+                                AND length(trim(payment_link_url)) BETWEEN 9 AND 8192
+                                AND substr(lower(trim(payment_link_url)), 9, 1) NOT IN ('', '/', '?', '#')
+                                AND trim(payment_link_url) NOT LIKE '% %'
+                            )
+                            OR (
+                                lower(legacy_paypal_link_url) LIKE 'http://%'
+                                AND length(trim(legacy_paypal_link_url)) BETWEEN 8 AND 8192
+                                AND substr(lower(trim(legacy_paypal_link_url)), 8, 1) NOT IN ('', '/', '?', '#')
+                                AND trim(legacy_paypal_link_url) NOT LIKE '% %'
+                            )
+                            OR (
+                                lower(legacy_paypal_link_url) LIKE 'https://%'
+                                AND length(trim(legacy_paypal_link_url)) BETWEEN 9 AND 8192
+                                AND substr(lower(trim(legacy_paypal_link_url)), 9, 1) NOT IN ('', '/', '?', '#')
+                                AND trim(legacy_paypal_link_url) NOT LIKE '% %'
+                            )
+                            OR payment_link_status IN ('expired_cleaned', 'paid_cleaned', 'cancelled_cleaned')
+                            OR payment_generation_succeeded = 1
+                        )
+                        THEN 1
+                        ELSE 0
+                    END AS payment_link_generated,
+                    CASE
+                        WHEN payment_link_status IN ('expired_cleaned', 'paid_cleaned', 'cancelled_cleaned')
+                        THEN 'none'
                         WHEN payment_link_uses_legacy_paypal = 1
                         THEN 'paypal'
-                        WHEN lower(payment_link_url) NOT LIKE 'http://%'
-                             AND lower(payment_link_url) NOT LIKE 'https://%'
+                        WHEN payment_link_url_valid = 0
                         THEN 'none'
                         WHEN payment_link_type = 'pix' OR payment_link_method_type = 'pix'
                         THEN 'pix'
@@ -1486,15 +1752,54 @@ def refresh_account_list_state(
                              OR payment_link_method_type LIKE '%paypal%'
                              OR payment_link_format IN ('paypal', 'paypal_url', 'paypal_approval', 'provider_url')
                              OR payment_link_source LIKE '%paypal%'
-                             OR lower(payment_link_url) LIKE '%paypal.com/%'
+                             OR lower(payment_link_url) LIKE 'http://paypal.com'
+                             OR lower(payment_link_url) LIKE 'https://paypal.com'
+                             OR lower(payment_link_url) LIKE 'http://paypal.com/%'
+                             OR lower(payment_link_url) LIKE 'https://paypal.com/%'
+                             OR lower(payment_link_url) LIKE 'http://paypal.com?%'
+                             OR lower(payment_link_url) LIKE 'https://paypal.com?%'
+                             OR lower(payment_link_url) LIKE 'http://paypal.com#%'
+                             OR lower(payment_link_url) LIKE 'https://paypal.com#%'
+                             OR lower(payment_link_url) LIKE 'http://%.paypal.com'
+                             OR lower(payment_link_url) LIKE 'https://%.paypal.com'
+                             OR lower(payment_link_url) LIKE 'http://%.paypal.com/%'
+                             OR lower(payment_link_url) LIKE 'https://%.paypal.com/%'
+                             OR lower(payment_link_url) LIKE 'http://%.paypal.com?%'
+                             OR lower(payment_link_url) LIKE 'https://%.paypal.com?%'
+                             OR lower(payment_link_url) LIKE 'http://%.paypal.com#%'
+                             OR lower(payment_link_url) LIKE 'https://%.paypal.com#%'
                         THEN 'paypal'
                         WHEN payment_link_type IN ('hosted', 'chatgpt', 'chatgpt_hosted', 'stripe_hosted')
                              OR payment_link_format IN ('short', 'short_chatgpt', 'long', 'long_hosted', 'hosted', 'hosted_checkout', 'pay_openai', 'stripe_hosted')
                              OR payment_link_source = 'chatgpt_hosted'
+                             OR lower(payment_link_url) LIKE 'http://chatgpt.com'
+                             OR lower(payment_link_url) LIKE 'https://chatgpt.com'
+                             OR lower(payment_link_url) LIKE 'http://chatgpt.com/%'
                              OR lower(payment_link_url) LIKE 'https://chatgpt.com/%'
+                             OR lower(payment_link_url) LIKE 'http://chatgpt.com?%'
+                             OR lower(payment_link_url) LIKE 'https://chatgpt.com?%'
+                             OR lower(payment_link_url) LIKE 'http://chatgpt.com#%'
+                             OR lower(payment_link_url) LIKE 'https://chatgpt.com#%'
+                             OR lower(payment_link_url) LIKE 'http://%.chatgpt.com'
+                             OR lower(payment_link_url) LIKE 'https://%.chatgpt.com'
+                             OR lower(payment_link_url) LIKE 'http://%.chatgpt.com/%'
                              OR lower(payment_link_url) LIKE 'https://%.chatgpt.com/%'
+                             OR lower(payment_link_url) LIKE 'http://pay.openai.com'
+                             OR lower(payment_link_url) LIKE 'https://pay.openai.com'
+                             OR lower(payment_link_url) LIKE 'http://pay.openai.com/%'
                              OR lower(payment_link_url) LIKE 'https://pay.openai.com/%'
+                             OR lower(payment_link_url) LIKE 'http://pay.openai.com?%'
+                             OR lower(payment_link_url) LIKE 'https://pay.openai.com?%'
+                             OR lower(payment_link_url) LIKE 'http://pay.openai.com#%'
+                             OR lower(payment_link_url) LIKE 'https://pay.openai.com#%'
+                             OR lower(payment_link_url) LIKE 'http://%.openai.com'
+                             OR lower(payment_link_url) LIKE 'https://%.openai.com'
+                             OR lower(payment_link_url) LIKE 'http://%.openai.com/%'
                              OR lower(payment_link_url) LIKE 'https://%.openai.com/%'
+                             OR lower(payment_link_url) LIKE 'http://%.openai.com?%'
+                             OR lower(payment_link_url) LIKE 'https://%.openai.com?%'
+                             OR lower(payment_link_url) LIKE 'http://%.openai.com#%'
+                             OR lower(payment_link_url) LIKE 'https://%.openai.com#%'
                         THEN 'chatgpt'
                         ELSE 'other'
                     END AS payment_link_platform,
@@ -1580,6 +1885,7 @@ def refresh_account_list_state(
                 auth_type,
                 phone_binding_state,
                 payment_link_platform,
+                payment_link_generated,
                 auth_level,
                 subscription_type,
                 account_validity,
@@ -1603,6 +1909,7 @@ def refresh_account_list_state(
                 auth_type,
                 phone_binding_state,
                 payment_link_platform,
+                payment_link_generated,
                 auth_level,
                 subscription_type,
                 account_validity,
@@ -1626,6 +1933,7 @@ def refresh_account_list_state(
                 auth_type = excluded.auth_type,
                 phone_binding_state = excluded.phone_binding_state,
                 payment_link_platform = excluded.payment_link_platform,
+                payment_link_generated = excluded.payment_link_generated,
                 auth_level = excluded.auth_level,
                 subscription_type = excluded.subscription_type,
                 account_validity = excluded.account_validity,
@@ -1747,6 +2055,7 @@ def should_use_account_list_state(
     auth_type: Any = None,
     phone_binding_state: Any = None,
     payment_link_platform: Any = None,
+    payment_link_generated: bool | None = None,
     subscription_type: Any = None,
     account_validity_filter: Any = None,
     sub2api_state: Any = None,
@@ -1764,6 +2073,7 @@ def should_use_account_list_state(
             bool(_split_values(auth_type)),
             bool(_split_phone_binding_state_filter_values(phone_binding_state)),
             bool(_split_payment_link_platform_filter_values(payment_link_platform)),
+            payment_link_generated is not None,
             bool(_split_values(subscription_type)),
             bool(_split_values(account_validity_filter)),
             bool(_split_integration_upload_state_filter_values(sub2api_state)),
@@ -1784,6 +2094,7 @@ def apply_account_list_state_filters(
     auth_type: Any = None,
     phone_binding_state: Any = None,
     payment_link_platform: Any = None,
+    payment_link_generated: bool | None = None,
     subscription_type: Any = None,
     account_validity_filter: Any = None,
     sub2api_state: Any = None,
@@ -1807,6 +2118,9 @@ def apply_account_list_state_filters(
     payment_link_platforms = _split_payment_link_platform_filter_values(payment_link_platform)
     if payment_link_platforms:
         query = query.where(AccountListStateModel.payment_link_platform.in_(sorted(payment_link_platforms)))
+
+    if payment_link_generated is not None:
+        query = query.where(AccountListStateModel.payment_link_generated == payment_link_generated)
 
     subscription_types = _split_values(subscription_type)
     if subscription_types:
@@ -1860,6 +2174,7 @@ def account_filtered_query(
         auth_type=normalized["auth_type"],
         phone_binding_state=normalized["phone_binding_state"],
         payment_link_platform=normalized["payment_link_platform"],
+        payment_link_generated=normalized["payment_link_generated"],
         subscription_type=normalized["subscription_type"],
         account_validity_filter=normalized["account_validity"],
         sub2api_state=normalized["sub2api_state"],
@@ -1892,6 +2207,7 @@ def account_filtered_query(
         auth_type=normalized["auth_type"],
         phone_binding_state=normalized["phone_binding_state"],
         payment_link_platform=normalized["payment_link_platform"],
+        payment_link_generated=normalized["payment_link_generated"],
         subscription_type=normalized["subscription_type"],
         account_validity_filter=normalized["account_validity"],
         sub2api_state=normalized["sub2api_state"],
@@ -1990,6 +2306,7 @@ def filter_account_rows(
     auth_type: Any = None,
     phone_binding_state: Any = None,
     payment_link_platform: Any = None,
+    payment_link_generated: bool | None = None,
     subscription_type: Any = None,
     account_validity_filter: Any = None,
     sub2api_state: Any = None,
@@ -2020,6 +2337,8 @@ def filter_account_rows(
         if phone_binding_states and account_phone_binding_state(row, extra) not in phone_binding_states:
             continue
         if payment_link_platforms and account_payment_link_platform(row, extra) not in payment_link_platforms:
+            continue
+        if payment_link_generated is not None and account_payment_link_generated(row, extra) is not payment_link_generated:
             continue
         if subscription_types and account_subscription_type(row, extra) not in subscription_types:
             continue

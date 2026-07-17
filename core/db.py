@@ -76,6 +76,11 @@ class PaymentLinkGenerationModel(SQLModel, table=True):
 
     id: Optional[int] = Field(default=None, primary_key=True)
     account_id: int = Field(index=True)
+    # The numeric account id is reusable in SQLite.  Keep the immutable account
+    # identity alongside it so an old async result cannot attach to a later row
+    # that happens to receive the same id.
+    account_email: str = Field(default="", index=True)
+    account_created_at: str = ""
     task_id: str = Field(default="", index=True)
     request_id: str = Field(default="", index=True)
     remote_batch_id: str = Field(default="", index=True)
@@ -224,6 +229,7 @@ class AccountListStateModel(SQLModel, table=True):
     auth_type: str = Field(default="unknown", index=True)
     phone_binding_state: str = Field(default="unknown", index=True)
     payment_link_platform: str = Field(default="none", index=True)
+    payment_link_generated: bool = Field(default=False, index=True)
     auth_level: str = Field(default="", index=True)
     subscription_type: str = Field(default="unknown", index=True)
     account_validity: str = Field(default="valid", index=True)
@@ -3351,6 +3357,7 @@ def _ensure_account_list_state_schema() -> None:
                 auth_type TEXT NOT NULL DEFAULT 'unknown',
                 phone_binding_state TEXT NOT NULL DEFAULT 'unknown',
                 payment_link_platform TEXT NOT NULL DEFAULT 'none',
+                payment_link_generated INTEGER NOT NULL DEFAULT 0,
                 auth_level TEXT NOT NULL DEFAULT '',
                 subscription_type TEXT NOT NULL DEFAULT 'unknown',
                 account_validity TEXT NOT NULL DEFAULT 'valid',
@@ -3376,6 +3383,7 @@ def _ensure_account_list_state_schema() -> None:
             "auth_type": "TEXT NOT NULL DEFAULT 'unknown'",
             "phone_binding_state": "TEXT NOT NULL DEFAULT 'unknown'",
             "payment_link_platform": "TEXT NOT NULL DEFAULT 'none'",
+            "payment_link_generated": "INTEGER NOT NULL DEFAULT 0",
             "auth_level": "TEXT NOT NULL DEFAULT ''",
             "subscription_type": "TEXT NOT NULL DEFAULT 'unknown'",
             "account_validity": "TEXT NOT NULL DEFAULT 'valid'",
@@ -3423,6 +3431,10 @@ def _ensure_account_list_state_schema() -> None:
             "ON account_list_state(payment_link_platform)"
         )
         conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_account_list_state_payment_link_generated "
+            "ON account_list_state(payment_link_generated)"
+        )
+        conn.exec_driver_sql(
             "CREATE INDEX IF NOT EXISTS idx_account_list_state_subscription_type "
             "ON account_list_state(subscription_type)"
         )
@@ -3464,6 +3476,82 @@ def _ensure_account_list_state_schema() -> None:
         )
 
 
+def _ensure_payment_link_generation_schema() -> None:
+    """Add immutable account identity columns to payment-link history.
+
+    ``accounts.id`` is an integer primary key and may be reused after a delete.
+    Existing history rows predate the identity columns, so bind only rows whose
+    identity is still empty and whose account currently exists.  Orphan rows
+    remain unbound and are intentionally ignored by the payment-link guard.
+    """
+
+    if not _IS_SQLITE:
+        return
+    with engine.begin() as conn:
+        existing_columns = {
+            str(row[1])
+            for row in conn.exec_driver_sql("PRAGMA table_info(payment_link_generations)").fetchall()
+        }
+        if not existing_columns:
+            return
+        required_columns = {
+            "account_email": "TEXT NOT NULL DEFAULT ''",
+            "account_created_at": "TEXT NOT NULL DEFAULT ''",
+        }
+        for column_name, ddl in required_columns.items():
+            if column_name in existing_columns:
+                continue
+            conn.exec_driver_sql(
+                f"ALTER TABLE payment_link_generations ADD COLUMN {column_name} {ddl}"
+            )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_payment_link_generations_account_email "
+            "ON payment_link_generations(account_email)"
+        )
+        conn.exec_driver_sql(
+            """
+            UPDATE payment_link_generations
+            SET
+                account_email = lower(trim(CAST((
+                    SELECT email FROM accounts WHERE accounts.id = payment_link_generations.account_id
+                ) AS TEXT))),
+                account_created_at = CAST((
+                    SELECT created_at FROM accounts WHERE accounts.id = payment_link_generations.account_id
+                ) AS TEXT)
+            WHERE EXISTS (
+                SELECT 1 FROM accounts WHERE accounts.id = payment_link_generations.account_id
+            )
+              AND (
+                  trim(coalesce(account_email, '')) = ''
+                  OR trim(coalesce(account_created_at, '')) = ''
+              )
+            """
+        )
+
+
+def _ensure_payment_link_generation_cleanup_trigger() -> None:
+    """Remove durable link history when its account row is deleted.
+
+    Account ids are reusable in SQLite.  Without a database-level cleanup
+    trigger, deleting an account and later creating a new row with the same id
+    would incorrectly inherit the previous account's successful-link history.
+    The trigger covers ORM deletes and raw SQL maintenance paths alike.
+    """
+
+    if not _IS_SQLITE:
+        return
+    with engine.begin() as conn:
+        conn.exec_driver_sql(
+            """
+            CREATE TRIGGER IF NOT EXISTS trg_accounts_delete_payment_link_generations
+            AFTER DELETE ON accounts
+            BEGIN
+                DELETE FROM payment_link_generations WHERE account_id = OLD.id;
+            END
+            """
+        )
+
+
 def init_db():
     _ensure_icloud_hme_alias_schema()
     _ensure_icloud_hme_recheck_queue_schema()
@@ -3471,6 +3559,8 @@ def init_db():
     _ensure_phone_prefix_state_schema()
     _ensure_baxigpt_cdk_pool_schema()
     SQLModel.metadata.create_all(engine)
+    _ensure_payment_link_generation_schema()
+    _ensure_payment_link_generation_cleanup_trigger()
     _ensure_account_list_state_schema()
     _ensure_delivery_card_schema()
     _ensure_task_log_schema()

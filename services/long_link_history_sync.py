@@ -82,6 +82,7 @@ class AccountRow:
     cashier_url: str
     extra_json: str
     updated_at: str
+    created_at: str = ""
 
 
 @dataclass
@@ -96,6 +97,8 @@ class GenerationRow:
     link_type: str
     generated_at: str
     result_json: str
+    account_email: str = ""
+    account_created_at: str = ""
 
 
 @dataclass
@@ -334,14 +337,23 @@ def _load_target_snapshot(path: Path, *, platform: str, busy_timeout_seconds: in
                 f"payment_link_generations is missing columns in {path}: {sorted(missing_generations)}"
             )
 
+        account_created_at_expr = (
+            "CAST(created_at AS TEXT)" if "created_at" in account_columns else "''"
+        )
+        generation_email_expr = "account_email" if "account_email" in generation_columns else "''"
+        generation_created_at_expr = (
+            "account_created_at" if "account_created_at" in generation_columns else "''"
+        )
+
         accounts: dict[int, AccountRow] = {}
         email_index: dict[str, list[AccountRow]] = defaultdict(list)
         for row in connection.execute(
             """
-            SELECT id, email, cashier_url, extra_json, updated_at
+            SELECT id, email, cashier_url, extra_json, updated_at,
+                   {account_created_at_expr} AS created_at
             FROM accounts
             WHERE platform = ?
-            """,
+            """.format(account_created_at_expr=account_created_at_expr),
             (platform,),
         ):
             account = AccountRow(
@@ -351,6 +363,7 @@ def _load_target_snapshot(path: Path, *, platform: str, busy_timeout_seconds: in
                 cashier_url=_safe_text(row[2]),
                 extra_json=str(row[3] or "{}"),
                 updated_at=_safe_text(row[4], limit=128),
+                created_at=_safe_text(row[5], limit=128),
             )
             accounts[account.account_id] = account
             if account.email:
@@ -361,9 +374,14 @@ def _load_target_snapshot(path: Path, *, platform: str, busy_timeout_seconds: in
         for row in connection.execute(
             """
             SELECT id, account_id, request_id, remote_job_id, status, url, link_type,
-                   generated_at, result_json
+                   generated_at, result_json,
+                   {generation_email_expr} AS account_email,
+                   {generation_created_at_expr} AS account_created_at
             FROM payment_link_generations
-            """
+            """.format(
+                generation_email_expr=generation_email_expr,
+                generation_created_at_expr=generation_created_at_expr,
+            )
         ):
             generation = GenerationRow(
                 database=path,
@@ -376,6 +394,8 @@ def _load_target_snapshot(path: Path, *, platform: str, busy_timeout_seconds: in
                 link_type=_normalized_link_type(row[6]),
                 generated_at=_safe_text(row[7], limit=128),
                 result_json=str(row[8] or "{}"),
+                account_email=_normalized_email(row[9]),
+                account_created_at=_safe_text(row[10], limit=128),
             )
             if generation.remote_job_id:
                 by_remote_job[generation.remote_job_id].append(generation)
@@ -468,6 +488,16 @@ def _generation_is_current(existing: GenerationRow, source: SourceLink) -> bool:
     )
 
 
+def _generation_matches_account_identity(existing: GenerationRow, account: AccountRow) -> bool:
+    """Reject a history row that is tied to a different incarnation of an id."""
+
+    if existing.account_email and existing.account_email != account.email:
+        return False
+    if existing.account_created_at and account.created_at and existing.account_created_at != account.created_at:
+        return False
+    return True
+
+
 def _unique_accounts(rows: Iterable[GenerationRow], targets: dict[Path, TargetSnapshot]) -> list[AccountRow]:
     unique: dict[tuple[Path, int], AccountRow] = {}
     for row in rows:
@@ -526,6 +556,10 @@ def _build_plans(source_rows: list[SourceLink], targets: list[TargetSnapshot]) -
                     continue
                 existing = by_request
 
+        if existing is not None and not _generation_matches_account_identity(existing, account):
+            counters["skipped_generation_identity_conflict"] += 1
+            continue
+
         action = "insert"
         if existing is not None:
             if existing.account_id != account.account_id:
@@ -578,48 +612,95 @@ def _upsert_generation(
     payload = _record_payload(source)
     result_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     existing = record.existing_generation
+    generation_columns = _table_columns(connection, "payment_link_generations")
+    has_account_email = "account_email" in generation_columns
+    has_account_created_at = "account_created_at" in generation_columns
+
     if existing is not None and record.generation_action == "existing":
+        identity_assignments: list[str] = []
+        identity_values: list[Any] = []
+        if has_account_email:
+            identity_assignments.append("account_email = ?")
+            identity_values.append(record.account.email)
+        if has_account_created_at:
+            identity_assignments.append("account_created_at = ?")
+            identity_values.append(record.account.created_at)
+        if identity_assignments:
+            connection.execute(
+                "UPDATE payment_link_generations SET "
+                + ", ".join(identity_assignments)
+                + " WHERE id = ?",
+                tuple(identity_values) + (existing.generation_id,),
+            )
         return "existing"
     if existing is not None:
-        connection.execute(
-            """
-            UPDATE payment_link_generations
-            SET status = 'succeeded', link_type = ?, url = ?, generated_at = ?,
-                persisted_at = ?, sanitized_error = '', result_json = ?, updated_at = ?
-            WHERE id = ?
-            """,
-            (
-                source.link_type,
-                source.url,
-                source.generated_at,
-                now_iso,
-                result_json,
-                now_iso,
-                existing.generation_id,
-            ),
-        )
-        return "updated"
-    connection.execute(
-        """
-        INSERT INTO payment_link_generations (
-            account_id, task_id, request_id, remote_batch_id, remote_job_id,
-            profile_hash, link_type, status, url, submitted_at, started_at,
-            generated_at, persisted_at, sanitized_error, result_json, created_at, updated_at
-        ) VALUES (?, ?, ?, '', ?, '', ?, 'succeeded', ?, '', '', ?, ?, '', ?, ?, ?)
-        """,
-        (
-            record.account.account_id,
-            SYNC_TASK_ID,
-            source.request_id,
-            source.job_id,
+        update_assignments = [
+            "status = 'succeeded'",
+            "link_type = ?",
+            "url = ?",
+            "generated_at = ?",
+            "persisted_at = ?",
+            "sanitized_error = ''",
+            "result_json = ?",
+            "updated_at = ?",
+        ]
+        update_values: list[Any] = [
             source.link_type,
             source.url,
             source.generated_at,
             now_iso,
             result_json,
             now_iso,
-            now_iso,
-        ),
+        ]
+        if has_account_email:
+            update_assignments.append("account_email = ?")
+            update_values.append(record.account.email)
+        if has_account_created_at:
+            update_assignments.append("account_created_at = ?")
+            update_values.append(record.account.created_at)
+        update_values.append(existing.generation_id)
+        connection.execute(
+            "UPDATE payment_link_generations SET "
+            + ", ".join(update_assignments)
+            + " WHERE id = ?",
+            tuple(update_values),
+        )
+        return "updated"
+    columns = [
+        "account_id", "task_id", "request_id", "remote_batch_id", "remote_job_id",
+        "profile_hash", "link_type", "status", "url", "submitted_at", "started_at",
+        "generated_at", "persisted_at", "sanitized_error", "result_json", "created_at", "updated_at",
+    ]
+    values: list[Any] = [
+        record.account.account_id,
+        SYNC_TASK_ID,
+        source.request_id,
+        "",
+        source.job_id,
+        "",
+        source.link_type,
+        "succeeded",
+        source.url,
+        "",
+        "",
+        source.generated_at,
+        now_iso,
+        "",
+        result_json,
+        now_iso,
+        now_iso,
+    ]
+    if has_account_email:
+        columns.insert(0, "account_email")
+        values.insert(0, record.account.email)
+    if has_account_created_at:
+        insertion_index = 1 if has_account_email else 0
+        columns.insert(insertion_index, "account_created_at")
+        values.insert(insertion_index, record.account.created_at)
+    placeholders = ", ".join("?" for _ in columns)
+    connection.execute(
+        f"INSERT INTO payment_link_generations ({', '.join(columns)}) VALUES ({placeholders})",
+        tuple(values),
     )
     return "inserted"
 

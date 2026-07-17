@@ -43,6 +43,7 @@ def test_account_filter_preset_crud_and_normalization(monkeypatch):
                     "authType": ["refresh_token"],
                     "phoneBindingState": ["unbound"],
                     "paymentLinkPlatform": ["pix", "none", "pix"],
+                    "paymentLinkGenerated": ["succeeded", "true"],
                     "accountValidity": ["valid"],
                     "oaipayState": ["unknown", "not_found"],
                     "ideaSubmitState": ["available", "submitted", "processing", "unavailable"],
@@ -61,6 +62,7 @@ def test_account_filter_preset_crud_and_normalization(monkeypatch):
     assert item["filters"]["columnFilters"]["subscriptionType"] == ["plus", "pro"]
     assert item["filters"]["columnFilters"]["phoneBindingState"] == ["unbound"]
     assert item["filters"]["columnFilters"]["paymentLinkPlatform"] == ["pix", "none"]
+    assert item["filters"]["columnFilters"]["paymentLinkGenerated"] == ["true"]
     assert item["filters"]["columnFilters"]["oaipayState"] == ["not_uploaded"]
     assert item["filters"]["columnFilters"]["ideaSubmitState"] == ["unsubmitted", "submitting", "unavailable"]
     assert item["filters"]["columnFilters"]["submitState"] == ["unsubmitted", "submitting", "timeout"]
@@ -68,6 +70,11 @@ def test_account_filter_preset_crud_and_normalization(monkeypatch):
     assert item["filters"]["sortOrder"] == "asc"
     assert item["filters"]["pageSize"] == 50
     assert created["custom_count"] == 1
+
+    normalized_all_history = accounts._normalize_filter_preset_filters(
+        {"columnFilters": {"paymentLinkGenerated": ["true", "never"]}}
+    )
+    assert normalized_all_history["columnFilters"]["paymentLinkGenerated"] == []
 
     with pytest.raises(HTTPException) as duplicate:
         accounts.create_account_filter_preset(

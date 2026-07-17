@@ -6,6 +6,23 @@
 
 ## [Unreleased] (未发布)
 
+## [2.3.8] - 2026-07-18
+
+### 优化 (Changed)
+- **支付链接筛选拆分为当前状态与历史记录两个维度**：`frontend/src/pages/Accounts.tsx` 与 `frontend/src/features/accounts/hooks/useAccountsQuery.ts` 将支付链接筛选拆为“当前链接类型”（PIX、PayPal、ChatGPT 结账、其他、当前无链接）和“提取记录”（已成功提取、尚未成功提取）。提取记录保留二元 OR 语义：只选一项筛对应状态，两项同时选择自动归一为不筛选；筛选组合、移动端控件、任务范围和 API 查询参数统一携带 `payment_link_generated`。
+- **历史成功证据进入账号列表派生索引**：`services/account_filters.py` 与 `core/db.py` 新增 `account_list_state.payment_link_generated` 及索引。当前合法 HTTP(S) 链接、三类 PIX 清理墓碑（`expired_cleaned`、`paid_cleaned`、`cancelled_cleaned`）、成功生成历史和合法旧版 PayPal 链接均归入“已成功提取”；当前链接平台仍只表示实际可打开的当前 URL，清理后的账号显示为“当前无链接”。普通列表和详情接口只对缺失/过期页状态做批量刷新，避免分页序列化触发逐账号查询。
+- **清理墓碑保留可追溯元数据**：列表摘要保留链接类型、生成时间、清理时间和清理原因等非 URL 信息；残留 URL 不会被展示或通过旧版 PayPal 字段复活，前端清理行不再提供复制/打开操作。
+
+### 修复 (Fixed)
+- **普通支付链接生成默认防重复**：`api/tasks.py` 在任务解析、worker 准备阶段和远端批量提交前复核当前合法链接、清理墓碑、成功历史和旧版 PayPal URL。普通模式遇到任一成功证据都会跳过；失败/中断或非法 URL 仍可重试。
+- **强制重新生成保留明确边界**：`force_refresh=true` 可绕过普通成功历史、过期/取消清理和非付款终态旧链接，但账号失效、已订阅、明确 `paid`/`already_paid`/`paid_cleaned` 以及新鲜的 `submitting`/`queued`/`running` 任务始终阻断。历史成功只认 `payment_link_generations.status=succeeded` 且记录 URL 合法，生成成功状态不会误判为已付款。
+- **并发任务采用 SQLite 原子 claim**：最终提交前使用 `BEGIN IMMEDIATE` 检查并写入本任务的 `submitting` provisional 记录，只有首个持锁任务可以调用远端；异常任务通过失败/中断终态或 `max(30 分钟, OPENAI_PAY_LONG_LINK_JOB_TIMEOUT_SECONDS + 5 分钟)` TTL 释放，避免重复提交和永久卡死。
+- **删除账号不污染新账号历史**：`core/db.py` 在初始化时创建账号删除触发器，账号删除会同步清理 `payment_link_generations`，防止 SQLite 复用主键后新账号继承旧支付链接成功记录。
+
+### 测试 (Tests)
+- **支付筛选与任务回归**：`tests/test_account_filter_presets.py`、`tests/test_accounts_payment_link_filter_ui.py`、`tests/test_account_filters.py`、`tests/test_filtered_task_scope.py`、`tests/test_payment_link_generation_history.py`、`tests/test_payment_link_task_guard.py`、`tests/test_pix_payment_link_cleanup.py`、`tests/test_register_task_controls.py` 等定向回归共 `128 passed`，覆盖清理后历史筛选、非法/超长 URL、旧版 PayPal、强制边界、在途 TTL、批量历史加载、账号删除后 ID 复用和任务范围一致性。
+- **前端与构建验证**：`frontend` 的 `npm run build` 和 `npm test`（9 项）通过；全量后端测试在当前工作站缺少 `argon2` 依赖，排除受影响的认证测试后为 `961 passed`，剩余失败为既有 custom-email 代理默认值契约及同一缺失依赖引起的导入失败。
+
 ## [2.3.7] - 2026-07-18
 
 ### 优化 (Changed)
@@ -1968,4 +1985,8 @@
 
 ## 2026-07-18 06:11:02 +0800
 - 升级 v2.3.7：明确提交记录筛选语义
+- 发布模式: multi
+
+## 2026-07-18 07:43:48 +0800
+- 升级 v2.3.8：支付链接历史筛选与生成防重
 - 发布模式: multi

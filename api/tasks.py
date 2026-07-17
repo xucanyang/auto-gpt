@@ -2,12 +2,13 @@ from collections import deque
 from datetime import datetime, timezone
 import hashlib
 import os
+import uuid
 from urllib.parse import urlsplit
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import func
+from sqlalchemy import func, text
 from sqlmodel import Session, select
 from typing import Any, Literal, Optional
 from copy import deepcopy
@@ -43,6 +44,7 @@ from services.account_rate_limit_recovery import (
     reconcile_rate_limited_accounts,
 )
 from services.chatgpt_core.payment_link_cache import (
+    PIX_CLEANED_STATUSES,
     PAYMENT_LINK_FORMAT_LONG_LINK,
     PAYMENT_SOURCE_LONG_LINK,
     cache_checkout_link_in_extra,
@@ -1879,14 +1881,374 @@ def _build_batch_payment_link_params(account: AccountModel, request_params: dict
     return params
 
 
-def _payment_link_skip_reason(account: AccountModel, *, force_refresh: bool = False) -> str:
+_PAYMENT_LINK_HISTORY_SUCCESS_STATUSES = frozenset({"succeeded"})
+_PAYMENT_LINK_HISTORY_IN_FLIGHT_STATUSES = frozenset({
+    "submitting",
+    "queued",
+    "running",
+})
+_PAYMENT_LINK_PAID_TERMINAL_STATUSES = frozenset({
+    "paid",
+    "already_paid",
+    "paid_cleaned",
+})
+_PAYMENT_LINK_IN_FLIGHT_MIN_TTL_SECONDS = 30 * 60
+_PAYMENT_LINK_IN_FLIGHT_GRACE_SECONDS = 5 * 60
+
+
+def _payment_link_inflight_ttl_seconds() -> float:
+    """Return a bounded freshness window for durable remote-job claims.
+
+    ``payment_link_generations`` survives a process restart, while the task
+    runtime does not.  A fresh queued/running row must therefore block a
+    competing task, but an old row from a crashed worker must eventually be
+    retriable.  The remote job timeout is the natural upper bound; retain a
+    minimum window for deployments with an accidentally tiny env value.
+    """
+
+    try:
+        timeout = float(os.getenv("OPENAI_PAY_LONG_LINK_JOB_TIMEOUT_SECONDS") or 1800.0)
+    except (TypeError, ValueError):
+        timeout = 1800.0
+    if timeout != timeout or timeout <= 0:
+        timeout = 1800.0
+    return max(
+        float(_PAYMENT_LINK_IN_FLIGHT_MIN_TTL_SECONDS),
+        timeout + float(_PAYMENT_LINK_IN_FLIGHT_GRACE_SECONDS),
+    )
+
+
+def _coerce_payment_link_datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        text_value = str(value or "").strip()
+        if not text_value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(text_value.replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _payment_link_account_created_at_text(value: Any) -> str:
+    """Use the same naive timestamp representation SQLite stores for accounts."""
+
+    if isinstance(value, datetime):
+        # SQLAlchemy's SQLite DateTime adapter persists a timezone-aware value
+        # without the offset.  Preserve the wall-clock fields so this matches
+        # ``CAST(accounts.created_at AS TEXT)`` used by the SQL list projection.
+        return value.replace(tzinfo=None).isoformat(sep=" ")
+    return str(value or "").strip()
+
+
+def _payment_link_account_identity_values(account: AccountModel) -> tuple[str, str]:
+    return (
+        str(getattr(account, "email", "") or "").strip().lower(),
+        _payment_link_account_created_at_text(getattr(account, "created_at", None)),
+    )
+
+
+def _payment_link_account_identity(account: AccountModel) -> str:
+    """Bind an asynchronous payment result to one immutable account row."""
+
+    account_email, account_created_at = _payment_link_account_identity_values(account)
+    source = "\x1f".join(
+        (
+            str(int(getattr(account, "id", 0) or 0)),
+            str(getattr(account, "platform", "") or "").strip().lower(),
+            account_email,
+            account_created_at,
+        )
+    )
+    return hashlib.sha256(source.encode("utf-8")).hexdigest()
+
+
+def _payment_link_generation_matches_account(
+    row: PaymentLinkGenerationModel | None,
+    account: AccountModel | None,
+) -> bool:
+    """Return whether a persisted generation belongs to the current account row."""
+
+    if row is None or account is None:
+        return False
+    if int(getattr(row, "account_id", 0) or 0) != int(getattr(account, "id", 0) or 0):
+        return False
+    expected_email, expected_created_at = _payment_link_account_identity_values(account)
+    row_email = str(getattr(row, "account_email", "") or "").strip().lower()
+    row_created_at = _payment_link_account_created_at_text(getattr(row, "account_created_at", ""))
+    return bool(expected_email and expected_created_at and row_email and row_created_at) and (
+        row_email == expected_email and row_created_at == expected_created_at
+    )
+
+
+def _payment_link_generation_matches_pending(
+    row: PaymentLinkGenerationModel | None,
+    pending: dict[str, Any],
+) -> bool:
+    """Check a request row against the immutable identity captured at submit time."""
+
+    if row is None:
+        return False
+    pending_email = str(pending.get("account_email") or "").strip().lower()
+    pending_created_at = _payment_link_account_created_at_text(pending.get("account_created_at"))
+    row_email = str(getattr(row, "account_email", "") or "").strip().lower()
+    row_created_at = _payment_link_account_created_at_text(getattr(row, "account_created_at", ""))
+    return bool(pending_email and pending_created_at and row_email and row_created_at) and (
+        int(getattr(row, "account_id", 0) or 0) == int(pending.get("account_id", 0) or 0)
+        and row_email == pending_email
+        and row_created_at == pending_created_at
+    )
+
+
+def _payment_link_pending_matches_account(account: AccountModel | None, pending: dict[str, Any]) -> bool:
+    if account is None or str(getattr(account, "platform", "") or "").strip().lower() != "chatgpt":
+        return False
+    expected_email, expected_created_at = _payment_link_account_identity_values(account)
+    pending_email = str(pending.get("account_email") or "").strip().lower()
+    pending_created_at = _payment_link_account_created_at_text(pending.get("account_created_at"))
+    if not pending_email or not pending_created_at or pending_email != expected_email or pending_created_at != expected_created_at:
+        return False
+    expected = str(pending.get("account_identity") or "").strip()
+    return bool(expected) and _payment_link_account_identity(account) == expected
+
+
+def _payment_link_pending_identity_kwargs(pending: dict[str, Any]) -> dict[str, str]:
+    """Return the persisted identity fields captured before remote submit."""
+
+    return {
+        "account_email": str(pending.get("account_email") or "").strip().lower(),
+        "account_created_at": _payment_link_account_created_at_text(
+            pending.get("account_created_at")
+        ),
+    }
+
+
+def _payment_link_generation_activity_at(row: PaymentLinkGenerationModel) -> datetime | None:
+    # updated_at is written on every remote status transition.  The string
+    # fallbacks cover rows created by older migrations that predate it.
+    for field_name in ("updated_at", "persisted_at", "submitted_at", "started_at", "created_at"):
+        parsed = _coerce_payment_link_datetime(getattr(row, field_name, None))
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _payment_link_generation_is_fresh_inflight(
+    row: PaymentLinkGenerationModel,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    status = str(getattr(row, "status", "") or "").strip().lower()
+    if status not in _PAYMENT_LINK_HISTORY_IN_FLIGHT_STATUSES:
+        return False
+    activity_at = _payment_link_generation_activity_at(row)
+    if activity_at is None:
+        # A malformed timestamp must not become a permanent account lock.
+        return False
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    age_seconds = (current.astimezone(timezone.utc) - activity_at).total_seconds()
+    return age_seconds <= _payment_link_inflight_ttl_seconds()
+
+
+def _payment_link_generation_has_url(row: PaymentLinkGenerationModel) -> bool:
+    # ``url`` is the canonical durable success artifact. Keeping this strict
+    # matches the account-list SQL projection and avoids treating incidental
+    # URLs in a diagnostic result payload as a successful extraction.
+    return bool(_validated_payment_link_url(getattr(row, "url", "")))
+
+
+def _validated_payment_link_url(value: Any) -> str:
+    """Match the account-list contract for a browser-openable payment URL."""
+
+    url = str(value or "").strip()
+    if not url or len(url) > 8192:
+        return ""
+    try:
+        parsed = urlsplit(url)
+    except (TypeError, ValueError):
+        return ""
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+        return ""
+    return url
+
+
+def _payment_link_current_cache_url(cached: dict[str, Any]) -> str:
+    if not isinstance(cached, dict):
+        return ""
+    link_format = str(cached.get("payment_link_format") or "long_hosted").strip()
+    for field_name in (
+        "url",
+        "paypal_url",
+        "provider_redirect_url",
+        "approval_url",
+        "checkout_url",
+        "cashier_url",
+    ):
+        raw_value = cached.get(field_name)
+        if not str(raw_value or "").strip():
+            continue
+        normalized = normalize_payment_link_url(raw_value, link_format)
+        validated = _validated_payment_link_url(normalized)
+        if validated:
+            return validated
+    return ""
+
+
+def _load_payment_link_history_by_account(
+    session: Session,
+    account_ids: list[int] | set[int] | tuple[int, ...],
+) -> dict[int, list[PaymentLinkGenerationModel]]:
+    ids: list[int] = []
+    for value in account_ids:
+        try:
+            normalized = int(value or 0)
+        except (TypeError, ValueError):
+            continue
+        if normalized > 0 and normalized not in ids:
+            ids.append(normalized)
+    ids.sort()
+    if not ids:
+        return {}
+    rows = session.exec(
+        select(PaymentLinkGenerationModel).where(PaymentLinkGenerationModel.account_id.in_(ids))
+    ).all()
+    grouped: dict[int, list[PaymentLinkGenerationModel]] = {}
+    for row in rows:
+        grouped.setdefault(int(row.account_id or 0), []).append(row)
+    return grouped
+
+
+def _payment_link_paid_terminal_marker(
+    account: AccountModel,
+    cached: dict[str, Any],
+    extra: dict[str, Any],
+) -> bool:
+    """Detect an explicit paid/already-paid terminal, including old payloads."""
+
+    def is_paid_status(value: Any) -> bool:
+        return str(value or "").strip().lower().replace("-", "_") in _PAYMENT_LINK_PAID_TERMINAL_STATUSES
+
+    if is_paid_status(cached.get("link_status")):
+        return True
+    if bool(extra.get("chatgpt_payment_already_paid")):
+        return True
+    if is_paid_status(extra.get("chatgpt_payment_status")):
+        return True
+    if str(extra.get("chatgpt_checkout_error_code") or "").strip().lower().replace("-", "_") in {
+        "already_paid",
+        "paid",
+        "paid_cleaned",
+    }:
+        return True
+
+    # GoPay and older checkout adapters persist their terminal state in a
+    # nested snapshot rather than changing AccountModel.status immediately.
+    for key in ("chatgpt_gopay", "chatgpt_payment", "payment"):
+        snapshot = extra.get(key)
+        if not isinstance(snapshot, dict):
+            continue
+        if any(
+            is_paid_status(snapshot.get(field_name))
+            for field_name in ("phase", "status", "state", "payment_status", "upstream_status")
+        ):
+            return True
+        result = snapshot.get("result")
+        if isinstance(result, dict) and any(
+            is_paid_status(result.get(field_name))
+            for field_name in ("phase", "status", "state", "payment_status", "upstream_status")
+        ):
+            return True
+
+    # Some historical rows only retained the upstream error text.
+    marker_text = " ".join(
+        str(extra.get(key) or "").strip().lower()
+        for key in ("chatgpt_checkout_error_body", "chatgpt_skip_save_reason", "chatgpt_unavailable_reason")
+    )
+    if any(token in marker_text for token in ("already paid", "user is already paid", "you have paid")):
+        return True
+    del account  # Kept in the signature for call-site readability.
+    return False
+
+
+def _payment_link_skip_reason(
+    account: AccountModel,
+    *,
+    force_refresh: bool = False,
+    session: Session | None = None,
+    exclude_request_id: str = "",
+    history_rows: list[PaymentLinkGenerationModel] | None = None,
+) -> str:
+    """Return a durable, account-level generation guard reason.
+
+    The current cache decides whether a matching URL can be reused.  This
+    helper covers the separate historical dimension: successful generations,
+    cleaned PIX tombstones, explicit paid terminals, and fresh remote claims.
+    """
+
     status = str(getattr(account, "status", "") or "").strip().lower()
+    try:
+        extra = account.get_extra()
+    except Exception:
+        extra = {}
+    if not isinstance(extra, dict):
+        extra = {}
+    cached = extra.get("chatgpt_last_payment_link")
+    cached = cached if isinstance(cached, dict) else {}
+    legacy_cached = extra.get("chatgpt_paypal_url")
+    legacy_cached = legacy_cached if isinstance(legacy_cached, dict) else {}
+
     if status == "invalid":
         return "账号已失效，不能生成支付链接" if bool(force_refresh) else "账号已失效，默认不预生成支付链接"
+    if (
+        _payment_link_paid_terminal_marker(account, cached, extra)
+        or _payment_link_paid_terminal_marker(account, legacy_cached, {})
+    ):
+        return "账号已明确支付完成，不能重复生成支付链接"
+    if status == "subscribed":
+        return "账号已订阅，不能生成支付链接" if bool(force_refresh) else "账号已订阅，默认不预生成支付链接"
+
+    loaded_history_rows = list(history_rows or [])
+    if history_rows is None and session is not None and int(getattr(account, "id", 0) or 0) > 0:
+        loaded_history_rows = session.exec(
+            select(PaymentLinkGenerationModel)
+            .where(PaymentLinkGenerationModel.account_id == int(account.id or 0))
+            .order_by(PaymentLinkGenerationModel.id.desc())
+        ).all()
+
+    normalized_excluded_request_id = str(exclude_request_id or "").strip()
+    for row in loaded_history_rows:
+        if normalized_excluded_request_id and str(row.request_id or "").strip() == normalized_excluded_request_id:
+            continue
+        # A numeric account id can be reused.  Empty or mismatched identity
+        # fields are legacy/orphan history and must not block the replacement.
+        if not _payment_link_generation_matches_account(row, account):
+            continue
+        if _payment_link_generation_is_fresh_inflight(row):
+            return "已有支付链接生成任务正在进行"
+
+    # Force refresh is an explicit operator override for historical success or
+    # expired/cancelled links, but never for a paid terminal or an in-flight job.
     if bool(force_refresh):
         return ""
-    if status == "subscribed":
-        return "账号已订阅，默认不预生成支付链接"
+
+    cached_status = str(cached.get("link_status") or "").strip().lower()
+    if cached_status in PIX_CLEANED_STATUSES:
+        return "已有支付链接提取记录（链接已清理），默认不重复生成"
+    if _payment_link_current_cache_url(cached) or _payment_link_current_cache_url(legacy_cached):
+        return "已有当前支付链接，默认不重复生成"
+    if any(
+        str(row.status or "").strip().lower() in _PAYMENT_LINK_HISTORY_SUCCESS_STATUSES
+        and _payment_link_generation_matches_account(row, account)
+        and _payment_link_generation_has_url(row)
+        for row in loaded_history_rows
+    ):
+        return "已有支付链接提取成功记录，默认不重复生成"
     return ""
 
 
@@ -1941,6 +2303,8 @@ def _upsert_payment_link_generation(
     session: Session,
     *,
     account_id: int,
+    account_email: str = "",
+    account_created_at: str = "",
     task_id: str,
     request_id: str,
     status: str,
@@ -1955,15 +2319,38 @@ def _upsert_payment_link_generation(
     error: str = "",
     result: dict[str, Any] | None = None,
 ) -> PaymentLinkGenerationModel:
+    if not str(account_email or "").strip() or not str(account_created_at or "").strip():
+        bound_account = session.get(AccountModel, int(account_id or 0))
+        if bound_account is not None:
+            account_email = str(bound_account.email or "").strip().lower()
+            account_created_at = _payment_link_account_created_at_text(bound_account.created_at)
     row = session.exec(
         select(PaymentLinkGenerationModel).where(PaymentLinkGenerationModel.request_id == str(request_id))
     ).first()
     if row is None:
         row = PaymentLinkGenerationModel(
             account_id=int(account_id),
+            account_email=str(account_email or "").strip().lower(),
+            account_created_at=_payment_link_account_created_at_text(account_created_at),
             task_id=str(task_id),
             request_id=str(request_id),
         )
+    else:
+        supplied_email = str(account_email or "").strip().lower()
+        supplied_created_at = _payment_link_account_created_at_text(account_created_at)
+        existing_email = str(getattr(row, "account_email", "") or "").strip().lower()
+        existing_created_at = _payment_link_account_created_at_text(getattr(row, "account_created_at", ""))
+        if (
+            supplied_email
+            and supplied_created_at
+            and (existing_email or existing_created_at)
+            and (existing_email != supplied_email or existing_created_at != supplied_created_at)
+        ):
+            raise ValueError("支付链接历史请求身份不匹配")
+        if supplied_email and not existing_email:
+            row.account_email = supplied_email
+        if supplied_created_at and not existing_created_at:
+            row.account_created_at = supplied_created_at
     row.account_id = int(account_id)
     row.task_id = str(task_id)
     row.status = str(status or "unknown")[:48]
@@ -1995,6 +2382,18 @@ def _upsert_payment_link_generation(
     return row
 
 
+def _delete_payment_link_generation_by_request_id(session: Session, request_id: str) -> bool:
+    row = session.exec(
+        select(PaymentLinkGenerationModel).where(
+            PaymentLinkGenerationModel.request_id == str(request_id or "").strip()
+        )
+    ).first()
+    if row is None:
+        return False
+    session.delete(row)
+    return True
+
+
 def _resolve_batch_payment_link_accounts(
     req: BatchPaymentLinkTaskRequest,
 ) -> tuple[list[dict[str, Any]], list[int], list[dict[str, Any]], list[dict[str, Any]]]:
@@ -2011,25 +2410,31 @@ def _resolve_batch_payment_link_accounts(
                 .where(AccountModel.platform == "chatgpt")
                 .where(AccountModel.id.in_(requested_ids))
             ).all()
-        row_map = {int(row.id or 0): row for row in rows if int(row.id or 0) > 0}
-        eligible: list[dict[str, Any]] = []
-        skipped: list[dict[str, Any]] = []
-        missing_ids: list[int] = []
-        for account_id in requested_ids:
-            account = row_map.get(account_id)
-            if account is None:
-                missing_ids.append(account_id)
-                continue
-            item = {
-                "account_id": account_id,
-                "email": str(account.email or ""),
-                "status": str(account.status or ""),
-            }
-            reason = _payment_link_skip_reason(account, force_refresh=force_refresh)
-            if reason:
-                skipped.append({**item, "reason": reason})
-            else:
-                eligible.append(item)
+            row_map = {int(row.id or 0): row for row in rows if int(row.id or 0) > 0}
+            history_by_account = _load_payment_link_history_by_account(session, list(row_map))
+            eligible: list[dict[str, Any]] = []
+            skipped: list[dict[str, Any]] = []
+            missing_ids: list[int] = []
+            for account_id in requested_ids:
+                account = row_map.get(account_id)
+                if account is None:
+                    missing_ids.append(account_id)
+                    continue
+                item = {
+                    "account_id": account_id,
+                    "email": str(account.email or ""),
+                    "status": str(account.status or ""),
+                }
+                reason = _payment_link_skip_reason(
+                    account,
+                    force_refresh=force_refresh,
+                    history_rows=history_by_account.get(account_id, []),
+                )
+                if reason:
+                    skipped.append({**item, "reason": reason})
+                else:
+                    eligible.append(item)
+
         if limit > 0:
             overflow = eligible[limit:]
             eligible = eligible[:limit]
@@ -2041,25 +2446,32 @@ def _resolve_batch_payment_link_accounts(
 
     with Session(engine) as session:
         rows = _filtered_chatgpt_accounts(session, req)
-
-    eligible = []
-    skipped = []
-    matched = []
-    for account in rows:
-        account_id = int(account.id or 0)
-        if account_id <= 0:
-            continue
-        item = {
-            "account_id": account_id,
-            "email": str(account.email or ""),
-            "status": str(account.status or ""),
-        }
-        matched.append(item)
-        reason = _payment_link_skip_reason(account, force_refresh=force_refresh)
-        if reason:
-            skipped.append({**item, "reason": reason})
-        else:
-            eligible.append(item)
+        history_by_account = _load_payment_link_history_by_account(
+            session,
+            [int(account.id or 0) for account in rows if int(account.id or 0) > 0],
+        )
+        eligible = []
+        skipped = []
+        matched = []
+        for account in rows:
+            account_id = int(account.id or 0)
+            if account_id <= 0:
+                continue
+            item = {
+                "account_id": account_id,
+                "email": str(account.email or ""),
+                "status": str(account.status or ""),
+            }
+            matched.append(item)
+            reason = _payment_link_skip_reason(
+                account,
+                force_refresh=force_refresh,
+                history_rows=history_by_account.get(account_id, []),
+            )
+            if reason:
+                skipped.append({**item, "reason": reason})
+            else:
+                eligible.append(item)
     if limit > 0:
         overflow = eligible[limit:]
         eligible = eligible[:limit]
@@ -4862,7 +5274,7 @@ def enqueue_batch_payment_link_task(
         skipped_accounts=skipped_accounts,
     )
 
-    task_id = f"task_{int(time.time() * 1000)}"
+    task_id = f"task_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
     source = "batch_payment_link"
     meta = {
         "total_requested": total_requested,
@@ -10498,15 +10910,41 @@ def _run_batch_payment_links(task_id: str, account_ids: list[int]):
                 remote = item_by_request.get(request_id)
                 if remote is None:
                     continue
+                if request_id in terminal_request_ids:
+                    continue
                 remote_status = str(remote.get("status") or "unknown").strip().lower()
                 remote_batch_id = str(remote.get("batch_id") or "").strip()
                 remote_job_id = str(remote.get("job_id") or "").strip()
                 submitted_at = _remote_time(remote.get("created_at"))
                 started_at = _remote_time(remote.get("started_at"))
+                email = str(pending.get("email") or pending.get("account_id") or "")
+                account = session.get(AccountModel, int(pending["account_id"]))
+                if not _payment_link_pending_matches_account(account, pending):
+                    _delete_payment_link_generation_by_request_id(session, request_id)
+                    error_text = "账号已被删除或替换，支付链接结果未写入"
+                    errors.append(f"{email}: {error_text}")
+                    terminal_request_ids.add(request_id)
+                    changed = True
+                    _log(task_id, f"[SKIP] {error_text}: {email}")
+                    continue
+                existing_history = session.exec(
+                    select(PaymentLinkGenerationModel).where(
+                        PaymentLinkGenerationModel.request_id == request_id
+                    )
+                ).first()
+                if existing_history is not None and not _payment_link_generation_matches_pending(
+                    existing_history, pending
+                ):
+                    error_text = "支付链接历史请求身份不匹配，结果未写入"
+                    errors.append(f"{email}: {error_text}")
+                    terminal_request_ids.add(request_id)
+                    _log(task_id, f"[SKIP] {error_text}: {email}")
+                    continue
                 if remote_status in {"queued", "running"}:
                     _upsert_payment_link_generation(
                         session,
                         account_id=int(pending["account_id"]),
+                        **_payment_link_pending_identity_kwargs(pending),
                         task_id=task_id,
                         request_id=request_id,
                         status=remote_status,
@@ -10519,15 +10957,9 @@ def _run_batch_payment_links(task_id: str, account_ids: list[int]):
                     )
                     changed = True
                     continue
-                if request_id in terminal_request_ids:
-                    continue
-                email = str(pending.get("email") or pending.get("account_id") or "")
                 if remote_status == "done":
                     try:
                         data = payment_link_from_remote_job(remote, profile=profile)
-                        account = session.get(AccountModel, int(pending["account_id"]))
-                        if account is None or account.platform != "chatgpt":
-                            raise ValueError("ChatGPT 账号在远端任务完成前已不存在")
                         _apply_action_result(
                             "chatgpt",
                             "payment_link",
@@ -10538,6 +10970,7 @@ def _run_batch_payment_links(task_id: str, account_ids: list[int]):
                         _upsert_payment_link_generation(
                             session,
                             account_id=int(pending["account_id"]),
+                            **_payment_link_pending_identity_kwargs(pending),
                             task_id=task_id,
                             request_id=request_id,
                             status="succeeded",
@@ -10560,6 +10993,7 @@ def _run_batch_payment_links(task_id: str, account_ids: list[int]):
                         _upsert_payment_link_generation(
                             session,
                             account_id=int(pending["account_id"]),
+                            **_payment_link_pending_identity_kwargs(pending),
                             task_id=task_id,
                             request_id=request_id,
                             status="failed",
@@ -10582,6 +11016,7 @@ def _run_batch_payment_links(task_id: str, account_ids: list[int]):
                     _upsert_payment_link_generation(
                         session,
                         account_id=int(pending["account_id"]),
+                        **_payment_link_pending_identity_kwargs(pending),
                         task_id=task_id,
                         request_id=request_id,
                         status="interrupted" if interruption else "failed",
@@ -10609,17 +11044,24 @@ def _run_batch_payment_links(task_id: str, account_ids: list[int]):
                 request_id = str(pending["request_id"])
                 if request_id in terminal_request_ids:
                     continue
-                _upsert_payment_link_generation(
-                    session,
-                    account_id=int(pending["account_id"]),
-                    task_id=task_id,
-                    request_id=request_id,
-                    status="interrupted",
-                    profile_hash=str(profile.get("profile_hash") or ""),
-                    link_type=str(profile.get("link_type") or ""),
-                    error=reason,
-                )
-                errors.append(f"{pending.get('email') or pending.get('account_id')}: {reason}")
+                account = session.get(AccountModel, int(pending["account_id"]))
+                if _payment_link_pending_matches_account(account, pending):
+                    _upsert_payment_link_generation(
+                        session,
+                        account_id=int(pending["account_id"]),
+                        **_payment_link_pending_identity_kwargs(pending),
+                        task_id=task_id,
+                        request_id=request_id,
+                        status="interrupted",
+                        profile_hash=str(profile.get("profile_hash") or ""),
+                        link_type=str(profile.get("link_type") or ""),
+                        error=reason,
+                    )
+                    item_reason = reason
+                else:
+                    _delete_payment_link_generation_by_request_id(session, request_id)
+                    item_reason = "账号已被删除或替换，未保留中断记录"
+                errors.append(f"{pending.get('email') or pending.get('account_id')}: {item_reason}")
                 terminal_request_ids.add(request_id)
                 remote_interrupted_count += 1
                 changed = True
@@ -10680,18 +11122,61 @@ def _run_batch_payment_links(task_id: str, account_ids: list[int]):
                     email = str(account.email or "")
                     if not primary_email:
                         primary_email = email
-                    skip_reason = _payment_link_skip_reason(account, force_refresh=force_refresh)
+                    extra = account.get_extra()
+                    cached = (
+                        extra.get("chatgpt_last_payment_link")
+                        if isinstance(extra.get("chatgpt_last_payment_link"), dict)
+                        else {}
+                    )
+                    legacy_cached = (
+                        extra.get("chatgpt_paypal_url")
+                        if isinstance(extra.get("chatgpt_paypal_url"), dict)
+                        else {}
+                    )
+                    current_cached_url = _payment_link_current_cache_url(cached) or _payment_link_current_cache_url(legacy_cached)
+                    skip_reason = _payment_link_skip_reason(
+                        account,
+                        force_refresh=force_refresh,
+                        session=session,
+                        exclude_request_id=f"{instance_id}:{task_id}:{int(account_id or 0)}",
+                    )
                     if skip_reason:
+                        # Preserve the existing already-paid reconciliation
+                        # path: it is a terminal generation guard, but the
+                        # local subscription state still needs one refresh.
+                        cached_for_status = (
+                            cached
+                            if str(cached.get("link_status") or "").strip().lower() == "already_paid"
+                            else legacy_cached
+                            if str(legacy_cached.get("link_status") or "").strip().lower() == "already_paid"
+                            else {}
+                        )
+                        if cached_for_status:
+                            status_label = payment_link_status_label(cached_for_status.get("link_status"))
+                            _log(task_id, f"[SYNC] {status_label}，开始同步账号状态: {email or account_id}")
+                            _sync_payment_link_account_status(session, account)
+                            skipped_count += 1
+                            _log(task_id, f"[SYNC] 账号状态同步完成: {email or account_id}")
+                            continue
+                        if current_cached_url and "已有当前支付链接" in skip_reason:
+                            if str(account.cashier_url or "").strip() != current_cached_url:
+                                account.cashier_url = current_cached_url
+                                account.updated_at = datetime.now(timezone.utc)
+                                session.add(account)
+                            _task_store.add_cashier_url(task_id, current_cached_url)
+                            skipped_count += 1
+                            _log(task_id, f"[SKIP] 已有当前支付链接: {email or account_id}")
+                            continue
                         skipped_count += 1
                         _log(task_id, f"[SKIP] 支付链接生成跳过: {email or account_id} - {skip_reason}")
                         continue
 
                     params = _build_batch_payment_link_params(account, request_params)
-                    extra = account.get_extra()
-                    cached = extra.get("chatgpt_last_payment_link") if isinstance(extra.get("chatgpt_last_payment_link"), dict) else {}
                     raw_cached_url = str(cached.get("url") or "").strip()
                     cached_format = str(cached.get("payment_link_format") or "long_hosted").strip()
-                    cached_url = normalize_payment_link_url(raw_cached_url, cached_format)
+                    cached_url = _validated_payment_link_url(
+                        normalize_payment_link_url(raw_cached_url, cached_format)
+                    )
                     if cached_url and cached_url != raw_cached_url:
                         cached = {**cached, "url": cached_url}
                         extra["chatgpt_last_payment_link"] = cached
@@ -10723,21 +11208,15 @@ def _run_batch_payment_links(task_id: str, account_ids: list[int]):
                     if not token:
                         raise ValueError("账号缺少 Access Token")
                     request_id = f"{instance_id}:{task_id}:{int(account_id or 0)}"
-                    _upsert_payment_link_generation(
-                        session,
-                        account_id=int(account_id),
-                        task_id=task_id,
-                        request_id=request_id,
-                        status="submitting",
-                        profile_hash=profile_hash,
-                        link_type=str(profile.get("link_type") or ""),
-                    )
                     prepared.append(
                         {
                             "account_id": int(account_id),
                             "email": email,
+                            "account_email": str(account.email or "").strip().lower(),
+                            "account_created_at": _payment_link_account_created_at_text(account.created_at),
                             "request_id": request_id,
                             "access_token": token,
+                            "account_identity": _payment_link_account_identity(account),
                         }
                     )
                     _log(task_id, f"[SUBMIT] 已准备 {index}/{total}: {email or account_id}")
@@ -10756,9 +11235,84 @@ def _run_batch_payment_links(task_id: str, account_ids: list[int]):
             session.commit()
 
         if prepared:
+            # The account list was resolved before the worker started.  A
+            # second task (or a cleanup/status refresh) may have changed one
+            # of those accounts in the meantime.  Serialize the final local
+            # claim so only the winner reaches the remote batch endpoint.
+            guarded_prepared: list[dict[str, Any]] = []
+            guarded_skipped: list[tuple[dict[str, Any], str]] = []
+            with Session(engine) as guard_session:
+                guard_session.exec(text("BEGIN IMMEDIATE"))
+                for pending in prepared:
+                    account_id = int(pending.get("account_id") or 0)
+                    request_id = str(pending.get("request_id") or "").strip()
+                    account = guard_session.get(AccountModel, account_id)
+                    reason = "账号不存在"
+                    if account is not None and not _payment_link_pending_matches_account(account, pending):
+                        reason = "账号已被删除或替换"
+                    elif account is not None:
+                        reason = _payment_link_skip_reason(
+                            account,
+                            force_refresh=force_refresh,
+                            session=guard_session,
+                            exclude_request_id=request_id,
+                        )
+                        if not reason and skip_existing and not force_refresh:
+                            params = _build_batch_payment_link_params(account, request_params)
+                            extra = account.get_extra()
+                            cached = (
+                                extra.get("chatgpt_last_payment_link")
+                                if isinstance(extra.get("chatgpt_last_payment_link"), dict)
+                                else {}
+                            )
+                            cached_format = str(cached.get("payment_link_format") or "long_hosted").strip()
+                            cached_url = _validated_payment_link_url(
+                                normalize_payment_link_url(
+                                    str(cached.get("url") or "").strip(),
+                                    cached_format,
+                                )
+                            )
+                            if cached_url and payment_link_cache_matches(cached, params):
+                                reason = "已有可复用支付链接"
+                    if reason:
+                        guarded_skipped.append((pending, reason))
+                    else:
+                        _upsert_payment_link_generation(
+                            guard_session,
+                            account_id=account_id,
+                            **_payment_link_pending_identity_kwargs(pending),
+                            task_id=task_id,
+                            request_id=request_id,
+                            status="submitting",
+                            profile_hash=profile_hash,
+                            link_type=str(profile.get("link_type") or ""),
+                        )
+                        guarded_prepared.append(pending)
+                guard_session.commit()
+
+            prepared = guarded_prepared
+            for pending, reason in guarded_skipped:
+                skipped_count += 1
+                _log(
+                    task_id,
+                    f"[SKIP] 提交前重新检查跳过: {pending.get('email') or pending.get('account_id') or '-'} - {reason}",
+                )
+
+        if prepared:
             control.checkpoint(consume_skip=False)
             _task_store.update_meta(task_id, {"payment_link_state": "submitting", "payment_link_submitted": 0})
-            response = client.submit_batch(items=prepared, expected_profile_hash=profile_hash)
+            response = client.submit_batch(
+                items=[
+                    {
+                        "account_id": item["account_id"],
+                        "email": item["email"],
+                        "request_id": item["request_id"],
+                        "access_token": item["access_token"],
+                    }
+                    for item in prepared
+                ],
+                expected_profile_hash=profile_hash,
+            )
             remote_items = response.get("items") if isinstance(response.get("items"), list) else []
             submitted_request_ids = {str(item["request_id"]) for item in prepared}
             _record_remote_items([item for item in remote_items if isinstance(item, dict)])
@@ -16658,7 +17212,20 @@ def list_chatgpt_payment_link_history(
     with Session(engine) as session:
         statement = select(PaymentLinkGenerationModel)
         if int(account_id or 0) > 0:
+            account = session.get(AccountModel, int(account_id))
+            if account is None or str(account.platform or "").strip().lower() != "chatgpt":
+                return {
+                    "items": [],
+                    "total": 0,
+                    "limit": bounded_limit,
+                    "offset": bounded_offset,
+                    "has_more": False,
+                }
+            account_email = str(account.email or "").strip().lower()
+            account_created_at = _payment_link_account_created_at_text(account.created_at)
             statement = statement.where(PaymentLinkGenerationModel.account_id == int(account_id))
+            statement = statement.where(PaymentLinkGenerationModel.account_email == account_email)
+            statement = statement.where(PaymentLinkGenerationModel.account_created_at == account_created_at)
         if str(task_id or "").strip():
             statement = statement.where(PaymentLinkGenerationModel.task_id == str(task_id).strip())
         rows = session.exec(
@@ -16667,6 +17234,8 @@ def list_chatgpt_payment_link_history(
         total_statement = select(func.count()).select_from(PaymentLinkGenerationModel)
         if int(account_id or 0) > 0:
             total_statement = total_statement.where(PaymentLinkGenerationModel.account_id == int(account_id))
+            total_statement = total_statement.where(PaymentLinkGenerationModel.account_email == account_email)
+            total_statement = total_statement.where(PaymentLinkGenerationModel.account_created_at == account_created_at)
         if str(task_id or "").strip():
             total_statement = total_statement.where(PaymentLinkGenerationModel.task_id == str(task_id).strip())
         total = int(session.exec(total_statement).one())

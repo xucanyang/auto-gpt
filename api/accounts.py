@@ -3,9 +3,10 @@ from fastapi.responses import StreamingResponse
 from sqlmodel import Session, select, func
 from pydantic import BaseModel, Field
 from core.config_store import config_store
-from core.db import AccountModel, get_session
+from core.db import AccountListStateModel, AccountModel, get_session
 from services.account_filters import (
     account_auth_type,
+    account_payment_link_generated,
     account_filtered_query,
     account_payment_link_summary,
     account_revival_info,
@@ -13,6 +14,7 @@ from services.account_filters import (
     account_subscription_type,
     apply_account_list_state_sort,
     delete_account_list_state_for_account_ids,
+    refresh_account_list_state,
     upsert_account_list_state_for_account_ids,
 )
 from services.account_rate_limit_recovery import (
@@ -69,6 +71,7 @@ ACCOUNT_FILTER_PRESET_COLUMN_KEYS = (
     "authType",
     "phoneBindingState",
     "paymentLinkPlatform",
+    "paymentLinkGenerated",
     "subscriptionType",
     "accountValidity",
     "codexState",
@@ -176,6 +179,23 @@ def _normalize_integration_upload_filter_values(values: Any) -> list[str]:
     return normalized
 
 
+def _normalize_payment_link_generated_filter_values(values: Any) -> list[str]:
+    normalized: list[str] = []
+    for item in _filter_value_list(values):
+        value = item.lower()
+        if value in {"true", "1", "yes", "on", "generated", "succeeded"}:
+            value = "true"
+        elif value in {"false", "0", "no", "off", "not_generated", "never"}:
+            value = "false"
+        else:
+            continue
+        if value not in normalized:
+            normalized.append(value)
+    if set(normalized) == {"true", "false"}:
+        return []
+    return normalized
+
+
 def _empty_filter_preset_payload() -> dict[str, Any]:
     return {
         "search": "",
@@ -207,6 +227,8 @@ def _normalize_filter_preset_filters(filters: Any) -> dict[str, Any]:
             clean["columnFilters"][key] = _normalize_idea_submit_filter_values(values)
         elif key in {"sub2apiState", "oaipayState"}:
             clean["columnFilters"][key] = _normalize_integration_upload_filter_values(values)
+        elif key == "paymentLinkGenerated":
+            clean["columnFilters"][key] = _normalize_payment_link_generated_filter_values(values)
         else:
             clean["columnFilters"][key] = values
 
@@ -239,6 +261,7 @@ def _filter_preset_summary(filters: dict[str, Any]) -> str:
         ("authType", "认证"),
         ("phoneBindingState", "手机号"),
         ("paymentLinkPlatform", "支付链接"),
+        ("paymentLinkGenerated", "提取记录"),
         ("accountValidity", "有效性"),
         ("manuallyUsed", "使用"),
         ("sub2apiState", "Sub2API"),
@@ -710,7 +733,11 @@ def _maybe_reconcile_rate_limited_accounts(session: Session, *, platform: Option
     reconcile_rate_limited_accounts(session, platform=platform)
 
 
-def _serialize_account(account: AccountModel) -> dict[str, Any]:
+def _serialize_account(
+    account: AccountModel,
+    *,
+    payment_link_generated: bool | None = None,
+) -> dict[str, Any]:
     data = account.model_dump(mode="json") if hasattr(account, "model_dump") else account.dict()
     extra = _safe_extra(account)
     chatgpt_local = extra.get("chatgpt_local") if isinstance(extra.get("chatgpt_local"), dict) else {}
@@ -753,6 +780,7 @@ def _serialize_account(account: AccountModel) -> dict[str, Any]:
     compact = _serialize_account_compact_item(
         account,
         extra=extra,
+        payment_link_generated=payment_link_generated,
     )
     data.update(compact)
     for secret_key in (
@@ -783,12 +811,14 @@ def _serialize_account_list_item(
     account: AccountModel,
     *,
     extra: Optional[dict[str, Any]] = None,
+    payment_link_generated: bool | None = None,
 ) -> dict[str, Any]:
     """Backward-compatible name for the compact list serializer."""
 
     return _serialize_account_compact_item(
         account,
         extra=extra,
+        payment_link_generated=payment_link_generated,
     )
 
 
@@ -1318,6 +1348,7 @@ def _serialize_account_compact_item(
     account: AccountModel,
     *,
     extra: dict[str, Any] | None = None,
+    payment_link_generated: bool | None = None,
 ) -> dict[str, Any]:
     extra = extra if isinstance(extra, dict) else _safe_get_extra(account)
     sync_statuses = extra.get("sync_statuses") if isinstance(extra.get("sync_statuses"), dict) else {}
@@ -1350,6 +1381,11 @@ def _serialize_account_compact_item(
     submission_info = account_submission_info(account, extra)
     submission = _build_submission_summary(extra, baxigpt_cdk, submission_info)
     payment_link = account_payment_link_summary(account, extra)
+    generated = account_payment_link_generated(
+        account,
+        extra,
+        persisted_history=payment_link_generated,
+    )
     payload = {
         "id": account.id,
         "platform": account.platform,
@@ -1362,6 +1398,7 @@ def _serialize_account_compact_item(
         "cashier_url": account.cashier_url,
         "payment_link": payment_link,
         "payment_link_platform": _safe_str(payment_link.get("platform")) or "none",
+        "payment_link_generated": generated,
         "manually_used": bool(extra.get("manually_used")),
         "workspace": {
             "id": _safe_str(extra.get("workspace_id") or extra.get("organization_id") or chatgpt_capabilities.get("workspace_id")),
@@ -1516,6 +1553,7 @@ def list_accounts(
     platform: Optional[str] = None,
     status: Optional[str] = None,
     email: Optional[str] = None,
+    payment_link_generated: Optional[str] = None,
     manually_used: Optional[str] = None,
     auth_type: Optional[str] = None,
     phone_binding_state: Optional[str] = None,
@@ -1543,6 +1581,7 @@ def list_accounts(
         platform=platform,
         filter_source={
             "email": email,
+            "payment_link_generated": payment_link_generated,
             "status": status,
             "manually_used": manually_used,
             "auth_type": auth_type,
@@ -1567,26 +1606,68 @@ def list_accounts(
     else:
         q = q.order_by(AccountModel.id.desc())
     items = session.exec(q.offset((page_value - 1) * page_size_value).limit(page_size_value)).all()
+    generated_by_id: dict[int, bool] = {}
+    item_ids = [int(item.id or 0) for item in items if int(item.id or 0) > 0]
+    page_state_refresh_pending = False
+    if item_ids:
+        if not use_list_state:
+            # An unfiltered page does not otherwise touch the derived cache.
+            # Refresh just this page in one SQL batch so historical successful
+            # generations cannot be rendered as "never extracted".
+            try:
+                refreshed_count = refresh_account_list_state(
+                    session,
+                    account_ids=item_ids,
+                    stale_only=True,
+                    cleanup_orphans=False,
+                    commit=False,
+                )
+                page_state_refresh_pending = refreshed_count > 0
+            except Exception:
+                # A standalone database may be serving the API before the
+                # next init_db migration creates payment_link_generations.
+                # Keep the list usable and let the serializer use its local
+                # URL/tombstone fallback rather than failing the whole page.
+                session.rollback()
+        try:
+            state_rows = session.exec(
+                select(AccountListStateModel).where(AccountListStateModel.account_id.in_(item_ids))
+            ).all()
+            generated_by_id = {
+                int(state.account_id): bool(state.payment_link_generated)
+                for state in state_rows
+            }
+        except Exception:
+            # Older standalone/test databases may not have the cache table yet;
+            # the serializer falls back to current URL/tombstone evidence.
+            generated_by_id = {}
     extras_by_id = {
         int(item.id or 0): _safe_extra(item)
         for item in items
         if int(item.id or 0) > 0
     }
-    return {
+    response = {
         "total": total,
         "page": page_value,
         "items": [
             (
-                _serialize_account(item)
+                _serialize_account(
+                    item,
+                    payment_link_generated=generated_by_id.get(int(item.id or 0)),
+                )
                 if detail
                 else _serialize_account_compact_item(
                     item,
                     extra=extras_by_id.get(int(item.id or 0)),
+                    payment_link_generated=generated_by_id.get(int(item.id or 0)),
                 )
             )
             for item in items
         ],
     }
+    if page_state_refresh_pending:
+        session.commit()
+    return response
 
 
 @router.post("")
@@ -1883,7 +1964,32 @@ def get_account(account_id: int, session: Session = Depends(get_session)):
         raise HTTPException(404, "账号不存在")
     reconcile_rate_limited_accounts(session, accounts=[acc])
     session.refresh(acc)
-    return _serialize_account(acc)
+    detail_state_refresh_pending = False
+    try:
+        refreshed_count = refresh_account_list_state(
+            session,
+            account_ids=[account_id],
+            stale_only=True,
+            cleanup_orphans=False,
+            commit=False,
+        )
+        detail_state_refresh_pending = refreshed_count > 0
+    except Exception:
+        session.rollback()
+    try:
+        state = session.get(AccountListStateModel, account_id)
+    except Exception:
+        # Keep the detail endpoint usable for databases upgrading from a
+        # pre-list-state schema; compact serialization has a local fallback.
+        session.rollback()
+        state = None
+    payload = _serialize_account(
+        acc,
+        payment_link_generated=(bool(state.payment_link_generated) if state is not None else None),
+    )
+    if detail_state_refresh_pending:
+        session.commit()
+    return payload
 
 
 @router.get("/{account_id}/secrets")

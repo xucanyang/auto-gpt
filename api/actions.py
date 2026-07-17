@@ -5,6 +5,7 @@ from pydantic import BaseModel
 import json
 import random
 import time
+from datetime import datetime
 from typing import Any
 from core.db import AccountModel, PaymentLinkGenerationModel, get_session
 from core.base_platform import RegisterConfig
@@ -31,6 +32,14 @@ from services.sub2api_sync import backfill_chatgpt_account_to_sub2api, probe_cha
 from services.oaipay_sync import backfill_chatgpt_account_to_oaipay, probe_chatgpt_oaipay_status, update_account_model_oaipay_sync
 
 router = APIRouter(prefix="/actions", tags=["actions"])
+
+
+def _payment_link_account_created_at_text(value: Any) -> str:
+    """Match the timestamp representation persisted in SQLite account rows."""
+
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=None).isoformat(sep=" ")
+    return str(value or "").strip()
 
 _LOCAL_STATUS_AUTH_ACTION_IDS = {
     "refresh_token",
@@ -152,6 +161,26 @@ def _apply_action_result(
         data = result.get("data") if isinstance(result.get("data"), dict) else {}
         checkout_url = str(data.get("url") or data.get("checkout_url") or data.get("cashier_url") or "").strip()
         if checkout_url:
+            remote_request_id = str(data.get("remote_request_id") or data.get("request_id") or "").strip()
+            account_email = str(acc_model.email or "").strip().lower()
+            account_created_at = _payment_link_account_created_at_text(acc_model.created_at)
+            existing_history = None
+            if remote_request_id:
+                existing_history = session.exec(
+                    select(PaymentLinkGenerationModel).where(
+                        PaymentLinkGenerationModel.request_id == remote_request_id
+                    )
+                ).first()
+                if existing_history is not None:
+                    history_email = str(getattr(existing_history, "account_email", "") or "").strip().lower()
+                    history_created_at = _payment_link_account_created_at_text(
+                        getattr(existing_history, "account_created_at", "")
+                    )
+                    if (
+                        (history_email and history_email != account_email)
+                        or (history_created_at and history_created_at != account_created_at)
+                    ):
+                        raise ValueError("支付链接历史请求身份不匹配")
             extra = acc_model.get_extra()
             acc_model.cashier_url = checkout_url
             existing_cache = extra.get("chatgpt_last_payment_link") if isinstance(extra.get("chatgpt_last_payment_link"), dict) else {}
@@ -175,19 +204,18 @@ def _apply_action_result(
 
             acc_model.updated_at = datetime.now(timezone.utc)
             session.add(acc_model)
-            remote_request_id = str(data.get("remote_request_id") or data.get("request_id") or "").strip()
             if remote_request_id:
-                history = session.exec(
-                    select(PaymentLinkGenerationModel).where(
-                        PaymentLinkGenerationModel.request_id == remote_request_id
-                    )
-                ).first()
+                history = existing_history
                 if history is None:
                     history = PaymentLinkGenerationModel(
                         account_id=int(acc_model.id or 0),
+                        account_email=account_email,
+                        account_created_at=account_created_at,
                         request_id=remote_request_id,
                     )
                 history.account_id = int(acc_model.id or 0)
+                history.account_email = account_email
+                history.account_created_at = account_created_at
                 history.status = "succeeded"
                 history.remote_batch_id = str(data.get("remote_batch_id") or history.remote_batch_id or "")[:128]
                 history.remote_job_id = str(data.get("remote_job_id") or history.remote_job_id or "")[:128]

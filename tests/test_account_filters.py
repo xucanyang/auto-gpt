@@ -6,11 +6,13 @@ try:
     from sqlalchemy import text
     from sqlmodel import Session, select
 
-    from core.db import AccountListStateModel, AccountModel, engine, init_db
+    from core.db import AccountListStateModel, AccountModel, PaymentLinkGenerationModel, engine, init_db
     from services.account_filters import (
         account_has_submitted,
         account_idea_submit_state,
         account_payment_link_platform,
+        account_payment_link_generated,
+        account_payment_link_summary,
         account_phone_binding_state,
         account_oaipay_upload_state,
         account_revival_info,
@@ -34,12 +36,15 @@ except ModuleNotFoundError as exc:
         raise
     AccountListStateModel = None
     AccountModel = None
+    PaymentLinkGenerationModel = None
     Session = None
     engine = None
     init_db = None
     account_idea_submit_state = None
     account_has_submitted = None
     account_payment_link_platform = None
+    account_payment_link_generated = None
+    account_payment_link_summary = None
     account_phone_binding_state = None
     account_oaipay_upload_state = None
     account_revival_info = None
@@ -80,6 +85,16 @@ class AccountFilterSortTests(unittest.TestCase):
                 }
             )
         return account
+
+    def _payment_history(self, account: AccountModel, *, request_id: str, status: str, url: str = "") -> PaymentLinkGenerationModel:
+        return PaymentLinkGenerationModel(
+            account_id=int(account.id or 0),
+            account_email=str(account.email or "").strip().lower(),
+            account_created_at=account.created_at.replace(tzinfo=None).isoformat(sep=" "),
+            request_id=request_id,
+            status=status,
+            url=url,
+        )
 
     def test_sort_subscription_active_until_ascending_with_empty_last(self):
         rows = [
@@ -509,6 +524,268 @@ class AccountFilterSortTests(unittest.TestCase):
 
             self.assertEqual(sql_ids(payment_link_platform="pix,paypal"), [511, 512, 517])
             self.assertEqual(sql_ids(payment_link_platform="none"), [515, 516])
+
+    def test_payment_link_generated_filter_keeps_history_after_url_cleanup(self):
+        init_db()
+        cleaned = self._account(531)
+        cleaned.set_extra(
+            {
+                "chatgpt_last_payment_link": {
+                    "link_type": "pix",
+                    "link_status": "expired_cleaned",
+                    "generated_at": "2026-07-01T00:00:00Z",
+                }
+            }
+        )
+        current = self._account(532)
+        current.set_extra(
+            {
+                "chatgpt_last_payment_link": {
+                    "url": "https://payments.example.test/current-532",
+                    "link_type": "pix",
+                }
+            }
+        )
+        history_only = self._account(533)
+        failed_only = self._account(534)
+        invalid_history = self._account(535)
+
+        with Session(engine) as session:
+            ids = (531, 532, 533, 534, 535)
+            placeholders = ",".join(str(value) for value in ids)
+            session.exec(text(f"DELETE FROM payment_link_generations WHERE account_id IN ({placeholders})"))
+            session.exec(text(f"DELETE FROM account_list_state WHERE account_id IN ({placeholders})"))
+            session.exec(text(f"DELETE FROM accounts WHERE id IN ({placeholders})"))
+            session.add_all([cleaned, current, history_only, failed_only, invalid_history])
+            session.add(
+                self._payment_history(
+                    history_only,
+                    request_id="account-filter-history-533",
+                    status="succeeded",
+                    url="https://payments.example.test/history-533",
+                )
+            )
+            session.add(
+                self._payment_history(
+                    failed_only,
+                    request_id="account-filter-failed-534",
+                    status="failed",
+                    url="https://payments.example.test/failed-534",
+                )
+            )
+            session.add(
+                self._payment_history(
+                    invalid_history,
+                    request_id="account-filter-invalid-535",
+                    status="succeeded",
+                    url="javascript:alert('not-a-link')",
+                )
+            )
+            session.commit()
+            refresh_account_list_state(session)
+
+            cached = {
+                int(row[0]): bool(row[1])
+                for row in session.exec(
+                    text(
+                        """
+                        SELECT account_id, payment_link_generated
+                        FROM account_list_state
+                        WHERE account_id BETWEEN 531 AND 535
+                        ORDER BY account_id
+                        """
+                    )
+                ).all()
+            }
+            self.assertEqual(cached, {531: True, 532: True, 533: True, 534: False, 535: False})
+
+            def sql_ids(generated):
+                query = select(AccountModel).join(
+                    AccountListStateModel,
+                    AccountListStateModel.account_id == AccountModel.id,
+                ).where(AccountModel.id.in_(ids))
+                query = apply_account_list_state_filters(query, payment_link_generated=generated)
+                return [int(row.id or 0) for row in session.exec(query.order_by(AccountModel.id.asc())).all()]
+
+            self.assertEqual(sql_ids(True), [531, 532, 533])
+            self.assertEqual(sql_ids(False), [534, 535])
+
+        self.assertTrue(account_payment_link_generated(cleaned))
+        self.assertTrue(account_payment_link_generated(current))
+
+    def test_cleaned_payment_link_summary_keeps_metadata_without_url(self):
+        account = self._account(536)
+        account.set_extra(
+            {
+                "chatgpt_last_payment_link": {
+                    "link_type": "pix",
+                    "link_status": "paid_cleaned",
+                    "generated_at": "2026-07-02T00:00:00Z",
+                    "cleaned_at": "2026-07-03T00:00:00Z",
+                }
+            }
+        )
+
+        summary = account_payment_link_summary(account)
+
+        self.assertEqual(summary["platform"], "none")
+        self.assertEqual(summary["link_type"], "pix")
+        self.assertEqual(summary["link_status"], "paid_cleaned")
+        self.assertEqual(summary["generated_at"], "2026-07-02T00:00:00Z")
+        self.assertNotIn("url", summary)
+
+    def test_payment_link_sql_uses_valid_secondary_url_when_primary_marker_is_invalid(self):
+        init_db()
+        account = self._account(537)
+        account.set_extra(
+            {
+                "chatgpt_last_payment_link": {
+                    "url": "javascript:alert('bad-primary')",
+                    "paypal_url": "https://www.paypal.com/agreements/approve?ba_token=BA-537",
+                    "link_type": "pix",
+                }
+            }
+        )
+
+        self.assertEqual(account_payment_link_platform(account), "pix")
+
+        with Session(engine) as session:
+            session.exec(text("DELETE FROM account_list_state WHERE account_id = 537"))
+            session.exec(text("DELETE FROM accounts WHERE id = 537"))
+            session.add(account)
+            session.commit()
+            refresh_account_list_state(session)
+            state = session.get(AccountListStateModel, 537)
+
+        self.assertIsNotNone(state)
+        self.assertEqual(state.payment_link_platform, "pix")
+        self.assertTrue(state.payment_link_generated)
+
+    def test_cleaned_tombstone_never_exposes_residual_url_or_resurrects_legacy_paypal(self):
+        init_db()
+        account = self._account(538)
+        account.set_extra(
+            {
+                "chatgpt_last_payment_link": {
+                    "url": "https://payments.example.test/expired-538",
+                    "link_type": "pix",
+                    "link_status": "expired_cleaned",
+                    "generated_at": "2026-07-04T00:00:00Z",
+                }
+            }
+        )
+
+        self.assertEqual(account_payment_link_platform(account), "none")
+        self.assertNotIn("url", account_payment_link_summary(account))
+
+        with Session(engine) as session:
+            session.exec(text("DELETE FROM account_list_state WHERE account_id = 538"))
+            session.exec(text("DELETE FROM accounts WHERE id = 538"))
+            session.add(account)
+            session.commit()
+            refresh_account_list_state(session)
+            state = session.get(AccountListStateModel, 538)
+            self.assertIsNotNone(state)
+            self.assertEqual(state.payment_link_platform, "none")
+            self.assertTrue(state.payment_link_generated)
+
+            extra = account.get_extra()
+            extra["chatgpt_paypal_url"] = {
+                "approval_url": "https://www.paypal.com/agreements/approve?ba_token=BA-538"
+            }
+            account.set_extra(extra)
+            session.add(account)
+            session.commit()
+            refresh_account_list_state(session, account_ids=[538])
+            state = session.get(AccountListStateModel, 538)
+
+        self.assertEqual(account_payment_link_platform(account), "none")
+        self.assertEqual(state.payment_link_platform, "none")
+        self.assertTrue(state.payment_link_generated)
+
+    def test_invalid_legacy_paypal_url_is_not_promoted_by_sql_platform_filter(self):
+        init_db()
+        account = self._account(539)
+        account.set_extra(
+            {
+                "chatgpt_last_payment_link": {"url": "javascript:alert('bad-primary')"},
+                "chatgpt_paypal_url": {"approval_url": "https:///missing-host"},
+            }
+        )
+        self.assertEqual(account_payment_link_platform(account), "none")
+
+        with Session(engine) as session:
+            session.exec(text("DELETE FROM account_list_state WHERE account_id = 539"))
+            session.exec(text("DELETE FROM accounts WHERE id = 539"))
+            session.add(account)
+            session.commit()
+            refresh_account_list_state(session)
+            state = session.get(AccountListStateModel, 539)
+
+        self.assertIsNotNone(state)
+        self.assertEqual(state.payment_link_platform, "none")
+        self.assertFalse(state.payment_link_generated)
+
+    def test_overlong_payment_url_is_not_counted_as_current_or_generated(self):
+        init_db()
+        account = self._account(540)
+        account.set_extra(
+            {
+                "chatgpt_last_payment_link": {
+                    "url": "https://payments.example.test/" + ("x" * 9000),
+                    "link_type": "pix",
+                }
+            }
+        )
+        self.assertEqual(account_payment_link_platform(account), "none")
+        self.assertFalse(account_payment_link_generated(account))
+
+        with Session(engine) as session:
+            session.exec(text("DELETE FROM account_list_state WHERE account_id = 540"))
+            session.exec(text("DELETE FROM accounts WHERE id = 540"))
+            session.add(account)
+            session.commit()
+            refresh_account_list_state(session)
+            state = session.get(AccountListStateModel, 540)
+
+        self.assertIsNotNone(state)
+        self.assertEqual(state.payment_link_platform, "none")
+        self.assertFalse(state.payment_link_generated)
+
+    def test_account_delete_cleans_payment_history_before_id_reuse(self):
+        init_db()
+        account_id = 541
+        with Session(engine) as session:
+            session.exec(text("DELETE FROM account_list_state WHERE account_id = 541"))
+            session.exec(text("DELETE FROM payment_link_generations WHERE account_id = 541"))
+            session.exec(text("DELETE FROM accounts WHERE id = 541"))
+            account = self._account(account_id)
+            session.add(account)
+            session.add(
+                self._payment_history(
+                    account,
+                    request_id="account-delete-history-541",
+                    status="succeeded",
+                    url="https://payments.example.test/history-541",
+                )
+            )
+            session.commit()
+
+            session.exec(text("DELETE FROM accounts WHERE id = 541"))
+            session.commit()
+            remaining = session.exec(
+                text("SELECT COUNT(*) FROM payment_link_generations WHERE account_id = 541")
+            ).one()
+            self.assertEqual(int(remaining[0]), 0)
+
+            replacement = self._account(account_id)
+            session.add(replacement)
+            session.commit()
+            refresh_account_list_state(session, account_ids=[account_id])
+            state = session.get(AccountListStateModel, account_id)
+
+        self.assertIsNotNone(state)
+        self.assertFalse(state.payment_link_generated)
 
     def test_integration_upload_filter_uses_positive_evidence_and_migrates_legacy_states(self):
         uploaded_marker = self._account(520)

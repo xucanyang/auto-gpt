@@ -7,7 +7,7 @@ from fastapi import HTTPException
 from sqlmodel import SQLModel, Session, create_engine
 
 from api import accounts, actions, chatgpt, tasks
-from core.db import AccountListStateModel, AccountModel
+from core.db import AccountListStateModel, AccountModel, PaymentLinkGenerationModel
 from services import account_filters
 from services.account_rate_limit_recovery import reconcile_rate_limited_accounts as real_reconcile_rate_limited_accounts
 
@@ -110,6 +110,12 @@ def test_all_filtered_capable_request_schemas_share_oaipay_and_expected_total():
             request_model(expected_total=-1)
 
 
+def test_payment_link_generated_both_values_normalize_to_unfiltered_state():
+    assert account_filters.normalize_account_filter({"payment_link_generated": "true"})["payment_link_generated"] is True
+    assert account_filters.normalize_account_filter({"payment_link_generated": "false"})["payment_link_generated"] is False
+    assert account_filters.normalize_account_filter({"payment_link_generated": "true,false"})["payment_link_generated"] is None
+
+
 def test_oaipay_plus_not_received_filter_does_not_expand_and_old_request_is_compatible(filter_engine):
     request = tasks.BatchOaipayUploadTaskRequest(
         all_filtered=True,
@@ -158,6 +164,67 @@ def test_accounts_list_and_task_resolver_return_the_same_scope(filter_engine):
     assert resolution.expected_total is None
     assert resolution.verified is False
     assert {item["id"] for item in listed["items"]} == set(resolution.account_ids) == {1}
+
+
+def test_unfiltered_account_list_refreshes_payment_history_state(filter_engine):
+    with Session(filter_engine) as session:
+        account = session.get(AccountModel, 1)
+        assert account is not None
+        state = session.get(AccountListStateModel, 1)
+        assert state is not None
+        state.payment_link_generated = False
+        state.source_updated_at = str(account.updated_at)
+        state.derivation_version = account_filters.ACCOUNT_LIST_STATE_DERIVATION_VERSION
+        session.add(state)
+        session.add(
+            PaymentLinkGenerationModel(
+                account_id=1,
+                account_email=str(account.email or "").strip().lower(),
+                account_created_at=account.created_at.replace(tzinfo=None).isoformat(sep=" "),
+                request_id="unfiltered-payment-history-1",
+                status="succeeded",
+                url="https://payments.example.test/history-1",
+            )
+        )
+        session.commit()
+
+        listed = accounts.list_accounts(
+            platform="chatgpt",
+            page=1,
+            page_size=200,
+            session=session,
+        )
+
+    item = next(item for item in listed["items"] if item["id"] == 1)
+    assert item["payment_link_generated"] is True
+
+
+def test_account_detail_refreshes_payment_history_state(filter_engine, monkeypatch):
+    monkeypatch.setattr(accounts, "reconcile_rate_limited_accounts", lambda *args, **kwargs: 0)
+    with Session(filter_engine) as session:
+        account = session.get(AccountModel, 1)
+        assert account is not None
+        state = session.get(AccountListStateModel, 1)
+        assert state is not None
+        state.payment_link_generated = False
+        state.source_updated_at = str(account.updated_at)
+        state.derivation_version = account_filters.ACCOUNT_LIST_STATE_DERIVATION_VERSION
+        session.add(state)
+        session.add(
+            PaymentLinkGenerationModel(
+                account_id=1,
+                account_email=str(account.email or "").strip().lower(),
+                account_created_at=account.created_at.replace(tzinfo=None).isoformat(sep=" "),
+                request_id="detail-payment-history-1",
+                status="succeeded",
+                url="https://payments.example.test/detail-history-1",
+            )
+        )
+        session.commit()
+
+        payload = accounts.get_account(1, session=session)
+
+    assert payload["payment_link_generated"] is True
 
 
 def test_phone_binding_filter_keeps_list_and_task_scope_identical(filter_engine):

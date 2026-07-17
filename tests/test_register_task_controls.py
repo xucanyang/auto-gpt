@@ -1252,6 +1252,7 @@ class _FakeLongLinkPaymentClient:
         profile: dict | None = None,
         submitted_status: str = "queued",
         polled_status: str = "done",
+        after_submit=None,
     ):
         self.profile = dict(
             profile
@@ -1266,6 +1267,7 @@ class _FakeLongLinkPaymentClient:
         )
         self.submitted_status = submitted_status
         self.polled_status = polled_status
+        self.after_submit = after_submit
         self.events: list[tuple] = []
         self.submissions: list[dict] = []
         self._items: list[dict] = []
@@ -1306,6 +1308,8 @@ class _FakeLongLinkPaymentClient:
             }
         )
         self._items = [self._remote_item(item, index, self.submitted_status) for index, item in enumerate(items, start=1)]
+        if self.after_submit is not None:
+            self.after_submit()
         return {
             "batch_id": self.batch_id,
             "batch_ids": [self.batch_id],
@@ -1455,6 +1459,53 @@ class BatchPaymentLinkTaskTests(unittest.TestCase):
             self.assertEqual(cache["profile_hash"], "profile-hash-brl")
             self.assertTrue(cache["generated_at"])
 
+    def test_batch_payment_link_does_not_write_old_result_to_reused_account_id(self):
+        task_id = "task-batch-payment-account-id-reuse"
+        account_id = self._add_account(email="original@example.com")
+        self._create_payment_link_task(task_id, account_id, "original@example.com")
+
+        def replace_account() -> None:
+            with Session(self.engine) as session:
+                original = session.get(AccountModel, account_id)
+                self.assertIsNotNone(original)
+                session.delete(original)
+                session.commit()
+                replacement = AccountModel(
+                    id=account_id,
+                    platform="chatgpt",
+                    email="replacement@example.com",
+                    password="pw",
+                    token="replacement-access-token",
+                )
+                replacement.set_extra({})
+                session.add(replacement)
+                session.commit()
+
+        client = _FakeLongLinkPaymentClient(after_submit=replace_account)
+        with (
+            patch(
+                "services.chatgpt_core.long_link_payment_client.LongLinkPaymentClient.from_env",
+                return_value=client,
+            ),
+            patch("api.tasks._save_task_log"),
+        ):
+            _run_batch_payment_links(task_id, [account_id])
+
+        snapshot = _task_store.snapshot(task_id)
+        self.assertEqual(snapshot["status"], "failed")
+        self.assertEqual(snapshot["success"], 0)
+        self.assertTrue(any("账号已被删除或替换" in line for line in snapshot["logs"]))
+        with Session(self.engine) as session:
+            replacement = session.get(AccountModel, account_id)
+            history = session.exec(
+                select(PaymentLinkGenerationModel).where(
+                    PaymentLinkGenerationModel.account_id == account_id
+                )
+            ).all()
+        self.assertEqual(replacement.email, "replacement@example.com")
+        self.assertNotIn("chatgpt_last_payment_link", replacement.get_extra())
+        self.assertEqual(history, [])
+
     def test_batch_payment_link_syncs_already_paid_instead_of_generating(self):
         task_id = "task-batch-payment-already-paid"
         account_id = self._add_account(
@@ -1490,8 +1541,8 @@ class BatchPaymentLinkTaskTests(unittest.TestCase):
         self.assertEqual(snapshot["skipped"], 1)
         self.assertTrue(any("已经支付过，开始同步账号状态" in line for line in snapshot["logs"]))
 
-    def test_batch_payment_link_replaces_legacy_hosted_cache_with_active_profile_link(self):
-        task_id = "task-batch-payment-regenerate-legacy-cache"
+    def test_batch_payment_link_reuses_legacy_hosted_cache_unless_force_refresh(self):
+        task_id = "task-batch-payment-reuse-legacy-cache"
         account_id = self._add_account(
             email="legacy-cache@example.com",
             cached={
@@ -1515,10 +1566,33 @@ class BatchPaymentLinkTaskTests(unittest.TestCase):
         ):
             _run_batch_payment_links(task_id, [account_id])
 
-        self.assertEqual(len(client.submissions), 1)
+        self.assertEqual(client.submissions, [])
+        self.assertEqual(_task_store.snapshot(task_id)["skipped"], 1)
+
+        force_task_id = "task-batch-payment-force-legacy-cache"
+        self._create_payment_link_task(
+            force_task_id,
+            account_id,
+            "legacy-cache@example.com",
+            force_refresh=True,
+        )
+        force_client = _FakeLongLinkPaymentClient()
+        with (
+            patch(
+                "services.chatgpt_core.long_link_payment_client.LongLinkPaymentClient.from_env",
+                return_value=force_client,
+            ),
+            patch("api.tasks._save_task_log"),
+        ):
+            _run_batch_payment_links(force_task_id, [account_id])
+
+        self.assertEqual(len(force_client.submissions), 1)
         snapshot = _task_store.snapshot(task_id)
-        self.assertEqual(snapshot["success"], 1)
-        self.assertEqual(snapshot["skipped"], 0)
+        self.assertEqual(snapshot["success"], 0)
+        self.assertEqual(snapshot["skipped"], 1)
+        force_snapshot = _task_store.snapshot(force_task_id)
+        self.assertEqual(force_snapshot["success"], 1)
+        self.assertEqual(force_snapshot["skipped"], 0)
 
         with Session(self.engine) as session:
             row = session.get(AccountModel, account_id)
@@ -1656,6 +1730,22 @@ class BatchPaymentLinkTaskTests(unittest.TestCase):
         self.assertEqual([item["account_id"] for item in result["skipped_items"]], [invalid_id])
         self.assertIn("不能生成支付链接", result["skipped_items"][0]["reason"])
         thread_cls.assert_called_once()
+
+    def test_enqueue_batch_payment_link_task_ids_are_unique_within_same_millisecond(self):
+        account_id = self._add_account(email="same-millisecond@example.com")
+        req = BatchPaymentLinkTaskRequest(account_ids=[account_id])
+
+        with (
+            patch("api.tasks.time.time", return_value=1_784_000_000.123),
+            patch("api.tasks.threading.Thread") as thread_cls,
+        ):
+            first = enqueue_batch_payment_link_task(req)
+            second = enqueue_batch_payment_link_task(req)
+
+        self.assertNotEqual(first["task_id"], second["task_id"])
+        self.assertTrue(first["task_id"].startswith("task_1784000000123_"))
+        self.assertTrue(second["task_id"].startswith("task_1784000000123_"))
+        self.assertEqual(thread_cls.call_count, 2)
 
 
 class BatchResumeAuthTaskCreationTests(unittest.TestCase):
