@@ -4,6 +4,30 @@
 
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，并且本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/) (语义化版本)。
 
+## [2.3.0] - 2026-07-17
+
+### 新增 (Added)
+- **持久管理员会话与认证审计**：`core/db.py` 新增 `admin_auth_sessions`、`admin_auth_audit`、`admin_auth_throttles`，`api/auth.py` 为每个管理员 JWT 创建服务端 `jti` 会话并提供受保护的 `/api/auth/sessions`、`/api/auth/audit` 与全会话撤销接口。审计仅保存实例、时间、真实客户端 IP、User-Agent、阶段、结果、原因和会话标识，不保存密码、TOTP 或 JWT。
+- **统一 fetch SSE 客户端**：新增 `frontend/src/lib/eventStream.ts`，使用带 `Authorization: Bearer` 的 `fetch` 流式读取 SSE，支持 CRLF/分块边界、多行 `data`、心跳、Abort、终态主动断流与指数退避重连；自动流水线和任务日志面板不再依赖无法设置请求头的原生 `EventSource`。
+- **可回滚的边缘安全配置与运维工具**：新增 `ops/nginx/` 三域名规范配置、`scripts/install-auto-gpt-nginx-security.sh`、`scripts/rotate-admin-auth-secrets.py`、`scripts/redact-nginx-query-tokens.py` 和 `scripts/prepare-legacy-auth-rollback.py`，分别用于 nginx 原子安装/失败回滚、三实例 JWT 基础密钥无回显轮换、历史日志查询串令牌脱敏，以及回滚到 v2.3.0 之前镜像时仅恢复旧版可识别的管理员密码/TOTP 而不覆盖期间新增的业务数据；兼容回滚仍会生成全新 JWT 密钥，避免旧会话复活。
+
+### 优化 (Changed)
+- **密码与会话强度升级**：管理员密码改用 Argon2id；旧无盐 SHA-256 在首次成功验证后原地迁移，不强制现有管理员立即重置。新设或修改密码最低 12 位，JWT 默认有效期由 7 天缩短为 12 小时；真实 logout、密码变更、2FA 变更和密钥轮换都会撤销对应服务端会话。
+- **凭据变更改为 step-up 验证**：首次 `/api/auth/setup` 只允许未初始化实例，并支持 `APP_AUTH_BOOTSTRAP_TOKEN` / `X-Auth-Bootstrap-Token`；未配置令牌时只接受本机或显式可信容器网关。修改密码必须验证当前密码；启用 2FA 必须验证当前密码和新验证码；停用 2FA 必须同时验证当前密码和当前 TOTP。前端安全面板同步展示实例身份、一次性初始化流程和二次验证表单。
+- **管理端口与来源日志收口**：`docker-compose.multi.yml` 将 `8000/8001/8003`、`8317/8318/8320` 全部改为仅绑定 `127.0.0.1`，继续保留三个 solver 端口的本机绑定。三个域名使用独立 JSON access/error log，访问日志仅记录 `$uri` 而不记录查询串；`auto-gpt.cccy.me` 仅对 Cloudflare 官方代理网段信任 `CF-Connecting-IP`，Plus 与 Plus2 继续使用直连来源 IP。 安装脚本会把主站从历史聚合配置 `cccy-apps.conf` 原子迁移到实际被 nginx 顶层加载的独立 vhost，并在 reload 前通过 `nginx -T` 断言唯一生效来源，避免安全配置写入未加载的 `conf.d/managed/` 后形成假上线。
+
+### 修复 (Fixed)
+- **修复三实例认证横向复用**：JWT 签名密钥现在通过 `APP_INSTANCE_ID` 派生，并强制校验实例独立的 `iss`、`aud`、`jti` 和 `auth_version`。即使底层配置被误复制，主实例、Plus、Plus2 的令牌也不能跨实例验签，主实例未启用 TOTP 不再成为 Plus 系列 2FA 的绕过入口。
+- **修复认证缺失时 fail-open**：`main.py` 在管理员密码缺失时对普通受保护 API 返回 `503`，不再直接放行；`/api/auth/disable` 被明确禁止，`/api/auth/setup` 不能再被已有 Bearer 用来绕过当前密码覆盖凭据，关闭“清空认证后重新抢占初始化”的接管链。
+- **修复 JWT 进入 URL 与 nginx 日志**：删除后端 query `access_token` 兼容入口，前端所有管理员 SSE 和导出请求统一走 Authorization header；nginx 同时拒绝旧式 `access_token` 查询参数，避免新旧浏览器或扫描器再次把完整 JWT 写入 access/error log。
+
+### 安全 (Security)
+- **登录限速、冷却与可信代理边界**：密码、TOTP、bootstrap 和凭据 step-up 按实例、真实 IP、阶段持久计数，SQLite/PostgreSQL 使用原子 UPSERT 防止多 worker 丢计数，达到阈值返回 `429 + Retry-After`。应用仅在直连 peer 命中 `APP_TRUSTED_PROXY_CIDRS` 时采纳转发 IP；nginx 会清除调用方自带的 Cloudflare 身份头。 三个 vhost 对 `/api/auth/` 单独限制请求体为 16 KiB，Pydantic 同步限制密码、临时令牌、TOTP 和密钥字段长度；业务上传接口仍保留 200 MiB 上限，避免认证入口被大请求并发占满磁盘或内存。 单进程运行态还会原子消费密码阶段的临时 2FA challenge，并串行化首次 bootstrap 初始化，阻止同一临时令牌并发兑换多份会话或两个初始化请求互相覆盖。
+- **实例密钥轮换不触碰用户凭据**：发布流程会为主实例、Plus、Plus2 生成不同 JWT 基础密钥并递增 `auth_version`，使发布前所有令牌立即失效；现有管理员密码和 TOTP 不会被脚本静默改写，仍可由管理员在各实例安全面板逐一轮换。
+
+### 测试 (Tests)
+- **认证、SSE 与基础设施合同回归**：新增 `tests/test_admin_auth_security.py`、`tests/test_auth_infra_contract.py`、`tests/test_rotate_admin_auth_secrets.py`、`tests/test_redact_nginx_query_tokens.py`、`tests/test_prepare_legacy_auth_rollback.py` 及 `frontend/tests/`，覆盖旧哈希迁移、跨实例拒绝、真实注销、会话撤销、bootstrap、公网初始化拦截、2FA step-up、并发限速、审计字段、URL 令牌清除、SSE 解析、401 会话清理、回环端口和 nginx 无查询串日志合同。 前端测试通过仓库既有 TypeScript 编译器在临时目录转译目标模块，再使用 Node 20 原生 `node --test` 运行，与 Dockerfile 的构建基线一致且不新增运行器依赖，不再依赖宿主 Node 22 的实验参数。
+
 ## [2.2.16] - 2026-07-17
 
 ### 优化 (Changed)
@@ -1807,4 +1831,8 @@
 
 ## 2026-07-17 05:47:00 +0800
 - 恢复主实例常驻发布拓扑并补齐三实例发布烟测
+- 发布模式: multi
+
+## 2026-07-17 09:37:38 +0800
+- 升级 v2.3.0：隔离三实例管理员认证并加固会话、审计、SSE 与公网端口
 - 发布模式: multi

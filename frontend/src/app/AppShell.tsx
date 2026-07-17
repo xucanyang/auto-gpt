@@ -21,7 +21,7 @@ import {
 import zhCN from 'antd/locale/zh_CN'
 import { APP_ROUTES } from './router'
 import { darkTheme, lightTheme } from '@/theme'
-import { clearToken, getToken } from '@/lib/utils'
+import { getToken, logout } from '@/lib/utils'
 
 const { Sider, Content } = Layout
 
@@ -71,6 +71,7 @@ function AppContent({ hasPassword }: { hasPassword: boolean }) {
     (localStorage.getItem('theme') as 'dark' | 'light') || 'dark',
   )
   const [collapsed, setCollapsed] = useState(false)
+  const [logoutLoading, setLogoutLoading] = useState(false)
   const location = useLocation()
   const navigate = useNavigate()
 
@@ -221,9 +222,10 @@ function AppContent({ hasPassword }: { hasPassword: boolean }) {
                   block
                   danger
                   icon={<LogoutOutlined />}
+                  loading={logoutLoading}
                   onClick={() => {
-                    clearToken()
-                    navigate('/login')
+                    setLogoutLoading(true)
+                    void logout().catch(() => undefined)
                   }}
                   style={{
                     display: 'flex',
@@ -243,7 +245,7 @@ function AppContent({ hasPassword }: { hasPassword: boolean }) {
                     marginTop: 4,
                   }}
                 >
-                  v2.2.16
+                  v2.3.0
                 </div>
               )}
             </div>

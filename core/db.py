@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 from math import ceil
 import os
 from typing import Any, Optional
-from sqlalchemy import event, text, UniqueConstraint
+from sqlalchemy import Index, event, text, UniqueConstraint
 from sqlmodel import Field, SQLModel, create_engine, Session, select
 import json
 
@@ -102,6 +102,70 @@ class PaymentLinkGenerationModel(SQLModel, table=True):
 
     def set_result(self, value: dict | None) -> None:
         self.result_json = json.dumps(value if isinstance(value, dict) else {}, ensure_ascii=False)
+
+
+class AdminAuthSessionModel(SQLModel, table=True):
+    """Server-side state for one administrator JWT session."""
+
+    __tablename__ = "admin_auth_sessions"
+    __table_args__ = (
+        Index(
+            "idx_admin_auth_sessions_instance_active",
+            "instance_id",
+            "revoked_at",
+            "expires_at",
+        ),
+    )
+
+    jti: str = Field(primary_key=True, max_length=64)
+    instance_id: str = Field(index=True, max_length=128)
+    auth_version: int = Field(default=1, index=True)
+    issued_at: int = Field(default=0, index=True)
+    expires_at: int = Field(default=0, index=True)
+    revoked_at: int = Field(default=0, index=True)
+    revoke_reason: str = Field(default="", max_length=128)
+    client_ip: str = Field(default="", max_length=128)
+    user_agent: str = Field(default="", max_length=512)
+
+
+class AdminAuthAuditModel(SQLModel, table=True):
+    """Credential-free administrator authentication audit trail."""
+
+    __tablename__ = "admin_auth_audit"
+    __table_args__ = (
+        Index(
+            "idx_admin_auth_audit_lookup",
+            "instance_id",
+            "client_ip",
+            "stage",
+            "event_at",
+        ),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    instance_id: str = Field(index=True, max_length=128)
+    event_at: int = Field(default=0, index=True)
+    client_ip: str = Field(default="", index=True, max_length=128)
+    user_agent: str = Field(default="", max_length=512)
+    stage: str = Field(default="", index=True, max_length=64)
+    outcome: str = Field(default="", index=True, max_length=32)
+    reason: str = Field(default="", max_length=128)
+    jti: str = Field(default="", index=True, max_length=64)
+
+
+class AdminAuthThrottleModel(SQLModel, table=True):
+    """Persistent per-instance/IP/stage authentication cooldown state."""
+
+    __tablename__ = "admin_auth_throttles"
+
+    bucket_key: str = Field(primary_key=True, max_length=64)
+    instance_id: str = Field(index=True, max_length=128)
+    client_ip: str = Field(default="", index=True, max_length=128)
+    stage: str = Field(default="", index=True, max_length=64)
+    failure_count: int = 0
+    window_started_at: int = 0
+    blocked_until: int = Field(default=0, index=True)
+    updated_at: int = Field(default=0, index=True)
 
 
 def _has_non_empty_text(value: Any) -> bool:

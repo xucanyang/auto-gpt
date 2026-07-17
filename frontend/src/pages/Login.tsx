@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { App, Card, ConfigProvider, Form, Input, Button, Typography } from 'antd'
 import { LockOutlined, SafetyCertificateOutlined, UserOutlined } from '@ant-design/icons'
-import { setToken } from '@/lib/utils'
+import { apiErrorFromResponse, setToken } from '@/lib/utils'
 import { darkTheme } from '@/theme'
 
 type Step = 'password' | '2fa'
@@ -18,19 +18,24 @@ function LoginContent() {
       const res = await fetch('/api/auth/login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        cache: 'no-store',
         body: JSON.stringify({ password: values.password }),
       })
+      if (!res.ok) throw await apiErrorFromResponse(res)
       const data = await res.json()
-      if (!res.ok) throw new Error(data.detail || '登录失败')
       if (data.requires_2fa) {
-        setTempToken(data.temp_token)
+        const nextTempToken = String(data.temp_token || '')
+        if (!nextTempToken) throw new Error('登录响应缺少双因素验证令牌')
+        setTempToken(nextTempToken)
         setStep('2fa')
       } else {
-        setToken(data.access_token)
+        const accessToken = String(data.access_token || '')
+        if (!accessToken) throw new Error('登录响应缺少访问令牌')
+        setToken(accessToken)
         window.location.href = '/'
       }
-    } catch (e: any) {
-      message.error(e.message)
+    } catch (error: unknown) {
+      message.error(error instanceof Error ? error.message : '登录失败')
     } finally {
       setLoading(false)
     }
@@ -42,14 +47,23 @@ function LoginContent() {
       const res = await fetch('/api/auth/verify-totp', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        cache: 'no-store',
         body: JSON.stringify({ temp_token: tempToken, code: values.code }),
       })
+      if (!res.ok) {
+        if (res.status === 401) {
+          setTempToken('')
+          setStep('password')
+        }
+        throw await apiErrorFromResponse(res)
+      }
       const data = await res.json()
-      if (!res.ok) throw new Error(data.detail || '验证失败')
-      setToken(data.access_token)
+      const accessToken = String(data.access_token || '')
+      if (!accessToken) throw new Error('验证响应缺少访问令牌')
+      setToken(accessToken)
       window.location.href = '/'
-    } catch (e: any) {
-      message.error(e.message)
+    } catch (error: unknown) {
+      message.error(error instanceof Error ? error.message : '验证失败')
     } finally {
       setLoading(false)
     }
@@ -107,7 +121,14 @@ function LoginContent() {
               </Button>
             </Form.Item>
             <div style={{ textAlign: 'center', marginTop: 12 }}>
-              <Button type="link" size="small" onClick={() => setStep('password')}>
+              <Button
+                type="link"
+                size="small"
+                onClick={() => {
+                  setTempToken('')
+                  setStep('password')
+                }}
+              >
                 返回密码登录
               </Button>
             </div>

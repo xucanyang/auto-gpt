@@ -45,10 +45,6 @@ PUBLIC_API_PATHS = {
     "/api/integrations/gopay-otp/smsforwarder",
 }
 
-TOKEN_QUERY_API_PATHS = {
-    "/api/pipeline/logs/stream",
-}
-
 SENSITIVE_SPA_FALLBACK_ROOTS = {
     "actuator",
     "adminer",
@@ -352,13 +348,14 @@ async def auth_middleware(request: Request, call_next):
         return await call_next(request)
     from core.config_store import config_store as _cs
     if not _cs.get("auth_password_hash", ""):
-        return await call_next(request)
+        return JSONResponse(
+            {"detail": "管理员认证尚未初始化，请先设置管理员密码"},
+            status_code=503,
+        )
     auth_header = request.headers.get("Authorization", "")
     token = ""
     if auth_header.startswith("Bearer "):
         token = auth_header[7:]
-    elif path in TOKEN_QUERY_API_PATHS:
-        token = str(request.query_params.get("access_token") or "").strip()
     if not token:
         return JSONResponse({"detail": "未认证，请先登录"}, status_code=401)
     try:

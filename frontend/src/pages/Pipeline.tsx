@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import {
   Alert,
   Button,
@@ -32,7 +32,8 @@ import {
   StopOutlined,
 } from '@ant-design/icons'
 
-import { apiFetch, getToken } from '@/lib/utils'
+import { consumeEventStream, isAbortError } from '@/lib/eventStream'
+import { ApiError, apiFetch } from '@/lib/utils'
 
 const { Text, Title } = Typography
 
@@ -413,7 +414,6 @@ export default function Pipeline() {
   const [logFilter, setLogFilter] = useState<LogFilterKey>('all')
   const [selectedTaskKey, setSelectedTaskKey] = useState('')
   const [selectedTaskLogsCache, setSelectedTaskLogsCache] = useState<Record<string, string[]>>({})
-  const eventSourceRef = useRef<EventSource | null>(null)
 
   const loadConfig = async () => {
     setConfigLoading(true)
@@ -497,37 +497,58 @@ export default function Pipeline() {
   }, [selectedTaskKey, statusData?.task?.task_key, statusData?.task_logs])
 
   useEffect(() => {
-    if (eventSourceRef.current) {
-      eventSourceRef.current.close()
-    }
-    const token = getToken()
-    const sourceUrl = token
-      ? `/api/pipeline/logs/stream?access_token=${encodeURIComponent(token)}`
-      : '/api/pipeline/logs/stream'
-    const source = new EventSource(sourceUrl)
-    source.onmessage = (event) => {
-      try {
-        const payload = JSON.parse(event.data || '{}')
-        if (payload.line) {
-          setLogs((prev) => {
-            const line = String(payload.line)
-            if (prev[prev.length - 1] === line) {
-              return prev
-            }
-            return [...prev, line].slice(-500)
+    const controller = new AbortController()
+    let retryCount = 0
+    let retryTimer: number | undefined
+
+    const waitForRetry = (delayMs: number) => new Promise<void>((resolve) => {
+      const finish = () => {
+        if (retryTimer !== undefined) window.clearTimeout(retryTimer)
+        retryTimer = undefined
+        controller.signal.removeEventListener('abort', finish)
+        resolve()
+      }
+      retryTimer = window.setTimeout(finish, delayMs)
+      controller.signal.addEventListener('abort', finish, { once: true })
+    })
+
+    const connect = async () => {
+      while (!controller.signal.aborted) {
+        try {
+          await consumeEventStream('/pipeline/logs/stream', {
+            signal: controller.signal,
+            onEvent: (event) => {
+              if (controller.signal.aborted) return false
+              retryCount = 0
+              try {
+                const payload = JSON.parse(event.data || '{}')
+                if (payload.line) {
+                  setLogs((prev) => {
+                    const line = String(payload.line)
+                    if (prev[prev.length - 1] === line) return prev
+                    return [...prev, line].slice(-500)
+                  })
+                }
+              } catch {
+                // Ignore malformed event payloads and keep the stream alive.
+              }
+            },
           })
+        } catch (error: unknown) {
+          if (controller.signal.aborted || isAbortError(error)) return
+          if (error instanceof ApiError && error.status === 401) return
         }
-      } catch {
-        // ignore malformed event payloads
+
+        retryCount += 1
+        const retryMs = Math.min(1000 * (2 ** (retryCount - 1)), 8000)
+        await waitForRetry(retryMs)
       }
     }
-    source.onerror = () => {
-      // Let the browser's EventSource retry automatically.
-    }
-    eventSourceRef.current = source
+
+    void connect()
     return () => {
-      source.close()
-      eventSourceRef.current = null
+      controller.abort()
+      if (retryTimer !== undefined) window.clearTimeout(retryTimer)
     }
   }, [])
 

@@ -3,7 +3,8 @@ import { Badge, Button, Card, Descriptions, message, Segmented, Space, Tag, them
 import { CopyOutlined, FastForwardOutlined, StopOutlined } from '@ant-design/icons'
 
 import IdeaSubmitSummary from '@/components/idea/IdeaSubmitSummary'
-import { API_BASE, apiFetch, getToken } from '@/lib/utils'
+import { consumeEventStream, isAbortError } from '@/lib/eventStream'
+import { ApiError, apiFetch } from '@/lib/utils'
 import { getTaskTerminalStatus, type TaskTerminalStatus } from '@/lib/taskStatus'
 
 interface TaskLogPanelProps {
@@ -289,45 +290,18 @@ export function TaskLogPanel({ taskId, onDone, showTaskControls = true }: TaskLo
     }
 
     const connectStreamOnce = async (): Promise<boolean> => {
+      let reachedTerminalState = false
       try {
-        const token = getToken()
-        const headers: Record<string, string> = {}
-        if (token) headers.Authorization = `Bearer ${token}`
-
         const since = nextSinceRef.current
-        const response = await fetch(`${API_BASE}/tasks/${taskId}/logs/stream?since=${since}`, {
-          headers,
+        await consumeEventStream(`/tasks/${taskId}/logs/stream?since=${since}`, {
           signal: controller.signal,
-        })
-
-        if (!response.ok) {
-          setError(`日志流连接失败 (${response.status})`)
-          return true
-        }
-
-        if (!response.body) {
-          setError('日志流未返回可读数据')
-          return false
-        }
-
-        setError('')
-        const reader = response.body.getReader()
-        const decoder = new TextDecoder()
-        let buffer = ''
-
-        while (!cancelled) {
-          const { done, value } = await reader.read()
-          if (done) break
-
-          buffer += decoder.decode(value, { stream: true })
-          const parts = buffer.split('\n\n')
-          buffer = parts.pop() || ''
-
-          for (const part of parts) {
-            const match = part.match(/^data:\s*(.+)$/m)
-            if (!match) continue
+          onOpen: () => {
+            if (!cancelled) setError('')
+          },
+          onEvent: (event) => {
+            if (cancelled || controller.signal.aborted) return false
             try {
-              const payload = JSON.parse(match[1]) as {
+              const payload = JSON.parse(event.data) as {
                 line?: string
                 done?: boolean
                 status?: string
@@ -348,20 +322,23 @@ export function TaskLogPanel({ taskId, onDone, showTaskControls = true }: TaskLo
                 // Notify the parent after the terminal state is visible so pages can refresh
                 // their page data without making the final log lines disappear first.
                 notifyTaskDone(terminal)
-                return true
+                reachedTerminalState = true
+                return false
               }
             } catch {
               // ignore malformed SSE payload
             }
-          }
-        }
-
-        return false
+          },
+        })
+        return reachedTerminalState
       } catch (error_: unknown) {
-        if (!cancelled && !(error_ instanceof DOMException && error_.name === 'AbortError')) {
-          return false
+        if (cancelled || controller.signal.aborted || isAbortError(error_)) return true
+        if (error_ instanceof ApiError && error_.status === 401) return true
+        if (error_ instanceof ApiError && error_.status >= 400 && error_.status < 500) {
+          setError(`日志流连接失败 (${error_.status})`)
+          return true
         }
-        return true
+        return false
       }
     }
 

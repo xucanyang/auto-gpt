@@ -52,6 +52,7 @@ services:
       APP_CONDA_ENV: docker
       APP_RUNTIME_DIR: /runtime
       APP_INSTANCE_ID: auto-gpt
+      APP_TRUSTED_PROXY_CIDRS: ${APP_TRUSTED_PROXY_CIDRS:-172.20.0.1/32}
       PHONE_API_RELAY_INTERNAL_URL: http://phone-api-relay:8787
       PHONE_API_RELAY_ADMIN_TOKEN: ${PHONE_API_RELAY_ADMIN_TOKEN:?PHONE_API_RELAY_ADMIN_TOKEN is required}
       SHARED_CONFIG_DB: /shared_config/shared_config.db
@@ -62,9 +63,9 @@ services:
       SOLVER_BROWSER_TYPE: ${SOLVER_BROWSER_TYPE:-camoufox}
       PLAYWRIGHT_HEADLESS: ${PLAYWRIGHT_HEADLESS:-}
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
       - "127.0.0.1:8889:8889"
-      - "${CLIPROXYAPI_PORT_BIND:-8317}:8317"
+      - "127.0.0.1:${CLIPROXYAPI_PORT_BIND:-8317}:8317"
     volumes:
       - ./data:/runtime
       - ./shared_config:/shared_config
@@ -107,6 +108,7 @@ services:
       APP_CONDA_ENV: docker
       APP_RUNTIME_DIR: /runtime
       APP_INSTANCE_ID: auto-gpt-plus
+      APP_TRUSTED_PROXY_CIDRS: ${APP_TRUSTED_PROXY_CIDRS:-172.20.0.1/32}
       PHONE_API_RELAY_INTERNAL_URL: http://phone-api-relay:8787
       PHONE_API_RELAY_ADMIN_TOKEN: ${PHONE_API_RELAY_ADMIN_TOKEN:?PHONE_API_RELAY_ADMIN_TOKEN is required}
       SHARED_CONFIG_DB: /shared_config/shared_config.db
@@ -120,9 +122,9 @@ services:
       phone-api-relay:
         condition: service_healthy
     ports:
-      - "8001:8000"
+      - "127.0.0.1:8001:8000"
       - "127.0.0.1:8890:8889"
-      - "${CLIPROXYAPI_PORT_BIND_PLUS:-8318}:8317"
+      - "127.0.0.1:${CLIPROXYAPI_PORT_BIND_PLUS:-8318}:8317"
     volumes:
       - /opt/auto-gpt-plus/data:/runtime
       - /opt/auto-gpt/shared_config:/shared_config
@@ -158,6 +160,7 @@ services:
       APP_CONDA_ENV: docker
       APP_RUNTIME_DIR: /runtime
       APP_INSTANCE_ID: auto-plus2
+      APP_TRUSTED_PROXY_CIDRS: ${APP_TRUSTED_PROXY_CIDRS:-172.20.0.1/32}
       PHONE_API_RELAY_INTERNAL_URL: http://phone-api-relay:8787
       PHONE_API_RELAY_ADMIN_TOKEN: ${PHONE_API_RELAY_ADMIN_TOKEN:?PHONE_API_RELAY_ADMIN_TOKEN is required}
       SHARED_CONFIG_DB: /shared_config/shared_config.db
@@ -171,9 +174,9 @@ services:
       phone-api-relay:
         condition: service_healthy
     ports:
-      - "8003:8000"
+      - "127.0.0.1:8003:8000"
       - "127.0.0.1:8892:8889"
-      - "${CLIPROXYAPI_PORT_BIND_PLUS2:-8320}:8317"
+      - "127.0.0.1:${CLIPROXYAPI_PORT_BIND_PLUS2:-8320}:8317"
     volumes:
       - /opt/auto-plus2/data:/runtime
       - /opt/auto-gpt/shared_config:/shared_config

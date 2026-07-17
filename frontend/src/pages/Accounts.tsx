@@ -68,7 +68,7 @@ import {
   normalizeGopayRecognizedCountryCodes,
   splitGopayPhoneInput,
 } from '@/lib/gopayPhone'
-import { apiFetch } from '@/lib/utils'
+import { apiFetch, apiRequest } from '@/lib/utils'
 import { buildTaskProxyPayload, saveTaskProxySettingsToConfig, taskProxySettingsFromConfig, validateTaskProxySettings } from '@/lib/taskProxySettings'
 import { normalizeExecutorForPlatform } from '@/lib/platformExecutorOptions'
 import { isActiveTaskStatus, normalizeTaskStatus } from '@/lib/taskStatus'
@@ -3583,10 +3583,6 @@ export default function Accounts() {
   ) => {
     if (currentPlatform === 'chatgpt') {
       try {
-        const token = localStorage.getItem('auth_token') || ''
-        if (!token) {
-          throw new Error('未认证，请先登录')
-        }
         const selectedIds = selectedRowKeys
           .map((key) => Number(key))
           .filter((id) => Number.isFinite(id) && id > 0)
@@ -3610,12 +3606,8 @@ export default function Accounts() {
             return
           }
         }
-        const res = await fetch('/api/chatgpt/export-sub2api-ticket', {
+        const res = await apiRequest('/chatgpt/export-sub2api-ticket', {
           method: 'POST',
-          headers: {
-            Authorization: `Bearer ${token}`,
-            'Content-Type': 'application/json',
-          },
           body: JSON.stringify(body),
         })
         if (!res.ok) {

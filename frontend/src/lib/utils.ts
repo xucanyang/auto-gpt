@@ -1,5 +1,6 @@
 export const API = '/api'
 export const API_BASE = '/api'
+const AUTH_TOKEN_KEY = 'auth_token'
 
 // Protocol 2 means the task UI has the terminal-state polling fix.  The
 // backend uses it only to distinguish a freshly deployed bundle from a stale
@@ -7,15 +8,24 @@ export const API_BASE = '/api'
 export const TASK_POLL_PROTOCOL_VERSION = '2'
 
 export function getToken(): string {
-  return localStorage.getItem('auth_token') || ''
+  if (typeof localStorage === 'undefined') return ''
+  return localStorage.getItem(AUTH_TOKEN_KEY) || ''
 }
 
 export function setToken(token: string): void {
-  localStorage.setItem('auth_token', token)
+  if (typeof localStorage === 'undefined') return
+  localStorage.setItem(AUTH_TOKEN_KEY, token)
 }
 
 export function clearToken(): void {
-  localStorage.removeItem('auth_token')
+  if (typeof localStorage === 'undefined') return
+  localStorage.removeItem(AUTH_TOKEN_KEY)
+}
+
+export function invalidateSession(): void {
+  clearToken()
+  if (typeof window === 'undefined' || window.location.pathname === '/login') return
+  window.location.replace('/login')
 }
 
 export class ApiError extends Error {
@@ -63,29 +73,60 @@ function buildApiError(res: Response, text: string): ApiError {
   return new ApiError(res.status, message, detail, code)
 }
 
-export async function apiFetch(path: string, opts?: RequestInit) {
+export async function apiErrorFromResponse(res: Response): Promise<ApiError> {
+  return buildApiError(res, await res.text())
+}
+
+function apiUrl(path: string): string {
+  if (path === API || path.startsWith(`${API}/`)) return path
+  return `${API}${path.startsWith('/') ? path : `/${path}`}`
+}
+
+export async function apiRequest(path: string, opts?: RequestInit): Promise<Response> {
   const token = getToken()
-  const baseHeaders: Record<string, string> = {
-    'Content-Type': 'application/json',
-    'X-Auto-Gpt-Task-Poll-Protocol': TASK_POLL_PROTOCOL_VERSION,
+  const headers = new Headers(opts?.headers)
+  headers.set('X-Auto-Gpt-Task-Poll-Protocol', TASK_POLL_PROTOCOL_VERSION)
+  if (typeof opts?.body === 'string' && !headers.has('Content-Type')) {
+    headers.set('Content-Type', 'application/json')
   }
-  if (token) baseHeaders['Authorization'] = `Bearer ${token}`
-  const res = await fetch(API + path, {
+  if (token && !headers.has('Authorization')) {
+    headers.set('Authorization', `Bearer ${token}`)
+  }
+
+  const res = await fetch(apiUrl(path), {
     ...opts,
-    headers: { ...baseHeaders, ...(opts?.headers as Record<string, string> || {}) },
+    headers,
   })
   if (res.status === 401) {
-    const text = await res.text()
-    const error = buildApiError(res, text)
-    clearToken()
-    if (window.location.pathname !== '/login') {
-      window.location.href = '/login'
-    }
+    const error = await apiErrorFromResponse(res)
+    invalidateSession()
     throw new ApiError(error.status, '未认证，请重新登录', error.detail, error.code)
   }
+  return res
+}
+
+export async function apiFetch(path: string, opts?: RequestInit) {
+  const res = await apiRequest(path, opts)
   if (!res.ok) {
-    const text = await res.text()
-    throw buildApiError(res, text)
+    throw await apiErrorFromResponse(res)
   }
   return res.json()
+}
+
+export async function logout(): Promise<void> {
+  const controller = new AbortController()
+  const timeout = globalThis.setTimeout(() => controller.abort(), 5000)
+  try {
+    if (getToken()) {
+      const response = await apiRequest('/auth/logout', {
+        method: 'POST',
+        keepalive: true,
+        signal: controller.signal,
+      })
+      if (!response.ok) throw await apiErrorFromResponse(response)
+    }
+  } finally {
+    globalThis.clearTimeout(timeout)
+    invalidateSession()
+  }
 }

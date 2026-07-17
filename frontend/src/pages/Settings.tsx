@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { App, Card, Form, Input, Select, Button, message, Tabs, Space, Tag, Typography, Modal, QRCode, Switch, Alert, Table, Grid } from 'antd'
+import { App, Card, Form, Input, Select, Button, message, Tabs, Space, Tag, Typography, Modal, QRCode, Switch, Alert, Table, Grid, Spin } from 'antd'
 import type { FormInstance } from 'antd'
 import {
   SaveOutlined,
@@ -16,7 +16,7 @@ import {
   CopyOutlined,
 } from '@ant-design/icons'
 import { parseBooleanConfigValue } from '@/lib/configValueParsers'
-import { apiFetch } from '@/lib/utils'
+import { apiFetch, invalidateSession, setToken } from '@/lib/utils'
 
 type ConfigShareState = {
   instance_id?: string
@@ -3293,60 +3293,69 @@ function ICloudHmeManagerSection({ form }: { form: any }) {
 }
 
 type TotpSetupState = 'idle' | 'setup'
+type AuthStatus = {
+  has_password: boolean
+  has_totp: boolean
+  instance_id?: string
+  bootstrap_token_required?: boolean
+  min_password_length?: number
+}
 
 function SecurityPanel() {
   const { message: msg } = App.useApp()
-  const [status, setStatus] = useState<{ has_password: boolean; has_totp: boolean } | null>(null)
+  const [status, setStatus] = useState<AuthStatus | null>(null)
+  const [statusLoading, setStatusLoading] = useState(true)
+  const [statusError, setStatusError] = useState('')
   const [loading, setLoading] = useState(false)
 
-  const [enableForm] = Form.useForm()
+  const [setupForm] = Form.useForm()
   const [pwForm] = Form.useForm()
   const [codeForm] = Form.useForm()
+  const [disableTotpForm] = Form.useForm()
 
   const [totpSetupState, setTotpSetupState] = useState<TotpSetupState>('idle')
   const [totpSecret, setTotpSecret] = useState('')
   const [totpUri, setTotpUri] = useState('')
+  const [disableTotpOpen, setDisableTotpOpen] = useState(false)
+  const minPasswordLength = Math.max(12, Number(status?.min_password_length || 12))
 
   const loadStatus = async () => {
+    setStatusLoading(true)
+    setStatusError('')
     try {
-      const s = await apiFetch('/auth/status')
+      const s = await apiFetch('/auth/status') as AuthStatus
       setStatus(s)
-    } catch {}
+    } catch (error: unknown) {
+      setStatus(null)
+      setStatusError(error instanceof Error ? error.message : '读取管理员认证状态失败')
+    } finally {
+      setStatusLoading(false)
+    }
   }
 
   useEffect(() => { loadStatus() }, [])
 
-  const handleEnable = async (values: { password: string; confirm: string }) => {
+  const handleInitialize = async (values: { password: string; confirm: string; bootstrap_token?: string }) => {
     if (values.password !== values.confirm) {
       msg.error('两次输入的密码不一致')
       return
     }
     setLoading(true)
     try {
+      const bootstrapToken = String(values.bootstrap_token || '').trim()
       const d = await apiFetch('/auth/setup', {
         method: 'POST',
+        headers: bootstrapToken ? { 'X-Auth-Bootstrap-Token': bootstrapToken } : undefined,
         body: JSON.stringify({ password: values.password }),
       })
-      localStorage.setItem('auth_token', d.access_token)
-      msg.success('密码保护已启用')
-      enableForm.resetFields()
+      const accessToken = String(d.access_token || '')
+      if (!accessToken) throw new Error('初始化响应缺少访问令牌')
+      setToken(accessToken)
+      msg.success('管理员认证已初始化')
+      setupForm.resetFields()
       await loadStatus()
-    } catch (e: any) {
-      msg.error(e.message)
-    } finally {
-      setLoading(false)
-    }
-  }
-
-  const handleDisableAuth = async () => {
-    setLoading(true)
-    try {
-      await apiFetch('/auth/disable', { method: 'POST' })
-      localStorage.removeItem('auth_token')
-      msg.success('密码保护已关闭')
-      await loadStatus()
-    } catch (e: any) {
-      msg.error(e.message)
+    } catch (error: unknown) {
+      msg.error(error instanceof Error ? error.message : '初始化管理员认证失败')
     } finally {
       setLoading(false)
     }
@@ -3363,10 +3372,11 @@ function SecurityPanel() {
         method: 'POST',
         body: JSON.stringify({ current_password: values.current_password, new_password: values.new_password }),
       })
-      msg.success('密码已更新')
+      msg.success('密码已更新，请重新登录')
       pwForm.resetFields()
-    } catch (e: any) {
-      msg.error(e.message)
+      invalidateSession()
+    } catch (error: unknown) {
+      msg.error(error instanceof Error ? error.message : '修改密码失败')
     } finally {
       setLoading(false)
     }
@@ -3379,39 +3389,63 @@ function SecurityPanel() {
       setTotpSecret(d.secret)
       setTotpUri(d.uri)
       setTotpSetupState('setup')
-    } catch (e: any) {
-      msg.error(e.message)
+    } catch (error: unknown) {
+      msg.error(error instanceof Error ? error.message : '生成双因素认证配置失败')
     } finally {
       setLoading(false)
     }
   }
 
-  const handleEnableTotp = async (values: { code: string }) => {
+  const cancelTotpSetup = () => {
+    codeForm.resetFields()
+    setTotpSecret('')
+    setTotpUri('')
+    setTotpSetupState('idle')
+  }
+
+  const handleEnableTotp = async (values: { code: string; current_password: string }) => {
     setLoading(true)
     try {
       await apiFetch('/auth/2fa/enable', {
         method: 'POST',
-        body: JSON.stringify({ secret: totpSecret, code: values.code }),
+        body: JSON.stringify({
+          secret: totpSecret,
+          code: values.code,
+          current_password: values.current_password,
+        }),
       })
-      msg.success('双因素认证已启用')
-      setTotpSetupState('idle')
-      codeForm.resetFields()
-      await loadStatus()
-    } catch (e: any) {
-      msg.error(e.message)
+      msg.success('双因素认证已启用，请重新登录')
+      cancelTotpSetup()
+      invalidateSession()
+    } catch (error: unknown) {
+      codeForm.setFieldValue('code', '')
+      msg.error(error instanceof Error ? error.message : '启用双因素认证失败')
     } finally {
       setLoading(false)
     }
   }
 
-  const handleDisableTotp = async () => {
+  const closeDisableTotp = () => {
+    setDisableTotpOpen(false)
+    disableTotpForm.resetFields()
+  }
+
+  const handleDisableTotp = async (values: { current_password: string; code: string }) => {
     setLoading(true)
     try {
-      await apiFetch('/auth/2fa/disable', { method: 'POST' })
-      msg.success('双因素认证已关闭')
-      await loadStatus()
-    } catch (e: any) {
-      msg.error(e.message)
+      await apiFetch('/auth/2fa/disable', {
+        method: 'POST',
+        body: JSON.stringify({
+          current_password: values.current_password,
+          code: values.code,
+        }),
+      })
+      msg.success('双因素认证已关闭，请重新登录')
+      closeDisableTotp()
+      invalidateSession()
+    } catch (error: unknown) {
+      disableTotpForm.setFieldValue('code', '')
+      msg.error(error instanceof Error ? error.message : '关闭双因素认证失败')
     } finally {
       setLoading(false)
     }
@@ -3420,40 +3454,59 @@ function SecurityPanel() {
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
       <Card
-        title="访问密码保护"
+        title="管理员认证"
         extra={
-          status?.has_password
-            ? <Tag color="green"><CheckCircleOutlined /> 已启用</Tag>
-            : <Tag color="default"><CloseCircleOutlined /> 未启用</Tag>
+          status
+            ? status.has_password
+              ? <Tag color="green"><CheckCircleOutlined /> 已初始化</Tag>
+              : <Tag color="warning"><CloseCircleOutlined /> 待初始化</Tag>
+            : null
         }
       >
-        {!status?.has_password ? (
+        {statusLoading ? (
+          <div style={{ minHeight: 96, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+            <Spin />
+          </div>
+        ) : statusError ? (
+          <Alert
+            type="error"
+            showIcon
+            message="管理员认证状态读取失败"
+            description={statusError}
+            action={<Button size="small" onClick={() => void loadStatus()}>重试</Button>}
+          />
+        ) : status?.has_password === false ? (
           <Space direction="vertical" style={{ width: '100%' }}>
-            <Typography.Text type="secondary">
-              启用后，访问页面需要输入密码。默认不开启，任何能访问此地址的人均可使用。
-            </Typography.Text>
-            <Form form={enableForm} layout="vertical" onFinish={handleEnable} requiredMark={false} style={{ maxWidth: 360, marginTop: 8 }}>
-              <Form.Item name="password" label="设置访问密码" rules={[{ required: true, message: '请输入密码' }, { min: 6, message: '至少 6 位' }]}>
-                <Input.Password placeholder="至少 6 位" />
+            <Alert
+              type="warning"
+              showIcon
+              message="管理员认证尚未初始化"
+              description={`请为当前实例${status.instance_id ? ` ${status.instance_id}` : ''} 设置独立的管理员密码。初始化完成后认证不可关闭，后续只能在验证当前密码后更新。${status.bootstrap_token_required ? ' 本实例要求提供初始化令牌。' : ' 未配置初始化令牌时，仅接受本机或可信容器网关来源的初始化请求。'}`}
+            />
+            <Form form={setupForm} layout="vertical" onFinish={handleInitialize} requiredMark={false} style={{ maxWidth: 360, marginTop: 8 }}>
+              <Form.Item name="password" label="管理员密码" rules={[{ required: true, message: '请输入密码' }, { min: minPasswordLength, message: `至少 ${minPasswordLength} 位` }]}>
+                <Input.Password placeholder={`至少 ${minPasswordLength} 位`} autoComplete="new-password" />
               </Form.Item>
               <Form.Item name="confirm" label="确认密码" rules={[{ required: true, message: '请再次输入' }]}>
-                <Input.Password placeholder="再次输入密码" />
+                <Input.Password placeholder="再次输入密码" autoComplete="new-password" />
               </Form.Item>
+              {status.bootstrap_token_required ? (
+                <Form.Item name="bootstrap_token" label="初始化令牌" rules={[{ required: true, message: '请输入初始化令牌' }]}>
+                  <Input.Password placeholder="APP_AUTH_BOOTSTRAP_TOKEN" autoComplete="off" />
+                </Form.Item>
+              ) : null}
               <Form.Item style={{ marginBottom: 0 }}>
                 <Button type="primary" htmlType="submit" loading={loading} icon={<LockOutlined />}>
-                  启用密码保护
+                  初始化管理员认证
                 </Button>
               </Form.Item>
             </Form>
           </Space>
-        ) : (
-          <Space direction="vertical" style={{ width: '100%' }}>
-            <Typography.Text type="secondary">当前已启用密码保护，关闭后任何人无需密码即可访问。</Typography.Text>
-            <Button danger loading={loading} onClick={handleDisableAuth}>
-              关闭密码保护
-            </Button>
-          </Space>
-        )}
+        ) : status?.has_password ? (
+          <Typography.Text type="secondary">
+            管理员认证已初始化且不可关闭。需要轮换凭据时，请使用下方的修改密码功能。
+          </Typography.Text>
+        ) : null}
       </Card>
 
       {status?.has_password && (
@@ -3461,13 +3514,13 @@ function SecurityPanel() {
           <Card title="修改密码">
             <Form form={pwForm} layout="vertical" onFinish={handleChangePassword} requiredMark={false} style={{ maxWidth: 360 }}>
               <Form.Item name="current_password" label="当前密码" rules={[{ required: true, message: '请输入当前密码' }]}>
-                <Input.Password placeholder="当前密码" />
+                <Input.Password placeholder="当前密码" autoComplete="current-password" />
               </Form.Item>
-              <Form.Item name="new_password" label="新密码" rules={[{ required: true, message: '请输入新密码' }, { min: 6, message: '至少 6 位' }]}>
-                <Input.Password placeholder="新密码（至少 6 位）" />
+              <Form.Item name="new_password" label="新密码" rules={[{ required: true, message: '请输入新密码' }, { min: minPasswordLength, message: `至少 ${minPasswordLength} 位` }]}>
+                <Input.Password placeholder={`新密码（至少 ${minPasswordLength} 位）`} autoComplete="new-password" />
               </Form.Item>
               <Form.Item name="confirm" label="确认新密码" rules={[{ required: true, message: '请再次输入' }]}>
-                <Input.Password placeholder="再次输入新密码" />
+                <Input.Password placeholder="再次输入新密码" autoComplete="new-password" />
               </Form.Item>
               <Form.Item style={{ marginBottom: 0 }}>
                 <Button type="primary" htmlType="submit" loading={loading} icon={<SaveOutlined />}>
@@ -3490,7 +3543,7 @@ function SecurityPanel() {
                 <Typography.Text type="secondary">
                   登录时需输入 Google Authenticator / Authy 等 App 中的 6 位验证码。
                 </Typography.Text>
-                <Button danger loading={loading} onClick={handleDisableTotp}>
+                <Button danger loading={loading} onClick={() => setDisableTotpOpen(true)}>
                   关闭双因素认证
                 </Button>
               </Space>
@@ -3515,16 +3568,19 @@ function SecurityPanel() {
                     </Typography.Paragraph>
                   </div>
                 </div>
-                <Typography.Text strong>2. 输入 App 中显示的 6 位验证码以确认绑定</Typography.Text>
-                <Form form={codeForm} layout="inline" onFinish={handleEnableTotp}>
-                  <Form.Item name="code" rules={[{ required: true, message: '请输入验证码' }, { len: 6, message: '6 位数字' }]}>
-                    <Input placeholder="000000" maxLength={6} style={{ width: 140, letterSpacing: 4, textAlign: 'center' }} />
+                <Typography.Text strong>2. 验证当前管理员密码和新验证器中的 6 位验证码</Typography.Text>
+                <Form form={codeForm} layout="vertical" onFinish={handleEnableTotp} style={{ maxWidth: 360 }}>
+                  <Form.Item name="current_password" label="当前管理员密码" rules={[{ required: true, message: '请输入当前管理员密码' }]}>
+                    <Input.Password placeholder="当前管理员密码" autoComplete="current-password" />
                   </Form.Item>
-                  <Form.Item>
-                    <Button type="primary" htmlType="submit" loading={loading}>确认启用</Button>
+                  <Form.Item name="code" label="新验证器验证码" rules={[{ required: true, message: '请输入验证码' }, { pattern: /^\d{6}$/, message: '请输入 6 位数字' }]}>
+                    <Input inputMode="numeric" autoComplete="one-time-code" placeholder="000000" maxLength={6} style={{ width: 160, letterSpacing: 4, textAlign: 'center' }} />
                   </Form.Item>
-                  <Form.Item>
-                    <Button onClick={() => setTotpSetupState('idle')}>取消</Button>
+                  <Form.Item style={{ marginBottom: 0 }}>
+                    <Space>
+                      <Button type="primary" htmlType="submit" loading={loading}>确认启用</Button>
+                      <Button onClick={cancelTotpSetup} disabled={loading}>取消</Button>
+                    </Space>
                   </Form.Item>
                 </Form>
               </Space>
@@ -3532,6 +3588,41 @@ function SecurityPanel() {
           </Card>
         </>
       )}
+
+      <Modal
+        title="关闭双因素认证"
+        open={disableTotpOpen}
+        onCancel={() => {
+          if (!loading) closeDisableTotp()
+        }}
+        footer={null}
+        destroyOnHidden
+        closable={!loading}
+        keyboard={!loading}
+        maskClosable={!loading}
+      >
+        <Alert
+          type="warning"
+          showIcon
+          message="此操作需要二次验证"
+          description="请输入当前管理员密码和现有验证器中的 6 位验证码。成功后所有现有会话都会失效。"
+          style={{ marginBottom: 16 }}
+        />
+        <Form form={disableTotpForm} layout="vertical" onFinish={handleDisableTotp} requiredMark={false}>
+          <Form.Item name="current_password" label="当前管理员密码" rules={[{ required: true, message: '请输入当前管理员密码' }]}>
+            <Input.Password placeholder="当前管理员密码" autoComplete="current-password" />
+          </Form.Item>
+          <Form.Item name="code" label="当前验证器验证码" rules={[{ required: true, message: '请输入验证码' }, { pattern: /^\d{6}$/, message: '请输入 6 位数字' }]}>
+            <Input inputMode="numeric" autoComplete="one-time-code" placeholder="000000" maxLength={6} style={{ letterSpacing: 4, textAlign: 'center' }} />
+          </Form.Item>
+          <Form.Item style={{ marginBottom: 0 }}>
+            <Space>
+              <Button danger type="primary" htmlType="submit" loading={loading}>确认关闭</Button>
+              <Button onClick={closeDisableTotp} disabled={loading}>取消</Button>
+            </Space>
+          </Form.Item>
+        </Form>
+      </Modal>
     </div>
   )
 }

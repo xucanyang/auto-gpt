@@ -18,8 +18,38 @@ def test_main_instance_is_an_unprofiled_persistent_service():
     service = match.group("body")
     assert "profiles:" not in service
     assert "restart: unless-stopped" in service
-    assert '- "8000:8000"' in service
+    assert '- "127.0.0.1:8000:8000"' in service
     assert "./data:/runtime" in service
+
+
+def test_all_published_business_and_cliproxy_ports_are_loopback_only():
+    source = COMPOSE_FILE.read_text(encoding="utf-8")
+
+    expected = {
+        '127.0.0.1:8000:8000',
+        '127.0.0.1:8001:8000',
+        '127.0.0.1:8003:8000',
+        '127.0.0.1:${CLIPROXYAPI_PORT_BIND:-8317}:8317',
+        '127.0.0.1:${CLIPROXYAPI_PORT_BIND_PLUS:-8318}:8317',
+        '127.0.0.1:${CLIPROXYAPI_PORT_BIND_PLUS2:-8320}:8317',
+    }
+    for binding in expected:
+        assert f'- "{binding}"' in source
+
+    forbidden = {
+        '8000:8000',
+        '8001:8000',
+        '8003:8000',
+        '${CLIPROXYAPI_PORT_BIND:-8317}:8317',
+        '${CLIPROXYAPI_PORT_BIND_PLUS:-8318}:8317',
+        '${CLIPROXYAPI_PORT_BIND_PLUS2:-8320}:8317',
+    }
+    published = {
+        line.strip()[3:-1]
+        for line in source.splitlines()
+        if line.strip().startswith('- "') and line.strip().endswith('"')
+    }
+    assert published.isdisjoint(forbidden)
 
 
 def test_deploy_keeps_and_verifies_all_three_business_instances():
