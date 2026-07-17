@@ -306,9 +306,21 @@ def _base_report(
     mode = normalize_pix_cleanup_mode(cleanup_mode)
     now_utc = _utc_datetime(now) or datetime.now(timezone.utc)
     cutoff_utc = latest_pix_expiry_cutoff(now_utc)
-    expired = [item for item in candidates if item.expires_at is not None and item.expires_at <= now_utc]
-    paid = [item for item in candidates if _is_paid_candidate(item)]
-    cancelled = [item for item in candidates if _is_cancelled_candidate(item)]
+    paid: list[PixLinkCandidate] = []
+    cancelled: list[PixLinkCandidate] = []
+    expired: list[PixLinkCandidate] = []
+    valid: list[PixLinkCandidate] = []
+    for item in candidates:
+        # These buckets drive both the scan UI and cleanup eligibility, so a
+        # current link must belong to exactly one operator-visible category.
+        if _is_paid_candidate(item):
+            paid.append(item)
+        elif _is_cancelled_candidate(item):
+            cancelled.append(item)
+        elif item.expires_at is not None and item.expires_at <= now_utc:
+            expired.append(item)
+        else:
+            valid.append(item)
     eligible_by_mode = {
         PIX_CLEANUP_MODE_EXPIRED: expired,
         PIX_CLEANUP_MODE_PAID: paid,
@@ -316,6 +328,7 @@ def _base_report(
     }
     eligible = eligible_by_mode[mode]
     missing = [item for item in candidates if item.expires_at is None]
+    valid_missing = [item for item in valid if item.expires_at is None]
     provider_count = sum(item.expiry_source == "provider" for item in candidates)
     derived_count = sum(item.expiry_source == "beijing_11" for item in candidates)
     cutoff_beijing = cutoff_utc.astimezone(PIX_PAYMENT_TIMEZONE)
@@ -329,15 +342,17 @@ def _base_report(
         "cleanup_mode": mode,
         "cleanup_label": PIX_CLEANUP_MODE_LABELS[mode],
         "current_pix_links": len(candidates),
+        "valid_links": len(valid),
         "expired_links": len(expired),
         "paid_links": len(paid),
         "cancelled_links": len(cancelled),
         "eligible_links": len(eligible),
         "retained_links": len(candidates) - len(eligible),
-        "active_links": len(candidates) - len(expired) - len(missing),
+        "active_links": sum(item.expires_at is not None and item.expires_at > now_utc for item in valid),
         "provider_expiry_links": provider_count,
         "derived_expiry_links": derived_count,
         "missing_expiry_links": len(missing),
+        "valid_missing_expiry_links": len(valid_missing),
     }
     return report, eligible
 

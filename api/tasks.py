@@ -16372,6 +16372,14 @@ def preview_chatgpt_expired_pix_payment_links(
         return preview_pix_payment_link_cleanup(session, cleanup_mode=cleanup_mode)
 
 
+@router.get("/chatgpt/payment-links/pix-cleanup/scan")
+def scan_chatgpt_pix_payment_links():
+    """Return mutually exclusive current PIX-link status buckets."""
+
+    with Session(engine) as session:
+        return preview_pix_payment_link_cleanup(session)
+
+
 def _run_expired_pix_payment_link_cleanup(
     task_id: str,
     cleanup_mode: PixCleanupMode = PIX_CLEANUP_MODE_EXPIRED,

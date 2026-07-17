@@ -167,12 +167,14 @@ def test_preview_and_cleanup_are_scoped_atomic_and_idempotent():
         "expired_links": 3,
         "paid_links": 0,
         "cancelled_links": 0,
+        "valid_links": 4,
         "eligible_links": 3,
         "retained_links": 4,
         "active_links": 3,
         "provider_expiry_links": 3,
         "derived_expiry_links": 3,
         "missing_expiry_links": 1,
+        "valid_missing_expiry_links": 1,
     }
 
     with Session(engine) as session:
@@ -348,6 +350,52 @@ def test_cancelled_cleanup_accepts_explicit_payment_cancel_evidence_but_not_gene
             assert marker["pix_cleanup_mode"] == "cancelled"
             assert "url" not in marker
         assert session.get(AccountModel, 33).get_extra()["chatgpt_last_payment_link"]["url"].endswith("generic-failure")
+
+
+def test_scan_buckets_are_mutually_exclusive_and_cleanup_matches_each_bucket():
+    engine = _engine()
+    with Session(engine) as session:
+        paid_expired = _pix_link(
+            "https://payments.example.test/paid-expired",
+            generated_at="2026-07-15T01:00:00+00:00",
+        )
+        paid_expired["link_status"] = "paid"
+        cancelled_expired = _pix_link(
+            "https://payments.example.test/cancelled-expired",
+            generated_at="2026-07-15T01:00:00+00:00",
+        )
+        cancelled_expired["link_status"] = "payment_cancelled"
+        session.add_all(
+            [
+                _account(41, paid_expired),
+                _account(42, cancelled_expired),
+                _account(43, _pix_link("https://payments.example.test/expired", generated_at="2026-07-15T01:00:00+00:00")),
+                _account(44, _pix_link("https://payments.example.test/valid", generated_at="2026-07-16T03:30:00+00:00")),
+                _account(45, _pix_link("https://payments.example.test/missing-time")),
+            ]
+        )
+        session.commit()
+
+    with Session(engine) as session:
+        scan = preview_pix_payment_link_cleanup(session, now=NOW)
+
+    assert scan["current_pix_links"] == 5
+    assert scan["valid_links"] == 2
+    assert scan["paid_links"] == 1
+    assert scan["expired_links"] == 1
+    assert scan["cancelled_links"] == 1
+    assert scan["valid_missing_expiry_links"] == 1
+    assert sum(scan[key] for key in ("valid_links", "paid_links", "expired_links", "cancelled_links")) == 5
+
+    with Session(engine) as session:
+        expired = clean_expired_pix_payment_links(session, now=NOW)
+    assert expired["cleaned_links"] == 1
+    assert expired["eligible_links"] == 1
+
+    with Session(engine) as session:
+        assert session.get(AccountModel, 41).get_extra()["chatgpt_last_payment_link"]["url"].endswith("paid-expired")
+        assert session.get(AccountModel, 42).get_extra()["chatgpt_last_payment_link"]["url"].endswith("cancelled-expired")
+        assert session.get(AccountModel, 43).get_extra()["chatgpt_last_payment_link"]["link_status"] == PIX_EXPIRED_CLEANED_STATUS
 
 
 def test_file_database_cleanup_creates_a_verified_backup(tmp_path, monkeypatch):

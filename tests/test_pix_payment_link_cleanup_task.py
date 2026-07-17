@@ -74,12 +74,14 @@ def _success_report() -> dict[str, Any]:
         "cleanup_mode": "expired",
         "cleanup_label": "过期",
         "active_links": 2,
+        "valid_links": 3,
         "expired_links": 3,
         "paid_links": 0,
         "cancelled_links": 0,
         "eligible_links": 3,
         "retained_links": 3,
         "missing_expiry_links": 1,
+        "valid_missing_expiry_links": 1,
         "provider_expiry_links": 2,
         "derived_expiry_links": 3,
         "cleaned_links": 3,
@@ -98,6 +100,17 @@ def test_pix_cleanup_task_route_is_a_dedicated_post_endpoint():
 
     assert len(matches) == 1
     assert "POST" in (getattr(matches[0], "methods", set()) or set())
+
+
+def test_pix_cleanup_scan_route_is_a_dedicated_get_endpoint():
+    matches = [
+        route
+        for route in tasks.router.routes
+        if getattr(route, "path", "") == "/tasks/chatgpt/payment-links/pix-cleanup/scan"
+    ]
+
+    assert len(matches) == 1
+    assert "GET" in (getattr(matches[0], "methods", set()) or set())
 
 
 def test_enqueue_pix_cleanup_returns_immediately_and_creates_task(
@@ -246,12 +259,14 @@ def test_pix_cleanup_runner_zero_expired_is_success_with_summary(
         "cleanup_mode": "expired",
         "cleanup_label": "过期",
         "active_links": 2,
+        "valid_links": 3,
         "expired_links": 0,
         "paid_links": 0,
         "cancelled_links": 0,
         "eligible_links": 0,
         "retained_links": 3,
         "missing_expiry_links": 1,
+        "valid_missing_expiry_links": 1,
         "provider_expiry_links": 1,
         "derived_expiry_links": 1,
         "cleaned_links": 0,

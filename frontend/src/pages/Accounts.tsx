@@ -50,8 +50,9 @@ import type {
   AccountExportMode,
   AccountExportScope,
   AccountsToolbarActionId as AccountToolbarActionId,
-  PixLinkCleanupMode,
 } from '@/features/accounts/components/AccountsToolbar'
+import { PixLinkScanModal } from '@/features/accounts/components/PixLinkScanModal'
+import type { PixLinkCleanupMode, PixLinkScanReport } from '@/features/accounts/components/PixLinkScanModal'
 import { BatchGopayWorkbench } from '@/features/accounts/components/BatchGopayWorkbench'
 import { ImportAccountsModal } from '@/features/accounts/components/ImportAccountsModal'
 import { useAccountDetailQuery } from '@/features/accounts/hooks/useAccountDetailQuery'
@@ -390,23 +391,6 @@ type PaymentLinkProfile = {
     request_preset?: string
     seed_pool_configured?: boolean
   }
-}
-
-type PixLinkCleanupReport = {
-  instance_id?: string
-  cleanup_mode?: PixLinkCleanupMode
-  cleanup_label?: string
-  cutoff_display?: string
-  current_pix_links?: number
-  expired_links?: number
-  paid_links?: number
-  cancelled_links?: number
-  eligible_links?: number
-  retained_links?: number
-  active_links?: number
-  missing_expiry_links?: number
-  cleaned_links?: number
-  concurrent_skipped_links?: number
 }
 
 type PixLinkCleanupTaskResponse = {
@@ -2452,7 +2436,12 @@ export default function Accounts() {
   const [backfillLoading, setBackfillLoading] = useState<'' | 'cliproxyapi_pending' | 'cliproxyapi_selected' | 'sub2api_pending' | 'sub2api_selected'>('')
   const [batchResumeAuthLoading, setBatchResumeAuthLoading] = useState<'' | 'selected' | 'filtered' | 'selected_phone' | 'filtered_phone'>('')
   const [batchPaymentLinkLoading, setBatchPaymentLinkLoading] = useState(false)
+  const [pixLinkScanOpen, setPixLinkScanOpen] = useState(false)
+  const [pixLinkScanLoading, setPixLinkScanLoading] = useState(false)
+  const [pixLinkScanReport, setPixLinkScanReport] = useState<PixLinkScanReport | null>(null)
+  const [pixLinkScanError, setPixLinkScanError] = useState('')
   const [pixLinkCleanupLoading, setPixLinkCleanupLoading] = useState(false)
+  const [pixLinkCleanupMode, setPixLinkCleanupMode] = useState<PixLinkCleanupMode | null>(null)
   const [batchInvalidRecheckLoading, setBatchInvalidRecheckLoading] = useState(false)
   const [visibleColumnKeys, setVisibleColumnKeys] = useState<AccountColumnKey[]>(() => loadVisibleAccountColumnKeys())
   const [pinnedToolbarActionIds, setPinnedToolbarActionIds] = useState<AccountToolbarActionId[]>(() => loadPinnedToolbarActions())
@@ -3898,9 +3887,28 @@ export default function Accounts() {
     void loadBatchPaymentLinkProfile()
   }
 
+  const loadPixLinkScan = async () => {
+    setPixLinkScanOpen(true)
+    setPixLinkScanLoading(true)
+    setPixLinkScanError('')
+    try {
+      const report = await apiFetch('/tasks/chatgpt/payment-links/pix-cleanup/scan') as PixLinkScanReport
+      setPixLinkScanReport(report)
+    } catch (error: unknown) {
+      const detail = error instanceof Error && error.message
+        ? error.message
+        : '无法扫描当前 PIX 链接'
+      setPixLinkScanError(detail)
+      appMessage.error(detail)
+    } finally {
+      setPixLinkScanLoading(false)
+    }
+  }
+
   const executePixLinkCleanup = async (cleanupMode: PixLinkCleanupMode) => {
     const cleanupMeta = PIX_LINK_CLEANUP_META[cleanupMode]
     setPixLinkCleanupLoading(true)
+    setPixLinkCleanupMode(cleanupMode)
     try {
       const result = await apiFetch('/tasks/chatgpt/payment-links/pix-cleanup/task', {
         method: 'POST',
@@ -3929,6 +3937,7 @@ export default function Accounts() {
       })
       setRegisterModalOpen(true)
       setActiveTasksPanelOpen(true)
+      setPixLinkScanOpen(false)
       void activeTasksQuery.refetch()
       if (result?.already_running) {
         appMessage.info(`${instanceId} 已有${activeMeta.label}链接清理任务在运行，已打开现有任务日志`)
@@ -3940,20 +3949,24 @@ export default function Accounts() {
       throw e
     } finally {
       setPixLinkCleanupLoading(false)
+      setPixLinkCleanupMode(null)
     }
   }
 
   const handleCleanupPixLinks = async (cleanupMode: PixLinkCleanupMode) => {
     const cleanupMeta = PIX_LINK_CLEANUP_META[cleanupMode]
     setPixLinkCleanupLoading(true)
-    let preview: PixLinkCleanupReport
+    setPixLinkCleanupMode(cleanupMode)
+    let preview: PixLinkScanReport
     try {
-      preview = await apiFetch(`/tasks/chatgpt/payment-links/pix-cleanup/preview?cleanup_mode=${encodeURIComponent(cleanupMode)}`) as PixLinkCleanupReport
+      preview = await apiFetch(`/tasks/chatgpt/payment-links/pix-cleanup/preview?cleanup_mode=${encodeURIComponent(cleanupMode)}`) as PixLinkScanReport
+      setPixLinkScanReport(preview)
     } catch (e: any) {
       appMessage.error(e?.message || `读取${cleanupMeta.title}数量失败`)
       return
     } finally {
       setPixLinkCleanupLoading(false)
+      setPixLinkCleanupMode(null)
     }
 
     const eligible = Number(preview?.eligible_links || 0)
@@ -3961,7 +3974,7 @@ export default function Accounts() {
     const instanceId = String(preview?.instance_id || '当前实例')
     const cutoff = String(preview?.cutoff_display || '最近一个北京时间 11:00')
     if (eligible <= 0) {
-      void executePixLinkCleanup(cleanupMode)
+      appMessage.info(`当前没有可清理的${cleanupMeta.title}`)
       return
     }
 
@@ -3983,7 +3996,6 @@ export default function Accounts() {
       cancelText: '取消',
       okButtonProps: { danger: true },
       onOk: () => executePixLinkCleanup(cleanupMode),
-      onCancel: () => setPixLinkCleanupLoading(false),
     })
   }
 
@@ -7755,13 +7767,13 @@ export default function Accounts() {
         isChatgptPlatform={currentPlatform === 'chatgpt'}
         batchGopayLoading={batchGopayLoading}
         batchPaymentLinkLoading={batchPaymentLinkLoading}
-        pixLinkCleanupLoading={pixLinkCleanupLoading}
+        pixLinkCleanupLoading={pixLinkCleanupLoading || pixLinkScanLoading}
         batchInvalidRecheckLoading={batchInvalidRecheckLoading}
         phoneBindingTestLoading={phoneBindingTestLoading}
         paypalBindingLoading={paypalBindingLoading}
         baxiCdkSubmitLoading={baxiCdkSubmitLoading}
         onBatchPaymentLink={handleBatchPaymentLink}
-        onCleanupPixLinks={(cleanupMode) => { void handleCleanupPixLinks(cleanupMode) }}
+        onScanPixLinks={() => { void loadPixLinkScan() }}
         onBatchInvalidRecheck={handleBatchInvalidRecheck}
         onOpenPhoneBindingTest={() => { void openPhoneBindingTest() }}
         onOpenPaypalBinding={openPaypalBinding}
@@ -8148,6 +8160,21 @@ export default function Accounts() {
         }}
         onSubmit={handleImport}
         onImportTextChange={setImportText}
+      />
+
+      <PixLinkScanModal
+        open={pixLinkScanOpen}
+        report={pixLinkScanReport}
+        loading={pixLinkScanLoading}
+        error={pixLinkScanError}
+        cleanupMode={pixLinkCleanupMode}
+        onClose={() => {
+          if (!pixLinkScanLoading && !pixLinkCleanupLoading) {
+            setPixLinkScanOpen(false)
+          }
+        }}
+        onScan={() => { void loadPixLinkScan() }}
+        onCleanup={(cleanupMode) => { void handleCleanupPixLinks(cleanupMode) }}
       />
 
       <Modal
