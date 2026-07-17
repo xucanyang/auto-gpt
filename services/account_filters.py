@@ -20,7 +20,7 @@ from services.chatgpt_account_state import (
 )
 
 AUTO_DELETE_REVIVAL_TASK_ID = "icloud_hme_auto_delete"
-ACCOUNT_LIST_STATE_DERIVATION_VERSION = "submission-state-v1"
+ACCOUNT_LIST_STATE_DERIVATION_VERSION = "integration-upload-state-v1"
 ACCOUNT_FILTER_RESOLVER_VERSION = "account-list-state-v4"
 ACCOUNT_FILTER_FIELD_NAMES = (
     "email",
@@ -184,6 +184,20 @@ _PAYMENT_LINK_PLATFORM_FILTER_ALIASES: dict[str, set[str]] = {
     "other": {"other"},
 }
 
+_INTEGRATION_UPLOAD_STATE_FILTER_ALIASES: dict[str, str] = {
+    "true": "uploaded",
+    "uploaded": "uploaded",
+    "exists": "uploaded",
+    "false": "not_uploaded",
+    "not_uploaded": "not_uploaded",
+    "unknown": "not_uploaded",
+    "not_found": "not_uploaded",
+    "cross_workspace_only": "not_uploaded",
+    "deleted_exact_match": "not_uploaded",
+    "ambiguous": "not_uploaded",
+    "unreachable": "not_uploaded",
+}
+
 
 def _split_idea_submit_filter_values(value: Any) -> set[str]:
     expanded: set[str] = set()
@@ -204,6 +218,17 @@ def _split_payment_link_platform_filter_values(value: Any) -> set[str]:
     for item in _split_values(value):
         expanded.update(_PAYMENT_LINK_PLATFORM_FILTER_ALIASES.get(item, {item}))
     return expanded
+
+
+def _split_integration_upload_state_filter_values(value: Any) -> set[str]:
+    normalized = {
+        _INTEGRATION_UPLOAD_STATE_FILTER_ALIASES.get(item, item)
+        for item in _split_values(value)
+    }
+    normalized.discard("")
+    if normalized == {"uploaded", "not_uploaded"}:
+        return set()
+    return normalized
 
 
 def normalize_optional_bool(value: Any) -> bool | None:
@@ -231,6 +256,7 @@ def _normalize_filter_values(
     idea_submit: bool = False,
     phone_binding_state: bool = False,
     payment_link_platform: bool = False,
+    integration_upload_state: bool = False,
 ) -> str:
     if idea_submit:
         values = _split_idea_submit_filter_values(value)
@@ -238,6 +264,8 @@ def _normalize_filter_values(
         values = _split_phone_binding_state_filter_values(value)
     elif payment_link_platform:
         values = _split_payment_link_platform_filter_values(value)
+    elif integration_upload_state:
+        values = _split_integration_upload_state_filter_values(value)
     else:
         values = _split_values(value)
     return ",".join(sorted(values))
@@ -261,8 +289,14 @@ def normalize_account_filter(source: Any) -> dict[str, Any]:
         ),
         "subscription_type": _normalize_filter_values(_filter_source_value(source, "subscription_type")),
         "account_validity": _normalize_filter_values(_filter_source_value(source, "account_validity")),
-        "sub2api_state": _normalize_filter_values(_filter_source_value(source, "sub2api_state")),
-        "oaipay_state": _normalize_filter_values(_filter_source_value(source, "oaipay_state")),
+        "sub2api_state": _normalize_filter_values(
+            _filter_source_value(source, "sub2api_state"),
+            integration_upload_state=True,
+        ),
+        "oaipay_state": _normalize_filter_values(
+            _filter_source_value(source, "oaipay_state"),
+            integration_upload_state=True,
+        ),
         "idea_submit_state": _normalize_filter_values(
             _filter_source_value(source, "idea_submit_state"),
             idea_submit=True,
@@ -759,6 +793,30 @@ def account_oaipay_state(account: AccountModel, extra: dict[str, Any] | None = N
     return _lower_text(oaipay.get("remote_state")) or "unknown"
 
 
+def _integration_upload_state(sync_state: Any) -> str:
+    state = sync_state if isinstance(sync_state, dict) else {}
+    remote_state = _lower_text(state.get("remote_state"))
+    last_upload = state.get("last_upload") if isinstance(state.get("last_upload"), dict) else {}
+    uploaded = (
+        normalize_optional_bool(state.get("uploaded")) is True
+        or remote_state in {"exists", "uploaded"}
+        or _lower_text(last_upload.get("status")) == "success"
+    )
+    return "uploaded" if uploaded else "not_uploaded"
+
+
+def account_sub2api_upload_state(account: AccountModel, extra: dict[str, Any] | None = None) -> str:
+    extra = extra if isinstance(extra, dict) else _extra(account)
+    sync_statuses = extra.get("sync_statuses") if isinstance(extra.get("sync_statuses"), dict) else {}
+    return _integration_upload_state(sync_statuses.get("sub2api"))
+
+
+def account_oaipay_upload_state(account: AccountModel, extra: dict[str, Any] | None = None) -> str:
+    extra = extra if isinstance(extra, dict) else _extra(account)
+    sync_statuses = extra.get("sync_statuses") if isinstance(extra.get("sync_statuses"), dict) else {}
+    return _integration_upload_state(sync_statuses.get("oaipay"))
+
+
 _SUBMISSION_RESULT_STATES = {"paid", "submitted", "processing", "failed", "timeout"}
 _SUBMISSION_EVIDENCE_STATES = {"paid", "submitted", "processing"}
 _PIX_LINK_SUBMITTED_STATUS = "pix_submitted"
@@ -1180,7 +1238,11 @@ def refresh_account_list_state(
                     replace(lower(trim(coalesce(json_extract(extra, '$.chatgpt_subscription_plan'), ''))), '-', '_') AS extra_subscription_plan,
                     lower(trim(coalesce(json_extract(extra, '$.chatgpt_workspace_scope'), ''))) AS workspace_scope,
                     lower(trim(coalesce(json_extract(extra, '$.sync_statuses.sub2api.remote_state'), ''))) AS sub2api_remote_state,
+                    lower(trim(CAST(coalesce(json_extract(extra, '$.sync_statuses.sub2api.uploaded'), '') AS TEXT))) AS sub2api_uploaded_marker,
+                    lower(trim(coalesce(json_extract(extra, '$.sync_statuses.sub2api.last_upload.status'), ''))) AS sub2api_last_upload_status,
                     lower(trim(coalesce(json_extract(extra, '$.sync_statuses.oaipay.remote_state'), ''))) AS oaipay_remote_state,
+                    lower(trim(CAST(coalesce(json_extract(extra, '$.sync_statuses.oaipay.uploaded'), '') AS TEXT))) AS oaipay_uploaded_marker,
+                    lower(trim(coalesce(json_extract(extra, '$.sync_statuses.oaipay.last_upload.status'), ''))) AS oaipay_last_upload_status,
                     lower(trim(coalesce(json_extract(extra, '$.baxigpt_cdk.status'), ''))) AS baxigpt_cdk_status,
                     lower(trim(coalesce(json_extract(extra, '$.idea_submit.status'), ''))) AS idea_marker_status,
                     trim(coalesce(json_extract(extra, '$.baxigpt_cdk.order_id'), '')) AS baxigpt_order_id,
@@ -1439,8 +1501,20 @@ def refresh_account_list_state(
                     auth_level,
                     derived_subscription_type AS subscription_type,
                     derived_account_validity AS account_validity,
-                    CASE WHEN sub2api_remote_state != '' THEN sub2api_remote_state ELSE 'unknown' END AS sub2api_state,
-                    CASE WHEN oaipay_remote_state != '' THEN oaipay_remote_state ELSE 'unknown' END AS oaipay_state,
+                    CASE
+                        WHEN sub2api_uploaded_marker IN ('1', 'true', 'yes', 'on')
+                            OR sub2api_remote_state IN ('exists', 'uploaded')
+                            OR sub2api_last_upload_status = 'success'
+                        THEN 'uploaded'
+                        ELSE 'not_uploaded'
+                    END AS sub2api_state,
+                    CASE
+                        WHEN oaipay_uploaded_marker IN ('1', 'true', 'yes', 'on')
+                            OR oaipay_remote_state IN ('exists', 'uploaded')
+                            OR oaipay_last_upload_status = 'success'
+                        THEN 'uploaded'
+                        ELSE 'not_uploaded'
+                    END AS oaipay_state,
                     CASE
                         WHEN idea_marker_unavailable = 1
                             OR idea_submit_unavailable = 1
@@ -1692,8 +1766,8 @@ def should_use_account_list_state(
             bool(_split_payment_link_platform_filter_values(payment_link_platform)),
             bool(_split_values(subscription_type)),
             bool(_split_values(account_validity_filter)),
-            bool(_split_values(sub2api_state)),
-            bool(_split_values(oaipay_state)),
+            bool(_split_integration_upload_state_filter_values(sub2api_state)),
+            bool(_split_integration_upload_state_filter_values(oaipay_state)),
             bool(_split_values(idea_submit_state)),
             bool(_split_values(submit_state)),
             has_submitted is not None,
@@ -1742,11 +1816,11 @@ def apply_account_list_state_filters(
     if validity_values:
         query = query.where(AccountListStateModel.account_validity.in_(sorted(validity_values)))
 
-    sub2api_states = _split_values(sub2api_state)
+    sub2api_states = _split_integration_upload_state_filter_values(sub2api_state)
     if sub2api_states:
         query = query.where(AccountListStateModel.sub2api_state.in_(sorted(sub2api_states)))
 
-    oaipay_states = _split_values(oaipay_state)
+    oaipay_states = _split_integration_upload_state_filter_values(oaipay_state)
     if oaipay_states:
         query = query.where(AccountListStateModel.oaipay_state.in_(sorted(oaipay_states)))
 
@@ -1930,8 +2004,8 @@ def filter_account_rows(
     payment_link_platforms = _split_payment_link_platform_filter_values(payment_link_platform)
     subscription_types = _split_values(subscription_type)
     validity_values = _split_values(account_validity_filter)
-    sub2api_states = _split_values(sub2api_state)
-    oaipay_states = _split_values(oaipay_state)
+    sub2api_states = _split_integration_upload_state_filter_values(sub2api_state)
+    oaipay_states = _split_integration_upload_state_filter_values(oaipay_state)
     idea_submit_states = _split_idea_submit_filter_values(idea_submit_state)
     submit_states = _split_idea_submit_filter_values(submit_state)
     revival_states = _split_values(revival_state)
@@ -1951,9 +2025,9 @@ def filter_account_rows(
             continue
         if validity_values and account_validity(row, extra) not in validity_values:
             continue
-        if sub2api_states and account_sub2api_state(row, extra) not in sub2api_states:
+        if sub2api_states and account_sub2api_upload_state(row, extra) not in sub2api_states:
             continue
-        if oaipay_states and account_oaipay_state(row, extra) not in oaipay_states:
+        if oaipay_states and account_oaipay_upload_state(row, extra) not in oaipay_states:
             continue
         if idea_submit_states and account_idea_submit_state(row, extra) not in idea_submit_states:
             continue

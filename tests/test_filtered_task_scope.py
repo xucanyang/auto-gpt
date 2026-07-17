@@ -82,8 +82,8 @@ def filter_engine(tmp_path, monkeypatch):
                     auth_type=auth_type,
                     subscription_type=subscription_type,
                     account_validity=account_validity,
-                    sub2api_state="not_found",
-                    oaipay_state=oaipay_state,
+                    sub2api_state="not_uploaded",
+                    oaipay_state="uploaded" if oaipay_state == "exists" else "not_uploaded",
                     idea_submit_state="available",
                 )
             )
@@ -444,6 +444,8 @@ def test_batch_auth_task_meta_contains_complete_verified_filter_audit(monkeypatc
     assert audit["filter"]["email"] == "@example.com"
     assert audit["filter"]["manually_used"] is True
     assert audit["filter"]["idea_submit_state"] == "available"
+    assert audit["filter"]["sub2api_state"] == "not_uploaded"
+    assert audit["filter"]["oaipay_state"] == "not_uploaded"
     assert audit["expected_total"] == 2
     assert audit["matched_total"] == 2
     assert audit["verified"] is True

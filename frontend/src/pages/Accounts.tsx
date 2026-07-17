@@ -554,25 +554,27 @@ const ACCOUNT_VALIDITY_FILTER_OPTIONS = [
   { value: 'not_checked', text: '未验证' },
 ]
 
-const SUB2API_FILTER_OPTIONS = [
-  { value: 'exists', text: '已存在' },
-  { value: 'not_found', text: '未发现' },
-  { value: 'cross_workspace_only', text: '远端其他记录已存在' },
-  { value: 'deleted_exact_match', text: '已删可重传' },
-  { value: 'ambiguous', text: '多候选' },
-  { value: 'unreachable', text: '不可达' },
-  { value: 'unknown', text: '未同步' },
+const INTEGRATION_UPLOAD_FILTER_OPTIONS = [
+  { value: 'uploaded', text: '已上传' },
+  { value: 'not_uploaded', text: '未上传' },
 ]
 
-const OAIPAY_FILTER_OPTIONS = [
-  { value: 'exists', text: '已存在' },
-  { value: 'not_found', text: '未发现' },
-  { value: 'cross_workspace_only', text: '远端其他记录已存在' },
-  { value: 'deleted_exact_match', text: '已删可重传' },
-  { value: 'ambiguous', text: '多候选' },
-  { value: 'unreachable', text: '不可达' },
-  { value: 'unknown', text: '未同步' },
-]
+const SUB2API_FILTER_OPTIONS = INTEGRATION_UPLOAD_FILTER_OPTIONS
+const OAIPAY_FILTER_OPTIONS = INTEGRATION_UPLOAD_FILTER_OPTIONS
+
+const INTEGRATION_UPLOAD_FILTER_VALUE_ALIASES: Record<string, string> = {
+  true: 'uploaded',
+  uploaded: 'uploaded',
+  exists: 'uploaded',
+  false: 'not_uploaded',
+  not_uploaded: 'not_uploaded',
+  unknown: 'not_uploaded',
+  not_found: 'not_uploaded',
+  cross_workspace_only: 'not_uploaded',
+  deleted_exact_match: 'not_uploaded',
+  ambiguous: 'not_uploaded',
+  unreachable: 'not_uploaded',
+}
 
 const SUBMISSION_STATE_FILTER_OPTIONS = [
   { value: 'unsubmitted', text: '未提交' },
@@ -614,6 +616,15 @@ function normalizeHasSubmittedFilterValue(value: unknown) {
   if (['true', '1', 'yes', 'on', 'submitted'].includes(text)) return 'true'
   if (['false', '0', 'no', 'off', 'unsubmitted', 'not_submitted'].includes(text)) return 'false'
   return ''
+}
+
+function normalizeIntegrationUploadFilterValues(value: unknown): string[] {
+  const normalized = normalizePresetList(value).reduce((items, item) => {
+    const mapped = INTEGRATION_UPLOAD_FILTER_VALUE_ALIASES[item.toLowerCase()] || item.toLowerCase()
+    if (mapped && !items.includes(mapped)) items.push(mapped)
+    return items
+  }, [] as string[])
+  return normalized.includes('uploaded') && normalized.includes('not_uploaded') ? [] : normalized
 }
 
 const SUBSCRIPTION_EXPIRY_SORT_OPTIONS = [
@@ -686,6 +697,10 @@ function cloneAccountColumnFilters(value?: Partial<Record<keyof AccountColumnFil
         if (normalized && !acc.includes(normalized)) acc.push(normalized)
         return acc
       }, [] as string[])
+      return
+    }
+    if (key === 'sub2apiState' || key === 'oaipayState') {
+      next[key] = normalizeIntegrationUploadFilterValues(values)
       return
     }
     ;(next[key] as string[]) = values
@@ -1350,8 +1365,21 @@ function normalizeAccount(account: any) {
       ? extra.chatgpt_phone_binding
       : {}
   const syncStatuses = extra.sync_statuses && typeof extra.sync_statuses === 'object' ? extra.sync_statuses : {}
-  const cliproxySync = syncStatuses.cliproxyapi && typeof syncStatuses.cliproxyapi === 'object' ? syncStatuses.cliproxyapi : {}
-  const sub2apiSync = syncStatuses.sub2api && typeof syncStatuses.sub2api === 'object' ? syncStatuses.sub2api : {}
+  const cliproxySync = account.cliproxySync && typeof account.cliproxySync === 'object'
+    ? account.cliproxySync
+    : syncStatuses.cliproxyapi && typeof syncStatuses.cliproxyapi === 'object'
+      ? syncStatuses.cliproxyapi
+      : {}
+  const sub2apiSync = account.sub2apiSync && typeof account.sub2apiSync === 'object'
+    ? account.sub2apiSync
+    : syncStatuses.sub2api && typeof syncStatuses.sub2api === 'object'
+      ? syncStatuses.sub2api
+      : {}
+  const oaipaySync = account.oaipaySync && typeof account.oaipaySync === 'object'
+    ? account.oaipaySync
+    : syncStatuses.oaipay && typeof syncStatuses.oaipay === 'object'
+      ? syncStatuses.oaipay
+      : {}
   const chatgptLocal = account.chatgptLocal && typeof account.chatgptLocal === 'object'
     ? account.chatgptLocal
     : extra.chatgpt_local && typeof extra.chatgpt_local === 'object'
@@ -1393,6 +1421,7 @@ function normalizeAccount(account: any) {
     extra,
     cliproxySync,
     sub2apiSync,
+    oaipaySync,
     chatgptLocal,
     chatgptCapabilities,
     chatgptPendingSubscriptionAuth,
@@ -2203,35 +2232,17 @@ function isPaypalBindingEligibleAccount(record: any) {
     && PAYPAL_BINDING_ALLOWED_SUBSCRIPTION_TYPES.has(subscriptionTypeValue(record))
 }
 
-function sub2apiStateMeta(sync: any) {
-  if (!sync || Object.keys(sync).length === 0) {
-    return { color: 'default', label: '未同步' }
-  }
-  if (sync.remote_state === 'unreachable') {
-    return { color: 'error', label: 'DB不可达' }
-  }
-  if (sync.remote_state === 'ambiguous') {
-    return { color: 'warning', label: '多条候选' }
-  }
-  if (sync.remote_state === 'cross_workspace_only') {
-    return { color: 'processing', label: '远端其他记录已存在' }
-  }
-  if (sync.remote_state === 'deleted_exact_match') {
-    return { color: 'warning', label: '已删可重传' }
-  }
-  if (sync.remote_state === 'not_found') {
-    return { color: 'default', label: '远端未发现' }
-  }
-  if (sync.remote_state === 'exists') {
-    return { color: 'success', label: '远端已存在' }
-  }
-  if (sync.status === 'active') {
-    return { color: 'processing', label: '远端Active' }
-  }
-  if (sync.status === 'error') {
-    return { color: 'error', label: '远端错误' }
-  }
-  return { color: 'default', label: '未同步' }
+function integrationUploadStateMeta(sync: any) {
+  const state = sync && typeof sync === 'object' ? sync : {}
+  const remoteState = String(state.remote_state || '').trim().toLowerCase()
+  const lastUpload = state.last_upload && typeof state.last_upload === 'object' ? state.last_upload : {}
+  const uploaded = parseSubmissionBoolean(state.uploaded) === true
+    || remoteState === 'uploaded'
+    || remoteState === 'exists'
+    || String(lastUpload.status || '').trim().toLowerCase() === 'success'
+  return uploaded
+    ? { color: 'success', label: '已上传' }
+    : { color: 'default', label: '未上传' }
 }
 
 function shouldShowResumeAuthButton(record: any) {
@@ -6194,7 +6205,7 @@ export default function Accounts() {
             placeholder="Sub2API"
             value={columnFilters.sub2apiState}
             options={toSelectOptions(SUB2API_FILTER_OPTIONS)}
-            onChange={(value) => setColumnFilters((prev) => ({ ...prev, sub2apiState: value }))}
+            onChange={(value) => setColumnFilters((prev) => ({ ...prev, sub2apiState: normalizeIntegrationUploadFilterValues(value) }))}
           />
           <Select
             allowClear
@@ -6203,7 +6214,7 @@ export default function Accounts() {
             placeholder="OAIPay"
             value={columnFilters.oaipayState}
             options={toSelectOptions(OAIPAY_FILTER_OPTIONS)}
-            onChange={(value) => setColumnFilters((prev) => ({ ...prev, oaipayState: value }))}
+            onChange={(value) => setColumnFilters((prev) => ({ ...prev, oaipayState: normalizeIntegrationUploadFilterValues(value) }))}
           />
           <Select
             allowClear
@@ -6236,7 +6247,7 @@ export default function Accounts() {
 
   const renderSub2ApiState = (record: any) => {
     const sync = record.sub2apiSync || {}
-    const meta = sub2apiStateMeta(
+    const meta = integrationUploadStateMeta(
       record.sub2api_remote_state
         ? { ...sync, remote_state: record.sub2api_remote_state }
         : sync,
@@ -6288,7 +6299,7 @@ export default function Accounts() {
 
   const renderOaipayState = (record: any) => {
     const sync = record.oaipaySync || {}
-    const meta = sub2apiStateMeta(sync)
+    const meta = integrationUploadStateMeta(sync)
     return <Tag color={meta.color} style={compactTagStyle}>{meta.label}</Tag>
   }
 
@@ -7202,7 +7213,7 @@ export default function Accounts() {
           'Sub2API',
           columnFilters.sub2apiState,
           SUB2API_FILTER_OPTIONS,
-          (next) => setColumnFilters((prev) => ({ ...prev, sub2apiState: next })),
+          (next) => setColumnFilters((prev) => ({ ...prev, sub2apiState: normalizeIntegrationUploadFilterValues(next) })),
         ),
         key: 'sub2api_state',
         width: 106,
@@ -7219,7 +7230,7 @@ export default function Accounts() {
           'OAIPay',
           columnFilters.oaipayState,
           OAIPAY_FILTER_OPTIONS,
-          (next) => setColumnFilters((prev) => ({ ...prev, oaipayState: next })),
+          (next) => setColumnFilters((prev) => ({ ...prev, oaipayState: normalizeIntegrationUploadFilterValues(next) })),
         ),
         key: 'oaipay_state',
         width: 106,
@@ -7942,34 +7953,34 @@ export default function Accounts() {
                   <Input placeholder="邮箱或关键词" allowClear />
                 </Form.Item>
                 <Form.Item name="status" label="业务状态" style={{ marginBottom: 0 }}>
-                  <Select mode="multiple" placeholder="全部业务状态" options={STATUS_FILTER_OPTIONS} allowClear />
+                  <Select mode="multiple" placeholder="全部业务状态" options={toSelectOptions(STATUS_FILTER_OPTIONS)} allowClear />
                 </Form.Item>
                 <Form.Item name="authType" label="认证材料" style={{ marginBottom: 0 }}>
-                  <Select mode="multiple" placeholder="全部认证材料" options={AUTH_TYPE_FILTER_OPTIONS} allowClear />
+                  <Select mode="multiple" placeholder="全部认证材料" options={toSelectOptions(AUTH_TYPE_FILTER_OPTIONS)} allowClear />
                 </Form.Item>
                 <Form.Item name="phoneBindingState" label="手机号绑定" style={{ marginBottom: 0 }}>
-                  <Select mode="multiple" placeholder="全部绑定情况" options={PHONE_BINDING_STATE_FILTER_OPTIONS} allowClear />
+                  <Select mode="multiple" placeholder="全部绑定情况" options={toSelectOptions(PHONE_BINDING_STATE_FILTER_OPTIONS)} allowClear />
                 </Form.Item>
                 <Form.Item name="paymentLinkPlatform" label="支付链接" style={{ marginBottom: 0 }}>
-                  <Select mode="multiple" placeholder="全部支付链接平台" options={PAYMENT_LINK_PLATFORM_FILTER_OPTIONS} allowClear />
+                  <Select mode="multiple" placeholder="全部支付链接平台" options={toSelectOptions(PAYMENT_LINK_PLATFORM_FILTER_OPTIONS)} allowClear />
                 </Form.Item>
                 <Form.Item name="subscriptionType" label="当前订阅" style={{ marginBottom: 0 }}>
-                  <Select mode="multiple" placeholder="全部当前订阅" options={SUBSCRIPTION_TYPE_FILTER_OPTIONS} allowClear />
+                  <Select mode="multiple" placeholder="全部当前订阅" options={toSelectOptions(SUBSCRIPTION_TYPE_FILTER_OPTIONS)} allowClear />
                 </Form.Item>
                 <Form.Item name="accountValidity" label="认证状态" style={{ marginBottom: 0 }}>
-                  <Select mode="multiple" placeholder="全部认证状态" options={ACCOUNT_VALIDITY_FILTER_OPTIONS} allowClear />
+                  <Select mode="multiple" placeholder="全部认证状态" options={toSelectOptions(ACCOUNT_VALIDITY_FILTER_OPTIONS)} allowClear />
                 </Form.Item>
-                <Form.Item name="sub2apiState" label="Sub2Api 状态" style={{ marginBottom: 0 }}>
-                  <Select mode="multiple" placeholder="全部 Sub2Api 状态" options={SUB2API_FILTER_OPTIONS} allowClear />
+                <Form.Item name="sub2apiState" label="Sub2API 状态" style={{ marginBottom: 0 }}>
+                  <Select mode="multiple" placeholder="全部 Sub2API 状态" options={toSelectOptions(SUB2API_FILTER_OPTIONS)} allowClear />
                 </Form.Item>
                 <Form.Item name="oaipayState" label="OAIPay 状态" style={{ marginBottom: 0 }}>
-                  <Select mode="multiple" placeholder="全部 OAIPay 状态" options={OAIPAY_FILTER_OPTIONS} allowClear />
+                  <Select mode="multiple" placeholder="全部 OAIPay 状态" options={toSelectOptions(OAIPAY_FILTER_OPTIONS)} allowClear />
                 </Form.Item>
                 <Form.Item name="submitState" label="提交状态" style={{ marginBottom: 0 }}>
-                  <Select mode="multiple" placeholder="全部提交状态" options={SUBMISSION_STATE_FILTER_OPTIONS} allowClear />
+                  <Select mode="multiple" placeholder="全部提交状态" options={toSelectOptions(SUBMISSION_STATE_FILTER_OPTIONS)} allowClear />
                 </Form.Item>
                 <Form.Item name="hasSubmitted" label="是否已提交" style={{ marginBottom: 0 }}>
-                  <Select placeholder="不限" options={HAS_SUBMITTED_FILTER_OPTIONS} allowClear />
+                  <Select placeholder="不限" options={toSelectOptions(HAS_SUBMITTED_FILTER_OPTIONS)} allowClear />
                 </Form.Item>
                 <Form.Item name="sortOrder" label="到期时间排序" style={{ marginBottom: 0 }}>
                   <Select placeholder="默认排序" options={SUBSCRIPTION_EXPIRY_SORT_OPTIONS} allowClear />

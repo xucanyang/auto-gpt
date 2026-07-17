@@ -78,12 +78,20 @@ ACCOUNT_FILTER_PRESET_COLUMN_KEYS = (
     "submitState",
     "hasSubmitted",
 )
-ACCOUNT_FILTER_PRESET_PENDING_OAIPAY_STATES = [
-    "unknown",
-    "not_found",
-    "deleted_exact_match",
-    "cross_workspace_only",
-]
+ACCOUNT_FILTER_PRESET_PENDING_OAIPAY_STATES = ["not_uploaded"]
+_INTEGRATION_UPLOAD_FILTER_ALIASES = {
+    "true": "uploaded",
+    "uploaded": "uploaded",
+    "exists": "uploaded",
+    "false": "not_uploaded",
+    "not_uploaded": "not_uploaded",
+    "unknown": "not_uploaded",
+    "not_found": "not_uploaded",
+    "deleted_exact_match": "not_uploaded",
+    "cross_workspace_only": "not_uploaded",
+    "ambiguous": "not_uploaded",
+    "unreachable": "not_uploaded",
+}
 
 
 class AccountFilterPresetBody(BaseModel):
@@ -157,6 +165,17 @@ def _normalize_idea_submit_filter_values(values: Any) -> list[str]:
     return normalized
 
 
+def _normalize_integration_upload_filter_values(values: Any) -> list[str]:
+    normalized: list[str] = []
+    for item in _filter_value_list(values):
+        value = _INTEGRATION_UPLOAD_FILTER_ALIASES.get(item.lower(), item.lower())
+        if value and value not in normalized:
+            normalized.append(value)
+    if set(normalized) == {"uploaded", "not_uploaded"}:
+        return []
+    return normalized
+
+
 def _empty_filter_preset_payload() -> dict[str, Any]:
     return {
         "search": "",
@@ -184,11 +203,12 @@ def _normalize_filter_preset_filters(filters: Any) -> dict[str, Any]:
         if key in {"email", "status"}:
             continue
         values = _filter_value_list(source_column_filters.get(key) or source.get(key))
-        clean["columnFilters"][key] = (
-            _normalize_idea_submit_filter_values(values)
-            if key in {"ideaSubmitState", "submitState"}
-            else values
-        )
+        if key in {"ideaSubmitState", "submitState"}:
+            clean["columnFilters"][key] = _normalize_idea_submit_filter_values(values)
+        elif key in {"sub2apiState", "oaipayState"}:
+            clean["columnFilters"][key] = _normalize_integration_upload_filter_values(values)
+        else:
+            clean["columnFilters"][key] = values
 
     sort_source = source.get("sort") if isinstance(source.get("sort"), dict) else {}
     sort_order = _trim_text(
@@ -270,7 +290,7 @@ BUILTIN_ACCOUNT_FILTER_PRESETS: list[dict[str, Any]] = [
     _make_builtin_filter_preset(
         preset_id="builtin_oaipay_pending",
         name="OAIPay 待补传",
-        description="OAIPay 未同步、未发现、已删可重传或其他工作区已存在。",
+        description="OAIPay 尚无远端存在或上传成功记录。",
         column_filters={"oaipayState": ACCOUNT_FILTER_PRESET_PENDING_OAIPAY_STATES},
     ),
     _make_builtin_filter_preset(
@@ -307,17 +327,11 @@ BUILTIN_ACCOUNT_FILTER_PRESETS: list[dict[str, Any]] = [
         },
     ),
     _make_builtin_filter_preset(
-        preset_id="builtin_oaipay_attention",
-        name="OAIPay 异常待处理",
-        description="OAIPay 多候选或远端不可达，需要人工复查。",
-        column_filters={"oaipayState": ["ambiguous", "unreachable"]},
-    ),
-    _make_builtin_filter_preset(
         preset_id="builtin_sub2api_exists_oaipay_pending",
         name="Sub2API 已有但 OAIPay 未传",
-        description="Sub2API 已存在，但 OAIPay 仍处于待补传状态。",
+        description="Sub2API 已确认上传或远端存在，但 OAIPay 尚未上传。",
         column_filters={
-            "sub2apiState": ["exists"],
+            "sub2apiState": ["uploaded"],
             "oaipayState": ACCOUNT_FILTER_PRESET_PENDING_OAIPAY_STATES,
         },
     ),

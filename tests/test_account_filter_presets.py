@@ -27,7 +27,7 @@ def test_account_filter_preset_crud_and_normalization(monkeypatch):
     monkeypatch.setattr(accounts, "config_store", store)
 
     initial = accounts.list_account_filter_presets()
-    assert initial["built_in_count"] >= 6
+    assert initial["built_in_count"] >= 5
     assert initial["custom_count"] == 0
 
     created = accounts.create_account_filter_preset(
@@ -61,6 +61,7 @@ def test_account_filter_preset_crud_and_normalization(monkeypatch):
     assert item["filters"]["columnFilters"]["subscriptionType"] == ["plus", "pro"]
     assert item["filters"]["columnFilters"]["phoneBindingState"] == ["unbound"]
     assert item["filters"]["columnFilters"]["paymentLinkPlatform"] == ["pix", "none"]
+    assert item["filters"]["columnFilters"]["oaipayState"] == ["not_uploaded"]
     assert item["filters"]["columnFilters"]["ideaSubmitState"] == ["unsubmitted", "submitting", "unavailable"]
     assert item["filters"]["columnFilters"]["submitState"] == ["unsubmitted", "submitting", "timeout"]
     assert item["filters"]["columnFilters"]["hasSubmitted"] == ["true"]
@@ -84,7 +85,7 @@ def test_account_filter_preset_crud_and_normalization(monkeypatch):
         ),
     )
     assert updated["item"]["name"] == "Plus 长效待补传"
-    assert updated["item"]["filters"]["columnFilters"]["oaipayState"] == ["deleted_exact_match"]
+    assert updated["item"]["filters"]["columnFilters"]["oaipayState"] == ["not_uploaded"]
     assert updated["item"]["filters"]["pageSize"] == 20
 
     deleted = accounts.delete_account_filter_preset(item["id"])
@@ -111,7 +112,7 @@ def test_builtin_filter_preset_can_be_updated_and_deleted(monkeypatch):
     assert updated["item"]["built_in"] is True
     assert updated["item"]["name"] == "OAIPay 待补传（改）"
     assert updated["item"]["pinned"] is False
-    assert updated["item"]["filters"]["columnFilters"]["oaipayState"] == ["not_found"]
+    assert updated["item"]["filters"]["columnFilters"]["oaipayState"] == ["not_uploaded"]
     assert updated["built_in_count"] == initial_builtin_count
     assert updated["builtin_override_count"] == 1
 
@@ -140,3 +141,4 @@ def test_legacy_filter_preset_list_payload_still_loads(monkeypatch):
     assert listed["custom_count"] == 1
     item = next(item for item in listed["items"] if item["id"] == "preset_legacy")
     assert item["filters"]["columnFilters"]["ideaSubmitState"] == ["submitting", "unavailable"]
+    assert item["filters"]["columnFilters"]["oaipayState"] == ["not_uploaded"]

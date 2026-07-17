@@ -52,8 +52,8 @@ def backfill_engine(tmp_path, monkeypatch):
                     auth_type="access_token_only",
                     subscription_type="plus",
                     account_validity="valid",
-                    sub2api_state="not_found",
-                    oaipay_state="not_found",
+                    sub2api_state="not_uploaded",
+                    oaipay_state="not_uploaded",
                     idea_submit_state="available",
                 )
             )

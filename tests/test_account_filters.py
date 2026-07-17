@@ -12,8 +12,10 @@ try:
         account_idea_submit_state,
         account_payment_link_platform,
         account_phone_binding_state,
+        account_oaipay_upload_state,
         account_revival_info,
         account_revival_state,
+        account_sub2api_upload_state,
         account_submission_info,
         account_submit_state,
         apply_account_list_state_filters,
@@ -39,8 +41,10 @@ except ModuleNotFoundError as exc:
     account_has_submitted = None
     account_payment_link_platform = None
     account_phone_binding_state = None
+    account_oaipay_upload_state = None
     account_revival_info = None
     account_revival_state = None
+    account_sub2api_upload_state = None
     account_submission_info = None
     account_submit_state = None
     apply_account_list_state_filters = None
@@ -505,6 +509,55 @@ class AccountFilterSortTests(unittest.TestCase):
 
             self.assertEqual(sql_ids(payment_link_platform="pix,paypal"), [511, 512, 517])
             self.assertEqual(sql_ids(payment_link_platform="none"), [515, 516])
+
+    def test_integration_upload_filter_uses_positive_evidence_and_migrates_legacy_states(self):
+        uploaded_marker = self._account(520)
+        uploaded_marker.set_extra({"sync_statuses": {"sub2api": {"uploaded": True, "remote_state": "unreachable"}}})
+        remote_exists = self._account(521)
+        remote_exists.set_extra({"sync_statuses": {"sub2api": {"remote_state": "exists"}}})
+        successful_history = self._account(522)
+        successful_history.set_extra({"sync_statuses": {"oaipay": {"remote_state": "not_found", "last_upload": {"status": "success"}}}})
+        not_uploaded = self._account(523)
+        not_uploaded.set_extra({"sync_statuses": {"sub2api": {"remote_state": "ambiguous"}}})
+        unknown = self._account(524)
+        rows = [uploaded_marker, remote_exists, successful_history, not_uploaded, unknown]
+
+        self.assertEqual(account_sub2api_upload_state(uploaded_marker), "uploaded")
+        self.assertEqual(account_sub2api_upload_state(remote_exists), "uploaded")
+        self.assertEqual(account_oaipay_upload_state(successful_history), "uploaded")
+        self.assertEqual(account_sub2api_upload_state(not_uploaded), "not_uploaded")
+        self.assertEqual(account_sub2api_upload_state(unknown), "not_uploaded")
+        self.assertEqual(
+            [row.id for row in filter_account_rows(rows, sub2api_state="exists")],
+            [520, 521],
+        )
+        self.assertEqual(
+            [row.id for row in filter_account_rows(rows, sub2api_state="unknown,not_found,ambiguous")],
+            [522, 523, 524],
+        )
+        self.assertEqual(
+            [row.id for row in filter_account_rows(rows, sub2api_state="uploaded,not_uploaded")],
+            [520, 521, 522, 523, 524],
+        )
+
+        init_db()
+        with Session(engine) as session:
+            session.exec(text("DELETE FROM account_list_state"))
+            session.exec(text("DELETE FROM accounts"))
+            for row in rows:
+                session.add(row)
+            session.commit()
+            refresh_account_list_state(session)
+            states = {
+                int(row.account_id): (row.sub2api_state, row.oaipay_state)
+                for row in session.exec(select(AccountListStateModel)).all()
+            }
+
+        self.assertEqual(states[520][0], "uploaded")
+        self.assertEqual(states[521][0], "uploaded")
+        self.assertEqual(states[522][1], "uploaded")
+        self.assertEqual(states[523][0], "not_uploaded")
+        self.assertEqual(states[524], ("not_uploaded", "not_uploaded"))
 
     def test_account_list_state_sql_filters_match_python_filters(self):
         init_db()

@@ -6,6 +6,17 @@
 
 ## [Unreleased] (未发布)
 
+## [2.3.6] - 2026-07-18
+
+### 优化 (Changed)
+- **Sub2API/OAIPay 筛选收敛为二元上传状态**：`frontend/src/pages/Accounts.tsx` 的两列筛选统一只显示“已上传”和“未上传”。`services/account_filters.py` 以 `uploaded=true`、远端状态 `exists/uploaded` 或最近上传记录 `last_upload.status=success` 作为明确上传证据，其余远端未发现、多候选、不可达、历史删除和未同步状态统一归入“未上传”；原始技术状态继续保留在同步记录、上传记录和任务日志中用于防重复与排障。
+- **旧筛选条件无感迁移**：账号列表请求和筛选组合把历史 `exists` 映射为“已上传”，把 `unknown/not_found/cross_workspace_only/deleted_exact_match/ambiguous/unreachable` 映射为“未上传”；同时选择两类时按不限处理。`account_list_state` 派生版本升级为 `integration-upload-state-v1`，三个实例会从各自账号数据重新生成二元索引，不修改原始同步证据。
+- **常用筛选组合同步简化**：`api/accounts.py` 的 OAIPay 待补传组合改用单一“未上传”条件，“Sub2API 已有但 OAIPay 未传”同时覆盖上传成功记录与远端探测已存在记录；移除已经失去独立筛选语义的 OAIPay 多候选/不可达内置组合，避免继续暴露废弃技术枚举。
+- **其他列筛选标签统一**：筛选组合编辑弹窗现在统一通过 `toSelectOptions()` 把业务状态、认证材料、手机号、支付链接、订阅、认证状态、提交状态等 `{text,value}` 配置转换为 Ant Design 所需的 `{label,value}`，避免弹窗显示原始英文值；桌面表头、移动端和组合编辑器使用同一套中文标签。账号规范化同时优先保留紧凑列表接口返回的 Sub2API、OAIPay 与 CLIProxyAPI 同步摘要，避免安全裁剪后的 `extra` 空对象覆盖上传记录。前端侧栏版本同步至 `v2.3.6`。
+
+### 测试 (Tests)
+- **二元状态与筛选合同回归**：扩展 `tests/test_account_filters.py`、`test_account_filter_presets.py`、`test_filtered_task_scope.py` 和 `test_integrations_backfill_scope.py`，覆盖上传标记、远端存在、成功历史三类正向证据，未上传归类、旧枚举迁移、SQL 索引与 Python 回退一致性及冻结任务范围；新增 `test_accounts_integration_upload_filter_ui.py` 锁定两项筛选和全部组合编辑标签转换。
+
 ## [2.3.5] - 2026-07-18
 
 ### 新增 (Added)
@@ -1941,4 +1952,8 @@
 
 ## 2026-07-18 04:17:58 +0800
 - 升级 v2.3.5：PIX 链接改为 Stripe 实时状态扫描
+- 发布模式: multi
+
+## 2026-07-18 05:56:01 +0800
+- 升级 v2.3.6：统一 Sub2API 与 OAIPay 二元上传筛选
 - 发布模式: multi
