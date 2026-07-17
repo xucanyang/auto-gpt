@@ -177,7 +177,8 @@ export function RegisterTaskModal({
   const isPrefixSample = Boolean(prefixSample?.enabled)
   const modalTitle = () => {
     if (taskModalMode === 'pix_cleanup') {
-      return '过期 PIX 链接清理'
+      const cleanupLabel = String(taskSnapshot?.meta?.cleanup_label || '').trim()
+      return cleanupLabel ? `${cleanupLabel} PIX 链接清理` : 'PIX 链接清理'
     }
     if (taskModalMode === 'probe_local_status') {
       const eligible = Number(taskSnapshot?.meta?.eligible || 0)

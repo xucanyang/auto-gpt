@@ -36,6 +36,14 @@ type PaymentLinkGeneration = {
 function paymentLinkStatusMeta(value: unknown) {
   const status = String(value || '').trim().toLowerCase()
   if (status === 'succeeded' || status === 'done') return { color: 'success', label: '已生成' }
+  if (status === 'paid' || status === 'already_paid') return { color: 'success', label: '已支付' }
+  if (['cancelled', 'canceled', 'payment_cancelled', 'payment_canceled'].includes(status)) {
+    return { color: 'warning', label: '支付已取消' }
+  }
+  if (status === 'pix_submitted') return { color: 'processing', label: '已提交 PIX 管理端' }
+  if (status === 'expired_cleaned') return { color: 'default', label: '已过期清理' }
+  if (status === 'paid_cleaned') return { color: 'default', label: '已支付清理' }
+  if (status === 'cancelled_cleaned') return { color: 'default', label: '支付已取消清理' }
   if (status === 'queued') return { color: 'default', label: '已提交' }
   if (status === 'running') return { color: 'processing', label: '生成中' }
   if (status === 'interrupted') return { color: 'warning', label: '远端中断' }

@@ -31,6 +31,7 @@ export type AccountsToolbarActionId =
 
 export type AccountExportMode = 'sub2api' | 'access_token' | 'pix_payment_links'
 export type AccountExportScope = 'selected' | 'filtered'
+export type PixLinkCleanupMode = 'expired' | 'paid' | 'cancelled'
 
 type AccountsToolbarDangerActionId = 'deleteInvalid' | 'batchDelete'
 type MoreMenuClickInfo = Parameters<NonNullable<MenuProps['onClick']>>[0]
@@ -85,6 +86,14 @@ const normalizePinnedActionIds = (actionIds: string[]): AccountsToolbarActionId[
 const makeMoreMenuChildKey = (actionId: AccountsToolbarActionId, key: React.Key) => (
   `${actionId}${MORE_MENU_CHILD_KEY_SEPARATOR}${String(key)}`
 )
+
+const pixCleanupModeFromMenuKey = (key: React.Key): PixLinkCleanupMode | null => {
+  const normalized = String(key)
+  if (normalized === 'pix_cleanup_expired') return 'expired'
+  if (normalized === 'pix_cleanup_paid') return 'paid'
+  if (normalized === 'pix_cleanup_cancelled') return 'cancelled'
+  return null
+}
 
 const prefixDropdownMenuItems = (
   actionId: AccountsToolbarActionId,
@@ -143,7 +152,7 @@ type AccountsToolbarProps = {
   paypalBindingLoading: boolean
   baxiCdkSubmitLoading: boolean
   onBatchPaymentLink: (options?: { forceRefresh?: boolean }) => void
-  onCleanupExpiredPixLinks: () => void
+  onCleanupPixLinks: (mode: PixLinkCleanupMode) => void
   onBatchInvalidRecheck: () => void
   onOpenPhoneBindingTest: () => void
   onOpenPaypalBinding: () => void
@@ -191,7 +200,7 @@ export function AccountsToolbar({
   paypalBindingLoading,
   baxiCdkSubmitLoading,
   onBatchPaymentLink,
-  onCleanupExpiredPixLinks,
+  onCleanupPixLinks,
   onBatchInvalidRecheck,
   onOpenPhoneBindingTest,
   onOpenPaypalBinding,
@@ -273,8 +282,22 @@ export function AccountsToolbar({
     },
     { type: 'divider' },
     {
-      key: 'pix_cleanup',
+      key: 'pix_cleanup_expired',
       label: '清理过期 PIX 链接',
+      icon: <DeleteOutlined />,
+      danger: true,
+      disabled: pixLinkCleanupLoading,
+    },
+    {
+      key: 'pix_cleanup_paid',
+      label: '清理已支付 PIX 链接',
+      icon: <DeleteOutlined />,
+      danger: true,
+      disabled: pixLinkCleanupLoading,
+    },
+    {
+      key: 'pix_cleanup_cancelled',
+      label: '清理支付已取消 PIX 链接',
       icon: <DeleteOutlined />,
       danger: true,
       disabled: pixLinkCleanupLoading,
@@ -477,8 +500,9 @@ export function AccountsToolbar({
         return
       }
       if (actionId === 'paymentLink') {
-        if (originalKey === 'pix_cleanup') {
-          onCleanupExpiredPixLinks()
+        const cleanupMode = pixCleanupModeFromMenuKey(originalKey)
+        if (cleanupMode) {
+          onCleanupPixLinks(cleanupMode)
           return
         }
         onBatchPaymentLink({ forceRefresh: originalKey === 'force' })
@@ -622,8 +646,9 @@ export function AccountsToolbar({
             menu={{
               items: paymentLinkMenuItems,
               onClick: ({ key }) => {
-                if (String(key) === 'pix_cleanup') {
-                  onCleanupExpiredPixLinks()
+                const cleanupMode = pixCleanupModeFromMenuKey(key)
+                if (cleanupMode) {
+                  onCleanupPixLinks(cleanupMode)
                   return
                 }
                 onBatchPaymentLink({ forceRefresh: String(key) === 'force' })

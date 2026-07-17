@@ -6,12 +6,25 @@
 
 ## [Unreleased] (未发布)
 
+## [2.3.3] - 2026-07-18
+
+### 新增 (Added)
+- **PIX 链接清理扩展为三种独立动作**：账号页“支付链接生成”下拉菜单在原“清理过期 PIX 链接”之外，新增“清理已支付 PIX 链接”和“清理支付已取消 PIX 链接”。三个动作分别调用带 `cleanup_mode=expired|paid|cancelled` 的预览与后台任务接口，继续执行当前实例扫描、确认弹窗、任务日志、校验备份、事务清理和账号列表索引刷新，不受当前分页、勾选或筛选范围影响。
+- **终态清理审计标记**：`services/chatgpt_core/payment_link_cache.py` 与 `pix_payment_link_cleanup.py` 新增 `paid_cleaned`、`cancelled_cleaned` tombstone。清理只移除当前 PIX URL 及完全相同的 `cashier_url`，保留原链接状态、清理模式、生成/到期时间和清理截止点；账号状态、支付生成历史、PIX CDK、订单提交结果及任务日志保持不变。
+
 ### 优化 (Changed)
+- **已支付识别采用链接级组合证据**：清理服务只接受当前链接自身的 `paid/already_paid`，或“当前链接已标记 `pix_submitted` + 对应 `user_link` PIX 订单明确为 paid”的组合；不会仅凭账号已订阅、历史订单 paid 或 `auto_extract` 结果删除后来生成的新链接。支付标记时间早于当前链接生成时间时会安全排除。
+- **支付取消与普通失败严格分离**：取消清理识别链接自身的 `cancelled/canceled/payment_cancelled/payment_canceled`，以及 `user_link` PIX 订单返回明确“PIX 支付已取消”证据的记录。普通上游失败、超时、结果未知和人工复核状态继续保留，避免把可重试或未决链接误删。
 - **扩展 attsms 手机绑定收码格式**：`services/chatgpt_core/phone_service.py` 现在支持解析 `attsms.com` 这类纯文本响应，例如 `【OpenAI/ChatGPT】暂无短信，到期时间：2026-7-31 13:04`。轮询阶段继续将“暂无短信”视为等待，并记录纯文本到期时间；收到带“验证码”的后续响应时可直接提取验证码完成手机号绑定。
 - **手机号池到期探测兼容纯文本 API**：`services/chatgpt_core/phone_pool_repository.py` 的有效期探测不再强制要求 JSON，能够从纯文本 `到期时间` 字段写入 `api_expired_date`，避免 attsms 号码导入后被误标为探测失败。
 
+### 修复 (Fixed)
+- **所有清理终态都阻止旧历史复活链接**：`services/long_link_history_sync.py` 统一识别三种 PIX 清理 tombstone，旧 long-link 成功记录仍进入 `payment_link_generations` 审计历史，但不会重新写回已清理 URL；只有清理截止点之后真正生成的新链接可以覆盖 tombstone。
+- **前端终态文案与发布版本对齐**：账号详情将 paid、payment cancelled、PIX 已提交及三种清理状态显示为明确中文标签；`frontend/src/app/AppShell.tsx` 侧栏版本同步至 `v2.3.3`，用于确认三个实例已经加载本次清理能力和此前 attsms 兼容更新。
+
 ### 测试 (Tests)
 - 新增 attsms 纯文本轮询和手机号池有效期探测回归用例，覆盖“暂无短信”等待、验证码提取、`2026-7-31 13:04` 到期时间保存及非 JSON 响应。
+- **PIX 清理模式与证据边界回归**：扩展 `tests/test_pix_payment_link_cleanup.py`、`test_pix_payment_link_cleanup_task.py`、`test_long_link_history_sync.py` 和前端合同测试，覆盖三种模式参数冻结、paid 组合证据、取消文案证据、旧支付结果不误删新链接、普通失败隔离、不同 tombstone 防回填、零候选任务及后台日志持久化。
 
 ## [2.3.2] - 2026-07-17
 
@@ -1877,4 +1890,8 @@
 
 ## 2026-07-17 21:23:32 +0800
 - 支持 attsms 纯文本手机号绑定收码与到期时间解析
+- 发布模式: multi
+
+## 2026-07-18 00:43:51 +0800
+- 升级 v2.3.3：扩展 PIX 过期、已支付与支付取消链接清理
 - 发布模式: multi

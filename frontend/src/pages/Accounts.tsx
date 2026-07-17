@@ -50,6 +50,7 @@ import type {
   AccountExportMode,
   AccountExportScope,
   AccountsToolbarActionId as AccountToolbarActionId,
+  PixLinkCleanupMode,
 } from '@/features/accounts/components/AccountsToolbar'
 import { BatchGopayWorkbench } from '@/features/accounts/components/BatchGopayWorkbench'
 import { ImportAccountsModal } from '@/features/accounts/components/ImportAccountsModal'
@@ -393,9 +394,15 @@ type PaymentLinkProfile = {
 
 type PixLinkCleanupReport = {
   instance_id?: string
+  cleanup_mode?: PixLinkCleanupMode
+  cleanup_label?: string
   cutoff_display?: string
   current_pix_links?: number
   expired_links?: number
+  paid_links?: number
+  cancelled_links?: number
+  eligible_links?: number
+  retained_links?: number
   active_links?: number
   missing_expiry_links?: number
   cleaned_links?: number
@@ -407,6 +414,14 @@ type PixLinkCleanupTaskResponse = {
   source?: string
   instance_id?: string
   already_running?: boolean
+  cleanup_mode?: PixLinkCleanupMode
+  requested_cleanup_mode?: PixLinkCleanupMode
+}
+
+const PIX_LINK_CLEANUP_META: Record<PixLinkCleanupMode, { label: string; title: string }> = {
+  expired: { label: '过期', title: '过期 PIX 链接' },
+  paid: { label: '已支付', title: '已支付 PIX 链接' },
+  cancelled: { label: '支付已取消', title: '支付已取消 PIX 链接' },
 }
 
 const ACCOUNT_COLUMN_OPTIONS: Array<{ value: AccountColumnKey; text: string; chatgptOnly?: boolean }> = [
@@ -3883,17 +3898,21 @@ export default function Accounts() {
     void loadBatchPaymentLinkProfile()
   }
 
-  const executeExpiredPixLinkCleanup = async () => {
+  const executePixLinkCleanup = async (cleanupMode: PixLinkCleanupMode) => {
+    const cleanupMeta = PIX_LINK_CLEANUP_META[cleanupMode]
     setPixLinkCleanupLoading(true)
     try {
       const result = await apiFetch('/tasks/chatgpt/payment-links/pix-cleanup/task', {
         method: 'POST',
+        body: JSON.stringify({ cleanup_mode: cleanupMode }),
       }) as PixLinkCleanupTaskResponse
       const taskIdFromResponse = String(result?.task_id || '').trim()
       if (!taskIdFromResponse) {
         throw new Error('清理任务未返回 task_id')
       }
       const instanceId = String(result?.instance_id || '当前实例')
+      const activeMode = result?.cleanup_mode || cleanupMode
+      const activeMeta = PIX_LINK_CLEANUP_META[activeMode]
       setTaskModalMode('pix_cleanup')
       setTaskModalAccount(null)
       setTaskId(taskIdFromResponse)
@@ -3902,61 +3921,68 @@ export default function Accounts() {
         task_id: taskIdFromResponse,
         source: String(result?.source || 'pix_payment_link_cleanup'),
         status: result?.already_running ? 'running' : 'pending',
-        meta: { instance_id: instanceId },
+        meta: {
+          instance_id: instanceId,
+          cleanup_mode: activeMode,
+          cleanup_label: activeMeta.label,
+        },
       })
       setRegisterModalOpen(true)
       setActiveTasksPanelOpen(true)
       void activeTasksQuery.refetch()
       if (result?.already_running) {
-        appMessage.info(`${instanceId} 已有清理任务在运行，已打开现有任务日志`)
+        appMessage.info(`${instanceId} 已有${activeMeta.label}链接清理任务在运行，已打开现有任务日志`)
       } else {
-        appMessage.success(`${instanceId} 过期 PIX 链接清理任务已启动`)
+        appMessage.success(`${instanceId} ${cleanupMeta.title}清理任务已启动`)
       }
     } catch (e: any) {
-      appMessage.error(e?.message || '过期 PIX 支付链接清理任务启动失败')
+      appMessage.error(e?.message || `${cleanupMeta.title}清理任务启动失败`)
       throw e
     } finally {
       setPixLinkCleanupLoading(false)
     }
   }
 
-  const handleCleanupExpiredPixLinks = async () => {
+  const handleCleanupPixLinks = async (cleanupMode: PixLinkCleanupMode) => {
+    const cleanupMeta = PIX_LINK_CLEANUP_META[cleanupMode]
     setPixLinkCleanupLoading(true)
     let preview: PixLinkCleanupReport
     try {
-      preview = await apiFetch('/tasks/chatgpt/payment-links/pix-cleanup/preview') as PixLinkCleanupReport
+      preview = await apiFetch(`/tasks/chatgpt/payment-links/pix-cleanup/preview?cleanup_mode=${encodeURIComponent(cleanupMode)}`) as PixLinkCleanupReport
     } catch (e: any) {
-      appMessage.error(e?.message || '读取过期 PIX 链接数量失败')
+      appMessage.error(e?.message || `读取${cleanupMeta.title}数量失败`)
       return
     } finally {
       setPixLinkCleanupLoading(false)
     }
 
-    const expired = Number(preview?.expired_links || 0)
+    const eligible = Number(preview?.eligible_links || 0)
     const missing = Number(preview?.missing_expiry_links || 0)
     const instanceId = String(preview?.instance_id || '当前实例')
     const cutoff = String(preview?.cutoff_display || '最近一个北京时间 11:00')
-    if (expired <= 0) {
-      void executeExpiredPixLinkCleanup()
+    if (eligible <= 0) {
+      void executePixLinkCleanup(cleanupMode)
       return
     }
 
     appModal.confirm({
-      title: `清理 ${expired} 条过期 PIX 链接？`,
+      title: `清理 ${eligible} 条${cleanupMeta.title}？`,
       content: (
         <Space direction="vertical" size={6} style={{ width: '100%' }}>
           <Text>实例：{instanceId}</Text>
-          <Text>当前清理截止点：{cutoff}（北京时间）</Text>
+          {cleanupMode === 'expired' ? <Text>当前清理截止点：{cutoff}（北京时间）</Text> : null}
+          {cleanupMode === 'paid' ? <Text>仅匹配当前链接的明确支付成功证据。</Text> : null}
+          {cleanupMode === 'cancelled' ? <Text>仅匹配当前链接的明确支付取消证据，普通失败和超时会保留。</Text> : null}
           <Text type="secondary">
             只清理账号当前 PIX 链接及其完全相同的 cashier_url；不会删除账号、支付生成历史、PIX CDK 或提交结果。
           </Text>
-          {missing > 0 ? <Text type="warning">另有 {missing} 条缺少有效时间信息，本次不会清理。</Text> : null}
+          {cleanupMode === 'expired' && missing > 0 ? <Text type="warning">另有 {missing} 条缺少有效时间信息，本次不会清理。</Text> : null}
         </Space>
       ),
       okText: '确认清理',
       cancelText: '取消',
       okButtonProps: { danger: true },
-      onOk: executeExpiredPixLinkCleanup,
+      onOk: () => executePixLinkCleanup(cleanupMode),
       onCancel: () => setPixLinkCleanupLoading(false),
     })
   }
@@ -7735,7 +7761,7 @@ export default function Accounts() {
         paypalBindingLoading={paypalBindingLoading}
         baxiCdkSubmitLoading={baxiCdkSubmitLoading}
         onBatchPaymentLink={handleBatchPaymentLink}
-        onCleanupExpiredPixLinks={() => { void handleCleanupExpiredPixLinks() }}
+        onCleanupPixLinks={(cleanupMode) => { void handleCleanupPixLinks(cleanupMode) }}
         onBatchInvalidRecheck={handleBatchInvalidRecheck}
         onOpenPhoneBindingTest={() => { void openPhoneBindingTest() }}
         onOpenPaypalBinding={openPaypalBinding}

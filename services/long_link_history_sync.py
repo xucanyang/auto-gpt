@@ -18,7 +18,7 @@ import sqlite3
 from typing import Any, Iterable
 from urllib.parse import urlsplit
 
-from services.chatgpt_core.payment_link_cache import PIX_EXPIRED_CLEANED_STATUS
+from services.chatgpt_core.payment_link_cache import PIX_CLEANED_STATUSES
 
 
 SYNC_NAME = "long_link_history_sync"
@@ -435,9 +435,9 @@ def _current_cache_should_be_replaced(extra: dict[str, Any], source: SourceLink)
     if not isinstance(current, dict):
         return True
     current_time = _timestamp_for_compare(current.get("generated_at") or current.get("created_at"))
-    if _safe_text(current.get("link_status"), limit=64).lower() == PIX_EXPIRED_CLEANED_STATUS:
+    if _safe_text(current.get("link_status"), limit=64).lower() in PIX_CLEANED_STATUSES:
         # Cleanup deliberately leaves a URL-free tombstone. Historical rows at
-        # or before that generation must not resurrect the expired current link;
+        # or before that generation must not resurrect the cleared current link;
         # a genuinely newer source record may replace it normally.
         tombstone_time = (
             _timestamp_for_compare(current.get("pix_cleanup_through_at"))

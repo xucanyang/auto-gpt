@@ -56,8 +56,12 @@ from services.chatgpt_core.payment_link_cache import (
     validate_plus_payment_request_params,
 )
 from services.chatgpt_core.pix_payment_link_cleanup import (
-    clean_expired_pix_payment_links,
-    preview_expired_pix_payment_links,
+    PIX_CLEANUP_MODE_EXPIRED,
+    PIX_CLEANUP_MODE_LABELS,
+    PixCleanupMode,
+    clean_pix_payment_links,
+    normalize_pix_cleanup_mode,
+    preview_pix_payment_link_cleanup,
 )
 from services.chatgpt_core.local_status_refresh import (
     schedule_chatgpt_local_status_refresh_for_account_id,
@@ -395,6 +399,10 @@ class BatchPaymentLinkTaskRequest(AccountFilterRequestMixin):
     skip_existing: bool = True
     force_refresh: bool = False
     limit: int = 0
+
+
+class PixPaymentLinkCleanupRequest(BaseModel):
+    cleanup_mode: Literal["expired", "paid", "cancelled"] = PIX_CLEANUP_MODE_EXPIRED
 
 
 class BatchSub2ApiUploadTaskRequest(AccountFilterRequestMixin):
@@ -16355,22 +16363,29 @@ def get_chatgpt_payment_link_profile():
 
 
 @router.get("/chatgpt/payment-links/pix-cleanup/preview")
-def preview_chatgpt_expired_pix_payment_links():
+def preview_chatgpt_expired_pix_payment_links(
+    cleanup_mode: Literal["expired", "paid", "cancelled"] = PIX_CLEANUP_MODE_EXPIRED,
+):
     """Return a server-calculated, current-instance PIX cleanup preview."""
 
     with Session(engine) as session:
-        return preview_expired_pix_payment_links(session)
+        return preview_pix_payment_link_cleanup(session, cleanup_mode=cleanup_mode)
 
 
-def _run_expired_pix_payment_link_cleanup(task_id: str) -> None:
+def _run_expired_pix_payment_link_cleanup(
+    task_id: str,
+    cleanup_mode: PixCleanupMode = PIX_CLEANUP_MODE_EXPIRED,
+) -> None:
     """Run one verified PIX cleanup and publish its complete operator timeline."""
 
+    mode = normalize_pix_cleanup_mode(cleanup_mode)
+    cleanup_label = PIX_CLEANUP_MODE_LABELS[mode]
     _task_store.mark_running(task_id)
     _task_store.set_progress(task_id, "0/1")
     try:
-        _log(task_id, "[PIX清理] 开始重新扫描当前实例的 PIX 支付链接")
+        _log(task_id, f"[PIX清理] 开始重新扫描当前实例的{cleanup_label} PIX 支付链接")
         with Session(engine) as session:
-            preview = preview_expired_pix_payment_links(session)
+            preview = preview_pix_payment_link_cleanup(session, cleanup_mode=mode)
         preview = dict(preview or {})
         _task_store.update_meta(
             task_id,
@@ -16382,38 +16397,38 @@ def _run_expired_pix_payment_link_cleanup(task_id: str) -> None:
 
         preview_total = max(int(preview.get("current_pix_links") or 0), 0)
         preview_active = max(int(preview.get("active_links") or 0), 0)
-        preview_expired = max(int(preview.get("expired_links") or 0), 0)
+        preview_eligible = max(int(preview.get("eligible_links") or 0), 0)
         preview_missing = max(int(preview.get("missing_expiry_links") or 0), 0)
         _log(
             task_id,
             (
                 "[PIX清理] 扫描完成："
-                f"总 {preview_total}；有效 {preview_active}；"
-                f"缺少时间 {preview_missing}；过期 {preview_expired}"
+                f"总 {preview_total}；{cleanup_label} {preview_eligible}；"
+                f"时间有效 {preview_active}；缺少时间 {preview_missing}"
             ),
         )
-        if preview_missing:
+        if mode == PIX_CLEANUP_MODE_EXPIRED and preview_missing:
             _log(
                 task_id,
                 f"[PIX清理] {preview_missing} 条链接缺少有效过期时间，将安全保留",
             )
-        if preview_expired:
+        if preview_eligible:
             _log(
                 task_id,
-                f"[PIX清理] 准备为 {preview_expired} 条过期链接创建校验备份并执行事务清理",
+                f"[PIX清理] 准备为 {preview_eligible} 条{cleanup_label}链接创建校验备份并执行事务清理",
             )
         else:
-            _log(task_id, "[PIX清理] 当前扫描未发现过期链接，正在进行执行前复核")
+            _log(task_id, f"[PIX清理] 当前扫描未发现{cleanup_label}链接，正在进行执行前复核")
 
         with Session(engine) as session:
-            result = clean_expired_pix_payment_links(session)
+            result = clean_pix_payment_links(session, cleanup_mode=mode)
         result = dict(result or {})
 
         total = max(int(result.get("current_pix_links") or 0), 0)
         active = max(int(result.get("active_links") or 0), 0)
-        expired = max(int(result.get("expired_links") or 0), 0)
+        eligible = max(int(result.get("eligible_links") or 0), 0)
         missing = max(int(result.get("missing_expiry_links") or 0), 0)
-        retained = max(total - expired, 0)
+        retained = max(total - eligible, 0)
         cleaned = max(int(result.get("cleaned_links") or 0), 0)
         concurrent_skipped = max(int(result.get("concurrent_skipped_links") or 0), 0)
         list_state_refreshed = max(int(result.get("list_state_refreshed") or 0), 0)
@@ -16422,7 +16437,9 @@ def _run_expired_pix_payment_link_cleanup(task_id: str) -> None:
             "total": total,
             "retained": retained,
             "active": active,
-            "expired": expired,
+            "eligible": eligible,
+            "cleanup_mode": mode,
+            "cleanup_label": cleanup_label,
             "missing_expiry": missing,
             "cleaned": cleaned,
             "concurrent_skipped": concurrent_skipped,
@@ -16438,7 +16455,7 @@ def _run_expired_pix_payment_link_cleanup(task_id: str) -> None:
             },
         )
 
-        if expired:
+        if eligible:
             _log(
                 task_id,
                 (
@@ -16449,12 +16466,12 @@ def _run_expired_pix_payment_link_cleanup(task_id: str) -> None:
                 ),
             )
         else:
-            _log(task_id, "[PIX清理] 执行前复核确认没有需要清理的过期链接")
-        if missing:
+            _log(task_id, f"[PIX清理] 执行前复核确认没有需要清理的{cleanup_label}链接")
+        if mode == PIX_CLEANUP_MODE_EXPIRED and missing:
             _log(task_id, f"[PIX清理] 缺少有效过期时间并保留：{missing}")
 
         _task_store.set_progress(task_id, "1/1")
-        _log(task_id, f"[SUMMARY] 总：{total}；保留：{retained}；过期：{expired}")
+        _log(task_id, f"[SUMMARY] 总：{total}；保留：{retained}；{cleanup_label}：{eligible}")
         _task_store.finish(
             task_id,
             status="done",
@@ -16463,8 +16480,8 @@ def _run_expired_pix_payment_link_cleanup(task_id: str) -> None:
             errors=[],
         )
     except Exception as exc:
-        error_text = sanitize_error_message(exc)[:1600] or "过期 PIX 支付链接清理失败"
-        logger.exception("Expired PIX payment-link cleanup task failed task_id=%s", task_id)
+        error_text = sanitize_error_message(exc)[:1600] or f"{cleanup_label} PIX 支付链接清理失败"
+        logger.exception("PIX payment-link cleanup task failed task_id=%s mode=%s", task_id, mode)
         _task_store.update_meta(
             task_id,
             {
@@ -16472,7 +16489,7 @@ def _run_expired_pix_payment_link_cleanup(task_id: str) -> None:
                 "cleanup_error": error_text,
             },
         )
-        _log(task_id, f"[FAIL] 过期 PIX 支付链接清理失败：{error_text}")
+        _log(task_id, f"[FAIL] {cleanup_label} PIX 支付链接清理失败：{error_text}")
         _task_store.finish(
             task_id,
             status="failed",
@@ -16488,9 +16505,11 @@ def _run_expired_pix_payment_link_cleanup(task_id: str) -> None:
 def enqueue_expired_pix_payment_link_cleanup_task(
     *,
     background_tasks: BackgroundTasks | None = None,
+    cleanup_mode: PixCleanupMode = PIX_CLEANUP_MODE_EXPIRED,
 ) -> dict[str, Any]:
     """Create or atomically reuse the current instance's active cleanup task."""
 
+    mode = normalize_pix_cleanup_mode(cleanup_mode)
     source = "pix_payment_link_cleanup"
     instance_id = str(os.getenv("APP_INSTANCE_ID") or "auto-gpt").strip() or "auto-gpt"
     with _PIX_PAYMENT_LINK_CLEANUP_TASK_LOCK:
@@ -16499,19 +16518,25 @@ def enqueue_expired_pix_payment_link_cleanup_task(
                 str(snapshot.get("source") or "").strip() == source
                 and str(snapshot.get("status") or "").strip().lower() in {"pending", "running"}
             ):
+                active_meta = snapshot.get("meta") if isinstance(snapshot.get("meta"), dict) else {}
+                active_mode = normalize_pix_cleanup_mode(active_meta.get("cleanup_mode"))
                 return {
                     "task_id": str(snapshot.get("id") or ""),
                     "source": source,
                     "instance_id": instance_id,
                     "already_running": True,
                     "reused": True,
+                    "cleanup_mode": active_mode,
+                    "requested_cleanup_mode": mode,
                 }
 
-        task_id = f"task_{int(time.time() * 1000)}_pix_cleanup"
+        task_id = f"task_{int(time.time() * 1000)}_pix_cleanup_{mode}"
         meta = {
             "source": source,
             "instance_id": instance_id,
-            "operation": "expired_pix_payment_link_cleanup",
+            "operation": f"{mode}_pix_payment_link_cleanup",
+            "cleanup_mode": mode,
+            "cleanup_label": PIX_CLEANUP_MODE_LABELS[mode],
             "cleanup_state": "queued",
         }
         _create_standalone_task_record(
@@ -16539,14 +16564,14 @@ def enqueue_expired_pix_payment_link_cleanup_task(
             if background_tasks is None:
                 thread = threading.Thread(
                     target=_run_expired_pix_payment_link_cleanup,
-                    args=(task_id,),
+                    args=(task_id, mode),
                     daemon=True,
                 )
                 thread.start()
             else:
-                background_tasks.add_task(_run_expired_pix_payment_link_cleanup, task_id)
+                background_tasks.add_task(_run_expired_pix_payment_link_cleanup, task_id, mode)
         except Exception as exc:
-            error_text = sanitize_error_message(exc)[:1600] or "过期 PIX 支付链接清理任务创建失败"
+            error_text = sanitize_error_message(exc)[:1600] or f"{PIX_CLEANUP_MODE_LABELS[mode]} PIX 支付链接清理任务创建失败"
             _task_store.finish(
                 task_id,
                 status="failed",
@@ -16563,34 +16588,40 @@ def enqueue_expired_pix_payment_link_cleanup_task(
         "instance_id": instance_id,
         "already_running": False,
         "reused": False,
+        "cleanup_mode": mode,
+        "requested_cleanup_mode": mode,
     }
 
 
 @router.post("/chatgpt/payment-links/pix-cleanup/task")
 def create_chatgpt_expired_pix_payment_link_cleanup_task(
     background_tasks: BackgroundTasks,
+    req: PixPaymentLinkCleanupRequest | None = None,
 ):
     """Start a logged cleanup task while preserving the synchronous legacy API."""
 
     return enqueue_expired_pix_payment_link_cleanup_task(
         background_tasks=background_tasks,
+        cleanup_mode=req.cleanup_mode if req is not None else PIX_CLEANUP_MODE_EXPIRED,
     )
 
 
 @router.post("/chatgpt/payment-links/pix-cleanup")
-def cleanup_chatgpt_expired_pix_payment_links():
-    """Clear expired current PIX links without touching history or CDKs."""
+def cleanup_chatgpt_expired_pix_payment_links(req: PixPaymentLinkCleanupRequest | None = None):
+    """Clear one current PIX-link category without touching history or CDKs."""
 
+    mode = normalize_pix_cleanup_mode(req.cleanup_mode if req is not None else PIX_CLEANUP_MODE_EXPIRED)
     try:
         with Session(engine) as session:
-            result = clean_expired_pix_payment_links(session)
+            result = clean_pix_payment_links(session, cleanup_mode=mode)
     except Exception as exc:
-        logger.exception("Expired PIX payment-link cleanup failed")
-        raise HTTPException(500, "过期 PIX 支付链接清理失败，请检查服务日志") from exc
+        logger.exception("PIX payment-link cleanup failed mode=%s", mode)
+        raise HTTPException(500, f"{PIX_CLEANUP_MODE_LABELS[mode]} PIX 支付链接清理失败，请检查服务日志") from exc
     logger.info(
-        "Expired PIX payment links cleaned instance=%s eligible=%s cleaned=%s skipped=%s backup=%s",
+        "PIX payment links cleaned instance=%s mode=%s eligible=%s cleaned=%s skipped=%s backup=%s",
         result.get("instance_id"),
-        result.get("expired_links"),
+        mode,
+        result.get("eligible_links"),
         result.get("cleaned_links"),
         result.get("concurrent_skipped_links"),
         result.get("backup_created"),

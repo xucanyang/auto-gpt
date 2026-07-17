@@ -4,7 +4,10 @@ import json
 from pathlib import Path
 import sqlite3
 
+import pytest
+
 from services.long_link_history_sync import synchronize_long_link_success_history
+from services.chatgpt_core.payment_link_cache import PIX_CLEANED_STATUSES
 
 
 def _create_source(path: Path, rows: list[dict]) -> None:
@@ -234,7 +237,8 @@ def test_existing_newer_current_link_is_not_overwritten_but_history_is_imported(
     assert json.loads(extra_json)["chatgpt_last_payment_link"]["url"] == "https://pay.example.test/current"
 
 
-def test_expired_cleanup_tombstone_blocks_old_history_from_restoring_current_url(tmp_path: Path):
+@pytest.mark.parametrize("cleaned_status", sorted(PIX_CLEANED_STATUSES))
+def test_pix_cleanup_tombstone_blocks_old_history_from_restoring_current_url(tmp_path: Path, cleaned_status: str):
     source = tmp_path / "tasks.db"
     target = tmp_path / "account_manager.db"
     completed_at = 1_700_000_000
@@ -251,7 +255,7 @@ def test_expired_cleanup_tombstone_blocks_old_history_from_restoring_current_url
                 "extra": {
                     "chatgpt_last_payment_link": {
                         "link_type": "pix",
-                        "link_status": "expired_cleaned",
+                        "link_status": cleaned_status,
                         "generated_at": "2023-11-14T22:13:20+00:00",
                         "pix_cleanup_through_at": "2023-11-15T03:00:00+00:00",
                         "cleaned_at": "2023-11-15T04:00:00+00:00",
@@ -276,7 +280,7 @@ def test_expired_cleanup_tombstone_blocks_old_history_from_restoring_current_url
         assert connection.execute("SELECT COUNT(*) FROM payment_link_generations").fetchone()[0] == 1
     assert cashier_url == ""
     marker = json.loads(extra_json)["chatgpt_last_payment_link"]
-    assert marker["link_status"] == "expired_cleaned"
+    assert marker["link_status"] == cleaned_status
     assert "url" not in marker
 
 

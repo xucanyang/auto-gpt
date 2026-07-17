@@ -1,4 +1,4 @@
-"""Preview and atomically clean expired current PIX payment links."""
+"""Preview and atomically clean terminal current PIX payment links."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import os
 from pathlib import Path
 import shutil
 import sqlite3
-from typing import Any
+from typing import Any, Literal, cast
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import text
@@ -17,8 +17,12 @@ from sqlmodel import Session
 
 from services.account_filters import upsert_account_list_state_for_account_ids
 from services.chatgpt_core.payment_link_cache import (
+    PIX_CANCELLED_CLEANED_STATUS,
+    PIX_CLEANED_STATUSES,
     PIX_EXPIRED_CLEANED_STATUS,
+    PIX_PAID_CLEANED_STATUS,
     normalize_payment_link_expires_at,
+    normalize_payment_link_status,
 )
 
 
@@ -40,6 +44,39 @@ _LINK_URL_FIELDS_TO_REMOVE = frozenset({
     "chatgpt_checkout_url",
 })
 _BACKUP_MIN_FREE_MARGIN_BYTES = 64 * 1024 * 1024
+PIX_CLEANUP_MODE_EXPIRED = "expired"
+PIX_CLEANUP_MODE_PAID = "paid"
+PIX_CLEANUP_MODE_CANCELLED = "cancelled"
+PIX_CLEANUP_MODES = frozenset({
+    PIX_CLEANUP_MODE_EXPIRED,
+    PIX_CLEANUP_MODE_PAID,
+    PIX_CLEANUP_MODE_CANCELLED,
+})
+PixCleanupMode = Literal["expired", "paid", "cancelled"]
+PIX_CLEANUP_MODE_LABELS: dict[str, str] = {
+    PIX_CLEANUP_MODE_EXPIRED: "过期",
+    PIX_CLEANUP_MODE_PAID: "已支付",
+    PIX_CLEANUP_MODE_CANCELLED: "支付已取消",
+}
+_PAID_LINK_STATUSES = frozenset({"paid", "already_paid"})
+_CANCELLED_LINK_STATUSES = frozenset({
+    "cancelled",
+    "canceled",
+    "payment_cancelled",
+    "payment_canceled",
+})
+_PAID_PAYMENT_STATUSES = frozenset({"paid", "success", "completed"})
+_CANCELLED_PAYMENT_STATUSES = frozenset({"cancelled", "canceled", "payment_cancelled", "payment_canceled"})
+_CLEANED_STATUS_BY_MODE = {
+    PIX_CLEANUP_MODE_EXPIRED: PIX_EXPIRED_CLEANED_STATUS,
+    PIX_CLEANUP_MODE_PAID: PIX_PAID_CLEANED_STATUS,
+    PIX_CLEANUP_MODE_CANCELLED: PIX_CANCELLED_CLEANED_STATUS,
+}
+_CLEANED_REASON_BY_MODE = {
+    PIX_CLEANUP_MODE_EXPIRED: "PIX payment link expired and was cleared",
+    PIX_CLEANUP_MODE_PAID: "PIX payment link was paid and cleared",
+    PIX_CLEANUP_MODE_CANCELLED: "PIX payment was cancelled and the link was cleared",
+}
 
 
 @dataclass(frozen=True)
@@ -48,9 +85,18 @@ class PixLinkCandidate:
     cashier_url: str
     current_url: str
     payload: dict[str, Any]
+    payment_marker: dict[str, Any]
+    link_status: str
     generated_at: datetime | None
     expires_at: datetime | None
     expiry_source: str
+
+
+def normalize_pix_cleanup_mode(value: Any) -> PixCleanupMode:
+    mode = str(value or PIX_CLEANUP_MODE_EXPIRED).strip().lower()
+    if mode not in PIX_CLEANUP_MODES:
+        raise ValueError(f"Unsupported PIX cleanup mode: {mode}")
+    return cast(PixCleanupMode, mode)
 
 
 def _utc_datetime(value: Any) -> datetime | None:
@@ -145,7 +191,8 @@ def _load_current_pix_link_candidates(session: Session) -> list[PixLinkCandidate
             SELECT
                 id,
                 cashier_url,
-                json_extract(extra, '$.chatgpt_last_payment_link') AS link_json
+                json_extract(extra, '$.chatgpt_last_payment_link') AS link_json,
+                json_extract(extra, '$.baxigpt_cdk') AS payment_json
             FROM account_json
             WHERE json_type(extra, '$.chatgpt_last_payment_link') = 'object'
               AND (
@@ -163,6 +210,12 @@ def _load_current_pix_link_candidates(session: Session) -> list[PixLinkCandidate
             continue
         if not isinstance(payload, dict):
             continue
+        try:
+            payment_marker = json.loads(str(row.get("payment_json") or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payment_marker = {}
+        if not isinstance(payment_marker, dict):
+            payment_marker = {}
         current_url = _current_payment_link_url(payload)
         if not current_url:
             continue
@@ -174,6 +227,8 @@ def _load_current_pix_link_candidates(session: Session) -> list[PixLinkCandidate
                 cashier_url=str(row.get("cashier_url") or "").strip(),
                 current_url=current_url,
                 payload=payload,
+                payment_marker=payment_marker,
+                link_status=normalize_payment_link_status(payload.get("link_status")),
                 generated_at=generated_at,
                 expires_at=expires_at,
                 expiry_source=expiry_source,
@@ -182,10 +237,84 @@ def _load_current_pix_link_candidates(session: Session) -> list[PixLinkCandidate
     return candidates
 
 
-def _base_report(candidates: list[PixLinkCandidate], *, now: datetime) -> tuple[dict[str, Any], list[PixLinkCandidate]]:
+def _payment_marker_timestamp(marker: dict[str, Any]) -> datetime | None:
+    values = [
+        _utc_datetime(marker.get(key))
+        for key in ("last_checked_at", "paid_at", "failed_at", "submitted_at")
+    ]
+    valid = [value for value in values if value is not None]
+    return max(valid) if valid else None
+
+
+def _marker_applies_to_current_user_link(candidate: PixLinkCandidate) -> bool:
+    marker = candidate.payment_marker
+    if str(marker.get("payment_channel") or "").strip().lower() != "pix":
+        return False
+    if str(marker.get("pix_submit_mode") or "").strip().lower() != "user_link":
+        return False
+    marker_at = _payment_marker_timestamp(marker)
+    if candidate.generated_at is not None and marker_at is not None and candidate.generated_at > marker_at:
+        return False
+    return marker_at is not None or candidate.link_status == "pix_submitted"
+
+
+def _is_paid_candidate(candidate: PixLinkCandidate) -> bool:
+    if candidate.link_status in _PAID_LINK_STATUSES:
+        return True
+    marker_status = normalize_payment_link_status(candidate.payment_marker.get("status"))
+    return (
+        candidate.link_status == "pix_submitted"
+        and marker_status in _PAID_PAYMENT_STATUSES
+        and _marker_applies_to_current_user_link(candidate)
+    )
+
+
+def _payment_cancelled_evidence(marker: dict[str, Any]) -> bool:
+    status = normalize_payment_link_status(marker.get("upstream_status") or marker.get("status"))
+    if status in _CANCELLED_PAYMENT_STATUSES:
+        return True
+    text = " ".join(
+        str(marker.get(key) or "").strip().lower()
+        for key in ("last_error_message", "error_code", "failure_status", "message")
+    )
+    return any(token in text for token in (
+        "支付已取消",
+        "payment cancelled",
+        "payment canceled",
+        "payment_cancelled",
+        "payment_canceled",
+    ))
+
+
+def _is_cancelled_candidate(candidate: PixLinkCandidate) -> bool:
+    if candidate.link_status in _CANCELLED_LINK_STATUSES:
+        return True
+    marker_status = normalize_payment_link_status(candidate.payment_marker.get("status"))
+    return (
+        marker_status in ({"failed"} | _CANCELLED_PAYMENT_STATUSES)
+        and _marker_applies_to_current_user_link(candidate)
+        and _payment_cancelled_evidence(candidate.payment_marker)
+    )
+
+
+def _base_report(
+    candidates: list[PixLinkCandidate],
+    *,
+    now: datetime,
+    cleanup_mode: PixCleanupMode = PIX_CLEANUP_MODE_EXPIRED,
+) -> tuple[dict[str, Any], list[PixLinkCandidate]]:
+    mode = normalize_pix_cleanup_mode(cleanup_mode)
     now_utc = _utc_datetime(now) or datetime.now(timezone.utc)
     cutoff_utc = latest_pix_expiry_cutoff(now_utc)
     expired = [item for item in candidates if item.expires_at is not None and item.expires_at <= now_utc]
+    paid = [item for item in candidates if _is_paid_candidate(item)]
+    cancelled = [item for item in candidates if _is_cancelled_candidate(item)]
+    eligible_by_mode = {
+        PIX_CLEANUP_MODE_EXPIRED: expired,
+        PIX_CLEANUP_MODE_PAID: paid,
+        PIX_CLEANUP_MODE_CANCELLED: cancelled,
+    }
+    eligible = eligible_by_mode[mode]
     missing = [item for item in candidates if item.expires_at is None]
     provider_count = sum(item.expiry_source == "provider" for item in candidates)
     derived_count = sum(item.expiry_source == "beijing_11" for item in candidates)
@@ -197,14 +326,20 @@ def _base_report(candidates: list[PixLinkCandidate], *, now: datetime) -> tuple[
         "cutoff_at": cutoff_utc.isoformat(),
         "cutoff_at_beijing": cutoff_beijing.isoformat(),
         "cutoff_display": cutoff_beijing.strftime("%Y-%m-%d %H:%M"),
+        "cleanup_mode": mode,
+        "cleanup_label": PIX_CLEANUP_MODE_LABELS[mode],
         "current_pix_links": len(candidates),
         "expired_links": len(expired),
+        "paid_links": len(paid),
+        "cancelled_links": len(cancelled),
+        "eligible_links": len(eligible),
+        "retained_links": len(candidates) - len(eligible),
         "active_links": len(candidates) - len(expired) - len(missing),
         "provider_expiry_links": provider_count,
         "derived_expiry_links": derived_count,
         "missing_expiry_links": len(missing),
     }
-    return report, expired
+    return report, eligible
 
 
 def _assert_integrity(connection: sqlite3.Connection, *, label: str) -> None:
@@ -284,32 +419,58 @@ def preview_expired_pix_payment_links(
     return report
 
 
-def _cleaned_link_payload(candidate: PixLinkCandidate, *, cleaned_at: datetime) -> dict[str, Any]:
+def preview_pix_payment_link_cleanup(
+    session: Session,
+    *,
+    cleanup_mode: PixCleanupMode = PIX_CLEANUP_MODE_EXPIRED,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    now_utc = _utc_datetime(now or datetime.now(timezone.utc)) or datetime.now(timezone.utc)
+    report, _ = _base_report(
+        _load_current_pix_link_candidates(session),
+        now=now_utc,
+        cleanup_mode=cleanup_mode,
+    )
+    return report
+
+
+def _cleaned_link_payload(
+    candidate: PixLinkCandidate,
+    *,
+    cleaned_at: datetime,
+    cleanup_mode: PixCleanupMode,
+) -> dict[str, Any]:
+    mode = normalize_pix_cleanup_mode(cleanup_mode)
     payload = {
         key: value
         for key, value in candidate.payload.items()
         if key not in _LINK_URL_FIELDS_TO_REMOVE
     }
     previous_status = str(candidate.payload.get("link_status") or "").strip()
-    if previous_status and previous_status != PIX_EXPIRED_CLEANED_STATUS:
+    if previous_status and previous_status not in PIX_CLEANED_STATUSES:
         payload["previous_link_status"] = previous_status
-    cutoff_at = latest_pix_expiry_cutoff(cleaned_at)
-    cleanup_through_at = max(
-        value
-        for value in (cutoff_at, candidate.generated_at)
-        if value is not None
-    )
+    if mode == PIX_CLEANUP_MODE_EXPIRED:
+        cutoff_at = latest_pix_expiry_cutoff(cleaned_at)
+        cleanup_through_at = max(
+            value
+            for value in (cutoff_at, candidate.generated_at)
+            if value is not None
+        )
+    else:
+        cleanup_through_at = cleaned_at
     payload.update(
         {
-            "link_status": PIX_EXPIRED_CLEANED_STATUS,
-            "link_status_reason": "PIX payment link expired and was cleared",
+            "link_status": _CLEANED_STATUS_BY_MODE[mode],
+            "link_status_reason": _CLEANED_REASON_BY_MODE[mode],
             "link_status_updated_at": cleaned_at.isoformat(),
-            "expired_at": candidate.expires_at.isoformat() if candidate.expires_at is not None else "",
             "cleaned_at": cleaned_at.isoformat(),
             "pix_cleanup_through_at": cleanup_through_at.isoformat(),
+            "pix_cleanup_mode": mode,
             "link_expiry_source": candidate.expiry_source,
         }
     )
+    if mode == PIX_CLEANUP_MODE_EXPIRED:
+        payload["expired_at"] = candidate.expires_at.isoformat() if candidate.expires_at is not None else ""
     if candidate.expires_at is not None:
         payload["link_expires_at"] = int(candidate.expires_at.timestamp())
     return payload
@@ -321,11 +482,30 @@ def clean_expired_pix_payment_links(
     now: datetime | None = None,
 ) -> dict[str, Any]:
     """Clean expired current links and their exact cashier mirror in one transaction."""
+    return clean_pix_payment_links(
+        session,
+        cleanup_mode=PIX_CLEANUP_MODE_EXPIRED,
+        now=now,
+    )
 
+
+def clean_pix_payment_links(
+    session: Session,
+    *,
+    cleanup_mode: PixCleanupMode = PIX_CLEANUP_MODE_EXPIRED,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Clean one explicit PIX link category without touching payment history."""
+
+    mode = normalize_pix_cleanup_mode(cleanup_mode)
     now_utc = _utc_datetime(now or datetime.now(timezone.utc)) or datetime.now(timezone.utc)
-    initial_report, initial_expired = _base_report(_load_current_pix_link_candidates(session), now=now_utc)
+    initial_report, initial_eligible = _base_report(
+        _load_current_pix_link_candidates(session),
+        now=now_utc,
+        cleanup_mode=mode,
+    )
     session.rollback()
-    if not initial_expired:
+    if not initial_eligible:
         initial_report.update(
             {
                 "cleaned_links": 0,
@@ -339,11 +519,15 @@ def clean_expired_pix_payment_links(
     backup_path = _create_verified_backup(session, now=now_utc)
     try:
         session.exec(text("BEGIN IMMEDIATE"))
-        report, expired = _base_report(_load_current_pix_link_candidates(session), now=now_utc)
+        report, eligible = _base_report(
+            _load_current_pix_link_candidates(session),
+            now=now_utc,
+            cleanup_mode=mode,
+        )
         cleaned_ids: list[int] = []
-        for candidate in expired:
+        for candidate in eligible:
             marker_json = json.dumps(
-                _cleaned_link_payload(candidate, cleaned_at=now_utc),
+                _cleaned_link_payload(candidate, cleaned_at=now_utc, cleanup_mode=mode),
                 ensure_ascii=False,
                 separators=(",", ":"),
             )
@@ -402,7 +586,7 @@ def clean_expired_pix_payment_links(
     report.update(
         {
             "cleaned_links": len(cleaned_ids),
-            "concurrent_skipped_links": len(expired) - len(cleaned_ids),
+            "concurrent_skipped_links": len(eligible) - len(cleaned_ids),
             "list_state_refreshed": list_state_refreshed,
             "backup_created": bool(backup_path),
         }

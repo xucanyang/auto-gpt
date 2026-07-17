@@ -46,9 +46,10 @@ def cleanup_task_runtime(monkeypatch: pytest.MonkeyPatch, tmp_path):
     return store, engine
 
 
-def _enqueue(background_tasks: RecordingBackgroundTasks) -> str:
+def _enqueue(background_tasks: RecordingBackgroundTasks, cleanup_mode: str = "expired") -> str:
     response = tasks.enqueue_expired_pix_payment_link_cleanup_task(
         background_tasks=background_tasks,
+        cleanup_mode=cleanup_mode,
     )
     task_id = str(response.get("task_id") or "").strip()
     assert task_id
@@ -70,8 +71,14 @@ def _success_report() -> dict[str, Any]:
         "timezone": "Asia/Shanghai",
         "cutoff_display": "2026-07-16 11:00",
         "current_pix_links": 6,
+        "cleanup_mode": "expired",
+        "cleanup_label": "过期",
         "active_links": 2,
         "expired_links": 3,
+        "paid_links": 0,
+        "cancelled_links": 0,
+        "eligible_links": 3,
+        "retained_links": 3,
         "missing_expiry_links": 1,
         "provider_expiry_links": 2,
         "derived_expiry_links": 3,
@@ -103,14 +110,14 @@ def test_enqueue_pix_cleanup_returns_immediately_and_creates_task(
     def must_not_clean_in_request(*_args: Any, **_kwargs: Any) -> None:
         pytest.fail("cleanup ran in the request instead of the queued runner")
 
-    monkeypatch.setattr(tasks, "clean_expired_pix_payment_links", must_not_clean_in_request)
+    monkeypatch.setattr(tasks, "clean_pix_payment_links", must_not_clean_in_request)
 
     task_id = _enqueue(background_tasks)
 
     assert len(background_tasks.calls) == 1
     runner, args, kwargs = background_tasks.calls[0]
     assert runner is tasks._run_expired_pix_payment_link_cleanup
-    assert args == (task_id,)
+    assert args == (task_id, "expired")
     assert kwargs == {}
 
     snapshot = store.snapshot(task_id)
@@ -153,6 +160,29 @@ def test_enqueue_pix_cleanup_reuses_the_active_task_without_queueing_twice(
     assert len(rows) == 1
 
 
+def test_enqueue_pix_cleanup_freezes_requested_terminal_mode(cleanup_task_runtime):
+    store, _engine = cleanup_task_runtime
+    background_tasks = RecordingBackgroundTasks()
+
+    response = tasks.enqueue_expired_pix_payment_link_cleanup_task(
+        background_tasks=background_tasks,
+        cleanup_mode="paid",
+    )
+
+    task_id = str(response["task_id"])
+    assert response["cleanup_mode"] == "paid"
+    assert response["requested_cleanup_mode"] == "paid"
+    assert len(background_tasks.calls) == 1
+    runner, args, kwargs = background_tasks.calls[0]
+    assert runner is tasks._run_expired_pix_payment_link_cleanup
+    assert args == (task_id, "paid")
+    assert kwargs == {}
+    snapshot = store.snapshot(task_id)
+    assert snapshot["meta"]["cleanup_mode"] == "paid"
+    assert snapshot["meta"]["cleanup_label"] == "已支付"
+    assert snapshot["meta"]["operation"] == "paid_pix_payment_link_cleanup"
+
+
 def test_pix_cleanup_runner_persists_success_and_keeps_summary_last(
     cleanup_task_runtime,
     monkeypatch: pytest.MonkeyPatch,
@@ -164,8 +194,8 @@ def test_pix_cleanup_runner_persists_success_and_keeps_summary_last(
 
     monkeypatch.setattr(
         tasks,
-        "preview_expired_pix_payment_links",
-        lambda _session: {
+        "preview_pix_payment_link_cleanup",
+        lambda _session, *, cleanup_mode: {
             key: value
             for key, value in report.items()
             if key
@@ -179,8 +209,8 @@ def test_pix_cleanup_runner_persists_success_and_keeps_summary_last(
     )
     monkeypatch.setattr(
         tasks,
-        "clean_expired_pix_payment_links",
-        lambda _session: dict(report),
+        "clean_pix_payment_links",
+        lambda _session, *, cleanup_mode: dict(report),
     )
 
     background_tasks.run_one()
@@ -213,8 +243,14 @@ def test_pix_cleanup_runner_zero_expired_is_success_with_summary(
         "timezone": "Asia/Shanghai",
         "cutoff_display": "2026-07-16 11:00",
         "current_pix_links": 3,
+        "cleanup_mode": "expired",
+        "cleanup_label": "过期",
         "active_links": 2,
         "expired_links": 0,
+        "paid_links": 0,
+        "cancelled_links": 0,
+        "eligible_links": 0,
+        "retained_links": 3,
         "missing_expiry_links": 1,
         "provider_expiry_links": 1,
         "derived_expiry_links": 1,
@@ -223,8 +259,8 @@ def test_pix_cleanup_runner_zero_expired_is_success_with_summary(
         "list_state_refreshed": 0,
         "backup_created": False,
     }
-    monkeypatch.setattr(tasks, "preview_expired_pix_payment_links", lambda _session: dict(report))
-    monkeypatch.setattr(tasks, "clean_expired_pix_payment_links", lambda _session: dict(report))
+    monkeypatch.setattr(tasks, "preview_pix_payment_link_cleanup", lambda _session, *, cleanup_mode: dict(report))
+    monkeypatch.setattr(tasks, "clean_pix_payment_links", lambda _session, *, cleanup_mode: dict(report))
 
     background_tasks.run_one()
 
@@ -256,12 +292,12 @@ def test_pix_cleanup_runner_failure_is_terminal_and_fail_log_is_last(
             "backup_created",
         }
     }
-    monkeypatch.setattr(tasks, "preview_expired_pix_payment_links", lambda _session: dict(preview))
+    monkeypatch.setattr(tasks, "preview_pix_payment_link_cleanup", lambda _session, *, cleanup_mode: dict(preview))
 
-    def fail_cleanup(_session):
+    def fail_cleanup(_session, *, cleanup_mode):
         raise RuntimeError("verified backup failed")
 
-    monkeypatch.setattr(tasks, "clean_expired_pix_payment_links", fail_cleanup)
+    monkeypatch.setattr(tasks, "clean_pix_payment_links", fail_cleanup)
 
     background_tasks.run_one()
 

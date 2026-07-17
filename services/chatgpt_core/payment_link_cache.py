@@ -19,6 +19,13 @@ from services.chatgpt_core.payment import (
 )
 
 PIX_EXPIRED_CLEANED_STATUS = "expired_cleaned"
+PIX_PAID_CLEANED_STATUS = "paid_cleaned"
+PIX_CANCELLED_CLEANED_STATUS = "cancelled_cleaned"
+PIX_CLEANED_STATUSES = frozenset({
+    PIX_EXPIRED_CLEANED_STATUS,
+    PIX_PAID_CLEANED_STATUS,
+    PIX_CANCELLED_CLEANED_STATUS,
+})
 
 PAYMENT_LINK_STATUS_LABELS = {
     "invalid": "无效",
@@ -28,6 +35,8 @@ PAYMENT_LINK_STATUS_LABELS = {
     "precheck_failed": "支付链接核验失败",
     "pix_submitted": "已提交 PIX 管理端",
     PIX_EXPIRED_CLEANED_STATUS: "已过期清理",
+    PIX_PAID_CLEANED_STATUS: "已支付清理",
+    PIX_CANCELLED_CLEANED_STATUS: "支付已取消清理",
 }
 PAYMENT_LINK_REGENERATE_STATUSES = {
     "invalid",
@@ -37,7 +46,7 @@ PAYMENT_LINK_REGENERATE_STATUSES = {
     # A Stripe PIX instruction link is single-use from the management
     # service's perspective, even while its QR deadline has not elapsed.
     "pix_submitted",
-    PIX_EXPIRED_CLEANED_STATUS,
+    *PIX_CLEANED_STATUSES,
 }
 PAYMENT_LINK_STATUS_SYNC_STATUSES = {"already_paid"}
 PAYMENT_LINK_FORMAT_PAYPAL = "paypal_url"
