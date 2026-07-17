@@ -168,6 +168,22 @@ bad-line
         self.assertEqual(saved.api_expired_date, "2026-08-05 21:00:59")
         self.assertEqual(saved.api_expiry_status, "ok")
 
+    def test_refresh_api_expiry_accepts_attsms_plain_text_expiry(self):
+        repo = PhonePoolRepository()
+        rec = repo.add(phone="+17632736440", api_url="https://attsms.com/1Y6IbGuv")
+
+        with patch.object(repo_module.requests, "get") as mock_get:
+            mock_get.return_value.status_code = 200
+            mock_get.return_value.text = "【OpenAI/ChatGPT】暂无短信，到期时间：2026-7-31 13:04"
+            mock_get.return_value.json.side_effect = ValueError("not json")
+            result = repo.refresh_api_expiry_for_ids([rec.id])
+
+        self.assertEqual(result["summary"]["checked"], 1)
+        self.assertEqual(result["summary"]["success"], 1)
+        saved = repo.get("+17632736440")
+        self.assertEqual(saved.api_expired_date, "2026-7-31 13:04")
+        self.assertEqual(saved.api_expiry_status, "ok")
+
     def test_refresh_api_expiry_records_missing_or_error_once(self):
         repo = PhonePoolRepository()
         rec = repo.add(phone="+15551230002", api_url="https://relay.example.com/b")

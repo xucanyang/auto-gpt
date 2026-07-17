@@ -543,6 +543,12 @@ _UPLOADED_SMS_CODE_CONTEXT_RE = re.compile(
     r"[^0-9]{0,40}(\d{4,6})(?!\d)",
     re.I,
 )
+_UPLOADED_SMS_EXPIRY_RE = re.compile(
+    r"(?:到期时间|到期|有效期至|expired?\s*(?:date|time)?|expire(?:s|d)?(?:[_\s-]*(?:date|time))?|"
+    r"expires?[_\s-]*at)\s*[:：=]?\s*"
+    r"(\d{4}[-/]\d{1,2}[-/]\d{1,2}(?:[ T]\d{1,2}:\d{2}(?::\d{2})?)?)",
+    re.I,
+)
 
 
 def _normalize_uploaded_phone(raw_phone: Any) -> str:
@@ -633,6 +639,20 @@ def _extract_uploaded_sms_code(value: Any, *, require_context: bool = False) -> 
     return ""
 
 
+def _extract_uploaded_sms_expiry(value: Any) -> str:
+    """Extract provider expiry metadata from plain-text responses.
+
+    Some providers (including attsms.com) return a human-readable line such
+    as ``暂无短信，到期时间：2026-7-31 13:04`` instead of JSON.
+    """
+    match = _UPLOADED_SMS_EXPIRY_RE.search(str(value or ""))
+    return str(match.group(1) or "").strip() if match else ""
+
+
+def _remove_uploaded_sms_expiry(value: Any) -> str:
+    return _UPLOADED_SMS_EXPIRY_RE.sub(" ", str(value or ""))
+
+
 def _safe_response_text(resp: Any) -> str:
     text = getattr(resp, "text", "")
     if isinstance(text, str):
@@ -662,6 +682,7 @@ def _parse_uploaded_sms_api_result(
     """Normalize uploaded phone API responses into code/pending/error semantics."""
 
     safe_text = str(text or "").strip()
+    text_expired_date = _extract_uploaded_sms_expiry(safe_text)
     data = payload.get("data") if isinstance(payload, dict) and isinstance(payload.get("data"), dict) else {}
     message = ""
     expired_date = ""
@@ -679,7 +700,7 @@ def _parse_uploaded_sms_api_result(
             or payload.get("expire_time")
             or data.get("expireTime")
             or payload.get("expireTime")
-            or ""
+            or text_expired_date
         ).strip()
         code_time = str(data.get("code_time") or payload.get("code_time") or payload.get("received_at") or "").strip()
         raw_code = (
@@ -700,15 +721,18 @@ def _parse_uploaded_sms_api_result(
         top_level_code = payload.get("code")
         if not raw_code and isinstance(top_level_code, bool):
             if top_level_code is True:
-                maybe_code = _extract_uploaded_sms_code(message)
+                maybe_code = _extract_uploaded_sms_code(_remove_uploaded_sms_expiry(message))
                 if maybe_code:
                     raw_code = message
         elif not raw_code and str(top_level_code or "").strip().lower() not in {"", "0", "false", "none", "null"}:
-            maybe_code = _extract_uploaded_sms_code(top_level_code)
+            maybe_code = _extract_uploaded_sms_code(_remove_uploaded_sms_expiry(top_level_code))
             if maybe_code:
                 raw_code = top_level_code
         if not raw_code and message:
-            maybe_code = _extract_uploaded_sms_code(message, require_context=True)
+            maybe_code = _extract_uploaded_sms_code(
+                _remove_uploaded_sms_expiry(message),
+                require_context=True,
+            )
             if maybe_code:
                 raw_code = message
         code = _extract_uploaded_sms_code(raw_code)
@@ -767,7 +791,7 @@ def _parse_uploaded_sms_api_result(
             "code": "",
             "raw_code": "",
             "code_time": "",
-            "expired_date": "",
+            "expired_date": text_expired_date,
             "message": safe_text.split("|", 1)[1].strip() or "暂无短信",
             "parser": "plain_yes_no",
             "payload": {},
@@ -775,27 +799,30 @@ def _parse_uploaded_sms_api_result(
         }
     if upper_text.startswith("YES|"):
         body = safe_text.split("|", 1)[1].strip()
-        code = _extract_uploaded_sms_code(body)
+        code = _extract_uploaded_sms_code(_remove_uploaded_sms_expiry(body))
         return {
             "status": "code" if code else "error",
             "code": code,
             "raw_code": body,
             "code_time": "",
-            "expired_date": "",
+            "expired_date": text_expired_date,
             "message": body if code else "YES 响应中未提取到 4-6 位验证码",
             "parser": "plain_yes_no",
             "payload": {},
             "raw_excerpt": _safe_response_snippet(safe_text, 240),
         }
 
-    code = _extract_uploaded_sms_code(safe_text, require_context=True)
+    code = _extract_uploaded_sms_code(
+        _remove_uploaded_sms_expiry(safe_text),
+        require_context=True,
+    )
     if code:
         return {
             "status": "code",
             "code": code,
             "raw_code": safe_text,
             "code_time": "",
-            "expired_date": "",
+            "expired_date": text_expired_date,
             "message": safe_text,
             "parser": "generic_text",
             "payload": {},
@@ -807,7 +834,7 @@ def _parse_uploaded_sms_api_result(
             "code": "",
             "raw_code": "",
             "code_time": "",
-            "expired_date": "",
+            "expired_date": text_expired_date,
             "message": safe_text or "暂无短信",
             "parser": "generic_text",
             "payload": {},
@@ -819,7 +846,7 @@ def _parse_uploaded_sms_api_result(
             "code": "",
             "raw_code": safe_text,
             "code_time": "",
-            "expired_date": "",
+            "expired_date": text_expired_date,
             "message": safe_text or f"HTTP {status_code}",
             "parser": "generic_text",
             "payload": {},
@@ -830,7 +857,7 @@ def _parse_uploaded_sms_api_result(
         "code": "",
         "raw_code": "",
         "code_time": "",
-        "expired_date": "",
+        "expired_date": text_expired_date,
         "message": safe_text or "No verification code",
         "parser": "generic_text",
         "payload": {},

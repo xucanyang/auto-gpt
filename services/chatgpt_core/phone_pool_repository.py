@@ -64,6 +64,12 @@ _PHONE_SIGNUP_PREFIX_LIMIT_MARKERS = (
 )
 
 _PHONE_POOL_API_URL_RE = re.compile(r"https?://[^\s'\"<>]+", re.I)
+_PHONE_POOL_TEXT_EXPIRY_RE = re.compile(
+    r"(?:到期时间|到期|有效期至|expired?\s*(?:date|time)?|expire(?:s|d)?(?:[_\s-]*(?:date|time))?|"
+    r"expires?[_\s-]*at)\s*[:：=]?\s*"
+    r"(\d{4}[-/]\d{1,2}[-/]\d{1,2}(?:[ T]\d{1,2}:\d{2}(?::\d{2})?)?)",
+    re.I,
+)
 
 
 def _utcnow() -> datetime:
@@ -275,6 +281,11 @@ def _extract_expired_date_from_payload(payload: Any) -> str:
     return ""
 
 
+def _extract_expired_date_from_text(value: Any) -> str:
+    match = _PHONE_POOL_TEXT_EXPIRY_RE.search(str(value or ""))
+    return str(match.group(1) or "").strip() if match else ""
+
+
 def probe_phone_api_expiry(api_url: str, *, timeout: float = 12.0) -> dict[str, Any]:
     """一次性探测收码 API 的固定到期时间。"""
     url = str(api_url or "").strip()
@@ -295,16 +306,11 @@ def probe_phone_api_expiry(api_url: str, *, timeout: float = 12.0) -> dict[str, 
             "expired_date": "",
             "error": f"请求失败: {exc}",
         }
-    try:
-        payload = resp.json()
-    except Exception:
-        return {
-            "ok": False,
-            "status": API_EXPIRY_STATUS_ERROR,
-            "expired_date": "",
-            "error": f"响应不是 JSON: {resp.text[:160]}",
-        }
     if resp.status_code >= 400:
+        try:
+            payload = resp.json()
+        except Exception:
+            payload = {}
         message = ""
         if isinstance(payload, dict):
             message = str(payload.get("msg") or payload.get("message") or payload.get("error") or "").strip()
@@ -314,13 +320,19 @@ def probe_phone_api_expiry(api_url: str, *, timeout: float = 12.0) -> dict[str, 
             "expired_date": "",
             "error": message or f"HTTP {resp.status_code}",
         }
+    try:
+        payload = resp.json()
+    except Exception:
+        payload = None
     expired_date = _extract_expired_date_from_payload(payload)
+    if not expired_date:
+        expired_date = _extract_expired_date_from_text(getattr(resp, "text", ""))
     if not expired_date:
         return {
             "ok": False,
             "status": API_EXPIRY_STATUS_MISSING,
             "expired_date": "",
-            "error": "API 响应未包含 expired_date/expireTime",
+            "error": "API 响应未包含 expired_date/expireTime/到期时间",
         }
     return {
         "ok": True,

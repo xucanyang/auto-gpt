@@ -440,6 +440,32 @@ class UploadedPhoneServiceTests(unittest.TestCase):
         self.assertEqual(service.last_api_parser, "json_status")
         self.assertTrue(service.last_code_was_extracted)
 
+    def test_uploaded_phone_service_supports_attsms_plain_text_pending_and_expiry(self):
+        entries, errors = parse_uploaded_phone_lines(
+            "17632736440----https://attsms.com/1Y6IbGuv"
+        )
+        self.assertFalse(errors)
+        service = UploadedPhoneService(entries, {"uploaded_phone_poll_interval_seconds": "1"})
+        service.bind_entry(entries[0])
+
+        first = mock.Mock(
+            status_code=200,
+            text="【OpenAI/ChatGPT】暂无短信，到期时间：2026-7-31 13:04",
+        )
+        first.json.side_effect = ValueError("not json")
+        second = mock.Mock(
+            status_code=200,
+            text="【OpenAI/ChatGPT】验证码：421804，到期时间：2026-7-31 13:04",
+        )
+        second.json.side_effect = ValueError("not json")
+
+        with mock.patch("services.chatgpt_core.phone_service.requests.get", side_effect=[first, second]):
+            with mock.patch("services.chatgpt_core.phone_service.time.sleep"):
+                self.assertEqual(service.wait_for_code(entries[0], timeout=10), "421804")
+        self.assertEqual(service.last_expired_date, "2026-7-31 13:04")
+        self.assertEqual(service.last_api_parser, "generic_text")
+        self.assertTrue(service.last_code_was_extracted)
+
     def test_uploaded_phone_service_extracts_six_digit_code_from_sms_text(self):
         entries, errors = parse_uploaded_phone_lines(
             "+13434832954----https://api.sms8.net/api/record?token=one"

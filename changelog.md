@@ -4,6 +4,15 @@
 
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，并且本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/) (语义化版本)。
 
+## [Unreleased] (未发布)
+
+### 优化 (Changed)
+- **扩展 attsms 手机绑定收码格式**：`services/chatgpt_core/phone_service.py` 现在支持解析 `attsms.com` 这类纯文本响应，例如 `【OpenAI/ChatGPT】暂无短信，到期时间：2026-7-31 13:04`。轮询阶段继续将“暂无短信”视为等待，并记录纯文本到期时间；收到带“验证码”的后续响应时可直接提取验证码完成手机号绑定。
+- **手机号池到期探测兼容纯文本 API**：`services/chatgpt_core/phone_pool_repository.py` 的有效期探测不再强制要求 JSON，能够从纯文本 `到期时间` 字段写入 `api_expired_date`，避免 attsms 号码导入后被误标为探测失败。
+
+### 测试 (Tests)
+- 新增 attsms 纯文本轮询和手机号池有效期探测回归用例，覆盖“暂无短信”等待、验证码提取、`2026-7-31 13:04` 到期时间保存及非 JSON 响应。
+
 ## [2.3.2] - 2026-07-17
 
 ### 修复 (Fixed)
@@ -1864,4 +1873,8 @@
 
 ## 2026-07-17 10:02:16 +0800
 - 修复 v2.3.2：让 nginx 查询令牌脱敏校验可重复执行
+- 发布模式: multi
+
+## 2026-07-17 21:23:32 +0800
+- 支持 attsms 纯文本手机号绑定收码与到期时间解析
 - 发布模式: multi
