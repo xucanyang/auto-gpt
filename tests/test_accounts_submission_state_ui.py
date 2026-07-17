@@ -17,7 +17,9 @@ def test_accounts_uses_canonical_submission_filters_and_keeps_legacy_reads_compa
     assert "{ value: 'idea_submit_status', text: '提交状态'" in page
     assert "const SUBMISSION_STATE_FILTER_OPTIONS" in page
     assert "const HAS_SUBMITTED_FILTER_OPTIONS" in page
-    assert 'placeholder="是否已提交"' in page
+    assert 'placeholder="提交记录"' in page
+    assert "{ value: 'true', text: '有提交记录' }" in page
+    assert "{ value: 'false', text: '无提交记录' }" in page
     assert "submit_state: columnFilters.submitState.join(',')" in page
     assert "has_submitted: columnFilters.hasSubmitted.join(',')" in page
 

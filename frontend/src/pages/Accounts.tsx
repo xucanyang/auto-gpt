@@ -586,8 +586,8 @@ const SUBMISSION_STATE_FILTER_OPTIONS = [
 ]
 
 const HAS_SUBMITTED_FILTER_OPTIONS = [
-  { value: 'true', text: '已提交' },
-  { value: 'false', text: '未提交' },
+  { value: 'true', text: '有提交记录' },
+  { value: 'false', text: '无提交记录' },
 ]
 
 const IDEA_SUBMIT_FILTER_VALUE_ALIASES: Record<string, string> = {
@@ -798,7 +798,7 @@ export function buildAccountFilterPresetSummary(filters?: AccountFilterPresetFil
     summarizePresetValues(SUB2API_FILTER_OPTIONS, columnFilters.sub2apiState) ? `Sub2API：${summarizePresetValues(SUB2API_FILTER_OPTIONS, columnFilters.sub2apiState)}` : '',
     summarizePresetValues(OAIPAY_FILTER_OPTIONS, columnFilters.oaipayState) ? `OAIPay：${summarizePresetValues(OAIPAY_FILTER_OPTIONS, columnFilters.oaipayState)}` : '',
     summarizePresetValues(SUBMISSION_STATE_FILTER_OPTIONS, columnFilters.submitState) ? `提交状态：${summarizePresetValues(SUBMISSION_STATE_FILTER_OPTIONS, columnFilters.submitState)}` : '',
-    summarizePresetValues(HAS_SUBMITTED_FILTER_OPTIONS, columnFilters.hasSubmitted) ? `已提交：${summarizePresetValues(HAS_SUBMITTED_FILTER_OPTIONS, columnFilters.hasSubmitted)}` : '',
+    summarizePresetValues(HAS_SUBMITTED_FILTER_OPTIONS, columnFilters.hasSubmitted) ? `提交记录：${summarizePresetValues(HAS_SUBMITTED_FILTER_OPTIONS, columnFilters.hasSubmitted)}` : '',
     normalized.sortOrder ? `到期：${labelForOption(SUBSCRIPTION_EXPIRY_SORT_OPTIONS, normalized.sortOrder)}` : '',
   ].filter(Boolean)
   return parts.length ? parts.join(' · ') : '无筛选条件'
@@ -6228,7 +6228,7 @@ export default function Accounts() {
           <Select
             allowClear
             size="small"
-            placeholder="是否已提交"
+            placeholder="提交记录"
             value={columnFilters.hasSubmitted[0] || undefined}
             options={toSelectOptions(HAS_SUBMITTED_FILTER_OPTIONS)}
             onChange={(value) => setColumnFilters((prev) => ({ ...prev, hasSubmitted: value ? [String(value)] : [] }))}
@@ -7181,7 +7181,7 @@ export default function Accounts() {
           SUBMISSION_STATE_FILTER_OPTIONS,
           (next) => setColumnFilters((prev) => ({ ...prev, submitState: next })),
           {
-            label: '是否已提交',
+            label: '提交记录',
             values: columnFilters.hasSubmitted,
             options: HAS_SUBMITTED_FILTER_OPTIONS,
             onChange: (next) => setColumnFilters((prev) => ({ ...prev, hasSubmitted: next })),
@@ -7979,7 +7979,7 @@ export default function Accounts() {
                 <Form.Item name="submitState" label="提交状态" style={{ marginBottom: 0 }}>
                   <Select mode="multiple" placeholder="全部提交状态" options={toSelectOptions(SUBMISSION_STATE_FILTER_OPTIONS)} allowClear />
                 </Form.Item>
-                <Form.Item name="hasSubmitted" label="是否已提交" style={{ marginBottom: 0 }}>
+                <Form.Item name="hasSubmitted" label="提交记录" style={{ marginBottom: 0 }}>
                   <Select placeholder="不限" options={toSelectOptions(HAS_SUBMITTED_FILTER_OPTIONS)} allowClear />
                 </Form.Item>
                 <Form.Item name="sortOrder" label="到期时间排序" style={{ marginBottom: 0 }}>

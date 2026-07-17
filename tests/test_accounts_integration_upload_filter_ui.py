@@ -47,3 +47,15 @@ def test_filter_preset_editor_converts_all_text_options_to_select_labels():
     ):
         assert f"options={{toSelectOptions({option_name})}}" in page
         assert f"options={{{option_name}}}" not in page
+
+
+def test_submission_history_filter_is_distinct_from_current_submission_state():
+    page = ACCOUNTS_PAGE.read_text(encoding="utf-8")
+
+    history_options = page.split("const HAS_SUBMITTED_FILTER_OPTIONS = [", 1)[1].split("]", 1)[0]
+    assert "{ value: 'true', text: '有提交记录' }" in history_options
+    assert "{ value: 'false', text: '无提交记录' }" in history_options
+    assert "{ value: 'true', text: '已提交' }" not in history_options
+    assert "{ value: 'false', text: '未提交' }" not in history_options
+    assert "label: '提交记录'" in page
+    assert 'placeholder="提交记录"' in page
