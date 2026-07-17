@@ -2,16 +2,22 @@
 
 from __future__ import annotations
 
+import base64
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, time as datetime_time, timedelta, timezone
+from html.parser import HTMLParser
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import sqlite3
-from typing import Any, Literal, cast
+from typing import Any, Callable, Literal, Mapping, cast
+from urllib.parse import urljoin, urlsplit
 from zoneinfo import ZoneInfo
 
+import requests
 from sqlalchemy import text
 from sqlmodel import Session
 
@@ -44,6 +50,16 @@ _LINK_URL_FIELDS_TO_REMOVE = frozenset({
     "chatgpt_checkout_url",
 })
 _BACKUP_MIN_FREE_MARGIN_BYTES = 64 * 1024 * 1024
+_STRIPE_PIX_HOST = "payments.stripe.com"
+_STRIPE_PIX_PATH_PREFIX = "/qr/instructions/"
+_STRIPE_PIX_MAX_RESPONSE_BYTES = 256 * 1024
+_STRIPE_PIX_CONNECT_TIMEOUT_SECONDS = 5.0
+_STRIPE_PIX_READ_TIMEOUT_SECONDS = 10.0
+_STRIPE_PIX_MAX_REDIRECTS = 2
+_STRIPE_PIX_DEFAULT_CONCURRENCY = 12
+_STRIPE_PIX_MAX_CONCURRENCY = 32
+_STRIPE_INTENT_STATE_RE = re.compile(r"^[a-z0-9_]{1,64}$")
+_STRIPE_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 PIX_CLEANUP_MODE_EXPIRED = "expired"
 PIX_CLEANUP_MODE_PAID = "paid"
 PIX_CLEANUP_MODE_CANCELLED = "cancelled"
@@ -90,6 +106,27 @@ class PixLinkCandidate:
     generated_at: datetime | None
     expires_at: datetime | None
     expiry_source: str
+
+
+@dataclass(frozen=True)
+class StripePixDirectState:
+    attempted: bool
+    success: bool
+    intent_state: str = ""
+    server_timestamp: datetime | None = None
+
+
+class _StripePayloadMetaParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.data_message = ""
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if self.data_message or tag.lower() != "meta":
+            return
+        values = {str(key or "").lower(): str(value or "") for key, value in attrs}
+        if values.get("id") == "payload" and values.get("data-message"):
+            self.data_message = values["data-message"]
 
 
 def normalize_pix_cleanup_mode(value: Any) -> PixCleanupMode:
@@ -174,6 +211,178 @@ def _current_payment_link_url(payload: dict[str, Any]) -> str:
         if value:
             return value
     return ""
+
+
+def _strict_stripe_pix_url(value: Any) -> str:
+    url = str(value or "").strip()
+    if not url or len(url) > 10_000 or any(ord(character) < 32 or ord(character) == 127 for character in url):
+        return ""
+    try:
+        parsed = urlsplit(url)
+        port = parsed.port
+    except ValueError:
+        return ""
+    if (
+        parsed.scheme.lower() != "https"
+        or (parsed.hostname or "").lower() != _STRIPE_PIX_HOST
+        or port not in {None, 443}
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.fragment
+        or not parsed.path.startswith(_STRIPE_PIX_PATH_PREFIX)
+        or not parsed.path.removeprefix(_STRIPE_PIX_PATH_PREFIX).strip("/")
+    ):
+        return ""
+    return url
+
+
+def parse_stripe_pix_instruction_html(value: bytes | str) -> StripePixDirectState:
+    """Extract only the non-secret state fields from Stripe's embedded payload."""
+
+    if isinstance(value, bytes):
+        if len(value) > _STRIPE_PIX_MAX_RESPONSE_BYTES:
+            return StripePixDirectState(attempted=True, success=False)
+        html = value.decode("utf-8", errors="replace")
+    else:
+        html = str(value or "")
+        if len(html.encode("utf-8", errors="replace")) > _STRIPE_PIX_MAX_RESPONSE_BYTES:
+            return StripePixDirectState(attempted=True, success=False)
+    parser = _StripePayloadMetaParser()
+    try:
+        parser.feed(html)
+        encoded = parser.data_message.strip()
+        if not encoded or len(encoded) > _STRIPE_PIX_MAX_RESPONSE_BYTES:
+            return StripePixDirectState(attempted=True, success=False)
+        decoded = base64.b64decode(encoded, validate=True)
+        payload = json.loads(decoded.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        return StripePixDirectState(attempted=True, success=False)
+    if not isinstance(payload, dict):
+        return StripePixDirectState(attempted=True, success=False)
+    if str(payload.get("type") or "").strip().lower() != "qr_instructions":
+        return StripePixDirectState(attempted=True, success=False)
+    if str(payload.get("payment_method_type") or "").strip().lower() != "pix":
+        return StripePixDirectState(attempted=True, success=False)
+    intent_state = str(payload.get("intent_state") or "").strip().lower()
+    server_timestamp = _utc_datetime(payload.get("server_timestamp"))
+    if not _STRIPE_INTENT_STATE_RE.fullmatch(intent_state) or server_timestamp is None:
+        return StripePixDirectState(attempted=True, success=False)
+    return StripePixDirectState(
+        attempted=True,
+        success=True,
+        intent_state=intent_state,
+        server_timestamp=server_timestamp,
+    )
+
+
+def _read_limited_response_body(response: requests.Response) -> bytes | None:
+    content_length = str(response.headers.get("Content-Length") or "").strip()
+    if content_length:
+        try:
+            if int(content_length) > _STRIPE_PIX_MAX_RESPONSE_BYTES:
+                return None
+        except ValueError:
+            return None
+    body = bytearray()
+    for chunk in response.iter_content(chunk_size=16 * 1024):
+        if not chunk:
+            continue
+        body.extend(chunk)
+        if len(body) > _STRIPE_PIX_MAX_RESPONSE_BYTES:
+            return None
+    return bytes(body)
+
+
+def _fetch_stripe_pix_instruction(
+    url: str,
+    *,
+    http_get: Callable[..., requests.Response] | None = None,
+) -> StripePixDirectState:
+    current_url = _strict_stripe_pix_url(url)
+    if not current_url:
+        return StripePixDirectState(attempted=False, success=False)
+    request_get = http_get or requests.get
+    for redirect_index in range(_STRIPE_PIX_MAX_REDIRECTS + 1):
+        response: requests.Response | None = None
+        try:
+            response = request_get(
+                current_url,
+                allow_redirects=False,
+                stream=True,
+                timeout=(_STRIPE_PIX_CONNECT_TIMEOUT_SECONDS, _STRIPE_PIX_READ_TIMEOUT_SECONDS),
+                headers={
+                    "Accept": "text/html,application/xhtml+xml",
+                    "Cache-Control": "no-cache",
+                    "Pragma": "no-cache",
+                    "User-Agent": "Mozilla/5.0 (compatible; auto-gpt-pix-status/1.0)",
+                },
+            )
+            if response.status_code in _STRIPE_REDIRECT_STATUSES:
+                if redirect_index >= _STRIPE_PIX_MAX_REDIRECTS:
+                    return StripePixDirectState(attempted=True, success=False)
+                next_url = _strict_stripe_pix_url(urljoin(current_url, str(response.headers.get("Location") or "")))
+                if not next_url:
+                    return StripePixDirectState(attempted=True, success=False)
+                current_url = next_url
+                continue
+            if response.status_code != 200:
+                return StripePixDirectState(attempted=True, success=False)
+            content_type = str(response.headers.get("Content-Type") or "").lower()
+            if "text/html" not in content_type:
+                return StripePixDirectState(attempted=True, success=False)
+            body = _read_limited_response_body(response)
+            if body is None:
+                return StripePixDirectState(attempted=True, success=False)
+            return parse_stripe_pix_instruction_html(body)
+        except requests.RequestException:
+            return StripePixDirectState(attempted=True, success=False)
+        finally:
+            if response is not None:
+                response.close()
+    return StripePixDirectState(attempted=True, success=False)
+
+
+def _direct_scan_concurrency() -> int:
+    try:
+        configured = int(str(os.getenv("PIX_LINK_DIRECT_SCAN_CONCURRENCY") or _STRIPE_PIX_DEFAULT_CONCURRENCY).strip())
+    except (TypeError, ValueError):
+        configured = _STRIPE_PIX_DEFAULT_CONCURRENCY
+    return min(max(configured, 1), _STRIPE_PIX_MAX_CONCURRENCY)
+
+
+def _scan_stripe_pix_states(
+    candidates: list[PixLinkCandidate],
+) -> dict[tuple[int, str], StripePixDirectState]:
+    if not candidates:
+        return {}
+    candidates_by_url: dict[str, list[PixLinkCandidate]] = {}
+    results: dict[tuple[int, str], StripePixDirectState] = {}
+    for candidate in candidates:
+        strict_url = _strict_stripe_pix_url(candidate.current_url)
+        if not strict_url:
+            results[(candidate.account_id, candidate.current_url)] = StripePixDirectState(
+                attempted=False,
+                success=False,
+            )
+            continue
+        candidates_by_url.setdefault(strict_url, []).append(candidate)
+    if not candidates_by_url:
+        return results
+    worker_count = min(_direct_scan_concurrency(), len(candidates_by_url))
+    with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="pix-stripe-scan") as executor:
+        futures = {
+            executor.submit(_fetch_stripe_pix_instruction, url): (url, linked_candidates)
+            for url, linked_candidates in candidates_by_url.items()
+        }
+        for future in as_completed(futures):
+            _url, linked_candidates = futures[future]
+            try:
+                direct_state = future.result()
+            except Exception:
+                direct_state = StripePixDirectState(attempted=True, success=False)
+            for candidate in linked_candidates:
+                results[(candidate.account_id, candidate.current_url)] = direct_state
+    return results
 
 
 def _load_current_pix_link_candidates(session: Session) -> list[PixLinkCandidate]:
@@ -302,6 +511,7 @@ def _base_report(
     *,
     now: datetime,
     cleanup_mode: PixCleanupMode = PIX_CLEANUP_MODE_EXPIRED,
+    direct_results: Mapping[tuple[int, str], StripePixDirectState] | None = None,
 ) -> tuple[dict[str, Any], list[PixLinkCandidate]]:
     mode = normalize_pix_cleanup_mode(cleanup_mode)
     now_utc = _utc_datetime(now) or datetime.now(timezone.utc)
@@ -310,10 +520,33 @@ def _base_report(
     cancelled: list[PixLinkCandidate] = []
     expired: list[PixLinkCandidate] = []
     valid: list[PixLinkCandidate] = []
+    direct_states: dict[str, int] = {}
+    direct_attempted = 0
+    direct_success = 0
     for item in candidates:
         # These buckets drive both the scan UI and cleanup eligibility, so a
         # current link must belong to exactly one operator-visible category.
-        if _is_paid_candidate(item):
+        direct_state = (direct_results or {}).get((item.account_id, item.current_url))
+        if direct_state is not None and direct_state.attempted:
+            direct_attempted += 1
+        if direct_state is not None and direct_state.success:
+            direct_success += 1
+            direct_states[direct_state.intent_state] = direct_states.get(direct_state.intent_state, 0) + 1
+        if direct_state is not None and direct_state.success and direct_state.intent_state == "succeeded":
+            paid.append(item)
+        elif direct_state is not None and direct_state.success and direct_state.intent_state in {"canceled", "cancelled"}:
+            cancelled.append(item)
+        elif (
+            direct_state is not None
+            and direct_state.success
+            and direct_state.server_timestamp is not None
+            and item.expires_at is not None
+            and item.expires_at <= direct_state.server_timestamp
+        ):
+            expired.append(item)
+        elif direct_state is not None and direct_state.success:
+            valid.append(item)
+        elif _is_paid_candidate(item):
             paid.append(item)
         elif _is_cancelled_candidate(item):
             cancelled.append(item)
@@ -353,6 +586,11 @@ def _base_report(
         "derived_expiry_links": derived_count,
         "missing_expiry_links": len(missing),
         "valid_missing_expiry_links": len(valid_missing),
+        "direct_scan_source": "stripe_direct",
+        "direct_scan_attempted_links": direct_attempted,
+        "direct_scan_success_links": direct_success,
+        "direct_scan_fallback_links": len(candidates) - direct_success,
+        "direct_scan_state_counts": dict(sorted(direct_states.items())),
     }
     return report, eligible
 
@@ -430,7 +668,10 @@ def preview_expired_pix_payment_links(
     now: datetime | None = None,
 ) -> dict[str, Any]:
     now_utc = _utc_datetime(now or datetime.now(timezone.utc)) or datetime.now(timezone.utc)
-    report, _ = _base_report(_load_current_pix_link_candidates(session), now=now_utc)
+    candidates = _load_current_pix_link_candidates(session)
+    session.rollback()
+    direct_results = _scan_stripe_pix_states(candidates)
+    report, _ = _base_report(candidates, now=now_utc, direct_results=direct_results)
     return report
 
 
@@ -441,10 +682,14 @@ def preview_pix_payment_link_cleanup(
     now: datetime | None = None,
 ) -> dict[str, Any]:
     now_utc = _utc_datetime(now or datetime.now(timezone.utc)) or datetime.now(timezone.utc)
+    candidates = _load_current_pix_link_candidates(session)
+    session.rollback()
+    direct_results = _scan_stripe_pix_states(candidates)
     report, _ = _base_report(
-        _load_current_pix_link_candidates(session),
+        candidates,
         now=now_utc,
         cleanup_mode=cleanup_mode,
+        direct_results=direct_results,
     )
     return report
 
@@ -514,12 +759,15 @@ def clean_pix_payment_links(
 
     mode = normalize_pix_cleanup_mode(cleanup_mode)
     now_utc = _utc_datetime(now or datetime.now(timezone.utc)) or datetime.now(timezone.utc)
+    initial_candidates = _load_current_pix_link_candidates(session)
+    session.rollback()
+    direct_results = _scan_stripe_pix_states(initial_candidates)
     initial_report, initial_eligible = _base_report(
-        _load_current_pix_link_candidates(session),
+        initial_candidates,
         now=now_utc,
         cleanup_mode=mode,
+        direct_results=direct_results,
     )
-    session.rollback()
     if not initial_eligible:
         initial_report.update(
             {
@@ -531,14 +779,24 @@ def clean_pix_payment_links(
         )
         return initial_report
 
+    initial_eligible_keys = {
+        (candidate.account_id, candidate.current_url)
+        for candidate in initial_eligible
+    }
     backup_path = _create_verified_backup(session, now=now_utc)
     try:
         session.exec(text("BEGIN IMMEDIATE"))
-        report, eligible = _base_report(
+        report, current_eligible = _base_report(
             _load_current_pix_link_candidates(session),
             now=now_utc,
             cleanup_mode=mode,
+            direct_results=direct_results,
         )
+        eligible = [
+            candidate
+            for candidate in current_eligible
+            if (candidate.account_id, candidate.current_url) in initial_eligible_keys
+        ]
         cleaned_ids: list[int] = []
         for candidate in eligible:
             marker_json = json.dumps(
@@ -601,7 +859,7 @@ def clean_pix_payment_links(
     report.update(
         {
             "cleaned_links": len(cleaned_ids),
-            "concurrent_skipped_links": len(eligible) - len(cleaned_ids),
+            "concurrent_skipped_links": len(initial_eligible) - len(cleaned_ids),
             "list_state_refreshed": list_state_refreshed,
             "backup_created": bool(backup_path),
         }

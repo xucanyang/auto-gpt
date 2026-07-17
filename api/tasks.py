@@ -16374,7 +16374,7 @@ def preview_chatgpt_expired_pix_payment_links(
 
 @router.get("/chatgpt/payment-links/pix-cleanup/scan")
 def scan_chatgpt_pix_payment_links():
-    """Return mutually exclusive current PIX-link status buckets."""
+    """Probe Stripe and return mutually exclusive current PIX-link status buckets."""
 
     with Session(engine) as session:
         return preview_pix_payment_link_cleanup(session)
@@ -16407,12 +16407,21 @@ def _run_expired_pix_payment_link_cleanup(
         preview_active = max(int(preview.get("active_links") or 0), 0)
         preview_eligible = max(int(preview.get("eligible_links") or 0), 0)
         preview_missing = max(int(preview.get("missing_expiry_links") or 0), 0)
+        preview_direct_success = max(int(preview.get("direct_scan_success_links") or 0), 0)
+        preview_direct_fallback = max(int(preview.get("direct_scan_fallback_links") or 0), 0)
         _log(
             task_id,
             (
                 "[PIX清理] 扫描完成："
                 f"总 {preview_total}；{cleanup_label} {preview_eligible}；"
                 f"时间有效 {preview_active}；缺少时间 {preview_missing}"
+            ),
+        )
+        _log(
+            task_id,
+            (
+                f"[PIX清理] Stripe 实时查询成功 {preview_direct_success}/{preview_total}；"
+                f"本地记录兜底 {preview_direct_fallback}"
             ),
         )
         if mode == PIX_CLEANUP_MODE_EXPIRED and preview_missing:

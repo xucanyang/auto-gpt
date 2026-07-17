@@ -6,6 +6,19 @@
 
 ## [Unreleased] (未发布)
 
+## [2.3.5] - 2026-07-18
+
+### 新增 (Added)
+- **PIX 链接改为 Stripe 实时状态扫描**：`services/chatgpt_core/pix_payment_link_cleanup.py` 现在并发 GET 当前 `payments.stripe.com/qr/instructions/` 链接，从 HTML 的 `meta#payload[data-message]` 解码 Stripe `qr_instructions` 响应，并按 `intent_state=succeeded`、`canceled/cancelled`、其他非终态结合 `server_timestamp` 与链接到期时间，实时归类为已支付、支付已取消、过期或有效。扫描接口、清理预览和后台清理统一复用同一分类规则，不再把滞后的本地支付标记当作首选真相。
+- **实时查询覆盖率可见**：扫描报告新增 `direct_scan_attempted_links`、`direct_scan_success_links`、`direct_scan_fallback_links` 与脱敏状态计数；`PixLinkScanModal.tsx` 展示 Stripe 实时查询成功数/总数，并在请求失败、非 Stripe URL 或响应无法验证时明确显示本地记录兜底数量。前端侧栏版本同步至 `v2.3.5`。
+
+### 优化 (Changed)
+- **实时探测增加并发、超时和响应边界**：仅允许 HTTPS、精确主机 `payments.stripe.com` 和 `/qr/instructions/` 路径，重定向仍需通过同一白名单；默认并发 12、上限 32，连接/读取超时分别为 5/10 秒，响应体限制 256 KiB。解析结果只保留 `intent_state` 与 `server_timestamp`，不会把原始链接、HTML、Base64 payload、`client_secret` 或 publishable key 写入报告和任务日志。
+- **联网与 SQLite 写事务彻底分离**：实际清理先加载候选并释放读取事务，再完成 Stripe 并发扫描和校验备份，最后进入 `BEGIN IMMEDIATE`。事务内只复用 `(account_id, current_url)` 完全匹配的实时结果；扫描后链接发生变化时安全跳过，避免持锁联网、误删新链接或扩大数据库阻塞时间。
+
+### 测试 (Tests)
+- **Stripe 实时分类与事务边界回归**：扩展 `tests/test_pix_payment_link_cleanup.py`，覆盖 Base64 HTML 解析、实时 `succeeded/canceled/requires_action` 覆盖滞后本地状态、非终态到期判断、请求失败本地兜底、非 Stripe URL 零网络访问、异常响应不泄露敏感字段、写事务内不联网及并发换链跳过清理；前端合同测试同步锁定实时覆盖率与兜底提示。
+
 ## [2.3.4] - 2026-07-18
 
 ### 新增 (Added)
@@ -1924,4 +1937,8 @@
 
 ## 2026-07-18 03:47:25 +0800
 - 更新 auto-gpt 约定：三个业务实例统一常驻
+- 发布模式: multi
+
+## 2026-07-18 04:17:58 +0800
+- 升级 v2.3.5：PIX 链接改为 Stripe 实时状态扫描
 - 发布模式: multi

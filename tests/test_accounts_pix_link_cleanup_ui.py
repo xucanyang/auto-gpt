@@ -63,6 +63,10 @@ def test_pix_link_scan_lists_exclusive_buckets_and_cleanup_is_confirmed():
     assert "label: '已支付'" in scan_modal
     assert "label: '过期'" in scan_modal
     assert "label: '支付已取消'" in scan_modal
+    assert "Stripe 实时查询" in scan_modal
+    assert "direct_scan_success_links" in scan_modal
+    assert "direct_scan_fallback_links" in scan_modal
+    assert "已使用本地记录兜底" in scan_modal
     assert "cleanupMode: null" in scan_modal
     assert "if (!mode) return null" in scan_modal
     assert "<DeleteOutlined />" in scan_modal

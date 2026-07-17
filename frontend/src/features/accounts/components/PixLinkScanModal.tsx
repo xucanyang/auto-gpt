@@ -21,6 +21,11 @@ export type PixLinkScanReport = {
   active_links?: number
   missing_expiry_links?: number
   valid_missing_expiry_links?: number
+  direct_scan_source?: string
+  direct_scan_attempted_links?: number
+  direct_scan_success_links?: number
+  direct_scan_fallback_links?: number
+  direct_scan_state_counts?: Record<string, number>
   cleaned_links?: number
   concurrent_skipped_links?: number
 }
@@ -124,6 +129,9 @@ export function PixLinkScanModal({
     },
   ]
   const validMissing = Number(report?.valid_missing_expiry_links || 0)
+  const totalLinks = Number(report?.current_pix_links || 0)
+  const directSuccess = Number(report?.direct_scan_success_links || 0)
+  const directFallback = Number(report?.direct_scan_fallback_links || 0)
 
   return (
     <Modal
@@ -139,7 +147,7 @@ export function PixLinkScanModal({
           <Space size={8}>
             <Text type="secondary">总 PIX 链接</Text>
             <Text strong style={{ fontSize: 18, fontVariantNumeric: 'tabular-nums' }}>
-              {report ? Number(report.current_pix_links || 0) : '-'}
+              {report ? totalLinks : '-'}
             </Text>
           </Space>
           <Button icon={<ReloadOutlined />} loading={loading} disabled={cleanupMode !== null} onClick={onScan}>
@@ -147,6 +155,19 @@ export function PixLinkScanModal({
           </Button>
         </div>
         {error ? <Alert type="error" showIcon message="扫描失败" description={error} /> : null}
+        {report ? (
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
+            <Text type="secondary">Stripe 实时查询</Text>
+            <Text strong style={{ fontVariantNumeric: 'tabular-nums' }}>{directSuccess} / {totalLinks}</Text>
+          </div>
+        ) : null}
+        {directFallback > 0 ? (
+          <Alert
+            type="warning"
+            showIcon
+            message={`${directFallback} 条实时查询失败，已使用本地记录兜底`}
+          />
+        ) : null}
         {validMissing > 0 ? (
           <Alert
             type="warning"

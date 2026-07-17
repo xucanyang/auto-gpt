@@ -1,18 +1,22 @@
 from __future__ import annotations
 
+import base64
 from datetime import datetime, timezone
+import json
 import sqlite3
 
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
 from core.db import AccountListStateModel, AccountModel, PaymentLinkGenerationModel
+from services.chatgpt_core import pix_payment_link_cleanup as pix_cleanup
 from services.chatgpt_core.pix_payment_link_cleanup import (
     PIX_CLEANUP_MODE_CANCELLED,
     PIX_CLEANUP_MODE_PAID,
     PIX_EXPIRED_CLEANED_STATUS,
     clean_pix_payment_links,
     clean_expired_pix_payment_links,
+    parse_stripe_pix_instruction_html,
     pix_schedule_expires_at,
     preview_pix_payment_link_cleanup,
     preview_expired_pix_payment_links,
@@ -24,6 +28,18 @@ from services.chatgpt_core.payment_link_cache import (
 
 
 NOW = datetime(2026, 7, 16, 4, 0, tzinfo=timezone.utc)
+
+
+def _stripe_html(intent_state: str, *, server_timestamp: int | None = None, **extra) -> bytes:
+    payload = {
+        "type": "qr_instructions",
+        "payment_method_type": "pix",
+        "intent_state": intent_state,
+        "server_timestamp": int(server_timestamp or NOW.timestamp()),
+        **extra,
+    }
+    encoded = base64.b64encode(json.dumps(payload).encode()).decode()
+    return f'<html><head><meta id="payload" data-message="{encoded}"></head></html>'.encode()
 
 
 def _pix_link(url: str, *, generated_at: str = "", expires_at: int | None = None) -> dict:
@@ -175,6 +191,11 @@ def test_preview_and_cleanup_are_scoped_atomic_and_idempotent():
         "derived_expiry_links": 3,
         "missing_expiry_links": 1,
         "valid_missing_expiry_links": 1,
+        "direct_scan_source": "stripe_direct",
+        "direct_scan_attempted_links": 0,
+        "direct_scan_success_links": 0,
+        "direct_scan_fallback_links": 7,
+        "direct_scan_state_counts": {},
     }
 
     with Session(engine) as session:
@@ -425,3 +446,203 @@ def test_file_database_cleanup_creates_a_verified_backup(tmp_path, monkeypatch):
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         original_extra = connection.execute("SELECT extra_json FROM accounts WHERE id = 1").fetchone()[0]
     assert "https://payments.example.test/file-backup" in original_extra
+
+
+def test_stripe_embedded_payload_parser_returns_only_safe_state_fields():
+    secret = "pi_secret_must_not_escape"
+    result = parse_stripe_pix_instruction_html(
+        _stripe_html(
+            "succeeded",
+            client_secret=secret,
+            publishable_key="pk_live_must_not_escape",
+        )
+    )
+
+    assert result.success is True
+    assert result.intent_state == "succeeded"
+    assert result.server_timestamp == NOW
+    assert secret not in repr(result)
+    assert "publishable_key" not in repr(result)
+
+
+def test_direct_stripe_states_override_stale_local_records_and_fallback_on_failure(monkeypatch):
+    engine = _engine()
+    future_epoch = int(datetime(2026, 7, 17, 3, 0, tzinfo=timezone.utc).timestamp())
+    expired_epoch = int(datetime(2026, 7, 16, 3, 0, tzinfo=timezone.utc).timestamp())
+    urls = {
+        name: f"https://payments.stripe.com/qr/instructions/{name}"
+        for name in ("paid", "cancelled", "valid", "expired", "fallback")
+    }
+    with Session(engine) as session:
+        stale_failed = _pix_link(urls["paid"], expires_at=expired_epoch)
+        stale_failed["link_status"] = "failed"
+        fallback_paid = _pix_link(urls["fallback"], expires_at=future_epoch)
+        fallback_paid["link_status"] = "paid"
+        session.add_all(
+            [
+                _account(101, stale_failed),
+                _account(102, _pix_link(urls["cancelled"], expires_at=future_epoch)),
+                _account(103, _pix_link(urls["valid"], expires_at=future_epoch)),
+                _account(104, _pix_link(urls["expired"], expires_at=expired_epoch)),
+                _account(105, fallback_paid),
+            ]
+        )
+        session.commit()
+
+    states = {
+        urls["paid"]: pix_cleanup.StripePixDirectState(True, True, "succeeded", NOW),
+        urls["cancelled"]: pix_cleanup.StripePixDirectState(True, True, "canceled", NOW),
+        urls["valid"]: pix_cleanup.StripePixDirectState(True, True, "requires_action", NOW),
+        urls["expired"]: pix_cleanup.StripePixDirectState(True, True, "requires_action", NOW),
+        urls["fallback"]: pix_cleanup.StripePixDirectState(True, False),
+    }
+    monkeypatch.setattr(pix_cleanup, "_fetch_stripe_pix_instruction", lambda url: states[url])
+
+    with Session(engine) as session:
+        scan = preview_pix_payment_link_cleanup(session, now=NOW)
+
+    assert scan["current_pix_links"] == 5
+    assert scan["paid_links"] == 2
+    assert scan["cancelled_links"] == 1
+    assert scan["valid_links"] == 1
+    assert scan["expired_links"] == 1
+    assert scan["direct_scan_attempted_links"] == 5
+    assert scan["direct_scan_success_links"] == 4
+    assert scan["direct_scan_fallback_links"] == 1
+    assert scan["direct_scan_state_counts"] == {
+        "canceled": 1,
+        "requires_action": 2,
+        "succeeded": 1,
+    }
+
+
+def test_non_stripe_url_never_triggers_a_network_request(monkeypatch):
+    engine = _engine()
+    with Session(engine) as session:
+        session.add(
+            _account(
+                201,
+                _pix_link(
+                    "https://payments.example.test/qr/instructions/not-stripe",
+                    generated_at="2026-07-16T03:30:00+00:00",
+                ),
+            )
+        )
+        session.commit()
+
+    def must_not_fetch(_url):
+        raise AssertionError("non-Stripe URL reached the network probe")
+
+    monkeypatch.setattr(pix_cleanup, "_fetch_stripe_pix_instruction", must_not_fetch)
+    with Session(engine) as session:
+        scan = preview_pix_payment_link_cleanup(session, now=NOW)
+
+    assert scan["direct_scan_attempted_links"] == 0
+    assert scan["direct_scan_success_links"] == 0
+    assert scan["direct_scan_fallback_links"] == 1
+    assert scan["valid_links"] == 1
+
+
+def test_invalid_stripe_response_and_cross_host_redirect_do_not_expose_secrets():
+    secret = "pi_secret_response_must_not_escape"
+
+    class FakeResponse:
+        def __init__(self, status_code, headers, body=b""):
+            self.status_code = status_code
+            self.headers = headers
+            self._body = body
+
+        def iter_content(self, chunk_size):
+            assert chunk_size > 0
+            yield self._body
+
+        def close(self):
+            return None
+
+    calls = []
+
+    def redirect_get(url, **_kwargs):
+        calls.append(url)
+        return FakeResponse(302, {"Location": f"https://example.test/{secret}"})
+
+    result = pix_cleanup._fetch_stripe_pix_instruction(
+        "https://payments.stripe.com/qr/instructions/redirect",
+        http_get=redirect_get,
+    )
+    assert result.success is False
+    assert len(calls) == 1
+    assert secret not in repr(result)
+
+    invalid = parse_stripe_pix_instruction_html(
+        f'<meta id="payload" data-message="not-base64-{secret}">'.encode()
+    )
+    assert invalid.success is False
+    assert secret not in repr(invalid)
+
+
+def test_cleanup_does_not_probe_after_begin_immediate(monkeypatch):
+    engine = _engine()
+    url = "https://payments.stripe.com/qr/instructions/transaction-boundary"
+    with Session(engine) as session:
+        session.add(_account(301, _pix_link(url, generated_at="2026-07-15T01:00:00+00:00")))
+        session.commit()
+
+    with Session(engine) as session:
+        transaction_locked = False
+        original_exec = session.exec
+
+        def recording_exec(statement, *args, **kwargs):
+            nonlocal transaction_locked
+            if str(statement).strip().upper().startswith("BEGIN IMMEDIATE"):
+                transaction_locked = True
+            return original_exec(statement, *args, **kwargs)
+
+        def direct_state(_url):
+            assert transaction_locked is False
+            return pix_cleanup.StripePixDirectState(True, True, "requires_action", NOW)
+
+        monkeypatch.setattr(session, "exec", recording_exec)
+        monkeypatch.setattr(pix_cleanup, "_fetch_stripe_pix_instruction", direct_state)
+        report = clean_expired_pix_payment_links(session, now=NOW)
+
+    assert transaction_locked is True
+    assert report["cleaned_links"] == 1
+
+
+def test_cleanup_skips_an_account_whose_current_url_changed_after_direct_scan(monkeypatch):
+    engine = _engine()
+    original_url = "https://payments.stripe.com/qr/instructions/original-paid"
+    replacement_url = "https://payments.example.test/replacement-paid"
+    original_link = _pix_link(original_url, generated_at="2026-07-16T03:30:00+00:00")
+    with Session(engine) as session:
+        session.add(_account(401, original_link))
+        session.commit()
+
+    monkeypatch.setattr(
+        pix_cleanup,
+        "_fetch_stripe_pix_instruction",
+        lambda _url: pix_cleanup.StripePixDirectState(True, True, "succeeded", NOW),
+    )
+
+    def replace_before_lock(session, *, now):
+        del now
+        account = session.get(AccountModel, 401)
+        replacement = _pix_link(replacement_url, generated_at="2026-07-16T03:31:00+00:00")
+        replacement["link_status"] = "paid"
+        extra = account.get_extra()
+        extra["chatgpt_last_payment_link"] = replacement
+        account.set_extra(extra)
+        account.cashier_url = replacement_url
+        session.add(account)
+        session.commit()
+        return ""
+
+    monkeypatch.setattr(pix_cleanup, "_create_verified_backup", replace_before_lock)
+    with Session(engine) as session:
+        report = clean_pix_payment_links(session, cleanup_mode=PIX_CLEANUP_MODE_PAID, now=NOW)
+
+    assert report["cleaned_links"] == 0
+    assert report["concurrent_skipped_links"] == 1
+    with Session(engine) as session:
+        current = session.get(AccountModel, 401).get_extra()["chatgpt_last_payment_link"]
+    assert current["url"] == replacement_url
