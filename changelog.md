@@ -4,6 +4,18 @@
 
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，并且本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/) (语义化版本)。
 
+## [2.3.1] - 2026-07-17
+
+### 优化 (Changed)
+- **统一镜像发布只构建一次**：`docker-compose.multi.yml` 仅保留 `auto-gpt` 作为 `auto-gpt:latest` 的规范构建服务，Plus、Plus2 与 `phone-api-relay` 继续只引用该共享镜像。`deploy.sh --mode=multi` 现在显式执行 `compose_multi build auto-gpt`，随后使用 `up --no-build` 启动全部活动服务，避免 Compose 为相同 Dockerfile 和相同镜像标签创建两次独立导出任务。
+
+### 修复 (Fixed)
+- **修复多实例发布并行导出耗尽磁盘**：此前 `auto-gpt` 与 `auto-gpt-plus` 同时声明相同 `build`，无服务过滤的 Compose build 会并行解包两份约 4 GiB rootfs，并可能在 Chromium 层导出时触发 `no space left on device`。现在发布路径从编排文件和脚本两层消除重复构建，并禁止 `up` 隐式补建，保证三个业务实例原子切换到同一已完成镜像。
+- **前端版本同步至 v2.3.1**：`frontend/src/app/AppShell.tsx` 更新侧栏版本，便于确认浏览器已加载修复后的统一镜像发布产物。
+
+### 测试 (Tests)
+- **单构建拓扑合同**：扩展 `tests/test_deploy_topology_contract.py`，锁定四个活动服务共用同一镜像、Compose 仅存在一个规范 `build`、multi 发布只构建 `auto-gpt` 且启动阶段必须使用 `--no-build`，防止重复导出和磁盘峰值问题回归。
+
 ## [2.3.0] - 2026-07-17
 
 ### 新增 (Added)
@@ -1835,4 +1847,8 @@
 
 ## 2026-07-17 09:37:38 +0800
 - 升级 v2.3.0：隔离三实例管理员认证并加固会话、审计、SSE 与公网端口
+- 发布模式: multi
+
+## 2026-07-17 09:50:51 +0800
+- 修复 v2.3.1：统一多实例镜像单次构建并完成认证安全发布
 - 发布模式: multi

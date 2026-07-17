@@ -89,12 +89,6 @@ services:
   auto-gpt-plus:
     image: ${APP_IMAGE:-auto-gpt:latest}
     # 三个业务实例共用统一镜像，运行数据仍由各自 bind mount 隔离。
-    build:
-      context: .
-      dockerfile: Dockerfile
-      args:
-        CAMOUFOX_VERSION: ${CAMOUFOX_VERSION:-135.0.1}
-        CAMOUFOX_RELEASE: ${CAMOUFOX_RELEASE:-beta.24}
     container_name: auto-gpt-plus
     init: true
     restart: unless-stopped

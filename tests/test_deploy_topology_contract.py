@@ -83,3 +83,30 @@ def test_deploy_keeps_and_verifies_all_three_business_instances():
         assert (
             f'smoke_url "{instance} index" "http://127.0.0.1:{port}/"'
         ) in source
+
+
+def test_multi_release_builds_shared_image_exactly_once():
+    compose_source = COMPOSE_FILE.read_text(encoding="utf-8")
+    deploy_source = DEPLOY_SCRIPT.read_text(encoding="utf-8")
+
+    service_bodies = {}
+    for service_name in ("phone-api-relay", "auto-gpt", "auto-gpt-plus", "auto-plus2"):
+        match = re.search(
+            rf"(?ms)^  {re.escape(service_name)}:\n(?P<body>.*?)(?=^  [a-zA-Z0-9_-]+:\n|^networks:\n|\Z)",
+            compose_source,
+        )
+        assert match is not None
+        service_bodies[service_name] = match.group("body")
+        assert "image: ${APP_IMAGE:-auto-gpt:latest}" in match.group("body")
+
+    assert "    build:\n" in service_bodies["auto-gpt"]
+    assert compose_source.count("    build:\n") == 1
+    for service_name in ("phone-api-relay", "auto-gpt-plus", "auto-plus2"):
+        assert "    build:\n" not in service_bodies[service_name]
+
+    assert "compose_multi build auto-gpt" in deploy_source
+    assert (
+        'compose_multi up -d --no-build --remove-orphans "${ACTIVE_SERVICES[@]}"'
+        in deploy_source
+    )
+    assert re.search(r"(?m)^\s*compose_multi build\s*$", deploy_source) is None

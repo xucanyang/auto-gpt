@@ -418,10 +418,10 @@ fi
 
 case "$MODE" in
   multi)
-    log "Compose build: $COMPOSE_FILE"
-    compose_multi build
-    log "Compose up -d --remove-orphans: ${ACTIVE_SERVICES[*]}"
-    compose_multi up -d --remove-orphans "${ACTIVE_SERVICES[@]}"
+    log "Compose build canonical image: auto-gpt"
+    compose_multi build auto-gpt
+    log "Compose up -d --no-build --remove-orphans: ${ACTIVE_SERVICES[*]}"
+    compose_multi up -d --no-build --remove-orphans "${ACTIVE_SERVICES[@]}"
     ;;
   hot)
     hot_sync_service auto-gpt http://127.0.0.1:8000/api/health
