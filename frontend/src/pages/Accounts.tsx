@@ -388,6 +388,18 @@ type PaymentLinkProfile = {
   effective_concurrency?: number
   profile_hash?: string
   proxy_configured?: boolean
+  plan?: 'plus' | 'team' | string
+  generation_kind?: string
+  plan_name?: string
+  variant_key?: string
+  promo_code_digest?: string
+  team?: {
+    workspace_name?: string
+    price_interval?: string
+    seat_quantity?: number
+    cancel_url?: string
+    promo_code_configured?: boolean
+  }
   regions?: Record<string, string>
   pix?: {
     request_preset?: string
@@ -2417,6 +2429,7 @@ export default function Accounts() {
   const [batchPaymentLinkProfile, setBatchPaymentLinkProfile] = useState<PaymentLinkProfile | null>(null)
   const [batchPaymentLinkProfileLoading, setBatchPaymentLinkProfileLoading] = useState(false)
   const [batchPaymentLinkProfileError, setBatchPaymentLinkProfileError] = useState('')
+  const [batchPaymentLinkPlan, setBatchPaymentLinkPlan] = useState<'plus' | 'team'>('plus')
   const [batchProbeStatusConfigOpen, setBatchProbeStatusConfigOpen] = useState(false)
   const [batchProbeStatusConfigScope, setBatchProbeStatusConfigScope] = useState<'selected' | 'all'>('selected')
 
@@ -2427,6 +2440,7 @@ export default function Accounts() {
   const [phoneBindingTestForm] = Form.useForm()
   const [baxiCdkSubmitForm] = Form.useForm()
   const [paypalBindingForm] = Form.useForm()
+  const [batchPaymentLinkForm] = Form.useForm()
   const [batchProbeStatusConfigForm] = Form.useForm()
   const [filterPresetForm] = Form.useForm()
   const phoneBindingUsePoolValue = Form.useWatch('use_pool', phoneBindingTestForm)
@@ -3923,11 +3937,45 @@ export default function Accounts() {
     }
   }
 
-  const loadBatchPaymentLinkProfile = async (): Promise<PaymentLinkProfile | null> => {
+  const buildBatchPaymentLinkParams = (forceRefresh = false): Record<string, unknown> => {
+    const values = batchPaymentLinkForm.getFieldsValue()
+    const plan = String(values?.plan || batchPaymentLinkPlan || 'plus').trim().toLowerCase() === 'team' ? 'team' : 'plus'
+    const params: Record<string, unknown> = {
+      plan,
+      reuse_cached_link: !forceRefresh,
+    }
+    if (plan === 'team') {
+      const teamPlanData: Record<string, unknown> = {}
+      const workspaceName = String(values?.workspace_name || '').trim()
+      const priceInterval = String(values?.price_interval || '').trim().toLowerCase()
+      const seatQuantity = values?.seat_quantity
+      if (workspaceName) teamPlanData.workspace_name = workspaceName
+      if (priceInterval) teamPlanData.price_interval = priceInterval
+      if (seatQuantity !== undefined && seatQuantity !== null && seatQuantity !== '') {
+        teamPlanData.seat_quantity = Number(seatQuantity)
+      }
+      if (Object.keys(teamPlanData).length > 0) params.team_plan_data = teamPlanData
+      const promoCode = String(values?.promo_code || '').trim()
+      const cancelUrl = String(values?.cancel_url || '').trim()
+      if (promoCode) params.promo_code = promoCode
+      if (cancelUrl) params.cancel_url = cancelUrl
+    }
+    return params
+  }
+
+  const loadBatchPaymentLinkProfile = async (
+    params?: Record<string, unknown>,
+  ): Promise<PaymentLinkProfile | null> => {
     setBatchPaymentLinkProfileLoading(true)
     setBatchPaymentLinkProfileError('')
     try {
-      const profile = await apiFetch('/tasks/chatgpt/payment-links/profile') as PaymentLinkProfile
+      const requestedPlan = String(params?.plan || 'plus').trim().toLowerCase()
+      const profile = await apiFetch('/tasks/chatgpt/payment-links/profile', requestedPlan === 'team'
+        ? {
+            method: 'POST',
+            body: JSON.stringify({ params }),
+          }
+        : undefined) as PaymentLinkProfile
       if (!profile || !String(profile.profile_hash || '').trim()) {
         throw new Error('long-link 未返回当前配置标识')
       }
@@ -3945,10 +3993,19 @@ export default function Accounts() {
 
   const handleBatchPaymentLink = (options: { forceRefresh?: boolean } = {}) => {
     setBatchPaymentLinkForceRefresh(Boolean(options.forceRefresh))
+    setBatchPaymentLinkPlan('plus')
+    batchPaymentLinkForm.setFieldsValue({
+      plan: 'plus',
+      workspace_name: '',
+      price_interval: '',
+      seat_quantity: undefined,
+      promo_code: '',
+      cancel_url: '',
+    })
     setBatchPaymentLinkProfile(null)
     setBatchPaymentLinkProfileError('')
     setBatchPaymentLinkConfigOpen(true)
-    void loadBatchPaymentLinkProfile()
+    void loadBatchPaymentLinkProfile({ plan: 'plus' })
   }
 
   const loadPixLinkScan = async () => {
@@ -4064,19 +4121,25 @@ export default function Accounts() {
   }
 
   const submitBatchPaymentLinkConfig = async () => {
-    const profile = await loadBatchPaymentLinkProfile()
+    try {
+      await batchPaymentLinkForm.validateFields()
+    } catch {
+      return
+    }
+    const forceRefresh = Boolean(batchPaymentLinkForceRefresh)
+    const requestParams = buildBatchPaymentLinkParams(forceRefresh)
+    const requestedPlan = String(requestParams.plan || 'plus').trim().toLowerCase()
+    const profile = await loadBatchPaymentLinkProfile(requestParams)
     if (!profile) return
     const scope: 'selected' | 'filtered' = selectedRowKeys.length > 0 ? 'selected' : 'filtered'
-    const forceRefresh = Boolean(batchPaymentLinkForceRefresh)
-    const toastKey = `payment-link:${scope}:${forceRefresh ? 'force' : 'normal'}`
+    const toastKey = `payment-link:${requestedPlan}:${scope}:${forceRefresh ? 'force' : 'normal'}`
     const body: Record<string, unknown> = {
       skip_existing: !forceRefresh,
       force_refresh: forceRefresh,
-      params: {
-        reuse_cached_link: !forceRefresh,
-      },
+      params: requestParams,
     }
-    const actionLabel = forceRefresh ? '强制重新生成支付链接' : '支付链接生成'
+    const productLabel = requestedPlan === 'team' ? 'Team checkout 长链接' : '支付链接'
+    const actionLabel = forceRefresh ? `强制重新生成${productLabel}` : `${productLabel}生成`
     const requestedCount = applyAccountTaskScopeToBody(body, {
       scope,
       emptySelectedMessage: `请先选择要${forceRefresh ? '强制重新生成' : '生成'}支付链接的账号`,
@@ -6390,6 +6453,10 @@ export default function Accounts() {
       other: '其他',
     } as Record<string, string>)[platform]
     const storedLinkType = String(link.link_type || '').trim().toUpperCase()
+    const productLabel = String(link.generation_kind || '').trim().toLowerCase() === 'team_checkout'
+      || String(link.plan || '').trim().toLowerCase() === 'team'
+      ? 'TEAM'
+      : ''
     const linkType = platformLabel || storedLinkType
       || (format === 'paypal_url' ? 'PAYPAL' : format === 'long_link' ? 'LONG-LINK' : '')
     const generatedAt = formatCompactDateTime(String(link.generated_at || link.created_at || '').trim())
@@ -6413,6 +6480,7 @@ export default function Accounts() {
     return (
       <Space direction="vertical" size={2} style={{ maxWidth: 172 }}>
         <Space size={5} wrap>
+          {productLabel ? <Tag color="gold" style={compactTagStyle}>{productLabel}</Tag> : null}
           {linkType ? <Tag color="blue" style={compactTagStyle}>{linkType}</Tag> : null}
           <Tag color={statusMeta.color} style={compactTagStyle} title={statusTitle || undefined}>{statusMeta.label}</Tag>
         </Space>
@@ -8287,7 +8355,7 @@ export default function Accounts() {
       />
 
       <Modal
-        title={batchPaymentLinkForceRefresh ? '强制重新生成支付链接' : '支付链接生成'}
+        title={`${batchPaymentLinkForceRefresh ? '强制重新生成' : '生成'}${batchPaymentLinkPlan === 'team' ? ' Team checkout 长链接' : '支付链接'}`}
         open={batchPaymentLinkConfigOpen}
         onCancel={() => setBatchPaymentLinkConfigOpen(false)}
         onOk={submitBatchPaymentLinkConfig}
@@ -8296,8 +8364,117 @@ export default function Accounts() {
         okText={batchPaymentLinkForceRefresh ? '开始重新生成' : '开始生成'}
         cancelText="取消"
         maskClosable={false}
+        width={720}
       >
         <Space direction="vertical" size={12} style={{ width: '100%' }}>
+          <Form
+            form={batchPaymentLinkForm}
+            layout="vertical"
+            initialValues={{ plan: 'plus', price_interval: '', seat_quantity: undefined }}
+          >
+            <Form.Item name="plan" label="生成类型" style={{ marginBottom: 12 }}>
+              <Segmented
+                block
+                options={[
+                  { label: 'Plus 支付链接', value: 'plus' },
+                  { label: 'Team 优惠码长链接', value: 'team' },
+                ]}
+                onChange={(value) => {
+                  const nextPlan = String(value) === 'team' ? 'team' : 'plus'
+                  setBatchPaymentLinkPlan(nextPlan)
+                  setBatchPaymentLinkProfile(null)
+                  setBatchPaymentLinkProfileError('')
+                  const nextParams = nextPlan === 'team'
+                    ? { ...buildBatchPaymentLinkParams(batchPaymentLinkForceRefresh), plan: 'team' }
+                    : { plan: 'plus' }
+                  void loadBatchPaymentLinkProfile(nextParams)
+                }}
+              />
+            </Form.Item>
+
+            {batchPaymentLinkPlan === 'team' ? (
+              <>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: '0 12px' }}>
+                  <Form.Item
+                    name="workspace_name"
+                    label="Workspace 名称"
+                    rules={[{ max: 256, message: 'Workspace 名称不能超过 256 个字符' }]}
+                  >
+                    <Input
+                      maxLength={256}
+                      placeholder={batchPaymentLinkProfile?.team?.workspace_name || '沿用 long-link 管理页'}
+                    />
+                  </Form.Item>
+                  <Form.Item name="price_interval" label="计费周期">
+                    <Select
+                      options={[
+                        { value: '', label: '沿用 long-link 管理页' },
+                        { value: 'month', label: '月付' },
+                        { value: 'year', label: '年付' },
+                      ]}
+                    />
+                  </Form.Item>
+                  <Form.Item
+                    name="seat_quantity"
+                    label="席位数量"
+                    rules={[
+                      {
+                        validator: (_, value) => value === undefined || value === null || value === ''
+                          || (Number.isInteger(Number(value)) && Number(value) >= 2 && Number(value) <= 1000)
+                          ? Promise.resolve()
+                          : Promise.reject(new Error('席位数量必须是 2 到 1000 的整数')),
+                      },
+                    ]}
+                  >
+                    <InputNumber
+                      min={2}
+                      max={1000}
+                      precision={0}
+                      placeholder={batchPaymentLinkProfile?.team?.seat_quantity ? String(batchPaymentLinkProfile.team.seat_quantity) : '沿用管理页'}
+                      style={{ width: '100%' }}
+                    />
+                  </Form.Item>
+                  <Form.Item
+                    name="promo_code"
+                    label="优惠码"
+                    rules={[{ max: 256, message: '优惠码不能超过 256 个字符' }]}
+                  >
+                    <Input maxLength={256} placeholder="沿用 long-link 管理页" />
+                  </Form.Item>
+                </div>
+                <Form.Item
+                  name="cancel_url"
+                  label="取消支付跳转 URL"
+                  rules={[
+                    {
+                      validator: (_, value) => {
+                        const text = String(value || '').trim()
+                        if (!text) return Promise.resolve()
+                        try {
+                          const parsed = new URL(text)
+                          return ['http:', 'https:'].includes(parsed.protocol)
+                            ? Promise.resolve()
+                            : Promise.reject(new Error('请输入 HTTP(S) URL'))
+                        } catch {
+                          return Promise.reject(new Error('请输入完整的 HTTP(S) URL'))
+                        }
+                      },
+                    },
+                  ]}
+                >
+                  <Input maxLength={2048} placeholder={batchPaymentLinkProfile?.team?.cancel_url || '沿用 long-link 管理页'} />
+                </Form.Item>
+                <Button
+                  size="small"
+                  icon={<SyncOutlined />}
+                  loading={batchPaymentLinkProfileLoading}
+                  onClick={() => void loadBatchPaymentLinkProfile(buildBatchPaymentLinkParams(batchPaymentLinkForceRefresh))}
+                >
+                  刷新生效配置
+                </Button>
+              </>
+            ) : null}
+          </Form>
           <Alert
             type="info"
             showIcon
@@ -8308,8 +8485,8 @@ export default function Accounts() {
             }
             description={
               batchPaymentLinkForceRefresh
-                ? '强制模式会重新生成普通历史链接；已支付、已订阅、已失效或正在生成的账号仍会跳过。'
-                : '默认只处理从未成功提取的账号；当前有链接、已有成功记录或已清理的账号不会重复提交。'
+                ? `强制模式会重新生成当前${batchPaymentLinkPlan === 'team' ? ' Team 参数变体' : ' Plus 配置'}；已支付、已订阅、已失效或正在生成的账号仍会跳过。`
+                : `默认只跳过相同${batchPaymentLinkPlan === 'team' ? ' Team 参数变体' : ' Plus 配置'}的当前链接和成功记录。`
             }
           />
           {batchPaymentLinkProfileLoading ? (
@@ -8318,7 +8495,11 @@ export default function Accounts() {
           {batchPaymentLinkProfileError ? (
             <Space direction="vertical" size={8} style={{ width: '100%' }}>
               <Alert type="error" showIcon message="无法读取 long-link 管理端配置" description={batchPaymentLinkProfileError} />
-              <Button size="small" style={{ alignSelf: 'flex-start' }} onClick={() => void loadBatchPaymentLinkProfile()}>
+              <Button
+                size="small"
+                style={{ alignSelf: 'flex-start' }}
+                onClick={() => void loadBatchPaymentLinkProfile(buildBatchPaymentLinkParams(batchPaymentLinkForceRefresh))}
+              >
                 重新读取
               </Button>
             </Space>
@@ -8330,6 +8511,22 @@ export default function Accounts() {
                   <Text type="secondary" style={{ display: 'block', fontSize: 12 }}>支付类型</Text>
                   <Tag color="blue" style={{ marginTop: 4 }}>{String(batchPaymentLinkProfile.link_type || 'hosted').toUpperCase()}</Tag>
                 </div>
+                {String(batchPaymentLinkProfile.plan || '').toLowerCase() === 'team' ? (
+                  <>
+                    <div>
+                      <Text type="secondary" style={{ display: 'block', fontSize: 12 }}>Workspace</Text>
+                      <Text>{batchPaymentLinkProfile.team?.workspace_name || '-'}</Text>
+                    </div>
+                    <div>
+                      <Text type="secondary" style={{ display: 'block', fontSize: 12 }}>周期 / 席位</Text>
+                      <Text>{`${batchPaymentLinkProfile.team?.price_interval === 'year' ? '年付' : '月付'} / ${batchPaymentLinkProfile.team?.seat_quantity || '-'}`}</Text>
+                    </div>
+                    <div>
+                      <Text type="secondary" style={{ display: 'block', fontSize: 12 }}>优惠码</Text>
+                      <Text>{batchPaymentLinkProfile.team?.promo_code_configured ? '已配置' : '未配置'}</Text>
+                    </div>
+                  </>
+                ) : null}
                 <div>
                   <Text type="secondary" style={{ display: 'block', fontSize: 12 }}>国家 / 币种</Text>
                   <Text>{`${batchPaymentLinkProfile.country || batchPaymentLinkProfile.billing_country || '-'} / ${batchPaymentLinkProfile.currency || '-'}`}</Text>

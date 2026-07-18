@@ -87,6 +87,8 @@ class PaymentLinkGenerationModel(SQLModel, table=True):
     remote_job_id: str = Field(default="", index=True)
     profile_hash: str = Field(default="", index=True)
     link_type: str = Field(default="", index=True)
+    generation_kind: str = Field(default="plus_checkout", index=True)
+    variant_key: str = Field(default="", index=True)
     status: str = Field(default="submitting", index=True)
     url: str = ""
     submitted_at: str = ""
@@ -3497,6 +3499,8 @@ def _ensure_payment_link_generation_schema() -> None:
         required_columns = {
             "account_email": "TEXT NOT NULL DEFAULT ''",
             "account_created_at": "TEXT NOT NULL DEFAULT ''",
+            "generation_kind": "TEXT NOT NULL DEFAULT 'plus_checkout'",
+            "variant_key": "TEXT NOT NULL DEFAULT ''",
         }
         for column_name, ddl in required_columns.items():
             if column_name in existing_columns:
@@ -3507,6 +3511,14 @@ def _ensure_payment_link_generation_schema() -> None:
         conn.exec_driver_sql(
             "CREATE INDEX IF NOT EXISTS idx_payment_link_generations_account_email "
             "ON payment_link_generations(account_email)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_payment_link_generations_variant_key "
+            "ON payment_link_generations(variant_key)"
+        )
+        conn.exec_driver_sql(
+            "UPDATE payment_link_generations SET generation_kind = 'plus_checkout' "
+            "WHERE trim(coalesce(generation_kind, '')) = ''"
         )
         conn.exec_driver_sql(
             """

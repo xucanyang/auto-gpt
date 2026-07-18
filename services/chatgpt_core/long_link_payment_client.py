@@ -18,7 +18,12 @@ from typing import Any, Callable, Iterable
 
 import requests
 
-from services.chatgpt_core.payment_link_cache import normalize_payment_link_expires_at
+from services.chatgpt_core.payment_link_cache import (
+    PAYMENT_LINK_GENERATION_TEAM,
+    PAYMENT_LINK_PLAN_TEAM,
+    normalize_payment_link_expires_at,
+    payment_link_variant_key,
+)
 
 
 DEFAULT_BASE_URL = "http://openai-pay-long-link:8788"
@@ -32,7 +37,7 @@ _RUNNING_STATUSES = {"queued", "running"}
 _TERMINAL_STATUSES = {"done", "error", "interrupted"}
 _JWT_RE = re.compile(r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)?\b")
 _profile_cache_lock = threading.Lock()
-_profile_cache: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
+_profile_cache: dict[tuple[str, str, str], tuple[float, dict[str, Any]]] = {}
 
 
 class LongLinkPaymentError(RuntimeError):
@@ -94,7 +99,7 @@ def normalize_payment_profile(profile_response: dict[str, Any] | None) -> dict[s
         effective_concurrency = int(response.get("effective_concurrency") or profile.get("effective_concurrency") or 0)
     except (TypeError, ValueError):
         effective_concurrency = 0
-    return {
+    normalized = {
         "profile_hash": profile_hash,
         "link_type": link_type,
         "country": country,
@@ -102,6 +107,23 @@ def normalize_payment_profile(profile_response: dict[str, Any] | None) -> dict[s
         "effective_concurrency": max(effective_concurrency, 0),
         "profile": dict(profile),
     }
+    # Keep the redacted Team business summary returned by the long-link
+    # profile endpoint.  Raw promo codes are never accepted here.
+    team = profile.get("team") if isinstance(profile.get("team"), dict) else profile.get("team_plan_data")
+    if isinstance(team, dict):
+        normalized["team"] = dict(team)
+        normalized["team_plan_data"] = dict(team)
+    for key in ("plan", "plan_name", "generation_kind", "promo_code_digest", "variant_key"):
+        value = response.get(key)
+        if value in (None, ""):
+            value = profile.get(key)
+        if value not in (None, ""):
+            normalized[key] = value
+    if "team" in normalized:
+        normalized.setdefault("plan", PAYMENT_LINK_PLAN_TEAM)
+        normalized.setdefault("generation_kind", PAYMENT_LINK_GENERATION_TEAM)
+        normalized.setdefault("plan_name", "chatgptteamplan")
+    return normalized
 
 
 def payment_link_from_remote_job(
@@ -122,16 +144,57 @@ def payment_link_from_remote_job(
         raise LongLinkPaymentError("支付链接任务成功但未返回有效 HTTP(S) 链接")
 
     link_type = str(result.get("link_type") or profile.get("link_type") or "hosted").strip().lower() or "hosted"
+    raw_generation_kind = str(
+        result.get("generation_kind") or profile.get("generation_kind") or ""
+    ).strip().lower()
+    raw_plan = str(result.get("plan") or profile.get("plan") or "").strip().lower()
+    raw_plan_name = str(result.get("plan_name") or profile.get("plan_name") or "").strip().lower()
+    is_team = (
+        link_type in {"team", "team_checkout"}
+        or raw_plan in {"team", "team_checkout", "chatgptteamplan"}
+        or raw_generation_kind == PAYMENT_LINK_GENERATION_TEAM
+        or raw_plan_name == "chatgptteamplan"
+    )
+    if is_team:
+        link_type = "team"
+    team_source = result.get("team_plan_data") if isinstance(result.get("team_plan_data"), dict) else {}
+    if not team_source and isinstance(result.get("team"), dict):
+        team_source = result.get("team")
+    if not team_source and isinstance(profile.get("team"), dict):
+        team_source = profile.get("team")
+    if not team_source and isinstance(profile.get("team_plan_data"), dict):
+        team_source = profile.get("team_plan_data")
+    team_plan_data = {
+        "workspace_name": str(team_source.get("workspace_name") or team_source.get("workspaceName") or "").strip(),
+        "price_interval": str(team_source.get("price_interval") or team_source.get("priceInterval") or "month").strip().lower(),
+        "seat_quantity": team_source.get("seat_quantity") or team_source.get("seatQuantity") or 2,
+        "cancel_url": str(team_source.get("cancel_url") or team_source.get("cancelUrl") or "").strip(),
+    } if is_team else {}
+    if is_team:
+        try:
+            team_plan_data["seat_quantity"] = int(team_plan_data["seat_quantity"])
+        except (TypeError, ValueError):
+            team_plan_data["seat_quantity"] = 2
+    profile_hash = str(payload.get("profile_hash") or profile.get("profile_hash") or "").strip()
+    promo_code_digest = str(
+        result.get("promo_code_digest") or profile.get("promo_code_digest") or team_source.get("promo_code_digest") or ""
+    ).strip()
+    if is_team and promo_code_digest:
+        team_plan_data["promo_code_digest"] = promo_code_digest
+    plan = PAYMENT_LINK_PLAN_TEAM if is_team else "plus"
+    generation_kind = PAYMENT_LINK_GENERATION_TEAM if is_team else "plus_checkout"
     completed_at = _iso_timestamp(payload.get("completed_at"))
     output: dict[str, Any] = {
         "url": url,
-        "plan": "plus",
+        "plan": plan,
+        "generation_kind": generation_kind,
+        "plan_name": "chatgptteamplan" if is_team else "chatgptplusplan",
         "country": str(result.get("billing_country") or profile.get("country") or "").strip().upper(),
         "currency": str(result.get("currency") or profile.get("currency") or "").strip().upper(),
         "payment_link_format": "long_link",
         "payment_source": "long_link",
         "link_type": link_type,
-        "profile_hash": str(payload.get("profile_hash") or profile.get("profile_hash") or "").strip(),
+        "profile_hash": profile_hash,
         "remote_batch_id": str(payload.get("batch_id") or "").strip(),
         "remote_job_id": str(payload.get("job_id") or "").strip(),
         "remote_request_id": str(payload.get("request_id") or "").strip(),
@@ -143,6 +206,13 @@ def payment_link_from_remote_job(
         output["link_expires_at"] = link_expires_at
     if link_type == "paypal":
         output["paypal_url"] = _http_url(result.get("paypal_url")) or url
+    if is_team:
+        output["team_plan_data"] = team_plan_data
+        output["workspace_name"] = team_plan_data.get("workspace_name") or ""
+        output["price_interval"] = team_plan_data.get("price_interval") or "month"
+        output["seat_quantity"] = team_plan_data.get("seat_quantity") or 2
+        output["cancel_url"] = team_plan_data.get("cancel_url") or ""
+        output["promo_code_digest"] = promo_code_digest
     for key in (
         "provider_redirect_url",
         "long_url",
@@ -161,6 +231,11 @@ def payment_link_from_remote_job(
         value = result.get(key)
         if value is not None and value != "":
             output[key] = value
+    output["variant_key"] = (
+        payment_link_variant_key(output)
+        if is_team
+        else str(result.get("variant_key") or "").strip() or payment_link_variant_key(output)
+    )
     return output
 
 
@@ -203,8 +278,18 @@ class LongLinkPaymentClient:
             ),
         )
 
-    def _cache_key(self) -> tuple[str, str]:
-        return self.base_url, hashlib.sha256(self.api_key.encode("utf-8")).hexdigest()
+    def _cache_key(self, overrides: dict[str, Any] | None = None) -> tuple[str, str, str]:
+        override_digest = ""
+        if isinstance(overrides, dict) and overrides:
+            try:
+                import json
+
+                override_digest = hashlib.sha256(
+                    json.dumps(overrides, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+                ).hexdigest()
+            except (TypeError, ValueError):
+                override_digest = hashlib.sha256(repr(sorted(overrides.items())).encode("utf-8")).hexdigest()
+        return self.base_url, hashlib.sha256(self.api_key.encode("utf-8")).hexdigest(), override_digest
 
     def _request(
         self,
@@ -242,15 +327,26 @@ class LongLinkPaymentClient:
             )
         return data
 
-    def get_profile(self, *, force_refresh: bool = False) -> dict[str, Any]:
-        cache_key = self._cache_key()
+    def get_profile(
+        self,
+        *,
+        overrides: dict[str, Any] | None = None,
+        force_refresh: bool = False,
+    ) -> dict[str, Any]:
+        safe_overrides = dict(overrides) if isinstance(overrides, dict) else {}
+        cache_key = self._cache_key(safe_overrides)
         now = self._monotonic()
         if not force_refresh and self.profile_cache_seconds > 0:
             with _profile_cache_lock:
                 cached = _profile_cache.get(cache_key)
                 if cached and cached[0] > now:
                     return dict(cached[1])
-        normalized = normalize_payment_profile(self._request("GET", _PROFILE_PATH))
+        if safe_overrides:
+            normalized = normalize_payment_profile(
+                self._request("POST", _PROFILE_PATH, payload={"profileOverrides": safe_overrides})
+            )
+        else:
+            normalized = normalize_payment_profile(self._request("GET", _PROFILE_PATH))
         if not normalized["profile_hash"]:
             raise LongLinkPaymentError("支付链接生成服务未返回 profile_hash")
         if self.profile_cache_seconds > 0:
@@ -263,6 +359,7 @@ class LongLinkPaymentClient:
         *,
         items: list[dict[str, Any]],
         expected_profile_hash: str,
+        profile_overrides: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if not items:
             raise LongLinkPaymentError("支付链接批次不能为空")
@@ -284,13 +381,16 @@ class LongLinkPaymentClient:
             seen_ids.add(request_id)
             tokens.append(token)
             serialized_items.append({"accessToken": token, "requestId": request_id})
+        request_payload: dict[str, Any] = {
+            "expectedProfileHash": str(expected_profile_hash or "").strip(),
+            "items": serialized_items,
+        }
+        if isinstance(profile_overrides, dict) and profile_overrides:
+            request_payload["profileOverrides"] = dict(profile_overrides)
         response = self._request(
             "POST",
             _BATCH_PATH,
-            payload={
-                "expectedProfileHash": str(expected_profile_hash or "").strip(),
-                "items": serialized_items,
-            },
+            payload=request_payload,
             secrets=tokens,
         )
         returned_items = response.get("items") if isinstance(response.get("items"), list) else []

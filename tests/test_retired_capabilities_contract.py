@@ -20,6 +20,7 @@ from services.chatgpt_core.payment_link_cache import (
     build_payment_link_cache_payload,
     normalize_payment_link_plan,
     payment_link_cache_matches,
+    validate_payment_link_request_params,
 )
 from services.chatgpt_core.plugin import ChatGPTPlatform
 from services.pipeline.config import PipelineConfigStore
@@ -117,11 +118,16 @@ def test_config_response_and_update_allowlist_drop_retired_keys():
     set_many.assert_called_once_with({}, base_revision=None)
 
 
-def test_payment_plan_normalization_is_plus_only():
+def test_payment_plan_normalization_supports_checkout_only_team_without_other_products():
     assert normalize_payment_link_plan("plus") == "plus"
-    assert normalize_payment_link_plan("team") == "plus"
+    assert normalize_payment_link_plan("team") == "team"
+    assert normalize_payment_link_plan("chatgptteamplan") == "team"
     assert normalize_payment_link_plan("business") == "plus"
     assert normalize_payment_link_plan("enterprise") == "plus"
+    with pytest.raises(ValueError):
+        validate_payment_link_request_params({"plan": "business"})
+    with pytest.raises(ValueError):
+        validate_payment_link_request_params({"plan": "enterprise"})
 
 
 def test_payment_config_response_exposes_plus_pricing_only():
@@ -359,7 +365,7 @@ def test_external_subscription_rejects_paypal_link_without_explicit_plus_metadat
     assert external_subscription._payment_link_from_account(account) == {}
 
 
-@pytest.mark.parametrize("plan", ["team", "business", "enterprise"])
+@pytest.mark.parametrize("plan", ["business", "enterprise"])
 def test_payment_action_rejects_retired_plans(plan):
     platform = ChatGPTPlatform(config=RegisterConfig(extra={}))
     account = Account(
@@ -384,7 +390,6 @@ def test_payment_action_rejects_retired_plans(plan):
 @pytest.mark.parametrize(
     "params",
     [
-        {"plan": "team"},
         {"plan": "business"},
         {"promo_code": "TEAM50"},
         {"workspace_name": "Legacy Workspace"},

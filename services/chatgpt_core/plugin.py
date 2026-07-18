@@ -769,17 +769,29 @@ class ChatGPTPlatform(BasePlatform):
             )
             from services.chatgpt_core.payment_link_cache import (
                 PAYMENT_LINK_FORMAT_LONG_LINK,
+                PAYMENT_LINK_PLAN_TEAM,
                 PAYMENT_SOURCE_LONG_LINK,
                 normalize_payment_link_params,
+                normalize_payment_link_plan,
                 normalize_payment_link_url,
                 payment_link_cache_matches,
+                payment_link_cache_for_params,
+                payment_link_variant_key,
+                validate_payment_link_request_params,
             )
 
-            plan = str(params.get("plan") or "plus").strip().lower()
-            if plan != "plus":
-                return {"ok": False, "error": "Only the Plus payment plan is supported"}
+            try:
+                validate_payment_link_request_params(params)
+            except ValueError as exc:
+                return {"ok": False, "error": str(exc)}
+            plan = normalize_payment_link_plan(params.get("plan"))
+            is_team = plan == PAYMENT_LINK_PLAN_TEAM
             client = LongLinkPaymentClient.from_env()
-            payment_profile = client.get_profile()
+            payment_profile = (
+                client.get_profile(overrides={**params, "plan": plan})
+                if is_team
+                else client.get_profile()
+            )
             payment_profile_hash = str(payment_profile.get("profile_hash") or "").strip()
             expected_profile_hash = str(params.get("payment_profile_hash") or params.get("profile_hash") or "").strip()
             if expected_profile_hash and expected_profile_hash != payment_profile_hash:
@@ -787,19 +799,40 @@ class ChatGPTPlatform(BasePlatform):
             country = str(payment_profile.get("country") or "").strip().upper()
             currency = str(payment_profile.get("currency") or "").strip().upper()
             reuse_cached_link = params.get("reuse_cached_link") is not False
-            cached_link = extra.get("chatgpt_last_payment_link") if isinstance(extra.get("chatgpt_last_payment_link"), dict) else {}
+            profile_detail = payment_profile.get("profile") if isinstance(payment_profile.get("profile"), dict) else {}
+            team_profile = payment_profile.get("team") if isinstance(payment_profile.get("team"), dict) else profile_detail.get("team")
+            team_profile = team_profile if isinstance(team_profile, dict) else {}
+            cache_request = {
+                **params,
+                "plan": plan,
+                "country": country,
+                "currency": currency,
+                "payment_link_format": PAYMENT_LINK_FORMAT_LONG_LINK,
+                "payment_source": PAYMENT_SOURCE_LONG_LINK,
+                "profile_hash": payment_profile_hash,
+            }
+            if is_team:
+                cache_request.update(
+                    {
+                        "team_plan_data": {
+                            "workspace_name": str(team_profile.get("workspace_name") or "").strip(),
+                            "price_interval": str(team_profile.get("price_interval") or "month").strip().lower(),
+                            "seat_quantity": team_profile.get("seat_quantity") or 2,
+                        },
+                        "cancel_url": str(team_profile.get("cancel_url") or "").strip(),
+                        "promo_code_digest": str(
+                            payment_profile.get("promo_code_digest")
+                            or profile_detail.get("promo_code_digest")
+                            or ""
+                        ).strip(),
+                        "plan_name": "chatgptteamplan",
+                    }
+                )
+            normalized_cache_params = normalize_payment_link_params(cache_request)
+            normalized_cache_params["variant_key"] = payment_link_variant_key(cache_request)
+            cached_link = payment_link_cache_for_params(extra, normalized_cache_params)
             cached_format = str(cached_link.get("payment_link_format") or "long_hosted")
             cached_url = normalize_payment_link_url(cached_link.get("url"), cached_format)
-            normalized_cache_params = normalize_payment_link_params(
-                {
-                    "plan": plan,
-                    "country": country,
-                    "currency": currency,
-                    "payment_link_format": PAYMENT_LINK_FORMAT_LONG_LINK,
-                    "payment_source": PAYMENT_SOURCE_LONG_LINK,
-                    "profile_hash": payment_profile_hash,
-                }
-            )
             should_reuse_cached_link = (
                 reuse_cached_link
                 and bool(cached_url)
@@ -831,9 +864,17 @@ class ChatGPTPlatform(BasePlatform):
             access_token = str(a.access_token or "").strip()
             if not access_token:
                 return {"ok": False, "error": "账号缺少 Access Token"}
-            submitted = client.submit_batch(
-                items=[{"access_token": access_token, "request_id": request_id}],
-                expected_profile_hash=payment_profile_hash,
+            submitted = (
+                client.submit_batch(
+                    items=[{"access_token": access_token, "request_id": request_id}],
+                    expected_profile_hash=payment_profile_hash,
+                    profile_overrides={**params, "plan": plan},
+                )
+                if is_team
+                else client.submit_batch(
+                    items=[{"access_token": access_token, "request_id": request_id}],
+                    expected_profile_hash=payment_profile_hash,
+                )
             )
             remote_items = submitted.get("items") if isinstance(submitted.get("items"), list) else []
             remote = next(
@@ -877,7 +918,7 @@ class ChatGPTPlatform(BasePlatform):
                 return {"ok": False, "error": str(exc)}
             data.update(
                 {
-                    "plan": "plus",
+                    "plan": plan,
                     "country": str(data.get("country") or country).strip().upper(),
                     "currency": str(data.get("currency") or currency).strip().upper(),
                     "cache_reused": False,

@@ -46,15 +46,22 @@ from services.account_rate_limit_recovery import (
 from services.chatgpt_core.payment_link_cache import (
     PIX_CLEANED_STATUSES,
     PAYMENT_LINK_FORMAT_LONG_LINK,
+    PAYMENT_LINK_PLAN_TEAM,
+    PAYMENT_LINK_GENERATION_TEAM,
     PAYMENT_SOURCE_LONG_LINK,
     cache_checkout_link_in_extra,
     payment_link_cache_matches,
+    payment_link_cache_for_params,
+    payment_link_generation_kind,
+    payment_link_variant_key,
+    store_payment_link_variant,
     payment_link_expires_soon,
     payment_link_requires_regeneration,
     payment_link_requires_status_sync,
     payment_link_status_label,
     normalize_payment_link_url,
     normalize_payment_link_params,
+    validate_payment_link_request_params,
     validate_plus_payment_request_params,
 )
 from services.chatgpt_core.pix_payment_link_cleanup import (
@@ -401,6 +408,10 @@ class BatchPaymentLinkTaskRequest(AccountFilterRequestMixin):
     skip_existing: bool = True
     force_refresh: bool = False
     limit: int = 0
+
+
+class PaymentLinkProfilePreviewRequest(BaseModel):
+    params: dict[str, Any] = Field(default_factory=dict)
 
 
 class PixPaymentLinkCleanupRequest(BaseModel):
@@ -1861,12 +1872,65 @@ def _filtered_payment_link_request_params(params: dict[str, Any] | None) -> dict
     """
 
     source = params if isinstance(params, dict) else {}
-    return {
-        "plan": "plus",
+    raw_plan = str(source.get("plan") or "plus").strip().lower()
+    is_team = raw_plan in {"team", "team_checkout", "chatgptteamplan", "chatgpt_team_plan"}
+    normalized: dict[str, Any] = {
+        "plan": "team" if is_team else "plus",
+        "generation_kind": PAYMENT_LINK_GENERATION_TEAM if is_team else "plus_checkout",
         "payment_source": PAYMENT_SOURCE_LONG_LINK,
         "payment_link_format": PAYMENT_LINK_FORMAT_LONG_LINK,
         "reuse_cached_link": source.get("reuse_cached_link") is not False,
     }
+    if is_team:
+        nested = source.get("team_plan_data") or source.get("teamPlanData")
+        nested = dict(nested) if isinstance(nested, dict) else {}
+        team_data: dict[str, Any] = {}
+
+        def first_explicit(*candidates: tuple[dict[str, Any], str]) -> Any:
+            for container, key in candidates:
+                if key in container and container.get(key) not in (None, ""):
+                    return container.get(key)
+            return None
+
+        workspace = first_explicit(
+            (nested, "workspace_name"),
+            (nested, "workspaceName"),
+            (source, "workspace_name"),
+            (source, "team_workspace_name"),
+            (source, "teamWorkspaceName"),
+        )
+        interval = first_explicit(
+            (nested, "price_interval"),
+            (nested, "priceInterval"),
+            (source, "price_interval"),
+            (source, "team_price_interval"),
+            (source, "teamPriceInterval"),
+        )
+        seats = first_explicit(
+            (nested, "seat_quantity"),
+            (nested, "seatQuantity"),
+            (source, "seat_quantity"),
+            (source, "team_seat_quantity"),
+            (source, "teamSeatQuantity"),
+        )
+        if workspace is not None:
+            team_data["workspace_name"] = str(workspace).strip()
+        if interval is not None:
+            team_data["price_interval"] = str(interval).strip().lower()
+        if seats is not None:
+            team_data["seat_quantity"] = seats
+        if team_data:
+            normalized["team_plan_data"] = team_data
+
+        for canonical, aliases in {
+            "promo_code": ("promo_code", "promoCode"),
+            "cancel_url": ("cancel_url", "cancelUrl"),
+            "plan_name": ("plan_name", "planName"),
+        }.items():
+            value = first_explicit(*((source, alias) for alias in aliases))
+            if value is not None:
+                normalized[canonical] = str(value).strip()
+    return normalized
 
 
 def _build_batch_payment_link_params(account: AccountModel, request_params: dict[str, Any]) -> dict[str, Any]:
@@ -1878,7 +1942,56 @@ def _build_batch_payment_link_params(account: AccountModel, request_params: dict
     params["country"] = str(request_params.get("country") or "").strip().upper()
     params["currency"] = str(request_params.get("currency") or "").strip().upper()
     params["profile_hash"] = str(request_params.get("profile_hash") or "").strip()
+    params["generation_kind"] = payment_link_generation_kind(params)
+    params["variant_key"] = payment_link_variant_key(params)
     return params
+
+
+def _payment_link_params_from_profile(
+    request_params: dict[str, Any],
+    profile: dict[str, Any],
+) -> dict[str, Any]:
+    """Merge the redacted, frozen long-link profile into task parameters."""
+
+    merged = _filtered_payment_link_request_params(request_params)
+    profile_detail = profile.get("profile") if isinstance(profile.get("profile"), dict) else {}
+    plan = str(profile.get("plan") or profile_detail.get("plan") or merged.get("plan") or "plus").strip().lower()
+    if plan in {"team", "team_checkout", "chatgptteamplan"}:
+        merged["plan"] = PAYMENT_LINK_PLAN_TEAM
+        team = profile.get("team") if isinstance(profile.get("team"), dict) else profile_detail.get("team")
+        if not isinstance(team, dict):
+            team = profile.get("team_plan_data") if isinstance(profile.get("team_plan_data"), dict) else {}
+        if not team and isinstance(profile_detail.get("team_plan_data"), dict):
+            team = profile_detail.get("team_plan_data")
+        existing_team = merged.get("team_plan_data") if isinstance(merged.get("team_plan_data"), dict) else {}
+        merged["team_plan_data"] = {
+            "workspace_name": str(team.get("workspace_name") or team.get("workspaceName") or existing_team.get("workspace_name") or "").strip(),
+            "price_interval": str(team.get("price_interval") or team.get("priceInterval") or existing_team.get("price_interval") or "month").strip().lower(),
+            "seat_quantity": team.get("seat_quantity") or team.get("seatQuantity") or existing_team.get("seat_quantity") or 2,
+        }
+        merged["cancel_url"] = str(
+            team.get("cancel_url")
+            or team.get("cancelUrl")
+            or merged.get("cancel_url")
+            or ""
+        ).strip()
+        merged["promo_code_digest"] = str(
+            profile.get("promo_code_digest")
+            or profile_detail.get("promo_code_digest")
+            or team.get("promo_code_digest")
+            or ""
+        ).strip()
+        merged["plan_name"] = str(
+            profile.get("plan_name") or profile_detail.get("plan_name") or "chatgptteamplan"
+        ).strip()
+    else:
+        merged["plan"] = "plus"
+    merged["country"] = str(profile.get("country") or profile_detail.get("country") or profile_detail.get("billing_country") or "").strip().upper()
+    merged["currency"] = str(profile.get("currency") or profile_detail.get("currency") or "").strip().upper()
+    merged["profile_hash"] = str(profile.get("profile_hash") or profile_detail.get("profile_hash") or "").strip()
+    merged["generation_kind"] = payment_link_generation_kind(merged)
+    merged["variant_key"] = payment_link_variant_key(merged)
+    return merged
 
 
 _PAYMENT_LINK_HISTORY_SUCCESS_STATUSES = frozenset({"succeeded"})
@@ -2063,6 +2176,40 @@ def _payment_link_generation_has_url(row: PaymentLinkGenerationModel) -> bool:
     return bool(_validated_payment_link_url(getattr(row, "url", "")))
 
 
+def _payment_link_generation_matches_variant(
+    row: PaymentLinkGenerationModel | None,
+    params: dict[str, Any] | None,
+) -> bool:
+    """Match history by product/config variant, not only by account id."""
+
+    if row is None:
+        return False
+    expected = normalize_payment_link_params(params)
+    raw_result = row.get_result() if hasattr(row, "get_result") else {}
+    actual = {
+        **raw_result,
+        "plan": raw_result.get("plan") or getattr(row, "generation_kind", "") or "plus",
+        "generation_kind": raw_result.get("generation_kind") or getattr(row, "generation_kind", "") or "",
+        "profile_hash": raw_result.get("profile_hash") or getattr(row, "profile_hash", "") or "",
+        "variant_key": raw_result.get("variant_key") or getattr(row, "variant_key", "") or "",
+    }
+    actual_normalized = normalize_payment_link_params(actual)
+    if actual_normalized.get("generation_kind") != expected.get("generation_kind"):
+        return False
+    if expected.get("plan") == PAYMENT_LINK_PLAN_TEAM:
+        return all(actual_normalized.get(key) == expected.get(key) for key in (
+            "workspace_name",
+            "price_interval",
+            "seat_quantity",
+            "promo_code_digest",
+            "cancel_url",
+            "plan_name",
+        ))
+    expected_profile = str(expected.get("profile_hash") or "").strip()
+    actual_profile = str(actual_normalized.get("profile_hash") or "").strip()
+    return not expected_profile or not actual_profile or expected_profile == actual_profile
+
+
 def _validated_payment_link_url(value: Any) -> str:
     """Match the account-list contract for a browser-openable payment URL."""
 
@@ -2183,6 +2330,7 @@ def _payment_link_skip_reason(
     session: Session | None = None,
     exclude_request_id: str = "",
     history_rows: list[PaymentLinkGenerationModel] | None = None,
+    variant_params: dict[str, Any] | None = None,
 ) -> str:
     """Return a durable, account-level generation guard reason.
 
@@ -2198,8 +2346,22 @@ def _payment_link_skip_reason(
         extra = {}
     if not isinstance(extra, dict):
         extra = {}
-    cached = extra.get("chatgpt_last_payment_link")
-    cached = cached if isinstance(cached, dict) else {}
+    desired_params = variant_params if isinstance(variant_params, dict) else {"plan": "plus"}
+    desired_plan = str(desired_params.get("plan") or "plus").strip().lower()
+    cached = payment_link_cache_for_params(extra, desired_params)
+    # Preserve the historical Plus guard before the remote profile is known:
+    # a legacy/current pointer may not carry the normalized format or profile
+    # hash yet, but it is still durable success evidence.  Never apply this
+    # fallback to Team, where a Plus pointer must remain independent.
+    raw_current = extra.get("chatgpt_last_payment_link")
+    if desired_plan != PAYMENT_LINK_PLAN_TEAM and isinstance(raw_current, dict):
+        raw_plan = str(raw_current.get("plan") or "plus").strip().lower()
+        if raw_plan not in {PAYMENT_LINK_PLAN_TEAM, "team_checkout", "chatgptteamplan"}:
+            if (
+                _payment_link_current_cache_url(raw_current)
+                or str(raw_current.get("link_status") or "").strip().lower() in PIX_CLEANED_STATUSES
+            ):
+                cached = raw_current
     legacy_cached = extra.get("chatgpt_paypal_url")
     legacy_cached = legacy_cached if isinstance(legacy_cached, dict) else {}
 
@@ -2207,7 +2369,10 @@ def _payment_link_skip_reason(
         return "账号已失效，不能生成支付链接" if bool(force_refresh) else "账号已失效，默认不预生成支付链接"
     if (
         _payment_link_paid_terminal_marker(account, cached, extra)
-        or _payment_link_paid_terminal_marker(account, legacy_cached, {})
+        or (
+            str(desired_params.get("plan") or "plus").strip().lower() != PAYMENT_LINK_PLAN_TEAM
+            and _payment_link_paid_terminal_marker(account, legacy_cached, {})
+        )
     ):
         return "账号已明确支付完成，不能重复生成支付链接"
     if status == "subscribed":
@@ -2229,7 +2394,7 @@ def _payment_link_skip_reason(
         # fields are legacy/orphan history and must not block the replacement.
         if not _payment_link_generation_matches_account(row, account):
             continue
-        if _payment_link_generation_is_fresh_inflight(row):
+        if _payment_link_generation_is_fresh_inflight(row) and _payment_link_generation_matches_variant(row, desired_params):
             return "已有支付链接生成任务正在进行"
 
     # Force refresh is an explicit operator override for historical success or
@@ -2240,11 +2405,14 @@ def _payment_link_skip_reason(
     cached_status = str(cached.get("link_status") or "").strip().lower()
     if cached_status in PIX_CLEANED_STATUSES:
         return "已有支付链接提取记录（链接已清理），默认不重复生成"
-    if _payment_link_current_cache_url(cached) or _payment_link_current_cache_url(legacy_cached):
+    if _payment_link_current_cache_url(cached) or (
+        desired_plan != PAYMENT_LINK_PLAN_TEAM and _payment_link_current_cache_url(legacy_cached)
+    ):
         return "已有当前支付链接，默认不重复生成"
     if any(
         str(row.status or "").strip().lower() in _PAYMENT_LINK_HISTORY_SUCCESS_STATUSES
         and _payment_link_generation_matches_account(row, account)
+        and _payment_link_generation_matches_variant(row, desired_params)
         and _payment_link_generation_has_url(row)
         for row in loaded_history_rows
     ):
@@ -2262,6 +2430,15 @@ _PAYMENT_LINK_HISTORY_RESULT_FIELDS = (
     "url",
     "paypal_url",
     "plan",
+    "generation_kind",
+    "variant_key",
+    "team_plan_data",
+    "workspace_name",
+    "price_interval",
+    "seat_quantity",
+    "promo_code_digest",
+    "cancel_url",
+    "plan_name",
     "country",
     "currency",
     "payment_link_format",
@@ -2310,6 +2487,8 @@ def _upsert_payment_link_generation(
     status: str,
     profile_hash: str = "",
     link_type: str = "",
+    generation_kind: str = "",
+    variant_key: str = "",
     remote_batch_id: str = "",
     remote_job_id: str = "",
     submitted_at: str = "",
@@ -2358,6 +2537,10 @@ def _upsert_payment_link_generation(
         row.profile_hash = str(profile_hash)[:128]
     if link_type:
         row.link_type = str(link_type)[:64]
+    if generation_kind:
+        row.generation_kind = str(generation_kind)[:64]
+    if variant_key:
+        row.variant_key = str(variant_key)[:128]
     if remote_batch_id:
         row.remote_batch_id = str(remote_batch_id)[:128]
     if remote_job_id:
@@ -2396,10 +2579,17 @@ def _delete_payment_link_generation_by_request_id(session: Session, request_id: 
 
 def _resolve_batch_payment_link_accounts(
     req: BatchPaymentLinkTaskRequest,
+    *,
+    variant_params: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], list[int], list[dict[str, Any]], list[dict[str, Any]]]:
     requested_ids = _normalize_batch_account_ids(req.account_ids)
     force_refresh = bool(req.force_refresh)
     limit = max(int(req.limit or 0), 0)
+    desired_params = (
+        dict(variant_params)
+        if isinstance(variant_params, dict)
+        else _filtered_payment_link_request_params(req.params)
+    )
 
     if requested_ids:
         if len(requested_ids) > 1000:
@@ -2429,6 +2619,7 @@ def _resolve_batch_payment_link_accounts(
                     account,
                     force_refresh=force_refresh,
                     history_rows=history_by_account.get(account_id, []),
+                    variant_params=desired_params,
                 )
                 if reason:
                     skipped.append({**item, "reason": reason})
@@ -2467,6 +2658,7 @@ def _resolve_batch_payment_link_accounts(
                 account,
                 force_refresh=force_refresh,
                 history_rows=history_by_account.get(account_id, []),
+                variant_params=desired_params,
             )
             if reason:
                 skipped.append({**item, "reason": reason})
@@ -5261,11 +5453,14 @@ def enqueue_batch_payment_link_task(
     background_tasks: BackgroundTasks | None = None,
 ) -> dict[str, Any]:
     try:
-        validate_plus_payment_request_params(req.params)
+        validate_payment_link_request_params(req.params)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     request_params = _filtered_payment_link_request_params(req.params)
-    eligible_accounts, missing_ids, skipped_accounts, matched_accounts = _resolve_batch_payment_link_accounts(req)
+    eligible_accounts, missing_ids, skipped_accounts, matched_accounts = _resolve_batch_payment_link_accounts(
+        req,
+        variant_params=request_params,
+    )
     total_requested = len(_normalize_batch_account_ids(req.account_ids)) if req.account_ids else len(matched_accounts)
     filter_audit = _task_account_filter_audit(
         req,
@@ -10874,6 +11069,9 @@ def _run_batch_payment_links(task_id: str, account_ids: list[int]):
     skipped_items = list(meta.get("skipped_items") or [])
     missing_ids = list(meta.get("missing_ids") or [])
     request_params = _filtered_payment_link_request_params(dict(meta.get("params") or {}))
+    profile_overrides = dict(request_params)
+    is_team_task = str(request_params.get("plan") or "plus").strip().lower() == PAYMENT_LINK_PLAN_TEAM
+    generation_label = "Team checkout 长链接" if is_team_task else "支付链接"
     skip_existing = bool(meta.get("skip_existing", True))
     force_refresh = bool(meta.get("force_refresh", False))
     profile: dict[str, Any] = {}
@@ -10950,6 +11148,8 @@ def _run_batch_payment_links(task_id: str, account_ids: list[int]):
                         status=remote_status,
                         profile_hash=str(profile.get("profile_hash") or ""),
                         link_type=str(profile.get("link_type") or ""),
+                        generation_kind=payment_link_generation_kind(request_params),
+                        variant_key=payment_link_variant_key(request_params),
                         remote_batch_id=remote_batch_id,
                         remote_job_id=remote_job_id,
                         submitted_at=submitted_at,
@@ -10976,6 +11176,8 @@ def _run_batch_payment_links(task_id: str, account_ids: list[int]):
                             status="succeeded",
                             profile_hash=str(data.get("profile_hash") or profile.get("profile_hash") or ""),
                             link_type=str(data.get("link_type") or profile.get("link_type") or ""),
+                            generation_kind=str(data.get("generation_kind") or payment_link_generation_kind(request_params)),
+                            variant_key=str(data.get("variant_key") or payment_link_variant_key(request_params)),
                             remote_batch_id=str(data.get("remote_batch_id") or remote_batch_id),
                             remote_job_id=str(data.get("remote_job_id") or remote_job_id),
                             submitted_at=submitted_at,
@@ -10986,7 +11188,7 @@ def _run_batch_payment_links(task_id: str, account_ids: list[int]):
                         )
                         _task_store.add_cashier_url(task_id, str(data.get("url") or ""))
                         success_count += 1
-                        _log(task_id, f"[OK] 支付链接已生成并保存: {email}")
+                        _log(task_id, f"[OK] {generation_label}已生成并保存: {email}")
                     except Exception as exc:
                         error_text = sanitize_error_message(exc)[:1600]
                         errors.append(f"{email}: {error_text}")
@@ -10999,6 +11201,8 @@ def _run_batch_payment_links(task_id: str, account_ids: list[int]):
                             status="failed",
                             profile_hash=str(profile.get("profile_hash") or ""),
                             link_type=str(profile.get("link_type") or ""),
+                            generation_kind=payment_link_generation_kind(request_params),
+                            variant_key=payment_link_variant_key(request_params),
                             remote_batch_id=remote_batch_id,
                             remote_job_id=remote_job_id,
                             submitted_at=submitted_at,
@@ -11006,7 +11210,7 @@ def _run_batch_payment_links(task_id: str, account_ids: list[int]):
                             generated_at=_remote_time(remote.get("completed_at")),
                             error=error_text,
                         )
-                        _log(task_id, f"[FAIL] 支付链接保存失败: {email} - {error_text}")
+                        _log(task_id, f"[FAIL] {generation_label}保存失败: {email} - {error_text}")
                 else:
                     interruption = remote_status == "interrupted"
                     error_text = sanitize_error_message(remote.get("error") or "支付链接生成失败")[:1600]
@@ -11022,6 +11226,8 @@ def _run_batch_payment_links(task_id: str, account_ids: list[int]):
                         status="interrupted" if interruption else "failed",
                         profile_hash=str(profile.get("profile_hash") or ""),
                         link_type=str(profile.get("link_type") or ""),
+                        generation_kind=payment_link_generation_kind(request_params),
+                        variant_key=payment_link_variant_key(request_params),
                         remote_batch_id=remote_batch_id,
                         remote_job_id=remote_job_id,
                         submitted_at=submitted_at,
@@ -11029,7 +11235,7 @@ def _run_batch_payment_links(task_id: str, account_ids: list[int]):
                         generated_at=_remote_time(remote.get("completed_at")),
                         error=error_text,
                     )
-                    label = "远端任务中断" if interruption else "支付链接生成失败"
+                    label = "远端任务中断" if interruption else f"{generation_label}生成失败"
                     _log(task_id, f"[FAIL] {label}: {email} - {error_text}")
                 terminal_request_ids.add(request_id)
                 changed = True
@@ -11055,6 +11261,8 @@ def _run_batch_payment_links(task_id: str, account_ids: list[int]):
                         status="interrupted",
                         profile_hash=str(profile.get("profile_hash") or ""),
                         link_type=str(profile.get("link_type") or ""),
+                        generation_kind=payment_link_generation_kind(request_params),
+                        variant_key=payment_link_variant_key(request_params),
                         error=reason,
                     )
                     item_reason = reason
@@ -11070,17 +11278,18 @@ def _run_batch_payment_links(task_id: str, account_ids: list[int]):
 
     try:
         client = LongLinkPaymentClient.from_env()
-        profile = client.get_profile(force_refresh=True)
+        profile = (
+            client.get_profile(overrides=profile_overrides, force_refresh=True)
+            if is_team_task
+            else client.get_profile(force_refresh=True)
+        )
         profile_hash = str(profile.get("profile_hash") or "").strip()
         if not profile_hash:
             raise LongLinkPaymentError("支付链接生成服务未返回配置哈希")
-        request_params.update(
-            {
-                "profile_hash": profile_hash,
-                "country": str(profile.get("country") or "").strip().upper(),
-                "currency": str(profile.get("currency") or "").strip().upper(),
-            }
-        )
+        request_params = _payment_link_params_from_profile(request_params, profile)
+        generation_kind = payment_link_generation_kind(request_params)
+        variant_key = payment_link_variant_key(request_params)
+        team_data = request_params.get("team_plan_data") if isinstance(request_params.get("team_plan_data"), dict) else {}
         _task_store.update_meta(
             task_id,
             {
@@ -11090,16 +11299,29 @@ def _run_batch_payment_links(task_id: str, account_ids: list[int]):
                     "currency": request_params["currency"],
                     "profile_hash": profile_hash,
                     "effective_concurrency": int(profile.get("effective_concurrency") or 0),
+                    "generation_kind": generation_kind,
+                    "variant_key": variant_key,
+                    "plan": request_params.get("plan") or "plus",
+                    "team_plan_data": dict(team_data),
+                    "promo_code_digest": str(request_params.get("promo_code_digest") or ""),
                 },
                 "payment_link_state": "preparing",
+                "params": dict(request_params),
             },
         )
         _log(
             task_id,
-            "[支付链接生成] 已冻结 long-link 管理端配置 "
+            f"[{generation_label}] 已冻结 long-link 管理端配置 "
             f"type={profile.get('link_type') or '-'} profile={profile_hash[:12]} "
             f"country={request_params['country'] or '-'} currency={request_params['currency'] or '-'} "
-            f"concurrency={profile.get('effective_concurrency') or '-'}",
+            f"concurrency={profile.get('effective_concurrency') or '-'}"
+            + (
+                f" workspace={team_data.get('workspace_name') or '-'}"
+                f" interval={team_data.get('price_interval') or '-'}"
+                f" seats={team_data.get('seat_quantity') or '-'}"
+                if is_team_task
+                else ""
+            ),
         )
 
         for missing_id in missing_ids:
@@ -11123,14 +11345,11 @@ def _run_batch_payment_links(task_id: str, account_ids: list[int]):
                     if not primary_email:
                         primary_email = email
                     extra = account.get_extra()
-                    cached = (
-                        extra.get("chatgpt_last_payment_link")
-                        if isinstance(extra.get("chatgpt_last_payment_link"), dict)
-                        else {}
-                    )
+                    params = _build_batch_payment_link_params(account, request_params)
+                    cached = payment_link_cache_for_params(extra, params)
                     legacy_cached = (
                         extra.get("chatgpt_paypal_url")
-                        if isinstance(extra.get("chatgpt_paypal_url"), dict)
+                        if not is_team_task and isinstance(extra.get("chatgpt_paypal_url"), dict)
                         else {}
                     )
                     current_cached_url = _payment_link_current_cache_url(cached) or _payment_link_current_cache_url(legacy_cached)
@@ -11139,6 +11358,7 @@ def _run_batch_payment_links(task_id: str, account_ids: list[int]):
                         force_refresh=force_refresh,
                         session=session,
                         exclude_request_id=f"{instance_id}:{task_id}:{int(account_id or 0)}",
+                        variant_params=params,
                     )
                     if skip_reason:
                         # Preserve the existing already-paid reconciliation
@@ -11171,7 +11391,6 @@ def _run_batch_payment_links(task_id: str, account_ids: list[int]):
                         _log(task_id, f"[SKIP] 支付链接生成跳过: {email or account_id} - {skip_reason}")
                         continue
 
-                    params = _build_batch_payment_link_params(account, request_params)
                     raw_cached_url = str(cached.get("url") or "").strip()
                     cached_format = str(cached.get("payment_link_format") or "long_hosted").strip()
                     cached_url = _validated_payment_link_url(
@@ -11179,7 +11398,7 @@ def _run_batch_payment_links(task_id: str, account_ids: list[int]):
                     )
                     if cached_url and cached_url != raw_cached_url:
                         cached = {**cached, "url": cached_url}
-                        extra["chatgpt_last_payment_link"] = cached
+                        store_payment_link_variant(extra, cached, make_current=True)
                         account.set_extra(extra)
                         session.add(account)
                     if cached_url and not force_refresh and payment_link_requires_status_sync(cached):
@@ -11256,15 +11475,12 @@ def _run_batch_payment_links(task_id: str, account_ids: list[int]):
                             force_refresh=force_refresh,
                             session=guard_session,
                             exclude_request_id=request_id,
+                            variant_params=_build_batch_payment_link_params(account, request_params),
                         )
                         if not reason and skip_existing and not force_refresh:
                             params = _build_batch_payment_link_params(account, request_params)
                             extra = account.get_extra()
-                            cached = (
-                                extra.get("chatgpt_last_payment_link")
-                                if isinstance(extra.get("chatgpt_last_payment_link"), dict)
-                                else {}
-                            )
+                            cached = payment_link_cache_for_params(extra, params)
                             cached_format = str(cached.get("payment_link_format") or "long_hosted").strip()
                             cached_url = _validated_payment_link_url(
                                 normalize_payment_link_url(
@@ -11286,6 +11502,8 @@ def _run_batch_payment_links(task_id: str, account_ids: list[int]):
                             status="submitting",
                             profile_hash=profile_hash,
                             link_type=str(profile.get("link_type") or ""),
+                            generation_kind=payment_link_generation_kind(request_params),
+                            variant_key=payment_link_variant_key(request_params),
                         )
                         guarded_prepared.append(pending)
                 guard_session.commit()
@@ -11301,17 +11519,26 @@ def _run_batch_payment_links(task_id: str, account_ids: list[int]):
         if prepared:
             control.checkpoint(consume_skip=False)
             _task_store.update_meta(task_id, {"payment_link_state": "submitting", "payment_link_submitted": 0})
-            response = client.submit_batch(
-                items=[
-                    {
-                        "account_id": item["account_id"],
-                        "email": item["email"],
-                        "request_id": item["request_id"],
-                        "access_token": item["access_token"],
-                    }
-                    for item in prepared
-                ],
-                expected_profile_hash=profile_hash,
+            submission_items = [
+                {
+                    "account_id": item["account_id"],
+                    "email": item["email"],
+                    "request_id": item["request_id"],
+                    "access_token": item["access_token"],
+                }
+                for item in prepared
+            ]
+            response = (
+                client.submit_batch(
+                    items=submission_items,
+                    expected_profile_hash=profile_hash,
+                    profile_overrides=profile_overrides,
+                )
+                if is_team_task
+                else client.submit_batch(
+                    items=submission_items,
+                    expected_profile_hash=profile_hash,
+                )
             )
             remote_items = response.get("items") if isinstance(response.get("items"), list) else []
             submitted_request_ids = {str(item["request_id"]) for item in prepared}
@@ -11342,7 +11569,7 @@ def _run_batch_payment_links(task_id: str, account_ids: list[int]):
                     "payment_link_remote_summary": dict(response.get("summary") or {}),
                 },
             )
-            _log(task_id, f"[SUBMIT] 已批量提交 {len(prepared)} 个账号，开始统一轮询 {len(batch_ids)} 个远端批次")
+            _log(task_id, f"[SUBMIT] 已批量提交 {len(prepared)} 个账号生成{generation_label}，开始统一轮询 {len(batch_ids)} 个远端批次")
 
             poll_interval = max(float(os.getenv("OPENAI_PAY_LONG_LINK_POLL_INTERVAL_SECONDS") or 2.0), 0.2)
             job_timeout = max(float(os.getenv("OPENAI_PAY_LONG_LINK_JOB_TIMEOUT_SECONDS") or 1800.0), 5.0)
@@ -11397,7 +11624,7 @@ def _run_batch_payment_links(task_id: str, account_ids: list[int]):
             aggregate = "completed_success"
         total_skipped = skipped_count + len(skipped_items)
         summary_message = (
-            f"批量支付链接生成完成: 成功 {success_count} 个，跳过 {total_skipped} 个，"
+            f"批量{generation_label}生成完成: 成功 {success_count} 个，跳过 {total_skipped} 个，"
             f"失败 {len(errors)} 个，中断 {remote_interrupted_count} 个"
         )
         _task_store.update_meta(
@@ -11464,7 +11691,7 @@ def _run_batch_payment_links(task_id: str, account_ids: list[int]):
     except Exception as exc:
         error_text = sanitize_error_message(exc)[:1600]
         _mark_unresolved_interrupted(error_text)
-        _log(task_id, f"[FAIL] 批量支付链接生成失败: {error_text}")
+        _log(task_id, f"[FAIL] 批量{generation_label}生成失败: {error_text}")
         _save_task_log(
             "chatgpt",
             primary_email,
@@ -16876,10 +17103,18 @@ def _payment_link_profile_view(profile: dict[str, Any]) -> dict[str, Any]:
     raw_profile = source.get("profile") if isinstance(source.get("profile"), dict) else {}
     raw_regions = raw_profile.get("regions") if isinstance(raw_profile.get("regions"), dict) else {}
     raw_pix = raw_profile.get("pix") if isinstance(raw_profile.get("pix"), dict) else {}
+    raw_team = source.get("team") if isinstance(source.get("team"), dict) else raw_profile.get("team")
+    raw_team = raw_team if isinstance(raw_team, dict) else {}
 
     def text(key: str, *, default: str = "", upper: bool = False, limit: int = 128) -> str:
         value = str(source.get(key) or raw_profile.get(key) or default).strip()[:limit]
         return value.upper() if upper else value
+
+    def nonnegative_int(value: Any) -> int:
+        try:
+            return max(int(value or 0), 0)
+        except (TypeError, ValueError):
+            return 0
 
     return {
         "link_type": text("link_type", default="hosted", limit=64).lower(),
@@ -16899,7 +17134,18 @@ def _payment_link_profile_view(profile: dict[str, Any]) -> dict[str, Any]:
             "request_preset": str(raw_pix.get("request_preset") or "").strip()[:64],
             "seed_pool_configured": bool(raw_pix.get("seed_pool_configured")),
         },
-        "effective_concurrency": max(int(source.get("effective_concurrency") or 0), 0),
+        "plan": text("plan", default="plus", limit=32).lower(),
+        "generation_kind": text("generation_kind", default="plus_checkout", limit=64).lower(),
+        "plan_name": text("plan_name", default="chatgptplusplan", limit=64),
+        "team": {
+            "workspace_name": str(raw_team.get("workspace_name") or "").strip()[:256],
+            "price_interval": str(raw_team.get("price_interval") or "").strip().lower()[:16],
+            "seat_quantity": nonnegative_int(raw_team.get("seat_quantity")),
+            "cancel_url": str(raw_team.get("cancel_url") or "").strip()[:2048],
+            "promo_code_configured": bool(raw_team.get("promo_code_configured")),
+        },
+        "variant_key": text("variant_key", limit=128),
+        "effective_concurrency": nonnegative_int(source.get("effective_concurrency")),
         "profile_hash": text("profile_hash", limit=128),
     }
 
@@ -16912,6 +17158,28 @@ def get_chatgpt_payment_link_profile():
 
     try:
         return _payment_link_profile_view(LongLinkPaymentClient.from_env().get_profile(force_refresh=True))
+    except LongLinkPaymentError as exc:
+        raise HTTPException(503, sanitize_error_message(exc)[:600]) from exc
+
+
+@router.post("/chatgpt/payment-links/profile")
+def preview_chatgpt_payment_link_profile(payload: PaymentLinkProfilePreviewRequest):
+    """Preview the effective profile after safe Team task overrides."""
+
+    from services.chatgpt_core.long_link_payment_client import LongLinkPaymentClient, LongLinkPaymentError
+
+    try:
+        validate_payment_link_request_params(payload.params)
+        overrides = _filtered_payment_link_request_params(payload.params)
+        client = LongLinkPaymentClient.from_env()
+        profile = (
+            client.get_profile(overrides=overrides, force_refresh=True)
+            if str(overrides.get("plan") or "plus").strip().lower() == PAYMENT_LINK_PLAN_TEAM
+            else client.get_profile(force_refresh=True)
+        )
+        return _payment_link_profile_view(profile)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
     except LongLinkPaymentError as exc:
         raise HTTPException(503, sanitize_error_message(exc)[:600]) from exc
 
@@ -17250,6 +17518,8 @@ def list_chatgpt_payment_link_history(
                 "remote_job_id": row.remote_job_id,
                 "profile_hash": row.profile_hash,
                 "link_type": row.link_type,
+                "generation_kind": row.generation_kind,
+                "variant_key": row.variant_key,
                 "status": row.status,
                 "url": row.url,
                 "submitted_at": row.submitted_at,

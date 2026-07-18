@@ -22,10 +22,16 @@ from services.chatgpt_core.local_status_refresh import schedule_chatgpt_local_st
 from services.chatgpt_core.invalid_account_recheck import recheck_invalid_chatgpt_account
 from services.chatgpt_core.payment_link_cache import (
     PAYMENT_LINK_FORMAT_PAYPAL,
+    PAYMENT_LINK_PLAN_TEAM,
     PAYMENT_SOURCE_LONG_LINK_PAYPAL,
     build_payment_link_cache_payload,
     normalize_payment_link_output_format,
+    normalize_payment_link_plan,
     normalize_payment_link_source,
+    payment_link_cache_for_params,
+    payment_link_generation_kind,
+    payment_link_variant_key,
+    store_payment_link_variant,
 )
 from services.chatgpt_sync import update_account_model_cliproxy_sync
 from services.sub2api_sync import backfill_chatgpt_account_to_sub2api, probe_chatgpt_sub2api_status, update_account_model_sub2api_sync
@@ -183,17 +189,27 @@ def _apply_action_result(
                         raise ValueError("支付链接历史请求身份不匹配")
             extra = acc_model.get_extra()
             acc_model.cashier_url = checkout_url
-            existing_cache = extra.get("chatgpt_last_payment_link") if isinstance(extra.get("chatgpt_last_payment_link"), dict) else {}
+            existing_cache = payment_link_cache_for_params(extra, data)
             cache_payload = build_payment_link_cache_payload(
                 data,
                 source=str(data.get("cache_source") or "payment_link_action"),
                 fallback=existing_cache,
             )
-            extra["chatgpt_last_payment_link"] = cache_payload
+            cache_payload["generation_kind"] = str(
+                data.get("generation_kind") or payment_link_generation_kind(cache_payload)
+            )
+            cache_payload["variant_key"] = str(
+                data.get("variant_key") or payment_link_variant_key(cache_payload)
+            )
+            store_payment_link_variant(extra, cache_payload, make_current=True)
+            is_team = normalize_payment_link_plan(cache_payload.get("plan")) == PAYMENT_LINK_PLAN_TEAM
             if (
-                str(data.get("link_type") or cache_payload.get("link_type") or "").strip().lower() == "paypal"
-                or normalize_payment_link_output_format(cache_payload.get("payment_link_format")) == PAYMENT_LINK_FORMAT_PAYPAL
-                or normalize_payment_link_source(cache_payload.get("payment_source")) == PAYMENT_SOURCE_LONG_LINK_PAYPAL
+                not is_team
+                and (
+                    str(data.get("link_type") or cache_payload.get("link_type") or "").strip().lower() == "paypal"
+                    or normalize_payment_link_output_format(cache_payload.get("payment_link_format")) == PAYMENT_LINK_FORMAT_PAYPAL
+                    or normalize_payment_link_source(cache_payload.get("payment_source")) == PAYMENT_SOURCE_LONG_LINK_PAYPAL
+                )
             ):
                 paypal_payload = dict(cache_payload)
                 paypal_payload["paypal_url"] = str(paypal_payload.get("paypal_url") or checkout_url).strip()
@@ -221,6 +237,12 @@ def _apply_action_result(
                 history.remote_job_id = str(data.get("remote_job_id") or history.remote_job_id or "")[:128]
                 history.profile_hash = str(data.get("profile_hash") or history.profile_hash or "")[:128]
                 history.link_type = str(data.get("link_type") or history.link_type or "")[:64]
+                history.generation_kind = str(
+                    data.get("generation_kind") or cache_payload.get("generation_kind") or history.generation_kind or "plus_checkout"
+                )[:64]
+                history.variant_key = str(
+                    data.get("variant_key") or cache_payload.get("variant_key") or history.variant_key or ""
+                )[:128]
                 history.url = checkout_url[:10_000]
                 history.generated_at = str(data.get("generated_at") or history.generated_at or datetime.now(timezone.utc).isoformat())[:64]
                 history.persisted_at = datetime.now(timezone.utc).isoformat()
@@ -231,6 +253,16 @@ def _apply_action_result(
                         for key in (
                             "url",
                             "paypal_url",
+                            "plan",
+                            "generation_kind",
+                            "variant_key",
+                            "plan_name",
+                            "team_plan_data",
+                            "workspace_name",
+                            "price_interval",
+                            "seat_quantity",
+                            "promo_code_digest",
+                            "cancel_url",
                             "link_type",
                             "link_expires_at",
                             "profile_hash",

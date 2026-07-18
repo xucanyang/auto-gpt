@@ -23,6 +23,8 @@ type PaymentLinkGeneration = {
   remote_job_id?: string
   profile_hash?: string
   link_type?: string
+  generation_kind?: string
+  variant_key?: string
   status?: string
   url?: string
   submitted_at?: string
@@ -58,6 +60,26 @@ function paymentLinkTypeLabel(value: unknown, format?: unknown) {
   if (normalizedFormat === 'paypal_url') return 'PAYPAL'
   if (normalizedFormat === 'long_link') return 'LONG-LINK'
   return '历史链接'
+}
+
+function paymentLinkProductLabel(value: any) {
+  const kind = String(value?.generation_kind || value?.result?.generation_kind || '').trim().toLowerCase()
+  const plan = String(value?.plan || value?.result?.plan || '').trim().toLowerCase()
+  return kind === 'team_checkout' || plan === 'team' ? 'TEAM' : 'PLUS'
+}
+
+function paymentLinkTeamMeta(value: any) {
+  const result = value?.result && typeof value.result === 'object' ? value.result : {}
+  const nested = value?.team_plan_data && typeof value.team_plan_data === 'object'
+    ? value.team_plan_data
+    : result?.team_plan_data && typeof result.team_plan_data === 'object'
+      ? result.team_plan_data
+      : {}
+  return {
+    workspaceName: String(value?.workspace_name || result?.workspace_name || nested?.workspace_name || '').trim(),
+    priceInterval: String(value?.price_interval || result?.price_interval || nested?.price_interval || '').trim().toLowerCase(),
+    seatQuantity: Number(value?.seat_quantity || result?.seat_quantity || nested?.seat_quantity || 0),
+  }
 }
 
 function paymentLinkExpiryMeta(
@@ -585,6 +607,8 @@ export function AccountDetailModal({
         ? extra.chatgpt_paypal_url
         : {}
   const currentPaymentLinkUrl = String(currentPaymentLink.url || currentPaymentLink.paypal_url || '').trim()
+  const currentPaymentLinkProduct = paymentLinkProductLabel(currentPaymentLink)
+  const currentPaymentLinkTeam = paymentLinkTeamMeta(currentPaymentLink)
   const currentPaymentLinkStatus = paymentLinkStatusMeta(currentPaymentLink.link_status || (currentPaymentLinkUrl ? 'succeeded' : ''))
   const currentPaymentLinkExpiry = paymentLinkExpiryMeta(
     currentPaymentLink.link_type,
@@ -711,6 +735,7 @@ export function AccountDetailModal({
                   <Text type="secondary" style={{ fontSize: 12, lineHeight: '20px' }}>当前链接</Text>
                   <div style={{ minWidth: 0 }}>
                     <Space size={6} wrap style={{ marginBottom: 4 }}>
+                      <Tag color={currentPaymentLinkProduct === 'TEAM' ? 'gold' : 'default'}>{currentPaymentLinkProduct}</Tag>
                       <Tag color="blue">{paymentLinkTypeLabel(currentPaymentLink.link_type, currentPaymentLink.payment_link_format)}</Tag>
                       <Tag color={currentPaymentLinkStatus.color}>{currentPaymentLinkStatus.label}</Tag>
                       {currentPaymentLink.generated_at || currentPaymentLink.created_at ? (
@@ -720,6 +745,11 @@ export function AccountDetailModal({
                       ) : null}
                       {currentPaymentLinkExpiry ? <Tag color={currentPaymentLinkExpiry.color}>{currentPaymentLinkExpiry.label}</Tag> : null}
                     </Space>
+                    {currentPaymentLinkProduct === 'TEAM' ? (
+                      <Text type="secondary" style={{ display: 'block', marginBottom: 4, fontSize: 12 }}>
+                        {`${currentPaymentLinkTeam.workspaceName || '-'} · ${currentPaymentLinkTeam.priceInterval === 'year' ? '年付' : '月付'} · ${currentPaymentLinkTeam.seatQuantity || '-'} 席位`}
+                      </Text>
+                    ) : null}
                     <Space size={6} wrap style={{ width: '100%' }}>
                       <Text copyable={{ text: currentPaymentLinkUrl }} style={{ minWidth: 0, overflowWrap: 'anywhere' }}>
                         {currentPaymentLinkUrl}
@@ -752,6 +782,8 @@ export function AccountDetailModal({
                     const generatedAt = item.generated_at || item.persisted_at || item.submitted_at
                     const url = String(item.url || '').trim()
                     const expiry = paymentLinkExpiryMeta(item.link_type, item.result?.link_expires_at, formatSyncTime)
+                    const product = paymentLinkProductLabel(item)
+                    const teamMeta = paymentLinkTeamMeta(item)
                     return (
                       <div
                         key={String(item.id || `${item.task_id || 'payment-link'}:${index}`)}
@@ -759,12 +791,18 @@ export function AccountDetailModal({
                       >
                         <div style={{ minWidth: 0 }}>
                           <Space size={6} wrap>
+                            <Tag color={product === 'TEAM' ? 'gold' : 'default'}>{product}</Tag>
                             <Tag color="blue">{paymentLinkTypeLabel(item.link_type, 'long_link')}</Tag>
                             <Tag color={status.color}>{status.label}</Tag>
                             {generatedAt ? <Text type="secondary" style={{ fontSize: 12 }}>{formatSyncTime(generatedAt)}</Text> : null}
                             {expiry ? <Tag color={expiry.color}>{expiry.label}</Tag> : null}
                             {item.profile_hash ? <Text code title={item.profile_hash}>{item.profile_hash.slice(0, 12)}</Text> : null}
                           </Space>
+                          {product === 'TEAM' ? (
+                            <Text type="secondary" style={{ display: 'block', marginTop: 4, fontSize: 12 }}>
+                              {`${teamMeta.workspaceName || '-'} · ${teamMeta.priceInterval === 'year' ? '年付' : '月付'} · ${teamMeta.seatQuantity || '-'} 席位`}
+                            </Text>
+                          ) : null}
                           {url ? (
                             <Text copyable={{ text: url }} style={{ display: 'block', marginTop: 4, overflowWrap: 'anywhere' }}>
                               {url}

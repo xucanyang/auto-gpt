@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import hashlib
+import json
 import re
 import time
 from typing import Any
@@ -54,23 +56,56 @@ PAYMENT_LINK_FORMAT_LONG_LINK = "long_link"
 PAYMENT_SOURCE_CHATGPT_HOSTED = "chatgpt_hosted"
 PAYMENT_SOURCE_LONG_LINK_PAYPAL = "long_link_paypal"
 PAYMENT_SOURCE_LONG_LINK = "long_link"
+PAYMENT_LINK_PLAN_PLUS = "plus"
+PAYMENT_LINK_PLAN_TEAM = "team"
+PAYMENT_LINK_GENERATION_PLUS = "plus_checkout"
+PAYMENT_LINK_GENERATION_TEAM = "team_checkout"
+PAYMENT_LINK_PLUS_PLAN_ALIASES = frozenset({
+    "plus",
+    "plus_checkout",
+    "chatgptplusplan",
+    "chatgpt_plus_plan",
+})
+PAYMENT_LINK_TEAM_PLAN_ALIASES = frozenset({
+    "team",
+    "team_checkout",
+    "chatgptteamplan",
+    "chatgpt_team_plan",
+})
 MAX_PAYMENT_LINK_EXPIRES_AT_EPOCH = 253_402_300_799
 PIX_LINK_REUSE_GUARD_SECONDS = 60
 RETIRED_PAYMENT_REQUEST_KEYS = frozenset({
     "promo_code",
+    "promoCode",
     "workspace_name",
+    "workspaceName",
+    "team_workspace_name",
+    "teamWorkspaceName",
     "seat_quantity",
+    "seatQuantity",
+    "team_seat_quantity",
+    "teamSeatQuantity",
     "price_interval",
+    "priceInterval",
+    "team_price_interval",
+    "teamPriceInterval",
+    "cancel_url",
+    "cancelUrl",
+    "team_plan_data",
+    "teamPlanData",
 })
 
 
 def normalize_payment_link_plan(value: Any) -> str:
-    return "plus"
+    raw = str(value or "").strip().lower().replace("-", "_")
+    if raw in PAYMENT_LINK_TEAM_PLAN_ALIASES:
+        return PAYMENT_LINK_PLAN_TEAM
+    return PAYMENT_LINK_PLAN_PLUS
 
 
 def _is_supported_raw_payment_link_plan(value: Any) -> bool:
-    raw_plan = str(value or "").strip().lower()
-    return not raw_plan or raw_plan == "plus"
+    raw_plan = str(value or "").strip().lower().replace("-", "_")
+    return not raw_plan or raw_plan in PAYMENT_LINK_PLUS_PLAN_ALIASES | PAYMENT_LINK_TEAM_PLAN_ALIASES
 
 
 def validate_plus_payment_request_params(params: dict[str, Any] | None) -> None:
@@ -79,12 +114,154 @@ def validate_plus_payment_request_params(params: dict[str, Any] | None) -> None:
         return
     if not isinstance(params, dict):
         raise ValueError("支付参数必须是对象")
-    raw_plan = str(params.get("plan") or "").strip().lower()
-    if raw_plan and raw_plan != "plus":
+    raw_plan = str(params.get("plan") or "").strip().lower().replace("-", "_")
+    if raw_plan and raw_plan not in PAYMENT_LINK_PLUS_PLAN_ALIASES:
         raise ValueError("当前仅支持 Plus 支付计划")
     retired_keys = sorted(RETIRED_PAYMENT_REQUEST_KEYS.intersection(params))
     if retired_keys:
         raise ValueError(f"已下线的 Team 支付参数: {', '.join(retired_keys)}")
+
+
+def _team_param_source(params: dict[str, Any] | None) -> dict[str, Any]:
+    source = params if isinstance(params, dict) else {}
+    nested = source.get("team_plan_data") or source.get("teamPlanData")
+    nested = dict(nested) if isinstance(nested, dict) else {}
+    return {
+        "workspace_name": str(
+            nested.get("workspace_name")
+            or nested.get("workspaceName")
+            or source.get("workspace_name")
+            or source.get("team_workspace_name")
+            or source.get("teamWorkspaceName")
+            or ""
+        ).strip(),
+        "price_interval": str(
+            nested.get("price_interval")
+            or nested.get("priceInterval")
+            or source.get("price_interval")
+            or source.get("team_price_interval")
+            or source.get("teamPriceInterval")
+            or "month"
+        ).strip().lower(),
+        "seat_quantity": source.get(
+            "seat_quantity",
+            source.get(
+                "team_seat_quantity",
+                source.get("teamSeatQuantity", nested.get("seat_quantity", nested.get("seatQuantity", 2))),
+            ),
+        ),
+        "promo_code": str(source.get("promo_code") or source.get("promoCode") or "").strip(),
+        "cancel_url": str(source.get("cancel_url") or source.get("cancelUrl") or "").strip(),
+        "plan_name": str(source.get("plan_name") or source.get("planName") or "chatgptteamplan").strip(),
+    }
+
+
+def _team_param_presence(params: dict[str, Any] | None) -> set[str]:
+    """Return Team fields explicitly supplied by the caller.
+
+    Batch requests may intentionally omit a field so the long-link admin
+    profile supplies its default.  Matching must distinguish an omitted field
+    from an explicit default such as ``seat_quantity=2``.
+    """
+
+    source = params if isinstance(params, dict) else {}
+    nested = source.get("team_plan_data") or source.get("teamPlanData")
+    nested = nested if isinstance(nested, dict) else {}
+    aliases = {
+        "workspace_name": ("workspace_name", "workspaceName", "team_workspace_name", "teamWorkspaceName"),
+        "price_interval": ("price_interval", "priceInterval", "team_price_interval", "teamPriceInterval"),
+        "seat_quantity": ("seat_quantity", "seatQuantity", "team_seat_quantity", "teamSeatQuantity"),
+    }
+    present: set[str] = set()
+    for canonical, keys in aliases.items():
+        if any(key in source and source.get(key) not in (None, "") for key in keys[:2]) or any(
+            key in nested and nested.get(key) not in (None, "") for key in keys[:2]
+        ) or any(
+            key in source and source.get(key) not in (None, "") for key in keys[2:]
+        ):
+            present.add(canonical)
+    if any(key in source and source.get(key) not in (None, "") for key in ("promo_code", "promoCode")):
+        present.add("promo_code_digest")
+    if any(key in source and source.get(key) not in (None, "") for key in ("cancel_url", "cancelUrl")):
+        present.add("cancel_url")
+    if any(key in source and source.get(key) not in (None, "") for key in ("plan_name", "planName")):
+        present.add("plan_name")
+    return present
+
+
+def validate_team_payment_request_params(params: dict[str, Any] | None) -> None:
+    if not isinstance(params, dict):
+        raise ValueError("支付参数必须是对象")
+    if normalize_payment_link_plan(params.get("plan")) != PAYMENT_LINK_PLAN_TEAM:
+        raise ValueError("Team 支付请求必须指定 plan=team")
+    values = _team_param_source(params)
+    explicit = _team_param_presence(params)
+    # Omitted/blank values inherit the long-link admin profile.  Explicit
+    # values are still validated locally before any account task is created.
+    if "workspace_name" in explicit and len(values["workspace_name"]) > 256:
+        raise ValueError("Team Workspace 名称不能超过 256 个字符")
+    if "price_interval" in explicit and values["price_interval"] not in {"month", "year"}:
+        raise ValueError("Team price_interval 必须是 month 或 year")
+    if "seat_quantity" in explicit:
+        try:
+            seats = int(values["seat_quantity"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Team seat_quantity 必须是整数") from exc
+        if seats < 2 or seats > 1000:
+            raise ValueError("Team seat_quantity 必须在 2 到 1000 之间")
+    if len(values["promo_code"]) > 256:
+        raise ValueError("Team promo_code 过长")
+    if values["cancel_url"] and not re.match(r"^https?://[^\s]+$", values["cancel_url"], re.I):
+        raise ValueError("Team cancel_url 必须是 HTTP(S) 地址")
+
+
+def validate_payment_link_request_params(params: dict[str, Any] | None) -> None:
+    source = params if isinstance(params, dict) else {}
+    raw_plan = str(source.get("plan") or "").strip().lower().replace("-", "_")
+    if raw_plan in PAYMENT_LINK_TEAM_PLAN_ALIASES:
+        validate_team_payment_request_params(source)
+        return
+    validate_plus_payment_request_params(source)
+
+
+def payment_link_generation_kind(params: dict[str, Any] | None) -> str:
+    return (
+        PAYMENT_LINK_GENERATION_TEAM
+        if normalize_payment_link_plan((params or {}).get("plan")) == PAYMENT_LINK_PLAN_TEAM
+        else PAYMENT_LINK_GENERATION_PLUS
+    )
+
+
+def payment_link_variant_key(params: dict[str, Any] | None) -> str:
+    source = params if isinstance(params, dict) else {}
+    plan = normalize_payment_link_plan(source.get("plan"))
+    country = normalize_checkout_country(source.get("country") or source.get("billing_country"))
+    currency = normalize_checkout_currency(source.get("currency"), country)
+    canonical: dict[str, Any] = {
+        "generation_kind": payment_link_generation_kind(source),
+        "plan": plan,
+        "country": country,
+        "currency": currency,
+        "profile_hash": str(source.get("profile_hash") or source.get("payment_profile_hash") or "").strip(),
+    }
+    if plan == PAYMENT_LINK_PLAN_TEAM:
+        team = _team_param_source(source)
+        try:
+            seats = int(team["seat_quantity"] or 0)
+        except (TypeError, ValueError):
+            seats = 0
+        canonical["team"] = {
+            "workspace_name": team["workspace_name"],
+            "price_interval": team["price_interval"],
+            "seat_quantity": seats,
+            "promo_code_digest": str(source.get("promo_code_digest") or "").strip()
+            or (hashlib.sha256(team["promo_code"].encode("utf-8")).hexdigest() if team["promo_code"] else ""),
+            "cancel_url": team["cancel_url"],
+            "plan_name": team["plan_name"] or "chatgptteamplan",
+        }
+    return hashlib.sha256(
+        json.dumps(canonical, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    ).hexdigest()
 
 
 def normalize_payment_link_status(value: Any) -> str:
@@ -181,14 +358,14 @@ def normalize_payment_link_params(params: dict[str, Any] | None) -> dict[str, An
     payment_source = normalize_payment_link_source(source.get("payment_source"))
     payment_link_format = normalize_payment_link_output_format(source.get("payment_link_format"))
     if payment_source in {PAYMENT_SOURCE_LONG_LINK, PAYMENT_SOURCE_LONG_LINK_PAYPAL}:
-        plan = "plus"
         payment_link_format = (
             PAYMENT_LINK_FORMAT_LONG_LINK
             if payment_source == PAYMENT_SOURCE_LONG_LINK
             else PAYMENT_LINK_FORMAT_PAYPAL
         )
-    return {
+    normalized: dict[str, Any] = {
         "plan": plan,
+        "generation_kind": payment_link_generation_kind({"plan": plan}),
         "country": country,
         "currency": currency,
         "proxy": (
@@ -200,6 +377,27 @@ def normalize_payment_link_params(params: dict[str, Any] | None) -> dict[str, An
         "payment_source": payment_source,
         "profile_hash": str(source.get("profile_hash") or source.get("payment_profile_hash") or "").strip(),
     }
+    if plan == PAYMENT_LINK_PLAN_TEAM:
+        team = _team_param_source(source)
+        try:
+            seats = int(team["seat_quantity"] or 0)
+        except (TypeError, ValueError):
+            seats = 0
+        normalized.update(
+            {
+                "workspace_name": team["workspace_name"],
+                "price_interval": team["price_interval"],
+                "seat_quantity": seats,
+                "promo_code_digest": str(source.get("promo_code_digest") or "").strip()
+                or (hashlib.sha256(team["promo_code"].encode("utf-8")).hexdigest() if team["promo_code"] else ""),
+                "cancel_url": team["cancel_url"],
+                "plan_name": team["plan_name"] or "chatgptteamplan",
+            }
+        )
+    normalized["variant_key"] = str(source.get("variant_key") or "").strip() or payment_link_variant_key(
+        {**source, **normalized}
+    )
+    return normalized
 
 
 def payment_link_cache_matches(
@@ -223,12 +421,15 @@ def payment_link_cache_matches(
         or (PAYMENT_SOURCE_LONG_LINK_PAYPAL if cached_format == PAYMENT_LINK_FORMAT_PAYPAL else "")
     )
     cached_profile_hash = str(cached.get("profile_hash") or cached.get("payment_profile_hash") or "").strip()
+    cached_generation_kind = str(cached.get("generation_kind") or payment_link_generation_kind(cached)).strip()
+    cached_variant_key = str(cached.get("variant_key") or "").strip()
     if payment_link_url_requires_regeneration(cached.get("url"), cached_format):
         return False
     if payment_link_requires_regeneration(cached):
         return False
     matches = (
         cached_plan == expected["plan"]
+        and cached_generation_kind == expected["generation_kind"]
         and cached_country == expected["country"]
         and cached_currency == expected["currency"]
         and cached_proxy == expected["proxy"]
@@ -237,8 +438,32 @@ def payment_link_cache_matches(
     )
     if not matches:
         return False
+    if expected["plan"] == PAYMENT_LINK_PLAN_TEAM:
+        if str(cached.get("generation_kind") or "").strip().lower() != PAYMENT_LINK_GENERATION_TEAM:
+            return False
+        # The complete key includes the long-link profile hash.  Before the
+        # remote profile is frozen, compare only explicitly supplied business
+        # fields and defer the full-key check to the worker.
+        if cached_variant_key and expected["variant_key"] and expected.get("profile_hash") and cached_variant_key != expected["variant_key"]:
+            return False
+        cached_team = normalize_payment_link_params(cached)
+        if not str(cached_team.get("workspace_name") or "").strip():
+            return False
+        explicit_fields = _team_param_presence(params)
+        for key in (
+            "workspace_name",
+            "price_interval",
+            "seat_quantity",
+            "promo_code_digest",
+            "cancel_url",
+            "plan_name",
+        ):
+            if key not in explicit_fields:
+                continue
+            if cached_team.get(key) != expected.get(key):
+                return False
     if expected["payment_source"] in {PAYMENT_SOURCE_LONG_LINK, PAYMENT_SOURCE_LONG_LINK_PAYPAL}:
-        return bool(expected["profile_hash"]) and cached_profile_hash == expected["profile_hash"]
+        return not expected["profile_hash"] or cached_profile_hash == expected["profile_hash"]
     return True
 
 
@@ -319,6 +544,18 @@ def build_payment_link_cache_payload(
         or metadata_fallback.get("plan")
         or metadata_fallback.get("chatgpt_checkout_plan")
     )
+    if plan == PAYMENT_LINK_PLAN_TEAM:
+        team_generation_kind = str(
+            payload_source.get("generation_kind")
+            or metadata_fallback.get("generation_kind")
+            or ""
+        ).strip().lower()
+        team_candidate = _team_param_source({**metadata_fallback, **payload_source})
+        # Historical Team/Business caches predate the current checkout-only
+        # contract and do not carry a frozen workspace variant.  Do not silently
+        # reinterpret them as a reusable Team checkout.
+        if team_generation_kind != PAYMENT_LINK_GENERATION_TEAM or not team_candidate["workspace_name"]:
+            return {}
     country = normalize_checkout_country(
         payload_source.get("country")
         or payload_source.get("chatgpt_checkout_country")
@@ -371,6 +608,31 @@ def build_payment_link_cache_payload(
             or datetime.now(timezone.utc).isoformat()
         ),
     }
+    payload["generation_kind"] = payment_link_generation_kind({"plan": plan})
+    if plan == PAYMENT_LINK_PLAN_TEAM:
+        team_source = {
+            **metadata_fallback,
+            **payload_source,
+        }
+        team = _team_param_source(team_source)
+        try:
+            team_seats = int(team["seat_quantity"] or 0)
+        except (TypeError, ValueError):
+            team_seats = 0
+        payload.update(
+            {
+                "workspace_name": team["workspace_name"],
+                "price_interval": team["price_interval"],
+                "seat_quantity": team_seats,
+                "promo_code_digest": str(payload_source.get("promo_code_digest") or metadata_fallback.get("promo_code_digest") or "").strip()
+                or (hashlib.sha256(team["promo_code"].encode("utf-8")).hexdigest() if team["promo_code"] else ""),
+                "cancel_url": team["cancel_url"],
+                "plan_name": team["plan_name"] or "chatgptteamplan",
+            }
+        )
+    payload["variant_key"] = str(
+        payload_source.get("variant_key") or metadata_fallback.get("variant_key") or ""
+    ).strip() or payment_link_variant_key(payload)
 
     fallback_url = normalize_payment_link_url(
         fallback_source.get("url")
@@ -455,6 +717,14 @@ def build_payment_link_cache_payload(
         "payment_locale",
         "amount_display",
         "cs_count",
+        "generation_kind",
+        "plan_name",
+        "promo_code_digest",
+        "variant_key",
+        "workspace_name",
+        "price_interval",
+        "seat_quantity",
+        "cancel_url",
     ):
         value = payload_source.get(key)
         if value is None or value == "":
@@ -472,4 +742,56 @@ def cache_checkout_link_in_extra(extra: dict[str, Any], *, source: str) -> dict[
     payload = build_payment_link_cache_payload(extra, source=source, fallback=existing)
     if payload:
         extra["chatgpt_last_payment_link"] = payload
+        variants = extra.get("chatgpt_payment_link_variants")
+        if not isinstance(variants, dict):
+            variants = {}
+        variant_key = str(payload.get("variant_key") or payment_link_variant_key(payload)).strip()
+        if variant_key:
+            variants[variant_key] = dict(payload)
+            extra["chatgpt_payment_link_variants"] = variants
+    return extra
+
+
+def payment_link_cache_for_params(
+    extra: dict[str, Any] | None,
+    params: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Read a variant-specific cache without losing legacy Plus pointers."""
+
+    source = extra if isinstance(extra, dict) else {}
+    expected_key = payment_link_variant_key(params)
+    variants = source.get("chatgpt_payment_link_variants")
+    if isinstance(variants, dict):
+        candidate = variants.get(expected_key)
+        if isinstance(candidate, dict):
+            return dict(candidate)
+    current = source.get("chatgpt_last_payment_link")
+    if isinstance(current, dict) and payment_link_cache_matches(current, params):
+        return dict(current)
+    if normalize_payment_link_plan((params or {}).get("plan")) == PAYMENT_LINK_PLAN_PLUS:
+        legacy = source.get("chatgpt_paypal_url")
+        if isinstance(legacy, dict) and payment_link_cache_matches(legacy, params):
+            return dict(legacy)
+    return {}
+
+
+def store_payment_link_variant(
+    extra: dict[str, Any],
+    payload: dict[str, Any],
+    *,
+    make_current: bool = True,
+) -> dict[str, Any]:
+    """Persist a normalized variant and keep the historical current pointer."""
+
+    if not isinstance(extra, dict) or not isinstance(payload, dict) or not payload:
+        return extra if isinstance(extra, dict) else {}
+    variants = extra.get("chatgpt_payment_link_variants")
+    if not isinstance(variants, dict):
+        variants = {}
+    variant_key = str(payload.get("variant_key") or payment_link_variant_key(payload)).strip()
+    if variant_key:
+        variants[variant_key] = dict(payload)
+        extra["chatgpt_payment_link_variants"] = variants
+    if make_current:
+        extra["chatgpt_last_payment_link"] = dict(payload)
     return extra

@@ -195,6 +195,77 @@ class LongLinkPaymentClientTests(unittest.TestCase):
 
         self.assertEqual(result["link_expires_at"], 1_784_170_800)
 
+    def test_team_profile_and_batch_send_identical_profile_overrides(self):
+        token = "eyJteam.payload.signature"
+        overrides = {
+            "plan": "team",
+            "team_plan_data": {
+                "workspace_name": "Client Workspace",
+                "price_interval": "year",
+                "seat_quantity": 7,
+            },
+            "promo_code": "TEAM50",
+        }
+        batch_id = "batch_" + "f" * 32
+        session = _Session(
+            [
+                _Response(
+                    200,
+                    {
+                        "ok": True,
+                        "link_type": "team",
+                        "profile_hash": PROFILE_HASH,
+                        "profile": {
+                            "link_type": "team",
+                            "plan": "team",
+                            "generation_kind": "team_checkout",
+                            "billing_country": "GB",
+                            "currency": "GBP",
+                            "team": {
+                                "workspace_name": "Client Workspace",
+                                "price_interval": "year",
+                                "seat_quantity": 7,
+                            },
+                        },
+                    },
+                ),
+                _Response(
+                    200,
+                    {
+                        "ok": True,
+                        "batch_id": batch_id,
+                        "items": [
+                            {
+                                "request_id": "task:team:client",
+                                "batch_id": batch_id,
+                                "job_id": "job-team-client",
+                                "status": "queued",
+                            }
+                        ],
+                    },
+                ),
+            ]
+        )
+        client = LongLinkPaymentClient(
+            base_url="http://long-link.test",
+            api_key="internal-key",
+            session=session,
+        )
+
+        profile = client.get_profile(overrides=overrides)
+        submitted = client.submit_batch(
+            items=[{"access_token": token, "request_id": "task:team:client"}],
+            expected_profile_hash=PROFILE_HASH,
+            profile_overrides=overrides,
+        )
+
+        self.assertEqual(profile["plan"], "team")
+        self.assertEqual(profile["team"]["workspace_name"], "Client Workspace")
+        self.assertEqual(submitted["batch_id"], batch_id)
+        self.assertEqual([call[0] for call in session.calls], ["POST", "POST"])
+        self.assertEqual(session.calls[0][2]["json"], {"profileOverrides": overrides})
+        self.assertEqual(session.calls[1][2]["json"]["profileOverrides"], overrides)
+
 
 if __name__ == "__main__":
     unittest.main()

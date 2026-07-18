@@ -38,11 +38,12 @@ def test_payment_link_filter_separates_current_link_from_success_history():
     assert "params.set('payment_link_generated', paymentLinkGenerated)" in query
 
 
-def test_payment_link_generation_dialog_explains_default_history_guard():
+def test_payment_link_generation_dialog_explains_variant_aware_history_guard():
     page = ACCOUNTS_PAGE.read_text(encoding="utf-8")
 
-    assert "默认只处理从未成功提取的账号" in page
-    assert "已有成功记录或已清理的账号不会重复提交" in page
+    assert "默认只跳过相同" in page
+    assert "Team 参数变体" in page
+    assert "Plus 配置" in page
     assert "已支付、已订阅、已失效或正在生成的账号仍会跳过" in page
 
 

@@ -6,6 +6,24 @@
 
 ## [Unreleased] (未发布)
 
+## [2.4.0] - 2026-07-19
+
+### 新增 (Added)
+- **新增 ChatGPT Team 优惠码 checkout 长链**：账号页“支付链接生成”增加 Plus / Team 分段模式。Team 支持 Workspace 名称、月付/年付、席位数量、优惠码和取消跳转 URL；字段留空时继承 `/opt/openai-pay-long-link` 管理页默认值，提交前通过 `POST /api/tasks/chatgpt/payment-links/profile` 预览并冻结实际生效配置。
+- **支付链接历史增加产品与变体身份**：`core/db.py` 的 `payment_link_generations` 新增 `generation_kind`、`variant_key` 字段和索引；账号当前链接、详情历史及任务元数据展示 PLUS / TEAM、Workspace、周期和席位，优惠码只保存摘要，不在浏览器或任务日志中回显明文。
+
+### 优化 (Changed)
+- **Auto-GPT 继续由 long-link 统一提供底层提链能力**：`services/chatgpt_core/long_link_payment_client.py` 对 Team 使用带 `profileOverrides` 的 profile 预览和批量提交，Plus 继续保持旧 GET/批量请求结构。Team 只消费 long-link 返回的 hosted checkout URL，不在 Auto-GPT 内复制 ChatGPT checkout、Stripe init、Provider 或 Approve 实现。
+- **Plus 与 Team 配置变体完全隔离**：`services/chatgpt_core/payment_link_cache.py` 新增 `chatgpt_payment_link_variants` 变体缓存，以产品、国家、币种、profile hash、Workspace、周期、席位、优惠码摘要和取消 URL 计算稳定键；相同账号的 Plus、不同 Team Workspace 或不同优惠码不会互相覆盖或错误触发跳过，旧 `chatgpt_last_payment_link` 仅保留为兼容当前指针。
+- **批任务按实际配置冻结后再提交**：`api/tasks.py` 先读取 long-link 生效 profile，再写入最终 `generation_kind` / `variant_key`，完成全部账号预提交后统一轮询远端批次。Team 不读取或覆盖旧 `chatgpt_paypal_url`，Plus/PayPal 历史兼容行为保持不变。
+
+### 修复 (Fixed)
+- **严格区分受支持计划与历史产品标记**：支付链接入口只允许 Plus 与 checkout-only Team；`business`、`enterprise` 及缺少 `plan=team` 的孤立 Team 参数在账号扫描前拒绝。缺少 `team_checkout` 身份或 Workspace 的旧 Team/Business 缓存不会被重新解释为本次 Team checkout。
+- **Team 配置重试与安全展示修正**：Team profile 读取失败后的“重新读取”继续携带当前表单参数，不再误读 Plus 配置；浏览器 profile 只显示优惠码是否配置，不返回稳定 digest，并对异常席位/并发值安全降级。
+
+### 测试 (Tests)
+- **Team 专项与兼容回归**：新增 `tests/test_team_payment_links.py`，扩展 long-link client、退役能力和账号页契约测试，覆盖部分参数继承、非法输入、变体键隔离、Team/Plus 缓存、单账号 action、历史持久化和 profile/batch override 一致性。定向回归 `34 passed`（另有 8 个 subtests），排除一个未改动的相邻 custom-email 默认值既有失败后其余后端回归 `966 passed`（另有 17 个 subtests）；容器依赖环境下管理员认证与 OpenAPI 契约 `22 passed`，前端 `npm run build` 通过。
+
 ## [2.3.8] - 2026-07-18
 
 ### 优化 (Changed)
@@ -1989,4 +2007,8 @@
 
 ## 2026-07-18 07:43:48 +0800
 - 升级 v2.3.8：支付链接历史筛选与生成防重
+- 发布模式: multi
+
+## 2026-07-19 00:48:26 +0800
+- 新增 ChatGPT Team 优惠码 checkout 长链及双端配置
 - 发布模式: multi
