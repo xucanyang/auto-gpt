@@ -258,11 +258,19 @@ class RestoredEmailServiceTests(unittest.TestCase):
         state = {
             "provider": "icloud_hme",
             "email": "helper-hme@icloud.com",
-            "account": {
-                "email": "helper-hme@icloud.com",
-                "account_id": "lease-1",
-                "extra": {"provider": "icloud_hme", "lease_id": "lease-1"},
-            },
+                "account": {
+                    "email": "helper-hme@icloud.com",
+                    "account_id": "lease-1",
+                    "extra": {
+                        "provider": "icloud_hme",
+                        "lease_id": "lease-1",
+                        "registration_id": "reg-1",
+                        "logical_address_id": "logical-1",
+                        "physical_alias_id": "physical-1",
+                        "tag": "f8k2mq",
+                        "tag_namespace": "random_tag",
+                    },
+                },
             "config": {"icloud_hme_mode": "live"},
         }
 
@@ -282,6 +290,8 @@ class RestoredEmailServiceTests(unittest.TestCase):
 
         self.assertEqual(restored["config"]["icloud_hme_mode"], "helper_ready_api")
         self.assertEqual(restored["account"]["extra"]["lease_id"], "lease-1")
+        self.assertEqual(restored["account"]["extra"]["registration_id"], "reg-1")
+        self.assertEqual(restored["account"]["extra"]["platform"], "chatgpt")
 
 
 if __name__ == "__main__":

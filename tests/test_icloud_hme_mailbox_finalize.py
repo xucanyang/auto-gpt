@@ -2,6 +2,10 @@ import unittest
 from unittest.mock import Mock, patch
 
 from core.base_mailbox import IcloudHmeMailbox, MailboxAccount
+from services.chatgpt_core.refresh_token_registration_engine import (
+    RegistrationResult,
+    RefreshTokenRegistrationEngine,
+)
 
 
 class IcloudHmeMailboxFinalizeTests(unittest.TestCase):
@@ -160,6 +164,7 @@ class IcloudHmeMailboxFinalizeTests(unittest.TestCase):
 
         mailbox._helper_client.prepare.assert_called_once_with(
             forward_to="*",
+            platform="chatgpt",
             request_id="attempt-uuid-1",
             task_id="task-parent-1",
             consumer="auto-gpt/test",
@@ -282,6 +287,19 @@ class IcloudHmeMailboxFinalizeTests(unittest.TestCase):
             IcloudHmeMailbox._tagged_hme_headers_match_alias(
                 "Return-Path: <bounce+abc-reviser.smiths_2f+gpt2=icloud.com_at_tm1_openai_com_abc@icloud.com>\r\n",
                 expected,
+            )
+        )
+        random_alias = "reviser.smiths_2f+f8k2mq@icloud.com"
+        self.assertTrue(
+            IcloudHmeMailbox._tagged_hme_headers_match_alias(
+                "Return-Path: <bounce+abc-reviser.smiths_2f+f8k2mq=icloud.com_at_tm1_openai_com_abc@icloud.com>\r\n",
+                random_alias,
+            )
+        )
+        self.assertFalse(
+            IcloudHmeMailbox._tagged_hme_headers_match_alias(
+                "Return-Path: <bounce+abc-reviser.smiths_2f+8f2k6m=icloud.com_at_tm1_openai_com_abc@icloud.com>\r\n",
+                random_alias,
             )
         )
         self.assertFalse(
@@ -414,7 +432,13 @@ class IcloudHmeMailboxFinalizeTests(unittest.TestCase):
 
         ids = mailbox.get_current_ids(account)
 
-        self.assertEqual(ids, {"mbox-global@example.com", "mbox-second@example.com"})
+        self.assertEqual(
+            ids,
+            {
+                "mbox-global@example.com:mbox-global@example.com",
+                "mbox-second@example.com:mbox-second@example.com",
+            },
+        )
         self.assertEqual(
             [call.args[0] for call in mailbox._tempmail_mailbox.ensure_mailbox_by_email.call_args_list],
             ["global@example.com", "second@example.com"],
@@ -465,6 +489,216 @@ class IcloudHmeMailboxFinalizeTests(unittest.TestCase):
         mark_deactivated.assert_called_once()
         self.assertEqual(mark_deactivated.call_args.args[0], "anon-dead")
         self.assertEqual(mark_deactivated.call_args.kwargs["task_id"], "task-dead")
+
+    def test_helper_prepare_persists_platform_registration_identity(self):
+        mailbox = IcloudHmeMailbox(
+            mail_provider_name="hme_ready_api",
+            icloud_hme_mode="helper_ready_api",
+            icloud_cookie="",
+            icloud_forward_to="global@example.com",
+            tempmail_api_url="http://tempmail-api-1:8080",
+            tempmail_api_key="tempmail-key",
+            icloud_hme_helper_api_url="http://helper-api",
+            icloud_hme_helper_internal_key="helper-key",
+        )
+        mailbox._helper_client.prepare = Mock(
+            return_value={
+                "platform": "ChatGPT",
+                "registration_id": "reg-1",
+                "logical_address_id": "logical-1",
+                "physical_alias_id": "physical-1",
+                "lease_id": "lease-1",
+                "lease_state": "checked_out",
+                "email": "base+f8k2mq@icloud.com",
+                "physical_hme": "base@icloud.com",
+                "logical_type": "tag",
+                "tag": "f8k2mq",
+                "tag_namespace": "random_tag",
+                "tag_slot": 1,
+                "forward_to": "global@example.com",
+            }
+        )
+
+        account = mailbox.get_email()
+
+        self.assertEqual(account.account_id, "lease-1")
+        self.assertEqual(account.extra["platform"], "chatgpt")
+        self.assertEqual(account.extra["registration_id"], "reg-1")
+        self.assertEqual(account.extra["logical_address_id"], "logical-1")
+        self.assertEqual(account.extra["physical_alias_id"], "physical-1")
+        self.assertEqual(account.extra["physical_hme"], "base@icloud.com")
+        self.assertEqual(account.extra["tag"], "f8k2mq")
+        self.assertEqual(account.extra["tag_namespace"], "random_tag")
+        self.assertEqual(account.extra["tag_slot"], 1)
+
+    def test_invalid_prepare_email_early_finalizes_known_lease(self):
+        mailbox = IcloudHmeMailbox(
+            icloud_hme_mode="helper_ready_api",
+            icloud_cookie="",
+            icloud_forward_to="global@example.com",
+            tempmail_api_url="http://tempmail-api-1:8080",
+            tempmail_api_key="tempmail-key",
+            icloud_hme_helper_api_url="http://helper-api",
+            icloud_hme_helper_internal_key="helper-key",
+        )
+        mailbox._registration_task_id = "task-1"
+        mailbox._helper_client.prepare = Mock(
+            return_value={
+                "email": "not-an-email",
+                "lease_id": "lease-invalid",
+                "registration_id": "reg-invalid",
+                "logical_address_id": "logical-invalid",
+                "physical_alias_id": "physical-invalid",
+            }
+        )
+        mailbox._helper_client.finalize = Mock(return_value={})
+
+        with self.assertRaises(RuntimeError):
+            mailbox.get_email()
+
+        mailbox._helper_client.finalize.assert_called_once_with(
+            "lease-invalid",
+            outcome="early_failure",
+            reason="invalid_prepare_email",
+            registration_id="reg-invalid",
+            logical_address_id="logical-invalid",
+            physical_alias_id="physical-invalid",
+            platform="chatgpt",
+            task_id="task-1",
+        )
+
+    def test_helper_finalize_uses_registration_and_lease_and_merges_state(self):
+        mailbox = self._build_mailbox()
+        mailbox._icloud_hme_mode = "helper_ready_api"
+        account = MailboxAccount(
+            email="base+f8k2mq@icloud.com",
+            account_id="lease-1",
+            extra={
+                "provider": "hme_ready_api",
+                "mode": "helper_ready_api",
+                "lease_id": "lease-1",
+                "registration_id": "reg-1",
+                "logical_address_id": "logical-1",
+                "physical_alias_id": "physical-1",
+                "tag": "f8k2mq",
+                "tag_namespace": "random_tag",
+            },
+        )
+        mailbox._helper_client.finalize = Mock(
+            return_value={
+                "registration_id": "reg-1",
+                "logical_address_id": "logical-1",
+                "physical_alias_id": "physical-1",
+                "lease_id": "lease-1",
+                "platform": "chatgpt",
+                "lease_state": "committed",
+            }
+        )
+
+        mailbox.finalize_success(account, registered_email="account@example.com", task_id="task-1")
+
+        kwargs = mailbox._helper_client.finalize.call_args.kwargs
+        self.assertEqual(kwargs["registration_id"], "reg-1")
+        self.assertEqual(kwargs["logical_address_id"], "logical-1")
+        self.assertEqual(kwargs["platform"], "chatgpt")
+        self.assertEqual(kwargs["bound_account_email"], "account@example.com")
+        self.assertEqual(account.extra["lease_state"], "committed")
+
+    def test_base_body_address_is_not_a_routing_match(self):
+        self.assertFalse(
+            IcloudHmeMailbox._base_hme_headers_match_alias(
+                "Subject: quoted alias@example.com\r\n\r\nbody alias@example.com",
+                "alias@example.com",
+                [],
+            )
+        )
+        self.assertTrue(
+            IcloudHmeMailbox._base_hme_headers_match_alias(
+                "Delivered-To: alias@example.com\r\n\r\nbody",
+                "alias@example.com",
+                [],
+            )
+        )
+
+    def test_multi_forward_same_provider_message_id_keeps_mailbox_namespace(self):
+        mailbox = IcloudHmeMailbox(
+            icloud_hme_mode="helper_ready_api",
+            icloud_cookie="",
+            icloud_forward_to="one@example.com, two@example.com",
+            tempmail_api_url="http://tempmail-api-1:8080",
+            tempmail_api_key="test-key",
+            icloud_hme_helper_api_url="http://helper-api",
+            icloud_hme_helper_internal_key="helper-key",
+        )
+        account = MailboxAccount(
+            email="base+f8k2mq@icloud.com",
+            account_id="lease-1",
+            extra={
+                "provider": "hme_ready_api",
+                "mode": "helper_ready_api",
+                "lease_id": "lease-1",
+            },
+        )
+        mailbox._tempmail_mailbox.ensure_mailbox_by_email = Mock(
+            side_effect=lambda email, force_lookup=False: MailboxAccount(
+                email=email,
+                account_id=f"mb-{email.split('@', 1)[0]}",
+            )
+        )
+        mailbox._tempmail_mailbox._list_emails = Mock(
+            side_effect=lambda mailbox_id: [{"id": "same-message", "subject": "OpenAI verification"}]
+        )
+
+        def detail(mailbox_id, _message_id):
+            expected = mailbox_id == "mb-two"
+            token = "base+f8k2mq" if expected else "base+other1"
+            return {
+                "received_for": ["base@icloud.com"],
+                "subject": "OpenAI verification",
+                "body_text": "Your verification code is 123456.",
+                "raw_message": (
+                    f"Return-Path: <bounce+{token}=icloud.com_at_tm_openai_com@icloud.com>\r\n\r\n"
+                    "Your verification code is 123456."
+                ),
+            }
+
+        mailbox._tempmail_mailbox._get_email_detail = Mock(side_effect=detail)
+
+        code = mailbox.wait_for_code(account, timeout=1)
+
+        self.assertEqual(code, "123456")
+        self.assertEqual(mailbox._last_verification_result["message_id"], "mb-two:same-message")
+        self.assertEqual(mailbox._last_verification_result["message_id_namespace"], "mb-two")
+
+    def test_finalize_success_reexports_authoritative_mailbox_state(self):
+        class _Service:
+            def __init__(self):
+                self.state = {"lease_state": "checked_out"}
+                self.finalized = False
+
+            def finalize_success(self, **kwargs):
+                self.finalized = True
+                self.state = {"lease_state": "committed", "registration_id": "reg-1"}
+
+            def export_state(self):
+                return dict(self.state)
+
+        service = _Service()
+        engine = RefreshTokenRegistrationEngine.__new__(RefreshTokenRegistrationEngine)
+        engine.email_service = service
+        engine.task_uuid = "task-1"
+        engine._log = lambda *args, **kwargs: None
+        result = RegistrationResult(
+            success=True,
+            email="account@example.com",
+            metadata={"mailbox_state": {"lease_state": "checked_out"}},
+        )
+
+        engine._finalize_email_service_success(result)
+
+        self.assertTrue(service.finalized)
+        self.assertEqual(result.metadata["mailbox_state"]["lease_state"], "committed")
+        self.assertEqual(result.metadata["mailbox_state"]["registration_id"], "reg-1")
 
 
 if __name__ == "__main__":

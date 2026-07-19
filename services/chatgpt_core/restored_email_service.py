@@ -171,7 +171,9 @@ def mailbox_state_from_account(
             try:
                 with Session(engine) as session:
                     alias = session.exec(
-                        select(IcloudHmeAliasModel).where(IcloudHmeAliasModel.hme == email)
+                        select(IcloudHmeAliasModel)
+                        .where(IcloudHmeAliasModel.hme == email)
+                        .where(IcloudHmeAliasModel.bound_service == "chatgpt")
                     ).first()
                     if alias is not None:
                         anonymous_id = str(alias.anonymous_id or "").strip()
@@ -190,6 +192,34 @@ def mailbox_state_from_account(
         required = ("icloud_hme_mode", "icloud_forward_to", "tempmail_api_url", "tempmail_api_key")
         if any(not _has_value(mailbox_config.get(key)) for key in required):
             return {}
+        hme_extra = {
+            "provider": "icloud_hme",
+            "platform": "chatgpt",
+            "registration_platform": "chatgpt",
+            "forward_to": str(mailbox_config.get("icloud_forward_to") or "").strip(),
+            "forward_mailbox_id": str(
+                mailbox_config.get("icloud_forward_mailbox_id")
+                or account_extra.get("forward_mailbox_id")
+                or ""
+            ).strip(),
+        }
+        for key in (
+            "registration_id",
+            "logical_address_id",
+            "physical_alias_id",
+            "lease_id",
+            "platform",
+            "registration_platform",
+            "lease_state",
+            "physical_hme",
+            "logical_type",
+            "tag",
+            "tag_namespace",
+            "tag_slot",
+            "external_account_ref",
+        ):
+            if account_extra.get(key) not in (None, ""):
+                hme_extra[key] = account_extra[key]
         return sanitize_mailbox_state(
             {
                 "provider": "icloud_hme",
@@ -197,15 +227,7 @@ def mailbox_state_from_account(
                 "account": {
                     "email": email,
                     "account_id": anonymous_id,
-                    "extra": {
-                        "provider": "icloud_hme",
-                        "forward_to": str(mailbox_config.get("icloud_forward_to") or "").strip(),
-                        "forward_mailbox_id": str(
-                            mailbox_config.get("icloud_forward_mailbox_id")
-                            or account_extra.get("forward_mailbox_id")
-                            or ""
-                        ).strip(),
-                    },
+                    "extra": hme_extra,
                 },
                 "before_ids": [],
                 "config": mailbox_config,
@@ -323,6 +345,13 @@ class RestoredEmailService:
             account_id=str(account_payload.get("account_id") or "").strip(),
             extra=dict(account_payload.get("extra") or {}),
         )
+        if self._provider in ICLOUD_HME_PROVIDERS:
+            account_extra = dict(self._acct.extra or {})
+            account_extra.setdefault("platform", "chatgpt")
+            account_extra.setdefault("registration_platform", "chatgpt")
+            if not str(account_extra.get("lease_id") or "").strip() and self._acct.account_id:
+                account_extra["lease_id"] = self._acct.account_id
+            self._acct.extra = account_extra
         self._email = self._acct.email
         self._before_ids = set(self._state.get("before_ids") or [])
         self._last_verification_result: dict[str, Any] = {}
@@ -422,6 +451,26 @@ class RestoredEmailService:
                 "proxy": self._proxy,
             }
         )
+
+    def finalize_success(self, account_email: str = "", task_id: str = "") -> None:
+        finalize = getattr(self._mailbox, "finalize_success", None)
+        if callable(finalize):
+            finalize(
+                self._acct,
+                registered_email=str(account_email or self._email or "").strip(),
+                task_id=str(task_id or "").strip(),
+            )
+        self._state = self.export_state()
+
+    def finalize_failure(self, error_message: str = "", task_id: str = "") -> None:
+        finalize = getattr(self._mailbox, "finalize_failure", None)
+        if callable(finalize):
+            finalize(
+                self._acct,
+                error_message=str(error_message or "").strip(),
+                task_id=str(task_id or "").strip(),
+            )
+        self._state = self.export_state()
 
 
 __all__ = ["RestoredEmailService", "mailbox_state_from_account"]

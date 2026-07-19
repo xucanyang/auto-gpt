@@ -331,6 +331,15 @@ class RefreshTokenRegistrationEngine:
             )
         except Exception as exc:
             self._log(f"[邮箱] finalize_success 执行失败: {exc}", "warning")
+        try:
+            exporter = getattr(self.email_service, "export_state", None)
+            if callable(exporter):
+                refreshed = exporter() or {}
+                if isinstance(refreshed, dict):
+                    result.metadata = dict(result.metadata or {})
+                    result.metadata["mailbox_state"] = refreshed
+        except Exception as exc:
+            self._log(f"[邮箱] finalize_success 后导出 mailbox_state 失败: {exc}", "warning")
 
     def _finalize_email_service_failure(
         self,
@@ -349,6 +358,15 @@ class RefreshTokenRegistrationEngine:
             )
         except Exception as exc:
             self._log(f"[邮箱] finalize_failure 执行失败: {exc}", "warning")
+        try:
+            exporter = getattr(self.email_service, "export_state", None)
+            if callable(exporter):
+                refreshed = exporter() or {}
+                if isinstance(refreshed, dict):
+                    result.metadata = dict(result.metadata or {})
+                    result.metadata["mailbox_state"] = refreshed
+        except Exception as exc:
+            self._log(f"[邮箱] finalize_failure 后导出 mailbox_state 失败: {exc}", "warning")
 
     @staticmethod
     def _should_switch_to_login_after_register_failure(message: str) -> bool:

@@ -591,9 +591,20 @@ def _mailbox_state_from_icloud_hme_alias(email: str, global_config: dict[str, An
         from core.db import IcloudHmeAliasModel
 
         with Session(engine) as session:
-            alias = session.exec(select(IcloudHmeAliasModel).where(IcloudHmeAliasModel.hme == email)).first()
+            alias = session.exec(
+                select(IcloudHmeAliasModel)
+                .where(IcloudHmeAliasModel.hme == email)
+                .where(IcloudHmeAliasModel.bound_service == 'chatgpt')
+            ).first()
             if alias is None:
-                aliases = session.exec(select(IcloudHmeAliasModel)).all()
+                # Keep this ChatGPT-only association lookup bounded.  The
+                # Helper ledger, not this SQLite cache, owns cross-platform
+                # logical-address availability.
+                aliases = session.exec(
+                    select(IcloudHmeAliasModel).where(
+                        IcloudHmeAliasModel.bound_service == 'chatgpt'
+                    )
+                ).all()
                 alias = next((row for row in aliases if _normalize_email(getattr(row, 'hme', '')) == target), None)
             if alias is None:
                 return {}
@@ -637,6 +648,8 @@ def _mailbox_state_from_icloud_hme_alias(email: str, global_config: dict[str, An
             'account_id': anonymous_id,
             'extra': {
                 'provider': 'icloud_hme',
+                'platform': 'chatgpt',
+                'registration_platform': 'chatgpt',
                 'forward_to': str(config.get('icloud_forward_to') or '').strip(),
                 'forward_mailbox_id': str(config.get('icloud_forward_mailbox_id') or '').strip(),
             },
@@ -1136,6 +1149,7 @@ def recheck_custom_chatgpt_email(
     finalize_mailbox: bool = True,
 ) -> dict[str, Any]:
     action_logs: list[str] = []
+    saved_account_id = 0
 
     def _check_stop() -> None:
         if callable(stop_checker):
@@ -1148,6 +1162,36 @@ def recheck_custom_chatgpt_email(
             return
         action_logs.append(text)
         _log_to(log_fn, text)
+
+    def _persist_post_finalize_state(state: dict[str, Any], *account_ids: int) -> None:
+        """Persist the post-finalize lease projection for saved ChatGPT rows."""
+
+        if not save_on_success or not isinstance(state, dict) or not state:
+            return
+        candidates = []
+        for value in account_ids:
+            try:
+                account_id = int(value or 0)
+            except (TypeError, ValueError):
+                account_id = 0
+            if account_id > 0 and account_id not in candidates:
+                candidates.append(account_id)
+        if not candidates:
+            return
+        try:
+            with Session(engine) as session:
+                for account_id in candidates:
+                    row = session.get(AccountModel, account_id)
+                    if row is None:
+                        continue
+                    extra = row.get_extra()
+                    extra['chatgpt_mailbox_state'] = dict(state)
+                    row.set_extra(extra)
+                    row.updated_at = _utcnow()
+                    session.add(row)
+                session.commit()
+        except Exception as exc:
+            _log(f'[邮箱测活] finalize 后 mailbox_state 写回失败: {exc}', 'warning')
 
     normalized_email = str(email or '').strip()
     normalized_password = str(password or '')
@@ -1440,6 +1484,15 @@ def recheck_custom_chatgpt_email(
                 email_service.finalize_success(account_email=normalized_email, task_id=task_id)
             except Exception:
                 pass
+            try:
+                # Finalize may replace the lease state/registration projection;
+                # return the post-commit snapshot to callers instead of the
+                # pre-finalize mailbox state captured above.
+                exported_mailbox_state = email_service.export_state()
+                payload["mailbox_state"] = exported_mailbox_state
+                _persist_post_finalize_state(exported_mailbox_state, saved_account_id, stage1_saved_account_id)
+            except Exception:
+                pass
         return {
             'ok': True,
             'data': {
@@ -1483,6 +1536,12 @@ def recheck_custom_chatgpt_email(
                     email_service.finalize_success(account_email=normalized_email, task_id=task_id)
                 except Exception:
                     pass
+                try:
+                    exported_mailbox_state = email_service.export_state()
+                    payload["mailbox_state"] = exported_mailbox_state
+                    _persist_post_finalize_state(exported_mailbox_state, stage1_saved_account_id)
+                except Exception:
+                    pass
             _timeline_log(log_fn, f'[邮箱测活] 阶段 2/2 失败：{raw_error}；保留第一阶段结果')
             return {
                 'ok': True,
@@ -1514,6 +1573,12 @@ def recheck_custom_chatgpt_email(
         if finalize_mailbox:
             try:
                 email_service.finalize_failure(error_message=sanitize_error_message(raw_error), task_id=task_id)
+            except Exception:
+                pass
+            try:
+                exported_mailbox_state = email_service.export_state()
+                payload['mailbox_state'] = exported_mailbox_state
+                _persist_post_finalize_state(exported_mailbox_state, saved_account_id, stage1_saved_account_id)
             except Exception:
                 pass
         _timeline_log(log_fn, f'[邮箱测活] 结果：失败，{payload["message"]}')

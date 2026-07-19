@@ -6,6 +6,16 @@
 
 ## [Unreleased] (未发布)
 
+## [2.5.0] - 2026-07-20
+
+### 优化 (Changed)
+- **HME Helper 平台注册兼容链路**：`core/base_mailbox.py` 的 ChatGPT HME prepare 请求现在显式传递 `platform=chatgpt`，保存 Helper 返回的 `registration_id`、`logical_address_id`、`physical_alias_id`、`lease_id`、`lease_state`、`physical_hme`、`logical_type`、`tag`、`tag_namespace` 和 `tag_slot`。finalize 以 registration/lease 标识为主，同时保留 `chatgpt_account_email` 兼容投影，并在 authoritative 响应后刷新 mailbox state。
+- **随机/legacy tag 收码边界**：tag 地址（包括随机六位 tag 与历史 `+gptN`）只依据完整逻辑地址的可信 transport header 匹配；ChatGPT 不回退物理 HME。base 地址不再从正文宽松命中，多转发箱在多箱扫描时使用 mailbox-scoped message ID，避免相同 provider ID 串箱。
+- **恢复与本地旁路隔离**：`services/chatgpt_core/mailbox_state.py`、`restored_email_service.py` 保留并恢复完整 Helper 身份字段；SQLite HME alias 恢复查询限定 ChatGPT association，不以本地全局邮箱记录阻塞其它平台注册。
+
+### 修复 (Fixed)
+- **无效 Helper prepare 自动释放租约**：Helper 返回已领取但无有效逻辑邮箱时，auto-gpt 会带已知 registration/logical/physical ID 立即执行 early finalize，再报告 prepare 异常，避免无主 lease 等待 TTL。
+
 ## [2.4.0] - 2026-07-19
 
 ### 新增 (Added)
@@ -2011,4 +2021,8 @@
 
 ## 2026-07-19 00:48:26 +0800
 - 新增 ChatGPT Team 优惠码 checkout 长链及双端配置
+- 发布模式: multi
+
+## 2026-07-20 02:36:01 +0800
+- 发布 v2.5.0 HME 平台 registration 消费者兼容
 - 发布模式: multi

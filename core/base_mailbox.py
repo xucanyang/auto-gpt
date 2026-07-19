@@ -2351,6 +2351,7 @@ class HmeReadyApiClient:
         self,
         *,
         forward_to: str,
+        platform: str = "chatgpt",
         request_id: str = "",
         task_id: str = "",
         consumer: str = "",
@@ -2359,6 +2360,10 @@ class HmeReadyApiClient:
     ) -> Any:
         body = {
             "forward_to": str(forward_to or "").strip(),
+            # ChatGPT is the only platform consumed by this checkout.  Keep
+            # the field explicit even while talking to an older Helper which
+            # ignores unknown JSON keys.
+            "platform": str(platform or "chatgpt").strip().lower() or "chatgpt",
             "request_id": str(request_id or "").strip(),
             "task_id": str(task_id or "").strip(),
             "consumer": str(consumer or "").strip(),
@@ -2416,16 +2421,32 @@ class HmeReadyApiClient:
         *,
         outcome: str,
         reason: str = "",
+        registration_id: str = "",
+        logical_address_id: str = "",
+        physical_alias_id: str = "",
+        platform: str = "chatgpt",
+        bound_account_email: str = "",
+        external_account_ref: str = "",
         chatgpt_account_email: str = "",
         task_id: str = "",
     ) -> dict[str, Any]:
+        normalized_bound_email = str(bound_account_email or chatgpt_account_email or "").strip()
         payload = self._request(
             "POST",
             f"/api/hme-ready/mailboxes/{lease_id}/finalize",
             payload={
                 "outcome": str(outcome or "").strip(),
                 "reason": str(reason or "").strip(),
-                "chatgpt_account_email": str(chatgpt_account_email or "").strip(),
+                "platform": str(platform or "chatgpt").strip().lower() or "chatgpt",
+                "lease_id": str(lease_id or "").strip(),
+                "registration_id": str(registration_id or "").strip(),
+                "logical_address_id": str(logical_address_id or "").strip(),
+                "physical_alias_id": str(physical_alias_id or "").strip(),
+                "bound_account_email": normalized_bound_email,
+                "external_account_ref": str(external_account_ref or "").strip(),
+                # Legacy Helper releases still read this field.  It remains a
+                # projection only; new callers use bound_account_email above.
+                "chatgpt_account_email": normalized_bound_email,
                 "task_id": str(task_id or "").strip(),
             },
         )
@@ -2565,11 +2586,38 @@ class IcloudHmeMailbox(BaseMailbox):
         return re.split(r"\r?\n\r?\n", str(raw_message or ""), maxsplit=1)[0]
 
     @classmethod
+    def _trusted_transport_header_values(cls, raw_message: str) -> list[str]:
+        """Extract routing headers while excluding Subject/From/body text."""
+
+        header_block = cls._raw_header_block(raw_message)
+        if not header_block:
+            return []
+        unfolded = re.sub(r"\r?\n[ \t]+", " ", header_block)
+        allowed = {
+            "return-path",
+            "received",
+            "delivered-to",
+            "x-original-to",
+            "x-forwarded-to",
+            "envelope-to",
+            "x-envelope-to",
+            "original-recipient",
+            "final-recipient",
+            "x-icloud-hme",
+        }
+        values: list[str] = []
+        for line in unfolded.splitlines():
+            name, separator, value = line.partition(":")
+            if separator and name.strip().lower() in allowed:
+                values.append(value.strip().lower())
+        return values
+
+    @classmethod
     def _tagged_hme_headers_match_alias(cls, raw_message: str, alias: str) -> bool:
         """Match a tagged HME only through trusted transport-header tokens.
 
         Apple normalizes the visible ``To`` and ``X-ICLOUD-HME p=`` values to
-        the physical HME alias.  The logical ``+gptN`` destination survives in
+        the physical HME alias.  The logical ``+tag`` destination survives in
         ``Return-Path`` as ``local+tag=domain_at_...``.  Matching the physical
         alias would let sibling tag leases consume each other's OTP, and
         searching the body would turn quoted addresses into routing evidence.
@@ -2578,7 +2626,7 @@ class IcloudHmeMailbox(BaseMailbox):
         if not cls._is_tagged_hme_alias(normalized):
             return False
 
-        headers = cls._raw_header_block(raw_message).lower()
+        headers = "\n".join(cls._trusted_transport_header_values(raw_message))
         if not headers:
             return False
 
@@ -2586,7 +2634,7 @@ class IcloudHmeMailbox(BaseMailbox):
             escaped = re.escape(token)
             return bool(
                 re.search(
-                    rf"(?:^|[<\s:;=,\-]){escaped}(?=$|[\s_@>;,)])",
+                    rf"(?:^|[<\s:;=,\-+]){escaped}(?=$|[\s_@>;,)])",
                     headers,
                     flags=re.IGNORECASE,
                 )
@@ -2594,9 +2642,49 @@ class IcloudHmeMailbox(BaseMailbox):
 
         # Keep the literal address form for providers that preserve it, then
         # accept Apple's transport-safe @ -> = representation.  The boundary
-        # rejects gpt1/gpt10 prefix collisions and only considers headers.
+        # rejects sibling-tag prefix collisions and only considers headers.
         return contains_transport_token(normalized) or contains_transport_token(
             normalized.replace("@", "=", 1)
+        )
+
+    @classmethod
+    def _base_hme_headers_match_alias(
+        cls,
+        raw_message: str,
+        alias: str,
+        received_for: Any = None,
+    ) -> bool:
+        """Match an untagged/base HME without searching the message body.
+
+        ``received_for`` and the transport header block are routing metadata;
+        the decoded body is untrusted content and may quote an arbitrary
+        address.  This intentionally mirrors the tagged path's trust boundary
+        while allowing providers that expose only ``Delivered-To`` or
+        ``X-Original-To``.
+        """
+
+        normalized = cls._normalize_email(alias)
+        if not normalized or cls._is_tagged_hme_alias(normalized):
+            return False
+        if isinstance(received_for, str):
+            received_for = [received_for]
+        targets = {
+            cls._normalize_email(value)
+            for value in (received_for if isinstance(received_for, (list, tuple, set)) else [])
+            if str(value or "").strip()
+        }
+        if normalized in targets:
+            return True
+        headers = "\n".join(cls._trusted_transport_header_values(raw_message))
+        if not headers:
+            return False
+        escaped = re.escape(normalized)
+        transport_safe = re.escape(normalized.replace("@", "=", 1))
+        # Restrict matches to the extracted routing values.  A bare address in
+        # a Subject or other non-transport header is not evidence.
+        return bool(
+            re.search(rf"(?<![\w.+\-]){escaped}(?![\w.+\-])", headers, flags=re.IGNORECASE)
+            or re.search(rf"(?<![\w.+\-]){transport_safe}(?![\w.+\-])", headers, flags=re.IGNORECASE)
         )
 
     @staticmethod
@@ -2952,6 +3040,180 @@ class IcloudHmeMailbox(BaseMailbox):
             return ""
         return str(extra.get("mailbox_id") or getattr(account, "account_id", "") or "").strip()
 
+    @staticmethod
+    def _helper_identity_from_payload(payload: Any) -> dict[str, Any]:
+        """Extract canonical Helper identity fields from old and new shapes.
+
+        The Helper compatibility window has returned the same lease in several
+        projections (``auto_gpt``, ``mailbox``, ``lease`` and, in newer builds,
+        top-level canonical fields).  Consumers must not derive an address from
+        a slot number, so normalize every projection here and leave absent new
+        IDs empty for the legacy fallback path.
+        """
+
+        root = payload if isinstance(payload, dict) else {}
+        sources: list[dict[str, Any]] = [root]
+        for key in ("registration", "logical_address", "physical_alias", "lease", "mailbox", "auto_gpt"):
+            value = root.get(key)
+            if isinstance(value, dict):
+                sources.append(value)
+                if key == "auto_gpt" and isinstance(value.get("extra"), dict):
+                    sources.append(value["extra"])
+
+        def first(*keys: str) -> str:
+            for source in sources:
+                for key in keys:
+                    value = source.get(key)
+                    if value not in (None, ""):
+                        text = str(value).strip()
+                        if text:
+                            return text
+            return ""
+
+        def first_int(*keys: str) -> Any:
+            for source in sources:
+                for key in keys:
+                    value = source.get(key)
+                    if value not in (None, ""):
+                        try:
+                            return int(value)
+                        except (TypeError, ValueError):
+                            return value
+            return ""
+
+        identity = {
+            "email": IcloudHmeMailbox._extract_hme(root),
+            "registration_id": first("registration_id", "registrationId"),
+            "logical_address_id": first("logical_address_id", "logicalAddressId"),
+            "physical_alias_id": first("physical_alias_id", "physicalAliasId"),
+            "lease_id": first("lease_id", "leaseId", "checkout_id", "checkoutId"),
+            "platform": first("platform", "registration_platform") or "chatgpt",
+            "lease_state": first("lease_state", "leaseState"),
+            "physical_hme": first("physical_hme", "physicalHme", "apple_hme", "appleHme"),
+            "logical_type": first("logical_type", "logicalType"),
+            "tag": first("tag"),
+            "tag_namespace": first("tag_namespace", "tagNamespace", "slot_namespace", "slotNamespace"),
+            "tag_slot": first_int("tag_slot", "tagSlot", "slot_index", "slotIndex"),
+            "forward_to": first("forward_to", "forwardTo"),
+            "forward_mailbox_id": first("forward_mailbox_id", "forwardMailboxId"),
+            "external_account_ref": first("external_account_ref", "externalAccountRef"),
+        }
+        if not identity["lease_state"]:
+            for object_key in ("lease", "registration"):
+                obj = root.get(object_key)
+                if not isinstance(obj, dict):
+                    continue
+                identity["lease_state"] = str(
+                    obj.get("lease_state")
+                    or obj.get("leaseState")
+                    or obj.get("state")
+                    or obj.get("status")
+                    or ""
+                ).strip()
+                if identity["lease_state"]:
+                    break
+        if not identity["lease_state"]:
+            # Legacy responses sometimes exposed only a top-level state.  Do
+            # not use top-level ``status=ok`` from newer envelope responses.
+            identity["lease_state"] = str(root.get("state") or "").strip()
+        # Some Helper responses expose resource IDs only as ``{id: ...}``
+        # inside their typed object.  Map those explicitly without treating a
+        # generic mailbox/lease ID as a registration ID.
+        for object_key, identity_key in (
+            ("registration", "registration_id"),
+            ("logical_address", "logical_address_id"),
+            ("physical_alias", "physical_alias_id"),
+        ):
+            if not identity[identity_key]:
+                obj = root.get(object_key)
+                if isinstance(obj, dict):
+                    identity[identity_key] = str(obj.get("id") or "").strip()
+
+        # Legacy responses expose the checkout as auto_gpt.account_id or
+        # mailbox.id.  This is deliberately the only ID fallback; registration
+        # and logical IDs remain empty so callers can distinguish old Helper
+        # state from a stable new identity.
+        if not identity["lease_id"]:
+            auto_gpt = root.get("auto_gpt") if isinstance(root.get("auto_gpt"), dict) else {}
+            mailbox = root.get("mailbox") if isinstance(root.get("mailbox"), dict) else {}
+            lease = root.get("lease") if isinstance(root.get("lease"), dict) else {}
+            identity["lease_id"] = str(
+                auto_gpt.get("account_id")
+                or lease.get("id")
+                or lease.get("checkout_id")
+                or mailbox.get("id")
+                or ""
+            ).strip()
+        if not identity["email"]:
+            for source in sources:
+                for key in ("email", "full_address", "fullAddress", "address"):
+                    candidate = IcloudHmeMailbox._extract_email_like_text(source.get(key))
+                    if candidate:
+                        identity["email"] = candidate
+                        break
+                if identity["email"]:
+                    break
+        identity["platform"] = str(identity["platform"] or "chatgpt").strip().lower() or "chatgpt"
+        return identity
+
+    @staticmethod
+    def _merge_helper_identity(extra: dict[str, Any], identity: dict[str, Any]) -> dict[str, Any]:
+        """Merge non-empty canonical identity fields into mailbox metadata."""
+
+        result = dict(extra or {})
+        key_map = {
+            "registration_id": "registration_id",
+            "logical_address_id": "logical_address_id",
+            "physical_alias_id": "physical_alias_id",
+            "lease_id": "lease_id",
+            "platform": "platform",
+            "lease_state": "lease_state",
+            "physical_hme": "physical_hme",
+            "logical_type": "logical_type",
+            "tag": "tag",
+            "tag_namespace": "tag_namespace",
+            "tag_slot": "tag_slot",
+            "external_account_ref": "external_account_ref",
+        }
+        for source_key, target_key in key_map.items():
+            value = identity.get(source_key)
+            if value not in (None, ""):
+                result[target_key] = value
+        # Keep the historical field for downstream account snapshots.
+        if identity.get("platform"):
+            result["registration_platform"] = str(identity["platform"]).strip().lower()
+        if identity.get("lease_id"):
+            result.setdefault("checkout_id", str(identity["lease_id"]).strip())
+        return result
+
+    def _finalize_invalid_helper_prepare(
+        self,
+        identity: dict[str, Any],
+        *,
+        reason: str,
+        task_id: str,
+    ) -> None:
+        """Release a lease returned with an unusable mailbox before raising."""
+
+        lease_id = str(identity.get("lease_id") or "").strip()
+        if not lease_id:
+            return
+        try:
+            self._helper_client.finalize(
+                lease_id,
+                outcome="early_failure",
+                reason=reason,
+                registration_id=str(identity.get("registration_id") or "").strip(),
+                logical_address_id=str(identity.get("logical_address_id") or "").strip(),
+                physical_alias_id=str(identity.get("physical_alias_id") or "").strip(),
+                platform="chatgpt",
+                task_id=task_id,
+            )
+        except Exception as exc:
+            # Preserve the original malformed-prepare error while making the
+            # release failure visible for reconciliation.
+            self._log(f"[iCloudHME] 无效 prepare lease early finalize 失败: {exc}", "warning")
+
     def _helper_get_email(self) -> MailboxAccount:
         self._ensure_config()
         self._log("[iCloudHME] 使用 Helper Ready API 出池")
@@ -2963,6 +3225,7 @@ class IcloudHmeMailbox(BaseMailbox):
         ttl_ms = self._helper_checkout_ttl_seconds * 1000 if self._helper_checkout_ttl_seconds else None
         payload = self._helper_client.prepare(
             forward_to="*",
+            platform="chatgpt",
             request_id=attempt_id,
             task_id=parent_task_id,
             consumer=self._helper_consumer,
@@ -2979,15 +3242,14 @@ class IcloudHmeMailbox(BaseMailbox):
         if not isinstance(lease, dict):
             lease = {}
 
-        email = str(auto_gpt.get("email") or mailbox.get("email") or mailbox.get("full_address") or "").strip()
-        lease_id = str(
-            auto_gpt.get("account_id")
-            or lease.get("id")
-            or lease.get("checkout_id")
-            or mailbox.get("id")
-            or ""
-        ).strip()
+        identity = self._helper_identity_from_payload(payload)
+        # This checkout is the ChatGPT consumer; do not let a malformed or
+        # cross-platform response re-label its registration metadata.
+        identity["platform"] = "chatgpt"
+        email = str(identity.get("email") or "").strip()
+        lease_id = str(identity.get("lease_id") or "").strip()
         extra = dict(auto_gpt.get("extra") or {})
+        extra = self._merge_helper_identity(extra, identity)
         helper_forward_to = self._normalize_email(
             extra.get("forward_to")
             or mailbox.get("forward_to")
@@ -3002,7 +3264,15 @@ class IcloudHmeMailbox(BaseMailbox):
             or mailbox.get("forwardMailboxId")
             or ""
         ).strip()
-        if not email or not lease_id:
+        resolved_task_id = str(getattr(self, "_registration_task_id", "") or "").strip()
+        if not email:
+            self._finalize_invalid_helper_prepare(
+                identity,
+                reason="invalid_prepare_email",
+                task_id=resolved_task_id,
+            )
+            raise RuntimeError(f"HME Ready API prepare 返回异常邮箱: {payload}")
+        if not lease_id:
             raise RuntimeError(f"HME Ready API prepare 返回异常: {payload}")
         extra.update(
             {
@@ -3011,6 +3281,7 @@ class IcloudHmeMailbox(BaseMailbox):
                 "source": extra.get("source") or "icloud-hide-email-helper",
                 "lease_id": extra.get("lease_id") or lease_id,
                 "checkout_id": extra.get("checkout_id") or lease_id,
+                "lease_state": extra.get("lease_state") or "checked_out",
                 "hme": extra.get("hme") or email,
                 "configured_forward_to": self._icloud_forward_to,
                 "configured_forward_tos": list(self._icloud_forward_tos),
@@ -3046,14 +3317,17 @@ class IcloudHmeMailbox(BaseMailbox):
 
     def get_current_ids(self, account: MailboxAccount) -> set:
         all_ids = set()
-        for forward_mailbox in self._candidate_forward_mailboxes_for_account(account):
+        forward_mailboxes = self._candidate_forward_mailboxes_for_account(account)
+        namespace_ids = len(forward_mailboxes) > 1
+        for forward_mailbox in forward_mailboxes:
             m_id = str(getattr(forward_mailbox, "account_id", "") or "").strip()
             if not m_id:
                 continue
             try:
                 mails = self._tempmail_mailbox._list_emails(m_id)
                 for idx, msg in enumerate(mails):
-                    all_ids.add(self._tempmail_mailbox._message_id(msg, idx))
+                    raw_mid = self._tempmail_mailbox._message_id(msg, idx)
+                    all_ids.add(f"{m_id}:{raw_mid}" if namespace_ids else raw_mid)
             except Exception as exc:
                 if not self._tempmail_mailbox._is_mailbox_not_found_error(exc):
                     raise
@@ -3087,7 +3361,9 @@ class IcloudHmeMailbox(BaseMailbox):
         }
 
         def poll_once() -> Optional[str]:
-            for forward_mailbox in self._candidate_forward_mailboxes_for_account(account):
+            forward_mailboxes = self._candidate_forward_mailboxes_for_account(account)
+            namespace_ids = len(forward_mailboxes) > 1
+            for forward_mailbox in forward_mailboxes:
                 m_id = str(getattr(forward_mailbox, "account_id", "") or "").strip()
                 if not m_id:
                     continue
@@ -3099,40 +3375,36 @@ class IcloudHmeMailbox(BaseMailbox):
                     raise
 
                 for idx, msg in enumerate(mails):
-                    mid = self._tempmail_mailbox._message_id(msg, idx)
-                    if mid in seen:
+                    raw_mid = self._tempmail_mailbox._message_id(msg, idx)
+                    scoped_mid = f"{m_id}:{raw_mid}" if namespace_ids else raw_mid
+                    # A multi-forward scan must namespace IDs; accepting a
+                    # raw ID there would let mailbox A suppress mailbox B.
+                    if scoped_mid in seen or (not namespace_ids and raw_mid in seen):
                         continue
                     msg_ts = self._tempmail_mailbox._parse_message_timestamp(msg)
                     if otp_sent_at and msg_ts and msg_ts < float(otp_sent_at):
-                        seen.add(mid)
+                        seen.add(scoped_mid)
                         continue
 
-                    detail = self._tempmail_mailbox._get_email_detail(m_id, mid)
+                    detail = self._tempmail_mailbox._get_email_detail(m_id, raw_mid)
                     received_for = detail.get("received_for") if isinstance(detail, dict) else []
                     raw_message = str(detail.get("raw_message") or "")
                     if self._is_tagged_hme_alias(alias):
                         # A tagged lease must never fall back to its physical
                         # HME address in received_for / X-ICLOUD-HME p=.
-                        # Those fields intentionally omit +gptN after Apple
+                        # Those fields intentionally omit +tag after Apple
                         # forwarding and would cross-deliver sibling OTPs.
                         matched_alias = self._tagged_hme_headers_match_alias(raw_message, alias)
                         match_source = "tagged_hme_transport_header"
                     else:
-                        normalized_targets = {
-                            self._normalize_email(value)
-                            for value in (received_for if isinstance(received_for, list) else [])
-                            if str(value or "").strip()
-                        }
-                        raw_lower = raw_message.lower()
-                        matched_alias = alias in normalized_targets or (
-                            f"for <{alias}>" in raw_lower
-                            or f"delivered-to: {alias}" in raw_lower
-                            or f"x-original-to: {alias}" in raw_lower
-                            or alias in raw_lower
+                        matched_alias = self._base_hme_headers_match_alias(
+                            raw_message,
+                            alias,
+                            received_for,
                         )
-                        match_source = "legacy_received_for_or_raw"
+                        match_source = "base_hme_transport_header"
                     if not matched_alias:
-                        seen.add(mid)
+                        seen.add(scoped_mid)
                         continue
 
                     full_text = " ".join(
@@ -3145,7 +3417,7 @@ class IcloudHmeMailbox(BaseMailbox):
                         ]
                     )
                     code = self._safe_extract(full_text, code_pattern)
-                    seen.add(mid)
+                    seen.add(scoped_mid)
                     if not code or str(code).strip() in exclude_codes:
                         continue
 
@@ -3156,7 +3428,7 @@ class IcloudHmeMailbox(BaseMailbox):
                             last_otp_at=self._utcnow_iso(),
                         )
                     self._record_verification_result(
-                        message_id=mid,
+                        message_id=scoped_mid,
                         code=code,
                         phase=kwargs.get("phase") or "",
                         provider="IcloudHmeTempMailForwardMailbox",
@@ -3165,6 +3437,8 @@ class IcloudHmeMailbox(BaseMailbox):
                             "matched_alias": getattr(account, "email", "") or "",
                             "alias_match_source": match_source,
                             "mailbox": {"id": m_id},
+                            "raw_message_id": raw_mid,
+                            "message_id_namespace": m_id,
                             "lease_id": helper_lease_id if self._icloud_hme_mode == "helper_ready_api" else "",
                             "matched_forward_to": str(getattr(forward_mailbox, "email", "") or ""),
                             "matched_mailbox_id": m_id,
@@ -3181,6 +3455,24 @@ class IcloudHmeMailbox(BaseMailbox):
             timeout_message=f"等待验证码超时 ({max(int(timeout or self._wait_timeout_seconds), 1)}s)",
         )
 
+    def _apply_helper_finalize_payload(
+        self,
+        account: MailboxAccount,
+        payload: Any,
+        *,
+        outcome: str,
+    ) -> None:
+        """Keep the authoritative registration/lease projection for export."""
+
+        extra = dict(getattr(account, "extra", None) or {})
+        identity = self._helper_identity_from_payload(payload)
+        extra = self._merge_helper_identity(extra, identity)
+        if outcome:
+            extra["lease_state"] = str(identity.get("lease_state") or outcome).strip().lower()
+        extra["platform"] = "chatgpt"
+        extra["registration_platform"] = "chatgpt"
+        account.extra = extra
+
     def finalize_success(
         self,
         account: MailboxAccount,
@@ -3196,13 +3488,20 @@ class IcloudHmeMailbox(BaseMailbox):
                 return
             bound_email = str(registered_email or getattr(account, "email", "") or "").strip()
             resolved_task_id = str(task_id or getattr(self, "_task_attempt_token", "") or "").strip()
-            self._helper_client.finalize(
+            extra = dict(getattr(account, "extra", None) or {})
+            response = self._helper_client.finalize(
                 lease_id,
                 outcome="success",
                 reason="registered",
+                registration_id=str(extra.get("registration_id") or "").strip(),
+                logical_address_id=str(extra.get("logical_address_id") or "").strip(),
+                physical_alias_id=str(extra.get("physical_alias_id") or "").strip(),
+                platform="chatgpt",
+                bound_account_email=bound_email,
                 chatgpt_account_email=bound_email,
                 task_id=resolved_task_id,
             )
+            self._apply_helper_finalize_payload(account, response, outcome="committed")
             self._helper_wait_started_leases.discard(lease_id)
             self._log(f"[iCloudHME] Helper 已提交成功: {getattr(account, 'email', '')}")
             return
@@ -3272,12 +3571,18 @@ class IcloudHmeMailbox(BaseMailbox):
                     outcome = "early_failure"
                 else:
                     outcome = "late_failure"
-            self._helper_client.finalize(
+            extra = dict(getattr(account, "extra", None) or {})
+            response = self._helper_client.finalize(
                 lease_id,
                 outcome=outcome,
                 reason=error_text or outcome,
+                registration_id=str(extra.get("registration_id") or "").strip(),
+                logical_address_id=str(extra.get("logical_address_id") or "").strip(),
+                physical_alias_id=str(extra.get("physical_alias_id") or "").strip(),
+                platform="chatgpt",
                 task_id=resolved_task_id,
             )
+            self._apply_helper_finalize_payload(account, response, outcome=outcome)
             self._helper_wait_started_leases.discard(lease_id)
             self._log(f"[iCloudHME] Helper 已处理失败 outcome={outcome}: {getattr(account, 'email', '')}")
             return

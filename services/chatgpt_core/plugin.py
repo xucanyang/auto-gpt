@@ -234,6 +234,7 @@ class ChatGPTPlatform(BasePlatform):
                     self._before_ids = set()
                     self._mailbox = _mailbox
                     self._last_verification_result = {}
+                    self._post_finalize_state = None
 
                 def _can_reuse_current_account(self) -> bool:
                     acct = self._acct
@@ -335,6 +336,10 @@ class ChatGPTPlatform(BasePlatform):
                             registered_email=str(account_email or self._email or "").strip(),
                             task_id=resolved_task_id,
                         )
+                    # Helper finalize can return authoritative registration /
+                    # lease state.  Capture it after the mutation so account
+                    # persistence never stores the pre-commit snapshot.
+                    self._post_finalize_state = self.export_state()
                     _sync_hme_rerun_result(self._acct, success=True, task_id=resolved_task_id)
 
                 def finalize_failure(self, error_message: str = "", task_id: str = ""):
@@ -349,6 +354,7 @@ class ChatGPTPlatform(BasePlatform):
                             error_message=normalized_error,
                             task_id=resolved_task_id,
                         )
+                    self._post_finalize_state = self.export_state()
                     _sync_hme_rerun_result(self._acct, success=False, error_message=normalized_error, task_id=resolved_task_id)
 
                 def update_status(self, success, error=None):

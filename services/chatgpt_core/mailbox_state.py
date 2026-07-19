@@ -8,6 +8,7 @@ never copy the global registration ``extra_config`` object into this payload.
 from __future__ import annotations
 
 import json
+import unicodedata
 from collections.abc import Mapping
 from typing import Any
 
@@ -195,8 +196,23 @@ _PROVIDER_ACCOUNT_EXTRA_KEYS: dict[str, set[str]] = {
         "source",
         "anonymous_id",
         "hme",
+        # Helper platform-registration identity.  These fields are bounded
+        # account metadata, not secrets; keeping them here makes a restored
+        # ChatGPT mailbox addressable without reconstructing a tag or slot.
+        "platform",
+        "registration_platform",
+        "registration_id",
+        "logical_address_id",
+        "physical_alias_id",
         "lease_id",
         "checkout_id",
+        "lease_state",
+        "physical_hme",
+        "logical_type",
+        "tag",
+        "tag_namespace",
+        "tag_slot",
+        "external_account_ref",
         "mailbox_id",
         "service_id",
         "forward_to",
@@ -336,7 +352,23 @@ def export_mailbox_account_extra(
     nested_account = source.get("account")
     nested_extra = nested_account.get("extra") if isinstance(nested_account, Mapping) else {}
     if normalized_provider == "icloud_hme" and isinstance(nested_extra, Mapping):
-        for key in ("forward_to", "forward_mailbox_id", "lease_id", "checkout_id"):
+        for key in (
+            "forward_to",
+            "forward_mailbox_id",
+            "lease_id",
+            "checkout_id",
+            "registration_id",
+            "logical_address_id",
+            "physical_alias_id",
+            "platform",
+            "registration_platform",
+            "lease_state",
+            "physical_hme",
+            "logical_type",
+            "tag",
+            "tag_namespace",
+            "tag_slot",
+        ):
             if source.get(key) in (None, "") and nested_extra.get(key) not in (None, ""):
                 source[key] = nested_extra.get(key)
 
@@ -448,6 +480,29 @@ def sanitize_mailbox_state(
     if is_helper_hme:
         state_config.pop("icloud_cookie", None)
         state_config["icloud_hme_mode"] = "helper_ready_api"
+        # auto-gpt only consumes ChatGPT registrations.  Old Helper snapshots
+        # lack this field, so default only inside the helper-HME scope and keep
+        # the original provider-independent state contract intact.
+        account_extra.setdefault("platform", "chatgpt")
+        account_extra.setdefault("registration_platform", "chatgpt")
+        account_extra["platform"] = str(account_extra.get("platform") or "chatgpt").strip().lower() or "chatgpt"
+        account_extra["registration_platform"] = (
+            str(account_extra.get("registration_platform") or account_extra["platform"] or "chatgpt")
+            .strip()
+            .lower()
+            or "chatgpt"
+        )
+        for key in (
+            "platform",
+            "registration_platform",
+            "lease_state",
+            "logical_type",
+            "tag",
+            "tag_namespace",
+        ):
+            value = account_extra.get(key)
+            if isinstance(value, str):
+                account_extra[key] = unicodedata.normalize("NFKC", value).strip().lower()
 
     before_ids = bound_before_ids(
         state.get("before_ids"),
