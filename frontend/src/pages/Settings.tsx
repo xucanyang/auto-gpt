@@ -141,6 +141,16 @@ const TAB_ITEMS = [
           { key: 'dynamic_proxy_probe_timeout_seconds', label: '探测超时秒数', placeholder: '8' },
         ],
       },
+      {
+        title: '本地状态同步默认参数',
+        desc: '账号页的“同步本地状态”只启动任务，网络出口统一使用上方全局模式；并发、独立出口和账号间延时在这里统一配置。',
+        fields: [
+          { key: 'chatgpt_local_status_probe_concurrency', label: '同步并发账号数', placeholder: '1' },
+          { key: 'chatgpt_local_status_probe_unique_exit_ip_enabled', label: '要求独立出口 IP', type: 'boolean' },
+          { key: 'chatgpt_local_status_probe_delay_seconds', label: '最小账号间延时（秒）', placeholder: '0' },
+          { key: 'chatgpt_local_status_probe_delay_max_seconds', label: '最大账号间延时（秒）', placeholder: '0' },
+        ],
+      },
     ],
   },
   {

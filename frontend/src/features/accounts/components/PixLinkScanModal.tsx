@@ -5,6 +5,7 @@ import { DeleteOutlined, ReloadOutlined } from '@ant-design/icons'
 const { Text } = Typography
 
 export type PixLinkCleanupMode = 'expired' | 'paid' | 'cancelled'
+export type PaymentLinkScanType = 'pix' | 'upi'
 
 export type PixLinkScanReport = {
   instance_id?: string
@@ -28,6 +29,18 @@ export type PixLinkScanReport = {
   direct_scan_state_counts?: Record<string, number>
   cleaned_links?: number
   concurrent_skipped_links?: number
+  current_upi_links?: number
+  payment_type_counts?: Record<string, number>
+  payment_types?: string[]
+  upi_qr_expiry_links?: number
+  pix_valid_links?: number
+  pix_expired_links?: number
+  pix_paid_links?: number
+  pix_cancelled_links?: number
+  upi_valid_links?: number
+  upi_expired_links?: number
+  upi_paid_links?: number
+  upi_cancelled_links?: number
 }
 
 type PixLinkScanRow = {
@@ -46,7 +59,7 @@ type PixLinkScanModalProps = {
   cleanupMode: PixLinkCleanupMode | null
   onClose: () => void
   onScan: () => void
-  onCleanup: (mode: PixLinkCleanupMode) => void
+  onCleanup: (mode: PixLinkCleanupMode, paymentType: PaymentLinkScanType) => void
 }
 
 export function PixLinkScanModal({
@@ -59,36 +72,16 @@ export function PixLinkScanModal({
   onScan,
   onCleanup,
 }: PixLinkScanModalProps) {
-  const rows: PixLinkScanRow[] = [
-    {
-      key: 'valid',
-      label: '有效',
-      color: 'success',
-      count: Number(report?.valid_links || 0),
-      cleanupMode: null,
-    },
-    {
-      key: 'paid',
-      label: '已支付',
-      color: 'blue',
-      count: Number(report?.paid_links || 0),
-      cleanupMode: 'paid',
-    },
-    {
-      key: 'expired',
-      label: '过期',
-      color: 'orange',
-      count: Number(report?.expired_links || 0),
-      cleanupMode: 'expired',
-    },
-    {
-      key: 'cancelled',
-      label: '支付已取消',
-      color: 'red',
-      count: Number(report?.cancelled_links || 0),
-      cleanupMode: 'cancelled',
-    },
-  ]
+  const buildRows = (paymentType: PaymentLinkScanType): PixLinkScanRow[] => {
+    const prefix = paymentType === 'upi' ? 'upi' : 'pix'
+    const legacy = paymentType === 'pix'
+    return [
+      { key: 'valid', label: '有效', color: 'success', count: Number(report?.[`${prefix}_valid_links` as keyof PixLinkScanReport] ?? (legacy ? report?.valid_links : 0) ?? 0), cleanupMode: null },
+      { key: 'paid', label: '已支付', color: 'blue', count: Number(report?.[`${prefix}_paid_links` as keyof PixLinkScanReport] ?? (legacy ? report?.paid_links : 0) ?? 0), cleanupMode: 'paid' },
+      { key: 'expired', label: '过期', color: 'orange', count: Number(report?.[`${prefix}_expired_links` as keyof PixLinkScanReport] ?? (legacy ? report?.expired_links : 0) ?? 0), cleanupMode: 'expired' },
+      { key: 'cancelled', label: '支付已取消', color: 'red', count: Number(report?.[`${prefix}_cancelled_links` as keyof PixLinkScanReport] ?? (legacy ? report?.cancelled_links : 0) ?? 0), cleanupMode: 'cancelled' },
+    ]
+  }
   const columns: ColumnsType<PixLinkScanRow> = [
     {
       title: '状态',
@@ -120,7 +113,7 @@ export function PixLinkScanModal({
             icon={<DeleteOutlined />}
             disabled={loading || cleanupMode !== null || row.count <= 0}
             loading={cleanupMode === mode}
-            onClick={() => onCleanup(mode)}
+            onClick={() => onCleanup(mode, 'pix')}
           >
             清理
           </Button>
@@ -129,13 +122,15 @@ export function PixLinkScanModal({
     },
   ]
   const validMissing = Number(report?.valid_missing_expiry_links || 0)
-  const totalLinks = Number(report?.current_pix_links || 0)
+  const pixTotal = Number(report?.current_pix_links || report?.payment_type_counts?.pix || 0)
+  const upiTotal = Number(report?.current_upi_links || report?.payment_type_counts?.upi || 0)
+  const showUpi = upiTotal > 0 || report?.payment_types?.includes('upi')
   const directSuccess = Number(report?.direct_scan_success_links || 0)
   const directFallback = Number(report?.direct_scan_fallback_links || 0)
 
   return (
     <Modal
-      title="PIX 链接扫描"
+      title="PIX / UPI 链接扫描"
       open={open}
       onCancel={onClose}
       width={520}
@@ -145,9 +140,9 @@ export function PixLinkScanModal({
       <Space direction="vertical" size={12} style={{ width: '100%' }}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
           <Space size={8}>
-            <Text type="secondary">总 PIX 链接</Text>
+            <Text type="secondary">当前 PIX / UPI 链接</Text>
             <Text strong style={{ fontSize: 18, fontVariantNumeric: 'tabular-nums' }}>
-              {report ? totalLinks : '-'}
+              {report ? pixTotal + upiTotal : '-'}
             </Text>
           </Space>
           <Button icon={<ReloadOutlined />} loading={loading} disabled={cleanupMode !== null} onClick={onScan}>
@@ -158,7 +153,7 @@ export function PixLinkScanModal({
         {report ? (
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
             <Text type="secondary">Stripe 实时查询</Text>
-            <Text strong style={{ fontVariantNumeric: 'tabular-nums' }}>{directSuccess} / {totalLinks}</Text>
+            <Text strong style={{ fontVariantNumeric: 'tabular-nums' }}>{directSuccess} / {pixTotal + upiTotal}</Text>
           </div>
         ) : null}
         {directFallback > 0 ? (
@@ -175,15 +170,39 @@ export function PixLinkScanModal({
             message={`${validMissing} 条保留链接缺少有效过期时间`}
           />
         ) : null}
-        <Table<PixLinkScanRow>
-          rowKey="key"
-          size="small"
-          tableLayout="fixed"
-          pagination={false}
-          loading={loading && !report}
-          columns={columns}
-          dataSource={rows}
-        />
+        {(['pix', ...(showUpi ? ['upi'] : [])] as PaymentLinkScanType[]).map((paymentType) => {
+          const rows = buildRows(paymentType)
+          const total = paymentType === 'upi' ? upiTotal : pixTotal
+          return (
+            <div key={paymentType}>
+              <Space size={8} style={{ marginBottom: 6 }}>
+                <Text strong>{paymentType === 'upi' ? 'UPI 链接扫描' : 'PIX 链接扫描'}</Text>
+                <Text type="secondary">{total} 条</Text>
+                {paymentType === 'upi' ? <Text type="secondary">有效期 5 分钟，以 qr_code.expires_at 为准</Text> : null}
+              </Space>
+              <Table<PixLinkScanRow>
+                rowKey="key"
+                size="small"
+                tableLayout="fixed"
+                pagination={false}
+                loading={loading && !report}
+                columns={columns.map((column) => column.key === 'action'
+                  ? { ...column, render: (_, row) => row.cleanupMode ? (
+                    <Button
+                      size="small"
+                      danger
+                      icon={<DeleteOutlined />}
+                      disabled={loading || cleanupMode !== null || row.count <= 0}
+                      loading={cleanupMode === row.cleanupMode}
+                      onClick={() => onCleanup(row.cleanupMode as PixLinkCleanupMode, paymentType)}
+                    >清理</Button>
+                  ) : null }
+                  : column)}
+                dataSource={rows}
+              />
+            </div>
+          )
+        })}
       </Space>
     </Modal>
   )

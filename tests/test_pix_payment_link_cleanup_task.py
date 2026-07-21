@@ -13,6 +13,7 @@ from core.task_runtime import RegisterTaskStore
 
 
 PIX_CLEANUP_SOURCE = "pix_payment_link_cleanup"
+UPI_CLEANUP_SOURCE = "upi_payment_link_cleanup"
 
 
 @dataclass
@@ -113,6 +114,19 @@ def test_pix_cleanup_scan_route_is_a_dedicated_get_endpoint():
     assert "GET" in (getattr(matches[0], "methods", set()) or set())
 
 
+def test_generic_and_upi_cleanup_routes_are_registered_once():
+    expected = {
+        "/tasks/chatgpt/payment-links/scan": "GET",
+        "/tasks/chatgpt/payment-links/cleanup/preview": "GET",
+        "/tasks/chatgpt/payment-links/cleanup/task": "POST",
+        "/tasks/chatgpt/payment-links/upi-cleanup/task": "POST",
+    }
+    for path, method in expected.items():
+        matches = [route for route in tasks.router.routes if getattr(route, "path", "") == path]
+        assert len(matches) == 1
+        assert method in (getattr(matches[0], "methods", set()) or set())
+
+
 def test_enqueue_pix_cleanup_returns_immediately_and_creates_task(
     cleanup_task_runtime,
     monkeypatch: pytest.MonkeyPatch,
@@ -194,6 +208,30 @@ def test_enqueue_pix_cleanup_freezes_requested_terminal_mode(cleanup_task_runtim
     assert snapshot["meta"]["cleanup_mode"] == "paid"
     assert snapshot["meta"]["cleanup_label"] == "已支付"
     assert snapshot["meta"]["operation"] == "paid_pix_payment_link_cleanup"
+
+
+def test_enqueue_upi_cleanup_uses_independent_source_and_runner_scope(cleanup_task_runtime):
+    store, _engine = cleanup_task_runtime
+    background_tasks = RecordingBackgroundTasks()
+
+    response = tasks.enqueue_expired_pix_payment_link_cleanup_task(
+        background_tasks=background_tasks,
+        cleanup_mode="expired",
+        payment_type="upi",
+    )
+
+    task_id = str(response["task_id"])
+    assert response["source"] == UPI_CLEANUP_SOURCE
+    assert response["payment_type"] == "upi"
+    assert len(background_tasks.calls) == 1
+    runner, args, kwargs = background_tasks.calls[0]
+    assert runner is tasks._run_expired_pix_payment_link_cleanup
+    assert args == (task_id, "expired", "upi")
+    assert kwargs == {}
+    snapshot = store.snapshot(task_id)
+    assert snapshot["source"] == UPI_CLEANUP_SOURCE
+    assert snapshot["meta"]["payment_type"] == "upi"
+    assert snapshot["meta"]["operation"] == "expired_upi_payment_link_cleanup"
 
 
 def test_pix_cleanup_runner_persists_success_and_keeps_summary_last(

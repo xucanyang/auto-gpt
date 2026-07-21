@@ -180,6 +180,8 @@ class ProbeLocalStatusBatchConfigTests(unittest.TestCase):
                 "task_proxy_mode": "dynamic",
                 "dynamic_proxy_max_attempts": "2",
                 "chatgpt_local_status_probe_unique_exit_ip_enabled": "true",
+                "chatgpt_local_status_probe_delay_seconds": "1.5",
+                "chatgpt_local_status_probe_delay_max_seconds": "3",
             },
         ):
             params, settings = _prepare_batch_probe_local_status_params(
@@ -193,6 +195,10 @@ class ProbeLocalStatusBatchConfigTests(unittest.TestCase):
         self.assertGreaterEqual(params["dynamic_proxy_max_attempts"], 8)
         self.assertEqual(settings["requested_concurrency"], 4)
         self.assertEqual(settings["effective_concurrency"], 4)
+        self.assertEqual(params["delay_seconds"], 1.5)
+        self.assertEqual(params["delay_max_seconds"], 3.0)
+        self.assertEqual(settings["delay_seconds"], 1.5)
+        self.assertEqual(settings["delay_max_seconds"], 3.0)
 
     def test_prepare_batch_probe_rejects_direct_mode_with_unique_exit_requirement(self):
         from api.tasks import _prepare_batch_probe_local_status_params

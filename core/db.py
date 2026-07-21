@@ -41,6 +41,9 @@ if _IS_SQLITE:
 
 class AccountModel(SQLModel, table=True):
     __tablename__ = "accounts"
+    __table_args__ = (
+        Index("idx_accounts_platform_created_at_id", "platform", "created_at", "id"),
+    )
 
     id: Optional[int] = Field(default=None, primary_key=True)
     platform: str = Field(index=True)
@@ -866,6 +869,14 @@ def _ensure_task_log_schema() -> None:
             )
         conn.exec_driver_sql(
             "CREATE INDEX IF NOT EXISTS idx_task_logs_task_id ON task_logs(task_id)"
+        )
+
+
+def _ensure_account_sort_indexes() -> None:
+    with engine.begin() as conn:
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_accounts_platform_created_at_id "
+            "ON accounts(platform, created_at, id)"
         )
 
 
@@ -3571,6 +3582,7 @@ def init_db():
     _ensure_phone_prefix_state_schema()
     _ensure_baxigpt_cdk_pool_schema()
     SQLModel.metadata.create_all(engine)
+    _ensure_account_sort_indexes()
     _ensure_payment_link_generation_schema()
     _ensure_payment_link_generation_cleanup_trigger()
     _ensure_account_list_state_schema()

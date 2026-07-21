@@ -265,6 +265,7 @@ def _apply_action_result(
                             "cancel_url",
                             "link_type",
                             "link_expires_at",
+                            "link_expiry_source",
                             "profile_hash",
                             "remote_batch_id",
                             "remote_job_id",

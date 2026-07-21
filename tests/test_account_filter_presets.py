@@ -68,6 +68,7 @@ def test_account_filter_preset_crud_and_normalization(monkeypatch):
     assert item["filters"]["columnFilters"]["submitState"] == ["unsubmitted", "submitting", "timeout"]
     assert item["filters"]["columnFilters"]["hasSubmitted"] == ["true"]
     assert item["filters"]["sortOrder"] == "asc"
+    assert item["filters"]["registrationSortOrder"] == "asc"
     assert item["filters"]["pageSize"] == 50
     assert created["custom_count"] == 1
 
@@ -75,6 +76,7 @@ def test_account_filter_preset_crud_and_normalization(monkeypatch):
         {"columnFilters": {"paymentLinkGenerated": ["true", "never"]}}
     )
     assert normalized_all_history["columnFilters"]["paymentLinkGenerated"] == []
+    assert normalized_all_history["registrationSortOrder"] == "asc"
 
     with pytest.raises(HTTPException) as duplicate:
         accounts.create_account_filter_preset(

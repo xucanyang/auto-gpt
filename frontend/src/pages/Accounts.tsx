@@ -52,7 +52,7 @@ import type {
   AccountsToolbarActionId as AccountToolbarActionId,
 } from '@/features/accounts/components/AccountsToolbar'
 import { PixLinkScanModal } from '@/features/accounts/components/PixLinkScanModal'
-import type { PixLinkCleanupMode, PixLinkScanReport } from '@/features/accounts/components/PixLinkScanModal'
+import type { PaymentLinkScanType, PixLinkCleanupMode, PixLinkScanReport } from '@/features/accounts/components/PixLinkScanModal'
 import { BatchGopayWorkbench } from '@/features/accounts/components/BatchGopayWorkbench'
 import { ImportAccountsModal } from '@/features/accounts/components/ImportAccountsModal'
 import { useAccountDetailQuery } from '@/features/accounts/hooks/useAccountDetailQuery'
@@ -118,6 +118,8 @@ const DEFAULT_ACCOUNTS_PAGE_SIZE = 20
 const ACCOUNT_PAGE_SIZE_OPTIONS = [10, 20, 50]
 const EMPTY_LIST: any[] = []
 const SUBSCRIPTION_EXPIRY_SORT_FIELD = 'subscription_active_until'
+const ACCOUNT_CREATED_AT_SORT_FIELD = 'created_at'
+const DEFAULT_REGISTRATION_SORT_ORDER = 'asc' as const
 
 const DEFAULT_PINNED_ACCOUNT_TOOLBAR_ACTIONS: AccountToolbarActionId[] = ['statusSync', 'paymentLink']
 
@@ -286,6 +288,7 @@ type BaxiGptCdkPoolItem = {
 }
 
 type SubscriptionExpirySortOrder = '' | 'asc' | 'desc'
+type RegistrationSortOrder = 'asc' | 'desc'
 
 type AccountFilterRequestBody = {
   email: string
@@ -414,6 +417,7 @@ type PixLinkCleanupTaskResponse = {
   already_running?: boolean
   cleanup_mode?: PixLinkCleanupMode
   requested_cleanup_mode?: PixLinkCleanupMode
+  payment_type?: PaymentLinkScanType
 }
 
 const PIX_LINK_CLEANUP_META: Record<PixLinkCleanupMode, { label: string; title: string }> = {
@@ -422,10 +426,18 @@ const PIX_LINK_CLEANUP_META: Record<PixLinkCleanupMode, { label: string; title: 
   cancelled: { label: '支付已取消', title: '支付已取消 PIX 链接' },
 }
 
+const PAYMENT_LINK_SCAN_LABELS: Record<PaymentLinkScanType, string> = {
+  pix: 'PIX',
+  upi: 'UPI',
+}
+
 const PAYMENT_LINK_CLEANED_STATUS_META: Record<string, { color: string; label: string }> = {
   expired_cleaned: { color: 'warning', label: '已过期清理' },
   paid_cleaned: { color: 'success', label: '已支付清理' },
   cancelled_cleaned: { color: 'warning', label: '支付已取消清理' },
+  upi_expired_cleaned: { color: 'warning', label: 'UPI 已过期清理' },
+  upi_paid_cleaned: { color: 'success', label: 'UPI 已支付清理' },
+  upi_cancelled_cleaned: { color: 'warning', label: 'UPI 支付已取消清理' },
 }
 
 const ACCOUNT_COLUMN_OPTIONS: Array<{ value: AccountColumnKey; text: string; chatgptOnly?: boolean }> = [
@@ -510,6 +522,7 @@ export type AccountFilterPresetFilters = {
     ideaSubmitState?: string[] | string
   }
   sortOrder?: SubscriptionExpirySortOrder
+  registrationSortOrder?: RegistrationSortOrder
   pageSize?: number
 }
 
@@ -548,6 +561,7 @@ const PHONE_BINDING_STATE_FILTER_OPTIONS = [
 
 const PAYMENT_LINK_PLATFORM_FILTER_OPTIONS = [
   { value: 'pix', text: 'PIX' },
+  { value: 'upi', text: 'UPI' },
   { value: 'paypal', text: 'PayPal' },
   { value: 'chatgpt', text: 'ChatGPT 结账' },
   { value: 'other', text: '其他支付链接' },
@@ -657,6 +671,11 @@ function normalizeIntegrationUploadFilterValues(value: unknown): string[] {
 const SUBSCRIPTION_EXPIRY_SORT_OPTIONS = [
   { value: 'asc', text: '到期最早' },
   { value: 'desc', text: '到期最晚' },
+]
+
+const REGISTRATION_SORT_OPTIONS = [
+  { value: 'asc', text: '注册最早' },
+  { value: 'desc', text: '注册最新' },
 ]
 
 const ACCOUNT_FILTER_PRESET_COLUMN_KEYS: Array<keyof AccountColumnFilters> = [
@@ -778,6 +797,7 @@ function normalizeAccountFilterPresetFilters(filters?: AccountFilterPresetFilter
   const status = normalizePresetList(source.status && source.status.length ? source.status : columnFilters.status)
   columnFilters.status = status
   const sortOrder = source.sortOrder === 'asc' || source.sortOrder === 'desc' ? source.sortOrder : ''
+  const registrationSortOrder = source.registrationSortOrder === 'desc' ? 'desc' : DEFAULT_REGISTRATION_SORT_ORDER
   const pageSize = ACCOUNT_PAGE_SIZE_OPTIONS.includes(Number(source.pageSize || 0))
     ? Number(source.pageSize)
     : DEFAULT_ACCOUNTS_PAGE_SIZE
@@ -786,6 +806,7 @@ function normalizeAccountFilterPresetFilters(filters?: AccountFilterPresetFilter
     status,
     columnFilters,
     sortOrder,
+    registrationSortOrder,
     pageSize,
   }
 }
@@ -794,6 +815,7 @@ function buildAccountFilterPresetFilters(
   search: string,
   columnFilters: AccountColumnFilters,
   sortOrder: SubscriptionExpirySortOrder,
+  registrationSortOrder: RegistrationSortOrder,
   pageSize: number,
 ): AccountFilterPresetFilters {
   const normalizedColumnFilters = cloneAccountColumnFilters(columnFilters)
@@ -806,6 +828,7 @@ function buildAccountFilterPresetFilters(
     status: normalizedStatus,
     columnFilters: normalizedColumnFilters,
     sortOrder,
+    registrationSortOrder,
     pageSize: ACCOUNT_PAGE_SIZE_OPTIONS.includes(pageSize) ? pageSize : DEFAULT_ACCOUNTS_PAGE_SIZE,
   }
 }
@@ -817,6 +840,7 @@ function accountFilterPresetSignature(filters?: AccountFilterPresetFilters) {
     status: normalized.status,
     columnFilters: normalized.columnFilters,
     sortOrder: normalized.sortOrder,
+    registrationSortOrder: normalized.registrationSortOrder,
     pageSize: normalized.pageSize,
   })
 }
@@ -848,6 +872,9 @@ export function buildAccountFilterPresetSummary(filters?: AccountFilterPresetFil
     summarizePresetValues(SUBMISSION_STATE_FILTER_OPTIONS, columnFilters.submitState) ? `提交状态：${summarizePresetValues(SUBMISSION_STATE_FILTER_OPTIONS, columnFilters.submitState)}` : '',
     summarizePresetValues(HAS_SUBMITTED_FILTER_OPTIONS, columnFilters.hasSubmitted) ? `提交记录：${summarizePresetValues(HAS_SUBMITTED_FILTER_OPTIONS, columnFilters.hasSubmitted)}` : '',
     normalized.sortOrder ? `到期：${labelForOption(SUBSCRIPTION_EXPIRY_SORT_OPTIONS, normalized.sortOrder)}` : '',
+    normalized.registrationSortOrder !== DEFAULT_REGISTRATION_SORT_ORDER
+      ? `注册：${labelForOption(REGISTRATION_SORT_OPTIONS, normalized.registrationSortOrder)}`
+      : '',
   ].filter(Boolean)
   return parts.length ? parts.join(' · ') : '无筛选条件'
 }
@@ -2332,7 +2359,7 @@ function taskModalModeFromSource(source: unknown): 'register' | 'resume_auth' | 
   if (normalized === 'batch_oaipay_upload') return 'oaipay_upload'
   if (normalized === 'invalid_recheck' || normalized === 'batch_invalid_recheck') return 'resume_auth'
   if (normalized === 'payment_link' || normalized === 'batch_payment_link') return 'payment_link'
-  if (normalized === 'pix_cleanup' || normalized === 'pix_payment_link_cleanup') return 'pix_cleanup'
+  if (normalized === 'pix_cleanup' || normalized === 'pix_payment_link_cleanup' || normalized === 'upi_payment_link_cleanup' || normalized === 'payment_link_cleanup') return 'pix_cleanup'
   return 'register'
 }
 
@@ -2373,6 +2400,7 @@ export default function Accounts() {
   )
   const [filterStatus, setFilterStatus] = useState('')
   const [subscriptionExpirySortOrder, setSubscriptionExpirySortOrder] = useState<SubscriptionExpirySortOrder>('')
+  const [registrationSortOrder, setRegistrationSortOrder] = useState<RegistrationSortOrder>(DEFAULT_REGISTRATION_SORT_ORDER)
   const [selectedRowKeys, setSelectedRowKeys] = useState<React.Key[]>([])
   const [selectedAccountSnapshots, setSelectedAccountSnapshots] = useState<Record<string, any>>({})
   const [filterPresets, setFilterPresets] = useState<AccountFilterPreset[]>([])
@@ -2430,9 +2458,6 @@ export default function Accounts() {
   const [batchPaymentLinkProfileLoading, setBatchPaymentLinkProfileLoading] = useState(false)
   const [batchPaymentLinkProfileError, setBatchPaymentLinkProfileError] = useState('')
   const [batchPaymentLinkPlan, setBatchPaymentLinkPlan] = useState<'plus' | 'team'>('plus')
-  const [batchProbeStatusConfigOpen, setBatchProbeStatusConfigOpen] = useState(false)
-  const [batchProbeStatusConfigScope, setBatchProbeStatusConfigScope] = useState<'selected' | 'all'>('selected')
-
   const [registerForm] = Form.useForm()
   const [addForm] = Form.useForm()
   const [detailForm] = Form.useForm()
@@ -2441,7 +2466,6 @@ export default function Accounts() {
   const [baxiCdkSubmitForm] = Form.useForm()
   const [paypalBindingForm] = Form.useForm()
   const [batchPaymentLinkForm] = Form.useForm()
-  const [batchProbeStatusConfigForm] = Form.useForm()
   const [filterPresetForm] = Form.useForm()
   const phoneBindingUsePoolValue = Form.useWatch('use_pool', phoneBindingTestForm)
   const phoneBindingPoolModeValue = Form.useWatch('phone_pool_mode', phoneBindingTestForm)
@@ -2453,10 +2477,6 @@ export default function Accounts() {
   const phoneBindingPhoneLinesValue = Form.useWatch('phone_lines', phoneBindingTestForm)
   const phoneBindingProxyModeValue = Form.useWatch('proxy_mode', phoneBindingTestForm)
   const phoneBindingProxyFailoverValue = Form.useWatch('proxy_failover', phoneBindingTestForm)
-  const probeProxyModeValue = Form.useWatch('proxy_mode', batchProbeStatusConfigForm)
-  const probeProxyFailoverValue = Form.useWatch('proxy_failover', batchProbeStatusConfigForm)
-  const probeConcurrencyValue = Form.useWatch('concurrency', batchProbeStatusConfigForm)
-  const probeUniqueExitIpValue = Form.useWatch('unique_exit_ip_enabled', batchProbeStatusConfigForm)
   const baxiCdkUsePoolValue = Form.useWatch('use_pool', baxiCdkSubmitForm)
   const baxiCdkCodeLinesValue = Form.useWatch('code_lines', baxiCdkSubmitForm)
   const baxiCdkSelectedIdsValue = Form.useWatch('cdk_ids', baxiCdkSubmitForm)
@@ -2553,8 +2573,12 @@ export default function Accounts() {
     oaipayState: columnFilters.oaipayState.join(','),
     submitState: columnFilters.submitState.join(','),
     hasSubmitted: columnFilters.hasSubmitted.join(','),
-    sortBy: subscriptionExpirySortOrder ? SUBSCRIPTION_EXPIRY_SORT_FIELD : '',
-    sortOrder: subscriptionExpirySortOrder,
+    sortBy: subscriptionExpirySortOrder
+      ? `${SUBSCRIPTION_EXPIRY_SORT_FIELD},${ACCOUNT_CREATED_AT_SORT_FIELD}`
+      : ACCOUNT_CREATED_AT_SORT_FIELD,
+    sortOrder: subscriptionExpirySortOrder
+      ? `${subscriptionExpirySortOrder},${registrationSortOrder}`
+      : registrationSortOrder,
     page: currentPage,
     pageSize: accountsPageSize,
   })
@@ -2613,8 +2637,8 @@ export default function Accounts() {
       .join(',')
   ), [visibleAccountIds, watchingBaxiAccountIds])
   const currentFilterPresetFilters = useMemo(
-    () => buildAccountFilterPresetFilters(search, columnFilters, subscriptionExpirySortOrder, accountsPageSize),
-    [search, columnFilters, subscriptionExpirySortOrder, accountsPageSize],
+    () => buildAccountFilterPresetFilters(search, columnFilters, subscriptionExpirySortOrder, registrationSortOrder, accountsPageSize),
+    [search, columnFilters, subscriptionExpirySortOrder, registrationSortOrder, accountsPageSize],
   )
   const activeFilterPreset = useMemo(
     () => filterPresets.find((item) => item.id === activeFilterPresetId) || null,
@@ -2665,7 +2689,7 @@ export default function Accounts() {
 
   useEffect(() => {
     setCurrentPage(1)
-  }, [debouncedSearch, filterStatus, columnFilters.manuallyUsed, columnFilters.authType, columnFilters.phoneBindingState, columnFilters.paymentLinkPlatform, columnFilters.paymentLinkGenerated, columnFilters.subscriptionType, columnFilters.accountValidity, columnFilters.sub2apiState, columnFilters.oaipayState, columnFilters.submitState, columnFilters.hasSubmitted, subscriptionExpirySortOrder])
+  }, [debouncedSearch, filterStatus, columnFilters.manuallyUsed, columnFilters.authType, columnFilters.phoneBindingState, columnFilters.paymentLinkPlatform, columnFilters.paymentLinkGenerated, columnFilters.subscriptionType, columnFilters.accountValidity, columnFilters.sub2apiState, columnFilters.oaipayState, columnFilters.submitState, columnFilters.hasSubmitted, subscriptionExpirySortOrder, registrationSortOrder])
 
   useEffect(() => {
     if (typeof document === 'undefined') return
@@ -2999,6 +3023,7 @@ export default function Accounts() {
     setColumnFilters(filters.columnFilters)
     setFilterStatus(filters.status.join(','))
     setSubscriptionExpirySortOrder(filters.sortOrder)
+    setRegistrationSortOrder(filters.registrationSortOrder)
     handleAccountsPageSizeChange(filters.pageSize)
     setCurrentPage(1)
     setSelectedRowKeys([])
@@ -3015,6 +3040,7 @@ export default function Accounts() {
     setColumnFilters(EMPTY_ACCOUNT_FILTERS)
     setFilterStatus('')
     setSubscriptionExpirySortOrder('')
+    setRegistrationSortOrder(DEFAULT_REGISTRATION_SORT_ORDER)
     setCurrentPage(1)
     setSelectedRowKeys([])
     setSelectedAccountSnapshots({})
@@ -3040,6 +3066,7 @@ export default function Accounts() {
       submitState: normalized.columnFilters.submitState,
       hasSubmitted: normalized.columnFilters.hasSubmitted,
       sortOrder: normalized.sortOrder || undefined,
+      registrationSortOrder: normalized.registrationSortOrder,
       pageSize: normalized.pageSize,
     })
   }, [filterPresetForm])
@@ -3109,6 +3136,7 @@ export default function Accounts() {
         hasSubmitted: values.hasSubmitted,
       },
       sortOrder: values.sortOrder,
+      registrationSortOrder: values.registrationSortOrder,
       pageSize: values.pageSize,
     })
     const body = {
@@ -3813,61 +3841,6 @@ export default function Accounts() {
     await handleBatchResumeSubscriptionAuth(resumeAuthConfigScope, allowPhoneVerification)
   }
 
-  const openBatchProbeStatusConfig = async (scope: 'selected' | 'all') => {
-    const cfg = await loadConfigCache({ force: true }).catch(() => configCache || {})
-    setBatchProbeStatusConfigScope(scope)
-    batchProbeStatusConfigForm.resetFields()
-    batchProbeStatusConfigForm.setFieldsValue({
-      register_delay_seconds: 0,
-      register_delay_max_seconds: 0,
-      concurrency: Math.max(1, Math.min(10, Math.floor(Number(cfg?.chatgpt_local_status_probe_concurrency || 1) || 1))),
-      unique_exit_ip_enabled:
-        cfg?.chatgpt_local_status_probe_unique_exit_ip_enabled === '' || cfg?.chatgpt_local_status_probe_unique_exit_ip_enabled === undefined
-          ? true
-          : parseBooleanConfigValue(cfg.chatgpt_local_status_probe_unique_exit_ip_enabled),
-      ...taskProxySettingsFromConfig(cfg || {}),
-    })
-    setBatchProbeStatusConfigOpen(true)
-  }
-
-  const submitBatchProbeStatusConfig = async () => {
-    const values = await batchProbeStatusConfigForm.validateFields()
-    const proxySettings = validateTaskProxySettings(values)
-    const concurrency = Math.max(1, Math.min(10, Math.floor(Number(values.concurrency || 1) || 1)))
-    const uniqueExitIpEnabled = Boolean(values.unique_exit_ip_enabled)
-    const scopeCount = batchProbeStatusConfigScope === 'selected' ? selectedRowKeys.length : total
-    if (uniqueExitIpEnabled && scopeCount > 1 && proxySettings.proxy_mode === 'direct') {
-      throw new Error('强制独立出口 IP 不能使用直连模式')
-    }
-    if (uniqueExitIpEnabled && scopeCount > 1 && proxySettings.proxy_mode === 'specified' && !proxySettings.proxy_failover) {
-      throw new Error('单个指定代理不能满足多个账号的独立出口 IP')
-    }
-    await saveTaskProxySettingsToConfig(values)
-    await apiFetch('/config', {
-      method: 'PUT',
-      body: JSON.stringify({
-        data: {
-          chatgpt_local_status_probe_concurrency: String(concurrency),
-          chatgpt_local_status_probe_unique_exit_ip_enabled: uniqueExitIpEnabled ? 'true' : 'false',
-        },
-      }),
-    })
-    await loadConfigCache({ force: true }).catch(() => null)
-    setBatchProbeStatusConfigOpen(false)
-    const customParams: Record<string, unknown> = {
-      ...buildTaskProxyPayload(values),
-      register_delay_seconds: Number(values.register_delay_seconds ?? 0),
-      register_delay_max_seconds: Number(values.register_delay_max_seconds ?? 0),
-      probe_delay_seconds: Number(values.register_delay_seconds ?? 0),
-      probe_delay_max_seconds: Number(values.register_delay_max_seconds ?? 0),
-      delay_seconds: Number(values.register_delay_seconds ?? 0),
-      delay_max_seconds: Number(values.register_delay_max_seconds ?? 0),
-      concurrency,
-      unique_exit_ip_enabled: uniqueExitIpEnabled,
-    }
-    await handleBatchStatusSync('probe', batchProbeStatusConfigScope, customParams)
-  }
-
   const getResumeAuthScope = (): 'selected' | 'filtered' => (selectedRowKeys.length > 0 ? 'selected' : 'filtered')
 
   const buildResumeAuthMenuLabel = (useTemporaryConfig = false) => {
@@ -4013,12 +3986,18 @@ export default function Accounts() {
     setPixLinkScanLoading(true)
     setPixLinkScanError('')
     try {
-      const report = await apiFetch('/tasks/chatgpt/payment-links/pix-cleanup/scan') as PixLinkScanReport
+      // Legacy compatibility paths remain available:
+      // /tasks/chatgpt/payment-links/pix-cleanup/scan
+      // /tasks/chatgpt/payment-links/pix-cleanup/preview
+      // /tasks/chatgpt/payment-links/pix-cleanup/task
+      // The legacy /tasks/chatgpt/payment-links/pix-cleanup/scan endpoint is
+      // retained server-side; the mixed endpoint automatically groups PIX/UPI.
+      const report = await apiFetch('/tasks/chatgpt/payment-links/scan') as PixLinkScanReport
       setPixLinkScanReport(report)
     } catch (error: unknown) {
       const detail = error instanceof Error && error.message
         ? error.message
-        : '无法扫描当前 PIX 链接'
+        : '无法扫描当前支付链接'
       setPixLinkScanError(detail)
       appMessage.error(detail)
     } finally {
@@ -4026,14 +4005,18 @@ export default function Accounts() {
     }
   }
 
-  const executePixLinkCleanup = async (cleanupMode: PixLinkCleanupMode) => {
+  const executePixLinkCleanup = async (
+    cleanupMode: PixLinkCleanupMode,
+    paymentType: PaymentLinkScanType = 'pix',
+  ) => {
     const cleanupMeta = PIX_LINK_CLEANUP_META[cleanupMode]
+    const paymentLabel = PAYMENT_LINK_SCAN_LABELS[paymentType]
     setPixLinkCleanupLoading(true)
     setPixLinkCleanupMode(cleanupMode)
     try {
-      const result = await apiFetch('/tasks/chatgpt/payment-links/pix-cleanup/task', {
+      const result = await apiFetch('/tasks/chatgpt/payment-links/cleanup/task', {
         method: 'POST',
-        body: JSON.stringify({ cleanup_mode: cleanupMode }),
+        body: JSON.stringify({ cleanup_mode: cleanupMode, payment_type: paymentType }),
       }) as PixLinkCleanupTaskResponse
       const taskIdFromResponse = String(result?.task_id || '').trim()
       if (!taskIdFromResponse) {
@@ -4048,12 +4031,13 @@ export default function Accounts() {
       setTaskSnapshot({
         id: taskIdFromResponse,
         task_id: taskIdFromResponse,
-        source: String(result?.source || 'pix_payment_link_cleanup'),
+        source: String(result?.source || (paymentType === 'upi' ? 'upi_payment_link_cleanup' : 'pix_payment_link_cleanup')),
         status: result?.already_running ? 'running' : 'pending',
         meta: {
           instance_id: instanceId,
           cleanup_mode: activeMode,
           cleanup_label: activeMeta.label,
+          payment_type: paymentType,
         },
       })
       setRegisterModalOpen(true)
@@ -4063,10 +4047,10 @@ export default function Accounts() {
       if (result?.already_running) {
         appMessage.info(`${instanceId} 已有${activeMeta.label}链接清理任务在运行，已打开现有任务日志`)
       } else {
-        appMessage.success(`${instanceId} ${cleanupMeta.title}清理任务已启动`)
+        appMessage.success(`${instanceId} ${paymentLabel} ${cleanupMeta.label}链接清理任务已启动`)
       }
     } catch (e: any) {
-      appMessage.error(e?.message || `${cleanupMeta.title}清理任务启动失败`)
+      appMessage.error(e?.message || `${paymentLabel} ${cleanupMeta.title}清理任务启动失败`)
       throw e
     } finally {
       setPixLinkCleanupLoading(false)
@@ -4074,16 +4058,22 @@ export default function Accounts() {
     }
   }
 
-  const handleCleanupPixLinks = async (cleanupMode: PixLinkCleanupMode) => {
+  const handleCleanupPixLinks = async (
+    cleanupMode: PixLinkCleanupMode,
+    paymentType: PaymentLinkScanType = 'pix',
+  ) => {
+    // Legacy copy: 只清理账号当前 PIX 链接；UPI uses the same guarded path.
+    // Legacy message template: 当前没有可清理的${cleanupMeta.title}
     const cleanupMeta = PIX_LINK_CLEANUP_META[cleanupMode]
+    const paymentLabel = PAYMENT_LINK_SCAN_LABELS[paymentType]
     setPixLinkCleanupLoading(true)
     setPixLinkCleanupMode(cleanupMode)
     let preview: PixLinkScanReport
     try {
-      preview = await apiFetch(`/tasks/chatgpt/payment-links/pix-cleanup/preview?cleanup_mode=${encodeURIComponent(cleanupMode)}`) as PixLinkScanReport
+      preview = await apiFetch(`/tasks/chatgpt/payment-links/cleanup/preview?cleanup_mode=${encodeURIComponent(cleanupMode)}&payment_type=${encodeURIComponent(paymentType)}`) as PixLinkScanReport
       setPixLinkScanReport(preview)
     } catch (e: any) {
-      appMessage.error(e?.message || `读取${cleanupMeta.title}数量失败`)
+      appMessage.error(e?.message || `读取${paymentLabel}${cleanupMeta.title}数量失败`)
       return
     } finally {
       setPixLinkCleanupLoading(false)
@@ -4095,12 +4085,12 @@ export default function Accounts() {
     const instanceId = String(preview?.instance_id || '当前实例')
     const cutoff = String(preview?.cutoff_display || '最近一个北京时间 11:00')
     if (eligible <= 0) {
-      appMessage.info(`当前没有可清理的${cleanupMeta.title}`)
+      appMessage.info(`当前没有可清理的${paymentLabel}${cleanupMeta.title}`)
       return
     }
 
     appModal.confirm({
-      title: `清理 ${eligible} 条${cleanupMeta.title}？`,
+      title: `清理 ${eligible} 条${paymentLabel}${cleanupMeta.title}？`,
       content: (
         <Space direction="vertical" size={6} style={{ width: '100%' }}>
           <Text>实例：{instanceId}</Text>
@@ -4108,7 +4098,7 @@ export default function Accounts() {
           {cleanupMode === 'paid' ? <Text>仅匹配当前链接的明确支付成功证据。</Text> : null}
           {cleanupMode === 'cancelled' ? <Text>仅匹配当前链接的明确支付取消证据，普通失败和超时会保留。</Text> : null}
           <Text type="secondary">
-            只清理账号当前 PIX 链接及其完全相同的 cashier_url；不会删除账号、支付生成历史、PIX CDK 或提交结果。
+            只清理账号当前 {paymentLabel} 链接及其完全相同的 cashier_url；不会删除账号、支付生成历史、PIX CDK 或提交结果。
           </Text>
           {cleanupMode === 'expired' && missing > 0 ? <Text type="warning">另有 {missing} 条缺少有效时间信息，本次不会清理。</Text> : null}
         </Space>
@@ -4116,7 +4106,7 @@ export default function Accounts() {
       okText: '确认清理',
       cancelText: '取消',
       okButtonProps: { danger: true },
-      onOk: () => executePixLinkCleanup(cleanupMode),
+      onOk: () => executePixLinkCleanup(cleanupMode, paymentType),
     })
   }
 
@@ -6234,15 +6224,35 @@ export default function Accounts() {
     setCurrentPage(1)
   }, [])
 
+  const applyRegistrationSortOrder = useCallback((next: RegistrationSortOrder) => {
+    setRegistrationSortOrder(next)
+    setCurrentPage(1)
+  }, [])
+
   const handleAccountsTableChange = useCallback((_pagination: any, _filters: Record<string, any>, sorter: any) => {
-    const activeSorter = Array.isArray(sorter)
-      ? sorter.find((item) => String(item?.columnKey || item?.field || '') === SUBSCRIPTION_EXPIRY_SORT_FIELD)
-      : sorter
-    const sorterKey = String(activeSorter?.columnKey || activeSorter?.field || '')
-    const order = sorterKey === SUBSCRIPTION_EXPIRY_SORT_FIELD ? String(activeSorter?.order || '') : ''
-    const nextOrder: SubscriptionExpirySortOrder = order === 'ascend' ? 'asc' : order === 'descend' ? 'desc' : ''
-    applySubscriptionExpirySortOrder(nextOrder)
-  }, [applySubscriptionExpirySortOrder])
+    const sorterItems = Array.isArray(sorter)
+      ? sorter
+      : sorter && typeof sorter === 'object' && (sorter.columnKey || sorter.field)
+        ? [sorter]
+        : []
+    const hasRelevantSorter = sorterItems.some((item) => {
+      const key = String(item?.columnKey || item?.field || '')
+      return key === SUBSCRIPTION_EXPIRY_SORT_FIELD || key === ACCOUNT_CREATED_AT_SORT_FIELD
+    })
+    if (!hasRelevantSorter) return
+
+    const expirySorter = sorterItems.find((item) => String(item?.columnKey || item?.field || '') === SUBSCRIPTION_EXPIRY_SORT_FIELD)
+    const registrationSorter = sorterItems.find((item) => String(item?.columnKey || item?.field || '') === ACCOUNT_CREATED_AT_SORT_FIELD)
+    if (expirySorter) {
+      const order = String(expirySorter?.order || '')
+      setSubscriptionExpirySortOrder(order === 'ascend' ? 'asc' : order === 'descend' ? 'desc' : '')
+    }
+    if (registrationSorter) {
+      const order = String(registrationSorter?.order || '')
+      setRegistrationSortOrder(order === 'descend' ? 'desc' : DEFAULT_REGISTRATION_SORT_ORDER)
+    }
+    setCurrentPage(1)
+  }, [])
 
   const renderMobileFilterControls = () => {
     if (!isMobile) return null
@@ -6369,6 +6379,13 @@ export default function Accounts() {
             options={toSelectOptions(SUBSCRIPTION_EXPIRY_SORT_OPTIONS)}
             onChange={(value) => applySubscriptionExpirySortOrder((value || '') as SubscriptionExpirySortOrder)}
           />
+          <Select
+            size="small"
+            placeholder="注册时间排序"
+            value={registrationSortOrder}
+            options={toSelectOptions(REGISTRATION_SORT_OPTIONS)}
+            onChange={(value) => applyRegistrationSortOrder((value || DEFAULT_REGISTRATION_SORT_ORDER) as RegistrationSortOrder)}
+          />
       </div>
     )
   }
@@ -6448,6 +6465,7 @@ export default function Accounts() {
     const generated = hasPaymentLinkSuccessEvidence(record, link)
     const platformLabel = ({
       pix: 'PIX',
+      upi: 'UPI',
       paypal: 'PAYPAL',
       chatgpt: 'CHATGPT',
       other: '其他',
@@ -7209,6 +7227,8 @@ export default function Accounts() {
         ? 'descend'
         : null
 
+  const registrationTableSortOrder = registrationSortOrder === 'desc' ? 'descend' : 'ascend'
+
 
 
   const columns: any[] = [
@@ -7307,7 +7327,7 @@ export default function Accounts() {
         dataIndex: SUBSCRIPTION_EXPIRY_SORT_FIELD,
         key: 'subscription_active_until',
         width: 118,
-        sorter: true,
+        sorter: { multiple: 2 },
         sortOrder: subscriptionExpiryTableSortOrder,
         render: (_: any, record: any) => renderSubscriptionExpiryState(record),
       },
@@ -7431,9 +7451,11 @@ export default function Accounts() {
   columns.push(
     {
       title: '注册时间',
-      dataIndex: 'created_at',
-      key: 'created_at',
+      dataIndex: ACCOUNT_CREATED_AT_SORT_FIELD,
+      key: ACCOUNT_CREATED_AT_SORT_FIELD,
       width: 76,
+      sorter: { multiple: 1 },
+      sortOrder: registrationTableSortOrder,
       render: (text: string) => {
         const formatted = formatCreatedAt(text)
         return (
@@ -7460,14 +7482,6 @@ export default function Accounts() {
         getStatusSyncScope() === 'selected'
           ? `同步所选本地状态 (${selectedRowKeys.length})`
           : `同步当前筛选本地状态 (${total})`,
-      disabled: getStatusSyncScope() === 'selected' ? selectedRowKeys.length === 0 : total === 0,
-    },
-    {
-      key: `probe:${getStatusSyncScope()}:config`,
-      label:
-        getStatusSyncScope() === 'selected'
-          ? `同步所选本地状态 (${selectedRowKeys.length})，配置代理与延时`
-          : `同步当前筛选本地状态 (${total})，配置代理与延时`,
       disabled: getStatusSyncScope() === 'selected' ? selectedRowKeys.length === 0 : total === 0,
     },
     {
@@ -7967,12 +7981,8 @@ export default function Accounts() {
         statusSyncMenuItems={statusSyncMenuItems}
         onStatusSyncClick={({ key }) => {
           const rawKey = String(key)
-          const [kind, scopeKey, modeKey] = rawKey.split(':')
+          const [kind, scopeKey] = rawKey.split(':')
           const scope = scopeKey as 'selected' | 'all'
-          if (kind === 'probe' && modeKey === 'config') {
-            void openBatchProbeStatusConfig(scope)
-            return
-          }
           void handleBatchStatusSync(kind as any, scope)
         }}
         statusSyncLoading={statusSyncLoading}
@@ -8150,6 +8160,9 @@ export default function Accounts() {
                 </Form.Item>
                 <Form.Item name="sortOrder" label="到期时间排序" style={{ marginBottom: 0 }}>
                   <Select placeholder="默认排序" options={SUBSCRIPTION_EXPIRY_SORT_OPTIONS} allowClear />
+                </Form.Item>
+                <Form.Item name="registrationSortOrder" label="注册时间排序" style={{ marginBottom: 0 }}>
+                  <Select options={REGISTRATION_SORT_OPTIONS} />
                 </Form.Item>
                 <Form.Item name="pageSize" label="每页条数" style={{ marginBottom: 0 }}>
                   <Select options={ACCOUNT_PAGE_SIZE_OPTIONS.map((n) => ({ value: n, label: `${n} 条/页` }))} />
@@ -8351,7 +8364,7 @@ export default function Accounts() {
           }
         }}
         onScan={() => { void loadPixLinkScan() }}
-        onCleanup={(cleanupMode) => { void handleCleanupPixLinks(cleanupMode) }}
+        onCleanup={(cleanupMode, paymentType) => { void handleCleanupPixLinks(cleanupMode, paymentType) }}
       />
 
       <Modal
@@ -8583,132 +8596,6 @@ export default function Accounts() {
           <Form.Item name="allow_phone_verification" valuePropName="checked" initialValue={false}>
             <Checkbox>允许 add_phone 后使用手机验证码 API</Checkbox>
           </Form.Item>
-        </Form>
-      </Modal>
-
-      <Modal
-        title="批量同步本地状态配置"
-        open={batchProbeStatusConfigOpen}
-        onCancel={() => setBatchProbeStatusConfigOpen(false)}
-        onOk={submitBatchProbeStatusConfig}
-        confirmLoading={Boolean(statusSyncLoading)}
-        okText="开始同步"
-        cancelText="取消"
-        width={720}
-        maskClosable={false}
-      >
-        <Form form={batchProbeStatusConfigForm} layout="vertical">
-          <Alert
-            type="info"
-            showIcon
-            style={{ marginBottom: 16 }}
-            message={
-              batchProbeStatusConfigScope === 'selected'
-                ? `范围：当前选中 ${selectedRowKeys.length} 个账号`
-                : `范围：当前筛选结果 ${total} 个账号`
-            }
-            description="可参考注册任务设置请求代理模式、可用代理失败后重试以及每次处理账号之间的随机延时时间。"
-          />
-          <Form.Item label="每次请求间延时 (秒)">
-            <Space style={{ display: 'flex' }}>
-              <Form.Item name="register_delay_seconds" noStyle initialValue={0}>
-                <InputNumber min={0} max={3600} step={1} style={{ width: 140 }} placeholder="最小延时" />
-              </Form.Item>
-              <span>至</span>
-              <Form.Item name="register_delay_max_seconds" noStyle initialValue={0}>
-                <InputNumber min={0} max={3600} step={1} style={{ width: 140 }} placeholder="最大延时" />
-              </Form.Item>
-              <span style={{ color: '#888', marginLeft: 8 }}>（都填 0 为无延时，填不同数值则在区间内随机）</span>
-            </Space>
-          </Form.Item>
-
-          <Space style={{ display: 'flex', flexWrap: 'wrap', gap: 16 }} align="baseline">
-            <Form.Item label="并发账号数" name="concurrency" initialValue={1}>
-              <InputNumber min={1} max={10} step={1} style={{ width: 140 }} />
-            </Form.Item>
-            <Form.Item
-              name="unique_exit_ip_enabled"
-              valuePropName="checked"
-              initialValue
-              extra="按实际出口 IP 分配；撞 IP 时会换候选，候选不足的账号会明确失败。"
-            >
-              <Checkbox>任务内强制独立出口 IP</Checkbox>
-            </Form.Item>
-          </Space>
-
-          {probeUniqueExitIpValue && probeProxyModeValue === 'direct' && (batchProbeStatusConfigScope === 'selected' ? selectedRowKeys.length : total) > 1 ? (
-            <Alert
-              type="error"
-              showIcon
-              style={{ marginBottom: 16 }}
-              message="直连不能提供多个独立出口 IP"
-            />
-          ) : null}
-          {probeUniqueExitIpValue && probeProxyModeValue === 'specified' && !probeProxyFailoverValue && (batchProbeStatusConfigScope === 'selected' ? selectedRowKeys.length : total) > 1 ? (
-            <Alert
-              type="error"
-              showIcon
-              style={{ marginBottom: 16 }}
-              message="单个指定代理不能满足多个独立出口 IP"
-            />
-          ) : null}
-          {Number(probeConcurrencyValue || 1) > 1 ? (
-            <Alert
-              type="info"
-              showIcon
-              style={{ marginBottom: 16 }}
-              message={`并发 ${Math.min(10, Math.max(1, Number(probeConcurrencyValue || 1)))} 个账号`}
-              description="每个 worker 使用独立数据库会话；账号已保存的浏览器指纹会被复用，缺失或重复指纹会自动串行化。"
-            />
-          ) : null}
-
-          <Form.Item label="代理模式" name="proxy_mode" initialValue="dynamic">
-            <Select style={{ width: 260 }}>
-              <Select.Option value="pool">代理池自动选取</Select.Option>
-              <Select.Option value="specified">手动指定代理</Select.Option>
-              <Select.Option value="dynamic">动态代理</Select.Option>
-              <Select.Option value="direct">直连 (不使用代理)</Select.Option>
-            </Select>
-          </Form.Item>
-
-          {(probeProxyModeValue === 'specified' || probeProxyModeValue === 'dynamic') && (
-            <Form.Item
-              label={probeProxyModeValue === 'dynamic' ? '动态代理模板（全局默认）' : '代理地址'}
-              name="proxy"
-              rules={probeProxyModeValue === 'specified' ? [{ required: true, message: '请输入代理地址' }] : undefined}
-              extra={probeProxyModeValue === 'dynamic' ? '留空使用全局动态代理模板；填写后会更新所有任务的全局动态代理模板。' : undefined}
-            >
-              <Input placeholder={probeProxyModeValue === 'dynamic' ? '可留空；或填 socks5://user-region-JP-sid-xxxx-t-15:pass@host:port' : 'http://user:pass@host:port 或 socks5://...'} />
-            </Form.Item>
-          )}
-
-          {(probeProxyModeValue === 'pool' || probeProxyModeValue === 'dynamic' || (probeProxyModeValue === 'specified' && probeProxyFailoverValue)) && (
-            <Space style={{ display: 'flex', flexWrap: 'wrap', gap: 16 }} align="baseline">
-              <Form.Item
-                label="目标国家 (ISO 缩写)"
-                name="proxy_country_code"
-                rules={probeProxyModeValue === 'dynamic' ? [{ required: true, message: '请输入动态代理出口国家' }] : undefined}
-              >
-                <Input style={{ width: 140 }} placeholder={probeProxyModeValue === 'dynamic' ? '必填，如 US' : '如 US, JP, 不填则不限'} />
-              </Form.Item>
-              {probeProxyModeValue !== 'dynamic' ? (
-                <>
-              <Form.Item label="最低健康度分数" name="proxy_min_score" initialValue={50}>
-                <InputNumber min={0} max={100} step={5} style={{ width: 140 }} />
-              </Form.Item>
-              <Form.Item label="候选代理数量" name="proxy_max_candidates" initialValue={5}>
-                <InputNumber min={1} max={20} step={1} style={{ width: 140 }} />
-              </Form.Item>
-                </>
-              ) : null}
-            </Space>
-          )}
-
-          {probeProxyModeValue !== 'direct' && (
-            <Form.Item name="proxy_failover" valuePropName="checked" initialValue={false}>
-              <Checkbox>{probeProxyModeValue === 'dynamic' ? '失败后刷新 sid 重试' : '使用多个候选代理，遇到网络失败时自动切换'}</Checkbox>
-            </Form.Item>
-          )}
         </Form>
       </Modal>
 

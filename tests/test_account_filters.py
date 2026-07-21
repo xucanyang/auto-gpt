@@ -24,6 +24,7 @@ try:
         apply_account_list_state_sort,
         delete_account_list_state_for_account_ids,
         filter_account_rows,
+        normalize_account_sort_specs,
         refresh_account_list_state,
         refresh_stale_account_list_state,
         sort_account_rows,
@@ -56,6 +57,7 @@ except ModuleNotFoundError as exc:
     apply_account_list_state_sort = None
     delete_account_list_state_for_account_ids = None
     filter_account_rows = None
+    normalize_account_sort_specs = None
     refresh_account_list_state = None
     refresh_stale_account_list_state = None
     select = None
@@ -67,13 +69,15 @@ except ModuleNotFoundError as exc:
 
 @unittest.skipUnless(HAS_DB_DEPS, "sqlmodel is not installed in this environment")
 class AccountFilterSortTests(unittest.TestCase):
-    def _account(self, account_id: int, expires_at="") -> AccountModel:
+    def _account(self, account_id: int, expires_at="", *, created_at: datetime | None = None) -> AccountModel:
         account = AccountModel(
             id=account_id,
             platform="chatgpt",
             email=f"user{account_id}@example.com",
             password="",
         )
+        if created_at is not None:
+            account.created_at = created_at
         if expires_at:
             account.set_extra(
                 {
@@ -85,6 +89,68 @@ class AccountFilterSortTests(unittest.TestCase):
                 }
             )
         return account
+
+    def test_sort_specs_default_and_legacy_expiry_compatibility(self):
+        self.assertEqual(normalize_account_sort_specs(), (("created_at", "asc"),))
+        self.assertEqual(
+            normalize_account_sort_specs("subscription_active_until", "descend"),
+            (("subscription_active_until", "desc"), ("created_at", "asc")),
+        )
+        self.assertEqual(
+            normalize_account_sort_specs(
+                "subscription_active_until,created_at",
+                "asc,desc",
+            ),
+            (("subscription_active_until", "asc"), ("created_at", "desc")),
+        )
+        self.assertEqual(
+            normalize_account_sort_specs("unsupported", "desc"),
+            (("created_at", "asc"),),
+        )
+
+    def test_sort_registration_time_defaults_oldest_first_and_supports_descending(self):
+        rows = [
+            self._account(1, created_at=datetime(2026, 1, 2, tzinfo=timezone.utc)),
+            self._account(2, created_at=datetime(2026, 1, 1, tzinfo=timezone.utc)),
+            self._account(3, created_at=datetime(2026, 1, 2, tzinfo=timezone.utc)),
+        ]
+
+        self.assertEqual([row.id for row in sort_account_rows(rows)], [2, 1, 3])
+        self.assertEqual(
+            [row.id for row in sort_account_rows(rows, sort_by="created_at", sort_order="desc")],
+            [3, 1, 2],
+        )
+
+    def test_sort_expiry_then_registration_time(self):
+        rows = [
+            self._account(1, "2030-01-02T00:00:00Z", created_at=datetime(2026, 1, 3, tzinfo=timezone.utc)),
+            self._account(2, "2030-01-01T00:00:00Z", created_at=datetime(2026, 1, 2, tzinfo=timezone.utc)),
+            self._account(3, "2030-01-01T00:00:00Z", created_at=datetime(2026, 1, 1, tzinfo=timezone.utc)),
+            self._account(4, "", created_at=datetime(2026, 1, 4, tzinfo=timezone.utc)),
+        ]
+
+        self.assertEqual(
+            [
+                row.id
+                for row in sort_account_rows(
+                    rows,
+                    sort_by="subscription_active_until,created_at",
+                    sort_order="asc,asc",
+                )
+            ],
+            [3, 2, 1, 4],
+        )
+        self.assertEqual(
+            [
+                row.id
+                for row in sort_account_rows(
+                    rows,
+                    sort_by="subscription_active_until,created_at",
+                    sort_order="asc,desc",
+                )
+            ],
+            [2, 3, 1, 4],
+        )
 
     def _payment_history(self, account: AccountModel, *, request_id: str, status: str, url: str = "") -> PaymentLinkGenerationModel:
         return PaymentLinkGenerationModel(
@@ -524,6 +590,32 @@ class AccountFilterSortTests(unittest.TestCase):
 
             self.assertEqual(sql_ids(payment_link_platform="pix,paypal"), [511, 512, 517])
             self.assertEqual(sql_ids(payment_link_platform="none"), [515, 516])
+
+    def test_payment_link_platform_auto_classifies_upi_from_payment_method_or_url(self):
+        upi_by_method = self._account(518)
+        upi_by_method.set_extra(
+            {
+                "chatgpt_last_payment_link": {
+                    "url": "https://payments.stripe.com/upi/instructions/method",
+                    "link_type": "hosted",
+                    "payment_method_type": "upi",
+                }
+            }
+        )
+        upi_by_url = self._account(519)
+        upi_by_url.set_extra(
+            {
+                "chatgpt_last_payment_link": {
+                    "url": "https://payments.stripe.com/upi/instructions/url",
+                }
+            }
+        )
+        self.assertEqual(account_payment_link_platform(upi_by_method), "upi")
+        self.assertEqual(account_payment_link_platform(upi_by_url), "upi")
+        self.assertEqual(
+            [row.id for row in filter_account_rows([upi_by_method, upi_by_url], payment_link_platform="upi")],
+            [518, 519],
+        )
 
     def test_payment_link_generated_filter_keeps_history_after_url_cleanup(self):
         init_db()
@@ -1194,10 +1286,10 @@ class AccountFilterSortTests(unittest.TestCase):
     def test_account_list_state_sql_sort_subscription_active_until_empty_last(self):
         init_db()
         rows = [
-            self._account(201, ""),
-            self._account(202, "1781089634000"),
-            self._account(203, "2026-05-01T00:00:00+00:00"),
-            self._account(204, "1781089634"),
+            self._account(201, "", created_at=datetime(2026, 1, 1, tzinfo=timezone.utc)),
+            self._account(202, "1781089634000", created_at=datetime(2026, 1, 2, tzinfo=timezone.utc)),
+            self._account(203, "2026-05-01T00:00:00+00:00", created_at=datetime(2026, 1, 3, tzinfo=timezone.utc)),
+            self._account(204, "1781089634", created_at=datetime(2026, 1, 4, tzinfo=timezone.utc)),
         ]
         with Session(engine) as session:
             session.exec(text("DELETE FROM account_list_state"))
@@ -1223,9 +1315,35 @@ class AccountFilterSortTests(unittest.TestCase):
                     apply_account_list_state_sort(q, sort_by="subscription_active_until", sort_order="descend")
                 ).all()
             ]
+            expiry_asc_registration_desc_ids = [
+                int(row.id or 0)
+                for row in session.exec(
+                    apply_account_list_state_sort(
+                        q,
+                        sort_by="subscription_active_until,created_at",
+                        sort_order="asc,desc",
+                    )
+                ).all()
+            ]
+            default_ids = [
+                int(row.id or 0)
+                for row in session.exec(apply_account_list_state_sort(select(AccountModel))).all()
+            ]
 
-        self.assertEqual(asc_ids, [203, 204, 202, 201])
-        self.assertEqual(desc_ids, [204, 202, 203, 201])
+        self.assertEqual(asc_ids, [203, 202, 204, 201])
+        self.assertEqual(desc_ids, [202, 204, 203, 201])
+        self.assertEqual(expiry_asc_registration_desc_ids, [203, 204, 202, 201])
+        self.assertEqual(default_ids, [201, 202, 203, 204])
+
+    def test_init_db_ensures_registration_sort_index(self):
+        init_db()
+        with Session(engine) as session:
+            indexes = {
+                str(row[1])
+                for row in session.exec(text("PRAGMA index_list(accounts)")).all()
+            }
+
+        self.assertIn("idx_accounts_platform_created_at_id", indexes)
 
 
 if __name__ == "__main__":

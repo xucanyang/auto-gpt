@@ -28,6 +28,7 @@ from services.chatgpt_account_state import AUTH_INVALID_STATES, classify_chatgpt
 from services.chatgpt_core.bound_phone import chatgpt_bound_phone_payload, chatgpt_phone_challenge_payload
 from services.chatgpt_core.codex_usage import build_codex_usage_progress_from_extra
 from services.chatgpt_core.local_status_refresh import schedule_chatgpt_local_status_refresh_for_account_id
+from services.chatgpt_core.payment_link_cache import payment_link_type_from_payload
 from typing import Any, Optional
 from datetime import datetime, timezone
 import io, csv, json, logging, threading, time, uuid
@@ -202,6 +203,7 @@ def _empty_filter_preset_payload() -> dict[str, Any]:
         "status": [],
         "columnFilters": {key: [] for key in ACCOUNT_FILTER_PRESET_COLUMN_KEYS},
         "sortOrder": "",
+        "registrationSortOrder": "asc",
         "pageSize": 20,
     }
 
@@ -242,6 +244,15 @@ def _normalize_filter_preset_filters(filters: Any) -> dict[str, Any]:
     ).lower()
     clean["sortOrder"] = sort_order if sort_order in {"asc", "desc"} else ""
 
+    registration_sort_order = _trim_text(
+        source.get("registrationSortOrder")
+        or source.get("createdAtSortOrder")
+        or sort_source.get("registrationSortOrder")
+        or sort_source.get("createdAtOrder"),
+        max_length=8,
+    ).lower()
+    clean["registrationSortOrder"] = registration_sort_order if registration_sort_order in {"asc", "desc"} else "asc"
+
     try:
         page_size = int(source.get("pageSize") or source.get("page_size") or 20)
     except Exception:
@@ -276,6 +287,8 @@ def _filter_preset_summary(filters: dict[str, Any]) -> str:
             parts.append(f"{label}={','.join(values[:4])}{'…' if len(values) > 4 else ''}")
     if filters.get("sortOrder"):
         parts.append("到期排序=" + ("最早" if filters.get("sortOrder") == "asc" else "最晚"))
+    if filters.get("registrationSortOrder") == "desc":
+        parts.append("注册排序=最新")
     return " · ".join(parts) or "无筛选条件"
 
 
@@ -1073,14 +1086,16 @@ def _build_submission_summary(
     )
     legacy = _build_idea_submit_summary(extra, baxigpt_cdk)
     state = _safe_str(submission_info.get("state")).lower() or "available"
+    payment_link_type = payment_link_type_from_payload(payment_link)
     link_is_pix = bool(
         submission_info.get("link_submitted")
-        or _safe_str(payment_link.get("link_type")).lower() == "pix"
-        or _safe_str(payment_link.get("payment_method_type")).lower() == "pix"
+        or payment_link_type == "pix"
     )
     payment_channel = _safe_str(marker.get("payment_channel") or raw_cdk.get("payment_channel")).lower()
     if link_is_pix:
         payment_channel = "pix"
+    elif payment_link_type == "upi":
+        payment_channel = "upi"
     elif not payment_channel and (marker or raw_cdk):
         payment_channel = "ideal"
     reason = _safe_str(
@@ -1601,10 +1616,7 @@ def list_accounts(
     )
     count_q = select(func.count()).select_from(q.subquery())
     total = int(session.exec(count_q).one())
-    if use_list_state:
-        q = apply_account_list_state_sort(q, sort_by=sort_by, sort_order=sort_order)
-    else:
-        q = q.order_by(AccountModel.id.desc())
+    q = apply_account_list_state_sort(q, sort_by=sort_by, sort_order=sort_order)
     items = session.exec(q.offset((page_value - 1) * page_size_value).limit(page_size_value)).all()
     generated_by_id: dict[int, bool] = {}
     item_ids = [int(item.id or 0) for item in items if int(item.id or 0) > 0]

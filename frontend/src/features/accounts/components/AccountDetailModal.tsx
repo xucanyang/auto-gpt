@@ -46,6 +46,9 @@ function paymentLinkStatusMeta(value: unknown) {
   if (status === 'expired_cleaned') return { color: 'default', label: '已过期清理' }
   if (status === 'paid_cleaned') return { color: 'default', label: '已支付清理' }
   if (status === 'cancelled_cleaned') return { color: 'default', label: '支付已取消清理' }
+  if (status === 'upi_expired_cleaned') return { color: 'default', label: 'UPI 已过期清理' }
+  if (status === 'upi_paid_cleaned') return { color: 'default', label: 'UPI 已支付清理' }
+  if (status === 'upi_cancelled_cleaned') return { color: 'default', label: 'UPI 支付已取消清理' }
   if (status === 'queued') return { color: 'default', label: '已提交' }
   if (status === 'running') return { color: 'processing', label: '生成中' }
   if (status === 'interrupted') return { color: 'warning', label: '远端中断' }
@@ -87,7 +90,8 @@ function paymentLinkExpiryMeta(
   value: unknown,
   formatSyncTime: (value?: string) => string,
 ) {
-  if (String(linkType || '').trim().toLowerCase() !== 'pix' || typeof value === 'boolean') return null
+  const normalizedType = String(linkType || '').trim().toLowerCase()
+  if (!['pix', 'upi'].includes(normalizedType) || typeof value === 'boolean') return null
   const text = String(value || '').trim()
   if (!/^\d{1,12}$/.test(text)) return null
   const expiresAt = Number(text)
@@ -95,7 +99,8 @@ function paymentLinkExpiryMeta(
 
   const deadline = formatSyncTime(new Date(expiresAt * 1000).toISOString())
   const remainingSeconds = expiresAt - Math.floor(Date.now() / 1000)
-  if (remainingSeconds <= 0) return { color: 'error', label: `PIX 已过期（${deadline}）` }
+  const label = normalizedType === 'upi' ? 'UPI' : 'PIX'
+  if (remainingSeconds <= 0) return { color: 'error', label: `${label} 已过期（${deadline}）` }
 
   const days = Math.floor(remainingSeconds / 86400)
   const hours = Math.floor((remainingSeconds % 86400) / 3600)
@@ -103,7 +108,7 @@ function paymentLinkExpiryMeta(
   const remaining = days > 0 ? `${days}天${hours}小时` : hours > 0 ? `${hours}小时${minutes}分钟` : `${minutes}分钟`
   return {
     color: remainingSeconds <= 300 ? 'warning' : 'success',
-    label: `PIX 有效至 ${deadline}（剩余 ${remaining}）`,
+    label: `${label} 有效至 ${deadline}（剩余 ${remaining}）`,
   }
 }
 

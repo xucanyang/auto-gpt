@@ -20,8 +20,8 @@ from services.chatgpt_account_state import (
 )
 
 AUTO_DELETE_REVIVAL_TASK_ID = "icloud_hme_auto_delete"
-ACCOUNT_LIST_STATE_DERIVATION_VERSION = "integration-upload-state-v1-payment-link-history-v1"
-ACCOUNT_FILTER_RESOLVER_VERSION = "account-list-state-v5-payment-link-history"
+ACCOUNT_LIST_STATE_DERIVATION_VERSION = "integration-upload-state-v1-payment-link-history-v2"
+ACCOUNT_FILTER_RESOLVER_VERSION = "account-list-state-v6-payment-link-types"
 ACCOUNT_FILTER_FIELD_NAMES = (
     "email",
     "status",
@@ -38,6 +38,13 @@ ACCOUNT_FILTER_FIELD_NAMES = (
     "submit_state",
     "has_submitted",
 )
+ACCOUNT_SORT_CREATED_AT = "created_at"
+ACCOUNT_SORT_SUBSCRIPTION_ACTIVE_UNTIL = "subscription_active_until"
+ACCOUNT_SORT_FIELDS = frozenset({
+    ACCOUNT_SORT_CREATED_AT,
+    ACCOUNT_SORT_SUBSCRIPTION_ACTIVE_UNTIL,
+})
+DEFAULT_ACCOUNT_SORT_SPECS = ((ACCOUNT_SORT_CREATED_AT, "asc"),)
 logger = logging.getLogger(__name__)
 
 
@@ -178,6 +185,7 @@ _PAYMENT_LINK_PLATFORM_FILTER_ALIASES: dict[str, set[str]] = {
     "without_link": {"none"},
     "missing": {"none"},
     "pix": {"pix"},
+    "upi": {"upi"},
     "paypal": {"paypal"},
     "paypal_url": {"paypal"},
     "chatgpt": {"chatgpt"},
@@ -190,6 +198,9 @@ _PAYMENT_LINK_CLEANED_STATUSES = frozenset({
     "expired_cleaned",
     "paid_cleaned",
     "cancelled_cleaned",
+    "upi_expired_cleaned",
+    "upi_paid_cleaned",
+    "upi_cancelled_cleaned",
 })
 
 _INTEGRATION_UPLOAD_STATE_FILTER_ALIASES: dict[str, str] = {
@@ -687,7 +698,13 @@ def _payment_link_platform_from_payload(payload: dict[str, Any]) -> str:
     except (TypeError, ValueError):
         host = ""
 
+    if link_type == "upi" or payment_method_type == "upi":
+        return "upi"
     if link_type == "pix" or payment_method_type == "pix":
+        return "pix"
+    if "/upi/instructions/" in (urlsplit(url).path or "").lower():
+        return "upi"
+    if "/qr/instructions/" in (urlsplit(url).path or "").lower():
         return "pix"
     if (
         "paypal" in link_type
@@ -1291,7 +1308,7 @@ def refresh_account_list_state(
                                 END
                             )
                             WHERE key IN ('url', 'paypal_url', 'provider_redirect_url', 'approval_url', 'checkout_url', 'cashier_url')
-                              AND lower(trim(coalesce(json_extract(extra, '$.chatgpt_last_payment_link.link_status'), ''))) NOT IN ('expired_cleaned', 'paid_cleaned', 'cancelled_cleaned')
+                              AND lower(trim(coalesce(json_extract(extra, '$.chatgpt_last_payment_link.link_status'), ''))) NOT IN ('expired_cleaned', 'paid_cleaned', 'cancelled_cleaned', 'upi_expired_cleaned', 'upi_paid_cleaned', 'upi_cancelled_cleaned')
                               AND (
                                   (
                                       lower(trim(CAST(value AS TEXT))) LIKE 'http://%'
@@ -1359,7 +1376,7 @@ def refresh_account_list_state(
                     )) AS legacy_paypal_link_url,
                     lower(trim(coalesce(
                         nullif(trim(CAST(CASE
-                            WHEN lower(trim(coalesce(json_extract(extra, '$.chatgpt_last_payment_link.link_status'), ''))) IN ('expired_cleaned', 'paid_cleaned', 'cancelled_cleaned')
+                            WHEN lower(trim(coalesce(json_extract(extra, '$.chatgpt_last_payment_link.link_status'), ''))) IN ('expired_cleaned', 'paid_cleaned', 'cancelled_cleaned', 'upi_expired_cleaned', 'upi_paid_cleaned', 'upi_cancelled_cleaned')
                             THEN NULL
                             ELSE json_extract(extra, '$.chatgpt_last_payment_link.link_type')
                         END AS TEXT)), ''),
@@ -1369,7 +1386,7 @@ def refresh_account_list_state(
                     ))) AS payment_link_type,
                     lower(trim(coalesce(
                         nullif(trim(CAST(CASE
-                            WHEN lower(trim(coalesce(json_extract(extra, '$.chatgpt_last_payment_link.link_status'), ''))) IN ('expired_cleaned', 'paid_cleaned', 'cancelled_cleaned')
+                            WHEN lower(trim(coalesce(json_extract(extra, '$.chatgpt_last_payment_link.link_status'), ''))) IN ('expired_cleaned', 'paid_cleaned', 'cancelled_cleaned', 'upi_expired_cleaned', 'upi_paid_cleaned', 'upi_cancelled_cleaned')
                             THEN NULL
                             ELSE json_extract(extra, '$.chatgpt_last_payment_link.payment_method_type')
                         END AS TEXT)), ''),
@@ -1378,7 +1395,7 @@ def refresh_account_list_state(
                     ))) AS payment_link_method_type,
                     replace(lower(trim(coalesce(
                         nullif(trim(CAST(CASE
-                            WHEN lower(trim(coalesce(json_extract(extra, '$.chatgpt_last_payment_link.link_status'), ''))) IN ('expired_cleaned', 'paid_cleaned', 'cancelled_cleaned')
+                            WHEN lower(trim(coalesce(json_extract(extra, '$.chatgpt_last_payment_link.link_status'), ''))) IN ('expired_cleaned', 'paid_cleaned', 'cancelled_cleaned', 'upi_expired_cleaned', 'upi_paid_cleaned', 'upi_cancelled_cleaned')
                             THEN NULL
                             ELSE json_extract(extra, '$.chatgpt_last_payment_link.payment_link_format')
                         END AS TEXT)), ''),
@@ -1387,7 +1404,7 @@ def refresh_account_list_state(
                     ))), '-', '_') AS payment_link_format,
                     replace(lower(trim(coalesce(
                         nullif(trim(CAST(CASE
-                            WHEN lower(trim(coalesce(json_extract(extra, '$.chatgpt_last_payment_link.link_status'), ''))) IN ('expired_cleaned', 'paid_cleaned', 'cancelled_cleaned')
+                            WHEN lower(trim(coalesce(json_extract(extra, '$.chatgpt_last_payment_link.link_status'), ''))) IN ('expired_cleaned', 'paid_cleaned', 'cancelled_cleaned', 'upi_expired_cleaned', 'upi_paid_cleaned', 'upi_cancelled_cleaned')
                             THEN NULL
                             ELSE json_extract(extra, '$.chatgpt_last_payment_link.payment_source')
                         END AS TEXT)), ''),
@@ -1733,20 +1750,26 @@ def refresh_account_list_state(
                                 AND substr(lower(trim(legacy_paypal_link_url)), 9, 1) NOT IN ('', '/', '?', '#')
                                 AND trim(legacy_paypal_link_url) NOT LIKE '% %'
                             )
-                            OR payment_link_status IN ('expired_cleaned', 'paid_cleaned', 'cancelled_cleaned')
+                            OR payment_link_status IN ('expired_cleaned', 'paid_cleaned', 'cancelled_cleaned', 'upi_expired_cleaned', 'upi_paid_cleaned', 'upi_cancelled_cleaned')
                             OR payment_generation_succeeded = 1
                         )
                         THEN 1
                         ELSE 0
                     END AS payment_link_generated,
                     CASE
-                        WHEN payment_link_status IN ('expired_cleaned', 'paid_cleaned', 'cancelled_cleaned')
+                        WHEN payment_link_status IN ('expired_cleaned', 'paid_cleaned', 'cancelled_cleaned', 'upi_expired_cleaned', 'upi_paid_cleaned', 'upi_cancelled_cleaned')
                         THEN 'none'
                         WHEN payment_link_uses_legacy_paypal = 1
                         THEN 'paypal'
                         WHEN payment_link_url_valid = 0
                         THEN 'none'
+                        WHEN payment_link_type = 'upi' OR payment_link_method_type = 'upi'
+                        THEN 'upi'
                         WHEN payment_link_type = 'pix' OR payment_link_method_type = 'pix'
+                        THEN 'pix'
+                        WHEN lower(payment_link_url) LIKE '%/upi/instructions/%'
+                        THEN 'upi'
+                        WHEN lower(payment_link_url) LIKE '%/qr/instructions/%'
                         THEN 'pix'
                         WHEN payment_link_type LIKE '%paypal%'
                              OR payment_link_method_type LIKE '%paypal%'
@@ -2045,8 +2068,49 @@ def normalize_account_sort_order(value: Any) -> str:
     return ""
 
 
+def _split_account_sort_values(value: Any) -> list[str]:
+    if isinstance(value, (list, tuple)):
+        raw_values = value
+    else:
+        raw_values = str(value or "").split(",")
+    return [_lower_text(item) for item in raw_values]
+
+
+def normalize_account_sort_specs(sort_by: Any = None, sort_order: Any = None) -> tuple[tuple[str, str], ...]:
+    """Return the canonical, deterministic account-list sort specification.
+
+    The legacy API accepted one ``sort_by`` / ``sort_order`` pair.  Comma-
+    separated values extend that contract without breaking old callers.  An
+    expiry-only request implicitly uses oldest registration first for equal
+    expiry timestamps; an omitted or invalid request defaults to oldest
+    registration first.
+    """
+
+    fields = _split_account_sort_values(sort_by)
+    orders = _split_account_sort_values(sort_order)
+    specs: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for index, field in enumerate(fields):
+        if field not in ACCOUNT_SORT_FIELDS or field in seen:
+            continue
+        order = normalize_account_sort_order(orders[index] if index < len(orders) else "")
+        if not order:
+            continue
+        specs.append((field, order))
+        seen.add(field)
+
+    if not specs:
+        return DEFAULT_ACCOUNT_SORT_SPECS
+    if ACCOUNT_SORT_SUBSCRIPTION_ACTIVE_UNTIL in seen and ACCOUNT_SORT_CREATED_AT not in seen:
+        specs.append((ACCOUNT_SORT_CREATED_AT, "asc"))
+    return tuple(specs)
+
+
 def should_sort_account_rows(sort_by: Any, sort_order: Any) -> bool:
-    return _lower_text(sort_by) == "subscription_active_until" and bool(normalize_account_sort_order(sort_order))
+    return any(
+        field == ACCOUNT_SORT_SUBSCRIPTION_ACTIVE_UNTIL
+        for field, _ in normalize_account_sort_specs(sort_by, sort_order)
+    )
 
 
 def should_use_account_list_state(
@@ -2266,37 +2330,77 @@ def apply_account_list_state_sort(
     sort_by: Any = None,
     sort_order: Any = None,
 ) -> Any:
-    if not should_sort_account_rows(sort_by, sort_order):
-        return query.order_by(AccountModel.id.desc())
+    specs = normalize_account_sort_specs(sort_by, sort_order)
+    order_by: list[Any] = []
+    created_at_order = "asc"
+    for field, order in specs:
+        if field == ACCOUNT_SORT_SUBSCRIPTION_ACTIVE_UNTIL:
+            timestamp = AccountListStateModel.subscription_active_until_ts
+            order_by.append(timestamp.is_(None).asc())
+            order_by.append(timestamp.desc() if order == "desc" else timestamp.asc())
+            continue
+        if field == ACCOUNT_SORT_CREATED_AT:
+            created_at_order = order
+            created_at = AccountModel.created_at
+            order_by.append(created_at.is_(None).asc())
+            order_by.append(created_at.desc() if order == "desc" else created_at.asc())
 
-    timestamp_is_empty = AccountListStateModel.subscription_active_until_ts.is_(None)
-    if normalize_account_sort_order(sort_order) == "desc":
-        return query.order_by(
-            timestamp_is_empty.asc(),
-            AccountListStateModel.subscription_active_until_ts.desc(),
-            AccountModel.id.desc(),
-        )
-    return query.order_by(
-        timestamp_is_empty.asc(),
-        AccountListStateModel.subscription_active_until_ts.asc(),
-        AccountModel.id.desc(),
-    )
+    order_by.append(AccountModel.id.desc() if created_at_order == "desc" else AccountModel.id.asc())
+    return query.order_by(*order_by)
 
 
 def sort_account_rows(rows: Iterable[AccountModel], *, sort_by: Any = None, sort_order: Any = None) -> list[AccountModel]:
     items = list(rows)
-    if not should_sort_account_rows(sort_by, sort_order):
-        return items
+    specs = normalize_account_sort_specs(sort_by, sort_order)
+    created_at_order = next(
+        (order for field, order in specs if field == ACCOUNT_SORT_CREATED_AT),
+        "asc",
+    )
+    items.sort(key=lambda row: int(getattr(row, "id", 0) or 0), reverse=created_at_order == "desc")
 
-    reverse = normalize_account_sort_order(sort_order) == "desc"
+    def created_at_timestamp(row: AccountModel) -> float | None:
+        value = getattr(row, "created_at", None)
+        if isinstance(value, datetime):
+            normalized = value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+            return normalized.timestamp()
+        text = _safe_str(value)
+        if not text:
+            return None
+        try:
+            parsed = datetime.fromisoformat(text[:-1] + "+00:00" if text.endswith("Z") else text)
+        except ValueError:
+            return None
+        normalized = parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+        return normalized.timestamp()
 
-    def sort_key(row: AccountModel) -> tuple[int, float]:
-        timestamp = account_subscription_active_until_timestamp(row)
-        if timestamp is None:
-            return (1, 0)
-        return (0, -timestamp if reverse else timestamp)
-
-    return sorted(items, key=sort_key)
+    # Python's sort is stable. Apply lower-priority fields first so this helper
+    # exactly mirrors the SQL ORDER BY used before pagination.
+    for field, order in reversed(specs):
+        reverse = order == "desc"
+        if field == ACCOUNT_SORT_CREATED_AT:
+            present: list[tuple[AccountModel, float]] = []
+            missing: list[AccountModel] = []
+            for row in items:
+                timestamp = created_at_timestamp(row)
+                if timestamp is None:
+                    missing.append(row)
+                else:
+                    present.append((row, timestamp))
+            present.sort(key=lambda item: item[1], reverse=reverse)
+            items = [row for row, _ in present] + missing
+            continue
+        if field == ACCOUNT_SORT_SUBSCRIPTION_ACTIVE_UNTIL:
+            present: list[tuple[AccountModel, float]] = []
+            missing: list[AccountModel] = []
+            for row in items:
+                timestamp = account_subscription_active_until_timestamp(row)
+                if timestamp is None:
+                    missing.append(row)
+                else:
+                    present.append((row, timestamp))
+            present.sort(key=lambda item: item[1], reverse=reverse)
+            items = [row for row, _ in present] + missing
+    return items
 
 
 def filter_account_rows(

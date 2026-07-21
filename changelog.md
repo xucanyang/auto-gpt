@@ -6,6 +6,32 @@
 
 ## [Unreleased] (未发布)
 
+### 优化 (Changed)
+- **账号列表支持注册时间与订阅到期多字段排序**：`services/account_filters.py` 将账号排序合同扩展为逗号分隔的有序字段列表，默认使用 `accounts.created_at ASC, accounts.id ASC`，保证最早注册账号出现在第一页；选择订阅到期排序时自动以注册时间作为次级排序，同一到期时间内可继续按注册时间正序或逆序排列。`api/accounts.py` 在分页前统一应用服务端排序，并继续兼容旧的单字段 `sort_by/sort_order` 请求。
+- **注册时间排序增加数据库索引**：`core/db.py` 新增并在 `init_db()` 中兜底创建 `idx_accounts_platform_created_at_id(platform, created_at, id)`，避免账号列表按平台和注册时间分页时反复构建临时排序表。
+- **本地状态同步收敛为单一入口**：`frontend/src/pages/Accounts.tsx` 移除账号页内“配置代理与延时”的第二个同步入口及临时配置弹窗，页面只保留一个“同步本地状态”动作；任务请求不再携带页面级直连/代理选择，统一读取全局 `task_proxy_mode` 及代理模板、国家和失败切换配置。
+- **本地状态同步参数纳入全局配置**：`frontend/src/pages/Settings.tsx` 增加同步并发、独立出口 IP、账号间最小/最大延时配置；`api/config.py` 注册对应配置键，`api/tasks.py` 在任务创建时从全局配置冻结参数，同时保留 API 显式参数的兼容覆盖能力。
+
+### 测试 (Tests)
+- 增加账号默认/逆序/多字段排序、空到期值置后、旧排序参数兼容、索引迁移、全局本地状态参数回退及账号页单入口合同测试。
+
+## [2.5.1] - 2026-07-21
+
+### 新增 (Added)
+- **支付链接扫描按支付类型自动归类并接入 UPI**：`services/chatgpt_core/pix_payment_link_cleanup.py` 将原 PIX 专用扫描扩展为 PIX/UPI QR 链路统一扫描，依据 `link_type`、`payment_method_type` 和 Stripe 指令 URL 自动识别支付类型；新增混合扫描接口 `/api/tasks/chatgpt/payment-links/scan`、通用预览/清理任务接口，以及保留旧 PIX 路由的 UPI 兼容别名。账号页扫描面板现在分别展示 PIX、UPI 的有效、已支付、过期和支付已取消分桶，清理操作带支付类型参数，不会跨通道误删。
+- **UPI QR 过期清理**：UPI 过期判断只接受 Stripe `setup_intent.next_action.upi_handle_redirect_or_display_qr_code.qr_code.expires_at`（及其指令页等价的 QR 到期值），按 5 分钟 QR 有效期展示和清理；清理后写入独立的 `upi_expired_cleaned`、`upi_paid_cleaned`、`upi_cancelled_cleaned` 墓碑，保留生成/到期/清理时间和历史记录。
+
+### 优化 (Changed)
+- **UPI 到期字段贯穿缓存、任务历史和同步**：`payment_link_cache.py`、`long_link_payment_client.py`、`api/tasks.py` 与 `services/long_link_history_sync.py` 统一保存 `link_expires_at` 与 `link_expiry_source=upi_qr_code`；当旧账号当前缓存缺少到期字段时，扫描器按账号/URL 从 `payment_link_generations.result_json` 回填，不猜测 Checkout Session 到期时间。
+- **账号列表类型索引同步升级**：`services/account_filters.py` 将 UPI 纳入当前链接类型筛选，支持从支付方式字段或 `/upi/instructions/` URL 自动识别，并升级派生索引版本，使现有 Plus 账号的 UPI 不再显示为“其他支付链接”。账号详情和历史卡片同步显示 UPI 到期倒计时及清理状态。
+
+### 修复 (Fixed)
+- **防止 UPI 链接被误当作 hosted/PIX**：当上游同时返回通用 `link_type=hosted` 和 `payment_method_type=upi` 时，QR 支付方式优先；UPI QR 到期值优先于旧的 Checkout Session 值，避免 5 分钟二维码被错误延长。
+- **清理与生成防重边界统一**：通用清理墓碑加入支付链接生成跳过、防复活和列表“已成功提取”判断；旧 PIX 清理接口、任务源和前端合同保持兼容。
+
+### 测试 (Tests)
+- 新增 UPI QR HTML 安全解析、嵌套 `qr_code.expires_at` 优先级、缓存自动归类、UPI 过期清理、历史同步和账号列表类型筛选回归；定向后端回归 82 项通过，前端 `npm run build` 通过。
+
 ## [2.5.0] - 2026-07-20
 
 ### 优化 (Changed)
@@ -2025,4 +2051,8 @@
 
 ## 2026-07-20 02:36:01 +0800
 - 发布 v2.5.0 HME 平台 registration 消费者兼容
+- 发布模式: multi
+
+## 2026-07-22 06:28:14 +0800
+- 账号列表多字段排序并统一本地状态同步全局配置
 - 发布模式: multi

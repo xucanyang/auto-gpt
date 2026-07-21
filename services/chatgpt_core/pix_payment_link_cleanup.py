@@ -1,10 +1,10 @@
-"""Preview and atomically clean terminal current PIX payment links."""
+"""Scan and atomically clean current QR payment links (PIX and UPI)."""
 
 from __future__ import annotations
 
 import base64
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, time as datetime_time, timedelta, timezone
 from html.parser import HTMLParser
 import json
@@ -24,16 +24,28 @@ from sqlmodel import Session
 from services.account_filters import upsert_account_list_state_for_account_ids
 from services.chatgpt_core.payment_link_cache import (
     PIX_CANCELLED_CLEANED_STATUS,
-    PIX_CLEANED_STATUSES,
     PIX_EXPIRED_CLEANED_STATUS,
     PIX_PAID_CLEANED_STATUS,
+    UPI_CANCELLED_CLEANED_STATUS,
+    UPI_EXPIRED_CLEANED_STATUS,
+    UPI_PAID_CLEANED_STATUS,
+    PAYMENT_LINK_CLEANED_STATUSES,
+    PAYMENT_LINK_QR_TYPES,
+    extract_payment_link_qr_expires_at,
     normalize_payment_link_expires_at,
+    normalize_payment_link_type,
+    payment_link_type_from_payload,
     normalize_payment_link_status,
 )
 
 
 PIX_PAYMENT_TIMEZONE = ZoneInfo("Asia/Shanghai")
 PIX_DAILY_EXPIRY_TIME = datetime_time(hour=11)
+UPI_QR_VALIDITY_SECONDS = 5 * 60
+UPI_QR_EXPIRY_TOLERANCE_SECONDS = 60
+PAYMENT_LINK_TYPE_PIX = "pix"
+PAYMENT_LINK_TYPE_UPI = "upi"
+PAYMENT_LINK_TYPES = frozenset({PAYMENT_LINK_TYPE_PIX, PAYMENT_LINK_TYPE_UPI})
 _CURRENT_LINK_URL_FIELDS = (
     "url",
     "paypal_url",
@@ -52,6 +64,7 @@ _LINK_URL_FIELDS_TO_REMOVE = frozenset({
 _BACKUP_MIN_FREE_MARGIN_BYTES = 64 * 1024 * 1024
 _STRIPE_PIX_HOST = "payments.stripe.com"
 _STRIPE_PIX_PATH_PREFIX = "/qr/instructions/"
+_STRIPE_UPI_PATH_PREFIX = "/upi/instructions/"
 _STRIPE_PIX_MAX_RESPONSE_BYTES = 256 * 1024
 _STRIPE_PIX_CONNECT_TIMEOUT_SECONDS = 5.0
 _STRIPE_PIX_READ_TIMEOUT_SECONDS = 10.0
@@ -94,9 +107,18 @@ _CLEANED_REASON_BY_MODE = {
     PIX_CLEANUP_MODE_CANCELLED: "PIX payment was cancelled and the link was cleared",
 }
 
+_CLEANED_STATUS_BY_TYPE_AND_MODE = {
+    (PAYMENT_LINK_TYPE_PIX, PIX_CLEANUP_MODE_EXPIRED): PIX_EXPIRED_CLEANED_STATUS,
+    (PAYMENT_LINK_TYPE_PIX, PIX_CLEANUP_MODE_PAID): PIX_PAID_CLEANED_STATUS,
+    (PAYMENT_LINK_TYPE_PIX, PIX_CLEANUP_MODE_CANCELLED): PIX_CANCELLED_CLEANED_STATUS,
+    (PAYMENT_LINK_TYPE_UPI, PIX_CLEANUP_MODE_EXPIRED): UPI_EXPIRED_CLEANED_STATUS,
+    (PAYMENT_LINK_TYPE_UPI, PIX_CLEANUP_MODE_PAID): UPI_PAID_CLEANED_STATUS,
+    (PAYMENT_LINK_TYPE_UPI, PIX_CLEANUP_MODE_CANCELLED): UPI_CANCELLED_CLEANED_STATUS,
+}
+
 
 @dataclass(frozen=True)
-class PixLinkCandidate:
+class PaymentLinkCandidate:
     account_id: int
     cashier_url: str
     current_url: str
@@ -106,14 +128,29 @@ class PixLinkCandidate:
     generated_at: datetime | None
     expires_at: datetime | None
     expiry_source: str
+    payment_type: str = PAYMENT_LINK_TYPE_PIX
+
+    @property
+    def link_type(self) -> str:
+        return self.payment_type
+
+
+# Keep the old import/name stable for integrations and existing tests.
+PixLinkCandidate = PaymentLinkCandidate
 
 
 @dataclass(frozen=True)
-class StripePixDirectState:
+class StripePaymentDirectState:
     attempted: bool
     success: bool
     intent_state: str = ""
     server_timestamp: datetime | None = None
+    payment_type: str = ""
+    expires_at: datetime | None = None
+    expiry_source: str = ""
+
+
+StripePixDirectState = StripePaymentDirectState
 
 
 class _StripePayloadMetaParser(HTMLParser):
@@ -192,6 +229,52 @@ def pix_effective_expires_at(payload: dict[str, Any] | None) -> tuple[datetime |
     return (derived, "beijing_11") if derived is not None else (None, "missing")
 
 
+def upi_effective_expires_at(payload: dict[str, Any] | None) -> tuple[datetime | None, str]:
+    """Return UPI's concrete QR deadline; never substitute checkout expiry.
+
+    ``link_expires_at`` is the normalized scalar returned by long-link.  Older
+    payloads may instead retain the nested SetupIntent response, so inspect the
+    QR shape as a fallback.  Missing provider data remains unknown rather than
+    fabricating a deadline from generation time.
+    """
+
+    if not isinstance(payload, dict):
+        return None, "missing"
+    qr_epoch = extract_payment_link_qr_expires_at(payload, payment_type=PAYMENT_LINK_TYPE_UPI)
+    if qr_epoch is not None:
+        return datetime.fromtimestamp(qr_epoch, timezone.utc), "upi_qr_code"
+    provider_epoch = normalize_payment_link_expires_at(payload.get("link_expires_at"))
+    if provider_epoch is not None:
+        source = str(payload.get("link_expiry_source") or "").strip().lower()
+        if source == "checkout_session":
+            return None, "missing"
+        if not source:
+            generated_at = _utc_datetime(payload.get("generated_at") or payload.get("created_at"))
+            if (
+                generated_at is None
+                or provider_epoch
+                > int(generated_at.timestamp()) + UPI_QR_VALIDITY_SECONDS + UPI_QR_EXPIRY_TOLERANCE_SECONDS
+            ):
+                return None, "missing"
+        # Historical upstream rows persisted the QR-derived scalar before the
+        # provenance field was added.  Untagged values remain compatible, but
+        # an explicitly tagged Checkout Session deadline is never accepted.
+        return datetime.fromtimestamp(provider_epoch, timezone.utc), source or "upi_qr_code"
+    return None, "missing"
+
+
+def payment_link_effective_expires_at(
+    payload: dict[str, Any] | None,
+    payment_type: Any = "",
+) -> tuple[datetime | None, str]:
+    normalized_type = normalize_payment_link_type(payment_type) or payment_link_type_from_payload(payload)
+    if normalized_type == PAYMENT_LINK_TYPE_UPI:
+        return upi_effective_expires_at(payload)
+    if normalized_type == PAYMENT_LINK_TYPE_PIX:
+        return pix_effective_expires_at(payload)
+    return None, "missing"
+
+
 def latest_pix_expiry_cutoff(now: datetime | None = None) -> datetime:
     now_utc = _utc_datetime(now or datetime.now(timezone.utc)) or datetime.now(timezone.utc)
     now_beijing = now_utc.astimezone(PIX_PAYMENT_TIMEZONE)
@@ -229,50 +312,73 @@ def _strict_stripe_pix_url(value: Any) -> str:
         or parsed.username is not None
         or parsed.password is not None
         or parsed.fragment
-        or not parsed.path.startswith(_STRIPE_PIX_PATH_PREFIX)
-        or not parsed.path.removeprefix(_STRIPE_PIX_PATH_PREFIX).strip("/")
+        or not any(
+            parsed.path.startswith(prefix)
+            and parsed.path.removeprefix(prefix).strip("/")
+            for prefix in (_STRIPE_PIX_PATH_PREFIX, _STRIPE_UPI_PATH_PREFIX)
+        )
     ):
         return ""
     return url
 
 
-def parse_stripe_pix_instruction_html(value: bytes | str) -> StripePixDirectState:
-    """Extract only the non-secret state fields from Stripe's embedded payload."""
+def parse_stripe_payment_instruction_html(
+    value: bytes | str,
+    *,
+    expected_payment_type: str = "",
+) -> StripePaymentDirectState:
+    """Extract safe state/QR-expiry scalars from a Stripe instruction page."""
 
     if isinstance(value, bytes):
         if len(value) > _STRIPE_PIX_MAX_RESPONSE_BYTES:
-            return StripePixDirectState(attempted=True, success=False)
+            return StripePaymentDirectState(attempted=True, success=False)
         html = value.decode("utf-8", errors="replace")
     else:
         html = str(value or "")
         if len(html.encode("utf-8", errors="replace")) > _STRIPE_PIX_MAX_RESPONSE_BYTES:
-            return StripePixDirectState(attempted=True, success=False)
+            return StripePaymentDirectState(attempted=True, success=False)
     parser = _StripePayloadMetaParser()
     try:
         parser.feed(html)
         encoded = parser.data_message.strip()
         if not encoded or len(encoded) > _STRIPE_PIX_MAX_RESPONSE_BYTES:
-            return StripePixDirectState(attempted=True, success=False)
+            return StripePaymentDirectState(attempted=True, success=False)
         decoded = base64.b64decode(encoded, validate=True)
         payload = json.loads(decoded.decode("utf-8"))
     except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
         return StripePixDirectState(attempted=True, success=False)
     if not isinstance(payload, dict):
-        return StripePixDirectState(attempted=True, success=False)
-    if str(payload.get("type") or "").strip().lower() != "qr_instructions":
-        return StripePixDirectState(attempted=True, success=False)
-    if str(payload.get("payment_method_type") or "").strip().lower() != "pix":
-        return StripePixDirectState(attempted=True, success=False)
+        return StripePaymentDirectState(attempted=True, success=False)
+    detected_type = normalize_payment_link_type(
+        payload.get("payment_method_type") or payload.get("payment_type")
+    )
+    if not detected_type:
+        raw_type = str(payload.get("type") or "").strip().lower()
+        detected_type = "upi" if raw_type == "upi" else "pix" if raw_type == "qr_instructions" else ""
+    expected_type = normalize_payment_link_type(expected_payment_type)
+    if detected_type not in PAYMENT_LINK_TYPES or (expected_type and detected_type != expected_type):
+        return StripePaymentDirectState(attempted=True, success=False)
     intent_state = str(payload.get("intent_state") or "").strip().lower()
     server_timestamp = _utc_datetime(payload.get("server_timestamp"))
     if not _STRIPE_INTENT_STATE_RE.fullmatch(intent_state) or server_timestamp is None:
-        return StripePixDirectState(attempted=True, success=False)
-    return StripePixDirectState(
+        return StripePaymentDirectState(attempted=True, success=False)
+    expiry_epoch = extract_payment_link_qr_expires_at(payload, payment_type=detected_type)
+    expiry = datetime.fromtimestamp(expiry_epoch, timezone.utc) if expiry_epoch is not None else None
+    return StripePaymentDirectState(
         attempted=True,
         success=True,
         intent_state=intent_state,
         server_timestamp=server_timestamp,
+        payment_type=detected_type,
+        expires_at=expiry,
+        expiry_source="upi_qr_code" if detected_type == "upi" and expiry is not None else "",
     )
+
+
+def parse_stripe_pix_instruction_html(value: bytes | str) -> StripePixDirectState:
+    """Backward-compatible PIX-only parser."""
+
+    return parse_stripe_payment_instruction_html(value, expected_payment_type=PAYMENT_LINK_TYPE_PIX)
 
 
 def _read_limited_response_body(response: requests.Response) -> bytes | None:
@@ -333,7 +439,16 @@ def _fetch_stripe_pix_instruction(
             body = _read_limited_response_body(response)
             if body is None:
                 return StripePixDirectState(attempted=True, success=False)
-            return parse_stripe_pix_instruction_html(body)
+            try:
+                path = (urlsplit(current_url).path or "").lower()
+            except ValueError:
+                path = ""
+            expected_type = (
+                PAYMENT_LINK_TYPE_UPI
+                if path.startswith(_STRIPE_UPI_PATH_PREFIX)
+                else PAYMENT_LINK_TYPE_PIX
+            )
+            return parse_stripe_payment_instruction_html(body, expected_payment_type=expected_type)
         except requests.RequestException:
             return StripePixDirectState(attempted=True, success=False)
         finally:
@@ -385,7 +500,19 @@ def _scan_stripe_pix_states(
     return results
 
 
-def _load_current_pix_link_candidates(session: Session) -> list[PixLinkCandidate]:
+def _scan_stripe_payment_states(
+    candidates: list[PaymentLinkCandidate],
+) -> dict[tuple[int, str], StripePaymentDirectState]:
+    """Generic alias used by the mixed PIX/UPI scanner."""
+
+    return _scan_stripe_pix_states(candidates)
+
+
+def _load_current_payment_link_candidates(
+    session: Session,
+    *,
+    payment_type: str | None = None,
+) -> list[PaymentLinkCandidate]:
     rows = session.exec(
         text(
             """
@@ -404,20 +531,59 @@ def _load_current_pix_link_candidates(session: Session) -> list[PixLinkCandidate
                 json_extract(extra, '$.baxigpt_cdk') AS payment_json
             FROM account_json
             WHERE json_type(extra, '$.chatgpt_last_payment_link') = 'object'
-              AND (
-                    lower(trim(coalesce(json_extract(extra, '$.chatgpt_last_payment_link.link_type'), ''))) = 'pix'
-                 OR lower(trim(coalesce(json_extract(extra, '$.chatgpt_last_payment_link.payment_method_type'), ''))) = 'pix'
-              )
             """
         )
     ).mappings().all()
-    candidates: list[PixLinkCandidate] = []
+    requested_type = normalize_payment_link_type(payment_type) if payment_type else ""
+    history_expiry: dict[tuple[int, str], tuple[int, str]] = {}
+    try:
+        history_rows = session.exec(
+            text(
+                """
+                SELECT account_id, url, link_type, result_json
+                FROM payment_link_generations
+                WHERE lower(trim(coalesce(status, ''))) = 'succeeded'
+                  AND trim(coalesce(url, '')) <> ''
+                """
+            )
+        ).mappings().all()
+    except Exception:
+        history_rows = []
+    for history in history_rows:
+        account_id = int(history.get("account_id") or 0)
+        history_url = str(history.get("url") or "").strip()
+        if not account_id or not history_url:
+            continue
+        try:
+            result_payload = json.loads(str(history.get("result_json") or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            result_payload = {}
+        if not isinstance(result_payload, dict):
+            result_payload = {}
+        history_type = normalize_payment_link_type(
+            result_payload.get("link_type")
+            or result_payload.get("payment_method_type")
+            or history.get("link_type")
+        )
+        if history_type not in PAYMENT_LINK_TYPES:
+            continue
+        expiry, source = payment_link_effective_expires_at(result_payload, history_type)
+        if expiry is None:
+            continue
+        history_expiry[(account_id, history_url)] = (int(expiry.timestamp()), source)
+
+    candidates: list[PaymentLinkCandidate] = []
     for row in rows:
         try:
             payload = json.loads(str(row.get("link_json") or "{}"))
         except (TypeError, ValueError, json.JSONDecodeError):
             continue
         if not isinstance(payload, dict):
+            continue
+        payment_type_value = normalize_payment_link_type(payment_link_type_from_payload(payload))
+        if payment_type_value not in PAYMENT_LINK_TYPES:
+            continue
+        if requested_type and payment_type_value != requested_type:
             continue
         try:
             payment_marker = json.loads(str(row.get("payment_json") or "{}"))
@@ -429,9 +595,14 @@ def _load_current_pix_link_candidates(session: Session) -> list[PixLinkCandidate
         if not current_url:
             continue
         generated_at = _utc_datetime(payload.get("generated_at") or payload.get("created_at"))
-        expires_at, expiry_source = pix_effective_expires_at(payload)
+        expires_at, expiry_source = payment_link_effective_expires_at(payload, payment_type_value)
+        if expires_at is None:
+            history_value = history_expiry.get((int(row.get("id") or 0), current_url))
+            if history_value is not None:
+                expires_at = datetime.fromtimestamp(history_value[0], timezone.utc)
+                expiry_source = history_value[1] or expiry_source
         candidates.append(
-            PixLinkCandidate(
+            PaymentLinkCandidate(
                 account_id=int(row.get("id") or 0),
                 cashier_url=str(row.get("cashier_url") or "").strip(),
                 current_url=current_url,
@@ -441,9 +612,16 @@ def _load_current_pix_link_candidates(session: Session) -> list[PixLinkCandidate
                 generated_at=generated_at,
                 expires_at=expires_at,
                 expiry_source=expiry_source,
+                payment_type=payment_type_value,
             )
         )
     return candidates
+
+
+def _load_current_pix_link_candidates(session: Session) -> list[PixLinkCandidate]:
+    """Backward-compatible PIX-only candidate loader."""
+
+    return _load_current_payment_link_candidates(session, payment_type=PAYMENT_LINK_TYPE_PIX)
 
 
 def _payment_marker_timestamp(marker: dict[str, Any]) -> datetime | None:
@@ -457,9 +635,11 @@ def _payment_marker_timestamp(marker: dict[str, Any]) -> datetime | None:
 
 def _marker_applies_to_current_user_link(candidate: PixLinkCandidate) -> bool:
     marker = candidate.payment_marker
-    if str(marker.get("payment_channel") or "").strip().lower() != "pix":
+    payment_type = normalize_payment_link_type(candidate.payment_type)
+    marker_channel = normalize_payment_link_type(marker.get("payment_channel"))
+    if marker_channel and marker_channel != payment_type:
         return False
-    if str(marker.get("pix_submit_mode") or "").strip().lower() != "user_link":
+    if payment_type == PAYMENT_LINK_TYPE_PIX and str(marker.get("pix_submit_mode") or "").strip().lower() != "user_link":
         return False
     marker_at = _payment_marker_timestamp(marker)
     if candidate.generated_at is not None and marker_at is not None and candidate.generated_at > marker_at:
@@ -512,10 +692,18 @@ def _base_report(
     now: datetime,
     cleanup_mode: PixCleanupMode = PIX_CLEANUP_MODE_EXPIRED,
     direct_results: Mapping[tuple[int, str], StripePixDirectState] | None = None,
+    payment_type: str | None = None,
 ) -> tuple[dict[str, Any], list[PixLinkCandidate]]:
     mode = normalize_pix_cleanup_mode(cleanup_mode)
     now_utc = _utc_datetime(now) or datetime.now(timezone.utc)
     cutoff_utc = latest_pix_expiry_cutoff(now_utc)
+    normalized_scope = normalize_payment_link_type(payment_type) if payment_type else ""
+    scoped_candidates = [
+        item
+        for item in candidates
+        if not normalized_scope or normalize_payment_link_type(item.payment_type) == normalized_scope
+    ]
+    candidates = scoped_candidates
     paid: list[PixLinkCandidate] = []
     cancelled: list[PixLinkCandidate] = []
     expired: list[PixLinkCandidate] = []
@@ -523,15 +711,34 @@ def _base_report(
     direct_states: dict[str, int] = {}
     direct_attempted = 0
     direct_success = 0
-    for item in candidates:
+    effective_candidates: list[PixLinkCandidate] = []
+    for original_item in candidates:
+        item = original_item
         # These buckets drive both the scan UI and cleanup eligibility, so a
         # current link must belong to exactly one operator-visible category.
         direct_state = (direct_results or {}).get((item.account_id, item.current_url))
+        item_type = normalize_payment_link_type(item.payment_type)
+        state_type = normalize_payment_link_type(direct_state.payment_type) if direct_state is not None else ""
+        if state_type and state_type != item_type:
+            # A URL/type mismatch is not a trustworthy direct result.  Keep the
+            # local classification and expiry instead of allowing one rail's
+            # Stripe page to affect another rail.
+            direct_state = None
+        if direct_state is not None and direct_state.expires_at is not None:
+            # A live Stripe page can be newer than the cached/history result.
+            # Use its QR deadline for this scan without mutating the account
+            # until an explicit cleanup transaction is confirmed.
+            item = replace(
+                item,
+                expires_at=direct_state.expires_at,
+                expiry_source=direct_state.expiry_source or item.expiry_source,
+            )
         if direct_state is not None and direct_state.attempted:
             direct_attempted += 1
         if direct_state is not None and direct_state.success:
             direct_success += 1
             direct_states[direct_state.intent_state] = direct_states.get(direct_state.intent_state, 0) + 1
+        effective_candidates.append(item)
         if direct_state is not None and direct_state.success and direct_state.intent_state == "succeeded":
             paid.append(item)
         elif direct_state is not None and direct_state.success and direct_state.intent_state in {"canceled", "cancelled"}:
@@ -560,11 +767,16 @@ def _base_report(
         PIX_CLEANUP_MODE_CANCELLED: cancelled,
     }
     eligible = eligible_by_mode[mode]
-    missing = [item for item in candidates if item.expires_at is None]
+    missing = [item for item in effective_candidates if item.expires_at is None]
     valid_missing = [item for item in valid if item.expires_at is None]
-    provider_count = sum(item.expiry_source == "provider" for item in candidates)
-    derived_count = sum(item.expiry_source == "beijing_11" for item in candidates)
+    provider_expiry_sources = {"provider", "pix_qr_code", "upi_qr_code"}
+    provider_count = sum(item.expiry_source in provider_expiry_sources for item in effective_candidates)
+    derived_count = sum(item.expiry_source == "beijing_11" for item in effective_candidates)
     cutoff_beijing = cutoff_utc.astimezone(PIX_PAYMENT_TIMEZONE)
+    type_counts = {
+        payment_type: sum(1 for item in candidates if normalize_payment_link_type(item.payment_type) == payment_type)
+        for payment_type in sorted(PAYMENT_LINK_TYPES)
+    }
     report = {
         "instance_id": str(os.getenv("APP_INSTANCE_ID") or "auto-gpt").strip() or "auto-gpt",
         "timezone": "Asia/Shanghai",
@@ -591,7 +803,37 @@ def _base_report(
         "direct_scan_success_links": direct_success,
         "direct_scan_fallback_links": len(candidates) - direct_success,
         "direct_scan_state_counts": dict(sorted(direct_states.items())),
+        "current_upi_links": type_counts.get(PAYMENT_LINK_TYPE_UPI, 0),
+        "payment_type_counts": type_counts,
+        "payment_types": sorted(type_counts),
+        "upi_qr_expiry_links": sum(
+            1
+            for item in effective_candidates
+            if normalize_payment_link_type(item.payment_type) == PAYMENT_LINK_TYPE_UPI
+            and item.expiry_source == "upi_qr_code"
+        ),
+        "upi_qr_validity_seconds": UPI_QR_VALIDITY_SECONDS,
     }
+    for payment_type_name in sorted(PAYMENT_LINK_TYPES):
+        report[f"{payment_type_name}_links"] = type_counts.get(payment_type_name, 0)
+        report[f"{payment_type_name}_valid_links"] = sum(
+            1 for item in valid if normalize_payment_link_type(item.payment_type) == payment_type_name
+        )
+        report[f"{payment_type_name}_expired_links"] = sum(
+            1 for item in expired if normalize_payment_link_type(item.payment_type) == payment_type_name
+        )
+        report[f"{payment_type_name}_paid_links"] = sum(
+            1 for item in paid if normalize_payment_link_type(item.payment_type) == payment_type_name
+        )
+        report[f"{payment_type_name}_cancelled_links"] = sum(
+            1 for item in cancelled if normalize_payment_link_type(item.payment_type) == payment_type_name
+        )
+    # ``current_pix_links`` is a legacy name.  For a mixed scan it must only
+    # report PIX while the generic counters carry the full scope.
+    if any(normalize_payment_link_type(item.payment_type) != PAYMENT_LINK_TYPE_PIX for item in candidates):
+        report["current_pix_links"] = type_counts.get(PAYMENT_LINK_TYPE_PIX, 0)
+        report["pix_links"] = type_counts.get(PAYMENT_LINK_TYPE_PIX, 0)
+        report["upi_links"] = type_counts.get(PAYMENT_LINK_TYPE_UPI, 0)
     return report, eligible
 
 
@@ -662,16 +904,59 @@ def _create_verified_backup(session: Session, *, now: datetime) -> str:
     return str(backup)
 
 
+def preview_payment_link_cleanup(
+    session: Session,
+    *,
+    payment_type: str | None = None,
+    cleanup_mode: PixCleanupMode = PIX_CLEANUP_MODE_EXPIRED,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Scan current QR payment links, optionally scoped to one payment type."""
+
+    now_utc = _utc_datetime(now or datetime.now(timezone.utc)) or datetime.now(timezone.utc)
+    candidates = _load_current_payment_link_candidates(session, payment_type=payment_type)
+    session.rollback()
+    direct_results = _scan_stripe_payment_states(candidates)
+    report, _ = _base_report(
+        candidates,
+        now=now_utc,
+        cleanup_mode=cleanup_mode,
+        direct_results=direct_results,
+        payment_type=payment_type,
+    )
+    return report
+
+
 def preview_expired_pix_payment_links(
     session: Session,
     *,
     now: datetime | None = None,
 ) -> dict[str, Any]:
-    now_utc = _utc_datetime(now or datetime.now(timezone.utc)) or datetime.now(timezone.utc)
-    candidates = _load_current_pix_link_candidates(session)
-    session.rollback()
-    direct_results = _scan_stripe_pix_states(candidates)
-    report, _ = _base_report(candidates, now=now_utc, direct_results=direct_results)
+    # Preserve the exact legacy report shape consumed by older operators/tests.
+    report = preview_payment_link_cleanup(
+        session,
+        payment_type=PAYMENT_LINK_TYPE_PIX,
+        cleanup_mode=PIX_CLEANUP_MODE_EXPIRED,
+        now=now,
+    )
+    for key in (
+        "current_upi_links",
+        "payment_type_counts",
+        "payment_types",
+        "upi_qr_expiry_links",
+        "upi_qr_validity_seconds",
+        "pix_links",
+        "upi_links",
+        "pix_valid_links",
+        "pix_expired_links",
+        "pix_paid_links",
+        "pix_cancelled_links",
+        "upi_valid_links",
+        "upi_expired_links",
+        "upi_paid_links",
+        "upi_cancelled_links",
+    ):
+        report.pop(key, None)
     return report
 
 
@@ -681,17 +966,26 @@ def preview_pix_payment_link_cleanup(
     cleanup_mode: PixCleanupMode = PIX_CLEANUP_MODE_EXPIRED,
     now: datetime | None = None,
 ) -> dict[str, Any]:
-    now_utc = _utc_datetime(now or datetime.now(timezone.utc)) or datetime.now(timezone.utc)
-    candidates = _load_current_pix_link_candidates(session)
-    session.rollback()
-    direct_results = _scan_stripe_pix_states(candidates)
-    report, _ = _base_report(
-        candidates,
-        now=now_utc,
+    return preview_payment_link_cleanup(
+        session,
+        payment_type=PAYMENT_LINK_TYPE_PIX,
         cleanup_mode=cleanup_mode,
-        direct_results=direct_results,
+        now=now,
     )
-    return report
+
+
+def preview_upi_payment_link_cleanup(
+    session: Session,
+    *,
+    cleanup_mode: PixCleanupMode = PIX_CLEANUP_MODE_EXPIRED,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    return preview_payment_link_cleanup(
+        session,
+        payment_type=PAYMENT_LINK_TYPE_UPI,
+        cleanup_mode=cleanup_mode,
+        now=now,
+    )
 
 
 def _cleaned_link_payload(
@@ -701,31 +995,41 @@ def _cleaned_link_payload(
     cleanup_mode: PixCleanupMode,
 ) -> dict[str, Any]:
     mode = normalize_pix_cleanup_mode(cleanup_mode)
+    payment_type = normalize_payment_link_type(candidate.payment_type) or PAYMENT_LINK_TYPE_PIX
+    cleaned_status = _CLEANED_STATUS_BY_TYPE_AND_MODE[(payment_type, mode)]
+    type_label = payment_type.upper()
     payload = {
         key: value
         for key, value in candidate.payload.items()
         if key not in _LINK_URL_FIELDS_TO_REMOVE
     }
     previous_status = str(candidate.payload.get("link_status") or "").strip()
-    if previous_status and previous_status not in PIX_CLEANED_STATUSES:
+    if previous_status and previous_status not in PAYMENT_LINK_CLEANED_STATUSES:
         payload["previous_link_status"] = previous_status
-    if mode == PIX_CLEANUP_MODE_EXPIRED:
+    if mode == PIX_CLEANUP_MODE_EXPIRED and payment_type == PAYMENT_LINK_TYPE_PIX:
         cutoff_at = latest_pix_expiry_cutoff(cleaned_at)
         cleanup_through_at = max(
             value
             for value in (cutoff_at, candidate.generated_at)
             if value is not None
         )
+    elif mode == PIX_CLEANUP_MODE_EXPIRED:
+        cleanup_through_at = max(
+            value
+            for value in (candidate.expires_at, candidate.generated_at, cleaned_at)
+            if value is not None
+        )
     else:
         cleanup_through_at = cleaned_at
     payload.update(
         {
-            "link_status": _CLEANED_STATUS_BY_MODE[mode],
-            "link_status_reason": _CLEANED_REASON_BY_MODE[mode],
+            "link_status": cleaned_status,
+            "link_status_reason": f"{type_label} {str(_CLEANED_REASON_BY_MODE[mode]).lower()}",
             "link_status_updated_at": cleaned_at.isoformat(),
             "cleaned_at": cleaned_at.isoformat(),
             "pix_cleanup_through_at": cleanup_through_at.isoformat(),
             "pix_cleanup_mode": mode,
+            "payment_link_type": payment_type,
             "link_expiry_source": candidate.expiry_source,
         }
     )
@@ -749,24 +1053,26 @@ def clean_expired_pix_payment_links(
     )
 
 
-def clean_pix_payment_links(
+def clean_payment_links(
     session: Session,
     *,
+    payment_type: str | None = None,
     cleanup_mode: PixCleanupMode = PIX_CLEANUP_MODE_EXPIRED,
     now: datetime | None = None,
 ) -> dict[str, Any]:
-    """Clean one explicit PIX link category without touching payment history."""
+    """Clean one explicit QR-link category without touching payment history."""
 
     mode = normalize_pix_cleanup_mode(cleanup_mode)
     now_utc = _utc_datetime(now or datetime.now(timezone.utc)) or datetime.now(timezone.utc)
-    initial_candidates = _load_current_pix_link_candidates(session)
+    initial_candidates = _load_current_payment_link_candidates(session, payment_type=payment_type)
     session.rollback()
-    direct_results = _scan_stripe_pix_states(initial_candidates)
+    direct_results = _scan_stripe_payment_states(initial_candidates)
     initial_report, initial_eligible = _base_report(
         initial_candidates,
         now=now_utc,
         cleanup_mode=mode,
         direct_results=direct_results,
+        payment_type=payment_type,
     )
     if not initial_eligible:
         initial_report.update(
@@ -787,10 +1093,11 @@ def clean_pix_payment_links(
     try:
         session.exec(text("BEGIN IMMEDIATE"))
         report, current_eligible = _base_report(
-            _load_current_pix_link_candidates(session),
+            _load_current_payment_link_candidates(session, payment_type=payment_type),
             now=now_utc,
             cleanup_mode=mode,
             direct_results=direct_results,
+            payment_type=payment_type,
         )
         eligible = [
             candidate
@@ -848,7 +1155,7 @@ def clean_pix_payment_links(
                 commit=False,
             )
             if list_state_refreshed != len(cleaned_ids):
-                raise RuntimeError("PIX payment-link list state did not refresh completely")
+                raise RuntimeError("payment-link list state did not refresh completely")
         session.commit()
         _assert_session_integrity(session)
         session.rollback()
@@ -865,3 +1172,35 @@ def clean_pix_payment_links(
         }
     )
     return report
+
+
+def clean_pix_payment_links(
+    session: Session,
+    *,
+    cleanup_mode: PixCleanupMode = PIX_CLEANUP_MODE_EXPIRED,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Backward-compatible PIX-only cleanup entry point."""
+
+    return clean_payment_links(
+        session,
+        payment_type=PAYMENT_LINK_TYPE_PIX,
+        cleanup_mode=cleanup_mode,
+        now=now,
+    )
+
+
+def clean_upi_payment_links(
+    session: Session,
+    *,
+    cleanup_mode: PixCleanupMode = PIX_CLEANUP_MODE_EXPIRED,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Clean UPI links using the provider QR expiry/status evidence."""
+
+    return clean_payment_links(
+        session,
+        payment_type=PAYMENT_LINK_TYPE_UPI,
+        cleanup_mode=cleanup_mode,
+        now=now,
+    )

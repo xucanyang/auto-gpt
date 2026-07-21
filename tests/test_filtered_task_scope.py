@@ -166,6 +166,63 @@ def test_accounts_list_and_task_resolver_return_the_same_scope(filter_engine):
     assert {item["id"] for item in listed["items"]} == set(resolution.account_ids) == {1}
 
 
+def test_accounts_list_defaults_to_registration_asc_and_supports_expiry_then_registration(filter_engine):
+    created_at_by_id = {
+        1: datetime(2026, 1, 3, tzinfo=timezone.utc),
+        2: datetime(2026, 1, 2, tzinfo=timezone.utc),
+        3: datetime(2026, 1, 1, tzinfo=timezone.utc),
+        4: datetime(2026, 1, 5, tzinfo=timezone.utc),
+        5: datetime(2026, 1, 4, tzinfo=timezone.utc),
+    }
+    expiry_by_id = {
+        1: "2030-01-02T00:00:00Z",
+        2: "2030-01-01T00:00:00Z",
+        3: "2030-01-01T00:00:00Z",
+    }
+    with Session(filter_engine) as session:
+        for account_id, created_at in created_at_by_id.items():
+            account = session.get(AccountModel, account_id)
+            assert account is not None
+            account.created_at = created_at
+            extra = account.get_extra()
+            expiry = expiry_by_id.get(account_id, "")
+            if expiry:
+                extra["chatgpt_local"] = {
+                    "subscription": {"subscription_active_until": expiry}
+                }
+            account.set_extra(extra)
+            session.add(account)
+        session.commit()
+        account_filters.refresh_account_list_state(session)
+
+        default_list = accounts.list_accounts(
+            platform="chatgpt",
+            page=1,
+            page_size=200,
+            session=session,
+        )
+        legacy_expiry_list = accounts.list_accounts(
+            platform="chatgpt",
+            sort_by="subscription_active_until",
+            sort_order="asc",
+            page=1,
+            page_size=200,
+            session=session,
+        )
+        combined_list = accounts.list_accounts(
+            platform="chatgpt",
+            sort_by="subscription_active_until,created_at",
+            sort_order="asc,desc",
+            page=1,
+            page_size=200,
+            session=session,
+        )
+
+    assert [item["id"] for item in default_list["items"]] == [3, 2, 1, 5, 4]
+    assert [item["id"] for item in legacy_expiry_list["items"]] == [3, 2, 1, 5, 4]
+    assert [item["id"] for item in combined_list["items"]] == [2, 3, 1, 4, 5]
+
+
 def test_unfiltered_account_list_refreshes_payment_history_state(filter_engine):
     with Session(filter_engine) as session:
         account = session.get(AccountModel, 1)

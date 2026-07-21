@@ -132,3 +132,17 @@ def test_generic_submission_infers_pix_channel_from_link_type_without_submit_mar
 
     assert compact["submission"]["link_submitted"] is False
     assert compact["submission"]["payment_channel"] == "pix"
+
+
+def test_generic_submission_infers_upi_channel_when_hosted_type_is_generic():
+    extra = {
+        "chatgpt_last_payment_link": {
+            "url": "https://payments.stripe.com/upi/instructions/summary-upi",
+            "link_type": "hosted",
+            "payment_method_type": "upi",
+        },
+    }
+    compact = accounts._serialize_account_compact_item(_account(extra), extra=extra)
+
+    assert compact["submission"]["link_submitted"] is False
+    assert compact["submission"]["payment_channel"] == "upi"

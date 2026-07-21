@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import base64
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import sqlite3
 
@@ -20,6 +20,9 @@ from services.chatgpt_core.pix_payment_link_cleanup import (
     pix_schedule_expires_at,
     preview_pix_payment_link_cleanup,
     preview_expired_pix_payment_links,
+    clean_upi_payment_links,
+    parse_stripe_payment_instruction_html,
+    preview_upi_payment_link_cleanup,
 )
 from services.chatgpt_core.payment_link_cache import (
     PIX_CANCELLED_CLEANED_STATUS,
@@ -56,6 +59,24 @@ def _pix_link(url: str, *, generated_at: str = "", expires_at: int | None = None
         payload["created_at"] = generated_at
     if expires_at is not None:
         payload["link_expires_at"] = expires_at
+    return payload
+
+
+def _upi_link(url: str, *, generated_at: str = "", expires_at: int | None = None) -> dict:
+    payload = {
+        "url": url,
+        "long_url": url,
+        "link_type": "upi",
+        "payment_method_type": "upi",
+        "payment_link_format": "long_link",
+        "plan": "plus",
+    }
+    if generated_at:
+        payload["generated_at"] = generated_at
+        payload["created_at"] = generated_at
+    if expires_at is not None:
+        payload["link_expires_at"] = expires_at
+        payload["link_expiry_source"] = "upi_qr_code"
     return payload
 
 
@@ -98,6 +119,104 @@ def test_beijing_11_schedule_treats_exact_rollover_as_the_new_cycle():
 
     assert before == datetime(2026, 7, 16, 3, 0, tzinfo=timezone.utc)
     assert exact == datetime(2026, 7, 17, 3, 0, tzinfo=timezone.utc)
+
+
+def test_upi_instruction_parser_keeps_qr_expiry_and_never_exposes_secrets():
+    secret = "seti_secret_should_not_escape"
+    payload = {
+        "type": "upi",
+        "payment_method_type": "upi",
+        "intent_state": "requires_action",
+        "server_timestamp": int(NOW.timestamp()),
+        "expires_at": int((NOW + timedelta(minutes=5)).timestamp()),
+        "client_secret": secret,
+        "publishable_key": "pk_live_should_not_escape",
+    }
+    encoded = base64.b64encode(json.dumps(payload).encode()).decode()
+    result = parse_stripe_payment_instruction_html(
+        f'<meta id="payload" data-message="{encoded}">'.encode(),
+        expected_payment_type="upi",
+    )
+
+    assert result.success is True
+    assert result.payment_type == "upi"
+    assert result.expires_at == NOW + timedelta(minutes=5)
+    assert result.expiry_source == "upi_qr_code"
+    assert secret not in repr(result)
+
+
+def test_upi_cleanup_uses_qr_expiry_and_leaves_valid_link(monkeypatch):
+    engine = _engine()
+    expired_epoch = int((NOW - timedelta(seconds=1)).timestamp())
+    valid_epoch = int((NOW + timedelta(seconds=1)).timestamp())
+    with Session(engine) as session:
+        session.add_all(
+            [
+                _account(601, _upi_link("https://payments.stripe.com/upi/instructions/expired", expires_at=expired_epoch)),
+                _account(602, _upi_link("https://payments.stripe.com/upi/instructions/valid", expires_at=valid_epoch)),
+            ]
+        )
+        session.commit()
+
+    monkeypatch.setattr(
+        pix_cleanup,
+        "_fetch_stripe_pix_instruction",
+        lambda _url: pix_cleanup.StripePaymentDirectState(
+            True,
+            True,
+            "requires_action",
+            NOW,
+            payment_type="upi",
+        ),
+    )
+    with Session(engine) as session:
+        preview = preview_upi_payment_link_cleanup(session, now=NOW)
+    assert preview["current_upi_links"] == 2
+    assert preview["upi_expired_links"] == 1
+    assert preview["eligible_links"] == 1
+    assert preview["upi_qr_validity_seconds"] == 300
+    assert preview["provider_expiry_links"] == 2
+
+    with Session(engine) as session:
+        result = clean_upi_payment_links(session, now=NOW)
+    assert result["cleaned_links"] == 1
+    with Session(engine) as session:
+        cleaned = session.get(AccountModel, 601)
+        retained = session.get(AccountModel, 602)
+        assert cleaned is not None and retained is not None
+        assert cleaned.get_extra()["chatgpt_last_payment_link"]["link_status"] == "upi_expired_cleaned"
+        assert retained.get_extra()["chatgpt_last_payment_link"]["url"].endswith("/valid")
+
+
+def test_upi_cleanup_rejects_explicit_checkout_session_expiry(monkeypatch):
+    engine = _engine()
+    payload = _upi_link(
+        "https://payments.stripe.com/upi/instructions/checkout-expiry",
+        expires_at=int((NOW - timedelta(hours=1)).timestamp()),
+    )
+    payload["link_expiry_source"] = "checkout_session"
+    untagged_checkout = _upi_link(
+        "https://payments.stripe.com/upi/instructions/untagged-checkout-expiry",
+        generated_at=NOW.isoformat(),
+        expires_at=int((NOW + timedelta(hours=24)).timestamp()),
+    )
+    untagged_checkout.pop("link_expiry_source", None)
+    with Session(engine) as session:
+        session.add_all([_account(603, payload), _account(604, untagged_checkout)])
+        session.commit()
+
+    monkeypatch.setattr(
+        pix_cleanup,
+        "_fetch_stripe_pix_instruction",
+        lambda _url: pix_cleanup.StripePaymentDirectState(True, False),
+    )
+    with Session(engine) as session:
+        preview = preview_upi_payment_link_cleanup(session, now=NOW)
+
+    assert preview["current_upi_links"] == 2
+    assert preview["upi_expired_links"] == 0
+    assert preview["missing_expiry_links"] == 2
+    assert preview["eligible_links"] == 0
 
 
 def test_preview_and_cleanup_are_scoped_atomic_and_idempotent():

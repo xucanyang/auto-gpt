@@ -8,6 +8,7 @@ import json
 import re
 import time
 from typing import Any
+from urllib.parse import urlsplit
 
 from core.proxy_utils import normalize_proxy_url
 from services.chatgpt_core.payment import (
@@ -28,6 +29,18 @@ PIX_CLEANED_STATUSES = frozenset({
     PIX_PAID_CLEANED_STATUS,
     PIX_CANCELLED_CLEANED_STATUS,
 })
+# UPI links are independent QR instruments.  Keep their tombstones distinct so
+# a historical PIX cleanup marker can never be mistaken for an UPI link (and so
+# operators can tell which payment rail was cleared from the account metadata).
+UPI_EXPIRED_CLEANED_STATUS = "upi_expired_cleaned"
+UPI_PAID_CLEANED_STATUS = "upi_paid_cleaned"
+UPI_CANCELLED_CLEANED_STATUS = "upi_cancelled_cleaned"
+UPI_CLEANED_STATUSES = frozenset({
+    UPI_EXPIRED_CLEANED_STATUS,
+    UPI_PAID_CLEANED_STATUS,
+    UPI_CANCELLED_CLEANED_STATUS,
+})
+PAYMENT_LINK_CLEANED_STATUSES = frozenset({*PIX_CLEANED_STATUSES, *UPI_CLEANED_STATUSES})
 
 PAYMENT_LINK_STATUS_LABELS = {
     "invalid": "无效",
@@ -39,6 +52,9 @@ PAYMENT_LINK_STATUS_LABELS = {
     PIX_EXPIRED_CLEANED_STATUS: "已过期清理",
     PIX_PAID_CLEANED_STATUS: "已支付清理",
     PIX_CANCELLED_CLEANED_STATUS: "支付已取消清理",
+    UPI_EXPIRED_CLEANED_STATUS: "UPI 已过期清理",
+    UPI_PAID_CLEANED_STATUS: "UPI 已支付清理",
+    UPI_CANCELLED_CLEANED_STATUS: "UPI 支付已取消清理",
 }
 PAYMENT_LINK_REGENERATE_STATUSES = {
     "invalid",
@@ -49,6 +65,7 @@ PAYMENT_LINK_REGENERATE_STATUSES = {
     # service's perspective, even while its QR deadline has not elapsed.
     "pix_submitted",
     *PIX_CLEANED_STATUSES,
+    *UPI_CLEANED_STATUSES,
 }
 PAYMENT_LINK_STATUS_SYNC_STATUSES = {"already_paid"}
 PAYMENT_LINK_FORMAT_PAYPAL = "paypal_url"
@@ -74,6 +91,7 @@ PAYMENT_LINK_TEAM_PLAN_ALIASES = frozenset({
 })
 MAX_PAYMENT_LINK_EXPIRES_AT_EPOCH = 253_402_300_799
 PIX_LINK_REUSE_GUARD_SECONDS = 60
+UPI_LINK_REUSE_GUARD_SECONDS = 60
 RETIRED_PAYMENT_REQUEST_KEYS = frozenset({
     "promo_code",
     "promoCode",
@@ -268,6 +286,169 @@ def normalize_payment_link_status(value: Any) -> str:
     return str(value or "").strip().lower()
 
 
+PAYMENT_LINK_QR_TYPES = frozenset({"pix", "upi"})
+_GENERIC_PAYMENT_LINK_TYPES = frozenset({
+    "hosted",
+    "chatgpt",
+    "chatgpt_hosted",
+    "stripe_hosted",
+    "checkout",
+    "payment",
+    "pay",
+    "long",
+})
+
+
+def normalize_payment_link_type(value: Any) -> str:
+    """Normalize provider payment types used by the current-link contract."""
+
+    text = str(value or "").strip().lower().replace("-", "_")
+    aliases = {
+        "qr": "pix",
+        "pix_qr": "pix",
+        "upi_qr": "upi",
+        "upi_qr_code": "upi",
+    }
+    return aliases.get(text, text)
+
+
+def payment_link_type_from_payload(payload: dict[str, Any] | None) -> str:
+    """Infer a payment type from explicit provider fields before URL shape.
+
+    Long-link responses historically omitted ``link_type`` in a few paths while
+    still carrying ``payment_method_type``.  Inferring the type here keeps cache,
+    list filters, and cleanup in agreement without guessing from arbitrary URLs.
+    """
+
+    source = payload if isinstance(payload, dict) else {}
+    explicit_values = [
+        normalize_payment_link_type(source.get(key))
+        for key in ("link_type", "payment_method_type", "payment_type")
+    ]
+    # A concrete QR method wins over a generic transport label such as
+    # ``hosted``.  This is the automatic classification boundary used by the
+    # scanner and account-list filter.
+    for value in explicit_values:
+        if value in PAYMENT_LINK_QR_TYPES:
+            return value
+    # The canonical Stripe instruction path is stronger evidence than a
+    # generic ``link_type=hosted`` value.  This also covers old rows that did
+    # not persist ``payment_method_type`` at all.
+    for key in ("url", "long_url", "provider_redirect_url", "stripe_redirect_url"):
+        value = str(source.get(key) or "").strip()
+        if not value:
+            continue
+        try:
+            path = (urlsplit(value).path or "").lower()
+        except (TypeError, ValueError):
+            path = ""
+        if "/upi/instructions/" in path:
+            return "upi"
+        if "/qr/instructions/" in path:
+            return "pix"
+    for value in explicit_values:
+        if value and value not in _GENERIC_PAYMENT_LINK_TYPES:
+            return value
+    for value in explicit_values:
+        if value:
+            return value
+    return ""
+
+
+def _normalize_qr_expiry_epoch(value: Any) -> int | None:
+    return normalize_payment_link_expires_at(value)
+
+
+def extract_payment_link_qr_expires_at(
+    payload: Any,
+    *,
+    payment_type: Any = "",
+    depth: int = 0,
+) -> int | None:
+    """Extract the concrete QR deadline without borrowing checkout expiry.
+
+    UPI's authoritative value is
+    ``next_action.upi_handle_redirect_or_display_qr_code.qr_code.expires_at``.
+    Stripe's hosted instructions page also exposes the same value as a
+    top-level ``expires_at``.  PIX uses the analogous
+    ``pix_display_qr_code`` shape.  We intentionally do not recurse into
+    ``checkout_session.expires_at`` because that is a different lifetime.
+    """
+
+    if depth > 12:
+        return None
+    normalized_type = normalize_payment_link_type(payment_type)
+    if isinstance(payload, dict):
+        qr_code = payload.get("qr_code")
+        if isinstance(qr_code, dict):
+            direct = _normalize_qr_expiry_epoch(qr_code.get("expires_at"))
+            if direct is not None:
+                return direct
+        next_action = payload.get("next_action")
+        if isinstance(next_action, dict):
+            if normalized_type == "upi":
+                action_keys = ("upi_handle_redirect_or_display_qr_code",)
+            elif normalized_type == "pix":
+                action_keys = ("pix_display_qr_code",)
+            else:
+                action_keys = (
+                    "upi_handle_redirect_or_display_qr_code",
+                    "pix_display_qr_code",
+                )
+            for action_key in action_keys:
+                action = next_action.get(action_key)
+                if not isinstance(action, dict):
+                    continue
+                nested_qr = action.get("qr_code")
+                if isinstance(nested_qr, dict):
+                    direct = _normalize_qr_expiry_epoch(nested_qr.get("expires_at"))
+                    if direct is not None:
+                        return direct
+                direct = _normalize_qr_expiry_epoch(action.get("expires_at"))
+                if direct is not None:
+                    return direct
+        # Hosted UPI/PIX instruction payloads put the QR deadline at the root.
+        if normalized_type in PAYMENT_LINK_QR_TYPES:
+            direct = _normalize_qr_expiry_epoch(payload.get("expires_at"))
+            if direct is not None:
+                return direct
+        for key, value in payload.items():
+            if key in {"checkout_session", "expires_at", "qr_code", "next_action"}:
+                continue
+            found = extract_payment_link_qr_expires_at(
+                value,
+                payment_type=normalized_type,
+                depth=depth + 1,
+            )
+            if found is not None:
+                return found
+    elif isinstance(payload, list):
+        for value in payload:
+            found = extract_payment_link_qr_expires_at(
+                value,
+                payment_type=normalized_type,
+                depth=depth + 1,
+            )
+            if found is not None:
+                return found
+    return None
+
+
+def normalize_payment_link_expiry_source(value: Any, payment_type: Any = "") -> str:
+    source = str(value or "").strip().lower().replace("-", "_")
+    normalized_type = normalize_payment_link_type(payment_type)
+    if normalized_type == "upi":
+        if source in {"upi_qr_code", "qr_code", "qr"}:
+            return "upi_qr_code"
+        if source == "checkout_session":
+            # Kept for reading old upstream rows; new UPI cleanup prefers QR
+            # expiry whenever a concrete QR value is available.
+            return source
+    if normalized_type == "pix" and source in {"pix_qr_code", "qr_code", "qr"}:
+        return "pix_qr_code"
+    return source[:64]
+
+
 def normalize_payment_link_output_format(value: Any) -> str:
     text = str(value or "").strip().lower().replace("-", "_")
     if text in {"long_link", "longlink", "admin_long_link", "configured_long_link"}:
@@ -311,10 +492,10 @@ def normalize_payment_link_expires_at(value: Any) -> int | None:
 
 
 def payment_link_expires_soon(cached: dict[str, Any] | None, *, now: float | None = None) -> bool:
-    """PIX is reusable only while its upstream QR deadline remains safely ahead."""
+    """QR-based links are reusable only while their provider deadline is safe."""
     if not isinstance(cached, dict):
         return False
-    if str(cached.get("link_type") or "").strip().lower() != "pix":
+    if payment_link_type_from_payload(cached) not in PAYMENT_LINK_QR_TYPES:
         return False
     expires_at = normalize_payment_link_expires_at(cached.get("link_expires_at"))
     if expires_at is None:
@@ -323,7 +504,12 @@ def payment_link_expires_soon(cached: dict[str, Any] | None, *, now: float | Non
         current = float(time.time() if now is None else now)
     except (TypeError, ValueError):
         return False
-    return expires_at <= current + PIX_LINK_REUSE_GUARD_SECONDS
+    guard_seconds = (
+        UPI_LINK_REUSE_GUARD_SECONDS
+        if payment_link_type_from_payload(cached) == "upi"
+        else PIX_LINK_REUSE_GUARD_SECONDS
+    )
+    return expires_at <= current + guard_seconds
 
 
 def payment_link_requires_regeneration(cached: dict[str, Any] | None) -> bool:
@@ -570,16 +756,29 @@ def build_payment_link_cache_payload(
         country,
     )
 
+    inferred_link_type = payment_link_type_from_payload({**fallback_source, **payload_source})
+    explicit_link_type = normalize_payment_link_type(
+        payload_source.get("link_type") or metadata_fallback.get("link_type")
+    )
+    method_link_type = normalize_payment_link_type(
+        payload_source.get("payment_method_type") or metadata_fallback.get("payment_method_type")
+    )
+    if method_link_type in PAYMENT_LINK_QR_TYPES:
+        normalized_link_type = method_link_type
+    elif explicit_link_type in PAYMENT_LINK_QR_TYPES:
+        normalized_link_type = explicit_link_type
+    elif inferred_link_type in PAYMENT_LINK_QR_TYPES and (
+        not explicit_link_type or explicit_link_type in _GENERIC_PAYMENT_LINK_TYPES
+    ):
+        normalized_link_type = inferred_link_type
+    else:
+        normalized_link_type = explicit_link_type or method_link_type or inferred_link_type
     payload: dict[str, Any] = {
         "url": url,
         "plan": plan,
         "country": country,
         "currency": currency,
-        "link_type": str(
-            payload_source.get("link_type")
-            or metadata_fallback.get("link_type")
-            or ""
-        ).strip().lower(),
+        "link_type": normalized_link_type.strip().lower(),
         "proxy": (
             ""
             if payment_source in {PAYMENT_SOURCE_LONG_LINK, PAYMENT_SOURCE_LONG_LINK_PAYPAL}
@@ -655,13 +854,43 @@ def build_payment_link_cache_payload(
         if value is not None and value != "":
             payload[key] = value
 
-    if payload["link_type"] == "pix":
+    if payload["link_type"] in PAYMENT_LINK_QR_TYPES:
         raw_expires_at = payload_source.get("link_expires_at")
+        expiry_metadata = payload_source
         if raw_expires_at is None or raw_expires_at == "":
             raw_expires_at = metadata_fallback.get("link_expires_at")
+            expiry_metadata = metadata_fallback
+        qr_expires_at = extract_payment_link_qr_expires_at(
+            payload_source,
+            payment_type=payload["link_type"],
+        )
+        if qr_expires_at is None:
+            qr_expires_at = extract_payment_link_qr_expires_at(
+                metadata_fallback,
+                payment_type=payload["link_type"],
+            )
+        # For UPI the QR deadline is authoritative even when an older upstream
+        # response also carried a Checkout Session expiry.
+        if payload["link_type"] == "upi" and qr_expires_at is not None:
+            raw_expires_at = qr_expires_at
+        source_value = expiry_metadata.get("link_expiry_source")
+        normalized_source = normalize_payment_link_expiry_source(source_value, payload["link_type"])
+        if payload["link_type"] == "upi" and qr_expires_at is None and normalized_source == "checkout_session":
+            # Checkout Session lifetime is not the UPI QR lifetime.  Treat an
+            # explicitly tagged scalar as unknown instead of extending a
+            # five-minute QR code to the session deadline.
+            raw_expires_at = None
         link_expires_at = normalize_payment_link_expires_at(raw_expires_at)
         if link_expires_at is not None:
             payload["link_expires_at"] = link_expires_at
+            if payload["link_type"] == "upi" and qr_expires_at is not None:
+                normalized_source = "upi_qr_code"
+            elif payload["link_type"] == "upi" and not normalized_source:
+                # Historical long-link rows persisted the QR scalar before
+                # provenance was added to the schema.
+                normalized_source = "upi_qr_code"
+            if normalized_source:
+                payload["link_expiry_source"] = normalized_source
 
     billing = payload_source.get("billing") if isinstance(payload_source.get("billing"), dict) else metadata_fallback.get("billing")
     if isinstance(billing, dict):
@@ -702,6 +931,7 @@ def build_payment_link_cache_payload(
 
     for key in (
         "link_type",
+        "link_expiry_source",
         "provider_redirect_url",
         "long_url",
         "stripe_redirect_url",
@@ -731,6 +961,24 @@ def build_payment_link_cache_payload(
             value = metadata_fallback.get(key)
         if value is not None and value != "":
             payload[key] = value
+
+    # The metadata compatibility loop above must not overwrite a concrete UPI
+    # QR provenance with an older Checkout Session marker.
+    inferred_after_metadata = payment_link_type_from_payload(payload)
+    if inferred_after_metadata in PAYMENT_LINK_QR_TYPES:
+        payload["link_type"] = inferred_after_metadata
+    if payload.get("link_type") == "upi":
+        qr_expiry = extract_payment_link_qr_expires_at(payload_source, payment_type="upi")
+        if qr_expiry is None:
+            qr_expiry = extract_payment_link_qr_expires_at(metadata_fallback, payment_type="upi")
+        if qr_expiry is not None:
+            payload["link_expires_at"] = qr_expiry
+            payload["link_expiry_source"] = "upi_qr_code"
+        elif normalize_payment_link_expiry_source(payload.get("link_expiry_source"), "upi") == "checkout_session":
+            payload.pop("link_expires_at", None)
+            payload.pop("link_expiry_source", None)
+        elif normalize_payment_link_expires_at(payload.get("link_expires_at")) is not None:
+            payload["link_expiry_source"] = "upi_qr_code"
 
     return payload
 

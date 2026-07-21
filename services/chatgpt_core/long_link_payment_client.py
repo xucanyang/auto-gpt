@@ -21,7 +21,11 @@ import requests
 from services.chatgpt_core.payment_link_cache import (
     PAYMENT_LINK_GENERATION_TEAM,
     PAYMENT_LINK_PLAN_TEAM,
+    extract_payment_link_qr_expires_at,
+    normalize_payment_link_expiry_source,
     normalize_payment_link_expires_at,
+    normalize_payment_link_type,
+    payment_link_type_from_payload,
     payment_link_variant_key,
 )
 
@@ -29,6 +33,8 @@ from services.chatgpt_core.payment_link_cache import (
 DEFAULT_BASE_URL = "http://openai-pay-long-link:8788"
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 20.0
 DEFAULT_PROFILE_CACHE_SECONDS = 30.0
+UPI_QR_VALIDITY_SECONDS = 5 * 60
+UPI_QR_EXPIRY_TOLERANCE_SECONDS = 60
 
 _PROFILE_PATH = "/api/internal/payment-links/profile"
 _BATCH_PATH = "/api/internal/payment-links/batches"
@@ -143,7 +149,12 @@ def payment_link_from_remote_job(
     if not url:
         raise LongLinkPaymentError("支付链接任务成功但未返回有效 HTTP(S) 链接")
 
-    link_type = str(result.get("link_type") or profile.get("link_type") or "hosted").strip().lower() or "hosted"
+    explicit_link_type = normalize_payment_link_type(result.get("link_type") or profile.get("link_type"))
+    method_link_type = normalize_payment_link_type(
+        result.get("payment_method_type") or profile.get("payment_method_type")
+    )
+    inferred_link_type = payment_link_type_from_payload({**profile, **result, "url": url})
+    link_type = inferred_link_type or explicit_link_type or method_link_type or "hosted"
     raw_generation_kind = str(
         result.get("generation_kind") or profile.get("generation_kind") or ""
     ).strip().lower()
@@ -201,9 +212,48 @@ def payment_link_from_remote_job(
         "generated_at": completed_at,
         "created_at": completed_at or datetime.now(timezone.utc).isoformat(),
     }
-    link_expires_at = normalize_payment_link_expires_at(result.get("link_expires_at"))
+    # UPI's QR deadline is the only expiry that is safe for QR cleanup.  The
+    # upstream service returns the scalar ``link_expires_at`` and may also
+    # include the nested SetupIntent shape; prefer the nested QR value whenever
+    # it is present and retain its provenance for the account UI.
+    qr_expires_at = extract_payment_link_qr_expires_at(result, payment_type=link_type)
+    if qr_expires_at is None:
+        qr_expires_at = extract_payment_link_qr_expires_at(payload, payment_type=link_type)
+    expiry_source = normalize_payment_link_expiry_source(
+        result.get("link_expiry_source") or payload.get("link_expiry_source"),
+        link_type,
+    )
+    raw_expires_at = result.get("link_expires_at")
+    if link_type == "upi":
+        if qr_expires_at is not None:
+            raw_expires_at = qr_expires_at
+            expiry_source = "upi_qr_code"
+        elif expiry_source == "checkout_session":
+            raw_expires_at = None
+        elif raw_expires_at not in (None, "") and not expiry_source:
+            # Older internal API rows exposed the UPI QR scalar before adding
+            # an explicit provenance field.  Accept only a five-minute-shaped
+            # deadline so an untagged Checkout Session value cannot leak in.
+            candidate_expiry = normalize_payment_link_expires_at(raw_expires_at)
+            try:
+                completed_epoch = int(float(payload.get("completed_at") or 0))
+            except (TypeError, ValueError):
+                completed_epoch = 0
+            if (
+                candidate_expiry is not None
+                and completed_epoch > 0
+                and candidate_expiry <= completed_epoch + UPI_QR_VALIDITY_SECONDS + UPI_QR_EXPIRY_TOLERANCE_SECONDS
+            ):
+                expiry_source = "upi_qr_code"
+            else:
+                raw_expires_at = None
+    link_expires_at = normalize_payment_link_expires_at(
+        raw_expires_at
+    )
     if link_expires_at is not None:
         output["link_expires_at"] = link_expires_at
+        if expiry_source:
+            output["link_expiry_source"] = expiry_source
     if link_type == "paypal":
         output["paypal_url"] = _http_url(result.get("paypal_url")) or url
     if is_team:

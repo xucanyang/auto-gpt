@@ -395,6 +395,64 @@ def test_paypal_history_keeps_generic_long_link_contract_and_legacy_payload(tmp_
     assert extra["chatgpt_paypal_url"]["paypal_url"] == row["long_url"]
 
 
+def test_upi_history_preserves_qr_expiry_and_payment_type(tmp_path: Path):
+    source = tmp_path / "tasks.db"
+    target = tmp_path / "account_manager.db"
+    row = _source_row(
+        "job-upi",
+        "one@example.test",
+        completed_at=1_700_000_000,
+        url="https://payments.stripe.com/upi/instructions/upi-history",
+    )
+    row.update({"link_type": "upi", "payment_method_type": "upi", "link_expires_at": 1_700_000_300})
+    _create_source(source, [row])
+    _create_target(target, [{"id": 1, "email": "one@example.test"}])
+
+    synchronize_long_link_success_history(
+        source_database=source,
+        target_databases=[target],
+        apply=True,
+        backup_dir=tmp_path / "backups",
+    )
+
+    with sqlite3.connect(target) as connection:
+        extra_json = connection.execute("SELECT extra_json FROM accounts WHERE id = 1").fetchone()[0]
+    payload = json.loads(extra_json)["chatgpt_last_payment_link"]
+    assert payload["link_type"] == "upi"
+    assert payload["payment_method_type"] == "upi"
+    assert payload["link_expires_at"] == 1_700_000_300
+    assert payload["link_expiry_source"] == "upi_qr_code"
+
+
+def test_upi_history_ignores_untagged_checkout_session_expiry(tmp_path: Path):
+    source = tmp_path / "tasks.db"
+    target = tmp_path / "account_manager.db"
+    row = _source_row(
+        "job-upi-checkout-expiry",
+        "one@example.test",
+        completed_at=1_700_000_000,
+        url="https://payments.stripe.com/upi/instructions/upi-checkout-expiry",
+    )
+    row.update({"link_type": "hosted", "payment_method_type": "upi", "link_expires_at": 1_700_086_400})
+    _create_source(source, [row])
+    _create_target(target, [{"id": 1, "email": "one@example.test"}])
+
+    report = synchronize_long_link_success_history(
+        source_database=source,
+        target_databases=[target],
+        apply=True,
+        backup_dir=tmp_path / "backups",
+    )
+
+    assert report["source"]["upi_checkout_expiry_ignored"] == 1
+    with sqlite3.connect(target) as connection:
+        extra_json = connection.execute("SELECT extra_json FROM accounts WHERE id = 1").fetchone()[0]
+    payload = json.loads(extra_json)["chatgpt_last_payment_link"]
+    assert payload["link_type"] == "upi"
+    assert "link_expires_at" not in payload
+    assert "link_expiry_source" not in payload
+
+
 def test_orphan_remote_job_is_not_remapped_by_email(tmp_path: Path):
     source = tmp_path / "tasks.db"
     target = tmp_path / "account_manager.db"

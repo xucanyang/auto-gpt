@@ -44,7 +44,7 @@ from services.account_rate_limit_recovery import (
     reconcile_rate_limited_accounts,
 )
 from services.chatgpt_core.payment_link_cache import (
-    PIX_CLEANED_STATUSES,
+    PAYMENT_LINK_CLEANED_STATUSES,
     PAYMENT_LINK_FORMAT_LONG_LINK,
     PAYMENT_LINK_PLAN_TEAM,
     PAYMENT_LINK_GENERATION_TEAM,
@@ -67,10 +67,16 @@ from services.chatgpt_core.payment_link_cache import (
 from services.chatgpt_core.pix_payment_link_cleanup import (
     PIX_CLEANUP_MODE_EXPIRED,
     PIX_CLEANUP_MODE_LABELS,
+    PAYMENT_LINK_TYPE_PIX,
+    PAYMENT_LINK_TYPE_UPI,
     PixCleanupMode,
+    clean_payment_links,
     clean_pix_payment_links,
+    clean_upi_payment_links,
     normalize_pix_cleanup_mode,
+    preview_payment_link_cleanup,
     preview_pix_payment_link_cleanup,
+    preview_upi_payment_link_cleanup,
 )
 from services.chatgpt_core.local_status_refresh import (
     schedule_chatgpt_local_status_refresh_for_account_id,
@@ -416,6 +422,14 @@ class PaymentLinkProfilePreviewRequest(BaseModel):
 
 class PixPaymentLinkCleanupRequest(BaseModel):
     cleanup_mode: Literal["expired", "paid", "cancelled"] = PIX_CLEANUP_MODE_EXPIRED
+    payment_type: Literal["pix", "upi"] = PAYMENT_LINK_TYPE_PIX
+
+
+def _normalize_payment_link_cleanup_type(value: Any) -> str:
+    normalized = str(value or PAYMENT_LINK_TYPE_PIX).strip().lower().replace("-", "_")
+    if normalized not in {PAYMENT_LINK_TYPE_PIX, PAYMENT_LINK_TYPE_UPI}:
+        raise ValueError(f"Unsupported payment link type: {normalized}")
+    return normalized
 
 
 class BatchSub2ApiUploadTaskRequest(AccountFilterRequestMixin):
@@ -2004,6 +2018,7 @@ _PAYMENT_LINK_PAID_TERMINAL_STATUSES = frozenset({
     "paid",
     "already_paid",
     "paid_cleaned",
+    "upi_paid_cleaned",
 })
 _PAYMENT_LINK_IN_FLIGHT_MIN_TTL_SECONDS = 30 * 60
 _PAYMENT_LINK_IN_FLIGHT_GRACE_SECONDS = 5 * 60
@@ -2359,7 +2374,7 @@ def _payment_link_skip_reason(
         if raw_plan not in {PAYMENT_LINK_PLAN_TEAM, "team_checkout", "chatgptteamplan"}:
             if (
                 _payment_link_current_cache_url(raw_current)
-                or str(raw_current.get("link_status") or "").strip().lower() in PIX_CLEANED_STATUSES
+                or str(raw_current.get("link_status") or "").strip().lower() in PAYMENT_LINK_CLEANED_STATUSES
             ):
                 cached = raw_current
     legacy_cached = extra.get("chatgpt_paypal_url")
@@ -2403,7 +2418,7 @@ def _payment_link_skip_reason(
         return ""
 
     cached_status = str(cached.get("link_status") or "").strip().lower()
-    if cached_status in PIX_CLEANED_STATUSES:
+    if cached_status in PAYMENT_LINK_CLEANED_STATUSES:
         return "已有支付链接提取记录（链接已清理），默认不重复生成"
     if _payment_link_current_cache_url(cached) or (
         desired_plan != PAYMENT_LINK_PLAN_TEAM and _payment_link_current_cache_url(legacy_cached)
@@ -2445,6 +2460,7 @@ _PAYMENT_LINK_HISTORY_RESULT_FIELDS = (
     "payment_source",
     "link_type",
     "link_expires_at",
+    "link_expiry_source",
     "profile_hash",
     "remote_batch_id",
     "remote_job_id",
@@ -3876,6 +3892,21 @@ def _prepare_batch_probe_local_status_params(
 
     params = dict(raw_params or {}) if isinstance(raw_params, dict) else {}
     config = config_store.get_all()
+
+    def _coerce_probe_delay(value: Any) -> float:
+        try:
+            return max(float(value or 0), 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    delay_min = _first_batch_probe_param(params, "delay_seconds", "probe_delay_seconds")
+    delay_max = _first_batch_probe_param(params, "delay_max_seconds", "probe_delay_max_seconds")
+    params["delay_seconds"] = _coerce_probe_delay(
+        delay_min if delay_min is not None else config.get("chatgpt_local_status_probe_delay_seconds")
+    )
+    params["delay_max_seconds"] = _coerce_probe_delay(
+        delay_max if delay_max is not None else config.get("chatgpt_local_status_probe_delay_max_seconds")
+    )
     requested_concurrency = _coerce_batch_probe_positive_int(
         _first_batch_probe_param(params, "concurrency", "probe_concurrency", "local_status_probe_concurrency")
         or config.get("chatgpt_local_status_probe_concurrency")
@@ -3962,6 +3993,8 @@ def _prepare_batch_probe_local_status_params(
     settings = {
         "requested_concurrency": requested_concurrency,
         "effective_concurrency": effective_concurrency,
+        "delay_seconds": params["delay_seconds"],
+        "delay_max_seconds": params["delay_max_seconds"],
         "unique_exit_ip_requested": unique_exit_ip_requested,
         "unique_exit_ip_enabled": unique_exit_ip_enabled,
         "proxy_mode": mode,
@@ -17194,6 +17227,23 @@ def preview_chatgpt_expired_pix_payment_links(
         return preview_pix_payment_link_cleanup(session, cleanup_mode=cleanup_mode)
 
 
+@router.get("/chatgpt/payment-links/cleanup/preview")
+def preview_chatgpt_payment_links(
+    payment_type: Literal["pix", "upi"] = PAYMENT_LINK_TYPE_PIX,
+    cleanup_mode: Literal["expired", "paid", "cancelled"] = PIX_CLEANUP_MODE_EXPIRED,
+):
+    """Scan one QR payment rail using the automatic payment-type classifier."""
+
+    normalized_type = _normalize_payment_link_cleanup_type(payment_type)
+    mode = normalize_pix_cleanup_mode(cleanup_mode)
+    with Session(engine) as session:
+        return preview_payment_link_cleanup(
+            session,
+            payment_type=normalized_type,
+            cleanup_mode=mode,
+        )
+
+
 @router.get("/chatgpt/payment-links/pix-cleanup/scan")
 def scan_chatgpt_pix_payment_links():
     """Probe Stripe and return mutually exclusive current PIX-link status buckets."""
@@ -17202,20 +17252,41 @@ def scan_chatgpt_pix_payment_links():
         return preview_pix_payment_link_cleanup(session)
 
 
+@router.get("/chatgpt/payment-links/scan")
+def scan_chatgpt_payment_links():
+    """Scan all current PIX/UPI links and return type-specific buckets."""
+
+    with Session(engine) as session:
+        return preview_payment_link_cleanup(session)
+
+
+@router.get("/chatgpt/payment-links/upi-cleanup/scan")
+def scan_chatgpt_upi_payment_links():
+    """Compatibility alias for operators that want an UPI-only scan."""
+
+    with Session(engine) as session:
+        return preview_upi_payment_link_cleanup(session)
+
+
 def _run_expired_pix_payment_link_cleanup(
     task_id: str,
     cleanup_mode: PixCleanupMode = PIX_CLEANUP_MODE_EXPIRED,
+    payment_type: str = PAYMENT_LINK_TYPE_PIX,
 ) -> None:
-    """Run one verified PIX cleanup and publish its complete operator timeline."""
+    """Run one verified QR-link cleanup and publish its complete timeline."""
 
     mode = normalize_pix_cleanup_mode(cleanup_mode)
+    normalized_type = _normalize_payment_link_cleanup_type(payment_type)
+    type_label = normalized_type.upper()
     cleanup_label = PIX_CLEANUP_MODE_LABELS[mode]
+    preview_fn = preview_pix_payment_link_cleanup if normalized_type == PAYMENT_LINK_TYPE_PIX else preview_upi_payment_link_cleanup
+    clean_fn = clean_pix_payment_links if normalized_type == PAYMENT_LINK_TYPE_PIX else clean_upi_payment_links
     _task_store.mark_running(task_id)
     _task_store.set_progress(task_id, "0/1")
     try:
-        _log(task_id, f"[PIX清理] 开始重新扫描当前实例的{cleanup_label} PIX 支付链接")
+        _log(task_id, f"[{type_label}清理] 开始重新扫描当前实例的{cleanup_label} {type_label} 支付链接")
         with Session(engine) as session:
-            preview = preview_pix_payment_link_cleanup(session, cleanup_mode=mode)
+            preview = preview_fn(session, cleanup_mode=mode)
         preview = dict(preview or {})
         _task_store.update_meta(
             task_id,
@@ -17225,7 +17296,8 @@ def _run_expired_pix_payment_link_cleanup(
             },
         )
 
-        preview_total = max(int(preview.get("current_pix_links") or 0), 0)
+        total_key = "current_pix_links" if normalized_type == PAYMENT_LINK_TYPE_PIX else "current_upi_links"
+        preview_total = max(int(preview.get(total_key) or 0), 0)
         preview_active = max(int(preview.get("active_links") or 0), 0)
         preview_eligible = max(int(preview.get("eligible_links") or 0), 0)
         preview_missing = max(int(preview.get("missing_expiry_links") or 0), 0)
@@ -17234,7 +17306,7 @@ def _run_expired_pix_payment_link_cleanup(
         _log(
             task_id,
             (
-                "[PIX清理] 扫描完成："
+                f"[{type_label}清理] 扫描完成："
                 f"总 {preview_total}；{cleanup_label} {preview_eligible}；"
                 f"时间有效 {preview_active}；缺少时间 {preview_missing}"
             ),
@@ -17242,28 +17314,28 @@ def _run_expired_pix_payment_link_cleanup(
         _log(
             task_id,
             (
-                f"[PIX清理] Stripe 实时查询成功 {preview_direct_success}/{preview_total}；"
+                f"[{type_label}清理] Stripe 实时查询成功 {preview_direct_success}/{preview_total}；"
                 f"本地记录兜底 {preview_direct_fallback}"
             ),
         )
         if mode == PIX_CLEANUP_MODE_EXPIRED and preview_missing:
             _log(
                 task_id,
-                f"[PIX清理] {preview_missing} 条链接缺少有效过期时间，将安全保留",
+                f"[{type_label}清理] {preview_missing} 条链接缺少有效过期时间，将安全保留",
             )
         if preview_eligible:
             _log(
                 task_id,
-                f"[PIX清理] 准备为 {preview_eligible} 条{cleanup_label}链接创建校验备份并执行事务清理",
+                f"[{type_label}清理] 准备为 {preview_eligible} 条{cleanup_label}链接创建校验备份并执行事务清理",
             )
         else:
-            _log(task_id, f"[PIX清理] 当前扫描未发现{cleanup_label}链接，正在进行执行前复核")
+            _log(task_id, f"[{type_label}清理] 当前扫描未发现{cleanup_label}链接，正在进行执行前复核")
 
         with Session(engine) as session:
-            result = clean_pix_payment_links(session, cleanup_mode=mode)
+            result = clean_fn(session, cleanup_mode=mode)
         result = dict(result or {})
 
-        total = max(int(result.get("current_pix_links") or 0), 0)
+        total = max(int(result.get(total_key) or 0), 0)
         active = max(int(result.get("active_links") or 0), 0)
         eligible = max(int(result.get("eligible_links") or 0), 0)
         missing = max(int(result.get("missing_expiry_links") or 0), 0)
@@ -17298,16 +17370,16 @@ def _run_expired_pix_payment_link_cleanup(
             _log(
                 task_id,
                 (
-                    "[PIX清理] 执行完成："
+                    f"[{type_label}清理] 执行完成："
                     f"已清理 {cleaned}；列表索引刷新 {list_state_refreshed}；"
                     f"并发变化跳过 {concurrent_skipped}；"
                     f"备份 {'已创建并校验' if backup_created else '无需创建'}"
                 ),
             )
         else:
-            _log(task_id, f"[PIX清理] 执行前复核确认没有需要清理的{cleanup_label}链接")
+            _log(task_id, f"[{type_label}清理] 执行前复核确认没有需要清理的{cleanup_label}链接")
         if mode == PIX_CLEANUP_MODE_EXPIRED and missing:
-            _log(task_id, f"[PIX清理] 缺少有效过期时间并保留：{missing}")
+            _log(task_id, f"[{type_label}清理] 缺少有效过期时间并保留：{missing}")
 
         _task_store.set_progress(task_id, "1/1")
         _log(task_id, f"[SUMMARY] 总：{total}；保留：{retained}；{cleanup_label}：{eligible}")
@@ -17319,8 +17391,8 @@ def _run_expired_pix_payment_link_cleanup(
             errors=[],
         )
     except Exception as exc:
-        error_text = sanitize_error_message(exc)[:1600] or f"{cleanup_label} PIX 支付链接清理失败"
-        logger.exception("PIX payment-link cleanup task failed task_id=%s mode=%s", task_id, mode)
+        error_text = sanitize_error_message(exc)[:1600] or f"{cleanup_label} {type_label} 支付链接清理失败"
+        logger.exception("payment-link cleanup task failed task_id=%s type=%s mode=%s", task_id, normalized_type, mode)
         _task_store.update_meta(
             task_id,
             {
@@ -17328,7 +17400,7 @@ def _run_expired_pix_payment_link_cleanup(
                 "cleanup_error": error_text,
             },
         )
-        _log(task_id, f"[FAIL] {cleanup_label} PIX 支付链接清理失败：{error_text}")
+        _log(task_id, f"[FAIL] {cleanup_label} {type_label} 支付链接清理失败：{error_text}")
         _task_store.finish(
             task_id,
             status="failed",
@@ -17345,11 +17417,13 @@ def enqueue_expired_pix_payment_link_cleanup_task(
     *,
     background_tasks: BackgroundTasks | None = None,
     cleanup_mode: PixCleanupMode = PIX_CLEANUP_MODE_EXPIRED,
+    payment_type: str = PAYMENT_LINK_TYPE_PIX,
 ) -> dict[str, Any]:
-    """Create or atomically reuse the current instance's active cleanup task."""
+    """Create or atomically reuse one payment rail's active cleanup task."""
 
     mode = normalize_pix_cleanup_mode(cleanup_mode)
-    source = "pix_payment_link_cleanup"
+    normalized_type = _normalize_payment_link_cleanup_type(payment_type)
+    source = "pix_payment_link_cleanup" if normalized_type == PAYMENT_LINK_TYPE_PIX else "upi_payment_link_cleanup"
     instance_id = str(os.getenv("APP_INSTANCE_ID") or "auto-gpt").strip() or "auto-gpt"
     with _PIX_PAYMENT_LINK_CLEANUP_TASK_LOCK:
         for snapshot in _task_store.list_snapshots():
@@ -17358,6 +17432,9 @@ def enqueue_expired_pix_payment_link_cleanup_task(
                 and str(snapshot.get("status") or "").strip().lower() in {"pending", "running"}
             ):
                 active_meta = snapshot.get("meta") if isinstance(snapshot.get("meta"), dict) else {}
+                active_type = _normalize_payment_link_cleanup_type(active_meta.get("payment_type"))
+                if active_type != normalized_type:
+                    continue
                 active_mode = normalize_pix_cleanup_mode(active_meta.get("cleanup_mode"))
                 return {
                     "task_id": str(snapshot.get("id") or ""),
@@ -17367,15 +17444,17 @@ def enqueue_expired_pix_payment_link_cleanup_task(
                     "reused": True,
                     "cleanup_mode": active_mode,
                     "requested_cleanup_mode": mode,
+                    "payment_type": normalized_type,
                 }
 
-        task_id = f"task_{int(time.time() * 1000)}_pix_cleanup_{mode}"
+        task_id = f"task_{int(time.time() * 1000)}_{normalized_type}_cleanup_{mode}"
         meta = {
             "source": source,
             "instance_id": instance_id,
-            "operation": f"{mode}_pix_payment_link_cleanup",
+            "operation": f"{mode}_{normalized_type}_payment_link_cleanup",
             "cleanup_mode": mode,
             "cleanup_label": PIX_CLEANUP_MODE_LABELS[mode],
+            "payment_type": normalized_type,
             "cleanup_state": "queued",
         }
         _create_standalone_task_record(
@@ -17400,15 +17479,20 @@ def enqueue_expired_pix_payment_link_cleanup_task(
                     },
                 ),
             )
+            runner_args = (
+                (task_id, mode)
+                if normalized_type == PAYMENT_LINK_TYPE_PIX
+                else (task_id, mode, normalized_type)
+            )
             if background_tasks is None:
                 thread = threading.Thread(
                     target=_run_expired_pix_payment_link_cleanup,
-                    args=(task_id, mode),
+                    args=runner_args,
                     daemon=True,
                 )
                 thread.start()
             else:
-                background_tasks.add_task(_run_expired_pix_payment_link_cleanup, task_id, mode)
+                background_tasks.add_task(_run_expired_pix_payment_link_cleanup, *runner_args)
         except Exception as exc:
             error_text = sanitize_error_message(exc)[:1600] or f"{PIX_CLEANUP_MODE_LABELS[mode]} PIX 支付链接清理任务创建失败"
             _task_store.finish(
@@ -17429,6 +17513,7 @@ def enqueue_expired_pix_payment_link_cleanup_task(
         "reused": False,
         "cleanup_mode": mode,
         "requested_cleanup_mode": mode,
+        "payment_type": normalized_type,
     }
 
 
@@ -17442,6 +17527,33 @@ def create_chatgpt_expired_pix_payment_link_cleanup_task(
     return enqueue_expired_pix_payment_link_cleanup_task(
         background_tasks=background_tasks,
         cleanup_mode=req.cleanup_mode if req is not None else PIX_CLEANUP_MODE_EXPIRED,
+        payment_type=PAYMENT_LINK_TYPE_PIX,
+    )
+
+
+@router.post("/chatgpt/payment-links/cleanup/task")
+def create_chatgpt_payment_link_cleanup_task(
+    background_tasks: BackgroundTasks,
+    req: PixPaymentLinkCleanupRequest | None = None,
+):
+    request = req or PixPaymentLinkCleanupRequest()
+    return enqueue_expired_pix_payment_link_cleanup_task(
+        background_tasks=background_tasks,
+        cleanup_mode=request.cleanup_mode,
+        payment_type=request.payment_type,
+    )
+
+
+@router.post("/chatgpt/payment-links/upi-cleanup/task")
+def create_chatgpt_upi_payment_link_cleanup_task(
+    background_tasks: BackgroundTasks,
+    req: PixPaymentLinkCleanupRequest | None = None,
+):
+    request = req or PixPaymentLinkCleanupRequest(payment_type=PAYMENT_LINK_TYPE_UPI)
+    return enqueue_expired_pix_payment_link_cleanup_task(
+        background_tasks=background_tasks,
+        cleanup_mode=request.cleanup_mode,
+        payment_type=PAYMENT_LINK_TYPE_UPI,
     )
 
 
@@ -17466,6 +17578,32 @@ def cleanup_chatgpt_expired_pix_payment_links(req: PixPaymentLinkCleanupRequest 
         result.get("backup_created"),
     )
     return result
+
+
+@router.post("/chatgpt/payment-links/cleanup")
+def cleanup_chatgpt_payment_links(req: PixPaymentLinkCleanupRequest | None = None):
+    request = req or PixPaymentLinkCleanupRequest()
+    payment_type = _normalize_payment_link_cleanup_type(request.payment_type)
+    mode = normalize_pix_cleanup_mode(request.cleanup_mode)
+    try:
+        with Session(engine) as session:
+            result = clean_payment_links(session, payment_type=payment_type, cleanup_mode=mode)
+    except Exception as exc:
+        logger.exception("payment-link cleanup failed type=%s mode=%s", payment_type, mode)
+        raise HTTPException(500, f"{PIX_CLEANUP_MODE_LABELS[mode]} {payment_type.upper()} 支付链接清理失败，请检查服务日志") from exc
+    return result
+
+
+@router.post("/chatgpt/payment-links/upi-cleanup")
+def cleanup_chatgpt_upi_payment_links(req: PixPaymentLinkCleanupRequest | None = None):
+    request = req or PixPaymentLinkCleanupRequest(payment_type=PAYMENT_LINK_TYPE_UPI)
+    mode = normalize_pix_cleanup_mode(request.cleanup_mode)
+    try:
+        with Session(engine) as session:
+            return clean_upi_payment_links(session, cleanup_mode=mode)
+    except Exception as exc:
+        logger.exception("UPI payment-link cleanup failed mode=%s", mode)
+        raise HTTPException(500, f"{PIX_CLEANUP_MODE_LABELS[mode]} UPI 支付链接清理失败，请检查服务日志") from exc
 
 
 @router.get("/chatgpt/payment-links/history")

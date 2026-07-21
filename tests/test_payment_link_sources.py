@@ -162,6 +162,68 @@ class PaymentLinkSourceTests(unittest.TestCase):
             self.assertFalse(payment_link_cache_matches(cached, expected))
             self.assertTrue(payment_link_requires_regeneration(cached))
 
+    def test_upi_cache_is_classified_from_payment_method_and_uses_qr_expiry(self):
+        cached = build_payment_link_cache_payload(
+            {
+                "url": "https://payments.stripe.com/upi/instructions/upi-cache",
+                "plan": "plus",
+                "country": "IN",
+                "currency": "INR",
+                "link_type": "hosted",
+                "payment_method_type": "upi",
+                "link_expires_at": 1_784_170_000,
+                "link_expiry_source": "checkout_session",
+                "next_action": {
+                    "upi_handle_redirect_or_display_qr_code": {
+                        "qr_code": {"expires_at": 1_784_170_300}
+                    }
+                },
+                "payment_link_format": "long_link",
+                "payment_source": "long_link",
+                "profile_hash": PROFILE_HASH,
+            },
+            source="long_link",
+        )
+
+        self.assertEqual(cached["link_type"], "upi")
+        self.assertEqual(cached["link_expires_at"], 1_784_170_300)
+        self.assertEqual(cached["link_expiry_source"], "upi_qr_code")
+        expected = normalize_payment_link_params(
+            {
+                "plan": "plus",
+                "country": "IN",
+                "currency": "INR",
+                "payment_link_format": "long_link",
+                "payment_source": "long_link",
+                "profile_hash": PROFILE_HASH,
+            }
+        )
+        with mock.patch("services.chatgpt_core.payment_link_cache.time.time", return_value=1_784_169_900):
+            self.assertTrue(payment_link_cache_matches(cached, expected))
+        with mock.patch("services.chatgpt_core.payment_link_cache.time.time", return_value=1_784_170_241):
+            self.assertFalse(payment_link_cache_matches(cached, expected))
+
+    def test_upi_url_overrides_generic_hosted_type_and_rejects_checkout_expiry(self):
+        cached = build_payment_link_cache_payload(
+            {
+                "url": "https://payments.stripe.com/upi/instructions/upi-url-only",
+                "plan": "plus",
+                "country": "IN",
+                "currency": "INR",
+                "link_type": "hosted",
+                "link_expires_at": 1_784_256_400,
+                "link_expiry_source": "checkout_session",
+                "payment_link_format": "long_link",
+                "payment_source": "long_link",
+                "profile_hash": PROFILE_HASH,
+            },
+            source="long_link",
+        )
+
+        self.assertEqual(cached["link_type"], "upi")
+        self.assertNotIn("link_expires_at", cached)
+        self.assertNotIn("link_expiry_source", cached)
+
     def test_pix_link_already_submitted_to_management_is_not_reused(self):
         cached = build_payment_link_cache_payload(
             {

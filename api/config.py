@@ -187,6 +187,8 @@ CONFIG_KEYS = [
     "chatgpt_register_unique_exit_ip_enabled",
     "chatgpt_local_status_probe_concurrency",
     "chatgpt_local_status_probe_unique_exit_ip_enabled",
+    "chatgpt_local_status_probe_delay_seconds",
+    "chatgpt_local_status_probe_delay_max_seconds",
     "chatgpt_register_otp_wait_seconds",
     "chatgpt_register_otp_resend_wait_seconds",
     "chatgpt_register_otp_account_budget_seconds",
@@ -460,6 +462,10 @@ def _build_config_response(*, local_only: bool = False) -> dict[str, Any]:
         all_cfg["chatgpt_local_status_probe_concurrency"] = "1"
     if not all_cfg.get("chatgpt_local_status_probe_unique_exit_ip_enabled"):
         all_cfg["chatgpt_local_status_probe_unique_exit_ip_enabled"] = "true"
+    if not all_cfg.get("chatgpt_local_status_probe_delay_seconds"):
+        all_cfg["chatgpt_local_status_probe_delay_seconds"] = "0"
+    if not all_cfg.get("chatgpt_local_status_probe_delay_max_seconds"):
+        all_cfg["chatgpt_local_status_probe_delay_max_seconds"] = "0"
     if "chatgpt_save_registration_access_token_account" not in all_cfg:
         all_cfg["chatgpt_save_registration_access_token_account"] = "true"
     if not all_cfg.get("chatgpt_register_otp_wait_seconds"):

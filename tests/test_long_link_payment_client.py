@@ -195,6 +195,63 @@ class LongLinkPaymentClientTests(unittest.TestCase):
 
         self.assertEqual(result["link_expires_at"], 1_784_170_800)
 
+    def test_upi_result_uses_qr_expiry_and_auto_classifies_payment_method(self):
+        result = payment_link_from_remote_job(
+            {
+                "batch_id": "batch_" + "u" * 32,
+                "job_id": "job-upi",
+                "request_id": "task:upi",
+                "status": "done",
+                "profile_hash": PROFILE_HASH,
+                "completed_at": 1_720_000_000,
+                "result": {
+                    "long_url": "https://payments.stripe.com/upi/instructions/upi-test",
+                    "link_type": "hosted",
+                    "payment_method_type": "upi",
+                    "billing_country": "IN",
+                    "currency": "INR",
+                    "link_expires_at": 1_784_170_000,
+                    "link_expiry_source": "checkout_session",
+                    "next_action": {
+                        "upi_handle_redirect_or_display_qr_code": {
+                            "qr_code": {"expires_at": 1_784_170_300}
+                        }
+                    },
+                },
+            },
+            profile={"profile_hash": PROFILE_HASH, "link_type": "upi", "country": "IN", "currency": "INR"},
+        )
+
+        self.assertEqual(result["link_type"], "upi")
+        self.assertEqual(result["payment_method_type"], "upi")
+        self.assertEqual(result["link_expires_at"], 1_784_170_300)
+        self.assertEqual(result["link_expiry_source"], "upi_qr_code")
+
+    def test_upi_url_classification_does_not_accept_checkout_session_expiry(self):
+        result = payment_link_from_remote_job(
+            {
+                "batch_id": "batch_" + "v" * 32,
+                "job_id": "job-upi-url",
+                "request_id": "task:upi-url",
+                "status": "done",
+                "profile_hash": PROFILE_HASH,
+                "completed_at": 1_720_000_000,
+                "result": {
+                    "long_url": "https://payments.stripe.com/upi/instructions/upi-url",
+                    "link_type": "hosted",
+                    "billing_country": "IN",
+                    "currency": "INR",
+                    "link_expires_at": 1_784_256_400,
+                    "link_expiry_source": "checkout_session",
+                },
+            },
+            profile={"profile_hash": PROFILE_HASH, "link_type": "hosted", "country": "IN", "currency": "INR"},
+        )
+
+        self.assertEqual(result["link_type"], "upi")
+        self.assertNotIn("link_expires_at", result)
+        self.assertNotIn("link_expiry_source", result)
+
     def test_team_profile_and_batch_send_identical_profile_overrides(self):
         token = "eyJteam.payload.signature"
         overrides = {

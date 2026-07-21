@@ -19,6 +19,7 @@ export const TASK_SOURCE_LABELS: Record<string, string> = {
   chatgpt_oaipay_approval: 'OaiPay授权链接',
   batch_payment_link: '批量支付链接生成',
   pix_payment_link_cleanup: '过期 PIX 链接清理',
+  upi_payment_link_cleanup: 'UPI 链接清理',
   gopay_payment: 'GoPay支付',
   idea_oaipay_pipeline: '账号处理流水线',
 }

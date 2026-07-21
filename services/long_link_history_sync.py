@@ -18,12 +18,17 @@ import sqlite3
 from typing import Any, Iterable
 from urllib.parse import urlsplit
 
-from services.chatgpt_core.payment_link_cache import PIX_CLEANED_STATUSES
+from services.chatgpt_core.payment_link_cache import (
+    PAYMENT_LINK_CLEANED_STATUSES,
+    payment_link_type_from_payload,
+)
 
 
 SYNC_NAME = "long_link_history_sync"
 SYNC_TASK_ID = "long_link_history_sync"
 SOURCE_TABLE = "long_link_success_history"
+UPI_QR_VALIDITY_SECONDS = 5 * 60
+UPI_QR_HISTORY_TOLERANCE_SECONDS = 60
 _TARGET_ACCOUNT_COLUMNS = {"id", "platform", "email", "cashier_url", "extra_json", "updated_at"}
 _TARGET_GENERATION_COLUMNS = {
     "id",
@@ -303,13 +308,35 @@ def _parse_source_rows(connection: sqlite3.Connection) -> tuple[list[SourceLink]
             expiry = int(float(link_expires_at)) if link_expires_at not in (None, "") else None
         except (TypeError, ValueError):
             expiry = None
+        normalized_method_type = _normalized_payment_method_type(payment_method_type)
+        normalized_link_type = _normalized_link_type(link_type)
+        classified_type = payment_link_type_from_payload(
+            {
+                "link_type": normalized_link_type,
+                "payment_method_type": normalized_method_type,
+                "url": normalized_url,
+            }
+        )
+        if classified_type in {"pix", "upi"}:
+            normalized_link_type = classified_type
+        completed_epoch = int(float(completed_at))
+        if (
+            normalized_link_type == "upi"
+            and expiry is not None
+            and expiry > completed_epoch + UPI_QR_VALIDITY_SECONDS + UPI_QR_HISTORY_TOLERANCE_SECONDS
+        ):
+            # The source table predates expiry provenance.  A value well beyond
+            # UPI's five-minute window is a Checkout Session deadline, not the
+            # QR deadline requested by the current-link contract.
+            counters["upi_checkout_expiry_ignored"] += 1
+            expiry = None
         rows.append(
             SourceLink(
                 job_id=normalized_job_id,
-                completed_at=int(float(completed_at)),
+                completed_at=completed_epoch,
                 account_email=normalized_email,
                 url=normalized_url,
-                link_type=_normalized_link_type(link_type),
+                link_type=normalized_link_type,
                 source=_safe_text(source, limit=40) or "unknown",
                 billing_country=_safe_text(billing_country, limit=16).upper(),
                 currency=_safe_text(currency, limit=16).upper(),
@@ -435,8 +462,13 @@ def _record_payload(source: SourceLink) -> dict[str, Any]:
         payload["payment_method_type"] = source.payment_method_type
     if source.cs_id:
         payload["cs_id"] = source.cs_id
-    if source.link_expires_at is not None and source.link_type == "pix":
+    if source.link_expires_at is not None and source.link_type in {"pix", "upi"}:
         payload["link_expires_at"] = source.link_expires_at
+        if source.link_type == "upi":
+            # The upstream history table stores the normalized scalar only;
+            # its UPI producer derives it from
+            # setup_intent.next_action...qr_code.expires_at.
+            payload["link_expiry_source"] = "upi_qr_code"
     if source.link_type == "paypal" or "paypal" in source.payment_method_type:
         payload["paypal_url"] = source.url
     return payload
@@ -455,7 +487,7 @@ def _current_cache_should_be_replaced(extra: dict[str, Any], source: SourceLink)
     if not isinstance(current, dict):
         return True
     current_time = _timestamp_for_compare(current.get("generated_at") or current.get("created_at"))
-    if _safe_text(current.get("link_status"), limit=64).lower() in PIX_CLEANED_STATUSES:
+    if _safe_text(current.get("link_status"), limit=64).lower() in PAYMENT_LINK_CLEANED_STATUSES:
         # Cleanup deliberately leaves a URL-free tombstone. Historical rows at
         # or before that generation must not resurrect the cleared current link;
         # a genuinely newer source record may replace it normally.
