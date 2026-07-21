@@ -2342,7 +2342,8 @@ def apply_account_list_state_sort(
         if field == ACCOUNT_SORT_CREATED_AT:
             created_at_order = order
             created_at = AccountModel.created_at
-            order_by.append(created_at.is_(None).asc())
+            # AccountModel.created_at is NOT NULL and this exact expression
+            # keeps SQLite eligible for the (platform, created_at, id) index.
             order_by.append(created_at.desc() if order == "desc" else created_at.asc())
 
     order_by.append(AccountModel.id.desc() if created_at_order == "desc" else AccountModel.id.asc())

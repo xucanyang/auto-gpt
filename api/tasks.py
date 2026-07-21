@@ -1,6 +1,7 @@
 from collections import deque
 from datetime import datetime, timezone
 import hashlib
+import math
 import os
 import uuid
 from urllib.parse import urlsplit
@@ -112,6 +113,7 @@ MAX_FINISHED_TASKS = 200
 CLEANUP_THRESHOLD = 250
 PHONE_BINDING_MAX_CONCURRENCY = 5
 LOCAL_STATUS_PROBE_MAX_CONCURRENCY = 10
+LOCAL_STATUS_PROBE_MAX_DELAY_SECONDS = 3600.0
 _task_store = RegisterTaskStore(
     max_finished_tasks=MAX_FINISHED_TASKS,
     cleanup_threshold=CLEANUP_THRESHOLD,
@@ -3895,9 +3897,12 @@ def _prepare_batch_probe_local_status_params(
 
     def _coerce_probe_delay(value: Any) -> float:
         try:
-            return max(float(value or 0), 0.0)
+            parsed = float(value or 0)
         except (TypeError, ValueError):
             return 0.0
+        if not math.isfinite(parsed):
+            return 0.0
+        return max(min(parsed, LOCAL_STATUS_PROBE_MAX_DELAY_SECONDS), 0.0)
 
     delay_min = _first_batch_probe_param(params, "delay_seconds", "probe_delay_seconds")
     delay_max = _first_batch_probe_param(params, "delay_max_seconds", "probe_delay_max_seconds")
@@ -3925,12 +3930,9 @@ def _prepare_batch_probe_local_status_params(
     )
     unique_exit_ip_requested = _coerce_batch_probe_bool(
         raw_unique_exit_ip,
-        default=(
-            requested_concurrency > 1
-            and _coerce_batch_probe_bool(
-                config.get("chatgpt_local_status_probe_unique_exit_ip_enabled"),
-                default=True,
-            )
+        default=_coerce_batch_probe_bool(
+            config.get("chatgpt_local_status_probe_unique_exit_ip_enabled"),
+            default=True,
         ),
     )
     unique_exit_ip_enabled = bool(unique_exit_ip_requested and account_count > 1)
@@ -3951,6 +3953,55 @@ def _prepare_batch_probe_local_status_params(
         _first_batch_probe_param(params, "proxy_failover", "probe_proxy_failover"),
         default=_coerce_batch_probe_bool(config.get("task_proxy_failover"), default=False),
     )
+
+    def _set_global_proxy_param(keys: tuple[str, ...], value: Any) -> None:
+        if value is None or value == "":
+            return
+        if _first_batch_probe_param(params, *keys) is None:
+            params[keys[0]] = value
+
+    # Freeze the effective global network contract at task creation. Explicit
+    # API parameters still win, while workers no longer observe mid-task
+    # changes to shared proxy settings.
+    if _first_batch_probe_param(params, "proxy_mode", "register_proxy_mode", "probe_proxy_mode") is None:
+        params["proxy_mode"] = mode
+    if _first_batch_probe_param(params, "proxy_failover", "register_proxy_failover", "probe_proxy_failover") is None:
+        params["proxy_failover"] = "true" if failover else "false"
+
+    if mode == "specified":
+        _set_global_proxy_param(
+            ("proxy",),
+            config.get("task_proxy_url"),
+        )
+        _set_global_proxy_param(
+            ("proxy_country_code", "register_proxy_country_code", "probe_proxy_country_code"),
+            config.get("task_proxy_country_code"),
+        )
+    elif mode == "dynamic":
+        dynamic_template = config.get("dynamic_proxy_template") or config.get("task_proxy_url")
+        dynamic_country = config.get("dynamic_proxy_default_country") or config.get("task_proxy_country_code")
+        _set_global_proxy_param(("dynamic_proxy_template", "proxy", "proxy_url", "probe_proxy"), dynamic_template)
+        _set_global_proxy_param(
+            ("proxy_country_code", "register_proxy_country_code", "probe_proxy_country_code"),
+            dynamic_country,
+        )
+        for key in (
+            "dynamic_proxy_probe_enabled",
+            "dynamic_proxy_require_country_match",
+            "dynamic_proxy_probe_timeout_seconds",
+            "dynamic_proxy_ip_retention_minutes",
+            "dynamic_proxy_max_attempts",
+        ):
+            _set_global_proxy_param((key,), config.get(key))
+    else:
+        _set_global_proxy_param(
+            ("proxy_country_code", "register_proxy_country_code", "probe_proxy_country_code"),
+            config.get("task_proxy_country_code"),
+        )
+
+    _set_global_proxy_param(("proxy_max_candidates", "register_proxy_max_candidates", "probe_proxy_max_candidates"), config.get("task_proxy_max_candidates") or config.get("proxy_pool_max_candidates"))
+    _set_global_proxy_param(("proxy_min_score", "register_proxy_min_score", "probe_proxy_min_score"), config.get("task_proxy_min_score") or config.get("proxy_scan_min_score"))
+
     if unique_exit_ip_enabled:
         if mode == "direct":
             raise HTTPException(
@@ -3989,7 +4040,6 @@ def _prepare_batch_probe_local_status_params(
 
     params["concurrency"] = requested_concurrency
     params["unique_exit_ip_enabled"] = unique_exit_ip_enabled
-    params.setdefault("proxy_mode", mode)
     settings = {
         "requested_concurrency": requested_concurrency,
         "effective_concurrency": effective_concurrency,
@@ -15166,9 +15216,12 @@ def _run_batch_probe_local_status(task_id: str, account_ids: list[int], params: 
 
     def _coerce_delay(value: Any) -> float:
         try:
-            return max(float(value or 0), 0.0)
+            parsed = float(value or 0)
         except (TypeError, ValueError):
             return 0.0
+        if not math.isfinite(parsed):
+            return 0.0
+        return max(min(parsed, LOCAL_STATUS_PROBE_MAX_DELAY_SECONDS), 0.0)
 
     delay_min = _coerce_delay(runtime_params.get("delay_seconds") or runtime_params.get("probe_delay_seconds"))
     delay_max = _coerce_delay(runtime_params.get("delay_max_seconds") or runtime_params.get("probe_delay_max_seconds"))

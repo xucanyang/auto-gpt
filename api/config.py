@@ -1,4 +1,5 @@
 import os
+import math
 from pathlib import Path
 from typing import Any
 
@@ -283,6 +284,98 @@ class AppleMailImportRequest(BaseModel):
     filename: str = ""
     pool_dir: str = ""
     bind_to_config: bool = True
+
+
+_LOCAL_STATUS_PROBE_MAX_CONCURRENCY = 10
+_LOCAL_STATUS_PROBE_MAX_DELAY_SECONDS = 3600.0
+
+
+def _config_bool(value: Any, *, default: bool = False) -> bool:
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on", "y", "是", "开启", "启用"}:
+        return True
+    if text in {"0", "false", "no", "off", "n", "否", "关闭", "禁用"}:
+        return False
+    return default
+
+
+def _normalize_probe_delay_config(value: Any, label: str) -> str:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(400, f"{label}必须是 0 到 3600 之间的有限数字") from exc
+    if not math.isfinite(parsed) or parsed < 0 or parsed > _LOCAL_STATUS_PROBE_MAX_DELAY_SECONDS:
+        raise HTTPException(400, f"{label}必须是 0 到 3600 之间的有限数字")
+    return str(int(parsed)) if parsed.is_integer() else str(parsed)
+
+
+def _normalize_local_status_probe_update(safe: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
+    """Normalize and validate the global local-status probe contract atomically."""
+    probe_keys = {
+        "chatgpt_local_status_probe_concurrency",
+        "chatgpt_local_status_probe_unique_exit_ip_enabled",
+        "chatgpt_local_status_probe_delay_seconds",
+        "chatgpt_local_status_probe_delay_max_seconds",
+        "task_proxy_mode",
+        "task_proxy_failover",
+    }
+    if not probe_keys.intersection(safe):
+        return safe
+
+    merged = dict(current or {})
+    merged.update(safe)
+
+    if "chatgpt_local_status_probe_concurrency" in safe:
+        raw = safe["chatgpt_local_status_probe_concurrency"]
+        try:
+            parsed = float(raw)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(400, "本地状态同步并发必须是 1 到 10 的整数") from exc
+        if not math.isfinite(parsed) or not parsed.is_integer() or not 1 <= parsed <= _LOCAL_STATUS_PROBE_MAX_CONCURRENCY:
+            raise HTTPException(400, "本地状态同步并发必须是 1 到 10 的整数")
+        safe["chatgpt_local_status_probe_concurrency"] = str(int(parsed))
+
+    if "chatgpt_local_status_probe_unique_exit_ip_enabled" in safe:
+        safe["chatgpt_local_status_probe_unique_exit_ip_enabled"] = (
+            "true" if _config_bool(safe["chatgpt_local_status_probe_unique_exit_ip_enabled"], default=True) else "false"
+        )
+
+    for key, label in (
+        ("chatgpt_local_status_probe_delay_seconds", "本地状态同步最小延时"),
+        ("chatgpt_local_status_probe_delay_max_seconds", "本地状态同步最大延时"),
+    ):
+        if key in safe:
+            safe[key] = _normalize_probe_delay_config(safe[key], label)
+
+    merged.update(safe)
+
+    def _effective_delay(value: Any) -> float:
+        try:
+            parsed = float(value or 0)
+        except (TypeError, ValueError):
+            return 0.0
+        return parsed if math.isfinite(parsed) and parsed >= 0 else 0.0
+
+    min_delay = _effective_delay(merged.get("chatgpt_local_status_probe_delay_seconds"))
+    max_delay = _effective_delay(merged.get("chatgpt_local_status_probe_delay_max_seconds"))
+    if max_delay < min_delay:
+        raise HTTPException(400, "本地状态同步最大延时不能小于最小延时")
+
+    mode = str(merged.get("task_proxy_mode") or "dynamic").strip().lower()
+    unique_exit_ip = _config_bool(
+        merged.get("chatgpt_local_status_probe_unique_exit_ip_enabled"),
+        default=True,
+    )
+    failover = _config_bool(merged.get("task_proxy_failover"), default=False)
+    if unique_exit_ip and mode in {"direct", "none", "no_proxy", "直连"}:
+        raise HTTPException(400, "直连模式不能满足本地状态同步的独立出口 IP 要求，请关闭该开关或改用代理模式")
+    if unique_exit_ip and mode in {"specified", "manual", "explicit"} and not failover:
+        raise HTTPException(400, "指定代理模式开启独立出口 IP 时必须开启失败切换，或关闭独立出口要求")
+    return safe
 
 
 def _default_tempmail_archive_backup_path() -> str:
@@ -766,7 +859,9 @@ def get_shared_config_audit(limit: int = 50):
 def update_config(body: ConfigUpdate):
     # 只允许更新已知 key
     safe = {k: v for k, v in body.data.items() if k in CONFIG_KEYS}
-    safe = normalize_dynamic_proxy_update(safe, config_store.get_all())
+    current_config = config_store.get_all()
+    safe = normalize_dynamic_proxy_update(safe, current_config)
+    safe = _normalize_local_status_probe_update(safe, current_config)
     if "dynamic_proxy_ip_retention_minutes" in safe:
         try:
             from core.dynamic_proxy import normalize_retention_minutes

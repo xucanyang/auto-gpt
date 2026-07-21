@@ -200,6 +200,86 @@ class ProbeLocalStatusBatchConfigTests(unittest.TestCase):
         self.assertEqual(settings["delay_seconds"], 1.5)
         self.assertEqual(settings["delay_max_seconds"], 3.0)
 
+    def test_prepare_batch_probe_honors_global_unique_exit_with_serial_concurrency(self):
+        from api.tasks import _prepare_batch_probe_local_status_params
+
+        with mock.patch(
+            "core.config_store.config_store.get_all",
+            return_value={
+                "task_proxy_mode": "dynamic",
+                "dynamic_proxy_max_attempts": "2",
+                "chatgpt_local_status_probe_unique_exit_ip_enabled": "true",
+            },
+        ):
+            params, settings = _prepare_batch_probe_local_status_params({}, eligible_count=2)
+
+        self.assertEqual(params["concurrency"], 1)
+        self.assertTrue(params["unique_exit_ip_enabled"])
+        self.assertTrue(settings["unique_exit_ip_requested"])
+
+    def test_prepare_batch_probe_bounds_non_finite_delays(self):
+        from api.tasks import _prepare_batch_probe_local_status_params
+
+        with mock.patch(
+            "core.config_store.config_store.get_all",
+            return_value={"task_proxy_mode": "dynamic", "chatgpt_local_status_probe_unique_exit_ip_enabled": "false"},
+        ):
+            params, _settings = _prepare_batch_probe_local_status_params(
+                {"delay_seconds": "inf", "delay_max_seconds": "99999"},
+                eligible_count=2,
+            )
+
+        self.assertEqual(params["delay_seconds"], 0.0)
+        self.assertEqual(params["delay_max_seconds"], 3600.0)
+
+    def test_config_api_normalizes_local_status_probe_values(self):
+        from api import config as config_api
+
+        current = {
+            "task_proxy_mode": "dynamic",
+            "task_proxy_failover": "true",
+            "chatgpt_local_status_probe_unique_exit_ip_enabled": "true",
+            "chatgpt_local_status_probe_delay_seconds": "0",
+            "chatgpt_local_status_probe_delay_max_seconds": "0",
+        }
+        with mock.patch.object(config_api.config_store, "get_all", return_value=current), mock.patch.object(
+            config_api.config_store, "set_many"
+        ) as set_many:
+            config_api.update_config(
+                config_api.ConfigUpdate(
+                    data={
+                        "chatgpt_local_status_probe_concurrency": "3.0",
+                        "chatgpt_local_status_probe_unique_exit_ip_enabled": "false",
+                        "chatgpt_local_status_probe_delay_seconds": "1.5",
+                        "chatgpt_local_status_probe_delay_max_seconds": "3",
+                    }
+                )
+            )
+
+        saved = set_many.call_args.args[0]
+        self.assertEqual(saved["chatgpt_local_status_probe_concurrency"], "3")
+        self.assertEqual(saved["chatgpt_local_status_probe_unique_exit_ip_enabled"], "false")
+        self.assertEqual(saved["chatgpt_local_status_probe_delay_seconds"], "1.5")
+        self.assertEqual(saved["chatgpt_local_status_probe_delay_max_seconds"], "3")
+
+    def test_config_api_rejects_incompatible_direct_mode(self):
+        from api import config as config_api
+
+        with mock.patch.object(
+            config_api.config_store,
+            "get_all",
+            return_value={
+                "task_proxy_mode": "dynamic",
+                "task_proxy_failover": "true",
+                "chatgpt_local_status_probe_unique_exit_ip_enabled": "true",
+            },
+        ), mock.patch.object(config_api.config_store, "set_many") as set_many:
+            with self.assertRaises(HTTPException) as error:
+                config_api.update_config(config_api.ConfigUpdate(data={"task_proxy_mode": "direct"}))
+
+        self.assertEqual(error.exception.status_code, 400)
+        set_many.assert_not_called()
+
     def test_prepare_batch_probe_rejects_direct_mode_with_unique_exit_requirement(self):
         from api.tasks import _prepare_batch_probe_local_status_params
 

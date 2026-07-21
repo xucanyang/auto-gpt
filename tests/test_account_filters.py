@@ -1345,6 +1345,22 @@ class AccountFilterSortTests(unittest.TestCase):
 
         self.assertIn("idx_accounts_platform_created_at_id", indexes)
 
+    def test_default_registration_sort_uses_index_without_temp_sort(self):
+        init_db()
+        query = apply_account_list_state_sort(
+            select(AccountModel).where(AccountModel.platform == "chatgpt")
+        ).limit(20)
+        sql = str(query.compile(engine, compile_kwargs={"literal_binds": True}))
+
+        with Session(engine) as session:
+            plan = "\n".join(
+                str(row[3])
+                for row in session.exec(text(f"EXPLAIN QUERY PLAN {sql}")).all()
+            )
+
+        self.assertIn("idx_accounts_platform_created_at_id", plan)
+        self.assertNotIn("USE TEMP B-TREE FOR ORDER BY", plan)
+
 
 if __name__ == "__main__":
     unittest.main()

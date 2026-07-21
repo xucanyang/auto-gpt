@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { App, Card, Form, Input, Select, Button, message, Tabs, Space, Tag, Typography, Modal, QRCode, Switch, Alert, Table, Grid, Spin } from 'antd'
+import { App, Card, Form, Input, InputNumber, Select, Button, message, Tabs, Space, Tag, Typography, Modal, QRCode, Switch, Alert, Table, Grid, Spin } from 'antd'
 import type { FormInstance } from 'antd'
 import {
   SaveOutlined,
@@ -1178,6 +1178,8 @@ function ConfigField({ field }: { field: FieldConfig }) {
         ? '仅用于代理池筛选，或“手动指定代理 + 失败切换代理池”；动态代理模式不会读取本项。'
       : field.key === 'task_proxy_failover'
         ? '动态模式开启后会刷新 sid 生成下一个出口；手动指定代理开启后会回退到代理池候选。'
+      : field.key === 'chatgpt_local_status_probe_unique_exit_ip_enabled'
+        ? '按任务内真实出口 IP 去重；需要多个候选代理。直连模式或不可切换的单个指定代理无法满足该要求。'
       : field.key === 'task_proxy_max_candidates'
         ? '代理池或指定代理 failover 时最多尝试的候选数量。'
       : field.key === 'task_proxy_min_score'
@@ -1289,6 +1291,10 @@ function ConfigField({ field }: { field: FieldConfig }) {
         <Select options={options} style={{ width: '100%' }} />
       ) : isBooleanField ? (
         <Switch checkedChildren="开启" unCheckedChildren="关闭" disabled={field.disabled} />
+      ) : field.key === 'chatgpt_local_status_probe_concurrency' ? (
+        <InputNumber min={1} max={10} precision={0} style={{ width: '100%' }} placeholder={field.placeholder} />
+      ) : field.key === 'chatgpt_local_status_probe_delay_seconds' || field.key === 'chatgpt_local_status_probe_delay_max_seconds' ? (
+        <InputNumber min={0} max={3600} precision={2} step={0.5} style={{ width: '100%' }} placeholder={field.placeholder} />
       ) : field.secret ? (
         <Input.Password
           placeholder={field.placeholder}
@@ -3991,6 +3997,20 @@ export default function Settings() {
         data.task_proxy_min_score = data.proxy_scan_min_score || '50'
       }
       data.task_proxy_failover = data.task_proxy_failover === '' ? false : parseBooleanConfigValue(data.task_proxy_failover)
+      if (!data.chatgpt_local_status_probe_concurrency) {
+        data.chatgpt_local_status_probe_concurrency = '1'
+      }
+      data.chatgpt_local_status_probe_unique_exit_ip_enabled =
+        data.chatgpt_local_status_probe_unique_exit_ip_enabled === '' ||
+        data.chatgpt_local_status_probe_unique_exit_ip_enabled === undefined
+          ? true
+          : parseBooleanConfigValue(data.chatgpt_local_status_probe_unique_exit_ip_enabled)
+      if (data.chatgpt_local_status_probe_delay_seconds === undefined || data.chatgpt_local_status_probe_delay_seconds === '') {
+        data.chatgpt_local_status_probe_delay_seconds = '0'
+      }
+      if (data.chatgpt_local_status_probe_delay_max_seconds === undefined || data.chatgpt_local_status_probe_delay_max_seconds === '') {
+        data.chatgpt_local_status_probe_delay_max_seconds = '0'
+      }
       if (String(data.task_proxy_mode).trim().toLowerCase() === 'dynamic') {
         // 只在内存中兼容旧配置，访问 Settings 不会因此改共享 revision。
         if (!data.dynamic_proxy_template && data.task_proxy_url) {
@@ -4176,6 +4196,34 @@ export default function Settings() {
       values.task_proxy_url = String(values.task_proxy_url || '').trim()
       values.task_proxy_country_code = String(values.task_proxy_country_code || '').trim().toUpperCase().slice(0, 2)
       values.task_proxy_failover = parseBooleanConfigValue(values.task_proxy_failover)
+      const localProbeConcurrency = Number.parseInt(String(values.chatgpt_local_status_probe_concurrency || '1'), 10)
+      values.chatgpt_local_status_probe_concurrency = String(
+        Math.max(1, Math.min(10, Number.isFinite(localProbeConcurrency) ? localProbeConcurrency : 1)),
+      )
+      values.chatgpt_local_status_probe_unique_exit_ip_enabled = parseBooleanConfigValue(
+        values.chatgpt_local_status_probe_unique_exit_ip_enabled === undefined
+          ? true
+          : values.chatgpt_local_status_probe_unique_exit_ip_enabled,
+      )
+      const normalizeLocalProbeDelay = (value: unknown) => {
+        const parsed = Number(value)
+        if (!Number.isFinite(parsed)) return '0'
+        return String(Math.max(0, Math.min(3600, parsed)))
+      }
+      values.chatgpt_local_status_probe_delay_seconds = normalizeLocalProbeDelay(
+        values.chatgpt_local_status_probe_delay_seconds,
+      )
+      values.chatgpt_local_status_probe_delay_max_seconds = normalizeLocalProbeDelay(
+        values.chatgpt_local_status_probe_delay_max_seconds,
+      )
+      if (
+        Number(values.chatgpt_local_status_probe_delay_max_seconds) <
+        Number(values.chatgpt_local_status_probe_delay_seconds)
+      ) {
+        setActiveTab('register')
+        message.error('本地状态同步最大延时不能小于最小延时')
+        return
+      }
       values.task_proxy_max_candidates = String(
         Math.max(1, Math.min(100, Number.parseInt(String(values.task_proxy_max_candidates || '5'), 10) || 5)),
       )
@@ -4202,6 +4250,20 @@ export default function Settings() {
       } else if (values.task_proxy_mode === 'specified' && !values.task_proxy_url) {
         setActiveTab('register')
         message.error('手动指定代理模式必须填写指定代理地址')
+        return
+      }
+      if (values.chatgpt_local_status_probe_unique_exit_ip_enabled && values.task_proxy_mode === 'direct') {
+        setActiveTab('register')
+        message.error('直连模式不能满足本地状态同步的独立出口 IP 要求，请关闭该开关或改用代理模式')
+        return
+      }
+      if (
+        values.chatgpt_local_status_probe_unique_exit_ip_enabled &&
+        values.task_proxy_mode === 'specified' &&
+        !values.task_proxy_failover
+      ) {
+        setActiveTab('register')
+        message.error('指定代理模式开启独立出口 IP 时必须开启失败切换，或关闭独立出口要求')
         return
       }
       values.dynamic_proxy_default_country = dynamicProxyCountry || 'JP'

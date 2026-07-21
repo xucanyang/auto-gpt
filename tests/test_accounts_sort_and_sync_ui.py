@@ -31,3 +31,7 @@ def test_account_page_has_one_local_status_action_and_global_sync_settings():
     assert "chatgpt_local_status_probe_unique_exit_ip_enabled" in settings
     assert "chatgpt_local_status_probe_delay_seconds" in settings
     assert "chatgpt_local_status_probe_delay_max_seconds" in settings
+    assert "parseBooleanConfigValue(data.chatgpt_local_status_probe_unique_exit_ip_enabled)" in settings
+    assert "InputNumber min={1} max={10}" in settings
+    assert "最大延时不能小于最小延时" in settings
+    assert "直连模式不能满足本地状态同步的独立出口 IP 要求" in settings
