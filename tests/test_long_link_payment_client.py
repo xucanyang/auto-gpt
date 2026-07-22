@@ -1,4 +1,6 @@
+import os
 import unittest
+from unittest import mock
 
 from services.chatgpt_core.long_link_payment_client import (
     LongLinkPaymentClient,
@@ -100,9 +102,9 @@ class LongLinkPaymentClientTests(unittest.TestCase):
         self.assertEqual(submitted["batch_id"], batch_id)
         self.assertEqual(polled["status"], "done")
         self.assertEqual([call[0] for call in session.calls], ["GET", "POST", "GET"])
-        self.assertTrue(session.calls[0][1].endswith("/api/internal/payment-links/profile"))
-        self.assertTrue(session.calls[1][1].endswith("/api/internal/payment-links/batches"))
-        self.assertTrue(session.calls[2][1].endswith(f"/api/internal/payment-links/batches/{batch_id}"))
+        self.assertTrue(session.calls[0][1].endswith("/api/v1/payment-links/profile"))
+        self.assertTrue(session.calls[1][1].endswith("/api/v1/payment-links/batches"))
+        self.assertTrue(session.calls[2][1].endswith(f"/api/v1/payment-links/batches/{batch_id}"))
         self.assertEqual(
             session.calls[1][2]["json"],
             {
@@ -113,7 +115,89 @@ class LongLinkPaymentClientTests(unittest.TestCase):
                 ],
             },
         )
-        self.assertEqual(session.calls[1][2]["headers"]["X-Internal-API-Key"], "internal-key")
+        self.assertEqual(session.calls[1][2]["headers"]["Authorization"], "Bearer internal-key")
+        self.assertNotIn("X-Internal-API-Key", session.calls[1][2]["headers"])
+
+    def test_v1_404_falls_back_once_to_legacy_routes(self):
+        profile_payload = {
+            "ok": True,
+            "link_type": "hosted",
+            "profile_hash": PROFILE_HASH,
+            "effective_concurrency": 2,
+            "profile": {"billing_country": "US", "currency": "USD"},
+        }
+        session = _Session(
+            [
+                _Response(404, {"detail": "Not Found"}),
+                _Response(200, profile_payload),
+                _Response(200, profile_payload),
+            ]
+        )
+        client = LongLinkPaymentClient(
+            base_url="http://long-link.test",
+            api_key="legacy-key",
+            session=session,
+            profile_cache_seconds=0,
+        )
+
+        client.get_profile(force_refresh=True)
+        client.get_profile(force_refresh=True)
+
+        self.assertEqual(client.api_version, "legacy")
+        self.assertEqual(len(session.calls), 3)
+        self.assertTrue(session.calls[0][1].endswith("/api/v1/payment-links/profile"))
+        self.assertEqual(session.calls[0][2]["headers"]["Authorization"], "Bearer legacy-key")
+        self.assertTrue(session.calls[1][1].endswith("/api/internal/payment-links/profile"))
+        self.assertTrue(session.calls[2][1].endswith("/api/internal/payment-links/profile"))
+        self.assertEqual(session.calls[1][2]["headers"]["X-Internal-API-Key"], "legacy-key")
+        self.assertNotIn("Authorization", session.calls[1][2]["headers"])
+
+    def test_v1_auth_error_does_not_fall_back_or_echo_key(self):
+        api_key = "opll_live_do-not-echo"
+        session = _Session([_Response(401, {"detail": f"bad credential {api_key}"})])
+        client = LongLinkPaymentClient(
+            base_url="https://pay.example.test",
+            api_key=api_key,
+            session=session,
+            profile_cache_seconds=0,
+        )
+
+        with self.assertRaises(LongLinkPaymentError) as raised:
+            client.get_profile(force_refresh=True)
+
+        self.assertEqual(len(session.calls), 1)
+        self.assertNotIn(api_key, str(raised.exception))
+        self.assertIn("HTTP 401", str(raised.exception))
+
+    def test_runtime_config_precedes_environment_values(self):
+        configured = {
+            "openai_pay_long_link_base_url": "https://pay.example.test/",
+            "openai_pay_long_link_api_key": "opll_live_shared",
+        }
+        with mock.patch(
+            "core.config_store.config_store.get",
+            side_effect=lambda key, default="": configured.get(key, default),
+        ), mock.patch.dict(
+            os.environ,
+            {
+                "OPENAI_PAY_LONG_LINK_BASE_URL": "http://legacy.internal:8788",
+                "OPENAI_PAY_LONG_LINK_API_KEY": "legacy-env-key",
+            },
+        ):
+            client = LongLinkPaymentClient.from_env()
+
+        self.assertEqual(client.base_url, "https://pay.example.test")
+        self.assertEqual(client.api_key, "opll_live_shared")
+
+    def test_invalid_service_url_is_rejected_without_echoing_credentials(self):
+        with self.assertRaises(LongLinkPaymentError) as raised:
+            LongLinkPaymentClient(
+                base_url="https://user:password@pay.example.test?token=secret",
+                api_key="opll_live_test",
+            )
+
+        self.assertNotIn("password", str(raised.exception))
+        self.assertNotIn("secret", str(raised.exception))
 
     def test_rejects_mismatched_batch_handles_without_echoing_access_token(self):
         token = "eyJsecret.payload.signature"

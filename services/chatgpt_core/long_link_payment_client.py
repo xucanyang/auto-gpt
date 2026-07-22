@@ -1,8 +1,8 @@
-"""Internal client for admin-configured payment links from openai-pay-long-link.
+"""Service client for admin-configured payment links from openai-pay-long-link.
 
 The long-link service owns every payment setting.  Auto-GPT sends only an
 account access token plus a stable request id, then persists the redacted batch
-result returned by the internal API.
+result returned by the versioned service API.
 """
 
 from __future__ import annotations
@@ -36,9 +36,14 @@ DEFAULT_PROFILE_CACHE_SECONDS = 30.0
 UPI_QR_VALIDITY_SECONDS = 5 * 60
 UPI_QR_EXPIRY_TOLERANCE_SECONDS = 60
 
-_PROFILE_PATH = "/api/internal/payment-links/profile"
-_BATCH_PATH = "/api/internal/payment-links/batches"
-_BATCH_STATUS_PATH = "/api/internal/payment-links/batches/{batch_id}"
+_V1_PROFILE_PATH = "/api/v1/payment-links/profile"
+_V1_BATCH_PATH = "/api/v1/payment-links/batches"
+_V1_BATCH_STATUS_PATH = "/api/v1/payment-links/batches/{batch_id}"
+_LEGACY_PROFILE_PATH = "/api/internal/payment-links/profile"
+_LEGACY_BATCH_PATH = "/api/internal/payment-links/batches"
+_LEGACY_BATCH_STATUS_PATH = "/api/internal/payment-links/batches/{batch_id}"
+_API_MODE_V1 = "v1"
+_API_MODE_LEGACY = "legacy"
 _RUNNING_STATUSES = {"queued", "running"}
 _TERMINAL_STATUSES = {"done", "error", "interrupted"}
 _JWT_RE = re.compile(r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)?\b")
@@ -47,7 +52,7 @@ _profile_cache: dict[tuple[str, str, str], tuple[float, dict[str, Any]]] = {}
 
 
 class LongLinkPaymentError(RuntimeError):
-    """Raised when the generic internal payment-link API cannot be used."""
+    """Raised when the generic payment-link service API cannot be used."""
 
 
 def _env_float(name: str, default: float, *, minimum: float) -> float:
@@ -79,6 +84,49 @@ def _http_url(value: Any) -> str:
     if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
         return ""
     return url
+
+
+def normalize_long_link_base_url(value: Any) -> str:
+    """Validate a service base URL without accepting credentials or URL suffix data."""
+
+    raw = str(value or "").strip().rstrip("/")
+    if not raw:
+        raise LongLinkPaymentError("未配置支付链接生成服务地址")
+    if len(raw) > 2048 or any(ord(character) < 32 or ord(character) == 127 for character in raw):
+        raise LongLinkPaymentError("支付链接生成服务地址格式无效")
+    try:
+        parsed = urllib.parse.urlsplit(raw)
+        port = parsed.port
+    except ValueError as exc:
+        raise LongLinkPaymentError("支付链接生成服务地址格式无效") from exc
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise LongLinkPaymentError("支付链接生成服务地址必须是无凭据、无查询参数的 HTTP(S) URL")
+    hostname = parsed.hostname
+    if ":" in hostname and not hostname.startswith("["):
+        hostname = f"[{hostname}]"
+    netloc = hostname
+    if port is not None:
+        netloc = f"{netloc}:{port}"
+    path = parsed.path.rstrip("/")
+    return urllib.parse.urlunsplit((parsed.scheme.lower(), netloc, path, "", ""))
+
+
+def _runtime_config_value(config_key: str, env_key: str, default: str = "") -> str:
+    configured = ""
+    try:
+        from core.config_store import config_store
+
+        configured = str(config_store.get(config_key, "") or "").strip()
+    except Exception:
+        configured = ""
+    return configured or str(os.getenv(env_key) or default).strip()
 
 
 def _iso_timestamp(value: Any) -> str:
@@ -300,22 +348,32 @@ class LongLinkPaymentClient:
         session: requests.Session | None = None,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
-        self.base_url = str(base_url or "").strip().rstrip("/")
+        self.base_url = normalize_long_link_base_url(base_url)
         self.api_key = str(api_key or "").strip()
         self.request_timeout = max(float(request_timeout or DEFAULT_REQUEST_TIMEOUT_SECONDS), 1.0)
         self.profile_cache_seconds = max(float(profile_cache_seconds or 0.0), 0.0)
         self.session = session or requests.Session()
         self._monotonic = monotonic
-        if not self.base_url:
-            raise LongLinkPaymentError("未配置支付链接生成服务地址")
+        self._api_mode: str | None = None
+        self._api_mode_lock = threading.Lock()
         if not self.api_key:
             raise LongLinkPaymentError("未配置支付链接生成服务密钥")
+        if len(self.api_key) > 512 or any(ord(character) < 32 or ord(character) == 127 for character in self.api_key):
+            raise LongLinkPaymentError("支付链接生成服务密钥格式无效")
 
     @classmethod
-    def from_env(cls) -> "LongLinkPaymentClient":
+    def from_runtime_config(cls) -> "LongLinkPaymentClient":
+        """Build from shared/runtime config first, retaining environment fallbacks."""
         return cls(
-            base_url=os.getenv("OPENAI_PAY_LONG_LINK_BASE_URL", DEFAULT_BASE_URL),
-            api_key=os.getenv("OPENAI_PAY_LONG_LINK_API_KEY", ""),
+            base_url=_runtime_config_value(
+                "openai_pay_long_link_base_url",
+                "OPENAI_PAY_LONG_LINK_BASE_URL",
+                DEFAULT_BASE_URL,
+            ),
+            api_key=_runtime_config_value(
+                "openai_pay_long_link_api_key",
+                "OPENAI_PAY_LONG_LINK_API_KEY",
+            ),
             request_timeout=_env_float(
                 "OPENAI_PAY_LONG_LINK_REQUEST_TIMEOUT_SECONDS",
                 DEFAULT_REQUEST_TIMEOUT_SECONDS,
@@ -327,6 +385,25 @@ class LongLinkPaymentClient:
                 minimum=0.0,
             ),
         )
+
+    @classmethod
+    def from_env(cls) -> "LongLinkPaymentClient":
+        """Backward-compatible factory name used by existing task code."""
+
+        return cls.from_runtime_config()
+
+    @property
+    def api_version(self) -> str:
+        with self._api_mode_lock:
+            return self._api_mode or _API_MODE_V1
+
+    def _set_api_mode(self, mode: str) -> None:
+        with self._api_mode_lock:
+            self._api_mode = mode
+
+    def _get_api_mode(self) -> str | None:
+        with self._api_mode_lock:
+            return self._api_mode
 
     def _cache_key(self, overrides: dict[str, Any] | None = None) -> tuple[str, str, str]:
         override_digest = ""
@@ -341,41 +418,87 @@ class LongLinkPaymentClient:
                 override_digest = hashlib.sha256(repr(sorted(overrides.items())).encode("utf-8")).hexdigest()
         return self.base_url, hashlib.sha256(self.api_key.encode("utf-8")).hexdigest(), override_digest
 
-    def _request(
+    def _request_once(
         self,
         method: str,
         path: str,
         *,
+        api_mode: str,
         payload: dict[str, Any] | None = None,
         secrets: Iterable[str] = (),
-    ) -> dict[str, Any]:
+        allow_not_found: bool = False,
+    ) -> dict[str, Any] | None:
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
+        if api_mode == _API_MODE_LEGACY:
+            headers["X-Internal-API-Key"] = self.api_key
+        else:
+            headers["Authorization"] = f"Bearer {self.api_key}"
         try:
             response = self.session.request(
                 method,
                 f"{self.base_url}{path}",
                 json=payload,
-                headers={
-                    "Accept": "application/json",
-                    "Content-Type": "application/json",
-                    "X-Internal-API-Key": self.api_key,
-                },
+                headers=headers,
                 timeout=self.request_timeout,
             )
         except requests.RequestException as exc:
-            raise LongLinkPaymentError(f"支付链接生成服务不可用: {_safe_error_text(exc, secrets=secrets)}") from exc
+            raise LongLinkPaymentError(
+                f"支付链接生成服务不可用: {_safe_error_text(exc, secrets=(*secrets, self.api_key))}"
+            ) from exc
+        status_code = int(response.status_code or 0)
+        if allow_not_found and status_code == 404:
+            return None
         try:
             data = response.json()
         except ValueError as exc:
-            raise LongLinkPaymentError(f"支付链接生成服务返回无效 JSON (HTTP {response.status_code})") from exc
+            raise LongLinkPaymentError(f"支付链接生成服务返回无效 JSON (HTTP {status_code})") from exc
         if not isinstance(data, dict):
-            raise LongLinkPaymentError(f"支付链接生成服务返回格式错误 (HTTP {response.status_code})")
-        if not 200 <= int(response.status_code or 0) < 300:
+            raise LongLinkPaymentError(f"支付链接生成服务返回格式错误 (HTTP {status_code})")
+        if not 200 <= status_code < 300:
             detail = data.get("detail") or data.get("error") or data.get("message") or "上游请求失败"
             raise LongLinkPaymentError(
-                f"支付链接生成服务请求失败 (HTTP {response.status_code}): "
-                f"{_safe_error_text(detail, secrets=secrets)}"
+                f"支付链接生成服务请求失败 (HTTP {status_code}): "
+                f"{_safe_error_text(detail, secrets=(*secrets, self.api_key))}"
             )
         return data
+
+    def _request(
+        self,
+        method: str,
+        v1_path: str,
+        legacy_path: str,
+        *,
+        payload: dict[str, Any] | None = None,
+        secrets: Iterable[str] = (),
+    ) -> dict[str, Any]:
+        mode = self._get_api_mode()
+        if mode != _API_MODE_LEGACY:
+            response = self._request_once(
+                method,
+                v1_path,
+                api_mode=_API_MODE_V1,
+                payload=payload,
+                secrets=secrets,
+                allow_not_found=mode is None,
+            )
+            if response is not None:
+                self._set_api_mode(_API_MODE_V1)
+                return response
+
+        response = self._request_once(
+            method,
+            legacy_path,
+            api_mode=_API_MODE_LEGACY,
+            payload=payload,
+            secrets=secrets,
+        )
+        if response is None:
+            raise LongLinkPaymentError("支付链接生成服务未返回结果")
+        self._set_api_mode(_API_MODE_LEGACY)
+        return response
 
     def get_profile(
         self,
@@ -393,10 +516,17 @@ class LongLinkPaymentClient:
                     return dict(cached[1])
         if safe_overrides:
             normalized = normalize_payment_profile(
-                self._request("POST", _PROFILE_PATH, payload={"profileOverrides": safe_overrides})
+                self._request(
+                    "POST",
+                    _V1_PROFILE_PATH,
+                    _LEGACY_PROFILE_PATH,
+                    payload={"profileOverrides": safe_overrides},
+                )
             )
         else:
-            normalized = normalize_payment_profile(self._request("GET", _PROFILE_PATH))
+            normalized = normalize_payment_profile(
+                self._request("GET", _V1_PROFILE_PATH, _LEGACY_PROFILE_PATH)
+            )
         if not normalized["profile_hash"]:
             raise LongLinkPaymentError("支付链接生成服务未返回 profile_hash")
         if self.profile_cache_seconds > 0:
@@ -439,7 +569,8 @@ class LongLinkPaymentClient:
             request_payload["profileOverrides"] = dict(profile_overrides)
         response = self._request(
             "POST",
-            _BATCH_PATH,
+            _V1_BATCH_PATH,
+            _LEGACY_BATCH_PATH,
             payload=request_payload,
             secrets=tokens,
         )
@@ -463,7 +594,8 @@ class LongLinkPaymentClient:
             raise LongLinkPaymentError("支付链接远端批次 ID 为空")
         response = self._request(
             "GET",
-            _BATCH_STATUS_PATH.format(batch_id=urllib.parse.quote(normalized_id, safe="")),
+            _V1_BATCH_STATUS_PATH.format(batch_id=urllib.parse.quote(normalized_id, safe="")),
+            _LEGACY_BATCH_STATUS_PATH.format(batch_id=urllib.parse.quote(normalized_id, safe="")),
         )
         status = str(response.get("status") or "").strip().lower()
         if status not in _RUNNING_STATUSES | _TERMINAL_STATUSES | {"partial"}:

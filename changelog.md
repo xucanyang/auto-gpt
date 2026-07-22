@@ -6,6 +6,18 @@
 
 ## [Unreleased] (未发布)
 
+## [2.7.0] - 2026-07-23
+
+### 新增 (Added)
+- **支付长链服务支持运行时 API Key 配置**：`api/config.py` 与 `frontend/src/pages/Settings.tsx` 在 ChatGPT 设置中新增服务地址、API Key 和原位连接测试。配置通过现有 `config_store` 持久化并进入共享模板，主服务、Plus、Plus2 可共用同一稳定 HTTPS 地址和服务密钥；环境变量继续作为未配置时的兼容兜底。
+- **接入版本化远程接口**：`services/chatgpt_core/long_link_payment_client.py` 默认调用 `/api/v1/payment-links/*` 并使用标准 `Authorization: Bearer`。首次请求仅在 v1 明确返回 404 时回退旧 `/api/internal/payment-links/*` 与 `X-Internal-API-Key`，后续请求固定已探测的协议版本，支持两个项目滚动升级。
+
+### 安全 (Security)
+- **服务凭据输入和错误回显收紧**：服务地址拒绝内嵌用户名密码、查询参数、片段和非 HTTP(S) 协议；API Key 限制控制字符和长度。连接测试只返回支付类型、国家、币种、并发和 profile hash 前缀，不回传 API Key 或完整上游配置；客户端错误会同步脱敏服务密钥和账号 Access Token。
+
+### 测试 (Tests)
+- 增加 v1 Bearer 请求、旧接口 404 单次回退、非 404 不降级、共享配置优先级、URL 校验、错误脱敏、配置持久化、连接测试响应和 Settings 前端合同回归；前端侧栏版本同步至 `v2.7.0`。
+
 ## [2.6.1] - 2026-07-22
 
 ### 优化 (Changed)
@@ -2078,4 +2090,8 @@
 
 ## 2026-07-22 22:24:15 +0800
 - 发布 v2.6.1：账号按最新注册排序并增加支付链接复制反馈
+- 发布模式: multi
+
+## 2026-07-23 04:07:50 +0800
+- 发布 v2.7.0：支付长链远程 API Key 配置
 - 发布模式: multi

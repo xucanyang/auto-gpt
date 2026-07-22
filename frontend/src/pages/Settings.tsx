@@ -454,6 +454,14 @@ const TAB_ITEMS = [
         ],
       },
       {
+        title: '支付长链服务',
+        desc: '跨服务器服务连接',
+        fields: [
+          { key: 'openai_pay_long_link_base_url', label: '服务地址', placeholder: 'https://pay.cccy.me' },
+          { key: 'openai_pay_long_link_api_key', label: 'API Key', secret: true, placeholder: 'opll_live_...' },
+        ],
+      },
+      {
         title: 'GoPay 账单地址 LLM',
         desc: 'GoPay 启动时生成本次账单地址，失败时回落到表单/默认地址',
         fields: [
@@ -620,6 +628,7 @@ interface SectionConfig {
 }
 
 const TASK_PROXY_SECTION_TITLE = '账号网络默认出口'
+const PAYMENT_LINK_SERVICE_SECTION_TITLE = '支付长链服务'
 
 function taskProxyFieldsForMode(
   fields: FieldConfig[],
@@ -683,7 +692,7 @@ const CHATGPT_PIN_GROUPS = [
   },
   {
     label: '账号订阅',
-    titles: ['账号登录凭据', 'GoPay 账单地址 LLM', '无 RT / Access Token Only', '外部 ChatGPT 分发 API'],
+    titles: ['账号登录凭据', '支付长链服务', 'GoPay 账单地址 LLM', '无 RT / Access Token Only', '外部 ChatGPT 分发 API'],
   },
   {
     label: '维护验证',
@@ -1315,6 +1324,76 @@ function ConfigField({ field }: { field: FieldConfig }) {
   )
 }
 
+interface PaymentLinkConnectionResult {
+  ok?: boolean
+  base_url?: string
+  api_version?: string
+  link_type?: string
+  country?: string
+  currency?: string
+  effective_concurrency?: number
+}
+
+function PaymentLinkConnectionTest() {
+  const form = Form.useFormInstance()
+  const baseUrl = Form.useWatch('openai_pay_long_link_base_url', form)
+  const apiKey = Form.useWatch('openai_pay_long_link_api_key', form)
+  const [testing, setTesting] = useState(false)
+  const [result, setResult] = useState<PaymentLinkConnectionResult | null>(null)
+  const [error, setError] = useState('')
+
+  useEffect(() => {
+    setResult(null)
+    setError('')
+  }, [baseUrl, apiKey])
+
+  const testConnection = async () => {
+    const normalizedBaseUrl = String(baseUrl || '').trim()
+    const normalizedApiKey = String(apiKey || '').trim()
+    if (!normalizedBaseUrl || !normalizedApiKey) {
+      message.warning('请先填写服务地址和 API Key')
+      return
+    }
+    setTesting(true)
+    setResult(null)
+    setError('')
+    try {
+      const response = await apiFetch('/config/payment-link/test', {
+        method: 'POST',
+        body: JSON.stringify({ base_url: normalizedBaseUrl, api_key: normalizedApiKey }),
+      }) as PaymentLinkConnectionResult
+      setResult(response)
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : String(requestError || '连接失败'))
+    } finally {
+      setTesting(false)
+    }
+  }
+
+  const summary = [
+    String(result?.link_type || '').toUpperCase(),
+    [result?.country, result?.currency].filter(Boolean).join(' / '),
+    result?.effective_concurrency ? `并发 ${result.effective_concurrency}` : '',
+  ].filter(Boolean).join(' · ')
+
+  return (
+    <div style={{ display: 'grid', gap: 10 }}>
+      <Button icon={<ApiOutlined />} onClick={testConnection} loading={testing} style={{ justifySelf: 'start' }}>
+        测试连接
+      </Button>
+      {result ? (
+        <Alert
+          type="success"
+          showIcon
+          message={`连接成功 · ${result.api_version === 'legacy' ? '兼容接口' : 'API v1'}`}
+          description={summary || result.base_url}
+        />
+      ) : null}
+      {error ? <Alert type="error" showIcon message="连接失败" description={error} /> : null}
+    </div>
+  )
+}
+
 function ConfigSection({
   section,
   fields,
@@ -1382,6 +1461,7 @@ function ConfigSection({
           {(fields || section.fields).map((field) => (
             <ConfigField key={field.key} field={field} />
           ))}
+          {section.title === PAYMENT_LINK_SERVICE_SECTION_TITLE ? <PaymentLinkConnectionTest /> : null}
         </>
       )}
     </Card>
@@ -3835,6 +3915,9 @@ export default function Settings() {
       if (!data.contribution_server_url) {
         data.contribution_server_url = 'http://new.xem8k5.top:7317/'
       }
+      if (!data.openai_pay_long_link_base_url) {
+        data.openai_pay_long_link_base_url = 'http://openai-pay-long-link:8788'
+      }
       if (!data.chatgpt_gopay_billing_llm_base_url) {
         data.chatgpt_gopay_billing_llm_base_url = 'https://api.666800.xyz'
       }
@@ -4378,6 +4461,26 @@ export default function Settings() {
       values.local_phone_gateway_max_attempts = String(values.local_phone_gateway_max_attempts || '3').trim() || '3'
       values.local_phone_gateway_max_resend_attempts = String(values.local_phone_gateway_max_resend_attempts || '20').trim() || '20'
       values.local_phone_gateway_resend_interval_seconds = String(values.local_phone_gateway_resend_interval_seconds || '30').trim() || '30'
+      values.openai_pay_long_link_base_url = String(values.openai_pay_long_link_base_url || '').trim().replace(/\/+$/, '')
+      values.openai_pay_long_link_api_key = String(values.openai_pay_long_link_api_key || '').trim()
+      if (values.openai_pay_long_link_base_url) {
+        try {
+          const serviceUrl = new URL(values.openai_pay_long_link_base_url)
+          if (
+            !['http:', 'https:'].includes(serviceUrl.protocol)
+            || serviceUrl.username
+            || serviceUrl.password
+            || serviceUrl.search
+            || serviceUrl.hash
+          ) {
+            throw new Error('invalid service URL')
+          }
+        } catch {
+          setActiveTab('chatgpt')
+          message.error('支付长链服务地址必须是无凭据、无查询参数的 HTTP(S) URL')
+          return
+        }
+      }
 
       await apiFetch('/config', {
         method: 'PUT',
@@ -4458,6 +4561,8 @@ export default function Settings() {
         local_phone_gateway_max_attempts: values.local_phone_gateway_max_attempts,
         local_phone_gateway_max_resend_attempts: values.local_phone_gateway_max_resend_attempts,
         local_phone_gateway_resend_interval_seconds: values.local_phone_gateway_resend_interval_seconds,
+        openai_pay_long_link_base_url: values.openai_pay_long_link_base_url,
+        openai_pay_long_link_api_key: values.openai_pay_long_link_api_key,
         external_subscription_api_enabled: values.external_subscription_api_enabled,
         external_subscription_api_token: values.external_subscription_api_token,
         external_access_token_api_enabled: values.external_access_token_api_enabled,

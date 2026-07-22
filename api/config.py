@@ -208,6 +208,8 @@ CONFIG_KEYS = [
     "chatgpt_workspace_select_no_org_retry_delays_seconds",
     "chatgpt_gopay_defaults",
     "chatgpt_payment_link_defaults",
+    "openai_pay_long_link_base_url",
+    "openai_pay_long_link_api_key",
     "chatgpt_access_token_only_checkout_amount_check_enabled",
     "chatgpt_access_token_only_checkout_country",
     "chatgpt_access_token_only_checkout_currency",
@@ -284,6 +286,11 @@ class AppleMailImportRequest(BaseModel):
     filename: str = ""
     pool_dir: str = ""
     bind_to_config: bool = True
+
+
+class PaymentLinkConnectionTestRequest(BaseModel):
+    base_url: str = ""
+    api_key: str = ""
 
 
 _LOCAL_STATUS_PROBE_MAX_CONCURRENCY = 10
@@ -375,6 +382,30 @@ def _normalize_local_status_probe_update(safe: dict[str, Any], current: dict[str
         raise HTTPException(400, "直连模式不能满足本地状态同步的独立出口 IP 要求，请关闭该开关或改用代理模式")
     if unique_exit_ip and mode in {"specified", "manual", "explicit"} and not failover:
         raise HTTPException(400, "指定代理模式开启独立出口 IP 时必须开启失败切换，或关闭独立出口要求")
+    return safe
+
+
+def _normalize_payment_link_service_update(safe: dict[str, Any]) -> dict[str, Any]:
+    base_url_key = "openai_pay_long_link_base_url"
+    api_key_key = "openai_pay_long_link_api_key"
+    if base_url_key in safe:
+        raw_base_url = str(safe.get(base_url_key) or "").strip()
+        if raw_base_url:
+            from services.chatgpt_core.long_link_payment_client import (
+                LongLinkPaymentError,
+                normalize_long_link_base_url,
+            )
+
+            try:
+                raw_base_url = normalize_long_link_base_url(raw_base_url)
+            except LongLinkPaymentError as exc:
+                raise HTTPException(400, str(exc)) from exc
+        safe[base_url_key] = raw_base_url
+    if api_key_key in safe:
+        api_key = str(safe.get(api_key_key) or "").strip()
+        if len(api_key) > 512 or any(ord(character) < 32 or ord(character) == 127 for character in api_key):
+            raise HTTPException(400, "支付链接生成服务密钥格式无效")
+        safe[api_key_key] = api_key
     return safe
 
 
@@ -663,6 +694,10 @@ def _build_config_response(*, local_only: bool = False) -> dict[str, Any]:
         all_cfg["contribution_server_url"] = "http://new.xem8k5.top:7317/"
     if not all_cfg.get("chatgpt_gopay_billing_llm_enabled"):
         all_cfg["chatgpt_gopay_billing_llm_enabled"] = "true"
+    if not all_cfg.get("openai_pay_long_link_base_url"):
+        all_cfg["openai_pay_long_link_base_url"] = (
+            os.getenv("OPENAI_PAY_LONG_LINK_BASE_URL") or "http://openai-pay-long-link:8788"
+        ).strip()
     if not all_cfg.get("chatgpt_access_token_only_zero_amount_stop_enabled"):
         all_cfg["chatgpt_access_token_only_zero_amount_stop_enabled"] = "false"
     if not all_cfg.get("chatgpt_access_token_only_checkout_amount_check_enabled"):
@@ -791,6 +826,40 @@ def get_config():
     return _build_config_response()
 
 
+@router.post("/payment-link/test")
+def test_payment_link_connection(body: PaymentLinkConnectionTestRequest | None = None):
+    from services.chatgpt_core.long_link_payment_client import LongLinkPaymentClient, LongLinkPaymentError
+
+    try:
+        if body is None:
+            client = LongLinkPaymentClient.from_runtime_config()
+        else:
+            client = LongLinkPaymentClient(
+                base_url=body.base_url,
+                api_key=body.api_key,
+                request_timeout=15,
+                profile_cache_seconds=0,
+            )
+        profile = client.get_profile(force_refresh=True)
+    except LongLinkPaymentError as exc:
+        detail = str(exc)
+        invalid_config = detail.startswith("未配置支付链接生成服务") or detail.startswith(
+            "支付链接生成服务地址"
+        ) or detail.startswith("支付链接生成服务密钥格式")
+        raise HTTPException(400 if invalid_config else 502, detail) from exc
+
+    return {
+        "ok": True,
+        "base_url": client.base_url,
+        "api_version": client.api_version,
+        "link_type": str(profile.get("link_type") or "hosted"),
+        "country": str(profile.get("country") or ""),
+        "currency": str(profile.get("currency") or ""),
+        "effective_concurrency": int(profile.get("effective_concurrency") or 0),
+        "profile_hash_prefix": str(profile.get("profile_hash") or "")[:12],
+    }
+
+
 @router.get("/share-state")
 def get_config_share_state():
     return config_store.get_share_state()
@@ -862,6 +931,7 @@ def update_config(body: ConfigUpdate):
     current_config = config_store.get_all()
     safe = normalize_dynamic_proxy_update(safe, current_config)
     safe = _normalize_local_status_probe_update(safe, current_config)
+    safe = _normalize_payment_link_service_update(safe)
     if "dynamic_proxy_ip_retention_minutes" in safe:
         try:
             from core.dynamic_proxy import normalize_retention_minutes
