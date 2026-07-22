@@ -58,5 +58,13 @@ def test_payment_link_cell_keeps_cleaned_tombstones_visible_without_link_actions
     assert "generated ? '已成功提取' : '尚未提取'" in page
     assert "if (!url && !status && !generated)" in page
     assert "{url ? (" in page
-    assert 'title="复制支付链接"' in page
+    assert "const [copiedPaymentLinkUrlsByAccountId, setCopiedPaymentLinkUrlsByAccountId]" in page
+    assert "const ok = await copyText(normalizedUrl)" in page
+    assert "if (!ok) return" in page
+    assert "copiedPaymentLinkUrlsByAccountId.get(accountId) === url" in page
+    assert "title={paymentLinkCopied ? '已复制支付链接' : '复制支付链接'}" in page
+    assert "aria-label={paymentLinkCopied ? '已复制支付链接' : '复制支付链接'}" in page
+    assert "icon={paymentLinkCopied ? <CheckOutlined /> : <CopyOutlined />}" in page
+    assert "background: token.colorWarningBg" in page
+    assert "void copyPaymentLink(record, url)" in page
     assert 'title="打开支付链接"' in page

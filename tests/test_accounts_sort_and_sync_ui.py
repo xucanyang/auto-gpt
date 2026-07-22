@@ -7,11 +7,13 @@ ACCOUNTS_QUERY = ROOT / "frontend" / "src" / "features" / "accounts" / "hooks" /
 SETTINGS_PAGE = ROOT / "frontend" / "src" / "pages" / "Settings.tsx"
 
 
-def test_account_list_sends_expiry_then_registration_sort_and_defaults_registration_asc():
+def test_account_list_sends_expiry_then_registration_sort_and_defaults_registration_desc():
     page = ACCOUNTS_PAGE.read_text(encoding="utf-8")
     query = ACCOUNTS_QUERY.read_text(encoding="utf-8")
 
     assert "const ACCOUNT_CREATED_AT_SORT_FIELD = 'created_at'" in page
+    assert "const DEFAULT_REGISTRATION_SORT_ORDER = 'desc' as const" in page
+    assert "source.registrationSortOrder === 'asc' || source.registrationSortOrder === 'desc'" in page
     assert "`${SUBSCRIPTION_EXPIRY_SORT_FIELD},${ACCOUNT_CREATED_AT_SORT_FIELD}`" in page
     assert "`${subscriptionExpirySortOrder},${registrationSortOrder}`" in page
     assert "const registrationTableSortOrder = registrationSortOrder === 'desc' ? 'descend' : 'ascend'" in page

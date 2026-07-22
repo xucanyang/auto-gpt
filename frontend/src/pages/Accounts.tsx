@@ -29,6 +29,7 @@ import {
 import type { CheckboxOptionType } from 'antd/es/checkbox/Group'
 import type { MenuProps } from 'antd'
 import {
+  CheckOutlined,
   CopyOutlined,
   DeleteOutlined,
   DownOutlined,
@@ -119,7 +120,7 @@ const ACCOUNT_PAGE_SIZE_OPTIONS = [10, 20, 50]
 const EMPTY_LIST: any[] = []
 const SUBSCRIPTION_EXPIRY_SORT_FIELD = 'subscription_active_until'
 const ACCOUNT_CREATED_AT_SORT_FIELD = 'created_at'
-const DEFAULT_REGISTRATION_SORT_ORDER = 'asc' as const
+const DEFAULT_REGISTRATION_SORT_ORDER = 'desc' as const
 
 const DEFAULT_PINNED_ACCOUNT_TOOLBAR_ACTIONS: AccountToolbarActionId[] = ['statusSync', 'paymentLink']
 
@@ -797,7 +798,9 @@ function normalizeAccountFilterPresetFilters(filters?: AccountFilterPresetFilter
   const status = normalizePresetList(source.status && source.status.length ? source.status : columnFilters.status)
   columnFilters.status = status
   const sortOrder = source.sortOrder === 'asc' || source.sortOrder === 'desc' ? source.sortOrder : ''
-  const registrationSortOrder = source.registrationSortOrder === 'desc' ? 'desc' : DEFAULT_REGISTRATION_SORT_ORDER
+  const registrationSortOrder = source.registrationSortOrder === 'asc' || source.registrationSortOrder === 'desc'
+    ? source.registrationSortOrder
+    : DEFAULT_REGISTRATION_SORT_ORDER
   const pageSize = ACCOUNT_PAGE_SIZE_OPTIONS.includes(Number(source.pageSize || 0))
     ? Number(source.pageSize)
     : DEFAULT_ACCOUNTS_PAGE_SIZE
@@ -2558,6 +2561,7 @@ export default function Accounts() {
   const [batchGopayOtpDelaySaving, setBatchGopayOtpDelaySaving] = useState(false)
   const [batchGopayNextRoundAt, setBatchGopayNextRoundAt] = useState<number | null>(null)
   const [accessTokenCopiedAccountIds, setAccessTokenCopiedAccountIds] = useState<Set<number>>(() => new Set())
+  const [copiedPaymentLinkUrlsByAccountId, setCopiedPaymentLinkUrlsByAccountId] = useState<Map<number, string>>(() => new Map())
   const [codexUsageRefreshingIds, setCodexUsageRefreshingIds] = useState<Set<number>>(() => new Set())
   const accountsQuery = useAccountsQuery({
     email: debouncedSearch,
@@ -3452,6 +3456,21 @@ export default function Accounts() {
   const copyAccessToken = useCallback(async (record: any) => {
     await copyAccountSecret(record, 'access_token', 'AT')
   }, [copyAccountSecret])
+
+  const copyPaymentLink = useCallback(async (record: { id?: unknown }, url: string) => {
+    const normalizedUrl = String(url || '').trim()
+    if (!normalizedUrl) return
+    const ok = await copyText(normalizedUrl)
+    if (!ok) return
+    const accountId = Number(record?.id || 0)
+    if (!accountId) return
+    setCopiedPaymentLinkUrlsByAccountId((prev) => {
+      if (prev.get(accountId) === normalizedUrl) return prev
+      const next = new Map(prev)
+      next.set(accountId, normalizedUrl)
+      return next
+    })
+  }, [])
 
   const ensurePlatformActionsLoaded = useCallback(async () => {
     if (platformActionsLoading || platformActions.length > 0) return
@@ -6492,6 +6511,8 @@ export default function Accounts() {
     const displayTime = cleanedStatusMeta ? (cleanedAt || generatedAt) : generatedAt
     const displayTimeLabel = cleanedStatusMeta ? '清理时间' : '生成时间'
     const statusTitle = String(link.link_status_reason || '').trim()
+    const accountId = Number(record?.id || 0)
+    const paymentLinkCopied = Boolean(url && accountId > 0 && copiedPaymentLinkUrlsByAccountId.get(accountId) === url)
 
     if (!url && !status && !generated) return <Text type="secondary" style={{ fontSize: 11 }}>尚未提取</Text>
 
@@ -6510,13 +6531,19 @@ export default function Accounts() {
         {url ? (
           <Space size={0}>
             <Button
-              title="复制支付链接"
+              title={paymentLinkCopied ? '已复制支付链接' : '复制支付链接'}
+              aria-label={paymentLinkCopied ? '已复制支付链接' : '复制支付链接'}
               type="text"
               size="small"
-              icon={<CopyOutlined />}
+              icon={paymentLinkCopied ? <CheckOutlined /> : <CopyOutlined />}
+              style={paymentLinkCopied ? {
+                color: token.colorWarningText,
+                background: token.colorWarningBg,
+                boxShadow: `inset 0 0 0 1px ${token.colorWarningBorder}`,
+              } : undefined}
               onClick={(event) => {
                 event.stopPropagation()
-                void copyText(url)
+                void copyPaymentLink(record, url)
               }}
             />
             <Button

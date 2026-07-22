@@ -68,7 +68,7 @@ def test_account_filter_preset_crud_and_normalization(monkeypatch):
     assert item["filters"]["columnFilters"]["submitState"] == ["unsubmitted", "submitting", "timeout"]
     assert item["filters"]["columnFilters"]["hasSubmitted"] == ["true"]
     assert item["filters"]["sortOrder"] == "asc"
-    assert item["filters"]["registrationSortOrder"] == "asc"
+    assert item["filters"]["registrationSortOrder"] == "desc"
     assert item["filters"]["pageSize"] == 50
     assert created["custom_count"] == 1
 
@@ -76,7 +76,7 @@ def test_account_filter_preset_crud_and_normalization(monkeypatch):
         {"columnFilters": {"paymentLinkGenerated": ["true", "never"]}}
     )
     assert normalized_all_history["columnFilters"]["paymentLinkGenerated"] == []
-    assert normalized_all_history["registrationSortOrder"] == "asc"
+    assert normalized_all_history["registrationSortOrder"] == "desc"
 
     with pytest.raises(HTTPException) as duplicate:
         accounts.create_account_filter_preset(
@@ -151,3 +151,36 @@ def test_legacy_filter_preset_list_payload_still_loads(monkeypatch):
     item = next(item for item in listed["items"] if item["id"] == "preset_legacy")
     assert item["filters"]["columnFilters"]["ideaSubmitState"] == ["submitting", "unavailable"]
     assert item["filters"]["columnFilters"]["oaipayState"] == ["not_uploaded"]
+    assert item["filters"]["registrationSortOrder"] == "desc"
+
+
+def test_filter_preset_v2_registration_default_migrates_once():
+    legacy = accounts._normalize_filter_preset_state(
+        {
+            "version": 2,
+            "custom": [
+                {
+                    "id": "preset_v2",
+                    "name": "旧默认排序",
+                    "filters": {"registrationSortOrder": "asc"},
+                }
+            ],
+        }
+    )
+    current = accounts._normalize_filter_preset_state(
+        {
+            "version": accounts.ACCOUNT_FILTER_PRESET_SCHEMA_VERSION,
+            "custom": [
+                {
+                    "id": "preset_v3",
+                    "name": "显式最早排序",
+                    "filters": {"registrationSortOrder": "asc"},
+                }
+            ],
+        }
+    )
+
+    assert legacy["version"] == accounts.ACCOUNT_FILTER_PRESET_SCHEMA_VERSION
+    assert legacy["custom"][0]["filters"]["registrationSortOrder"] == "desc"
+    assert current["custom"][0]["filters"]["registrationSortOrder"] == "asc"
+    assert "注册排序=最早" in current["custom"][0]["summary"]

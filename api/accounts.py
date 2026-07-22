@@ -62,6 +62,8 @@ def _safe_extra(account: AccountModel) -> dict[str, Any]:
 
 
 ACCOUNT_FILTER_PRESETS_CONFIG_KEY = "chatgpt_account_filter_presets"
+ACCOUNT_FILTER_PRESET_SCHEMA_VERSION = 3
+ACCOUNT_FILTER_PRESET_REGISTRATION_DESC_VERSION = 3
 ACCOUNT_FILTER_PRESET_MAX_CUSTOM_ITEMS = 80
 ACCOUNT_FILTER_PRESET_MAX_LIST_VALUES = 32
 ACCOUNT_FILTER_PRESET_PAGE_SIZES = {10, 20, 50}
@@ -203,7 +205,7 @@ def _empty_filter_preset_payload() -> dict[str, Any]:
         "status": [],
         "columnFilters": {key: [] for key in ACCOUNT_FILTER_PRESET_COLUMN_KEYS},
         "sortOrder": "",
-        "registrationSortOrder": "asc",
+        "registrationSortOrder": "desc",
         "pageSize": 20,
     }
 
@@ -251,7 +253,7 @@ def _normalize_filter_preset_filters(filters: Any) -> dict[str, Any]:
         or sort_source.get("createdAtOrder"),
         max_length=8,
     ).lower()
-    clean["registrationSortOrder"] = registration_sort_order if registration_sort_order in {"asc", "desc"} else "asc"
+    clean["registrationSortOrder"] = registration_sort_order if registration_sort_order in {"asc", "desc"} else "desc"
 
     try:
         page_size = int(source.get("pageSize") or source.get("page_size") or 20)
@@ -287,8 +289,8 @@ def _filter_preset_summary(filters: dict[str, Any]) -> str:
             parts.append(f"{label}={','.join(values[:4])}{'…' if len(values) > 4 else ''}")
     if filters.get("sortOrder"):
         parts.append("到期排序=" + ("最早" if filters.get("sortOrder") == "asc" else "最晚"))
-    if filters.get("registrationSortOrder") == "desc":
-        parts.append("注册排序=最新")
+    if filters.get("registrationSortOrder") == "asc":
+        parts.append("注册排序=最早")
     return " · ".join(parts) or "无筛选条件"
 
 
@@ -440,6 +442,7 @@ def _normalize_builtin_filter_preset_override(preset_id: str, item: Any) -> dict
 
 def _empty_filter_preset_state() -> dict[str, Any]:
     return {
+        "version": ACCOUNT_FILTER_PRESET_SCHEMA_VERSION,
         "custom": [],
         "builtin_overrides": {},
         "deleted_builtin_ids": set(),
@@ -448,12 +451,17 @@ def _empty_filter_preset_state() -> dict[str, Any]:
 
 def _normalize_filter_preset_state(payload: Any) -> dict[str, Any]:
     state = _empty_filter_preset_state()
+    source_version = 1
 
     if isinstance(payload, list):
         custom_raw = payload
         builtin_override_raw: Any = {}
         deleted_raw: Any = []
     elif isinstance(payload, dict):
+        try:
+            source_version = int(payload.get("version") or 1)
+        except (TypeError, ValueError):
+            source_version = 1
         custom_raw = payload.get("custom")
         if not isinstance(custom_raw, list):
             custom_raw = payload.get("items") if isinstance(payload.get("items"), list) else []
@@ -463,12 +471,16 @@ def _normalize_filter_preset_state(payload: Any) -> dict[str, Any]:
         custom_raw = []
         builtin_override_raw = {}
         deleted_raw = []
+    migrate_registration_sort_default = source_version < ACCOUNT_FILTER_PRESET_REGISTRATION_DESC_VERSION
 
     seen_custom_ids: set[str] = set()
     for raw_item in custom_raw:
         item = _normalize_custom_filter_preset(raw_item)
         if not item:
             continue
+        if migrate_registration_sort_default:
+            item["filters"]["registrationSortOrder"] = "desc"
+            item["summary"] = _filter_preset_summary(item["filters"])
         preset_id = str(item["id"])
         if preset_id in seen_custom_ids:
             continue
@@ -501,6 +513,9 @@ def _normalize_filter_preset_state(payload: Any) -> dict[str, Any]:
             continue
         item = _normalize_builtin_filter_preset_override(normalized_id, raw_item)
         if item:
+            if migrate_registration_sort_default:
+                item["filters"]["registrationSortOrder"] = "desc"
+                item["summary"] = _filter_preset_summary(item["filters"])
             overrides[normalized_id] = item
     state["builtin_overrides"] = overrides
     return state
@@ -547,12 +562,13 @@ def _save_filter_preset_state(state: dict[str, Any]) -> dict[str, Any]:
             safe_overrides[preset_id] = override
 
     saved_state = {
+        "version": ACCOUNT_FILTER_PRESET_SCHEMA_VERSION,
         "custom": safe_custom,
         "builtin_overrides": safe_overrides,
         "deleted_builtin_ids": deleted_builtin_ids,
     }
     payload = {
-        "version": 2,
+        "version": ACCOUNT_FILTER_PRESET_SCHEMA_VERSION,
         "custom": safe_custom,
         "builtin_overrides": safe_overrides,
         "deleted_builtin_ids": [

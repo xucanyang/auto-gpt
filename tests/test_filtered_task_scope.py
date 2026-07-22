@@ -166,7 +166,7 @@ def test_accounts_list_and_task_resolver_return_the_same_scope(filter_engine):
     assert {item["id"] for item in listed["items"]} == set(resolution.account_ids) == {1}
 
 
-def test_accounts_list_defaults_to_registration_asc_and_supports_expiry_then_registration(filter_engine):
+def test_accounts_list_defaults_to_registration_desc_and_supports_expiry_then_registration(filter_engine):
     created_at_by_id = {
         1: datetime(2026, 1, 3, tzinfo=timezone.utc),
         2: datetime(2026, 1, 2, tzinfo=timezone.utc),
@@ -218,8 +218,8 @@ def test_accounts_list_defaults_to_registration_asc_and_supports_expiry_then_reg
             session=session,
         )
 
-    assert [item["id"] for item in default_list["items"]] == [3, 2, 1, 5, 4]
-    assert [item["id"] for item in legacy_expiry_list["items"]] == [3, 2, 1, 5, 4]
+    assert [item["id"] for item in default_list["items"]] == [4, 5, 1, 2, 3]
+    assert [item["id"] for item in legacy_expiry_list["items"]] == [2, 3, 1, 4, 5]
     assert [item["id"] for item in combined_list["items"]] == [2, 3, 1, 4, 5]
 
 

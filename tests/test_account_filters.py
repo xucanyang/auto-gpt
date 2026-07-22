@@ -91,10 +91,10 @@ class AccountFilterSortTests(unittest.TestCase):
         return account
 
     def test_sort_specs_default_and_legacy_expiry_compatibility(self):
-        self.assertEqual(normalize_account_sort_specs(), (("created_at", "asc"),))
+        self.assertEqual(normalize_account_sort_specs(), (("created_at", "desc"),))
         self.assertEqual(
             normalize_account_sort_specs("subscription_active_until", "descend"),
-            (("subscription_active_until", "desc"), ("created_at", "asc")),
+            (("subscription_active_until", "desc"), ("created_at", "desc")),
         )
         self.assertEqual(
             normalize_account_sort_specs(
@@ -105,20 +105,24 @@ class AccountFilterSortTests(unittest.TestCase):
         )
         self.assertEqual(
             normalize_account_sort_specs("unsupported", "desc"),
-            (("created_at", "asc"),),
+            (("created_at", "desc"),),
         )
 
-    def test_sort_registration_time_defaults_oldest_first_and_supports_descending(self):
+    def test_sort_registration_time_defaults_newest_first_and_supports_ascending(self):
         rows = [
             self._account(1, created_at=datetime(2026, 1, 2, tzinfo=timezone.utc)),
             self._account(2, created_at=datetime(2026, 1, 1, tzinfo=timezone.utc)),
             self._account(3, created_at=datetime(2026, 1, 2, tzinfo=timezone.utc)),
         ]
 
-        self.assertEqual([row.id for row in sort_account_rows(rows)], [2, 1, 3])
+        self.assertEqual([row.id for row in sort_account_rows(rows)], [3, 1, 2])
         self.assertEqual(
             [row.id for row in sort_account_rows(rows, sort_by="created_at", sort_order="desc")],
             [3, 1, 2],
+        )
+        self.assertEqual(
+            [row.id for row in sort_account_rows(rows, sort_by="created_at", sort_order="asc")],
+            [2, 1, 3],
         )
 
     def test_sort_expiry_then_registration_time(self):
@@ -172,7 +176,7 @@ class AccountFilterSortTests(unittest.TestCase):
 
         sorted_rows = sort_account_rows(rows, sort_by="subscription_active_until", sort_order="asc")
 
-        self.assertEqual([row.id for row in sorted_rows], [3, 2, 4, 1])
+        self.assertEqual([row.id for row in sorted_rows], [3, 4, 2, 1])
 
     def test_sort_subscription_active_until_descending_with_empty_last(self):
         rows = [
@@ -1330,10 +1334,10 @@ class AccountFilterSortTests(unittest.TestCase):
                 for row in session.exec(apply_account_list_state_sort(select(AccountModel))).all()
             ]
 
-        self.assertEqual(asc_ids, [203, 202, 204, 201])
-        self.assertEqual(desc_ids, [202, 204, 203, 201])
+        self.assertEqual(asc_ids, [203, 204, 202, 201])
+        self.assertEqual(desc_ids, [204, 202, 203, 201])
         self.assertEqual(expiry_asc_registration_desc_ids, [203, 204, 202, 201])
-        self.assertEqual(default_ids, [201, 202, 203, 204])
+        self.assertEqual(default_ids, [204, 203, 202, 201])
 
     def test_init_db_ensures_registration_sort_index(self):
         init_db()

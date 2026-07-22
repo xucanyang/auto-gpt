@@ -44,7 +44,7 @@ ACCOUNT_SORT_FIELDS = frozenset({
     ACCOUNT_SORT_CREATED_AT,
     ACCOUNT_SORT_SUBSCRIPTION_ACTIVE_UNTIL,
 })
-DEFAULT_ACCOUNT_SORT_SPECS = ((ACCOUNT_SORT_CREATED_AT, "asc"),)
+DEFAULT_ACCOUNT_SORT_SPECS = ((ACCOUNT_SORT_CREATED_AT, "desc"),)
 logger = logging.getLogger(__name__)
 
 
@@ -2081,8 +2081,8 @@ def normalize_account_sort_specs(sort_by: Any = None, sort_order: Any = None) ->
 
     The legacy API accepted one ``sort_by`` / ``sort_order`` pair.  Comma-
     separated values extend that contract without breaking old callers.  An
-    expiry-only request implicitly uses oldest registration first for equal
-    expiry timestamps; an omitted or invalid request defaults to oldest
+    expiry-only request implicitly uses newest registration first for equal
+    expiry timestamps; an omitted or invalid request defaults to newest
     registration first.
     """
 
@@ -2102,7 +2102,7 @@ def normalize_account_sort_specs(sort_by: Any = None, sort_order: Any = None) ->
     if not specs:
         return DEFAULT_ACCOUNT_SORT_SPECS
     if ACCOUNT_SORT_SUBSCRIPTION_ACTIVE_UNTIL in seen and ACCOUNT_SORT_CREATED_AT not in seen:
-        specs.append((ACCOUNT_SORT_CREATED_AT, "asc"))
+        specs.append((ACCOUNT_SORT_CREATED_AT, DEFAULT_ACCOUNT_SORT_SPECS[0][1]))
     return tuple(specs)
 
 
@@ -2332,7 +2332,7 @@ def apply_account_list_state_sort(
 ) -> Any:
     specs = normalize_account_sort_specs(sort_by, sort_order)
     order_by: list[Any] = []
-    created_at_order = "asc"
+    created_at_order = DEFAULT_ACCOUNT_SORT_SPECS[0][1]
     for field, order in specs:
         if field == ACCOUNT_SORT_SUBSCRIPTION_ACTIVE_UNTIL:
             timestamp = AccountListStateModel.subscription_active_until_ts
@@ -2355,7 +2355,7 @@ def sort_account_rows(rows: Iterable[AccountModel], *, sort_by: Any = None, sort
     specs = normalize_account_sort_specs(sort_by, sort_order)
     created_at_order = next(
         (order for field, order in specs if field == ACCOUNT_SORT_CREATED_AT),
-        "asc",
+        DEFAULT_ACCOUNT_SORT_SPECS[0][1],
     )
     items.sort(key=lambda row: int(getattr(row, "id", 0) or 0), reverse=created_at_order == "desc")
 
