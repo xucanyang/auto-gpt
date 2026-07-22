@@ -6,6 +6,14 @@
 
 ## [Unreleased] (未发布)
 
+## [2.7.1] - 2026-07-23
+
+### 安全 (Security)
+- **Settings 密钥字段恢复默认遮罩**：`frontend/src/pages/Settings.tsx` 修正 Ant Design `Input.Password` 的受控可见状态，API Key、Token、密码、Cookie 和代理凭据等所有 `secret` 字段现在默认显示为遮罩，只在用户主动点击眼睛图标时临时显示；支付长链服务 API Key 不再随面板展开直接明文暴露。
+
+### 测试 (Tests)
+- 增加 Settings secret 可见状态合同，锁定 `showSecret=false` 对应遮罩状态，防止后续再次反转。
+
 ## [2.7.0] - 2026-07-23
 
 ### 新增 (Added)
@@ -2094,4 +2102,8 @@
 
 ## 2026-07-23 04:07:50 +0800
 - 发布 v2.7.0：支付长链远程 API Key 配置
+- 发布模式: multi
+
+## 2026-07-23 04:28:10 +0800
+- 发布 v2.7.1：修复 Settings 密钥默认遮罩
 - 发布模式: multi

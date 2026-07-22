@@ -81,6 +81,8 @@ class PaymentLinkServiceConfigTests(unittest.TestCase):
         self.assertIn("key: 'openai_pay_long_link_api_key'", source)
         self.assertIn("apiFetch('/config/payment-link/test'", source)
         self.assertIn("message={`连接成功", source)
+        self.assertIn("visible: showSecret", source)
+        self.assertNotIn("visible: !showSecret", source)
 
 
 if __name__ == "__main__":

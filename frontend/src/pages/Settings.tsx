@@ -1308,7 +1308,7 @@ function ConfigField({ field }: { field: FieldConfig }) {
         <Input.Password
           placeholder={field.placeholder}
           visibilityToggle={{
-            visible: !showSecret,
+            visible: showSecret,
             onVisibleChange: setShowSecret,
           }}
           iconRender={(visible) => (visible ? <EyeOutlined /> : <EyeInvisibleOutlined />)}
