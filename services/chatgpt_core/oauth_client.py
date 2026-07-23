@@ -38,7 +38,12 @@ from .utils import (
     seed_oai_device_cookie,
 )
 from .sentinel_token import build_sentinel_token
-from .sentinel_browser import get_sentinel_token_via_browser
+from .sentinel_browser import (
+    create_account_via_browser,
+    export_session_cookies_for_playwright,
+    get_sentinel_token_via_browser,
+    merge_playwright_cookies_into_session,
+)
 from .sentinel_constants import PINNED_CHROMIUM_VERSION
 
 
@@ -568,66 +573,10 @@ class OAuthClient:
         *,
         fallback_domain: str = "auth.openai.com",
     ) -> list[dict[str, object]]:
-        result: list[dict[str, object]] = []
-        cookies = getattr(self.session, "cookies", None)
-        if cookies is None:
-            return result
-
-        iterable = []
-        jar = getattr(cookies, "jar", None)
-        if jar is not None:
-            try:
-                iterable = list(jar)
-            except Exception:
-                iterable = []
-        if not iterable:
-            try:
-                iterable = list(cookies)
-            except Exception:
-                iterable = []
-
-        seen: set[tuple[str, str, str]] = set()
-        for item in iterable:
-            name = getattr(item, "name", None) or getattr(item, "key", None)
-            value = getattr(item, "value", None)
-            domain = str(getattr(item, "domain", "") or "").strip()
-            path = str(getattr(item, "path", "/") or "/").strip() or "/"
-            secure = bool(getattr(item, "secure", True))
-            if not name or value is None:
-                continue
-
-            normalized_domain = domain.lstrip(".") or fallback_domain
-            cookie_key = (str(name), str(value), normalized_domain)
-            if cookie_key in seen:
-                continue
-            seen.add(cookie_key)
-
-            same_site = "Lax"
-            rest = getattr(item, "_rest", {}) or {}
-            for key in ("SameSite", "samesite"):
-                if key not in rest:
-                    continue
-                normalized = str(rest[key]).strip().lower()
-                if normalized.startswith("strict"):
-                    same_site = "Strict"
-                elif normalized.startswith("none"):
-                    same_site = "None"
-                else:
-                    same_site = "Lax"
-                break
-
-            result.append(
-                {
-                    "name": str(name),
-                    "value": str(value),
-                    "domain": normalized_domain,
-                    "path": path,
-                    "secure": secure,
-                    "httpOnly": False,
-                    "sameSite": same_site,
-                }
-            )
-        return result
+        return export_session_cookies_for_playwright(
+            self.session,
+            fallback_domain=fallback_domain,
+        )
 
     def _export_session_cookie_header_for_browser(self) -> str:
         pairs = []
@@ -642,44 +591,7 @@ class OAuthClient:
         return "; ".join(pairs)
 
     def _merge_playwright_cookies_into_session(self, cookies: list[dict[str, object]]) -> int:
-        merged = 0
-        if not cookies:
-            return merged
-        for item in cookies:
-            name = str(item.get("name") or "").strip()
-            value = item.get("value")
-            if not name or value is None:
-                continue
-            domain = str(item.get("domain") or "").strip()
-            path = str(item.get("path") or "/").strip() or "/"
-            secure = bool(item.get("secure"))
-            candidate_domains = []
-            if domain:
-                candidate_domains.append(domain)
-                stripped = domain.lstrip(".")
-                if stripped and stripped != domain:
-                    candidate_domains.append(stripped)
-                elif stripped:
-                    candidate_domains.append(f".{stripped}")
-            else:
-                candidate_domains.append("auth.openai.com")
-
-            stored = False
-            for target_domain in candidate_domains:
-                try:
-                    self.session.cookies.set(
-                        name,
-                        str(value),
-                        domain=target_domain,
-                        path=path,
-                        secure=secure,
-                    )
-                    stored = True
-                except Exception:
-                    continue
-            if stored:
-                merged += 1
-        return merged
+        return merge_playwright_cookies_into_session(self.session, cookies)
 
     def _browser_bootstrap_oauth_session(
         self,
@@ -768,24 +680,38 @@ class OAuthClient:
         auth_origin = self.oauth_issuer.rstrip("/") + "/"
         sentinel_origin = "https://sentinel.openai.com/"
         if device_id:
-            cookie_payload.extend(
-                [
+            def _covers_host(item, host: str) -> bool:
+                domain = str(item.get("domain") or "").strip().lstrip(".").lower()
+                return bool(domain and (host == domain or host.endswith(f".{domain}")))
+
+            if not any(
+                str(item.get("name") or "") == "oai-did"
+                and _covers_host(item, "auth.openai.com")
+                for item in cookie_payload
+            ):
+                cookie_payload.append(
                     {
                         "name": "oai-did",
                         "value": str(device_id),
                         "url": auth_origin,
                         "secure": True,
                         "sameSite": "Lax",
-                    },
+                    }
+                )
+            if not any(
+                str(item.get("name") or "") == "oai-did"
+                and _covers_host(item, "sentinel.openai.com")
+                for item in cookie_payload
+            ):
+                cookie_payload.append(
                     {
                         "name": "oai-did",
                         "value": str(device_id),
                         "url": sentinel_origin,
                         "secure": True,
                         "sameSite": "Lax",
-                    },
-                ]
-            )
+                    }
+                )
 
         self._log(
             "browser bootstrap: 启动浏览器预热 auth.openai.com "
@@ -2309,80 +2235,76 @@ class OAuthClient:
             self._set_error("about_you 资料不完整: 缺少姓名或生日")
             return None
 
-        sentinel_token = get_sentinel_token_via_browser(
-            flow="oauth_create_account",
-            proxy=self.proxy,
-            page_url=referer or f"{self.oauth_issuer}/about-you",
-            headless=self.browser_mode != "headed",
-            device_id=device_id,
-            user_agent=user_agent,
-            sec_ch_ua=sec_ch_ua,
-            accept_language=(self.browser_fingerprint.accept_language if self.browser_fingerprint else None),
-            chrome_full_version=(self.browser_fingerprint.chrome_full_version if self.browser_fingerprint else None),
-            platform_version=(self.browser_fingerprint.platform_version if self.browser_fingerprint else None),
-            viewport_width=(self.browser_fingerprint.viewport_width if self.browser_fingerprint else None),
-            viewport_height=(self.browser_fingerprint.viewport_height if self.browser_fingerprint else None),
-            cookie_header=self._export_session_cookie_header_for_browser(),
-            require_complete_signals=True,
-            log_fn=lambda msg: self._log(f"oauth_create_account: {msg}"),
-        )
-        if sentinel_token:
-            self._log("oauth_create_account: 已通过 Playwright SentinelSDK 获取 token")
-        else:
-            self._set_error(
-                "sentinel_browser_unavailable: "
-                "oauth_create_account 未获得完整 p/t/c 浏览器令牌"
-            )
-            return None
-
         request_url = f"{self.oauth_issuer}/api/accounts/create_account"
-        headers = self._headers(
-            request_url,
-            user_agent=user_agent,
-            sec_ch_ua=sec_ch_ua,
-            accept="application/json",
-            referer=referer or f"{self.oauth_issuer}/about-you",
-            origin=self.oauth_issuer,
-            content_type="application/json",
-            fetch_site="same-origin",
-            extra_headers={
-                "oai-device-id": device_id,
-                "openai-sentinel-token": sentinel_token,
-            },
-        )
-        headers.update(generate_datadog_trace())
-
-        payload = {
-            "name": full_name,
-            "birthdate": str(birthdate).strip(),
-        }
-        self._log("about_you 请求体已构建，准备 POST /api/accounts/create_account")
+        self._log("about_you 请求体已构建，交由同一 Auth 浏览器上下文提交")
 
         try:
             self._check_stop()
-            kwargs = {
-                "json": payload,
-                "headers": headers,
-                "timeout": 30,
-                "allow_redirects": False,
-            }
-            if impersonate:
-                kwargs["impersonate"] = impersonate
+            result = create_account_via_browser(
+                name=full_name,
+                birthdate=str(birthdate).strip(),
+                proxy=self.proxy,
+                page_url=referer or f"{self.oauth_issuer}/about-you",
+                headless=self.browser_mode != "headed",
+                device_id=device_id,
+                user_agent=user_agent,
+                sec_ch_ua=sec_ch_ua,
+                accept_language=(
+                    self.browser_fingerprint.accept_language
+                    if self.browser_fingerprint
+                    else None
+                ),
+                chrome_full_version=(
+                    self.browser_fingerprint.chrome_full_version
+                    if self.browser_fingerprint
+                    else None
+                ),
+                platform_version=(
+                    self.browser_fingerprint.platform_version
+                    if self.browser_fingerprint
+                    else None
+                ),
+                viewport_width=(
+                    self.browser_fingerprint.viewport_width
+                    if self.browser_fingerprint
+                    else None
+                ),
+                viewport_height=(
+                    self.browser_fingerprint.viewport_height
+                    if self.browser_fingerprint
+                    else None
+                ),
+                cookies=self._export_session_cookies_for_playwright(),
+                trace_headers=generate_datadog_trace(),
+                stop_check=self._check_stop,
+                log_fn=lambda msg: self._log(f"oauth_create_account: {msg}"),
+            )
+            if result is None:
+                self._set_error(
+                    "auth_browser_finalize_unavailable: "
+                    "oauth_create_account 浏览器事务没有返回结果"
+                )
+                return None
 
-            self._browser_pause()
-            r = self.session.post(request_url, **kwargs)
-            self._log(f"/create_account -> {r.status_code}")
+            merged = self._merge_playwright_cookies_into_session(result.cookies)
+            self._log(
+                "oauth_create_account 浏览器事务完成: "
+                f"status={result.status_code} merged_cookies={merged} "
+                f"cf_clearance={'✓' if result.cf_clearance_present else '✗'} "
+                f"oai-sc={'✓' if result.oai_sc_present else '✗'}"
+            )
+            if not result.status_code:
+                self._set_error(
+                    "auth_browser_finalize_unavailable: "
+                    + str(result.error or "create_account 浏览器请求未完成")[:300]
+                )
+                return None
 
-            response_text = ""
-            try:
-                response_text = r.text or ""
-            except Exception:
-                response_text = ""
-
-            if r.status_code != 200:
+            response_text = result.response_text or ""
+            if not result.ok:
                 lowered = response_text.lower()
                 if (
-                    r.status_code == 400
+                    result.status_code == 400
                     and (
                         "account already exists" in lowered
                         or "please login instead" in lowered
@@ -2396,23 +2318,19 @@ class OAuthClient:
                     )
                     return None
 
-                self._set_error(f"about_you 提交失败: {r.status_code} - {response_text[:180]}")
+                self._set_error(
+                    f"about_you 提交失败: {result.status_code} - {response_text[:180]}"
+                )
                 return None
 
-            try:
-                data = r.json()
-            except Exception:
-                data = {}
+            data = result.response_json or {}
 
             flow_state = self._state_from_payload(
                 data,
-                current_url=str(r.url) or request_url,
+                current_url=result.response_url or request_url,
             )
             if self._state_is_add_phone(flow_state):
-                try:
-                    raw_text = r.text or ""
-                except Exception:
-                    raw_text = ""
+                raw_text = response_text
                 try:
                     raw_json = json.dumps(data, ensure_ascii=False)
                 except Exception:

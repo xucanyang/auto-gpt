@@ -6,6 +6,20 @@
 
 ## [Unreleased] (未发布)
 
+## [2.8.7] - 2026-07-24
+
+### 优化 (Changed)
+- **开户阶段改为单一 Auth 浏览器事务**：`services/chatgpt_core/sentinel_browser.py` 新增浏览器拥有的 `about-you` finalize 流程，将协议会话 Cookie 按原始域和路径导入 Playwright，在真实 `auth.openai.com/about-you` 页面完成 Cloudflare JSD、Sentinel iframe `oauth_create_account` token 和 `POST /api/accounts/create_account`。开户请求不再把 Playwright 生成的风控 token 交给另一个 `curl_cffi` 会话发送，保持 Cookie、设备标识、TLS/HTTP2 浏览器连接和 Sentinel 上下文一致。
+- **浏览器 Cookie 双向同步保留真实作用域**：共享 Cookie bridge 不再把 `.openai.com` 压成 `auth.openai.com` host-only，也不再为同一 Cookie 同时写入点域和裸域副本。浏览器运行期间新生成的 `cf_clearance`、`oai-sc`、`__cf_bm`、登录会话及开户响应 Cookie 会按原始 domain/path 回灌协议会话，供 OAuth callback、AccessToken 抓取和后续账户状态推进复用。
+- **两套注册引擎统一开户合同**：`ChatGPTClient.create_account()` 与 `OAuthClient._submit_about_you_create_account()` 都接入同一浏览器 finalize，不再单独拼装 `oai-device-id` 和 Sentinel 请求头后执行协议 POST。浏览器请求补齐每次动作独立的 `x-access-flow-invocation-id` 与现有 Datadog trace，HTTP 错误仍保留 `registration_disallowed` 等精确服务端错误码。
+
+### 修复 (Fixed)
+- **修复完整 `p/t/c` 仍被拒绝开户**：此前 v2.7.3 虽已修通认证 SOCKS5 到 Chromium 的本地 HTTP CONNECT 桥，并能生成非空 `p/t/c`，但临时 Sentinel 浏览器只访问顶层 frame、只接收扁平 Cookie 字符串且退出前不回写 Cookie；最终开户由另一个会话发送，缺少浏览器生成的 `cf_clearance`、`oai-sc` 及域级稳定身份。现在开户前日志只记录 Cookie 名和 Sentinel 字段长度，既可核验上下文连续性，也不会输出凭证值。
+- **浏览器基础设施失败立即停止批次**：新增 `auth_browser_finalize_unavailable` 致命基础设施分类。Auth 页面跳转异常、Sentinel frame 不可用或同浏览器开户请求未完成时，注册批次停止调度新邮箱，避免在本地浏览器链路故障时持续消耗 HME 地址和代理尝试。
+
+### 测试 (Tests)
+- 扩展 Sentinel、ChatGPT 注册、OAuth about-you 与任务控制回归，覆盖 `.openai.com` Cookie 域保留、无重复域写入、同一 Playwright context 顺序执行 Auth 页面/Sentinel/开户、浏览器 Cookie 回灌、禁止回退 `session.post()`、`x-access-flow-invocation-id` 请求合同、`registration_disallowed` 错误保真及基础设施失败批次 fail-fast；前端侧栏版本同步更新为 `v2.8.7`。
+
 ## [2.8.6] - 2026-07-24
 
 ### 新增 (Added)
@@ -2276,4 +2290,8 @@
 
 ## 2026-07-24 04:49:39 +0800
 - v2.8.6 支付链接全状态人工删除与 Team 24 小时有效期
+- 发布模式: multi
+
+## 2026-07-24 05:47:14 +0800
+- 发布 v2.8.7：注册开户改为同一 Auth 浏览器事务并保持 Sentinel Cookie 连续性
 - 发布模式: multi

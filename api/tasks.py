@@ -15917,7 +15917,13 @@ def _run_batch_probe_local_status(task_id: str, account_ids: list[int], params: 
 
 def _is_fatal_registration_infrastructure_error(message: Any) -> bool:
     text = str(message or "").strip().lower()
-    return "sentinel_browser_unavailable" in text
+    return any(
+        marker in text
+        for marker in (
+            "sentinel_browser_unavailable",
+            "auth_browser_finalize_unavailable",
+        )
+    )
 
 
 def _run_register(task_id: str, req: RegisterTaskRequest):

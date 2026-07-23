@@ -296,6 +296,11 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
                 "注册流失败: sentinel_browser_unavailable: oauth_create_account"
             )
         )
+        self.assertTrue(
+            _is_fatal_registration_infrastructure_error(
+                "注册流失败: auth_browser_finalize_unavailable: create_account"
+            )
+        )
         self.assertFalse(
             _is_fatal_registration_infrastructure_error(
                 "注册流失败: HTTP 400: registration_disallowed"

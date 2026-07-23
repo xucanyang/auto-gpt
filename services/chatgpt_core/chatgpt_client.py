@@ -17,7 +17,12 @@ except ImportError:
     sys.exit(1)
 
 from .sentinel_token import build_sentinel_token
-from .sentinel_browser import get_sentinel_token_via_browser
+from .sentinel_browser import (
+    create_account_via_browser,
+    export_session_cookies_for_playwright,
+    get_sentinel_token_via_browser,
+    merge_playwright_cookies_into_session,
+)
 from .utils import (
     FlowState,
     apply_browser_fingerprint,
@@ -948,73 +953,72 @@ class ChatGPTClient:
         """
         name = f"{first_name} {last_name}"
         self._log(f"完成账号创建: {name}")
-        url = f"{self.AUTH}/api/accounts/create_account"
-
-        sentinel_token = self._get_sentinel_token(
-            "oauth_create_account",
-            page_url=f"{self.AUTH}/about-you",
-        )
-        if not sentinel_token:
-            detail = (
-                "sentinel_browser_unavailable: "
-                "oauth_create_account 未获得完整 Sentinel 浏览器令牌"
-            )
-            self._log(f"create_account: {detail}")
-            return False, detail
-        self._log("create_account: 已生成完整 Sentinel 浏览器 token")
-
-        headers = self._headers(
-            url,
-            accept="application/json",
-            referer=f"{self.AUTH}/about-you",
-            origin=self.AUTH,
-            content_type="application/json",
-            fetch_site="same-origin",
-            extra_headers={
-                "oai-device-id": self.device_id,
-            },
-        )
-        headers["openai-sentinel-token"] = sentinel_token
-        headers.update(generate_datadog_trace())
-
-        payload = {
-            "name": name,
-            "birthdate": birthdate,
-        }
-
         try:
-            self._browser_pause()
-            r = self.session.post(url, json=payload, headers=headers, timeout=30)
+            result = create_account_via_browser(
+                name=name,
+                birthdate=birthdate,
+                proxy=self.proxy,
+                page_url=f"{self.AUTH}/about-you",
+                headless=self.browser_mode != "headed",
+                device_id=self.device_id,
+                user_agent=self.ua,
+                sec_ch_ua=self.sec_ch_ua,
+                chrome_full_version=self.chrome_full,
+                accept_language=self.accept_language,
+                platform_version=self.chrome_platform_version,
+                viewport_width=self.viewport_width,
+                viewport_height=self.viewport_height,
+                cookies=export_session_cookies_for_playwright(self.session),
+                trace_headers=generate_datadog_trace(),
+                log_fn=lambda msg: self._log(f"oauth_create_account: {msg}"),
+            )
+            if result is None:
+                detail = (
+                    "auth_browser_finalize_unavailable: "
+                    "oauth_create_account 浏览器事务没有返回结果"
+                )
+                self._log(f"create_account: {detail}")
+                return False, detail
 
-            if r.status_code == 200:
-                try:
-                    data = r.json()
-                except Exception:
-                    data = {}
+            merged = merge_playwright_cookies_into_session(
+                self.session, result.cookies
+            )
+            self._log(
+                "create_account: 浏览器事务完成 "
+                f"status={result.status_code} merged_cookies={merged} "
+                f"cf_clearance={'✓' if result.cf_clearance_present else '✗'} "
+                f"oai-sc={'✓' if result.oai_sc_present else '✗'}"
+            )
+            if not result.status_code:
+                detail = (
+                    "auth_browser_finalize_unavailable: "
+                    + str(result.error or "create_account 浏览器请求未完成")[:300]
+                )
+                self._log(f"create_account: {detail}")
+                return False, detail
+
+            if result.ok:
+                data = result.response_json or {}
                 next_state = self._state_from_payload(
-                    data, current_url=str(r.url) or self.BASE
+                    data, current_url=result.response_url or self.BASE
                 )
                 self._log(f"账号创建成功 {describe_flow_state(next_state)}")
                 return (True, next_state) if return_state else (True, "账号创建成功")
-            else:
-                error_code = ""
-                error_msg = r.text[:200]
-                try:
-                    error_data = r.json() or {}
-                    error_info = error_data.get("error") or {}
-                    error_code = str(error_info.get("code") or "").strip()
-                    error_msg = str(error_info.get("message") or error_msg).strip()
-                except Exception:
-                    pass
 
-                detail = f"HTTP {r.status_code}"
-                if error_code:
-                    detail += f": {error_code}"
-                elif error_msg:
-                    detail += f": {error_msg}"
+            error_data = result.response_json or {}
+            error_info = error_data.get("error") or {}
+            error_code = str(error_info.get("code") or "").strip()
+            error_msg = str(
+                error_info.get("message") or result.response_text[:200]
+            ).strip()
+            detail = f"HTTP {result.status_code}"
+            if error_code:
+                detail += f": {error_code}"
+            elif error_msg:
+                detail += f": {error_msg}"
 
-                self._log(f"创建失败: {detail} - {error_msg[:200]}")
-                return False, detail
+            self._log(f"创建失败: {detail} - {error_msg[:200]}")
+            return False, detail
 
         except Exception as e:
             self._log(f"创建异常: {e}")
