@@ -263,6 +263,7 @@ def _apply_action_result(
                             "seat_quantity",
                             "promo_code_digest",
                             "cancel_url",
+                            "checkout_proxy_region",
                             "link_type",
                             "link_expires_at",
                             "link_expiry_source",

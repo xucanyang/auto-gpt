@@ -82,6 +82,12 @@ function paymentLinkTeamMeta(value: any) {
     workspaceName: String(value?.workspace_name || result?.workspace_name || nested?.workspace_name || '').trim(),
     priceInterval: String(value?.price_interval || result?.price_interval || nested?.price_interval || '').trim().toLowerCase(),
     seatQuantity: Number(value?.seat_quantity || result?.seat_quantity || nested?.seat_quantity || 0),
+    checkoutProxyRegion: String(
+      value?.checkout_proxy_region
+      || result?.checkout_proxy_region
+      || nested?.checkout_proxy_region
+      || '',
+    ).trim().toUpperCase(),
   }
 }
 
@@ -752,7 +758,7 @@ export function AccountDetailModal({
                     </Space>
                     {currentPaymentLinkProduct === 'TEAM' ? (
                       <Text type="secondary" style={{ display: 'block', marginBottom: 4, fontSize: 12 }}>
-                        {`${currentPaymentLinkTeam.workspaceName || '-'} · ${currentPaymentLinkTeam.priceInterval === 'year' ? '年付' : '月付'} · ${currentPaymentLinkTeam.seatQuantity || '-'} 席位`}
+                        {`${currentPaymentLinkTeam.workspaceName || '-'} · ${currentPaymentLinkTeam.priceInterval === 'year' ? '年付' : '月付'} · ${currentPaymentLinkTeam.seatQuantity || '-'} 席位 · IP ${currentPaymentLinkTeam.checkoutProxyRegion || '-'}`}
                       </Text>
                     ) : null}
                     <Space size={6} wrap style={{ width: '100%' }}>
@@ -805,7 +811,7 @@ export function AccountDetailModal({
                           </Space>
                           {product === 'TEAM' ? (
                             <Text type="secondary" style={{ display: 'block', marginTop: 4, fontSize: 12 }}>
-                              {`${teamMeta.workspaceName || '-'} · ${teamMeta.priceInterval === 'year' ? '年付' : '月付'} · ${teamMeta.seatQuantity || '-'} 席位`}
+                              {`${teamMeta.workspaceName || '-'} · ${teamMeta.priceInterval === 'year' ? '年付' : '月付'} · ${teamMeta.seatQuantity || '-'} 席位 · IP ${teamMeta.checkoutProxyRegion || '-'}`}
                             </Text>
                           ) : null}
                           {url ? (

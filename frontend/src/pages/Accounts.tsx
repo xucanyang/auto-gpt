@@ -121,6 +121,22 @@ const EMPTY_LIST: any[] = []
 const SUBSCRIPTION_EXPIRY_SORT_FIELD = 'subscription_active_until'
 const ACCOUNT_CREATED_AT_SORT_FIELD = 'created_at'
 const DEFAULT_REGISTRATION_SORT_ORDER = 'desc' as const
+const DEFAULT_TEAM_WORKSPACE_NAME = 'MyTeam'
+const TEAM_PROXY_COUNTRY_CODES = [
+  'US', 'GB', 'CA', 'AU', 'JP', 'SG', 'HK', 'TW', 'KR', 'ID', 'MY', 'TH',
+  'TR', 'VN', 'PH', 'IN', 'DE', 'FR', 'IT', 'ES', 'NL', 'IE', 'PT', 'BE',
+  'FI', 'AT', 'CH', 'SE', 'NO', 'DK', 'PL', 'CZ', 'MX', 'BR', 'NZ',
+] as const
+
+function teamProxyCountryLabel(code: string) {
+  const normalized = String(code || '').trim().toUpperCase()
+  try {
+    const displayNames = new Intl.DisplayNames(['zh-CN'], { type: 'region' })
+    return `${displayNames.of(normalized) || normalized} (${normalized})`
+  } catch {
+    return normalized
+  }
+}
 
 const DEFAULT_PINNED_ACCOUNT_TOOLBAR_ACTIONS: AccountToolbarActionId[] = ['statusSync', 'paymentLink']
 
@@ -2461,6 +2477,7 @@ export default function Accounts() {
   const [batchPaymentLinkProfileLoading, setBatchPaymentLinkProfileLoading] = useState(false)
   const [batchPaymentLinkProfileError, setBatchPaymentLinkProfileError] = useState('')
   const [batchPaymentLinkPlan, setBatchPaymentLinkPlan] = useState<'plus' | 'team'>('plus')
+  const [teamProxyCountrySearch, setTeamProxyCountrySearch] = useState('')
   const [registerForm] = Form.useForm()
   const [addForm] = Form.useForm()
   const [detailForm] = Form.useForm()
@@ -2470,6 +2487,14 @@ export default function Accounts() {
   const [paypalBindingForm] = Form.useForm()
   const [batchPaymentLinkForm] = Form.useForm()
   const [filterPresetForm] = Form.useForm()
+  const teamProxyCountryOptions = useMemo(() => {
+    const typed = String(teamProxyCountrySearch || '').trim().toUpperCase()
+    const codes = [...TEAM_PROXY_COUNTRY_CODES]
+    if (/^[A-Z]{2}$/.test(typed) && !codes.includes(typed as (typeof TEAM_PROXY_COUNTRY_CODES)[number])) {
+      codes.unshift(typed as (typeof TEAM_PROXY_COUNTRY_CODES)[number])
+    }
+    return codes.map((code) => ({ value: code, label: teamProxyCountryLabel(code) }))
+  }, [teamProxyCountrySearch])
   const phoneBindingUsePoolValue = Form.useWatch('use_pool', phoneBindingTestForm)
   const phoneBindingPoolModeValue = Form.useWatch('phone_pool_mode', phoneBindingTestForm)
   const phoneBindingSelectedPrefixesValue = Form.useWatch('selected_prefixes', phoneBindingTestForm)
@@ -3949,8 +3974,10 @@ export default function Accounts() {
       if (Object.keys(teamPlanData).length > 0) params.team_plan_data = teamPlanData
       const promoCode = String(values?.promo_code || '').trim()
       const cancelUrl = String(values?.cancel_url || '').trim()
+      const checkoutProxyRegion = String(values?.checkout_proxy_region || '').trim().toUpperCase()
       if (promoCode) params.promo_code = promoCode
       if (cancelUrl) params.cancel_url = cancelUrl
+      if (checkoutProxyRegion) params.checkout_proxy_region = checkoutProxyRegion
     }
     return params
   }
@@ -3988,12 +4015,14 @@ export default function Accounts() {
     setBatchPaymentLinkPlan('plus')
     batchPaymentLinkForm.setFieldsValue({
       plan: 'plus',
-      workspace_name: '',
+      workspace_name: DEFAULT_TEAM_WORKSPACE_NAME,
+      checkout_proxy_region: undefined,
       price_interval: '',
       seat_quantity: undefined,
       promo_code: '',
       cancel_url: '',
     })
+    setTeamProxyCountrySearch('')
     setBatchPaymentLinkProfile(null)
     setBatchPaymentLinkProfileError('')
     setBatchPaymentLinkConfigOpen(true)
@@ -6494,6 +6523,7 @@ export default function Accounts() {
       || String(link.plan || '').trim().toLowerCase() === 'team'
       ? 'TEAM'
       : ''
+    const checkoutProxyRegion = String(link.checkout_proxy_region || '').trim().toUpperCase()
     const linkType = platformLabel || storedLinkType
       || (format === 'paypal_url' ? 'PAYPAL' : format === 'long_link' ? 'LONG-LINK' : '')
     const generatedAt = formatCompactDateTime(String(link.generated_at || link.created_at || '').trim())
@@ -6520,6 +6550,7 @@ export default function Accounts() {
       <Space direction="vertical" size={2} style={{ maxWidth: 172 }}>
         <Space size={5} wrap>
           {productLabel ? <Tag color="gold" style={compactTagStyle}>{productLabel}</Tag> : null}
+          {productLabel && checkoutProxyRegion ? <Tag style={compactTagStyle}>{`IP ${checkoutProxyRegion}`}</Tag> : null}
           {linkType ? <Tag color="blue" style={compactTagStyle}>{linkType}</Tag> : null}
           <Tag color={statusMeta.color} style={compactTagStyle} title={statusTitle || undefined}>{statusMeta.label}</Tag>
         </Space>
@@ -8410,7 +8441,13 @@ export default function Accounts() {
           <Form
             form={batchPaymentLinkForm}
             layout="vertical"
-            initialValues={{ plan: 'plus', price_interval: '', seat_quantity: undefined }}
+            initialValues={{
+              plan: 'plus',
+              workspace_name: DEFAULT_TEAM_WORKSPACE_NAME,
+              checkout_proxy_region: undefined,
+              price_interval: '',
+              seat_quantity: undefined,
+            }}
           >
             <Form.Item name="plan" label="生成类型" style={{ marginBottom: 12 }}>
               <Segmented
@@ -8424,10 +8461,17 @@ export default function Accounts() {
                   setBatchPaymentLinkPlan(nextPlan)
                   setBatchPaymentLinkProfile(null)
                   setBatchPaymentLinkProfileError('')
-                  const nextParams = nextPlan === 'team'
-                    ? { ...buildBatchPaymentLinkParams(batchPaymentLinkForceRefresh), plan: 'team' }
-                    : { plan: 'plus' }
-                  void loadBatchPaymentLinkProfile(nextParams)
+                  if (nextPlan === 'plus') {
+                    void loadBatchPaymentLinkProfile({ plan: 'plus' })
+                    return
+                  }
+                  const nextParams: Record<string, unknown> = {
+                    ...buildBatchPaymentLinkParams(batchPaymentLinkForceRefresh),
+                    plan: 'team',
+                  }
+                  if (/^[A-Z]{2}$/.test(String(nextParams.checkout_proxy_region || ''))) {
+                    void loadBatchPaymentLinkProfile(nextParams)
+                  }
                 }}
               />
             </Form.Item>
@@ -8438,11 +8482,44 @@ export default function Accounts() {
                   <Form.Item
                     name="workspace_name"
                     label="Workspace 名称"
-                    rules={[{ max: 256, message: 'Workspace 名称不能超过 256 个字符' }]}
+                    rules={[
+                      { required: true, whitespace: true, message: '请输入 Workspace 名称' },
+                      { max: 256, message: 'Workspace 名称不能超过 256 个字符' },
+                    ]}
                   >
                     <Input
                       maxLength={256}
-                      placeholder={batchPaymentLinkProfile?.team?.workspace_name || '沿用 long-link 管理页'}
+                      placeholder={DEFAULT_TEAM_WORKSPACE_NAME}
+                    />
+                  </Form.Item>
+                  <Form.Item
+                    name="checkout_proxy_region"
+                    label="动态 IP 国家"
+                    rules={[
+                      { required: true, message: '请选择动态 IP 国家' },
+                      { pattern: /^[A-Za-z]{2}$/, message: '请输入两位国家代码' },
+                    ]}
+                  >
+                    <Select
+                      showSearch
+                      allowClear
+                      optionFilterProp="label"
+                      placeholder="选择国家"
+                      options={teamProxyCountryOptions}
+                      onSearch={setTeamProxyCountrySearch}
+                      onChange={(value) => {
+                        const checkoutProxyRegion = String(value || '').trim().toUpperCase()
+                        setTeamProxyCountrySearch(checkoutProxyRegion)
+                        setBatchPaymentLinkProfile(null)
+                        setBatchPaymentLinkProfileError('')
+                        if (!checkoutProxyRegion) return
+                        batchPaymentLinkForm.setFieldValue('checkout_proxy_region', checkoutProxyRegion)
+                        void loadBatchPaymentLinkProfile({
+                          ...buildBatchPaymentLinkParams(batchPaymentLinkForceRefresh),
+                          plan: 'team',
+                          checkout_proxy_region: checkoutProxyRegion,
+                        })
+                      }}
                     />
                   </Form.Item>
                   <Form.Item name="price_interval" label="计费周期">
@@ -8565,10 +8642,14 @@ export default function Accounts() {
                       <Text type="secondary" style={{ display: 'block', fontSize: 12 }}>优惠码</Text>
                       <Text>{batchPaymentLinkProfile.team?.promo_code_configured ? '已配置' : '未配置'}</Text>
                     </div>
+                    <div>
+                      <Text type="secondary" style={{ display: 'block', fontSize: 12 }}>动态 IP 国家</Text>
+                      <Text>{batchPaymentLinkProfile.regions?.checkout || '-'}</Text>
+                    </div>
                   </>
                 ) : null}
                 <div>
-                  <Text type="secondary" style={{ display: 'block', fontSize: 12 }}>国家 / 币种</Text>
+                  <Text type="secondary" style={{ display: 'block', fontSize: 12 }}>账单国家 / 币种</Text>
                   <Text>{`${batchPaymentLinkProfile.country || batchPaymentLinkProfile.billing_country || '-'} / ${batchPaymentLinkProfile.currency || '-'}`}</Text>
                 </div>
                 <div>

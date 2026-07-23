@@ -45,6 +45,10 @@ def test_payment_link_generation_dialog_explains_variant_aware_history_guard():
     assert "Team 参数变体" in page
     assert "Plus 配置" in page
     assert "已支付、已订阅、已失效或正在生成的账号仍会跳过" in page
+    assert "DEFAULT_TEAM_WORKSPACE_NAME = 'MyTeam'" in page
+    assert 'name="checkout_proxy_region"' in page
+    assert 'label="动态 IP 国家"' in page
+    assert "batchPaymentLinkProfile.regions?.checkout" in page
 
 
 def test_payment_link_cell_keeps_cleaned_tombstones_visible_without_link_actions():

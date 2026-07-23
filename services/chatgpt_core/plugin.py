@@ -806,6 +806,8 @@ class ChatGPTPlatform(BasePlatform):
             currency = str(payment_profile.get("currency") or "").strip().upper()
             reuse_cached_link = params.get("reuse_cached_link") is not False
             profile_detail = payment_profile.get("profile") if isinstance(payment_profile.get("profile"), dict) else {}
+            profile_regions = payment_profile.get("regions") if isinstance(payment_profile.get("regions"), dict) else profile_detail.get("regions")
+            profile_regions = profile_regions if isinstance(profile_regions, dict) else {}
             team_profile = payment_profile.get("team") if isinstance(payment_profile.get("team"), dict) else profile_detail.get("team")
             team_profile = team_profile if isinstance(team_profile, dict) else {}
             cache_request = {
@@ -832,6 +834,11 @@ class ChatGPTPlatform(BasePlatform):
                             or ""
                         ).strip(),
                         "plan_name": "chatgptteamplan",
+                        "checkout_proxy_region": str(
+                            profile_regions.get("checkout")
+                            or params.get("checkout_proxy_region")
+                            or ""
+                        ).strip().upper(),
                     }
                 )
             normalized_cache_params = normalize_payment_link_params(cache_request)

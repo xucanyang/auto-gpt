@@ -6,6 +6,22 @@
 
 ## [Unreleased] (未发布)
 
+## [2.8.0] - 2026-07-24
+
+### 新增 (Added)
+- **Team 优惠链接支持任务级动态 IP 国家**：`frontend/src/pages/Accounts.tsx` 在 Plus / Team 支付链接配置中为 Team 增加必选、可搜索的两位国家代码控件。国家选择随 profile 预览和批次请求提交，只控制本次 Team Checkout 的动态代理出口，不再继承 `/opt/openai-pay-long-link` 当前 UPI/PIX/Plus 路由地区，也不改写账单国家、币种或全局代理配置。
+- **Workspace 提供可编辑默认名称**：Team Workspace 输入框现在实际预填 `MyTeam`，用户仍可按批次修改；上游 Team profile 在管理默认值为空时也使用同一默认值，避免空 Workspace 到执行阶段才返回 422。
+
+### 优化 (Changed)
+- **代理国家贯穿配置身份与审计信息**：`api/tasks.py`、`services/chatgpt_core/payment_link_cache.py`、`long_link_payment_client.py` 和 `plugin.py` 将 `checkout_proxy_region` 纳入 profile 冻结、变体键、缓存复用、任务元数据、运行日志和支付历史。相同优惠码与 Workspace 在不同代理国家下会形成不同 Team 变体，不会复用其他地区生成的链接。
+- **支付国家语义拆分展示**：账号页 Team 配置预览分别展示“动态 IP 国家”和“账单国家 / 币种”，账号列表及详情历史显示实际 Team Checkout IP 国家；前端侧栏版本同步更新为 `v2.8.0`。
+
+### 修复 (Fixed)
+- **禁止 Team 国家静默回退**：Team profile 和批任务缺少有效两位国家码时，会在账号扫描及远端提交前直接拒绝；上游严格按所选国家改写动态代理并核验真实出口，地区不匹配时不会继续生成优惠链接。
+
+### 测试 (Tests)
+- 扩展 Team 支付专项、long-link 客户端和账号页合同测试，覆盖国家必填、大小写归一化、不同国家变体隔离、profile/batch 覆盖一致性、历史持久化、`MyTeam` 默认值及安全预览。
+
 ## [2.7.3] - 2026-07-23
 
 ### 优化 (Changed)
@@ -2137,4 +2153,8 @@
 
 ## 2026-07-23 15:45:57 +0800
 - 发布 v2.7.3：修复注册 Sentinel 浏览器代理与完整风控令牌
+- 发布模式: multi
+
+## 2026-07-24 00:48:01 +0800
+- 发布v2.8.0：Team优惠链接支持自主动态IP国家
 - 发布模式: multi

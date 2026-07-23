@@ -111,6 +111,8 @@ RETIRED_PAYMENT_REQUEST_KEYS = frozenset({
     "cancelUrl",
     "team_plan_data",
     "teamPlanData",
+    "checkout_proxy_region",
+    "checkoutProxyRegion",
 })
 
 
@@ -174,6 +176,15 @@ def _team_param_source(params: dict[str, Any] | None) -> dict[str, Any]:
     }
 
 
+def normalize_team_checkout_proxy_region(params: dict[str, Any] | None) -> str:
+    source = params if isinstance(params, dict) else {}
+    return str(
+        source.get("checkout_proxy_region")
+        or source.get("checkoutProxyRegion")
+        or ""
+    ).strip().upper()
+
+
 def _team_param_presence(params: dict[str, Any] | None) -> set[str]:
     """Return Team fields explicitly supplied by the caller.
 
@@ -204,6 +215,8 @@ def _team_param_presence(params: dict[str, Any] | None) -> set[str]:
         present.add("cancel_url")
     if any(key in source and source.get(key) not in (None, "") for key in ("plan_name", "planName")):
         present.add("plan_name")
+    if any(key in source and source.get(key) not in (None, "") for key in ("checkout_proxy_region", "checkoutProxyRegion")):
+        present.add("checkout_proxy_region")
     return present
 
 
@@ -214,8 +227,11 @@ def validate_team_payment_request_params(params: dict[str, Any] | None) -> None:
         raise ValueError("Team 支付请求必须指定 plan=team")
     values = _team_param_source(params)
     explicit = _team_param_presence(params)
-    # Omitted/blank values inherit the long-link admin profile.  Explicit
-    # values are still validated locally before any account task is created.
+    checkout_proxy_region = normalize_team_checkout_proxy_region(params)
+    if not re.fullmatch(r"[A-Z]{2}", checkout_proxy_region):
+        raise ValueError("Team 动态 IP 国家必须显式选择两位国家代码")
+    # Business fields may inherit the long-link admin profile. The checkout
+    # proxy country above is deliberately mandatory and request-scoped.
     if "workspace_name" in explicit and len(values["workspace_name"]) > 256:
         raise ValueError("Team Workspace 名称不能超过 256 个字符")
     if "price_interval" in explicit and values["price_interval"] not in {"month", "year"}:
@@ -261,6 +277,7 @@ def payment_link_variant_key(params: dict[str, Any] | None) -> str:
         "country": country,
         "currency": currency,
         "profile_hash": str(source.get("profile_hash") or source.get("payment_profile_hash") or "").strip(),
+        "checkout_proxy_region": normalize_team_checkout_proxy_region(source) if plan == PAYMENT_LINK_PLAN_TEAM else "",
     }
     if plan == PAYMENT_LINK_PLAN_TEAM:
         team = _team_param_source(source)
@@ -562,6 +579,7 @@ def normalize_payment_link_params(params: dict[str, Any] | None) -> dict[str, An
         "payment_link_format": payment_link_format,
         "payment_source": payment_source,
         "profile_hash": str(source.get("profile_hash") or source.get("payment_profile_hash") or "").strip(),
+        "checkout_proxy_region": normalize_team_checkout_proxy_region(source) if plan == PAYMENT_LINK_PLAN_TEAM else "",
     }
     if plan == PAYMENT_LINK_PLAN_TEAM:
         team = _team_param_source(source)
@@ -621,6 +639,7 @@ def payment_link_cache_matches(
         and cached_proxy == expected["proxy"]
         and cached_format == expected["payment_link_format"]
         and cached_source == expected["payment_source"]
+        and normalize_team_checkout_proxy_region(cached) == expected["checkout_proxy_region"]
     )
     if not matches:
         return False
@@ -827,6 +846,7 @@ def build_payment_link_cache_payload(
                 or (hashlib.sha256(team["promo_code"].encode("utf-8")).hexdigest() if team["promo_code"] else ""),
                 "cancel_url": team["cancel_url"],
                 "plan_name": team["plan_name"] or "chatgptteamplan",
+                "checkout_proxy_region": normalize_team_checkout_proxy_region(team_source),
             }
         )
     payload["variant_key"] = str(
@@ -955,6 +975,7 @@ def build_payment_link_cache_payload(
         "price_interval",
         "seat_quantity",
         "cancel_url",
+        "checkout_proxy_region",
     ):
         value = payload_source.get(key)
         if value is None or value == "":
