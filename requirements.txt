@@ -2,18 +2,19 @@ fastapi>=0.110.0
 uvicorn>=0.29.0
 quart>=0.19.4
 sqlmodel>=0.0.16
-curl_cffi>=0.6.0
+# Keep these aligned with services/chatgpt_core/sentinel_constants.py.
+curl_cffi==0.15.0
 requests>=2.31.0
 pysocks>=1.7.1
-playwright>=1.43.0
-patchright>=1.52.5
+playwright==1.58.0
+patchright==1.61.2
 pydantic>=2.0.0
 pydantic-settings>=2.2.1
 pyjwt>=2.8.0
 jwcrypto>=1.5.0
 cbor2>=5.4.0
 aiosqlite>=0.20.0
-camoufox>=0.4.0
+camoufox==0.5.4
 aiofiles>=23.0.0
 rich>=13.7.1
 pyinstaller>=6.0.0

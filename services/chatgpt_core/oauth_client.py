@@ -8,6 +8,7 @@ import uuid
 import json
 import random
 import re
+from contextlib import ExitStack
 from datetime import datetime, timezone
 from urllib.parse import urlparse, parse_qs, urlencode
 from core.proxy_utils import build_requests_proxy_config
@@ -38,6 +39,7 @@ from .utils import (
 )
 from .sentinel_token import build_sentinel_token
 from .sentinel_browser import get_sentinel_token_via_browser
+from .sentinel_constants import PINNED_CHROMIUM_VERSION
 
 
 class OAuthClient:
@@ -627,6 +629,18 @@ class OAuthClient:
             )
         return result
 
+    def _export_session_cookie_header_for_browser(self) -> str:
+        pairs = []
+        seen = set()
+        for item in self._export_session_cookies_for_playwright():
+            name = str(item.get("name") or "").strip()
+            value = str(item.get("value") or "").strip()
+            if not name or not value or name in seen:
+                continue
+            seen.add(name)
+            pairs.append(f"{name}={value}")
+        return "; ".join(pairs)
+
     def _merge_playwright_cookies_into_session(self, cookies: list[dict[str, object]]) -> int:
         merged = 0
         if not cookies:
@@ -682,7 +696,7 @@ class OAuthClient:
                 ensure_browser_display_available,
                 resolve_browser_headless,
             )
-            from core.proxy_utils import build_playwright_proxy_config
+            from core.playwright_proxy import playwright_proxy_context
         except Exception as exc:
             self._log(f"browser bootstrap: Playwright 不可用: {exc}")
             return "", False
@@ -698,7 +712,7 @@ class OAuthClient:
             or (fingerprint.user_agent if fingerprint else None)
             or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/136.0.7103.92 Safari/537.36"
+            f"Chrome/{PINNED_CHROMIUM_VERSION} Safari/537.36"
         )
         effective_accept_language = (
             (fingerprint.accept_language if fingerprint else None) or "en-US,en;q=0.9"
@@ -737,9 +751,6 @@ class OAuthClient:
             "headless": headless,
             "args": ["--no-sandbox", "--disable-blink-features=AutomationControlled"],
         }
-        proxy_config = build_playwright_proxy_config(self.proxy)
-        if proxy_config:
-            launch_kwargs["proxy"] = proxy_config
 
         encoded_params = urlencode(authorize_params or {}, doseq=True)
         nav_targets = []
@@ -783,7 +794,16 @@ class OAuthClient:
 
         final_url = ""
         try:
-            with sync_playwright() as p:
+            with ExitStack() as stack:
+                proxy_config = stack.enter_context(
+                    playwright_proxy_context(
+                        self.proxy,
+                        logger=lambda message: self._log(f"browser bootstrap: {message}"),
+                    )
+                )
+                if proxy_config:
+                    launch_kwargs["proxy"] = proxy_config
+                p = stack.enter_context(sync_playwright())
                 browser = p.chromium.launch(**launch_kwargs)
                 try:
                     context = browser.new_context(
@@ -2302,24 +2322,18 @@ class OAuthClient:
             platform_version=(self.browser_fingerprint.platform_version if self.browser_fingerprint else None),
             viewport_width=(self.browser_fingerprint.viewport_width if self.browser_fingerprint else None),
             viewport_height=(self.browser_fingerprint.viewport_height if self.browser_fingerprint else None),
+            cookie_header=self._export_session_cookie_header_for_browser(),
+            require_complete_signals=True,
             log_fn=lambda msg: self._log(f"oauth_create_account: {msg}"),
         )
         if sentinel_token:
             self._log("oauth_create_account: 已通过 Playwright SentinelSDK 获取 token")
         else:
-            sentinel_token = build_sentinel_token(
-                self.session,
-                device_id,
-                flow="oauth_create_account",
-                user_agent=user_agent,
-                sec_ch_ua=sec_ch_ua,
-                impersonate=impersonate,
+            self._set_error(
+                "sentinel_browser_unavailable: "
+                "oauth_create_account 未获得完整 p/t/c 浏览器令牌"
             )
-            if sentinel_token:
-                self._log("oauth_create_account: 已通过 HTTP PoW 获取 token")
-            else:
-                self._set_error("无法获取 sentinel token (oauth_create_account)")
-                return None
+            return None
 
         request_url = f"{self.oauth_issuer}/api/accounts/create_account"
         headers = self._headers(

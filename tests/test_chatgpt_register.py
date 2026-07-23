@@ -1166,6 +1166,32 @@ class OAuthClientBootstrapTests(unittest.TestCase):
         self.assertGreaterEqual(merged, 1)
         self.assertTrue(client._has_cookie("login_session"))
 
+    def test_about_you_requires_complete_browser_sentinel_without_http_fallback(self):
+        client = self._make_client()
+        client.session.post = mock.Mock()
+
+        with mock.patch(
+            "services.chatgpt_core.oauth_client.get_sentinel_token_via_browser",
+            return_value=None,
+        ) as browser_token, mock.patch(
+            "services.chatgpt_core.oauth_client.build_sentinel_token"
+        ) as http_token:
+            state = client._submit_about_you_create_account(
+                "Alice",
+                "Smith",
+                "1990-01-01",
+                "device-demo",
+                user_agent="UA",
+                sec_ch_ua='"Chromium";v="145"',
+                impersonate="chrome145",
+            )
+
+        self.assertIsNone(state)
+        self.assertIn("sentinel_browser_unavailable", client.last_error)
+        self.assertTrue(browser_token.call_args.kwargs["require_complete_signals"])
+        http_token.assert_not_called()
+        client.session.post.assert_not_called()
+
     def test_stop_after_login_waits_for_existing_phone_otp_handling(self):
         client = self._make_client()
         email_otp_state = FlowState(

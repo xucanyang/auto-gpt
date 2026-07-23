@@ -13,28 +13,23 @@ import re
 from urllib.parse import urlparse
 from typing import Any, Dict
 
+from .sentinel_constants import (
+    PINNED_CHROMIUM_MAJOR,
+    PINNED_CHROMIUM_VERSION,
+    PINNED_CURL_IMPERSONATE,
+)
+
 
 _CHROME_PROFILES = [
     {
-        "major": 131,
-        "impersonate": "chrome131",
-        "build": 6778,
-        "patch_range": (69, 205),
-        "sec_ch_ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
-    },
-    {
-        "major": 133,
-        "impersonate": "chrome133a",
-        "build": 6943,
-        "patch_range": (33, 153),
-        "sec_ch_ua": '"Not(A:Brand";v="99", "Google Chrome";v="133", "Chromium";v="133"',
-    },
-    {
-        "major": 136,
-        "impersonate": "chrome136",
-        "build": 7103,
-        "patch_range": (48, 175),
-        "sec_ch_ua": '"Chromium";v="136", "Google Chrome";v="136", "Not.A/Brand";v="99"',
+        "major": PINNED_CHROMIUM_MAJOR,
+        "impersonate": PINNED_CURL_IMPERSONATE,
+        "full_version": PINNED_CHROMIUM_VERSION,
+        "sec_ch_ua": (
+            f'"Chromium";v="{PINNED_CHROMIUM_MAJOR}", '
+            f'"Google Chrome";v="{PINNED_CHROMIUM_MAJOR}", '
+            '"Not.A/Brand";v="99"'
+        ),
     },
 ]
 
@@ -95,9 +90,7 @@ def generate_browser_fingerprint(device_id=None, accept_language=None):
     """生成任务级一致浏览器指纹。"""
     profile = random.choice(_CHROME_PROFILES)
     major = profile["major"]
-    build = profile["build"]
-    patch = random.randint(*profile["patch_range"])
-    chrome_full_version = f"{major}.0.{build}.{patch}"
+    chrome_full_version = profile["full_version"]
     user_agent = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "

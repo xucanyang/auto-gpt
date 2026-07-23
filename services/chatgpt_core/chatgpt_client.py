@@ -77,6 +77,25 @@ class ChatGPTClient:
             "url": "",
         }
 
+    def _get_openai_cookie_header(self) -> str:
+        pairs = []
+        seen = set()
+        jar = getattr(getattr(self.session, "cookies", None), "jar", None)
+        if jar is None:
+            return ""
+        for cookie in jar:
+            domain = str(getattr(cookie, "domain", "") or "").lower()
+            name = str(getattr(cookie, "name", "") or "").strip()
+            value = str(getattr(cookie, "value", "") or "").strip()
+            if "openai.com" not in domain or not name or not value:
+                continue
+            key = (name, value)
+            if key in seen:
+                continue
+            seen.add(key)
+            pairs.append(f"{name}={value}")
+        return "; ".join(pairs)
+
     def _get_sentinel_token(self, flow: str, *, page_url: str | None = None):
         prefer_browser = flow in {"username_password_create", "oauth_create_account"}
         if prefer_browser:
@@ -93,11 +112,17 @@ class ChatGPTClient:
                 platform_version=self.chrome_platform_version,
                 viewport_width=self.viewport_width,
                 viewport_height=self.viewport_height,
+                cookie_header=self._get_openai_cookie_header(),
+                require_complete_signals=True,
                 log_fn=lambda msg: self._log(msg),
             )
             if token:
                 self._log(f"{flow}: 已通过 Playwright SentinelSDK 获取 token")
                 return token
+            self._log(
+                f"{flow}: sentinel_browser_unavailable，未获得完整 p/t/c 浏览器令牌"
+            )
+            return None
 
         token = build_sentinel_token(
             self.session,
@@ -770,8 +795,14 @@ class ChatGPTClient:
             "username_password_create",
             page_url=f"{self.AUTH}/create-account/password",
         )
-        if sentinel_token:
-            headers["openai-sentinel-token"] = sentinel_token
+        if not sentinel_token:
+            detail = (
+                "sentinel_browser_unavailable: "
+                "username_password_create 未获得完整 Sentinel 浏览器令牌"
+            )
+            self._log(f"注册失败: {detail}")
+            return False, detail
+        headers["openai-sentinel-token"] = sentinel_token
 
         payload = {
             "username": email,
@@ -923,10 +954,14 @@ class ChatGPTClient:
             "oauth_create_account",
             page_url=f"{self.AUTH}/about-you",
         )
-        if sentinel_token:
-            self._log("create_account: 已生成 sentinel token")
-        else:
-            self._log("create_account: 未生成 sentinel token，降级继续请求")
+        if not sentinel_token:
+            detail = (
+                "sentinel_browser_unavailable: "
+                "oauth_create_account 未获得完整 Sentinel 浏览器令牌"
+            )
+            self._log(f"create_account: {detail}")
+            return False, detail
+        self._log("create_account: 已生成完整 Sentinel 浏览器 token")
 
         headers = self._headers(
             url,
@@ -939,8 +974,7 @@ class ChatGPTClient:
                 "oai-device-id": self.device_id,
             },
         )
-        if sentinel_token:
-            headers["openai-sentinel-token"] = sentinel_token
+        headers["openai-sentinel-token"] = sentinel_token
         headers.update(generate_datadog_trace())
 
         payload = {

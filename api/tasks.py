@@ -15848,6 +15848,11 @@ def _run_batch_probe_local_status(task_id: str, account_ids: list[int], params: 
         _task_store.cleanup()
 
 
+def _is_fatal_registration_infrastructure_error(message: Any) -> bool:
+    text = str(message or "").strip().lower()
+    return "sentinel_browser_unavailable" in text
+
+
 def _run_register(task_id: str, req: RegisterTaskRequest):
 
     from core.base_platform import RegisterConfig
@@ -15862,6 +15867,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
     success = 0
     skipped = 0
     errors = []
+    fatal_registration_error = ""
     start_gate_lock = threading.Lock()
     next_start_time = time.time()
 
@@ -16862,8 +16868,21 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                         stopped = True
                     elif result.outcome == AttemptOutcome.FAILED:
                         errors.append(result.message)
+                        if _is_fatal_registration_infrastructure_error(result.message):
+                            fatal_registration_error = str(result.message or "").strip()
+                            _log(
+                                task_id,
+                                "[FATAL] Sentinel 浏览器基础设施不可用，立即停止后续注册尝试",
+                            )
+                            control.request_stop()
 
                     _task_store.set_progress(task_id, f"{success}/{target_successes}")
+
+                    if fatal_registration_error:
+                        for pending in list(in_flight.keys()):
+                            pending.cancel()
+                        in_flight.clear()
+                        break
 
                     if success >= target_successes:
                         stopped = True
@@ -16926,7 +16945,9 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
 
     if 'attempt_limit_reached' in locals() and attempt_limit_reached and success < target_successes:
         errors.append(f"已达到注册最大尝试次数 {attempt_cap}，成功 {success}/{target_successes}")
-    if success >= target_successes:
+    if fatal_registration_error:
+        final_status = "failed"
+    elif success >= target_successes:
         final_status = "done"
     elif errors and not (
         control.is_stop_requested()
@@ -16986,6 +17007,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
         success=success,
         skipped=skipped,
         errors=errors,
+        error=fatal_registration_error,
     )
     _persist_register_task_snapshot(
         task_id,
@@ -16997,6 +17019,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
             if final_status == "done"
             else "register_failed"
         ),
+        error=fatal_registration_error,
     )
     if 'initial_email_api_entry' in locals() and initial_email_api_entry:
         try:

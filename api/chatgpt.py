@@ -40,6 +40,7 @@ from services.chatgpt_core.codex_usage import (
 )
 from services.chatgpt_core.local_status_refresh import schedule_chatgpt_local_status_refresh_for_account_id
 from services.chatgpt_core.payment_link_cache import validate_plus_payment_request_params
+from services.chatgpt_core.sentinel_constants import PINNED_CHROMIUM_VERSION
 import json, sys
 
 
@@ -655,24 +656,6 @@ def _resolve_browser_auth_proxy(proxy: Optional[str] = None) -> str:
         raise HTTPException(400, f"默认代理解析失败: {exc}") from exc
 
 
-def _is_authenticated_socks_proxy(proxy: Optional[str]) -> bool:
-    from urllib.parse import urlsplit
-
-    parts = urlsplit(str(proxy or "").strip())
-    return parts.scheme.lower().startswith("socks") and bool(parts.username or parts.password)
-
-
-def _playwright_proxy_config_for_browser_auth(proxy: Optional[str]) -> dict[str, str] | None:
-    from core.proxy_utils import build_playwright_proxy_config
-
-    if _is_authenticated_socks_proxy(proxy):
-        raise HTTPException(
-            400,
-            "浏览器登录不支持带账号密码认证的 SOCKS 代理，请改用 HTTP/HTTPS 代理或无认证 SOCKS 代理",
-        )
-    return build_playwright_proxy_config(proxy or None)
-
-
 async def _browser_auth_goto(state: Any, url: Optional[str]) -> None:
     if state.page is None:
         raise HTTPException(410, "浏览器已关闭")
@@ -1264,6 +1247,7 @@ class _BrowserAuthSession:
         self.browser = None
         self.context = None
         self.page = None
+        self.proxy_context = None
         self.user_agent = ""
         self.accept_language = "en-US,en;q=0.9"
         self.sec_ch_ua = ""
@@ -1359,10 +1343,16 @@ async def _browser_auth_close_state(state: _BrowserAuthSession) -> None:
                 await state.playwright.stop()
             except Exception:
                 pass
+        if state.proxy_context is not None:
+            try:
+                state.proxy_context.__exit__(None, None, None)
+            except Exception:
+                pass
         state.browser = None
         state.context = None
         state.page = None
         state.playwright = None
+        state.proxy_context = None
         state.updated_at = datetime.now(timezone.utc)
     _BROWSER_AUTH_SESSIONS.pop(state.capture_id, None)
 
@@ -1408,7 +1398,7 @@ def _account_browser_fingerprint(acc: AccountModel) -> dict[str, Any]:
             **resolved,
             "user_agent": resolved.get("user_agent")
             or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-               "(KHTML, like Gecko) Chrome/136.0.7103.92 Safari/537.36",
+               f"(KHTML, like Gecko) Chrome/{PINNED_CHROMIUM_VERSION} Safari/537.36",
             "accept_language": resolved.get("accept_language") or "en-US,en;q=0.9",
             "sec_ch_ua": resolved.get("sec_ch_ua") or _sec_ch_ua_for_major(
                 int(resolved.get("chrome_major") or _infer_chrome_major(str(resolved.get("user_agent") or "")) or 136)
@@ -1427,7 +1417,7 @@ def _account_browser_fingerprint(acc: AccountModel) -> dict[str, Any]:
         str(registration_context.get("user_agent") or "").strip()
         or str(browser_fingerprint.get("user_agent") or "").strip()
         or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-           "(KHTML, like Gecko) Chrome/136.0.7103.92 Safari/537.36"
+           f"(KHTML, like Gecko) Chrome/{PINNED_CHROMIUM_VERSION} Safari/537.36"
     )
     major = _infer_chrome_major(user_agent)
     return {
@@ -3209,7 +3199,7 @@ async def start_browser_auth(account_id: int, req: BrowserAuthStartReq,
 
     try:
         from playwright.async_api import async_playwright
-        from core.proxy_utils import build_playwright_proxy_config
+        from core.playwright_proxy import playwright_proxy_context
     except Exception as exc:
         raise HTTPException(500, f"Playwright 不可用: {exc}") from exc
 
@@ -3234,7 +3224,8 @@ async def start_browser_auth(account_id: int, req: BrowserAuthStartReq,
                 "--force-device-scale-factor=1",
             ],
         }
-        proxy_config = _playwright_proxy_config_for_browser_auth(proxy or None)
+        state.proxy_context = playwright_proxy_context(proxy or None)
+        proxy_config = state.proxy_context.__enter__()
         if proxy_config:
             launch_args["proxy"] = proxy_config
         try:

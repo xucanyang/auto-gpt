@@ -1,0 +1,11 @@
+PINNED_CHROMIUM_VERSION = "145.0.7632.6"
+PINNED_CHROMIUM_MAJOR = 145
+PINNED_CURL_IMPERSONATE = "chrome145"
+DEFAULT_SENTINEL_SDK_VERSION = "20260219f9f6"
+DEFAULT_SENTINEL_FRAME_URL = (
+    "https://sentinel.openai.com/backend-api/sentinel/frame.html"
+    f"?sv={DEFAULT_SENTINEL_SDK_VERSION}"
+)
+DEFAULT_SENTINEL_SDK_URL = (
+    f"https://sentinel.openai.com/sentinel/{DEFAULT_SENTINEL_SDK_VERSION}/sdk.js"
+)

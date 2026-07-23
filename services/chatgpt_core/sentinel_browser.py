@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+from contextlib import ExitStack
 from typing import Any, Callable, Optional
 from urllib.parse import urlsplit
 
@@ -12,8 +13,13 @@ from core.browser_runtime import (
     ensure_browser_display_available,
     resolve_browser_headless,
 )
-from core.proxy_utils import build_playwright_proxy_config
+from core.playwright_proxy import playwright_proxy_context
 
+from .sentinel_constants import (
+    DEFAULT_SENTINEL_FRAME_URL,
+    DEFAULT_SENTINEL_SDK_URL,
+    PINNED_CHROMIUM_VERSION,
+)
 from .utils import build_sec_ch_ua_full_version_list, extract_chrome_full_version
 
 
@@ -27,6 +33,16 @@ def _flow_page_url(flow: str) -> str:
         "oauth_create_account": "https://auth.openai.com/about-you",
     }
     return mapping.get(flow_name, "https://auth.openai.com/about-you")
+
+
+def _sentinel_token_field_state(token: str) -> Optional[dict[str, bool]]:
+    try:
+        parsed = json.loads(str(token or ""))
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    return {key: bool(parsed.get(key)) for key in ("p", "t", "c")}
 
 
 def _thread_has_running_asyncio_loop() -> bool:
@@ -87,6 +103,7 @@ def get_sentinel_token_via_browser(
     viewport_width: Optional[int] = None,
     viewport_height: Optional[int] = None,
     cookie_header: Optional[str] = None,
+    require_complete_signals: bool = False,
     log_fn: Optional[Callable[[str], None]] = None,
 ) -> Optional[str]:
     """通过浏览器直接调用 SentinelSDK.token(flow) 获取完整 token。"""
@@ -107,6 +124,7 @@ def get_sentinel_token_via_browser(
             viewport_width=viewport_width,
             viewport_height=viewport_height,
             cookie_header=cookie_header,
+            require_complete_signals=require_complete_signals,
             log_fn=logger,
         ),
         logger=logger,
@@ -130,6 +148,7 @@ def _get_sentinel_token_via_browser_sync(
     viewport_width: Optional[int] = None,
     viewport_height: Optional[int] = None,
     cookie_header: Optional[str] = None,
+    require_complete_signals: bool = False,
     log_fn: Optional[Callable[[str], None]] = None,
 ) -> Optional[str]:
     logger = log_fn or (lambda _msg: None)
@@ -140,7 +159,8 @@ def _get_sentinel_token_via_browser_sync(
         logger(f"Sentinel Browser 不可用: {e}")
         return None
 
-    target_url = str(page_url or _flow_page_url(flow)).strip() or _flow_page_url(flow)
+    logical_page_url = str(page_url or _flow_page_url(flow)).strip() or _flow_page_url(flow)
+    target_url = DEFAULT_SENTINEL_FRAME_URL
     effective_headless, reason = resolve_browser_headless(headless)
     ensure_browser_display_available(effective_headless)
     logger(
@@ -151,7 +171,7 @@ def _get_sentinel_token_via_browser_sync(
         user_agent
         or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/136.0.7103.92 Safari/537.36"
+        f"Chrome/{PINNED_CHROMIUM_VERSION} Safari/537.36"
     )
     effective_chrome_full = chrome_full_version or extract_chrome_full_version(effective_user_agent)
     effective_accept_language = str(accept_language or "en-US,en;q=0.9")
@@ -189,11 +209,9 @@ def _get_sentinel_token_via_browser_sync(
             "--disable-blink-features=AutomationControlled",
         ],
     }
-    proxy_config = build_playwright_proxy_config(proxy)
-    if proxy_config:
-        launch_args["proxy"] = proxy_config
-
-    logger(f"Sentinel Browser 启动: flow={flow}, url={target_url}")
+    logger(
+        f"Sentinel Browser 启动: flow={flow}, page={logical_page_url}, frame={target_url}"
+    )
     logger(
         "Sentinel Browser 参数: "
         f"launch_timeout={launch_timeout_ms}ms, "
@@ -206,7 +224,20 @@ def _get_sentinel_token_via_browser_sync(
     page = None
     stage = "bootstrap"
 
-    with sync_playwright() as p:
+    stack = ExitStack()
+    try:
+        proxy_config = stack.enter_context(
+            playwright_proxy_context(proxy, logger=logger)
+        )
+        if proxy_config:
+            launch_args["proxy"] = proxy_config
+        p = stack.enter_context(sync_playwright())
+    except Exception as exc:
+        stack.close()
+        logger(f"Sentinel Browser 异常(stage=proxy_setup): {exc}")
+        return None
+
+    with stack:
         try:
             stage = "launch"
             logger("Sentinel Browser 阶段: launch chromium")
@@ -226,11 +257,11 @@ def _get_sentinel_token_via_browser_sync(
             cookie_names: set[str] = set()
             if cookie_header:
                 cookie_items = []
-                target_parts = urlsplit(target_url)
+                target_parts = urlsplit(logical_page_url)
                 cookie_url = (
                     f"{target_parts.scheme or 'https'}://{target_parts.netloc}/"
                     if target_parts.netloc
-                    else target_url
+                    else logical_page_url
                 )
                 for part in str(cookie_header or "").split(";"):
                     text = part.strip()
@@ -258,25 +289,33 @@ def _get_sentinel_token_via_browser_sync(
                         logger(f"Sentinel Browser add cookie_header 失败: {cookie_exc}")
             if device_id:
                 try:
-                    target_parts = urlsplit(target_url)
-                    device_cookie_url = (
-                        f"{target_parts.scheme or 'https'}://{target_parts.netloc}/"
-                        if target_parts.netloc
+                    logical_parts = urlsplit(logical_page_url)
+                    logical_cookie_url = (
+                        f"{logical_parts.scheme or 'https'}://{logical_parts.netloc}/"
+                        if logical_parts.netloc
                         else "https://auth.openai.com/"
                     )
+                    device_cookies = [
+                        {
+                            "name": "oai-did",
+                            "value": str(device_id),
+                            "url": "https://sentinel.openai.com/",
+                            "secure": True,
+                            "sameSite": "Lax",
+                        }
+                    ]
                     if "oai-did" not in cookie_names:
-                        context.add_cookies(
-                            [
-                                {
-                                    "name": "oai-did",
-                                    "value": str(device_id),
-                                    "url": device_cookie_url,
-                                    "secure": True,
-                                    "sameSite": "Lax",
-                                }
-                            ]
+                        device_cookies.append(
+                            {
+                                "name": "oai-did",
+                                "value": str(device_id),
+                                "url": logical_cookie_url,
+                                "secure": True,
+                                "sameSite": "Lax",
+                            }
                         )
-                        logger("Sentinel Browser 阶段完成: add cookies")
+                    context.add_cookies(device_cookies)
+                    logger("Sentinel Browser 阶段完成: add device cookies")
                 except Exception as cookie_exc:
                     logger(f"Sentinel Browser add cookies 失败: {cookie_exc}")
 
@@ -289,15 +328,40 @@ def _get_sentinel_token_via_browser_sync(
 
             stage = "goto"
             logger(f"Sentinel Browser 阶段: page.goto -> {target_url}")
-            page.goto(target_url, wait_until="domcontentloaded", timeout=int(timeout_ms or 45000))
+            page.goto(target_url, wait_until="load", timeout=int(timeout_ms or 45000))
             logger(f"Sentinel Browser 阶段完成: page.goto -> {page.url}")
 
             stage = "wait_sentinel_sdk"
             logger("Sentinel Browser 阶段: wait SentinelSDK ready")
-            page.wait_for_function(
-                "() => typeof window.SentinelSDK !== 'undefined' && typeof window.SentinelSDK.token === 'function'",
-                timeout=sdk_wait_timeout_ms,
-            )
+            try:
+                page.wait_for_function(
+                    "() => typeof window.SentinelSDK !== 'undefined' && typeof window.SentinelSDK.token === 'function'",
+                    timeout=sdk_wait_timeout_ms,
+                )
+            except Exception:
+                logger("Sentinel Browser 未发现 SDK，注入当前固定版本")
+                page.evaluate(
+                    """
+                    async (sdkUrl) => {
+                        const existing = Array.from(document.scripts || [])
+                            .some((item) => item.src === sdkUrl);
+                        if (existing) return;
+                        await new Promise((resolve, reject) => {
+                            const script = document.createElement('script');
+                            script.src = sdkUrl;
+                            script.async = true;
+                            script.onload = () => resolve(true);
+                            script.onerror = () => reject(new Error(`Failed to load ${sdkUrl}`));
+                            document.head.appendChild(script);
+                        });
+                    }
+                    """,
+                    DEFAULT_SENTINEL_SDK_URL,
+                )
+                page.wait_for_function(
+                    "() => typeof window.SentinelSDK !== 'undefined' && typeof window.SentinelSDK.token === 'function'",
+                    timeout=sdk_wait_timeout_ms,
+                )
             logger("Sentinel Browser 阶段完成: wait SentinelSDK ready")
 
             stage = "evaluate_token"
@@ -306,6 +370,9 @@ def _get_sentinel_token_via_browser_sync(
                 """
                 async ({ flow, timeoutMs }) => {
                     try {
+                        if (typeof window.SentinelSDK.init === 'function') {
+                            await window.SentinelSDK.init(flow);
+                        }
                         const token = await Promise.race([
                             window.SentinelSDK.token(flow),
                             new Promise((_, reject) =>
@@ -338,15 +405,23 @@ def _get_sentinel_token_via_browser_sync(
                 return None
 
             try:
-                parsed = json.loads(token)
+                field_state = _sentinel_token_field_state(token)
+                if field_state is None:
+                    raise ValueError("not a Sentinel JSON object")
                 logger(
                     "Sentinel Browser 成功: "
-                    f"p={'✓' if parsed.get('p') else '✗'} "
-                    f"t={'✓' if parsed.get('t') else '✗'} "
-                    f"c={'✓' if parsed.get('c') else '✗'}"
+                    f"p={'✓' if field_state['p'] else '✗'} "
+                    f"t={'✓' if field_state['t'] else '✗'} "
+                    f"c={'✓' if field_state['c'] else '✗'}"
                 )
+                if require_complete_signals and not all(field_state.values()):
+                    logger("Sentinel Browser 令牌缺少完整 p/t/c 信号，拒绝降级使用")
+                    return None
             except Exception:
                 logger(f"Sentinel Browser 成功: len={len(token)}")
+                if require_complete_signals:
+                    logger("Sentinel Browser 令牌格式不可验证，拒绝降级使用")
+                    return None
 
             return token
         except Exception as e:

@@ -7,6 +7,7 @@ import os
 import tempfile
 import uuid
 from abc import ABC, abstractmethod
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,19 +18,24 @@ from core.browser_runtime import (
     resolve_browser_headless,
 )
 from core.config_store import ConfigStore, config_store
+from core.playwright_proxy import playwright_proxy_context
 from core.proxy_pool import ProxyPool, proxy_pool
-from core.proxy_utils import build_playwright_proxy_config, normalize_proxy_url
+from core.proxy_utils import normalize_proxy_url
 
-
-DEFAULT_SDK_VERSION = "20260219f9f6"
-DEFAULT_FRAME_URL = (
-    f"https://sentinel.openai.com/backend-api/sentinel/frame.html?sv={DEFAULT_SDK_VERSION}"
+from .sentinel_constants import (
+    DEFAULT_SENTINEL_FRAME_URL,
+    DEFAULT_SENTINEL_SDK_URL,
+    DEFAULT_SENTINEL_SDK_VERSION,
+    PINNED_CHROMIUM_VERSION,
 )
-DEFAULT_SDK_URL = f"https://sentinel.openai.com/sentinel/{DEFAULT_SDK_VERSION}/sdk.js"
+
+DEFAULT_SDK_VERSION = DEFAULT_SENTINEL_SDK_VERSION
+DEFAULT_FRAME_URL = DEFAULT_SENTINEL_FRAME_URL
+DEFAULT_SDK_URL = DEFAULT_SENTINEL_SDK_URL
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/136.0.7103.92 Safari/537.36"
+    f"Chrome/{PINNED_CHROMIUM_VERSION} Safari/537.36"
 )
 DEFAULT_OUT = Path(tempfile.gettempdir()) / "sentinel_multi_helper_out.json"
 DEFAULT_FLOW_SPECS: tuple["FlowSpec", ...]
@@ -308,61 +314,71 @@ class PlaywrightSentinelProvider(SentinelProvider):
         self._context = None
         self._page = None
         self._resolved_sdk_url = config.sdk_url
+        self._exit_stack: Optional[ExitStack] = None
 
     def __enter__(self) -> "PlaywrightSentinelProvider":
         from playwright.sync_api import sync_playwright
 
         ensure_browser_display_available(self._config.headless)
-        self._playwright = sync_playwright().start()
+        stack = ExitStack()
+        self._exit_stack = stack
 
-        launch_kwargs: dict[str, object] = {
-            "headless": self._config.headless,
-            "args": [
-                "--no-sandbox",
-                "--disable-blink-features=AutomationControlled",
-            ],
-        }
-        proxy_config = build_playwright_proxy_config(self._config.proxy)
-        if proxy_config:
-            launch_kwargs["proxy"] = proxy_config
+        try:
+            proxy_config = stack.enter_context(
+                playwright_proxy_context(self._config.proxy)
+            )
+            self._playwright = sync_playwright().start()
+            stack.callback(self._playwright.stop)
 
-        self._browser = self._playwright.chromium.launch(**launch_kwargs)
-        self._context = self._browser.new_context(
-            user_agent=self._config.user_agent,
-            locale="en-US",
-            viewport={"width": 1920, "height": 1080},
-            ignore_https_errors=True,
-        )
-        self._context.add_cookies(
-            [
-                {
-                    "name": "oai-did",
-                    "value": self._device_id,
-                    "url": "https://sentinel.openai.com/",
-                    "path": "/",
-                    "secure": True,
-                    "sameSite": "Lax",
-                },
-                {
-                    "name": "oai-did",
-                    "value": self._device_id,
-                    "url": "https://auth.openai.com/",
-                    "path": "/",
-                    "secure": True,
-                    "sameSite": "Lax",
-                },
-            ]
-        )
-        self._page = self._context.new_page()
-        self._page.goto(self._config.frame_url, wait_until="load", timeout=self._timeout_ms)
-        self._ensure_sdk_loaded()
-        return self
+            launch_kwargs: dict[str, object] = {
+                "headless": self._config.headless,
+                "args": [
+                    "--no-sandbox",
+                    "--disable-blink-features=AutomationControlled",
+                ],
+            }
+            if proxy_config:
+                launch_kwargs["proxy"] = proxy_config
+
+            self._browser = self._playwright.chromium.launch(**launch_kwargs)
+            stack.callback(self._browser.close)
+            self._context = self._browser.new_context(
+                user_agent=self._config.user_agent,
+                locale="en-US",
+                viewport={"width": 1920, "height": 1080},
+                ignore_https_errors=True,
+            )
+            self._context.add_cookies(
+                [
+                    {
+                        "name": "oai-did",
+                        "value": self._device_id,
+                        "url": "https://sentinel.openai.com/",
+                        "secure": True,
+                        "sameSite": "Lax",
+                    },
+                    {
+                        "name": "oai-did",
+                        "value": self._device_id,
+                        "url": "https://auth.openai.com/",
+                        "secure": True,
+                        "sameSite": "Lax",
+                    },
+                ]
+            )
+            self._page = self._context.new_page()
+            self._page.goto(self._config.frame_url, wait_until="load", timeout=self._timeout_ms)
+            self._ensure_sdk_loaded()
+            return self
+        except Exception:
+            stack.close()
+            self._exit_stack = None
+            raise
 
     def __exit__(self, exc_type, exc, tb) -> None:
-        if self._browser is not None:
-            self._browser.close()
-        if self._playwright is not None:
-            self._playwright.stop()
+        if self._exit_stack is not None:
+            self._exit_stack.close()
+            self._exit_stack = None
 
     def _ensure_sdk_loaded(self) -> None:
         assert self._page is not None

@@ -18,6 +18,7 @@ from api.tasks import (
     _create_task_record,
     _create_standalone_task_record,
     _build_effective_register_extra,
+    _is_fatal_registration_infrastructure_error,
     _prepare_register_request,
     _run_batch_resume_subscription_auth,
     _run_phone_binding_test,
@@ -289,6 +290,51 @@ class EmailApiRegisterRequestTests(unittest.TestCase):
 
 
 class RegisterTaskControlFlowTests(unittest.TestCase):
+    def test_sentinel_browser_unavailable_is_fatal_for_registration_batch(self):
+        self.assertTrue(
+            _is_fatal_registration_infrastructure_error(
+                "注册流失败: sentinel_browser_unavailable: oauth_create_account"
+            )
+        )
+        self.assertFalse(
+            _is_fatal_registration_infrastructure_error(
+                "注册流失败: HTTP 400: registration_disallowed"
+            )
+        )
+
+    def test_fatal_sentinel_error_stops_scheduling_new_registration_attempts(self):
+        calls = []
+
+        class FatalSentinelPlatform(_FakePlatform):
+            def register(self, email=None, password=None):
+                calls.append((email, password))
+                raise RuntimeError(
+                    "sentinel_browser_unavailable: oauth_create_account"
+                )
+
+        task_id = "task-fatal-sentinel"
+        req = RegisterTaskRequest(
+            platform="chatgpt",
+            count=10,
+            concurrency=1,
+            proxy_mode="direct",
+            extra={"mail_provider": "fake"},
+        )
+        _create_task_record(task_id, req, "manual", None)
+
+        with (
+            patch("services.chatgpt_core.ChatGPTPlatform", FatalSentinelPlatform),
+            patch("core.proxy_utils.resolve_task_proxy_candidates", return_value=[("", None, "direct")]),
+            patch("core.base_mailbox.create_mailbox", return_value=_FakeMailbox()),
+            patch("api.tasks._save_task_log"),
+        ):
+            _run_register(task_id, req)
+
+        snapshot = _task_store.snapshot(task_id)
+        self.assertEqual(snapshot["status"], "failed")
+        self.assertEqual(len(calls), 1)
+        self.assertIn("sentinel_browser_unavailable", snapshot["error"])
+
     def _build_request(self):
         return RegisterTaskRequest(
             platform="chatgpt",

@@ -5,7 +5,7 @@ from typing import Any
 
 from ..base_executor import BaseExecutor, Response
 from ..browser_runtime import ensure_browser_display_available, resolve_browser_headless
-from ..proxy_utils import build_playwright_proxy_config
+from ..playwright_proxy import playwright_proxy_context
 
 
 logger = logging.getLogger(__name__)
@@ -19,6 +19,7 @@ class PlaywrightExecutor(BaseExecutor):
         self._browser: Any | None = None
         self._context: Any | None = None
         self._page: Any | None = None
+        self._proxy_context: Any | None = None
         self._init()
 
     def _init(self) -> None:
@@ -35,12 +36,25 @@ class PlaywrightExecutor(BaseExecutor):
 
         launch_opts: dict[str, Any] = {"headless": headless}
         if self.proxy:
-            proxy_cfg = build_playwright_proxy_config(self.proxy)
+            self._proxy_context = playwright_proxy_context(self.proxy)
+            proxy_cfg = self._proxy_context.__enter__()
             if proxy_cfg:
                 launch_opts["proxy"] = proxy_cfg
-        self._browser = self._pw.chromium.launch(**launch_opts)
-        self._context = self._browser.new_context()
-        self._page = self._context.new_page()
+        try:
+            self._browser = self._pw.chromium.launch(**launch_opts)
+            self._context = self._browser.new_context()
+            self._page = self._context.new_page()
+        except Exception:
+            if self._browser is not None:
+                self._browser.close()
+                self._browser = None
+            if self._pw is not None:
+                self._pw.stop()
+                self._pw = None
+            if self._proxy_context is not None:
+                self._proxy_context.__exit__(None, None, None)
+                self._proxy_context = None
+            raise
 
     def _require_page(self) -> Any:
         if self._page is None:
@@ -120,3 +134,6 @@ class PlaywrightExecutor(BaseExecutor):
             self._browser.close()
         if self._pw:
             self._pw.stop()
+        if self._proxy_context is not None:
+            self._proxy_context.__exit__(None, None, None)
+            self._proxy_context = None

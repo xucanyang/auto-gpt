@@ -6,6 +6,19 @@
 
 ## [Unreleased] (未发布)
 
+## [2.7.3] - 2026-07-23
+
+### 优化 (Changed)
+- **注册浏览器与协议指纹重新对齐**：`requirements.txt` 将相关运行栈固定为 `playwright 1.58.0 / Chromium 145.0.7632.6 / curl_cffi 0.15.0 chrome145`，`services/chatgpt_core/utils.py` 只为新注册尝试生成同版本 User-Agent、Client Hints 与 TLS impersonate。修复镜像无上限依赖已漂移到 Chromium 148、任务仍随机声明 Chrome 131/133/136 的跨层指纹矛盾；`frontend/src/app/AppShell.tsx` 同步展示 `v2.7.3`。
+- **Sentinel 入口与会话信号统一**：`services/chatgpt_core/sentinel_browser.py` 改为在项目已验证的 Sentinel frame 与固定 SDK 上调用 `SentinelSDK.init/token`，同时携带本次注册的 `oai-did`、OpenAI 会话 Cookie、语言、视口和完整 Client Hints。`sentinel_batch.py` 与 OAuth 浏览器 bootstrap 复用同一组 URL、浏览器版本和代理适配，避免同一注册流程内部再次漂移。
+
+### 修复 (Fixed)
+- **修复认证 SOCKS 代理导致 Sentinel 浏览器完全不可用**：新增 `core/playwright_proxy.py`，把 Playwright 不支持的“带账号密码 SOCKS5”安全适配为仅监听 loopback 的临时 HTTP CONNECT 代理，再通过 PySocks 使用原凭据和远端 DNS 转发。注册 Sentinel、OAuth bootstrap、账号浏览器登录、批量 Sentinel 与通用 Playwright executor 全部接入该适配，解决动态 Cliproxy 下 `net::ERR_NO_SUPPORTED_PROXIES` 后持续 `registration_disallowed` 的主故障。
+- **禁止注册用残缺 Sentinel token 继续撞接口**：`ChatGPTClient` 与 `OAuthClient` 的创建账号阶段必须拿到浏览器生成且同时包含 `p/t/c` 的 token；浏览器失败时不再降级到只有 PoW 的 HTTP token，也不会继续提交 `create_account`。`api/tasks.py` 将 `sentinel_browser_unavailable` 视为基础设施故障并立即停止批次，避免连续消耗邮箱、代理和注册尝试。
+
+### 测试 (Tests)
+- **代理、Sentinel 与批次停止回归**：新增认证 SOCKS loopback 适配、远端 DNS、完整 `p/t/c` 校验、Cookie 传递、禁止 HTTP 降级、创建前终止、浏览器版本锁定和批次 fail-fast 覆盖；真实 Sentinel 探针已分别验证直连与当前动态认证 SOCKS 代理均可返回完整 `p/t/c` token。
+
 ## [2.7.2] - 2026-07-23
 
 ### 优化 (Changed)
@@ -2120,4 +2133,8 @@
 
 ## 2026-07-23 11:09:06 +0800
 - 发布 v2.7.2：本地订阅状态缺失自动补刷
+- 发布模式: multi
+
+## 2026-07-23 15:45:57 +0800
+- 发布 v2.7.3：修复注册 Sentinel 浏览器代理与完整风控令牌
 - 发布模式: multi
