@@ -4,8 +4,10 @@ import json
 import os
 import sys
 import threading
+import time
 import types
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from unittest import mock
 
 from core.browser_runtime import resolve_browser_headless
@@ -53,6 +55,49 @@ class SentinelBrowserRuntimeTests(unittest.TestCase):
 
         self.assertNotEqual(worker_thread, loop_thread)
         self.assertTrue(any("asyncio loop" in item and "隔离线程" in item for item in logs))
+
+    def test_browser_account_finalize_obeys_process_wide_concurrency_limit(self):
+        active = 0
+        peak = 0
+        lock = threading.Lock()
+
+        def fake_finalize(**_kwargs):
+            nonlocal active, peak
+            with lock:
+                active += 1
+                peak = max(peak, active)
+            time.sleep(0.05)
+            with lock:
+                active -= 1
+            return BrowserAccountCreateResult(status_code=200)
+
+        with (
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser._AUTH_BROWSER_SEMAPHORE",
+                threading.BoundedSemaphore(1),
+            ),
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser.AUTH_BROWSER_MAX_CONCURRENCY",
+                1,
+            ),
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser._create_account_via_browser_sync",
+                side_effect=fake_finalize,
+            ),
+        ):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                results = list(
+                    pool.map(
+                        lambda index: create_account_via_browser(
+                            name=f"User {index}",
+                            birthdate="1990-01-01",
+                        ),
+                        range(2),
+                    )
+                )
+
+        self.assertEqual(peak, 1)
+        self.assertTrue(all(result and result.ok for result in results))
 
     def test_browser_token_requires_all_three_sentinel_signals(self):
         self.assertEqual(

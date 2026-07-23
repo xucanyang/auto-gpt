@@ -343,7 +343,7 @@ export function RegisterTaskModal({
             </>
           ) : null}
           {currentPlatform === 'chatgpt' && !isPhoneSignup ? (
-            <Form.Item name="mail_provider_override" label="邮箱服务" initialValue="__global__">
+            <Form.Item name="mail_provider_override" label="邮箱服务（仅本任务）" initialValue="__global__">
               <Select
                 options={[
                   {

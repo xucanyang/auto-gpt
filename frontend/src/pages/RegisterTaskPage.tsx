@@ -31,7 +31,7 @@ import { buildChatGPTRegistrationRequestAdapter } from '@/lib/chatgptRegistratio
 import { CHATGPT_REGISTRATION_MODE_REFRESH_TOKEN } from '@/lib/chatgptRegistrationMode'
 import { getExecutorOptions, normalizeExecutorForPlatform } from '@/lib/platformExecutorOptions'
 import { apiFetch } from '@/lib/utils'
-import { buildTaskProxyPayload, saveTaskProxySettingsToConfig, taskProxySettingsFromConfig, validateTaskProxySettings } from '@/lib/taskProxySettings'
+import { buildTaskProxyPayload, taskProxySettingsFromConfig, validateTaskProxySettings } from '@/lib/taskProxySettings'
 import { normalizeDomainList, parseStoredDomainList } from '@/lib/domainList'
 
 const { Text } = Typography
@@ -376,28 +376,7 @@ export default function RegisterTaskPage() {
       : registerExtra
 
     try {
-      if (phoneSignupEnabled) {
-        await apiFetch('/config', {
-          method: 'PUT',
-          body: JSON.stringify({
-            data: {
-              chatgpt_phone_signup_password: String(values.login_password || values.password || '').trim(),
-            },
-          }),
-        })
-      }
-      if (platform === 'chatgpt') {
-        await apiFetch('/config', {
-          method: 'PUT',
-          body: JSON.stringify({
-            data: {
-              chatgpt_register_unique_exit_ip_enabled: values.chatgpt_register_unique_exit_ip_enabled ? 'true' : 'false',
-            },
-          }),
-        })
-      }
       validateTaskProxySettings(values)
-      await saveTaskProxySettingsToConfig(values)
       const proxyPayload = buildTaskProxyPayload(values)
       const res = await apiFetch('/tasks/register', {
         method: 'POST',

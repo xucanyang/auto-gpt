@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import threading
 import uuid
 from contextlib import ExitStack
@@ -23,6 +24,20 @@ from .sentinel_constants import (
     PINNED_CHROMIUM_VERSION,
 )
 from .utils import build_sec_ch_ua_full_version_list, extract_chrome_full_version
+
+
+def _auth_browser_concurrency_limit() -> int:
+    try:
+        requested = int(os.getenv("AUTH_BROWSER_MAX_CONCURRENCY", "2") or 2)
+    except (TypeError, ValueError):
+        requested = 2
+    # The runtime has four CPUs and a 2.5 GiB container limit. More than two
+    # headed Chromium instances can exhaust GLib's worker pool before new_page.
+    return max(1, min(requested, 2))
+
+
+AUTH_BROWSER_MAX_CONCURRENCY = _auth_browser_concurrency_limit()
+_AUTH_BROWSER_SEMAPHORE = threading.BoundedSemaphore(AUTH_BROWSER_MAX_CONCURRENCY)
 
 
 @dataclass
@@ -657,27 +672,47 @@ def create_account_via_browser(
 ) -> Optional[BrowserAccountCreateResult]:
     """Load Auth, obtain Sentinel, and submit create_account in one browser context."""
     logger = log_fn or (lambda _msg: None)
+
+    def _run_with_browser_slot() -> Optional[BrowserAccountCreateResult]:
+        acquired = _AUTH_BROWSER_SEMAPHORE.acquire(blocking=False)
+        waited = not acquired
+        if waited:
+            logger(
+                "Auth Browser 并发槽已满，等待可用槽位 "
+                f"(limit={AUTH_BROWSER_MAX_CONCURRENCY})"
+            )
+            while not acquired:
+                if stop_check is not None:
+                    stop_check()
+                acquired = _AUTH_BROWSER_SEMAPHORE.acquire(timeout=0.5)
+            logger("Auth Browser 已获取等待槽位")
+        try:
+            return _create_account_via_browser_sync(
+                name=name,
+                birthdate=birthdate,
+                proxy=proxy,
+                page_url=page_url,
+                timeout_ms=timeout_ms,
+                headless=headless,
+                device_id=device_id,
+                user_agent=user_agent,
+                sec_ch_ua=sec_ch_ua,
+                chrome_full_version=chrome_full_version,
+                accept_language=accept_language,
+                platform_version=platform_version,
+                viewport_width=viewport_width,
+                viewport_height=viewport_height,
+                cookies=cookies,
+                trace_headers=trace_headers,
+                stop_check=stop_check,
+                log_fn=logger,
+            )
+        finally:
+            if acquired:
+                _AUTH_BROWSER_SEMAPHORE.release()
+
     return run_sync_playwright_safely(
-        lambda: _create_account_via_browser_sync(
-            name=name,
-            birthdate=birthdate,
-            proxy=proxy,
-            page_url=page_url,
-            timeout_ms=timeout_ms,
-            headless=headless,
-            device_id=device_id,
-            user_agent=user_agent,
-            sec_ch_ua=sec_ch_ua,
-            chrome_full_version=chrome_full_version,
-            accept_language=accept_language,
-            platform_version=platform_version,
-            viewport_width=viewport_width,
-            viewport_height=viewport_height,
-            cookies=cookies,
-            trace_headers=trace_headers,
-            stop_check=stop_check,
-            log_fn=logger,
-        ),
+        _run_with_browser_slot,
         logger=logger,
         label="Auth Browser Create Account",
     )

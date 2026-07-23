@@ -109,7 +109,7 @@ function gopayPhaseMeta(phase?: string) {
   return GOPAY_PHASE_META[String(phase || '').trim()] || { title: '未知', description: String(phase || '未知阶段'), step: 0, status: 'process' as const }
 }
 
-const REGISTER_FORM_SETTINGS_STORAGE_PREFIX = 'auto-chatgpt.register-form-settings.'
+const REGISTER_FORM_SETTINGS_STORAGE_PREFIX = 'auto-chatgpt.register-form-settings.v2.'
 const DEFAULT_CHECKOUT_COUNTRY = 'ID'
 const DEFAULT_CHECKOUT_CURRENCY = 'IDR'
 const DEFAULT_GOPAY_OTP_AUTO_RESEND_DELAY_SECONDS = 120
@@ -3615,12 +3615,12 @@ export default function Accounts() {
   useEffect(() => {
     if (!registerModalOpen) return
     let cancelled = false
-    loadConfigCache()
+    loadConfigCache({ force: true })
       .then((cfg) => {
         if (cancelled) return
         const provider = String(cfg?.mail_provider || 'luckmail').trim() || 'luckmail'
         const savedSettings = loadRegisterFormSettings(currentPlatform)
-        const proxySettings = taskProxySettingsFromConfig(cfg, savedSettings)
+        const proxySettings = taskProxySettingsFromConfig(cfg)
         const savedEmail = window.localStorage.getItem('auto-chatgpt.manual_email_otp.email') || ''
         const configuredTempMailMode = String(cfg?.tempmail_mode || 'fixed_domain').trim().toLowerCase()
         const tempmailMode = configuredTempMailMode === 'task_subdomain' ? 'task_subdomain' : 'fixed_domain'
@@ -3634,7 +3634,7 @@ export default function Accounts() {
           concurrency: Number(savedSettings.concurrency || 1) || 1,
           register_delay_seconds: Number(savedSettings.register_delay_seconds || 0) || 0,
           ...proxySettings,
-          mail_provider_override: String(savedSettings.mail_provider_override || '__global__'),
+          mail_provider_override: '__global__',
           email_api_lines: String(cfg.email_api_lines || '').trim(),
           email_api_poll_interval_seconds: cfg.email_api_poll_interval_seconds || 3,
           email_api_request_timeout_seconds: cfg.email_api_request_timeout_seconds || 15,
@@ -3649,30 +3649,27 @@ export default function Accounts() {
           login_password: String(cfg.chatgpt_existing_account_login_password || '').trim(),
           chatgpt_existing_account_capture: savedSettings.chatgpt_existing_account_capture ?? false,
           chatgpt_save_registration_access_token_account:
-            savedSettings.chatgpt_save_registration_access_token_account
-            ?? (cfg.chatgpt_save_registration_access_token_account === ''
+            cfg.chatgpt_save_registration_access_token_account === ''
               ? true
               : cfg.chatgpt_save_registration_access_token_account === undefined
                 ? true
-                : parseBooleanConfigValue(cfg.chatgpt_save_registration_access_token_account)),
+                : parseBooleanConfigValue(cfg.chatgpt_save_registration_access_token_account),
           chatgpt_existing_account_login_route_enabled:
-            savedSettings.chatgpt_existing_account_login_route_enabled
-            ?? (cfg.chatgpt_existing_account_login_route_enabled === ''
+            cfg.chatgpt_existing_account_login_route_enabled === ''
               ? true
               : cfg.chatgpt_existing_account_login_route_enabled === undefined
                 ? true
-                : parseBooleanConfigValue(cfg.chatgpt_existing_account_login_route_enabled)),
+                : parseBooleanConfigValue(cfg.chatgpt_existing_account_login_route_enabled),
           chatgpt_register_unique_exit_ip_enabled:
-            savedSettings.chatgpt_register_unique_exit_ip_enabled
-            ?? (cfg.chatgpt_register_unique_exit_ip_enabled === undefined
+            cfg.chatgpt_register_unique_exit_ip_enabled === undefined
               ? false
-              : parseBooleanConfigValue(cfg.chatgpt_register_unique_exit_ip_enabled)),
+              : parseBooleanConfigValue(cfg.chatgpt_register_unique_exit_ip_enabled),
           chatgpt_register_otp_wait_seconds:
-            savedSettings.chatgpt_register_otp_wait_seconds ?? cfg.chatgpt_register_otp_wait_seconds ?? 120,
+            cfg.chatgpt_register_otp_wait_seconds ?? 120,
           chatgpt_register_otp_resend_wait_seconds:
-            savedSettings.chatgpt_register_otp_resend_wait_seconds ?? cfg.chatgpt_register_otp_resend_wait_seconds ?? 90,
+            cfg.chatgpt_register_otp_resend_wait_seconds ?? 90,
           chatgpt_register_otp_account_budget_seconds:
-            savedSettings.chatgpt_register_otp_account_budget_seconds ?? cfg.chatgpt_register_otp_account_budget_seconds ?? 210,
+            cfg.chatgpt_register_otp_account_budget_seconds ?? 210,
         })
       })
       .catch(() => {
@@ -3684,8 +3681,8 @@ export default function Accounts() {
           count: Number(savedSettings.count || 1) || 1,
           concurrency: Number(savedSettings.concurrency || 1) || 1,
           register_delay_seconds: Number(savedSettings.register_delay_seconds || 0) || 0,
-          ...taskProxySettingsFromConfig({}, savedSettings),
-          mail_provider_override: String(savedSettings.mail_provider_override || '__global__'),
+          ...taskProxySettingsFromConfig({}),
+          mail_provider_override: '__global__',
           email_api_lines: '',
           email_api_poll_interval_seconds: 3,
           email_api_request_timeout_seconds: 15,
@@ -3699,12 +3696,12 @@ export default function Accounts() {
           email: String(savedSettings.email || savedEmail || '').trim(),
           login_password: '',
           chatgpt_existing_account_capture: savedSettings.chatgpt_existing_account_capture ?? false,
-          chatgpt_save_registration_access_token_account: savedSettings.chatgpt_save_registration_access_token_account ?? true,
-          chatgpt_existing_account_login_route_enabled: savedSettings.chatgpt_existing_account_login_route_enabled ?? true,
-          chatgpt_register_unique_exit_ip_enabled: savedSettings.chatgpt_register_unique_exit_ip_enabled ?? false,
-          chatgpt_register_otp_wait_seconds: savedSettings.chatgpt_register_otp_wait_seconds ?? 120,
-          chatgpt_register_otp_resend_wait_seconds: savedSettings.chatgpt_register_otp_resend_wait_seconds ?? 90,
-          chatgpt_register_otp_account_budget_seconds: savedSettings.chatgpt_register_otp_account_budget_seconds ?? 210,
+          chatgpt_save_registration_access_token_account: true,
+          chatgpt_existing_account_login_route_enabled: true,
+          chatgpt_register_unique_exit_ip_enabled: false,
+          chatgpt_register_otp_wait_seconds: 120,
+          chatgpt_register_otp_resend_wait_seconds: 90,
+          chatgpt_register_otp_account_budget_seconds: 210,
         })
       })
     return () => {
@@ -5314,17 +5311,17 @@ export default function Accounts() {
 
   const handleSaveRegisterSettings = async () => {
     const values = registerForm.getFieldsValue(true)
-      const settingsPayload = {
-        count: Number(values.count || 1) || 1,
-        concurrency: Number(values.concurrency || 1) || 1,
-        register_delay_seconds: Number(values.register_delay_seconds || 0) || 0,
-        proxy_mode: String(values.proxy_mode || 'dynamic'),
-        proxy: String(values.proxy || '').trim(),
-        proxy_country_code: String(values.proxy_country_code || '').trim().toUpperCase(),
-        proxy_failover: Boolean(values.proxy_failover),
-        proxy_max_candidates: Number(values.proxy_max_candidates || 5) || 5,
-        proxy_min_score: Number(values.proxy_min_score || 50) || 50,
-        mail_provider_override: String(values.mail_provider_override || '__global__'),
+    const settingsPayload = {
+      count: Number(values.count || 1) || 1,
+      concurrency: Number(values.concurrency || 1) || 1,
+      register_delay_seconds: Number(values.register_delay_seconds || 0) || 0,
+      proxy_mode: String(values.proxy_mode || 'dynamic'),
+      proxy: String(values.proxy || '').trim(),
+      proxy_country_code: String(values.proxy_country_code || '').trim().toUpperCase(),
+      proxy_failover: Boolean(values.proxy_failover),
+      proxy_max_candidates: Number(values.proxy_max_candidates || 5) || 5,
+      proxy_min_score: Number(values.proxy_min_score || 50) || 50,
+      mail_provider_override: String(values.mail_provider_override || '__global__'),
       email: String(values.email || '').trim(),
       chatgpt_existing_account_capture: Boolean(values.chatgpt_existing_account_capture),
       chatgpt_save_registration_access_token_account:
@@ -5344,7 +5341,12 @@ export default function Accounts() {
     setRegisterSettingsSaving(true)
     try {
       validateTaskProxySettings(settingsPayload)
-      saveRegisterFormSettings(currentPlatform, settingsPayload)
+      saveRegisterFormSettings(currentPlatform, {
+        count: settingsPayload.count,
+        concurrency: settingsPayload.concurrency,
+        register_delay_seconds: settingsPayload.register_delay_seconds,
+        email: settingsPayload.email,
+      })
       await saveTaskProxySettingsToConfig(settingsPayload)
       if (currentPlatform === 'chatgpt') {
         await apiFetch('/config', {
@@ -5352,6 +5354,11 @@ export default function Accounts() {
           body: JSON.stringify({
             data: {
               chatgpt_register_unique_exit_ip_enabled: settingsPayload.chatgpt_register_unique_exit_ip_enabled ? 'true' : 'false',
+              chatgpt_save_registration_access_token_account: settingsPayload.chatgpt_save_registration_access_token_account ? 'true' : 'false',
+              chatgpt_existing_account_login_route_enabled: settingsPayload.chatgpt_existing_account_login_route_enabled ? 'true' : 'false',
+              chatgpt_register_otp_wait_seconds: String(settingsPayload.chatgpt_register_otp_wait_seconds),
+              chatgpt_register_otp_resend_wait_seconds: String(settingsPayload.chatgpt_register_otp_resend_wait_seconds),
+              chatgpt_register_otp_account_budget_seconds: String(settingsPayload.chatgpt_register_otp_account_budget_seconds),
             },
           }),
         })
@@ -5523,41 +5530,8 @@ export default function Accounts() {
         count: Number(values.count || 1) || 1,
         concurrency: Number(values.concurrency || 1) || 1,
         register_delay_seconds: Number(values.register_delay_seconds || 0) || 0,
-        proxy_mode: String(values.proxy_mode || 'dynamic'),
-        proxy: String(values.proxy || '').trim(),
-        proxy_country_code: String(values.proxy_country_code || '').trim().toUpperCase(),
-        proxy_failover: Boolean(values.proxy_failover),
-        proxy_max_candidates: Number(values.proxy_max_candidates || 5) || 5,
-        proxy_min_score: Number(values.proxy_min_score || 50) || 50,
-        mail_provider_override: selectedProviderOverride || '__global__',
         email: String(values.email || '').trim(),
-        chatgpt_existing_account_capture: Boolean(values.chatgpt_existing_account_capture),
-        chatgpt_save_registration_access_token_account:
-          values.chatgpt_save_registration_access_token_account === undefined
-            ? true
-            : Boolean(values.chatgpt_save_registration_access_token_account),
-        chatgpt_existing_account_login_route_enabled:
-          values.chatgpt_existing_account_login_route_enabled === undefined
-            ? true
-            : Boolean(values.chatgpt_existing_account_login_route_enabled),
-        chatgpt_register_unique_exit_ip_enabled: Boolean(values.chatgpt_register_unique_exit_ip_enabled),
-        chatgpt_register_otp_wait_seconds: Number(values.chatgpt_register_otp_wait_seconds || 120) || 120,
-        chatgpt_register_otp_resend_wait_seconds: Number(values.chatgpt_register_otp_resend_wait_seconds || 90) || 90,
-        chatgpt_register_otp_account_budget_seconds: Number(values.chatgpt_register_otp_account_budget_seconds || 210) || 210,
       })
-
-      await saveTaskProxySettingsToConfig(values)
-      if (currentPlatform === 'chatgpt') {
-        await apiFetch('/config', {
-          method: 'PUT',
-          body: JSON.stringify({
-            data: {
-              chatgpt_register_unique_exit_ip_enabled: values.chatgpt_register_unique_exit_ip_enabled ? 'true' : 'false',
-            },
-          }),
-        })
-      }
-      await loadConfigCache({ force: true }).catch(() => null)
       const proxyPayload = buildTaskProxyPayload(values)
 
       const res = await apiFetch('/tasks/register', {
