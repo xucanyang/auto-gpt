@@ -6,6 +6,16 @@
 
 ## [Unreleased] (未发布)
 
+## [2.7.2] - 2026-07-23
+
+### 优化 (Changed)
+- **本地订阅状态缺失自动补刷**：`services/chatgpt_core/local_status_refresh.py` 在手机绑定后的 Auth/RT 补抓、支付成功回写及手工本地状态刷新等既有入口中，若首轮探测已经确认认证有效但未得到当前套餐，或已确认付费套餐但缺少订阅到期时间，会等待 3 秒后以完整探测链路重试一次。重试仍会执行后端资料、`accounts/check` 兜底和 Codex 状态探测，避免 OpenAI 侧状态传播稍慢时把刚完成手机号绑定的 Plus 账号降为 `subscription_type=unknown` 并从“Plus 长效未传”中错误排除。
+- **重试结果可审计且保持保守**：本地 `chatgpt_local.subscription` 现在记录 `refresh_attempts`、`retry_reason` 和 `retry_outcome`。二次探测若退化为认证失败，不会覆盖首轮的有效结果；两次都没有套餐或到期信息时仍保留 `unknown_plan`，不会仅凭历史支付链接或 `last_known_plan` 自动提升为可上传 Plus。
+- **前端版本同步至 v2.7.2**：`frontend/src/app/AppShell.tsx` 侧栏版本更新，便于确认三个常驻实例已加载订阅探测容错逻辑。
+
+### 测试 (Tests)
+- **订阅补刷回归**：新增 `tests/test_chatgpt_local_status_refresh.py`，覆盖首轮套餐未知后二次恢复 Plus、付费套餐缺少到期时间后二次补齐、两次均缺失时的有界停止，以及套餐已确认或认证失效时不产生额外探测。
+
 ## [2.7.1] - 2026-07-23
 
 ### 安全 (Security)
@@ -2106,4 +2116,8 @@
 
 ## 2026-07-23 04:28:10 +0800
 - 发布 v2.7.1：修复 Settings 密钥默认遮罩
+- 发布模式: multi
+
+## 2026-07-23 11:09:06 +0800
+- 发布 v2.7.2：本地订阅状态缺失自动补刷
 - 发布模式: multi

@@ -15,13 +15,20 @@ from typing import Any
 from sqlmodel import Session
 
 from core.db import AccountModel
-from services.chatgpt_account_state import apply_chatgpt_status_policy, classify_chatgpt_capabilities
+from services.chatgpt_account_state import (
+    AUTH_VALID_STATES,
+    apply_chatgpt_status_policy,
+    classify_chatgpt_capabilities,
+    is_paid_subscription_plan,
+    normalize_subscription_plan,
+)
 from services.chatgpt_core.status_probe import probe_local_chatgpt_status
 
 logger = logging.getLogger(__name__)
 
 _LOCAL_STATUS_REFRESH_LOCK = threading.Lock()
 _LOCAL_STATUS_REFRESH_IN_FLIGHT: set[int] = set()
+_SUBSCRIPTION_RETRY_DELAY_SECONDS = 3.0
 
 
 def _account_extra(account: Any) -> dict[str, Any]:
@@ -63,6 +70,73 @@ def account_has_local_status_auth_material(account: Any) -> bool:
     return bool(refresh_token or access_token)
 
 
+def _subscription_retry_reason(probe: dict[str, Any] | None) -> str:
+    """Return why one more probe can improve an otherwise valid subscription read."""
+    result = probe if isinstance(probe, dict) else {}
+    auth = result.get("auth") if isinstance(result.get("auth"), dict) else {}
+    if str(auth.get("state") or "").strip().lower() not in AUTH_VALID_STATES:
+        return ""
+
+    subscription = result.get("subscription") if isinstance(result.get("subscription"), dict) else {}
+    plan = normalize_subscription_plan(subscription.get("plan"))
+    if plan == "unknown":
+        return "subscription_plan_unknown"
+    if is_paid_subscription_plan(plan) and not str(subscription.get("subscription_active_until") or "").strip():
+        return "subscription_expiry_missing"
+    return ""
+
+
+def _subscription_probe_score(probe: dict[str, Any] | None) -> int:
+    """Rank probes so a transient retry failure cannot replace useful evidence."""
+    result = probe if isinstance(probe, dict) else {}
+    auth = result.get("auth") if isinstance(result.get("auth"), dict) else {}
+    if str(auth.get("state") or "").strip().lower() not in AUTH_VALID_STATES:
+        return 0
+
+    subscription = result.get("subscription") if isinstance(result.get("subscription"), dict) else {}
+    plan = normalize_subscription_plan(subscription.get("plan"))
+    if plan == "unknown":
+        return 1
+    score = 3
+    if is_paid_subscription_plan(plan) and str(subscription.get("subscription_active_until") or "").strip():
+        score += 1
+    return score
+
+
+def _probe_local_status_with_subscription_retry(
+    probe_account: Any,
+    *,
+    proxy: str | None,
+    use_default_proxy: bool,
+) -> dict[str, Any]:
+    """Probe once, then retry only a valid but incomplete subscription response."""
+    first_probe = probe_local_chatgpt_status(
+        probe_account,
+        proxy=proxy,
+        use_default_proxy=use_default_proxy,
+    )
+    retry_reason = _subscription_retry_reason(first_probe)
+    if not retry_reason:
+        return first_probe
+
+    time.sleep(_SUBSCRIPTION_RETRY_DELAY_SECONDS)
+    retry_probe = probe_local_chatgpt_status(
+        probe_account,
+        proxy=proxy,
+        use_default_proxy=use_default_proxy,
+    )
+    selected_probe = retry_probe if _subscription_probe_score(retry_probe) >= _subscription_probe_score(first_probe) else first_probe
+    subscription = selected_probe.setdefault("subscription", {})
+    if not isinstance(subscription, dict):
+        subscription = {}
+        selected_probe["subscription"] = subscription
+    remaining_reason = _subscription_retry_reason(selected_probe)
+    subscription["refresh_attempts"] = 2
+    subscription["retry_reason"] = retry_reason
+    subscription["retry_outcome"] = "resolved" if not remaining_reason else "still_incomplete"
+    return selected_probe
+
+
 def sync_chatgpt_account_local_status(
     session: Session,
     account: AccountModel,
@@ -96,7 +170,7 @@ def sync_chatgpt_account_local_status(
         workspace_id=str(extra.get("workspace_id") or "").strip(),
         extra=extra,
     )
-    probe = probe_local_chatgpt_status(
+    probe = _probe_local_status_with_subscription_retry(
         probe_account,
         proxy=proxy,
         use_default_proxy=use_default_proxy,
