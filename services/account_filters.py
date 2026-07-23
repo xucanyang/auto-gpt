@@ -20,8 +20,8 @@ from services.chatgpt_account_state import (
 )
 
 AUTO_DELETE_REVIVAL_TASK_ID = "icloud_hme_auto_delete"
-ACCOUNT_LIST_STATE_DERIVATION_VERSION = "integration-upload-state-v1-payment-link-history-v3-long-link-types"
-ACCOUNT_FILTER_RESOLVER_VERSION = "account-list-state-v7-long-link-types"
+ACCOUNT_LIST_STATE_DERIVATION_VERSION = "integration-upload-state-v1-payment-link-history-v3-long-link-types-ideal-cleanup"
+ACCOUNT_FILTER_RESOLVER_VERSION = "account-list-state-v8-payment-link-scan"
 ACCOUNT_FILTER_FIELD_NAMES = (
     "email",
     "status",
@@ -259,6 +259,9 @@ _PAYMENT_LINK_CLEANED_STATUSES = frozenset({
     "upi_expired_cleaned",
     "upi_paid_cleaned",
     "upi_cancelled_cleaned",
+    "ideal_expired_cleaned",
+    "ideal_paid_cleaned",
+    "ideal_cancelled_cleaned",
 })
 
 _INTEGRATION_UPLOAD_STATE_FILTER_ALIASES: dict[str, str] = {
@@ -742,7 +745,9 @@ def _account_payment_link_payload(
     return {}
 
 
-def _payment_link_platform_from_payload(payload: dict[str, Any]) -> str:
+def payment_link_platform_from_payload(payload: dict[str, Any]) -> str:
+    """Classify one normalized current-link payload into the public platform contract."""
+
     url = _validated_payment_link_url(payload.get("url"))
     if not url:
         return "none"
@@ -809,11 +814,16 @@ def _payment_link_platform_from_payload(payload: dict[str, Any]) -> str:
     return "other"
 
 
+# Keep the private name stable for older in-repo imports while scanners and
+# other shared services consume the explicit public classifier above.
+_payment_link_platform_from_payload = payment_link_platform_from_payload
+
+
 def account_payment_link_platform(account: AccountModel, extra: dict[str, Any] | None = None) -> str:
     """Classify generated payment links by payment platform, not transport source."""
 
     extra = extra if isinstance(extra, dict) else _extra(account)
-    return _payment_link_platform_from_payload(_account_payment_link_payload(account, extra))
+    return payment_link_platform_from_payload(_account_payment_link_payload(account, extra))
 
 
 def _account_payment_link_metadata_payload(
@@ -888,6 +898,9 @@ def account_payment_link_summary(account: AccountModel, extra: dict[str, Any] | 
         ("link_status_updated_at", 128),
         ("cleaned_at", 128),
         ("expired_at", 128),
+        ("payment_link_cleanup_mode", 64),
+        ("payment_link_cleanup_type", 64),
+        ("payment_link_cleanup_through_at", 128),
         ("pix_cleanup_mode", 64),
         ("link_expiry_source", 64),
         ("previous_link_status", 64),
@@ -1389,7 +1402,7 @@ def refresh_account_list_state(
                                 END
                             )
                             WHERE key IN ('url', 'paypal_url', 'provider_redirect_url', 'approval_url', 'checkout_url', 'cashier_url')
-                              AND lower(trim(coalesce(json_extract(extra, '$.chatgpt_last_payment_link.link_status'), ''))) NOT IN ('expired_cleaned', 'paid_cleaned', 'cancelled_cleaned', 'upi_expired_cleaned', 'upi_paid_cleaned', 'upi_cancelled_cleaned')
+                              AND lower(trim(coalesce(json_extract(extra, '$.chatgpt_last_payment_link.link_status'), ''))) NOT IN ('expired_cleaned', 'paid_cleaned', 'cancelled_cleaned', 'upi_expired_cleaned', 'upi_paid_cleaned', 'upi_cancelled_cleaned', 'ideal_expired_cleaned', 'ideal_paid_cleaned', 'ideal_cancelled_cleaned')
                               AND (
                                   (
                                       lower(trim(CAST(value AS TEXT))) LIKE 'http://%'
@@ -1457,7 +1470,7 @@ def refresh_account_list_state(
                     )) AS legacy_paypal_link_url,
                     replace(lower(trim(coalesce(
                         nullif(trim(CAST(CASE
-                            WHEN lower(trim(coalesce(json_extract(extra, '$.chatgpt_last_payment_link.link_status'), ''))) IN ('expired_cleaned', 'paid_cleaned', 'cancelled_cleaned', 'upi_expired_cleaned', 'upi_paid_cleaned', 'upi_cancelled_cleaned')
+                            WHEN lower(trim(coalesce(json_extract(extra, '$.chatgpt_last_payment_link.link_status'), ''))) IN ('expired_cleaned', 'paid_cleaned', 'cancelled_cleaned', 'upi_expired_cleaned', 'upi_paid_cleaned', 'upi_cancelled_cleaned', 'ideal_expired_cleaned', 'ideal_paid_cleaned', 'ideal_cancelled_cleaned')
                             THEN NULL
                             ELSE json_extract(extra, '$.chatgpt_last_payment_link.link_type')
                         END AS TEXT)), ''),
@@ -1467,7 +1480,7 @@ def refresh_account_list_state(
                     ))), '-', '_') AS payment_link_type,
                     replace(lower(trim(coalesce(
                         nullif(trim(CAST(CASE
-                            WHEN lower(trim(coalesce(json_extract(extra, '$.chatgpt_last_payment_link.link_status'), ''))) IN ('expired_cleaned', 'paid_cleaned', 'cancelled_cleaned', 'upi_expired_cleaned', 'upi_paid_cleaned', 'upi_cancelled_cleaned')
+                            WHEN lower(trim(coalesce(json_extract(extra, '$.chatgpt_last_payment_link.link_status'), ''))) IN ('expired_cleaned', 'paid_cleaned', 'cancelled_cleaned', 'upi_expired_cleaned', 'upi_paid_cleaned', 'upi_cancelled_cleaned', 'ideal_expired_cleaned', 'ideal_paid_cleaned', 'ideal_cancelled_cleaned')
                             THEN NULL
                             ELSE json_extract(extra, '$.chatgpt_last_payment_link.payment_method_type')
                         END AS TEXT)), ''),
@@ -1488,7 +1501,7 @@ def refresh_account_list_state(
                     ))), '-', '_') AS payment_link_plan_name,
                     replace(lower(trim(coalesce(
                         nullif(trim(CAST(CASE
-                            WHEN lower(trim(coalesce(json_extract(extra, '$.chatgpt_last_payment_link.link_status'), ''))) IN ('expired_cleaned', 'paid_cleaned', 'cancelled_cleaned', 'upi_expired_cleaned', 'upi_paid_cleaned', 'upi_cancelled_cleaned')
+                            WHEN lower(trim(coalesce(json_extract(extra, '$.chatgpt_last_payment_link.link_status'), ''))) IN ('expired_cleaned', 'paid_cleaned', 'cancelled_cleaned', 'upi_expired_cleaned', 'upi_paid_cleaned', 'upi_cancelled_cleaned', 'ideal_expired_cleaned', 'ideal_paid_cleaned', 'ideal_cancelled_cleaned')
                             THEN NULL
                             ELSE json_extract(extra, '$.chatgpt_last_payment_link.payment_link_format')
                         END AS TEXT)), ''),
@@ -1497,7 +1510,7 @@ def refresh_account_list_state(
                     ))), '-', '_') AS payment_link_format,
                     replace(lower(trim(coalesce(
                         nullif(trim(CAST(CASE
-                            WHEN lower(trim(coalesce(json_extract(extra, '$.chatgpt_last_payment_link.link_status'), ''))) IN ('expired_cleaned', 'paid_cleaned', 'cancelled_cleaned', 'upi_expired_cleaned', 'upi_paid_cleaned', 'upi_cancelled_cleaned')
+                            WHEN lower(trim(coalesce(json_extract(extra, '$.chatgpt_last_payment_link.link_status'), ''))) IN ('expired_cleaned', 'paid_cleaned', 'cancelled_cleaned', 'upi_expired_cleaned', 'upi_paid_cleaned', 'upi_cancelled_cleaned', 'ideal_expired_cleaned', 'ideal_paid_cleaned', 'ideal_cancelled_cleaned')
                             THEN NULL
                             ELSE json_extract(extra, '$.chatgpt_last_payment_link.payment_source')
                         END AS TEXT)), ''),
@@ -1843,14 +1856,14 @@ def refresh_account_list_state(
                                 AND substr(lower(trim(legacy_paypal_link_url)), 9, 1) NOT IN ('', '/', '?', '#')
                                 AND trim(legacy_paypal_link_url) NOT LIKE '% %'
                             )
-                            OR payment_link_status IN ('expired_cleaned', 'paid_cleaned', 'cancelled_cleaned', 'upi_expired_cleaned', 'upi_paid_cleaned', 'upi_cancelled_cleaned')
+                            OR payment_link_status IN ('expired_cleaned', 'paid_cleaned', 'cancelled_cleaned', 'upi_expired_cleaned', 'upi_paid_cleaned', 'upi_cancelled_cleaned', 'ideal_expired_cleaned', 'ideal_paid_cleaned', 'ideal_cancelled_cleaned')
                             OR payment_generation_succeeded = 1
                         )
                         THEN 1
                         ELSE 0
                     END AS payment_link_generated,
                     CASE
-                        WHEN payment_link_status IN ('expired_cleaned', 'paid_cleaned', 'cancelled_cleaned', 'upi_expired_cleaned', 'upi_paid_cleaned', 'upi_cancelled_cleaned')
+                        WHEN payment_link_status IN ('expired_cleaned', 'paid_cleaned', 'cancelled_cleaned', 'upi_expired_cleaned', 'upi_paid_cleaned', 'upi_cancelled_cleaned', 'ideal_expired_cleaned', 'ideal_paid_cleaned', 'ideal_cancelled_cleaned')
                         THEN 'none'
                         WHEN payment_link_uses_legacy_paypal = 1
                         THEN 'paypal'

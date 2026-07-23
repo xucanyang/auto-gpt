@@ -41,14 +41,14 @@ PIX_LINK_SCAN_MODAL = (
 )
 
 
-def test_pix_link_scan_lists_exclusive_buckets_and_cleanup_is_confirmed():
+def test_payment_link_scan_covers_all_types_collapses_empty_sections_and_preserves_unknown():
     page = ACCOUNTS_PAGE.read_text(encoding="utf-8")
     toolbar = ACCOUNTS_TOOLBAR.read_text(encoding="utf-8")
     task_modal = REGISTER_TASK_MODAL.read_text(encoding="utf-8")
     detail_modal = ACCOUNT_DETAIL_MODAL.read_text(encoding="utf-8")
     scan_modal = PIX_LINK_SCAN_MODAL.read_text(encoding="utf-8")
 
-    assert "扫描 PIX 链接" in toolbar
+    assert "扫描支付链接" in toolbar
     assert "pix_scan" in toolbar
     assert "onScanPixLinks" in toolbar
     assert "setPaymentLinkMenuOpen(false)" in toolbar
@@ -57,29 +57,48 @@ def test_pix_link_scan_lists_exclusive_buckets_and_cleanup_is_confirmed():
     assert "清理过期 PIX 链接" not in toolbar
     assert "清理已支付 PIX 链接" not in toolbar
     assert "清理支付已取消 PIX 链接" not in toolbar
-    assert "PIX 链接扫描" in scan_modal
-    assert "总 PIX 链接" in scan_modal
+    assert 'title="支付链接扫描"' in scan_modal
+    for payment_type in (
+        "hosted",
+        "paypal",
+        "ideal",
+        "upi",
+        "pix",
+        "twint",
+        "kakao_pay",
+        "gopay",
+        "team",
+        "other",
+    ):
+        assert f"type: '{payment_type}'" in scan_modal
+    assert ".filter((section) => paymentTypeTotal(report, section.type) > 0)" in scan_modal
+    assert "defaultActiveKey={defaultExpandedTypes}" in scan_modal
+    assert "提取后 15 分钟到期" in scan_modal
+    assert "cleanupModes: ['expired']" in scan_modal
     assert "label: '有效'" in scan_modal
     assert "label: '已支付'" in scan_modal
     assert "label: '过期'" in scan_modal
     assert "label: '支付已取消'" in scan_modal
-    assert "Stripe 实时查询" in scan_modal
+    assert "label: '状态未知'" in scan_modal
+    assert "条链接状态暂时无法确认，已保留" in scan_modal
+    assert "PIX / UPI Stripe 实时查询" in scan_modal
     assert "direct_scan_success_links" in scan_modal
     assert "direct_scan_fallback_links" in scan_modal
-    assert "已使用本地记录兜底" in scan_modal
+    assert "已按本地证据归类" in scan_modal
     assert "cleanupMode: null" in scan_modal
-    assert "if (!mode) return null" in scan_modal
+    assert "if (!mode || row.count <= 0) return null" in scan_modal
     assert "<DeleteOutlined />" in scan_modal
-    assert "/tasks/chatgpt/payment-links/pix-cleanup/scan" in page
-    assert "/tasks/chatgpt/payment-links/pix-cleanup/preview" in page
-    assert "/tasks/chatgpt/payment-links/pix-cleanup/task" in page
+    assert "/tasks/chatgpt/payment-links/scan" in page
+    assert "/tasks/chatgpt/payment-links/cleanup/preview" in page
+    assert "/tasks/chatgpt/payment-links/cleanup/task" in page
     assert "cleanup_mode: cleanupMode" in page
     assert "eligible_links" in page
     assert "const { message: appMessage, modal: appModal } = App.useApp()" in page
     assert "appModal.confirm({" in page
     assert re.search(r"(?<![A-Za-z0-9_.])Modal\.confirm\(", page) is None
     assert "只清理账号当前 PIX 链接" in page
-    assert "不会删除账号、支付生成历史、PIX CDK 或提交结果" in page
+    assert "以支付链接提取时间后 15 分钟为过期点" in page
+    assert "不会删除账号、支付生成历史、支付 CDK 或提交结果" in page
 
     assert "pix_payment_link_cleanup" in page
     assert "pix_cleanup" in page
@@ -90,7 +109,8 @@ def test_pix_link_scan_lists_exclusive_buckets_and_cleanup_is_confirmed():
     assert "当前没有可清理的${cleanupMeta.title}" in page
 
     assert "'pix_cleanup'" in task_modal
-    assert "`${cleanupLabel} PIX 链接清理`" in task_modal
+    assert "ideal: 'iDEAL'" in task_modal
+    assert "`${cleanupLabel} ${paymentLabel} 链接清理`" in task_modal
     assert "<TaskLogPanel" in task_modal
     assert "showTaskControls={taskModalMode !== 'pix_cleanup'}" in task_modal
     assert "onTaskDone" in task_modal

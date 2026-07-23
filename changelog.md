@@ -6,6 +6,24 @@
 
 ## [Unreleased] (未发布)
 
+## [2.8.5] - 2026-07-24
+
+### 新增 (Added)
+- **支付链接扫描覆盖全部规范类型**：`services/chatgpt_core/pix_payment_link_cleanup.py` 与 `GET /tasks/chatgpt/payment-links/scan` 复用账号列表的统一分类合同，同时扫描 Hosted Checkout、PayPal、iDEAL、UPI、PIX、TWINT、Kakao Pay、GoPay、ChatGPT Team 与其他链接。响应按类型提供有效、已支付、过期、支付已取消和状态未知五个互斥状态桶，并保留 PIX/UPI 兼容字段与旧接口。
+- **iDEAL 增加 15 分钟有效期与过期清理**：iDEAL 当前链接以 `generated_at`（兼容 `created_at`）后的 15 分钟作为明确过期点，缺少提取时间时保持状态未知而不猜测。过期 iDEAL 可沿用现有预览、确认、SQLite 校验备份、事务清理和列表索引刷新流程，清理后记录独立的 `ideal_expired_cleaned` 墓碑，历史生成记录保持不变。
+
+### 优化 (Changed)
+- **扫描弹窗改为按支付类型折叠**：`frontend/src/features/accounts/components/PixLinkScanModal.tsx` 展示全部支付类型，有链接的面板默认展开，零链接面板默认收起，避免空状态表格占用大块空间。总数、各类型数量和状态计数使用稳定布局；PIX/UPI 继续显示 Stripe 实时查询覆盖，iDEAL 明确显示“提取后 15 分钟到期”。
+- **未知状态安全保留**：没有实时状态、明确本地终态或可信过期时间的链接不再被误标为“有效”，统一进入“状态未知”并显示保留状态。Hosted、PayPal、TWINT、Kakao Pay、GoPay、Team 和其他类型暂不暴露无证据清理动作；PIX/UPI 保留原三类清理，iDEAL 仅在过期状态提供清理入口。
+- **清理任务按类型表达**：`api/tasks.py`、`Accounts.tsx` 与 `RegisterTaskModal.tsx` 让清理任务来源、日志、任务标题和确认文案携带实际支付类型，不再把 UPI/iDEAL 统一显示成 PIX；账号详情与当前链接摘要同步识别 iDEAL 清理状态和通用清理元数据。
+
+### 修复 (Fixed)
+- **修复混合扫描把非 QR 链接计为 Stripe 查询失败**：实时查询分母和本地兜底数量现在只统计 PIX/UPI 指令链接，其他支付类型按持久化证据分类，不再拉低 Stripe 查询成功率。
+- **修复 iDEAL 清理后列表索引可能复活旧链接**：`services/account_filters.py` 的 Python 与 SQLite 派生逻辑同时识别三种 iDEAL 清理墓碑，并提升派生/筛选合同版本，确保三个常驻实例重算后都将已清理链接稳定归为“当前无链接”。
+
+### 测试 (Tests)
+- 扩展支付链接扫描、清理任务和前端合同回归，覆盖十类混合链接的互斥状态总账、未知链接保留、iDEAL 第 15 分钟边界、过期清理墓碑、列表索引刷新、独立任务来源，以及零条类型默认收起；前端生产构建通过，侧栏版本同步更新为 `v2.8.5`。
+
 ## [2.8.4] - 2026-07-24
 
 ### 新增 (Added)
@@ -2232,4 +2250,8 @@
 
 ## 2026-07-24 03:33:58 +0800
 - v2.8.4 补齐支付链接全类型筛选
+- 发布模式: multi
+
+## 2026-07-24 04:10:10 +0800
+- v2.8.5 扩展全类型支付链接扫描与 iDEAL 15 分钟过期
 - 发布模式: multi

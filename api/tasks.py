@@ -71,13 +71,16 @@ from services.chatgpt_core.payment_link_cache import (
 from services.chatgpt_core.pix_payment_link_cleanup import (
     PIX_CLEANUP_MODE_EXPIRED,
     PIX_CLEANUP_MODE_LABELS,
+    PAYMENT_LINK_TYPE_IDEAL,
     PAYMENT_LINK_TYPE_PIX,
     PAYMENT_LINK_TYPE_UPI,
     PixCleanupMode,
+    clean_ideal_payment_links,
     clean_payment_links,
     clean_pix_payment_links,
     clean_upi_payment_links,
     normalize_pix_cleanup_mode,
+    preview_ideal_payment_link_cleanup,
     preview_payment_link_cleanup,
     preview_pix_payment_link_cleanup,
     preview_upi_payment_link_cleanup,
@@ -427,12 +430,12 @@ class PaymentLinkProfilePreviewRequest(BaseModel):
 
 class PixPaymentLinkCleanupRequest(BaseModel):
     cleanup_mode: Literal["expired", "paid", "cancelled"] = PIX_CLEANUP_MODE_EXPIRED
-    payment_type: Literal["pix", "upi"] = PAYMENT_LINK_TYPE_PIX
+    payment_type: Literal["pix", "upi", "ideal"] = PAYMENT_LINK_TYPE_PIX
 
 
 def _normalize_payment_link_cleanup_type(value: Any) -> str:
     normalized = str(value or PAYMENT_LINK_TYPE_PIX).strip().lower().replace("-", "_")
-    if normalized not in {PAYMENT_LINK_TYPE_PIX, PAYMENT_LINK_TYPE_UPI}:
+    if normalized not in {PAYMENT_LINK_TYPE_PIX, PAYMENT_LINK_TYPE_UPI, PAYMENT_LINK_TYPE_IDEAL}:
         raise ValueError(f"Unsupported payment link type: {normalized}")
     return normalized
 
@@ -2056,6 +2059,7 @@ _PAYMENT_LINK_PAID_TERMINAL_STATUSES = frozenset({
     "already_paid",
     "paid_cleaned",
     "upi_paid_cleaned",
+    "ideal_paid_cleaned",
 })
 _PAYMENT_LINK_IN_FLIGHT_MIN_TTL_SECONDS = 30 * 60
 _PAYMENT_LINK_IN_FLIGHT_GRACE_SECONDS = 5 * 60
@@ -17352,10 +17356,10 @@ def preview_chatgpt_expired_pix_payment_links(
 
 @router.get("/chatgpt/payment-links/cleanup/preview")
 def preview_chatgpt_payment_links(
-    payment_type: Literal["pix", "upi"] = PAYMENT_LINK_TYPE_PIX,
+    payment_type: Literal["pix", "upi", "ideal"] = PAYMENT_LINK_TYPE_PIX,
     cleanup_mode: Literal["expired", "paid", "cancelled"] = PIX_CLEANUP_MODE_EXPIRED,
 ):
-    """Scan one QR payment rail using the automatic payment-type classifier."""
+    """Scan one cleanup-capable payment rail using the shared type classifier."""
 
     normalized_type = _normalize_payment_link_cleanup_type(payment_type)
     mode = normalize_pix_cleanup_mode(cleanup_mode)
@@ -17377,7 +17381,7 @@ def scan_chatgpt_pix_payment_links():
 
 @router.get("/chatgpt/payment-links/scan")
 def scan_chatgpt_payment_links():
-    """Scan all current PIX/UPI links and return type-specific buckets."""
+    """Scan all current payment links and return type-specific status buckets."""
 
     with Session(engine) as session:
         return preview_payment_link_cleanup(session)
@@ -17396,14 +17400,22 @@ def _run_expired_pix_payment_link_cleanup(
     cleanup_mode: PixCleanupMode = PIX_CLEANUP_MODE_EXPIRED,
     payment_type: str = PAYMENT_LINK_TYPE_PIX,
 ) -> None:
-    """Run one verified QR-link cleanup and publish its complete timeline."""
+    """Run one verified payment-link cleanup and publish its complete timeline."""
 
     mode = normalize_pix_cleanup_mode(cleanup_mode)
     normalized_type = _normalize_payment_link_cleanup_type(payment_type)
     type_label = normalized_type.upper()
     cleanup_label = PIX_CLEANUP_MODE_LABELS[mode]
-    preview_fn = preview_pix_payment_link_cleanup if normalized_type == PAYMENT_LINK_TYPE_PIX else preview_upi_payment_link_cleanup
-    clean_fn = clean_pix_payment_links if normalized_type == PAYMENT_LINK_TYPE_PIX else clean_upi_payment_links
+    preview_fn = {
+        PAYMENT_LINK_TYPE_PIX: preview_pix_payment_link_cleanup,
+        PAYMENT_LINK_TYPE_UPI: preview_upi_payment_link_cleanup,
+        PAYMENT_LINK_TYPE_IDEAL: preview_ideal_payment_link_cleanup,
+    }[normalized_type]
+    clean_fn = {
+        PAYMENT_LINK_TYPE_PIX: clean_pix_payment_links,
+        PAYMENT_LINK_TYPE_UPI: clean_upi_payment_links,
+        PAYMENT_LINK_TYPE_IDEAL: clean_ideal_payment_links,
+    }[normalized_type]
     _task_store.mark_running(task_id)
     _task_store.set_progress(task_id, "0/1")
     try:
@@ -17419,7 +17431,11 @@ def _run_expired_pix_payment_link_cleanup(
             },
         )
 
-        total_key = "current_pix_links" if normalized_type == PAYMENT_LINK_TYPE_PIX else "current_upi_links"
+        total_key = {
+            PAYMENT_LINK_TYPE_PIX: "current_pix_links",
+            PAYMENT_LINK_TYPE_UPI: "current_upi_links",
+            PAYMENT_LINK_TYPE_IDEAL: "ideal_links",
+        }[normalized_type]
         preview_total = max(int(preview.get(total_key) or 0), 0)
         preview_active = max(int(preview.get("active_links") or 0), 0)
         preview_eligible = max(int(preview.get("eligible_links") or 0), 0)
@@ -17434,13 +17450,14 @@ def _run_expired_pix_payment_link_cleanup(
                 f"时间有效 {preview_active}；缺少时间 {preview_missing}"
             ),
         )
-        _log(
-            task_id,
-            (
-                f"[{type_label}清理] Stripe 实时查询成功 {preview_direct_success}/{preview_total}；"
-                f"本地记录兜底 {preview_direct_fallback}"
-            ),
-        )
+        if normalized_type in {PAYMENT_LINK_TYPE_PIX, PAYMENT_LINK_TYPE_UPI}:
+            _log(
+                task_id,
+                (
+                    f"[{type_label}清理] Stripe 实时查询成功 {preview_direct_success}/{preview_total}；"
+                    f"本地记录兜底 {preview_direct_fallback}"
+                ),
+            )
         if mode == PIX_CLEANUP_MODE_EXPIRED and preview_missing:
             _log(
                 task_id,
@@ -17546,7 +17563,7 @@ def enqueue_expired_pix_payment_link_cleanup_task(
 
     mode = normalize_pix_cleanup_mode(cleanup_mode)
     normalized_type = _normalize_payment_link_cleanup_type(payment_type)
-    source = "pix_payment_link_cleanup" if normalized_type == PAYMENT_LINK_TYPE_PIX else "upi_payment_link_cleanup"
+    source = f"{normalized_type}_payment_link_cleanup"
     instance_id = str(os.getenv("APP_INSTANCE_ID") or "auto-gpt").strip() or "auto-gpt"
     with _PIX_PAYMENT_LINK_CLEANUP_TASK_LOCK:
         for snapshot in _task_store.list_snapshots():

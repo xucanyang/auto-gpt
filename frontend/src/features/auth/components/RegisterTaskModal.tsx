@@ -178,7 +178,9 @@ export function RegisterTaskModal({
   const modalTitle = () => {
     if (taskModalMode === 'pix_cleanup') {
       const cleanupLabel = String(taskSnapshot?.meta?.cleanup_label || '').trim()
-      return cleanupLabel ? `${cleanupLabel} PIX 链接清理` : 'PIX 链接清理'
+      const paymentType = String(taskSnapshot?.meta?.payment_type || 'pix').trim().toLowerCase()
+      const paymentLabel = ({ pix: 'PIX', upi: 'UPI', ideal: 'iDEAL' } as Record<string, string>)[paymentType] || paymentType.toUpperCase()
+      return cleanupLabel ? `${cleanupLabel} ${paymentLabel} 链接清理` : `${paymentLabel} 链接清理`
     }
     if (taskModalMode === 'probe_local_status') {
       const eligible = Number(taskSnapshot?.meta?.eligible || 0)

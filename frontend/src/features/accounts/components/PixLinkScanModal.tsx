@@ -1,55 +1,88 @@
-import { Alert, Button, Modal, Space, Table, Tag, Typography } from 'antd'
+import { Alert, Button, Collapse, Modal, Skeleton, Space, Table, Tag, Typography } from 'antd'
 import type { ColumnsType } from 'antd/es/table'
 import { DeleteOutlined, ReloadOutlined } from '@ant-design/icons'
 
 const { Text } = Typography
 
 export type PixLinkCleanupMode = 'expired' | 'paid' | 'cancelled'
-export type PaymentLinkScanType = 'pix' | 'upi'
+export type PaymentLinkScanType =
+  | 'hosted'
+  | 'paypal'
+  | 'ideal'
+  | 'upi'
+  | 'pix'
+  | 'twint'
+  | 'kakao_pay'
+  | 'gopay'
+  | 'team'
+  | 'other'
+export type PaymentLinkCleanupType = Extract<PaymentLinkScanType, 'pix' | 'upi' | 'ideal'>
 
 export type PixLinkScanReport = {
   instance_id?: string
+  now?: string
   cleanup_mode?: PixLinkCleanupMode
   cleanup_label?: string
   cutoff_display?: string
+  total_links?: number
+  current_payment_links?: number
   current_pix_links?: number
+  current_upi_links?: number
   valid_links?: number
   expired_links?: number
   paid_links?: number
   cancelled_links?: number
+  unknown_links?: number
   eligible_links?: number
   retained_links?: number
   active_links?: number
   missing_expiry_links?: number
-  valid_missing_expiry_links?: number
+  unknown_missing_expiry_links?: number
   direct_scan_source?: string
+  direct_scan_supported_links?: number
   direct_scan_attempted_links?: number
   direct_scan_success_links?: number
   direct_scan_fallback_links?: number
   direct_scan_state_counts?: Record<string, number>
   cleaned_links?: number
   concurrent_skipped_links?: number
-  current_upi_links?: number
-  payment_type_counts?: Record<string, number>
-  payment_types?: string[]
+  payment_type_counts?: Partial<Record<PaymentLinkScanType, number>>
+  payment_types?: PaymentLinkScanType[]
+  payment_types_with_links?: PaymentLinkScanType[]
   upi_qr_expiry_links?: number
-  pix_valid_links?: number
-  pix_expired_links?: number
-  pix_paid_links?: number
-  pix_cancelled_links?: number
-  upi_valid_links?: number
-  upi_expired_links?: number
-  upi_paid_links?: number
-  upi_cancelled_links?: number
+  upi_qr_validity_seconds?: number
+  ideal_derived_expiry_links?: number
+  ideal_validity_seconds?: number
+  [key: string]: unknown
 }
 
 type PixLinkScanRow = {
-  key: 'valid' | PixLinkCleanupMode
+  key: 'valid' | PixLinkCleanupMode | 'unknown'
   label: string
-  color: string
+  color?: string
   count: number
   cleanupMode: PixLinkCleanupMode | null
 }
+
+type ScanSection = {
+  type: PaymentLinkScanType
+  label: string
+  note?: string
+  cleanupModes: PixLinkCleanupMode[]
+}
+
+const PAYMENT_LINK_SCAN_SECTIONS: ScanSection[] = [
+  { type: 'hosted', label: 'Hosted Checkout', cleanupModes: [] },
+  { type: 'paypal', label: 'PayPal', cleanupModes: [] },
+  { type: 'ideal', label: 'iDEAL', note: '提取后 15 分钟到期', cleanupModes: ['expired'] },
+  { type: 'upi', label: 'UPI', note: 'QR 有效期 5 分钟', cleanupModes: ['expired', 'paid', 'cancelled'] },
+  { type: 'pix', label: 'PIX', cleanupModes: ['expired', 'paid', 'cancelled'] },
+  { type: 'twint', label: 'TWINT', cleanupModes: [] },
+  { type: 'kakao_pay', label: 'Kakao Pay', cleanupModes: [] },
+  { type: 'gopay', label: 'GoPay', cleanupModes: [] },
+  { type: 'team', label: 'ChatGPT Team', cleanupModes: [] },
+  { type: 'other', label: '其他支付链接', cleanupModes: [] },
+]
 
 type PixLinkScanModalProps = {
   open: boolean
@@ -57,9 +90,29 @@ type PixLinkScanModalProps = {
   loading: boolean
   error: string
   cleanupMode: PixLinkCleanupMode | null
+  cleanupPaymentType: PaymentLinkCleanupType | null
   onClose: () => void
   onScan: () => void
-  onCleanup: (mode: PixLinkCleanupMode, paymentType: PaymentLinkScanType) => void
+  onCleanup: (mode: PixLinkCleanupMode, paymentType: PaymentLinkCleanupType) => void
+}
+
+function reportCount(report: PixLinkScanReport | null, key: string, fallback = 0): number {
+  const value = report?.[key]
+  const count = Number(value ?? fallback)
+  return Number.isFinite(count) && count > 0 ? count : 0
+}
+
+function paymentTypeTotal(report: PixLinkScanReport | null, paymentType: PaymentLinkScanType): number {
+  const legacy = paymentType === 'pix'
+    ? Number(report?.current_pix_links || 0)
+    : paymentType === 'upi'
+      ? Number(report?.current_upi_links || 0)
+      : 0
+  return reportCount(
+    report,
+    `${paymentType}_links`,
+    Number(report?.payment_type_counts?.[paymentType] || legacy),
+  )
 }
 
 export function PixLinkScanModal({
@@ -68,25 +121,60 @@ export function PixLinkScanModal({
   loading,
   error,
   cleanupMode,
+  cleanupPaymentType,
   onClose,
   onScan,
   onCleanup,
 }: PixLinkScanModalProps) {
-  const buildRows = (paymentType: PaymentLinkScanType): PixLinkScanRow[] => {
-    const prefix = paymentType === 'upi' ? 'upi' : 'pix'
-    const legacy = paymentType === 'pix'
+  const buildRows = (section: ScanSection): PixLinkScanRow[] => {
+    const prefix = section.type
+    const legacy = section.type === 'pix'
+    const cleanupModeFor = (mode: PixLinkCleanupMode) => (
+      section.cleanupModes.includes(mode) ? mode : null
+    )
     return [
-      { key: 'valid', label: '有效', color: 'success', count: Number(report?.[`${prefix}_valid_links` as keyof PixLinkScanReport] ?? (legacy ? report?.valid_links : 0) ?? 0), cleanupMode: null },
-      { key: 'paid', label: '已支付', color: 'blue', count: Number(report?.[`${prefix}_paid_links` as keyof PixLinkScanReport] ?? (legacy ? report?.paid_links : 0) ?? 0), cleanupMode: 'paid' },
-      { key: 'expired', label: '过期', color: 'orange', count: Number(report?.[`${prefix}_expired_links` as keyof PixLinkScanReport] ?? (legacy ? report?.expired_links : 0) ?? 0), cleanupMode: 'expired' },
-      { key: 'cancelled', label: '支付已取消', color: 'red', count: Number(report?.[`${prefix}_cancelled_links` as keyof PixLinkScanReport] ?? (legacy ? report?.cancelled_links : 0) ?? 0), cleanupMode: 'cancelled' },
+      {
+        key: 'valid',
+        label: '有效',
+        color: 'success',
+        count: reportCount(report, `${prefix}_valid_links`, legacy ? Number(report?.valid_links || 0) : 0),
+        cleanupMode: null,
+      },
+      {
+        key: 'paid',
+        label: '已支付',
+        color: 'blue',
+        count: reportCount(report, `${prefix}_paid_links`, legacy ? Number(report?.paid_links || 0) : 0),
+        cleanupMode: cleanupModeFor('paid'),
+      },
+      {
+        key: 'expired',
+        label: '过期',
+        color: 'orange',
+        count: reportCount(report, `${prefix}_expired_links`, legacy ? Number(report?.expired_links || 0) : 0),
+        cleanupMode: cleanupModeFor('expired'),
+      },
+      {
+        key: 'cancelled',
+        label: '支付已取消',
+        color: 'red',
+        count: reportCount(report, `${prefix}_cancelled_links`, legacy ? Number(report?.cancelled_links || 0) : 0),
+        cleanupMode: cleanupModeFor('cancelled'),
+      },
+      {
+        key: 'unknown',
+        label: '状态未知',
+        count: reportCount(report, `${prefix}_unknown_links`),
+        cleanupMode: null,
+      },
     ]
   }
-  const columns: ColumnsType<PixLinkScanRow> = [
+
+  const buildColumns = (section: ScanSection): ColumnsType<PixLinkScanRow> => [
     {
       title: '状态',
       dataIndex: 'label',
-      width: 132,
+      width: 144,
       render: (label: string, row) => <Tag color={row.color}>{label}</Tag>,
     },
     {
@@ -104,16 +192,21 @@ export function PixLinkScanModal({
       width: 104,
       align: 'right',
       render: (_, row) => {
+        if (row.key === 'unknown' && row.count > 0) {
+          return <Text type="secondary">保留</Text>
+        }
         const mode = row.cleanupMode
-        if (!mode) return null
+        if (!mode || row.count <= 0) return null
+        const paymentType = section.type as PaymentLinkCleanupType
+        const isTarget = cleanupMode === mode && cleanupPaymentType === paymentType
         return (
           <Button
             size="small"
             danger
             icon={<DeleteOutlined />}
-            disabled={loading || cleanupMode !== null || row.count <= 0}
-            loading={cleanupMode === mode}
-            onClick={() => onCleanup(mode, 'pix')}
+            disabled={loading || cleanupMode !== null}
+            loading={isTarget}
+            onClick={() => onCleanup(mode, paymentType)}
           >
             清理
           </Button>
@@ -121,28 +214,64 @@ export function PixLinkScanModal({
       },
     },
   ]
-  const validMissing = Number(report?.valid_missing_expiry_links || 0)
-  const pixTotal = Number(report?.current_pix_links || report?.payment_type_counts?.pix || 0)
-  const upiTotal = Number(report?.current_upi_links || report?.payment_type_counts?.upi || 0)
-  const showUpi = upiTotal > 0 || report?.payment_types?.includes('upi')
-  const directSuccess = Number(report?.direct_scan_success_links || 0)
-  const directFallback = Number(report?.direct_scan_fallback_links || 0)
+
+  const totalLinks = reportCount(
+    report,
+    'total_links',
+    PAYMENT_LINK_SCAN_SECTIONS.reduce((total, section) => total + paymentTypeTotal(report, section.type), 0),
+  )
+  const unknownTotal = reportCount(report, 'unknown_links')
+  const directSupported = reportCount(
+    report,
+    'direct_scan_supported_links',
+    paymentTypeTotal(report, 'pix') + paymentTypeTotal(report, 'upi'),
+  )
+  const directSuccess = reportCount(report, 'direct_scan_success_links')
+  const directFallback = reportCount(report, 'direct_scan_fallback_links')
+  const defaultExpandedTypes = PAYMENT_LINK_SCAN_SECTIONS
+    .filter((section) => paymentTypeTotal(report, section.type) > 0)
+    .map((section) => section.type)
+
+  const collapseItems = PAYMENT_LINK_SCAN_SECTIONS.map((section) => {
+    const total = paymentTypeTotal(report, section.type)
+    return {
+      key: section.type,
+      label: (
+        <Space size={8} wrap>
+          <Text strong>{section.label}</Text>
+          <Text type="secondary" style={{ fontVariantNumeric: 'tabular-nums' }}>{total} 条</Text>
+          {section.note ? <Text type="secondary">{section.note}</Text> : null}
+        </Space>
+      ),
+      children: (
+        <Table<PixLinkScanRow>
+          rowKey="key"
+          size="small"
+          tableLayout="fixed"
+          pagination={false}
+          columns={buildColumns(section)}
+          dataSource={buildRows(section)}
+        />
+      ),
+    }
+  })
 
   return (
     <Modal
-      title="PIX / UPI 链接扫描"
+      title="支付链接扫描"
       open={open}
       onCancel={onClose}
-      width={520}
+      width={640}
       footer={<Button onClick={onClose}>关闭</Button>}
       maskClosable={!loading && cleanupMode === null}
+      styles={{ body: { maxHeight: '72vh', overflowY: 'auto' } }}
     >
       <Space direction="vertical" size={12} style={{ width: '100%' }}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
           <Space size={8}>
-            <Text type="secondary">当前 PIX / UPI 链接</Text>
+            <Text type="secondary">当前支付链接</Text>
             <Text strong style={{ fontSize: 18, fontVariantNumeric: 'tabular-nums' }}>
-              {report ? pixTotal + upiTotal : '-'}
+              {report ? totalLinks : '-'}
             </Text>
           </Space>
           <Button icon={<ReloadOutlined />} loading={loading} disabled={cleanupMode !== null} onClick={onScan}>
@@ -150,59 +279,35 @@ export function PixLinkScanModal({
           </Button>
         </div>
         {error ? <Alert type="error" showIcon message="扫描失败" description={error} /> : null}
-        {report ? (
+        {loading && !report ? <Skeleton active paragraph={{ rows: 4 }} /> : null}
+        {report && directSupported > 0 ? (
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
-            <Text type="secondary">Stripe 实时查询</Text>
-            <Text strong style={{ fontVariantNumeric: 'tabular-nums' }}>{directSuccess} / {pixTotal + upiTotal}</Text>
+            <Text type="secondary">PIX / UPI Stripe 实时查询</Text>
+            <Text strong style={{ fontVariantNumeric: 'tabular-nums' }}>{directSuccess} / {directSupported}</Text>
           </div>
         ) : null}
         {directFallback > 0 ? (
           <Alert
             type="warning"
             showIcon
-            message={`${directFallback} 条实时查询失败，已使用本地记录兜底`}
+            message={`${directFallback} 条实时查询未返回可信状态，已按本地证据归类`}
           />
         ) : null}
-        {validMissing > 0 ? (
+        {unknownTotal > 0 ? (
           <Alert
-            type="warning"
+            type="info"
             showIcon
-            message={`${validMissing} 条保留链接缺少有效过期时间`}
+            message={`${unknownTotal} 条链接状态暂时无法确认，已保留`}
           />
         ) : null}
-        {(['pix', ...(showUpi ? ['upi'] : [])] as PaymentLinkScanType[]).map((paymentType) => {
-          const rows = buildRows(paymentType)
-          const total = paymentType === 'upi' ? upiTotal : pixTotal
-          return (
-            <div key={paymentType}>
-              <Space size={8} style={{ marginBottom: 6 }}>
-                <Text strong>{paymentType === 'upi' ? 'UPI 链接扫描' : 'PIX 链接扫描'}</Text>
-                <Text type="secondary">{total} 条</Text>
-                {paymentType === 'upi' ? <Text type="secondary">有效期 5 分钟，以 qr_code.expires_at 为准</Text> : null}
-              </Space>
-              <Table<PixLinkScanRow>
-                rowKey="key"
-                size="small"
-                tableLayout="fixed"
-                pagination={false}
-                loading={loading && !report}
-                columns={columns.map((column) => column.key === 'action'
-                  ? { ...column, render: (_, row) => row.cleanupMode ? (
-                    <Button
-                      size="small"
-                      danger
-                      icon={<DeleteOutlined />}
-                      disabled={loading || cleanupMode !== null || row.count <= 0}
-                      loading={cleanupMode === row.cleanupMode}
-                      onClick={() => onCleanup(row.cleanupMode as PixLinkCleanupMode, paymentType)}
-                    >清理</Button>
-                  ) : null }
-                  : column)}
-                dataSource={rows}
-              />
-            </div>
-          )
-        })}
+        {report ? (
+          <Collapse
+            key={String(report.now || 'payment-link-scan')}
+            size="small"
+            defaultActiveKey={defaultExpandedTypes}
+            items={collapseItems}
+          />
+        ) : null}
       </Space>
     </Modal>
   )

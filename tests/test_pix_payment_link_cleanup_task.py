@@ -234,6 +234,30 @@ def test_enqueue_upi_cleanup_uses_independent_source_and_runner_scope(cleanup_ta
     assert snapshot["meta"]["operation"] == "expired_upi_payment_link_cleanup"
 
 
+def test_enqueue_ideal_cleanup_uses_independent_source_and_expired_scope(cleanup_task_runtime):
+    store, _engine = cleanup_task_runtime
+    background_tasks = RecordingBackgroundTasks()
+
+    response = tasks.enqueue_expired_pix_payment_link_cleanup_task(
+        background_tasks=background_tasks,
+        cleanup_mode="expired",
+        payment_type="ideal",
+    )
+
+    task_id = str(response["task_id"])
+    assert response["source"] == "ideal_payment_link_cleanup"
+    assert response["payment_type"] == "ideal"
+    assert len(background_tasks.calls) == 1
+    runner, args, kwargs = background_tasks.calls[0]
+    assert runner is tasks._run_expired_pix_payment_link_cleanup
+    assert args == (task_id, "expired", "ideal")
+    assert kwargs == {}
+    snapshot = store.snapshot(task_id)
+    assert snapshot["source"] == "ideal_payment_link_cleanup"
+    assert snapshot["meta"]["payment_type"] == "ideal"
+    assert snapshot["meta"]["operation"] == "expired_ideal_payment_link_cleanup"
+
+
 def test_pix_cleanup_runner_persists_success_and_keeps_summary_last(
     cleanup_task_runtime,
     monkeypatch: pytest.MonkeyPatch,

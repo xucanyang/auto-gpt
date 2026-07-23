@@ -16,15 +16,19 @@ from services.chatgpt_core.pix_payment_link_cleanup import (
     PIX_EXPIRED_CLEANED_STATUS,
     clean_pix_payment_links,
     clean_expired_pix_payment_links,
+    clean_ideal_payment_links,
+    ideal_effective_expires_at,
     parse_stripe_pix_instruction_html,
     pix_schedule_expires_at,
     preview_pix_payment_link_cleanup,
+    preview_payment_link_cleanup,
     preview_expired_pix_payment_links,
     clean_upi_payment_links,
     parse_stripe_payment_instruction_html,
     preview_upi_payment_link_cleanup,
 )
 from services.chatgpt_core.payment_link_cache import (
+    IDEAL_EXPIRED_CLEANED_STATUS,
     PIX_CANCELLED_CLEANED_STATUS,
     PIX_PAID_CLEANED_STATUS,
 )
@@ -77,6 +81,33 @@ def _upi_link(url: str, *, generated_at: str = "", expires_at: int | None = None
     if expires_at is not None:
         payload["link_expires_at"] = expires_at
         payload["link_expiry_source"] = "upi_qr_code"
+    return payload
+
+
+def _typed_link(
+    payment_type: str,
+    url: str,
+    *,
+    generated_at: str = "",
+    expires_at: int | None = None,
+    link_status: str = "",
+) -> dict:
+    payload = {
+        "url": url,
+        "long_url": url,
+        "link_type": payment_type,
+        "payment_method_type": payment_type,
+        "payment_link_format": "long_link",
+        "plan": "plus",
+    }
+    if generated_at:
+        payload["generated_at"] = generated_at
+        payload["created_at"] = generated_at
+    if expires_at is not None:
+        payload["link_expires_at"] = expires_at
+        payload["link_expiry_source"] = "provider"
+    if link_status:
+        payload["link_status"] = link_status
     return payload
 
 
@@ -217,6 +248,112 @@ def test_upi_cleanup_rejects_explicit_checkout_session_expiry(monkeypatch):
     assert preview["upi_expired_links"] == 0
     assert preview["missing_expiry_links"] == 2
     assert preview["eligible_links"] == 0
+
+
+def test_mixed_scan_classifies_every_payment_type_and_retains_unknown_states():
+    engine = _engine()
+    future_epoch = int((NOW + timedelta(hours=1)).timestamp())
+    with Session(engine) as session:
+        session.add_all(
+            [
+                _account(701, _typed_link("hosted", "https://pay.openai.com/hosted", link_status="payment_expired")),
+                _account(702, _typed_link("paypal", "https://www.paypal.com/checkout", expires_at=future_epoch)),
+                _account(703, _typed_link("ideal", "https://pay.ideal.nl/transactions/expired", generated_at="2026-07-16T03:44:00+00:00")),
+                _account(704, _typed_link("upi", "https://payments.example.test/upi")),
+                _account(705, _typed_link("pix", "https://payments.example.test/pix", generated_at="2026-07-16T03:30:00+00:00")),
+                _account(706, _typed_link("twint", "https://pay.twint.ch/order", link_status="paid")),
+                _account(707, _typed_link("kakao_pay", "https://pay.kakaopay.com/order", link_status="payment_cancelled")),
+                _account(708, _typed_link("gopay", "https://example.test/gopay")),
+                _account(709, _typed_link("team", "https://chatgpt.com/checkout/team")),
+                _account(710, _typed_link("other", "https://example.test/unknown")),
+            ]
+        )
+        session.commit()
+
+    with Session(engine) as session:
+        scan = preview_payment_link_cleanup(session, now=NOW)
+
+    assert scan["total_links"] == 10
+    assert scan["payment_type_counts"] == {
+        "hosted": 1,
+        "paypal": 1,
+        "ideal": 1,
+        "upi": 1,
+        "pix": 1,
+        "twint": 1,
+        "kakao_pay": 1,
+        "gopay": 1,
+        "team": 1,
+        "other": 1,
+    }
+    assert scan["valid_links"] == 2
+    assert scan["expired_links"] == 2
+    assert scan["paid_links"] == 1
+    assert scan["cancelled_links"] == 1
+    assert scan["unknown_links"] == 4
+    assert scan["ideal_expired_links"] == 1
+    assert scan["ideal_derived_expiry_links"] == 1
+    assert scan["ideal_validity_seconds"] == 15 * 60
+    assert scan["direct_scan_supported_links"] == 2
+    assert scan["direct_scan_success_links"] == 0
+    assert scan["direct_scan_fallback_links"] == 2
+    assert sum(
+        scan[key]
+        for key in ("valid_links", "expired_links", "paid_links", "cancelled_links", "unknown_links")
+    ) == scan["total_links"]
+
+
+def test_ideal_expiry_is_extraction_plus_15_minutes_and_cleanup_keeps_newer_link():
+    expires_at, source = ideal_effective_expires_at({"generated_at": "2026-07-16T03:45:00+00:00"})
+    assert expires_at == NOW
+    assert source == "ideal_generated_15m"
+    assert ideal_effective_expires_at({}) == (None, "missing")
+
+    engine = _engine()
+    with Session(engine) as session:
+        session.add_all(
+            [
+                _account(711, _typed_link("ideal", "https://pay.ideal.nl/transactions/expired", generated_at="2026-07-16T03:44:59+00:00")),
+                _account(712, _typed_link("ideal", "https://pay.ideal.nl/transactions/valid", generated_at="2026-07-16T03:45:01+00:00")),
+                _account(713, _typed_link("ideal", "https://pay.ideal.nl/transactions/history-expired")),
+            ]
+        )
+        session.add(
+            PaymentLinkGenerationModel(
+                account_id=713,
+                request_id="ideal-history-expiry",
+                link_type="ideal",
+                status="succeeded",
+                url="https://pay.ideal.nl/transactions/history-expired",
+                generated_at="2026-07-16T03:40:00+00:00",
+            )
+        )
+        session.commit()
+
+    with Session(engine) as session:
+        preview = preview_payment_link_cleanup(session, payment_type="ideal", now=NOW)
+    assert preview["ideal_links"] == 3
+    assert preview["ideal_expired_links"] == 2
+    assert preview["ideal_valid_links"] == 1
+    assert preview["ideal_unknown_links"] == 0
+
+    with Session(engine) as session:
+        result = clean_ideal_payment_links(session, now=NOW)
+    assert result["cleaned_links"] == 2
+
+    with Session(engine) as session:
+        expired = session.get(AccountModel, 711)
+        valid = session.get(AccountModel, 712)
+        assert expired is not None and valid is not None
+        marker = expired.get_extra()["chatgpt_last_payment_link"]
+        assert marker["link_status"] == IDEAL_EXPIRED_CLEANED_STATUS
+        assert marker["link_expiry_source"] == "ideal_generated_15m"
+        assert marker["link_expires_at"] == int(datetime(2026, 7, 16, 3, 59, 59, tzinfo=timezone.utc).timestamp())
+        assert "url" not in marker
+        assert valid.get_extra()["chatgpt_last_payment_link"]["url"].endswith("/valid")
+        state = session.get(AccountListStateModel, 711)
+        assert state is not None
+        assert state.payment_link_platform == "none"
 
 
 def test_preview_and_cleanup_are_scoped_atomic_and_idempotent():
@@ -520,12 +657,14 @@ def test_scan_buckets_are_mutually_exclusive_and_cleanup_matches_each_bucket():
         scan = preview_pix_payment_link_cleanup(session, now=NOW)
 
     assert scan["current_pix_links"] == 5
-    assert scan["valid_links"] == 2
+    assert scan["valid_links"] == 1
     assert scan["paid_links"] == 1
     assert scan["expired_links"] == 1
     assert scan["cancelled_links"] == 1
-    assert scan["valid_missing_expiry_links"] == 1
-    assert sum(scan[key] for key in ("valid_links", "paid_links", "expired_links", "cancelled_links")) == 5
+    assert scan["valid_missing_expiry_links"] == 0
+    assert scan["unknown_links"] == 1
+    assert scan["unknown_missing_expiry_links"] == 1
+    assert sum(scan[key] for key in ("valid_links", "paid_links", "expired_links", "cancelled_links", "unknown_links")) == 5
 
     with Session(engine) as session:
         expired = clean_expired_pix_payment_links(session, now=NOW)
@@ -624,6 +763,7 @@ def test_direct_stripe_states_override_stale_local_records_and_fallback_on_failu
     assert scan["paid_links"] == 2
     assert scan["cancelled_links"] == 1
     assert scan["valid_links"] == 1
+    assert scan["unknown_links"] == 0
     assert scan["expired_links"] == 1
     assert scan["direct_scan_attempted_links"] == 5
     assert scan["direct_scan_success_links"] == 4

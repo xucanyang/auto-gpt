@@ -276,7 +276,7 @@ export function AccountsToolbar({
     { type: 'divider' },
     {
       key: 'pix_scan',
-      label: '扫描 PIX / UPI 链接',
+      label: '扫描支付链接',
       icon: <SearchOutlined />,
       disabled: pixLinkCleanupLoading,
     },

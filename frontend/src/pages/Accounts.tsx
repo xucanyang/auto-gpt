@@ -53,7 +53,7 @@ import type {
   AccountsToolbarActionId as AccountToolbarActionId,
 } from '@/features/accounts/components/AccountsToolbar'
 import { PixLinkScanModal } from '@/features/accounts/components/PixLinkScanModal'
-import type { PaymentLinkScanType, PixLinkCleanupMode, PixLinkScanReport } from '@/features/accounts/components/PixLinkScanModal'
+import type { PaymentLinkCleanupType, PixLinkCleanupMode, PixLinkScanReport } from '@/features/accounts/components/PixLinkScanModal'
 import { BatchGopayWorkbench } from '@/features/accounts/components/BatchGopayWorkbench'
 import { ImportAccountsModal } from '@/features/accounts/components/ImportAccountsModal'
 import { useAccountDetailQuery } from '@/features/accounts/hooks/useAccountDetailQuery'
@@ -461,18 +461,19 @@ type PixLinkCleanupTaskResponse = {
   already_running?: boolean
   cleanup_mode?: PixLinkCleanupMode
   requested_cleanup_mode?: PixLinkCleanupMode
-  payment_type?: PaymentLinkScanType
+  payment_type?: PaymentLinkCleanupType
 }
 
 const PIX_LINK_CLEANUP_META: Record<PixLinkCleanupMode, { label: string; title: string }> = {
-  expired: { label: '过期', title: '过期 PIX 链接' },
-  paid: { label: '已支付', title: '已支付 PIX 链接' },
-  cancelled: { label: '支付已取消', title: '支付已取消 PIX 链接' },
+  expired: { label: '过期', title: '过期链接' },
+  paid: { label: '已支付', title: '已支付链接' },
+  cancelled: { label: '支付已取消', title: '支付已取消链接' },
 }
 
-const PAYMENT_LINK_SCAN_LABELS: Record<PaymentLinkScanType, string> = {
+const PAYMENT_LINK_SCAN_LABELS: Record<PaymentLinkCleanupType, string> = {
   pix: 'PIX',
   upi: 'UPI',
+  ideal: 'iDEAL',
 }
 
 const PAYMENT_LINK_CLEANED_STATUS_META: Record<string, { color: string; label: string }> = {
@@ -482,6 +483,9 @@ const PAYMENT_LINK_CLEANED_STATUS_META: Record<string, { color: string; label: s
   upi_expired_cleaned: { color: 'warning', label: 'UPI 已过期清理' },
   upi_paid_cleaned: { color: 'success', label: 'UPI 已支付清理' },
   upi_cancelled_cleaned: { color: 'warning', label: 'UPI 支付已取消清理' },
+  ideal_expired_cleaned: { color: 'warning', label: 'iDEAL 已过期清理' },
+  ideal_paid_cleaned: { color: 'success', label: 'iDEAL 已支付清理' },
+  ideal_cancelled_cleaned: { color: 'warning', label: 'iDEAL 支付已取消清理' },
 }
 
 const ACCOUNT_COLUMN_OPTIONS: Array<{ value: AccountColumnKey; text: string; chatgptOnly?: boolean }> = [
@@ -2453,7 +2457,7 @@ function taskModalModeFromSource(source: unknown): 'register' | 'resume_auth' | 
   if (normalized === 'batch_oaipay_upload') return 'oaipay_upload'
   if (normalized === 'invalid_recheck' || normalized === 'batch_invalid_recheck') return 'resume_auth'
   if (normalized === 'payment_link' || normalized === 'batch_payment_link') return 'payment_link'
-  if (normalized === 'pix_cleanup' || normalized === 'pix_payment_link_cleanup' || normalized === 'upi_payment_link_cleanup' || normalized === 'payment_link_cleanup') return 'pix_cleanup'
+  if (normalized === 'pix_cleanup' || normalized === 'pix_payment_link_cleanup' || normalized === 'upi_payment_link_cleanup' || normalized === 'ideal_payment_link_cleanup' || normalized === 'payment_link_cleanup') return 'pix_cleanup'
   return 'register'
 }
 
@@ -2638,6 +2642,7 @@ export default function Accounts() {
   const [pixLinkScanError, setPixLinkScanError] = useState('')
   const [pixLinkCleanupLoading, setPixLinkCleanupLoading] = useState(false)
   const [pixLinkCleanupMode, setPixLinkCleanupMode] = useState<PixLinkCleanupMode | null>(null)
+  const [pixLinkCleanupType, setPixLinkCleanupType] = useState<PaymentLinkCleanupType | null>(null)
   const [batchInvalidRecheckLoading, setBatchInvalidRecheckLoading] = useState(false)
   const [visibleColumnKeys, setVisibleColumnKeys] = useState<AccountColumnKey[]>(() => loadVisibleAccountColumnKeys())
   const [pinnedToolbarActionIds, setPinnedToolbarActionIds] = useState<AccountToolbarActionId[]>(() => loadPinnedToolbarActions())
@@ -4125,12 +4130,13 @@ export default function Accounts() {
 
   const executePixLinkCleanup = async (
     cleanupMode: PixLinkCleanupMode,
-    paymentType: PaymentLinkScanType = 'pix',
+    paymentType: PaymentLinkCleanupType = 'pix',
   ) => {
     const cleanupMeta = PIX_LINK_CLEANUP_META[cleanupMode]
     const paymentLabel = PAYMENT_LINK_SCAN_LABELS[paymentType]
     setPixLinkCleanupLoading(true)
     setPixLinkCleanupMode(cleanupMode)
+    setPixLinkCleanupType(paymentType)
     try {
       const result = await apiFetch('/tasks/chatgpt/payment-links/cleanup/task', {
         method: 'POST',
@@ -4149,7 +4155,7 @@ export default function Accounts() {
       setTaskSnapshot({
         id: taskIdFromResponse,
         task_id: taskIdFromResponse,
-        source: String(result?.source || (paymentType === 'upi' ? 'upi_payment_link_cleanup' : 'pix_payment_link_cleanup')),
+        source: String(result?.source || `${paymentType}_payment_link_cleanup`),
         status: result?.already_running ? 'running' : 'pending',
         meta: {
           instance_id: instanceId,
@@ -4173,12 +4179,13 @@ export default function Accounts() {
     } finally {
       setPixLinkCleanupLoading(false)
       setPixLinkCleanupMode(null)
+      setPixLinkCleanupType(null)
     }
   }
 
   const handleCleanupPixLinks = async (
     cleanupMode: PixLinkCleanupMode,
-    paymentType: PaymentLinkScanType = 'pix',
+    paymentType: PaymentLinkCleanupType = 'pix',
   ) => {
     // Legacy copy: 只清理账号当前 PIX 链接；UPI uses the same guarded path.
     // Legacy message template: 当前没有可清理的${cleanupMeta.title}
@@ -4186,16 +4193,17 @@ export default function Accounts() {
     const paymentLabel = PAYMENT_LINK_SCAN_LABELS[paymentType]
     setPixLinkCleanupLoading(true)
     setPixLinkCleanupMode(cleanupMode)
+    setPixLinkCleanupType(paymentType)
     let preview: PixLinkScanReport
     try {
       preview = await apiFetch(`/tasks/chatgpt/payment-links/cleanup/preview?cleanup_mode=${encodeURIComponent(cleanupMode)}&payment_type=${encodeURIComponent(paymentType)}`) as PixLinkScanReport
-      setPixLinkScanReport(preview)
     } catch (e: any) {
       appMessage.error(e?.message || `读取${paymentLabel}${cleanupMeta.title}数量失败`)
       return
     } finally {
       setPixLinkCleanupLoading(false)
       setPixLinkCleanupMode(null)
+      setPixLinkCleanupType(null)
     }
 
     const eligible = Number(preview?.eligible_links || 0)
@@ -4212,11 +4220,13 @@ export default function Accounts() {
       content: (
         <Space direction="vertical" size={6} style={{ width: '100%' }}>
           <Text>实例：{instanceId}</Text>
-          {cleanupMode === 'expired' ? <Text>当前清理截止点：{cutoff}（北京时间）</Text> : null}
+          {cleanupMode === 'expired' && paymentType === 'pix' ? <Text>当前清理截止点：{cutoff}（北京时间）</Text> : null}
+          {cleanupMode === 'expired' && paymentType === 'upi' ? <Text>以 Stripe QR 的 expires_at 为过期依据。</Text> : null}
+          {cleanupMode === 'expired' && paymentType === 'ideal' ? <Text>以支付链接提取时间后 15 分钟为过期点。</Text> : null}
           {cleanupMode === 'paid' ? <Text>仅匹配当前链接的明确支付成功证据。</Text> : null}
           {cleanupMode === 'cancelled' ? <Text>仅匹配当前链接的明确支付取消证据，普通失败和超时会保留。</Text> : null}
           <Text type="secondary">
-            只清理账号当前 {paymentLabel} 链接及其完全相同的 cashier_url；不会删除账号、支付生成历史、PIX CDK 或提交结果。
+            只清理账号当前 {paymentLabel} 链接及其完全相同的 cashier_url；不会删除账号、支付生成历史、支付 CDK 或提交结果。
           </Text>
           {cleanupMode === 'expired' && missing > 0 ? <Text type="warning">另有 {missing} 条缺少有效时间信息，本次不会清理。</Text> : null}
         </Space>
@@ -8518,6 +8528,7 @@ export default function Accounts() {
         loading={pixLinkScanLoading}
         error={pixLinkScanError}
         cleanupMode={pixLinkCleanupMode}
+        cleanupPaymentType={pixLinkCleanupType}
         onClose={() => {
           if (!pixLinkScanLoading && !pixLinkCleanupLoading) {
             setPixLinkScanOpen(false)
