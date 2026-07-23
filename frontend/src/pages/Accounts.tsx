@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useState, useCallback, useMemo } from 'react'
+import { lazy, Suspense, useEffect, useState, useCallback, useMemo, useRef } from 'react'
 import type { CSSProperties } from 'react'
 import { FilterPresetBar } from '../features/accounts/components/FilterPresetBar'
 import {
@@ -2603,6 +2603,7 @@ export default function Accounts() {
   const baxiPixSubmitModeValue = Form.useWatch('pix_submit_mode', baxiCdkSubmitForm)
   const [registerMailProvider, setRegisterMailProvider] = useState('luckmail')
   const [configCache, setConfigCache] = useState<Record<string, any> | null>(null)
+  const configCacheRef = useRef<Record<string, any> | null>(null)
   const { mode: chatgptRegistrationMode, setMode: setChatgptRegistrationMode } =
     usePersistentChatGPTRegistrationMode()
   const [importText, setImportText] = useState('')
@@ -2873,11 +2874,12 @@ export default function Accounts() {
   }, [accountsQuery.refetch])
 
   const loadConfigCache = useCallback(async (options: { force?: boolean } = {}) => {
-    if (!options.force && configCache) return configCache
+    if (!options.force && configCacheRef.current) return configCacheRef.current
     const cfg = await apiFetch('/config')
+    configCacheRef.current = cfg
     setConfigCache(cfg)
     return cfg
-  }, [configCache])
+  }, [])
 
   const load = useCallback(async () => {
     await accountsQuery.refetch()

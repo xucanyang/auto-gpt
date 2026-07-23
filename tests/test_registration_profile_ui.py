@@ -23,6 +23,9 @@ def test_registration_modal_uses_server_profile_instead_of_stale_browser_overrid
     assert "taskProxySettingsFromConfig(cfg, savedSettings)" not in page
     assert "const proxySettings = taskProxySettingsFromConfig(cfg)" in page
     assert "loadConfigCache({ force: true })" in page
+    assert "const configCacheRef = useRef<Record<string, any> | null>(null)" in page
+    assert "if (!options.force && configCacheRef.current) return configCacheRef.current" in page
+    assert "configCacheRef.current = cfg" in page
     assert "mail_provider_override: '__global__'" in page
     assert "savedSettings.chatgpt_register_otp_wait_seconds" not in page
     assert 'label="邮箱服务（仅本任务）"' in modal
