@@ -258,6 +258,55 @@ def test_enqueue_ideal_cleanup_uses_independent_source_and_expired_scope(cleanup
     assert snapshot["meta"]["operation"] == "expired_ideal_payment_link_cleanup"
 
 
+def test_cleanup_request_accepts_all_payment_types_and_status_modes():
+    payment_types = (
+        "hosted",
+        "paypal",
+        "ideal",
+        "upi",
+        "pix",
+        "twint",
+        "kakao_pay",
+        "gopay",
+        "team",
+        "other",
+    )
+    cleanup_modes = ("valid", "paid", "expired", "cancelled", "unknown")
+
+    for payment_type in payment_types:
+        assert tasks._normalize_payment_link_cleanup_type(payment_type) == payment_type
+        for cleanup_mode in cleanup_modes:
+            request = tasks.PixPaymentLinkCleanupRequest(
+                payment_type=payment_type,
+                cleanup_mode=cleanup_mode,
+            )
+            assert request.payment_type == payment_type
+            assert request.cleanup_mode == cleanup_mode
+
+
+def test_enqueue_generic_unknown_delete_uses_type_scoped_runner(cleanup_task_runtime):
+    store, _engine = cleanup_task_runtime
+    background_tasks = RecordingBackgroundTasks()
+
+    response = tasks.enqueue_expired_pix_payment_link_cleanup_task(
+        background_tasks=background_tasks,
+        cleanup_mode="unknown",
+        payment_type="hosted",
+    )
+
+    task_id = str(response["task_id"])
+    assert response["source"] == "hosted_payment_link_cleanup"
+    assert response["payment_type"] == "hosted"
+    assert len(background_tasks.calls) == 1
+    runner, args, kwargs = background_tasks.calls[0]
+    assert runner is tasks._run_expired_pix_payment_link_cleanup
+    assert args == (task_id, "unknown", "hosted")
+    assert kwargs == {}
+    snapshot = store.snapshot(task_id)
+    assert snapshot["meta"]["cleanup_label"] == "状态未知"
+    assert snapshot["meta"]["operation"] == "unknown_hosted_payment_link_cleanup"
+
+
 def test_pix_cleanup_runner_persists_success_and_keeps_summary_last(
     cleanup_task_runtime,
     monkeypatch: pytest.MonkeyPatch,

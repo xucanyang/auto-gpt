@@ -4,7 +4,7 @@ import { DeleteOutlined, ReloadOutlined } from '@ant-design/icons'
 
 const { Text } = Typography
 
-export type PixLinkCleanupMode = 'expired' | 'paid' | 'cancelled'
+export type PixLinkCleanupMode = 'valid' | 'paid' | 'expired' | 'cancelled' | 'unknown'
 export type PaymentLinkScanType =
   | 'hosted'
   | 'paypal'
@@ -16,7 +16,7 @@ export type PaymentLinkScanType =
   | 'gopay'
   | 'team'
   | 'other'
-export type PaymentLinkCleanupType = Extract<PaymentLinkScanType, 'pix' | 'upi' | 'ideal'>
+export type PaymentLinkCleanupType = PaymentLinkScanType
 
 export type PixLinkScanReport = {
   instance_id?: string
@@ -53,11 +53,13 @@ export type PixLinkScanReport = {
   upi_qr_validity_seconds?: number
   ideal_derived_expiry_links?: number
   ideal_validity_seconds?: number
+  team_derived_expiry_links?: number
+  team_validity_seconds?: number
   [key: string]: unknown
 }
 
 type PixLinkScanRow = {
-  key: 'valid' | PixLinkCleanupMode | 'unknown'
+  key: PixLinkCleanupMode
   label: string
   color?: string
   count: number
@@ -71,17 +73,25 @@ type ScanSection = {
   cleanupModes: PixLinkCleanupMode[]
 }
 
+const ALL_PAYMENT_LINK_CLEANUP_MODES: PixLinkCleanupMode[] = [
+  'valid',
+  'paid',
+  'expired',
+  'cancelled',
+  'unknown',
+]
+
 const PAYMENT_LINK_SCAN_SECTIONS: ScanSection[] = [
-  { type: 'hosted', label: 'Hosted Checkout', cleanupModes: [] },
-  { type: 'paypal', label: 'PayPal', cleanupModes: [] },
-  { type: 'ideal', label: 'iDEAL', note: '提取后 15 分钟到期', cleanupModes: ['expired'] },
-  { type: 'upi', label: 'UPI', note: 'QR 有效期 5 分钟', cleanupModes: ['expired', 'paid', 'cancelled'] },
-  { type: 'pix', label: 'PIX', cleanupModes: ['expired', 'paid', 'cancelled'] },
-  { type: 'twint', label: 'TWINT', cleanupModes: [] },
-  { type: 'kakao_pay', label: 'Kakao Pay', cleanupModes: [] },
-  { type: 'gopay', label: 'GoPay', cleanupModes: [] },
-  { type: 'team', label: 'ChatGPT Team', cleanupModes: [] },
-  { type: 'other', label: '其他支付链接', cleanupModes: [] },
+  { type: 'hosted', label: 'Hosted Checkout', cleanupModes: ALL_PAYMENT_LINK_CLEANUP_MODES },
+  { type: 'paypal', label: 'PayPal', cleanupModes: ALL_PAYMENT_LINK_CLEANUP_MODES },
+  { type: 'ideal', label: 'iDEAL', note: '提取后 15 分钟到期', cleanupModes: ALL_PAYMENT_LINK_CLEANUP_MODES },
+  { type: 'upi', label: 'UPI', note: 'QR 有效期 5 分钟', cleanupModes: ALL_PAYMENT_LINK_CLEANUP_MODES },
+  { type: 'pix', label: 'PIX', cleanupModes: ALL_PAYMENT_LINK_CLEANUP_MODES },
+  { type: 'twint', label: 'TWINT', cleanupModes: ALL_PAYMENT_LINK_CLEANUP_MODES },
+  { type: 'kakao_pay', label: 'Kakao Pay', cleanupModes: ALL_PAYMENT_LINK_CLEANUP_MODES },
+  { type: 'gopay', label: 'GoPay', cleanupModes: ALL_PAYMENT_LINK_CLEANUP_MODES },
+  { type: 'team', label: 'ChatGPT Team', note: '提取后 24 小时到期', cleanupModes: ALL_PAYMENT_LINK_CLEANUP_MODES },
+  { type: 'other', label: '其他支付链接', cleanupModes: ALL_PAYMENT_LINK_CLEANUP_MODES },
 ]
 
 type PixLinkScanModalProps = {
@@ -138,7 +148,7 @@ export function PixLinkScanModal({
         label: '有效',
         color: 'success',
         count: reportCount(report, `${prefix}_valid_links`, legacy ? Number(report?.valid_links || 0) : 0),
-        cleanupMode: null,
+        cleanupMode: cleanupModeFor('valid'),
       },
       {
         key: 'paid',
@@ -165,7 +175,7 @@ export function PixLinkScanModal({
         key: 'unknown',
         label: '状态未知',
         count: reportCount(report, `${prefix}_unknown_links`),
-        cleanupMode: null,
+        cleanupMode: cleanupModeFor('unknown'),
       },
     ]
   }
@@ -192,9 +202,6 @@ export function PixLinkScanModal({
       width: 104,
       align: 'right',
       render: (_, row) => {
-        if (row.key === 'unknown' && row.count > 0) {
-          return <Text type="secondary">保留</Text>
-        }
         const mode = row.cleanupMode
         if (!mode || row.count <= 0) return null
         const paymentType = section.type as PaymentLinkCleanupType
@@ -208,7 +215,7 @@ export function PixLinkScanModal({
             loading={isTarget}
             onClick={() => onCleanup(mode, paymentType)}
           >
-            清理
+            删除
           </Button>
         )
       },
@@ -228,10 +235,6 @@ export function PixLinkScanModal({
   )
   const directSuccess = reportCount(report, 'direct_scan_success_links')
   const directFallback = reportCount(report, 'direct_scan_fallback_links')
-  const defaultExpandedTypes = PAYMENT_LINK_SCAN_SECTIONS
-    .filter((section) => paymentTypeTotal(report, section.type) > 0)
-    .map((section) => section.type)
-
   const collapseItems = PAYMENT_LINK_SCAN_SECTIONS.map((section) => {
     const total = paymentTypeTotal(report, section.type)
     return {
@@ -297,14 +300,14 @@ export function PixLinkScanModal({
           <Alert
             type="info"
             showIcon
-            message={`${unknownTotal} 条链接状态暂时无法确认，已保留`}
+            message={`${unknownTotal} 条链接状态暂时无法确认，默认保留；可展开对应类型后人工删除`}
           />
         ) : null}
         {report ? (
           <Collapse
             key={String(report.now || 'payment-link-scan')}
             size="small"
-            defaultActiveKey={defaultExpandedTypes}
+            defaultActiveKey={[]}
             items={collapseItems}
           />
         ) : null}

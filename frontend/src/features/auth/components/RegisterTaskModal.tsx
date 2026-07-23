@@ -179,8 +179,19 @@ export function RegisterTaskModal({
     if (taskModalMode === 'pix_cleanup') {
       const cleanupLabel = String(taskSnapshot?.meta?.cleanup_label || '').trim()
       const paymentType = String(taskSnapshot?.meta?.payment_type || 'pix').trim().toLowerCase()
-      const paymentLabel = ({ pix: 'PIX', upi: 'UPI', ideal: 'iDEAL' } as Record<string, string>)[paymentType] || paymentType.toUpperCase()
-      return cleanupLabel ? `${cleanupLabel} ${paymentLabel} 链接清理` : `${paymentLabel} 链接清理`
+      const paymentLabel = ({
+        hosted: 'Hosted Checkout',
+        paypal: 'PayPal',
+        ideal: 'iDEAL',
+        upi: 'UPI',
+        pix: 'PIX',
+        twint: 'TWINT',
+        kakao_pay: 'Kakao Pay',
+        gopay: 'GoPay',
+        team: 'ChatGPT Team',
+        other: '其他支付链接',
+      } as Record<string, string>)[paymentType] || paymentType.toUpperCase()
+      return cleanupLabel ? `${cleanupLabel} ${paymentLabel} 链接删除` : `${paymentLabel} 链接删除`
     }
     if (taskModalMode === 'probe_local_status') {
       const eligible = Number(taskSnapshot?.meta?.eligible || 0)

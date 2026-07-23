@@ -6,6 +6,24 @@
 
 ## [Unreleased] (未发布)
 
+## [2.8.6] - 2026-07-24
+
+### 新增 (Added)
+- **ChatGPT Team 固定 24 小时有效期**：`services/chatgpt_core/pix_payment_link_cleanup.py` 以当前链接的 `generated_at`（兼容 `created_at`）派生提取后 24 小时过期点，并在当前缓存缺少时间时按账号和 URL 回退到 `payment_link_generations.generated_at`。恰好第 24 小时进入过期状态；仍无提取时间的链接保持“状态未知”，不使用无来源的过期猜测。
+- **十类支付链接开放五状态人工删除**：Hosted Checkout、PayPal、iDEAL、UPI、PIX、TWINT、Kakao Pay、GoPay、ChatGPT Team 与其他链接均支持按“有效 / 已支付 / 过期 / 支付已取消 / 状态未知”单独预览和删除。数量为零时不显示删除动作；未知状态继续默认保留，仅在运营人员主动展开并二次确认后删除。
+
+### 优化 (Changed)
+- **扫描弹窗全部默认收起**：`PixLinkScanModal.tsx` 不再根据是否存在链接自动展开类型面板。首次扫描和重新扫描都以十个类型全部收起呈现，减少大批量状态表占用；需要查看计数或执行删除时再展开对应类型。
+- **通用删除墓碑兼容全部组合**：保留 PIX、UPI、iDEAL 既有九种清理墓碑，新类型以及有效/未知状态统一写入 `payment_link_deleted`，并通过 `payment_link_cleanup_type`、`payment_link_cleanup_mode`、`payment_link_cleanup_through_at` 和 `previous_link_status` 保留实际语义。`payment_link_cache.py`、账号摘要和前端状态映射同步识别该墓碑，允许后续重新生成链接。
+- **删除范围保持最小化**：删除事务只移除账号当前支付链接对象中的 URL 字段，并仅在 `cashier_url` 与扫描确认的当前 URL 完全一致时清空镜像字段；账号、支付生成历史、支付 CDK、提交结果及其他业务状态均不修改。
+
+### 修复 (Fixed)
+- **防止通用删除后旧链接被列表索引复活**：`services/account_filters.py` 的 Python 与全部 SQLite 派生分支加入 `payment_link_deleted` 终态识别，同时提升账号列表派生版本和筛选解析版本，确保三个常驻实例重算后统一显示为“当前无链接”。
+- **保留删除前并发复核**：所有新增类型和状态继续执行预览、二次确认、SQLite 完整性校验备份、`BEGIN IMMEDIATE` 事务及 URL 精确复核；扫描后链接被其他任务刷新时跳过该账号，不会误删新链接。
+
+### 测试 (Tests)
+- 扩展支付链接扫描、清理任务、列表派生和前端静态合同回归，覆盖 Team `23:59:59 / 24:00:00` 边界、生成历史时间回退、十类型乘五状态的预览与删除、通用墓碑可重新生成、未知链接人工删除、历史数据保留、精确 `cashier_url` 清理及全部面板默认收起；前端侧栏版本同步更新为 `v2.8.6`。
+
 ## [2.8.5] - 2026-07-24
 
 ### 新增 (Added)
@@ -2254,4 +2272,8 @@
 
 ## 2026-07-24 04:10:10 +0800
 - v2.8.5 扩展全类型支付链接扫描与 iDEAL 15 分钟过期
+- 发布模式: multi
+
+## 2026-07-24 04:49:39 +0800
+- v2.8.6 支付链接全状态人工删除与 Team 24 小时有效期
 - 发布模式: multi

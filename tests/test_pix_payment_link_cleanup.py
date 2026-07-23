@@ -29,8 +29,10 @@ from services.chatgpt_core.pix_payment_link_cleanup import (
 )
 from services.chatgpt_core.payment_link_cache import (
     IDEAL_EXPIRED_CLEANED_STATUS,
+    PAYMENT_LINK_DELETED_STATUS,
     PIX_CANCELLED_CLEANED_STATUS,
     PIX_PAID_CLEANED_STATUS,
+    payment_link_requires_regeneration,
 )
 
 
@@ -354,6 +356,136 @@ def test_ideal_expiry_is_extraction_plus_15_minutes_and_cleanup_keeps_newer_link
         state = session.get(AccountListStateModel, 711)
         assert state is not None
         assert state.payment_link_platform == "none"
+
+
+def test_team_expiry_is_extraction_plus_24_hours_with_history_fallback():
+    expires_at, source = pix_cleanup.team_effective_expires_at(
+        {
+            "generated_at": "2026-07-15T04:00:00+00:00",
+            "link_expires_at": int((NOW + timedelta(days=30)).timestamp()),
+        }
+    )
+    assert expires_at == NOW
+    assert source == "team_generated_24h"
+    assert pix_cleanup.team_effective_expires_at({}) == (None, "missing")
+
+    engine = _engine()
+    with Session(engine) as session:
+        session.add_all(
+            [
+                _account(
+                    714,
+                    _typed_link(
+                        "team",
+                        "https://chatgpt.com/checkout/team-valid",
+                        generated_at="2026-07-15T04:00:01+00:00",
+                    ),
+                ),
+                _account(
+                    715,
+                    _typed_link(
+                        "team",
+                        "https://chatgpt.com/checkout/team-exact-expiry",
+                        generated_at="2026-07-15T04:00:00+00:00",
+                    ),
+                ),
+                _account(716, _typed_link("team", "https://chatgpt.com/checkout/team-history-expiry")),
+                _account(717, _typed_link("team", "https://chatgpt.com/checkout/team-missing-time")),
+            ]
+        )
+        session.add(
+            PaymentLinkGenerationModel(
+                account_id=716,
+                request_id="team-history-expiry",
+                link_type="team",
+                status="succeeded",
+                url="https://chatgpt.com/checkout/team-history-expiry",
+                generated_at="2026-07-15T03:59:59+00:00",
+            )
+        )
+        session.commit()
+
+    with Session(engine) as session:
+        preview = preview_payment_link_cleanup(session, payment_type="team", now=NOW)
+
+    assert preview["team_links"] == 4
+    assert preview["team_valid_links"] == 1
+    assert preview["team_expired_links"] == 2
+    assert preview["team_unknown_links"] == 1
+    assert preview["team_derived_expiry_links"] == 3
+    assert preview["team_validity_seconds"] == 24 * 60 * 60
+    assert preview["derived_expiry_links"] == 3
+
+
+def test_all_payment_types_support_all_five_manual_delete_modes():
+    cleanup_modes = ("valid", "paid", "expired", "cancelled", "unknown")
+    status_by_mode = {
+        "paid": "paid",
+        "expired": "payment_expired",
+        "cancelled": "payment_cancelled",
+    }
+    legacy_terminal_modes = {
+        (payment_type, mode)
+        for payment_type in ("pix", "upi", "ideal")
+        for mode in ("paid", "expired", "cancelled")
+    }
+
+    for type_index, payment_type in enumerate(pix_cleanup.PAYMENT_LINK_TYPE_ORDER, start=1):
+        engine = _engine()
+        account_ids: dict[str, int] = {}
+        with Session(engine) as session:
+            for mode_index, mode in enumerate(cleanup_modes, start=1):
+                account_id = type_index * 100 + mode_index
+                account_ids[mode] = account_id
+                url = f"https://example.test/{payment_type}/{mode}"
+                if mode == "valid" and payment_type in {"ideal", "team"}:
+                    link = _typed_link(payment_type, url, generated_at=NOW.isoformat())
+                elif mode == "valid":
+                    link = _typed_link(
+                        payment_type,
+                        url,
+                        expires_at=int((NOW + timedelta(hours=1)).timestamp()),
+                    )
+                else:
+                    link = _typed_link(
+                        payment_type,
+                        url,
+                        link_status=status_by_mode.get(mode, ""),
+                    )
+                session.add(_account(account_id, link))
+            session.commit()
+
+        for mode in cleanup_modes:
+            with Session(engine) as session:
+                preview = preview_payment_link_cleanup(
+                    session,
+                    payment_type=payment_type,
+                    cleanup_mode=mode,
+                    now=NOW,
+                )
+            assert preview["eligible_links"] == 1, (payment_type, mode, preview)
+
+        for mode in cleanup_modes:
+            with Session(engine) as session:
+                result = pix_cleanup.clean_payment_links(
+                    session,
+                    payment_type=payment_type,
+                    cleanup_mode=mode,
+                    now=NOW,
+                )
+            assert result["cleaned_links"] == 1, (payment_type, mode, result)
+            with Session(engine) as session:
+                account = session.get(AccountModel, account_ids[mode])
+                assert account is not None
+                marker = account.get_extra()["chatgpt_last_payment_link"]
+                assert "url" not in marker
+                assert "long_url" not in marker
+                assert marker["payment_link_cleanup_type"] == payment_type
+                assert marker["payment_link_cleanup_mode"] == mode
+                assert account.cashier_url == ""
+                assert payment_link_requires_regeneration(marker) is True
+                if (payment_type, mode) not in legacy_terminal_modes:
+                    assert marker["link_status"] == PAYMENT_LINK_DELETED_STATUS
 
 
 def test_preview_and_cleanup_are_scoped_atomic_and_idempotent():

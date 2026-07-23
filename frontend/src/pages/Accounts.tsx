@@ -465,15 +465,24 @@ type PixLinkCleanupTaskResponse = {
 }
 
 const PIX_LINK_CLEANUP_META: Record<PixLinkCleanupMode, { label: string; title: string }> = {
+  valid: { label: '有效', title: '有效链接' },
   expired: { label: '过期', title: '过期链接' },
   paid: { label: '已支付', title: '已支付链接' },
   cancelled: { label: '支付已取消', title: '支付已取消链接' },
+  unknown: { label: '状态未知', title: '状态未知链接' },
 }
 
 const PAYMENT_LINK_SCAN_LABELS: Record<PaymentLinkCleanupType, string> = {
-  pix: 'PIX',
-  upi: 'UPI',
+  hosted: 'Hosted Checkout',
+  paypal: 'PayPal',
   ideal: 'iDEAL',
+  upi: 'UPI',
+  pix: 'PIX',
+  twint: 'TWINT',
+  kakao_pay: 'Kakao Pay',
+  gopay: 'GoPay',
+  team: 'ChatGPT Team',
+  other: '其他支付链接',
 }
 
 const PAYMENT_LINK_CLEANED_STATUS_META: Record<string, { color: string; label: string }> = {
@@ -486,6 +495,7 @@ const PAYMENT_LINK_CLEANED_STATUS_META: Record<string, { color: string; label: s
   ideal_expired_cleaned: { color: 'warning', label: 'iDEAL 已过期清理' },
   ideal_paid_cleaned: { color: 'success', label: 'iDEAL 已支付清理' },
   ideal_cancelled_cleaned: { color: 'warning', label: 'iDEAL 支付已取消清理' },
+  payment_link_deleted: { color: 'default', label: '支付链接已删除' },
 }
 
 const ACCOUNT_COLUMN_OPTIONS: Array<{ value: AccountColumnKey; text: string; chatgptOnly?: boolean }> = [
@@ -4144,7 +4154,7 @@ export default function Accounts() {
       }) as PixLinkCleanupTaskResponse
       const taskIdFromResponse = String(result?.task_id || '').trim()
       if (!taskIdFromResponse) {
-        throw new Error('清理任务未返回 task_id')
+        throw new Error('删除任务未返回 task_id')
       }
       const instanceId = String(result?.instance_id || '当前实例')
       const activeMode = result?.cleanup_mode || cleanupMode
@@ -4169,12 +4179,12 @@ export default function Accounts() {
       setPixLinkScanOpen(false)
       void activeTasksQuery.refetch()
       if (result?.already_running) {
-        appMessage.info(`${instanceId} 已有${activeMeta.label}链接清理任务在运行，已打开现有任务日志`)
+        appMessage.info(`${instanceId} 已有${activeMeta.label}链接删除任务在运行，已打开现有任务日志`)
       } else {
-        appMessage.success(`${instanceId} ${paymentLabel} ${cleanupMeta.label}链接清理任务已启动`)
+        appMessage.success(`${instanceId} ${paymentLabel} ${cleanupMeta.label}链接删除任务已启动`)
       }
     } catch (e: any) {
-      appMessage.error(e?.message || `${paymentLabel} ${cleanupMeta.title}清理任务启动失败`)
+      appMessage.error(e?.message || `${paymentLabel} ${cleanupMeta.title}删除任务启动失败`)
       throw e
     } finally {
       setPixLinkCleanupLoading(false)
@@ -4187,8 +4197,6 @@ export default function Accounts() {
     cleanupMode: PixLinkCleanupMode,
     paymentType: PaymentLinkCleanupType = 'pix',
   ) => {
-    // Legacy copy: 只清理账号当前 PIX 链接；UPI uses the same guarded path.
-    // Legacy message template: 当前没有可清理的${cleanupMeta.title}
     const cleanupMeta = PIX_LINK_CLEANUP_META[cleanupMode]
     const paymentLabel = PAYMENT_LINK_SCAN_LABELS[paymentType]
     setPixLinkCleanupLoading(true)
@@ -4211,27 +4219,30 @@ export default function Accounts() {
     const instanceId = String(preview?.instance_id || '当前实例')
     const cutoff = String(preview?.cutoff_display || '最近一个北京时间 11:00')
     if (eligible <= 0) {
-      appMessage.info(`当前没有可清理的${paymentLabel}${cleanupMeta.title}`)
+      appMessage.info(`当前没有可删除的${paymentLabel}${cleanupMeta.title}`)
       return
     }
 
     appModal.confirm({
-      title: `清理 ${eligible} 条${paymentLabel}${cleanupMeta.title}？`,
+      title: `删除 ${eligible} 条${paymentLabel}${cleanupMeta.title}？`,
       content: (
         <Space direction="vertical" size={6} style={{ width: '100%' }}>
           <Text>实例：{instanceId}</Text>
-          {cleanupMode === 'expired' && paymentType === 'pix' ? <Text>当前清理截止点：{cutoff}（北京时间）</Text> : null}
+          {cleanupMode === 'expired' && paymentType === 'pix' ? <Text>当前删除截止点：{cutoff}（北京时间）</Text> : null}
           {cleanupMode === 'expired' && paymentType === 'upi' ? <Text>以 Stripe QR 的 expires_at 为过期依据。</Text> : null}
           {cleanupMode === 'expired' && paymentType === 'ideal' ? <Text>以支付链接提取时间后 15 分钟为过期点。</Text> : null}
+          {cleanupMode === 'expired' && paymentType === 'team' ? <Text>以支付链接提取时间后 24 小时为过期点。</Text> : null}
+          {cleanupMode === 'valid' ? <Text type="warning">有效链接可能仍可使用，仅在确认不再需要时删除。</Text> : null}
           {cleanupMode === 'paid' ? <Text>仅匹配当前链接的明确支付成功证据。</Text> : null}
           {cleanupMode === 'cancelled' ? <Text>仅匹配当前链接的明确支付取消证据，普通失败和超时会保留。</Text> : null}
+          {cleanupMode === 'unknown' ? <Text type="warning">该链接状态无法确认，系统默认保留；本次将按人工选择删除。</Text> : null}
           <Text type="secondary">
-            只清理账号当前 {paymentLabel} 链接及其完全相同的 cashier_url；不会删除账号、支付生成历史、支付 CDK 或提交结果。
+            只删除账号当前 {paymentLabel} 链接 URL 及其完全相同的 cashier_url；不会删除账号、支付生成历史、支付 CDK 或提交结果。
           </Text>
-          {cleanupMode === 'expired' && missing > 0 ? <Text type="warning">另有 {missing} 条缺少有效时间信息，本次不会清理。</Text> : null}
+          {cleanupMode === 'expired' && missing > 0 ? <Text type="warning">另有 {missing} 条缺少有效时间信息，本次不会删除。</Text> : null}
         </Space>
       ),
-      okText: '确认清理',
+      okText: '确认删除',
       cancelText: '取消',
       okButtonProps: { danger: true },
       onOk: () => executePixLinkCleanup(cleanupMode, paymentType),

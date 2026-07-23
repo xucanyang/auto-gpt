@@ -1,4 +1,4 @@
-"""Scan and atomically clean current QR payment links (PIX and UPI)."""
+"""Scan and atomically delete current payment links without touching history."""
 
 from __future__ import annotations
 
@@ -29,6 +29,7 @@ from services.chatgpt_core.payment_link_cache import (
     IDEAL_CANCELLED_CLEANED_STATUS,
     IDEAL_EXPIRED_CLEANED_STATUS,
     IDEAL_PAID_CLEANED_STATUS,
+    PAYMENT_LINK_DELETED_STATUS,
     PIX_CANCELLED_CLEANED_STATUS,
     PIX_EXPIRED_CLEANED_STATUS,
     PIX_PAID_CLEANED_STATUS,
@@ -50,6 +51,7 @@ PIX_DAILY_EXPIRY_TIME = datetime_time(hour=11)
 UPI_QR_VALIDITY_SECONDS = 5 * 60
 UPI_QR_EXPIRY_TOLERANCE_SECONDS = 60
 IDEAL_LINK_VALIDITY_SECONDS = 15 * 60
+TEAM_LINK_VALIDITY_SECONDS = 24 * 60 * 60
 PAYMENT_LINK_TYPE_HOSTED = "hosted"
 PAYMENT_LINK_TYPE_PAYPAL = "paypal"
 PAYMENT_LINK_TYPE_IDEAL = "ideal"
@@ -74,11 +76,7 @@ PAYMENT_LINK_TYPE_ORDER = (
 )
 PAYMENT_LINK_TYPES = frozenset(PAYMENT_LINK_TYPE_ORDER)
 PAYMENT_LINK_DIRECT_SCAN_TYPES = frozenset({PAYMENT_LINK_TYPE_PIX, PAYMENT_LINK_TYPE_UPI})
-PAYMENT_LINK_CLEANUP_TYPES = frozenset({
-    PAYMENT_LINK_TYPE_PIX,
-    PAYMENT_LINK_TYPE_UPI,
-    PAYMENT_LINK_TYPE_IDEAL,
-})
+PAYMENT_LINK_CLEANUP_TYPES = PAYMENT_LINK_TYPES
 _CURRENT_LINK_URL_FIELDS = (
     "url",
     "paypal_url",
@@ -109,16 +107,22 @@ _STRIPE_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 PIX_CLEANUP_MODE_EXPIRED = "expired"
 PIX_CLEANUP_MODE_PAID = "paid"
 PIX_CLEANUP_MODE_CANCELLED = "cancelled"
+PIX_CLEANUP_MODE_VALID = "valid"
+PIX_CLEANUP_MODE_UNKNOWN = "unknown"
 PIX_CLEANUP_MODES = frozenset({
+    PIX_CLEANUP_MODE_VALID,
     PIX_CLEANUP_MODE_EXPIRED,
     PIX_CLEANUP_MODE_PAID,
     PIX_CLEANUP_MODE_CANCELLED,
+    PIX_CLEANUP_MODE_UNKNOWN,
 })
-PixCleanupMode = Literal["expired", "paid", "cancelled"]
+PixCleanupMode = Literal["valid", "expired", "paid", "cancelled", "unknown"]
 PIX_CLEANUP_MODE_LABELS: dict[str, str] = {
+    PIX_CLEANUP_MODE_VALID: "有效",
     PIX_CLEANUP_MODE_EXPIRED: "过期",
     PIX_CLEANUP_MODE_PAID: "已支付",
     PIX_CLEANUP_MODE_CANCELLED: "支付已取消",
+    PIX_CLEANUP_MODE_UNKNOWN: "状态未知",
 }
 _PAID_LINK_STATUSES = frozenset({"paid", "already_paid"})
 _EXPIRED_LINK_STATUSES = frozenset({"expired", "payment_expired"})
@@ -130,15 +134,12 @@ _CANCELLED_LINK_STATUSES = frozenset({
 })
 _PAID_PAYMENT_STATUSES = frozenset({"paid", "success", "completed"})
 _CANCELLED_PAYMENT_STATUSES = frozenset({"cancelled", "canceled", "payment_cancelled", "payment_canceled"})
-_CLEANED_STATUS_BY_MODE = {
-    PIX_CLEANUP_MODE_EXPIRED: PIX_EXPIRED_CLEANED_STATUS,
-    PIX_CLEANUP_MODE_PAID: PIX_PAID_CLEANED_STATUS,
-    PIX_CLEANUP_MODE_CANCELLED: PIX_CANCELLED_CLEANED_STATUS,
-}
 _CLEANED_REASON_BY_MODE = {
+    PIX_CLEANUP_MODE_VALID: "valid payment link was manually deleted",
     PIX_CLEANUP_MODE_EXPIRED: "payment link expired and was cleared",
     PIX_CLEANUP_MODE_PAID: "payment link was paid and cleared",
     PIX_CLEANUP_MODE_CANCELLED: "payment was cancelled and the link was cleared",
+    PIX_CLEANUP_MODE_UNKNOWN: "payment link with unknown status was manually deleted",
 }
 
 _CLEANED_STATUS_BY_TYPE_AND_MODE = {
@@ -311,6 +312,17 @@ def ideal_effective_expires_at(payload: dict[str, Any] | None) -> tuple[datetime
     return generated_at + timedelta(seconds=IDEAL_LINK_VALIDITY_SECONDS), "ideal_generated_15m"
 
 
+def team_effective_expires_at(payload: dict[str, Any] | None) -> tuple[datetime | None, str]:
+    """Apply Team's fixed 24-hour lifetime from the extraction timestamp."""
+
+    if not isinstance(payload, dict):
+        return None, "missing"
+    generated_at = _utc_datetime(payload.get("generated_at") or payload.get("created_at"))
+    if generated_at is None:
+        return None, "missing"
+    return generated_at + timedelta(seconds=TEAM_LINK_VALIDITY_SECONDS), "team_generated_24h"
+
+
 def provider_effective_expires_at(payload: dict[str, Any] | None) -> tuple[datetime | None, str]:
     """Use an explicit provider deadline for non-QR rails without inventing one."""
 
@@ -334,6 +346,8 @@ def payment_link_effective_expires_at(
         return pix_effective_expires_at(payload)
     if normalized_type == PAYMENT_LINK_TYPE_IDEAL:
         return ideal_effective_expires_at(payload)
+    if normalized_type == PAYMENT_LINK_TYPE_TEAM:
+        return team_effective_expires_at(payload)
     return provider_effective_expires_at(payload)
 
 
@@ -842,19 +856,22 @@ def _base_report(
             valid.append(item)
         else:
             # A current URL is not evidence that the payment is still usable.
-            # Unknown rails stay visible and are never cleanup candidates.
+            # Unknown links remain visible and retained until an operator
+            # explicitly selects the unknown bucket for deletion.
             unknown.append(item)
     eligible_by_mode = {
+        PIX_CLEANUP_MODE_VALID: valid,
         PIX_CLEANUP_MODE_EXPIRED: expired,
         PIX_CLEANUP_MODE_PAID: paid,
         PIX_CLEANUP_MODE_CANCELLED: cancelled,
+        PIX_CLEANUP_MODE_UNKNOWN: unknown,
     }
     eligible = eligible_by_mode[mode]
     missing = [item for item in effective_candidates if item.expires_at is None]
     valid_missing = [item for item in valid if item.expires_at is None]
     provider_expiry_sources = {"provider", "pix_qr_code", "upi_qr_code", "checkout_session"}
     provider_count = sum(item.expiry_source in provider_expiry_sources for item in effective_candidates)
-    derived_expiry_sources = {"beijing_11", "ideal_generated_15m"}
+    derived_expiry_sources = {"beijing_11", "ideal_generated_15m", "team_generated_24h"}
     derived_count = sum(item.expiry_source in derived_expiry_sources for item in effective_candidates)
     cutoff_beijing = cutoff_utc.astimezone(PIX_PAYMENT_TIMEZONE)
     type_counts = {
@@ -919,6 +936,13 @@ def _base_report(
             and item.expiry_source == "ideal_generated_15m"
         ),
         "ideal_validity_seconds": IDEAL_LINK_VALIDITY_SECONDS,
+        "team_derived_expiry_links": sum(
+            1
+            for item in effective_candidates
+            if normalize_payment_link_type(item.payment_type) == PAYMENT_LINK_TYPE_TEAM
+            and item.expiry_source == "team_generated_24h"
+        ),
+        "team_validity_seconds": TEAM_LINK_VALIDITY_SECONDS,
     }
     for payment_type_name in PAYMENT_LINK_TYPE_ORDER:
         report[f"{payment_type_name}_links"] = type_counts.get(payment_type_name, 0)
@@ -1125,7 +1149,10 @@ def _cleaned_link_payload(
 ) -> dict[str, Any]:
     mode = normalize_pix_cleanup_mode(cleanup_mode)
     payment_type = normalize_payment_link_type(candidate.payment_type) or PAYMENT_LINK_TYPE_PIX
-    cleaned_status = _CLEANED_STATUS_BY_TYPE_AND_MODE[(payment_type, mode)]
+    cleaned_status = _CLEANED_STATUS_BY_TYPE_AND_MODE.get(
+        (payment_type, mode),
+        PAYMENT_LINK_DELETED_STATUS,
+    )
     type_label = payment_type.upper()
     payload = {
         key: value

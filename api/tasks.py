@@ -69,6 +69,7 @@ from services.chatgpt_core.payment_link_cache import (
     validate_plus_payment_request_params,
 )
 from services.chatgpt_core.pix_payment_link_cleanup import (
+    PAYMENT_LINK_CLEANUP_TYPES,
     PIX_CLEANUP_MODE_EXPIRED,
     PIX_CLEANUP_MODE_LABELS,
     PAYMENT_LINK_TYPE_IDEAL,
@@ -428,14 +429,29 @@ class PaymentLinkProfilePreviewRequest(BaseModel):
     params: dict[str, Any] = Field(default_factory=dict)
 
 
+PaymentLinkCleanupModeParam = Literal["valid", "paid", "expired", "cancelled", "unknown"]
+PaymentLinkCleanupTypeParam = Literal[
+    "hosted",
+    "paypal",
+    "ideal",
+    "upi",
+    "pix",
+    "twint",
+    "kakao_pay",
+    "gopay",
+    "team",
+    "other",
+]
+
+
 class PixPaymentLinkCleanupRequest(BaseModel):
-    cleanup_mode: Literal["expired", "paid", "cancelled"] = PIX_CLEANUP_MODE_EXPIRED
-    payment_type: Literal["pix", "upi", "ideal"] = PAYMENT_LINK_TYPE_PIX
+    cleanup_mode: PaymentLinkCleanupModeParam = PIX_CLEANUP_MODE_EXPIRED
+    payment_type: PaymentLinkCleanupTypeParam = PAYMENT_LINK_TYPE_PIX
 
 
 def _normalize_payment_link_cleanup_type(value: Any) -> str:
     normalized = str(value or PAYMENT_LINK_TYPE_PIX).strip().lower().replace("-", "_")
-    if normalized not in {PAYMENT_LINK_TYPE_PIX, PAYMENT_LINK_TYPE_UPI, PAYMENT_LINK_TYPE_IDEAL}:
+    if normalized not in PAYMENT_LINK_CLEANUP_TYPES:
         raise ValueError(f"Unsupported payment link type: {normalized}")
     return normalized
 
@@ -17346,7 +17362,7 @@ def preview_chatgpt_payment_link_profile(payload: PaymentLinkProfilePreviewReque
 
 @router.get("/chatgpt/payment-links/pix-cleanup/preview")
 def preview_chatgpt_expired_pix_payment_links(
-    cleanup_mode: Literal["expired", "paid", "cancelled"] = PIX_CLEANUP_MODE_EXPIRED,
+    cleanup_mode: PaymentLinkCleanupModeParam = PIX_CLEANUP_MODE_EXPIRED,
 ):
     """Return a server-calculated, current-instance PIX cleanup preview."""
 
@@ -17356,8 +17372,8 @@ def preview_chatgpt_expired_pix_payment_links(
 
 @router.get("/chatgpt/payment-links/cleanup/preview")
 def preview_chatgpt_payment_links(
-    payment_type: Literal["pix", "upi", "ideal"] = PAYMENT_LINK_TYPE_PIX,
-    cleanup_mode: Literal["expired", "paid", "cancelled"] = PIX_CLEANUP_MODE_EXPIRED,
+    payment_type: PaymentLinkCleanupTypeParam = PAYMENT_LINK_TYPE_PIX,
+    cleanup_mode: PaymentLinkCleanupModeParam = PIX_CLEANUP_MODE_EXPIRED,
 ):
     """Scan one cleanup-capable payment rail using the shared type classifier."""
 
@@ -17410,18 +17426,26 @@ def _run_expired_pix_payment_link_cleanup(
         PAYMENT_LINK_TYPE_PIX: preview_pix_payment_link_cleanup,
         PAYMENT_LINK_TYPE_UPI: preview_upi_payment_link_cleanup,
         PAYMENT_LINK_TYPE_IDEAL: preview_ideal_payment_link_cleanup,
-    }[normalized_type]
+    }.get(normalized_type)
     clean_fn = {
         PAYMENT_LINK_TYPE_PIX: clean_pix_payment_links,
         PAYMENT_LINK_TYPE_UPI: clean_upi_payment_links,
         PAYMENT_LINK_TYPE_IDEAL: clean_ideal_payment_links,
-    }[normalized_type]
+    }.get(normalized_type)
     _task_store.mark_running(task_id)
     _task_store.set_progress(task_id, "0/1")
     try:
         _log(task_id, f"[{type_label}清理] 开始重新扫描当前实例的{cleanup_label} {type_label} 支付链接")
         with Session(engine) as session:
-            preview = preview_fn(session, cleanup_mode=mode)
+            preview = (
+                preview_fn(session, cleanup_mode=mode)
+                if preview_fn is not None
+                else preview_payment_link_cleanup(
+                    session,
+                    payment_type=normalized_type,
+                    cleanup_mode=mode,
+                )
+            )
         preview = dict(preview or {})
         _task_store.update_meta(
             task_id,
@@ -17431,12 +17455,12 @@ def _run_expired_pix_payment_link_cleanup(
             },
         )
 
-        total_key = {
+        legacy_total_key = {
             PAYMENT_LINK_TYPE_PIX: "current_pix_links",
             PAYMENT_LINK_TYPE_UPI: "current_upi_links",
-            PAYMENT_LINK_TYPE_IDEAL: "ideal_links",
-        }[normalized_type]
-        preview_total = max(int(preview.get(total_key) or 0), 0)
+        }.get(normalized_type, "")
+        total_key = f"{normalized_type}_links"
+        preview_total = max(int(preview.get(total_key) or preview.get(legacy_total_key) or 0), 0)
         preview_active = max(int(preview.get("active_links") or 0), 0)
         preview_eligible = max(int(preview.get("eligible_links") or 0), 0)
         preview_missing = max(int(preview.get("missing_expiry_links") or 0), 0)
@@ -17472,10 +17496,18 @@ def _run_expired_pix_payment_link_cleanup(
             _log(task_id, f"[{type_label}清理] 当前扫描未发现{cleanup_label}链接，正在进行执行前复核")
 
         with Session(engine) as session:
-            result = clean_fn(session, cleanup_mode=mode)
+            result = (
+                clean_fn(session, cleanup_mode=mode)
+                if clean_fn is not None
+                else clean_payment_links(
+                    session,
+                    payment_type=normalized_type,
+                    cleanup_mode=mode,
+                )
+            )
         result = dict(result or {})
 
-        total = max(int(result.get(total_key) or 0), 0)
+        total = max(int(result.get(total_key) or result.get(legacy_total_key) or 0), 0)
         active = max(int(result.get("active_links") or 0), 0)
         eligible = max(int(result.get("eligible_links") or 0), 0)
         missing = max(int(result.get("missing_expiry_links") or 0), 0)

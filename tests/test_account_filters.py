@@ -937,6 +937,40 @@ class AccountFilterSortTests(unittest.TestCase):
         self.assertEqual(state.payment_link_platform, "none")
         self.assertTrue(state.payment_link_generated)
 
+    def test_generic_payment_link_deleted_tombstone_is_terminal_in_python_and_sql(self):
+        init_db()
+        account = self._account(548)
+        account.set_extra(
+            {
+                "chatgpt_last_payment_link": {
+                    "url": "https://pay.openai.com/deleted-548",
+                    "link_type": "hosted",
+                    "link_status": "payment_link_deleted",
+                    "payment_link_cleanup_type": "hosted",
+                    "payment_link_cleanup_mode": "unknown",
+                }
+            }
+        )
+
+        self.assertEqual(account_payment_link_platform(account), "none")
+        summary = account_payment_link_summary(account)
+        self.assertNotIn("url", summary)
+        self.assertEqual(summary["link_status"], "payment_link_deleted")
+        self.assertEqual(summary["payment_link_cleanup_type"], "hosted")
+        self.assertEqual(summary["payment_link_cleanup_mode"], "unknown")
+
+        with Session(engine) as session:
+            session.exec(text("DELETE FROM account_list_state WHERE account_id = 548"))
+            session.exec(text("DELETE FROM accounts WHERE id = 548"))
+            session.add(account)
+            session.commit()
+            refresh_account_list_state(session)
+            state = session.get(AccountListStateModel, 548)
+
+        self.assertIsNotNone(state)
+        self.assertEqual(state.payment_link_platform, "none")
+        self.assertTrue(state.payment_link_generated)
+
     def test_invalid_legacy_paypal_url_is_not_promoted_by_sql_platform_filter(self):
         init_db()
         account = self._account(539)

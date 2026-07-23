@@ -52,6 +52,7 @@ function paymentLinkStatusMeta(value: unknown) {
   if (status === 'ideal_expired_cleaned') return { color: 'default', label: 'iDEAL 已过期清理' }
   if (status === 'ideal_paid_cleaned') return { color: 'default', label: 'iDEAL 已支付清理' }
   if (status === 'ideal_cancelled_cleaned') return { color: 'default', label: 'iDEAL 支付已取消清理' }
+  if (status === 'payment_link_deleted') return { color: 'default', label: '支付链接已删除' }
   if (status === 'queued') return { color: 'default', label: '已提交' }
   if (status === 'running') return { color: 'processing', label: '生成中' }
   if (status === 'interrupted') return { color: 'warning', label: '远端中断' }
