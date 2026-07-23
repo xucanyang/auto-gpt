@@ -6,10 +6,19 @@
 
 ## [Unreleased] (未发布)
 
+## [2.8.9] - 2026-07-24
+
+### 修复 (Fixed)
+- **Sentinel SDK 改由顶层 Auth 页面调用**：v2.8.8 真实单账号验证进一步确认 `SentinelSDK.token()` 与 `init()` 一样禁止在 iframe 内执行。`services/chatgpt_core/sentinel_browser.py` 删除 Auth finalize 中手工查找/注入 Sentinel iframe 的错误分支，改为在同一 `auth.openai.com/about-you` 顶层 Page 中加载并调用 SDK；SDK 自身创建隐藏 frame，通过 `postMessage` 驱动 `sentinel.openai.com/backend-api/sentinel/req`，与成功 HAR 的调用栈和 Referer 一致。
+- **阻止再次从 frame 调用 SDK**：共享 Sentinel token helper 在执行前显式校验 `window.top === window`，并始终按顶层合同执行 `init(flow) + token(flow)`。开户请求仍由同一个 Auth Page 的 `fetch('/api/accounts/create_account')` 发出，继续保留 v2.8.7 已建立的 Cloudflare、Sentinel 与注册 Cookie 连续性。
+
+### 测试 (Tests)
+- 更新 Sentinel 浏览器合同测试，锁定顶层上下文校验、SDK 初始化以及 Auth finalize 将真实顶层 Page 传给 token helper；前端侧栏版本同步更新为 `v2.8.9`。
+
 ## [2.8.8] - 2026-07-24
 
 ### 修复 (Fixed)
-- **嵌入式 Sentinel 不再错误调用 `init()`**：v2.8.7 首次单账号线上 smoke 证明 Auth 页面与 Cloudflare Cookie 已进入同一 Playwright context，但注入的 Sentinel iframe 明确返回 `init() should not be called from within an iframe`。`services/chatgpt_core/sentinel_browser.py` 现在只在顶层 Sentinel 页面调用 `SentinelSDK.init(flow)`；Auth 页面内的官方/注入 iframe 直接执行 `SentinelSDK.token(oauth_create_account)`，符合 SDK 的 frame 调用合同。
+- **嵌入式 Sentinel 不再错误调用 `init()`**：v2.8.7 首次单账号线上 smoke 证明 Auth 页面与 Cloudflare Cookie 已进入同一 Playwright context，但注入的 Sentinel iframe 明确返回 `init() should not be called from within an iframe`。该版本先取消 iframe 内的 `init()` 并保留 `token()`；后续 v2.8.9 真实验证确认 SDK 的两个公开方法都必须从顶层调用，并完成最终修正。
 - **基础设施错误取消账号内三轮重试**：`services/chatgpt_core/access_token_only_registration_engine.py` 将 `sentinel_browser_unavailable` 和 `auth_browser_finalize_unavailable` 设为账号内不可重试错误。浏览器启动、frame 或 finalize 链路故障时不再对同一个 HME 地址重复走三轮首页、验证码和开户，随后由任务层 fatal gate 停止调度新邮箱。
 
 ### 测试 (Tests)
@@ -2307,4 +2316,8 @@
 
 ## 2026-07-24 05:56:24 +0800
 - 发布 v2.8.8：修复 iframe Sentinel 初始化并阻止基础设施错误重复注册
+- 发布模式: multi
+
+## 2026-07-24 06:06:33 +0800
+- 发布 v2.8.9：Sentinel SDK 改由顶层 Auth 页面调用
 - 发布模式: multi

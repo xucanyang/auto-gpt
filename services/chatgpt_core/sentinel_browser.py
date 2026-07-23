@@ -215,9 +215,8 @@ def _evaluate_complete_sentinel_token(
     token_eval_timeout_ms: int,
     require_complete_signals: bool,
     logger: Callable[[str], None],
-    initialize_sdk: bool = True,
 ) -> Optional[str]:
-    """Evaluate Sentinel in a Page or Frame and validate the returned signals."""
+    """Evaluate Sentinel from a top-level Page and validate the returned signals."""
     logger("Sentinel Browser 阶段: wait SentinelSDK ready")
     try:
         target.wait_for_function(
@@ -253,9 +252,12 @@ def _evaluate_complete_sentinel_token(
     logger(f"Sentinel Browser 阶段: evaluate SentinelSDK.token({flow})")
     result = target.evaluate(
         """
-        async ({ flow, timeoutMs, initializeSdk }) => {
+        async ({ flow, timeoutMs }) => {
             try {
-                if (initializeSdk && typeof window.SentinelSDK.init === 'function') {
+                if (window.top !== window) {
+                    throw new Error('SentinelSDK must be called from a top-level page');
+                }
+                if (typeof window.SentinelSDK.init === 'function') {
                     await window.SentinelSDK.init(flow);
                 }
                 const token = await Promise.race([
@@ -276,7 +278,6 @@ def _evaluate_complete_sentinel_token(
         {
             "flow": flow,
             "timeoutMs": token_eval_timeout_ms,
-            "initializeSdk": initialize_sdk,
         },
     )
     logger("Sentinel Browser 阶段完成: evaluate SentinelSDK.token")
@@ -879,67 +880,14 @@ def _create_account_via_browser_sync(
                 f"cf_clearance={'✓' if cf_clearance_present else '✗'}"
             )
 
-            stage = "find_sentinel_frame"
-
-            def _find_frame() -> Any:
-                for candidate in page.frames:
-                    if "sentinel.openai.com/backend-api/sentinel/frame.html" in str(
-                        candidate.url or ""
-                    ):
-                        return candidate
-                return None
-
-            sentinel_frame = None
-            for _ in range(10):
-                check_stop()
-                sentinel_frame = _find_frame()
-                if sentinel_frame is not None:
-                    break
-                page.wait_for_timeout(500)
-            if sentinel_frame is None:
-                logger("Auth Browser 未发现现成 Sentinel iframe，按官方 frame URL 注入")
-                page.evaluate(
-                    """
-                    (frameUrl) => {
-                        let frame = document.querySelector('iframe[data-codex-sentinel-frame="1"]');
-                        if (!frame) {
-                            frame = document.createElement('iframe');
-                            frame.dataset.codexSentinelFrame = '1';
-                            frame.style.position = 'fixed';
-                            frame.style.width = '1px';
-                            frame.style.height = '1px';
-                            frame.style.opacity = '0';
-                            frame.style.pointerEvents = 'none';
-                            document.body.appendChild(frame);
-                        }
-                        frame.src = frameUrl;
-                    }
-                    """,
-                    DEFAULT_SENTINEL_FRAME_URL,
-                )
-                for _ in range(20):
-                    check_stop()
-                    sentinel_frame = _find_frame()
-                    if sentinel_frame is not None:
-                        break
-                    page.wait_for_timeout(500)
-            if sentinel_frame is None:
-                return BrowserAccountCreateResult(
-                    response_url=final_url,
-                    cookies=list(context.cookies()),
-                    cf_clearance_present=cf_clearance_present,
-                    error="sentinel_frame_unavailable",
-                )
-
             stage = "sentinel_token"
             token = _evaluate_complete_sentinel_token(
-                sentinel_frame,
+                page,
                 flow="oauth_create_account",
                 sdk_wait_timeout_ms=sdk_wait_timeout_ms,
                 token_eval_timeout_ms=token_eval_timeout_ms,
                 require_complete_signals=True,
                 logger=logger,
-                initialize_sdk=False,
             )
             if not token:
                 return BrowserAccountCreateResult(

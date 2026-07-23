@@ -56,15 +56,17 @@ class SentinelBrowserRuntimeTests(unittest.TestCase):
         )
         self.assertIsNone(_sentinel_token_field_state("not-json"))
 
-    def test_embedded_sentinel_token_skips_sdk_init(self):
-        class FakeFrame:
+    def test_sentinel_token_requires_top_level_page_and_initializes_sdk(self):
+        class FakePage:
             def __init__(self):
                 self.payload = None
+                self.script = ""
 
             def wait_for_function(self, *_args, **_kwargs):
                 return None
 
-            def evaluate(self, _script, payload):
+            def evaluate(self, script, payload):
+                self.script = script
                 self.payload = payload
                 return {
                     "success": True,
@@ -73,19 +75,20 @@ class SentinelBrowserRuntimeTests(unittest.TestCase):
                     ),
                 }
 
-        frame = FakeFrame()
+        page = FakePage()
         token = _evaluate_complete_sentinel_token(
-            frame,
+            page,
             flow="oauth_create_account",
             sdk_wait_timeout_ms=1000,
             token_eval_timeout_ms=1000,
             require_complete_signals=True,
             logger=lambda _message: None,
-            initialize_sdk=False,
         )
 
         self.assertTrue(token)
-        self.assertFalse(frame.payload["initializeSdk"])
+        self.assertIn("window.top !== window", page.script)
+        self.assertIn("window.SentinelSDK.init(flow)", page.script)
+        self.assertNotIn("initializeSdk", page.payload)
 
     def test_registration_sentinel_does_not_fall_back_to_http_pow(self):
         client = ChatGPTClient(verbose=False)
@@ -247,12 +250,6 @@ class SentinelBrowserRuntimeTests(unittest.TestCase):
         self.assertEqual(domains, [".openai.com"])
 
     def test_browser_finalize_uses_one_context_for_auth_sentinel_and_create(self):
-        sentinel_frame = type(
-            "FakeFrame",
-            (),
-            {"url": "https://sentinel.openai.com/backend-api/sentinel/frame.html"},
-        )()
-
         class FakeContext:
             def __init__(self):
                 self.imported = []
@@ -288,7 +285,6 @@ class SentinelBrowserRuntimeTests(unittest.TestCase):
             def __init__(self, context):
                 self.context = context
                 self.url = "https://auth.openai.com/about-you"
-                self.frames = [sentinel_frame]
                 self.evaluate_calls = []
 
             def set_default_timeout(self, _timeout):
@@ -358,7 +354,7 @@ class SentinelBrowserRuntimeTests(unittest.TestCase):
             mock.patch(
                 "services.chatgpt_core.sentinel_browser._evaluate_complete_sentinel_token",
                 return_value=token,
-            ),
+            ) as sentinel_token,
         ):
             result = create_account_via_browser(
                 name="Alice Smith",
@@ -387,6 +383,7 @@ class SentinelBrowserRuntimeTests(unittest.TestCase):
         self.assertTrue(result.cf_clearance_present)
         self.assertTrue(result.oai_sc_present)
         self.assertEqual(result.sentinel_field_lengths, {"p": 3, "t": 9, "c": 9})
+        self.assertIs(sentinel_token.call_args.args[0], context.page)
         imported_domains = {
             item.get("domain")
             for item in context.imported
