@@ -264,6 +264,7 @@ def _apply_action_result(
                             "promo_code_digest",
                             "cancel_url",
                             "checkout_proxy_region",
+                            "checkout_ui_mode",
                             "link_type",
                             "link_expires_at",
                             "link_expiry_source",

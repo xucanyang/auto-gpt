@@ -77,6 +77,8 @@ PAYMENT_LINK_PLAN_PLUS = "plus"
 PAYMENT_LINK_PLAN_TEAM = "team"
 PAYMENT_LINK_GENERATION_PLUS = "plus_checkout"
 PAYMENT_LINK_GENERATION_TEAM = "team_checkout"
+TEAM_DEFAULT_CHECKOUT_UI_MODE = "hosted"
+TEAM_CHECKOUT_UI_MODES = frozenset({"hosted", "custom"})
 PAYMENT_LINK_PLUS_PLAN_ALIASES = frozenset({
     "plus",
     "plus_checkout",
@@ -113,6 +115,9 @@ RETIRED_PAYMENT_REQUEST_KEYS = frozenset({
     "teamPlanData",
     "checkout_proxy_region",
     "checkoutProxyRegion",
+    "checkout_ui_mode",
+    "checkoutUiMode",
+    "checkoutMode",
 })
 
 
@@ -185,6 +190,39 @@ def normalize_team_checkout_proxy_region(params: dict[str, Any] | None) -> str:
     ).strip().upper()
 
 
+def normalize_team_checkout_ui_mode(params: dict[str, Any] | None) -> str:
+    source = params if isinstance(params, dict) else {}
+    raw_mode = source.get("checkout_ui_mode")
+    if raw_mode in (None, ""):
+        raw_mode = source.get("checkoutUiMode")
+    if raw_mode in (None, ""):
+        raw_mode = source.get("checkoutMode")
+    mode = str(raw_mode or "").strip().lower()
+    if mode:
+        return mode
+
+    # Team links created before the mode became task-scoped did not persist the
+    # field. The ChatGPT checkout route identifies those custom-mode links so
+    # they cannot be reused as the new hosted default.
+    raw_url = str(
+        source.get("url")
+        or source.get("long_url")
+        or source.get("checkout_url")
+        or ""
+    ).strip()
+    try:
+        parsed = urlsplit(raw_url)
+    except ValueError:
+        parsed = None
+    if (
+        parsed is not None
+        and str(parsed.hostname or "").lower() in {"chatgpt.com", "www.chatgpt.com"}
+        and parsed.path.startswith("/checkout/openai_llc/")
+    ):
+        return "custom"
+    return TEAM_DEFAULT_CHECKOUT_UI_MODE
+
+
 def _team_param_presence(params: dict[str, Any] | None) -> set[str]:
     """Return Team fields explicitly supplied by the caller.
 
@@ -217,6 +255,8 @@ def _team_param_presence(params: dict[str, Any] | None) -> set[str]:
         present.add("plan_name")
     if any(key in source and source.get(key) not in (None, "") for key in ("checkout_proxy_region", "checkoutProxyRegion")):
         present.add("checkout_proxy_region")
+    if any(key in source and source.get(key) not in (None, "") for key in ("checkout_ui_mode", "checkoutUiMode", "checkoutMode")):
+        present.add("checkout_ui_mode")
     return present
 
 
@@ -230,8 +270,11 @@ def validate_team_payment_request_params(params: dict[str, Any] | None) -> None:
     checkout_proxy_region = normalize_team_checkout_proxy_region(params)
     if not re.fullmatch(r"[A-Z]{2}", checkout_proxy_region):
         raise ValueError("Team 动态 IP 国家必须显式选择两位国家代码")
-    # Business fields may inherit the long-link admin profile. The checkout
-    # proxy country above is deliberately mandatory and request-scoped.
+    checkout_ui_mode = normalize_team_checkout_ui_mode(params)
+    if checkout_ui_mode not in TEAM_CHECKOUT_UI_MODES:
+        raise ValueError("Team checkout_ui_mode 必须是 hosted 或 custom")
+    # Business fields may inherit the long-link admin profile. Proxy country is
+    # mandatory and checkout mode always has a task-scoped hosted default.
     if "workspace_name" in explicit and len(values["workspace_name"]) > 256:
         raise ValueError("Team Workspace 名称不能超过 256 个字符")
     if "price_interval" in explicit and values["price_interval"] not in {"month", "year"}:
@@ -281,6 +324,7 @@ def payment_link_variant_key(params: dict[str, Any] | None) -> str:
     }
     if plan == PAYMENT_LINK_PLAN_TEAM:
         team = _team_param_source(source)
+        canonical["checkout_ui_mode"] = normalize_team_checkout_ui_mode(source)
         try:
             seats = int(team["seat_quantity"] or 0)
         except (TypeError, ValueError):
@@ -580,6 +624,7 @@ def normalize_payment_link_params(params: dict[str, Any] | None) -> dict[str, An
         "payment_source": payment_source,
         "profile_hash": str(source.get("profile_hash") or source.get("payment_profile_hash") or "").strip(),
         "checkout_proxy_region": normalize_team_checkout_proxy_region(source) if plan == PAYMENT_LINK_PLAN_TEAM else "",
+        "checkout_ui_mode": normalize_team_checkout_ui_mode(source) if plan == PAYMENT_LINK_PLAN_TEAM else "",
     }
     if plan == PAYMENT_LINK_PLAN_TEAM:
         team = _team_param_source(source)
@@ -640,6 +685,10 @@ def payment_link_cache_matches(
         and cached_format == expected["payment_link_format"]
         and cached_source == expected["payment_source"]
         and normalize_team_checkout_proxy_region(cached) == expected["checkout_proxy_region"]
+        and (
+            expected["plan"] != PAYMENT_LINK_PLAN_TEAM
+            or normalize_team_checkout_ui_mode(cached) == expected["checkout_ui_mode"]
+        )
     )
     if not matches:
         return False
@@ -847,6 +896,7 @@ def build_payment_link_cache_payload(
                 "cancel_url": team["cancel_url"],
                 "plan_name": team["plan_name"] or "chatgptteamplan",
                 "checkout_proxy_region": normalize_team_checkout_proxy_region(team_source),
+                "checkout_ui_mode": normalize_team_checkout_ui_mode(team_source),
             }
         )
     payload["variant_key"] = str(
@@ -976,6 +1026,7 @@ def build_payment_link_cache_payload(
         "seat_quantity",
         "cancel_url",
         "checkout_proxy_region",
+        "checkout_ui_mode",
     ):
         value = payload_source.get(key)
         if value is None or value == "":

@@ -780,6 +780,7 @@ class ChatGPTPlatform(BasePlatform):
                 normalize_payment_link_params,
                 normalize_payment_link_plan,
                 normalize_payment_link_url,
+                normalize_team_checkout_ui_mode,
                 payment_link_cache_matches,
                 payment_link_cache_for_params,
                 payment_link_variant_key,
@@ -792,9 +793,12 @@ class ChatGPTPlatform(BasePlatform):
                 return {"ok": False, "error": str(exc)}
             plan = normalize_payment_link_plan(params.get("plan"))
             is_team = plan == PAYMENT_LINK_PLAN_TEAM
+            profile_overrides = {**params, "plan": plan}
+            if is_team:
+                profile_overrides["checkout_ui_mode"] = normalize_team_checkout_ui_mode(params)
             client = LongLinkPaymentClient.from_env()
             payment_profile = (
-                client.get_profile(overrides={**params, "plan": plan})
+                client.get_profile(overrides=profile_overrides)
                 if is_team
                 else client.get_profile()
             )
@@ -839,6 +843,12 @@ class ChatGPTPlatform(BasePlatform):
                             or params.get("checkout_proxy_region")
                             or ""
                         ).strip().upper(),
+                        "checkout_ui_mode": str(
+                            payment_profile.get("checkout_ui_mode")
+                            or profile_detail.get("checkout_ui_mode")
+                            or profile_overrides.get("checkout_ui_mode")
+                            or "hosted"
+                        ).strip().lower(),
                     }
                 )
             normalized_cache_params = normalize_payment_link_params(cache_request)
@@ -881,7 +891,7 @@ class ChatGPTPlatform(BasePlatform):
                 client.submit_batch(
                     items=[{"access_token": access_token, "request_id": request_id}],
                     expected_profile_hash=payment_profile_hash,
-                    profile_overrides={**params, "plan": plan},
+                    profile_overrides=profile_overrides,
                 )
                 if is_team
                 else client.submit_batch(

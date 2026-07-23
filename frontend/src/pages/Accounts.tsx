@@ -122,6 +122,7 @@ const SUBSCRIPTION_EXPIRY_SORT_FIELD = 'subscription_active_until'
 const ACCOUNT_CREATED_AT_SORT_FIELD = 'created_at'
 const DEFAULT_REGISTRATION_SORT_ORDER = 'desc' as const
 const DEFAULT_TEAM_WORKSPACE_NAME = 'MyTeam'
+const DEFAULT_TEAM_CHECKOUT_UI_MODE = 'hosted' as const
 const TEAM_PROXY_COUNTRY_CODES = [
   'US', 'GB', 'CA', 'AU', 'JP', 'SG', 'HK', 'TW', 'KR', 'ID', 'MY', 'TH',
   'TR', 'VN', 'PH', 'IN', 'DE', 'FR', 'IT', 'ES', 'NL', 'IE', 'PT', 'BE',
@@ -3962,9 +3963,11 @@ export default function Accounts() {
       const promoCode = String(values?.promo_code || '').trim()
       const cancelUrl = String(values?.cancel_url || '').trim()
       const checkoutProxyRegion = String(values?.checkout_proxy_region || '').trim().toUpperCase()
+      const checkoutUiMode = String(values?.checkout_ui_mode || DEFAULT_TEAM_CHECKOUT_UI_MODE).trim().toLowerCase()
       if (promoCode) params.promo_code = promoCode
       if (cancelUrl) params.cancel_url = cancelUrl
       if (checkoutProxyRegion) params.checkout_proxy_region = checkoutProxyRegion
+      params.checkout_ui_mode = checkoutUiMode === 'custom' ? 'custom' : DEFAULT_TEAM_CHECKOUT_UI_MODE
     }
     return params
   }
@@ -4006,6 +4009,7 @@ export default function Accounts() {
       plan: 'plus',
       workspace_name: DEFAULT_TEAM_WORKSPACE_NAME,
       checkout_proxy_region: undefined,
+      checkout_ui_mode: DEFAULT_TEAM_CHECKOUT_UI_MODE,
       price_interval: '',
       seat_quantity: undefined,
       promo_code: '',
@@ -8453,6 +8457,7 @@ export default function Accounts() {
               plan: 'plus',
               workspace_name: DEFAULT_TEAM_WORKSPACE_NAME,
               checkout_proxy_region: undefined,
+              checkout_ui_mode: DEFAULT_TEAM_CHECKOUT_UI_MODE,
               price_interval: '',
               seat_quantity: undefined,
             }}
@@ -8498,6 +8503,35 @@ export default function Accounts() {
                     <Input
                       maxLength={256}
                       placeholder={DEFAULT_TEAM_WORKSPACE_NAME}
+                    />
+                  </Form.Item>
+                  <Form.Item
+                    name="checkout_ui_mode"
+                    label="支付页模式"
+                    rules={[{ required: true, message: '请选择支付页模式' }]}
+                  >
+                    <Segmented
+                      block
+                      options={[
+                        { label: 'Hosted（默认）', value: 'hosted' },
+                        { label: 'Custom', value: 'custom' },
+                      ]}
+                      onChange={(value) => {
+                        const checkoutUiMode = String(value) === 'custom' ? 'custom' : DEFAULT_TEAM_CHECKOUT_UI_MODE
+                        batchPaymentLinkForm.setFieldValue('checkout_ui_mode', checkoutUiMode)
+                        setBatchPaymentLinkProfile(null)
+                        setBatchPaymentLinkProfileError('')
+                        const checkoutProxyRegion = String(
+                          batchPaymentLinkForm.getFieldValue('checkout_proxy_region') || '',
+                        ).trim().toUpperCase()
+                        if (!/^[A-Z]{2}$/.test(checkoutProxyRegion)) return
+                        void loadBatchPaymentLinkProfile({
+                          ...buildBatchPaymentLinkParams(batchPaymentLinkForceRefresh),
+                          plan: 'team',
+                          checkout_proxy_region: checkoutProxyRegion,
+                          checkout_ui_mode: checkoutUiMode,
+                        })
+                      }}
                     />
                   </Form.Item>
                   <Form.Item
@@ -8668,7 +8702,7 @@ export default function Accounts() {
                 </div>
                 <div>
                   <Text type="secondary" style={{ display: 'block', fontSize: 12 }}>Checkout 模式</Text>
-                  <Text>{batchPaymentLinkProfile.checkout_ui_mode || '-'}</Text>
+                  <Text>{String(batchPaymentLinkProfile.checkout_ui_mode || '-').toUpperCase()}</Text>
                 </div>
                 <div>
                   <Text type="secondary" style={{ display: 'block', fontSize: 12 }}>代理链</Text>

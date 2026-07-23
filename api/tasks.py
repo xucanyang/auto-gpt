@@ -63,6 +63,7 @@ from services.chatgpt_core.payment_link_cache import (
     normalize_payment_link_url,
     normalize_payment_link_params,
     normalize_team_checkout_proxy_region,
+    normalize_team_checkout_ui_mode,
     validate_payment_link_request_params,
     validate_plus_payment_request_params,
 )
@@ -1884,9 +1885,9 @@ def _filtered_payment_link_request_params(params: dict[str, Any] | None) -> dict
     """Keep the public task contract while removing local checkout controls.
 
     Billing country, currency, provider, base proxy and runtime strategy belong
-    to openai-pay-long-link's active admin profile. Team checkout is the one
-    exception: its task must explicitly freeze a checkout proxy country so a
-    coupon can never inherit the upstream profile's unrelated region.
+    to openai-pay-long-link's active admin profile. Team checkout explicitly
+    freezes its proxy country and checkout UI mode so neither can inherit an
+    unrelated payment rail from the upstream admin profile.
     """
 
     source = params if isinstance(params, dict) else {}
@@ -1940,6 +1941,7 @@ def _filtered_payment_link_request_params(params: dict[str, Any] | None) -> dict
         if team_data:
             normalized["team_plan_data"] = team_data
         normalized["checkout_proxy_region"] = normalize_team_checkout_proxy_region(source)
+        normalized["checkout_ui_mode"] = normalize_team_checkout_ui_mode(source)
 
         for canonical, aliases in {
             "promo_code": ("promo_code", "promoCode"),
@@ -2010,6 +2012,11 @@ def _payment_link_params_from_profile(
             or merged.get("checkout_proxy_region")
             or ""
         ).strip().upper()
+        merged["checkout_ui_mode"] = normalize_team_checkout_ui_mode({
+            "checkout_ui_mode": profile.get("checkout_ui_mode")
+            or profile_detail.get("checkout_ui_mode")
+            or merged.get("checkout_ui_mode"),
+        })
     else:
         merged["plan"] = "plus"
     merged["country"] = str(profile.get("country") or profile_detail.get("country") or profile_detail.get("billing_country") or "").strip().upper()
@@ -2232,6 +2239,7 @@ def _payment_link_generation_matches_variant(
             "cancel_url",
             "plan_name",
             "checkout_proxy_region",
+            "checkout_ui_mode",
         ))
     expected_profile = str(expected.get("profile_hash") or "").strip()
     actual_profile = str(actual_normalized.get("profile_hash") or "").strip()
@@ -2467,6 +2475,7 @@ _PAYMENT_LINK_HISTORY_RESULT_FIELDS = (
     "promo_code_digest",
     "cancel_url",
     "checkout_proxy_region",
+    "checkout_ui_mode",
     "plan_name",
     "country",
     "currency",
@@ -11400,6 +11409,7 @@ def _run_batch_payment_links(task_id: str, account_ids: list[int]):
                     "team_plan_data": dict(team_data),
                     "promo_code_digest": str(request_params.get("promo_code_digest") or ""),
                     "checkout_proxy_region": str(request_params.get("checkout_proxy_region") or ""),
+                    "checkout_ui_mode": str(request_params.get("checkout_ui_mode") or ""),
                 },
                 "payment_link_state": "preparing",
                 "params": dict(request_params),
@@ -11416,6 +11426,7 @@ def _run_batch_payment_links(task_id: str, account_ids: list[int]):
                 f" interval={team_data.get('price_interval') or '-'}"
                 f" seats={team_data.get('seat_quantity') or '-'}"
                 f" proxy_country={request_params.get('checkout_proxy_region') or '-'}"
+                f" checkout_mode={request_params.get('checkout_ui_mode') or '-'}"
                 if is_team_task
                 else ""
             ),

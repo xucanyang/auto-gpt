@@ -158,6 +158,7 @@ def normalize_payment_profile(profile_response: dict[str, Any] | None) -> dict[s
         "link_type": link_type,
         "country": country,
         "currency": currency,
+        "checkout_ui_mode": str(profile.get("checkout_ui_mode") or "").strip().lower(),
         "effective_concurrency": max(effective_concurrency, 0),
         "profile": dict(profile),
     }
@@ -241,6 +242,12 @@ def payment_link_from_remote_job(
     profile_detail = profile.get("profile") if isinstance(profile.get("profile"), dict) else {}
     profile_regions = profile.get("regions") if isinstance(profile.get("regions"), dict) else profile_detail.get("regions")
     profile_regions = profile_regions if isinstance(profile_regions, dict) else {}
+    checkout_ui_mode = str(
+        result.get("checkout_ui_mode")
+        or profile.get("checkout_ui_mode")
+        or profile_detail.get("checkout_ui_mode")
+        or ""
+    ).strip().lower()
     checkout_proxy_region = str(
         result.get("checkout_proxy_region")
         or profile.get("checkout_proxy_region")
@@ -324,6 +331,7 @@ def payment_link_from_remote_job(
         output["cancel_url"] = team_plan_data.get("cancel_url") or ""
         output["promo_code_digest"] = promo_code_digest
         output["checkout_proxy_region"] = checkout_proxy_region
+        output["checkout_ui_mode"] = checkout_ui_mode or "hosted"
     for key in (
         "provider_redirect_url",
         "long_url",

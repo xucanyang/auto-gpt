@@ -6,6 +6,21 @@
 
 ## [Unreleased] (未发布)
 
+## [2.8.2] - 2026-07-24
+
+### 新增 (Added)
+- **Team 支付页模式改为任务级配置**：`frontend/src/pages/Accounts.tsx` 在 Team 优惠码长链接配置中增加 Hosted / Custom 分段选择，默认明确选中 `hosted`。Profile 预览与批次提交都会携带本次选择，不再继承 `/opt/openai-pay-long-link` 管理页当前支付方式的 `checkoutMode`；Plus 支付链接仍保持原管理配置合同。
+
+### 优化 (Changed)
+- **支付页模式进入 Team 变体身份**：`api/tasks.py`、`api/actions.py`、`services/chatgpt_core/payment_link_cache.py`、`long_link_payment_client.py` 与 `plugin.py` 将 `checkout_ui_mode` 贯穿参数过滤、profile 冻结、任务元数据、单账号/批量结果持久化、缓存匹配和变体键。相同账号及 Team 业务参数在 Hosted / Custom 下不会互相复用，运行日志会记录实际冻结模式。
+
+### 修复 (Fixed)
+- **修复 Team 优惠链接生成成功但无法打开**：此前 Team 请求未传支付页模式，会继承 long-link 当前 UPI 的 `custom` 配置；上游仅返回 Checkout Session ID 时，最终保存为依赖 ChatGPT 自定义支付页上下文的 `chatgpt.com/checkout/openai_llc/...` 路由。现在缺省请求强制覆盖为 `hosted`，生成可独立打开的 `pay.openai.com/c/pay/...` Hosted Checkout 长链。
+- **阻止旧 Custom 链被 Hosted 默认错误复用**：没有 `checkout_ui_mode` 字段的历史 Team 缓存会按 URL 形态识别旧 Custom 路由，账号扫描和成功历史防重不会再把这类故障链接视为 Hosted 变体；用户可直接为同账号重新生成新的 Hosted 链。
+
+### 测试 (Tests)
+- 扩展 Team 支付、long-link 客户端和账号页静态合同测试，覆盖默认 Hosted、显式 Custom、非法模式拒绝、Hosted / Custom 变体隔离、旧 Custom URL 识别、profile/batch 覆盖一致性及前端参数提交；侧栏版本同步更新为 `v2.8.2`。
+
 ## [2.8.1] - 2026-07-24
 
 ### 修复 (Fixed)
@@ -2170,4 +2185,8 @@
 
 ## 2026-07-24 00:53:51 +0800
 - 发布v2.8.1：统一行级Team支付链接配置入口
+- 发布模式: multi
+
+## 2026-07-24 01:28:06 +0800
+- 发布v2.8.2：修复Team优惠长链接Hosted模式与缓存隔离
 - 发布模式: multi
