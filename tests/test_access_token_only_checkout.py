@@ -45,6 +45,21 @@ class AccessTokenOnlyCheckoutTests(unittest.TestCase):
             }
             return False, "user_already_exists: existing_account_login_route"
 
+    def test_browser_infrastructure_failure_does_not_retry_same_email(self):
+        engine = AccessTokenOnlyRegistrationEngine(
+            email_service=mock.Mock(),
+            proxy_url="http://proxy.local:8080",
+        )
+
+        self.assertFalse(
+            engine._should_retry(
+                "创建账号失败: auth_browser_finalize_unavailable: sentinel_browser_unavailable"
+            )
+        )
+        self.assertTrue(
+            engine._should_retry("创建账号失败: HTTP 400: registration_disallowed")
+        )
+
     def test_v2_email_adapter_returns_none_on_mailbox_timeout_for_resend_path(self):
         email_service = mock.Mock()
         email_service.get_verification_code.side_effect = TimeoutError("等待 Email API 验证码超时 (30s)")

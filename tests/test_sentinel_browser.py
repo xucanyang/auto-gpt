@@ -10,6 +10,7 @@ from unittest import mock
 from services.chatgpt_core.chatgpt_client import ChatGPTClient
 from services.chatgpt_core.sentinel_browser import (
     BrowserAccountCreateResult,
+    _evaluate_complete_sentinel_token,
     _sentinel_token_field_state,
     export_session_cookies_for_playwright,
     merge_playwright_cookies_into_session,
@@ -54,6 +55,37 @@ class SentinelBrowserRuntimeTests(unittest.TestCase):
             {"p": True, "t": False, "c": True},
         )
         self.assertIsNone(_sentinel_token_field_state("not-json"))
+
+    def test_embedded_sentinel_token_skips_sdk_init(self):
+        class FakeFrame:
+            def __init__(self):
+                self.payload = None
+
+            def wait_for_function(self, *_args, **_kwargs):
+                return None
+
+            def evaluate(self, _script, payload):
+                self.payload = payload
+                return {
+                    "success": True,
+                    "token": json.dumps(
+                        {"p": "pow", "t": "telemetry", "c": "challenge"}
+                    ),
+                }
+
+        frame = FakeFrame()
+        token = _evaluate_complete_sentinel_token(
+            frame,
+            flow="oauth_create_account",
+            sdk_wait_timeout_ms=1000,
+            token_eval_timeout_ms=1000,
+            require_complete_signals=True,
+            logger=lambda _message: None,
+            initialize_sdk=False,
+        )
+
+        self.assertTrue(token)
+        self.assertFalse(frame.payload["initializeSdk"])
 
     def test_registration_sentinel_does_not_fall_back_to_http_pow(self):
         client = ChatGPTClient(verbose=False)

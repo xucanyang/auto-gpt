@@ -215,6 +215,7 @@ def _evaluate_complete_sentinel_token(
     token_eval_timeout_ms: int,
     require_complete_signals: bool,
     logger: Callable[[str], None],
+    initialize_sdk: bool = True,
 ) -> Optional[str]:
     """Evaluate Sentinel in a Page or Frame and validate the returned signals."""
     logger("Sentinel Browser 阶段: wait SentinelSDK ready")
@@ -252,9 +253,9 @@ def _evaluate_complete_sentinel_token(
     logger(f"Sentinel Browser 阶段: evaluate SentinelSDK.token({flow})")
     result = target.evaluate(
         """
-        async ({ flow, timeoutMs }) => {
+        async ({ flow, timeoutMs, initializeSdk }) => {
             try {
-                if (typeof window.SentinelSDK.init === 'function') {
+                if (initializeSdk && typeof window.SentinelSDK.init === 'function') {
                     await window.SentinelSDK.init(flow);
                 }
                 const token = await Promise.race([
@@ -272,7 +273,11 @@ def _evaluate_complete_sentinel_token(
             }
         }
         """,
-        {"flow": flow, "timeoutMs": token_eval_timeout_ms},
+        {
+            "flow": flow,
+            "timeoutMs": token_eval_timeout_ms,
+            "initializeSdk": initialize_sdk,
+        },
     )
     logger("Sentinel Browser 阶段完成: evaluate SentinelSDK.token")
 
@@ -934,6 +939,7 @@ def _create_account_via_browser_sync(
                 token_eval_timeout_ms=token_eval_timeout_ms,
                 require_complete_signals=True,
                 logger=logger,
+                initialize_sdk=False,
             )
             if not token:
                 return BrowserAccountCreateResult(

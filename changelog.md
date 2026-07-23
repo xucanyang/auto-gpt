@@ -6,6 +6,15 @@
 
 ## [Unreleased] (未发布)
 
+## [2.8.8] - 2026-07-24
+
+### 修复 (Fixed)
+- **嵌入式 Sentinel 不再错误调用 `init()`**：v2.8.7 首次单账号线上 smoke 证明 Auth 页面与 Cloudflare Cookie 已进入同一 Playwright context，但注入的 Sentinel iframe 明确返回 `init() should not be called from within an iframe`。`services/chatgpt_core/sentinel_browser.py` 现在只在顶层 Sentinel 页面调用 `SentinelSDK.init(flow)`；Auth 页面内的官方/注入 iframe 直接执行 `SentinelSDK.token(oauth_create_account)`，符合 SDK 的 frame 调用合同。
+- **基础设施错误取消账号内三轮重试**：`services/chatgpt_core/access_token_only_registration_engine.py` 将 `sentinel_browser_unavailable` 和 `auth_browser_finalize_unavailable` 设为账号内不可重试错误。浏览器启动、frame 或 finalize 链路故障时不再对同一个 HME 地址重复走三轮首页、验证码和开户，随后由任务层 fatal gate 停止调度新邮箱。
+
+### 测试 (Tests)
+- 新增 iframe Sentinel 调用模式和账号内 retry gate 回归，锁定嵌入 frame 的 `initializeSdk=false`、普通服务端 `registration_disallowed` 仍可按现有策略重试，以及浏览器基础设施错误立即返回；前端侧栏版本同步更新为 `v2.8.8`。
+
 ## [2.8.7] - 2026-07-24
 
 ### 优化 (Changed)
@@ -2294,4 +2303,8 @@
 
 ## 2026-07-24 05:47:14 +0800
 - 发布 v2.8.7：注册开户改为同一 Auth 浏览器事务并保持 Sentinel Cookie 连续性
+- 发布模式: multi
+
+## 2026-07-24 05:56:24 +0800
+- 发布 v2.8.8：修复 iframe Sentinel 初始化并阻止基础设施错误重复注册
 - 发布模式: multi

@@ -531,6 +531,14 @@ class AccessTokenOnlyRegistrationEngine:
 
     def _should_retry(self, message: str) -> bool:
         text = str(message or "").lower()
+        if any(
+            marker in text
+            for marker in (
+                "sentinel_browser_unavailable",
+                "auth_browser_finalize_unavailable",
+            )
+        ):
+            return False
         retriable_markers = [
             "tls",
             "ssl",
