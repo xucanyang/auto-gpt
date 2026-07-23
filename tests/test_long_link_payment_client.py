@@ -341,6 +341,8 @@ class LongLinkPaymentClientTests(unittest.TestCase):
         overrides = {
             "plan": "team",
             "billing_country": "GB",
+            "country": "IN",
+            "currency": "INR",
             "checkout_ui_mode": "hosted",
             "checkout_proxy_region": "CA",
             "team_plan_data": {
@@ -412,8 +414,13 @@ class LongLinkPaymentClientTests(unittest.TestCase):
         self.assertEqual(profile["checkout_ui_mode"], "hosted")
         self.assertEqual(submitted["batch_id"], batch_id)
         self.assertEqual([call[0] for call in session.calls], ["POST", "POST"])
-        self.assertEqual(session.calls[0][2]["json"], {"profileOverrides": overrides})
-        self.assertEqual(session.calls[1][2]["json"]["profileOverrides"], overrides)
+        expected_overrides = {
+            key: value
+            for key, value in overrides.items()
+            if key not in {"country", "currency"}
+        }
+        self.assertEqual(session.calls[0][2]["json"], {"profileOverrides": expected_overrides})
+        self.assertEqual(session.calls[1][2]["json"]["profileOverrides"], expected_overrides)
 
 
 if __name__ == "__main__":

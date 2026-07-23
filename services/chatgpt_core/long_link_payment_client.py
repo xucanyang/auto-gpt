@@ -24,7 +24,10 @@ from services.chatgpt_core.payment_link_cache import (
     extract_payment_link_qr_expires_at,
     normalize_payment_link_expiry_source,
     normalize_payment_link_expires_at,
+    normalize_payment_link_plan,
     normalize_payment_link_type,
+    normalize_team_billing_country,
+    normalize_team_checkout_ui_mode,
     payment_link_type_from_payload,
     payment_link_variant_key,
 )
@@ -53,6 +56,21 @@ _profile_cache: dict[tuple[str, str, str], tuple[float, dict[str, Any]]] = {}
 
 class LongLinkPaymentError(RuntimeError):
     """Raised when the generic payment-link service API cannot be used."""
+
+
+def normalize_team_profile_overrides(overrides: dict[str, Any] | None) -> dict[str, Any]:
+    """Canonicalize Team overrides before they cross the upstream API boundary."""
+
+    source = dict(overrides) if isinstance(overrides, dict) else {}
+    plan = source.get("plan") or source.get("link_type")
+    if normalize_payment_link_plan(plan) != PAYMENT_LINK_PLAN_TEAM:
+        return source
+    source["plan"] = PAYMENT_LINK_PLAN_TEAM
+    for inherited_key in ("billingCountry", "country", "currency"):
+        source.pop(inherited_key, None)
+    source["billing_country"] = normalize_team_billing_country(overrides)
+    source["checkout_ui_mode"] = normalize_team_checkout_ui_mode(source)
+    return source
 
 
 def _env_float(name: str, default: float, *, minimum: float) -> float:
@@ -529,7 +547,7 @@ class LongLinkPaymentClient:
         overrides: dict[str, Any] | None = None,
         force_refresh: bool = False,
     ) -> dict[str, Any]:
-        safe_overrides = dict(overrides) if isinstance(overrides, dict) else {}
+        safe_overrides = normalize_team_profile_overrides(overrides)
         cache_key = self._cache_key(safe_overrides)
         now = self._monotonic()
         if not force_refresh and self.profile_cache_seconds > 0:
@@ -588,8 +606,9 @@ class LongLinkPaymentClient:
             "expectedProfileHash": str(expected_profile_hash or "").strip(),
             "items": serialized_items,
         }
-        if isinstance(profile_overrides, dict) and profile_overrides:
-            request_payload["profileOverrides"] = dict(profile_overrides)
+        safe_profile_overrides = normalize_team_profile_overrides(profile_overrides)
+        if safe_profile_overrides:
+            request_payload["profileOverrides"] = safe_profile_overrides
         response = self._request(
             "POST",
             _V1_BATCH_PATH,
