@@ -51,6 +51,17 @@ def test_payment_link_generation_dialog_explains_variant_aware_history_guard():
     assert "batchPaymentLinkProfile.regions?.checkout" in page
 
 
+def test_row_payment_link_actions_reuse_config_dialog_with_single_account_scope():
+    page = ACCOUNTS_PAGE.read_text(encoding="utf-8")
+
+    assert "const [batchPaymentLinkTargetAccount, setBatchPaymentLinkTargetAccount]" in page
+    assert "setBatchPaymentLinkTargetAccount(targetAccountId > 0 ? options.account : null)" in page
+    assert "handleBatchPaymentLink({ account: record })" in page
+    assert "handleBatchPaymentLink({ account: record, forceRefresh: true })" in page
+    assert "selectedIds: [targetAccountId]" in page
+    assert "范围：当前账号" in page
+
+
 def test_payment_link_cell_keeps_cleaned_tombstones_visible_without_link_actions():
     page = ACCOUNTS_PAGE.read_text(encoding="utf-8")
 

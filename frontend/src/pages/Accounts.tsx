@@ -2473,6 +2473,7 @@ export default function Accounts() {
   const [baxiCdkPoolSummaryLoading, setBaxiCdkPoolSummaryLoading] = useState(false)
   const [batchPaymentLinkConfigOpen, setBatchPaymentLinkConfigOpen] = useState(false)
   const [batchPaymentLinkForceRefresh, setBatchPaymentLinkForceRefresh] = useState(false)
+  const [batchPaymentLinkTargetAccount, setBatchPaymentLinkTargetAccount] = useState<any>(null)
   const [batchPaymentLinkProfile, setBatchPaymentLinkProfile] = useState<PaymentLinkProfile | null>(null)
   const [batchPaymentLinkProfileLoading, setBatchPaymentLinkProfileLoading] = useState(false)
   const [batchPaymentLinkProfileError, setBatchPaymentLinkProfileError] = useState('')
@@ -2739,20 +2740,6 @@ export default function Accounts() {
       token: detailAccount.token,
     })
   }, [detailModalOpen, detailAccount, detailForm])
-
-  const openAccountPaymentLinkAction = useCallback((record: any) => {
-    setActionAccount(record)
-    setActionSurfaceInitialActionId('payment_link')
-    setActionSurfaceInitialActionMode('direct')
-    setActionSurfaceOpen(true)
-  }, [])
-
-  const openAccountPaymentLinkRegenerateAction = useCallback((record: any) => {
-    setActionAccount(record)
-    setActionSurfaceInitialActionId('payment_link_regenerate')
-    setActionSurfaceInitialActionMode('direct')
-    setActionSurfaceOpen(true)
-  }, [])
 
   const openAccountProbeStatusAction = useCallback((record: any) => {
     setActionAccount(record)
@@ -4010,8 +3997,10 @@ export default function Accounts() {
     }
   }
 
-  const handleBatchPaymentLink = (options: { forceRefresh?: boolean } = {}) => {
+  const handleBatchPaymentLink = (options: { forceRefresh?: boolean; account?: any } = {}) => {
+    const targetAccountId = Number(options.account?.id || 0)
     setBatchPaymentLinkForceRefresh(Boolean(options.forceRefresh))
+    setBatchPaymentLinkTargetAccount(targetAccountId > 0 ? options.account : null)
     setBatchPaymentLinkPlan('plus')
     batchPaymentLinkForm.setFieldsValue({
       plan: 'plus',
@@ -4169,7 +4158,12 @@ export default function Accounts() {
     const requestedPlan = String(requestParams.plan || 'plus').trim().toLowerCase()
     const profile = await loadBatchPaymentLinkProfile(requestParams)
     if (!profile) return
-    const scope: 'selected' | 'filtered' = selectedRowKeys.length > 0 ? 'selected' : 'filtered'
+    const targetAccountId = Number(batchPaymentLinkTargetAccount?.id || 0)
+    const hasTargetAccount = Number.isInteger(targetAccountId) && targetAccountId > 0
+    const batchScope: AccountTaskScope = selectedRowKeys.length > 0 ? 'selected' : 'filtered'
+    const scope: 'single' | 'selected' | 'filtered' = hasTargetAccount
+      ? 'single'
+      : batchScope
     const toastKey = `payment-link:${requestedPlan}:${scope}:${forceRefresh ? 'force' : 'normal'}`
     const body: Record<string, unknown> = {
       skip_existing: !forceRefresh,
@@ -4178,10 +4172,16 @@ export default function Accounts() {
     }
     const productLabel = requestedPlan === 'team' ? 'Team checkout 长链接' : '支付链接'
     const actionLabel = forceRefresh ? `强制重新生成${productLabel}` : `${productLabel}生成`
-    const requestedCount = applyAccountTaskScopeToBody(body, {
-      scope,
-      emptySelectedMessage: `请先选择要${forceRefresh ? '强制重新生成' : '生成'}支付链接的账号`,
-    })
+    const requestedCount = hasTargetAccount
+      ? applyAccountTaskScopeToBody(body, {
+          scope: 'selected',
+          selectedIds: [targetAccountId],
+          emptySelectedMessage: '当前账号不存在或已失效',
+        })
+      : applyAccountTaskScopeToBody(body, {
+          scope: batchScope,
+          emptySelectedMessage: `请先选择要${forceRefresh ? '强制重新生成' : '生成'}支付链接的账号`,
+        })
     if (requestedCount === null) return
 
     setBatchPaymentLinkLoading(true)
@@ -4190,6 +4190,7 @@ export default function Accounts() {
       const res = await postAccountScopeRequest('/tasks/chatgpt/payment-links/batch', body, toastKey)
       if (!res) return
       setBatchPaymentLinkConfigOpen(false)
+      setBatchPaymentLinkTargetAccount(null)
 
       const eligible = Number(res?.eligible || 0)
       const skipped = Number(res?.skipped || 0)
@@ -4209,7 +4210,11 @@ export default function Accounts() {
 
       const snapshot = await apiFetch(`/tasks/${taskIdFromResponse}`)
       setTaskModalMode('payment_link')
-      setTaskModalAccount(scope === 'selected' ? null : { email: `当前筛选 ${eligible} 个账号` })
+      setTaskModalAccount(
+        scope === 'single'
+          ? batchPaymentLinkTargetAccount
+          : scope === 'selected' ? null : { email: `当前筛选 ${eligible} 个账号` },
+      )
       setTaskId(taskIdFromResponse)
       setTaskSnapshot(snapshot)
       setRegisterModalOpen(true)
@@ -6795,11 +6800,11 @@ export default function Accounts() {
       return
     }
     if (String(key) === '__payment_link_config__') {
-      openAccountInlineAction(record, 'payment_link', 'dialog')
+      handleBatchPaymentLink({ account: record })
       return
     }
     if (String(key) === '__payment_link_regenerate__') {
-      openAccountPaymentLinkRegenerateAction(record)
+      handleBatchPaymentLink({ account: record, forceRefresh: true })
       return
     }
     if (String(key) === '__resume_auth_config__') {
@@ -6830,7 +6835,7 @@ export default function Accounts() {
       return (
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 8 }}>
           {paymentLinkAction ? (
-            <Button size="small" style={mobileActionButtonStyle(accountActionTextStyles.payment)} onClick={() => openAccountPaymentLinkAction(record)}>
+            <Button size="small" style={mobileActionButtonStyle(accountActionTextStyles.payment)} onClick={() => handleBatchPaymentLink({ account: record })}>
               支付链接生成
             </Button>
           ) : null}
@@ -6879,7 +6884,7 @@ export default function Accounts() {
               type="link"
               size="small"
               style={accountActionTextStyles.payment}
-              onClick={() => openAccountPaymentLinkAction(record)}
+              onClick={() => handleBatchPaymentLink({ account: record })}
             >
               支付链接生成
             </Button>
@@ -8428,7 +8433,10 @@ export default function Accounts() {
       <Modal
         title={`${batchPaymentLinkForceRefresh ? '强制重新生成' : '生成'}${batchPaymentLinkPlan === 'team' ? ' Team checkout 长链接' : '支付链接'}`}
         open={batchPaymentLinkConfigOpen}
-        onCancel={() => setBatchPaymentLinkConfigOpen(false)}
+        onCancel={() => {
+          setBatchPaymentLinkConfigOpen(false)
+          setBatchPaymentLinkTargetAccount(null)
+        }}
         onOk={submitBatchPaymentLinkConfig}
         confirmLoading={batchPaymentLinkLoading}
         okButtonProps={{ disabled: batchPaymentLinkProfileLoading || Boolean(batchPaymentLinkProfileError) }}
@@ -8596,7 +8604,9 @@ export default function Accounts() {
             type="info"
             showIcon
             message={
-              selectedRowKeys.length > 0
+              batchPaymentLinkTargetAccount
+                ? `范围：当前账号 ${String(batchPaymentLinkTargetAccount.email || batchPaymentLinkTargetAccount.id || '-')}`
+                : selectedRowKeys.length > 0
                 ? `范围：当前选中 ${selectedRowKeys.length} 个账号`
                 : `范围：当前筛选结果 ${total} 个账号`
             }
