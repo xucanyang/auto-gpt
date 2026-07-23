@@ -504,8 +504,8 @@ class AccountFilterSortTests(unittest.TestCase):
             {
                 "chatgpt_last_payment_link": {
                     "url": "https://pay.example.test/checkout/514",
-                    "link_type": "ideal",
-                    "payment_link_format": "ideal_url",
+                    "link_type": "bank_transfer",
+                    "payment_link_format": "provider_link",
                 },
             }
         )
@@ -535,7 +535,7 @@ class AccountFilterSortTests(unittest.TestCase):
 
         self.assertEqual(account_payment_link_platform(pix), "pix")
         self.assertEqual(account_payment_link_platform(legacy_paypal), "paypal")
-        self.assertEqual(account_payment_link_platform(hosted), "chatgpt")
+        self.assertEqual(account_payment_link_platform(hosted), "hosted")
         self.assertEqual(account_payment_link_platform(other), "other")
         self.assertEqual(account_payment_link_platform(no_link), "none")
         self.assertEqual(account_payment_link_platform(malformed), "none")
@@ -575,7 +575,7 @@ class AccountFilterSortTests(unittest.TestCase):
                 {
                     511: "pix",
                     512: "paypal",
-                    513: "chatgpt",
+                    513: "hosted",
                     514: "other",
                     515: "none",
                     516: "none",
@@ -620,6 +620,144 @@ class AccountFilterSortTests(unittest.TestCase):
             [row.id for row in filter_account_rows([upi_by_method, upi_by_url], payment_link_platform="upi")],
             [518, 519],
         )
+
+    def test_payment_link_platform_classifies_every_long_link_type_in_python_and_sql(self):
+        init_db()
+        payloads = {
+            551: {
+                "url": "https://pay.openai.com/c/pay/cs_hosted_551",
+                "link_type": "hosted",
+            },
+            552: {
+                "url": "https://www.paypal.com/agreements/approve?ba_token=BA-552",
+                "link_type": "paypal",
+                "payment_method_type": "paypal",
+            },
+            553: {
+                "url": "https://pay.ideal.nl/transactions/ideal-553",
+                "link_type": "ideal",
+                "payment_method_type": "ideal",
+            },
+            554: {
+                "url": "https://payments.stripe.com/upi/instructions/upi-554",
+                "link_type": "upi",
+                "payment_method_type": "upi",
+            },
+            555: {
+                "url": "https://payments.stripe.com/qr/instructions/pix-555",
+                "link_type": "pix",
+                "payment_method_type": "pix",
+            },
+            556: {
+                "url": "https://checkout.twint.ch/redirect/twint-556",
+                "link_type": "twint",
+                "payment_method_type": "twint",
+            },
+            557: {
+                "url": "https://web.nicepay.co.kr/v3/pay/kakao-557",
+                "link_type": "kakao_pay",
+                "payment_method_type": "kakao_pay",
+            },
+            558: {
+                "url": "https://pay.example.test/gopay/558",
+                "link_type": "gopay",
+                "payment_method_type": "gopay",
+            },
+            559: {
+                "url": "https://pay.openai.com/c/pay/cs_team_559",
+                "link_type": "team",
+                "generation_kind": "team_checkout",
+                "plan": "team",
+            },
+            560: {
+                "url": "https://pay.ideal.nl/transactions/ideal-method-560",
+                "link_type": "hosted",
+                "payment_method_type": "ideal",
+            },
+            561: {
+                "url": "https://pay.openai.com/c/pay/cs_team_legacy_561",
+                "link_type": "hosted",
+                "generation_kind": "team_checkout",
+                "plan_name": "chatgptteamplan",
+            },
+            562: {
+                "url": "https://checkout.twint.ch/redirect/twint-url-562",
+            },
+            563: {
+                "url": "https://web.nicepay.co.kr/v3/pay/kakao-url-563",
+            },
+        }
+        expected = {
+            551: "hosted",
+            552: "paypal",
+            553: "ideal",
+            554: "upi",
+            555: "pix",
+            556: "twint",
+            557: "kakao_pay",
+            558: "gopay",
+            559: "team",
+            560: "ideal",
+            561: "team",
+            562: "twint",
+            563: "kakao_pay",
+        }
+        accounts = []
+        for account_id, payload in payloads.items():
+            account = self._account(account_id)
+            account.set_extra({"chatgpt_last_payment_link": payload})
+            accounts.append(account)
+
+        self.assertEqual(
+            {int(account.id or 0): account_payment_link_platform(account) for account in accounts},
+            expected,
+        )
+        self.assertEqual(
+            [int(account.id or 0) for account in filter_account_rows(accounts, payment_link_platform="chatgpt")],
+            [551, 559, 561],
+        )
+
+        ids = tuple(expected)
+        placeholders = ",".join(str(account_id) for account_id in ids)
+        with Session(engine) as session:
+            session.exec(text(f"DELETE FROM account_list_state WHERE account_id IN ({placeholders})"))
+            session.exec(text(f"DELETE FROM accounts WHERE id IN ({placeholders})"))
+            session.add_all(accounts)
+            session.commit()
+            refresh_account_list_state(session, account_ids=ids)
+
+            state_rows = {
+                int(row[0]): str(row[1])
+                for row in session.exec(
+                    text(
+                        f"""
+                        SELECT account_id, payment_link_platform
+                        FROM account_list_state
+                        WHERE account_id IN ({placeholders})
+                        ORDER BY account_id
+                        """
+                    )
+                ).all()
+            }
+            self.assertEqual(state_rows, expected)
+
+            def sql_ids(payment_link_platform):
+                query = select(AccountModel).join(
+                    AccountListStateModel,
+                    AccountListStateModel.account_id == AccountModel.id,
+                ).where(AccountModel.id.in_(ids))
+                query = apply_account_list_state_filters(
+                    query,
+                    payment_link_platform=payment_link_platform,
+                )
+                return [int(row.id or 0) for row in session.exec(query.order_by(AccountModel.id.asc())).all()]
+
+            self.assertEqual(sql_ids("hosted"), [551])
+            self.assertEqual(sql_ids("ideal"), [553, 560])
+            self.assertEqual(sql_ids("twint"), [556, 562])
+            self.assertEqual(sql_ids("kakao_pay"), [557, 563])
+            self.assertEqual(sql_ids("team"), [559, 561])
+            self.assertEqual(sql_ids("chatgpt"), [551, 559, 561])
 
     def test_payment_link_generated_filter_keeps_history_after_url_cleanup(self):
         init_db()

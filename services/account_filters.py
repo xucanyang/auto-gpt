@@ -20,8 +20,8 @@ from services.chatgpt_account_state import (
 )
 
 AUTO_DELETE_REVIVAL_TASK_ID = "icloud_hme_auto_delete"
-ACCOUNT_LIST_STATE_DERIVATION_VERSION = "integration-upload-state-v1-payment-link-history-v2"
-ACCOUNT_FILTER_RESOLVER_VERSION = "account-list-state-v6-payment-link-types"
+ACCOUNT_LIST_STATE_DERIVATION_VERSION = "integration-upload-state-v1-payment-link-history-v3-long-link-types"
+ACCOUNT_FILTER_RESOLVER_VERSION = "account-list-state-v7-long-link-types"
 ACCOUNT_FILTER_FIELD_NAMES = (
     "email",
     "status",
@@ -188,11 +188,69 @@ _PAYMENT_LINK_PLATFORM_FILTER_ALIASES: dict[str, set[str]] = {
     "upi": {"upi"},
     "paypal": {"paypal"},
     "paypal_url": {"paypal"},
-    "chatgpt": {"chatgpt"},
-    "hosted": {"chatgpt"},
-    "chatgpt_hosted": {"chatgpt"},
+    "ideal": {"ideal"},
+    "ideal-pay": {"ideal"},
+    "ideal_pay": {"ideal"},
+    "twint": {"twint"},
+    "kakao": {"kakao_pay"},
+    "kakaopay": {"kakao_pay"},
+    "kakao-pay": {"kakao_pay"},
+    "kakao_pay": {"kakao_pay"},
+    "gopy": {"gopay"},
+    "gopay": {"gopay"},
+    "team": {"team"},
+    "team_checkout": {"team"},
+    "chatgptteamplan": {"team"},
+    "chatgpt": {"hosted", "team"},
+    "hosted": {"hosted"},
+    "payment": {"hosted"},
+    "pay": {"hosted"},
+    "long": {"hosted"},
+    "chatgpt_hosted": {"hosted"},
+    "stripe_hosted": {"hosted"},
     "other": {"other"},
 }
+
+_PAYMENT_LINK_TYPE_ALIASES: dict[str, str] = {
+    "payment": "hosted",
+    "pay": "hosted",
+    "long": "hosted",
+    "chatgpt": "hosted",
+    "chatgpt_hosted": "hosted",
+    "stripe_hosted": "hosted",
+    "checkout": "hosted",
+    "pp": "paypal",
+    "paypal_url": "paypal",
+    "ideal_pay": "ideal",
+    "qr": "pix",
+    "pix_qr": "pix",
+    "upi_qr": "upi",
+    "upi_qr_code": "upi",
+    "kakao": "kakao_pay",
+    "kakaopay": "kakao_pay",
+    "gopy": "gopay",
+    "team_checkout": "team",
+    "chatgptteamplan": "team",
+}
+_PAYMENT_LINK_CONCRETE_TYPES = frozenset({
+    "paypal",
+    "ideal",
+    "upi",
+    "pix",
+    "twint",
+    "kakao_pay",
+    "gopay",
+})
+
+
+def _normalize_payment_link_type(value: Any) -> str:
+    normalized = _lower_text(value).replace("-", "_")
+    return _PAYMENT_LINK_TYPE_ALIASES.get(normalized, normalized)
+
+
+def _payment_link_host_matches(host: str, *domains: str) -> bool:
+    return any(host == domain or host.endswith(f".{domain}") for domain in domains)
+
 
 _PAYMENT_LINK_CLEANED_STATUSES = frozenset({
     "expired_cleaned",
@@ -689,42 +747,65 @@ def _payment_link_platform_from_payload(payload: dict[str, Any]) -> str:
     if not url:
         return "none"
 
-    link_type = _lower_text(payload.get("link_type"))
-    payment_method_type = _lower_text(payload.get("payment_method_type"))
+    link_type = _normalize_payment_link_type(payload.get("link_type"))
+    payment_method_type = _normalize_payment_link_type(payload.get("payment_method_type"))
+    generation_kind = _normalize_payment_link_type(payload.get("generation_kind"))
+    plan = _normalize_payment_link_type(payload.get("plan"))
+    plan_name = _normalize_payment_link_type(payload.get("plan_name"))
     link_format = _lower_text(payload.get("payment_link_format")).replace("-", "_")
     payment_source = _lower_text(payload.get("payment_source")).replace("-", "_")
     try:
-        host = (urlsplit(url).hostname or "").lower()
+        parsed_url = urlsplit(url)
+        host = (parsed_url.hostname or "").lower()
+        path = (parsed_url.path or "").lower()
     except (TypeError, ValueError):
         host = ""
+        path = ""
 
+    if link_type == "team" or generation_kind == "team" or plan == "team" or plan_name == "team":
+        return "team"
     if link_type == "upi" or payment_method_type == "upi":
         return "upi"
     if link_type == "pix" or payment_method_type == "pix":
         return "pix"
-    if "/upi/instructions/" in (urlsplit(url).path or "").lower():
+    if "/upi/instructions/" in path:
         return "upi"
-    if "/qr/instructions/" in (urlsplit(url).path or "").lower():
+    if "/qr/instructions/" in path:
         return "pix"
+    for candidate in (link_type, payment_method_type):
+        if candidate in _PAYMENT_LINK_CONCRETE_TYPES:
+            return candidate
     if (
-        "paypal" in link_type
-        or "paypal" in payment_method_type
-        or link_format in {"paypal", "paypal_url", "paypal_approval", "provider_url"}
+        link_format in {"paypal", "paypal_url", "paypal_approval", "provider_url"}
         or "paypal" in payment_source
-        or host == "paypal.com"
-        or host.endswith(".paypal.com")
+        or _payment_link_host_matches(host, "paypal.com")
     ):
         return "paypal"
+    if link_format in {"ideal", "ideal_url"} or (host == "pay.ideal.nl" and path.startswith("/transactions/")):
+        return "ideal"
+    if link_format in {"twint", "twint_url"} or _payment_link_host_matches(host, "twint.ch"):
+        return "twint"
+    if link_format in {"kakao_pay", "kakao_pay_url"} or _payment_link_host_matches(
+        host,
+        "kakao.com",
+        "kakaopay.com",
+        "kakaopay.co.kr",
+        "nicepay.com",
+        "nicepay.co.kr",
+    ):
+        return "kakao_pay"
+    if link_format in {"gopay", "gopay_url"}:
+        return "gopay"
     if (
-        link_type in {"hosted", "chatgpt", "chatgpt_hosted", "stripe_hosted"}
+        link_type == "hosted"
+        or payment_method_type == "hosted"
         or link_format in {"short", "short_chatgpt", "long", "long_hosted", "hosted", "hosted_checkout", "pay_openai", "stripe_hosted"}
         or payment_source == "chatgpt_hosted"
-        or host == "chatgpt.com"
-        or host.endswith(".chatgpt.com")
+        or _payment_link_host_matches(host, "chatgpt.com")
         or host == "pay.openai.com"
         or host.endswith(".openai.com")
     ):
-        return "chatgpt"
+        return "hosted"
     return "other"
 
 
@@ -1374,7 +1455,7 @@ def refresh_account_list_state(
                         ),
                         ''
                     )) AS legacy_paypal_link_url,
-                    lower(trim(coalesce(
+                    replace(lower(trim(coalesce(
                         nullif(trim(CAST(CASE
                             WHEN lower(trim(coalesce(json_extract(extra, '$.chatgpt_last_payment_link.link_status'), ''))) IN ('expired_cleaned', 'paid_cleaned', 'cancelled_cleaned', 'upi_expired_cleaned', 'upi_paid_cleaned', 'upi_cancelled_cleaned')
                             THEN NULL
@@ -1383,8 +1464,8 @@ def refresh_account_list_state(
                         nullif(trim(CAST(json_extract(extra, '$.chatgpt_paypal_url.link_type') AS TEXT)), ''),
                         CASE WHEN json_type(extra, '$.chatgpt_paypal_url') = 'object' THEN 'paypal' ELSE '' END,
                         ''
-                    ))) AS payment_link_type,
-                    lower(trim(coalesce(
+                    ))), '-', '_') AS payment_link_type,
+                    replace(lower(trim(coalesce(
                         nullif(trim(CAST(CASE
                             WHEN lower(trim(coalesce(json_extract(extra, '$.chatgpt_last_payment_link.link_status'), ''))) IN ('expired_cleaned', 'paid_cleaned', 'cancelled_cleaned', 'upi_expired_cleaned', 'upi_paid_cleaned', 'upi_cancelled_cleaned')
                             THEN NULL
@@ -1392,7 +1473,19 @@ def refresh_account_list_state(
                         END AS TEXT)), ''),
                         nullif(trim(CAST(json_extract(extra, '$.chatgpt_paypal_url.payment_method_type') AS TEXT)), ''),
                         ''
-                    ))) AS payment_link_method_type,
+                    ))), '-', '_') AS payment_link_method_type,
+                    replace(lower(trim(coalesce(
+                        nullif(trim(CAST(json_extract(extra, '$.chatgpt_last_payment_link.generation_kind') AS TEXT)), ''),
+                        ''
+                    ))), '-', '_') AS payment_link_generation_kind,
+                    replace(lower(trim(coalesce(
+                        nullif(trim(CAST(json_extract(extra, '$.chatgpt_last_payment_link.plan') AS TEXT)), ''),
+                        ''
+                    ))), '-', '_') AS payment_link_plan,
+                    replace(lower(trim(coalesce(
+                        nullif(trim(CAST(json_extract(extra, '$.chatgpt_last_payment_link.plan_name') AS TEXT)), ''),
+                        ''
+                    ))), '-', '_') AS payment_link_plan_name,
                     replace(lower(trim(coalesce(
                         nullif(trim(CAST(CASE
                             WHEN lower(trim(coalesce(json_extract(extra, '$.chatgpt_last_payment_link.link_status'), ''))) IN ('expired_cleaned', 'paid_cleaned', 'cancelled_cleaned', 'upi_expired_cleaned', 'upi_paid_cleaned', 'upi_cancelled_cleaned')
@@ -1763,17 +1856,42 @@ def refresh_account_list_state(
                         THEN 'paypal'
                         WHEN payment_link_url_valid = 0
                         THEN 'none'
-                        WHEN payment_link_type = 'upi' OR payment_link_method_type = 'upi'
+                        WHEN payment_link_type IN ('team', 'team_checkout', 'chatgptteamplan')
+                             OR payment_link_generation_kind = 'team_checkout'
+                             OR payment_link_plan = 'team'
+                             OR payment_link_plan_name = 'chatgptteamplan'
+                        THEN 'team'
+                        WHEN payment_link_type IN ('upi', 'upi_qr', 'upi_qr_code')
+                             OR payment_link_method_type IN ('upi', 'upi_qr', 'upi_qr_code')
                         THEN 'upi'
-                        WHEN payment_link_type = 'pix' OR payment_link_method_type = 'pix'
+                        WHEN payment_link_type IN ('pix', 'qr', 'pix_qr')
+                             OR payment_link_method_type IN ('pix', 'qr', 'pix_qr')
                         THEN 'pix'
                         WHEN lower(payment_link_url) LIKE '%/upi/instructions/%'
                         THEN 'upi'
                         WHEN lower(payment_link_url) LIKE '%/qr/instructions/%'
                         THEN 'pix'
-                        WHEN payment_link_type LIKE '%paypal%'
-                             OR payment_link_method_type LIKE '%paypal%'
-                             OR payment_link_format IN ('paypal', 'paypal_url', 'paypal_approval', 'provider_url')
+                        WHEN payment_link_type IN ('paypal', 'pp', 'paypal_url')
+                        THEN 'paypal'
+                        WHEN payment_link_type IN ('ideal', 'ideal_pay')
+                        THEN 'ideal'
+                        WHEN payment_link_type = 'twint'
+                        THEN 'twint'
+                        WHEN payment_link_type IN ('kakao', 'kakaopay', 'kakao_pay')
+                        THEN 'kakao_pay'
+                        WHEN payment_link_type IN ('gopy', 'gopay')
+                        THEN 'gopay'
+                        WHEN payment_link_method_type IN ('paypal', 'pp', 'paypal_url')
+                        THEN 'paypal'
+                        WHEN payment_link_method_type IN ('ideal', 'ideal_pay')
+                        THEN 'ideal'
+                        WHEN payment_link_method_type = 'twint'
+                        THEN 'twint'
+                        WHEN payment_link_method_type IN ('kakao', 'kakaopay', 'kakao_pay')
+                        THEN 'kakao_pay'
+                        WHEN payment_link_method_type IN ('gopy', 'gopay')
+                        THEN 'gopay'
+                        WHEN payment_link_format IN ('paypal', 'paypal_url', 'paypal_approval', 'provider_url')
                              OR payment_link_source LIKE '%paypal%'
                              OR lower(payment_link_url) LIKE 'http://paypal.com'
                              OR lower(payment_link_url) LIKE 'https://paypal.com'
@@ -1792,7 +1910,42 @@ def refresh_account_list_state(
                              OR lower(payment_link_url) LIKE 'http://%.paypal.com#%'
                              OR lower(payment_link_url) LIKE 'https://%.paypal.com#%'
                         THEN 'paypal'
-                        WHEN payment_link_type IN ('hosted', 'chatgpt', 'chatgpt_hosted', 'stripe_hosted')
+                        WHEN payment_link_format IN ('ideal', 'ideal_url')
+                             OR lower(payment_link_url) LIKE 'http://pay.ideal.nl/transactions/%'
+                             OR lower(payment_link_url) LIKE 'https://pay.ideal.nl/transactions/%'
+                        THEN 'ideal'
+                        WHEN payment_link_format IN ('twint', 'twint_url')
+                             OR lower(payment_link_url) LIKE 'http://twint.ch/%'
+                             OR lower(payment_link_url) LIKE 'https://twint.ch/%'
+                             OR lower(payment_link_url) LIKE 'http://%.twint.ch/%'
+                             OR lower(payment_link_url) LIKE 'https://%.twint.ch/%'
+                        THEN 'twint'
+                        WHEN payment_link_format IN ('kakao_pay', 'kakao_pay_url')
+                             OR lower(payment_link_url) LIKE 'http://kakao.com/%'
+                             OR lower(payment_link_url) LIKE 'https://kakao.com/%'
+                             OR lower(payment_link_url) LIKE 'http://%.kakao.com/%'
+                             OR lower(payment_link_url) LIKE 'https://%.kakao.com/%'
+                             OR lower(payment_link_url) LIKE 'http://kakaopay.com/%'
+                             OR lower(payment_link_url) LIKE 'https://kakaopay.com/%'
+                             OR lower(payment_link_url) LIKE 'http://%.kakaopay.com/%'
+                             OR lower(payment_link_url) LIKE 'https://%.kakaopay.com/%'
+                             OR lower(payment_link_url) LIKE 'http://kakaopay.co.kr/%'
+                             OR lower(payment_link_url) LIKE 'https://kakaopay.co.kr/%'
+                             OR lower(payment_link_url) LIKE 'http://%.kakaopay.co.kr/%'
+                             OR lower(payment_link_url) LIKE 'https://%.kakaopay.co.kr/%'
+                             OR lower(payment_link_url) LIKE 'http://nicepay.com/%'
+                             OR lower(payment_link_url) LIKE 'https://nicepay.com/%'
+                             OR lower(payment_link_url) LIKE 'http://%.nicepay.com/%'
+                             OR lower(payment_link_url) LIKE 'https://%.nicepay.com/%'
+                             OR lower(payment_link_url) LIKE 'http://nicepay.co.kr/%'
+                             OR lower(payment_link_url) LIKE 'https://nicepay.co.kr/%'
+                             OR lower(payment_link_url) LIKE 'http://%.nicepay.co.kr/%'
+                             OR lower(payment_link_url) LIKE 'https://%.nicepay.co.kr/%'
+                        THEN 'kakao_pay'
+                        WHEN payment_link_format IN ('gopay', 'gopay_url')
+                        THEN 'gopay'
+                        WHEN payment_link_type IN ('hosted', 'payment', 'pay', 'long', 'chatgpt', 'chatgpt_hosted', 'stripe_hosted', 'checkout')
+                             OR payment_link_method_type IN ('hosted', 'payment', 'pay', 'long', 'chatgpt', 'chatgpt_hosted', 'stripe_hosted', 'checkout')
                              OR payment_link_format IN ('short', 'short_chatgpt', 'long', 'long_hosted', 'hosted', 'hosted_checkout', 'pay_openai', 'stripe_hosted')
                              OR payment_link_source = 'chatgpt_hosted'
                              OR lower(payment_link_url) LIKE 'http://chatgpt.com'
@@ -1823,7 +1976,7 @@ def refresh_account_list_state(
                              OR lower(payment_link_url) LIKE 'https://%.openai.com?%'
                              OR lower(payment_link_url) LIKE 'http://%.openai.com#%'
                              OR lower(payment_link_url) LIKE 'https://%.openai.com#%'
-                        THEN 'chatgpt'
+                        THEN 'hosted'
                         ELSE 'other'
                     END AS payment_link_platform,
                     auth_level,

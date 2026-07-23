@@ -604,13 +604,46 @@ const PHONE_BINDING_STATE_FILTER_OPTIONS = [
 ]
 
 const PAYMENT_LINK_PLATFORM_FILTER_OPTIONS = [
-  { value: 'pix', text: 'PIX' },
-  { value: 'upi', text: 'UPI' },
+  { value: 'hosted', text: 'Hosted Checkout' },
   { value: 'paypal', text: 'PayPal' },
-  { value: 'chatgpt', text: 'ChatGPT 结账' },
+  { value: 'ideal', text: 'iDEAL' },
+  { value: 'upi', text: 'UPI' },
+  { value: 'pix', text: 'PIX' },
+  { value: 'twint', text: 'TWINT' },
+  { value: 'kakao_pay', text: 'Kakao Pay' },
+  { value: 'gopay', text: 'GoPay' },
+  { value: 'team', text: 'ChatGPT Team' },
   { value: 'other', text: '其他支付链接' },
   { value: 'none', text: '当前无链接' },
 ]
+
+const PAYMENT_LINK_PLATFORM_FILTER_VALUE_ALIASES: Record<string, string[]> = {
+  payment: ['hosted'],
+  pay: ['hosted'],
+  long: ['hosted'],
+  checkout: ['hosted'],
+  chatgpt: ['hosted', 'team'],
+  chatgpt_hosted: ['hosted'],
+  stripe_hosted: ['hosted'],
+  pp: ['paypal'],
+  paypal_url: ['paypal'],
+  'ideal-pay': ['ideal'],
+  ideal_pay: ['ideal'],
+  qr: ['pix'],
+  pix_qr: ['pix'],
+  upi_qr: ['upi'],
+  upi_qr_code: ['upi'],
+  kakao: ['kakao_pay'],
+  kakaopay: ['kakao_pay'],
+  'kakao-pay': ['kakao_pay'],
+  gopy: ['gopay'],
+  team_checkout: ['team'],
+  chatgptteamplan: ['team'],
+  no_link: ['none'],
+  no_payment_link: ['none'],
+  without_link: ['none'],
+  missing: ['none'],
+}
 
 const PAYMENT_LINK_GENERATED_FILTER_OPTIONS = [
   { value: 'true', text: '已成功提取' },
@@ -751,6 +784,17 @@ function normalizePresetList(value: unknown): string[] {
   return items
 }
 
+function normalizePaymentLinkPlatformFilterValues(value: unknown): string[] {
+  return normalizePresetList(value).reduce((items, item) => {
+    const text = item.toLowerCase()
+    const mappedValues = PAYMENT_LINK_PLATFORM_FILTER_VALUE_ALIASES[text] || [text.replace(/-/g, '_')]
+    mappedValues.forEach((mapped) => {
+      if (mapped && !items.includes(mapped)) items.push(mapped)
+    })
+    return items
+  }, [] as string[])
+}
+
 function normalizePaymentLinkGeneratedFilterValues(value: unknown): string[] {
   const normalized = normalizePresetList(value).reduce((items, item) => {
     const text = item.toLowerCase()
@@ -807,6 +851,10 @@ function cloneAccountColumnFilters(value?: Partial<Record<keyof AccountColumnFil
     }
     if (key === 'sub2apiState' || key === 'oaipayState') {
       next[key] = normalizeIntegrationUploadFilterValues(values)
+      return
+    }
+    if (key === 'paymentLinkPlatform') {
+      next.paymentLinkPlatform = normalizePaymentLinkPlatformFilterValues(values)
       return
     }
     if (key === 'paymentLinkGenerated') {
@@ -6390,7 +6438,10 @@ export default function Accounts() {
             placeholder="当前链接类型"
             value={columnFilters.paymentLinkPlatform}
             options={toSelectOptions(PAYMENT_LINK_PLATFORM_FILTER_OPTIONS)}
-            onChange={(value) => setColumnFilters((prev) => ({ ...prev, paymentLinkPlatform: value }))}
+            onChange={(value) => setColumnFilters((prev) => ({
+              ...prev,
+              paymentLinkPlatform: normalizePaymentLinkPlatformFilterValues(value),
+            }))}
           />
           <Select
             allowClear
@@ -6550,10 +6601,15 @@ export default function Accounts() {
     const platform = String(record?.paymentLinkPlatform || record?.payment_link_platform || link.platform || '').trim().toLowerCase()
     const generated = hasPaymentLinkSuccessEvidence(record, link)
     const platformLabel = ({
+      hosted: 'HOSTED',
       pix: 'PIX',
       upi: 'UPI',
       paypal: 'PAYPAL',
-      chatgpt: 'CHATGPT',
+      ideal: 'iDEAL',
+      twint: 'TWINT',
+      kakao_pay: 'KAKAO PAY',
+      gopay: 'GOPAY',
+      team: 'TEAM',
       other: '其他',
     } as Record<string, string>)[platform]
     const storedLinkType = String(link.link_type || '').trim().toUpperCase()
@@ -7460,7 +7516,10 @@ export default function Accounts() {
           '支付链接',
           columnFilters.paymentLinkPlatform,
           PAYMENT_LINK_PLATFORM_FILTER_OPTIONS,
-          (next) => setColumnFilters((prev) => ({ ...prev, paymentLinkPlatform: next })),
+          (next) => setColumnFilters((prev) => ({
+            ...prev,
+            paymentLinkPlatform: normalizePaymentLinkPlatformFilterValues(next),
+          })),
           {
             primaryLabel: '当前链接类型',
             label: '提取记录',
@@ -8225,7 +8284,12 @@ export default function Accounts() {
                 <Form.Item name="phoneBindingState" label="手机号绑定" style={{ marginBottom: 0 }}>
                   <Select mode="multiple" placeholder="全部绑定情况" options={toSelectOptions(PHONE_BINDING_STATE_FILTER_OPTIONS)} allowClear />
                 </Form.Item>
-                <Form.Item name="paymentLinkPlatform" label="当前链接类型" style={{ marginBottom: 0 }}>
+                <Form.Item
+                  name="paymentLinkPlatform"
+                  label="当前链接类型"
+                  normalize={normalizePaymentLinkPlatformFilterValues}
+                  style={{ marginBottom: 0 }}
+                >
                   <Select mode="multiple" placeholder="全部当前链接类型" options={toSelectOptions(PAYMENT_LINK_PLATFORM_FILTER_OPTIONS)} allowClear />
                 </Form.Item>
                 <Form.Item

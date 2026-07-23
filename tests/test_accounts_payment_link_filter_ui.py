@@ -18,7 +18,25 @@ def test_payment_link_filter_separates_current_link_from_success_history():
     page = ACCOUNTS_PAGE.read_text(encoding="utf-8")
     query = ACCOUNTS_QUERY.read_text(encoding="utf-8")
 
+    for option in (
+        "{ value: 'hosted', text: 'Hosted Checkout' }",
+        "{ value: 'paypal', text: 'PayPal' }",
+        "{ value: 'ideal', text: 'iDEAL' }",
+        "{ value: 'upi', text: 'UPI' }",
+        "{ value: 'pix', text: 'PIX' }",
+        "{ value: 'twint', text: 'TWINT' }",
+        "{ value: 'kakao_pay', text: 'Kakao Pay' }",
+        "{ value: 'gopay', text: 'GoPay' }",
+        "{ value: 'team', text: 'ChatGPT Team' }",
+        "{ value: 'other', text: '其他支付链接' }",
+    ):
+        assert option in page
     assert "{ value: 'none', text: '当前无链接' }" in page
+    assert "chatgpt: ['hosted', 'team']" in page
+    assert "next.paymentLinkPlatform = normalizePaymentLinkPlatformFilterValues(values)" in page
+    assert "normalize={normalizePaymentLinkPlatformFilterValues}" in page
+    assert "kakao_pay: 'KAKAO PAY'" in page
+    assert "team: 'TEAM'" in page
     assert "{ value: 'true', text: '已成功提取' }" in page
     assert "{ value: 'false', text: '从未成功提取' }" in page
     assert "primaryLabel: '当前链接类型'" in page

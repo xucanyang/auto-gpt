@@ -6,6 +6,21 @@
 
 ## [Unreleased] (未发布)
 
+## [2.8.4] - 2026-07-24
+
+### 新增 (Added)
+- **支付链接列表补齐 long-link 全类型筛选**：`frontend/src/pages/Accounts.tsx` 的“当前链接类型”现在按 `/opt/openai-pay-long-link` 规范完整提供 Hosted Checkout、PayPal、iDEAL、UPI、PIX、TWINT、Kakao Pay、GoPay 与 ChatGPT Team 九种独立选项，同时保留“其他支付链接”和“当前无链接”兜底。账号行类型标签同步展示规范名称，不再把已支持通道压缩成模糊的 ChatGPT/其他分类。
+
+### 优化 (Changed)
+- **统一当前链接类型的 Python/SQL 分类合同**：`services/account_filters.py` 让账号序列化、纯 Python 筛选和 `account_list_state` SQLite 派生索引使用相同的 long-link 类型语义。具体 `payment_method_type` 可以纠正泛化 Hosted，Team 通过 `link_type`、`generation_kind`、`plan` 或 `plan_name` 保持独立；规范 UPI/PIX 路径及 PayPal、iDEAL、TWINT、Kakao Pay 域名仅作为旧记录兜底，未知类型继续归入 `other`。
+- **旧筛选组合无损迁移**：历史前端筛选值和 API 参数 `chatgpt` 自动展开为 `hosted + team`，其他旧别名同步归一化到规范值。提升账号列表派生版本与筛选解析版本，三个常驻实例会自动重算已有 `account_list_state`，无需重写支付链接历史或修改数据库结构。
+
+### 修复 (Fixed)
+- **修复 iDEAL 等已知链接无法单独筛选**：此前后端只单列 PIX、UPI、PayPal，将 Hosted/Team 合并为 `chatgpt`，并把 iDEAL、TWINT、Kakao Pay、GoPay 全部落入 `other`；新增筛选项即使显示也无法匹配缓存数据。现在前端选项、列表标签、批量任务筛选范围与后端派生索引保持一致。
+
+### 测试 (Tests)
+- 扩展账号筛选与前端静态合同回归，覆盖九种规范类型、Hosted 加具体支付方式、Team 元数据、TWINT/Kakao Pay 旧 URL、未知类型、无链接、旧 `chatgpt` 组合，以及纯 Python 与 SQLite 派生结果一致性；侧栏版本同步更新为 `v2.8.4`。
+
 ## [2.8.3] - 2026-07-24
 
 ### 新增 (Added)
@@ -2213,4 +2228,8 @@
 
 ## 2026-07-24 02:38:49 +0800
 - 补强 v2.8.3：客户端边界清理 Team 旧 country/currency 字段
+- 发布模式: multi
+
+## 2026-07-24 03:33:58 +0800
+- v2.8.4 补齐支付链接全类型筛选
 - 发布模式: multi
