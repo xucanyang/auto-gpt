@@ -780,6 +780,7 @@ class ChatGPTPlatform(BasePlatform):
                 normalize_payment_link_params,
                 normalize_payment_link_plan,
                 normalize_payment_link_url,
+                normalize_team_billing_country,
                 normalize_team_checkout_ui_mode,
                 payment_link_cache_matches,
                 payment_link_cache_for_params,
@@ -795,6 +796,9 @@ class ChatGPTPlatform(BasePlatform):
             is_team = plan == PAYMENT_LINK_PLAN_TEAM
             profile_overrides = {**params, "plan": plan}
             if is_team:
+                for inherited_key in ("billingCountry", "country", "currency"):
+                    profile_overrides.pop(inherited_key, None)
+                profile_overrides["billing_country"] = normalize_team_billing_country(params)
                 profile_overrides["checkout_ui_mode"] = normalize_team_checkout_ui_mode(params)
             client = LongLinkPaymentClient.from_env()
             payment_profile = (
@@ -838,6 +842,7 @@ class ChatGPTPlatform(BasePlatform):
                             or ""
                         ).strip(),
                         "plan_name": "chatgptteamplan",
+                        "billing_country": country,
                         "checkout_proxy_region": str(
                             profile_regions.get("checkout")
                             or params.get("checkout_proxy_region")

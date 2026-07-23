@@ -40,6 +40,7 @@ def team_params(workspace: str = "Workspace A", **overrides: object) -> dict[str
         "plan_name": "chatgptteamplan",
         "checkout_proxy_region": "GB",
         "checkout_ui_mode": "hosted",
+        "billing_country": "GB",
         "country": "GB",
         "currency": "GBP",
         "payment_link_format": "long_link",
@@ -86,13 +87,17 @@ class TeamPaymentLinkContractTests(unittest.TestCase):
         })
         self.assertEqual(filtered["checkout_proxy_region"], "CA")
         self.assertEqual(filtered["checkout_ui_mode"], "hosted")
+        self.assertEqual(filtered["billing_country"], "US")
         self.assertNotIn("country", filtered)
+        self.assertNotIn("currency", filtered)
         custom = tasks_api._filtered_payment_link_request_params({
             "plan": "team",
             "checkout_proxy_region": "CA",
             "checkout_ui_mode": "custom",
+            "billingCountry": "ch",
         })
         self.assertEqual(custom["checkout_ui_mode"], "custom")
+        self.assertEqual(custom["billing_country"], "CH")
 
         invalid = (
             {"plan": "team", "checkout_proxy_region": "GB", "price_interval": "week"},
@@ -102,6 +107,7 @@ class TeamPaymentLinkContractTests(unittest.TestCase):
             {"plan": "team", "checkout_proxy_region": "GB", "seat_quantity": 1001},
             {"plan": "team", "checkout_proxy_region": "GB", "cancel_url": "javascript:alert(1)"},
             {"plan": "team", "checkout_proxy_region": "GB", "checkout_ui_mode": "embedded"},
+            {"plan": "team", "checkout_proxy_region": "GB", "billing_country": "ZZ"},
             {"plan": "business"},
             {"plan": "enterprise"},
             {"plan": "plus", "promo_code": "TEAM50"},
@@ -120,11 +126,49 @@ class TeamPaymentLinkContractTests(unittest.TestCase):
             team_params(profile_hash="e" * 64),
             team_params(checkout_proxy_region="US"),
             team_params(checkout_ui_mode="custom"),
+            team_params(country="US", billing_country="US", currency="USD"),
         ]
 
         base_key = payment_link_variant_key(base)
         self.assertEqual(len(base_key), 64)
-        self.assertEqual(len({base_key, *(payment_link_variant_key(item) for item in variants)}), 7)
+        self.assertEqual(len({base_key, *(payment_link_variant_key(item) for item in variants)}), 8)
+
+        request_params = normalize_payment_link_params({
+            "plan": "team",
+            "billing_country": "fr",
+            "checkout_proxy_region": "CA",
+        })
+        self.assertEqual(request_params["country"], "FR")
+        self.assertEqual(request_params["currency"], "EUR")
+
+    def test_profile_freeze_preserves_task_billing_country_and_rejects_mismatch(self) -> None:
+        request = tasks_api._filtered_payment_link_request_params({
+            "plan": "team",
+            "checkout_proxy_region": "CA",
+            "billing_country": "CH",
+        })
+        profile = {
+            "profile_hash": PROFILE_HASH,
+            "plan": "team",
+            "country": "CH",
+            "billing_country": "CH",
+            "currency": "CHF",
+            "checkout_ui_mode": "hosted",
+            "regions": {"checkout": "CA"},
+            "team": {
+                "workspace_name": "Billing Workspace",
+                "price_interval": "month",
+                "seat_quantity": 2,
+            },
+        }
+
+        frozen = tasks_api._payment_link_params_from_profile(request, profile)
+
+        self.assertEqual(frozen["billing_country"], "CH")
+        self.assertEqual(frozen["country"], "CH")
+        self.assertEqual(frozen["currency"], "CHF")
+        with self.assertRaisesRegex(ValueError, "账单国家与任务配置不一致"):
+            tasks_api._payment_link_params_from_profile(request, {**profile, "country": "US"})
 
     def test_browser_profile_view_keeps_team_summary_but_redacts_coupon_digest(self) -> None:
         view = tasks_api._payment_link_profile_view({
@@ -155,6 +199,7 @@ class TeamPaymentLinkContractTests(unittest.TestCase):
         self.assertEqual(view["team"]["seat_quantity"], 0)
         self.assertEqual(view["effective_concurrency"], 0)
         self.assertEqual(view["regions"]["checkout"], "GB")
+        self.assertEqual(view["billing_country"], "GB")
         self.assertEqual(view["checkout_ui_mode"], "hosted")
         self.assertNotIn("promo_code_digest", view)
         self.assertNotIn(PROMO_DIGEST, json.dumps(view))
@@ -284,6 +329,7 @@ class TeamPaymentLinkContractTests(unittest.TestCase):
             self.assertEqual(history.get_result()["workspace_name"], "Workspace A")
             self.assertEqual(history.get_result()["checkout_proxy_region"], "GB")
             self.assertEqual(history.get_result()["checkout_ui_mode"], "hosted")
+            self.assertEqual(history.get_result()["billing_country"], "GB")
             self.assertEqual(history.get_result()["promo_code_digest"], PROMO_DIGEST)
             self.assertNotIn("TEAM50", history.result_json)
 
@@ -303,6 +349,9 @@ class TeamPaymentLinkContractTests(unittest.TestCase):
             },
             "promo_code": "TEAM50",
             "checkout_proxy_region": "CA",
+            "billing_country": "CH",
+            "country": "IN",
+            "currency": "INR",
             "cancel_url": "https://chatgpt.com/action",
             "request_id": "task:team:action",
         }
@@ -312,8 +361,9 @@ class TeamPaymentLinkContractTests(unittest.TestCase):
             "link_type": "team",
             "plan": "team",
             "generation_kind": "team_checkout",
-            "country": "GB",
-            "currency": "GBP",
+            "country": "CH",
+            "billing_country": "CH",
+            "currency": "CHF",
             "checkout_ui_mode": "hosted",
             "regions": {"checkout": "CA"},
             "promo_code_digest": PROMO_DIGEST,
@@ -340,8 +390,8 @@ class TeamPaymentLinkContractTests(unittest.TestCase):
                         "link_type": "team",
                         "generation_kind": "team_checkout",
                         "plan_name": "chatgptteamplan",
-                        "billing_country": "GB",
-                        "currency": "GBP",
+                        "billing_country": "CH",
+                        "currency": "CHF",
                         "team_plan_data": {
                             "workspace_name": "Action Workspace",
                             "price_interval": "year",
@@ -366,7 +416,13 @@ class TeamPaymentLinkContractTests(unittest.TestCase):
         self.assertEqual(result["data"]["workspace_name"], "Action Workspace")
         self.assertEqual(result["data"]["checkout_proxy_region"], "CA")
         self.assertEqual(result["data"]["checkout_ui_mode"], "hosted")
-        effective_overrides = {**overrides, "checkout_ui_mode": "hosted"}
+        self.assertEqual(result["data"]["billing_country"], "CH")
+        effective_overrides = {
+            key: value
+            for key, value in overrides.items()
+            if key not in {"country", "currency"}
+        }
+        effective_overrides["checkout_ui_mode"] = "hosted"
         client.get_profile.assert_called_once_with(overrides=effective_overrides)
         client.submit_batch.assert_called_once_with(
             items=[{"access_token": "access-token-secret", "request_id": "task:team:action"}],

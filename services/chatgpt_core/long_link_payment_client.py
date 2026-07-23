@@ -157,6 +157,7 @@ def normalize_payment_profile(profile_response: dict[str, Any] | None) -> dict[s
         "profile_hash": profile_hash,
         "link_type": link_type,
         "country": country,
+        "billing_country": country,
         "currency": currency,
         "checkout_ui_mode": str(profile.get("checkout_ui_mode") or "").strip().lower(),
         "effective_concurrency": max(effective_concurrency, 0),
@@ -324,6 +325,7 @@ def payment_link_from_remote_job(
     if link_type == "paypal":
         output["paypal_url"] = _http_url(result.get("paypal_url")) or url
     if is_team:
+        output["billing_country"] = output["country"]
         output["team_plan_data"] = team_plan_data
         output["workspace_name"] = team_plan_data.get("workspace_name") or ""
         output["price_interval"] = team_plan_data.get("price_interval") or "month"

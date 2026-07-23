@@ -274,6 +274,7 @@ def _apply_action_result(
                             "remote_request_id",
                             "generated_at",
                             "country",
+                            "billing_country",
                             "currency",
                             "provider_redirect_url",
                             "long_url",

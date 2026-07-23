@@ -47,12 +47,17 @@ def test_payment_link_generation_dialog_explains_variant_aware_history_guard():
     assert "已支付、已订阅、已失效或正在生成的账号仍会跳过" in page
     assert "DEFAULT_TEAM_WORKSPACE_NAME = 'MyTeam'" in page
     assert "DEFAULT_TEAM_CHECKOUT_UI_MODE = 'hosted'" in page
+    assert "DEFAULT_TEAM_BILLING_COUNTRY = 'US'" in page
+    assert "TEAM_BILLING_COUNTRY_CURRENCIES" in page
     assert 'name="checkout_proxy_region"' in page
     assert 'label="动态 IP 国家"' in page
+    assert 'name="billing_country"' in page
+    assert 'label="账单国家"' in page
     assert 'name="checkout_ui_mode"' in page
     assert 'label="支付页模式"' in page
     assert "{ label: 'Hosted（默认）', value: 'hosted' }" in page
     assert "params.checkout_ui_mode = checkoutUiMode === 'custom' ? 'custom' : DEFAULT_TEAM_CHECKOUT_UI_MODE" in page
+    assert "params.billing_country = billingCountry" in page
     assert "batchPaymentLinkProfile.regions?.checkout" in page
 
 

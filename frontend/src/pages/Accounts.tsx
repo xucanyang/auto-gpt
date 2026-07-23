@@ -123,11 +123,19 @@ const ACCOUNT_CREATED_AT_SORT_FIELD = 'created_at'
 const DEFAULT_REGISTRATION_SORT_ORDER = 'desc' as const
 const DEFAULT_TEAM_WORKSPACE_NAME = 'MyTeam'
 const DEFAULT_TEAM_CHECKOUT_UI_MODE = 'hosted' as const
+const DEFAULT_TEAM_BILLING_COUNTRY = 'US' as const
 const TEAM_PROXY_COUNTRY_CODES = [
   'US', 'GB', 'CA', 'AU', 'JP', 'SG', 'HK', 'TW', 'KR', 'ID', 'MY', 'TH',
   'TR', 'VN', 'PH', 'IN', 'DE', 'FR', 'IT', 'ES', 'NL', 'IE', 'PT', 'BE',
   'FI', 'AT', 'CH', 'SE', 'NO', 'DK', 'PL', 'CZ', 'MX', 'BR', 'NZ',
 ] as const
+const TEAM_BILLING_COUNTRY_CURRENCIES = {
+  AT: 'EUR', AU: 'AUD', BE: 'EUR', BR: 'BRL', CA: 'CAD', CH: 'CHF', CZ: 'CZK',
+  DE: 'EUR', DK: 'DKK', ES: 'EUR', FI: 'EUR', FR: 'EUR', GB: 'GBP', HK: 'HKD',
+  ID: 'IDR', IE: 'EUR', IN: 'INR', IT: 'EUR', JP: 'JPY', KR: 'KRW', MX: 'MXN',
+  MY: 'MYR', NL: 'EUR', NO: 'NOK', NZ: 'NZD', PH: 'PHP', PL: 'PLN', PT: 'EUR',
+  SE: 'SEK', SG: 'SGD', TH: 'THB', TR: 'TRY', TW: 'TWD', US: 'USD', VN: 'VND',
+} as const
 
 function teamProxyCountryLabel(code: string) {
   const normalized = String(code || '').trim().toUpperCase()
@@ -138,6 +146,24 @@ function teamProxyCountryLabel(code: string) {
     return normalized
   }
 }
+
+function teamBillingCountryLabel(code: string, currency: string) {
+  const normalized = String(code || '').trim().toUpperCase()
+  try {
+    const displayNames = new Intl.DisplayNames(['zh-CN'], { type: 'region' })
+    return `${displayNames.of(normalized) || normalized} (${normalized}) · ${currency}`
+  } catch {
+    return `${normalized} · ${currency}`
+  }
+}
+
+const TEAM_BILLING_COUNTRY_OPTIONS = Object.entries(TEAM_BILLING_COUNTRY_CURRENCIES)
+  .sort(([left], [right]) => {
+    if (left === DEFAULT_TEAM_BILLING_COUNTRY) return -1
+    if (right === DEFAULT_TEAM_BILLING_COUNTRY) return 1
+    return left.localeCompare(right)
+  })
+  .map(([code, currency]) => ({ value: code, label: teamBillingCountryLabel(code, currency) }))
 
 const DEFAULT_PINNED_ACCOUNT_TOOLBAR_ACTIONS: AccountToolbarActionId[] = ['statusSync', 'paymentLink']
 
@@ -3964,10 +3990,12 @@ export default function Accounts() {
       const cancelUrl = String(values?.cancel_url || '').trim()
       const checkoutProxyRegion = String(values?.checkout_proxy_region || '').trim().toUpperCase()
       const checkoutUiMode = String(values?.checkout_ui_mode || DEFAULT_TEAM_CHECKOUT_UI_MODE).trim().toLowerCase()
+      const billingCountry = String(values?.billing_country || DEFAULT_TEAM_BILLING_COUNTRY).trim().toUpperCase()
       if (promoCode) params.promo_code = promoCode
       if (cancelUrl) params.cancel_url = cancelUrl
       if (checkoutProxyRegion) params.checkout_proxy_region = checkoutProxyRegion
       params.checkout_ui_mode = checkoutUiMode === 'custom' ? 'custom' : DEFAULT_TEAM_CHECKOUT_UI_MODE
+      params.billing_country = billingCountry
     }
     return params
   }
@@ -4010,6 +4038,7 @@ export default function Accounts() {
       workspace_name: DEFAULT_TEAM_WORKSPACE_NAME,
       checkout_proxy_region: undefined,
       checkout_ui_mode: DEFAULT_TEAM_CHECKOUT_UI_MODE,
+      billing_country: DEFAULT_TEAM_BILLING_COUNTRY,
       price_interval: '',
       seat_quantity: undefined,
       promo_code: '',
@@ -8458,6 +8487,7 @@ export default function Accounts() {
               workspace_name: DEFAULT_TEAM_WORKSPACE_NAME,
               checkout_proxy_region: undefined,
               checkout_ui_mode: DEFAULT_TEAM_CHECKOUT_UI_MODE,
+              billing_country: DEFAULT_TEAM_BILLING_COUNTRY,
               price_interval: '',
               seat_quantity: undefined,
             }}
@@ -8559,6 +8589,34 @@ export default function Accounts() {
                         void loadBatchPaymentLinkProfile({
                           ...buildBatchPaymentLinkParams(batchPaymentLinkForceRefresh),
                           plan: 'team',
+                          checkout_proxy_region: checkoutProxyRegion,
+                        })
+                      }}
+                    />
+                  </Form.Item>
+                  <Form.Item
+                    name="billing_country"
+                    label="账单国家"
+                    rules={[{ required: true, message: '请选择账单国家' }]}
+                  >
+                    <Select
+                      showSearch
+                      optionFilterProp="label"
+                      placeholder="选择账单国家"
+                      options={TEAM_BILLING_COUNTRY_OPTIONS}
+                      onChange={(value) => {
+                        const billingCountry = String(value || DEFAULT_TEAM_BILLING_COUNTRY).trim().toUpperCase()
+                        batchPaymentLinkForm.setFieldValue('billing_country', billingCountry)
+                        setBatchPaymentLinkProfile(null)
+                        setBatchPaymentLinkProfileError('')
+                        const checkoutProxyRegion = String(
+                          batchPaymentLinkForm.getFieldValue('checkout_proxy_region') || '',
+                        ).trim().toUpperCase()
+                        if (!/^[A-Z]{2}$/.test(checkoutProxyRegion)) return
+                        void loadBatchPaymentLinkProfile({
+                          ...buildBatchPaymentLinkParams(batchPaymentLinkForceRefresh),
+                          plan: 'team',
+                          billing_country: billingCountry,
                           checkout_proxy_region: checkoutProxyRegion,
                         })
                       }}

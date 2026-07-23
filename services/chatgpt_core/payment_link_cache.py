@@ -79,6 +79,44 @@ PAYMENT_LINK_GENERATION_PLUS = "plus_checkout"
 PAYMENT_LINK_GENERATION_TEAM = "team_checkout"
 TEAM_DEFAULT_CHECKOUT_UI_MODE = "hosted"
 TEAM_CHECKOUT_UI_MODES = frozenset({"hosted", "custom"})
+TEAM_DEFAULT_BILLING_COUNTRY = "US"
+TEAM_BILLING_COUNTRY_CURRENCIES = {
+    "AT": "EUR",
+    "AU": "AUD",
+    "BE": "EUR",
+    "BR": "BRL",
+    "CA": "CAD",
+    "CH": "CHF",
+    "CZ": "CZK",
+    "DE": "EUR",
+    "DK": "DKK",
+    "ES": "EUR",
+    "FI": "EUR",
+    "FR": "EUR",
+    "GB": "GBP",
+    "HK": "HKD",
+    "ID": "IDR",
+    "IE": "EUR",
+    "IN": "INR",
+    "IT": "EUR",
+    "JP": "JPY",
+    "KR": "KRW",
+    "MX": "MXN",
+    "MY": "MYR",
+    "NL": "EUR",
+    "NO": "NOK",
+    "NZ": "NZD",
+    "PH": "PHP",
+    "PL": "PLN",
+    "PT": "EUR",
+    "SE": "SEK",
+    "SG": "SGD",
+    "TH": "THB",
+    "TR": "TRY",
+    "TW": "TWD",
+    "US": "USD",
+    "VN": "VND",
+}
 PAYMENT_LINK_PLUS_PLAN_ALIASES = frozenset({
     "plus",
     "plus_checkout",
@@ -223,6 +261,29 @@ def normalize_team_checkout_ui_mode(params: dict[str, Any] | None) -> str:
     return TEAM_DEFAULT_CHECKOUT_UI_MODE
 
 
+def normalize_team_billing_country(params: dict[str, Any] | None) -> str:
+    """Normalize the task-owned Team billing country without admin fallback."""
+
+    source = params if isinstance(params, dict) else {}
+    raw_country = source.get("billing_country")
+    if raw_country in (None, ""):
+        raw_country = source.get("billingCountry")
+    country = str(raw_country or "").strip().upper() or TEAM_DEFAULT_BILLING_COUNTRY
+    if country not in TEAM_BILLING_COUNTRY_CURRENCIES:
+        supported = ",".join(TEAM_BILLING_COUNTRY_CURRENCIES)
+        raise ValueError(f"Team billing_country 不受支持: {country or '<empty>'}; supported={supported}")
+    return country
+
+
+def _team_country_and_currency(source: dict[str, Any]) -> tuple[str, str]:
+    raw_country = str(source.get("country") or "").strip().upper()
+    country = raw_country or normalize_team_billing_country(source)
+    currency = str(source.get("currency") or "").strip().upper()
+    if not currency:
+        currency = TEAM_BILLING_COUNTRY_CURRENCIES.get(country) or normalize_checkout_currency(None, country)
+    return country, currency
+
+
 def _team_param_presence(params: dict[str, Any] | None) -> set[str]:
     """Return Team fields explicitly supplied by the caller.
 
@@ -273,8 +334,9 @@ def validate_team_payment_request_params(params: dict[str, Any] | None) -> None:
     checkout_ui_mode = normalize_team_checkout_ui_mode(params)
     if checkout_ui_mode not in TEAM_CHECKOUT_UI_MODES:
         raise ValueError("Team checkout_ui_mode 必须是 hosted 或 custom")
-    # Business fields may inherit the long-link admin profile. Proxy country is
-    # mandatory and checkout mode always has a task-scoped hosted default.
+    normalize_team_billing_country(params)
+    # Business fields may inherit the long-link admin profile. Billing country
+    # and checkout mode have task-scoped defaults; proxy country is mandatory.
     if "workspace_name" in explicit and len(values["workspace_name"]) > 256:
         raise ValueError("Team Workspace 名称不能超过 256 个字符")
     if "price_interval" in explicit and values["price_interval"] not in {"month", "year"}:
@@ -312,8 +374,11 @@ def payment_link_generation_kind(params: dict[str, Any] | None) -> str:
 def payment_link_variant_key(params: dict[str, Any] | None) -> str:
     source = params if isinstance(params, dict) else {}
     plan = normalize_payment_link_plan(source.get("plan"))
-    country = normalize_checkout_country(source.get("country") or source.get("billing_country"))
-    currency = normalize_checkout_currency(source.get("currency"), country)
+    if plan == PAYMENT_LINK_PLAN_TEAM:
+        country, currency = _team_country_and_currency(source)
+    else:
+        country = normalize_checkout_country(source.get("country") or source.get("billing_country"))
+        currency = normalize_checkout_currency(source.get("currency"), country)
     canonical: dict[str, Any] = {
         "generation_kind": payment_link_generation_kind(source),
         "plan": plan,
@@ -600,8 +665,11 @@ def payment_link_url_requires_regeneration(value: Any, link_format: Any = None) 
 def normalize_payment_link_params(params: dict[str, Any] | None) -> dict[str, Any]:
     source = params if isinstance(params, dict) else {}
     plan = normalize_payment_link_plan(source.get("plan"))
-    country = normalize_checkout_country(source.get("country"))
-    currency = normalize_checkout_currency(source.get("currency"), country)
+    if plan == PAYMENT_LINK_PLAN_TEAM:
+        country, currency = _team_country_and_currency(source)
+    else:
+        country = normalize_checkout_country(source.get("country"))
+        currency = normalize_checkout_currency(source.get("currency"), country)
     payment_source = normalize_payment_link_source(source.get("payment_source"))
     payment_link_format = normalize_payment_link_output_format(source.get("payment_link_format"))
     if payment_source in {PAYMENT_SOURCE_LONG_LINK, PAYMENT_SOURCE_LONG_LINK_PAYPAL}:
@@ -661,8 +729,11 @@ def payment_link_cache_matches(
         return False
     expected = normalize_payment_link_params(params)
     cached_plan = normalize_payment_link_plan(cached.get("plan"))
-    cached_country = normalize_checkout_country(cached.get("country"))
-    cached_currency = normalize_checkout_currency(cached.get("currency"), cached_country)
+    if cached_plan == PAYMENT_LINK_PLAN_TEAM:
+        cached_country, cached_currency = _team_country_and_currency(cached)
+    else:
+        cached_country = normalize_checkout_country(cached.get("country"))
+        cached_currency = normalize_checkout_currency(cached.get("currency"), cached_country)
     cached_proxy = normalize_proxy_url(cached.get("proxy")) or ""
     cached_format = normalize_payment_link_output_format(cached.get("payment_link_format") or PAYMENT_LINK_FORMAT_LONG)
     cached_source = normalize_payment_link_source(
@@ -810,19 +881,26 @@ def build_payment_link_cache_payload(
         # reinterpret them as a reusable Team checkout.
         if team_generation_kind != PAYMENT_LINK_GENERATION_TEAM or not team_candidate["workspace_name"]:
             return {}
-    country = normalize_checkout_country(
-        payload_source.get("country")
-        or payload_source.get("chatgpt_checkout_country")
-        or metadata_fallback.get("country")
-        or metadata_fallback.get("chatgpt_checkout_country")
-    )
-    currency = normalize_checkout_currency(
-        payload_source.get("currency")
-        or payload_source.get("chatgpt_checkout_currency")
-        or metadata_fallback.get("currency")
-        or metadata_fallback.get("chatgpt_checkout_currency"),
-        country,
-    )
+    country_source = {
+        "country": (
+            payload_source.get("country")
+            or payload_source.get("chatgpt_checkout_country")
+            or metadata_fallback.get("country")
+            or metadata_fallback.get("chatgpt_checkout_country")
+        ),
+        "billing_country": payload_source.get("billing_country") or metadata_fallback.get("billing_country"),
+        "currency": (
+            payload_source.get("currency")
+            or payload_source.get("chatgpt_checkout_currency")
+            or metadata_fallback.get("currency")
+            or metadata_fallback.get("chatgpt_checkout_currency")
+        ),
+    }
+    if plan == PAYMENT_LINK_PLAN_TEAM:
+        country, currency = _team_country_and_currency(country_source)
+    else:
+        country = normalize_checkout_country(country_source["country"])
+        currency = normalize_checkout_currency(country_source["currency"], country)
 
     inferred_link_type = payment_link_type_from_payload({**fallback_source, **payload_source})
     explicit_link_type = normalize_payment_link_type(
@@ -877,6 +955,7 @@ def build_payment_link_cache_payload(
     }
     payload["generation_kind"] = payment_link_generation_kind({"plan": plan})
     if plan == PAYMENT_LINK_PLAN_TEAM:
+        payload["billing_country"] = country
         team_source = {
             **metadata_fallback,
             **payload_source,
@@ -1033,6 +1112,9 @@ def build_payment_link_cache_payload(
             value = metadata_fallback.get(key)
         if value is not None and value != "":
             payload[key] = value
+
+    if plan == PAYMENT_LINK_PLAN_TEAM:
+        payload["billing_country"] = payload["country"]
 
     # The metadata compatibility loop above must not overwrite a concrete UPI
     # QR provenance with an older Checkout Session marker.

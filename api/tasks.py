@@ -62,6 +62,7 @@ from services.chatgpt_core.payment_link_cache import (
     payment_link_status_label,
     normalize_payment_link_url,
     normalize_payment_link_params,
+    normalize_team_billing_country,
     normalize_team_checkout_proxy_region,
     normalize_team_checkout_ui_mode,
     validate_payment_link_request_params,
@@ -1884,10 +1885,10 @@ def _json_object_from_config(value: Any) -> dict[str, Any]:
 def _filtered_payment_link_request_params(params: dict[str, Any] | None) -> dict[str, Any]:
     """Keep the public task contract while removing local checkout controls.
 
-    Billing country, currency, provider, base proxy and runtime strategy belong
-    to openai-pay-long-link's active admin profile. Team checkout explicitly
-    freezes its proxy country and checkout UI mode so neither can inherit an
-    unrelated payment rail from the upstream admin profile.
+    Provider, base proxy and runtime strategy belong to openai-pay-long-link's
+    active admin profile. Team checkout explicitly freezes billing country,
+    proxy country and checkout UI mode so none can inherit an unrelated payment
+    rail from the upstream admin profile. Currency remains upstream-derived.
     """
 
     source = params if isinstance(params, dict) else {}
@@ -1940,6 +1941,7 @@ def _filtered_payment_link_request_params(params: dict[str, Any] | None) -> dict
             team_data["seat_quantity"] = seats
         if team_data:
             normalized["team_plan_data"] = team_data
+        normalized["billing_country"] = normalize_team_billing_country(source)
         normalized["checkout_proxy_region"] = normalize_team_checkout_proxy_region(source)
         normalized["checkout_ui_mode"] = normalize_team_checkout_ui_mode(source)
 
@@ -2019,8 +2021,24 @@ def _payment_link_params_from_profile(
         })
     else:
         merged["plan"] = "plus"
-    merged["country"] = str(profile.get("country") or profile_detail.get("country") or profile_detail.get("billing_country") or "").strip().upper()
-    merged["currency"] = str(profile.get("currency") or profile_detail.get("currency") or "").strip().upper()
+    profile_country = str(
+        profile.get("country")
+        or profile.get("billing_country")
+        or profile_detail.get("country")
+        or profile_detail.get("billing_country")
+        or ""
+    ).strip().upper()
+    profile_currency = str(profile.get("currency") or profile_detail.get("currency") or "").strip().upper()
+    if merged["plan"] == PAYMENT_LINK_PLAN_TEAM:
+        requested_billing_country = normalize_team_billing_country(merged)
+        if profile_country != requested_billing_country:
+            raise ValueError(
+                "long-link 返回的 Team 账单国家与任务配置不一致: "
+                f"requested={requested_billing_country}, actual={profile_country or '<empty>'}"
+            )
+        merged["billing_country"] = requested_billing_country
+    merged["country"] = profile_country
+    merged["currency"] = profile_currency
     merged["profile_hash"] = str(profile.get("profile_hash") or profile_detail.get("profile_hash") or "").strip()
     merged["generation_kind"] = payment_link_generation_kind(merged)
     merged["variant_key"] = payment_link_variant_key(merged)
@@ -2238,6 +2256,8 @@ def _payment_link_generation_matches_variant(
             "promo_code_digest",
             "cancel_url",
             "plan_name",
+            "country",
+            "currency",
             "checkout_proxy_region",
             "checkout_ui_mode",
         ))
@@ -11400,6 +11420,7 @@ def _run_batch_payment_links(task_id: str, account_ids: list[int]):
                 "payment_link_profile": {
                     "link_type": str(profile.get("link_type") or ""),
                     "country": request_params["country"],
+                    "billing_country": str(request_params.get("billing_country") or request_params["country"]),
                     "currency": request_params["currency"],
                     "profile_hash": profile_hash,
                     "effective_concurrency": int(profile.get("effective_concurrency") or 0),
@@ -11425,6 +11446,7 @@ def _run_batch_payment_links(task_id: str, account_ids: list[int]):
                 f" workspace={team_data.get('workspace_name') or '-'}"
                 f" interval={team_data.get('price_interval') or '-'}"
                 f" seats={team_data.get('seat_quantity') or '-'}"
+                f" billing_country={request_params.get('billing_country') or '-'}"
                 f" proxy_country={request_params.get('checkout_proxy_region') or '-'}"
                 f" checkout_mode={request_params.get('checkout_ui_mode') or '-'}"
                 if is_team_task
