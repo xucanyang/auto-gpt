@@ -140,6 +140,15 @@ class TeamPaymentLinkContractTests(unittest.TestCase):
         })
         self.assertEqual(request_params["country"], "FR")
         self.assertEqual(request_params["currency"], "EUR")
+        conflicting = normalize_payment_link_params({
+            "plan": "team",
+            "billing_country": "ch",
+            "country": "IN",
+            "currency": "INR",
+            "checkout_proxy_region": "CA",
+        })
+        self.assertEqual(conflicting["country"], "CH")
+        self.assertEqual(conflicting["currency"], "CHF")
 
     def test_profile_freeze_preserves_task_billing_country_and_rejects_mismatch(self) -> None:
         request = tasks_api._filtered_payment_link_request_params({

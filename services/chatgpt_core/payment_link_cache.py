@@ -276,11 +276,12 @@ def normalize_team_billing_country(params: dict[str, Any] | None) -> str:
 
 
 def _team_country_and_currency(source: dict[str, Any]) -> tuple[str, str]:
+    raw_billing_country = str(
+        source.get("billing_country") or source.get("billingCountry") or ""
+    ).strip().upper()
     raw_country = str(source.get("country") or "").strip().upper()
-    country = raw_country or normalize_team_billing_country(source)
-    currency = str(source.get("currency") or "").strip().upper()
-    if not currency:
-        currency = TEAM_BILLING_COUNTRY_CURRENCIES.get(country) or normalize_checkout_currency(None, country)
+    country = raw_billing_country or raw_country or normalize_team_billing_country(source)
+    currency = TEAM_BILLING_COUNTRY_CURRENCIES.get(country) or normalize_checkout_currency(None, country)
     return country, currency
 
 

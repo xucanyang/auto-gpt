@@ -13,7 +13,7 @@
 
 ### 优化 (Changed)
 - **Team 不再继承管理页账单配置**：`api/tasks.py` 与 `services/chatgpt_core/plugin.py` 在 Team profile 预览、单账号 action 和批次提交中始终显式传递已校验的 `billing_country`；未传时固定使用 `US`。Auto-GPT 不向 long-link 发送 `currency`，币种继续由 long-link 按账单国家唯一派生，Plus 支付链接仍保持原管理配置合同。
-- **账单国家进入 Team 变体与审计身份**：`payment_link_cache.py`、`long_link_payment_client.py`、`api/actions.py` 与任务历史将实际账单国家、派生币种贯穿 profile 冻结、变体键、缓存匹配、成功历史防重及结果持久化。相同账号与业务参数在不同账单国家下不会互相复用，且上游返回国家与任务选择不一致时会失败关闭。
+- **账单国家进入 Team 变体与审计身份**：`payment_link_cache.py`、`long_link_payment_client.py`、`api/actions.py` 与任务历史将实际账单国家、派生币种贯穿 profile 冻结、变体键、缓存匹配、成功历史防重及结果持久化。相同账号与业务参数在不同账单国家下不会互相复用；即使旧客户端同时提交 `country/currency`，也以任务级账单国家为准；上游返回国家与任务选择不一致时会失败关闭。
 
 ### 测试 (Tests)
 - 扩展 Team 支付、long-link 客户端和账号页合同测试，覆盖默认 `US`、显式国家、非法国家拒绝、国家/币种变体隔离、动态 IP 与账单国家独立、旧 `country/currency` 输入清理、profile/batch 覆盖一致性及历史持久化；前端生产构建、单测与 ESLint 通过，侧栏版本同步更新为 `v2.8.3`。
@@ -2205,4 +2205,8 @@
 
 ## 2026-07-24 02:22:31 +0800
 - 发布 v2.8.3：Team 优惠长链接支持任务级账单国家
+- 发布模式: multi
+
+## 2026-07-24 02:35:43 +0800
+- 补强 v2.8.3：Team 账单国家优先并按国家派生币种
 - 发布模式: multi
