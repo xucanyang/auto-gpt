@@ -6,6 +6,17 @@
 
 ## [Unreleased] (未发布)
 
+## [2.8.10] - 2026-07-24
+
+### 优化 (Changed)
+- **注册默认画像对齐成功 HAR**：共享运行配置将 ChatGPT 邮箱注册默认来源切换为 TempMail 固定域名 `aa8.pl`，动态代理默认出口切换为 `SG`。真实对照中 `HME + JP` 在有头浏览器下仍返回应用层 `registration_disallowed`，而 `aa8.pl + SG` 与新 HAR 的邮箱域名、Auth `country_code_hint=SG` 和 Cloudflare SIN 路由一致。
+
+### 修复 (Fixed)
+- **开户事务固定使用 Xvfb 有头 Chromium**：`ChatGPTClient` 与 `OAuthClient` 的 Auth finalize 只在 `auth.openai.com/about-you` 开户事务中强制有头浏览器；共享 `core/browser_runtime.py` 允许显式 headed 请求覆盖容器级 `PLAYWRIGHT_HEADLESS=1`。修复完整 JSD、`cf_clearance` 与 Sentinel `p/t/c` 均存在时，headless 开户 POST 仍被 Cloudflare 返回 403 challenge 的问题；密码、OTP、OAuth 和其他协议步骤保持原执行模式。
+
+### 测试 (Tests)
+- 新增容器环境变量与显式 headed 优先级、两条开户客户端必须传递 `headless=False` 的回归。真实单账号任务 `task_codex_har_parity_sg_aa8_headed_v289_1784845000109` 已验证 `create_account 200`、OAuth callback 200、AccessToken 入库及任务 `1/1 done`；前端侧栏版本同步更新为 `v2.8.10`。
+
 ## [2.8.9] - 2026-07-24
 
 ### 修复 (Fixed)
@@ -2320,4 +2331,8 @@
 
 ## 2026-07-24 06:06:33 +0800
 - 发布 v2.8.9：Sentinel SDK 改由顶层 Auth 页面调用
+- 发布模式: multi
+
+## 2026-07-24 06:25:58 +0800
+- 发布 v2.8.10：开户固定有头 Chromium 并启用 HAR 验证注册画像
 - 发布模式: multi

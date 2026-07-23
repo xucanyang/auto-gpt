@@ -37,6 +37,12 @@ def resolve_browser_headless(
     default_headless: bool = True,
     override_env_names: Iterable[str] = ("PLAYWRIGHT_HEADLESS", "REGISTER_HEADLESS"),
 ) -> tuple[bool, str]:
+    # A caller that explicitly requires a visible browser must win over the
+    # container-wide headless default. The Docker image runs under Xvfb, and
+    # Auth finalize relies on the headed Chromium surface for Cloudflare JSD.
+    if requested_headless is False:
+        return False, "requested:false"
+
     for env_name in override_env_names:
         override = parse_env_bool(env_name)
         if override is not None:

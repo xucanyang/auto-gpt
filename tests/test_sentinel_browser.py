@@ -1,12 +1,14 @@
 import asyncio
 import contextlib
 import json
+import os
 import sys
 import threading
 import types
 import unittest
 from unittest import mock
 
+from core.browser_runtime import resolve_browser_headless
 from services.chatgpt_core.chatgpt_client import ChatGPTClient
 from services.chatgpt_core.sentinel_browser import (
     BrowserAccountCreateResult,
@@ -21,6 +23,13 @@ from services.chatgpt_core.utils import generate_browser_fingerprint
 
 
 class SentinelBrowserRuntimeTests(unittest.TestCase):
+    def test_explicit_headed_mode_wins_over_container_headless_default(self):
+        with mock.patch.dict(os.environ, {"PLAYWRIGHT_HEADLESS": "1"}):
+            headless, reason = resolve_browser_headless(False)
+
+        self.assertFalse(headless)
+        self.assertEqual(reason, "requested:false")
+
     def test_sync_playwright_helper_runs_directly_without_async_loop(self):
         current_thread = threading.get_ident()
 
@@ -180,6 +189,7 @@ class SentinelBrowserRuntimeTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(state.page_type, "external_url")
         client.session.post.assert_not_called()
+        self.assertFalse(browser_create.call_args.kwargs["headless"])
         exported = browser_create.call_args.kwargs["cookies"]
         login_cookie = next(item for item in exported if item["name"] == "login_session")
         self.assertEqual(login_cookie["domain"], "auth.openai.com")

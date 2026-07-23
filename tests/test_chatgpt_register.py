@@ -1193,6 +1193,7 @@ class OAuthClientBootstrapTests(unittest.TestCase):
             browser_create.call_args.kwargs["page_url"],
             "https://auth.openai.com/about-you",
         )
+        self.assertFalse(browser_create.call_args.kwargs["headless"])
         http_token.assert_not_called()
         client.session.post.assert_not_called()
 

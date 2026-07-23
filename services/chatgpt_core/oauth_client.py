@@ -2245,7 +2245,9 @@ class OAuthClient:
                 birthdate=str(birthdate).strip(),
                 proxy=self.proxy,
                 page_url=referer or f"{self.oauth_issuer}/about-you",
-                headless=self.browser_mode != "headed",
+                # Cloudflare rejects the create_account POST from headless
+                # Chromium even after JSD; keep only this Auth transaction headed.
+                headless=False,
                 device_id=device_id,
                 user_agent=user_agent,
                 sec_ch_ua=sec_ch_ua,

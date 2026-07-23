@@ -959,7 +959,9 @@ class ChatGPTClient:
                 birthdate=birthdate,
                 proxy=self.proxy,
                 page_url=f"{self.AUTH}/about-you",
-                headless=self.browser_mode != "headed",
+                # Cloudflare rejects the create_account POST from headless
+                # Chromium even after JSD; keep only this Auth transaction headed.
+                headless=False,
                 device_id=self.device_id,
                 user_agent=self.ua,
                 sec_ch_ua=self.sec_ch_ua,
