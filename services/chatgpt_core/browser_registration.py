@@ -991,14 +991,17 @@ def _pick_best_about_you_input(entries: list[dict], field: str, exclude_visible_
                 score += 10
             if any(token in hints for token in (" name ", "name", "autocomplete=name", "nombre", "nom", "nome")):
                 score += 3
-            if any(token in hints for token in ("age", "年龄", "edad", "âge", "alter", "idade", "birthday", "birth", "date of birth", "出生", "生日")):
+            if any(token in hints for token in ("age", "年龄", "edad", "âge", "alter", "idade", "umur", "usia", "birthday", "birth", "date of birth", "出生", "生日")):
                 score -= 8
         elif field == "age":
-            if any(token in hints for token in ("age", "年龄", "how old", "edad", "âge", "alter", "idade", "나이")):
+            if any(token in hints for token in ("age", "年龄", "how old", "edad", "âge", "alter", "idade", "umur", "usia", "나이")):
                 score += 10
             if any(token in hints for token in ("full name", "fullname", "全名", "姓名", "nombre completo", "nom complet")):
                 score -= 10
-            if "name" in hints and "age" not in hints and "年龄" not in hints and "edad" not in hints:
+            if (
+                "name" in hints
+                and not any(token in hints for token in ("age", "年龄", "edad", "umur", "usia"))
+            ):
                 score -= 6
             if any(token in hints for token in ("birthday", "birth", "date of birth", "出生", "生日", "fecha de nacimiento", "nascimento")):
                 score -= 3
@@ -1052,9 +1055,9 @@ def _derive_registration_state_from_page(page) -> dict:
                   });
                   const hasAgeOrBirth = inputs.some((el) => {
                     const hint = `${el.name || ''} ${el.id || ''} ${el.placeholder || ''}`.toLowerCase();
-                    return hint.includes('age') || hint.includes('birth') || hint.includes('birthday') || hint.includes('年龄') || hint.includes('生日');
+                    return hint.includes('age') || hint.includes('birth') || hint.includes('birthday') || hint.includes('年龄') || hint.includes('生日') || hint.includes('umur') || hint.includes('usia');
                   });
-                  return (hasName && hasAgeOrBirth) || text.includes('about you');
+              return (hasName && hasAgeOrBirth) || text.includes('about you');
                 }
                 """
             )
@@ -3708,9 +3711,9 @@ def _submit_about_you_via_page(
         age_years = random.randint(25, 35)
 
     age_candidates = [
-        page.get_by_label(re.compile(r"age", re.IGNORECASE)),
+        page.get_by_label(re.compile(r"age|umur|usia", re.IGNORECASE)),
         page.get_by_label(re.compile(r"年龄", re.IGNORECASE)),
-        page.get_by_role("textbox", name=re.compile(r"age", re.IGNORECASE)),
+        page.get_by_role("textbox", name=re.compile(r"age|umur|usia", re.IGNORECASE)),
         page.get_by_role("textbox", name=re.compile(r"年龄", re.IGNORECASE)),
         page.locator("input[name*='age' i]"),
         page.locator("input[id*='age' i]"),
@@ -3745,7 +3748,7 @@ def _submit_about_you_via_page(
                 .map((n) => String(n.textContent || '').trim().toLowerCase())
                 .filter(Boolean);
               const allText = labels.concat(placeholders).concat(headings);
-              const hasAge = allText.some((t) => t === 'age' || t === 'edad' || t === 'âge' || t === 'alter' || t === 'idade' || t.includes('how old') || t.includes('年龄') || t.includes('나이'));
+              const hasAge = allText.some((t) => t === 'age' || t === 'edad' || t === 'âge' || t === 'alter' || t === 'idade' || t === 'umur' || t === 'usia' || t.includes('how old') || t.includes('年龄') || t.includes('나이'));
               const hasBirthday = allText.some((t) =>
                 t.includes('birthday') || t.includes('date of birth') || t.includes('birth') || t.includes('生日') || t.includes('出生') || t.includes('fecha de nacimiento') || t.includes('nascimento') || t.includes('geburtstag') || t.includes('naissance')
               );
@@ -3758,8 +3761,8 @@ def _submit_about_you_via_page(
 
     has_age_label = bool(mode_probe.get("hasAge"))
     has_birthday_label = bool(mode_probe.get("hasBirthday"))
-    has_age_field = any(_has_visible(candidate) for candidate in age_candidates[:3])
-    has_birthday_field = any(_has_visible(candidate) for candidate in birthday_candidates[:3])
+    has_age_field = any(_has_visible(candidate) for candidate in age_candidates)
+    has_birthday_field = any(_has_visible(candidate) for candidate in birthday_candidates)
     has_birthday_select = False
     try:
         has_birthday_select = page.locator("select:visible").count() >= 2
@@ -3788,6 +3791,8 @@ def _submit_about_you_via_page(
             'input[placeholder="Age"]',
             'input[placeholder="age"]',
             'input[placeholder*="年龄"]',
+            'input[placeholder*="umur" i]',
+            'input[placeholder*="usia" i]',
             'input[id*="age" i]',
         ]
     )
