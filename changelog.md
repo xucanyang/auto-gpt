@@ -15,6 +15,7 @@
 - **保持协议与浏览器资料一致**：后备链路沿用协议阶段生成的完整姓名和生日；独立浏览器入口也不再发送只有一个词的姓名，避免 Auth API 以资料不完整返回 400。
 - **修复本地化 about_you 年龄识别**：补充马来/印尼页面的 `umur/usia` 标签，并扩大 `input[name=age]` 探测范围，避免地区画像切换后只填生日而漏掉必填年龄。
 - **修复浏览器回调导航顺序**：`external_url` 状态不再被提前当成 ChatGPT 完成页，必须先跟随 `continue_url` 落地到真实 callback/home 后才结束注册阶段。
+- **补齐浏览器注册后的 Token 提取**：当 Camoufox 已落地 ChatGPT callback/home 但 NextAuth session cookie 尚未写入时，复用现有 `OAuthClient` 的强制密码登录/完整 OAuth 逻辑获取 AT/RT，不再重做邮箱注册或误判为已有账号。
 
 ### 测试 (Tests)
 - 新增浏览器后备状态恢复、OTP callback 时间/排除参数、API 成功但 URL 不变及错误响应回归；前端侧栏版本同步更新为 `v2.8.18`。
@@ -2472,4 +2473,8 @@
 
 ## 2026-07-24 13:49:13 +0800
 - 修复 external_url 回调必须先导航再判定注册完成
+- 发布模式: multi
+
+## 2026-07-24 13:53:56 +0800
+- 补齐浏览器注册完成后的 OAuth Token 提取兜底
 - 发布模式: multi

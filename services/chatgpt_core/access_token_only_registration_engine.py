@@ -741,6 +741,67 @@ class AccessTokenOnlyRegistrationEngine:
         )
         return True, "registration complete via browser fallback"
 
+    def _recover_tokens_after_browser_registration(
+        self,
+        *,
+        chatgpt_client: ChatGPTClient,
+        email_addr: str,
+        password: str,
+        first_name: str,
+        last_name: str,
+        birthdate: str,
+        skymail_adapter: EmailServiceAdapter,
+    ) -> tuple[bool, dict[str, Any] | str]:
+        """Extract AT/RT through the existing OAuth client after browser signup.
+
+        The signup callback can land on ChatGPT without a NextAuth session cookie
+        (for example when the callback is consumed by a SPA navigation). The
+        account is already created at that point; restarting the mailbox flow is
+        wasteful and can consume a second OTP. Reuse the established login OAuth
+        implementation with a forced password route instead.
+        """
+        try:
+            from services.chatgpt_core.oauth_client import OAuthClient
+
+            oauth_client = OAuthClient(
+                self.extra_config,
+                proxy=self.proxy_url,
+                verbose=False,
+                browser_mode=self.browser_mode,
+            )
+            oauth_client._log = lambda message: self._log(f"[注册后 OAuth] {message}")
+            tokens = oauth_client.login_and_get_tokens(
+                email_addr,
+                password,
+                device_id=str(getattr(chatgpt_client, "device_id", "") or ""),
+                user_agent=getattr(chatgpt_client, "ua", None),
+                sec_ch_ua=getattr(chatgpt_client, "sec_ch_ua", None),
+                impersonate=getattr(chatgpt_client, "impersonate", None),
+                browser_fingerprint=getattr(chatgpt_client, "fingerprint", None),
+                skymail_client=skymail_adapter,
+                prefer_passwordless_login=False,
+                allow_phone_verification=False,
+                force_new_browser=True,
+                force_chatgpt_entry=False,
+                screen_hint="login",
+                force_password_login=True,
+                complete_about_you_if_needed=True,
+                first_name=first_name,
+                last_name=last_name,
+                birthdate=birthdate,
+                login_source="access_token_only:browser_registration_token_recovery",
+                allow_add_phone_session_recovery=False,
+            )
+        except Exception as exc:
+            self._log(f"浏览器注册后 OAuth Token 提取异常: {exc}", "warning")
+            return False, str(exc)
+        if not tokens:
+            error = str(getattr(oauth_client, "last_error", "") or "浏览器注册后 OAuth 未返回 Token")
+            self._log(f"浏览器注册后 OAuth Token 提取失败: {error}", "warning")
+            return False, error
+        self._log("浏览器注册后 OAuth Token 提取成功")
+        return True, dict(tokens)
+
     def _finalize_email_service_success(self, result: RegistrationResult) -> None:
         finalize = getattr(self.email_service, "finalize_success", None)
         if not callable(finalize):
@@ -1237,6 +1298,24 @@ class AccessTokenOnlyRegistrationEngine:
                         else:
                             self._log("步骤 2/2: 复用注册会话，直接获取 ChatGPT Session / AccessToken...")
                             session_ok, session_result = chatgpt_client.reuse_session_and_get_tokens()
+                            if (
+                                not session_ok
+                                and str(getattr(chatgpt_client, "registration_transport", "") or "")
+                                == "camoufox_browser_fallback"
+                            ):
+                                self._log(
+                                    "浏览器注册已完成但 Session Cookie 不完整，切换现有 OAuth Token 提取链路",
+                                    "warning",
+                                )
+                                session_ok, session_result = self._recover_tokens_after_browser_registration(
+                                    chatgpt_client=chatgpt_client,
+                                    email_addr=email_addr,
+                                    password=pwd,
+                                    first_name=first_name,
+                                    last_name=last_name,
+                                    birthdate=birthdate,
+                                    skymail_adapter=skymail_adapter,
+                                )
 
                     if session_ok:
                         self._log("Token 提取完成！")
