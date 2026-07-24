@@ -2246,6 +2246,28 @@ class OAuthClient:
         impersonate=None,
         referer=None,
     ):
+        # 对齐 any-auto：create_account 前推进 client_auth_session_dump
+        dump_url = f"{self.oauth_issuer}/api/accounts/client_auth_session_dump"
+        try:
+            dump_headers = self._headers(
+                dump_url,
+                user_agent=user_agent,
+                sec_ch_ua=sec_ch_ua,
+                accept="application/json",
+                referer=f"{self.oauth_issuer}/email-verification",
+                fetch_site="same-origin",
+                extra_headers={"oai-device-id": device_id},
+            )
+            dump_kwargs = {"headers": dump_headers, "timeout": 20}
+            if impersonate:
+                dump_kwargs["impersonate"] = impersonate
+            dump_resp = self.session.get(dump_url, **dump_kwargs)
+            self._log(
+                f"client_auth_session_dump 状态: {getattr(dump_resp, 'status_code', 0)}"
+            )
+        except Exception as dump_exc:
+            self._log(f"client_auth_session_dump 异常: {dump_exc}")
+
         sentinel_token = build_sentinel_token(
             self.session,
             device_id,
@@ -2278,8 +2300,13 @@ class OAuthClient:
         )
         headers.update(generate_datadog_trace())
         try:
+            import json as _json
+
             kwargs = {
-                "json": {"name": full_name, "birthdate": str(birthdate).strip()},
+                "data": _json.dumps(
+                    {"name": full_name, "birthdate": str(birthdate).strip()},
+                    separators=(",", ":"),
+                ),
                 "headers": headers,
                 "timeout": 30,
                 "allow_redirects": False,

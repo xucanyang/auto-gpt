@@ -1,5 +1,9 @@
 """
 Sentinel Token 生成器模块（纯 Python 方案）。
+
+协议路径对齐 any-auto-register：
+- PoW 用纯 Python FNV
+- turnstile ``t`` 用 sentinel_vm 解 dx（不再固定空串）
 """
 
 import base64
@@ -7,6 +11,8 @@ import json
 import random
 import time
 import uuid
+
+from .sentinel_constants import DEFAULT_SENTINEL_SDK_URL
 
 
 SENTINEL_REQ_URL = "https://sentinel.openai.com/backend-api/sentinel/req"
@@ -98,7 +104,7 @@ class SentinelTokenGenerator:
         js_heap_limit = 4294705152
         nav_random1 = random.random()
         ua = self.user_agent
-        script_src = "https://sentinel.openai.com/sentinel/20260124ceb8/sdk.js"
+        script_src = DEFAULT_SENTINEL_SDK_URL
         script_version = None
         data_build = None
         language = "en-US"
@@ -234,9 +240,11 @@ def fetch_sentinel_challenge(
     impersonate=None,
     request_p=None,
 ):
+    """请求 sentinel/req。返回 (challenge_dict, request_p) 或 (None, request_p)。"""
     generator = SentinelTokenGenerator(device_id=device_id, user_agent=user_agent)
+    sent_p = str(request_p or "").strip() or generator.generate_requirements_token()
     req_body = {
-        "p": str(request_p or "").strip() or generator.generate_requirements_token(),
+        "p": sent_p,
         "id": device_id,
         "flow": flow,
     }
@@ -261,10 +269,39 @@ def fetch_sentinel_challenge(
     try:
         response = session.post(SENTINEL_REQ_URL, **kwargs)
         if response.status_code == 200:
-            return response.json()
+            data = response.json()
+            if isinstance(data, dict):
+                return data, sent_p
     except Exception:
-        return None
-    return None
+        return None, sent_p
+    return None, sent_p
+
+
+def _solve_turnstile_t(
+    *,
+    challenge: dict,
+    request_p: str,
+    user_agent: str | None,
+) -> str:
+    """对齐 any-auto：用请求时的 requirements p 作为 dx 的 XOR key。"""
+    turnstile = challenge.get("turnstile") or {}
+    dx_b64 = str(turnstile.get("dx") or "").strip()
+    if not dx_b64 or not str(request_p or "").strip():
+        return ""
+    try:
+        from .sentinel_vm import solve_turnstile_dx
+
+        return str(
+            solve_turnstile_dx(
+                dx_b64,
+                str(request_p),
+                user_agent=user_agent or "",
+                sdk_url=DEFAULT_SENTINEL_SDK_URL,
+            )
+            or ""
+        )
+    except Exception:
+        return ""
 
 
 def _build_sentinel_token_python(
@@ -276,7 +313,7 @@ def _build_sentinel_token_python(
     sec_ch_ua=None,
     impersonate=None,
 ):
-    challenge = fetch_sentinel_challenge(
+    challenge, request_p = fetch_sentinel_challenge(
         session,
         device_id,
         flow=flow,
@@ -293,22 +330,30 @@ def _build_sentinel_token_python(
 
     generator = SentinelTokenGenerator(device_id=device_id, user_agent=user_agent)
     pow_data = challenge.get("proofofwork") or {}
+    # any-auto: turnstile 用初始 requirements p；PoW 成功后 p 换成 gAAAAAB...
     if pow_data.get("required") and pow_data.get("seed"):
         p_value = generator.generate_token(
             seed=pow_data.get("seed"),
             difficulty=pow_data.get("difficulty", "0"),
         )
     else:
-        p_value = generator.generate_requirements_token()
+        p_value = request_p or generator.generate_requirements_token()
+
+    t_value = _solve_turnstile_t(
+        challenge=challenge,
+        request_p=request_p,
+        user_agent=user_agent,
+    )
 
     return json.dumps(
         {
             "p": p_value,
-            "t": "",
+            "t": t_value,
             "c": c_value,
             "id": device_id,
             "flow": flow,
-        }
+        },
+        separators=(",", ":"),
     )
 
 
@@ -320,7 +365,7 @@ def build_sentinel_token(
     sec_ch_ua=None,
     impersonate=None,
 ):
-    """默认 Sentinel token 构造：纯 Python。"""
+    """默认 Sentinel token 构造：PoW + 可选 turnstile VM（any-auto 对齐）。"""
     return _build_sentinel_token_python(
         session,
         device_id,
@@ -340,7 +385,7 @@ def build_sentinel_token_vm_only(
     impersonate=None,
 ):
     """
-    VM 分支专用构造器（命名保持不变，内部使用纯 Python）。
+    与 build_sentinel_token 相同：协议路径统一走 PoW + VM turnstile。
     """
     return _build_sentinel_token_python(
         session,

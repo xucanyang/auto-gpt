@@ -618,7 +618,9 @@ emit({"type": "result", "value": {"status_code": 200}})
             "page": {"type": "external_url"},
             "continue_url": "https://chatgpt.com/api/auth/callback/openai?code=demo",
         }
+        dump_response = mock.Mock(status_code=200)
         client.session.post = mock.Mock(return_value=response)
+        client.session.get = mock.Mock(return_value=dump_response)
 
         with mock.patch.object(
             client,
@@ -638,6 +640,10 @@ emit({"type": "result", "value": {"status_code": 200}})
         self.assertTrue(ok)
         self.assertEqual(state.page_type, "external_url")
         client.session.post.assert_called_once()
+        # any-auto 对齐：create 前先 client_auth_session_dump
+        self.assertTrue(client.session.get.called)
+        dump_url = str(client.session.get.call_args.args[0])
+        self.assertIn("client_auth_session_dump", dump_url)
         browser_create.assert_not_called()
 
     def test_registration_stops_before_post_when_browser_token_is_missing(self):

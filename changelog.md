@@ -6,6 +6,16 @@
 
 ## [Unreleased] (未发布)
 
+## [2.8.29] - 2026-07-25
+
+### 修复 (Fixed)
+- **协议注册对齐 any-auto-register 的 create_account 成功路径**：`services/chatgpt_core/sentinel_token.py` 引入 `sentinel_vm.py`（自 any-auto 移植），在协议 Sentinel 拿到 `turnstile.dx` 时用 VM 解出真实 `t`，不再固定空串提交 `oauth_create_account` / `username_password_create`。
+- **create_account 前补 `client_auth_session_dump`**：`ChatGPTClient._create_account_via_protocol` 与 `OAuthClient._submit_about_you_create_account_via_protocol` 在开户 POST 前推进 auth 状态机，请求体改为与 any-auto 一致的紧凑 JSON。
+- **协议状态机补齐 signup continue + 密码页预热**：authorize 后若未进入密码/OTP/about_you，显式 `authorize/continue`（`screen_hint=signup`）；密码提交前预加载 `/create-account/password` 并刷新 Sentinel，减少直接落到 `email-verification` 跳过密码段、随后 `registration_disallowed` 的情况。
+
+### 测试 (Tests)
+- 新增 `tests/test_sentinel_protocol_vm.py`，覆盖 turnstile `t` 填充与无 dx 回退；扩展 `test_protocol_create_account` 断言 `client_auth_session_dump`。侧栏版本同步为 `v2.8.29`。
+
 ## [2.8.28] - 2026-07-25
 
 ### 变更 (Changed)
@@ -2644,4 +2654,8 @@
 
 ## 2026-07-25 06:44:47 +0800
 - 撤销 v2.8.27，恢复 v2.8.26 注册代码 v2.8.28
+- 发布模式: multi
+
+## 2026-07-25 07:07:41 +0800
+- 协议注册对齐 any-auto：Sentinel VM 解 t + client_auth_session_dump + signup continue
 - 发布模式: multi

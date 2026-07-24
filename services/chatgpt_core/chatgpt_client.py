@@ -3,6 +3,7 @@ ChatGPT 注册客户端模块
 使用 curl_cffi 模拟浏览器行为
 """
 
+import json
 import time
 import uuid
 from urllib.parse import urlparse
@@ -814,6 +815,77 @@ class ChatGPTClient:
         )
         return ok
 
+    def _load_create_account_password_page(self) -> bool:
+        """对齐 any-auto：预加载密码页，拿页面阶段 cookie。"""
+        url = f"{self.AUTH}/create-account/password"
+        try:
+            r = self.session.get(
+                url,
+                headers=self._headers(
+                    url,
+                    accept="text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    referer=f"{self.BASE}/",
+                    navigation=True,
+                ),
+                timeout=20,
+            )
+            status = int(getattr(r, "status_code", 0) or 0)
+            self._log(f"加载密码页状态: {status}")
+            return status == 200
+        except Exception as exc:
+            self._log(f"加载密码页失败: {exc}")
+            return False
+
+    def _submit_signup_continue(self, email: str) -> tuple[bool, FlowState | str]:
+        """对齐 any-auto：authorize/continue + screen_hint=signup 建立注册会话。"""
+        url = f"{self.AUTH}/api/accounts/authorize/continue"
+        sentinel_token = self._get_sentinel_token(
+            "authorize_continue",
+            page_url=f"{self.AUTH}/create-account",
+        )
+        headers = self._headers(
+            url,
+            accept="application/json",
+            referer=f"{self.AUTH}/create-account",
+            origin=self.AUTH,
+            content_type="application/json",
+            fetch_site="same-origin",
+            extra_headers={"oai-device-id": self.device_id},
+        )
+        if sentinel_token:
+            headers["openai-sentinel-token"] = sentinel_token
+            try:
+                parsed = json.loads(sentinel_token)
+                self._log(
+                    "authorize_continue Sentinel: "
+                    f"turnstile={'yes' if str((parsed or {}).get('t') or '').strip() else 'no'}"
+                )
+            except Exception:
+                pass
+        headers.update(generate_datadog_trace())
+        body = json.dumps(
+            {
+                "username": {"value": str(email or "").strip(), "kind": "email"},
+                "screen_hint": "signup",
+            },
+            separators=(",", ":"),
+        )
+        try:
+            r = self.session.post(url, data=body, headers=headers, timeout=30)
+            status = int(getattr(r, "status_code", 0) or 0)
+            self._log(f"提交注册表单状态: {status}")
+            if status != 200:
+                return False, f"HTTP {status}: {(getattr(r, 'text', '') or '')[:200]}"
+            try:
+                data = r.json() or {}
+            except Exception:
+                data = {}
+            state = self._state_from_payload(data, current_url=str(getattr(r, "url", "") or url))
+            self._log(f"注册表单响应 {describe_flow_state(state)}")
+            return True, state
+        except Exception as exc:
+            return False, str(exc)
+
     def register_user(self, email, password):
         """
         注册用户（邮箱 + 密码）
@@ -823,6 +895,9 @@ class ChatGPTClient:
         """
         self._log(f"注册用户: {email}")
         url = f"{self.AUTH}/api/accounts/user/register"
+
+        # any-auto: 每次密码提交前预热密码页并刷新 Sentinel
+        self._load_create_account_password_page()
 
         headers = self._headers(
             url,
@@ -840,32 +915,59 @@ class ChatGPTClient:
             page_url=f"{self.AUTH}/create-account/password",
         )
         if not sentinel_token:
-            detail = (
-                "sentinel_browser_unavailable: "
-                "username_password_create 未获得完整 Sentinel 浏览器令牌"
-            )
+            if self.browser_mode == "protocol":
+                detail = (
+                    "sentinel_protocol_unavailable: "
+                    "username_password_create 未获得协议 Sentinel token"
+                )
+            else:
+                detail = (
+                    "sentinel_browser_unavailable: "
+                    "username_password_create 未获得完整 Sentinel 浏览器令牌"
+                )
             self._log(f"注册失败: {detail}")
             return False, detail
         headers["openai-sentinel-token"] = sentinel_token
+        try:
+            parsed = json.loads(sentinel_token)
+            self._log(
+                "密码阶段 Sentinel: flow=username_password_create "
+                f"turnstile={'yes' if str((parsed or {}).get('t') or '').strip() else 'no'}"
+            )
+        except Exception:
+            pass
 
         payload = {
-            "username": email,
             "password": password,
+            "username": email,
         }
 
         try:
             self._browser_pause()
-            r = self.session.post(url, json=payload, headers=headers, timeout=30)
+            r = self.session.post(
+                url,
+                data=json.dumps(payload, separators=(",", ":")),
+                headers=headers,
+                timeout=30,
+            )
 
             if r.status_code == 200:
-                data = r.json()
-                self._log("注册成功")
+                try:
+                    data = r.json() or {}
+                except Exception:
+                    data = {}
+                page_type = ""
+                if isinstance(data, dict):
+                    page = data.get("page") or {}
+                    if isinstance(page, dict):
+                        page_type = str(page.get("type") or "").strip()
+                self._log(f"注册成功 page_type={page_type or '-'}")
                 return True, "注册成功"
             else:
                 try:
                     error_data = r.json()
                     error_msg = error_data.get("error", {}).get("message", r.text[:200])
-                except:
+                except Exception:
                     error_msg = r.text[:200]
                 self._log(f"注册失败: {r.status_code} - {error_msg}")
                 return False, f"HTTP {r.status_code}: {error_msg}"
@@ -978,6 +1080,27 @@ class ChatGPTClient:
             self._log(f"验证异常: {e}")
             return False, str(e)
 
+    def _client_auth_session_dump(self, *, referer: str | None = None) -> None:
+        """对齐 any-auto：create_account 前推进 auth 状态机。"""
+        dump_url = f"{self.AUTH}/api/accounts/client_auth_session_dump"
+        try:
+            dump_resp = self.session.get(
+                dump_url,
+                headers=self._headers(
+                    dump_url,
+                    accept="application/json",
+                    referer=referer or f"{self.AUTH}/email-verification",
+                    fetch_site="same-origin",
+                    extra_headers={"oai-device-id": self.device_id},
+                ),
+                timeout=20,
+            )
+            self._log(
+                f"client_auth_session_dump 状态: {getattr(dump_resp, 'status_code', 0)}"
+            )
+        except Exception as exc:
+            self._log(f"client_auth_session_dump 异常: {exc}")
+
     def _create_account_via_protocol(
         self,
         first_name,
@@ -986,8 +1109,13 @@ class ChatGPTClient:
         *,
         return_state=False,
     ):
-        name = f"{first_name} {last_name}"
+        name = f"{str(first_name or '').strip()} {str(last_name or '').strip()}".strip()
+        birthdate = str(birthdate or "").strip()
         url = f"{self.AUTH}/api/accounts/create_account"
+
+        # any-auto-register: dump 后再取 oauth_create_account Sentinel 并 POST
+        self._client_auth_session_dump(referer=f"{self.AUTH}/email-verification")
+
         sentinel_token = self._get_sentinel_token(
             "oauth_create_account",
             page_url=f"{self.AUTH}/about-you",
@@ -999,6 +1127,16 @@ class ChatGPTClient:
             )
             self._log(f"create_account: {detail}")
             return False, detail
+
+        try:
+            parsed_sentinel = json.loads(sentinel_token)
+            t_present = bool(str((parsed_sentinel or {}).get("t") or "").strip())
+            self._log(
+                f"create_account Sentinel: flow=oauth_create_account "
+                f"turnstile={'yes' if t_present else 'no'}"
+            )
+        except Exception:
+            pass
 
         headers = self._headers(
             url,
@@ -1014,7 +1152,11 @@ class ChatGPTClient:
         try:
             r = self.session.post(
                 url,
-                json={"name": name, "birthdate": birthdate},
+                # 与 any-auto 一致：紧凑 JSON body
+                data=json.dumps(
+                    {"name": name, "birthdate": birthdate},
+                    separators=(",", ":"),
+                ),
                 headers=headers,
                 timeout=30,
             )
@@ -1257,6 +1399,31 @@ class ChatGPTClient:
 
         state = self._state_from_url(final_url)
         self._log(f"注册状态起点: {describe_flow_state(state)}")
+
+        # 对齐 any-auto-register 协议流：authorize 后显式 authorize/continue(signup)，
+        # 避免 login_or_signup 直接落到 email-verification 而跳过密码段。
+        if self.browser_mode == "protocol" and not (
+            self._state_is_password_registration(state)
+            or self._state_is_email_otp(state)
+            or self._state_is_about_you(state)
+            or self._state_is_existing_account_login_route(state)
+        ):
+            self._log("协议模式：提交 authorize/continue signup（any-auto 对齐）...")
+            signup_ok, signup_state = self._submit_signup_continue(email)
+            if signup_ok and isinstance(signup_state, FlowState):
+                state = signup_state
+                self._log(f"signup continue 后状态: {describe_flow_state(state)}")
+            elif not signup_ok:
+                self._log(f"signup continue 未成功，保留 authorize 状态: {signup_state}")
+            # 若仍未知，强制进入密码注册页（any-auto 新号路径）
+            if (
+                (not self._state_is_password_registration(state))
+                and (not self._state_is_email_otp(state))
+                and (not self._state_is_about_you(state))
+                and (not self._state_is_existing_account_login_route(state))
+            ):
+                state = self._state_from_url(f"{self.AUTH}/create-account/password")
+                self._log(f"协议模式回退密码注册起点: {describe_flow_state(state)}")
 
         register_submitted = False
         otp_verified = False
