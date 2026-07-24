@@ -111,6 +111,26 @@ def main() -> int:
                         f"browser_registration_failed: {type(exc).__name__}: {exc}"
                     )[:1000]
                 }
+        elif operation == "browser_oauth_token_recovery":
+            from services.chatgpt_core.browser_registration import (
+                run_browser_oauth_token_recovery_sync,
+            )
+
+            try:
+                value = run_browser_oauth_token_recovery_sync(
+                    **payload,
+                    otp_callback=lambda callback_payload=None: request_callback(
+                        "otp", dict(callback_payload or {})
+                    ),
+                    log_fn=logger,
+                )
+            except Exception as exc:
+                value = {
+                    "error": (
+                        "browser_oauth_token_recovery_failed: "
+                        f"{type(exc).__name__}: {exc}"
+                    )[:1000]
+                }
         else:
             raise ValueError(f"unsupported browser worker operation: {operation}")
 

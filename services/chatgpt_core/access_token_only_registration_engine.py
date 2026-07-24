@@ -25,8 +25,10 @@ from .task_logging import classify_task_log_level
 from .utils import FlowState, generate_random_name, generate_random_birthday
 from .account_fingerprint import build_browser_fingerprint_payload, fingerprint_signature
 from .sentinel_browser import (
+    BrowserOAuthTokenRecoveryResult,
     export_session_cookies_for_playwright,
     merge_playwright_cookies_into_session,
+    run_browser_oauth_token_recovery,
     run_browser_registration_stage,
 )
 
@@ -752,14 +754,16 @@ class AccessTokenOnlyRegistrationEngine:
         birthdate: str,
         skymail_adapter: EmailServiceAdapter,
     ) -> tuple[bool, dict[str, Any] | str]:
-        """Extract AT/RT through the existing OAuth client after browser signup.
+        """Extract AT/RT after browser signup without restarting registration.
 
-        The signup callback can land on ChatGPT without a NextAuth session cookie
-        (for example when the callback is consumed by a SPA navigation). The
-        account is already created at that point; restarting the mailbox flow is
-        wasteful and can consume a second OTP. Reuse the established login OAuth
-        implementation with a forced password route instead.
+        The normal HTTP OAuth client remains the first attempt. When it reaches
+        the post-login ``add_phone`` wall (or loses the callback/session), use a
+        fresh Camoufox Codex OAuth transaction. That mirrors any-auto-register's
+        proven recovery: revisit the original authorization URL in a new browser
+        so OpenAI can issue the callback without forcing a phone bind.
         """
+        oauth_client = None
+        http_error = ""
         try:
             from services.chatgpt_core.oauth_client import OAuthClient
 
@@ -793,14 +797,122 @@ class AccessTokenOnlyRegistrationEngine:
                 allow_add_phone_session_recovery=False,
             )
         except Exception as exc:
-            self._log(f"浏览器注册后 OAuth Token 提取异常: {exc}", "warning")
-            return False, str(exc)
-        if not tokens:
-            error = str(getattr(oauth_client, "last_error", "") or "浏览器注册后 OAuth 未返回 Token")
-            self._log(f"浏览器注册后 OAuth Token 提取失败: {error}", "warning")
-            return False, error
-        self._log("浏览器注册后 OAuth Token 提取成功")
-        return True, dict(tokens)
+            http_error = str(exc or "浏览器注册后 OAuth 异常")
+            self._log(f"浏览器注册后 OAuth Token 提取异常: {http_error}", "warning")
+        else:
+            if tokens:
+                self._log("浏览器注册后 OAuth Token 提取成功")
+                return True, dict(tokens)
+            http_error = str(
+                getattr(oauth_client, "last_error", "")
+                or "浏览器注册后 OAuth 未返回 Token"
+            )
+            self._log(
+                f"浏览器注册后 OAuth Token 提取失败: {http_error}",
+                "warning",
+            )
+
+        browser_recovery_enabled = self._parse_bool_default(
+            self.extra_config.get("chatgpt_browser_oauth_token_recovery_enabled"),
+            default=True,
+        )
+        lowered_error = str(http_error or "").strip().lower()
+        browser_recovery_markers = (
+            "add_phone",
+            "add-phone",
+            "callback",
+            "workspace",
+            "session",
+            "oauth",
+        )
+        if not browser_recovery_enabled or not any(
+            marker in lowered_error for marker in browser_recovery_markers
+        ):
+            return False, http_error
+
+        otp_timeout = self._read_int_config(
+            "chatgpt_browser_oauth_otp_wait_seconds",
+            fallback_keys=("chatgpt_otp_wait_seconds",),
+            default=120,
+            minimum=30,
+            maximum=3600,
+        )
+
+        def _wait_for_browser_oauth_otp(request_payload: dict | None = None) -> str:
+            request = dict(request_payload or {})
+            sent_at = request.get("otp_sent_at")
+            try:
+                sent_at = float(sent_at) if sent_at is not None else None
+            except (TypeError, ValueError):
+                sent_at = None
+            exclude_codes = skymail_adapter.used_codes_for_phases(
+                "register_email_otp",
+                "browser_register_email_otp",
+                "oauth_email_otp",
+                "browser_oauth_email_otp",
+            )
+            return str(
+                skymail_adapter.wait_for_verification_code(
+                    email_addr,
+                    timeout=otp_timeout,
+                    otp_sent_at=sent_at,
+                    exclude_codes=exclude_codes,
+                    phase="browser_oauth_email_otp",
+                    phase_label="浏览器 OAuth 邮箱验证码",
+                )
+                or ""
+            ).strip()
+
+        hard_timeout_seconds = self._read_int_config(
+            "chatgpt_browser_oauth_hard_timeout_seconds",
+            default=420,
+            minimum=120,
+            maximum=600,
+        )
+        self._log(
+            "浏览器注册后 HTTP OAuth 未完成，切换 any-auto-register 同源的独立 "
+            "Camoufox OAuth recovery"
+        )
+        try:
+            browser_result = run_browser_oauth_token_recovery(
+                email=email_addr,
+                password=password,
+                otp_callback=_wait_for_browser_oauth_otp,
+                proxy=self.proxy_url,
+                device_id=str(getattr(chatgpt_client, "device_id", "") or ""),
+                headless=self.browser_mode != "headed",
+                stop_check=getattr(chatgpt_client, "_check_stop", None),
+                hard_timeout_seconds=hard_timeout_seconds,
+                log_fn=lambda message: self._log(f"[浏览器 OAuth] {message}"),
+            )
+        except Exception as exc:
+            browser_error = str(exc or "浏览器 OAuth recovery 异常")
+            self._log(f"浏览器 OAuth recovery 异常: {browser_error}", "warning")
+            return False, f"{http_error}; {browser_error}"
+
+        if isinstance(browser_result, BrowserOAuthTokenRecoveryResult):
+            if browser_result.ok:
+                self._log("浏览器注册后 OAuth Token 提取成功")
+                return True, dict(browser_result.tokens)
+            browser_error = str(browser_result.error or "浏览器 OAuth recovery 未返回 Token")
+        elif isinstance(browser_result, dict):
+            browser_error = str(browser_result.get("error") or "")
+            browser_tokens = {
+                key: value
+                for key, value in browser_result.items()
+                if key != "error"
+            }
+            if (
+                str(browser_tokens.get("access_token") or "").strip()
+                and str(browser_tokens.get("refresh_token") or "").strip()
+            ):
+                self._log("浏览器注册后 OAuth Token 提取成功")
+                return True, browser_tokens
+            browser_error = browser_error or "浏览器 OAuth recovery 未返回 Token"
+        else:
+            browser_error = "浏览器 OAuth recovery 返回格式无效"
+        self._log(f"浏览器 OAuth recovery 失败: {browser_error}", "warning")
+        return False, f"{http_error}; {browser_error}"
 
     def _finalize_email_service_success(self, result: RegistrationResult) -> None:
         finalize = getattr(self.email_service, "finalize_success", None)

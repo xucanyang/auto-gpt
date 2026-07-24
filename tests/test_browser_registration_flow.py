@@ -10,7 +10,10 @@ except ModuleNotFoundError as exc:
 
 from services.chatgpt_core.access_token_only_registration_engine import EmailServiceAdapter
 from services.chatgpt_core.access_token_only_registration_engine import AccessTokenOnlyRegistrationEngine
-from services.chatgpt_core.sentinel_browser import BrowserRegistrationStageResult
+from services.chatgpt_core.sentinel_browser import (
+    BrowserOAuthTokenRecoveryResult,
+    BrowserRegistrationStageResult,
+)
 from services.chatgpt_core.utils import FlowState
 
 
@@ -248,6 +251,63 @@ class BrowserRegistrationFlowTests(unittest.TestCase):
         self.assertEqual(callback_result["code"], "654321")
         self.assertEqual(callback_result["otp_sent_at"], 123.0)
         self.assertIn("123456", email_service.get_verification_code.call_args.kwargs["exclude_codes"])
+
+    def test_post_browser_add_phone_uses_isolated_oauth_recovery(self):
+        email_service = mock.Mock()
+        email_service.get_verification_code.return_value = "654321"
+        adapter = EmailServiceAdapter(email_service, "buyer@example.com", lambda _message: None)
+        adapter._used_codes_by_phase["register_email_otp"] = {"123456"}
+        client = mock.Mock()
+        client.device_id = "device-demo"
+        client.ua = "Mozilla/5.0"
+        client.sec_ch_ua = '"Chromium";v="145"'
+        client.impersonate = "chrome145"
+        client.fingerprint = None
+        client._check_stop = mock.Mock()
+        oauth_client = mock.Mock()
+        oauth_client.login_and_get_tokens.return_value = None
+        oauth_client.last_error = (
+            "passwordless 登录后仍停留在 add_phone，未获取到 workspace / callback"
+        )
+        browser_tokens = BrowserOAuthTokenRecoveryResult(
+            tokens={
+                "access_token": "at-demo",
+                "refresh_token": "rt-demo",
+                "id_token": "id-demo",
+            }
+        )
+        engine = AccessTokenOnlyRegistrationEngine(email_service, max_retries=1)
+
+        with (
+            mock.patch(
+                "services.chatgpt_core.oauth_client.OAuthClient",
+                return_value=oauth_client,
+            ),
+            mock.patch(
+                "services.chatgpt_core.access_token_only_registration_engine.run_browser_oauth_token_recovery",
+                return_value=browser_tokens,
+            ) as browser_recovery,
+        ):
+            ok, result = engine._recover_tokens_after_browser_registration(
+                chatgpt_client=client,
+                email_addr="buyer@example.com",
+                password="Password123!",
+                first_name="Buyer",
+                last_name="Example",
+                birthdate="1990-01-01",
+                skymail_adapter=adapter,
+            )
+
+        self.assertTrue(ok)
+        self.assertEqual(result["access_token"], "at-demo")
+        browser_kwargs = browser_recovery.call_args.kwargs
+        self.assertEqual(browser_kwargs["device_id"], "device-demo")
+        callback_result = browser_kwargs["otp_callback"]({"otp_sent_at": 123.0})
+        self.assertEqual(callback_result, "654321")
+        self.assertIn(
+            "123456",
+            email_service.get_verification_code.call_args.kwargs["exclude_codes"],
+        )
 
 
 if __name__ == "__main__":

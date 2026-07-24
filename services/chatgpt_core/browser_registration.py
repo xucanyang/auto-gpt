@@ -1,8 +1,8 @@
 """Browser-owned ChatGPT registration flow adapted from any-auto-register.
 
-Only the registration stage is consumed by auto-gpt. Token extraction, account
-persistence, mailbox ownership, and the optional second OAuth stage remain
-owned by auto-gpt's existing registration engine.
+The registration stage and the optional isolated OAuth recovery stage are
+consumed by auto-gpt. Account persistence and mailbox ownership remain owned by
+auto-gpt's registration engine.
 """
 import base64
 import json
@@ -4540,6 +4540,76 @@ class ChatGPTBrowserRegister:
         except Exception as e:
             self.log(f"  全新浏览器 OAuth 异常: {e}")
             return None
+
+
+def run_browser_oauth_token_recovery_sync(
+    *,
+    email: str,
+    password: str,
+    proxy: Optional[str],
+    otp_callback: Callable[[], str],
+    device_id: str = "",
+    headless: bool = True,
+    log_fn: Callable[[str], None] = print,
+) -> dict:
+    """Run the any-auto-register-style Codex OAuth flow in an isolated browser.
+
+    A completed signup can still leave the HTTP OAuth client at ``add_phone``
+    without a ChatGPT session cookie. The reference implementation solves this
+    by opening a fresh browser and revisiting the original OAuth authorization
+    URL; OpenAI can then issue the callback without forcing a phone bind. Keep
+    this transaction separate from the signup browser so it receives the same
+    killable process and proxy/GeoIP setup as the registration stage.
+    """
+    logger = log_fn or (lambda _message: None)
+    effective_headless, headless_reason = resolve_browser_headless(headless)
+    ensure_browser_display_available(effective_headless)
+    logger(
+        "浏览器 OAuth Token recovery 启动: "
+        f"mode={'headless' if effective_headless else 'headed'} ({headless_reason})"
+    )
+
+    with ExitStack() as stack:
+        proxy_config = stack.enter_context(
+            playwright_proxy_context(proxy, logger=logger)
+        )
+        launch_opts: dict[str, Any] = {"headless": effective_headless}
+        launch_opts.update(_camoufox_executable_options())
+        if proxy_config:
+            _ensure_camoufox_geoip_ready()
+            launch_opts["proxy"] = proxy_config
+            launch_opts["geoip"] = True
+
+        browser = stack.enter_context(Camoufox(**launch_opts))
+        page = browser.new_page()
+        page.set_default_timeout(30000)
+        page.set_default_navigation_timeout(45000)
+        effective_device_id = str(device_id or "").strip()
+        if effective_device_id:
+            _seed_browser_device_id(page, effective_device_id)
+
+        logger("浏览器 OAuth Token recovery 已进入独立 Codex OAuth 状态机")
+        result = _do_codex_oauth(
+            page,
+            {"oai-did": effective_device_id} if effective_device_id else {},
+            str(email or ""),
+            str(password or ""),
+            otp_callback,
+            None,
+            proxy,
+            logger,
+        )
+        if not isinstance(result, dict):
+            raise RuntimeError("browser_oauth_token_recovery_empty_result")
+        if not str(result.get("access_token") or "").strip():
+            raise RuntimeError("browser_oauth_token_recovery_missing_access_token")
+        if not str(result.get("refresh_token") or "").strip():
+            raise RuntimeError("browser_oauth_token_recovery_missing_refresh_token")
+        logger(
+            "浏览器 OAuth Token recovery 完成: "
+            f"account_id={str(result.get('account_id') or '')[:24]}"
+        )
+        return dict(result)
 
 
 def run_browser_registration_stage_sync(

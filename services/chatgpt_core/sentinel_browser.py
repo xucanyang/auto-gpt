@@ -617,6 +617,20 @@ class BrowserRegistrationStageResult:
         }
 
 
+@dataclass
+class BrowserOAuthTokenRecoveryResult:
+    """Result of the isolated Codex OAuth recovery transaction."""
+
+    tokens: dict[str, Any] = field(default_factory=dict)
+    error: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return not self.error and bool(
+            str(self.tokens.get("access_token") or "").strip()
+        ) and bool(str(self.tokens.get("refresh_token") or "").strip())
+
+
 def export_session_cookies_for_playwright(
     session: Any,
     *,
@@ -1292,6 +1306,69 @@ def run_browser_registration_stage(
         return BrowserRegistrationStageResult(
             error=f"browser_registration_result_parse_failed: {exc}"
         )
+
+
+def run_browser_oauth_token_recovery(
+    *,
+    email: str,
+    password: str,
+    otp_callback: Callable[[], str],
+    proxy: Optional[str] = None,
+    device_id: str = "",
+    headless: bool = True,
+    stop_check: Optional[Callable[[], None]] = None,
+    hard_timeout_seconds: Optional[float] = None,
+    log_fn: Optional[Callable[[str], None]] = None,
+) -> BrowserOAuthTokenRecoveryResult:
+    """Run the fresh-browser Codex OAuth recovery behind the shared browser gate."""
+
+    logger = log_fn or (lambda _message: None)
+    effective_hard_timeout = (
+        max(float(hard_timeout_seconds), 0.1)
+        if hard_timeout_seconds is not None
+        else _browser_hard_timeout_seconds(
+            "BROWSER_OAUTH_HARD_TIMEOUT_SECONDS",
+            420.0,
+        )
+    )
+
+    def _request_otp(callback_payload: dict[str, Any]) -> Any:
+        try:
+            return otp_callback(dict(callback_payload or {}))
+        except TypeError:
+            return otp_callback()
+
+    outcome = _run_with_browser_slot(
+        "browser_oauth_token_recovery",
+        {
+            "email": str(email or ""),
+            "password": str(password or ""),
+            "proxy": str(proxy or "") or None,
+            "device_id": str(device_id or ""),
+            "headless": bool(headless),
+        },
+        hard_timeout_seconds=effective_hard_timeout,
+        logger=logger,
+        stop_check=stop_check,
+        callbacks={"otp": _request_otp},
+    )
+    if outcome.status == "timeout":
+        return BrowserOAuthTokenRecoveryResult(
+            error=f"browser_oauth_token_recovery_hard_timeout: {outcome.error}"
+        )
+    if outcome.status != "ok":
+        return BrowserOAuthTokenRecoveryResult(
+            error=f"browser_oauth_token_recovery_unavailable: {outcome.error}"
+        )
+    if not isinstance(outcome.value, dict):
+        return BrowserOAuthTokenRecoveryResult(
+            error="browser_oauth_token_recovery_invalid_result"
+        )
+    payload = dict(outcome.value)
+    error = str(payload.pop("error", "") or "").strip()
+    if error:
+        return BrowserOAuthTokenRecoveryResult(error=error)
+    return BrowserOAuthTokenRecoveryResult(tokens=payload)
 
 
 def create_account_via_browser(

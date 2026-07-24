@@ -15,6 +15,7 @@ from core.task_runtime import StopTaskRequested
 from services.chatgpt_core.chatgpt_client import ChatGPTClient
 from services.chatgpt_core.sentinel_browser import (
     BrowserAccountCreateResult,
+    BrowserOAuthTokenRecoveryResult,
     BrowserRegistrationStageResult,
     _BrowserWorkerOutcome,
     _create_account_via_browser_sync,
@@ -26,6 +27,7 @@ from services.chatgpt_core.sentinel_browser import (
     get_sentinel_token_via_browser,
     merge_playwright_cookies_into_session,
     run_browser_registration_stage,
+    run_browser_oauth_token_recovery,
     run_sync_playwright_safely,
 )
 from services.chatgpt_core.utils import generate_browser_fingerprint
@@ -217,6 +219,36 @@ sys.stdin.readline()
         self.assertIsInstance(result, BrowserRegistrationStageResult)
         self.assertTrue(result.ok)
         self.assertEqual(result.cookie_names, ("login_session",))
+        self.assertIn("otp", worker.call_args.kwargs["callbacks"])
+
+    def test_browser_oauth_recovery_uses_shared_worker_gate(self):
+        worker_outcome = _BrowserWorkerOutcome(
+            status="ok",
+            value={
+                "access_token": "at-demo",
+                "refresh_token": "rt-demo",
+                "id_token": "id-demo",
+            },
+        )
+        with mock.patch(
+            "services.chatgpt_core.sentinel_browser._run_with_browser_slot",
+            return_value=worker_outcome,
+        ) as worker:
+            result = run_browser_oauth_token_recovery(
+                email="buyer@example.com",
+                password="Password123!",
+                otp_callback=lambda: "123456",
+                proxy="http://proxy.local:8080",
+                device_id="device-demo",
+                hard_timeout_seconds=300,
+            )
+
+        self.assertIsInstance(result, BrowserOAuthTokenRecoveryResult)
+        self.assertTrue(result.ok)
+        self.assertEqual(result.tokens["refresh_token"], "rt-demo")
+        self.assertEqual(
+            worker.call_args.args[0], "browser_oauth_token_recovery"
+        )
         self.assertIn("otp", worker.call_args.kwargs["callbacks"])
 
     def test_browser_worker_hard_timeout_kills_entire_process_group(self):
