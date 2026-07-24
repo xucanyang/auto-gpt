@@ -2652,7 +2652,15 @@ def _validate_browser_email_otp(
     )
 
 
-def _submit_browser_about_you(page, device_id: str, user_agent: str, referer: str) -> dict:
+def _submit_browser_about_you(
+    page,
+    device_id: str,
+    user_agent: str,
+    referer: str,
+    *,
+    name: str = "",
+    birthdate: str = "",
+) -> dict:
     from .constants import generate_random_user_info
 
     headers = _build_browser_headers(
@@ -2664,13 +2672,21 @@ def _submit_browser_about_you(page, device_id: str, user_agent: str, referer: st
         extra_headers={
             "sec-fetch-site": "same-origin",
             "oai-device-id": device_id,
+            "x-access-flow-invocation-id": str(uuid.uuid4()),
             **_generate_datadog_trace_headers(),
         },
     )
-    sentinel = _build_browser_sentinel_token(page, device_id, "oauth_create_account", user_agent)
+    try:
+        sentinel = _build_browser_sentinel_token(page, device_id, "oauth_create_account", user_agent)
+    except Exception:
+        sentinel = ""
     if sentinel:
         headers["openai-sentinel-token"] = sentinel
     user_info = generate_random_user_info()
+    if str(name or "").strip():
+        user_info["name"] = str(name).strip()
+    if str(birthdate or "").strip():
+        user_info["birthdate"] = str(birthdate).strip()
     _browser_pause(page)
     return _browser_fetch(
         page,
@@ -3383,7 +3399,13 @@ def _submit_otp_via_page(
                 pass
 
 
-def _submit_about_you_via_page(page, log) -> dict:
+def _submit_about_you_via_page(
+    page,
+    log,
+    *,
+    device_id: str = "",
+    user_agent: str = "",
+) -> dict:
     from .constants import generate_random_user_info
 
     user_info = generate_random_user_info()
@@ -3961,7 +3983,10 @@ def _submit_about_you_via_page(page, log) -> dict:
         raise RuntimeError("about_you 未找到提交按钮")
     log(f"about_you 已点击继续按钮: {submit_selector}")
 
-    deadline = time.time() + 20
+    submit_started_at = time.time()
+    deadline = submit_started_at + 20
+    about_api_attempted = False
+    about_api_error = ""
     retried_generic_validation = False
     last_url = page.url
     while time.time() < deadline:
@@ -4025,6 +4050,54 @@ def _submit_about_you_via_page(page, log) -> dict:
             "external_url",
         }:
             return {"ok": True, "status": 200, "url": current_url, "data": None, "text": ""}
+        if not about_api_attempted and time.time() - submit_started_at >= 2.5:
+            about_api_attempted = True
+            log("about_you URL 未变化，改用浏览器上下文 create_account API 兜底")
+            try:
+                api_result = _submit_browser_about_you(
+                    page,
+                    device_id,
+                    user_agent,
+                    referer=current_url,
+                    name=name,
+                    birthdate=birthdate,
+                )
+            except Exception as exc:
+                api_result = {
+                    "ok": False,
+                    "status": 0,
+                    "url": current_url,
+                    "data": None,
+                    "text": str(exc),
+                }
+            api_status = int(api_result.get("status") or 0)
+            api_url = str(api_result.get("url") or current_url)
+            api_data = api_result.get("data") if isinstance(api_result.get("data"), dict) else None
+            if 200 <= api_status < 300 or api_result.get("ok"):
+                if not api_data:
+                    # A successful 204/empty response still means the account
+                    # was created; advance through the normal ChatGPT landing
+                    # route so the existing session extraction can continue.
+                    api_data = {
+                        "continue_url": f"{CHATGPT_APP}/",
+                        "method": "GET",
+                    }
+                return {
+                    "ok": True,
+                    "status": api_status or 200,
+                    "url": api_url,
+                    "data": api_data,
+                    "text": "",
+                }
+            if api_status >= 400:
+                error_payload = api_result.get("data") if isinstance(api_result.get("data"), dict) else {}
+                error_obj = error_payload.get("error") if isinstance(error_payload, dict) else {}
+                about_api_error = (
+                    str(error_obj.get("message") or error_obj.get("detail") or "").strip()
+                    if isinstance(error_obj, dict)
+                    else ""
+                ) or str(error_payload.get("message") or "").strip() or str(api_result.get("text") or "").strip()[:500]
+                log(f"about_you API 兜底返回失败: status={api_status} text={about_api_error[:180]}")
         if "code=" in current_url or "chatgpt.com" in current_url or "sign-in-with-chatgpt" in current_url:
             return {"ok": True, "status": 200, "url": current_url, "data": None, "text": ""}
         if "add-phone" in current_url:
@@ -4105,7 +4178,13 @@ def _submit_about_you_via_page(page, log) -> dict:
             return {"ok": False, "status": 400, "url": current_url, "data": None, "text": error_text}
         time.sleep(0.5)
     _dump_debug(page, "chatgpt_about_you_fail")
-    return {"ok": False, "status": 0, "url": last_url, "data": None, "text": "about_you 提交后未跳转"}
+    return {
+        "ok": False,
+        "status": 0,
+        "url": last_url,
+        "data": None,
+        "text": about_api_error or "about_you 提交后未跳转",
+    }
 
 
 def _browser_registration_flow(
@@ -4307,7 +4386,12 @@ def _browser_registration_flow(
             if "about-you" not in str(page.url):
                 log(f"跳转到 about_you 页面: {target_url[:120]}")
                 page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
-            about_resp = _submit_about_you_via_page(page, log)
+            about_resp = _submit_about_you_via_page(
+                page,
+                log,
+                device_id=device_id,
+                user_agent=user_agent,
+            )
             log(f"about_you 提交状态: {about_resp.get('status', 0)}")
             if not about_resp.get("ok"):
                 raise RuntimeError(f"about_you 提交失败: {(about_resp.get('text') or '')[:300]}")
