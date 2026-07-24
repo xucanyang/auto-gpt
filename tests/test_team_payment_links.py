@@ -28,18 +28,14 @@ PROFILE_HASH = "f" * 64
 TEAM_URL = "https://pay.openai.com/c/pay/cs_team_test#hosted"
 LEGACY_CUSTOM_TEAM_URL = "https://chatgpt.com/checkout/openai_llc/cs_team_custom"
 PROMO_DIGEST = hashlib.sha256(b"TEAM50").hexdigest()
-UPSTREAM_TEAM_BILLING_COUNTRY_CURRENCIES = dict(
-    item.split(":", 1)
-    for item in """
-    AD:EUR AE:AED AR:ARS AT:EUR AU:AUD BE:EUR BH:BHD BM:BMD BO:BOB BR:BRL BQ:USD
-    CA:CAD CH:CHF CL:CLP CO:COP CZ:CZK CY:EUR DE:EUR DK:DKK EE:EUR EG:EGP ES:EUR
-    FI:EUR FR:EUR GB:GBP GR:EUR GU:USD HK:HKD HR:EUR HU:HUF ID:IDR IE:EUR IN:INR
-    IL:ILS IS:ISK IT:EUR JP:JPY KR:KRW KZ:KZT LT:EUR LU:EUR LV:EUR MC:EUR ME:EUR
-    MX:MXN MY:MYR MT:EUR NG:NGN NL:EUR NO:NOK NZ:NZD PE:PEN PH:PHP PK:PKR
-    PL:PLN PT:EUR PR:USD QA:QAR RO:RON SA:SAR SE:SEK SG:SGD SI:EUR SK:EUR SM:EUR
-    TH:THB TR:TRY TW:TWD TZ:TZS UA:UAH UM:USD US:USD VN:VND ZA:ZAR
-    """.split()
-)
+UPSTREAM_TEAM_BILLING_CATALOG_SHA256 = "81f8423c2c207232db8a83c27d71e9cfaba5f40d0b1e1b91069abf1afd6ebcd3"
+UPSTREAM_TEAM_CHECKOUT_CURRENCIES = frozenset({
+    "AED", "AUD", "BRL", "CAD", "CHF", "CLP", "COP", "CZK", "DKK",
+    "EGP", "EUR", "GBP", "HUF", "IDR", "ILS", "INR", "JPY", "KRW",
+    "KZT", "MXN", "MYR", "NGN", "NOK", "NZD", "PEN", "PHP", "PKR",
+    "PLN", "QAR", "RON", "SAR", "SEK", "SGD", "THB", "TWD", "TZS",
+    "USD", "VND", "ZAR",
+})
 
 
 def team_params(workspace: str = "Workspace A", **overrides: object) -> dict[str, object]:
@@ -88,14 +84,31 @@ def team_result(workspace: str = "Workspace A", **overrides: object) -> dict[str
 
 class TeamPaymentLinkContractTests(unittest.TestCase):
     def test_billing_catalog_matches_upstream_country_currency_contract(self) -> None:
-        self.assertEqual(TEAM_BILLING_COUNTRY_CURRENCIES, UPSTREAM_TEAM_BILLING_COUNTRY_CURRENCIES)
-        self.assertEqual(len(TEAM_BILLING_COUNTRY_CURRENCIES), 74)
+        serialized = json.dumps(
+            TEAM_BILLING_COUNTRY_CURRENCIES,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("utf-8")
+        self.assertEqual(hashlib.sha256(serialized).hexdigest(), UPSTREAM_TEAM_BILLING_CATALOG_SHA256)
+        self.assertEqual(len(TEAM_BILLING_COUNTRY_CURRENCIES), 232)
+        self.assertEqual(set(TEAM_BILLING_COUNTRY_CURRENCIES.values()), UPSTREAM_TEAM_CHECKOUT_CURRENCIES)
+        self.assertEqual(
+            {
+                country: TEAM_BILLING_COUNTRY_CURRENCIES[country]
+                for country in ("BO", "IN", "AR", "IS", "TR", "UA", "XK")
+            },
+            {"BO": "USD", "IN": "INR", "AR": "USD", "IS": "EUR", "TR": "USD", "UA": "USD", "XK": "EUR"},
+        )
+        for unsupported in ("EU", "US2", "HK", "UM"):
+            self.assertNotIn(unsupported, TEAM_BILLING_COUNTRY_CURRENCIES)
         self.assertEqual(normalize_team_billing_country({"billing_country": "bo"}), "BO")
+        self.assertEqual(normalize_team_billing_country({"billing_country": "xk"}), "XK")
         self.assertEqual(
             team_billing_country_options(),
             [
                 {"country": country, "currency": currency}
-                for country, currency in UPSTREAM_TEAM_BILLING_COUNTRY_CURRENCIES.items()
+                for country, currency in TEAM_BILLING_COUNTRY_CURRENCIES.items()
             ],
         )
 
@@ -135,6 +148,8 @@ class TeamPaymentLinkContractTests(unittest.TestCase):
             {"plan": "team", "checkout_proxy_region": "GB", "cancel_url": "javascript:alert(1)"},
             {"plan": "team", "checkout_proxy_region": "GB", "checkout_ui_mode": "embedded"},
             {"plan": "team", "checkout_proxy_region": "GB", "billing_country": "ZZ"},
+            {"plan": "team", "checkout_proxy_region": "GB", "billing_country": "HK"},
+            {"plan": "team", "checkout_proxy_region": "GB", "billing_country": "UM"},
             {"plan": "business"},
             {"plan": "enterprise"},
             {"plan": "plus", "promo_code": "TEAM50"},
@@ -153,7 +168,7 @@ class TeamPaymentLinkContractTests(unittest.TestCase):
             team_params(profile_hash="e" * 64),
             team_params(checkout_proxy_region="US"),
             team_params(checkout_ui_mode="custom"),
-            team_params(country="BO", billing_country="BO", currency="BOB"),
+            team_params(country="BO", billing_country="BO", currency="USD"),
         ]
 
         base_key = payment_link_variant_key(base)
@@ -179,11 +194,11 @@ class TeamPaymentLinkContractTests(unittest.TestCase):
         bolivia = normalize_payment_link_params({
             "plan": "team",
             "billing_country": "bo",
-            "currency": "USD",
+            "currency": "BOB",
             "checkout_proxy_region": "CA",
         })
         self.assertEqual(bolivia["country"], "BO")
-        self.assertEqual(bolivia["currency"], "BOB")
+        self.assertEqual(bolivia["currency"], "USD")
 
     def test_profile_freeze_preserves_task_billing_country_and_rejects_mismatch(self) -> None:
         request = tasks_api._filtered_payment_link_request_params({
@@ -196,7 +211,7 @@ class TeamPaymentLinkContractTests(unittest.TestCase):
             "plan": "team",
             "country": "BO",
             "billing_country": "BO",
-            "currency": "BOB",
+            "currency": "USD",
             "checkout_ui_mode": "hosted",
             "regions": {"checkout": "CA"},
             "team": {
@@ -210,7 +225,7 @@ class TeamPaymentLinkContractTests(unittest.TestCase):
 
         self.assertEqual(frozen["billing_country"], "BO")
         self.assertEqual(frozen["country"], "BO")
-        self.assertEqual(frozen["currency"], "BOB")
+        self.assertEqual(frozen["currency"], "USD")
         with self.assertRaisesRegex(ValueError, "账单国家与任务配置不一致"):
             tasks_api._payment_link_params_from_profile(request, {**profile, "country": "US"})
 
@@ -250,7 +265,7 @@ class TeamPaymentLinkContractTests(unittest.TestCase):
             team_billing_country_options(),
         )
         self.assertIn(
-            {"country": "BO", "currency": "BOB"},
+            {"country": "BO", "currency": "USD"},
             view["billing_country_options"],
         )
         self.assertNotIn("promo_code_digest", view)

@@ -366,7 +366,7 @@ class LongLinkPaymentClientTests(unittest.TestCase):
                             "plan": "team",
                             "generation_kind": "team_checkout",
                             "billing_country": "BO",
-                            "currency": "BOB",
+                            "currency": "USD",
                             "checkout_ui_mode": "hosted",
                             "regions": {"checkout": "CA"},
                             "team": {
@@ -411,7 +411,7 @@ class LongLinkPaymentClientTests(unittest.TestCase):
         self.assertEqual(profile["team"]["workspace_name"], "Client Workspace")
         self.assertEqual(profile["regions"]["checkout"], "CA")
         self.assertEqual(profile["billing_country"], "BO")
-        self.assertEqual(profile["currency"], "BOB")
+        self.assertEqual(profile["currency"], "USD")
         self.assertEqual(profile["checkout_ui_mode"], "hosted")
         self.assertEqual(submitted["batch_id"], batch_id)
         self.assertEqual([call[0] for call in session.calls], ["POST", "POST"])
