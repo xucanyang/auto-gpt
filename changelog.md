@@ -6,6 +6,14 @@
 
 ## [Unreleased] (未发布)
 
+## [2.8.20] - 2026-07-24
+
+### 修复 (Fixed)
+- **保留 registration_disallowed 后已实际落地的账号**：`services/chatgpt_core/access_token_only_registration_engine.py` 识别同一次协议尝试已经进入 `about_you`、首个 `create_account` 返回 `registration_disallowed`、而浏览器后备再次收到 “account already exists” 的组合。该组合现在标记为服务端已提交注册并继续 AT/RT 提取；普通历史已有账号仍遵守禁止登录恢复/跳过保存策略。
+
+### 测试 (Tests)
+- 增加服务端已提交账号与浏览器后备“已有账号”响应的回归覆盖。
+
 ## [2.8.19] - 2026-07-24
 
 ### 修复 (Fixed)
@@ -2500,4 +2508,8 @@
 
 ## 2026-07-24 14:41:39 +0800
 - 修复独立浏览器 OAuth OTP 重发、时间戳过滤与严格状态推进
+- 发布模式: multi
+
+## 2026-07-24 14:48:27 +0800
+- 保留 registration_disallowed 后已落地账号并继续 Token 提取
 - 发布模式: multi

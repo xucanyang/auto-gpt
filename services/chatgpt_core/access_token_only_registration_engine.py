@@ -621,6 +621,7 @@ class AccessTokenOnlyRegistrationEngine:
         otp_account_budget_timeout: int,
         profile_name: str = "",
         profile_birthdate: str = "",
+        allow_existing_account_after_disallowed: bool = False,
     ) -> tuple[bool, str]:
         self._log(
             "协议注册未完成，切换 Camoufox 后备链路：优先恢复已有 about_you，必要时再走邮箱 -> OTP",
@@ -709,6 +710,31 @@ class AccessTokenOnlyRegistrationEngine:
         if not stage_result.ok:
             error = str(stage_result.error or "browser_registration_failed")
             self._log(f"浏览器注册后备链路失败: {error}", "warning")
+            # OpenAI may commit the account and still return the anti-abuse
+            # `registration_disallowed` response from the first create_account
+            # request. A second browser submission then reports
+            # "An account already exists". When the caller has proven that the
+            # same attempt reached about_you after that response, keep the
+            # account and continue with OAuth token recovery instead of routing
+            # it through the ordinary existing-account skip policy.
+            lowered_error = error.lower()
+            existing_markers = (
+                "account already exists",
+                "already exists for this email",
+                "邮箱地址已存在",
+                "邮箱已存在",
+                "已注册",
+            )
+            if allow_existing_account_after_disallowed and any(
+                marker in lowered_error for marker in existing_markers
+            ):
+                chatgpt_client.registration_transport = "camoufox_browser_fallback"
+                self._log(
+                    "协议 registration_disallowed 后服务端已落账号，后备再次收到已有账号提示；"
+                    "按本次尝试完成注册，继续 OAuth Token 提取",
+                    "warning",
+                )
+                return True, "registration complete after server-side account commit"
             return False, error
 
         merged = merge_playwright_cookies_into_session(
@@ -1289,6 +1315,18 @@ class AccessTokenOnlyRegistrationEngine:
                                     ),
                                     profile_name=f"{first_name} {last_name}".strip(),
                                     profile_birthdate=birthdate,
+                                    allow_existing_account_after_disallowed=(
+                                        "registration_disallowed" in str(msg or "").lower()
+                                        and str(
+                                            getattr(
+                                                getattr(chatgpt_client, "last_registration_state", None),
+                                                "page_type",
+                                                "",
+                                            )
+                                            or ""
+                                        ).strip()
+                                        == "about_you"
+                                    ),
                                 )
                             )
                             if fallback_ok:

@@ -355,6 +355,45 @@ class BrowserRegistrationFlowTests(unittest.TestCase):
             email_service.get_verification_code.call_args.kwargs["exclude_codes"],
         )
 
+    def test_disallowed_create_account_then_existing_response_keeps_account(self):
+        email_service = mock.Mock()
+        adapter = EmailServiceAdapter(email_service, "buyer@example.com", lambda _message: None)
+        client = mock.Mock()
+        client.session = mock.Mock()
+        client.device_id = "device-demo"
+        client.last_registration_state = FlowState(
+            page_type="about_you",
+            current_url="https://auth.openai.com/about-you",
+            continue_url="https://auth.openai.com/about-you",
+        )
+        client.registration_transport = "protocol"
+        client._check_stop = mock.Mock()
+        stage_result = BrowserRegistrationStageResult(
+            error=(
+                "browser_registration_failed: RuntimeError: about_you 提交失败: "
+                "An account already exists for this email address."
+            )
+        )
+        engine = AccessTokenOnlyRegistrationEngine(email_service, max_retries=1)
+
+        with mock.patch(
+            "services.chatgpt_core.access_token_only_registration_engine.run_browser_registration_stage",
+            return_value=stage_result,
+        ):
+            ok, message = engine._run_browser_registration_fallback(
+                chatgpt_client=client,
+                email_addr="buyer@example.com",
+                password="Password123!",
+                skymail_adapter=adapter,
+                otp_wait_timeout=30,
+                otp_account_budget_timeout=60,
+                allow_existing_account_after_disallowed=True,
+            )
+
+        self.assertTrue(ok)
+        self.assertIn("server-side account commit", message)
+        self.assertEqual(client.registration_transport, "camoufox_browser_fallback")
+
 
 if __name__ == "__main__":
     unittest.main()
