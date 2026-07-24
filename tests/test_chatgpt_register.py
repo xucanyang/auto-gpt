@@ -14,7 +14,6 @@ sys.modules.setdefault("smstome_tool", smstome_tool_stub)
 
 from services.chatgpt_core.chatgpt_client import ChatGPTClient
 from services.chatgpt_core.oauth_client import OAuthClient
-from services.chatgpt_core.sentinel_browser import BrowserAccountCreateResult
 from services.chatgpt_core.refresh_token_registration_engine import (
     EmailServiceAdapter,
     RegistrationResult,
@@ -989,7 +988,7 @@ class OAuthClientPasswordlessTests(unittest.TestCase):
         mailbox.get_last_verification_result.return_value = {"message_id": "otp-1"}
 
         with mock.patch(
-            "services.chatgpt_core.oauth_client.build_sentinel_token",
+            "services.chatgpt_core.oauth_client.get_sentinel_token_via_browser",
             return_value="sentinel",
         ):
             next_state = client._handle_otp_verification(
@@ -1099,16 +1098,11 @@ class OAuthClientPasswordlessTests(unittest.TestCase):
 
 
 class OAuthClientBootstrapTests(unittest.TestCase):
-    def _make_client(self, browser_mode="protocol"):
-        return OAuthClient(
-            {},
-            proxy="http://127.0.0.1:7890",
-            verbose=False,
-            browser_mode=browser_mode,
-        )
+    def _make_client(self):
+        return OAuthClient({}, proxy="http://127.0.0.1:7890", verbose=False)
 
     def test_bootstrap_invokes_browser_fallback_when_http_is_blocked(self):
-        client = self._make_client("headed")
+        client = self._make_client()
         blocked_response = mock.Mock(
             status_code=403,
             text="<!DOCTYPE html><title>Just a moment...</title>",
@@ -1135,36 +1129,8 @@ class OAuthClientBootstrapTests(unittest.TestCase):
         self.assertEqual(final_url, "https://auth.openai.com/log-in")
         browser_bootstrap.assert_called_once()
 
-    def test_protocol_bootstrap_never_invokes_browser_when_http_is_blocked(self):
-        client = self._make_client("protocol")
-        blocked_response = mock.Mock(
-            status_code=403,
-            text="<!DOCTYPE html><title>Just a moment...</title>",
-            url="https://auth.openai.com/",
-            history=[],
-        )
-        client.session.get = mock.Mock(
-            side_effect=[blocked_response, blocked_response]
-        )
-
-        with mock.patch.object(
-            client,
-            "_browser_bootstrap_oauth_session",
-            side_effect=AssertionError("protocol executor started browser"),
-        ) as browser_bootstrap:
-            final_url = client._bootstrap_oauth_session(
-                "https://auth.openai.com/oauth/authorize",
-                {"client_id": "app-demo", "state": "state-demo"},
-                device_id="device-demo",
-                user_agent="UA",
-                sec_ch_ua='"Chromium";v="136"',
-            )
-
-        self.assertEqual(final_url, "https://auth.openai.com/")
-        browser_bootstrap.assert_not_called()
-
     def test_authorize_continue_stops_without_login_session(self):
-        client = self._make_client("headed")
+        client = self._make_client()
 
         with mock.patch(
             "services.chatgpt_core.oauth_client.build_sentinel_token"
@@ -1183,7 +1149,7 @@ class OAuthClientBootstrapTests(unittest.TestCase):
         build_token.assert_not_called()
 
     def test_merge_playwright_cookies_backfills_login_session(self):
-        client = self._make_client("headed")
+        client = self._make_client()
 
         merged = client._merge_playwright_cookies_into_session(
             [
@@ -1199,113 +1165,6 @@ class OAuthClientBootstrapTests(unittest.TestCase):
 
         self.assertGreaterEqual(merged, 1)
         self.assertTrue(client._has_cookie("login_session"))
-
-    def test_about_you_requires_browser_owned_finalize_without_http_fallback(self):
-        client = self._make_client("headed")
-        client.session.post = mock.Mock()
-
-        with mock.patch(
-            "services.chatgpt_core.oauth_client.create_account_via_browser",
-            return_value=None,
-        ) as browser_create, mock.patch(
-            "services.chatgpt_core.oauth_client.build_sentinel_token"
-        ) as http_token:
-            state = client._submit_about_you_create_account(
-                "Alice",
-                "Smith",
-                "1990-01-01",
-                "device-demo",
-                user_agent="UA",
-                sec_ch_ua='"Chromium";v="145"',
-                impersonate="chrome145",
-            )
-
-        self.assertIsNone(state)
-        self.assertIn("auth_browser_finalize_unavailable", client.last_error)
-        self.assertEqual(
-            browser_create.call_args.kwargs["page_url"],
-            "https://auth.openai.com/about-you",
-        )
-        self.assertFalse(browser_create.call_args.kwargs["headless"])
-        http_token.assert_not_called()
-        client.session.post.assert_not_called()
-
-    def test_about_you_browser_finalize_merges_cookies_and_returns_state(self):
-        client = self._make_client("headed")
-        client.session.post = mock.Mock()
-        result = BrowserAccountCreateResult(
-            status_code=200,
-            response_url="https://auth.openai.com/api/accounts/create_account",
-            response_json={
-                "page": {"type": "external_url"},
-                "continue_url": "https://chatgpt.com/api/auth/callback/openai?code=demo",
-                "method": "GET",
-            },
-            cookies=[
-                {
-                    "name": "oai-sc",
-                    "value": "sentinel-cookie",
-                    "domain": ".openai.com",
-                    "path": "/",
-                    "secure": True,
-                }
-            ],
-            cf_clearance_present=True,
-            oai_sc_present=True,
-        )
-
-        with mock.patch(
-            "services.chatgpt_core.oauth_client.create_account_via_browser",
-            return_value=result,
-        ) as browser_create:
-            state = client._submit_about_you_create_account(
-                "Alice",
-                "Smith",
-                "1990-01-01",
-                "device-demo",
-                user_agent="UA",
-                sec_ch_ua='"Chromium";v="145"',
-                impersonate="chrome145",
-            )
-
-        self.assertEqual(state.page_type, "external_url")
-        self.assertEqual(browser_create.call_args.kwargs["device_id"], "device-demo")
-        self.assertTrue(client._has_cookie("oai-sc"))
-        client.session.post.assert_not_called()
-
-    def test_about_you_protocol_posts_http_without_browser(self):
-        client = self._make_client("protocol")
-        response = mock.Mock(
-            status_code=200,
-            text="{}",
-            url="https://auth.openai.com/api/accounts/create_account",
-        )
-        response.json.return_value = {
-            "page": {"type": "external_url"},
-            "continue_url": "https://chatgpt.com/api/auth/callback/openai?code=demo",
-        }
-        client.session.post = mock.Mock(return_value=response)
-
-        with mock.patch(
-            "services.chatgpt_core.oauth_client.build_sentinel_token",
-            return_value="protocol-token",
-        ), mock.patch(
-            "services.chatgpt_core.oauth_client.create_account_via_browser",
-            side_effect=AssertionError("protocol executor started browser"),
-        ) as browser_create:
-            state = client._submit_about_you_create_account(
-                "Alice",
-                "Smith",
-                "1990-01-01",
-                "device-demo",
-                user_agent="UA",
-                sec_ch_ua='"Chromium";v="145"',
-                impersonate="chrome145",
-            )
-
-        self.assertEqual(state.page_type, "external_url")
-        client.session.post.assert_called_once()
-        browser_create.assert_not_called()
 
     def test_stop_after_login_waits_for_existing_phone_otp_handling(self):
         client = self._make_client()

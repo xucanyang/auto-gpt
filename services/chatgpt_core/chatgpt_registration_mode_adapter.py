@@ -101,12 +101,8 @@ class BaseChatGPTRegistrationModeAdapter(ABC):
     def _build_account_extra(self, result) -> dict:
         metadata = getattr(result, "metadata", None)
         metadata = metadata if isinstance(metadata, dict) else {}
-        access_token = str(getattr(result, "access_token", "") or "").strip()
         refresh_token = str(getattr(result, "refresh_token", "") or "").strip()
-        registered_auth_pending = bool(metadata.get("registered_auth_pending")) and not (
-            access_token or refresh_token
-        )
-        partial_auth = registered_auth_pending or self.mode == CHATGPT_REGISTRATION_MODE_ACCESS_TOKEN_ONLY or (
+        partial_auth = self.mode == CHATGPT_REGISTRATION_MODE_ACCESS_TOKEN_ONLY or (
             not refresh_token
             and bool(
                 metadata.get("registration_access_token_saved")
@@ -116,18 +112,14 @@ class BaseChatGPTRegistrationModeAdapter(ABC):
         )
         return self._build_account_extra_from_auth(
             {
-                "access_token": access_token,
+                "access_token": getattr(result, "access_token", ""),
                 "refresh_token": refresh_token,
                 "id_token": getattr(result, "id_token", ""),
                 "session_token": getattr(result, "session_token", ""),
                 "workspace_id": getattr(result, "workspace_id", ""),
                 "account_id": getattr(result, "account_id", ""),
                 "source": getattr(result, "source", "register"),
-                "auth_level": (
-                    "registered_auth_pending"
-                    if registered_auth_pending
-                    else "access_token_only" if partial_auth else "full"
-                ),
+                "auth_level": "access_token_only" if partial_auth else "full",
                 "partial_auth": partial_auth,
             },
             result,
@@ -225,8 +217,6 @@ class BaseChatGPTRegistrationModeAdapter(ABC):
                 "cookies",
                 "cookie_header",
                 "registration_web_session_material_preserved",
-                "registered_auth_pending",
-                "chatgpt_browser_runtime_profile",
             ):
                 if key in metadata:
                     if key in {"cookies", "cookie_header"} and extra.get(key):
@@ -246,26 +236,10 @@ class BaseChatGPTRegistrationModeAdapter(ABC):
                 if cleaned_mailbox_state:
                     extra["chatgpt_mailbox_state"] = cleaned_mailbox_state
             if metadata.get("registration_context"):
-                registration_context = metadata.get("registration_context")
-                extra["chatgpt_registration_context"] = registration_context
-                if isinstance(registration_context, dict):
-                    extra["requested_executor_type"] = str(
-                        registration_context.get("requested_executor") or ""
-                    )
-                    extra["effective_executor_type"] = str(
-                        registration_context.get("effective_executor") or ""
-                    )
-                    extra["chatgpt_registration_transport"] = str(
-                        registration_context.get("registration_transport") or ""
-                    )
-                    extra["chatgpt_registration_stage_transports"] = list(
-                        registration_context.get("stage_transports") or []
-                    )
+                extra["chatgpt_registration_context"] = metadata.get("registration_context")
             if metadata.get("needs_auth_capture"):
                 extra["needs_auth_capture"] = True
                 extra["auth_capture_required"] = True
-            if metadata.get("registered_auth_pending"):
-                extra["registered_auth_pending"] = True
             if metadata.get("registration_full_auth_failed"):
                 extra["registration_full_auth_failed"] = True
                 extra["registration_full_auth_error"] = metadata.get("registration_full_auth_error") or metadata.get(
@@ -273,11 +247,7 @@ class BaseChatGPTRegistrationModeAdapter(ABC):
                 ) or ""
                 extra["registration_full_auth_failed_policy"] = metadata.get(
                     "registration_full_auth_failed_policy"
-                ) or (
-                    "keep_registered_auth_pending"
-                    if metadata.get("registered_auth_pending")
-                    else "keep_access_token_checkpoint"
-                )
+                ) or "keep_access_token_checkpoint"
             if metadata.get("chatgpt_phone_challenge"):
                 extra["chatgpt_phone_challenge"] = metadata.get("chatgpt_phone_challenge")
             if metadata.get("chatgpt_phone_challenge_history"):
@@ -383,33 +353,14 @@ class RefreshTokenChatGPTRegistrationAdapter(BaseChatGPTRegistrationModeAdapter)
         return _Stage1EmailService(email_service)
 
     @staticmethod
-    def _finalize_original_email_success(
-        email_service,
-        *,
-        account_email: str,
-        task_id: str = "",
-        result_code: str = "login_alive",
-        access_token_saved: bool = False,
-    ) -> dict:
+    def _finalize_original_email_success(email_service, *, account_email: str, task_id: str = "") -> None:
+        finalize = getattr(email_service, "finalize_success", None)
+        if not callable(finalize):
+            return
         try:
-            email_service._registration_result_code = str(result_code or "login_alive")
-            email_service._registration_access_token_saved = bool(access_token_saved)
+            finalize(account_email=account_email, task_id=task_id)
         except Exception:
             pass
-        finalize = getattr(email_service, "finalize_success", None)
-        if callable(finalize):
-            try:
-                finalize(account_email=account_email, task_id=task_id)
-            except Exception:
-                pass
-        exporter = getattr(email_service, "export_state", None)
-        if callable(exporter):
-            try:
-                state = exporter() or {}
-                return dict(state) if isinstance(state, dict) else {}
-            except Exception:
-                pass
-        return {}
 
     @staticmethod
     def _first_non_empty_string(*values: Any) -> str:
@@ -475,11 +426,7 @@ class RefreshTokenChatGPTRegistrationAdapter(BaseChatGPTRegistrationModeAdapter)
             RefreshTokenRegistrationEngine,
             RegistrationResult,
         )
-        from services.chatgpt_core.utils import (
-            decode_jwt_payload,
-            generate_random_birthday,
-            generate_random_name,
-        )
+        from services.chatgpt_core.utils import generate_random_birthday, generate_random_name
 
         email = str(getattr(stage1_result, "email", "") or context.email or "").strip()
         password = str(getattr(stage1_result, "password", "") or context.password or "")
@@ -511,65 +458,22 @@ class RefreshTokenChatGPTRegistrationAdapter(BaseChatGPTRegistrationModeAdapter)
 
         stage2_engine._log("[注册] 第二阶段：使用注册邮箱抓取完整 Auth/RT")
         email_adapter = EmailServiceAdapter(stage2_engine.email_service, email, stage2_engine._log)
-        stage1_metadata = getattr(stage1_result, "metadata", None)
-        stage1_metadata = stage1_metadata if isinstance(stage1_metadata, dict) else {}
-        stage1_context = stage1_metadata.get("registration_context")
-        stage1_context = stage1_context if isinstance(stage1_context, dict) else {}
-        first_name = str(stage1_context.get("first_name") or "").strip()
-        last_name = str(stage1_context.get("last_name") or "").strip()
-        birthdate = str(stage1_context.get("birthdate") or "").strip()
-        if not first_name or not last_name:
-            first_name, last_name = generate_random_name()
-        if not birthdate:
-            birthdate = generate_random_birthday()
-
-        if context.browser_mode in {"headless", "headed"}:
-            browser_ok, browser_payload = stage1_engine._capture_browser_oauth_tokens(
-                chatgpt_client=register_client,
-                email_addr=email,
-                password=password,
-                skymail_adapter=email_adapter,
-            )
-            if browser_ok and isinstance(browser_payload, dict):
-                access_token = str(browser_payload.get("access_token") or "").strip()
-                auth_claims = (
-                    decode_jwt_payload(access_token).get("https://api.openai.com/auth")
-                    or {}
-                )
-                account_id = str(
-                    browser_payload.get("account_id")
-                    or auth_claims.get("chatgpt_account_id")
-                    or ""
-                ).strip()
-                auth_payload = {
-                    "access_token": access_token,
-                    "refresh_token": str(browser_payload.get("refresh_token") or "").strip(),
-                    "id_token": str(browser_payload.get("id_token") or "").strip(),
-                    "session_token": str(browser_payload.get("session_token") or "").strip(),
-                    "account_id": account_id,
-                    "workspace_id": str(browser_payload.get("workspace_id") or account_id),
-                    "source": "registration_stage2_browser_oauth",
-                }
-            else:
-                auth_payload = None
-                stage2_engine._last_auth_capture_error = str(
-                    browser_payload or "注册第二阶段浏览器 OAuth 捕获失败"
-                )
-        else:
-            auth_payload = stage2_engine._capture_auth_via_fresh_login(
-                email=email,
-                password=password,
-                device_id=getattr(register_client, "device_id", "") or "",
-                user_agent=getattr(register_client, "ua", None),
-                sec_ch_ua=getattr(register_client, "sec_ch_ua", None),
-                impersonate=getattr(register_client, "impersonate", None),
-                browser_fingerprint=getattr(register_client, "fingerprint", None),
-                email_adapter=email_adapter,
-                first_name=first_name,
-                last_name=last_name,
-                birthdate=birthdate,
-                login_source="registration_stage2_full_auth",
-            )
+        first_name, last_name = generate_random_name()
+        birthdate = generate_random_birthday()
+        auth_payload = stage2_engine._capture_auth_via_fresh_login(
+            email=email,
+            password=password,
+            device_id=getattr(register_client, "device_id", "") or "",
+            user_agent=getattr(register_client, "ua", None),
+            sec_ch_ua=getattr(register_client, "sec_ch_ua", None),
+            impersonate=getattr(register_client, "impersonate", None),
+            browser_fingerprint=getattr(register_client, "fingerprint", None),
+            email_adapter=email_adapter,
+            first_name=first_name,
+            last_name=last_name,
+            birthdate=birthdate,
+            login_source="registration_stage2_full_auth",
+        )
         if not auth_payload:
             error = str(
                 getattr(stage2_engine, "_last_auth_capture_error", "")
@@ -601,6 +505,8 @@ class RefreshTokenChatGPTRegistrationAdapter(BaseChatGPTRegistrationModeAdapter)
             metadata={},
         )
         stage2_engine._apply_auth_payload_to_result(result, auth_payload)
+        stage1_metadata = getattr(stage1_result, "metadata", None)
+        stage1_metadata = stage1_metadata if isinstance(stage1_metadata, dict) else {}
         result.metadata = {
             key: value
             for key, value in stage1_metadata.items()
@@ -613,26 +519,8 @@ class RefreshTokenChatGPTRegistrationAdapter(BaseChatGPTRegistrationModeAdapter)
                 "registration_session_workspace_id",
                 "cookies",
                 "cookie_header",
-                "chatgpt_browser_runtime_profile",
             }
         }
-        if context.browser_mode in {"headless", "headed"}:
-            build_context = getattr(stage1_engine, "_build_registration_context_payload", None)
-            if callable(build_context):
-                registration_context = build_context(
-                    chatgpt_client=register_client,
-                    first_name=first_name,
-                    last_name=last_name,
-                    birthdate=birthdate,
-                )
-                result.metadata["registration_context"] = registration_context
-                if isinstance(registration_context, dict) and isinstance(
-                    registration_context.get("browser_runtime_profile"),
-                    dict,
-                ):
-                    result.metadata["chatgpt_browser_runtime_profile"] = dict(
-                        registration_context["browser_runtime_profile"]
-                    )
         result.metadata.update(
             {
                 "chatgpt_rt_registration_two_stage": True,
@@ -641,11 +529,7 @@ class RefreshTokenChatGPTRegistrationAdapter(BaseChatGPTRegistrationModeAdapter)
                 "registration_access_token_saved": True,
                 "registration_stage1_saved_account_id": saved_stage1_id,
                 "auth_capture_stage": "success",
-                "auth_capture_method": (
-                    "registration_stage2_browser_oauth"
-                    if context.browser_mode in {"headless", "headed"}
-                    else "registration_stage2_full_auth"
-                ),
+                "auth_capture_method": "registration_stage2_full_auth",
             }
         )
         try:
@@ -655,38 +539,9 @@ class RefreshTokenChatGPTRegistrationAdapter(BaseChatGPTRegistrationModeAdapter)
         return result
 
     def run(self, context: ChatGPTRegistrationContext):
-        if context.browser_mode in {"headless", "headed"}:
-            if self._parse_bool(
-                (context.extra_config or {}).get("chatgpt_existing_account_capture"),
-                default=False,
-            ):
-                return self._run_browser_existing_account_capture(context)
-            return self._run_two_stage_registration(context)
         if not self._two_stage_enabled(context.extra_config):
             return super().run(context)
         return self._run_two_stage_registration(context)
-
-    def _run_browser_existing_account_capture(
-        self,
-        context: ChatGPTRegistrationContext,
-    ):
-        from services.chatgpt_core.access_token_only_registration_engine import (
-            AccessTokenOnlyRegistrationEngine,
-        )
-
-        engine = AccessTokenOnlyRegistrationEngine(
-            email_service=context.email_service,
-            proxy_url=context.proxy_url,
-            browser_mode=context.browser_mode,
-            callback_logger=context.callback_logger,
-            max_retries=context.max_retries,
-            extra_config=dict(context.extra_config or {}),
-        )
-        if context.email is not None:
-            engine.email = context.email
-        if context.password is not None:
-            engine.password = context.password
-        return engine.run()
 
     def _run_two_stage_registration(self, context: ChatGPTRegistrationContext):
         from services.chatgpt_core.access_token_only_registration_engine import AccessTokenOnlyRegistrationEngine
@@ -721,34 +576,6 @@ class RefreshTokenChatGPTRegistrationAdapter(BaseChatGPTRegistrationModeAdapter)
         if not getattr(stage1_result, "success", False):
             return stage1_result
         if not str(getattr(stage1_result, "access_token", "") or "").strip():
-            stage1_metadata = getattr(stage1_result, "metadata", None)
-            if isinstance(stage1_metadata, dict) and stage1_metadata.get(
-                "registered_auth_pending"
-            ):
-                # Browser signup is already committed. Returning the pending
-                # account prevents a second signup submission for the same email.
-                stage1_metadata.update(
-                    {
-                        "chatgpt_rt_registration_two_stage": True,
-                        "registration_stage": "registered_auth_pending",
-                        "registration_stage_complete": True,
-                        "auth_capture_stage": "pending",
-                        "registration_full_auth_failed": True,
-                        "registration_full_auth_failed_policy": "keep_registered_auth_pending",
-                    }
-                )
-                mailbox_state = self._finalize_original_email_success(
-                    context.email_service,
-                    account_email=str(
-                        getattr(stage1_result, "email", "") or context.email or ""
-                    ).strip(),
-                    task_id=str((context.extra_config or {}).get("_current_task_id") or ""),
-                    result_code="registered_auth_pending",
-                    access_token_saved=False,
-                )
-                if mailbox_state:
-                    stage1_metadata["mailbox_state"] = mailbox_state
-                return stage1_result
             stage1_result.success = False
             stage1_result.error_message = "第一阶段无 RT 注册成功但未获取 access_token"
             return stage1_result
@@ -779,10 +606,6 @@ class RefreshTokenChatGPTRegistrationAdapter(BaseChatGPTRegistrationModeAdapter)
                 context.email_service,
                 account_email=str(getattr(stage1_result, "email", "") or context.email or "").strip(),
                 task_id=str((context.extra_config or {}).get("_current_task_id") or ""),
-                result_code="login_alive",
-                access_token_saved=bool(
-                    str(getattr(stage1_result, "access_token", "") or "").strip()
-                ),
             )
 
         stage2_extra = dict(context.extra_config or {})
@@ -834,18 +657,6 @@ class RefreshTokenChatGPTRegistrationAdapter(BaseChatGPTRegistrationModeAdapter)
         self._merge_stage_logs(stage1_result, stage1_result, stage2_result)
         stage1_result.success = True
         stage1_result.error_message = ""
-        stage1_result.metadata.update(
-            {
-                "registration_stage": "access_token_saved",
-                "auth_capture_stage": "failed",
-                "needs_auth_capture": True,
-                "auth_capture_required": True,
-                "registration_full_auth_failed": True,
-                "registration_full_auth_error": error_message,
-                "registration_full_auth_failed_policy": "keep_access_token_checkpoint",
-                "registration_access_token_partial_reason": error_message,
-            }
-        )
         stage1_result.metadata.setdefault("registration_stage1_saved_account_id", saved_stage1_id)
         self._mark_access_token_checkpoint(stage1_result)
         return stage1_result

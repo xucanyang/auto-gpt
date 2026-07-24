@@ -6,6 +6,17 @@
 
 ## [Unreleased] (未发布)
 
+## [2.8.30] - 2026-07-25
+
+### 变更 (Changed)
+- **注册链路整段回退到 2026-07-18 提交 `b880955` 的保存模型**：从该提交恢复 `access_token_only_registration_engine.py`、`refresh_token_registration_engine.py`、`chatgpt_registration_mode_adapter.py`、`chatgpt_client.py`、`oauth_client.py`、`sentinel_token.py`、`plugin.py`，以及对应注册专项测试。
+- **恢复“会话材料齐套才算注册成功”的落库语义**：开户后必须 `reuse_session_and_get_tokens` 拿到 Web AT / session_token / cookies / account_id 后才 `success` 并进入 `save_account`；撤销 7/24 之后的 `registered_auth_pending` 空壳成功入库，以及浏览器独立 OAuth recovery 作为注册收尾的路径。
+- **与 plus free+仅 AT 历史库存对齐**：注册成功默认继续产出 access_token + session_token + cookies + password/email 的 Web Session 包；`refresh_token`/`id_token` 不作为注册成功条件。RT 两阶段代码仍保留为可选（与 7/18 一致），Stage1 无 AT 时失败而非落空壳。
+- **兼容保留**：`sentinel_browser.py` 保持当前版本，避免手机号注册 / GoPay 等仍依赖后续 API 的模块被连带回退。侧栏版本同步为 `v2.8.30`。
+
+### 测试 (Tests)
+- 同步恢复 7/18 的 `test_chatgpt_registration_mode_adapter` / `test_access_token_only_checkout` / `test_chatgpt_register` / `test_register_task_controls`；上述 89 项通过。
+
 ## [2.8.29] - 2026-07-25
 
 ### 修复 (Fixed)
@@ -2658,4 +2669,8 @@
 
 ## 2026-07-25 07:07:41 +0800
 - 协议注册对齐 any-auto：Sentinel VM 解 t + client_auth_session_dump + signup continue
+- 发布模式: multi
+
+## 2026-07-25 07:48:45 +0800
+- v2.8.30: 注册链路回退到 7/18 b880955 保存模型（会话齐套才落库）
 - 发布模式: multi
