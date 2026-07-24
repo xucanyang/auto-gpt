@@ -1235,6 +1235,7 @@ function saveRegisterFormSettings(platform: string, values: Record<string, unkno
 
 function normalizeRegisterMailProviderOverride(value: unknown) {
   const normalized = String(value || '').trim().toLowerCase()
+  if (normalized === 'tempmail_api') return 'tempmail_local'
   return REGISTER_MAIL_PROVIDER_OVERRIDES.has(normalized) ? normalized : '__global__'
 }
 
@@ -3640,7 +3641,10 @@ export default function Accounts() {
         if (cancelled) return
         const provider = String(cfg?.mail_provider || 'luckmail').trim() || 'luckmail'
         const savedSettings = loadRegisterFormSettings(currentPlatform)
-        const savedProviderOverride = normalizeRegisterMailProviderOverride(savedSettings.mail_provider_override)
+        const hasSavedMailProfile = parseBooleanConfigValue(savedSettings.register_mail_profile_saved)
+        const savedProviderOverride = hasSavedMailProfile
+          ? normalizeRegisterMailProviderOverride(savedSettings.mail_provider_override)
+          : '__global__'
         const proxySettings = taskProxySettingsFromConfig(cfg)
         const savedEmail = window.localStorage.getItem('auto-chatgpt.manual_email_otp.email') || ''
         const configuredTempMailMode = String(cfg?.tempmail_mode || 'fixed_domain').trim().toLowerCase()
@@ -3649,15 +3653,15 @@ export default function Accounts() {
           ...parseStoredDomainList(cfg?.tempmail_fixed_domains),
           cfg?.tempmail_primary_domain,
         ])
-        const hasSavedTempMailMode = Object.prototype.hasOwnProperty.call(savedSettings, 'tempmail_mode')
-        const hasSavedTempMailDomains = Object.prototype.hasOwnProperty.call(savedSettings, 'tempmail_fixed_domains')
+        const hasSavedTempMailMode = hasSavedMailProfile && Object.prototype.hasOwnProperty.call(savedSettings, 'tempmail_mode')
+        const hasSavedTempMailDomains = hasSavedMailProfile && Object.prototype.hasOwnProperty.call(savedSettings, 'tempmail_fixed_domains')
         const tempmailMode = hasSavedTempMailMode
           ? normalizeRegisterTempMailMode(savedSettings.tempmail_mode, globalTempMailMode)
           : globalTempMailMode
         const tempmailFixedDomains = hasSavedTempMailDomains
           ? normalizeDomainList(savedSettings.tempmail_fixed_domains)
           : globalTempMailFixedDomains
-        const tempmailPrimaryDomain = Object.prototype.hasOwnProperty.call(savedSettings, 'tempmail_primary_domain')
+        const tempmailPrimaryDomain = hasSavedMailProfile && Object.prototype.hasOwnProperty.call(savedSettings, 'tempmail_primary_domain')
           ? String(savedSettings.tempmail_primary_domain || '').trim().replace(/^[@.]+/, '')
           : (tempmailFixedDomains[0] || '')
         setRegisterMailProvider(provider)
@@ -3708,9 +3712,16 @@ export default function Accounts() {
         if (cancelled) return
         setRegisterMailProvider('luckmail')
         const savedSettings = loadRegisterFormSettings(currentPlatform)
-        const savedProviderOverride = normalizeRegisterMailProviderOverride(savedSettings.mail_provider_override)
-        const savedTempMailMode = normalizeRegisterTempMailMode(savedSettings.tempmail_mode)
-        const savedTempMailDomains = normalizeDomainList(savedSettings.tempmail_fixed_domains)
+        const hasSavedMailProfile = parseBooleanConfigValue(savedSettings.register_mail_profile_saved)
+        const savedProviderOverride = hasSavedMailProfile
+          ? normalizeRegisterMailProviderOverride(savedSettings.mail_provider_override)
+          : '__global__'
+        const savedTempMailMode = hasSavedMailProfile
+          ? normalizeRegisterTempMailMode(savedSettings.tempmail_mode)
+          : 'fixed_domain'
+        const savedTempMailDomains = hasSavedMailProfile
+          ? normalizeDomainList(savedSettings.tempmail_fixed_domains)
+          : []
         const savedEmail = window.localStorage.getItem('auto-chatgpt.manual_email_otp.email') || ''
         registerForm.setFieldsValue({
           count: Number(savedSettings.count || 1) || 1,
@@ -3726,7 +3737,9 @@ export default function Accounts() {
           email_api_gmail_variant_rules: 'all',
           email_api_gmail_plus_tag_template: 'r{rand}',
           tempmail_mode: savedTempMailMode,
-          tempmail_primary_domain: String(savedSettings.tempmail_primary_domain || '').trim().replace(/^[@.]+/, '') || savedTempMailDomains[0] || '',
+          tempmail_primary_domain: hasSavedMailProfile
+            ? (String(savedSettings.tempmail_primary_domain || '').trim().replace(/^[@.]+/, '') || savedTempMailDomains[0] || '')
+            : '',
           tempmail_fixed_domains: savedTempMailDomains,
           email: String(savedSettings.email || savedEmail || '').trim(),
           login_password: '',
@@ -5386,6 +5399,7 @@ export default function Accounts() {
     try {
       validateTaskProxySettings(settingsPayload)
       saveRegisterFormSettings(currentPlatform, {
+        register_mail_profile_saved: true,
         count: settingsPayload.count,
         concurrency: settingsPayload.concurrency,
         register_delay_seconds: settingsPayload.register_delay_seconds,
