@@ -43,12 +43,47 @@ def _auth_browser_concurrency_limit() -> int:
 
 AUTH_BROWSER_MAX_CONCURRENCY = _auth_browser_concurrency_limit()
 _AUTH_BROWSER_SEMAPHORE = threading.BoundedSemaphore(AUTH_BROWSER_MAX_CONCURRENCY)
+_BROWSER_SLOT_STATE_LOCK = threading.Lock()
+_BROWSER_ACTIVE_COUNT = 0
 
 _BROWSER_WORKER_POLL_SECONDS = 0.2
 _BROWSER_WORKER_TERM_GRACE_SECONDS = 2.0
 _AUTH_BROWSER_HARD_TIMEOUT_DEFAULT_SECONDS = 150.0
 _SENTINEL_BROWSER_HARD_TIMEOUT_DEFAULT_SECONDS = 90.0
 _BROWSER_WORKER_ID_ENV = "AUTO_GPT_BROWSER_WORKER_ID"
+
+
+def _browser_second_slot_reserve_bytes() -> int:
+    try:
+        reserve_mib = int(
+            float(os.getenv("BROWSER_SECOND_SLOT_RESERVE_MIB", "1280") or 1280)
+        )
+    except (TypeError, ValueError):
+        reserve_mib = 1280
+    return max(512, min(reserve_mib, 2048)) * 1024 * 1024
+
+
+def _read_int_file(path: str) -> Optional[int]:
+    try:
+        with open(path, "r", encoding="ascii") as handle:
+            value = handle.read().strip()
+    except OSError:
+        return None
+    if not value or value == "max":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _browser_memory_allows_second_slot() -> tuple[bool, int, int, int]:
+    current = _read_int_file("/sys/fs/cgroup/memory.current")
+    limit = _read_int_file("/sys/fs/cgroup/memory.max")
+    reserve = _browser_second_slot_reserve_bytes()
+    if current is None or limit is None or limit <= 0:
+        return True, int(current or 0), int(limit or 0), reserve
+    return current + reserve <= limit, current, limit, reserve
 
 
 def _browser_hard_timeout_seconds(env_name: str, default: float) -> float:
@@ -397,16 +432,63 @@ def _run_with_browser_slot(
     logger: Callable[[str], None],
     stop_check: Optional[Callable[[], None]] = None,
 ) -> _BrowserWorkerOutcome:
-    acquired = _AUTH_BROWSER_SEMAPHORE.acquire(blocking=False)
+    global _BROWSER_ACTIVE_COUNT
+
+    def _try_acquire(*, blocking: bool, timeout: float = 0.0):
+        global _BROWSER_ACTIVE_COUNT
+        if blocking:
+            semaphore_acquired = _AUTH_BROWSER_SEMAPHORE.acquire(timeout=timeout)
+        else:
+            semaphore_acquired = _AUTH_BROWSER_SEMAPHORE.acquire(blocking=False)
+        if not semaphore_acquired:
+            return False, "capacity", None
+        with _BROWSER_SLOT_STATE_LOCK:
+            if _BROWSER_ACTIVE_COUNT >= 1:
+                memory_state = _browser_memory_allows_second_slot()
+                if not memory_state[0]:
+                    _AUTH_BROWSER_SEMAPHORE.release()
+                    return False, "memory", memory_state
+            _BROWSER_ACTIVE_COUNT += 1
+        return True, "", None
+
+    acquired, wait_reason, memory_state = _try_acquire(blocking=False)
+    memory_wait_logged = False
     if not acquired:
-        logger(
-            "Browser 全局并发槽已满，等待可用槽位 "
-            f"(limit={AUTH_BROWSER_MAX_CONCURRENCY}, operation={operation})"
-        )
+        if wait_reason == "memory" and memory_state is not None:
+            _allowed, current, limit, reserve = memory_state
+            logger(
+                "Browser 第二槽内存余量不足，保持单浏览器并等待: "
+                f"current={current} limit={limit} reserve={reserve} operation={operation}"
+            )
+            memory_wait_logged = True
+        else:
+            logger(
+                "Browser 全局并发槽已满，等待可用槽位 "
+                f"(limit={AUTH_BROWSER_MAX_CONCURRENCY}, operation={operation})"
+            )
         while not acquired:
             if stop_check is not None:
                 stop_check()
-            acquired = _AUTH_BROWSER_SEMAPHORE.acquire(timeout=0.5)
+            if wait_reason == "memory":
+                time.sleep(0.5)
+                acquired, wait_reason, memory_state = _try_acquire(blocking=False)
+            else:
+                acquired, wait_reason, memory_state = _try_acquire(
+                    blocking=True,
+                    timeout=0.5,
+                )
+            if (
+                not acquired
+                and wait_reason == "memory"
+                and memory_state is not None
+                and not memory_wait_logged
+            ):
+                _allowed, current, limit, reserve = memory_state
+                logger(
+                    "Browser 第二槽内存余量不足，保持单浏览器并等待: "
+                    f"current={current} limit={limit} reserve={reserve} operation={operation}"
+                )
+                memory_wait_logged = True
         logger(f"Browser 已获取等待槽位: operation={operation}")
     try:
         return _run_isolated_browser_transaction(
@@ -418,6 +500,8 @@ def _run_with_browser_slot(
         )
     finally:
         if acquired:
+            with _BROWSER_SLOT_STATE_LOCK:
+                _BROWSER_ACTIVE_COUNT = max(0, _BROWSER_ACTIVE_COUNT - 1)
             _AUTH_BROWSER_SEMAPHORE.release()
 
 

@@ -6,6 +6,17 @@
 
 ## [Unreleased] (未发布)
 
+## [2.8.15] - 2026-07-24
+
+### 优化 (Changed)
+- **浏览器 2 槽改为 cgroup 内存自适应**：`services/chatgpt_core/sentinel_browser.py` 保留单实例最大 2 套 Chromium，但不再无条件填满第二槽。第一套浏览器始终可运行；第二套仅在 `memory.current + reserve <= memory.max` 时启动，默认 reserve 为 1280 MiB，可通过 `BROWSER_SECOND_SLOT_RESERVE_MIB` 在 512-2048 MiB 范围调整。内存高水位时 Auth 或前置 Sentinel 会排队并记录当前值、上限与保留量，自动退化为单浏览器；建箱、协议请求、发码和 OTP 轮询的注册 worker 并发仍保持原配置。
+
+### 修复 (Fixed)
+- **避免 Python 高水位与双浏览器再次顶满 2.5 GiB**：`auto-gpt-plus` 的真实 200 目标 / 5 worker 压测显示，修复卡死和无界日志后，Python 匿名堆在活跃注册阶段仍可达到约 1.28 GiB；固定两套有头 Chromium 叠加时 cgroup 峰值达到约 2.40 GiB，仅余约 105 MiB。自适应第二槽在该状态下保持一个 Chromium，避免正常轮转任务重新触发 swap、`memory.events.max` 与 PSI 压力，同时在冷启动低占用时仍允许两套并行。
+
+### 测试 (Tests)
+- 新增第二槽内存保留回归，验证 cgroup 余量不足时第二事务不会进入、余量恢复后可继续并发且信号量正确释放；Sentinel/Auth 专项 18 项通过，侧栏版本同步更新为 `v2.8.15`。
+
 ## [2.8.14] - 2026-07-24
 
 ### 修复 (Fixed)
@@ -2393,4 +2404,8 @@
 
 ## 2026-07-24 09:33:11 +0800
 - 发布 v2.8.14：补齐 Chromium 跨 Session 硬超时清理
+- 发布模式: multi
+
+## 2026-07-24 09:46:19 +0800
+- 发布 v2.8.15：浏览器第二槽按 cgroup 内存自适应
 - 发布模式: multi

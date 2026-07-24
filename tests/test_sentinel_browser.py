@@ -291,6 +291,90 @@ emit({"type": "result", "value": {"status_code": 200}})
         self.assertTrue(auth_result and auth_result.ok)
         self.assertEqual(sentinel_result, "sentinel-token")
 
+    def test_second_browser_slot_waits_until_cgroup_memory_reserve_is_available(self):
+        active = 0
+        peak = 0
+        lock = threading.Lock()
+        first_started = threading.Event()
+        second_started = threading.Event()
+        allow_second = threading.Event()
+        release_workers = threading.Event()
+        logs: list[str] = []
+
+        def fake_transaction(_operation, _payload, **_kwargs):
+            nonlocal active, peak
+            with lock:
+                active += 1
+                peak = max(peak, active)
+                if active == 1:
+                    first_started.set()
+                if active == 2:
+                    second_started.set()
+            release_workers.wait(timeout=3)
+            with lock:
+                active -= 1
+            return _BrowserWorkerOutcome(
+                status="ok",
+                value={"status_code": 200},
+            )
+
+        def memory_state():
+            return (
+                allow_second.is_set(),
+                2_000_000_000,
+                2_684_354_560,
+                1_342_177_280,
+            )
+
+        with (
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser._AUTH_BROWSER_SEMAPHORE",
+                threading.BoundedSemaphore(2),
+            ),
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser.AUTH_BROWSER_MAX_CONCURRENCY",
+                2,
+            ),
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser._BROWSER_ACTIVE_COUNT",
+                0,
+            ),
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser._browser_memory_allows_second_slot",
+                side_effect=memory_state,
+            ),
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser._run_isolated_browser_transaction",
+                side_effect=fake_transaction,
+            ),
+        ):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                first = pool.submit(
+                    create_account_via_browser,
+                    name="Memory One",
+                    birthdate="1990-01-01",
+                    log_fn=logs.append,
+                )
+                self.assertTrue(first_started.wait(timeout=1))
+                second = pool.submit(
+                    create_account_via_browser,
+                    name="Memory Two",
+                    birthdate="1990-01-01",
+                    log_fn=logs.append,
+                )
+                time.sleep(0.15)
+                self.assertFalse(second_started.is_set())
+                allow_second.set()
+                self.assertTrue(second_started.wait(timeout=2))
+                release_workers.set()
+                first_result = first.result(timeout=2)
+                second_result = second.result(timeout=2)
+
+        self.assertEqual(peak, 2)
+        self.assertTrue(first_result and first_result.ok)
+        self.assertTrue(second_result and second_result.ok)
+        self.assertTrue(any("第二槽内存余量不足" in line for line in logs))
+
     def test_browser_token_requires_all_three_sentinel_signals(self):
         self.assertEqual(
             _sentinel_token_field_state('{"p":"pow","t":"telemetry","c":"challenge"}'),
