@@ -177,6 +177,52 @@ class BrowserRegistrationFlowTests(unittest.TestCase):
         self.assertEqual(result["status"], 422)
         self.assertIn("invalid", result["text"].lower())
 
+    def test_otp_strict_mode_rejects_success_without_next_state(self):
+        page = _FakePage()
+        api_result = {
+            "ok": True,
+            "status": 200,
+            "url": page.url,
+            "data": {},
+            "text": "",
+        }
+        clock = [0.0]
+
+        def fake_time():
+            clock[0] += 1.0
+            return clock[0]
+
+        with (
+            mock.patch.object(br, "_browser_pause"),
+            mock.patch.object(br, "_validate_browser_email_otp", return_value=api_result),
+            mock.patch.object(br.time, "time", side_effect=fake_time),
+            mock.patch.object(br.time, "sleep"),
+        ):
+            result = br._submit_otp_via_page(
+                page,
+                "123456",
+                lambda _message: None,
+                assume_success_without_state=False,
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], 200)
+        self.assertIn("仍停留", result["text"])
+
+    def test_invoke_otp_callback_supports_contextual_and_legacy_forms(self):
+        contextual = mock.Mock(return_value="123456")
+        self.assertEqual(
+            br._invoke_otp_callback(contextual, {"phase": "oauth_email_otp"}),
+            "123456",
+        )
+        contextual.assert_called_once_with({"phase": "oauth_email_otp"})
+
+        keyword_only = mock.Mock(side_effect=lambda **kwargs: kwargs["phase"])
+        self.assertEqual(
+            br._invoke_otp_callback(keyword_only, {"phase": "oauth_email_otp"}),
+            "oauth_email_otp",
+        )
+
     def test_email_adapter_excludes_codes_used_by_protocol_phase(self):
         service = mock.Mock()
         service.get_verification_code.return_value = "654321"

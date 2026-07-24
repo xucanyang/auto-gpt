@@ -6,6 +6,15 @@
 
 ## [Unreleased] (未发布)
 
+## [2.8.19] - 2026-07-24
+
+### 修复 (Fixed)
+- **修复独立 Camoufox OAuth 二次邮箱验证码无法推进**：`services/chatgpt_core/browser_registration.py` 为 fresh Codex OAuth 记录邮箱提交时间并向邮箱读取器传递阶段/时间戳，避免重复消费注册阶段旧 OTP；失败重试时复用 HTTP OAuth 的 `passwordless/send-otp` 与 `email-otp/send` 重发顺序，并将真实 `device_id`、浏览器 User-Agent 和 Sentinel 传入校验兜底。
+- **收紧浏览器 OAuth OTP 状态判定**：独立 OAuth 不再把“HTTP 200 但页面仍停留在邮箱验证码页”伪判定为成功，会根据服务端返回的下一状态导航到 `add_phone`、workspace 或 callback，只有状态真正推进才继续提取 AT/RT。
+
+### 测试 (Tests)
+- 增加 fresh OAuth OTP 重发、跨阶段时间戳与严格状态推进回归覆盖；保留已有注册后备和 AT/RT 提取专项测试。
+
 ## [2.8.18] - 2026-07-24
 
 ### 修复 (Fixed)
@@ -2487,4 +2496,8 @@
 
 ## 2026-07-24 14:26:35 +0800
 - 修复独立浏览器 OAuth recovery 使用 auto-gpt OAuth 常量
+- 发布模式: multi
+
+## 2026-07-24 14:41:39 +0800
+- 修复独立浏览器 OAuth OTP 重发、时间戳过滤与严格状态推进
 - 发布模式: multi

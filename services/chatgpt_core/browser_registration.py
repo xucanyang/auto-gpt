@@ -1887,6 +1887,20 @@ def _submit_login_email_via_page(page, email: str, log) -> dict:
     return {"ok": False, "status": 0, "url": last_url, "data": None, "text": "OAuth 邮箱页提交后未跳转"}
 
 
+def _invoke_otp_callback(otp_callback, payload: dict | None = None):
+    """Call OTP providers from both legacy no-arg and contextual forms."""
+    if not callable(otp_callback):
+        return None
+    context = dict(payload or {})
+    try:
+        return otp_callback(context)
+    except TypeError:
+        try:
+            return otp_callback(**context)
+        except TypeError:
+            return otp_callback()
+
+
 def _do_codex_oauth(page, cookies_dict: dict, email: str, password: str, otp_callback, phone_callback, proxy: str | None, log) -> dict | None:
     """在真实浏览器会话内完成 Codex OAuth，返回完整 token 包。"""
     from .oauth import generate_oauth_url
@@ -1907,6 +1921,8 @@ def _do_codex_oauth(page, cookies_dict: dict, email: str, password: str, otp_cal
         user_agent = _random_chrome_ua()
     device_id = str(cookies_dict.get("oai-did") or uuid.uuid4())
     log(f"  OAuth state={oauth_start.state[:20]}...")
+    oauth_email_submitted_at: float | None = None
+    oauth_otp_attempt = 0
 
     try:
         try:
@@ -1955,6 +1971,10 @@ def _do_codex_oauth(page, cookies_dict: dict, email: str, password: str, otp_cal
                 log(f"  OAuth 邮箱页提交状态: {email_resp.get('status', 0)}")
                 if not email_resp.get("ok"):
                     raise RuntimeError(f"OAuth 邮箱页提交失败: {(email_resp.get('text') or '')[:300]}")
+                # The email submit itself normally sends the first OTP.  Keep
+                # a timestamp cutoff so the mailbox cannot return the signup
+                # OTP from the preceding registration phase.
+                oauth_email_submitted_at = time.time() - 8
                 continue
 
             if state["page_type"] in {"login_password", "create_account_password"}:
@@ -1970,15 +1990,91 @@ def _do_codex_oauth(page, cookies_dict: dict, email: str, password: str, otp_cal
                 if not otp_callback:
                     log("  ⚠️ OAuth 需要邮箱 OTP 但没有 otp_callback")
                     return None
+                oauth_otp_attempt += 1
+                otp_sent_at = oauth_email_submitted_at
+                # If the first code was rejected or the flow entered the OTP
+                # page directly, explicitly request a fresh code before the
+                # next mailbox read. This mirrors OAuthClient's resend path.
+                if otp_sent_at is None or oauth_otp_attempt > 1:
+                    sent_ok, sent_at = _send_browser_oauth_email_otp(
+                        page,
+                        device_id=device_id,
+                        user_agent=user_agent,
+                        referer=str(
+                            state.get("current_url")
+                            or state.get("continue_url")
+                            or f"{OPENAI_AUTH}/email-verification"
+                        ),
+                        log=log,
+                    )
+                    if sent_ok and sent_at is not None:
+                        otp_sent_at = sent_at
+                        oauth_email_submitted_at = sent_at
+                    else:
+                        log("  OAuth OTP 重发未确认成功，继续按现有页面等待")
                 log("  OAuth 等待邮箱验证码...")
-                code = otp_callback()
+                callback_payload = {
+                    "otp_sent_at": otp_sent_at,
+                    "phase": "browser_oauth_email_otp",
+                    "page_type": "email_otp_verification",
+                }
+                callback_value = _invoke_otp_callback(otp_callback, callback_payload)
+                if isinstance(callback_value, dict):
+                    code = str(
+                        callback_value.get("code")
+                        or callback_value.get("otp")
+                        or callback_value.get("value")
+                        or ""
+                    ).strip()
+                else:
+                    code = str(callback_value or "").strip()
                 if not code:
                     log("  ⚠️ OAuth OTP 获取失败")
+                    if oauth_otp_attempt < 3:
+                        oauth_email_submitted_at = None
+                        continue
                     return None
-                otp_resp = _submit_otp_via_page(page, code, log)
+                otp_resp = _submit_otp_via_page(
+                    page,
+                    code,
+                    log,
+                    device_id=device_id,
+                    user_agent=user_agent,
+                    referer=str(
+                        state.get("current_url")
+                        or state.get("continue_url")
+                        or f"{OPENAI_AUTH}/email-verification"
+                    ),
+                    assume_success_without_state=False,
+                )
                 log(f"  OAuth 验证码页提交状态: {otp_resp.get('status', 0)}")
                 if not otp_resp.get("ok"):
-                    raise RuntimeError(f"OAuth 验证码校验失败: {(otp_resp.get('text') or '')[:300]}")
+                    detail = str(otp_resp.get("text") or "OAuth 验证码校验失败")[:300]
+                    log(f"  OAuth OTP 未推进状态: {detail}")
+                    if oauth_otp_attempt < 3:
+                        oauth_email_submitted_at = None
+                        continue
+                    raise RuntimeError(f"OAuth 验证码校验失败: {detail}")
+                next_state = _extract_flow_state(
+                    otp_resp.get("data") if isinstance(otp_resp.get("data"), dict) else None,
+                    str(otp_resp.get("url") or page.url or ""),
+                )
+                if not next_state.get("page_type") or next_state.get("page_type") == "email_otp_verification":
+                    next_state = _derive_oauth_state_from_page(page)
+                if next_state.get("page_type") and next_state.get("page_type") != "email_otp_verification":
+                    state = next_state
+                    target_url = _normalize_url(
+                        str(next_state.get("continue_url") or next_state.get("current_url") or ""),
+                        OPENAI_AUTH,
+                    )
+                    if target_url and target_url != str(page.url or "") and "api/accounts/" not in target_url:
+                        try:
+                            page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
+                        except Exception as exc:
+                            callback_url = _extract_callback_url_from_exception(exc)
+                            if callback_url:
+                                return _submit_callback_result(callback_url, oauth_start, proxy)
+                            log(f"  OAuth OTP 后续页面导航异常: {exc}")
                 continue
 
             if state["page_type"] == "about_you":
@@ -2663,6 +2759,82 @@ def _validate_browser_email_otp(
     )
 
 
+def _send_browser_oauth_email_otp(
+    page,
+    *,
+    device_id: str,
+    user_agent: str,
+    referer: str,
+    log,
+) -> tuple[bool, float | None]:
+    """Request a fresh OAuth OTP and return a mailbox timestamp cutoff.
+
+    The passwordless login page can display an OTP form while the only message
+    in the forwarding mailbox is the code consumed by the preceding signup
+    phase.  The HTTP OAuth client explicitly resends in this situation; the
+    browser recovery path must do the same and pass the cutoff to its mailbox
+    reader so an old code cannot be submitted to a new auth session.
+    """
+    effective_referer = referer or f"{OPENAI_AUTH}/email-verification"
+    common_extra = {
+        "sec-fetch-site": "same-origin",
+        "oai-device-id": device_id,
+        **_generate_datadog_trace_headers(),
+    }
+    attempts = (
+        (
+            "POST",
+            f"{OPENAI_AUTH}/api/accounts/passwordless/send-otp",
+            "passwordless/send-otp",
+            "application/json",
+        ),
+        (
+            "GET",
+            f"{OPENAI_AUTH}/api/accounts/email-otp/send",
+            "email-otp/send",
+            "",
+        ),
+    )
+    for method, url, label, content_type in attempts:
+        sent_at = time.time() - 8
+        headers = _build_browser_headers(
+            user_agent=user_agent,
+            accept="application/json, text/plain, */*",
+            referer=effective_referer,
+            origin=OPENAI_AUTH,
+            content_type=content_type,
+            extra_headers=common_extra,
+        )
+        try:
+            sentinel = _build_browser_sentinel_token(
+                page,
+                device_id,
+                "email_otp_send",
+                user_agent,
+            )
+        except Exception as exc:
+            sentinel = ""
+            log(f"  OAuth {label} Sentinel 生成失败，继续请求: {exc}")
+        if sentinel:
+            headers["openai-sentinel-token"] = sentinel
+        try:
+            result = _browser_fetch(
+                page,
+                url,
+                method=method,
+                headers=headers,
+                redirect="follow",
+            )
+        except Exception as exc:
+            log(f"  OAuth {label} 异常: {exc}")
+            continue
+        status = int(result.get("status") or 0)
+        log(f"  OAuth {label} -> {status}")
+        if 200 <= status < 300 or result.get("ok"):
+            return True, sent_at
+    return False, None
+
+
 def _submit_browser_about_you(
     page,
     device_id: str,
@@ -3126,6 +3298,7 @@ def _submit_otp_via_page(
     user_agent: str = "",
     referer: str = "",
     allow_api_fallback: bool = True,
+    assume_success_without_state: bool = True,
 ) -> dict:
     otp = str(code or "").strip()
     if not otp:
@@ -3300,6 +3473,14 @@ def _submit_otp_via_page(
                 derived = _derive_registration_state_from_page(page)
                 if derived.get("page_type") and derived.get("page_type") != "email_otp_verification":
                     return {"ok": True, "status": status or 200, "url": effective_url, "data": payload, "text": ""}
+                if not assume_success_without_state:
+                    return {
+                        "ok": False,
+                        "status": status or 200,
+                        "url": effective_url,
+                        "data": payload,
+                        "text": "验证码校验返回成功但页面仍停留在邮箱验证码页",
+                    }
                 # The validate endpoint can return an empty 204 while the SPA
                 # keeps the same URL. Its successful contract is the next
                 # about_you step, so expose that state to the outer machine.
