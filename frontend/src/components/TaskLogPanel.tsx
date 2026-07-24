@@ -253,13 +253,17 @@ export function TaskLogPanel({ taskId, onDone, showTaskControls = true }: TaskLo
             stop_mode?: StopMode
           }
           meta?: { current?: TaskCurrentState }
+          log_next_index?: number
         }
         if (cancelled) return true
 
         setTaskSnapshot(snapshot)
         const snapshotLines = Array.isArray(snapshot.logs) ? snapshot.logs : []
-        setLines(snapshotLines)
-        nextSinceRef.current = snapshotLines.length
+        setLines(snapshotLines.slice(-4000))
+        const snapshotNextIndex = Number(snapshot.log_next_index)
+        nextSinceRef.current = Number.isFinite(snapshotNextIndex)
+          ? Math.max(0, snapshotNextIndex)
+          : snapshotLines.length
         const snapshotStopMode = snapshot.control?.stop_mode
         setStopMode(
           snapshotStopMode === 'after_current' || snapshotStopMode === 'immediate'
@@ -309,7 +313,7 @@ export function TaskLogPanel({ taskId, onDone, showTaskControls = true }: TaskLo
               const logLine = payload.line
               if (typeof logLine === 'string') {
                 nextSinceRef.current += 1
-                setLines((previous) => [...previous, logLine])
+                setLines((previous) => [...previous, logLine].slice(-4000))
               }
               if (payload.done) {
                 const terminal = getTaskTerminalStatus(payload.status) || 'done'

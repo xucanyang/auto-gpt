@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 import logging
@@ -32,6 +33,15 @@ class SkipCurrentAttemptRequested(TaskInterruption):
 
 
 TERMINAL_TASK_STATUSES = frozenset({"done", "failed", "stopped", "partial", "interrupted"})
+
+DEFAULT_ACTIVE_MAX_LOG_ENTRIES = 4000
+DEFAULT_ACTIVE_MAX_LOG_BYTES = 4 * 1024 * 1024
+DEFAULT_FINISHED_MAX_LOG_ENTRIES = 500
+DEFAULT_FINISHED_MAX_LOG_BYTES = 512 * 1024
+
+
+def _log_entry_bytes(entry: str) -> int:
+    return len(str(entry or "").encode("utf-8", errors="replace"))
 
 
 class AttemptOutcome(str, Enum):
@@ -505,7 +515,11 @@ class RegisterTaskRecord:
     meta: dict[str, Any] = field(default_factory=dict)
     status: str = "pending"
     progress: str = "0/0"
-    logs: list[str] = field(default_factory=list)
+    logs: deque[str] = field(default_factory=deque)
+    logs_truncated: bool = False
+    dropped_log_entries: int = 0
+    dropped_log_bytes: int = 0
+    _retained_log_bytes: int = field(default=0, repr=False)
     success: int = 0
     skipped: int = 0
     errors: list[str] = field(default_factory=list)
@@ -527,6 +541,12 @@ class RegisterTaskRecord:
             "meta": dict(self.meta),
             "progress": self.progress,
             "logs": list(self.logs),
+            "logs_truncated": self.logs_truncated,
+            "dropped_log_entries": self.dropped_log_entries,
+            "dropped_log_bytes": self.dropped_log_bytes,
+            "retained_log_bytes": self._retained_log_bytes,
+            "log_start_index": self.dropped_log_entries,
+            "log_next_index": self.dropped_log_entries + len(self.logs),
             "success": self.success,
             "skipped": self.skipped,
             "errors": list(self.errors),
@@ -558,13 +578,42 @@ class RegisterTaskStore:
         *,
         max_finished_tasks: int = 200,
         cleanup_threshold: int = 250,
+        active_max_log_entries: int = DEFAULT_ACTIVE_MAX_LOG_ENTRIES,
+        active_max_log_bytes: int = DEFAULT_ACTIVE_MAX_LOG_BYTES,
+        finished_max_log_entries: int = DEFAULT_FINISHED_MAX_LOG_ENTRIES,
+        finished_max_log_bytes: int = DEFAULT_FINISHED_MAX_LOG_BYTES,
         on_terminal: Callable[[str, dict[str, Any]], None] | None = None,
     ):
         self._lock = threading.Lock()
         self._records: dict[str, RegisterTaskRecord] = {}
         self.max_finished_tasks = max_finished_tasks
         self.cleanup_threshold = cleanup_threshold
+        self.active_max_log_entries = max(1, int(active_max_log_entries or 1))
+        self.active_max_log_bytes = max(1, int(active_max_log_bytes or 1))
+        self.finished_max_log_entries = max(1, int(finished_max_log_entries or 1))
+        self.finished_max_log_bytes = max(1, int(finished_max_log_bytes or 1))
         self._on_terminal = on_terminal
+
+    @staticmethod
+    def _trim_record_logs(
+        record: RegisterTaskRecord,
+        *,
+        max_entries: int,
+        max_bytes: int,
+    ) -> None:
+        while record.logs and (
+            len(record.logs) > max_entries
+            or record._retained_log_bytes > max_bytes
+        ):
+            dropped = record.logs.popleft()
+            dropped_bytes = _log_entry_bytes(dropped)
+            record._retained_log_bytes = max(
+                0,
+                record._retained_log_bytes - dropped_bytes,
+            )
+            record.logs_truncated = True
+            record.dropped_log_entries += 1
+            record.dropped_log_bytes += dropped_bytes
 
     def set_terminal_callback(
         self,
@@ -666,7 +715,14 @@ class RegisterTaskStore:
             record = self._records.get(task_id)
             if record is None:
                 return
-            record.logs.append(entry)
+            normalized_entry = str(entry or "")
+            record.logs.append(normalized_entry)
+            record._retained_log_bytes += _log_entry_bytes(normalized_entry)
+            self._trim_record_logs(
+                record,
+                max_entries=self.active_max_log_entries,
+                max_bytes=self.active_max_log_bytes,
+            )
             record.updated_at = time.time()
 
     def mark_running(self, task_id: str) -> None:
@@ -706,6 +762,7 @@ class RegisterTaskStore:
     ) -> None:
         terminal_snapshot: dict[str, Any] | None = None
         callback: Callable[[str, dict[str, Any]], None] | None = None
+        terminal_record: RegisterTaskRecord | None = None
         with self._lock:
             record = self._records[task_id]
             # A graceful request is only a dispatch gate.  Runners report
@@ -728,6 +785,7 @@ class RegisterTaskStore:
             if final_status in TERMINAL_TASK_STATUSES:
                 terminal_snapshot = record.to_dict()
                 callback = self._on_terminal
+                terminal_record = record
 
         if callback is not None and terminal_snapshot is not None:
             # SQLite can briefly be locked by an account/state update just
@@ -746,6 +804,18 @@ class RegisterTaskStore:
                     if retry_index < 2:
                         time.sleep(0.05 * (retry_index + 1))
 
+        if terminal_record is not None:
+            # The durable callback must observe the larger active-task window.
+            # Only its completion attempts may compact the in-memory copy.
+            with self._lock:
+                current_record = self._records.get(task_id)
+                if current_record is terminal_record:
+                    self._trim_record_logs(
+                        current_record,
+                        max_entries=self.finished_max_log_entries,
+                        max_bytes=self.finished_max_log_bytes,
+                    )
+
     def snapshot(self, task_id: str) -> dict[str, Any]:
         with self._lock:
             return self._records[task_id].to_dict()
@@ -758,6 +828,18 @@ class RegisterTaskStore:
         with self._lock:
             record = self._records[task_id]
             return list(record.logs), record.status
+
+    def log_window_state(self, task_id: str) -> tuple[list[str], str, int, int]:
+        with self._lock:
+            record = self._records[task_id]
+            logs = list(record.logs)
+            start_index = int(record.dropped_log_entries)
+            return (
+                logs,
+                record.status,
+                start_index,
+                start_index + len(logs),
+            )
 
     def cleanup(self) -> None:
         with self._lock:

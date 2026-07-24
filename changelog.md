@@ -6,6 +6,20 @@
 
 ## [Unreleased] (未发布)
 
+## [2.8.13] - 2026-07-24
+
+### 优化 (Changed)
+- **Sentinel 与 Auth Chromium 共用全局容量**：`services/chatgpt_core/sentinel_browser.py` 将前置 Sentinel token 浏览器和最终 Auth 开户浏览器统一纳入进程级 2 槽闸门。注册 worker 仍可按任务配置并发执行建箱、发码和 OTP 轮询，但单个实例内任意时刻最多运行两套 Playwright Chromium，避免注册并发 5 时前置浏览器绕过 Auth 限制叠加占满 2.5 GiB 容器。
+- **任务日志改为有界内存窗口**：`core/task_runtime.py` 按 UTF-8 实际字节限制活跃任务为 4000 条 / 4 MiB，终态快照完成 SQLite 持久化后将内存副本压缩为 500 条 / 512 KiB；`api/tasks.py` 将已完成任务内存保留量从 200 个降到 50 个。快照新增 `logs_truncated`、丢弃条数/字节数和单调日志游标，历史 TaskLog 继续保留较大的活跃窗口，不会被终态内存压缩后的重复写入覆盖。
+
+### 修复 (Fixed)
+- **冻结的 Renderer 不再永久占用 Auth 并发槽**：新增 `services/chatgpt_core/sentinel_browser_worker.py`，每次 Sentinel/Auth 浏览器事务都在独立 OS session 中运行，代理桥、Playwright Node driver 与 Chromium 继承同一进程组。父进程为 Sentinel 设置默认 90 秒、Auth 开户设置默认 150 秒硬截止；超时或立即停止时先 TERM、再 KILL 整个进程组，并在 `finally` 释放浏览器槽，修复 `page.evaluate(SentinelSDK.token)` 冻结后 `browser.close()` 永远无法执行、后续开户只剩一个可用槽的问题。截止时间可分别通过 `SENTINEL_BROWSER_HARD_TIMEOUT_SECONDS` 与 `AUTH_BROWSER_HARD_TIMEOUT_SECONDS` 调整。
+- **任务停止可以中断正在运行的浏览器事务**：`ChatGPTClient`、`OAuthClient` 与 AccessToken 注册引擎将任务控制检查传到浏览器父进程；等待槽位或浏览器运行期间收到停止请求，会先完整清理子进程组再传播原始任务中断，不再等待页面内部 JavaScript 超时。
+- **日志窗口移动后 SSE 仍持续推送**：`api/tasks.py` 与 `frontend/src/components/TaskLogPanel.tsx` 不再把当前数组长度当作永久游标，改用 `log_start_index / log_next_index` 单调序号。活跃日志达到裁剪上限后，新日志仍会实时到达，前端自身也只保留最近 4000 行，避免长任务把浏览器页面内存同步拖高。
+
+### 测试 (Tests)
+- 扩展 Sentinel/Auth、任务运行时、SQLite 终态历史和 SSE 回归，覆盖 worker 正常结果与日志传输、整个子进程组硬超时清理、停止中断、超时后槽位复用、前置 Sentinel 与 Auth 共享容量、UTF-8 条数/字节裁剪、持久化先于内存压缩及移动窗口游标；专项注册链路 86 项通过，前端侧栏版本同步更新为 `v2.8.13`。
+
 ## [2.8.12] - 2026-07-24
 
 ### 修复 (Fixed)
@@ -2363,4 +2377,8 @@
 
 ## 2026-07-24 07:01:38 +0800
 - 发布 v2.8.12：修复注册配置强刷导致的重复请求
+- 发布模式: multi
+
+## 2026-07-24 09:21:21 +0800
+- 发布 v2.8.13：修复 Auth 浏览器卡死与任务内存膨胀
 - 发布模式: multi

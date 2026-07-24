@@ -559,6 +559,93 @@ def test_api_tasks_preserves_blank_log_lines_in_sse(monkeypatch):
     assert events[-1] == {"done": True, "status": "done"}
 
 
+def test_api_task_sse_uses_monotonic_cursor_after_log_window_trim(monkeypatch):
+    from api import tasks
+    from core.task_runtime import RegisterTaskStore
+
+    task_id = "task_trimmed_log_sse"
+    store = RegisterTaskStore(
+        active_max_log_entries=3,
+        active_max_log_bytes=1024,
+        finished_max_log_entries=3,
+        finished_max_log_bytes=1024,
+    )
+    store.create(task_id, platform="chatgpt", total=1, source="unit")
+    for index in range(5):
+        store.append_log(task_id, f"line-{index}")
+    store.finish(task_id, status="done", success=1, skipped=0, errors=[])
+    monkeypatch.setattr(tasks, "_task_store", store)
+
+    snapshot = store.snapshot(task_id)
+    assert snapshot["log_start_index"] == 2
+    assert snapshot["log_next_index"] == 5
+
+    async def collect_events():
+        response = await tasks.stream_logs(task_id, since=0)
+        events = []
+        async for chunk in response.body_iterator:
+            text = chunk.decode() if isinstance(chunk, bytes) else chunk
+            for line in text.splitlines():
+                if line.startswith("data: "):
+                    events.append(json.loads(line[6:]))
+        return events
+
+    events = asyncio.run(collect_events())
+
+    assert events[:-1] == [
+        {"line": "line-2"},
+        {"line": "line-3"},
+        {"line": "line-4"},
+    ]
+    assert events[-1] == {"done": True, "status": "done"}
+
+
+def test_terminal_history_keeps_persisted_active_window_after_memory_compaction(
+    monkeypatch,
+    tmp_path,
+):
+    from api import tasks
+    from core.task_runtime import RegisterTaskStore
+
+    test_engine = create_engine(
+        f"sqlite:///{tmp_path / 'terminal_window.db'}",
+        connect_args={"check_same_thread": False},
+    )
+    SQLModel.metadata.create_all(test_engine)
+    monkeypatch.setattr(tasks, "engine", test_engine)
+
+    store = RegisterTaskStore(
+        active_max_log_entries=10,
+        active_max_log_bytes=1024,
+        finished_max_log_entries=2,
+        finished_max_log_bytes=1024,
+    )
+    store.set_terminal_callback(tasks._persist_terminal_task_snapshot)
+    monkeypatch.setattr(tasks, "_task_store", store)
+    task_id = "task_terminal_window"
+    store.create(task_id, platform="chatgpt", total=1, source="unit")
+    for entry in ("line-1", "line-2", "line-3", "line-4"):
+        store.append_log(task_id, entry)
+
+    store.finish(task_id, status="done", success=1, skipped=0, errors=[])
+    assert store.snapshot(task_id)["logs"] == ["line-3", "line-4"]
+
+    # Historical runners may issue a second terminal persistence call after
+    # finish(). It must not replace the larger durable window with the compact
+    # in-memory copy.
+    tasks._persist_task_snapshot(
+        task_id,
+        attempt_outcome="runner_terminal_followup",
+    )
+
+    with Session(test_engine) as session:
+        row = session.exec(select(TaskLog).where(TaskLog.task_id == task_id)).one()
+        detail = json.loads(row.detail_json)
+    assert detail["logs"] == ["line-1", "line-2", "line-3", "line-4"]
+    assert detail["log_start_index"] == 0
+    assert detail["log_next_index"] == 4
+
+
 def test_batch_oaipay_upload_task_logging_saves_attempt_outcome(tmp_path, monkeypatch):
     from sqlmodel import create_engine
     from api import tasks

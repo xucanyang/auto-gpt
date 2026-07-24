@@ -5,7 +5,12 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import selectors
+import signal
+import subprocess
+import sys
 import threading
+import time
 import uuid
 from contextlib import ExitStack
 from dataclasses import dataclass, field
@@ -38,6 +43,298 @@ def _auth_browser_concurrency_limit() -> int:
 
 AUTH_BROWSER_MAX_CONCURRENCY = _auth_browser_concurrency_limit()
 _AUTH_BROWSER_SEMAPHORE = threading.BoundedSemaphore(AUTH_BROWSER_MAX_CONCURRENCY)
+
+_BROWSER_WORKER_POLL_SECONDS = 0.2
+_BROWSER_WORKER_TERM_GRACE_SECONDS = 2.0
+_AUTH_BROWSER_HARD_TIMEOUT_DEFAULT_SECONDS = 150.0
+_SENTINEL_BROWSER_HARD_TIMEOUT_DEFAULT_SECONDS = 90.0
+
+
+def _browser_hard_timeout_seconds(env_name: str, default: float) -> float:
+    try:
+        configured = float(os.getenv(env_name, str(default)) or default)
+    except (TypeError, ValueError):
+        configured = default
+    return max(30.0, min(configured, 600.0))
+
+
+@dataclass
+class _BrowserWorkerOutcome:
+    status: str
+    value: Any = None
+    error: str = ""
+    exit_code: Optional[int] = None
+
+
+def _browser_worker_command(protocol_fd: int) -> list[str]:
+    return [
+        sys.executable,
+        "-m",
+        "services.chatgpt_core.sentinel_browser_worker",
+        str(protocol_fd),
+    ]
+
+
+def _terminate_browser_worker_group(
+    process: subprocess.Popen[bytes],
+    *,
+    logger: Callable[[str], None],
+) -> None:
+    """Terminate the worker and every Playwright/Chromium descendant it owns."""
+    group_id = int(process.pid)
+    try:
+        os.killpg(group_id, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    except Exception as exc:
+        logger(f"Browser Worker 进程组 SIGTERM 失败: {exc}")
+        if process.poll() is None:
+            try:
+                process.terminate()
+            except Exception:
+                pass
+
+    deadline = time.monotonic() + _BROWSER_WORKER_TERM_GRACE_SECONDS
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            try:
+                os.killpg(group_id, 0)
+            except ProcessLookupError:
+                return
+            except Exception:
+                break
+        time.sleep(0.05)
+
+    try:
+        os.killpg(group_id, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except Exception as exc:
+        logger(f"Browser Worker 进程组 SIGKILL 失败: {exc}")
+        if process.poll() is None:
+            try:
+                process.kill()
+            except Exception:
+                pass
+    try:
+        process.wait(timeout=1.0)
+    except Exception:
+        pass
+
+
+def _decode_browser_worker_message(
+    raw_line: bytes,
+    *,
+    logger: Callable[[str], None],
+) -> Optional[_BrowserWorkerOutcome]:
+    try:
+        message = json.loads(raw_line.decode("utf-8"))
+    except Exception as exc:
+        logger(f"Browser Worker 返回了无效协议消息: {exc}")
+        return None
+    if not isinstance(message, dict):
+        return None
+    kind = str(message.get("type") or "")
+    if kind == "log":
+        logger(str(message.get("message") or ""))
+        return None
+    if kind == "result":
+        return _BrowserWorkerOutcome(status="ok", value=message.get("value"))
+    if kind == "error":
+        return _BrowserWorkerOutcome(
+            status="error",
+            error=str(message.get("error") or "browser worker failed")[:1000],
+        )
+    logger(f"Browser Worker 返回了未知消息类型: {kind or '<empty>'}")
+    return None
+
+
+def _run_isolated_browser_transaction(
+    operation: str,
+    payload: dict[str, Any],
+    *,
+    hard_timeout_seconds: float,
+    logger: Callable[[str], None],
+    stop_check: Optional[Callable[[], None]] = None,
+) -> _BrowserWorkerOutcome:
+    """Run one browser transaction in a killable OS process group."""
+    read_fd, write_fd = os.pipe()
+    process: Optional[subprocess.Popen[bytes]] = None
+    selector = selectors.DefaultSelector()
+    protocol_buffer = b""
+    outcome: Optional[_BrowserWorkerOutcome] = None
+    timed_out = False
+    interrupted: Optional[BaseException] = None
+
+    try:
+        process = subprocess.Popen(
+            _browser_worker_command(write_fd),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            pass_fds=(write_fd,),
+            start_new_session=True,
+            close_fds=True,
+            bufsize=0,
+        )
+        os.close(write_fd)
+        write_fd = -1
+        selector.register(read_fd, selectors.EVENT_READ)
+
+        request_bytes = json.dumps(
+            {"operation": str(operation), "payload": dict(payload or {})},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if process.stdin is None:
+            raise RuntimeError("browser worker stdin unavailable")
+        request_view = memoryview(request_bytes)
+        while request_view:
+            written = process.stdin.write(request_view)
+            if not written:
+                raise BrokenPipeError("browser worker closed stdin before request completed")
+            request_view = request_view[written:]
+        process.stdin.close()
+
+        deadline = time.monotonic() + max(float(hard_timeout_seconds), 0.1)
+        protocol_eof = False
+        while True:
+            if stop_check is not None:
+                try:
+                    stop_check()
+                except BaseException as exc:  # ensure cleanup before propagating task stop
+                    interrupted = exc
+                    break
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                break
+
+            events = selector.select(
+                timeout=min(_BROWSER_WORKER_POLL_SECONDS, remaining)
+            )
+            for key, _mask in events:
+                chunk = os.read(int(key.fd), 65536)
+                if not chunk:
+                    protocol_eof = True
+                    try:
+                        selector.unregister(read_fd)
+                    except Exception:
+                        pass
+                    continue
+                protocol_buffer += chunk
+                while b"\n" in protocol_buffer:
+                    raw_line, protocol_buffer = protocol_buffer.split(b"\n", 1)
+                    if not raw_line:
+                        continue
+                    message_outcome = _decode_browser_worker_message(
+                        raw_line,
+                        logger=logger,
+                    )
+                    if message_outcome is not None:
+                        outcome = message_outcome
+
+            exit_code = process.poll()
+            if exit_code is not None and protocol_eof:
+                break
+
+        if protocol_buffer.strip():
+            message_outcome = _decode_browser_worker_message(
+                protocol_buffer.strip(),
+                logger=logger,
+            )
+            if message_outcome is not None:
+                outcome = message_outcome
+
+        if interrupted is not None:
+            logger(f"Browser Worker 收到任务停止请求，清理进程组 pid={process.pid}")
+            _terminate_browser_worker_group(process, logger=logger)
+            raise interrupted
+        if timed_out:
+            logger(
+                "Browser Worker 超过硬截止，清理进程组: "
+                f"operation={operation} timeout={hard_timeout_seconds:.1f}s pid={process.pid}"
+            )
+            _terminate_browser_worker_group(process, logger=logger)
+            return _BrowserWorkerOutcome(
+                status="timeout",
+                error=f"{operation} hard timeout after {hard_timeout_seconds:.1f}s",
+                exit_code=process.poll(),
+            )
+
+        exit_code = process.poll()
+        if outcome is not None:
+            outcome.exit_code = exit_code
+            if outcome.status != "ok" or exit_code not in (0, None):
+                _terminate_browser_worker_group(process, logger=logger)
+            return outcome
+        if exit_code not in (0, None):
+            _terminate_browser_worker_group(process, logger=logger)
+        return _BrowserWorkerOutcome(
+            status="error",
+            error=f"browser worker exited without result (exit_code={exit_code})",
+            exit_code=exit_code,
+        )
+    except BaseException as exc:
+        if process is not None and process.poll() is None:
+            _terminate_browser_worker_group(process, logger=logger)
+        if interrupted is not None or isinstance(exc, (KeyboardInterrupt, SystemExit)):
+            raise
+        error_text = f"{type(exc).__name__}: {exc}"[:1000]
+        logger(f"Browser Worker 启动或通信失败: {error_text}")
+        return _BrowserWorkerOutcome(status="error", error=error_text)
+    finally:
+        try:
+            selector.close()
+        except Exception:
+            pass
+        try:
+            os.close(read_fd)
+        except OSError:
+            pass
+        if write_fd >= 0:
+            try:
+                os.close(write_fd)
+            except OSError:
+                pass
+        if process is not None and process.stdin is not None:
+            try:
+                process.stdin.close()
+            except Exception:
+                pass
+
+
+def _run_with_browser_slot(
+    operation: str,
+    payload: dict[str, Any],
+    *,
+    hard_timeout_seconds: float,
+    logger: Callable[[str], None],
+    stop_check: Optional[Callable[[], None]] = None,
+) -> _BrowserWorkerOutcome:
+    acquired = _AUTH_BROWSER_SEMAPHORE.acquire(blocking=False)
+    if not acquired:
+        logger(
+            "Browser 全局并发槽已满，等待可用槽位 "
+            f"(limit={AUTH_BROWSER_MAX_CONCURRENCY}, operation={operation})"
+        )
+        while not acquired:
+            if stop_check is not None:
+                stop_check()
+            acquired = _AUTH_BROWSER_SEMAPHORE.acquire(timeout=0.5)
+        logger(f"Browser 已获取等待槽位: operation={operation}")
+    try:
+        return _run_isolated_browser_transaction(
+            operation,
+            payload,
+            hard_timeout_seconds=hard_timeout_seconds,
+            logger=logger,
+            stop_check=stop_check,
+        )
+    finally:
+        if acquired:
+            _AUTH_BROWSER_SEMAPHORE.release()
 
 
 @dataclass
@@ -346,32 +643,47 @@ def get_sentinel_token_via_browser(
     viewport_height: Optional[int] = None,
     cookie_header: Optional[str] = None,
     require_complete_signals: bool = False,
+    stop_check: Optional[Callable[[], None]] = None,
+    hard_timeout_seconds: Optional[float] = None,
     log_fn: Optional[Callable[[str], None]] = None,
 ) -> Optional[str]:
     """通过浏览器直接调用 SentinelSDK.token(flow) 获取完整 token。"""
     logger = log_fn or (lambda _msg: None)
-    return run_sync_playwright_safely(
-        lambda: _get_sentinel_token_via_browser_sync(
-            flow=flow,
-            proxy=proxy,
-            timeout_ms=timeout_ms,
-            page_url=page_url,
-            headless=headless,
-            device_id=device_id,
-            user_agent=user_agent,
-            sec_ch_ua=sec_ch_ua,
-            chrome_full_version=chrome_full_version,
-            accept_language=accept_language,
-            platform_version=platform_version,
-            viewport_width=viewport_width,
-            viewport_height=viewport_height,
-            cookie_header=cookie_header,
-            require_complete_signals=require_complete_signals,
-            log_fn=logger,
-        ),
-        logger=logger,
-        label="Sentinel Browser",
+    effective_hard_timeout = (
+        max(float(hard_timeout_seconds), 0.1)
+        if hard_timeout_seconds is not None
+        else _browser_hard_timeout_seconds(
+            "SENTINEL_BROWSER_HARD_TIMEOUT_SECONDS",
+            _SENTINEL_BROWSER_HARD_TIMEOUT_DEFAULT_SECONDS,
+        )
     )
+    outcome = _run_with_browser_slot(
+        "sentinel_token",
+        {
+            "flow": flow,
+            "proxy": proxy,
+            "timeout_ms": timeout_ms,
+            "page_url": page_url,
+            "headless": headless,
+            "device_id": device_id,
+            "user_agent": user_agent,
+            "sec_ch_ua": sec_ch_ua,
+            "chrome_full_version": chrome_full_version,
+            "accept_language": accept_language,
+            "platform_version": platform_version,
+            "viewport_width": viewport_width,
+            "viewport_height": viewport_height,
+            "cookie_header": cookie_header,
+            "require_complete_signals": require_complete_signals,
+        },
+        hard_timeout_seconds=effective_hard_timeout,
+        logger=logger,
+        stop_check=stop_check,
+    )
+    if outcome.status == "ok":
+        return str(outcome.value or "").strip() or None
+    logger(f"Sentinel Browser Worker 失败: {outcome.error}")
+    return None
 
 
 def _get_sentinel_token_via_browser_sync(
@@ -668,54 +980,60 @@ def create_account_via_browser(
     cookies: Optional[list[dict[str, Any]]] = None,
     trace_headers: Optional[dict[str, str]] = None,
     stop_check: Optional[Callable[[], None]] = None,
+    hard_timeout_seconds: Optional[float] = None,
     log_fn: Optional[Callable[[str], None]] = None,
 ) -> Optional[BrowserAccountCreateResult]:
     """Load Auth, obtain Sentinel, and submit create_account in one browser context."""
     logger = log_fn or (lambda _msg: None)
-
-    def _run_with_browser_slot() -> Optional[BrowserAccountCreateResult]:
-        acquired = _AUTH_BROWSER_SEMAPHORE.acquire(blocking=False)
-        waited = not acquired
-        if waited:
-            logger(
-                "Auth Browser 并发槽已满，等待可用槽位 "
-                f"(limit={AUTH_BROWSER_MAX_CONCURRENCY})"
-            )
-            while not acquired:
-                if stop_check is not None:
-                    stop_check()
-                acquired = _AUTH_BROWSER_SEMAPHORE.acquire(timeout=0.5)
-            logger("Auth Browser 已获取等待槽位")
-        try:
-            return _create_account_via_browser_sync(
-                name=name,
-                birthdate=birthdate,
-                proxy=proxy,
-                page_url=page_url,
-                timeout_ms=timeout_ms,
-                headless=headless,
-                device_id=device_id,
-                user_agent=user_agent,
-                sec_ch_ua=sec_ch_ua,
-                chrome_full_version=chrome_full_version,
-                accept_language=accept_language,
-                platform_version=platform_version,
-                viewport_width=viewport_width,
-                viewport_height=viewport_height,
-                cookies=cookies,
-                trace_headers=trace_headers,
-                stop_check=stop_check,
-                log_fn=logger,
-            )
-        finally:
-            if acquired:
-                _AUTH_BROWSER_SEMAPHORE.release()
-
-    return run_sync_playwright_safely(
-        _run_with_browser_slot,
-        logger=logger,
-        label="Auth Browser Create Account",
+    effective_hard_timeout = (
+        max(float(hard_timeout_seconds), 0.1)
+        if hard_timeout_seconds is not None
+        else _browser_hard_timeout_seconds(
+            "AUTH_BROWSER_HARD_TIMEOUT_SECONDS",
+            _AUTH_BROWSER_HARD_TIMEOUT_DEFAULT_SECONDS,
+        )
     )
+    outcome = _run_with_browser_slot(
+        "create_account",
+        {
+            "name": name,
+            "birthdate": birthdate,
+            "proxy": proxy,
+            "page_url": page_url,
+            "timeout_ms": timeout_ms,
+            "headless": headless,
+            "device_id": device_id,
+            "user_agent": user_agent,
+            "sec_ch_ua": sec_ch_ua,
+            "chrome_full_version": chrome_full_version,
+            "accept_language": accept_language,
+            "platform_version": platform_version,
+            "viewport_width": viewport_width,
+            "viewport_height": viewport_height,
+            "cookies": list(cookies or []),
+            "trace_headers": dict(trace_headers or {}),
+        },
+        hard_timeout_seconds=effective_hard_timeout,
+        logger=logger,
+        stop_check=stop_check,
+    )
+    if outcome.status == "timeout":
+        return BrowserAccountCreateResult(error=f"auth_browser_hard_timeout: {outcome.error}")
+    if outcome.status != "ok":
+        logger(f"Auth Browser Worker 失败: {outcome.error}")
+        return None
+    if outcome.value is None:
+        return None
+    if not isinstance(outcome.value, dict):
+        logger("Auth Browser Worker 返回结果格式错误")
+        return None
+    result_payload = dict(outcome.value)
+    result_payload["cookie_names"] = tuple(result_payload.get("cookie_names") or ())
+    try:
+        return BrowserAccountCreateResult(**result_payload)
+    except (TypeError, ValueError) as exc:
+        logger(f"Auth Browser Worker 结果解析失败: {exc}")
+        return None
 
 
 def _create_account_via_browser_sync(

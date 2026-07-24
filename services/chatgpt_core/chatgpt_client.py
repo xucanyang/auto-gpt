@@ -6,6 +6,7 @@ ChatGPT 注册客户端模块
 import time
 import uuid
 from urllib.parse import urlparse
+from core.task_runtime import TaskInterruption
 from core.proxy_utils import build_requests_proxy_config
 
 try:
@@ -43,7 +44,14 @@ class ChatGPTClient:
     BASE = "https://chatgpt.com"
     AUTH = "https://auth.openai.com"
 
-    def __init__(self, proxy=None, verbose=True, browser_mode="protocol", fingerprint=None):
+    def __init__(
+        self,
+        proxy=None,
+        verbose=True,
+        browser_mode="protocol",
+        fingerprint=None,
+        stop_checker=None,
+    ):
         """
         初始化 ChatGPT 客户端
 
@@ -55,6 +63,7 @@ class ChatGPTClient:
         self.proxy = proxy
         self.verbose = verbose
         self.browser_mode = browser_mode or "protocol"
+        self.stop_checker = stop_checker
         self.fingerprint = coerce_browser_fingerprint(fingerprint)
         self._apply_fingerprint_meta(self.fingerprint)
 
@@ -81,6 +90,10 @@ class ChatGPTClient:
             "detail": "",
             "url": "",
         }
+
+    def _check_stop(self) -> None:
+        if callable(self.stop_checker):
+            self.stop_checker()
 
     def _get_openai_cookie_header(self) -> str:
         pairs = []
@@ -119,6 +132,7 @@ class ChatGPTClient:
                 viewport_height=self.viewport_height,
                 cookie_header=self._get_openai_cookie_header(),
                 require_complete_signals=True,
+                stop_check=self._check_stop,
                 log_fn=lambda msg: self._log(msg),
             )
             if token:
@@ -972,6 +986,7 @@ class ChatGPTClient:
                 viewport_height=self.viewport_height,
                 cookies=export_session_cookies_for_playwright(self.session),
                 trace_headers=generate_datadog_trace(),
+                stop_check=self._check_stop,
                 log_fn=lambda msg: self._log(f"oauth_create_account: {msg}"),
             )
             if result is None:
@@ -1022,6 +1037,8 @@ class ChatGPTClient:
             self._log(f"创建失败: {detail} - {error_msg[:200]}")
             return False, detail
 
+        except TaskInterruption:
+            raise
         except Exception as e:
             self._log(f"创建异常: {e}")
             return False, str(e)

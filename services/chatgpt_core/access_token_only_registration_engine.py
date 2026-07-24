@@ -642,6 +642,13 @@ class AccessTokenOnlyRegistrationEngine:
         ).strip()
 
     def _build_chatgpt_client(self) -> ChatGPTClient:
+        stop_checker = self.extra_config.get("_task_stop_checker")
+        task_control = self.extra_config.get("_task_control")
+        task_attempt_id = self.extra_config.get("_task_attempt_id")
+        if not callable(stop_checker) and task_control is not None:
+            stop_checker = lambda: task_control.checkpoint(
+                attempt_id=task_attempt_id
+            )
         return ChatGPTClient(
             proxy=self.proxy_url,
             verbose=False,
@@ -650,6 +657,7 @@ class AccessTokenOnlyRegistrationEngine:
                 self.extra_config.get("chatgpt_browser_fingerprint")
                 or self.extra_config.get("browser_fingerprint")
             ),
+            stop_checker=stop_checker,
         )
 
     def _build_registration_context_payload(

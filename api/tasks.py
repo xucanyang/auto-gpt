@@ -116,8 +116,8 @@ import time, json, asyncio, threading, logging, re, random
 router = APIRouter(prefix="/tasks", tags=["tasks"])
 logger = logging.getLogger(__name__)
 
-MAX_FINISHED_TASKS = 200
-CLEANUP_THRESHOLD = 250
+MAX_FINISHED_TASKS = 50
+CLEANUP_THRESHOLD = 75
 PHONE_BINDING_MAX_CONCURRENCY = 5
 LOCAL_STATUS_PROBE_MAX_CONCURRENCY = 10
 LOCAL_STATUS_PROBE_MAX_DELAY_SECONDS = 3600.0
@@ -6053,6 +6053,40 @@ def _save_task_log(
             # running merely because the click was processed concurrently.
             if log.status in TERMINAL_TASK_STATUSES and status == "running":
                 return
+            if log.status in TERMINAL_TASK_STATUSES and status in TERMINAL_TASK_STATUSES:
+                try:
+                    existing_detail = json.loads(log.detail_json or "{}")
+                except (TypeError, ValueError):
+                    existing_detail = {}
+                existing_logs = (
+                    list(existing_detail.get("logs") or [])
+                    if isinstance(existing_detail, dict)
+                    else []
+                )
+                incoming_logs = list(safe_detail.get("logs") or [])
+                existing_next_index = int(
+                    (existing_detail or {}).get("log_next_index")
+                    or len(existing_logs)
+                )
+                incoming_next_index = int(
+                    safe_detail.get("log_next_index")
+                    or len(incoming_logs)
+                )
+                if (
+                    len(existing_logs) > len(incoming_logs)
+                    and existing_next_index >= incoming_next_index
+                ):
+                    for key in (
+                        "logs",
+                        "logs_truncated",
+                        "dropped_log_entries",
+                        "dropped_log_bytes",
+                        "retained_log_bytes",
+                        "log_start_index",
+                        "log_next_index",
+                    ):
+                        if key in existing_detail:
+                            safe_detail[key] = existing_detail[key]
             log.status = status
             log.error = safe_error
             log.detail_json = json.dumps(safe_detail, ensure_ascii=False)
@@ -6082,6 +6116,12 @@ def _build_task_log_detail(
         "source": str(snapshot.get("source") or ""),
         "meta": dict(snapshot.get("meta") or {}),
         "logs": list(snapshot.get("logs") or []),
+        "logs_truncated": bool(snapshot.get("logs_truncated")),
+        "dropped_log_entries": int(snapshot.get("dropped_log_entries") or 0),
+        "dropped_log_bytes": int(snapshot.get("dropped_log_bytes") or 0),
+        "retained_log_bytes": int(snapshot.get("retained_log_bytes") or 0),
+        "log_start_index": int(snapshot.get("log_start_index") or 0),
+        "log_next_index": int(snapshot.get("log_next_index") or 0),
         "control": dict(snapshot.get("control") or {}),
         "capabilities": dict(snapshot.get("capabilities") or {}),
     }
@@ -18051,9 +18091,14 @@ async def stream_logs(task_id: str, since: int = 0):
     async def event_generator():
         sent = since
         while True:
-            logs, status = _task_store.log_state(task_id)
-            while sent < len(logs):
-                yield f"data: {json.dumps({'line': logs[sent]})}\n\n"
+            logs, status, start_index, next_index = _task_store.log_window_state(task_id)
+            if sent < start_index:
+                sent = start_index
+            while sent < next_index:
+                local_index = sent - start_index
+                if local_index < 0 or local_index >= len(logs):
+                    break
+                yield f"data: {json.dumps({'line': logs[local_index]})}\n\n"
                 sent += 1
             if status in TERMINAL_TASK_STATUSES:
                 yield f"data: {json.dumps({'done': True, 'status': status})}\n\n"

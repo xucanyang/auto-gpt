@@ -169,6 +169,61 @@ class RegisterTaskStoreTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             store.request_stop_after_current("task-runtime-immediate-only")
 
+    def test_active_task_logs_are_bounded_by_entry_count_and_utf8_bytes(self):
+        store = RegisterTaskStore(
+            active_max_log_entries=3,
+            active_max_log_bytes=8,
+            finished_max_log_entries=3,
+            finished_max_log_bytes=8,
+        )
+        task_id = "task-runtime-log-bounds"
+        store.create(task_id, platform="chatgpt", total=1, source="unit")
+
+        for entry in ("old", "汉", "middle", "new"):
+            store.append_log(task_id, entry)
+
+        snapshot = store.snapshot(task_id)
+        self.assertEqual(snapshot["logs"], ["new"])
+        self.assertTrue(snapshot["logs_truncated"])
+        self.assertEqual(snapshot["dropped_log_entries"], 3)
+        self.assertEqual(snapshot["dropped_log_bytes"], 12)
+        self.assertEqual(snapshot["retained_log_bytes"], 3)
+        self.assertEqual(snapshot["log_start_index"], 3)
+        self.assertEqual(snapshot["log_next_index"], 4)
+
+        logs, status, start_index, next_index = store.log_window_state(task_id)
+        self.assertEqual(logs, ["new"])
+        self.assertEqual(status, "pending")
+        self.assertEqual((start_index, next_index), (3, 4))
+
+    def test_terminal_callback_observes_active_window_before_memory_compaction(self):
+        persisted: list[dict] = []
+        store = RegisterTaskStore(
+            active_max_log_entries=10,
+            active_max_log_bytes=1024,
+            finished_max_log_entries=2,
+            finished_max_log_bytes=1024,
+            on_terminal=lambda _task_id, snapshot: persisted.append(snapshot),
+        )
+        task_id = "task-runtime-terminal-compaction"
+        store.create(task_id, platform="chatgpt", total=1, source="unit")
+        for entry in ("line-1", "line-2", "line-3", "line-4"):
+            store.append_log(task_id, entry)
+
+        store.finish(
+            task_id,
+            status="done",
+            success=1,
+            skipped=0,
+            errors=[],
+        )
+
+        self.assertEqual(persisted[0]["logs"], ["line-1", "line-2", "line-3", "line-4"])
+        in_memory = store.snapshot(task_id)
+        self.assertEqual(in_memory["logs"], ["line-3", "line-4"])
+        self.assertTrue(in_memory["logs_truncated"])
+        self.assertEqual(in_memory["dropped_log_entries"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()

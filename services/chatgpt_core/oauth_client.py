@@ -152,6 +152,9 @@ class OAuthClient:
     def _check_stop(self) -> None:
         if callable(self.stop_checker):
             self.stop_checker()
+            return
+        if self.task_control is not None:
+            self.task_control.checkpoint(attempt_id=self.task_attempt_id)
 
     def _set_error(self, message):
         self.last_error = redact_log_text(str(message or "").strip())
@@ -1880,6 +1883,7 @@ class OAuthClient:
                     platform_version=(self.browser_fingerprint.platform_version if self.browser_fingerprint else None),
                     viewport_width=(self.browser_fingerprint.viewport_width if self.browser_fingerprint else None),
                     viewport_height=(self.browser_fingerprint.viewport_height if self.browser_fingerprint else None),
+                    stop_check=self._check_stop,
                     log_fn=lambda msg: self._log(f"authorize_continue: {msg}"),
                 )
                 if sentinel_token:
@@ -2039,6 +2043,7 @@ class OAuthClient:
                 platform_version=(self.browser_fingerprint.platform_version if self.browser_fingerprint else None),
                 viewport_width=(self.browser_fingerprint.viewport_width if self.browser_fingerprint else None),
                 viewport_height=(self.browser_fingerprint.viewport_height if self.browser_fingerprint else None),
+                stop_check=self._check_stop,
                 log_fn=lambda msg: self._log(f"password_verify: {msg}"),
             )
             if sentinel_pwd:
@@ -4786,6 +4791,7 @@ class OAuthClient:
             platform_version=(self.browser_fingerprint.platform_version if self.browser_fingerprint else None),
             viewport_width=(self.browser_fingerprint.viewport_width if self.browser_fingerprint else None),
             viewport_height=(self.browser_fingerprint.viewport_height if self.browser_fingerprint else None),
+            stop_check=self._check_stop,
             log_fn=lambda msg: self._log(f"email_otp_validate: {msg}"),
         )
         if sentinel_otp:
