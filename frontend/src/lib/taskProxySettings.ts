@@ -144,6 +144,7 @@ export function validateTaskProxySettings(values: unknown) {
 export async function saveTaskProxySettingsToConfig(values: unknown) {
   const settings = normalizeTaskProxySettings(values)
   const data: Record<string, string> = { task_proxy_mode: settings.proxy_mode }
+  const rawValues = values && typeof values === 'object' ? values as Record<string, unknown> : {}
 
   if (settings.proxy_mode === 'dynamic') {
     // 任务弹窗动态模式的空 proxy 表示“沿用全局模板”，绝不能反向清空它。
@@ -172,6 +173,13 @@ export async function saveTaskProxySettingsToConfig(values: unknown) {
     data.task_proxy_min_score = String(settings.proxy_min_score)
     data.proxy_pool_max_candidates = String(settings.proxy_max_candidates)
     data.proxy_scan_min_score = String(settings.proxy_min_score)
+  }
+
+  // The proxy page exposes this global runtime switch alongside the template.
+  // Only write it when the caller supplied the field, so task forms that do
+  // not render the switch cannot reset the existing global value.
+  if (Object.prototype.hasOwnProperty.call(rawValues, 'dynamic_proxy_probe_enabled')) {
+    data.dynamic_proxy_probe_enabled = booleanWithDefault(rawValues.dynamic_proxy_probe_enabled, true) ? 'true' : 'false'
   }
 
   await apiFetch('/config', {

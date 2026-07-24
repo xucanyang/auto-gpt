@@ -683,6 +683,7 @@ export default function Proxies() {
         proxy: template,
         proxy_country_code: country,
         dynamic_proxy_ip_retention_minutes: dynamicProxyRetentionMinutes,
+        dynamic_proxy_probe_enabled: dynamicProxyProbe,
         proxy_failover: false,
         proxy_max_candidates: poolMaxCandidates,
         proxy_min_score: scanMinScore,

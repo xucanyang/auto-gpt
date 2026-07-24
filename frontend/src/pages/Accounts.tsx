@@ -1249,6 +1249,11 @@ function intWithDefault(value: unknown, fallback: number, min = 0) {
   return Math.max(Math.floor(next), min)
 }
 
+function boolWithDefault(value: unknown, fallback: boolean) {
+  if (value === undefined || value === null || value === '') return fallback
+  return parseBooleanConfigValue(value)
+}
+
 function normalizeBaxiStatusPollInterval(value: unknown) {
   return Math.min(
     intWithDefault(
@@ -1265,8 +1270,8 @@ function normalizePhonePoolMode(value: unknown, raw?: Record<string, unknown>): 
   if (mode === 'prefix_limited' || mode === 'prefix_sample' || mode === 'normal') {
     return mode
   }
-  if (raw && Boolean(raw.prefix_bind_enabled)) return 'prefix_limited'
-  if (raw && Boolean(raw.prefix_sample_enabled)) return 'prefix_sample'
+  if (raw && parseBooleanConfigValue(raw.prefix_bind_enabled)) return 'prefix_limited'
+  if (raw && parseBooleanConfigValue(raw.prefix_sample_enabled)) return 'prefix_sample'
   return 'normal'
 }
 
@@ -1322,9 +1327,9 @@ function uniquePhonePoolPrefixItems(values: unknown, fallbackStatus: PhonePoolPr
 function normalizePhoneBindingSettings(value: unknown): PhoneBindingSettings {
   const raw = value && typeof value === 'object' ? value as Record<string, unknown> : {}
   const phonePoolMode = normalizePhonePoolMode(raw.phone_pool_mode, raw)
-  const reusePhoneUntilUnusable = Boolean(raw.reuse_phone_until_unusable)
+  const reusePhoneUntilUnusable = boolWithDefault(raw.reuse_phone_until_unusable, false)
   return {
-    use_pool: raw.use_pool === undefined ? DEFAULT_PHONE_BINDING_SETTINGS.use_pool : Boolean(raw.use_pool),
+    use_pool: boolWithDefault(raw.use_pool, DEFAULT_PHONE_BINDING_SETTINGS.use_pool),
     phone_pool_mode: phonePoolMode,
     selected_prefixes: normalizeSelectedPrefixes(raw.selected_prefixes),
     prefix_sample_enabled: phonePoolMode === 'prefix_sample',
@@ -1335,7 +1340,7 @@ function normalizePhoneBindingSettings(value: unknown): PhoneBindingSettings {
       if (value === 'rejected' || value === 'rejected_only' || value === 'unavailable' || value === 'unavailable_only') return 'rejected'
       return 'all'
     })(),
-    prefix_sms_probe_only: Boolean(raw.prefix_sms_probe_only || raw.sms_probe_only),
+    prefix_sms_probe_only: boolWithDefault(raw.prefix_sms_probe_only, boolWithDefault(raw.sms_probe_only, false)),
     timeout_seconds: intWithDefault(raw.timeout_seconds, DEFAULT_PHONE_BINDING_SETTINGS.timeout_seconds, 10),
     poll_interval_seconds: intWithDefault(raw.poll_interval_seconds, DEFAULT_PHONE_BINDING_SETTINGS.poll_interval_seconds, 1),
     max_resend_attempts: intWithDefault(raw.max_resend_attempts, DEFAULT_PHONE_BINDING_SETTINGS.max_resend_attempts, 0),
@@ -1349,7 +1354,7 @@ function normalizePhoneBindingSettings(value: unknown): PhoneBindingSettings {
     })(),
     proxy: String(raw.proxy || ''),
     proxy_country_code: String(raw.proxy_country_code || '').trim().toUpperCase(),
-    proxy_failover: raw.proxy_failover === undefined ? DEFAULT_PHONE_BINDING_SETTINGS.proxy_failover : Boolean(raw.proxy_failover),
+    proxy_failover: boolWithDefault(raw.proxy_failover, DEFAULT_PHONE_BINDING_SETTINGS.proxy_failover),
     proxy_max_candidates: intWithDefault(raw.proxy_max_candidates, DEFAULT_PHONE_BINDING_SETTINGS.proxy_max_candidates, 1),
     proxy_min_score: intWithDefault(raw.proxy_min_score, DEFAULT_PHONE_BINDING_SETTINGS.proxy_min_score, 0),
   }
@@ -1376,11 +1381,11 @@ function normalizeBaxiGptCdkSettings(value: unknown): BaxiGptCdkSettings {
   return {
     payment_channel: raw.payment_channel === 'pix' ? 'pix' : 'ideal',
     pix_submit_mode: raw.pix_submit_mode === 'user_link' ? 'user_link' : 'auto_extract',
-    use_pool: raw.use_pool === undefined ? DEFAULT_BAXIGPT_CDK_SETTINGS.use_pool : Boolean(raw.use_pool),
-    precheck: raw.precheck === undefined ? DEFAULT_BAXIGPT_CDK_SETTINGS.precheck : Boolean(raw.precheck),
-    failure_continue: raw.failure_continue === undefined ? DEFAULT_BAXIGPT_CDK_SETTINGS.failure_continue : Boolean(raw.failure_continue),
+    use_pool: boolWithDefault(raw.use_pool, DEFAULT_BAXIGPT_CDK_SETTINGS.use_pool),
+    precheck: boolWithDefault(raw.precheck, DEFAULT_BAXIGPT_CDK_SETTINGS.precheck),
+    failure_continue: boolWithDefault(raw.failure_continue, DEFAULT_BAXIGPT_CDK_SETTINGS.failure_continue),
     submit_interval_seconds: intWithDefault(raw.submit_interval_seconds, DEFAULT_BAXIGPT_CDK_SETTINGS.submit_interval_seconds, 0),
-    auto_poll_status: raw.auto_poll_status === undefined ? DEFAULT_BAXIGPT_CDK_SETTINGS.auto_poll_status : Boolean(raw.auto_poll_status),
+    auto_poll_status: boolWithDefault(raw.auto_poll_status, DEFAULT_BAXIGPT_CDK_SETTINGS.auto_poll_status),
     status_poll_interval_seconds: normalizeBaxiStatusPollInterval(raw.status_poll_interval_seconds),
     status_poll_timeout_seconds: intWithDefault(raw.status_poll_timeout_seconds, DEFAULT_BAXIGPT_CDK_SETTINGS.status_poll_timeout_seconds, 1800),
   }
@@ -1446,13 +1451,13 @@ function normalizePaypalBindingSettings(value: unknown): PaypalBindingSettings {
     phone: String(raw.phone || '').trim(),
     paypal_email: String(raw.paypal_email || '').trim(),
     sms_api: String(raw.sms_api || '').trim(),
-    sms_api_test_mode: raw.sms_api_test_mode === undefined ? DEFAULT_PAYPAL_BINDING_SETTINGS.sms_api_test_mode : Boolean(raw.sms_api_test_mode),
+    sms_api_test_mode: boolWithDefault(raw.sms_api_test_mode, DEFAULT_PAYPAL_BINDING_SETTINGS.sms_api_test_mode),
     otp_timeout: intWithDefault(raw.otp_timeout, DEFAULT_PAYPAL_BINDING_SETTINGS.otp_timeout, 30),
     pplink_retry: intWithDefault(raw.pplink_retry, DEFAULT_PAYPAL_BINDING_SETTINGS.pplink_retry, 1),
     timeout: intWithDefault(raw.timeout, DEFAULT_PAYPAL_BINDING_SETTINGS.timeout, 5),
     event_timeout: intWithDefault(raw.event_timeout, DEFAULT_PAYPAL_BINDING_SETTINGS.event_timeout, 10),
     account_interval_seconds: intWithDefault(raw.account_interval_seconds, DEFAULT_PAYPAL_BINDING_SETTINGS.account_interval_seconds, 0),
-    failure_continue: raw.failure_continue === undefined ? DEFAULT_PAYPAL_BINDING_SETTINGS.failure_continue : Boolean(raw.failure_continue),
+    failure_continue: boolWithDefault(raw.failure_continue, DEFAULT_PAYPAL_BINDING_SETTINGS.failure_continue),
   }
 }
 
@@ -4636,6 +4641,10 @@ export default function Accounts() {
         code_lines: '',
         use_pool: true,
         cdk_ids: importedIds,
+      })
+      saveBaxiGptCdkSettings({
+        ...baxiCdkSubmitForm.getFieldsValue(true),
+        use_pool: true,
       })
       setBaxiCdkManualOpen(false)
       await Promise.all([loadBaxiCdkPoolSummary(false), loadBaxiCdkPoolItems(false)])
@@ -8009,10 +8018,17 @@ export default function Accounts() {
                 : (phoneBindingPoolSummary.prefix_sample_count_1 ?? phoneBindingPoolSummary.available_prefix_sample_1)
             ),
       ) || 0
+  const updatePhoneBindingSettings = (patch: Record<string, unknown>) => {
+    const nextValues = {
+      ...phoneBindingTestForm.getFieldsValue(true),
+      ...patch,
+    }
+    phoneBindingTestForm.setFieldsValue(patch)
+    savePhoneBindingSettings(nextValues)
+  }
   const setPhoneBindingSelectedPrefixes = (nextPrefixes: unknown) => {
     const selected = normalizeSelectedPrefixes(nextPrefixes)
-    phoneBindingTestForm.setFieldsValue({ selected_prefixes: selected })
-    savePhoneBindingSettings({ ...phoneBindingTestForm.getFieldsValue(true), selected_prefixes: selected })
+    updatePhoneBindingSettings({ selected_prefixes: selected })
   }
   const togglePhoneBindingPrefix = (prefix: string) => {
     const next = phoneBindingSelectedPrefixSet.has(prefix)
@@ -9038,7 +9054,7 @@ export default function Accounts() {
                       ]}
                       onChange={(value) => {
                         const mode = normalizePhonePoolMode(value)
-                        phoneBindingTestForm.setFieldsValue({
+                        updatePhoneBindingSettings({
                           phone_pool_mode: mode,
                           prefix_sample_enabled: mode === 'prefix_sample',
                           use_pool: mode === 'normal' ? phoneBindingUsePoolValue !== false : true,
@@ -9290,9 +9306,10 @@ export default function Accounts() {
                   checkedChildren="只测收发码"
                   unCheckedChildren="完整绑定"
                   onChange={(checked) => {
-                    if (checked) {
-                      phoneBindingTestForm.setFieldsValue({ reuse_phone_until_unusable: false })
-                    }
+                    updatePhoneBindingSettings({
+                      prefix_sms_probe_only: checked,
+                      reuse_phone_until_unusable: checked ? false : phoneBindingReusePhoneValue,
+                    })
                   }}
                 />
               </Form.Item>
@@ -9429,9 +9446,10 @@ export default function Accounts() {
                   unCheckedChildren="关闭"
                   disabled={phoneBindingPrefixSampleEnabled || Boolean(phoneBindingSmsProbeOnlyValue)}
                   onChange={(checked) => {
-                    if (checked) {
-                      phoneBindingTestForm.setFieldsValue({ concurrency: 1 })
-                    }
+                    updatePhoneBindingSettings({
+                      reuse_phone_until_unusable: checked,
+                      ...(checked ? { concurrency: 1 } : {}),
+                    })
                   }}
                 />
               </Form.Item>
