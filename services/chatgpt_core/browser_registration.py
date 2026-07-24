@@ -2142,6 +2142,10 @@ def _wait_for_access_token(page, timeout: int = 60) -> str:
 
 def _is_registration_complete(state: dict) -> bool:
     page_type = str(state.get("page_type") or "")
+    if page_type == "external_url":
+        # The URL is a server-provided destination, not proof that the browser
+        # has actually followed it. Let the state machine perform navigation.
+        return False
     url = str(state.get("current_url") or state.get("continue_url") or "").lower()
     return page_type in {"callback", "oauth_callback", "chatgpt_home"} or (
         "chatgpt.com" in url and "redirect_uri" not in url and "about-you" not in url
@@ -4448,8 +4452,16 @@ def _browser_registration_flow(
             target_url = _normalize_url(str(state.get("continue_url") or state.get("current_url") or ""), OPENAI_AUTH)
             if not target_url:
                 raise RuntimeError("缺少可跟随的 continue_url")
-            page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
+            try:
+                page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
+            except Exception as exc:
+                # OAuth callbacks commonly end in a refused localhost/redirect
+                # navigation after the URL has already been committed. Keep the
+                # actual browser URL and let the next iteration classify it.
+                log(f"跟随注册回调导航出现可忽略异常: {exc}")
             state = _extract_flow_state(None, page.url)
+            if not state.get("page_type") and "code=" in str(page.url or ""):
+                state = _build_manual_flow_state("oauth_callback", str(page.url or ""))
             continue
 
         raise RuntimeError(f"未支持的注册状态: page={state.get('page_type') or '-'}")
