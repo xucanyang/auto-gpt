@@ -442,6 +442,237 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertIn("sentinel_browser_unavailable", snapshot["error"])
 
+    def test_browser_proxy_failure_does_not_rebuild_identity_on_next_candidate(self):
+        calls = []
+
+        class BrowserProxyFailurePlatform(_FakePlatform):
+            def register(self, email=None, password=None):
+                calls.append(str(getattr(self.config, "proxy", "") or ""))
+                if len(calls) == 1:
+                    raise RuntimeError("proxy connection timed out")
+                return Account(
+                    platform="chatgpt",
+                    email="replacement-must-not-run@example.com",
+                    password=password or "pw",
+                    token="at-replacement-must-not-run",
+                    extra={},
+                )
+
+        task_id = "task-browser-proxy-identity-boundary"
+        req = RegisterTaskRequest(
+            platform="chatgpt",
+            count=1,
+            concurrency=1,
+            executor_type="headless",
+            proxy_mode="dynamic",
+            proxy_failover=True,
+            extra={"mail_provider": "fake"},
+        )
+        _create_task_record(task_id, req, "manual", None)
+        candidates = [
+            ("http://proxy-a.local:8080", None, "dynamic"),
+            ("http://proxy-b.local:8080", None, "dynamic"),
+        ]
+
+        with (
+            patch("services.chatgpt_core.ChatGPTPlatform", BrowserProxyFailurePlatform),
+            patch(
+                "core.proxy_utils.resolve_task_proxy_candidates",
+                return_value=candidates,
+            ),
+            patch(
+                "core.base_mailbox.create_mailbox",
+                side_effect=lambda **_kwargs: _FakeMailbox(),
+            ) as create_mailbox,
+            patch("api.tasks._save_task_log"),
+        ):
+            _run_register(task_id, req)
+
+        snapshot = _task_store.snapshot(task_id)
+        self.assertEqual(snapshot["status"], "failed")
+        self.assertEqual(calls, ["http://proxy-a.local:8080"])
+        self.assertEqual(create_mailbox.call_count, 1)
+        self.assertTrue(
+            any(
+                "浏览器注册链路启动后失败" in line
+                and "避免身份分叉" in line
+                and "不切换下一候选" in line
+                for line in snapshot["logs"]
+            )
+        )
+        self.assertFalse(
+            any("保留当前尝试重试下一个代理" in line for line in snapshot["logs"])
+        )
+        self.assertTrue(
+            any("占用一个目标身份槽" in line for line in snapshot["logs"])
+        )
+
+    def test_browser_uncertain_failure_keeps_remaining_requested_identity_slots(self):
+        calls = []
+
+        class BrowserMixedResultPlatform(_FakePlatform):
+            def register(self, email=None, password=None):
+                calls.append(str(getattr(self.config, "proxy", "") or ""))
+                if len(calls) == 1:
+                    raise RuntimeError("proxy connection timed out")
+                return Account(
+                    platform="chatgpt",
+                    email=f"browser-success-{len(calls)}@example.com",
+                    password=password or "pw",
+                    token=f"at-browser-success-{len(calls)}",
+                    extra={},
+                )
+
+        task_id = "task-browser-uncertain-slot-budget"
+        req = RegisterTaskRequest(
+            platform="chatgpt",
+            count=3,
+            concurrency=2,
+            executor_type="headless",
+            proxy_mode="direct",
+            extra={"mail_provider": "fake"},
+        )
+        _create_task_record(task_id, req, "manual", None)
+
+        with (
+            patch("services.chatgpt_core.ChatGPTPlatform", BrowserMixedResultPlatform),
+            patch(
+                "core.proxy_utils.resolve_task_proxy_candidates",
+                return_value=[("", None, "direct")],
+            ),
+            patch(
+                "core.base_mailbox.create_mailbox",
+                side_effect=lambda **_kwargs: _FakeMailbox(),
+            ) as create_mailbox,
+            patch("core.db.save_account", side_effect=lambda account: account),
+            patch("api.tasks.schedule_chatgpt_local_status_refresh_for_account_id"),
+            patch("api.tasks._auto_upload_integrations"),
+            patch("api.tasks._save_task_log"),
+        ):
+            _run_register(task_id, req)
+
+        snapshot = _task_store.snapshot(task_id)
+        self.assertEqual(snapshot["status"], "failed")
+        self.assertEqual(snapshot["success"], 2)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(create_mailbox.call_count, 3)
+
+    def test_browser_failure_before_register_can_fill_the_same_target_slot(self):
+        calls = []
+
+        class BrowserPreRegisterRecoveryPlatform(_FakePlatform):
+            def register(self, email=None, password=None):
+                calls.append(str(getattr(self.config, "proxy", "") or ""))
+                return Account(
+                    platform="chatgpt",
+                    email="browser-recovered@example.com",
+                    password=password or "pw",
+                    token="at-browser-recovered",
+                    extra={},
+                )
+
+        task_id = "task-browser-pre-register-recovery"
+        req = RegisterTaskRequest(
+            platform="chatgpt",
+            count=1,
+            concurrency=1,
+            executor_type="headed",
+            proxy_mode="direct",
+            extra={"mail_provider": "fake"},
+        )
+        _create_task_record(task_id, req, "manual", None)
+
+        with (
+            patch(
+                "services.chatgpt_core.ChatGPTPlatform",
+                BrowserPreRegisterRecoveryPlatform,
+            ),
+            patch(
+                "core.proxy_utils.resolve_task_proxy_candidates",
+                return_value=[("", None, "direct")],
+            ),
+            patch(
+                "core.base_mailbox.create_mailbox",
+                side_effect=[RuntimeError("mailbox unavailable"), _FakeMailbox()],
+            ) as create_mailbox,
+            patch("core.db.save_account", side_effect=lambda account: account),
+            patch("api.tasks.schedule_chatgpt_local_status_refresh_for_account_id"),
+            patch("api.tasks._auto_upload_integrations"),
+            patch("api.tasks._save_task_log"),
+        ):
+            _run_register(task_id, req)
+
+        snapshot = _task_store.snapshot(task_id)
+        self.assertEqual(snapshot["status"], "done")
+        self.assertEqual(snapshot["success"], 1)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(create_mailbox.call_count, 2)
+
+    def test_protocol_proxy_failure_can_continue_with_next_candidate(self):
+        calls = []
+
+        class ProtocolProxyFailoverPlatform(_FakePlatform):
+            def register(self, email=None, password=None):
+                proxy = str(getattr(self.config, "proxy", "") or "")
+                calls.append(proxy)
+                if len(calls) == 1:
+                    raise RuntimeError("proxy connection timed out")
+                return Account(
+                    platform="chatgpt",
+                    email="protocol-success@example.com",
+                    password=password or "pw",
+                    token="at-protocol-success",
+                    extra={},
+                )
+
+        task_id = "task-protocol-proxy-failover"
+        req = RegisterTaskRequest(
+            platform="chatgpt",
+            count=1,
+            concurrency=1,
+            executor_type="protocol",
+            proxy_mode="dynamic",
+            proxy_failover=True,
+            extra={"mail_provider": "fake", "register_max_attempts": 1},
+        )
+        _create_task_record(task_id, req, "manual", None)
+        candidates = [
+            ("http://proxy-a.local:8080", None, "dynamic"),
+            ("http://proxy-b.local:8080", None, "dynamic"),
+        ]
+
+        with (
+            patch("services.chatgpt_core.ChatGPTPlatform", ProtocolProxyFailoverPlatform),
+            patch(
+                "core.proxy_utils.resolve_task_proxy_candidates",
+                return_value=candidates,
+            ),
+            patch(
+                "core.base_mailbox.create_mailbox",
+                side_effect=lambda **_kwargs: _FakeMailbox(),
+            ) as create_mailbox,
+            patch("core.db.save_account", side_effect=lambda account: account),
+            patch("api.tasks.schedule_chatgpt_local_status_refresh_for_account_id"),
+            patch("api.tasks._auto_upload_integrations"),
+            patch("api.tasks._save_task_log"),
+        ):
+            _run_register(task_id, req)
+
+        snapshot = _task_store.snapshot(task_id)
+        self.assertEqual(snapshot["status"], "done")
+        self.assertEqual(snapshot["success"], 1)
+        self.assertEqual(
+            calls,
+            ["http://proxy-a.local:8080", "http://proxy-b.local:8080"],
+        )
+        self.assertEqual(create_mailbox.call_count, 2)
+        self.assertTrue(
+            any("保留当前尝试重试下一个代理" in line for line in snapshot["logs"])
+        )
+        self.assertFalse(
+            any("浏览器注册链路启动后失败" in line for line in snapshot["logs"])
+        )
+
     def _build_request(self):
         return RegisterTaskRequest(
             platform="chatgpt",

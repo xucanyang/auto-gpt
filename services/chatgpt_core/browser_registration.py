@@ -122,6 +122,10 @@ PASSWORDLESS_LOGIN_SELECTORS = [
     'button:has-text("código de uso único")',
 ]
 
+
+class _BrowserSignupEntryUnavailable(RuntimeError):
+    """The browser could not reach an email entry form before signup began."""
+
 # add-phone 页面国际拨号码 -> 国家名映射（用于 UI 下拉选择）
 PHONE_COUNTRY_CODE_MAP = {
     "1": "United States", "7": "Russia", "20": "Egypt", "27": "South Africa",
@@ -660,18 +664,24 @@ def _find_first_selector(page, selectors: list[str]) -> str | None:
 
 def _find_first_visible_selector(page, selectors: list[str]) -> str | None:
     for selector in selectors:
+        if _first_visible_locator(page, selector) is not None:
+            return selector
+    return None
+
+
+def _first_visible_locator(page, selector: str):
+    try:
+        locator = page.locator(selector)
+        count = min(int(locator.count() or 0), 20)
+    except Exception:
+        return None
+    for index in range(count):
         try:
-            locator = page.locator(selector)
-            count = min(int(locator.count() or 0), 10)
+            candidate = locator.nth(index) if hasattr(locator, "nth") else locator.first
+            if candidate.is_visible(timeout=150):
+                return candidate
         except Exception:
             continue
-        for index in range(count):
-            try:
-                candidate = locator.nth(index) if hasattr(locator, "nth") else locator.first
-                if candidate.is_visible(timeout=150):
-                    return selector
-            except Exception:
-                continue
     return None
 
 
@@ -694,6 +704,305 @@ def _click_first(page, selectors: list[str], *, timeout: int = 10) -> str | None
         return found
     except Exception:
         return None
+
+
+class _NetworkActivityObserver:
+    """Track one browser transaction without moving it to another transport."""
+
+    _SENTINEL_MARKERS = (
+        "sentinel.openai.com/backend-api/sentinel/req",
+        "/backend-api/sentinel/req",
+        "challenges.cloudflare.com",
+    )
+
+    def __init__(self, page, business_markers: tuple[str, ...]):
+        self.page = page
+        self.business_markers = tuple(str(item) for item in business_markers if item)
+        self.business_requests: list[Any] = []
+        self.business_responses: list[Any] = []
+        self.business_failures: list[str] = []
+        self.sentinel_requests: list[Any] = []
+        self.sentinel_responses: list[Any] = []
+        self.sentinel_failures: list[str] = []
+        self._listeners: list[tuple[str, Any]] = []
+        self._install()
+
+    @staticmethod
+    def _url(item) -> str:
+        try:
+            return str(getattr(item, "url", "") or "")
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _failure(item) -> str:
+        try:
+            failure = getattr(item, "failure", "")
+            if callable(failure):
+                failure = failure()
+            if isinstance(failure, dict):
+                failure = failure.get("errorText") or failure.get("error_text") or ""
+            return str(failure or "request failed")[:300]
+        except Exception:
+            return "request failed"
+
+    def _is_business(self, url: str) -> bool:
+        return any(marker in url for marker in self.business_markers)
+
+    def _is_sentinel(self, url: str) -> bool:
+        return any(marker in url for marker in self._SENTINEL_MARKERS)
+
+    def _install(self) -> None:
+        if not hasattr(self.page, "on"):
+            return
+
+        def on_request(request):
+            url = self._url(request)
+            if self._is_business(url):
+                self.business_requests.append(request)
+            elif self._is_sentinel(url):
+                self.sentinel_requests.append(request)
+
+        def on_response(response):
+            url = self._url(response)
+            if self._is_business(url):
+                self.business_responses.append(response)
+            elif self._is_sentinel(url):
+                self.sentinel_responses.append(response)
+
+        def on_request_failed(request):
+            url = self._url(request)
+            if self._is_business(url):
+                self.business_failures.append(self._failure(request))
+            elif self._is_sentinel(url):
+                self.sentinel_failures.append(self._failure(request))
+
+        for event, listener in (
+            ("request", on_request),
+            ("response", on_response),
+            ("requestfailed", on_request_failed),
+        ):
+            try:
+                self.page.on(event, listener)
+                self._listeners.append((event, listener))
+            except Exception:
+                continue
+
+    @property
+    def has_business_request(self) -> bool:
+        return bool(
+            self.business_requests
+            or self.business_responses
+            or self.business_failures
+        )
+
+    @property
+    def sentinel_pending(self) -> bool:
+        completed = len(self.sentinel_responses) + len(self.sentinel_failures)
+        return len(self.sentinel_requests) > completed
+
+    def close(self) -> None:
+        if not hasattr(self.page, "remove_listener"):
+            return
+        for event, listener in self._listeners:
+            try:
+                self.page.remove_listener(event, listener)
+            except Exception:
+                pass
+        self._listeners.clear()
+
+
+class _PasswordFormSubmission:
+    """Submit the password form with trusted, bounded browser actions."""
+
+    REQUEST_SUBMIT_DELAY_SECONDS = 10.0
+    ENTER_DELAY_SECONDS = 10.0
+
+    def __init__(self, page, input_selector: str, log, *, context: str, business_markers: tuple[str, ...]):
+        self.page = page
+        self.input_selector = input_selector
+        self.log = log
+        self.context = context
+        self.input = _first_visible_locator(page, input_selector)
+        if self.input is None:
+            raise RuntimeError(f"{context}未找到可见密码输入框")
+        try:
+            form = self.input.locator("xpath=ancestor::form[1]")
+            self.form = form.first if int(form.count() or 0) > 0 else None
+        except Exception:
+            self.form = None
+        if self.form is None:
+            raise RuntimeError(f"{context}密码输入框不属于可提交表单")
+        try:
+            buttons = self.form.locator(
+                'button[type="submit"], input[type="submit"], button[data-testid="continue-button"]'
+            )
+            self.submit_button = None
+            for index in range(min(int(buttons.count() or 0), 10)):
+                candidate = buttons.nth(index) if hasattr(buttons, "nth") else buttons.first
+                if candidate.is_visible(timeout=150):
+                    self.submit_button = candidate
+                    break
+        except Exception:
+            self.submit_button = None
+        if self.submit_button is None:
+            raise RuntimeError(f"{context}未找到密码所属表单的可见提交按钮")
+        self.observer = _NetworkActivityObserver(page, business_markers)
+        self.started_at = 0.0
+        self.request_submit_at: float | None = None
+        self.enter_at: float | None = None
+        self.initial_click_error = ""
+
+    def _validity(self) -> tuple[bool, str]:
+        try:
+            result = self.input.evaluate(
+                """
+                (input) => {
+                  const form = input.form || input.closest?.('form');
+                  const valid = Boolean(form?.checkValidity ? form.checkValidity() : input.checkValidity?.());
+                  return { valid, message: String(input.validationMessage || '') };
+                }
+                """
+            )
+        except Exception:
+            return True, ""
+        if not isinstance(result, dict):
+            return True, ""
+        return bool(result.get("valid", True)), str(result.get("message") or "").strip()
+
+    def start(self) -> None:
+        try:
+            self.input.press("Tab", timeout=3000)
+        except Exception:
+            try:
+                self.page.keyboard.press("Tab")
+            except Exception:
+                pass
+        valid, message = self._validity()
+        if not valid:
+            self.close()
+            raise RuntimeError(message or f"{self.context}密码表单校验失败")
+        self.started_at = time.time()
+        try:
+            self.submit_button.click(timeout=8000)
+            self.log(f"{self.context}已点击密码所属表单提交按钮")
+            return
+        except Exception as click_error:
+            if self.observer.has_business_request:
+                self.log(f"{self.context}提交按钮点击返回异常，但已观察到业务请求")
+                return
+            self.initial_click_error = str(click_error or "").strip()
+            self.log(
+                f"{self.context}提交按钮点击返回异常，先观察现有事务；"
+                "确认无业务请求后再执行下一阶提交动作"
+            )
+
+    def _request_submit(self) -> bool:
+        try:
+            return bool(
+                self.input.evaluate(
+                    """
+                    (input) => {
+                      const form = input.form || input.closest?.('form');
+                      if (!form?.requestSubmit) return false;
+                      const visible = (el) => {
+                        const style = window.getComputedStyle(el);
+                        const rect = el.getBoundingClientRect();
+                        return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+                      };
+                      const button = Array.from(form.querySelectorAll(
+                        'button[type="submit"], input[type="submit"], button[data-testid="continue-button"]'
+                      )).find(visible);
+                      if (!button) return false;
+                      form.requestSubmit(button);
+                      return true;
+                    }
+                    """
+                )
+            )
+        except Exception:
+            return False
+
+    def advance_if_idle(self, now: float | None = None) -> None:
+        if self.observer.has_business_request:
+            return
+        current = float(now if now is not None else time.time())
+        if self.request_submit_at is None:
+            if current - self.started_at < self.REQUEST_SUBMIT_DELAY_SECONDS:
+                return
+            if self.observer.sentinel_pending and current - self.started_at < 25:
+                return
+            self.request_submit_at = current
+            if self._request_submit():
+                self.log(f"{self.context}点击后无业务请求，已执行一次同表单 requestSubmit")
+            else:
+                self.log(f"{self.context}点击后无业务请求，同表单 requestSubmit 不可用")
+            return
+        if self.enter_at is not None:
+            return
+        if current - self.request_submit_at < self.ENTER_DELAY_SECONDS:
+            return
+        if self.observer.sentinel_pending and current - self.request_submit_at < 25:
+            return
+        try:
+            self.input.press("Enter", timeout=5000)
+            self.enter_at = current
+            self.log(f"{self.context}requestSubmit 后仍无业务请求，已执行一次可信 Enter")
+        except Exception:
+            self.enter_at = current
+
+    def close(self) -> None:
+        self.observer.close()
+
+
+def _browser_response_details(response) -> tuple[int, str, dict, str]:
+    status = int(getattr(response, "status", 0) or 0)
+    response_url = str(getattr(response, "url", "") or "")
+    text = ""
+    data: dict = {}
+    try:
+        text = str(response.text() or "")
+    except Exception:
+        pass
+    try:
+        parsed = response.json()
+        if isinstance(parsed, dict):
+            data = parsed
+    except Exception:
+        if text:
+            try:
+                parsed = json.loads(text)
+                if isinstance(parsed, dict):
+                    data = parsed
+            except (TypeError, ValueError):
+                pass
+    return status, response_url, data, text
+
+
+def _browser_response_error(data: dict, text: str) -> str:
+    error = data.get("error") if isinstance(data, dict) else None
+    if isinstance(error, dict):
+        message = str(
+            error.get("message") or error.get("detail") or error.get("code") or ""
+        ).strip()
+        if message:
+            return message
+    for key in ("message", "detail", "error"):
+        value = data.get(key) if isinstance(data, dict) else None
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return str(text or "").strip()[:500]
+
+
+def _password_submission_timeout_text(submission: _PasswordFormSubmission, fallback: str) -> str:
+    if submission.observer.sentinel_failures:
+        return f"Sentinel/Cloudflare 前置请求失败: {submission.observer.sentinel_failures[-1]}"
+    if submission.observer.sentinel_pending:
+        return "Sentinel/Cloudflare 前置请求未完成，密码表单未发出业务请求"
+    initial_click_error = getattr(submission, "initial_click_error", "")
+    if isinstance(initial_click_error, str) and initial_click_error.strip():
+        return f"{fallback}；初始提交按钮点击失败: {initial_click_error.strip()[:300]}"
+    return fallback
 
 
 def _is_login_password_url(url: str) -> bool:
@@ -832,7 +1141,7 @@ def _extract_input_validation_message(page, selector: str) -> str:
 
 def _fill_input_like_user(page, selector: str, value: str) -> bool:
     try:
-        locator = page.locator(selector).first
+        locator = _first_visible_locator(page, selector) or page.locator(selector).first
         locator.wait_for(state="visible", timeout=2000)
         current = str(locator.input_value() or "").strip()
         if current == str(value).strip():
@@ -861,7 +1170,11 @@ def _fill_input_like_user(page, selector: str, value: str) -> bool:
         ok = page.evaluate(
             """
             ({ selector, value }) => {
-              const input = document.querySelector(selector);
+              const input = Array.from(document.querySelectorAll(selector)).find((candidate) => {
+                const style = window.getComputedStyle(candidate);
+                const rect = candidate.getBoundingClientRect();
+                return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+              });
               if (!input) return false;
               const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
               if (!setter) return false;
@@ -880,7 +1193,7 @@ def _fill_input_like_user(page, selector: str, value: str) -> bool:
 
 def _submit_form_with_fallback(page, input_selector: str) -> bool:
     try:
-        return bool(
+        requested = bool(
             page.evaluate(
                 """
                 (selector) => {
@@ -891,25 +1204,20 @@ def _submit_form_with_fallback(page, input_selector: str) -> bool:
                     form.requestSubmit();
                     return true;
                   }
-                  if (form?.submit) {
-                    form.submit();
-                    return true;
-                  }
-                  input.focus?.();
-                  for (const type of ['keydown', 'keypress', 'keyup']) {
-                    input.dispatchEvent(new KeyboardEvent(type, {
-                      key: 'Enter',
-                      code: 'Enter',
-                      bubbles: true,
-                      cancelable: true,
-                    }));
-                  }
-                  return true;
+                  return false;
                 }
                 """,
                 input_selector,
             )
         )
+        if requested:
+            return True
+    except Exception:
+        pass
+    try:
+        locator = _first_visible_locator(page, input_selector) or page.locator(input_selector).first
+        locator.press("Enter", timeout=5000)
+        return True
     except Exception:
         return False
 
@@ -1083,15 +1391,22 @@ def _derive_registration_state_from_page(page) -> dict:
                 () => {
                   const inputs = Array.from(document.querySelectorAll("input:not([type='hidden'])"));
                   const text = String(document.body?.innerText || '').toLowerCase();
+                  const visible = (el) => {
+                    const style = window.getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+                  };
                   const hasName = inputs.some((el) => {
+                    if (!visible(el)) return false;
                     const hint = `${el.name || ''} ${el.id || ''} ${el.placeholder || ''}`.toLowerCase();
-                    return hint.includes('name') || hint.includes('姓名') || hint.includes('全名');
+                    return hint.includes('name') || hint.includes('姓名') || hint.includes('全名') || hint.includes('氏名');
                   });
                   const hasAgeOrBirth = inputs.some((el) => {
+                    if (!visible(el)) return false;
                     const hint = `${el.name || ''} ${el.id || ''} ${el.placeholder || ''}`.toLowerCase();
-                    return hint.includes('age') || hint.includes('birth') || hint.includes('birthday') || hint.includes('年龄') || hint.includes('生日') || hint.includes('umur') || hint.includes('usia');
+                    return hint.includes('age') || hint.includes('birth') || hint.includes('birthday') || hint.includes('年龄') || hint.includes('年齢') || hint.includes('生日') || hint.includes('生年月日') || hint.includes('umur') || hint.includes('usia');
                   });
-              return (hasName && hasAgeOrBirth) || text.includes('about you');
+                  return (hasName && hasAgeOrBirth) || text.includes('about you') || text.includes('あなたについて');
                 }
                 """
             )
@@ -1128,18 +1443,11 @@ def _recover_signup_password_page(page, log) -> bool:
     return True
 
 
-def _wait_for_signup_entry_transition(page, log, timeout: int = 20) -> dict:
+def _wait_for_signup_entry_transition(page, log, timeout: int = 60) -> dict:
     deadline = time.time() + timeout
     passwordless_clicked = False
+    otp_sent_at = None
     while time.time() < deadline:
-        if not passwordless_clicked and _click_passwordless_login_if_available(
-            page,
-            log,
-            context="邮箱页提交后",
-        ):
-            passwordless_clicked = True
-            time.sleep(0.5)
-            continue
         state = _derive_registration_state_from_page(page)
         if state.get("page_type") in {
             "create_account_password",
@@ -1152,7 +1460,21 @@ def _wait_for_signup_entry_transition(page, log, timeout: int = 20) -> dict:
         }:
             if state.get("page_type") == "login_password" and _recover_signup_password_page(page, log):
                 return _derive_registration_state_from_page(page)
+            if passwordless_clicked and state.get("page_type") == "email_otp_verification":
+                state["_page_otp_triggered"] = True
+                state["_otp_sent_at"] = otp_sent_at
             return state
+        if not passwordless_clicked:
+            click_started_at = time.time() - 8
+            if _click_passwordless_login_if_available(
+                page,
+                log,
+                context="邮箱页提交后",
+            ):
+                passwordless_clicked = True
+                otp_sent_at = click_started_at
+                time.sleep(0.5)
+                continue
         error_text = _extract_auth_error_text(page)
         if error_text:
             raise RuntimeError(f"邮箱页提交失败: {error_text[:300]}")
@@ -1161,12 +1483,14 @@ def _wait_for_signup_entry_transition(page, log, timeout: int = 20) -> dict:
 
 
 def _start_browser_signup_via_page(page, email: str, log) -> dict:
+    entry_errors: list[str] = []
     for entry_url in (PLATFORM_LOGIN_ENTRY, f"{OPENAI_AUTH}/log-in"):
         try:
             log(f"打开 OpenAI 注册入口: {entry_url}")
             page.goto(entry_url, wait_until="domcontentloaded", timeout=30000)
         except Exception as exc:
             log(f"注册入口访问失败: {entry_url} -> {exc}")
+            entry_errors.append(f"{entry_url}: {exc}")
             continue
 
         initial_state = _derive_registration_state_from_page(page)
@@ -1181,6 +1505,7 @@ def _start_browser_signup_via_page(page, email: str, log) -> dict:
 
         email_selector = _wait_for_any_selector(page, EMAIL_INPUT_SELECTORS, timeout=12)
         if not email_selector:
+            entry_errors.append(f"{entry_url}: 未找到邮箱输入框")
             continue
         if not _fill_input_like_user(page, email_selector, email):
             raise RuntimeError("邮箱页填写失败")
@@ -1192,6 +1517,7 @@ def _start_browser_signup_via_page(page, email: str, log) -> dict:
                 return _derive_registration_state_from_page(page)
             return inline_state
 
+        email_submit_at = time.time() - 8
         submit_selector = _click_first(page, EMAIL_SUBMIT_SELECTORS, timeout=8)
         if submit_selector:
             log(f"邮箱页已点击继续按钮: {submit_selector}")
@@ -1200,9 +1526,16 @@ def _start_browser_signup_via_page(page, email: str, log) -> dict:
         else:
             raise RuntimeError("邮箱页未找到 Continue 按钮")
 
-        return _wait_for_signup_entry_transition(page, log)
+        state = _wait_for_signup_entry_transition(page, log, timeout=60)
+        if state.get("page_type") == "email_otp_verification" and not state.get("_otp_sent_at"):
+            state["_page_otp_triggered"] = True
+            state["_otp_sent_at"] = email_submit_at
+        return state
 
-    raise RuntimeError("未找到 OpenAI 注册入口邮箱输入框")
+    detail = "; ".join(entry_errors[-2:])
+    raise _BrowserSignupEntryUnavailable(
+        f"未找到可用 OpenAI 注册入口邮箱输入框{f': {detail}' if detail else ''}"
+    )
 
 
 def _start_browser_signup_via_authorize(page, email: str, device_id: str, log) -> dict:
@@ -1890,6 +2223,7 @@ def _submit_login_email_via_page(page, email: str, log) -> dict:
     _browser_pause(page)
 
     start_url = str(page.url or "")
+    otp_sent_at = time.time() - 8
     submit_selector = _click_first(page, EMAIL_SUBMIT_SELECTORS, timeout=8)
     if submit_selector:
         log(f"OAuth 邮箱页已点击继续按钮: {submit_selector}")
@@ -1898,14 +2232,23 @@ def _submit_login_email_via_page(page, email: str, log) -> dict:
     else:
         raise RuntimeError("OAuth 邮箱页未找到 Continue 按钮")
 
-    deadline = time.time() + 20
+    deadline = time.time() + 60
     last_url = start_url
+    passwordless_clicked = False
     while time.time() < deadline:
         current_url = str(page.url or "")
         last_url = current_url or last_url
-        if _click_passwordless_login_if_available(page, log, context="OAuth 邮箱页提交后"):
-            time.sleep(0.5)
-            continue
+        if not passwordless_clicked:
+            passwordless_started_at = time.time() - 8
+            if _click_passwordless_login_if_available(
+                page,
+                log,
+                context="OAuth 邮箱页提交后",
+            ):
+                passwordless_clicked = True
+                otp_sent_at = passwordless_started_at
+                time.sleep(0.5)
+                continue
         state = _derive_oauth_state_from_page(page)
         page_type = str(state.get("page_type") or "")
         if page_type in {
@@ -1921,9 +2264,25 @@ def _submit_login_email_via_page(page, email: str, log) -> dict:
             "oauth_callback",
             "chatgpt_home",
         }:
-            return {"ok": True, "status": 200, "url": current_url, "data": None, "text": ""}
+            return {
+                "ok": True,
+                "status": 200,
+                "url": current_url,
+                "data": None,
+                "text": "",
+                "otp_triggered": page_type == "email_otp_verification" or passwordless_clicked,
+                "otp_sent_at": otp_sent_at,
+            }
         if current_url != start_url and page_type != "login_email":
-            return {"ok": True, "status": 200, "url": current_url, "data": None, "text": ""}
+            return {
+                "ok": True,
+                "status": 200,
+                "url": current_url,
+                "data": None,
+                "text": "",
+                "otp_triggered": passwordless_clicked,
+                "otp_sent_at": otp_sent_at,
+            }
         error_text = _extract_auth_error_text(page)
         if error_text:
             return {"ok": False, "status": 400, "url": current_url, "data": None, "text": error_text}
@@ -1977,6 +2336,7 @@ def _do_codex_oauth(
     device_id = str(cookies_dict.get("oai-did") or uuid.uuid4())
     log(f"  OAuth state={oauth_start.state[:20]}...")
     oauth_email_submitted_at: float | None = None
+    oauth_password_verified = False
     oauth_otp_attempt = 0
 
     try:
@@ -2026,19 +2386,41 @@ def _do_codex_oauth(
                 log(f"  OAuth 邮箱页提交状态: {email_resp.get('status', 0)}")
                 if not email_resp.get("ok"):
                     raise RuntimeError(f"OAuth 邮箱页提交失败: {(email_resp.get('text') or '')[:300]}")
-                # The email submit itself normally sends the first OTP.  Keep
-                # a timestamp cutoff so the mailbox cannot return the signup
-                # OTP from the preceding registration phase.
-                oauth_email_submitted_at = time.time() - 8
+                # The transition helper samples before the action that can send
+                # the code. Sampling after its 60-second wait can filter out the
+                # very OTP this transaction triggered.
+                oauth_email_submitted_at = email_resp.get("otp_sent_at")
+                if oauth_email_submitted_at is None:
+                    oauth_email_submitted_at = time.time() - 8
                 continue
 
             if state["page_type"] in {"login_password", "create_account_password"}:
+                if oauth_password_verified:
+                    log("  OAuth 密码请求已明确成功，等待页面离开旧密码 DOM...")
+                    time.sleep(0.5)
+                    continue
                 log("  OAuth 页面需要密码登录，提交密码...")
                 # OAuth 流程中直接填密码登录，不尝试恢复到注册态
                 password_resp = _submit_oauth_password_direct(page, password, log)
                 log(f"  OAuth 密码页提交状态: {password_resp.get('status', 0)}")
                 if not password_resp.get("ok"):
                     raise RuntimeError(f"OAuth 密码页提交失败: {(password_resp.get('text') or '')[:300]}")
+                oauth_password_verified = bool(password_resp.get("password_verified"))
+                next_state = password_resp.get("next_state")
+                if isinstance(next_state, dict):
+                    next_target = _normalize_url(
+                        str(next_state.get("continue_url") or next_state.get("current_url") or ""),
+                        OPENAI_AUTH,
+                    )
+                    if (
+                        next_target
+                        and next_target != str(page.url or "")
+                        and "/api/accounts/" not in next_target
+                    ):
+                        try:
+                            page.goto(next_target, wait_until="domcontentloaded", timeout=30000)
+                        except Exception as exc:
+                            log(f"  OAuth 密码响应后续导航异常: {exc}")
                 continue
 
             if state["page_type"] == "email_otp_verification":
@@ -2106,6 +2488,10 @@ def _do_codex_oauth(
                 if not otp_resp.get("ok"):
                     detail = str(otp_resp.get("text") or "OAuth 验证码校验失败")[:300]
                     log(f"  OAuth OTP 未推进状态: {detail}")
+                    if otp_resp.get("otp_committed"):
+                        raise RuntimeError(
+                            f"OAuth 验证码已成功提交但页面未推进: {detail}"
+                        )
                     if oauth_otp_attempt < 3:
                         oauth_email_submitted_at = None
                         continue
@@ -2356,6 +2742,8 @@ def _normalize_browser_web_session(session_data: dict, cookies: list[dict]) -> d
 
 def _is_registration_complete(state: dict) -> bool:
     page_type = str(state.get("page_type") or "")
+    if page_type == "add_phone" and bool(state.get("signup_committed")):
+        return True
     if page_type == "external_url":
         # The URL is a server-provided destination, not proof that the browser
         # has actually followed it. Let the state machine perform navigation.
@@ -3319,29 +3707,120 @@ def _submit_oauth_password_direct(page, password: str, log) -> dict:
     log(f"  OAuth 密码页输入框: {input_selector}")
     _browser_pause(page)
 
-    submit_selector = _click_first(page, PASSWORD_SUBMIT_SELECTORS, timeout=8)
-    if submit_selector:
-        log(f"  OAuth 密码页已点击继续按钮: {submit_selector}")
-    elif _submit_form_with_fallback(page, input_selector):
-        log("  OAuth 密码页使用表单 fallback 提交")
-    else:
-        raise RuntimeError("OAuth 密码页未找到 Continue 按钮")
-
-    deadline = time.time() + 20
-    while time.time() < deadline:
-        current_url = str(page.url or "")
-        state = _derive_registration_state_from_page(page)
-        page_type = str(state.get("page_type") or "")
-        if page_type in {"email_otp_verification", "about_you", "consent", "workspace_selection",
-                         "organization_selection", "add_phone", "oauth_callback", "chatgpt_home", "external_url"}:
-            return {"ok": True, "status": 200, "url": current_url, "data": None, "text": ""}
-        if "code=" in current_url:
-            return {"ok": True, "status": 200, "url": current_url, "data": None, "text": ""}
-        error_text = _extract_auth_error_text(page)
-        if error_text:
-            return {"ok": False, "status": 400, "url": current_url, "data": None, "text": error_text}
-        time.sleep(0.5)
-    return {"ok": False, "status": 0, "url": str(page.url or ""), "data": None, "text": "OAuth 密码提交后未跳转"}
+    submission = _PasswordFormSubmission(
+        page,
+        input_selector,
+        log,
+        context="OAuth 密码页",
+        business_markers=("/api/accounts/password/verify",),
+    )
+    try:
+        submission.start()
+        deadline = time.time() + 60
+        processed_responses = 0
+        verified_result: dict | None = None
+        while time.time() < deadline:
+            current_url = str(page.url or "")
+            while processed_responses < len(submission.observer.business_responses):
+                response = submission.observer.business_responses[processed_responses]
+                processed_responses += 1
+                status, response_url, data, response_text = _browser_response_details(response)
+                if 200 <= status < 300:
+                    next_state = _extract_flow_state(data, response_url or current_url)
+                    verified_result = {
+                        "ok": True,
+                        "status": status,
+                        "url": response_url or current_url,
+                        "data": data or None,
+                        "text": "",
+                        "password_verified": True,
+                        "next_state": next_state,
+                    }
+                    if str(next_state.get("page_type") or "") not in {
+                        "",
+                        "login_password",
+                        "create_account_password",
+                    }:
+                        return verified_result
+                    continue
+                if status >= 400:
+                    return {
+                        "ok": False,
+                        "status": status,
+                        "url": response_url or current_url,
+                        "data": data or None,
+                        "text": _browser_response_error(data, response_text)
+                        or f"password verify HTTP {status}",
+                    }
+            if submission.observer.business_failures and verified_result is None:
+                return {
+                    "ok": False,
+                    "status": 0,
+                    "url": current_url,
+                    "data": None,
+                    "text": f"OAuth 密码请求失败: {submission.observer.business_failures[-1]}",
+                }
+            state = _derive_registration_state_from_page(page)
+            page_type = str(state.get("page_type") or "")
+            if page_type in {
+                "email_otp_verification",
+                "about_you",
+                "consent",
+                "workspace_selection",
+                "organization_selection",
+                "add_phone",
+                "oauth_callback",
+                "chatgpt_home",
+                "external_url",
+            } or "code=" in current_url:
+                return {
+                    "ok": True,
+                    "status": int((verified_result or {}).get("status") or 200),
+                    "url": current_url,
+                    "data": (verified_result or {}).get("data"),
+                    "text": "",
+                    "password_verified": verified_result is not None,
+                    "next_state": state,
+                }
+            error_text = _extract_auth_error_text(page) if verified_result is None else ""
+            if error_text:
+                return {
+                    "ok": False,
+                    "status": 400,
+                    "url": current_url,
+                    "data": None,
+                    "text": error_text,
+                }
+            validation_error = (
+                _extract_input_validation_message(page, input_selector)
+                if verified_result is None
+                else ""
+            )
+            if validation_error:
+                return {
+                    "ok": False,
+                    "status": 400,
+                    "url": current_url,
+                    "data": None,
+                    "text": validation_error,
+                }
+            submission.advance_if_idle()
+            time.sleep(0.5)
+        if verified_result is not None:
+            verified_result["transition_pending"] = True
+            return verified_result
+        return {
+            "ok": False,
+            "status": 0,
+            "url": str(page.url or ""),
+            "data": None,
+            "text": _password_submission_timeout_text(
+                submission,
+                "OAuth 密码请求未产生响应且页面未跳转",
+            ),
+        }
+    finally:
+        submission.close()
 
 
 def _submit_password_via_page(page, password: str, log) -> dict:
@@ -3356,189 +3835,181 @@ def _submit_password_via_page(page, password: str, log) -> dict:
     log(f"密码页输入框: {input_selector}")
     _browser_pause(page)
 
-    register_responses: list[Any] = []
-    register_request_failures: list[str] = []
-    response_listener = None
-    request_failed_listener = None
+    submission = _PasswordFormSubmission(
+        page,
+        input_selector,
+        log,
+        context="密码页",
+        business_markers=("/api/accounts/user/register",),
+    )
     try:
-        if hasattr(page, "on"):
-            def _capture_register_response(response):
-                try:
-                    if "/api/accounts/user/register" in str(getattr(response, "url", "") or ""):
-                        register_responses.append(response)
-                except Exception:
-                    return
-
-            def _capture_register_request_failure(request):
-                try:
-                    if "/api/accounts/user/register" not in str(getattr(request, "url", "") or ""):
-                        return
-                    failure = getattr(request, "failure", "")
-                    if callable(failure):
-                        failure = failure()
-                    if isinstance(failure, dict):
-                        failure = failure.get("errorText") or failure.get("error_text") or ""
-                    register_request_failures.append(str(failure or "request failed")[:300])
-                except Exception:
-                    register_request_failures.append("request failed")
-
-            response_listener = _capture_register_response
-            request_failed_listener = _capture_register_request_failure
-            page.on("response", response_listener)
-            page.on("requestfailed", request_failed_listener)
-    except Exception:
-        response_listener = None
-        request_failed_listener = None
-
-    def _finish(result: dict) -> dict:
-        if response_listener is not None and hasattr(page, "remove_listener"):
-            try:
-                page.remove_listener("response", response_listener)
-            except Exception:
-                pass
-        if request_failed_listener is not None and hasattr(page, "remove_listener"):
-            try:
-                page.remove_listener("requestfailed", request_failed_listener)
-            except Exception:
-                pass
-        return result
-
-    def _response_details(response) -> tuple[int, dict, str]:
-        status = int(getattr(response, "status", 0) or 0)
-        text = ""
-        data: dict = {}
-        try:
-            text = str(response.text() or "")
-        except Exception:
-            pass
-        try:
-            parsed = response.json()
-            if isinstance(parsed, dict):
-                data = parsed
-        except Exception:
-            if text:
-                try:
-                    parsed = json.loads(text)
-                    if isinstance(parsed, dict):
-                        data = parsed
-                except (TypeError, ValueError):
-                    pass
-        return status, data, text
-
-    def _response_error(data: dict, text: str) -> str:
-        error = data.get("error") if isinstance(data, dict) else None
-        if isinstance(error, dict):
-            message = str(error.get("message") or error.get("detail") or error.get("code") or "").strip()
-            if message:
-                return message
-        for key in ("message", "detail", "error"):
-            value = data.get(key) if isinstance(data, dict) else None
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-        return str(text or "").strip()[:500]
-
-    start_url = str(page.url or "")
-    submit_selector = _click_first(page, PASSWORD_SUBMIT_SELECTORS, timeout=8)
-    if submit_selector:
-        log(f"密码页已点击继续按钮: {submit_selector}")
-    elif _submit_form_with_fallback(page, input_selector):
-        log("密码页未找到可点击 Continue，已使用表单 fallback 提交")
-    else:
-        _finish({})
-        raise RuntimeError("密码页未找到 Continue 按钮")
-
-    deadline = time.time() + 45
-    last_url = str(page.url or "")
-    processed_responses = 0
-    while time.time() < deadline:
-        current_url = str(page.url or "")
-        last_url = current_url or last_url
-        while processed_responses < len(register_responses):
-            response = register_responses[processed_responses]
-            processed_responses += 1
-            status, data, response_text = _response_details(response)
-            if 200 <= status < 300:
-                payload = data or {
-                    "page": {
-                        "type": "email_otp_verification",
-                        "payload": {"url": f"{OPENAI_AUTH}/email-verification"},
-                    }
-                }
-                return _finish(
-                    {
+        submission.start()
+        start_url = str(page.url or "")
+        deadline = time.time() + 60
+        last_url = start_url
+        processed_responses = 0
+        committed_result: dict | None = None
+        while time.time() < deadline:
+            current_url = str(page.url or "")
+            last_url = current_url or last_url
+            while processed_responses < len(submission.observer.business_responses):
+                response = submission.observer.business_responses[processed_responses]
+                processed_responses += 1
+                status, response_url, data, response_text = _browser_response_details(response)
+                if 200 <= status < 300:
+                    response_state = _extract_flow_state(
+                        data or None,
+                        response_url or current_url,
+                    )
+                    response_page_type = str(response_state.get("page_type") or "")
+                    if response_page_type and response_page_type not in {
+                        "create_account_password",
+                        "login_password",
+                    }:
+                        return {
+                            "ok": True,
+                            "status": status,
+                            "url": response_url or current_url,
+                            "data": data or None,
+                            "text": "",
+                            "otp_triggered": response_page_type == "email_otp_verification",
+                            "otp_sent_at": submission.started_at - 8,
+                            "register_committed": True,
+                        }
+                    committed_result = {
                         "ok": True,
                         "status": status,
-                        "url": current_url,
-                        "data": payload,
+                        "url": response_url or current_url,
+                        "data": data or None,
                         "text": "",
+                        "register_committed": True,
+                        "transition_pending": True,
                     }
-                )
-            if status >= 400:
-                error_text = _response_error(data, response_text)
-                return _finish(
-                    {
+                    log("密码注册请求已返回成功，等待 SPA 离开旧密码页面")
+                    break
+                if status >= 400:
+                    return {
                         "ok": False,
                         "status": status,
-                        "url": current_url,
+                        "url": response_url or current_url,
                         "data": data or None,
-                        "text": error_text or f"user register HTTP {status}",
+                        "text": _browser_response_error(data, response_text)
+                        or f"user register HTTP {status}",
                     }
+            state = _derive_registration_state_from_page(page)
+            page_type = str(state.get("page_type") or "")
+            if page_type in {
+                "email_otp_verification",
+                "about_you",
+                "add_phone",
+                "oauth_callback",
+                "chatgpt_home",
+            }:
+                state_url = str(
+                    state.get("continue_url")
+                    or state.get("current_url")
+                    or current_url
                 )
-        if register_request_failures:
-            return _finish(
-                {
-                    "ok": False,
-                    "status": 0,
+                return {
+                    "ok": True,
+                    "status": int((committed_result or {}).get("status") or 200),
+                    "url": current_url,
+                    "data": {
+                        "page": {
+                            "type": page_type,
+                            "payload": {"url": state_url},
+                        }
+                    },
+                    "text": "",
+                    "otp_triggered": page_type == "email_otp_verification",
+                    "otp_sent_at": submission.started_at - 8,
+                    "register_committed": committed_result is not None,
+                }
+            if current_url != start_url and page_type and page_type not in {
+                "create_account_password",
+                "login_password",
+            }:
+                return {
+                    "ok": True,
+                    "status": 200,
                     "url": current_url,
                     "data": None,
-                    "text": f"密码注册请求失败: {register_request_failures[-1]}",
+                    "text": "",
                 }
+            if (
+                committed_result is None
+                and page_type == "login_password"
+                and _recover_signup_password_page(page, log)
+            ):
+                submission.close()
+                return _submit_password_via_page(page, password, log)
+            error_text = (
+                _extract_auth_error_text(page)
+                if committed_result is None
+                else ""
             )
-        state = _derive_registration_state_from_page(page)
-        page_type = str(state.get("page_type") or "")
-        if page_type in {"email_otp_verification", "about_you", "add_phone", "oauth_callback", "chatgpt_home"}:
-            return _finish({"ok": True, "status": 200, "url": current_url, "data": None, "text": ""})
-        if current_url != start_url and page_type and page_type not in {"create_account_password", "login_password"}:
-            return _finish({"ok": True, "status": 200, "url": current_url, "data": None, "text": ""})
-        if page_type == "login_password" and _recover_signup_password_page(page, log):
-            input_selector = _wait_for_any_selector(page, PASSWORD_INPUT_SELECTORS, timeout=5)
-            if not input_selector:
-                return _finish({"ok": False, "status": 400, "url": current_url, "data": None, "text": "登录密码页恢复后未找到注册密码输入框"})
-            if not _fill_input_like_user(page, input_selector, password):
-                return _finish({"ok": False, "status": 400, "url": current_url, "data": None, "text": "登录密码页恢复后密码重新填写失败"})
-            submit_selector = _click_first(page, PASSWORD_SUBMIT_SELECTORS, timeout=5)
-            if submit_selector:
-                log(f"恢复后重新点击密码提交按钮: {submit_selector}")
-                start_url = str(page.url or start_url)
-                time.sleep(0.4)
-                continue
-            if _submit_form_with_fallback(page, input_selector):
-                log("恢复后未找到密码提交按钮，已使用表单 fallback 提交")
-                start_url = str(page.url or start_url)
-                time.sleep(0.4)
-                continue
-            return _finish({"ok": False, "status": 400, "url": current_url, "data": None, "text": "登录密码页恢复后未找到提交方式"})
-        error_text = _extract_auth_error_text(page)
-        if error_text:
-            _dump_debug(page, "chatgpt_password_fail")
-            return _finish({"ok": False, "status": 400, "url": current_url, "data": None, "text": error_text})
-        validation_error = _extract_input_validation_message(page, input_selector)
-        if validation_error:
-            _dump_debug(page, "chatgpt_password_fail")
-            return _finish({"ok": False, "status": 400, "url": current_url, "data": None, "text": validation_error})
-        time.sleep(0.5)
-    _dump_debug(page, "chatgpt_password_fail")
-    validation_error = _extract_input_validation_message(page, input_selector)
-    error_text = _extract_auth_error_text(page)
-    return _finish(
-        {
+            if error_text:
+                _dump_debug(page, "chatgpt_password_fail")
+                return {
+                    "ok": False,
+                    "status": 400,
+                    "url": current_url,
+                    "data": None,
+                    "text": error_text,
+                }
+            validation_error = (
+                _extract_input_validation_message(page, input_selector)
+                if committed_result is None
+                else ""
+            )
+            if validation_error:
+                _dump_debug(page, "chatgpt_password_fail")
+                return {
+                    "ok": False,
+                    "status": 400,
+                    "url": current_url,
+                    "data": None,
+                    "text": validation_error,
+                }
+            if committed_result is None:
+                submission.advance_if_idle()
+            time.sleep(0.5)
+        _dump_debug(page, "chatgpt_password_fail")
+        validation_error = (
+            _extract_input_validation_message(page, input_selector)
+            if committed_result is None
+            else ""
+        )
+        error_text = (
+            _extract_auth_error_text(page)
+            if committed_result is None
+            else ""
+        )
+        return {
             "ok": False,
-            "status": 0,
+            "status": int((committed_result or {}).get("status") or 0),
             "url": last_url,
-            "data": None,
-            "text": error_text or validation_error or "密码注册请求未产生响应且页面未跳转",
+            "data": (committed_result or {}).get("data"),
+            "text": error_text
+            or validation_error
+            or (
+                "密码注册请求已成功提交，但页面在等待期限内未离开旧密码页面"
+                if committed_result is not None
+                else ""
+            )
+            or (
+                f"密码注册请求结果不确定: {submission.observer.business_failures[-1]}"
+                if submission.observer.business_failures
+                else ""
+            )
+            or _password_submission_timeout_text(
+                submission,
+                "密码注册请求未产生响应且页面未跳转",
+            ),
+            "register_committed": committed_result is not None,
         }
-    )
+    finally:
+        submission.close()
 
 
 def _submit_otp_via_page(
@@ -3555,6 +4026,14 @@ def _submit_otp_via_page(
     otp = str(code or "").strip()
     if not otp:
         return {"ok": False, "status": 400, "url": page.url, "data": None, "text": "验证码为空"}
+
+    # Six-box OTP forms may auto-submit as soon as the last digit is typed.
+    # Install the observer before filling so that transaction cannot race past
+    # the listener and trigger a duplicate API fallback.
+    otp_observer = _NetworkActivityObserver(
+        page,
+        ("/api/accounts/email-otp/validate",),
+    )
 
     # 等待页面加载完成，确保 OTP 输入框已渲染
     try:
@@ -3638,49 +4117,45 @@ def _submit_otp_via_page(
                 continue
 
     if not filled:
+        otp_observer.close()
         return {"ok": False, "status": 0, "url": page.url, "data": None, "text": "验证码页未找到可填写输入框"}
 
     _browser_pause(page)
-    captured_responses: list[Any] = []
-    response_listener = None
-    try:
-        if hasattr(page, "on"):
-            def _capture_response(response):
-                try:
-                    if "/api/accounts/email-otp/validate" in str(response.url or ""):
-                        captured_responses.append(response)
-                except Exception:
-                    return
-
-            response_listener = _capture_response
-            page.on("response", response_listener)
-    except Exception:
-        response_listener = None
 
     try:
-        submit_selector = _click_first(
-            page,
-            [
-                'button[type="submit"]',
-                'button[data-testid="continue-button"]',
-                'button:has-text("Continue")',
-                'button:has-text("continue")',
-                'button:has-text("Verify")',
-                'button:has-text("verify")',
-                'button:has-text("Next")',
-                'button:has-text("next")',
-            ],
-            timeout=8,
+        state_after_fill = _derive_registration_state_from_page(page)
+        auto_submitted = bool(
+            otp_observer.has_business_request
+            or str(state_after_fill.get("page_type") or "")
+            not in {"", "email_otp_verification"}
         )
-        if not submit_selector:
-            return {"ok": False, "status": 0, "url": page.url, "data": None, "text": "验证码页未找到 Continue 按钮"}
-        log(f"验证码页已点击继续按钮: {submit_selector}")
+        if auto_submitted:
+            log("验证码输入完成后页面已自动提交，继续等待现有请求")
+        else:
+            submit_selector = _click_first(
+                page,
+                [
+                    'button[type="submit"]',
+                    'button[data-testid="continue-button"]',
+                    'button:has-text("Continue")',
+                    'button:has-text("continue")',
+                    'button:has-text("Verify")',
+                    'button:has-text("verify")',
+                    'button:has-text("Next")',
+                    'button:has-text("next")',
+                ],
+                timeout=8,
+            )
+            if not submit_selector:
+                return {"ok": False, "status": 0, "url": page.url, "data": None, "text": "验证码页未找到 Continue 按钮"}
+            log(f"验证码页已点击继续按钮: {submit_selector}")
 
         start_time = time.time()
-        deadline = start_time + 20
+        deadline = start_time + 60
         last_url = str(page.url or "")
         processed_responses = 0
         api_fallback_attempted = False
+        committed_result: dict | None = None
 
         def _response_details(response) -> tuple[int, str, dict, str]:
             status = int(getattr(response, "status", 0) or 0)
@@ -3717,12 +4192,21 @@ def _submit_otp_via_page(
                     return value.strip()
             return str(text or "").strip()[:500]
 
-        def _success_result(status: int, response_url: str, data: dict | None = None) -> dict:
+        def _success_result(
+            status: int,
+            response_url: str,
+            data: dict | None = None,
+            current_state: dict | None = None,
+        ) -> dict:
             effective_url = str(response_url or page.url or "")
             payload = data if isinstance(data, dict) else None
             state = _extract_flow_state(payload, effective_url)
             if not state.get("page_type") or state.get("page_type") == "email_otp_verification":
-                derived = _derive_registration_state_from_page(page)
+                derived = (
+                    current_state
+                    if isinstance(current_state, dict)
+                    else _derive_registration_state_from_page(page)
+                )
                 if derived.get("page_type") and derived.get("page_type") != "email_otp_verification":
                     return {"ok": True, "status": status or 200, "url": effective_url, "data": payload, "text": ""}
                 if not assume_success_without_state:
@@ -3731,7 +4215,9 @@ def _submit_otp_via_page(
                         "status": status or 200,
                         "url": effective_url,
                         "data": payload,
-                        "text": "验证码校验返回成功但页面仍停留在邮箱验证码页",
+                        "text": "验证码校验已成功提交，等待页面离开邮箱验证码页",
+                        "otp_committed": True,
+                        "transition_pending": True,
                     }
                 # The validate endpoint can return an empty 204 while the SPA
                 # keeps the same URL. Its successful contract is the next
@@ -3759,14 +4245,30 @@ def _submit_otp_via_page(
                 "chatgpt_home",
                 "external_url",
             } or "code=" in current_url:
-                return {"ok": True, "status": 200, "url": current_url, "data": None, "text": ""}
+                return {
+                    "ok": True,
+                    "status": int((committed_result or {}).get("status") or 200),
+                    "url": current_url,
+                    "data": (committed_result or {}).get("data"),
+                    "text": "",
+                    "otp_committed": committed_result is not None,
+                }
 
-            while processed_responses < len(captured_responses):
-                response = captured_responses[processed_responses]
+            while processed_responses < len(otp_observer.business_responses):
+                response = otp_observer.business_responses[processed_responses]
                 processed_responses += 1
                 status, response_url, data, response_text = _response_details(response)
                 if 200 <= status < 300:
-                    return _success_result(status, response_url, data)
+                    success_result = _success_result(
+                        status,
+                        response_url,
+                        data,
+                        current_state=state,
+                    )
+                    if success_result.get("otp_committed") and not success_result.get("ok"):
+                        committed_result = success_result
+                        break
+                    return success_result
                 if status >= 400:
                     error_text = _response_error(data, response_text)
                     return {
@@ -3777,7 +4279,16 @@ def _submit_otp_via_page(
                         "text": error_text or f"email OTP validate HTTP {status}",
                     }
 
-            if allow_api_fallback and not api_fallback_attempted and time.time() - start_time >= 2:
+            ui_request_in_flight = bool(otp_observer.business_requests) and not (
+                otp_observer.business_responses or otp_observer.business_failures
+            )
+            if (
+                allow_api_fallback
+                and not api_fallback_attempted
+                and time.time() - start_time >= 10
+                and not ui_request_in_flight
+                and not otp_observer.has_business_request
+            ):
                 api_fallback_attempted = True
                 log("验证码页 URL 未变化，改用浏览器上下文 API 校验兜底")
                 api_result = _validate_browser_email_otp(
@@ -3789,11 +4300,16 @@ def _submit_otp_via_page(
                 )
                 api_status = int(api_result.get("status") or 0)
                 if 200 <= api_status < 300 or api_result.get("ok"):
-                    return _success_result(
+                    success_result = _success_result(
                         api_status,
                         str(api_result.get("url") or current_url),
                         api_result.get("data") if isinstance(api_result.get("data"), dict) else None,
+                        current_state=state,
                     )
+                    if success_result.get("otp_committed") and not success_result.get("ok"):
+                        committed_result = success_result
+                    else:
+                        return success_result
                 if api_status >= 400:
                     post_api_state = _derive_registration_state_from_page(page)
                     if str(post_api_state.get("page_type") or "") in {
@@ -3824,23 +4340,28 @@ def _submit_otp_via_page(
                         ) or f"email OTP validate HTTP {api_status}",
                     }
 
-            error_text = _extract_auth_error_text(page)
+            error_text = "" if committed_result is not None else _extract_auth_error_text(page)
             if error_text:
                 return {"ok": False, "status": 400, "url": current_url, "data": None, "text": error_text}
             time.sleep(0.4)
+        if committed_result is not None:
+            committed_result["text"] = (
+                "验证码校验已成功提交，但页面在等待期限内未离开邮箱验证码页"
+            )
+            return committed_result
         return {
             "ok": False,
             "status": 0,
             "url": last_url,
             "data": None,
-            "text": f"验证码页提交后未进入下一状态: url={last_url[:160]}",
+            "text": (
+                f"验证码请求结果不确定且页面未进入下一状态: url={last_url[:160]}"
+                if otp_observer.business_failures
+                else f"验证码页提交后未进入下一状态: url={last_url[:160]}"
+            ),
         }
     finally:
-        if response_listener is not None:
-            try:
-                page.remove_listener("response", response_listener)
-            except Exception:
-                pass
+        otp_observer.close()
 
 
 def _submit_about_you_via_page(
@@ -4221,6 +4742,7 @@ def _submit_about_you_via_page(
             'input[name="full_name"]',
             'input[autocomplete="name"]',
             'input[placeholder*="全名"]',
+            'input[placeholder*="氏名"]',
             'input[placeholder*="name" i]',
             'input[id*="name" i]:not([type="hidden"])',
         ]
@@ -4231,6 +4753,7 @@ def _submit_about_you_via_page(
             'input[placeholder="Age"]',
             'input[placeholder="age"]',
             'input[placeholder*="年龄"]',
+            'input[placeholder*="年齢"]',
             'input[placeholder*="umur" i]',
             'input[placeholder*="usia" i]',
             'input[id*="age" i]',
@@ -4405,41 +4928,49 @@ def _submit_about_you_via_page(
         raise RuntimeError("about_you 未成功填写 Birthday/Age")
     _browser_pause(page)
 
-    create_account_responses: list[Any] = []
+    about_observer = _NetworkActivityObserver(
+        page,
+        ("/api/accounts/create_account",),
+    )
+    create_account_requests = about_observer.business_requests
+    create_account_responses = about_observer.business_responses
+    create_account_failures = about_observer.business_failures
+
+    def _finish_about(result: dict) -> dict:
+        about_observer.close()
+        return result
+
     try:
-        page.on(
-            "response",
-            lambda response: create_account_responses.append(response)
-            if "/api/accounts/create_account" in str(getattr(response, "url", "") or "")
-            else None,
+        submit_selector = _click_first(
+            page,
+            [
+                'button:has-text("Finish creating account")',
+                'button:has-text("finish creating account")',
+                'button[type="submit"]',
+                'button[data-testid="continue-button"]',
+                'button:has-text("Continue")',
+                'button:has-text("continue")',
+                'button:has-text("Next")',
+                'button:has-text("next")',
+            ],
+            timeout=8,
         )
     except Exception:
-        create_account_responses = []
-
-    submit_selector = _click_first(
-        page,
-        [
-            'button:has-text("Finish creating account")',
-            'button:has-text("finish creating account")',
-            'button[type="submit"]',
-            'button[data-testid="continue-button"]',
-            'button:has-text("Continue")',
-            'button:has-text("continue")',
-            'button:has-text("Next")',
-            'button:has-text("next")',
-        ],
-        timeout=8,
-    )
+        about_observer.close()
+        raise
     if not submit_selector:
+        about_observer.close()
         raise RuntimeError("about_you 未找到提交按钮")
     log(f"about_you 已点击继续按钮: {submit_selector}")
 
     submit_started_at = time.time()
-    deadline = submit_started_at + 20
+    deadline = submit_started_at + 60
     about_api_attempted = False
     about_api_error = ""
     retried_generic_validation = False
     last_url = page.url
+    committed_result: dict | None = None
+    committed_at: float | None = None
     while time.time() < deadline:
         current_url = page.url
         last_url = current_url or last_url
@@ -4468,13 +4999,19 @@ def _submit_about_you_via_page(
                     except (TypeError, ValueError):
                         pass
             if 200 <= response_status < 300:
-                return {
+                committed_result = {
                     "ok": True,
                     "status": response_status,
                     "url": response_url,
                     "data": response_data,
                     "text": "",
+                    "signup_committed": True,
                 }
+                committed_at = time.time()
+                response_state = _extract_flow_state(response_data, response_url)
+                if str(response_state.get("page_type") or "") not in {"", "about_you"}:
+                    return _finish_about(committed_result)
+                continue
             if response_status >= 400:
                 response_error = ""
                 if isinstance(response_data, dict):
@@ -4482,15 +5019,18 @@ def _submit_about_you_via_page(
                     if isinstance(error, dict):
                         response_error = str(error.get("message") or error.get("detail") or "").strip()
                     response_error = response_error or str(response_data.get("message") or "").strip()
-                return {
+                return _finish_about({
                     "ok": False,
                     "status": response_status,
                     "url": response_url,
                     "data": response_data,
                     "text": response_error or response_text[:500] or f"create_account HTTP {response_status}",
-                }
+                })
         state_after_submit = _derive_registration_state_from_page(page)
         state_page_type = str(state_after_submit.get("page_type") or "")
+        ui_request_in_flight = bool(create_account_requests) and not (
+            create_account_responses or create_account_failures
+        )
         if state_page_type in {
             "add_phone",
             "consent",
@@ -4500,8 +5040,39 @@ def _submit_about_you_via_page(
             "chatgpt_home",
             "external_url",
         }:
-            return {"ok": True, "status": 200, "url": current_url, "data": None, "text": ""}
-        if not about_api_attempted and time.time() - submit_started_at >= 2.5:
+            if committed_result is not None:
+                committed_result["url"] = current_url
+                committed_result["data"] = {
+                    "continue_url": str(
+                        state_after_submit.get("continue_url")
+                        or state_after_submit.get("current_url")
+                        or current_url
+                    ),
+                    "method": "GET",
+                }
+                return _finish_about(committed_result)
+            if ui_request_in_flight or state_page_type == "add_phone":
+                time.sleep(0.2)
+                continue
+            return _finish_about(
+                {"ok": True, "status": 200, "url": current_url, "data": None, "text": ""}
+            )
+        if committed_result is not None:
+            if committed_at is not None and time.time() - committed_at >= 5:
+                committed_result["data"] = {
+                    "continue_url": f"{CHATGPT_APP}/",
+                    "method": "GET",
+                }
+                committed_result["transition_pending"] = True
+                return _finish_about(committed_result)
+            time.sleep(0.2)
+            continue
+        if (
+            not about_api_attempted
+            and time.time() - submit_started_at >= 10
+            and not ui_request_in_flight
+            and not about_observer.has_business_request
+        ):
             about_api_attempted = True
             log("about_you URL 未变化，改用浏览器上下文 create_account API 兜底")
             try:
@@ -4533,13 +5104,14 @@ def _submit_about_you_via_page(
                         "continue_url": f"{CHATGPT_APP}/",
                         "method": "GET",
                     }
-                return {
+                return _finish_about({
                     "ok": True,
                     "status": api_status or 200,
                     "url": api_url,
                     "data": api_data,
                     "text": "",
-                }
+                    "signup_committed": True,
+                })
             if api_status >= 400:
                 error_payload = api_result.get("data") if isinstance(api_result.get("data"), dict) else {}
                 error_obj = error_payload.get("error") if isinstance(error_payload, dict) else {}
@@ -4550,9 +5122,16 @@ def _submit_about_you_via_page(
                 ) or str(error_payload.get("message") or "").strip() or str(api_result.get("text") or "").strip()[:500]
                 log(f"about_you API 兜底返回失败: status={api_status} text={about_api_error[:180]}")
         if "code=" in current_url or "chatgpt.com" in current_url or "sign-in-with-chatgpt" in current_url:
-            return {"ok": True, "status": 200, "url": current_url, "data": None, "text": ""}
+            return _finish_about(
+                {"ok": True, "status": 200, "url": current_url, "data": None, "text": ""}
+            )
         if "add-phone" in current_url:
-            return {"ok": True, "status": 200, "url": current_url, "data": None, "text": ""}
+            if ui_request_in_flight:
+                time.sleep(0.2)
+                continue
+            return _finish_about(
+                {"ok": False, "status": 0, "url": current_url, "data": None, "text": "add_phone 已出现但未观察到 create_account 成功响应"}
+            )
         try:
             error_text = page.locator("text=Sorry, we cannot create your account").first.text_content(timeout=500)
         except Exception:
@@ -4582,6 +5161,7 @@ def _submit_about_you_via_page(
             if (
                 about_mode == "age"
                 and not retried_generic_validation
+                and not about_observer.has_business_request
                 and ("doesn't look right" in normalized_error or "try again" in normalized_error)
             ):
                 retried_generic_validation = True
@@ -4626,16 +5206,20 @@ def _submit_about_you_via_page(
                     log(f"about_you 重试提交按钮: {retry_submit_selector}")
                     time.sleep(0.5)
                     continue
-            return {"ok": False, "status": 400, "url": current_url, "data": None, "text": error_text}
+            return _finish_about(
+                {"ok": False, "status": 400, "url": current_url, "data": None, "text": error_text}
+            )
         time.sleep(0.5)
     _dump_debug(page, "chatgpt_about_you_fail")
-    return {
+    return _finish_about({
         "ok": False,
         "status": 0,
         "url": last_url,
         "data": None,
-        "text": about_api_error or "about_you 提交后未跳转",
-    }
+        "text": about_api_error
+        or (create_account_failures[-1] if create_account_failures else "")
+        or "about_you 提交后未跳转",
+    })
 
 
 def _browser_registration_flow(
@@ -4664,9 +5248,11 @@ def _browser_registration_flow(
     profile_birthdate = str(profile_data.get("birthdate") or "").strip()
     try:
         state = _start_browser_signup_via_page(page, email, log)
-    except Exception as exc:
+    except _BrowserSignupEntryUnavailable as exc:
         log(f"OpenAI 页面注册入口失败，尝试 ChatGPT authorize 入口: {exc}")
         state = _start_browser_signup_via_authorize(page, email, device_id, log)
+    page_otp_triggered = bool(state.pop("_page_otp_triggered", False))
+    otp_sent_at_hint = state.pop("_otp_sent_at", None)
     auth_cookies = _get_cookies(page)
     log(
         "授权态 cookies: "
@@ -4676,6 +5262,7 @@ def _browser_registration_flow(
     log(f"注册状态起点: page={state.get('page_type') or '-'} url={(state.get('current_url') or '')[:100]}")
     register_submitted = False
     browser_otp_sent = False
+    signup_committed = False
     seen_states: dict[str, int] = {}
 
     for step in range(12):
@@ -4714,6 +5301,9 @@ def _browser_registration_flow(
             if not reg_resp.get("ok"):
                 raise RuntimeError(f"密码页提交失败: {(reg_resp.get('text') or '')[:300]}")
             register_submitted = True
+            if reg_resp.get("otp_triggered"):
+                page_otp_triggered = True
+                otp_sent_at_hint = reg_resp.get("otp_sent_at")
             state = _extract_flow_state(reg_resp.get("data"), reg_resp.get("url", page.url))
             if not state.get("page_type") or _is_password_registration(state):
                 state = _derive_registration_state_from_page(page)
@@ -4728,8 +5318,9 @@ def _browser_registration_flow(
         if _is_email_otp(state):
             if not otp_callback:
                 raise RuntimeError("ChatGPT 注册需要邮箱验证码但未提供 otp_callback")
-            otp_sent_at = None
-            if not browser_otp_sent:
+            otp_sent_at = otp_sent_at_hint
+            if not browser_otp_sent and not page_otp_triggered:
+                request_started_at = time.time() - 8
                 send_result = _send_browser_email_otp(
                     page,
                     device_id=device_id,
@@ -4738,7 +5329,7 @@ def _browser_registration_flow(
                 )
                 send_status = int(send_result.get("status") or 0)
                 if 200 <= send_status < 300 or send_result.get("ok"):
-                    otp_sent_at = time.time()
+                    otp_sent_at = request_started_at
                     log(f"浏览器注册验证码已触发: status={send_status or 200}")
                 else:
                     log(
@@ -4746,6 +5337,8 @@ def _browser_registration_flow(
                         f"status={send_status} text={str(send_result.get('text') or '')[:160]}"
                     )
                 browser_otp_sent = True
+            elif page_otp_triggered:
+                log("浏览器页面已触发注册验证码，直接等待现有 OTP，不重复发送")
             log("等待 ChatGPT 验证码")
             callback_payload = {
                 "otp_sent_at": otp_sent_at,
@@ -4767,6 +5360,8 @@ def _browser_registration_flow(
                 code = str(callback_value or "").strip()
             if not code:
                 raise RuntimeError("未获取到验证码")
+            page_otp_triggered = False
+            otp_sent_at_hint = None
             otp_resp = _submit_otp_via_page(
                 page,
                 code,
@@ -4803,11 +5398,15 @@ def _browser_registration_flow(
             log(f"about_you 提交状态: {about_resp.get('status', 0)}")
             if not about_resp.get("ok"):
                 raise RuntimeError(f"about_you 提交失败: {(about_resp.get('text') or '')[:300]}")
+            signup_committed = bool(about_resp.get("signup_committed"))
             state = _extract_flow_state(about_resp.get("data"), about_resp.get("url", page.url))
             if not state.get("page_type"):
                 state = _derive_registration_state_from_page(page)
             if _is_add_phone(state):
                 if not phone_callback:
+                    if signup_committed:
+                        state["signup_committed"] = True
+                        state["signup_commit_source"] = "about_you_create_account_2xx"
                     return state
                 log("about_you 后进入 add_phone，尝试短信验证...")
                 state = _handle_add_phone_challenge(
@@ -4822,6 +5421,9 @@ def _browser_registration_flow(
 
         if _is_add_phone(state):
             if not phone_callback:
+                if signup_committed:
+                    state["signup_committed"] = True
+                    state["signup_commit_source"] = "about_you_create_account_2xx"
                 return state
             log("注册流程进入 add_phone，尝试短信验证...")
             state = _handle_add_phone_challenge(

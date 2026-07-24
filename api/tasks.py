@@ -16005,6 +16005,10 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
         PlatformCls = ChatGPTPlatform
 
         initial_merged_extra = _build_effective_register_extra(req)
+        browser_executor = str(req.executor_type or "protocol").strip().lower() in {
+            "headless",
+            "headed",
+        }
         chatgpt_zero_amount_stop_enabled = (
             req.platform == "chatgpt"
             and _is_truthy(initial_merged_extra.get("chatgpt_access_token_only_zero_amount_stop_enabled"))
@@ -16359,6 +16363,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
             nonlocal chatgpt_zero_amount_stop_triggered
             current_email = req.email or ""
             attempt_id: int | None = None
+            browser_register_invoked = False
             try:
                 from core.proxy_utils import (
                     is_proxy_error_text,
@@ -16509,6 +16514,13 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                             # still attributable and recoverable.
                             _platform.mailbox._registration_task_id = task_id
                             _platform.mailbox._log_fn = _platform._log_fn
+                        if browser_executor:
+                            browser_register_invoked = True
+                            _log(
+                                task_id,
+                                "[代理] 浏览器注册链路已启动；为避免邮箱、密码和身份画像分叉，"
+                                "本次失败不再切换代理候选",
+                            )
                         account = _platform.register(
                             email=req.email or None,
                             password=req.password,
@@ -16536,6 +16548,15 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                                     error_message=error_text,
                                     status_code=403 if ("403" in error_text or "访问首页失败" in error_text or "预授权被拦截" in error_text) else 0,
                                 )
+                        if browser_executor and browser_register_invoked:
+                            last_proxy_error = error_text
+                            last_proxy_error_email = current_email
+                            _log(
+                                task_id,
+                                "[代理] 浏览器注册链路启动后失败；为避免身份分叉，"
+                                f"保持当前代理并终止本次尝试，不切换下一候选: {error_text}",
+                            )
+                            raise
                         if is_proxy_error_text(error_text) and proxy_index < len(candidate_proxies):
                             last_proxy_error = error_text
                             last_proxy_error_email = current_email
@@ -16958,7 +16979,12 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                         },
                     ),
                 )
-                return AttemptResult.failed(error_text)
+                return AttemptResult.failed(
+                    error_text,
+                    consumes_target_slot=bool(
+                        browser_executor and browser_register_invoked
+                    ),
+                )
             finally:
                 control.finish_attempt(attempt_id)
 
@@ -17029,6 +17055,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
         max_workers = min(req.concurrency, target_successes, attempt_cap or target_successes, 5)
         stopped = False
         attempt_limit_reached = False
+        consumed_browser_failure_slots = 0
         next_attempt_index = 0
         in_flight: dict[Any, int] = {}
 
@@ -17064,6 +17091,12 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                         stopped = True
                     elif result.outcome == AttemptOutcome.FAILED:
                         errors.append(result.message)
+                        if result.consumes_target_slot:
+                            consumed_browser_failure_slots += 1
+                            _log(
+                                task_id,
+                                "[控制] 浏览器注册已进入结果不确定区间；本次失败占用一个目标身份槽，禁止补发替代身份",
+                            )
                         if _is_fatal_registration_infrastructure_error(result.message):
                             fatal_registration_error = str(result.message or "").strip()
                             _log(
@@ -17099,6 +17132,14 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                         continue
 
                     if success < target_successes:
+                        if (
+                            browser_executor
+                            and success
+                            + consumed_browser_failure_slots
+                            + len(in_flight)
+                            >= target_successes
+                        ):
+                            continue
                         if attempt_cap > 0 and next_attempt_index >= attempt_cap:
                             attempt_limit_reached = True
                             _log(

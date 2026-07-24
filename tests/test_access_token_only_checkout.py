@@ -191,6 +191,47 @@ class AccessTokenOnlyCheckoutTests(unittest.TestCase):
                     expected_headless,
                 )
 
+    def test_browser_signup_full_flow_is_never_replayed(self):
+        email_service = mock.Mock()
+        email_service.create_email.return_value = {"email": "buyer@example.com"}
+        engine = AccessTokenOnlyRegistrationEngine(
+            email_service=email_service,
+            proxy_url="http://proxy.local:8080",
+            browser_mode="headless",
+            max_retries=3,
+        )
+        client = mock.Mock(
+            device_id="device-demo",
+            ua="Mozilla/5.0",
+            sec_ch_ua='"Chromium";v="145"',
+            impersonate="chrome145",
+            fingerprint=None,
+            last_registration_route_event=None,
+            registration_transport="camoufox_browser",
+            registration_stage_transports=[],
+        )
+        browser_result = BrowserRegistrationStageResult(
+            error="创建账号失败: HTTP 400: registration_disallowed"
+        )
+
+        with (
+            mock.patch.object(engine, "_build_chatgpt_client", return_value=client),
+            mock.patch.object(
+                engine,
+                "_run_browser_registration",
+                return_value=browser_result,
+            ) as browser_stage,
+        ):
+            result = engine.run()
+
+        self.assertFalse(result.success)
+        self.assertIn("registration_disallowed", result.error_message)
+        browser_stage.assert_called_once()
+        email_service.create_email.assert_called_once()
+        self.assertTrue(
+            any("固定为单次执行" in line for line in result.logs)
+        )
+
     def test_browser_signup_existing_account_never_switches_to_login_recovery(self):
         email_service = mock.Mock()
         email_service.create_email.return_value = {"email": "existing@example.com"}

@@ -6,6 +6,20 @@
 
 ## [Unreleased] (未发布)
 
+## [2.8.26] - 2026-07-25
+
+### 修复 (Fixed)
+- **封死浏览器注册的身份分叉与结果不确定重放**：`api/tasks.py` 在 `executor_type=headless/headed` 进入 `Platform.register()` 后，失败不再切换代理候选、换邮箱或换指纹补位，并通过 `core/task_runtime.py` 的 `consumes_target_slot` 将不确定失败计入目标身份槽预算；`count > 1` 时仍允许跑用户原本请求的其他身份槽。`protocol` 的代理 failover 与补尝试语义保持不变。
+- **Camoufox 完整 signup 单次执行**：`services/chatgpt_core/access_token_only_registration_engine.py` 对普通浏览器开户强制 `registration_max_retries=1`，禁止默认 `max_retries=3` 对结果不确定的 signup 整流程重放；纯协议与显式已有账号浏览器登录仍保留原重试。
+- **密码提交改为受控 staged 降级**：`services/chatgpt_core/browser_registration.py` 引入 `_NetworkActivityObserver` 与 `_PasswordFormSubmission`，按 `真实 click → 无业务请求再 requestSubmit → 再无请求才 Enter` 推进，并在 Sentinel/Cloudflare 进行中延长观察。注册与 OAuth 密码页均以业务 API 响应（`/api/accounts/user/register`、`/api/accounts/password/verify`）为准推进，`2xx` 后等待 SPA 离开旧密码 DOM，不再在 click 异常后立即 `requestSubmit`。
+- **OTP / about-you 禁止非幂等重放**：OTP 在填充前安装网络观察器，自动提交后不再重复点击 Continue；`2xx/204` 记为 `otp_committed`/`signup_committed` 后有界等待页面推进。请求已发出但 response 丢失时，不再走 API fallback 重放验证码，也不再用新 invocation ID 重建 `create_account`。`signup_committed` 后的 add-phone 页按注册完成处理，便于后续严格浏览器 OAuth。
+
+### 优化 (Changed)
+- **注册入口等待与 passwordless 单次点击**：邮箱入口等待超时放宽到 60 秒，passwordless 一次性验证码入口只点击一次并记录 `otp_sent_at`，避免循环点击造成重复发码竞态。
+
+### 测试 (Tests)
+- 扩展 `tests/test_browser_registration_flow.py`、`tests/test_register_task_controls.py`、`tests/test_access_token_only_checkout.py`，覆盖密码 staged 提交、OTP/about-you committed、浏览器失败占用身份槽、协议 failover 不受影响、engine 单次 signup。侧栏版本同步为 `v2.8.26`。
+
 ## [2.8.25] - 2026-07-25
 
 ### 优化 (Changed)
@@ -2609,4 +2623,12 @@
 
 ## 2026-07-25 04:10:05 +0800
 - 修复 Camoufox 注册密码校验与页面状态推进
+- 发布模式: multi
+
+## 2026-07-25 05:59:00 +0800
+- 修复浏览器注册密码提交与身份槽重放合同 v2.8.26
+- 发布模式: multi
+
+## 2026-07-25 05:59:07 +0800
+- 修复浏览器注册密码提交与身份槽重放合同 v2.8.26
 - 发布模式: multi

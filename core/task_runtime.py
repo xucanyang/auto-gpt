@@ -56,14 +56,24 @@ class AttemptOutcome(str, Enum):
 class AttemptResult:
     outcome: AttemptOutcome
     message: str = ""
+    consumes_target_slot: bool = False
 
     @classmethod
     def success(cls) -> "AttemptResult":
         return cls(AttemptOutcome.SUCCESS)
 
     @classmethod
-    def failed(cls, message: str) -> "AttemptResult":
-        return cls(AttemptOutcome.FAILED, message)
+    def failed(
+        cls,
+        message: str,
+        *,
+        consumes_target_slot: bool = False,
+    ) -> "AttemptResult":
+        return cls(
+            AttemptOutcome.FAILED,
+            message,
+            consumes_target_slot=consumes_target_slot,
+        )
 
     @classmethod
     def skipped(cls, message: str) -> "AttemptResult":

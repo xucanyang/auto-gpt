@@ -1119,6 +1119,13 @@ class AccessTokenOnlyRegistrationEngine:
         existing_account_capture = self._parse_bool(self.extra_config.get("chatgpt_existing_account_capture"))
         existing_account_login_route_allowed = self._is_existing_account_login_route_enabled()
         existing_account_login_route_event: dict[str, Any] | None = None
+        registration_max_retries = self.max_retries
+        if self._is_browser_executor() and not existing_account_capture:
+            registration_max_retries = 1
+            if self.max_retries > 1:
+                self._log(
+                    "浏览器注册完整链路固定为单次执行，禁止对结果不确定的 signup 重放"
+                )
         register_otp_wait_seconds = self._read_int_config(
             "chatgpt_register_otp_wait_seconds",
             fallback_keys=("chatgpt_otp_wait_seconds",),
@@ -1158,7 +1165,7 @@ class AccessTokenOnlyRegistrationEngine:
         email_initialized = False
         try:
             last_error = ""
-            for attempt in range(self.max_retries):
+            for attempt in range(registration_max_retries):
                 try:
                     if attempt == 0:
                         self._log("=" * 60)
@@ -1170,7 +1177,7 @@ class AccessTokenOnlyRegistrationEngine:
                             )
                         self._log("=" * 60)
                     else:
-                        self._log(f"整流程重试 {attempt + 1}/{self.max_retries} ...")
+                        self._log(f"整流程重试 {attempt + 1}/{registration_max_retries} ...")
                         time.sleep(1)
 
                     if not existing_account_capture:
@@ -1193,7 +1200,7 @@ class AccessTokenOnlyRegistrationEngine:
                         last_error = homepage_error or "访问首页失败"
                         result.error_message = last_error
                         self._log(f"预热失败，跳过邮箱创建: {last_error}")
-                        if attempt < self.max_retries - 1 and self._should_retry(last_error):
+                        if attempt < registration_max_retries - 1 and self._should_retry(last_error):
                             continue
                         self._finalize_email_service_failure(result, fallback_error=result.error_message)
                         return result
@@ -1286,7 +1293,7 @@ class AccessTokenOnlyRegistrationEngine:
                                 last_error = str(login_exc or "已有账号登录失败")
                         if not tokens:
                             last_error = str(getattr(oauth_client, "last_error", "") or last_error or "已有账号登录失败")
-                            if attempt < self.max_retries - 1 and self._should_retry(last_error):
+                            if attempt < registration_max_retries - 1 and self._should_retry(last_error):
                                 self._log(f"已有账号登录失败，准备整流程重试: {last_error}")
                                 continue
                             result.error_message = last_error
@@ -1453,7 +1460,7 @@ class AccessTokenOnlyRegistrationEngine:
                                     last_error = str(login_exc or "已有账号登录恢复失败")
                                 if not tokens:
                                     last_error = str(getattr(oauth_client, "last_error", "") or last_error or "已有账号登录恢复失败")
-                                    if attempt < self.max_retries - 1 and self._should_retry(last_error):
+                                    if attempt < registration_max_retries - 1 and self._should_retry(last_error):
                                         self._log(f"已有账号登录恢复失败，准备整流程重试: {last_error}")
                                         continue
                                     result.error_message = last_error
@@ -1474,7 +1481,7 @@ class AccessTokenOnlyRegistrationEngine:
                                 existing_account_login_route_event = None
                                 last_error = f"注册流失败: {msg}"
                                 if (
-                                    attempt < self.max_retries - 1
+                                    attempt < registration_max_retries - 1
                                     and not skymail_adapter.is_otp_wait_budget_exhausted()
                                     and self._should_retry(msg)
                                 ):
@@ -1611,7 +1618,7 @@ class AccessTokenOnlyRegistrationEngine:
                         )
                         self._finalize_email_service_success(result)
                         return result
-                    if attempt < self.max_retries - 1:
+                    if attempt < registration_max_retries - 1:
                         self._log(f"{last_error}，准备整流程重试")
                         continue
                     result.error_message = last_error
@@ -1621,7 +1628,7 @@ class AccessTokenOnlyRegistrationEngine:
                     raise
                 except Exception as attempt_error:
                     last_error = str(attempt_error)
-                    if attempt < self.max_retries - 1 and self._should_retry(last_error):
+                    if attempt < registration_max_retries - 1 and self._should_retry(last_error):
                         self._log(f"本轮出现异常，准备整流程重试: {last_error}")
                         continue
                     raise
