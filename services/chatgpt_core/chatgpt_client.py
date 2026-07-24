@@ -62,10 +62,7 @@ class ChatGPTClient:
         """
         self.proxy = proxy
         self.verbose = verbose
-        normalized_browser_mode = str(browser_mode or "protocol").strip().lower()
-        if normalized_browser_mode not in {"protocol", "headless", "headed"}:
-            raise ValueError(f"unsupported ChatGPT executor: {browser_mode}")
-        self.browser_mode = normalized_browser_mode
+        self.browser_mode = browser_mode or "protocol"
         self.stop_checker = stop_checker
         self.fingerprint = coerce_browser_fingerprint(fingerprint)
         self._apply_fingerprint_meta(self.fingerprint)
@@ -79,11 +76,7 @@ class ChatGPTClient:
         apply_browser_fingerprint(self.session, self.fingerprint)
         self.last_registration_state = FlowState()
         self.last_registration_route_event = None
-        self.requested_executor = self.browser_mode
-        self.effective_executor = self.browser_mode
-        self.registration_transport = "protocol_http"
-        self.registration_stage_transports: list[dict] = []
-        self.registration_runtime_profile: dict = {}
+        self.registration_transport = "protocol"
         self.last_homepage_probe = {
             "ok": False,
             "status_code": 0,
@@ -123,23 +116,6 @@ class ChatGPTClient:
         return "; ".join(pairs)
 
     def _get_sentinel_token(self, flow: str, *, page_url: str | None = None):
-        if self.browser_mode == "protocol":
-            token = build_sentinel_token(
-                self.session,
-                self.device_id,
-                flow=flow,
-                user_agent=self.ua,
-                sec_ch_ua=self.sec_ch_ua,
-                impersonate=self.impersonate,
-            )
-            if token:
-                self._log(f"{flow}: 已通过纯协议 HTTP PoW 获取 token")
-            else:
-                self._log(
-                    f"{flow}: sentinel_protocol_unavailable，纯协议模式禁止启动浏览器"
-                )
-            return token
-
         prefer_browser = flow in {"username_password_create", "oauth_create_account"}
         if prefer_browser:
             token = get_sentinel_token_via_browser(
@@ -978,80 +954,6 @@ class ChatGPTClient:
             self._log(f"验证异常: {e}")
             return False, str(e)
 
-    def _create_account_via_protocol(
-        self,
-        first_name,
-        last_name,
-        birthdate,
-        *,
-        return_state=False,
-    ):
-        name = f"{first_name} {last_name}"
-        url = f"{self.AUTH}/api/accounts/create_account"
-        sentinel_token = self._get_sentinel_token(
-            "oauth_create_account",
-            page_url=f"{self.AUTH}/about-you",
-        )
-        if not sentinel_token:
-            detail = (
-                "sentinel_protocol_unavailable: oauth_create_account HTTP PoW "
-                "未返回 token，纯协议模式不会切换浏览器"
-            )
-            self._log(f"create_account: {detail}")
-            return False, detail
-
-        headers = self._headers(
-            url,
-            accept="application/json",
-            referer=f"{self.AUTH}/about-you",
-            origin=self.AUTH,
-            content_type="application/json",
-            fetch_site="same-origin",
-            extra_headers={"oai-device-id": self.device_id},
-        )
-        headers["openai-sentinel-token"] = sentinel_token
-        headers.update(generate_datadog_trace())
-        try:
-            r = self.session.post(
-                url,
-                json={"name": name, "birthdate": birthdate},
-                headers=headers,
-                timeout=30,
-            )
-            if r.status_code == 200:
-                try:
-                    data = r.json()
-                except Exception:
-                    data = {}
-                next_state = self._state_from_payload(
-                    data,
-                    current_url=str(r.url) or self.BASE,
-                )
-                self._log(f"账号创建成功 {describe_flow_state(next_state)}")
-                return (True, next_state) if return_state else (True, "账号创建成功")
-
-            error_code = ""
-            error_msg = str(getattr(r, "text", "") or "")[:200]
-            try:
-                error_data = r.json() or {}
-                error_info = error_data.get("error") or {}
-                error_code = str(error_info.get("code") or "").strip()
-                error_msg = str(error_info.get("message") or error_msg).strip()
-            except Exception:
-                pass
-            detail = f"HTTP {r.status_code}"
-            if error_code:
-                detail += f": {error_code}"
-            elif error_msg:
-                detail += f": {error_msg}"
-            self._log(f"创建失败: {detail} - {error_msg[:200]}")
-            return False, detail
-        except TaskInterruption:
-            raise
-        except Exception as exc:
-            self._log(f"创建异常: {exc}")
-            return False, str(exc)
-
     def create_account(self, first_name, last_name, birthdate, return_state=False):
         """
         完成账号创建（提交姓名和生日）
@@ -1064,14 +966,6 @@ class ChatGPTClient:
         Returns:
             tuple: (success, message)
         """
-        if self.browser_mode == "protocol":
-            return self._create_account_via_protocol(
-                first_name,
-                last_name,
-                birthdate,
-                return_state=return_state,
-            )
-
         name = f"{first_name} {last_name}"
         self._log(f"完成账号创建: {name}")
         try:
@@ -1080,7 +974,9 @@ class ChatGPTClient:
                 birthdate=birthdate,
                 proxy=self.proxy,
                 page_url=f"{self.AUTH}/about-you",
-                headless=self.browser_mode == "headless",
+                # Cloudflare rejects the create_account POST from headless
+                # Chromium even after JSD; keep only this Auth transaction headed.
+                headless=False,
                 device_id=self.device_id,
                 user_agent=self.ua,
                 sec_ch_ua=self.sec_ch_ua,

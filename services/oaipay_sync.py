@@ -13,7 +13,6 @@ from services.chatgpt_account_state import (
     RETIRED_SUBSCRIPTION_TYPES,
     classify_chatgpt_capabilities,
     effective_subscription_plan,
-    is_chatgpt_upload_ready,
 )
 from services.chatgpt_sync import build_chatgpt_sync_account
 
@@ -525,37 +524,6 @@ def backfill_chatgpt_account_to_oaipay(
     results: list[dict[str, Any]] = []
     started_at = _utcnow_iso()
     cached_sync = get_oaipay_sync_state(account)
-    ready, gate_message, capabilities = is_chatgpt_upload_ready(account)
-    if not ready:
-        upload_state = _build_upload_failure_state(
-            gate_message,
-            started_at=started_at,
-            initial_sync=cached_sync,
-        )
-        upload_state["upload_gate"] = capabilities.get("upload_gate") or ""
-        upload_state["probe_source"] = _safe_str(cached_sync.get("probe_source")) or "upload_gate"
-        upload_state["last_upload"] = _last_upload(
-            "skipped",
-            "upload_gate",
-            gate_message,
-            started_at=started_at,
-            probe_before=cached_sync.get("remote_state") or "",
-            upload_gate=capabilities.get("upload_gate") or "",
-        )
-        update_account_model_oaipay_sync(account, upload_state, session=session, commit=False)
-        if session is not None and commit:
-            session.commit()
-            session.refresh(account)
-        results.append({"name": "OAIPay 上传", "ok": False, "msg": gate_message})
-        return {
-            "ok": False,
-            "uploaded": False,
-            "skipped": True,
-            "message": gate_message,
-            "results": results,
-            "capabilities": capabilities,
-        }
-
     mode = str(category_mode or "auto").strip().lower() or "auto"
     if mode not in {"auto", "manual"}:
         mode = "auto"
@@ -565,6 +533,7 @@ def backfill_chatgpt_account_to_oaipay(
         # Backward compatibility: historical callers passed category_id as the
         # fallback group while automatic classification still took precedence.
         fallback_group_ids = [int(category_id)]
+    capabilities = classify_chatgpt_capabilities(account)
     subscription_plan = effective_subscription_plan(capabilities)
     if subscription_plan in RETIRED_SUBSCRIPTION_TYPES:
         message = f"订阅类型 {subscription_plan} 已退役，禁止上传 OAIPay"

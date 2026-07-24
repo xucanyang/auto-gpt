@@ -1158,9 +1158,9 @@ def _is_resume_auth_candidate(account: AccountModel) -> bool:
     capabilities = extra.get("chatgpt_capabilities") if isinstance(extra.get("chatgpt_capabilities"), dict) else {}
     auth_level = str(capabilities.get("auth_level") or "").strip().lower()
     upload_gate = str(capabilities.get("upload_gate") or "").strip().lower()
-    if auth_level in {"registered_auth_pending", "access_token_only", "invalid"}:
+    if auth_level in {"access_token_only", "invalid"}:
         return True
-    if upload_gate in {"blocked_missing_at", "blocked_missing_rt", "blocked_missing_workspace"}:
+    if upload_gate in {"blocked_missing_rt", "blocked_missing_workspace"}:
         return True
     return False
 
@@ -16005,10 +16005,6 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
         PlatformCls = ChatGPTPlatform
 
         initial_merged_extra = _build_effective_register_extra(req)
-        browser_executor = str(req.executor_type or "protocol").strip().lower() in {
-            "headless",
-            "headed",
-        }
         chatgpt_zero_amount_stop_enabled = (
             req.platform == "chatgpt"
             and _is_truthy(initial_merged_extra.get("chatgpt_access_token_only_zero_amount_stop_enabled"))
@@ -16363,7 +16359,6 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
             nonlocal chatgpt_zero_amount_stop_triggered
             current_email = req.email or ""
             attempt_id: int | None = None
-            browser_register_invoked = False
             try:
                 from core.proxy_utils import (
                     is_proxy_error_text,
@@ -16514,13 +16509,6 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                             # still attributable and recoverable.
                             _platform.mailbox._registration_task_id = task_id
                             _platform.mailbox._log_fn = _platform._log_fn
-                        if browser_executor:
-                            browser_register_invoked = True
-                            _log(
-                                task_id,
-                                "[代理] 浏览器注册链路已启动；为避免邮箱、密码和身份画像分叉，"
-                                "本次失败不再切换代理候选",
-                            )
                         account = _platform.register(
                             email=req.email or None,
                             password=req.password,
@@ -16548,15 +16536,6 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                                     error_message=error_text,
                                     status_code=403 if ("403" in error_text or "访问首页失败" in error_text or "预授权被拦截" in error_text) else 0,
                                 )
-                        if browser_executor and browser_register_invoked:
-                            last_proxy_error = error_text
-                            last_proxy_error_email = current_email
-                            _log(
-                                task_id,
-                                "[代理] 浏览器注册链路启动后失败；为避免身份分叉，"
-                                f"保持当前代理并终止本次尝试，不切换下一候选: {error_text}",
-                            )
-                            raise
                         if is_proxy_error_text(error_text) and proxy_index < len(candidate_proxies):
                             last_proxy_error = error_text
                             last_proxy_error_email = current_email
@@ -16569,12 +16548,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
 
                 current_email = account.email or current_email
                 if isinstance(account.extra, dict):
-                    persist_attempt_fingerprint = (
-                        req.platform == "chatgpt"
-                        and str(req.executor_type or "protocol").strip().lower()
-                        == "protocol"
-                    )
-                    if attempt_fingerprint_payload and persist_attempt_fingerprint:
+                    if attempt_fingerprint_payload:
                         from services.chatgpt_core.account_fingerprint import persist_account_browser_fingerprint
 
                         account.extra = persist_account_browser_fingerprint(
@@ -16583,7 +16557,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                             source="registration",
                             overwrite=False,
                         )
-                    if attempt_fingerprint_signature and persist_attempt_fingerprint:
+                    if attempt_fingerprint_signature:
                         account.extra.setdefault("chatgpt_browser_fingerprint_isolated", True)
                         account.extra.setdefault("chatgpt_browser_fingerprint_signature", attempt_fingerprint_signature)
                     if unique_exit_ip_enabled:
@@ -16635,16 +16609,6 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                     account.extra = account_extra
                 if req.platform == "chatgpt" and isinstance(account.extra, dict):
                     account.extra["chatgpt_capabilities"] = classify_chatgpt_capabilities(account)
-                registered_auth_pending = bool(
-                    req.platform == "chatgpt"
-                    and isinstance(account.extra, dict)
-                    and account.extra.get("registered_auth_pending")
-                    and not str(
-                        account.token
-                        or account.extra.get("access_token")
-                        or ""
-                    ).strip()
-                )
                 existing_account_route_event = {}
                 if req.platform == "chatgpt" and isinstance(account_extra, dict):
                     existing_account_route_event = _coerce_existing_account_login_route_event(
@@ -16762,56 +16726,11 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                                 _task_store.update_meta(task_id, {"registered_accounts": registered_accounts[-500:]})
                     except Exception as meta_exc:
                         _log(task_id, f"[WARN] 注册账号结果写入任务快照失败: {meta_exc}")
-                    if registered_auth_pending:
-                        try:
-                            latest_meta = dict(_task_store.snapshot(task_id).get("meta") or {})
-                            pending_accounts = latest_meta.get("auth_pending_accounts")
-                            if not isinstance(pending_accounts, list):
-                                pending_accounts = []
-                            pending_item = {
-                                "account_id": int(getattr(saved_account, "id", 0) or 0),
-                                "email": str(getattr(saved_account, "email", "") or account.email or ""),
-                                "reason": str(
-                                    account.extra.get("registration_full_auth_error")
-                                    or "浏览器注册完成但认证材料待补抓"
-                                ),
-                                "requested_executor_type": str(
-                                    account.extra.get("requested_executor_type") or req.executor_type or ""
-                                ),
-                                "effective_executor_type": str(
-                                    account.extra.get("effective_executor_type") or req.executor_type or ""
-                                ),
-                            }
-                            pending_key = (
-                                pending_item["account_id"],
-                                pending_item["email"].strip().lower(),
-                            )
-                            pending_accounts = [
-                                item
-                                for item in pending_accounts
-                                if not isinstance(item, dict)
-                                or (
-                                    int(item.get("account_id") or 0),
-                                    str(item.get("email") or "").strip().lower(),
-                                )
-                                != pending_key
-                            ]
-                            pending_accounts.append(pending_item)
-                            _task_store.update_meta(
-                                task_id,
-                                {
-                                    "auth_pending_accounts": pending_accounts[-500:],
-                                    "auth_pending_count": len(pending_accounts[-500:]),
-                                },
-                            )
-                        except Exception as meta_exc:
-                            _log(task_id, f"[WARN] 认证待补抓结果写入任务快照失败: {meta_exc}")
-                    else:
-                        schedule_chatgpt_local_status_refresh_for_account_id(
-                            int(getattr(saved_account, "id", 0) or 0),
-                            reason="registration_saved",
-                            delay_seconds=2.0,
-                        )
+                    schedule_chatgpt_local_status_refresh_for_account_id(
+                        int(getattr(saved_account, "id", 0) or 0),
+                        reason="registration_saved",
+                        delay_seconds=2.0,
+                    )
                 if req.platform == "chatgpt" and isinstance(account.extra, dict) and account.extra.get("chatgpt_registration_entry") == "phone_signup":
                     try:
                         phone_result = account.extra.get("chatgpt_phone_signup_result")
@@ -16877,11 +16796,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                                 saved_account_id=int(getattr(saved_account, "id", 0) or 0) if saved_account is not None else 0,
                                 access_token_saved=bool(token_value),
                                 mailbox_state=mailbox_state,
-                                result_code=(
-                                    "registered_auth_pending"
-                                    if registered_auth_pending
-                                    else "login_alive"
-                                ),
+                                result_code="login_alive",
                             )
                     except Exception as sync_exc:
                         _log(task_id, f"[iCloudHME] 重跑结果写回失败: {sync_exc}")
@@ -16890,16 +16805,8 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                 if should_stop_after_current_account and zero_amount_stop_reason:
                     control.request_stop()
                     _log(task_id, f"[STOP] {zero_amount_stop_reason}")
-                if registered_auth_pending:
-                    _log(
-                        task_id,
-                        f"[PENDING] 远端注册完成，认证材料待补抓: {account.email}",
-                        "warning",
-                    )
-                    _log(task_id, "[Auto Upload] 认证材料待补抓，已跳过外部同步")
-                else:
-                    _log(task_id, f"[OK] 注册成功: {account.email}")
-                    _auto_upload_integrations(task_id, saved_account or account)
+                _log(task_id, f"[OK] 注册成功: {account.email}")
+                _auto_upload_integrations(task_id, saved_account or account)
                 cashier_url = (account.extra or {}).get("cashier_url", "")
                 if cashier_url:
                     _log(task_id, f"  [升级链接] {cashier_url}")
@@ -16911,16 +16818,8 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                     detail=_build_task_log_detail(
                         task_id,
                         {
-                            "attempt_outcome": (
-                                "registered_auth_pending"
-                                if registered_auth_pending
-                                else "success"
-                            ),
+                            "attempt_outcome": "success",
                             "email": account.email,
-                            "registered_auth_pending": registered_auth_pending,
-                            "registration_full_auth_error": str(
-                                account_extra.get("registration_full_auth_error") or ""
-                            ),
                             "existing_account_login_route": existing_account_route_event,
                             "chatgpt_zero_amount_stop_enabled": chatgpt_zero_amount_stop_enabled,
                             "chatgpt_zero_amount_stop_threshold": chatgpt_zero_amount_stop_threshold,
@@ -16979,12 +16878,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                         },
                     ),
                 )
-                return AttemptResult.failed(
-                    error_text,
-                    consumes_target_slot=bool(
-                        browser_executor and browser_register_invoked
-                    ),
-                )
+                return AttemptResult.failed(error_text)
             finally:
                 control.finish_attempt(attempt_id)
 
@@ -17055,7 +16949,6 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
         max_workers = min(req.concurrency, target_successes, attempt_cap or target_successes, 5)
         stopped = False
         attempt_limit_reached = False
-        consumed_browser_failure_slots = 0
         next_attempt_index = 0
         in_flight: dict[Any, int] = {}
 
@@ -17091,12 +16984,6 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                         stopped = True
                     elif result.outcome == AttemptOutcome.FAILED:
                         errors.append(result.message)
-                        if result.consumes_target_slot:
-                            consumed_browser_failure_slots += 1
-                            _log(
-                                task_id,
-                                "[控制] 浏览器注册已进入结果不确定区间；本次失败占用一个目标身份槽，禁止补发替代身份",
-                            )
                         if _is_fatal_registration_infrastructure_error(result.message):
                             fatal_registration_error = str(result.message or "").strip()
                             _log(
@@ -17132,14 +17019,6 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                         continue
 
                     if success < target_successes:
-                        if (
-                            browser_executor
-                            and success
-                            + consumed_browser_failure_slots
-                            + len(in_flight)
-                            >= target_successes
-                        ):
-                            continue
                         if attempt_cap > 0 and next_attempt_index >= attempt_cap:
                             attempt_limit_reached = True
                             _log(

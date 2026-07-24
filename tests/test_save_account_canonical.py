@@ -37,14 +37,12 @@ class SaveAccountCanonicalTests(unittest.TestCase):
         token: str,
         extra: dict,
         email: str = "canonical@example.com",
-        user_id: str = "",
     ) -> int:
         with Session(self.engine) as session:
             row = AccountModel(
                 platform="chatgpt",
                 email=email,
                 password=password,
-                user_id=user_id,
                 token=token,
                 status="registered",
                 extra_json=json.dumps(extra),
@@ -133,61 +131,6 @@ class SaveAccountCanonicalTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0].password, "new-pw")
         self.assertEqual(rows[0].get_extra()["account_id"], "acct-current")
-
-    def test_auth_pending_update_cannot_erase_existing_valid_credentials(self):
-        row_id = self._insert_row(
-            password="valid-pw",
-            user_id="acct-valid",
-            token="at-valid",
-            extra={
-                "access_token": "at-valid",
-                "refresh_token": "rt-valid",
-                "id_token": "id-valid",
-                "account_id": "acct-valid",
-                "workspace_id": "ws-valid",
-                "auth_level": "full",
-            },
-        )
-        pending = Account(
-            platform="chatgpt",
-            email="canonical@example.com",
-            password="unconfirmed-pw",
-            user_id="",
-            token="",
-            status=AccountStatus.PENDING_PAYMENT,
-            extra={
-                "access_token": "",
-                "refresh_token": "",
-                "id_token": "",
-                "account_id": "",
-                "workspace_id": "",
-                "registered_auth_pending": True,
-                "auth_level": "registered_auth_pending",
-                "registration_full_auth_error": "browser session missing",
-                "requested_executor_type": "headless",
-                "effective_executor_type": "headless",
-                "chatgpt_registration_transport": "camoufox_browser",
-            },
-        )
-
-        saved = core_db.save_account(pending)
-
-        self.assertEqual(saved.id, row_id)
-        self.assertEqual(saved.password, "valid-pw")
-        self.assertEqual(saved.user_id, "acct-valid")
-        self.assertEqual(saved.token, "at-valid")
-        self.assertEqual(saved.status, "registered")
-        extra = saved.get_extra()
-        self.assertEqual(extra["access_token"], "at-valid")
-        self.assertEqual(extra["refresh_token"], "rt-valid")
-        self.assertEqual(extra["id_token"], "id-valid")
-        self.assertEqual(extra["account_id"], "acct-valid")
-        self.assertEqual(extra["workspace_id"], "ws-valid")
-        self.assertNotIn("registered_auth_pending", extra)
-        self.assertEqual(
-            extra["chatgpt_last_registered_auth_pending"]["registration_transport"],
-            "camoufox_browser",
-        )
 
     def test_free_or_personal_variant_is_promoted_to_canonical_row(self):
         for scope in ("free", "personal"):

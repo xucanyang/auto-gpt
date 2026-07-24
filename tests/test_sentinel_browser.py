@@ -74,16 +74,6 @@ class SentinelBrowserRuntimeTests(unittest.TestCase):
         self.assertFalse(headless)
         self.assertEqual(reason, "requested:false")
 
-    def test_strict_headless_mode_ignores_container_override(self):
-        with mock.patch.dict(os.environ, {"PLAYWRIGHT_HEADLESS": "0"}):
-            headless, reason = resolve_browser_headless(
-                True,
-                override_env_names=(),
-            )
-
-        self.assertTrue(headless)
-        self.assertEqual(reason, "requested:true")
-
     def test_sync_playwright_helper_runs_directly_without_async_loop(self):
         current_thread = threading.get_ident()
 
@@ -568,7 +558,7 @@ emit({"type": "result", "value": {"status_code": 200}})
         self.assertNotIn("initializeSdk", page.payload)
 
     def test_registration_sentinel_does_not_fall_back_to_http_pow(self):
-        client = ChatGPTClient(verbose=False, browser_mode="headless")
+        client = ChatGPTClient(verbose=False)
         client.session.cookies.set(
             "login_session",
             "session-demo",
@@ -593,55 +583,8 @@ emit({"type": "result", "value": {"status_code": 200}})
         self.assertTrue(kwargs["require_complete_signals"])
         self.assertIn("login_session=session-demo", kwargs["cookie_header"])
 
-    def test_protocol_registration_sentinel_never_starts_browser(self):
-        client = ChatGPTClient(verbose=False, browser_mode="protocol")
-        with mock.patch(
-            "services.chatgpt_core.chatgpt_client.build_sentinel_token",
-            return_value="protocol-token",
-        ) as http_token, mock.patch(
-            "services.chatgpt_core.chatgpt_client.get_sentinel_token_via_browser",
-            side_effect=AssertionError("protocol executor started browser"),
-        ) as browser_token:
-            token = client._get_sentinel_token(
-                "oauth_create_account",
-                page_url="https://auth.openai.com/about-you",
-            )
-
-        self.assertEqual(token, "protocol-token")
-        http_token.assert_called_once()
-        browser_token.assert_not_called()
-
-    def test_protocol_create_account_posts_http_and_never_starts_browser(self):
-        client = ChatGPTClient(verbose=False, browser_mode="protocol")
-        response = mock.Mock(status_code=200, url="https://auth.openai.com/api/accounts/create_account")
-        response.json.return_value = {
-            "page": {"type": "external_url"},
-            "continue_url": "https://chatgpt.com/api/auth/callback/openai?code=demo",
-        }
-        client.session.post = mock.Mock(return_value=response)
-
-        with mock.patch.object(
-            client,
-            "_get_sentinel_token",
-            return_value="protocol-token",
-        ), mock.patch(
-            "services.chatgpt_core.chatgpt_client.create_account_via_browser",
-            side_effect=AssertionError("protocol executor started browser"),
-        ) as browser_create:
-            ok, state = client.create_account(
-                "Alice",
-                "Smith",
-                "1990-01-01",
-                return_state=True,
-            )
-
-        self.assertTrue(ok)
-        self.assertEqual(state.page_type, "external_url")
-        client.session.post.assert_called_once()
-        browser_create.assert_not_called()
-
     def test_registration_stops_before_post_when_browser_token_is_missing(self):
-        client = ChatGPTClient(verbose=False, browser_mode="headed")
+        client = ChatGPTClient(verbose=False)
         client.session.post = mock.Mock()
 
         with mock.patch(
@@ -659,7 +602,7 @@ emit({"type": "result", "value": {"status_code": 200}})
         client.session.post.assert_not_called()
 
     def test_browser_create_account_preserves_cookie_scope_and_never_uses_curl_post(self):
-        client = ChatGPTClient(verbose=False, browser_mode="headed")
+        client = ChatGPTClient(verbose=False)
         client.session.post = mock.Mock()
         client.session.cookies.set(
             "login_session",
@@ -716,7 +659,7 @@ emit({"type": "result", "value": {"status_code": 200}})
         self.assertEqual(stored_domains, {".openai.com"})
 
     def test_browser_create_account_keeps_registration_disallowed_error_code(self):
-        client = ChatGPTClient(verbose=False, browser_mode="headed")
+        client = ChatGPTClient(verbose=False)
         result = BrowserAccountCreateResult(
             status_code=400,
             response_text=(

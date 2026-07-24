@@ -29,11 +29,7 @@ import { usePersistentChatGPTRegistrationMode } from '@/hooks/usePersistentChatG
 import { parseBooleanConfigValue } from '@/lib/configValueParsers'
 import { buildChatGPTRegistrationRequestAdapter } from '@/lib/chatgptRegistrationRequestAdapter'
 import { CHATGPT_REGISTRATION_MODE_REFRESH_TOKEN } from '@/lib/chatgptRegistrationMode'
-import {
-  EXECUTOR_SELECTION_HELP,
-  getExecutorOptions,
-  normalizeExecutorForPlatform,
-} from '@/lib/platformExecutorOptions'
+import { getExecutorOptions, normalizeExecutorForPlatform } from '@/lib/platformExecutorOptions'
 import { apiFetch } from '@/lib/utils'
 import { buildTaskProxyPayload, taskProxySettingsFromConfig, validateTaskProxySettings } from '@/lib/taskProxySettings'
 import { normalizeDomainList, parseStoredDomainList } from '@/lib/domainList'
@@ -685,12 +681,7 @@ export default function RegisterTaskPage() {
           <Form.Item label="平台">
             <Input value="ChatGPT" readOnly />
           </Form.Item>
-          <Form.Item
-            name="executor_type"
-            label="注册执行器"
-            rules={[{ required: true }]}
-            extra={EXECUTOR_SELECTION_HELP}
-          >
+          <Form.Item name="executor_type" label="执行器" rules={[{ required: true }]}>
             <Select options={executorOptions} />
           </Form.Item>
           <Form.Item name="captcha_solver" label="验证码" rules={[{ required: true }]}>

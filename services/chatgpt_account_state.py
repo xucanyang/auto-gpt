@@ -365,7 +365,6 @@ def classify_chatgpt_capabilities(
     auth_state = _lower_text(auth.get("state"))
     auth_reason = classify_local_probe_state(probe) if probe else ""
     remote_reason = classify_remote_sync_state(remote_sync) if remote_sync else ""
-    registered_auth_pending = bool(extra.get("registered_auth_pending")) and not access_token
 
     if auth_reason or remote_reason or auth_state in AUTH_INVALID_STATES:
         auth_level = "invalid"
@@ -373,8 +372,6 @@ def classify_chatgpt_capabilities(
         auth_level = "refresh_token"
     elif auth_state == "access_token_valid" or access_token:
         auth_level = "access_token_only"
-    elif registered_auth_pending:
-        auth_level = "registered_auth_pending"
     else:
         auth_level = "unknown"
 
@@ -396,8 +393,6 @@ def classify_chatgpt_capabilities(
     codex_probe_state = _lower_text(codex.get("state"))
     if auth_level == "invalid":
         codex_state = "invalid"
-    elif not access_token:
-        codex_state = "missing_access_token"
     elif not refresh_token:
         codex_state = "missing_refresh_token"
     elif not workspace_id:
@@ -409,8 +404,6 @@ def classify_chatgpt_capabilities(
 
     if auth_level == "invalid":
         upload_gate = "blocked_auth_invalid"
-    elif not access_token:
-        upload_gate = "blocked_missing_at"
     elif not refresh_token:
         upload_gate = "blocked_missing_rt"
     elif not account_id or not workspace_id:
@@ -446,8 +439,6 @@ def chatgpt_upload_gate_message(capabilities: dict[str, Any]) -> str:
     gate = str((capabilities or {}).get("upload_gate") or "").strip()
     if gate == "ready":
         return ""
-    if gate == "blocked_missing_at":
-        return "跳过上传：缺少 access_token，认证材料尚未就绪"
     if gate == "blocked_missing_rt":
         return "跳过上传：待支付/仅 AT 账号缺少 refresh_token"
     if gate == "blocked_missing_workspace":
@@ -483,8 +474,6 @@ def _status_from_capabilities(account: Any, capabilities: dict[str, Any]) -> str
         return SUBSCRIBED_ACCOUNT_STATUS
     if current_status == PAYMENT_FAILED_STATUS and upload_gate != "ready":
         return PAYMENT_FAILED_STATUS
-    if upload_gate == "blocked_missing_at" and auth_level in {"registered_auth_pending", "access_token_only"}:
-        return PENDING_PAYMENT_STATUS
     if upload_gate == "blocked_missing_rt" and auth_level == "access_token_only":
         return PENDING_PAYMENT_STATUS
     if has_pending_marker:

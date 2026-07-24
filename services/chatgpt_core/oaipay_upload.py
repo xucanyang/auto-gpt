@@ -661,37 +661,9 @@ def upload_to_oaipay_detailed(
     capabilities: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """上传单个账号到 OAIPay 管理后台，返回结构化结果。"""
-    upload_account = account
-    token_data = generate_token_json(upload_account)
-    if (
-        not str(token_data.get("access_token") or "").strip()
-        or not str(token_data.get("refresh_token") or "").strip()
-    ):
-        from services.chatgpt_sync import build_chatgpt_sync_account
-
-        upload_account = build_chatgpt_sync_account(account)
-        upload_account.access_token = token_data.get("access_token") or upload_account.access_token
-        upload_account.refresh_token = token_data.get("refresh_token") or upload_account.refresh_token
-        upload_account.id_token = token_data.get("id_token") or upload_account.id_token
-        token_data = generate_token_json(upload_account)
-    if not str(token_data.get("access_token") or "").strip():
-        return {
-            "ok": False,
-            "skipped": True,
-            "upload_gate": "blocked_missing_at",
-            "message": "跳过上传：缺少 access_token，认证材料尚未就绪",
-        }
-    if not str(token_data.get("refresh_token") or "").strip():
-        return {
-            "ok": False,
-            "skipped": True,
-            "upload_gate": "blocked_missing_rt",
-            "message": "跳过上传：缺少 refresh_token",
-        }
-
     if capabilities is None:
         from services.chatgpt_account_state import classify_chatgpt_capabilities
-        caps = classify_chatgpt_capabilities(upload_account)
+        caps = classify_chatgpt_capabilities(account)
     else:
         caps = capabilities
     from services.chatgpt_account_state import RETIRED_SUBSCRIPTION_TYPES, effective_subscription_plan
@@ -722,10 +694,13 @@ def upload_to_oaipay_detailed(
     group = str(category_decision.get("resolved_group") or "").strip()
     category_fields = _category_fields_from_decision(category_decision)
 
-    email = getattr(upload_account, "email", "")
-    password = getattr(upload_account, "password", "")
+    email = getattr(account, "email", "")
+    password = getattr(account, "password", "")
+    from services.chatgpt_core.cpa_upload import generate_token_json
+    token_data = generate_token_json(account)
+    token = token_data.get("access_token", "")
 
-    extra = _get_account_extra(upload_account)
+    extra = _get_account_extra(account)
     phone_delivery = {"phone": "", "api_url": "", "source_api_url": "", "api_token": ""}
     if isinstance(extra, dict):
         try:

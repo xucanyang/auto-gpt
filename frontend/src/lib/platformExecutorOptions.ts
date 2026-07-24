@@ -1,10 +1,8 @@
 export const EXECUTOR_OPTIONS = [
-  { value: 'protocol', label: '纯协议（不启动注册浏览器）' },
+  { value: 'protocol', label: '纯协议' },
   { value: 'headless', label: '无头浏览器' },
   { value: 'headed', label: '有头浏览器' },
 ] as const
-
-export const EXECUTOR_SELECTION_HELP = '三种注册执行器互斥：每个任务仅运行所选模式，执行中不会在纯协议、无头和有头浏览器之间自动切换。'
 
 const CHATGPT_EXECUTORS = ['protocol', 'headless', 'headed']
 

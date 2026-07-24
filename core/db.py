@@ -194,66 +194,6 @@ def _preserve_chatgpt_web_session_material(incoming_extra: dict, existing_extra:
     return incoming_extra
 
 
-def _is_chatgpt_registered_auth_pending(account: Any, extra: dict) -> bool:
-    if not isinstance(extra, dict) or not extra.get("registered_auth_pending"):
-        return False
-    access_token = str(
-        extra.get("access_token")
-        or extra.get("accessToken")
-        or getattr(account, "token", "")
-        or ""
-    ).strip()
-    return not access_token
-
-
-def _has_chatgpt_auth_material(extra: dict, token: Any = "") -> bool:
-    if not isinstance(extra, dict):
-        extra = {}
-    return bool(
-        str(
-            extra.get("access_token")
-            or extra.get("accessToken")
-            or extra.get("refresh_token")
-            or extra.get("refreshToken")
-            or token
-            or ""
-        ).strip()
-    )
-
-
-def _record_chatgpt_pending_attempt(existing_extra: dict, incoming_extra: dict) -> dict:
-    """Retain a pending registration audit without replacing valid credentials."""
-    merged = dict(existing_extra or {})
-    event = {
-        "seen_at": _utcnow().isoformat(),
-        "source": str(incoming_extra.get("chatgpt_token_source") or "registered_auth_pending"),
-        "error": str(
-            incoming_extra.get("registration_full_auth_error")
-            or incoming_extra.get("registration_access_token_partial_reason")
-            or ""
-        ),
-        "requested_executor_type": str(incoming_extra.get("requested_executor_type") or ""),
-        "effective_executor_type": str(incoming_extra.get("effective_executor_type") or ""),
-        "registration_transport": str(incoming_extra.get("chatgpt_registration_transport") or ""),
-    }
-    for key in (
-        "chatgpt_registration_context",
-        "chatgpt_browser_runtime_profile",
-        "chatgpt_mailbox_state",
-    ):
-        value = incoming_extra.get(key)
-        if value not in (None, "", {}, []):
-            event[key] = value
-    event = {key: value for key, value in event.items() if value not in (None, "")}
-    history = merged.get("chatgpt_registered_auth_pending_history")
-    if not isinstance(history, list):
-        history = []
-    history.append(event)
-    merged["chatgpt_registered_auth_pending_history"] = history[-20:]
-    merged["chatgpt_last_registered_auth_pending"] = event
-    return merged
-
-
 def _preserve_chatgpt_account_browser_fingerprint(incoming_extra: dict, existing_extra: dict | None = None) -> dict:
     """保存 ChatGPT 账号时，保持账号级浏览器指纹稳定。"""
     if not isinstance(incoming_extra, dict):
@@ -552,27 +492,18 @@ def save_account(account) -> 'AccountModel':
             break
 
         if existing:
-            preserve_existing_auth = False
             if str(account.platform or "").strip().lower() == "chatgpt":
                 try:
                     existing_extra = json.loads(existing.extra_json or "{}")
                 except Exception:
                     existing_extra = {}
-                preserve_existing_auth = (
-                    _is_chatgpt_registered_auth_pending(account, extra)
-                    and _has_chatgpt_auth_material(existing_extra, existing.token)
-                )
-                if preserve_existing_auth:
-                    extra = _record_chatgpt_pending_attempt(existing_extra, extra)
-                else:
-                    extra = _preserve_chatgpt_web_session_material(extra, existing_extra)
-                    extra = _preserve_chatgpt_account_browser_fingerprint(extra, existing_extra)
-            if not preserve_existing_auth:
-                existing.password = account.password
-                existing.user_id = account.user_id or ""
-                existing.region = account.region or ""
-                existing.token = account.token or ""
-                existing.status = account.status.value
+                extra = _preserve_chatgpt_web_session_material(extra, existing_extra)
+                extra = _preserve_chatgpt_account_browser_fingerprint(extra, existing_extra)
+            existing.password = account.password
+            existing.user_id = account.user_id or ""
+            existing.region = account.region or ""
+            existing.token = account.token or ""
+            existing.status = account.status.value
             existing.extra_json = json.dumps(extra, ensure_ascii=False)
             existing.cashier_url = extra.get("cashier_url", "")
             existing.updated_at = _utcnow()
@@ -2656,10 +2587,6 @@ def sync_icloud_hme_rerun_result(
     now = _utcnow()
     now_text = now.isoformat()
     error_text = str(error_message or "").strip()
-    normalized_result_code = str(result_code or "").strip()
-    registered_auth_pending = bool(
-        success and normalized_result_code == "registered_auth_pending"
-    )
     try:
         from services.chatgpt_account_state import is_account_deactivated_message
 
@@ -2692,18 +2619,12 @@ def sync_icloud_hme_rerun_result(
             return {"updated": 0, "reason": "queue_item_not_found", "campaign_id": latest_campaign_id}
 
         if success:
-            row.status = "registered_auth_pending" if registered_auth_pending else "alive"
+            row.status = "alive"
             row.result_code = str(result_code or "login_alive")[:200]
-            row.result_message = (
-                "远端注册已完成，认证材料待补抓"
-                if registered_auth_pending
-                else "账号可登录，已由注册流程重新保存"
-            )
+            row.result_message = "账号可登录，已由注册流程重新保存"
             if int(saved_account_id or 0) > 0:
                 row.saved_account_id = int(saved_account_id or 0)
-            if registered_auth_pending:
-                row.access_token_saved = bool(access_token_saved)
-            elif access_token_saved or int(saved_account_id or 0) > 0:
+            if access_token_saved or int(saved_account_id or 0) > 0:
                 row.access_token_saved = True
             row.delete_candidate = False
             row.delete_candidate_reason = ""
@@ -2724,7 +2645,6 @@ def sync_icloud_hme_rerun_result(
             "rerun_register_flow": True,
             "last_rerun_task_id": str(task_id or ""),
             "last_rerun_success": bool(success),
-            "last_rerun_auth_pending": registered_auth_pending,
             "last_rerun_error": error_text,
             "last_rerun_at": now_text,
         })

@@ -3,7 +3,7 @@ from unittest import mock
 
 from core.db import AccountModel
 from services.sub2api_sync import backfill_chatgpt_account_to_sub2api, probe_chatgpt_sub2api_status
-from services.chatgpt_core.sub2api_upload import build_sub2api_account_payload, upload_to_sub2api_detailed
+from services.chatgpt_core.sub2api_upload import build_sub2api_account_payload
 
 
 class Sub2ApiSyncTests(unittest.TestCase):
@@ -219,58 +219,6 @@ class Sub2ApiSyncTests(unittest.TestCase):
         self.assertTrue(state["uploaded"])
         self.assertEqual(state["remote_account_id"], 654)
         self.assertEqual(state["last_upload"]["status"], "failed")
-
-    def test_backfill_blocks_registered_auth_pending_before_low_level_upload(self):
-        account = AccountModel(
-            platform="chatgpt",
-            email="pending@example.com",
-            password="secret",
-            token="",
-            status="pending_payment",
-        )
-        account.set_extra({"registered_auth_pending": True})
-
-        with mock.patch(
-            "services.sub2api_sync.upload_to_sub2api_detailed",
-            side_effect=AssertionError("upload must not run without access_token"),
-        ) as upload_mock:
-            result = backfill_chatgpt_account_to_sub2api(account, commit=False)
-
-        self.assertFalse(result["ok"])
-        self.assertTrue(result["skipped"])
-        self.assertEqual(result["capabilities"]["upload_gate"], "blocked_missing_at")
-        upload_mock.assert_not_called()
-        state = account.get_extra()["sync_statuses"]["sub2api"]
-        self.assertEqual(state["upload_gate"], "blocked_missing_at")
-        self.assertEqual(state["last_upload"]["status"], "skipped")
-
-    def test_direct_upload_rejects_missing_at_or_rt_without_network(self):
-        cases = (
-            ({"registered_auth_pending": True}, "blocked_missing_at"),
-            ({"access_token": "at-only"}, "blocked_missing_rt"),
-        )
-        for extra, expected_gate in cases:
-            with self.subTest(expected_gate=expected_gate):
-                account = AccountModel(
-                    platform="chatgpt",
-                    email="incomplete@example.com",
-                    password="secret",
-                    token="",
-                    status="pending_payment",
-                )
-                account.set_extra(extra)
-                with mock.patch("services.chatgpt_core.sub2api_upload.cffi_requests.post") as post:
-                    result = upload_to_sub2api_detailed(
-                        account,
-                        api_url="https://sub2api.example",
-                        api_key="upload-key",
-                        group_ids=[2],
-                    )
-
-                self.assertFalse(result["ok"])
-                self.assertTrue(result["skipped"])
-                self.assertEqual(result["upload_gate"], expected_gate)
-                post.assert_not_called()
 
     def test_payload_uses_saved_subscription_without_local_probe(self):
         account = self._make_account()

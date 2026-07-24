@@ -605,10 +605,6 @@ class BrowserRegistrationStageResult:
     cookie_names: tuple[str, ...] = ()
     device_id: str = ""
     user_agent: str = ""
-    web_session: dict[str, Any] = field(default_factory=dict)
-    requested_executor: str = ""
-    effective_executor: str = ""
-    headless_reason: str = ""
     error: str = ""
 
     @property

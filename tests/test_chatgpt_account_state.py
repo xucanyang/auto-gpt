@@ -102,27 +102,6 @@ class ChatGPTAccountStateTests(unittest.TestCase):
         self.assertIn("refresh_token", message)
         self.assertEqual(account.status, "pending_payment")
 
-    def test_registered_auth_pending_has_distinct_auth_level_and_missing_at_gate(self):
-        account = DummyAccount(
-            status="registered",
-            extra={
-                "registered_auth_pending": True,
-                "access_token": "",
-                "refresh_token": "",
-            },
-        )
-
-        ready, message, capabilities = is_chatgpt_upload_ready(account)
-        apply_chatgpt_status_policy(account)
-
-        self.assertFalse(ready)
-        self.assertEqual(capabilities["auth_level"], "registered_auth_pending")
-        self.assertEqual(capabilities["codex_state"], "missing_access_token")
-        self.assertEqual(capabilities["upload_gate"], "blocked_missing_at")
-        self.assertFalse(capabilities["has_access_token"])
-        self.assertIn("access_token", message)
-        self.assertEqual(account.status, "pending_payment")
-
     def test_refresh_token_with_current_account_identity_is_upload_ready(self):
         account = DummyAccount(
             status="pending_payment",

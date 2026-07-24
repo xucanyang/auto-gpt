@@ -123,10 +123,6 @@ class CamoufoxRuntimeTests(unittest.TestCase):
                 },
             ), mock.patch.object(
                 browser_registration, "_is_registration_complete", return_value=True
-            ), mock.patch.object(
-                browser_registration,
-                "_wait_for_web_session",
-                return_value={},
             ):
                 result = browser_registration.run_browser_registration_stage_sync(
                     email="user@example.com",

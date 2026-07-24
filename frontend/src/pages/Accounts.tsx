@@ -2490,8 +2490,8 @@ function shouldShowResumeAuthButton(record: any) {
   const pendingStatus = String(record?.chatgptPendingSubscriptionAuth?.status || '').trim().toLowerCase()
   if (status === 'pending_payment') return true
   if (pendingStatus && pendingStatus !== 'completed' && pendingStatus !== 'abandoned') return true
-  if (authLevel === 'registered_auth_pending' || authLevel === 'access_token_only' || authLevel === 'invalid') return true
-  if (uploadGate === 'blocked_missing_at' || uploadGate === 'blocked_missing_rt' || uploadGate === 'blocked_missing_workspace') return true
+  if (authLevel === 'access_token_only' || authLevel === 'invalid') return true
+  if (uploadGate === 'blocked_missing_rt' || uploadGate === 'blocked_missing_workspace') return true
   return false
 }
 
@@ -3689,20 +3689,11 @@ export default function Accounts() {
         const tempmailPrimaryDomain = hasSavedMailProfile && Object.prototype.hasOwnProperty.call(savedSettings, 'tempmail_primary_domain')
           ? String(savedSettings.tempmail_primary_domain || '').trim().replace(/^[@.]+/, '')
           : (tempmailFixedDomains[0] || '')
-        const executorFieldHydration = registerForm.isFieldTouched('executor_type')
-          ? {}
-          : {
-              executor_type: normalizeExecutorForPlatform(
-                currentPlatform,
-                String(savedSettings.executor_type || cfg.default_executor || '').trim(),
-              ),
-            }
         setRegisterMailProvider(provider)
         registerForm.setFieldsValue({
           count: Number(savedSettings.count || 1) || 1,
           concurrency: Number(savedSettings.concurrency || 1) || 1,
           register_delay_seconds: Number(savedSettings.register_delay_seconds || 0) || 0,
-          ...executorFieldHydration,
           ...proxySettings,
           mail_provider_override: savedProviderOverride,
           email_api_lines: String(cfg.email_api_lines || '').trim(),
@@ -3757,19 +3748,10 @@ export default function Accounts() {
           ? normalizeDomainList(savedSettings.tempmail_fixed_domains)
           : []
         const savedEmail = window.localStorage.getItem('auto-chatgpt.manual_email_otp.email') || ''
-        const executorFieldHydration = registerForm.isFieldTouched('executor_type')
-          ? {}
-          : {
-              executor_type: normalizeExecutorForPlatform(
-                currentPlatform,
-                String(savedSettings.executor_type || 'protocol').trim(),
-              ),
-            }
         registerForm.setFieldsValue({
           count: Number(savedSettings.count || 1) || 1,
           concurrency: Number(savedSettings.concurrency || 1) || 1,
           register_delay_seconds: Number(savedSettings.register_delay_seconds || 0) || 0,
-          ...executorFieldHydration,
           ...taskProxySettingsFromConfig({}),
           mail_provider_override: savedProviderOverride,
           email_api_lines: '',
@@ -5421,7 +5403,6 @@ export default function Accounts() {
       count: Number(values.count || 1) || 1,
       concurrency: Number(values.concurrency || 1) || 1,
       register_delay_seconds: Number(values.register_delay_seconds || 0) || 0,
-      executor_type: normalizeExecutorForPlatform(currentPlatform, values.executor_type),
       proxy_mode: String(values.proxy_mode || 'dynamic'),
       proxy: String(values.proxy || '').trim(),
       proxy_country_code: String(values.proxy_country_code || '').trim().toUpperCase(),
@@ -5456,7 +5437,6 @@ export default function Accounts() {
         count: settingsPayload.count,
         concurrency: settingsPayload.concurrency,
         register_delay_seconds: settingsPayload.register_delay_seconds,
-        executor_type: settingsPayload.executor_type,
         mail_provider_override: settingsPayload.mail_provider_override,
         tempmail_mode: settingsPayload.tempmail_mode,
         tempmail_primary_domain: settingsPayload.tempmail_primary_domain,
@@ -5504,7 +5484,7 @@ export default function Accounts() {
           ? selectedProviderOverride
           : (String(cfg.mail_provider || 'luckmail').trim() || 'luckmail')
       setRegisterMailProvider(resolvedMailProvider)
-      const executorType = normalizeExecutorForPlatform(currentPlatform, values.executor_type)
+      const executorType = normalizeExecutorForPlatform(currentPlatform, cfg.default_executor)
       const existingAccountCapture =
         currentPlatform === 'chatgpt'
         && chatgptRegistrationMode === CHATGPT_REGISTRATION_MODE_REFRESH_TOKEN
@@ -5646,7 +5626,6 @@ export default function Accounts() {
         count: Number(values.count || 1) || 1,
         concurrency: Number(values.concurrency || 1) || 1,
         register_delay_seconds: Number(values.register_delay_seconds || 0) || 0,
-        executor_type: executorType,
         email: String(values.email || '').trim(),
       })
       const proxyPayload = buildTaskProxyPayload(values)
