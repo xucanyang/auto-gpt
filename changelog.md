@@ -12,6 +12,7 @@
 - **修复协议注册转浏览器后备时重复消费邮箱验证码**：`services/chatgpt_core/access_token_only_registration_engine.py` 现在把协议阶段已经确认的 `about_you` 状态和域级 Cookie 传给 Camoufox，优先在同一认证状态继续提交姓名/生日，不再无条件重新提交邮箱并读取另一阶段的旧 OTP。
 - **修复浏览器 OTP 提交被误报为未跳转**：`services/chatgpt_core/browser_registration.py` 增加真实发码时间与跨阶段已用验证码排除，读取页面 API 响应和 React 页面状态，在 URL 不变时仍能推进到 `about_you`、回调或明确返回完整错误；浏览器 worker callback 同步传递 OTP 请求上下文。
 - **补齐 about_you 页面提交兜底**：当 Camoufox 页面按钮点击没有触发可观察的导航或响应时，使用同一浏览器上下文直接调用 `create_account`，沿用页面填写的姓名/生日、Cookie、设备标识和 Sentinel，避免将 SPA 事件丢失误判为注册失败。
+- **保持协议与浏览器资料一致**：后备链路沿用协议阶段生成的完整姓名和生日；独立浏览器入口也不再发送只有一个词的姓名，避免 Auth API 以资料不完整返回 400。
 
 ### 测试 (Tests)
 - 新增浏览器后备状态恢复、OTP callback 时间/排除参数、API 成功但 URL 不变及错误响应回归；前端侧栏版本同步更新为 `v2.8.18`。
@@ -2457,4 +2458,8 @@
 
 ## 2026-07-24 13:35:57 +0800
 - 补齐 about_you SPA 点击失败时的浏览器上下文 create_account API 兜底
+- 发布模式: multi
+
+## 2026-07-24 13:41:05 +0800
+- 保持协议与浏览器后备的完整姓名生日一致
 - 发布模式: multi

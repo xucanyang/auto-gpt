@@ -617,6 +617,8 @@ class AccessTokenOnlyRegistrationEngine:
         skymail_adapter: EmailServiceAdapter,
         otp_wait_timeout: int,
         otp_account_budget_timeout: int,
+        profile_name: str = "",
+        profile_birthdate: str = "",
     ) -> tuple[bool, str]:
         self._log(
             "协议注册未完成，切换 Camoufox 后备链路：优先恢复已有 about_you，必要时再走邮箱 -> OTP",
@@ -641,6 +643,11 @@ class AccessTokenOnlyRegistrationEngine:
                     if isinstance(getattr(registration_state, "raw", {}), dict)
                     else {}
                 ),
+            }
+        if str(profile_name or "").strip() and str(profile_birthdate or "").strip():
+            initial_state["profile"] = {
+                "name": str(profile_name).strip(),
+                "birthdate": str(profile_birthdate).strip(),
             }
         if initial_state.get("page_type"):
             self._log(
@@ -1107,6 +1114,8 @@ class AccessTokenOnlyRegistrationEngine:
                                     otp_account_budget_timeout=(
                                         register_otp_account_budget_seconds
                                     ),
+                                    profile_name=f"{first_name} {last_name}".strip(),
+                                    profile_birthdate=birthdate,
                                 )
                             )
                             if fallback_ok:

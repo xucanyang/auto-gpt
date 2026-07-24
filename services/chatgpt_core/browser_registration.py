@@ -3405,12 +3405,18 @@ def _submit_about_you_via_page(
     *,
     device_id: str = "",
     user_agent: str = "",
+    profile_name: str = "",
+    profile_birthdate: str = "",
 ) -> dict:
     from .constants import generate_random_user_info
+    from .utils import generate_random_name
 
     user_info = generate_random_user_info()
-    name = str(user_info.get("name") or "").strip()
-    birthdate = str(user_info.get("birthdate") or "").strip()
+    name = str(profile_name or user_info.get("name") or "").strip()
+    birthdate = str(profile_birthdate or user_info.get("birthdate") or "").strip()
+    if len(name.split()) < 2:
+        _first, generated_last = generate_random_name()
+        name = f"{name} {generated_last}".strip()
     if not name or not birthdate:
         raise RuntimeError("about_you 数据生成失败")
     date_parts = birthdate.split("-")
@@ -4207,6 +4213,11 @@ def _browser_registration_flow(
     _seed_browser_device_id(page, device_id)
     requested_state = dict(initial_state or {})
     requested_page_type = str(requested_state.get("page_type") or "").strip()
+    profile_data = requested_state.get("profile")
+    if not isinstance(profile_data, dict):
+        profile_data = {}
+    profile_name = str(profile_data.get("name") or "").strip()
+    profile_birthdate = str(profile_data.get("birthdate") or "").strip()
     if requested_page_type:
         target_url = _normalize_url(
             str(
@@ -4391,6 +4402,8 @@ def _browser_registration_flow(
                 log,
                 device_id=device_id,
                 user_agent=user_agent,
+                profile_name=profile_name,
+                profile_birthdate=profile_birthdate,
             )
             log(f"about_you 提交状态: {about_resp.get('status', 0)}")
             if not about_resp.get("ok"):
