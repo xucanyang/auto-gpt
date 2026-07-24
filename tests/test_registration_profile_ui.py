@@ -60,3 +60,11 @@ def test_start_registration_does_not_write_task_values_back_to_global_config():
     assert "register_mail_profile_saved: true" in save_block
     assert "saveTaskProxySettingsToConfig" not in standalone_page
     assert "method: 'PUT'" not in standalone_page
+
+
+def test_start_registration_draft_save_preserves_explicit_mail_profile():
+    page = ACCOUNTS_PAGE.read_text(encoding="utf-8")
+    assert "function mergeRegisterFormSettings(platform: string, values: Record<string, unknown>)" in page
+    start_block = page[page.index("const handleRegister = async () => {"):]
+    assert "mergeRegisterFormSettings(currentPlatform, {" in start_block
+    assert "saveRegisterFormSettings(currentPlatform, {" not in start_block

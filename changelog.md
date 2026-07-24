@@ -7,6 +7,7 @@
 ## [Unreleased] (未发布)
 
 ### 修复 (Fixed)
+- **修复注册任务启动覆盖已保存邮箱画像**：`frontend/src/pages/Accounts.tsx` 的启动路径现在合并保存数量、并发和邮箱草稿，不再用缺少 `mail_provider_override`、TempMail 模式及域名的精简对象覆盖显式保存的浏览器画像；再次打开注册面板时，已选择的 HME Ready/TempMail 域名画像保持不变。
 - **补齐其他面板的设置保存闭环**：`frontend/src/pages/Proxies.tsx` 现在会把动态代理“实测出口”开关连同模板、出口国家和 IP 保留时长一起写入全局配置；账号页手机号绑定的号段模式、只测收发码和同号复用联动值在通过 `setFieldsValue` 变更时也会立即写入浏览器画像，避免关闭弹窗后恢复旧值。`frontend/src/pages/Accounts.tsx` 同时兼容旧 localStorage 中的字符串布尔值，避免 `"false"` 被错误解释为开启。
 - **修复注册面板邮箱画像保存失效**：`frontend/src/pages/Accounts.tsx` 现在会在用户显式点击“保存设置”时持久化本任务邮箱服务选择、TempMail 建箱模式和固定域名列表，并写入显式保存标记；注册弹窗重新打开时仅在存在这份新画像时恢复对应值，否则继续以 `/api/config` 的共享默认配置为准，旧版本残留的 localStorage 字段不会越权覆盖服务端设置。这样选择 `HME Ready API` 后不会再次被共享的 TempMail 域名画像覆盖，同时“开始注册”仍只携带任务级 `extra`，不会偷偷改写三实例共享配置。
 - **明确邮箱选择的作用域**：`frontend/src/features/auth/components/RegisterTaskModal.tsx` 将邮箱字段标为“本任务默认”，并提示保存后的浏览器画像与设置页全局默认相互独立，避免把一次任务覆盖误认为全局配置保存。
@@ -2545,4 +2546,8 @@
 
 ## 2026-07-24 21:18:25 +0800
 - 修复代理与账号其他面板设置保存覆盖问题
+- 发布模式: multi
+
+## 2026-07-24 21:30:20 +0800
+- 修复注册启动覆盖已保存邮箱画像
 - 发布模式: multi

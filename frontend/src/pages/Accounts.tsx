@@ -1233,6 +1233,13 @@ function saveRegisterFormSettings(platform: string, values: Record<string, unkno
   window.localStorage.setItem(getRegisterFormSettingsStorageKey(platform), JSON.stringify(values))
 }
 
+function mergeRegisterFormSettings(platform: string, values: Record<string, unknown>) {
+  saveRegisterFormSettings(platform, {
+    ...loadRegisterFormSettings(platform),
+    ...values,
+  })
+}
+
 function normalizeRegisterMailProviderOverride(value: unknown) {
   const normalized = String(value || '').trim().toLowerCase()
   if (normalized === 'tempmail_api') return 'tempmail_local'
@@ -5597,7 +5604,7 @@ export default function Accounts() {
       }
 
       validateTaskProxySettings(values)
-      saveRegisterFormSettings(currentPlatform, {
+      mergeRegisterFormSettings(currentPlatform, {
         count: Number(values.count || 1) || 1,
         concurrency: Number(values.concurrency || 1) || 1,
         register_delay_seconds: Number(values.register_delay_seconds || 0) || 0,
