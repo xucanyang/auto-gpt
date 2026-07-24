@@ -6,6 +6,15 @@
 
 ## [Unreleased] (未发布)
 
+## [2.8.18] - 2026-07-24
+
+### 修复 (Fixed)
+- **修复协议注册转浏览器后备时重复消费邮箱验证码**：`services/chatgpt_core/access_token_only_registration_engine.py` 现在把协议阶段已经确认的 `about_you` 状态和域级 Cookie 传给 Camoufox，优先在同一认证状态继续提交姓名/生日，不再无条件重新提交邮箱并读取另一阶段的旧 OTP。
+- **修复浏览器 OTP 提交被误报为未跳转**：`services/chatgpt_core/browser_registration.py` 增加真实发码时间与跨阶段已用验证码排除，读取页面 API 响应和 React 页面状态，在 URL 不变时仍能推进到 `about_you`、回调或明确返回完整错误；浏览器 worker callback 同步传递 OTP 请求上下文。
+
+### 测试 (Tests)
+- 新增浏览器后备状态恢复、OTP callback 时间/排除参数、API 成功但 URL 不变及错误响应回归；前端侧栏版本同步更新为 `v2.8.18`。
+
 ## [2.8.17] - 2026-07-24
 
 ### 修复 (Fixed)
@@ -2439,4 +2448,8 @@
 
 ## 2026-07-24 12:43:11 +0800
 - 修复 Camoufox 自定义安装路径识别并验证浏览器注册后备链路
+- 发布模式: multi
+
+## 2026-07-24 13:29:33 +0800
+- 修复 ChatGPT 注册后备状态恢复、OTP 跨阶段去重与 SPA/API 提交判定
 - 发布模式: multi

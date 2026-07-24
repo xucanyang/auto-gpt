@@ -1229,6 +1229,8 @@ def run_browser_registration_stage(
     proxy: Optional[str] = None,
     device_id: str = "",
     headless: bool = True,
+    cookies: Optional[list[dict[str, Any]]] = None,
+    initial_state: Optional[dict[str, Any]] = None,
     stop_check: Optional[Callable[[], None]] = None,
     hard_timeout_seconds: Optional[float] = None,
     log_fn: Optional[Callable[[str], None]] = None,
@@ -1245,9 +1247,14 @@ def run_browser_registration_stage(
         )
     )
 
-    def _request_otp(_payload: dict[str, Any]) -> str:
-        value = otp_callback()
-        return str(value or "").strip()
+    def _request_otp(callback_payload: dict[str, Any]) -> Any:
+        # New callbacks receive the browser's send timestamp and exclusion
+        # context; retain zero-argument compatibility for older integrations.
+        try:
+            value = otp_callback(dict(callback_payload or {}))
+        except TypeError:
+            value = otp_callback()
+        return value
 
     outcome = _run_with_browser_slot(
         "browser_registration",
@@ -1257,6 +1264,8 @@ def run_browser_registration_stage(
             "proxy": str(proxy or "") or None,
             "device_id": str(device_id or ""),
             "headless": bool(headless),
+            "cookies": list(cookies or []),
+            "initial_state": dict(initial_state or {}),
         },
         hard_timeout_seconds=effective_hard_timeout,
         logger=logger,

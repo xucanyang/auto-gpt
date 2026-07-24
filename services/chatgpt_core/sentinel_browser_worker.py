@@ -100,7 +100,9 @@ def main() -> int:
             try:
                 value = run_browser_registration_stage_sync(
                     **payload,
-                    otp_callback=lambda: request_callback("otp", {}),
+                    otp_callback=lambda callback_payload=None: request_callback(
+                        "otp", dict(callback_payload or {})
+                    ),
                     log_fn=logger,
                 )
             except Exception as exc:

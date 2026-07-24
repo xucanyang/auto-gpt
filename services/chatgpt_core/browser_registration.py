@@ -14,7 +14,7 @@ import time
 import uuid
 from contextlib import ExitStack
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 from urllib.parse import urljoin, urlparse
 
 from camoufox.sync_api import Camoufox
@@ -1031,16 +1031,13 @@ def _pick_best_about_you_input(entries: list[dict], field: str, exclude_visible_
 def _derive_registration_state_from_page(page) -> dict:
     current_url = str(page.url or "")
     state = _extract_flow_state(None, current_url)
-    if state.get("page_type"):
-        return state
+    # A successful SPA transition can keep /email-verification in the address
+    # bar while replacing the form. Inspect the live DOM before trusting that
+    # URL-derived OTP state.
 
     if _find_first_selector(page, PASSWORD_INPUT_SELECTORS):
         page_type = "login_password" if _is_login_password_url(current_url) else "create_account_password"
         return _build_manual_flow_state(page_type, current_url)
-
-    otp_selector = _find_first_selector(page, OTP_INPUT_SELECTORS)
-    if otp_selector and "password" not in otp_selector:
-        return _build_manual_flow_state("email_otp_verification", current_url)
 
     try:
         about_visible = bool(
@@ -1066,6 +1063,13 @@ def _derive_registration_state_from_page(page) -> dict:
         about_visible = False
     if about_visible:
         return _build_manual_flow_state("about_you", current_url)
+
+    otp_selector = _find_first_selector(page, OTP_INPUT_SELECTORS)
+    if otp_selector and "password" not in otp_selector:
+        return _build_manual_flow_state("email_otp_verification", current_url)
+
+    if state.get("page_type"):
+        return state
 
     return state
 
@@ -1189,6 +1193,47 @@ def _dump_debug(page, prefix: str) -> None:
 
 def _get_cookies(page) -> dict:
     return {c["name"]: c["value"] for c in page.context.cookies()}
+
+
+def _import_browser_context_cookies(page, cookies: list[dict] | None, log) -> int:
+    """Import protocol-session cookies without letting one malformed cookie abort the context."""
+    imported = 0
+    for item in cookies or []:
+        if not isinstance(item, dict):
+            continue
+        normalized = {
+            key: value
+            for key, value in item.items()
+            if key in {
+                "name",
+                "value",
+                "url",
+                "domain",
+                "path",
+                "expires",
+                "httpOnly",
+                "secure",
+                "sameSite",
+                "partitionKey",
+            }
+        }
+        if not normalized.get("name") or normalized.get("value") is None:
+            continue
+        if normalized.get("url"):
+            normalized.pop("domain", None)
+            normalized.pop("path", None)
+        elif not normalized.get("domain"):
+            continue
+        try:
+            page.context.add_cookies([normalized])
+            imported += 1
+        except Exception as exc:
+            log(
+                "协议 Cookie 导入跳过: "
+                f"name={normalized.get('name')} domain={normalized.get('domain') or normalized.get('url')} "
+                f"error={exc}"
+            )
+    return imported
 
 
 def _random_chrome_ua() -> str:
@@ -1530,20 +1575,43 @@ def _submit_browser_user_register(page, email: str, password: str, device_id: st
     )
 
 
-def _send_browser_email_otp(page) -> dict:
+def _send_browser_email_otp(
+    page,
+    *,
+    device_id: str = "",
+    user_agent: str = "",
+    referer: str = "",
+) -> dict:
     _browser_pause(page)
+    effective_user_agent = user_agent or _random_chrome_ua()
+    headers = _build_browser_headers(
+        user_agent=effective_user_agent,
+        accept="application/json, text/plain, */*",
+        referer=referer or f"{OPENAI_AUTH}/create-account/password",
+        origin=OPENAI_AUTH,
+        extra_headers={
+            "sec-fetch-site": "same-origin",
+            "oai-device-id": device_id,
+            **_generate_datadog_trace_headers(),
+        },
+    )
+    if device_id:
+        try:
+            sentinel = _build_browser_sentinel_token(
+                page,
+                device_id,
+                "email_otp_send",
+                effective_user_agent,
+            )
+        except Exception:
+            sentinel = ""
+        if sentinel:
+            headers["openai-sentinel-token"] = sentinel
     return _browser_fetch(
         page,
         f"{OPENAI_AUTH}/api/accounts/email-otp/send",
         method="GET",
-        headers={
-            "accept": "application/json, text/plain, */*",
-            "referer": f"{OPENAI_AUTH}/create-account/password",
-            "sec-fetch-site": "same-origin",
-            "sec-fetch-mode": "cors",
-            "sec-fetch-dest": "empty",
-            "accept-language": "en-US,en;q=0.9",
-        },
+        headers=headers,
         redirect="follow",
     )
 
@@ -2409,7 +2477,12 @@ def _do_add_phone_attempt(
             raise RuntimeError("未找到短信验证码输入框")
 
         # 使用与邮箱 OTP 相同的填写逻辑
-        otp_resp = _submit_otp_via_page(page, sms_code, log)
+        otp_resp = _submit_otp_via_page(
+            page,
+            sms_code,
+            log,
+            allow_api_fallback=False,
+        )
         otp_status = int(otp_resp.get("status") or 0)
         log(f"  phone-otp 页面提交状态: {otp_status}")
 
@@ -2543,7 +2616,13 @@ def _browser_authorize(page, auth_url: str, log) -> str:
         return ""
 
 
-def _validate_browser_email_otp(page, code: str, device_id: str, user_agent: str, referer: str) -> dict:
+def _validate_browser_email_otp(
+    page,
+    code: str,
+    device_id: str = "",
+    user_agent: str = "",
+    referer: str = "",
+) -> dict:
     headers = _build_browser_headers(
         user_agent=user_agent,
         accept="application/json",
@@ -2556,7 +2635,10 @@ def _validate_browser_email_otp(page, code: str, device_id: str, user_agent: str
             **_generate_datadog_trace_headers(),
         },
     )
-    sentinel = _build_browser_sentinel_token(page, device_id, "email_otp_validate", user_agent)
+    try:
+        sentinel = _build_browser_sentinel_token(page, device_id, "email_otp_validate", user_agent)
+    except Exception:
+        sentinel = ""
     if sentinel:
         headers["openai-sentinel-token"] = sentinel
     _browser_pause(page)
@@ -3008,7 +3090,16 @@ def _submit_password_via_page(page, password: str, log) -> dict:
     return {"ok": False, "status": 0, "url": last_url, "data": None, "text": "密码页提交后未跳转"}
 
 
-def _submit_otp_via_page(page, code: str, log) -> dict:
+def _submit_otp_via_page(
+    page,
+    code: str,
+    log,
+    *,
+    device_id: str = "",
+    user_agent: str = "",
+    referer: str = "",
+    allow_api_fallback: bool = True,
+) -> dict:
     otp = str(code or "").strip()
     if not otp:
         return {"ok": False, "status": 400, "url": page.url, "data": None, "text": "验证码为空"}
@@ -3098,43 +3189,198 @@ def _submit_otp_via_page(page, code: str, log) -> dict:
         return {"ok": False, "status": 0, "url": page.url, "data": None, "text": "验证码页未找到可填写输入框"}
 
     _browser_pause(page)
-    submit_selector = _click_first(
-        page,
-        [
-            'button[type="submit"]',
-            'button[data-testid="continue-button"]',
-            'button:has-text("Continue")',
-            'button:has-text("continue")',
-            'button:has-text("Verify")',
-            'button:has-text("verify")',
-            'button:has-text("Next")',
-            'button:has-text("next")',
-        ],
-        timeout=8,
-    )
-    if not submit_selector:
-        return {"ok": False, "status": 0, "url": page.url, "data": None, "text": "验证码页未找到 Continue 按钮"}
-    log(f"验证码页已点击继续按钮: {submit_selector}")
+    captured_responses: list[Any] = []
+    response_listener = None
+    try:
+        if hasattr(page, "on"):
+            def _capture_response(response):
+                try:
+                    if "/api/accounts/email-otp/validate" in str(response.url or ""):
+                        captured_responses.append(response)
+                except Exception:
+                    return
 
-    deadline = time.time() + 20
-    last_url = page.url
-    while time.time() < deadline:
-        current_url = page.url
-        last_url = current_url or last_url
-        if "about-you" in current_url:
-            return {"ok": True, "status": 200, "url": current_url, "data": None, "text": ""}
-        if "add-phone" in current_url or "chatgpt.com" in current_url or "code=" in current_url:
-            return {"ok": True, "status": 200, "url": current_url, "data": None, "text": ""}
-        if "consent" in current_url or "sign-in-with-chatgpt" in current_url or "workspace" in current_url or "organization" in current_url:
-            return {"ok": True, "status": 200, "url": current_url, "data": None, "text": ""}
-        try:
-            error_text = page.locator("text=Invalid code").first.text_content(timeout=400)
-        except Exception:
-            error_text = ""
-        if error_text:
-            return {"ok": False, "status": 400, "url": current_url, "data": None, "text": error_text}
-        time.sleep(0.5)
-    return {"ok": False, "status": 0, "url": last_url, "data": None, "text": "验证码页提交后未跳转"}
+            response_listener = _capture_response
+            page.on("response", response_listener)
+    except Exception:
+        response_listener = None
+
+    try:
+        submit_selector = _click_first(
+            page,
+            [
+                'button[type="submit"]',
+                'button[data-testid="continue-button"]',
+                'button:has-text("Continue")',
+                'button:has-text("continue")',
+                'button:has-text("Verify")',
+                'button:has-text("verify")',
+                'button:has-text("Next")',
+                'button:has-text("next")',
+            ],
+            timeout=8,
+        )
+        if not submit_selector:
+            return {"ok": False, "status": 0, "url": page.url, "data": None, "text": "验证码页未找到 Continue 按钮"}
+        log(f"验证码页已点击继续按钮: {submit_selector}")
+
+        start_time = time.time()
+        deadline = start_time + 20
+        last_url = str(page.url or "")
+        processed_responses = 0
+        api_fallback_attempted = False
+
+        def _response_details(response) -> tuple[int, str, dict, str]:
+            status = int(getattr(response, "status", 0) or 0)
+            response_url = str(getattr(response, "url", "") or "")
+            text = ""
+            data = {}
+            try:
+                text = str(response.text() or "")
+            except Exception:
+                pass
+            try:
+                parsed = response.json()
+                if isinstance(parsed, dict):
+                    data = parsed
+            except Exception:
+                if text:
+                    try:
+                        parsed = json.loads(text)
+                        if isinstance(parsed, dict):
+                            data = parsed
+                    except (TypeError, ValueError):
+                        pass
+            return status, response_url, data, text
+
+        def _response_error(data: dict, text: str) -> str:
+            error = data.get("error") if isinstance(data, dict) else None
+            if isinstance(error, dict):
+                message = str(error.get("message") or error.get("detail") or "").strip()
+                if message:
+                    return message
+            for key in ("message", "detail", "error"):
+                value = data.get(key) if isinstance(data, dict) else None
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+            return str(text or "").strip()[:500]
+
+        def _success_result(status: int, response_url: str, data: dict | None = None) -> dict:
+            effective_url = str(response_url or page.url or "")
+            payload = data if isinstance(data, dict) else None
+            state = _extract_flow_state(payload, effective_url)
+            if not state.get("page_type") or state.get("page_type") == "email_otp_verification":
+                derived = _derive_registration_state_from_page(page)
+                if derived.get("page_type") and derived.get("page_type") != "email_otp_verification":
+                    return {"ok": True, "status": status or 200, "url": effective_url, "data": payload, "text": ""}
+                # The validate endpoint can return an empty 204 while the SPA
+                # keeps the same URL. Its successful contract is the next
+                # about_you step, so expose that state to the outer machine.
+                payload = {
+                    "page": {
+                        "type": "about_you",
+                        "payload": {"url": f"{OPENAI_AUTH}/about-you"},
+                    }
+                }
+            return {"ok": True, "status": status or 200, "url": effective_url, "data": payload, "text": ""}
+
+        while time.time() < deadline:
+            current_url = str(page.url or "")
+            last_url = current_url or last_url
+            state = _derive_registration_state_from_page(page)
+            page_type = str(state.get("page_type") or "")
+            if page_type in {
+                "about_you",
+                "add_phone",
+                "consent",
+                "workspace_selection",
+                "organization_selection",
+                "oauth_callback",
+                "chatgpt_home",
+                "external_url",
+            } or "code=" in current_url:
+                return {"ok": True, "status": 200, "url": current_url, "data": None, "text": ""}
+
+            while processed_responses < len(captured_responses):
+                response = captured_responses[processed_responses]
+                processed_responses += 1
+                status, response_url, data, response_text = _response_details(response)
+                if 200 <= status < 300:
+                    return _success_result(status, response_url, data)
+                if status >= 400:
+                    error_text = _response_error(data, response_text)
+                    return {
+                        "ok": False,
+                        "status": status,
+                        "url": response_url or current_url,
+                        "data": data or None,
+                        "text": error_text or f"email OTP validate HTTP {status}",
+                    }
+
+            if allow_api_fallback and not api_fallback_attempted and time.time() - start_time >= 2:
+                api_fallback_attempted = True
+                log("验证码页 URL 未变化，改用浏览器上下文 API 校验兜底")
+                api_result = _validate_browser_email_otp(
+                    page,
+                    otp,
+                    device_id=device_id,
+                    user_agent=user_agent,
+                    referer=referer or current_url,
+                )
+                api_status = int(api_result.get("status") or 0)
+                if 200 <= api_status < 300 or api_result.get("ok"):
+                    return _success_result(
+                        api_status,
+                        str(api_result.get("url") or current_url),
+                        api_result.get("data") if isinstance(api_result.get("data"), dict) else None,
+                    )
+                if api_status >= 400:
+                    post_api_state = _derive_registration_state_from_page(page)
+                    if str(post_api_state.get("page_type") or "") in {
+                        "about_you",
+                        "add_phone",
+                        "consent",
+                        "workspace_selection",
+                        "organization_selection",
+                        "oauth_callback",
+                        "chatgpt_home",
+                        "external_url",
+                    }:
+                        return {
+                            "ok": True,
+                            "status": 200,
+                            "url": str(page.url or current_url),
+                            "data": None,
+                            "text": "",
+                        }
+                    return {
+                        "ok": False,
+                        "status": api_status,
+                        "url": str(api_result.get("url") or current_url),
+                        "data": api_result.get("data"),
+                        "text": _response_error(
+                            api_result.get("data") if isinstance(api_result.get("data"), dict) else {},
+                            str(api_result.get("text") or ""),
+                        ) or f"email OTP validate HTTP {api_status}",
+                    }
+
+            error_text = _extract_auth_error_text(page)
+            if error_text:
+                return {"ok": False, "status": 400, "url": current_url, "data": None, "text": error_text}
+            time.sleep(0.4)
+        return {
+            "ok": False,
+            "status": 0,
+            "url": last_url,
+            "data": None,
+            "text": f"验证码页提交后未进入下一状态: url={last_url[:160]}",
+        }
+    finally:
+        if response_listener is not None:
+            try:
+                page.remove_listener("response", response_listener)
+            except Exception:
+                pass
 
 
 def _submit_about_you_via_page(page, log) -> dict:
@@ -3686,6 +3932,17 @@ def _submit_about_you_via_page(page, log) -> dict:
         raise RuntimeError("about_you 未成功填写 Birthday/Age")
     _browser_pause(page)
 
+    create_account_responses: list[Any] = []
+    try:
+        page.on(
+            "response",
+            lambda response: create_account_responses.append(response)
+            if "/api/accounts/create_account" in str(getattr(response, "url", "") or "")
+            else None,
+        )
+    except Exception:
+        create_account_responses = []
+
     submit_selector = _click_first(
         page,
         [
@@ -3710,6 +3967,64 @@ def _submit_about_you_via_page(page, log) -> dict:
     while time.time() < deadline:
         current_url = page.url
         last_url = current_url or last_url
+        # The Auth SPA may keep /about-you in the URL while the create_account
+        # request has already advanced its internal flow state.
+        if create_account_responses:
+            response = create_account_responses.pop(0)
+            response_status = int(getattr(response, "status", 0) or 0)
+            response_url = str(getattr(response, "url", "") or current_url)
+            response_text = ""
+            response_data = None
+            try:
+                response_text = str(response.text() or "")
+            except Exception:
+                pass
+            try:
+                parsed_response = response.json()
+                if isinstance(parsed_response, dict):
+                    response_data = parsed_response
+            except Exception:
+                if response_text:
+                    try:
+                        parsed_response = json.loads(response_text)
+                        if isinstance(parsed_response, dict):
+                            response_data = parsed_response
+                    except (TypeError, ValueError):
+                        pass
+            if 200 <= response_status < 300:
+                return {
+                    "ok": True,
+                    "status": response_status,
+                    "url": response_url,
+                    "data": response_data,
+                    "text": "",
+                }
+            if response_status >= 400:
+                response_error = ""
+                if isinstance(response_data, dict):
+                    error = response_data.get("error")
+                    if isinstance(error, dict):
+                        response_error = str(error.get("message") or error.get("detail") or "").strip()
+                    response_error = response_error or str(response_data.get("message") or "").strip()
+                return {
+                    "ok": False,
+                    "status": response_status,
+                    "url": response_url,
+                    "data": response_data,
+                    "text": response_error or response_text[:500] or f"create_account HTTP {response_status}",
+                }
+        state_after_submit = _derive_registration_state_from_page(page)
+        state_page_type = str(state_after_submit.get("page_type") or "")
+        if state_page_type in {
+            "add_phone",
+            "consent",
+            "workspace_selection",
+            "organization_selection",
+            "oauth_callback",
+            "chatgpt_home",
+            "external_url",
+        }:
+            return {"ok": True, "status": 200, "url": current_url, "data": None, "text": ""}
         if "code=" in current_url or "chatgpt.com" in current_url or "sign-in-with-chatgpt" in current_url:
             return {"ok": True, "status": 200, "url": current_url, "data": None, "text": ""}
         if "add-phone" in current_url:
@@ -3802,6 +4117,7 @@ def _browser_registration_flow(
     log,
     *,
     device_id: str = "",
+    initial_state: dict | None = None,
 ) -> dict:
     device_id = str(device_id or uuid.uuid4())
     try:
@@ -3810,11 +4126,48 @@ def _browser_registration_flow(
         user_agent = _random_chrome_ua()
 
     _seed_browser_device_id(page, device_id)
-    try:
-        state = _start_browser_signup_via_page(page, email, log)
-    except Exception as exc:
-        log(f"页面驱动注册入口失败，回退 ChatGPT authorize 入口: {exc}")
-        state = _start_browser_signup_via_authorize(page, email, device_id, log)
+    requested_state = dict(initial_state or {})
+    requested_page_type = str(requested_state.get("page_type") or "").strip()
+    if requested_page_type:
+        target_url = _normalize_url(
+            str(
+                requested_state.get("current_url")
+                or requested_state.get("continue_url")
+                or (
+                    f"{OPENAI_AUTH}/about-you"
+                    if requested_page_type == "about_you"
+                    else ""
+                )
+                or ""
+            ),
+            OPENAI_AUTH,
+        )
+        if target_url:
+            try:
+                log(f"恢复协议注册页面: {target_url[:140]}")
+                page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
+            except Exception as exc:
+                log(f"恢复协议注册页面失败: {exc}")
+        state = _derive_registration_state_from_page(page)
+        if not state.get("page_type"):
+            state = requested_state
+        elif requested_page_type == "about_you" and state.get("page_type") in {
+            "login_password",
+            "create_account_password",
+        }:
+            # The protocol cookies may have expired before the worker started.
+            # Only in that case restart from the browser signup entry.
+            log("协议 Cookie 无法恢复 about_you，回退完整浏览器注册入口")
+            state = {}
+    else:
+        state = {}
+
+    if not state.get("page_type"):
+        try:
+            state = _start_browser_signup_via_page(page, email, log)
+        except Exception as exc:
+            log(f"页面驱动注册入口失败，回退 ChatGPT authorize 入口: {exc}")
+            state = _start_browser_signup_via_authorize(page, email, device_id, log)
     auth_cookies = _get_cookies(page)
     log(
         "授权态 cookies: "
@@ -3822,7 +4175,14 @@ def _browser_registration_flow(
         f"oai-did={'yes' if auth_cookies.get('oai-did') else 'no'}"
     )
     log(f"注册状态起点: page={state.get('page_type') or '-'} url={(state.get('current_url') or '')[:100]}")
-    register_submitted = False
+    register_submitted = requested_page_type in {
+        "email_otp_verification",
+        "about_you",
+        "add_phone",
+        "consent",
+        "oauth_callback",
+    }
+    browser_otp_sent = requested_page_type == "email_otp_verification"
     seen_states: dict[str, int] = {}
 
     for step in range(12):
@@ -3883,11 +4243,53 @@ def _browser_registration_flow(
         if _is_email_otp(state):
             if not otp_callback:
                 raise RuntimeError("ChatGPT 注册需要邮箱验证码但未提供 otp_callback")
+            otp_sent_at = None
+            if not browser_otp_sent:
+                send_result = _send_browser_email_otp(
+                    page,
+                    device_id=device_id,
+                    user_agent=user_agent,
+                    referer=str(state.get("current_url") or state.get("continue_url") or ""),
+                )
+                send_status = int(send_result.get("status") or 0)
+                if 200 <= send_status < 300 or send_result.get("ok"):
+                    otp_sent_at = time.time()
+                    log(f"浏览器注册验证码已触发: status={send_status or 200}")
+                else:
+                    log(
+                        "浏览器注册验证码触发返回非成功，继续按页面已有验证码等待: "
+                        f"status={send_status} text={str(send_result.get('text') or '')[:160]}"
+                    )
+                browser_otp_sent = True
             log("等待 ChatGPT 验证码")
-            code = otp_callback()
+            callback_payload = {
+                "otp_sent_at": otp_sent_at,
+                "phase": "browser_register_email_otp",
+                "page_type": str(state.get("page_type") or "email_otp_verification"),
+            }
+            try:
+                callback_value = otp_callback(callback_payload)
+            except TypeError:
+                callback_value = otp_callback()
+            if isinstance(callback_value, dict):
+                code = str(
+                    callback_value.get("code")
+                    or callback_value.get("otp")
+                    or callback_value.get("value")
+                    or ""
+                ).strip()
+            else:
+                code = str(callback_value or "").strip()
             if not code:
                 raise RuntimeError("未获取到验证码")
-            otp_resp = _submit_otp_via_page(page, code, log)
+            otp_resp = _submit_otp_via_page(
+                page,
+                code,
+                log,
+                device_id=device_id,
+                user_agent=user_agent,
+                referer=str(state.get("current_url") or state.get("continue_url") or ""),
+            )
             log(f"验证码页提交状态: {otp_resp.get('status', 0)}")
             if not otp_resp.get("ok"):
                 raise RuntimeError(f"验证码校验失败: {(otp_resp.get('text') or '')[:300]}")
@@ -4034,6 +4436,8 @@ def run_browser_registration_stage_sync(
     otp_callback: Callable[[], str],
     device_id: str,
     headless: bool = True,
+    cookies: Optional[list[dict]] = None,
+    initial_state: Optional[dict] = None,
     log_fn: Callable[[str], None] = print,
 ) -> dict:
     """Complete only signup in one Camoufox context and return scoped cookies."""
@@ -4061,6 +4465,9 @@ def run_browser_registration_stage_sync(
         page = browser.new_page()
         page.set_default_timeout(30000)
         page.set_default_navigation_timeout(45000)
+        imported_cookies = _import_browser_context_cookies(page, cookies, logger)
+        if cookies:
+            logger(f"浏览器注册后备链路导入协议 Cookie: {imported_cookies}/{len(cookies)}")
         logger("浏览器注册后备链路已进入同一上下文状态机")
         final_state = _browser_registration_flow(
             page,
@@ -4070,6 +4477,7 @@ def run_browser_registration_stage_sync(
             None,
             logger,
             device_id=device_id,
+            initial_state=initial_state,
         )
         if not _is_registration_complete(final_state):
             page_type = str(final_state.get("page_type") or "unknown")

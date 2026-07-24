@@ -25,6 +25,7 @@ from .task_logging import classify_task_log_level
 from .utils import FlowState, generate_random_name, generate_random_birthday
 from .account_fingerprint import build_browser_fingerprint_payload, fingerprint_signature
 from .sentinel_browser import (
+    export_session_cookies_for_playwright,
     merge_playwright_cookies_into_session,
     run_browser_registration_stage,
 )
@@ -43,6 +44,20 @@ class EmailServiceAdapter:
     def is_otp_wait_budget_exhausted(self) -> bool:
         budget = self._otp_budget
         return bool(budget and budget.is_exhausted())
+
+    def used_codes_for_phases(self, *phases: str) -> set[str]:
+        """Return codes already consumed by any related registration phase.
+
+        A browser fallback can follow a protocol OTP phase for the same mailbox.
+        Keeping the phase labels separate is useful for logs, but reusing a code
+        across those labels is never valid and can make the page appear stuck.
+        """
+        result: set[str] = set()
+        for phase in phases:
+            key = str(phase or "").strip()
+            if key:
+                result.update(self._used_codes_by_phase.get(key, set()))
+        return result
 
     def wait_for_verification_code(
         self,
@@ -604,21 +619,66 @@ class AccessTokenOnlyRegistrationEngine:
         otp_account_budget_timeout: int,
     ) -> tuple[bool, str]:
         self._log(
-            "协议注册未完成，切换同一浏览器上下文后备链路：邮箱 -> OTP -> about_you",
+            "协议注册未完成，切换 Camoufox 后备链路：优先恢复已有 about_you，必要时再走邮箱 -> OTP",
             "warning",
         )
 
-        def _wait_for_browser_otp() -> str:
-            return str(
-                skymail_adapter.wait_for_verification_code(
-                    email_addr,
-                    timeout=otp_wait_timeout,
-                    otp_sent_at=time.time() - 15,
-                    phase="browser_register_email_otp",
-                    phase_label="浏览器注册邮箱验证码",
-                )
-                or ""
-            ).strip()
+        registration_state = getattr(chatgpt_client, "last_registration_state", None)
+        initial_state: dict[str, Any] = {}
+        if registration_state is not None:
+            initial_state = {
+                "page_type": str(getattr(registration_state, "page_type", "") or ""),
+                "continue_url": str(getattr(registration_state, "continue_url", "") or ""),
+                "method": str(getattr(registration_state, "method", "GET") or "GET"),
+                "current_url": str(getattr(registration_state, "current_url", "") or ""),
+                "payload": (
+                    dict(getattr(registration_state, "payload", {}) or {})
+                    if isinstance(getattr(registration_state, "payload", {}), dict)
+                    else {}
+                ),
+                "raw": (
+                    dict(getattr(registration_state, "raw", {}) or {})
+                    if isinstance(getattr(registration_state, "raw", {}), dict)
+                    else {}
+                ),
+            }
+        if initial_state.get("page_type"):
+            self._log(
+                "浏览器后备继承协议状态: "
+                f"page={initial_state.get('page_type')} "
+                f"url={str(initial_state.get('current_url') or initial_state.get('continue_url') or '')[:120]}"
+            )
+
+        def _wait_for_browser_otp(request_payload: dict | None = None) -> dict:
+            request = dict(request_payload or {})
+            sent_at = request.get("otp_sent_at")
+            try:
+                sent_at = float(sent_at) if sent_at is not None else None
+            except (TypeError, ValueError):
+                sent_at = None
+            exclude_codes = skymail_adapter.used_codes_for_phases(
+                "register_email_otp",
+                "browser_register_email_otp",
+            )
+            code = skymail_adapter.wait_for_verification_code(
+                email_addr,
+                timeout=otp_wait_timeout,
+                otp_sent_at=sent_at,
+                exclude_codes=exclude_codes,
+                phase="browser_register_email_otp",
+                phase_label="浏览器注册邮箱验证码",
+            )
+            return {
+                "code": str(code or "").strip(),
+                "otp_sent_at": sent_at,
+                "exclude_codes": sorted(exclude_codes),
+            }
+
+        try:
+            browser_cookies = export_session_cookies_for_playwright(chatgpt_client.session)
+        except Exception as exc:
+            browser_cookies = []
+            self._log(f"导出协议 Cookie 供浏览器恢复失败，继续空上下文: {exc}", "warning")
 
         hard_timeout_seconds = min(
             600,
@@ -631,6 +691,8 @@ class AccessTokenOnlyRegistrationEngine:
             proxy=self.proxy_url,
             device_id=str(getattr(chatgpt_client, "device_id", "") or ""),
             headless=self.browser_mode != "headed",
+            cookies=browser_cookies,
+            initial_state=initial_state,
             stop_check=chatgpt_client._check_stop,
             hard_timeout_seconds=hard_timeout_seconds,
             log_fn=lambda message: self._log(f"[浏览器注册] {message}"),
