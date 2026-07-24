@@ -242,6 +242,39 @@ class BrowserRegistrationFlowTests(unittest.TestCase):
         kwargs = service.get_verification_code.call_args.kwargs
         self.assertIn("123456", kwargs["exclude_codes"])
 
+    def test_email_adapter_can_reserve_independent_oauth_wait_budget(self):
+        service = mock.Mock()
+        service.get_verification_code.return_value = "654321"
+        budget = mock.Mock()
+        budget.plan_wait.return_value = type(
+            "Plan",
+            (),
+            {
+                "exhausted": True,
+                "timeout_seconds": 0,
+                "requested_seconds": 120,
+                "remaining_seconds": 0,
+                "clamped": True,
+            },
+        )()
+        adapter = EmailServiceAdapter(
+            service,
+            "buyer@example.com",
+            lambda _message: None,
+            otp_budget=budget,
+        )
+
+        code = adapter.wait_for_verification_code(
+            "buyer@example.com",
+            timeout=120,
+            phase="browser_oauth_email_otp",
+            ignore_budget=True,
+        )
+
+        self.assertEqual(code, "654321")
+        budget.plan_wait.assert_not_called()
+        self.assertEqual(service.get_verification_code.call_args.kwargs["timeout"], 120)
+
     def test_browser_fallback_carries_about_you_state_cookies_and_otp_context(self):
         email_service = mock.Mock()
         email_service.get_verification_code.return_value = "654321"

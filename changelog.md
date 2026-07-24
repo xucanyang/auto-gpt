@@ -6,6 +6,14 @@
 
 ## [Unreleased] (未发布)
 
+## [2.8.21] - 2026-07-24
+
+### 修复 (Fixed)
+- **解耦 OAuth recovery 与注册验证码预算**：`services/chatgpt_core/access_token_only_registration_engine.py` 为独立浏览器 OAuth 使用独立 OTP 等待窗口，不再被注册阶段已消耗的单账号验证码预算截断；整体浏览器事务仍受 `chatgpt_browser_oauth_hard_timeout_seconds` 和任务停止控制约束，重发后的新验证码可以完整等待并提交。
+
+### 测试 (Tests)
+- 增加 OAuth 阶段绕过注册预算、仍保留阶段验证码排除的回归测试。
+
 ## [2.8.20] - 2026-07-24
 
 ### 修复 (Fixed)
@@ -2512,4 +2520,8 @@
 
 ## 2026-07-24 14:48:27 +0800
 - 保留 registration_disallowed 后已落地账号并继续 Token 提取
+- 发布模式: multi
+
+## 2026-07-24 14:55:41 +0800
+- 解耦独立 OAuth OTP 等待预算，允许重发后完整等待
 - 发布模式: multi

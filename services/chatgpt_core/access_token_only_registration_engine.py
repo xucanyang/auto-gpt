@@ -69,11 +69,16 @@ class EmailServiceAdapter:
         exclude_codes=None,
         phase=None,
         phase_label=None,
+        ignore_budget: bool = False,
     ):
         phase_key = str(phase or "email_otp").strip() or "email_otp"
         phase_title = str(phase_label or phase_key).strip() or phase_key
         used_codes = self._used_codes_by_phase.setdefault(phase_key, set())
-        wait_plan = self._otp_budget.plan_wait(timeout) if self._otp_budget else None
+        wait_plan = (
+            self._otp_budget.plan_wait(timeout)
+            if self._otp_budget and not ignore_budget
+            else None
+        )
         if wait_plan and wait_plan.exhausted:
             self.log_fn(
                 f"[验证码] {phase_title} 已超过单账号验证码等待预算 "
@@ -885,6 +890,7 @@ class AccessTokenOnlyRegistrationEngine:
                     exclude_codes=exclude_codes,
                     phase="browser_oauth_email_otp",
                     phase_label="浏览器 OAuth 邮箱验证码",
+                    ignore_budget=True,
                 )
                 or ""
             ).strip()
