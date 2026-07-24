@@ -66,7 +66,11 @@ def test_payment_link_generation_dialog_explains_variant_aware_history_guard():
     assert "DEFAULT_TEAM_WORKSPACE_NAME = 'MyTeam'" in page
     assert "DEFAULT_TEAM_CHECKOUT_UI_MODE = 'hosted'" in page
     assert "DEFAULT_TEAM_BILLING_COUNTRY = 'US'" in page
-    assert "TEAM_BILLING_COUNTRY_CURRENCIES" in page
+    assert "TEAM_BILLING_COUNTRY_CURRENCIES" not in page
+    assert "billing_country_options?: Array" in page
+    assert "normalizeTeamBillingCountryOptions(profile.billing_country_options)" in page
+    assert "options={teamBillingCountryOptions}" in page
+    assert "BOB" not in page
     assert 'name="checkout_proxy_region"' in page
     assert 'label="动态 IP 国家"' in page
     assert 'name="billing_country"' in page

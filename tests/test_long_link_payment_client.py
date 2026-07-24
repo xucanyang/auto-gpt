@@ -340,7 +340,7 @@ class LongLinkPaymentClientTests(unittest.TestCase):
         token = "eyJteam.payload.signature"
         overrides = {
             "plan": "team",
-            "billing_country": "GB",
+            "billing_country": "BO",
             "country": "IN",
             "currency": "INR",
             "checkout_ui_mode": "hosted",
@@ -365,8 +365,8 @@ class LongLinkPaymentClientTests(unittest.TestCase):
                             "link_type": "team",
                             "plan": "team",
                             "generation_kind": "team_checkout",
-                            "billing_country": "GB",
-                            "currency": "GBP",
+                            "billing_country": "BO",
+                            "currency": "BOB",
                             "checkout_ui_mode": "hosted",
                             "regions": {"checkout": "CA"},
                             "team": {
@@ -410,7 +410,8 @@ class LongLinkPaymentClientTests(unittest.TestCase):
         self.assertEqual(profile["plan"], "team")
         self.assertEqual(profile["team"]["workspace_name"], "Client Workspace")
         self.assertEqual(profile["regions"]["checkout"], "CA")
-        self.assertEqual(profile["billing_country"], "GB")
+        self.assertEqual(profile["billing_country"], "BO")
+        self.assertEqual(profile["currency"], "BOB")
         self.assertEqual(profile["checkout_ui_mode"], "hosted")
         self.assertEqual(submitted["batch_id"], batch_id)
         self.assertEqual([call[0] for call in session.calls], ["POST", "POST"])

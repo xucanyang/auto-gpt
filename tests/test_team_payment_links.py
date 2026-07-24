@@ -10,12 +10,15 @@ from api.actions import _apply_action_result
 from core.base_platform import Account, RegisterConfig
 from core.db import AccountModel, PaymentLinkGenerationModel
 from services.chatgpt_core.payment_link_cache import (
+    TEAM_BILLING_COUNTRY_CURRENCIES,
     build_payment_link_cache_payload,
     normalize_payment_link_params,
+    normalize_team_billing_country,
     payment_link_cache_for_params,
     payment_link_cache_matches,
     payment_link_variant_key,
     store_payment_link_variant,
+    team_billing_country_options,
     validate_payment_link_request_params,
 )
 from services.chatgpt_core.plugin import ChatGPTPlatform
@@ -25,6 +28,18 @@ PROFILE_HASH = "f" * 64
 TEAM_URL = "https://pay.openai.com/c/pay/cs_team_test#hosted"
 LEGACY_CUSTOM_TEAM_URL = "https://chatgpt.com/checkout/openai_llc/cs_team_custom"
 PROMO_DIGEST = hashlib.sha256(b"TEAM50").hexdigest()
+UPSTREAM_TEAM_BILLING_COUNTRY_CURRENCIES = dict(
+    item.split(":", 1)
+    for item in """
+    AD:EUR AE:AED AR:ARS AT:EUR AU:AUD BE:EUR BH:BHD BM:BMD BO:BOB BR:BRL BQ:USD
+    CA:CAD CH:CHF CL:CLP CO:COP CZ:CZK CY:EUR DE:EUR DK:DKK EE:EUR EG:EGP ES:EUR
+    FI:EUR FR:EUR GB:GBP GR:EUR GU:USD HK:HKD HR:EUR HU:HUF ID:IDR IE:EUR IN:INR
+    IL:ILS IS:ISK IT:EUR JP:JPY KR:KRW KZ:KZT LT:EUR LU:EUR LV:EUR MC:EUR ME:EUR
+    MX:MXN MY:MYR MT:EUR NG:NGN NL:EUR NO:NOK NZ:NZD PE:PEN PH:PHP PK:PKR
+    PL:PLN PT:EUR PR:USD QA:QAR RO:RON SA:SAR SE:SEK SG:SGD SI:EUR SK:EUR SM:EUR
+    TH:THB TR:TRY TW:TWD TZ:TZS UA:UAH UM:USD US:USD VN:VND ZA:ZAR
+    """.split()
+)
 
 
 def team_params(workspace: str = "Workspace A", **overrides: object) -> dict[str, object]:
@@ -72,6 +87,18 @@ def team_result(workspace: str = "Workspace A", **overrides: object) -> dict[str
 
 
 class TeamPaymentLinkContractTests(unittest.TestCase):
+    def test_billing_catalog_matches_upstream_country_currency_contract(self) -> None:
+        self.assertEqual(TEAM_BILLING_COUNTRY_CURRENCIES, UPSTREAM_TEAM_BILLING_COUNTRY_CURRENCIES)
+        self.assertEqual(len(TEAM_BILLING_COUNTRY_CURRENCIES), 74)
+        self.assertEqual(normalize_team_billing_country({"billing_country": "bo"}), "BO")
+        self.assertEqual(
+            team_billing_country_options(),
+            [
+                {"country": country, "currency": currency}
+                for country, currency in UPSTREAM_TEAM_BILLING_COUNTRY_CURRENCIES.items()
+            ],
+        )
+
     def test_team_partial_overrides_are_allowed_but_invalid_or_ambiguous_inputs_fail(self) -> None:
         validate_payment_link_request_params({"plan": "team", "checkout_proxy_region": "gb"})
         validate_payment_link_request_params({
@@ -126,7 +153,7 @@ class TeamPaymentLinkContractTests(unittest.TestCase):
             team_params(profile_hash="e" * 64),
             team_params(checkout_proxy_region="US"),
             team_params(checkout_ui_mode="custom"),
-            team_params(country="US", billing_country="US", currency="USD"),
+            team_params(country="BO", billing_country="BO", currency="BOB"),
         ]
 
         base_key = payment_link_variant_key(base)
@@ -149,19 +176,27 @@ class TeamPaymentLinkContractTests(unittest.TestCase):
         })
         self.assertEqual(conflicting["country"], "CH")
         self.assertEqual(conflicting["currency"], "CHF")
+        bolivia = normalize_payment_link_params({
+            "plan": "team",
+            "billing_country": "bo",
+            "currency": "USD",
+            "checkout_proxy_region": "CA",
+        })
+        self.assertEqual(bolivia["country"], "BO")
+        self.assertEqual(bolivia["currency"], "BOB")
 
     def test_profile_freeze_preserves_task_billing_country_and_rejects_mismatch(self) -> None:
         request = tasks_api._filtered_payment_link_request_params({
             "plan": "team",
             "checkout_proxy_region": "CA",
-            "billing_country": "CH",
+            "billing_country": "BO",
         })
         profile = {
             "profile_hash": PROFILE_HASH,
             "plan": "team",
-            "country": "CH",
-            "billing_country": "CH",
-            "currency": "CHF",
+            "country": "BO",
+            "billing_country": "BO",
+            "currency": "BOB",
             "checkout_ui_mode": "hosted",
             "regions": {"checkout": "CA"},
             "team": {
@@ -173,9 +208,9 @@ class TeamPaymentLinkContractTests(unittest.TestCase):
 
         frozen = tasks_api._payment_link_params_from_profile(request, profile)
 
-        self.assertEqual(frozen["billing_country"], "CH")
-        self.assertEqual(frozen["country"], "CH")
-        self.assertEqual(frozen["currency"], "CHF")
+        self.assertEqual(frozen["billing_country"], "BO")
+        self.assertEqual(frozen["country"], "BO")
+        self.assertEqual(frozen["currency"], "BOB")
         with self.assertRaisesRegex(ValueError, "账单国家与任务配置不一致"):
             tasks_api._payment_link_params_from_profile(request, {**profile, "country": "US"})
 
@@ -210,6 +245,14 @@ class TeamPaymentLinkContractTests(unittest.TestCase):
         self.assertEqual(view["regions"]["checkout"], "GB")
         self.assertEqual(view["billing_country"], "GB")
         self.assertEqual(view["checkout_ui_mode"], "hosted")
+        self.assertEqual(
+            view["billing_country_options"],
+            team_billing_country_options(),
+        )
+        self.assertIn(
+            {"country": "BO", "currency": "BOB"},
+            view["billing_country_options"],
+        )
         self.assertNotIn("promo_code_digest", view)
         self.assertNotIn(PROMO_DIGEST, json.dumps(view))
 

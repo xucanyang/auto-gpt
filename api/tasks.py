@@ -65,6 +65,7 @@ from services.chatgpt_core.payment_link_cache import (
     normalize_team_billing_country,
     normalize_team_checkout_proxy_region,
     normalize_team_checkout_ui_mode,
+    team_billing_country_options,
     validate_payment_link_request_params,
     validate_plus_payment_request_params,
 )
@@ -17371,6 +17372,7 @@ def _payment_link_profile_view(profile: dict[str, Any]) -> dict[str, Any]:
         "variant_key": text("variant_key", limit=128),
         "effective_concurrency": nonnegative_int(source.get("effective_concurrency")),
         "profile_hash": text("profile_hash", limit=128),
+        "billing_country_options": team_billing_country_options(),
     }
 
 

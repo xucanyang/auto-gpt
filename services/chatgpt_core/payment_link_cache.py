@@ -97,42 +97,85 @@ PAYMENT_LINK_GENERATION_TEAM = "team_checkout"
 TEAM_DEFAULT_CHECKOUT_UI_MODE = "hosted"
 TEAM_CHECKOUT_UI_MODES = frozenset({"hosted", "custom"})
 TEAM_DEFAULT_BILLING_COUNTRY = "US"
+# Keep this server-side catalog aligned with openai-pay-long-link's
+# COUNTRY_CURRENCY contract.  The upstream profile API currently returns only
+# the selected country/currency pair, so Auto-GPT exposes this canonical mirror
+# to its frontend instead of maintaining a second browser-side mapping.
 TEAM_BILLING_COUNTRY_CURRENCIES = {
+    "AD": "EUR",
+    "AE": "AED",
+    "AR": "ARS",
     "AT": "EUR",
     "AU": "AUD",
     "BE": "EUR",
+    "BH": "BHD",
+    "BM": "BMD",
+    "BO": "BOB",
     "BR": "BRL",
+    "BQ": "USD",
     "CA": "CAD",
     "CH": "CHF",
+    "CL": "CLP",
+    "CO": "COP",
     "CZ": "CZK",
+    "CY": "EUR",
     "DE": "EUR",
     "DK": "DKK",
+    "EE": "EUR",
+    "EG": "EGP",
     "ES": "EUR",
     "FI": "EUR",
     "FR": "EUR",
     "GB": "GBP",
+    "GR": "EUR",
+    "GU": "USD",
     "HK": "HKD",
+    "HR": "EUR",
+    "HU": "HUF",
     "ID": "IDR",
     "IE": "EUR",
     "IN": "INR",
+    "IL": "ILS",
+    "IS": "ISK",
     "IT": "EUR",
     "JP": "JPY",
     "KR": "KRW",
+    "KZ": "KZT",
+    "LT": "EUR",
+    "LU": "EUR",
+    "LV": "EUR",
+    "MC": "EUR",
+    "ME": "EUR",
     "MX": "MXN",
     "MY": "MYR",
+    "MT": "EUR",
+    "NG": "NGN",
     "NL": "EUR",
     "NO": "NOK",
     "NZ": "NZD",
+    "PE": "PEN",
     "PH": "PHP",
+    "PK": "PKR",
     "PL": "PLN",
     "PT": "EUR",
+    "PR": "USD",
+    "QA": "QAR",
+    "RO": "RON",
+    "SA": "SAR",
     "SE": "SEK",
     "SG": "SGD",
+    "SI": "EUR",
+    "SK": "EUR",
+    "SM": "EUR",
     "TH": "THB",
     "TR": "TRY",
     "TW": "TWD",
+    "TZ": "TZS",
+    "UA": "UAH",
+    "UM": "USD",
     "US": "USD",
     "VN": "VND",
+    "ZA": "ZAR",
 }
 PAYMENT_LINK_PLUS_PLAN_ALIASES = frozenset({
     "plus",
@@ -174,6 +217,15 @@ RETIRED_PAYMENT_REQUEST_KEYS = frozenset({
     "checkoutUiMode",
     "checkoutMode",
 })
+
+
+def team_billing_country_options() -> list[dict[str, str]]:
+    """Return a fresh browser-safe view of the upstream Team billing catalog."""
+
+    return [
+        {"country": country, "currency": currency}
+        for country, currency in TEAM_BILLING_COUNTRY_CURRENCIES.items()
+    ]
 
 
 def normalize_payment_link_plan(value: Any) -> str:

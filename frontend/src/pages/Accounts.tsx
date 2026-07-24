@@ -138,13 +138,6 @@ const TEAM_PROXY_COUNTRY_CODES = [
   'TR', 'VN', 'PH', 'IN', 'DE', 'FR', 'IT', 'ES', 'NL', 'IE', 'PT', 'BE',
   'FI', 'AT', 'CH', 'SE', 'NO', 'DK', 'PL', 'CZ', 'MX', 'BR', 'NZ',
 ] as const
-const TEAM_BILLING_COUNTRY_CURRENCIES = {
-  AT: 'EUR', AU: 'AUD', BE: 'EUR', BR: 'BRL', CA: 'CAD', CH: 'CHF', CZ: 'CZK',
-  DE: 'EUR', DK: 'DKK', ES: 'EUR', FI: 'EUR', FR: 'EUR', GB: 'GBP', HK: 'HKD',
-  ID: 'IDR', IE: 'EUR', IN: 'INR', IT: 'EUR', JP: 'JPY', KR: 'KRW', MX: 'MXN',
-  MY: 'MYR', NL: 'EUR', NO: 'NOK', NZ: 'NZD', PH: 'PHP', PL: 'PLN', PT: 'EUR',
-  SE: 'SEK', SG: 'SGD', TH: 'THB', TR: 'TRY', TW: 'TWD', US: 'USD', VN: 'VND',
-} as const
 
 function teamProxyCountryLabel(code: string) {
   const normalized = String(code || '').trim().toUpperCase()
@@ -166,13 +159,28 @@ function teamBillingCountryLabel(code: string, currency: string) {
   }
 }
 
-const TEAM_BILLING_COUNTRY_OPTIONS = Object.entries(TEAM_BILLING_COUNTRY_CURRENCIES)
-  .sort(([left], [right]) => {
-    if (left === DEFAULT_TEAM_BILLING_COUNTRY) return -1
-    if (right === DEFAULT_TEAM_BILLING_COUNTRY) return 1
-    return left.localeCompare(right)
+function normalizeTeamBillingCountryOptions(value: unknown): Array<{ value: string; label: string }> {
+  if (!Array.isArray(value)) return []
+  const currencies = new Map<string, string>()
+  value.forEach((item) => {
+    if (!item || typeof item !== 'object') return
+    const option = item as { country?: unknown; currency?: unknown }
+    const country = String(option.country || '').trim().toUpperCase()
+    const currency = String(option.currency || '').trim().toUpperCase()
+    if (!/^[A-Z]{2}$/.test(country) || !/^[A-Z]{3}$/.test(currency) || currencies.has(country)) return
+    currencies.set(country, currency)
   })
-  .map(([code, currency]) => ({ value: code, label: teamBillingCountryLabel(code, currency) }))
+  return Array.from(currencies.entries())
+    .sort(([left], [right]) => {
+      if (left === DEFAULT_TEAM_BILLING_COUNTRY) return -1
+      if (right === DEFAULT_TEAM_BILLING_COUNTRY) return 1
+      return left.localeCompare(right)
+    })
+    .map(([country, currency]) => ({
+      value: country,
+      label: teamBillingCountryLabel(country, currency),
+    }))
+}
 
 const DEFAULT_PINNED_ACCOUNT_TOOLBAR_ACTIONS: AccountToolbarActionId[] = ['statusSync', 'paymentLink']
 
@@ -449,6 +457,10 @@ type PaymentLinkProfile = {
   plan_name?: string
   variant_key?: string
   promo_code_digest?: string
+  billing_country_options?: Array<{
+    country?: string
+    currency?: string
+  }>
   team?: {
     workspace_name?: string
     price_interval?: string
@@ -2598,6 +2610,7 @@ export default function Accounts() {
   const [batchPaymentLinkProfileLoading, setBatchPaymentLinkProfileLoading] = useState(false)
   const [batchPaymentLinkProfileError, setBatchPaymentLinkProfileError] = useState('')
   const [batchPaymentLinkPlan, setBatchPaymentLinkPlan] = useState<'plus' | 'team'>('plus')
+  const [teamBillingCountryOptions, setTeamBillingCountryOptions] = useState<Array<{ value: string; label: string }>>([])
   const [teamProxyCountrySearch, setTeamProxyCountrySearch] = useState('')
   const [registerForm] = Form.useForm()
   const [addForm] = Form.useForm()
@@ -4136,6 +4149,11 @@ export default function Accounts() {
       if (!profile || !String(profile.profile_hash || '').trim()) {
         throw new Error('long-link 未返回当前配置标识')
       }
+      const billingCountryOptions = normalizeTeamBillingCountryOptions(profile.billing_country_options)
+      if (billingCountryOptions.length === 0) {
+        throw new Error('服务端未返回 long-link 账单国家选项')
+      }
+      setTeamBillingCountryOptions(billingCountryOptions)
       setBatchPaymentLinkProfile(profile)
       return profile
     } catch (e: any) {
@@ -8748,7 +8766,8 @@ export default function Accounts() {
                       showSearch
                       optionFilterProp="label"
                       placeholder="选择账单国家"
-                      options={TEAM_BILLING_COUNTRY_OPTIONS}
+                      loading={batchPaymentLinkProfileLoading && teamBillingCountryOptions.length === 0}
+                      options={teamBillingCountryOptions}
                       onChange={(value) => {
                         const billingCountry = String(value || DEFAULT_TEAM_BILLING_COUNTRY).trim().toUpperCase()
                         batchPaymentLinkForm.setFieldValue('billing_country', billingCountry)

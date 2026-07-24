@@ -6,6 +6,11 @@
 
 ## [Unreleased] (未发布)
 
+## [2.8.22] - 2026-07-25
+
+### 优化 (Changed)
+- **Team 账单国家目录对齐 long-link 上游映射**：`services/chatgpt_core/payment_link_cache.py` 将 Team 账单国家从本地 35 项扩展为与 `openai-pay-long-link` 当前 `COUNTRY_CURRENCY` 合同一致的 74 项，并由 `api/tasks.py` 的支付 profile 接口统一下发浏览器；`frontend/src/pages/Accounts.tsx` 删除独立国家/币种表，只消费服务端目录。玻利维亚现在可选择为 `BO / BOB`，请求校验、profile 冻结、变体缓存和生成历史使用同一国家本币，不再把旧客户端提交的冲突 `currency` 当作有效覆盖。
+
 ### 修复 (Fixed)
 - **修复注册任务启动覆盖已保存邮箱画像**：`frontend/src/pages/Accounts.tsx` 的启动路径现在合并保存数量、并发和邮箱草稿，不再用缺少 `mail_provider_override`、TempMail 模式及域名的精简对象覆盖显式保存的浏览器画像；再次打开注册面板时，已选择的 HME Ready/TempMail 域名画像保持不变。
 - **补齐其他面板的设置保存闭环**：`frontend/src/pages/Proxies.tsx` 现在会把动态代理“实测出口”开关连同模板、出口国家和 IP 保留时长一起写入全局配置；账号页手机号绑定的号段模式、只测收发码和同号复用联动值在通过 `setFieldsValue` 变更时也会立即写入浏览器画像，避免关闭弹窗后恢复旧值。`frontend/src/pages/Accounts.tsx` 同时兼容旧 localStorage 中的字符串布尔值，避免 `"false"` 被错误解释为开启。
@@ -13,6 +18,7 @@
 - **明确邮箱选择的作用域**：`frontend/src/features/auth/components/RegisterTaskModal.tsx` 将邮箱字段标为“本任务默认”，并提示保存后的浏览器画像与设置页全局默认相互独立，避免把一次任务覆盖误认为全局配置保存。
 
 ### 测试 (Tests)
+- 扩展 Team 支付、long-link 客户端和账号页合同测试，完整锁定 74 项上游国家本币映射、`BO / BOB` 参数与缓存变体、旧 `country/currency` 清理，以及前端仅从 profile 目录生成账单国家选项；Python 专项测试与前端生产构建通过，侧栏版本同步更新为 `v2.8.22`。
 - 增加其他设置面板的保存合同断言，覆盖动态代理探测开关、手机号绑定联动字段的显式画像写入，以及旧字符串布尔值的归一化。
 - 扩展 `tests/test_registration_profile_ui.py`，覆盖显式保存邮箱服务/域名画像、弹窗恢复画像以及全局配置不被任务启动反写的前端合同。
 
@@ -2550,4 +2556,8 @@
 
 ## 2026-07-24 21:30:20 +0800
 - 修复注册启动覆盖已保存邮箱画像
+- 发布模式: multi
+
+## 2026-07-25 00:42:36 +0800
+- 对齐 Team 账单国家与上游本币映射
 - 发布模式: multi
