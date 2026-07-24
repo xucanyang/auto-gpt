@@ -987,20 +987,20 @@ def _pick_best_about_you_input(entries: list[dict], field: str, exclude_visible_
 
         score = 0
         if field == "name":
-            if any(token in hints for token in ("full name", "fullname", "全名", "姓名", "nombre completo", "nom complet", "vollständiger name", "nome completo")):
+            if any(token in hints for token in ("full name", "fullname", "全名", "姓名", "氏名", "nombre completo", "nom complet", "vollständiger name", "nome completo")):
                 score += 10
             if any(token in hints for token in (" name ", "name", "autocomplete=name", "nombre", "nom", "nome")):
                 score += 3
-            if any(token in hints for token in ("age", "年龄", "edad", "âge", "alter", "idade", "umur", "usia", "birthday", "birth", "date of birth", "出生", "生日")):
+            if any(token in hints for token in ("age", "年龄", "年齢", "edad", "âge", "alter", "idade", "umur", "usia", "birthday", "birth", "date of birth", "出生", "生日")):
                 score -= 8
         elif field == "age":
-            if any(token in hints for token in ("age", "年龄", "how old", "edad", "âge", "alter", "idade", "umur", "usia", "나이")):
+            if any(token in hints for token in ("age", "年龄", "年齢", "how old", "edad", "âge", "alter", "idade", "umur", "usia", "나이")):
                 score += 10
-            if any(token in hints for token in ("full name", "fullname", "全名", "姓名", "nombre completo", "nom complet")):
+            if any(token in hints for token in ("full name", "fullname", "全名", "姓名", "氏名", "nombre completo", "nom complet")):
                 score -= 10
             if (
                 "name" in hints
-                and not any(token in hints for token in ("age", "年龄", "edad", "umur", "usia"))
+                and not any(token in hints for token in ("age", "年龄", "年齢", "edad", "umur", "usia"))
             ):
                 score -= 6
             if any(token in hints for token in ("birthday", "birth", "date of birth", "出生", "生日", "fecha de nacimiento", "nascimento")):
@@ -1199,7 +1199,7 @@ def _get_cookies(page) -> dict:
 
 
 def _import_browser_context_cookies(page, cookies: list[dict] | None, log) -> int:
-    """Import protocol-session cookies without letting one malformed cookie abort the context."""
+    """Import explicit browser cookies without letting one malformed item abort the context."""
     imported = 0
     for item in cookies or []:
         if not isinstance(item, dict):
@@ -1901,7 +1901,18 @@ def _invoke_otp_callback(otp_callback, payload: dict | None = None):
             return otp_callback()
 
 
-def _do_codex_oauth(page, cookies_dict: dict, email: str, password: str, otp_callback, phone_callback, proxy: str | None, log) -> dict | None:
+def _do_codex_oauth(
+    page,
+    cookies_dict: dict,
+    email: str,
+    password: str,
+    otp_callback,
+    phone_callback,
+    proxy: str | None,
+    log,
+    *,
+    strict_browser: bool = False,
+) -> dict | None:
     """在真实浏览器会话内完成 Codex OAuth，返回完整 token 包。"""
     from .oauth import generate_oauth_url
     from .oauth import (
@@ -2089,10 +2100,11 @@ def _do_codex_oauth(page, cookies_dict: dict, email: str, password: str, otp_cal
                 browser_result = _complete_oauth_in_browser(page, oauth_start, proxy, log)
                 if browser_result:
                     return browser_result
-                cookies_dict = _get_cookies(page)
-                session_result = _complete_oauth_with_session(cookies_dict, oauth_start, proxy, log)
-                if session_result:
-                    return session_result
+                if not strict_browser:
+                    cookies_dict = _get_cookies(page)
+                    session_result = _complete_oauth_with_session(cookies_dict, oauth_start, proxy, log)
+                    if session_result:
+                        return session_result
                 log("  ⚠️ 页面已到 consent/workspace，但会话补全失败")
                 return None
 
@@ -2143,11 +2155,11 @@ def _do_codex_oauth(page, cookies_dict: dict, email: str, password: str, otp_cal
                         browser_result = _complete_oauth_in_browser(page, oauth_start, proxy, log)
                         if browser_result:
                             return browser_result
-                        # 回退到 curl session 方式
-                        cookies_dict = _get_cookies(page)
-                        session_result = _complete_oauth_with_session(cookies_dict, oauth_start, proxy, log)
-                        if session_result:
-                            return session_result
+                        if not strict_browser:
+                            cookies_dict = _get_cookies(page)
+                            session_result = _complete_oauth_with_session(cookies_dict, oauth_start, proxy, log)
+                            if session_result:
+                                return session_result
 
                     if skip_state.get("page_type") == "add_phone":
                         log("  跳过失败，仍在 add_phone 页面")
@@ -2177,15 +2189,15 @@ def _do_codex_oauth(page, cookies_dict: dict, email: str, password: str, otp_cal
                 new_url = str(page.url or "")
                 if new_url != current_url:
                     continue
-                # 检查 cookie 里是否有 session
-                cookies_dict = _get_cookies(page)
-                for ck, cv in cookies_dict.items():
-                    if "session" in ck.lower() and cv:
-                        log(f"  chatgpt_home 检测到 session cookie: {ck}")
-                        session_result = _complete_oauth_with_session(cookies_dict, oauth_start, proxy, log)
-                        if session_result:
-                            return session_result
-                        break
+                if not strict_browser:
+                    cookies_dict = _get_cookies(page)
+                    for ck, cv in cookies_dict.items():
+                        if "session" in ck.lower() and cv:
+                            log(f"  chatgpt_home 检测到 session cookie: {ck}")
+                            session_result = _complete_oauth_with_session(cookies_dict, oauth_start, proxy, log)
+                            if session_result:
+                                return session_result
+                            break
                 continue
 
             target_url = _normalize_url(state.get("continue_url") or "", OPENAI_AUTH)
@@ -2209,9 +2221,10 @@ def _do_codex_oauth(page, cookies_dict: dict, email: str, password: str, otp_cal
         return None
 
     cookies_dict = _get_cookies(page)
-    result = _complete_oauth_with_session(cookies_dict, oauth_start, proxy, log)
-    if result:
-        return result
+    if not strict_browser:
+        result = _complete_oauth_with_session(cookies_dict, oauth_start, proxy, log)
+        if result:
+            return result
 
     session_token = cookies_dict.get("__Secure-next-auth.session-token", "")
     if not session_token:
@@ -2222,22 +2235,79 @@ def _do_codex_oauth(page, cookies_dict: dict, email: str, password: str, otp_cal
 
 
 def _wait_for_access_token(page, timeout: int = 60) -> str:
-    deadline = time.time() + timeout
+    return str((_wait_for_web_session(page, timeout=timeout) or {}).get("accessToken") or "")
+
+
+def _wait_for_web_session(page, timeout: int = 30) -> dict:
+    """Read the ChatGPT web session from the active browser context only."""
+    deadline = time.time() + max(int(timeout or 0), 1)
+    navigated_to_chatgpt = False
     while time.time() < deadline:
         try:
-            r = page.evaluate("""
+            current_url = str(page.url or "")
+            if "chatgpt.com" not in current_url and not navigated_to_chatgpt:
+                navigated_to_chatgpt = True
+                page.goto(CHATGPT_APP, wait_until="domcontentloaded", timeout=30000)
+            result = page.evaluate("""
             async () => {
-                const r = await fetch('/api/auth/session');
+                const r = await fetch('https://chatgpt.com/api/auth/session', {
+                  credentials: 'include'
+                });
+                if (!r.ok) return {};
                 const j = await r.json();
-                return j.accessToken || '';
+                return j && typeof j === 'object' ? j : {};
             }
             """)
-            if r:
-                return r
+            if isinstance(result, dict) and str(result.get("accessToken") or "").strip():
+                return dict(result)
         except Exception:
             pass
         time.sleep(2)
-    return ""
+    return {}
+
+
+def _normalize_browser_web_session(session_data: dict, cookies: list[dict]) -> dict:
+    data = dict(session_data or {})
+    access_token = str(data.get("accessToken") or "").strip()
+    claims = _decode_jwt_payload(access_token)
+    auth_claims = claims.get("https://api.openai.com/auth") or {}
+    account = data.get("account") if isinstance(data.get("account"), dict) else {}
+    user = data.get("user") if isinstance(data.get("user"), dict) else {}
+    account_id = str(
+        account.get("id")
+        or auth_claims.get("chatgpt_account_id")
+        or ""
+    ).strip()
+    session_token = str(data.get("sessionToken") or "").strip()
+    cookie_pairs: list[str] = []
+    for item in cookies or []:
+        name = str(item.get("name") or "").strip()
+        value = str(item.get("value") or "").strip()
+        if not name or not value:
+            continue
+        cookie_pairs.append(f"{name}={value}")
+        if not session_token and "session-token" in name.lower():
+            session_token = value
+    cookie_header = "; ".join(cookie_pairs)
+    return {
+        "access_token": access_token,
+        "session_token": session_token,
+        "cookies": cookie_header,
+        "cookie_header": cookie_header,
+        "account_id": account_id,
+        "workspace_id": account_id,
+        "user_id": str(
+            user.get("id")
+            or auth_claims.get("chatgpt_user_id")
+            or auth_claims.get("user_id")
+            or ""
+        ).strip(),
+        "expires": data.get("expires"),
+        "user": user,
+        "account": account,
+        "auth_provider": data.get("authProvider"),
+        "raw_session": data,
+    }
 
 
 def _is_registration_complete(state: dict) -> bool:
@@ -3856,9 +3926,9 @@ def _submit_about_you_via_page(
 
     name_candidates = [
         page.get_by_label(re.compile(r"full\s*name", re.IGNORECASE)),
-        page.get_by_label(re.compile(r"全名|姓名", re.IGNORECASE)),
+        page.get_by_label(re.compile(r"全名|姓名|氏名", re.IGNORECASE)),
         page.get_by_role("textbox", name=re.compile(r"full\s*name|name", re.IGNORECASE)),
-        page.get_by_role("textbox", name=re.compile(r"全名|姓名", re.IGNORECASE)),
+        page.get_by_role("textbox", name=re.compile(r"全名|姓名|氏名", re.IGNORECASE)),
         page.locator("input[autocomplete='name']"),
         page.locator("input[name*='name' i]"),
         page.locator("input[id*='name' i]"),
@@ -3883,7 +3953,6 @@ def _submit_about_you_via_page(
         page.locator("input[placeholder*='年']"),
         page.locator("input[placeholder*='月']"),
         page.locator("input[placeholder*='日']"),
-        page.locator("input[inputmode='numeric']"),
         page.locator(
             "xpath=//*[contains(translate(normalize-space(string(.)),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'birthday')]/following::input[1]"
         ),
@@ -3901,17 +3970,17 @@ def _submit_about_you_via_page(
 
     age_candidates = [
         page.get_by_label(re.compile(r"age|umur|usia", re.IGNORECASE)),
-        page.get_by_label(re.compile(r"年龄", re.IGNORECASE)),
+        page.get_by_label(re.compile(r"年龄|年齢", re.IGNORECASE)),
         page.get_by_role("textbox", name=re.compile(r"age|umur|usia", re.IGNORECASE)),
-        page.get_by_role("textbox", name=re.compile(r"年龄", re.IGNORECASE)),
+        page.get_by_role("textbox", name=re.compile(r"年龄|年齢", re.IGNORECASE)),
         page.locator("input[name*='age' i]"),
         page.locator("input[id*='age' i]"),
         page.locator("input[placeholder*='Age' i]"),
-        page.locator("input[placeholder*='年龄']"),
+        page.locator("input[placeholder*='年龄'], input[placeholder*='年齢']"),
         page.locator(
             "xpath=//*[contains(translate(normalize-space(string(.)),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'age')]/following::input[1]"
         ),
-        page.locator("xpath=//*[contains(normalize-space(string(.)),'年龄')]/following::input[1]"),
+        page.locator("xpath=//*[contains(normalize-space(string(.)),'年龄') or contains(normalize-space(string(.)),'年齢')]/following::input[1]"),
     ]
 
     fill_result = {"name": False, "birthdate": False, "age": False, "month": False, "day": False, "year": False}
@@ -3937,7 +4006,7 @@ def _submit_about_you_via_page(
                 .map((n) => String(n.textContent || '').trim().toLowerCase())
                 .filter(Boolean);
               const allText = labels.concat(placeholders).concat(headings);
-              const hasAge = allText.some((t) => t === 'age' || t === 'edad' || t === 'âge' || t === 'alter' || t === 'idade' || t === 'umur' || t === 'usia' || t.includes('how old') || t.includes('年龄') || t.includes('나이'));
+              const hasAge = allText.some((t) => t === 'age' || t === 'edad' || t === 'âge' || t === 'alter' || t === 'idade' || t === 'umur' || t === 'usia' || t.includes('how old') || t.includes('年龄') || t.includes('年齢') || t.includes('나이'));
               const hasBirthday = allText.some((t) =>
                 t.includes('birthday') || t.includes('date of birth') || t.includes('birth') || t.includes('生日') || t.includes('出生') || t.includes('fecha de nacimiento') || t.includes('nascimento') || t.includes('geburtstag') || t.includes('naissance')
               );
@@ -4406,52 +4475,16 @@ def _browser_registration_flow(
 
     _seed_browser_device_id(page, device_id)
     requested_state = dict(initial_state or {})
-    requested_page_type = str(requested_state.get("page_type") or "").strip()
     profile_data = requested_state.get("profile")
     if not isinstance(profile_data, dict):
         profile_data = {}
     profile_name = str(profile_data.get("name") or "").strip()
     profile_birthdate = str(profile_data.get("birthdate") or "").strip()
-    if requested_page_type:
-        target_url = _normalize_url(
-            str(
-                requested_state.get("current_url")
-                or requested_state.get("continue_url")
-                or (
-                    f"{OPENAI_AUTH}/about-you"
-                    if requested_page_type == "about_you"
-                    else ""
-                )
-                or ""
-            ),
-            OPENAI_AUTH,
-        )
-        if target_url:
-            try:
-                log(f"恢复协议注册页面: {target_url[:140]}")
-                page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
-            except Exception as exc:
-                log(f"恢复协议注册页面失败: {exc}")
-        state = _derive_registration_state_from_page(page)
-        if not state.get("page_type"):
-            state = requested_state
-        elif requested_page_type == "about_you" and state.get("page_type") in {
-            "login_password",
-            "create_account_password",
-        }:
-            # The protocol cookies may have expired before the worker started.
-            # Only in that case restart from the browser signup entry.
-            log("协议 Cookie 无法恢复 about_you，回退完整浏览器注册入口")
-            state = {}
-    else:
-        state = {}
-
-    if not state.get("page_type"):
-        try:
-            state = _start_browser_signup_via_page(page, email, log)
-        except Exception as exc:
-            log(f"页面驱动注册入口失败，回退 ChatGPT authorize 入口: {exc}")
-            state = _start_browser_signup_via_authorize(page, email, device_id, log)
+    try:
+        state = _start_browser_signup_via_authorize(page, email, device_id, log)
+    except Exception as exc:
+        log(f"ChatGPT authorize 注册入口失败，尝试 OpenAI 页面入口: {exc}")
+        state = _start_browser_signup_via_page(page, email, log)
     auth_cookies = _get_cookies(page)
     log(
         "授权态 cookies: "
@@ -4459,14 +4492,8 @@ def _browser_registration_flow(
         f"oai-did={'yes' if auth_cookies.get('oai-did') else 'no'}"
     )
     log(f"注册状态起点: page={state.get('page_type') or '-'} url={(state.get('current_url') or '')[:100]}")
-    register_submitted = requested_page_type in {
-        "email_otp_verification",
-        "about_you",
-        "add_phone",
-        "consent",
-        "oauth_callback",
-    }
-    browser_otp_sent = requested_page_type == "email_otp_verification"
+    register_submitted = False
+    browser_otp_sent = False
     seen_states: dict[str, int] = {}
 
     for step in range(12):
@@ -4511,18 +4538,10 @@ def _browser_registration_flow(
             continue
 
         if str(state.get("page_type") or "") == "login_password":
-            if _recover_signup_password_page(page, log):
-                state = _derive_registration_state_from_page(page)
-                continue
-            log("注册流程落到已有账号登录密码页，按登录流程继续认证...")
-            login_resp = _submit_oauth_password_direct(page, password, log)
-            log(f"登录密码页提交状态: {login_resp.get('status', 0)}")
-            if not login_resp.get("ok"):
-                raise RuntimeError(f"登录密码页提交失败: {(login_resp.get('text') or '')[:300]}")
-            state = _extract_flow_state(login_resp.get("data"), login_resp.get("url", page.url))
-            if not state.get("page_type"):
-                state = _derive_registration_state_from_page(page)
-            continue
+            raise RuntimeError(
+                "user_already_exists: browser registration reached login_password; "
+                "use explicit existing-account capture instead of replaying signup"
+            )
 
         if _is_email_otp(state):
             if not otp_callback:
@@ -4720,6 +4739,7 @@ class ChatGPTBrowserRegister:
                 result = _do_codex_oauth(
                     page, {}, email, password,
                     self.otp_callback, self.phone_callback, self.proxy, self.log,
+                    strict_browser=True,
                 )
                 return result
         except Exception as e:
@@ -4747,7 +4767,10 @@ def run_browser_oauth_token_recovery_sync(
     killable process and proxy/GeoIP setup as the registration stage.
     """
     logger = log_fn or (lambda _message: None)
-    effective_headless, headless_reason = resolve_browser_headless(headless)
+    effective_headless, headless_reason = resolve_browser_headless(
+        headless,
+        override_env_names=(),
+    )
     ensure_browser_display_available(effective_headless)
     logger(
         "浏览器 OAuth Token recovery 启动: "
@@ -4783,6 +4806,7 @@ def run_browser_oauth_token_recovery_sync(
             None,
             proxy,
             logger,
+            strict_browser=True,
         )
         if not isinstance(result, dict):
             raise RuntimeError("browser_oauth_token_recovery_empty_result")
@@ -4812,10 +4836,13 @@ def run_browser_registration_stage_sync(
     """Complete only signup in one Camoufox context and return scoped cookies."""
 
     logger = log_fn or (lambda _message: None)
-    effective_headless, headless_reason = resolve_browser_headless(headless)
+    effective_headless, headless_reason = resolve_browser_headless(
+        headless,
+        override_env_names=(),
+    )
     ensure_browser_display_available(effective_headless)
     logger(
-        "浏览器注册后备链路启动: "
+        "浏览器注册链路启动: "
         f"mode={'headless' if effective_headless else 'headed'} ({headless_reason})"
     )
 
@@ -4836,8 +4863,8 @@ def run_browser_registration_stage_sync(
         page.set_default_navigation_timeout(45000)
         imported_cookies = _import_browser_context_cookies(page, cookies, logger)
         if cookies:
-            logger(f"浏览器注册后备链路导入协议 Cookie: {imported_cookies}/{len(cookies)}")
-        logger("浏览器注册后备链路已进入同一上下文状态机")
+            logger(f"浏览器注册链路导入显式 Cookie: {imported_cookies}/{len(cookies)}")
+        logger("浏览器注册链路已进入独立上下文状态机")
         final_state = _browser_registration_flow(
             page,
             email,
@@ -4858,7 +4885,9 @@ def run_browser_registration_stage_sync(
             user_agent = str(page.evaluate("() => navigator.userAgent") or "")
         except Exception:
             user_agent = ""
+        session_data = _wait_for_web_session(page, timeout=30)
         cookies = list(page.context.cookies())
+        web_session = _normalize_browser_web_session(session_data, cookies)
         cookie_names = sorted(
             {
                 str(cookie.get("name") or "")
@@ -4867,9 +4896,10 @@ def run_browser_registration_stage_sync(
             }
         )
         logger(
-            "浏览器注册后备链路完成: "
+            "浏览器注册链路完成: "
             f"page={final_state.get('page_type') or '-'} "
-            f"cookies={','.join(cookie_names)}"
+            f"cookies={','.join(cookie_names)} "
+            f"web_at={'yes' if web_session.get('access_token') else 'no'}"
         )
         return {
             "final_state": final_state,
@@ -4878,4 +4908,8 @@ def run_browser_registration_stage_sync(
             "cookie_names": cookie_names,
             "device_id": str(device_id or ""),
             "user_agent": user_agent,
+            "web_session": web_session,
+            "requested_executor": "headless" if headless else "headed",
+            "effective_executor": "headless" if effective_headless else "headed",
+            "headless_reason": headless_reason,
         }

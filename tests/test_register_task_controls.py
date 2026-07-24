@@ -28,7 +28,7 @@ from api.tasks import (
 )
 from core.db import AccountModel, PaymentLinkGenerationModel
 from core.base_mailbox import BaseMailbox, MailboxAccount
-from core.base_platform import Account, BasePlatform
+from core.base_platform import Account, AccountStatus, BasePlatform
 from core import db as core_db
 
 
@@ -197,6 +197,98 @@ class _FakeChatGPTProxyFingerprintPlatform(BasePlatform):
 
     def check_valid(self, account: Account) -> bool:
         return True
+
+
+class _FakeChatGPTBrowserRuntimeProfilePlatform(BasePlatform):
+    name = "chatgpt"
+    display_name = "ChatGPT"
+    seen: list[dict] = []
+    runtime_profile = {
+        "browser_family": "camoufox",
+        "device_id": "camoufox-runtime-device",
+        "user_agent": "Mozilla/5.0 Firefox/135.0",
+        "requested_executor": "headless",
+        "effective_executor": "headless",
+        "headless_reason": "requested:true",
+    }
+
+    def __init__(self, config=None, mailbox=None):
+        super().__init__(config)
+        self.mailbox = mailbox
+
+    def register(self, email: str, password: str = None) -> Account:
+        extra = dict(getattr(self.config, "extra", None) or {})
+        type(self).seen.append(
+            {
+                "executor_type": getattr(self.config, "executor_type", ""),
+                "seed_fingerprint": dict(extra.get("chatgpt_browser_fingerprint") or {}),
+                "seed_signature": str(
+                    extra.get("chatgpt_browser_fingerprint_signature") or ""
+                ),
+            }
+        )
+        runtime_profile = dict(type(self).runtime_profile)
+        return Account(
+            platform="chatgpt",
+            email="browser-runtime@example.com",
+            password=password or "pw",
+            token="at-browser-runtime",
+            extra={
+                "chatgpt_browser_runtime_profile": runtime_profile,
+                "chatgpt_registration_context": {
+                    "requested_executor": "headless",
+                    "effective_executor": "headless",
+                    "registration_transport": "camoufox_browser",
+                    "browser_runtime_profile": dict(runtime_profile),
+                },
+            },
+        )
+
+    def check_valid(self, account: Account) -> bool:
+        return True
+
+
+class _FakeChatGPTAuthPendingPlatform(BasePlatform):
+    name = "chatgpt"
+    display_name = "ChatGPT"
+
+    def __init__(self, config=None, mailbox=None):
+        super().__init__(config)
+        self.mailbox = mailbox
+
+    def register(self, email: str, password: str = None) -> Account:
+        return Account(
+            platform="chatgpt",
+            email="pending@example.com",
+            password=password or "pw",
+            token="",
+            status=AccountStatus.PENDING_PAYMENT,
+            extra={
+                "access_token": "",
+                "refresh_token": "",
+                "registered_auth_pending": True,
+                "needs_auth_capture": True,
+                "registration_full_auth_failed": True,
+                "registration_full_auth_error": "browser web session missing",
+                "requested_executor_type": "headless",
+                "effective_executor_type": "headless",
+                "chatgpt_registration_transport": "camoufox_browser",
+                "chatgpt_mailbox_state": {
+                    "provider": "icloud_hme",
+                    "email": "pending@example.com",
+                    "account": {
+                        "account_id": "alias-pending",
+                        "extra": {
+                            "anonymous_id": "anon-pending",
+                            "hme": "pending@example.com",
+                        },
+                    },
+                },
+            },
+        )
+
+    def check_valid(self, account: Account) -> bool:
+        return False
 
 
 class EmailApiRegisterRequestTests(unittest.TestCase):
@@ -609,6 +701,118 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
         unique_meta = dict((snapshot.get("meta") or {}).get("register_unique_exit_ip") or {})
         self.assertEqual(unique_meta.get("assigned_count"), 2)
         self.assertGreaterEqual(int(unique_meta.get("collision_count") or 0), 1)
+
+    def test_browser_executor_uses_attempt_seed_without_persisting_protocol_fingerprint(self):
+        task_id = "task-register-browser-runtime-profile"
+        req = RegisterTaskRequest(
+            platform="chatgpt",
+            count=1,
+            concurrency=1,
+            executor_type="headless",
+            proxy_mode="direct",
+            extra={"mail_provider": "fake"},
+        )
+        _create_task_record(task_id, req, "manual", None)
+        _FakeChatGPTBrowserRuntimeProfilePlatform.seen = []
+        saved_accounts = []
+
+        def fake_save_account(account):
+            saved_accounts.append(account)
+            return account
+
+        with (
+            patch(
+                "services.chatgpt_core.ChatGPTPlatform",
+                _FakeChatGPTBrowserRuntimeProfilePlatform,
+            ),
+            patch("core.base_mailbox.create_mailbox", return_value=_FakeMailbox()),
+            patch("core.db.save_account", side_effect=fake_save_account),
+            patch("api.tasks._auto_upload_integrations"),
+            patch("api.tasks._save_task_log"),
+        ):
+            _run_register(task_id, req)
+
+        snapshot = _task_store.snapshot(task_id)
+        self.assertEqual(snapshot["status"], "done")
+        self.assertEqual(snapshot["success"], 1)
+        self.assertEqual(len(_FakeChatGPTBrowserRuntimeProfilePlatform.seen), 1)
+        seen = _FakeChatGPTBrowserRuntimeProfilePlatform.seen[0]
+        seed = seen["seed_fingerprint"]
+        self.assertEqual(seen["executor_type"], "headless")
+        self.assertTrue(seed.get("device_id"))
+        self.assertIn("Chrome/", seed.get("user_agent", ""))
+        self.assertTrue(str(seed.get("impersonate") or "").startswith("chrome"))
+        self.assertTrue(seen["seed_signature"])
+
+        self.assertEqual(len(saved_accounts), 1)
+        saved_extra = dict(saved_accounts[0].extra or {})
+        self.assertNotEqual(
+            seed["device_id"],
+            _FakeChatGPTBrowserRuntimeProfilePlatform.runtime_profile["device_id"],
+        )
+        self.assertNotIn("chatgpt_browser_fingerprint", saved_extra)
+        self.assertNotIn("chatgpt_browser_fingerprint_signature", saved_extra)
+        self.assertEqual(
+            saved_extra["chatgpt_browser_runtime_profile"],
+            _FakeChatGPTBrowserRuntimeProfilePlatform.runtime_profile,
+        )
+        self.assertEqual(
+            saved_extra["chatgpt_registration_context"]["browser_runtime_profile"],
+            _FakeChatGPTBrowserRuntimeProfilePlatform.runtime_profile,
+        )
+
+    def test_registered_auth_pending_is_saved_once_without_probe_or_upload(self):
+        task_id = "task-register-auth-pending"
+        req = RegisterTaskRequest(
+            platform="chatgpt",
+            count=1,
+            concurrency=1,
+            executor_type="headless",
+            proxy_mode="direct",
+            extra={"mail_provider": "fake"},
+        )
+        _create_task_record(task_id, req, "manual", None)
+        saved_accounts = []
+
+        def fake_save_account(account):
+            account.id = 91
+            saved_accounts.append(account)
+            return account
+
+        with (
+            patch("services.chatgpt_core.ChatGPTPlatform", _FakeChatGPTAuthPendingPlatform),
+            patch("core.base_mailbox.create_mailbox", return_value=_FakeMailbox()),
+            patch("core.db.save_account", side_effect=fake_save_account),
+            patch("api.tasks._auto_upload_integrations") as auto_upload,
+            patch(
+                "api.tasks.schedule_chatgpt_local_status_refresh_for_account_id"
+            ) as schedule_refresh,
+            patch("core.db.sync_icloud_hme_rerun_result") as sync_hme,
+            patch("api.tasks._save_task_log") as save_task_log,
+        ):
+            _run_register(task_id, req)
+
+        snapshot = _task_store.snapshot(task_id)
+        self.assertEqual(snapshot["status"], "done")
+        self.assertEqual(snapshot["success"], 1)
+        self.assertEqual(len(saved_accounts), 1)
+        self.assertEqual(saved_accounts[0].token, "")
+        self.assertTrue(saved_accounts[0].extra["registered_auth_pending"])
+        self.assertEqual(snapshot["meta"]["auth_pending_count"], 1)
+        self.assertEqual(
+            snapshot["meta"]["auth_pending_accounts"][0]["email"],
+            "pending@example.com",
+        )
+        self.assertTrue(any("[PENDING]" in line for line in snapshot["logs"]))
+        auto_upload.assert_not_called()
+        schedule_refresh.assert_not_called()
+        sync_hme.assert_called_once()
+        self.assertFalse(sync_hme.call_args.kwargs["access_token_saved"])
+        self.assertEqual(
+            sync_hme.call_args.kwargs["result_code"],
+            "registered_auth_pending",
+        )
+        self.assertIn("registered_auth_pending", str(save_task_log.call_args_list))
 
     def test_effective_register_extra_uses_access_token_checkout_defaults(self):
         req = RegisterTaskRequest(

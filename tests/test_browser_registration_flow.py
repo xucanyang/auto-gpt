@@ -1,4 +1,5 @@
 import unittest
+import types
 from unittest import mock
 
 try:
@@ -14,7 +15,6 @@ from services.chatgpt_core.sentinel_browser import (
     BrowserOAuthTokenRecoveryResult,
     BrowserRegistrationStageResult,
 )
-from services.chatgpt_core.utils import FlowState
 
 
 class _FakeLocator:
@@ -106,6 +106,97 @@ class _FakePage:
     def remove_listener(self, _event, listener):
         if self.listener is listener:
             self.listener = None
+
+
+class _AboutYouInputLocator:
+    def __init__(self, *, visible=True):
+        self.visible = visible
+        self.value = ""
+        self.first = self
+
+    def count(self):
+        return 1 if self.visible else 0
+
+    def wait_for(self, **_kwargs):
+        if not self.visible:
+            raise TimeoutError("not visible")
+
+    def click(self, **_kwargs):
+        if not self.visible:
+            raise TimeoutError("not visible")
+
+    def evaluate(self, _script, value):
+        self.value = str(value)
+        return True
+
+    def dispatch_event(self, _event):
+        return None
+
+    def fill(self, value):
+        self.value = str(value)
+
+    def type(self, value, **_kwargs):
+        self.value += str(value)
+
+    def input_value(self):
+        return self.value
+
+
+class _AboutYouInputCollection:
+    def __init__(self, inputs):
+        self.inputs = list(inputs)
+        self.first = self.inputs[0] if self.inputs else _AboutYouInputLocator(visible=False)
+
+    def count(self):
+        return len(self.inputs)
+
+    def nth(self, index):
+        return self.inputs[index]
+
+
+class _JapaneseAgePage:
+    url = "https://auth.openai.com/about-you"
+
+    def __init__(self):
+        self.name_input = _AboutYouInputLocator()
+        self.age_input = _AboutYouInputLocator()
+        self.empty = _AboutYouInputLocator(visible=False)
+        self.visible_inputs = _AboutYouInputCollection([self.name_input, self.age_input])
+        self.keyboard = mock.Mock()
+
+    @staticmethod
+    def _pattern_text(value):
+        return str(getattr(value, "pattern", value) or "")
+
+    def locator(self, selector):
+        if selector == "input:visible:not([type='hidden']):not([disabled]):not([readonly])":
+            return self.visible_inputs
+        if selector == "input[inputmode='numeric']":
+            return self.age_input
+        return self.empty
+
+    def get_by_label(self, pattern):
+        return self.age_input if "年齢" in self._pattern_text(pattern) else self.empty
+
+    def get_by_role(self, _role, **kwargs):
+        return self.age_input if "年齢" in self._pattern_text(kwargs.get("name")) else self.empty
+
+    def get_by_placeholder(self, pattern):
+        return self.age_input if "年齢" in self._pattern_text(pattern) else self.empty
+
+    def evaluate(self, script):
+        source = str(script or "")
+        recognizes_japanese_age = "年齢" in source or "\\u5e74\\u9f62" in source.lower()
+        return {
+            "labels": ["full name", "年齢"],
+            "placeholders": [],
+            "headings": [],
+            "hasAge": recognizes_japanese_age,
+            "hasBirthday": False,
+        }
+
+    def on(self, _event, _listener):
+        return None
 
 
 class BrowserRegistrationFlowTests(unittest.TestCase):
@@ -223,6 +314,97 @@ class BrowserRegistrationFlowTests(unittest.TestCase):
             "oauth_email_otp",
         )
 
+    def test_strict_browser_oauth_never_uses_cookie_to_curl_fallback(self):
+        page = mock.Mock()
+        page.url = "https://auth.openai.com/sign-in-with-chatgpt/codex/consent"
+        page.evaluate.return_value = "Mozilla/5.0 Camoufox"
+        oauth_start = types.SimpleNamespace(
+            auth_url="https://auth.openai.com/oauth/authorize?state=state-demo",
+            state="state-demo",
+            code_verifier="verifier-demo",
+            redirect_uri="http://localhost:1455/auth/callback",
+            client_id="client-demo",
+        )
+
+        with (
+            mock.patch(
+                "services.chatgpt_core.oauth.generate_oauth_url",
+                return_value=oauth_start,
+            ),
+            mock.patch.object(
+                br,
+                "_derive_oauth_state_from_page",
+                return_value={
+                    "page_type": "consent",
+                    "continue_url": page.url,
+                    "current_url": page.url,
+                },
+            ),
+            mock.patch.object(br, "_complete_oauth_in_browser", return_value=None),
+            mock.patch.object(
+                br,
+                "_complete_oauth_with_session",
+                side_effect=AssertionError("strict browser OAuth used curl fallback"),
+            ) as curl_fallback,
+        ):
+            result = br._do_codex_oauth(
+                page,
+                {"oai-did": "device-demo"},
+                "buyer@example.com",
+                "Password123!",
+                lambda *_args, **_kwargs: "123456",
+                None,
+                None,
+                lambda _message: None,
+                strict_browser=True,
+            )
+
+        self.assertIsNone(result)
+        curl_fallback.assert_not_called()
+
+    def test_japanese_age_label_is_classified_as_age(self):
+        entries = [
+            {"visibleIndex": 0, "labels": ["Full name"]},
+            {"visibleIndex": 1, "labels": ["年齢"]},
+            {"visibleIndex": 2, "labels": ["紹介コード"]},
+        ]
+
+        selected = br._pick_best_about_you_input(entries, "age")
+
+        self.assertIs(selected, entries[1])
+
+    def test_japanese_age_input_receives_age_instead_of_birthdate(self):
+        page = _JapaneseAgePage()
+        logs = []
+        visible_inputs = [
+            {"visibleIndex": 0, "labels": ["Full name"]},
+            {"visibleIndex": 1, "labels": ["年齢"]},
+        ]
+
+        with (
+            mock.patch.object(br, "_collect_visible_text_inputs", return_value=visible_inputs),
+            mock.patch.object(br, "_browser_pause"),
+            mock.patch.object(br, "_sync_hidden_birthday_input", return_value=True),
+            mock.patch.object(br, "_click_first", return_value='button[type="submit"]'),
+            mock.patch.object(
+                br,
+                "_derive_registration_state_from_page",
+                return_value={"page_type": "oauth_callback"},
+            ),
+        ):
+            result = br._submit_about_you_via_page(
+                page,
+                logs.append,
+                profile_name="Demo User",
+                profile_birthdate="1990-01-02",
+            )
+
+        expected_age = str(max(25, min(40, int(br.time.strftime("%Y")) - 1990)))
+        self.assertTrue(result["ok"])
+        self.assertEqual(page.age_input.value, expected_age)
+        self.assertNotIn("1990", page.age_input.value)
+        self.assertTrue(any("页面模式: age" in line for line in logs))
+
     def test_email_adapter_excludes_codes_used_by_protocol_phase(self):
         service = mock.Mock()
         service.get_verification_code.return_value = "654321"
@@ -275,19 +457,13 @@ class BrowserRegistrationFlowTests(unittest.TestCase):
         budget.plan_wait.assert_not_called()
         self.assertEqual(service.get_verification_code.call_args.kwargs["timeout"], 120)
 
-    def test_browser_fallback_carries_about_you_state_cookies_and_otp_context(self):
+    def test_browser_direct_starts_without_protocol_state_or_cookies(self):
         email_service = mock.Mock()
         email_service.get_verification_code.return_value = "654321"
         adapter = EmailServiceAdapter(email_service, "buyer@example.com", lambda _message: None)
         adapter._used_codes_by_phase["register_email_otp"] = {"123456"}
         client = mock.Mock()
         client.device_id = "device-demo"
-        client.session = mock.Mock()
-        client.last_registration_state = FlowState(
-            page_type="about_you",
-            current_url="https://auth.openai.com/about-you",
-            continue_url="https://auth.openai.com/about-you",
-        )
         client._check_stop = mock.Mock()
         stage_result = BrowserRegistrationStageResult(
             final_state={
@@ -296,40 +472,50 @@ class BrowserRegistrationFlowTests(unittest.TestCase):
             },
             page_url="https://chatgpt.com/api/auth/callback/openai?code=demo",
             cookies=[{"name": "login_session", "value": "demo", "domain": "auth.openai.com", "path": "/"}],
+            device_id="device-demo",
+            user_agent="Mozilla/5.0 Camoufox",
+            requested_executor="headless",
+            effective_executor="headless",
+            web_session={"access_token": "at-demo"},
         )
-        engine = AccessTokenOnlyRegistrationEngine(email_service, max_retries=1)
+        engine = AccessTokenOnlyRegistrationEngine(
+            email_service,
+            browser_mode="headless",
+            max_retries=1,
+        )
 
-        with (
-            mock.patch(
-                "services.chatgpt_core.access_token_only_registration_engine.export_session_cookies_for_playwright",
-                return_value=[{"name": "login_session", "value": "protocol", "domain": "auth.openai.com", "path": "/"}],
-            ),
-            mock.patch(
-                "services.chatgpt_core.access_token_only_registration_engine.run_browser_registration_stage",
-                return_value=stage_result,
-            ) as run_stage,
-            mock.patch(
-                "services.chatgpt_core.access_token_only_registration_engine.merge_playwright_cookies_into_session",
-                return_value=1,
-            ),
-        ):
-            ok, _message = engine._run_browser_registration_fallback(
+        with mock.patch(
+            "services.chatgpt_core.access_token_only_registration_engine.run_browser_registration_stage",
+            return_value=stage_result,
+        ) as run_stage:
+            result = engine._run_browser_registration(
                 chatgpt_client=client,
                 email_addr="buyer@example.com",
                 password="Password123!",
                 skymail_adapter=adapter,
                 otp_wait_timeout=30,
                 otp_account_budget_timeout=60,
+                profile_name="Buyer Example",
+                profile_birthdate="1990-01-01",
             )
 
-        self.assertTrue(ok)
+        self.assertTrue(result.ok)
         kwargs = run_stage.call_args.kwargs
-        self.assertEqual(kwargs["initial_state"]["page_type"], "about_you")
-        self.assertEqual(kwargs["cookies"][0]["value"], "protocol")
+        self.assertNotIn("page_type", kwargs["initial_state"])
+        self.assertEqual(
+            kwargs["initial_state"]["profile"],
+            {"name": "Buyer Example", "birthdate": "1990-01-01"},
+        )
+        self.assertEqual(kwargs["cookies"], [])
         callback_result = kwargs["otp_callback"]({"otp_sent_at": 123.0})
         self.assertEqual(callback_result["code"], "654321")
         self.assertEqual(callback_result["otp_sent_at"], 123.0)
         self.assertIn("123456", email_service.get_verification_code.call_args.kwargs["exclude_codes"])
+        self.assertEqual(client.registration_transport, "camoufox_browser")
+        self.assertEqual(
+            client.registration_runtime_profile["user_agent"],
+            "Mozilla/5.0 Camoufox",
+        )
 
     def test_post_browser_add_phone_uses_isolated_oauth_recovery(self):
         email_service = mock.Mock()
@@ -343,11 +529,9 @@ class BrowserRegistrationFlowTests(unittest.TestCase):
         client.impersonate = "chrome145"
         client.fingerprint = None
         client._check_stop = mock.Mock()
-        oauth_client = mock.Mock()
-        oauth_client.login_and_get_tokens.return_value = None
-        oauth_client.last_error = (
-            "passwordless 登录后仍停留在 add_phone，未获取到 workspace / callback"
-        )
+        client.registration_stage_transports = []
+        client.registration_runtime_profile = {}
+        client.registration_transport = "camoufox_browser"
         browser_tokens = BrowserOAuthTokenRecoveryResult(
             tokens={
                 "access_token": "at-demo",
@@ -355,29 +539,31 @@ class BrowserRegistrationFlowTests(unittest.TestCase):
                 "id_token": "id-demo",
             }
         )
-        engine = AccessTokenOnlyRegistrationEngine(email_service, max_retries=1)
+        engine = AccessTokenOnlyRegistrationEngine(
+            email_service,
+            browser_mode="headless",
+            max_retries=1,
+        )
 
         with (
             mock.patch(
                 "services.chatgpt_core.oauth_client.OAuthClient",
-                return_value=oauth_client,
-            ),
+                side_effect=AssertionError("browser executor must not use HTTP OAuthClient"),
+            ) as oauth_class,
             mock.patch(
                 "services.chatgpt_core.access_token_only_registration_engine.run_browser_oauth_token_recovery",
                 return_value=browser_tokens,
             ) as browser_recovery,
         ):
-            ok, result = engine._recover_tokens_after_browser_registration(
+            ok, result = engine._capture_browser_oauth_tokens(
                 chatgpt_client=client,
                 email_addr="buyer@example.com",
                 password="Password123!",
-                first_name="Buyer",
-                last_name="Example",
-                birthdate="1990-01-01",
                 skymail_adapter=adapter,
             )
 
         self.assertTrue(ok)
+        oauth_class.assert_not_called()
         self.assertEqual(result["access_token"], "at-demo")
         browser_kwargs = browser_recovery.call_args.kwargs
         self.assertEqual(browser_kwargs["device_id"], "device-demo")
@@ -388,44 +574,33 @@ class BrowserRegistrationFlowTests(unittest.TestCase):
             email_service.get_verification_code.call_args.kwargs["exclude_codes"],
         )
 
-    def test_disallowed_create_account_then_existing_response_keeps_account(self):
+    def test_protocol_executor_cannot_call_browser_registration_helper(self):
         email_service = mock.Mock()
         adapter = EmailServiceAdapter(email_service, "buyer@example.com", lambda _message: None)
         client = mock.Mock()
-        client.session = mock.Mock()
         client.device_id = "device-demo"
-        client.last_registration_state = FlowState(
-            page_type="about_you",
-            current_url="https://auth.openai.com/about-you",
-            continue_url="https://auth.openai.com/about-you",
-        )
-        client.registration_transport = "protocol"
         client._check_stop = mock.Mock()
-        stage_result = BrowserRegistrationStageResult(
-            error=(
-                "browser_registration_failed: RuntimeError: about_you 提交失败: "
-                "An account already exists for this email address."
-            )
+        engine = AccessTokenOnlyRegistrationEngine(
+            email_service,
+            browser_mode="protocol",
+            max_retries=1,
         )
-        engine = AccessTokenOnlyRegistrationEngine(email_service, max_retries=1)
 
         with mock.patch(
             "services.chatgpt_core.access_token_only_registration_engine.run_browser_registration_stage",
-            return_value=stage_result,
-        ):
-            ok, message = engine._run_browser_registration_fallback(
+        ) as browser_stage:
+            result = engine._run_browser_registration(
                 chatgpt_client=client,
                 email_addr="buyer@example.com",
                 password="Password123!",
                 skymail_adapter=adapter,
                 otp_wait_timeout=30,
                 otp_account_budget_timeout=60,
-                allow_existing_account_after_disallowed=True,
             )
 
-        self.assertTrue(ok)
-        self.assertIn("server-side account commit", message)
-        self.assertEqual(client.registration_transport, "camoufox_browser_fallback")
+        self.assertFalse(result.ok)
+        self.assertIn("forbidden", result.error)
+        browser_stage.assert_not_called()
 
 
 if __name__ == "__main__":

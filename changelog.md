@@ -6,6 +6,23 @@
 
 ## [Unreleased] (未发布)
 
+## [2.8.24] - 2026-07-25
+
+### 优化 (Changed)
+- **建立 ChatGPT 三执行器硬分派合同**：`services/chatgpt_core/access_token_only_registration_engine.py`、`chatgpt_client.py`、`oauth_client.py`、`browser_registration.py` 与 `sentinel_browser.py` 现在将 `protocol`、`headless`、`headed` 作为互斥执行器。纯协议注册只使用 `curl_cffi` 与 HTTP Sentinel PoW，Cloudflare、Sentinel 或协议状态机失败时原样失败；浏览器注册从第一步直接进入独立 Camoufox 上下文，不再先跑协议注册、回灌浏览器 Cookie 到 curl Session，或在失败后由另一执行器接管。显式无头/有头选择不会再被运行环境变量改写，未知执行器直接拒绝。
+- **统一浏览器注册与 RT 两阶段的 transport 所有权**：浏览器注册上下文在关闭前直接读取 `/api/auth/session` 并返回 Web AT、Session、Cookie 与账号身份；需要 RT 时，第二阶段继续使用严格 Camoufox OAuth，只保留标准 authorization-code exchange，不允许 curl OAuth 状态机接管。注册阶段遇到 `login_password` 只报告已有账号，必须显式使用“已有账号抓取”，不会从 signup 偷偷切换登录恢复。
+- **补齐执行器运行审计**：账号注册上下文与 `extra` 记录 requested/effective executor、registration transport、各阶段 transport 以及 Camoufox 实测 UA/device profile。浏览器账号不再被任务层预生成的 Chrome fingerprint 覆盖；协议账号继续保留稳定的账号级指纹与签名。
+- **统一前端任务级执行器选择**：`RegisterTaskPage.tsx` 与账号页 `RegisterTaskModal.tsx` 共享三项互斥说明，注册画像保存并恢复 `executor_type`，任务提交使用表单当次选择而非全局默认。异步加载配置时会检测字段是否已被用户触碰，避免响应返回后覆盖刚选择的执行器。
+
+### 修复 (Fixed)
+- **固定单次注册身份与本地化资料填写**：同一 account attempt 的整流程重试固定邮箱、密码、姓名、生日、device ID 与指纹种子，不再重试一次就换一套人物资料。Camoufox about-you 表单补齐日文 `氏名` / `年齢` 识别，年龄输入框填写实际年龄，不再误填完整生日字符串。
+- **安全保存“已注册但认证待补抓”账号**：浏览器已完成 signup 但暂未拿到 AT/RT 时，使用 `registered_auth_pending`、`needs_auth_capture` 和独立 auth level 落库，禁止重放同邮箱 signup，也不再伪造远端 account ID。RT adapter 会完成真实邮箱/HME finalize；任务快照、日志与 HME 重跑队列明确区分远端注册完成和认证可用，且不会把本地账号 ID 误判为已保存 AT。
+- **防止 pending 覆盖有效账号**：`core/db.py::save_account()` 在同邮箱已有有效认证材料时保留原密码、AT/RT/ID Token、真实 account/workspace、状态与指纹，只追加有界的 pending 审计事件，避免一次补抓失败清空现有可用账号。
+- **封死空认证材料的外部上传旁路**：`services/chatgpt_account_state.py` 新增 `blocked_missing_at`，Sub2API、OAIPay backfill 与低层上传器、CPA 直传 API 和平台 action 都在网络请求前执行中央 gate，并独立拒绝缺 AT/RT 的 payload；注册后的 pending 账号不会触发本地测活或自动上传。
+
+### 测试 (Tests)
+- 新增/扩展执行器、Browser Web Session、严格 browser OAuth、protocol fail-closed、RT transport 保持、retry 身份固定、日文年龄、实际执行器审计、pending 落库与 HME 状态、同邮箱有效凭据保护、Sub2API/OAIPay/CPA 零网络 gate、任务级指纹隔离及前端画像竞态合同。后端专项测试、含 Camoufox 的镜像测试、前端 Node 测试和生产构建均通过；侧栏版本同步更新为 `v2.8.24`。
+
 ## [2.8.23] - 2026-07-25
 
 ### 优化 (Changed)
@@ -2572,4 +2589,8 @@
 
 ## 2026-07-25 01:23:15 +0800
 - 同步 Team 账单国家至上游官方 Checkout 目录
+- 发布模式: multi
+
+## 2026-07-25 03:37:00 +0800
+- 修复 ChatGPT 注册三执行器串线并统一浏览器注册链路
 - 发布模式: multi

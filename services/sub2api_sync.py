@@ -9,7 +9,7 @@ from sqlmodel import Session
 from core.config_store import config_store
 from core.db import AccountModel
 from services.chatgpt_core.sub2api_upload import build_sub2api_lookup_payload, upload_to_sub2api_detailed
-from services.chatgpt_account_state import classify_chatgpt_capabilities
+from services.chatgpt_account_state import classify_chatgpt_capabilities, is_chatgpt_upload_ready
 from services.chatgpt_sync import build_chatgpt_sync_account
 
 SUB2API_SYNC_NAME = "sub2api"
@@ -406,6 +406,37 @@ def backfill_chatgpt_account_to_sub2api(
     results: list[dict[str, Any]] = []
     started_at = _utcnow_iso()
     cached_sync = get_sub2api_sync_state(account)
+    ready, gate_message, capabilities = is_chatgpt_upload_ready(account)
+    if not ready:
+        upload_state = _build_upload_failure_state(
+            gate_message,
+            started_at=started_at,
+            initial_sync=cached_sync,
+        )
+        upload_state["upload_gate"] = capabilities.get("upload_gate") or ""
+        upload_state["probe_source"] = _safe_str(cached_sync.get("probe_source")) or "upload_gate"
+        upload_state["last_upload"] = _last_upload(
+            "skipped",
+            "upload_gate",
+            gate_message,
+            started_at=started_at,
+            probe_before=cached_sync.get("remote_state") or "",
+            upload_gate=capabilities.get("upload_gate") or "",
+        )
+        update_account_model_sub2api_sync(account, upload_state, session=session, commit=False)
+        if session is not None and commit:
+            session.commit()
+            session.refresh(account)
+        results.append({"name": "Sub2API 上传", "ok": False, "msg": gate_message})
+        return {
+            "ok": False,
+            "uploaded": False,
+            "skipped": True,
+            "message": gate_message,
+            "results": results,
+            "capabilities": capabilities,
+        }
+
     sync_account = build_chatgpt_sync_account(account)
     try:
         upload_result = upload_to_sub2api_detailed(sync_account)

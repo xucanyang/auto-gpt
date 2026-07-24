@@ -64,16 +64,17 @@ class AccessTokenOnlyCheckoutTests(unittest.TestCase):
             engine._should_retry("browser_registration_unavailable: worker crashed")
         )
 
-    def test_registration_disallowed_uses_browser_stage_fallback(self):
+    def test_protocol_registration_never_falls_back_to_browser(self):
         email_service = mock.Mock()
         email_service.create_email.return_value = {"email": "buyer@example.com"}
         engine = AccessTokenOnlyRegistrationEngine(
             email_service=email_service,
             proxy_url="http://proxy.local:8080",
+            browser_mode="protocol",
             max_retries=1,
         )
 
-        class BrowserFallbackClient(self._FakeChatGPTClient):
+        class ProtocolClient(self._FakeChatGPTClient):
             def __init__(self, *args, **kwargs):
                 super().__init__(*args, **kwargs)
                 self.session = mock.Mock()
@@ -86,24 +87,6 @@ class AccessTokenOnlyCheckoutTests(unittest.TestCase):
             def register_complete_flow(self, *args, **kwargs):
                 return False, "创建账号失败: HTTP 400: registration_disallowed"
 
-        stage_result = BrowserRegistrationStageResult(
-            final_state={
-                "page_type": "oauth_callback",
-                "current_url": "https://chatgpt.com/api/auth/callback/openai?code=demo",
-                "method": "GET",
-            },
-            page_url="https://chatgpt.com/api/auth/callback/openai?code=demo",
-            cookies=[
-                {
-                    "name": "login_session",
-                    "value": "demo",
-                    "domain": "auth.openai.com",
-                    "path": "/",
-                }
-            ],
-            cookie_names=("login_session",),
-            device_id="device-demo",
-        )
         with (
             mock.patch.object(
                 engine, "_probe_homepage_before_email_creation", return_value=(True, "")
@@ -112,37 +95,274 @@ class AccessTokenOnlyCheckoutTests(unittest.TestCase):
             mock.patch.object(engine, "_probe_plus_checkout_billing", return_value={}),
             mock.patch(
                 "services.chatgpt_core.access_token_only_registration_engine.ChatGPTClient",
-                BrowserFallbackClient,
+                ProtocolClient,
             ),
             mock.patch(
                 "services.chatgpt_core.access_token_only_registration_engine.run_browser_registration_stage",
-                return_value=stage_result,
             ) as browser_stage,
             mock.patch(
-                "services.chatgpt_core.access_token_only_registration_engine.merge_playwright_cookies_into_session",
-                return_value=1,
+                "services.chatgpt_core.access_token_only_registration_engine.run_browser_oauth_token_recovery",
+            ) as browser_oauth,
+        ):
+            result = engine.run()
+
+        self.assertFalse(result.success)
+        self.assertIn("registration_disallowed", result.error_message)
+        browser_stage.assert_not_called()
+        browser_oauth.assert_not_called()
+
+    def test_browser_modes_start_with_browser_registration_and_preserve_headless_flag(self):
+        for browser_mode, expected_headless in (("headless", True), ("headed", False)):
+            with self.subTest(browser_mode=browser_mode):
+                email_service = mock.Mock()
+                email_service.create_email.return_value = {"email": "buyer@example.com"}
+                engine = AccessTokenOnlyRegistrationEngine(
+                    email_service=email_service,
+                    proxy_url="http://proxy.local:8080",
+                    browser_mode=browser_mode,
+                    max_retries=1,
+                )
+                client = mock.Mock(
+                    device_id="device-demo",
+                    ua="Mozilla/5.0",
+                    sec_ch_ua='"Chromium";v="145"',
+                    impersonate="chrome145",
+                    fingerprint=None,
+                    session=mock.Mock(),
+                    last_registration_state=None,
+                    registration_transport="protocol",
+                )
+                client.register_complete_flow.side_effect = AssertionError(
+                    "browser mode must not execute protocol registration"
+                )
+                client.reuse_session_and_get_tokens.side_effect = AssertionError(
+                    "browser mode must not reuse curl session"
+                )
+                stage_result = BrowserRegistrationStageResult(
+                    final_state={
+                        "page_type": "oauth_callback",
+                        "current_url": "https://chatgpt.com/api/auth/callback/openai?code=demo",
+                        "method": "GET",
+                    },
+                    page_url="https://chatgpt.com/api/auth/callback/openai?code=demo",
+                    cookies=[
+                        {
+                            "name": "login_session",
+                            "value": "demo",
+                            "domain": "auth.openai.com",
+                            "path": "/",
+                        }
+                    ],
+                    cookie_names=("login_session",),
+                    device_id="device-demo",
+                    user_agent="Mozilla/5.0 Camoufox",
+                    requested_executor=browser_mode,
+                    effective_executor=browser_mode,
+                    web_session={
+                        "access_token": "at-demo",
+                        "session_token": "session-demo",
+                        "account_id": "acct-demo",
+                        "workspace_id": "ws-demo",
+                    },
+                )
+
+                with (
+                    mock.patch.object(
+                        engine,
+                        "_probe_homepage_before_email_creation",
+                        return_value=(True, ""),
+                    ),
+                    mock.patch.object(engine, "_report_homepage_probe"),
+                    mock.patch.object(engine, "_build_chatgpt_client", return_value=client),
+                    mock.patch.object(engine, "_probe_plus_checkout_billing", return_value={}),
+                    mock.patch(
+                        "services.chatgpt_core.access_token_only_registration_engine.run_browser_registration_stage",
+                        return_value=stage_result,
+                    ) as browser_stage,
+                ):
+                    result = engine.run()
+
+                self.assertTrue(result.success, result.error_message)
+                client.register_complete_flow.assert_not_called()
+                client.reuse_session_and_get_tokens.assert_not_called()
+                browser_stage.assert_called_once()
+                self.assertIs(
+                    browser_stage.call_args.kwargs["headless"],
+                    expected_headless,
+                )
+
+    def test_browser_signup_existing_account_never_switches_to_login_recovery(self):
+        email_service = mock.Mock()
+        email_service.create_email.return_value = {"email": "existing@example.com"}
+        engine = AccessTokenOnlyRegistrationEngine(
+            email_service=email_service,
+            proxy_url="http://proxy.local:8080",
+            browser_mode="headless",
+            max_retries=1,
+        )
+        client = mock.Mock(
+            device_id="device-demo",
+            ua="Mozilla/5.0",
+            sec_ch_ua='"Chromium";v="145"',
+            impersonate="chrome145",
+            fingerprint=None,
+            last_registration_route_event=None,
+            registration_transport="camoufox_browser",
+            registration_stage_transports=[],
+        )
+        browser_stage = BrowserRegistrationStageResult(
+            error=(
+                "user_already_exists: browser registration reached login_password; "
+                "use explicit existing-account capture instead"
+            )
+        )
+
+        with (
+            mock.patch.object(engine, "_build_chatgpt_client", return_value=client),
+            mock.patch.object(
+                engine,
+                "_run_browser_registration",
+                return_value=browser_stage,
+            ),
+            mock.patch.object(engine, "_capture_browser_oauth_tokens") as browser_login,
+            mock.patch(
+                "services.chatgpt_core.oauth_client.OAuthClient",
+                side_effect=AssertionError("browser signup switched to protocol login"),
+            ) as protocol_login,
+        ):
+            result = engine.run()
+
+        self.assertFalse(result.success)
+        self.assertIn("不会自动切换登录恢复", result.error_message)
+        self.assertEqual(
+            result.metadata["chatgpt_existing_account_login_route"]["action"],
+            "explicit_existing_account_capture_required",
+        )
+        browser_login.assert_not_called()
+        protocol_login.assert_not_called()
+
+    def test_explicit_browser_existing_account_capture_uses_browser_oauth_only(self):
+        email_service = mock.Mock()
+        email_service.create_email.return_value = {"email": "existing@example.com"}
+        engine = AccessTokenOnlyRegistrationEngine(
+            email_service=email_service,
+            proxy_url="http://proxy.local:8080",
+            browser_mode="headed",
+            max_retries=1,
+            extra_config={"chatgpt_existing_account_capture": True},
+        )
+        client = mock.Mock(
+            device_id="device-demo",
+            ua="Mozilla/5.0",
+            sec_ch_ua='"Chromium";v="145"',
+            impersonate="chrome145",
+            fingerprint=None,
+            registration_transport="camoufox_browser_oauth",
+            registration_runtime_profile={
+                "browser_family": "camoufox",
+                "device_id": "device-demo",
+                "user_agent": "Mozilla/5.0 Camoufox",
+            },
+            registration_stage_transports=[],
+        )
+        browser_tokens = {
+            "access_token": "at-existing",
+            "refresh_token": "rt-existing",
+            "session_token": "session-existing",
+            "account_id": "acct-existing",
+            "workspace_id": "ws-existing",
+        }
+
+        with (
+            mock.patch.object(engine, "_build_chatgpt_client", return_value=client),
+            mock.patch.object(
+                engine,
+                "_capture_browser_oauth_tokens",
+                return_value=(True, browser_tokens),
+            ) as browser_login,
+            mock.patch.object(engine, "_probe_plus_checkout_billing", return_value={}),
+            mock.patch(
+                "services.chatgpt_core.oauth_client.OAuthClient",
+                side_effect=AssertionError("explicit browser capture used protocol OAuth"),
+            ) as protocol_login,
+        ):
+            result = engine.run()
+
+        self.assertTrue(result.success, result.error_message)
+        self.assertEqual(result.account_id, "acct-existing")
+        browser_login.assert_called_once()
+        protocol_login.assert_not_called()
+
+    def test_engine_retry_reuses_one_generated_profile(self):
+        email_service = mock.Mock()
+        email_service.create_email.return_value = {"email": "buyer@example.com"}
+        engine = AccessTokenOnlyRegistrationEngine(
+            email_service=email_service,
+            proxy_url="http://proxy.local:8080",
+            browser_mode="protocol",
+            max_retries=2,
+        )
+        client = mock.Mock(
+            device_id="device-demo",
+            ua="Mozilla/5.0",
+            sec_ch_ua='"Chromium";v="145"',
+            impersonate="chrome145",
+            fingerprint=None,
+            registration_transport="protocol",
+        )
+        client.register_complete_flow.side_effect = [
+            (False, "OTP transient failure"),
+            (True, "registration complete"),
+        ]
+        client.reuse_session_and_get_tokens.return_value = (
+            True,
+            {
+                "access_token": "at-demo",
+                "session_token": "session-demo",
+                "account_id": "acct-demo",
+                "workspace_id": "ws-demo",
+            },
+        )
+
+        with (
+            mock.patch.object(
+                engine, "_probe_homepage_before_email_creation", return_value=(True, "")
+            ),
+            mock.patch.object(engine, "_report_homepage_probe"),
+            mock.patch.object(engine, "_build_chatgpt_client", return_value=client),
+            mock.patch.object(engine, "_probe_plus_checkout_billing", return_value={}),
+            mock.patch(
+                "services.chatgpt_core.access_token_only_registration_engine.generate_random_name",
+                side_effect=[("Fixed", "Profile"), ("Changed", "Identity")],
+            ) as generate_name,
+            mock.patch(
+                "services.chatgpt_core.access_token_only_registration_engine.generate_random_birthday",
+                side_effect=["1990-01-02", "2001-03-04"],
+            ) as generate_birthday,
+            mock.patch(
+                "services.chatgpt_core.access_token_only_registration_engine.time.sleep"
             ),
         ):
             result = engine.run()
 
-        self.assertTrue(result.success)
-        browser_stage.assert_called_once()
+        self.assertTrue(result.success, result.error_message)
+        self.assertEqual(generate_name.call_count, 1)
+        self.assertEqual(generate_birthday.call_count, 1)
+        profiles = [call.args[2:5] for call in client.register_complete_flow.call_args_list]
         self.assertEqual(
-            result.metadata["registration_context"]["registration_transport"],
-            "camoufox_browser_fallback",
+            profiles,
+            [
+                ("Fixed", "Profile", "1990-01-02"),
+                ("Fixed", "Profile", "1990-01-02"),
+            ],
         )
 
-    def test_browser_registration_fallback_can_be_disabled(self):
-        engine = AccessTokenOnlyRegistrationEngine(
-            email_service=mock.Mock(),
-            extra_config={"chatgpt_browser_registration_fallback_enabled": False},
-        )
-
-        self.assertFalse(
-            engine._should_use_browser_registration_fallback(
-                "创建账号失败: HTTP 400: registration_disallowed"
+    def test_unknown_executor_is_rejected_instead_of_downgraded(self):
+        with self.assertRaisesRegex(ValueError, "unsupported ChatGPT executor"):
+            AccessTokenOnlyRegistrationEngine(
+                email_service=mock.Mock(),
+                browser_mode="automatic",
             )
-        )
 
     def test_v2_email_adapter_returns_none_on_mailbox_timeout_for_resend_path(self):
         email_service = mock.Mock()

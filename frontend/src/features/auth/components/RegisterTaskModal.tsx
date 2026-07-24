@@ -22,6 +22,7 @@ import {
   CHATGPT_REGISTRATION_MODE_REFRESH_TOKEN,
   type ChatGPTRegistrationMode,
 } from '@/lib/chatgptRegistrationMode'
+import { EXECUTOR_SELECTION_HELP, getExecutorOptions } from '@/lib/platformExecutorOptions'
 import { apiFetch } from '@/lib/utils'
 import { normalizeDomainList } from '@/lib/domainList'
 
@@ -282,6 +283,15 @@ export function RegisterTaskModal({
               />
             </Form.Item>
           ) : null}
+          <Form.Item
+            name="executor_type"
+            label="注册执行器"
+            initialValue="protocol"
+            rules={[{ required: true, message: '请选择注册执行器' }]}
+            extra={EXECUTOR_SELECTION_HELP}
+          >
+            <Select options={getExecutorOptions(currentPlatform)} />
+          </Form.Item>
           {currentPlatform === 'chatgpt' && isPhoneSignup ? (
             <>
               <Alert

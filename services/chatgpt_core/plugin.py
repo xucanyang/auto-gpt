@@ -195,7 +195,15 @@ class ChatGPTPlatform(BasePlatform):
                     proxy=proxy,
                 )
 
-            def _sync_hme_rerun_result(acct, *, success: bool, error_message: str = "", task_id: str = ""):
+            def _sync_hme_rerun_result(
+                acct,
+                *,
+                success: bool,
+                error_message: str = "",
+                task_id: str = "",
+                result_code: str = "",
+                access_token_saved: bool = False,
+            ):
                 if _mail_provider != "icloud_hme" or acct is None:
                     return
                 account_extra = dict(getattr(acct, "extra", None) or {})
@@ -213,6 +221,8 @@ class ChatGPTPlatform(BasePlatform):
                         task_id=str(task_id or _task_id or "").strip(),
                         success=bool(success),
                         error_message=str(error_message or ""),
+                        access_token_saved=bool(access_token_saved),
+                        result_code=str(result_code or ""),
                         mailbox_state=_export_mailbox_state_payload(acct, getattr(email_service, "_before_ids", set()) if "email_service" in locals() else set()),
                         delete_candidate=bool(not success and is_account_deactivated_message("", str(error_message or ""))),
                     )
@@ -340,7 +350,17 @@ class ChatGPTPlatform(BasePlatform):
                     # lease state.  Capture it after the mutation so account
                     # persistence never stores the pre-commit snapshot.
                     self._post_finalize_state = self.export_state()
-                    _sync_hme_rerun_result(self._acct, success=True, task_id=resolved_task_id)
+                    _sync_hme_rerun_result(
+                        self._acct,
+                        success=True,
+                        task_id=resolved_task_id,
+                        result_code=str(
+                            getattr(self, "_registration_result_code", "") or "login_alive"
+                        ),
+                        access_token_saved=bool(
+                            getattr(self, "_registration_access_token_saved", False)
+                        ),
+                    )
 
                 def finalize_failure(self, error_message: str = "", task_id: str = ""):
                     if not self._acct:
