@@ -6,6 +6,18 @@
 
 ## [Unreleased] (未发布)
 
+## [2.8.25] - 2026-07-25
+
+### 优化 (Changed)
+- **浏览器注册优先采用已验证的 OpenAI 页面入口**：`services/chatgpt_core/browser_registration.py` 现在与参考实现一致，先从 `platform.openai.com/login` 在同一 Camoufox 上下文推进邮箱与 passwordless OTP，页面入口不可用时才回退 ChatGPT authorize。一次性验证码入口只点击一次，后续仅观察状态，避免循环点击造成重复发码竞态；整个过程仍保持 `headless/headed` 浏览器 transport，不接入协议 Session。
+
+### 修复 (Fixed)
+- **修复随机弱密码导致注册页原地不动**：`services/chatgpt_core/plugin.py` 不再从混合字符池无约束抽取 16 位密码，改为使用 `secrets` 强制生成不少于 12 位且必含大写、小写、数字和符号的密码。该规则补齐了从 `/opt/any-auto-register` 移植浏览器流程时遗漏的 ChatGPT 专用密码合同，避免命中 `/create-account/password` 时因缺少字符类别被前端校验拦截。
+- **按真实注册响应推进密码阶段**：密码提交前监听同一浏览器上下文的 `/api/accounts/user/register` response 与 request failure；`2xx` 即使 SPA URL 未变化也按返回的 `page.type` 进入 OTP，`4xx` 保留服务端错误，不再统一等 20 秒后伪装成 `status=0`。页面状态识别改为可见 OTP/about-you 优先，不会再被 SPA 遗留的隐藏 password input 拉回密码阶段；浏览器原生 validity 与关联错误节点也会进入失败原因。
+
+### 测试 (Tests)
+- 扩展 `tests/test_chatgpt_plugin.py` 与 `tests/test_browser_registration_flow.py`，覆盖密码字符类别、显式密码保持、page-first/authorize fallback、passwordless 单次点击、隐藏密码 DOM、密码注册 `2xx` URL 不变及 `4xx` 错误传播。插件、Camoufox 浏览器流、注册模式、AT-only 与任务控制专项回归均通过；侧栏版本同步更新为 `v2.8.25`。
+
 ## [2.8.24] - 2026-07-25
 
 ### 优化 (Changed)
@@ -2593,4 +2605,8 @@
 
 ## 2026-07-25 03:37:00 +0800
 - 修复 ChatGPT 注册三执行器串线并统一浏览器注册链路
+- 发布模式: multi
+
+## 2026-07-25 04:10:05 +0800
+- 修复 Camoufox 注册密码校验与页面状态推进
 - 发布模式: multi

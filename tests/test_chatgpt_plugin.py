@@ -3,7 +3,10 @@ from unittest import mock
 
 from core.base_mailbox import MailboxAccount
 from core.base_platform import RegisterConfig
-from services.chatgpt_core.plugin import ChatGPTPlatform
+from services.chatgpt_core.plugin import (
+    ChatGPTPlatform,
+    _generate_chatgpt_registration_password,
+)
 
 
 class _BlankMailbox:
@@ -153,6 +156,59 @@ class ChatGPTPluginTests(unittest.TestCase):
 
     def tearDown(self):
         self.default_proxy_patcher.stop()
+
+    def test_generated_registration_password_always_meets_openai_policy(self):
+        allowed_specials = set(",._!@#")
+        for requested_length in (0, 8, 12, 16, 32):
+            for _ in range(50):
+                password = _generate_chatgpt_registration_password(requested_length)
+                self.assertEqual(len(password), max(requested_length, 12))
+                self.assertTrue(any(char.islower() for char in password))
+                self.assertTrue(any(char.isupper() for char in password))
+                self.assertTrue(any(char.isdigit() for char in password))
+                self.assertTrue(any(char in allowed_specials for char in password))
+
+    def test_register_uses_policy_compliant_generated_password(self):
+        platform = ChatGPTPlatform(
+            config=RegisterConfig(extra={"chatgpt_registration_mode": "refresh_token"}),
+            mailbox=_TrackingMailbox(),
+        )
+        adapter = _CaptureContextAdapter()
+        generated = "OpenAI9_policy!"
+
+        with mock.patch(
+            "services.chatgpt_core.plugin._generate_chatgpt_registration_password",
+            return_value=generated,
+        ) as generate_password, mock.patch(
+            "services.chatgpt_core.plugin.build_chatgpt_registration_mode_adapter",
+            return_value=adapter,
+        ):
+            result = platform.register()
+
+        self.assertTrue(result["success"])
+        generate_password.assert_called_once_with()
+        self.assertIsNotNone(adapter.context)
+        self.assertEqual(adapter.context.password, generated)
+
+    def test_register_preserves_explicit_password(self):
+        platform = ChatGPTPlatform(
+            config=RegisterConfig(extra={"chatgpt_registration_mode": "refresh_token"}),
+            mailbox=_TrackingMailbox(),
+        )
+        adapter = _CaptureContextAdapter()
+
+        with mock.patch(
+            "services.chatgpt_core.plugin._generate_chatgpt_registration_password",
+        ) as generate_password, mock.patch(
+            "services.chatgpt_core.plugin.build_chatgpt_registration_mode_adapter",
+            return_value=adapter,
+        ):
+            result = platform.register(password="Explicit9_password!")
+
+        self.assertTrue(result["success"])
+        generate_password.assert_not_called()
+        self.assertIsNotNone(adapter.context)
+        self.assertEqual(adapter.context.password, "Explicit9_password!")
 
     def test_custom_provider_rejects_blank_email(self):
         platform = ChatGPTPlatform(

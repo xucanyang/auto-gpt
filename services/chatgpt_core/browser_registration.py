@@ -658,6 +658,23 @@ def _find_first_selector(page, selectors: list[str]) -> str | None:
     return None
 
 
+def _find_first_visible_selector(page, selectors: list[str]) -> str | None:
+    for selector in selectors:
+        try:
+            locator = page.locator(selector)
+            count = min(int(locator.count() or 0), 10)
+        except Exception:
+            continue
+        for index in range(count):
+            try:
+                candidate = locator.nth(index) if hasattr(locator, "nth") else locator.first
+                if candidate.is_visible(timeout=150):
+                    return selector
+            except Exception:
+                continue
+    return None
+
+
 def _wait_for_any_selector(page, selectors: list[str], timeout: int = 30):
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -790,6 +807,27 @@ def _extract_auth_error_text(page) -> str:
         if text and "oai_log" not in text and "SSR_HTML" not in text:
             return text
     return ""
+
+
+def _extract_input_validation_message(page, selector: str) -> str:
+    try:
+        return str(
+            page.locator(selector).first.evaluate(
+                """
+                (input) => {
+                  if (!(input instanceof HTMLInputElement)) return '';
+                  if (input.validationMessage) return String(input.validationMessage);
+                  if (input.getAttribute('aria-invalid') !== 'true') return '';
+                  const errorId = input.getAttribute('aria-errormessage') || input.getAttribute('aria-describedby');
+                  const errorNode = errorId ? document.getElementById(errorId.split(/\\s+/)[0]) : null;
+                  return String(errorNode?.textContent || 'Password input validation failed');
+                }
+                """
+            )
+            or ""
+        ).strip()
+    except Exception:
+        return ""
 
 
 def _fill_input_like_user(page, selector: str, value: str) -> bool:
@@ -1038,10 +1076,6 @@ def _derive_registration_state_from_page(page) -> dict:
     # bar while replacing the form. Inspect the live DOM before trusting that
     # URL-derived OTP state.
 
-    if _find_first_selector(page, PASSWORD_INPUT_SELECTORS):
-        page_type = "login_password" if _is_login_password_url(current_url) else "create_account_password"
-        return _build_manual_flow_state(page_type, current_url)
-
     try:
         about_visible = bool(
             page.evaluate(
@@ -1067,9 +1101,13 @@ def _derive_registration_state_from_page(page) -> dict:
     if about_visible:
         return _build_manual_flow_state("about_you", current_url)
 
-    otp_selector = _find_first_selector(page, OTP_INPUT_SELECTORS)
-    if otp_selector and "password" not in otp_selector:
+    otp_selector = _find_first_visible_selector(page, OTP_INPUT_SELECTORS)
+    if otp_selector:
         return _build_manual_flow_state("email_otp_verification", current_url)
+
+    if _find_first_visible_selector(page, PASSWORD_INPUT_SELECTORS):
+        page_type = "login_password" if _is_login_password_url(current_url) else "create_account_password"
+        return _build_manual_flow_state(page_type, current_url)
 
     if state.get("page_type"):
         return state
@@ -1092,8 +1130,14 @@ def _recover_signup_password_page(page, log) -> bool:
 
 def _wait_for_signup_entry_transition(page, log, timeout: int = 20) -> dict:
     deadline = time.time() + timeout
+    passwordless_clicked = False
     while time.time() < deadline:
-        if _click_passwordless_login_if_available(page, log, context="邮箱页提交后"):
+        if not passwordless_clicked and _click_passwordless_login_if_available(
+            page,
+            log,
+            context="邮箱页提交后",
+        ):
+            passwordless_clicked = True
             time.sleep(0.5)
             continue
         state = _derive_registration_state_from_page(page)
@@ -3312,6 +3356,87 @@ def _submit_password_via_page(page, password: str, log) -> dict:
     log(f"密码页输入框: {input_selector}")
     _browser_pause(page)
 
+    register_responses: list[Any] = []
+    register_request_failures: list[str] = []
+    response_listener = None
+    request_failed_listener = None
+    try:
+        if hasattr(page, "on"):
+            def _capture_register_response(response):
+                try:
+                    if "/api/accounts/user/register" in str(getattr(response, "url", "") or ""):
+                        register_responses.append(response)
+                except Exception:
+                    return
+
+            def _capture_register_request_failure(request):
+                try:
+                    if "/api/accounts/user/register" not in str(getattr(request, "url", "") or ""):
+                        return
+                    failure = getattr(request, "failure", "")
+                    if callable(failure):
+                        failure = failure()
+                    if isinstance(failure, dict):
+                        failure = failure.get("errorText") or failure.get("error_text") or ""
+                    register_request_failures.append(str(failure or "request failed")[:300])
+                except Exception:
+                    register_request_failures.append("request failed")
+
+            response_listener = _capture_register_response
+            request_failed_listener = _capture_register_request_failure
+            page.on("response", response_listener)
+            page.on("requestfailed", request_failed_listener)
+    except Exception:
+        response_listener = None
+        request_failed_listener = None
+
+    def _finish(result: dict) -> dict:
+        if response_listener is not None and hasattr(page, "remove_listener"):
+            try:
+                page.remove_listener("response", response_listener)
+            except Exception:
+                pass
+        if request_failed_listener is not None and hasattr(page, "remove_listener"):
+            try:
+                page.remove_listener("requestfailed", request_failed_listener)
+            except Exception:
+                pass
+        return result
+
+    def _response_details(response) -> tuple[int, dict, str]:
+        status = int(getattr(response, "status", 0) or 0)
+        text = ""
+        data: dict = {}
+        try:
+            text = str(response.text() or "")
+        except Exception:
+            pass
+        try:
+            parsed = response.json()
+            if isinstance(parsed, dict):
+                data = parsed
+        except Exception:
+            if text:
+                try:
+                    parsed = json.loads(text)
+                    if isinstance(parsed, dict):
+                        data = parsed
+                except (TypeError, ValueError):
+                    pass
+        return status, data, text
+
+    def _response_error(data: dict, text: str) -> str:
+        error = data.get("error") if isinstance(data, dict) else None
+        if isinstance(error, dict):
+            message = str(error.get("message") or error.get("detail") or error.get("code") or "").strip()
+            if message:
+                return message
+        for key in ("message", "detail", "error"):
+            value = data.get(key) if isinstance(data, dict) else None
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return str(text or "").strip()[:500]
+
     start_url = str(page.url or "")
     submit_selector = _click_first(page, PASSWORD_SUBMIT_SELECTORS, timeout=8)
     if submit_selector:
@@ -3319,25 +3444,68 @@ def _submit_password_via_page(page, password: str, log) -> dict:
     elif _submit_form_with_fallback(page, input_selector):
         log("密码页未找到可点击 Continue，已使用表单 fallback 提交")
     else:
+        _finish({})
         raise RuntimeError("密码页未找到 Continue 按钮")
 
-    deadline = time.time() + 20
+    deadline = time.time() + 45
     last_url = str(page.url or "")
+    processed_responses = 0
     while time.time() < deadline:
         current_url = str(page.url or "")
         last_url = current_url or last_url
+        while processed_responses < len(register_responses):
+            response = register_responses[processed_responses]
+            processed_responses += 1
+            status, data, response_text = _response_details(response)
+            if 200 <= status < 300:
+                payload = data or {
+                    "page": {
+                        "type": "email_otp_verification",
+                        "payload": {"url": f"{OPENAI_AUTH}/email-verification"},
+                    }
+                }
+                return _finish(
+                    {
+                        "ok": True,
+                        "status": status,
+                        "url": current_url,
+                        "data": payload,
+                        "text": "",
+                    }
+                )
+            if status >= 400:
+                error_text = _response_error(data, response_text)
+                return _finish(
+                    {
+                        "ok": False,
+                        "status": status,
+                        "url": current_url,
+                        "data": data or None,
+                        "text": error_text or f"user register HTTP {status}",
+                    }
+                )
+        if register_request_failures:
+            return _finish(
+                {
+                    "ok": False,
+                    "status": 0,
+                    "url": current_url,
+                    "data": None,
+                    "text": f"密码注册请求失败: {register_request_failures[-1]}",
+                }
+            )
         state = _derive_registration_state_from_page(page)
         page_type = str(state.get("page_type") or "")
         if page_type in {"email_otp_verification", "about_you", "add_phone", "oauth_callback", "chatgpt_home"}:
-            return {"ok": True, "status": 200, "url": current_url, "data": None, "text": ""}
+            return _finish({"ok": True, "status": 200, "url": current_url, "data": None, "text": ""})
         if current_url != start_url and page_type and page_type not in {"create_account_password", "login_password"}:
-            return {"ok": True, "status": 200, "url": current_url, "data": None, "text": ""}
+            return _finish({"ok": True, "status": 200, "url": current_url, "data": None, "text": ""})
         if page_type == "login_password" and _recover_signup_password_page(page, log):
             input_selector = _wait_for_any_selector(page, PASSWORD_INPUT_SELECTORS, timeout=5)
             if not input_selector:
-                return {"ok": False, "status": 400, "url": current_url, "data": None, "text": "登录密码页恢复后未找到注册密码输入框"}
+                return _finish({"ok": False, "status": 400, "url": current_url, "data": None, "text": "登录密码页恢复后未找到注册密码输入框"})
             if not _fill_input_like_user(page, input_selector, password):
-                return {"ok": False, "status": 400, "url": current_url, "data": None, "text": "登录密码页恢复后密码重新填写失败"}
+                return _finish({"ok": False, "status": 400, "url": current_url, "data": None, "text": "登录密码页恢复后密码重新填写失败"})
             submit_selector = _click_first(page, PASSWORD_SUBMIT_SELECTORS, timeout=5)
             if submit_selector:
                 log(f"恢复后重新点击密码提交按钮: {submit_selector}")
@@ -3349,14 +3517,28 @@ def _submit_password_via_page(page, password: str, log) -> dict:
                 start_url = str(page.url or start_url)
                 time.sleep(0.4)
                 continue
-            return {"ok": False, "status": 400, "url": current_url, "data": None, "text": "登录密码页恢复后未找到提交方式"}
+            return _finish({"ok": False, "status": 400, "url": current_url, "data": None, "text": "登录密码页恢复后未找到提交方式"})
         error_text = _extract_auth_error_text(page)
         if error_text:
             _dump_debug(page, "chatgpt_password_fail")
-            return {"ok": False, "status": 400, "url": current_url, "data": None, "text": error_text}
+            return _finish({"ok": False, "status": 400, "url": current_url, "data": None, "text": error_text})
+        validation_error = _extract_input_validation_message(page, input_selector)
+        if validation_error:
+            _dump_debug(page, "chatgpt_password_fail")
+            return _finish({"ok": False, "status": 400, "url": current_url, "data": None, "text": validation_error})
         time.sleep(0.5)
     _dump_debug(page, "chatgpt_password_fail")
-    return {"ok": False, "status": 0, "url": last_url, "data": None, "text": "密码页提交后未跳转"}
+    validation_error = _extract_input_validation_message(page, input_selector)
+    error_text = _extract_auth_error_text(page)
+    return _finish(
+        {
+            "ok": False,
+            "status": 0,
+            "url": last_url,
+            "data": None,
+            "text": error_text or validation_error or "密码注册请求未产生响应且页面未跳转",
+        }
+    )
 
 
 def _submit_otp_via_page(
@@ -4481,10 +4663,10 @@ def _browser_registration_flow(
     profile_name = str(profile_data.get("name") or "").strip()
     profile_birthdate = str(profile_data.get("birthdate") or "").strip()
     try:
-        state = _start_browser_signup_via_authorize(page, email, device_id, log)
-    except Exception as exc:
-        log(f"ChatGPT authorize 注册入口失败，尝试 OpenAI 页面入口: {exc}")
         state = _start_browser_signup_via_page(page, email, log)
+    except Exception as exc:
+        log(f"OpenAI 页面注册入口失败，尝试 ChatGPT authorize 入口: {exc}")
+        state = _start_browser_signup_via_authorize(page, email, device_id, log)
     auth_cookies = _get_cookies(page)
     log(
         "授权态 cookies: "

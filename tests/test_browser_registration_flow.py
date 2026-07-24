@@ -200,6 +200,229 @@ class _JapaneseAgePage:
 
 
 class BrowserRegistrationFlowTests(unittest.TestCase):
+    def test_password_validation_message_is_reported(self):
+        page = mock.Mock()
+        page.locator.return_value.first.evaluate.return_value = (
+            "Please include at least one special character."
+        )
+
+        message = br._extract_input_validation_message(page, 'input[type="password"]')
+
+        self.assertEqual(
+            message,
+            "Please include at least one special character.",
+        )
+
+    def test_browser_registration_prefers_openai_page_entry(self):
+        page = mock.Mock()
+        page.url = "https://chatgpt.com/"
+        page.evaluate.return_value = "Mozilla/5.0 Camoufox"
+        page.context.cookies.return_value = []
+        terminal_state = {
+            "page_type": "chatgpt_home",
+            "current_url": "https://chatgpt.com/",
+        }
+
+        with (
+            mock.patch.object(br, "_seed_browser_device_id"),
+            mock.patch.object(
+                br,
+                "_start_browser_signup_via_page",
+                return_value=terminal_state,
+            ) as page_entry,
+            mock.patch.object(br, "_start_browser_signup_via_authorize") as authorize_entry,
+            mock.patch.object(br, "_handle_post_signup_onboarding"),
+            mock.patch.object(br, "_extract_flow_state", return_value=terminal_state),
+        ):
+            result = br._browser_registration_flow(
+                page,
+                "buyer@example.com",
+                "OpenAI9_policy!",
+                lambda *_args, **_kwargs: "123456",
+                None,
+                lambda _message: None,
+            )
+
+        self.assertEqual(result, terminal_state)
+        page_entry.assert_called_once_with(page, "buyer@example.com", mock.ANY)
+        authorize_entry.assert_not_called()
+
+    def test_browser_registration_falls_back_to_authorize_entry(self):
+        page = mock.Mock()
+        page.url = "https://chatgpt.com/"
+        page.evaluate.return_value = "Mozilla/5.0 Camoufox"
+        page.context.cookies.return_value = []
+        terminal_state = {
+            "page_type": "chatgpt_home",
+            "current_url": "https://chatgpt.com/",
+        }
+
+        with (
+            mock.patch.object(br, "_seed_browser_device_id"),
+            mock.patch.object(
+                br,
+                "_start_browser_signup_via_page",
+                side_effect=RuntimeError("page entry unavailable"),
+            ) as page_entry,
+            mock.patch.object(
+                br,
+                "_start_browser_signup_via_authorize",
+                return_value=terminal_state,
+            ) as authorize_entry,
+            mock.patch.object(br, "_handle_post_signup_onboarding"),
+            mock.patch.object(br, "_extract_flow_state", return_value=terminal_state),
+        ):
+            result = br._browser_registration_flow(
+                page,
+                "buyer@example.com",
+                "OpenAI9_policy!",
+                lambda *_args, **_kwargs: "123456",
+                None,
+                lambda _message: None,
+                device_id="device-demo",
+            )
+
+        self.assertEqual(result, terminal_state)
+        page_entry.assert_called_once_with(page, "buyer@example.com", mock.ANY)
+        authorize_entry.assert_called_once_with(
+            page,
+            "buyer@example.com",
+            "device-demo",
+            mock.ANY,
+        )
+
+    def test_signup_transition_clicks_passwordless_only_once(self):
+        page = mock.Mock()
+        otp_state = {
+            "page_type": "email_otp_verification",
+            "current_url": "https://auth.openai.com/email-verification",
+        }
+
+        with (
+            mock.patch.object(
+                br,
+                "_click_passwordless_login_if_available",
+                return_value=True,
+            ) as click_passwordless,
+            mock.patch.object(
+                br,
+                "_derive_registration_state_from_page",
+                return_value=otp_state,
+            ),
+            mock.patch.object(br.time, "sleep"),
+        ):
+            result = br._wait_for_signup_entry_transition(
+                page,
+                lambda _message: None,
+                timeout=1,
+            )
+
+        self.assertEqual(result, otp_state)
+        click_passwordless.assert_called_once_with(
+            page,
+            mock.ANY,
+            context="邮箱页提交后",
+        )
+
+    def test_hidden_password_input_does_not_override_visible_otp(self):
+        page = mock.Mock()
+        page.url = "https://auth.openai.com/create-account/password"
+        page.evaluate.return_value = False
+
+        hidden = mock.Mock()
+        hidden.count.return_value = 1
+        hidden.nth.return_value.is_visible.return_value = False
+        visible = mock.Mock()
+        visible.count.return_value = 1
+        visible.nth.return_value.is_visible.return_value = True
+        empty = mock.Mock()
+        empty.count.return_value = 0
+
+        def locator(selector):
+            if selector in br.PASSWORD_INPUT_SELECTORS:
+                return hidden
+            if selector in br.OTP_INPUT_SELECTORS:
+                return visible
+            return empty
+
+        page.locator.side_effect = locator
+
+        state = br._derive_registration_state_from_page(page)
+
+        self.assertEqual(state["page_type"], "email_otp_verification")
+
+    def test_password_submit_uses_success_response_when_url_does_not_change(self):
+        page = mock.Mock()
+        page.url = "https://auth.openai.com/create-account/password"
+        listeners = {}
+        page.on.side_effect = lambda event, listener: listeners.__setitem__(event, listener)
+        response = mock.Mock()
+        response.url = "https://auth.openai.com/api/accounts/user/register"
+        response.status = 200
+        response.json.return_value = {
+            "page": {
+                "type": "email_otp_verification",
+                "payload": {"url": "https://auth.openai.com/email-verification"},
+            }
+        }
+        response.text.return_value = ""
+
+        def click_first(*_args, **_kwargs):
+            listeners["response"](response)
+            return 'button[type="submit"]'
+
+        with (
+            mock.patch.object(br, "_recover_signup_password_page", return_value=False),
+            mock.patch.object(br, "_wait_for_any_selector", return_value='input[type="password"]'),
+            mock.patch.object(br, "_fill_input_like_user", return_value=True),
+            mock.patch.object(br, "_browser_pause"),
+            mock.patch.object(br, "_click_first", side_effect=click_first),
+        ):
+            result = br._submit_password_via_page(
+                page,
+                "OpenAI9_policy!",
+                lambda _message: None,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], 200)
+        self.assertEqual(result["data"]["page"]["type"], "email_otp_verification")
+        page.remove_listener.assert_any_call("response", listeners["response"])
+
+    def test_password_submit_reports_server_rejection(self):
+        page = mock.Mock()
+        page.url = "https://auth.openai.com/create-account/password"
+        listeners = {}
+        page.on.side_effect = lambda event, listener: listeners.__setitem__(event, listener)
+        response = mock.Mock()
+        response.url = "https://auth.openai.com/api/accounts/user/register"
+        response.status = 400
+        response.json.return_value = {
+            "error": {"message": "Password does not meet requirements."}
+        }
+        response.text.return_value = ""
+
+        def click_first(*_args, **_kwargs):
+            listeners["response"](response)
+            return 'button[type="submit"]'
+
+        with (
+            mock.patch.object(br, "_recover_signup_password_page", return_value=False),
+            mock.patch.object(br, "_wait_for_any_selector", return_value='input[type="password"]'),
+            mock.patch.object(br, "_fill_input_like_user", return_value=True),
+            mock.patch.object(br, "_browser_pause"),
+            mock.patch.object(br, "_click_first", side_effect=click_first),
+        ):
+            result = br._submit_password_via_page(
+                page,
+                "OpenAI9_policy!",
+                lambda _message: None,
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], 400)
+        self.assertEqual(result["text"], "Password does not meet requirements.")
+
     def test_otp_response_success_is_accepted_without_url_change(self):
         response = _FakeResponse(
             200,
