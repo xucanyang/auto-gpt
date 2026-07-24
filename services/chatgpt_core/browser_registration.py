@@ -1890,7 +1890,11 @@ def _submit_login_email_via_page(page, email: str, log) -> dict:
 def _do_codex_oauth(page, cookies_dict: dict, email: str, password: str, otp_callback, phone_callback, proxy: str | None, log) -> dict | None:
     """在真实浏览器会话内完成 Codex OAuth，返回完整 token 包。"""
     from .oauth import generate_oauth_url
-    from .constants import CODEX_CLIENT_ID, CODEX_REDIRECT_URI, CODEX_SCOPE
+    from .oauth import (
+        OAUTH_CLIENT_ID as CODEX_CLIENT_ID,
+        OAUTH_REDIRECT_URI as CODEX_REDIRECT_URI,
+        OAUTH_SCOPE as CODEX_SCOPE,
+    )
 
     oauth_start = generate_oauth_url(
         redirect_uri=CODEX_REDIRECT_URI,

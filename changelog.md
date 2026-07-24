@@ -17,6 +17,7 @@
 - **修复浏览器回调导航顺序**：`external_url` 状态不再被提前当成 ChatGPT 完成页，必须先跟随 `continue_url` 落地到真实 callback/home 后才结束注册阶段。
 - **补齐浏览器注册后的 Token 提取**：当 Camoufox 已落地 ChatGPT callback/home 但 NextAuth session cookie 尚未写入时，复用现有 `OAuthClient` 的强制密码登录/完整 OAuth 逻辑获取 AT/RT，不再重做邮箱注册或误判为已有账号。
 - **对齐 any-auto-register 的注册后 OAuth 完成策略**：当上述 HTTP OAuth recovery 仍停留在 `add_phone`、workspace 或 callback 状态时，`services/chatgpt_core/access_token_only_registration_engine.py` 现在通过共享浏览器槽位、硬超时和 OTP IPC 启动独立 Camoufox Codex OAuth；它重访原始授权 URL，沿用跨阶段验证码排除规则，成功后直接回传 AT/RT，避免把已完成的注册账号再次走邮箱注册或强制绑定手机号。
+- **修复独立 OAuth 移植常量兼容性**：浏览器 Codex OAuth 改用 auto-gpt 自有 `services/chatgpt_core/oauth.py` 的 client、redirect URI 和 scope 常量，避免引用对照项目私有的 `CODEX_*` 符号导致 recovery worker 在启动后立即 ImportError。
 
 ### 测试 (Tests)
 - 新增浏览器后备状态恢复、OTP callback 时间/排除参数、API 成功但 URL 不变及错误响应回归；前端侧栏版本同步更新为 `v2.8.18`。
@@ -2482,4 +2483,8 @@
 
 ## 2026-07-24 14:21:28 +0800
 - 对齐 any-auto-register 的独立浏览器 OAuth recovery，补齐 add_phone 后 AT/RT 提取
+- 发布模式: multi
+
+## 2026-07-24 14:26:35 +0800
+- 修复独立浏览器 OAuth recovery 使用 auto-gpt OAuth 常量
 - 发布模式: multi
