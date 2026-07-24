@@ -6,6 +6,14 @@
 
 ## [Unreleased] (未发布)
 
+## [2.8.14] - 2026-07-24
+
+### 修复 (Fixed)
+- **硬超时清理覆盖 Chromium 自建 Session**：真实 Xvfb smoke 发现 Playwright Node 继承 browser worker 的 PGID，但 Chromium 主进程会再次 `setsid()`，Crashpad 也会脱离父进程并各自建立进程组；仅对 worker PGID 发信号仍可能在 Renderer 冻结时留下浏览器。`services/chatgpt_core/sentinel_browser.py` 现在为每次事务注入随机 `AUTO_GPT_BROWSER_WORKER_ID`，超时、停止、worker 异常及正常退出残留检查都会从 `/proc/*/environ` 找出继承该事务标记的 worker、Node、Chromium 主进程和 Crashpad，先 TERM、再 KILL 所有独立 PGID/PID，Chrome 同组的 zygote、renderer、GPU 与 utility 进程随主进程组一并回收。
+
+### 测试 (Tests)
+- 将浏览器硬超时与停止测试中的模拟 Chromium 改为 `start_new_session=True`，锁定跨 Session 子进程仍被清理且后续事务可复用信号量槽；容器实测确认 worker/Node、Chromium、Crashpad 分属三个以上 PGID/SID，但都继承同一事务标记。侧栏版本同步更新为 `v2.8.14`。
+
 ## [2.8.13] - 2026-07-24
 
 ### 优化 (Changed)
@@ -13,7 +21,7 @@
 - **任务日志改为有界内存窗口**：`core/task_runtime.py` 按 UTF-8 实际字节限制活跃任务为 4000 条 / 4 MiB，终态快照完成 SQLite 持久化后将内存副本压缩为 500 条 / 512 KiB；`api/tasks.py` 将已完成任务内存保留量从 200 个降到 50 个。快照新增 `logs_truncated`、丢弃条数/字节数和单调日志游标，历史 TaskLog 继续保留较大的活跃窗口，不会被终态内存压缩后的重复写入覆盖。
 
 ### 修复 (Fixed)
-- **冻结的 Renderer 不再永久占用 Auth 并发槽**：新增 `services/chatgpt_core/sentinel_browser_worker.py`，每次 Sentinel/Auth 浏览器事务都在独立 OS session 中运行，代理桥、Playwright Node driver 与 Chromium 继承同一进程组。父进程为 Sentinel 设置默认 90 秒、Auth 开户设置默认 150 秒硬截止；超时或立即停止时先 TERM、再 KILL 整个进程组，并在 `finally` 释放浏览器槽，修复 `page.evaluate(SentinelSDK.token)` 冻结后 `browser.close()` 永远无法执行、后续开户只剩一个可用槽的问题。截止时间可分别通过 `SENTINEL_BROWSER_HARD_TIMEOUT_SECONDS` 与 `AUTH_BROWSER_HARD_TIMEOUT_SECONDS` 调整。
+- **冻结的 Renderer 获得外部硬截止**：新增 `services/chatgpt_core/sentinel_browser_worker.py`，每次 Sentinel/Auth 浏览器事务都由独立 OS session 中的 worker 执行。父进程为 Sentinel 设置默认 90 秒、Auth 开户设置默认 150 秒硬截止，并在 `finally` 释放浏览器槽；v2.8.13 初版按 worker 进程组执行 TERM/KILL，后续 v2.8.14 真实进程树验证发现 Chromium 会再次 `setsid()`，因此补充了跨 Session 事务标记清理。截止时间可分别通过 `SENTINEL_BROWSER_HARD_TIMEOUT_SECONDS` 与 `AUTH_BROWSER_HARD_TIMEOUT_SECONDS` 调整。
 - **任务停止可以中断正在运行的浏览器事务**：`ChatGPTClient`、`OAuthClient` 与 AccessToken 注册引擎将任务控制检查传到浏览器父进程；等待槽位或浏览器运行期间收到停止请求，会先完整清理子进程组再传播原始任务中断，不再等待页面内部 JavaScript 超时。
 - **日志窗口移动后 SSE 仍持续推送**：`api/tasks.py` 与 `frontend/src/components/TaskLogPanel.tsx` 不再把当前数组长度当作永久游标，改用 `log_start_index / log_next_index` 单调序号。活跃日志达到裁剪上限后，新日志仍会实时到达，前端自身也只保留最近 4000 行，避免长任务把浏览器页面内存同步拖高。
 
@@ -2381,4 +2389,8 @@
 
 ## 2026-07-24 09:21:21 +0800
 - 发布 v2.8.13：修复 Auth 浏览器卡死与任务内存膨胀
+- 发布模式: multi
+
+## 2026-07-24 09:33:11 +0800
+- 发布 v2.8.14：补齐 Chromium 跨 Session 硬超时清理
 - 发布模式: multi

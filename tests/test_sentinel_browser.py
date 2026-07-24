@@ -116,7 +116,10 @@ emit({"type": "result", "value": {"status_code": 200, "cookie_names": ["oai-sc"]
 
     def test_browser_worker_hard_timeout_kills_entire_process_group(self):
         script = _INLINE_WORKER_PREAMBLE + r"""
-child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+child = subprocess.Popen(
+    [sys.executable, "-c", "import time; time.sleep(30)"],
+    start_new_session=True,
+)
 emit({"type": "log", "message": "CHILD_PID=" + str(child.pid)})
 time.sleep(30)
 """
@@ -149,7 +152,10 @@ time.sleep(30)
 
     def test_browser_worker_stop_check_interrupts_and_cleans_process_group(self):
         script = _INLINE_WORKER_PREAMBLE + r"""
-child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+child = subprocess.Popen(
+    [sys.executable, "-c", "import time; time.sleep(30)"],
+    start_new_session=True,
+)
 emit({"type": "log", "message": "STOP_CHILD_PID=" + str(child.pid)})
 time.sleep(30)
 """

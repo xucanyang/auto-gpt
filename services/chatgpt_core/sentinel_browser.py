@@ -48,6 +48,7 @@ _BROWSER_WORKER_POLL_SECONDS = 0.2
 _BROWSER_WORKER_TERM_GRACE_SECONDS = 2.0
 _AUTH_BROWSER_HARD_TIMEOUT_DEFAULT_SECONDS = 150.0
 _SENTINEL_BROWSER_HARD_TIMEOUT_DEFAULT_SECONDS = 90.0
+_BROWSER_WORKER_ID_ENV = "AUTO_GPT_BROWSER_WORKER_ID"
 
 
 def _browser_hard_timeout_seconds(env_name: str, default: float) -> float:
@@ -75,47 +76,97 @@ def _browser_worker_command(protocol_fd: int) -> list[str]:
     ]
 
 
+def _marked_browser_worker_processes(worker_id: str) -> dict[int, int]:
+    marker = f"{_BROWSER_WORKER_ID_ENV}={worker_id}".encode("utf-8")
+    matches: dict[int, int] = {}
+    if not worker_id or os.name != "posix":
+        return matches
+    try:
+        proc_entries = os.scandir("/proc")
+    except OSError:
+        return matches
+    with proc_entries:
+        for entry in proc_entries:
+            if not entry.name.isdigit():
+                continue
+            pid = int(entry.name)
+            try:
+                with open(f"/proc/{pid}/environ", "rb") as handle:
+                    environment = handle.read()
+                if marker not in environment.split(b"\0"):
+                    continue
+                matches[pid] = os.getpgid(pid)
+            except (FileNotFoundError, ProcessLookupError, PermissionError, OSError):
+                continue
+    return matches
+
+
+def _signal_browser_worker_processes(
+    process: subprocess.Popen[bytes],
+    *,
+    worker_id: str,
+    signal_number: int,
+    logger: Callable[[str], None],
+) -> None:
+    marked = _marked_browser_worker_processes(worker_id)
+    marked.setdefault(int(process.pid), int(process.pid))
+    current_group = os.getpgrp()
+    signaled_groups: set[int] = set()
+    for process_group in sorted(set(marked.values())):
+        if process_group <= 0 or process_group == current_group:
+            continue
+        try:
+            os.killpg(process_group, signal_number)
+            signaled_groups.add(process_group)
+        except ProcessLookupError:
+            pass
+        except Exception as exc:
+            logger(
+                "Browser Worker 进程组信号失败: "
+                f"pgid={process_group} signal={signal_number} error={exc}"
+            )
+    for pid, process_group in marked.items():
+        if process_group in signaled_groups or pid == os.getpid():
+            continue
+        try:
+            os.kill(pid, signal_number)
+        except ProcessLookupError:
+            pass
+        except Exception as exc:
+            logger(
+                "Browser Worker 进程信号失败: "
+                f"pid={pid} signal={signal_number} error={exc}"
+            )
+
+
 def _terminate_browser_worker_group(
     process: subprocess.Popen[bytes],
     *,
+    worker_id: str,
     logger: Callable[[str], None],
 ) -> None:
-    """Terminate the worker and every Playwright/Chromium descendant it owns."""
-    group_id = int(process.pid)
-    try:
-        os.killpg(group_id, signal.SIGTERM)
-    except ProcessLookupError:
-        return
-    except Exception as exc:
-        logger(f"Browser Worker 进程组 SIGTERM 失败: {exc}")
-        if process.poll() is None:
-            try:
-                process.terminate()
-            except Exception:
-                pass
+    """Terminate all marked worker, Node, Chromium, and Crashpad groups."""
+    _signal_browser_worker_processes(
+        process,
+        worker_id=worker_id,
+        signal_number=signal.SIGTERM,
+        logger=logger,
+    )
 
     deadline = time.monotonic() + _BROWSER_WORKER_TERM_GRACE_SECONDS
     while time.monotonic() < deadline:
-        if process.poll() is not None:
-            try:
-                os.killpg(group_id, 0)
-            except ProcessLookupError:
-                return
-            except Exception:
-                break
+        if process.poll() is not None and not _marked_browser_worker_processes(
+            worker_id
+        ):
+            return
         time.sleep(0.05)
 
-    try:
-        os.killpg(group_id, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    except Exception as exc:
-        logger(f"Browser Worker 进程组 SIGKILL 失败: {exc}")
-        if process.poll() is None:
-            try:
-                process.kill()
-            except Exception:
-                pass
+    _signal_browser_worker_processes(
+        process,
+        worker_id=worker_id,
+        signal_number=signal.SIGKILL,
+        logger=logger,
+    )
     try:
         process.wait(timeout=1.0)
     except Exception:
@@ -165,8 +216,11 @@ def _run_isolated_browser_transaction(
     outcome: Optional[_BrowserWorkerOutcome] = None
     timed_out = False
     interrupted: Optional[BaseException] = None
+    worker_id = uuid.uuid4().hex
 
     try:
+        worker_environment = dict(os.environ)
+        worker_environment[_BROWSER_WORKER_ID_ENV] = worker_id
         process = subprocess.Popen(
             _browser_worker_command(write_fd),
             stdin=subprocess.PIPE,
@@ -176,6 +230,7 @@ def _run_isolated_browser_transaction(
             start_new_session=True,
             close_fds=True,
             bufsize=0,
+            env=worker_environment,
         )
         os.close(write_fd)
         write_fd = -1
@@ -249,14 +304,22 @@ def _run_isolated_browser_transaction(
 
         if interrupted is not None:
             logger(f"Browser Worker 收到任务停止请求，清理进程组 pid={process.pid}")
-            _terminate_browser_worker_group(process, logger=logger)
+            _terminate_browser_worker_group(
+                process,
+                worker_id=worker_id,
+                logger=logger,
+            )
             raise interrupted
         if timed_out:
             logger(
                 "Browser Worker 超过硬截止，清理进程组: "
                 f"operation={operation} timeout={hard_timeout_seconds:.1f}s pid={process.pid}"
             )
-            _terminate_browser_worker_group(process, logger=logger)
+            _terminate_browser_worker_group(
+                process,
+                worker_id=worker_id,
+                logger=logger,
+            )
             return _BrowserWorkerOutcome(
                 status="timeout",
                 error=f"{operation} hard timeout after {hard_timeout_seconds:.1f}s",
@@ -267,18 +330,39 @@ def _run_isolated_browser_transaction(
         if outcome is not None:
             outcome.exit_code = exit_code
             if outcome.status != "ok" or exit_code not in (0, None):
-                _terminate_browser_worker_group(process, logger=logger)
+                _terminate_browser_worker_group(
+                    process,
+                    worker_id=worker_id,
+                    logger=logger,
+                )
+            elif _marked_browser_worker_processes(worker_id):
+                logger("Browser Worker 正常退出后仍有标记进程，执行兜底清理")
+                _terminate_browser_worker_group(
+                    process,
+                    worker_id=worker_id,
+                    logger=logger,
+                )
             return outcome
-        if exit_code not in (0, None):
-            _terminate_browser_worker_group(process, logger=logger)
+        if exit_code not in (0, None) or _marked_browser_worker_processes(worker_id):
+            _terminate_browser_worker_group(
+                process,
+                worker_id=worker_id,
+                logger=logger,
+            )
         return _BrowserWorkerOutcome(
             status="error",
             error=f"browser worker exited without result (exit_code={exit_code})",
             exit_code=exit_code,
         )
     except BaseException as exc:
-        if process is not None and process.poll() is None:
-            _terminate_browser_worker_group(process, logger=logger)
+        if process is not None and (
+            process.poll() is None or _marked_browser_worker_processes(worker_id)
+        ):
+            _terminate_browser_worker_group(
+                process,
+                worker_id=worker_id,
+                logger=logger,
+            )
         if interrupted is not None or isinstance(exc, (KeyboardInterrupt, SystemExit)):
             raise
         error_text = f"{type(exc).__name__}: {exc}"[:1000]
