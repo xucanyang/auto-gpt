@@ -6,6 +6,14 @@
 
 ## [Unreleased] (未发布)
 
+## [2.8.17] - 2026-07-24
+
+### 修复 (Fixed)
+- **修复 Camoufox 运行时误判未安装**：`scripts/install_camoufox.py` 改用 Camoufox 0.5.4 的 `browsers/official/<version>-<release>` 多版本目录并写入 `active_version`，保留构建阶段下载的固定浏览器、GeoIP 和 UBO 资源，避免注册后备、LocalSolver 或普通浏览器启动时因旧扁平目录被清理而触发运行时下载。`services/chatgpt_core/browser_registration.py` 同时支持 `CAMOUFOX_EXECUTABLE_PATH` 和旧镜像扁平二进制，并从 `version.json` 传递匹配的 Firefox 主版本。
+
+### 测试 (Tests)
+- 新增 Camoufox 自定义可执行路径、版本参数、非法路径 fail-closed 及浏览器注册阶段参数传递回归；前端侧栏版本同步更新为 `v2.8.17`。
+
 ## [2.8.16] - 2026-07-24
 
 ### 新增 (Added)
@@ -2427,4 +2435,8 @@
 
 ## 2026-07-24 12:11:19 +0800
 - 发布 v2.8.16：接入同浏览器注册后备链路
+- 发布模式: multi
+
+## 2026-07-24 12:43:11 +0800
+- 修复 Camoufox 自定义安装路径识别并验证浏览器注册后备链路
 - 发布模式: multi

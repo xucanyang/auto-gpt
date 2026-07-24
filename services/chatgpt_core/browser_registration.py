@@ -13,6 +13,7 @@ import secrets
 import time
 import uuid
 from contextlib import ExitStack
+from pathlib import Path
 from typing import Callable, Optional
 from urllib.parse import urljoin, urlparse
 
@@ -565,9 +566,70 @@ def _ensure_camoufox_geoip_ready() -> None:
         ) from exc
 
 
+def _camoufox_executable_path() -> Optional[Path]:
+    """Resolve an explicitly installed Camoufox binary without downloading one.
+
+    The image now uses Camoufox's multiversion layout and therefore normally
+    lets the package choose the active install.  Keep an explicit override and
+    the pre-0.5 flat layout as compatibility paths for older running images.
+    """
+    configured = str(os.environ.get("CAMOUFOX_EXECUTABLE_PATH") or "").strip()
+    if configured:
+        path = Path(configured).expanduser()
+        if not path.is_file() or not os.access(path, os.X_OK):
+            raise RuntimeError(
+                "CAMOUFOX_EXECUTABLE_PATH 不存在或不可执行: " f"{path}"
+            )
+        return path
+
+    try:
+        from camoufox.pkgman import INSTALL_DIR
+    except Exception:
+        return None
+
+    legacy_path = Path(INSTALL_DIR) / "camoufox-bin"
+    if legacy_path.is_file() and os.access(legacy_path, os.X_OK):
+        return legacy_path
+    return None
+
+
+def _camoufox_major_version(executable_path: Path) -> Optional[int]:
+    """Read the browser major version needed by the legacy flat installer."""
+    try:
+        metadata = json.loads(
+            (executable_path.parent / "version.json").read_text(encoding="utf-8")
+        )
+        value = str(metadata.get("version") or "").split(".", 1)[0]
+        major = int(value)
+        return major if major > 0 else None
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def _camoufox_executable_options() -> dict:
+    executable_path = _camoufox_executable_path()
+    if executable_path is None:
+        return {}
+
+    options = {"executable_path": str(executable_path)}
+    major_version = _camoufox_major_version(executable_path)
+    if major_version is not None:
+        # The old flat installer has no active_version entry.  Supplying the
+        # matching major lets camoufox build its fingerprint without invoking
+        # the package manager; it is not a version spoof.
+        options.update(
+            {
+                "ff_version": major_version,
+                "i_know_what_im_doing": True,
+            }
+        )
+    return options
+
+
 def _camoufox_launch_opts(*, headless: bool, proxy: Optional[str]) -> dict:
     """统一 Camoufox 启动参数：有代理时启用 geoip，避免时区/locale 与出口 IP 不一致。"""
     launch_opts: dict = {"headless": headless}
+    launch_opts.update(_camoufox_executable_options())
     proxy_cfg = _build_proxy_config(proxy)
     if proxy_cfg:
         _ensure_camoufox_geoip_ready()
@@ -3989,6 +4051,7 @@ def run_browser_registration_stage_sync(
             playwright_proxy_context(proxy, logger=logger)
         )
         launch_opts: dict = {"headless": effective_headless}
+        launch_opts.update(_camoufox_executable_options())
         if proxy_config:
             _ensure_camoufox_geoip_ready()
             launch_opts["proxy"] = proxy_config
