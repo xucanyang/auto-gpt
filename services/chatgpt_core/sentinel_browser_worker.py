@@ -19,6 +19,16 @@ def _write_message(protocol_fd: int, message: dict[str, Any]) -> None:
         view = view[written:]
 
 
+def _read_message() -> dict[str, Any]:
+    raw = sys.stdin.readline()
+    if not raw:
+        raise EOFError("browser worker control channel closed")
+    message = json.loads(raw)
+    if not isinstance(message, dict):
+        raise ValueError("browser worker control message must be an object")
+    return message
+
+
 def main() -> int:
     if len(sys.argv) != 2:
         return 2
@@ -28,7 +38,7 @@ def main() -> int:
     os.set_inheritable(protocol_fd, False)
 
     try:
-        request = json.load(sys.stdin)
+        request = _read_message()
         operation = str(request.get("operation") or "")
         payload = request.get("payload")
         if not isinstance(payload, dict):
@@ -43,6 +53,32 @@ def main() -> int:
             protocol_fd,
             {"type": "log", "message": str(message)},
         )
+
+        callback_sequence = 0
+
+        def request_callback(name: str, callback_payload: dict[str, Any]) -> Any:
+            nonlocal callback_sequence
+            callback_sequence += 1
+            callback_id = f"callback-{callback_sequence}"
+            _write_message(
+                protocol_fd,
+                {
+                    "type": "callback_request",
+                    "id": callback_id,
+                    "name": str(name or ""),
+                    "payload": dict(callback_payload or {}),
+                },
+            )
+            response = _read_message()
+            if response.get("type") != "callback_response":
+                raise RuntimeError("invalid browser callback response type")
+            if str(response.get("id") or "") != callback_id:
+                raise RuntimeError("browser callback response id mismatch")
+            error = str(response.get("error") or "").strip()
+            if error:
+                raise RuntimeError(error)
+            return response.get("value")
+
         if operation == "sentinel_token":
             value = _get_sentinel_token_via_browser_sync(
                 **payload,
@@ -56,6 +92,23 @@ def main() -> int:
             )
             if value is not None:
                 value = asdict(value)
+        elif operation == "browser_registration":
+            from services.chatgpt_core.browser_registration import (
+                run_browser_registration_stage_sync,
+            )
+
+            try:
+                value = run_browser_registration_stage_sync(
+                    **payload,
+                    otp_callback=lambda: request_callback("otp", {}),
+                    log_fn=logger,
+                )
+            except Exception as exc:
+                value = {
+                    "error": (
+                        f"browser_registration_failed: {type(exc).__name__}: {exc}"
+                    )[:1000]
+                }
         else:
             raise ValueError(f"unsupported browser worker operation: {operation}")
 

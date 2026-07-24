@@ -15962,6 +15962,8 @@ def _is_fatal_registration_infrastructure_error(message: Any) -> bool:
         for marker in (
             "sentinel_browser_unavailable",
             "auth_browser_finalize_unavailable",
+            "browser_registration_unavailable",
+            "browser_registration_hard_timeout",
         )
     )
 

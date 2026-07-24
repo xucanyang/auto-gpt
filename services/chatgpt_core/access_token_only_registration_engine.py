@@ -22,8 +22,12 @@ from .registration_route_policy import (
     parse_bool,
 )
 from .task_logging import classify_task_log_level
-from .utils import generate_random_name, generate_random_birthday
+from .utils import FlowState, generate_random_name, generate_random_birthday
 from .account_fingerprint import build_browser_fingerprint_payload, fingerprint_signature
+from .sentinel_browser import (
+    merge_playwright_cookies_into_session,
+    run_browser_registration_stage,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -188,6 +192,28 @@ class AccessTokenOnlyRegistrationEngine:
 
     def _is_existing_account_login_route_enabled(self) -> bool:
         return existing_account_login_route_enabled(self.extra_config)
+
+    def _is_browser_registration_fallback_enabled(self) -> bool:
+        return self._parse_bool_default(
+            self.extra_config.get("chatgpt_browser_registration_fallback_enabled"),
+            default=True,
+        )
+
+    def _should_use_browser_registration_fallback(self, message: str) -> bool:
+        if not self._is_browser_registration_fallback_enabled():
+            return False
+        text = str(message or "").strip().lower()
+        return any(
+            marker in text
+            for marker in (
+                "registration_disallowed",
+                "sentinel_browser_unavailable",
+                "auth_browser_finalize_unavailable",
+                "cloudflare",
+                "just a moment",
+                "http 403",
+            )
+        )
 
     def _read_int_config(
         self,
@@ -536,6 +562,8 @@ class AccessTokenOnlyRegistrationEngine:
             for marker in (
                 "sentinel_browser_unavailable",
                 "auth_browser_finalize_unavailable",
+                "browser_registration_unavailable",
+                "browser_registration_hard_timeout",
             )
         ):
             return False
@@ -564,6 +592,85 @@ class AccessTokenOnlyRegistrationEngine:
             "账单探测",
         ]
         return any(marker.lower() in text for marker in retriable_markers)
+
+    def _run_browser_registration_fallback(
+        self,
+        *,
+        chatgpt_client: ChatGPTClient,
+        email_addr: str,
+        password: str,
+        skymail_adapter: EmailServiceAdapter,
+        otp_wait_timeout: int,
+        otp_account_budget_timeout: int,
+    ) -> tuple[bool, str]:
+        self._log(
+            "协议注册未完成，切换同一浏览器上下文后备链路：邮箱 -> OTP -> about_you",
+            "warning",
+        )
+
+        def _wait_for_browser_otp() -> str:
+            return str(
+                skymail_adapter.wait_for_verification_code(
+                    email_addr,
+                    timeout=otp_wait_timeout,
+                    otp_sent_at=time.time() - 15,
+                    phase="browser_register_email_otp",
+                    phase_label="浏览器注册邮箱验证码",
+                )
+                or ""
+            ).strip()
+
+        hard_timeout_seconds = min(
+            600,
+            max(300, int(otp_account_budget_timeout or 0) + 180),
+        )
+        stage_result = run_browser_registration_stage(
+            email=email_addr,
+            password=password,
+            otp_callback=_wait_for_browser_otp,
+            proxy=self.proxy_url,
+            device_id=str(getattr(chatgpt_client, "device_id", "") or ""),
+            headless=self.browser_mode != "headed",
+            stop_check=chatgpt_client._check_stop,
+            hard_timeout_seconds=hard_timeout_seconds,
+            log_fn=lambda message: self._log(f"[浏览器注册] {message}"),
+        )
+        if not stage_result.ok:
+            error = str(stage_result.error or "browser_registration_failed")
+            self._log(f"浏览器注册后备链路失败: {error}", "warning")
+            return False, error
+
+        merged = merge_playwright_cookies_into_session(
+            chatgpt_client.session,
+            stage_result.cookies,
+        )
+        if merged <= 0:
+            return False, "browser_registration_invalid_result: no cookies merged"
+
+        state_data = dict(stage_result.final_state or {})
+        chatgpt_client.last_registration_state = FlowState(
+            page_type=str(state_data.get("page_type") or ""),
+            continue_url=str(state_data.get("continue_url") or ""),
+            method=str(state_data.get("method") or "GET"),
+            current_url=str(
+                state_data.get("current_url") or stage_result.page_url or ""
+            ),
+            payload=(
+                dict(state_data.get("payload") or {})
+                if isinstance(state_data.get("payload"), dict)
+                else {}
+            ),
+            raw=(
+                dict(state_data.get("raw") or {})
+                if isinstance(state_data.get("raw"), dict)
+                else {}
+            ),
+        )
+        chatgpt_client.registration_transport = "camoufox_browser_fallback"
+        self._log(
+            "浏览器注册后备链路完成，已将域级 Cookie 合并回现有 Session，继续 AT 提取"
+        )
+        return True, "registration complete via browser fallback"
 
     def _finalize_email_service_success(self, result: RegistrationResult) -> None:
         finalize = getattr(self.email_service, "finalize_success", None)
@@ -679,6 +786,10 @@ class AccessTokenOnlyRegistrationEngine:
             "first_name": first_name,
             "last_name": last_name,
             "birthdate": birthdate,
+            "registration_transport": str(
+                getattr(chatgpt_client, "registration_transport", "protocol")
+                or "protocol"
+            ),
         }
 
     def _attach_browser_fingerprint_metadata(self, metadata: dict[str, Any], chatgpt_client: ChatGPTClient) -> dict[str, Any]:
@@ -920,6 +1031,26 @@ class AccessTokenOnlyRegistrationEngine:
                             otp_account_budget_timeout=register_otp_account_budget_seconds,
                             allow_existing_account_login_route=existing_account_login_route_allowed,
                         )
+                        if (
+                            not success
+                            and self._should_use_browser_registration_fallback(msg)
+                        ):
+                            fallback_ok, fallback_message = (
+                                self._run_browser_registration_fallback(
+                                    chatgpt_client=chatgpt_client,
+                                    email_addr=email_addr,
+                                    password=pwd,
+                                    skymail_adapter=skymail_adapter,
+                                    otp_wait_timeout=register_otp_wait_seconds,
+                                    otp_account_budget_timeout=(
+                                        register_otp_account_budget_seconds
+                                    ),
+                                )
+                            )
+                            if fallback_ok:
+                                success, msg = True, fallback_message
+                            else:
+                                msg = f"{msg}; 浏览器注册后备失败: {fallback_message}"
 
                     if not existing_account_capture:
                         if not success:

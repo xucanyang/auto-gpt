@@ -6,6 +6,21 @@
 
 ## [Unreleased] (未发布)
 
+## [2.8.16] - 2026-07-24
+
+### 新增 (Added)
+- **ChatGPT 注册增加同浏览器上下文后备链路**：`services/chatgpt_core/browser_registration.py` 复用 `/opt/any-auto-register` 已实际完成注册阶段的 Camoufox 状态机；当原有协议链路命中 `registration_disallowed`、Cloudflare 403 或浏览器开户基础设施错误时，在同一个邮箱上改走“邮箱提交 -> 一次性验证码 -> about_you -> callback”，并将浏览器生成的域级 Cookie 合并回 `ChatGPTClient`，继续沿用本项目既有的 ChatGPT Session / AccessToken 提取、第二阶段 Auth/RT、邮箱占用和账号入库逻辑。对照项目仍失败的独立 Codex OAuth 重登段未被迁入。
+
+### 优化 (Changed)
+- **完整浏览器注册纳入统一资源门禁**：`services/chatgpt_core/sentinel_browser.py` 与 `sentinel_browser_worker.py` 扩展可双向回调的隔离进程协议，浏览器子进程只在进入 OTP 页后向父任务请求验证码；整个事务继续受全局最多两槽、cgroup 第二槽内存判断、任务停止检查和最长 600 秒硬截止控制，超时或异常会清理 Camoufox、Playwright 与脱离 Session 的子进程，避免绕过 v2.8.13-v2.8.15 已建立的内存保护。
+- **Camoufox 代理画像补齐 GeoIP 能力**：`requirements.txt` 改用 `camoufox[geoip]==0.5.4`，`Dockerfile` 在构建时下载并校验 MMDB；认证 SOCKS5 继续通过本机 HTTP CONNECT 桥交给浏览器，Camoufox 据真实出口同步地区、时区与 locale，而不是暴露容器默认画像。
+
+### 修复 (Fixed)
+- **协议开户失败不再立即浪费当前邮箱**：`services/chatgpt_core/access_token_only_registration_engine.py` 默认启用浏览器后备，仅对明确的风控/浏览器开户失败触发；成功结果记录 `registration_transport=camoufox_browser_fallback`，浏览器 worker 不可用或硬超时被提升为批次级基础设施错误，停止继续创建邮箱。可通过任务配置 `chatgpt_browser_registration_fallback_enabled=false` 显式关闭。
+
+### 测试 (Tests)
+- 新增浏览器 worker OTP 双向 IPC 与停止传播、共享槽位结果解析、`registration_disallowed` 后备成功、显式关闭以及新基础设施致命分类回归；注册/Sentinel/任务控制专项 104 项通过，侧栏版本同步更新为 `v2.8.16`。
+
 ## [2.8.15] - 2026-07-24
 
 ### 优化 (Changed)
@@ -2408,4 +2423,8 @@
 
 ## 2026-07-24 09:46:19 +0800
 - 发布 v2.8.15：浏览器第二槽按 cgroup 内存自适应
+- 发布模式: multi
+
+## 2026-07-24 12:11:19 +0800
+- 发布 v2.8.16：接入同浏览器注册后备链路
 - 发布模式: multi

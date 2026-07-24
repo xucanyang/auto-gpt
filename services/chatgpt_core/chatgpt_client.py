@@ -76,6 +76,7 @@ class ChatGPTClient:
         apply_browser_fingerprint(self.session, self.fingerprint)
         self.last_registration_state = FlowState()
         self.last_registration_route_event = None
+        self.registration_transport = "protocol"
         self.last_homepage_probe = {
             "ok": False,
             "status_code": 0,

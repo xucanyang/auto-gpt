@@ -301,6 +301,16 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
                 "注册流失败: auth_browser_finalize_unavailable: create_account"
             )
         )
+        self.assertTrue(
+            _is_fatal_registration_infrastructure_error(
+                "注册流失败: browser_registration_unavailable: worker crashed"
+            )
+        )
+        self.assertTrue(
+            _is_fatal_registration_infrastructure_error(
+                "注册流失败: browser_registration_hard_timeout"
+            )
+        )
         self.assertFalse(
             _is_fatal_registration_infrastructure_error(
                 "注册流失败: HTTP 400: registration_disallowed"

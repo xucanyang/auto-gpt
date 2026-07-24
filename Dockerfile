@@ -57,7 +57,8 @@ RUN pip install --upgrade pip \
          sleep 5; \
        done \
     && [ "$installed" -eq 1 ] \
-    && CAMOUFOX_VERSION="$CAMOUFOX_VERSION" CAMOUFOX_RELEASE="$CAMOUFOX_RELEASE" python /tmp/install_camoufox.py
+    && CAMOUFOX_VERSION="$CAMOUFOX_VERSION" CAMOUFOX_RELEASE="$CAMOUFOX_RELEASE" python /tmp/install_camoufox.py \
+    && python -c "from camoufox.geolocation import download_mmdb, geoip_allowed; download_mmdb(); geoip_allowed(); print('camoufox geoip ok')"
 
 COPY . .
 COPY --from=frontend-builder /app/static /app/static

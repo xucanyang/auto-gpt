@@ -7,6 +7,7 @@ from services.chatgpt_core.access_token_only_registration_engine import (
 )
 from services.chatgpt_core.payment import CheckoutRequestError
 from services.chatgpt_core.registration_route_policy import ExistingAccountLoginRouteBlocked
+from services.chatgpt_core.sentinel_browser import BrowserRegistrationStageResult
 
 
 class AccessTokenOnlyCheckoutTests(unittest.TestCase):
@@ -58,6 +59,89 @@ class AccessTokenOnlyCheckoutTests(unittest.TestCase):
         )
         self.assertTrue(
             engine._should_retry("创建账号失败: HTTP 400: registration_disallowed")
+        )
+        self.assertFalse(
+            engine._should_retry("browser_registration_unavailable: worker crashed")
+        )
+
+    def test_registration_disallowed_uses_browser_stage_fallback(self):
+        email_service = mock.Mock()
+        email_service.create_email.return_value = {"email": "buyer@example.com"}
+        engine = AccessTokenOnlyRegistrationEngine(
+            email_service=email_service,
+            proxy_url="http://proxy.local:8080",
+            max_retries=1,
+        )
+
+        class BrowserFallbackClient(self._FakeChatGPTClient):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.session = mock.Mock()
+                self.registration_transport = "protocol"
+                self.last_registration_state = None
+
+            def _check_stop(self):
+                return None
+
+            def register_complete_flow(self, *args, **kwargs):
+                return False, "创建账号失败: HTTP 400: registration_disallowed"
+
+        stage_result = BrowserRegistrationStageResult(
+            final_state={
+                "page_type": "oauth_callback",
+                "current_url": "https://chatgpt.com/api/auth/callback/openai?code=demo",
+                "method": "GET",
+            },
+            page_url="https://chatgpt.com/api/auth/callback/openai?code=demo",
+            cookies=[
+                {
+                    "name": "login_session",
+                    "value": "demo",
+                    "domain": "auth.openai.com",
+                    "path": "/",
+                }
+            ],
+            cookie_names=("login_session",),
+            device_id="device-demo",
+        )
+        with (
+            mock.patch.object(
+                engine, "_probe_homepage_before_email_creation", return_value=(True, "")
+            ),
+            mock.patch.object(engine, "_report_homepage_probe"),
+            mock.patch.object(engine, "_probe_plus_checkout_billing", return_value={}),
+            mock.patch(
+                "services.chatgpt_core.access_token_only_registration_engine.ChatGPTClient",
+                BrowserFallbackClient,
+            ),
+            mock.patch(
+                "services.chatgpt_core.access_token_only_registration_engine.run_browser_registration_stage",
+                return_value=stage_result,
+            ) as browser_stage,
+            mock.patch(
+                "services.chatgpt_core.access_token_only_registration_engine.merge_playwright_cookies_into_session",
+                return_value=1,
+            ),
+        ):
+            result = engine.run()
+
+        self.assertTrue(result.success)
+        browser_stage.assert_called_once()
+        self.assertEqual(
+            result.metadata["registration_context"]["registration_transport"],
+            "camoufox_browser_fallback",
+        )
+
+    def test_browser_registration_fallback_can_be_disabled(self):
+        engine = AccessTokenOnlyRegistrationEngine(
+            email_service=mock.Mock(),
+            extra_config={"chatgpt_browser_registration_fallback_enabled": False},
+        )
+
+        self.assertFalse(
+            engine._should_use_browser_registration_fallback(
+                "创建账号失败: HTTP 400: registration_disallowed"
+            )
         )
 
     def test_v2_email_adapter_returns_none_on_mailbox_timeout_for_resend_path(self):

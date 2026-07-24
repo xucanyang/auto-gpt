@@ -11,9 +11,11 @@ from concurrent.futures import ThreadPoolExecutor
 from unittest import mock
 
 from core.browser_runtime import resolve_browser_headless
+from core.task_runtime import StopTaskRequested
 from services.chatgpt_core.chatgpt_client import ChatGPTClient
 from services.chatgpt_core.sentinel_browser import (
     BrowserAccountCreateResult,
+    BrowserRegistrationStageResult,
     _BrowserWorkerOutcome,
     _create_account_via_browser_sync,
     _evaluate_complete_sentinel_token,
@@ -23,6 +25,7 @@ from services.chatgpt_core.sentinel_browser import (
     export_session_cookies_for_playwright,
     get_sentinel_token_via_browser,
     merge_playwright_cookies_into_session,
+    run_browser_registration_stage,
     run_sync_playwright_safely,
 )
 from services.chatgpt_core.utils import generate_browser_fingerprint
@@ -113,6 +116,108 @@ emit({"type": "result", "value": {"status_code": 200, "cookie_names": ["oai-sc"]
         self.assertTrue(result and result.ok)
         self.assertEqual(result.cookie_names, ("oai-sc",))
         self.assertIn("worker-log-line", logs)
+
+    def test_browser_worker_round_trips_otp_callback(self):
+        script = r"""
+import json
+import os
+import sys
+
+protocol_fd = int(sys.argv[1])
+os.set_inheritable(protocol_fd, False)
+request = json.loads(sys.stdin.readline())
+
+def emit(message):
+    payload = (json.dumps(message, separators=(",", ":")) + "\n").encode()
+    os.write(protocol_fd, payload)
+
+emit({"type": "callback_request", "id": "otp-1", "name": "otp", "payload": {}})
+response = json.loads(sys.stdin.readline())
+emit({"type": "result", "value": {"request": request, "otp": response.get("value")}})
+"""
+        with mock.patch(
+            "services.chatgpt_core.sentinel_browser._browser_worker_command",
+            side_effect=_inline_worker_command(script),
+        ):
+            outcome = _run_isolated_browser_transaction(
+                "browser_registration",
+                {"email": "buyer@example.com"},
+                hard_timeout_seconds=2,
+                logger=lambda _message: None,
+                callbacks={"otp": lambda _payload: "123456"},
+            )
+
+        self.assertEqual(outcome.status, "ok")
+        self.assertEqual(outcome.value["otp"], "123456")
+        self.assertEqual(
+            outcome.value["request"]["operation"], "browser_registration"
+        )
+
+    def test_browser_worker_propagates_stop_from_otp_callback(self):
+        script = r"""
+import json
+import os
+import sys
+
+protocol_fd = int(sys.argv[1])
+os.set_inheritable(protocol_fd, False)
+json.loads(sys.stdin.readline())
+payload = json.dumps(
+    {"type": "callback_request", "id": "otp-1", "name": "otp", "payload": {}},
+    separators=(",", ":"),
+).encode() + b"\n"
+os.write(protocol_fd, payload)
+sys.stdin.readline()
+"""
+
+        def stop_callback(_payload):
+            raise StopTaskRequested()
+
+        with mock.patch(
+            "services.chatgpt_core.sentinel_browser._browser_worker_command",
+            side_effect=_inline_worker_command(script),
+        ):
+            with self.assertRaises(StopTaskRequested):
+                _run_isolated_browser_transaction(
+                    "browser_registration",
+                    {},
+                    hard_timeout_seconds=2,
+                    logger=lambda _message: None,
+                    callbacks={"otp": stop_callback},
+                )
+
+    def test_browser_registration_stage_uses_shared_worker_gate(self):
+        worker_outcome = _BrowserWorkerOutcome(
+            status="ok",
+            value={
+                "final_state": {
+                    "page_type": "oauth_callback",
+                    "current_url": "https://chatgpt.com/api/auth/callback/openai?code=demo",
+                },
+                "page_url": "https://chatgpt.com/api/auth/callback/openai?code=demo",
+                "cookies": [{"name": "login_session", "value": "demo"}],
+                "cookie_names": ["login_session"],
+                "device_id": "device-demo",
+                "user_agent": "Mozilla/5.0",
+            },
+        )
+        with mock.patch(
+            "services.chatgpt_core.sentinel_browser._run_with_browser_slot",
+            return_value=worker_outcome,
+        ) as worker:
+            result = run_browser_registration_stage(
+                email="buyer@example.com",
+                password="Password123!",
+                otp_callback=lambda: "123456",
+                proxy="http://proxy.local:8080",
+                device_id="device-demo",
+                hard_timeout_seconds=300,
+            )
+
+        self.assertIsInstance(result, BrowserRegistrationStageResult)
+        self.assertTrue(result.ok)
+        self.assertEqual(result.cookie_names, ("login_session",))
+        self.assertIn("otp", worker.call_args.kwargs["callbacks"])
 
     def test_browser_worker_hard_timeout_kills_entire_process_group(self):
         script = _INLINE_WORKER_PREAMBLE + r"""

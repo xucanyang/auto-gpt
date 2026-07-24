@@ -22,6 +22,7 @@ from core.browser_runtime import (
     resolve_browser_headless,
 )
 from core.playwright_proxy import playwright_proxy_context
+from core.task_runtime import TaskInterruption
 
 from .sentinel_constants import (
     DEFAULT_SENTINEL_FRAME_URL,
@@ -231,6 +232,8 @@ def _decode_browser_worker_message(
             status="error",
             error=str(message.get("error") or "browser worker failed")[:1000],
         )
+    if kind == "callback_request":
+        return _BrowserWorkerOutcome(status="callback", value=dict(message))
     logger(f"Browser Worker 返回了未知消息类型: {kind or '<empty>'}")
     return None
 
@@ -242,6 +245,7 @@ def _run_isolated_browser_transaction(
     hard_timeout_seconds: float,
     logger: Callable[[str], None],
     stop_check: Optional[Callable[[], None]] = None,
+    callbacks: Optional[dict[str, Callable[[dict[str, Any]], Any]]] = None,
 ) -> _BrowserWorkerOutcome:
     """Run one browser transaction in a killable OS process group."""
     read_fd, write_fd = os.pipe()
@@ -271,10 +275,13 @@ def _run_isolated_browser_transaction(
         write_fd = -1
         selector.register(read_fd, selectors.EVENT_READ)
 
-        request_bytes = json.dumps(
+        request_bytes = (
+            json.dumps(
             {"operation": str(operation), "payload": dict(payload or {})},
             ensure_ascii=False,
             separators=(",", ":"),
+            )
+            + "\n"
         ).encode("utf-8")
         if process.stdin is None:
             raise RuntimeError("browser worker stdin unavailable")
@@ -284,7 +291,9 @@ def _run_isolated_browser_transaction(
             if not written:
                 raise BrokenPipeError("browser worker closed stdin before request completed")
             request_view = request_view[written:]
-        process.stdin.close()
+        process.stdin.flush()
+        if not callbacks:
+            process.stdin.close()
 
         deadline = time.monotonic() + max(float(hard_timeout_seconds), 0.1)
         protocol_eof = False
@@ -323,7 +332,66 @@ def _run_isolated_browser_transaction(
                         logger=logger,
                     )
                     if message_outcome is not None:
-                        outcome = message_outcome
+                        if message_outcome.status == "callback":
+                            callback_request = dict(message_outcome.value or {})
+                            callback_name = str(
+                                callback_request.get("name") or ""
+                            ).strip()
+                            callback_id = str(
+                                callback_request.get("id") or ""
+                            ).strip()
+                            callback_payload = callback_request.get("payload")
+                            if not isinstance(callback_payload, dict):
+                                callback_payload = {}
+                            callback = (callbacks or {}).get(callback_name)
+                            callback_response: dict[str, Any] = {
+                                "type": "callback_response",
+                                "id": callback_id,
+                            }
+                            if callback is None:
+                                callback_response["error"] = (
+                                    f"unsupported browser callback: {callback_name or '<empty>'}"
+                                )
+                            else:
+                                if stop_check is not None:
+                                    try:
+                                        stop_check()
+                                    except BaseException as exc:
+                                        interrupted = exc
+                                        break
+                                try:
+                                    callback_response["value"] = callback(
+                                        callback_payload
+                                    )
+                                except BaseException as exc:
+                                    if isinstance(
+                                        exc,
+                                        (TaskInterruption, KeyboardInterrupt, SystemExit),
+                                    ):
+                                        interrupted = exc
+                                        break
+                                    callback_response["error"] = (
+                                        f"{type(exc).__name__}: {exc}"
+                                    )[:1000]
+                            response_bytes = (
+                                json.dumps(
+                                    callback_response,
+                                    ensure_ascii=False,
+                                    separators=(",", ":"),
+                                )
+                                + "\n"
+                            ).encode("utf-8")
+                            if process.stdin is None:
+                                raise RuntimeError(
+                                    "browser worker stdin unavailable during callback"
+                                )
+                            process.stdin.write(response_bytes)
+                            process.stdin.flush()
+                        else:
+                            outcome = message_outcome
+
+            if interrupted is not None:
+                break
 
             exit_code = process.poll()
             if exit_code is not None and protocol_eof:
@@ -431,6 +499,7 @@ def _run_with_browser_slot(
     hard_timeout_seconds: float,
     logger: Callable[[str], None],
     stop_check: Optional[Callable[[], None]] = None,
+    callbacks: Optional[dict[str, Callable[[dict[str, Any]], Any]]] = None,
 ) -> _BrowserWorkerOutcome:
     global _BROWSER_ACTIVE_COUNT
 
@@ -497,6 +566,7 @@ def _run_with_browser_slot(
             hard_timeout_seconds=hard_timeout_seconds,
             logger=logger,
             stop_check=stop_check,
+            callbacks=callbacks,
         )
     finally:
         if acquired:
@@ -523,6 +593,28 @@ class BrowserAccountCreateResult:
     @property
     def ok(self) -> bool:
         return 200 <= int(self.status_code or 0) < 300
+
+
+@dataclass
+class BrowserRegistrationStageResult:
+    """Result of a browser-owned email/OTP/about-you registration stage."""
+
+    final_state: dict[str, Any] = field(default_factory=dict)
+    page_url: str = ""
+    cookies: list[dict[str, Any]] = field(default_factory=list)
+    cookie_names: tuple[str, ...] = ()
+    device_id: str = ""
+    user_agent: str = ""
+    error: str = ""
+
+    @property
+    def ok(self) -> bool:
+        page_type = str((self.final_state or {}).get("page_type") or "")
+        return not self.error and page_type in {
+            "callback",
+            "oauth_callback",
+            "chatgpt_home",
+        }
 
 
 def export_session_cookies_for_playwright(
@@ -1127,6 +1219,70 @@ def _add_cookies_best_effort(
                 f"error={exc}"
             )
     return added
+
+
+def run_browser_registration_stage(
+    *,
+    email: str,
+    password: str,
+    otp_callback: Callable[[], str],
+    proxy: Optional[str] = None,
+    device_id: str = "",
+    headless: bool = True,
+    stop_check: Optional[Callable[[], None]] = None,
+    hard_timeout_seconds: Optional[float] = None,
+    log_fn: Optional[Callable[[str], None]] = None,
+) -> BrowserRegistrationStageResult:
+    """Run browser registration in the shared, killable browser capacity gate."""
+
+    logger = log_fn or (lambda _message: None)
+    effective_hard_timeout = (
+        max(float(hard_timeout_seconds), 0.1)
+        if hard_timeout_seconds is not None
+        else _browser_hard_timeout_seconds(
+            "BROWSER_REGISTRATION_HARD_TIMEOUT_SECONDS",
+            420.0,
+        )
+    )
+
+    def _request_otp(_payload: dict[str, Any]) -> str:
+        value = otp_callback()
+        return str(value or "").strip()
+
+    outcome = _run_with_browser_slot(
+        "browser_registration",
+        {
+            "email": str(email or ""),
+            "password": str(password or ""),
+            "proxy": str(proxy or "") or None,
+            "device_id": str(device_id or ""),
+            "headless": bool(headless),
+        },
+        hard_timeout_seconds=effective_hard_timeout,
+        logger=logger,
+        stop_check=stop_check,
+        callbacks={"otp": _request_otp},
+    )
+    if outcome.status == "timeout":
+        return BrowserRegistrationStageResult(
+            error=f"browser_registration_hard_timeout: {outcome.error}"
+        )
+    if outcome.status != "ok":
+        return BrowserRegistrationStageResult(
+            error=f"browser_registration_unavailable: {outcome.error}"
+        )
+    if not isinstance(outcome.value, dict):
+        return BrowserRegistrationStageResult(
+            error="browser_registration_invalid_result"
+        )
+    payload = dict(outcome.value)
+    payload["cookie_names"] = tuple(payload.get("cookie_names") or ())
+    try:
+        return BrowserRegistrationStageResult(**payload)
+    except (TypeError, ValueError) as exc:
+        return BrowserRegistrationStageResult(
+            error=f"browser_registration_result_parse_failed: {exc}"
+        )
 
 
 def create_account_via_browser(
