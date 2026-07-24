@@ -343,7 +343,12 @@ export function RegisterTaskModal({
             </>
           ) : null}
           {currentPlatform === 'chatgpt' && !isPhoneSignup ? (
-            <Form.Item name="mail_provider_override" label="邮箱服务（仅本任务）" initialValue="__global__">
+            <Form.Item
+              name="mail_provider_override"
+              label="邮箱服务（本任务默认）"
+              initialValue="__global__"
+              extra="选择“跟随全局默认”以使用设置页配置；点击“保存设置”后，本浏览器的注册面板会记住这里的选择，不会改写全局配置。"
+            >
               <Select
                 options={[
                   {

@@ -26,9 +26,12 @@ def test_registration_modal_uses_server_profile_instead_of_stale_browser_overrid
     assert "const configCacheRef = useRef<Record<string, any> | null>(null)" in page
     assert "if (!options.force && configCacheRef.current) return configCacheRef.current" in page
     assert "configCacheRef.current = cfg" in page
-    assert "mail_provider_override: '__global__'" in page
+    assert "const savedProviderOverride = normalizeRegisterMailProviderOverride(savedSettings.mail_provider_override)" in page
+    assert "mail_provider_override: savedProviderOverride" in page
+    assert "tempmail_fixed_domains: tempmailFixedDomains" in page
     assert "savedSettings.chatgpt_register_otp_wait_seconds" not in page
-    assert 'label="邮箱服务（仅本任务）"' in modal
+    assert 'label="邮箱服务（本任务默认）"' in modal
+    assert '不会改写全局配置' in modal
 
 
 def test_start_registration_does_not_write_task_values_back_to_global_config():
@@ -51,5 +54,7 @@ def test_start_registration_does_not_write_task_values_back_to_global_config():
     assert "chatgpt_register_otp_wait_seconds: String(" in save_block
     assert "chatgpt_register_otp_resend_wait_seconds: String(" in save_block
     assert "chatgpt_register_otp_account_budget_seconds: String(" in save_block
+    assert "mail_provider_override: settingsPayload.mail_provider_override" in save_block
+    assert "tempmail_fixed_domains: settingsPayload.tempmail_fixed_domains" in save_block
     assert "saveTaskProxySettingsToConfig" not in standalone_page
     assert "method: 'PUT'" not in standalone_page

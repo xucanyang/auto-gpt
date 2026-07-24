@@ -110,6 +110,15 @@ function gopayPhaseMeta(phase?: string) {
 }
 
 const REGISTER_FORM_SETTINGS_STORAGE_PREFIX = 'auto-chatgpt.register-form-settings.v2.'
+const REGISTER_MAIL_PROVIDER_OVERRIDES = new Set([
+  '__global__',
+  'hme_ready_api',
+  'icloud_hme',
+  'tempmail_local',
+  'tempmail_api',
+  'email_api',
+  'manual_email_otp',
+])
 const DEFAULT_CHECKOUT_COUNTRY = 'ID'
 const DEFAULT_CHECKOUT_CURRENCY = 'IDR'
 const DEFAULT_GOPAY_OTP_AUTO_RESEND_DELAY_SECONDS = 120
@@ -1222,6 +1231,15 @@ function loadRegisterFormSettings(platform: string) {
 function saveRegisterFormSettings(platform: string, values: Record<string, unknown>) {
   if (typeof window === 'undefined') return
   window.localStorage.setItem(getRegisterFormSettingsStorageKey(platform), JSON.stringify(values))
+}
+
+function normalizeRegisterMailProviderOverride(value: unknown) {
+  const normalized = String(value || '').trim().toLowerCase()
+  return REGISTER_MAIL_PROVIDER_OVERRIDES.has(normalized) ? normalized : '__global__'
+}
+
+function normalizeRegisterTempMailMode(value: unknown, fallback = 'fixed_domain') {
+  return String(value || '').trim().toLowerCase() === 'task_subdomain' ? 'task_subdomain' : fallback
 }
 
 function intWithDefault(value: unknown, fallback: number, min = 0) {
@@ -3622,21 +3640,33 @@ export default function Accounts() {
         if (cancelled) return
         const provider = String(cfg?.mail_provider || 'luckmail').trim() || 'luckmail'
         const savedSettings = loadRegisterFormSettings(currentPlatform)
+        const savedProviderOverride = normalizeRegisterMailProviderOverride(savedSettings.mail_provider_override)
         const proxySettings = taskProxySettingsFromConfig(cfg)
         const savedEmail = window.localStorage.getItem('auto-chatgpt.manual_email_otp.email') || ''
         const configuredTempMailMode = String(cfg?.tempmail_mode || 'fixed_domain').trim().toLowerCase()
-        const tempmailMode = configuredTempMailMode === 'task_subdomain' ? 'task_subdomain' : 'fixed_domain'
-        const tempmailFixedDomains = normalizeDomainList([
+        const globalTempMailMode = normalizeRegisterTempMailMode(configuredTempMailMode)
+        const globalTempMailFixedDomains = normalizeDomainList([
           ...parseStoredDomainList(cfg?.tempmail_fixed_domains),
           cfg?.tempmail_primary_domain,
         ])
+        const hasSavedTempMailMode = Object.prototype.hasOwnProperty.call(savedSettings, 'tempmail_mode')
+        const hasSavedTempMailDomains = Object.prototype.hasOwnProperty.call(savedSettings, 'tempmail_fixed_domains')
+        const tempmailMode = hasSavedTempMailMode
+          ? normalizeRegisterTempMailMode(savedSettings.tempmail_mode, globalTempMailMode)
+          : globalTempMailMode
+        const tempmailFixedDomains = hasSavedTempMailDomains
+          ? normalizeDomainList(savedSettings.tempmail_fixed_domains)
+          : globalTempMailFixedDomains
+        const tempmailPrimaryDomain = Object.prototype.hasOwnProperty.call(savedSettings, 'tempmail_primary_domain')
+          ? String(savedSettings.tempmail_primary_domain || '').trim().replace(/^[@.]+/, '')
+          : (tempmailFixedDomains[0] || '')
         setRegisterMailProvider(provider)
         registerForm.setFieldsValue({
           count: Number(savedSettings.count || 1) || 1,
           concurrency: Number(savedSettings.concurrency || 1) || 1,
           register_delay_seconds: Number(savedSettings.register_delay_seconds || 0) || 0,
           ...proxySettings,
-          mail_provider_override: '__global__',
+          mail_provider_override: savedProviderOverride,
           email_api_lines: String(cfg.email_api_lines || '').trim(),
           email_api_poll_interval_seconds: cfg.email_api_poll_interval_seconds || 3,
           email_api_request_timeout_seconds: cfg.email_api_request_timeout_seconds || 15,
@@ -3645,7 +3675,7 @@ export default function Accounts() {
           email_api_gmail_variant_rules: cfg.email_api_gmail_variant_rules || 'all',
           email_api_gmail_plus_tag_template: cfg.email_api_gmail_plus_tag_template || 'r{rand}',
           tempmail_mode: tempmailMode,
-          tempmail_primary_domain: tempmailFixedDomains[0] || '',
+          tempmail_primary_domain: tempmailPrimaryDomain || tempmailFixedDomains[0] || '',
           tempmail_fixed_domains: tempmailFixedDomains,
           email: String(savedSettings.email || savedEmail || '').trim(),
           login_password: String(cfg.chatgpt_existing_account_login_password || '').trim(),
@@ -3678,13 +3708,16 @@ export default function Accounts() {
         if (cancelled) return
         setRegisterMailProvider('luckmail')
         const savedSettings = loadRegisterFormSettings(currentPlatform)
+        const savedProviderOverride = normalizeRegisterMailProviderOverride(savedSettings.mail_provider_override)
+        const savedTempMailMode = normalizeRegisterTempMailMode(savedSettings.tempmail_mode)
+        const savedTempMailDomains = normalizeDomainList(savedSettings.tempmail_fixed_domains)
         const savedEmail = window.localStorage.getItem('auto-chatgpt.manual_email_otp.email') || ''
         registerForm.setFieldsValue({
           count: Number(savedSettings.count || 1) || 1,
           concurrency: Number(savedSettings.concurrency || 1) || 1,
           register_delay_seconds: Number(savedSettings.register_delay_seconds || 0) || 0,
           ...taskProxySettingsFromConfig({}),
-          mail_provider_override: '__global__',
+          mail_provider_override: savedProviderOverride,
           email_api_lines: '',
           email_api_poll_interval_seconds: 3,
           email_api_request_timeout_seconds: 15,
@@ -3692,9 +3725,9 @@ export default function Accounts() {
           email_api_gmail_variant_count: 2,
           email_api_gmail_variant_rules: 'all',
           email_api_gmail_plus_tag_template: 'r{rand}',
-          tempmail_mode: 'fixed_domain',
-          tempmail_primary_domain: '',
-          tempmail_fixed_domains: [],
+          tempmail_mode: savedTempMailMode,
+          tempmail_primary_domain: String(savedSettings.tempmail_primary_domain || '').trim().replace(/^[@.]+/, '') || savedTempMailDomains[0] || '',
+          tempmail_fixed_domains: savedTempMailDomains,
           email: String(savedSettings.email || savedEmail || '').trim(),
           login_password: '',
           chatgpt_existing_account_capture: savedSettings.chatgpt_existing_account_capture ?? false,
@@ -5313,6 +5346,12 @@ export default function Accounts() {
 
   const handleSaveRegisterSettings = async () => {
     const values = registerForm.getFieldsValue(true)
+    const mailProviderOverride = normalizeRegisterMailProviderOverride(values.mail_provider_override)
+    const tempmailMode = normalizeRegisterTempMailMode(values.tempmail_mode)
+    const tempmailFixedDomains = normalizeDomainList(values.tempmail_fixed_domains)
+    const tempmailPrimaryDomain = String(
+      values.tempmail_primary_domain || tempmailFixedDomains[0] || '',
+    ).trim().replace(/^[@.]+/, '')
     const settingsPayload = {
       count: Number(values.count || 1) || 1,
       concurrency: Number(values.concurrency || 1) || 1,
@@ -5323,7 +5362,10 @@ export default function Accounts() {
       proxy_failover: Boolean(values.proxy_failover),
       proxy_max_candidates: Number(values.proxy_max_candidates || 5) || 5,
       proxy_min_score: Number(values.proxy_min_score || 50) || 50,
-      mail_provider_override: String(values.mail_provider_override || '__global__'),
+      mail_provider_override: mailProviderOverride,
+      tempmail_mode: tempmailMode,
+      tempmail_primary_domain: tempmailPrimaryDomain,
+      tempmail_fixed_domains: tempmailFixedDomains,
       email: String(values.email || '').trim(),
       chatgpt_existing_account_capture: Boolean(values.chatgpt_existing_account_capture),
       chatgpt_save_registration_access_token_account:
@@ -5347,6 +5389,10 @@ export default function Accounts() {
         count: settingsPayload.count,
         concurrency: settingsPayload.concurrency,
         register_delay_seconds: settingsPayload.register_delay_seconds,
+        mail_provider_override: settingsPayload.mail_provider_override,
+        tempmail_mode: settingsPayload.tempmail_mode,
+        tempmail_primary_domain: settingsPayload.tempmail_primary_domain,
+        tempmail_fixed_domains: settingsPayload.tempmail_fixed_domains,
         email: settingsPayload.email,
       })
       await saveTaskProxySettingsToConfig(settingsPayload)
