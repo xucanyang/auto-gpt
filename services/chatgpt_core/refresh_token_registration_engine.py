@@ -1,9 +1,12 @@
 """
 ChatGPT Refresh Token 注册引擎。
 
-新实现不再沿用旧的分步补丁式注册链路，而是直接复用：
-1. `ChatGPTClient.register_complete_flow()` 负责完整注册状态机
-2. `OAuthClient.login_and_get_tokens()` 负责全新 OAuth + passwordless OTP 登录拿 RT
+协议执行器复用：
+1. `ChatGPTClient.register_complete_flow()` 负责纯 HTTP 注册状态机
+2. `OAuthClient.login_and_get_tokens()` 负责纯 HTTP OAuth + passwordless OTP 登录拿 RT
+
+浏览器执行器由 `chatgpt_registration_mode_adapter` 分派到 Camoufox 两阶段链路，
+不会进入本引擎的 HTTP 注册/OAuth 状态机。
 
 目标是让 refresh_token 模式与当前主状态机链路保持一致，不再以旧流程做兜底。
 """
@@ -321,6 +324,19 @@ class RefreshTokenRegistrationEngine:
             return False
 
     def _finalize_email_service_success(self, result: RegistrationResult) -> None:
+        metadata = getattr(result, "metadata", None)
+        metadata = metadata if isinstance(metadata, dict) else {}
+        try:
+            self.email_service._registration_result_code = (
+                "registered_auth_pending"
+                if metadata.get("registered_auth_pending")
+                else "login_alive"
+            )
+            self.email_service._registration_access_token_saved = bool(
+                str(getattr(result, "access_token", "") or "").strip()
+            )
+        except Exception:
+            pass
         finalize = getattr(self.email_service, "finalize_success", None)
         if not callable(finalize):
             return
@@ -1039,6 +1055,21 @@ class RefreshTokenRegistrationEngine:
             "first_name": first_name,
             "last_name": last_name,
             "birthdate": birthdate,
+            "requested_executor": str(
+                getattr(register_client, "requested_executor", self.browser_mode)
+                or self.browser_mode
+            ),
+            "effective_executor": str(
+                getattr(register_client, "effective_executor", self.browser_mode)
+                or self.browser_mode
+            ),
+            "registration_transport": str(
+                getattr(register_client, "registration_transport", "protocol_http")
+                or "protocol_http"
+            ),
+            "stage_transports": list(
+                getattr(register_client, "registration_stage_transports", None) or []
+            ),
         })
 
     def _attach_browser_fingerprint_metadata(
@@ -1388,6 +1419,16 @@ class RefreshTokenRegistrationEngine:
                 return result
 
             self._log("[注册] 开始执行注册状态机")
+            register_client.requested_executor = "protocol"
+            register_client.effective_executor = "protocol"
+            register_client.registration_transport = "protocol_http"
+            register_client.registration_stage_transports = [
+                {
+                    "stage": "registration",
+                    "transport": "curl_cffi_http",
+                    "executor": "protocol",
+                }
+            ]
             registered, registration_message = register_client.register_complete_flow(
                 result.email,
                 self.password,
@@ -1447,6 +1488,14 @@ class RefreshTokenRegistrationEngine:
             if registered and source == "register":
                 self._log("[注册] 开始落地 ChatGPT session")
                 session_ok, session_or_error = register_client.reuse_session_and_get_tokens()
+                register_client.registration_stage_transports.append(
+                    {
+                        "stage": "web_session_capture",
+                        "transport": "curl_cffi_http",
+                        "executor": "protocol",
+                        "status": "success" if session_ok else "failed",
+                    }
+                )
                 if not session_ok:
                     result.error_message = f"注册收尾失败: {session_or_error}"
                     self._log(result.error_message, "warning")

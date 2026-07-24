@@ -1,8 +1,7 @@
 """ChatGPT / Codex CLI 平台插件"""
 
 import json
-import random
-import string
+import secrets
 
 from core.base_mailbox import BaseMailbox
 from core.base_platform import Account, BasePlatform, RegisterConfig
@@ -15,6 +14,23 @@ from services.chatgpt_core.mailbox_state import (
     build_mailbox_state,
     export_mailbox_state_config,
 )
+
+
+def _generate_chatgpt_registration_password(length: int = 16) -> str:
+    """Generate a password that always satisfies the OpenAI signup form."""
+    minimum_length = 12
+    size = max(int(length or minimum_length), minimum_length)
+    specials = ",._!@#"
+    characters = [
+        secrets.choice("abcdefghijklmnopqrstuvwxyz"),
+        secrets.choice("ABCDEFGHIJKLMNOPQRSTUVWXYZ"),
+        secrets.choice("0123456789"),
+        secrets.choice(specials),
+    ]
+    pool = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789" + specials
+    characters.extend(secrets.choice(pool) for _ in range(size - len(characters)))
+    secrets.SystemRandom().shuffle(characters)
+    return "".join(characters)
 
 
 class ChatGPTPlatform(BasePlatform):
@@ -45,7 +61,7 @@ class ChatGPTPlatform(BasePlatform):
 
     def register(self, email: str = None, password: str = None) -> Account:
         if not password:
-            password = "".join(random.choices(string.ascii_letters + string.digits + "!@#$", k=16))
+            password = _generate_chatgpt_registration_password()
 
         browser_mode = (self.config.executor_type if self.config else None) or "protocol"
         extra_config = dict((self.config.extra or {}) if self.config and getattr(self.config, "extra", None) else {})
@@ -195,7 +211,15 @@ class ChatGPTPlatform(BasePlatform):
                     proxy=proxy,
                 )
 
-            def _sync_hme_rerun_result(acct, *, success: bool, error_message: str = "", task_id: str = ""):
+            def _sync_hme_rerun_result(
+                acct,
+                *,
+                success: bool,
+                error_message: str = "",
+                task_id: str = "",
+                result_code: str = "",
+                access_token_saved: bool = False,
+            ):
                 if _mail_provider != "icloud_hme" or acct is None:
                     return
                 account_extra = dict(getattr(acct, "extra", None) or {})
@@ -213,6 +237,8 @@ class ChatGPTPlatform(BasePlatform):
                         task_id=str(task_id or _task_id or "").strip(),
                         success=bool(success),
                         error_message=str(error_message or ""),
+                        access_token_saved=bool(access_token_saved),
+                        result_code=str(result_code or ""),
                         mailbox_state=_export_mailbox_state_payload(acct, getattr(email_service, "_before_ids", set()) if "email_service" in locals() else set()),
                         delete_candidate=bool(not success and is_account_deactivated_message("", str(error_message or ""))),
                     )
@@ -340,7 +366,17 @@ class ChatGPTPlatform(BasePlatform):
                     # lease state.  Capture it after the mutation so account
                     # persistence never stores the pre-commit snapshot.
                     self._post_finalize_state = self.export_state()
-                    _sync_hme_rerun_result(self._acct, success=True, task_id=resolved_task_id)
+                    _sync_hme_rerun_result(
+                        self._acct,
+                        success=True,
+                        task_id=resolved_task_id,
+                        result_code=str(
+                            getattr(self, "_registration_result_code", "") or "login_alive"
+                        ),
+                        access_token_saved=bool(
+                            getattr(self, "_registration_access_token_saved", False)
+                        ),
+                    )
 
                 def finalize_failure(self, error_message: str = "", task_id: str = ""):
                     if not self._acct:

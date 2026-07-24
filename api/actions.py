@@ -520,6 +520,16 @@ def _execute_platform_action(
 
     if platform == "chatgpt" and action_id == "upload_sub2api":
         outcome = backfill_chatgpt_account_to_sub2api(acc_model, session=session, commit=False)
+        result = {
+            "ok": bool(outcome.get("ok")),
+            "data": {
+                "message": str(outcome.get("message") or ""),
+                "results": outcome.get("results") or [],
+            },
+            "error": "" if outcome.get("ok") else str(outcome.get("message") or ""),
+        }
+        _apply_action_result(platform, action_id, acc_model, result, session)
+        return result
     if platform == "chatgpt" and action_id == "upload_oaipay":
         category_id = params.get("category_id")
         outcome = backfill_chatgpt_account_to_oaipay(

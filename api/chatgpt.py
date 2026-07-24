@@ -25,6 +25,7 @@ from services.chatgpt_account_state import (
     apply_chatgpt_status_policy,
     apply_payment_snapshot_status,
     classify_chatgpt_capabilities,
+    is_chatgpt_upload_ready,
     mark_payment_failed,
     mark_payment_pending,
 )
@@ -3733,6 +3734,14 @@ class CpaUploadReq(BaseModel):
 def upload_cpa(account_id: int, req: CpaUploadReq,
                session: Session = Depends(get_session)):
     acc = _get_account(account_id, session)
+    ready, gate_message, capabilities = is_chatgpt_upload_ready(acc)
+    if not ready:
+        return {
+            "ok": False,
+            "skipped": True,
+            "message": gate_message,
+            "upload_gate": capabilities.get("upload_gate") or "",
+        }
     codex_acc = _to_codex_account(acc)
 
     from services.chatgpt_core.cpa_upload import upload_to_cpa, generate_token_json

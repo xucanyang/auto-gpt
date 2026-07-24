@@ -6,27 +6,57 @@
 
 ## [Unreleased] (未发布)
 
-## [2.8.27] - 2026-07-25
+## [2.8.28] - 2026-07-25
 
-### 移除 (Removed) / 回退 (Reverted)
-- **整段回退本轮 ChatGPT 注册改造（v2.8.24–v2.8.26）**：通过 `git revert` 撤销 `64d2e17`（三执行器硬分派与浏览器链路统一）、`02ede6f`（Camoufox 密码校验与页面推进）、`9fc896b`（密码 staged 提交、身份槽与禁止 signup 重放）。注册相关代码恢复到 **`145cf4b`（v2.8.23）** 时的行为：协议/浏览器后备混用路径与旧密码提交逻辑回到改前状态。
-- **明确保留的非注册改动**：Team 账单国家/Checkout 目录（v2.8.22–v2.8.23）、注册面板邮箱画像与代理/手机号面板保存修复、以及更早的 OAuth/HME/支付链路历史提交均未回退。
-- 侧栏版本同步为 `v2.8.27`，便于与曾部署过的 v2.8.24–v2.8.26 区分。
+### 变更 (Changed)
+- **撤销 v2.8.27 回退，恢复上一版 v2.8.26 运行态**：`git revert` 掉 `fec1d28`（曾整段撤掉 v2.8.24–v2.8.26 注册改造），注册三执行器硬分派、Camoufox 密码 staged 提交、身份槽与禁止 signup 重放、OTP/about-you committed 合同等全部恢复为 v2.8.26 时的代码与测试。侧栏版本记为 `v2.8.28`，避免与已下线的 v2.8.27 混淆。
 
-### 说明 (Notes)
-- 历史上线过的 v2.8.24 / v2.8.25 / v2.8.26 功能在本版本运行态中已不再生效；如需重新引入「执行器互斥」或密码提交合同，应基于当前代码重新设计，不要假设旧 commit 仍在镜像中。
+## [2.8.27] - 2026-07-25 (已于 v2.8.28 撤销)
 
-## [2.8.26] - 2026-07-25 (已于 v2.8.27 回退)
+曾整段回退 v2.8.24–v2.8.26 注册改造；**已在 v2.8.28 撤销该回退**。
 
-曾包含浏览器注册密码 staged 提交、身份槽占用与 OTP/about-you 禁止非幂等重放；**已在 v2.8.27 整段 revert**。
+## [2.8.26] - 2026-07-25
 
-## [2.8.25] - 2026-07-25 (已于 v2.8.27 回退)
+### 修复 (Fixed)
+- **封死浏览器注册的身份分叉与结果不确定重放**：`api/tasks.py` 在 `executor_type=headless/headed` 进入 `Platform.register()` 后，失败不再切换代理候选、换邮箱或换指纹补位，并通过 `core/task_runtime.py` 的 `consumes_target_slot` 将不确定失败计入目标身份槽预算；`count > 1` 时仍允许跑用户原本请求的其他身份槽。`protocol` 的代理 failover 与补尝试语义保持不变。
+- **Camoufox 完整 signup 单次执行**：`services/chatgpt_core/access_token_only_registration_engine.py` 对普通浏览器开户强制 `registration_max_retries=1`，禁止默认 `max_retries=3` 对结果不确定的 signup 整流程重放；纯协议与显式已有账号浏览器登录仍保留原重试。
+- **密码提交改为受控 staged 降级**：`services/chatgpt_core/browser_registration.py` 引入 `_NetworkActivityObserver` 与 `_PasswordFormSubmission`，按 `真实 click → 无业务请求再 requestSubmit → 再无请求才 Enter` 推进，并在 Sentinel/Cloudflare 进行中延长观察。注册与 OAuth 密码页均以业务 API 响应（`/api/accounts/user/register`、`/api/accounts/password/verify`）为准推进，`2xx` 后等待 SPA 离开旧密码 DOM，不再在 click 异常后立即 `requestSubmit`。
+- **OTP / about-you 禁止非幂等重放**：OTP 在填充前安装网络观察器，自动提交后不再重复点击 Continue；`2xx/204` 记为 `otp_committed`/`signup_committed` 后有界等待页面推进。请求已发出但 response 丢失时，不再走 API fallback 重放验证码，也不再用新 invocation ID 重建 `create_account`。`signup_committed` 后的 add-phone 页按注册完成处理，便于后续严格浏览器 OAuth。
 
-曾包含 Camoufox 密码字符类别、page-first 入口与密码响应推进；**已在 v2.8.27 整段 revert**。
+### 优化 (Changed)
+- **注册入口等待与 passwordless 单次点击**：邮箱入口等待超时放宽到 60 秒，passwordless 一次性验证码入口只点击一次并记录 `otp_sent_at`，避免循环点击造成重复发码竞态。
 
-## [2.8.24] - 2026-07-25 (已于 v2.8.27 回退)
+### 测试 (Tests)
+- 扩展 `tests/test_browser_registration_flow.py`、`tests/test_register_task_controls.py`、`tests/test_access_token_only_checkout.py`，覆盖密码 staged 提交、OTP/about-you committed、浏览器失败占用身份槽、协议 failover 不受影响、engine 单次 signup。侧栏版本同步为 `v2.8.26`。
 
-曾包含三执行器硬分派、浏览器 transport 所有权、`registered_auth_pending` 与上传 gate 等；**已在 v2.8.27 整段 revert**。
+## [2.8.25] - 2026-07-25
+
+### 优化 (Changed)
+- **浏览器注册优先采用已验证的 OpenAI 页面入口**：`services/chatgpt_core/browser_registration.py` 现在与参考实现一致，先从 `platform.openai.com/login` 在同一 Camoufox 上下文推进邮箱与 passwordless OTP，页面入口不可用时才回退 ChatGPT authorize。一次性验证码入口只点击一次，后续仅观察状态，避免循环点击造成重复发码竞态；整个过程仍保持 `headless/headed` 浏览器 transport，不接入协议 Session。
+
+### 修复 (Fixed)
+- **修复随机弱密码导致注册页原地不动**：`services/chatgpt_core/plugin.py` 不再从混合字符池无约束抽取 16 位密码，改为使用 `secrets` 强制生成不少于 12 位且必含大写、小写、数字和符号的密码。该规则补齐了从 `/opt/any-auto-register` 移植浏览器流程时遗漏的 ChatGPT 专用密码合同，避免命中 `/create-account/password` 时因缺少字符类别被前端校验拦截。
+- **按真实注册响应推进密码阶段**：密码提交前监听同一浏览器上下文的 `/api/accounts/user/register` response 与 request failure；`2xx` 即使 SPA URL 未变化也按返回的 `page.type` 进入 OTP，`4xx` 保留服务端错误，不再统一等 20 秒后伪装成 `status=0`。页面状态识别改为可见 OTP/about-you 优先，不会再被 SPA 遗留的隐藏 password input 拉回密码阶段；浏览器原生 validity 与关联错误节点也会进入失败原因。
+
+### 测试 (Tests)
+- 扩展 `tests/test_chatgpt_plugin.py` 与 `tests/test_browser_registration_flow.py`，覆盖密码字符类别、显式密码保持、page-first/authorize fallback、passwordless 单次点击、隐藏密码 DOM、密码注册 `2xx` URL 不变及 `4xx` 错误传播。插件、Camoufox 浏览器流、注册模式、AT-only 与任务控制专项回归均通过；侧栏版本同步更新为 `v2.8.25`。
+
+## [2.8.24] - 2026-07-25
+
+### 优化 (Changed)
+- **建立 ChatGPT 三执行器硬分派合同**：`services/chatgpt_core/access_token_only_registration_engine.py`、`chatgpt_client.py`、`oauth_client.py`、`browser_registration.py` 与 `sentinel_browser.py` 现在将 `protocol`、`headless`、`headed` 作为互斥执行器。纯协议注册只使用 `curl_cffi` 与 HTTP Sentinel PoW，Cloudflare、Sentinel 或协议状态机失败时原样失败；浏览器注册从第一步直接进入独立 Camoufox 上下文，不再先跑协议注册、回灌浏览器 Cookie 到 curl Session，或在失败后由另一执行器接管。显式无头/有头选择不会再被运行环境变量改写，未知执行器直接拒绝。
+- **统一浏览器注册与 RT 两阶段的 transport 所有权**：浏览器注册上下文在关闭前直接读取 `/api/auth/session` 并返回 Web AT、Session、Cookie 与账号身份；需要 RT 时，第二阶段继续使用严格 Camoufox OAuth，只保留标准 authorization-code exchange，不允许 curl OAuth 状态机接管。注册阶段遇到 `login_password` 只报告已有账号，必须显式使用“已有账号抓取”，不会从 signup 偷偷切换登录恢复。
+- **补齐执行器运行审计**：账号注册上下文与 `extra` 记录 requested/effective executor、registration transport、各阶段 transport 以及 Camoufox 实测 UA/device profile。浏览器账号不再被任务层预生成的 Chrome fingerprint 覆盖；协议账号继续保留稳定的账号级指纹与签名。
+- **统一前端任务级执行器选择**：`RegisterTaskPage.tsx` 与账号页 `RegisterTaskModal.tsx` 共享三项互斥说明，注册画像保存并恢复 `executor_type`，任务提交使用表单当次选择而非全局默认。异步加载配置时会检测字段是否已被用户触碰，避免响应返回后覆盖刚选择的执行器。
+
+### 修复 (Fixed)
+- **固定单次注册身份与本地化资料填写**：同一 account attempt 的整流程重试固定邮箱、密码、姓名、生日、device ID 与指纹种子，不再重试一次就换一套人物资料。Camoufox about-you 表单补齐日文 `氏名` / `年齢` 识别，年龄输入框填写实际年龄，不再误填完整生日字符串。
+- **安全保存“已注册但认证待补抓”账号**：浏览器已完成 signup 但暂未拿到 AT/RT 时，使用 `registered_auth_pending`、`needs_auth_capture` 和独立 auth level 落库，禁止重放同邮箱 signup，也不再伪造远端 account ID。RT adapter 会完成真实邮箱/HME finalize；任务快照、日志与 HME 重跑队列明确区分远端注册完成和认证可用，且不会把本地账号 ID 误判为已保存 AT。
+- **防止 pending 覆盖有效账号**：`core/db.py::save_account()` 在同邮箱已有有效认证材料时保留原密码、AT/RT/ID Token、真实 account/workspace、状态与指纹，只追加有界的 pending 审计事件，避免一次补抓失败清空现有可用账号。
+- **封死空认证材料的外部上传旁路**：`services/chatgpt_account_state.py` 新增 `blocked_missing_at`，Sub2API、OAIPay backfill 与低层上传器、CPA 直传 API 和平台 action 都在网络请求前执行中央 gate，并独立拒绝缺 AT/RT 的 payload；注册后的 pending 账号不会触发本地测活或自动上传。
+
+### 测试 (Tests)
+- 新增/扩展执行器、Browser Web Session、严格 browser OAuth、protocol fail-closed、RT transport 保持、retry 身份固定、日文年龄、实际执行器审计、pending 落库与 HME 状态、同邮箱有效凭据保护、Sub2API/OAIPay/CPA 零网络 gate、任务级指纹隔离及前端画像竞态合同。后端专项测试、含 Camoufox 的镜像测试、前端 Node 测试和生产构建均通过；侧栏版本同步更新为 `v2.8.24`。
 
 ## [2.8.23] - 2026-07-25
 
@@ -2596,6 +2626,22 @@
 - 同步 Team 账单国家至上游官方 Checkout 目录
 - 发布模式: multi
 
-## 2026-07-25 06:27:04 +0800
-- 回退 v2.8.24-v2.8.26 注册改造，保留账单目录等其他修改 v2.8.27
+## 2026-07-25 03:37:00 +0800
+- 修复 ChatGPT 注册三执行器串线并统一浏览器注册链路
+- 发布模式: multi
+
+## 2026-07-25 04:10:05 +0800
+- 修复 Camoufox 注册密码校验与页面状态推进
+- 发布模式: multi
+
+## 2026-07-25 05:59:00 +0800
+- 修复浏览器注册密码提交与身份槽重放合同 v2.8.26
+- 发布模式: multi
+
+## 2026-07-25 05:59:07 +0800
+- 修复浏览器注册密码提交与身份槽重放合同 v2.8.26
+- 发布模式: multi
+
+## 2026-07-25 06:44:47 +0800
+- 撤销 v2.8.27，恢复 v2.8.26 注册代码 v2.8.28
 - 发布模式: multi

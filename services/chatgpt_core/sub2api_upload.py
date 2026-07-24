@@ -336,6 +336,34 @@ def upload_to_sub2api_detailed(
     group_ids: list[int] | None = None,
 ) -> dict[str, Any]:
     """上传单个账号到 Sub2API 管理后台，返回结构化结果。"""
+    upload_account = account
+    token_data = generate_token_json(upload_account)
+    if (
+        not str(token_data.get("access_token") or "").strip()
+        or not str(token_data.get("refresh_token") or "").strip()
+    ):
+        from services.chatgpt_sync import build_chatgpt_sync_account
+
+        upload_account = build_chatgpt_sync_account(account)
+        upload_account.access_token = token_data.get("access_token") or upload_account.access_token
+        upload_account.refresh_token = token_data.get("refresh_token") or upload_account.refresh_token
+        upload_account.id_token = token_data.get("id_token") or upload_account.id_token
+        token_data = generate_token_json(upload_account)
+    if not str(token_data.get("access_token") or "").strip():
+        return {
+            "ok": False,
+            "skipped": True,
+            "upload_gate": "blocked_missing_at",
+            "message": "跳过上传：缺少 access_token，认证材料尚未就绪",
+        }
+    if not str(token_data.get("refresh_token") or "").strip():
+        return {
+            "ok": False,
+            "skipped": True,
+            "upload_gate": "blocked_missing_rt",
+            "message": "跳过上传：缺少 refresh_token",
+        }
+
     api_url = str(api_url or _get_config_value("sub2api_api_url")).strip()
     api_key = str(api_key or _get_config_value("sub2api_api_key")).strip()
     resolved_group_ids = _parse_group_ids(
@@ -347,7 +375,7 @@ def upload_to_sub2api_detailed(
     if not api_key:
         return {"ok": False, "message": "Sub2API API Key 未配置"}
 
-    payload = build_sub2api_account_payload(account, group_ids=resolved_group_ids)
+    payload = build_sub2api_account_payload(upload_account, group_ids=resolved_group_ids)
     url = f"{api_url.rstrip('/')}/api/v1/admin/accounts"
     headers = {
         "Content-Type": "application/json",
