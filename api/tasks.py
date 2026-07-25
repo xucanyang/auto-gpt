@@ -15965,6 +15965,12 @@ def _is_fatal_registration_infrastructure_error(message: Any) -> bool:
             "auth_browser_finalize_unavailable",
             "browser_registration_unavailable",
             "browser_registration_hard_timeout",
+            "代理池没有可用候选",
+            "动态代理没有可用候选",
+            "dynamic proxy",
+            "no available proxy",
+            "已选择动态代理模式，但代理模板为空",
+            "动态代理模式必须填写出口国家",
         )
     )
 
@@ -17049,7 +17055,12 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
             if configured_max_attempts > 0:
                 attempt_cap = min(attempt_cap, max(target_successes, configured_max_attempts))
         else:
-            attempt_cap = max(target_successes, configured_max_attempts) if configured_max_attempts > 0 else 0
+            if configured_max_attempts > 0:
+                attempt_cap = max(target_successes, configured_max_attempts)
+            else:
+                # 默认有限补尝试：避免代理池空/基础设施错误时无限刷 FAIL
+                # （历史 attempt_cap=0 时 while 会一直 next_attempt_index++ 直到手动停止）
+                attempt_cap = min(100, max(target_successes * 3, target_successes))
         if attempt_cap > 0:
             _log(task_id, f"[控制] 注册最大尝试次数: {attempt_cap}")
         max_workers = min(req.concurrency, target_successes, attempt_cap or target_successes, 5)
@@ -17058,6 +17069,44 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
         consumed_browser_failure_slots = 0
         next_attempt_index = 0
         in_flight: dict[Any, int] = {}
+
+        # 任务启动前预检代理候选：无可用 IP 时立即失败，避免刷几百条相同错误
+        try:
+            _preflight_proxies = _build_register_candidate_proxies()
+            if not _preflight_proxies:
+                raise RuntimeError("代理候选列表为空")
+            _log(
+                task_id,
+                f"[代理] 预检通过：候选 {len(_preflight_proxies)} 个 "
+                f"(首个 source={str(_preflight_proxies[0][2] if _preflight_proxies else '-')[:80]})",
+            )
+        except Exception as proxy_preflight_exc:
+            fatal_registration_error = str(proxy_preflight_exc or "代理预检失败").strip()
+            _log(task_id, f"[FATAL] 代理预检失败，停止注册任务: {fatal_registration_error}")
+            errors.append(fatal_registration_error)
+            _task_store.finish(
+                task_id,
+                status="failed",
+                success=success,
+                skipped=skipped,
+                errors=errors,
+                error=fatal_registration_error,
+            )
+            _persist_register_task_snapshot(
+                task_id,
+                req,
+                attempt_outcome="register_failed",
+                error=fatal_registration_error,
+            )
+            if initial_email_api_entry:
+                try:
+                    from core.base_mailbox import EmailApiMailbox
+
+                    EmailApiMailbox.release_pool(task_id)
+                except Exception:
+                    pass
+            _task_store.cleanup()
+            return
 
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             while (

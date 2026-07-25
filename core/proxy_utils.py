@@ -372,17 +372,24 @@ def resolve_task_proxy_candidates(
     if mode == "direct":
         return [("", None, "direct")]
 
-    explicit_country = _param_first(
-        params,
+    # 表单若显式提交了国家字段（含空串），必须尊重；空串 = 不限（pool）
+    # 旧逻辑用 _param_first 会跳过空串，导致回落到全局 JP，出现「国家留空仍选 JP」。
+    country_keys = (
         "proxy_country_code",
         "register_proxy_country_code",
         "probe_proxy_country_code",
-        default=None,
     )
-    if explicit_country not in (None, ""):
-        country_code = str(explicit_country).strip().upper()
+    has_explicit_country_field = any(key in params for key in country_keys)
+    raw_country_value = None
+    if has_explicit_country_field:
+        for key in country_keys:
+            if key in params:
+                raw_country_value = params.get(key)
+                break
+        country_code = str(raw_country_value or "").strip().upper()
     elif mode == "dynamic":
-        country_code = get_global_dynamic_proxy_country("JP")
+        # 未传字段时才读全局；不再硬编码 JP 静默兜底
+        country_code = get_global_dynamic_proxy_country("")
     elif use_global_defaults:
         country_code = _global_task_proxy_country("")
     else:

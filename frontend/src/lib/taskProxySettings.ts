@@ -15,7 +15,8 @@ export type TaskProxySettings = {
 const DEFAULT_TASK_PROXY_SETTINGS: TaskProxySettings = {
   proxy_mode: 'dynamic',
   proxy: '',
-  proxy_country_code: 'JP',
+  // 默认不强制国家；pool 留空=不限；dynamic 由表单校验必填
+  proxy_country_code: '',
   proxy_failover: false,
   proxy_max_candidates: 5,
   proxy_min_score: 50,
@@ -62,6 +63,16 @@ export function normalizeTaskProxyMode(value: unknown, fallback: TaskProxyMode =
   return VALID_PROXY_MODES.has(normalized) ? normalized : fallback
 }
 
+function explicitCountryCode(record: Record<string, unknown>, fallback = '') {
+  for (const key of ['proxy_country_code', 'register_proxy_country_code', 'probe_proxy_country_code']) {
+    if (Object.prototype.hasOwnProperty.call(record, key)) {
+      // 允许显式空串表示「不限」，不再回落到 JP
+      return String(record[key] ?? '').trim().toUpperCase().slice(0, 2)
+    }
+  }
+  return countryCode(undefined, fallback)
+}
+
 export function normalizeTaskProxySettings(value: unknown, fallback?: Partial<TaskProxySettings>): TaskProxySettings {
   const base = { ...DEFAULT_TASK_PROXY_SETTINGS, ...(fallback || {}) }
   const record = value && typeof value === 'object' ? value as Record<string, unknown> : {}
@@ -69,7 +80,7 @@ export function normalizeTaskProxySettings(value: unknown, fallback?: Partial<Ta
   return {
     proxy_mode: mode,
     proxy: stringWithDefault(valueOf(record, 'proxy', 'proxy_url', 'register_proxy', 'probe_proxy'), base.proxy),
-    proxy_country_code: countryCode(valueOf(record, 'proxy_country_code', 'register_proxy_country_code', 'probe_proxy_country_code'), base.proxy_country_code),
+    proxy_country_code: explicitCountryCode(record, base.proxy_country_code),
     proxy_failover: booleanWithDefault(valueOf(record, 'proxy_failover', 'register_proxy_failover', 'probe_proxy_failover'), base.proxy_failover),
     proxy_max_candidates: numberWithDefault(valueOf(record, 'proxy_max_candidates', 'register_proxy_max_candidates', 'probe_proxy_max_candidates'), base.proxy_max_candidates, 1, 100),
     proxy_min_score: numberWithDefault(valueOf(record, 'proxy_min_score', 'register_proxy_min_score', 'probe_proxy_min_score'), base.proxy_min_score, 0, 100),
@@ -87,10 +98,12 @@ export function taskProxySettingsFromConfig(config: unknown, fallback?: Partial<
   const proxy = mode === 'dynamic'
     ? (globalDynamicTemplate ? '' : taskProxyUrl)
     : taskProxyUrl
+  // pool/specified：全局国家可预填，但允许用户清空表示不限
+  // dynamic：优先 dynamic_proxy_default_country，不再硬编码 JP
   const country = mode === 'dynamic'
     ? countryCode(
       cfg.dynamic_proxy_default_country,
-      countryCode(cfg.task_proxy_country_code, base.proxy_country_code || 'JP'),
+      countryCode(cfg.task_proxy_country_code, base.proxy_country_code),
     )
     : countryCode(cfg.task_proxy_country_code, base.proxy_country_code)
   return {
