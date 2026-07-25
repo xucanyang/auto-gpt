@@ -6,6 +6,14 @@
 
 ## [Unreleased] (未发布)
 
+## [2.8.49] - 2026-07-26
+
+### 修复 (Fixed)
+- **修复浏览器 signup callback 被丢弃导致 Web Session bridge 落到邮箱验证页**：`services/chatgpt_core/any_auto/browser_register.py` 不再在 `oauth_callback` 完成分支重新从 `page.url` 构造状态而丢失 `continue_url`，现在保留开户接口返回的 callback，并在同一 Camoufox context 先跟随 OpenAI callback，再访问 `https://chatgpt.com/api/auth/session`。该路径仍属于 GPT signup 收尾，不会启动 Codex OAuth 或额外 OAuth OTP。
+
+### 测试 (Tests)
+- 扩展 `tests/test_any_auto_web_session_contract.py`，断言 signup callback 在 Web Session 抓取前被同上下文跟随。
+
 ## [2.8.48] - 2026-07-26
 
 ### 优化 (Changed)
@@ -2937,4 +2945,8 @@
 
 ## 2026-07-26 06:20:53 +0800
 - v2.8.48: 分离 any-auto GPT signup 与 Web Session/RT 捕获
+- 发布模式: multi
+
+## 2026-07-26 06:31:07 +0800
+- v2.8.49: 跟随 signup callback 后再抓 Web Session
 - 发布模式: multi

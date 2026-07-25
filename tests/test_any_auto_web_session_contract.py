@@ -68,7 +68,10 @@ class AnyAutoWebSessionContractTests(unittest.TestCase):
             mock.patch.object(
                 browser_register,
                 "_browser_registration_flow",
-                return_value={"page_type": "oauth_callback"},
+                return_value={
+                    "page_type": "oauth_callback",
+                    "continue_url": "https://chatgpt.com/auth/callback/openai?code=demo",
+                },
             ) as signup_flow,
             mock.patch(
                 "services.chatgpt_core.browser_registration._wait_for_web_session",
@@ -117,6 +120,11 @@ class AnyAutoWebSessionContractTests(unittest.TestCase):
         self.assertIs(signup_kwargs["stop_check"], stop_check)
         self.assertIs(wait_session.call_args.kwargs["stop_check"], stop_check)
         self.assertEqual(normalize_session.call_args.args[1], final_cookies)
+        page.goto.assert_any_call(
+            "https://chatgpt.com/auth/callback/openai?code=demo",
+            wait_until="domcontentloaded",
+            timeout=30000,
+        )
         retry_oauth.assert_not_called()
 
     def test_protocol_transport_explicitly_disables_codex_oauth(self):

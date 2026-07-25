@@ -1988,6 +1988,43 @@ def _is_registration_complete(state: dict) -> bool:
     )
 
 
+def _signup_callback_url(page, state: dict) -> str:
+    """Return the post-signup callback URL without treating a login URL as one."""
+    candidates = [
+        str((state or {}).get("continue_url") or "").strip(),
+        str((state or {}).get("current_url") or "").strip(),
+        str(getattr(page, "url", "") or "").strip(),
+    ]
+    for raw in candidates:
+        candidate = _normalize_url(raw, OPENAI_AUTH)
+        if not candidate:
+            continue
+        parsed = urlparse(candidate)
+        path = str(parsed.path or "").lower()
+        query = str(parsed.query or "").lower()
+        if "code=" in query or "callback" in path or "/oauth/" in path:
+            return candidate
+    return ""
+
+
+def _follow_signup_callback(page, state: dict, log) -> str:
+    """Follow OpenAI's create-account callback in the existing browser context."""
+    callback_url = _signup_callback_url(page, state)
+    if not callback_url:
+        return str(getattr(page, "url", "") or "").strip()
+    current_url = str(getattr(page, "url", "") or "").strip()
+    if callback_url == current_url and "chatgpt.com" in current_url:
+        return current_url
+    log(f"跟随 signup callback 建立 ChatGPT 会话: {callback_url[:160]}")
+    try:
+        page.goto(callback_url, wait_until="domcontentloaded", timeout=30000)
+    except Exception as exc:
+        # Redirects to ChatGPT can abort the original document navigation; the
+        # waiter below will inspect the final URL and session cookies.
+        log(f"signup callback 导航异常（可继续检查最终 URL）: {exc}")
+    return str(getattr(page, "url", "") or callback_url).strip()
+
+
 def _handle_post_signup_onboarding(page, log) -> None:
     current_url = str(page.url or "")
     if "chatgpt.com" not in current_url:
@@ -3912,7 +3949,12 @@ def _browser_registration_flow(
 
         if _is_registration_complete(state):
             _handle_post_signup_onboarding(page, log)
-            return _extract_flow_state(None, page.url)
+            completed_state = dict(state or {})
+            completed_state["page_url"] = str(page.url or "")
+            completed_state["current_url"] = str(page.url or "") or str(
+                state.get("current_url") or state.get("continue_url") or ""
+            )
+            return completed_state
 
         if _is_password_registration(state):
             if register_submitted:
@@ -4081,6 +4123,7 @@ class ChatGPTBrowserRegister:
                 _wait_for_web_session,
             )
 
+            _follow_signup_callback(page, final_state, self.log)
             cookie_items = list(page.context.cookies() or [])
             device_id = next(
                 (
