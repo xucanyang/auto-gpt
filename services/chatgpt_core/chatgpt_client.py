@@ -3,9 +3,11 @@ ChatGPT 注册客户端模块
 使用 curl_cffi 模拟浏览器行为
 """
 
+import json
 import time
 import uuid
 from urllib.parse import urlparse
+from core.task_runtime import TaskInterruption
 from core.proxy_utils import build_requests_proxy_config
 
 try:
@@ -15,9 +17,6 @@ except ImportError:
     import sys
 
     sys.exit(1)
-
-import json
-from core.task_runtime import TaskInterruption
 
 from .sentinel_token import build_sentinel_token
 from .sentinel_browser import (
@@ -83,9 +82,7 @@ class ChatGPTClient:
         self.last_registration_route_event = None
         self.requested_executor = self.browser_mode
         self.effective_executor = self.browser_mode
-        self.registration_transport = (
-            "protocol_http" if self.browser_mode == "protocol" else "camoufox_browser"
-        )
+        self.registration_transport = "protocol_http"
         self.registration_stage_transports: list[dict] = []
         self.registration_runtime_profile: dict = {}
         self.last_homepage_probe = {
@@ -127,7 +124,6 @@ class ChatGPTClient:
         return "; ".join(pairs)
 
     def _get_sentinel_token(self, flow: str, *, page_url: str | None = None):
-        # 方案 R：协议执行器只走 HTTP PoW + VM 解 t，禁止为拿 Sentinel 起浏览器。
         if self.browser_mode == "protocol":
             token = build_sentinel_token(
                 self.session,
@@ -1218,8 +1214,6 @@ class ChatGPTClient:
                 return_state=return_state,
             )
 
-        # 非注册主链遗留：ChatGPTClient 若在 headless/headed 下被直接调用 create，
-        # 仍可走 Auth Browser finalize（主链 headless/headed 由 engine 整段 Camoufox）。
         name = f"{first_name} {last_name}"
         self._log(f"完成账号创建: {name}")
         try:
@@ -1421,6 +1415,7 @@ class ChatGPTClient:
                 self._log(f"signup continue 后状态: {describe_flow_state(state)}")
             elif not signup_ok:
                 self._log(f"signup continue 未成功，保留 authorize 状态: {signup_state}")
+            # 若仍未知，强制进入密码注册页（any-auto 新号路径）
             if (
                 (not self._state_is_password_registration(state))
                 and (not self._state_is_email_otp(state))

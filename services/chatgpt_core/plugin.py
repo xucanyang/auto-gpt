@@ -16,7 +16,6 @@ from services.chatgpt_core.mailbox_state import (
 )
 
 
-
 def _generate_chatgpt_registration_password(length: int = 16) -> str:
     """Generate a password that always satisfies the OpenAI signup form."""
     minimum_length = 12
@@ -97,14 +96,11 @@ class ChatGPTPlatform(BasePlatform):
             log_fn(f"[代理] ChatGPT 注册核心链路 proxy={proxy_label}")
         else:
             log_fn("[代理] ChatGPT 注册核心链路 proxy=direct")
-        # 方案 R：浏览器整段注册默认同身份不整流程重放；协议默认同身份 create 不 3 连
-        # registration_disallowed / create 失败由 engine._should_retry 进一步收口。
-        default_retries = 1 if str(browser_mode or "").strip().lower() in {"headless", "headed"} else 1
+        max_retries = 3
         try:
-            max_retries = int(extra_config.get("register_max_retries", default_retries) or default_retries)
+            max_retries = int(extra_config.get("register_max_retries", 3) or 3)
         except Exception:
-            max_retries = default_retries
-        max_retries = max(1, min(int(max_retries), 3))
+            max_retries = 3
 
         registration_entry = str(
             extra_config.get("chatgpt_registration_entry")
@@ -215,7 +211,15 @@ class ChatGPTPlatform(BasePlatform):
                     proxy=proxy,
                 )
 
-            def _sync_hme_rerun_result(acct, *, success: bool, error_message: str = "", task_id: str = ""):
+            def _sync_hme_rerun_result(
+                acct,
+                *,
+                success: bool,
+                error_message: str = "",
+                task_id: str = "",
+                result_code: str = "",
+                access_token_saved: bool = False,
+            ):
                 if _mail_provider != "icloud_hme" or acct is None:
                     return
                 account_extra = dict(getattr(acct, "extra", None) or {})
@@ -233,6 +237,8 @@ class ChatGPTPlatform(BasePlatform):
                         task_id=str(task_id or _task_id or "").strip(),
                         success=bool(success),
                         error_message=str(error_message or ""),
+                        access_token_saved=bool(access_token_saved),
+                        result_code=str(result_code or ""),
                         mailbox_state=_export_mailbox_state_payload(acct, getattr(email_service, "_before_ids", set()) if "email_service" in locals() else set()),
                         delete_candidate=bool(not success and is_account_deactivated_message("", str(error_message or ""))),
                     )
@@ -254,6 +260,7 @@ class ChatGPTPlatform(BasePlatform):
                     self._before_ids = set()
                     self._mailbox = _mailbox
                     self._last_verification_result = {}
+                    self._post_finalize_state = None
 
                 def _can_reuse_current_account(self) -> bool:
                     acct = self._acct
@@ -355,7 +362,21 @@ class ChatGPTPlatform(BasePlatform):
                             registered_email=str(account_email or self._email or "").strip(),
                             task_id=resolved_task_id,
                         )
-                    _sync_hme_rerun_result(self._acct, success=True, task_id=resolved_task_id)
+                    # Helper finalize can return authoritative registration /
+                    # lease state.  Capture it after the mutation so account
+                    # persistence never stores the pre-commit snapshot.
+                    self._post_finalize_state = self.export_state()
+                    _sync_hme_rerun_result(
+                        self._acct,
+                        success=True,
+                        task_id=resolved_task_id,
+                        result_code=str(
+                            getattr(self, "_registration_result_code", "") or "login_alive"
+                        ),
+                        access_token_saved=bool(
+                            getattr(self, "_registration_access_token_saved", False)
+                        ),
+                    )
 
                 def finalize_failure(self, error_message: str = "", task_id: str = ""):
                     if not self._acct:
@@ -369,6 +390,7 @@ class ChatGPTPlatform(BasePlatform):
                             error_message=normalized_error,
                             task_id=resolved_task_id,
                         )
+                    self._post_finalize_state = self.export_state()
                     _sync_hme_rerun_result(self._acct, success=False, error_message=normalized_error, task_id=resolved_task_id)
 
                 def update_status(self, success, error=None):
@@ -789,17 +811,37 @@ class ChatGPTPlatform(BasePlatform):
             )
             from services.chatgpt_core.payment_link_cache import (
                 PAYMENT_LINK_FORMAT_LONG_LINK,
+                PAYMENT_LINK_PLAN_TEAM,
                 PAYMENT_SOURCE_LONG_LINK,
                 normalize_payment_link_params,
+                normalize_payment_link_plan,
                 normalize_payment_link_url,
+                normalize_team_billing_country,
+                normalize_team_checkout_ui_mode,
                 payment_link_cache_matches,
+                payment_link_cache_for_params,
+                payment_link_variant_key,
+                validate_payment_link_request_params,
             )
 
-            plan = str(params.get("plan") or "plus").strip().lower()
-            if plan != "plus":
-                return {"ok": False, "error": "Only the Plus payment plan is supported"}
+            try:
+                validate_payment_link_request_params(params)
+            except ValueError as exc:
+                return {"ok": False, "error": str(exc)}
+            plan = normalize_payment_link_plan(params.get("plan"))
+            is_team = plan == PAYMENT_LINK_PLAN_TEAM
+            profile_overrides = {**params, "plan": plan}
+            if is_team:
+                for inherited_key in ("billingCountry", "country", "currency"):
+                    profile_overrides.pop(inherited_key, None)
+                profile_overrides["billing_country"] = normalize_team_billing_country(params)
+                profile_overrides["checkout_ui_mode"] = normalize_team_checkout_ui_mode(params)
             client = LongLinkPaymentClient.from_env()
-            payment_profile = client.get_profile()
+            payment_profile = (
+                client.get_profile(overrides=profile_overrides)
+                if is_team
+                else client.get_profile()
+            )
             payment_profile_hash = str(payment_profile.get("profile_hash") or "").strip()
             expected_profile_hash = str(params.get("payment_profile_hash") or params.get("profile_hash") or "").strip()
             if expected_profile_hash and expected_profile_hash != payment_profile_hash:
@@ -807,19 +849,54 @@ class ChatGPTPlatform(BasePlatform):
             country = str(payment_profile.get("country") or "").strip().upper()
             currency = str(payment_profile.get("currency") or "").strip().upper()
             reuse_cached_link = params.get("reuse_cached_link") is not False
-            cached_link = extra.get("chatgpt_last_payment_link") if isinstance(extra.get("chatgpt_last_payment_link"), dict) else {}
+            profile_detail = payment_profile.get("profile") if isinstance(payment_profile.get("profile"), dict) else {}
+            profile_regions = payment_profile.get("regions") if isinstance(payment_profile.get("regions"), dict) else profile_detail.get("regions")
+            profile_regions = profile_regions if isinstance(profile_regions, dict) else {}
+            team_profile = payment_profile.get("team") if isinstance(payment_profile.get("team"), dict) else profile_detail.get("team")
+            team_profile = team_profile if isinstance(team_profile, dict) else {}
+            cache_request = {
+                **params,
+                "plan": plan,
+                "country": country,
+                "currency": currency,
+                "payment_link_format": PAYMENT_LINK_FORMAT_LONG_LINK,
+                "payment_source": PAYMENT_SOURCE_LONG_LINK,
+                "profile_hash": payment_profile_hash,
+            }
+            if is_team:
+                cache_request.update(
+                    {
+                        "team_plan_data": {
+                            "workspace_name": str(team_profile.get("workspace_name") or "").strip(),
+                            "price_interval": str(team_profile.get("price_interval") or "month").strip().lower(),
+                            "seat_quantity": team_profile.get("seat_quantity") or 2,
+                        },
+                        "cancel_url": str(team_profile.get("cancel_url") or "").strip(),
+                        "promo_code_digest": str(
+                            payment_profile.get("promo_code_digest")
+                            or profile_detail.get("promo_code_digest")
+                            or ""
+                        ).strip(),
+                        "plan_name": "chatgptteamplan",
+                        "billing_country": country,
+                        "checkout_proxy_region": str(
+                            profile_regions.get("checkout")
+                            or params.get("checkout_proxy_region")
+                            or ""
+                        ).strip().upper(),
+                        "checkout_ui_mode": str(
+                            payment_profile.get("checkout_ui_mode")
+                            or profile_detail.get("checkout_ui_mode")
+                            or profile_overrides.get("checkout_ui_mode")
+                            or "hosted"
+                        ).strip().lower(),
+                    }
+                )
+            normalized_cache_params = normalize_payment_link_params(cache_request)
+            normalized_cache_params["variant_key"] = payment_link_variant_key(cache_request)
+            cached_link = payment_link_cache_for_params(extra, normalized_cache_params)
             cached_format = str(cached_link.get("payment_link_format") or "long_hosted")
             cached_url = normalize_payment_link_url(cached_link.get("url"), cached_format)
-            normalized_cache_params = normalize_payment_link_params(
-                {
-                    "plan": plan,
-                    "country": country,
-                    "currency": currency,
-                    "payment_link_format": PAYMENT_LINK_FORMAT_LONG_LINK,
-                    "payment_source": PAYMENT_SOURCE_LONG_LINK,
-                    "profile_hash": payment_profile_hash,
-                }
-            )
             should_reuse_cached_link = (
                 reuse_cached_link
                 and bool(cached_url)
@@ -851,9 +928,17 @@ class ChatGPTPlatform(BasePlatform):
             access_token = str(a.access_token or "").strip()
             if not access_token:
                 return {"ok": False, "error": "账号缺少 Access Token"}
-            submitted = client.submit_batch(
-                items=[{"access_token": access_token, "request_id": request_id}],
-                expected_profile_hash=payment_profile_hash,
+            submitted = (
+                client.submit_batch(
+                    items=[{"access_token": access_token, "request_id": request_id}],
+                    expected_profile_hash=payment_profile_hash,
+                    profile_overrides=profile_overrides,
+                )
+                if is_team
+                else client.submit_batch(
+                    items=[{"access_token": access_token, "request_id": request_id}],
+                    expected_profile_hash=payment_profile_hash,
+                )
             )
             remote_items = submitted.get("items") if isinstance(submitted.get("items"), list) else []
             remote = next(
@@ -897,7 +982,7 @@ class ChatGPTPlatform(BasePlatform):
                 return {"ok": False, "error": str(exc)}
             data.update(
                 {
-                    "plan": "plus",
+                    "plan": plan,
                     "country": str(data.get("country") or country).strip().upper(),
                     "currency": str(data.get("currency") or currency).strip().upper(),
                     "cache_reused": False,

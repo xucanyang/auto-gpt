@@ -6,6 +6,16 @@
 
 ## [Unreleased] (未发布)
 
+## [2.8.36] - 2026-07-25
+
+### 变更 (Changed)
+- **一键回归 v2.8.29 注册保存模型**：从提交 `e453647` 恢复注册核心链路（`access_token_only_registration_engine` / `chatgpt_client` / `oauth_client` / `plugin` / `refresh_token_registration_engine` / `chatgpt_registration_mode_adapter` 及对应专项测试），撤销 `v2.8.30` 起「会话齐套才 success」对业务落库的过严门闩。
+- **恢复「开户完成即可落库」语义**：浏览器 signup 完成后若 Web AT 暂缺，先走独立 Camoufox OAuth recovery 补 Token；仍无 AT 时以 `registered_auth_pending` + `needs_auth_capture` **成功落库**（邮箱/密码/画像保留，禁止同邮箱 signup 重放），不再整单记 FAIL 并占用身份槽后空手而归。
+- **有意保留的后续修复（不整树回退）**：
+  - `browser_registration.py` 保持 v2.8.32–v2.8.35（OTP 导航竞态、Web Session 桥接、`/api/auth/callback` OAuth 可导航）；
+  - 代理国家空串 / 无可用候选致命停（v2.8.34）保留。
+- 侧栏版本同步为 `v2.8.36`。
+
 ## [2.8.35] - 2026-07-25
 
 ### 修复 (Fixed)
@@ -2741,4 +2751,8 @@
 
 ## 2026-07-25 09:58:27 +0800
 - v2.8.35 修复Camoufox about_you后chatgpt OAuth callback被/api误拦
+- 发布模式: multi
+
+## 2026-07-25 10:08:55 +0800
+- v2.8.36 一键回归v2.8.29注册保存模型（auth_pending落库+保留浏览器补丁）
 - 发布模式: multi

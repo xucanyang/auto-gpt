@@ -1,9 +1,12 @@
 """
 ChatGPT Refresh Token 注册引擎。
 
-新实现不再沿用旧的分步补丁式注册链路，而是直接复用：
-1. `ChatGPTClient.register_complete_flow()` 负责完整注册状态机
-2. `OAuthClient.login_and_get_tokens()` 负责全新 OAuth + passwordless OTP 登录拿 RT
+协议执行器复用：
+1. `ChatGPTClient.register_complete_flow()` 负责纯 HTTP 注册状态机
+2. `OAuthClient.login_and_get_tokens()` 负责纯 HTTP OAuth + passwordless OTP 登录拿 RT
+
+浏览器执行器由 `chatgpt_registration_mode_adapter` 分派到 Camoufox 两阶段链路，
+不会进入本引擎的 HTTP 注册/OAuth 状态机。
 
 目标是让 refresh_token 模式与当前主状态机链路保持一致，不再以旧流程做兜底。
 """
@@ -243,10 +246,7 @@ class RefreshTokenRegistrationEngine:
         self.proxy_url = proxy_url
         self.callback_logger = callback_logger or (lambda msg, *_: logger.info(msg))
         self.task_uuid = task_uuid
-        normalized = str(browser_mode or "protocol").strip().lower() or "protocol"
-        if normalized not in {"protocol", "headless", "headed"}:
-            raise ValueError(f"unsupported ChatGPT executor: {browser_mode}")
-        self.browser_mode = normalized
+        self.browser_mode = str(browser_mode or "protocol").strip().lower() or "protocol"
         # 已移除整流程重试能力，保留参数仅兼容调用方
         self.max_retries = 1
         self.extra_config = dict(extra_config or {})
@@ -324,6 +324,19 @@ class RefreshTokenRegistrationEngine:
             return False
 
     def _finalize_email_service_success(self, result: RegistrationResult) -> None:
+        metadata = getattr(result, "metadata", None)
+        metadata = metadata if isinstance(metadata, dict) else {}
+        try:
+            self.email_service._registration_result_code = (
+                "registered_auth_pending"
+                if metadata.get("registered_auth_pending")
+                else "login_alive"
+            )
+            self.email_service._registration_access_token_saved = bool(
+                str(getattr(result, "access_token", "") or "").strip()
+            )
+        except Exception:
+            pass
         finalize = getattr(self.email_service, "finalize_success", None)
         if not callable(finalize):
             return
@@ -334,6 +347,15 @@ class RefreshTokenRegistrationEngine:
             )
         except Exception as exc:
             self._log(f"[邮箱] finalize_success 执行失败: {exc}", "warning")
+        try:
+            exporter = getattr(self.email_service, "export_state", None)
+            if callable(exporter):
+                refreshed = exporter() or {}
+                if isinstance(refreshed, dict):
+                    result.metadata = dict(result.metadata or {})
+                    result.metadata["mailbox_state"] = refreshed
+        except Exception as exc:
+            self._log(f"[邮箱] finalize_success 后导出 mailbox_state 失败: {exc}", "warning")
 
     def _finalize_email_service_failure(
         self,
@@ -352,6 +374,15 @@ class RefreshTokenRegistrationEngine:
             )
         except Exception as exc:
             self._log(f"[邮箱] finalize_failure 执行失败: {exc}", "warning")
+        try:
+            exporter = getattr(self.email_service, "export_state", None)
+            if callable(exporter):
+                refreshed = exporter() or {}
+                if isinstance(refreshed, dict):
+                    result.metadata = dict(result.metadata or {})
+                    result.metadata["mailbox_state"] = refreshed
+        except Exception as exc:
+            self._log(f"[邮箱] finalize_failure 后导出 mailbox_state 失败: {exc}", "warning")
 
     @staticmethod
     def _should_switch_to_login_after_register_failure(message: str) -> bool:
@@ -1024,6 +1055,21 @@ class RefreshTokenRegistrationEngine:
             "first_name": first_name,
             "last_name": last_name,
             "birthdate": birthdate,
+            "requested_executor": str(
+                getattr(register_client, "requested_executor", self.browser_mode)
+                or self.browser_mode
+            ),
+            "effective_executor": str(
+                getattr(register_client, "effective_executor", self.browser_mode)
+                or self.browser_mode
+            ),
+            "registration_transport": str(
+                getattr(register_client, "registration_transport", "protocol_http")
+                or "protocol_http"
+            ),
+            "stage_transports": list(
+                getattr(register_client, "registration_stage_transports", None) or []
+            ),
         })
 
     def _attach_browser_fingerprint_metadata(
@@ -1275,7 +1321,7 @@ class RefreshTokenRegistrationEngine:
                     "[已有账号] 注册阶段遇到已注册邮箱时"
                     f"{'允许路由到登录恢复' if existing_account_login_route_allowed else '禁止路由到登录恢复，将跳过且不保存'}"
                 )
-            if not existing_account_capture and self.browser_mode == "protocol":
+            if not existing_account_capture:
                 homepage_ok, homepage_error = self._probe_homepage_before_email_creation()
                 self._report_homepage_probe(homepage_ok, homepage_error)
                 if not homepage_ok:
@@ -1373,81 +1419,29 @@ class RefreshTokenRegistrationEngine:
                 return result
 
             self._log("[注册] 开始执行注册状态机")
-            self._log(
-                f"[注册] 请求模式: {self.browser_mode} effective_transport="
-                f"{'camoufox_browser' if self.browser_mode in {'headless', 'headed'} else 'protocol_http'}"
-            )
-            # 方案 R：headless/headed 与 AT-only 共享整段 Camoufox 运输层，禁止协议半截嫁接
-            if self.browser_mode in {"headless", "headed"}:
-                from services.chatgpt_core.access_token_only_registration_engine import (
-                    AccessTokenOnlyRegistrationEngine,
-                )
-
-                browser_engine = AccessTokenOnlyRegistrationEngine(
-                    email_service=self.email_service,
-                    proxy_url=self.proxy_url,
-                    browser_mode=self.browser_mode,
-                    callback_logger=self.callback_logger,
-                    task_uuid=self.task_uuid,
-                    max_retries=1,
-                    extra_config=dict(self.extra_config or {}),
-                )
-                browser_engine.email = result.email
-                browser_engine.password = self.password
-                browser_result = browser_engine.run()
-                self.logs.extend(list(getattr(browser_result, "logs", None) or []))
-                if not getattr(browser_result, "success", False):
-                    last_error = str(
-                        getattr(browser_result, "error_message", "")
-                        or "浏览器注册状态机失败"
-                    )
-                    result.error_message = last_error
-                    self._finalize_email_service_failure(result, fallback_error=last_error)
-                    return result
-                # 浏览器已齐套 Web Session；RT 第二阶段仍可选，不作为注册成功门闩
-                result.access_token = str(getattr(browser_result, "access_token", "") or "")
-                result.session_token = str(getattr(browser_result, "session_token", "") or "")
-                result.account_id = str(getattr(browser_result, "account_id", "") or "")
-                result.workspace_id = str(getattr(browser_result, "workspace_id", "") or "")
-                result.id_token = str(getattr(browser_result, "id_token", "") or "")
-                result.refresh_token = str(getattr(browser_result, "refresh_token", "") or "")
-                result.metadata = dict(getattr(browser_result, "metadata", None) or {})
-                result.metadata["registration_transport"] = "camoufox_browser"
-                result.metadata["requested_executor"] = self.browser_mode
-                result.metadata["effective_executor"] = self.browser_mode
-                # 继续尝试 RT 捕获（失败不回滚已齐套 Web Session 成功）
-                registered = True
-                registration_message = "registration complete via camoufox browser (rt-mode stage1)"
-                register_client = getattr(browser_engine, "_last_chatgpt_client", register_client)
-                session_ok = True
-                session_or_error = {
-                    "access_token": result.access_token,
-                    "session_token": result.session_token,
-                    "account_id": result.account_id,
-                    "workspace_id": result.workspace_id,
-                    "id_token": result.id_token,
-                    "refresh_token": result.refresh_token,
-                    "cookies": (result.metadata or {}).get("cookies")
-                    or (result.metadata or {}).get("cookie_header")
-                    or "",
-                    "cookie_header": (result.metadata or {}).get("cookie_header")
-                    or (result.metadata or {}).get("cookies")
-                    or "",
+            register_client.requested_executor = "protocol"
+            register_client.effective_executor = "protocol"
+            register_client.registration_transport = "protocol_http"
+            register_client.registration_stage_transports = [
+                {
+                    "stage": "registration",
+                    "transport": "curl_cffi_http",
+                    "executor": "protocol",
                 }
-            else:
-                registered, registration_message = register_client.register_complete_flow(
-                    result.email,
-                    self.password,
-                    first_name,
-                    last_name,
-                    birthdate,
-                    email_adapter,
-                    stop_before_about_you_submission=False,
-                    otp_wait_timeout=register_otp_wait_seconds,
-                    otp_resend_wait_timeout=register_otp_resend_wait_seconds,
-                    otp_account_budget_timeout=register_otp_account_budget_seconds,
-                    allow_existing_account_login_route=existing_account_login_route_allowed,
-                )
+            ]
+            registered, registration_message = register_client.register_complete_flow(
+                result.email,
+                self.password,
+                first_name,
+                last_name,
+                birthdate,
+                email_adapter,
+                stop_before_about_you_submission=False,
+                otp_wait_timeout=register_otp_wait_seconds,
+                otp_resend_wait_timeout=register_otp_resend_wait_seconds,
+                otp_account_budget_timeout=register_otp_account_budget_seconds,
+                allow_existing_account_login_route=existing_account_login_route_allowed,
+            )
 
             if not registered:
                 if not self._should_switch_to_login_after_register_failure(registration_message):
@@ -1493,24 +1487,15 @@ class RefreshTokenRegistrationEngine:
 
             if registered and source == "register":
                 self._log("[注册] 开始落地 ChatGPT session")
-                if self.browser_mode in {"headless", "headed"} and str(result.access_token or "").strip():
-                    session_ok = True
-                    session_or_error = {
-                        "access_token": result.access_token,
-                        "session_token": result.session_token,
-                        "account_id": result.account_id,
-                        "workspace_id": result.workspace_id,
-                        "id_token": result.id_token,
-                        "refresh_token": result.refresh_token,
-                        "cookies": (result.metadata or {}).get("cookies")
-                        or (result.metadata or {}).get("cookie_header")
-                        or "",
-                        "cookie_header": (result.metadata or {}).get("cookie_header")
-                        or (result.metadata or {}).get("cookies")
-                        or "",
+                session_ok, session_or_error = register_client.reuse_session_and_get_tokens()
+                register_client.registration_stage_transports.append(
+                    {
+                        "stage": "web_session_capture",
+                        "transport": "curl_cffi_http",
+                        "executor": "protocol",
+                        "status": "success" if session_ok else "failed",
                     }
-                else:
-                    session_ok, session_or_error = register_client.reuse_session_and_get_tokens()
+                )
                 if not session_ok:
                     result.error_message = f"注册收尾失败: {session_or_error}"
                     self._log(result.error_message, "warning")

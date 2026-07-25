@@ -205,6 +205,75 @@ class ChatGPTRegistrationModeAdapterTests(unittest.TestCase):
         )
         self.assertEqual(account.extra["chatgpt_phone_challenge"]["type"], "add_phone")
 
+    def test_build_account_marks_registered_without_tokens_as_auth_pending(self):
+        for registration_mode in ("access_token_only", "refresh_token"):
+            with self.subTest(registration_mode=registration_mode):
+                adapter = build_chatgpt_registration_mode_adapter(
+                    {"chatgpt_registration_mode": registration_mode}
+                )
+                account = adapter.build_account(
+                    _result(
+                        account_id="",
+                        workspace_id="",
+                        access_token="",
+                        refresh_token="",
+                        session_token="",
+                        source="registered_auth_pending",
+                        metadata={
+                            "registered_auth_pending": True,
+                            "needs_auth_capture": True,
+                            "registration_full_auth_failed": True,
+                            "registration_full_auth_error": "browser auth capture failed",
+                        },
+                    ),
+                    fallback_password="fallback",
+                )
+
+                self.assertEqual(account.status.value, "pending_payment")
+                self.assertEqual(account.token, "")
+                self.assertEqual(account.user_id, "")
+                self.assertEqual(account.extra["auth_level"], "registered_auth_pending")
+                self.assertTrue(account.extra["partial_auth"])
+                self.assertEqual(
+                    account.extra["registration_full_auth_failed_policy"],
+                    "keep_registered_auth_pending",
+                )
+
+    def test_build_account_persists_effective_executor_and_stage_transports(self):
+        adapter = build_chatgpt_registration_mode_adapter(
+            {"chatgpt_registration_mode": "access_token_only"}
+        )
+        account = adapter.build_account(
+            _result(
+                metadata={
+                    "registration_context": {
+                        "requested_executor": "headless",
+                        "effective_executor": "headless",
+                        "registration_transport": "camoufox_browser",
+                        "stage_transports": [
+                            {
+                                "stage": "registration",
+                                "transport": "camoufox_browser",
+                                "executor": "headless",
+                            }
+                        ],
+                    }
+                }
+            ),
+            fallback_password="fallback",
+        )
+
+        self.assertEqual(account.extra["requested_executor_type"], "headless")
+        self.assertEqual(account.extra["effective_executor_type"], "headless")
+        self.assertEqual(
+            account.extra["chatgpt_registration_transport"],
+            "camoufox_browser",
+        )
+        self.assertEqual(
+            account.extra["chatgpt_registration_stage_transports"][0]["stage"],
+            "registration",
+        )
+
     def test_build_account_carries_confirmed_phone_binding_metadata(self):
         adapter = build_chatgpt_registration_mode_adapter(
             {"chatgpt_registration_mode": "refresh_token"}
@@ -409,6 +478,100 @@ class ChatGPTRegistrationModeAdapterTests(unittest.TestCase):
         )
         self.assertEqual(captured["auth_kwargs"]["device_id"], "device-stage1")
 
+    def test_browser_refresh_token_stage2_uses_browser_oauth_only(self):
+        adapter = build_chatgpt_registration_mode_adapter(
+            {"chatgpt_registration_mode": "refresh_token"}
+        )
+        context = ChatGPTRegistrationContext(
+            email_service=mock.Mock(),
+            proxy_url="http://127.0.0.1:7890",
+            callback_logger=lambda _msg, *_: None,
+            email=None,
+            password="pw",
+            browser_mode="headless",
+            max_retries=1,
+            extra_config={"chatgpt_registration_mode": "refresh_token"},
+        )
+        register_client = types.SimpleNamespace(
+            device_id="device-stage1",
+            registration_stage_transports=[
+                {
+                    "stage": "registration",
+                    "transport": "camoufox_browser",
+                    "executor": "headless",
+                }
+            ],
+        )
+        stage1_engine = mock.Mock()
+        stage1_engine._last_chatgpt_client = register_client
+        stage1_engine._capture_browser_oauth_tokens.return_value = (
+            True,
+            {
+                "account_id": "acct-browser",
+                "access_token": "at-browser",
+                "refresh_token": "rt-browser",
+                "id_token": "id-browser",
+            },
+        )
+        stage1_engine._build_registration_context_payload.return_value = {
+            "requested_executor": "headless",
+            "effective_executor": "headless",
+            "registration_transport": "camoufox_browser",
+            "stage_transports": register_client.registration_stage_transports,
+            "first_name": "Fixed",
+            "last_name": "Profile",
+            "birthdate": "1990-01-02",
+            "browser_runtime_profile": {
+                "browser_family": "camoufox",
+                "device_id": "device-stage1",
+                "user_agent": "Mozilla/5.0 Firefox/135.0",
+            },
+        }
+        stage1_result = _result(
+            email="stage1@example.com",
+            password="pw-stage1",
+            access_token="at-stage1",
+            metadata={
+                "chatgpt_browser_runtime_profile": {
+                    "browser_family": "camoufox",
+                    "device_id": "device-stage1",
+                    "user_agent": "Mozilla/5.0 Firefox/135.0",
+                },
+                "registration_context": {
+                    "first_name": "Fixed",
+                    "last_name": "Profile",
+                    "birthdate": "1990-01-02",
+                }
+            },
+        )
+
+        with mock.patch(
+            "services.chatgpt_core.refresh_token_registration_engine.RefreshTokenRegistrationEngine._capture_auth_via_fresh_login",
+            side_effect=AssertionError("browser executor used protocol OAuth"),
+        ) as protocol_oauth, mock.patch(
+            "services.chatgpt_core.refresh_token_registration_engine.RefreshTokenRegistrationEngine._append_gopay_provider_link_metadata",
+        ):
+            result = adapter._capture_stage2_from_stage1_session(
+                context=context,
+                stage1_engine=stage1_engine,
+                stage1_result=stage1_result,
+                stage2_extra={"chatgpt_registration_mode": "refresh_token"},
+                saved_stage1_id=42,
+            )
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.refresh_token, "rt-browser")
+        self.assertEqual(
+            result.metadata["auth_capture_method"],
+            "registration_stage2_browser_oauth",
+        )
+        self.assertEqual(
+            result.metadata["chatgpt_browser_runtime_profile"]["browser_family"],
+            "camoufox",
+        )
+        protocol_oauth.assert_not_called()
+        stage1_engine._capture_browser_oauth_tokens.assert_called_once()
+
     def test_refresh_token_two_stage_keeps_saved_access_token_when_upgrade_fails(self):
         stage1_result = _result(
             email="stage1@example.com",
@@ -484,6 +647,95 @@ class ChatGPTRegistrationModeAdapterTests(unittest.TestCase):
         self.assertEqual(saved_account.extra["workspace_id"], "ws-personal")
         self.assertEqual(saved_account.extra["auth_level"], "access_token_only")
         context.email_service.finalize_success.assert_called_once()
+        self.assertTrue(result.metadata["needs_auth_capture"])
+        self.assertTrue(result.metadata["auth_capture_required"])
+        self.assertTrue(result.metadata["registration_full_auth_failed"])
+        self.assertEqual(
+            result.metadata["registration_full_auth_error"],
+            "full auth failed",
+        )
+        self.assertEqual(
+            result.metadata["registration_full_auth_failed_policy"],
+            "keep_access_token_checkpoint",
+        )
+
+    def test_browser_pending_finalizes_original_mailbox_without_replaying_signup(self):
+        stage1_result = _result(
+            success=True,
+            email="pending@example.com",
+            password="pending-pw",
+            account_id="",
+            workspace_id="",
+            access_token="",
+            refresh_token="",
+            session_token="",
+            source="registered_auth_pending",
+            metadata={
+                "registered_auth_pending": True,
+                "needs_auth_capture": True,
+                "registration_full_auth_failed": True,
+                "registration_full_auth_error": "browser auth capture failed",
+            },
+        )
+
+        class FakeStage1Engine:
+            def __init__(self, **_kwargs):
+                self.email = None
+                self.password = None
+
+            def run(self):
+                return stage1_result
+
+        fake_module = types.ModuleType(
+            "services.chatgpt_core.access_token_only_registration_engine"
+        )
+        fake_module.AccessTokenOnlyRegistrationEngine = FakeStage1Engine
+        email_service = mock.Mock()
+        email_service.export_state.return_value = {
+            "provider": "icloud_hme",
+            "email": "pending@example.com",
+            "status": "ready",
+        }
+        adapter = build_chatgpt_registration_mode_adapter(
+            {"chatgpt_registration_mode": "refresh_token"}
+        )
+        context = ChatGPTRegistrationContext(
+            email_service=email_service,
+            proxy_url="http://127.0.0.1:7890",
+            callback_logger=lambda _msg, *_: None,
+            email=None,
+            password="pending-pw",
+            browser_mode="headless",
+            max_retries=1,
+            extra_config={
+                "chatgpt_registration_mode": "refresh_token",
+                "_current_task_id": "task-pending",
+            },
+        )
+
+        with mock.patch.dict(
+            "sys.modules",
+            {"services.chatgpt_core.access_token_only_registration_engine": fake_module},
+        ), mock.patch(
+            "core.db.save_account",
+            side_effect=AssertionError("pending result must be saved by the outer task only"),
+        ):
+            result = adapter.run(context)
+
+        self.assertIs(result, stage1_result)
+        self.assertTrue(result.success)
+        self.assertEqual(result.metadata["registration_stage"], "registered_auth_pending")
+        self.assertEqual(result.metadata["auth_capture_stage"], "pending")
+        self.assertEqual(result.metadata["mailbox_state"]["status"], "ready")
+        self.assertEqual(
+            email_service._registration_result_code,
+            "registered_auth_pending",
+        )
+        self.assertFalse(email_service._registration_access_token_saved)
+        email_service.finalize_success.assert_called_once_with(
+            account_email="pending@example.com",
+            task_id="task-pending",
+        )
 
     def test_refresh_token_two_stage_upgrades_the_same_email(self):
         stage1_result = _result(
