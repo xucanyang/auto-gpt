@@ -1,8 +1,12 @@
 """ChatGPT AccessToken 注册引擎。
 
-``protocol`` 使用 curl_cffi 完成注册和 Web Session 提取；``headless`` 与
-``headed`` 使用独立 Camoufox 注册上下文。执行器在一次 account attempt 内固定，
-失败不会跨 transport 兜底。
+三执行器运输层统一迁入 any-auto-register（``services/chatgpt_core/any_auto``）：
+
+- ``protocol`` → any-auto RegistrationEngine（curl_cffi 同 session create + NextAuth AT）
+- ``headless`` / ``headed`` → any-auto ChatGPTBrowserRegister（整段 Camoufox）
+
+本引擎只做邮箱出池、OTP 回调、库存落库合同；失败不跨 transport 兜底，
+也不再把独立 Codex OAuth recovery / auth_pending 半成品当作注册成功。
 """
 
 import json
@@ -26,6 +30,10 @@ from .registration_route_policy import (
 from .task_logging import classify_task_log_level
 from .utils import FlowState, generate_random_name, generate_random_birthday
 from .account_fingerprint import build_browser_fingerprint_payload, fingerprint_signature
+from .any_auto import (
+    run_any_auto_browser_registration,
+    run_any_auto_protocol_registration,
+)
 from .sentinel_browser import (
     BrowserOAuthTokenRecoveryResult,
     BrowserRegistrationStageResult,
@@ -634,7 +642,7 @@ class AccessTokenOnlyRegistrationEngine:
         ]
         return any(marker.lower() in text for marker in retriable_markers)
 
-    def _run_browser_registration(
+    def _run_any_auto_registration(
         self,
         *,
         chatgpt_client: ChatGPTClient,
@@ -642,209 +650,144 @@ class AccessTokenOnlyRegistrationEngine:
         password: str,
         skymail_adapter: EmailServiceAdapter,
         otp_wait_timeout: int,
-        otp_account_budget_timeout: int,
-        otp_resend_wait_timeout: int = 90,
         profile_name: str = "",
         profile_birthdate: str = "",
-    ) -> BrowserRegistrationStageResult:
-        if not self._is_browser_executor():
-            return BrowserRegistrationStageResult(
-                error="browser_registration_forbidden_for_protocol_executor"
+    ):
+        """Run any-auto transport for the configured executor (protocol/headless/headed)."""
+        from .any_auto.transport import AnyAutoRegistrationResult
+
+        chatgpt_client.requested_executor = self.browser_mode
+        chatgpt_client.effective_executor = self.browser_mode
+
+        def _wait_code(
+            *,
+            email=None,
+            timeout=120,
+            pattern=None,
+            otp_sent_at=None,
+            exclude_codes=None,
+            phase="any_auto_otp",
+        ):
+            return skymail_adapter.wait_for_verification_code(
+                email or email_addr,
+                timeout=max(int(timeout or otp_wait_timeout or 120), 30),
+                otp_sent_at=otp_sent_at,
+                exclude_codes=set(exclude_codes or set()),
+                phase=str(phase or "any_auto_otp"),
+                phase_label="any-auto 邮箱验证码",
             )
 
-        self._log(
-            "启动独立 Camoufox 注册链路：邮箱 -> OTP -> about_you -> ChatGPT Web Session"
-        )
-        initial_state: dict[str, Any] = {
-            "otp_wait_timeout": max(int(otp_wait_timeout or 120), 30),
-            "otp_resend_wait_timeout": max(int(otp_resend_wait_timeout or 90), 30),
-        }
-        if str(profile_name or "").strip() and str(profile_birthdate or "").strip():
-            initial_state["profile"] = {
-                "name": str(profile_name).strip(),
-                "birthdate": str(profile_birthdate).strip(),
-            }
-
-        def _wait_for_browser_otp(request_payload: dict | None = None) -> dict:
-            request = dict(request_payload or {})
-            action = str(request.get("action") or "").strip().lower()
-            phase = str(request.get("phase") or "browser_register_email_otp").strip()
-            if action == "release_code":
-                skymail_adapter.release_code(
-                    str(request.get("code") or ""),
-                    "register_email_otp",
-                    "browser_register_email_otp",
-                    phase,
-                )
-                return {"released": True, "code": str(request.get("code") or "").strip()}
-            if action == "signup_committed":
-                # about_you already committed on OpenAI — permanently retire the
-                # HME lease before the long Web Session/OAuth tail can be killed.
-                try:
-                    interim = RegistrationResult(
-                        success=True,
-                        email=str(email_addr or ""),
-                        password=str(password or ""),
-                        metadata={
-                            "registered_auth_pending": True,
-                            "registration_stage_complete": True,
-                            "signup_committed_early": True,
-                        },
-                    )
-                    self._finalize_email_service_success(interim)
-                    self._log(
-                        f"[邮箱] OpenAI 开户已提交，提前 finalize HME success: {email_addr}",
-                        "warning",
-                    )
-                except Exception as exc:
-                    self._log(f"[邮箱] signup_committed 提前 finalize 失败: {exc}", "warning")
-                return {
-                    "signup_committed": True,
-                    "email": str(email_addr or ""),
-                    "page_type": str(request.get("page_type") or ""),
-                }
-            sent_at = request.get("otp_sent_at")
-            try:
-                sent_at = float(sent_at) if sent_at is not None else None
-            except (TypeError, ValueError):
-                sent_at = None
-            try:
-                wait_timeout = int(request.get("timeout") or otp_wait_timeout or 120)
-            except (TypeError, ValueError):
-                wait_timeout = int(otp_wait_timeout or 120)
-            wait_timeout = max(wait_timeout, 30)
-            phase_label = str(
-                request.get("phase_label") or "浏览器注册邮箱验证码"
-            ).strip()
-            exclude_codes = skymail_adapter.used_codes_for_phases(
-                "register_email_otp",
-                "browser_register_email_otp",
-                phase,
-            )
+        def _otp_plain() -> str:
             code = skymail_adapter.wait_for_verification_code(
                 email_addr,
-                timeout=wait_timeout,
-                otp_sent_at=sent_at,
-                exclude_codes=exclude_codes,
-                phase=phase or "browser_register_email_otp",
-                phase_label=phase_label or "浏览器注册邮箱验证码",
+                timeout=max(int(otp_wait_timeout or 120), 30),
+                phase="any_auto_browser_otp",
+                phase_label="any-auto 浏览器邮箱验证码",
             )
-            return {
-                "code": str(code or "").strip(),
-                "otp_sent_at": sent_at,
-                "exclude_codes": sorted(exclude_codes),
-            }
+            return str(code or "").strip()
 
-        hard_timeout_seconds = min(
-            600,
-            max(300, int(otp_account_budget_timeout or 0) + 180),
-        )
-
-        def _browser_stage_log(message: str) -> None:
+        def _transport_log(message: str) -> None:
             clean = str(message or "").strip()
-            business_prefixes = (
-                "[路由]",
-                "[阶段]",
-                "[已有账号]",
-                "[结果]",
-                "[控制]",
-                "[邮箱]",
-                "[验证码]",
-            )
-            if clean.startswith(business_prefixes):
+            if not clean:
+                return
+            if clean.startswith(("[路由]", "[阶段]", "[结果]", "[验证码]", "[邮箱]", "[控制]")):
                 self._log(clean)
             else:
-                self._log(f"[浏览器注册] {clean}", "debug")
+                self._log(f"[any-auto/{self.browser_mode}] {clean}", "debug")
 
-        stage_result = run_browser_registration_stage(
-            email=email_addr,
-            password=password,
-            otp_callback=_wait_for_browser_otp,
-            proxy=self.proxy_url,
-            device_id=str(getattr(chatgpt_client, "device_id", "") or ""),
-            headless=self.browser_mode != "headed",
-            cookies=[],
-            initial_state=initial_state,
-            stop_check=chatgpt_client._check_stop,
-            hard_timeout_seconds=hard_timeout_seconds,
-            log_fn=_browser_stage_log,
-        )
-        route_event = getattr(stage_result, "route_event", None)
-        if isinstance(route_event, dict) and route_event:
-            chatgpt_client.last_registration_route_event = dict(route_event)
-        error = str(stage_result.error or "")
-        signup_complete = bool(getattr(stage_result, "signup_complete", False))
-        if not signup_complete and not stage_result.ok:
-            if not (isinstance(route_event, dict) and route_event):
-                self._log(
-                    f"Camoufox 注册链路失败: {error or 'browser_registration_failed'}",
-                    "warning",
-                )
-            return stage_result
-
-        if error and "missing_web_session" in error:
-            # Signup already committed on OpenAI; keep going so the engine can
-            # run isolated OAuth recovery or save registered_auth_pending.
+        if self._is_browser_executor():
             self._log(
-                "Camoufox 注册开户已完成，但同上下文未读到 Web AT；"
-                "继续独立 OAuth / auth_pending 落库路径",
-                "warning",
+                f"启动 any-auto 浏览器注册运输层 executor={self.browser_mode} "
+                f"(Camoufox 整段：邮箱 -> OTP -> about_you -> Web Session)"
             )
-        elif not stage_result.ok and signup_complete:
+            result = run_any_auto_browser_registration(
+                email=email_addr,
+                password=password,
+                proxy_url=self.proxy_url,
+                headless=self.browser_mode != "headed",
+                otp_callback=_otp_plain,
+                log_fn=_transport_log,
+            )
+        else:
             self._log(
-                f"Camoufox 注册链路开户完成但带告警: {error or '-'}",
-                "warning",
+                "启动 any-auto 协议注册运输层 executor=protocol "
+                "(curl_cffi 同 session create + NextAuth AT)"
+            )
+            provider = str(
+                getattr(getattr(self.email_service, "service_type", None), "value", "")
+                or getattr(self.email_service, "provider", "")
+                or "auto_gpt_mailbox"
             )
 
-        state_data = dict(stage_result.final_state or {})
-        chatgpt_client.last_registration_state = FlowState(
-            page_type=str(state_data.get("page_type") or ""),
-            continue_url=str(state_data.get("continue_url") or ""),
-            method=str(state_data.get("method") or "GET"),
-            current_url=str(
-                state_data.get("current_url") or stage_result.page_url or ""
-            ),
-            payload=(
-                dict(state_data.get("payload") or {})
-                if isinstance(state_data.get("payload"), dict)
-                else {}
-            ),
-            raw=(
-                dict(state_data.get("raw") or {})
-                if isinstance(state_data.get("raw"), dict)
-                else {}
-            ),
-        )
-        chatgpt_client.registration_transport = "camoufox_browser"
-        chatgpt_client.requested_executor = self.browser_mode
-        chatgpt_client.effective_executor = str(
-            stage_result.effective_executor or self.browser_mode
-        )
+            def _create_email():
+                return {
+                    "email": email_addr,
+                    "service_id": str(
+                        getattr(self.email_service, "last_service_id", "")
+                        or getattr(self.email_service, "token", "")
+                        or ""
+                    ),
+                    "token": str(getattr(self.email_service, "token", "") or ""),
+                }
+
+            result = run_any_auto_protocol_registration(
+                email=email_addr,
+                password=password,
+                proxy_url=self.proxy_url,
+                wait_code=_wait_code,
+                log_fn=_transport_log,
+                provider=provider,
+                create_email_fn=_create_email,
+                prefer_password=True,
+            )
+
+        if not isinstance(result, AnyAutoRegistrationResult):
+            result = AnyAutoRegistrationResult(
+                success=False,
+                email=email_addr,
+                password=password,
+                error_message="any_auto_transport_invalid_result",
+                executor=self.browser_mode,
+                transport="any_auto",
+            )
+
+        chatgpt_client.registration_transport = str(result.transport or "any_auto")
+        chatgpt_client.effective_executor = str(result.executor or self.browser_mode)
         chatgpt_client.registration_runtime_profile = {
-            "browser_family": "camoufox",
-            "device_id": str(stage_result.device_id or getattr(chatgpt_client, "device_id", "") or ""),
-            "user_agent": str(stage_result.user_agent or ""),
+            "browser_family": "camoufox" if self._is_browser_executor() else "curl_cffi",
+            "device_id": str(getattr(chatgpt_client, "device_id", "") or ""),
+            "user_agent": "",
             "requested_executor": self.browser_mode,
-            "effective_executor": str(stage_result.effective_executor or self.browser_mode),
-            "headless_reason": str(stage_result.headless_reason or ""),
+            "effective_executor": str(result.executor or self.browser_mode),
+            "transport": str(result.transport or "any_auto"),
+            "profile_name": str(profile_name or ""),
+            "profile_birthdate": str(profile_birthdate or ""),
         }
         chatgpt_client.registration_stage_transports = [
             {
                 "stage": "registration",
-                "transport": "camoufox_browser",
-                "executor": str(stage_result.effective_executor or self.browser_mode),
+                "transport": str(result.transport or "any_auto"),
+                "executor": str(result.executor or self.browser_mode),
             },
             {
                 "stage": "web_session_capture",
-                "transport": "camoufox_browser",
-                "executor": str(stage_result.effective_executor or self.browser_mode),
-                "status": "success" if str((stage_result.web_session or {}).get("access_token") or "").strip() else "missing_access_token",
+                "transport": str(result.transport or "any_auto"),
+                "executor": str(result.executor or self.browser_mode),
+                "status": "success" if result.ok else "failed",
             },
         ]
-        self._log(
-            "Camoufox 注册链路完成；浏览器 Cookie 保持在浏览器结果中，不回灌协议 Session"
-        )
-        return stage_result
+        if result.ok:
+            self._log(
+                f"any-auto 注册运输层成功 executor={result.executor} "
+                f"transport={result.transport} account_id={result.account_id or '-'}"
+            )
+        else:
+            self._log(
+                f"any-auto 注册运输层失败 executor={result.executor}: "
+                f"{result.error_message or 'unknown'}",
+                "warning",
+            )
+        return result
 
     def _capture_browser_oauth_tokens(
         self,
@@ -1462,61 +1405,50 @@ class AccessTokenOnlyRegistrationEngine:
                         session_result.setdefault("account_id", str((tokens or {}).get("account_id") or ""))
                         session_result.setdefault("workspace_id", str((tokens or {}).get("workspace_id") or ""))
                     else:
-                        self._log("步骤 1/2: 执行注册状态机...")
-                        if self._is_browser_executor():
-                            browser_stage = self._run_browser_registration(
-                                chatgpt_client=chatgpt_client,
-                                email_addr=email_addr,
-                                password=pwd,
-                                skymail_adapter=skymail_adapter,
-                                otp_wait_timeout=register_otp_wait_seconds,
-                                otp_resend_wait_timeout=register_otp_resend_wait_seconds,
-                                otp_account_budget_timeout=register_otp_account_budget_seconds,
-                                profile_name=f"{first_name} {last_name}".strip(),
-                                profile_birthdate=birthdate,
-                            )
-                            stage_error = str(browser_stage.error or "")
-                            # OpenAI signup can finish while ChatGPT AT capture fails.
-                            # Treat missing_web_session as signup success so we still
-                            # run isolated OAuth recovery / auth_pending save instead of
-                            # discarding a real account and late_failure-ing the HME.
-                            signup_complete = bool(
-                                getattr(browser_stage, "signup_complete", False)
-                            ) or ("missing_web_session" in stage_error)
-                            success = bool(browser_stage.ok or signup_complete)
-                            if browser_stage.ok:
-                                msg = "registration complete via camoufox browser"
-                            elif signup_complete:
-                                msg = stage_error or "browser_registration_signup_complete_missing_at"
-                            else:
-                                msg = stage_error or "browser_registration_failed"
-                            session_result = dict(browser_stage.web_session or {})
-                            session_ok = bool(
-                                str(session_result.get("access_token") or "").strip()
+                        self._log(
+                            f"步骤 1/2: 执行 any-auto 注册运输层 executor={self.browser_mode}..."
+                        )
+                        any_auto_result = self._run_any_auto_registration(
+                            chatgpt_client=chatgpt_client,
+                            email_addr=email_addr,
+                            password=pwd,
+                            skymail_adapter=skymail_adapter,
+                            otp_wait_timeout=register_otp_wait_seconds,
+                            profile_name=f"{first_name} {last_name}".strip(),
+                            profile_birthdate=birthdate,
+                        )
+                        success = bool(any_auto_result.ok)
+                        if success:
+                            msg = (
+                                f"registration complete via any-auto "
+                                f"executor={any_auto_result.executor} "
+                                f"transport={any_auto_result.transport}"
                             )
                         else:
-                            chatgpt_client.requested_executor = "protocol"
-                            chatgpt_client.effective_executor = "protocol"
-                            chatgpt_client.registration_transport = "protocol_http"
-                            chatgpt_client.registration_stage_transports = [
-                                {
-                                    "stage": "registration",
-                                    "transport": "curl_cffi_http",
-                                    "executor": "protocol",
-                                }
-                            ]
-                            success, msg = chatgpt_client.register_complete_flow(
-                                email_addr,
-                                pwd,
-                                first_name,
-                                last_name,
-                                birthdate,
-                                skymail_adapter,
-                                otp_wait_timeout=register_otp_wait_seconds,
-                                otp_resend_wait_timeout=register_otp_resend_wait_seconds,
-                                otp_account_budget_timeout=register_otp_account_budget_seconds,
-                                allow_existing_account_login_route=existing_account_login_route_allowed,
+                            msg = (
+                                any_auto_result.error_message
+                                or "any_auto_registration_failed"
                             )
+                        # any-auto transport already returns final AT/session material.
+                        session_result = {
+                            "access_token": any_auto_result.access_token,
+                            "refresh_token": any_auto_result.refresh_token,
+                            "id_token": any_auto_result.id_token,
+                            "session_token": any_auto_result.session_token,
+                            "account_id": any_auto_result.account_id,
+                            "workspace_id": any_auto_result.workspace_id,
+                            "cookies": any_auto_result.cookies,
+                            "cookie_header": any_auto_result.cookie_header
+                            or any_auto_result.cookies,
+                            "user_id": any_auto_result.account_id,
+                            "source": any_auto_result.source,
+                        }
+                        if any_auto_result.password:
+                            pwd = any_auto_result.password
+                            self.password = pwd
+                        session_ok = bool(
+                            str(session_result.get("access_token") or "").strip()
+                        )
 
                     if not existing_account_capture:
                         if not success:
@@ -1695,53 +1627,21 @@ class AccessTokenOnlyRegistrationEngine:
                         if not success and existing_account_login_route_event:
                             # 已按上面的登录恢复链路填充 session_result，不再复用注册会话。
                             pass
-                        elif self._is_browser_executor():
-                            if not session_ok:
-                                self._log(
-                                    "浏览器注册已完成但同上下文未读到 Web AT，启动独立浏览器 OAuth 捕获",
-                                    "warning",
-                                )
-                                prior_session = (
-                                    dict(session_result)
-                                    if isinstance(session_result, dict)
-                                    else {}
-                                )
-                                session_ok, oauth_session = self._capture_browser_oauth_tokens(
-                                    chatgpt_client=chatgpt_client,
-                                    email_addr=email_addr,
-                                    password=pwd,
-                                    skymail_adapter=skymail_adapter,
-                                )
-                                if session_ok and isinstance(oauth_session, dict):
-                                    session_result = oauth_session
-                                else:
-                                    # Keep signup-context cookies/session_token for auth_pending.
-                                    session_result = prior_session
-                                    if not isinstance(session_result, dict):
-                                        session_result = {
-                                            "error": str(oauth_session or "oauth recovery failed")
-                                        }
-                                    elif oauth_session:
-                                        session_result = {
-                                            **session_result,
-                                            "oauth_recovery_error": str(oauth_session)[:300],
-                                        }
+                        elif session_ok:
+                            # any-auto transport already returned AT/session; no second-stage
+                            # OAuth recovery or protocol reuse_session bridge.
+                            self._log(
+                                "步骤 2/2: any-auto 已返回 AccessToken/Session，跳过二次 OAuth recovery"
+                            )
                         else:
-                            self._log("步骤 2/2: 复用注册会话，直接获取 ChatGPT Session / AccessToken...")
-                            session_ok, session_result = chatgpt_client.reuse_session_and_get_tokens()
-                            stages = list(
-                                getattr(chatgpt_client, "registration_stage_transports", None)
-                                or []
+                            self._log(
+                                "步骤 2/2: any-auto 未返回 AccessToken，按注册失败处理"
+                                "（不再启动独立 OAuth recovery / auth_pending 半成品成功）",
+                                "warning",
                             )
-                            stages.append(
-                                {
-                                    "stage": "web_session_capture",
-                                    "transport": "curl_cffi_http",
-                                    "executor": "protocol",
-                                    "status": "success" if session_ok else "failed",
-                                }
-                            )
-                            chatgpt_client.registration_stage_transports = stages
+                            session_result = {
+                                "error": msg or "any_auto_missing_access_token",
+                            }
 
                     if session_ok:
                         self._log("Token 提取完成！")
@@ -1805,55 +1705,7 @@ class AccessTokenOnlyRegistrationEngine:
                             self._finalize_email_service_success(result)
                         return result
 
-                    last_error = f"注册成功，但获取 AccessToken 失败: {session_result}"
-                    if self._is_browser_executor() and not existing_account_capture:
-                        pending_session = (
-                            dict(session_result)
-                            if isinstance(session_result, dict)
-                            else {}
-                        )
-                        result.success = True
-                        result.source = "registered_auth_pending"
-                        result.error_message = last_error
-                        result.account_id = str(
-                            pending_session.get("account_id")
-                            or pending_session.get("user_id")
-                            or ""
-                        ).strip()
-                        result.session_token = str(
-                            pending_session.get("session_token") or ""
-                        ).strip()
-                        result.metadata = {
-                            "registered_auth_pending": True,
-                            "needs_auth_capture": True,
-                            "auth_capture_required": True,
-                            "registration_stage_complete": True,
-                            "registration_full_auth_failed": True,
-                            "registration_full_auth_error": last_error,
-                            "registration_full_auth_failed_policy": "keep_registered_auth_pending",
-                            "cookies": pending_session.get("cookies") or "",
-                            "cookie_header": (
-                                pending_session.get("cookie_header")
-                                or pending_session.get("cookies")
-                                or ""
-                            ),
-                            "registration_context": self._build_registration_context_payload(
-                                chatgpt_client=chatgpt_client,
-                                first_name=first_name,
-                                last_name=last_name,
-                                birthdate=birthdate,
-                            ),
-                        }
-                        result.metadata = self._attach_browser_fingerprint_metadata(
-                            result.metadata,
-                            chatgpt_client,
-                        )
-                        self._log(
-                            "浏览器已确认注册完成但认证材料待补抓；保存 auth_pending，禁止重放注册",
-                            "warning",
-                        )
-                        self._finalize_email_service_success(result)
-                        return result
+                    last_error = f"注册未拿到 AccessToken（any-auto 合同失败）: {session_result}"
                     if attempt < registration_max_retries - 1:
                         self._log(f"{last_error}，准备整流程重试")
                         continue

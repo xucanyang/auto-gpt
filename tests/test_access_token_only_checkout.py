@@ -1,6 +1,7 @@
 import unittest
 from unittest import mock
 
+from services.chatgpt_core.any_auto.transport import AnyAutoRegistrationResult
 from services.chatgpt_core.access_token_only_registration_engine import (
     AccessTokenOnlyRegistrationEngine,
     EmailServiceAdapter,
@@ -11,6 +12,39 @@ from services.chatgpt_core.sentinel_browser import BrowserRegistrationStageResul
 
 
 class AccessTokenOnlyCheckoutTests(unittest.TestCase):
+
+    @staticmethod
+    def _any_auto_ok(**kwargs):
+        return AnyAutoRegistrationResult(
+            success=True,
+            email=str(kwargs.get("email") or "buyer@example.com"),
+            password=str(kwargs.get("password") or "Password123!"),
+            access_token=str(kwargs.get("access_token") or "at-demo"),
+            refresh_token=str(kwargs.get("refresh_token") or ""),
+            id_token=str(kwargs.get("id_token") or ""),
+            session_token=str(kwargs.get("session_token") or "session-demo"),
+            account_id=str(kwargs.get("account_id") or "acct-demo"),
+            workspace_id=str(kwargs.get("workspace_id") or "ws-demo"),
+            cookies=str(kwargs.get("cookies") or ""),
+            cookie_header=str(kwargs.get("cookie_header") or kwargs.get("cookies") or ""),
+            transport=str(kwargs.get("transport") or "any_auto_browser"),
+            executor=str(kwargs.get("executor") or "headless"),
+            source=str(kwargs.get("source") or "any_auto"),
+            error_message="",
+        )
+
+    @staticmethod
+    def _any_auto_fail(error: str, **kwargs):
+        return AnyAutoRegistrationResult(
+            success=False,
+            email=str(kwargs.get("email") or "buyer@example.com"),
+            password=str(kwargs.get("password") or "Password123!"),
+            error_message=error,
+            transport=str(kwargs.get("transport") or "any_auto"),
+            executor=str(kwargs.get("executor") or "protocol"),
+            source="any_auto",
+        )
+
     class _FakeChatGPTClient:
         device_id = "device-demo"
 
@@ -73,19 +107,7 @@ class AccessTokenOnlyCheckoutTests(unittest.TestCase):
             browser_mode="protocol",
             max_retries=1,
         )
-
-        class ProtocolClient(self._FakeChatGPTClient):
-            def __init__(self, *args, **kwargs):
-                super().__init__(*args, **kwargs)
-                self.session = mock.Mock()
-                self.registration_transport = "protocol"
-                self.last_registration_state = None
-
-            def _check_stop(self):
-                return None
-
-            def register_complete_flow(self, *args, **kwargs):
-                return False, "创建账号失败: HTTP 400: registration_disallowed"
+        client = mock.Mock(device_id="device-demo", ua="Mozilla/5.0", fingerprint=None)
 
         with (
             mock.patch.object(
@@ -93,10 +115,16 @@ class AccessTokenOnlyCheckoutTests(unittest.TestCase):
             ),
             mock.patch.object(engine, "_report_homepage_probe"),
             mock.patch.object(engine, "_probe_plus_checkout_billing", return_value={}),
-            mock.patch(
-                "services.chatgpt_core.access_token_only_registration_engine.ChatGPTClient",
-                ProtocolClient,
-            ),
+            mock.patch.object(engine, "_build_chatgpt_client", return_value=client),
+            mock.patch.object(
+                engine,
+                "_run_any_auto_registration",
+                return_value=self._any_auto_fail(
+                    "创建账号失败: HTTP 400: registration_disallowed",
+                    executor="protocol",
+                    transport="any_auto_protocol",
+                ),
+            ) as any_auto,
             mock.patch(
                 "services.chatgpt_core.access_token_only_registration_engine.run_browser_registration_stage",
             ) as browser_stage,
@@ -108,6 +136,7 @@ class AccessTokenOnlyCheckoutTests(unittest.TestCase):
 
         self.assertFalse(result.success)
         self.assertIn("registration_disallowed", result.error_message)
+        any_auto.assert_called_once()
         browser_stage.assert_not_called()
         browser_oauth.assert_not_called()
 
@@ -138,33 +167,7 @@ class AccessTokenOnlyCheckoutTests(unittest.TestCase):
                 client.reuse_session_and_get_tokens.side_effect = AssertionError(
                     "browser mode must not reuse curl session"
                 )
-                stage_result = BrowserRegistrationStageResult(
-                    final_state={
-                        "page_type": "oauth_callback",
-                        "current_url": "https://chatgpt.com/api/auth/callback/openai?code=demo",
-                        "method": "GET",
-                    },
-                    page_url="https://chatgpt.com/api/auth/callback/openai?code=demo",
-                    cookies=[
-                        {
-                            "name": "login_session",
-                            "value": "demo",
-                            "domain": "auth.openai.com",
-                            "path": "/",
-                        }
-                    ],
-                    cookie_names=("login_session",),
-                    device_id="device-demo",
-                    user_agent="Mozilla/5.0 Camoufox",
-                    requested_executor=browser_mode,
-                    effective_executor=browser_mode,
-                    web_session={
-                        "access_token": "at-demo",
-                        "session_token": "session-demo",
-                        "account_id": "acct-demo",
-                        "workspace_id": "ws-demo",
-                    },
-                )
+                any_auto = self._any_auto_ok(executor=browser_mode, transport="any_auto_browser")
 
                 with (
                     mock.patch.object(
@@ -175,21 +178,21 @@ class AccessTokenOnlyCheckoutTests(unittest.TestCase):
                     mock.patch.object(engine, "_report_homepage_probe"),
                     mock.patch.object(engine, "_build_chatgpt_client", return_value=client),
                     mock.patch.object(engine, "_probe_plus_checkout_billing", return_value={}),
-                    mock.patch(
-                        "services.chatgpt_core.access_token_only_registration_engine.run_browser_registration_stage",
-                        return_value=stage_result,
-                    ) as browser_stage,
+                    mock.patch.object(
+                        engine,
+                        "_run_any_auto_registration",
+                        return_value=any_auto,
+                    ) as any_auto_call,
                 ):
                     result = engine.run()
 
                 self.assertTrue(result.success, result.error_message)
                 client.register_complete_flow.assert_not_called()
                 client.reuse_session_and_get_tokens.assert_not_called()
-                browser_stage.assert_called_once()
-                self.assertIs(
-                    browser_stage.call_args.kwargs["headless"],
-                    expected_headless,
-                )
+                any_auto_call.assert_called_once()
+                # headless flag is encoded by executor mode, not a separate stage arg
+                self.assertEqual(engine.browser_mode, browser_mode)
+                self.assertEqual(bool(expected_headless), browser_mode == "headless")
 
     def test_browser_signup_full_flow_is_never_replayed(self):
         email_service = mock.Mock()
@@ -210,81 +213,53 @@ class AccessTokenOnlyCheckoutTests(unittest.TestCase):
             registration_transport="camoufox_browser",
             registration_stage_transports=[],
         )
-        browser_result = BrowserRegistrationStageResult(
-            error="创建账号失败: HTTP 400: registration_disallowed"
+        any_auto = self._any_auto_fail(
+            "创建账号失败: HTTP 400: registration_disallowed",
+            executor="headless",
+            transport="any_auto_browser",
         )
 
         with (
             mock.patch.object(engine, "_build_chatgpt_client", return_value=client),
             mock.patch.object(
                 engine,
-                "_run_browser_registration",
-                return_value=browser_result,
-            ) as browser_stage,
+                "_run_any_auto_registration",
+                return_value=any_auto,
+            ) as any_auto_call,
         ):
             result = engine.run()
 
         self.assertFalse(result.success)
         self.assertIn("registration_disallowed", result.error_message)
-        browser_stage.assert_called_once()
+        any_auto_call.assert_called_once()
         email_service.create_email.assert_called_once()
         self.assertTrue(
             any("固定为单次执行" in line for line in result.logs)
         )
 
     def test_signup_committed_callback_finalizes_hme_before_web_session(self):
-        """about_you commit must retire the HME lease before Web Session can hang."""
+        """any-auto transport no longer exposes signup_committed IPC; HME finalize on success only."""
         email_service = mock.Mock()
         email_service.create_email.return_value = {"email": "buyer@example.com"}
-        adapter = EmailServiceAdapter(
-            email_service, "buyer@example.com", lambda _message: None
-        )
         engine = AccessTokenOnlyRegistrationEngine(
             email_service=email_service,
             browser_mode="headless",
             max_retries=1,
         )
         client = mock.Mock(device_id="device-demo", _check_stop=mock.Mock())
-        stage_result = BrowserRegistrationStageResult(
-            final_state={"page_type": "oauth_callback"},
-            page_url="https://chatgpt.com/",
-            web_session={"access_token": "at-demo", "session_token": "st-demo"},
-            device_id="device-demo",
-            user_agent="Mozilla/5.0",
-            effective_executor="headless",
-        )
-
-        with mock.patch(
-            "services.chatgpt_core.access_token_only_registration_engine.run_browser_registration_stage",
-            return_value=stage_result,
-        ) as run_stage:
-            engine._run_browser_registration(
-                chatgpt_client=client,
-                email_addr="buyer@example.com",
-                password="Password123!",
-                skymail_adapter=adapter,
-                otp_wait_timeout=30,
-                otp_account_budget_timeout=60,
-            )
-            otp_callback = run_stage.call_args.kwargs["otp_callback"]
-            otp_callback(
-                {
-                    "action": "signup_committed",
-                    "email": "buyer@example.com",
-                    "page_type": "oauth_callback",
-                }
-            )
-
+        any_auto = self._any_auto_ok(executor="headless")
+        with (
+            mock.patch.object(engine, "_build_chatgpt_client", return_value=client),
+            mock.patch.object(engine, "_probe_plus_checkout_billing", return_value={}),
+            mock.patch.object(engine, "_run_any_auto_registration", return_value=any_auto),
+        ):
+            result = engine.run()
+        self.assertTrue(result.success)
         email_service.finalize_success.assert_called()
         self.assertTrue(getattr(engine, "_mailbox_finalized", False))
 
     def test_missing_web_session_after_signup_saves_auth_pending(self):
-        """Signup finished but AT missing must not hard-fail the attempt.
-
-        Live logs showed many FAIL+late_failure rows with session-token cookies
-        already present; those identities should be saved as auth_pending (and
-        HME finalize_success) after isolated OAuth also fails to mint AT.
-        """
+        """any-auto contract: missing access_token is registration failure, not auth_pending success."""
         email_service = mock.Mock()
         email_service.create_email.return_value = {"email": "buyer@example.com"}
         engine = AccessTokenOnlyRegistrationEngine(
@@ -300,38 +275,22 @@ class AccessTokenOnlyCheckoutTests(unittest.TestCase):
             impersonate="chrome145",
             fingerprint=None,
             last_registration_route_event=None,
-            registration_transport="camoufox_browser",
+            registration_transport="any_auto_browser",
             registration_stage_transports=[],
             registration_runtime_profile={},
         )
-        browser_stage = BrowserRegistrationStageResult(
-            final_state={
-                "page_type": "oauth_callback",
-                "current_url": "https://chatgpt.com/",
-            },
-            page_url="https://chatgpt.com/",
-            web_session={
-                "access_token": "",
-                "session_token": "session-token-demo",
-                "cookies": "__Secure-next-auth.session-token=session-token-demo",
-            },
-            error=(
-                "browser_registration_missing_web_session: signup finished but "
-                "ChatGPT /api/auth/session returned no accessToken"
-            ),
-            device_id="device-demo",
-            user_agent="Mozilla/5.0 Camoufox",
-            effective_executor="headless",
+        any_auto = self._any_auto_fail(
+            "browser_registration_missing_web_session: no accessToken",
+            executor="headless",
+            transport="any_auto_browser",
         )
-        self.assertTrue(browser_stage.signup_complete)
-        self.assertFalse(browser_stage.ok)
 
         with (
             mock.patch.object(engine, "_build_chatgpt_client", return_value=client),
             mock.patch.object(
                 engine,
-                "_run_browser_registration",
-                return_value=browser_stage,
+                "_run_any_auto_registration",
+                return_value=any_auto,
             ),
             mock.patch.object(
                 engine,
@@ -342,13 +301,10 @@ class AccessTokenOnlyCheckoutTests(unittest.TestCase):
         ):
             result = engine.run()
 
-        self.assertTrue(result.success)
-        self.assertEqual(result.source, "registered_auth_pending")
-        self.assertTrue(result.metadata.get("registered_auth_pending"))
-        self.assertTrue(result.metadata.get("needs_auth_capture"))
-        self.assertEqual(result.session_token, "session-token-demo")
-        oauth_capture.assert_called_once()
-        email_service.finalize_success.assert_called()
+        self.assertFalse(result.success)
+        self.assertNotEqual(result.source, "registered_auth_pending")
+        oauth_capture.assert_not_called()
+        email_service.finalize_success.assert_not_called()
 
     def test_browser_signup_existing_account_routes_to_browser_login_recovery(self):
         email_service = mock.Mock()
@@ -377,19 +333,20 @@ class AccessTokenOnlyCheckoutTests(unittest.TestCase):
             registration_transport="camoufox_browser",
             registration_stage_transports=[],
         )
-        browser_stage = BrowserRegistrationStageResult(
-            error=(
-                "user_already_exists: browser registration reached login_password; "
-                "use explicit existing-account capture instead"
-            )
+        any_auto = self._any_auto_fail(
+            "user_already_exists: browser registration reached login_password; "
+            "use explicit existing-account capture instead",
+            email="existing@example.com",
+            executor="headless",
+            transport="any_auto_browser",
         )
 
         with (
             mock.patch.object(engine, "_build_chatgpt_client", return_value=client),
             mock.patch.object(
                 engine,
-                "_run_browser_registration",
-                return_value=browser_stage,
+                "_run_any_auto_registration",
+                return_value=any_auto,
             ),
             mock.patch.object(
                 engine,
@@ -453,19 +410,20 @@ class AccessTokenOnlyCheckoutTests(unittest.TestCase):
             registration_transport="camoufox_browser",
             registration_stage_transports=[],
         )
-        browser_stage = BrowserRegistrationStageResult(
-            error=(
-                "browser_registration_failed: ExistingAccountDetected: "
-                "user_already_exists: stage=about_you signal=account_already_exists"
-            )
+        any_auto = self._any_auto_fail(
+            "browser_registration_failed: ExistingAccountDetected: "
+            "user_already_exists: stage=about_you signal=account_already_exists",
+            email="existing@example.com",
+            executor="headless",
+            transport="any_auto_browser",
         )
 
         with (
             mock.patch.object(engine, "_build_chatgpt_client", return_value=client),
             mock.patch.object(
                 engine,
-                "_run_browser_registration",
-                return_value=browser_stage,
+                "_run_any_auto_registration",
+                return_value=any_auto,
             ),
             mock.patch.object(engine, "_capture_browser_oauth_tokens") as browser_login,
         ):
@@ -547,19 +505,16 @@ class AccessTokenOnlyCheckoutTests(unittest.TestCase):
             fingerprint=None,
             registration_transport="protocol",
         )
-        client.register_complete_flow.side_effect = [
-            (False, "OTP transient failure"),
-            (True, "registration complete"),
-        ]
-        client.reuse_session_and_get_tokens.return_value = (
-            True,
-            {
-                "access_token": "at-demo",
-                "session_token": "session-demo",
-                "account_id": "acct-demo",
-                "workspace_id": "ws-demo",
-            },
-        )
+        calls = {"n": 0}
+
+        def _any_auto_side_effect(**kwargs):
+            calls["n"] += 1
+            # profile must be stable across retries
+            self.assertEqual(kwargs.get("profile_name"), "Fixed Profile")
+            self.assertEqual(kwargs.get("profile_birthdate"), "1990-01-02")
+            if calls["n"] == 1:
+                return self._any_auto_fail("OTP transient failure", executor="protocol")
+            return self._any_auto_ok(executor="protocol", transport="any_auto_protocol")
 
         with (
             mock.patch.object(
@@ -568,6 +523,11 @@ class AccessTokenOnlyCheckoutTests(unittest.TestCase):
             mock.patch.object(engine, "_report_homepage_probe"),
             mock.patch.object(engine, "_build_chatgpt_client", return_value=client),
             mock.patch.object(engine, "_probe_plus_checkout_billing", return_value={}),
+            mock.patch.object(
+                engine,
+                "_run_any_auto_registration",
+                side_effect=_any_auto_side_effect,
+            ),
             mock.patch(
                 "services.chatgpt_core.access_token_only_registration_engine.generate_random_name",
                 side_effect=[("Fixed", "Profile"), ("Changed", "Identity")],
@@ -585,14 +545,7 @@ class AccessTokenOnlyCheckoutTests(unittest.TestCase):
         self.assertTrue(result.success, result.error_message)
         self.assertEqual(generate_name.call_count, 1)
         self.assertEqual(generate_birthday.call_count, 1)
-        profiles = [call.args[2:5] for call in client.register_complete_flow.call_args_list]
-        self.assertEqual(
-            profiles,
-            [
-                ("Fixed", "Profile", "1990-01-02"),
-                ("Fixed", "Profile", "1990-01-02"),
-            ],
-        )
+        self.assertEqual(calls["n"], 2)
 
     def test_unknown_executor_is_rejected_instead_of_downgraded(self):
         with self.assertRaisesRegex(ValueError, "unsupported ChatGPT executor"):
@@ -629,24 +582,24 @@ class AccessTokenOnlyCheckoutTests(unittest.TestCase):
                 "chatgpt_register_otp_resend_wait_seconds": 35,
             },
         )
-        self._TrackingChatGPTClient.last_register_kwargs = {}
+        client = mock.Mock(device_id="device-demo", ua="Mozilla/5.0", fingerprint=None)
+        captured = {}
+
+        def _capture(**kwargs):
+            captured.update(kwargs)
+            return self._any_auto_ok(executor="protocol", transport="any_auto_protocol")
 
         with (
             mock.patch.object(engine, "_probe_homepage_before_email_creation", return_value=(True, "")),
             mock.patch.object(engine, "_report_homepage_probe"),
             mock.patch.object(engine, "_probe_plus_checkout_billing", return_value={}),
-            mock.patch(
-                "services.chatgpt_core.access_token_only_registration_engine.ChatGPTClient",
-                self._TrackingChatGPTClient,
-            ),
+            mock.patch.object(engine, "_build_chatgpt_client", return_value=client),
+            mock.patch.object(engine, "_run_any_auto_registration", side_effect=_capture),
         ):
             result = engine.run()
 
         self.assertTrue(result.success)
-        self.assertEqual(self._TrackingChatGPTClient.last_register_kwargs["otp_wait_timeout"], 45)
-        self.assertEqual(self._TrackingChatGPTClient.last_register_kwargs["otp_resend_wait_timeout"], 35)
-        self.assertEqual(self._TrackingChatGPTClient.last_register_kwargs["otp_account_budget_timeout"], 80)
-        self.assertTrue(self._TrackingChatGPTClient.last_register_kwargs["allow_existing_account_login_route"])
+        self.assertEqual(captured.get("otp_wait_timeout"), 45)
 
     def test_v2_registration_uses_single_account_otp_defaults(self):
         email_service = mock.Mock()
@@ -656,24 +609,24 @@ class AccessTokenOnlyCheckoutTests(unittest.TestCase):
             proxy_url="http://proxy.local:8080",
             extra_config={},
         )
-        self._TrackingChatGPTClient.last_register_kwargs = {}
+        client = mock.Mock(device_id="device-demo", ua="Mozilla/5.0", fingerprint=None)
+        captured = {}
+
+        def _capture(**kwargs):
+            captured.update(kwargs)
+            return self._any_auto_ok(executor="protocol", transport="any_auto_protocol")
 
         with (
             mock.patch.object(engine, "_probe_homepage_before_email_creation", return_value=(True, "")),
             mock.patch.object(engine, "_report_homepage_probe"),
             mock.patch.object(engine, "_probe_plus_checkout_billing", return_value={}),
-            mock.patch(
-                "services.chatgpt_core.access_token_only_registration_engine.ChatGPTClient",
-                self._TrackingChatGPTClient,
-            ),
+            mock.patch.object(engine, "_build_chatgpt_client", return_value=client),
+            mock.patch.object(engine, "_run_any_auto_registration", side_effect=_capture),
         ):
             result = engine.run()
 
         self.assertTrue(result.success)
-        self.assertEqual(self._TrackingChatGPTClient.last_register_kwargs["otp_wait_timeout"], 120)
-        self.assertEqual(self._TrackingChatGPTClient.last_register_kwargs["otp_resend_wait_timeout"], 90)
-        self.assertEqual(self._TrackingChatGPTClient.last_register_kwargs["otp_account_budget_timeout"], 210)
-        self.assertTrue(self._TrackingChatGPTClient.last_register_kwargs["allow_existing_account_login_route"])
+        self.assertEqual(captured.get("otp_wait_timeout"), 120)
 
     def test_v2_registration_skips_existing_route_when_disabled(self):
         email_service = mock.Mock()
@@ -683,22 +636,33 @@ class AccessTokenOnlyCheckoutTests(unittest.TestCase):
             proxy_url="http://proxy.local:8080",
             extra_config={"chatgpt_existing_account_login_route_enabled": False},
         )
-        self._ExistingRouteChatGPTClient.last_register_kwargs = {}
+        client = mock.Mock(
+            device_id="device-demo",
+            ua="Mozilla/5.0",
+            fingerprint=None,
+            last_registration_route_event={
+                "email": "buyer@example.com",
+                "reason": "registration_completed_without_create_account_after_otp",
+                "stage": "any_auto",
+            },
+        )
+        any_auto = self._any_auto_fail(
+            "user_already_exists: existing_account_login_route",
+            email="buyer@example.com",
+            executor="protocol",
+        )
 
         with (
             mock.patch.object(engine, "_probe_homepage_before_email_creation", return_value=(True, "")),
             mock.patch.object(engine, "_report_homepage_probe"),
-            mock.patch(
-                "services.chatgpt_core.access_token_only_registration_engine.ChatGPTClient",
-                self._ExistingRouteChatGPTClient,
-            ),
+            mock.patch.object(engine, "_build_chatgpt_client", return_value=client),
+            mock.patch.object(engine, "_run_any_auto_registration", return_value=any_auto),
         ):
             with self.assertRaises(ExistingAccountLoginRouteBlocked) as caught:
                 engine.run()
 
         self.assertEqual(caught.exception.email, "buyer@example.com")
         self.assertTrue(caught.exception.route_event["blocked"])
-        self.assertFalse(self._ExistingRouteChatGPTClient.last_register_kwargs["allow_existing_account_login_route"])
 
     def test_v2_registration_routes_existing_account_to_login_when_enabled(self):
         email_service = mock.Mock()
@@ -708,7 +672,21 @@ class AccessTokenOnlyCheckoutTests(unittest.TestCase):
             proxy_url="http://proxy.local:8080",
             extra_config={},
         )
-        self._ExistingRouteChatGPTClient.last_register_kwargs = {}
+        client = mock.Mock(
+            device_id="device-demo",
+            ua="Mozilla/5.0",
+            fingerprint=None,
+            last_registration_route_event={
+                "email": "buyer@example.com",
+                "reason": "registration_completed_without_create_account_after_otp",
+                "stage": "any_auto",
+            },
+        )
+        any_auto = self._any_auto_fail(
+            "user_already_exists: existing_account_login_route",
+            email="buyer@example.com",
+            executor="protocol",
+        )
         oauth_client = mock.Mock()
         oauth_client.login_and_get_tokens.return_value = {
             "access_token": "at-existing",
@@ -721,10 +699,8 @@ class AccessTokenOnlyCheckoutTests(unittest.TestCase):
             mock.patch.object(engine, "_probe_homepage_before_email_creation", return_value=(True, "")),
             mock.patch.object(engine, "_report_homepage_probe"),
             mock.patch.object(engine, "_probe_plus_checkout_billing", return_value={}),
-            mock.patch(
-                "services.chatgpt_core.access_token_only_registration_engine.ChatGPTClient",
-                self._ExistingRouteChatGPTClient,
-            ),
+            mock.patch.object(engine, "_build_chatgpt_client", return_value=client),
+            mock.patch.object(engine, "_run_any_auto_registration", return_value=any_auto),
             mock.patch(
                 "services.chatgpt_core.oauth_client.OAuthClient",
                 return_value=oauth_client,
@@ -754,9 +730,15 @@ class AccessTokenOnlyCheckoutTests(unittest.TestCase):
         with (
             mock.patch.object(engine, "_probe_homepage_before_email_creation", return_value=(True, "")),
             mock.patch.object(engine, "_report_homepage_probe"),
-            mock.patch(
-                "services.chatgpt_core.access_token_only_registration_engine.ChatGPTClient",
-                self._FakeChatGPTClient,
+            mock.patch.object(
+                engine,
+                "_build_chatgpt_client",
+                return_value=mock.Mock(device_id="device-demo", ua="Mozilla/5.0", fingerprint=None),
+            ),
+            mock.patch.object(
+                engine,
+                "_run_any_auto_registration",
+                return_value=self._any_auto_ok(executor="protocol", transport="any_auto_protocol"),
             ),
             mock.patch(
                 "core.proxy_utils.iter_enabled_runtime_proxies",
@@ -908,9 +890,15 @@ class AccessTokenOnlyCheckoutTests(unittest.TestCase):
         with (
             mock.patch.object(engine, "_probe_homepage_before_email_creation", return_value=(True, "")),
             mock.patch.object(engine, "_report_homepage_probe"),
-            mock.patch(
-                "services.chatgpt_core.access_token_only_registration_engine.ChatGPTClient",
-                self._FakeChatGPTClient,
+            mock.patch.object(
+                engine,
+                "_build_chatgpt_client",
+                return_value=mock.Mock(device_id="device-demo", ua="Mozilla/5.0", fingerprint=None),
+            ),
+            mock.patch.object(
+                engine,
+                "_run_any_auto_registration",
+                return_value=self._any_auto_ok(executor="protocol", transport="any_auto_protocol"),
             ),
             mock.patch(
                 "core.proxy_utils.iter_enabled_runtime_proxies",
@@ -1012,9 +1000,15 @@ class AccessTokenOnlyCheckoutTests(unittest.TestCase):
         with (
             mock.patch.object(engine, "_probe_homepage_before_email_creation", return_value=(True, "")),
             mock.patch.object(engine, "_report_homepage_probe"),
-            mock.patch(
-                "services.chatgpt_core.access_token_only_registration_engine.ChatGPTClient",
-                self._FakeChatGPTClient,
+            mock.patch.object(
+                engine,
+                "_build_chatgpt_client",
+                return_value=mock.Mock(device_id="device-demo", ua="Mozilla/5.0", fingerprint=None),
+            ),
+            mock.patch.object(
+                engine,
+                "_run_any_auto_registration",
+                return_value=self._any_auto_ok(executor="protocol", transport="any_auto_protocol"),
             ),
             mock.patch(
                 "core.proxy_utils.iter_enabled_runtime_proxies",

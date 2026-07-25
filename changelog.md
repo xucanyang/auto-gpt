@@ -6,6 +6,16 @@
 
 ## [Unreleased] (未发布)
 
+## [2.8.46] - 2026-07-26
+
+### 优化 (Changed)
+- **ChatGPT 注册运输层整段替换为 any-auto 三执行器**：`protocol` / `headless` / `headed` 统一走 vendored 包 `services/chatgpt_core/any_auto/`（源对照 `/opt/any-auto-register/platforms/chatgpt`）。
+  - 协议：`RegistrationEngine`（curl_cffi 同 session create + NextAuth session AT，Codex RT 可选）
+  - 无头/有头：`ChatGPTBrowserRegister`（Camoufox 整段邮箱→OTP→about_you；优先同上下文 Web AT，Codex OAuth 仅作 RT 升级/AT 兜底）
+  - 引擎入口：`access_token_only_registration_engine._run_any_auto_registration`
+- **注册成功合同收紧**：必须拿到 `access_token` 才算成功；去掉注册主链上的独立 OAuth recovery 二次浏览器、以及 `registered_auth_pending` 半成品当成功落库。邮箱出池 / HME finalize / 库存字段仍由本项目负责。
+- 侧栏版本同步为 `v2.8.46`。
+
 ## [2.8.45] - 2026-07-26
 
 ### 修复 (Fixed)
@@ -2893,4 +2903,8 @@
 
 ## 2026-07-26 01:58:48 +0800
 - v2.8.45 统一已有账号分流并重构注册Info/Debug日志
+- 发布模式: multi
+
+## 2026-07-26 04:06:04 +0800
+- v2.8.46: 注册运输层整段替换为 any-auto 三执行器 (protocol/headless/headed)
 - 发布模式: multi
