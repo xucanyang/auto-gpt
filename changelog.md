@@ -6,6 +6,17 @@
 
 ## [Unreleased] (未发布)
 
+## [2.8.35] - 2026-07-25
+
+### 修复 (Fixed)
+- **Camoufox about_you 成功后误报「未支持的注册状态: page=external_url」**：US/部分出口在 about_you `200` 后 `continue_url` 为 `https://chatgpt.com/api/auth/callback/openai`。状态机此前把所有含 `/api/` 的 continue 当成「内部协议 API」禁止 `page.goto`，于是开户已完成却立刻 `RuntimeError: 未支持的注册状态: page=external_url`，身份槽被白白占用。现区分：
+  - **可导航的浏览器 OAuth/next-auth 回调**（`/api/auth/callback`、`platform.openai.com/auth/callback` 等）必须跟随；
+  - **auth.openai.com `/api/accounts/*` 等状态机 API** 仍禁止当页面打开。
+- 影响文件：`services/chatgpt_core/browser_registration.py`（`_is_oauth_browser_callback_url` / `_is_internal_auth_api_continue_url` / `_requires_registration_navigation` 与状态机导航分支）；侧栏版本 `v2.8.35`。
+
+### 测试 (Tests)
+- `tests/test_browser_registration_flow.py` 增补 ChatGPT OAuth callback external_url 必须导航、platform callback 可导航、accounts API 仍拦截的合同用例。
+
 ## [2.8.34] - 2026-07-25
 
 ### 修复 (Fixed)
@@ -2726,4 +2737,8 @@
 
 ## 2026-07-25 09:23:38 +0800
 - v2.8.34 修复代理池国家留空误选JP与无可用IP无限重试
+- 发布模式: multi
+
+## 2026-07-25 09:58:27 +0800
+- v2.8.35 修复Camoufox about_you后chatgpt OAuth callback被/api误拦
 - 发布模式: multi

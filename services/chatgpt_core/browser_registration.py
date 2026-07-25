@@ -3451,6 +3451,46 @@ def _do_add_phone_attempt(
     raise RuntimeError("短信验证码校验失败: 多次验证码均无效或未通过")
 
 
+def _is_oauth_browser_callback_url(url: str) -> bool:
+    """True for real browser OAuth/next-auth callback destinations.
+
+    These paths often contain ``/api/`` (e.g. ChatGPT next-auth
+    ``/api/auth/callback/openai``) but must still be followed with page.goto.
+    Do not confuse them with auth.openai.com JSON continue APIs such as
+    ``/api/accounts/email-otp/send``.
+    """
+    text = str(url or "").strip().lower()
+    if not text:
+        return False
+    if "/api/auth/callback" in text:
+        return True
+    if "chatgpt.com" in text and "/api/auth/" in text:
+        return True
+    if "platform.openai.com" in text and "/auth/callback" in text:
+        return True
+    if "/api/oauth/oauth2/auth" in text:
+        return True
+    return False
+
+
+def _is_internal_auth_api_continue_url(url: str) -> bool:
+    """True for auth state-machine API continues that must not be page.goto'd."""
+    text = str(url or "").strip()
+    if not text:
+        return False
+    if _is_oauth_browser_callback_url(text):
+        return False
+    lowered = text.lower()
+    if lowered.rstrip("/").endswith("/send"):
+        return True
+    if "/api/accounts/" in lowered:
+        return True
+    # Remaining auth.openai.com /api/* continues are protocol steps, not pages.
+    if "auth.openai.com" in lowered and "/api/" in lowered:
+        return True
+    return False
+
+
 def _requires_registration_navigation(state: dict) -> bool:
     if str(state.get("method") or "GET").upper() != "GET":
         return False
@@ -3465,17 +3505,22 @@ def _requires_registration_navigation(state: dict) -> bool:
         "add_phone",
     }:
         return False
-    if str(state.get("page_type") or "") == "external_url" and state.get("continue_url"):
+    if page_type == "external_url" and state.get("continue_url"):
         continue_url = str(state.get("continue_url") or "")
-        if "/api/" in continue_url:
+        # next-auth / OAuth browser callbacks must be navigated even when path has /api/
+        if _is_oauth_browser_callback_url(continue_url):
+            return True
+        if _is_internal_auth_api_continue_url(continue_url):
             return False
-        return True
+        return bool(continue_url)
     continue_url = str(state.get("continue_url") or "")
     current_url = str(state.get("current_url") or "")
     if not continue_url or continue_url == current_url:
         return False
-    # 禁止把 JSON 状态机里的 API 路径当页面导航
-    if "/api/" in continue_url or continue_url.rstrip("/").endswith("/send"):
+    # 禁止把 JSON 状态机里的 API 路径当页面导航；OAuth 浏览器回调除外
+    if _is_oauth_browser_callback_url(continue_url):
+        return True
+    if _is_internal_auth_api_continue_url(continue_url) or "/api/" in continue_url:
         return False
     return True
 
@@ -5842,7 +5887,10 @@ def _browser_registration_flow(
             target_url = _normalize_url(str(state.get("continue_url") or state.get("current_url") or ""), OPENAI_AUTH)
             if not target_url:
                 raise RuntimeError("缺少可跟随的 continue_url")
-            if "/api/" in target_url:
+            # 仅跳过 auth 状态机内部 API；ChatGPT next-auth /api/auth/callback 必须 goto
+            if _is_internal_auth_api_continue_url(target_url) or (
+                "/api/" in target_url and not _is_oauth_browser_callback_url(target_url)
+            ):
                 log(f"跳过 API continue_url 页面导航: {target_url[:120]}")
                 # API continue 交给对应阶段（OTP/about_you）处理
                 if "email-otp" in target_url:

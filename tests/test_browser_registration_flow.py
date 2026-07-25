@@ -1651,7 +1651,35 @@ class BrowserRegistrationFlowTests(unittest.TestCase):
         }
         self.assertFalse(br._requires_registration_navigation(state))
 
+    def test_chatgpt_oauth_callback_external_url_must_navigate(self):
+        """about_you 成功后常见 continue=chatgpt.com/api/auth/callback/openai，不可当内部 API 跳过。"""
+        state = {
+            "method": "GET",
+            "page_type": "external_url",
+            "continue_url": "https://chatgpt.com/api/auth/callback/openai?code=demo",
+            "current_url": "https://auth.openai.com/about-you",
+        }
+        self.assertTrue(br._is_oauth_browser_callback_url(state["continue_url"]))
+        self.assertFalse(br._is_internal_auth_api_continue_url(state["continue_url"]))
+        self.assertTrue(br._requires_registration_navigation(state))
 
+    def test_platform_auth_callback_external_url_must_navigate(self):
+        state = {
+            "method": "GET",
+            "page_type": "external_url",
+            "continue_url": "https://platform.openai.com/auth/callback",
+            "current_url": "https://auth.openai.com/about-you",
+        }
+        self.assertTrue(br._requires_registration_navigation(state))
+
+    def test_external_url_internal_accounts_api_still_blocked(self):
+        state = {
+            "method": "GET",
+            "page_type": "external_url",
+            "continue_url": "https://auth.openai.com/api/accounts/email-otp/send",
+            "current_url": "https://auth.openai.com/create-account/password",
+        }
+        self.assertFalse(br._requires_registration_navigation(state))
 
 
 if __name__ == "__main__":
