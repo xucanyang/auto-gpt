@@ -381,6 +381,12 @@ _COMMON_INFO_PREFIXES = (
 )
 
 _REGISTER_INFO_PREFIXES = (
+    "create_account:",
+    "创建失败:",
+    "client_auth_session_dump",
+    "请求模式:",
+    "有效运输层:",
+    "Camoufox 注册链路",
     "[阶段]",
     "[账号]",
     "[主链路]",
@@ -451,15 +457,11 @@ _LOW_LEVEL_DEBUG_PREFIXES = (
     "验证码发送响应:",
     "验证 OTP 码:",
     "验证成功 ",
-    "完成账号创建:",
-    "create_account:",
-    "账号创建成功",
     "Session Account ID:",
     "Session User ID:",
     "Session Workspace ID:",
     "Account ID:",
     "Workspace ID:",
-    "请求模式:",
     "实现策略:",
     "流程策略:",
     "验证码等待策略:",
@@ -479,8 +481,6 @@ _LOW_LEVEL_DEBUG_PREFIXES = (
     "Plus checkout amount:",
     "GoPay 平台链接:",
     "GoPay 平台链接已获取:",
-    "oauth_create_account:",
-    "username_password_create:",
     "password/verify ->",
     "user/register ->",
     "phone-otp/send ->",
@@ -541,6 +541,28 @@ def _strip_leading_bracket_tags(text: str) -> str:
     return normalized
 
 
+_REGISTER_FORCE_INFO_MARKERS = (
+    "registration_disallowed",
+    "create_account:",
+    "创建失败:",
+    "client_auth_session_dump",
+    "create_account Sentinel:",
+    "密码阶段 Sentinel:",
+    "协议模式：提交 authorize/continue",
+    "signup continue",
+    "sentinel_protocol_unavailable",
+    "sentinel_browser_unavailable",
+    "auth_browser_finalize_unavailable",
+    "有效运输层",
+    "effective_transport",
+    "effective_executor",
+    "registration_transport",
+    "Camoufox 注册链路",
+    "HTTP 400",
+    "创建账号失败",
+)
+
+
 def classify_task_log_level(
     message: Any,
     level: str = "info",
@@ -567,6 +589,10 @@ def classify_task_log_level(
     upper = text.lstrip().upper()
     if upper.startswith("[DEBUG]"):
         return "debug"
+    # 方案 R：create 400 / disallowed / dump / transport 对任务 UI 必须可见
+    lowered = text.lower()
+    if any(marker.lower() in lowered for marker in _REGISTER_FORCE_INFO_MARKERS):
+        return "info"
     if text.startswith("="):
         return "debug"
     if text[:2].isdigit() and len(text) > 2 and text[2] == ".":

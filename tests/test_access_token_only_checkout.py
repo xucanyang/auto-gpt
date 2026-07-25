@@ -159,6 +159,8 @@ class AccessTokenOnlyCheckoutTests(unittest.TestCase):
             "session_token": "session-existing",
             "account_id": "acct-existing",
             "workspace_id": "ws-existing",
+            "cookies": "session-token=session-existing; oai-did=did",
+            "cookie_header": "session-token=session-existing; oai-did=did",
         }
 
         with (

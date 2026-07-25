@@ -6,6 +6,20 @@
 
 ## [Unreleased] (未发布)
 
+## [2.8.31] - 2026-07-25
+
+### 修复 (Fixed)
+- **方案 R：协议 create 对齐 any-auto-register**：`sentinel_token.py` 接回 `sentinel_vm.solve_turnstile_dx`，存在 turnstile `dx` 时解出非空 `t`（不再固定空串）；`ChatGPTClient` 协议模式仅 HTTP PoW+VM，禁止为 Sentinel/create 启动浏览器。
+- **create 前 `client_auth_session_dump` + signup continue + 密码页预热**：`register_complete_flow` / `register_user` / `_create_account_via_protocol` 对齐 any-auto 同 session 状态机；`oauth_client` 协议 about_you 同样 dump 后 create。
+- **三执行器硬隔离恢复**：`access_token_only_registration_engine` 对 `protocol` 走 `register_complete_flow`，`headless`/`headed` 走整段 Camoufox `run_browser_registration_stage`，失败不跨 transport 兜底；RT 引擎浏览器模式复用同一 AT-only 浏览器运输层。
+- **成功门闩加固**：注册 success 必须齐套 access_token + session_token + cookies/cookie_header + account_id；禁止 synthetic `v2_acct_*` 冒充 account_id。
+- **`registration_disallowed` 同身份不 3 连**：默认 `max_retries=1`，`_should_retry` 将 disallowed / create 400 / sentinel 不可用标为不可重试。
+- **任务日志可见性**：create 失败、dump、disallowed、transport 关键字强制 INFO，避免仅 DEBUG 不可见。
+- **强密码合同补回**：`plugin._generate_chatgpt_registration_password` 必含大小写/数字/符号。
+
+### 测试 (Tests)
+- `test_sentinel_protocol_vm` 转绿；`test_sentinel_browser` 协议 create dump 合同；注册/插件/任务控制/浏览器流等专项共 130 passed。
+
 ## [2.8.30] - 2026-07-25
 
 ### 变更 (Changed)
@@ -2673,4 +2687,8 @@
 
 ## 2026-07-25 07:48:45 +0800
 - v2.8.30: 注册链路回退到 7/18 b880955 保存模型（会话齐套才落库）
+- 发布模式: multi
+
+## 2026-07-25 08:36:09 +0800
+- v2.8.31 方案R：any-auto协议create对齐+三执行器Camoufox隔离+Web Session齐套门闩
 - 发布模式: multi

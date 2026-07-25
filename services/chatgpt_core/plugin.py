@@ -1,8 +1,7 @@
 """ChatGPT / Codex CLI 平台插件"""
 
 import json
-import random
-import string
+import secrets
 
 from core.base_mailbox import BaseMailbox
 from core.base_platform import Account, BasePlatform, RegisterConfig
@@ -15,6 +14,24 @@ from services.chatgpt_core.mailbox_state import (
     build_mailbox_state,
     export_mailbox_state_config,
 )
+
+
+
+def _generate_chatgpt_registration_password(length: int = 16) -> str:
+    """Generate a password that always satisfies the OpenAI signup form."""
+    minimum_length = 12
+    size = max(int(length or minimum_length), minimum_length)
+    specials = ",._!@#"
+    characters = [
+        secrets.choice("abcdefghijklmnopqrstuvwxyz"),
+        secrets.choice("ABCDEFGHIJKLMNOPQRSTUVWXYZ"),
+        secrets.choice("0123456789"),
+        secrets.choice(specials),
+    ]
+    pool = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789" + specials
+    characters.extend(secrets.choice(pool) for _ in range(size - len(characters)))
+    secrets.SystemRandom().shuffle(characters)
+    return "".join(characters)
 
 
 class ChatGPTPlatform(BasePlatform):
@@ -45,7 +62,7 @@ class ChatGPTPlatform(BasePlatform):
 
     def register(self, email: str = None, password: str = None) -> Account:
         if not password:
-            password = "".join(random.choices(string.ascii_letters + string.digits + "!@#$", k=16))
+            password = _generate_chatgpt_registration_password()
 
         browser_mode = (self.config.executor_type if self.config else None) or "protocol"
         extra_config = dict((self.config.extra or {}) if self.config and getattr(self.config, "extra", None) else {})
@@ -80,11 +97,14 @@ class ChatGPTPlatform(BasePlatform):
             log_fn(f"[代理] ChatGPT 注册核心链路 proxy={proxy_label}")
         else:
             log_fn("[代理] ChatGPT 注册核心链路 proxy=direct")
-        max_retries = 3
+        # 方案 R：浏览器整段注册默认同身份不整流程重放；协议默认同身份 create 不 3 连
+        # registration_disallowed / create 失败由 engine._should_retry 进一步收口。
+        default_retries = 1 if str(browser_mode or "").strip().lower() in {"headless", "headed"} else 1
         try:
-            max_retries = int(extra_config.get("register_max_retries", 3) or 3)
+            max_retries = int(extra_config.get("register_max_retries", default_retries) or default_retries)
         except Exception:
-            max_retries = 3
+            max_retries = default_retries
+        max_retries = max(1, min(int(max_retries), 3))
 
         registration_entry = str(
             extra_config.get("chatgpt_registration_entry")

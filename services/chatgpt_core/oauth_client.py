@@ -2262,6 +2262,127 @@ class OAuthClient:
             self._set_error(f"触发 passwordless OTP 异常: {e}")
             return None
 
+    def _submit_about_you_create_account_via_protocol(
+        self,
+        *,
+        full_name,
+        birthdate,
+        device_id,
+        user_agent=None,
+        sec_ch_ua=None,
+        impersonate=None,
+        referer=None,
+    ):
+        """方案 R：协议 about_you create — dump + HTTP Sentinel(VM t) + 同 session POST。"""
+        dump_url = f"{self.oauth_issuer}/api/accounts/client_auth_session_dump"
+        try:
+            dump_headers = self._headers(
+                dump_url,
+                user_agent=user_agent,
+                sec_ch_ua=sec_ch_ua,
+                accept="application/json",
+                referer=f"{self.oauth_issuer}/email-verification",
+                fetch_site="same-origin",
+                extra_headers={"oai-device-id": device_id},
+            )
+            dump_kwargs = {"headers": dump_headers, "timeout": 20}
+            if impersonate:
+                dump_kwargs["impersonate"] = impersonate
+            dump_resp = self.session.get(dump_url, **dump_kwargs)
+            self._log(
+                f"client_auth_session_dump 状态: {getattr(dump_resp, 'status_code', 0)}"
+            )
+        except Exception as dump_exc:
+            self._log(f"client_auth_session_dump 异常: {dump_exc}")
+
+        sentinel_token = build_sentinel_token(
+            self.session,
+            device_id,
+            flow="oauth_create_account",
+            user_agent=user_agent,
+            sec_ch_ua=sec_ch_ua,
+            impersonate=impersonate,
+        )
+        if not sentinel_token:
+            self._set_error(
+                "sentinel_protocol_unavailable (oauth_create_account): "
+                "纯协议执行器禁止启动浏览器"
+            )
+            return None
+
+        request_url = f"{self.oauth_issuer}/api/accounts/create_account"
+        headers = self._headers(
+            request_url,
+            user_agent=user_agent,
+            sec_ch_ua=sec_ch_ua,
+            accept="application/json",
+            referer=referer or f"{self.oauth_issuer}/about-you",
+            origin=self.oauth_issuer,
+            content_type="application/json",
+            fetch_site="same-origin",
+            extra_headers={
+                "oai-device-id": device_id,
+                "openai-sentinel-token": sentinel_token,
+            },
+        )
+        headers.update(generate_datadog_trace())
+        try:
+            import json as _json
+
+            kwargs = {
+                "data": _json.dumps(
+                    {"name": full_name, "birthdate": str(birthdate).strip()},
+                    separators=(",", ":"),
+                ),
+                "headers": headers,
+                "timeout": 30,
+                "allow_redirects": False,
+            }
+            if impersonate:
+                kwargs["impersonate"] = impersonate
+            self._check_stop()
+            response = self.session.post(request_url, **kwargs)
+            response_text = str(getattr(response, "text", "") or "")
+            try:
+                data = response.json() or {}
+            except Exception:
+                data = {}
+            if response.status_code != 200:
+                lowered = response_text.lower()
+                if response.status_code == 400 and any(
+                    marker in lowered
+                    for marker in (
+                        "account already exists",
+                        "please login instead",
+                        "user_already_exists",
+                    )
+                ):
+                    self._about_you_existing_account_detected = True
+                error_info = data.get("error") if isinstance(data, dict) else {}
+                error_code = str(
+                    (error_info or {}).get("code")
+                    if isinstance(error_info, dict)
+                    else ""
+                ).strip()
+                detail = f"about_you 提交失败: {response.status_code}"
+                if error_code:
+                    detail += f": {error_code}"
+                elif response_text:
+                    detail += f" - {response_text[:180]}"
+                self._set_error(detail)
+                return None
+            flow_state = self._state_from_payload(
+                data,
+                current_url=str(getattr(response, "url", "") or request_url),
+            )
+            self._log(f"about_you 纯协议提交成功 {describe_flow_state(flow_state)}")
+            return flow_state
+        except Exception as exc:
+            if self._is_stop_exception(exc):
+                self._raise_stop(exc)
+            self._set_error(f"about_you 纯协议提交异常: {exc}")
+            return None
+
     def _submit_about_you_create_account(
         self,
         first_name,
@@ -2288,6 +2409,17 @@ class OAuthClient:
         if not full_name or not str(birthdate or "").strip():
             self._set_error("about_you 资料不完整: 缺少姓名或生日")
             return None
+
+        if str(getattr(self, "browser_mode", "protocol") or "protocol").strip().lower() == "protocol":
+            return self._submit_about_you_create_account_via_protocol(
+                full_name=full_name,
+                birthdate=birthdate,
+                device_id=device_id,
+                user_agent=user_agent,
+                sec_ch_ua=sec_ch_ua,
+                impersonate=impersonate,
+                referer=referer,
+            )
 
         sentinel_token = get_sentinel_token_via_browser(
             flow="oauth_create_account",

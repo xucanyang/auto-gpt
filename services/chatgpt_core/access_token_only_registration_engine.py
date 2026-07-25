@@ -1,6 +1,8 @@
-"""
-注册流程引擎 V2
-基于 curl_cffi 的注册状态机，注册成功后直接复用同一会话提取 ChatGPT Session。
+"""ChatGPT AccessToken 注册引擎（方案 R）。
+
+``protocol``：全程 curl_cffi 同 session + Sentinel HTTP/VM + dump create；
+``headless``/``headed``：全程 Camoufox，不与协议嫁接。
+成功门闩：email/password + AT + session_token + cookies + account_id。
 """
 
 import json
@@ -22,8 +24,12 @@ from .registration_route_policy import (
     parse_bool,
 )
 from .task_logging import classify_task_log_level
-from .utils import generate_random_name, generate_random_birthday
+from .utils import FlowState, generate_random_name, generate_random_birthday
 from .account_fingerprint import build_browser_fingerprint_payload, fingerprint_signature
+from .sentinel_browser import (
+    BrowserRegistrationStageResult,
+    run_browser_registration_stage,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -103,10 +109,17 @@ class AccessTokenOnlyRegistrationEngine:
     ):
         self.email_service = email_service
         self.proxy_url = proxy_url
-        self.browser_mode = browser_mode or "protocol"
+        normalized_browser_mode = str(browser_mode or "protocol").strip().lower()
+        if normalized_browser_mode not in {"protocol", "headless", "headed"}:
+            raise ValueError(f"unsupported ChatGPT executor: {browser_mode}")
+        self.browser_mode = normalized_browser_mode
         self.callback_logger = callback_logger
         self.task_uuid = task_uuid
-        self.max_retries = max(1, int(max_retries or 1))
+        # 浏览器整段注册默认单次；协议也默认 1（避免 disallowed 3 连），仍可被显式配置放大
+        if self.browser_mode in {"headless", "headed"}:
+            self.max_retries = 1
+        else:
+            self.max_retries = max(1, min(int(max_retries or 1), 3))
         self.extra_config = dict(extra_config or {})
         
         self.email = None
@@ -116,7 +129,32 @@ class AccessTokenOnlyRegistrationEngine:
         self._last_chatgpt_client: ChatGPTClient | None = None
         self._last_email_adapter = None
 
+    def _is_browser_executor(self) -> bool:
+        return self.browser_mode in {"headless", "headed"}
+
+    @staticmethod
+    def _session_materials_complete(session_result: dict | None, *, password: str = "", email: str = "") -> tuple[bool, str]:
+        """方案 R 成功门闩：AT + session_token + cookies + account_id (+ email/password 由外层保证)。"""
+        data = dict(session_result or {})
+        access_token = str(data.get("access_token") or "").strip()
+        session_token = str(data.get("session_token") or "").strip()
+        cookies = str(data.get("cookies") or data.get("cookie_header") or "").strip()
+        account_id = str(data.get("account_id") or data.get("user_id") or "").strip()
+        missing = []
+        if not access_token:
+            missing.append("access_token")
+        if not session_token:
+            missing.append("session_token")
+        if not cookies:
+            missing.append("cookies")
+        if not account_id:
+            missing.append("account_id")
+        if missing:
+            return False, "missing_session_materials:" + ",".join(missing)
+        return True, ""
+
     def _should_probe_plus_checkout(self) -> bool:
+
         plan = str(
             self.extra_config.get("chatgpt_checkout_probe_plan")
             or self.extra_config.get("chatgpt_payment_plan")
@@ -531,15 +569,28 @@ class AccessTokenOnlyRegistrationEngine:
 
     def _should_retry(self, message: str) -> bool:
         text = str(message or "").lower()
+        # 方案 R：同身份 create 失败 / disallowed 默认不整流程重放
+        non_retriable = [
+            "registration_disallowed",
+            "sentinel_protocol_unavailable",
+            "sentinel_browser_unavailable",
+            "auth_browser_finalize_unavailable",
+            "browser_registration_unavailable",
+            "browser_registration_hard_timeout",
+            "browser_registration_forbidden",
+            "missing_session_materials",
+            "unsupported chatgpt executor",
+        ]
+        if any(marker in text for marker in non_retriable):
+            return False
+        if "http 400" in text and ("create" in text or "创建" in text or "disallowed" in text):
+            return False
         retriable_markers = [
             "tls",
             "ssl",
             "curl: (35)",
             "预授权被拦截",
             "authorize",
-            "registration_disallowed",
-            "http 400",
-            "创建账号失败",
             "未获取到 authorization code",
             "consent",
             "workspace",
@@ -547,7 +598,7 @@ class AccessTokenOnlyRegistrationEngine:
             "otp",
             "验证码",
             "session",
-            "accessToken",
+            "accesstoken",
             "next-auth",
             "checkout",
             "stripe",
@@ -615,7 +666,139 @@ class AccessTokenOnlyRegistrationEngine:
             or "账号无效"
         ).strip()
 
+    def _run_browser_registration(
+        self,
+        *,
+        chatgpt_client: ChatGPTClient,
+        email_addr: str,
+        password: str,
+        skymail_adapter: EmailServiceAdapter,
+        otp_wait_timeout: int,
+        otp_account_budget_timeout: int,
+        profile_name: str = "",
+        profile_birthdate: str = "",
+    ) -> BrowserRegistrationStageResult:
+        if not self._is_browser_executor():
+            return BrowserRegistrationStageResult(
+                error="browser_registration_forbidden_for_protocol_executor"
+            )
+
+        self._log(
+            "启动独立 Camoufox 注册链路：邮箱 -> OTP -> about_you -> ChatGPT Web Session"
+        )
+        self._log(
+            f"有效运输层: effective_transport=camoufox_browser "
+            f"requested_executor={self.browser_mode}"
+        )
+        initial_state: dict[str, Any] = {}
+        if str(profile_name or "").strip() and str(profile_birthdate or "").strip():
+            initial_state["profile"] = {
+                "name": str(profile_name).strip(),
+                "birthdate": str(profile_birthdate).strip(),
+            }
+
+        def _wait_for_browser_otp(request_payload: dict | None = None) -> dict:
+            request = dict(request_payload or {})
+            sent_at = request.get("otp_sent_at")
+            try:
+                sent_at = float(sent_at) if sent_at is not None else None
+            except (TypeError, ValueError):
+                sent_at = None
+            used = set()
+            for phase in ("register_email_otp", "browser_register_email_otp"):
+                used |= set(skymail_adapter._used_codes_by_phase.get(phase, set()))
+            code = skymail_adapter.wait_for_verification_code(
+                email_addr,
+                timeout=otp_wait_timeout,
+                otp_sent_at=sent_at,
+                exclude_codes=used,
+                phase="browser_register_email_otp",
+                phase_label="浏览器注册邮箱验证码",
+            )
+            return {
+                "code": str(code or "").strip(),
+                "otp_sent_at": sent_at,
+                "exclude_codes": sorted(used),
+            }
+
+        hard_timeout_seconds = min(
+            600,
+            max(300, int(otp_account_budget_timeout or 0) + 180),
+        )
+        stage_result = run_browser_registration_stage(
+            email=email_addr,
+            password=password,
+            otp_callback=_wait_for_browser_otp,
+            proxy=self.proxy_url,
+            device_id=str(getattr(chatgpt_client, "device_id", "") or ""),
+            headless=self.browser_mode != "headed",
+            cookies=[],
+            initial_state=initial_state,
+            stop_check=getattr(chatgpt_client, "_check_stop", None),
+            hard_timeout_seconds=hard_timeout_seconds,
+            log_fn=lambda message: self._log(f"[浏览器注册] {message}"),
+        )
+        if not stage_result.ok:
+            error = str(stage_result.error or "browser_registration_failed")
+            self._log(f"Camoufox 注册链路失败: {error}", "warning")
+            return stage_result
+
+        state_data = dict(stage_result.final_state or {})
+        chatgpt_client.last_registration_state = FlowState(
+            page_type=str(state_data.get("page_type") or ""),
+            continue_url=str(state_data.get("continue_url") or ""),
+            method=str(state_data.get("method") or "GET"),
+            current_url=str(
+                state_data.get("current_url") or stage_result.page_url or ""
+            ),
+            payload=(
+                dict(state_data.get("payload") or {})
+                if isinstance(state_data.get("payload"), dict)
+                else {}
+            ),
+            raw=(
+                dict(state_data.get("raw") or {})
+                if isinstance(state_data.get("raw"), dict)
+                else {}
+            ),
+        )
+        chatgpt_client.registration_transport = "camoufox_browser"
+        chatgpt_client.requested_executor = self.browser_mode
+        chatgpt_client.effective_executor = str(
+            stage_result.effective_executor or self.browser_mode
+        )
+        chatgpt_client.registration_runtime_profile = {
+            "browser_family": "camoufox",
+            "device_id": str(stage_result.device_id or getattr(chatgpt_client, "device_id", "") or ""),
+            "user_agent": str(stage_result.user_agent or ""),
+            "requested_executor": self.browser_mode,
+            "effective_executor": str(stage_result.effective_executor or self.browser_mode),
+            "headless_reason": str(stage_result.headless_reason or ""),
+        }
+        chatgpt_client.registration_stage_transports = [
+            {
+                "stage": "registration",
+                "transport": "camoufox_browser",
+                "executor": str(stage_result.effective_executor or self.browser_mode),
+            },
+            {
+                "stage": "web_session_capture",
+                "transport": "camoufox_browser",
+                "executor": str(stage_result.effective_executor or self.browser_mode),
+                "status": (
+                    "success"
+                    if str((stage_result.web_session or {}).get("access_token") or "").strip()
+                    else "missing_access_token"
+                ),
+            },
+        ]
+        self._log(
+            "Camoufox 注册链路完成；浏览器 Cookie 保持在浏览器结果中，不回灌协议 Session"
+        )
+        return stage_result
+
     def _build_chatgpt_client(self) -> ChatGPTClient:
+
         return ChatGPTClient(
             proxy=self.proxy_url,
             verbose=False,
@@ -645,6 +828,17 @@ class AccessTokenOnlyRegistrationEngine:
             "first_name": first_name,
             "last_name": last_name,
             "birthdate": birthdate,
+            "requested_executor": getattr(chatgpt_client, "requested_executor", self.browser_mode),
+            "effective_executor": getattr(chatgpt_client, "effective_executor", self.browser_mode),
+            "registration_transport": getattr(
+                chatgpt_client, "registration_transport", "protocol_http"
+            ),
+            "registration_stage_transports": list(
+                getattr(chatgpt_client, "registration_stage_transports", []) or []
+            ),
+            "registration_runtime_profile": dict(
+                getattr(chatgpt_client, "registration_runtime_profile", {}) or {}
+            ),
         }
 
     def _attach_browser_fingerprint_metadata(self, metadata: dict[str, Any], chatgpt_client: ChatGPTClient) -> dict[str, Any]:
@@ -777,8 +971,12 @@ class AccessTokenOnlyRegistrationEngine:
                             f"{'允许路由到登录恢复' if existing_account_login_route_allowed else '禁止路由到登录恢复，将跳过且不保存'}"
                         )
 
-                    homepage_ok, homepage_error = (True, "") if existing_account_capture else self._probe_homepage_before_email_creation()
-                    if not existing_account_capture:
+                    # 浏览器执行器不走协议首页预热（避免协议 session 污染 / 文案误导）
+                    if existing_account_capture or self._is_browser_executor():
+                        homepage_ok, homepage_error = True, ""
+                    else:
+                        homepage_ok, homepage_error = self._probe_homepage_before_email_creation()
+                    if not existing_account_capture and not self._is_browser_executor():
                         self._report_homepage_probe(homepage_ok, homepage_error)
                     if not homepage_ok:
                         last_error = homepage_error or "访问首页失败"
@@ -789,9 +987,13 @@ class AccessTokenOnlyRegistrationEngine:
                         self._finalize_email_service_failure(result, fallback_error=result.error_message)
                         return result
 
-                    # 1. 创建邮箱
-                    email_data = self.email_service.create_email()
-                    email_addr = self.email or (email_data.get('email') if email_data else None)
+                    # 1. 创建邮箱（若调用方已固定邮箱，则复用，避免同 attempt 二次建箱）
+                    email_addr = str(self.email or "").strip()
+                    if email_addr:
+                        self._log(f"复用已固定邮箱: {email_addr}")
+                    else:
+                        email_data = self.email_service.create_email()
+                        email_addr = (email_data.get('email') if email_data else None)
                     if not email_addr:
                         result.error_message = "创建邮箱失败"
                         self._finalize_email_service_failure(result, fallback_error=result.error_message)
@@ -824,6 +1026,10 @@ class AccessTokenOnlyRegistrationEngine:
                     self._last_chatgpt_client = chatgpt_client
                     self._last_email_adapter = skymail_adapter
 
+                    session_ok = False
+                    session_result = {}
+                    success = False
+                    msg = ""
                     if existing_account_capture:
                         self._log("步骤 1/2: 已启用已有账号抓 AT，跳过注册状态机，直接登录...")
                         try:
@@ -873,23 +1079,103 @@ class AccessTokenOnlyRegistrationEngine:
                         session_result.setdefault("workspace_id", str((tokens or {}).get("workspace_id") or ""))
                     else:
                         self._log("步骤 1/2: 执行注册状态机...")
-
-                        success, msg = chatgpt_client.register_complete_flow(
-                            email_addr,
-                            pwd,
-                            first_name,
-                            last_name,
-                            birthdate,
-                            skymail_adapter,
-                            otp_wait_timeout=register_otp_wait_seconds,
-                            otp_resend_wait_timeout=register_otp_resend_wait_seconds,
-                            otp_account_budget_timeout=register_otp_account_budget_seconds,
-                            allow_existing_account_login_route=existing_account_login_route_allowed,
+                        self._log(
+                            f"请求模式: {self.browser_mode} "
+                            f"effective_transport="
+                            f"{'camoufox_browser' if self._is_browser_executor() else 'protocol_http'}"
                         )
+                        if self._is_browser_executor():
+                            browser_stage = self._run_browser_registration(
+                                chatgpt_client=chatgpt_client,
+                                email_addr=email_addr,
+                                password=pwd,
+                                skymail_adapter=skymail_adapter,
+                                otp_wait_timeout=register_otp_wait_seconds,
+                                otp_account_budget_timeout=register_otp_account_budget_seconds,
+                                profile_name=f"{first_name} {last_name}".strip(),
+                                profile_birthdate=birthdate,
+                            )
+                            success = browser_stage.ok
+                            msg = (
+                                "registration complete via camoufox browser"
+                                if success
+                                else str(browser_stage.error or "browser_registration_failed")
+                            )
+                            session_result = dict(browser_stage.web_session or {})
+                            # cookies list → cookie_header 兼容门闩
+                            if not str(session_result.get("cookies") or session_result.get("cookie_header") or "").strip():
+                                cookie_pairs = []
+                                for item in list(browser_stage.cookies or []):
+                                    if not isinstance(item, dict):
+                                        continue
+                                    name = str(item.get("name") or "").strip()
+                                    value = str(item.get("value") or "").strip()
+                                    if name and value:
+                                        cookie_pairs.append(f"{name}={value}")
+                                if cookie_pairs:
+                                    session_result["cookies"] = "; ".join(cookie_pairs)
+                                    session_result.setdefault("cookie_header", session_result["cookies"])
+                            session_ok = bool(str(session_result.get("access_token") or "").strip())
+                        else:
+                            chatgpt_client.requested_executor = "protocol"
+                            chatgpt_client.effective_executor = "protocol"
+                            chatgpt_client.registration_transport = "protocol_http"
+                            chatgpt_client.registration_stage_transports = [
+                                {
+                                    "stage": "registration",
+                                    "transport": "curl_cffi_http",
+                                    "executor": "protocol",
+                                }
+                            ]
+                            success, msg = chatgpt_client.register_complete_flow(
+                                email_addr,
+                                pwd,
+                                first_name,
+                                last_name,
+                                birthdate,
+                                skymail_adapter,
+                                otp_wait_timeout=register_otp_wait_seconds,
+                                otp_resend_wait_timeout=register_otp_resend_wait_seconds,
+                                otp_account_budget_timeout=register_otp_account_budget_seconds,
+                                allow_existing_account_login_route=existing_account_login_route_allowed,
+                            )
 
                     if not existing_account_capture:
                         if not success:
                             if is_existing_account_login_route_message(msg):
+                                if self._is_browser_executor():
+                                    existing_account_login_route_event = build_existing_account_login_route_event(
+                                        email=email_addr,
+                                        reason=msg,
+                                        stage="browser_registration",
+                                        enabled=existing_account_login_route_allowed,
+                                        routed=False,
+                                        blocked=True,
+                                        action="explicit_existing_account_capture_required",
+                                        source="access_token_only_registration",
+                                        base_event=getattr(
+                                            chatgpt_client,
+                                            "last_registration_route_event",
+                                            None,
+                                        ),
+                                    )
+                                    last_error = (
+                                        "浏览器注册检测到该邮箱已存在；当前注册执行器不会自动切换登录恢复，"
+                                        "请显式启用已有账号抓取"
+                                    )
+                                    result.error_message = last_error
+                                    result.email = email_addr
+                                    result.password = pwd
+                                    result.metadata = {
+                                        "chatgpt_existing_account_login_route": existing_account_login_route_event,
+                                    }
+                                    self._log(f"[已有账号] {last_error}: {email_addr}", "warning")
+                                    self._finalize_email_service_failure(
+                                        result,
+                                        fallback_error=last_error,
+                                    )
+                                    return result
+
                                 existing_account_login_route_event = build_existing_account_login_route_event(
                                     email=email_addr,
                                     reason=msg,
@@ -998,6 +1284,10 @@ class AccessTokenOnlyRegistrationEngine:
                         if not success and existing_account_login_route_event:
                             # 已按上面的登录恢复链路填充 session_result，不再复用注册会话。
                             pass
+                        elif self._is_browser_executor() and success:
+                            # 浏览器路径已在 Camoufox 上下文取 Web Session，禁止回灌协议 Session
+                            self._log("步骤 2/2: 使用 Camoufox Web Session 材料（不复用协议 Session）")
+                            # session_ok / session_result 已在浏览器分支填充
                         else:
                             self._log("步骤 2/2: 复用注册会话，直接获取 ChatGPT Session / AccessToken...")
                             session_ok, session_result = chatgpt_client.reuse_session_and_get_tokens()
@@ -1011,7 +1301,7 @@ class AccessTokenOnlyRegistrationEngine:
                         result.account_id = (
                             session_result.get("account_id")
                             or session_result.get("user_id")
-                            or ("v2_acct_" + chatgpt_client.device_id[:8])
+                            or ""
                         )
                         result.workspace_id = session_result.get("workspace_id", "")
                         checkout_metadata = self._probe_plus_checkout_billing(session_result, email_addr)
@@ -1052,6 +1342,28 @@ class AccessTokenOnlyRegistrationEngine:
                             self._log(f"无 RT 注册判定为无效失败: {failure_reason}", "warning")
                             self._finalize_email_service_failure(result, fallback_error=failure_reason)
                             return result
+
+                        materials_ok, materials_err = self._session_materials_complete(
+                            {
+                                "access_token": result.access_token,
+                                "session_token": result.session_token,
+                                "cookies": (result.metadata or {}).get("cookies")
+                                or (result.metadata or {}).get("cookie_header")
+                                or "",
+                                "account_id": result.account_id,
+                            }
+                        )
+                        if not materials_ok:
+                            result.success = False
+                            result.error_message = (
+                                f"注册成功门闩未满足（AT+session_token+cookies+account_id）: {materials_err}"
+                            )
+                            self._log(result.error_message, "warning")
+                            self._finalize_email_service_failure(
+                                result, fallback_error=result.error_message
+                            )
+                            return result
+
 
                         result.success = True
 
