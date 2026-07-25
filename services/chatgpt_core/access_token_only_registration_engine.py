@@ -62,6 +62,30 @@ class EmailServiceAdapter:
                 result.update(self._used_codes_by_phase.get(key, set()))
         return result
 
+    def release_code(self, code: str, *phases: str) -> None:
+        """Allow a previously fetched code to be reused after a non-advancing submit.
+
+        Browser signup can get HTTP 200 from email-otp/validate while the SPA
+        stays on the OTP page (or OpenAI resends the same digits). Marking the
+        code as used on first fetch then permanently excludes it and the
+        waiter times out even though TempMail still has a usable OTP.
+        """
+        normalized = str(code or "").strip()
+        if not normalized:
+            return
+        targets = [str(phase or "").strip() for phase in phases if str(phase or "").strip()]
+        if not targets:
+            targets = list(self._used_codes_by_phase.keys())
+        released = False
+        for key in targets:
+            bucket = self._used_codes_by_phase.get(key)
+            if not bucket or normalized not in bucket:
+                continue
+            bucket.discard(normalized)
+            released = True
+        if released:
+            self.log_fn(f"[验证码] 已释放可复用验证码（提交后页面未推进） phase={','.join(targets)}")
+
     def wait_for_verification_code(
         self,
         email,
@@ -634,6 +658,16 @@ class AccessTokenOnlyRegistrationEngine:
 
         def _wait_for_browser_otp(request_payload: dict | None = None) -> dict:
             request = dict(request_payload or {})
+            action = str(request.get("action") or "").strip().lower()
+            phase = str(request.get("phase") or "browser_register_email_otp").strip()
+            if action == "release_code":
+                skymail_adapter.release_code(
+                    str(request.get("code") or ""),
+                    "register_email_otp",
+                    "browser_register_email_otp",
+                    phase,
+                )
+                return {"released": True, "code": str(request.get("code") or "").strip()}
             sent_at = request.get("otp_sent_at")
             try:
                 sent_at = float(sent_at) if sent_at is not None else None
@@ -644,7 +678,6 @@ class AccessTokenOnlyRegistrationEngine:
             except (TypeError, ValueError):
                 wait_timeout = int(otp_wait_timeout or 120)
             wait_timeout = max(wait_timeout, 30)
-            phase = str(request.get("phase") or "browser_register_email_otp").strip()
             phase_label = str(
                 request.get("phase_label") or "浏览器注册邮箱验证码"
             ).strip()

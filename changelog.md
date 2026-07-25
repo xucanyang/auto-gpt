@@ -6,6 +6,16 @@
 
 ## [Unreleased] (未发布)
 
+## [2.8.40] - 2026-07-25
+
+### 修复 (Fixed)
+- **OTP 提交 200 后仍停在验证码页 → 二次收码把同码永久排除**：浏览器注册把验证码在「取出时」就写入 `used_codes`；若 `email-otp/validate` 返回 2xx 但 SPA 未离开 OTP（或 OpenAI 重发同一串数字），下一轮收码会命中「解析到验证码但在排除列表中已跳过」并耗尽 120s/90s 预算。现增加 `release_code`：提交未推进时释放该码；提交后额外 settle/重试一轮，避免误杀可用验证码。
+- **about_you `Page.goto: NS_BINDING_ABORTED`**：OTP 成功后 Auth SPA 常已在导航到 `/about-you`，硬 `page.goto` 与 SPA 竞态会直接 FAIL。改为 `_ensure_about_you_page`：先看 DOM/URL，goto 遇 `NS_BINDING_ABORTED` 则 settle 并在页面已可用时继续填写，不再整单失败。
+- **validate 响应 URL 含 `email-otp` 被误判为仍在 OTP**：`_success_result` 对 `email_otp_send/validate` 与 API URL 统一按 OTP 态处理，并优先采用页面 live DOM 的下一状态。
+
+### 测试 (Tests)
+- `release_code` 可复用合同；`NS_BINDING_ABORTED` 后 about_you 可继续。
+
 ## [2.8.39] - 2026-07-25
 
 ### 修复 (Fixed)
@@ -2801,4 +2811,8 @@
 
 ## 2026-07-25 11:39:32 +0800
 - v2.8.39 修复浏览器注册otp_sent_at过紧导致TempMail已有验证码被跳过
+- 发布模式: multi
+
+## 2026-07-25 12:44:33 +0800
+- v2.8.40 修复OTP提交后同码被排除与about_you NS_BINDING_ABORTED
 - 发布模式: multi

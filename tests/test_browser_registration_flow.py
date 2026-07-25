@@ -1529,6 +1529,66 @@ class BrowserRegistrationFlowTests(unittest.TestCase):
         kwargs = service.get_verification_code.call_args.kwargs
         self.assertIn("123456", kwargs["exclude_codes"])
 
+    def test_email_adapter_release_code_allows_reuse_after_non_advancing_submit(self):
+        logs: list[str] = []
+        service = mock.Mock()
+        service.get_verification_code.side_effect = ["111111", "111111"]
+        adapter = EmailServiceAdapter(
+            service, "buyer@example.com", lambda message: logs.append(str(message))
+        )
+
+        first = adapter.wait_for_verification_code(
+            "buyer@example.com",
+            timeout=30,
+            phase="browser_register_email_otp",
+        )
+        self.assertEqual(first, "111111")
+        self.assertIn("111111", adapter.used_codes_for_phases("browser_register_email_otp"))
+
+        adapter.release_code("111111", "browser_register_email_otp")
+        self.assertNotIn("111111", adapter.used_codes_for_phases("browser_register_email_otp"))
+        self.assertTrue(any("释放可复用验证码" in item for item in logs))
+
+        second = adapter.wait_for_verification_code(
+            "buyer@example.com",
+            timeout=30,
+            phase="browser_register_email_otp",
+        )
+        self.assertEqual(second, "111111")
+        # After release, the same digits are not force-excluded on the next wait.
+        second_exclude = service.get_verification_code.call_args_list[1].kwargs["exclude_codes"]
+        self.assertNotIn("111111", second_exclude)
+
+    def test_ensure_about_you_page_tolerates_ns_binding_aborted(self):
+        page = mock.Mock()
+        page.url = "https://auth.openai.com/email-verification"
+        logs: list[str] = []
+
+        def fake_goto(url, **_kwargs):
+            raise RuntimeError("Page.goto: NS_BINDING_ABORTED")
+
+        page.goto.side_effect = fake_goto
+
+        with (
+            mock.patch.object(
+                br,
+                "_derive_registration_state_from_page",
+                side_effect=[
+                    {"page_type": "email_otp_verification"},
+                    {"page_type": "about_you", "current_url": "https://auth.openai.com/about-you"},
+                ],
+            ),
+            mock.patch.object(br, "_wait_for_auth_page_settle"),
+        ):
+            br._ensure_about_you_page(
+                page,
+                "https://auth.openai.com/about-you",
+                lambda message: logs.append(str(message)),
+            )
+
+        page.goto.assert_called_once()
+        self.assertTrue(any("导航被中断" in item for item in logs))
+
     def test_email_adapter_can_reserve_independent_oauth_wait_budget(self):
         service = mock.Mock()
         service.get_verification_code.return_value = "654321"

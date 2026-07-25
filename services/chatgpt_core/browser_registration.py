@@ -2506,6 +2506,84 @@ def _invoke_otp_callback(otp_callback, payload: dict | None = None):
             return otp_callback()
 
 
+def _invoke_otp_release(otp_callback, code: str, log) -> None:
+    """Ask the parent task to un-exclude an OTP that did not advance the SPA."""
+    normalized = str(code or "").strip()
+    if not normalized or not callable(otp_callback):
+        return
+    try:
+        _invoke_otp_callback(
+            otp_callback,
+            {
+                "action": "release_code",
+                "code": normalized,
+                "phase": "browser_register_email_otp",
+            },
+        )
+    except Exception as exc:
+        log(f"释放可复用验证码失败（可忽略）: {exc}")
+
+
+def _ensure_about_you_page(page, target_url: str, log) -> None:
+    """Reach about_you without racing an in-flight SPA navigation.
+
+    After OTP validate, Auth often already navigates to /about-you. A hard
+    page.goto then collides and raises NS_BINDING_ABORTED even though the
+    destination is correct.
+    """
+    current = str(page.url or "")
+    if "about-you" in current:
+        return
+    try:
+        live = _derive_registration_state_from_page(page)
+    except Exception as exc:
+        if not _is_navigation_context_error(exc):
+            raise
+        _wait_for_auth_page_settle(page, timeout=6.0, log=log)
+        live = _derive_registration_state_from_page(page)
+    if str(live.get("page_type") or "") == "about_you":
+        return
+
+    dest = str(target_url or f"{OPENAI_AUTH}/about-you").strip() or f"{OPENAI_AUTH}/about-you"
+    # Never navigate to API continue_url paths from OTP responses.
+    if "/api/accounts/" in dest:
+        dest = f"{OPENAI_AUTH}/about-you"
+    log(f"跳转到 about_you 页面: {dest[:120]}")
+    try:
+        page.goto(dest, wait_until="domcontentloaded", timeout=30000)
+        return
+    except Exception as exc:
+        message = str(exc or "")
+        if "NS_BINDING_ABORTED" not in message and "Navigation" not in message:
+            raise
+        log(f"about_you 导航被中断，改为等待 SPA settle: {message[:160]}")
+        _wait_for_auth_page_settle(page, timeout=12.0, log=log)
+        try:
+            live = _derive_registration_state_from_page(page)
+        except Exception as derive_exc:
+            if not _is_navigation_context_error(derive_exc):
+                raise
+            _wait_for_auth_page_settle(page, timeout=6.0, log=log)
+            live = _derive_registration_state_from_page(page)
+        if str(live.get("page_type") or "") == "about_you" or "about-you" in str(page.url or ""):
+            log("about_you 页面已在导航中断后可用，继续填写")
+            return
+        # One more bounded attempt after the abort — common when OTP SPA and
+        # our goto raced once.
+        try:
+            page.goto(dest, wait_until="domcontentloaded", timeout=30000)
+        except Exception as retry_exc:
+            retry_msg = str(retry_exc or "")
+            if "NS_BINDING_ABORTED" in retry_msg or "Navigation" in retry_msg:
+                _wait_for_auth_page_settle(page, timeout=10.0, log=log)
+                if "about-you" in str(page.url or "") or str(
+                    (_derive_registration_state_from_page(page) or {}).get("page_type") or ""
+                ) == "about_you":
+                    log("about_you 重试导航中断后页面已可用")
+                    return
+            raise
+
+
 def _do_codex_oauth(
     page,
     cookies_dict: dict,
@@ -4701,14 +4779,35 @@ def _submit_otp_via_page(
             effective_url = str(response_url or page.url or "")
             payload = data if isinstance(data, dict) else None
             state = _extract_flow_state(payload, effective_url)
-            if not state.get("page_type") or state.get("page_type") == "email_otp_verification":
+            # Validate API URLs contain "email-otp" and wrongly infer OTP state;
+            # also treat email_otp_send as still-on-OTP for success handling.
+            still_otp_from_payload = _is_email_otp(state) or not state.get("page_type")
+            if still_otp_from_payload:
                 derived = (
                     current_state
                     if isinstance(current_state, dict)
                     else _derive_registration_state_from_page(page)
                 )
-                if derived.get("page_type") and derived.get("page_type") != "email_otp_verification":
-                    return {"ok": True, "status": status or 200, "url": effective_url, "data": payload, "text": ""}
+                if derived.get("page_type") and not _is_email_otp(derived):
+                    return {
+                        "ok": True,
+                        "status": status or 200,
+                        "url": effective_url,
+                        "data": {
+                            "page": {
+                                "type": str(derived.get("page_type")),
+                                "payload": {
+                                    "url": str(
+                                        derived.get("continue_url")
+                                        or derived.get("current_url")
+                                        or page.url
+                                        or ""
+                                    )
+                                },
+                            }
+                        },
+                        "text": "",
+                    }
                 if not assume_success_without_state:
                     return {
                         "ok": False,
@@ -5998,10 +6097,83 @@ def _browser_registration_flow(
             )
             log(f"验证码页提交状态: {otp_resp.get('status', 0)}")
             if not otp_resp.get("ok"):
+                # Validate rejected or never left OTP: allow the same digits to
+                # be fetched again after resend (OpenAI often reuses the code).
+                _invoke_otp_release(otp_callback, code, log)
                 raise RuntimeError(f"验证码校验失败: {(otp_resp.get('text') or '')[:300]}")
             state = _extract_flow_state(otp_resp.get("data"), otp_resp.get("url", page.url))
-            if not state.get("page_type"):
-                state = _derive_registration_state_from_page(page)
+            if not state.get("page_type") or _is_email_otp(state):
+                # Prefer live DOM: API/URL can still say email-verification while
+                # about_you inputs are already painted.
+                try:
+                    live_after_otp = _derive_registration_state_from_page(page)
+                except Exception as exc:
+                    if not _is_navigation_context_error(exc):
+                        raise
+                    _wait_for_auth_page_settle(page, timeout=8.0, log=log)
+                    live_after_otp = _derive_registration_state_from_page(page)
+                if live_after_otp.get("page_type") and not _is_email_otp(live_after_otp):
+                    state = live_after_otp
+                elif _is_email_otp(state) or _is_email_otp(live_after_otp or {}):
+                    # HTTP 2xx but SPA still on OTP — wait for transition before
+                    # burning another mailbox poll that excludes this code.
+                    log("验证码 API 已成功，等待 SPA 离开验证码页...")
+                    _wait_for_auth_page_settle(page, timeout=12.0, log=log)
+                    settle_deadline = time.time() + 20.0
+                    advanced = None
+                    while time.time() < settle_deadline:
+                        try:
+                            advanced = _derive_registration_state_from_page(page)
+                        except Exception as exc:
+                            if not _is_navigation_context_error(exc):
+                                raise
+                            _wait_for_auth_page_settle(page, timeout=4.0, log=log)
+                            continue
+                        if advanced.get("page_type") and not _is_email_otp(advanced):
+                            state = advanced
+                            break
+                        time.sleep(0.5)
+                    if _is_email_otp(state) and (not advanced or _is_email_otp(advanced)):
+                        # Still stuck: release the code so resend/reuse can work.
+                        _invoke_otp_release(otp_callback, code, log)
+                        log(
+                            "验证码提交后页面仍停留在 OTP，已释放该码以便重试/重发"
+                        )
+                        # Keep state as OTP; next loop iteration will resend path
+                        # only if we re-enter OTP with empty code budget — force
+                        # one controlled resend instead of a silent second wait.
+                        otp_sent_at = _resend_browser_email_otp()
+                        page_otp_triggered = True
+                        code_retry = _request_browser_email_otp(resend_wait)
+                        if not code_retry:
+                            raise RuntimeError(
+                                "验证码提交后页面未推进，且重发后仍未获取到新验证码"
+                            )
+                        otp_resp = _submit_otp_via_page(
+                            page,
+                            code_retry,
+                            log,
+                            device_id=device_id,
+                            user_agent=user_agent,
+                            referer=str(
+                                state.get("current_url")
+                                or state.get("continue_url")
+                                or ""
+                            ),
+                        )
+                        log(f"验证码页重试提交状态: {otp_resp.get('status', 0)}")
+                        if not otp_resp.get("ok"):
+                            _invoke_otp_release(otp_callback, code_retry, log)
+                            raise RuntimeError(
+                                f"验证码校验失败: {(otp_resp.get('text') or '')[:300]}"
+                            )
+                        state = _extract_flow_state(
+                            otp_resp.get("data"), otp_resp.get("url", page.url)
+                        )
+                        if not state.get("page_type") or _is_email_otp(state):
+                            live_retry = _derive_registration_state_from_page(page)
+                            if live_retry.get("page_type"):
+                                state = live_retry
             continue
 
         if _is_about_you(state):
@@ -6010,9 +6182,7 @@ def _browser_registration_flow(
                 str(state.get("current_url") or state.get("continue_url") or f"{OPENAI_AUTH}/about-you"),
                 OPENAI_AUTH,
             )
-            if "about-you" not in str(page.url):
-                log(f"跳转到 about_you 页面: {target_url[:120]}")
-                page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
+            _ensure_about_you_page(page, target_url, log)
             about_resp = _submit_about_you_via_page(
                 page,
                 log,
