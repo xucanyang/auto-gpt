@@ -6,6 +6,16 @@
 
 ## [Unreleased] (未发布)
 
+## [2.8.32] - 2026-07-25
+
+### 修复 (Fixed)
+- **Camoufox 浏览器注册导航竞态**：密码提交后 API 返回 `email_otp_send` + `/api/accounts/email-otp/send` 时，状态机不再 `page.goto` API URL；改为 settle 后按 OTP 阶段处理，避免 `Page.evaluate: Execution context was destroyed`。
+- **`_browser_fetch` / 页面状态探测**：`page.evaluate` 增加导航重试与 settle；邮箱填写三次重试；about_you 提交后等待 SPA 稳定再读状态。
+- **OTP 发码**：若页面已出现 OTP 输入框则跳过 `email-otp/send` 重放，减少与 SPA 导航冲突。
+
+### 测试 (Tests)
+- 新增 `email_otp_send` 禁止页面导航、API continue_url 不 goto 的合同用例。
+
 ## [2.8.31] - 2026-07-25
 
 ### 修复 (Fixed)
@@ -2691,4 +2701,8 @@
 
 ## 2026-07-25 08:36:09 +0800
 - v2.8.31 方案R：any-auto协议create对齐+三执行器Camoufox隔离+Web Session齐套门闩
+- 发布模式: multi
+
+## 2026-07-25 08:58:36 +0800
+- v2.8.32 修复Camoufox密码后OTP导航竞态与API continue_url误goto
 - 发布模式: multi

@@ -1005,7 +1005,74 @@ def _password_submission_timeout_text(submission: _PasswordFormSubmission, fallb
     return fallback
 
 
+def _is_navigation_context_error(exc: BaseException | str) -> bool:
+    text = str(exc or "").lower()
+    return any(
+        marker in text
+        for marker in (
+            "execution context was destroyed",
+            "most likely because of a navigation",
+            "target closed",
+            "target page, context or browser has been closed",
+            "frame was detached",
+            "navigation",
+        )
+    )
+
+
+def _wait_for_auth_page_settle(page, *, timeout: float = 12.0, log=None) -> str:
+    """Wait for SPA navigations to settle before page.evaluate / form work."""
+    deadline = time.time() + max(1.0, float(timeout or 1.0))
+    last_url = ""
+    stable_hits = 0
+    while time.time() < deadline:
+        try:
+            current = str(page.url or "")
+        except Exception as exc:
+            if _is_navigation_context_error(exc):
+                time.sleep(0.35)
+                continue
+            current = ""
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=1500)
+        except Exception:
+            pass
+        if current and current == last_url:
+            stable_hits += 1
+            if stable_hits >= 2:
+                return current
+        else:
+            stable_hits = 0
+            last_url = current
+        time.sleep(0.35)
+    try:
+        return str(page.url or last_url or "")
+    except Exception:
+        return last_url or ""
+
+
+def _page_evaluate_safe(page, script, arg=None, *, retries: int = 4, settle: bool = True):
+    """page.evaluate with navigation-race retries."""
+    last_exc: Exception | None = None
+    for attempt in range(max(1, int(retries or 1))):
+        if settle and attempt > 0:
+            _wait_for_auth_page_settle(page, timeout=4.0)
+        try:
+            if arg is None:
+                return page.evaluate(script)
+            return page.evaluate(script, arg)
+        except Exception as exc:
+            last_exc = exc
+            if not _is_navigation_context_error(exc) or attempt >= max(1, int(retries or 1)) - 1:
+                raise
+            time.sleep(0.4 + 0.2 * attempt)
+    if last_exc:
+        raise last_exc
+    return None
+
+
 def _is_login_password_url(url: str) -> bool:
+
     return bool(re.search(r"(?:auth|accounts)\.openai\.com/.*log-?in/password", str(url or ""), flags=re.I))
 
 
@@ -1140,34 +1207,47 @@ def _extract_input_validation_message(page, selector: str) -> str:
 
 
 def _fill_input_like_user(page, selector: str, value: str) -> bool:
-    try:
-        locator = _first_visible_locator(page, selector) or page.locator(selector).first
-        locator.wait_for(state="visible", timeout=2000)
-        current = str(locator.input_value() or "").strip()
-        if current == str(value).strip():
-            return True
-        locator.click(timeout=1500)
-        _browser_pause(page)
+    target = str(value or "")
+    for attempt in range(3):
         try:
-            locator.fill("")
-        except Exception:
-            pass
-        _browser_pause(page, headed=False)
-        try:
-            locator.type(value, delay=random.randint(35, 85))
-        except Exception:
+            if attempt:
+                _wait_for_auth_page_settle(page, timeout=5.0)
+            locator = _first_visible_locator(page, selector) or page.locator(selector).first
+            locator.wait_for(state="visible", timeout=4000)
+            current = str(locator.input_value() or "").strip()
+            if current == target.strip():
+                return True
+            locator.click(timeout=2500)
+            _browser_pause(page)
             try:
-                page.fill(selector, value)
+                locator.fill("")
             except Exception:
-                return False
-        final_value = str(locator.input_value() or "").strip()
-        if final_value == str(value):
-            return True
-    except Exception:
-        pass
+                pass
+            _browser_pause(page, headed=False)
+            try:
+                locator.type(target, delay=random.randint(35, 85))
+            except Exception:
+                try:
+                    page.fill(selector, target)
+                except Exception:
+                    if attempt >= 2:
+                        break
+                    continue
+            final_value = str(locator.input_value() or "").strip()
+            if final_value == target:
+                return True
+            # 部分 SPA 会规范化空白；宽松比对
+            if final_value.replace(" ", "") == target.replace(" ", ""):
+                return True
+        except Exception as exc:
+            if attempt >= 2 and not _is_navigation_context_error(exc):
+                break
+            time.sleep(0.4)
+            continue
 
     try:
-        ok = page.evaluate(
+        ok = _page_evaluate_safe(
+            page,
             """
             ({ selector, value }) => {
               const input = Array.from(document.querySelectorAll(selector)).find((candidate) => {
@@ -1185,6 +1265,7 @@ def _fill_input_like_user(page, selector: str, value: str) -> bool:
             }
             """,
             {"selector": selector, "value": value},
+            retries=3,
         )
         return bool(ok)
     except Exception:
@@ -1386,7 +1467,8 @@ def _derive_registration_state_from_page(page) -> dict:
 
     try:
         about_visible = bool(
-            page.evaluate(
+            _page_evaluate_safe(
+                page,
                 """
                 () => {
                   const inputs = Array.from(document.querySelectorAll("input:not([type='hidden'])"));
@@ -1408,7 +1490,8 @@ def _derive_registration_state_from_page(page) -> dict:
                   });
                   return (hasName && hasAgeOrBirth) || text.includes('about you') || text.includes('あなたについて');
                 }
-                """
+                """,
+                retries=3,
             )
         )
     except Exception:
@@ -1846,8 +1929,11 @@ class _SentinelTokenGenerator:
 
 
 def _browser_fetch(page, url: str, *, method: str = "GET", headers: dict | None = None, body: str | None = None, redirect: str = "manual", timeout_ms: int = 30000) -> dict:
-    return page.evaluate(
-        """
+    _wait_for_auth_page_settle(page, timeout=6.0)
+    try:
+        return _page_evaluate_safe(
+            page,
+            """
         async ({ url, method, headers, body, redirect, timeoutMs }) => {
           const controller = new AbortController();
           const timer = setTimeout(() => controller.abort(new Error(`fetch timeout after ${timeoutMs}ms`)), timeoutMs);
@@ -1873,15 +1959,25 @@ def _browser_fetch(page, url: str, *, method: str = "GET", headers: dict | None 
           }
         }
         """,
-        {
+            {
+                "url": url,
+                "method": method,
+                "headers": headers or {},
+                "body": body,
+                "redirect": redirect,
+                "timeoutMs": timeout_ms,
+            },
+            retries=4,
+        )
+    except Exception as exc:
+        return {
+            "ok": False,
+            "status": 0,
             "url": url,
-            "method": method,
-            "headers": headers or {},
-            "body": body,
-            "redirect": redirect,
-            "timeoutMs": timeout_ms,
-        },
-    )
+            "headers": {},
+            "text": f"browser_fetch_failed: {exc}",
+            "data": None,
+        }
 
 
 def _build_browser_sentinel_token(page, device_id: str, flow: str, user_agent: str) -> str:
@@ -2800,8 +2896,13 @@ def _is_password_registration(state: dict) -> bool:
 
 
 def _is_email_otp(state: dict) -> bool:
+    page_type = str(state.get("page_type") or "").strip().lower()
     target = f"{state.get('continue_url') or ''} {state.get('current_url') or ''}".lower()
-    return str(state.get("page_type") or "") == "email_otp_verification" or "email-verification" in target or "email-otp" in target
+    return (
+        page_type in {"email_otp_verification", "email_otp_send", "email_otp_validate"}
+        or "email-verification" in target
+        or "email-otp" in target
+    )
 
 
 def _is_about_you(state: dict) -> bool:
@@ -3130,11 +3231,30 @@ def _do_add_phone_attempt(
 def _requires_registration_navigation(state: dict) -> bool:
     if str(state.get("method") or "GET").upper() != "GET":
         return False
+    page_type = str(state.get("page_type") or "").strip().lower()
+    # API continue 不是页面 URL，禁止 page.goto 撞 /api/*
+    if page_type in {
+        "email_otp_send",
+        "email_otp_verification",
+        "create_account_password",
+        "login_password",
+        "about_you",
+        "add_phone",
+    }:
+        return False
     if str(state.get("page_type") or "") == "external_url" and state.get("continue_url"):
+        continue_url = str(state.get("continue_url") or "")
+        if "/api/" in continue_url:
+            return False
         return True
     continue_url = str(state.get("continue_url") or "")
     current_url = str(state.get("current_url") or "")
-    return bool(continue_url and continue_url != current_url)
+    if not continue_url or continue_url == current_url:
+        return False
+    # 禁止把 JSON 状态机里的 API 路径当页面导航
+    if "/api/" in continue_url or continue_url.rstrip("/").endswith("/send"):
+        return False
+    return True
 
 
 def _browser_add_cookies(page, cookies: list[dict]) -> None:
@@ -5304,9 +5424,31 @@ def _browser_registration_flow(
             if reg_resp.get("otp_triggered"):
                 page_otp_triggered = True
                 otp_sent_at_hint = reg_resp.get("otp_sent_at")
+            # 密码提交后 SPA 常立即导航到 email-verification；先 settle 再读状态，避免 evaluate 撞导航
+            _wait_for_auth_page_settle(page, timeout=10.0, log=log)
             state = _extract_flow_state(reg_resp.get("data"), reg_resp.get("url", page.url))
-            if not state.get("page_type") or _is_password_registration(state):
-                state = _derive_registration_state_from_page(page)
+            if str(state.get("page_type") or "") == "email_otp_send":
+                state["page_type"] = "email_otp_verification"
+                # API 返回 send 表示应触发/已触发发码，不把 continue_url 当地址栏导航
+                page_otp_triggered = page_otp_triggered or True
+                otp_sent_at_hint = otp_sent_at_hint or (time.time() - 8)
+            try:
+                live_state = _derive_registration_state_from_page(page)
+            except Exception as exc:
+                if not _is_navigation_context_error(exc):
+                    raise
+                _wait_for_auth_page_settle(page, timeout=8.0, log=log)
+                live_state = _derive_registration_state_from_page(page)
+            if live_state.get("page_type") in {
+                "email_otp_verification",
+                "about_you",
+                "add_phone",
+                "chatgpt_home",
+                "oauth_callback",
+            }:
+                state = live_state
+            elif not state.get("page_type") or _is_password_registration(state):
+                state = live_state
             continue
 
         if str(state.get("page_type") or "") == "login_password":
@@ -5319,14 +5461,40 @@ def _browser_registration_flow(
             if not otp_callback:
                 raise RuntimeError("ChatGPT 注册需要邮箱验证码但未提供 otp_callback")
             otp_sent_at = otp_sent_at_hint
+            _wait_for_auth_page_settle(page, timeout=8.0, log=log)
+            try:
+                live_before_send = _derive_registration_state_from_page(page)
+            except Exception as exc:
+                if _is_navigation_context_error(exc):
+                    _wait_for_auth_page_settle(page, timeout=6.0, log=log)
+                    live_before_send = _derive_registration_state_from_page(page)
+                else:
+                    raise
+            if _find_first_visible_selector(page, OTP_INPUT_SELECTORS):
+                page_otp_triggered = True
+                if not otp_sent_at:
+                    otp_sent_at = time.time() - 8
+                log("浏览器已出现 OTP 输入框，跳过 email-otp/send API 重放")
             if not browser_otp_sent and not page_otp_triggered:
                 request_started_at = time.time() - 8
-                send_result = _send_browser_email_otp(
-                    page,
-                    device_id=device_id,
-                    user_agent=user_agent,
-                    referer=str(state.get("current_url") or state.get("continue_url") or ""),
-                )
+                try:
+                    send_result = _send_browser_email_otp(
+                        page,
+                        device_id=device_id,
+                        user_agent=user_agent,
+                        referer=str(
+                            live_before_send.get("current_url")
+                            or state.get("current_url")
+                            or f"{OPENAI_AUTH}/email-verification"
+                        ),
+                    )
+                except Exception as exc:
+                    if _is_navigation_context_error(exc):
+                        log(f"email-otp/send 期间页面导航，按已发码继续: {exc}")
+                        send_result = {"ok": True, "status": 200, "text": "navigation_during_send"}
+                        page_otp_triggered = True
+                    else:
+                        raise
                 send_status = int(send_result.get("status") or 0)
                 if 200 <= send_status < 300 or send_result.get("ok"):
                     otp_sent_at = request_started_at
@@ -5337,6 +5505,7 @@ def _browser_registration_flow(
                         f"status={send_status} text={str(send_result.get('text') or '')[:160]}"
                     )
                 browser_otp_sent = True
+                _wait_for_auth_page_settle(page, timeout=8.0, log=log)
             elif page_otp_triggered:
                 log("浏览器页面已触发注册验证码，直接等待现有 OTP，不重复发送")
             log("等待 ChatGPT 验证码")
@@ -5399,9 +5568,19 @@ def _browser_registration_flow(
             if not about_resp.get("ok"):
                 raise RuntimeError(f"about_you 提交失败: {(about_resp.get('text') or '')[:300]}")
             signup_committed = bool(about_resp.get("signup_committed"))
+            _wait_for_auth_page_settle(page, timeout=12.0, log=log)
             state = _extract_flow_state(about_resp.get("data"), about_resp.get("url", page.url))
-            if not state.get("page_type"):
-                state = _derive_registration_state_from_page(page)
+            try:
+                if not state.get("page_type") or str(state.get("page_type") or "") == "about_you":
+                    live_after_about = _derive_registration_state_from_page(page)
+                    if live_after_about.get("page_type"):
+                        state = live_after_about
+            except Exception as exc:
+                if _is_navigation_context_error(exc):
+                    _wait_for_auth_page_settle(page, timeout=8.0, log=log)
+                    state = _derive_registration_state_from_page(page)
+                else:
+                    raise
             if _is_add_phone(state):
                 if not phone_callback:
                     if signup_committed:
@@ -5440,6 +5619,19 @@ def _browser_registration_flow(
             target_url = _normalize_url(str(state.get("continue_url") or state.get("current_url") or ""), OPENAI_AUTH)
             if not target_url:
                 raise RuntimeError("缺少可跟随的 continue_url")
+            if "/api/" in target_url:
+                log(f"跳过 API continue_url 页面导航: {target_url[:120]}")
+                # API continue 交给对应阶段（OTP/about_you）处理
+                if "email-otp" in target_url:
+                    state = {
+                        **state,
+                        "page_type": "email_otp_verification",
+                        "continue_url": f"{OPENAI_AUTH}/email-verification",
+                        "current_url": str(page.url or f"{OPENAI_AUTH}/email-verification"),
+                    }
+                    continue
+                state = _extract_flow_state(None, page.url)
+                continue
             try:
                 page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
             except Exception as exc:
@@ -5447,7 +5639,15 @@ def _browser_registration_flow(
                 # navigation after the URL has already been committed. Keep the
                 # actual browser URL and let the next iteration classify it.
                 log(f"跟随注册回调导航出现可忽略异常: {exc}")
-            state = _extract_flow_state(None, page.url)
+            _wait_for_auth_page_settle(page, timeout=8.0, log=log)
+            try:
+                state = _derive_registration_state_from_page(page)
+            except Exception as exc:
+                if _is_navigation_context_error(exc):
+                    _wait_for_auth_page_settle(page, timeout=6.0, log=log)
+                    state = _extract_flow_state(None, page.url)
+                else:
+                    raise
             if not state.get("page_type") and "code=" in str(page.url or ""):
                 state = _build_manual_flow_state("oauth_callback", str(page.url or ""))
             continue

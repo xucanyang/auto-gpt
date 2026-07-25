@@ -1632,6 +1632,27 @@ class BrowserRegistrationFlowTests(unittest.TestCase):
         self.assertIn("forbidden", result.error)
         browser_stage.assert_not_called()
 
+    def test_email_otp_send_is_not_page_navigation(self):
+        state = {
+            "method": "GET",
+            "page_type": "email_otp_send",
+            "continue_url": "https://auth.openai.com/api/accounts/email-otp/send",
+            "current_url": "https://auth.openai.com/create-account/password",
+        }
+        self.assertTrue(br._is_email_otp(state))
+        self.assertFalse(br._requires_registration_navigation(state))
+
+    def test_api_continue_url_never_navigates(self):
+        state = {
+            "method": "GET",
+            "page_type": "",
+            "continue_url": "https://auth.openai.com/api/accounts/create_account",
+            "current_url": "https://auth.openai.com/about-you",
+        }
+        self.assertFalse(br._requires_registration_navigation(state))
+
+
+
 
 if __name__ == "__main__":
     unittest.main()
