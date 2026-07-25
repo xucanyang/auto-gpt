@@ -232,6 +232,78 @@ class AccessTokenOnlyCheckoutTests(unittest.TestCase):
             any("固定为单次执行" in line for line in result.logs)
         )
 
+    def test_missing_web_session_after_signup_saves_auth_pending(self):
+        """Signup finished but AT missing must not hard-fail the attempt.
+
+        Live logs showed many FAIL+late_failure rows with session-token cookies
+        already present; those identities should be saved as auth_pending (and
+        HME finalize_success) after isolated OAuth also fails to mint AT.
+        """
+        email_service = mock.Mock()
+        email_service.create_email.return_value = {"email": "buyer@example.com"}
+        engine = AccessTokenOnlyRegistrationEngine(
+            email_service=email_service,
+            proxy_url="http://proxy.local:8080",
+            browser_mode="headless",
+            max_retries=1,
+        )
+        client = mock.Mock(
+            device_id="device-demo",
+            ua="Mozilla/5.0",
+            sec_ch_ua='"Chromium";v="145"',
+            impersonate="chrome145",
+            fingerprint=None,
+            last_registration_route_event=None,
+            registration_transport="camoufox_browser",
+            registration_stage_transports=[],
+            registration_runtime_profile={},
+        )
+        browser_stage = BrowserRegistrationStageResult(
+            final_state={
+                "page_type": "oauth_callback",
+                "current_url": "https://chatgpt.com/",
+            },
+            page_url="https://chatgpt.com/",
+            web_session={
+                "access_token": "",
+                "session_token": "session-token-demo",
+                "cookies": "__Secure-next-auth.session-token=session-token-demo",
+            },
+            error=(
+                "browser_registration_missing_web_session: signup finished but "
+                "ChatGPT /api/auth/session returned no accessToken"
+            ),
+            device_id="device-demo",
+            user_agent="Mozilla/5.0 Camoufox",
+            effective_executor="headless",
+        )
+        self.assertTrue(browser_stage.signup_complete)
+        self.assertFalse(browser_stage.ok)
+
+        with (
+            mock.patch.object(engine, "_build_chatgpt_client", return_value=client),
+            mock.patch.object(
+                engine,
+                "_run_browser_registration",
+                return_value=browser_stage,
+            ),
+            mock.patch.object(
+                engine,
+                "_capture_browser_oauth_tokens",
+                return_value=(False, "oauth recovery failed"),
+            ) as oauth_capture,
+            mock.patch.object(engine, "_probe_plus_checkout_billing", return_value={}),
+        ):
+            result = engine.run()
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.source, "registered_auth_pending")
+        self.assertTrue(result.metadata.get("registered_auth_pending"))
+        self.assertTrue(result.metadata.get("needs_auth_capture"))
+        self.assertEqual(result.session_token, "session-token-demo")
+        oauth_capture.assert_called_once()
+        email_service.finalize_success.assert_called()
+
     def test_browser_signup_existing_account_never_switches_to_login_recovery(self):
         email_service = mock.Mock()
         email_service.create_email.return_value = {"email": "existing@example.com"}

@@ -717,10 +717,28 @@ class AccessTokenOnlyRegistrationEngine:
             hard_timeout_seconds=hard_timeout_seconds,
             log_fn=lambda message: self._log(f"[浏览器注册] {message}"),
         )
-        if not stage_result.ok:
-            error = str(stage_result.error or "browser_registration_failed")
-            self._log(f"Camoufox 注册链路失败: {error}", "warning")
+        error = str(stage_result.error or "")
+        signup_complete = bool(getattr(stage_result, "signup_complete", False))
+        if not signup_complete and not stage_result.ok:
+            self._log(
+                f"Camoufox 注册链路失败: {error or 'browser_registration_failed'}",
+                "warning",
+            )
             return stage_result
+
+        if error and "missing_web_session" in error:
+            # Signup already committed on OpenAI; keep going so the engine can
+            # run isolated OAuth recovery or save registered_auth_pending.
+            self._log(
+                "Camoufox 注册开户已完成，但同上下文未读到 Web AT；"
+                "继续独立 OAuth / auth_pending 落库路径",
+                "warning",
+            )
+        elif not stage_result.ok and signup_complete:
+            self._log(
+                f"Camoufox 注册链路开户完成但带告警: {error or '-'}",
+                "warning",
+            )
 
         state_data = dict(stage_result.final_state or {})
         chatgpt_client.last_registration_state = FlowState(
@@ -1404,12 +1422,21 @@ class AccessTokenOnlyRegistrationEngine:
                                 profile_name=f"{first_name} {last_name}".strip(),
                                 profile_birthdate=birthdate,
                             )
-                            success = browser_stage.ok
-                            msg = (
-                                "registration complete via camoufox browser"
-                                if success
-                                else str(browser_stage.error or "browser_registration_failed")
-                            )
+                            stage_error = str(browser_stage.error or "")
+                            # OpenAI signup can finish while ChatGPT AT capture fails.
+                            # Treat missing_web_session as signup success so we still
+                            # run isolated OAuth recovery / auth_pending save instead of
+                            # discarding a real account and late_failure-ing the HME.
+                            signup_complete = bool(
+                                getattr(browser_stage, "signup_complete", False)
+                            ) or ("missing_web_session" in stage_error)
+                            success = bool(browser_stage.ok or signup_complete)
+                            if browser_stage.ok:
+                                msg = "registration complete via camoufox browser"
+                            elif signup_complete:
+                                msg = stage_error or "browser_registration_signup_complete_missing_at"
+                            else:
+                                msg = stage_error or "browser_registration_failed"
                             session_result = dict(browser_stage.web_session or {})
                             session_ok = bool(
                                 str(session_result.get("access_token") or "").strip()
@@ -1588,12 +1615,31 @@ class AccessTokenOnlyRegistrationEngine:
                                     "浏览器注册已完成但同上下文未读到 Web AT，启动独立浏览器 OAuth 捕获",
                                     "warning",
                                 )
-                                session_ok, session_result = self._capture_browser_oauth_tokens(
+                                prior_session = (
+                                    dict(session_result)
+                                    if isinstance(session_result, dict)
+                                    else {}
+                                )
+                                session_ok, oauth_session = self._capture_browser_oauth_tokens(
                                     chatgpt_client=chatgpt_client,
                                     email_addr=email_addr,
                                     password=pwd,
                                     skymail_adapter=skymail_adapter,
                                 )
+                                if session_ok and isinstance(oauth_session, dict):
+                                    session_result = oauth_session
+                                else:
+                                    # Keep signup-context cookies/session_token for auth_pending.
+                                    session_result = prior_session
+                                    if not isinstance(session_result, dict):
+                                        session_result = {
+                                            "error": str(oauth_session or "oauth recovery failed")
+                                        }
+                                    elif oauth_session:
+                                        session_result = {
+                                            **session_result,
+                                            "oauth_recovery_error": str(oauth_session)[:300],
+                                        }
                         else:
                             self._log("步骤 2/2: 复用注册会话，直接获取 ChatGPT Session / AccessToken...")
                             session_ok, session_result = chatgpt_client.reuse_session_and_get_tokens()
@@ -1675,10 +1721,22 @@ class AccessTokenOnlyRegistrationEngine:
 
                     last_error = f"注册成功，但获取 AccessToken 失败: {session_result}"
                     if self._is_browser_executor() and not existing_account_capture:
+                        pending_session = (
+                            dict(session_result)
+                            if isinstance(session_result, dict)
+                            else {}
+                        )
                         result.success = True
                         result.source = "registered_auth_pending"
                         result.error_message = last_error
-                        result.account_id = ""
+                        result.account_id = str(
+                            pending_session.get("account_id")
+                            or pending_session.get("user_id")
+                            or ""
+                        ).strip()
+                        result.session_token = str(
+                            pending_session.get("session_token") or ""
+                        ).strip()
                         result.metadata = {
                             "registered_auth_pending": True,
                             "needs_auth_capture": True,
@@ -1687,6 +1745,12 @@ class AccessTokenOnlyRegistrationEngine:
                             "registration_full_auth_failed": True,
                             "registration_full_auth_error": last_error,
                             "registration_full_auth_failed_policy": "keep_registered_auth_pending",
+                            "cookies": pending_session.get("cookies") or "",
+                            "cookie_header": (
+                                pending_session.get("cookie_header")
+                                or pending_session.get("cookies")
+                                or ""
+                            ),
                             "registration_context": self._build_registration_context_payload(
                                 chatgpt_client=chatgpt_client,
                                 first_name=first_name,

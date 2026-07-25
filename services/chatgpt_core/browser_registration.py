@@ -3129,6 +3129,7 @@ def _wait_for_web_session(
     logger = log or (lambda _message: None)
     deadline = time.time() + max(int(timeout or 0), 1)
     bridge_attempted = False
+    bridge_retried = False
     home_navigated = False
     attempt = 0
     logger(
@@ -3136,19 +3137,33 @@ def _wait_for_web_session(
         f"url={(str(page.url or '')[:120])} cookies={_cookie_names_summary(page)}"
     )
 
+    def _goto_chatgpt_home(reason: str) -> None:
+        nonlocal home_navigated
+        home_navigated = True
+        logger(f"Web Session: 导航 chatgpt.com 首页建立 next-auth 会话 ({reason})")
+        try:
+            page.goto(f"{CHATGPT_APP}/", wait_until="domcontentloaded", timeout=45000)
+        except Exception as exc:
+            message = str(exc or "")
+            logger(f"Web Session: 首页导航异常: {message[:180]}")
+            # NS_BINDING_ABORTED / detach often means SPA already navigated.
+            _wait_for_auth_page_settle(page, timeout=8.0, log=logger)
+            if "chatgpt.com" not in str(page.url or ""):
+                try:
+                    page.goto(f"{CHATGPT_APP}/", wait_until="commit", timeout=30000)
+                except Exception as retry_exc:
+                    logger(f"Web Session: 首页重试导航异常: {retry_exc}")
+                _wait_for_auth_page_settle(page, timeout=8.0, log=logger)
+            return
+        _wait_for_auth_page_settle(page, timeout=10.0, log=logger)
+
     while time.time() < deadline:
         attempt += 1
         try:
             current_url = str(page.url or "")
             # platform.openai.com callback 不是 ChatGPT session 域名
             if "chatgpt.com" not in current_url and not home_navigated:
-                home_navigated = True
-                logger("Web Session: 导航 chatgpt.com 首页建立 next-auth 会话")
-                try:
-                    page.goto(f"{CHATGPT_APP}/", wait_until="domcontentloaded", timeout=45000)
-                except Exception as exc:
-                    logger(f"Web Session: 首页导航异常: {exc}")
-                _wait_for_auth_page_settle(page, timeout=10.0, log=logger)
+                _goto_chatgpt_home("initial")
 
             payload = _fetch_chatgpt_session_payload(page)
             data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
@@ -3160,17 +3175,23 @@ def _wait_for_web_session(
                 )
                 return dict(data)
 
+            keys = sorted(list(data.keys()))[:8]
             logger(
                 "Web Session: 尚未就绪 "
                 f"attempt={attempt} status={payload.get('status')} "
-                f"keys={sorted(list(data.keys()))[:8]} "
+                f"keys={keys} "
                 f"url={(str(page.url or '')[:100])} "
                 f"text={str(payload.get('text') or '')[:120]}"
             )
 
-            # 约 8s 后仍无 AT：用 OpenAI 已登录态桥接 next-auth
+            # WARNING_BANNER-only / empty session: not authenticated yet → bridge ASAP
+            unauthenticated = (
+                not data
+                or set(keys) <= {"WARNING_BANNER"}
+                or (not data.get("user") and not data.get("account") and not data.get("accessToken"))
+            )
             elapsed = max(int(timeout or 0), 1) - max(int(deadline - time.time()), 0)
-            if (not bridge_attempted) and (attempt >= 2 or elapsed >= 8):
+            if (not bridge_attempted) and (attempt >= 1 and unauthenticated or attempt >= 2 or elapsed >= 6):
                 bridge_attempted = True
                 _browser_chatgpt_openai_signin_bridge(
                     page,
@@ -3181,13 +3202,29 @@ def _wait_for_web_session(
                 home_navigated = True
                 continue
 
+            # First bridge often lands authorize but SPA still lacks next-auth;
+            # retry once before the hard deadline.
+            remaining = deadline - time.time()
+            if (
+                bridge_attempted
+                and (not bridge_retried)
+                and remaining > 18
+                and unauthenticated
+                and attempt >= 4
+            ):
+                bridge_retried = True
+                logger("Web Session: 首次桥接后仍无 AT，重试 next-auth 桥接")
+                _browser_chatgpt_openai_signin_bridge(
+                    page,
+                    logger,
+                    email=email,
+                    device_id=device_id,
+                )
+                continue
+
             # 仍在 platform / auth 域名时，再次强制回 ChatGPT
             if "chatgpt.com" not in str(page.url or "") and attempt in {3, 5, 7}:
-                try:
-                    page.goto(f"{CHATGPT_APP}/", wait_until="domcontentloaded", timeout=45000)
-                except Exception:
-                    pass
-                _wait_for_auth_page_settle(page, timeout=8.0, log=logger)
+                _goto_chatgpt_home(f"retry-{attempt}")
         except Exception as exc:
             logger(f"Web Session: 轮询异常: {exc}")
         time.sleep(2)
@@ -3197,7 +3234,6 @@ def _wait_for_web_session(
         f"cookies={_cookie_names_summary(page)} url={(str(page.url or '')[:120])}"
     )
     return {}
-
 
 def _normalize_browser_web_session(session_data: dict, cookies: list[dict]) -> dict:
     data = dict(session_data or {})
@@ -6502,7 +6538,7 @@ def run_browser_registration_stage_sync(
         # 把 OpenAI 登录态桥成 ChatGPT next-auth，再读 AT/session_token。
         session_data = _wait_for_web_session(
             page,
-            timeout=75,
+            timeout=100,
             log=logger,
             email=str(email or ""),
             device_id=str(device_id or ""),

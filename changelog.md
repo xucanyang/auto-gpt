@@ -6,6 +6,18 @@
 
 ## [Unreleased] (未发布)
 
+## [2.8.41] - 2026-07-25
+
+### 修复 (Fixed)
+- **注册成功率被 `missing_web_session` 大量吃掉**：Camoufox 已完成 OTP/about_you（甚至已有 `__Secure-next-auth.session-token`），但同上下文 `/api/auth/session` 拿不到 `accessToken` 时，阶段结果 `ok=False` 会直接 **FAIL + HME late_failure**，既不走独立 OAuth 补抓，也不落 `registered_auth_pending`。现把 `browser_registration_missing_web_session` 识别为 **开户已完成**：
+  1. 继续跑独立浏览器 OAuth 补 AT/RT；
+  2. 仍无 AT 时 **成功落库 auth_pending**（邮箱/密码/session_token/cookies 保留，Helper finalize_success）；
+  3. 不再把已开户身份当注册失败丢掉。
+- **Web Session 抓取加硬**：首页 `NS_BINDING_ABORTED` 后 settle/commit 重试；`WARNING_BANNER` 空会话更早触发 next-auth 桥接，并允许一次桥接重试；超时窗口 75s→100s。
+
+### 测试 (Tests)
+- `missing_web_session` → OAuth 补抓失败后 `registered_auth_pending` 成功落库合同。
+
 ## [2.8.40] - 2026-07-25
 
 ### 修复 (Fixed)
@@ -2815,4 +2827,8 @@
 
 ## 2026-07-25 12:44:33 +0800
 - v2.8.40 修复OTP提交后同码被排除与about_you NS_BINDING_ABORTED
+- 发布模式: multi
+
+## 2026-07-25 19:47:19 +0800
+- v2.8.41 missing_web_session开户完成后走OAuth或auth_pending落库提升成功率
 - 发布模式: multi

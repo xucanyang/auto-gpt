@@ -612,13 +612,34 @@ class BrowserRegistrationStageResult:
     error: str = ""
 
     @property
-    def ok(self) -> bool:
-        page_type = str((self.final_state or {}).get("page_type") or "")
-        return not self.error and page_type in {
+    def signup_complete(self) -> bool:
+        """Whether OpenAI signup itself finished (independent of ChatGPT AT).
+
+        ``missing_web_session`` means about_you / callback already committed but
+        ``/api/auth/session`` did not yield accessToken. That is still a finished
+        registration identity and must not be treated as a hard signup failure.
+        """
+        error = str(self.error or "")
+        if "missing_web_session" in error:
+            return True
+        page_type = str((self.final_state or {}).get("page_type") or "").strip().lower()
+        return page_type in {
             "callback",
             "oauth_callback",
             "chatgpt_home",
+            "about_you",
+            "add_phone",
         }
+
+    @property
+    def ok(self) -> bool:
+        """Full success: signup finished and no stage error (includes AT capture)."""
+        if self.error:
+            # Signup-finished-but-missing-AT is recoverable by the engine.
+            if "missing_web_session" in str(self.error):
+                return False
+            return False
+        return self.signup_complete
 
 
 @dataclass
