@@ -6,6 +6,19 @@
 
 ## [Unreleased] (未发布)
 
+## [2.8.42] - 2026-07-25
+
+### 修复 (Fixed)
+- **开户完成后 Web Session 桥接 `missing csrfToken`**：真实失败日志为 signup 已到 `oauth_callback` / about_you，但 `fetch('/api/auth/csrf')` 常返回 HTTP 200 空 body，桥接直接失败，长时间空转后任务被停。现对齐注册入口实现：
+  1. 用 `_browser_fetch` + `context.request` 取 CSRF；
+  2. 仍失败则解析 `__Host-next-auth.csrf-token` cookie（`token|hash` 取前半）；
+  3. `signin/openai` 同样支持 cookie-jar 回退；
+  4. reload 后重试一次 CSRF。
+- **入口 `Page.goto` 超时误标 late_failure**：未发码前的注册入口超时 / 邮箱页失败纳入 HME `early_failure`，避免白白烧掉 ready lease。
+
+### 测试 (Tests)
+- CSRF API 空 body 时 cookie 回退桥接合同。
+
 ## [2.8.41] - 2026-07-25
 
 ### 修复 (Fixed)
@@ -2831,4 +2844,8 @@
 
 ## 2026-07-25 19:47:19 +0800
 - v2.8.41 missing_web_session开户完成后走OAuth或auth_pending落库提升成功率
+- 发布模式: multi
+
+## 2026-07-25 20:22:34 +0800
+- v2.8.42 修复Web Session桥接missing csrfToken与入口超时early_failure
 - 发布模式: multi

@@ -3015,89 +3015,63 @@ def _fetch_chatgpt_session_payload(page) -> dict:
 
 
 def _browser_chatgpt_openai_signin_bridge(page, log, *, email: str = "", device_id: str = "") -> bool:
-    """Use next-auth signin/openai in-browser so OpenAI auth cookies mint ChatGPT session."""
+    """Use next-auth signin/openai so OpenAI auth cookies mint a ChatGPT session.
+
+    Prefer the same ``_browser_fetch`` / cookie-jar helpers used by the signup
+    authorize entry. The previous page-world fetch often returned HTTP 200 with
+    an empty body (``missing csrfToken``) after platform callback.
+    """
     email = str(email or "").strip()
     device_id = str(device_id or "").strip()
     log("Web Session 桥接: ChatGPT next-auth signin/openai")
     try:
         page.goto(f"{CHATGPT_APP}/", wait_until="domcontentloaded", timeout=45000)
     except Exception as exc:
-        if not _is_navigation_context_error(exc):
-            log(f"Web Session 桥接首页导航异常: {exc}")
+        log(f"Web Session 桥接首页导航异常: {exc}")
     _wait_for_auth_page_settle(page, timeout=8.0, log=log)
 
-    try:
-        bridge = _page_evaluate_safe(
+    # Seed device id cookies on chatgpt domain before CSRF/signin.
+    if device_id:
+        try:
+            _seed_browser_device_id(page, device_id)
+        except Exception as exc:
+            log(f"Web Session 桥接写入 oai-did 失败（可继续）: {exc}")
+
+    csrf_token = _get_browser_csrf_token(page, log=log)
+    if not csrf_token:
+        # Hard reload once — next-auth often sets csrf cookie only after a full document load.
+        try:
+            page.reload(wait_until="domcontentloaded", timeout=45000)
+        except Exception as exc:
+            log(f"Web Session 桥接 reload 异常: {exc}")
+        _wait_for_auth_page_settle(page, timeout=8.0, log=log)
+        csrf_token = _get_browser_csrf_token(page, log=log)
+    if not csrf_token:
+        log("Web Session 桥接失败: 无法获取 csrfToken")
+        return False
+
+    authorize_url = _start_browser_signin(
+        page,
+        email,
+        device_id,
+        csrf_token,
+        screen_hint="login",
+        log=log,
+    )
+    if not authorize_url:
+        # Retry with signup-compatible hint used by the authorize entry path.
+        authorize_url = _start_browser_signin(
             page,
-            """
-            async ({ email, deviceId, base }) => {
-              const csrfResp = await fetch(base + '/api/auth/csrf', {
-                credentials: 'include',
-                headers: { 'accept': 'application/json' },
-              });
-              const csrfJson = await csrfResp.json().catch(() => ({}));
-              const csrfToken = String((csrfJson && csrfJson.csrfToken) || '');
-              if (!csrfToken) {
-                return { ok: false, stage: 'csrf', status: csrfResp.status, detail: 'missing csrfToken' };
-              }
-              const params = new URLSearchParams({
-                prompt: 'login',
-                'ext-oai-did': deviceId || '',
-                auth_session_logging_id: (crypto.randomUUID ? crypto.randomUUID() : String(Date.now())),
-                screen_hint: 'login',
-              });
-              if (email) params.set('login_hint', email);
-              const body = new URLSearchParams({
-                callbackUrl: base + '/',
-                csrfToken,
-                json: 'true',
-              });
-              const signinResp = await fetch(
-                base + '/api/auth/signin/openai?' + params.toString(),
-                {
-                  method: 'POST',
-                  credentials: 'include',
-                  headers: {
-                    'content-type': 'application/x-www-form-urlencoded',
-                    'accept': 'application/json',
-                  },
-                  body: body.toString(),
-                }
-              );
-              const signinJson = await signinResp.json().catch(() => ({}));
-              const authorizeUrl = String((signinJson && signinJson.url) || '');
-              if (!authorizeUrl) {
-                return {
-                  ok: false,
-                  stage: 'signin',
-                  status: signinResp.status,
-                  detail: JSON.stringify(signinJson || {}).slice(0, 180),
-                };
-              }
-              return { ok: true, stage: 'signin', status: signinResp.status, authorizeUrl };
-            }
-            """,
-            {
-                "email": email,
-                "deviceId": device_id,
-                "base": CHATGPT_APP.rstrip("/"),
-            },
-            retries=2,
+            email,
+            device_id,
+            csrf_token,
+            screen_hint="login_or_signup",
+            log=log,
         )
-    except Exception as exc:
-        log(f"Web Session 桥接 signin 调用失败: {exc}")
+    if not authorize_url:
+        log("Web Session 桥接 signin 未返回 authorize URL")
         return False
 
-    if not isinstance(bridge, dict) or not bridge.get("ok"):
-        log(
-            "Web Session 桥接 signin 未返回 authorize URL: "
-            f"stage={((bridge or {}).get('stage') if isinstance(bridge, dict) else '-') } "
-            f"status={((bridge or {}).get('status') if isinstance(bridge, dict) else '-') } "
-            f"detail={str((bridge or {}).get('detail') if isinstance(bridge, dict) else bridge)[:160]}"
-        )
-        return False
-
-    authorize_url = str(bridge.get("authorizeUrl") or "").strip()
     log(f"Web Session 桥接 authorize: {authorize_url[:120]}")
     try:
         page.goto(authorize_url, wait_until="domcontentloaded", timeout=60000)
@@ -3115,7 +3089,6 @@ def _browser_chatgpt_openai_signin_bridge(page, log, *, email: str = "", device_
             log(f"Web Session 桥接回 ChatGPT 首页异常: {exc}")
         _wait_for_auth_page_settle(page, timeout=10.0, log=log)
     return True
-
 
 def _wait_for_web_session(
     page,
@@ -3765,7 +3738,27 @@ def _seed_browser_device_id(page, device_id: str) -> None:
     )
 
 
-def _get_browser_csrf_token(page) -> str:
+def _csrf_token_from_cookies(page) -> str:
+    """next-auth stores csrf as cookie value ``token|hash``; API expects the token half."""
+    try:
+        cookies = list(page.context.cookies() or [])
+    except Exception:
+        return ""
+    for item in cookies:
+        name = str(item.get("name") or "").lower()
+        if "csrf" not in name:
+            continue
+        raw = str(item.get("value") or "").strip()
+        if not raw:
+            continue
+        token = raw.split("|", 1)[0].strip()
+        if token:
+            return token
+    return ""
+
+
+def _get_browser_csrf_token(page, *, log=None) -> str:
+    logger = log or (lambda _message: None)
     result = _browser_fetch(
         page,
         f"{CHATGPT_APP}/api/auth/csrf",
@@ -3778,19 +3771,67 @@ def _get_browser_csrf_token(page) -> str:
         redirect="follow",
     )
     if result.get("ok") and isinstance(result.get("data"), dict):
-        return str((result.get("data") or {}).get("csrfToken") or "").strip()
+        token = str((result.get("data") or {}).get("csrfToken") or "").strip()
+        if token:
+            return token
+
+    # Playwright request API shares the browser cookie jar and avoids some
+    # page-world fetch edge cases that return HTTP 200 with empty/HTML body.
+    try:
+        request = getattr(getattr(page, "context", None), "request", None)
+        if request is not None:
+            response = request.get(
+                f"{CHATGPT_APP}/api/auth/csrf",
+                headers={
+                    "accept": "application/json",
+                    "referer": f"{CHATGPT_APP}/",
+                },
+                timeout=20000,
+            )
+            try:
+                data = response.json()
+            except Exception:
+                data = {}
+            token = str((data or {}).get("csrfToken") or "").strip()
+            if token:
+                logger(
+                    f"Web Session CSRF via context.request status={getattr(response, 'status', '-')}"
+                )
+                return token
+    except Exception as exc:
+        logger(f"Web Session CSRF context.request 失败: {exc}")
+
+    cookie_token = _csrf_token_from_cookies(page)
+    if cookie_token:
+        logger("Web Session CSRF 回退使用 next-auth csrf cookie")
+        return cookie_token
+
+    logger(
+        "Web Session CSRF 获取失败: "
+        f"status={result.get('status')} ok={result.get('ok')} "
+        f"text={str(result.get('text') or '')[:120]} cookies={_cookie_names_summary(page)}"
+    )
     return ""
 
 
-def _start_browser_signin(page, email: str, device_id: str, csrf_token: str) -> str:
+def _start_browser_signin(
+    page,
+    email: str,
+    device_id: str,
+    csrf_token: str,
+    *,
+    screen_hint: str = "login_or_signup",
+    log=None,
+) -> str:
     from urllib.parse import urlencode
 
+    logger = log or (lambda _message: None)
     query = urlencode(
         {
             "prompt": "login",
             "ext-oai-did": device_id,
             "auth_session_logging_id": str(uuid.uuid4()),
-            "screen_hint": "login_or_signup",
+            "screen_hint": str(screen_hint or "login_or_signup"),
             "login_hint": email,
         }
     )
@@ -3816,9 +3857,47 @@ def _start_browser_signin(page, email: str, device_id: str, csrf_token: str) -> 
         redirect="follow",
     )
     if result.get("ok") and isinstance(result.get("data"), dict):
-        return str((result.get("data") or {}).get("url") or "").strip()
-    return ""
+        url = str((result.get("data") or {}).get("url") or "").strip()
+        if url:
+            return url
 
+    # Same fallback as CSRF: shared cookie jar via context.request.
+    try:
+        request = getattr(getattr(page, "context", None), "request", None)
+        if request is not None:
+            response = request.post(
+                f"{CHATGPT_APP}/api/auth/signin/openai?{query}",
+                headers={
+                    "accept": "application/json",
+                    "referer": f"{CHATGPT_APP}/",
+                    "origin": CHATGPT_APP,
+                    "content-type": "application/x-www-form-urlencoded",
+                },
+                data=body,
+                timeout=30000,
+            )
+            try:
+                data = response.json()
+            except Exception:
+                data = {}
+            url = str((data or {}).get("url") or "").strip()
+            if url:
+                logger(
+                    f"Web Session signin via context.request status={getattr(response, 'status', '-')}"
+                )
+                return url
+            logger(
+                "Web Session signin context.request 无 url: "
+                f"status={getattr(response, 'status', '-')} body={str(data)[:160]}"
+            )
+    except Exception as exc:
+        logger(f"Web Session signin context.request 失败: {exc}")
+
+    logger(
+        "Web Session signin 未返回 authorize URL: "
+        f"status={result.get('status')} text={str(result.get('text') or '')[:160]}"
+    )
+    return ""
 
 def _browser_authorize(page, auth_url: str, log) -> str:
     if not auth_url:

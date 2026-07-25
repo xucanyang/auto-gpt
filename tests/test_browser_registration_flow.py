@@ -1559,6 +1559,55 @@ class BrowserRegistrationFlowTests(unittest.TestCase):
         second_exclude = service.get_verification_code.call_args_list[1].kwargs["exclude_codes"]
         self.assertNotIn("111111", second_exclude)
 
+    def test_web_session_bridge_uses_csrf_cookie_when_api_body_empty(self):
+        """Live failure mode: /api/auth/csrf returns 200 with empty JSON body."""
+        page = mock.Mock()
+        page.url = "https://chatgpt.com/"
+        page.context.cookies.return_value = [
+            {
+                "name": "__Host-next-auth.csrf-token",
+                "value": "csrf-token-half|signature-half",
+                "domain": "chatgpt.com",
+                "path": "/",
+            }
+        ]
+        page.context.request = None
+        logs: list[str] = []
+
+        with (
+            mock.patch.object(
+                br,
+                "_browser_fetch",
+                return_value={"ok": True, "status": 200, "data": {}, "text": "{}"},
+            ),
+            mock.patch.object(br, "_wait_for_auth_page_settle"),
+            mock.patch.object(br, "_seed_browser_device_id"),
+            mock.patch.object(
+                br,
+                "_start_browser_signin",
+                return_value="https://auth.openai.com/api/accounts/authorize?client_id=x",
+            ) as signin,
+        ):
+            ok = br._browser_chatgpt_openai_signin_bridge(
+                page,
+                lambda message: logs.append(str(message)),
+                email="buyer@example.com",
+                device_id="device-demo",
+            )
+
+        self.assertTrue(ok)
+        signin.assert_called()
+        self.assertEqual(
+            signin.call_args.args[3],
+            "csrf-token-half",
+        )
+        self.assertTrue(any("csrf cookie" in item for item in logs))
+        page.goto.assert_any_call(
+            "https://auth.openai.com/api/accounts/authorize?client_id=x",
+            wait_until="domcontentloaded",
+            timeout=60000,
+        )
+
     def test_ensure_about_you_page_tolerates_ns_binding_aborted(self):
         page = mock.Mock()
         page.url = "https://auth.openai.com/email-verification"
