@@ -6,6 +6,13 @@
 
 ## [Unreleased] (未发布)
 
+## [2.8.47] - 2026-07-26
+
+### 修复 (Fixed)
+- **any-auto 日文 about_you 误判为生日模式**：JP 表单标签是 `氏名/年齢`，旧探测只认中文「年龄」、不认「年齢」，于是把年龄框当分段生日填写，最终 `400 続けるには有効な年齢を入力してください`。现强制 `input[name=age]` / `年齢` → age 模式，补齐姓名/年龄定位与 native 强制写入，age 模式必须写出数字年龄才允许提交。
+- **any-auto 密码页提交无响应（status=0）**：仅 click Continue 在 headless+代理下常不发业务请求。现对齐 staged 兜底：`click → 无业务请求则 form.requestSubmit → 仍无则 Enter`，观察窗延长到 35s，监听 `/api/accounts/user/register` 等业务请求。
+- 侧栏版本同步为 `v2.8.47`。
+
 ## [2.8.46] - 2026-07-26
 
 ### 优化 (Changed)
@@ -2908,3 +2915,7 @@
 ## 2026-07-26 04:06:04 +0800
 - v2.8.46: 注册运输层整段替换为 any-auto 三执行器 (protocol/headless/headed)
 - 发布模式: multi
+
+## 2026-07-26 04:25:09 +0800
+- v2.8.47: 修复 any-auto 日文年龄 about_you 与密码页 staged 提交
+- 发布模式: hot

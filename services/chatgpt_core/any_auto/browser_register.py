@@ -2870,24 +2870,88 @@ def _submit_password_via_page(page, password: str, log) -> dict:
     _browser_pause(page)
 
     start_url = str(page.url or "")
+    business_seen = {"n": 0}
+
+    def _on_request(req):
+        try:
+            url = str(getattr(req, "url", "") or "")
+        except Exception:
+            url = ""
+        if any(
+            token in url
+            for token in (
+                "/api/accounts/user/register",
+                "/api/accounts/password",
+                "/api/accounts/authorize",
+                "email-otp",
+                "email_otp",
+            )
+        ):
+            business_seen["n"] += 1
+
+    try:
+        page.on("request", _on_request)
+    except Exception:
+        pass
+
+    def _password_advanced(current_url: str, page_type: str) -> bool:
+        if page_type in {
+            "email_otp_verification",
+            "about_you",
+            "add_phone",
+            "oauth_callback",
+            "chatgpt_home",
+        }:
+            return True
+        if current_url != start_url and page_type and page_type not in {
+            "create_account_password",
+            "login_password",
+        }:
+            return True
+        return False
+
+    def _try_request_submit() -> bool:
+        try:
+            ok = page.evaluate(
+                """(sel) => {
+                    const el = document.querySelector(sel);
+                    if (!el) return false;
+                    const form = el.form || el.closest('form');
+                    if (!form) return false;
+                    if (typeof form.requestSubmit === 'function') {
+                      const btn = form.querySelector('button[type="submit"], input[type="submit"]');
+                      try { form.requestSubmit(btn || undefined); return true; } catch (e) {}
+                      try { form.requestSubmit(); return true; } catch (e) {}
+                    }
+                    try { form.submit(); return true; } catch (e) {}
+                    return false;
+                }""",
+                input_selector,
+            )
+            return bool(ok)
+        except Exception:
+            return False
+
     submit_selector = _click_first(page, PASSWORD_SUBMIT_SELECTORS, timeout=8)
     if submit_selector:
         log(f"密码页已点击继续按钮: {submit_selector}")
+    elif _try_request_submit():
+        log("密码页未找到可点击 Continue，已使用 form.requestSubmit")
     elif _submit_form_with_fallback(page, input_selector):
         log("密码页未找到可点击 Continue，已使用表单 fallback 提交")
     else:
         raise RuntimeError("密码页未找到 Continue 按钮")
 
-    deadline = time.time() + 20
+    deadline = time.time() + 35
     last_url = str(page.url or "")
+    did_request_submit = False
+    did_enter = False
     while time.time() < deadline:
         current_url = str(page.url or "")
         last_url = current_url or last_url
         state = _derive_registration_state_from_page(page)
         page_type = str(state.get("page_type") or "")
-        if page_type in {"email_otp_verification", "about_you", "add_phone", "oauth_callback", "chatgpt_home"}:
-            return {"ok": True, "status": 200, "url": current_url, "data": None, "text": ""}
-        if current_url != start_url and page_type and page_type not in {"create_account_password", "login_password"}:
+        if _password_advanced(current_url, page_type):
             return {"ok": True, "status": 200, "url": current_url, "data": None, "text": ""}
         if page_type == "login_password" and _recover_signup_password_page(page, log):
             input_selector = _wait_for_any_selector(page, PASSWORD_INPUT_SELECTORS, timeout=5)
@@ -2901,7 +2965,7 @@ def _submit_password_via_page(page, password: str, log) -> dict:
                 start_url = str(page.url or start_url)
                 time.sleep(0.4)
                 continue
-            if _submit_form_with_fallback(page, input_selector):
+            if _try_request_submit() or _submit_form_with_fallback(page, input_selector):
                 log("恢复后未找到密码提交按钮，已使用表单 fallback 提交")
                 start_url = str(page.url or start_url)
                 time.sleep(0.4)
@@ -2911,7 +2975,28 @@ def _submit_password_via_page(page, password: str, log) -> dict:
         if error_text:
             _dump_debug(page, "chatgpt_password_fail")
             return {"ok": False, "status": 400, "url": current_url, "data": None, "text": error_text}
+
+        elapsed = 35 - (deadline - time.time())
+        # Staged recovery: click may not fire SPA submit under headless/proxy lag.
+        if not did_request_submit and elapsed >= 8 and business_seen["n"] == 0:
+            if _try_request_submit():
+                log("密码页点击后无业务请求，已执行一次同表单 requestSubmit")
+            else:
+                log("密码页点击后无业务请求，requestSubmit 不可用")
+            did_request_submit = True
+        if not did_enter and elapsed >= 16 and business_seen["n"] == 0:
+            try:
+                page.locator(input_selector).first.focus()
+                page.keyboard.press("Enter")
+                log("密码页 requestSubmit 后仍无业务请求，已执行一次可信 Enter")
+            except Exception as exc:
+                log(f"密码页 Enter 兜底失败: {exc}")
+            did_enter = True
         time.sleep(0.5)
+    try:
+        page.remove_listener("request", _on_request)
+    except Exception:
+        pass
     _dump_debug(page, "chatgpt_password_fail")
     return {"ok": False, "status": 0, "url": last_url, "data": None, "text": "密码页提交后未跳转"}
 
@@ -3298,18 +3383,21 @@ def _submit_about_you_via_page(page, log) -> dict:
 
     name_candidates = [
         page.get_by_label(re.compile(r"full\s*name", re.IGNORECASE)),
-        page.get_by_label(re.compile(r"全名|姓名", re.IGNORECASE)),
+        page.get_by_label(re.compile(r"全名|姓名|氏名", re.IGNORECASE)),
         page.get_by_role("textbox", name=re.compile(r"full\s*name|name", re.IGNORECASE)),
-        page.get_by_role("textbox", name=re.compile(r"全名|姓名", re.IGNORECASE)),
+        page.get_by_role("textbox", name=re.compile(r"全名|姓名|氏名", re.IGNORECASE)),
         page.locator("input[autocomplete='name']"),
         page.locator("input[name*='name' i]"),
         page.locator("input[id*='name' i]"),
         page.locator("input[name*='姓名']"),
         page.locator("input[id*='姓名']"),
+        page.locator("input[placeholder*='氏名']"),
         page.locator(
             "xpath=//*[contains(translate(normalize-space(string(.)),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'full name')]/following::input[1]"
         ),
-        page.locator("xpath=//*[contains(normalize-space(string(.)),'全名') or contains(normalize-space(string(.)),'姓名')]/following::input[1]"),
+        page.locator(
+            "xpath=//*[contains(normalize-space(string(.)),'全名') or contains(normalize-space(string(.)),'姓名') or contains(normalize-space(string(.)),'氏名')]/following::input[1]"
+        ),
     ]
     birthday_candidates = [
         page.get_by_label(re.compile(r"birthday|date of birth|birth", re.IGNORECASE)),
@@ -3343,17 +3431,21 @@ def _submit_about_you_via_page(page, log) -> dict:
 
     age_candidates = [
         page.get_by_label(re.compile(r"age", re.IGNORECASE)),
-        page.get_by_label(re.compile(r"年龄", re.IGNORECASE)),
+        page.get_by_label(re.compile(r"年龄|年齢", re.IGNORECASE)),
         page.get_by_role("textbox", name=re.compile(r"age", re.IGNORECASE)),
-        page.get_by_role("textbox", name=re.compile(r"年龄", re.IGNORECASE)),
+        page.get_by_role("textbox", name=re.compile(r"年龄|年齢", re.IGNORECASE)),
+        page.locator("input[name='age']"),
         page.locator("input[name*='age' i]"),
         page.locator("input[id*='age' i]"),
         page.locator("input[placeholder*='Age' i]"),
         page.locator("input[placeholder*='年龄']"),
+        page.locator("input[placeholder*='年齢']"),
         page.locator(
             "xpath=//*[contains(translate(normalize-space(string(.)),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'age')]/following::input[1]"
         ),
-        page.locator("xpath=//*[contains(normalize-space(string(.)),'年龄')]/following::input[1]"),
+        page.locator(
+            "xpath=//*[contains(normalize-space(string(.)),'年龄') or contains(normalize-space(string(.)),'年齢')]/following::input[1]"
+        ),
     ]
 
     fill_result = {"name": False, "birthdate": False, "age": False, "month": False, "day": False, "year": False}
@@ -3379,29 +3471,53 @@ def _submit_about_you_via_page(page, log) -> dict:
                 .map((n) => String(n.textContent || '').trim().toLowerCase())
                 .filter(Boolean);
               const allText = labels.concat(placeholders).concat(headings);
-              const hasAge = allText.some((t) => t === 'age' || t === 'edad' || t === 'âge' || t === 'alter' || t === 'idade' || t.includes('how old') || t.includes('年龄') || t.includes('나이'));
-              const hasBirthday = allText.some((t) =>
-                t.includes('birthday') || t.includes('date of birth') || t.includes('birth') || t.includes('生日') || t.includes('出生') || t.includes('fecha de nacimiento') || t.includes('nascimento') || t.includes('geburtstag') || t.includes('naissance')
+              const hasAge = allText.some((t) =>
+                t === 'age' || t === 'edad' || t === 'âge' || t === 'alter' || t === 'idade' ||
+                t === 'umur' || t === 'usia' || t.includes('how old') ||
+                t.includes('年龄') || t.includes('年齢') || t.includes('나이')
               );
-              return { labels, placeholders, headings, hasAge, hasBirthday };
+              const hasAgeInput = Array.from(document.querySelectorAll('input')).some((n) => {
+                const name = String(n.getAttribute('name') || '').toLowerCase();
+                const id = String(n.id || '').toLowerCase();
+                const ph = String(n.placeholder || '').toLowerCase();
+                return name === 'age' || id.includes('age') || ph.includes('age') ||
+                  ph.includes('年龄') || ph.includes('年齢');
+              });
+              const hasBirthday = allText.some((t) =>
+                t.includes('birthday') || t.includes('date of birth') ||
+                t.includes('生年月日') || t.includes('生日') || t.includes('出生日期') ||
+                t.includes('fecha de nacimiento') || t.includes('nascimento') ||
+                t.includes('geburtstag') || t.includes('naissance') ||
+                (t.includes('birth') && !t.includes('年齢') && !(hasAge || hasAgeInput))
+              );
+              return { labels, placeholders, headings, hasAge: hasAge || hasAgeInput, hasBirthday, hasAgeInput };
             }
             """
         ) or {}
     except Exception:
         mode_probe = {}
 
-    has_age_label = bool(mode_probe.get("hasAge"))
+    has_age_label = bool(mode_probe.get("hasAge") or mode_probe.get("hasAgeInput"))
     has_birthday_label = bool(mode_probe.get("hasBirthday"))
-    has_age_field = any(_has_visible(candidate) for candidate in age_candidates[:3])
+    has_age_field = any(_has_visible(candidate) for candidate in age_candidates)
     has_birthday_field = any(_has_visible(candidate) for candidate in birthday_candidates[:3])
+    # Visible input map often exposes name=age even when label probe misses JP glyphs.
+    try:
+        has_named_age_input = page.locator('input[name="age"]:visible').count() > 0
+    except Exception:
+        has_named_age_input = False
+    label_blob = " ".join(str(x) for x in (mode_probe.get("labels") or []))
+    if "年齢" in label_blob or "年龄" in label_blob:
+        has_age_label = True
     has_birthday_select = False
     try:
         has_birthday_select = page.locator("select:visible").count() >= 2
     except Exception:
         has_birthday_select = False
-    if has_birthday_select:
+    if has_birthday_select and not (has_age_label or has_age_field or has_named_age_input):
         about_mode = "birthday_select"
-    elif (has_age_label and not has_birthday_label) or (has_age_field and not has_birthday_field):
+    elif has_age_label or has_age_field or has_named_age_input:
+        # JP 氏名/年齢 form must never fall into birthday segmented typing.
         about_mode = "age"
     else:
         about_mode = "birthday"
@@ -3412,6 +3528,7 @@ def _submit_about_you_via_page(page, log) -> dict:
             'input[name="full_name"]',
             'input[autocomplete="name"]',
             'input[placeholder*="全名"]',
+            'input[placeholder*="氏名"]',
             'input[placeholder*="name" i]',
             'input[id*="name" i]:not([type="hidden"])',
         ]
@@ -3422,6 +3539,7 @@ def _submit_about_you_via_page(page, log) -> dict:
             'input[placeholder="Age"]',
             'input[placeholder="age"]',
             'input[placeholder*="年龄"]',
+            'input[placeholder*="年齢"]',
             'input[id*="age" i]',
         ]
     )
@@ -3553,6 +3671,31 @@ def _submit_about_you_via_page(page, log) -> dict:
                 excluded_indices.add(int(name_entry.get("visibleIndex")))
             if _fill_second_visible_input([str(age_years)], excluded_visible_indices=excluded_indices):
                 fill_result["age"] = True
+        if not fill_result.get("age") and age_years is not None:
+            # Last resort: force native fill on OpenAI JP age field.
+            try:
+                forced = page.evaluate(
+                    """(age) => {
+                      const el = document.querySelector('input[name="age"]')
+                        || document.querySelector('input[placeholder*="年齢"]')
+                        || document.querySelector('input[placeholder*="年龄"]');
+                      if (!el) return false;
+                      el.focus();
+                      el.value = '';
+                      const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+                      if (setter) setter.call(el, String(age));
+                      else el.value = String(age);
+                      el.dispatchEvent(new Event('input', { bubbles: true }));
+                      el.dispatchEvent(new Event('change', { bubbles: true }));
+                      return String(el.value || '') === String(age);
+                    }""",
+                    str(age_years),
+                )
+                if forced:
+                    fill_result["age"] = True
+                    log(f"about_you age 强制写入成功: {age_years}")
+            except Exception as exc:
+                log(f"about_you age 强制写入失败: {exc}")
         if len(date_parts) == 3 and _sync_hidden_birthday_input(page, f"{yyyy}-{mm}-{dd}", log):
             fill_result["birthdate"] = True
     elif about_mode == "birthday" or about_mode == "birthday_text":
@@ -3586,7 +3729,11 @@ def _submit_about_you_via_page(page, log) -> dict:
     log(f"about_you 填写结果: {fill_result}")
     if not fill_result.get("name"):
         raise RuntimeError("about_you 未成功填写 Full name")
-    if not (
+    if about_mode == "age":
+        # JP 氏名/年齢 must fill numeric age; hidden birthday alone is not enough.
+        if not fill_result.get("age"):
+            raise RuntimeError("about_you 年龄模式未成功填写 Age/年齢")
+    elif not (
         fill_result.get("birthdate")
         or fill_result.get("age")
         or (fill_result.get("month") and fill_result.get("day") and fill_result.get("year"))
