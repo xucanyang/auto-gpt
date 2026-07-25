@@ -13,6 +13,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
+from core.task_runtime import SkipCurrentAttemptRequested, TaskInterruption
+
 
 @dataclass
 class AnyAutoRegistrationResult:
@@ -36,7 +38,12 @@ class AnyAutoRegistrationResult:
 
     @property
     def ok(self) -> bool:
-        return bool(self.success and str(self.access_token or "").strip())
+        return bool(
+            self.success
+            and str(self.access_token or "").strip()
+            and str(self.session_token or "").strip()
+            and str(self.cookie_header or self.cookies or "").strip()
+        )
 
 
 class _AnyAutoEmailService:
@@ -161,9 +168,22 @@ def _normalize_result(
     else:
         data = {}
 
-    access_token = str(data.get("access_token") or "").strip()
-    session_token = str(data.get("session_token") or "").strip()
-    cookies_raw = data.get("cookies") or data.get("cookie_header") or ""
+    metadata = dict(data.get("metadata") or {})
+    access_token = str(data.get("access_token") or metadata.get("access_token") or "").strip()
+    session_token = str(
+        data.get("session_token")
+        or data.get("sessionToken")
+        or metadata.get("session_token")
+        or metadata.get("sessionToken")
+        or ""
+    ).strip()
+    cookies_raw = (
+        data.get("cookies")
+        or data.get("cookie_header")
+        or metadata.get("cookies")
+        or metadata.get("cookie_header")
+        or ""
+    )
     cookie_header = _cookies_to_header(cookies_raw)
     if session_token and "session-token" not in cookie_header:
         # ensure session_token is representable even when cookie map missing
@@ -173,14 +193,18 @@ def _normalize_result(
             cookie_header = f"__Secure-next-auth.session-token={session_token}"
 
     success_flag = bool(data.get("success", True if access_token else False))
-    if not access_token:
+    if not access_token or not session_token or not cookie_header:
         success_flag = False
 
     err = str(
         error
         or data.get("error_message")
         or data.get("error")
-        or ("" if success_flag else "any-auto registration failed: missing access_token")
+        or (
+            ""
+            if success_flag
+            else "any-auto registration failed: incomplete ChatGPT Web Session material"
+        )
     ).strip()
 
     return AnyAutoRegistrationResult(
@@ -199,7 +223,7 @@ def _normalize_result(
         source=str(data.get("source") or "any_auto"),
         transport=transport,
         executor=executor,
-        metadata=dict(data.get("metadata") or {}),
+        metadata=metadata,
         raw=data if isinstance(data, dict) else {},
     )
 
@@ -228,6 +252,9 @@ def run_any_auto_protocol_registration(
         email_service=email_service,
         proxy_url=proxy_url,
         callback_logger=log_fn,
+        # RT capture is owned by the mode adapter's second stage. The shared
+        # transport stops after GPT signup + ChatGPT Web Session capture.
+        capture_codex_oauth=False,
     )
     if prefer_password and password:
         # Prefer the task-assigned password instead of regenerating 3 candidates.
@@ -236,6 +263,8 @@ def run_any_auto_protocol_registration(
     engine.email = email
     try:
         raw = engine.run()
+    except (TaskInterruption, SkipCurrentAttemptRequested):
+        raise
     except Exception as exc:
         return _normalize_result(
             email=email,
@@ -263,6 +292,9 @@ def run_any_auto_browser_registration(
     otp_callback: Callable[[], str],
     log_fn: Callable[[str], None] = print,
     phone_callback: Optional[Callable[[], str]] = None,
+    profile_name: str = "",
+    profile_birthdate: str = "",
+    stop_check: Optional[Callable[[], None]] = None,
 ) -> AnyAutoRegistrationResult:
     """headless/headed executor: any-auto ChatGPTBrowserRegister."""
     from .browser_register import ChatGPTBrowserRegister
@@ -273,10 +305,15 @@ def run_any_auto_browser_registration(
         proxy=proxy_url,
         otp_callback=otp_callback,
         phone_callback=phone_callback,
+        profile_name=profile_name,
+        profile_birthdate=profile_birthdate,
+        stop_check=stop_check,
         log_fn=log_fn,
     )
     try:
         raw = worker.run(email=email, password=password)
+    except (TaskInterruption, SkipCurrentAttemptRequested):
+        raise
     except Exception as exc:
         return _normalize_result(
             email=email,

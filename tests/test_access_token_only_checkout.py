@@ -15,6 +15,11 @@ class AccessTokenOnlyCheckoutTests(unittest.TestCase):
 
     @staticmethod
     def _any_auto_ok(**kwargs):
+        session_token = str(kwargs.get("session_token") or "session-demo")
+        cookies = str(
+            kwargs.get("cookies")
+            or f"oai-did=device; __Secure-next-auth.session-token={session_token}"
+        )
         return AnyAutoRegistrationResult(
             success=True,
             email=str(kwargs.get("email") or "buyer@example.com"),
@@ -22,11 +27,11 @@ class AccessTokenOnlyCheckoutTests(unittest.TestCase):
             access_token=str(kwargs.get("access_token") or "at-demo"),
             refresh_token=str(kwargs.get("refresh_token") or ""),
             id_token=str(kwargs.get("id_token") or ""),
-            session_token=str(kwargs.get("session_token") or "session-demo"),
+            session_token=session_token,
             account_id=str(kwargs.get("account_id") or "acct-demo"),
             workspace_id=str(kwargs.get("workspace_id") or "ws-demo"),
-            cookies=str(kwargs.get("cookies") or ""),
-            cookie_header=str(kwargs.get("cookie_header") or kwargs.get("cookies") or ""),
+            cookies=cookies,
+            cookie_header=str(kwargs.get("cookie_header") or cookies),
             transport=str(kwargs.get("transport") or "any_auto_browser"),
             executor=str(kwargs.get("executor") or "headless"),
             source=str(kwargs.get("source") or "any_auto"),

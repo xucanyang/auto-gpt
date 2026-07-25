@@ -42,6 +42,45 @@ from .constants import (
 logger = logging.getLogger(__name__)
 
 
+class _SkipCodexOAuth(RuntimeError):
+    """Internal control flow for the GPT-only registration contract."""
+
+
+def _cookie_header_from_session(session: Any) -> str:
+    """Serialize a curl_cffi cookie jar without losing its name/value pairs."""
+    jar = getattr(session, "cookies", None)
+    if jar is None:
+        return ""
+
+    pairs: list[tuple[Any, Any]] = []
+    try:
+        pairs = list(jar.items())
+    except Exception:
+        try:
+            values = jar.get_dict()
+            if isinstance(values, dict):
+                pairs = list(values.items())
+        except Exception:
+            pairs = []
+
+    if not pairs:
+        # Compatibility with stdlib CookieJar implementations.
+        try:
+            for cookie in jar:
+                name = getattr(cookie, "name", "")
+                value = getattr(cookie, "value", "")
+                if name:
+                    pairs.append((name, value))
+        except Exception:
+            pairs = []
+
+    return "; ".join(
+        f"{str(name).strip()}={str(value)}"
+        for name, value in pairs
+        if str(name or "").strip()
+    )
+
+
 @dataclass
 class RegistrationResult:
     """注册结果"""
@@ -228,7 +267,8 @@ class RegistrationEngine:
         email_service: Any,
         proxy_url: Optional[str] = None,
         callback_logger: Optional[Callable[[str], None]] = None,
-        task_uuid: Optional[str] = None
+        task_uuid: Optional[str] = None,
+        capture_codex_oauth: bool = False,
     ):
         """
         初始化注册引擎
@@ -243,6 +283,9 @@ class RegistrationEngine:
         self.proxy_url = proxy_url
         self.callback_logger = callback_logger or (lambda msg: logger.info(msg))
         self.task_uuid = task_uuid
+        # GPT signup and ChatGPT Web Session capture are the shared transport
+        # contract. RT/Codex capture belongs to the mode-owned second stage.
+        self.capture_codex_oauth = bool(capture_codex_oauth)
 
         # 创建 HTTP 客户端
         self.http_client = OpenAIHTTPClient(proxy_url=proxy_url)
@@ -1410,6 +1453,7 @@ class RegistrationEngine:
             session_data = session_resp.json()
             access_token = session_data.get("accessToken", "")
             user_data = session_data.get("user", {})
+            session_token = session_data.get("sessionToken") or session_token or ""
             self._log(f"session keys: {list(session_data.keys())}")
             self._log(f"accessToken 长度: {len(access_token)}")
 
@@ -1422,6 +1466,8 @@ class RegistrationEngine:
             # 15. Codex CLI OTP 登录获取 refresh_token + id_token
             codex_token_info = None
             try:
+                if not self.capture_codex_oauth:
+                    raise _SkipCodexOAuth()
                 self._log("15. Codex CLI OTP 登录...")
                 from .constants import (
                     CODEX_CLIENT_ID, CODEX_REDIRECT_URI, CODEX_SCOPE,
@@ -1567,19 +1613,25 @@ class RegistrationEngine:
                         self._log(f"Codex callback 未获取 (status={resp.status_code})", "warning")
                 else:
                     self._log(f"Codex 非 OTP 流程 ({page_type})，跳过", "warning")
+            except _SkipCodexOAuth:
+                self._log("15. GPT 注册模式跳过 Codex OAuth/RT 捕获")
             except Exception as e:
                 self._log(f"Codex CLI 登录失败: {e}", "warning")
 
             # 提取账户信息（优先 Codex token，fallback 到 NextAuth session）
             if codex_token_info and codex_token_info.get("access_token"):
                 self._log("使用 Codex CLI token（完整 refresh_token + id_token）")
-                result.account_id = codex_token_info.get("account_id", "") or account_cookie or ""
+                result.account_id = (
+                    codex_token_info.get("account_id", "")
+                    or account_cookie
+                    or str((user_data or {}).get("id") or "")
+                )
                 result.access_token = codex_token_info.get("access_token", "")
                 result.refresh_token = codex_token_info.get("refresh_token", "")
                 result.id_token = codex_token_info.get("id_token", "")
             else:
                 self._log("使用 NextAuth session token", "warning")
-                result.account_id = account_cookie or ""
+                result.account_id = account_cookie or str((user_data or {}).get("id") or "")
                 result.access_token = access_token
                 result.refresh_token = ""
                 # access_token JWT 包含 chatgpt_account_id 等同于 id_token 的 claims
@@ -1605,11 +1657,15 @@ class RegistrationEngine:
             self._log("=" * 60)
 
             result.success = True
+            cookie_header = _cookie_header_from_session(self.session)
             result.metadata = {
                 "email_service": self.email_service.service_type.value,
                 "proxy_used": self.proxy_url,
                 "registered_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                 "is_existing_account": self._is_existing_account,
+                "registration_session_capture": "chatgpt_api_auth_session",
+                "cookies": cookie_header,
+                "cookie_header": cookie_header,
             }
 
             return result

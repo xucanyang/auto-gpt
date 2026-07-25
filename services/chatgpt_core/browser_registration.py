@@ -3134,6 +3134,7 @@ def _wait_for_web_session(
     log=None,
     email: str = "",
     device_id: str = "",
+    stop_check: Callable[[], None] | None = None,
 ) -> dict:
     """Read ChatGPT web session; bridge OpenAI cookies via next-auth when needed."""
     logger = log or (lambda _message: None)
@@ -3168,6 +3169,8 @@ def _wait_for_web_session(
         _wait_for_auth_page_settle(page, timeout=10.0, log=logger)
 
     while time.time() < deadline:
+        if callable(stop_check):
+            stop_check()
         attempt += 1
         try:
             current_url = str(page.url or "")
@@ -3204,6 +3207,8 @@ def _wait_for_web_session(
             if (not bridge_attempted) and (
                 (attempt >= 1 and unauthenticated) or attempt >= 2 or elapsed >= 6
             ):
+                if callable(stop_check):
+                    stop_check()
                 bridge_attempted = True
                 bridged = _browser_chatgpt_openai_signin_bridge(
                     page,
@@ -3237,6 +3242,8 @@ def _wait_for_web_session(
                 and unauthenticated
                 and attempt >= 3
             ):
+                if callable(stop_check):
+                    stop_check()
                 bridge_retried = True
                 logger("Web Session: 首次桥接后仍无 AT，重试 next-auth 桥接")
                 bridged = _browser_chatgpt_openai_signin_bridge(
@@ -3259,6 +3266,8 @@ def _wait_for_web_session(
 
     # Final salvage fetch — covers the case where bridge printed a hit after
     # the loop condition already failed.
+    if callable(stop_check):
+        stop_check()
     try:
         last = _fetch_chatgpt_session_payload(page)
         last_data = last.get("data") if isinstance(last.get("data"), dict) else {}

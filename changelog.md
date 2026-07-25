@@ -6,6 +6,21 @@
 
 ## [Unreleased] (未发布)
 
+## [2.8.48] - 2026-07-26
+
+### 优化 (Changed)
+- **拆分 any-auto GPT 注册与 RT 捕获职责**：`services/chatgpt_core/any_auto/browser_register.py` 的 Camoufox 运输层现在只负责邮箱入口、密码、注册 OTP、`about_you`、开户提交，以及同一浏览器上下文访问绝对地址 `https://chatgpt.com/api/auth/session` 获取 Web Session；不再在注册完成后启动独立 Codex OAuth、二次 OAuth OTP 或 `add_phone` 流程。`oauth_callback` 仅作为 OpenAI 注册完成后的内部 redirect 状态保留。
+- **保留有 RT 模式的独立第二阶段**：`chatgpt_registration_mode_adapter.py` 继续由 refresh-token 模式单独执行完整 Auth/RT 捕获；无 RT 模式在拿到 `access_token`、`session_token` 和 cookie 后直接完成账号保存，RT 阶段失败不会重放已经提交的 signup。
+- **Web Session 材料完整性与停止传播**：any-auto 结果必须同时包含 `access_token`、`session_token` 和 cookie header；浏览器注册将外层用户资料、停止检查透传到状态机与 Session 等待，手动停止不会被普通异常吞掉。协议 cookie 序列化兼容 curl_cffi `items()/get_dict()` 容器，保留完整 cookie header。
+
+### 修复 (Fixed)
+- **修复注册后错误消耗第二个 OTP 预算**：移除浏览器注册运输层中的 `_retry_oauth_fresh_browser` 自动调用，避免第一个账号在共享注册 OTP 预算耗尽、第二个账号继续进入 OAuth 邮箱页超时的连锁失败。
+- **修复 Web Session 结果丢失上下文元数据**：access-token 注册引擎现在保留 any-auto 的 Session 捕获 metadata、cookie header 和页面信息，便于账号库存与后续 RT 第二阶段复用同一 Web 会话材料。
+
+### 测试 (Tests)
+- 更新 `tests/test_access_token_only_checkout.py` 成功夹具，明确要求完整 Web Session cookie；新增 `tests/test_any_auto_web_session_contract.py`，覆盖绝对 Session API、同上下文 cookie 重读、禁止 Codex OAuth、协议停止传播、完整性门槛及 curl_cffi cookie 序列化。
+- 相关注册回归通过：`76 passed`（当前 checkout 未安装 Camoufox 的浏览器集成测试跳过）；全套 `pytest` 仍受环境缺少 `argon2` 的既有依赖阻断。
+
 ## [2.8.47] - 2026-07-26
 
 ### 修复 (Fixed)
@@ -2919,3 +2934,7 @@
 ## 2026-07-26 04:25:09 +0800
 - v2.8.47: 修复 any-auto 日文年龄 about_you 与密码页 staged 提交
 - 发布模式: hot
+
+## 2026-07-26 06:20:53 +0800
+- v2.8.48: 分离 any-auto GPT signup 与 Web Session/RT 捕获
+- 发布模式: multi

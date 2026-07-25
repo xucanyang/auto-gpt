@@ -707,6 +707,9 @@ class AccessTokenOnlyRegistrationEngine:
                 headless=self.browser_mode != "headed",
                 otp_callback=_otp_plain,
                 log_fn=_transport_log,
+                profile_name=profile_name,
+                profile_birthdate=profile_birthdate,
+                stop_check=getattr(chatgpt_client, "_check_stop", None),
             )
         else:
             self._log(
@@ -1442,13 +1445,12 @@ class AccessTokenOnlyRegistrationEngine:
                             or any_auto_result.cookies,
                             "user_id": any_auto_result.account_id,
                             "source": any_auto_result.source,
+                            "metadata": dict(any_auto_result.metadata or {}),
                         }
                         if any_auto_result.password:
                             pwd = any_auto_result.password
                             self.password = pwd
-                        session_ok = bool(
-                            str(session_result.get("access_token") or "").strip()
-                        )
+                        session_ok = bool(any_auto_result.ok)
 
                     if not existing_account_capture:
                         if not success:
@@ -1656,7 +1658,14 @@ class AccessTokenOnlyRegistrationEngine:
                         )
                         result.workspace_id = session_result.get("workspace_id", "")
                         checkout_metadata = self._probe_plus_checkout_billing(session_result, email_addr)
+                        transport_metadata = session_result.get("metadata")
+                        transport_metadata = (
+                            dict(transport_metadata)
+                            if isinstance(transport_metadata, dict)
+                            else {}
+                        )
                         result.metadata = {
+                            **transport_metadata,
                             "auth_provider": session_result.get("auth_provider", ""),
                             "expires": session_result.get("expires", ""),
                             "user_id": session_result.get("user_id", ""),

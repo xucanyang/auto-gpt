@@ -1964,7 +1964,10 @@ def _wait_for_access_token(page, timeout: int = 60) -> str:
         try:
             r = page.evaluate("""
             async () => {
-                const r = await fetch('/api/auth/session');
+                const r = await fetch('https://chatgpt.com/api/auth/session', {
+                    credentials: 'include',
+                    headers: { 'accept': 'application/json' },
+                });
                 const j = await r.json();
                 return j.accessToken || '';
             }
@@ -3130,12 +3133,18 @@ def _submit_otp_via_page(page, code: str, log) -> dict:
     return {"ok": False, "status": 0, "url": last_url, "data": None, "text": "验证码页提交后未跳转"}
 
 
-def _submit_about_you_via_page(page, log) -> dict:
+def _submit_about_you_via_page(
+    page,
+    log,
+    *,
+    profile_name: str = "",
+    profile_birthdate: str = "",
+) -> dict:
     from .constants import generate_random_user_info
 
     user_info = generate_random_user_info()
-    name = str(user_info.get("name") or "").strip()
-    birthdate = str(user_info.get("birthdate") or "").strip()
+    name = str(profile_name or user_info.get("name") or "").strip()
+    birthdate = str(profile_birthdate or user_info.get("birthdate") or "").strip()
     if not name or not birthdate:
         raise RuntimeError("about_you 数据生成失败")
     date_parts = birthdate.split("-")
@@ -3848,7 +3857,18 @@ def _submit_about_you_via_page(page, log) -> dict:
     return {"ok": False, "status": 0, "url": last_url, "data": None, "text": "about_you 提交后未跳转"}
 
 
-def _browser_registration_flow(page, email: str, password: str, otp_callback, phone_callback, log) -> dict:
+def _browser_registration_flow(
+    page,
+    email: str,
+    password: str,
+    otp_callback,
+    phone_callback,
+    log,
+    *,
+    profile_name: str = "",
+    profile_birthdate: str = "",
+    stop_check: Callable[[], None] | None = None,
+) -> dict:
     device_id = str(uuid.uuid4())
     try:
         user_agent = str(page.evaluate("() => navigator.userAgent") or "").strip() or _random_chrome_ua()
@@ -3872,6 +3892,8 @@ def _browser_registration_flow(page, email: str, password: str, otp_callback, ph
     seen_states: dict[str, int] = {}
 
     for step in range(12):
+        if callable(stop_check):
+            stop_check()
         signature = "|".join(
             [
                 str(state.get("page_type") or ""),
@@ -3951,7 +3973,12 @@ def _browser_registration_flow(page, email: str, password: str, otp_callback, ph
             if "about-you" not in str(page.url):
                 log(f"跳转到 about_you 页面: {target_url[:120]}")
                 page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
-            about_resp = _submit_about_you_via_page(page, log)
+            about_resp = _submit_about_you_via_page(
+                page,
+                log,
+                profile_name=profile_name,
+                profile_birthdate=profile_birthdate,
+            )
             log(f"about_you 提交状态: {about_resp.get('status', 0)}")
             if not about_resp.get("ok"):
                 raise RuntimeError(f"about_you 提交失败: {(about_resp.get('text') or '')[:300]}")
@@ -4007,23 +4034,28 @@ class ChatGPTBrowserRegister:
         proxy: Optional[str] = None,
         otp_callback: Optional[Callable[[], str]] = None,
         phone_callback: Optional[Callable[[], str]] = None,
+        profile_name: str = "",
+        profile_birthdate: str = "",
+        stop_check: Optional[Callable[[], None]] = None,
         log_fn: Callable[[str], None] = print,
     ):
         self.headless = headless
         self.proxy = proxy
         self.otp_callback = otp_callback
         self.phone_callback = phone_callback
+        self.profile_name = str(profile_name or "").strip()
+        self.profile_birthdate = str(profile_birthdate or "").strip()
+        self.stop_check = stop_check
         self.log = log_fn
 
     def run(self, email: str, password: str) -> dict:
-        """any-auto browser signup + auto-gpt inventory contract.
+        """Complete GPT signup and capture the ChatGPT Web session in one context.
 
-        1) Whole Camoufox signup state machine (email -> OTP -> about_you)
-        2) Prefer same-context ChatGPT Web session accessToken (registration success)
-        3) Optional fresh-browser Codex OAuth for refresh_token upgrade / AT fallback
+        The browser transport owns only the OpenAI signup and the subsequent
+        ``chatgpt.com/api/auth/session`` capture. Refresh-token/Codex OAuth is a
+        separate mode-owned stage and must not run here.
         """
         launch_opts = _camoufox_launch_opts(headless=self.headless, proxy=self.proxy)
-        web_result = None
 
         with Camoufox(**launch_opts) as browser:
             page = browser.new_page()
@@ -4035,74 +4067,89 @@ class ChatGPTBrowserRegister:
                 self.otp_callback,
                 self.phone_callback,
                 self.log,
+                profile_name=self.profile_name,
+                profile_birthdate=self.profile_birthdate,
+                stop_check=self.stop_check,
             )
             self.log(f"注册流程完成: page={final_state.get('page_type') or '-'}")
 
-            cookies_dict = _get_cookies(page)
-            session_token = str(
-                cookies_dict.get("__Secure-next-auth.session-token")
-                or cookies_dict.get("__Secure-next-auth.session-token.0")
+            # The signup callback may still be on platform.openai.com. Reuse
+            # the project-owned bridge to establish ChatGPT next-auth, then
+            # read the absolute /api/auth/session endpoint in this context.
+            from services.chatgpt_core.browser_registration import (
+                _normalize_browser_web_session,
+                _wait_for_web_session,
+            )
+
+            cookie_items = list(page.context.cookies() or [])
+            device_id = next(
+                (
+                    str(item.get("value") or "").strip()
+                    for item in cookie_items
+                    if str(item.get("name") or "").strip() == "oai-did"
+                ),
+                "",
+            )
+            self.log("开始抓取 ChatGPT Web Session: https://chatgpt.com/api/auth/session")
+            session_data = _wait_for_web_session(
+                page,
+                timeout=55,
+                log=self.log,
+                email=email,
+                device_id=device_id,
+                stop_check=self.stop_check,
+            )
+            cookie_items = list(page.context.cookies() or [])
+            web_session = _normalize_browser_web_session(session_data, cookie_items)
+            access_token = str(web_session.get("access_token") or "").strip()
+            session_token = str(web_session.get("session_token") or "").strip()
+            cookie_header = str(
+                web_session.get("cookie_header") or web_session.get("cookies") or ""
+            ).strip()
+            account_id = str(
+                web_session.get("account_id")
+                or next(
+                    (
+                        str(item.get("value") or "").strip()
+                        for item in cookie_items
+                        if str(item.get("name") or "").strip() == "_account"
+                    ),
+                    "",
+                )
+                or (final_state or {}).get("account_id")
                 or ""
             ).strip()
-            access_token = ""
-            try:
-                access_token = str(_wait_for_access_token(page, timeout=60) or "").strip()
-            except Exception as exc:
-                self.log(f"同上下文读取 Web AT 异常: {exc}")
-            if access_token:
-                self.log("同上下文 Web Session accessToken 已获取，按注册成功合同返回")
-                web_result = {
-                    "email": email,
-                    "password": password,
-                    "account_id": str(
-                        (final_state or {}).get("account_id")
-                        or cookies_dict.get("_account")
-                        or ""
-                    ),
-                    "access_token": access_token,
-                    "refresh_token": "",
-                    "id_token": "",
-                    "session_token": session_token,
-                    "workspace_id": "",
-                    "cookies": cookies_dict,
-                    "profile": {},
-                    "source": "any_auto_browser_web_session",
-                }
-
-        # Optional Codex OAuth: upgrade RT when web AT already present; else fallback.
-        codex_result = None
-        try:
-            self.log("尝试全新浏览器 Codex OAuth（可选，用于 refresh_token / AT 兜底）...")
-            codex_result = self._retry_oauth_fresh_browser(email, password)
-        except Exception as exc:
-            self.log(f"Codex OAuth 可选阶段失败: {exc}")
-            codex_result = None
-
-        if codex_result and str(codex_result.get("access_token") or "").strip():
-            self.log(f"Codex OAuth 成功: account_id={codex_result.get('account_id','')}")
-            merged = {
+            if not access_token or not session_token or not cookie_header:
+                raise RuntimeError(
+                    "ChatGPT Web Session 材料不完整: "
+                    f"access_token={'yes' if access_token else 'no'} "
+                    f"session_token={'yes' if session_token else 'no'} "
+                    f"cookies={'yes' if cookie_header else 'no'}"
+                )
+            self.log(
+                "ChatGPT Web Session 获取成功: "
+                f"access_token=yes session_token=yes cookies=yes account_id={account_id or '-'}"
+            )
+            return {
+                "success": True,
                 "email": email,
                 "password": password,
-                "account_id": codex_result.get("account_id", "") or (web_result or {}).get("account_id", ""),
-                "access_token": codex_result.get("access_token", ""),
-                "refresh_token": codex_result.get("refresh_token", ""),
-                "id_token": codex_result.get("id_token", ""),
-                "session_token": (web_result or {}).get("session_token", "") or codex_result.get("session_token", ""),
-                "workspace_id": codex_result.get("workspace_id", "") or (web_result or {}).get("workspace_id", ""),
-                "cookies": (web_result or {}).get("cookies") or codex_result.get("cookies") or "",
-                "profile": {},
-                "source": "any_auto_browser_codex_oauth",
+                "account_id": account_id,
+                "access_token": access_token,
+                "refresh_token": "",
+                "id_token": access_token,
+                "session_token": session_token,
+                "workspace_id": str(web_session.get("workspace_id") or account_id),
+                "cookies": cookie_items,
+                "cookie_header": cookie_header,
+                "metadata": {
+                    "registration_stage_complete": True,
+                    "registration_session_capture": "chatgpt_api_auth_session",
+                    "registration_page_type": str(final_state.get("page_type") or ""),
+                    "registration_page_url": str(page.url or ""),
+                },
+                "source": "any_auto_browser_web_session",
             }
-            return merged
-
-        if web_result and str(web_result.get("access_token") or "").strip():
-            self.log("Codex OAuth 未拿到完整 token，使用同上下文 Web Session 结果完成注册")
-            return web_result
-
-        raise RuntimeError(
-            "ChatGPT 浏览器注册未拿到 access_token"
-            "（同上下文 Web Session 与 Codex OAuth 均失败）"
-        )
 
     def _retry_oauth_fresh_browser(self, email, password):
         """在全新浏览器 context 里做 Codex OAuth（绕过 add_phone session）。"""
