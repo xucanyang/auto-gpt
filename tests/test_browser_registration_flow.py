@@ -1587,15 +1587,24 @@ class BrowserRegistrationFlowTests(unittest.TestCase):
                 "_start_browser_signin",
                 return_value="https://auth.openai.com/api/accounts/authorize?client_id=x",
             ) as signin,
+            mock.patch.object(
+                br,
+                "_fetch_chatgpt_session_payload",
+                return_value={
+                    "status": 200,
+                    "data": {"accessToken": "at-from-bridge", "user": {"email": "buyer@example.com"}},
+                },
+            ),
         ):
-            ok = br._browser_chatgpt_openai_signin_bridge(
+            session = br._browser_chatgpt_openai_signin_bridge(
                 page,
                 lambda message: logs.append(str(message)),
                 email="buyer@example.com",
                 device_id="device-demo",
             )
 
-        self.assertTrue(ok)
+        self.assertIsInstance(session, dict)
+        self.assertEqual(session.get("accessToken"), "at-from-bridge")
         signin.assert_called()
         self.assertEqual(
             signin.call_args.args[3],
@@ -1605,7 +1614,7 @@ class BrowserRegistrationFlowTests(unittest.TestCase):
         page.goto.assert_any_call(
             "https://auth.openai.com/api/accounts/authorize?client_id=x",
             wait_until="domcontentloaded",
-            timeout=45000,
+            timeout=35000,
         )
 
     def test_ensure_about_you_page_tolerates_ns_binding_aborted(self):

@@ -3014,21 +3014,26 @@ def _fetch_chatgpt_session_payload(page) -> dict:
     return result if isinstance(result, dict) else {}
 
 
-def _browser_chatgpt_openai_signin_bridge(page, log, *, email: str = "", device_id: str = "") -> bool:
+def _browser_chatgpt_openai_signin_bridge(
+    page, log, *, email: str = "", device_id: str = ""
+) -> dict | None:
     """Use next-auth signin/openai so OpenAI auth cookies mint a ChatGPT session.
 
     Prefer the same ``_browser_fetch`` / cookie-jar helpers used by the signup
     authorize entry. The previous page-world fetch often returned HTTP 200 with
     an empty body (``missing csrfToken``) after platform callback.
+
+    Returns session JSON when accessToken is already available after the bridge
+    (so the outer waiter must not discard a late hit after its deadline).
     """
     email = str(email or "").strip()
     device_id = str(device_id or "").strip()
     log("Web Session 桥接: ChatGPT next-auth signin/openai")
     try:
-        page.goto(f"{CHATGPT_APP}/", wait_until="domcontentloaded", timeout=45000)
+        page.goto(f"{CHATGPT_APP}/", wait_until="domcontentloaded", timeout=30000)
     except Exception as exc:
         log(f"Web Session 桥接首页导航异常: {exc}")
-    _wait_for_auth_page_settle(page, timeout=8.0, log=log)
+    _wait_for_auth_page_settle(page, timeout=5.0, log=log)
 
     # Seed device id cookies on chatgpt domain before CSRF/signin.
     if device_id:
@@ -3041,14 +3046,14 @@ def _browser_chatgpt_openai_signin_bridge(page, log, *, email: str = "", device_
     if not csrf_token:
         # Hard reload once — next-auth often sets csrf cookie only after a full document load.
         try:
-            page.reload(wait_until="domcontentloaded", timeout=45000)
+            page.reload(wait_until="domcontentloaded", timeout=30000)
         except Exception as exc:
             log(f"Web Session 桥接 reload 异常: {exc}")
-        _wait_for_auth_page_settle(page, timeout=8.0, log=log)
+        _wait_for_auth_page_settle(page, timeout=5.0, log=log)
         csrf_token = _get_browser_csrf_token(page, log=log)
     if not csrf_token:
         log("Web Session 桥接失败: 无法获取 csrfToken")
-        return False
+        return None
 
     authorize_url = _start_browser_signin(
         page,
@@ -3070,41 +3075,41 @@ def _browser_chatgpt_openai_signin_bridge(page, log, *, email: str = "", device_
         )
     if not authorize_url:
         log("Web Session 桥接 signin 未返回 authorize URL")
-        return False
+        return None
 
     log(f"Web Session 桥接 authorize: {authorize_url[:120]}")
     try:
-        page.goto(authorize_url, wait_until="domcontentloaded", timeout=45000)
+        page.goto(authorize_url, wait_until="domcontentloaded", timeout=35000)
     except Exception as exc:
         # Callback 落地时 localhost / 中断导航常见，随后再看最终 URL
         log(f"Web Session 桥接 authorize 导航异常（可继续）: {exc}")
-    _wait_for_auth_page_settle(page, timeout=10.0, log=log)
+    _wait_for_auth_page_settle(page, timeout=6.0, log=log)
     log(f"Web Session 桥接 authorize 落地 url={(str(page.url or '')[:140])}")
 
     # 若停在 auth 中页，再推一次 ChatGPT 首页
     current = str(page.url or "")
     if "chatgpt.com" not in current:
         try:
-            page.goto(f"{CHATGPT_APP}/", wait_until="domcontentloaded", timeout=45000)
+            page.goto(f"{CHATGPT_APP}/", wait_until="domcontentloaded", timeout=30000)
         except Exception as exc:
             log(f"Web Session 桥接回 ChatGPT 首页异常: {exc}")
-        _wait_for_auth_page_settle(page, timeout=8.0, log=log)
+        _wait_for_auth_page_settle(page, timeout=5.0, log=log)
         log(f"Web Session 桥接回 ChatGPT 后 url={(str(page.url or '')[:140])}")
 
-    # Immediate session probe so the outer waiter does not sit silent.
+    # Immediate session probe — return token to caller so late hits are not dropped.
     try:
         probe = _fetch_chatgpt_session_payload(page)
         data = probe.get("data") if isinstance(probe.get("data"), dict) else {}
         if str(data.get("accessToken") or "").strip():
             log("Web Session 桥接后立即命中 accessToken")
-        else:
-            log(
-                "Web Session 桥接后仍无 AT "
-                f"status={probe.get('status')} keys={sorted(list(data.keys()))[:8]}"
-            )
+            return dict(data)
+        log(
+            "Web Session 桥接后仍无 AT "
+            f"status={probe.get('status')} keys={sorted(list(data.keys()))[:8]}"
+        )
     except Exception as exc:
         log(f"Web Session 桥接后探测失败: {exc}")
-    return True
+    return {}
 def _wait_for_web_session(
     page,
     timeout: int = 30,
@@ -3179,15 +3184,30 @@ def _wait_for_web_session(
                 or (not data.get("user") and not data.get("account") and not data.get("accessToken"))
             )
             elapsed = max(int(timeout or 0), 1) - max(int(deadline - time.time()), 0)
-            if (not bridge_attempted) and (attempt >= 1 and unauthenticated or attempt >= 2 or elapsed >= 6):
+            if (not bridge_attempted) and (
+                (attempt >= 1 and unauthenticated) or attempt >= 2 or elapsed >= 6
+            ):
                 bridge_attempted = True
-                _browser_chatgpt_openai_signin_bridge(
+                bridged = _browser_chatgpt_openai_signin_bridge(
                     page,
                     logger,
                     email=email,
                     device_id=device_id,
                 )
                 home_navigated = True
+                # Bridge may finish after the outer deadline; never drop a hit.
+                if isinstance(bridged, dict) and str(bridged.get("accessToken") or "").strip():
+                    logger("Web Session: 桥接返回 accessToken，立即结束等待")
+                    return dict(bridged)
+                # One immediate re-fetch even if deadline already passed.
+                try:
+                    post = _fetch_chatgpt_session_payload(page)
+                    post_data = post.get("data") if isinstance(post.get("data"), dict) else {}
+                    if str(post_data.get("accessToken") or "").strip():
+                        logger("Web Session: 桥接后补拉到 accessToken")
+                        return dict(post_data)
+                except Exception:
+                    pass
                 continue
 
             # First bridge often lands authorize but SPA still lacks next-auth;
@@ -3196,18 +3216,21 @@ def _wait_for_web_session(
             if (
                 bridge_attempted
                 and (not bridge_retried)
-                and remaining > 18
+                and remaining > 12
                 and unauthenticated
-                and attempt >= 4
+                and attempt >= 3
             ):
                 bridge_retried = True
                 logger("Web Session: 首次桥接后仍无 AT，重试 next-auth 桥接")
-                _browser_chatgpt_openai_signin_bridge(
+                bridged = _browser_chatgpt_openai_signin_bridge(
                     page,
                     logger,
                     email=email,
                     device_id=device_id,
                 )
+                if isinstance(bridged, dict) and str(bridged.get("accessToken") or "").strip():
+                    logger("Web Session: 二次桥接返回 accessToken")
+                    return dict(bridged)
                 continue
 
             # 仍在 platform / auth 域名时，再次强制回 ChatGPT
@@ -3215,14 +3238,24 @@ def _wait_for_web_session(
                 _goto_chatgpt_home(f"retry-{attempt}")
         except Exception as exc:
             logger(f"Web Session: 轮询异常: {exc}")
-        time.sleep(2)
+        time.sleep(1.2)
+
+    # Final salvage fetch — covers the case where bridge printed a hit after
+    # the loop condition already failed.
+    try:
+        last = _fetch_chatgpt_session_payload(page)
+        last_data = last.get("data") if isinstance(last.get("data"), dict) else {}
+        if str(last_data.get("accessToken") or "").strip():
+            logger("Web Session: 超时前补拉到 accessToken")
+            return dict(last_data)
+    except Exception:
+        pass
 
     logger(
         "Web Session: 超时未拿到 accessToken "
         f"cookies={_cookie_names_summary(page)} url={(str(page.url or '')[:120])}"
     )
     return {}
-
 def _normalize_browser_web_session(session_data: dict, cookies: list[dict]) -> dict:
     data = dict(session_data or {})
     access_token = str(data.get("accessToken") or "").strip()

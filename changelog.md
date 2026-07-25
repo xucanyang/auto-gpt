@@ -6,6 +6,11 @@
 
 ## [Unreleased] (未发布)
 
+## [2.8.44] - 2026-07-25
+
+### 修复 (Fixed)
+- **Web Session 桥接已命中 AT 却丢弃再跑 OAuth**：日志出现 `桥接后立即命中 accessToken` 后立刻 `超时未拿到 accessToken`，因为桥接耗时超过 55s 外层 deadline，探测结果未回传。现桥接直接返回 session JSON；deadline 过后仍接受桥接/补拉命中，避免再开一整轮独立 OAuth（+OTP 120s×N）把单号拖到 8–15 分钟。
+
 ## [2.8.43] - 2026-07-25
 
 ### 修复 (Fixed)
@@ -2861,4 +2866,8 @@
 
 ## 2026-07-25 20:51:04 +0800
 - v2.8.43 about_you完成后提前finalize HME并缩短Web Session等待
+- 发布模式: multi
+
+## 2026-07-25 21:20:38 +0800
+- v2.8.44 桥接命中AT不再丢弃避免二次OAuth拖慢
 - 发布模式: multi
