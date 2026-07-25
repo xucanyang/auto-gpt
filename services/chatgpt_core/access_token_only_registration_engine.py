@@ -145,6 +145,7 @@ class AccessTokenOnlyRegistrationEngine:
         self._prepared_register_client: ChatGPTClient | None = None
         self._last_chatgpt_client: ChatGPTClient | None = None
         self._last_email_adapter = None
+        self._mailbox_finalized = False
 
     def _is_browser_executor(self) -> bool:
         return self.browser_mode in {"headless", "headed"}
@@ -863,6 +864,8 @@ class AccessTokenOnlyRegistrationEngine:
         return False, browser_error
 
     def _finalize_email_service_success(self, result: RegistrationResult) -> None:
+        if getattr(self, "_mailbox_finalized", False):
+            return
         metadata = getattr(result, "metadata", None)
         metadata = metadata if isinstance(metadata, dict) else {}
         try:
@@ -884,6 +887,7 @@ class AccessTokenOnlyRegistrationEngine:
                 account_email=str(getattr(result, "email", "") or self.email or "").strip(),
                 task_id=str(self.task_uuid or "").strip(),
             )
+            self._mailbox_finalized = True
         except Exception as exc:
             self._log(f"[邮箱] finalize_success 执行失败: {exc}", "warning")
         try:
@@ -902,6 +906,8 @@ class AccessTokenOnlyRegistrationEngine:
         *,
         fallback_error: str = "",
     ) -> None:
+        if getattr(self, "_mailbox_finalized", False):
+            return
         finalize = getattr(self.email_service, "finalize_failure", None)
         if not callable(finalize):
             return
@@ -911,6 +917,7 @@ class AccessTokenOnlyRegistrationEngine:
                 error_message=error_message,
                 task_id=str(self.task_uuid or "").strip(),
             )
+            self._mailbox_finalized = True
         except Exception as exc:
             self._log(f"[邮箱] finalize_failure 执行失败: {exc}", "warning")
         try:
@@ -922,6 +929,36 @@ class AccessTokenOnlyRegistrationEngine:
                     result.metadata["mailbox_state"] = refreshed
         except Exception as exc:
             self._log(f"[邮箱] finalize_failure 后导出 mailbox_state 失败: {exc}", "warning")
+
+    def _finalize_email_on_interruption(
+        self,
+        result: RegistrationResult,
+        *,
+        stop_error: str = "",
+        leased_email: str = "",
+    ) -> None:
+        """Always release/retire the HME lease when the task is stopped mid-attempt."""
+        if getattr(self, "_mailbox_finalized", False):
+            return
+        email = str(
+            getattr(result, "email", "") or leased_email or self.email or ""
+        ).strip()
+        if not email:
+            # No mailbox was prepared yet — nothing to finalize.
+            return
+        if not str(getattr(result, "email", "") or "").strip():
+            result.email = email
+        message = str(
+            getattr(result, "error_message", "")
+            or stop_error
+            or "任务已手动停止"
+        ).strip()
+        if "任务已手动停止" not in message and "stop" not in message.lower():
+            message = f"任务已手动停止: {message}"
+        result.error_message = message
+        result.success = False
+        self._log(f"[邮箱] 任务中断，强制 finalize HME lease: {email}", "warning")
+        self._finalize_email_service_failure(result, fallback_error=message)
 
     @staticmethod
     def _metadata_indicates_discard_without_mailbox_writeback(metadata: dict | None) -> bool:
@@ -1163,6 +1200,7 @@ class AccessTokenOnlyRegistrationEngine:
         birthdate = generate_random_birthday()
         attempt_client: ChatGPTClient | None = None
         email_initialized = False
+        self._mailbox_finalized = False
         try:
             last_error = ""
             for attempt in range(registration_max_retries):
@@ -1624,7 +1662,12 @@ class AccessTokenOnlyRegistrationEngine:
                     result.error_message = last_error
                     self._finalize_email_service_failure(result, fallback_error=last_error)
                     return result
-                except TaskInterruption:
+                except TaskInterruption as stop_exc:
+                    self._finalize_email_on_interruption(
+                        result,
+                        stop_error=str(stop_exc or "") or "任务已手动停止",
+                        leased_email=str(locked_email_addr or result.email or "").strip(),
+                    )
                     raise
                 except Exception as attempt_error:
                     last_error = str(attempt_error)
@@ -1637,7 +1680,12 @@ class AccessTokenOnlyRegistrationEngine:
             self._finalize_email_service_failure(result, fallback_error=result.error_message)
             return result
                 
-        except TaskInterruption:
+        except TaskInterruption as stop_exc:
+            self._finalize_email_on_interruption(
+                result,
+                stop_error=str(stop_exc or "") or "任务已手动停止",
+                leased_email=str(locked_email_addr or result.email or "").strip(),
+            )
             raise
         except Exception as e:
             self._log(f"无 RT 注册全流程执行异常: {e}", "error")

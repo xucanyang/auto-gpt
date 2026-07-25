@@ -6,6 +6,19 @@
 
 ## [Unreleased] (未发布)
 
+## [2.8.37] - 2026-07-25
+
+### 修复 (Fixed)
+- **Camoufox `InvalidIP`/ipecho 不再整单杀死注册**：代理模式下启动前尽量多源探测出口 IP 并写入 `geoip=<ip>`；若 Camoufox 仍因 `ipecho.net`/ipify SSL 失败抛 `InvalidIP`，自动 **关闭 geoip 降级重试**，避免「浏览器还没开 OpenAI 就 FAIL 并占身份槽」。
+- **HME Helper 失败 outcome 收紧**（`core/base_mailbox.py`）：
+  - `InvalidIP` / geoip / 纯 CSRF·首页失败 → `early_failure`（可干净回收）；
+  - `user_already_exists` / `login_password` /「邮箱已存在」→ **`keep` 永久退役**，禁止同 lease 再当 ready 出池；
+  - 手动停任务 / OTP·密码后失败 → `late_failure`（不确定半开户）。
+- **任务中断强制 finalize HME lease**：`AccessTokenOnlyRegistrationEngine` 捕获 `TaskInterruption` 时，若已领取别名则必定 `finalize_failure`，修复此前密码 200/OTP 中途点停止导致 **同 `ck_*` lease 再次出池 → 必撞已存在** 的脏池问题；成功/失败 finalize 加幂等门闩防双写。
+
+### 测试 (Tests)
+- Helper outcome 分桶与 `keep`/`early_failure` finalize 合同；Camoufox geoip 失败识别合同。
+
 ## [2.8.36] - 2026-07-25
 
 ### 变更 (Changed)
@@ -2755,4 +2768,8 @@
 
 ## 2026-07-25 10:08:55 +0800
 - v2.8.36 一键回归v2.8.29注册保存模型（auth_pending落库+保留浏览器补丁）
+- 发布模式: multi
+
+## 2026-07-25 10:46:34 +0800
+- v2.8.37 修复HME脏lease复出+停任务强制finalize+Camoufox InvalidIP降级
 - 发布模式: multi

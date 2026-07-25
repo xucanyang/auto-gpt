@@ -1663,6 +1663,16 @@ class BrowserRegistrationFlowTests(unittest.TestCase):
         self.assertFalse(br._is_internal_auth_api_continue_url(state["continue_url"]))
         self.assertTrue(br._requires_registration_navigation(state))
 
+    def test_camoufox_geoip_ip_failure_detection(self):
+        class InvalidIP(Exception):
+            pass
+
+        self.assertTrue(br._is_camoufox_geoip_ip_failure(InvalidIP("Failed to get IP address: x")))
+        self.assertTrue(
+            br._is_camoufox_geoip_ip_failure(RuntimeError("Failed to get IP address: ipecho.net"))
+        )
+        self.assertFalse(br._is_camoufox_geoip_ip_failure(RuntimeError("about_you 提交失败")))
+
     def test_platform_auth_callback_external_url_must_navigate(self):
         state = {
             "method": "GET",

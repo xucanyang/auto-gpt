@@ -3519,6 +3519,78 @@ class IcloudHmeMailbox(BaseMailbox):
             note=note,
         )
 
+    @staticmethod
+    def _classify_helper_failure_outcome(
+        error_message: str,
+        *,
+        lease_id: str = "",
+        wait_started: bool = False,
+    ) -> str:
+        """Map registration failure text to Helper finalize outcome.
+
+        - ``early_failure``: safe to re-issue alias (never reached OpenAI signup
+          commit). Includes geoip/InvalidIP and pure homepage/CSRF failures.
+        - ``keep``: permanently retire as used (already exists / paid / etc.).
+        - ``late_failure``: uncertain partial signup (password/OTP/about_you or
+          manual stop after lease). Helper must not return the same ready lease.
+        """
+        error_text = str(error_message or "").strip()
+        lowered = error_text.lower()
+
+        keep_alias_failure_markers = (
+            "already paid",
+            "user is already paid",
+            "you have paid",
+            "已付费",
+            "amount != 0",
+            "checkout amount",
+            "chatgpt_payment_already_paid",
+            "chatgpt_nonzero_checkout_amount_failure",
+            # OpenAI already has this HME — never re-issue as fresh ready stock.
+            "user_already_exists",
+            "already exists",
+            "邮箱已存在",
+            "该邮箱已存在",
+            "existing-account capture",
+            "existing_account",
+            "login_password",
+            "reached login_password",
+            "use explicit existing-account",
+        )
+        early_failure_markers = (
+            "访问首页失败",
+            "获取 csrf token 失败",
+            "提交邮箱失败",
+            "authorize 失败",
+            "preauth",
+            "预授权",
+            "homepage",
+            "csrf",
+            # Browser never opened OpenAI signup: free the lease for reuse.
+            "invalidip",
+            "failed to get ip address",
+            "ipecho.net",
+            "api.ipify.org",
+            "geoip",
+            "camoufox geoip",
+        )
+        # Manual stop after prepare is uncertain if signup may have advanced.
+        stop_uncertain_markers = (
+            "任务已手动停止",
+            "task interruption",
+            "taskinterruption",
+            "stop requested",
+            "已请求立即停止",
+        )
+
+        if any(marker.lower() in lowered for marker in keep_alias_failure_markers):
+            return "keep"
+        if any(marker.lower() in lowered for marker in stop_uncertain_markers):
+            return "late_failure"
+        if (not wait_started) and any(marker.lower() in lowered for marker in early_failure_markers):
+            return "early_failure"
+        return "late_failure"
+
     def finalize_failure(
         self,
         account: MailboxAccount,
@@ -3539,38 +3611,14 @@ class IcloudHmeMailbox(BaseMailbox):
                 return
             resolved_task_id = str(task_id or getattr(self, "_task_attempt_token", "") or "").strip()
             error_text = str(error_message or "").strip()
-            lowered = error_text.lower()
             if is_account_deactivated_message("", error_text):
                 outcome = "account_deactivated"
             else:
-                keep_alias_failure_markers = (
-                    "already paid",
-                    "user is already paid",
-                    "you have paid",
-                    "已付费",
-                    "amount != 0",
-                    "checkout amount",
-                    "chatgpt_payment_already_paid",
-                    "chatgpt_nonzero_checkout_amount_failure",
+                outcome = self._classify_helper_failure_outcome(
+                    error_text,
+                    lease_id=lease_id,
+                    wait_started=lease_id in self._helper_wait_started_leases,
                 )
-                early_failure_markers = (
-                    "访问首页失败",
-                    "获取 csrf token 失败",
-                    "提交邮箱失败",
-                    "authorize 失败",
-                    "preauth",
-                    "预授权",
-                    "homepage",
-                    "csrf",
-                )
-                if any(marker.lower() in lowered for marker in keep_alias_failure_markers):
-                    outcome = "keep"
-                elif lease_id not in self._helper_wait_started_leases and any(
-                    marker.lower() in lowered for marker in early_failure_markers
-                ):
-                    outcome = "early_failure"
-                else:
-                    outcome = "late_failure"
             extra = dict(getattr(account, "extra", None) or {})
             response = self._helper_client.finalize(
                 lease_id,
@@ -3592,7 +3640,6 @@ class IcloudHmeMailbox(BaseMailbox):
             return
         resolved_task_id = str(task_id or getattr(self, "_task_attempt_token", "") or "").strip()
         error_text = str(error_message or "").strip()
-        lowered = error_text.lower()
         if is_account_deactivated_message("", error_text):
             update_icloud_hme_alias_on_account_deactivated(
                 anonymous_id,
@@ -3601,28 +3648,12 @@ class IcloudHmeMailbox(BaseMailbox):
             )
             self._log(f"[iCloudHME] 账号已删除/停用，别名标记为账号已禁用: {getattr(account, 'email', '')}")
             return
-        early_failure_markers = (
-            "访问首页失败",
-            "获取 csrf token 失败",
-            "提交邮箱失败",
-            "authorize 失败",
-            "preauth",
-            "预授权",
-            "homepage",
-            "csrf",
+        outcome = self._classify_helper_failure_outcome(
+            error_text,
+            lease_id="",
+            wait_started=False,
         )
-        keep_alias_failure_markers = (
-            "already paid",
-            "user is already paid",
-            "you have paid",
-            "已付费",
-            "amount != 0",
-            "checkout amount",
-            "chatgpt_payment_already_paid",
-            "chatgpt_nonzero_checkout_amount_failure",
-        )
-        should_keep_alias_used = any(marker.lower() in lowered for marker in keep_alias_failure_markers)
-        if not should_keep_alias_used and any(marker.lower() in lowered for marker in early_failure_markers):
+        if outcome == "early_failure":
             release_icloud_hme_alias_after_early_failure(
                 anonymous_id,
                 error_message=error_text,
@@ -3630,6 +3661,7 @@ class IcloudHmeMailbox(BaseMailbox):
             )
             self._log(f"[iCloudHME] 早期失败，别名回退为 reserved: {getattr(account, 'email', '')}")
             return
+        # keep / late_failure / 其它：标记失败占用，禁止再当 ready 出池
         update_icloud_hme_alias_on_failure(
             anonymous_id,
             error_message=error_text,

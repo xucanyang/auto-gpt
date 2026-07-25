@@ -466,6 +466,93 @@ class IcloudHmeMailboxFinalizeTests(unittest.TestCase):
         mark_failure.assert_not_called()
         self.assertEqual(release_alias.call_args.args[0], "anon-2")
 
+    def test_classify_helper_failure_outcome_buckets(self):
+        classify = IcloudHmeMailbox._classify_helper_failure_outcome
+        self.assertEqual(
+            classify("InvalidIP: Failed to get IP address: ipecho.net SSL"),
+            "early_failure",
+        )
+        self.assertEqual(
+            classify(
+                "user_already_exists: browser registration reached login_password; "
+                "use explicit existing-account capture"
+            ),
+            "keep",
+        )
+        self.assertEqual(
+            classify("浏览器注册检测到该邮箱已存在；请显式启用已有账号抓取"),
+            "keep",
+        )
+        self.assertEqual(
+            classify("任务已手动停止: registration interrupted after mailbox lease"),
+            "late_failure",
+        )
+        self.assertEqual(classify("未获取到验证码"), "late_failure")
+        self.assertEqual(classify("获取 CSRF token 失败"), "early_failure")
+
+    def test_helper_user_already_exists_finalizes_as_keep(self):
+        mailbox = IcloudHmeMailbox(
+            mail_provider_name="hme_ready_api",
+            icloud_hme_mode="helper_ready_api",
+            icloud_cookie="",
+            icloud_forward_to="global@example.com",
+            tempmail_api_url="http://tempmail-api-1:8080",
+            tempmail_api_key="tempmail-key",
+            icloud_hme_helper_api_url="http://helper-api",
+            icloud_hme_helper_internal_key="helper-key",
+        )
+        account = MailboxAccount(
+            email="dirty@icloud.com",
+            account_id="lease-dirty",
+            extra={
+                "provider": "hme_ready_api",
+                "lease_id": "lease-dirty",
+                "registration_id": "reg-dirty",
+            },
+        )
+        mailbox._helper_client.finalize = Mock(return_value={})
+
+        mailbox.finalize_failure(
+            account,
+            error_message="浏览器注册检测到该邮箱已存在；当前注册执行器不会自动切换登录恢复",
+            task_id="task-dirty",
+        )
+
+        mailbox._helper_client.finalize.assert_called_once()
+        kwargs = mailbox._helper_client.finalize.call_args.kwargs
+        self.assertEqual(kwargs["outcome"], "keep")
+        self.assertEqual(kwargs["task_id"], "task-dirty")
+
+    def test_helper_invalidip_finalizes_as_early_failure(self):
+        mailbox = IcloudHmeMailbox(
+            mail_provider_name="hme_ready_api",
+            icloud_hme_mode="helper_ready_api",
+            icloud_cookie="",
+            icloud_forward_to="global@example.com",
+            tempmail_api_url="http://tempmail-api-1:8080",
+            tempmail_api_key="tempmail-key",
+            icloud_hme_helper_api_url="http://helper-api",
+            icloud_hme_helper_internal_key="helper-key",
+        )
+        account = MailboxAccount(
+            email="fresh@icloud.com",
+            account_id="lease-fresh",
+            extra={"provider": "hme_ready_api", "lease_id": "lease-fresh"},
+        )
+        mailbox._helper_client.finalize = Mock(return_value={})
+
+        mailbox.finalize_failure(
+            account,
+            error_message=(
+                "browser_registration_failed: InvalidIP: Failed to get IP address: "
+                "HTTPSConnectionPool(host='ipecho.net')"
+            ),
+            task_id="task-geoip",
+        )
+
+        kwargs = mailbox._helper_client.finalize.call_args.kwargs
+        self.assertEqual(kwargs["outcome"], "early_failure")
+
     def test_deactivated_failure_marks_alias_disabled_dead(self):
         mailbox = self._build_mailbox()
         account = MailboxAccount(email="alias@icloud.com", account_id="anon-dead")
