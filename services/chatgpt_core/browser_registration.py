@@ -2764,31 +2764,254 @@ def _wait_for_access_token(page, timeout: int = 60) -> str:
     return str((_wait_for_web_session(page, timeout=timeout) or {}).get("accessToken") or "")
 
 
-def _wait_for_web_session(page, timeout: int = 30) -> dict:
-    """Read the ChatGPT web session from the active browser context only."""
+def _cookie_names_summary(page) -> str:
+    try:
+        cookies = list(page.context.cookies() or [])
+    except Exception:
+        return "-"
+    names = []
+    for item in cookies:
+        name = str(item.get("name") or "").strip()
+        domain = str(item.get("domain") or "").strip()
+        if not name:
+            continue
+        if any(
+            key in name.lower()
+            for key in (
+                "session",
+                "auth",
+                "csrf",
+                "oai-",
+                "cf_",
+                "login",
+                "did",
+            )
+        ):
+            names.append(f"{domain}:{name}")
+    return ", ".join(sorted(set(names))[:40]) or f"count={len(cookies)}"
+
+
+def _fetch_chatgpt_session_payload(page) -> dict:
+    """Fetch /api/auth/session from the live browser context."""
+    try:
+        result = _page_evaluate_safe(
+            page,
+            """
+            async () => {
+              try {
+                const r = await fetch('https://chatgpt.com/api/auth/session', {
+                  credentials: 'include',
+                  headers: { 'accept': 'application/json' },
+                });
+                let data = null;
+                let text = '';
+                try { text = await r.text(); } catch {}
+                try { data = text ? JSON.parse(text) : null; } catch {}
+                return {
+                  status: r.status,
+                  ok: !!r.ok,
+                  data: (data && typeof data === 'object') ? data : {},
+                  text: String(text || '').slice(0, 180),
+                };
+              } catch (e) {
+                return {
+                  status: 0,
+                  ok: false,
+                  data: {},
+                  text: String(e && e.message || e),
+                };
+              }
+            }
+            """,
+            retries=3,
+        )
+    except Exception as exc:
+        return {"status": 0, "ok": False, "data": {}, "text": str(exc)}
+    return result if isinstance(result, dict) else {}
+
+
+def _browser_chatgpt_openai_signin_bridge(page, log, *, email: str = "", device_id: str = "") -> bool:
+    """Use next-auth signin/openai in-browser so OpenAI auth cookies mint ChatGPT session."""
+    email = str(email or "").strip()
+    device_id = str(device_id or "").strip()
+    log("Web Session 桥接: ChatGPT next-auth signin/openai")
+    try:
+        page.goto(f"{CHATGPT_APP}/", wait_until="domcontentloaded", timeout=45000)
+    except Exception as exc:
+        if not _is_navigation_context_error(exc):
+            log(f"Web Session 桥接首页导航异常: {exc}")
+    _wait_for_auth_page_settle(page, timeout=8.0, log=log)
+
+    try:
+        bridge = _page_evaluate_safe(
+            page,
+            """
+            async ({ email, deviceId, base }) => {
+              const csrfResp = await fetch(base + '/api/auth/csrf', {
+                credentials: 'include',
+                headers: { 'accept': 'application/json' },
+              });
+              const csrfJson = await csrfResp.json().catch(() => ({}));
+              const csrfToken = String((csrfJson && csrfJson.csrfToken) || '');
+              if (!csrfToken) {
+                return { ok: false, stage: 'csrf', status: csrfResp.status, detail: 'missing csrfToken' };
+              }
+              const params = new URLSearchParams({
+                prompt: 'login',
+                'ext-oai-did': deviceId || '',
+                auth_session_logging_id: (crypto.randomUUID ? crypto.randomUUID() : String(Date.now())),
+                screen_hint: 'login',
+              });
+              if (email) params.set('login_hint', email);
+              const body = new URLSearchParams({
+                callbackUrl: base + '/',
+                csrfToken,
+                json: 'true',
+              });
+              const signinResp = await fetch(
+                base + '/api/auth/signin/openai?' + params.toString(),
+                {
+                  method: 'POST',
+                  credentials: 'include',
+                  headers: {
+                    'content-type': 'application/x-www-form-urlencoded',
+                    'accept': 'application/json',
+                  },
+                  body: body.toString(),
+                }
+              );
+              const signinJson = await signinResp.json().catch(() => ({}));
+              const authorizeUrl = String((signinJson && signinJson.url) || '');
+              if (!authorizeUrl) {
+                return {
+                  ok: false,
+                  stage: 'signin',
+                  status: signinResp.status,
+                  detail: JSON.stringify(signinJson || {}).slice(0, 180),
+                };
+              }
+              return { ok: true, stage: 'signin', status: signinResp.status, authorizeUrl };
+            }
+            """,
+            {
+                "email": email,
+                "deviceId": device_id,
+                "base": CHATGPT_APP.rstrip("/"),
+            },
+            retries=2,
+        )
+    except Exception as exc:
+        log(f"Web Session 桥接 signin 调用失败: {exc}")
+        return False
+
+    if not isinstance(bridge, dict) or not bridge.get("ok"):
+        log(
+            "Web Session 桥接 signin 未返回 authorize URL: "
+            f"stage={((bridge or {}).get('stage') if isinstance(bridge, dict) else '-') } "
+            f"status={((bridge or {}).get('status') if isinstance(bridge, dict) else '-') } "
+            f"detail={str((bridge or {}).get('detail') if isinstance(bridge, dict) else bridge)[:160]}"
+        )
+        return False
+
+    authorize_url = str(bridge.get("authorizeUrl") or "").strip()
+    log(f"Web Session 桥接 authorize: {authorize_url[:120]}")
+    try:
+        page.goto(authorize_url, wait_until="domcontentloaded", timeout=60000)
+    except Exception as exc:
+        # Callback 落地时 localhost / 中断导航常见，随后再看最终 URL
+        log(f"Web Session 桥接 authorize 导航异常（可继续）: {exc}")
+    _wait_for_auth_page_settle(page, timeout=12.0, log=log)
+
+    # 若停在 auth 中页，再推一次 ChatGPT 首页
+    current = str(page.url or "")
+    if "chatgpt.com" not in current:
+        try:
+            page.goto(f"{CHATGPT_APP}/", wait_until="domcontentloaded", timeout=45000)
+        except Exception as exc:
+            log(f"Web Session 桥接回 ChatGPT 首页异常: {exc}")
+        _wait_for_auth_page_settle(page, timeout=10.0, log=log)
+    return True
+
+
+def _wait_for_web_session(
+    page,
+    timeout: int = 30,
+    *,
+    log=None,
+    email: str = "",
+    device_id: str = "",
+) -> dict:
+    """Read ChatGPT web session; bridge OpenAI cookies via next-auth when needed."""
+    logger = log or (lambda _message: None)
     deadline = time.time() + max(int(timeout or 0), 1)
-    navigated_to_chatgpt = False
+    bridge_attempted = False
+    home_navigated = False
+    attempt = 0
+    logger(
+        "开始抓取 ChatGPT Web Session: "
+        f"url={(str(page.url or '')[:120])} cookies={_cookie_names_summary(page)}"
+    )
+
     while time.time() < deadline:
+        attempt += 1
         try:
             current_url = str(page.url or "")
-            if "chatgpt.com" not in current_url and not navigated_to_chatgpt:
-                navigated_to_chatgpt = True
-                page.goto(CHATGPT_APP, wait_until="domcontentloaded", timeout=30000)
-            result = page.evaluate("""
-            async () => {
-                const r = await fetch('https://chatgpt.com/api/auth/session', {
-                  credentials: 'include'
-                });
-                if (!r.ok) return {};
-                const j = await r.json();
-                return j && typeof j === 'object' ? j : {};
-            }
-            """)
-            if isinstance(result, dict) and str(result.get("accessToken") or "").strip():
-                return dict(result)
-        except Exception:
-            pass
+            # platform.openai.com callback 不是 ChatGPT session 域名
+            if "chatgpt.com" not in current_url and not home_navigated:
+                home_navigated = True
+                logger("Web Session: 导航 chatgpt.com 首页建立 next-auth 会话")
+                try:
+                    page.goto(f"{CHATGPT_APP}/", wait_until="domcontentloaded", timeout=45000)
+                except Exception as exc:
+                    logger(f"Web Session: 首页导航异常: {exc}")
+                _wait_for_auth_page_settle(page, timeout=10.0, log=logger)
+
+            payload = _fetch_chatgpt_session_payload(page)
+            data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+            access_token = str(data.get("accessToken") or "").strip()
+            if access_token:
+                logger(
+                    f"Web Session: 已拿到 accessToken status={payload.get('status')} "
+                    f"url={(str(page.url or '')[:100])}"
+                )
+                return dict(data)
+
+            logger(
+                "Web Session: 尚未就绪 "
+                f"attempt={attempt} status={payload.get('status')} "
+                f"keys={sorted(list(data.keys()))[:8]} "
+                f"url={(str(page.url or '')[:100])} "
+                f"text={str(payload.get('text') or '')[:120]}"
+            )
+
+            # 约 8s 后仍无 AT：用 OpenAI 已登录态桥接 next-auth
+            elapsed = max(int(timeout or 0), 1) - max(int(deadline - time.time()), 0)
+            if (not bridge_attempted) and (attempt >= 2 or elapsed >= 8):
+                bridge_attempted = True
+                _browser_chatgpt_openai_signin_bridge(
+                    page,
+                    logger,
+                    email=email,
+                    device_id=device_id,
+                )
+                home_navigated = True
+                continue
+
+            # 仍在 platform / auth 域名时，再次强制回 ChatGPT
+            if "chatgpt.com" not in str(page.url or "") and attempt in {3, 5, 7}:
+                try:
+                    page.goto(f"{CHATGPT_APP}/", wait_until="domcontentloaded", timeout=45000)
+                except Exception:
+                    pass
+                _wait_for_auth_page_settle(page, timeout=8.0, log=logger)
+        except Exception as exc:
+            logger(f"Web Session: 轮询异常: {exc}")
         time.sleep(2)
+
+    logger(
+        "Web Session: 超时未拿到 accessToken "
+        f"cookies={_cookie_names_summary(page)} url={(str(page.url or '')[:120])}"
+    )
     return {}
 
 
@@ -5869,7 +6092,16 @@ def run_browser_registration_stage_sync(
             user_agent = str(page.evaluate("() => navigator.userAgent") or "")
         except Exception:
             user_agent = ""
-        session_data = _wait_for_web_session(page, timeout=30)
+
+        # about_you 常落到 platform.openai.com callback；必须在同一 Camoufox 上下文
+        # 把 OpenAI 登录态桥成 ChatGPT next-auth，再读 AT/session_token。
+        session_data = _wait_for_web_session(
+            page,
+            timeout=75,
+            log=logger,
+            email=str(email or ""),
+            device_id=str(device_id or ""),
+        )
         cookies = list(page.context.cookies())
         web_session = _normalize_browser_web_session(session_data, cookies)
         cookie_names = sorted(
@@ -5879,13 +6111,17 @@ def run_browser_registration_stage_sync(
                 if cookie.get("name")
             }
         )
+        has_at = bool(str(web_session.get("access_token") or "").strip())
+        has_st = bool(str(web_session.get("session_token") or "").strip())
         logger(
             "浏览器注册链路完成: "
             f"page={final_state.get('page_type') or '-'} "
             f"cookies={','.join(cookie_names)} "
-            f"web_at={'yes' if web_session.get('access_token') else 'no'}"
+            f"web_at={'yes' if has_at else 'no'} "
+            f"web_session_token={'yes' if has_st else 'no'} "
+            f"account_id={str(web_session.get('account_id') or '-') }"
         )
-        return {
+        payload = {
             "final_state": final_state,
             "page_url": str(page.url or ""),
             "cookies": cookies,
@@ -5897,3 +6133,14 @@ def run_browser_registration_stage_sync(
             "effective_executor": "headless" if effective_headless else "headed",
             "headless_reason": headless_reason,
         }
+        if not has_at:
+            # 保留 cookies 供上层协议 Session 补抓；error 使 StageResult.ok=False
+            payload["error"] = (
+                "browser_registration_missing_web_session: "
+                "signup finished but ChatGPT /api/auth/session returned no accessToken; "
+                f"page={final_state.get('page_type') or '-'} "
+                f"url={(str(page.url or '')[:120])} "
+                f"cookies={','.join(cookie_names[:20])}"
+            )
+            logger(payload["error"])
+        return payload

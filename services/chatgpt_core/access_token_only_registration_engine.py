@@ -28,6 +28,7 @@ from .utils import FlowState, generate_random_name, generate_random_birthday
 from .account_fingerprint import build_browser_fingerprint_payload, fingerprint_signature
 from .sentinel_browser import (
     BrowserRegistrationStageResult,
+    merge_playwright_cookies_into_session,
     run_browser_registration_stage,
 )
 
@@ -1116,6 +1117,70 @@ class AccessTokenOnlyRegistrationEngine:
                                     session_result["cookies"] = "; ".join(cookie_pairs)
                                     session_result.setdefault("cookie_header", session_result["cookies"])
                             session_ok = bool(str(session_result.get("access_token") or "").strip())
+
+                            # signup 已完成但浏览器未读到 AT：用 Cookie 导入协议 Session 补抓
+                            if (not session_ok) and list(browser_stage.cookies or []):
+                                self._log(
+                                    "Camoufox 未读到 Web AT，尝试 Cookie 导入协议 Session 补抓 "
+                                    f"(cookies={len(list(browser_stage.cookies or []))}, "
+                                    f"err={str(browser_stage.error or '')[:120]})"
+                                )
+                                try:
+                                    merged = merge_playwright_cookies_into_session(
+                                        chatgpt_client.session,
+                                        list(browser_stage.cookies or []),
+                                    )
+                                    self._log(f"协议 Session 已合并浏览器 Cookie: {merged}")
+                                    # 用浏览器终态作为 reuse_session 的回调起点
+                                    state_data = dict(browser_stage.final_state or {})
+                                    chatgpt_client.last_registration_state = FlowState(
+                                        page_type=str(state_data.get("page_type") or "oauth_callback"),
+                                        continue_url=str(state_data.get("continue_url") or ""),
+                                        method=str(state_data.get("method") or "GET"),
+                                        current_url=str(
+                                            state_data.get("current_url")
+                                            or browser_stage.page_url
+                                            or "https://chatgpt.com/"
+                                        ),
+                                        payload=(
+                                            dict(state_data.get("payload") or {})
+                                            if isinstance(state_data.get("payload"), dict)
+                                            else {}
+                                        ),
+                                        raw=(
+                                            dict(state_data.get("raw") or {})
+                                            if isinstance(state_data.get("raw"), dict)
+                                            else {}
+                                        ),
+                                    )
+                                    reuse_ok, reuse_result = chatgpt_client.reuse_session_and_get_tokens()
+                                    if reuse_ok and isinstance(reuse_result, dict):
+                                        session_result = dict(reuse_result)
+                                        session_ok = bool(
+                                            str(session_result.get("access_token") or "").strip()
+                                        )
+                                        if session_ok:
+                                            success = True
+                                            msg = (
+                                                "registration complete via camoufox browser "
+                                                "+ protocol session reuse"
+                                            )
+                                            self._log("协议 Session 补抓 AccessToken 成功")
+                                        else:
+                                            self._log(
+                                                f"协议 Session 补抓未返回 AT: {str(reuse_result)[:200]}",
+                                                "warning",
+                                            )
+                                    else:
+                                        self._log(
+                                            f"协议 Session 补抓失败: {reuse_result}",
+                                            "warning",
+                                        )
+                                except Exception as reuse_exc:
+                                    self._log(
+                                        f"协议 Session 补抓异常: {reuse_exc}",
+                                        "warning",
+                                    )
                         else:
                             chatgpt_client.requested_executor = "protocol"
                             chatgpt_client.effective_executor = "protocol"

@@ -6,6 +6,12 @@
 
 ## [Unreleased] (未发布)
 
+## [2.8.33] - 2026-07-25
+
+### 修复 (Fixed)
+- **Camoufox 注册收尾抓 Web Session**：about_you/callback 常落在 `platform.openai.com`，仅靠 `chatgpt.com/api/auth/session` 会只剩 `oai-did`。现在在同一浏览器上下文内导航 ChatGPT 首页，并通过 **next-auth `signin/openai` 桥接**把 OpenAI 登录态铸成 ChatGPT `accessToken`/`session_token`，超时与 Cookie 摘要写进任务日志。
+- **缺 AT 时保留 Cookie 并协议补抓**：浏览器 signup 完成但 session 读空时返回 `browser_registration_missing_web_session`（不算业务成功），同时把 Cookie 交给 `AccessTokenOnlyRegistrationEngine` 合并进协议 Session 再 `reuse_session_and_get_tokens` 二次取 AT。
+
 ## [2.8.32] - 2026-07-25
 
 ### 修复 (Fixed)
@@ -2705,4 +2711,8 @@
 
 ## 2026-07-25 08:58:36 +0800
 - v2.8.32 修复Camoufox密码后OTP导航竞态与API continue_url误goto
+- 发布模式: multi
+
+## 2026-07-25 09:15:59 +0800
+- v2.8.33 修复Camoufox收尾Web Session抓取与协议Cookie补抓
 - 发布模式: multi
