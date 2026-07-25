@@ -1605,7 +1605,7 @@ class BrowserRegistrationFlowTests(unittest.TestCase):
         page.goto.assert_any_call(
             "https://auth.openai.com/api/accounts/authorize?client_id=x",
             wait_until="domcontentloaded",
-            timeout=60000,
+            timeout=45000,
         )
 
     def test_ensure_about_you_page_tolerates_ns_binding_aborted(self):

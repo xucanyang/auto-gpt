@@ -668,6 +668,32 @@ class AccessTokenOnlyRegistrationEngine:
                     phase,
                 )
                 return {"released": True, "code": str(request.get("code") or "").strip()}
+            if action == "signup_committed":
+                # about_you already committed on OpenAI — permanently retire the
+                # HME lease before the long Web Session/OAuth tail can be killed.
+                try:
+                    interim = RegistrationResult(
+                        success=True,
+                        email=str(email_addr or ""),
+                        password=str(password or ""),
+                        metadata={
+                            "registered_auth_pending": True,
+                            "registration_stage_complete": True,
+                            "signup_committed_early": True,
+                        },
+                    )
+                    self._finalize_email_service_success(interim)
+                    self._log(
+                        f"[邮箱] OpenAI 开户已提交，提前 finalize HME success: {email_addr}",
+                        "warning",
+                    )
+                except Exception as exc:
+                    self._log(f"[邮箱] signup_committed 提前 finalize 失败: {exc}", "warning")
+                return {
+                    "signup_committed": True,
+                    "email": str(email_addr or ""),
+                    "page_type": str(request.get("page_type") or ""),
+                }
             sent_at = request.get("otp_sent_at")
             try:
                 sent_at = float(sent_at) if sent_at is not None else None

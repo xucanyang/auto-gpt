@@ -6,6 +6,15 @@
 
 ## [Unreleased] (未发布)
 
+## [2.8.43] - 2026-07-25
+
+### 修复 (Fixed)
+- **about_you 已成功但仍失败 / 重试撞 `user_already_exists`**：真实日志显示 CSRF 桥接已拿到 authorize URL，随后进程在 Web Session 长等待中被中断；HME lease 未 finalize_success，下一轮同一 `ck_*` 再出池 → OpenAI 已注册 → 必 FAIL。现于 **注册状态机完成（about_you/callback）后立刻** 通过 `signup_committed` 回调执行 Helper `finalize_success`，再抓 Web Session；Session 等待缩短为 55s，authorize 落地补 URL 日志与即时 AT 探测。
+- 父任务即使在桥接中途被停/重启，lease 也不会再当 ready 脏出池。
+
+### 测试 (Tests)
+- `signup_committed` 提前 finalize HME 合同。
+
 ## [2.8.42] - 2026-07-25
 
 ### 修复 (Fixed)
@@ -2848,4 +2857,8 @@
 
 ## 2026-07-25 20:22:34 +0800
 - v2.8.42 修复Web Session桥接missing csrfToken与入口超时early_failure
+- 发布模式: multi
+
+## 2026-07-25 20:51:04 +0800
+- v2.8.43 about_you完成后提前finalize HME并缩短Web Session等待
 - 发布模式: multi

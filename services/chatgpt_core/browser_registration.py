@@ -3074,11 +3074,12 @@ def _browser_chatgpt_openai_signin_bridge(page, log, *, email: str = "", device_
 
     log(f"Web Session 桥接 authorize: {authorize_url[:120]}")
     try:
-        page.goto(authorize_url, wait_until="domcontentloaded", timeout=60000)
+        page.goto(authorize_url, wait_until="domcontentloaded", timeout=45000)
     except Exception as exc:
         # Callback 落地时 localhost / 中断导航常见，随后再看最终 URL
         log(f"Web Session 桥接 authorize 导航异常（可继续）: {exc}")
-    _wait_for_auth_page_settle(page, timeout=12.0, log=log)
+    _wait_for_auth_page_settle(page, timeout=10.0, log=log)
+    log(f"Web Session 桥接 authorize 落地 url={(str(page.url or '')[:140])}")
 
     # 若停在 auth 中页，再推一次 ChatGPT 首页
     current = str(page.url or "")
@@ -3087,9 +3088,23 @@ def _browser_chatgpt_openai_signin_bridge(page, log, *, email: str = "", device_
             page.goto(f"{CHATGPT_APP}/", wait_until="domcontentloaded", timeout=45000)
         except Exception as exc:
             log(f"Web Session 桥接回 ChatGPT 首页异常: {exc}")
-        _wait_for_auth_page_settle(page, timeout=10.0, log=log)
-    return True
+        _wait_for_auth_page_settle(page, timeout=8.0, log=log)
+        log(f"Web Session 桥接回 ChatGPT 后 url={(str(page.url or '')[:140])}")
 
+    # Immediate session probe so the outer waiter does not sit silent.
+    try:
+        probe = _fetch_chatgpt_session_payload(page)
+        data = probe.get("data") if isinstance(probe.get("data"), dict) else {}
+        if str(data.get("accessToken") or "").strip():
+            log("Web Session 桥接后立即命中 accessToken")
+        else:
+            log(
+                "Web Session 桥接后仍无 AT "
+                f"status={probe.get('status')} keys={sorted(list(data.keys()))[:8]}"
+            )
+    except Exception as exc:
+        log(f"Web Session 桥接后探测失败: {exc}")
+    return True
 def _wait_for_web_session(
     page,
     timeout: int = 30,
@@ -6608,6 +6623,26 @@ def run_browser_registration_stage_sync(
                 f"browser_registration_incomplete: page={page_type}"
             )
 
+        # CRITICAL: OpenAI account is already committed after about_you.
+        # Notify parent immediately so HME finalize_success runs before the
+        # long Web Session bridge. Otherwise a process kill / deploy mid-bridge
+        # leaves the lease reusable and the next attempt hits user_already_exists.
+        try:
+            _invoke_otp_callback(
+                otp_callback,
+                {
+                    "action": "signup_committed",
+                    "email": str(email or ""),
+                    "page_type": str(final_state.get("page_type") or ""),
+                    "page_url": str(page.url or ""),
+                },
+            )
+            logger(
+                "OpenAI 开户已提交（about_you/callback 完成），已通知父任务 finalize HME success"
+            )
+        except Exception as exc:
+            logger(f"通知 signup_committed 失败（继续抓 Web Session）: {exc}")
+
         try:
             user_agent = str(page.evaluate("() => navigator.userAgent") or "")
         except Exception:
@@ -6615,9 +6650,10 @@ def run_browser_registration_stage_sync(
 
         # about_you 常落到 platform.openai.com callback；必须在同一 Camoufox 上下文
         # 把 OpenAI 登录态桥成 ChatGPT next-auth，再读 AT/session_token。
+        # Keep this bounded: parent can OAuth-recover / auth_pending after.
         session_data = _wait_for_web_session(
             page,
-            timeout=100,
+            timeout=55,
             log=logger,
             email=str(email or ""),
             device_id=str(device_id or ""),

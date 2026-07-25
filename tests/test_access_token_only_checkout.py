@@ -232,6 +232,52 @@ class AccessTokenOnlyCheckoutTests(unittest.TestCase):
             any("固定为单次执行" in line for line in result.logs)
         )
 
+    def test_signup_committed_callback_finalizes_hme_before_web_session(self):
+        """about_you commit must retire the HME lease before Web Session can hang."""
+        email_service = mock.Mock()
+        email_service.create_email.return_value = {"email": "buyer@example.com"}
+        adapter = EmailServiceAdapter(
+            email_service, "buyer@example.com", lambda _message: None
+        )
+        engine = AccessTokenOnlyRegistrationEngine(
+            email_service=email_service,
+            browser_mode="headless",
+            max_retries=1,
+        )
+        client = mock.Mock(device_id="device-demo", _check_stop=mock.Mock())
+        stage_result = BrowserRegistrationStageResult(
+            final_state={"page_type": "oauth_callback"},
+            page_url="https://chatgpt.com/",
+            web_session={"access_token": "at-demo", "session_token": "st-demo"},
+            device_id="device-demo",
+            user_agent="Mozilla/5.0",
+            effective_executor="headless",
+        )
+
+        with mock.patch(
+            "services.chatgpt_core.access_token_only_registration_engine.run_browser_registration_stage",
+            return_value=stage_result,
+        ) as run_stage:
+            engine._run_browser_registration(
+                chatgpt_client=client,
+                email_addr="buyer@example.com",
+                password="Password123!",
+                skymail_adapter=adapter,
+                otp_wait_timeout=30,
+                otp_account_budget_timeout=60,
+            )
+            otp_callback = run_stage.call_args.kwargs["otp_callback"]
+            otp_callback(
+                {
+                    "action": "signup_committed",
+                    "email": "buyer@example.com",
+                    "page_type": "oauth_callback",
+                }
+            )
+
+        email_service.finalize_success.assert_called()
+        self.assertTrue(getattr(engine, "_mailbox_finalized", False))
+
     def test_missing_web_session_after_signup_saves_auth_pending(self):
         """Signup finished but AT missing must not hard-fail the attempt.
 
