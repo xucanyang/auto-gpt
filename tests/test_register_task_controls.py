@@ -505,10 +505,10 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
         )
         self.assertTrue(
             any(
-                "[结果] attempt=1" in line
-                and "outcome=FAILED" in line
-                and "slot=1" in line
-                and "backfill=no" in line
+                "[ChatGPT注册][尝试 1/" in line
+                and "[步骤09/09 完成] 失败" in line
+                and "占用目标=是" in line
+                and "补位=否" in line
                 for line in snapshot["logs"]
             )
         )
@@ -517,7 +517,7 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
         )
         self.assertTrue(
             any(
-                "certainty=unknown" in line and "slot=1" in line
+                "确定性=未知" in line and "占用目标=是" in line
                 for line in snapshot["logs"]
             )
         )
@@ -590,17 +590,17 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         self.assertTrue(
             any(
-                "[结果] attempt=1" in line
-                and "outcome=SKIPPED" in line
-                and "code=existing_account" in line
-                and "slot=0" in line
-                and "backfill=yes" in line
+                "[ChatGPT注册][尝试 1/" in line
+                and "[步骤09/09 完成] 跳过" in line
+                and "原因码=existing_account" in line
+                and "占用目标=否" in line
+                and "补位=是" in line
                 for line in snapshot["logs"]
             )
         )
         self.assertFalse(
             any(
-                "[结果] attempt=1" in line and "slot=1" in line
+                "[ChatGPT注册][尝试 1/" in line and "占用目标=是" in line
                 for line in snapshot["logs"]
             )
         )
@@ -835,17 +835,27 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
 
         snapshot = _task_store.snapshot(task_id)
         logs = snapshot["logs"]
-        headers = [line for line in logs if "[账号] attempt=" in line]
+        headers = [
+            line
+            for line in logs
+            if "[ChatGPT注册][尝试 " in line and "[步骤01/09 准备] 开始" in line
+        ]
 
         self.assertEqual(snapshot["status"], "done")
         self.assertEqual(snapshot["success"], 2)
         self.assertEqual(len(headers), 2)
-        self.assertIn("attempt=1 target=2 current_success=0", headers[0])
-        self.assertIn("attempt=2 target=2 current_success=1", headers[1])
+        self.assertIn("[尝试 1/", headers[0])
+        self.assertIn("目标=2", headers[0])
+        self.assertIn("已成功=0", headers[0])
+        self.assertIn("[尝试 2/", headers[1])
+        self.assertIn("目标=2", headers[1])
+        self.assertIn("已成功=1", headers[1])
         first_success_index = next(
             index
             for index, line in enumerate(logs)
-            if "[结果] attempt=1" in line and "outcome=SUCCESS" in line
+            if "[ChatGPT注册][尝试 1/" in line
+            and "[步骤09/09 完成] 成功" in line
+            and "原因码=success" in line
         )
         separator_index = logs.index("", first_success_index + 1)
         second_header_index = logs.index(headers[1])
@@ -1138,15 +1148,17 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
         )
         self.assertTrue(
             any(
-                "[阶段] attempt=1" in line
-                and "stage=auth_capture result=pending" in line
+                "[ChatGPT注册][尝试 1/" in line
+                and "[步骤08/09 保存与同步] 待补抓" in line
+                and "阶段=auth_capture" in line
+                and "结果=待补抓" in line
                 for line in snapshot["logs"]
             )
         )
         self.assertTrue(
             any(
-                "[结果] attempt=1" in line
-                and "code=registered_auth_pending" in line
+                "[ChatGPT注册][尝试 1/" in line
+                and "原因码=registered_auth_pending" in line
                 for line in snapshot["logs"]
             )
         )

@@ -12,6 +12,7 @@ from services.chatgpt_core.task_logging import (
     build_task_current_state,
     classify_task_log_level,
     format_task_timeline_log,
+    infer_registration_timeline_stage,
     mask_email_for_log,
     mask_phone_for_log,
     redact_log_text,
@@ -334,6 +335,158 @@ def test_format_phone_binding_timeline_log_is_plain_aligned_and_masks_phone_otp(
     assert "123456" not in line
     assert "+12269023179" not in line
     assert "+1226***3179" in line
+
+
+def test_format_registration_timeline_log_keeps_detailed_stable_fields():
+    message = (
+        "[代理] candidate=1/2 source=specified "
+        "proxy=http://proxy.local:8080 (出口IP: 198.51.100.10)"
+    )
+    stage_index, phase_label = infer_registration_timeline_stage(message)
+
+    line = format_task_timeline_log(
+        "ChatGPT注册",
+        message,
+        item_index=1,
+        item_total=3,
+        email="detailed.account+gpt1@example.com",
+        stage_index=stage_index,
+        stage_total=9,
+        phase_label=phase_label,
+    )
+
+    assert line.startswith(
+        "[ChatGPT注册][尝试 1/3][det***1@example.com][步骤02/09 选择代理] 已选择"
+    )
+    assert "候选=1/2" in line
+    assert "来源=指定代理" in line
+    assert "代理=http://proxy.local:8080" in line
+    assert "出口IP=198.51.100.10" in line
+
+    safe_line = redact_log_text(
+        "代理=http://proxy.local:8080｜出口IP=198.51.100.10"
+    )
+    assert safe_line == "代理=http://proxy.local:8080｜出口IP=198.51.100.10"
+
+
+def test_format_registration_timeline_masks_mailbox_details_without_dropping_them():
+    message = (
+        "[iCloudHME] Helper 已领取别名: detailed.account+gpt1@icloud.com "
+        "lease=ck_registration_123，监听转发箱 forward@example.net mailbox_id=mailbox-1"
+    )
+    stage_index, phase_label = infer_registration_timeline_stage(message)
+
+    line = format_task_timeline_log(
+        "ChatGPT注册",
+        message,
+        item_index=1,
+        item_total=3,
+        email="detailed.account+gpt1@icloud.com",
+        stage_index=stage_index,
+        stage_total=9,
+        phase_label=phase_label,
+    )
+
+    assert "[步骤03/09 领取邮箱] 已领取" in line
+    assert "别名=det***1@icloud.com" in line
+    assert "租约=ck_registration_123" in line
+    assert "监听转发箱=for***d@example.net" in line
+    assert "邮箱ID=mailbox-1" in line
+    assert "detailed.account+gpt1@icloud.com" not in line
+    assert "forward@example.net" not in line
+
+
+def test_format_registration_result_and_summary_preserve_operator_semantics():
+    result_line = format_task_timeline_log(
+        "ChatGPT注册",
+        "[结果] outcome=FAILED code=registration_failed reason=proxy timeout "
+        "mailbox=finalized slot=1 backfill=no certainty=unknown progress=0/1",
+        item_index=1,
+        item_total=3,
+        stage_index=9,
+        stage_total=9,
+        phase_label="完成",
+    )
+    summary_line = format_task_timeline_log(
+        "ChatGPT注册",
+        "完成: 成功 1 个, 跳过 0 个, 失败 1 个; "
+        "Plus checkout amount=0: 0 个, amount!=0: 1 个",
+        stage_index=9,
+        stage_total=9,
+        phase_label="完成",
+    )
+
+    assert "[步骤09/09 完成] 失败" in result_line
+    assert "原因码=registration_failed" in result_line
+    assert "原因=proxy timeout" in result_line
+    assert "占用目标=是" in result_line
+    assert "补位=否" in result_line
+    assert "确定性=未知" in result_line
+    assert "成功=1｜跳过=0｜失败=1" in summary_line
+    assert "amount!=0: 1" in summary_line
+
+
+def test_registration_timeline_formats_each_info_event_without_collapsing_density():
+    events = [
+        "[账号] target=1 current_success=0 executor=headless status=started",
+        "[邮箱] mail_provider=hme_ready_api",
+        "[验证码] 等待邮箱验证码：浏览器邮箱验证码 timeout=120s",
+        "[注册] about_you 资料已提交｜HTTP=200",
+        "[登录] ChatGPT Web Session 获取成功｜AT=是｜Session=是｜Cookie状态=已获取",
+        "[结果] outcome=SUCCESS code=success mailbox=success slot=0 backfill=no certainty=known progress=1/1",
+    ]
+    lines = []
+    for event in events:
+        stage_index, phase_label = infer_registration_timeline_stage(event)
+        lines.append(
+            format_task_timeline_log(
+                "ChatGPT注册",
+                event,
+                item_index=1,
+                item_total=3,
+                email="density@example.com",
+                stage_index=stage_index,
+                stage_total=9,
+                phase_label=phase_label,
+            )
+        )
+
+    assert len(lines) == len(events)
+    assert all(line.startswith("[ChatGPT注册][尝试 1/3]") for line in lines)
+    assert all("｜" in line for line in lines)
+
+
+def test_registration_auto_upload_gate_uses_skip_not_fail(monkeypatch):
+    from api import tasks
+    from services import external_sync
+
+    monkeypatch.setattr(
+        external_sync,
+        "sync_account",
+        lambda _account: [
+            {
+                "name": "Upload Gate",
+                "ok": False,
+                "msg": "跳过上传：待支付/仅 AT 账号缺少 refresh_token",
+            }
+        ],
+    )
+    emitted = []
+
+    tasks._auto_upload_integrations(
+        "task-registration-upload-skip",
+        type("Account", (), {"id": 5694})(),
+        log_fn=lambda message, level="info": emitted.append((level, message)),
+    )
+
+    assert emitted == [
+        ("info", "[Auto Upload] 开始自动同步外部系统，inventory_id=5694"),
+        (
+            "info",
+            "[Upload Gate] [SKIP] 跳过上传：待支付/仅 AT 账号缺少 refresh_token",
+        ),
+    ]
+    assert all("[FAIL]" not in message for _level, message in emitted)
 
 
 def test_build_task_current_state_masks_phone_and_keeps_stage_fields():

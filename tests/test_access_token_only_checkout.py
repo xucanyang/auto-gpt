@@ -145,6 +145,61 @@ class AccessTokenOnlyCheckoutTests(unittest.TestCase):
         browser_stage.assert_not_called()
         browser_oauth.assert_not_called()
 
+    def test_browser_transport_promotes_business_milestones_and_keeps_raw_debug(self):
+        emitted = []
+        engine = AccessTokenOnlyRegistrationEngine(
+            email_service=mock.Mock(),
+            proxy_url="http://proxy.local:8080",
+            browser_mode="headless",
+            callback_logger=lambda message, level="info": emitted.append((level, message)),
+        )
+        client = mock.Mock(device_id="device-demo")
+        adapter = mock.Mock()
+
+        def fake_browser_registration(**kwargs):
+            for line in (
+                '邮箱页已点击继续按钮: button[type="submit"]',
+                "验证码页提交状态: 200",
+                "about_you 提交状态: 200",
+                "注册流程完成: page=oauth_callback",
+                "开始抓取 ChatGPT Web Session: https://chatgpt.com/api/auth/session",
+                "ChatGPT Web Session 获取成功: access_token=secret session_token=secret cookies=secret",
+            ):
+                kwargs["log_fn"](line)
+            return self._any_auto_ok(
+                email=kwargs["email"],
+                password=kwargs["password"],
+            )
+
+        with mock.patch(
+            "services.chatgpt_core.access_token_only_registration_engine.run_any_auto_browser_registration",
+            side_effect=fake_browser_registration,
+        ):
+            result = engine._run_any_auto_registration(
+                chatgpt_client=client,
+                email_addr="buyer@example.com",
+                password="Password123!",
+                skymail_adapter=adapter,
+                otp_wait_timeout=120,
+                profile_name="Detailed User",
+                profile_birthdate="1990-01-02",
+            )
+
+        info_lines = [message for level, message in emitted if level == "info"]
+        debug_lines = [message for level, message in emitted if level == "debug"]
+        self.assertTrue(result.ok)
+        self.assertIn("[注册] 邮箱入口已提交", info_lines)
+        self.assertIn("[验证码] 注册验证码已提交｜HTTP=200", info_lines)
+        self.assertIn("[注册] about_you 资料已提交｜HTTP=200", info_lines)
+        self.assertIn("[注册] OpenAI 账号创建完成", info_lines)
+        self.assertIn("[登录] 开始获取 ChatGPT Web Session", info_lines)
+        self.assertIn(
+            "[登录] ChatGPT Web Session 获取成功｜AT=是｜Session=是｜Cookie状态=已获取",
+            info_lines,
+        )
+        self.assertTrue(any("邮箱页已点击继续按钮" in line for line in debug_lines))
+        self.assertTrue(any("ChatGPT Web Session 获取成功" in line for line in debug_lines))
+
     def test_browser_modes_start_with_browser_registration_and_preserve_headless_flag(self):
         for browser_mode, expected_headless in (("headless", True), ("headed", False)):
             with self.subTest(browser_mode=browser_mode):

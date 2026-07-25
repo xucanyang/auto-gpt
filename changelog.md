@@ -6,6 +6,21 @@
 
 ## [Unreleased] (未发布)
 
+## [2.8.50] - 2026-07-26
+
+### 优化 (Changed)
+- **ChatGPT 注册 Info 改为九阶段详细时间线，不压缩事件密度**：`services/chatgpt_core/task_logging.py` 与 `api/tasks.py` 统一输出 `[ChatGPT注册][尝试 x/y][脱敏邮箱][步骤NN/09 阶段] 状态｜字段=值`。任务策略、指纹、代理/HME 租约、验证码、开户、Web Session、保存、外部同步、单号结果与批次汇总继续逐项展示，但执行器、来源、出口 IP、邮箱回写、占槽和补位等字段统一中文语义，避免原有中英文 key/value、重复 attempt 前缀和散乱标点混排。
+- **补齐 any-auto 可运营业务节点**：`access_token_only_registration_engine.py` 从原始 Debug 流中投影邮箱入口提交、密码提交、注册 OTP 提交、`about_you` 提交、OpenAI 账号创建、`https://chatgpt.com/api/auth/session` Web Session 开始/成功等 Info 里程碑；原始 selector、HTTP、callback、cookie presence 等诊断材料仍完整保留在 Debug，不牺牲排障细节。
+- **无 RT 外部同步门禁改为明确跳过**：无 RT 账号因缺少 `refresh_token` 不满足外部上传条件时，注册 Info 现在显示 `[SKIP]` 与具体原因，不再在整条注册成功时间线末尾出现误导性的 `[FAIL]`。
+
+### 修复 (Fixed)
+- **修复标准化字段分隔符触发 URL 脱敏递归**：日志 URL 识别现在在 `｜/|/，/,/；/;` 字段边界停止，避免 `代理=http://...｜出口IP=...` 被当成一个畸形 URL 后递归脱敏并影响注册任务执行。
+
+### 测试 (Tests)
+- 扩展 `tests/test_chatgpt_task_logging.py`、`tests/test_access_token_only_checkout.py` 与 `tests/test_register_task_controls.py`，覆盖九阶段字段格式、邮箱脱敏、动态代理详情、失败/占槽/补位语义、批次附加统计、Info 事件逐条保留、无 RT 上传门禁、any-auto 业务里程碑及原始 Debug 并存；注册相关扩大回归通过 `184 passed, 3 skipped, 4 subtests passed`。
+- 全量 `pytest -q tests` 在当前 checkout 主机仍于收集 `tests/test_admin_auth_security.py` 时受既有环境缺少 `argon2` 阻断；本次注册与任务日志专项回归、Python 编译检查及前端生产构建均已通过。
+- 侧栏版本同步为 `v2.8.50`。
+
 ## [2.8.49] - 2026-07-26
 
 ### 修复 (Fixed)
@@ -2949,4 +2964,8 @@
 
 ## 2026-07-26 06:31:07 +0800
 - v2.8.49: 跟随 signup callback 后再抓 Web Session
+- 发布模式: multi
+
+## 2026-07-26 07:24:44 +0800
+- v2.8.50: 统一注册 Info 九阶段详细时间线
 - 发布模式: multi

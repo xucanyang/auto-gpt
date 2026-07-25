@@ -12,6 +12,7 @@
 import json
 import time
 import logging
+import re
 from datetime import datetime
 from typing import Any, Optional, Callable
 
@@ -692,8 +693,33 @@ class AccessTokenOnlyRegistrationEngine:
                 return
             if clean.startswith(("[路由]", "[阶段]", "[结果]", "[验证码]", "[邮箱]", "[控制]")):
                 self._log(clean)
-            else:
-                self._log(f"[any-auto/{self.browser_mode}] {clean}", "debug")
+                return
+
+            milestone = ""
+            status_match = re.search(r"状态\s*[:：]\s*(\d+)", clean)
+            http_status = str(status_match.group(1) or "") if status_match else ""
+            if "邮箱页已点击继续按钮" in clean:
+                milestone = "[注册] 邮箱入口已提交"
+            elif "密码页提交状态" in clean:
+                milestone = f"[注册] 注册密码已提交｜HTTP={http_status or '-'}"
+            elif "验证码页提交状态" in clean:
+                milestone = f"[验证码] 注册验证码已提交｜HTTP={http_status or '-'}"
+            elif "about_you 提交状态" in clean:
+                milestone = f"[注册] about_you 资料已提交｜HTTP={http_status or '-'}"
+            elif clean.startswith("注册流程完成:"):
+                milestone = "[注册] OpenAI 账号创建完成"
+            elif clean.startswith(
+                "开始抓取 ChatGPT Web Session: https://chatgpt.com/api/auth/session"
+            ):
+                milestone = "[登录] 开始获取 ChatGPT Web Session"
+            elif clean.startswith("ChatGPT Web Session 获取成功:"):
+                milestone = (
+                    "[登录] ChatGPT Web Session 获取成功｜"
+                    "AT=是｜Session=是｜Cookie状态=已获取"
+                )
+            if milestone:
+                self._log(milestone)
+            self._log(f"[any-auto/{self.browser_mode}] {clean}", "debug")
 
         if self._is_browser_executor():
             self._log(
@@ -1275,8 +1301,8 @@ class AccessTokenOnlyRegistrationEngine:
                 try:
                     if attempt == 0:
                         self._log("=" * 60)
-                        self._log("开始注册流程 V2 (Session 复用直取 AccessToken)")
-                        self._log(f"请求模式: {self.browser_mode}")
+                        self._log("开始注册流程 V2 (Session 复用直取 AccessToken)", "debug")
+                        self._log(f"请求模式: {self.browser_mode}", "debug")
                         if self._zero_amount_stop_enabled():
                             self._log(
                                 f"Zero amount auto-stop enabled: threshold={self._zero_amount_stop_threshold()}"
@@ -1289,7 +1315,10 @@ class AccessTokenOnlyRegistrationEngine:
                     if existing_account_capture or self._is_browser_executor():
                         homepage_ok, homepage_error = True, ""
                         if self._is_browser_executor() and not existing_account_capture:
-                            self._log("浏览器执行器直接进入 Camoufox 注册，跳过协议首页预热")
+                            self._log(
+                                "浏览器执行器直接进入 Camoufox 注册，跳过协议首页预热",
+                                "debug",
+                            )
                     elif attempt_client is not None:
                         homepage_ok, homepage_error = True, ""
                     else:
@@ -1306,6 +1335,7 @@ class AccessTokenOnlyRegistrationEngine:
                         return result
 
                     # 一个 account attempt 只领取一次邮箱，并固定密码与人物资料。
+                    email_claimed_now = not email_initialized
                     if not email_initialized:
                         email_data = self.email_service.create_email()
                         email_initialized = True
@@ -1320,6 +1350,8 @@ class AccessTokenOnlyRegistrationEngine:
                     email_addr = locked_email_addr
                     if self._task_log_context is not None:
                         self._task_log_context["email"] = email_addr
+                    if email_claimed_now:
+                        self._log("[邮箱] 邮箱领取成功")
 
                     result.email = email_addr
                     pwd = locked_password
@@ -1646,7 +1678,12 @@ class AccessTokenOnlyRegistrationEngine:
                             }
 
                     if session_ok:
-                        self._log("Token 提取完成！")
+                        self._log(
+                            "Token 提取完成｜"
+                            f"AT={'是' if session_result.get('access_token') else '否'}｜"
+                            f"Session={'是' if session_result.get('session_token') else '否'}｜"
+                            f"Cookie状态={'已获取' if session_result.get('cookie_header') or session_result.get('cookies') else '缺失'}"
+                        )
                         result.access_token = session_result.get("access_token", "")
                         result.refresh_token = session_result.get("refresh_token", "")
                         result.id_token = session_result.get("id_token", "")

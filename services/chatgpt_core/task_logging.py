@@ -16,7 +16,7 @@ REDACTED_TOKEN = "[REDACTED_TOKEN]"
 REDACTED_OTP = "[REDACTED_OTP]"
 REDACTED_URL = "[REDACTED_URL]"
 
-_URL_RE = re.compile(r"https?://[^\s'\"<>]+", re.I)
+_URL_RE = re.compile(r"https?://[^\s'\"<>｜|，,；;]+", re.I)
 _PROXY_URL_RE = re.compile(r"(?P<scheme>[a-z][a-z0-9+.-]*://)(?P<userinfo>[^\s/@:]+:[^\s/@]+)@(?P<host>[^\s'\"<>]+)", re.I)
 _PHONE_RE = re.compile(r"(?<![A-Za-z0-9])\+\d[\d\s().-]{6,}\d")
 _JWT_RE = re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b")
@@ -1040,6 +1040,401 @@ def _format_phone_binding_timeline_body(message: str, *, stage_tag: str) -> str:
     return f"{stage_tag} {status}".rstrip()
 
 
+_REGISTRATION_MODULE_PREFIX_RE = re.compile(
+    r"^\s*\[(?:控制|代理|账号|指纹|邮箱|验证码|iCloudHME|TempMailLocal|阶段|路由|注册|登录|已有账号|SKIP_SAVE|升级链接|Auto Upload|Upload Gate|结果|DEBUG|OK|SKIP|FAIL|FATAL|STOP|WARN|ERROR)\]\s*",
+    re.I,
+)
+_REGISTRATION_EMAIL_RE = re.compile(
+    r"(?<![A-Za-z0-9.!#$%&'*+/=?^_`{|}~-])"
+    r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"
+)
+_REGISTRATION_STAGE_LABELS: dict[int, str] = {
+    1: "准备",
+    2: "选择代理",
+    3: "领取邮箱",
+    4: "提交注册",
+    5: "邮箱验证",
+    6: "完成资料",
+    7: "建立会话",
+    8: "保存与同步",
+    9: "完成",
+}
+_REGISTRATION_FIELD_LABELS = {
+    "target": "目标",
+    "current_success": "已成功",
+    "executor": "执行器",
+    "concurrency": "并发",
+    "existing_account_action": "已有账号",
+    "uncertain_browser_failure_slot": "不确定浏览器失败",
+    "device": "设备",
+    "chrome": "Chrome",
+    "viewport": "视口",
+    "lang": "语言",
+    "sig": "指纹",
+    "candidate": "候选",
+    "source": "来源",
+    "country": "目标国家",
+    "actual": "实际国家",
+    "provider": "供应商",
+    "sid": "SID",
+    "probe": "探测",
+    "proxy": "代理",
+    "exit_ip": "出口IP",
+    "browser_identity_started": "浏览器身份",
+    "same_attempt_proxy_failover": "同尝试切换代理",
+    "mail_provider": "邮箱渠道",
+    "lease": "租约",
+    "mailbox_id": "邮箱ID",
+    "timeout": "超时",
+    "transport": "运输层",
+    "account_id": "OpenAI账号",
+    "inventory_id": "库存账号",
+    "access_token": "AccessToken",
+    "session_token": "SessionToken",
+    "cookies": "Cookie",
+    "at": "AT",
+    "session": "Session",
+    "cookie": "Cookie",
+    "http": "HTTP",
+    "stage": "阶段",
+    "result": "结果",
+    "saved": "已保存",
+    "code": "原因码",
+    "reason": "原因",
+    "mailbox": "邮箱回写",
+    "slot": "占用目标",
+    "backfill": "补位",
+    "certainty": "确定性",
+    "progress": "进度",
+}
+_REGISTRATION_VALUE_LABELS = {
+    "headless": "无头浏览器",
+    "headed": "有头浏览器",
+    "protocol": "协议",
+    "specified": "指定代理",
+    "dynamic": "动态代理",
+    "pool": "代理池",
+    "direct": "直连",
+    "login_recovery": "登录恢复",
+    "skip": "跳过",
+    "consume": "占用",
+    "started": "开始",
+    "success": "成功",
+    "failed": "失败",
+    "skipped": "跳过",
+    "stopped": "停止",
+    "pending": "待补抓",
+    "finalized": "已完成",
+    "keep": "保留",
+    "known": "已知",
+    "unknown": "未知",
+    "deterministic": "确定",
+    "enabled": "启用",
+    "disabled": "禁用",
+    "any_auto_browser": "any-auto 浏览器",
+    "any_auto_protocol": "any-auto 协议",
+    "hme_ready_api": "HME Helper API",
+    "ok": "正常",
+}
+
+
+def _clean_registration_body(value: Any) -> str:
+    text = str(value or "").strip()
+    while True:
+        cleaned = _REGISTRATION_MODULE_PREFIX_RE.sub("", text)
+        if cleaned == text:
+            break
+        text = cleaned.strip()
+    return _REGISTRATION_EMAIL_RE.sub(
+        lambda match: mask_email_for_log(match.group(0)),
+        text,
+    )
+
+
+def _registration_field_label(key: Any) -> str:
+    raw = str(key or "").strip()
+    return _REGISTRATION_FIELD_LABELS.get(raw.lower(), raw)
+
+
+def _registration_field_value(key: Any, value: Any) -> str:
+    raw_key = str(key or "").strip().lower()
+    text = str(value or "").strip().strip("()")
+    lowered = text.lower()
+    if raw_key == "code":
+        return text
+    if raw_key in {"slot", "backfill", "browser_identity_started"}:
+        if lowered in {"1", "yes", "true", "on"}:
+            return "是"
+        if lowered in {"0", "no", "false", "off"}:
+            return "否"
+    if raw_key == "same_attempt_proxy_failover":
+        if lowered in {"disabled", "no", "false", "off"}:
+            return "禁用"
+        if lowered in {"enabled", "yes", "true", "on"}:
+            return "启用"
+    if raw_key == "mailbox" and lowered == "success":
+        return "已提交"
+    if lowered in {"yes", "true", "on"}:
+        return "是"
+    if lowered in {"no", "false", "off"}:
+        return "否"
+    if raw_key == "timeout" and lowered.endswith("s") and lowered[:-1].isdigit():
+        return f"{lowered[:-1]}秒"
+    return _REGISTRATION_VALUE_LABELS.get(lowered, text)
+
+
+def _normalize_registration_key_values(value: Any) -> str:
+    text = str(value or "").strip().replace("|", "｜")
+    if not text:
+        return ""
+    text = re.sub(r"\(出口IP\s*[:：]\s*([^\)]+)\)", r"exit_ip=\1", text, flags=re.I)
+    known_keys = "|".join(re.escape(key) for key in _REGISTRATION_FIELD_LABELS)
+    text = re.sub(
+        rf"\s+(?=(?:{known_keys})\s*[:：=])",
+        "｜",
+        text,
+        flags=re.I,
+    )
+    chunks: list[str] = []
+    for raw_part in text.split("｜"):
+        part = raw_part.strip()
+        if not part:
+            continue
+        match = re.match(r"^([^:：=\s]{1,40})\s*[:：=]\s*(.+)$", part)
+        if not match:
+            chunks.append(part)
+            continue
+        key = str(match.group(1) or "").strip()
+        field_value = str(match.group(2) or "").strip()
+        chunks.append(
+            f"{_registration_field_label(key)}={_registration_field_value(key, field_value)}"
+        )
+    return "｜".join(chunks)
+
+
+def infer_registration_timeline_stage(message: Any) -> tuple[int, str]:
+    """Map one registration event to the stable nine-step operator timeline."""
+
+    raw_lowered = str(message or "").lower()
+    text = _clean_registration_body(message)
+    lowered = text.lower()
+    if any(marker in lowered for marker in ("outcome=", "完成: 成功", "失败: 成功", "任务已停止:")):
+        index = 9
+    elif any(
+        marker in lowered
+        for marker in (
+            "auto upload",
+            "upload gate",
+            "自动同步外部系统",
+            "跳过上传",
+            "refresh_token",
+            "helper 已提交",
+            "外部同步",
+            "plus 额度验证",
+            "账号保存",
+            "auth_capture",
+            "不保存账号",
+            "升级链接",
+            "已有账号",
+        )
+    ) or any(marker in raw_lowered for marker in ("[已有账号]", "[skip_save]", "[升级链接]")):
+        index = 8
+    elif "注册运输层" in lowered and "成功" not in lowered:
+        index = 4
+    elif any(
+        marker in lowered
+        for marker in (
+            "web session",
+            "accesstoken",
+            "sessiontoken",
+            "token 提取",
+            "注册运输层成功",
+            "oauth recovery",
+            "注册流程成功结束",
+        )
+    ):
+        index = 7
+    elif any(marker in lowered for marker in ("about_you", "资料已提交", "账号创建完成")):
+        index = 6
+    elif any(marker in lowered for marker in ("验证码", "email_otp", "email-verification", "otp")):
+        index = 5
+    elif any(
+        marker in lowered
+        for marker in (
+            "注册运输层",
+            "camoufox 整段",
+            "邮箱入口已提交",
+            "密码已提交",
+            "提交注册",
+        )
+    ):
+        index = 4
+    elif any(
+        marker in lowered
+        for marker in (
+            "mail_provider",
+            "helper ready api 出池",
+            "helper 已领取别名",
+            "复用远端邮箱",
+            "邮箱领取",
+            "转发箱",
+        )
+    ):
+        index = 3
+    elif any(
+        marker in lowered
+        for marker in (
+            "代理",
+            "proxy",
+            "candidate=",
+            "预检通过",
+            "browser_identity_started",
+            "出口 ip",
+            "候选",
+        )
+    ):
+        index = 2
+    else:
+        index = 1
+    return index, _REGISTRATION_STAGE_LABELS[index]
+
+
+def _registration_status_and_detail(message: Any) -> tuple[str, str]:
+    text = _clean_registration_body(message)
+    lowered = text.lower()
+    explicit_status = re.search(r"(?:^|\s)status=([^\s｜,，;；]+)", text, flags=re.I)
+    explicit_outcome = re.search(r"(?:^|\s)outcome=([^\s｜,，;；]+)", text, flags=re.I)
+    explicit_result = re.search(r"(?:^|\s)result=([^\s｜,，;；]+)", text, flags=re.I)
+
+    summary_match = re.match(
+        r"^(完成|失败|任务已停止)\s*[:：]\s*成功\s*(\d+)\s*个\s*[,，]\s*跳过\s*(\d+)\s*个\s*[,，]\s*失败\s*(\d+)\s*个",
+        text,
+    )
+    if summary_match:
+        status = "成功" if summary_match.group(1) == "完成" else "失败" if summary_match.group(1) == "失败" else "已停止"
+    elif explicit_outcome:
+        status = _registration_field_value("outcome", explicit_outcome.group(1))
+    elif "不保存账号" in text:
+        status = "不保存"
+    elif "升级链接" in text or text.startswith("http://") or text.startswith("https://"):
+        status = "已生成"
+    elif "致命" in text or "基础设施不可用" in text:
+        status = "失败"
+    elif "写入任务快照失败" in text or "写回失败" in text:
+        status = "警告"
+    elif explicit_result and str(explicit_result.group(1) or "").strip().lower() == "pending":
+        status = "待补抓"
+    elif "已达到注册最大尝试次数" in text:
+        status = "停止补位"
+    elif "any-auto 已返回 AccessToken/Session" in text:
+        status = "已获取"
+    elif "已提交" in text and ("HTTP=200" in text or "http=200" in lowered):
+        status = "提交成功"
+    elif "已提交" in text:
+        status = "已提交"
+    elif "跳过上传" in text or "跳过" in text:
+        status = "跳过"
+    elif explicit_status:
+        status = _registration_field_value("status", explicit_status.group(1))
+    elif "等待" in text:
+        status = "等待"
+    elif "命中验证码" in text or "收到验证码" in text:
+        status = "已收到"
+    elif "验证码已获取" in text or "token 提取完成" in lowered:
+        status = "已获取"
+    elif "预检通过" in text:
+        status = "预检通过"
+    elif "已分配" in text:
+        status = "已分配"
+    elif "已领取" in text:
+        status = "已领取"
+    elif "已选择" in text or "candidate=" in lowered:
+        status = "已选择"
+    elif (
+        "配置" in text
+        or "registration_policy" in lowered
+        or "请求模式" in text
+        or "注册最大尝试次数" in text
+        or "mail_provider=" in lowered
+    ):
+        status = "配置"
+    elif "browser_identity_started=" in lowered:
+        status = "策略"
+    elif "注册核心链路" in text:
+        status = "已应用"
+    elif "复用远端邮箱" in text:
+        status = "已连接"
+    elif "失败" in text or "[fail]" in lowered or "error" in lowered:
+        status = "失败"
+    elif "成功" in text or "完成" in text:
+        status = "成功"
+    elif "开始" in text or "启动" in text or "出池" in text or "执行 any-auto" in text:
+        status = "开始"
+    else:
+        status = "信息"
+
+    detail = text
+    detail = re.sub(r"(?:^|\s)status=[^\s｜,，;；]+", "", detail, flags=re.I)
+    detail = re.sub(r"(?:^|\s)outcome=[^\s｜,，;；]+", "", detail, flags=re.I)
+    if summary_match:
+        detail = (
+            f"成功={summary_match.group(2)}｜"
+            f"跳过={summary_match.group(3)}｜失败={summary_match.group(4)}"
+        )
+        summary_tail = text[summary_match.end() :].strip(" ;；")
+        if summary_tail:
+            detail = f"{detail}｜{summary_tail}"
+    replacements = (
+        (r"^注册最大尝试次数\s*[:：]\s*", "最大尝试="),
+        (r"^registration_policy\s*", ""),
+        (r"^已分配独立浏览器指纹\s*[:：]\s*", ""),
+        (r"^使用 Helper Ready API 出池$", "渠道=HME Helper API"),
+        (r"^Helper 已领取别名\s*[:：]\s*", "别名="),
+        (r"\s+lease=", "｜lease="),
+        (r"[，,]\s*监听转发箱\s+", "｜监听转发箱="),
+        (r"\s+mailbox_id=", "｜mailbox_id="),
+        (r"^复用远端邮箱\s*[:：]\s*", "转发箱="),
+        (r"^TempMail 转发箱命中验证码\s*[:：].*$", "来源=TempMail转发箱"),
+        (r"^等待邮箱验证码\s*[:：]\s*(?:\[REDACTED_OTP\]\s*)?", "类型="),
+        (r"^验证码已获取\s*[:：]\s*", "类型="),
+        (r"^步骤\s*[12]/2\s*[:：]\s*", ""),
+        (r"^开始自动同步外部系统\s*[，,]\s*", "同步模式=自动｜"),
+        (r"^Helper 已提交成功\s*[:：]\s*", "邮箱回写="),
+        (r"^跳过上传\s*[:：]\s*", "原因="),
+        (r"^ChatGPT 注册核心链路\s+proxy=", "注册核心代理="),
+        (r"^执行 any-auto 注册运输层\s+", "运输层=any-auto｜"),
+        (r"^启动 any-auto 浏览器注册运输层\s+executor=([^\s]+)\s*\(Camoufox 整段：邮箱 -> OTP -> about_you -> Web Session\)$", r"运输层=any-auto 浏览器｜executor=\1｜范围=邮箱→OTP→资料→Web Session"),
+        (r"^any-auto 注册运输层成功\s+", ""),
+        (r"^邮箱入口已提交$", "节点=邮箱入口"),
+        (r"^注册验证码已提交(?:｜|\s*)", ""),
+        (r"^about_you 资料已提交(?:｜|\s*)", "资料=about_you｜"),
+        (r"^OpenAI 账号创建完成$", "OpenAI账号=已创建"),
+        (r"^开始获取 ChatGPT Web Session$", "会话=ChatGPT Web Session"),
+        (r"^ChatGPT Web Session 获取成功(?:｜|\s*)", ""),
+        (r"^Token 提取完成(?:｜|\s*)", ""),
+        (r"^any-auto 已返回 AccessToken/Session[，,]?\s*跳过二次 OAuth recovery$", "AT/Session=已获取｜二次OAuth=跳过"),
+        (r"^注册流程成功结束!?$", "开户与会话材料=完整"),
+        (r"^Token 提取完成!?$", "AccessToken=已获取｜SessionToken=已获取｜Cookie=已获取"),
+        (r"^Plus 额度验证已关闭[，,]\s*跳过订阅链接生成和 amount 校验$", "项目=Plus额度/订阅链接｜原因=配置关闭｜影响=订阅链接和金额校验"),
+        (r"^预检通过\s*[:：]\s*候选\s+(\d+)\s+个\s*\(首个\s+source=([^\)]+)\)$", r"候选=\1｜首选来源=\2"),
+    )
+    for pattern, replacement in replacements:
+        detail = re.sub(pattern, replacement, detail, flags=re.I)
+
+    detail = re.sub(r"\s+", " ", detail).strip(" ｜|，,；;!。")
+    normalized = _normalize_registration_key_values(detail)
+    if normalized:
+        return status, normalized
+    return status, ""
+
+
+def _format_registration_timeline_body(message: Any, *, stage_tag: str) -> str:
+    status, detail = _registration_status_and_detail(message)
+    if detail:
+        return f"{stage_tag} {status}｜{detail}"
+    return f"{stage_tag} {status}".rstrip()
+
+
 def format_task_timeline_log(
     task: str,
     message: str = "",
@@ -1063,7 +1458,9 @@ def format_task_timeline_log(
     ``[邮箱测活][5/74][a@example.com] 阶段 1/2：登录测活并抓取 AccessToken``
     """
 
-    phone_binding_task = str(task or "").strip() in {"手机绑定", "手机号绑定"}
+    task_name = str(task or "").strip()
+    phone_binding_task = task_name in {"手机绑定", "手机号绑定"}
+    registration_task = task_name in {"ChatGPT注册", "ChatGPT 注册"}
     expose_phone = False
     expose_otp = False
 
@@ -1073,7 +1470,7 @@ def format_task_timeline_log(
 
     tags: list[str] = []
     task_label = redact_log_text(task, expose_phone=expose_phone, expose_otp=expose_otp).strip()
-    if task_label and not phone_binding_task:
+    if task_label and not phone_binding_task and not registration_task:
         tags.append(task_label)
 
     normalized_index = int(item_index or 0)
@@ -1108,6 +1505,32 @@ def format_task_timeline_log(
         if stage_tag:
             return _format_phone_binding_timeline_body(body, stage_tag=stage_tag)
         return body
+
+    if registration_task:
+        normalized_stage_index = int(stage_index or 0)
+        normalized_stage_total = int(stage_total or 0)
+        tags.append("ChatGPT注册")
+        if normalized_index > 0:
+            attempt_tag = f"尝试 {normalized_index}"
+            if normalized_total > 0:
+                attempt_tag = f"{attempt_tag}/{normalized_total}"
+            tags.append(attempt_tag)
+        else:
+            tags.append("任务")
+        if email:
+            tags.append(mask_email_for_log(email))
+        normalized_phase_label = redact_log_text(phase_label).strip()
+        if normalized_stage_index > 0 and normalized_stage_total > 0:
+            stage_text = (
+                f"步骤{_pad(normalized_stage_index, normalized_stage_total)}/"
+                f"{_pad(normalized_stage_total, normalized_stage_total)}"
+            )
+            if normalized_phase_label:
+                stage_text = f"{stage_text} {normalized_phase_label}"
+            tags.append(stage_text)
+        stage_tag = "".join(f"[{tag}]" for tag in tags)
+        body = redact_log_text(message).strip()
+        return _format_registration_timeline_body(body, stage_tag=stage_tag)
 
     if normalized_index > 0 and normalized_total > 0:
         tags.append(f"{normalized_index}/{normalized_total}")
