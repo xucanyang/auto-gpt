@@ -350,7 +350,7 @@ class AccessTokenOnlyCheckoutTests(unittest.TestCase):
         oauth_capture.assert_called_once()
         email_service.finalize_success.assert_called()
 
-    def test_browser_signup_existing_account_never_switches_to_login_recovery(self):
+    def test_browser_signup_existing_account_routes_to_browser_login_recovery(self):
         email_service = mock.Mock()
         email_service.create_email.return_value = {"email": "existing@example.com"}
         engine = AccessTokenOnlyRegistrationEngine(
@@ -365,7 +365,15 @@ class AccessTokenOnlyCheckoutTests(unittest.TestCase):
             sec_ch_ua='"Chromium";v="145"',
             impersonate="chrome145",
             fingerprint=None,
-            last_registration_route_event=None,
+            last_registration_route_event={
+                "email": "existing@example.com",
+                "stage": "after_email",
+                "signal": "login_password",
+                "page_type": "login_password",
+                "source": "browser_registration",
+                "reason": "login_password",
+                "deterministic": True,
+            },
             registration_transport="camoufox_browser",
             registration_stage_transports=[],
         )
@@ -383,7 +391,20 @@ class AccessTokenOnlyCheckoutTests(unittest.TestCase):
                 "_run_browser_registration",
                 return_value=browser_stage,
             ),
-            mock.patch.object(engine, "_capture_browser_oauth_tokens") as browser_login,
+            mock.patch.object(
+                engine,
+                "_capture_browser_oauth_tokens",
+                return_value=(
+                    True,
+                    {
+                        "access_token": "at-existing",
+                        "session_token": "session-existing",
+                        "account_id": "acct-existing",
+                        "workspace_id": "ws-existing",
+                    },
+                ),
+            ) as browser_login,
+            mock.patch.object(engine, "_probe_plus_checkout_billing", return_value={}),
             mock.patch(
                 "services.chatgpt_core.oauth_client.OAuthClient",
                 side_effect=AssertionError("browser signup switched to protocol login"),
@@ -391,14 +412,71 @@ class AccessTokenOnlyCheckoutTests(unittest.TestCase):
         ):
             result = engine.run()
 
-        self.assertFalse(result.success)
-        self.assertIn("不会自动切换登录恢复", result.error_message)
+        self.assertTrue(result.success)
+        self.assertEqual(result.account_id, "acct-existing")
         self.assertEqual(
             result.metadata["chatgpt_existing_account_login_route"]["action"],
-            "explicit_existing_account_capture_required",
+            "login_recovery",
         )
-        browser_login.assert_not_called()
+        self.assertEqual(
+            result.metadata["chatgpt_existing_account_login_route"]["stage"],
+            "after_email",
+        )
+        browser_login.assert_called_once()
         protocol_login.assert_not_called()
+
+    def test_browser_signup_existing_account_skips_when_login_route_disabled(self):
+        email_service = mock.Mock()
+        email_service.create_email.return_value = {"email": "existing@example.com"}
+        engine = AccessTokenOnlyRegistrationEngine(
+            email_service=email_service,
+            proxy_url="http://proxy.local:8080",
+            browser_mode="headless",
+            max_retries=1,
+            extra_config={"chatgpt_existing_account_login_route_enabled": False},
+        )
+        client = mock.Mock(
+            device_id="device-demo",
+            ua="Mozilla/5.0",
+            sec_ch_ua='"Chromium";v="145"',
+            impersonate="chrome145",
+            fingerprint=None,
+            last_registration_route_event={
+                "email": "existing@example.com",
+                "stage": "about_you",
+                "signal": "account_already_exists",
+                "page_type": "about_you",
+                "source": "browser_registration",
+                "reason": "An account already exists for this email address.",
+                "deterministic": True,
+            },
+            registration_transport="camoufox_browser",
+            registration_stage_transports=[],
+        )
+        browser_stage = BrowserRegistrationStageResult(
+            error=(
+                "browser_registration_failed: ExistingAccountDetected: "
+                "user_already_exists: stage=about_you signal=account_already_exists"
+            )
+        )
+
+        with (
+            mock.patch.object(engine, "_build_chatgpt_client", return_value=client),
+            mock.patch.object(
+                engine,
+                "_run_browser_registration",
+                return_value=browser_stage,
+            ),
+            mock.patch.object(engine, "_capture_browser_oauth_tokens") as browser_login,
+        ):
+            with self.assertRaises(ExistingAccountLoginRouteBlocked) as caught:
+                engine.run()
+
+        self.assertEqual(caught.exception.email, "existing@example.com")
+        self.assertTrue(caught.exception.route_event["blocked"])
+        self.assertEqual(caught.exception.route_event["action"], "skip_save")
+        self.assertEqual(caught.exception.route_event["stage"], "about_you")
+        browser_login.assert_not_called()
 
     def test_explicit_browser_existing_account_capture_uses_browser_oauth_only(self):
         email_service = mock.Mock()

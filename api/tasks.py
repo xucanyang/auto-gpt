@@ -97,6 +97,7 @@ from services.chatgpt_core.task_logging import (
     build_task_current_state,
     classify_task_log_level,
     format_task_timeline_log,
+    mask_email_for_log,
     mask_phone_for_log,
     redact_log_text,
     redact_proxy_url,
@@ -110,6 +111,7 @@ from services.chatgpt_core.registration_route_policy import (
     LOGIN_ROUTE_EVENT_KEY,
     LOGIN_ROUTE_TASK_META_KEY,
     build_existing_account_login_route_event,
+    is_existing_account_detected_message,
     parse_bool as parse_route_bool,
 )
 import time, json, asyncio, threading, logging, re, random
@@ -747,7 +749,13 @@ def _coerce_existing_account_login_route_event(
         enabled=enabled,
         routed=routed,
         blocked=blocked,
-        action=str(value.get("action") or ("skip_save" if blocked else "login_recovery" if routed else "")),
+        action=(
+            "skip_save"
+            if blocked
+            else "login_recovery"
+            if routed
+            else str(value.get("action") or "")
+        ),
         source=str(value.get("source") or "registration"),
         base_event=value,
     )
@@ -16044,7 +16052,15 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
         def _redact_proxy_for_log(proxy: Optional[str]) -> str:
             return redact_proxy_url(proxy) or "direct"
 
-        def _log_register_proxy_choice(proxy: str, source: str, index: int, total: int, exit_ip: str = "") -> None:
+        def _log_register_proxy_choice(
+            proxy: str,
+            source: str,
+            index: int,
+            total: int,
+            *,
+            attempt_index: int,
+            exit_ip: str = "",
+        ) -> None:
             label = str(source or "direct").strip() or "direct"
             ip_info = ""
             if exit_ip:
@@ -16059,7 +16075,8 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                     pass
             _log(
                 task_id,
-                f"[代理] 本次注册出口 {index}/{total}: source={label} proxy={_redact_proxy_for_log(proxy)}{ip_info}",
+                f"[代理] attempt={attempt_index} candidate={index}/{total} "
+                f"source={label} proxy={_redact_proxy_for_log(proxy)}{ip_info}",
             )
 
         def _truthy(value, default: bool = False) -> bool:
@@ -16370,6 +16387,34 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
             current_email = req.email or ""
             attempt_id: int | None = None
             browser_register_invoked = False
+            attempt_log_context: dict[str, Any] = {
+                "attempt": i + 1,
+                "email": current_email,
+            }
+
+            def _contextualize_attempt_log(message: str) -> str:
+                text = str(message or "").strip()
+                attempt_label = f"attempt={i + 1}"
+                masked_email = mask_email_for_log(
+                    attempt_log_context.get("email") or current_email
+                )
+                context = (
+                    f"{attempt_label} email={masked_email}"
+                    if masked_email
+                    else attempt_label
+                )
+                if text.upper().startswith("[DEBUG]"):
+                    remainder = text[len("[DEBUG]") :].strip()
+                    return f"[DEBUG][{context}] {remainder}".rstrip()
+                tag_match = re.match(r"^(\[[^\]]+\])\s*(.*)$", text)
+                if tag_match:
+                    tag, remainder = tag_match.groups()
+                    return f"{tag} {context} {remainder}".rstrip()
+                return f"[{context}] {text}".rstrip()
+
+            def _attempt_log(message: str, level: str = "info") -> None:
+                _log(task_id, _contextualize_attempt_log(message), level)
+
             try:
                 from core.proxy_utils import (
                     is_proxy_error_text,
@@ -16431,12 +16476,16 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                 def _register_task_log(message: str, level: str = "info", *_args: Any) -> None:
                     flow = "phone_signup" if phone_signup_entry else "access_token_register"
                     effective_level = classify_task_log_level(message, level, flow=flow)
-                    _log(task_id, str(message or ""), effective_level)
+                    _log(
+                        task_id,
+                        _contextualize_attempt_log(str(message or "")),
+                        effective_level,
+                    )
 
                 _task_store.set_progress(task_id, f"{success}/{target_successes}")
-                _log(
-                    task_id,
-                    f"[账号] -------- 尝试 {i + 1} / 目标成功 {target_successes} / 当前成功数 {success} --------",
+                _attempt_log(
+                    f"[账号] target={target_successes} current_success={success} "
+                    f"executor={req.executor_type or 'protocol'} status=started"
                 )
                 attempt_fingerprint_payload: dict[str, Any] = {}
                 attempt_fingerprint_signature = ""
@@ -16446,7 +16495,9 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                         attempt_fingerprint_signature,
                         attempt_fingerprint_summary,
                     ) = _build_register_attempt_fingerprint(i)
-                    _log(task_id, f"[指纹] 已为第 {i + 1} 次尝试分配独立浏览器指纹：{attempt_fingerprint_summary}")
+                    _attempt_log(
+                        f"[指纹] 已分配独立浏览器指纹：{attempt_fingerprint_summary}"
+                    )
 
                 last_proxy_error = ""
                 last_proxy_error_email = current_email
@@ -16469,17 +16520,23 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                             )
                             if not allocation_ok:
                                 last_proxy_error = allocation_reason
-                                _log(
-                                    task_id,
+                                _attempt_log(
                                     f"[代理] 独立出口 IP 检查未通过，跳过候选 {proxy_index}/{len(candidate_proxies)}：{allocation_reason}",
                                 )
                                 continue
-                            _log(
-                                task_id,
+                            _attempt_log(
                                 f"[代理] 独立出口 IP 已锁定: {allocated_exit_ip} candidate={proxy_index}/{len(candidate_proxies)}",
                             )
-                        _log_register_proxy_choice(_proxy, proxy_source, proxy_index, len(candidate_proxies), exit_ip=allocated_exit_ip)
+                        _log_register_proxy_choice(
+                            _proxy,
+                            proxy_source,
+                            proxy_index,
+                            len(candidate_proxies),
+                            attempt_index=i + 1,
+                            exit_ip=allocated_exit_ip,
+                        )
                         runtime_extra = dict(merged_extra or {})
+                        runtime_extra["__register_task_log_context"] = attempt_log_context
                         if not _proxy and str(proxy_source or "").strip().lower() == "direct":
                             runtime_extra["__register_proxy_mode"] = "direct"
                         runtime_extra["_current_task_id"] = task_id
@@ -16522,10 +16579,9 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                             _platform.mailbox._log_fn = _platform._log_fn
                         if browser_executor:
                             browser_register_invoked = True
-                            _log(
-                                task_id,
-                                "[代理] 浏览器注册链路已启动；为避免邮箱、密码和身份画像分叉，"
-                                "本次失败不再切换代理候选",
+                            _attempt_log(
+                                "[控制] browser_identity_started=yes "
+                                "same_attempt_proxy_failover=disabled"
                             )
                         account = _platform.register(
                             email=req.email or None,
@@ -16539,7 +16595,12 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                     except StopTaskRequested:
                         raise
                     except Exception as proxy_exc:
-                        current_email = current_email or req.email or ""
+                        current_email = str(
+                            attempt_log_context.get("email")
+                            or current_email
+                            or req.email
+                            or ""
+                        ).strip()
                         error_text = str(proxy_exc or "").strip()
                         if _proxy and proxy_pool is not None and str(proxy_source or "").startswith("pool"):
                             proxy_pool.report_fail(_proxy)
@@ -16557,16 +16618,19 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                         if browser_executor and browser_register_invoked:
                             last_proxy_error = error_text
                             last_proxy_error_email = current_email
-                            _log(
-                                task_id,
-                                "[代理] 浏览器注册链路启动后失败；为避免身份分叉，"
-                                f"保持当前代理并终止本次尝试，不切换下一候选: {error_text}",
+                            _attempt_log(
+                                "[控制] browser_identity_started=yes "
+                                "same_attempt_proxy_failover=disabled "
+                                f"reason={sanitize_error_message(error_text)[:300]}",
+                                "debug",
                             )
                             raise
                         if is_proxy_error_text(error_text) and proxy_index < len(candidate_proxies):
                             last_proxy_error = error_text
                             last_proxy_error_email = current_email
-                            _log(task_id, f"[代理] 当前代理失败，保留当前尝试重试下一个代理: {error_text}")
+                            _attempt_log(
+                                f"[代理] 当前代理失败，保留当前尝试重试下一个代理: {error_text}"
+                            )
                             continue
                         raise
                 else:
@@ -16574,6 +16638,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                     raise RuntimeError(final_error)
 
                 current_email = account.email or current_email
+                attempt_log_context["email"] = current_email
                 if isinstance(account.extra, dict):
                     persist_attempt_fingerprint = (
                         req.platform == "chatgpt"
@@ -16734,7 +16799,15 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                             },
                         ),
                     )
-                    return AttemptResult.failed(skip_reason)
+                    return AttemptResult.failed(
+                        skip_reason,
+                        metadata={
+                            "email": str(account.email or current_email or ""),
+                            "reason_code": "failed_skip_save",
+                            "mailbox_action": "success",
+                            "backfill": True,
+                        },
+                    )
                 saved_account = save_account(account)
                 if req.platform == "chatgpt" and saved_account is not None:
                     try:
@@ -16897,14 +16970,13 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                     control.request_stop()
                     _log(task_id, f"[STOP] {zero_amount_stop_reason}")
                 if registered_auth_pending:
-                    _log(
-                        task_id,
-                        f"[PENDING] 远端注册完成，认证材料待补抓: {account.email}",
-                        "warning",
+                    _attempt_log(
+                        "[阶段] stage=auth_capture result=pending saved=yes"
                     )
-                    _log(task_id, "[Auto Upload] 认证材料待补抓，已跳过外部同步")
+                    _attempt_log(
+                        "[Auto Upload] 认证材料待补抓，已跳过外部同步"
+                    )
                 else:
-                    _log(task_id, f"[OK] 注册成功: {account.email}")
                     _auto_upload_integrations(task_id, saved_account or account)
                 cashier_url = (account.extra or {}).get("cashier_url", "")
                 if cashier_url:
@@ -16935,22 +17007,40 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                         },
                     ),
                 )
-                return AttemptResult.success()
+                return AttemptResult.success(
+                    metadata={
+                        "email": str(account.email or current_email or ""),
+                        "reason_code": (
+                            "registered_auth_pending"
+                            if registered_auth_pending
+                            else "success"
+                        ),
+                        "mailbox_action": "success",
+                        "registered_auth_pending": registered_auth_pending,
+                        "backfill": False,
+                    }
+                )
             except SkipCurrentAttemptRequested as e:
+                current_email = str(
+                    attempt_log_context.get("email")
+                    or getattr(e, "email", "")
+                    or current_email
+                    or ""
+                ).strip()
                 route_event = _coerce_existing_account_login_route_event(
                     getattr(e, "route_event", None),
-                    fallback_email=str(getattr(e, "email", "") or current_email or ""),
+                    fallback_email=current_email,
                     default_blocked=bool(getattr(e, "route_event", None)),
                 )
                 if route_event:
                     current_email = str(route_event.get("email") or current_email or "").strip()
+                    attempt_log_context["email"] = current_email
                     _record_existing_account_login_route(task_id, route_event)
-                    _log(
-                        task_id,
-                        f"[已有账号] 已按配置跳过且不保存: {current_email or '-'} reason={route_event.get('reason') or e}",
-                        "warning",
-                    )
-                _log(task_id, f"[SKIP] 已跳过当前账号: {e}")
+                skip_reason_code = (
+                    "existing_account"
+                    if route_event
+                    else str(getattr(e, "code", "") or "skipped")
+                )
                 _save_task_log(
                     req.platform,
                     current_email,
@@ -16965,13 +17055,88 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                         },
                     ),
                 )
-                return AttemptResult.skipped(str(e))
+                return AttemptResult.skipped(
+                    str(e),
+                    metadata={
+                        "email": current_email,
+                        "reason_code": skip_reason_code,
+                        "mailbox_action": "keep" if route_event else "finalized",
+                        "backfill": True,
+                        "existing_account_login_route": route_event,
+                    },
+                )
             except StopTaskRequested as e:
                 _log(task_id, f"[STOP] {e}")
                 return AttemptResult.stopped(str(e))
             except Exception as e:
                 error_text = str(e)
-                _log(task_id, f"[FAIL] 注册失败: {e}")
+                current_email = str(
+                    attempt_log_context.get("email")
+                    or current_email
+                    or ""
+                ).strip()
+                deterministic_existing = is_existing_account_detected_message(
+                    error_text
+                )
+                route_enabled = parse_route_bool(
+                    (
+                        merged_extra.get(
+                            "chatgpt_existing_account_login_route_enabled"
+                        )
+                        if "merged_extra" in locals()
+                        else None
+                    ),
+                    default=True,
+                )
+                if deterministic_existing and not route_enabled:
+                    route_event = _coerce_existing_account_login_route_event(
+                        getattr(e, "route_event", None),
+                        fallback_email=current_email,
+                        default_blocked=True,
+                    )
+                    if not route_event:
+                        route_event = build_existing_account_login_route_event(
+                            email=current_email,
+                            reason=error_text,
+                            stage="task_fallback",
+                            enabled=False,
+                            routed=False,
+                            blocked=True,
+                            action="skip_save",
+                            source="registration_task",
+                            deterministic=True,
+                        )
+                    _record_existing_account_login_route(task_id, route_event)
+                    _save_task_log(
+                        req.platform,
+                        current_email,
+                        "skipped",
+                        error=error_text,
+                        detail=_build_task_log_detail(
+                            task_id,
+                            {
+                                "attempt_outcome": "existing_account_login_route_blocked",
+                                "email": current_email,
+                                "existing_account_login_route": route_event,
+                            },
+                        ),
+                    )
+                    return AttemptResult.skipped(
+                        error_text,
+                        metadata={
+                            "email": current_email,
+                            "reason_code": "existing_account",
+                            "mailbox_action": "keep",
+                            "backfill": True,
+                            "existing_account_login_route": route_event,
+                        },
+                    )
+
+                consumes_target_slot = bool(
+                    browser_executor
+                    and browser_register_invoked
+                    and not deterministic_existing
+                )
                 _save_task_log(
                     req.platform,
                     current_email,
@@ -16987,9 +17152,17 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                 )
                 return AttemptResult.failed(
                     error_text,
-                    consumes_target_slot=bool(
-                        browser_executor and browser_register_invoked
-                    ),
+                    consumes_target_slot=consumes_target_slot,
+                    metadata={
+                        "email": current_email,
+                        "reason_code": (
+                            "existing_account_login_recovery_failed"
+                            if deterministic_existing
+                            else "registration_failed"
+                        ),
+                        "mailbox_action": "finalized",
+                        "backfill": not consumes_target_slot,
+                    },
                 )
             finally:
                 control.finish_attempt(attempt_id)
@@ -17064,6 +17237,20 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
         if attempt_cap > 0:
             _log(task_id, f"[控制] 注册最大尝试次数: {attempt_cap}")
         max_workers = min(req.concurrency, target_successes, attempt_cap or target_successes, 5)
+        if req.platform == "chatgpt":
+            route_enabled = parse_route_bool(
+                initial_merged_extra.get(
+                    "chatgpt_existing_account_login_route_enabled"
+                ),
+                default=True,
+            )
+            _log(
+                task_id,
+                "[控制] registration_policy "
+                f"executor={req.executor_type or 'protocol'} concurrency={max_workers} "
+                f"existing_account_action={'login_recovery' if route_enabled else 'skip'} "
+                "uncertain_browser_failure_slot=consume",
+            )
         stopped = False
         attempt_limit_reached = False
         consumed_browser_failure_slots = 0
@@ -17142,10 +17329,6 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                         errors.append(result.message)
                         if result.consumes_target_slot:
                             consumed_browser_failure_slots += 1
-                            _log(
-                                task_id,
-                                "[控制] 浏览器注册已进入结果不确定区间；本次失败占用一个目标身份槽，禁止补发替代身份",
-                            )
                         if _is_fatal_registration_infrastructure_error(result.message):
                             fatal_registration_error = str(result.message or "").strip()
                             _log(
@@ -17155,6 +17338,47 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                             control.request_stop()
 
                     _task_store.set_progress(task_id, f"{success}/{target_successes}")
+                    result_meta = (
+                        dict(result.metadata)
+                        if isinstance(result.metadata, dict)
+                        else {}
+                    )
+                    result_email = mask_email_for_log(result_meta.get("email") or "")
+                    result_context = f"attempt={(attempt_no or 0) + 1}"
+                    if result_email:
+                        result_context += f" email={result_email}"
+                    if result.outcome != AttemptOutcome.NOT_STARTED:
+                        reason_code = str(
+                            result_meta.get("reason_code")
+                            or result.outcome.value
+                        ).strip()
+                        mailbox_action = str(
+                            result_meta.get("mailbox_action") or "-"
+                        ).strip()
+                        backfill = bool(
+                            result_meta.get(
+                                "backfill",
+                                result.outcome
+                                in {AttemptOutcome.SKIPPED, AttemptOutcome.FAILED}
+                                and not result.consumes_target_slot,
+                            )
+                        )
+                        certainty = (
+                            "unknown"
+                            if result.consumes_target_slot
+                            else "deterministic"
+                            if reason_code.startswith("existing_account")
+                            else "known"
+                        )
+                        _log(
+                            task_id,
+                            f"[结果] {result_context} "
+                            f"outcome={result.outcome.value.upper()} code={reason_code} "
+                            f"mailbox={mailbox_action} "
+                            f"slot={1 if result.consumes_target_slot else 0} "
+                            f"backfill={'yes' if backfill else 'no'} "
+                            f"certainty={certainty} progress={success}/{target_successes}",
+                        )
 
                     if fatal_registration_error:
                         for pending in list(in_flight.keys()):

@@ -29,6 +29,10 @@ from .sentinel_constants import (
     DEFAULT_SENTINEL_FRAME_URL,
     DEFAULT_SENTINEL_SDK_URL,
 )
+from .registration_route_policy import (
+    ExistingAccountDetected,
+    is_existing_account_detected_message,
+)
 
 
 OPENAI_AUTH = os.environ.get("OPENAI_AUTH_BASE_URL", "https://auth.openai.com")
@@ -111,21 +115,6 @@ OTP_INPUT_SELECTORS = [
     "input[type='number']",
     "input[name*='code' i]",
     "input[id*='code' i]",
-]
-
-SIGNUP_RECOVERY_SELECTORS = [
-    'a:has-text("Sign up")',
-    'button:has-text("Sign up")',
-    'a:has-text("sign up")',
-    'button:has-text("sign up")',
-    'a:has-text("Register")',
-    'button:has-text("Register")',
-    'a:has-text("Create account")',
-    'button:has-text("Create account")',
-    'a:has-text("创建账号")',
-    'button:has-text("创建账号")',
-    'a:has-text("注册")',
-    'button:has-text("注册")',
 ]
 
 PASSWORDLESS_LOGIN_SELECTORS = [
@@ -1189,22 +1178,6 @@ def _build_manual_flow_state(page_type: str, current_url: str) -> dict:
     return state
 
 
-def _get_visible_page_text(page) -> str:
-    try:
-        return str(page.evaluate("() => document.body?.innerText || ''") or "")
-    except Exception:
-        return ""
-
-
-def _has_signup_registration_choice(page) -> bool:
-    if not _is_login_password_url(str(page.url or "")):
-        return False
-    if _find_first_selector(page, SIGNUP_RECOVERY_SELECTORS):
-        return True
-    text = _get_visible_page_text(page)
-    return bool(re.search(r"sign\s*up|register|create\s*account|还没有帐户|还没有账户|請註冊|请注册|去注册|注册", text, flags=re.I))
-
-
 def _click_passwordless_login_if_available(page, log, *, context: str) -> bool:
     selector = _click_first(page, PASSWORDLESS_LOGIN_SELECTORS, timeout=1)
     if selector:
@@ -1619,24 +1592,52 @@ def _derive_registration_state_from_page(page) -> dict:
     return state
 
 
-def _recover_signup_password_page(page, log) -> bool:
-    if not _is_login_password_url(str(page.url or "")):
-        return False
-    if not _has_signup_registration_choice(page):
-        return False
-    selector = _click_first(page, SIGNUP_RECOVERY_SELECTORS, timeout=2)
-    if not selector:
-        return False
-    log(f"密码页落到登录态，尝试点击注册入口恢复: {selector}")
-    time.sleep(1.2)
-    return True
-
-
-def _wait_for_signup_entry_transition(page, log, timeout: int = 60) -> dict:
+def _wait_for_signup_entry_transition(
+    page,
+    log,
+    timeout: int = 60,
+    *,
+    response_observer: _NetworkActivityObserver | None = None,
+) -> dict:
     deadline = time.time() + timeout
     passwordless_clicked = False
     otp_sent_at = None
+    processed_responses = 0
     while time.time() < deadline:
+        if response_observer is not None:
+            while processed_responses < len(response_observer.business_responses):
+                response = response_observer.business_responses[processed_responses]
+                processed_responses += 1
+                status, response_url, data, response_text = _browser_response_details(response)
+                response_state = _extract_flow_state(data or None, response_url)
+                response_page_type = str(response_state.get("page_type") or "")
+                if 200 <= status < 300 and response_page_type in {
+                    "create_account_password",
+                    "login_password",
+                    "email_otp_verification",
+                    "email_otp_send",
+                    "about_you",
+                    "add_phone",
+                    "chatgpt_home",
+                    "oauth_callback",
+                }:
+                    response_state["_route_source"] = "authorize_continue_response"
+                    response_state["_route_response_status"] = status
+                    if response_page_type == "email_otp_send":
+                        response_state["page_type"] = "email_otp_verification"
+                    if response_page_type in {
+                        "email_otp_verification",
+                        "email_otp_send",
+                    }:
+                        response_state["_page_otp_triggered"] = True
+                        response_state["_otp_sent_at"] = otp_sent_at
+                    return response_state
+                if status >= 400:
+                    error_text = _browser_response_error(data, response_text)
+                    if error_text:
+                        raise RuntimeError(
+                            f"邮箱页 authorize/continue 失败: {error_text[:300]}"
+                        )
         state = _derive_registration_state_from_page(page)
         if state.get("page_type") in {
             "create_account_password",
@@ -1647,8 +1648,6 @@ def _wait_for_signup_entry_transition(page, log, timeout: int = 60) -> dict:
             "chatgpt_home",
             "oauth_callback",
         }:
-            if state.get("page_type") == "login_password" and _recover_signup_password_page(page, log):
-                return _derive_registration_state_from_page(page)
             if passwordless_clicked and state.get("page_type") == "email_otp_verification":
                 state["_page_otp_triggered"] = True
                 state["_otp_sent_at"] = otp_sent_at
@@ -1671,7 +1670,11 @@ def _wait_for_signup_entry_transition(page, log, timeout: int = 60) -> dict:
     raise RuntimeError("邮箱页提交后未进入密码/验证码页面")
 
 
-def _start_browser_signup_via_page(page, email: str, log) -> dict:
+def _start_browser_signup_via_page(
+    page,
+    email: str,
+    log,
+) -> dict:
     entry_errors: list[str] = []
     for entry_url in (PLATFORM_LOGIN_ENTRY, f"{OPENAI_AUTH}/log-in"):
         try:
@@ -1702,20 +1705,34 @@ def _start_browser_signup_via_page(page, email: str, log) -> dict:
 
         inline_state = _derive_registration_state_from_page(page)
         if inline_state.get("page_type") in {"create_account_password", "login_password"}:
-            if inline_state.get("page_type") == "login_password" and _recover_signup_password_page(page, log):
-                return _derive_registration_state_from_page(page)
             return inline_state
 
         email_submit_at = time.time() - 8
-        submit_selector = _click_first(page, EMAIL_SUBMIT_SELECTORS, timeout=8)
-        if submit_selector:
-            log(f"邮箱页已点击继续按钮: {submit_selector}")
-        elif _submit_form_with_fallback(page, email_selector):
-            log("邮箱页未找到可点击 Continue，已使用表单 fallback 提交")
-        else:
-            raise RuntimeError("邮箱页未找到 Continue 按钮")
+        email_observer = _NetworkActivityObserver(
+            page,
+            (
+                "/api/accounts/authorize/continue",
+                "/api/accounts/login",
+                "/api/accounts/log-in",
+            ),
+        )
+        try:
+            submit_selector = _click_first(page, EMAIL_SUBMIT_SELECTORS, timeout=8)
+            if submit_selector:
+                log(f"邮箱页已点击继续按钮: {submit_selector}")
+            elif _submit_form_with_fallback(page, email_selector):
+                log("邮箱页未找到可点击 Continue，已使用表单 fallback 提交")
+            else:
+                raise RuntimeError("邮箱页未找到 Continue 按钮")
 
-        state = _wait_for_signup_entry_transition(page, log, timeout=60)
+            state = _wait_for_signup_entry_transition(
+                page,
+                log,
+                timeout=60,
+                response_observer=email_observer,
+            )
+        finally:
+            email_observer.close()
         if state.get("page_type") == "email_otp_verification" and not state.get("_otp_sent_at"):
             state["_page_otp_triggered"] = True
             state["_otp_sent_at"] = email_submit_at
@@ -4559,9 +4576,6 @@ def _submit_oauth_password_direct(page, password: str, log) -> dict:
 
 
 def _submit_password_via_page(page, password: str, log) -> dict:
-    if _recover_signup_password_page(page, log):
-        time.sleep(1)
-
     input_selector = _wait_for_any_selector(page, PASSWORD_INPUT_SELECTORS, timeout=15)
     if not input_selector:
         raise RuntimeError("密码页未找到输入框")
@@ -4677,13 +4691,19 @@ def _submit_password_via_page(page, password: str, log) -> dict:
                     "otp_sent_at": submission.started_at - 8,
                     "register_committed": committed_result is not None,
                 }
-            if (
-                committed_result is None
-                and page_type == "login_password"
-                and _recover_signup_password_page(page, log)
-            ):
-                submission.close()
-                return _submit_password_via_page(page, password, log)
+            if committed_result is None and page_type == "login_password":
+                return {
+                    "ok": False,
+                    "status": 409,
+                    "url": current_url,
+                    "data": None,
+                    "text": (
+                        "user_already_exists: browser password submission "
+                        "reached login_password"
+                    ),
+                    "existing_account_signal": "login_password",
+                    "existing_account_stage": "password_submit",
+                }
             error_text = (
                 _extract_auth_error_text(page)
                 if committed_result is None
@@ -5984,6 +6004,49 @@ def _submit_about_you_via_page(
     })
 
 
+def _browser_route_action(page_type: str) -> str:
+    normalized = str(page_type or "").strip().lower()
+    if normalized == "login_password":
+        return "existing_account"
+    if normalized in {"create_account_password", "password"}:
+        return "signup"
+    if normalized in {"email_otp_verification", "email_otp_send"}:
+        return "otp_verify"
+    if normalized == "about_you":
+        return "complete_profile"
+    if normalized in {"oauth_callback", "chatgpt_home"}:
+        return "complete"
+    return "observe"
+
+
+def _raise_existing_account_detected(
+    email: str,
+    state: dict | None,
+    *,
+    stage: str,
+    reason: str,
+    signal: str = "",
+) -> None:
+    route_state = dict(state or {})
+    page_type = str(route_state.get("page_type") or "").strip()
+    normalized_signal = str(signal or "").strip() or (
+        "login_password" if page_type == "login_password" else "account_already_exists"
+    )
+    raise ExistingAccountDetected(
+        email,
+        reason,
+        stage=stage,
+        signal=normalized_signal,
+        page_type=page_type,
+        source="browser_registration",
+        event={
+            "current_url": str(route_state.get("current_url") or "")[:500],
+            "continue_url": str(route_state.get("continue_url") or "")[:500],
+            "route_source": str(route_state.get("_route_source") or "page"),
+        },
+    )
+
+
 def _browser_registration_flow(
     page,
     email: str,
@@ -6013,6 +6076,8 @@ def _browser_registration_flow(
     except _BrowserSignupEntryUnavailable as exc:
         log(f"OpenAI 页面注册入口失败，尝试 ChatGPT authorize 入口: {exc}")
         state = _start_browser_signup_via_authorize(page, email, device_id, log)
+    route_source = str(state.get("_route_source") or "page")
+    route_response_status = state.get("_route_response_status")
     page_otp_triggered = bool(state.pop("_page_otp_triggered", False))
     otp_sent_at_hint = state.pop("_otp_sent_at", None)
     auth_cookies = _get_cookies(page)
@@ -6021,7 +6086,27 @@ def _browser_registration_flow(
         f"login_session={'yes' if auth_cookies.get('login_session') else 'no'}, "
         f"oai-did={'yes' if auth_cookies.get('oai-did') else 'no'}"
     )
-    log(f"注册状态起点: page={state.get('page_type') or '-'} url={(state.get('current_url') or '')[:100]}")
+    initial_page_type = str(state.get("page_type") or "")
+    route_status_suffix = (
+        f" status={route_response_status}" if route_response_status is not None else ""
+    )
+    log(
+        "[路由] stage=after_email "
+        f"source={route_source} page={initial_page_type or '-'} "
+        f"action={_browser_route_action(initial_page_type)}{route_status_suffix}"
+    )
+    log(
+        f"注册状态起点: page={initial_page_type or '-'} "
+        f"url={(state.get('current_url') or '')[:100]}"
+    )
+    if initial_page_type == "login_password":
+        _raise_existing_account_detected(
+            email,
+            state,
+            stage="after_email",
+            reason="browser registration reached login_password after email continue",
+            signal="login_password",
+        )
     register_submitted = False
     browser_otp_sent = False
     signup_committed = False
@@ -6059,9 +6144,31 @@ def _browser_registration_flow(
                 f"oai-client-auth-session={'yes' if pre_cookies.get('oai-client-auth-session') else 'no'}"
             )
             reg_resp = _submit_password_via_page(page, password, log)
-            log(f"密码页提交状态: {reg_resp.get('status', 0)}")
+            password_status = int(reg_resp.get("status", 0) or 0)
+            log(
+                "[阶段] stage=password "
+                f"result={'ok' if reg_resp.get('ok') else 'failed'} status={password_status}"
+            )
+            log(f"密码页提交状态: {password_status}")
             if not reg_resp.get("ok"):
-                raise RuntimeError(f"密码页提交失败: {(reg_resp.get('text') or '')[:300]}")
+                password_error = str(reg_resp.get("text") or "")[:300]
+                if is_existing_account_detected_message(password_error):
+                    _raise_existing_account_detected(
+                        email,
+                        {
+                            **state,
+                            "page_type": "login_password",
+                            "current_url": reg_resp.get("url") or state.get("current_url"),
+                        },
+                        stage=str(
+                            reg_resp.get("existing_account_stage") or "password_submit"
+                        ),
+                        reason=password_error,
+                        signal=str(
+                            reg_resp.get("existing_account_signal") or "login_password"
+                        ),
+                    )
+                raise RuntimeError(f"密码页提交失败: {password_error}")
             register_submitted = True
             # Always keep the password-submit timestamp as the OTP cutoff, even when
             # the API page type is email_otp_send (otp_triggered used to be false and
@@ -6104,9 +6211,16 @@ def _browser_registration_flow(
             continue
 
         if str(state.get("page_type") or "") == "login_password":
-            raise RuntimeError(
-                "user_already_exists: browser registration reached login_password; "
-                "use explicit existing-account capture instead of replaying signup"
+            log(
+                "[路由] stage=state_transition page=login_password "
+                "action=existing_account"
+            )
+            _raise_existing_account_detected(
+                email,
+                state,
+                stage="state_transition",
+                reason="browser registration reached login_password",
+                signal="login_password",
             )
 
         if _is_email_otp(state):
@@ -6258,7 +6372,12 @@ def _browser_registration_flow(
                 user_agent=user_agent,
                 referer=str(state.get("current_url") or state.get("continue_url") or ""),
             )
-            log(f"验证码页提交状态: {otp_resp.get('status', 0)}")
+            otp_status = int(otp_resp.get("status", 0) or 0)
+            log(
+                "[阶段] stage=email_otp "
+                f"result={'ok' if otp_resp.get('ok') else 'failed'} status={otp_status}"
+            )
+            log(f"验证码页提交状态: {otp_status}")
             if not otp_resp.get("ok"):
                 # Validate rejected or never left OTP: allow the same digits to
                 # be fetched again after resend (OpenAI often reuses the code).
@@ -6354,9 +6473,32 @@ def _browser_registration_flow(
                 profile_name=profile_name,
                 profile_birthdate=profile_birthdate,
             )
-            log(f"about_you 提交状态: {about_resp.get('status', 0)}")
+            about_status = int(about_resp.get("status", 0) or 0)
+            about_error = str(about_resp.get("text") or "")[:300]
+            about_existing = bool(
+                not about_resp.get("ok")
+                and is_existing_account_detected_message(about_error)
+            )
+            log(
+                "[阶段] stage=about_you "
+                f"result={'existing_account' if about_existing else 'ok' if about_resp.get('ok') else 'failed'} "
+                f"status={about_status}"
+            )
+            log(f"about_you 提交状态: {about_status}")
             if not about_resp.get("ok"):
-                raise RuntimeError(f"about_you 提交失败: {(about_resp.get('text') or '')[:300]}")
+                if about_existing:
+                    _raise_existing_account_detected(
+                        email,
+                        {
+                            **state,
+                            "page_type": "about_you",
+                            "current_url": about_resp.get("url") or state.get("current_url"),
+                        },
+                        stage="about_you",
+                        reason=about_error,
+                        signal="account_already_exists",
+                    )
+                raise RuntimeError(f"about_you 提交失败: {about_error}")
             signup_committed = bool(about_resp.get("signup_committed"))
             _wait_for_auth_page_settle(page, timeout=12.0, log=log)
             state = _extract_flow_state(about_resp.get("data"), about_resp.get("url", page.url))

@@ -276,14 +276,15 @@ class RefreshTokenRegistrationEngine:
             except TypeError:
                 self.callback_logger(log_message)
 
-        if effective_level == "error":
-            logger.error(log_message)
-        elif effective_level == "warning":
-            logger.warning(log_message)
-        elif effective_level == "debug":
-            logger.debug(log_message)
-        else:
-            logger.info(log_message)
+        if not self.callback_logger:
+            if effective_level == "error":
+                logger.error(log_message)
+            elif effective_level == "warning":
+                logger.warning(log_message)
+            elif effective_level == "debug":
+                logger.debug(log_message)
+            else:
+                logger.info(log_message)
 
     def _log_stage(self, title: str, *, level: str = "info"):
         self._log(f"[阶段] ================ {title} ================", level)

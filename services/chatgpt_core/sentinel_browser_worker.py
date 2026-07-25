@@ -111,6 +111,9 @@ def main() -> int:
                         f"browser_registration_failed: {type(exc).__name__}: {exc}"
                     )[:1000]
                 }
+                route_event = getattr(exc, "route_event", None)
+                if isinstance(route_event, dict):
+                    value["route_event"] = dict(route_event)
         elif operation == "browser_oauth_token_recovery":
             from services.chatgpt_core.browser_registration import (
                 run_browser_oauth_token_recovery_sync,

@@ -57,10 +57,11 @@ class AttemptResult:
     outcome: AttemptOutcome
     message: str = ""
     consumes_target_slot: bool = False
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
-    def success(cls) -> "AttemptResult":
-        return cls(AttemptOutcome.SUCCESS)
+    def success(cls, *, metadata: dict[str, Any] | None = None) -> "AttemptResult":
+        return cls(AttemptOutcome.SUCCESS, metadata=dict(metadata or {}))
 
     @classmethod
     def failed(
@@ -68,16 +69,23 @@ class AttemptResult:
         message: str,
         *,
         consumes_target_slot: bool = False,
+        metadata: dict[str, Any] | None = None,
     ) -> "AttemptResult":
         return cls(
             AttemptOutcome.FAILED,
             message,
             consumes_target_slot=consumes_target_slot,
+            metadata=dict(metadata or {}),
         )
 
     @classmethod
-    def skipped(cls, message: str) -> "AttemptResult":
-        return cls(AttemptOutcome.SKIPPED, message)
+    def skipped(
+        cls,
+        message: str,
+        *,
+        metadata: dict[str, Any] | None = None,
+    ) -> "AttemptResult":
+        return cls(AttemptOutcome.SKIPPED, message, metadata=dict(metadata or {}))
 
     @classmethod
     def stopped(cls, message: str) -> "AttemptResult":

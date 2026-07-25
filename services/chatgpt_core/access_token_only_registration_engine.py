@@ -162,6 +162,10 @@ class AccessTokenOnlyRegistrationEngine:
         self.task_uuid = task_uuid
         self.max_retries = max(1, int(max_retries or 1))
         self.extra_config = dict(extra_config or {})
+        raw_log_context = self.extra_config.get("__register_task_log_context")
+        self._task_log_context = (
+            raw_log_context if isinstance(raw_log_context, dict) else None
+        )
         
         self.email = None
         self.password = None
@@ -578,14 +582,19 @@ class AccessTokenOnlyRegistrationEngine:
                 self.callback_logger(log_message, effective_level)
             except TypeError:
                 self.callback_logger(log_message)
-        if effective_level == "error":
-            logger.error(log_message)
-        elif effective_level == "warning":
-            logger.warning(log_message)
-        elif effective_level == "debug":
-            logger.debug(log_message)
-        else:
-            logger.info(log_message)
+        # Task callbacks already own the persisted log and stdout line. Emitting
+        # the same message through the module logger produces a second unscoped
+        # line in Docker logs. Standalone callers without a callback still use
+        # the normal Python logger.
+        if not self.callback_logger:
+            if effective_level == "error":
+                logger.error(log_message)
+            elif effective_level == "warning":
+                logger.warning(log_message)
+            elif effective_level == "debug":
+                logger.debug(log_message)
+            else:
+                logger.info(log_message)
 
     def _should_retry(self, message: str) -> bool:
         text = str(message or "").lower()
@@ -730,6 +739,23 @@ class AccessTokenOnlyRegistrationEngine:
             600,
             max(300, int(otp_account_budget_timeout or 0) + 180),
         )
+
+        def _browser_stage_log(message: str) -> None:
+            clean = str(message or "").strip()
+            business_prefixes = (
+                "[路由]",
+                "[阶段]",
+                "[已有账号]",
+                "[结果]",
+                "[控制]",
+                "[邮箱]",
+                "[验证码]",
+            )
+            if clean.startswith(business_prefixes):
+                self._log(clean)
+            else:
+                self._log(f"[浏览器注册] {clean}", "debug")
+
         stage_result = run_browser_registration_stage(
             email=email_addr,
             password=password,
@@ -741,15 +767,19 @@ class AccessTokenOnlyRegistrationEngine:
             initial_state=initial_state,
             stop_check=chatgpt_client._check_stop,
             hard_timeout_seconds=hard_timeout_seconds,
-            log_fn=lambda message: self._log(f"[浏览器注册] {message}"),
+            log_fn=_browser_stage_log,
         )
+        route_event = getattr(stage_result, "route_event", None)
+        if isinstance(route_event, dict) and route_event:
+            chatgpt_client.last_registration_route_event = dict(route_event)
         error = str(stage_result.error or "")
         signup_complete = bool(getattr(stage_result, "signup_complete", False))
         if not signup_complete and not stage_result.ok:
-            self._log(
-                f"Camoufox 注册链路失败: {error or 'browser_registration_failed'}",
-                "warning",
-            )
+            if not (isinstance(route_event, dict) and route_event):
+                self._log(
+                    f"Camoufox 注册链路失败: {error or 'browser_registration_failed'}",
+                    "warning",
+                )
             return stage_result
 
         if error and "missing_web_session" in error:
@@ -1252,7 +1282,8 @@ class AccessTokenOnlyRegistrationEngine:
             registration_max_retries = 1
             if self.max_retries > 1:
                 self._log(
-                    "浏览器注册完整链路固定为单次执行，禁止对结果不确定的 signup 重放"
+                    "浏览器注册完整链路固定为单次执行，禁止对结果不确定的 signup 重放",
+                    "debug",
                 )
         register_otp_wait_seconds = self._read_int_config(
             "chatgpt_register_otp_wait_seconds",
@@ -1309,12 +1340,6 @@ class AccessTokenOnlyRegistrationEngine:
                         self._log(f"整流程重试 {attempt + 1}/{registration_max_retries} ...")
                         time.sleep(1)
 
-                    if not existing_account_capture:
-                        self._log(
-                            "[已有账号] 注册阶段遇到已注册邮箱时"
-                            f"{'允许路由到登录恢复' if existing_account_login_route_allowed else '禁止路由到登录恢复，将跳过且不保存'}"
-                        )
-
                     if existing_account_capture or self._is_browser_executor():
                         homepage_ok, homepage_error = True, ""
                         if self._is_browser_executor() and not existing_account_capture:
@@ -1347,6 +1372,8 @@ class AccessTokenOnlyRegistrationEngine:
                         self._finalize_email_service_failure(result, fallback_error=result.error_message)
                         return result
                     email_addr = locked_email_addr
+                    if self._task_log_context is not None:
+                        self._task_log_context["email"] = email_addr
 
                     result.email = email_addr
                     pwd = locked_password
@@ -1494,52 +1521,45 @@ class AccessTokenOnlyRegistrationEngine:
                     if not existing_account_capture:
                         if not success:
                             if is_existing_account_login_route_message(msg):
-                                if self._is_browser_executor():
-                                    existing_account_login_route_event = build_existing_account_login_route_event(
-                                        email=email_addr,
-                                        reason=msg,
-                                        stage="browser_registration",
-                                        enabled=existing_account_login_route_allowed,
-                                        routed=False,
-                                        blocked=True,
-                                        action="explicit_existing_account_capture_required",
-                                        source="access_token_only_registration",
-                                        base_event=getattr(
-                                            chatgpt_client,
-                                            "last_registration_route_event",
-                                            None,
-                                        ),
-                                    )
-                                    last_error = (
-                                        "浏览器注册检测到该邮箱已存在；当前注册执行器不会自动切换登录恢复，"
-                                        "请显式启用已有账号抓取"
-                                    )
-                                    result.error_message = last_error
-                                    result.email = email_addr
-                                    result.password = pwd
-                                    result.metadata = {
-                                        "chatgpt_existing_account_login_route": existing_account_login_route_event,
-                                    }
-                                    self._log(f"[已有账号] {last_error}: {email_addr}", "warning")
-                                    self._finalize_email_service_failure(
-                                        result,
-                                        fallback_error=last_error,
-                                    )
-                                    return result
-
+                                base_route_event = getattr(
+                                    chatgpt_client,
+                                    "last_registration_route_event",
+                                    None,
+                                )
+                                base_route_event = (
+                                    dict(base_route_event)
+                                    if isinstance(base_route_event, dict)
+                                    else {}
+                                )
+                                route_reason = str(
+                                    base_route_event.get("reason") or msg or ""
+                                ).strip()
                                 existing_account_login_route_event = build_existing_account_login_route_event(
                                     email=email_addr,
-                                    reason=msg,
-                                    stage="register_complete_flow",
+                                    reason=route_reason,
+                                    stage=str(
+                                        base_route_event.get("stage")
+                                        or (
+                                            "browser_registration"
+                                            if self._is_browser_executor()
+                                            else "register_complete_flow"
+                                        )
+                                    ),
                                     enabled=existing_account_login_route_allowed,
                                     routed=existing_account_login_route_allowed,
                                     blocked=not existing_account_login_route_allowed,
                                     action="login_recovery" if existing_account_login_route_allowed else "skip_save",
-                                    source="access_token_only_registration",
-                                    base_event=getattr(chatgpt_client, "last_registration_route_event", None),
+                                    source=str(
+                                        base_route_event.get("source")
+                                        or "access_token_only_registration"
+                                    ),
+                                    deterministic=True,
+                                    base_event=base_route_event,
                                 )
                                 if not existing_account_login_route_allowed:
-                                    last_error = "注册阶段检测到该邮箱已存在，已按配置禁止路由到登录，账号未保存"
+                                    last_error = (
+                                        "注册阶段检测到该邮箱已存在，已按配置跳过且不保存账号"
+                                    )
                                     result.error_message = last_error
                                     result.email = email_addr
                                     result.password = pwd
@@ -1547,58 +1567,95 @@ class AccessTokenOnlyRegistrationEngine:
                                         "chatgpt_existing_account_login_route": existing_account_login_route_event,
                                     }
                                     self._log(
-                                        f"[已有账号] 已跳过并禁止保存: {email_addr or '-'} reason={msg}",
-                                        "warning",
+                                        "[已有账号] detection=deterministic "
+                                        f"stage={existing_account_login_route_event.get('stage') or '-'} "
+                                        f"signal={existing_account_login_route_event.get('signal') or '-'} "
+                                        "action=skip mailbox=keep slot=0"
                                     )
                                     self._finalize_email_service_failure(result, fallback_error=last_error)
                                     raise ExistingAccountLoginRouteBlocked(
                                         email_addr,
-                                        msg,
+                                        route_reason,
                                         existing_account_login_route_event,
                                     )
 
                                 self._log(
-                                    f"[已有账号] 注册阶段命中已注册邮箱，无 RT 方案切换到登录恢复: {email_addr}",
-                                    "warning",
+                                    "[已有账号] detection=deterministic "
+                                    f"stage={existing_account_login_route_event.get('stage') or '-'} "
+                                    f"signal={existing_account_login_route_event.get('signal') or '-'} "
+                                    "action=login_recovery"
                                 )
-                                try:
-                                    from services.chatgpt_core.oauth_client import OAuthClient
+                                tokens = None
+                                login_error = ""
+                                oauth_client = None
+                                if self._is_browser_executor():
+                                    try:
+                                        browser_ok, browser_payload = self._capture_browser_oauth_tokens(
+                                            chatgpt_client=chatgpt_client,
+                                            email_addr=email_addr,
+                                            password=pwd,
+                                            skymail_adapter=skymail_adapter,
+                                        )
+                                        if browser_ok and isinstance(browser_payload, dict):
+                                            tokens = dict(browser_payload)
+                                        else:
+                                            login_error = str(
+                                                browser_payload
+                                                or "浏览器已有账号登录恢复失败"
+                                            )
+                                    except Exception as login_exc:
+                                        login_error = str(
+                                            login_exc or "浏览器已有账号登录恢复失败"
+                                        )
+                                else:
+                                    try:
+                                        from services.chatgpt_core.oauth_client import OAuthClient
 
-                                    oauth_client = OAuthClient(
-                                        self.extra_config,
-                                        proxy=self.proxy_url,
-                                        verbose=False,
-                                        browser_mode=self.browser_mode,
-                                    )
-                                    oauth_client._log = lambda message: self._log(f"[登录链路] {message}")
-                                    tokens = oauth_client.login_and_get_tokens(
-                                        email_addr,
-                                        pwd,
-                                        device_id=getattr(chatgpt_client, "device_id", "") or "",
-                                        user_agent=getattr(chatgpt_client, "ua", None),
-                                        sec_ch_ua=getattr(chatgpt_client, "sec_ch_ua", None),
-                                        impersonate=getattr(chatgpt_client, "impersonate", None),
-                                        browser_fingerprint=getattr(chatgpt_client, "fingerprint", None),
-                                        skymail_client=skymail_adapter,
-                                        prefer_passwordless_login=True,
-                                        allow_phone_verification=False,
-                                        force_new_browser=True,
-                                        force_chatgpt_entry=False,
-                                        screen_hint="login",
-                                        force_password_login=False,
-                                        complete_about_you_if_needed=True,
-                                        first_name=first_name,
-                                        last_name=last_name,
-                                        birthdate=birthdate,
-                                        login_source="access_token_only:existing_account_recovery",
-                                        allow_add_phone_session_recovery=False,
-                                    )
-                                except Exception as login_exc:
-                                    tokens = None
-                                    oauth_client = None
-                                    last_error = str(login_exc or "已有账号登录恢复失败")
+                                        oauth_client = OAuthClient(
+                                            self.extra_config,
+                                            proxy=self.proxy_url,
+                                            verbose=False,
+                                            browser_mode=self.browser_mode,
+                                        )
+                                        oauth_client._log = lambda message: self._log(f"[登录链路] {message}")
+                                        tokens = oauth_client.login_and_get_tokens(
+                                            email_addr,
+                                            pwd,
+                                            device_id=getattr(chatgpt_client, "device_id", "") or "",
+                                            user_agent=getattr(chatgpt_client, "ua", None),
+                                            sec_ch_ua=getattr(chatgpt_client, "sec_ch_ua", None),
+                                            impersonate=getattr(chatgpt_client, "impersonate", None),
+                                            browser_fingerprint=getattr(chatgpt_client, "fingerprint", None),
+                                            skymail_client=skymail_adapter,
+                                            prefer_passwordless_login=True,
+                                            allow_phone_verification=False,
+                                            force_new_browser=True,
+                                            force_chatgpt_entry=False,
+                                            screen_hint="login",
+                                            force_password_login=False,
+                                            complete_about_you_if_needed=True,
+                                            first_name=first_name,
+                                            last_name=last_name,
+                                            birthdate=birthdate,
+                                            login_source="access_token_only:existing_account_recovery",
+                                            allow_add_phone_session_recovery=False,
+                                        )
+                                    except Exception as login_exc:
+                                        tokens = None
+                                        oauth_client = None
+                                        login_error = str(
+                                            login_exc or "已有账号登录恢复失败"
+                                        )
                                 if not tokens:
-                                    last_error = str(getattr(oauth_client, "last_error", "") or last_error or "已有账号登录恢复失败")
+                                    login_error = str(
+                                        getattr(oauth_client, "last_error", "")
+                                        or login_error
+                                        or "已有账号登录恢复失败"
+                                    )
+                                    last_error = (
+                                        "user_already_exists: login_recovery_failed: "
+                                        f"{login_error}"
+                                    )
                                     if attempt < registration_max_retries - 1 and self._should_retry(last_error):
                                         self._log(f"已有账号登录恢复失败，准备整流程重试: {last_error}")
                                         continue
@@ -1610,6 +1667,9 @@ class AccessTokenOnlyRegistrationEngine:
                                     }
                                     self._finalize_email_service_failure(result, fallback_error=last_error)
                                     return result
+                                self._log(
+                                    "[已有账号] action=login_recovery result=success saved=yes"
+                                )
                                 session_ok = True
                                 session_result = dict(tokens or {})
                                 session_result.setdefault("access_token", str((tokens or {}).get("access_token") or ""))

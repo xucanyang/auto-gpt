@@ -12,6 +12,7 @@ from services.chatgpt_core.task_logging import (
     build_task_current_state,
     classify_task_log_level,
     format_task_timeline_log,
+    mask_email_for_log,
     mask_phone_for_log,
     redact_log_text,
     redact_proxy_url,
@@ -97,6 +98,8 @@ def test_classify_task_log_level_sends_low_level_register_noise_to_debug():
 
     assert classify_task_log_level("[账号] -------- 尝试 1 / 目标成功 1 / 当前成功数 0 --------", flow="access_token_register") == "info"
     assert classify_task_log_level("[验证码] 等待邮箱验证码：注册阶段邮箱验证码 timeout=600s", flow="access_token_register") == "info"
+    assert classify_task_log_level("[路由] stage=after_email page=login_password action=existing_account", flow="access_token_register") == "info"
+    assert classify_task_log_level("[已有账号] stage=about_you action=skip slot=0", flow="access_token_register") == "info"
     assert classify_task_log_level("[FAIL] 注册失败: 验证码失败: HTTP 403", flow="access_token_register") == "info"
     assert classify_task_log_level("显式 debug", "debug", flow="access_token_register") == "debug"
     assert classify_task_log_level("显式 warning", "warning", flow="access_token_register") == "warning"
@@ -118,6 +121,11 @@ def test_raw_line_and_phone_helpers_do_not_expose_sms_api_secret():
     assert "token=secret" not in safe
     assert safe.endswith("https://sms.example.com/get")
     assert mask_phone_for_log("+15551234567") != "+15551234567"
+
+
+def test_mask_email_for_log_preserves_domain_and_compacts_local_part():
+    masked = mask_email_for_log("ahem.oafs.55+gpt1@icloud.com")
+    assert masked == "ahe***1@icloud.com"
 
 
 def test_raw_email_api_line_keeps_email_and_endpoint_but_removes_url_secrets():

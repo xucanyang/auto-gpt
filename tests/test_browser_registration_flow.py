@@ -58,9 +58,9 @@ class _FakeLocator:
 
 
 class _FakeResponse:
-    def __init__(self, status, data=None, text=""):
+    def __init__(self, status, data=None, text="", url=""):
         self.status = status
-        self.url = "https://auth.openai.com/api/accounts/email-otp/validate"
+        self.url = url or "https://auth.openai.com/api/accounts/email-otp/validate"
         self._data = data
         self._text = text
 
@@ -391,7 +391,6 @@ class BrowserRegistrationFlowTests(unittest.TestCase):
                 "_derive_registration_state_from_page",
                 return_value=login_state,
             ),
-            mock.patch.object(br, "_recover_signup_password_page", return_value=False),
             mock.patch.object(br, "_click_passwordless_login_if_available") as passwordless,
         ):
             result = br._wait_for_signup_entry_transition(
@@ -402,6 +401,111 @@ class BrowserRegistrationFlowTests(unittest.TestCase):
 
         self.assertEqual(result, login_state)
         passwordless.assert_not_called()
+
+    def test_signup_transition_prefers_authorize_continue_response_page_type(self):
+        page = mock.Mock()
+        response = _FakeResponse(
+            200,
+            data={
+                "page": {
+                    "type": "login_password",
+                    "payload": {"url": "/log-in/password"},
+                }
+            },
+            url="https://auth.openai.com/api/accounts/authorize/continue",
+        )
+        observer = types.SimpleNamespace(business_responses=[response])
+
+        result = br._wait_for_signup_entry_transition(
+            page,
+            lambda _message: None,
+            timeout=1,
+            response_observer=observer,
+        )
+
+        self.assertEqual(result["page_type"], "login_password")
+        self.assertEqual(result["_route_source"], "authorize_continue_response")
+        self.assertEqual(result["_route_response_status"], 200)
+
+    def test_browser_registration_login_password_is_structured_existing_account(self):
+        page = mock.Mock()
+        page.url = "https://auth.openai.com/log-in/password"
+        page.evaluate.return_value = "Mozilla/5.0 Camoufox"
+        page.context.cookies.return_value = []
+        login_state = {
+            "page_type": "login_password",
+            "current_url": page.url,
+            "_route_source": "authorize_continue_response",
+        }
+
+        with (
+            mock.patch.object(br, "_seed_browser_device_id"),
+            mock.patch.object(
+                br,
+                "_start_browser_signup_via_page",
+                return_value=login_state,
+            ),
+        ):
+            with self.assertRaises(br.ExistingAccountDetected) as caught:
+                br._browser_registration_flow(
+                    page,
+                    "existing@example.com",
+                    "OpenAI9_policy!",
+                    lambda *_args, **_kwargs: "123456",
+                    None,
+                    lambda _message: None,
+                )
+
+        event = caught.exception.route_event
+        self.assertEqual(event["stage"], "after_email")
+        self.assertEqual(event["signal"], "login_password")
+        self.assertEqual(event["page_type"], "login_password")
+        self.assertTrue(event["deterministic"])
+
+    def test_browser_registration_about_you_existing_is_structured_late_signal(self):
+        page = mock.Mock()
+        page.url = "https://auth.openai.com/about-you"
+        page.evaluate.return_value = "Mozilla/5.0 Camoufox"
+        page.context.cookies.return_value = []
+        about_state = {
+            "page_type": "about_you",
+            "current_url": page.url,
+        }
+
+        with (
+            mock.patch.object(br, "_seed_browser_device_id"),
+            mock.patch.object(
+                br,
+                "_start_browser_signup_via_page",
+                return_value=about_state,
+            ),
+            mock.patch.object(br, "_ensure_about_you_page"),
+            mock.patch.object(
+                br,
+                "_submit_about_you_via_page",
+                return_value={
+                    "ok": False,
+                    "status": 400,
+                    "url": page.url,
+                    "text": "An account already exists for this email address.",
+                },
+            ),
+        ):
+            with self.assertRaises(br.ExistingAccountDetected) as caught:
+                br._browser_registration_flow(
+                    page,
+                    "existing@example.com",
+                    "OpenAI9_policy!",
+                    lambda *_args, **_kwargs: "123456",
+                    None,
+                    lambda _message: None,
+                )
+
+        event = caught.exception.route_event
+        self.assertEqual(event["stage"], "about_you")
+        self.assertEqual(event["signal"], "account_already_exists")
+        self.assertEqual(event["page_type"], "about_you")
+        self.assertTrue(event["deterministic"])
 
     def test_hidden_password_input_does_not_override_visible_otp(self):
         page = mock.Mock()
@@ -458,7 +562,6 @@ class BrowserRegistrationFlowTests(unittest.TestCase):
         submission.started_at = 100.0
 
         with (
-            mock.patch.object(br, "_recover_signup_password_page", return_value=False),
             mock.patch.object(br, "_wait_for_any_selector", return_value='input[type="password"]'),
             mock.patch.object(br, "_fill_input_like_user", return_value=True),
             mock.patch.object(br, "_browser_pause"),
@@ -505,7 +608,6 @@ class BrowserRegistrationFlowTests(unittest.TestCase):
             return clock[0]
 
         with (
-            mock.patch.object(br, "_recover_signup_password_page", return_value=False),
             mock.patch.object(br, "_wait_for_any_selector", return_value='input[type="password"]'),
             mock.patch.object(br, "_fill_input_like_user", return_value=True),
             mock.patch.object(br, "_browser_pause"),
@@ -563,7 +665,6 @@ class BrowserRegistrationFlowTests(unittest.TestCase):
         submission.started_at = 100.0
 
         with (
-            mock.patch.object(br, "_recover_signup_password_page", return_value=False),
             mock.patch.object(br, "_wait_for_any_selector", return_value='input[type="password"]'),
             mock.patch.object(br, "_fill_input_like_user", return_value=True),
             mock.patch.object(br, "_browser_pause"),

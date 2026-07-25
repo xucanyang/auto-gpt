@@ -6,6 +6,10 @@ import api.actions as api_actions
 from fastapi import HTTPException
 from sqlmodel import Session, SQLModel, create_engine, select
 from core.task_runtime import StopTaskRequested
+from services.chatgpt_core.registration_route_policy import (
+    ExistingAccountLoginRouteBlocked,
+    build_existing_account_login_route_event,
+)
 from api.tasks import (
     BatchPaymentLinkTaskRequest,
     BatchResumeSubscriptionAuthTaskRequest,
@@ -494,9 +498,17 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
         self.assertEqual(create_mailbox.call_count, 1)
         self.assertTrue(
             any(
-                "浏览器注册链路启动后失败" in line
-                and "避免身份分叉" in line
-                and "不切换下一候选" in line
+                "same_attempt_proxy_failover=disabled" in line
+                and "proxy connection timed out" in line
+                for line in snapshot["logs"]
+            )
+        )
+        self.assertTrue(
+            any(
+                "[结果] attempt=1" in line
+                and "outcome=FAILED" in line
+                and "slot=1" in line
+                and "backfill=no" in line
                 for line in snapshot["logs"]
             )
         )
@@ -504,7 +516,93 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
             any("保留当前尝试重试下一个代理" in line for line in snapshot["logs"])
         )
         self.assertTrue(
-            any("占用一个目标身份槽" in line for line in snapshot["logs"])
+            any(
+                "certainty=unknown" in line and "slot=1" in line
+                for line in snapshot["logs"]
+            )
+        )
+
+    def test_browser_existing_account_skip_does_not_consume_slot_and_backfills(self):
+        calls = []
+
+        class BrowserExistingThenSuccessPlatform(_FakePlatform):
+            def register(self, email=None, password=None):
+                calls.append(len(calls) + 1)
+                if len(calls) == 1:
+                    route_event = build_existing_account_login_route_event(
+                        email="existing@example.com",
+                        reason="account already exists",
+                        stage="after_email",
+                        enabled=False,
+                        routed=False,
+                        blocked=True,
+                        action="skip_save",
+                        source="browser_registration",
+                        signal="login_password",
+                        page_type="login_password",
+                        deterministic=True,
+                    )
+                    raise ExistingAccountLoginRouteBlocked(
+                        "existing@example.com",
+                        "account already exists",
+                        route_event,
+                    )
+                return Account(
+                    platform="chatgpt",
+                    email="replacement@example.com",
+                    password=password or "pw",
+                    token="at-replacement",
+                    extra={},
+                )
+
+        task_id = "task-browser-existing-account-backfill"
+        req = RegisterTaskRequest(
+            platform="chatgpt",
+            count=1,
+            concurrency=1,
+            executor_type="headless",
+            proxy_mode="direct",
+            extra={
+                "mail_provider": "fake",
+                "chatgpt_existing_account_login_route_enabled": False,
+                "register_max_attempts": 2,
+            },
+        )
+        _create_task_record(task_id, req, "manual", None)
+
+        with (
+            patch(
+                "services.chatgpt_core.ChatGPTPlatform",
+                BrowserExistingThenSuccessPlatform,
+            ),
+            patch("core.base_mailbox.create_mailbox", return_value=_FakeMailbox()),
+            patch("core.db.save_account", side_effect=lambda account: account),
+            patch("api.tasks.schedule_chatgpt_local_status_refresh_for_account_id"),
+            patch("api.tasks._auto_upload_integrations"),
+            patch("api.tasks._save_task_log"),
+        ):
+            _run_register(task_id, req)
+
+        snapshot = _task_store.snapshot(task_id)
+        self.assertEqual(snapshot["status"], "done")
+        self.assertEqual(snapshot["success"], 1)
+        self.assertEqual(snapshot["skipped"], 1)
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(
+            any(
+                "[结果] attempt=1" in line
+                and "outcome=SKIPPED" in line
+                and "code=existing_account" in line
+                and "slot=0" in line
+                and "backfill=yes" in line
+                for line in snapshot["logs"]
+            )
+        )
+        self.assertFalse(
+            any(
+                "[结果] attempt=1" in line and "slot=1" in line
+                for line in snapshot["logs"]
+            )
         )
 
     def test_browser_uncertain_failure_keeps_remaining_requested_identity_slots(self):
@@ -737,14 +835,18 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
 
         snapshot = _task_store.snapshot(task_id)
         logs = snapshot["logs"]
-        headers = [line for line in logs if "[账号] -------- 尝试 " in line]
+        headers = [line for line in logs if "[账号] attempt=" in line]
 
         self.assertEqual(snapshot["status"], "done")
         self.assertEqual(snapshot["success"], 2)
         self.assertEqual(len(headers), 2)
-        self.assertIn("尝试 1 / 目标成功 2 / 当前成功数 0", headers[0])
-        self.assertIn("尝试 2 / 目标成功 2 / 当前成功数 1", headers[1])
-        first_success_index = next(index for index, line in enumerate(logs) if "注册成功" in line)
+        self.assertIn("attempt=1 target=2 current_success=0", headers[0])
+        self.assertIn("attempt=2 target=2 current_success=1", headers[1])
+        first_success_index = next(
+            index
+            for index, line in enumerate(logs)
+            if "[结果] attempt=1" in line and "outcome=SUCCESS" in line
+        )
         separator_index = logs.index("", first_success_index + 1)
         second_header_index = logs.index(headers[1])
         self.assertLess(first_success_index, separator_index)
@@ -1034,7 +1136,20 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
             snapshot["meta"]["auth_pending_accounts"][0]["email"],
             "pending@example.com",
         )
-        self.assertTrue(any("[PENDING]" in line for line in snapshot["logs"]))
+        self.assertTrue(
+            any(
+                "[阶段] attempt=1" in line
+                and "stage=auth_capture result=pending" in line
+                for line in snapshot["logs"]
+            )
+        )
+        self.assertTrue(
+            any(
+                "[结果] attempt=1" in line
+                and "code=registered_auth_pending" in line
+                for line in snapshot["logs"]
+            )
+        )
         auto_upload.assert_not_called()
         schedule_refresh.assert_not_called()
         sync_hme.assert_called_once()

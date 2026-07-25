@@ -6,6 +6,25 @@
 
 ## [Unreleased] (未发布)
 
+## [2.8.45] - 2026-07-26
+
+### 修复 (Fixed)
+- **浏览器/协议已有账号分流统一**：浏览器执行器不再绕开 `chatgpt_existing_account_login_route_enabled` 契约。登录路由开启时走 browser OAuth 登录恢复并保存；关闭时确定性已有账号 `SKIP`（HME `keep`、不入库、不占目标身份槽并补下一 attempt）。涉及 `access_token_only_registration_engine.py`、`browser_registration.py`、`registration_route_policy.py`、`api/tasks.py`。
+- **取消 login→signup 强制掰回**：邮箱后/密码阶段命中 `login_password` 不再默认点 Sign up 强行恢复注册流；改为按已有账号策略分流。
+- **about_you late `account already exists` 结构化兜底**：OpenAI 在密码/OTP 成功后才于 `create_account` 返回已存在时，仍按确定性已有账号处理，避免被任务层当成「结果不确定」失败。
+- **任务占槽语义纠偏**：确定性 SKIP（已有账号 / 路由关闭）`consumes_target_slot=0` 且可 backfill；真正不确定的浏览器半注册故障仍 `slot=1` 禁止身份重放。`AttemptResult` 增加 `metadata`（outcome / reason_code / mailbox_action / slot / backfill / certainty）。
+
+### 优化 (Changed)
+- **注册 Info/Debug 分层治理**（`task_logging.py`、engine、`api/tasks.py`）：
+  - Info 绑定 attempt/脱敏 email，输出 `[账号][代理][邮箱][路由][阶段][已有账号][结果][控制]` 运营可读链路；
+  - 低层 selector、raw HTTP、Sentinel、cookies presence 等留 Debug；
+  - 业务错误不再误标 `[代理]`；策略横幅每任务一次；
+  - 有 task callback 时 engine 避免 Docker 双重打日志。
+- authorize/continue 响应优先解析有效 `page.type`（含 `email_otp_send` 归并），与页面 URL/DOM 交叉早分流。
+
+### 测试 (Tests)
+- 扩展 `test_access_token_only_checkout.py`、`test_browser_registration_flow.py`、`test_register_task_controls.py`、`test_chatgpt_task_logging.py`：覆盖 browser 已有账号 login recovery / 路由关闭 SKIP 不占槽、late about_you、`page.type` 优先、attempt 上下文与 email mask、不确定失败仍占槽。专项 `94 passed` + browser stub `54 passed`。
+
 ## [2.8.44] - 2026-07-25
 
 ### 修复 (Fixed)
@@ -2870,4 +2889,8 @@
 
 ## 2026-07-25 21:20:38 +0800
 - v2.8.44 桥接命中AT不再丢弃避免二次OAuth拖慢
+- 发布模式: multi
+
+## 2026-07-26 01:58:48 +0800
+- v2.8.45 统一已有账号分流并重构注册Info/Debug日志
 - 发布模式: multi

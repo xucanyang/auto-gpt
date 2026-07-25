@@ -192,6 +192,20 @@ def mask_phone_for_log(value: Any) -> str:
     return f"{prefix}{digits[:4]}***{digits[-4:]}"
 
 
+def mask_email_for_log(value: Any) -> str:
+    """Compact an email for concurrent task context without losing identity."""
+
+    text = str(value or "").strip()
+    if not text or "@" not in text:
+        return text[:24]
+    local, domain = text.rsplit("@", 1)
+    if len(local) <= 3:
+        masked_local = f"{local[:1]}***"
+    else:
+        masked_local = f"{local[:3]}***{local[-1:]}"
+    return f"{masked_local}@{domain}"
+
+
 def redact_raw_phone_line(value: Any) -> str:
     """Redact a pasted ``phone----api_url`` line for task display/history."""
 
@@ -388,6 +402,8 @@ _REGISTER_INFO_PREFIXES = (
     "有效运输层:",
     "Camoufox 注册链路",
     "[阶段]",
+    "[路由]",
+    "[已有账号]",
     "[账号]",
     "[主链路]",
     "[注册]",
@@ -591,6 +607,8 @@ def classify_task_log_level(
         return "debug"
     # 方案 R：create 400 / disallowed / dump / transport 对任务 UI 必须可见
     lowered = text.lower()
+    if lowered.startswith("create_account:") and "sentinel token" in lowered:
+        return "debug"
     if any(marker.lower() in lowered for marker in _REGISTER_FORCE_INFO_MARKERS):
         return "info"
     if text.startswith("="):

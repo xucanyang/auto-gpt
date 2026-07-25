@@ -526,14 +526,14 @@ def _run_with_browser_slot(
         if wait_reason == "memory" and memory_state is not None:
             _allowed, current, limit, reserve = memory_state
             logger(
-                "Browser 第二槽内存余量不足，保持单浏览器并等待: "
+                "[控制] browser_slot=waiting reason=memory "
                 f"current={current} limit={limit} reserve={reserve} operation={operation}"
             )
             memory_wait_logged = True
         else:
             logger(
-                "Browser 全局并发槽已满，等待可用槽位 "
-                f"(limit={AUTH_BROWSER_MAX_CONCURRENCY}, operation={operation})"
+                "[控制] browser_slot=waiting reason=capacity "
+                f"limit={AUTH_BROWSER_MAX_CONCURRENCY} operation={operation}"
             )
         while not acquired:
             if stop_check is not None:
@@ -554,7 +554,7 @@ def _run_with_browser_slot(
             ):
                 _allowed, current, limit, reserve = memory_state
                 logger(
-                    "Browser 第二槽内存余量不足，保持单浏览器并等待: "
+                    "[控制] browser_slot=waiting reason=memory "
                     f"current={current} limit={limit} reserve={reserve} operation={operation}"
                 )
                 memory_wait_logged = True
@@ -609,6 +609,7 @@ class BrowserRegistrationStageResult:
     requested_executor: str = ""
     effective_executor: str = ""
     headless_reason: str = ""
+    route_event: dict[str, Any] = field(default_factory=dict)
     error: str = ""
 
     @property
