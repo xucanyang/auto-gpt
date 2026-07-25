@@ -3382,7 +3382,32 @@ class IcloudHmeMailbox(BaseMailbox):
                     if scoped_mid in seen or (not namespace_ids and raw_mid in seen):
                         continue
                     msg_ts = self._tempmail_mailbox._parse_message_timestamp(msg)
+                    subject_hint = str(msg.get("subject") or "").strip()
                     if otp_sent_at and msg_ts and msg_ts < float(otp_sent_at):
+                        # Log verification-looking mail that the time cutoff
+                        # discarded so operators can tell "no mail" from
+                        # "mail arrived before otp_sent_at".
+                        lowered_subject = subject_hint.lower()
+                        if any(
+                            marker in lowered_subject
+                            for marker in (
+                                "chatgpt",
+                                "openai",
+                                "verification",
+                                "verify",
+                                "code",
+                                "验证",
+                                "認証",
+                                "one-time",
+                                "otp",
+                            )
+                        ):
+                            age = max(0, int(float(otp_sent_at) - float(msg_ts)))
+                            self._log(
+                                "[iCloudHME] 转发箱有疑似验证码邮件但早于 otp_sent_at 被跳过: "
+                                f"alias={alias} forward={getattr(forward_mailbox, 'email', '')} "
+                                f"subject={subject_hint[:80]} age_before_cutoff={age}s"
+                            )
                         seen.add(scoped_mid)
                         continue
 
@@ -3406,6 +3431,7 @@ class IcloudHmeMailbox(BaseMailbox):
                     subject_hint = str(
                         (detail.get("subject") if isinstance(detail, dict) else "")
                         or msg.get("subject")
+                        or subject_hint
                         or ""
                     ).strip()
                     if not matched_alias:
@@ -3421,6 +3447,7 @@ class IcloudHmeMailbox(BaseMailbox):
                                 "verify",
                                 "code",
                                 "验证",
+                                "認証",
                                 "one-time",
                                 "otp",
                             )
@@ -3442,9 +3469,25 @@ class IcloudHmeMailbox(BaseMailbox):
                             str(detail.get("raw_message") or ""),
                         ]
                     )
+                    # Prefer decoded body over raw MIME for OpenAI HTML-only mails
+                    # (body_text is often empty; raw contains QP/base64 noise).
+                    if not str(detail.get("body_text") or "").strip() and raw_message:
+                        decoded_raw = self._decode_raw_content(raw_message)
+                        if decoded_raw:
+                            full_text = f"{full_text} {decoded_raw}"
                     code = self._safe_extract(full_text, code_pattern)
                     seen.add(scoped_mid)
-                    if not code or str(code).strip() in exclude_codes:
+                    if not code:
+                        self._log(
+                            "[iCloudHME] 别名已匹配但未能从邮件解析验证码: "
+                            f"alias={alias} subject={subject_hint[:80]} mid={raw_mid}"
+                        )
+                        continue
+                    if str(code).strip() in exclude_codes:
+                        self._log(
+                            "[iCloudHME] 解析到验证码但在排除列表中已跳过: "
+                            f"alias={alias} code={code}"
+                        )
                         continue
 
                     anonymous_id = str(getattr(account, "account_id", "") or "").strip()

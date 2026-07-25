@@ -971,7 +971,82 @@ class BrowserRegistrationFlowTests(unittest.TestCase):
             )
 
         send.assert_called_once()
-        self.assertEqual(callback.call_args.args[0]["otp_sent_at"], 92.0)
+        # Fallback grace is OTP_SENT_AT_FALLBACK_GRACE_SECONDS (60), not the old 8s.
+        self.assertEqual(callback.call_args.args[0]["otp_sent_at"], 40.0)
+
+    def test_password_submit_preserves_otp_sent_at_even_when_page_is_email_otp_send(self):
+        """Regression: first OTP can land in TempMail while password SPA is still settling.
+
+        Previously otp_sent_at was only kept when otp_triggered was true
+        (email_otp_verification). email_otp_send responses dropped the early
+        cutoff and fell back to now-8s, so already-delivered codes were ignored.
+        """
+        page = mock.Mock()
+        page.url = "https://auth.openai.com/create-account/password"
+        page.evaluate.return_value = "Mozilla/5.0 Camoufox"
+        page.context.cookies.return_value = []
+        callback = mock.Mock(return_value="654321")
+        start_state = {
+            "page_type": "create_account_password",
+            "current_url": "https://auth.openai.com/create-account/password",
+        }
+        password_resp = {
+            "ok": True,
+            "status": 200,
+            "url": "https://auth.openai.com/api/accounts/email-otp/send",
+            "data": {
+                "page": {
+                    "type": "email_otp_send",
+                    "payload": {
+                        "url": "https://auth.openai.com/api/accounts/email-otp/send",
+                    },
+                }
+            },
+            "text": "",
+            # Even when callers historically treated only email_otp_verification as
+            # otp_triggered, the absolute send timestamp must still be kept.
+            "otp_triggered": False,
+            "otp_sent_at": 55.0,
+            "register_committed": True,
+        }
+        otp_result = {
+            "ok": True,
+            "status": 200,
+            "url": "https://chatgpt.com/",
+            "data": None,
+            "text": "",
+        }
+
+        with (
+            mock.patch.object(br, "_seed_browser_device_id"),
+            mock.patch.object(br, "_start_browser_signup_via_page", return_value=start_state),
+            mock.patch.object(br, "_submit_password_via_page", return_value=password_resp),
+            mock.patch.object(br, "_wait_for_auth_page_settle"),
+            mock.patch.object(
+                br,
+                "_derive_registration_state_from_page",
+                return_value={
+                    "page_type": "email_otp_verification",
+                    "current_url": "https://auth.openai.com/email-verification",
+                },
+            ),
+            mock.patch.object(br, "_find_first_visible_selector", return_value='input[name="code"]'),
+            mock.patch.object(br, "_send_browser_email_otp") as send_otp,
+            mock.patch.object(br, "_submit_otp_via_page", return_value=otp_result),
+            mock.patch.object(br, "_handle_post_signup_onboarding"),
+            mock.patch.object(br.time, "time", return_value=100.0),
+        ):
+            br._browser_registration_flow(
+                page,
+                "buyer@example.com",
+                "OpenAI9_policy!",
+                callback,
+                None,
+                lambda _message: None,
+            )
+
+        send_otp.assert_not_called()
+        self.assertEqual(callback.call_args.args[0]["otp_sent_at"], 55.0)
 
     def test_otp_response_success_is_accepted_without_url_change(self):
         response = _FakeResponse(

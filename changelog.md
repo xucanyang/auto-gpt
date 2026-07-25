@@ -6,6 +6,18 @@
 
 ## [Unreleased] (未发布)
 
+## [2.8.39] - 2026-07-25
+
+### 修复 (Fixed)
+- **TempMail 里已有验证码邮件却等满 120s**：HME Ready → TempMail 转发箱链路本身可解析（`+gpt1` 的 Return-Path 匹配与 6 位码提取正常），问题在浏览器注册的 `otp_sent_at` 截止时间。密码提交后 SPA 若卡住数十秒才进入 OTP 页，旧逻辑只在 `otp_triggered=true` 时保留密码提交时间戳，否则回退 `now-8s`，把**已投递到 TempMail 的首封 OTP** 当成旧邮件静默丢掉；只有重发后的第二封才能命中。现改为：
+  1. 密码 `/user/register` 成功响应**始终**带出并保留 `otp_sent_at`（含 `email_otp_send` / 通用 SPA 跳转）；
+  2. 无明确发码时间时的回退宽限由 8s 提升到 **60s**（`OTP_SENT_AT_FALLBACK_GRACE_SECONDS`）；
+  3. 任务日志增加「早于 otp_sent_at 被跳过 / 别名匹配但解析失败」诊断，区分「没信」与「有信被时间窗滤掉」。
+- **HTML-only OpenAI 邮件**：转发箱 `body_text` 常为空时，额外用 `_decode_raw_content` 解码 raw MIME 再提取验证码，降低 QP/HTML 噪音下的漏提。
+
+### 测试 (Tests)
+- 密码提交后即使 `otp_triggered=false` 仍保留早期 `otp_sent_at` 传给收码回调；主动发码路径的 fallback grace 合同同步为 60s。
+
 ## [2.8.38] - 2026-07-25
 
 ### 修复 (Fixed)
@@ -2785,4 +2797,8 @@
 
 ## 2026-07-25 11:04:34 +0800
 - v2.8.38 浏览器注册OTP超时后自动重发再等
+- 发布模式: multi
+
+## 2026-07-25 11:39:32 +0800
+- v2.8.39 修复浏览器注册otp_sent_at过紧导致TempMail已有验证码被跳过
 - 发布模式: multi

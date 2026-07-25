@@ -36,6 +36,11 @@ CHATGPT_APP = os.environ.get("CHATGPT_APP_URL", "https://chatgpt.com")
 PLATFORM_LOGIN_ENTRY = os.environ.get(
     "PLATFORM_LOGIN_ENTRY", "https://platform.openai.com/login"
 )
+# Fallback mailbox cutoff when the exact OTP-send timestamp is unknown.
+# Password SPA can hang 30-60s after /user/register while OpenAI has already
+# delivered the first code to the HME→TempMail forward path; an 8s grace
+# silently drops that mail (visible in TempMail UI, missed by the waiter).
+OTP_SENT_AT_FALLBACK_GRACE_SECONDS = 60
 SENTINEL_BASE = os.environ.get("SENTINEL_BASE_URL", "https://sentinel.openai.com")
 SENTINEL_SDK_URL = os.environ.get("SENTINEL_SDK_URL", DEFAULT_SENTINEL_SDK_URL)
 SENTINEL_FRAME_URL = os.environ.get(
@@ -4361,7 +4366,8 @@ def _submit_password_via_page(page, password: str, log) -> dict:
                             "url": response_url or current_url,
                             "data": data or None,
                             "text": "",
-                            "otp_triggered": response_page_type == "email_otp_verification",
+                            "otp_triggered": response_page_type
+                            in {"email_otp_verification", "email_otp_send"},
                             "otp_sent_at": submission.started_at - 8,
                             "register_committed": True,
                         }
@@ -4410,7 +4416,7 @@ def _submit_password_via_page(page, password: str, log) -> dict:
                         }
                     },
                     "text": "",
-                    "otp_triggered": page_type == "email_otp_verification",
+                    "otp_triggered": page_type in {"email_otp_verification", "email_otp_send"},
                     "otp_sent_at": submission.started_at - 8,
                     "register_committed": committed_result is not None,
                 }
@@ -4424,6 +4430,11 @@ def _submit_password_via_page(page, password: str, log) -> dict:
                     "url": current_url,
                     "data": None,
                     "text": "",
+                    # Preserve password-submit time even on generic SPA navigation so
+                    # mailbox otp_sent_at does not fall back to a too-late cutoff.
+                    "otp_triggered": page_type in {"email_otp_verification", "email_otp_send"},
+                    "otp_sent_at": submission.started_at - 8,
+                    "register_committed": committed_result is not None,
                 }
             if (
                 committed_result is None
@@ -5790,9 +5801,18 @@ def _browser_registration_flow(
             if not reg_resp.get("ok"):
                 raise RuntimeError(f"密码页提交失败: {(reg_resp.get('text') or '')[:300]}")
             register_submitted = True
+            # Always keep the password-submit timestamp as the OTP cutoff, even when
+            # the API page type is email_otp_send (otp_triggered used to be false and
+            # the early sent_at was dropped). OpenAI often delivers the first code
+            # while Camoufox is still settling the password SPA.
+            raw_sent_at = reg_resp.get("otp_sent_at")
+            if raw_sent_at is not None:
+                try:
+                    otp_sent_at_hint = float(raw_sent_at)
+                except (TypeError, ValueError):
+                    pass
             if reg_resp.get("otp_triggered"):
                 page_otp_triggered = True
-                otp_sent_at_hint = reg_resp.get("otp_sent_at")
             # 密码提交后 SPA 常立即导航到 email-verification；先 settle 再读状态，避免 evaluate 撞导航
             _wait_for_auth_page_settle(page, timeout=10.0, log=log)
             state = _extract_flow_state(reg_resp.get("data"), reg_resp.get("url", page.url))
@@ -5800,7 +5820,8 @@ def _browser_registration_flow(
                 state["page_type"] = "email_otp_verification"
                 # API 返回 send 表示应触发/已触发发码，不把 continue_url 当地址栏导航
                 page_otp_triggered = page_otp_triggered or True
-                otp_sent_at_hint = otp_sent_at_hint or (time.time() - 8)
+                if otp_sent_at_hint is None:
+                    otp_sent_at_hint = time.time() - OTP_SENT_AT_FALLBACK_GRACE_SECONDS
             try:
                 live_state = _derive_registration_state_from_page(page)
             except Exception as exc:
@@ -5861,10 +5882,16 @@ def _browser_registration_flow(
             if _find_first_visible_selector(page, OTP_INPUT_SELECTORS):
                 page_otp_triggered = True
                 if not otp_sent_at:
-                    otp_sent_at = time.time() - 8
-                log("浏览器已出现 OTP 输入框，首次优先等待页面自动发码（超时后再重发）")
+                    # Wider grace than the historical 8s: password SPA can hang
+                    # 30-60s after register while the OTP mail already lands in
+                    # TempMail; a tight cutoff silently drops that mail.
+                    otp_sent_at = time.time() - OTP_SENT_AT_FALLBACK_GRACE_SECONDS
+                log(
+                    "浏览器已出现 OTP 输入框，首次优先等待页面自动发码（超时后再重发）"
+                    f" otp_sent_at_age={max(0, int(time.time() - float(otp_sent_at or time.time())))}s"
+                )
             if not browser_otp_sent and not page_otp_triggered:
-                request_started_at = time.time() - 8
+                request_started_at = time.time() - OTP_SENT_AT_FALLBACK_GRACE_SECONDS
                 try:
                     send_result = _send_browser_email_otp(
                         page,
