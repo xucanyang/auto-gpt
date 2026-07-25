@@ -46,6 +46,22 @@ OAUTH_CONSENT_FORM_SELECTOR = (
     'form[action*="/sign-in-with-chatgpt/"][action*="/consent"]'
 )
 
+EMAIL_OTP_RESEND_SELECTORS = [
+    'button:has-text("Resend")',
+    'button:has-text("resend")',
+    'button:has-text("Resend code")',
+    'button:has-text("Resend email")',
+    'button:has-text("Send again")',
+    'button:has-text("重新发送")',
+    'button:has-text("重发")',
+    'a:has-text("Resend")',
+    'a:has-text("resend")',
+    'a:has-text("Resend code")',
+    'a:has-text("重新发送")',
+    'button[data-testid*="resend"]',
+    'button[name*="resend" i]',
+]
+
 EMAIL_INPUT_SELECTORS = [
     'input#login-email',
     'input[type="email"]',
@@ -5814,6 +5830,21 @@ def _browser_registration_flow(
             if not otp_callback:
                 raise RuntimeError("ChatGPT 注册需要邮箱验证码但未提供 otp_callback")
             otp_sent_at = otp_sent_at_hint
+            try:
+                first_wait = int((requested_state or {}).get("otp_wait_timeout") or 120)
+            except (TypeError, ValueError):
+                first_wait = 120
+            try:
+                resend_wait = int((requested_state or {}).get("otp_resend_wait_timeout") or 90)
+            except (TypeError, ValueError):
+                resend_wait = 90
+            first_wait = max(first_wait, 30)
+            resend_wait = max(resend_wait, 30)
+            referer = str(
+                state.get("current_url")
+                or state.get("continue_url")
+                or f"{OPENAI_AUTH}/email-verification"
+            )
             _wait_for_auth_page_settle(page, timeout=8.0, log=log)
             try:
                 live_before_send = _derive_registration_state_from_page(page)
@@ -5823,11 +5854,15 @@ def _browser_registration_flow(
                     live_before_send = _derive_registration_state_from_page(page)
                 else:
                     raise
+            referer = str(
+                live_before_send.get("current_url")
+                or referer
+            )
             if _find_first_visible_selector(page, OTP_INPUT_SELECTORS):
                 page_otp_triggered = True
                 if not otp_sent_at:
                     otp_sent_at = time.time() - 8
-                log("浏览器已出现 OTP 输入框，跳过 email-otp/send API 重放")
+                log("浏览器已出现 OTP 输入框，首次优先等待页面自动发码（超时后再重发）")
             if not browser_otp_sent and not page_otp_triggered:
                 request_started_at = time.time() - 8
                 try:
@@ -5835,11 +5870,7 @@ def _browser_registration_flow(
                         page,
                         device_id=device_id,
                         user_agent=user_agent,
-                        referer=str(
-                            live_before_send.get("current_url")
-                            or state.get("current_url")
-                            or f"{OPENAI_AUTH}/email-verification"
-                        ),
+                        referer=referer,
                     )
                 except Exception as exc:
                     if _is_navigation_context_error(exc):
@@ -5859,27 +5890,73 @@ def _browser_registration_flow(
                     )
                 browser_otp_sent = True
                 _wait_for_auth_page_settle(page, timeout=8.0, log=log)
-            elif page_otp_triggered:
-                log("浏览器页面已触发注册验证码，直接等待现有 OTP，不重复发送")
-            log("等待 ChatGPT 验证码")
-            callback_payload = {
-                "otp_sent_at": otp_sent_at,
-                "phase": "browser_register_email_otp",
-                "page_type": str(state.get("page_type") or "email_otp_verification"),
-            }
-            try:
-                callback_value = otp_callback(callback_payload)
-            except TypeError:
-                callback_value = otp_callback()
-            if isinstance(callback_value, dict):
-                code = str(
-                    callback_value.get("code")
-                    or callback_value.get("otp")
-                    or callback_value.get("value")
-                    or ""
-                ).strip()
-            else:
-                code = str(callback_value or "").strip()
+
+            def _request_browser_email_otp(wait_timeout: int) -> str:
+                log(f"等待 ChatGPT 验证码 timeout={wait_timeout}s")
+                callback_payload = {
+                    "otp_sent_at": otp_sent_at,
+                    "timeout": wait_timeout,
+                    "phase": "browser_register_email_otp",
+                    "phase_label": "浏览器注册邮箱验证码",
+                    "page_type": str(state.get("page_type") or "email_otp_verification"),
+                }
+                try:
+                    callback_value = otp_callback(callback_payload)
+                except TypeError:
+                    callback_value = otp_callback()
+                if isinstance(callback_value, dict):
+                    return str(
+                        callback_value.get("code")
+                        or callback_value.get("otp")
+                        or callback_value.get("value")
+                        or ""
+                    ).strip()
+                return str(callback_value or "").strip()
+
+            def _resend_browser_email_otp() -> float:
+                """Resend registration OTP via UI first, then email-otp/send API."""
+                nonlocal browser_otp_sent
+                clicked = _click_first(page, EMAIL_OTP_RESEND_SELECTORS, timeout=4)
+                if clicked:
+                    log(f"验证码页已点击重发: {clicked}")
+                    browser_otp_sent = True
+                    _wait_for_auth_page_settle(page, timeout=6.0, log=log)
+                    return time.time() - 8
+                request_started_at = time.time() - 8
+                try:
+                    send_result = _send_browser_email_otp(
+                        page,
+                        device_id=device_id,
+                        user_agent=user_agent,
+                        referer=referer,
+                    )
+                except Exception as exc:
+                    if _is_navigation_context_error(exc):
+                        log(f"email-otp/send 重发期间页面导航，按已发码继续: {exc}")
+                        browser_otp_sent = True
+                        return request_started_at
+                    raise
+                send_status = int(send_result.get("status") or 0)
+                browser_otp_sent = True
+                if 200 <= send_status < 300 or send_result.get("ok"):
+                    log(f"浏览器注册验证码已重发: status={send_status or 200}")
+                else:
+                    log(
+                        "浏览器注册验证码重发返回非成功，继续等待新邮件: "
+                        f"status={send_status} text={str(send_result.get('text') or '')[:160]}"
+                    )
+                _wait_for_auth_page_settle(page, timeout=6.0, log=log)
+                return request_started_at
+
+            # Align with protocol: first wait auto-sent OTP, then one resend + second wait.
+            code = _request_browser_email_otp(first_wait)
+            if not code:
+                log(
+                    f"首次等待未收到验证码，尝试重发后等待 {resend_wait}s "
+                    f"(budget-aware via mailbox callback)"
+                )
+                otp_sent_at = _resend_browser_email_otp()
+                code = _request_browser_email_otp(resend_wait)
             if not code:
                 raise RuntimeError("未获取到验证码")
             page_otp_triggered = False

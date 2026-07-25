@@ -610,6 +610,7 @@ class AccessTokenOnlyRegistrationEngine:
         skymail_adapter: EmailServiceAdapter,
         otp_wait_timeout: int,
         otp_account_budget_timeout: int,
+        otp_resend_wait_timeout: int = 90,
         profile_name: str = "",
         profile_birthdate: str = "",
     ) -> BrowserRegistrationStageResult:
@@ -621,7 +622,10 @@ class AccessTokenOnlyRegistrationEngine:
         self._log(
             "启动独立 Camoufox 注册链路：邮箱 -> OTP -> about_you -> ChatGPT Web Session"
         )
-        initial_state: dict[str, Any] = {}
+        initial_state: dict[str, Any] = {
+            "otp_wait_timeout": max(int(otp_wait_timeout or 120), 30),
+            "otp_resend_wait_timeout": max(int(otp_resend_wait_timeout or 90), 30),
+        }
         if str(profile_name or "").strip() and str(profile_birthdate or "").strip():
             initial_state["profile"] = {
                 "name": str(profile_name).strip(),
@@ -635,17 +639,27 @@ class AccessTokenOnlyRegistrationEngine:
                 sent_at = float(sent_at) if sent_at is not None else None
             except (TypeError, ValueError):
                 sent_at = None
+            try:
+                wait_timeout = int(request.get("timeout") or otp_wait_timeout or 120)
+            except (TypeError, ValueError):
+                wait_timeout = int(otp_wait_timeout or 120)
+            wait_timeout = max(wait_timeout, 30)
+            phase = str(request.get("phase") or "browser_register_email_otp").strip()
+            phase_label = str(
+                request.get("phase_label") or "浏览器注册邮箱验证码"
+            ).strip()
             exclude_codes = skymail_adapter.used_codes_for_phases(
                 "register_email_otp",
                 "browser_register_email_otp",
+                phase,
             )
             code = skymail_adapter.wait_for_verification_code(
                 email_addr,
-                timeout=otp_wait_timeout,
+                timeout=wait_timeout,
                 otp_sent_at=sent_at,
                 exclude_codes=exclude_codes,
-                phase="browser_register_email_otp",
-                phase_label="浏览器注册邮箱验证码",
+                phase=phase or "browser_register_email_otp",
+                phase_label=phase_label or "浏览器注册邮箱验证码",
             )
             return {
                 "code": str(code or "").strip(),
@@ -1352,6 +1366,7 @@ class AccessTokenOnlyRegistrationEngine:
                                 password=pwd,
                                 skymail_adapter=skymail_adapter,
                                 otp_wait_timeout=register_otp_wait_seconds,
+                                otp_resend_wait_timeout=register_otp_resend_wait_seconds,
                                 otp_account_budget_timeout=register_otp_account_budget_seconds,
                                 profile_name=f"{first_name} {last_name}".strip(),
                                 profile_birthdate=birthdate,

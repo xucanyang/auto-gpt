@@ -3403,7 +3403,33 @@ class IcloudHmeMailbox(BaseMailbox):
                             received_for,
                         )
                         match_source = "base_hme_transport_header"
+                    subject_hint = str(
+                        (detail.get("subject") if isinstance(detail, dict) else "")
+                        or msg.get("subject")
+                        or ""
+                    ).strip()
                     if not matched_alias:
+                        # Surface OpenAI-looking mail that failed +tag header match so
+                        # operators can tell "no mail" from "mail arrived but unmatched".
+                        lowered_subject = subject_hint.lower()
+                        if any(
+                            marker in lowered_subject
+                            for marker in (
+                                "chatgpt",
+                                "openai",
+                                "verification",
+                                "verify",
+                                "code",
+                                "验证",
+                                "one-time",
+                                "otp",
+                            )
+                        ):
+                            self._log(
+                                "[iCloudHME] 转发箱有疑似验证码邮件但未匹配当前 HME 别名: "
+                                f"alias={alias} forward={getattr(forward_mailbox, 'email', '')} "
+                                f"subject={subject_hint[:80]}"
+                            )
                         seen.add(scoped_mid)
                         continue
 
