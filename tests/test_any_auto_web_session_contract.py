@@ -44,6 +44,119 @@ class AnyAutoWebSessionContractTests(unittest.TestCase):
         self.assertIn("credentials: 'include'", script)
 
     @unittest.skipUnless(_CAMOUFOX_AVAILABLE, "camoufox is only installed in the runtime image")
+    def test_encoded_csrf_cookie_bypasses_broken_socks_api_request(self):
+        page = mock.Mock()
+        page.context.cookies.return_value = [
+            {
+                "name": "__Host-next-auth.csrf-token",
+                "value": "csrf-cookie-half%7Csignature-half",
+                "domain": "chatgpt.com",
+            }
+        ]
+        page.context.request.get.side_effect = AssertionError(
+            "authenticated SOCKS5 APIRequestContext must not be used when the cookie exists"
+        )
+        logs: list[str] = []
+
+        with mock.patch.object(
+            browser_registration,
+            "_browser_fetch",
+            return_value={"ok": False, "status": 0, "data": {}, "text": "NetworkError"},
+        ):
+            token = browser_registration._get_browser_csrf_token(
+                page,
+                log=lambda message: logs.append(str(message)),
+            )
+
+        self.assertEqual(token, "csrf-cookie-half")
+        page.context.request.get.assert_not_called()
+        self.assertTrue(any("csrf cookie" in item for item in logs))
+
+    @unittest.skipUnless(_CAMOUFOX_AVAILABLE, "camoufox is only installed in the runtime image")
+    def test_signin_rejects_next_auth_self_route(self):
+        page = mock.Mock()
+        logs: list[str] = []
+        with mock.patch.object(
+            browser_registration,
+            "_browser_fetch",
+            return_value={
+                "ok": True,
+                "status": 200,
+                "data": {"url": "https://chatgpt.com/api/auth/signin"},
+                "text": "{}",
+            },
+        ):
+            authorize_url = browser_registration._start_browser_signin(
+                page,
+                "user@example.com",
+                "device-demo",
+                "csrf-demo",
+                log=lambda message: logs.append(str(message)),
+            )
+
+        self.assertEqual(authorize_url, "")
+        page.context.request.post.assert_not_called()
+        self.assertTrue(any("拒绝" in item for item in logs))
+
+    @unittest.skipUnless(_CAMOUFOX_AVAILABLE, "camoufox is only installed in the runtime image")
+    def test_signup_entry_accepts_committed_page_after_navigation_timeout(self):
+        page = mock.Mock()
+        page.url = "https://auth.openai.com/create-account/password"
+        page.goto.side_effect = RuntimeError("Page.goto: Timeout 30000ms exceeded")
+        recovered = {
+            "page_type": "create_account_password",
+            "current_url": page.url,
+        }
+        logs: list[str] = []
+
+        with mock.patch.object(
+            browser_register,
+            "_derive_registration_state_from_page",
+            return_value=recovered,
+        ):
+            result = browser_register._start_browser_signup_via_page(
+                page,
+                "user@example.com",
+                lambda message: logs.append(str(message)),
+            )
+
+        self.assertEqual(result, recovered)
+        page.goto.assert_called_once_with(
+            "https://platform.openai.com/login",
+            wait_until="commit",
+            timeout=30000,
+        )
+        self.assertTrue(any("页面已提交并可继续" in item for item in logs))
+
+    @unittest.skipUnless(_CAMOUFOX_AVAILABLE, "camoufox is only installed in the runtime image")
+    def test_signup_flow_does_not_authorize_fallback_after_submission_error(self):
+        page = mock.Mock()
+        page.evaluate.return_value = "Mozilla/5.0 Camoufox"
+        with (
+            mock.patch.object(browser_register, "_seed_browser_device_id"),
+            mock.patch.object(
+                browser_register,
+                "_start_browser_signup_via_page",
+                side_effect=RuntimeError("邮箱页提交后未进入密码页面"),
+            ),
+            mock.patch.object(
+                browser_register,
+                "_start_browser_signup_via_authorize",
+            ) as authorize_fallback,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "邮箱页提交后"):
+                browser_register._browser_registration_flow(
+                    page,
+                    "user@example.com",
+                    "Password123!",
+                    lambda: "123456",
+                    None,
+                    lambda _message: None,
+                )
+
+        authorize_fallback.assert_not_called()
+
+    @unittest.skipUnless(_CAMOUFOX_AVAILABLE, "camoufox is only installed in the runtime image")
     def test_browser_transport_reuses_context_cookies_and_skips_codex_oauth(self):
         page = mock.Mock()
         page.url = "https://auth.openai.com/oauth/callback"

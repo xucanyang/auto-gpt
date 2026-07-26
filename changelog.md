@@ -21,6 +21,18 @@
 ### 测试 (Tests)
 - **完成文档一致性校验**：通过 `git diff --check`、Markdown 代码围栏配对和文档目标链接存在性检查；本次仅修改项目文档，未执行 Python、前端或容器测试，也未触碰生产运行态。
 
+## [2.8.54] - 2026-07-26
+
+### 修复 (Fixed)
+- **修复认证 SOCKS5 代理下 Web Session 桥接稳定失败**：`services/chatgpt_core/browser_registration.py` 在页面内 `/api/auth/csrf` 暂时返回 `NetworkError` 时，优先复用浏览器 cookie jar 中的 next-auth CSRF，并兼容 cookie 将 `token|hash` 序列化为 `token%7Chash` 的形式；不再先调用对该代理返回 `invalid Socks5 initial handshake` 的 Playwright `APIRequestContext`，避免无效等待后使用错误 CSRF 值。
+- **拒绝把 next-auth 自身登录页当作 OpenAI authorize URL**：Web Session signin 现在校验返回地址，明确拒绝 `chatgpt.com/api/auth/signin`、`/api/auth/error` 和 `/auth/login`；首次 signin 未生成 OpenAI authorize 时刷新页面与 CSRF 事务后再以兼容提示重试，避免注册已完成的账号被错误导航回登录页并最终报“Web Session 材料不完整”。
+- **修复代理慢响应时注册入口的假超时**：`services/chatgpt_core/any_auto/browser_register.py` 将 OpenAI/ChatGPT 入口和 authorize 导航的完成条件从 `domcontentloaded` 调整为主文档 `commit`，随后独立检查 DOM/表单状态；即使 Playwright 报导航超时，只要页面已提交且注册状态或邮箱表单可读，仍继续当前浏览器事务。备用 authorize 入口复用同一套加固后的 CSRF/signin 实现。
+- **阻止已提交注册事务被入口 fallback 重放**：any-auto 页面入口仅在尚未到达邮箱表单时抛出结构化 `_BrowserSignupEntryUnavailable` 并允许回退 ChatGPT authorize；邮箱提交后的状态推进错误会原样失败，不再被宽泛 `except Exception` 当成安全入口故障重放。Web Session 缺失日志改用 `AT状态/Session状态/Cookie状态` 存在性字段，避免 `access_token=no` 等诊断布尔值被日志脱敏器误识别为真实凭证。
+
+### 测试 (Tests)
+- 新增 `tests/test_any_auto_web_session_contract.py` 合同覆盖：编码 CSRF cookie、认证 SOCKS5 `APIRequestContext` 禁用、next-auth 自路由拒绝、导航超时后已 commit 页面恢复，以及邮箱提交后禁止 authorize 重放。一次性断网、只读生产依赖容器专项测试通过 `10/10`。
+- 扩大运行 `tests.test_browser_registration_flow`：本次涉及的 Web Session/注册事务测试通过；全文件 `52` 条通过，另有 `2` 条 v2.8.46 后仍调用已删除 `_run_browser_registration` 的既有陈旧测试报错，与本次实现无关。
+
 ## [2.8.51] - 2026-07-26
 
 ### 优化 (Changed)
@@ -3010,4 +3022,8 @@
 
 ## 2026-07-26 11:09:41 +0800
 - 补齐本地配置发布为共享并启用当前实例
+- 发布模式: multi
+
+## 2026-07-26 12:15:47 +0800
+- v2.8.54 修复浏览器注册 CSRF 桥接与导航假超时
 - 发布模式: multi

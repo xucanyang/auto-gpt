@@ -15,7 +15,7 @@ import uuid
 from contextlib import ExitStack
 from pathlib import Path
 from typing import Any, Callable, Optional
-from urllib.parse import urljoin, urlparse
+from urllib.parse import unquote, urljoin, urlparse
 
 from camoufox.sync_api import Camoufox
 
@@ -3081,7 +3081,18 @@ def _browser_chatgpt_openai_signin_bridge(
         log=log,
     )
     if not authorize_url:
-        # Retry with signup-compatible hint used by the authorize entry path.
+        # A stale/encoded CSRF cookie makes next-auth return its own signin page
+        # instead of OpenAI authorize. Reload once to mint a fresh transaction
+        # before trying the signup-compatible hint.
+        log("Web Session 桥接首次 signin 未返回 authorize，刷新 CSRF 后重试")
+        try:
+            page.reload(wait_until="commit", timeout=20000)
+        except Exception as exc:
+            log(f"Web Session 桥接刷新 CSRF 导航异常: {exc}")
+        _wait_for_auth_page_settle(page, timeout=5.0, log=log)
+        refreshed_csrf = _get_browser_csrf_token(page, log=log)
+        if refreshed_csrf:
+            csrf_token = refreshed_csrf
         authorize_url = _start_browser_signin(
             page,
             email,
@@ -3825,7 +3836,9 @@ def _csrf_token_from_cookies(page) -> str:
         raw = str(item.get("value") or "").strip()
         if not raw:
             continue
-        token = raw.split("|", 1)[0].strip()
+        # next-auth serializes the separator as ``%7C`` in some browser jars.
+        # Playwright may expose either the encoded or decoded representation.
+        token = unquote(raw).split("|", 1)[0].strip()
         if token:
             return token
     return ""
@@ -3849,8 +3862,16 @@ def _get_browser_csrf_token(page, *, log=None) -> str:
         if token:
             return token
 
-    # Playwright request API shares the browser cookie jar and avoids some
-    # page-world fetch edge cases that return HTTP 200 with empty/HTML body.
+    # Prefer the browser cookie before Playwright APIRequestContext. Authenticated
+    # SOCKS5 proxies work for the browser process but APIRequestContext can reject
+    # their handshake, adding 20 seconds before returning the same cookie token.
+    cookie_token = _csrf_token_from_cookies(page)
+    if cookie_token:
+        logger("Web Session CSRF 回退使用 next-auth csrf cookie")
+        return cookie_token
+
+    # APIRequestContext remains a final fallback for direct/HTTP proxy contexts
+    # where page-world fetch returned an empty or HTML response.
     try:
         request = getattr(getattr(page, "context", None), "request", None)
         if request is not None:
@@ -3860,7 +3881,7 @@ def _get_browser_csrf_token(page, *, log=None) -> str:
                     "accept": "application/json",
                     "referer": f"{CHATGPT_APP}/",
                 },
-                timeout=20000,
+                timeout=12000,
             )
             try:
                 data = response.json()
@@ -3875,17 +3896,35 @@ def _get_browser_csrf_token(page, *, log=None) -> str:
     except Exception as exc:
         logger(f"Web Session CSRF context.request 失败: {exc}")
 
-    cookie_token = _csrf_token_from_cookies(page)
-    if cookie_token:
-        logger("Web Session CSRF 回退使用 next-auth csrf cookie")
-        return cookie_token
-
     logger(
         "Web Session CSRF 获取失败: "
         f"status={result.get('status')} ok={result.get('ok')} "
         f"text={str(result.get('text') or '')[:120]} cookies={_cookie_names_summary(page)}"
     )
     return ""
+
+
+def _usable_next_auth_signin_url(value: str) -> bool:
+    """Reject next-auth error/login self-routes masquerading as authorize URLs."""
+    raw = str(value or "").strip()
+    if not raw:
+        return False
+    try:
+        parsed = urlparse(raw)
+    except Exception:
+        return False
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return False
+    path = str(parsed.path or "/").rstrip("/").lower() or "/"
+    host = str(parsed.hostname or "").lower()
+    chatgpt_host = str(urlparse(CHATGPT_APP).hostname or "chatgpt.com").lower()
+    if host == chatgpt_host and (
+        path.startswith("/api/auth/signin")
+        or path.startswith("/api/auth/error")
+        or path in {"/auth/login", "/login"}
+    ):
+        return False
+    return host == chatgpt_host or host == "openai.com" or host.endswith(".openai.com")
 
 
 def _start_browser_signin(
@@ -3930,10 +3969,18 @@ def _start_browser_signin(
         body=body,
         redirect="follow",
     )
+    browser_url = ""
     if result.get("ok") and isinstance(result.get("data"), dict):
-        url = str((result.get("data") or {}).get("url") or "").strip()
-        if url:
-            return url
+        browser_url = str((result.get("data") or {}).get("url") or "").strip()
+        if _usable_next_auth_signin_url(browser_url):
+            return browser_url
+        if browser_url:
+            parsed = urlparse(browser_url)
+            logger(
+                "Web Session signin 拒绝 next-auth 非 authorize 路径: "
+                f"{parsed.hostname or '-'}{parsed.path or '/'}"
+            )
+            return ""
 
     # Same fallback as CSRF: shared cookie jar via context.request.
     try:
@@ -3948,18 +3995,24 @@ def _start_browser_signin(
                     "content-type": "application/x-www-form-urlencoded",
                 },
                 data=body,
-                timeout=30000,
+                timeout=15000,
             )
             try:
                 data = response.json()
             except Exception:
                 data = {}
             url = str((data or {}).get("url") or "").strip()
-            if url:
+            if _usable_next_auth_signin_url(url):
                 logger(
                     f"Web Session signin via context.request status={getattr(response, 'status', '-')}"
                 )
                 return url
+            if url:
+                parsed = urlparse(url)
+                logger(
+                    "Web Session signin context.request 拒绝非 authorize 路径: "
+                    f"{parsed.hostname or '-'}{parsed.path or '/'}"
+                )
             logger(
                 "Web Session signin context.request 无 url: "
                 f"status={getattr(response, 'status', '-')} body={str(data)[:160]}"

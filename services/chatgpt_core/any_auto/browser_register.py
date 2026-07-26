@@ -98,6 +98,11 @@ PASSWORDLESS_LOGIN_SELECTORS = [
     'button:has-text("código de uso único")',
 ]
 
+
+class _BrowserSignupEntryUnavailable(RuntimeError):
+    """No signup form was reached, so authorize fallback is still idempotent."""
+
+
 # add-phone 页面国际拨号码 -> 国家名映射（用于 UI 下拉选择）
 PHONE_COUNTRY_CODE_MAP = {
     "1": "United States", "7": "Russia", "20": "Egypt", "27": "South Africa",
@@ -1025,26 +1030,67 @@ def _wait_for_signup_entry_transition(page, log, timeout: int = 20) -> dict:
 
 
 def _start_browser_signup_via_page(page, email: str, log) -> dict:
+    entry_errors: list[str] = []
+    ready_page_types = {
+        "create_account_password",
+        "login_password",
+        "email_otp_verification",
+        "about_you",
+        "add_phone",
+    }
     for entry_url in (PLATFORM_LOGIN_ENTRY, f"{OPENAI_AUTH}/log-in"):
         try:
             log(f"打开 OpenAI 注册入口: {entry_url}")
-            page.goto(entry_url, wait_until="domcontentloaded", timeout=30000)
+            # A committed registration document is enough. Some proxy exits
+            # never fire DOMContentLoaded even though the form is interactive.
+            page.goto(entry_url, wait_until="commit", timeout=30000)
         except Exception as exc:
-            log(f"注册入口访问失败: {entry_url} -> {exc}")
-            continue
+            current_url = str(getattr(page, "url", "") or "")
+            try:
+                recovered_state = _derive_registration_state_from_page(page)
+            except Exception:
+                recovered_state = {}
+            recovered_selector = None
+            if recovered_state.get("page_type") not in ready_page_types:
+                try:
+                    recovered_selector = _wait_for_any_selector(
+                        page, EMAIL_INPUT_SELECTORS, timeout=2
+                    )
+                except Exception:
+                    recovered_selector = None
+            if recovered_state.get("page_type") in ready_page_types or recovered_selector:
+                log(
+                    "注册入口导航超时但页面已提交并可继续: "
+                    f"url={current_url[:120] or '-'}"
+                )
+            else:
+                log(
+                    f"注册入口访问失败: {entry_url} -> {exc} "
+                    f"current={current_url[:120] or '-'}"
+                )
+                entry_errors.append(f"{entry_url}: {exc}")
+                continue
 
-        initial_state = _derive_registration_state_from_page(page)
-        if initial_state.get("page_type") in {
-            "create_account_password",
-            "login_password",
-            "email_otp_verification",
-            "about_you",
-            "add_phone",
-        }:
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=8000)
+        except Exception as exc:
+            log(
+                "注册入口 DOMContentLoaded 未完成，继续检查表单状态: "
+                f"{str(exc)[:160]}"
+            )
+
+        try:
+            initial_state = _derive_registration_state_from_page(page)
+        except Exception as exc:
+            entry_errors.append(f"{entry_url}: 页面状态读取失败: {exc}")
+            log(f"注册入口页面状态读取失败: {entry_url} -> {str(exc)[:180]}")
+            continue
+        if initial_state.get("page_type") in ready_page_types:
             return initial_state
 
         email_selector = _wait_for_any_selector(page, EMAIL_INPUT_SELECTORS, timeout=12)
         if not email_selector:
+            entry_errors.append(f"{entry_url}: 未找到邮箱输入框")
             continue
         if not _fill_input_like_user(page, email_selector, email):
             raise RuntimeError("邮箱页填写失败")
@@ -1066,20 +1112,51 @@ def _start_browser_signup_via_page(page, email: str, log) -> dict:
 
         return _wait_for_signup_entry_transition(page, log)
 
-    raise RuntimeError("未找到 OpenAI 注册入口邮箱输入框")
+    detail = "; ".join(entry_errors[-2:])
+    raise _BrowserSignupEntryUnavailable(
+        f"未找到可用 OpenAI 注册入口邮箱输入框{f': {detail}' if detail else ''}"
+    )
 
 
 def _start_browser_signup_via_authorize(page, email: str, device_id: str, log) -> dict:
     log("访问 ChatGPT 首页...")
-    page.goto(f"{CHATGPT_APP}/", wait_until="domcontentloaded", timeout=30000)
+    try:
+        page.goto(f"{CHATGPT_APP}/", wait_until="commit", timeout=30000)
+    except Exception as exc:
+        current_url = str(getattr(page, "url", "") or "")
+        current_host = str(urlparse(current_url).hostname or "").lower()
+        target_host = str(urlparse(CHATGPT_APP).hostname or "chatgpt.com").lower()
+        if current_host != target_host:
+            raise
+        log(
+            "ChatGPT 首页导航超时但主文档已提交，继续 CSRF 探测: "
+            f"url={current_url[:120]} error={str(exc)[:120]}"
+        )
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=8000)
+    except Exception as exc:
+        log(f"ChatGPT 首页 DOMContentLoaded 未完成，继续浏览器内探测: {str(exc)[:160]}")
+
+    # Reuse the hardened project bridge: it decodes next-auth CSRF cookies and
+    # avoids APIRequestContext on authenticated SOCKS5 proxy paths.
+    from services.chatgpt_core.browser_registration import (
+        _get_browser_csrf_token as _get_hardened_csrf_token,
+        _start_browser_signin as _start_hardened_browser_signin,
+    )
 
     log("获取 CSRF token...")
-    csrf_token = _get_browser_csrf_token(page)
+    csrf_token = _get_hardened_csrf_token(page, log=log)
     if not csrf_token:
         raise RuntimeError("获取 CSRF token 失败")
 
     log(f"提交邮箱: {email}")
-    authorize_url = _start_browser_signin(page, email, device_id, csrf_token)
+    authorize_url = _start_hardened_browser_signin(
+        page,
+        email,
+        device_id,
+        csrf_token,
+        log=log,
+    )
     if not authorize_url:
         raise RuntimeError("提交邮箱失败，未获取 authorize URL")
 
@@ -2482,7 +2559,11 @@ def _browser_authorize(page, auth_url: str, log) -> str:
     if not auth_url:
         return ""
     try:
-        page.goto(auth_url, wait_until="domcontentloaded", timeout=30000)
+        page.goto(auth_url, wait_until="commit", timeout=30000)
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=10000)
+        except Exception as exc:
+            log(f"Authorize DOMContentLoaded 未完成，继续读取最终状态: {str(exc)[:160]}")
         final_url = page.url
         log(f"Authorize -> {final_url[:120]}")
         return final_url
@@ -3915,7 +3996,7 @@ def _browser_registration_flow(
     _seed_browser_device_id(page, device_id)
     try:
         state = _start_browser_signup_via_page(page, email, log)
-    except Exception as exc:
+    except _BrowserSignupEntryUnavailable as exc:
         log(f"页面驱动注册入口失败，回退 ChatGPT authorize 入口: {exc}")
         state = _start_browser_signup_via_authorize(page, email, device_id, log)
     auth_cookies = _get_cookies(page)
@@ -4165,9 +4246,9 @@ class ChatGPTBrowserRegister:
             if not access_token or not session_token or not cookie_header:
                 raise RuntimeError(
                     "ChatGPT Web Session 材料不完整: "
-                    f"access_token={'yes' if access_token else 'no'} "
-                    f"session_token={'yes' if session_token else 'no'} "
-                    f"cookies={'yes' if cookie_header else 'no'}"
+                    f"AT状态={'存在' if access_token else '缺失'}｜"
+                    f"Session状态={'存在' if session_token else '缺失'}｜"
+                    f"Cookie状态={'存在' if cookie_header else '缺失'}"
                 )
             self.log(
                 "ChatGPT Web Session 获取成功: "
