@@ -12,4 +12,7 @@ test('shared config actions use the App modal context and expose failures', () =
   assert.match(shareActions, /appModal\.info\(/)
   assert.doesNotMatch(shareActions, /(?<![A-Za-z])Modal\.(confirm|info)\(/)
   assert.match(shareActions, /关闭共享配置失败/)
+  assert.match(shareActions, /enable_shared:\s*true/)
+  assert.match(shareActions, /页面存在未保存修改/)
+  assert.match(settingsSource, /发布本地并启用共享/)
 })

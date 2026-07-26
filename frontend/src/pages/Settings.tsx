@@ -11,6 +11,7 @@ import {
   CheckCircleOutlined,
   CloseCircleOutlined,
   SyncOutlined,
+  CloudUploadOutlined,
   PlusOutlined,
   LockOutlined,
   CopyOutlined,
@@ -3749,6 +3750,7 @@ export default function Settings() {
   const [saved, setSaved] = useState(false)
   const [configLoaded, setConfigLoaded] = useState(false)
   const [configLoadError, setConfigLoadError] = useState('')
+  const [configDirty, setConfigDirty] = useState(false)
   const [shareState, setShareState] = useState<ConfigShareState | null>(null)
   const [shareBusy, setShareBusy] = useState(false)
   const [activeTab, setActiveTab] = useState('register')
@@ -3816,10 +3818,27 @@ export default function Settings() {
   }
 
   const pushLocalConfigToShared = () => {
+    if (!shareState) {
+      appMessage.error('共享状态尚未加载，请刷新状态后重试')
+      return
+    }
+    if (shareState.enabled) {
+      appMessage.info('当前实例已在共享模式，无需再次发布本地配置')
+      return
+    }
+    if (!configLoaded) {
+      appMessage.error('配置尚未加载完成，暂不能发布')
+      return
+    }
+    if (configDirty) {
+      appMessage.warning('页面存在未保存修改，请先点击“保存配置”再发布为共享模板')
+      return
+    }
+
     appModal.confirm({
-      title: '将本实例配置推送为共享模板',
-      content: '这是覆盖共享模板的危险操作，会影响所有开启共享配置的实例。建议仅在确认当前实例配置是最新母版时执行。',
-      okText: '确认覆盖共享模板',
+      title: '发布本地配置并启用共享',
+      content: '将使用本实例已保存的本地配置覆盖共享模板；成功后当前实例立即切换为共享模式，并影响所有已开启共享的实例。共享模板若已被其他实例更新，会因 revision 冲突而拒绝覆盖。',
+      okText: '发布并启用共享',
       okButtonProps: { danger: true },
       cancelText: '取消',
       onOk: async () => {
@@ -3831,10 +3850,11 @@ export default function Settings() {
               confirm: true,
               base_revision: shareState?.shared?.revision,
               note: `ui-push:${shareState?.instance_id || 'unknown'}`,
+              enable_shared: true,
             }),
           }) as { state?: ConfigShareState }
           if (result?.state) setShareState(result.state)
-          appMessage.success('已用本实例配置更新共享模板')
+          appMessage.success('本地配置已发布为共享模板，当前实例已切换为共享模式')
           reloadAfterShareChange()
         } catch (error: any) {
           appMessage.error(error?.message || '推送共享模板失败')
@@ -3876,6 +3896,7 @@ export default function Settings() {
   useEffect(() => {
     setConfigLoaded(false)
     setConfigLoadError('')
+    setConfigDirty(false)
     loadShareState().catch(() => undefined)
     apiFetch('/config').then((data) => {
       if (!data || typeof data !== 'object' || Array.isArray(data)) {
@@ -4625,6 +4646,7 @@ export default function Settings() {
         external_access_token_precheck_cooldown_seconds: values.external_access_token_precheck_cooldown_seconds,
       })
       message.success('保存成功')
+      setConfigDirty(false)
       setSaved(true)
       setTimeout(() => setSaved(false), 2000)
     } finally {
@@ -4725,7 +4747,7 @@ export default function Settings() {
             <Typography.Text type="secondary">
               {shareState?.enabled
                 ? `保存本页会更新共享模板，并影响所有开启共享的实例；最后更新：${shareState?.shared?.updated_by || '-'} / ${shareState?.shared?.updated_at || '-'}`
-                : `当前实例只使用本地配置；脱离基线：rev ${shareState?.baseline_revision || '0'}，脱离时间：${shareState?.detached_at || '-'}`}
+                : `当前实例只使用本地配置；脱离基线：rev ${shareState?.baseline_revision || '0'}，脱离时间：${shareState?.detached_at || '-'}。先保存修改，再发布本地配置即可重新加入共享。`}
             </Typography.Text>
             <Typography.Text type="secondary">
               本地保留不共享：CLIProxyAPI、外部分发 API Token、GoPay 近期运行态等实例专属配置。
@@ -4737,19 +4759,27 @@ export default function Settings() {
               checkedChildren="共享"
               unCheckedChildren="本地"
               loading={shareBusy}
+              disabled={!shareState}
               onChange={toggleShareMode}
             />
             <Button size="small" icon={<SyncOutlined />} loading={shareBusy} onClick={() => loadShareState()}>
               刷新状态
             </Button>
-            <Button size="small" loading={shareBusy} onClick={pullSharedConfig}>
+            <Button size="small" loading={shareBusy} disabled={!shareState} onClick={pullSharedConfig}>
               从共享拉取
             </Button>
-            <Button size="small" loading={shareBusy} onClick={showShareDiff}>
+            <Button size="small" loading={shareBusy} disabled={!shareState} onClick={showShareDiff}>
               查看差异
             </Button>
-            <Button size="small" danger loading={shareBusy} disabled={Boolean(shareState?.enabled)} onClick={pushLocalConfigToShared}>
-              本实例推送为共享模板
+            <Button
+              size="small"
+              danger
+              icon={<CloudUploadOutlined />}
+              loading={shareBusy}
+              disabled={!shareState || Boolean(shareState.enabled) || !configLoaded}
+              onClick={pushLocalConfigToShared}
+            >
+              发布本地并启用共享
             </Button>
           </Space>
         </div>
@@ -4818,7 +4848,13 @@ export default function Settings() {
           ) : activeTab === 'security' ? (
             <SecurityPanel />
           ) : (
-            <Form form={form} layout="vertical">
+            <Form
+              form={form}
+              layout="vertical"
+              onValuesChange={() => {
+                if (configLoaded) setConfigDirty(true)
+              }}
+            >
               {activeTab === 'contribution' ? (
                 <ContributionPanel form={form} onSave={save} saving={saving} saved={saved} />
               ) : (

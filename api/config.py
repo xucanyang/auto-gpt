@@ -272,6 +272,9 @@ class SharePushRequest(BaseModel):
     base_revision: int | None = None
     confirm: bool = False
     note: str = ""
+    # Backward-compatible default: callers that only need to replace the
+    # template can keep the current instance in local mode.
+    enable_shared: bool = False
 
 
 class TempMailDomainsRequest(BaseModel):
@@ -891,7 +894,21 @@ def push_instance_config_to_shared(body: SharePushRequest):
         )
     except SharedConfigConflict as exc:
         raise HTTPException(409, str(exc)) from exc
-    return {**result, "state": config_store.get_share_state()}
+    # Publishing from local mode is a two-part operator action: first commit
+    # the local snapshot as the new shared revision, then attach this instance
+    # to that exact revision without pulling it back over the local database.
+    # The opt-in flag keeps the existing push-only API behavior intact.
+    if body.enable_shared:
+        try:
+            state = config_store.enable_shared(pull=False)
+        except Exception as exc:
+            raise HTTPException(
+                503,
+                "共享模板已更新，但当前实例切换共享失败，请刷新状态后重试",
+            ) from exc
+    else:
+        state = config_store.get_share_state()
+    return {**result, "state": state}
 
 
 @router.get("/share/diff")

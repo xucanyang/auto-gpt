@@ -13,6 +13,7 @@
 - **统一测试文档入口**：`README.md`、`AGENTS.md` 与 `docs/docker-image-release.md` 现在统一指向 Docker 测试规范，移除会吞掉收集失败的 `pytest tests -q || true` 作为推荐门禁，明确当前 `requirements-test.txt`、`docker-compose.test.yml` 和测试脚本仍待落地。
 
 ### 修复 (Fixed)
+- **补齐本地配置发布为共享模板的闭环**：`api/config.py` 的 `/api/config/share/push` 新增可选 `enable_shared` 契约；Settings 在本地模式下现在明确提供“发布本地并启用共享”操作，先以当前实例已保存配置覆盖共享模板，再基于同一 revision 将当前实例切回共享模式。页面存在未保存改动或共享 revision 已变化时会阻止/拒绝发布，避免把旧快照误当成共享母版；未传该字段的旧调用仍保持仅覆盖模板的行为。
 - **修复 Settings 配置共享开关无法确认**：`frontend/src/pages/Settings.tsx` 的共享配置开启、关闭、推送和差异查看操作改用 `App.useApp()` 提供的上下文 `modal` 实例，不再调用当前构建中无法挂载的静态 `Modal.confirm/info`。现在切换到本地模式会正常显示确认框并提交 `PUT /api/config/share-state`；请求失败时会在页面提示具体错误，避免开关点击后无反馈。新增 `frontend/tests/sharedConfigContract.test.mjs` 锁定该交互契约。
 - **记录 Argon2 与 Sentinel 测试问题的真实边界**：文档区分宿主机缺少 `argon2` 的依赖环境漂移和 Sentinel 旧中文日志断言造成的测试契约漂移，避免以后把两类问题误判为线上认证或浏览器运行故障。
 - **修正 Docker 发布拓扑旧描述**：`docs/docker-image-release.md` 按当前 `docker-compose.multi.yml` 更新为 `auto-gpt`、`auto-gpt-plus`、`auto-plus2` 三个常驻业务实例与 `phone-api-relay` 共同运行，移除主服务 standby 的过时说法。
@@ -3005,4 +3006,8 @@
 
 ## 2026-07-26 10:29:18 +0800
 - 修复 Settings 共享配置开关确认弹窗
+- 发布模式: multi
+
+## 2026-07-26 11:09:41 +0800
+- 补齐本地配置发布为共享并启用当前实例
 - 发布模式: multi
