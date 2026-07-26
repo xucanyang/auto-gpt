@@ -21,6 +21,12 @@
 ### 测试 (Tests)
 - **完成文档一致性校验**：通过 `git diff --check`、Markdown 代码围栏配对和文档目标链接存在性检查；本次仅修改项目文档，未执行 Python、前端或容器测试，也未触碰生产运行态。
 
+## [2.8.56] - 2026-07-26
+
+### 修复 (Fixed)
+- **修复 Web Session 桥接的 authorize 假超时**：v2.8.54 只把 `services/chatgpt_core/any_auto/browser_register.py` 的注册入口导航改成主文档 `commit`，遗漏了 `services/chatgpt_core/browser_registration.py` 中 `_browser_chatgpt_openai_signin_bridge` 的 `auth.openai.com/api/accounts/authorize` 跳转，它仍以 `domcontentloaded` + 35s 等待。实测三次尝试中有两次在该处耗满 35s 才抛导航超时，桥接结束时 `/api/auth/session` 只能读到空 payload（`status=0 keys=[]`），accessToken 依赖后续“补拉”碰运气；唯一一次在 13s 内完成 `domcontentloaded` 的尝试则立即命中 accessToken。现在该跳转与桥接内首页导航、CSRF reload、回落 ChatGPT 首页统一改为 `wait_until="commit"`，超时压到 20s，落地后仍由 `_wait_for_auth_page_settle` 独立确认 URL 稳定。
+- **收敛 Web Session 等待的导航预算**：`_wait_for_web_session` 的首页导航从 `domcontentloaded` + 45s 改为 `commit` + 20s。此前单次导航超时就能吃掉调用方 55s 总预算的绝大部分，导致 next-auth 桥接来不及触发或只剩一次轮询；改动后桥接能在预算内启动，并保留原有的“桥接晚于 deadline 命中也不丢弃”与超时前补拉逻辑。
+
 ## [2.8.55] - 2026-07-26
 
 ### 修复 (Fixed)
@@ -3040,4 +3046,8 @@
 
 ## 2026-07-26 12:27:35 +0800
 - v2.8.55 修复浏览器早期失败误占目标槽
+- 发布模式: multi
+
+## 2026-07-26 16:51:22 +0800
+- v2.8.56 修复 Web Session 桥接 authorize 假超时
 - 发布模式: multi

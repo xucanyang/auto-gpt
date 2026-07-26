@@ -3047,7 +3047,7 @@ def _browser_chatgpt_openai_signin_bridge(
     device_id = str(device_id or "").strip()
     log("Web Session 桥接: ChatGPT next-auth signin/openai")
     try:
-        page.goto(f"{CHATGPT_APP}/", wait_until="domcontentloaded", timeout=30000)
+        page.goto(f"{CHATGPT_APP}/", wait_until="commit", timeout=20000)
     except Exception as exc:
         log(f"Web Session 桥接首页导航异常: {exc}")
     _wait_for_auth_page_settle(page, timeout=5.0, log=log)
@@ -3063,7 +3063,7 @@ def _browser_chatgpt_openai_signin_bridge(
     if not csrf_token:
         # Hard reload once — next-auth often sets csrf cookie only after a full document load.
         try:
-            page.reload(wait_until="domcontentloaded", timeout=30000)
+            page.reload(wait_until="commit", timeout=20000)
         except Exception as exc:
             log(f"Web Session 桥接 reload 异常: {exc}")
         _wait_for_auth_page_settle(page, timeout=5.0, log=log)
@@ -3107,7 +3107,7 @@ def _browser_chatgpt_openai_signin_bridge(
 
     log(f"Web Session 桥接 authorize: {authorize_url[:120]}")
     try:
-        page.goto(authorize_url, wait_until="domcontentloaded", timeout=35000)
+        page.goto(authorize_url, wait_until="commit", timeout=20000)
     except Exception as exc:
         # Callback 落地时 localhost / 中断导航常见，随后再看最终 URL
         log(f"Web Session 桥接 authorize 导航异常（可继续）: {exc}")
@@ -3118,7 +3118,7 @@ def _browser_chatgpt_openai_signin_bridge(
     current = str(page.url or "")
     if "chatgpt.com" not in current:
         try:
-            page.goto(f"{CHATGPT_APP}/", wait_until="domcontentloaded", timeout=30000)
+            page.goto(f"{CHATGPT_APP}/", wait_until="commit", timeout=20000)
         except Exception as exc:
             log(f"Web Session 桥接回 ChatGPT 首页异常: {exc}")
         _wait_for_auth_page_settle(page, timeout=5.0, log=log)
@@ -3164,7 +3164,7 @@ def _wait_for_web_session(
         home_navigated = True
         logger(f"Web Session: 导航 chatgpt.com 首页建立 next-auth 会话 ({reason})")
         try:
-            page.goto(f"{CHATGPT_APP}/", wait_until="domcontentloaded", timeout=45000)
+            page.goto(f"{CHATGPT_APP}/", wait_until="commit", timeout=20000)
         except Exception as exc:
             message = str(exc or "")
             logger(f"Web Session: 首页导航异常: {message[:180]}")
