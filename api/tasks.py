@@ -17147,6 +17147,18 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                 return AttemptResult.stopped(str(e))
             except Exception as e:
                 error_text = str(e)
+                registration_failure_metadata = getattr(
+                    e, "registration_metadata", None
+                )
+                registration_failure_metadata = (
+                    dict(registration_failure_metadata)
+                    if isinstance(registration_failure_metadata, dict)
+                    else {}
+                )
+                mailbox_finalize_outcome = str(
+                    registration_failure_metadata.get("mailbox_finalize_outcome")
+                    or ""
+                ).strip().lower()
                 current_email = str(
                     attempt_log_context.get("email")
                     or current_email
@@ -17209,11 +17221,23 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                         },
                     )
 
+                safe_early_failure = bool(
+                    browser_executor
+                    and browser_register_invoked
+                    and mailbox_finalize_outcome == "early_failure"
+                )
                 consumes_target_slot = bool(
                     browser_executor
                     and browser_register_invoked
                     and not deterministic_existing
+                    and not safe_early_failure
                 )
+                if deterministic_existing:
+                    failure_reason_code = "existing_account_login_recovery_failed"
+                elif safe_early_failure:
+                    failure_reason_code = "registration_early_failure"
+                else:
+                    failure_reason_code = "registration_failed"
                 _save_task_log(
                     req.platform,
                     current_email,
@@ -17224,6 +17248,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                         {
                             "attempt_outcome": "failed",
                             "email": current_email,
+                            "mailbox_finalize_outcome": mailbox_finalize_outcome,
                         },
                     ),
                 )
@@ -17232,13 +17257,10 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                     consumes_target_slot=consumes_target_slot,
                     metadata={
                         "email": current_email,
-                        "reason_code": (
-                            "existing_account_login_recovery_failed"
-                            if deterministic_existing
-                            else "registration_failed"
-                        ),
-                        "mailbox_action": "finalized",
+                        "reason_code": failure_reason_code,
+                        "mailbox_action": mailbox_finalize_outcome or "finalized",
                         "backfill": not consumes_target_slot,
+                        "mailbox_finalize_outcome": mailbox_finalize_outcome,
                     },
                 )
             finally:

@@ -261,6 +261,7 @@ class ChatGPTPlatform(BasePlatform):
                     self._mailbox = _mailbox
                     self._last_verification_result = {}
                     self._post_finalize_state = None
+                    self._registration_failure_outcome = ""
 
                 def _can_reuse_current_account(self) -> bool:
                     acct = self._acct
@@ -385,11 +386,14 @@ class ChatGPTPlatform(BasePlatform):
                     resolved_task_id = str(task_id or _task_id or "").strip()
                     normalized_error = str(error_message or "").strip()
                     if callable(finalize):
-                        finalize(
+                        finalize_outcome = finalize(
                             self._acct,
                             error_message=normalized_error,
                             task_id=resolved_task_id,
                         )
+                        self._registration_failure_outcome = str(
+                            finalize_outcome or ""
+                        ).strip().lower()
                     self._post_finalize_state = self.export_state()
                     _sync_hme_rerun_result(self._acct, success=False, error_message=normalized_error, task_id=resolved_task_id)
 
@@ -520,7 +524,11 @@ class ChatGPTPlatform(BasePlatform):
         )
         result = adapter.run(context)
         if not result or not result.success:
-            raise RuntimeError(result.error_message if result else "注册失败")
+            failure = RuntimeError(result.error_message if result else "注册失败")
+            result_metadata = getattr(result, "metadata", None) if result else None
+            if isinstance(result_metadata, dict):
+                failure.registration_metadata = dict(result_metadata)
+            raise failure
 
         return adapter.build_account(result, password)
 

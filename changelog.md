@@ -21,6 +21,16 @@
 ### 测试 (Tests)
 - **完成文档一致性校验**：通过 `git diff --check`、Markdown 代码围栏配对和文档目标链接存在性检查；本次仅修改项目文档，未执行 Python、前端或容器测试，也未触碰生产运行态。
 
+## [2.8.55] - 2026-07-26
+
+### 修复 (Fixed)
+- **Helper `early_failure` 不再误占浏览器目标槽**：HME Helper 已确认“尚未进入 OpenAI 注册提交”的首页、CSRF、导航等早期失败时，`core/base_mailbox.py` 将权威 finalize outcome 依次传递到 `access_token_only_registration_engine.py`、`services/chatgpt_core/plugin.py` 和 `api/tasks.py`。任务结果现在输出 `reason_code=registration_early_failure`、`mailbox=early_failure`、`slot=0`、`backfill=yes`，会继续使用剩余 `register_max_attempts` 补足目标成功数。
+- **保持晚期失败的非幂等保护**：只有邮箱系统成功 finalize 为 `early_failure` 才允许补位；OTP 等待已经开始、账号可能已完成密码/OTP/about_you 的 `late_failure`，以及没有权威邮箱 outcome 的普通浏览器异常，仍保持 `slot=1`、不重放身份。此次变更不放开同一尝试切换代理，也不改变已有账号确定性分流。
+- **修复“最大尝试 9 次实际只跑 3 次”的调度语义**：此前任务层只按“浏览器是否已启动”判断所有失败均占槽，忽略 Helper 已释放租约的早期失败；目标为 3 时，1 成功加 2 失败会提前填满三个身份槽。现在早期失败不计入 `consumed_browser_failure_slots`，调度器会启动第 4 次及后续尝试，直到成功数达标、真正不确定槽满或到达最大尝试上限。
+
+### 测试 (Tests)
+- 扩展 `tests/test_any_auto_web_session_contract.py`、`tests/test_chatgpt_plugin.py`、`tests/test_icloud_hme_mailbox_finalize.py` 和 `tests/test_register_task_controls.py`，覆盖 finalize outcome 返回、失败 metadata 透传、`early_failure` 安全补位及未知失败继续占槽。一次性断网、只读生产依赖容器回归共 `96 passed`。
+
 ## [2.8.54] - 2026-07-26
 
 ### 修复 (Fixed)
@@ -3026,4 +3036,8 @@
 
 ## 2026-07-26 12:15:47 +0800
 - v2.8.54 修复浏览器注册 CSRF 桥接与导航假超时
+- 发布模式: multi
+
+## 2026-07-26 12:27:35 +0800
+- v2.8.55 修复浏览器早期失败误占目标槽
 - 发布模式: multi

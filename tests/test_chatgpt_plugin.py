@@ -105,6 +105,15 @@ class _CaptureContextAdapter:
         return {"success": True, "password": fallback_password}
 
 
+class _FailureMetadataAdapter:
+    def run(self, context):
+        return mock.Mock(
+            success=False,
+            error_message="Page.goto: Timeout 30000ms exceeded",
+            metadata={"mailbox_finalize_outcome": "early_failure"},
+        )
+
+
 class _StateCaptureAdapter:
     def run(self, context):
         context.email_service.create_email()
@@ -423,6 +432,24 @@ class ChatGPTPluginTests(unittest.TestCase):
             platform.register()
 
         self.assertEqual(mailbox.get_email_calls, 1)
+
+    def test_registration_failure_preserves_internal_metadata_on_exception(self):
+        platform = ChatGPTPlatform(
+            config=RegisterConfig(extra={"chatgpt_registration_mode": "access_token_only"}),
+            mailbox=_TrackingMailbox(),
+        )
+
+        with mock.patch(
+            "services.chatgpt_core.plugin.build_chatgpt_registration_mode_adapter",
+            return_value=_FailureMetadataAdapter(),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Page.goto") as raised:
+                platform.register()
+
+        self.assertEqual(
+            raised.exception.registration_metadata["mailbox_finalize_outcome"],
+            "early_failure",
+        )
 
     def test_direct_mode_ignores_stale_explicit_proxy(self):
         mailbox = _TrackingMailbox()

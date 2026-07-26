@@ -3673,7 +3673,7 @@ class IcloudHmeMailbox(BaseMailbox):
         *,
         error_message: str = "",
         task_id: str = "",
-    ) -> None:
+    ) -> str | None:
         from core.db import (
             release_icloud_hme_alias_after_early_failure,
             update_icloud_hme_alias_on_account_deactivated,
@@ -3684,7 +3684,7 @@ class IcloudHmeMailbox(BaseMailbox):
         if self._icloud_hme_mode == "helper_ready_api":
             lease_id = self._helper_lease_id(account)
             if not lease_id:
-                return
+                return None
             resolved_task_id = str(task_id or getattr(self, "_task_attempt_token", "") or "").strip()
             error_text = str(error_message or "").strip()
             if is_account_deactivated_message("", error_text):
@@ -3709,11 +3709,11 @@ class IcloudHmeMailbox(BaseMailbox):
             self._apply_helper_finalize_payload(account, response, outcome=outcome)
             self._helper_wait_started_leases.discard(lease_id)
             self._log(f"[iCloudHME] Helper 已处理失败 outcome={outcome}: {getattr(account, 'email', '')}")
-            return
+            return outcome
 
         anonymous_id = str(getattr(account, "account_id", "") or "").strip()
         if not anonymous_id:
-            return
+            return None
         resolved_task_id = str(task_id or getattr(self, "_task_attempt_token", "") or "").strip()
         error_text = str(error_message or "").strip()
         if is_account_deactivated_message("", error_text):
@@ -3723,7 +3723,7 @@ class IcloudHmeMailbox(BaseMailbox):
                 task_id=resolved_task_id,
             )
             self._log(f"[iCloudHME] 账号已删除/停用，别名标记为账号已禁用: {getattr(account, 'email', '')}")
-            return
+            return "account_deactivated"
         outcome = self._classify_helper_failure_outcome(
             error_text,
             lease_id="",
@@ -3736,13 +3736,14 @@ class IcloudHmeMailbox(BaseMailbox):
                 task_id=resolved_task_id,
             )
             self._log(f"[iCloudHME] 早期失败，别名回退为 reserved: {getattr(account, 'email', '')}")
-            return
+            return outcome
         # keep / late_failure / 其它：标记失败占用，禁止再当 ready 出池
         update_icloud_hme_alias_on_failure(
             anonymous_id,
             error_message=error_text,
             task_id=resolved_task_id,
         )
+        return outcome
 
     def export_state_config(
         self,

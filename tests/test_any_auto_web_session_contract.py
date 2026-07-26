@@ -9,8 +9,12 @@ else:
     _CAMOUFOX_AVAILABLE = True
 
 from core.task_runtime import SkipCurrentAttemptRequested
+from services.chatgpt_core.access_token_only_registration_engine import (
+    AccessTokenOnlyRegistrationEngine,
+)
 from services.chatgpt_core.any_auto import register as any_auto_register
 from services.chatgpt_core.any_auto import transport
+from services.chatgpt_core.refresh_token_registration_engine import RegistrationResult
 
 if _CAMOUFOX_AVAILABLE:
     from services.chatgpt_core import browser_registration
@@ -296,6 +300,35 @@ class AnyAutoWebSessionContractTests(unittest.TestCase):
                     proxy_url=None,
                     wait_code=lambda **_kwargs: "123456",
                 )
+
+    def test_failure_finalize_outcome_is_attached_to_registration_metadata(self):
+        class FakeEmailService:
+            _registration_failure_outcome = ""
+
+            def finalize_failure(self, **_kwargs):
+                self._registration_failure_outcome = "early_failure"
+
+            def export_state(self):
+                return {"provider": "icloud_hme"}
+
+        email_service = FakeEmailService()
+        engine = AccessTokenOnlyRegistrationEngine(
+            email_service,
+            browser_mode="headless",
+        )
+        result = RegistrationResult(
+            success=False,
+            email="user@example.com",
+            error_message="Page.goto: Timeout 30000ms exceeded",
+        )
+
+        engine._finalize_email_service_failure(result)
+
+        self.assertEqual(
+            result.metadata["mailbox_finalize_outcome"],
+            "early_failure",
+        )
+        self.assertEqual(result.metadata["mailbox_state"]["provider"], "icloud_hme")
 
     def test_normalization_requires_access_and_session_material(self):
         incomplete = transport._normalize_result(

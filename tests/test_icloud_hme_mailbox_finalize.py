@@ -456,12 +456,13 @@ class IcloudHmeMailboxFinalizeTests(unittest.TestCase):
             patch("core.db.release_icloud_hme_alias_after_early_failure") as release_alias,
             patch("core.db.update_icloud_hme_alias_on_failure") as mark_failure,
         ):
-            mailbox.finalize_failure(
+            outcome = mailbox.finalize_failure(
                 account,
                 error_message="访问首页失败: timeout",
                 task_id="task-2",
             )
 
+        self.assertEqual(outcome, "early_failure")
         release_alias.assert_called_once()
         mark_failure.assert_not_called()
         self.assertEqual(release_alias.call_args.args[0], "anon-2")
@@ -512,12 +513,13 @@ class IcloudHmeMailboxFinalizeTests(unittest.TestCase):
         )
         mailbox._helper_client.finalize = Mock(return_value={})
 
-        mailbox.finalize_failure(
+        outcome = mailbox.finalize_failure(
             account,
             error_message="浏览器注册检测到该邮箱已存在；当前注册执行器不会自动切换登录恢复",
             task_id="task-dirty",
         )
 
+        self.assertEqual(outcome, "keep")
         mailbox._helper_client.finalize.assert_called_once()
         kwargs = mailbox._helper_client.finalize.call_args.kwargs
         self.assertEqual(kwargs["outcome"], "keep")
@@ -541,7 +543,7 @@ class IcloudHmeMailboxFinalizeTests(unittest.TestCase):
         )
         mailbox._helper_client.finalize = Mock(return_value={})
 
-        mailbox.finalize_failure(
+        outcome = mailbox.finalize_failure(
             account,
             error_message=(
                 "browser_registration_failed: InvalidIP: Failed to get IP address: "
@@ -550,6 +552,7 @@ class IcloudHmeMailboxFinalizeTests(unittest.TestCase):
             task_id="task-geoip",
         )
 
+        self.assertEqual(outcome, "early_failure")
         kwargs = mailbox._helper_client.finalize.call_args.kwargs
         self.assertEqual(kwargs["outcome"], "early_failure")
 

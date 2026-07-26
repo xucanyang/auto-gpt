@@ -655,6 +655,74 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
         self.assertEqual(len(calls), 3)
         self.assertEqual(create_mailbox.call_count, 3)
 
+    def test_browser_helper_early_failure_does_not_consume_slot_and_backfills(self):
+        calls = []
+
+        class BrowserEarlyFailureThenSuccessPlatform(_FakePlatform):
+            def register(self, email=None, password=None):
+                calls.append(len(calls) + 1)
+                if len(calls) == 1:
+                    failure = RuntimeError("Page.goto: Timeout 30000ms exceeded")
+                    failure.registration_metadata = {
+                        "mailbox_finalize_outcome": "early_failure",
+                    }
+                    raise failure
+                return Account(
+                    platform="chatgpt",
+                    email="replacement-after-early-failure@example.com",
+                    password=password or "pw",
+                    token="at-replacement",
+                    extra={},
+                )
+
+        task_id = "task-browser-helper-early-failure-backfill"
+        req = RegisterTaskRequest(
+            platform="chatgpt",
+            count=1,
+            concurrency=1,
+            executor_type="headless",
+            proxy_mode="direct",
+            extra={
+                "mail_provider": "fake",
+                "register_max_attempts": 2,
+            },
+        )
+        _create_task_record(task_id, req, "manual", None)
+
+        with (
+            patch(
+                "services.chatgpt_core.ChatGPTPlatform",
+                BrowserEarlyFailureThenSuccessPlatform,
+            ),
+            patch(
+                "core.proxy_utils.resolve_task_proxy_candidates",
+                return_value=[("", None, "direct")],
+            ),
+            patch(
+                "core.base_mailbox.create_mailbox",
+                side_effect=lambda **_kwargs: _FakeMailbox(),
+            ),
+            patch("core.db.save_account", side_effect=lambda account: account),
+            patch("api.tasks.schedule_chatgpt_local_status_refresh_for_account_id"),
+            patch("api.tasks._auto_upload_integrations"),
+            patch("api.tasks._save_task_log"),
+        ):
+            _run_register(task_id, req)
+
+        snapshot = _task_store.snapshot(task_id)
+        self.assertEqual(snapshot["status"], "done")
+        self.assertEqual(snapshot["success"], 1)
+        self.assertEqual(calls, [1, 2])
+        self.assertTrue(
+            any(
+                "原因码=registration_early_failure" in line
+                and "邮箱回写=early_failure" in line
+                and "占用目标=否" in line
+                and "补位=是" in line
+                for line in snapshot["logs"]
+            )
+        )
+
     def test_browser_failure_before_register_can_fill_the_same_target_slot(self):
         calls = []
 

@@ -1013,6 +1013,12 @@ class AccessTokenOnlyRegistrationEngine:
             self._mailbox_finalized = True
         except Exception as exc:
             self._log(f"[邮箱] finalize_failure 执行失败: {exc}", "warning")
+        finalize_outcome = str(
+            getattr(self.email_service, "_registration_failure_outcome", "") or ""
+        ).strip().lower()
+        if finalize_outcome:
+            result.metadata = dict(result.metadata or {})
+            result.metadata["mailbox_finalize_outcome"] = finalize_outcome
         try:
             exporter = getattr(self.email_service, "export_state", None)
             if callable(exporter):
