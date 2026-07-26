@@ -669,7 +669,7 @@ export default function Proxies() {
     const template = dynamicProxyTemplate.trim()
     const country = dynamicProxyCountry.trim().toUpperCase()
     if (!template) {
-      message.warning('请填写动态代理模板')
+      message.warning('请填写动态节点地址')
       return
     }
     if (!country) {
@@ -701,7 +701,7 @@ export default function Proxies() {
     const template = dynamicProxyTemplate.trim()
     const country = dynamicProxyCountry.trim().toUpperCase()
     if (!template) {
-      message.warning('请填写动态代理模板')
+      message.warning('请填写动态节点地址')
       return
     }
     if (!country) {
@@ -724,7 +724,7 @@ export default function Proxies() {
       }) as Record<string, any>
       setDynamicPreviewResult(result)
       if (result.ok) {
-        message.success(result.match ? `动态代理出口匹配 ${country}` : '动态代理模板解析成功')
+        message.success(result.match ? `动态代理出口匹配 ${country}` : '动态节点解析成功')
       } else {
         message.warning(String(result.message || '动态代理预览未通过'))
       }
@@ -1114,18 +1114,18 @@ export default function Proxies() {
             <InputNumber min={1} max={100} value={poolMaxCandidates} onChange={(value) => setPoolMaxCandidates(Number(value || 5))} addonBefore="候选数" />
           </Space>
           <Typography.Text type="secondary">
-            自动扫描目标固定为基础连通、出口国家和 ChatGPT 首页；代理池及指定代理失败回退时按这里的最低健康分和候选数挑选。动态代理不使用代理池健康分/候选数，只按模板和出口国家生成运行代理。
+            自动扫描目标固定为基础连通、出口国家和 ChatGPT 首页；代理池及指定代理失败回退时按这里的最低健康分和候选数挑选。动态代理不使用代理池健康分/候选数，只按动态节点和出口国家生成运行代理。
           </Typography.Text>
         </Space>
       </Card>
 
-      <Card title="动态代理预览">
+      <Card title="动态节点预览">
         <Space direction="vertical" size={12} style={{ width: '100%' }}>
           <Alert
             type="info"
             showIcon
-            message="动态代理不是本地代理池记录"
-            description="输入包含 region-XX 或 region-Rand、sid-xxx-t-N 的模板，系统会按出口国家改写 region、刷新 sid，并按“IP保留分钟”覆盖 t-N；预览优先用代理出口侧 Cloudflare Trace 实测国家，GeoIP 临时不可用时会标记未实测，预览和日志只展示脱敏地址。"
+            message="动态节点不是本地代理池记录"
+            description="输入包含 region-XX 或 region-Rand、sid-xxx-t-N 的节点地址，系统会按出口国家改写 region、刷新 sid，并按“IP保留分钟”覆盖 t-N；预览优先用代理出口侧 Cloudflare Trace 实测国家，GeoIP 临时不可用时会标记未实测，预览和日志只展示脱敏地址。"
           />
           <Space wrap align="start" style={{ width: '100%' }}>
             <Input.Password
@@ -1155,7 +1155,7 @@ export default function Proxies() {
               预览动态出口
             </Button>
             <Button loading={dynamicSaving} onClick={() => void saveDynamicProxySettings()}>
-              保存到全局动态配置
+              保存全局动态节点
             </Button>
           </Space>
           {dynamicPreviewResult ? (

@@ -4554,8 +4554,6 @@ export default function Accounts() {
       concurrency: effectiveConcurrency,
     }
     savePhoneBindingSettings(normalizedValues)
-    await saveTaskProxySettingsToConfig(values)
-    await loadConfigCache({ force: true }).catch(() => null)
     if (!usePool && !phoneLines) {
       message.warning('请粘贴手机号/API，或启用手机号池')
       return
@@ -9433,9 +9431,9 @@ export default function Accounts() {
               {phoneBindingProxyMode === 'specified' || phoneBindingProxyMode === 'dynamic' ? (
                 <Form.Item
                   name="proxy"
-                  label={phoneBindingProxyMode === 'dynamic' ? '动态代理模板（全局默认）' : '指定代理'}
+                  label={phoneBindingProxyMode === 'dynamic' ? '动态节点（本次任务可覆盖）' : '指定代理'}
                   rules={phoneBindingProxyMode === 'specified' ? [{ required: true, message: '请填写代理地址' }] : undefined}
-                  extra={phoneBindingProxyMode === 'dynamic' ? '留空使用全局动态代理模板；填写后会更新所有任务的全局动态代理模板。模板需包含 region-XX。' : '容器内建议使用 http://host.docker.internal:110xx。'}
+                  extra={phoneBindingProxyMode === 'dynamic' ? '留空沿用全局动态节点；填写后仅覆盖本次手机号绑定任务。节点需包含 region-XX。全局配置请到代理管理页保存。' : '容器内建议使用 http://host.docker.internal:110xx。'}
                 >
                   <Input placeholder={phoneBindingProxyMode === 'dynamic' ? '可留空；或填 socks5://user-region-JP-sid-xxxx-t-15:pass@host:port' : 'http://host.docker.internal:11021'} />
                 </Form.Item>

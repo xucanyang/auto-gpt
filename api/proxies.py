@@ -385,7 +385,7 @@ def dynamic_proxy_preview(body: DynamicProxyPreviewRequest):
     if retention_minutes in (None, ""):
         retention_minutes = "5"
     if not template:
-        raise HTTPException(400, "动态代理模板不能为空")
+        raise HTTPException(400, "动态节点地址不能为空")
     if not country_code:
         raise HTTPException(400, "出口国家不能为空")
 

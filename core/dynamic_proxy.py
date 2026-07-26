@@ -69,19 +69,19 @@ def _new_sid(length: int = 10) -> str:
 def proxy_with_region(proxy_url: Any, country_code: Any) -> str:
     value = str(proxy_url or "").strip()
     if not value:
-        raise ValueError("动态代理模板为空")
+        raise ValueError("动态节点地址为空")
     country = normalize_country_code(country_code)
     if not country:
         raise ValueError("动态代理模式必须填写出口国家")
     if not REGION_RE.search(value):
-        raise ValueError("动态代理模板缺少 region-XX/region-Rand 标记，无法按需改写出口国家")
+        raise ValueError("动态节点地址缺少 region-XX/region-Rand 标记，无法按需改写出口国家")
     return REGION_RE.sub(lambda match: f"{match.group(1)}{country}", value, count=1)
 
 
 def proxy_with_fresh_sid(proxy_url: Any) -> tuple[str, bool, str]:
     value = str(proxy_url or "").strip()
     if not value:
-        raise ValueError("动态代理模板为空")
+        raise ValueError("动态节点地址为空")
     sid = _new_sid()
     if not SID_RE.search(value):
         return value, False, ""
@@ -112,7 +112,7 @@ def normalize_retention_minutes(
 def proxy_with_retention(proxy_url: Any, retention_minutes: Any = None) -> tuple[str, bool, int | None]:
     value = str(proxy_url or "").strip()
     if not value:
-        raise ValueError("动态代理模板为空")
+        raise ValueError("动态节点地址为空")
     minutes = normalize_retention_minutes(retention_minutes, default=None)
     if minutes is None:
         return value, False, None
@@ -154,13 +154,13 @@ def resolve_dynamic_proxy_template(
 ) -> DynamicProxyResolution:
     template = str(proxy_url or "").strip()
     if not template:
-        raise ValueError("动态代理模板为空")
+        raise ValueError("动态节点地址为空")
     requested = normalize_country_code(country_code)
     if not requested:
         raise ValueError("动态代理模式必须填写出口国家")
     template_country = declared_proxy_region(template)
     if not template_country:
-        raise ValueError("动态代理模板缺少 region-XX/region-Rand 标记，无法按需改写出口国家")
+        raise ValueError("动态节点地址缺少 region-XX/region-Rand 标记，无法按需改写出口国家")
 
     resolved = proxy_with_region(template, requested)
     sid_refreshed = False

@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { App, Card, Form, Input, InputNumber, Select, Button, message, Tabs, Space, Tag, Typography, Modal, QRCode, Switch, Alert, Table, Grid, Spin } from 'antd'
 import type { FormInstance } from 'antd'
 import {
@@ -125,7 +125,7 @@ const TAB_ITEMS = [
       },
       {
         title: '账号网络默认出口',
-        desc: '动态模式只使用“动态代理模板 + 动态代理出口国家”；指定代理和代理池字段仅在对应模式显示。单项任务显式传代理时仍可覆盖本次任务。',
+        desc: '动态模式只使用“动态节点 + 动态代理出口国家”；指定代理和代理池字段仅在对应模式显示。单项任务显式传代理时仍可覆盖本次任务。',
         fields: [
           { key: 'task_proxy_mode', label: '默认出口模式', type: 'select' },
           { key: 'task_proxy_url', label: '指定代理地址', secret: true, placeholder: 'http:// 或 socks5://...' },
@@ -133,7 +133,7 @@ const TAB_ITEMS = [
           { key: 'task_proxy_failover', label: '失败后刷新 / 切换代理', type: 'boolean' },
           { key: 'task_proxy_max_candidates', label: '代理池候选数量', placeholder: '5' },
           { key: 'task_proxy_min_score', label: '代理池最低健康分', placeholder: '50' },
-          { key: 'dynamic_proxy_template', label: '动态代理模板', secret: true, placeholder: 'socks5://user-region-Rand-sid-xxxx-t-5:pass@host:port' },
+          { key: 'dynamic_proxy_template', label: '动态节点地址', secret: true, placeholder: 'socks5://user-region-Rand-sid-xxxx-t-5:pass@host:port' },
           { key: 'dynamic_proxy_default_country', label: '动态代理出口国家', placeholder: 'JP' },
           { key: 'dynamic_proxy_ip_retention_minutes', label: 'IP 保留分钟数（t-N）', placeholder: '5' },
           { key: 'dynamic_proxy_require_country_match', label: '要求实测国家匹配', type: 'boolean' },
@@ -629,6 +629,24 @@ interface SectionConfig {
 
 const TASK_PROXY_SECTION_TITLE = '账号网络默认出口'
 const PAYMENT_LINK_SERVICE_SECTION_TITLE = '支付长链服务'
+
+// Settings is a large snapshot form, but proxy defaults are also edited from
+// the dedicated dynamic-node page. Only fields actually touched in this form
+// may be sent back, otherwise an old tab can overwrite a newer shared value.
+const TASK_PROXY_CONFIG_KEYS = [
+  'task_proxy_mode',
+  'task_proxy_url',
+  'task_proxy_country_code',
+  'task_proxy_failover',
+  'task_proxy_max_candidates',
+  'task_proxy_min_score',
+  'dynamic_proxy_template',
+  'dynamic_proxy_default_country',
+  'dynamic_proxy_require_country_match',
+  'dynamic_proxy_probe_enabled',
+  'dynamic_proxy_probe_timeout_seconds',
+  'dynamic_proxy_ip_retention_minutes',
+] as const
 
 function taskProxyFieldsForMode(
   fields: FieldConfig[],
@@ -1194,7 +1212,7 @@ function ConfigField({ field }: { field: FieldConfig }) {
       : field.key === 'task_proxy_min_score'
         ? '代理池候选的最低健康分；低于此分数不会被默认账号网络动作选中。'
       : field.key === 'dynamic_proxy_template'
-      ? '动态模式唯一的全局模板。支持 region-JP/region-US 等固定国家，也支持 Cliproxy 生成的 region-Rand；任务会按本项出口国家改写完整 region token，再刷新 sid；展示和日志只保存脱敏地址。'
+      ? '动态模式唯一的全局动态节点地址。支持 region-JP/region-US 等固定国家，也支持 Cliproxy 生成的 region-Rand；任务会按本项出口国家改写完整 region token，再刷新 sid；展示和日志只保存脱敏地址。'
       : field.key === 'dynamic_proxy_default_country'
         ? '动态模式唯一的默认出口国家。任务未填写出口国家时使用两位 ISO 国家码，例如 JP、US、SG。'
       : field.key === 'dynamic_proxy_ip_retention_minutes'
@@ -3735,6 +3753,7 @@ export default function Settings() {
   const [activeTab, setActiveTab] = useState('register')
   const [chatgptPinEditorOpen, setChatgptPinEditorOpen] = useState(false)
   const [chatgptPinnedSections, setChatgptPinnedSections] = useState<string[]>(loadChatgptPinnedSections)
+  const initialTaskProxyValuesRef = useRef<Record<string, unknown> | null>(null)
   const selectedMailProvider = Form.useWatch('mail_provider', form) || 'luckmail'
   const taskProxyMode = String(Form.useWatch('task_proxy_mode', form) || 'dynamic').trim().toLowerCase()
   const taskProxyFailover = parseBooleanConfigValue(Form.useWatch('task_proxy_failover', form))
@@ -4149,6 +4168,9 @@ export default function Settings() {
           ? true
           : parseBooleanConfigValue(data.external_access_token_allow_refresh)
       form.setFieldsValue(data)
+      initialTaskProxyValuesRef.current = Object.fromEntries(
+        TASK_PROXY_CONFIG_KEYS.map((key) => [key, data[key]]),
+      )
       setConfigLoaded(true)
     }).catch((error) => {
       const detail = error instanceof Error ? error.message : String(error || '配置加载失败')
@@ -4164,7 +4186,8 @@ export default function Settings() {
     }
     setSaving(true)
     try {
-      const values = form.getFieldsValue(true)
+      const rawValues = form.getFieldsValue(true)
+      const values = { ...rawValues }
       const domains = normalizeDomainList(values.cfworker_domains)
       const enabledDomains = normalizeDomainList(values.cfworker_enabled_domains).filter((domain) => domains.includes(domain))
 
@@ -4318,7 +4341,7 @@ export default function Settings() {
       if (values.task_proxy_mode === 'dynamic') {
         if (!values.dynamic_proxy_template) {
           setActiveTab('register')
-          message.error('动态代理模式必须填写动态代理模板')
+          message.error('动态代理模式必须填写动态节点地址')
           return
         }
         if (!/^[A-Z]{2}$/.test(dynamicProxyCountry)) {
@@ -4482,10 +4505,30 @@ export default function Settings() {
         }
       }
 
+      const initialTaskProxyValues = initialTaskProxyValuesRef.current
+      const sameConfigValue = (left: unknown, right: unknown) => {
+        const normalize = (value: unknown) => {
+          if (value === undefined || value === null) return ''
+          if (typeof value === 'boolean') return value ? 'true' : 'false'
+          return String(value).trim()
+        }
+        return normalize(left) === normalize(right)
+      }
+      const changedTaskProxyKeys = new Set(
+        TASK_PROXY_CONFIG_KEYS.filter((key) => (
+          !initialTaskProxyValues
+          || !sameConfigValue(rawValues[key], initialTaskProxyValues[key])
+        )),
+      )
+      const payload = { ...values }
+      for (const key of TASK_PROXY_CONFIG_KEYS) {
+        if (!changedTaskProxyKeys.has(key)) delete payload[key]
+      }
+
       await apiFetch('/config', {
         method: 'PUT',
         body: JSON.stringify({
-          data: values,
+          data: payload,
           base_revision: shareState?.enabled ? shareState?.shared?.revision : undefined,
         }),
       })

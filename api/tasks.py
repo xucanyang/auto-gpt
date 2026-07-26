@@ -2952,13 +2952,17 @@ def _custom_email_proxy_settings(req: CustomEmailRecheckTaskRequest | BatchCusto
     explicit_proxy = normalize_proxy_url(getattr(req, "proxy", None)) or ""
     mode = str(getattr(req, "proxy_mode", "") or "").strip().lower()
     if not mode:
-        mode = "specified" if explicit_proxy else ""
+        # Keep the direct-API contract when a legacy caller omits all proxy
+        # fields. New task forms may intentionally omit fields to inherit the
+        # global configuration, but this endpoint historically defaulted to a
+        # direct check when no explicit proxy was supplied.
+        mode = "specified" if explicit_proxy else "direct"
     if mode in {"none", "no_proxy", "direct", "直连"}:
         mode = "direct"
     elif mode in {"manual", "explicit"}:
         mode = "specified"
     elif mode not in {"specified", "pool", "dynamic"}:
-        mode = "specified" if explicit_proxy else ""
+        mode = "specified" if explicit_proxy else "direct"
 
     country_code = str(getattr(req, "proxy_country_code", "") or "").strip().upper()
     if mode == "dynamic" and not country_code:
@@ -15987,7 +15991,7 @@ def _is_fatal_registration_infrastructure_error(message: Any) -> bool:
             "动态代理没有可用候选",
             "dynamic proxy",
             "no available proxy",
-            "已选择动态代理模式，但代理模板为空",
+            "已选择动态代理模式，但动态节点地址为空",
             "动态代理模式必须填写出口国家",
         )
     )

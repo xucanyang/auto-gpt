@@ -253,7 +253,7 @@ def _dynamic_candidate_tuples(
     from .dynamic_proxy import resolve_dynamic_proxy_template
 
     if not template:
-        raise RuntimeError("已选择动态代理模式，但代理模板为空")
+        raise RuntimeError("已选择动态代理模式，但动态节点地址为空")
     if not country_code:
         raise RuntimeError("动态代理模式必须填写出口国家")
 
@@ -273,7 +273,7 @@ def _dynamic_candidate_tuples(
             )
             runtime_proxy = normalize_proxy_url(resolved.proxy_url) or ""
             if not runtime_proxy:
-                raise RuntimeError("动态代理模板解析后为空")
+                raise RuntimeError("动态节点地址解析后为空")
             if runtime_proxy in seen:
                 if not resolved.sid_refreshed:
                     break

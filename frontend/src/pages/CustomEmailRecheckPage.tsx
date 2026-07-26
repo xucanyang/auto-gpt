@@ -31,7 +31,7 @@ import {
 import { TaskLogPanel } from '@/components/TaskLogPanel'
 import { TaskVerificationPanel } from '@/components/TaskVerificationPanel'
 import { apiFetch } from '@/lib/utils'
-import { buildTaskProxyPayload, saveTaskProxySettingsToConfig, taskProxySettingsFromConfig, validateTaskProxySettings } from '@/lib/taskProxySettings'
+import { buildTaskProxyPayload, taskProxySettingsFromConfig, validateTaskProxySettings } from '@/lib/taskProxySettings'
 
 const { Paragraph, Text, Title } = Typography
 
@@ -433,8 +433,6 @@ export default function CustomEmailRecheckPage() {
 
     setSubmitting(true)
     try {
-      const savedProxySettings = await saveTaskProxySettingsToConfig(values)
-      setProxyDefaults(savedProxySettings)
       window.localStorage.setItem(CUSTOM_EMAIL_RECHECK_EMAIL_KEY, normalizedEmail)
       window.localStorage.setItem('auto-chatgpt.manual_email_otp.email', normalizedEmail)
       const response = await apiFetch('/tasks/chatgpt/custom-email-recheck', {
@@ -552,8 +550,6 @@ export default function CustomEmailRecheckPage() {
 
     setBulkSubmitting(true)
     try {
-      const savedProxySettings = await saveTaskProxySettingsToConfig(values)
-      setProxyDefaults(savedProxySettings)
       const response = await apiFetch('/tasks/chatgpt/custom-email-recheck/batch', {
         method: 'POST',
         body: JSON.stringify({
@@ -735,10 +731,10 @@ export default function CustomEmailRecheckPage() {
                     <Space style={{ width: '100%' }} align="start" wrap>
                       <Form.Item
                         name="proxy"
-                        label={proxyMode === 'dynamic' ? '动态代理模板（全局默认）' : '指定代理'}
+                        label={proxyMode === 'dynamic' ? '动态节点（本次任务可覆盖）' : '指定代理'}
                         style={{ flex: '1 1 320px' }}
                         rules={proxyMode === 'specified' ? [{ required: true, message: '请输入指定代理地址' }] : undefined}
-                        extra={proxyMode === 'dynamic' ? '留空使用全局动态代理模板；填写后会更新所有任务的全局动态代理模板。' : undefined}
+                        extra={proxyMode === 'dynamic' ? '留空沿用全局动态节点；填写后仅覆盖本次测活任务。全局配置请到代理管理页保存。' : undefined}
                       >
                         <Input size="large" placeholder={proxyMode === 'dynamic' ? '可留空；或填 socks5://user-region-JP-sid-xxxx-t-15:pass@host:port' : 'http://user:pass@host:port'} />
                       </Form.Item>
@@ -784,7 +780,7 @@ export default function CustomEmailRecheckPage() {
                     type="info"
                     style={{ marginBottom: 18 }}
                     message="这个入口只做登录测活"
-                    description="代理模式与注册一致：直连不碰代理；指定代理默认只用填写节点，勾选失败切换后才使用代理池筛选项；代理池按健康分、冷却和实测出口国家挑选；动态代理默认使用全局模板，填写模板会保存为全局默认，必须填写出口国家，失败后刷新 sid 重试。"
+                    description="代理模式与注册一致：直连不碰代理；指定代理默认只用填写节点，勾选失败切换后才使用代理池筛选项；代理池按健康分、冷却和实测出口国家挑选；动态代理默认使用全局动态节点，填写节点只覆盖本次测活，必须填写出口国家，失败后刷新 sid 重试。"
                   />
 
                   <Space wrap>

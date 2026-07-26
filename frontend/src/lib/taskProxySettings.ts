@@ -127,17 +127,38 @@ export function taskProxyNeedsProxyUrl(settings: Pick<TaskProxySettings, 'proxy_
 
 export function buildTaskProxyPayload(values: unknown): Record<string, unknown> {
   const settings = normalizeTaskProxySettings(values)
-  const payload: Record<string, unknown> = {
-    proxy: taskProxyNeedsProxyUrl(settings) ? (settings.proxy || null) : null,
-    proxy_mode: settings.proxy_mode,
-    proxy_country_code: settings.proxy_country_code,
-    proxy_failover: settings.proxy_failover,
+  const rawValues = values && typeof values === 'object' ? values as Record<string, unknown> : {}
+  const payload: Record<string, unknown> = {}
+  const modeField = firstOwn(rawValues, 'proxy_mode', 'register_proxy_mode', 'probe_proxy_mode')
+  const proxyField = firstOwn(rawValues, 'proxy', 'proxy_url', 'register_proxy', 'probe_proxy')
+  const countryField = firstOwn(rawValues, 'proxy_country_code', 'register_proxy_country_code', 'probe_proxy_country_code')
+  const failoverField = firstOwn(rawValues, 'proxy_failover', 'register_proxy_failover', 'probe_proxy_failover')
+  const maxCandidatesField = firstOwn(rawValues, 'proxy_max_candidates', 'register_proxy_max_candidates', 'probe_proxy_max_candidates')
+  const minScoreField = firstOwn(rawValues, 'proxy_min_score', 'register_proxy_min_score', 'probe_proxy_min_score')
+
+  if (modeField.present && isProvided(modeField.value)) payload.proxy_mode = settings.proxy_mode
+  if (
+    proxyField.present
+    && taskProxyNeedsProxyUrl(settings)
+    && (isProvided(proxyField.value) || settings.proxy_mode === 'specified')
+  ) {
+    payload.proxy = settings.proxy || null
   }
+  if (countryField.present) payload.proxy_country_code = settings.proxy_country_code
+  if (failoverField.present) payload.proxy_failover = settings.proxy_failover
   if (taskProxyUsesPoolSelector(settings)) {
-    payload.proxy_max_candidates = settings.proxy_max_candidates
-    payload.proxy_min_score = settings.proxy_min_score
+    if (maxCandidatesField.present && isProvided(maxCandidatesField.value)) {
+      payload.proxy_max_candidates = settings.proxy_max_candidates
+    }
+    if (minScoreField.present && isProvided(minScoreField.value)) {
+      payload.proxy_min_score = settings.proxy_min_score
+    }
   }
-  if (settings.proxy_mode === 'dynamic') {
+  if (
+    settings.proxy_mode === 'dynamic'
+    && hasOwn(rawValues, 'dynamic_proxy_ip_retention_minutes')
+    && isProvided(rawValues.dynamic_proxy_ip_retention_minutes)
+  ) {
     payload.dynamic_proxy_ip_retention_minutes = settings.dynamic_proxy_ip_retention_minutes
   }
   return payload
@@ -154,50 +175,164 @@ export function validateTaskProxySettings(values: unknown) {
   return settings
 }
 
-export async function saveTaskProxySettingsToConfig(values: unknown) {
-  const settings = normalizeTaskProxySettings(values)
-  const data: Record<string, string> = { task_proxy_mode: settings.proxy_mode }
+function hasOwn(record: Record<string, unknown>, key: string) {
+  return Object.prototype.hasOwnProperty.call(record, key)
+}
+
+function firstOwn(record: Record<string, unknown>, ...keys: string[]) {
+  for (const key of keys) {
+    if (hasOwn(record, key)) return { present: true, value: record[key] }
+  }
+  return { present: false, value: undefined }
+}
+
+function isProvided(value: unknown) {
+  return value !== undefined && value !== null && value !== ''
+}
+
+function putBoolean(data: Record<string, string>, key: string, value: unknown, fallback: boolean) {
+  data[key] = booleanWithDefault(value, fallback) ? 'true' : 'false'
+}
+
+function putNumber(
+  data: Record<string, string>,
+  key: string,
+  value: unknown,
+  fallback: number,
+  minimum: number,
+  maximum: number,
+) {
+  data[key] = String(numberWithDefault(value, fallback, minimum, maximum))
+}
+
+/**
+ * Build a field-level global-config patch from an explicitly supplied task
+ * form. Missing fields are intentionally omitted: task forms are often
+ * rendered without the global retention/node controls and must not reset the
+ * shared dynamic-node configuration to frontend defaults.
+ */
+export function buildTaskProxyConfigPatch(values: unknown): Record<string, string> {
   const rawValues = values && typeof values === 'object' ? values as Record<string, unknown> : {}
+  const data: Record<string, string> = {}
+  const modeField = firstOwn(rawValues, 'proxy_mode', 'register_proxy_mode', 'probe_proxy_mode')
+  const modeProvided = modeField.present && isProvided(modeField.value)
+  const mode = modeProvided
+    ? normalizeTaskProxyMode(modeField.value)
+    : undefined
+  if (modeProvided) data.task_proxy_mode = mode || 'dynamic'
 
-  if (settings.proxy_mode === 'dynamic') {
-    // 任务弹窗动态模式的空 proxy 表示“沿用全局模板”，绝不能反向清空它。
-    // 同时主动清掉旧字段，防止历史 URL/国家重新覆盖 canonical dynamic 配置。
-    data.task_proxy_url = ''
-    data.task_proxy_country_code = ''
-    data.task_proxy_failover = settings.proxy_failover ? 'true' : 'false'
-    data.dynamic_proxy_default_country = settings.proxy_country_code
-    data.dynamic_proxy_ip_retention_minutes = String(settings.dynamic_proxy_ip_retention_minutes)
-    if (settings.proxy) {
-      data.dynamic_proxy_template = settings.proxy
+  const proxyField = firstOwn(rawValues, 'proxy', 'proxy_url', 'register_proxy', 'probe_proxy')
+  const countryField = firstOwn(rawValues, 'proxy_country_code', 'register_proxy_country_code', 'probe_proxy_country_code')
+  const failoverField = firstOwn(rawValues, 'proxy_failover', 'register_proxy_failover', 'probe_proxy_failover')
+  const maxCandidatesField = firstOwn(rawValues, 'proxy_max_candidates', 'register_proxy_max_candidates', 'probe_proxy_max_candidates')
+  const minScoreField = firstOwn(rawValues, 'proxy_min_score', 'register_proxy_min_score', 'probe_proxy_min_score')
+  const canonicalTemplateField = firstOwn(rawValues, 'dynamic_proxy_template')
+  const canonicalCountryField = firstOwn(rawValues, 'dynamic_proxy_default_country')
+
+  // A canonical field is also a valid direct input for the Settings page;
+  // task forms normally use the shorter proxy/country aliases above.
+  const dynamicIntent = mode === 'dynamic'
+    || canonicalTemplateField.present
+    || canonicalCountryField.present
+    || (hasOwn(rawValues, 'dynamic_proxy_ip_retention_minutes') && isProvided(rawValues.dynamic_proxy_ip_retention_minutes))
+    || (hasOwn(rawValues, 'dynamic_proxy_probe_enabled') && isProvided(rawValues.dynamic_proxy_probe_enabled))
+  const effectiveMode = mode || (dynamicIntent ? 'dynamic' : undefined)
+
+  if (effectiveMode === 'dynamic') {
+    const templateValue = canonicalTemplateField.present
+      ? stringWithDefault(canonicalTemplateField.value, '')
+      : proxyField.present
+        ? stringWithDefault(proxyField.value, '')
+        : ''
+    // Empty task-level proxy means “use the existing global dynamic node”; it
+    // is not a request to erase the shared node.
+    if (templateValue) data.dynamic_proxy_template = templateValue
+
+    const countryValue = canonicalCountryField.present
+      ? countryCode(canonicalCountryField.value)
+      : countryField.present
+        ? countryCode(countryField.value)
+        : ''
+    // An empty dynamic country is invalid for execution, so preserve the
+    // existing default instead of silently replacing it with a fallback.
+    if (countryValue) data.dynamic_proxy_default_country = countryValue
+
+    if (failoverField.present && isProvided(failoverField.value)) putBoolean(data, 'task_proxy_failover', failoverField.value, false)
+    if (
+      hasOwn(rawValues, 'dynamic_proxy_ip_retention_minutes')
+      && isProvided(rawValues.dynamic_proxy_ip_retention_minutes)
+    ) {
+      putNumber(data, 'dynamic_proxy_ip_retention_minutes', rawValues.dynamic_proxy_ip_retention_minutes, 5, 1, 1440)
     }
-  } else if (settings.proxy_mode === 'specified') {
-    data.task_proxy_url = settings.proxy
-    data.task_proxy_failover = settings.proxy_failover ? 'true' : 'false'
-    if (taskProxyUsesPoolSelector(settings)) {
-      data.task_proxy_country_code = settings.proxy_country_code
-      data.task_proxy_max_candidates = String(settings.proxy_max_candidates)
-      data.task_proxy_min_score = String(settings.proxy_min_score)
-      data.proxy_pool_max_candidates = String(settings.proxy_max_candidates)
-      data.proxy_scan_min_score = String(settings.proxy_min_score)
+    if (hasOwn(rawValues, 'dynamic_proxy_probe_enabled') && isProvided(rawValues.dynamic_proxy_probe_enabled)) {
+      putBoolean(data, 'dynamic_proxy_probe_enabled', rawValues.dynamic_proxy_probe_enabled, true)
     }
-  } else if (settings.proxy_mode === 'pool') {
-    data.task_proxy_country_code = settings.proxy_country_code
-    data.task_proxy_max_candidates = String(settings.proxy_max_candidates)
-    data.task_proxy_min_score = String(settings.proxy_min_score)
-    data.proxy_pool_max_candidates = String(settings.proxy_max_candidates)
-    data.proxy_scan_min_score = String(settings.proxy_min_score)
+    if (hasOwn(rawValues, 'dynamic_proxy_require_country_match') && isProvided(rawValues.dynamic_proxy_require_country_match)) {
+      putBoolean(data, 'dynamic_proxy_require_country_match', rawValues.dynamic_proxy_require_country_match, true)
+    }
+    if (hasOwn(rawValues, 'dynamic_proxy_probe_timeout_seconds') && isProvided(rawValues.dynamic_proxy_probe_timeout_seconds)) {
+      putNumber(data, 'dynamic_proxy_probe_timeout_seconds', rawValues.dynamic_proxy_probe_timeout_seconds, 8, 2, 60)
+    }
+
+    // Keep the legacy runtime fields empty whenever dynamic mode is explicitly
+    // selected. This is a compatibility cleanup, not a source of defaults.
+    if (modeProvided) {
+      data.task_proxy_url = ''
+      data.task_proxy_country_code = ''
+    }
+  } else if (effectiveMode === 'specified') {
+    if (proxyField.present) data.task_proxy_url = stringWithDefault(proxyField.value, '')
+    if (countryField.present) data.task_proxy_country_code = countryCode(countryField.value)
+    if (failoverField.present && isProvided(failoverField.value)) putBoolean(data, 'task_proxy_failover', failoverField.value, false)
+    if (maxCandidatesField.present && isProvided(maxCandidatesField.value)) {
+      putNumber(data, 'task_proxy_max_candidates', maxCandidatesField.value, 5, 1, 100)
+      data.proxy_pool_max_candidates = data.task_proxy_max_candidates
+    }
+    if (minScoreField.present && isProvided(minScoreField.value)) {
+      putNumber(data, 'task_proxy_min_score', minScoreField.value, 50, 0, 100)
+      data.proxy_scan_min_score = data.task_proxy_min_score
+    }
+  } else if (effectiveMode === 'pool') {
+    if (countryField.present) data.task_proxy_country_code = countryCode(countryField.value)
+    if (failoverField.present && isProvided(failoverField.value)) putBoolean(data, 'task_proxy_failover', failoverField.value, false)
+    if (maxCandidatesField.present && isProvided(maxCandidatesField.value)) {
+      putNumber(data, 'task_proxy_max_candidates', maxCandidatesField.value, 5, 1, 100)
+      data.proxy_pool_max_candidates = data.task_proxy_max_candidates
+    }
+    if (minScoreField.present && isProvided(minScoreField.value)) {
+      putNumber(data, 'task_proxy_min_score', minScoreField.value, 50, 0, 100)
+      data.proxy_scan_min_score = data.task_proxy_min_score
+    }
+  } else if (failoverField.present && isProvided(failoverField.value)) {
+    putBoolean(data, 'task_proxy_failover', failoverField.value, false)
   }
 
-  // The proxy page exposes this global runtime switch alongside the template.
-  // Only write it when the caller supplied the field, so task forms that do
-  // not render the switch cannot reset the existing global value.
-  if (Object.prototype.hasOwnProperty.call(rawValues, 'dynamic_proxy_probe_enabled')) {
-    data.dynamic_proxy_probe_enabled = booleanWithDefault(rawValues.dynamic_proxy_probe_enabled, true) ? 'true' : 'false'
+  // The proxy page exposes this global runtime switch alongside the node. It
+  // is intentionally guarded by field presence so unrelated forms cannot
+  // reset it.
+  if (
+    hasOwn(rawValues, 'dynamic_proxy_probe_enabled')
+    && isProvided(rawValues.dynamic_proxy_probe_enabled)
+    && !hasOwn(data, 'dynamic_proxy_probe_enabled')
+  ) {
+    putBoolean(data, 'dynamic_proxy_probe_enabled', rawValues.dynamic_proxy_probe_enabled, true)
   }
+  return data
+}
 
+export async function saveTaskProxySettingsToConfig(
+  values: unknown,
+  options: { baseRevision?: number } = {},
+) {
+  const settings = normalizeTaskProxySettings(values)
+  const data = buildTaskProxyConfigPatch(values)
+  if (Object.keys(data).length === 0) return settings
+
+  const body: Record<string, unknown> = { data }
+  if (options.baseRevision !== undefined) body.base_revision = options.baseRevision
   await apiFetch('/config', {
     method: 'PUT',
-    body: JSON.stringify({ data }),
+    body: JSON.stringify(body),
   })
   return settings
 }

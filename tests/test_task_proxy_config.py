@@ -138,6 +138,41 @@ def test_dynamic_update_prefers_explicit_canonical_values_from_new_ui():
     assert result["task_proxy_country_code"] == ""
 
 
+def test_dynamic_partial_update_keeps_canonical_values_when_legacy_fields_conflict():
+    result = normalize_dynamic_proxy_update(
+        {
+            "dynamic_proxy_default_country": "us",
+            "dynamic_proxy_ip_retention_minutes": "120",
+        },
+        {
+            "task_proxy_mode": "dynamic",
+            "dynamic_proxy_template": "canonical-template",
+            "task_proxy_url": "stale-legacy-template",
+            "dynamic_proxy_default_country": "JP",
+            "task_proxy_country_code": "DE",
+        },
+    )
+
+    assert result["dynamic_proxy_template"] == "canonical-template"
+    assert result["dynamic_proxy_default_country"] == "US"
+    assert result["dynamic_proxy_ip_retention_minutes"] == "120"
+    assert result["task_proxy_url"] == ""
+    assert result["task_proxy_country_code"] == ""
+
+
+def test_retention_only_update_is_a_true_field_patch():
+    update = {"dynamic_proxy_ip_retention_minutes": "120"}
+    current = {
+        "task_proxy_mode": "dynamic",
+        "dynamic_proxy_template": "canonical-template",
+        "task_proxy_url": "stale-legacy-template",
+        "dynamic_proxy_default_country": "JP",
+        "task_proxy_country_code": "DE",
+    }
+
+    assert normalize_dynamic_proxy_update(update, current) == update
+
+
 def test_specified_update_does_not_mutate_dynamic_canonical_values():
     update = {
         "task_proxy_mode": "specified",

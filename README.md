@@ -68,7 +68,7 @@ ChatGPT 账号自动注册与管理系统，支持 Web UI 管理、批量注册�
 
 除 `direct` / `specified` / `pool` 外，任务代理模式新增 `dynamic`。该模式不把动态模板混入本地代理池表，而是按任务参数实时生成运行代理：
 
-- `proxy`：动态代理模板，需包含 `region-XX`；支持类似 `socks5://user-region-JP-sid-xxxx-t-1:pass@host:port` 的用户名内嵌国家格式。
+- `proxy`：动态节点地址，需包含 `region-XX`；支持类似 `socks5://user-region-JP-sid-xxxx-t-1:pass@host:port` 的用户名内嵌国家格式。
 - `proxy_country_code`：目标出口国家，两位 ISO 代码，例如 `US`、`JP`、`SG`。
 - `proxy_failover`：开启后按动态代理内部重试次数刷新 `sid` 重试；动态模式不使用代理池的 `proxy_min_score` / `proxy_max_candidates`。
 - `dynamic_proxy_probe_enabled` / `dynamic_proxy_require_country_match`：全局配置中可控制是否运行前探测出口，以及实测国家不匹配时是否严格失败。

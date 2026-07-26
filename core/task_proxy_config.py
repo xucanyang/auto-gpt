@@ -207,14 +207,15 @@ def normalize_dynamic_proxy_update(
 
     # 明确 canonical 值代表新 UI 的用户意图；legacy 非空代表旧客户端
     # 的用户意图。legacy 空值通常是新 UI 的清理动作，不能吞掉旧模板。
+    #
+    # 关键边界：当本次请求没有提交某个 canonical 字段时，绝不能因为
+    # 旧字段仍残留且与 canonical 冲突，就把旧值重新提升覆盖当前值。
+    # 例如只改 IP 保留分钟或默认国家时，动态节点必须保持不变。旧字段
+    # 只有在 canonical 为空时才作为兼容回退。
     if has_canonical_template:
         template = _text(incoming.get("dynamic_proxy_template"))
     elif has_legacy_template and incoming_legacy_template:
         template = incoming_legacy_template
-    elif current_canonical_template and current_legacy_template and current_canonical_template != current_legacy_template:
-        # 没有明确新值时遵从升级前的实际 runtime 优先级，避免保存无关
-        # 配置时悄悄换出口；受控迁移和这里保持同一规则。
-        template = current_legacy_template
     elif current_canonical_template:
         template = current_canonical_template
     else:
@@ -224,8 +225,6 @@ def normalize_dynamic_proxy_update(
         country = _country(incoming.get("dynamic_proxy_default_country"))
     elif has_legacy_country and incoming_legacy_country:
         country = incoming_legacy_country
-    elif current_canonical_country and current_legacy_country and current_canonical_country != current_legacy_country:
-        country = current_legacy_country
     elif current_canonical_country:
         country = current_canonical_country
     else:

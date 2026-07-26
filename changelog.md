@@ -6,6 +6,21 @@
 
 ## [Unreleased] (未发布)
 
+## [2.8.51] - 2026-07-26
+
+### 优化 (Changed)
+- **共享动态节点改为字段级保存**：`frontend/src/lib/taskProxySettings.ts` 新增显式字段补丁构建，调用方未提供的动态节点地址、出口国家、IP 保留分钟、探测开关和候选参数不再用前端默认值写回 `/api/config`；动态任务请求也不再隐式携带 `dynamic_proxy_ip_retention_minutes=5` 覆盖共享配置。
+- **任务提交与全局动态节点保存解耦**：手机号绑定、单个邮箱测活和批量邮箱测活只提交本次任务的代理参数，不再在任务启动时修改共享配置；全局动态节点继续由代理管理页和明确的注册设置保存动作维护。
+- **界面术语统一为“动态节点”**：代理预览、注册、手机号绑定、邮箱测活和 Settings 页面将用户可编辑的动态地址称为动态节点，保留 `dynamic_proxy_template` 后端 key 作为兼容别名。
+
+### 修复 (Fixed)
+- **修复 Settings 旧快照覆盖共享动态配置**：`frontend/src/pages/Settings.tsx` 记录加载时的代理字段快照，只提交本次真正发生变化的代理字段；打开旧 Settings 页保存邮箱或其他设置时，不会把动态节点的保留时间回退到 `5`。
+- **修复 legacy 代理字段复活 canonical 节点**：`core/task_proxy_config.py` 在部分更新只涉及国家或保留时间时优先保留已有 canonical 动态节点，旧 `task_proxy_url/task_proxy_country_code` 仅在 canonical 为空时兼容回退。
+
+### 测试 (Tests)
+- 扩展 `tests/test_task_proxy_config.py` 覆盖 canonical/legacy 冲突下的国家与 retention 部分更新；扩展 `tests/test_settings_persistence_ui.py` 覆盖任务提交不写共享配置、缺省字段不产生默认补丁和 Settings 快照字段过滤。
+- 前端生产构建（`cd frontend && npm run build`）通过；专项 Python 回归 `20 passed`。
+
 ## [2.8.50] - 2026-07-26
 
 ### 优化 (Changed)
@@ -2968,4 +2983,8 @@
 
 ## 2026-07-26 07:24:44 +0800
 - v2.8.50: 统一注册 Info 九阶段详细时间线
+- 发布模式: multi
+
+## 2026-07-26 09:31:45 +0800
+- 修复共享动态节点配置字段覆盖与任务代理默认回写
 - 发布模式: multi
