@@ -1,7 +1,7 @@
 # Docker 镜像发布与回滚
 
 本项目的生产运行方式以 Docker 镜像为准：代码和依赖进入镜像，数据库、日志、外部目标等运行态数据继续走挂载目录。
-目前系统采用**“单代码库、统一镜像 (`auto-gpt:latest`)、两个常驻实例 (`auto-gpt-plus` 和 `auto-plus2`) + 主服务 standby (`auto-gpt`)”**架构。
+目前系统采用**“单代码库、统一镜像 (`auto-gpt:latest`)、三个常驻业务实例 (`auto-gpt`、`auto-gpt-plus`、`auto-plus2`) + `phone-api-relay`”**架构。
 
 ## 发布边界
 
@@ -10,15 +10,21 @@
 - 发布流程不会把运行数据打进镜像。
 - 回滚默认只回滚镜像，不自动覆盖数据库，避免丢掉发布后的新增数据。
 
+## 测试与生产隔离
+
+发布前的 Python、浏览器和注册链路测试必须遵循 [Docker 测试规范](testing-in-docker.md)。测试镜像应与生产镜像共用同一提交和运行依赖层，但使用独立的测试依赖、一次性容器和临时数据目录。
+
+`docker-compose.multi.yml` 是生产编排文件，包含真实运行数据挂载、共享配置和常驻重启策略，禁止用于完整 pytest。测试服务不得读取生产 `.env`，不得挂载 `/opt/auto-gpt/data` 或 `/opt/auto-gpt/shared_config`，也不得占用生产端口和浏览器资源。
+
 ## 标准生产发版
 
-生产发布统一走根目录门禁，同时升级两个常驻实例并保持主服务停止：
+生产发布统一走根目录门禁，同时升级三个常驻业务实例和 `phone-api-relay`，发布结束后四个活动服务都必须保持运行：
 
 ```bash
 /opt/auto-gpt/deploy.sh "清晰的发布说明" --mode=multi --backup
 ```
 
-发布脚本会完成 Git 归档、统一镜像构建、Plus/Plus2 重建、standby 停止检查和 HTTP smoke。显式 `--backup` 会保存三个常规数据目录中的 `account_manager.db` 及历史 `team_manage.db`，但不会重新挂载或运行 Team Manager。
+发布脚本会完成 Git 归档、统一镜像构建、三个业务实例与 Relay 重建、健康检查和 HTTP smoke。显式 `--backup` 会保存三个常规数据目录中的 `account_manager.db` 及历史 `team_manage.db`，但不会重新挂载或运行 Team Manager。
 
 ## 单实例镜像工具
 
@@ -41,17 +47,18 @@ scripts/deploy-image-release.sh --apply
 
 ## 手动检查多实例编排
 
-只做人工 Compose 检查时，必须显式指定两个常驻服务：
+只做人工 Compose 检查时，必须显式确认三个常驻业务实例和 Relay：
 
 ```bash
 # 1. 编译构建唯一的最新镜像 (auto-gpt:latest)
 docker compose -f docker-compose.multi.yml build
 
-# 2. 同时重启升级 Plus / Plus2（保持各自数据卷不变）
-docker compose -f docker-compose.multi.yml up -d --remove-orphans auto-gpt-plus auto-plus2
+# 2. 同时重启升级三个业务实例与 Relay（保持各自数据卷不变）
+docker compose -f docker-compose.multi.yml up -d --remove-orphans \
+  phone-api-relay auto-gpt auto-gpt-plus auto-plus2
 ```
 
-`auto-gpt` 仅在显式启用 `standby` profile 时出现；日常发布禁止启用该 profile。`auto-k12` 已从 Compose 移除。
+发布后必须确认 `auto-gpt`、`auto-gpt-plus`、`auto-plus2` 和 `phone-api-relay` 均处于运行/健康状态；`auto-k12` 已从 Compose 移除且不得重新接入。
 
 ## 手动回滚
 

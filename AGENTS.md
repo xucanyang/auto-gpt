@@ -94,7 +94,9 @@
 
 ```bash
 cd /opt/auto-gpt
-pytest tests -q || true
+
+# 正式测试必须遵循 docs/testing-in-docker.md 的隔离测试容器规范。
+# 不要在宿主机直接运行 pytest，也不要在常驻业务容器内 docker exec pytest。
 cd frontend && npm run build
 
 # 使用多实例编排构建并查看三个常驻业务实例状态

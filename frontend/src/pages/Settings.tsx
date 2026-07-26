@@ -3742,6 +3742,7 @@ function SecurityPanel() {
 }
 
 export default function Settings() {
+  const { message: appMessage, modal: appModal } = App.useApp()
   const [form] = Form.useForm()
   const screens = Grid.useBreakpoint()
   const [saving, setSaving] = useState(false)
@@ -3774,7 +3775,7 @@ export default function Settings() {
 
   const toggleShareMode = (enabled: boolean) => {
     const actionText = enabled ? '开启共享配置并拉取共享模板' : '关闭共享并转为本地配置'
-    Modal.confirm({
+    appModal.confirm({
       title: actionText,
       content: enabled
         ? '开启后，本页保存会更新共享配置，并影响所有开启共享的实例。当前实例本地配置会先被共享模板覆盖。'
@@ -3789,8 +3790,10 @@ export default function Settings() {
             body: JSON.stringify({ enabled, pull: true }),
           }) as ConfigShareState
           setShareState(result)
-          message.success(enabled ? '已开启共享配置' : '已关闭共享配置')
+          appMessage.success(enabled ? '已开启共享配置' : '已关闭共享配置')
           reloadAfterShareChange()
+        } catch (error: any) {
+          appMessage.error(error?.message || (enabled ? '开启共享配置失败' : '关闭共享配置失败'))
         } finally {
           setShareBusy(false)
         }
@@ -3803,15 +3806,17 @@ export default function Settings() {
     try {
       await apiFetch('/config/share/pull', { method: 'POST' })
       await loadShareState()
-      message.success('已从共享模板拉取到当前实例')
+      appMessage.success('已从共享模板拉取到当前实例')
       reloadAfterShareChange()
+    } catch (error: any) {
+      appMessage.error(error?.message || '从共享模板拉取失败')
     } finally {
       setShareBusy(false)
     }
   }
 
   const pushLocalConfigToShared = () => {
-    Modal.confirm({
+    appModal.confirm({
       title: '将本实例配置推送为共享模板',
       content: '这是覆盖共享模板的危险操作，会影响所有开启共享配置的实例。建议仅在确认当前实例配置是最新母版时执行。',
       okText: '确认覆盖共享模板',
@@ -3829,8 +3834,10 @@ export default function Settings() {
             }),
           }) as { state?: ConfigShareState }
           if (result?.state) setShareState(result.state)
-          message.success('已用本实例配置更新共享模板')
+          appMessage.success('已用本实例配置更新共享模板')
           reloadAfterShareChange()
+        } catch (error: any) {
+          appMessage.error(error?.message || '推送共享模板失败')
         } finally {
           setShareBusy(false)
         }
@@ -3843,7 +3850,7 @@ export default function Settings() {
     try {
       const result = await apiFetch('/config/share/diff') as { diff_count?: number; diffs?: { key: string }[] }
       const keys = (result.diffs || []).slice(0, 40).map((item) => item.key)
-      Modal.info({
+      appModal.info({
         title: `本地与共享差异：${result.diff_count || 0} 个 key`,
         content: keys.length > 0
           ? (
@@ -3854,6 +3861,8 @@ export default function Settings() {
             )
           : '当前本地配置与共享模板一致。',
       })
+    } catch (error: any) {
+      appMessage.error(error?.message || '读取共享差异失败')
     } finally {
       setShareBusy(false)
     }
