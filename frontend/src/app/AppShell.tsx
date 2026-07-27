@@ -245,7 +245,7 @@ function AppContent({ hasPassword }: { hasPassword: boolean }) {
                     marginTop: 4,
                   }}
                 >
-                  v2.8.59
+                  v2.8.60
                 </div>
               )}
             </div>

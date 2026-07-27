@@ -263,6 +263,7 @@ class BaseChatGPTRegistrationModeAdapter(ABC):
                 "registration_stage",
                 "registration_stage_complete",
                 "registration_access_token_saved",
+                "registration_auth_capture",
                 "registration_access_token_checkpoint_created",
                 "registration_access_token_checkpoint_policy",
                 "registration_access_token_partial_reason",

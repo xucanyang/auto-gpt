@@ -13,6 +13,7 @@
 - **统一测试文档入口**：`README.md`、`AGENTS.md` 与 `docs/docker-image-release.md` 现在统一指向 Docker 测试规范，移除会吞掉收集失败的 `pytest tests -q || true` 作为推荐门禁，明确当前 `requirements-test.txt`、`docker-compose.test.yml` 和测试脚本仍待落地。
 
 ### 修复 (Fixed)
+- **持久化注册 Auth 边界审计字段**：`chatgpt_registration_mode_adapter.py` 将 `registration_auth_capture=not_requested` 加入账号 metadata 白名单，确保注册完成后数据库明确记录“未请求独立 Auth/RT”，与 AT/Session/Cookie 和 `auth_level=access_token_only` 一起可审计。
 - **将 ChatGPT 注册与 Auth/refresh_token 获取彻底分离**：`services/chatgpt_core/chatgpt_registration_mode_adapter.py`、`services/chatgpt_core/plugin.py` 和 `api/tasks.py` 现在把所有注册请求（包括旧的 `refresh_token` 配置）规范化为单次 AccessToken-only signup。注册成功后只保存 signup 同一会话产生的 AccessToken、Web Session、Cookie、账号/Workspace 标识并结束当前尝试，不再启动独立 Codex OAuth、OAuth 邮箱验证码、密码页、`add-phone` 或第二次落库；完整 Auth/RT 继续由 `subscription_auth_capture` 的单个/批量补抓任务负责。
 - **关闭注册阶段的隐式结算探测**：注册任务不再在账号落库前调用 checkout amount 或 GoPay 平台链接流程，避免支付/手机号链路拖长注册并混淆失败原因；支付链接与补抓 Auth 保持在后续流水线中执行。
 - **清理前端注册模式误导**：`RegisterTaskPage`、`RegisterTaskModal` 和 ChatGPT 注册模式组件不再提供“有 RT 注册”开关或“注册后抓 RT”选项，明确展示注册仅保存 signup 凭据；旧 localStorage/请求字段仍兼容但会被服务端强制改为 AccessToken-only。
@@ -24,7 +25,7 @@
 
 ### 测试 (Tests)
 - 扩展 `tests/test_chatgpt_registration_mode_adapter.py`、`tests/test_chatgpt_plugin.py` 和 `tests/test_register_task_controls.py`，锁定默认/legacy refresh-token 注册均只执行一次 signup、不调用第二阶段 Auth、不会写入 Auth 失败标记，并确认独立补抓 Auth 入口仍使用原适配器。
-- 后端注册专项回归 `96 passed, 1 skipped`，前端 `npm run build` 通过；侧栏版本同步为 `v2.8.59`。
+- 后端注册专项回归 `96 passed, 1 skipped`，前端 `npm run build` 通过；侧栏版本同步为 `v2.8.60`。
 - 新增 `tests/test_restored_email_service.py` 适配器合同测试，覆盖跨注册阶段排除已消费验证码，以及独立 OAuth 等待不受注册 OTP 预算截断；专项测试 `9 passed`。
 - **完成文档一致性校验**：通过 `git diff --check`、Markdown 代码围栏配对和文档目标链接存在性检查；本次仅修改项目文档，未执行 Python、前端或容器测试，也未触碰生产运行态。
 
@@ -3083,4 +3084,8 @@
 
 ## 2026-07-28 05:37:02 +0800
 - 注册与 Auth 解耦，注册仅保存 signup AccessToken/Web Session/Cookie
+- 发布模式: multi
+
+## 2026-07-28 06:14:04 +0800
+- 补齐注册未请求 Auth 的审计字段持久化
 - 发布模式: multi

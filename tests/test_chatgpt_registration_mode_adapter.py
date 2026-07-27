@@ -623,6 +623,8 @@ class ChatGPTRegistrationModeAdapterTests(unittest.TestCase):
         self.assertEqual(result.source, "registration_session")
         self.assertEqual(result.metadata["registration_stage"], "access_token_saved")
         self.assertEqual(result.metadata["registration_auth_capture"], "not_requested")
+        account = adapter.build_account(result, "pw")
+        self.assertEqual(account.extra["registration_auth_capture"], "not_requested")
 
     def test_browser_pending_finalizes_original_mailbox_without_replaying_signup(self):
         stage1_result = _result(
