@@ -32,10 +32,10 @@ def _result(**overrides):
 
 
 class ChatGPTRegistrationModeAdapterTests(unittest.TestCase):
-    def test_resolve_defaults_to_refresh_token_mode(self):
+    def test_resolve_defaults_to_access_token_only_mode(self):
         self.assertEqual(
             resolve_chatgpt_registration_mode({}),
-            CHATGPT_REGISTRATION_MODE_REFRESH_TOKEN,
+            CHATGPT_REGISTRATION_MODE_ACCESS_TOKEN_ONLY,
         )
 
     def test_resolve_supports_boolean_no_rt_flag(self):
@@ -572,92 +572,57 @@ class ChatGPTRegistrationModeAdapterTests(unittest.TestCase):
         protocol_oauth.assert_not_called()
         stage1_engine._capture_browser_oauth_tokens.assert_called_once()
 
-    def test_refresh_token_two_stage_keeps_saved_access_token_when_upgrade_fails(self):
+    def test_legacy_refresh_token_mode_runs_signup_once_without_auth_capture(self):
         stage1_result = _result(
             email="stage1@example.com",
             password="pw-stage1",
-            account_id="acct-stage1",
-            workspace_id="ws-personal",
             access_token="at-stage1",
+            refresh_token="",
             session_token="session-stage1",
-            metadata={"mailbox_state": {"provider": "icloud_hme"}},
-            logs=["stage1-ok"],
         )
 
         class FakeStage1Engine:
-            def __init__(self, **_kwargs):
+            run_calls = 0
+
+            def __init__(self, **kwargs):
                 self.email = None
                 self.password = None
-                self._last_chatgpt_client = types.SimpleNamespace(
-                    device_id="device-stage1",
-                    ua="UA-stage1",
-                    sec_ch_ua='"Chromium";v="136"',
-                    impersonate="chrome136",
-                    fingerprint={"device_id": "device-stage1"},
-                )
+                self.extra_config = kwargs["extra_config"]
 
             def run(self):
+                self.run_calls += 1
                 return stage1_result
 
+        fake_module = types.ModuleType(
+            "services.chatgpt_core.access_token_only_registration_engine"
+        )
+        fake_module.AccessTokenOnlyRegistrationEngine = FakeStage1Engine
         adapter = build_chatgpt_registration_mode_adapter(
             {"chatgpt_registration_mode": "refresh_token"}
         )
         context = ChatGPTRegistrationContext(
             email_service=mock.Mock(),
-            proxy_url="http://127.0.0.1:7890",
+            proxy_url="",
             callback_logger=lambda _msg, *_: None,
             email=None,
             password="pw",
             browser_mode="protocol",
             max_retries=1,
-            extra_config={
-                "chatgpt_registration_mode": "refresh_token",
-                "_current_task_id": "task-1",
-            },
-        )
-        fake_module = types.ModuleType(
-            "services.chatgpt_core.access_token_only_registration_engine"
-        )
-        fake_module.AccessTokenOnlyRegistrationEngine = FakeStage1Engine
-        failed_upgrade = _result(
-            success=False,
-            email="stage1@example.com",
-            access_token="",
-            error_message="full auth failed",
-            logs=["stage2-failed"],
+            extra_config={"chatgpt_registration_mode": "refresh_token"},
         )
 
         with mock.patch.dict(
             "sys.modules",
             {"services.chatgpt_core.access_token_only_registration_engine": fake_module},
-        ), mock.patch("core.db.save_account", return_value=types.SimpleNamespace(id=42)) as save_account, mock.patch.object(
-            adapter,
-            "_capture_stage2_from_stage1_session",
-            return_value=failed_upgrade,
         ):
             result = adapter.run(context)
 
         self.assertTrue(result.success)
         self.assertEqual(result.access_token, "at-stage1")
         self.assertEqual(result.refresh_token, "")
-        save_account.assert_called_once()
-        saved_account = save_account.call_args.args[0]
-        self.assertEqual(saved_account.email, "stage1@example.com")
-        self.assertEqual(saved_account.user_id, "acct-stage1")
-        self.assertEqual(saved_account.extra["workspace_id"], "ws-personal")
-        self.assertEqual(saved_account.extra["auth_level"], "access_token_only")
-        context.email_service.finalize_success.assert_called_once()
-        self.assertTrue(result.metadata["needs_auth_capture"])
-        self.assertTrue(result.metadata["auth_capture_required"])
-        self.assertTrue(result.metadata["registration_full_auth_failed"])
-        self.assertEqual(
-            result.metadata["registration_full_auth_error"],
-            "full auth failed",
-        )
-        self.assertEqual(
-            result.metadata["registration_full_auth_failed_policy"],
-            "keep_access_token_checkpoint",
-        )
+        self.assertEqual(result.source, "registration_session")
+        self.assertEqual(result.metadata["registration_stage"], "access_token_saved")
+        self.assertEqual(result.metadata["registration_auth_capture"], "not_requested")
 
     def test_browser_pending_finalizes_original_mailbox_without_replaying_signup(self):
         stage1_result = _result(
@@ -725,18 +690,12 @@ class ChatGPTRegistrationModeAdapterTests(unittest.TestCase):
         self.assertIs(result, stage1_result)
         self.assertTrue(result.success)
         self.assertEqual(result.metadata["registration_stage"], "registered_auth_pending")
-        self.assertEqual(result.metadata["auth_capture_stage"], "pending")
-        self.assertEqual(result.metadata["mailbox_state"]["status"], "ready")
-        self.assertEqual(
-            email_service._registration_result_code,
-            "registered_auth_pending",
-        )
-        self.assertFalse(email_service._registration_access_token_saved)
-        email_service.finalize_success.assert_called_once_with(
-            account_email="pending@example.com",
-            task_id="task-pending",
-        )
+        self.assertEqual(result.metadata["registration_auth_capture"], "not_requested")
+        self.assertNotIn("auth_capture_stage", result.metadata)
+        self.assertNotIn("registration_full_auth_failed", result.metadata)
+        email_service.finalize_success.assert_not_called()
 
+    @unittest.skip("legacy two-stage registration is intentionally removed")
     def test_refresh_token_two_stage_upgrades_the_same_email(self):
         stage1_result = _result(
             email="stage1@example.com",

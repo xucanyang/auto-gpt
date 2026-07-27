@@ -12,7 +12,9 @@ from services.chatgpt_core.mailbox_state import sanitize_mailbox_state
 
 CHATGPT_REGISTRATION_MODE_REFRESH_TOKEN = "refresh_token"
 CHATGPT_REGISTRATION_MODE_ACCESS_TOKEN_ONLY = "access_token_only"
-DEFAULT_CHATGPT_REGISTRATION_MODE = CHATGPT_REGISTRATION_MODE_REFRESH_TOKEN
+# Registration owns signup and the credentials produced by that browser
+# session.  Full Auth/refresh-token capture is a separate task.
+DEFAULT_CHATGPT_REGISTRATION_MODE = CHATGPT_REGISTRATION_MODE_ACCESS_TOKEN_ONLY
 
 
 def normalize_chatgpt_registration_mode(value) -> str:
@@ -72,13 +74,92 @@ class BaseChatGPTRegistrationModeAdapter(ABC):
     def _create_engine(self, context: ChatGPTRegistrationContext):
         """按模式构造底层注册引擎。"""
 
-    def run(self, context: ChatGPTRegistrationContext):
-        engine = self._create_engine(context)
+    def _run_registration_only(self, context: ChatGPTRegistrationContext):
+        """Run signup once and stop after the signup Web session is saved.
+
+        Legacy callers may still send ``refresh_token`` mode.  That value is
+        accepted for request compatibility, but it must never turn a signup
+        attempt into an OAuth/Auth capture workflow.
+        """
+        from services.chatgpt_core.access_token_only_registration_engine import (
+            AccessTokenOnlyRegistrationEngine,
+        )
+
+        extra_config = dict(context.extra_config or {})
+        extra_config.update(
+            {
+                "chatgpt_registration_mode": CHATGPT_REGISTRATION_MODE_ACCESS_TOKEN_ONLY,
+                "chatgpt_has_refresh_token_solution": False,
+                "chatgpt_access_token_only_checkout_amount_check_enabled": False,
+                "chatgpt_access_token_only_gopay_provider_link_enabled": False,
+            }
+        )
+        engine = AccessTokenOnlyRegistrationEngine(
+            email_service=context.email_service,
+            proxy_url=context.proxy_url,
+            browser_mode=context.browser_mode,
+            callback_logger=context.callback_logger,
+            max_retries=context.max_retries,
+            extra_config=extra_config,
+        )
         if context.email is not None:
             engine.email = context.email
         if context.password is not None:
             engine.password = context.password
-        return engine.run()
+        result = engine.run()
+        metadata = getattr(result, "metadata", None)
+        if not isinstance(metadata, dict):
+            metadata = {}
+            result.metadata = metadata
+        if getattr(result, "success", False):
+            access_token_saved = bool(str(getattr(result, "access_token", "") or "").strip())
+            # Do not leak historical two-stage/Auth failure markers into a
+            # signup-only result.  ``registered_auth_pending`` is retained as
+            # an explicit browser committed-signup state, but it is not an
+            # Auth failure produced by this registration task.
+            for key in (
+                "chatgpt_rt_registration_two_stage",
+                "auth_capture_stage",
+                "auth_capture_method",
+                "needs_auth_capture",
+                "auth_capture_required",
+                "registration_full_auth_failed",
+                "registration_full_auth_error",
+                "registration_full_auth_failed_policy",
+            ):
+                metadata.pop(key, None)
+            metadata.update(
+                {
+                    "registration_stage": "access_token_saved" if access_token_saved else "registered_auth_pending",
+                    "registration_stage_complete": True,
+                    "registration_access_token_saved": access_token_saved,
+                    "registration_auth_capture": "not_requested",
+                }
+            )
+            if access_token_saved:
+                result.source = "registration_session"
+                self._log_registration_complete(result, context)
+        return result
+
+    @staticmethod
+    def _log_registration_complete(result, context: ChatGPTRegistrationContext) -> None:
+        logger = context.callback_logger
+        if not callable(logger):
+            return
+        try:
+            logger(
+                "[注册] signup 已完成，已保存 AccessToken/Session/Cookie；"
+                "注册任务结束，不执行独立 Auth/refresh_token 捕获"
+            )
+        except TypeError:
+            logger(
+                "[注册] signup 已完成，已保存 AccessToken/Session/Cookie；"
+                "注册任务结束，不执行独立 Auth/refresh_token 捕获",
+                "info",
+            )
+
+    def run(self, context: ChatGPTRegistrationContext):
+        return self._run_registration_only(context)
 
     def build_account(self, result, fallback_password: str) -> Account:
         extra = self._build_account_extra(result)
@@ -146,6 +227,11 @@ class BaseChatGPTRegistrationModeAdapter(ABC):
         refresh_token = _auth_or_result("refresh_token", "refresh_token")
         id_token = _auth_or_result("id_token", "id_token")
         session_token = _auth_or_result("session_token", "session_token")
+        metadata = getattr(result, "metadata", None) or {}
+        registration_only = bool(
+            metadata.get("registration_auth_capture") == "not_requested"
+            or getattr(result, "source", "") == "registration_session"
+        )
         extra = {
             "access_token": access_token,
             "refresh_token": refresh_token,
@@ -153,7 +239,11 @@ class BaseChatGPTRegistrationModeAdapter(ABC):
             "session_token": session_token,
             "workspace_id": workspace_id,
             "account_id": account_id,
-            "chatgpt_registration_mode": self.mode,
+            "chatgpt_registration_mode": (
+                CHATGPT_REGISTRATION_MODE_ACCESS_TOKEN_ONLY
+                if registration_only
+                else self.mode
+            ),
             "chatgpt_has_refresh_token_solution": bool(str(refresh_token or "").strip()),
             "chatgpt_token_source": auth.get("source") or getattr(result, "source", "register"),
         }
@@ -167,7 +257,6 @@ class BaseChatGPTRegistrationModeAdapter(ABC):
             extra["auth_level"] = auth.get("auth_level")
         if auth.get("partial_auth"):
             extra["partial_auth"] = True
-        metadata = getattr(result, "metadata", None) or {}
         if isinstance(metadata, dict):
             for key in (
                 "chatgpt_rt_registration_two_stage",
@@ -655,16 +744,10 @@ class RefreshTokenChatGPTRegistrationAdapter(BaseChatGPTRegistrationModeAdapter)
         return result
 
     def run(self, context: ChatGPTRegistrationContext):
-        if context.browser_mode in {"headless", "headed"}:
-            if self._parse_bool(
-                (context.extra_config or {}).get("chatgpt_existing_account_capture"),
-                default=False,
-            ):
-                return self._run_browser_existing_account_capture(context)
-            return self._run_two_stage_registration(context)
-        if not self._two_stage_enabled(context.extra_config):
-            return super().run(context)
-        return self._run_two_stage_registration(context)
+        # ``refresh_token`` is a legacy registration setting.  Registration
+        # itself never performs the independent OAuth/Auth capture; callers
+        # must enqueue the dedicated subscription-auth task for that work.
+        return self._run_registration_only(context)
 
     def _run_browser_existing_account_capture(
         self,
@@ -851,9 +934,11 @@ class RefreshTokenChatGPTRegistrationAdapter(BaseChatGPTRegistrationModeAdapter)
         return stage1_result
 
     def _create_engine(self, context: ChatGPTRegistrationContext):
-        from services.chatgpt_core.refresh_token_registration_engine import RefreshTokenRegistrationEngine
+        # The legacy class is retained for ``build_account`` compatibility,
+        # but it must never construct the Auth-capable engine for signup.
+        from services.chatgpt_core.access_token_only_registration_engine import AccessTokenOnlyRegistrationEngine
 
-        return RefreshTokenRegistrationEngine(
+        return AccessTokenOnlyRegistrationEngine(
             email_service=context.email_service,
             proxy_url=context.proxy_url,
             callback_logger=context.callback_logger,
@@ -882,7 +967,10 @@ class AccessTokenOnlyChatGPTRegistrationAdapter(BaseChatGPTRegistrationModeAdapt
 def build_chatgpt_registration_mode_adapter(
     extra: Optional[dict],
 ) -> BaseChatGPTRegistrationModeAdapter:
+    # Keep the legacy adapter object available to callers that use its
+    # account-building helpers, but its ``run`` method is registration-only
+    # and can never enter the historical two-stage OAuth path.
     mode = resolve_chatgpt_registration_mode(extra)
-    if mode == CHATGPT_REGISTRATION_MODE_ACCESS_TOKEN_ONLY:
-        return AccessTokenOnlyChatGPTRegistrationAdapter()
-    return RefreshTokenChatGPTRegistrationAdapter()
+    if mode == CHATGPT_REGISTRATION_MODE_REFRESH_TOKEN:
+        return RefreshTokenChatGPTRegistrationAdapter()
+    return AccessTokenOnlyChatGPTRegistrationAdapter()

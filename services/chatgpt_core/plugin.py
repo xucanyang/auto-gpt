@@ -511,6 +511,21 @@ class ChatGPTPlatform(BasePlatform):
 
             email_service = TempMailEmailService()
 
+        # Signup is intentionally a single-purpose task.  Older saved forms
+        # may still contain ``refresh_token``/``has_refresh_token_solution``;
+        # preserve those inputs for compatibility but normalize the actual
+        # registration execution to AccessToken-only.
+        requested_registration_mode = str(
+            extra_config.get("chatgpt_registration_mode")
+            or ("refresh_token" if extra_config.get("chatgpt_has_refresh_token_solution") else "")
+        ).strip()
+        if requested_registration_mode and requested_registration_mode != "access_token_only":
+            extra_config["chatgpt_registration_requested_mode"] = requested_registration_mode
+        extra_config["chatgpt_registration_mode"] = "access_token_only"
+        extra_config["chatgpt_has_refresh_token_solution"] = False
+        extra_config["chatgpt_access_token_only_checkout_amount_check_enabled"] = False
+        extra_config["chatgpt_access_token_only_gopay_provider_link_enabled"] = False
+
         adapter = build_chatgpt_registration_mode_adapter(extra_config)
         context = ChatGPTRegistrationContext(
             email_service=email_service,

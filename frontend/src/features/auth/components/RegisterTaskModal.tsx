@@ -451,7 +451,7 @@ export function RegisterTaskModal({
                 showIcon
                 style={{ marginBottom: 16 }}
                 message="当前注册将使用手动邮箱模式"
-                description="请先填写你的邮箱地址。默认仍走原始“注册新号”逻辑；若开启“已有账号抓 auth”，则会跳过注册状态机，直接登录并抓取认证信息。真正需要验证码时，弹窗会切到任务日志面板，再出现验证码输入卡片。"
+                description="请先填写你的邮箱地址。注册任务只执行 signup 并保存 AccessToken/Web Session/Cookie；已有账号的 Auth 补抓请从账号页单独发起。真正需要验证码时，弹窗会切到任务日志面板，再出现验证码输入卡片。"
               />
               <Form.Item
                 name="email"
@@ -667,7 +667,7 @@ export function RegisterTaskModal({
             />
           ) : currentPlatform === 'chatgpt' ? (
             <>
-              <Form.Item label="ChatGPT Token 方案">
+              <Form.Item label="ChatGPT 注册凭据">
                 <ChatGPTRegistrationModeSwitch
                   mode={chatgptRegistrationMode}
                   onChange={setChatgptRegistrationMode}
@@ -678,7 +678,7 @@ export function RegisterTaskModal({
                   name="chatgpt_save_registration_access_token_account"
                   valuePropName="checked"
                   initialValue={true}
-                  extra="默认开启：注册阶段已拿到 AccessToken，但后续 refresh_token 获取失败时，也会保存一个 AccessToken-only 账号，避免真实注册成功却没有入库。"
+                  extra="注册阶段只保存 signup 产生的 AccessToken、Web Session 和 Cookie；完整 Auth/refresh_token 请使用账号页的独立补抓 Auth 任务。"
                 >
                   <Checkbox>保存注册阶段 AccessToken 账号</Checkbox>
                 </Form.Item>

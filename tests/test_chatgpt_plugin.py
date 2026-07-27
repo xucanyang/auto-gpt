@@ -198,6 +198,11 @@ class ChatGPTPluginTests(unittest.TestCase):
         generate_password.assert_called_once_with()
         self.assertIsNotNone(adapter.context)
         self.assertEqual(adapter.context.password, generated)
+        self.assertEqual(
+            adapter.context.extra_config["chatgpt_registration_mode"],
+            "access_token_only",
+        )
+        self.assertFalse(adapter.context.extra_config["chatgpt_has_refresh_token_solution"])
 
     def test_register_preserves_explicit_password(self):
         platform = ChatGPTPlatform(

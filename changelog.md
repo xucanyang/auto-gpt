@@ -13,6 +13,9 @@
 - **统一测试文档入口**：`README.md`、`AGENTS.md` 与 `docs/docker-image-release.md` 现在统一指向 Docker 测试规范，移除会吞掉收集失败的 `pytest tests -q || true` 作为推荐门禁，明确当前 `requirements-test.txt`、`docker-compose.test.yml` 和测试脚本仍待落地。
 
 ### 修复 (Fixed)
+- **将 ChatGPT 注册与 Auth/refresh_token 获取彻底分离**：`services/chatgpt_core/chatgpt_registration_mode_adapter.py`、`services/chatgpt_core/plugin.py` 和 `api/tasks.py` 现在把所有注册请求（包括旧的 `refresh_token` 配置）规范化为单次 AccessToken-only signup。注册成功后只保存 signup 同一会话产生的 AccessToken、Web Session、Cookie、账号/Workspace 标识并结束当前尝试，不再启动独立 Codex OAuth、OAuth 邮箱验证码、密码页、`add-phone` 或第二次落库；完整 Auth/RT 继续由 `subscription_auth_capture` 的单个/批量补抓任务负责。
+- **关闭注册阶段的隐式结算探测**：注册任务不再在账号落库前调用 checkout amount 或 GoPay 平台链接流程，避免支付/手机号链路拖长注册并混淆失败原因；支付链接与补抓 Auth 保持在后续流水线中执行。
+- **清理前端注册模式误导**：`RegisterTaskPage`、`RegisterTaskModal` 和 ChatGPT 注册模式组件不再提供“有 RT 注册”开关或“注册后抓 RT”选项，明确展示注册仅保存 signup 凭据；旧 localStorage/请求字段仍兼容但会被服务端强制改为 AccessToken-only。
 - **修复 refresh-token 注册第二阶段 OAuth 验证码适配器契约不一致**：`services/chatgpt_core/refresh_token_registration_engine.py` 的 `EmailServiceAdapter` 补齐跨阶段验证码排除接口，并支持独立浏览器 OAuth 使用 `ignore_budget=True` 绕过注册阶段 OTP 累计预算。此前 headless 注册主链已经拿到 AT/Session 后，第二阶段 OAuth 在邮箱验证码页因缺少 `used_codes_for_phases()` 直接抛出 `AttributeError`，任务却继续按仅 AT 账号成功落库；修复后 OAuth recovery 可以继续取得验证码并按完整 Auth/RT 结果收口。
 - **补齐本地配置发布为共享模板的闭环**：`api/config.py` 的 `/api/config/share/push` 新增可选 `enable_shared` 契约；Settings 在本地模式下现在明确提供“发布本地并启用共享”操作，先以当前实例已保存配置覆盖共享模板，再基于同一 revision 将当前实例切回共享模式。页面存在未保存改动或共享 revision 已变化时会阻止/拒绝发布，避免把旧快照误当成共享母版；未传该字段的旧调用仍保持仅覆盖模板的行为。
 - **修复 Settings 配置共享开关无法确认**：`frontend/src/pages/Settings.tsx` 的共享配置开启、关闭、推送和差异查看操作改用 `App.useApp()` 提供的上下文 `modal` 实例，不再调用当前构建中无法挂载的静态 `Modal.confirm/info`。现在切换到本地模式会正常显示确认框并提交 `PUT /api/config/share-state`；请求失败时会在页面提示具体错误，避免开关点击后无反馈。新增 `frontend/tests/sharedConfigContract.test.mjs` 锁定该交互契约。
@@ -20,6 +23,8 @@
 - **修正 Docker 发布拓扑旧描述**：`docs/docker-image-release.md` 按当前 `docker-compose.multi.yml` 更新为 `auto-gpt`、`auto-gpt-plus`、`auto-plus2` 三个常驻业务实例与 `phone-api-relay` 共同运行，移除主服务 standby 的过时说法。
 
 ### 测试 (Tests)
+- 扩展 `tests/test_chatgpt_registration_mode_adapter.py`、`tests/test_chatgpt_plugin.py` 和 `tests/test_register_task_controls.py`，锁定默认/legacy refresh-token 注册均只执行一次 signup、不调用第二阶段 Auth、不会写入 Auth 失败标记，并确认独立补抓 Auth 入口仍使用原适配器。
+- 后端注册专项回归 `96 passed, 1 skipped`，前端 `npm run build` 通过；侧栏版本同步为 `v2.8.59`。
 - 新增 `tests/test_restored_email_service.py` 适配器合同测试，覆盖跨注册阶段排除已消费验证码，以及独立 OAuth 等待不受注册 OTP 预算截断；专项测试 `9 passed`。
 - **完成文档一致性校验**：通过 `git diff --check`、Markdown 代码围栏配对和文档目标链接存在性检查；本次仅修改项目文档，未执行 Python、前端或容器测试，也未触碰生产运行态。
 
@@ -3074,4 +3079,8 @@
 
 ## 2026-07-28 03:07:24 +0800
 - 修复注册第二阶段 OAuth 验证码适配器契约
+- 发布模式: multi
+
+## 2026-07-28 05:37:02 +0800
+- 注册与 Auth 解耦，注册仅保存 signup AccessToken/Web Session/Cookie
 - 发布模式: multi

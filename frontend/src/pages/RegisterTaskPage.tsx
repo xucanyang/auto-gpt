@@ -28,7 +28,6 @@ import { TaskVerificationPanel } from '@/components/TaskVerificationPanel'
 import { usePersistentChatGPTRegistrationMode } from '@/hooks/usePersistentChatGPTRegistrationMode'
 import { parseBooleanConfigValue } from '@/lib/configValueParsers'
 import { buildChatGPTRegistrationRequestAdapter } from '@/lib/chatgptRegistrationRequestAdapter'
-import { CHATGPT_REGISTRATION_MODE_REFRESH_TOKEN } from '@/lib/chatgptRegistrationMode'
 import {
   EXECUTOR_SELECTION_HELP,
   getExecutorOptions,
@@ -545,8 +544,6 @@ export default function RegisterTaskPage() {
   const executorOptions = getExecutorOptions(platform)
   const isManualEmailOtp = platform === 'chatgpt' && mailProvider === 'manual_email_otp'
   const isPhoneSignup = platform === 'chatgpt' && chatgptRegistrationEntry === 'phone_signup'
-  const isRefreshTokenMode =
-    chatgptRegistrationMode === CHATGPT_REGISTRATION_MODE_REFRESH_TOKEN
   const normalizedTempMailSelectedDomains = normalizeDomainList(tempmailSelectedDomains)
   const tempmailDomainOptions = useMemo(() => {
     const byDomain = new Map<string, any>()
@@ -818,58 +815,12 @@ export default function RegisterTaskPage() {
                   description="手机号会作为 ChatGPT 登录标识；接码输入格式沿用手机号绑定的“手机号----收码API”，并兼容“手机号|收码API”。当前只执行注册阶段，并保存注册阶段 AccessToken 账号。"
                 />
               ) : null}
-              <Form.Item label="ChatGPT Token 方案">
+              <Form.Item label="ChatGPT 注册凭据">
                 <ChatGPTRegistrationModeSwitch
                   mode={chatgptRegistrationMode}
                   onChange={setChatgptRegistrationMode}
                 />
               </Form.Item>
-              {!isRefreshTokenMode ? (
-                <Form.Item
-                  name="chatgpt_access_token_only_checkout_amount_check_enabled"
-                  valuePropName="checked"
-                  extra="关闭后：仍生成订阅链接，但不做 checkout amount 额度校验，也不会因为额度结果跳过保存账号。"
-                >
-                  <Checkbox>启用额度验证</Checkbox>
-                </Form.Item>
-              ) : null}
-              {!isRefreshTokenMode ? (
-                <Space style={{ width: '100%' }}>
-                  <Form.Item
-                    name="chatgpt_access_token_only_checkout_country"
-                    label="额度验证国家"
-                    style={{ flex: 1 }}
-                    extra="无 RT 注册生成订阅链接并验证 amount 时使用。"
-                  >
-                    <Input placeholder="US" />
-                  </Form.Item>
-                  <Form.Item
-                    name="chatgpt_access_token_only_checkout_currency"
-                    label="额度验证货币"
-                    style={{ flex: 1 }}
-                    extra="默认 USD；留空会按国家推导。"
-                  >
-                    <Input placeholder="USD" />
-                  </Form.Item>
-                </Space>
-              ) : null}
-              <Form.Item
-                name="chatgpt_access_token_only_gopay_provider_link_enabled"
-                valuePropName="checked"
-                extra="开启后：注册/登录成功后继续进入 GoPay/Midtrans 平台链接阶段，只保存平台链接，不进入手机号 OTP/PIN；失败不会丢弃已注册账号。"
-              >
-                <Checkbox>注册后获取 GoPay 平台链接</Checkbox>
-              </Form.Item>
-              {isRefreshTokenMode ? (
-                <Form.Item
-                  name="chatgpt_save_registration_access_token_account"
-                  valuePropName="checked"
-                  initialValue={true}
-                  extra="默认开启：注册阶段已拿到 AccessToken，但后续 refresh_token 获取失败时，也会保存一个 AccessToken-only 账号，避免真实注册成功却没有入库。"
-                >
-                  <Checkbox>保存注册阶段 AccessToken 账号</Checkbox>
-                </Form.Item>
-              ) : null}
               <Form.Item
                 name="chatgpt_existing_account_login_route_enabled"
                 valuePropName="checked"
@@ -922,7 +873,7 @@ export default function RegisterTaskPage() {
                 description={
                   <div>
                     <div>适合你自己掌控邮箱时使用。</div>
-                    <div>流程是：先手填邮箱 → 开始任务 → 若注册阶段或 OAuth 阶段需要邮箱验证码，任务状态区会弹出输入框。</div>
+                    <div>流程是：先手填邮箱 → 开始任务 → 注册阶段需要邮箱验证码时，任务状态区会弹出输入框。</div>
                     <div>当前模式会自动锁定为单任务、单并发，密码仍由系统随机生成。</div>
                   </div>
                 }

@@ -6443,6 +6443,19 @@ def _build_effective_register_extra(req: RegisterTaskRequest) -> dict:
         {k: v for k, v in req.extra.items() if v is not None and v != ""}
     )
     if req.platform == "chatgpt":
+        requested_registration_mode = str(
+            merged_extra.get("chatgpt_registration_mode")
+            or ("refresh_token" if _is_truthy(merged_extra.get("chatgpt_has_refresh_token_solution")) else "")
+        ).strip()
+        if requested_registration_mode and requested_registration_mode != "access_token_only":
+            merged_extra["chatgpt_registration_requested_mode"] = requested_registration_mode
+        # Registration stops after the signup Web session is available.  Auth
+        # / refresh-token capture is queued separately by the resume-auth
+        # endpoints and must never be hidden inside a registration task.
+        merged_extra["chatgpt_registration_mode"] = "access_token_only"
+        merged_extra["chatgpt_has_refresh_token_solution"] = False
+        merged_extra["chatgpt_access_token_only_checkout_amount_check_enabled"] = False
+        merged_extra["chatgpt_access_token_only_gopay_provider_link_enabled"] = False
         checkout_country = str(
             merged_extra.get("chatgpt_access_token_only_checkout_country")
             or "US"

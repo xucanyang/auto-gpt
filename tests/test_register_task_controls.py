@@ -1257,6 +1257,29 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
         self.assertEqual(extra["chatgpt_checkout_country"], "US")
         self.assertEqual(extra["chatgpt_checkout_currency"], "USD")
 
+    def test_effective_register_extra_forces_registration_only_for_legacy_rt_config(self):
+        req = RegisterTaskRequest(
+            platform="chatgpt",
+            count=1,
+            concurrency=1,
+            extra={
+                "mail_provider": "fake",
+                "chatgpt_registration_mode": "refresh_token",
+                "chatgpt_has_refresh_token_solution": True,
+                "chatgpt_access_token_only_checkout_amount_check_enabled": True,
+                "chatgpt_access_token_only_gopay_provider_link_enabled": True,
+            },
+        )
+
+        with patch("core.config_store.config_store.get_all", return_value={}):
+            extra = _build_effective_register_extra(req)
+
+        self.assertEqual(extra["chatgpt_registration_mode"], "access_token_only")
+        self.assertFalse(extra["chatgpt_has_refresh_token_solution"])
+        self.assertFalse(extra["chatgpt_access_token_only_checkout_amount_check_enabled"])
+        self.assertFalse(extra["chatgpt_access_token_only_gopay_provider_link_enabled"])
+        self.assertEqual(extra["chatgpt_registration_requested_mode"], "refresh_token")
+
     def test_effective_register_extra_uses_usd_when_config_defaults_are_not_persisted(self):
         req = RegisterTaskRequest(
             platform="chatgpt",
