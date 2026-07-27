@@ -713,9 +713,15 @@ class AccessTokenOnlyRegistrationEngine:
             ):
                 milestone = "[登录] 开始获取 ChatGPT Web Session"
             elif clean.startswith("ChatGPT Web Session 获取成功:"):
+                account_match = re.search(r"\baccount_id=([^\s]+)", clean)
+                account_suffix = (
+                    f"｜OpenAI账号={account_match.group(1)}"
+                    if account_match and account_match.group(1)
+                    else ""
+                )
                 milestone = (
                     "[登录] ChatGPT Web Session 获取成功｜"
-                    "AT=是｜Session=是｜Cookie状态=已获取"
+                    f"AT=是｜Session=是｜Cookie状态=已获取{account_suffix}"
                 )
             if milestone:
                 self._log(milestone)
@@ -808,7 +814,8 @@ class AccessTokenOnlyRegistrationEngine:
         if result.ok:
             self._log(
                 f"any-auto 注册运输层成功 executor={result.executor} "
-                f"transport={result.transport} account_id={result.account_id or '-'}"
+                f"transport={result.transport} account_id={result.account_id or '-'}",
+                "debug",
             )
         else:
             self._log(
@@ -1446,9 +1453,6 @@ class AccessTokenOnlyRegistrationEngine:
                         session_result.setdefault("account_id", str((tokens or {}).get("account_id") or ""))
                         session_result.setdefault("workspace_id", str((tokens or {}).get("workspace_id") or ""))
                     else:
-                        self._log(
-                            f"步骤 1/2: 执行 any-auto 注册运输层 executor={self.browser_mode}..."
-                        )
                         any_auto_result = self._run_any_auto_registration(
                             chatgpt_client=chatgpt_client,
                             email_addr=email_addr,
@@ -1671,7 +1675,8 @@ class AccessTokenOnlyRegistrationEngine:
                             # any-auto transport already returned AT/session; no second-stage
                             # OAuth recovery or protocol reuse_session bridge.
                             self._log(
-                                "步骤 2/2: any-auto 已返回 AccessToken/Session，跳过二次 OAuth recovery"
+                                "步骤 2/2: any-auto 已返回 AccessToken/Session，跳过二次 OAuth recovery",
+                                "debug",
                             )
                         else:
                             self._log(
@@ -1684,12 +1689,21 @@ class AccessTokenOnlyRegistrationEngine:
                             }
 
                     if session_ok:
-                        self._log(
-                            "Token 提取完成｜"
-                            f"AT={'是' if session_result.get('access_token') else '否'}｜"
-                            f"Session={'是' if session_result.get('session_token') else '否'}｜"
-                            f"Cookie状态={'已获取' if session_result.get('cookie_header') or session_result.get('cookies') else '缺失'}"
-                        )
+                        # Browser any-auto already emits one canonical Web Session
+                        # milestone. Keep the protocol executor's equivalent
+                        # summary here without duplicating the browser milestone.
+                        registration_transport = str(
+                            getattr(chatgpt_client, "registration_transport", "") or ""
+                        ).strip().lower()
+                        if registration_transport != "any_auto_browser":
+                            self._log(
+                                "Token 提取完成｜"
+                                f"executor={getattr(chatgpt_client, 'effective_executor', self.browser_mode)}｜"
+                                f"transport={registration_transport or 'any_auto_protocol'}｜"
+                                f"AT={'是' if session_result.get('access_token') else '否'}｜"
+                                f"Session={'是' if session_result.get('session_token') else '否'}｜"
+                                f"Cookie状态={'已获取' if session_result.get('cookie_header') or session_result.get('cookies') else '缺失'}"
+                            )
                         result.access_token = session_result.get("access_token", "")
                         result.refresh_token = session_result.get("refresh_token", "")
                         result.id_token = session_result.get("id_token", "")

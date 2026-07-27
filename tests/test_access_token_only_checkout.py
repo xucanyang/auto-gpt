@@ -197,6 +197,8 @@ class AccessTokenOnlyCheckoutTests(unittest.TestCase):
             "[登录] ChatGPT Web Session 获取成功｜AT=是｜Session=是｜Cookie状态=已获取",
             info_lines,
         )
+        self.assertFalse(any("any-auto 注册运输层成功" in line for line in info_lines))
+        self.assertTrue(any("any-auto 注册运输层成功" in line for line in debug_lines))
         self.assertTrue(any("邮箱页已点击继续按钮" in line for line in debug_lines))
         self.assertTrue(any("ChatGPT Web Session 获取成功" in line for line in debug_lines))
 

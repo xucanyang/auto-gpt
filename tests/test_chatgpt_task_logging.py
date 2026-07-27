@@ -363,6 +363,22 @@ def test_format_registration_timeline_log_keeps_detailed_stable_fields():
     assert "代理=http://proxy.local:8080" in line
     assert "出口IP=198.51.100.10" in line
 
+    dynamic_line = format_task_timeline_log(
+        "ChatGPT注册",
+        "[代理] candidate=1/2 source=dynamic country=JP actual=unverified "
+        "provider=dynamic sid=refreshed retention=t-120 probe=disabled",
+        item_index=1,
+        item_total=3,
+        email="detailed.account+gpt1@example.com",
+        stage_index=2,
+        stage_total=9,
+        phase_label="选择代理",
+    )
+    assert "目标国家=JP" in dynamic_line
+    assert "实际国家=未验证" in dynamic_line
+    assert "SID=已刷新" in dynamic_line
+    assert "IP保留=120分钟" in dynamic_line
+
     safe_line = redact_log_text(
         "代理=http://proxy.local:8080｜出口IP=198.51.100.10"
     )

@@ -1077,6 +1077,7 @@ _REGISTRATION_FIELD_LABELS = {
     "actual": "实际国家",
     "provider": "供应商",
     "sid": "SID",
+    "retention": "IP保留",
     "probe": "探测",
     "proxy": "代理",
     "exit_ip": "出口IP",
@@ -1131,6 +1132,9 @@ _REGISTRATION_VALUE_LABELS = {
     "deterministic": "确定",
     "enabled": "启用",
     "disabled": "禁用",
+    "refreshed": "已刷新",
+    "unchanged": "未变化",
+    "unverified": "未验证",
     "any_auto_browser": "any-auto 浏览器",
     "any_auto_protocol": "any-auto 协议",
     "hme_ready_api": "HME Helper API",
@@ -1172,6 +1176,10 @@ def _registration_field_value(key: Any, value: Any) -> str:
             return "禁用"
         if lowered in {"enabled", "yes", "true", "on"}:
             return "启用"
+    if raw_key == "retention":
+        retention_match = re.fullmatch(r"t-(\d+)", lowered)
+        if retention_match:
+            return f"{retention_match.group(1)}分钟"
     if raw_key == "mailbox" and lowered == "success":
         return "已提交"
     if lowered in {"yes", "true", "on"}:
