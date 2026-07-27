@@ -64,7 +64,7 @@ services:
       PLAYWRIGHT_HEADLESS: ${PLAYWRIGHT_HEADLESS:-}
     ports:
       - "127.0.0.1:8000:8000"
-      - "127.0.0.1:8889:8889"
+      - "127.0.0.1:${SOLVER_PORT_BIND_MAIN:-8889}:8889"
       - "127.0.0.1:${CLIPROXYAPI_PORT_BIND:-8317}:8317"
     volumes:
       - ./data:/runtime

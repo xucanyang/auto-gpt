@@ -25,6 +25,7 @@
 
 ### 修复 (Fixed)
 - **修复超过 1000 个账号时无法启动批量本地状态校验**：`api/tasks.py` 为 `batch_probe_local_status` 增加独立的 `LOCAL_STATUS_PROBE_MAX_ACCOUNTS=5000` 安全边界，显式选择与当前筛选两种范围统一使用该上限。现在可一次覆盖 `auto-gpt-plus` 当前 2863 个 free 账号，其他批处理原有的 1000 个上限保持不变；并发仍由 `LOCAL_STATUS_PROBE_MAX_CONCURRENCY=10` 单独限制，不会随账号总数放大。
+- **修复主实例发布被宿主机 solver 端口冲突阻断**：`docker-compose.multi.yml` 将 `auto-gpt` 的宿主机 solver 映射改为 `${SOLVER_PORT_BIND_MAIN:-8889}:8889`；本机通过忽略的 `.env` 使用 `8894`，避让正在运行的 `abai-autoplus.service`，容器内 solver 契约和其他实例端口不变。
 - **侧栏版本同步为 `v2.8.57`**：`frontend/src/app/AppShell.tsx` 更新可见版本号，便于确认三个常驻实例已加载本次发布资源。
 
 ### 测试 (Tests)
@@ -3063,4 +3064,8 @@
 
 ## 2026-07-27 11:28:08 +0800
 - v2.8.57 修复大批量本地状态校验启动上限
+- 发布模式: multi
+
+## 2026-07-27 11:31:10 +0800
+- v2.8.57 修复主实例 solver 端口冲突
 - 发布模式: multi

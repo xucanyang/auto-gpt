@@ -25,7 +25,8 @@
 - 统一镜像名称：`auto-gpt:latest`
 - 多实例编排配置：`docker-compose.multi.yml`
 - 实例映射：
-  - **主服务常驻实例 (`auto-gpt`)**：端口 `127.0.0.1:8000->8000/tcp`，`127.0.0.1:8317->8317/tcp`，`127.0.0.1:8889->8889/tcp`
+  - **主服务常驻实例 (`auto-gpt`)**：端口 `127.0.0.1:8000->8000/tcp`，`127.0.0.1:8317->8317/tcp`，`127.0.0.1:${SOLVER_PORT_BIND_MAIN:-8889}->8889/tcp`
+    - 当前宿主机的 `127.0.0.1:8889` 由独立 `abai-autoplus.service` 使用，因此 `/opt/auto-gpt/.env` 将 `SOLVER_PORT_BIND_MAIN` 设为 `8894`；容器内 solver 端口仍为 `8889`。
     - 数据卷：`/opt/auto-gpt/data -> /runtime` 等
   - **Plus 常驻实例 (`auto-gpt-plus`)**：端口 `127.0.0.1:8001->8000/tcp`，`127.0.0.1:8318->8317/tcp`，`127.0.0.1:8890->8889/tcp`
     - 数据卷：`/opt/auto-gpt-plus/data -> /runtime` 等
