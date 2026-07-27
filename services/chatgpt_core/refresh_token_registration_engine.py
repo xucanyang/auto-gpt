@@ -124,6 +124,20 @@ class EmailServiceAdapter:
         budget = self._otp_budget
         return bool(budget and budget.is_exhausted())
 
+    def used_codes_for_phases(self, *phases: str) -> set[str]:
+        """Return verification codes consumed by the requested OTP phases.
+
+        Browser OAuth runs after the registration OTP in the same mailbox.  It
+        must exclude codes already consumed by either stage, otherwise a stale
+        message can be submitted to the wrong state machine.
+        """
+        result: set[str] = set()
+        for phase in phases:
+            key = str(phase or "").strip()
+            if key:
+                result.update(self._used_codes_by_phase.get(key, set()))
+        return result
+
     def _mark_message_processed(self, message_id: str) -> None:
         marker = getattr(self.email_service, "mark_verification_message_processed", None)
         if callable(marker):
@@ -146,6 +160,7 @@ class EmailServiceAdapter:
         exclude_codes=None,
         phase: str | None = None,
         phase_label: str | None = None,
+        ignore_budget: bool = False,
     ):
         phase_key = str(phase or "email_otp").strip() or "email_otp"
         phase_title = str(phase_label or phase_key).strip() or phase_key
@@ -156,7 +171,11 @@ class EmailServiceAdapter:
             for code in (exclude_codes or set())
             if str(code or "").strip()
         }
-        wait_plan = self._otp_budget.plan_wait(timeout) if self._otp_budget else None
+        wait_plan = (
+            self._otp_budget.plan_wait(timeout)
+            if self._otp_budget and not ignore_budget
+            else None
+        )
         if wait_plan and wait_plan.exhausted:
             self._log(
                 f"[验证码] {phase_title} 已超过单账号验证码等待预算 "

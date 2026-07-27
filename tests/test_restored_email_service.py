@@ -89,6 +89,58 @@ class RestoredEmailServiceTests(unittest.TestCase):
         self.assertEqual(code, "476433")
         self.assertIn("otp-message-1", exported["before_ids"])
 
+    def test_email_adapter_excludes_codes_from_related_phases(self):
+        service = mock.Mock()
+        service.get_verification_code.return_value = "654321"
+        adapter = EmailServiceAdapter(
+            service,
+            "restored@example.com",
+            lambda *_args: None,
+        )
+        adapter._used_codes_by_phase["register_email_otp"] = {"123456"}
+        adapter._used_codes_by_phase["browser_register_email_otp"] = {"234567"}
+
+        code = adapter.wait_for_verification_code(
+            "restored@example.com",
+            timeout=30,
+            exclude_codes=adapter.used_codes_for_phases(
+                "register_email_otp",
+                "browser_register_email_otp",
+            ),
+            phase="browser_oauth_email_otp",
+        )
+
+        self.assertEqual(code, "654321")
+        self.assertEqual(
+            service.get_verification_code.call_args.kwargs["exclude_codes"],
+            {"123456", "234567"},
+        )
+
+    def test_email_adapter_can_ignore_registration_otp_budget(self):
+        service = mock.Mock()
+        service.get_verification_code.return_value = "654321"
+        budget = mock.Mock()
+        budget.plan_wait.return_value = mock.Mock(exhausted=True)
+        adapter = EmailServiceAdapter(
+            service,
+            "restored@example.com",
+            lambda *_args: None,
+            otp_budget=budget,
+        )
+
+        code = adapter.wait_for_verification_code(
+            "restored@example.com",
+            timeout=120,
+            phase="browser_oauth_email_otp",
+            ignore_budget=True,
+        )
+
+        self.assertEqual(code, "654321")
+        budget.plan_wait.assert_not_called()
+        effective_timeout = service.get_verification_code.call_args.kwargs["timeout"]
+        self.assertGreater(effective_timeout, 0)
+        self.assertLessEqual(effective_timeout, 120)
+
     def test_expired_tempmail_mailbox_is_recreated_by_exact_email(self):
         state = {
             "provider": "tempmail_local",

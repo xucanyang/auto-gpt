@@ -13,12 +13,14 @@
 - **统一测试文档入口**：`README.md`、`AGENTS.md` 与 `docs/docker-image-release.md` 现在统一指向 Docker 测试规范，移除会吞掉收集失败的 `pytest tests -q || true` 作为推荐门禁，明确当前 `requirements-test.txt`、`docker-compose.test.yml` 和测试脚本仍待落地。
 
 ### 修复 (Fixed)
+- **修复 refresh-token 注册第二阶段 OAuth 验证码适配器契约不一致**：`services/chatgpt_core/refresh_token_registration_engine.py` 的 `EmailServiceAdapter` 补齐跨阶段验证码排除接口，并支持独立浏览器 OAuth 使用 `ignore_budget=True` 绕过注册阶段 OTP 累计预算。此前 headless 注册主链已经拿到 AT/Session 后，第二阶段 OAuth 在邮箱验证码页因缺少 `used_codes_for_phases()` 直接抛出 `AttributeError`，任务却继续按仅 AT 账号成功落库；修复后 OAuth recovery 可以继续取得验证码并按完整 Auth/RT 结果收口。
 - **补齐本地配置发布为共享模板的闭环**：`api/config.py` 的 `/api/config/share/push` 新增可选 `enable_shared` 契约；Settings 在本地模式下现在明确提供“发布本地并启用共享”操作，先以当前实例已保存配置覆盖共享模板，再基于同一 revision 将当前实例切回共享模式。页面存在未保存改动或共享 revision 已变化时会阻止/拒绝发布，避免把旧快照误当成共享母版；未传该字段的旧调用仍保持仅覆盖模板的行为。
 - **修复 Settings 配置共享开关无法确认**：`frontend/src/pages/Settings.tsx` 的共享配置开启、关闭、推送和差异查看操作改用 `App.useApp()` 提供的上下文 `modal` 实例，不再调用当前构建中无法挂载的静态 `Modal.confirm/info`。现在切换到本地模式会正常显示确认框并提交 `PUT /api/config/share-state`；请求失败时会在页面提示具体错误，避免开关点击后无反馈。新增 `frontend/tests/sharedConfigContract.test.mjs` 锁定该交互契约。
 - **记录 Argon2 与 Sentinel 测试问题的真实边界**：文档区分宿主机缺少 `argon2` 的依赖环境漂移和 Sentinel 旧中文日志断言造成的测试契约漂移，避免以后把两类问题误判为线上认证或浏览器运行故障。
 - **修正 Docker 发布拓扑旧描述**：`docs/docker-image-release.md` 按当前 `docker-compose.multi.yml` 更新为 `auto-gpt`、`auto-gpt-plus`、`auto-plus2` 三个常驻业务实例与 `phone-api-relay` 共同运行，移除主服务 standby 的过时说法。
 
 ### 测试 (Tests)
+- 新增 `tests/test_restored_email_service.py` 适配器合同测试，覆盖跨注册阶段排除已消费验证码，以及独立 OAuth 等待不受注册 OTP 预算截断；专项测试 `9 passed`。
 - **完成文档一致性校验**：通过 `git diff --check`、Markdown 代码围栏配对和文档目标链接存在性检查；本次仅修改项目文档，未执行 Python、前端或容器测试，也未触碰生产运行态。
 
 ## [2.8.57] - 2026-07-27
@@ -3068,4 +3070,8 @@
 
 ## 2026-07-27 11:31:10 +0800
 - v2.8.57 修复主实例 solver 端口冲突
+- 发布模式: multi
+
+## 2026-07-28 03:07:24 +0800
+- 修复注册第二阶段 OAuth 验证码适配器契约
 - 发布模式: multi
