@@ -21,6 +21,15 @@
 ### 测试 (Tests)
 - **完成文档一致性校验**：通过 `git diff --check`、Markdown 代码围栏配对和文档目标链接存在性检查；本次仅修改项目文档，未执行 Python、前端或容器测试，也未触碰生产运行态。
 
+## [2.8.57] - 2026-07-27
+
+### 修复 (Fixed)
+- **修复超过 1000 个账号时无法启动批量本地状态校验**：`api/tasks.py` 为 `batch_probe_local_status` 增加独立的 `LOCAL_STATUS_PROBE_MAX_ACCOUNTS=5000` 安全边界，显式选择与当前筛选两种范围统一使用该上限。现在可一次覆盖 `auto-gpt-plus` 当前 2863 个 free 账号，其他批处理原有的 1000 个上限保持不变；并发仍由 `LOCAL_STATUS_PROBE_MAX_CONCURRENCY=10` 单独限制，不会随账号总数放大。
+- **侧栏版本同步为 `v2.8.57`**：`frontend/src/app/AppShell.tsx` 更新可见版本号，便于确认三个常驻实例已加载本次发布资源。
+
+### 测试 (Tests)
+- 扩展 `tests/test_probe_local_status_batch_config.py`，覆盖 2863 个具备本地认证材料的 free 账号可完整解析，以及超过 5000 个专用安全上限仍返回 400 的边界。
+
 ## [2.8.56] - 2026-07-26
 
 ### 修复 (Fixed)
@@ -3050,4 +3059,8 @@
 
 ## 2026-07-26 16:51:22 +0800
 - v2.8.56 修复 Web Session 桥接 authorize 假超时
+- 发布模式: multi
+
+## 2026-07-27 11:28:08 +0800
+- v2.8.57 修复大批量本地状态校验启动上限
 - 发布模式: multi

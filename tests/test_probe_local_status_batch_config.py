@@ -171,6 +171,61 @@ class ProbeLocalStatusBatchConfigTests(unittest.TestCase):
         self.assertEqual(res["requested_concurrency"], 2)
         self.assertEqual(res["effective_concurrency"], 1)
 
+    def test_resolve_batch_probe_accepts_full_free_inventory_above_legacy_limit(self):
+        from api.tasks import _resolve_batch_probe_local_status_accounts, BatchProbeLocalStatusTaskRequest
+
+        account_count = 2863
+        accounts = [
+            _RunnerAccount(account_id, extra={"access_token": f"at-{account_id}"})
+            for account_id in range(1, account_count + 1)
+        ]
+        req = BatchProbeLocalStatusTaskRequest(all_filtered=True, subscription_type="free")
+
+        with mock.patch("api.tasks.Session"), mock.patch(
+            "api.tasks._filtered_chatgpt_accounts",
+            return_value=accounts,
+        ):
+            eligible, missing, skipped, matched = _resolve_batch_probe_local_status_accounts(req)
+
+        self.assertEqual(len(eligible), account_count)
+        self.assertEqual(len(matched), account_count)
+        self.assertEqual(missing, [])
+        self.assertEqual(skipped, [])
+
+        session = mock.MagicMock()
+        session.__enter__.return_value.exec.return_value.all.return_value = accounts
+        selected_req = BatchProbeLocalStatusTaskRequest(
+            account_ids=list(range(1, account_count + 1)),
+        )
+        with mock.patch("api.tasks.Session", return_value=session):
+            selected_eligible, selected_missing, selected_skipped, selected_matched = (
+                _resolve_batch_probe_local_status_accounts(selected_req)
+            )
+
+        self.assertEqual(len(selected_eligible), account_count)
+        self.assertEqual(selected_missing, [])
+        self.assertEqual(selected_skipped, [])
+        self.assertEqual(selected_matched, [])
+
+    def test_resolve_batch_probe_rejects_above_dedicated_safety_limit(self):
+        from api.tasks import (
+            LOCAL_STATUS_PROBE_MAX_ACCOUNTS,
+            _resolve_batch_probe_local_status_accounts,
+            BatchProbeLocalStatusTaskRequest,
+        )
+
+        account = _RunnerAccount(1, extra={"access_token": "at-1"})
+        req = BatchProbeLocalStatusTaskRequest(all_filtered=True, subscription_type="free")
+
+        with mock.patch("api.tasks.Session"), mock.patch(
+            "api.tasks._filtered_chatgpt_accounts",
+            return_value=[account] * (LOCAL_STATUS_PROBE_MAX_ACCOUNTS + 1),
+        ), self.assertRaises(HTTPException) as error:
+            _resolve_batch_probe_local_status_accounts(req)
+
+        self.assertEqual(error.exception.status_code, 400)
+        self.assertIn(str(LOCAL_STATUS_PROBE_MAX_ACCOUNTS), str(error.exception.detail))
+
     def test_prepare_batch_probe_freezes_concurrency_and_expands_dynamic_candidates(self):
         from api.tasks import _prepare_batch_probe_local_status_params
 

@@ -124,6 +124,7 @@ MAX_FINISHED_TASKS = 50
 CLEANUP_THRESHOLD = 75
 PHONE_BINDING_MAX_CONCURRENCY = 5
 LOCAL_STATUS_PROBE_MAX_CONCURRENCY = 10
+LOCAL_STATUS_PROBE_MAX_ACCOUNTS = 5000
 LOCAL_STATUS_PROBE_MAX_DELAY_SECONDS = 3600.0
 _task_store = RegisterTaskStore(
     max_finished_tasks=MAX_FINISHED_TASKS,
@@ -2846,8 +2847,8 @@ def _resolve_batch_probe_local_status_accounts(
     limit = max(int(req.limit or 0), 0)
 
     if requested_ids:
-        if len(requested_ids) > 1000:
-            raise HTTPException(400, "单次最多处理 1000 个账号")
+        if len(requested_ids) > LOCAL_STATUS_PROBE_MAX_ACCOUNTS:
+            raise HTTPException(400, f"单次最多处理 {LOCAL_STATUS_PROBE_MAX_ACCOUNTS} 个账号")
         with Session(engine) as session:
             rows = session.exec(
                 select(AccountModel)
@@ -2884,8 +2885,8 @@ def _resolve_batch_probe_local_status_accounts(
     with Session(engine) as session:
         rows = _filtered_chatgpt_accounts(session, req)
 
-    if len(rows) > 1000:
-        raise HTTPException(400, "单次最多处理 1000 个账号")
+    if len(rows) > LOCAL_STATUS_PROBE_MAX_ACCOUNTS:
+        raise HTTPException(400, f"单次最多处理 {LOCAL_STATUS_PROBE_MAX_ACCOUNTS} 个账号")
 
     eligible = []
     skipped = []
