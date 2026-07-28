@@ -16561,15 +16561,20 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                             chosen_delay = delay_min
                             
                         next_start_time = time.time() + chosen_delay
-                attempt_id = control.start_attempt()
+                with success_lock:
+                    # Claiming the execution unit and freezing its next
+                    # success slot are one atomic dispatcher observation.
+                    # This prevents a concurrent completion from changing the
+                    # prefix between ``start_attempt`` and the snapshot.
+                    attempt_id = control.start_attempt()
+                    if attempt_id is not None:
+                        success_at_start = success
+                        success_slot = success_at_start + 1
                 if attempt_id is None:
                     if control.is_stop_requested():
                         raise StopTaskRequested()
                     return AttemptResult.not_started()
                 control.checkpoint(attempt_id=attempt_id)
-                with success_lock:
-                    success_at_start = success
-                    success_slot = success_at_start + 1
                 attempt_log_context["registration_success_slot"] = success_slot
                 candidate_proxies = _build_register_candidate_proxies()
 
