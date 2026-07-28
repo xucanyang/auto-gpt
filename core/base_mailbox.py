@@ -1773,6 +1773,11 @@ def create_mailbox(
             icloud_hme_helper_checkout_ttl_seconds=extra.get("icloud_hme_helper_checkout_ttl_seconds", ""),
             icloud_hme_helper_wait_timeout_seconds=extra.get("icloud_hme_helper_wait_timeout_seconds", ""),
             icloud_hme_helper_max_cache_age_seconds=extra.get("icloud_hme_helper_max_cache_age_seconds", ""),
+            icloud_hme_test_mode=extra.get("icloud_hme_test_mode", False),
+            icloud_hme_test_tag=extra.get("icloud_hme_test_tag", ""),
+            icloud_hme_test_tag_scheme=extra.get("icloud_hme_test_tag_scheme", ""),
+            icloud_hme_test_physical_alias_id=extra.get("icloud_hme_test_physical_alias_id", ""),
+            icloud_hme_test_run_id=extra.get("icloud_hme_test_run_id", ""),
             tempmail_api_url=extra.get("tempmail_api_url", ""),
             tempmail_api_key=extra.get("tempmail_api_key", ""),
             tempmail_api_key_header=extra.get("tempmail_api_key_header", "Authorization"),
@@ -2357,6 +2362,11 @@ class HmeReadyApiClient:
         consumer: str = "",
         ttl_ms: int | None = None,
         max_cache_age_ms: int | None = None,
+        test_mode: bool = False,
+        test_tag: str = "",
+        test_tag_scheme: str = "",
+        test_physical_alias_id: str = "",
+        test_run_id: str = "",
     ) -> Any:
         body = {
             "forward_to": str(forward_to or "").strip(),
@@ -2372,6 +2382,16 @@ class HmeReadyApiClient:
             body["ttl_ms"] = int(ttl_ms)
         if max_cache_age_ms:
             body["max_cache_age_ms"] = int(max_cache_age_ms)
+        if test_mode:
+            body.update(
+                {
+                    "test_mode": True,
+                    "test_tag": str(test_tag or "").strip(),
+                    "test_tag_scheme": str(test_tag_scheme or "").strip(),
+                    "test_physical_alias_id": str(test_physical_alias_id or "").strip(),
+                    "test_run_id": str(test_run_id or "").strip(),
+                }
+            )
         with self._PREPARE_LOCK:
             return self._request("POST", "/api/hme-ready/mailboxes/prepare", payload=body)
 
@@ -2483,6 +2503,11 @@ class IcloudHmeMailbox(BaseMailbox):
         icloud_hme_helper_checkout_ttl_seconds: Any = "",
         icloud_hme_helper_wait_timeout_seconds: Any = "",
         icloud_hme_helper_max_cache_age_seconds: Any = "",
+        icloud_hme_test_mode: Any = False,
+        icloud_hme_test_tag: str = "",
+        icloud_hme_test_tag_scheme: str = "",
+        icloud_hme_test_physical_alias_id: str = "",
+        icloud_hme_test_run_id: str = "",
     ):
         self._mail_provider_name = str(mail_provider_name or "icloud_hme").strip().lower() or "icloud_hme"
         self._icloud_hme_mode = str(icloud_hme_mode or "live").strip().lower() or "live"
@@ -2520,6 +2545,11 @@ class IcloudHmeMailbox(BaseMailbox):
         except (TypeError, ValueError):
             self._helper_max_cache_age_seconds = 86400
         self._helper_consumer = str(icloud_hme_helper_consumer or "auto-gpt/chatgpt_register").strip()
+        self._helper_test_mode = _mailbox_bool(icloud_hme_test_mode, default=False)
+        self._helper_test_tag = str(icloud_hme_test_tag or "").strip().lower()
+        self._helper_test_tag_scheme = str(icloud_hme_test_tag_scheme or "").strip().lower()
+        self._helper_test_physical_alias_id = str(icloud_hme_test_physical_alias_id or "").strip()
+        self._helper_test_run_id = str(icloud_hme_test_run_id or "").strip().lower()
         self._helper_wait_started_leases: set[str] = set()
         self._helper_client = HmeReadyApiClient(
             api_url=icloud_hme_helper_api_url,
@@ -3223,15 +3253,26 @@ class IcloudHmeMailbox(BaseMailbox):
         attempt_id = str(getattr(self, "_task_attempt_token", "") or "").strip()
         parent_task_id = str(getattr(self, "_registration_task_id", "") or "").strip()
         ttl_ms = self._helper_checkout_ttl_seconds * 1000 if self._helper_checkout_ttl_seconds else None
-        payload = self._helper_client.prepare(
-            forward_to="*",
-            platform="chatgpt",
-            request_id=attempt_id,
-            task_id=parent_task_id,
-            consumer=self._helper_consumer,
-            ttl_ms=ttl_ms,
-            max_cache_age_ms=self._helper_max_cache_age_seconds * 1000,
-        )
+        prepare_kwargs = {
+            "forward_to": "*",
+            "platform": "chatgpt",
+            "request_id": attempt_id,
+            "task_id": parent_task_id,
+            "consumer": self._helper_consumer,
+            "ttl_ms": ttl_ms,
+            "max_cache_age_ms": self._helper_max_cache_age_seconds * 1000,
+        }
+        if self._helper_test_mode:
+            prepare_kwargs.update(
+                {
+                    "test_mode": True,
+                    "test_tag": self._helper_test_tag,
+                    "test_tag_scheme": self._helper_test_tag_scheme,
+                    "test_physical_alias_id": self._helper_test_physical_alias_id,
+                    "test_run_id": self._helper_test_run_id,
+                }
+            )
+        payload = self._helper_client.prepare(**prepare_kwargs)
         auto_gpt = payload.get("auto_gpt") if isinstance(payload, dict) else {}
         mailbox = payload.get("mailbox") if isinstance(payload, dict) else {}
         lease = payload.get("lease") if isinstance(payload, dict) else {}

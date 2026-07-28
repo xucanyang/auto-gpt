@@ -10,6 +10,7 @@
 - **新增 Docker 测试规范**：`docs/testing-in-docker.md` 固化运行依赖统一、测试镜像与生产镜像同源、一次性测试容器、临时数据库/共享配置、网络隔离、浏览器资源约束和外部实时烟测分层要求，明确禁止在常驻业务容器或生产挂载上执行完整 pytest。
 
 ### 优化 (Changed)
+- **增加 HME Tag 长度对照测试的任务级传递能力**：`core/base_mailbox.py` 为 Helper Ready prepare 增加显式测试字段透传，但仅在请求携带测试模式时发送 `test_run_id`、指定物理 HME、Tag 和 Tag scheme；普通注册仍保持原有 `gpt+3` 分配路径，不改变共享容量或生产调度。
 - **统一测试文档入口**：`README.md`、`AGENTS.md` 与 `docs/docker-image-release.md` 现在统一指向 Docker 测试规范，移除会吞掉收集失败的 `pytest tests -q || true` 作为推荐门禁，明确当前 `requirements-test.txt`、`docker-compose.test.yml` 和测试脚本仍待落地。
 
 ### 修复 (Fixed)
@@ -26,6 +27,7 @@
 - **修正 Docker 发布拓扑旧描述**：`docs/docker-image-release.md` 按当前 `docker-compose.multi.yml` 更新为 `auto-gpt`、`auto-gpt-plus`、`auto-plus2` 三个常驻业务实例与 `phone-api-relay` 共同运行，移除主服务 standby 的过时说法。
 
 ### 测试 (Tests)
+- 新增 HME Ready 测试字段回归覆盖：普通 prepare 的调用参数保持向后兼容，测试模式才携带 Tag 长度实验所需的物理 alias、Tag、scheme 与 run 标识；`tests/test_icloud_hme_mailbox_finalize.py` 专项回归 `29 passed`。
 - 新增注册日志合同断言：`tests/test_chatgpt_task_logging.py` 覆盖成功位/九阶段前缀、邮箱与 OTP 字段、HTTP Debug 脱敏（含用户信息/查询串/数字验证码）；`tests/test_access_token_only_checkout.py` 覆盖业务里程碑与网络 Debug 分流；`tests/test_register_task_controls.py` 覆盖失败不递增成功位、并发启动快照及“Debug 仅保留 HTTP”门禁。注册与浏览器/协议合同合并回归 `113 passed, 7 skipped, 2 subtests passed`；涉及模块 `py_compile` 通过。
 - 扩展 `tests/test_chatgpt_registration_mode_adapter.py`、`tests/test_chatgpt_plugin.py` 和 `tests/test_register_task_controls.py`，锁定默认/legacy refresh-token 注册均只执行一次 signup、不调用第二阶段 Auth、不会写入 Auth 失败标记，并确认独立补抓 Auth 入口仍使用原适配器。
 - 后端注册专项回归 `96 passed, 1 skipped`，前端 `npm run build` 通过；侧栏版本同步为 `v2.8.60`。
@@ -3107,4 +3109,8 @@
 
 ## 2026-07-28 08:22:32 +0800
 - 阻止注册成功位越过目标数
+- 发布模式: multi
+
+## 2026-07-29 05:50:47 +0800
+- 增加 HME Tag 长度实验字段的任务级透传与回归测试
 - 发布模式: multi
