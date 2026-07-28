@@ -21,6 +21,7 @@ from .constants import (
     SENTINEL_BASE,
     OAUTH_CONSENT_FORM_SELECTOR,
 )
+from ..task_logging import format_http_trace_log
 
 EMAIL_INPUT_SELECTORS = [
     'input#login-email',
@@ -4048,13 +4049,16 @@ def _browser_registration_flow(
                 f"oai-client-auth-session={'yes' if pre_cookies.get('oai-client-auth-session') else 'no'}"
             )
             reg_resp = _submit_password_via_page(page, password, log)
-            log(f"密码页提交状态: {reg_resp.get('status', 0)}")
             if not reg_resp.get("ok"):
                 raise RuntimeError(f"密码页提交失败: {(reg_resp.get('text') or '')[:300]}")
             register_submitted = True
             state = _extract_flow_state(reg_resp.get("data"), reg_resp.get("url", page.url))
             if not state.get("page_type") or _is_password_registration(state):
                 state = _derive_registration_state_from_page(page)
+            log(
+                f"[注册] 注册密码已提交｜HTTP={reg_resp.get('status', 0) or '-'} "
+                f"｜下一页={state.get('page_type') or '-'}"
+            )
             continue
 
         if str(state.get("page_type") or "") == "login_password":
@@ -4079,12 +4083,16 @@ def _browser_registration_flow(
             if not code:
                 raise RuntimeError("未获取到验证码")
             otp_resp = _submit_otp_via_page(page, code, log)
-            log(f"验证码页提交状态: {otp_resp.get('status', 0)}")
+            otp_status = otp_resp.get("status", 0)
             if not otp_resp.get("ok"):
                 raise RuntimeError(f"验证码校验失败: {(otp_resp.get('text') or '')[:300]}")
             state = _extract_flow_state(otp_resp.get("data"), otp_resp.get("url", page.url))
             if not state.get("page_type"):
                 state = _derive_registration_state_from_page(page)
+            log(
+                f"[验证码] 验证码已提交｜长度={len(str(code or '').strip())} "
+                f"｜HTTP={otp_status or '-'}｜下一页={state.get('page_type') or '-'}"
+            )
             continue
 
         if _is_about_you(state):
@@ -4102,12 +4110,15 @@ def _browser_registration_flow(
                 profile_name=profile_name,
                 profile_birthdate=profile_birthdate,
             )
-            log(f"about_you 提交状态: {about_resp.get('status', 0)}")
             if not about_resp.get("ok"):
                 raise RuntimeError(f"about_you 提交失败: {(about_resp.get('text') or '')[:300]}")
             state = _extract_flow_state(about_resp.get("data"), about_resp.get("url", page.url))
             if not state.get("page_type"):
                 state = _derive_registration_state_from_page(page)
+            log(
+                f"[注册] about_you 资料已提交｜HTTP={about_resp.get('status', 0) or '-'} "
+                f"｜下一页={state.get('page_type') or '-'}"
+            )
             if _is_add_phone(state):
                 if not phone_callback:
                     return state
@@ -4182,7 +4193,120 @@ class ChatGPTBrowserRegister:
 
         with Camoufox(**launch_opts) as browser:
             page = browser.new_page()
-            self.log("启动浏览器上下文注册状态机 (any-auto)")
+            pending_requests: dict[int, tuple[float, str, str, int]] = {}
+
+            def _trace_allowed(url: str, resource_type: str = "") -> bool:
+                try:
+                    host = str(urlparse(str(url or "")).hostname or "").lower()
+                except Exception:
+                    host = ""
+                if host not in {
+                    "auth.openai.com",
+                    "chatgpt.com",
+                    "platform.openai.com",
+                    "sentinel.openai.com",
+                    "cloudflare.com",
+                } and not host.endswith(".openai.com"):
+                    return False
+                kind = str(resource_type or "").lower()
+                lowered_url = str(url or "").lower()
+                return kind in {"document", "xhr", "fetch", "websocket"} or "/api/" in lowered_url
+
+            def _page_hint(url: str) -> str:
+                lowered = str(url or "").lower()
+                if "email-otp" in lowered or "email-verification" in lowered:
+                    return "email_otp"
+                if "create-account/password" in lowered or "user/register" in lowered:
+                    return "password"
+                if "about-you" in lowered:
+                    return "about_you"
+                if "/api/auth/session" in lowered:
+                    return "chatgpt_session"
+                if "authorize" in lowered or "signin/openai" in lowered:
+                    return "authorize"
+                return ""
+
+            def _request_size(request) -> int:
+                try:
+                    payload = request.post_data
+                    if payload:
+                        return len(str(payload).encode("utf-8", errors="replace"))
+                except Exception:
+                    pass
+                return 0
+
+            def _on_request(request) -> None:
+                url = str(getattr(request, "url", "") or "")
+                resource_type = str(getattr(request, "resource_type", "") or "")
+                if not _trace_allowed(url, resource_type):
+                    return
+                pending_requests[id(request)] = (
+                    time.monotonic(),
+                    str(getattr(request, "method", "GET") or "GET"),
+                    resource_type,
+                    _request_size(request),
+                )
+
+            def _on_response(response) -> None:
+                try:
+                    request = response.request
+                    url = str(getattr(response, "url", "") or getattr(request, "url", "") or "")
+                    resource_type = str(getattr(request, "resource_type", "") or "")
+                    if not _trace_allowed(url, resource_type):
+                        return
+                    started, method, stored_type, request_bytes = pending_requests.pop(
+                        id(request),
+                        (time.monotonic(), str(getattr(request, "method", "GET") or "GET"), resource_type, _request_size(request)),
+                    )
+                    headers = getattr(response, "headers", {}) or {}
+                    try:
+                        response_bytes = int(headers.get("content-length") or 0)
+                    except (TypeError, ValueError):
+                        response_bytes = 0
+                    self.log(
+                        format_http_trace_log(
+                            method,
+                            url,
+                            status=getattr(response, "status", ""),
+                            duration_ms=round((time.monotonic() - started) * 1000),
+                            page=_page_hint(url),
+                            resource_type=stored_type or resource_type,
+                            request_bytes=request_bytes,
+                            response_bytes=response_bytes,
+                        )
+                    )
+                except Exception:
+                    return
+
+            def _on_request_failed(request) -> None:
+                try:
+                    url = str(getattr(request, "url", "") or "")
+                    resource_type = str(getattr(request, "resource_type", "") or "")
+                    if not _trace_allowed(url, resource_type):
+                        return
+                    started, method, stored_type, request_bytes = pending_requests.pop(
+                        id(request),
+                        (time.monotonic(), str(getattr(request, "method", "GET") or "GET"), resource_type, _request_size(request)),
+                    )
+                    self.log(
+                        format_http_trace_log(
+                            method,
+                            url,
+                            status="FAILED",
+                            duration_ms=round((time.monotonic() - started) * 1000),
+                            page=_page_hint(url),
+                            resource_type=stored_type or resource_type,
+                            request_bytes=request_bytes,
+                            error=str(getattr(request, "failure", "") or "network error"),
+                        )
+                    )
+                except Exception:
+                    return
+
+            page.on("request", _on_request)
+            page.on("response", _on_response)
+            page.on("requestfailed", _on_request_failed)
+            self.log("[注册] 浏览器上下文已启动")
             final_state = _browser_registration_flow(
                 page,
                 email,

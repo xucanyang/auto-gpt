@@ -175,6 +175,86 @@ def redact_url(value: Any, *, keep_host: bool = True) -> str:
     return _truncate(_redact_text_patterns(text), 240)
 
 
+def format_http_trace_log(
+    method: Any,
+    url: Any,
+    *,
+    status: Any = "",
+    duration_ms: Any = "",
+    page: Any = "",
+    resource_type: Any = "",
+    request_bytes: Any = "",
+    response_bytes: Any = "",
+    error: Any = "",
+) -> str:
+    """Build a display-safe registration network transaction line.
+
+    Only the request method, host/path, status, timing and coarse sizes are
+    retained. Query strings, fragments, headers and bodies are intentionally
+    excluded because they commonly contain OTPs, cookies or bearer tokens.
+    """
+
+    raw_url = str(url or "").strip()
+    try:
+        # ``urlsplit`` treats a scheme-less endpoint as a path.  Parse it with
+        # a temporary scheme so query/fragment stripping also applies to the
+        # compact host/path form emitted by some transports.  Rebuild the
+        # authority from hostname/port instead of ``netloc`` so userinfo can
+        # never enter a network trace.
+        if raw_url.startswith("/") and not raw_url.startswith("//"):
+            endpoint = raw_url.split("?", 1)[0].split("#", 1)[0] or "/"
+        else:
+            parse_target = raw_url if "://" in raw_url else f"https://{raw_url.lstrip('/')}"
+            parts = urlsplit(parse_target)
+            if parts.netloc:
+                hostname = str(parts.hostname or "").strip()
+                try:
+                    port = f":{parts.port}" if parts.port else ""
+                except ValueError:
+                    port = ""
+                if ":" in hostname and not hostname.startswith("["):
+                    hostname = f"[{hostname}]"
+                endpoint = f"{hostname}{port}{parts.path or '/'}"
+            else:
+                endpoint = redact_url(raw_url.split("?", 1)[0].split("#", 1)[0])
+    except Exception:
+        endpoint = redact_url(raw_url.split("?", 1)[0].split("#", 1)[0])
+    endpoint = _truncate(endpoint or "-", 220)
+    verb = str(method or "GET").strip().upper() or "GET"
+    status_text = str(status or "-").strip() or "-"
+    try:
+        elapsed = f"{float(duration_ms):g}ms" if duration_ms not in (None, "") else "-"
+    except (TypeError, ValueError):
+        elapsed = f"{str(duration_ms).strip()}ms" if str(duration_ms).strip() else "-"
+    chunks = [f"[HTTP] {verb} {endpoint} -> {status_text} {elapsed}"]
+    page_text = str(page or "").strip()
+    if page_text:
+        chunks.append(f"page={redact_log_text(page_text)}")
+    resource_text = str(resource_type or "").strip()
+    if resource_text:
+        chunks.append(f"type={redact_log_text(resource_text)}")
+    for label, value in (("req_bytes", request_bytes), ("resp_bytes", response_bytes)):
+        if value in (None, ""):
+            continue
+        try:
+            chunks.append(f"{label}={max(int(value), 0)}")
+        except (TypeError, ValueError):
+            continue
+    error_text = redact_log_text(error).strip()
+    # Network traces are intentionally identity-free; keep an error's reason
+    # while removing even the masked mailbox address that the generic redactor
+    # would otherwise retain for operator context.
+    error_text = re.sub(
+        r"(?i)(?:[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+)@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
+        "[EMAIL]",
+        error_text,
+    )
+    error_text = re.sub(r"(?i)\bemail(?:_addr|_address)?\s*[:=]\s*[^\s｜|,，;；]+", "email=[EMAIL]", error_text)
+    if error_text:
+        chunks.append(f"error={_truncate(error_text, 180)}")
+    return " ".join(chunks)
+
+
 def mask_phone_for_log(value: Any) -> str:
     """Mask a phone number for logs while preserving enough prefix/suffix context."""
 
@@ -1041,12 +1121,12 @@ def _format_phone_binding_timeline_body(message: str, *, stage_tag: str) -> str:
 
 
 _REGISTRATION_MODULE_PREFIX_RE = re.compile(
-    r"^\s*\[(?:控制|代理|账号|指纹|邮箱|验证码|iCloudHME|TempMailLocal|阶段|路由|注册|登录|已有账号|SKIP_SAVE|升级链接|Auto Upload|Upload Gate|结果|DEBUG|OK|SKIP|FAIL|FATAL|STOP|WARN|ERROR)\]\s*",
+    r"^\s*\[(?:控制|代理|账号|指纹|邮箱|验证码|保存|iCloudHME|TempMailLocal|阶段|路由|注册|登录|已有账号|SKIP_SAVE|升级链接|Auto Upload|Upload Gate|结果|DEBUG|OK|SKIP|FAIL|FATAL|STOP|WARN|ERROR)\]\s*",
     re.I,
 )
 _REGISTRATION_EMAIL_RE = re.compile(
-    r"(?<![A-Za-z0-9.!#$%&'*+/=?^_`{|}~-])"
-    r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"
+    r"(?<![A-Za-z0-9.!#$%&'*+/?^_`{|}~\-])"
+    r"[A-Za-z0-9.!#$%&'*+/?^_`{|}~-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"
 )
 _REGISTRATION_STAGE_LABELS: dict[int, str] = {
     1: "准备",
@@ -1060,8 +1140,13 @@ _REGISTRATION_STAGE_LABELS: dict[int, str] = {
     9: "完成",
 }
 _REGISTRATION_FIELD_LABELS = {
+    "email": "邮箱",
+    "email_address": "邮箱",
+    "emailaddress": "邮箱",
     "target": "目标",
     "current_success": "已成功",
+    "success_slot": "成功位",
+    "registration_success_slot": "成功位",
     "executor": "执行器",
     "concurrency": "并发",
     "existing_account_action": "已有账号",
@@ -1084,9 +1169,33 @@ _REGISTRATION_FIELD_LABELS = {
     "browser_identity_started": "浏览器身份",
     "same_attempt_proxy_failover": "同尝试切换代理",
     "mail_provider": "邮箱渠道",
+    "provider_name": "邮箱渠道",
     "lease": "租约",
+    "lease_id": "租约",
     "mailbox_id": "邮箱ID",
+    "forward_mailbox_id": "转发箱ID",
+    "mailbox_action": "邮箱动作",
     "timeout": "超时",
+    "wait_seconds": "等待",
+    "wait": "等待",
+    "otp_wait_seconds": "等待",
+    "otp_source": "来源",
+    "otp_resend_count": "重发次数",
+    "resend_count": "重发次数",
+    "code_length": "长度",
+    "otp_length": "长度",
+    "next_page": "下一页",
+    "page": "页面",
+    "page_type": "页面",
+    "duration_ms": "耗时",
+    "elapsed_ms": "耗时",
+    "request_bytes": "请求字节",
+    "response_bytes": "响应字节",
+    "content_type": "类型",
+    "http_status": "HTTP",
+    "status_code": "HTTP",
+    "method": "方法",
+    "path": "路径",
     "transport": "运输层",
     "account_id": "OpenAI账号",
     "inventory_id": "库存账号",
@@ -1139,6 +1248,10 @@ _REGISTRATION_VALUE_LABELS = {
     "any_auto_protocol": "any-auto 协议",
     "hme_ready_api": "HME Helper API",
     "ok": "正常",
+    "created": "已创建",
+    "claimed_helper": "Helper已领取",
+    "reused_existing": "复用已有",
+    "registered_email": "注册邮箱",
 }
 
 
@@ -1157,14 +1270,33 @@ def _clean_registration_body(value: Any) -> str:
 
 def _registration_field_label(key: Any) -> str:
     raw = str(key or "").strip()
-    return _REGISTRATION_FIELD_LABELS.get(raw.lower(), raw)
+    lowered = raw.lower().replace("-", "_")
+    return _REGISTRATION_FIELD_LABELS.get(lowered, _REGISTRATION_FIELD_LABELS.get(raw.lower(), raw))
 
 
 def _registration_field_value(key: Any, value: Any) -> str:
-    raw_key = str(key or "").strip().lower()
+    raw_key = str(key or "").strip().lower().replace("-", "_")
     text = str(value or "").strip().strip("()")
     lowered = text.lower()
-    if raw_key == "code":
+    if raw_key in {
+        "code",
+        "otp",
+        "verification_code",
+        "verificationcode",
+        "email_otp",
+        "emailotp",
+        "phone_otp",
+        "phoneotp",
+        "authorization_code",
+        "authorizationcode",
+        "auth_code",
+        "authcode",
+    }:
+        # The outer task logger redacts these too, but the timeline formatter is
+        # also used directly by tests and standalone callers.  Never let a
+        # numeric OTP reappear while normalizing ``code=...`` fields.
+        if re.fullmatch(r"\d{4,8}", text):
+            return REDACTED_OTP
         return text
     if raw_key in {"slot", "backfill", "browser_identity_started"}:
         if lowered in {"1", "yes", "true", "on"}:
@@ -1188,6 +1320,10 @@ def _registration_field_value(key: Any, value: Any) -> str:
         return "否"
     if raw_key == "timeout" and lowered.endswith("s") and lowered[:-1].isdigit():
         return f"{lowered[:-1]}秒"
+    if raw_key in {"wait_seconds", "wait", "otp_wait_seconds"} and lowered.endswith("s") and lowered[:-1].isdigit():
+        return f"{lowered[:-1]}秒"
+    if raw_key in {"duration_ms", "elapsed_ms"} and lowered.endswith("ms"):
+        return text
     return _REGISTRATION_VALUE_LABELS.get(lowered, text)
 
 
@@ -1240,6 +1376,7 @@ def infer_registration_timeline_stage(message: Any) -> tuple[int, str]:
             "外部同步",
             "plus 额度验证",
             "账号保存",
+            "账号已保存",
             "auth_capture",
             "不保存账号",
             "升级链接",
@@ -1253,6 +1390,7 @@ def infer_registration_timeline_stage(message: Any) -> tuple[int, str]:
         marker in lowered
         for marker in (
             "web session",
+            "api/auth/session",
             "accesstoken",
             "sessiontoken",
             "token 提取",
@@ -1262,10 +1400,27 @@ def infer_registration_timeline_stage(message: Any) -> tuple[int, str]:
         )
     ):
         index = 7
-    elif any(marker in lowered for marker in ("about_you", "资料已提交", "账号创建完成")):
-        index = 6
-    elif any(marker in lowered for marker in ("验证码", "email_otp", "email-verification", "otp")):
+    elif any(
+        marker in lowered
+        for marker in (
+            "验证码",
+            "email_otp",
+            "email-verification",
+            "email-otp",
+            "otp",
+        )
+    ):
         index = 5
+    elif any(
+        marker in lowered
+        for marker in (
+            "about_you",
+            "about-you",
+            "资料已提交",
+            "账号创建完成",
+        )
+    ):
+        index = 6
     elif any(
         marker in lowered
         for marker in (
@@ -1274,6 +1429,8 @@ def infer_registration_timeline_stage(message: Any) -> tuple[int, str]:
             "邮箱入口已提交",
             "密码已提交",
             "提交注册",
+            "api/accounts/user/register",
+            "create-account/password",
         )
     ):
         index = 4
@@ -1285,6 +1442,7 @@ def infer_registration_timeline_stage(message: Any) -> tuple[int, str]:
             "helper 已领取别名",
             "复用远端邮箱",
             "邮箱领取",
+            "邮箱已获取",
             "转发箱",
         )
     ):
@@ -1336,6 +1494,8 @@ def _registration_status_and_detail(message: Any) -> tuple[str, str]:
         status = "停止补位"
     elif "any-auto 已返回 AccessToken/Session" in text:
         status = "已获取"
+    elif "验证码已提交" in text and ("HTTP=200" in text or "http=200" in lowered):
+        status = "提交成功"
     elif "已提交" in text and ("HTTP=200" in text or "http=200" in lowered):
         status = "提交成功"
     elif "已提交" in text:
@@ -1344,12 +1504,16 @@ def _registration_status_and_detail(message: Any) -> tuple[str, str]:
         status = "跳过"
     elif explicit_status:
         status = _registration_field_value("status", explicit_status.group(1))
-    elif "等待" in text:
-        status = "等待"
-    elif "命中验证码" in text or "收到验证码" in text:
+    elif "命中验证码" in text or "收到验证码" in text or "验证码已收到" in text:
         status = "已收到"
     elif "验证码已获取" in text or "token 提取完成" in lowered:
         status = "已获取"
+    elif "邮箱已获取" in text:
+        status = "已获取"
+    elif "账号已保存" in text:
+        status = "已保存"
+    elif "等待" in text:
+        status = "等待"
     elif "预检通过" in text:
         status = "预检通过"
     elif "已分配" in text:
@@ -1403,6 +1567,13 @@ def _registration_status_and_detail(message: Any) -> tuple[str, str]:
         (r"\s+mailbox_id=", "｜mailbox_id="),
         (r"^复用远端邮箱\s*[:：]\s*", "转发箱="),
         (r"^TempMail 转发箱命中验证码\s*[:：].*$", "来源=TempMail转发箱"),
+        (r"^邮箱已获取\s*(?:｜|\|)?\s*", ""),
+        (r"^验证码已收到\s*(?:｜|\|)?\s*", ""),
+        (r"^验证码已提交\s*(?:｜|\|)?\s*", ""),
+        (r"^注册密码已提交\s*(?:｜|\|)?\s*", ""),
+        (r"^about_you 资料已提交\s*(?:｜|\|)?\s*", ""),
+        (r"^账号已保存\s*(?:｜|\|)?\s*", ""),
+        (r"^等待验证码\s*(?:｜|\|)?\s*", ""),
         (r"^等待邮箱验证码\s*[:：]\s*(?:\[REDACTED_OTP\]\s*)?", "类型="),
         (r"^验证码已获取\s*[:：]\s*", "类型="),
         (r"^步骤\s*[12]/2\s*[:：]\s*", ""),
@@ -1436,7 +1607,19 @@ def _registration_status_and_detail(message: Any) -> tuple[str, str]:
     return status, ""
 
 
-def _format_registration_timeline_body(message: Any, *, stage_tag: str) -> str:
+def _format_registration_timeline_body(
+    message: Any,
+    *,
+    stage_tag: str,
+    debug: bool = False,
+) -> str:
+    if debug:
+        body = redact_log_text(message).strip()
+        if body.upper().startswith("[DEBUG]"):
+            body = body[len("[DEBUG]") :].strip()
+        if stage_tag and body:
+            return f"{stage_tag} {body}"
+        return stage_tag or body
     status, detail = _registration_status_and_detail(message)
     if detail:
         return f"{stage_tag} {status}｜{detail}"
@@ -1457,13 +1640,17 @@ def format_task_timeline_log(
     stage_index: int | None = None,
     stage_total: int | None = None,
     phase_label: str = "",
+    success_slot: int | None = None,
+    success_total: int | None = None,
+    debug: bool = False,
 ) -> str:
     """Build a stable human-facing task timeline log line.
 
     The output intentionally stays plain text so the current frontend keeps
     working, while the wording becomes much more predictable:
 
-    ``[邮箱测活][5/74][a@example.com] 阶段 1/2：登录测活并抓取 AccessToken``
+    Registration lines intentionally use only the success-slot and stage tags:
+    ``[1/3][步骤05/09 邮箱验证] 验证码已收到｜长度=6``.
     """
 
     task_name = str(task or "").strip()
@@ -1517,16 +1704,16 @@ def format_task_timeline_log(
     if registration_task:
         normalized_stage_index = int(stage_index or 0)
         normalized_stage_total = int(stage_total or 0)
-        tags.append("ChatGPT注册")
-        if normalized_index > 0:
-            attempt_tag = f"尝试 {normalized_index}"
-            if normalized_total > 0:
-                attempt_tag = f"{attempt_tag}/{normalized_total}"
-            tags.append(attempt_tag)
-        else:
-            tags.append("任务")
-        if email:
-            tags.append(mask_email_for_log(email))
+        resolved_success_slot = int(success_slot or normalized_index or 0)
+        resolved_success_total = int(success_total or normalized_total or 0)
+        if resolved_success_slot <= 0:
+            # Task-level registration events happen before an account has been
+            # claimed.  Keep the same stable shape without exposing an attempt
+            # counter; the first potential success is the operator's next slot.
+            resolved_success_slot = 1
+        if resolved_success_total <= 0:
+            resolved_success_total = max(resolved_success_slot, 1)
+        tags.append(f"{resolved_success_slot}/{resolved_success_total}")
         normalized_phase_label = redact_log_text(phase_label).strip()
         if normalized_stage_index > 0 and normalized_stage_total > 0:
             stage_text = (
@@ -1537,8 +1724,14 @@ def format_task_timeline_log(
                 stage_text = f"{stage_text} {normalized_phase_label}"
             tags.append(stage_text)
         stage_tag = "".join(f"[{tag}]" for tag in tags)
-        body = redact_log_text(message).strip()
-        return _format_registration_timeline_body(body, stage_tag=stage_tag)
+        formatted = _format_registration_timeline_body(
+            message,
+            stage_tag=stage_tag,
+            debug=bool(debug),
+        )
+        if debug and formatted and not formatted.lstrip().upper().startswith("[DEBUG]"):
+            return f"[DEBUG]{formatted}"
+        return formatted
 
     if normalized_index > 0 and normalized_total > 0:
         tags.append(f"{normalized_index}/{normalized_total}")

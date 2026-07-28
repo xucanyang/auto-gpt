@@ -20,6 +20,7 @@ from curl_cffi import requests as cffi_requests
 
 from .oauth import OAuthManager, OAuthStart, generate_oauth_url, submit_callback_url
 from .http_client import OpenAIHTTPClient, HTTPClientError
+from ..task_logging import format_http_trace_log, mask_email_for_log
 # from ..services import EmailServiceFactory, BaseEmailService, EmailServiceType  # removed: external dep
 # from ..database import crud  # removed: external dep
 # from ..database.session import get_db  # removed: external dep
@@ -398,7 +399,7 @@ class RegistrationEngine:
                 return False
 
             self.email = self.email_info["email"]
-            self._log(f"成功创建邮箱: {self.email}")
+            self._log(f"[邮箱] 当前邮箱={mask_email_for_log(self.email)}")
             return True
 
         except Exception as e:
@@ -472,10 +473,95 @@ class RegistrationEngine:
         """初始化会话"""
         try:
             self.session = self.http_client.session
+            self._install_http_trace()
             return True
         except Exception as e:
             self._log(f"初始化会话失败: {e}", "error")
             return False
+
+    def _install_http_trace(self) -> None:
+        """Attach a redacted request/response trace to the protocol session."""
+
+        session = self.session
+        if session is None or getattr(session, "_auto_gpt_http_trace_wrapped", False):
+            return
+        original_request = getattr(session, "request", None)
+        if not callable(original_request):
+            return
+
+        def _payload_size(value: Any) -> int:
+            if value in (None, ""):
+                return 0
+            if isinstance(value, (bytes, bytearray)):
+                return len(value)
+            if isinstance(value, str):
+                return len(value.encode("utf-8", errors="replace"))
+            try:
+                return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+            except Exception:
+                return 0
+
+        def _page_for_url(url: Any) -> str:
+            lowered = str(url or "").lower()
+            if "email-otp" in lowered or "email-verification" in lowered:
+                return "email_otp"
+            if "create-account/password" in lowered or "user/register" in lowered:
+                return "password"
+            if "about-you" in lowered or "create_account" in lowered:
+                return "about_you"
+            if "/api/auth/session" in lowered:
+                return "chatgpt_session"
+            if "authorize" in lowered or "signin/openai" in lowered:
+                return "authorize"
+            return ""
+
+        def _traced_request(*args: Any, **kwargs: Any):
+            method = kwargs.get("method") or (args[0] if args else "GET")
+            url = kwargs.get("url") or (args[1] if len(args) > 1 else args[0] if args else "")
+            started = time.monotonic()
+            request_bytes = _payload_size(kwargs.get("data")) + _payload_size(kwargs.get("json"))
+            try:
+                response = original_request(*args, **kwargs)
+            except Exception as exc:
+                self._log(
+                    format_http_trace_log(
+                        method,
+                        url,
+                        status="ERROR",
+                        duration_ms=round((time.monotonic() - started) * 1000),
+                        page=_page_for_url(url),
+                        request_bytes=request_bytes,
+                        error=str(exc),
+                    ),
+                    "debug",
+                )
+                raise
+            try:
+                response_bytes = len(getattr(response, "content", b"") or b"")
+            except Exception:
+                response_bytes = 0
+            self._log(
+                format_http_trace_log(
+                    method,
+                    url,
+                    status=getattr(response, "status_code", ""),
+                    duration_ms=round((time.monotonic() - started) * 1000),
+                    page=_page_for_url(getattr(response, "url", "") or url),
+                    request_bytes=request_bytes,
+                    response_bytes=response_bytes,
+                ),
+                "debug",
+            )
+            return response
+
+        try:
+            session.request = _traced_request
+            session._auto_gpt_http_trace_wrapped = True
+        except Exception:
+            # Some curl backends expose a read-only request descriptor.  The
+            # registration flow must remain usable even when tracing cannot be
+            # attached to that particular session implementation.
+            return
 
     def _get_device_id(self) -> Optional[str]:
         """获取 Device ID"""
@@ -660,7 +746,7 @@ class RegistrationEngine:
                             f"turnstile={'yes' if self._password_sentinel.t else 'no'}"
                         )
 
-                self._log(f"生成密码[{index}/{len(candidates)}]: {password}")
+                self._log(f"[注册] 注册密码已生成｜长度={len(password)}｜候选={index}/{len(candidates)}")
 
                 register_body = json.dumps({
                     "password": password,
@@ -779,7 +865,8 @@ class RegistrationEngine:
     def _get_verification_code(self) -> Optional[str]:
         """获取验证码"""
         try:
-            self._log(f"正在等待邮箱 {self.email} 的验证码...")
+            wait_started = time.monotonic()
+            self._log(f"[验证码] 等待验证码｜邮箱={mask_email_for_log(self.email)}｜来源=注册邮箱")
 
             email_id = self.email_info.get("service_id") if self.email_info else None
             code = self.email_service.get_verification_code(
@@ -791,10 +878,17 @@ class RegistrationEngine:
             )
 
             if code:
-                self._log(f"成功获取验证码: {code}")
+                self._log(
+                    f"[验证码] 验证码已收到｜邮箱={mask_email_for_log(self.email)} "
+                    f"｜长度={len(str(code).strip())}｜等待={max(0, int(time.monotonic() - wait_started))}秒｜来源=注册邮箱"
+                )
                 return code
             else:
-                self._log("等待验证码超时", "error")
+                self._log(
+                    f"[验证码] 验证码未收到｜邮箱={mask_email_for_log(self.email)} "
+                    f"｜等待={max(0, int(time.monotonic() - wait_started))}秒｜来源=注册邮箱",
+                    "error",
+                )
                 return None
 
         except Exception as e:
@@ -816,7 +910,6 @@ class RegistrationEngine:
                 data=code_body,
             )
 
-            self._log(f"验证码校验状态: {response.status_code}")
             if response.status_code != 200:
                 self._log(f"验证码校验响应: {response.text[:300]}", "warning")
                 return False
@@ -826,10 +919,13 @@ class RegistrationEngine:
                 resp_data = response.json()
                 self._otp_continue_url = resp_data.get("continue_url", "")
                 self._otp_page_type = resp_data.get("page", {}).get("type", "")
-                self._log(f"验证码校验 -> page_type={self._otp_page_type}")
             except Exception:
                 self._otp_continue_url = ""
                 self._otp_page_type = ""
+            self._log(
+                f"[验证码] 验证码已提交｜长度={len(str(code or '').strip())} "
+                f"｜HTTP={response.status_code}｜下一页={self._otp_page_type or '-'}"
+            )
             return True
 
         except Exception as e:

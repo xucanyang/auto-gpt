@@ -496,7 +496,7 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
         self.assertEqual(snapshot["status"], "failed")
         self.assertEqual(calls, ["http://proxy-a.local:8080"])
         self.assertEqual(create_mailbox.call_count, 1)
-        self.assertTrue(
+        self.assertFalse(
             any(
                 "same_attempt_proxy_failover=disabled" in line
                 and "proxy connection timed out" in line
@@ -505,7 +505,7 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
         )
         self.assertTrue(
             any(
-                "[ChatGPT注册][尝试 1/" in line
+                "[1/1]" in line
                 and "[步骤09/09 完成] 失败" in line
                 and "占用目标=是" in line
                 and "补位=否" in line
@@ -590,7 +590,7 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         self.assertTrue(
             any(
-                "[ChatGPT注册][尝试 1/" in line
+                "[1/1]" in line
                 and "[步骤09/09 完成] 跳过" in line
                 and "原因码=existing_account" in line
                 and "占用目标=否" in line
@@ -600,7 +600,7 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
         )
         self.assertFalse(
             any(
-                "[ChatGPT注册][尝试 1/" in line and "占用目标=是" in line
+                "[1/1]" in line and "占用目标=是" in line
                 for line in snapshot["logs"]
             )
         )
@@ -906,22 +906,22 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
         headers = [
             line
             for line in logs
-            if "[ChatGPT注册][尝试 " in line and "[步骤01/09 准备] 开始" in line
+            if ("[1/2]" in line or "[2/2]" in line) and "[步骤01/09 准备] 开始" in line
         ]
 
         self.assertEqual(snapshot["status"], "done")
         self.assertEqual(snapshot["success"], 2)
         self.assertEqual(len(headers), 2)
-        self.assertIn("[尝试 1/", headers[0])
+        self.assertIn("[1/2]", headers[0])
         self.assertIn("目标=2", headers[0])
         self.assertIn("已成功=0", headers[0])
-        self.assertIn("[尝试 2/", headers[1])
+        self.assertIn("[2/2]", headers[1])
         self.assertIn("目标=2", headers[1])
         self.assertIn("已成功=1", headers[1])
         first_success_index = next(
             index
             for index, line in enumerate(logs)
-            if "[ChatGPT注册][尝试 1/" in line
+            if "[1/2]" in line
             and "[步骤09/09 完成] 成功" in line
             and "原因码=success" in line
         )
@@ -931,6 +931,138 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
         self.assertLess(separator_index, second_header_index)
         self.assertEqual(logs[second_header_index - 1], "")
         self.assertFalse(any("开始第 " in line and "目标成功数" in line for line in logs))
+
+    def test_success_slot_does_not_advance_after_failure(self):
+        calls = []
+
+        class FailThenSuccessPlatform(_FakePlatform):
+            def register(self, email=None, password=None):
+                calls.append(len(calls) + 1)
+                if len(calls) == 1:
+                    raise RuntimeError("first registration failed")
+                return Account(
+                    platform="chatgpt",
+                    email="replacement-success@example.com",
+                    password=password or "pw",
+                    token="at-success",
+                    extra={},
+                )
+
+        task_id = "task-register-success-slot-after-failure"
+        req = RegisterTaskRequest(
+            platform="chatgpt",
+            count=1,
+            concurrency=1,
+            executor_type="protocol",
+            proxy_mode="direct",
+            extra={"mail_provider": "fake", "register_max_attempts": 2},
+        )
+        _create_task_record(task_id, req, "manual", None)
+
+        with (
+            patch("services.chatgpt_core.ChatGPTPlatform", FailThenSuccessPlatform),
+            patch("core.base_mailbox.create_mailbox", return_value=_FakeMailbox()),
+            patch("core.db.save_account", side_effect=lambda account: account),
+            patch("api.tasks._auto_upload_integrations"),
+            patch("api.tasks._save_task_log"),
+        ):
+            _run_register(task_id, req)
+
+        snapshot = _task_store.snapshot(task_id)
+        result_lines = [line for line in snapshot["logs"] if "[步骤09/09 完成]" in line]
+        self.assertEqual(snapshot["status"], "done")
+        self.assertEqual(snapshot["success"], 1)
+        self.assertEqual(calls, [1, 2])
+        self.assertTrue(any("[1/1]" in line and "失败" in line for line in result_lines))
+        self.assertTrue(any("[1/1]" in line and "成功" in line and "原因码=success" in line for line in result_lines))
+        self.assertFalse(any("[2/1]" in line for line in result_lines))
+
+    def test_concurrent_attempts_keep_startup_success_slot_snapshot(self):
+        barrier = threading.Barrier(2)
+
+        class ConcurrentSuccessPlatform(_FakePlatform):
+            def register(self, email=None, password=None):
+                barrier.wait(timeout=5)
+                index = threading.get_ident()
+                return Account(
+                    platform="chatgpt",
+                    email=f"concurrent-{index}@example.com",
+                    password=password or "pw",
+                    token=f"at-{index}",
+                    extra={},
+                )
+
+        task_id = "task-register-success-slot-concurrent"
+        req = RegisterTaskRequest(
+            platform="chatgpt",
+            count=2,
+            concurrency=2,
+            executor_type="protocol",
+            proxy_mode="direct",
+            extra={"mail_provider": "fake"},
+        )
+        _create_task_record(task_id, req, "manual", None)
+
+        with (
+            patch("services.chatgpt_core.ChatGPTPlatform", ConcurrentSuccessPlatform),
+            patch("core.base_mailbox.create_mailbox", return_value=_FakeMailbox()),
+            patch("core.db.save_account", side_effect=lambda account: account),
+            patch("api.tasks._auto_upload_integrations"),
+            patch("api.tasks._save_task_log"),
+        ):
+            _run_register(task_id, req)
+
+        snapshot = _task_store.snapshot(task_id)
+        started = [line for line in snapshot["logs"] if "[步骤01/09 准备] 开始" in line]
+        self.assertEqual(snapshot["status"], "done")
+        self.assertEqual(snapshot["success"], 2)
+        # Both workers are claimed before either success is consumed, so the
+        # concurrent batch shares the same next-success slot.  A dispatcher
+        # may briefly submit one refill while the second completed future is
+        # still being drained; that later worker correctly receives slot 2.
+        self.assertGreaterEqual(len(started), 2)
+        self.assertTrue(all("[1/2]" in line for line in started[:2]))
+        self.assertTrue(all("[2/2]" in line for line in started[2:]))
+
+    def test_registration_debug_stream_keeps_http_transactions_only(self):
+        class DebugEmitterPlatform(_FakePlatform):
+            def register(self, email=None, password=None):
+                self._log_fn("状态机细节仅供诊断", "debug")
+                self._log_fn(
+                    "[HTTP] POST auth.openai.com/api/accounts/user/register -> 200 8ms",
+                    "debug",
+                )
+                return Account(
+                    platform="chatgpt",
+                    email="debug-emitter@example.com",
+                    password=password or "pw",
+                    token="at-debug",
+                    extra={},
+                )
+
+        task_id = "task-register-debug-http-only"
+        req = RegisterTaskRequest(
+            platform="chatgpt",
+            count=1,
+            concurrency=1,
+            executor_type="protocol",
+            proxy_mode="direct",
+            extra={"mail_provider": "fake"},
+        )
+        _create_task_record(task_id, req, "manual", None)
+
+        with (
+            patch("services.chatgpt_core.ChatGPTPlatform", DebugEmitterPlatform),
+            patch("core.base_mailbox.create_mailbox", return_value=_FakeMailbox()),
+            patch("core.db.save_account", side_effect=lambda account: account),
+            patch("api.tasks._auto_upload_integrations"),
+            patch("api.tasks._save_task_log"),
+        ):
+            _run_register(task_id, req)
+
+        logs = _task_store.snapshot(task_id)["logs"]
+        self.assertFalse(any("状态机细节仅供诊断" in line for line in logs))
+        self.assertTrue(any("[DEBUG][1/1]" in line and "[HTTP] POST" in line for line in logs))
 
     def test_chatgpt_nonzero_checkout_amount_counts_failure_without_saving_and_continues(self):
         task_id = "task-chatgpt-skip-save"
@@ -1216,7 +1348,7 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
         )
         self.assertTrue(
             any(
-                "[ChatGPT注册][尝试 1/" in line
+                "[1/1]" in line
                 and "[步骤08/09 保存与同步] 待补抓" in line
                 and "阶段=auth_capture" in line
                 and "结果=待补抓" in line
@@ -1225,7 +1357,7 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
         )
         self.assertTrue(
             any(
-                "[ChatGPT注册][尝试 1/" in line
+                "[1/1]" in line
                 and "原因码=registered_auth_pending" in line
                 for line in snapshot["logs"]
             )

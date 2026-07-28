@@ -164,6 +164,7 @@ class AccessTokenOnlyCheckoutTests(unittest.TestCase):
                 "注册流程完成: page=oauth_callback",
                 "开始抓取 ChatGPT Web Session: https://chatgpt.com/api/auth/session",
                 "ChatGPT Web Session 获取成功: access_token=secret session_token=secret cookies=secret",
+                "[HTTP] POST auth.openai.com/api/accounts/email-otp/validate -> 200 42ms page=about_you type=xhr",
             ):
                 kwargs["log_fn"](line)
             return self._any_auto_ok(
@@ -188,8 +189,8 @@ class AccessTokenOnlyCheckoutTests(unittest.TestCase):
         info_lines = [message for level, message in emitted if level == "info"]
         debug_lines = [message for level, message in emitted if level == "debug"]
         self.assertTrue(result.ok)
-        self.assertIn("[注册] 邮箱入口已提交", info_lines)
-        self.assertIn("[验证码] 注册验证码已提交｜HTTP=200", info_lines)
+        self.assertTrue(any(line.startswith("[注册] 邮箱入口已提交｜邮箱=") for line in info_lines))
+        self.assertIn("[验证码] 验证码已提交｜长度=- ｜HTTP=200｜下一页=-", info_lines)
         self.assertIn("[注册] about_you 资料已提交｜HTTP=200", info_lines)
         self.assertIn("[注册] OpenAI 账号创建完成", info_lines)
         self.assertIn("[登录] 开始获取 ChatGPT Web Session", info_lines)
@@ -198,9 +199,10 @@ class AccessTokenOnlyCheckoutTests(unittest.TestCase):
             info_lines,
         )
         self.assertFalse(any("any-auto 注册运输层成功" in line for line in info_lines))
-        self.assertTrue(any("any-auto 注册运输层成功" in line for line in debug_lines))
-        self.assertTrue(any("邮箱页已点击继续按钮" in line for line in debug_lines))
-        self.assertTrue(any("ChatGPT Web Session 获取成功" in line for line in debug_lines))
+        self.assertFalse(any("any-auto/" in line or "headless" in line for line in debug_lines))
+        self.assertFalse(any("邮箱页已点击继续按钮" in line for line in debug_lines))
+        self.assertFalse(any("ChatGPT Web Session 获取成功" in line for line in debug_lines))
+        self.assertTrue(any("[HTTP] POST auth.openai.com/api/accounts/email-otp/validate" in line for line in debug_lines))
 
     def test_browser_modes_start_with_browser_registration_and_preserve_headless_flag(self):
         for browser_mode, expected_headless in (("headless", True), ("headed", False)):

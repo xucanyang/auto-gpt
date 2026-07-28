@@ -12,6 +12,7 @@ from services.chatgpt_core.task_logging import (
     build_task_current_state,
     classify_task_log_level,
     format_task_timeline_log,
+    format_http_trace_log,
     infer_registration_timeline_stage,
     mask_email_for_log,
     mask_phone_for_log,
@@ -355,9 +356,10 @@ def test_format_registration_timeline_log_keeps_detailed_stable_fields():
         phase_label=phase_label,
     )
 
-    assert line.startswith(
-        "[ChatGPT注册][尝试 1/3][det***1@example.com][步骤02/09 选择代理] 已选择"
-    )
+    assert line.startswith("[1/3][步骤02/09 选择代理] 已选择")
+    assert "[ChatGPT注册]" not in line
+    assert "[尝试" not in line
+    assert "det***1@example.com" not in line
     assert "候选=1/2" in line
     assert "来源=指定代理" in line
     assert "代理=http://proxy.local:8080" in line
@@ -468,8 +470,90 @@ def test_registration_timeline_formats_each_info_event_without_collapsing_densit
         )
 
     assert len(lines) == len(events)
-    assert all(line.startswith("[ChatGPT注册][尝试 1/3]") for line in lines)
+    assert all(line.startswith("[1/3]") for line in lines)
+    assert all("[ChatGPT注册]" not in line and "[尝试" not in line for line in lines)
     assert all("｜" in line for line in lines)
+
+
+def test_registration_prefix_uses_success_slot_and_debug_is_network_only():
+    info = format_task_timeline_log(
+        "ChatGPT注册",
+        "[邮箱] 邮箱已获取｜邮箱=sta1231@icloud.com｜渠道=HME Helper API",
+        success_slot=2,
+        success_total=3,
+        stage_index=3,
+        stage_total=9,
+        phase_label="领取邮箱",
+    )
+    debug = format_task_timeline_log(
+        "ChatGPT注册",
+        format_http_trace_log(
+            "POST",
+            "https://auth.openai.com/api/accounts/email-otp/validate?token=secret",
+            status=200,
+            duration_ms=842,
+            page="about_you",
+            resource_type="xhr",
+        ),
+        success_slot=2,
+        success_total=3,
+        stage_index=5,
+        stage_total=9,
+        phase_label="邮箱验证",
+        debug=True,
+    )
+    assert info.startswith("[2/3][步骤03/09 领取邮箱]")
+    assert "邮箱=sta***1@icloud.com" in info
+    assert "[ChatGPT注册]" not in info and "[尝试" not in info
+    assert debug.startswith("[DEBUG][2/3][步骤05/09 邮箱验证] [HTTP] POST auth.openai.com/api/accounts/email-otp/validate")
+    assert "token=secret" not in debug
+    assert "any-auto" not in debug and "headless" not in debug
+
+
+def test_registration_otp_summary_never_contains_plain_code():
+    line = format_task_timeline_log(
+        "ChatGPT注册",
+        "[验证码] 验证码已收到｜邮箱=sta1231@icloud.com｜长度=6｜等待=18秒｜来源=注册邮箱｜重发次数=1",
+        success_slot=1,
+        success_total=3,
+        stage_index=5,
+        stage_total=9,
+        phase_label="邮箱验证",
+    )
+    submitted = format_task_timeline_log(
+        "ChatGPT注册",
+        "[验证码] 验证码已提交｜长度=6｜HTTP=200｜下一页=about_you",
+        success_slot=1,
+        success_total=3,
+        stage_index=5,
+        stage_total=9,
+        phase_label="邮箱验证",
+    )
+    assert "长度=6" in line and "等待=18秒" in line and "来源=注册邮箱" in line
+    assert "长度=6" in submitted and "HTTP=200" in submitted and "下一页=about_you" in submitted
+    assert "123456" not in line and "123456" not in submitted
+
+
+def test_http_trace_and_timeline_formatter_strip_transport_secrets_without_outer_logger():
+    trace = format_http_trace_log(
+        "POST",
+        "https://user:password@auth.openai.com/api/accounts/email-otp/validate?token=secret#fragment",
+        status=200,
+        duration_ms=12,
+    )
+    line = format_task_timeline_log(
+        "ChatGPT注册",
+        "[验证码] code=123456",
+        success_slot=1,
+        success_total=1,
+        stage_index=5,
+        stage_total=9,
+        phase_label="邮箱验证",
+    )
+    assert trace == "[HTTP] POST auth.openai.com/api/accounts/email-otp/validate -> 200 12ms"
+    assert "user:password" not in trace
+    assert "token=secret" not in trace
+    assert "123456" not in line
 
 
 def test_registration_auto_upload_gate_uses_skip_not_fail(monkeypatch):

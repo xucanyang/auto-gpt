@@ -28,7 +28,11 @@ from .registration_route_policy import (
     is_existing_account_login_route_message,
     parse_bool,
 )
-from .task_logging import classify_task_log_level
+from .task_logging import (
+    classify_task_log_level,
+    format_http_trace_log,
+    mask_email_for_log,
+)
 from .utils import FlowState, generate_random_name, generate_random_birthday
 from .account_fingerprint import build_browser_fingerprint_payload, fingerprint_signature
 from .any_auto import (
@@ -51,7 +55,25 @@ class EmailServiceAdapter:
         self.email = email
         self.log_fn = log_fn
         self._used_codes_by_phase: dict[str, set[str]] = {}
+        self._wait_counts_by_phase: dict[str, int] = {}
         self._otp_budget = otp_budget
+
+    def _otp_source_label(self) -> str:
+        raw = str(
+            getattr(getattr(self.es, "service_type", None), "value", "")
+            or getattr(self.es, "provider", "")
+            or self.es.__class__.__name__
+            or "注册邮箱"
+        ).strip().lower()
+        if raw in {"hme_ready_api", "icloud_hme_ready", "icloud_hme_helper_ready", "helper_ready_api"}:
+            return "HME Helper API"
+        if raw in {"icloud_hme", "icloud_hme_temp_mail_forward"}:
+            return "iCloud HME 转发箱"
+        if raw in {"email_api", "api_email", "email_otp_api", "mail_api_otp"}:
+            return "邮箱 API"
+        if raw:
+            return raw
+        return "注册邮箱"
 
     def is_otp_wait_budget_exhausted(self) -> bool:
         budget = self._otp_budget
@@ -108,6 +130,12 @@ class EmailServiceAdapter:
         phase_key = str(phase or "email_otp").strip() or "email_otp"
         phase_title = str(phase_label or phase_key).strip() or phase_key
         used_codes = self._used_codes_by_phase.setdefault(phase_key, set())
+        wait_count = self._wait_counts_by_phase.get(phase_key, 0) + 1
+        self._wait_counts_by_phase[phase_key] = wait_count
+        resend_count = max(wait_count - 1, 0)
+        source_label = self._otp_source_label()
+        masked_email = mask_email_for_log(email or self.email)
+        wait_started = time.monotonic()
         wait_plan = (
             self._otp_budget.plan_wait(timeout)
             if self._otp_budget and not ignore_budget
@@ -115,8 +143,8 @@ class EmailServiceAdapter:
         )
         if wait_plan and wait_plan.exhausted:
             self.log_fn(
-                f"[验证码] {phase_title} 已超过单账号验证码等待预算 "
-                f"budget={self._otp_budget.total_seconds}s，停止等待当前账号"
+                f"[验证码] 验证码等待预算已耗尽｜邮箱={masked_email}｜来源={source_label} "
+                f"｜等待=0秒｜重发次数={resend_count}｜预算={self._otp_budget.total_seconds}秒"
             )
             return None
         try:
@@ -126,12 +154,15 @@ class EmailServiceAdapter:
         effective_timeout = wait_plan.timeout_seconds if wait_plan else fallback_timeout
         if wait_plan and wait_plan.clamped:
             msg = (
-                f"[验证码] 等待邮箱验证码：{phase_title} "
-                f"timeout={effective_timeout}s requested={wait_plan.requested_seconds}s "
-                f"single_account_remaining={wait_plan.remaining_seconds}s"
+                f"[验证码] 等待验证码｜邮箱={masked_email}｜来源={source_label} "
+                f"｜超时={effective_timeout}s｜重发次数={resend_count} "
+                f"｜预算剩余={wait_plan.remaining_seconds}s｜阶段={phase_title}"
             )
         else:
-            msg = f"[验证码] 等待邮箱验证码：{phase_title} timeout={effective_timeout}s"
+            msg = (
+                f"[验证码] 等待验证码｜邮箱={masked_email}｜来源={source_label} "
+                f"｜超时={effective_timeout}s｜重发次数={resend_count}｜阶段={phase_title}"
+            )
         self.log_fn(msg)
         try:
             code = self.es.get_verification_code(
@@ -142,12 +173,20 @@ class EmailServiceAdapter:
                 phase_label=phase_title,
             )
         except TimeoutError as exc:
-            self.log_fn(f"[验证码] {phase_title} 等待超时: {exc}")
+            waited_seconds = max(0, int(time.monotonic() - wait_started))
+            self.log_fn(
+                f"[验证码] 验证码未收到｜邮箱={masked_email}｜来源={source_label} "
+                f"｜等待={waited_seconds}秒｜重发次数={resend_count}｜原因=等待超时: {exc}"
+            )
             return None
         if code:
             code = str(code).strip()
             used_codes.add(code)
-            self.log_fn(f"[验证码] 验证码已获取：{phase_title}")
+            waited_seconds = max(0, int(time.monotonic() - wait_started))
+            self.log_fn(
+                f"[验证码] 验证码已收到｜邮箱={masked_email}｜长度={len(code)} "
+                f"｜等待={waited_seconds}秒｜来源={source_label}｜重发次数={resend_count}"
+            )
         return code
 
 class AccessTokenOnlyRegistrationEngine:
@@ -669,7 +708,8 @@ class AccessTokenOnlyRegistrationEngine:
             exclude_codes=None,
             phase="any_auto_otp",
         ):
-            return skymail_adapter.wait_for_verification_code(
+            nonlocal last_otp_length
+            code = skymail_adapter.wait_for_verification_code(
                 email or email_addr,
                 timeout=max(int(timeout or otp_wait_timeout or 120), 30),
                 otp_sent_at=otp_sent_at,
@@ -677,40 +717,112 @@ class AccessTokenOnlyRegistrationEngine:
                 phase=str(phase or "any_auto_otp"),
                 phase_label="any-auto 邮箱验证码",
             )
+            last_otp_length = len(str(code or "").strip())
+            return code
 
         def _otp_plain() -> str:
+            nonlocal last_otp_length
             code = skymail_adapter.wait_for_verification_code(
                 email_addr,
                 timeout=max(int(otp_wait_timeout or 120), 30),
                 phase="any_auto_browser_otp",
                 phase_label="any-auto 浏览器邮箱验证码",
             )
-            return str(code or "").strip()
+            normalized = str(code or "").strip()
+            last_otp_length = len(normalized)
+            return normalized
+
+        last_page_type = ""
+        last_otp_length = 0
+
+        def _legacy_http_trace(clean: str) -> str:
+            """Normalize old transport chatter when a lower layer emits no hook."""
+
+            match = re.search(
+                r"(?P<method>GET|POST|PUT|PATCH|DELETE|HEAD)\s+(?P<url>https?://\S+)\s*(?:->|status=)\s*(?P<status>\d{3})",
+                clean,
+                flags=re.I,
+            )
+            if not match:
+                match = re.search(
+                    r"(?P<label>[^:]+?)\s*(?:->|状态[:：])\s*(?P<status>\d{3})\s*(?P<url>https?://\S+)?",
+                    clean,
+                    flags=re.I,
+                )
+                if not match:
+                    return ""
+                url = str(match.group("url") or "").strip()
+                if not url:
+                    return ""
+                method = "GET" if "post" not in clean.lower() else "POST"
+                return format_http_trace_log(
+                    method,
+                    url,
+                    status=match.group("status"),
+                    page=last_page_type,
+                )
+            return format_http_trace_log(
+                match.group("method"),
+                match.group("url"),
+                status=match.group("status"),
+                page=last_page_type,
+            )
 
         def _transport_log(message: str) -> None:
+            nonlocal last_page_type, last_otp_length
             clean = str(message or "").strip()
             if not clean:
                 return
-            if clean.startswith(("[路由]", "[阶段]", "[结果]", "[验证码]", "[邮箱]", "[控制]")):
-                self._log(clean)
+
+            # The protocol adapter already owns the canonical mailbox/OTP
+            # summaries.  any-auto's legacy transport emits a second copy of
+            # those milestones; keep the richer adapter line only.
+            if clean.startswith(
+                (
+                    "[邮箱] 当前邮箱=",
+                    "[验证码] 等待验证码",
+                    "[验证码] 验证码已收到",
+                    "[验证码] 验证码未收到",
+                )
+            ):
                 return
 
-            milestone = ""
-            status_match = re.search(r"状态\s*[:：]\s*(\d+)", clean)
+            http_line = re.sub(r"^\s*\[DEBUG\]\s*", "", clean, flags=re.I)
+            if http_line.upper().startswith("[HTTP]"):
+                self._log(http_line, "debug")
+                page_match = re.search(r"\bpage=([^\s｜]+)", http_line)
+                if page_match:
+                    last_page_type = str(page_match.group(1) or "").strip()
+                return
+
+            legacy_trace = _legacy_http_trace(clean)
+            if legacy_trace:
+                self._log(legacy_trace, "debug")
+                return
+
+            status_match = re.search(r"(?:状态|status)\s*[:：=]\s*(\d+)", clean, flags=re.I)
             http_status = str(status_match.group(1) or "") if status_match else ""
-            if "邮箱页已点击继续按钮" in clean:
-                milestone = "[注册] 邮箱入口已提交"
+            page_match = re.search(r"(?:page|page_type)=([^\s｜]+)", clean, flags=re.I)
+            if page_match:
+                last_page_type = str(page_match.group(1) or "").strip()
+
+            milestone = ""
+            if clean.startswith(("[路由]", "[阶段]", "[结果]", "[验证码]", "[邮箱]", "[控制]", "[注册]", "[登录]")):
+                milestone = clean
+            elif "邮箱页已点击继续按钮" in clean:
+                milestone = f"[注册] 邮箱入口已提交｜邮箱={mask_email_for_log(email_addr)}"
             elif "密码页提交状态" in clean:
                 milestone = f"[注册] 注册密码已提交｜HTTP={http_status or '-'}"
             elif "验证码页提交状态" in clean:
-                milestone = f"[验证码] 注册验证码已提交｜HTTP={http_status or '-'}"
+                milestone = (
+                    f"[验证码] 验证码已提交｜长度={last_otp_length or '-'} "
+                    f"｜HTTP={http_status or '-'}｜下一页={last_page_type or '-'}"
+                )
             elif "about_you 提交状态" in clean:
                 milestone = f"[注册] about_you 资料已提交｜HTTP={http_status or '-'}"
             elif clean.startswith("注册流程完成:"):
                 milestone = "[注册] OpenAI 账号创建完成"
-            elif clean.startswith(
-                "开始抓取 ChatGPT Web Session: https://chatgpt.com/api/auth/session"
-            ):
+            elif clean.startswith("开始抓取 ChatGPT Web Session:"):
                 milestone = "[登录] 开始获取 ChatGPT Web Session"
             elif clean.startswith("ChatGPT Web Session 获取成功:"):
                 account_match = re.search(r"\baccount_id=([^\s]+)", clean)
@@ -723,14 +835,15 @@ class AccessTokenOnlyRegistrationEngine:
                     "[登录] ChatGPT Web Session 获取成功｜"
                     f"AT=是｜Session=是｜Cookie状态=已获取{account_suffix}"
                 )
+            elif clean.startswith(("失败", "异常", "错误", "未获取", "无法", "请求失败")):
+                milestone = f"[结果] {clean}"
+
             if milestone:
-                self._log(milestone)
-            self._log(f"[any-auto/{self.browser_mode}] {clean}", "debug")
+                self._log(milestone, "warning" if any(marker in milestone for marker in ("失败", "异常", "错误")) else "info")
 
         if self._is_browser_executor():
             self._log(
-                f"启动 any-auto 浏览器注册运输层 executor={self.browser_mode} "
-                f"(Camoufox 整段：邮箱 -> OTP -> about_you -> Web Session)"
+                "[注册] 注册运输层已启动｜模式=浏览器｜范围=邮箱→OTP→资料→Web Session"
             )
             result = run_any_auto_browser_registration(
                 email=email_addr,
@@ -745,8 +858,7 @@ class AccessTokenOnlyRegistrationEngine:
             )
         else:
             self._log(
-                "启动 any-auto 协议注册运输层 executor=protocol "
-                "(curl_cffi 同 session create + NextAuth AT)"
+                "[注册] 注册运输层已启动｜模式=协议｜范围=邮箱→OTP→资料→Web Session"
             )
             provider = str(
                 getattr(getattr(self.email_service, "service_type", None), "value", "")
@@ -813,14 +925,15 @@ class AccessTokenOnlyRegistrationEngine:
         ]
         if result.ok:
             self._log(
-                f"any-auto 注册运输层成功 executor={result.executor} "
-                f"transport={result.transport} account_id={result.account_id or '-'}",
-                "debug",
+                "[登录] Web Session 材料已就绪｜"
+                f"AT={'是' if result.access_token else '否'}｜"
+                f"Session={'是' if result.session_token else '否'}｜"
+                f"Cookie={'是' if result.cookie_header or result.cookies else '否'}｜"
+                f"账号={result.account_id or '-'}",
             )
         else:
             self._log(
-                f"any-auto 注册运输层失败 executor={result.executor}: "
-                f"{result.error_message or 'unknown'}",
+                f"[结果] 注册运输层失败｜原因={result.error_message or 'unknown'}",
                 "warning",
             )
         return result
@@ -1350,11 +1463,34 @@ class AccessTokenOnlyRegistrationEngine:
                     # 一个 account attempt 只领取一次邮箱，并固定密码与人物资料。
                     email_claimed_now = not email_initialized
                     if not email_initialized:
-                        email_data = self.email_service.create_email()
+                        raw_email_data = self.email_service.create_email()
+                        mailbox_account = getattr(self.email_service, "_acct", None)
+                        if isinstance(raw_email_data, dict):
+                            email_data = dict(raw_email_data)
+                        elif hasattr(raw_email_data, "items"):
+                            try:
+                                email_data = dict(raw_email_data)
+                            except Exception:
+                                email_data = {}
+                        elif isinstance(raw_email_data, str):
+                            # Older mailbox adapters returned the address
+                            # directly instead of the current metadata dict.
+                            email_data = {"email": raw_email_data}
+                        else:
+                            email_data = {
+                                "email": str(getattr(raw_email_data, "email", "") or ""),
+                                "service_id": str(
+                                    getattr(raw_email_data, "service_id", "")
+                                    or getattr(raw_email_data, "account_id", "")
+                                    or ""
+                                ),
+                            }
                         email_initialized = True
                         if not locked_email_addr:
                             locked_email_addr = str(
-                                (email_data.get("email") if email_data else None) or ""
+                                email_data.get("email")
+                                or getattr(mailbox_account, "email", "")
+                                or ""
                             ).strip()
                     if not locked_email_addr:
                         result.error_message = "创建邮箱失败"
@@ -1364,14 +1500,53 @@ class AccessTokenOnlyRegistrationEngine:
                     if self._task_log_context is not None:
                         self._task_log_context["email"] = email_addr
                     if email_claimed_now:
-                        self._log("[邮箱] 邮箱领取成功")
+                        raw_mailbox_extra = getattr(mailbox_account, "extra", None)
+                        if not isinstance(raw_mailbox_extra, dict):
+                            raw_mailbox_extra = email_data.get("extra")
+                        mailbox_extra = (
+                            dict(raw_mailbox_extra)
+                            if isinstance(raw_mailbox_extra, dict)
+                            else {}
+                        )
+                        provider_label = str(
+                            getattr(getattr(self.email_service, "service_type", None), "value", "")
+                            or getattr(self.email_service, "provider", "")
+                            or email_data.get("provider")
+                            or self.email_service.__class__.__name__
+                        ).strip()
+                        lease_id = str(
+                            mailbox_extra.get("lease_id")
+                            or mailbox_extra.get("checkout_id")
+                            or email_data.get("lease_id")
+                            or email_data.get("checkout_id")
+                            or email_data.get("service_id")
+                            or getattr(mailbox_account, "account_id", "")
+                            or "-"
+                        ).strip()
+                        mailbox_id = str(
+                            mailbox_extra.get("mailbox_id")
+                            or mailbox_extra.get("forward_mailbox_id")
+                            or email_data.get("mailbox_id")
+                            or email_data.get("forward_mailbox_id")
+                            or "-"
+                        ).strip()
+                        mailbox_action = str(
+                            email_data.get("mailbox_action")
+                            or mailbox_extra.get("mailbox_action")
+                            or "claimed"
+                        ).strip()
+                        self._log(
+                            f"[邮箱] 邮箱已获取｜邮箱={mask_email_for_log(email_addr)} "
+                            f"｜渠道={provider_label}｜租约={lease_id}｜邮箱ID={mailbox_id}｜动作={mailbox_action}"
+                        )
 
                     result.email = email_addr
                     pwd = locked_password
                     result.password = pwd
 
-                    self._log(f"邮箱: {email_addr}, 密码: {pwd}")
-                    self._log(f"注册信息: {first_name} {last_name}, 生日: {birthdate}")
+                    self._log(
+                        f"[注册] 注册资料已准备｜姓名=已生成｜生日=已生成｜密码长度={len(str(pwd or ''))}"
+                    )
 
                     # 使用包装器为底层客户端提供接码服务
                     skymail_adapter = EmailServiceAdapter(

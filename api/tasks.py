@@ -16023,6 +16023,11 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
     control = _task_store.control_for(task_id)
     _task_store.mark_running(task_id)
     success = 0
+    target_successes = max(int(req.count or 1), 1)
+    # ``success`` is updated by the dispatcher while registration workers emit
+    # logs concurrently.  Each worker freezes its next-success slot once it
+    # actually starts so one account's prefix cannot change mid-attempt.
+    success_lock = threading.Lock()
     skipped = 0
     errors = []
     fatal_registration_error = ""
@@ -16036,18 +16041,32 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
         *,
         stage_index: int | None = None,
         phase_label: str = "",
+        success_slot: int | None = None,
     ) -> None:
         inferred_index, inferred_label = infer_registration_timeline_stage(message)
         resolved_index = int(stage_index or inferred_index)
         resolved_label = str(phase_label or inferred_label).strip()
+        if success_slot is None:
+            with success_lock:
+                resolved_success_slot = min(success + 1, target_successes)
+        else:
+            resolved_success_slot = int(success_slot or 1)
+        is_debug = str(level or "info").strip().lower() == "debug" or str(message or "").lstrip().upper().startswith("[DEBUG]")
+        if is_debug:
+            debug_text = str(message or "")
+            if "[HTTP]" not in debug_text.upper():
+                return
         _log(
             task_id,
             format_task_timeline_log(
                 "ChatGPT注册",
                 message,
+                success_slot=resolved_success_slot,
+                success_total=target_successes,
                 stage_index=resolved_index,
                 stage_total=registration_stage_total,
                 phase_label=resolved_label,
+                debug=is_debug,
             ),
             level,
         )
@@ -16443,6 +16462,8 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
             nonlocal chatgpt_zero_amount_stop_triggered
             current_email = req.email or ""
             attempt_id: int | None = None
+            success_slot = 0
+            success_at_start = 0
             browser_register_invoked = False
             phone_signup_entry = False
             attempt_log_context: dict[str, Any] = {
@@ -16470,17 +16491,17 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                     return f"{tag} {context} {remainder}".rstrip()
                 return f"[{context}] {text}".rstrip()
 
-            def _format_attempt_timeline_log(message: str) -> str:
+            def _format_attempt_timeline_log(message: str, *, debug: bool = False) -> str:
                 stage_index, phase_label = infer_registration_timeline_stage(message)
                 return format_task_timeline_log(
                     "ChatGPT注册",
                     str(message or ""),
-                    item_index=i + 1,
-                    item_total=int(attempt_cap or target_successes),
-                    email=str(attempt_log_context.get("email") or current_email or ""),
+                    success_slot=success_slot or 1,
+                    success_total=target_successes,
                     stage_index=stage_index,
                     stage_total=registration_stage_total,
                     phase_label=phase_label,
+                    debug=debug,
                 )
 
             def _attempt_log(message: str, level: str = "info") -> None:
@@ -16489,9 +16510,24 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                     _log(task_id, _contextualize_attempt_log(message), normalized_level)
                     return
                 if normalized_level == "debug" or str(message or "").lstrip().upper().startswith("[DEBUG]"):
-                    _log(task_id, _contextualize_attempt_log(message), "debug")
+                    if "[HTTP]" not in str(message or "").upper():
+                        return
+                    _log(task_id, _format_attempt_timeline_log(message, debug=True), "debug")
                     return
                 _log(task_id, _format_attempt_timeline_log(message), normalized_level)
+
+            def _attempt_result_metadata(**fields: Any) -> dict[str, Any]:
+                metadata = {
+                    "registration_success_slot": int(success_slot or 1),
+                    "email": str(
+                        attempt_log_context.get("email")
+                        or current_email
+                        or req.email
+                        or ""
+                    ).strip(),
+                }
+                metadata.update(fields)
+                return metadata
 
             try:
                 from core.proxy_utils import (
@@ -16531,10 +16567,13 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                         raise StopTaskRequested()
                     return AttemptResult.not_started()
                 control.checkpoint(attempt_id=attempt_id)
+                with success_lock:
+                    success_at_start = success
+                    success_slot = success_at_start + 1
+                attempt_log_context["registration_success_slot"] = success_slot
                 candidate_proxies = _build_register_candidate_proxies()
 
                 merged_extra = _build_effective_register_extra(req)
-                target_successes = max(int(req.count or 1), 1)
                 phone_signup_entry = (
                     req.platform == "chatgpt"
                     and str(
@@ -16551,12 +16590,34 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                     merged_extra["_target_success_count"] = target_successes
 
                 def _register_task_log(message: str, level: str = "info", *_args: Any) -> None:
+                    raw_message = str(message or "")
+                    # Mailbox implementations may still emit a low-level
+                    # "code hit" line containing the plaintext OTP. The
+                    # adapter emits the canonical length/wait/source summary;
+                    # discard the raw duplicate before it reaches task logs.
+                    if any(
+                        marker in raw_message
+                        for marker in ("命中验证码:", "解析到验证码", "成功获取验证码:")
+                    ) and "长度=" not in raw_message:
+                        return
+                    if raw_message.startswith("[邮箱] mail_provider=") or "Helper 已领取别名:" in raw_message:
+                        return
                     flow = "phone_signup" if phone_signup_entry else "access_token_register"
                     effective_level = classify_task_log_level(message, level, flow=flow)
+                    if (
+                        not phone_signup_entry
+                        and effective_level == "debug"
+                        and "[HTTP]" not in raw_message.upper()
+                    ):
+                        # Registration Debug is reserved for network
+                        # transactions.  OAuth/state-machine chatter remains
+                        # available in the engine's internal diagnostics but
+                        # does not inflate the operator-facing task log.
+                        return
                     if phone_signup_entry:
                         display_message = _contextualize_attempt_log(str(message or ""))
                     elif effective_level == "debug":
-                        display_message = _contextualize_attempt_log(str(message or ""))
+                        display_message = _format_attempt_timeline_log(str(message or ""), debug=True)
                     else:
                         display_message = _format_attempt_timeline_log(str(message or ""))
                     _log(
@@ -16565,9 +16626,9 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                         effective_level,
                     )
 
-                _task_store.set_progress(task_id, f"{success}/{target_successes}")
+                _task_store.set_progress(task_id, f"{success_at_start}/{target_successes}")
                 _attempt_log(
-                    f"[账号] target={target_successes} current_success={success} "
+                    f"[账号] target={target_successes} current_success={success_at_start} "
                     f"executor={req.executor_type or 'protocol'} status=started"
                 )
                 attempt_fingerprint_payload: dict[str, Any] = {}
@@ -16885,12 +16946,12 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                     )
                     return AttemptResult.failed(
                         skip_reason,
-                        metadata={
-                            "email": str(account.email or current_email or ""),
-                            "reason_code": "failed_skip_save",
-                            "mailbox_action": "success",
-                            "backfill": True,
-                        },
+                        metadata=_attempt_result_metadata(
+                            email=str(account.email or current_email or ""),
+                            reason_code="failed_skip_save",
+                            mailbox_action="success",
+                            backfill=True,
+                        ),
                     )
                 saved_account = save_account(account)
                 if req.platform == "chatgpt" and saved_account is not None:
@@ -17051,6 +17112,19 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                             )
                     except Exception as sync_exc:
                         _attempt_log(f"[iCloudHME] 重跑结果写回失败: {sync_exc}", "warning")
+                saved_inventory_id = int(getattr(saved_account, "id", 0) or 0) if saved_account is not None else 0
+                openai_account_id = str(
+                    account_extra.get("account_id")
+                    or account_extra.get("user_id")
+                    or "-"
+                ).strip()
+                _attempt_log(
+                    f"[保存] 账号已保存｜邮箱={mask_email_for_log(str(account.email or current_email or ''))} "
+                    f"｜库存ID={saved_inventory_id or '-'}｜OpenAI账号={openai_account_id} "
+                    f"｜AT={'是' if account.token or account_extra.get('access_token') else '否'} "
+                    f"｜Session={'是' if account_extra.get('session_token') or account_extra.get('sessionToken') else '否'} "
+                    f"｜Cookie状态={'已获取' if account_extra.get('cookie_header') or account_extra.get('cookies') else '缺失'}"
+                )
                 if _proxy and proxy_pool is not None and str(proxy_source or "").startswith("pool"):
                     proxy_pool.report_success(_proxy)
                 if should_stop_after_current_account and zero_amount_stop_reason:
@@ -17099,17 +17173,17 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                     ),
                 )
                 return AttemptResult.success(
-                    metadata={
-                        "email": str(account.email or current_email or ""),
-                        "reason_code": (
+                    metadata=_attempt_result_metadata(
+                        email=str(account.email or current_email or ""),
+                        reason_code=(
                             "registered_auth_pending"
                             if registered_auth_pending
                             else "success"
                         ),
-                        "mailbox_action": "success",
-                        "registered_auth_pending": registered_auth_pending,
-                        "backfill": False,
-                    }
+                        mailbox_action="success",
+                        registered_auth_pending=registered_auth_pending,
+                        backfill=False,
+                    )
                 )
             except SkipCurrentAttemptRequested as e:
                 current_email = str(
@@ -17148,16 +17222,16 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                 )
                 return AttemptResult.skipped(
                     str(e),
-                    metadata={
-                        "email": current_email,
-                        "reason_code": skip_reason_code,
-                        "mailbox_action": "keep" if route_event else "finalized",
-                        "backfill": True,
-                        "existing_account_login_route": route_event,
-                    },
+                    metadata=_attempt_result_metadata(
+                        email=current_email,
+                        reason_code=skip_reason_code,
+                        mailbox_action="keep" if route_event else "finalized",
+                        backfill=True,
+                        existing_account_login_route=route_event,
+                    ),
                 )
             except StopTaskRequested as e:
-                _log(task_id, f"[STOP] {e}")
+                _attempt_log(f"[STOP] {e}")
                 return AttemptResult.stopped(str(e))
             except Exception as e:
                 error_text = str(e)
@@ -17226,13 +17300,13 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                     )
                     return AttemptResult.skipped(
                         error_text,
-                        metadata={
-                            "email": current_email,
-                            "reason_code": "existing_account",
-                            "mailbox_action": "keep",
-                            "backfill": True,
-                            "existing_account_login_route": route_event,
-                        },
+                        metadata=_attempt_result_metadata(
+                            email=current_email,
+                            reason_code="existing_account",
+                            mailbox_action="keep",
+                            backfill=True,
+                            existing_account_login_route=route_event,
+                        ),
                     )
 
                 safe_early_failure = bool(
@@ -17269,20 +17343,19 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                 return AttemptResult.failed(
                     error_text,
                     consumes_target_slot=consumes_target_slot,
-                    metadata={
-                        "email": current_email,
-                        "reason_code": failure_reason_code,
-                        "mailbox_action": mailbox_finalize_outcome or "finalized",
-                        "backfill": not consumes_target_slot,
-                        "mailbox_finalize_outcome": mailbox_finalize_outcome,
-                    },
+                    metadata=_attempt_result_metadata(
+                        email=current_email,
+                        reason_code=failure_reason_code,
+                        mailbox_action=mailbox_finalize_outcome or "finalized",
+                        backfill=not consumes_target_slot,
+                        mailbox_finalize_outcome=mailbox_finalize_outcome,
+                    ),
                 )
             finally:
                 control.finish_attempt(attempt_id)
 
         from concurrent.futures import FIRST_COMPLETED, CancelledError, ThreadPoolExecutor, wait
 
-        target_successes = max(int(req.count or 1), 1)
         initial_registration_entry = str(
             initial_merged_extra.get("chatgpt_registration_entry")
             or initial_merged_extra.get("registration_entry")
@@ -17439,12 +17512,23 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                     except CancelledError:
                         continue
                     except Exception as e:
-                        _log(task_id, f"[ERROR] 任务线程异常: {e}")
+                        _registration_task_log(
+                            f"[ERROR] 任务线程异常: {e}",
+                            "error",
+                            stage_index=9,
+                            phase_label="完成",
+                        )
                         errors.append(str(e))
-                        result = AttemptResult.failed(str(e))
+                        with success_lock:
+                            fallback_slot = success + 1
+                        result = AttemptResult.failed(
+                            str(e),
+                            metadata={"registration_success_slot": fallback_slot},
+                        )
 
                     if result.outcome == AttemptOutcome.SUCCESS:
-                        success += 1
+                        with success_lock:
+                            success += 1
                     elif result.outcome == AttemptOutcome.SKIPPED:
                         skipped += 1
                     elif result.outcome == AttemptOutcome.STOPPED:
@@ -17463,7 +17547,9 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                             )
                             control.request_stop()
 
-                    _task_store.set_progress(task_id, f"{success}/{target_successes}")
+                    with success_lock:
+                        success_snapshot = success
+                    _task_store.set_progress(task_id, f"{success_snapshot}/{target_successes}")
                     result_meta = (
                         dict(result.metadata)
                         if isinstance(result.metadata, dict)
@@ -17499,16 +17585,20 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                             f"mailbox={mailbox_action} "
                             f"slot={1 if result.consumes_target_slot else 0} "
                             f"backfill={'yes' if backfill else 'no'} "
-                            f"certainty={certainty} progress={success}/{target_successes}"
+                            f"certainty={certainty} progress={success_snapshot}/{target_successes}"
+                        )
+                        result_success_slot = int(
+                            result_meta.get("registration_success_slot")
+                            or success_snapshot
+                            or 1
                         )
                         _log(
                             task_id,
                             format_task_timeline_log(
                                 "ChatGPT注册",
                                 result_message,
-                                item_index=(attempt_no or 0) + 1,
-                                item_total=int(attempt_cap or target_successes),
-                                email=str(result_meta.get("email") or ""),
+                                success_slot=result_success_slot,
+                                success_total=target_successes,
                                 stage_index=9,
                                 stage_total=registration_stage_total,
                                 phase_label="完成",
