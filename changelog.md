@@ -13,7 +13,7 @@
 - **统一测试文档入口**：`README.md`、`AGENTS.md` 与 `docs/docker-image-release.md` 现在统一指向 Docker 测试规范，移除会吞掉收集失败的 `pytest tests -q || true` 作为推荐门禁，明确当前 `requirements-test.txt`、`docker-compose.test.yml` 和测试脚本仍待落地。
 
 ### 修复 (Fixed)
-- **重构 ChatGPT 注册日志契约与网络 Debug 追踪**：`api/tasks.py` 将注册前缀从尝试计数改为“当前成功位/目标成功数”，并在 `start_attempt()` 与成功位快照之间使用同一把锁，因此并发尝试、失败补位和浏览器不确定失败占槽仍保持原有调度语义；`services/chatgpt_core/task_logging.py` 统一输出 `[成功位/目标][步骤NN/09 阶段]`，移除任务名、尝试号、邮箱前缀和 `any-auto/<executor>` 重复标签。Info 业务节点补充当前邮箱、邮箱渠道、租约/邮箱 ID、代理/出口 IP、OTP 来源/等待/长度/重发次数、提交 HTTP/下一页以及库存/AT/Session/Cookie 状态；OTP 明文和密码不进入日志。`services/chatgpt_core/any_auto/register.py` 与 `browser_register.py` 为协议 Session 和 Camoufox 页面接入脱敏 `[HTTP]` 方法、主机路径、状态、耗时、页面、资源类型和请求/响应字节追踪，查询串、请求体、Cookie、Token、用户信息均剥离；`access_token_only_registration_engine.py` 仅将网络事务送入 Debug，并过滤 any-auto 重复邮箱/OTP 低层行。兼容旧邮箱适配器的字符串/对象返回值。前端侧栏版本同步为 `v2.8.62`。
+- **重构 ChatGPT 注册日志契约与网络 Debug 追踪**：`api/tasks.py` 将注册前缀从尝试计数改为“当前成功位/目标成功数”，并在 `start_attempt()` 与成功位快照之间使用同一把锁；目标成功数已达成时，排队补位线程在锁内直接返回 `NOT_STARTED`，不会产生越界成功位或无效注册。并发尝试、失败补位和浏览器不确定失败占槽仍保持原有调度语义；`services/chatgpt_core/task_logging.py` 统一输出 `[成功位/目标][步骤NN/09 阶段]`，移除任务名、尝试号、邮箱前缀和 `any-auto/<executor>` 重复标签。Info 业务节点补充当前邮箱、邮箱渠道、租约/邮箱 ID、代理/出口 IP、OTP 来源/等待/长度/重发次数、提交 HTTP/下一页以及库存/AT/Session/Cookie 状态；OTP 明文和密码不进入日志。`services/chatgpt_core/any_auto/register.py` 与 `browser_register.py` 为协议 Session 和 Camoufox 页面接入脱敏 `[HTTP]` 方法、主机路径、状态、耗时、页面、资源类型和请求/响应字节追踪，查询串、请求体、Cookie、Token、用户信息均剥离；`access_token_only_registration_engine.py` 仅将网络事务送入 Debug，并过滤 any-auto 重复邮箱/OTP 低层行。兼容旧邮箱适配器的字符串/对象返回值。前端侧栏版本同步为 `v2.8.62`。
 - **收敛 ChatGPT 注册日志主线**：`services/chatgpt_core/access_token_only_registration_engine.py` 移除重复的 any-auto 启动/成功汇报，浏览器执行器在 Info 视图只保留一条 Web Session 成功节点，协议执行器保留统一的 AT/Session/Cookie 摘要，二次 OAuth 跳过和底层状态机细节降至 Debug；`services/chatgpt_core/task_logging.py` 将动态代理 SID、IP 保留时长和国家未验证状态拆为结构化字段，避免 `SID=refreshed retention=t-120` 粘连显示。前端侧栏版本同步为 `v2.8.61`。
 - **持久化注册 Auth 边界审计字段**：`chatgpt_registration_mode_adapter.py` 将 `registration_auth_capture=not_requested` 加入账号 metadata 白名单，确保注册完成后数据库明确记录“未请求独立 Auth/RT”，与 AT/Session/Cookie 和 `auth_level=access_token_only` 一起可审计。
 - **将 ChatGPT 注册与 Auth/refresh_token 获取彻底分离**：`services/chatgpt_core/chatgpt_registration_mode_adapter.py`、`services/chatgpt_core/plugin.py` 和 `api/tasks.py` 现在把所有注册请求（包括旧的 `refresh_token` 配置）规范化为单次 AccessToken-only signup。注册成功后只保存 signup 同一会话产生的 AccessToken、Web Session、Cookie、账号/Workspace 标识并结束当前尝试，不再启动独立 Codex OAuth、OAuth 邮箱验证码、密码页、`add-phone` 或第二次落库；完整 Auth/RT 继续由 `subscription_auth_capture` 的单个/批量补抓任务负责。
@@ -3103,4 +3103,8 @@
 
 ## 2026-07-28 08:19:56 +0800
 - 原子化注册成功位快照时序
+- 发布模式: multi
+
+## 2026-07-28 08:22:32 +0800
+- 阻止注册成功位越过目标数
 - 发布模式: multi

@@ -16566,6 +16566,8 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                     # success slot are one atomic dispatcher observation.
                     # This prevents a concurrent completion from changing the
                     # prefix between ``start_attempt`` and the snapshot.
+                    if success >= target_successes:
+                        return AttemptResult.not_started()
                     attempt_id = control.start_attempt()
                     if attempt_id is not None:
                         success_at_start = success
