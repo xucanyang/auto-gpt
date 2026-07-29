@@ -10,10 +10,14 @@
 - **新增 Docker 测试规范**：`docs/testing-in-docker.md` 固化运行依赖统一、测试镜像与生产镜像同源、一次性测试容器、临时数据库/共享配置、网络隔离、浏览器资源约束和外部实时烟测分层要求，明确禁止在常驻业务容器或生产挂载上执行完整 pytest。
 
 ### 优化 (Changed)
+- **重构手机号绑定取号模式与固定快照契约**：`frontend/src/pages/Accounts.tsx` 与 `api/tasks.py` 将手机号绑定统一为 `普通绑定`、`限定号段绑定`、`号段抽样测试`、`不可用号码全量复测` 四种 canonical `phone_pool_mode`。限定号段新增 `可用号码 / 不可用号码 / 全部号码` 的行级筛选，号段只作为范围，不再把前缀健康状态当成禁选条件；不可用/全部筛选和全池不可用复测在创建任务时冻结候选，关闭同号复用与手工粘贴入口，候选预览同时展示候选号码、账号数、预计测试数和未覆盖号码。普通可用号段绑定继续沿用原有动态分配和容量校验，号段抽样仍严格限制每段 1/2 个号码。
+- **统一固定快照任务的审计元数据**：`api/tasks.py` 为 `prefix_bind`、`unavailable_numbers` 和通用 `phone_selection` 写入号码筛选、候选数、预计测试数、未覆盖候选和是否固定快照；旧的 `prefix_bind_enabled` / `prefix_sample_enabled` 布尔请求继续兼容，新增的 `phone_number_filter`、`prefix_number_filter`、`unavailable_number_test_enabled` 可与 canonical mode 并存。
 - **增加 HME Tag 长度对照测试的任务级传递能力**：`core/base_mailbox.py` 为 Helper Ready prepare 增加显式测试字段透传，但仅在请求携带测试模式时发送 `test_run_id`、指定物理 HME、Tag 和 Tag scheme；普通注册仍保持原有 `gpt+3` 分配路径，不改变共享容量或生产调度。
 - **统一测试文档入口**：`README.md`、`AGENTS.md` 与 `docs/docker-image-release.md` 现在统一指向 Docker 测试规范，移除会吞掉收集失败的 `pytest tests -q || true` 作为推荐门禁，明确当前 `requirements-test.txt`、`docker-compose.test.yml` 和测试脚本仍待落地。
 
 ### 修复 (Fixed)
+- **修复不可用号段无法被限定绑定选择的问题**：`services/chatgpt_core/phone_pool_repository.py` 将号码可用性改为行级 `available / unavailable / all` 查询，`unavailable` 精确限定为带收码 API 的 `status=cannot_send` 记录，`all` 只组合自身可用与 `cannot_send` 行，不混入限流、冷却、耗尽或停用号码。`api/tasks.py` 的并发和串行 runner 同步保留不可用复测筛选值，避免运行时将全量复测错误回退成 `available`；固定快照的总进度按实际可测试的 `min(账号数, 候选数)` 收口，未触碰号码不会被预先恢复或改写。
+- **同步侧栏可见版本为 `v2.8.63`**：`frontend/src/app/AppShell.tsx` 更新版本标识，便于确认三个常驻实例已经加载本次手机号绑定前端资源。
 - **重构 ChatGPT 注册日志契约与网络 Debug 追踪**：`api/tasks.py` 将注册前缀从尝试计数改为“当前成功位/目标成功数”，并在 `start_attempt()` 与成功位快照之间使用同一把锁；目标成功数已达成时，排队补位线程在锁内直接返回 `NOT_STARTED`，不会产生越界成功位或无效注册。并发尝试、失败补位和浏览器不确定失败占槽仍保持原有调度语义；`services/chatgpt_core/task_logging.py` 统一输出 `[成功位/目标][步骤NN/09 阶段]`，移除任务名、尝试号、邮箱前缀和 `any-auto/<executor>` 重复标签。Info 业务节点补充当前邮箱、邮箱渠道、租约/邮箱 ID、代理/出口 IP、OTP 来源/等待/长度/重发次数、提交 HTTP/下一页以及库存/AT/Session/Cookie 状态；OTP 明文和密码不进入日志。`services/chatgpt_core/any_auto/register.py` 与 `browser_register.py` 为协议 Session 和 Camoufox 页面接入脱敏 `[HTTP]` 方法、主机路径、状态、耗时、页面、资源类型和请求/响应字节追踪，查询串、请求体、Cookie、Token、用户信息均剥离；`access_token_only_registration_engine.py` 仅将网络事务送入 Debug，并过滤 any-auto 重复邮箱/OTP 低层行。兼容旧邮箱适配器的字符串/对象返回值。前端侧栏版本同步为 `v2.8.62`。
 - **收敛 ChatGPT 注册日志主线**：`services/chatgpt_core/access_token_only_registration_engine.py` 移除重复的 any-auto 启动/成功汇报，浏览器执行器在 Info 视图只保留一条 Web Session 成功节点，协议执行器保留统一的 AT/Session/Cookie 摘要，二次 OAuth 跳过和底层状态机细节降至 Debug；`services/chatgpt_core/task_logging.py` 将动态代理 SID、IP 保留时长和国家未验证状态拆为结构化字段，避免 `SID=refreshed retention=t-120` 粘连显示。前端侧栏版本同步为 `v2.8.61`。
 - **持久化注册 Auth 边界审计字段**：`chatgpt_registration_mode_adapter.py` 将 `registration_auth_capture=not_requested` 加入账号 metadata 白名单，确保注册完成后数据库明确记录“未请求独立 Auth/RT”，与 AT/Session/Cookie 和 `auth_level=access_token_only` 一起可审计。
@@ -27,6 +31,7 @@
 - **修正 Docker 发布拓扑旧描述**：`docs/docker-image-release.md` 按当前 `docker-compose.multi.yml` 更新为 `auto-gpt`、`auto-gpt-plus`、`auto-plus2` 三个常驻业务实例与 `phone-api-relay` 共同运行，移除主服务 standby 的过时说法。
 
 ### 测试 (Tests)
+- **补充手机号绑定模式回归**：`tests/test_phone_pool.py` 覆盖指定前缀内 `available / unavailable / all` 的行级候选边界；`tests/test_phone_pool_task_integration.py` 覆盖限定号段不可用固定快照、全池 `cannot_send` 全量候选快照、候选数超过账号数时的未覆盖统计及 legacy 布尔模式优先级；`tests/test_phone_prefix_ui_contract.py` 锁定新模式、状态筛选、不可用号段可选、候选预览和请求字段契约。使用一次性 Docker 容器、`--network none`、只读 checkout 和临时运行目录执行该专项，结果为 `55 passed`。
 - 新增 HME Ready 测试字段回归覆盖：普通 prepare 的调用参数保持向后兼容，测试模式才携带 Tag 长度实验所需的物理 alias、Tag、scheme 与 run 标识；`tests/test_icloud_hme_mailbox_finalize.py` 专项回归 `29 passed`。
 - 新增注册日志合同断言：`tests/test_chatgpt_task_logging.py` 覆盖成功位/九阶段前缀、邮箱与 OTP 字段、HTTP Debug 脱敏（含用户信息/查询串/数字验证码）；`tests/test_access_token_only_checkout.py` 覆盖业务里程碑与网络 Debug 分流；`tests/test_register_task_controls.py` 覆盖失败不递增成功位、并发启动快照及“Debug 仅保留 HTTP”门禁。注册与浏览器/协议合同合并回归 `113 passed, 7 skipped, 2 subtests passed`；涉及模块 `py_compile` 通过。
 - 扩展 `tests/test_chatgpt_registration_mode_adapter.py`、`tests/test_chatgpt_plugin.py` 和 `tests/test_register_task_controls.py`，锁定默认/legacy refresh-token 注册均只执行一次 signup、不调用第二阶段 Auth、不会写入 Auth 失败标记，并确认独立补抓 Auth 入口仍使用原适配器。
@@ -3113,4 +3118,8 @@
 
 ## 2026-07-29 05:50:47 +0800
 - 增加 HME Tag 长度实验字段的任务级透传与回归测试
+- 发布模式: multi
+
+## 2026-07-29 23:37:47 +0800
+- 手机号绑定支持号段内号码状态筛选与全量不可用复测
 - 发布模式: multi

@@ -320,6 +320,12 @@ class PhoneBindingTestTaskRequest(AccountFilterRequestMixin):
     account_interval_seconds: int = 60
     concurrency: int = 1
     reuse_phone_until_unusable: bool = False
+    # ``phone_pool_mode`` is the canonical selector.  The boolean fields below
+    # remain accepted for legacy callers and are normalized in the enqueue path.
+    phone_pool_mode: str = ""
+    phone_number_filter: str = "available"
+    prefix_number_filter: str = ""
+    unavailable_number_test_enabled: bool = False
     prefix_bind_enabled: bool = False
     prefix_sample_enabled: bool = False
     prefix_sample_size: int = 1
@@ -4332,6 +4338,55 @@ def enqueue_batch_resume_subscription_auth_task(
     }
 
 
+PHONE_BINDING_POOL_MODES = {
+    "normal",
+    "prefix_limited",
+    "prefix_sample",
+    "unavailable_numbers",
+}
+
+
+def _normalize_phone_binding_pool_mode(
+    value: Any,
+    *,
+    prefix_bind_enabled: bool = False,
+    prefix_sample_enabled: bool = False,
+    unavailable_number_test_enabled: bool = False,
+) -> str:
+    """Resolve the canonical phone-pool mode while keeping legacy flags valid."""
+    raw = str(value or "").strip().lower()
+    aliases = {
+        "default": "normal",
+        "prefix": "prefix_limited",
+        "limited_prefix": "prefix_limited",
+        "sample": "prefix_sample",
+        "unavailable": "unavailable_numbers",
+        "unavailable_all": "unavailable_numbers",
+        "unavailable_only": "unavailable_numbers",
+        "all_unavailable": "unavailable_numbers",
+    }
+    if raw:
+        raw = aliases.get(raw, raw)
+        if raw not in PHONE_BINDING_POOL_MODES:
+            raise HTTPException(400, "手机号取号模式无效")
+        return raw
+    # Preserve the historical precedence when an older client sends multiple
+    # booleans instead of the canonical mode field.
+    if prefix_bind_enabled:
+        return "prefix_limited"
+    if prefix_sample_enabled:
+        return "prefix_sample"
+    if unavailable_number_test_enabled:
+        return "unavailable_numbers"
+    return "normal"
+
+
+def _normalize_phone_binding_number_filter(value: Any) -> str:
+    from services.chatgpt_core.phone_pool_repository import normalize_phone_number_filter
+
+    return normalize_phone_number_filter(value)
+
+
 def enqueue_phone_binding_test_task(
     req: PhoneBindingTestTaskRequest,
     *,
@@ -4346,9 +4401,18 @@ def enqueue_phone_binding_test_task(
         skipped_accounts=skipped_accounts,
     )
     manual_phone_lines = str(req.phone_lines or "").strip()
+    legacy_prefix_bind_enabled = bool(req.prefix_bind_enabled)
+    legacy_prefix_sample_enabled = bool(req.prefix_sample_enabled)
+    resolved_pool_mode = _normalize_phone_binding_pool_mode(
+        req.phone_pool_mode,
+        prefix_bind_enabled=legacy_prefix_bind_enabled,
+        prefix_sample_enabled=legacy_prefix_sample_enabled,
+        unavailable_number_test_enabled=bool(req.unavailable_number_test_enabled),
+    )
     # 手动粘贴的号码/API 优先于默认号池开关，避免用户粘贴后仍误用空号池。
-    prefix_bind_enabled = bool(req.prefix_bind_enabled) and not manual_phone_lines
-    prefix_sample_enabled = bool(req.prefix_sample_enabled) and not manual_phone_lines and not prefix_bind_enabled
+    prefix_bind_enabled = resolved_pool_mode == "prefix_limited" and not manual_phone_lines
+    prefix_sample_enabled = resolved_pool_mode == "prefix_sample" and not manual_phone_lines
+    unavailable_number_test_enabled = resolved_pool_mode == "unavailable_numbers" and not manual_phone_lines
     try:
         prefix_sample_size = int(req.prefix_sample_size or 1)
     except (TypeError, ValueError):
@@ -4378,9 +4442,29 @@ def enqueue_phone_binding_test_task(
         raise HTTPException(400, "单次最多指定 500 个号段")
     requested_prefixes = list(selected_prefixes)
     prefix_sms_probe_only = bool(req.prefix_sms_probe_only or req.sms_probe_only)
-    pool_source = (bool(req.use_pool) or prefix_sample_enabled or prefix_bind_enabled) and not manual_phone_lines
-    use_pool = pool_source and not prefix_sample_enabled
-    reuse_phone_until_unusable = bool(req.reuse_phone_until_unusable) and not prefix_sample_enabled and not prefix_sms_probe_only
+    raw_number_filter = req.prefix_number_filter or req.phone_number_filter
+    phone_number_filter = _normalize_phone_binding_number_filter(raw_number_filter)
+    if unavailable_number_test_enabled:
+        phone_number_filter = "unavailable"
+    elif not prefix_bind_enabled:
+        phone_number_filter = "available"
+    fixed_snapshot_selection = (
+        prefix_sample_enabled
+        or unavailable_number_test_enabled
+        or (prefix_bind_enabled and phone_number_filter != "available")
+    )
+    pool_source = (
+        bool(req.use_pool)
+        or prefix_sample_enabled
+        or prefix_bind_enabled
+        or unavailable_number_test_enabled
+    ) and not manual_phone_lines
+    use_pool = pool_source and not fixed_snapshot_selection
+    reuse_phone_until_unusable = (
+        bool(req.reuse_phone_until_unusable)
+        and not fixed_snapshot_selection
+        and not prefix_sms_probe_only
+    )
     phone_entries: list[dict[str, Any]] = []
     parse_errors: list[dict[str, Any]] = []
     phone_pool_import_summary = {"imported": 0, "existing": 0, "skipped": 0}
@@ -4427,9 +4511,23 @@ def enqueue_phone_binding_test_task(
         "enabled": prefix_bind_enabled,
         "selected_prefixes": requested_prefixes,
         "prefix_count": len(requested_prefixes) if prefix_bind_enabled else 0,
+        "number_filter": phone_number_filter if prefix_bind_enabled else "available",
         "available_phone_count": 0,
         "available_slot_count": 0,
+        "candidate_phone_count": 0,
+        "candidate_test_count": 0,
+        "uncovered_phone_count": 0,
+        "fixed_snapshot": bool(prefix_bind_enabled and fixed_snapshot_selection),
         "reuse_phone_until_unusable": reuse_phone_until_unusable,
+        "sms_probe_only": prefix_sms_probe_only,
+    }
+    unavailable_number_meta: dict[str, Any] = {
+        "enabled": unavailable_number_test_enabled,
+        "number_filter": "unavailable" if unavailable_number_test_enabled else "",
+        "candidate_phone_count": 0,
+        "candidate_test_count": 0,
+        "uncovered_phone_count": 0,
+        "fixed_snapshot": unavailable_number_test_enabled,
         "sms_probe_only": prefix_sms_probe_only,
     }
     prefix_bind_available_records: list[Any] = []
@@ -4496,35 +4594,119 @@ def enqueue_phone_binding_test_task(
         if not requested_prefixes:
             raise HTTPException(400, "限定号段绑定需要至少选择一个号段")
         pool_repo = PhonePoolRepository()
-        prefix_bind_available_records = pool_repo.list_available_by_prefixes(requested_prefixes)
-        available_phone_count = len(prefix_bind_available_records)
-        available_slot_count = (
-            sum(max(int(getattr(record, "remaining_capacity", 0) or 0), 0) for record in prefix_bind_available_records)
-            if reuse_phone_until_unusable
-            else available_phone_count
-        )
-        prefix_bind_meta = {
+        if phone_number_filter == "available":
+            prefix_bind_available_records = pool_repo.list_available_by_prefixes(requested_prefixes)
+            available_phone_count = len(prefix_bind_available_records)
+            available_slot_count = (
+                sum(max(int(getattr(record, "remaining_capacity", 0) or 0), 0) for record in prefix_bind_available_records)
+                if reuse_phone_until_unusable
+                else available_phone_count
+            )
+            prefix_bind_meta = {
+                "enabled": True,
+                "selected_prefixes": requested_prefixes,
+                "prefix_count": len(requested_prefixes),
+                "number_filter": phone_number_filter,
+                "available_phone_count": available_phone_count,
+                "available_slot_count": available_slot_count,
+                "candidate_phone_count": available_phone_count,
+                "candidate_test_count": min(len(account_items), available_slot_count),
+                "uncovered_phone_count": max(available_phone_count - min(len(account_items), available_phone_count), 0),
+                "fixed_snapshot": False,
+                "reuse_phone_until_unusable": reuse_phone_until_unusable,
+                "sms_probe_only": prefix_sms_probe_only,
+            }
+            phone_items = []
+            phone_count = available_phone_count
+            if account_items and available_phone_count <= 0:
+                raise HTTPException(
+                    400,
+                    f"指定号段没有可用绑定号码：{','.join(requested_prefixes)}。"
+                    "请确认这些号段存在自身 active、未冷却、未绑满且带 API 的手机号。",
+                )
+            if account_items and available_slot_count < len(account_items):
+                raise HTTPException(
+                    400,
+                    f"指定号段容量不足：{','.join(requested_prefixes)}，"
+                    f"需要 {len(account_items)}，当前可用 {available_slot_count}。",
+                )
+        else:
+            selected_records = pool_repo.list_by_prefixes(
+                requested_prefixes,
+                number_filter=phone_number_filter,
+            )
+            try:
+                phone_items = [
+                    _resolve_phone_binding_item_api(item)
+                    for item in pool_repo.to_phone_items(selected_records)
+                ]
+            except Exception as exc:
+                from services.chatgpt_core.phone_api_forwarding import PhoneApiForwardError
+
+                if isinstance(exc, PhoneApiForwardError):
+                    status_code = 409 if getattr(exc, "code", "") == "route_conflict" else 503
+                    raise HTTPException(status_code, f"手机号 API 转发准备失败: {exc}") from exc
+                raise
+            for item in phone_items:
+                item["prefix_bind"] = True
+                item["phone_number_filter"] = phone_number_filter
+            phone_count = len(phone_items)
+            available_phone_count = sum(1 for record in selected_records if getattr(record, "available", False))
+            prefix_bind_meta = {
+                "enabled": True,
+                "selected_prefixes": requested_prefixes,
+                "prefix_count": len(requested_prefixes),
+                "number_filter": phone_number_filter,
+                "available_phone_count": available_phone_count,
+                "available_slot_count": phone_count,
+                "candidate_phone_count": phone_count,
+                "candidate_test_count": min(len(account_items), phone_count),
+                "uncovered_phone_count": max(phone_count - len(account_items), 0),
+                "fixed_snapshot": True,
+                "reuse_phone_until_unusable": False,
+                "sms_probe_only": prefix_sms_probe_only,
+            }
+            if account_items and phone_count <= 0:
+                state_label = "不可用" if phone_number_filter == "unavailable" else "可用或不可用"
+                raise HTTPException(
+                    400,
+                    f"所选号段没有可测试的{state_label}号码：{','.join(requested_prefixes)}。"
+                    "请确认号码存在且带有收码 API。",
+                )
+    elif unavailable_number_test_enabled:
+        from services.chatgpt_core.phone_pool_repository import PhonePoolRepository
+
+        pool_repo = PhonePoolRepository()
+        selected_records = pool_repo.list_unavailable_numbers()
+        try:
+            phone_items = [
+                _resolve_phone_binding_item_api(item)
+                for item in pool_repo.to_phone_items(selected_records)
+            ]
+        except Exception as exc:
+            from services.chatgpt_core.phone_api_forwarding import PhoneApiForwardError
+
+            if isinstance(exc, PhoneApiForwardError):
+                status_code = 409 if getattr(exc, "code", "") == "route_conflict" else 503
+                raise HTTPException(status_code, f"手机号 API 转发准备失败: {exc}") from exc
+            raise
+        for item in phone_items:
+            item["unavailable_number_test"] = True
+            item["phone_number_filter"] = "unavailable"
+        phone_count = len(phone_items)
+        unavailable_number_meta = {
             "enabled": True,
-            "selected_prefixes": requested_prefixes,
-            "prefix_count": len(requested_prefixes),
-            "available_phone_count": available_phone_count,
-            "available_slot_count": available_slot_count,
-            "reuse_phone_until_unusable": reuse_phone_until_unusable,
+            "number_filter": "unavailable",
+            "candidate_phone_count": phone_count,
+            "candidate_test_count": min(len(account_items), phone_count),
+            "uncovered_phone_count": max(phone_count - len(account_items), 0),
+            "fixed_snapshot": True,
             "sms_probe_only": prefix_sms_probe_only,
         }
-        phone_items = []
-        phone_count = available_phone_count
-        if account_items and available_phone_count <= 0:
+        if account_items and phone_count <= 0:
             raise HTTPException(
                 400,
-                f"指定号段没有可用绑定号码：{','.join(requested_prefixes)}。"
-                "请确认这些号段存在自身 active、未冷却、未绑满且带 API 的手机号。",
-            )
-        if account_items and available_slot_count < len(account_items):
-            raise HTTPException(
-                400,
-                f"指定号段容量不足：{','.join(requested_prefixes)}，"
-                f"需要 {len(account_items)}，当前可用 {available_slot_count}。",
+                "手机号池没有可复测的不可用号码（需要 status=cannot_send 且带收码 API）。",
             )
     elif use_pool:
         from services.chatgpt_core.phone_pool_repository import PhonePoolRepository
@@ -4551,11 +4733,21 @@ def enqueue_phone_binding_test_task(
             "matched_accounts": len(matched_accounts),
             "eligible_accounts": 0,
             "phone_count": phone_count,
+            "phone_pool_mode": "manual" if manual_phone_lines else resolved_pool_mode,
+            "phone_number_filter": phone_number_filter,
             "requested_concurrency": requested_concurrency_preview,
             "effective_concurrency": 0,
             "phone_pool_import": dict(phone_pool_import_summary),
             "prefix_sample": dict(prefix_sample_meta),
             "prefix_bind": dict(prefix_bind_meta),
+            "unavailable_numbers": dict(unavailable_number_meta),
+            "phone_selection": {
+                "mode": "manual" if manual_phone_lines else resolved_pool_mode,
+                "number_filter": phone_number_filter,
+                "selected_prefixes": list(requested_prefixes),
+                "candidate_phone_count": phone_count,
+                "fixed_snapshot": bool(not use_pool),
+            },
             "sms_probe_only": prefix_sms_probe_only,
             "parse_errors": safe_parse_errors,
             "missing_ids": missing_ids,
@@ -4592,6 +4784,10 @@ def enqueue_phone_binding_test_task(
         "concurrency_forced_serial_reason": concurrency_forced_serial_reason,
         "reuse_phone_until_unusable": reuse_phone_until_unusable,
         "use_pool": use_pool,
+        "phone_pool_mode": "manual" if manual_phone_lines else resolved_pool_mode,
+        "phone_number_filter": phone_number_filter,
+        "prefix_number_filter": phone_number_filter if prefix_bind_enabled else "",
+        "unavailable_number_test_enabled": unavailable_number_test_enabled,
         "prefix_sample_enabled": prefix_sample_enabled,
         "prefix_bind_enabled": prefix_bind_enabled,
         "prefix_sample_size": prefix_sample_size,
@@ -4634,11 +4830,21 @@ def enqueue_phone_binding_test_task(
         "emails": [str(item["email"] or "") for item in account_items],
         "phone_count": phone_count,
         "phone_items": safe_phone_items,
+        "phone_pool_mode": "manual" if manual_phone_lines else resolved_pool_mode,
+        "phone_number_filter": phone_number_filter,
         "phone_pool_dynamic": use_pool,
         "phone_pool_source": pool_source,
         "phone_pool_import": dict(phone_pool_import_summary),
         "prefix_sample": dict(prefix_sample_meta),
         "prefix_bind": dict(prefix_bind_meta),
+        "unavailable_numbers": dict(unavailable_number_meta),
+        "phone_selection": {
+            "mode": "manual" if manual_phone_lines else resolved_pool_mode,
+            "number_filter": phone_number_filter,
+            "selected_prefixes": list(requested_prefixes),
+            "candidate_phone_count": phone_count,
+            "fixed_snapshot": bool(not use_pool),
+        },
         "sms_probe_only": prefix_sms_probe_only,
         "prefix_summary": _build_phone_prefix_sample_summary(phone_items, []),
         "parse_errors": safe_parse_errors,
@@ -4657,7 +4863,12 @@ def enqueue_phone_binding_test_task(
         task_id,
         platform="chatgpt",
         source=source,
-        total=max(len(account_items) if (use_pool or effective_concurrency > 1) else len(phone_items), 1),
+        total=max(
+            len(account_items)
+            if use_pool
+            else min(len(account_items), len(phone_items)),
+            1,
+        ),
         meta=meta,
     )
 
@@ -4703,9 +4914,14 @@ def enqueue_phone_binding_test_task(
         "requested_concurrency": requested_concurrency,
         "effective_concurrency": effective_concurrency,
         "concurrency_forced_serial_reason": concurrency_forced_serial_reason,
+        "phone_pool_mode": "manual" if manual_phone_lines else resolved_pool_mode,
+        "phone_number_filter": phone_number_filter,
+        "phone_pool_dynamic": use_pool,
         "phone_pool_import": dict(phone_pool_import_summary),
         "prefix_sample": dict(prefix_sample_meta),
         "prefix_bind": dict(prefix_bind_meta),
+        "unavailable_numbers": dict(unavailable_number_meta),
+        "phone_selection": dict(meta["phone_selection"]),
         "sms_probe_only": prefix_sms_probe_only,
         "parse_errors": safe_parse_errors,
         "missing_ids": missing_ids,
@@ -12561,10 +12777,26 @@ def _run_phone_binding_test_concurrent(
     account_interval_seconds = max(_parse_positive_int(settings.get("account_interval_seconds"), 60), 0)
     prefix_bind_enabled = _is_truthy(settings.get("prefix_bind_enabled"))
     prefix_sample_enabled = _is_truthy(settings.get("prefix_sample_enabled"))
+    runtime_pool_mode = _normalize_phone_binding_pool_mode(
+        settings.get("phone_pool_mode"),
+        prefix_bind_enabled=prefix_bind_enabled,
+        prefix_sample_enabled=prefix_sample_enabled,
+        unavailable_number_test_enabled=_is_truthy(settings.get("unavailable_number_test_enabled")),
+    )
+    unavailable_number_test_enabled = runtime_pool_mode == "unavailable_numbers"
+    phone_number_filter = _normalize_phone_binding_number_filter(
+        settings.get("prefix_number_filter") or settings.get("phone_number_filter")
+    )
+    if unavailable_number_test_enabled:
+        phone_number_filter = "unavailable"
+    elif not prefix_bind_enabled:
+        phone_number_filter = "available"
     prefix_sample_filter = str(settings.get("prefix_sample_filter") or "all").strip().lower()
     if prefix_sample_filter not in {"all", "available", "rejected"}:
         prefix_sample_filter = "all"
     prefix_sms_probe_only = _is_truthy(settings.get("prefix_sms_probe_only"))
+    if unavailable_number_test_enabled or (prefix_bind_enabled and phone_number_filter != "available"):
+        use_pool = False
     selected_prefixes = [
         str(prefix or "").strip()
         for prefix in (settings.get("selected_prefixes") or [])
@@ -13325,9 +13557,19 @@ def _run_phone_binding_test_concurrent(
         if prefix_sms_probe_only:
             _log(task_id, "[手机号绑定][配置] 短信探测模式已开启｜验证=OpenAI发码+收码API收码｜提交验证码=否｜完成绑定=否")
         if prefix_bind_enabled:
-            _log(task_id, f"[手机号绑定][限定号段] 已开启｜号段={','.join(selected_prefixes) or '-'}｜并发取号=任务内互斥")
+            _log(
+                task_id,
+                f"[手机号绑定][限定号段] 已开启｜号段={','.join(selected_prefixes) or '-'}"
+                f"｜号码范围={phone_number_filter}｜并发取号=任务内互斥",
+            )
         if prefix_sample_enabled:
             _log(task_id, f"[手机号绑定][号段抽样] 已开启｜范围={prefix_sample_filter}｜选中号码={len(phone_items)}｜并发取号=任务内互斥")
+        if unavailable_number_test_enabled:
+            _log(
+                task_id,
+                f"[手机号绑定][不可用号码复测] 已开启｜选中号码={len(phone_items)}"
+                "｜每个号码只测试一次",
+            )
 
         next_account_index = 0
         in_flight: dict[Any, tuple[int, int]] = {}
@@ -13733,7 +13975,7 @@ def _run_phone_binding_test(
         )
 
     use_pool = _is_truthy(settings.get("use_pool"))
-    total = max(len(account_ids) if use_pool else len(phone_items), 1)
+    total = max(len(account_ids) if use_pool else min(len(account_ids), len(phone_items)), 1)
     success_count = 0
     skipped_count = 0
     errors: list[str] = []
@@ -13749,13 +13991,34 @@ def _run_phone_binding_test(
     reuse_phone_until_unusable = _is_truthy(settings.get("reuse_phone_until_unusable"))
     prefix_bind_enabled = _is_truthy(settings.get("prefix_bind_enabled"))
     prefix_sample_enabled = _is_truthy(settings.get("prefix_sample_enabled"))
+    runtime_pool_mode = _normalize_phone_binding_pool_mode(
+        settings.get("phone_pool_mode"),
+        prefix_bind_enabled=prefix_bind_enabled,
+        prefix_sample_enabled=prefix_sample_enabled,
+        unavailable_number_test_enabled=_is_truthy(settings.get("unavailable_number_test_enabled")),
+    )
+    unavailable_number_test_enabled = runtime_pool_mode == "unavailable_numbers"
+    phone_number_filter = _normalize_phone_binding_number_filter(
+        settings.get("prefix_number_filter") or settings.get("phone_number_filter")
+    )
+    if unavailable_number_test_enabled:
+        phone_number_filter = "unavailable"
+    elif not prefix_bind_enabled:
+        phone_number_filter = "available"
     prefix_sample_size = 2 if int(settings.get("prefix_sample_size") or 1) == 2 else 1
     prefix_sample_filter = str(settings.get("prefix_sample_filter") or "all").strip().lower()
     if prefix_sample_filter not in {"all", "available", "rejected"}:
         prefix_sample_filter = "all"
     prefix_sms_probe_only = _is_truthy(settings.get("prefix_sms_probe_only"))
-    if prefix_sample_enabled or prefix_sms_probe_only:
+    if (
+        prefix_sample_enabled
+        or prefix_sms_probe_only
+        or unavailable_number_test_enabled
+        or (prefix_bind_enabled and phone_number_filter != "available")
+    ):
         reuse_phone_until_unusable = False
+    if unavailable_number_test_enabled or (prefix_bind_enabled and phone_number_filter != "available"):
+        use_pool = False
     selected_prefixes = [
         str(prefix or "").strip()
         for prefix in (settings.get("selected_prefixes") or [])
@@ -14169,11 +14432,18 @@ def _run_phone_binding_test(
         if prefix_bind_enabled:
             prefix_bind_meta = meta.get("prefix_bind") if isinstance(meta.get("prefix_bind"), dict) else {}
             slot_count = int((prefix_bind_meta or {}).get("available_slot_count") or 0)
-            phone_count = int((prefix_bind_meta or {}).get("available_phone_count") or 0)
+            phone_count = int((prefix_bind_meta or {}).get("candidate_phone_count") or (prefix_bind_meta or {}).get("available_phone_count") or 0)
             _log(
                 task_id,
                 f"[手机号绑定][限定号段] 已开启｜号段={','.join(selected_prefixes) or '-'}"
-                f"｜可用号码={phone_count}｜可覆盖账号={slot_count}｜兜底其他号段=否",
+                f"｜号码范围={phone_number_filter}｜候选号码={phone_count}"
+                f"｜可覆盖账号={slot_count}｜兜底其他号段=否",
+            )
+        if unavailable_number_test_enabled:
+            _log(
+                task_id,
+                f"[手机号绑定][不可用号码复测] 已开启｜选中号码={len(phone_items)}"
+                "｜每个号码只测试一次",
             )
         phone_cursor = 0
         total_phones = len(phone_items)

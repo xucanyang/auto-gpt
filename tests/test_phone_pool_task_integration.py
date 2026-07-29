@@ -9,6 +9,7 @@ from api.tasks import (
     _phone_binding_error_status,
     _phone_binding_status_label,
     _phone_binding_prefix4,
+    _normalize_phone_binding_pool_mode,
     _build_phone_prefix_sample_summary,
     _run_phone_binding_test,
     _task_store,
@@ -992,6 +993,210 @@ class PhonePoolTaskIntegrationTests(unittest.TestCase):
 
         self.assertEqual(ctx.exception.status_code, 400)
         self.assertIn("指定号段容量不足", str(ctx.exception.detail))
+
+    def test_prefix_limited_unavailable_filter_uses_fixed_snapshot(self):
+        created_meta = {}
+        created_total = []
+        calls = []
+
+        class _BackgroundTasks:
+            def __init__(self):
+                self.calls = []
+
+            def add_task(self, *args, **kwargs):
+                self.calls.append((args, kwargs))
+
+        class _Record:
+            def __init__(self, record_id, phone, *, available=False):
+                self.id = record_id
+                self.phone_e164 = phone
+                self.api_url = f"https://relay.example.com/{record_id}"
+                self.remaining_capacity = 3
+                self.available = available
+
+        selected_records = [
+            _Record(41, "+13430000041"),
+            _Record(42, "+13430000042"),
+            _Record(43, "+13430000043"),
+        ]
+
+        class _FakeRepo:
+            def list_by_prefixes(self, prefixes, *, number_filter):
+                calls.append((prefixes, number_filter))
+                return selected_records
+
+            def to_phone_items(self, records):
+                return [
+                    {
+                        "id": record.id,
+                        "pool_id": record.id,
+                        "line_no": index,
+                        "phone": record.phone_e164,
+                        "api_url": record.api_url,
+                        "raw_line": f"{record.phone_e164}----{record.api_url}",
+                        "pool_managed": True,
+                        "prefix4": record.phone_e164.lstrip("+")[:4],
+                    }
+                    for index, record in enumerate(records, start=1)
+                ]
+
+        def _fake_create_task(_task_id, *, platform, source, total, meta):
+            created_total.append(total)
+            created_meta.update(meta)
+
+        req = PhoneBindingTestTaskRequest(
+            account_ids=[123, 124],
+            use_pool=True,
+            phone_pool_mode="prefix_limited",
+            phone_number_filter="unavailable",
+            prefix_number_filter="unavailable",
+            selected_prefixes=["1343"],
+            reuse_phone_until_unusable=True,
+            concurrency=3,
+        )
+        background_tasks = _BackgroundTasks()
+
+        with (
+            patch(
+                "api.tasks._resolve_phone_binding_test_accounts",
+                return_value=(
+                    [
+                        {"account_id": 123, "email": "one@example.com", "status": "pending_payment"},
+                        {"account_id": 124, "email": "two@example.com", "status": "pending_payment"},
+                    ],
+                    [],
+                    [],
+                    [],
+                ),
+            ),
+            patch("services.chatgpt_core.phone_pool_repository.PhonePoolRepository", _FakeRepo),
+            patch("api.tasks._create_standalone_task_record", side_effect=_fake_create_task),
+            patch("api.tasks._save_task_log"),
+        ):
+            result = enqueue_phone_binding_test_task(req, background_tasks=background_tasks)
+
+        self.assertEqual(calls, [(["1343"], "unavailable")])
+        self.assertEqual(result["phone_pool_mode"], "prefix_limited")
+        self.assertEqual(result["phone_number_filter"], "unavailable")
+        self.assertEqual(result["phone_count"], 3)
+        self.assertTrue(result["prefix_bind"]["fixed_snapshot"])
+        self.assertEqual(result["prefix_bind"]["candidate_test_count"], 2)
+        self.assertEqual(result["prefix_bind"]["uncovered_phone_count"], 1)
+        self.assertFalse(created_meta["phone_pool_dynamic"])
+        self.assertFalse(created_meta["settings"]["use_pool"])
+        self.assertFalse(created_meta["settings"]["reuse_phone_until_unusable"])
+        self.assertEqual(created_meta["phone_selection"]["number_filter"], "unavailable")
+        self.assertTrue(created_meta["phone_selection"]["fixed_snapshot"])
+        self.assertEqual(created_total, [2])
+        self.assertEqual(len(background_tasks.calls[0][0][3]), 3)
+
+    def test_unavailable_numbers_mode_snapshots_every_candidate_before_account_limit(self):
+        created_meta = {}
+        created_total = []
+        calls = {"unavailable": 0}
+
+        class _BackgroundTasks:
+            def __init__(self):
+                self.calls = []
+
+            def add_task(self, *args, **kwargs):
+                self.calls.append((args, kwargs))
+
+        class _Record:
+            def __init__(self, record_id, phone):
+                self.id = record_id
+                self.phone_e164 = phone
+                self.api_url = f"https://relay.example.com/{record_id}"
+                self.remaining_capacity = 3
+                self.available = False
+
+        selected_records = [
+            _Record(51, "+12260000051"),
+            _Record(52, "+13430000052"),
+            _Record(53, "+14160000053"),
+        ]
+
+        class _FakeRepo:
+            def list_unavailable_numbers(self):
+                calls["unavailable"] += 1
+                return selected_records
+
+            def to_phone_items(self, records):
+                return [
+                    {
+                        "id": record.id,
+                        "pool_id": record.id,
+                        "line_no": index,
+                        "phone": record.phone_e164,
+                        "api_url": record.api_url,
+                        "raw_line": f"{record.phone_e164}----{record.api_url}",
+                        "pool_managed": True,
+                        "prefix4": record.phone_e164.lstrip("+")[:4],
+                    }
+                    for index, record in enumerate(records, start=1)
+                ]
+
+        def _fake_create_task(_task_id, *, platform, source, total, meta):
+            created_total.append(total)
+            created_meta.update(meta)
+
+        req = PhoneBindingTestTaskRequest(
+            account_ids=[123, 124],
+            use_pool=True,
+            phone_pool_mode="unavailable_numbers",
+            unavailable_number_test_enabled=True,
+            reuse_phone_until_unusable=True,
+        )
+        background_tasks = _BackgroundTasks()
+
+        with (
+            patch(
+                "api.tasks._resolve_phone_binding_test_accounts",
+                return_value=(
+                    [
+                        {"account_id": 123, "email": "one@example.com", "status": "pending_payment"},
+                        {"account_id": 124, "email": "two@example.com", "status": "pending_payment"},
+                    ],
+                    [],
+                    [],
+                    [],
+                ),
+            ),
+            patch("services.chatgpt_core.phone_pool_repository.PhonePoolRepository", _FakeRepo),
+            patch("api.tasks._create_standalone_task_record", side_effect=_fake_create_task),
+            patch("api.tasks._save_task_log"),
+        ):
+            result = enqueue_phone_binding_test_task(req, background_tasks=background_tasks)
+
+        self.assertEqual(calls, {"unavailable": 1})
+        self.assertEqual(result["phone_pool_mode"], "unavailable_numbers")
+        self.assertEqual(result["phone_number_filter"], "unavailable")
+        self.assertEqual(result["phone_count"], 3)
+        self.assertEqual(result["unavailable_numbers"]["candidate_test_count"], 2)
+        self.assertEqual(result["unavailable_numbers"]["uncovered_phone_count"], 1)
+        self.assertTrue(created_meta["unavailable_numbers"]["fixed_snapshot"])
+        self.assertFalse(created_meta["phone_pool_dynamic"])
+        self.assertFalse(created_meta["settings"]["use_pool"])
+        self.assertFalse(created_meta["settings"]["reuse_phone_until_unusable"])
+        self.assertEqual(created_meta["phone_selection"]["candidate_phone_count"], 3)
+        self.assertTrue(created_meta["phone_selection"]["fixed_snapshot"])
+        self.assertEqual(created_total, [2])
+        self.assertEqual(len(background_tasks.calls[0][0][3]), 3)
+
+    def test_legacy_phone_pool_flags_keep_the_existing_precedence(self):
+        self.assertEqual(
+            _normalize_phone_binding_pool_mode(
+                "",
+                prefix_bind_enabled=True,
+                prefix_sample_enabled=True,
+                unavailable_number_test_enabled=True,
+            ),
+            "prefix_limited",
+        )
+        self.assertEqual(
+            _normalize_phone_binding_pool_mode("", unavailable_number_test_enabled=True),
+            "unavailable_numbers",
+        )
 
     def test_prefix_sample_runner_accepts_filter_setting(self):
         task_id = "task-prefix-sample-filter-runner"

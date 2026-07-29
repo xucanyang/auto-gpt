@@ -22,6 +22,10 @@ STATUS_COOLDOWN = "cooldown"
 STATUS_EXHAUSTED = "exhausted"
 STATUS_DISABLED = "disabled"
 
+PHONE_NUMBER_FILTER_AVAILABLE = "available"
+PHONE_NUMBER_FILTER_UNAVAILABLE = "unavailable"
+PHONE_NUMBER_FILTER_ALL = "all"
+
 # Phone-rate limits are transient.  Keep the duration aligned with the
 # account-level rate-limit recovery policy instead of leaving a phone blocked
 # indefinitely after its cooldown timestamp passes.
@@ -116,6 +120,24 @@ def _phone_effective_digits(value: str) -> str:
 def _phone_prefix4(value: str) -> str:
     digits = _phone_effective_digits(value)
     return digits[:4] if len(digits) >= 4 else ""
+
+
+def normalize_phone_number_filter(value: Any) -> str:
+    """Normalize the row-level candidate filter used by binding tasks."""
+    normalized = str(value or "").strip().lower()
+    if normalized in {"available", "available_only", "healthy", "healthy_only"}:
+        return PHONE_NUMBER_FILTER_AVAILABLE
+    if normalized in {
+        "unavailable",
+        "unavailable_only",
+        "rejected",
+        "rejected_only",
+        "cannot_send",
+    }:
+        return PHONE_NUMBER_FILTER_UNAVAILABLE
+    if normalized in {"all", "all_testable", "testable", "mixed"}:
+        return PHONE_NUMBER_FILTER_ALL
+    return PHONE_NUMBER_FILTER_AVAILABLE
 
 
 def _temporary_status_recover_at(model: PhonePoolModel) -> datetime | None:
@@ -1081,66 +1103,79 @@ class PhonePoolRepository:
             session.commit()
             return True
 
-    def list_available(self) -> list[PhonePoolRecord]:
-        """返回当前号码自身可用的普通绑定候选。"""
-        self.recover_expired_temporary_statuses()
-        now = _utcnow()
-        with Session(engine) as session:
-            candidates = session.exec(
-                select(PhonePoolModel)
-                .where(PhonePoolModel.status == STATUS_ACTIVE)
-                .where(PhonePoolModel.bound_count < PhonePoolModel.max_accounts)
-                .order_by(PhonePoolModel.last_used_at, PhonePoolModel.id)
-            ).all()
-        items: list[PhonePoolRecord] = []
-        for model in candidates:
-            rec = _to_record(model)
-            if not rec.api_url:
-                continue
-            cooldown = _parse_time(rec.cooldown_until)
-            if cooldown and cooldown > now:
-                continue
-            if rec.remaining_capacity <= 0:
-                continue
-            items.append(rec)
-        return items
-
-    def list_available_by_prefixes(self, prefixes: list[str]) -> list[PhonePoolRecord]:
-        """返回指定号段内号码自身可用的绑定候选。
-
-        号段状态只用于展示相关性；限定模式仍逐号要求 active、未冷却、
-        未绑满且带 API，不会因为同段其他号码成功或失败而改变候选资格。
-        """
+    @staticmethod
+    def _normalize_selected_prefixes(prefixes: list[str] | None) -> set[str]:
         selected = {
             "".join(ch for ch in str(prefix or "") if ch.isdigit())[:4]
             for prefix in prefixes or []
         }
-        selected = {prefix for prefix in selected if len(prefix) == 4}
-        if not selected:
+        return {prefix for prefix in selected if len(prefix) == 4}
+
+    @staticmethod
+    def _matches_number_filter(record: PhonePoolRecord, number_filter: str) -> bool:
+        """Apply row-level state filtering without using prefix health as a gate."""
+        if not str(record.api_url or "").strip():
+            return False
+        if record.status in {STATUS_DISABLED, STATUS_EXHAUSTED}:
+            return False
+        if number_filter == PHONE_NUMBER_FILTER_UNAVAILABLE:
+            return record.status == STATUS_CANNOT_SEND
+        if number_filter == PHONE_NUMBER_FILTER_ALL:
+            return record.available or record.status == STATUS_CANNOT_SEND
+        return record.available
+
+    def list_by_number_filter(
+        self,
+        number_filter: str = PHONE_NUMBER_FILTER_AVAILABLE,
+        *,
+        prefixes: list[str] | None = None,
+    ) -> list[PhonePoolRecord]:
+        """Return row-level candidates for a binding/test task.
+
+        ``prefixes`` is an optional scope filter.  Prefix health never decides
+        eligibility; the selected number filter is applied to each row.
+        """
+        normalized_filter = normalize_phone_number_filter(number_filter)
+        selected = self._normalize_selected_prefixes(prefixes)
+        if prefixes is not None and not selected:
             return []
-        self.recover_expired_temporary_statuses()
-        now = _utcnow()
-        with Session(engine) as session:
-            candidates = session.exec(
-                select(PhonePoolModel)
-                .where(PhonePoolModel.status == STATUS_ACTIVE)
-                .where(PhonePoolModel.bound_count < PhonePoolModel.max_accounts)
-                .order_by(PhonePoolModel.last_used_at, PhonePoolModel.id)
-            ).all()
+        records = self.list()
         items: list[PhonePoolRecord] = []
-        for model in candidates:
-            rec = _to_record(model)
-            if _phone_prefix4(rec.phone_e164) not in selected:
+        for record in records:
+            if selected and _phone_prefix4(record.phone_e164) not in selected:
                 continue
-            if not rec.api_url:
+            if not self._matches_number_filter(record, normalized_filter):
                 continue
-            cooldown = _parse_time(rec.cooldown_until)
-            if cooldown and cooldown > now:
-                continue
-            if rec.remaining_capacity <= 0:
-                continue
-            items.append(rec)
+            items.append(record)
+        items.sort(
+            key=lambda record: (
+                0 if not str(record.last_used_at or "").strip() else 1,
+                str(record.last_used_at or ""),
+                int(record.id or 0),
+            )
+        )
         return items
+
+    def list_available(self) -> list[PhonePoolRecord]:
+        """返回当前号码自身可用的普通绑定候选。"""
+        return self.list_by_number_filter(PHONE_NUMBER_FILTER_AVAILABLE)
+
+    def list_available_by_prefixes(self, prefixes: list[str]) -> list[PhonePoolRecord]:
+        """返回指定号段内全部号码自身可用的绑定候选。"""
+        return self.list_by_number_filter(PHONE_NUMBER_FILTER_AVAILABLE, prefixes=prefixes)
+
+    def list_by_prefixes(
+        self,
+        prefixes: list[str],
+        *,
+        number_filter: str = PHONE_NUMBER_FILTER_AVAILABLE,
+    ) -> list[PhonePoolRecord]:
+        """Return all matching rows in selected prefixes for a fixed snapshot."""
+        return self.list_by_number_filter(number_filter, prefixes=prefixes)
+
+    def list_unavailable_numbers(self) -> list[PhonePoolRecord]:
+        """Return every API-backed ``cannot_send`` number for full retesting."""
+        return self.list_by_number_filter(PHONE_NUMBER_FILTER_UNAVAILABLE)
 
     def pick_available(self, account_count: int) -> list[PhonePoolRecord]:
         """兼容旧调用：按剩余容量取足够覆盖 account_count 的号码记录。"""

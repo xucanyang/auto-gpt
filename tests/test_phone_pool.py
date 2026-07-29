@@ -691,6 +691,35 @@ bad-line
         self.assertNotIn(other.phone_e164, [item.phone_e164 for item in items])
         self.assertNotIn(exhausted.phone_e164, [item.phone_e164 for item in items])
 
+    def test_list_by_prefixes_uses_row_status_for_available_unavailable_and_all(self):
+        repo = PhonePoolRepository()
+        available = repo.add(phone="+13430000001", api_url="https://relay.example.com/available")
+        unavailable = repo.add(phone="+13430000002", api_url="https://relay.example.com/unavailable")
+        other_prefix = repo.add(phone="+14160000001", api_url="https://relay.example.com/other")
+        rate_limited = repo.add(phone="+13430000003", api_url="https://relay.example.com/rate-limited")
+        exhausted = repo.add(phone="+13430000004", api_url="https://relay.example.com/exhausted")
+
+        repo.record_task_status(unavailable.phone_e164, "openai_rejected", reason="OpenAI 拒绝")
+        repo.record_task_status(rate_limited.phone_e164, "rate_limited", reason="429")
+        for _ in range(3):
+            repo.record_success(exhausted.phone_e164)
+
+        available_items = repo.list_by_prefixes(["1343"], number_filter="available")
+        unavailable_items = repo.list_by_prefixes(["1343"], number_filter="unavailable")
+        all_items = repo.list_by_prefixes(["1343"], number_filter="all")
+        full_unavailable = repo.list_unavailable_numbers()
+
+        self.assertEqual([item.phone_e164 for item in available_items], [available.phone_e164])
+        self.assertEqual([item.phone_e164 for item in unavailable_items], [unavailable.phone_e164])
+        self.assertEqual(
+            {item.phone_e164 for item in all_items},
+            {available.phone_e164, unavailable.phone_e164},
+        )
+        self.assertEqual([item.phone_e164 for item in full_unavailable], [unavailable.phone_e164])
+        self.assertNotIn(other_prefix.phone_e164, [item.phone_e164 for item in all_items])
+        self.assertNotIn(rate_limited.phone_e164, [item.phone_e164 for item in all_items])
+        self.assertNotIn(exhausted.phone_e164, [item.phone_e164 for item in all_items])
+
     def test_sms_probe_success_restores_phone_and_prefix_availability(self):
         repo = PhonePoolRepository()
         phone = repo.add(phone="+13430000001", api_url="https://relay.example.com/probe")

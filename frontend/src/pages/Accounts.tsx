@@ -196,7 +196,8 @@ const ACCOUNT_TOOLBAR_ACTION_OPTIONS: Array<{ value: AccountToolbarActionId; tex
   { value: 'gopay', text: '批量 GoPay' },
 ]
 
-type PhonePoolMode = 'normal' | 'prefix_limited' | 'prefix_sample'
+type PhonePoolMode = 'normal' | 'prefix_limited' | 'prefix_sample' | 'unavailable_numbers'
+type PhoneNumberFilter = 'available' | 'unavailable' | 'all'
 type PhonePoolPrefixStatus = 'available' | 'partial' | 'unavailable' | 'temporary' | 'exhausted'
 type PhonePoolPrefixItem = {
   prefix: string
@@ -205,6 +206,7 @@ type PhonePoolPrefixItem = {
   available_count?: number
   remaining_capacity?: number
   rejected_count?: number
+  cannot_send_count?: number
   bind_limit_count?: number
   [key: string]: unknown
 }
@@ -225,6 +227,9 @@ function loadAccountsPageSize() {
 const DEFAULT_PHONE_BINDING_SETTINGS = {
   use_pool: true,
   phone_pool_mode: 'normal' as PhonePoolMode,
+  phone_number_filter: 'available' as PhoneNumberFilter,
+  prefix_number_filter: 'available' as PhoneNumberFilter,
+  unavailable_number_test_enabled: false,
   selected_prefixes: [] as string[],
   prefix_sample_enabled: false,
   prefix_sample_size: 1,
@@ -1285,13 +1290,36 @@ function normalizeBaxiStatusPollInterval(value: unknown) {
 }
 
 function normalizePhonePoolMode(value: unknown, raw?: Record<string, unknown>): PhonePoolMode {
-  const mode = String(value || '').trim()
-  if (mode === 'prefix_limited' || mode === 'prefix_sample' || mode === 'normal') {
-    return mode
+  const mode = String(value || '').trim().toLowerCase()
+  const aliases: Record<string, PhonePoolMode> = {
+    default: 'normal',
+    prefix: 'prefix_limited',
+    limited_prefix: 'prefix_limited',
+    sample: 'prefix_sample',
+    unavailable: 'unavailable_numbers',
+    unavailable_all: 'unavailable_numbers',
+    unavailable_only: 'unavailable_numbers',
+    all_unavailable: 'unavailable_numbers',
+  }
+  const normalizedMode = aliases[mode] || mode
+  if (normalizedMode === 'prefix_limited' || normalizedMode === 'prefix_sample' || normalizedMode === 'normal' || normalizedMode === 'unavailable_numbers') {
+    return normalizedMode
   }
   if (raw && parseBooleanConfigValue(raw.prefix_bind_enabled)) return 'prefix_limited'
   if (raw && parseBooleanConfigValue(raw.prefix_sample_enabled)) return 'prefix_sample'
+  if (raw && parseBooleanConfigValue(raw.unavailable_number_test_enabled)) return 'unavailable_numbers'
   return 'normal'
+}
+
+function normalizePhoneNumberFilter(value: unknown): PhoneNumberFilter {
+  const filter = String(value || '').trim().toLowerCase()
+  if (filter === 'unavailable' || filter === 'unavailable_only' || filter === 'rejected' || filter === 'rejected_only' || filter === 'cannot_send') {
+    return 'unavailable'
+  }
+  if (filter === 'all' || filter === 'all_testable' || filter === 'testable' || filter === 'mixed') {
+    return 'all'
+  }
+  return 'available'
 }
 
 function normalizeSelectedPrefixes(value: unknown): string[] {
@@ -1321,7 +1349,7 @@ function normalizePhonePoolPrefixItem(raw: unknown, fallbackStatus: PhonePoolPre
     prefix,
     status: String(source.status || fallbackStatus),
   }
-  for (const key of ['total', 'available_count', 'remaining_capacity', 'rejected_count', 'bind_limit_count']) {
+  for (const key of ['total', 'available_count', 'remaining_capacity', 'rejected_count', 'cannot_send_count', 'bind_limit_count']) {
     const value = Number(source[key])
     if (Number.isFinite(value)) {
       item[key] = value
@@ -1346,10 +1374,22 @@ function uniquePhonePoolPrefixItems(values: unknown, fallbackStatus: PhonePoolPr
 function normalizePhoneBindingSettings(value: unknown): PhoneBindingSettings {
   const raw = value && typeof value === 'object' ? value as Record<string, unknown> : {}
   const phonePoolMode = normalizePhonePoolMode(raw.phone_pool_mode, raw)
-  const reusePhoneUntilUnusable = boolWithDefault(raw.reuse_phone_until_unusable, false)
+  const requestedPhoneNumberFilter = normalizePhoneNumberFilter(raw.prefix_number_filter || raw.phone_number_filter)
+  const phoneNumberFilter: PhoneNumberFilter = phonePoolMode === 'prefix_limited'
+    ? requestedPhoneNumberFilter
+    : phonePoolMode === 'unavailable_numbers'
+      ? 'unavailable'
+      : 'available'
+  const fixedSnapshotSelection = phonePoolMode === 'prefix_sample'
+    || phonePoolMode === 'unavailable_numbers'
+    || (phonePoolMode === 'prefix_limited' && phoneNumberFilter !== 'available')
+  const reusePhoneUntilUnusable = !fixedSnapshotSelection && boolWithDefault(raw.reuse_phone_until_unusable, false)
   return {
     use_pool: boolWithDefault(raw.use_pool, DEFAULT_PHONE_BINDING_SETTINGS.use_pool),
     phone_pool_mode: phonePoolMode,
+    phone_number_filter: phoneNumberFilter,
+    prefix_number_filter: phoneNumberFilter,
+    unavailable_number_test_enabled: phonePoolMode === 'unavailable_numbers',
     selected_prefixes: normalizeSelectedPrefixes(raw.selected_prefixes),
     prefix_sample_enabled: phonePoolMode === 'prefix_sample',
     prefix_sample_size: intWithDefault(raw.prefix_sample_size, DEFAULT_PHONE_BINDING_SETTINGS.prefix_sample_size, 1) === 2 ? 2 : 1,
@@ -2631,6 +2671,7 @@ export default function Accounts() {
   }, [teamProxyCountrySearch])
   const phoneBindingUsePoolValue = Form.useWatch('use_pool', phoneBindingTestForm)
   const phoneBindingPoolModeValue = Form.useWatch('phone_pool_mode', phoneBindingTestForm)
+  const phoneBindingNumberFilterValue = Form.useWatch('phone_number_filter', phoneBindingTestForm)
   const phoneBindingSelectedPrefixesValue = Form.useWatch('selected_prefixes', phoneBindingTestForm)
   const phoneBindingPrefixSampleSizeValue = Form.useWatch('prefix_sample_size', phoneBindingTestForm)
   const phoneBindingPrefixSampleFilterValue = Form.useWatch('prefix_sample_filter', phoneBindingTestForm)
@@ -4530,22 +4571,36 @@ export default function Accounts() {
     const values = await phoneBindingTestForm.validateFields()
     validateTaskProxySettings(values)
     const scope = (values.scope === 'filtered' ? 'filtered' : 'selected') as 'selected' | 'filtered'
-    const phoneLines = String(values.phone_lines || '').trim()
-    // 手动粘贴优先：避免默认“使用手机号池”开启时忽略用户粘贴的号码。
     const phonePoolMode = normalizePhonePoolMode(values.phone_pool_mode, values as Record<string, unknown>)
+    // 手动粘贴仅属于普通绑定；特殊模式固定从任务创建时的号池快照取号。
+    const phoneLines = phonePoolMode === 'normal' ? String(values.phone_lines || '').trim() : ''
     const selectedPrefixes = normalizeSelectedPrefixes(values.selected_prefixes)
     const prefixBindEnabled = !phoneLines && phonePoolMode === 'prefix_limited'
     const prefixSampleEnabled = !phoneLines && phonePoolMode === 'prefix_sample'
+    const unavailableNumberTestEnabled = !phoneLines && phonePoolMode === 'unavailable_numbers'
+    const requestedPhoneNumberFilter = normalizePhoneNumberFilter(values.prefix_number_filter || values.phone_number_filter)
+    const phoneNumberFilter: PhoneNumberFilter = prefixBindEnabled
+      ? requestedPhoneNumberFilter
+      : unavailableNumberTestEnabled
+        ? 'unavailable'
+        : 'available'
     const smsProbeOnly = Boolean(values.prefix_sms_probe_only || values.sms_probe_only)
     const rawPrefixSampleFilter = String(values.prefix_sample_filter || 'all')
     const prefixSampleFilter = rawPrefixSampleFilter === 'available' ? 'available' : rawPrefixSampleFilter === 'rejected' ? 'rejected' : 'all'
-    const usePool = !phoneLines && (Boolean(values.use_pool) || prefixBindEnabled || prefixSampleEnabled)
-    const reusePhoneUntilUnusable = prefixSampleEnabled || smsProbeOnly ? false : Boolean(values.reuse_phone_until_unusable)
+    const fixedSnapshotSelection = prefixSampleEnabled
+      || unavailableNumberTestEnabled
+      || (prefixBindEnabled && phoneNumberFilter !== 'available')
+    const usePool = !phoneLines && (Boolean(values.use_pool) || prefixBindEnabled || prefixSampleEnabled || unavailableNumberTestEnabled)
+    const reusePhoneUntilUnusable = fixedSnapshotSelection || smsProbeOnly ? false : Boolean(values.reuse_phone_until_unusable)
     const requestedConcurrency = Math.max(1, Math.min(5, Number(values.concurrency || 1) || 1))
     const effectiveConcurrency = reusePhoneUntilUnusable ? 1 : requestedConcurrency
     const normalizedValues = {
       ...values,
       phone_pool_mode: phonePoolMode,
+      phone_number_filter: phoneNumberFilter,
+      prefix_number_filter: phoneNumberFilter,
+      unavailable_number_test_enabled: unavailableNumberTestEnabled,
+      prefix_bind_enabled: prefixBindEnabled,
       selected_prefixes: selectedPrefixes,
       prefix_sample_enabled: prefixSampleEnabled,
       prefix_sms_probe_only: smsProbeOnly,
@@ -4565,6 +4620,10 @@ export default function Accounts() {
     const body: Record<string, unknown> = {
       phone_lines: phoneLines,
       use_pool: usePool,
+      phone_pool_mode: phonePoolMode,
+      phone_number_filter: phoneNumberFilter,
+      prefix_number_filter: phoneNumberFilter,
+      unavailable_number_test_enabled: unavailableNumberTestEnabled,
       prefix_bind_enabled: prefixBindEnabled,
       prefix_sample_enabled: prefixSampleEnabled,
       selected_prefixes: (prefixBindEnabled || prefixSampleEnabled) ? selectedPrefixes : [],
@@ -4598,7 +4657,8 @@ export default function Accounts() {
       const phoneCount = Number(res?.phone_count || 0)
       const prefixSample = res?.prefix_sample && typeof res.prefix_sample === 'object' ? res.prefix_sample : null
       const prefixBind = res?.prefix_bind && typeof res.prefix_bind === 'object' ? res.prefix_bind : null
-      const smsProbeOnly = Boolean(res?.sms_probe_only || prefixSample?.sms_probe_only || prefixBind?.sms_probe_only)
+      const unavailableNumbers = res?.unavailable_numbers && typeof res.unavailable_numbers === 'object' ? res.unavailable_numbers : null
+      const smsProbeOnly = Boolean(res?.sms_probe_only || prefixSample?.sms_probe_only || prefixBind?.sms_probe_only || unavailableNumbers?.sms_probe_only)
       const parseErrors = Array.isArray(res?.parse_errors) ? res.parse_errors : []
 
       if (!taskIdFromResponse) {
@@ -4623,10 +4683,12 @@ export default function Accounts() {
       void activeTasksQuery.refetch()
       message.success({
         content: prefixBind?.enabled
-          ? `限定号段绑定已启动：${Number(prefixBind.prefix_count || 0)} 个号段，${phoneCount} 个号码，${eligible} 个账号${smsProbeOnly ? '，仅测发码/收码' : ''}`
+          ? `限定号段绑定已启动：${Number(prefixBind.prefix_count || 0)} 个号段，${phoneCount} 个候选号码，预计测试 ${Number(prefixBind.candidate_test_count || Math.min(phoneCount, eligible))} 个${smsProbeOnly ? '，仅测发码/收码' : ''}`
           : prefixSample?.enabled
             ? `号段抽样已启动：${Array.isArray(prefixSample.requested_prefixes) && prefixSample.requested_prefixes.length > 0 ? '指定号段，' : String(prefixSample.filter || 'all') === 'rejected' ? '仅失败样本，' : ''}${Number(prefixSample.prefix_count || 0)} 个号段，${phoneCount} 个号码，${eligible} 个账号${smsProbeOnly ? '，仅测发码/收码' : ''}`
-            : `${smsProbeOnly ? '手机号发码/收码探测已启动' : '手机号绑定已启动'}：${phoneCount} 个号码，${eligible} 个账号${parseErrors.length > 0 ? `，解析跳过 ${parseErrors.length} 行` : ''}`,
+            : unavailableNumbers?.enabled
+              ? `不可用号码全量复测已启动：${phoneCount} 个固定候选，预计测试 ${Number(unavailableNumbers.candidate_test_count || Math.min(phoneCount, eligible))} 个${smsProbeOnly ? '，仅测发码/收码' : ''}`
+              : `${smsProbeOnly ? '手机号发码/收码探测已启动' : '手机号绑定已启动'}：${phoneCount} 个号码，${eligible} 个账号${parseErrors.length > 0 ? `，解析跳过 ${parseErrors.length} 行` : ''}`,
         key: toastKey,
       })
       if (parseErrors.length > 0) {
@@ -7953,7 +8015,17 @@ export default function Accounts() {
   const phoneBindingPoolMode = normalizePhonePoolMode(phoneBindingPoolModeValue)
   const phoneBindingPrefixBindEnabled = phoneBindingPoolMode === 'prefix_limited'
   const phoneBindingPrefixSampleEnabled = phoneBindingPoolMode === 'prefix_sample'
+  const phoneBindingUnavailableNumberTestEnabled = phoneBindingPoolMode === 'unavailable_numbers'
   const phoneBindingPrefixModeActive = phoneBindingPrefixBindEnabled || phoneBindingPrefixSampleEnabled
+  const phoneBindingPrefixNumberFilter = normalizePhoneNumberFilter(phoneBindingNumberFilterValue)
+  const phoneBindingPrefixNumberFilterLabel = phoneBindingPrefixNumberFilter === 'unavailable'
+    ? '不可用'
+    : phoneBindingPrefixNumberFilter === 'all'
+      ? '全部'
+      : '可用'
+  const phoneBindingFixedSnapshotSelection = phoneBindingPrefixSampleEnabled
+    || phoneBindingUnavailableNumberTestEnabled
+    || (phoneBindingPrefixBindEnabled && phoneBindingPrefixNumberFilter !== 'available')
   const phoneBindingSelectedPrefixes = normalizeSelectedPrefixes(phoneBindingSelectedPrefixesValue)
   const phoneBindingProxyMode = String(phoneBindingProxyModeValue || DEFAULT_PHONE_BINDING_SETTINGS.proxy_mode)
   const phoneBindingPrefixSampleSize = Number(phoneBindingPrefixSampleSizeValue) === 2 ? 2 : 1
@@ -7963,9 +8035,9 @@ export default function Accounts() {
     if (value === 'rejected') return 'rejected'
     return 'all'
   })()
-  const phoneBindingUsePool = phoneBindingPrefixModeActive || phoneBindingUsePoolValue !== false
-  const phoneBindingManualText = String(phoneBindingPhoneLinesValue || '').trim()
-  const phoneBindingShowManualInput = !phoneBindingPrefixModeActive && (phoneBindingManualOpen || !phoneBindingUsePool || Boolean(phoneBindingManualText))
+  const phoneBindingUsePool = phoneBindingPrefixModeActive || phoneBindingUnavailableNumberTestEnabled || phoneBindingUsePoolValue !== false
+  const phoneBindingManualText = phoneBindingPoolMode === 'normal' ? String(phoneBindingPhoneLinesValue || '').trim() : ''
+  const phoneBindingShowManualInput = phoneBindingPoolMode === 'normal' && (phoneBindingManualOpen || !phoneBindingUsePool || Boolean(phoneBindingManualText))
   const phoneBindingPoolSummary = phonePoolSummary || {}
   const phoneBindingTargetCount = phoneBindingTestScope === 'selected' ? selectedRowKeys.length : total
   const phoneBindingSummaryAvailable = Number(phoneBindingPoolSummary.available || 0)
@@ -7992,7 +8064,7 @@ export default function Accounts() {
       },
       {
         key: 'unavailable' as const,
-        label: '无可用号码',
+        label: '不可用',
         color: 'error',
         items: uniquePhonePoolPrefixItems(health.unavailable || summary.rejected_prefixes, 'unavailable'),
       },
@@ -8022,8 +8094,14 @@ export default function Accounts() {
   const phoneBindingSelectedPrefixItems = phoneBindingSelectedPrefixes.map((prefix) => phoneBindingPrefixMap.get(prefix)).filter(Boolean) as PhonePoolPrefixItem[]
   const phoneBindingSelectedPrefixSet = useMemo(() => new Set(phoneBindingSelectedPrefixes), [phoneBindingSelectedPrefixes.join('|')])
   const phoneBindingLimitedAvailablePhones = phoneBindingSelectedPrefixItems.reduce((sum, item) => sum + Number(item.available_count || 0), 0)
+  const phoneBindingLimitedUnavailablePhones = phoneBindingSelectedPrefixItems.reduce((sum, item) => sum + Number(item.cannot_send_count || 0), 0)
   const phoneBindingLimitedRemainingCapacity = phoneBindingSelectedPrefixItems.reduce((sum, item) => sum + Number(item.remaining_capacity || 0), 0)
   const phoneBindingLimitedCapacity = phoneBindingReusePhoneValue ? phoneBindingLimitedRemainingCapacity : phoneBindingLimitedAvailablePhones
+  const phoneBindingLimitedCandidatePhones = phoneBindingPrefixNumberFilter === 'unavailable'
+    ? phoneBindingLimitedUnavailablePhones
+    : phoneBindingPrefixNumberFilter === 'all'
+      ? phoneBindingLimitedAvailablePhones + phoneBindingLimitedUnavailablePhones
+      : phoneBindingLimitedAvailablePhones
   const phoneBindingSelectedSampleCount = phoneBindingSelectedPrefixItems.reduce((sum, item) => {
     const candidateCount = Math.max(
       Number(item.available_count || 0),
@@ -8062,6 +8140,32 @@ export default function Accounts() {
                 : (phoneBindingPoolSummary.prefix_sample_count_1 ?? phoneBindingPoolSummary.available_prefix_sample_1)
             ),
       ) || 0
+  const phoneBindingManualCandidateCount = phoneBindingManualText
+    ? phoneBindingManualText.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).length
+    : 0
+  const phoneBindingPoolCandidatePhoneCount = phoneBindingPrefixSampleEnabled
+    ? phoneBindingSummarySampleCount
+    : phoneBindingPrefixBindEnabled
+      ? phoneBindingLimitedCandidatePhones
+      : phoneBindingUnavailableNumberTestEnabled
+        ? phoneBindingSummaryUnavailable
+        : phoneBindingSummaryAvailable
+  const phoneBindingCandidatePhoneCount = phoneBindingManualText
+    ? phoneBindingManualCandidateCount
+    : phoneBindingUsePool
+      ? phoneBindingPoolCandidatePhoneCount
+      : 0
+  const phoneBindingDynamicCapacity = phoneBindingPrefixBindEnabled
+    ? phoneBindingLimitedCapacity
+    : phoneBindingReusePhoneValue
+      ? phoneBindingSummaryRemaining
+      : phoneBindingSummaryAvailable
+  const phoneBindingExpectedTestCount = phoneBindingManualText || phoneBindingFixedSnapshotSelection
+    ? Math.min(phoneBindingTargetCount, phoneBindingCandidatePhoneCount)
+    : phoneBindingUsePool
+      ? Math.min(phoneBindingTargetCount, phoneBindingDynamicCapacity)
+      : 0
+  const phoneBindingUncoveredPhoneCount = Math.max(phoneBindingCandidatePhoneCount - phoneBindingExpectedTestCount, 0)
   const updatePhoneBindingSettings = (patch: Record<string, unknown>) => {
     const nextValues = {
       ...phoneBindingTestForm.getFieldsValue(true),
@@ -8098,9 +8202,11 @@ export default function Accounts() {
     const parts: string[] = []
     const available = Number(item.available_count || 0)
     const remaining = Number(item.remaining_capacity || 0)
+    const cannotSend = Number(item.cannot_send_count || 0)
     const rejected = Number(item.rejected_count || 0)
     if (available > 0) parts.push(`可用 ${available}`)
     if (remaining > 0) parts.push(`容量 ${remaining}`)
+    if (cannotSend > 0) parts.push(`不可用 ${cannotSend}`)
     if (rejected > 0) parts.push(`拒 ${rejected}`)
     return parts.join(' · ')
   }
@@ -8113,16 +8219,16 @@ export default function Accounts() {
     && (phoneBindingPrefixSampleEnabled
       ? phoneBindingSummarySampleCount <= 0
       : phoneBindingPrefixBindEnabled
-        ? phoneBindingSelectedPrefixes.length > 0 && phoneBindingLimitedCapacity <= 0
-        : phoneBindingSummaryRemaining <= 0)
+        ? phoneBindingSelectedPrefixes.length > 0 && phoneBindingLimitedCandidatePhones <= 0
+        : phoneBindingUnavailableNumberTestEnabled
+          ? phoneBindingSummaryUnavailable <= 0
+          : phoneBindingDynamicCapacity <= 0)
   const phoneBindingPoolShortage =
-    !phoneBindingPrefixSampleEnabled
-    && phoneBindingUsePool
+    phoneBindingUsePool
     && phoneBindingManualText === ''
     && phoneBindingTargetCount > 0
-    && (phoneBindingPrefixBindEnabled
-      ? phoneBindingSelectedPrefixes.length > 0 && phoneBindingLimitedCapacity > 0 && phoneBindingLimitedCapacity < phoneBindingTargetCount
-      : phoneBindingSummaryRemaining > 0 && phoneBindingSummaryRemaining < phoneBindingTargetCount)
+    && phoneBindingCandidatePhoneCount > 0
+    && phoneBindingExpectedTestCount < phoneBindingTargetCount
   const baxiIsPix = baxiPaymentChannelValue === 'pix'
   const baxiPixUsesSavedLink = baxiIsPix && baxiPixSubmitModeValue === 'user_link'
   const baxiCdkManualText = baxiIsPix ? '' : String(baxiCdkCodeLinesValue || '').trim()
@@ -9014,6 +9120,15 @@ export default function Accounts() {
           <Form.Item name="prefix_sample_enabled" valuePropName="checked" hidden>
             <Switch />
           </Form.Item>
+          <Form.Item name="phone_number_filter" hidden>
+            <Input />
+          </Form.Item>
+          <Form.Item name="prefix_number_filter" hidden>
+            <Input />
+          </Form.Item>
+          <Form.Item name="unavailable_number_test_enabled" valuePropName="checked" hidden>
+            <Switch />
+          </Form.Item>
           <Alert
             type="info"
             showIcon
@@ -9051,7 +9166,7 @@ export default function Accounts() {
                   <Switch
                     checkedChildren="手机号池"
                     unCheckedChildren="临时号码"
-                    disabled={phoneBindingPrefixModeActive}
+                    disabled={phoneBindingPoolMode !== 'normal'}
                     onChange={(checked) => {
                       if (!checked) setPhoneBindingManualOpen(true)
                     }}
@@ -9077,7 +9192,7 @@ export default function Accounts() {
               </Space>
             </div>
             <Text type="secondary" style={{ display: 'block', marginTop: 6 }}>
-              普通绑定可用手机号池或临时粘贴号码；限定号段绑定和号段抽样固定从手机号池取号。
+              普通绑定使用可用号码；限定号段可按号码状态筛选；号段抽样和不可用复测固定从手机号池快照取号。
             </Text>
             <div
               style={{
@@ -9096,15 +9211,28 @@ export default function Accounts() {
                         { label: '普通绑定', value: 'normal' },
                         { label: '限定号段绑定', value: 'prefix_limited' },
                         { label: '号段抽样测试', value: 'prefix_sample' },
+                        { label: '不可用号码全量复测', value: 'unavailable_numbers' },
                       ]}
                       onChange={(value) => {
                         const mode = normalizePhonePoolMode(value)
+                        const nextPhoneNumberFilter: PhoneNumberFilter = mode === 'unavailable_numbers'
+                          ? 'unavailable'
+                          : mode === 'prefix_limited'
+                            ? phoneBindingPrefixNumberFilter
+                            : 'available'
+                        const fixedSnapshotSelection = mode === 'prefix_sample'
+                          || mode === 'unavailable_numbers'
+                          || (mode === 'prefix_limited' && nextPhoneNumberFilter !== 'available')
                         updatePhoneBindingSettings({
                           phone_pool_mode: mode,
+                          phone_number_filter: nextPhoneNumberFilter,
+                          prefix_number_filter: nextPhoneNumberFilter,
+                          unavailable_number_test_enabled: mode === 'unavailable_numbers',
+                          prefix_bind_enabled: mode === 'prefix_limited',
                           prefix_sample_enabled: mode === 'prefix_sample',
                           use_pool: mode === 'normal' ? phoneBindingUsePoolValue !== false : true,
                           phone_lines: mode === 'normal' ? phoneBindingPhoneLinesValue : '',
-                          reuse_phone_until_unusable: mode === 'prefix_sample' ? false : phoneBindingReusePhoneValue,
+                          reuse_phone_until_unusable: fixedSnapshotSelection ? false : phoneBindingReusePhoneValue,
                         })
                         if (mode !== 'normal') {
                           setPhoneBindingManualOpen(false)
@@ -9115,14 +9243,26 @@ export default function Accounts() {
                 </Space>
                 <Text type="secondary" style={{ fontSize: 12 }}>
                   {phoneBindingPrefixBindEnabled
-                    ? `已选 ${phoneBindingSelectedPrefixes.length} 个号段，实际可用 ${phoneBindingLimitedAvailablePhones} 个号码，可分配 ${phoneBindingLimitedCapacity} 个账号`
+                    ? `已选 ${phoneBindingSelectedPrefixes.length} 个号段，${phoneBindingPrefixNumberFilterLabel}候选 ${phoneBindingLimitedCandidatePhones} 个${phoneBindingPrefixNumberFilter === 'available' ? `，可分配 ${phoneBindingLimitedCapacity} 个账号` : '，固定快照逐个测试'}`
                     : phoneBindingPrefixSampleEnabled
                       ? phoneBindingSelectedPrefixes.length > 0
                         ? `按所选号段抽样，预计测试 ${phoneBindingSummarySampleCount} 个号码`
                         : `按范围抽样 ${phoneBindingSummaryPrefixCount} 个号段，预计 ${phoneBindingSummarySampleCount} 个号码`
-                      : '普通绑定按手机号池可用容量自动取号，也可展开临时粘贴号码。'}
+                      : phoneBindingUnavailableNumberTestEnabled
+                        ? `全池不可用号码 ${phoneBindingSummaryUnavailable} 个，创建任务时固定全部候选快照。`
+                        : '普通绑定按手机号池可用容量自动取号，也可展开临时粘贴号码。'}
                 </Text>
               </div>
+
+              <Space wrap size={[6, 6]} style={{ marginTop: 10 }}>
+                <Text type="secondary" style={{ fontSize: 12 }}>候选预览</Text>
+                <Tag color="blue">候选号码 {phoneBindingCandidatePhoneCount}</Tag>
+                <Tag>账号 {phoneBindingTargetCount}</Tag>
+                <Tag color="processing">预计测试 {phoneBindingExpectedTestCount}</Tag>
+                <Tag>未覆盖号码 {phoneBindingUncoveredPhoneCount}</Tag>
+                {phoneBindingPrefixBindEnabled && phoneBindingPrefixNumberFilter === 'available' ? <Tag color="cyan">可分配 {phoneBindingLimitedCapacity}</Tag> : null}
+                {!phoneBindingPrefixBindEnabled && !phoneBindingFixedSnapshotSelection && phoneBindingUsePool ? <Tag color="cyan">可用容量 {phoneBindingDynamicCapacity}</Tag> : null}
+              </Space>
 
               {phoneBindingPrefixModeActive ? (
                 <div
@@ -9228,6 +9368,36 @@ export default function Accounts() {
                 </div>
               ) : null}
 
+              {phoneBindingPrefixBindEnabled ? (
+                <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap', marginTop: 10 }}>
+                  <Text strong style={{ fontSize: 12 }}>号段内号码</Text>
+                  <Segmented
+                    size="small"
+                    value={phoneBindingPrefixNumberFilter}
+                    options={[
+                      { label: '可用号码', value: 'available' },
+                      { label: '不可用号码', value: 'unavailable' },
+                      { label: '全部号码', value: 'all' },
+                    ]}
+                    onChange={(value) => {
+                      const numberFilter = normalizePhoneNumberFilter(value)
+                      updatePhoneBindingSettings({
+                        phone_number_filter: numberFilter,
+                        prefix_number_filter: numberFilter,
+                        reuse_phone_until_unusable: numberFilter === 'available' ? phoneBindingReusePhoneValue : false,
+                      })
+                    }}
+                  />
+                  <Text type="secondary" style={{ fontSize: 12 }}>
+                    {phoneBindingPrefixNumberFilter === 'available'
+                      ? '按号码自身可用状态动态分配。'
+                      : phoneBindingPrefixNumberFilter === 'unavailable'
+                        ? '只取所选号段内 status=cannot_send 的号码，固定快照且每个号码只测试一次。'
+                        : '取所选号段内可用与 status=cannot_send 的号码，固定快照且每个号码只测试一次。'}
+                  </Text>
+                </div>
+              ) : null}
+
               {phoneBindingPrefixSampleEnabled ? (
                 <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap', marginTop: 10 }}>
                   <Form.Item name="prefix_sample_size" noStyle>
@@ -9276,7 +9446,9 @@ export default function Accounts() {
                   ? '手机号池没有可复测的 OpenAI 拒绝号码。'
                   : '手机号池没有可用于号段抽样的号码，请先启用/导入带 API 且未绑满的号码。'
                 : phoneBindingPrefixBindEnabled
-                ? '所选号段当前没有单号可用绑定容量。'
+                ? `所选号段没有可测试的${phoneBindingPrefixNumberFilterLabel}号码。`
+                : phoneBindingUnavailableNumberTestEnabled
+                  ? '手机号池没有可复测的不可用号码（需要 status=cannot_send 且带收码 API）。'
                 : '手机号池没有可用绑定容量，请先导入/重置号码，或展开临时粘贴号码。'}
             />
           ) : phoneBindingPoolShortage ? (
@@ -9284,9 +9456,15 @@ export default function Accounts() {
               type="warning"
               showIcon
               style={{ marginBottom: 12 }}
-              message={phoneBindingPrefixBindEnabled
-                ? `所选号段容量不足：当前范围 ${phoneBindingTargetCount} 个账号，单号实际可分配 ${phoneBindingLimitedCapacity}`
-                : `手机号池容量不足：当前范围 ${phoneBindingTargetCount} 个账号，剩余绑定容量 ${phoneBindingSummaryRemaining}`}
+              message={phoneBindingPrefixSampleEnabled
+                ? `号段抽样候选不足：当前范围 ${phoneBindingTargetCount} 个账号，预计测试 ${phoneBindingExpectedTestCount} 个号码。`
+                : phoneBindingPrefixBindEnabled && phoneBindingPrefixNumberFilter === 'available'
+                  ? `所选号段容量不足：当前范围 ${phoneBindingTargetCount} 个账号，单号实际可分配 ${phoneBindingLimitedCapacity}`
+                  : phoneBindingPrefixBindEnabled
+                    ? `所选号段${phoneBindingPrefixNumberFilterLabel}候选不足：当前范围 ${phoneBindingTargetCount} 个账号，候选 ${phoneBindingLimitedCandidatePhones} 个，预计测试 ${phoneBindingExpectedTestCount} 个。`
+                    : phoneBindingUnavailableNumberTestEnabled
+                      ? `不可用号码候选不足：当前范围 ${phoneBindingTargetCount} 个账号，固定候选 ${phoneBindingCandidatePhoneCount} 个，预计测试 ${phoneBindingExpectedTestCount} 个。`
+                      : `手机号池容量不足：当前范围 ${phoneBindingTargetCount} 个账号，剩余绑定容量 ${phoneBindingDynamicCapacity}`}
             />
           ) : null}
 
@@ -9303,7 +9481,9 @@ export default function Accounts() {
               <div>
                 <Text strong>临时粘贴号码</Text>
                 <Text type="secondary" style={{ display: 'block', fontSize: 12 }}>
-                  {phoneBindingPrefixBindEnabled
+                  {phoneBindingUnavailableNumberTestEnabled
+                    ? '不可用号码全量复测只使用手机号池固定快照；如需粘贴固定号码，请切回普通绑定。'
+                    : phoneBindingPrefixBindEnabled
                     ? '限定号段绑定只使用手机号池；如需粘贴固定号码，请切回普通绑定。'
                     : phoneBindingPrefixSampleEnabled
                     ? '号段抽样测试只使用手机号池；如需粘贴固定号码，请切回普通绑定。'
@@ -9314,7 +9494,7 @@ export default function Accounts() {
                 size="small"
                 type={phoneBindingShowManualInput ? 'default' : 'dashed'}
                 icon={<UploadOutlined />}
-                disabled={phoneBindingPrefixModeActive}
+                disabled={phoneBindingPoolMode !== 'normal'}
                 onClick={() => setPhoneBindingManualOpen((open) => !open)}
               >
                 {phoneBindingShowManualInput ? '收起' : '展开'}
@@ -9360,7 +9540,7 @@ export default function Accounts() {
               </Form.Item>
               <Text strong style={{ fontSize: 13 }}>只测发码/收码，不提交验证码</Text>
               <Text type="secondary" style={{ fontSize: 12 }}>
-                粘贴号码、普通手机号池、限定号段、号段抽样都生效；不保存账号绑定状态，不补抓 Auth/RT。
+                粘贴号码、普通手机号池、限定号段、号段抽样、不可用号码复测都生效；不保存账号绑定状态，不补抓 Auth/RT。
               </Text>
             </Space>
           </div>
@@ -9480,8 +9660,12 @@ export default function Accounts() {
                 name="reuse_phone_until_unusable"
                 label="尽量用满同一个手机号"
                 valuePropName="checked"
-                extra={phoneBindingPrefixSampleEnabled
-                  ? '号段抽样模式下固定关闭，每个抽中的号码只测试一次。'
+                extra={phoneBindingUnavailableNumberTestEnabled
+                  ? '不可用号码全量复测固定关闭，每个固定候选只测试一次。'
+                  : phoneBindingPrefixBindEnabled && phoneBindingPrefixNumberFilter !== 'available'
+                    ? '限定号段的不可用/全部号码筛选固定关闭，每个固定候选只测试一次。'
+                  : phoneBindingPrefixSampleEnabled
+                    ? '号段抽样模式下固定关闭，每个抽中的号码只测试一次。'
                   : phoneBindingSmsProbeOnlyValue
                   ? '只测发码/收码模式下固定关闭，避免同一号码重复探测。'
                   : '开启后，同一个号码会连续绑定多个账号，直到达到上限、限流、无法发码或接口异常。'}
@@ -9489,7 +9673,7 @@ export default function Accounts() {
                 <Switch
                   checkedChildren="开启"
                   unCheckedChildren="关闭"
-                  disabled={phoneBindingPrefixSampleEnabled || Boolean(phoneBindingSmsProbeOnlyValue)}
+                  disabled={phoneBindingFixedSnapshotSelection || Boolean(phoneBindingSmsProbeOnlyValue)}
                   onChange={(checked) => {
                     updatePhoneBindingSettings({
                       reuse_phone_until_unusable: checked,

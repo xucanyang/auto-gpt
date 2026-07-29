@@ -20,6 +20,25 @@ def test_phone_binding_panel_uses_row_capacity_and_sample_language():
     assert "只复测 OpenAI 拒绝过的号段" not in page
 
 
+def test_phone_binding_panel_supports_prefix_row_filters_and_full_unavailable_snapshot():
+    page = ACCOUNTS_PAGE.read_text(encoding="utf-8")
+
+    assert "type PhonePoolMode = 'normal' | 'prefix_limited' | 'prefix_sample' | 'unavailable_numbers'" in page
+    assert "{ label: '不可用号码全量复测', value: 'unavailable_numbers' }" in page
+    assert "{ label: '可用号码', value: 'available' }" in page
+    assert "{ label: '不可用号码', value: 'unavailable' }" in page
+    assert "{ label: '全部号码', value: 'all' }" in page
+    assert "phone_number_filter: phoneNumberFilter" in page
+    assert "prefix_number_filter: phoneNumberFilter" in page
+    assert "unavailable_number_test_enabled: unavailableNumberTestEnabled" in page
+    assert "phoneBindingLimitedUnavailablePhones" in page
+    assert "不可用 ${cannotSend}" in page
+    assert "label: '无可用号码'" not in page
+    assert "候选号码 {phoneBindingCandidatePhoneCount}" in page
+    assert "未覆盖号码 {phoneBindingUncoveredPhoneCount}" in page
+    assert "disabled={phoneBindingPoolMode !== 'normal'}" in page
+
+
 def test_phone_pool_shows_mixed_prefixes_without_prefix_skip_filter():
     page = PHONE_POOL_PAGE.read_text(encoding="utf-8")
 
