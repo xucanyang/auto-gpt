@@ -1045,6 +1045,9 @@ def _build_baxigpt_cdk_summary(cdk: dict[str, Any]) -> dict[str, Any]:
             "paid_at",
             "last_checked_at",
             "last_error_message",
+            "polling_disabled",
+            "polling_disabled_at",
+            "polling_disabled_reason",
         ),
     )
 
@@ -1060,6 +1063,7 @@ def _build_idea_submit_summary(extra: dict[str, Any], baxigpt_cdk: dict[str, Any
         unavailable = True
     reason = _safe_str(
         marker.get("reason")
+        or baxigpt_cdk.get("polling_disabled_reason")
         or extra.get("idea_submit_unavailable_reason")
         or (extra.get("chatgpt_unavailable_reason") if unavailable else "")
         or (baxigpt_cdk.get("last_error_message") if unavailable else "")
@@ -1067,14 +1071,18 @@ def _build_idea_submit_summary(extra: dict[str, Any], baxigpt_cdk: dict[str, Any
     status = "unavailable" if unavailable else "available"
     cdk_status = _safe_str(baxigpt_cdk.get("status")).lower()
     marker_status = _safe_str(marker.get("status")).lower()
-    current_status = cdk_status if cdk_status in {"paid", "submitted", "processing", "failed", "timeout"} else marker_status
-    if not unavailable and current_status in {"paid", "submitted", "processing", "failed", "timeout"}:
+    polling_disabled = bool(baxigpt_cdk.get("polling_disabled")) or cdk_status == "stopped"
+    current_status = "stopped" if polling_disabled else (
+        cdk_status if cdk_status in {"paid", "submitted", "processing", "failed", "timeout", "stopped"} else marker_status
+    )
+    if not unavailable and current_status in {"paid", "submitted", "processing", "failed", "timeout", "stopped"}:
         status = current_status
     return {
         "status": status,
         "available": not unavailable,
         "unavailable": unavailable,
         "reason": reason,
+        "polling_disabled": polling_disabled,
         "marked_at": _safe_str(marker.get("marked_at") or extra.get("idea_submit_unavailable_at")),
         "cleared_at": _safe_str(marker.get("cleared_at")),
         "source": _safe_str(marker.get("source") or ("baxigpt_cdk_submit" if marker else "")),

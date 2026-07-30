@@ -293,11 +293,22 @@ class AccountFilterSortTests(unittest.TestCase):
         submitted.set_extra({"baxigpt_cdk": {"status": "submitted"}})
         processing = self._account(35)
         processing.set_extra({"baxigpt_cdk": {"status": "processing"}})
+        stopped = self._account(36)
+        stopped.set_extra(
+            {
+                "baxigpt_cdk": {
+                    "status": "stopped",
+                    "polling_disabled": True,
+                    "order_id": "stopped-order",
+                }
+            }
+        )
 
         self.assertEqual(account_idea_submit_state(unavailable), "unavailable")
         self.assertEqual(account_idea_submit_state(paid), "paid")
         self.assertEqual(account_idea_submit_state(legacy_unavailable), "unavailable")
         self.assertEqual(account_idea_submit_state(available), "available")
+        self.assertEqual(account_idea_submit_state(stopped), "stopped")
 
         self.assertEqual(
             [row.id for row in filter_account_rows([unavailable, paid, legacy_unavailable, available, submitted, processing], idea_submit_state="unavailable")],
@@ -314,6 +325,10 @@ class AccountFilterSortTests(unittest.TestCase):
         self.assertEqual(
             [row.id for row in filter_account_rows([unavailable, paid, legacy_unavailable, available, submitted, processing], idea_submit_state="available,submitted")],
             [33, 34],
+        )
+        self.assertEqual(
+            [row.id for row in filter_account_rows([stopped], idea_submit_state="stopped")],
+            [36],
         )
 
     def test_generic_submission_state_keeps_outcome_and_submission_evidence_independent(self):

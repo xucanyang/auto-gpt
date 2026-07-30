@@ -11,6 +11,7 @@ import threading
 import time
 from typing import Callable, Any
 
+from sqlalchemy import func
 from sqlmodel import Session, select
 
 from core.db import AccountModel, engine
@@ -41,6 +42,11 @@ ACCOUNT_RECONCILE_INTERVAL_SECONDS = 60
 ACCOUNT_RECONCILE_BATCH_SIZE = 50
 ACCOUNT_RECONCILE_STALE_SECONDS = 120
 ACCOUNT_RECONCILE_STATUSES = {STATUS_SUBMITTED, STATUS_PROCESSING, "pending", "polling"}
+# Deliberately false: account-level recovery must be an explicit operator action,
+# never a hidden workload that survives a stopped local task.
+ACCOUNT_RECONCILE_AUTOMATIC = False
+POLLING_STOPPED_STATUS = "stopped"
+POLLING_STOPPED_REASON = "本地 Idea 任务已中断，已停止后续状态轮询"
 
 
 @dataclass(slots=True)
@@ -137,10 +143,120 @@ def _account_order_payload(account: AccountModel) -> tuple[dict[str, Any], dict[
     if not isinstance(extra, dict):
         extra = {}
     payload = extra.get("baxigpt_cdk") if isinstance(extra.get("baxigpt_cdk"), dict) else {}
+    if bool(payload.get("polling_disabled")):
+        return None
     status = str(payload.get("status") or "").strip().lower()
     if status not in ACCOUNT_RECONCILE_STATUSES:
         return None
     return extra, dict(payload)
+
+
+def stop_task_polling(
+    task_id: str,
+    *,
+    reason: str = POLLING_STOPPED_REASON,
+) -> dict[str, Any]:
+    """停止一个本地 Idea 任务留下的所有未终态订单轮询。
+
+    订单已经写入账号 extra 后，不能只清理进程内 target：服务重启或其他
+    调用方仍可能从旧的 ``processing`` 记录重新发现它们。这里同时写入持久化
+    ``polling_disabled`` 标记，并把账号侧状态收口为 ``stopped``；上游状态
+    保留在 ``upstream_status``，不假装订单已失败或已支付。
+    """
+
+    normalized_task_id = str(task_id or "").strip()
+    if not normalized_task_id:
+        return {"task_id": "", "accounts_marked": 0, "targets_removed": 0}
+    stop_reason = str(reason or POLLING_STOPPED_REASON).strip()[:1000]
+    now_text = _now_text()
+    matched_account_ids: list[int] = []
+    matched_record_ids: list[int] = []
+    with Session(engine) as session:
+        accounts = session.exec(
+            select(AccountModel)
+            .where(AccountModel.platform == "chatgpt")
+            .where(
+                func.json_extract(AccountModel.extra_json, "$.baxigpt_cdk.task_id")
+                == normalized_task_id
+            )
+        ).all()
+        for account in accounts:
+            try:
+                extra = account.get_extra()
+            except Exception:
+                extra = {}
+            if not isinstance(extra, dict):
+                continue
+            payload = extra.get("baxigpt_cdk") if isinstance(extra.get("baxigpt_cdk"), dict) else {}
+            payload_task_id = str(payload.get("task_id") or "").strip()
+            if payload_task_id != normalized_task_id:
+                continue
+            current_status = str(payload.get("status") or "").strip().lower()
+            if current_status not in ACCOUNT_RECONCILE_STATUSES and not bool(payload.get("polling_disabled")):
+                continue
+            payload = dict(payload)
+            payload["status"] = POLLING_STOPPED_STATUS
+            payload["polling_disabled"] = True
+            payload["polling_disabled_at"] = now_text
+            payload["polling_disabled_reason"] = stop_reason
+            payload["last_error_message"] = stop_reason
+            _upsert_account_order_history(extra, payload)
+            extra["baxigpt_cdk"] = payload
+
+            marker = extra.get(IDEA_SUBMIT_MARKER_KEY)
+            marker = dict(marker) if isinstance(marker, dict) else {}
+            marker.update(
+                {
+                    "status": POLLING_STOPPED_STATUS,
+                    "reason": stop_reason,
+                    "source": "baxigpt_cdk_submit",
+                    "task_id": normalized_task_id,
+                    "stopped_at": now_text,
+                }
+            )
+            extra[IDEA_SUBMIT_MARKER_KEY] = marker
+            account.set_extra(extra)
+            account.updated_at = datetime.now(timezone.utc)
+            session.add(account)
+            if account.id:
+                matched_account_ids.append(int(account.id))
+            try:
+                cdk_id = int(payload.get("cdk_id") or 0)
+            except Exception:
+                cdk_id = 0
+            if cdk_id > 0:
+                matched_record_ids.append(cdk_id)
+        if matched_account_ids:
+            session.commit()
+
+    with _lock:
+        targets_removed = 0
+        matched_ids = set(matched_record_ids)
+        for record_id, target in list(_targets.items()):
+            if str(target.task_id or "").strip() == normalized_task_id:
+                _targets.pop(record_id, None)
+                targets_removed += 1
+                continue
+            if record_id in matched_ids:
+                _targets.pop(record_id, None)
+                targets_removed += 1
+
+    if matched_account_ids:
+        try:
+            from services.account_filters import upsert_account_list_state_for_account_ids
+
+            with Session(engine) as session:
+                upsert_account_list_state_for_account_ids(session, matched_account_ids, commit=True)
+        except Exception:
+            # The order stop marker is already durable; a derived-list refresh can
+            # be retried by the normal account-state maintenance path.
+            pass
+
+    return {
+        "task_id": normalized_task_id,
+        "accounts_marked": len(matched_account_ids),
+        "targets_removed": targets_removed,
+    }
 
 
 def _resolve_account_order_id(payload: dict[str, Any], *, repo: BaxiGptCdkRepository) -> tuple[str, str]:
@@ -496,7 +612,12 @@ def enqueue_status_poll(
     if rid <= 0:
         return False
     record = BaxiGptCdkRepository().get_by_id(rid)
-    if record is None or not record.order_id or str(record.status or "").strip().lower() not in POLLABLE_STATUSES:
+    if (
+        record is None
+        or not record.order_id
+        or str(record.status or "").strip().lower() not in POLLABLE_STATUSES
+        or _record_polling_disabled(record)
+    ):
         return False
 
     interval = _positive_int(interval_seconds, DEFAULT_INTERVAL_SECONDS, minimum=1, maximum=3600)
@@ -605,6 +726,33 @@ def _remove_target(record_id: int) -> None:
         _targets.pop(int(record_id or 0), None)
 
 
+def _record_polling_disabled(record: Any) -> bool:
+    """Check the bound account marker before any upstream request."""
+
+    account_id = int(getattr(record, "bound_account_id", 0) or 0)
+    email = str(
+        getattr(record, "bound_account_email", "")
+        or getattr(record, "remote_email", "")
+        or ""
+    ).strip()
+    with Session(engine) as session:
+        account = session.get(AccountModel, account_id) if account_id > 0 else None
+        if account is None and email:
+            account = session.exec(
+                select(AccountModel)
+                .where(AccountModel.platform == "chatgpt")
+                .where(AccountModel.email == email)
+            ).first()
+        if account is None:
+            return False
+        try:
+            extra = account.get_extra()
+        except Exception:
+            extra = {}
+        payload = extra.get("baxigpt_cdk") if isinstance(extra, dict) else {}
+        return bool(isinstance(payload, dict) and payload.get("polling_disabled"))
+
+
 def _reschedule_target(target: BaxiGptStatusPollTarget) -> None:
     with _lock:
         current = _targets.get(target.record_id)
@@ -622,6 +770,8 @@ def _account_reconcile_due(now: float) -> bool:
 
 def _run_account_reconcile_if_due(now: float) -> None:
     global _account_reconcile_next_due_at, _account_reconcile_last_result
+    if not ACCOUNT_RECONCILE_AUTOMATIC:
+        return
     if not _account_reconcile_due(now):
         return
     with _lock:
@@ -654,7 +804,9 @@ def _loop() -> None:
         now = time.time()
         due = _take_due_targets(now)
         if not due:
-            _run_account_reconcile_if_due(now)
+            # Account-level reconciliation is intentionally not automatic. A
+            # stopped local Idea task must not keep querying upstream orders in
+            # the background; explicit/manual poll requests still use targets.
             _stop_event.wait(0.5)
             continue
         for target in due:
@@ -681,6 +833,10 @@ def _poll_once(repo: BaxiGptCdkRepository, client: BaxiGptClient, target: BaxiGp
     if not record.order_id:
         target.last_error = "没有 order_id"
         _safe_log(target, f"[Idea] 状态轮询停止: {record.code_masked} 没有 order_id")
+        return True
+    if _record_polling_disabled(record):
+        target.last_error = "本地任务已停止轮询"
+        _safe_log(target, f"[Idea] 状态轮询停止: 本地任务已停止 {record.display_id or record.order_id}")
         return True
     if str(record.status or "").strip().lower() not in POLLABLE_STATUSES:
         if record.status in REPOSITORY_TERMINAL_STATUSES:

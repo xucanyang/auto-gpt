@@ -276,14 +276,8 @@ async def lifespan(app: FastAPI):
         print(f"[WARN] 手机号池后台维护启动失败: {exc}")
     from services.proxy_scan_scheduler import start as start_proxy_scan_scheduler
     start_proxy_scan_scheduler()
-    from services.chatgpt_core.baxigpt_status_poller import (
-        restore_pending_targets as restore_baxigpt_status_poller_targets,
-        start as start_baxigpt_status_poller,
-    )
-    start_baxigpt_status_poller()
-    restored_baxigpt_targets = restore_baxigpt_status_poller_targets()
-    if restored_baxigpt_targets:
-        print(f"[BaxiGPT] 已恢复订单状态轮询: {restored_baxigpt_targets} 个")
+    # Idea 任务的订单轮询只在任务进程存活期间执行。服务重启后不自动恢复
+    # 旧订单，避免本地任务已中断但后台继续请求上游。
     start_subscription_verification_scheduler()
     from services.solver_manager import start_async
     start_async()

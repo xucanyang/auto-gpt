@@ -31,6 +31,9 @@ class BaxiGptAccountStatusReconcilerTests(unittest.TestCase):
         self.repo_engine_patch.stop()
         self.core_engine_patch.stop()
 
+    def test_account_reconcile_is_not_automatic(self):
+        self.assertFalse(poller_module.ACCOUNT_RECONCILE_AUTOMATIC)
+
     def test_reconciles_account_level_submitted_order_to_paid(self):
         repo = BaxiGptCdkRepository()
         cdk = repo.add(code="CDK-ACCOUNT-RECONCILE-1111")
@@ -147,6 +150,85 @@ class BaxiGptAccountStatusReconcilerTests(unittest.TestCase):
             self.assertEqual(extra["baxigpt_cdk"]["order_id"], expected_order_id)
             state = session.get(AccountListStateModel, account_id)
             self.assertEqual(state.idea_submit_state, "failed")
+
+    def test_stops_local_task_orders_and_excludes_them_from_reconcile(self):
+        repo = BaxiGptCdkRepository()
+        cdk = repo.add(code="CDK-ACCOUNT-STOP-3333")
+        reserved = repo.reserve_for_account(
+            cdk.id,
+            account_id=1,
+            email="stopped@example.com",
+            task_id="task-stop-1",
+        )
+        submitted = repo.mark_submit_success(
+            reserved.id,
+            {
+                "ok": True,
+                "status": "processing",
+                "order_id": f"{cdk.code_value}::task-stop-1",
+                "display_id": "task-stop-1",
+                "email": "stopped@example.com",
+            },
+        )
+        with Session(self.engine) as session:
+            account = AccountModel(
+                platform="chatgpt",
+                email="stopped@example.com",
+                password="pw",
+                token="at",
+                status="pending_payment",
+            )
+            account.set_extra(
+                {
+                    "baxigpt_cdk": {
+                        "status": "processing",
+                        "upstream_status": "processing",
+                        "task_id": "task-stop-1",
+                        "cdk_id": cdk.id,
+                        "order_id": submitted.order_id,
+                        "display_id": submitted.display_id,
+                    }
+                }
+            )
+            session.add(account)
+            session.commit()
+            session.refresh(account)
+            account_id = int(account.id or 0)
+
+        with poller_module._lock:
+            poller_module._targets[int(cdk.id)] = poller_module.BaxiGptStatusPollTarget(
+                record_id=int(cdk.id),
+                task_id="task-stop-1",
+            )
+
+        result = poller_module.stop_task_polling("task-stop-1")
+
+        self.assertEqual(result["accounts_marked"], 1)
+        self.assertEqual(result["targets_removed"], 1)
+        self.assertFalse(
+            poller_module.enqueue_status_poll(
+                int(cdk.id),
+                immediate=True,
+                task_id="task-stop-1",
+            )
+        )
+        with Session(self.engine) as session:
+            account = session.get(AccountModel, account_id)
+            extra = account.get_extra()
+            payload = extra["baxigpt_cdk"]
+            self.assertEqual(payload["status"], "stopped")
+            self.assertTrue(payload["polling_disabled"])
+            self.assertEqual(extra["idea_submit"]["status"], "stopped")
+            state = session.get(AccountListStateModel, account_id)
+            self.assertEqual(state.idea_submit_state, "stopped")
+
+        with patch.object(poller_module.BaxiGptClient, "status") as status_mock:
+            result = poller_module.reconcile_pending_account_statuses_once(
+                limit=10,
+                stale_seconds=0,
+            )
+        self.assertEqual(result["checked"], 0)
+        status_mock.assert_not_called()
 
 
 if __name__ == "__main__":

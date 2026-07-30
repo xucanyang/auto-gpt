@@ -10190,7 +10190,7 @@ def _run_baxigpt_cdk_submit(task_id: str, pairs: list[dict[str, Any]], settings:
                 },
             ),
         )
-    except StopTaskRequested as exc:
+    except TaskInterruption as exc:
         _log(task_id, f"[STOP] {exc}")
         sync_meta()
         _task_store.finish(
@@ -10226,6 +10226,19 @@ def _run_baxigpt_cdk_submit(task_id: str, pairs: list[dict[str, Any]], settings:
             error=str(exc),
         )
     finally:
+        try:
+            from services.chatgpt_core.baxigpt_status_poller import stop_task_polling
+
+            task_snapshot = _task_store.snapshot(task_id)
+            runtime_status = str(task_snapshot.get("status") or "").strip().lower()
+            stop_reason = (
+                "本地 Idea 任务已中断，已停止后续状态轮询"
+                if runtime_status in {"stopped", "interrupted"}
+                else "本地 Idea 任务已结束，已停止后续状态轮询"
+            )
+            stop_task_polling(task_id, reason=stop_reason)
+        except Exception as stop_polling_exc:
+            logger.warning("Idea 任务结束时停止后台轮询失败 task_id=%s: %s", task_id, stop_polling_exc)
         _clear_task_current(task_id)
         _task_store.cleanup()
 

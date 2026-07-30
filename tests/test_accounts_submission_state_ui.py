@@ -34,6 +34,8 @@ def test_accounts_uses_canonical_submission_filters_and_keeps_legacy_reads_compa
     assert "else if (!hasSubmitted && !unavailable)" in page
     assert "tags.push({ color: 'warning', label: '提交失败' })" in page
     assert "tags.push({ color: 'warning', label: '待人工复核' })" in page
+    assert "{ value: 'stopped', text: '已停止' }" in page
+    assert "tags.push({ color: 'default', label: '已停止' })" in page
 
 
 def test_baxi_pix_poll_interval_is_persisted_and_bounded_without_a_five_second_override():

@@ -741,6 +741,7 @@ const SUBMISSION_STATE_FILTER_OPTIONS = [
   { value: 'paid', text: '已完成' },
   { value: 'failed', text: '提交失败' },
   { value: 'timeout', text: '待人工复核' },
+  { value: 'stopped', text: '已停止' },
 ]
 
 const HAS_SUBMITTED_FILTER_OPTIONS = [
@@ -760,6 +761,7 @@ const IDEA_SUBMIT_FILTER_VALUE_ALIASES: Record<string, string> = {
   completed: 'paid',
   manual_review: 'timeout',
   unknown_submit: 'timeout',
+  stopped: 'stopped',
   fail: 'failed',
   error: 'failed',
 }
@@ -2205,7 +2207,7 @@ function isBaxiGptPendingOrder(record: any) {
 }
 
 function isBaxiGptTerminalCdkStatus(status?: string) {
-  return ['paid', 'failed', 'disabled'].includes(String(status || '').trim().toLowerCase())
+  return ['paid', 'failed', 'disabled', 'stopped'].includes(String(status || '').trim().toLowerCase())
 }
 
 function isBaxiGptTerminalAccountStatus(status?: string) {
@@ -2481,6 +2483,8 @@ function submissionMeta(record: any) {
     tags.push({ color: 'warning', label: '提交失败' })
   } else if (state === 'timeout') {
     tags.push({ color: 'warning', label: '待人工复核' })
+  } else if (state === 'stopped') {
+    tags.push({ color: 'default', label: '已停止' })
   } else if (state === 'submitting') {
     tags.push({ color: 'processing', label: '处理中' })
   } else if (!hasSubmitted && !unavailable) {

@@ -165,6 +165,7 @@ _IDEA_SUBMIT_STATE_FILTER_ALIASES: dict[str, set[str]] = {
     "timeout": {"timeout"},
     "manual_review": {"timeout"},
     "unknown_submit": {"timeout"},
+    "stopped": {"stopped"},
     "unavailable": {"unavailable"},
 }
 
@@ -1000,7 +1001,7 @@ def account_oaipay_upload_state(account: AccountModel, extra: dict[str, Any] | N
     return _integration_upload_state(sync_statuses.get("oaipay"))
 
 
-_SUBMISSION_RESULT_STATES = {"paid", "submitted", "processing", "failed", "timeout"}
+_SUBMISSION_RESULT_STATES = {"paid", "submitted", "processing", "failed", "timeout", "stopped"}
 _SUBMISSION_EVIDENCE_STATES = {"paid", "submitted", "processing"}
 _PIX_LINK_SUBMITTED_STATUS = "pix_submitted"
 
@@ -1081,7 +1082,7 @@ def account_idea_submit_state(account: AccountModel, extra: dict[str, Any] | Non
         unavailable = True
     if unavailable:
         return "unavailable"
-    if cdk_status in {"paid", "submitted", "processing", "failed", "timeout"}:
+    if cdk_status in {"paid", "submitted", "processing", "failed", "timeout", "stopped"}:
         return cdk_status
     return "available"
 
@@ -2015,14 +2016,14 @@ def refresh_account_list_state(
                             OR idea_submit_unavailable = 1
                             OR (chatgpt_account_unavailable = 1 AND baxigpt_cdk_status = 'failed')
                         THEN 'unavailable'
-                        WHEN baxigpt_cdk_status IN ('paid', 'submitted', 'processing', 'failed', 'timeout')
+                        WHEN baxigpt_cdk_status IN ('paid', 'submitted', 'processing', 'failed', 'timeout', 'stopped')
                         THEN baxigpt_cdk_status
                         ELSE 'available'
                     END AS idea_submit_state,
                     CASE
-                        WHEN baxigpt_cdk_status IN ('paid', 'submitted', 'processing', 'failed', 'timeout')
+                        WHEN baxigpt_cdk_status IN ('paid', 'submitted', 'processing', 'failed', 'timeout', 'stopped')
                         THEN baxigpt_cdk_status
-                        WHEN idea_marker_status IN ('paid', 'submitted', 'processing', 'failed', 'timeout')
+                        WHEN idea_marker_status IN ('paid', 'submitted', 'processing', 'failed', 'timeout', 'stopped')
                         THEN idea_marker_status
                         WHEN payment_link_status = 'pix_submitted'
                         THEN 'submitted'
@@ -2034,8 +2035,8 @@ def refresh_account_list_state(
                     END AS submit_state,
                     CASE
                         WHEN payment_link_status = 'pix_submitted'
-                            OR baxigpt_cdk_status IN ('paid', 'submitted', 'processing')
-                            OR idea_marker_status IN ('paid', 'submitted', 'processing')
+                            OR baxigpt_cdk_status IN ('paid', 'submitted', 'processing', 'stopped')
+                            OR idea_marker_status IN ('paid', 'submitted', 'processing', 'stopped')
                             OR baxigpt_order_id != ''
                             OR baxigpt_display_id != ''
                             OR idea_marker_order_id != ''

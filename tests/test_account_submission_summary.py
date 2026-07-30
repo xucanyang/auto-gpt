@@ -27,6 +27,24 @@ def test_legacy_idea_summary_preserves_unavailable_and_supports_timeout():
     assert timeout["status"] == "timeout"
     assert timeout["unavailable"] is False
 
+    stopped = accounts._build_idea_submit_summary(
+        {
+            "baxigpt_cdk": {
+                "status": "stopped",
+                "polling_disabled": True,
+                "polling_disabled_reason": "本地任务已中断",
+            }
+        },
+        {
+            "status": "stopped",
+            "polling_disabled": True,
+            "polling_disabled_reason": "本地任务已中断",
+        },
+    )
+    assert stopped["status"] == "stopped"
+    assert stopped["polling_disabled"] is True
+    assert stopped["reason"] == "本地任务已中断"
+
 
 def test_compact_account_payload_exposes_channel_neutral_submission_evidence():
     extra = {
