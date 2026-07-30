@@ -43,7 +43,7 @@
 - **修正 Docker 发布拓扑旧描述**：`docs/docker-image-release.md` 按当前 `docker-compose.multi.yml` 更新为 `auto-gpt`、`auto-gpt-plus`、`auto-plus2` 三个常驻业务实例与 `phone-api-relay` 共同运行，移除主服务 standby 的过时说法。
 
 ### 测试 (Tests)
-- **补充任务历史回归覆盖**：`tests/test_chatgpt_task_logging.py` 锁定活跃批任务的单账号结果不得提前关闭整批、终态中断不得被迟到回调覆盖、旧注册统计/汇总恢复、未知旧统计不得伪装为已知零值，以及内存日志压缩后仍保留持久化完整窗口；`tests/test_task_logs_history.py` 覆盖重复旧行的详情日志合并和明确成功状态不被误判。前端执行 Node 合同测试与生产构建。
+- **补充任务历史回归覆盖**：`tests/test_chatgpt_task_logging.py` 锁定活跃批任务的单账号结果不得提前关闭整批、终态中断不得被迟到回调覆盖、旧注册统计/汇总恢复、未知旧统计不得伪装为已知零值，以及内存日志压缩后仍保留持久化完整窗口；`tests/test_task_logs_history.py` 覆盖重复旧行的详情日志合并和明确成功状态不被误判。任务历史/控制专项 `92 passed`，相关任务运行时、终态守卫和支付摘要回归 `34 passed`，前端 Node 合同测试 `14 passed`，生产构建及本次修改文件 ESLint 通过。
 - 新增 Idea 任务停止标记、轮询队列清理、手动入队拦截、账号筛选和提交摘要回归测试；相关专项测试共 `44 passed`，BaxiGPT 卡密提交专项 `49 passed`。
 - **补充手机号绑定模式回归**：`tests/test_phone_pool.py` 覆盖指定前缀内 `available / unavailable / all` 的行级候选边界；`tests/test_phone_pool_task_integration.py` 覆盖限定号段不可用固定快照、全池 `cannot_send` 全量候选快照、候选数超过账号数时的未覆盖统计及 legacy 布尔模式优先级；`tests/test_phone_prefix_ui_contract.py` 锁定新模式、状态筛选、不可用号段可选、候选预览和请求字段契约。使用一次性 Docker 容器、`--network none`、只读 checkout 和临时运行目录执行该专项，结果为 `55 passed`。
 - 新增 HME Ready 测试字段回归覆盖：普通 prepare 的调用参数保持向后兼容，测试模式才携带 Tag 长度实验所需的物理 alias、Tag、scheme 与 run 标识；`tests/test_icloud_hme_mailbox_finalize.py` 专项回归 `29 passed`。
@@ -3147,5 +3147,9 @@
 - 发布模式: multi
 
 ## 2026-07-30 09:56:43 +0800
+- 修复任务历史中文类型、统计恢复与中断日志持久化
+- 发布模式: multi
+
+## 2026-07-30 09:56:58 +0800
 - 修复任务历史中文类型、统计恢复与中断日志持久化
 - 发布模式: multi
