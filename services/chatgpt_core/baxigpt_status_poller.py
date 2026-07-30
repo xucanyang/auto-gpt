@@ -735,22 +735,27 @@ def _record_polling_disabled(record: Any) -> bool:
         or getattr(record, "remote_email", "")
         or ""
     ).strip()
-    with Session(engine) as session:
-        account = session.get(AccountModel, account_id) if account_id > 0 else None
-        if account is None and email:
-            account = session.exec(
-                select(AccountModel)
-                .where(AccountModel.platform == "chatgpt")
-                .where(AccountModel.email == email)
-            ).first()
-        if account is None:
-            return False
-        try:
-            extra = account.get_extra()
-        except Exception:
-            extra = {}
-        payload = extra.get("baxigpt_cdk") if isinstance(extra, dict) else {}
-        return bool(isinstance(payload, dict) and payload.get("polling_disabled"))
+    try:
+        with Session(engine) as session:
+            account = session.get(AccountModel, account_id) if account_id > 0 else None
+            if account is None and email:
+                account = session.exec(
+                    select(AccountModel)
+                    .where(AccountModel.platform == "chatgpt")
+                    .where(AccountModel.email == email)
+                ).first()
+            if account is None:
+                return False
+            try:
+                extra = account.get_extra()
+            except Exception:
+                extra = {}
+            payload = extra.get("baxigpt_cdk") if isinstance(extra, dict) else {}
+            return bool(isinstance(payload, dict) and payload.get("polling_disabled"))
+    except Exception:
+        # The standalone CDK-pool migration/tests can run before the account
+        # table exists. In that context there is no stop marker to consult.
+        return False
 
 
 def _reschedule_target(target: BaxiGptStatusPollTarget) -> None:

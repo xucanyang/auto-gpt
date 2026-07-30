@@ -22,6 +22,7 @@
 - **修复 Idea 任务中断后仍被后台轮询的问题**：`services/chatgpt_core/baxigpt_status_poller.py` 在入队和实际请求前检查持久化停止标记，已停止订单直接移除 target，不访问上游；`api/accounts.py`、`services/account_filters.py` 与 `frontend/src/pages/Accounts.tsx` 保留上游原始状态并明确展示本地停止结果。
 - **修复服务重启造成的旧订单自动恢复**：移除 `main.py` 对 `restore_pending_targets()` 的启动调用，防止本地任务快照丢失后又从 `processing` 卡密记录恢复轮询。
 - **同步侧栏可见版本为 `v2.8.64`**：`frontend/src/app/AppShell.tsx` 更新版本标识，便于确认三个常驻实例已经加载本次 Idea 轮询生命周期修复。
+- **补齐独立卡密池测试兼容性**：`services/chatgpt_core/baxigpt_status_poller.py` 在账号表尚未创建的纯卡密池迁移/测试环境中安全跳过停止标记查询，不影响生产账号库中的强制停止语义。
 - **修复不可用号段无法被限定绑定选择的问题**：`services/chatgpt_core/phone_pool_repository.py` 将号码可用性改为行级 `available / unavailable / all` 查询，`unavailable` 精确限定为带收码 API 的 `status=cannot_send` 记录，`all` 只组合自身可用与 `cannot_send` 行，不混入限流、冷却、耗尽或停用号码。`api/tasks.py` 的并发和串行 runner 同步保留不可用复测筛选值，避免运行时将全量复测错误回退成 `available`；固定快照的总进度按实际可测试的 `min(账号数, 候选数)` 收口，未触碰号码不会被预先恢复或改写。
 - **同步侧栏可见版本为 `v2.8.63`**：`frontend/src/app/AppShell.tsx` 更新版本标识，便于确认三个常驻实例已经加载本次手机号绑定前端资源。
 - **重构 ChatGPT 注册日志契约与网络 Debug 追踪**：`api/tasks.py` 将注册前缀从尝试计数改为“当前成功位/目标成功数”，并在 `start_attempt()` 与成功位快照之间使用同一把锁；目标成功数已达成时，排队补位线程在锁内直接返回 `NOT_STARTED`，不会产生越界成功位或无效注册。并发尝试、失败补位和浏览器不确定失败占槽仍保持原有调度语义；`services/chatgpt_core/task_logging.py` 统一输出 `[成功位/目标][步骤NN/09 阶段]`，移除任务名、尝试号、邮箱前缀和 `any-auto/<executor>` 重复标签。Info 业务节点补充当前邮箱、邮箱渠道、租约/邮箱 ID、代理/出口 IP、OTP 来源/等待/长度/重发次数、提交 HTTP/下一页以及库存/AT/Session/Cookie 状态；OTP 明文和密码不进入日志。`services/chatgpt_core/any_auto/register.py` 与 `browser_register.py` 为协议 Session 和 Camoufox 页面接入脱敏 `[HTTP]` 方法、主机路径、状态、耗时、页面、资源类型和请求/响应字节追踪，查询串、请求体、Cookie、Token、用户信息均剥离；`access_token_only_registration_engine.py` 仅将网络事务送入 Debug，并过滤 any-auto 重复邮箱/OTP 低层行。兼容旧邮箱适配器的字符串/对象返回值。前端侧栏版本同步为 `v2.8.62`。
@@ -3133,4 +3134,8 @@
 
 ## 2026-07-30 08:58:03 +0800
 - 停止 Idea 本地中断任务的后台订单轮询
+- 发布模式: multi
+
+## 2026-07-30 09:06:39 +0800
+- 补齐 Idea 停止轮询的独立卡密池兼容性
 - 发布模式: multi
