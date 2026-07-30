@@ -5,6 +5,7 @@ import { PhoneBindingResultsTable } from '@/components/phone-binding/PhoneBindin
 import { ApprovalUrlResultsTable } from '@/components/approval-url/ApprovalUrlResultsTable'
 import {
   SPECIAL_OUTCOME_LABELS,
+  deriveTaskStats,
   statusLabel,
   statusTagColor,
   taskObjectSummary,
@@ -44,8 +45,12 @@ type TaskDetailRecord = {
   success?: number
   skipped?: number
   failed?: number
+  interrupted?: number
+  total?: number
+  stats_available?: boolean
   meta_summary?: Record<string, unknown>
   detail?: TaskLogDetailPayload
+  [key: string]: unknown
 }
 
 type TaskDetailHeaderProps = {
@@ -56,13 +61,8 @@ function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {}
 }
 
-function asArray(value: unknown): any[] {
+function asArray(value: unknown): unknown[] {
   return Array.isArray(value) ? value : []
-}
-
-function numberValue(value: unknown): number {
-  const n = Number(value || 0)
-  return Number.isFinite(n) ? n : 0
 }
 
 function sourceOf(record: TaskDetailRecord) {
@@ -77,23 +77,19 @@ function outcomeOf(record: TaskDetailRecord) {
 }
 
 function statsOf(record: TaskDetailRecord) {
-  const detail = asRecord(record.detail)
-  const errors = asArray(detail.errors)
-  return {
-    success: numberValue(record.success ?? detail.success),
-    skipped: numberValue(record.skipped ?? detail.skipped),
-    failed: numberValue(record.failed ?? errors.length),
-  }
+  return deriveTaskStats(record)
 }
 
 function renderStatsTags(record: TaskDetailRecord) {
   const stats = statsOf(record)
+  if (!stats.known) return <Text type="secondary">统计暂不可用</Text>
   const tags = [
-    stats.success > 0 ? <Tag key="success" color="success">成功 {stats.success}</Tag> : null,
-    stats.skipped > 0 ? <Tag key="skipped" color="warning">跳过 {stats.skipped}</Tag> : null,
-    stats.failed > 0 ? <Tag key="failed" color="error">失败 {stats.failed}</Tag> : null,
+    <Tag key="success" color={stats.success > 0 ? 'success' : undefined}>成功 {stats.success}</Tag>,
+    <Tag key="skipped" color={stats.skipped > 0 ? 'warning' : undefined}>跳过 {stats.skipped}</Tag>,
+    <Tag key="failed" color={stats.failed > 0 ? 'error' : undefined}>失败 {stats.failed}</Tag>,
+    stats.interrupted > 0 ? <Tag key="interrupted" color="warning">中断 {stats.interrupted}</Tag> : null,
   ].filter(Boolean)
-  return tags.length > 0 ? <Space size={4} wrap>{tags}</Space> : <Text type="secondary">-</Text>
+  return <Space size={4} wrap>{tags}</Space>
 }
 
 function ManualSummary({ meta }: { meta: Record<string, unknown> }) {
@@ -125,7 +121,7 @@ function PaymentLinks({ urls }: { urls: unknown }) {
   )
 }
 
-function GenericSummary({ record, meta, errors }: { record: TaskDetailRecord; meta: Record<string, unknown>; errors: any[] }) {
+function GenericSummary({ record, meta, errors }: { record: TaskDetailRecord; meta: Record<string, unknown>; errors: unknown[] }) {
   return (
     <Space direction="vertical" style={{ width: '100%' }} size={8}>
       <Descriptions
@@ -161,7 +157,7 @@ export function TaskDetailHeader({ record }: TaskDetailHeaderProps) {
   const runtimeResults = asArray(meta.runtime_results)
   const isPhoneSignupDetail = source === 'phone_signup'
     || Boolean(asRecord(meta.phone_signup).enabled)
-    || runtimeResults.some((item: any) => String(item?.status || '') === 'registered_phone_signup')
+    || runtimeResults.some((item) => String(asRecord(item).status || '') === 'registered_phone_signup')
 
   const content = (() => {
     if (source === 'phone_binding_test') {

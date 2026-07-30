@@ -24,6 +24,7 @@ import { TaskDetailHeader } from '@/components/task-detail/TaskDetailHeader'
 import {
   SPECIAL_OUTCOME_LABELS,
   TASK_SOURCE_OPTIONS,
+  deriveTaskStats,
   statusLabel,
   statusTagColor,
   taskObjectSummary,
@@ -33,7 +34,7 @@ import { apiFetch } from '@/lib/utils'
 
 const { Text } = Typography
 
-type TaskStatus = 'running' | 'success' | 'failed' | 'skipped' | 'stopped' | 'pending_activation'
+type TaskStatus = 'running' | 'success' | 'failed' | 'skipped' | 'stopped' | 'partial' | 'interrupted' | 'pending_activation'
 type LogViewMode = 'info' | 'debug'
 type StatusFilter = 'all' | TaskStatus
 
@@ -53,8 +54,12 @@ interface TaskLogItem {
   success?: number
   skipped?: number
   failed?: number
+  interrupted?: number
+  total?: number
+  stats_available?: boolean
   meta_summary?: Record<string, unknown>
   detail?: TaskLogDetailPayload
+  [key: string]: unknown
 }
 
 interface TaskLogListResponse {
@@ -79,6 +84,10 @@ interface TaskLogDetailPayload {
   source?: string
   meta?: Record<string, unknown>
   logs?: string[]
+  action_logs?: string[]
+  log_lines?: string[]
+  runtime_logs?: string[]
+  logs_truncated?: boolean
   attempt_outcome?: string
   email?: string
   [key: string]: unknown
@@ -107,22 +116,19 @@ function outcomeOf(record?: TaskLogItem | TaskLogDetailResponse | null) {
 }
 
 function countStats(record: TaskLogItem | TaskLogDetailResponse) {
-  const errors = Array.isArray(record.detail?.errors) ? record.detail?.errors : []
-  return {
-    success: Number(record.success ?? record.detail?.success ?? 0),
-    skipped: Number(record.skipped ?? record.detail?.skipped ?? 0),
-    failed: Number(record.failed ?? errors.length ?? 0),
-  }
+  return deriveTaskStats(record)
 }
 
 function renderStatsTags(record: TaskLogItem | TaskLogDetailResponse) {
   const stats = countStats(record)
+  if (!stats.known) return <Text type="secondary">统计暂不可用</Text>
   const tags = [
-    stats.success > 0 ? <Tag key="success" color="success">成功 {stats.success}</Tag> : null,
-    stats.skipped > 0 ? <Tag key="skipped" color="warning">跳过 {stats.skipped}</Tag> : null,
-    stats.failed > 0 ? <Tag key="failed" color="error">失败 {stats.failed}</Tag> : null,
+    <Tag key="success" color={stats.success > 0 ? 'success' : undefined}>成功 {stats.success}</Tag>,
+    <Tag key="skipped" color={stats.skipped > 0 ? 'warning' : undefined}>跳过 {stats.skipped}</Tag>,
+    <Tag key="failed" color={stats.failed > 0 ? 'error' : undefined}>失败 {stats.failed}</Tag>,
+    stats.interrupted > 0 ? <Tag key="interrupted" color="warning">中断 {stats.interrupted}</Tag> : null,
   ].filter(Boolean)
-  return tags.length > 0 ? <Space size={4} wrap>{tags}</Space> : <Text type="secondary">-</Text>
+  return <Space size={4} wrap>{tags}</Space>
 }
 
 function renderStatus(record: TaskLogItem | TaskLogDetailResponse) {
@@ -132,6 +138,16 @@ function renderStatus(record: TaskLogItem | TaskLogDetailResponse) {
       <Tag color={statusTagColor(record.status)}>{statusLabel(record.status)}</Tag>
       {SPECIAL_OUTCOME_LABELS[outcome] ? <Tag>{SPECIAL_OUTCOME_LABELS[outcome]}</Tag> : null}
     </Space>
+  )
+}
+
+function renderSourceTag(record: TaskLogItem | TaskLogDetailResponse) {
+  const source = sourceOf(record)
+  const label = taskSourceLabel(source)
+  return (
+    <Tooltip title={label === '其他任务' && source ? `内部来源：${source}` : undefined}>
+      <Tag color="blue">{label}</Tag>
+    </Tooltip>
   )
 }
 
@@ -218,10 +234,23 @@ export default function TaskHistory() {
     }
   }
 
-  const rawDetailLines = useMemo(
-    () => (Array.isArray(detailRecord?.detail?.logs) ? detailRecord?.detail?.logs || [] : []),
-    [detailRecord],
-  )
+  const rawDetailLines = useMemo(() => {
+    const detail = detailRecord?.detail
+    if (!detail) return []
+    for (const key of ['logs', 'action_logs', 'log_lines', 'runtime_logs'] as const) {
+      if (Array.isArray(detail[key]) && detail[key].length > 0) return detail[key].map((line) => String(line || ''))
+    }
+    // A few pre-snapshot interrupted rows only retained the terminal error.
+    // Show it as a synthetic line instead of presenting an empty drawer.
+    const errors = Array.isArray(detail.errors) ? detail.errors : []
+    if (errors.length > 0) return errors.map((error) => `[ERROR] ${String(error || '')}`)
+    if (detailRecord.error) return [`[ERROR] ${detailRecord.error}`]
+    const status = String(detailRecord.status || detail.status_snapshot || '').trim().toLowerCase()
+    const progress = String(detail.progress || '').trim()
+    if (status === 'interrupted') return [`[INTERRUPTED] 任务已中断${progress ? `；进度 ${progress}` : ''}；当前历史记录未保存可见日志`]
+    if (status === 'stopped') return [`[STOPPED] 任务已停止${progress ? `；进度 ${progress}` : ''}；当前历史记录未保存可见日志`]
+    return []
+  }, [detailRecord])
   const parsedDetailLines = useMemo(() => rawDetailLines.map(parseLogLine), [rawDetailLines])
   const visibleDetailLines = useMemo(
     () => (viewMode === 'debug' ? parsedDetailLines : parsedDetailLines.filter((line) => !line.isDebug)),
@@ -260,7 +289,7 @@ export default function TaskHistory() {
       title: '任务类型',
       key: 'source',
       width: 130,
-      render: (_, record) => <Tag color="blue">{taskSourceLabel(sourceOf(record))}</Tag>,
+      render: (_, record) => renderSourceTag(record),
     },
     {
       title: '对象',
@@ -373,6 +402,8 @@ export default function TaskHistory() {
               { value: 'running', label: '运行中' },
               { value: 'success', label: '成功' },
               { value: 'failed', label: '失败' },
+              { value: 'partial', label: '部分失败' },
+              { value: 'interrupted', label: '远端中断' },
               { value: 'stopped', label: '已停止' },
               { value: 'skipped', label: '跳过' },
               { value: 'pending_activation', label: '历史待激活（已退役）' },
@@ -474,7 +505,7 @@ export default function TaskHistory() {
               {detailLoading ? (
                 <Text type="secondary">正在加载日志...</Text>
               ) : rawDetailLines.length === 0 ? (
-                <Empty description="这条历史记录还没有持久化完整日志" image={Empty.PRESENTED_IMAGE_SIMPLE} />
+                <Empty description="这条历史记录没有可显示的日志" image={Empty.PRESENTED_IMAGE_SIMPLE} />
               ) : visibleDetailLines.length === 0 ? (
                 <Text type="secondary">当前 {viewMode === 'debug' ? 'Debug' : 'Info'} 视图下没有可显示的日志</Text>
               ) : (
@@ -504,6 +535,14 @@ export default function TaskHistory() {
                 ))
               )}
             </div>
+            {detailRecord.detail?.logs_truncated ? (
+              <Alert
+                type="warning"
+                showIcon
+                message="日志窗口已裁剪"
+                description={`仅保留最近 ${rawDetailLines.length} 行；更早日志已丢弃。`}
+              />
+            ) : null}
           </div>
         ) : detailLoading ? (
           <Text type="secondary">正在加载详情...</Text>

@@ -793,6 +793,123 @@ def test_stop_task_persists_click_and_terminal_snapshots(monkeypatch, tmp_path):
     assert any("terminal drain log" in line for line in detail["logs"])
 
 
+def test_account_result_does_not_close_active_task_and_late_callback_keeps_terminal_snapshot(monkeypatch, tmp_path):
+    """Per-account success writes must not erase a later interrupted batch."""
+    from api import tasks
+    from core.task_runtime import RegisterTaskStore
+
+    test_engine = create_engine(
+        f"sqlite:///{tmp_path / 'account_result_race.db'}",
+        connect_args={"check_same_thread": False},
+    )
+    SQLModel.metadata.create_all(test_engine)
+    monkeypatch.setattr(tasks, "engine", test_engine)
+    store = RegisterTaskStore()
+    store.set_terminal_callback(tasks._persist_terminal_task_snapshot)
+    monkeypatch.setattr(tasks, "_task_store", store)
+
+    task_id = "task_account_result_race"
+    store.create(task_id, platform="chatgpt", total=3, source="manual")
+    store.mark_running(task_id)
+    tasks._log(task_id, "[OK] 第一个账号完成")
+    tasks._save_task_log(
+        "chatgpt",
+        "first@example.com",
+        "success",
+        detail=tasks._build_task_log_detail(task_id, {"attempt_outcome": "success"}),
+    )
+    with Session(test_engine) as session:
+        row = session.exec(select(TaskLog).where(TaskLog.task_id == task_id)).one()
+        assert row.status == "running"
+
+    tasks._log(task_id, "[INTERRUPTED] 远端结果未知")
+    store.finish(
+        task_id,
+        status="interrupted",
+        success=1,
+        skipped=0,
+        errors=["远端结果未知"],
+        error="远端结果未知",
+    )
+    # Simulate a worker callback that captured the old running snapshot.
+    tasks._save_task_log(
+        "chatgpt",
+        "first@example.com",
+        "success",
+        error="迟到回调错误",
+        detail={
+            "task_id": task_id,
+            "status_snapshot": "running",
+            "success": 0,
+            "skipped": 0,
+            "errors": [],
+            "logs": ["旧快照"],
+            "source": "manual",
+            "attempt_outcome": "success",
+        },
+    )
+
+    with Session(test_engine) as session:
+        row = session.exec(select(TaskLog).where(TaskLog.task_id == task_id)).one()
+        detail = json.loads(row.detail_json)
+    assert row.status == "interrupted"
+    assert row.error == "远端结果未知"
+    assert detail["status_snapshot"] == "interrupted"
+    assert detail["attempt_outcome"] == "task_interrupted"
+    assert any("远端结果未知" in line for line in detail["logs"])
+    history = tasks.get_logs(platform="chatgpt")
+    assert history["items"][0]["status"] == "interrupted"
+    assert history["items"][0]["interrupted"] == 1
+
+
+def test_history_stats_are_recovered_from_legacy_registration_meta_and_summary():
+    from api import tasks
+
+    detail = {
+        "status_snapshot": "running",
+        "progress": "2/10",
+        "meta": {"registered_accounts": [{"account_id": 1}, {"account_id": 2}]},
+        "logs": ["[SUMMARY] 完成: 成功 2 个, 跳过 1 个, 失败 3 个"],
+    }
+    stats = tasks._task_log_stats(detail, status="stopped")
+    assert stats["success"] == 2
+    assert stats["skipped"] == 1
+    assert stats["failed"] == 3
+    assert stats["total"] == 10
+    assert stats["stats_available"] is True
+
+
+def test_history_stats_do_not_present_unknown_stale_running_counts_as_known_zero():
+    from api import tasks
+
+    stale = tasks._task_log_stats(
+        {
+            "status_snapshot": "running",
+            "progress": "0/10",
+            "success": 0,
+            "skipped": 0,
+            "errors": [],
+            "logs": [],
+        },
+        status="stopped",
+    )
+    assert stale["stats_available"] is False
+
+    terminal = tasks._task_log_stats(
+        {
+            "status_snapshot": "stopped",
+            "progress": "0/10",
+            "success": 0,
+            "skipped": 0,
+            "errors": [],
+            "logs": [],
+        },
+        status="stopped",
+    )
+    assert terminal["stats_available"] is True
+    assert terminal["total"] == 10
+
+
 def test_api_tasks_preserves_blank_log_lines_in_sse(monkeypatch):
     from api import tasks
     from core.task_runtime import RegisterTaskStore

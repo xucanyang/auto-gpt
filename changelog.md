@@ -10,6 +10,8 @@
 - **新增 Docker 测试规范**：`docs/testing-in-docker.md` 固化运行依赖统一、测试镜像与生产镜像同源、一次性测试容器、临时数据库/共享配置、网络隔离、浏览器资源约束和外部实时烟测分层要求，明确禁止在常驻业务容器或生产挂载上执行完整 pytest。
 
 ### 优化 (Changed)
+- **统一任务历史展示契约**：`api/tasks.py` 的任务历史列表与详情现在统一输出 `success / skipped / failed / interrupted / total / stats_available`，并从旧快照的 `registered_accounts`、`auth_pending_accounts`、`runtime_results`、Idea 提交摘要、错误列表及 `[SUMMARY]`/结果日志恢复统计；`frontend/src/lib/taskTypes.ts`、`TaskHistory.tsx` 与 `TaskDetailHeader.tsx` 对零值统计、状态别名和中断数量使用同一套推导规则，无法从旧数据可靠恢复时明确显示“统计暂不可用”，不再留空或伪造零值结论。
+- **收敛任务类型中文显示**：任务历史补齐本地状态同步、HME 复测、支付链接清理、浏览器认证、手动轮询、代理池测试及历史 `codex_*` / `register_*` 等来源映射；未知英文内部来源统一展示为“其他任务”，桌面端仅在 tooltip 保留内部 `source` 供排障，避免实现键直接暴露给操作员。
 - **收敛 Idea 订单轮询生命周期**：`main.py` 不再在服务启动时自动恢复旧的 BaxiGPT/Idea 订单，`services/chatgpt_core/baxigpt_status_poller.py` 关闭账号级常驻补偿扫描；显式卡密轮询接口仍保留。这样本地 Idea 任务因停止、异常或服务重启结束后，不会继续产生隐藏的上游状态请求。
 - **持久化本地任务停止语义**：`api/tasks.py` 在 Idea 提交任务收尾阶段调用轮询停止逻辑，将同一任务遗留的未终态账号订单写为 `stopped` 并保存 `polling_disabled`、停止时间和原因；账号列表状态、提交摘要和前端筛选同步支持“已停止”，避免旧 `processing` 记录在后续调用中重新入队。
 
@@ -19,6 +21,9 @@
 - **统一测试文档入口**：`README.md`、`AGENTS.md` 与 `docs/docker-image-release.md` 现在统一指向 Docker 测试规范，移除会吞掉收集失败的 `pytest tests -q || true` 作为推荐门禁，明确当前 `requirements-test.txt`、`docker-compose.test.yml` 和测试脚本仍待落地。
 
 ### 修复 (Fixed)
+- **修复运行中断后历史详情无日志**：`api/tasks.py` 为活跃任务增加低频日志 checkpoint，并在停止、中断、错误、致命异常和汇总节点立即持久化；终态快照与历史日志窗口按单调游标合并，迟到的单账号回调不能再把整批任务提前写成成功/失败，也不能覆盖已保存的终态状态、错误、统计和完整日志。旧版本遗留的同一 `task_id` 重复行会在详情读取时只读合并，尽可能恢复完整日志窗口且不改写生产数据库。
+- **保留旧任务的明确成功结论**：历史运行态只对数据库仍为 `running` 且当前进程已无对应任务的记录归一为“已停止”；数据库已经明确写为 `success/done/completed` 的旧记录继续显示成功，避免因旧快照停留在 `running` 而批量误判。
+- **同步侧栏可见版本为 `v2.8.66`**：`frontend/src/app/AppShell.tsx` 更新版本标识，便于确认三个常驻实例已加载本次任务历史修复。
 - **修复 Idea 任务中断后仍被后台轮询的问题**：`services/chatgpt_core/baxigpt_status_poller.py` 在入队和实际请求前检查持久化停止标记，已停止订单直接移除 target，不访问上游；`api/accounts.py`、`services/account_filters.py` 与 `frontend/src/pages/Accounts.tsx` 保留上游原始状态并明确展示本地停止结果。
 - **修复服务重启造成的旧订单自动恢复**：移除 `main.py` 对 `restore_pending_targets()` 的启动调用，防止本地任务快照丢失后又从 `processing` 卡密记录恢复轮询。
 - **同步侧栏可见版本为 `v2.8.64`**：`frontend/src/app/AppShell.tsx` 更新版本标识，便于确认三个常驻实例已经加载本次 Idea 轮询生命周期修复。
@@ -38,6 +43,7 @@
 - **修正 Docker 发布拓扑旧描述**：`docs/docker-image-release.md` 按当前 `docker-compose.multi.yml` 更新为 `auto-gpt`、`auto-gpt-plus`、`auto-plus2` 三个常驻业务实例与 `phone-api-relay` 共同运行，移除主服务 standby 的过时说法。
 
 ### 测试 (Tests)
+- **补充任务历史回归覆盖**：`tests/test_chatgpt_task_logging.py` 锁定活跃批任务的单账号结果不得提前关闭整批、终态中断不得被迟到回调覆盖、旧注册统计/汇总恢复、未知旧统计不得伪装为已知零值，以及内存日志压缩后仍保留持久化完整窗口；`tests/test_task_logs_history.py` 覆盖重复旧行的详情日志合并和明确成功状态不被误判。前端执行 Node 合同测试与生产构建。
 - 新增 Idea 任务停止标记、轮询队列清理、手动入队拦截、账号筛选和提交摘要回归测试；相关专项测试共 `44 passed`，BaxiGPT 卡密提交专项 `49 passed`。
 - **补充手机号绑定模式回归**：`tests/test_phone_pool.py` 覆盖指定前缀内 `available / unavailable / all` 的行级候选边界；`tests/test_phone_pool_task_integration.py` 覆盖限定号段不可用固定快照、全池 `cannot_send` 全量候选快照、候选数超过账号数时的未覆盖统计及 legacy 布尔模式优先级；`tests/test_phone_prefix_ui_contract.py` 锁定新模式、状态筛选、不可用号段可选、候选预览和请求字段契约。使用一次性 Docker 容器、`--network none`、只读 checkout 和临时运行目录执行该专项，结果为 `55 passed`。
 - 新增 HME Ready 测试字段回归覆盖：普通 prepare 的调用参数保持向后兼容，测试模式才携带 Tag 长度实验所需的物理 alias、Tag、scheme 与 run 标识；`tests/test_icloud_hme_mailbox_finalize.py` 专项回归 `29 passed`。
@@ -3138,4 +3144,8 @@
 
 ## 2026-07-30 09:06:39 +0800
 - 补齐 Idea 停止轮询的独立卡密池兼容性
+- 发布模式: multi
+
+## 2026-07-30 09:56:43 +0800
+- 修复任务历史中文类型、统计恢复与中断日志持久化
 - 发布模式: multi

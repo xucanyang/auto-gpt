@@ -62,6 +62,30 @@ class TaskLogHistoryTests(unittest.TestCase):
 
         self.assertEqual(result["items"][0]["status"], "stopped")
 
+    def test_explicit_legacy_success_is_not_reclassified_when_snapshot_was_running(self):
+        with Session(self.engine) as session:
+            row = TaskLog(
+                task_id="task_legacy_success",
+                platform="chatgpt",
+                email="demo@example.com",
+                status="success",
+                detail_json=json.dumps(
+                    {
+                        "task_id": "task_legacy_success",
+                        "status_snapshot": "running",
+                        "progress": "7/7",
+                        "attempt_outcome": "batch_sub2api_upload_success",
+                    },
+                    ensure_ascii=False,
+                ),
+            )
+            session.add(row)
+            session.commit()
+
+        result = tasks_api.get_logs(platform="chatgpt", page=1, page_size=50)
+
+        self.assertEqual(result["items"][0]["status"], "success")
+
     def test_batch_delete_logs_removes_whole_task_group(self):
         first = self._add_log(status="running", task_id="task_group")
         self._add_log(status="success", task_id="task_group")
@@ -73,6 +97,54 @@ class TaskLogHistoryTests(unittest.TestCase):
         with Session(self.engine) as session:
             rows = session.exec(select(TaskLog)).all()
         self.assertEqual(rows, [])
+
+    def test_detail_read_recovers_logs_from_legacy_duplicate_rows(self):
+        task_id = "task_legacy_duplicate_rows"
+        with Session(self.engine) as session:
+            first = TaskLog(
+                task_id=task_id,
+                platform="chatgpt",
+                email="demo@example.com",
+                status="running",
+                detail_json=json.dumps(
+                    {
+                        "task_id": task_id,
+                        "status_snapshot": "running",
+                        "logs": ["line-1", "line-2"],
+                        "log_start_index": 0,
+                        "log_next_index": 2,
+                    },
+                    ensure_ascii=False,
+                ),
+            )
+            second = TaskLog(
+                task_id=task_id,
+                platform="chatgpt",
+                email="demo@example.com",
+                status="interrupted",
+                detail_json=json.dumps(
+                    {
+                        "task_id": task_id,
+                        "status_snapshot": "interrupted",
+                        "logs": ["line-2", "line-3"],
+                        "log_start_index": 1,
+                        "log_next_index": 3,
+                        "errors": ["remote interrupted"],
+                    },
+                    ensure_ascii=False,
+                ),
+            )
+            session.add(first)
+            session.commit()
+            session.refresh(first)
+            session.add(second)
+            session.commit()
+            session.refresh(second)
+            second_id = int(second.id or 0)
+
+        payload = tasks_api.get_log_detail(second_id)
+        assert payload["status"] == "interrupted"
+        assert payload["detail"]["logs"] == ["line-1", "line-2", "line-3"]
 
 
 if __name__ == "__main__":

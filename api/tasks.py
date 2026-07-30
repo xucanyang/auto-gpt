@@ -135,6 +135,41 @@ _pix_cdk_usage_store = PixCdkUsageStore()
 _TASK_STAGE_STARTED_AT: dict[tuple[str, str], str] = {}
 _PIX_PAYMENT_LINK_CLEANUP_TASK_LOCK = threading.Lock()
 
+# ``TaskLog.status`` predates the in-memory task store and several older
+# runners used ``success``/``skipped`` as an account-level result while the
+# batch was still running.  Treat those values as terminal only when the
+# runtime task itself is gone or terminal; otherwise a single account result
+# must never close the whole task in history.
+_TASK_HISTORY_TERMINAL_STATUSES = frozenset(
+    {
+        *TERMINAL_TASK_STATUSES,
+        "success",
+        "succeeded",
+        "complete",
+        "completed",
+        "skipped",
+        "cancelled",
+        "canceled",
+        "aborted",
+        "terminated",
+    }
+)
+
+
+def _task_status_is_terminal(value: Any) -> bool:
+    return str(value or "").strip().lower() in _TASK_HISTORY_TERMINAL_STATUSES
+
+
+def _nonnegative_count(value: Any, default: int | None = None) -> int | None:
+    """Parse a bounded history counter without turning malformed data into 0."""
+    if value is None or isinstance(value, bool):
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return max(parsed, 0)
+
 
 # A page that was already open while a new frontend is deployed continues to
 # execute its old JavaScript.  The v1 task modal had an effect dependency loop
@@ -6041,6 +6076,64 @@ def enqueue_chatgpt_oaipay_approval_task(
     }
 
 
+_TASK_LOG_CHECKPOINT_LOCK = threading.Lock()
+_TASK_LOG_CHECKPOINT_STATE: dict[str, tuple[int, float]] = {}
+_TASK_LOG_CHECKPOINT_EVERY_ENTRIES = 200
+_TASK_LOG_CHECKPOINT_EVERY_SECONDS = 10.0
+
+
+def _maybe_persist_task_log_checkpoint(task_id: str, message: str) -> None:
+    """Periodically persist the active log window.
+
+    Terminal callbacks cover cooperative stops, but a worker can also be
+    killed by a browser hard-timeout or a process restart before its ``finally``
+    block runs.  A low-frequency checkpoint leaves enough history for the
+    persisted task row without turning every log line into a SQLite write.
+    """
+    task_key = str(task_id or "").strip()
+    if not task_key:
+        return
+    try:
+        task_exists = _task_store.exists(task_key)
+    except Exception:
+        task_exists = False
+    if not task_exists:
+        with _TASK_LOG_CHECKPOINT_LOCK:
+            _TASK_LOG_CHECKPOINT_STATE.pop(task_key, None)
+        return
+
+    # Use wall-clock time here rather than the task-control monotonic clock;
+    # runners/tests may deliberately stub ``time.monotonic`` for retry timing.
+    now = time.time()
+    text = str(message or "").lower()
+    urgent = any(
+        marker in text
+        for marker in ("[stop]", "[interrupted]", "中断", "任务已手动停止", "[fatal]", "[error]", "[summary]")
+    )
+    with _TASK_LOG_CHECKPOINT_LOCK:
+        previous_count, previous_at = _TASK_LOG_CHECKPOINT_STATE.get(task_key, (0, now))
+        next_count = previous_count + 1
+        should_persist = urgent or next_count >= _TASK_LOG_CHECKPOINT_EVERY_ENTRIES or now - previous_at >= _TASK_LOG_CHECKPOINT_EVERY_SECONDS
+        if should_persist:
+            _TASK_LOG_CHECKPOINT_STATE[task_key] = (0, now)
+        else:
+            _TASK_LOG_CHECKPOINT_STATE[task_key] = (next_count, previous_at)
+    if not should_persist:
+        return
+    snapshot = _task_store_snapshot_or_none(task_key)
+    if snapshot is None:
+        return
+    runtime_status = str(snapshot.get("status") or "").strip().lower()
+    if runtime_status in TERMINAL_TASK_STATUSES:
+        with _TASK_LOG_CHECKPOINT_LOCK:
+            _TASK_LOG_CHECKPOINT_STATE.pop(task_key, None)
+        return
+    try:
+        _persist_task_snapshot(task_key, attempt_outcome="task_running_checkpoint", snapshot=snapshot)
+    except Exception:
+        logger.debug("active task log checkpoint failed task_id=%s", task_key, exc_info=True)
+
+
 def _log(
     task_id: str,
     msg: str,
@@ -6068,6 +6161,7 @@ def _log(
     text = redact_log_text(text, expose_phone=expose_phone, expose_otp=expose_otp)
     entry = f"[{ts}] {text}"
     _task_store.append_log(task_id, entry)
+    _maybe_persist_task_log_checkpoint(task_id, text)
     print(entry)
 
 
@@ -6225,6 +6319,185 @@ def _task_timeline_log(
     return line
 
 
+_TASK_SNAPSHOT_DETAIL_KEYS = frozenset(
+    {
+        "task_id",
+        "status_snapshot",
+        "progress",
+        "success",
+        "skipped",
+        "errors",
+        "cashier_urls",
+        "source",
+        "meta",
+        "logs",
+        "logs_truncated",
+        "dropped_log_entries",
+        "dropped_log_bytes",
+        "retained_log_bytes",
+        "log_start_index",
+        "log_next_index",
+        "control",
+        "capabilities",
+    }
+)
+_TASK_LOG_WINDOW_KEYS = (
+    "logs",
+    "logs_truncated",
+    "dropped_log_entries",
+    "dropped_log_bytes",
+    "retained_log_bytes",
+    "log_start_index",
+    "log_next_index",
+)
+
+
+def _task_store_snapshot_or_none(task_id: str) -> dict[str, Any] | None:
+    if not task_id:
+        return None
+    try:
+        if not _task_store.exists(task_id):
+            return None
+        snapshot = _task_store.snapshot(task_id)
+        return snapshot if isinstance(snapshot, dict) else None
+    except Exception:
+        # A task can be cleaned up between ``exists`` and ``snapshot``.  DB
+        # history must remain writable in that small race window.
+        return None
+
+
+def _task_log_cursor(detail: dict[str, Any] | None) -> int:
+    payload = detail if isinstance(detail, dict) else {}
+    value = _nonnegative_count(payload.get("log_next_index"))
+    if value is not None:
+        return value
+    logs = payload.get("logs")
+    return len(logs) if isinstance(logs, list) else 0
+
+
+def _merge_task_meta(runtime_meta: Any, incoming_meta: Any) -> dict[str, Any]:
+    """Merge per-task metadata without allowing an older account callback to
+    replace the runtime's aggregate lists/counters.
+    """
+    base = dict(runtime_meta) if isinstance(runtime_meta, dict) else {}
+    extra = incoming_meta if isinstance(incoming_meta, dict) else {}
+    for key, value in extra.items():
+        if key not in base:
+            base[key] = value
+            continue
+        current = base[key]
+        if isinstance(current, list) and isinstance(value, list):
+            if len(value) > len(current):
+                base[key] = value
+            continue
+        if isinstance(current, dict) and isinstance(value, dict):
+            merged = dict(current)
+            for nested_key, nested_value in value.items():
+                if nested_key not in merged or not merged[nested_key]:
+                    merged[nested_key] = nested_value
+            base[key] = merged
+            continue
+        # Scalar fields supplied by a terminal/final callback are useful, but
+        # an active runtime snapshot remains authoritative for its own fields.
+        if current in (None, "", 0, False):
+            base[key] = value
+    return base
+
+
+def _merge_runtime_snapshot_detail(
+    incoming: dict[str, Any],
+    snapshot: dict[str, Any],
+    *,
+    task_id: str,
+) -> dict[str, Any]:
+    """Make the in-memory task snapshot authoritative for history writes.
+
+    Account-level runners still call ``_save_task_log(..., status="success")``
+    before a batch is complete.  The runtime snapshot tells us whether that is
+    merely an account result or the actual task terminal state, and also gives
+    us the complete log window and aggregate counters.
+    """
+    runtime = _build_task_log_detail(task_id, snapshot=snapshot)
+    merged = dict(incoming)
+    for key in _TASK_SNAPSHOT_DETAIL_KEYS:
+        if key in _TASK_LOG_WINDOW_KEYS:
+            continue
+        if key == "meta":
+            merged[key] = _merge_task_meta(runtime.get(key), incoming.get(key))
+            continue
+        if key in runtime:
+            merged[key] = runtime[key]
+    runtime_cursor = _task_log_cursor(runtime)
+    incoming_cursor = _task_log_cursor(incoming)
+    chosen_window = runtime if runtime_cursor >= incoming_cursor else incoming
+    for window_key in _TASK_LOG_WINDOW_KEYS:
+        if window_key in chosen_window:
+            merged[window_key] = chosen_window[window_key]
+    merged["task_id"] = task_id
+    return merged
+
+
+def _preserve_existing_history_window(
+    existing: dict[str, Any],
+    incoming: dict[str, Any],
+) -> dict[str, Any]:
+    """Never erase a longer persisted log window with a stale callback."""
+    result = dict(incoming)
+    existing_cursor = _task_log_cursor(existing)
+    incoming_cursor = _task_log_cursor(incoming)
+    existing_logs = existing.get("logs") if isinstance(existing.get("logs"), list) else []
+    incoming_logs = incoming.get("logs") if isinstance(incoming.get("logs"), list) else []
+    existing_start = _nonnegative_count(existing.get("log_start_index"), default=max(existing_cursor - len(existing_logs), 0)) or 0
+    incoming_start = _nonnegative_count(incoming.get("log_start_index"), default=max(incoming_cursor - len(incoming_logs), 0)) or 0
+    if existing_logs and incoming_logs:
+        # Both snapshots carry a monotonic cursor.  Join overlapping/adjacent
+        # windows so a terminal compacted tail cannot discard an earlier
+        # checkpoint window.
+        existing_end = existing_start + len(existing_logs)
+        incoming_end = incoming_start + len(incoming_logs)
+        if incoming_start <= existing_end and existing_start <= incoming_end:
+            by_index = {existing_start + index: line for index, line in enumerate(existing_logs)}
+            by_index.update({incoming_start + index: line for index, line in enumerate(incoming_logs)})
+            merged_start = min(existing_start, incoming_start)
+            merged_end = max(existing_end, incoming_end)
+            merged_logs = [by_index[index] for index in range(merged_start, merged_end) if index in by_index]
+            result["logs"] = merged_logs
+            result["log_start_index"] = merged_start
+            result["log_next_index"] = max(existing_cursor, incoming_cursor, merged_start + len(merged_logs))
+            result["logs_truncated"] = bool(existing.get("logs_truncated") or incoming.get("logs_truncated"))
+            result["dropped_log_entries"] = max(
+                _nonnegative_count(existing.get("dropped_log_entries"), 0) or 0,
+                _nonnegative_count(incoming.get("dropped_log_entries"), 0) or 0,
+            )
+            result["dropped_log_bytes"] = max(
+                _nonnegative_count(existing.get("dropped_log_bytes"), 0) or 0,
+                _nonnegative_count(incoming.get("dropped_log_bytes"), 0) or 0,
+            )
+            result["retained_log_bytes"] = max(
+                _nonnegative_count(existing.get("retained_log_bytes"), 0) or 0,
+                _nonnegative_count(incoming.get("retained_log_bytes"), 0) or 0,
+            )
+        elif existing_cursor >= incoming_cursor or len(existing_logs) >= len(incoming_logs):
+            for key in _TASK_LOG_WINDOW_KEYS:
+                if key in existing:
+                    result[key] = existing[key]
+    elif existing_logs and not incoming_logs:
+        for key in _TASK_LOG_WINDOW_KEYS:
+            if key in existing:
+                result[key] = existing[key]
+    # A stale account callback can also carry zeroed counters after a terminal
+    # snapshot.  Keep larger known aggregate values when the cursor did not
+    # advance; this is what makes interrupted/success history stable under
+    # late worker callbacks.
+    if existing_cursor >= incoming_cursor:
+        for key in ("success", "skipped", "failed", "interrupted"):
+            old_value = _nonnegative_count(existing.get(key), default=None)
+            new_value = _nonnegative_count(result.get(key), default=None)
+            if old_value is not None and (new_value is None or old_value > new_value):
+                result[key] = old_value
+    return result
+
+
 def _save_task_log(
     platform: str | None,
     email: str | None,
@@ -6232,7 +6505,13 @@ def _save_task_log(
     error: str = "",
     detail: dict | None = None,
 ):
-    """Write or update one TaskLog record per task_id."""
+    """Write or update one durable task history snapshot.
+
+    The task store is the source of truth while a task exists.  This prevents
+    account-level success/failure writes from closing a batch early and keeps a
+    terminal interruption's complete log window from being overwritten by a
+    late, older callback.
+    """
     raw_detail = detail or {}
     safe_detail = sanitize_task_detail(raw_detail)
     if not isinstance(safe_detail, dict):
@@ -6247,15 +6526,44 @@ def _save_task_log(
         safe_detail["logs"] = list(raw_detail.get("logs") or [])
     safe_detail.setdefault("redaction_version", REDACTION_VERSION)
     task_id = str(safe_detail.get("task_id") or "").strip()
+    incoming_declares_terminal = _task_status_is_terminal(
+        safe_detail.get("status_snapshot")
+    )
+
+    runtime_snapshot = _task_store_snapshot_or_none(task_id)
+    runtime_status = str((runtime_snapshot or {}).get("status") or "").strip().lower()
+    if runtime_snapshot is not None:
+        safe_detail = _merge_runtime_snapshot_detail(
+            safe_detail,
+            runtime_snapshot,
+            task_id=task_id,
+        )
+        if runtime_status in TERMINAL_TASK_STATUSES:
+            effective_status = runtime_status
+        elif runtime_status in {"pending", "running"}:
+            # ``success``/``failed`` here are per-account outcomes only.
+            effective_status = "running"
+        else:
+            effective_status = str(status or "running")
+    else:
+        effective_status = str(status or "running")
+
     safe_error = sanitize_error_message(error)
     with Session(engine) as s:
         log = None
+        existing_detail: dict[str, Any] = {}
         if task_id:
             log = s.exec(
                 select(TaskLog)
                 .where(TaskLog.task_id == task_id)
                 .order_by(TaskLog.id.desc())
             ).first()
+            if log is not None:
+                try:
+                    parsed = json.loads(log.detail_json or "{}")
+                    existing_detail = parsed if isinstance(parsed, dict) else {}
+                except (TypeError, ValueError):
+                    existing_detail = {}
 
         if log is None:
             log = TaskLog(
@@ -6265,7 +6573,7 @@ def _save_task_log(
                 # account.  TaskLog.email is NOT NULL, while ``None`` on an
                 # existing row intentionally means preserve its email.
                 email=email if email is not None else "",
-                status=status,
+                status=effective_status,
                 error=safe_error,
                 detail_json=json.dumps(safe_detail, ensure_ascii=False),
             )
@@ -6279,46 +6587,58 @@ def _save_task_log(
                 log.platform = platform
             if email is not None:
                 log.email = email
-            # A terminal callback may win the race with a stop-click
-            # checkpoint.  Never turn a completed history row back into
-            # running merely because the click was processed concurrently.
-            if log.status in TERMINAL_TASK_STATUSES and status == "running":
-                return
-            if log.status in TERMINAL_TASK_STATUSES and status in TERMINAL_TASK_STATUSES:
-                try:
-                    existing_detail = json.loads(log.detail_json or "{}")
-                except (TypeError, ValueError):
-                    existing_detail = {}
-                existing_logs = (
-                    list(existing_detail.get("logs") or [])
-                    if isinstance(existing_detail, dict)
-                    else []
-                )
-                incoming_logs = list(safe_detail.get("logs") or [])
-                existing_next_index = int(
-                    (existing_detail or {}).get("log_next_index")
-                    or len(existing_logs)
-                )
-                incoming_next_index = int(
-                    safe_detail.get("log_next_index")
-                    or len(incoming_logs)
-                )
-                if (
-                    len(existing_logs) > len(incoming_logs)
-                    and existing_next_index >= incoming_next_index
-                ):
-                    for key in (
-                        "logs",
-                        "logs_truncated",
-                        "dropped_log_entries",
-                        "dropped_log_bytes",
-                        "retained_log_bytes",
-                        "log_start_index",
-                        "log_next_index",
+
+            existing_status = str(log.status or "").strip().lower()
+            incoming_status = str(effective_status or "").strip().lower()
+            existing_cursor = _task_log_cursor(existing_detail)
+            incoming_cursor = _task_log_cursor(safe_detail)
+            preserve_existing_terminal_error = False
+
+            # A terminal row wins over a stale non-terminal callback.  A
+            # newer terminal runtime snapshot may still replace an older
+            # account-level ``success`` row.
+            if _task_status_is_terminal(existing_status) and not _task_status_is_terminal(incoming_status):
+                effective_status = existing_status
+                incoming_status = existing_status
+                preserve_existing_terminal_error = True
+                preserved = dict(existing_detail)
+                for key, value in safe_detail.items():
+                    if key not in _TASK_SNAPSHOT_DETAIL_KEYS and (key not in preserved or not preserved[key]):
+                        preserved[key] = value
+                safe_detail = preserved
+            elif (
+                _task_status_is_terminal(existing_status)
+                and _task_status_is_terminal(incoming_status)
+                and incoming_cursor <= existing_cursor
+            ):
+                # Keep terminal aggregate fields from the longer/equal
+                # snapshot but retain meaningful descriptive fields supplied
+                # by the callback (for example an Idea summary).  Empty fields
+                # from a stale account callback must not erase the terminal
+                # outcome marker.
+                preserve_existing_terminal_error = not incoming_declares_terminal
+                preserved = dict(existing_detail)
+                for key, value in safe_detail.items():
+                    if key in _TASK_SNAPSHOT_DETAIL_KEYS:
+                        preserved[key] = value
+                    elif (
+                        value not in (None, "", [], {})
+                        and (
+                            incoming_declares_terminal
+                            or key not in preserved
+                            or preserved[key] in (None, "", [], {})
+                        )
                     ):
-                        if key in existing_detail:
-                            safe_detail[key] = existing_detail[key]
-            log.status = status
+                        preserved[key] = value
+                safe_detail = preserved
+
+            safe_detail = _preserve_existing_history_window(existing_detail, safe_detail)
+            if log.error and (
+                preserve_existing_terminal_error
+                or (not safe_error and _task_status_is_terminal(existing_status))
+            ):
+                safe_error = str(log.error or "")
+            log.status = effective_status
             log.error = safe_error
             log.detail_json = json.dumps(safe_detail, ensure_ascii=False)
             s.add(log)
@@ -6407,13 +6727,17 @@ def _persist_task_snapshot(
 def _persist_terminal_task_snapshot(task_id: str, snapshot: dict[str, Any]) -> None:
     """Store callback: terminal runners always leave a complete TaskLog row."""
     terminal_status = str(snapshot.get("status") or "stopped")
-    _persist_task_snapshot(
-        task_id,
-        status=terminal_status,
-        attempt_outcome=f"task_{terminal_status}",
-        error=str(snapshot.get("error") or ""),
-        snapshot=snapshot,
-    )
+    try:
+        _persist_task_snapshot(
+            task_id,
+            status=terminal_status,
+            attempt_outcome=f"task_{terminal_status}",
+            error=str(snapshot.get("error") or ""),
+            snapshot=snapshot,
+        )
+    finally:
+        with _TASK_LOG_CHECKPOINT_LOCK:
+            _TASK_LOG_CHECKPOINT_STATE.pop(str(task_id or "").strip(), None)
 
 
 # Keep all task implementations honest: many historical runners wrote their
@@ -6473,33 +6797,236 @@ def _task_log_meta_summary(detail: dict[str, Any]) -> dict[str, Any]:
     return summary
 
 
+def _task_log_stats(detail: dict[str, Any], *, status: str = "") -> dict[str, Any]:
+    """Derive a stable aggregate for both new and legacy task snapshots.
+
+    Older rows contain only per-account ``success`` writes or a running
+    snapshot, while newer batch runners put their counters under ``meta``.
+    History must expose one consistent shape instead of making the UI guess
+    which generation produced the row.
+    """
+    payload = detail if isinstance(detail, dict) else {}
+    meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+    errors = payload.get("errors") if isinstance(payload.get("errors"), list) else []
+    logs = payload.get("logs") if isinstance(payload.get("logs"), list) else []
+    normalized_status = str(status or payload.get("status_snapshot") or "").strip().lower()
+    snapshot_status = str(payload.get("status_snapshot") or "").strip().lower()
+
+    counts: dict[str, int] = {"success": 0, "skipped": 0, "failed": 0, "interrupted": 0}
+    evidence = False
+
+    def apply_count(key: str, value: Any, *, force: bool = False) -> None:
+        nonlocal evidence
+        parsed = _nonnegative_count(value)
+        if parsed is None:
+            return
+        if parsed > 0 or force:
+            evidence = True
+        # History updates arrive out of order.  Aggregate evidence is
+        # monotonic within a task; a later stale snapshot must never lower a
+        # counter that was already persisted.
+        if parsed > counts[key]:
+            counts[key] = parsed
+
+    # Direct snapshot counters are authoritative when non-zero.  A zero-only
+    # legacy snapshot is deliberately allowed to be enriched by the sections
+    # below (registered_accounts/runtime_results/log summaries).
+    for key in counts:
+        if key in payload:
+            apply_count(
+                key,
+                payload.get(key),
+                force=_task_status_is_terminal(snapshot_status),
+            )
+
+    for key, target in (
+        ("runtime_success", "success"),
+        ("runtime_skipped", "skipped"),
+        ("runtime_interrupted", "interrupted"),
+    ):
+        if key in meta:
+            apply_count(target, meta.get(key), force=True)
+    runtime_errors = meta.get("runtime_errors")
+    if isinstance(runtime_errors, list):
+        apply_count("failed", len(runtime_errors), force=True)
+
+    idea_summary = meta.get("idea_submit_summary")
+    if not isinstance(idea_summary, dict):
+        idea_summary = payload.get("idea_submit_summary")
+    if isinstance(idea_summary, dict):
+        apply_count("success", idea_summary.get("success") or idea_summary.get("paid") or idea_summary.get("completed"), force=True)
+        apply_count("skipped", idea_summary.get("skipped") or idea_summary.get("unsubmitted"), force=True)
+        apply_count(
+            "failed",
+            _nonnegative_count(idea_summary.get("failed"), 0) + _nonnegative_count(idea_summary.get("timeout"), 0),
+            force=True,
+        )
+        apply_count("interrupted", idea_summary.get("interrupted"), force=True)
+
+    # Structured result arrays are present on phone/OaiPay/payment runners.
+    for result_key in ("runtime_results", "account_results", "results"):
+        items = meta.get(result_key)
+        if not isinstance(items, list):
+            items = payload.get(result_key)
+        if not isinstance(items, list) or not items:
+            continue
+        local = {"success": 0, "skipped": 0, "failed": 0, "interrupted": 0}
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            item_status = str(item.get("status") or item.get("result") or "").strip().lower()
+            if item_status in {"success", "succeeded", "done", "completed", "ok", "alive", "bound", "uploaded", "paid", "registered_phone_signup"} or item.get("ok") is True:
+                local["success"] += 1
+            elif item_status in {"skipped", "skip", "unsubmitted", "not_started", "not_tested", "not_available", "no_phone_available"}:
+                local["skipped"] += 1
+            elif item_status in {"interrupted", "remote_interrupted", "timeout", "timed_out"}:
+                local["interrupted"] += 1
+            elif item_status or item.get("ok") is False:
+                local["failed"] += 1
+        for key, value in local.items():
+            if value:
+                apply_count(key, value, force=True)
+
+    registered_accounts = meta.get("registered_accounts")
+    if isinstance(registered_accounts, list):
+        apply_count("success", len(registered_accounts), force=True)
+    auth_pending_accounts = meta.get("auth_pending_accounts")
+    if isinstance(auth_pending_accounts, list):
+        # Some old registration rows recorded only the committed-but-pending
+        # account list.  It is still a successful registration outcome.
+        apply_count("success", len(auth_pending_accounts), force=True)
+
+    # Registration result lines and generic batch markers are useful for rows
+    # written before aggregate counters were introduced.  Ignore summary lines
+    # here; they are parsed separately below to avoid double counting.
+    outcome_counts = {"success": 0, "skipped": 0, "failed": 0, "interrupted": 0}
+    marker_counts = {"success": 0, "skipped": 0, "failed": 0, "interrupted": 0}
+    summary_candidates: list[tuple[int, int, int, int]] = []
+    for raw_line in logs:
+        line = str(raw_line or "")
+        lowered = line.lower()
+        if "[summary]" in lowered or "[汇总]" in line or "完成:" in line or "失败:" in line or "任务已停止" in line:
+            match = re.search(
+                r"成功\s*[=:：]?\s*(\d+).*?跳过\s*[=:：]?\s*(\d+).*?失败\s*[=:：]?\s*(\d+)(?:.*?中断\s*[=:：]?\s*(\d+))?",
+                line,
+                re.IGNORECASE,
+            )
+            if match:
+                summary_candidates.append(tuple(int(group or 0) for group in match.groups()))
+        outcome = re.search(r"\boutcome\s*=\s*(SUCCESS|SKIPPED|FAILED|STOPPED|INTERRUPTED|NOT_STARTED)\b", line, re.IGNORECASE)
+        if outcome:
+            value = outcome.group(1).lower()
+            if value == "success":
+                outcome_counts["success"] += 1
+            elif value in {"skipped", "not_started"}:
+                outcome_counts["skipped"] += 1
+            elif value in {"stopped", "interrupted"}:
+                outcome_counts["interrupted"] += 1
+            else:
+                outcome_counts["failed"] += 1
+        if "[summary]" not in lowered and "[汇总]" not in line:
+            marker = re.search(r"\[(OK|SUCCESS|FAIL|FAILED|ERROR|SKIP|INTERRUPTED)\]", line, re.IGNORECASE)
+            if marker:
+                value = marker.group(1).lower()
+                if value in {"ok", "success"}:
+                    marker_counts["success"] += 1
+                elif value == "skip":
+                    marker_counts["skipped"] += 1
+                elif value == "interrupted":
+                    marker_counts["interrupted"] += 1
+                else:
+                    marker_counts["failed"] += 1
+
+    if summary_candidates:
+        summary_success, summary_skipped, summary_failed, summary_interrupted = summary_candidates[-1]
+        for key, value in zip(counts, (summary_success, summary_skipped, summary_failed, summary_interrupted)):
+            apply_count(key, value, force=True)
+    else:
+        for key, value in outcome_counts.items():
+            if value:
+                apply_count(key, value, force=True)
+        for key, value in marker_counts.items():
+            if value:
+                apply_count(key, value, force=True)
+
+    if counts["failed"] == 0 and errors:
+        apply_count("failed", len(errors), force=True)
+
+    if normalized_status == "interrupted":
+        # Remote interruption is itself a result bucket, even when the task
+        # also carries ordinary failures from items that completed earlier.
+        counts["interrupted"] = max(counts["interrupted"], 1)
+        evidence = True
+
+    if not any(counts.values()):
+        if normalized_status in {"success", "done", "succeeded", "complete", "completed"}:
+            counts["success"] = 1
+            evidence = True
+        elif normalized_status in {"failed", "failure", "error"}:
+            counts["failed"] = 1
+            evidence = True
+        elif normalized_status == "skipped":
+            counts["skipped"] = 1
+            evidence = True
+        elif normalized_status == "interrupted":
+            counts["interrupted"] = 1
+            evidence = True
+
+    declared_total = 0
+    for count_source in (payload, meta):
+        for key in (
+            "total",
+            "requested_count",
+            "total_requested",
+            "total_requested_accounts",
+            "eligible",
+            "eligible_accounts",
+            "email_count",
+            "phone_count",
+            "pair_count",
+        ):
+            parsed = _nonnegative_count(count_source.get(key))
+            if parsed is not None:
+                declared_total = max(declared_total, parsed)
+    progress_match = re.search(r"\b\d+\s*/\s*(\d+)\b", str(payload.get("progress") or ""))
+    if progress_match:
+        declared_total = max(declared_total, int(progress_match.group(1)))
+    total = declared_total if declared_total > 0 else sum(counts.values())
+    if declared_total <= 0:
+        total = max(total, max(counts.values()))
+    evidence = bool(evidence)
+    return {
+        **counts,
+        "total": total,
+        "stats_available": evidence,
+    }
+
+
 def _task_log_failed_count(detail: dict[str, Any]) -> int:
-    meta = detail.get("meta") if isinstance(detail.get("meta"), dict) else {}
-    idea_summary = meta.get("idea_submit_summary") if isinstance(meta.get("idea_submit_summary"), dict) else detail.get("idea_submit_summary")
-    if _task_log_source(detail) == "baxigpt_cdk_submit" and isinstance(idea_summary, dict):
-        return int(idea_summary.get("failed") or 0) + int(idea_summary.get("timeout") or 0)
-    errors = detail.get("errors")
-    if isinstance(errors, list):
-        return len(errors)
-    return 0
+    return int(_task_log_stats(detail).get("failed") or 0)
 
 
 def _task_log_summary(log: TaskLog) -> dict:
     detail = _task_log_detail_dict(log)
+    status = _effective_task_log_status(log, detail=detail)
+    stats = _task_log_stats(detail, status=status)
     return {
         "id": log.id,
         "platform": log.platform,
         "email": log.email,
-        "status": _effective_task_log_status(log, detail=detail),
+        "status": status,
         "error": log.error,
         "created_at": log.created_at,
         "task_id": str(log.task_id or detail.get("task_id") or ""),
         "source": _task_log_source(detail),
         "attempt_outcome": str(detail.get("attempt_outcome") or ""),
         "progress": str(detail.get("progress") or ""),
-        "success": int(detail.get("success") or 0),
-        "skipped": int(detail.get("skipped") or 0),
-        "failed": _task_log_failed_count(detail),
+        "success": int(stats.get("success") or 0),
+        "skipped": int(stats.get("skipped") or 0),
+        "failed": int(stats.get("failed") or 0),
+        "interrupted": int(stats.get("interrupted") or 0),
+        "total": int(stats.get("total") or 0),
+        "stats_available": bool(stats.get("stats_available")),
         "meta_summary": _task_log_meta_summary(detail),
     }
 
@@ -6522,28 +7049,81 @@ def _task_log_detail_dict(log: TaskLog) -> dict[str, Any]:
     return detail
 
 
+def _merge_task_log_detail_rows(rows: list[TaskLog]) -> dict[str, Any]:
+    """Recover the richest log window from legacy duplicate task rows."""
+    if not rows:
+        return {}
+    details = [_task_log_detail_dict(row) for row in rows]
+    merged = dict(details[0])
+    for detail in details[1:]:
+        # Newer row fields win, while the log-window helper joins the old and
+        # new ranges before those fields are copied over.
+        window = _preserve_existing_history_window(merged, detail)
+        next_detail = dict(detail)
+        for key in _TASK_LOG_WINDOW_KEYS:
+            if key in window:
+                next_detail[key] = window[key]
+        merged = next_detail
+    richest = merged
+    # Preserve terminal metadata/counters that only existed on the latest row,
+    # while retaining the earlier row's complete log list.
+    if isinstance(richest.get("meta"), dict) or isinstance(merged.get("meta"), dict):
+        merged["meta"] = _merge_task_meta(richest.get("meta"), merged.get("meta"))
+    errors: list[Any] = []
+    for detail in details:
+        for error in detail.get("errors") if isinstance(detail.get("errors"), list) else []:
+            if error not in errors:
+                errors.append(error)
+    if errors:
+        merged["errors"] = errors
+    for key in ("success", "skipped", "failed", "interrupted"):
+        values = [_nonnegative_count(detail.get(key)) for detail in details]
+        values = [value for value in values if value is not None]
+        if values:
+            merged[key] = max(values)
+    return merged
+
+
 def _task_log_runtime_status(task_id: str) -> str:
     task_id_value = str(task_id or "").strip()
     if not task_id_value:
         return ""
-    if not _task_store.exists(task_id_value):
+    snapshot = _task_store_snapshot_or_none(task_id_value)
+    if snapshot is None:
         return "stopped"
-    snapshot = _task_store.snapshot(task_id_value)
     runtime_status = str(snapshot.get("status") or "").strip().lower()
     if runtime_status == "done":
         return "success"
-    if runtime_status in {"failed", "stopped", "running", "pending"}:
+    if runtime_status in {"failed", "stopped", "partial", "interrupted", "running", "pending"}:
         return runtime_status
     return ""
 
 
 def _effective_task_log_status(log: TaskLog, *, detail: dict[str, Any] | None = None) -> str:
     base_status = str(log.status or "").strip().lower()
-    if base_status != "running":
-        return base_status
+    if base_status in {"done", "succeeded", "complete", "completed"}:
+        base_status = "success"
+    elif base_status in {"cancelled", "canceled", "aborted", "terminated"}:
+        base_status = "stopped"
     payload = detail or _task_log_detail_dict(log)
-    runtime_status = _task_log_runtime_status(str(payload.get("task_id") or ""))
-    return runtime_status or base_status
+    task_id = str(payload.get("task_id") or log.task_id or "").strip()
+    runtime_status = _task_log_runtime_status(task_id)
+    account_result_statuses = {
+        "success",
+        "succeeded",
+        "complete",
+        "completed",
+        "failed",
+        "failure",
+        "error",
+        "skipped",
+    }
+    if runtime_status in {"pending", "running"} and base_status in account_result_statuses:
+        # A per-account callback must not make an active batch look terminal.
+        return runtime_status
+    if base_status == "running":
+        return runtime_status or base_status
+    return base_status
 
 
 def _task_log_group_task_id(log: TaskLog) -> str:
@@ -18950,6 +19530,20 @@ def get_log_detail(log_id: int):
         log = s.get(TaskLog, log_id)
         if log is None:
             raise HTTPException(404, "任务历史不存在")
+        task_id = str(log.task_id or "").strip()
+        if task_id:
+            related = s.exec(
+                select(TaskLog)
+                .where(TaskLog.task_id == task_id)
+                .order_by(TaskLog.id.asc())
+            ).all()
+            if len(related) > 1:
+                # This is an in-memory response merge only; do not rewrite old
+                # rows as part of a read request.
+                log.detail_json = json.dumps(
+                    _merge_task_log_detail_rows(related),
+                    ensure_ascii=False,
+                )
     return _task_log_detail_payload(log)
 
 
