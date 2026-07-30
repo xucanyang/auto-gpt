@@ -1865,10 +1865,11 @@ def batch_delete_accounts(
     session: Session = Depends(get_session)
 ):
     """批量删除账号"""
-    if not body.ids:
+    requested_ids = list(dict.fromkeys(int(account_id) for account_id in (body.ids or [])))
+    if not requested_ids:
         raise HTTPException(400, "账号 ID 列表不能为空")
     
-    if len(body.ids) > 1000:
+    if len(requested_ids) > 1000:
         raise HTTPException(400, "单次最多删除 1000 个账号")
     
     deleted_count = 0
@@ -1876,7 +1877,7 @@ def batch_delete_accounts(
     not_found_ids = []
     
     try:
-        for account_id in body.ids:
+        for account_id in requested_ids:
             acc = session.get(AccountModel, account_id)
             if acc:
                 deleted_ids.append(int(account_id))
@@ -1892,7 +1893,7 @@ def batch_delete_accounts(
         return {
             "deleted": deleted_count,
             "not_found": not_found_ids,
-            "total_requested": len(body.ids)
+            "total_requested": len(requested_ids)
         }
     except Exception as e:
         session.rollback()

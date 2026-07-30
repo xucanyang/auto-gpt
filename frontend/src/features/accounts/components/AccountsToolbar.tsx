@@ -1,6 +1,6 @@
 import type { CSSProperties, ReactNode } from 'react'
 import { useState } from 'react'
-import { Button, Dropdown, Modal, Space } from 'antd'
+import { App, Button, Dropdown, Space } from 'antd'
 import type { MenuProps } from 'antd'
 import {
   DeleteOutlined,
@@ -221,6 +221,7 @@ export function AccountsToolbar({
   columnVisibilityControl,
   toolbarActionVisibilityControl,
 }: AccountsToolbarProps) {
+  const { modal: appModal } = App.useApp()
   const [mobileOpsOpen, setMobileOpsOpen] = useState(false)
   const [paymentLinkMenuOpen, setPaymentLinkMenuOpen] = useState(false)
   const [moreOperationMenuOpen, setMoreOperationMenuOpen] = useState(false)
@@ -293,7 +294,7 @@ export function AccountsToolbar({
   }
 
   const buildConfirmDeleteInvalid = () => {
-    Modal.confirm({
+    appModal.confirm({
       title: '确认删除当前平台的全部无效账号？',
       content: '只会删除 status=invalid 的账号，操作不可恢复。',
       okText: '确认删除',
@@ -304,7 +305,7 @@ export function AccountsToolbar({
   }
 
   const buildConfirmBatchDelete = () => {
-    Modal.confirm({
+    appModal.confirm({
       title: `确认删除选中的 ${selectedRowKeys.length} 个账号？`,
       okText: '确认删除',
       cancelText: '取消',

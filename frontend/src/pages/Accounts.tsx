@@ -5006,15 +5006,31 @@ export default function Accounts() {
   }
 
   const handleBatchDelete = async () => {
-    if (selectedRowKeys.length === 0) return
-    await apiFetch('/accounts/batch-delete', {
-      method: 'POST',
-      body: JSON.stringify({ ids: Array.from(selectedRowKeys) }),
-    })
-    message.success('批量删除成功')
-    setSelectedRowKeys([])
-    setSelectedAccountSnapshots({})
-    load()
+    const accountIds = normalizeAccountIds(selectedRowKeys)
+    if (accountIds.length === 0) {
+      appMessage.warning('请先选择要删除的账号')
+      return
+    }
+    try {
+      const result = await apiFetch('/accounts/batch-delete', {
+        method: 'POST',
+        body: JSON.stringify({ ids: accountIds }),
+      })
+      const deleted = Number(result?.deleted || 0)
+      const notFound = Array.isArray(result?.not_found) ? result.not_found.length : 0
+      if (deleted > 0) {
+        appMessage.success(`批量删除完成：已删除 ${deleted} 个账号${notFound > 0 ? `，${notFound} 个已不存在` : ''}`)
+      } else if (notFound > 0) {
+        appMessage.warning(`选中的账号已不存在（${notFound} 个），列表已刷新`)
+      } else {
+        appMessage.info('没有账号被删除，列表已刷新')
+      }
+      setSelectedRowKeys([])
+      setSelectedAccountSnapshots({})
+      await load()
+    } catch (error: unknown) {
+      appMessage.error(error instanceof Error && error.message ? error.message : '批量删除失败')
+    }
   }
 
   const handleDeleteAccount = async (record: any) => {

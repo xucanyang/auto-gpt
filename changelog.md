@@ -21,6 +21,8 @@
 - **统一测试文档入口**：`README.md`、`AGENTS.md` 与 `docs/docker-image-release.md` 现在统一指向 Docker 测试规范，移除会吞掉收集失败的 `pytest tests -q || true` 作为推荐门禁，明确当前 `requirements-test.txt`、`docker-compose.test.yml` 和测试脚本仍待落地。
 
 ### 修复 (Fixed)
+- **修复账号批量删除确认弹窗失效**：`frontend/src/features/accounts/components/AccountsToolbar.tsx` 改用页面 `App` 上下文提供的 `modal.confirm`，恢复“更多操作 → 删除选中”和“一键删无效”的确认交互；`frontend/src/pages/Accounts.tsx` 对选中 key 做正整数归一化，捕获 `/api/accounts/batch-delete` 失败并展示明确错误，成功后等待账号列表刷新，避免点击后无反馈或仍显示已删除账号。`api/accounts.py` 同时对请求 ID 去重，保证重复选择不会虚增删除数量；`tests/test_accounts_batch_delete.py` 覆盖账号行与派生列表状态的真实清理结果。
+- **同步侧栏可见版本为 `v2.8.67`**：`frontend/src/app/AppShell.tsx` 更新版本标识，便于确认三个常驻实例已加载本次批量删除修复。
 - **修复运行中断后历史详情无日志**：`api/tasks.py` 为活跃任务增加低频日志 checkpoint，并在停止、中断、错误、致命异常和汇总节点立即持久化；终态快照与历史日志窗口按单调游标合并，迟到的单账号回调不能再把整批任务提前写成成功/失败，也不能覆盖已保存的终态状态、错误、统计和完整日志。旧版本遗留的同一 `task_id` 重复行会在详情读取时只读合并，尽可能恢复完整日志窗口且不改写生产数据库。
 - **保留旧任务的明确成功结论**：历史运行态只对数据库仍为 `running` 且当前进程已无对应任务的记录归一为“已停止”；数据库已经明确写为 `success/done/completed` 的旧记录继续显示成功，避免因旧快照停留在 `running` 而批量误判。
 - **同步侧栏可见版本为 `v2.8.66`**：`frontend/src/app/AppShell.tsx` 更新版本标识，便于确认三个常驻实例已加载本次任务历史修复。
@@ -3152,4 +3154,8 @@
 
 ## 2026-07-30 09:56:58 +0800
 - 修复任务历史中文类型、统计恢复与中断日志持久化
+- 发布模式: multi
+
+## 2026-07-30 13:51:34 +0800
+- 修复账号批量删除确认交互与请求处理
 - 发布模式: multi
