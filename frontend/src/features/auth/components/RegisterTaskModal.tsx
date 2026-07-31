@@ -279,6 +279,7 @@ export function RegisterTaskModal({
               <Select
                 options={[
                   { value: 'email_signup', label: '邮箱注册' },
+                  { value: 'phone_signup', label: '手机号注册' },
                 ]}
               />
             </Form.Item>

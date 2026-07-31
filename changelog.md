@@ -55,6 +55,14 @@
 - 新增 `tests/test_restored_email_service.py` 适配器合同测试，覆盖跨注册阶段排除已消费验证码，以及独立 OAuth 等待不受注册 OTP 预算截断；专项测试 `9 passed`。
 - **完成文档一致性校验**：通过 `git diff --check`、Markdown 代码围栏配对和文档目标链接存在性检查；本次仅修改项目文档，未执行 Python、前端或容器测试，也未触碰生产运行态。
 
+## [2.8.68] - 2026-07-31
+
+### 修复 (Fixed)
+- **恢复 ChatGPT 手机号注册入口与实际请求合同**：`frontend/src/features/auth/components/RegisterTaskModal.tsx` 的 ChatGPT 注册入口重新提供“手机号注册”，`frontend/src/pages/RegisterTaskPage.tsx` 同步恢复该选项，避免两个注册界面继续分叉。`frontend/src/pages/Accounts.tsx` 现在在选择该入口时校验手机号池或 `手机号----收码API` 输入及统一登录密码，串行提交任务，并透传 `chatgpt_registration_entry=phone_signup`、`chatgpt_phone_signup_*` 参数与任务密码；邮箱注册专用的邮箱服务校验和注册模式适配不再污染手机号注册。后端继续复用既有 `PhoneRegistrationEngine`，手机号注册与手机号绑定保持独立业务语义。
+
+### 测试 (Tests)
+- **增加手机号注册前端入口回归合同**：`frontend/tests/phoneSignupEntryContract.test.mjs` 同时锁定 ChatGPT 注册弹窗、`/register` 页面中的“手机号注册”选项，以及账号页创建任务时的 `phone_signup` 请求字段、串行并发和密码透传，防止再次出现表单代码存在但没有入口或入口没有实际任务合同的问题。
+
 ## [2.8.57] - 2026-07-27
 
 ### 修复 (Fixed)
@@ -3158,4 +3166,8 @@
 
 ## 2026-07-30 13:51:34 +0800
 - 修复账号批量删除确认交互与请求处理
+- 发布模式: multi
+
+## 2026-07-31 08:34:52 +0800
+- 恢复 ChatGPT 手机号注册入口与任务提交合同
 - 发布模式: multi

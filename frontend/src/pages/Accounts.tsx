@@ -5584,13 +5584,27 @@ export default function Accounts() {
           ? selectedProviderOverride
           : (String(cfg.mail_provider || 'luckmail').trim() || 'luckmail')
       setRegisterMailProvider(resolvedMailProvider)
+      const phoneSignupEnabled =
+        currentPlatform === 'chatgpt'
+        && String(values.chatgpt_registration_entry || '').trim().toLowerCase().replace(/-/g, '_') === 'phone_signup'
       const executorType = normalizeExecutorForPlatform(currentPlatform, values.executor_type)
       const existingAccountCapture =
-        currentPlatform === 'chatgpt'
+        !phoneSignupEnabled
+        && currentPlatform === 'chatgpt'
         && chatgptRegistrationMode === CHATGPT_REGISTRATION_MODE_REFRESH_TOKEN
         && resolvedMailProvider === 'manual_email_otp'
         && Boolean(values.chatgpt_existing_account_capture)
       const normalizedLoginPassword = String(values.login_password || '').trim()
+      if (phoneSignupEnabled && !normalizedLoginPassword) {
+        throw new Error('手机号注册/已注册手机号登录必须填写同一个密码')
+      }
+      if (
+        phoneSignupEnabled
+        && !values.chatgpt_phone_signup_use_pool
+        && !String(values.chatgpt_phone_signup_phone_lines || '').trim()
+      ) {
+        throw new Error('手机号注册请粘贴 手机号----收码API / 手机号|收码API，或勾选使用手机号池')
+      }
       const configuredTempMailMode = String(values.tempmail_mode || cfg.tempmail_mode || 'fixed_domain').trim().toLowerCase()
       const tempmailMode = configuredTempMailMode === 'task_subdomain' ? 'task_subdomain' : 'fixed_domain'
       const tempmailFixedDomains = normalizeDomainList(values.tempmail_fixed_domains)
@@ -5599,8 +5613,8 @@ export default function Accounts() {
           ? String(values.tempmail_primary_domain || cfg.tempmail_primary_domain || '').trim().replace(/^[@.]+/, '')
           : '')
       const registerExtra = {
-        mail_provider: resolvedMailProvider,
-        email_api_lines: resolvedMailProvider === 'email_api' ? String(values.email_api_lines || cfg.email_api_lines || '').trim() : undefined,
+        mail_provider: phoneSignupEnabled ? undefined : resolvedMailProvider,
+        email_api_lines: !phoneSignupEnabled && resolvedMailProvider === 'email_api' ? String(values.email_api_lines || cfg.email_api_lines || '').trim() : undefined,
         email_api_poll_interval_seconds: cfg.email_api_poll_interval_seconds || values.email_api_poll_interval_seconds || 3,
         email_api_request_timeout_seconds: cfg.email_api_request_timeout_seconds || values.email_api_request_timeout_seconds || 15,
         email_api_gmail_dot_variant_enabled: parseBooleanConfigValue(
@@ -5610,7 +5624,7 @@ export default function Accounts() {
         email_api_gmail_variant_rules: String(values.email_api_gmail_variant_rules ?? cfg.email_api_gmail_variant_rules ?? 'all').trim() || 'all',
         email_api_gmail_plus_tag_template: String(values.email_api_gmail_plus_tag_template ?? cfg.email_api_gmail_plus_tag_template ?? 'r{rand}').trim() || 'r{rand}',
         email_api_default_scheme: cfg.email_api_default_scheme || 'https',
-        email_api_use_all_identities: resolvedMailProvider === 'email_api' ? true : undefined,
+        email_api_use_all_identities: !phoneSignupEnabled && resolvedMailProvider === 'email_api' ? true : undefined,
         applemail_base_url: cfg.applemail_base_url,
         applemail_pool_dir: cfg.applemail_pool_dir,
         applemail_pool_file: cfg.applemail_pool_file,
@@ -5675,6 +5689,15 @@ export default function Accounts() {
         luckmail_api_key: cfg.luckmail_api_key,
         luckmail_email_type: cfg.luckmail_email_type,
         luckmail_domain: cfg.luckmail_domain,
+        chatgpt_registration_entry:
+          currentPlatform === 'chatgpt' ? (phoneSignupEnabled ? 'phone_signup' : 'email_signup') : undefined,
+        chatgpt_phone_signup_password: phoneSignupEnabled ? normalizedLoginPassword : undefined,
+        chatgpt_phone_signup_use_pool: phoneSignupEnabled ? Boolean(values.chatgpt_phone_signup_use_pool) : undefined,
+        chatgpt_phone_signup_phone_lines: phoneSignupEnabled ? String(values.chatgpt_phone_signup_phone_lines || '').trim() : undefined,
+        chatgpt_phone_signup_timeout_seconds: phoneSignupEnabled ? values.chatgpt_phone_signup_timeout_seconds : undefined,
+        chatgpt_phone_signup_poll_interval_seconds: phoneSignupEnabled ? values.chatgpt_phone_signup_poll_interval_seconds : undefined,
+        chatgpt_phone_signup_max_resend_attempts: phoneSignupEnabled ? values.chatgpt_phone_signup_max_resend_attempts : undefined,
+        chatgpt_phone_signup_resend_interval_seconds: phoneSignupEnabled ? values.chatgpt_phone_signup_resend_interval_seconds : undefined,
         chatgpt_existing_account_capture: currentPlatform === 'chatgpt' ? existingAccountCapture : undefined,
         chatgpt_save_registration_access_token_account:
           currentPlatform === 'chatgpt'
@@ -5702,18 +5725,20 @@ export default function Accounts() {
           currentPlatform,
           chatgptRegistrationMode,
         )
-      const adaptedRegisterExtra = chatgptRegistrationRequestAdapter
-        ? chatgptRegistrationRequestAdapter.extendExtra(registerExtra)
-        : registerExtra
+      const adaptedRegisterExtra = phoneSignupEnabled
+        ? registerExtra
+        : chatgptRegistrationRequestAdapter
+          ? chatgptRegistrationRequestAdapter.extendExtra(registerExtra)
+          : registerExtra
 
-      if (resolvedMailProvider === 'email_api' && currentPlatform === 'chatgpt') {
+      if (!phoneSignupEnabled && resolvedMailProvider === 'email_api' && currentPlatform === 'chatgpt') {
         const rawLines = String(values.email_api_lines || cfg.email_api_lines || '').trim()
         if (!rawLines) {
           throw new Error('邮箱验证码 API 模式必须填写 email----api 行')
         }
       }
 
-      if (resolvedMailProvider === 'manual_email_otp' && currentPlatform === 'chatgpt') {
+      if (!phoneSignupEnabled && resolvedMailProvider === 'manual_email_otp' && currentPlatform === 'chatgpt') {
         const normalizedEmail = String(values.email || '').trim()
         if (!normalizedEmail) {
           throw new Error('手动邮箱模式必须填写邮箱地址')
@@ -5724,7 +5749,7 @@ export default function Accounts() {
       validateTaskProxySettings(values)
       mergeRegisterFormSettings(currentPlatform, {
         count: Number(values.count || 1) || 1,
-        concurrency: Number(values.concurrency || 1) || 1,
+        concurrency: phoneSignupEnabled ? 1 : (Number(values.concurrency || 1) || 1),
         register_delay_seconds: Number(values.register_delay_seconds || 0) || 0,
         executor_type: executorType,
         email: String(values.email || '').trim(),
@@ -5736,12 +5761,16 @@ export default function Accounts() {
         body: JSON.stringify({
           platform: currentPlatform,
           email:
-            resolvedMailProvider === 'manual_email_otp' && currentPlatform === 'chatgpt'
+            !phoneSignupEnabled && resolvedMailProvider === 'manual_email_otp' && currentPlatform === 'chatgpt'
               ? (String(values.email || '').trim() || null)
               : null,
-          password: existingAccountCapture ? (normalizedLoginPassword || null) : null,
+          password: phoneSignupEnabled
+            ? normalizedLoginPassword
+            : existingAccountCapture
+              ? (normalizedLoginPassword || null)
+              : null,
           count: values.count,
-          concurrency: values.concurrency,
+          concurrency: phoneSignupEnabled ? 1 : values.concurrency,
           register_delay_seconds: values.register_delay_seconds || 0,
           executor_type: executorType,
           captcha_solver: cfg.default_captcha_solver || 'yescaptcha',
