@@ -26,7 +26,6 @@ def test_payment_link_filter_separates_current_link_from_success_history():
         "{ value: 'pix', text: 'PIX' }",
         "{ value: 'twint', text: 'TWINT' }",
         "{ value: 'kakao_pay', text: 'Kakao Pay' }",
-        "{ value: 'gopay', text: 'GoPay' }",
         "{ value: 'team', text: 'ChatGPT Team' }",
         "{ value: 'other', text: '其他支付链接' }",
     ):

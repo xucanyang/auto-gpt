@@ -11,8 +11,6 @@ import {
   MoonOutlined,
   LogoutOutlined,
   MobileOutlined,
-  RocketOutlined,
-  ApartmentOutlined,
   ExperimentOutlined,
   DatabaseOutlined,
   KeyOutlined,
@@ -92,9 +90,6 @@ function AppContent({ hasPassword }: { hasPassword: boolean }) {
     if (path === '/') return ['/']
     if (path.startsWith('/chatgpt') || path.startsWith('/accounts')) return ['/chatgpt']
     if (path === '/custom-email-recheck') return ['/custom-email-recheck']
-    if (path === '/pipeline') return ['/pipeline']
-    if (path === '/idea-oaipay-pipeline') return ['/idea-oaipay-pipeline']
-    if (path === '/gopay-otp') return ['/gopay-otp']
     if (path === '/history') return ['/history']
     if (path === '/proxies') return ['/proxies']
     if (path === '/phone-pool') return ['/phone-pool']
@@ -108,9 +103,6 @@ function AppContent({ hasPassword }: { hasPassword: boolean }) {
     { key: '/', icon: <DashboardOutlined />, label: '仪表盘' },
     { key: '/chatgpt', icon: <UserOutlined />, label: 'ChatGPT' },
     { key: '/custom-email-recheck', icon: <ExperimentOutlined />, label: '邮箱登录测活' },
-    { key: '/gopay-otp', icon: <MobileOutlined />, label: 'GoPay OTP' },
-    { key: '/pipeline', icon: <RocketOutlined />, label: '自动流水线' },
-    { key: '/idea-oaipay-pipeline', icon: <ApartmentOutlined />, label: '账号处理流水线' },
     { key: '/history', icon: <HistoryOutlined />, label: '任务历史' },
     { key: '/proxies', icon: <GlobalOutlined />, label: '代理管理' },
     { key: '/phone-pool', icon: <MobileOutlined />, label: '手机号池' },
@@ -245,7 +237,7 @@ function AppContent({ hasPassword }: { hasPassword: boolean }) {
                     marginTop: 4,
                   }}
                 >
-                  v2.8.68
+                  v2.8.71
                 </div>
               )}
             </div>

@@ -7,9 +7,6 @@ from sqlalchemy import Index, event, text, UniqueConstraint
 from sqlmodel import Field, SQLModel, create_engine, Session, select
 import json
 
-from services.pipeline.models import PipelineAccountItem, PipelineTask
-from services.idea_oaipay_pipeline.models import IdeaOaiPayPipelineItem, IdeaOaiPayPipelineTask
-
 
 def _utcnow():
     return datetime.now(timezone.utc)
@@ -3671,8 +3668,6 @@ def init_db():
     _ensure_proxy_schema()
     _ensure_external_subscription_claim_schema()
     _ensure_external_access_token_claim_schema()
-    _ensure_pipeline_schema()
-    _ensure_idea_oaipay_pipeline_schema()
 
 
 def get_session():

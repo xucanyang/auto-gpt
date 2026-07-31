@@ -25,9 +25,6 @@ export const TASK_SOURCE_LABELS: Record<string, string> = {
   kakao_pay_payment_link_cleanup: 'Kakao Pay 链接清理',
   hosted_payment_link_cleanup: 'Hosted 链接清理',
   team_payment_link_cleanup: 'Team 链接清理',
-  gopay_payment_link_cleanup: 'GoPay 链接清理',
-  gopay_payment: 'GoPay支付',
-  idea_oaipay_pipeline: '账号处理流水线',
   batch_probe_local_status: '批量本地状态同步',
   icloud_hme_recheck_batch: 'HME邮箱复测',
   registration: '注册',
@@ -80,7 +77,6 @@ export function taskSourceLabel(source?: string | null): string {
   // Historical smoke/test task names encode the implementation branch in
   // ``source``.  They are still registration or payment tasks to an operator;
   // never leak the internal English identifier into the task history table.
-  if (canonical.includes('gopay')) return 'GoPay支付'
   if (canonical.includes('proxy_pool')) return '代理池测试'
   if (
     canonical.startsWith('codex_')

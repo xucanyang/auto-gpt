@@ -3,7 +3,7 @@ from unittest.mock import patch
 
 from sqlmodel import SQLModel, Session, create_engine, select
 
-import api.chatgpt as chatgpt_api
+import api.actions as actions_api
 from core import db as core_db
 from core.db import AccountModel, PaymentLinkGenerationModel
 
@@ -72,8 +72,8 @@ class ChatGPTPaymentLinkEndpointTests(unittest.TestCase):
 
     def test_compatibility_endpoint_ignores_retired_local_controls_and_uses_long_link(self):
         client = _LongLinkClient()
-        request = chatgpt_api.PaymentReq.model_validate(
-            {
+        request = actions_api.ActionRequest(
+            params={
                 "plan": "plus",
                 "country": "ID",
                 "currency": "IDR",
@@ -86,15 +86,16 @@ class ChatGPTPaymentLinkEndpointTests(unittest.TestCase):
             "services.chatgpt_core.long_link_payment_client.LongLinkPaymentClient.from_env",
             return_value=client,
         ), patch("services.chatgpt_core.payment.generate_plus_link") as local_generator:
-            response = chatgpt_api.generate_payment_link(self.account_id, request, session)
+            response = actions_api.execute_action("chatgpt", self.account_id, "payment_link", request, session=session)
             account = session.get(AccountModel, self.account_id)
             generation = session.exec(select(PaymentLinkGenerationModel)).one()
 
-        self.assertEqual(response["url"], "https://pay.example.test/endpoint")
-        self.assertEqual(response["payment_source"], "long_link")
-        self.assertEqual(response["payment_link_format"], "long_link")
-        self.assertEqual(response["country"], "BR")
-        self.assertEqual(response["currency"], "BRL")
+        self.assertTrue(response["ok"])
+        self.assertEqual(response["data"]["url"], "https://pay.example.test/endpoint")
+        self.assertEqual(response["data"]["payment_source"], "long_link")
+        self.assertEqual(response["data"]["payment_link_format"], "long_link")
+        self.assertEqual(response["data"]["country"], "BR")
+        self.assertEqual(response["data"]["currency"], "BRL")
         self.assertEqual(len(client.submissions), 1)
         self.assertFalse(client.submissions[0][0][0]["access_token"] == "")
         self.assertEqual(client.submissions[0][1], client.profile_hash)

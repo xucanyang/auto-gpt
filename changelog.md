@@ -10,6 +10,8 @@
 - **新增 Docker 测试规范**：`docs/testing-in-docker.md` 固化运行依赖统一、测试镜像与生产镜像同源、一次性测试容器、临时数据库/共享配置、网络隔离、浏览器资源约束和外部实时烟测分层要求，明确禁止在常驻业务容器或生产挂载上执行完整 pytest。
 
 ### 优化 (Changed)
+- **收口已退役的 GoPay / 流水线入口**：`main.py` 继续保持不挂载 `api.integrations`、`api.pipeline` 与 `api.idea_oaipay_pipeline`，`api/system.py` 不再展示自动流水线健康资源，`frontend/src/app/AppShell.tsx` / `router.tsx` 也移除了对应导航与路由；`frontend/src/pages/Settings.tsx` 同步删去 GoPay 分组标题与本地模式提示中的 GoPay 文案，避免新界面继续暴露已退役入口。
+- **停用 GoPay 作为支付链接分类**：`api/tasks.py`、`services/account_filters.py` 与 `services/chatgpt_core/pix_payment_link_cleanup.py` 不再把 `gopay` 当作独立支付类型；过滤、清理与清单统计现在会把旧的 `gopay` payload 归入 `other`，而不是继续向前端和任务契约暴露一个新的分类。
 - **统一任务历史展示契约**：`api/tasks.py` 的任务历史列表与详情现在统一输出 `success / skipped / failed / interrupted / total / stats_available`，并从旧快照的 `registered_accounts`、`auth_pending_accounts`、`runtime_results`、Idea 提交摘要、错误列表及 `[SUMMARY]`/结果日志恢复统计；`frontend/src/lib/taskTypes.ts`、`TaskHistory.tsx` 与 `TaskDetailHeader.tsx` 对零值统计、状态别名和中断数量使用同一套推导规则，无法从旧数据可靠恢复时明确显示“统计暂不可用”，不再留空或伪造零值结论。
 - **收敛任务类型中文显示**：任务历史补齐本地状态同步、HME 复测、支付链接清理、浏览器认证、手动轮询、代理池测试及历史 `codex_*` / `register_*` 等来源映射；未知英文内部来源统一展示为“其他任务”，桌面端仅在 tooltip 保留内部 `source` 供排障，避免实现键直接暴露给操作员。
 - **收敛 Idea 订单轮询生命周期**：`main.py` 不再在服务启动时自动恢复旧的 BaxiGPT/Idea 订单，`services/chatgpt_core/baxigpt_status_poller.py` 关闭账号级常驻补偿扫描；显式卡密轮询接口仍保留。这样本地 Idea 任务因停止、异常或服务重启结束后，不会继续产生隐藏的上游状态请求。
@@ -45,6 +47,7 @@
 - **修正 Docker 发布拓扑旧描述**：`docs/docker-image-release.md` 按当前 `docker-compose.multi.yml` 更新为 `auto-gpt`、`auto-gpt-plus`、`auto-plus2` 三个常驻业务实例与 `phone-api-relay` 共同运行，移除主服务 standby 的过时说法。
 
 ### 测试 (Tests)
+- **更新 GoPay 退役回归**：`tests/test_retired_capabilities_contract.py` 继续锁定退役路由与配置键不再进入 OpenAPI / config allowlist；`tests/test_account_filters.py` 与 `tests/test_pix_payment_link_cleanup.py` 切换到“旧 gopay 只算 other”的新分类预期，避免回归时又把退役支付类型重新恢复成独立枚举。
 - **补充任务历史回归覆盖**：`tests/test_chatgpt_task_logging.py` 锁定活跃批任务的单账号结果不得提前关闭整批、终态中断不得被迟到回调覆盖、旧注册统计/汇总恢复、未知旧统计不得伪装为已知零值，以及内存日志压缩后仍保留持久化完整窗口；`tests/test_task_logs_history.py` 覆盖重复旧行的详情日志合并和明确成功状态不被误判。任务历史/控制专项 `92 passed`，相关任务运行时、终态守卫和支付摘要回归 `34 passed`，前端 Node 合同测试 `14 passed`，生产构建及本次修改文件 ESLint 通过。
 - 新增 Idea 任务停止标记、轮询队列清理、手动入队拦截、账号筛选和提交摘要回归测试；相关专项测试共 `44 passed`，BaxiGPT 卡密提交专项 `49 passed`。
 - **补充手机号绑定模式回归**：`tests/test_phone_pool.py` 覆盖指定前缀内 `available / unavailable / all` 的行级候选边界；`tests/test_phone_pool_task_integration.py` 覆盖限定号段不可用固定快照、全池 `cannot_send` 全量候选快照、候选数超过账号数时的未覆盖统计及 legacy 布尔模式优先级；`tests/test_phone_prefix_ui_contract.py` 锁定新模式、状态筛选、不可用号段可选、候选预览和请求字段契约。使用一次性 Docker 容器、`--network none`、只读 checkout 和临时运行目录执行该专项，结果为 `55 passed`。
@@ -3170,4 +3173,8 @@
 
 ## 2026-07-31 08:34:52 +0800
 - 恢复 ChatGPT 手机号注册入口与任务提交合同
+- 发布模式: multi
+
+## 2026-07-31 13:42:24 +0800
+- 剥离 GoPay、自动流水线和账号处理流水线残留入口
 - 发布模式: multi

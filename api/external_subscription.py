@@ -798,7 +798,7 @@ def _mark_link_status(
 
 
 def _preflight_subscription_link(account: AccountModel, link: dict[str, Any]) -> dict[str, Any]:
-    from services.chatgpt_core.gopay_flow import probe_chatgpt_checkout_amount
+    from services.chatgpt_core.checkout_probe import probe_chatgpt_checkout_amount
 
     checkout_url = str(link.get("url") or "").strip()
     if not checkout_url:

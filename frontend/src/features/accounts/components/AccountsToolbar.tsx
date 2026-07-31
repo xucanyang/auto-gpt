@@ -28,7 +28,6 @@ export type AccountsToolbarActionId =
   | 'paypalBinding'
   | 'baxiCdkSubmit'
   | 'paymentLink'
-  | 'gopay'
 
 export type AccountExportMode = 'sub2api' | 'access_token' | 'pix_payment_links'
 export type AccountExportScope = 'selected' | 'filtered'
@@ -54,7 +53,6 @@ const CHATGPT_BATCH_ACTION_IDS: AccountsToolbarActionId[] = [
   'paypalBinding',
   'baxiCdkSubmit',
   'paymentLink',
-  'gopay',
 ]
 const CHATGPT_ACTION_IDS: AccountsToolbarActionId[] = [
   ...CHATGPT_SYNC_ACTION_IDS,
@@ -135,7 +133,6 @@ type AccountsToolbarProps = {
   onRefreshActiveTasks: () => Promise<void> | void
   onActiveTasksOpen: () => void
   isChatgptPlatform: boolean
-  batchGopayLoading: boolean
   batchPaymentLinkLoading: boolean
   pixLinkCleanupLoading: boolean
   batchInvalidRecheckLoading: boolean
@@ -148,7 +145,6 @@ type AccountsToolbarProps = {
   onOpenPhoneBindingTest: () => void
   onOpenPaypalBinding: () => void
   onOpenBaxiCdkSubmit: () => void
-  onOpenBatchGopay: () => void
   deleteInvalidLoading: boolean
   onDeleteInvalid: () => Promise<void> | void
   onBatchDelete: () => Promise<void> | void
@@ -183,7 +179,6 @@ export function AccountsToolbar({
   onRefreshActiveTasks,
   onActiveTasksOpen,
   isChatgptPlatform,
-  batchGopayLoading,
   batchPaymentLinkLoading,
   pixLinkCleanupLoading,
   batchInvalidRecheckLoading,
@@ -196,7 +191,6 @@ export function AccountsToolbar({
   onOpenPhoneBindingTest,
   onOpenPaypalBinding,
   onOpenBaxiCdkSubmit,
-  onOpenBatchGopay,
   deleteInvalidLoading,
   onDeleteInvalid,
   onBatchDelete,
@@ -397,13 +391,6 @@ export function AccountsToolbar({
           paymentLinkMenuItems,
           paymentLinkActionLoading,
         )
-      case 'gopay':
-        return {
-          key: actionId,
-          label: '批量 GoPay',
-          icon: batchGopayLoading ? <SyncOutlined spin /> : <LinkOutlined />,
-          disabled: batchGopayLoading,
-        } as ToolbarMenuItem
       default:
         return null
     }
@@ -506,9 +493,6 @@ export function AccountsToolbar({
         return
       case 'baxiCdkSubmit':
         onOpenBaxiCdkSubmit()
-        return
-      case 'gopay':
-        onOpenBatchGopay()
         return
       case 'deleteInvalid':
         if (!deleteInvalidLoading && total > 0) {
@@ -650,19 +634,6 @@ export function AccountsToolbar({
               支付链接生成 <DownOutlined />
             </Button>
           </Dropdown>
-        )
-      case 'gopay':
-        return (
-          <Button
-            key={actionId}
-            block={isMobile}
-            style={operationButtonStyle}
-            icon={<LinkOutlined />}
-            loading={batchGopayLoading}
-            onClick={onOpenBatchGopay}
-          >
-            批量 GoPay
-          </Button>
         )
       default:
         return null

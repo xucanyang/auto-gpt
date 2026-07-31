@@ -524,7 +524,6 @@ class ChatGPTPlatform(BasePlatform):
         extra_config["chatgpt_registration_mode"] = "access_token_only"
         extra_config["chatgpt_has_refresh_token_solution"] = False
         extra_config["chatgpt_access_token_only_checkout_amount_check_enabled"] = False
-        extra_config["chatgpt_access_token_only_gopay_provider_link_enabled"] = False
 
         adapter = build_chatgpt_registration_mode_adapter(extra_config)
         context = ChatGPTRegistrationContext(

@@ -284,9 +284,8 @@ def test_mixed_scan_classifies_every_payment_type_and_retains_unknown_states():
         "pix": 1,
         "twint": 1,
         "kakao_pay": 1,
-        "gopay": 1,
         "team": 1,
-        "other": 1,
+        "other": 2,
     }
     assert scan["valid_links"] == 2
     assert scan["expired_links"] == 2

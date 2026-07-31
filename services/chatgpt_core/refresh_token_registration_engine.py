@@ -710,15 +710,6 @@ class RefreshTokenRegistrationEngine:
     def _is_existing_account_login_route_enabled(self) -> bool:
         return existing_account_login_route_enabled(self.extra_config)
 
-    def _should_capture_gopay_provider_link(self) -> bool:
-        for key in (
-            "chatgpt_access_token_only_gopay_provider_link_enabled",
-            "chatgpt_gopay_provider_link_enabled",
-        ):
-            if key in self.extra_config and self.extra_config.get(key) not in (None, ""):
-                return self._read_bool_config(key, default=False)
-        return False
-
     @staticmethod
     def _json_object(value: Any) -> dict:
         if isinstance(value, dict):
@@ -757,135 +748,10 @@ class RefreshTokenRegistrationEngine:
         if not isinstance(billing, dict):
             billing = self.extra_config.get("billing") if isinstance(self.extra_config.get("billing"), dict) else {}
         resolved = dict(billing or {})
-        gopay_defaults = self._json_object(self.extra_config.get("chatgpt_gopay_defaults"))
-        mapping = {
-            "name": "billing_name",
-            "email": "billing_email",
-            "country": "billing_country",
-            "line1": "billing_line1",
-            "city": "billing_city",
-            "state": "billing_state",
-            "postal_code": "billing_postal_code",
-        }
-        for target_key, source_key in mapping.items():
-            value = gopay_defaults.get(source_key)
-            if value not in (None, "") and not resolved.get(target_key):
-                resolved[target_key] = value
         resolved.setdefault("email", email_addr)
         resolved.setdefault("country", country)
         resolved.setdefault("currency", currency)
         return resolved
-
-    def _append_gopay_provider_link_metadata(
-        self,
-        result: RegistrationResult,
-        session_result: dict[str, Any] | None = None,
-    ) -> None:
-        if not self._should_capture_gopay_provider_link():
-            return
-        result.metadata = result.metadata or {}
-        metadata = {
-            "chatgpt_gopay_provider_link_enabled": True,
-            "chatgpt_gopay_provider_link_ready": False,
-            "chatgpt_gopay_provider_link": "",
-            "chatgpt_gopay_provider_link_error": "",
-        }
-        try:
-            from core.proxy_utils import resolve_default_chatgpt_proxy
-            from services.chatgpt_core.gopay_flow import create_gopay_provider_link
-            from services.chatgpt_core.payment import generate_plus_link
-
-            class _CheckoutAccount:
-                pass
-
-            session_result = dict(session_result or {})
-            account = _CheckoutAccount()
-            account.access_token = str(session_result.get("access_token") or result.access_token or "")
-            account.cookies = str(session_result.get("cookies") or session_result.get("cookie") or "")
-            account.session_token = str(session_result.get("session_token") or result.session_token or "")
-            account.email = str(result.email or "")
-            account.extra = {
-                "account_id": str(session_result.get("account_id") or result.account_id or ""),
-                "workspace_id": str(session_result.get("workspace_id") or result.workspace_id or ""),
-                "session_token": account.session_token,
-            }
-            if self.extra_config.get("stripe_publishable_key"):
-                account.extra["stripe_publishable_key"] = self.extra_config.get("stripe_publishable_key")
-            if self.extra_config.get("gopay_browser_profile"):
-                account.extra["gopay_browser_profile"] = self.extra_config.get("gopay_browser_profile")
-            if self.extra_config.get("gopay_processor_entity"):
-                account.extra["gopay_processor_entity"] = self.extra_config.get("gopay_processor_entity")
-            if not account.access_token:
-                raise RuntimeError("缺少 access_token，无法生成 GoPay 平台链接")
-
-            country, currency = self._checkout_country_currency()
-            billing = self._checkout_billing_config(country=country, currency=currency, email_addr=account.email)
-            billing = {**billing, "country": country, "currency": currency}
-            checkout_proxy = resolve_default_chatgpt_proxy(self.proxy_url)
-            if not checkout_proxy:
-                raise RuntimeError("当前没有可用代理，无法生成 GoPay 平台链接")
-            self._log(f"[GoPay] 开始生成注册后平台链接 country={country} currency={currency}")
-            checkout_url = generate_plus_link(
-                account,
-                proxy=checkout_proxy,
-                country=country,
-                currency=currency,
-                billing=billing,
-            )
-            snapshot = create_gopay_provider_link(
-                account,
-                account_id=0,
-                plan="plus",
-                country=country,
-                currency=currency,
-                proxy=checkout_proxy,
-                checkout_url=checkout_url,
-                billing=billing,
-                proxy_source="registration_checkout_proxy",
-                browser_profile=(
-                    self.extra_config.get("gopay_browser_profile")
-                    if isinstance(self.extra_config.get("gopay_browser_profile"), dict)
-                    else None
-                ),
-                return_on_error=True,
-            )
-            provider_link = str(
-                snapshot.get("payment_platform_url")
-                or snapshot.get("midtrans_redirect_url")
-                or ""
-            ).strip()
-            metadata.update(
-                {
-                    "chatgpt_checkout_plan": "plus",
-                    "chatgpt_checkout_url": checkout_url,
-                    "chatgpt_checkout_country": country,
-                    "chatgpt_checkout_currency": currency,
-                    "chatgpt_gopay_provider_link_ready": bool(provider_link),
-                    "chatgpt_gopay_provider_link": provider_link,
-                    "chatgpt_gopay_provider_link_error": "" if provider_link else str(snapshot.get("last_error") or "未返回有效 URL"),
-                    "chatgpt_gopay_provider_link_snapshot": snapshot,
-                    "chatgpt_gopay_provider_link_checkout_url": snapshot.get("checkout_url") or checkout_url,
-                    "chatgpt_gopay_provider_link_cs_id": snapshot.get("cs_id") or "",
-                    "chatgpt_gopay_provider_link_snap_token": snapshot.get("snap_token") or "",
-                    "chatgpt_gopay_provider_link_stripe_redirect_url": snapshot.get("stripe_redirect_url") or "",
-                    "chatgpt_gopay_provider_link_midtrans_redirect_url": snapshot.get("midtrans_redirect_url") or "",
-                    "chatgpt_gopay_provider_link_payment_method_types": (
-                        (snapshot.get("result") or {}).get("payment_method_types")
-                        if isinstance(snapshot.get("result"), dict)
-                        else []
-                    ),
-                    "chatgpt_gopay_provider_link_phase": snapshot.get("phase") or "",
-                }
-            )
-            if provider_link:
-                self._log(f"[GoPay] 注册后平台链接已获取: {provider_link}")
-            else:
-                self._log("[GoPay] 注册后平台链接未返回有效 URL", "warning")
-        except Exception as exc:
-            error = str(exc).strip() or exc.__class__.__name__
-            metadata["chatgpt_gopay_provider_link_error"] = error
-            self._log(f"[GoPay] 注册后平台链接获取失败，账号仍按注册结果保存: {error}", "warning")
-        result.metadata.update(metadata)
 
     def _build_auth_payload(
         self,
@@ -1434,7 +1300,6 @@ class RefreshTokenRegistrationEngine:
                 )
                 result.metadata = self._attach_browser_fingerprint_metadata(result.metadata, register_client)
                 result.metadata["mailbox_state"] = self._export_mailbox_state(email_adapter)
-                self._append_gopay_provider_link_metadata(result, tokens or {})
                 self._finalize_email_service_success(result)
                 return result
 
@@ -1581,10 +1446,6 @@ class RefreshTokenRegistrationEngine:
                     self._finalize_email_service_failure(result, fallback_error=result.error_message)
                     return result
 
-                self._append_gopay_provider_link_metadata(
-                    result,
-                    session_or_error if isinstance(session_or_error, dict) else {},
-                )
                 self._finalize_email_service_success(result)
                 return result
 
@@ -1651,7 +1512,6 @@ class RefreshTokenRegistrationEngine:
                 self._finalize_email_service_failure(result, fallback_error=result.error_message)
                 return result
 
-            self._append_gopay_provider_link_metadata(result, tokens or {})
             self._apply_phone_challenge_metadata(result)
             self._log(f"[结果] 成功，account_id={result.account_id or '-'} workspace_id={result.workspace_id or '-'}")
             self._finalize_email_service_success(result)

@@ -1125,15 +1125,6 @@ export function AccountActionSurface({
       return
     }
     if (actionsLoading || actionOpen || resultOpen || gopayOpen || browserAuthOpen || runningActionId) return
-    if (resolvedInitialActionId === 'gopay' && acc?.platform === 'chatgpt') {
-      const signature = `${acc?.id || ''}:${initialActionKey || resolvedInitialActionId}`
-      if (autoHandledActionRef.current === signature) return
-      autoHandledActionRef.current = signature
-      void openGopayDialog().finally(() => {
-        onInitialActionHandled?.()
-      })
-      return
-    }
     const matchedAction = actions.find((item) => String(item?.id || '') === resolvedInitialActionId)
     if (!matchedAction) return
     const signature = `${acc?.id || ''}:${initialActionKey || resolvedInitialActionId}`
@@ -1584,6 +1575,8 @@ export function AccountActionSurface({
     )
   }
 
+  void [openGopayDialog, renderGopayDialog]
+
   const renderBrowserAuthDialog = () => (
     <Modal
       title={`ChatGPT 浏览器登录 · ${acc.email || acc.id}`}
@@ -1737,11 +1730,6 @@ export function AccountActionSurface({
               </Button>
             ) : null,
             acc?.platform === 'chatgpt' ? (
-              <Button key="gopay" loading={gopayLoading} onClick={openGopayDialog}>
-                GoPay
-              </Button>
-            ) : null,
-            acc?.platform === 'chatgpt' ? (
               <Button key="browser-auth" loading={browserAuthLoading} onClick={startBrowserAuth}>
                 浏览器登录
               </Button>
@@ -1787,11 +1775,6 @@ export function AccountActionSurface({
               {paymentLinkAction ? (
                 <Button block loading={runningActionId === 'payment_link'} onClick={() => handleAction('payment_link')}>
                   支付链接生成
-                </Button>
-              ) : null}
-              {acc?.platform === 'chatgpt' ? (
-                <Button block loading={gopayLoading} onClick={openGopayDialog}>
-                  GoPay
                 </Button>
               ) : null}
               {acc?.platform === 'chatgpt' ? (
@@ -1899,7 +1882,6 @@ export function AccountActionSurface({
           </pre>
         ) : null}
       </Modal>
-      {renderGopayDialog()}
       {renderBrowserAuthDialog()}
     </>
   )

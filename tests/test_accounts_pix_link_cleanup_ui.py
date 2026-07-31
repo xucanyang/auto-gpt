@@ -66,7 +66,6 @@ def test_payment_link_scan_covers_all_types_defaults_collapsed_and_allows_five_s
         "pix",
         "twint",
         "kakao_pay",
-        "gopay",
         "team",
         "other",
     ):

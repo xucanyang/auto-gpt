@@ -188,7 +188,6 @@ export function RegisterTaskModal({
         pix: 'PIX',
         twint: 'TWINT',
         kakao_pay: 'Kakao Pay',
-        gopay: 'GoPay',
         team: 'ChatGPT Team',
         other: '其他支付链接',
       } as Record<string, string>)[paymentType] || paymentType.toUpperCase()

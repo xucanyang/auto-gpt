@@ -321,15 +321,6 @@ class AccessTokenOnlyRegistrationEngine:
             return max(minimum, min(parsed, maximum))
         return max(minimum, min(int(default), maximum))
 
-    def _should_capture_gopay_provider_link(self) -> bool:
-        for key in (
-            "chatgpt_access_token_only_gopay_provider_link_enabled",
-            "chatgpt_gopay_provider_link_enabled",
-        ):
-            if key in self.extra_config and self.extra_config.get(key) not in (None, ""):
-                return self._parse_bool(self.extra_config.get(key))
-        return False
-
     @staticmethod
     def _json_object(value: Any) -> dict:
         if isinstance(value, dict):
@@ -348,115 +339,26 @@ class AccessTokenOnlyRegistrationEngine:
         if not isinstance(billing, dict):
             billing = self.extra_config.get("billing") if isinstance(self.extra_config.get("billing"), dict) else {}
         resolved = dict(billing or {})
-        gopay_defaults = self._json_object(self.extra_config.get("chatgpt_gopay_defaults"))
-        mapping = {
-            "name": "billing_name",
-            "email": "billing_email",
-            "country": "billing_country",
-            "line1": "billing_line1",
-            "city": "billing_city",
-            "state": "billing_state",
-            "postal_code": "billing_postal_code",
-        }
-        for target_key, source_key in mapping.items():
-            value = gopay_defaults.get(source_key)
-            if value not in (None, "") and not resolved.get(target_key):
-                resolved[target_key] = value
         resolved.setdefault("email", email_addr)
         resolved.setdefault("country", country)
         resolved.setdefault("currency", currency)
         return resolved
 
-    def _capture_gopay_provider_link(
-        self,
-        account: Any,
-        *,
-        checkout_url: str,
-        country: str,
-        currency: str,
-        billing: dict,
-        proxy: str,
-    ) -> dict:
-        metadata = {
-            "chatgpt_gopay_provider_link_enabled": True,
-            "chatgpt_gopay_provider_link_ready": False,
-            "chatgpt_gopay_provider_link": "",
-            "chatgpt_gopay_provider_link_error": "",
-        }
-        try:
-            from services.chatgpt_core.gopay_flow import create_gopay_provider_link
-
-            self._log("GoPay 平台链接: 开始进入 GoPay/Midtrans 平台链接阶段")
-            snapshot = create_gopay_provider_link(
-                account,
-                account_id=0,
-                plan="plus",
-                country=country,
-                currency=currency,
-                proxy=proxy,
-                checkout_url=checkout_url,
-                billing=billing,
-                proxy_source="registration_checkout_proxy",
-                browser_profile=(
-                    self.extra_config.get("gopay_browser_profile")
-                    if isinstance(self.extra_config.get("gopay_browser_profile"), dict)
-                    else None
-                ),
-                return_on_error=True,
-            )
-            provider_link = str(
-                snapshot.get("payment_platform_url")
-                or snapshot.get("midtrans_redirect_url")
-                or ""
-            ).strip()
-            ready = bool(provider_link)
-            if ready:
-                self._log(f"GoPay 平台链接已获取: {provider_link}")
-            else:
-                error = str(snapshot.get("last_error") or "未返回有效 URL").strip()
-                self._log(f"GoPay 平台链接未返回有效 URL: {error}", "warning")
-            metadata.update(
-                {
-                    "chatgpt_gopay_provider_link_ready": ready,
-                    "chatgpt_gopay_provider_link": provider_link,
-                    "chatgpt_gopay_provider_link_error": "" if ready else str(snapshot.get("last_error") or "未返回有效 URL"),
-                    "chatgpt_gopay_provider_link_snapshot": snapshot,
-                    "chatgpt_gopay_provider_link_checkout_url": snapshot.get("checkout_url") or checkout_url,
-                    "chatgpt_gopay_provider_link_cs_id": snapshot.get("cs_id") or "",
-                    "chatgpt_gopay_provider_link_snap_token": snapshot.get("snap_token") or "",
-                    "chatgpt_gopay_provider_link_stripe_redirect_url": snapshot.get("stripe_redirect_url") or "",
-                    "chatgpt_gopay_provider_link_midtrans_redirect_url": snapshot.get("midtrans_redirect_url") or "",
-                    "chatgpt_gopay_provider_link_payment_method_types": (
-                        (snapshot.get("result") or {}).get("payment_method_types")
-                        if isinstance(snapshot.get("result"), dict)
-                        else []
-                    ),
-                    "chatgpt_gopay_provider_link_phase": snapshot.get("phase") or "",
-                }
-            )
-        except Exception as exc:
-            error = str(exc).strip() or exc.__class__.__name__
-            self._log(f"GoPay 平台链接获取失败，账号仍按注册结果保存: {error}", "warning")
-            metadata["chatgpt_gopay_provider_link_error"] = error
-        return metadata
-
     def _probe_plus_checkout_billing(self, session_result: dict, email_addr: str) -> dict:
         if not self._should_probe_plus_checkout():
             return {}
         amount_check_enabled = self._is_checkout_amount_check_enabled()
-        gopay_provider_link_enabled = self._should_capture_gopay_provider_link()
-        if not amount_check_enabled and not gopay_provider_link_enabled:
-            self._log("Plus 额度验证已关闭，跳过订阅链接生成和 amount 校验")
+        if not amount_check_enabled:
+            self._log("Plus 额度验证已关闭，仅生成订阅链接")
             return {
                 "chatgpt_checkout_plan": "plus",
                 "chatgpt_checkout_url": "",
                 "chatgpt_checkout_amount_check_enabled": False,
                 "chatgpt_skip_save_account": False,
                 "chatgpt_skip_save_reason": "",
-                "chatgpt_gopay_provider_link_enabled": False,
             }
 
-        from services.chatgpt_core.gopay_flow import probe_chatgpt_checkout_amount
+        from services.chatgpt_core.checkout_probe import probe_chatgpt_checkout_amount
         from services.chatgpt_core.payment import (
             CheckoutRequestError,
             generate_plus_link,
@@ -480,10 +382,6 @@ class AccessTokenOnlyRegistrationEngine:
         }
         if self.extra_config.get("stripe_publishable_key"):
             account.extra["stripe_publishable_key"] = self.extra_config.get("stripe_publishable_key")
-        if self.extra_config.get("gopay_browser_profile"):
-            account.extra["gopay_browser_profile"] = self.extra_config.get("gopay_browser_profile")
-        if self.extra_config.get("gopay_processor_entity"):
-            account.extra["gopay_processor_entity"] = self.extra_config.get("gopay_processor_entity")
 
         country = normalize_checkout_country(
             self.extra_config.get("chatgpt_checkout_country")
@@ -504,8 +402,6 @@ class AccessTokenOnlyRegistrationEngine:
             country,
         )
         billing = self._checkout_billing_config(country=country, currency=currency, email_addr=email_addr)
-        if gopay_provider_link_enabled:
-            billing = {**billing, "country": country, "currency": currency}
 
         checkout_proxy = resolve_default_chatgpt_proxy(self.proxy_url)
         if not checkout_proxy:
@@ -550,7 +446,6 @@ class AccessTokenOnlyRegistrationEngine:
             "chatgpt_checkout_country": country,
             "chatgpt_checkout_currency": currency,
             "chatgpt_checkout_amount_check_enabled": amount_check_enabled,
-            "chatgpt_gopay_provider_link_enabled": gopay_provider_link_enabled,
             "chatgpt_access_token_only_zero_amount_stop_enabled": self._zero_amount_stop_enabled(),
             "chatgpt_access_token_only_zero_amount_stop_threshold": self._zero_amount_stop_threshold(),
         }
@@ -562,11 +457,7 @@ class AccessTokenOnlyRegistrationEngine:
                 country=country,
                 currency=currency,
                 proxy=checkout_proxy,
-                browser_profile=(
-                    self.extra_config.get("gopay_browser_profile")
-                    if isinstance(self.extra_config.get("gopay_browser_profile"), dict)
-                    else None
-                ),
+                browser_profile=None,
             )
             amount_text = str(probe.get("amount_text") or probe.get("amount") or "").strip()
             currency_text = str(probe.get("currency") or currency or "").lower()
@@ -595,24 +486,12 @@ class AccessTokenOnlyRegistrationEngine:
             if skip_save:
                 return metadata
         else:
-            self._log("Plus 额度验证已关闭，仅为 GoPay 平台链接生成 checkout")
+            self._log("Plus 额度验证已关闭，仅生成订阅链接")
             metadata.update(
                 {
                     "chatgpt_skip_save_account": False,
                     "chatgpt_skip_save_reason": "",
                 }
-            )
-
-        if gopay_provider_link_enabled:
-            metadata.update(
-                self._capture_gopay_provider_link(
-                    account,
-                    checkout_url=checkout_url,
-                    country=country,
-                    currency=currency,
-                    billing=billing,
-                    proxy=checkout_proxy,
-                )
             )
         return metadata
 

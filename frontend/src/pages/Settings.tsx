@@ -100,11 +100,6 @@ const SELECT_FIELDS: Record<string, { label: string; value: string }[]> = {
     { label: 'AT（Access Token，推荐）', value: 'at' },
     { label: 'RT（Refresh Token）', value: 'rt' },
   ],
-  chatgpt_gopay_billing_llm_country_strategy: [
-    { label: '跟随账单国家', value: 'billing_country' },
-    { label: '跟随结账国家', value: 'checkout_country' },
-    { label: '固定国家', value: 'fixed_country' },
-  ],
   chatgpt_phone_verification_provider: [
     { label: 'SMSToMe 号码池', value: 'smstome' },
     { label: '本地接码网关', value: 'local_gateway' },
@@ -463,22 +458,6 @@ const TAB_ITEMS = [
         ],
       },
       {
-        title: 'GoPay 账单地址 LLM',
-        desc: 'GoPay 启动时生成本次账单地址，失败时回落到表单/默认地址',
-        fields: [
-          { key: 'chatgpt_gopay_billing_llm_enabled', label: '启用 LLM 地址', type: 'boolean' },
-          { key: 'chatgpt_gopay_billing_llm_base_url', label: 'Base URL', placeholder: 'https://api.666800.xyz' },
-          { key: 'chatgpt_gopay_billing_llm_api_key', label: 'API Key', secret: true },
-          { key: 'chatgpt_gopay_billing_llm_model', label: '模型', placeholder: 'gpt-5.4' },
-          { key: 'chatgpt_gopay_billing_llm_wire_api', label: '接口格式', placeholder: 'responses' },
-          { key: 'chatgpt_gopay_billing_llm_country_strategy', label: '地址国家策略', type: 'select' },
-          { key: 'chatgpt_gopay_billing_llm_fixed_country', label: '固定国家代码', placeholder: 'US' },
-          { key: 'chatgpt_gopay_billing_llm_reasoning_effort', label: '推理强度', placeholder: 'xhigh' },
-          { key: 'chatgpt_gopay_billing_llm_timeout_seconds', label: '超时秒数', placeholder: '45' },
-          { key: 'chatgpt_gopay_billing_llm_prompt', label: '提示词', type: 'textarea', placeholder: '生成一个真实可用的账单地址，地址在谷歌地图中能找到对应的位置。' },
-        ],
-      },
-      {
         title: '无 RT / Access Token Only',
         desc: '控制是否执行订阅链接账单 amount 校验，以及 amount=0 命中后的自动停策略',
         fields: [
@@ -487,7 +466,6 @@ const TAB_ITEMS = [
           { key: 'chatgpt_access_token_only_checkout_currency', label: '额度验证货币', placeholder: 'USD' },
           { key: 'chatgpt_access_token_only_zero_amount_stop_enabled', label: '启用 amount=0 自动停', type: 'boolean' },
           { key: 'chatgpt_access_token_only_zero_amount_stop_threshold', label: 'amount=0 命中阈值', placeholder: '1' },
-          { key: 'chatgpt_access_token_only_gopay_provider_link_enabled', label: '注册后获取 GoPay 平台链接', type: 'boolean' },
         ],
       },
       {
@@ -711,7 +689,7 @@ const CHATGPT_PIN_GROUPS = [
   },
   {
     label: '账号订阅',
-    titles: ['账号登录凭据', '支付长链服务', 'GoPay 账单地址 LLM', '无 RT / Access Token Only', '外部 ChatGPT 分发 API'],
+    titles: ['账号登录凭据', '支付长链服务', '无 RT / Access Token Only', '外部 ChatGPT 分发 API'],
   },
   {
     label: '维护验证',
@@ -1264,8 +1242,6 @@ function ConfigField({ field }: { field: FieldConfig }) {
         ? '开启后，有注册等任务在跑时本轮删除会自动跳过，避免误删正在使用的别名。'
       : field.key === 'icloud_hme_auto_delete_dead_statuses'
         ? '逗号分隔；只有失效测活结论命中这些代码时才会删除绑定的别名。默认 account_deactivated（账号被删/停用）、password_invalid（密码失效）。network_failed 等临时失败不会被删。'
-      : field.key === 'chatgpt_access_token_only_gopay_provider_link_enabled'
-        ? '开启后，无 RT 注册/登录成功并生成 Plus checkout 后，会继续走到 GoPay/Midtrans 平台链接阶段并把链接保存到账号 extra；失败不会让已注册账号丢失。'
       : field.key === 'tempmail_archive_cleanup_enabled'
         ? '开启后后台会定时扫描共享 TempMail 收件箱，先写入本地备份库，再删除超过保留窗口的旧邮件。'
       : field.key === 'tempmail_archive_cleanup_interval_minutes'
@@ -3967,30 +3943,6 @@ export default function Settings() {
       if (!data.openai_pay_long_link_base_url) {
         data.openai_pay_long_link_base_url = 'http://openai-pay-long-link:8788'
       }
-      if (!data.chatgpt_gopay_billing_llm_base_url) {
-        data.chatgpt_gopay_billing_llm_base_url = 'https://api.666800.xyz'
-      }
-      if (!data.chatgpt_gopay_billing_llm_model) {
-        data.chatgpt_gopay_billing_llm_model = 'gpt-5.4'
-      }
-      if (!data.chatgpt_gopay_billing_llm_wire_api) {
-        data.chatgpt_gopay_billing_llm_wire_api = 'responses'
-      }
-      if (!data.chatgpt_gopay_billing_llm_country_strategy) {
-        data.chatgpt_gopay_billing_llm_country_strategy = 'billing_country'
-      }
-      if (!data.chatgpt_gopay_billing_llm_fixed_country) {
-        data.chatgpt_gopay_billing_llm_fixed_country = 'US'
-      }
-      if (!data.chatgpt_gopay_billing_llm_reasoning_effort) {
-        data.chatgpt_gopay_billing_llm_reasoning_effort = 'xhigh'
-      }
-      if (!data.chatgpt_gopay_billing_llm_timeout_seconds) {
-        data.chatgpt_gopay_billing_llm_timeout_seconds = 45
-      }
-      if (!data.chatgpt_gopay_billing_llm_prompt) {
-        data.chatgpt_gopay_billing_llm_prompt = '生成一个真实可用的账单地址，地址在谷歌地图中能找到对应的位置。'
-      }
       if (!data.chatgpt_access_token_only_zero_amount_stop_threshold) {
         data.chatgpt_access_token_only_zero_amount_stop_threshold = '1'
       }
@@ -4167,16 +4119,12 @@ export default function Settings() {
       data.cfworker_enabled_domains = parseStoredDomainList(data.cfworker_enabled_domains)
       data.cfworker_random_subdomain = parseBooleanConfigValue(data.cfworker_random_subdomain)
       data.contribution_enabled = parseBooleanConfigValue(data.contribution_enabled)
-      data.chatgpt_gopay_billing_llm_enabled = data.chatgpt_gopay_billing_llm_enabled === '' ? true : parseBooleanConfigValue(data.chatgpt_gopay_billing_llm_enabled)
       data.chatgpt_access_token_only_checkout_amount_check_enabled =
         data.chatgpt_access_token_only_checkout_amount_check_enabled === ''
           ? true
           : parseBooleanConfigValue(data.chatgpt_access_token_only_checkout_amount_check_enabled)
       data.chatgpt_access_token_only_zero_amount_stop_enabled = parseBooleanConfigValue(
         data.chatgpt_access_token_only_zero_amount_stop_enabled,
-      )
-      data.chatgpt_access_token_only_gopay_provider_link_enabled = parseBooleanConfigValue(
-        data.chatgpt_access_token_only_gopay_provider_link_enabled,
       )
       data.chatgpt_resume_auth_allow_phone_verification = parseBooleanConfigValue(
         data.chatgpt_resume_auth_allow_phone_verification,
@@ -4447,15 +4395,11 @@ export default function Settings() {
       values.email_api_gmail_plus_tag_template = String(values.email_api_gmail_plus_tag_template || 'r{rand}').trim() || 'r{rand}'
       values.email_api_default_scheme = String(values.email_api_default_scheme || 'https').trim() || 'https'
       values.contribution_enabled = parseBooleanConfigValue(values.contribution_enabled)
-      values.chatgpt_gopay_billing_llm_enabled = parseBooleanConfigValue(values.chatgpt_gopay_billing_llm_enabled)
       values.chatgpt_access_token_only_checkout_amount_check_enabled = parseBooleanConfigValue(
         values.chatgpt_access_token_only_checkout_amount_check_enabled,
       )
       values.chatgpt_access_token_only_zero_amount_stop_enabled = parseBooleanConfigValue(
         values.chatgpt_access_token_only_zero_amount_stop_enabled,
-      )
-      values.chatgpt_access_token_only_gopay_provider_link_enabled = parseBooleanConfigValue(
-        values.chatgpt_access_token_only_gopay_provider_link_enabled,
       )
       values.chatgpt_resume_auth_allow_phone_verification = parseBooleanConfigValue(
         values.chatgpt_resume_auth_allow_phone_verification,
@@ -4608,13 +4552,11 @@ export default function Settings() {
         dynamic_proxy_probe_timeout_seconds: values.dynamic_proxy_probe_timeout_seconds,
         dynamic_proxy_ip_retention_minutes: values.dynamic_proxy_ip_retention_minutes,
         contribution_enabled: values.contribution_enabled,
-        chatgpt_gopay_billing_llm_enabled: values.chatgpt_gopay_billing_llm_enabled,
         chatgpt_access_token_only_checkout_amount_check_enabled: values.chatgpt_access_token_only_checkout_amount_check_enabled,
         chatgpt_access_token_only_checkout_country: values.chatgpt_access_token_only_checkout_country,
         chatgpt_access_token_only_checkout_currency: values.chatgpt_access_token_only_checkout_currency,
         chatgpt_access_token_only_zero_amount_stop_enabled: values.chatgpt_access_token_only_zero_amount_stop_enabled,
         chatgpt_access_token_only_zero_amount_stop_threshold: values.chatgpt_access_token_only_zero_amount_stop_threshold,
-        chatgpt_access_token_only_gopay_provider_link_enabled: values.chatgpt_access_token_only_gopay_provider_link_enabled,
         chatgpt_resume_auth_allow_phone_verification: values.chatgpt_resume_auth_allow_phone_verification,
         chatgpt_resume_auth_allow_add_phone_verification: values.chatgpt_resume_auth_allow_add_phone_verification,
         chatgpt_resume_auth_allow_existing_phone_verification: values.chatgpt_resume_auth_allow_existing_phone_verification,
@@ -4750,7 +4692,7 @@ export default function Settings() {
                 : `当前实例只使用本地配置；脱离基线：rev ${shareState?.baseline_revision || '0'}，脱离时间：${shareState?.detached_at || '-'}。先保存修改，再发布本地配置即可重新加入共享。`}
             </Typography.Text>
             <Typography.Text type="secondary">
-              本地保留不共享：CLIProxyAPI、外部分发 API Token、GoPay 近期运行态等实例专属配置。
+              本地保留不共享：CLIProxyAPI、外部分发 API Token、支付会话近期运行态等实例专属配置。
             </Typography.Text>
           </Space>
           <Space size={8} wrap>

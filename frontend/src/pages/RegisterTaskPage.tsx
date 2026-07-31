@@ -187,9 +187,6 @@ export default function RegisterTaskPage() {
             : parseBooleanConfigValue(cfg.chatgpt_access_token_only_checkout_amount_check_enabled),
         chatgpt_access_token_only_checkout_country: String(cfg.chatgpt_access_token_only_checkout_country || 'US').trim().toUpperCase() || 'US',
         chatgpt_access_token_only_checkout_currency: String(cfg.chatgpt_access_token_only_checkout_currency || 'USD').trim().toUpperCase() || 'USD',
-        chatgpt_access_token_only_gopay_provider_link_enabled: parseBooleanConfigValue(
-          cfg.chatgpt_access_token_only_gopay_provider_link_enabled,
-        ),
         chatgpt_save_registration_access_token_account:
           cfg.chatgpt_save_registration_access_token_account === ''
             ? true
@@ -363,10 +360,6 @@ export default function RegisterTaskPage() {
       chatgpt_access_token_only_checkout_currency:
         platform === 'chatgpt'
           ? String(values.chatgpt_access_token_only_checkout_currency || 'USD').trim().toUpperCase() || 'USD'
-          : undefined,
-      chatgpt_access_token_only_gopay_provider_link_enabled:
-        platform === 'chatgpt'
-          ? Boolean(values.chatgpt_access_token_only_gopay_provider_link_enabled)
           : undefined,
     }
     const chatgptRegistrationRequestAdapter =

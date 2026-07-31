@@ -91,7 +91,6 @@ class BaseChatGPTRegistrationModeAdapter(ABC):
                 "chatgpt_registration_mode": CHATGPT_REGISTRATION_MODE_ACCESS_TOKEN_ONLY,
                 "chatgpt_has_refresh_token_solution": False,
                 "chatgpt_access_token_only_checkout_amount_check_enabled": False,
-                "chatgpt_access_token_only_gopay_provider_link_enabled": False,
             }
         )
         engine = AccessTokenOnlyRegistrationEngine(
@@ -300,18 +299,6 @@ class BaseChatGPTRegistrationModeAdapter(ABC):
                 "chatgpt_payment_already_paid",
                 "chatgpt_skip_save_account",
                 "chatgpt_skip_save_reason",
-                "chatgpt_gopay_provider_link_enabled",
-                "chatgpt_gopay_provider_link_ready",
-                "chatgpt_gopay_provider_link",
-                "chatgpt_gopay_provider_link_error",
-                "chatgpt_gopay_provider_link_snapshot",
-                "chatgpt_gopay_provider_link_checkout_url",
-                "chatgpt_gopay_provider_link_cs_id",
-                "chatgpt_gopay_provider_link_snap_token",
-                "chatgpt_gopay_provider_link_stripe_redirect_url",
-                "chatgpt_gopay_provider_link_midtrans_redirect_url",
-                "chatgpt_gopay_provider_link_payment_method_types",
-                "chatgpt_gopay_provider_link_phase",
                 "cookies",
                 "cookie_header",
                 "registration_web_session_material_preserved",
@@ -738,10 +725,6 @@ class RefreshTokenChatGPTRegistrationAdapter(BaseChatGPTRegistrationModeAdapter)
                 ),
             }
         )
-        try:
-            stage2_engine._append_gopay_provider_link_metadata(result, {})
-        except Exception:
-            pass
         return result
 
     def run(self, context: ChatGPTRegistrationContext):
@@ -784,7 +767,6 @@ class RefreshTokenChatGPTRegistrationAdapter(BaseChatGPTRegistrationModeAdapter)
                 # 第一阶段只负责注册/登录并拿 ChatGPT Web access_token；不要让账单、
                 # GoPay 或 RT/full-auth 探测改变“先落库”的语义。
                 "chatgpt_access_token_only_checkout_amount_check_enabled": False,
-                "chatgpt_access_token_only_gopay_provider_link_enabled": False,
             }
         )
 

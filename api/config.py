@@ -206,7 +206,6 @@ CONFIG_KEYS = [
     "existing_phone_otp_resend_interval_seconds",
     "chatgpt_subscription_auth_capture_retry_delays_seconds",
     "chatgpt_workspace_select_no_org_retry_delays_seconds",
-    "chatgpt_gopay_defaults",
     "chatgpt_payment_link_defaults",
     "openai_pay_long_link_base_url",
     "openai_pay_long_link_api_key",
@@ -215,7 +214,6 @@ CONFIG_KEYS = [
     "chatgpt_access_token_only_checkout_currency",
     "chatgpt_access_token_only_zero_amount_stop_enabled",
     "chatgpt_access_token_only_zero_amount_stop_threshold",
-    "chatgpt_access_token_only_gopay_provider_link_enabled",
     "external_subscription_api_enabled",
     "external_subscription_api_token",
     "external_subscription_verify_after_seconds",
@@ -225,28 +223,12 @@ CONFIG_KEYS = [
     "external_access_token_default_lease_seconds",
     "external_access_token_max_limit",
     "external_access_token_precheck_cooldown_seconds",
-    "chatgpt_gopay_billing_llm_enabled",
-    "chatgpt_gopay_billing_llm_base_url",
-    "chatgpt_gopay_billing_llm_api_key",
-    "chatgpt_gopay_billing_llm_model",
-    "chatgpt_gopay_billing_llm_wire_api",
-    "chatgpt_gopay_billing_llm_country_strategy",
-    "chatgpt_gopay_billing_llm_fixed_country",
-    "chatgpt_gopay_billing_llm_reasoning_effort",
-    "chatgpt_gopay_billing_llm_timeout_seconds",
-    "chatgpt_gopay_billing_llm_prompt",
     "chatgpt_llm_api_base_url",
     "chatgpt_llm_api_key",
     "chatgpt_llm_model",
     "chatgpt_llm_timeout_seconds",
     "chatgpt_llm_billing_address_prompt",
     "chatgpt_phone_verification_enabled",
-    "chatgpt_gopay_otp_auto_resend_delay_seconds",
-    "chatgpt_gopay_phone_candidates",
-    "chatgpt_gopay_uid_bindings",
-    "chatgpt_gopay_uid_sessions",
-    "chatgpt_gopay_smsforwarder_secret",
-    "chatgpt_gopay_smsforwarder_recent_events",
     "codex_proxy_url",
     "codex_proxy_key",
     "codex_proxy_upload_type",
@@ -695,8 +677,6 @@ def _build_config_response(*, local_only: bool = False) -> dict[str, Any]:
         all_cfg["luckmail_base_url"] = "https://mails.luckyous.com/"
     if not all_cfg.get("contribution_server_url"):
         all_cfg["contribution_server_url"] = "http://new.xem8k5.top:7317/"
-    if not all_cfg.get("chatgpt_gopay_billing_llm_enabled"):
-        all_cfg["chatgpt_gopay_billing_llm_enabled"] = "true"
     if not all_cfg.get("openai_pay_long_link_base_url"):
         all_cfg["openai_pay_long_link_base_url"] = (
             os.getenv("OPENAI_PAY_LONG_LINK_BASE_URL") or "http://openai-pay-long-link:8788"
@@ -711,8 +691,6 @@ def _build_config_response(*, local_only: bool = False) -> dict[str, Any]:
         all_cfg["chatgpt_access_token_only_checkout_currency"] = "USD"
     if not all_cfg.get("chatgpt_access_token_only_zero_amount_stop_threshold"):
         all_cfg["chatgpt_access_token_only_zero_amount_stop_threshold"] = "1"
-    if not all_cfg.get("chatgpt_access_token_only_gopay_provider_link_enabled"):
-        all_cfg["chatgpt_access_token_only_gopay_provider_link_enabled"] = "false"
     if not all_cfg.get("external_subscription_api_enabled"):
         all_cfg["external_subscription_api_enabled"] = "false"
     if not all_cfg.get("external_subscription_verify_after_seconds"):
@@ -779,36 +757,8 @@ def _build_config_response(*, local_only: bool = False) -> dict[str, Any]:
         all_cfg["chatgpt_phone_signup_max_resend_attempts"] = "1"
     if not all_cfg.get("chatgpt_phone_signup_resend_interval_seconds"):
         all_cfg["chatgpt_phone_signup_resend_interval_seconds"] = "60"
-    if not all_cfg.get("chatgpt_gopay_billing_llm_base_url"):
-        all_cfg["chatgpt_gopay_billing_llm_base_url"] = "https://api.666800.xyz"
-    if not all_cfg.get("chatgpt_gopay_billing_llm_model"):
-        all_cfg["chatgpt_gopay_billing_llm_model"] = "gpt-5.4"
-    if not all_cfg.get("chatgpt_gopay_billing_llm_wire_api"):
-        all_cfg["chatgpt_gopay_billing_llm_wire_api"] = "responses"
-    if not all_cfg.get("chatgpt_gopay_billing_llm_country_strategy"):
-        all_cfg["chatgpt_gopay_billing_llm_country_strategy"] = "billing_country"
-    if not all_cfg.get("chatgpt_gopay_billing_llm_fixed_country"):
-        all_cfg["chatgpt_gopay_billing_llm_fixed_country"] = "US"
-    if not all_cfg.get("chatgpt_gopay_billing_llm_reasoning_effort"):
-        all_cfg["chatgpt_gopay_billing_llm_reasoning_effort"] = "xhigh"
-    if not all_cfg.get("chatgpt_gopay_billing_llm_timeout_seconds"):
-        all_cfg["chatgpt_gopay_billing_llm_timeout_seconds"] = "45"
-    if not all_cfg.get("chatgpt_gopay_billing_llm_prompt"):
-        all_cfg["chatgpt_gopay_billing_llm_prompt"] = "生成一个真实可用的账单地址，地址在谷歌地图中能找到对应的位置。"
-    if not all_cfg.get("chatgpt_gopay_billing_llm_api_key") and all_cfg.get("chatgpt_llm_api_key"):
-        all_cfg["chatgpt_gopay_billing_llm_api_key"] = all_cfg.get("chatgpt_llm_api_key") or ""
-    if not all_cfg.get("chatgpt_llm_api_base_url"):
-        all_cfg["chatgpt_llm_api_base_url"] = all_cfg.get("chatgpt_gopay_billing_llm_base_url") or "https://api.666800.xyz/"
-    if not all_cfg.get("chatgpt_llm_model"):
-        all_cfg["chatgpt_llm_model"] = all_cfg.get("chatgpt_gopay_billing_llm_model") or "gpt-5.4"
-    if not all_cfg.get("chatgpt_llm_timeout_seconds"):
-        all_cfg["chatgpt_llm_timeout_seconds"] = all_cfg.get("chatgpt_gopay_billing_llm_timeout_seconds") or "45"
-    if not all_cfg.get("chatgpt_llm_billing_address_prompt"):
-        all_cfg["chatgpt_llm_billing_address_prompt"] = all_cfg.get("chatgpt_gopay_billing_llm_prompt") or ""
     if not all_cfg.get("chatgpt_phone_verification_enabled"):
         all_cfg["chatgpt_phone_verification_enabled"] = "true"
-    if not all_cfg.get("chatgpt_gopay_otp_auto_resend_delay_seconds"):
-        all_cfg["chatgpt_gopay_otp_auto_resend_delay_seconds"] = "10"
     # 只返回已知 key，未设置的返回空字符串
     return {k: all_cfg.get(k, "") for k in CONFIG_KEYS}
 

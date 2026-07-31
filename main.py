@@ -14,14 +14,11 @@ from api.tasks import router as tasks_router
 from api.proxies import router as proxies_router
 from api.config import router as config_router
 from api.actions import router as actions_router
-from api.integrations import router as integrations_router
 from api.auth import router as auth_router
 from api.outlook import router as outlook_router
 from api.contribution import router as contribution_router
 from api.icloud_hme import router as icloud_hme_router
 from api.tempmail_archive import router as tempmail_archive_router
-from api.pipeline import router as pipeline_router
-from api.idea_oaipay_pipeline import router as idea_oaipay_pipeline_router
 from api.external_subscription import (
     router as external_subscription_router,
     start_subscription_verification_scheduler,
@@ -34,15 +31,11 @@ from api.delivery_cards import public_router as delivery_cards_public_router
 from api.delivery_cards import router as delivery_cards_router
 from api.system import router as system_router
 from services.chatgpt_core import ChatGPTPlatform
-from services.idea_oaipay_pipeline.engine import idea_oaipay_pipeline_engine
-from services.pipeline import pipeline_engine
 
 EXPECTED_CONDA_ENV = os.getenv("APP_CONDA_ENV", "auto-chatgpt")
 PUBLIC_API_PATHS = {
     "/api/health",
     "/api/chatgpt/export-sub2api-download",
-    "/api/integrations/gopay-otp/admin",
-    "/api/integrations/gopay-otp/smsforwarder",
 }
 
 SENSITIVE_SPA_FALLBACK_ROOTS = {
@@ -281,14 +274,6 @@ async def lifespan(app: FastAPI):
     start_subscription_verification_scheduler()
     from services.solver_manager import start_async
     start_async()
-    try:
-        pipeline_engine.restore_or_start()
-    except Exception as exc:
-        print(f"[WARN] 自动流水线恢复/启动失败: {exc}")
-    try:
-        idea_oaipay_pipeline_engine.recover_latest_task()
-    except Exception as exc:
-        print(f"[WARN] 账号处理流水线恢复失败: {exc}")
     yield
     from core.scheduler import scheduler as _scheduler
     _scheduler.stop()
@@ -307,14 +292,6 @@ async def lifespan(app: FastAPI):
     from services.chatgpt_core.baxigpt_status_poller import stop as stop_baxigpt_status_poller
     stop_baxigpt_status_poller()
     stop_subscription_verification_scheduler()
-    try:
-        pipeline_engine.stop()
-    except Exception:
-        pass
-    try:
-        idea_oaipay_pipeline_engine.shutdown()
-    except Exception:
-        pass
     from services.solver_manager import stop
     stop()
 
@@ -373,14 +350,11 @@ app.include_router(tasks_router, prefix="/api")
 app.include_router(proxies_router, prefix="/api")
 app.include_router(config_router, prefix="/api")
 app.include_router(actions_router, prefix="/api")
-app.include_router(integrations_router, prefix="/api")
 app.include_router(auth_router, prefix="/api")
 app.include_router(outlook_router, prefix="/api")
 app.include_router(contribution_router, prefix="/api")
 app.include_router(icloud_hme_router, prefix="/api")
 app.include_router(tempmail_archive_router, prefix="/api")
-app.include_router(pipeline_router, prefix="/api")
-app.include_router(idea_oaipay_pipeline_router, prefix="/api")
 app.include_router(external_subscription_router, prefix="/api")
 app.include_router(external_access_tokens_router, prefix="/api")
 app.include_router(phone_pool_router, prefix="/api")

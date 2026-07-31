@@ -710,7 +710,7 @@ class AccountFilterSortTests(unittest.TestCase):
             555: "pix",
             556: "twint",
             557: "kakao_pay",
-            558: "gopay",
+            558: "other",
             559: "team",
             560: "ideal",
             561: "team",

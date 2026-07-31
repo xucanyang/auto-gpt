@@ -54,7 +54,6 @@ import type {
 } from '@/features/accounts/components/AccountsToolbar'
 import { PixLinkScanModal } from '@/features/accounts/components/PixLinkScanModal'
 import type { PaymentLinkCleanupType, PixLinkCleanupMode, PixLinkScanReport } from '@/features/accounts/components/PixLinkScanModal'
-import { BatchGopayWorkbench } from '@/features/accounts/components/BatchGopayWorkbench'
 import { ImportAccountsModal } from '@/features/accounts/components/ImportAccountsModal'
 import { useAccountDetailQuery } from '@/features/accounts/hooks/useAccountDetailQuery'
 import { useActiveTasksQuery } from '@/features/accounts/hooks/useActiveTasksQuery'
@@ -193,7 +192,6 @@ const ACCOUNT_TOOLBAR_ACTION_OPTIONS: Array<{ value: AccountToolbarActionId; tex
   { value: 'phoneBindingTest', text: '手机号绑定' },
   { value: 'paypalBinding', text: 'PayPal绑定' },
   { value: 'baxiCdkSubmit', text: 'iDEAL / PIX 批量提交' },
-  { value: 'gopay', text: '批量 GoPay' },
 ]
 
 type PhonePoolMode = 'normal' | 'prefix_limited' | 'prefix_sample' | 'unavailable_numbers'
@@ -506,7 +504,6 @@ const PAYMENT_LINK_SCAN_LABELS: Record<PaymentLinkCleanupType, string> = {
   pix: 'PIX',
   twint: 'TWINT',
   kakao_pay: 'Kakao Pay',
-  gopay: 'GoPay',
   team: 'ChatGPT Team',
   other: '其他支付链接',
 }
@@ -651,7 +648,6 @@ const PAYMENT_LINK_PLATFORM_FILTER_OPTIONS = [
   { value: 'pix', text: 'PIX' },
   { value: 'twint', text: 'TWINT' },
   { value: 'kakao_pay', text: 'Kakao Pay' },
-  { value: 'gopay', text: 'GoPay' },
   { value: 'team', text: 'ChatGPT Team' },
   { value: 'other', text: '其他支付链接' },
   { value: 'none', text: '当前无链接' },
@@ -676,7 +672,6 @@ const PAYMENT_LINK_PLATFORM_FILTER_VALUE_ALIASES: Record<string, string[]> = {
   kakao: ['kakao_pay'],
   kakaopay: ['kakao_pay'],
   'kakao-pay': ['kakao_pay'],
-  gopy: ['gopay'],
   team_checkout: ['team'],
   chatgptteamplan: ['team'],
   no_link: ['none'],
@@ -6829,7 +6824,6 @@ export default function Accounts() {
       ideal: 'iDEAL',
       twint: 'TWINT',
       kakao_pay: 'KAKAO PAY',
-      gopay: 'GOPAY',
       team: 'TEAM',
       other: '其他',
     } as Record<string, string>)[platform]
@@ -7162,11 +7156,6 @@ export default function Accounts() {
               补抓Auth
             </Button>
           ) : null}
-          {isChatgptPlatform ? (
-            <Button size="small" style={mobileActionButtonStyle(accountActionTextStyles.payment)} onClick={() => openAccountInlineAction(record, 'gopay', 'direct')}>
-              GoPay支付
-            </Button>
-          ) : null}
           {showInvalidRecheck ? (
             <Button size="small" style={mobileActionButtonStyle(accountActionTextStyles.resume)} onClick={() => handleInvalidRecheck(record)}>
               失效测活
@@ -7218,16 +7207,6 @@ export default function Accounts() {
               onClick={() => handleResumeSubscriptionAuth(record)}
             >
               补抓Auth
-            </Button>
-          ) : null}
-          {isChatgptPlatform ? (
-            <Button
-              type="link"
-              size="small"
-              style={accountActionTextStyles.payment}
-              onClick={() => openAccountInlineAction(record, 'gopay', 'direct')}
-            >
-              GoPay支付
             </Button>
           ) : null}
           {showInvalidRecheck ? (
@@ -8350,6 +8329,24 @@ export default function Accounts() {
       ? '-'
       : String(paypalFilteredEligibleCount)
 
+  void [
+    batchGopayLoading,
+    batchGopayPhoneSaving,
+    batchGopayStopMode,
+    setBatchGopayRoundInterval,
+    batchGopayOtpDelaySaving,
+    batchGopayNextRoundAt,
+    deleteBatchGopayPhone,
+    moveBatchGopayPhone,
+    openBatchGopayWorkbench,
+    addBatchGopayPhoneToPool,
+    updateBatchGopayPhoneNumberInput,
+    startBatchGopay,
+    cancelBatchGopayAll,
+    stopBatchGopayAfterCurrent,
+    renderBatchGopayItem,
+  ]
+
   return (
     <div
       style={{
@@ -8375,7 +8372,6 @@ export default function Accounts() {
         onRefreshActiveTasks={refreshActiveTasks}
         onActiveTasksOpen={() => setActiveTasksPanelOpen(true)}
         isChatgptPlatform={currentPlatform === 'chatgpt'}
-        batchGopayLoading={batchGopayLoading}
         batchPaymentLinkLoading={batchPaymentLinkLoading}
         pixLinkCleanupLoading={pixLinkCleanupLoading || pixLinkScanLoading}
         batchInvalidRecheckLoading={batchInvalidRecheckLoading}
@@ -8388,7 +8384,6 @@ export default function Accounts() {
         onOpenPhoneBindingTest={() => { void openPhoneBindingTest() }}
         onOpenPaypalBinding={openPaypalBinding}
         onOpenBaxiCdkSubmit={openBaxiCdkSubmit}
-        onOpenBatchGopay={openBatchGopayWorkbench}
         deleteInvalidLoading={deleteInvalidLoading}
         onDeleteInvalid={handleDeleteInvalid}
         onBatchDelete={handleBatchDelete}
@@ -8690,47 +8685,6 @@ export default function Accounts() {
           ) : null}
         </Space>
       </Modal>
-
-      <BatchGopayWorkbench
-        open={batchGopayOpen}
-        onClose={() => {
-          setBatchGopayOpen(false)
-          setBatchGopayPhoneCountryCode(DEFAULT_GOPAY_PHONE_COUNTRY_CODE)
-          setBatchGopayPhoneNumber('')
-          setBatchGopayRecognizedCountryCodes([DEFAULT_GOPAY_PHONE_COUNTRY_CODE])
-          setBatchGopayPhoneSaving(false)
-        }}
-        token={token}
-        items={batchGopayItems}
-        phones={batchGopayPhones}
-        loading={batchGopayLoading}
-        phoneSaving={batchGopayPhoneSaving}
-        started={batchGopayStarted}
-        stopMode={batchGopayStopMode}
-        roundInterval={batchGopayRoundInterval}
-        otpAutoResendDelay={batchGopayOtpAutoResendDelay}
-        otpDelaySaving={batchGopayOtpDelaySaving}
-        nextRoundAt={batchGopayNextRoundAt}
-        phoneCountryCode={batchGopayPhoneCountryCode}
-        phoneNumber={batchGopayPhoneNumber}
-        onPhoneCountryCodeChange={(value) => setBatchGopayPhoneCountryCode(normalizeGopayPhonePart(value))}
-        onPhoneNumberChange={updateBatchGopayPhoneNumberInput}
-        onSaveOtpDelay={() => saveBatchGopayOtpAutoResendDelay(batchGopayOtpAutoResendDelay)}
-        onRefreshConfig={loadGopayBatchConfig}
-        onStart={startBatchGopay}
-        onStopAfterCurrent={stopBatchGopayAfterCurrent}
-        onCancelAll={cancelBatchGopayAll}
-        onAddPhone={addBatchGopayPhoneToPool}
-        onMovePhone={moveBatchGopayPhone}
-        onDeletePhone={deleteBatchGopayPhone}
-        onRoundIntervalChange={(value) => setBatchGopayRoundInterval(Number(value || 0))}
-        onOtpAutoResendDelayChange={(value) => setBatchGopayOtpAutoResendDelay(value)}
-        formatGopayPhoneLabel={formatGopayPhoneLabel}
-        formatGopayPhoneExpiryLabel={formatGopayPhoneExpiryLabel}
-        renderBatchGopayItem={renderBatchGopayItem}
-        normalizeGopayOtpAutoResendDelay={normalizeGopayOtpAutoResendDelay}
-        activePhaseMatcher={(item) => Boolean(item.snapshot?.session_id && GOPAY_ACTIVE_PHASES.has(String(item.snapshot?.phase || '')))}
-      />
 
       <RegisterTaskModal
         open={registerModalOpen}

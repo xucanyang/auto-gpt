@@ -229,38 +229,6 @@ def _scheduler_resource() -> dict[str, Any]:
     )
 
 
-def _pipeline_resource() -> dict[str, Any]:
-    from services.pipeline import pipeline_engine
-
-    snapshot = pipeline_engine.get_status_snapshot()
-    task = dict(snapshot.get("task") or {})
-    pipeline_status = str(task.get("status") or getattr(pipeline_engine, "status", "") or "stopped").strip()
-    last_error = str(task.get("last_error") or "").strip()
-    summary = dict(snapshot.get("summary") or {})
-
-    if last_error:
-        status = "warning"
-    elif pipeline_status == "running":
-        status = "healthy"
-    elif pipeline_status == "paused":
-        status = "warning"
-    else:
-        status = "unknown"
-
-    return _resource(
-        key="pipeline",
-        title="自动流水线",
-        status=status,
-        message=f"状态: {pipeline_status or 'unknown'}",
-        metrics={
-            "status": pipeline_status,
-            **summary,
-        },
-        action_path="/pipeline",
-        details={"last_error": last_error},
-    )
-
-
 def _icloud_auto_pool_resource() -> dict[str, Any]:
     from services.icloud_hme_auto_pool import get_status
 
@@ -371,7 +339,6 @@ def build_system_health(
             [
                 _safe_resource("solver", "Turnstile Solver", _solver_resource, action_path="/settings"),
                 _safe_resource("scheduler", "后台调度器", _scheduler_resource),
-                _safe_resource("pipeline", "自动流水线", _pipeline_resource, action_path="/pipeline"),
                 _safe_resource("icloud_hme_auto_pool", "iCloud HME 自动补池", _icloud_auto_pool_resource, action_path="/settings"),
                 _safe_resource("icloud_hme_auto_delete", "iCloud HME 自动删除", _icloud_auto_delete_resource, action_path="/settings"),
                 _safe_resource("tempmail_archive", "TempMail 归档清理", _tempmail_archive_resource, action_path="/settings"),

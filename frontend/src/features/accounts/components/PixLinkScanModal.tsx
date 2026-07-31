@@ -13,7 +13,6 @@ export type PaymentLinkScanType =
   | 'pix'
   | 'twint'
   | 'kakao_pay'
-  | 'gopay'
   | 'team'
   | 'other'
 export type PaymentLinkCleanupType = PaymentLinkScanType
@@ -89,7 +88,6 @@ const PAYMENT_LINK_SCAN_SECTIONS: ScanSection[] = [
   { type: 'pix', label: 'PIX', cleanupModes: ALL_PAYMENT_LINK_CLEANUP_MODES },
   { type: 'twint', label: 'TWINT', cleanupModes: ALL_PAYMENT_LINK_CLEANUP_MODES },
   { type: 'kakao_pay', label: 'Kakao Pay', cleanupModes: ALL_PAYMENT_LINK_CLEANUP_MODES },
-  { type: 'gopay', label: 'GoPay', cleanupModes: ALL_PAYMENT_LINK_CLEANUP_MODES },
   { type: 'team', label: 'ChatGPT Team', note: '提取后 24 小时到期', cleanupModes: ALL_PAYMENT_LINK_CLEANUP_MODES },
   { type: 'other', label: '其他支付链接', cleanupModes: ALL_PAYMENT_LINK_CLEANUP_MODES },
 ]

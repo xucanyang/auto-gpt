@@ -22,7 +22,6 @@ class RefreshTokenChatGPTRegistrationRequestAdapter
       chatgpt_registration_mode: this.mode,
       chatgpt_has_refresh_token_solution: false,
       chatgpt_access_token_only_checkout_amount_check_enabled: false,
-      chatgpt_access_token_only_gopay_provider_link_enabled: false,
     }
   }
 }
@@ -38,7 +37,6 @@ class AccessTokenOnlyChatGPTRegistrationRequestAdapter
       chatgpt_registration_mode: this.mode,
       chatgpt_has_refresh_token_solution: false,
       chatgpt_access_token_only_checkout_amount_check_enabled: false,
-      chatgpt_access_token_only_gopay_provider_link_enabled: false,
     }
   }
 }

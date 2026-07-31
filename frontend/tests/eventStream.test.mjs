@@ -84,14 +84,14 @@ test('consumeEventStream sends the session only in the Authorization header', as
 
   const events = []
   try {
-    await consumeEventStream('/pipeline/logs/stream', {
+    await consumeEventStream('/tasks/123/logs/stream?since=0', {
       onEvent: (event) => events.push(event),
     })
   } finally {
     globalThis.fetch = originalFetch
   }
 
-  assert.equal(requestedUrl, '/api/pipeline/logs/stream')
+  assert.equal(requestedUrl, '/api/tasks/123/logs/stream?since=0')
   assert.equal(requestedUrl.includes('top-secret-session'), false)
   assert.equal(requestedUrl.includes('access_token='), false)
   assert.equal(requestedHeaders.get('Authorization'), 'Bearer top-secret-session')
@@ -137,7 +137,7 @@ test('consumeEventStream forwards aborts without retrying or swallowing them', a
   })
 
   try {
-    const stream = consumeEventStream('/pipeline/logs/stream', {
+    const stream = consumeEventStream('/tasks/123/logs/stream?since=0', {
       signal: controller.signal,
       onEvent: () => undefined,
     })

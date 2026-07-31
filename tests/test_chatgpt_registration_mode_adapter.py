@@ -102,35 +102,6 @@ class ChatGPTRegistrationModeAdapterTests(unittest.TestCase):
             "https://chatgpt.com/checkout/openai_llc/cs_live_123",
         )
 
-    def test_build_account_propagates_gopay_provider_link_metadata(self):
-        adapter = build_chatgpt_registration_mode_adapter(
-            {"chatgpt_registration_mode": "access_token_only"}
-        )
-
-        account = adapter.build_account(
-            _result(
-                metadata={
-                    "chatgpt_gopay_provider_link_enabled": True,
-                    "chatgpt_gopay_provider_link_ready": True,
-                    "chatgpt_gopay_provider_link": "https://app.midtrans.com/snap/v4/redirection/demo",
-                    "chatgpt_gopay_provider_link_cs_id": "cs_live_123",
-                    "chatgpt_gopay_provider_link_payment_method_types": ["gopay"],
-                }
-            ),
-            fallback_password="fallback",
-        )
-
-        self.assertTrue(account.extra["chatgpt_gopay_provider_link_enabled"])
-        self.assertTrue(account.extra["chatgpt_gopay_provider_link_ready"])
-        self.assertEqual(
-            account.extra["chatgpt_gopay_provider_link"],
-            "https://app.midtrans.com/snap/v4/redirection/demo",
-        )
-        self.assertEqual(
-            account.extra["chatgpt_gopay_provider_link_payment_method_types"],
-            ["gopay"],
-        )
-
     def test_build_account_marks_already_paid_checkout_as_invalid(self):
         adapter = build_chatgpt_registration_mode_adapter(
             {"chatgpt_registration_mode": "access_token_only"}
@@ -437,10 +408,6 @@ class ChatGPTRegistrationModeAdapterTests(unittest.TestCase):
                 for key, value in payload.items():
                     setattr(result, key, value)
 
-            @staticmethod
-            def _append_gopay_provider_link_metadata(_result, _session_result):
-                return None
-
         fake_module = types.ModuleType(
             "services.chatgpt_core.refresh_token_registration_engine"
         )
@@ -548,9 +515,7 @@ class ChatGPTRegistrationModeAdapterTests(unittest.TestCase):
         with mock.patch(
             "services.chatgpt_core.refresh_token_registration_engine.RefreshTokenRegistrationEngine._capture_auth_via_fresh_login",
             side_effect=AssertionError("browser executor used protocol OAuth"),
-        ) as protocol_oauth, mock.patch(
-            "services.chatgpt_core.refresh_token_registration_engine.RefreshTokenRegistrationEngine._append_gopay_provider_link_metadata",
-        ):
+        ) as protocol_oauth:
             result = adapter._capture_stage2_from_stage1_session(
                 context=context,
                 stage1_engine=stage1_engine,
@@ -797,10 +762,6 @@ class ChatGPTRegistrationModeAdapterTests(unittest.TestCase):
                 result.success = True
                 for key, value in payload.items():
                     setattr(result, key, value)
-
-            @staticmethod
-            def _append_gopay_provider_link_metadata(_result, _session_result):
-                return None
 
         refresh_module = types.ModuleType(
             "services.chatgpt_core.refresh_token_registration_engine"

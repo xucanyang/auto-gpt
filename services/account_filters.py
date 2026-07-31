@@ -197,8 +197,6 @@ _PAYMENT_LINK_PLATFORM_FILTER_ALIASES: dict[str, set[str]] = {
     "kakaopay": {"kakao_pay"},
     "kakao-pay": {"kakao_pay"},
     "kakao_pay": {"kakao_pay"},
-    "gopy": {"gopay"},
-    "gopay": {"gopay"},
     "team": {"team"},
     "team_checkout": {"team"},
     "chatgptteamplan": {"team"},
@@ -229,7 +227,6 @@ _PAYMENT_LINK_TYPE_ALIASES: dict[str, str] = {
     "upi_qr_code": "upi",
     "kakao": "kakao_pay",
     "kakaopay": "kakao_pay",
-    "gopy": "gopay",
     "team_checkout": "team",
     "chatgptteamplan": "team",
 }
@@ -240,7 +237,6 @@ _PAYMENT_LINK_CONCRETE_TYPES = frozenset({
     "pix",
     "twint",
     "kakao_pay",
-    "gopay",
 })
 
 
@@ -801,8 +797,6 @@ def payment_link_platform_from_payload(payload: dict[str, Any]) -> str:
         "nicepay.co.kr",
     ):
         return "kakao_pay"
-    if link_format in {"gopay", "gopay_url"}:
-        return "gopay"
     if (
         link_type == "hosted"
         or payment_method_type == "hosted"
@@ -1894,8 +1888,6 @@ def refresh_account_list_state(
                         THEN 'twint'
                         WHEN payment_link_type IN ('kakao', 'kakaopay', 'kakao_pay')
                         THEN 'kakao_pay'
-                        WHEN payment_link_type IN ('gopy', 'gopay')
-                        THEN 'gopay'
                         WHEN payment_link_method_type IN ('paypal', 'pp', 'paypal_url')
                         THEN 'paypal'
                         WHEN payment_link_method_type IN ('ideal', 'ideal_pay')
@@ -1904,8 +1896,6 @@ def refresh_account_list_state(
                         THEN 'twint'
                         WHEN payment_link_method_type IN ('kakao', 'kakaopay', 'kakao_pay')
                         THEN 'kakao_pay'
-                        WHEN payment_link_method_type IN ('gopy', 'gopay')
-                        THEN 'gopay'
                         WHEN payment_link_format IN ('paypal', 'paypal_url', 'paypal_approval', 'provider_url')
                              OR payment_link_source LIKE '%paypal%'
                              OR lower(payment_link_url) LIKE 'http://paypal.com'
@@ -1957,8 +1947,6 @@ def refresh_account_list_state(
                              OR lower(payment_link_url) LIKE 'http://%.nicepay.co.kr/%'
                              OR lower(payment_link_url) LIKE 'https://%.nicepay.co.kr/%'
                         THEN 'kakao_pay'
-                        WHEN payment_link_format IN ('gopay', 'gopay_url')
-                        THEN 'gopay'
                         WHEN payment_link_type IN ('hosted', 'payment', 'pay', 'long', 'chatgpt', 'chatgpt_hosted', 'stripe_hosted', 'checkout')
                              OR payment_link_method_type IN ('hosted', 'payment', 'pay', 'long', 'chatgpt', 'chatgpt_hosted', 'stripe_hosted', 'checkout')
                              OR payment_link_format IN ('short', 'short_chatgpt', 'long', 'long_hosted', 'hosted', 'hosted_checkout', 'pay_openai', 'stripe_hosted')

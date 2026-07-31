@@ -45,13 +45,6 @@ LOCAL_ONLY_KEYS = {
     "external_access_token_default_lease_seconds",
     "external_access_token_max_limit",
     "external_access_token_precheck_cooldown_seconds",
-    "chatgpt_gopay_uid_bindings",
-    "chatgpt_gopay_uid_sessions",
-    "chatgpt_gopay_phone_pool",
-    "chatgpt_gopay_smsforwarder_secret",
-    "chatgpt_gopay_smsforwarder_recent_events",
-    "chatgpt_gopay_batch_tasks",
-    "chatgpt_gopay_active_batch_task_id",
     "chatgpt_account_filter_presets",
     "chatgpt_auto_pipeline_config",
 }
@@ -59,6 +52,7 @@ LOCAL_ONLY_KEYS = {
 LOCAL_ONLY_PREFIXES = (
     "auth_",
     "delivery_cards_",
+    "chatgpt_gopay_",
 )
 
 _SECRET_KEY_PARTS = (

@@ -484,7 +484,6 @@ PaymentLinkCleanupTypeParam = Literal[
     "pix",
     "twint",
     "kakao_pay",
-    "gopay",
     "team",
     "other",
 ]
@@ -7251,7 +7250,6 @@ def _build_effective_register_extra(req: RegisterTaskRequest) -> dict:
         merged_extra["chatgpt_registration_mode"] = "access_token_only"
         merged_extra["chatgpt_has_refresh_token_solution"] = False
         merged_extra["chatgpt_access_token_only_checkout_amount_check_enabled"] = False
-        merged_extra["chatgpt_access_token_only_gopay_provider_link_enabled"] = False
         checkout_country = str(
             merged_extra.get("chatgpt_access_token_only_checkout_country")
             or "US"
@@ -19647,8 +19645,6 @@ def list_active_task_summaries(request: Request):
         meta = sanitize_task_detail(dict(item.get("meta") or {}))
         source = str(item.get("source") or "").strip()
         progress = str(item.get("progress") or "").strip()
-        if source == "gopay_payment" and progress == "1/1":
-            continue
         active_items.append(
             {
                 "id": item.get("id"),
