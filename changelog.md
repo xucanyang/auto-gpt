@@ -7,6 +7,7 @@
 ## [Unreleased] (未发布)
 
 ### 新增 (Added)
+- **支付链接列新增“当前有链接 / 当前无链接”筛选**：`frontend/src/pages/Accounts.tsx` 在账号表“支付链接”列的当前链接筛选中增加 `当前有链接`，并保留 `当前无链接`；`services/account_filters.py` 将 `has_link / with_link / current_has_link` 统一展开为 Hosted、PayPal、iDEAL、UPI、PIX、TWINT、Kakao Pay、Team 与 other 等当前实际可打开链接类型，列表接口、批量任务筛选范围和筛选组合复用同一后端语义，避免把历史“已成功提取”误当成当前仍有链接。
 - **新增 Docker 测试规范**：`docs/testing-in-docker.md` 固化运行依赖统一、测试镜像与生产镜像同源、一次性测试容器、临时数据库/共享配置、网络隔离、浏览器资源约束和外部实时烟测分层要求，明确禁止在常驻业务容器或生产挂载上执行完整 pytest。
 
 ### 优化 (Changed)
@@ -23,6 +24,8 @@
 - **统一测试文档入口**：`README.md`、`AGENTS.md` 与 `docs/docker-image-release.md` 现在统一指向 Docker 测试规范，移除会吞掉收集失败的 `pytest tests -q || true` 作为推荐门禁，明确当前 `requirements-test.txt`、`docker-compose.test.yml` 和测试脚本仍待落地。
 
 ### 修复 (Fixed)
+- **修复 OAIPay 手动上传弹窗无法拉取分组**：`main.py` 新增只包含 `/api/integrations/oaipay-categories` 的窄路由 `api/oaipay.py`，不重新挂载已退役的 `api.integrations`/GoPay 入口；手动弹窗继续使用旧前端路径，但现在由 `services/chatgpt_core/oaipay_upload.py` 的 `fetch_oaipay_categories()` 统一拉取分类，和自动上传共用 base URL 解析、分类接口候选、Bearer/raw 上传密钥兼容、`x-api-key` 头和 `data.items / data / categories` 响应解析，避免自动上传能分类、手动选择却 404 或认证失败。`frontend/src/pages/Accounts.tsx` 同步清空旧分类缓存并展示明确的分组拉取错误。
+- **同步侧栏可见版本为 `v2.8.73`**：`frontend/src/app/AppShell.tsx` 更新版本标识，便于确认三个常驻实例已加载本次 OAIPay 手动分组与支付链接当前状态筛选修复。
 - **修复手动手机号绑定任务启动后无实时日志**：`api/tasks.py` 将手动粘贴 `手机号----收码API` 生成的展示态 `manual` 与运行态 canonical `normal` 解耦；后台 runner 继续消费任务创建时冻结的 `phone_items`，但不会再把 `manual` 当作非法 `phone_pool_mode` 抛出 `HTTPException(400, "手机号取号模式无效")`。同时兼容旧快照中的 `manual/upload/paste` 别名，避免接口已返回 `task_id`、任务历史显示 `running`，但 background task 在首行日志前崩溃，导致前端 SSE 一直空白。
 - **同步侧栏可见版本为 `v2.8.72`**：`frontend/src/app/AppShell.tsx` 更新版本标识，便于确认三个常驻实例已加载本次手机号绑定启动修复。
 - **修复账号批量删除确认弹窗失效**：`frontend/src/features/accounts/components/AccountsToolbar.tsx` 改用页面 `App` 上下文提供的 `modal.confirm`，恢复“更多操作 → 删除选中”和“一键删无效”的确认交互；`frontend/src/pages/Accounts.tsx` 对选中 key 做正整数归一化，捕获 `/api/accounts/batch-delete` 失败并展示明确错误，成功后等待账号列表刷新，避免点击后无反馈或仍显示已删除账号。`api/accounts.py` 同时对请求 ID 去重，保证重复选择不会虚增删除数量；`tests/test_accounts_batch_delete.py` 覆盖账号行与派生列表状态的真实清理结果。
@@ -49,6 +52,7 @@
 - **修正 Docker 发布拓扑旧描述**：`docs/docker-image-release.md` 按当前 `docker-compose.multi.yml` 更新为 `auto-gpt`、`auto-gpt-plus`、`auto-plus2` 三个常驻业务实例与 `phone-api-relay` 共同运行，移除主服务 standby 的过时说法。
 
 ### 测试 (Tests)
+- **补充 OAIPay 手动分组与支付链接当前状态筛选回归**：`tests/test_oaipay_sync.py` 覆盖分类拉取复用自动上传解析器、raw Authorization 失败后的 Bearer fallback、窄路由响应 envelope；`tests/test_retired_capabilities_contract.py` 确认只恢复 OAIPay 分类兼容接口而不暴露 GoPay；`tests/test_account_filters.py`、`tests/test_account_filter_presets.py` 与 `tests/test_accounts_payment_link_filter_ui.py` 锁定 `has_link` 在 Python/SQL 筛选、筛选组合和账号页静态 UI 中的合同。
 - **补充手动手机号绑定启动回归**：`tests/test_phone_pool_task_integration.py` 锁定手动上传号码时对外仍展示 `phone_pool_mode=manual`，任务 runner 实际收到 canonical `phone_pool_mode=normal`，并覆盖旧别名归一化，防止并发手机号绑定再次在创建后、首条日志前崩溃。
 - **更新 GoPay 退役回归**：`tests/test_retired_capabilities_contract.py` 继续锁定退役路由与配置键不再进入 OpenAPI / config allowlist；`tests/test_account_filters.py` 与 `tests/test_pix_payment_link_cleanup.py` 切换到“旧 gopay 只算 other”的新分类预期，避免回归时又把退役支付类型重新恢复成独立枚举。
 - **补充任务历史回归覆盖**：`tests/test_chatgpt_task_logging.py` 锁定活跃批任务的单账号结果不得提前关闭整批、终态中断不得被迟到回调覆盖、旧注册统计/汇总恢复、未知旧统计不得伪装为已知零值，以及内存日志压缩后仍保留持久化完整窗口；`tests/test_task_logs_history.py` 覆盖重复旧行的详情日志合并和明确成功状态不被误判。任务历史/控制专项 `92 passed`，相关任务运行时、终态守卫和支付摘要回归 `34 passed`，前端 Node 合同测试 `14 passed`，生产构建及本次修改文件 ESLint 通过。
@@ -3184,4 +3188,8 @@
 
 ## 2026-08-01 17:13:19 +0800
 - 修复手动手机号绑定启动后无实时日志
+- 发布模式: multi
+
+## 2026-08-01 18:40:40 +0800
+- 修复 OAIPay 手动上传分组拉取并新增支付链接当前有无筛选
 - 发布模式: multi

@@ -471,57 +471,172 @@ def _format_oaipay_upload_error(response: Any, detail: Any) -> str:
 
 _CATEGORIES_CACHE: dict[str, str] = {}
 _CATEGORIES_ID_TO_NAME_CACHE: dict[str, str] = {}
+_CATEGORIES_ITEMS_CACHE: list[dict[str, Any]] = []
 _CATEGORIES_CACHE_TIME = 0
 _CATEGORIES_CACHE_KEY = ""
 
 
-def _load_oaipay_categories(api_url: str, api_key: str) -> tuple[dict[str, str], dict[str, str]]:
-    global _CATEGORIES_CACHE, _CATEGORIES_ID_TO_NAME_CACHE, _CATEGORIES_CACHE_TIME, _CATEGORIES_CACHE_KEY
+def _oaipay_api_base_url(api_url: Any) -> str:
+    return str(api_url or "").split("/api/")[0].rstrip("/")
+
+
+def _oaipay_auth_header_variants(api_key: str) -> list[dict[str, str]]:
+    raw_key = str(api_key or "").strip()
+    if not raw_key:
+        return []
+    bearer = raw_key if raw_key.lower().startswith("bearer ") else f"Bearer {raw_key}"
+    bare = raw_key[7:].strip() if raw_key.lower().startswith("bearer ") else raw_key
+
+    variants = [
+        {
+            "Authorization": raw_key,
+            "x-api-key": bare,
+            "api-key": bare,
+        },
+        {
+            "Authorization": bearer,
+            "x-api-key": bare,
+            "api-key": bare,
+        },
+        {
+            "Authorization": bare,
+            "x-api-key": bare,
+            "api-key": bare,
+        },
+    ]
+    seen: set[tuple[tuple[str, str], ...]] = set()
+    unique: list[dict[str, str]] = []
+    for headers in variants:
+        key = tuple(sorted(headers.items()))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(headers)
+    return unique
+
+
+def _extract_oaipay_category_items(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, list):
+        raw_items = payload
+    elif isinstance(payload, dict):
+        data = payload.get("data")
+        if isinstance(data, list):
+            raw_items = data
+        elif isinstance(data, dict) and isinstance(data.get("items"), list):
+            raw_items = data.get("items") or []
+        elif isinstance(payload.get("categories"), list):
+            raw_items = payload.get("categories") or []
+        elif isinstance(payload.get("items"), list):
+            raw_items = payload.get("items") or []
+        else:
+            raw_items = []
+    else:
+        raw_items = []
+
+    categories: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        cid = str(item.get("id") or item.get("category_id") or item.get("categoryId") or "").strip()
+        name = str(item.get("name") or item.get("category_name") or item.get("categoryName") or item.get("title") or "").strip()
+        if not cid or not name or cid in seen_ids:
+            continue
+        seen_ids.add(cid)
+        try:
+            normalized_id: Any = int(cid)
+        except ValueError:
+            normalized_id = cid
+        categories.append({"id": normalized_id, "name": name})
+    return categories
+
+
+def fetch_oaipay_categories(
+    api_url: str | None = None,
+    api_key: str | None = None,
+    *,
+    force_refresh: bool = False,
+) -> list[dict[str, Any]]:
+    """Fetch OAIPay categories through the same contract used by auto upload."""
+
+    global _CATEGORIES_CACHE, _CATEGORIES_ID_TO_NAME_CACHE, _CATEGORIES_ITEMS_CACHE, _CATEGORIES_CACHE_TIME, _CATEGORIES_CACHE_KEY
     now = time.time()
-    base_url = str(api_url or "").split("/api/")[0].rstrip("/")
+    api_url = str(api_url or _get_config_value("oaipay_api_url")).strip()
+    api_key = str(api_key or _get_config_value("oaipay_api_key")).strip()
+    base_url = _oaipay_api_base_url(api_url)
     cache_key = f"{base_url}|{api_key}"
-    if _CATEGORIES_CACHE and _CATEGORIES_CACHE_KEY == cache_key and now - _CATEGORIES_CACHE_TIME <= 60:
-        return _CATEGORIES_CACHE, _CATEGORIES_ID_TO_NAME_CACHE
+    if (
+        not force_refresh
+        and _CATEGORIES_ITEMS_CACHE
+        and _CATEGORIES_CACHE_KEY == cache_key
+        and now - _CATEGORIES_CACHE_TIME <= 60
+    ):
+        return [dict(item) for item in _CATEGORIES_ITEMS_CACHE]
 
     if not base_url or not api_key:
-        return _CATEGORIES_CACHE, _CATEGORIES_ID_TO_NAME_CACHE
+        return []
 
-    try:
-        for path in ("/api/admin/cdk/categories", "/api/auto-gpt/categories"):
+    candidate_paths = (
+        "/api/admin/cdk/categories",
+        "/api/auto-gpt/categories",
+        "/api/cdk/categories",
+        "/api/v1/admin/categories",
+        "/api/admin/categories",
+    )
+    last_error = ""
+    for path in candidate_paths:
+        url = f"{base_url}{path}"
+        for auth_headers in _oaipay_auth_header_variants(api_key):
             try:
                 res = cffi_requests.get(
-                    f"{base_url}{path}",
-                    headers={"Authorization": api_key},
+                    url,
+                    headers={
+                        "Accept": "application/json, text/plain, */*",
+                        "Referer": f"{base_url}/admin/accounts",
+                        **auth_headers,
+                    },
                     timeout=10,
                     verify=False,
                     impersonate="chrome110",
                 )
-                if res.status_code != 200:
+                if res.status_code in (404, 405):
+                    break
+                if res.status_code >= 400:
+                    try:
+                        detail = _extract_oaipay_error_detail(res.json())
+                    except Exception:
+                        detail = str(getattr(res, "text", "") or "")[:200].strip()
+                    last_error = f"HTTP {res.status_code}{(': ' + detail) if detail else ''}"
                     continue
-                data = res.json()
-                cats = data if isinstance(data, list) else data.get("data") or data.get("categories") or []
-                if not isinstance(cats, list):
+                categories = _extract_oaipay_category_items(res.json())
+                if not categories:
+                    last_error = "OAIPay 分类接口返回空列表或不兼容格式"
                     continue
 
                 name_to_id: dict[str, str] = {}
                 id_to_name: dict[str, str] = {}
-                for c in cats:
-                    if not isinstance(c, dict):
+                for category in categories:
+                    cname = str(category.get("name") or "").strip()
+                    cid = str(category.get("id") or "").strip()
+                    if not cname or not cid:
                         continue
-                    cname = str(c.get("name") or "").strip()
-                    cid = str(c.get("id") or c.get("category_id") or "").strip()
-                    if cname and cid:
-                        name_to_id[cname] = cid
-                        id_to_name[cid] = cname
+                    name_to_id[cname] = cid
+                    id_to_name[cid] = cname
                 _CATEGORIES_CACHE = name_to_id
                 _CATEGORIES_ID_TO_NAME_CACHE = id_to_name
+                _CATEGORIES_ITEMS_CACHE = [dict(item) for item in categories]
                 _CATEGORIES_CACHE_TIME = now
                 _CATEGORIES_CACHE_KEY = cache_key
-                break
+                return [dict(item) for item in _CATEGORIES_ITEMS_CACHE]
             except Exception:
-                pass
-    except Exception:
-        pass
+                continue
+    if last_error and not _CATEGORIES_ITEMS_CACHE:
+        logger.warning("OAIPay 分类拉取失败: %s", last_error)
+    return [dict(item) for item in _CATEGORIES_ITEMS_CACHE] if _CATEGORIES_CACHE_KEY == cache_key else []
+
+
+def _load_oaipay_categories(api_url: str, api_key: str) -> tuple[dict[str, str], dict[str, str]]:
+    fetch_oaipay_categories(api_url, api_key)
     return _CATEGORIES_CACHE, _CATEGORIES_ID_TO_NAME_CACHE
 
 

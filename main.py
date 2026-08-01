@@ -29,6 +29,7 @@ from api.phone_pool import router as phone_pool_router
 from api.baxigpt_cdk_pool import router as baxigpt_cdk_pool_router
 from api.delivery_cards import public_router as delivery_cards_public_router
 from api.delivery_cards import router as delivery_cards_router
+from api.oaipay import router as oaipay_router
 from api.system import router as system_router
 from services.chatgpt_core import ChatGPTPlatform
 
@@ -359,6 +360,7 @@ app.include_router(external_subscription_router, prefix="/api")
 app.include_router(external_access_tokens_router, prefix="/api")
 app.include_router(phone_pool_router, prefix="/api")
 app.include_router(baxigpt_cdk_pool_router, prefix="/api")
+app.include_router(oaipay_router, prefix="/api")
 app.include_router(delivery_cards_router, prefix="/api/admin")
 app.include_router(delivery_cards_public_router, prefix="/api")
 app.include_router(system_router, prefix="/api")

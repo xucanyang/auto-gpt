@@ -179,11 +179,28 @@ _PHONE_BINDING_STATE_FILTER_ALIASES: dict[str, set[str]] = {
     "unknown": {"unknown"},
 }
 
+_PAYMENT_LINK_PRESENT_PLATFORMS = frozenset({
+    "hosted",
+    "paypal",
+    "ideal",
+    "upi",
+    "pix",
+    "twint",
+    "kakao_pay",
+    "team",
+    "other",
+})
+
 _PAYMENT_LINK_PLATFORM_FILTER_ALIASES: dict[str, set[str]] = {
+    "has_link": set(_PAYMENT_LINK_PRESENT_PLATFORMS),
+    "current_has_link": set(_PAYMENT_LINK_PRESENT_PLATFORMS),
+    "with_link": set(_PAYMENT_LINK_PRESENT_PLATFORMS),
+    "has_payment_link": set(_PAYMENT_LINK_PRESENT_PLATFORMS),
     "none": {"none"},
+    "without_link": {"none"},
     "no_link": {"none"},
     "no_payment_link": {"none"},
-    "without_link": {"none"},
+    "current_no_link": {"none"},
     "missing": {"none"},
     "pix": {"pix"},
     "upi": {"upi"},

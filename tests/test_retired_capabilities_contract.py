@@ -28,6 +28,7 @@ def test_openapi_does_not_expose_retired_payment_and_pipeline_routes():
     from main import app
 
     paths = set(app.openapi().get("paths") or {})
+    assert "/api/integrations/oaipay-categories" in paths
     assert not any(path.startswith("/api/pipeline") for path in paths)
     assert not any(path.startswith("/api/idea-oaipay-pipeline") for path in paths)
     assert not any("/integrations/gopay-otp" in path for path in paths)

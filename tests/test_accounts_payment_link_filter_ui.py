@@ -30,6 +30,7 @@ def test_payment_link_filter_separates_current_link_from_success_history():
         "{ value: 'other', text: '其他支付链接' }",
     ):
         assert option in page
+    assert "{ value: 'has_link', text: '当前有链接' }" in page
     assert "{ value: 'none', text: '当前无链接' }" in page
     assert "chatgpt: ['hosted', 'team']" in page
     assert "next.paymentLinkPlatform = normalizePaymentLinkPlatformFilterValues(values)" in page

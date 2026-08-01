@@ -641,6 +641,8 @@ const PHONE_BINDING_STATE_FILTER_OPTIONS = [
 ]
 
 const PAYMENT_LINK_PLATFORM_FILTER_OPTIONS = [
+  { value: 'has_link', text: '当前有链接' },
+  { value: 'none', text: '当前无链接' },
   { value: 'hosted', text: 'Hosted Checkout' },
   { value: 'paypal', text: 'PayPal' },
   { value: 'ideal', text: 'iDEAL' },
@@ -650,7 +652,6 @@ const PAYMENT_LINK_PLATFORM_FILTER_OPTIONS = [
   { value: 'kakao_pay', text: 'Kakao Pay' },
   { value: 'team', text: 'ChatGPT Team' },
   { value: 'other', text: '其他支付链接' },
-  { value: 'none', text: '当前无链接' },
 ]
 
 const PAYMENT_LINK_PLATFORM_FILTER_VALUE_ALIASES: Record<string, string[]> = {
@@ -677,6 +678,7 @@ const PAYMENT_LINK_PLATFORM_FILTER_VALUE_ALIASES: Record<string, string[]> = {
   no_link: ['none'],
   no_payment_link: ['none'],
   without_link: ['none'],
+  current_no_link: ['none'],
   missing: ['none'],
 }
 
@@ -2706,11 +2708,17 @@ export default function Accounts() {
   const openOaipayUploadModal = async (scope: 'selected' | 'pending') => {
     setOaipayUploadScope(scope)
     setOaipayCategoryMode('auto')
+    setOaipayCategories([])
+    setOaipaySelectedCategory(undefined)
+    setOaipayFallbackCategory(undefined)
     setOaipayUploadModalOpen(true)
     setOaipayCategoryLoading(true)
     try {
       const res = await apiFetch('/integrations/oaipay-categories')
-      if (Array.isArray(res)) {
+      if (res?.success === false) {
+        setOaipayCategories([])
+        message.error('无法获取 OAIPay 分组: ' + (res.error || '远端未返回可用分组'))
+      } else if (Array.isArray(res)) {
         setOaipayCategories(res)
       } else if (res?.categories && Array.isArray(res.categories)) {
         setOaipayCategories(res.categories)
@@ -2718,9 +2726,12 @@ export default function Accounts() {
         setOaipayCategories(res.data)
       } else if (res?.error) {
         message.error('无法获取 OAIPay 分组: ' + res.error)
+      } else {
+        setOaipayCategories([])
+        message.warning('OAIPay 分组返回为空，请检查远端分类接口')
       }
-    } catch (e) {
-      message.error('请求 OAIPay 分组失败: ' + String(e))
+    } catch (e: any) {
+      message.error('请求 OAIPay 分组失败: ' + (e?.message || String(e)))
     } finally {
       setOaipayCategoryLoading(false)
     }

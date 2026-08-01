@@ -22,6 +22,7 @@ class OaiPaySyncTests(unittest.TestCase):
     def setUp(self):
         oaipay_upload_module._CATEGORIES_CACHE = {}
         oaipay_upload_module._CATEGORIES_ID_TO_NAME_CACHE = {}
+        oaipay_upload_module._CATEGORIES_ITEMS_CACHE = []
         oaipay_upload_module._CATEGORIES_CACHE_TIME = 0
         oaipay_upload_module._CATEGORIES_CACHE_KEY = ""
 
@@ -349,6 +350,66 @@ class OaiPaySyncTests(unittest.TestCase):
         self.assertEqual(result["category_id"], 1)
         self.assertEqual(result["category_name"], "PLUS--未接码")
         self.assertEqual(mock_post.call_args.kwargs["json"]["group"], "1")
+
+    def test_manual_category_fetch_reuses_upload_category_parser_and_bearer_fallback(self):
+        first = FakeOaiPayResponse(401, {"detail": "raw auth rejected"})
+        second = FakeOaiPayResponse(
+            200,
+            {
+                "data": {
+                    "items": [
+                        {"category_id": 2, "category_name": "PLUS--已接美国长效"},
+                        {"id": 3, "name": "FREE--已接码带RT"},
+                    ]
+                }
+            },
+        )
+        with mock.patch(
+            "services.chatgpt_core.oaipay_upload.cffi_requests.get",
+            side_effect=[first, second],
+        ) as get:
+            categories = oaipay_upload_module.fetch_oaipay_categories(
+                "https://gpt.cccy.me/api/auto-gpt/upload",
+                "upload-key",
+                force_refresh=True,
+            )
+
+        self.assertEqual(
+            categories,
+            [
+                {"id": 2, "name": "PLUS--已接美国长效"},
+                {"id": 3, "name": "FREE--已接码带RT"},
+            ],
+        )
+        self.assertEqual(get.call_count, 2)
+        self.assertEqual(get.call_args_list[0].kwargs["headers"]["Authorization"], "upload-key")
+        self.assertEqual(get.call_args_list[1].kwargs["headers"]["Authorization"], "Bearer upload-key")
+        name_to_id, id_to_name = oaipay_upload_module._load_oaipay_categories("https://gpt.cccy.me", "upload-key")
+        self.assertEqual(name_to_id["PLUS--已接美国长效"], "2")
+        self.assertEqual(id_to_name["3"], "FREE--已接码带RT")
+
+    def test_oaipay_categories_api_uses_narrow_mounted_helper(self):
+        from api import oaipay as oaipay_api
+
+        def fake_config(key: str, default: str = "") -> str:
+            return {
+                "oaipay_api_url": "https://gpt.cccy.me/api/auto-gpt/upload",
+                "oaipay_api_key": "upload-key",
+            }.get(key, default)
+
+        with mock.patch.object(oaipay_api.config_store, "get", side_effect=fake_config):
+            with mock.patch(
+                "api.oaipay.fetch_oaipay_categories",
+                return_value=[{"id": 2, "name": "PLUS--已接美国长效"}],
+            ) as fetch:
+                result = oaipay_api.get_oaipay_categories()
+
+        self.assertEqual(result, {"success": True, "categories": [{"id": 2, "name": "PLUS--已接美国长效"}]})
+        fetch.assert_called_once_with(
+            "https://gpt.cccy.me/api/auto-gpt/upload",
+            "upload-key",
+            force_refresh=True,
+        )
 
     def test_upload_401_surfaces_server_detail(self):
         account = self._make_account()

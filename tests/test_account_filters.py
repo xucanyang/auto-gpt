@@ -563,6 +563,10 @@ class AccountFilterSortTests(unittest.TestCase):
             [row.id for row in filter_account_rows(rows, payment_link_platform="no_payment_link")],
             [515, 516],
         )
+        self.assertEqual(
+            [row.id for row in filter_account_rows(rows, payment_link_platform="has_link")],
+            [511, 512, 513, 514, 517],
+        )
 
         with Session(engine) as session:
             session.exec(text("DELETE FROM account_list_state"))
@@ -609,6 +613,7 @@ class AccountFilterSortTests(unittest.TestCase):
 
             self.assertEqual(sql_ids(payment_link_platform="pix,paypal"), [511, 512, 517])
             self.assertEqual(sql_ids(payment_link_platform="none"), [515, 516])
+            self.assertEqual(sql_ids(payment_link_platform="has_link"), [511, 512, 513, 514, 517])
 
     def test_payment_link_platform_auto_classifies_upi_from_payment_method_or_url(self):
         upi_by_method = self._account(518)
