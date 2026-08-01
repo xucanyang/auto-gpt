@@ -4391,6 +4391,15 @@ def _normalize_phone_binding_pool_mode(
     raw = str(value or "").strip().lower()
     aliases = {
         "default": "normal",
+        # ``manual`` is a display/persisted mode for tasks created with
+        # explicit ``phone_lines``.  Execution still consumes the frozen
+        # ``phone_items`` list with ``use_pool=False``, so runners must treat
+        # old/new manual snapshots as the normal binding execution mode.
+        "manual": "normal",
+        "upload": "normal",
+        "uploaded": "normal",
+        "paste": "normal",
+        "pasted": "normal",
         "prefix": "prefix_limited",
         "limited_prefix": "prefix_limited",
         "sample": "prefix_sample",
@@ -4443,6 +4452,8 @@ def enqueue_phone_binding_test_task(
         prefix_sample_enabled=legacy_prefix_sample_enabled,
         unavailable_number_test_enabled=bool(req.unavailable_number_test_enabled),
     )
+    display_pool_mode = "manual" if manual_phone_lines else resolved_pool_mode
+    execution_pool_mode = resolved_pool_mode
     # 手动粘贴的号码/API 优先于默认号池开关，避免用户粘贴后仍误用空号池。
     prefix_bind_enabled = resolved_pool_mode == "prefix_limited" and not manual_phone_lines
     prefix_sample_enabled = resolved_pool_mode == "prefix_sample" and not manual_phone_lines
@@ -4767,7 +4778,7 @@ def enqueue_phone_binding_test_task(
             "matched_accounts": len(matched_accounts),
             "eligible_accounts": 0,
             "phone_count": phone_count,
-            "phone_pool_mode": "manual" if manual_phone_lines else resolved_pool_mode,
+            "phone_pool_mode": display_pool_mode,
             "phone_number_filter": phone_number_filter,
             "requested_concurrency": requested_concurrency_preview,
             "effective_concurrency": 0,
@@ -4776,7 +4787,7 @@ def enqueue_phone_binding_test_task(
             "prefix_bind": dict(prefix_bind_meta),
             "unavailable_numbers": dict(unavailable_number_meta),
             "phone_selection": {
-                "mode": "manual" if manual_phone_lines else resolved_pool_mode,
+                "mode": display_pool_mode,
                 "number_filter": phone_number_filter,
                 "selected_prefixes": list(requested_prefixes),
                 "candidate_phone_count": phone_count,
@@ -4818,7 +4829,7 @@ def enqueue_phone_binding_test_task(
         "concurrency_forced_serial_reason": concurrency_forced_serial_reason,
         "reuse_phone_until_unusable": reuse_phone_until_unusable,
         "use_pool": use_pool,
-        "phone_pool_mode": "manual" if manual_phone_lines else resolved_pool_mode,
+        "phone_pool_mode": execution_pool_mode,
         "phone_number_filter": phone_number_filter,
         "prefix_number_filter": phone_number_filter if prefix_bind_enabled else "",
         "unavailable_number_test_enabled": unavailable_number_test_enabled,
@@ -4836,6 +4847,7 @@ def enqueue_phone_binding_test_task(
         "proxy_min_score": float(req.proxy_min_score or 0),
     }
     display_settings = dict(runtime_settings)
+    display_settings["phone_pool_mode"] = display_pool_mode
     display_settings["proxy"] = redact_proxy_url(runtime_settings.get("proxy"))
     display_settings["proxy_redacted"] = display_settings["proxy"]
     display_proxy_mode = str(display_settings.get("proxy_mode") or "global").strip().lower()
@@ -4864,7 +4876,7 @@ def enqueue_phone_binding_test_task(
         "emails": [str(item["email"] or "") for item in account_items],
         "phone_count": phone_count,
         "phone_items": safe_phone_items,
-        "phone_pool_mode": "manual" if manual_phone_lines else resolved_pool_mode,
+        "phone_pool_mode": display_pool_mode,
         "phone_number_filter": phone_number_filter,
         "phone_pool_dynamic": use_pool,
         "phone_pool_source": pool_source,
@@ -4873,7 +4885,7 @@ def enqueue_phone_binding_test_task(
         "prefix_bind": dict(prefix_bind_meta),
         "unavailable_numbers": dict(unavailable_number_meta),
         "phone_selection": {
-            "mode": "manual" if manual_phone_lines else resolved_pool_mode,
+            "mode": display_pool_mode,
             "number_filter": phone_number_filter,
             "selected_prefixes": list(requested_prefixes),
             "candidate_phone_count": phone_count,
@@ -4948,7 +4960,7 @@ def enqueue_phone_binding_test_task(
         "requested_concurrency": requested_concurrency,
         "effective_concurrency": effective_concurrency,
         "concurrency_forced_serial_reason": concurrency_forced_serial_reason,
-        "phone_pool_mode": "manual" if manual_phone_lines else resolved_pool_mode,
+        "phone_pool_mode": display_pool_mode,
         "phone_number_filter": phone_number_filter,
         "phone_pool_dynamic": use_pool,
         "phone_pool_import": dict(phone_pool_import_summary),

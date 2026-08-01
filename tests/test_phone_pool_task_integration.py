@@ -124,14 +124,20 @@ class PhonePoolTaskIntegrationTests(unittest.TestCase):
             patch("api.tasks._create_standalone_task_record", side_effect=_fake_create_task),
             patch("api.tasks._save_task_log"),
         ):
-            result = enqueue_phone_binding_test_task(req, background_tasks=_BackgroundTasks())
+            background_tasks = _BackgroundTasks()
+            result = enqueue_phone_binding_test_task(req, background_tasks=background_tasks)
 
         self.assertEqual(result["requested_concurrency"], 3)
         self.assertEqual(result["effective_concurrency"], 3)
+        self.assertEqual(result["phone_pool_mode"], "manual")
+        self.assertEqual(created_meta["phone_pool_mode"], "manual")
+        self.assertEqual(created_meta["phone_selection"]["mode"], "manual")
         self.assertEqual(created_meta["requested_concurrency"], 3)
         self.assertEqual(created_meta["effective_concurrency"], 3)
         self.assertEqual(created_meta["settings"]["concurrency"], 3)
         self.assertEqual(created_meta["settings"]["requested_concurrency"], 3)
+        self.assertEqual(created_meta["settings"]["phone_pool_mode"], "manual")
+        self.assertEqual(background_tasks.calls[0][0][4]["phone_pool_mode"], "normal")
 
     def test_phone_binding_concurrency_forces_serial_when_reusing_same_phone(self):
         created_meta = {}
@@ -1184,6 +1190,8 @@ class PhonePoolTaskIntegrationTests(unittest.TestCase):
         self.assertEqual(len(background_tasks.calls[0][0][3]), 3)
 
     def test_legacy_phone_pool_flags_keep_the_existing_precedence(self):
+        self.assertEqual(_normalize_phone_binding_pool_mode("manual"), "normal")
+        self.assertEqual(_normalize_phone_binding_pool_mode("uploaded"), "normal")
         self.assertEqual(
             _normalize_phone_binding_pool_mode(
                 "",
