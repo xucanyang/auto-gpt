@@ -10,7 +10,7 @@ from core.base_mailbox import MailboxAccount, create_mailbox
 from core.config_store import config_store
 from core.db import AccountModel, IcloudHmeAliasModel, engine
 
-from .mailbox_state import sanitize_mailbox_state
+from .mailbox_state import normalize_mailbox_provider, sanitize_mailbox_state
 
 
 TEMPMAIL_CONFIG_KEYS = (
@@ -26,12 +26,9 @@ TEMPMAIL_CONFIG_KEYS = (
     "tempmail_permanent",
     "tempmail_platform",
 )
-ICLOUD_HME_CONFIG_KEYS = (
+HME_READY_CONFIG_KEYS = (
     "icloud_hme_mode",
-    "icloud_cookie",
-    "icloud_domain_base",
     "icloud_forward_to",
-    "icloud_forward_mailbox_id",
     "icloud_hme_helper_api_url",
     "icloud_hme_helper_internal_key",
     "icloud_hme_helper_api_key_header",
@@ -44,9 +41,11 @@ ICLOUD_HME_CONFIG_KEYS = (
     "tempmail_api_key_header",
     "tempmail_wait_timeout_seconds",
 )
-ICLOUD_HME_PROVIDERS = {
-    "icloud_hme",
+HME_READY_PROVIDERS = {
     "hme_ready_api",
+    "helper_ready_api",
+    # Read-only aliases for account rows written before the provider cutover.
+    "icloud_hme",
     "icloud_hme_ready",
     "icloud_hme_helper_ready",
 }
@@ -68,64 +67,39 @@ def _current_config(keys: tuple[str, ...]) -> dict[str, Any]:
     return {key: values[key] for key in keys if _has_value(values.get(key))}
 
 
-def _has_helper_lease(state: dict[str, Any]) -> bool:
-    account_extra = dict((state.get("account") or {}).get("extra") or {})
-    if _has_value(account_extra.get("lease_id")) or _has_value(account_extra.get("checkout_id")):
-        return True
-    markers = {
-        str(state.get("provider") or "").strip().lower(),
-        str(account_extra.get("provider") or "").strip().lower(),
-        str(account_extra.get("mode") or "").strip().lower(),
-        str(account_extra.get("source") or "").strip().lower(),
-    }
-    return bool(
-        markers
-        & {
-            "helper_ready_api",
-            "hme_ready_api",
-            "icloud_hme_ready",
-            "icloud_hme_helper_ready",
-            "icloud-hide-email-helper",
-        }
-    ) and bool(str((state.get("account") or {}).get("account_id") or "").strip())
-
-
 def _with_current_mailbox_config(raw_state: dict[str, Any]) -> dict[str, Any]:
     state = sanitize_mailbox_state(raw_state)
     if not state:
         return {}
     provider = str(state.get("provider") or "").strip()
-    if provider not in {"tempmail_local", "tempmail_api", *ICLOUD_HME_PROVIDERS}:
+    provider = normalize_mailbox_provider(provider)
+    if provider not in {"tempmail_local", "tempmail_api", *HME_READY_PROVIDERS}:
         return state
 
-    keys = ICLOUD_HME_CONFIG_KEYS if provider in ICLOUD_HME_PROVIDERS else TEMPMAIL_CONFIG_KEYS
+    keys = HME_READY_CONFIG_KEYS if provider in HME_READY_PROVIDERS else TEMPMAIL_CONFIG_KEYS
     current = _current_config(keys)
     if not current:
         return state
 
     config = dict(state.get("config") or {})
     config.update(current)
-    if provider in {"hme_ready_api", "icloud_hme_ready", "icloud_hme_helper_ready"}:
+    if provider == "hme_ready_api":
         config["icloud_hme_mode"] = "helper_ready_api"
-    elif (
-        provider == "icloud_hme"
-        and str(config.get("icloud_hme_mode") or "").strip().lower() == "helper_ready_api"
-        and not _has_helper_lease(state)
-    ):
-        config["icloud_hme_mode"] = "import_pool"
 
-    current_forward_id = current.get("icloud_forward_mailbox_id")
-    if provider in ICLOUD_HME_PROVIDERS and not _has_value(current_forward_id):
-        config.pop("icloud_forward_mailbox_id", None)
     state["config"] = config
 
     account = dict(state.get("account") or {})
     account_extra = dict(account.get("extra") or {})
-    if provider in ICLOUD_HME_PROVIDERS:
-        if _has_value(config.get("icloud_forward_to")):
+    if provider == "hme_ready_api":
+        # The global list is only a fallback for legacy rows which have no
+        # account-level routing metadata.  Never overwrite a concrete target
+        # returned by HME Ready with the global candidate list.
+        if not _has_value(account_extra.get("forward_to")) and _has_value(config.get("icloud_forward_to")):
             account_extra["forward_to"] = str(config.get("icloud_forward_to") or "").strip()
-        if _has_value(current_forward_id):
-            account_extra["forward_mailbox_id"] = str(current_forward_id or "").strip()
+        # `icloud_forward_mailbox_id` is a removed global hard pointer.  A
+        # per-account cached id may remain and is validated/refreshed by the
+        # TempMail reader instead of being replaced from global config.
+        config.pop("icloud_forward_mailbox_id", None)
     if account_extra:
         account["extra"] = account_extra
     if not str(account.get("email") or "").strip() and str(state.get("email") or "").strip():
@@ -160,7 +134,13 @@ def mailbox_state_from_account(
     if not email:
         return {}
 
-    if provider in ICLOUD_HME_PROVIDERS:
+    provider = normalize_mailbox_provider(provider)
+    if provider == "hme_ready_api":
+        lease_id = str(
+            account_extra.get("lease_id")
+            or account_extra.get("checkout_id")
+            or ""
+        ).strip()
         anonymous_id = str(
             account_extra.get("anonymous_id")
             or account_extra.get("mailbox_id")
@@ -180,29 +160,40 @@ def mailbox_state_from_account(
             except Exception:
                 anonymous_id = ""
 
-        current = _current_config(ICLOUD_HME_CONFIG_KEYS)
+        current = _current_config(HME_READY_CONFIG_KEYS)
         mailbox_config = {
             key: account_extra.get(key, current.get(key))
-            for key in ICLOUD_HME_CONFIG_KEYS
+            for key in HME_READY_CONFIG_KEYS
             if _has_value(account_extra.get(key, current.get(key)))
         }
         mailbox_config.setdefault("icloud_forward_to", "b@cccy.me")
-        mailbox_config.setdefault("icloud_domain_base", "icloud.com")
-        mailbox_config.setdefault("icloud_hme_mode", "import_pool")
-        required = ("icloud_hme_mode", "icloud_forward_to", "tempmail_api_url", "tempmail_api_key")
-        if any(not _has_value(mailbox_config.get(key)) for key in required):
+        mailbox_config.setdefault("icloud_hme_mode", "helper_ready_api")
+        if (
+            not _has_value(mailbox_config.get("icloud_hme_helper_api_url"))
+            or not _has_value(
+                mailbox_config.get("icloud_hme_helper_internal_key")
+                or mailbox_config.get("icloud_hme_helper_api_key")
+            )
+            or not _has_value(mailbox_config.get("tempmail_api_url"))
+            or not _has_value(mailbox_config.get("tempmail_api_key"))
+        ):
             return {}
+        account_forward_to = str(
+            account_extra.get("forward_to")
+            or mailbox_config.get("icloud_forward_to")
+            or ""
+        ).strip()
         hme_extra = {
-            "provider": "icloud_hme",
+            "provider": "hme_ready_api",
             "platform": "chatgpt",
             "registration_platform": "chatgpt",
-            "forward_to": str(mailbox_config.get("icloud_forward_to") or "").strip(),
-            "forward_mailbox_id": str(
-                mailbox_config.get("icloud_forward_mailbox_id")
-                or account_extra.get("forward_mailbox_id")
-                or ""
-            ).strip(),
+            "forward_to": account_forward_to,
+            "forward_mailbox_id": str(account_extra.get("forward_mailbox_id") or "").strip(),
         }
+        if anonymous_id:
+            hme_extra["anonymous_id"] = anonymous_id
+        if not lease_id:
+            hme_extra["source"] = "legacy-icloud-hme"
         for key in (
             "registration_id",
             "logical_address_id",
@@ -222,11 +213,11 @@ def mailbox_state_from_account(
                 hme_extra[key] = account_extra[key]
         return sanitize_mailbox_state(
             {
-                "provider": "icloud_hme",
+                "provider": "hme_ready_api",
                 "email": email,
                 "account": {
                     "email": email,
-                    "account_id": anonymous_id,
+                    "account_id": lease_id or anonymous_id,
                     "extra": hme_extra,
                 },
                 "before_ids": [],
@@ -345,11 +336,20 @@ class RestoredEmailService:
             account_id=str(account_payload.get("account_id") or "").strip(),
             extra=dict(account_payload.get("extra") or {}),
         )
-        if self._provider in ICLOUD_HME_PROVIDERS:
+        if self._provider in HME_READY_PROVIDERS:
             account_extra = dict(self._acct.extra or {})
             account_extra.setdefault("platform", "chatgpt")
             account_extra.setdefault("registration_platform", "chatgpt")
-            if not str(account_extra.get("lease_id") or "").strip() and self._acct.account_id:
+            legacy_source = str(account_extra.get("source") or "").strip().lower() in {
+                "legacy-icloud-hme",
+                "icloud-hme-legacy",
+            }
+            if (
+                not legacy_source
+                and not str(account_extra.get("anonymous_id") or "").strip()
+                and not str(account_extra.get("lease_id") or "").strip()
+                and self._acct.account_id
+            ):
                 account_extra["lease_id"] = self._acct.account_id
             self._acct.extra = account_extra
         self._email = self._acct.email

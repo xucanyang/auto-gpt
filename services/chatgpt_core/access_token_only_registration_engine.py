@@ -65,10 +65,15 @@ class EmailServiceAdapter:
             or self.es.__class__.__name__
             or "注册邮箱"
         ).strip().lower()
-        if raw in {"hme_ready_api", "icloud_hme_ready", "icloud_hme_helper_ready", "helper_ready_api"}:
-            return "HME Helper API"
-        if raw in {"icloud_hme", "icloud_hme_temp_mail_forward"}:
-            return "iCloud HME 转发箱"
+        if raw in {
+            "hme_ready_api",
+            "icloud_hme",
+            "icloud_hme_ready",
+            "icloud_hme_helper_ready",
+            "helper_ready_api",
+            "icloud_hme_temp_mail_forward",
+        }:
+            return "HME Ready + TempMail"
         if raw in {"email_api", "api_email", "email_otp_api", "mail_api_otp"}:
             return "邮箱 API"
         if raw:

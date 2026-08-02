@@ -30,6 +30,7 @@ from services.chatgpt_core.account_fingerprint import inject_account_browser_fin
 from services.chatgpt_core.mailbox_state import (
     build_mailbox_state,
     mailbox_state_summary,
+    normalize_mailbox_provider,
     sanitize_mailbox_state,
 )
 from services.chatgpt_core.restored_email_service import RestoredEmailService, mailbox_state_from_account
@@ -584,6 +585,13 @@ def _mailbox_state_from_tempmail_domain_match(
 
 
 def _mailbox_state_from_icloud_hme_alias(email: str, global_config: dict[str, Any]) -> dict[str, Any]:
+    """Recover a historical HME row into the Ready + TempMail contract.
+
+    The legacy SQLite table remains useful for audit/backfill, but this path
+    never reads Apple cookies or invokes the removed direct HME client.
+    ``anonymous_id`` is retained as historical metadata and is not guessed to
+    be a current Helper lease.
+    """
     target = _normalize_email(email)
     if not target:
         return {}
@@ -616,11 +624,14 @@ def _mailbox_state_from_icloud_hme_alias(email: str, global_config: dict[str, An
 
     config = {}
     for key in (
-        'icloud_hme_mode',
-        'icloud_cookie',
-        'icloud_domain_base',
         'icloud_forward_to',
-        'icloud_forward_mailbox_id',
+        'icloud_hme_helper_api_url',
+        'icloud_hme_helper_internal_key',
+        'icloud_hme_helper_api_key_header',
+        'icloud_hme_helper_consumer',
+        'icloud_hme_helper_checkout_ttl_seconds',
+        'icloud_hme_helper_wait_timeout_seconds',
+        'icloud_hme_helper_max_cache_age_seconds',
         'tempmail_api_url',
         'tempmail_api_key',
         'tempmail_api_key_header',
@@ -629,29 +640,31 @@ def _mailbox_state_from_icloud_hme_alias(email: str, global_config: dict[str, An
         value = global_config.get(key)
         if _has_value(value):
             config[key] = value
-    config['icloud_hme_mode'] = 'import_pool'
-    config.setdefault('icloud_domain_base', 'icloud.com')
+    config['icloud_hme_mode'] = 'helper_ready_api'
     if forward_to:
         config['icloud_forward_to'] = forward_to
     else:
         config.setdefault('icloud_forward_to', str(global_config.get('icloud_forward_to') or 'b@cccy.me'))
-    if forward_mailbox_id:
-        config['icloud_forward_mailbox_id'] = forward_mailbox_id
-
+    if not config.get('icloud_hme_helper_api_url') or not (
+        config.get('icloud_hme_helper_internal_key') or config.get('icloud_hme_helper_api_key')
+    ):
+        return {}
     if not config.get('tempmail_api_url') or not config.get('tempmail_api_key'):
         return {}
     return {
-        'provider': 'icloud_hme',
+        'provider': 'hme_ready_api',
         'email': email,
         'account': {
             'email': email,
             'account_id': anonymous_id,
             'extra': {
-                'provider': 'icloud_hme',
+                'provider': 'hme_ready_api',
                 'platform': 'chatgpt',
                 'registration_platform': 'chatgpt',
+                'source': 'legacy-icloud-hme',
+                'anonymous_id': anonymous_id,
                 'forward_to': str(config.get('icloud_forward_to') or '').strip(),
-                'forward_mailbox_id': str(config.get('icloud_forward_mailbox_id') or '').strip(),
+                'forward_mailbox_id': forward_mailbox_id,
             },
         },
         'before_ids': [],
@@ -734,8 +747,11 @@ def _resolve_custom_email_service(
     if state:
         if callable(log_fn):
             if existing_state and str(existing_state.get('provider') or '').strip() == 'manual_email_otp':
-                log_fn('[邮箱测活] 账号池邮箱通道为 manual_email_otp，但当前邮箱命中 iCloud HME，优先切换自动收码通道')
-            log_fn(f"[邮箱测活] 命中 iCloud HME 邮箱通道: provider={state.get('provider')}")
+                log_fn('[邮箱测活] 账号池邮箱通道为 manual_email_otp，但当前邮箱命中 HME Ready，优先切换自动收码通道')
+            log_fn(
+                f"[邮箱测活] 命中 HME Ready 邮箱通道: "
+                f"provider={normalize_mailbox_provider(state.get('provider'))}"
+            )
         service = RestoredEmailService(
             state=state,
             proxy=proxy_url,

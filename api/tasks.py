@@ -18021,24 +18021,42 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                         mailbox_account = mailbox_state.get("account") if isinstance(mailbox_state.get("account"), dict) else {}
                         mailbox_extra = mailbox_account.get("extra") if isinstance(mailbox_account.get("extra"), dict) else {}
                         provider = str(mailbox_state.get("provider") or account.extra.get("mail_provider") or "").strip()
-                        if provider == "icloud_hme":
-                            token_value = str(account.token or account.extra.get("access_token") or "").strip()
-                            sync_icloud_hme_rerun_result(
-                                anonymous_id=str(mailbox_extra.get("anonymous_id") or mailbox_account.get("account_id") or ""),
-                                hme=str(mailbox_extra.get("hme") or mailbox_state.get("email") or account.email or ""),
-                                task_id=task_id,
-                                success=True,
-                                saved_account_id=int(getattr(saved_account, "id", 0) or 0) if saved_account is not None else 0,
-                                access_token_saved=bool(token_value),
-                                mailbox_state=mailbox_state,
-                                result_code=(
-                                    "registered_auth_pending"
-                                    if registered_auth_pending
-                                    else "login_alive"
-                                ),
-                            )
+                        raw_provider = provider.lower()
+                        from services.chatgpt_core.mailbox_state import normalize_mailbox_provider
+
+                        if normalize_mailbox_provider(provider) == "hme_ready_api":
+                            legacy_source = str(
+                                mailbox_extra.get("source")
+                                or mailbox_extra.get("record_source")
+                                or ""
+                            ).strip().lower()
+                            anonymous_id = str(mailbox_extra.get("anonymous_id") or "").strip()
+                            lease_id = str(
+                                mailbox_extra.get("lease_id")
+                                or mailbox_extra.get("checkout_id")
+                                or ""
+                            ).strip()
+                            if anonymous_id and (
+                                legacy_source in {"legacy-icloud-hme", "icloud-hme-legacy"}
+                                or (raw_provider == "icloud_hme" and not lease_id)
+                            ):
+                                token_value = str(account.token or account.extra.get("access_token") or "").strip()
+                                sync_icloud_hme_rerun_result(
+                                    anonymous_id=anonymous_id,
+                                    hme=str(mailbox_extra.get("hme") or mailbox_state.get("email") or account.email or ""),
+                                    task_id=task_id,
+                                    success=True,
+                                    saved_account_id=int(getattr(saved_account, "id", 0) or 0) if saved_account is not None else 0,
+                                    access_token_saved=bool(token_value),
+                                    mailbox_state=mailbox_state,
+                                    result_code=(
+                                        "registered_auth_pending"
+                                        if registered_auth_pending
+                                        else "login_alive"
+                                    ),
+                                )
                     except Exception as sync_exc:
-                        _attempt_log(f"[iCloudHME] 重跑结果写回失败: {sync_exc}", "warning")
+                        _attempt_log(f"[HME Ready] 重跑结果写回失败: {sync_exc}", "warning")
                 saved_inventory_id = int(getattr(saved_account, "id", 0) or 0) if saved_account is not None else 0
                 openai_account_id = str(
                     account_extra.get("account_id")

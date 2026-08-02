@@ -13,6 +13,7 @@ from services.chatgpt_core.chatgpt_registration_mode_adapter import (
 from services.chatgpt_core.mailbox_state import (
     build_mailbox_state,
     export_mailbox_state_config,
+    normalize_mailbox_provider,
 )
 
 
@@ -172,7 +173,7 @@ class ChatGPTPlatform(BasePlatform):
         if self.mailbox:
             _mailbox = self.mailbox
             _fixed_email = email
-            _mail_provider = (
+            _mail_provider = normalize_mailbox_provider(
                 str(extra_config.get("mail_provider") or "custom_provider").strip()
                 or "custom_provider"
             )
@@ -220,12 +221,23 @@ class ChatGPTPlatform(BasePlatform):
                 result_code: str = "",
                 access_token_saved: bool = False,
             ):
-                if _mail_provider != "icloud_hme" or acct is None:
+                if _mail_provider != "hme_ready_api" or acct is None:
                     return
                 account_extra = dict(getattr(acct, "extra", None) or {})
-                anonymous_id = str(account_extra.get("anonymous_id") or getattr(acct, "account_id", "") or "").strip()
+                anonymous_id = str(account_extra.get("anonymous_id") or "").strip()
+                lease_id = str(account_extra.get("lease_id") or account_extra.get("checkout_id") or "").strip()
+                source = str(account_extra.get("source") or "").strip().lower()
+                raw_account_provider = str(account_extra.get("provider") or "").strip().lower()
+                legacy_state = source in {"legacy-icloud-hme", "icloud-hme-legacy"} or (
+                    raw_account_provider == "icloud_hme" and bool(anonymous_id) and not lease_id
+                )
+                # The old SQLite alias table has no representation of a Ready
+                # lease.  Only historical anonymous aliases may be projected
+                # there; never mistake a Helper lease/account_id for one.
+                if not legacy_state or not anonymous_id:
+                    return
                 hme = str(account_extra.get("hme") or getattr(acct, "email", "") or _fixed_email or "").strip()
-                if not anonymous_id and not hme:
+                if not hme:
                     return
                 try:
                     from services.chatgpt_account_state import is_account_deactivated_message
@@ -243,7 +255,7 @@ class ChatGPTPlatform(BasePlatform):
                         delete_candidate=bool(not success and is_account_deactivated_message("", str(error_message or ""))),
                     )
                 except Exception as exc:
-                    log_fn(f"[iCloudHME] 重跑进度写回失败: {exc}")
+                    log_fn(f"[HME Ready] 重跑进度写回失败: {exc}")
 
             def _resolve_email(candidate_email: str = "") -> str:
                 resolved_email = str(_fixed_email or candidate_email or "").strip()

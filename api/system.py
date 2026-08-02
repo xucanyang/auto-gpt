@@ -229,65 +229,6 @@ def _scheduler_resource() -> dict[str, Any]:
     )
 
 
-def _icloud_auto_pool_resource() -> dict[str, Any]:
-    from services.icloud_hme_auto_pool import get_status
-
-    payload = get_status()
-    enabled = bool(payload.get("enabled"))
-    last_error = str(payload.get("last_error") or "").strip()
-    ready_count = int(payload.get("ready_count") or 0)
-    stock_limit = int(payload.get("stock_limit") or 0)
-    if not enabled:
-        status = "unknown"
-        message = "未启用自动补池"
-    elif last_error:
-        status = "warning"
-        message = f"自动补池异常: {last_error}"
-    elif ready_count < stock_limit:
-        status = "warning"
-        message = f"库存 {ready_count}/{stock_limit}，等待补池"
-    else:
-        status = "healthy"
-        message = f"库存 {ready_count}/{stock_limit}"
-    return _resource(
-        key="icloud_hme_auto_pool",
-        title="iCloud HME 自动补池",
-        status=status,
-        message=message,
-        metrics=payload,
-        action_path="/settings",
-    )
-
-
-def _icloud_auto_delete_resource() -> dict[str, Any]:
-    from services.icloud_hme_auto_delete import get_status
-
-    payload = get_status()
-    enabled = bool(payload.get("enabled"))
-    last_error = str(payload.get("last_error") or "").strip()
-    pending = int(payload.get("pending_candidates") or 0)
-    if not enabled:
-        status = "unknown"
-        message = "未启用自动删除"
-    elif last_error:
-        status = "warning"
-        message = f"自动删除异常: {last_error}"
-    elif pending:
-        status = "warning"
-        message = f"待处理候选 {pending} 个"
-    else:
-        status = "healthy"
-        message = "暂无待删除候选"
-    return _resource(
-        key="icloud_hme_auto_delete",
-        title="iCloud HME 自动删除",
-        status=status,
-        message=message,
-        metrics=payload,
-        action_path="/settings",
-    )
-
-
 def _tempmail_archive_resource() -> dict[str, Any]:
     from services.tempmail_archive_cleanup import get_status
 
@@ -339,8 +280,6 @@ def build_system_health(
             [
                 _safe_resource("solver", "Turnstile Solver", _solver_resource, action_path="/settings"),
                 _safe_resource("scheduler", "后台调度器", _scheduler_resource),
-                _safe_resource("icloud_hme_auto_pool", "iCloud HME 自动补池", _icloud_auto_pool_resource, action_path="/settings"),
-                _safe_resource("icloud_hme_auto_delete", "iCloud HME 自动删除", _icloud_auto_delete_resource, action_path="/settings"),
                 _safe_resource("tempmail_archive", "TempMail 归档清理", _tempmail_archive_resource, action_path="/settings"),
             ]
         )

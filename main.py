@@ -17,7 +17,6 @@ from api.actions import router as actions_router
 from api.auth import router as auth_router
 from api.outlook import router as outlook_router
 from api.contribution import router as contribution_router
-from api.icloud_hme import router as icloud_hme_router
 from api.tempmail_archive import router as tempmail_archive_router
 from api.external_subscription import (
     router as external_subscription_router,
@@ -250,12 +249,8 @@ async def lifespan(app: FastAPI):
     print(f"[OK] 已加载核心模块: {[ChatGPTPlatform.name]}")
     from core.scheduler import scheduler
     scheduler.start()
-    from services.icloud_hme_auto_pool import start as start_icloud_hme_auto_pool
-    start_icloud_hme_auto_pool()
     from services.tempmail_archive_cleanup import start as start_tempmail_archive_cleanup
     start_tempmail_archive_cleanup()
-    from services.icloud_hme_auto_delete import start as start_icloud_hme_auto_delete
-    start_icloud_hme_auto_delete()
     from services.account_rate_limit_recovery import start as start_account_rate_limit_recovery
     start_account_rate_limit_recovery()
     try:
@@ -278,12 +273,8 @@ async def lifespan(app: FastAPI):
     yield
     from core.scheduler import scheduler as _scheduler
     _scheduler.stop()
-    from services.icloud_hme_auto_pool import stop as stop_icloud_hme_auto_pool
-    stop_icloud_hme_auto_pool()
     from services.tempmail_archive_cleanup import stop as stop_tempmail_archive_cleanup
     stop_tempmail_archive_cleanup()
-    from services.icloud_hme_auto_delete import stop as stop_icloud_hme_auto_delete
-    stop_icloud_hme_auto_delete()
     from services.account_rate_limit_recovery import stop as stop_account_rate_limit_recovery
     stop_account_rate_limit_recovery()
     from services.chatgpt_core.phone_pool_repository import stop_phone_pool_maintenance
@@ -354,7 +345,6 @@ app.include_router(actions_router, prefix="/api")
 app.include_router(auth_router, prefix="/api")
 app.include_router(outlook_router, prefix="/api")
 app.include_router(contribution_router, prefix="/api")
-app.include_router(icloud_hme_router, prefix="/api")
 app.include_router(tempmail_archive_router, prefix="/api")
 app.include_router(external_subscription_router, prefix="/api")
 app.include_router(external_access_tokens_router, prefix="/api")

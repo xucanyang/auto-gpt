@@ -73,10 +73,7 @@ CONFIG_KEYS = [
     "email_api_gmail_plus_tag_template",
     "email_api_default_scheme",
     "icloud_hme_mode",
-    "icloud_cookie",
-    "icloud_domain_base",
     "icloud_forward_to",
-    "icloud_forward_mailbox_id",
     "icloud_hme_helper_api_url",
     "icloud_hme_helper_internal_key",
     "icloud_hme_helper_api_key_header",
@@ -84,25 +81,6 @@ CONFIG_KEYS = [
     "icloud_hme_helper_checkout_ttl_seconds",
     "icloud_hme_helper_wait_timeout_seconds",
     "icloud_hme_helper_max_cache_age_seconds",
-    "icloud_hme_auto_create_enabled",
-    "icloud_hme_auto_create_stock_limit",
-    "icloud_hme_auto_create_interval_min_minutes",
-    "icloud_hme_auto_create_interval_max_minutes",
-    "icloud_hme_auto_create_rate_limit_backoff_minutes",
-    "icloud_hme_auto_create_error_backoff_minutes",
-    "icloud_hme_auto_delete_enabled",
-    "icloud_hme_auto_delete_account_interval_min_minutes",
-    "icloud_hme_auto_delete_account_interval_max_minutes",
-    "icloud_hme_auto_delete_interval_min_minutes",
-    "icloud_hme_auto_delete_interval_max_minutes",
-    "icloud_hme_auto_delete_max_per_run",
-    "icloud_hme_auto_delete_per_item_delay_min_seconds",
-    "icloud_hme_auto_delete_per_item_delay_max_seconds",
-    "icloud_hme_auto_delete_rate_limit_backoff_minutes",
-    "icloud_hme_auto_delete_error_backoff_minutes",
-    "icloud_hme_auto_delete_recheck_before_delete",
-    "icloud_hme_auto_delete_pause_active_tasks",
-    "icloud_hme_auto_delete_dead_statuses",
     "tempmail_archive_cleanup_enabled",
     "tempmail_archive_cleanup_interval_minutes",
     "tempmail_archive_cleanup_keep_recent_minutes",
@@ -238,6 +216,31 @@ CONFIG_KEYS = [
     "contribution_server_url",
     "contribution_key",
 ]
+
+REMOVED_ICLOUD_HME_CONFIG_KEYS = {
+    "icloud_cookie",
+    "icloud_domain_base",
+    "icloud_forward_mailbox_id",
+    "icloud_hme_auto_create_enabled",
+    "icloud_hme_auto_create_stock_limit",
+    "icloud_hme_auto_create_interval_min_minutes",
+    "icloud_hme_auto_create_interval_max_minutes",
+    "icloud_hme_auto_create_rate_limit_backoff_minutes",
+    "icloud_hme_auto_create_error_backoff_minutes",
+    "icloud_hme_auto_delete_enabled",
+    "icloud_hme_auto_delete_account_interval_min_minutes",
+    "icloud_hme_auto_delete_account_interval_max_minutes",
+    "icloud_hme_auto_delete_interval_min_minutes",
+    "icloud_hme_auto_delete_interval_max_minutes",
+    "icloud_hme_auto_delete_max_per_run",
+    "icloud_hme_auto_delete_per_item_delay_min_seconds",
+    "icloud_hme_auto_delete_per_item_delay_max_seconds",
+    "icloud_hme_auto_delete_rate_limit_backoff_minutes",
+    "icloud_hme_auto_delete_error_backoff_minutes",
+    "icloud_hme_auto_delete_recheck_before_delete",
+    "icloud_hme_auto_delete_pause_active_tasks",
+    "icloud_hme_auto_delete_dead_statuses",
+}
 
 
 class ConfigUpdate(BaseModel):
@@ -598,9 +601,7 @@ def _build_config_response(*, local_only: bool = False) -> dict[str, Any]:
     if not all_cfg.get("email_api_default_scheme"):
         all_cfg["email_api_default_scheme"] = "https"
     if not all_cfg.get("icloud_hme_mode"):
-        all_cfg["icloud_hme_mode"] = "live"
-    if not all_cfg.get("icloud_domain_base"):
-        all_cfg["icloud_domain_base"] = "icloud.com"
+        all_cfg["icloud_hme_mode"] = "helper_ready_api"
     if not all_cfg.get("icloud_forward_to"):
         all_cfg["icloud_forward_to"] = "b@cccy.me"
     if not all_cfg.get("icloud_hme_helper_api_key_header"):
@@ -613,44 +614,6 @@ def _build_config_response(*, local_only: bool = False) -> dict[str, Any]:
         all_cfg["icloud_hme_helper_wait_timeout_seconds"] = "300"
     if not all_cfg.get("icloud_hme_helper_max_cache_age_seconds"):
         all_cfg["icloud_hme_helper_max_cache_age_seconds"] = "86400"
-    if not all_cfg.get("icloud_hme_auto_create_enabled"):
-        all_cfg["icloud_hme_auto_create_enabled"] = "false"
-    if not all_cfg.get("icloud_hme_auto_create_stock_limit"):
-        all_cfg["icloud_hme_auto_create_stock_limit"] = "10"
-    if not all_cfg.get("icloud_hme_auto_create_interval_min_minutes"):
-        all_cfg["icloud_hme_auto_create_interval_min_minutes"] = "60"
-    if not all_cfg.get("icloud_hme_auto_create_interval_max_minutes"):
-        all_cfg["icloud_hme_auto_create_interval_max_minutes"] = "120"
-    if not all_cfg.get("icloud_hme_auto_create_rate_limit_backoff_minutes"):
-        all_cfg["icloud_hme_auto_create_rate_limit_backoff_minutes"] = "360"
-    if not all_cfg.get("icloud_hme_auto_create_error_backoff_minutes"):
-        all_cfg["icloud_hme_auto_create_error_backoff_minutes"] = "3"
-    if not all_cfg.get("icloud_hme_auto_delete_enabled"):
-        all_cfg["icloud_hme_auto_delete_enabled"] = "false"
-    if not all_cfg.get("icloud_hme_auto_delete_account_interval_min_minutes"):
-        all_cfg["icloud_hme_auto_delete_account_interval_min_minutes"] = "10"
-    if not all_cfg.get("icloud_hme_auto_delete_account_interval_max_minutes"):
-        all_cfg["icloud_hme_auto_delete_account_interval_max_minutes"] = "30"
-    if not all_cfg.get("icloud_hme_auto_delete_interval_min_minutes"):
-        all_cfg["icloud_hme_auto_delete_interval_min_minutes"] = "60"
-    if not all_cfg.get("icloud_hme_auto_delete_interval_max_minutes"):
-        all_cfg["icloud_hme_auto_delete_interval_max_minutes"] = "120"
-    if not all_cfg.get("icloud_hme_auto_delete_max_per_run"):
-        all_cfg["icloud_hme_auto_delete_max_per_run"] = "20"
-    if not all_cfg.get("icloud_hme_auto_delete_per_item_delay_min_seconds"):
-        all_cfg["icloud_hme_auto_delete_per_item_delay_min_seconds"] = "30"
-    if not all_cfg.get("icloud_hme_auto_delete_per_item_delay_max_seconds"):
-        all_cfg["icloud_hme_auto_delete_per_item_delay_max_seconds"] = "90"
-    if not all_cfg.get("icloud_hme_auto_delete_rate_limit_backoff_minutes"):
-        all_cfg["icloud_hme_auto_delete_rate_limit_backoff_minutes"] = "60"
-    if not all_cfg.get("icloud_hme_auto_delete_error_backoff_minutes"):
-        all_cfg["icloud_hme_auto_delete_error_backoff_minutes"] = "3"
-    if not all_cfg.get("icloud_hme_auto_delete_recheck_before_delete"):
-        all_cfg["icloud_hme_auto_delete_recheck_before_delete"] = "true"
-    if not all_cfg.get("icloud_hme_auto_delete_pause_active_tasks"):
-        all_cfg["icloud_hme_auto_delete_pause_active_tasks"] = "true"
-    if not all_cfg.get("icloud_hme_auto_delete_dead_statuses"):
-        all_cfg["icloud_hme_auto_delete_dead_statuses"] = "account_deactivated,password_invalid"
     if not all_cfg.get("tempmail_archive_cleanup_enabled"):
         all_cfg["tempmail_archive_cleanup_enabled"] = "false"
     if not all_cfg.get("tempmail_archive_cleanup_interval_minutes"):
@@ -759,6 +722,20 @@ def _build_config_response(*, local_only: bool = False) -> dict[str, Any]:
         all_cfg["chatgpt_phone_signup_resend_interval_seconds"] = "60"
     if not all_cfg.get("chatgpt_phone_verification_enabled"):
         all_cfg["chatgpt_phone_verification_enabled"] = "true"
+    # HME Ready is the only active HME contract.  Historical Apple cookie,
+    # domain and global receiver-id values remain in the store only for audit;
+    # never expose them as editable runtime settings.
+    try:
+        from services.chatgpt_core.mailbox_state import normalize_mailbox_provider
+
+        normalized_provider = normalize_mailbox_provider(all_cfg.get("mail_provider"))
+    except Exception:
+        normalized_provider = str(all_cfg.get("mail_provider") or "").strip().lower()
+    if normalized_provider == "hme_ready_api":
+        all_cfg["mail_provider"] = "hme_ready_api"
+        all_cfg["icloud_hme_mode"] = "helper_ready_api"
+    for removed_key in REMOVED_ICLOUD_HME_CONFIG_KEYS:
+        all_cfg.pop(removed_key, None)
     # 只返回已知 key，未设置的返回空字符串
     return {k: all_cfg.get(k, "") for k in CONFIG_KEYS}
 
@@ -770,7 +747,20 @@ def _build_shareable_local_snapshot() -> dict[str, str]:
     其他全局 key。推送或对比共享模板时必须基于本地 configs 全量快照，
     避免丢掉非页面字段，也避免把默认值/布尔展示值当成真实差异。
     """
-    return filter_shareable_config(config_store.get_saved_local_all())
+    snapshot = filter_shareable_config(config_store.get_saved_local_all())
+    try:
+        from services.chatgpt_core.mailbox_state import normalize_mailbox_provider
+
+        if normalize_mailbox_provider(snapshot.get("mail_provider")) == "hme_ready_api":
+            snapshot["mail_provider"] = "hme_ready_api"
+            snapshot["icloud_hme_mode"] = "helper_ready_api"
+    except Exception:
+        pass
+    return {
+        key: value
+        for key, value in snapshot.items()
+        if key not in REMOVED_ICLOUD_HME_CONFIG_KEYS
+    }
 
 
 @router.get("")
@@ -895,6 +885,21 @@ def get_shared_config_audit(limit: int = 50):
 def update_config(body: ConfigUpdate):
     # 只允许更新已知 key
     safe = {k: v for k, v in body.data.items() if k in CONFIG_KEYS}
+    try:
+        from services.chatgpt_core.mailbox_state import normalize_mailbox_provider
+
+        requested_provider = normalize_mailbox_provider(safe.get("mail_provider"))
+    except Exception:
+        requested_provider = str(safe.get("mail_provider") or "").strip().lower()
+    if requested_provider == "hme_ready_api":
+        safe["mail_provider"] = "hme_ready_api"
+        safe["icloud_hme_mode"] = "helper_ready_api"
+    elif "icloud_hme_mode" in safe:
+        # No active setting may switch the Ready implementation back to the
+        # removed Apple-direct/import-pool modes.
+        safe["icloud_hme_mode"] = "helper_ready_api"
+    for removed_key in REMOVED_ICLOUD_HME_CONFIG_KEYS:
+        safe.pop(removed_key, None)
     current_config = config_store.get_all()
     safe = normalize_dynamic_proxy_update(safe, current_config)
     safe = _normalize_local_status_probe_update(safe, current_config)

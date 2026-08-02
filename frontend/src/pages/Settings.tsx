@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { App, Card, Form, Input, InputNumber, Select, Button, message, Tabs, Space, Tag, Typography, Modal, QRCode, Switch, Alert, Table, Grid, Spin } from 'antd'
+import { App, Card, Form, Input, InputNumber, Select, Button, message, Tabs, Space, Tag, Typography, Modal, QRCode, Switch, Alert, Grid, Spin } from 'antd'
 import type { FormInstance } from 'antd'
 import {
   SaveOutlined,
@@ -14,7 +14,6 @@ import {
   CloudUploadOutlined,
   PlusOutlined,
   LockOutlined,
-  CopyOutlined,
 } from '@ant-design/icons'
 import { parseBooleanConfigValue } from '@/lib/configValueParsers'
 import { apiFetch, invalidateSession, setToken } from '@/lib/utils'
@@ -46,8 +45,7 @@ const SELECT_FIELDS: Record<string, { label: string; value: string }[]> = {
     { label: 'Laoudo（固定邮箱）', value: 'laoudo' },
     { label: 'TempMail.lol（自动生成）', value: 'tempmail_lol' },
     { label: 'TempMail Ready API（本地接口）', value: 'tempmail_local' },
-    { label: 'HME Ready API（iCloud Helper）', value: 'hme_ready_api' },
-    { label: 'iCloud HME', value: 'icloud_hme' },
+    { label: 'HME Ready API + TempMail（iCloud Helper）', value: 'hme_ready_api' },
     { label: 'SkyMail（CloudMail 接口）', value: 'skymail' },
     { label: 'CloudMail（genToken 口令模式）', value: 'cloudmail' },
     { label: 'DuckMail（自动生成）', value: 'duckmail' },
@@ -66,15 +64,6 @@ const SELECT_FIELDS: Record<string, { label: string; value: string }[]> = {
   tempmail_mode: [
     { label: '固定域名', value: 'fixed_domain' },
     { label: '随机子域 / Ready', value: 'task_subdomain' },
-  ],
-  icloud_domain_base: [
-    { label: 'icloud.com', value: 'icloud.com' },
-    { label: 'icloud.com.cn', value: 'icloud.com.cn' },
-  ],
-  icloud_hme_mode: [
-    { label: '实时创建', value: 'live' },
-    { label: '仅导入池', value: 'import_pool' },
-    { label: '优先导入池', value: 'prefer_import' },
   ],
   default_executor: [
     { label: 'API 协议（无浏览器）', value: 'protocol' },
@@ -295,7 +284,7 @@ const TAB_ITEMS = [
       },
       {
         title: 'HME Ready API',
-        desc: '通过 icloud-hide-email-helper 领取 HME、收码和 finalize',
+        desc: 'Helper 负责出池、身份和 finalize；auto-gpt 直接从 TempMail 转发箱读取验证码',
         fields: [
           { key: 'icloud_forward_to', label: '转发目标邮箱', placeholder: 'b@666800.xyz', type: 'stringList' },
           { key: 'icloud_hme_helper_api_url', label: 'Helper API URL', placeholder: 'http://host.docker.internal:18765' },
@@ -304,45 +293,7 @@ const TAB_ITEMS = [
           { key: 'icloud_hme_helper_consumer', label: 'Helper Consumer', placeholder: 'auto-gpt/chatgpt_register' },
           { key: 'icloud_hme_helper_checkout_ttl_seconds', label: 'Helper lease TTL 秒', placeholder: '10800' },
           { key: 'icloud_hme_helper_wait_timeout_seconds', label: 'Helper 等码超时秒', placeholder: '300' },
-          { key: 'icloud_hme_helper_max_cache_age_seconds', label: 'Helper iCloud 缓存有效秒', placeholder: '86400' },
-        ],
-      },
-      {
-        title: 'iCloud HME 基础配置',
-        desc: 'auto-gpt 直接管理 iCloud HME Cookie、别名来源和共享收件箱',
-        fields: [
-          { key: 'icloud_hme_mode', label: '别名来源模式', type: 'select' },
-          { key: 'icloud_cookie', label: 'iCloud Cookie', type: 'textarea', placeholder: '从 www.icloud.com DevTools 请求头复制完整 Cookie 字符串' },
-          { key: 'icloud_domain_base', label: 'iCloud 域', type: 'select' },
-          { key: 'icloud_forward_to', label: '转发目标邮箱', placeholder: 'b@cccy.me', type: 'stringList' },
-          { key: 'icloud_forward_mailbox_id', label: '转发目标 mailbox_id（可选）', placeholder: '0d355f68-8506-4c93-ac56-5ef017f0b932' },
-        ],
-      },
-      {
-        title: 'iCloud HME 自动补池',
-        desc: '按随机间隔创建新 HME，并放入导入池待使用',
-        fields: [
-          { key: 'icloud_hme_auto_create_enabled', label: '自动创建导入池邮箱', type: 'boolean' },
-          { key: 'icloud_hme_auto_create_stock_limit', label: '导入池库存上限', placeholder: '10' },
-          { key: 'icloud_hme_auto_create_interval_min_minutes', label: '随机间隔最小分钟', placeholder: '60' },
-          { key: 'icloud_hme_auto_create_interval_max_minutes', label: '随机间隔最大分钟', placeholder: '120' },
-          { key: 'icloud_hme_auto_create_rate_limit_backoff_minutes', label: '遇到限流延长等待分钟', placeholder: '360' },
-          { key: 'icloud_hme_auto_create_error_backoff_minutes', label: '普通错误短退避分钟', placeholder: '3' },
-        ],
-      },
-      {
-        title: 'iCloud HME 自动删除',
-        desc: '扫描未使用或失效别名，删除前可再次测活确认',
-        fields: [
-          { key: 'icloud_hme_auto_delete_enabled', label: '自动删除未使用/失效别名', type: 'boolean' },
-          { key: 'icloud_hme_auto_delete_recheck_before_delete', label: '删除前先失效测活', type: 'boolean' },
-          { key: 'icloud_hme_auto_delete_account_interval_min_minutes', label: '账号间隔最小分钟', placeholder: '10' },
-          { key: 'icloud_hme_auto_delete_account_interval_max_minutes', label: '账号间隔最大分钟', placeholder: '30' },
-          { key: 'icloud_hme_auto_delete_max_per_run', label: '单次最多删除个数', placeholder: '20' },
-          { key: 'icloud_hme_auto_delete_rate_limit_backoff_minutes', label: '删除遇限流延长等待分钟', placeholder: '60' },
-          { key: 'icloud_hme_auto_delete_error_backoff_minutes', label: '普通错误短退避分钟', placeholder: '3' },
-          { key: 'icloud_hme_auto_delete_pause_active_tasks', label: '活跃任务期间暂停删除', type: 'boolean' },
-          { key: 'icloud_hme_auto_delete_dead_statuses', label: '判为失效的测活结论', placeholder: 'account_deactivated,password_invalid' },
+          { key: 'icloud_hme_helper_max_cache_age_seconds', label: 'Helper 缓存有效秒', placeholder: '86400' },
         ],
       },
       {
@@ -729,10 +680,6 @@ function orderPinnedSections(sections: SectionConfig[], pinnedSections: string[]
   ]
 }
 
-function getIcloudHmeModeLabel(mode: string): string {
-  return SELECT_FIELDS.icloud_hme_mode.find((item) => item.value === mode)?.label || mode || '未配置'
-}
-
 function getMailboxSectionProvider(title: string): string | null {
   switch (title) {
     case '邮箱验证码 API':
@@ -761,11 +708,8 @@ function getMailboxSectionProvider(title: string): string | null {
       return 'tempmail_local'
     case 'HME Ready API':
       return 'hme_ready_api'
-    case 'iCloud HME 基础配置':
-    case 'iCloud HME 自动补池':
-    case 'iCloud HME 自动删除':
     case 'TempMail 归档清理':
-      return 'icloud_hme'
+      return 'tempmail_local'
     case 'DuckMail':
       return 'duckmail'
     case 'CF Worker 自建邮箱':
@@ -780,7 +724,6 @@ function getMailboxSectionProvider(title: string): string | null {
 const MAILBOX_QUICK_PROVIDERS = [
   'luckmail',
   'hme_ready_api',
-  'icloud_hme',
   'email_api',
   'applemail',
   'tempmail_local',
@@ -799,9 +742,7 @@ function getMailboxProviderBrief(provider: string): string {
     case 'luckmail':
       return '购买邮箱 / 已购邮箱，适合稳定批量注册。'
     case 'hme_ready_api':
-      return 'auto-gpt 只调用 helper 的 prepare / wait-code / finalize；iCloud Cookie、alias 池和收件箱都留在 helper。'
-    case 'icloud_hme':
-      return 'auto-gpt 直接管理 iCloud Cookie / HME 别名池 / 共享收件箱，适合导入池、实时创建和别名治理。'
+      return 'Helper 负责邮箱出池、身份和 finalize；auto-gpt 直接从 TempMail 转发箱读取验证码。'
     case 'email_api':
       return '自带邮箱 + 外部 API 自动收码；Gmail 一行可展开为原邮箱 + N-1 个随机变体，共用同一 API。'
     case 'applemail':
@@ -826,14 +767,6 @@ function applyMailboxQuickProvider(form: FormInstance, provider: string) {
     form.setFieldsValue({
       mail_provider: 'hme_ready_api',
       icloud_hme_mode: 'helper_ready_api',
-    })
-    return
-  }
-  if (provider === 'icloud_hme') {
-    const currentMode = form.getFieldValue('icloud_hme_mode')
-    form.setFieldsValue({
-      mail_provider: 'icloud_hme',
-      icloud_hme_mode: currentMode === 'helper_ready_api' ? 'import_pool' : (currentMode || 'import_pool'),
     })
     return
   }
@@ -865,7 +798,6 @@ function MailboxOverviewPanel({
   visibleSections: SectionConfig[]
 }) {
   const otpTimeout = Form.useWatch('mailbox_otp_timeout_seconds', form) || '90'
-  const icloudMode = Form.useWatch('icloud_hme_mode', form) || 'live'
   const forwardTo = Form.useWatch('icloud_forward_to', form) || '-'
   const helperApiUrl = Form.useWatch('icloud_hme_helper_api_url', form) || '-'
   const providerLabel = getMailboxProviderLabel(selectedProvider)
@@ -879,7 +811,7 @@ function MailboxOverviewPanel({
           <div>
             <Typography.Text strong>邮箱管理概览</Typography.Text>
             <Typography.Text type="secondary" style={{ display: 'block', marginTop: 4 }}>
-              只展示当前邮箱服务相关配置；HME Ready API 和 iCloud HME 是两个独立方式。
+              只展示当前邮箱服务相关配置；HME Ready API 的验证码由 auto-gpt 直接读取 TempMail 转发箱。
             </Typography.Text>
           </div>
           <Space size={6} wrap>
@@ -902,11 +834,6 @@ function MailboxOverviewPanel({
           {selectedProvider === 'hme_ready_api' ? (
             <Typography.Text type="secondary" style={{ display: 'block', marginTop: 4 }}>
               Helper：{String(helperApiUrl)}，转发目标：{String(forwardTo)}
-            </Typography.Text>
-          ) : null}
-          {selectedProvider === 'icloud_hme' ? (
-            <Typography.Text type="secondary" style={{ display: 'block', marginTop: 4 }}>
-              当前 HME 模式：{getIcloudHmeModeLabel(String(icloudMode))}，转发目标：{String(forwardTo)}
             </Typography.Text>
           ) : null}
         </div>
@@ -959,86 +886,6 @@ interface AppleMailPoolSnapshot {
   truncated: boolean
 }
 
-interface ICloudHmeAutoPoolStatus {
-  running?: boolean
-  enabled?: boolean
-  stock_limit?: number
-  ready_count?: number
-  interval_min_minutes?: number
-  interval_max_minutes?: number
-  rate_limit_backoff_minutes?: number
-  error_backoff_minutes?: number
-  next_run_at?: string
-  seconds_until_next_run?: number
-  rate_limit_until?: string
-  in_rate_limit_backoff?: boolean
-  error_backoff_until?: string
-  in_error_backoff?: boolean
-  consecutive_error_count?: number
-  last_backoff_reason?: string
-  last_run_at?: string
-  last_success_at?: string
-  last_created_hme?: string
-  last_error?: string
-  forward_to?: string
-}
-
-interface ICloudHmeAutoDeleteStatus {
-  running?: boolean
-  enabled?: boolean
-  account_interval_min_minutes?: number
-  account_interval_max_minutes?: number
-  max_per_run?: number
-  rate_limit_backoff_minutes?: number
-  error_backoff_minutes?: number
-  recheck_before_delete?: boolean
-  pause_active_tasks?: boolean
-  dead_statuses?: string[]
-  pending_candidates?: number
-  candidate_summary?: Record<string, number>
-  next_run_at?: string
-  seconds_until_next_run?: number
-  rate_limit_until?: string
-  in_rate_limit_backoff?: boolean
-  error_backoff_until?: string
-  in_error_backoff?: boolean
-  consecutive_error_count?: number
-  last_backoff_reason?: string
-  last_run_at?: string
-  last_success_at?: string
-  last_error?: string
-  last_result?: Record<string, any>
-}
-
-
-interface ICloudHmeRecheckCampaignData {
-  campaign_id?: string
-  summary?: Record<string, any>
-  data?: any[]
-  total?: number
-  page?: number
-  size?: number
-  pages?: number
-}
-
-interface TempMailArchiveCleanupStatus {
-  running?: boolean
-  enabled?: boolean
-  mailbox?: string
-  backup_path?: string
-  interval_minutes?: number
-  keep_recent_minutes?: number
-  threshold?: number
-  pause_active_tasks?: boolean
-  active_task_count?: number
-  next_run_at?: string
-  seconds_until_next_run?: number
-  last_run_at?: string
-  last_success_at?: string
-  last_error?: string
-  last_result?: Record<string, any>
-}
-
 function formatResultText(data: unknown) {
   if (typeof data === 'string') return data
   try {
@@ -1073,7 +920,9 @@ function parseStoredDomainList(value: unknown): string[] {
     if (Array.isArray(parsed)) {
       return normalizeDomainList(parsed)
     }
-  } catch {}
+  } catch {
+    // Legacy settings may store domains as a plain comma/newline list.
+  }
 
   return normalizeDomainList(
     text
@@ -1134,25 +983,6 @@ function formatDisplayPercent(value: number | null): string {
   return `${value.toFixed(2)}%`
 }
 
-function formatDateTimeText(value: string | undefined): string {
-  const text = String(value || '').trim()
-  if (!text) return '-'
-  const date = new Date(text)
-  if (Number.isNaN(date.getTime())) return text
-  return date.toLocaleString('zh-CN', { hour12: false })
-}
-
-function formatDurationText(seconds: number | undefined): string {
-  const totalSeconds = Math.max(0, Math.floor(Number(seconds || 0)))
-  if (!totalSeconds) return '-'
-  const minutes = Math.floor(totalSeconds / 60)
-  const hours = Math.floor(minutes / 60)
-  const restMinutes = minutes % 60
-  if (hours > 0) return `${hours}小时${restMinutes}分钟`
-  if (minutes > 0) return `${minutes}分钟`
-  return `${totalSeconds}秒`
-}
-
 function StringListInput({ value, onChange, placeholder }: { value?: string, onChange?: (val: string) => void, placeholder?: string }) {
   const arr = (value || '').split(',').map(e => e.trim()).filter(Boolean)
   const handleChange = (newVals: string[]) => {
@@ -1204,44 +1034,10 @@ function ConfigField({ field }: { field: FieldConfig }) {
         ? '动态代理出口探测超时，建议 6-12 秒。'
       : field.key === 'default_executor'
       ? '当前仅对 ChatGPT 生效；支持纯协议、无头浏览器和有头浏览器模式。'
-      : field.key === 'icloud_cookie'
-        ? '从浏览器打开 www.icloud.com，进入 DevTools，找到发往 setup.icloud.com 或 /hme/ 的请求，把完整 Cookie 请求头原样复制到这里。不要删任何字段。'
-      : field.key === 'icloud_hme_mode'
-        ? '实时创建会直接调用 Apple 私有接口；仅导入池会只从本地已导入的 HME 别名池领取；优先导入池会先领池里的别名，没货再实时创建。HME Ready API 已拆成独立邮箱方式。'
       : field.key === 'icloud_hme_helper_api_url'
         ? 'auto-gpt 容器访问 helper 的内网地址；本机 Docker 推荐 http://host.docker.internal:18765 或宿主 Docker 网关地址。'
       : field.key === 'icloud_hme_helper_internal_key'
-        ? '读取 helper 项目 .internal-api-key；只用于 auto-gpt 调用本地 Helper Ready API。'
-      : field.key === 'icloud_hme_auto_create_enabled'
-        ? '开启后后台会按随机时间间隔自动创建 1 个新 HME，并放入导入池；达到库存上限时暂停创建。'
-      : field.key === 'icloud_hme_auto_create_stock_limit'
-        ? '只统计当前转发邮箱下可注册的导入池库存；库存达到该数量时不再创建新 HME。'
-      : field.key === 'icloud_hme_auto_create_interval_min_minutes'
-        ? '每次成功创建或跳过后，会在最小和最大分钟之间随机选择下次检查时间。'
-      : field.key === 'icloud_hme_auto_create_interval_max_minutes'
-        ? '必须大于或等于最小分钟；填写更大的范围可以降低固定节奏触发风控的概率。'
-      : field.key === 'icloud_hme_auto_create_rate_limit_backoff_minutes'
-        ? '如果 Apple 返回创建限流，后台会至少等待这么久后再尝试。'
-      : field.key === 'icloud_hme_auto_create_error_backoff_minutes'
-        ? '普通网络/API/解析错误会先短暂停再重试；连续普通错误会按该值递增，最多 15 分钟。填 0 可关闭普通错误短退避。'
-      : field.key === 'icloud_hme_auto_delete_enabled'
-        ? '开启后后台按随机间隔扫描候选（不在任何 ChatGPT 账号里的孤儿别名 + 绑定账号已失效的别名）。每个候选删除前都会先免密登录测活：能登录的视为存活、保留并重新导入账号列表，只删确认失效的。永不删待用库存与正在注册的别名。删除在 Apple 端 deactivate+delete，不可恢复。'
-      : field.key === 'icloud_hme_auto_delete_recheck_before_delete'
-        ? '开启（强烈推荐）：每个待删邮箱删除前都先免密登录测活——能登录=账号还活着→保留并重新导入；提示账号不存在/已停用=确认失效→才删；网络/限流等临时失败→本轮跳过。关闭则不测活、直接信任本地状态删除（快但激进，可能误删本地没记录但其实还活着的账号）。'
-      : field.key === 'icloud_hme_auto_delete_account_interval_min_minutes'
-        ? '每个候选邮箱/账号处理完成后，会在最小和最大分钟之间随机等待，再处理下一个候选。'
-      : field.key === 'icloud_hme_auto_delete_account_interval_max_minutes'
-        ? '必须大于或等于最小分钟；例如 10-30 表示每个账号之间随机等待 10 到 30 分钟。'
-      : field.key === 'icloud_hme_auto_delete_max_per_run'
-        ? '每轮最多删除的别名数量，避免一次删太多触发风控；超出的留到下一轮。'
-      : field.key === 'icloud_hme_auto_delete_rate_limit_backoff_minutes'
-        ? '如果删除时 Apple 返回限流，后台会至少等待这么久后再继续。'
-      : field.key === 'icloud_hme_auto_delete_error_backoff_minutes'
-        ? '删除或删前测活遇到普通临时错误时短暂停，不当作限流；连续普通错误会按该值递增，最多 15 分钟。填 0 可关闭。'
-      : field.key === 'icloud_hme_auto_delete_pause_active_tasks'
-        ? '开启后，有注册等任务在跑时本轮删除会自动跳过，避免误删正在使用的别名。'
-      : field.key === 'icloud_hme_auto_delete_dead_statuses'
-        ? '逗号分隔；只有失效测活结论命中这些代码时才会删除绑定的别名。默认 account_deactivated（账号被删/停用）、password_invalid（密码失效）。network_failed 等临时失败不会被删。'
+        ? '读取 helper 项目 .internal-api-key；只用于 auto-gpt 调用 HME Ready API 出池和 finalize，验证码仍由 auto-gpt 直接读取 TempMail。'
       : field.key === 'tempmail_archive_cleanup_enabled'
         ? '开启后后台会定时扫描共享 TempMail 收件箱，先写入本地备份库，再删除超过保留窗口的旧邮件。'
       : field.key === 'tempmail_archive_cleanup_interval_minutes'
@@ -1253,7 +1049,7 @@ function ConfigField({ field }: { field: FieldConfig }) {
       : field.key === 'tempmail_archive_cleanup_pause_active_tasks'
         ? '开启后只要后台还有注册、补抓、手机号绑定等活跃任务，归档清理会先跳过。'
       : field.key === 'tempmail_archive_cleanup_mailbox'
-        ? '通常填写 iCloud HME 的转发目标邮箱；留空时后端默认使用当前转发目标。'
+        ? '填写 HME Ready 转发到的 TempMail 地址；留空时后端使用当前候选转发目标。'
       : field.key === 'tempmail_archive_cleanup_backup_path'
         ? 'SQLite 备份库路径；容器内推荐 /runtime/tempmail_email_backups.db，可随运行数据持久化。'
       : field.key === 'chatgpt_resume_auth_allow_phone_verification'
@@ -2304,1085 +2100,6 @@ function OutlookImportSection() {
   )
 }
 
-function ICloudHmeManagerSection({ form }: { form: any }) {
-  const [syncing, setSyncing] = useState(false)
-  const [loading, setLoading] = useState(false)
-  const [bulkEnabling, setBulkEnabling] = useState(false)
-  const [bulkDisablingUsed, setBulkDisablingUsed] = useState(false)
-  const [syncPruning, setSyncPruning] = useState(false)
-  const [switchingMode, setSwitchingMode] = useState(false)
-  const [togglingId, setTogglingId] = useState('')
-  const [aliases, setAliases] = useState<any[]>([])
-  const [total, setTotal] = useState(0)
-  const [availableImportPoolCount, setAvailableImportPoolCount] = useState(0)
-  const [autoPoolStatus, setAutoPoolStatus] = useState<ICloudHmeAutoPoolStatus | null>(null)
-  const [autoPoolStatusLoading, setAutoPoolStatusLoading] = useState(false)
-  const [archiveStatus, setArchiveStatus] = useState<TempMailArchiveCleanupStatus | null>(null)
-  const [archiveStatusLoading, setArchiveStatusLoading] = useState(false)
-  const [archiveRunning, setArchiveRunning] = useState(false)
-  const [autoDeleteStatus, setAutoDeleteStatus] = useState<ICloudHmeAutoDeleteStatus | null>(null)
-  const [autoDeleteStatusLoading, setAutoDeleteStatusLoading] = useState(false)
-  const [autoDeleteRunning, setAutoDeleteRunning] = useState(false)
-  const [recheckCampaign, setRecheckCampaign] = useState<ICloudHmeRecheckCampaignData | null>(null)
-  const [recheckLoading, setRecheckLoading] = useState(false)
-  const [rerunResetting, setRerunResetting] = useState(false)
-  const [recheckStatusFilter, setRecheckStatusFilter] = useState('')
-  const [previewLoading, setPreviewLoading] = useState(false)
-  const [previewOpen, setPreviewOpen] = useState(false)
-  const [previewData, setPreviewData] = useState<any | null>(null)
-  const [onlyReadyView, setOnlyReadyView] = useState(false)
-  const [page, setPage] = useState(1)
-  const [pageSize, setPageSize] = useState(20)
-  const [statusFilter, setStatusFilter] = useState('')
-  const [enabledFilter, setEnabledFilter] = useState('')
-  const [sourceFilter, setSourceFilter] = useState('')
-  const [searchHme, setSearchHme] = useState('')
-
-  const loadAutoPoolStatus = async () => {
-    setAutoPoolStatusLoading(true)
-    try {
-      const data = await apiFetch('/icloud-hme/auto-pool/status')
-      setAutoPoolStatus(data || null)
-    } catch {
-      setAutoPoolStatus(null)
-    } finally {
-      setAutoPoolStatusLoading(false)
-    }
-  }
-
-  const loadArchiveStatus = async () => {
-    setArchiveStatusLoading(true)
-    try {
-      const data = await apiFetch('/tempmail-archive/status')
-      setArchiveStatus(data || null)
-    } catch {
-      setArchiveStatus(null)
-    } finally {
-      setArchiveStatusLoading(false)
-    }
-  }
-
-  const loadAutoDeleteStatus = async () => {
-    setAutoDeleteStatusLoading(true)
-    try {
-      const data = await apiFetch('/icloud-hme/auto-delete/status')
-      setAutoDeleteStatus(data || null)
-    } catch {
-      setAutoDeleteStatus(null)
-    } finally {
-      setAutoDeleteStatusLoading(false)
-    }
-  }
-
-  const loadRecheckCampaign = async (campaignId = recheckCampaign?.campaign_id || '', statusValue = recheckStatusFilter) => {
-    setRecheckLoading(true)
-    try {
-      const path = campaignId
-        ? `/icloud-hme/recheck/campaigns/${encodeURIComponent(String(campaignId))}`
-        : '/icloud-hme/recheck/current'
-      const params = new URLSearchParams({ page: '1', size: '8' })
-      if (statusValue) params.set('status', statusValue)
-      const data = await apiFetch(`${path}?${params.toString()}`)
-      setRecheckCampaign(data || null)
-    } catch {
-      setRecheckCampaign(null)
-    } finally {
-      setRecheckLoading(false)
-    }
-  }
-
-  const loadAliases = async (
-    nextPage = page,
-    nextPageSize = pageSize,
-    nextOnlyReadyView = onlyReadyView,
-    nextStatus = statusFilter,
-    nextEnabled = enabledFilter,
-    nextSource = sourceFilter,
-    nextSearchHme = searchHme,
-  ) => {
-    setLoading(true)
-    try {
-      const values = form.getFieldsValue(true)
-      const currentForwardTo = String(values.icloud_forward_to || 'b@cccy.me').trim() || 'b@cccy.me'
-      const params = new URLSearchParams({
-        page: String(nextPage),
-        size: String(nextPageSize),
-        purpose: 'chatgpt_register',
-        bound_service: 'chatgpt',
-      })
-      if (nextOnlyReadyView) {
-        params.set('ready_only', 'true')
-        params.set('forward_to', currentForwardTo)
-      }
-      if (nextStatus) params.set('status', nextStatus)
-      if (nextEnabled) params.set('enabled', nextEnabled)
-      if (nextSource) params.set('created_source', nextSource)
-      if (String(nextSearchHme || '').trim()) params.set('hme', String(nextSearchHme || '').trim())
-
-      const data = await apiFetch(`/icloud-hme/aliases?${params.toString()}`)
-      setAliases(Array.isArray(data?.data) ? data.data : [])
-      setTotal(Number(data?.total || 0) || 0)
-      setAvailableImportPoolCount(Number(data?.available_import_pool_count || 0) || 0)
-      setPage(Number(data?.page || nextPage) || 1)
-      setPageSize(Number(data?.size || nextPageSize) || nextPageSize)
-      loadAutoPoolStatus().catch(() => {})
-      loadArchiveStatus().catch(() => {})
-      loadAutoDeleteStatus().catch(() => {})
-    } catch (e: any) {
-      message.error(e?.message || '读取 iCloud HME 别名失败')
-    } finally {
-      setLoading(false)
-    }
-  }
-
-  useEffect(() => {
-    loadAliases().catch(() => {})
-    loadAutoPoolStatus().catch(() => {})
-    loadArchiveStatus().catch(() => {})
-    loadAutoDeleteStatus().catch(() => {})
-    loadRecheckCampaign().catch(() => {})
-  }, [])
-
-  const runArchiveCleanup = async () => {
-    setArchiveRunning(true)
-    try {
-      const result = await apiFetch('/tempmail-archive/run', {
-        method: 'POST',
-        body: JSON.stringify({
-          force: true,
-          ignore_active_tasks: false,
-          delete: true,
-        }),
-      })
-      setArchiveStatus((prev) => ({
-        ...(prev || {}),
-        last_result: result || {},
-        last_error: String(result?.error || result?.last_error || ''),
-      }))
-      if (result?.reason === 'active_tasks') {
-        message.warning(`当前有 ${Number(result?.active_task_count || 0)} 个活跃任务，已跳过清理`)
-      } else if (result?.ok) {
-        message.success(`归档清理完成：归档 ${Number(result?.archived || 0)} 封，删除 ${Number(result?.deleted || 0)} 封`)
-      } else {
-        message.warning(result?.error || '归档清理已执行，但存在未完成项')
-      }
-      await loadArchiveStatus()
-    } catch (e: any) {
-      message.error(e?.message || '归档清理失败')
-    } finally {
-      setArchiveRunning(false)
-    }
-  }
-
-  const previewDeletion = async () => {
-    setPreviewLoading(true)
-    try {
-      const data = await apiFetch('/icloud-hme/deletion-preview')
-      setPreviewData(data || null)
-      setPreviewOpen(true)
-    } catch (e: any) {
-      message.error(e?.message || '扫描未使用别名失败')
-    } finally {
-      setPreviewLoading(false)
-    }
-  }
-
-  const resetAliasesForRerun = async () => {
-    const values = form.getFieldsValue(true)
-    const forwardTo = String(values.icloud_forward_to || 'b@cccy.me').trim() || 'b@cccy.me'
-    setRerunResetting(true)
-    try {
-      const result = await apiFetch('/icloud-hme/aliases/reset-rerun', {
-        method: 'POST',
-        body: JSON.stringify({
-          forward_to: forwardTo,
-          purpose: 'chatgpt_register',
-          bound_service: 'chatgpt',
-          include_in_flight: false,
-          include_ready_stock: false,
-          reset_existing_queue: true,
-          dry_run: false,
-        }),
-      })
-      const campaignId = String(result?.campaign_id || '').trim()
-      setRecheckCampaign({
-        campaign_id: campaignId,
-        summary: result?.summary || {},
-        data: [],
-        total: Number(result?.summary?.total || 0),
-      })
-      message.success(`已重置到导入池：${Number(result?.reset || 0)} 个，创建进度批次 ${campaignId || '-'}`)
-      await loadAliases(1, pageSize)
-      await loadRecheckCampaign(campaignId)
-    } catch (e: any) {
-      message.error(e?.message || '重置 HME 到导入池失败')
-    } finally {
-      setRerunResetting(false)
-    }
-  }
-
-  const confirmResetAliasesForRerun = () => {
-    Modal.confirm({
-      title: '重置已领取 HME 到导入池',
-      content: (
-        <div>
-          <div>会把当前转发邮箱下已领取/已使用的 HME 本地恢复为可领取库存。</div>
-          <div style={{ marginTop: 8 }}>重置后请到注册面板继续选择「iCloud HME」和「仅导入池」，分批重新跑。</div>
-          <div style={{ color: '#cf1322', marginTop: 8 }}>
-            本动作只改本地状态，不调用 Apple 停用/删除，也不删除 ChatGPT 账号。明确 account_deleted/account_deactivated 后只会标记待删除。
-          </div>
-        </div>
-      ),
-      okText: '确认重置',
-      cancelText: '取消',
-      onOk: resetAliasesForRerun,
-    })
-  }
-
-  const executeAutoDelete = async () => {
-    setAutoDeleteRunning(true)
-    try {
-      const result = await apiFetch('/icloud-hme/auto-delete/run', {
-        method: 'POST',
-        body: JSON.stringify({ force: true, ignore_active_tasks: false, delete: true }),
-      })
-      if (result?.reason === 'active_tasks') {
-        message.warning(`当前有 ${Number(result?.active_task_count || 0)} 个活跃任务，已跳过删除`)
-      } else if (result?.reason === 'rate_limit_backoff') {
-        message.warning('当前处于限流退避中，已跳过本轮删除')
-      } else if (result?.reason === 'disabled') {
-        message.warning('自动删除未开启（手动执行已被拦截）')
-      } else if (result?.ok) {
-        message.success(`删除完成：测活 ${Number(result?.rechecked || 0)} 个，存活保留 ${Number(result?.kept_alive || 0)} 个，删除 ${Number(result?.deleted || 0)} 个，跳过 ${Number(result?.skipped || 0)} 个`)
-      } else {
-        message.warning(result?.error || `删除已执行：删除 ${Number(result?.deleted || 0)} 个，存在未完成项`)
-      }
-      setPreviewOpen(false)
-      await loadAutoDeleteStatus()
-      await loadAliases()
-    } catch (e: any) {
-      message.error(e?.message || '删除执行失败')
-    } finally {
-      setAutoDeleteRunning(false)
-    }
-  }
-
-  const runAutoDelete = async () => {
-    const summary = autoDeleteStatus?.candidate_summary || {}
-    const orphan = Number(summary.orphan || 0) || 0
-    const boundInvalid = Number(summary.bound_invalid || 0) || 0
-    Modal.confirm({
-      title: '立即删除未使用/失效别名',
-      content: (
-        <div>
-          <div>候选：孤儿别名 {orphan} 个、失效绑定 {boundInvalid} 个。每个删除前都会先免密登录测活：能登录的视为存活、保留并重新导入账号列表，只删确认失效的。</div>
-          <div style={{ color: '#cf1322', marginTop: 8 }}>
-            删除会在 Apple 端 deactivate + delete，不可恢复；测活是真实登录、较慢，受单次上限限制，超出的留到下一轮。
-          </div>
-        </div>
-      ),
-      okText: '确认删除',
-      okButtonProps: { danger: true },
-      cancelText: '取消',
-      onOk: executeAutoDelete,
-    })
-  }
-
-  const syncLiveAliases = async (pruneMissing = false) => {
-    const values = form.getFieldsValue(true)
-    const payload = {
-      icloud_cookie: String(values.icloud_cookie || '').trim(),
-      icloud_domain_base: String(values.icloud_domain_base || 'icloud.com').trim() || 'icloud.com',
-      forward_to: String(values.icloud_forward_to || 'b@cccy.me').trim() || 'b@cccy.me',
-      purpose: 'chatgpt_register',
-      bound_service: 'chatgpt',
-      prune_missing: pruneMissing,
-      dry_run: false,
-    }
-    if (!payload.icloud_cookie) {
-      message.error('请先填写 iCloud Cookie')
-      return
-    }
-    setSyncing(true)
-    try {
-      const result = await apiFetch('/icloud-hme/sync-live', {
-        method: 'POST',
-        body: JSON.stringify(payload),
-      })
-      const pruned = Number(result?.prune?.deleted || 0)
-      const inserted = Number(result?.result?.inserted || 0)
-      const updated = Number(result?.result?.updated || 0)
-      message.success(
-        pruneMissing
-          ? `同步完成：官网 ${Number(result?.synced_count || 0)} 条，新增 ${inserted}，更新 ${updated}，清理本地多余 ${pruned} 条`
-          : `同步完成：${Number(result?.synced_count || 0)} 条`
-      )
-      await loadAliases(1, pageSize)
-    } catch (e: any) {
-      message.error(e?.message || '同步 iCloud 官网别名失败')
-    } finally {
-      setSyncing(false)
-    }
-  }
-
-  const syncLiveAliasesAndPrune = () => {
-    Modal.confirm({
-      title: '同步并清理本地多余别名',
-      content: (
-        <div>
-          <div>将先读取 iCloud 官网当前 HME 别名列表，然后删除本地别名池中“官网已不存在”的记录。</div>
-          <div style={{ color: '#cf1322', marginTop: 8 }}>
-            只清理本地 iCloud HME 别名池，不删除 ChatGPT 账号，也不会调用 Apple 端 delete。
-          </div>
-        </div>
-      ),
-      okText: '同步并清理',
-      okButtonProps: { danger: true },
-      cancelText: '取消',
-      onOk: async () => {
-        setSyncPruning(true)
-        try {
-          await syncLiveAliases(true)
-        } finally {
-          setSyncPruning(false)
-        }
-      },
-    })
-  }
-
-  const bulkEnableAvailableAliases = async () => {
-    const values = form.getFieldsValue(true)
-    const forwardTo = String(values.icloud_forward_to || 'b@cccy.me').trim() || 'b@cccy.me'
-    setBulkEnabling(true)
-    try {
-      const result = await apiFetch('/icloud-hme/aliases/bulk-enable', {
-        method: 'POST',
-        body: JSON.stringify({
-          forward_to: forwardTo,
-          only_manual_created: false,
-          only_unused: true,
-        }),
-      })
-      message.success(
-        `批量启用完成：命中 ${Number(result?.matched || 0)} 条，新启用 ${Number(result?.enabled || 0)} 条，恢复普通失败 ${Number(result?.recycled || 0)} 条；账号已禁用/死号不会回收`
-      )
-      await loadAliases(page, pageSize)
-    } catch (e: any) {
-      message.error(e?.message || '批量启用失败')
-    } finally {
-      setBulkEnabling(false)
-    }
-  }
-
-  const switchToImportPoolMode = async () => {
-    const values = form.getFieldsValue(true)
-    const nextValues = {
-      ...values,
-      icloud_hme_mode: 'import_pool',
-    }
-    setSwitchingMode(true)
-    try {
-      await apiFetch('/config', {
-        method: 'PUT',
-        body: JSON.stringify({ data: nextValues }),
-      })
-      form.setFieldsValue({ icloud_hme_mode: 'import_pool' })
-      message.success('已切换到 import_pool 模式')
-    } catch (e: any) {
-      message.error(e?.message || '切换 import_pool 模式失败')
-    } finally {
-      setSwitchingMode(false)
-    }
-  }
-
-  const bulkDisableUsedAliases = async () => {
-    const values = form.getFieldsValue(true)
-    const forwardTo = String(values.icloud_forward_to || 'b@cccy.me').trim() || 'b@cccy.me'
-    setBulkDisablingUsed(true)
-    try {
-      const result = await apiFetch('/icloud-hme/aliases/bulk-disable-used', {
-        method: 'POST',
-        body: JSON.stringify({
-          forward_to: forwardTo,
-        }),
-      })
-      message.success(`批量停用完成：命中 ${Number(result?.matched || 0)} 条，新停用 ${Number(result?.disabled || 0)} 条`)
-      await loadAliases(page, pageSize)
-    } catch (e: any) {
-      message.error(e?.message || '批量停用失败')
-    } finally {
-      setBulkDisablingUsed(false)
-    }
-  }
-
-  const toggleAliasEnabled = async (anonymousId: string, enabled: boolean) => {
-    if (!anonymousId) return
-    setTogglingId(anonymousId)
-    try {
-      await apiFetch(`/icloud-hme/aliases/${encodeURIComponent(anonymousId)}/enabled`, {
-        method: 'POST',
-        body: JSON.stringify({ enabled }),
-      })
-      message.success(enabled ? '已启用到邮箱池' : '已从邮箱池停用')
-      await loadAliases(page, pageSize)
-    } catch (e: any) {
-      message.error(e?.message || '切换启用状态失败')
-    } finally {
-      setTogglingId('')
-    }
-  }
-
-  const copyText = async (item: any) => {
-    const anonymousId = String(item?.anonymous_id || '').trim()
-    const value = String(item?.hme || '').trim()
-    if (!value) return
-    setTogglingId(anonymousId)
-    try {
-      await navigator.clipboard.writeText(value)
-      if (anonymousId) {
-        await apiFetch(`/icloud-hme/aliases/${encodeURIComponent(anonymousId)}/mark-used`, {
-          method: 'POST',
-          body: JSON.stringify({ note: 'manually_copied' }),
-        })
-      }
-      message.success('已复制，并标记为已使用')
-      await loadAliases(page, pageSize)
-    } catch {
-      message.error('复制失败')
-    } finally {
-      setTogglingId('')
-    }
-  }
-
-  const columns = [
-    {
-      title: '标签 / 地址',
-      key: 'alias',
-      render: (_: any, item: any) => (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-          <Space size={6}>
-            <Typography.Text strong>{String(item.label || '-')}</Typography.Text>
-          </Space>
-          <Space size={6}>
-            <Typography.Text style={{ fontFamily: 'monospace' }}>{String(item.hme || '')}</Typography.Text>
-            <Button
-              size="small"
-              type="text"
-              icon={<CopyOutlined />}
-              loading={togglingId === String(item.anonymous_id || '')}
-              onClick={() => copyText(item)}
-            />
-          </Space>
-        </div>
-      ),
-    },
-    {
-      title: '来源',
-      key: 'source',
-      width: 140,
-      render: (_: any, item: any) => (
-        <Tag color={item.is_manual_created ? 'blue' : 'purple'}>
-          {item.is_manual_created ? '手动创建' : '系统创建'}
-        </Tag>
-      ),
-    },
-    {
-      title: '使用状态',
-      key: 'used',
-      width: 170,
-      render: (_: any, item: any) => {
-        if (item.account_disabled || String(item.status || '') === 'account_deactivated' || String(item.status || '') === 'account_disabled') {
-          return <Tag color="red">账号已禁用/死号</Tag>
-        }
-        return (
-          <Tag color={item.used_by_system ? 'orange' : 'green'}>
-            {item.used_by_system ? '系统已使用' : '系统未使用'}
-          </Tag>
-        )
-      },
-    },
-    {
-      title: '池状态',
-      key: 'status',
-      width: 150,
-      render: (_: any, item: any) => {
-        const status = String(item.status || '-')
-        const color = status === 'account_deactivated' || status === 'account_disabled'
-          ? 'red'
-          : status === 'registered'
-            ? 'green'
-            : status === 'register_failed'
-              ? 'orange'
-              : status === 'in_use'
-                ? 'blue'
-                : status === 'retired'
-                  ? 'default'
-                  : 'cyan'
-        const label = status === 'account_deactivated' || status === 'account_disabled' ? '账号已禁用' : status
-        return <Tag color={color}>{label}</Tag>
-      },
-    },
-    {
-      title: '绑定账号',
-      dataIndex: 'bound_account_email',
-      key: 'bound_account_email',
-      width: 220,
-      render: (value: string) => <Typography.Text type="secondary">{String(value || '-')}</Typography.Text>,
-    },
-    {
-      title: '使用次数',
-      dataIndex: 'use_count',
-      key: 'use_count',
-      width: 100,
-      render: (value: number) => String(value ?? 0),
-    },
-    {
-      title: '转发',
-      dataIndex: 'forward_to',
-      key: 'forward_to',
-      width: 180,
-      render: (value: string) => <Typography.Text type="secondary">{String(value || '-')}</Typography.Text>,
-    },
-    {
-      title: '操作',
-      key: 'actions',
-      width: 180,
-      render: (_: any, item: any) => (
-        <Space>
-          <Switch
-            checked={Boolean(item.enabled)}
-            checkedChildren="启用"
-            unCheckedChildren="停用"
-            disabled={Boolean(item.account_disabled) || String(item.status || '') === 'account_deactivated' || String(item.status || '') === 'account_disabled'}
-            title={Boolean(item.account_disabled) ? '账号已禁用/死号，不允许重新启用到邮箱池' : undefined}
-            loading={togglingId === String(item.anonymous_id || '')}
-            onChange={(checked) => toggleAliasEnabled(String(item.anonymous_id || ''), checked)}
-          />
-        </Space>
-      ),
-    },
-  ]
-
-  const displayedAliases = aliases
-  const statusReadyCount = Number(autoPoolStatus?.ready_count ?? availableImportPoolCount) || 0
-  const statusStockLimit = Number(autoPoolStatus?.stock_limit || 0) || 0
-  const archiveLastResult = archiveStatus?.last_result || {}
-  const archiveEmailCount = Number(archiveLastResult.email_count || 0) || 0
-  const archiveArchivedCount = Number(archiveLastResult.archived || 0) || 0
-  const archiveDeletedCount = Number(archiveLastResult.deleted || 0) || 0
-  const archiveActiveTaskCount = Number(archiveStatus?.active_task_count || archiveLastResult.active_task_count || 0) || 0
-  const autoDeleteSummary = autoDeleteStatus?.candidate_summary || {}
-  const autoDeletePending = Number(autoDeleteStatus?.pending_candidates || 0) || 0
-  const autoDeleteLastResult = autoDeleteStatus?.last_result || {}
-  const autoDeleteLastDeleted = Number(autoDeleteLastResult.deleted || 0) || 0
-  const autoDeleteLastKept = Number(autoDeleteLastResult.kept_alive || 0) || 0
-  const recheckSummary = recheckCampaign?.summary || {}
-  const recheckCampaignId = String(recheckCampaign?.campaign_id || '').trim()
-  const recheckTotal = Number(recheckSummary.total || 0) || 0
-  const recheckChecked = Number(recheckSummary.checked || 0) || 0
-  const recheckPending = Number(recheckSummary.pending || 0) || 0
-  const recheckRetry = Number(recheckSummary.retry || 0) || 0
-  const recheckAlive = Number(recheckSummary.alive || 0) || 0
-  const recheckDeleteCandidates = Number(recheckSummary.delete_candidates || recheckSummary.delete_candidate || 0) || 0
-  const recheckAccessTokenSaved = Number(recheckSummary.access_token_saved || 0) || 0
-
-  return (
-    <Card
-      title="iCloud HME 已创建邮箱"
-      extra={(
-        <Space>
-          <Tag color="blue">总数: {total}</Tag>
-          <Tag color="geekblue">当前显示: {displayedAliases.length}</Tag>
-          <Button loading={bulkDisablingUsed} onClick={bulkDisableUsedAliases}>
-            批量停用系统已使用别名
-          </Button>
-          <Button loading={switchingMode} onClick={switchToImportPoolMode}>
-            一键切换 import_pool
-          </Button>
-          <Button loading={bulkEnabling} onClick={bulkEnableAvailableAliases}>
-            批量启用可用官网别名
-          </Button>
-          <Button danger loading={syncPruning} onClick={syncLiveAliasesAndPrune}>
-            同步并清理多余
-          </Button>
-          <Button icon={<SyncOutlined />} loading={(syncing || loading) && !syncPruning} onClick={() => syncLiveAliases(false)}>
-            同步官网别名
-          </Button>
-        </Space>
-      )}
-      style={{ marginBottom: 16 }}
-    >
-      <Alert
-        type="info"
-        showIcon
-        style={{ marginBottom: 16 }}
-        message="来源与使用状态说明"
-        description="手动创建表示该别名来自 iCloud 官网同步；系统创建表示它由当前系统 live create 或导入消费链路落库。只有启用到邮箱池的别名，才会被 import_pool / prefer_import 模式拿去注册。系统已使用的别名仅作历史标记，不代表当前自动再次复用。register_failed 的官网别名可通过批量启用恢复回可用池。"
-      />
-      <div
-        style={{
-          marginBottom: 16,
-          padding: 12,
-          border: '1px solid rgba(24, 144, 255, 0.18)',
-          borderRadius: 8,
-          background: 'rgba(24, 144, 255, 0.04)',
-        }}
-      >
-        <Space wrap size={[8, 8]} style={{ width: '100%', justifyContent: 'space-between' }}>
-          <Space wrap>
-            <Tag color={autoPoolStatus?.enabled ? 'green' : 'default'}>
-              自动补池: {autoPoolStatus?.enabled ? '开启' : '关闭'}
-            </Tag>
-            <Tag color={autoPoolStatus?.running ? 'blue' : 'default'}>
-              调度线程: {autoPoolStatus?.running ? '运行中' : '未运行'}
-            </Tag>
-            <Tag color={autoPoolStatus?.in_rate_limit_backoff ? 'red' : 'cyan'}>
-              {autoPoolStatus?.in_rate_limit_backoff ? '限流等待中' : '未限流'}
-            </Tag>
-            <Tag color={autoPoolStatus?.in_error_backoff ? 'orange' : 'cyan'}>
-              {autoPoolStatus?.in_error_backoff ? '错误短退避中' : '无错误退避'}
-            </Tag>
-            <Tag color={statusStockLimit > 0 && statusReadyCount >= statusStockLimit ? 'gold' : 'green'}>
-              库存: {statusReadyCount}/{statusStockLimit || '-'}
-            </Tag>
-          </Space>
-          <Button size="small" loading={autoPoolStatusLoading} onClick={() => loadAutoPoolStatus()}>
-            刷新自动补池状态
-          </Button>
-        </Space>
-        <Space wrap size={[16, 6]} style={{ marginTop: 8 }}>
-          <Typography.Text type="secondary">
-            下次创建: {formatDateTimeText(autoPoolStatus?.next_run_at)}
-          </Typography.Text>
-          <Typography.Text type="secondary">
-            剩余: {formatDurationText(autoPoolStatus?.seconds_until_next_run)}
-          </Typography.Text>
-          <Typography.Text type="secondary">
-            随机间隔: {autoPoolStatus?.interval_min_minutes || '-'} - {autoPoolStatus?.interval_max_minutes || '-'} 分钟
-          </Typography.Text>
-          <Typography.Text type="secondary">
-            限流延长: {autoPoolStatus?.rate_limit_backoff_minutes || '-'} 分钟
-          </Typography.Text>
-          <Typography.Text type="secondary">
-            错误短退避: {autoPoolStatus?.error_backoff_minutes ?? '-'} 分钟
-          </Typography.Text>
-          <Typography.Text type="secondary">
-            退避到: {formatDateTimeText(autoPoolStatus?.rate_limit_until || autoPoolStatus?.error_backoff_until)}
-          </Typography.Text>
-          <Typography.Text type="secondary">
-            最近创建: {autoPoolStatus?.last_created_hme || '-'}
-          </Typography.Text>
-          <Typography.Text type={autoPoolStatus?.last_error ? 'danger' : 'secondary'}>
-            最近错误: {autoPoolStatus?.last_error || '-'}
-          </Typography.Text>
-        </Space>
-      </div>
-      <div
-        style={{
-          marginBottom: 16,
-          padding: 12,
-          border: '1px solid rgba(114, 46, 209, 0.22)',
-          borderRadius: 8,
-          background: 'rgba(114, 46, 209, 0.04)',
-        }}
-      >
-        <Space wrap size={[8, 8]} style={{ width: '100%', justifyContent: 'space-between' }}>
-          <Space wrap>
-            <Tag color={recheckCampaignId ? 'purple' : 'default'}>
-              重跑批次: {recheckCampaignId || '未创建'}
-            </Tag>
-            <Tag color="blue">总数: {recheckTotal || '-'}</Tag>
-            <Tag color={recheckPending > 0 ? 'gold' : 'green'}>未跑: {recheckPending}</Tag>
-            <Tag color="green">存活: {recheckAlive}</Tag>
-            <Tag color={recheckDeleteCandidates > 0 ? 'volcano' : 'default'}>
-              待删除标记: {recheckDeleteCandidates}
-            </Tag>
-            <Tag color={recheckRetry > 0 ? 'orange' : 'default'}>待重试: {recheckRetry}</Tag>
-            <Tag color="cyan">AT保存: {recheckAccessTokenSaved}</Tag>
-          </Space>
-          <Space wrap>
-            <Button size="small" loading={recheckLoading} onClick={() => loadRecheckCampaign()}>
-              刷新进度
-            </Button>
-            <Button size="small" loading={rerunResetting} onClick={confirmResetAliasesForRerun}>
-              重置已领取到导入池
-            </Button>
-          </Space>
-        </Space>
-        <Alert
-          type="info"
-          showIcon
-          style={{ marginTop: 10, marginBottom: 10 }}
-          message="重置后走原注册面板分批重跑"
-          description="这里显示重跑进度；先把已领取 HME 重置回导入池，然后到注册面板选择「iCloud HME」并使用「仅导入池」模式分批跑。存活账号会重新保存 access_token；明确 account_deleted/account_deactivated 只标记待删除，真正 Apple 停用/删除仍走下面原来的自动删除模块。"
-        />
-        <Space wrap size={[12, 8]}>
-          <Typography.Text type="secondary">
-            已跑: {recheckChecked}/{recheckTotal || 0}
-          </Typography.Text>
-          <Typography.Text type="secondary">
-            继续分批重跑请使用注册面板：邮箱服务 iCloud HME，模式仅导入池。
-          </Typography.Text>
-        </Space>
-        <Space wrap style={{ marginTop: 10, marginBottom: 8 }}>
-          <Select
-            allowClear
-            size="small"
-            placeholder="重跑状态"
-            style={{ width: 150 }}
-            value={recheckStatusFilter || undefined}
-            onChange={(value) => {
-              const nextValue = String(value || '')
-              setRecheckStatusFilter(nextValue)
-              loadRecheckCampaign(recheckCampaignId, nextValue).catch(() => {})
-            }}
-            options={[
-              { label: 'pending', value: 'pending' },
-              { label: 'running', value: 'running' },
-              { label: 'alive', value: 'alive' },
-              { label: 'delete_candidate', value: 'delete_candidate' },
-              { label: 'retry', value: 'retry' },
-              { label: 'dead_kept', value: 'dead_kept' },
-              { label: 'skipped', value: 'skipped' },
-            ]}
-          />
-        </Space>
-        <Table
-          size="small"
-          rowKey={(r: any) => String(r.id || r.anonymous_id || r.hme)}
-          loading={recheckLoading}
-          pagination={false}
-          dataSource={Array.isArray(recheckCampaign?.data) ? recheckCampaign.data : []}
-          columns={[
-            {
-              title: '邮箱',
-              dataIndex: 'hme',
-              key: 'hme',
-              render: (v: string) => <Typography.Text copyable style={{ fontFamily: 'monospace' }}>{v}</Typography.Text>,
-            },
-            {
-              title: '状态',
-              dataIndex: 'status',
-              key: 'status',
-              width: 130,
-              render: (v: string) => {
-                const value = String(v || '')
-                const color = value === 'alive' ? 'green' : value === 'delete_candidate' ? 'volcano' : value === 'retry' ? 'orange' : 'default'
-                return <Tag color={color}>{value || '-'}</Tag>
-              },
-            },
-            { title: '结果', dataIndex: 'result_code', key: 'result_code', width: 150, render: (v: string) => v || '-' },
-            {
-              title: '待删除',
-              dataIndex: 'delete_candidate',
-              key: 'delete_candidate',
-              width: 90,
-              render: (v: boolean) => <Tag color={v ? 'volcano' : 'default'}>{v ? '是' : '否'}</Tag>,
-            },
-            { title: '保存账号', dataIndex: 'saved_account_id', key: 'saved_account_id', width: 100, render: (v: number) => v || '-' },
-            { title: '重跑时间', dataIndex: 'checked_at', key: 'checked_at', width: 180, render: (v: string) => formatDateTimeText(v) },
-          ]}
-        />
-      </div>
-      <div
-        style={{
-          marginBottom: 16,
-          padding: 12,
-          border: '1px solid rgba(82, 196, 26, 0.22)',
-          borderRadius: 8,
-          background: 'rgba(82, 196, 26, 0.04)',
-        }}
-      >
-        <Space wrap size={[8, 8]} style={{ width: '100%', justifyContent: 'space-between' }}>
-          <Space wrap>
-            <Tag color={archiveStatus?.enabled ? 'green' : 'default'}>
-              归档清理: {archiveStatus?.enabled ? '开启' : '关闭'}
-            </Tag>
-            <Tag color={archiveStatus?.running ? 'blue' : 'default'}>
-              调度线程: {archiveStatus?.running ? '运行中' : '未运行'}
-            </Tag>
-            <Tag color={archiveActiveTaskCount > 0 ? 'gold' : 'green'}>
-              活跃任务: {archiveActiveTaskCount}
-            </Tag>
-            <Tag color="cyan">最近扫描: {archiveEmailCount || '-'}</Tag>
-            <Tag color="geekblue">归档: {archiveArchivedCount || '-'}</Tag>
-            <Tag color="purple">删除: {archiveDeletedCount || '-'}</Tag>
-          </Space>
-          <Space wrap>
-            <Button size="small" loading={archiveStatusLoading} onClick={() => loadArchiveStatus()}>
-              刷新归档状态
-            </Button>
-            <Button size="small" type="primary" loading={archiveRunning} onClick={runArchiveCleanup}>
-              立即归档清理
-            </Button>
-          </Space>
-        </Space>
-        <Space wrap size={[16, 6]} style={{ marginTop: 8 }}>
-          <Typography.Text type="secondary">
-            归档邮箱: {archiveStatus?.mailbox || '-'}
-          </Typography.Text>
-          <Typography.Text type="secondary">
-            下次清理: {formatDateTimeText(archiveStatus?.next_run_at)}
-          </Typography.Text>
-          <Typography.Text type="secondary">
-            剩余: {formatDurationText(archiveStatus?.seconds_until_next_run)}
-          </Typography.Text>
-          <Typography.Text type="secondary">
-            保留最近: {archiveStatus?.keep_recent_minutes || '-'} 分钟
-          </Typography.Text>
-          <Typography.Text type="secondary">
-            触发阈值: {archiveStatus?.threshold || '-'} 封
-          </Typography.Text>
-          <Typography.Text type="secondary">
-            备份: {archiveStatus?.backup_path || '-'}
-          </Typography.Text>
-          <Typography.Text type={archiveStatus?.last_error ? 'danger' : 'secondary'}>
-            最近错误: {archiveStatus?.last_error || '-'}
-          </Typography.Text>
-        </Space>
-      </div>
-      <div
-        style={{
-          marginBottom: 16,
-          padding: 12,
-          border: '1px solid rgba(245, 34, 45, 0.20)',
-          borderRadius: 8,
-          background: 'rgba(245, 34, 45, 0.04)',
-        }}
-      >
-        <Space wrap size={[8, 8]} style={{ width: '100%', justifyContent: 'space-between' }}>
-          <Space wrap>
-            <Tag color={autoDeleteStatus?.enabled ? 'green' : 'default'}>
-              自动删除: {autoDeleteStatus?.enabled ? '开启' : '关闭'}
-            </Tag>
-            <Tag color={autoDeleteStatus?.running ? 'blue' : 'default'}>
-              调度线程: {autoDeleteStatus?.running ? '运行中' : '未运行'}
-            </Tag>
-            <Tag color={autoDeleteStatus?.in_rate_limit_backoff ? 'red' : 'cyan'}>
-              {autoDeleteStatus?.in_rate_limit_backoff ? '限流等待中' : '未限流'}
-            </Tag>
-            <Tag color={autoDeleteStatus?.recheck_before_delete ? 'geekblue' : 'default'}>
-              删前测活: {autoDeleteStatus?.recheck_before_delete ? '是' : '否'}
-            </Tag>
-            <Tag color={autoDeletePending > 0 ? 'volcano' : 'green'}>
-              待测候选: {autoDeletePending}（孤儿 {Number(autoDeleteSummary.orphan || 0)} / 失效绑定 {Number(autoDeleteSummary.bound_invalid || 0)}）
-            </Tag>
-            <Tag color={autoDeleteStatus?.in_rate_limit_backoff ? 'red' : 'cyan'}>
-              {autoDeleteStatus?.in_rate_limit_backoff ? '限流等待中' : '未限流'}
-            </Tag>
-            <Tag color={autoDeleteStatus?.in_error_backoff ? 'orange' : 'cyan'}>
-              {autoDeleteStatus?.in_error_backoff ? '错误短退避中' : '无错误退避'}
-            </Tag>
-          </Space>
-          <Space wrap>
-            <Button size="small" loading={autoDeleteStatusLoading} onClick={() => loadAutoDeleteStatus()}>
-              刷新删除状态
-            </Button>
-            <Button size="small" loading={previewLoading} onClick={previewDeletion}>
-              扫描预览
-            </Button>
-            <Button size="small" danger type="primary" loading={autoDeleteRunning} onClick={runAutoDelete}>
-              立即删除
-            </Button>
-          </Space>
-        </Space>
-        <Space wrap size={[16, 6]} style={{ marginTop: 8 }}>
-          <Typography.Text type="secondary">
-            单次上限: {autoDeleteStatus?.max_per_run || '-'}
-          </Typography.Text>
-          <Typography.Text type="secondary">
-            账号间隔: {autoDeleteStatus?.account_interval_min_minutes ?? '-'} - {autoDeleteStatus?.account_interval_max_minutes ?? '-'} 分钟
-          </Typography.Text>
-          <Typography.Text type="secondary">
-            限流延长: {autoDeleteStatus?.rate_limit_backoff_minutes || '-'} 分钟
-          </Typography.Text>
-          <Typography.Text type="secondary">
-            错误短退避: {autoDeleteStatus?.error_backoff_minutes ?? '-'} 分钟
-          </Typography.Text>
-          <Typography.Text type="secondary">
-            退避到: {formatDateTimeText(autoDeleteStatus?.rate_limit_until || autoDeleteStatus?.error_backoff_until)}
-          </Typography.Text>
-          <Typography.Text type="secondary">
-            上轮删除: {autoDeleteLastDeleted}
-          </Typography.Text>
-          <Typography.Text type="secondary">
-            上轮存活保留: {autoDeleteLastKept}
-          </Typography.Text>
-          <Typography.Text type={autoDeleteStatus?.last_error ? 'danger' : 'secondary'}>
-            最近错误: {autoDeleteStatus?.last_error || '-'}
-          </Typography.Text>
-        </Space>
-      </div>
-      <Modal
-        open={previewOpen}
-        title="未使用/失效别名预览"
-        width={760}
-        onCancel={() => setPreviewOpen(false)}
-        footer={(
-          <Space>
-            <Button onClick={() => setPreviewOpen(false)}>关闭</Button>
-            <Button danger type="primary" loading={autoDeleteRunning} onClick={executeAutoDelete}>
-              立即删除
-            </Button>
-          </Space>
-        )}
-      >
-        {previewData ? (
-          <div>
-            <Space wrap style={{ marginBottom: 12 }}>
-              <Tag color="volcano">孤儿(不在账号里): {(previewData.orphan || []).length}</Tag>
-              <Tag color="orange">失效绑定(需测活): {(previewData.bound_invalid || []).length}</Tag>
-              <Tag color="green">受保护: {Number(previewData.protected_count || 0)}</Tag>
-              <Tag color="blue">别名总数: {Number(previewData.total || 0)}</Tag>
-            </Space>
-            <Alert
-              type="warning"
-              showIcon
-              style={{ marginBottom: 12 }}
-              message="所有候选删除前都会先免密登录测活：能登录的视为存活、保留并重新导入账号列表；只删确认失效（账号被删/停用）的。删除不可恢复，受单次上限限制。"
-            />
-            <Table
-              size="small"
-              rowKey={(r: any) => String(r.anonymous_id || r.hme)}
-              pagination={{ pageSize: 8 }}
-              dataSource={[...(previewData.orphan || []), ...(previewData.bound_invalid || [])]}
-              columns={[
-                {
-                  title: '邮箱',
-                  dataIndex: 'hme',
-                  key: 'hme',
-                  render: (v: string) => (
-                    <Typography.Text copyable style={{ fontFamily: 'monospace' }}>{v}</Typography.Text>
-                  ),
-                },
-                {
-                  title: '类型',
-                  dataIndex: 'disposition',
-                  key: 'disposition',
-                  width: 110,
-                  render: (v: string) =>
-                    v === 'orphan' ? <Tag color="volcano">孤儿</Tag> : <Tag color="orange">失效绑定</Tag>,
-                },
-                { title: '别名状态', dataIndex: 'status', key: 'status', width: 100 },
-                {
-                  title: '绑定账号',
-                  dataIndex: 'bound_account_email',
-                  key: 'bound_account_email',
-                  render: (v: string) => v || '-',
-                },
-              ]}
-            />
-          </div>
-        ) : (
-          <Typography.Text type="secondary">暂无数据</Typography.Text>
-        )}
-      </Modal>
-      <Space wrap style={{ marginBottom: 12 }}>
-        <Tag color="green">导入池可用账号: {availableImportPoolCount}</Tag>
-        <Typography.Text type="secondary">
-          按当前转发邮箱统计，表示 import_pool / prefer_import 实际还能领取去注册的邮箱数量
-        </Typography.Text>
-      </Space>
-      <Space wrap style={{ marginBottom: 12 }}>
-        <Switch
-          checked={onlyReadyView}
-          checkedChildren="只看可注册"
-          unCheckedChildren="显示全部"
-          onChange={(checked) => {
-            setOnlyReadyView(checked)
-            setPage(1)
-            loadAliases(1, pageSize, checked, statusFilter, enabledFilter, sourceFilter, searchHme).catch(() => {})
-          }}
-        />
-        <Select
-          allowClear
-          placeholder="状态"
-          style={{ width: 140 }}
-          value={statusFilter || undefined}
-          onChange={(value) => {
-            const nextValue = String(value || '')
-            setStatusFilter(nextValue)
-            setPage(1)
-            loadAliases(1, pageSize, onlyReadyView, nextValue, enabledFilter, sourceFilter, searchHme).catch(() => {})
-          }}
-          options={[
-            { label: 'reserved', value: 'reserved' },
-            { label: 'in_use', value: 'in_use' },
-            { label: 'registered', value: 'registered' },
-            { label: 'register_failed', value: 'register_failed' },
-            { label: '账号已禁用/死号', value: 'account_deactivated' },
-            { label: 'retired', value: 'retired' },
-          ]}
-        />
-        <Select
-          allowClear
-          placeholder="启用状态"
-          style={{ width: 140 }}
-          value={enabledFilter || undefined}
-          onChange={(value) => {
-            const nextValue = String(value || '')
-            setEnabledFilter(nextValue)
-            setPage(1)
-            loadAliases(1, pageSize, onlyReadyView, statusFilter, nextValue, sourceFilter, searchHme).catch(() => {})
-          }}
-          options={[
-            { label: '已启用', value: 'enabled' },
-            { label: '已停用', value: 'disabled' },
-          ]}
-        />
-        <Select
-          allowClear
-          placeholder="来源"
-          style={{ width: 140 }}
-          value={sourceFilter || undefined}
-          onChange={(value) => {
-            const nextValue = String(value || '')
-            setSourceFilter(nextValue)
-            setPage(1)
-            loadAliases(1, pageSize, onlyReadyView, statusFilter, enabledFilter, nextValue, searchHme).catch(() => {})
-          }}
-          options={[
-            { label: '手动创建', value: 'manual_created' },
-            { label: '系统创建', value: 'live_create' },
-            { label: 'CSV 导入', value: 'csv_import' },
-          ]}
-        />
-        <Input.Search
-          allowClear
-          placeholder="搜索邮箱地址"
-          style={{ width: 220 }}
-          value={searchHme}
-          onChange={(event) => setSearchHme(event.target.value)}
-          onSearch={(value) => {
-            const nextValue = String(value || '')
-            setSearchHme(nextValue)
-            setPage(1)
-            loadAliases(1, pageSize, onlyReadyView, statusFilter, enabledFilter, sourceFilter, nextValue).catch(() => {})
-          }}
-        />
-      </Space>
-      <Table
-        rowKey={(item) => String(item.anonymous_id || item.id)}
-        loading={loading}
-        columns={columns}
-        dataSource={displayedAliases}
-        pagination={{
-          current: page,
-          pageSize,
-          total,
-          showSizeChanger: true,
-          pageSizeOptions: ['20', '50', '100'],
-          onChange: (nextPage, nextPageSize) => {
-            loadAliases(nextPage, nextPageSize, onlyReadyView, statusFilter, enabledFilter, sourceFilter, searchHme).catch(() => {})
-          },
-        }}
-        locale={{ emptyText: '还没有同步到任何 iCloud HME 别名。' }}
-        scroll={{ x: 1100, y: '60vh' }}
-      />
-    </Card>
-  )
-}
-
 type TotpSetupState = 'idle' | 'setup'
 type AuthStatus = {
   has_password: boolean
@@ -3736,8 +2453,6 @@ export default function Settings() {
   const selectedMailProvider = Form.useWatch('mail_provider', form) || 'luckmail'
   const taskProxyMode = String(Form.useWatch('task_proxy_mode', form) || 'dynamic').trim().toLowerCase()
   const taskProxyFailover = parseBooleanConfigValue(Form.useWatch('task_proxy_failover', form))
-  const icloudAutoCreateEnabled = parseBooleanConfigValue(Form.useWatch('icloud_hme_auto_create_enabled', form))
-  const icloudAutoDeleteEnabled = parseBooleanConfigValue(Form.useWatch('icloud_hme_auto_delete_enabled', form))
   const tempmailArchiveCleanupEnabled = parseBooleanConfigValue(Form.useWatch('tempmail_archive_cleanup_enabled', form))
   const isMobile = screens.md === false
 
@@ -3881,14 +2596,10 @@ export default function Settings() {
       if (!data.mail_provider) {
         data.mail_provider = 'luckmail'
       }
-      if (data.mail_provider === 'icloud_hme' && data.icloud_hme_mode === 'helper_ready_api') {
+      if (['icloud_hme', 'icloud_hme_ready', 'icloud_hme_helper_ready', 'helper_ready_api'].includes(String(data.mail_provider || '').trim().toLowerCase())) {
         data.mail_provider = 'hme_ready_api'
       }
-      if (data.mail_provider === 'hme_ready_api') {
-        data.icloud_hme_mode = 'helper_ready_api'
-      } else if (data.mail_provider === 'icloud_hme' && data.icloud_hme_mode === 'helper_ready_api') {
-        data.icloud_hme_mode = 'import_pool'
-      }
+      if (data.mail_provider === 'hme_ready_api') data.icloud_hme_mode = 'helper_ready_api'
       if (!data.applemail_base_url) {
         data.applemail_base_url = 'https://www.appleemail.top'
       }
@@ -4006,39 +2717,6 @@ export default function Settings() {
       if (!data.tempmail_platform) {
         data.tempmail_platform = 'chatgpt'
       }
-      if (!data.icloud_hme_auto_create_stock_limit) {
-        data.icloud_hme_auto_create_stock_limit = '10'
-      }
-      if (!data.icloud_hme_auto_create_interval_min_minutes) {
-        data.icloud_hme_auto_create_interval_min_minutes = '60'
-      }
-      if (!data.icloud_hme_auto_create_interval_max_minutes) {
-        data.icloud_hme_auto_create_interval_max_minutes = '120'
-      }
-      if (!data.icloud_hme_auto_create_rate_limit_backoff_minutes) {
-        data.icloud_hme_auto_create_rate_limit_backoff_minutes = '360'
-      }
-      if (!data.icloud_hme_auto_create_error_backoff_minutes) {
-        data.icloud_hme_auto_create_error_backoff_minutes = '3'
-      }
-      if (!data.icloud_hme_auto_delete_account_interval_min_minutes) {
-        data.icloud_hme_auto_delete_account_interval_min_minutes = '10'
-      }
-      if (!data.icloud_hme_auto_delete_account_interval_max_minutes) {
-        data.icloud_hme_auto_delete_account_interval_max_minutes = '30'
-      }
-      if (!data.icloud_hme_auto_delete_max_per_run) {
-        data.icloud_hme_auto_delete_max_per_run = '20'
-      }
-      if (!data.icloud_hme_auto_delete_rate_limit_backoff_minutes) {
-        data.icloud_hme_auto_delete_rate_limit_backoff_minutes = '60'
-      }
-      if (!data.icloud_hme_auto_delete_error_backoff_minutes) {
-        data.icloud_hme_auto_delete_error_backoff_minutes = '3'
-      }
-      if (!data.icloud_hme_auto_delete_dead_statuses) {
-        data.icloud_hme_auto_delete_dead_statuses = 'account_deactivated,password_invalid'
-      }
       if (!data.tempmail_archive_cleanup_interval_minutes) {
         data.tempmail_archive_cleanup_interval_minutes = '30'
       }
@@ -4055,16 +2733,6 @@ export default function Settings() {
         data.tempmail_archive_cleanup_backup_path = '/runtime/tempmail_email_backups.db'
       }
       data.tempmail_permanent = parseBooleanConfigValue(data.tempmail_permanent)
-      data.icloud_hme_auto_create_enabled = parseBooleanConfigValue(data.icloud_hme_auto_create_enabled)
-      data.icloud_hme_auto_delete_enabled = parseBooleanConfigValue(data.icloud_hme_auto_delete_enabled)
-      data.icloud_hme_auto_delete_recheck_before_delete =
-        data.icloud_hme_auto_delete_recheck_before_delete === ''
-          ? true
-          : parseBooleanConfigValue(data.icloud_hme_auto_delete_recheck_before_delete)
-      data.icloud_hme_auto_delete_pause_active_tasks =
-        data.icloud_hme_auto_delete_pause_active_tasks === ''
-          ? true
-          : parseBooleanConfigValue(data.icloud_hme_auto_delete_pause_active_tasks)
       data.tempmail_archive_cleanup_enabled = parseBooleanConfigValue(data.tempmail_archive_cleanup_enabled)
       data.tempmail_archive_cleanup_pause_active_tasks =
         data.tempmail_archive_cleanup_pause_active_tasks === ''
@@ -4182,68 +2850,7 @@ export default function Settings() {
       }
       values.cfworker_random_subdomain = parseBooleanConfigValue(values.cfworker_random_subdomain)
       values.tempmail_permanent = parseBooleanConfigValue(values.tempmail_permanent)
-      if (values.mail_provider === 'hme_ready_api') {
-        values.icloud_hme_mode = 'helper_ready_api'
-      } else if (values.mail_provider === 'icloud_hme' && values.icloud_hme_mode === 'helper_ready_api') {
-        values.icloud_hme_mode = 'import_pool'
-      }
-      values.icloud_hme_auto_create_enabled = parseBooleanConfigValue(values.icloud_hme_auto_create_enabled)
-      values.icloud_hme_auto_create_stock_limit = String(
-        Math.max(1, Number.parseInt(String(values.icloud_hme_auto_create_stock_limit || '10'), 10) || 10),
-      )
-      const intervalMin = Math.max(
-        1,
-        Number.parseInt(String(values.icloud_hme_auto_create_interval_min_minutes || '60'), 10) || 60,
-      )
-      const intervalMax = Math.max(
-        intervalMin,
-        Number.parseInt(String(values.icloud_hme_auto_create_interval_max_minutes || '120'), 10) || 120,
-      )
-      values.icloud_hme_auto_create_interval_min_minutes = String(intervalMin)
-      values.icloud_hme_auto_create_interval_max_minutes = String(intervalMax)
-      values.icloud_hme_auto_create_rate_limit_backoff_minutes = String(
-        Math.max(
-          1,
-          Number.parseInt(String(values.icloud_hme_auto_create_rate_limit_backoff_minutes || '360'), 10) || 360,
-        ),
-      )
-      const createErrorBackoff = Number.parseInt(String(values.icloud_hme_auto_create_error_backoff_minutes ?? '3'), 10)
-      values.icloud_hme_auto_create_error_backoff_minutes = String(
-        Math.max(0, Number.isFinite(createErrorBackoff) ? createErrorBackoff : 3),
-      )
-      values.icloud_hme_auto_delete_enabled = parseBooleanConfigValue(values.icloud_hme_auto_delete_enabled)
-      values.icloud_hme_auto_delete_recheck_before_delete = parseBooleanConfigValue(
-        values.icloud_hme_auto_delete_recheck_before_delete,
-      )
-      values.icloud_hme_auto_delete_pause_active_tasks = parseBooleanConfigValue(
-        values.icloud_hme_auto_delete_pause_active_tasks,
-      )
-      const accountIntervalMin = Math.max(
-        0,
-        Number.parseInt(String(values.icloud_hme_auto_delete_account_interval_min_minutes || '10'), 10) || 10,
-      )
-      const accountIntervalMax = Math.max(
-        accountIntervalMin,
-        Number.parseInt(String(values.icloud_hme_auto_delete_account_interval_max_minutes || '30'), 10) || 30,
-      )
-      values.icloud_hme_auto_delete_account_interval_min_minutes = String(accountIntervalMin)
-      values.icloud_hme_auto_delete_account_interval_max_minutes = String(accountIntervalMax)
-      values.icloud_hme_auto_delete_max_per_run = String(
-        Math.max(1, Number.parseInt(String(values.icloud_hme_auto_delete_max_per_run || '20'), 10) || 20),
-      )
-      values.icloud_hme_auto_delete_rate_limit_backoff_minutes = String(
-        Math.max(
-          1,
-          Number.parseInt(String(values.icloud_hme_auto_delete_rate_limit_backoff_minutes || '60'), 10) || 60,
-        ),
-      )
-      const deleteErrorBackoff = Number.parseInt(String(values.icloud_hme_auto_delete_error_backoff_minutes ?? '3'), 10)
-      values.icloud_hme_auto_delete_error_backoff_minutes = String(
-        Math.max(0, Number.isFinite(deleteErrorBackoff) ? deleteErrorBackoff : 3),
-      )
-      values.icloud_hme_auto_delete_dead_statuses =
-        String(values.icloud_hme_auto_delete_dead_statuses || 'account_deactivated,password_invalid').trim() ||
-        'account_deactivated,password_invalid'
+      if (values.mail_provider === 'hme_ready_api') values.icloud_hme_mode = 'helper_ready_api'
       values.tempmail_archive_cleanup_enabled = parseBooleanConfigValue(values.tempmail_archive_cleanup_enabled)
       values.tempmail_archive_cleanup_pause_active_tasks = parseBooleanConfigValue(
         values.tempmail_archive_cleanup_pause_active_tasks,
@@ -4517,21 +3124,6 @@ export default function Settings() {
         tempmail_permanent: values.tempmail_permanent,
         mail_provider: values.mail_provider,
         icloud_hme_mode: values.icloud_hme_mode,
-        icloud_hme_auto_create_enabled: values.icloud_hme_auto_create_enabled,
-        icloud_hme_auto_create_stock_limit: values.icloud_hme_auto_create_stock_limit,
-        icloud_hme_auto_create_interval_min_minutes: values.icloud_hme_auto_create_interval_min_minutes,
-        icloud_hme_auto_create_interval_max_minutes: values.icloud_hme_auto_create_interval_max_minutes,
-        icloud_hme_auto_create_rate_limit_backoff_minutes: values.icloud_hme_auto_create_rate_limit_backoff_minutes,
-        icloud_hme_auto_create_error_backoff_minutes: values.icloud_hme_auto_create_error_backoff_minutes,
-        icloud_hme_auto_delete_enabled: values.icloud_hme_auto_delete_enabled,
-        icloud_hme_auto_delete_recheck_before_delete: values.icloud_hme_auto_delete_recheck_before_delete,
-        icloud_hme_auto_delete_pause_active_tasks: values.icloud_hme_auto_delete_pause_active_tasks,
-        icloud_hme_auto_delete_account_interval_min_minutes: values.icloud_hme_auto_delete_account_interval_min_minutes,
-        icloud_hme_auto_delete_account_interval_max_minutes: values.icloud_hme_auto_delete_account_interval_max_minutes,
-        icloud_hme_auto_delete_max_per_run: values.icloud_hme_auto_delete_max_per_run,
-        icloud_hme_auto_delete_rate_limit_backoff_minutes: values.icloud_hme_auto_delete_rate_limit_backoff_minutes,
-        icloud_hme_auto_delete_error_backoff_minutes: values.icloud_hme_auto_delete_error_backoff_minutes,
-        icloud_hme_auto_delete_dead_statuses: values.icloud_hme_auto_delete_dead_statuses,
         tempmail_archive_cleanup_enabled: values.tempmail_archive_cleanup_enabled,
         tempmail_archive_cleanup_interval_minutes: values.tempmail_archive_cleanup_interval_minutes,
         tempmail_archive_cleanup_keep_recent_minutes: values.tempmail_archive_cleanup_keep_recent_minutes,
@@ -4642,15 +3234,7 @@ export default function Settings() {
     })
   }
   const getMailboxSectionCollapseState = (sectionTitle: string) => {
-    if (activeTab !== 'mailbox' || selectedMailProvider !== 'icloud_hme') {
-      return { defaultCollapsed: false, autoExpand: false }
-    }
-    if (sectionTitle === 'iCloud HME 自动补池') {
-      return { defaultCollapsed: true, autoExpand: icloudAutoCreateEnabled }
-    }
-    if (sectionTitle === 'iCloud HME 自动删除') {
-      return { defaultCollapsed: true, autoExpand: icloudAutoDeleteEnabled }
-    }
+    if (activeTab !== 'mailbox') return { defaultCollapsed: false, autoExpand: false }
     if (sectionTitle === 'TempMail 归档清理') {
       return { defaultCollapsed: true, autoExpand: tempmailArchiveCleanupEnabled }
     }
@@ -4912,7 +3496,6 @@ export default function Settings() {
                       )
                     })()
                   ))}
-                  {activeTab === 'mailbox' && selectedMailProvider === 'icloud_hme' ? <ICloudHmeManagerSection form={form} /> : null}
                   {activeTab === 'mailbox' && selectedMailProvider === 'applemail' ? <AppleMailPoolImportSection form={form} /> : null}
                   {activeTab === 'mailbox' && selectedMailProvider === 'cfworker' ? <CFWorkerDomainPoolSection form={form} /> : null}
                   {activeTab === 'mailbox' && selectedMailProvider === 'outlook' ? <OutlookImportSection /> : null}

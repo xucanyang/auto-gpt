@@ -478,6 +478,123 @@ class IcloudHmeMailboxFinalizeTests(unittest.TestCase):
         )
         mailbox._tempmail_mailbox.ensure_mailbox_by_email.assert_not_called()
 
+    def test_helper_ready_current_ids_rebinds_expired_forward_mailbox(self):
+        mailbox = IcloudHmeMailbox(
+            icloud_hme_mode="helper_ready_api",
+            icloud_cookie="",
+            icloud_forward_to="global@example.com",
+            tempmail_api_url="http://tempmail-api-1:8080",
+            tempmail_api_key="test-key",
+            icloud_hme_helper_api_url="http://helper-api",
+            icloud_hme_helper_internal_key="helper-key",
+        )
+        account = MailboxAccount(
+            email="alias@icloud.com",
+            account_id="lease-rebind-1",
+            extra={
+                "provider": "hme_ready_api",
+                "lease_id": "lease-rebind-1",
+                "forward_to": "specific@example.com",
+                "forward_mailbox_id": "expired-mbox",
+            },
+        )
+        mailbox._tempmail_mailbox.ensure_mailbox_by_email = Mock(
+            return_value=MailboxAccount(email="specific@example.com", account_id="fresh-mbox")
+        )
+        mailbox._tempmail_mailbox._list_emails = Mock(
+            side_effect=[
+                RuntimeError("TempMail Ready API 列邮件失败: 404 mailbox not found"),
+                [{"id": "fresh-message"}],
+            ]
+        )
+
+        ids = mailbox.get_current_ids(account)
+
+        self.assertEqual(ids, {"fresh-message"})
+        self.assertEqual(account.extra["forward_mailbox_id"], "fresh-mbox")
+        mailbox._tempmail_mailbox.ensure_mailbox_by_email.assert_called_once_with(
+            "specific@example.com", force_lookup=True
+        )
+
+    def test_helper_ready_rebind_persists_global_fallback_target_on_account(self):
+        mailbox = IcloudHmeMailbox(
+            icloud_hme_mode="helper_ready_api",
+            icloud_cookie="",
+            icloud_forward_to="b@cccy.me",
+            tempmail_api_url="http://tempmail-api-1:8080",
+            tempmail_api_key="test-key",
+            icloud_hme_helper_api_url="http://helper-api",
+            icloud_hme_helper_internal_key="helper-key",
+        )
+        account = MailboxAccount(
+            email="alias@icloud.com",
+            account_id="lease-rebind-global",
+            extra={
+                "provider": "hme_ready_api",
+                "lease_id": "lease-rebind-global",
+                "forward_mailbox_id": "expired-mbox",
+            },
+        )
+        mailbox._tempmail_mailbox.ensure_mailbox_by_email = Mock(
+            return_value=MailboxAccount(email="b@cccy.me", account_id="fresh-mbox")
+        )
+        mailbox._tempmail_mailbox._list_emails = Mock(
+            side_effect=[
+                RuntimeError("TempMail Ready API 列邮件失败: 404 mailbox not found"),
+                [],
+            ]
+        )
+
+        self.assertEqual(mailbox.get_current_ids(account), set())
+        self.assertEqual(account.extra["forward_to"], "b@cccy.me")
+        self.assertEqual(account.extra["forward_mailbox_id"], "fresh-mbox")
+
+    def test_helper_ready_wait_rebinds_expired_forward_mailbox_without_resetting_boundary(self):
+        mailbox = IcloudHmeMailbox(
+            icloud_hme_mode="helper_ready_api",
+            icloud_cookie="",
+            icloud_forward_to="global@example.com",
+            tempmail_api_url="http://tempmail-api-1:8080",
+            tempmail_api_key="test-key",
+            icloud_hme_helper_api_url="http://helper-api",
+            icloud_hme_helper_internal_key="helper-key",
+        )
+        account = MailboxAccount(
+            email="alias@icloud.com",
+            account_id="lease-rebind-2",
+            extra={
+                "provider": "hme_ready_api",
+                "lease_id": "lease-rebind-2",
+                "forward_to": "specific@example.com",
+                "forward_mailbox_id": "expired-mbox",
+            },
+        )
+        mailbox._tempmail_mailbox.ensure_mailbox_by_email = Mock(
+            return_value=MailboxAccount(email="specific@example.com", account_id="fresh-mbox")
+        )
+        mailbox._tempmail_mailbox._list_emails = Mock(
+            side_effect=[
+                RuntimeError("TempMail Ready API 列邮件失败: 404 mailbox not found"),
+                [{"id": "fresh-message", "subject": "OpenAI verification"}],
+            ]
+        )
+        mailbox._tempmail_mailbox._get_email_detail = Mock(
+            return_value={
+                "received_for": ["alias@icloud.com"],
+                "subject": "OpenAI verification",
+                "body_text": "Your verification code is 654321.",
+                "raw_message": "Delivered-To: alias@icloud.com",
+            }
+        )
+        before_ids = {"baseline-message"}
+
+        code = mailbox.wait_for_code(account, timeout=1, before_ids=before_ids, otp_sent_at=1)
+
+        self.assertEqual(code, "654321")
+        self.assertEqual(before_ids, {"baseline-message"})
+        self.assertEqual(account.extra["forward_mailbox_id"], "fresh-mbox")
+        self.assertEqual(mailbox._last_verification_result["matched_mailbox_id"], "fresh-mbox")
+
     def test_helper_ready_forward_to_without_mailbox_id_scans_only_that_forward(self):
         mailbox = IcloudHmeMailbox(
             icloud_hme_mode="helper_ready_api",

@@ -233,6 +233,36 @@ def _persist_subscription_auth_result(
         }
 
 
+def _persist_restored_mailbox_state(
+    account_id: int,
+    mailbox_state: dict[str, Any] | None,
+) -> bool:
+    """Persist mailbox routing changes without changing account business state."""
+
+    if not isinstance(mailbox_state, dict) or not mailbox_state:
+        return False
+    with Session(core_db.engine) as session:
+        account = session.get(AccountModel, int(account_id or 0))
+        if account is None or account.platform != "chatgpt":
+            return False
+        cleaned = sanitize_mailbox_state(
+            mailbox_state,
+            account_email=str(account.email or ""),
+        )
+        if not cleaned:
+            return False
+        extra = account.get_extra()
+        current = extra.get("chatgpt_mailbox_state")
+        if isinstance(current, dict) and current == cleaned:
+            return False
+        extra["chatgpt_mailbox_state"] = cleaned
+        account.set_extra(extra)
+        account.updated_at = _utcnow()
+        session.add(account)
+        session.commit()
+        return True
+
+
 def capture_subscription_auth_for_account(
     account_id: int,
     *,
@@ -512,9 +542,36 @@ def capture_subscription_auth_for_account(
                 "error": "",
             }
         except TaskInterruption:
+            if email_service is not None:
+                try:
+                    refreshed_state = email_service.export_state()
+                    cleaned_state = sanitize_mailbox_state(
+                        refreshed_state,
+                        account_email=email,
+                    )
+                    if cleaned_state:
+                        mailbox_state = cleaned_state
+                        exported_mailbox_state = cleaned_state
+                        _persist_restored_mailbox_state(account_id, cleaned_state)
+                except Exception:
+                    pass
             raise
         except Exception as exc:
             last_error = sanitize_error_message(exc or "补抓 Auth 失败")
+            if email_service is not None:
+                try:
+                    refreshed_state = email_service.export_state()
+                    cleaned_state = sanitize_mailbox_state(
+                        refreshed_state,
+                        account_email=email,
+                    )
+                    if cleaned_state:
+                        mailbox_state = cleaned_state
+                        exported_mailbox_state = cleaned_state
+                        if _persist_restored_mailbox_state(account_id, cleaned_state):
+                            _log("[邮箱] 已保存本次任务刷新的 mailbox_state")
+                except Exception as state_exc:
+                    _log(f"[邮箱] 保存刷新后的 mailbox_state 失败: {state_exc}", "warning")
             last_error_code, retryable = _classify_capture_error(
                 last_error,
                 allow_phone_verification=allow_phone_verification,

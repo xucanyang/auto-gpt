@@ -227,7 +227,7 @@ class RestoredEmailServiceTests(unittest.TestCase):
         self.assertEqual(getattr(mailbox, "_task_control", None), "task-control")
         self.assertEqual(getattr(mailbox, "_task_attempt_token", None), 123)
 
-    def test_icloud_stored_state_uses_current_forward_config(self):
+    def test_hme_ready_stored_state_keeps_account_route_and_refreshes_runtime_credentials(self):
         account = AccountModel(
             platform="chatgpt",
             email="alias@icloud.com",
@@ -264,9 +264,11 @@ class RestoredEmailServiceTests(unittest.TestCase):
         self.assertEqual(state["config"]["tempmail_api_url"], "http://new-api")
         self.assertEqual(state["config"]["tempmail_api_key"], "new-key")
         self.assertEqual(state["config"]["icloud_forward_to"], "current@example.com")
-        self.assertEqual(state["config"]["icloud_forward_mailbox_id"], "new-mailbox")
-        self.assertEqual(state["account"]["extra"]["forward_to"], "current@example.com")
-        self.assertEqual(state["account"]["extra"]["forward_mailbox_id"], "new-mailbox")
+        self.assertEqual(state["config"]["icloud_hme_mode"], "helper_ready_api")
+        self.assertNotIn("icloud_forward_mailbox_id", state["config"])
+        self.assertEqual(state["provider"], "hme_ready_api")
+        self.assertEqual(state["account"]["extra"]["forward_to"], "old@example.com")
+        self.assertEqual(state["account"]["extra"]["forward_mailbox_id"], "old-mailbox")
 
     def test_icloud_stored_state_drops_stale_config_forward_id_when_current_empty(self):
         account = AccountModel(
@@ -303,7 +305,8 @@ class RestoredEmailServiceTests(unittest.TestCase):
 
         self.assertEqual(state["config"]["tempmail_api_url"], "http://new-api")
         self.assertNotIn("icloud_forward_mailbox_id", state["config"])
-        self.assertEqual(state["account"]["extra"]["forward_to"], "current@example.com")
+        self.assertEqual(state["provider"], "hme_ready_api")
+        self.assertEqual(state["account"]["extra"]["forward_to"], "old@example.com")
         self.assertEqual(state["account"]["extra"]["forward_mailbox_id"], "cached-mailbox")
 
     def test_icloud_state_with_helper_lease_keeps_helper_mode(self):

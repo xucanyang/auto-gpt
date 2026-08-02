@@ -38,14 +38,16 @@ const MAIL_PROVIDER_LABELS: Record<string, string> = {
   luckmail: 'LuckMail',
   manual_email_otp: '手动邮箱 + 手输验证码',
   email_api: '邮箱验证码 API',
-  hme_ready_api: 'HME Ready API',
-  icloud_hme: 'iCloud HME',
+  hme_ready_api: 'HME Ready API + TempMail',
   tempmail_local: 'TempMail Ready API',
   tempmail_api: 'TempMail Ready API',
 }
 
 function mailProviderLabel(provider: string) {
-  const normalized = String(provider || '').trim()
+  const raw = String(provider || '').trim().toLowerCase()
+  const normalized = ['icloud_hme', 'icloud_hme_ready', 'icloud_hme_helper_ready', 'helper_ready_api'].includes(raw)
+    ? 'hme_ready_api'
+    : raw
   return MAIL_PROVIDER_LABELS[normalized] || normalized || '未配置'
 }
 
@@ -98,10 +100,15 @@ export function RegisterTaskModal({
   const [tempmailDomains, setTempmailDomains] = useState<TempMailDomainOption[]>([])
   const [tempmailDomainsLoading, setTempmailDomainsLoading] = useState(false)
   const isPhoneSignup = currentPlatform === 'chatgpt' && chatgptRegistrationEntry === 'phone_signup'
-  const effectiveRegisterMailProvider =
+  const rawEffectiveRegisterMailProvider =
     currentPlatform === 'chatgpt' && !isPhoneSignup && registerProviderOverride && registerProviderOverride !== '__global__'
       ? registerProviderOverride
       : registerMailProvider
+  const effectiveRegisterMailProvider = ['icloud_hme', 'icloud_hme_ready', 'icloud_hme_helper_ready', 'helper_ready_api'].includes(
+    String(rawEffectiveRegisterMailProvider || '').trim().toLowerCase(),
+  )
+    ? 'hme_ready_api'
+    : rawEffectiveRegisterMailProvider
   const effectiveTempMailProvider = effectiveRegisterMailProvider === 'tempmail_local' || effectiveRegisterMailProvider === 'tempmail_api'
   const tempmailRequiresFixedDomain = effectiveTempMailProvider && selectedTempMailMode === 'fixed_domain'
   const tempmailUsesTaskSubdomain = effectiveTempMailProvider && selectedTempMailMode === 'task_subdomain'
@@ -365,8 +372,7 @@ export function RegisterTaskModal({
                     value: '__global__',
                     label: `跟随全局默认（当前：${mailProviderLabel(registerMailProvider)}）`,
                   },
-                  { value: 'hme_ready_api', label: 'HME Ready API' },
-                  { value: 'icloud_hme', label: 'iCloud HME' },
+                  { value: 'hme_ready_api', label: 'HME Ready API + TempMail' },
                   { value: 'tempmail_local', label: 'TempMail Ready API' },
                   { value: 'email_api', label: '邮箱验证码 API（email----api）' },
                   { value: 'manual_email_otp', label: '手动邮箱 + 手输验证码' },
@@ -379,17 +385,8 @@ export function RegisterTaskModal({
               type="info"
               showIcon
               style={{ marginBottom: 16 }}
-              message="当前注册将使用 HME Ready API"
-              description="auto-gpt 会通过 icloud-hide-email-helper 出池、收码和 finalize；不会直接使用 iCloud Cookie。"
-            />
-          ) : null}
-          {currentPlatform === 'chatgpt' && !isPhoneSignup && effectiveRegisterMailProvider === 'icloud_hme' ? (
-            <Alert
-              type="info"
-              showIcon
-              style={{ marginBottom: 16 }}
-              message="当前注册将使用 iCloud HME"
-              description="auto-gpt 会按全局 iCloud HME 配置直接管理 Cookie、导入池/实时创建和共享收件箱。"
+              message="当前注册将使用 HME Ready API + TempMail"
+              description="Helper 负责 HME 出池、身份和 finalize；auto-gpt 直接从 TempMail 转发箱读取验证码。"
             />
           ) : null}
           {currentPlatform === 'chatgpt' && !isPhoneSignup && effectiveTempMailProvider ? (

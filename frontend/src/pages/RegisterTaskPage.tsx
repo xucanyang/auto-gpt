@@ -836,8 +836,7 @@ export default function RegisterTaskPage() {
                   ? [
                       { value: 'manual_email_otp', label: '手动邮箱 + 手输验证码' },
                       { value: 'email_api', label: '邮箱验证码 API（email----api）' },
-                      { value: 'hme_ready_api', label: 'HME Ready API' },
-                      { value: 'icloud_hme', label: 'iCloud HME' },
+                      { value: 'hme_ready_api', label: 'HME Ready API + TempMail' },
                     ]
                   : []),
                 { value: 'luckmail', label: 'LuckMail' },

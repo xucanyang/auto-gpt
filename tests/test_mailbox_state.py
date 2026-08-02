@@ -39,6 +39,8 @@ def test_hme_state_sanitizer_keeps_recovery_identity_and_drops_global_state():
         "config": {
             "icloud_hme_mode": "helper_ready_api",
             "icloud_cookie": "must-never-be-persisted-for-helper",
+            "icloud_domain_base": "icloud.com",
+            "icloud_forward_mailbox_id": "must-not-be-global",
             "icloud_hme_helper_api_url": "http://helper.internal",
             "icloud_hme_helper_internal_key": "helper-secret",
             "tempmail_api_url": "http://tempmail.internal",
@@ -53,6 +55,7 @@ def test_hme_state_sanitizer_keeps_recovery_identity_and_drops_global_state():
     cleaned = sanitize_mailbox_state(state)
 
     assert cleaned["schema_version"] == 2
+    assert cleaned["provider"] == "hme_ready_api"
     assert cleaned["account"]["account_id"] == "lease-123"
     assert cleaned["account"]["extra"]["lease_id"] == "lease-123"
     assert cleaned["account"]["extra"]["registration_id"] == "reg-123"
@@ -65,6 +68,8 @@ def test_hme_state_sanitizer_keeps_recovery_identity_and_drops_global_state():
     assert cleaned["config"]["icloud_hme_helper_api_url"] == "http://helper.internal"
     assert cleaned["config"]["tempmail_api_url"] == "http://tempmail.internal"
     assert "icloud_cookie" not in cleaned["config"]
+    assert "icloud_domain_base" not in cleaned["config"]
+    assert "icloud_forward_mailbox_id" not in cleaned["config"]
     assert "chatgpt_gopay_batch_tasks" not in cleaned["config"]
     assert "chatgpt_gopay_phone_pool" not in cleaned["config"]
     assert "chatgpt_account_filter_presets" not in cleaned["config"]
@@ -122,6 +127,43 @@ def test_helper_marker_on_legacy_icloud_provider_also_drops_cookie_and_keeps_ide
     assert "refresh_token" not in cleaned["account"]["extra"]
     assert cleaned["config"]["icloud_hme_mode"] == "helper_ready_api"
     assert "icloud_cookie" not in cleaned["config"]
+
+
+def test_legacy_direct_hme_state_normalizes_without_promoting_anonymous_id_to_lease():
+    cleaned = sanitize_mailbox_state({
+        "provider": "icloud_hme",
+        "email": "legacy@icloud.com",
+        "account": {
+            "email": "legacy@icloud.com",
+            "account_id": "anonymous-legacy-1",
+            "extra": {
+                "provider": "icloud_hme",
+                "mode": "helper_ready_api",
+                "forward_to": "forward@example.com",
+                "forward_mailbox_id": "cached-mailbox",
+            },
+        },
+        "config": {
+            "icloud_hme_mode": "import_pool",
+            "icloud_cookie": "must-not-survive",
+            "icloud_domain_base": "icloud.com",
+            "icloud_forward_mailbox_id": "must-not-survive",
+            "icloud_hme_helper_api_url": "http://helper.internal",
+            "icloud_hme_helper_internal_key": "helper-key",
+            "tempmail_api_url": "http://tempmail.internal",
+            "tempmail_api_key": "tempmail-key",
+        },
+    })
+
+    assert cleaned["provider"] == "hme_ready_api"
+    assert cleaned["account"]["account_id"] == "anonymous-legacy-1"
+    assert cleaned["account"]["extra"]["anonymous_id"] == "anonymous-legacy-1"
+    assert cleaned["account"]["extra"]["source"] == "legacy-icloud-hme"
+    assert "lease_id" not in cleaned["account"]["extra"]
+    assert cleaned["config"]["icloud_hme_mode"] == "helper_ready_api"
+    assert "icloud_cookie" not in cleaned["config"]
+    assert "icloud_domain_base" not in cleaned["config"]
+    assert "icloud_forward_mailbox_id" not in cleaned["config"]
 
 
 def test_before_ids_are_deterministic_deduplicated_and_byte_bounded():

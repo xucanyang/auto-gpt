@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -24,7 +25,7 @@ class SubscriptionAuthCaptureTests(unittest.TestCase):
         self.core_engine_patch.stop()
         self._tmpdir.cleanup()
 
-    def _add_account(self, *, status: str = "subscribed") -> int:
+    def _add_account(self, *, status: str = "subscribed", extra_json: str | None = None) -> int:
         with Session(self.engine) as session:
             row = AccountModel(
                 platform="chatgpt",
@@ -32,14 +33,14 @@ class SubscriptionAuthCaptureTests(unittest.TestCase):
                 password="pw",
                 token="old-token",
                 status=status,
-                extra_json='{"chatgpt_mailbox_state": {"provider": "dummy", "email": "capture@example.com"}}',
+                extra_json=extra_json or '{"chatgpt_mailbox_state": {"provider": "dummy", "email": "capture@example.com"}}',
             )
             session.add(row)
             session.commit()
             session.refresh(row)
             return int(row.id or 0)
 
-    def _patch_capture_runtime(self, *, tokens=None, error=""):
+    def _patch_capture_runtime(self, *, tokens=None, error="", exported_mailbox_state=None):
         login_calls: list[dict] = []
 
         class _FakeEmailService:
@@ -49,6 +50,8 @@ class SubscriptionAuthCaptureTests(unittest.TestCase):
                 self.state = dict(state or {})
 
             def export_state(self):
+                if isinstance(exported_mailbox_state, dict):
+                    return dict(exported_mailbox_state)
                 return {**self.state, "provider": "dummy", "email": "capture@example.com"}
 
         class _FakeRegisterClient:
@@ -198,6 +201,69 @@ class SubscriptionAuthCaptureTests(unittest.TestCase):
         self.assertTrue(result["data"]["retryable"])
         self.assertEqual(len(login_calls), 2)
         sleep_mock.assert_not_called()
+
+    def test_failed_phone_auth_persists_refreshed_mailbox_id_only(self):
+        original_state = {
+            "provider": "icloud_hme",
+            "email": "capture@example.com",
+            "account": {
+                "email": "capture@example.com",
+                "account_id": "lease-1",
+                "extra": {
+                    "provider": "icloud_hme",
+                    "mode": "helper_ready_api",
+                    "source": "icloud-hide-email-helper",
+                    "lease_id": "lease-1",
+                    "forward_to": "b@cccy.me",
+                    "forward_mailbox_id": "expired-mailbox",
+                },
+            },
+            "config": {
+                "icloud_hme_mode": "helper_ready_api",
+                "icloud_forward_to": "b@cccy.me",
+                "icloud_hme_helper_api_url": "http://helper.internal",
+                "icloud_hme_helper_internal_key": "helper-key",
+                "tempmail_api_url": "http://tempmail.internal",
+                "tempmail_api_key": "tempmail-key",
+            },
+        }
+        refreshed_state = json.loads(json.dumps(original_state))
+        refreshed_state["account"]["extra"]["forward_mailbox_id"] = "fresh-mailbox"
+        account_id = self._add_account(
+            status="subscribed",
+            extra_json=json.dumps(
+                {
+                    "chatgpt_mailbox_state": original_state,
+                    "unrelated_marker": "keep",
+                }
+            ),
+        )
+        login_calls, email_patch, engine_patch, config_patch = self._patch_capture_runtime(
+            tokens=None,
+            error="OAuth 登录失败",
+            exported_mailbox_state=refreshed_state,
+        )
+
+        with email_patch, engine_patch, config_patch:
+            result = subscription_auth_capture.capture_subscription_auth_for_account(
+                account_id,
+                allow_phone_verification=True,
+                retry_delays_seconds=[],
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(len(login_calls), 1)
+        with Session(self.engine) as session:
+            account = session.get(AccountModel, account_id)
+            extra = account.get_extra()
+        state = extra["chatgpt_mailbox_state"]
+        self.assertEqual(account.status, "subscribed")
+        self.assertEqual(account.token, "old-token")
+        self.assertEqual(extra["unrelated_marker"], "keep")
+        self.assertEqual(state["provider"], "hme_ready_api")
+        self.assertEqual(state["account"]["extra"]["forward_to"], "b@cccy.me")
+        self.assertEqual(state["account"]["extra"]["forward_mailbox_id"], "fresh-mailbox")
+        self.assertNotIn("chatgpt_phone_binding", extra)
 
 
 if __name__ == "__main__":

@@ -65,12 +65,12 @@ _PROVIDER_CONFIG_KEYS: dict[str, tuple[str, ...]] = {
         "tempmail_api_proxy",
         "tempmail_use_task_proxy",
     ),
-    "icloud_hme": (
+    "hme_ready_api": (
+        # These keys retain their historical storage names for compatibility
+        # with the shared config store.  They are the HME Ready + TempMail
+        # consumer contract, not a direct Apple/iCloud client contract.
         "icloud_hme_mode",
-        "icloud_cookie",
-        "icloud_domain_base",
         "icloud_forward_to",
-        "icloud_forward_mailbox_id",
         "icloud_hme_helper_api_url",
         "icloud_hme_helper_internal_key",
         "icloud_hme_helper_api_key",
@@ -162,9 +162,13 @@ _PROVIDER_ALIASES = {
     "email_otp_api": "email_api",
     "mail_api_otp": "email_api",
     "tempmail_api": "tempmail_local",
-    "hme_ready_api": "icloud_hme",
-    "icloud_hme_ready": "icloud_hme",
-    "icloud_hme_helper_ready": "icloud_hme",
+    # HME Ready is the only supported HME provider.  The older values remain
+    # readable so persisted account state can be upgraded without a data wipe.
+    "hme_ready_api": "hme_ready_api",
+    "helper_ready_api": "hme_ready_api",
+    "icloud_hme": "hme_ready_api",
+    "icloud_hme_ready": "hme_ready_api",
+    "icloud_hme_helper_ready": "hme_ready_api",
 }
 
 _COMMON_ACCOUNT_EXTRA_KEYS = {
@@ -191,7 +195,7 @@ _PROVIDER_ACCOUNT_EXTRA_KEYS: dict[str, set[str]] = {
         "task_key",
         "tempmail_mode",
     },
-    "icloud_hme": {
+    "hme_ready_api": {
         "mode",
         "source",
         "anonymous_id",
@@ -320,8 +324,10 @@ def export_mailbox_state_config(provider: Any, config: Mapping[str, Any] | Any) 
         value = _bounded_simple_value(source.get(key))
         if value is not None:
             exported[key] = value
-    if normalized_provider == "icloud_hme" and raw_provider in {
+    if normalized_provider == "hme_ready_api" and raw_provider in {
         "hme_ready_api",
+        "helper_ready_api",
+        "icloud_hme",
         "icloud_hme_ready",
         "icloud_hme_helper_ready",
     }:
@@ -330,6 +336,8 @@ def export_mailbox_state_config(provider: Any, config: Mapping[str, Any] | Any) 
         # account and recreates the exact per-account-copy failure this module
         # exists to prevent.
         exported.pop("icloud_cookie", None)
+        exported.pop("icloud_domain_base", None)
+        exported.pop("icloud_forward_mailbox_id", None)
         exported["icloud_hme_mode"] = "helper_ready_api"
     return exported
 
@@ -351,7 +359,7 @@ def export_mailbox_account_extra(
     source = dict(source)
     nested_account = source.get("account")
     nested_extra = nested_account.get("extra") if isinstance(nested_account, Mapping) else {}
-    if normalized_provider == "icloud_hme" and isinstance(nested_extra, Mapping):
+    if normalized_provider == "hme_ready_api" and isinstance(nested_extra, Mapping):
         for key in (
             "forward_to",
             "forward_mailbox_id",
@@ -387,6 +395,8 @@ def export_mailbox_account_extra(
             if nested:
                 exported[key] = nested
             continue
+        if key == "provider":
+            value = normalized_provider
         bounded = _bounded_simple_value(value)
         if bounded is not None:
             exported[key] = bounded
@@ -460,16 +470,20 @@ def sanitize_mailbox_state(
     account_id = _bounded_string(account_raw.get("account_id") or "", max_bytes=4096).strip()
     account_extra = export_mailbox_account_extra(raw_account_extra, provider=provider_raw)
     normalized_provider = normalize_mailbox_provider(provider_raw)
-    is_helper_hme = bool(
-        normalized_provider == "icloud_hme"
-        and (
-            provider_raw in {"hme_ready_api", "icloud_hme_ready", "icloud_hme_helper_ready"}
-            or str(raw_account_extra.get("mode") or "").strip().lower() == "helper_ready_api"
-            or str(raw_account_extra.get("source") or "").strip().lower() == "icloud-hide-email-helper"
-            or bool(raw_account_extra.get("lease_id") or raw_account_extra.get("checkout_id"))
-        )
+    explicit_hme_lease = bool(
+        raw_account_extra.get("lease_id")
+        or raw_account_extra.get("checkout_id")
     )
-    if not account_id and normalized_provider == "icloud_hme":
+    # A historical `icloud_hme` row may carry `mode=helper_ready_api` even
+    # though its account_id is the old Apple anonymous ID.  Never promote that
+    # implicit ID into a current Helper lease; only explicit lease metadata is
+    # authoritative for the legacy provider name.
+    is_legacy_direct_hme = bool(
+        normalized_provider == "hme_ready_api"
+        and provider_raw == "icloud_hme"
+        and not explicit_hme_lease
+    )
+    if not account_id and normalized_provider == "hme_ready_api":
         for key in ("lease_id", "checkout_id", "mailbox_id", "service_id", "anonymous_id"):
             candidate = _bounded_string(account_extra.get(key) or "", max_bytes=4096).strip()
             if candidate:
@@ -477,7 +491,7 @@ def sanitize_mailbox_state(
                 break
 
     state_config = export_mailbox_state_config(provider_raw, state.get("config"))
-    if is_helper_hme:
+    if normalized_provider == "hme_ready_api":
         state_config.pop("icloud_cookie", None)
         state_config["icloud_hme_mode"] = "helper_ready_api"
         # auto-gpt only consumes ChatGPT registrations.  Old Helper snapshots
@@ -492,6 +506,10 @@ def sanitize_mailbox_state(
             .lower()
             or "chatgpt"
         )
+        if is_legacy_direct_hme:
+            account_extra.setdefault("source", "legacy-icloud-hme")
+            if account_id:
+                account_extra.setdefault("anonymous_id", account_id)
         for key in (
             "platform",
             "registration_platform",
@@ -516,7 +534,7 @@ def sanitize_mailbox_state(
     )
     result: dict[str, Any] = {
         "schema_version": MAILBOX_STATE_SCHEMA_VERSION,
-        "provider": provider_raw,
+        "provider": normalized_provider,
         "email": _bounded_string(email, max_bytes=4096),
         "account": {
             "email": _bounded_string(str(account_raw.get("email") or email or ""), max_bytes=4096),

@@ -211,7 +211,7 @@ class CustomEmailRecheckPersistenceTests(unittest.TestCase):
         self.assertEqual(extra["chatgpt_custom_email_recheck"]["followup_auth_ok"], False)
         self.assertEqual(extra["chatgpt_last_revival"]["mode"], "revive_existing")
 
-    def test_resolve_custom_email_service_prefers_icloud_hme_over_restored_manual_email_otp(self):
+    def test_resolve_custom_email_service_prefers_hme_ready_over_restored_manual_email_otp(self):
         with Session(self.engine) as session:
             row = AccountModel(
                 platform="chatgpt",
@@ -234,7 +234,7 @@ class CustomEmailRecheckPersistenceTests(unittest.TestCase):
             mock.patch.object(
                 custom_email_recheck,
                 "_mailbox_state_from_icloud_hme_alias",
-                return_value={"provider": "icloud_hme", "email": "hme@example.com", "account": {"email": "hme@example.com", "account_id": "alias-1", "extra": {}}},
+                return_value={"provider": "hme_ready_api", "email": "hme@example.com", "account": {"email": "hme@example.com", "account_id": "alias-1", "extra": {"source": "legacy-icloud-hme"}}},
             ),
             mock.patch.object(custom_email_recheck, "_mailbox_state_from_applemail_pool", return_value={}),
             mock.patch.object(custom_email_recheck, "_mailbox_state_from_tempmail_domain_match", return_value={}),
@@ -251,8 +251,8 @@ class CustomEmailRecheckPersistenceTests(unittest.TestCase):
             )
 
         self.assertIsInstance(service, _CaptureService)
-        self.assertEqual(state["provider"], "icloud_hme")
-        self.assertEqual(captured["state"]["provider"], "icloud_hme")
+        self.assertEqual(state["provider"], "hme_ready_api")
+        self.assertEqual(captured["state"]["provider"], "hme_ready_api")
         self.assertEqual(captured["task_control"], "task-control")
         self.assertEqual(captured["attempt_id"], 88)
 

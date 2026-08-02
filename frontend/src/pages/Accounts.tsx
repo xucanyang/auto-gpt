@@ -111,7 +111,6 @@ const REGISTER_FORM_SETTINGS_STORAGE_PREFIX = 'auto-chatgpt.register-form-settin
 const REGISTER_MAIL_PROVIDER_OVERRIDES = new Set([
   '__global__',
   'hme_ready_api',
-  'icloud_hme',
   'tempmail_local',
   'tempmail_api',
   'email_api',
@@ -1302,6 +1301,9 @@ function mergeRegisterFormSettings(platform: string, values: Record<string, unkn
 function normalizeRegisterMailProviderOverride(value: unknown) {
   const normalized = String(value || '').trim().toLowerCase()
   if (normalized === 'tempmail_api') return 'tempmail_local'
+  if (['icloud_hme', 'icloud_hme_ready', 'icloud_hme_helper_ready', 'helper_ready_api'].includes(normalized)) {
+    return 'hme_ready_api'
+  }
   return REGISTER_MAIL_PROVIDER_OVERRIDES.has(normalized) ? normalized : '__global__'
 }
 
