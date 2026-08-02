@@ -2,6 +2,8 @@ import { useQuery } from '@tanstack/react-query'
 import { apiFetch } from '@/lib/utils'
 
 export type AccountsQueryParams = {
+  filterPresetId?: string
+  filterPresetRevision?: string
   email?: string
   status?: string
   manuallyUsed?: string
@@ -28,9 +30,17 @@ export type AccountsQueryResult = {
   total: number
   page: number
   items: any[]
+  fixed_preset?: {
+    id: string
+    stored_account_count: number
+    resolved_account_ids: number[]
+    missing_account_ids: number[]
+  }
 }
 
 export function useAccountsQuery({
+  filterPresetId = '',
+  filterPresetRevision = '',
   email = '',
   status = '',
   manuallyUsed = '',
@@ -53,7 +63,7 @@ export function useAccountsQuery({
 }: AccountsQueryParams) {
   const canonicalSubmitState = submitState || ''
   return useQuery<AccountsQueryResult>({
-    queryKey: ['accounts', { email, status, manuallyUsed, authType, phoneBindingState, paymentLinkPlatform, paymentLinkGenerated, subscriptionType, accountValidity, sub2apiState, oaipayState, submitState: canonicalSubmitState, hasSubmitted, ideaSubmitState, revivalState, sortBy, sortOrder, page, pageSize }],
+    queryKey: ['accounts', { filterPresetId, filterPresetRevision, email, status, manuallyUsed, authType, phoneBindingState, paymentLinkPlatform, paymentLinkGenerated, subscriptionType, accountValidity, sub2apiState, oaipayState, submitState: canonicalSubmitState, hasSubmitted, ideaSubmitState, revivalState, sortBy, sortOrder, page, pageSize }],
     queryFn: async ({ signal }) => {
       const params = new URLSearchParams({
         platform: 'chatgpt',
@@ -61,6 +71,7 @@ export function useAccountsQuery({
         page_size: String(pageSize),
         detail: 'false',
       })
+      if (filterPresetId) params.set('filter_preset_id', filterPresetId)
       if (email) params.set('email', email)
       if (status) params.set('status', status)
       if (manuallyUsed) params.set('manually_used', manuallyUsed)
@@ -85,6 +96,6 @@ export function useAccountsQuery({
       return apiFetch(`/accounts?${params}`, { signal }) as Promise<AccountsQueryResult>
     },
     placeholderData: (previousData) => previousData,
-    staleTime: 60_000,
+    staleTime: filterPresetId ? 0 : 60_000,
   })
 }

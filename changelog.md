@@ -7,10 +7,12 @@
 ## [Unreleased] (未发布)
 
 ### 新增 (Added)
+- **筛选组合支持固定账号成员**：`api/accounts.py` 将原有组合契约扩展为向后兼容的 `dynamic / fixed` 两种内容模式；未勾选账号时仍保存动态筛选条件，人工跨页勾选账号后则可从同一个“筛选组合”入口保存固定成员。固定组合使用实例本地配置持久化，支持现有的选择、置顶、复制、编辑、覆盖、还原和删除操作；账号状态变化不会改变成员，新出现的同条件账号也不会自动加入。`GET /api/accounts` 新增短参数 `filter_preset_id`，按组合 ID 分页返回固定成员，避免在 URL 中展开最多 5000 个账号 ID；现有批量任务和 PIX 导出继续复用明确的 `account_ids` 范围。
 - **支付链接列新增“当前有链接 / 当前无链接”筛选**：`frontend/src/pages/Accounts.tsx` 在账号表“支付链接”列的当前链接筛选中增加 `当前有链接`，并保留 `当前无链接`；`services/account_filters.py` 将 `has_link / with_link / current_has_link` 统一展开为 Hosted、PayPal、iDEAL、UPI、PIX、TWINT、Kakao Pay、Team 与 other 等当前实际可打开链接类型，列表接口、批量任务筛选范围和筛选组合复用同一后端语义，避免把历史“已成功提取”误当成当前仍有链接。
 - **新增 Docker 测试规范**：`docs/testing-in-docker.md` 固化运行依赖统一、测试镜像与生产镜像同源、一次性测试容器、临时数据库/共享配置、网络隔离、浏览器资源约束和外部实时烟测分层要求，明确禁止在常驻业务容器或生产挂载上执行完整 pytest。
 
 ### 优化 (Changed)
+- **固定组合使用稳定账号身份并保持单入口交互**：固定成员除数字 ID 外同步保存规范化邮箱和创建时间，加载时必须三者匹配，避免 SQLite 删除账号后复用主键而把新账号错误加入旧组合；不存在、跨平台或身份不匹配的成员会从本次范围剔除并在页面提示，全部成员失效时返回空列表而不是回退成全量账号。历史筛选组合没有 `mode` 字段时继续按动态组合迁移，内置组合和三个实例之间的本地隔离语义不变。`frontend/src/pages/Accounts.tsx`、`FilterPresetBar.tsx` 与 `useAccountsQuery.ts` 继续只保留原“筛选组合”选择器和管理弹窗，通过分段控件区分“筛选条件 / 固定账号”，没有新增第二套页面或工具栏入口。侧栏可见版本同步为 `v2.9.0`。
 - **收口已退役的 GoPay / 流水线入口**：`main.py` 继续保持不挂载 `api.integrations`、`api.pipeline` 与 `api.idea_oaipay_pipeline`，`api/system.py` 不再展示自动流水线健康资源，`frontend/src/app/AppShell.tsx` / `router.tsx` 也移除了对应导航与路由；`frontend/src/pages/Settings.tsx` 同步删去 GoPay 分组标题与本地模式提示中的 GoPay 文案，避免新界面继续暴露已退役入口。
 - **停用 GoPay 作为支付链接分类**：`api/tasks.py`、`services/account_filters.py` 与 `services/chatgpt_core/pix_payment_link_cleanup.py` 不再把 `gopay` 当作独立支付类型；过滤、清理与清单统计现在会把旧的 `gopay` payload 归入 `other`，而不是继续向前端和任务契约暴露一个新的分类。
 - **统一任务历史展示契约**：`api/tasks.py` 的任务历史列表与详情现在统一输出 `success / skipped / failed / interrupted / total / stats_available`，并从旧快照的 `registered_accounts`、`auth_pending_accounts`、`runtime_results`、Idea 提交摘要、错误列表及 `[SUMMARY]`/结果日志恢复统计；`frontend/src/lib/taskTypes.ts`、`TaskHistory.tsx` 与 `TaskDetailHeader.tsx` 对零值统计、状态别名和中断数量使用同一套推导规则，无法从旧数据可靠恢复时明确显示“统计暂不可用”，不再留空或伪造零值结论。
@@ -56,6 +58,7 @@
 - **修正 Docker 发布拓扑旧描述**：`docs/docker-image-release.md` 按当前 `docker-compose.multi.yml` 更新为 `auto-gpt`、`auto-gpt-plus`、`auto-plus2` 三个常驻业务实例与 `phone-api-relay` 共同运行，移除主服务 standby 的过时说法。
 
 ### 测试 (Tests)
+- **补充固定筛选组合端到端合同回归**：`tests/test_account_filter_presets.py` 覆盖旧动态组合迁移、固定成员去重、ChatGPT 平台校验、5000 个成员上限、持久化身份引用、成员删除、SQLite ID 复用和全员失效空列表；新增 `tests/test_account_filter_presets_ui.py` 锁定同一筛选组合入口、按当前勾选自动选择固定模式、短组合 ID 查询、成员恢复以及批量 `account_ids` 范围。隔离测试容器相关及相邻账号筛选回归 `44 passed`，前端合同测试 `18 passed`，TypeScript 与 Vite 生产构建通过。
 - **补充 OTP 时间锚点与手机号绑定日志合同回归**：`tests/test_chatgpt_register.py` 覆盖 authorize、密码、passwordless、首轮延迟、成功/失败重发；新增 `tests/test_any_auto_otp_timing.py` 覆盖注册、已有账号和显式发码；`tests/test_icloud_hme_mailbox_finalize.py` 锁定 HME 先匹配 alias 再判断新旧；`tests/test_chatgpt_task_logging.py` 与 `tests/test_register_task_controls.py` 锁定 Info 完整身份、Debug 身份遮蔽及强敏感字段始终脱敏。使用从生产镜像派生的一次性测试镜像、只读 checkout、临时运行目录和 `--network none` 分组执行，本次相关及相邻回归共 `292 passed`。
 - **补充 OAIPay 手动分组与支付链接当前状态筛选回归**：`tests/test_oaipay_sync.py` 覆盖分类拉取复用自动上传解析器、raw Authorization 失败后的 Bearer fallback、窄路由响应 envelope；`tests/test_retired_capabilities_contract.py` 确认只恢复 OAIPay 分类兼容接口而不暴露 GoPay；`tests/test_account_filters.py`、`tests/test_account_filter_presets.py` 与 `tests/test_accounts_payment_link_filter_ui.py` 锁定 `has_link` 在 Python/SQL 筛选、筛选组合和账号页静态 UI 中的合同。
 - **补充手动手机号绑定启动回归**：`tests/test_phone_pool_task_integration.py` 锁定手动上传号码时对外仍展示 `phone_pool_mode=manual`，任务 runner 实际收到 canonical `phone_pool_mode=normal`，并覆盖旧别名归一化，防止并发手机号绑定再次在创建后、首条日志前崩溃。
@@ -3201,4 +3204,8 @@
 
 ## 2026-08-02 08:06:49 +0800
 - 修复 OAuth 验证码时间锚点并显示手机号绑定完整身份
+- 发布模式: multi
+
+## 2026-08-02 23:40:03 +0800
+- 新增固定账号筛选组合并统一组合管理
 - 发布模式: multi

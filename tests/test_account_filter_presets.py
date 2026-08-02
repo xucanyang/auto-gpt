@@ -1,7 +1,11 @@
+import json
+
 import pytest
 from fastapi import HTTPException
+from sqlmodel import Session, SQLModel, create_engine
 
 from api import accounts
+from core.db import AccountModel
 from core.shared_config import LOCAL_ONLY_KEYS
 
 
@@ -57,6 +61,9 @@ def test_account_filter_preset_crud_and_normalization(monkeypatch):
     )
     item = created["item"]
     assert item["built_in"] is False
+    assert item["mode"] == "dynamic"
+    assert item["account_ids"] == []
+    assert item["account_count"] == 0
     assert item["filters"]["search"] == "user@example.com"
     assert item["filters"]["status"] == ["registered", "subscribed"]
     assert item["filters"]["columnFilters"]["subscriptionType"] == ["plus", "pro"]
@@ -149,6 +156,8 @@ def test_legacy_filter_preset_list_payload_still_loads(monkeypatch):
     listed = accounts.list_account_filter_presets()
     assert listed["custom_count"] == 1
     item = next(item for item in listed["items"] if item["id"] == "preset_legacy")
+    assert item["mode"] == "dynamic"
+    assert item["account_ids"] == []
     assert item["filters"]["columnFilters"]["ideaSubmitState"] == ["submitting", "unavailable"]
     assert item["filters"]["columnFilters"]["oaipayState"] == ["not_uploaded"]
     assert item["filters"]["registrationSortOrder"] == "desc"
@@ -184,3 +193,130 @@ def test_filter_preset_v2_registration_default_migrates_once():
     assert legacy["custom"][0]["filters"]["registrationSortOrder"] == "desc"
     assert current["custom"][0]["filters"]["registrationSortOrder"] == "asc"
     assert "注册排序=最早" in current["custom"][0]["summary"]
+
+
+def test_fixed_account_filter_preset_persists_members_and_reports_deleted_accounts(monkeypatch, tmp_path):
+    store = DummyConfigStore()
+    monkeypatch.setattr(accounts, "config_store", store)
+    engine = create_engine(f"sqlite:///{tmp_path / 'fixed-presets.db'}")
+    SQLModel.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        first = AccountModel(platform="chatgpt", email="fixed-a@example.com", password="pw")
+        second = AccountModel(platform="chatgpt", email="fixed-b@example.com", password="pw")
+        foreign = AccountModel(platform="other", email="foreign@example.com", password="pw")
+        session.add(first)
+        session.add(second)
+        session.add(foreign)
+        session.commit()
+        session.refresh(first)
+        session.refresh(second)
+        session.refresh(foreign)
+        first_id = int(first.id)
+        second_id = int(second.id)
+        foreign_id = int(foreign.id)
+
+        created = accounts.create_account_filter_preset(
+            accounts.AccountFilterPresetBody(
+                name="人工特选号",
+                description="固定成员",
+                mode="fixed",
+                account_ids=[second_id, first_id, second_id, foreign_id, 999999, -1],
+                filters={"status": ["subscribed"]},
+                pinned=True,
+            ),
+            session=session,
+        )
+        item = created["item"]
+        assert item["mode"] == "fixed"
+        assert item["account_ids"] == [second_id, first_id]
+        assert "account_refs" not in item
+        stored_item = json.loads(store.value)["custom"][0]
+        assert [ref["id"] for ref in stored_item["account_refs"]] == [second_id, first_id]
+        assert [ref["email"] for ref in stored_item["account_refs"]] == [
+            "fixed-b@example.com",
+            "fixed-a@example.com",
+        ]
+        assert item["account_count"] == 2
+        assert item["summary"] == "固定账号 · 2 个"
+        assert item["filters"] == accounts._empty_filter_preset_payload()
+        assert created["discarded_account_ids"] == [foreign_id, 999999]
+        assert created["fixed_count"] == 1
+        preset_id = item["id"]
+
+        session.expire_all()
+        listed = accounts.list_accounts(
+            platform="chatgpt",
+            filter_preset_id=preset_id,
+            session=session,
+        )
+        assert listed["total"] == 2
+        assert {row["id"] for row in listed["items"]} == {first_id, second_id}
+        assert listed["fixed_preset"] == {
+            "id": preset_id,
+            "stored_account_count": 2,
+            "resolved_account_ids": [second_id, first_id],
+            "missing_account_ids": [],
+        }
+
+        session.delete(second)
+        session.commit()
+        replacement = AccountModel(
+            id=second_id,
+            platform="chatgpt",
+            email="replacement@example.com",
+            password="pw",
+        )
+        session.add(replacement)
+        session.commit()
+        session.expire_all()
+        listed_after_delete = accounts.list_accounts(
+            platform="chatgpt",
+            filter_preset_id=preset_id,
+            session=session,
+        )
+        assert listed_after_delete["total"] == 1
+        assert [row["id"] for row in listed_after_delete["items"]] == [first_id]
+        assert listed_after_delete["fixed_preset"]["resolved_account_ids"] == [first_id]
+        assert listed_after_delete["fixed_preset"]["missing_account_ids"] == [second_id]
+
+        session.delete(first)
+        session.commit()
+        listed_after_all_members_deleted = accounts.list_accounts(
+            platform="chatgpt",
+            filter_preset_id=preset_id,
+            session=session,
+        )
+        assert listed_after_all_members_deleted["total"] == 0
+        assert listed_after_all_members_deleted["items"] == []
+        assert listed_after_all_members_deleted["fixed_preset"]["resolved_account_ids"] == []
+        assert listed_after_all_members_deleted["fixed_preset"]["missing_account_ids"] == [
+            second_id,
+            first_id,
+        ]
+
+
+def test_fixed_account_filter_preset_requires_members_and_enforces_limit(monkeypatch, tmp_path):
+    store = DummyConfigStore()
+    monkeypatch.setattr(accounts, "config_store", store)
+    engine = create_engine(f"sqlite:///{tmp_path / 'fixed-presets-validation.db'}")
+    SQLModel.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        with pytest.raises(HTTPException) as empty_error:
+            accounts.create_account_filter_preset(
+                accounts.AccountFilterPresetBody(name="空组合", mode="fixed", account_ids=[]),
+                session=session,
+            )
+        assert empty_error.value.status_code == 400
+
+        with pytest.raises(HTTPException) as limit_error:
+            accounts.create_account_filter_preset(
+                accounts.AccountFilterPresetBody(
+                    name="超限组合",
+                    mode="fixed",
+                    account_ids=list(range(1, accounts.ACCOUNT_FILTER_PRESET_MAX_ACCOUNT_IDS + 2)),
+                ),
+                session=session,
+            )
+        assert limit_error.value.status_code == 400

@@ -28,6 +28,7 @@ export interface FilterPresetBarProps {
   loadFilterPresets: (silent?: boolean) => void;
   overwriteActiveFilterPreset: () => void;
   openCopyFilterPreset: (preset: AccountFilterPreset) => void;
+  selectedAccountCount: number;
   selectedAccountsControl?: React.ReactNode;
   mobileFilterControls?: React.ReactNode;
 }
@@ -53,6 +54,7 @@ export const FilterPresetBar: React.FC<FilterPresetBarProps> = ({
   loadFilterPresets,
   overwriteActiveFilterPreset,
   openCopyFilterPreset,
+  selectedAccountCount,
   selectedAccountsControl,
   mobileFilterControls,
 }) => {
@@ -109,7 +111,7 @@ export const FilterPresetBar: React.FC<FilterPresetBarProps> = ({
             optionFilterProp="label"
             options={filterPresets.map((preset) => ({
               value: preset.id,
-              label: `${preset.name}${preset.built_in ? ' · 内置' : ''}`,
+              label: `${preset.name}${preset.mode === 'fixed' ? ` · 固定 ${preset.account_count}` : ''}${preset.built_in ? ' · 内置' : ''}`,
             }))}
             onChange={(presetId) => {
               const preset = filterPresets.find((item) => item.id === presetId)
@@ -120,7 +122,12 @@ export const FilterPresetBar: React.FC<FilterPresetBarProps> = ({
           <Dropdown
             menu={{
               items: [
-                { key: 'save', icon: <SaveOutlined />, label: '保存当前筛选', onClick: openCreateCurrentFilterPreset },
+                {
+                  key: 'save',
+                  icon: <SaveOutlined />,
+                  label: selectedAccountCount > 0 ? `保存已选账号 (${selectedAccountCount})` : '保存当前筛选',
+                  onClick: openCreateCurrentFilterPreset,
+                },
                 { key: 'manage', icon: <SettingOutlined />, label: '管理筛选组合', onClick: () => setFilterPresetManageOpen(true) },
                 { type: 'divider' },
                 { key: 'refresh', icon: <SyncOutlined spin={filterPresetLoading} />, label: '刷新组合', onClick: () => void loadFilterPresets(false) },
@@ -174,6 +181,11 @@ export const FilterPresetBar: React.FC<FilterPresetBarProps> = ({
         <div className="accounts-filter-preset-summary-row">
           {shouldRenderFilterSummary || shouldRenderDirtyActions ? (
             <div className="accounts-filter-preset-summary-left">
+              {activeFilterPreset?.mode === 'fixed' && activeFilterPresetDirty ? (
+                <Text type="secondary" style={{ fontSize: 12 }}>
+                  固定成员：已保存 {activeFilterPreset.account_count}，当前已选 {selectedAccountCount}
+                </Text>
+              ) : null}
               {shouldRenderFilterSummary ? (
                 <Text
                   className="accounts-filter-preset-summary-copy"

@@ -62,11 +62,14 @@ def _safe_extra(account: AccountModel) -> dict[str, Any]:
 
 
 ACCOUNT_FILTER_PRESETS_CONFIG_KEY = "chatgpt_account_filter_presets"
-ACCOUNT_FILTER_PRESET_SCHEMA_VERSION = 3
+ACCOUNT_FILTER_PRESET_SCHEMA_VERSION = 4
 ACCOUNT_FILTER_PRESET_REGISTRATION_DESC_VERSION = 3
 ACCOUNT_FILTER_PRESET_MAX_CUSTOM_ITEMS = 80
 ACCOUNT_FILTER_PRESET_MAX_LIST_VALUES = 32
+ACCOUNT_FILTER_PRESET_MAX_ACCOUNT_IDS = 5000
 ACCOUNT_FILTER_PRESET_PAGE_SIZES = {10, 20, 50}
+ACCOUNT_FILTER_PRESET_MODE_DYNAMIC = "dynamic"
+ACCOUNT_FILTER_PRESET_MODE_FIXED = "fixed"
 ACCOUNT_FILTER_PRESET_COLUMN_KEYS = (
     "email",
     "status",
@@ -103,7 +106,9 @@ _INTEGRATION_UPLOAD_FILTER_ALIASES = {
 class AccountFilterPresetBody(BaseModel):
     name: str
     description: str = ""
+    mode: str = ACCOUNT_FILTER_PRESET_MODE_DYNAMIC
     filters: dict[str, Any] = Field(default_factory=dict)
+    account_ids: list[int] = Field(default_factory=list)
     pinned: bool = False
 
 
@@ -140,6 +145,133 @@ def _filter_value_list(value: Any) -> list[str]:
         if len(result) >= ACCOUNT_FILTER_PRESET_MAX_LIST_VALUES:
             break
     return result
+
+
+def _normalize_filter_preset_mode(value: Any) -> str:
+    normalized = _trim_text(value, max_length=24).lower().replace("-", "_")
+    if normalized in {"fixed", "accounts", "account_ids", "selected", "selection"}:
+        return ACCOUNT_FILTER_PRESET_MODE_FIXED
+    return ACCOUNT_FILTER_PRESET_MODE_DYNAMIC
+
+
+def _normalize_filter_preset_account_ids(value: Any) -> list[int]:
+    if value is None:
+        raw_items: list[Any] = []
+    elif isinstance(value, (list, tuple, set)):
+        raw_items = list(value)
+    else:
+        raw_items = str(value or "").split(",")
+
+    result: list[int] = []
+    seen: set[int] = set()
+    for raw in raw_items:
+        if isinstance(raw, bool):
+            continue
+        account_id = _safe_int(raw)
+        if account_id <= 0 or account_id in seen:
+            continue
+        seen.add(account_id)
+        result.append(account_id)
+        if len(result) >= ACCOUNT_FILTER_PRESET_MAX_ACCOUNT_IDS:
+            break
+    return result
+
+
+def _filter_preset_account_created_at(value: Any) -> str:
+    if isinstance(value, datetime):
+        normalized = value
+        if normalized.tzinfo is not None:
+            normalized = normalized.astimezone(timezone.utc).replace(tzinfo=None)
+        return normalized.isoformat(timespec="microseconds")
+    return _trim_text(value, max_length=80)
+
+
+def _filter_preset_account_ref(account: AccountModel) -> dict[str, Any]:
+    return {
+        "id": int(account.id or 0),
+        "email": _trim_text(account.email, max_length=320).lower(),
+        "created_at": _filter_preset_account_created_at(account.created_at),
+    }
+
+
+def _normalize_filter_preset_account_refs(
+    value: Any,
+    account_ids: list[int],
+) -> list[dict[str, Any]]:
+    raw_items = value if isinstance(value, list) else []
+    refs_by_id: dict[int, dict[str, Any]] = {}
+    allowed_ids = set(account_ids)
+    for raw in raw_items:
+        if not isinstance(raw, dict):
+            continue
+        account_id = _safe_int(raw.get("id"))
+        if account_id <= 0 or account_id not in allowed_ids or account_id in refs_by_id:
+            continue
+        email = _trim_text(raw.get("email"), max_length=320).lower()
+        created_at = _filter_preset_account_created_at(raw.get("created_at"))
+        if not email or not created_at:
+            continue
+        refs_by_id[account_id] = {
+            "id": account_id,
+            "email": email,
+            "created_at": created_at,
+        }
+    return [refs_by_id[account_id] for account_id in account_ids if account_id in refs_by_id]
+
+
+def _filter_preset_account_matches_ref(
+    account: AccountModel,
+    account_ref: dict[str, Any] | None,
+) -> bool:
+    # `account_refs` did not exist in early fixed-preset development payloads.
+    # Keep those readable by ID, while all API-created presets carry a strong
+    # identity reference that prevents SQLite primary-key reuse from rebinding.
+    if not account_ref:
+        return True
+    return (
+        _trim_text(account.email, max_length=320).lower() == account_ref.get("email")
+        and _filter_preset_account_created_at(account.created_at) == account_ref.get("created_at")
+    )
+
+
+def _validate_filter_preset_content(
+    body: AccountFilterPresetBody,
+    *,
+    session: Session,
+) -> tuple[str, dict[str, Any], list[int], list[dict[str, Any]], list[int]]:
+    mode = _normalize_filter_preset_mode(body.mode)
+    filters = _normalize_filter_preset_filters(body.filters)
+    if mode != ACCOUNT_FILTER_PRESET_MODE_FIXED:
+        return mode, filters, [], [], []
+
+    raw_account_ids = list(body.account_ids or [])
+    if len(raw_account_ids) > ACCOUNT_FILTER_PRESET_MAX_ACCOUNT_IDS:
+        raise HTTPException(
+            400,
+            f"固定账号组合最多保存 {ACCOUNT_FILTER_PRESET_MAX_ACCOUNT_IDS} 个账号",
+        )
+    requested_ids = _normalize_filter_preset_account_ids(raw_account_ids)
+    if not requested_ids:
+        raise HTTPException(400, "固定账号组合至少需要一个有效账号")
+
+    existing_rows = session.exec(
+        select(AccountModel).where(
+            AccountModel.platform == "chatgpt",
+            AccountModel.id.in_(requested_ids),
+        )
+    ).all()
+    accounts_by_id = {
+        int(account.id): account
+        for account in existing_rows
+        if _safe_int(account.id) > 0
+    }
+    existing_ids = set(accounts_by_id)
+    account_ids = [account_id for account_id in requested_ids if account_id in existing_ids]
+    account_refs = [_filter_preset_account_ref(accounts_by_id[account_id]) for account_id in account_ids]
+    discarded_ids = [account_id for account_id in requested_ids if account_id not in existing_ids]
+    if not account_ids:
+        raise HTTPException(400, "所选账号已不存在，无法保存固定账号组合")
+    return mode, _empty_filter_preset_payload(), account_ids, account_refs, discarded_ids
 
 
 _IDEA_SUBMIT_FILTER_PRESET_ALIASES = {
@@ -294,6 +426,16 @@ def _filter_preset_summary(filters: dict[str, Any]) -> str:
     return " · ".join(parts) or "无筛选条件"
 
 
+def _filter_preset_content_summary(
+    mode: str,
+    filters: dict[str, Any],
+    account_ids: list[int],
+) -> str:
+    if mode == ACCOUNT_FILTER_PRESET_MODE_FIXED:
+        return f"固定账号 · {len(account_ids)} 个"
+    return _filter_preset_summary(filters)
+
+
 def _make_builtin_filter_preset(
     *,
     preset_id: str,
@@ -315,7 +457,11 @@ def _make_builtin_filter_preset(
         "id": preset_id,
         "name": name,
         "description": description,
+        "mode": ACCOUNT_FILTER_PRESET_MODE_DYNAMIC,
         "filters": filters,
+        "account_ids": [],
+        "account_refs": [],
+        "account_count": 0,
         "summary": _filter_preset_summary(filters),
         "pinned": pinned,
         "built_in": True,
@@ -397,15 +543,28 @@ def _normalize_custom_filter_preset(item: Any) -> dict[str, Any] | None:
     preset_id = _trim_text(item.get("id"), max_length=80)
     if not preset_id or preset_id.startswith("builtin_"):
         preset_id = "preset_" + uuid.uuid4().hex[:12]
-    filters = _normalize_filter_preset_filters(item.get("filters"))
+    mode = _normalize_filter_preset_mode(item.get("mode"))
+    account_ids = _normalize_filter_preset_account_ids(item.get("account_ids")) if mode == ACCOUNT_FILTER_PRESET_MODE_FIXED else []
+    account_refs = _normalize_filter_preset_account_refs(item.get("account_refs"), account_ids) if mode == ACCOUNT_FILTER_PRESET_MODE_FIXED else []
+    if mode == ACCOUNT_FILTER_PRESET_MODE_FIXED and not account_ids:
+        return None
+    filters = (
+        _empty_filter_preset_payload()
+        if mode == ACCOUNT_FILTER_PRESET_MODE_FIXED
+        else _normalize_filter_preset_filters(item.get("filters"))
+    )
     created_at = _trim_text(item.get("created_at"), max_length=40) or _utc_iso()
     updated_at = _trim_text(item.get("updated_at"), max_length=40) or created_at
     return {
         "id": preset_id,
         "name": name,
         "description": _trim_text(item.get("description"), max_length=240),
+        "mode": mode,
         "filters": filters,
-        "summary": _filter_preset_summary(filters),
+        "account_ids": account_ids,
+        "account_refs": account_refs,
+        "account_count": len(account_ids),
+        "summary": _filter_preset_content_summary(mode, filters, account_ids),
         "pinned": bool(item.get("pinned")),
         "built_in": False,
         "created_at": created_at,
@@ -420,8 +579,17 @@ def _normalize_builtin_filter_preset_override(preset_id: str, item: Any) -> dict
     name = _trim_text(item.get("name") or default.get("name"), max_length=80)
     if not name:
         return None
+    mode = _normalize_filter_preset_mode(item.get("mode") or default.get("mode"))
+    account_ids = _normalize_filter_preset_account_ids(item.get("account_ids")) if mode == ACCOUNT_FILTER_PRESET_MODE_FIXED else []
+    account_refs = _normalize_filter_preset_account_refs(item.get("account_refs"), account_ids) if mode == ACCOUNT_FILTER_PRESET_MODE_FIXED else []
+    if mode == ACCOUNT_FILTER_PRESET_MODE_FIXED and not account_ids:
+        return None
     filters_source = item.get("filters") if isinstance(item.get("filters"), dict) else default.get("filters")
-    filters = _normalize_filter_preset_filters(filters_source)
+    filters = (
+        _empty_filter_preset_payload()
+        if mode == ACCOUNT_FILTER_PRESET_MODE_FIXED
+        else _normalize_filter_preset_filters(filters_source)
+    )
     created_at = _trim_text(item.get("created_at"), max_length=40) or _trim_text(default.get("created_at"), max_length=40) or _utc_iso()
     updated_at = _trim_text(item.get("updated_at"), max_length=40) or _utc_iso()
     return {
@@ -431,8 +599,12 @@ def _normalize_builtin_filter_preset_override(preset_id: str, item: Any) -> dict
             item.get("description") if "description" in item else default.get("description"),
             max_length=240,
         ),
+        "mode": mode,
         "filters": filters,
-        "summary": _filter_preset_summary(filters),
+        "account_ids": account_ids,
+        "account_refs": account_refs,
+        "account_count": len(account_ids),
+        "summary": _filter_preset_content_summary(mode, filters, account_ids),
         "pinned": _source_bool(item, "pinned", bool(default.get("pinned"))),
         "built_in": True,
         "created_at": created_at,
@@ -480,7 +652,11 @@ def _normalize_filter_preset_state(payload: Any) -> dict[str, Any]:
             continue
         if migrate_registration_sort_default:
             item["filters"]["registrationSortOrder"] = "desc"
-            item["summary"] = _filter_preset_summary(item["filters"])
+            item["summary"] = _filter_preset_content_summary(
+                item["mode"],
+                item["filters"],
+                item["account_ids"],
+            )
         preset_id = str(item["id"])
         if preset_id in seen_custom_ids:
             continue
@@ -515,7 +691,11 @@ def _normalize_filter_preset_state(payload: Any) -> dict[str, Any]:
         if item:
             if migrate_registration_sort_default:
                 item["filters"]["registrationSortOrder"] = "desc"
-                item["summary"] = _filter_preset_summary(item["filters"])
+                item["summary"] = _filter_preset_content_summary(
+                    item["mode"],
+                    item["filters"],
+                    item["account_ids"],
+                )
             overrides[normalized_id] = item
     state["builtin_overrides"] = overrides
     return state
@@ -619,6 +799,30 @@ def _duplicate_filter_preset_name(state: dict[str, Any], name: str, *, ignore_id
     return False
 
 
+def _find_visible_filter_preset(
+    preset_id: str,
+    state: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    normalized_id = _trim_text(preset_id, max_length=80)
+    if not normalized_id:
+        return None
+    state = state if state is not None else _load_filter_preset_state()
+    return next(
+        (
+            item
+            for item in [*_visible_builtin_filter_presets(state), *list(state.get("custom") or [])]
+            if str(item.get("id") or "") == normalized_id
+        ),
+        None,
+    )
+
+
+def _public_filter_preset(item: dict[str, Any]) -> dict[str, Any]:
+    public_item = dict(item)
+    public_item.pop("account_refs", None)
+    return public_item
+
+
 def _build_filter_presets_response(state: dict[str, Any] | None = None) -> dict[str, Any]:
     state = state if state is not None else _load_filter_preset_state()
     custom = list(state.get("custom") or [])
@@ -627,11 +831,14 @@ def _build_filter_presets_response(state: dict[str, Any] | None = None) -> dict[
         custom,
         key=lambda item: (not bool(item.get("pinned")), str(item.get("updated_at") or "")),
     )
+    internal_items = [*builtin_items, *ordered_custom]
     return {
         "ok": True,
-        "items": [*builtin_items, *ordered_custom],
+        "items": [_public_filter_preset(item) for item in internal_items],
         "built_in_count": len(builtin_items),
         "custom_count": len(custom),
+        "dynamic_count": sum(1 for item in internal_items if item.get("mode") != ACCOUNT_FILTER_PRESET_MODE_FIXED),
+        "fixed_count": sum(1 for item in internal_items if item.get("mode") == ACCOUNT_FILTER_PRESET_MODE_FIXED),
         "deleted_builtin_count": len(set(state.get("deleted_builtin_ids") or set())),
         "builtin_override_count": len(dict(state.get("builtin_overrides") or {})),
     }
@@ -643,32 +850,50 @@ def list_account_filter_presets():
 
 
 @router.post("/filter-presets")
-def create_account_filter_preset(body: AccountFilterPresetBody):
+def create_account_filter_preset(
+    body: AccountFilterPresetBody,
+    session: Session = Depends(get_session),
+):
     name = _trim_text(body.name, max_length=80)
     if not name:
         raise HTTPException(400, "筛选组合名称不能为空")
     state = _load_filter_preset_state()
     if _duplicate_filter_preset_name(state, name):
         raise HTTPException(400, "已存在同名筛选组合")
+    mode, filters, account_ids, account_refs, discarded_ids = _validate_filter_preset_content(body, session=session)
     now = _utc_iso()
     item = {
         "id": "preset_" + uuid.uuid4().hex[:12],
         "name": name,
         "description": _trim_text(body.description, max_length=240),
-        "filters": _normalize_filter_preset_filters(body.filters),
+        "mode": mode,
+        "filters": filters,
+        "account_ids": account_ids,
+        "account_refs": account_refs,
+        "account_count": len(account_ids),
         "pinned": bool(body.pinned),
         "built_in": False,
         "created_at": now,
         "updated_at": now,
     }
-    item["summary"] = _filter_preset_summary(item["filters"])
+    item["summary"] = _filter_preset_content_summary(mode, filters, account_ids)
     state["custom"].append(item)
     state = _save_filter_preset_state(state)
-    return {"ok": True, "item": item, **_build_filter_presets_response(state)}
+    saved_item = _find_visible_filter_preset(item["id"], state) or item
+    return {
+        "ok": True,
+        "item": _public_filter_preset(saved_item),
+        "discarded_account_ids": discarded_ids,
+        **_build_filter_presets_response(state),
+    }
 
 
 @router.put("/filter-presets/{preset_id}")
-def update_account_filter_preset(preset_id: str, body: AccountFilterPresetBody):
+def update_account_filter_preset(
+    preset_id: str,
+    body: AccountFilterPresetBody,
+    session: Session = Depends(get_session),
+):
     preset_id = _trim_text(preset_id, max_length=80)
     name = _trim_text(body.name, max_length=80)
     if not name:
@@ -677,10 +902,13 @@ def update_account_filter_preset(preset_id: str, body: AccountFilterPresetBody):
     if preset_id in BUILTIN_ACCOUNT_FILTER_PRESETS_BY_ID and preset_id in set(state.get("deleted_builtin_ids") or set()):
         raise HTTPException(404, "筛选组合不存在")
     is_builtin = preset_id in BUILTIN_ACCOUNT_FILTER_PRESETS_BY_ID
-    if not is_builtin and not preset_id:
+    items = list(state.get("custom") or [])
+    index = next((idx for idx, item in enumerate(items) if str(item.get("id") or "") == preset_id), -1)
+    if not is_builtin and index < 0:
         raise HTTPException(404, "筛选组合不存在")
     if _duplicate_filter_preset_name(state, name, ignore_id=preset_id):
         raise HTTPException(400, "已存在同名筛选组合")
+    mode, filters, account_ids, account_refs, discarded_ids = _validate_filter_preset_content(body, session=session)
 
     if is_builtin:
         current = dict(
@@ -692,36 +920,52 @@ def update_account_filter_preset(preset_id: str, body: AccountFilterPresetBody):
             "id": preset_id,
             "name": name,
             "description": _trim_text(body.description, max_length=240),
-            "filters": _normalize_filter_preset_filters(body.filters),
+            "mode": mode,
+            "filters": filters,
+            "account_ids": account_ids,
+            "account_refs": account_refs,
+            "account_count": len(account_ids),
             "pinned": bool(body.pinned),
             "built_in": True,
             "updated_at": _utc_iso(),
         }
-        updated["summary"] = _filter_preset_summary(updated["filters"])
+        updated["summary"] = _filter_preset_content_summary(mode, filters, account_ids)
         state.setdefault("builtin_overrides", {})[preset_id] = updated
         state["deleted_builtin_ids"] = set(state.get("deleted_builtin_ids") or set()) - {preset_id}
         state = _save_filter_preset_state(state)
-        return {"ok": True, "item": updated, **_build_filter_presets_response(state)}
+        saved_item = _find_visible_filter_preset(preset_id, state) or updated
+        return {
+            "ok": True,
+            "item": _public_filter_preset(saved_item),
+            "discarded_account_ids": discarded_ids,
+            **_build_filter_presets_response(state),
+        }
 
-    items = list(state.get("custom") or [])
-    index = next((idx for idx, item in enumerate(items) if str(item.get("id") or "") == preset_id), -1)
-    if index < 0:
-        raise HTTPException(404, "筛选组合不存在")
     current = dict(items[index])
     updated = {
         **current,
         "name": name,
         "description": _trim_text(body.description, max_length=240),
-        "filters": _normalize_filter_preset_filters(body.filters),
+        "mode": mode,
+        "filters": filters,
+        "account_ids": account_ids,
+        "account_refs": account_refs,
+        "account_count": len(account_ids),
         "pinned": bool(body.pinned),
         "built_in": False,
         "updated_at": _utc_iso(),
     }
-    updated["summary"] = _filter_preset_summary(updated["filters"])
+    updated["summary"] = _filter_preset_content_summary(mode, filters, account_ids)
     items[index] = updated
     state["custom"] = items
     state = _save_filter_preset_state(state)
-    return {"ok": True, "item": updated, **_build_filter_presets_response(state)}
+    saved_item = _find_visible_filter_preset(preset_id, state) or updated
+    return {
+        "ok": True,
+        "item": _public_filter_preset(saved_item),
+        "discarded_account_ids": discarded_ids,
+        **_build_filter_presets_response(state),
+    }
 
 
 @router.delete("/filter-presets/{preset_id}")
@@ -1590,6 +1834,7 @@ def _parse_secret_fields(value: Any) -> list[str]:
 @router.get("")
 def list_accounts(
     platform: Optional[str] = None,
+    filter_preset_id: Optional[str] = None,
     status: Optional[str] = None,
     email: Optional[str] = None,
     payment_link_generated: Optional[str] = None,
@@ -1615,6 +1860,48 @@ def list_accounts(
     _maybe_reconcile_rate_limited_accounts(session, platform=platform)
     page_value = max(1, int(page or 1))
     page_size_value = max(1, min(int(page_size or 20), 200))
+    fixed_preset_scope: dict[str, Any] | None = None
+    fixed_account_ids: list[int] = []
+    normalized_filter_preset_id = _trim_text(filter_preset_id, max_length=80)
+    if normalized_filter_preset_id:
+        preset = _find_visible_filter_preset(normalized_filter_preset_id)
+        if not preset:
+            raise HTTPException(404, "筛选组合不存在")
+        if preset.get("mode") != ACCOUNT_FILTER_PRESET_MODE_FIXED:
+            raise HTTPException(400, "该筛选组合不是固定账号模式")
+        fixed_account_ids = _normalize_filter_preset_account_ids(preset.get("account_ids"))
+        if not fixed_account_ids:
+            raise HTTPException(409, "固定账号组合没有可用成员")
+        account_refs = _normalize_filter_preset_account_refs(
+            preset.get("account_refs"),
+            fixed_account_ids,
+        )
+        refs_by_id = {int(item["id"]): item for item in account_refs}
+
+        existing_rows = session.exec(
+            select(AccountModel).where(
+                AccountModel.platform == "chatgpt",
+                AccountModel.id.in_(fixed_account_ids),
+            )
+        ).all()
+        existing_ids = {
+            int(account.id)
+            for account in existing_rows
+            if _safe_int(account.id) > 0
+            and _filter_preset_account_matches_ref(
+                account,
+                refs_by_id.get(int(account.id)),
+            )
+        }
+        resolved_ids = [account_id for account_id in fixed_account_ids if account_id in existing_ids]
+        missing_ids = [account_id for account_id in fixed_account_ids if account_id not in existing_ids]
+        fixed_preset_scope = {
+            "id": normalized_filter_preset_id,
+            "stored_account_count": len(fixed_account_ids),
+            "resolved_account_ids": resolved_ids,
+            "missing_account_ids": missing_ids,
+        }
+        fixed_account_ids = resolved_ids
     q, use_list_state, _ = account_filtered_query(
         session,
         platform=platform,
@@ -1638,6 +1925,8 @@ def list_accounts(
             "sort_order": sort_order,
         },
     )
+    if fixed_preset_scope is not None:
+        q = q.where(AccountModel.id.in_(fixed_account_ids))
     count_q = select(func.count()).select_from(q.subquery())
     total = int(session.exec(count_q).one())
     q = apply_account_list_state_sort(q, sort_by=sort_by, sort_order=sort_order)
@@ -1701,6 +1990,8 @@ def list_accounts(
             for item in items
         ],
     }
+    if fixed_preset_scope is not None:
+        response["fixed_preset"] = fixed_preset_scope
     if page_state_refresh_pending:
         session.commit()
     return response
