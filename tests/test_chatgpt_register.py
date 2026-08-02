@@ -850,6 +850,259 @@ class OAuthClientPasswordlessTests(unittest.TestCase):
         self.assertNotIn("json", kwargs)
         self.assertNotIn("data", kwargs)
 
+    def test_password_verify_carries_request_start_into_email_otp_state(self):
+        client = self._make_client()
+        response = mock.Mock(
+            status_code=200,
+            url="https://auth.openai.com/api/accounts/password/verify",
+            text="",
+        )
+        response.json.return_value = {
+            "page": {"type": "email_otp_verification"},
+            "continue_url": "https://auth.openai.com/email-verification",
+        }
+        client.session.post = mock.Mock(return_value=response)
+
+        with mock.patch(
+            "services.chatgpt_core.oauth_client.build_sentinel_token",
+            return_value="sentinel",
+        ), mock.patch(
+            "services.chatgpt_core.oauth_client.time.time",
+            return_value=200.0,
+        ):
+            state = client._submit_password_verify(
+                "user@example.com",
+                "Secret123!",
+                "device-fixed",
+            )
+
+        self.assertIsNotNone(state)
+        self.assertEqual(state.otp_sent_at, 195.0)
+
+    def test_authorize_continue_carries_request_start_into_existing_account_otp(self):
+        client = self._make_client()
+        client._has_cookie = mock.Mock(return_value=True)
+        response = mock.Mock(
+            status_code=200,
+            url="https://auth.openai.com/api/accounts/authorize/continue",
+            text="",
+        )
+        response.json.return_value = {
+            "page": {"type": "email_otp_verification"},
+            "continue_url": "https://auth.openai.com/email-verification",
+        }
+        client.session.post = mock.Mock(return_value=response)
+
+        with mock.patch(
+            "services.chatgpt_core.oauth_client.build_sentinel_token",
+            return_value="sentinel",
+        ), mock.patch(
+            "services.chatgpt_core.oauth_client.time.time",
+            return_value=400.0,
+        ):
+            state = client._submit_authorize_continue(
+                "user@example.com",
+                "device-fixed",
+                "https://auth.openai.com/log-in",
+            )
+
+        self.assertIsNotNone(state)
+        self.assertEqual(state.otp_sent_at, 395.0)
+
+    def test_passwordless_carries_request_start_into_email_otp_state(self):
+        client = self._make_client()
+        response = mock.Mock(
+            status_code=200,
+            url="https://auth.openai.com/api/accounts/passwordless/send-otp",
+            text="",
+        )
+        response.json.return_value = {
+            "page": {"type": "email_otp_verification"},
+            "continue_url": "https://auth.openai.com/email-verification",
+        }
+        client.session.post = mock.Mock(return_value=response)
+
+        with mock.patch(
+            "services.chatgpt_core.oauth_client.time.time",
+            return_value=300.0,
+        ):
+            state = client._send_passwordless_login_otp(
+                "user@example.com",
+                "device-fixed",
+            )
+
+        self.assertIsNotNone(state)
+        self.assertEqual(state.otp_sent_at, 295.0)
+
+    def test_email_otp_wait_uses_trigger_request_cutoff_after_processing_delay(self):
+        client = self._make_client()
+        state = FlowState(
+            page_type="email_otp_verification",
+            continue_url="https://auth.openai.com/email-verification",
+            current_url="https://auth.openai.com/email-verification",
+            otp_sent_at=123.0,
+        )
+        response = mock.Mock(
+            status_code=200,
+            url="https://auth.openai.com/api/accounts/email-otp/validate",
+            text="",
+        )
+        response.json.return_value = {
+            "page": {"type": "consent"},
+            "continue_url": "https://auth.openai.com/consent",
+        }
+        client.session.post = mock.Mock(return_value=response)
+        mailbox = mock.Mock()
+        mailbox._used_codes = set()
+        mailbox.wait_for_verification_code.return_value = "972138"
+        mailbox.get_last_verification_result.return_value = {"message_id": "otp-1"}
+
+        with mock.patch(
+            "services.chatgpt_core.oauth_client.build_sentinel_token",
+            return_value="sentinel",
+        ):
+            next_state = client._handle_otp_verification(
+                "user@example.com",
+                "device-fixed",
+                "UA",
+                '"Chromium";v="136"',
+                "chrome136",
+                mailbox,
+                state,
+            )
+
+        self.assertIsNotNone(next_state)
+        self.assertEqual(
+            mailbox.wait_for_verification_code.call_args.kwargs["otp_sent_at"],
+            123.0,
+        )
+
+    def test_successful_email_otp_resend_replaces_cutoff_with_resend_start(self):
+        clock = [1000.0]
+        client = OAuthClient(
+            {
+                "chatgpt_oauth_otp_wait_seconds": 120,
+                "chatgpt_oauth_otp_resend_wait_seconds": 30,
+            },
+            proxy="http://127.0.0.1:7890",
+            verbose=False,
+        )
+        state = FlowState(
+            page_type="email_otp_verification",
+            continue_url="https://auth.openai.com/email-verification",
+            current_url="https://auth.openai.com/email-verification",
+            otp_sent_at=900.0,
+        )
+        resend_response = mock.Mock(status_code=200, text="", url="")
+        client.session.get = mock.Mock(return_value=resend_response)
+        validate_response = mock.Mock(
+            status_code=200,
+            url="https://auth.openai.com/api/accounts/email-otp/validate",
+            text="",
+        )
+        validate_response.json.return_value = {
+            "page": {"type": "consent"},
+            "continue_url": "https://auth.openai.com/consent",
+        }
+        client.session.post = mock.Mock(return_value=validate_response)
+        mailbox = mock.Mock()
+        mailbox._used_codes = set()
+        wait_cutoffs = []
+
+        def wait_for_code(*_args, **kwargs):
+            wait_cutoffs.append(kwargs["otp_sent_at"])
+            if len(wait_cutoffs) == 1:
+                clock[0] = 1031.0
+                return None
+            return "972138"
+
+        mailbox.wait_for_verification_code.side_effect = wait_for_code
+        mailbox.get_last_verification_result.return_value = {"message_id": "otp-new"}
+
+        with mock.patch(
+            "services.chatgpt_core.oauth_client.build_sentinel_token",
+            return_value="sentinel",
+        ), mock.patch(
+            "services.chatgpt_core.oauth_client.time.time",
+            side_effect=lambda: clock[0],
+        ):
+            next_state = client._handle_otp_verification(
+                "user@example.com",
+                "device-fixed",
+                "UA",
+                '"Chromium";v="136"',
+                "chrome136",
+                mailbox,
+                state,
+            )
+
+        self.assertIsNotNone(next_state)
+        self.assertEqual(wait_cutoffs, [900.0, 1026.0])
+        client.session.get.assert_called_once()
+
+    def test_failed_email_otp_resend_keeps_previous_cutoff(self):
+        clock = [1000.0]
+        client = OAuthClient(
+            {
+                "chatgpt_oauth_otp_wait_seconds": 120,
+                "chatgpt_oauth_otp_resend_wait_seconds": 30,
+            },
+            proxy="http://127.0.0.1:7890",
+            verbose=False,
+        )
+        state = FlowState(
+            page_type="email_otp_verification",
+            continue_url="https://auth.openai.com/email-verification",
+            current_url="https://auth.openai.com/email-verification",
+            otp_sent_at=900.0,
+        )
+        resend_response = mock.Mock(status_code=500, text="failed", url="")
+        client.session.get = mock.Mock(return_value=resend_response)
+        validate_response = mock.Mock(
+            status_code=200,
+            url="https://auth.openai.com/api/accounts/email-otp/validate",
+            text="",
+        )
+        validate_response.json.return_value = {
+            "page": {"type": "consent"},
+            "continue_url": "https://auth.openai.com/consent",
+        }
+        client.session.post = mock.Mock(return_value=validate_response)
+        mailbox = mock.Mock()
+        mailbox._used_codes = set()
+        wait_cutoffs = []
+
+        def wait_for_code(*_args, **kwargs):
+            wait_cutoffs.append(kwargs["otp_sent_at"])
+            if len(wait_cutoffs) == 1:
+                clock[0] = 1031.0
+                return None
+            return "972138"
+
+        mailbox.wait_for_verification_code.side_effect = wait_for_code
+        mailbox.get_last_verification_result.return_value = {"message_id": "otp-new"}
+
+        with mock.patch(
+            "services.chatgpt_core.oauth_client.build_sentinel_token",
+            return_value="sentinel",
+        ), mock.patch(
+            "services.chatgpt_core.oauth_client.time.time",
+            side_effect=lambda: clock[0],
+        ):
+            next_state = client._handle_otp_verification(
+                "user@example.com",
+                "device-fixed",
+                "UA",
+                '"Chromium";v="136"',
+                "chrome136",
+                mailbox,
+                state,
+            )
+
+        self.assertIsNotNone(next_state)
+        self.assertEqual(wait_cutoffs, [900.0, 900.0])
+        client.session.get.assert_called_once()
+
     def test_email_otp_account_deactivated_stops_waiting_for_more_codes(self):
         client = self._make_client()
         state = FlowState(

@@ -319,6 +319,80 @@ class IcloudHmeMailboxFinalizeTests(unittest.TestCase):
         mailbox._helper_client.wait_code.assert_not_called()
         self.assertEqual(mailbox._last_verification_result["alias_match_source"], "tagged_hme_transport_header")
 
+    def test_tagged_hme_checks_alias_before_logging_early_cutoff(self):
+        mailbox = IcloudHmeMailbox(
+            icloud_hme_mode="helper_ready_api",
+            icloud_cookie="",
+            icloud_forward_to="specific@example.com",
+            tempmail_api_url="http://tempmail-api-1:8080",
+            tempmail_api_key="test-key",
+            icloud_hme_helper_api_url="http://helper-api",
+            icloud_hme_helper_internal_key="helper-key",
+        )
+        account = MailboxAccount(
+            email="reviser.smiths_2f+gpt1@icloud.com",
+            account_id="lease-tag-1",
+            extra={
+                "provider": "hme_ready_api",
+                "mode": "helper_ready_api",
+                "lease_id": "lease-tag-1",
+            },
+        )
+        forward = MailboxAccount(
+            email="specific@example.com",
+            account_id="specific-mbox",
+        )
+        logs = []
+        mailbox._log_fn = logs.append
+        mailbox._candidate_forward_mailboxes_for_account = Mock(return_value=[forward])
+        mailbox._tempmail_mailbox._list_emails = Mock(
+            return_value=[
+                {
+                    "id": "other-alias-old",
+                    "subject": "New sign-in to your OpenAI account",
+                    "timestamp": 80,
+                },
+                {
+                    "id": "current-alias-old",
+                    "subject": "Your temporary ChatGPT verification code",
+                    "timestamp": 90,
+                },
+            ]
+        )
+
+        def detail(_mailbox_id, message_id):
+            tag = "gpt2" if message_id == "other-alias-old" else "gpt1"
+            return {
+                "received_for": ["reviser.smiths_2f@icloud.com"],
+                "subject": (
+                    "New sign-in to your OpenAI account"
+                    if message_id == "other-alias-old"
+                    else "Your temporary ChatGPT verification code"
+                ),
+                "body_text": "Your verification code is 123456.",
+                "raw_message": (
+                    "Return-Path: "
+                    f"<bounce+abc-reviser.smiths_2f+{tag}=icloud.com_at_tm_openai_com_abc@icloud.com>\r\n\r\n"
+                    "Your verification code is 123456."
+                ),
+            }
+
+        mailbox._tempmail_mailbox._get_email_detail = Mock(side_effect=detail)
+        mailbox._run_polling_wait = Mock(
+            side_effect=lambda **kwargs: kwargs["poll_once"]()
+        )
+
+        code = mailbox.wait_for_code(account, timeout=1, otp_sent_at=100)
+
+        self.assertIsNone(code)
+        unmatched_logs = [line for line in logs if "未匹配当前 HME 别名" in line]
+        early_logs = [line for line in logs if "早于 otp_sent_at" in line]
+        self.assertEqual(len(unmatched_logs), 1)
+        self.assertIn("New sign-in", unmatched_logs[0])
+        self.assertEqual(len(early_logs), 1)
+        self.assertIn("temporary ChatGPT verification code", early_logs[0])
+        self.assertNotIn("New sign-in", early_logs[0])
+
     def test_tagged_hme_transport_match_never_falls_back_or_prefix_matches(self):
         expected = "reviser.smiths_2f+gpt1@icloud.com"
 

@@ -1979,7 +1979,11 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
         self.assertTrue(any("同号连续绑定已开启" in line for line in snapshot["logs"]))
         self.assertTrue(any("同号连续绑定继续" in line for line in snapshot["logs"]))
         self.assertFalse(any("===== 成功手机号" in line for line in snapshot["logs"]))
-        self.assertNotIn("+15555550123", "\n".join(snapshot["logs"]))
+        info_logs = [line for line in snapshot["logs"] if "[DEBUG]" not in line]
+        debug_logs = [line for line in snapshot["logs"] if "[DEBUG]" in line]
+        self.assertTrue(any("+15555550123" in line for line in info_logs))
+        self.assertFalse(any("+15555550123" in line for line in debug_logs))
+        self.assertTrue(any("+1555***0123" in line for line in debug_logs))
 
     def test_phone_binding_test_does_not_consume_phone_on_account_preflight_failure(self):
         task_id = "task-phone-binding-preflight-failure"
@@ -2084,7 +2088,10 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
         self.assertEqual(snapshot["skipped"], 0)
         self.assertTrue(any("账号前置失败" in line and "手机号未被触碰" in line for line in snapshot["logs"]))
         self.assertFalse(any("===== 手机号" in line for line in snapshot["logs"]))
-        self.assertNotIn("+13333333333", "\n".join(snapshot["logs"]))
+        info_logs = [line for line in snapshot["logs"] if "[DEBUG]" not in line]
+        debug_logs = [line for line in snapshot["logs"] if "[DEBUG]" in line]
+        self.assertTrue(any("+13333333333" in line for line in info_logs))
+        self.assertFalse(any("+13333333333" in line for line in debug_logs))
 
 
 class _FakeLongLinkPaymentClient:

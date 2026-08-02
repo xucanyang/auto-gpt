@@ -3401,6 +3401,23 @@ class IcloudHmeMailbox(BaseMailbox):
             if str(code or "").strip()
         }
 
+        def looks_like_verification_mail(subject: str) -> bool:
+            lowered_subject = str(subject or "").lower()
+            return any(
+                marker in lowered_subject
+                for marker in (
+                    "chatgpt",
+                    "openai",
+                    "verification",
+                    "verify",
+                    "code",
+                    "验证",
+                    "認証",
+                    "one-time",
+                    "otp",
+                )
+            )
+
         def poll_once() -> Optional[str]:
             forward_mailboxes = self._candidate_forward_mailboxes_for_account(account)
             namespace_ids = len(forward_mailboxes) > 1
@@ -3422,36 +3439,7 @@ class IcloudHmeMailbox(BaseMailbox):
                     # raw ID there would let mailbox A suppress mailbox B.
                     if scoped_mid in seen or (not namespace_ids and raw_mid in seen):
                         continue
-                    msg_ts = self._tempmail_mailbox._parse_message_timestamp(msg)
                     subject_hint = str(msg.get("subject") or "").strip()
-                    if otp_sent_at and msg_ts and msg_ts < float(otp_sent_at):
-                        # Log verification-looking mail that the time cutoff
-                        # discarded so operators can tell "no mail" from
-                        # "mail arrived before otp_sent_at".
-                        lowered_subject = subject_hint.lower()
-                        if any(
-                            marker in lowered_subject
-                            for marker in (
-                                "chatgpt",
-                                "openai",
-                                "verification",
-                                "verify",
-                                "code",
-                                "验证",
-                                "認証",
-                                "one-time",
-                                "otp",
-                            )
-                        ):
-                            age = max(0, int(float(otp_sent_at) - float(msg_ts)))
-                            self._log(
-                                "[iCloudHME] 转发箱有疑似验证码邮件但早于 otp_sent_at 被跳过: "
-                                f"alias={alias} forward={getattr(forward_mailbox, 'email', '')} "
-                                f"subject={subject_hint[:80]} age_before_cutoff={age}s"
-                            )
-                        seen.add(scoped_mid)
-                        continue
-
                     detail = self._tempmail_mailbox._get_email_detail(m_id, raw_mid)
                     received_for = detail.get("received_for") if isinstance(detail, dict) else []
                     raw_message = str(detail.get("raw_message") or "")
@@ -3478,25 +3466,25 @@ class IcloudHmeMailbox(BaseMailbox):
                     if not matched_alias:
                         # Surface OpenAI-looking mail that failed +tag header match so
                         # operators can tell "no mail" from "mail arrived but unmatched".
-                        lowered_subject = subject_hint.lower()
-                        if any(
-                            marker in lowered_subject
-                            for marker in (
-                                "chatgpt",
-                                "openai",
-                                "verification",
-                                "verify",
-                                "code",
-                                "验证",
-                                "認証",
-                                "one-time",
-                                "otp",
-                            )
-                        ):
+                        if looks_like_verification_mail(subject_hint):
                             self._log(
                                 "[iCloudHME] 转发箱有疑似验证码邮件但未匹配当前 HME 别名: "
                                 f"alias={alias} forward={getattr(forward_mailbox, 'email', '')} "
                                 f"subject={subject_hint[:80]}"
+                            )
+                        seen.add(scoped_mid)
+                        continue
+
+                    msg_ts = self._tempmail_mailbox._parse_message_timestamp(msg)
+                    if otp_sent_at and msg_ts and msg_ts < float(otp_sent_at):
+                        # Time filtering is valid only after the shared forward
+                        # mailbox message has been attributed to this HME alias.
+                        if looks_like_verification_mail(subject_hint):
+                            age = max(0, int(float(otp_sent_at) - float(msg_ts)))
+                            self._log(
+                                "[iCloudHME] 转发箱有疑似验证码邮件但早于 otp_sent_at 被跳过: "
+                                f"alias={alias} forward={getattr(forward_mailbox, 'email', '')} "
+                                f"subject={subject_hint[:80]} age_before_cutoff={age}s"
                             )
                         seen.add(scoped_mid)
                         continue

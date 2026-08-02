@@ -152,6 +152,18 @@ def test_redact_log_text_masks_phone_after_verification_context_without_otp_misf
     assert REDACTED_OTP not in safe
 
 
+def test_redact_log_text_can_expose_phone_without_treating_it_as_otp():
+    phone = "+13434832954"
+    safe = redact_log_text(
+        f"OpenAI 已接受并发送验证码: {phone} otp=123456",
+        expose_phone=True,
+    )
+
+    assert phone in safe
+    assert "123456" not in safe
+    assert REDACTED_OTP in safe
+
+
 def test_redact_log_text_covers_free_text_code_and_api_secret_snippets():
     raw = "\n".join(
         [
@@ -321,10 +333,17 @@ def test_format_task_timeline_log_builds_stable_human_timeline():
     assert line == "[邮箱测活][5/74][demo@example.com] 阶段 1/2：登录测活并抓取 AccessToken；开始执行"
 
 
-def test_format_phone_binding_timeline_log_is_plain_aligned_and_masks_phone_otp():
+def test_format_phone_binding_info_shows_full_identity_but_masks_otp():
+    email = "operator.account+gpt1@icloud.com"
+    phone = "+12269023179"
     line = format_task_timeline_log(
         "手机绑定",
-        "状态：已获取｜验证码=123456，手机号=+12269023179",
+        (
+            "状态：已获取｜验证码=123456，"
+            f"手机号={mask_phone_for_log(phone)}，邮箱={mask_email_for_log(email)}"
+        ),
+        email=email,
+        phone=phone,
         stage_index=4,
         stage_total=12,
         phase_label="邮箱验证",
@@ -334,8 +353,36 @@ def test_format_phone_binding_timeline_log_is_plain_aligned_and_masks_phone_otp(
     assert "已获取" in line
     assert "验证码=[REDACTED_OTP]" in line
     assert "123456" not in line
-    assert "+12269023179" not in line
-    assert "+1226***3179" in line
+    assert phone in line
+    assert email in line
+    assert mask_phone_for_log(phone) not in line
+    assert mask_email_for_log(email) not in line
+
+
+def test_format_phone_binding_debug_masks_identity_and_strong_secrets():
+    email = "operator.account+gpt1@icloud.com"
+    phone = "+12269023179"
+    line = format_task_timeline_log(
+        "手机绑定",
+        (
+            f"邮箱={email}，手机号={phone}，验证码=123456，"
+            "token=token-secret password=password-secret"
+        ),
+        email=email,
+        phone=phone,
+        stage_index=4,
+        stage_total=12,
+        phase_label="邮箱验证",
+        debug=True,
+    )
+
+    assert email not in line
+    assert phone not in line
+    assert mask_email_for_log(email) in line
+    assert mask_phone_for_log(phone) in line
+    assert "123456" not in line
+    assert "token-secret" not in line
+    assert "password-secret" not in line
 
 
 def test_format_registration_timeline_log_keeps_detailed_stable_fields():
@@ -739,6 +786,55 @@ def test_api_tasks_log_and_save_task_log_are_redaction_backstops(monkeypatch, tm
     assert "654321" not in dumped
     assert "eyJabcdefghijk" not in row.error
     assert "secret" not in row.error
+
+
+def test_phone_binding_info_keeps_identity_while_debug_and_secrets_stay_masked():
+    import api.tasks as tasks
+
+    task_id = "task_phone_binding_identity_visibility"
+    email = "operator.account+gpt1@icloud.com"
+    phone = "+15551234567"
+    tasks._task_store.create(
+        task_id,
+        platform="chatgpt",
+        total=1,
+        source="phone_binding_test",
+        meta={},
+    )
+
+    sensitive_suffix = (
+        "验证码=876543 token=token-secret password=password-secret "
+        "proxy=http://proxy-user:proxy-pass@1.2.3.4:8000"
+    )
+    tasks._log(
+        task_id,
+        f"[手机号绑定] 邮箱={email} 手机号={phone} {sensitive_suffix}",
+        level="info",
+    )
+    tasks._log(
+        task_id,
+        f"[手机号绑定] 邮箱={email} 手机号={phone} {sensitive_suffix}",
+        level="debug",
+    )
+
+    raw_snapshot = tasks._task_store.snapshot(task_id)
+    response_snapshot = tasks._sanitize_task_snapshot_for_response(raw_snapshot)
+    for snapshot in (raw_snapshot, response_snapshot):
+        info_line, debug_line = snapshot["logs"][-2:]
+        assert email in info_line
+        assert phone in info_line
+        assert email not in debug_line
+        assert phone not in debug_line
+        assert mask_email_for_log(email) in debug_line
+        assert mask_phone_for_log(phone) in debug_line
+        for leaked in (
+            "876543",
+            "token-secret",
+            "password-secret",
+            "proxy-user:proxy-pass@",
+        ):
+            assert leaked not in info_line
+            assert leaked not in debug_line
 
 
 def test_stop_task_persists_click_and_terminal_snapshots(monkeypatch, tmp_path):

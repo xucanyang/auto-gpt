@@ -42,6 +42,12 @@ from .constants import (
 
 logger = logging.getLogger(__name__)
 
+OTP_SENT_AT_CLOCK_SKEW_GRACE_SECONDS = 5
+
+
+def _otp_request_started_at() -> float:
+    return time.time() - OTP_SENT_AT_CLOCK_SKEW_GRACE_SECONDS
+
 
 class _SkipCodexOAuth(RuntimeError):
     """Internal control flow for the GPT-only registration contract."""
@@ -672,6 +678,7 @@ class RegistrationEngine:
                 }, separators=(",", ":"))
                 headers["openai-sentinel-token"] = sentinel
 
+            request_started_at = _otp_request_started_at()
             response = self.session.post(
                 OPENAI_API_ENDPOINTS["signup"],
                 headers=headers,
@@ -700,6 +707,7 @@ class RegistrationEngine:
                 if is_existing:
                     self._log(f"检测到已注册账号，将自动切换到登录流程")
                     self._is_existing_account = True
+                    self._otp_sent_at = request_started_at
 
                 return SignupFormResult(
                     success=True,
@@ -778,6 +786,7 @@ class RegistrationEngine:
                         "flow": self._password_sentinel.flow,
                     }, separators=(",", ":"))
 
+                request_started_at = _otp_request_started_at()
                 response = self.session.post(
                     OPENAI_API_ENDPOINTS["register"],
                     headers=register_headers,
@@ -795,6 +804,7 @@ class RegistrationEngine:
                         if page_type == OPENAI_PAGE_TYPES.get("EMAIL_OTP_VERIFICATION", "email_otp_verification"):
                             self._log("检测到已注册账号，自动切换到登录流程")
                             self._is_existing_account = True
+                            self._otp_sent_at = request_started_at
                     except Exception:
                         pass
                     return True, password
@@ -844,9 +854,7 @@ class RegistrationEngine:
     def _send_verification_code(self) -> bool:
         """发送验证码"""
         try:
-            # 记录发送时间戳
-            self._otp_sent_at = time.time()
-
+            request_started_at = _otp_request_started_at()
             response = self.session.get(
                 OPENAI_API_ENDPOINTS["send_otp"],
                 headers={
@@ -856,7 +864,10 @@ class RegistrationEngine:
             )
 
             self._log(f"验证码发送状态: {response.status_code}")
-            return response.status_code == 200
+            if response.status_code == 200:
+                self._otp_sent_at = request_started_at
+                return True
+            return False
 
         except Exception as e:
             self._log(f"发送验证码失败: {e}", "error")
@@ -1090,6 +1101,7 @@ class RegistrationEngine:
                     "id": did, "flow": sen_payload.flow,
                 }, separators=(",", ":"))
 
+            authorize_started_at = _otp_request_started_at()
             resp = login_session.post(OPENAI_API_ENDPOINTS["signup"], headers=headers, data=signup_body)
             self._log(f"Codex login authorize/continue: {resp.status_code}")
             if resp.status_code != 200:
@@ -1103,7 +1115,7 @@ class RegistrationEngine:
             # 6. 如果需要 OTP，等待第二次验证码
             if page_type == "email_otp_verification":
                 self._log("等待第二次验证码...")
-                self._otp_sent_at = time.time()
+                self._otp_sent_at = authorize_started_at
                 code = self._get_verification_code()
                 if not code:
                     self._log("Codex login 获取验证码失败", "error")
@@ -1184,6 +1196,7 @@ class RegistrationEngine:
                     }, separators=(",", ":"))
 
                 pwd_body = json.dumps({"password": self.password, "username": self.email})
+                password_started_at = _otp_request_started_at()
                 pwd_resp = login_session.post(OPENAI_API_ENDPOINTS["register"], headers=pwd_headers, data=pwd_body)
                 self._log(f"Codex login 密码提交: {pwd_resp.status_code}")
                 if pwd_resp.status_code != 200:
@@ -1197,11 +1210,14 @@ class RegistrationEngine:
                 # 密码后可能需要 OTP
                 if pwd_page == "email_otp_verification" or pwd_page == "email_otp_send":
                     if pwd_page == "email_otp_send":
+                        otp_send_started_at = _otp_request_started_at()
                         login_session.get(OPENAI_API_ENDPOINTS["send_otp"], headers={
                             "referer": f"{OPENAI_AUTH}/email-verification",
                         }, timeout=15)
+                        self._otp_sent_at = otp_send_started_at
+                    else:
+                        self._otp_sent_at = password_started_at
                     self._log("Codex login: 等待验证码...")
-                    self._otp_sent_at = time.time()
                     code = self._get_verification_code()
                     if not code:
                         self._log("Codex login 获取验证码失败", "error")
@@ -1481,8 +1497,6 @@ class RegistrationEngine:
             # 9. [已注册账号跳过] 发送验证码
             if self._is_existing_account:
                 self._log("9. [已注册账号] 跳过发送验证码，使用自动发送的 OTP")
-                # 已注册账号的 OTP 在提交表单时已自动发送，记录时间戳
-                self._otp_sent_at = time.time()
             else:
                 self._log("9. 发送验证码...")
                 if not self._send_verification_code():
@@ -1626,6 +1640,7 @@ class RegistrationEngine:
                     }, separators=(",", ":"))
 
                 signup_body = json.dumps({"username": {"value": self.email, "kind": "email"}, "screen_hint": "signup"})
+                authorize_started_at = _otp_request_started_at()
                 signup_resp = login_session.post(
                     OPENAI_API_ENDPOINTS["signup"], headers=signup_headers, data=signup_body
                 )
@@ -1640,13 +1655,16 @@ class RegistrationEngine:
                 if page_type in ("email_otp_send", "email_otp_verification"):
                     # 发送 OTP
                     if page_type == "email_otp_send":
+                        otp_send_started_at = _otp_request_started_at()
                         login_session.get(OPENAI_API_ENDPOINTS["send_otp"], headers={
                             "referer": f"{OPENAI_AUTH}/email-verification",
                         }, timeout=15)
+                        self._otp_sent_at = otp_send_started_at
                         self._log("Codex OTP 已发送")
+                    else:
+                        self._otp_sent_at = authorize_started_at
 
                     # 等待 OTP
-                    self._otp_sent_at = time.time()
                     code = self._get_verification_code()
                     if not code:
                         raise RuntimeError("Codex OTP 获取失败")

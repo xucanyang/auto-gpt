@@ -19,6 +19,10 @@ REDACTED_URL = "[REDACTED_URL]"
 _URL_RE = re.compile(r"https?://[^\s'\"<>｜|，,；;]+", re.I)
 _PROXY_URL_RE = re.compile(r"(?P<scheme>[a-z][a-z0-9+.-]*://)(?P<userinfo>[^\s/@:]+:[^\s/@]+)@(?P<host>[^\s'\"<>]+)", re.I)
 _PHONE_RE = re.compile(r"(?<![A-Za-z0-9])\+\d[\d\s().-]{6,}\d")
+_EMAIL_RE = re.compile(
+    r"(?<![A-Za-z0-9.!#$%&'*+/?^_`{|}~\-])"
+    r"[A-Za-z0-9.!#$%&'*+/?^_`{|}~-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"
+)
 _JWT_RE = re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b")
 
 _TOKEN_KEYS = {
@@ -286,6 +290,30 @@ def mask_email_for_log(value: Any) -> str:
     return f"{masked_local}@{domain}"
 
 
+def mask_emails_for_log(value: Any) -> str:
+    """Mask every email address in one free-text log line."""
+
+    return _EMAIL_RE.sub(lambda match: mask_email_for_log(match.group(0)), str(value or ""))
+
+
+def restore_known_identity_for_log(
+    value: Any,
+    *,
+    email: Any = "",
+    phone: Any = "",
+) -> str:
+    """Restore only the task's known masked identity in an Info log line."""
+
+    text = str(value or "")
+    raw_email = str(email or "").strip()
+    if raw_email:
+        text = text.replace(mask_email_for_log(raw_email), raw_email)
+    raw_phone = str(phone or "").strip()
+    if raw_phone:
+        text = text.replace(mask_phone_for_log(raw_phone), raw_phone)
+    return text
+
+
 def redact_raw_phone_line(value: Any) -> str:
     """Redact a pasted ``phone----api_url`` line for task display/history."""
 
@@ -444,6 +472,14 @@ def _redact_text_patterns(value: Any, *, expose_phone: bool = False, expose_otp:
         text,
     )
     text = _redact_urls_in_text(text)
+    protected_phones: list[str] = []
+    phone_placeholder = "<TASK_PHONE>"
+    if expose_phone:
+        def protect_phone(match: re.Match[str]) -> str:
+            protected_phones.append(match.group(0))
+            return phone_placeholder
+
+        text = _PHONE_RE.sub(protect_phone, text)
     text = _redact_key_value_text(text, expose_otp=expose_otp)
     # 先处理 E.164 手机号，再做验证码上下文匹配。否则
     # “发送验证码: +13434832954” 会被长授权码规则误判成 OTP。
@@ -451,6 +487,8 @@ def _redact_text_patterns(value: Any, *, expose_phone: bool = False, expose_otp:
         text = _PHONE_RE.sub(lambda m: mask_phone_for_log(m.group(0)), text)
     if not expose_otp:
         text = _redact_otp_context(text)
+    for phone in protected_phones:
+        text = text.replace(phone_placeholder, phone, 1)
     return text
 
 
@@ -458,6 +496,16 @@ def redact_log_text(value: Any, *, expose_phone: bool = False, expose_otp: bool 
     """Free-text log redaction.  Safe to call at every task-log boundary."""
 
     return _redact_text_patterns(value, expose_phone=expose_phone, expose_otp=expose_otp)
+
+
+def sanitize_phone_binding_log_line(value: Any, *, debug: bool | None = None) -> str:
+    """Apply the phone-binding Info/Debug identity visibility contract."""
+
+    text = str(value or "")
+    is_debug = "[DEBUG]" in text.upper() if debug is None else bool(debug)
+    if is_debug:
+        text = mask_emails_for_log(text)
+    return redact_log_text(text, expose_phone=not is_debug, expose_otp=False)
 
 
 _COMMON_INFO_PREFIXES = (
@@ -1124,10 +1172,7 @@ _REGISTRATION_MODULE_PREFIX_RE = re.compile(
     r"^\s*\[(?:控制|代理|账号|指纹|邮箱|验证码|保存|iCloudHME|TempMailLocal|阶段|路由|注册|登录|已有账号|SKIP_SAVE|升级链接|Auto Upload|Upload Gate|结果|DEBUG|OK|SKIP|FAIL|FATAL|STOP|WARN|ERROR)\]\s*",
     re.I,
 )
-_REGISTRATION_EMAIL_RE = re.compile(
-    r"(?<![A-Za-z0-9.!#$%&'*+/?^_`{|}~\-])"
-    r"[A-Za-z0-9.!#$%&'*+/?^_`{|}~-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"
-)
+_REGISTRATION_EMAIL_RE = _EMAIL_RE
 _REGISTRATION_STAGE_LABELS: dict[int, str] = {
     1: "准备",
     2: "选择代理",
@@ -1656,7 +1701,7 @@ def format_task_timeline_log(
     task_name = str(task or "").strip()
     phone_binding_task = task_name in {"手机绑定", "手机号绑定"}
     registration_task = task_name in {"ChatGPT注册", "ChatGPT 注册"}
-    expose_phone = False
+    expose_phone = phone_binding_task and not debug
     expose_otp = False
 
     def _pad(value: int, total_value: int) -> str:
@@ -1691,8 +1736,17 @@ def format_task_timeline_log(
                 stage_text = f"{stage_text} {normalized_phase_label}"
             tags.append(stage_text)
 
+        identity_message = str(message or "")
+        if debug:
+            identity_message = mask_emails_for_log(identity_message)
+        else:
+            identity_message = restore_known_identity_for_log(
+                identity_message,
+                email=email,
+                phone=phone,
+            )
         body = redact_log_text(
-            message,
+            identity_message,
             expose_phone=expose_phone,
             expose_otp=expose_otp,
         ).strip()

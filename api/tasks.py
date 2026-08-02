@@ -103,7 +103,9 @@ from services.chatgpt_core.task_logging import (
     redact_log_text,
     redact_proxy_url,
     redact_raw_phone_line,
+    restore_known_identity_for_log,
     sanitize_error_message,
+    sanitize_phone_binding_log_line,
     sanitize_phone_item,
     sanitize_phone_result,
     sanitize_task_detail,
@@ -6169,11 +6171,35 @@ def _log(
     normalized_level = str(level or "info").strip().lower() or "info"
     if normalized_level == "debug" and not text.lstrip().upper().startswith("[DEBUG]"):
         text = f"[DEBUG] {text}"
-    text = redact_log_text(text, expose_phone=expose_phone, expose_otp=expose_otp)
+    if "[手机号绑定]" in text:
+        text = sanitize_phone_binding_log_line(
+            text,
+            debug=normalized_level == "debug",
+        )
+    else:
+        text = redact_log_text(text, expose_phone=expose_phone, expose_otp=expose_otp)
     entry = f"[{ts}] {text}"
     _task_store.append_log(task_id, entry)
     _maybe_persist_task_log_checkpoint(task_id, text)
     print(entry)
+
+
+def _sanitize_task_snapshot_for_response(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Sanitize one task snapshot without remasking phone-binding Info logs."""
+
+    raw_snapshot = dict(snapshot or {})
+    safe_snapshot = sanitize_task_detail(raw_snapshot)
+    if not isinstance(safe_snapshot, dict):
+        return {}
+    if (
+        str(raw_snapshot.get("source") or "").strip() == "phone_binding_test"
+        and isinstance(raw_snapshot.get("logs"), list)
+    ):
+        safe_snapshot["logs"] = [
+            sanitize_phone_binding_log_line(line)
+            for line in raw_snapshot.get("logs") or []
+        ]
+    return safe_snapshot
 
 
 def _claim_next_task_attempt(control) -> int:
@@ -6301,6 +6327,7 @@ def _task_timeline_log(
         stage_index=stage_index,
         stage_total=stage_total,
         phase_label=phase_label,
+        debug=str(level or "info").strip().lower() == "debug",
     )
     _set_task_current(
         task_id,
@@ -6324,7 +6351,10 @@ def _task_timeline_log(
         task_id,
         line,
         level,
-        expose_phone=False,
+        expose_phone=(
+            str(task or "").strip() in {"手机绑定", "手机号绑定"}
+            and str(level or "info").strip().lower() != "debug"
+        ),
         expose_otp=False,
     )
     return line
@@ -6532,9 +6562,12 @@ def _save_task_log(
         and str(raw_detail.get("source") or "").strip() == "phone_binding_test"
         and isinstance(raw_detail.get("logs"), list)
     ):
-        # 手机绑定排障依赖完整手机号/验证码上下文；这些日志进入任务前
-        # 已经保留 token/password/proxy 密码等强敏感信息的脱敏。
-        safe_detail["logs"] = list(raw_detail.get("logs") or [])
+        # 手机绑定 Info 保留完整任务身份；Debug 仍遮手机号和邮箱，
+        # OTP/token/password/proxy 凭据继续经过统一强敏感信息脱敏。
+        safe_detail["logs"] = [
+            sanitize_phone_binding_log_line(line)
+            for line in raw_detail.get("logs") or []
+        ]
     safe_detail.setdefault("redaction_version", REDACTION_VERSION)
     task_id = str(safe_detail.get("task_id") or "").strip()
     incoming_declares_terminal = _task_status_is_terminal(
@@ -13803,17 +13836,24 @@ def _run_phone_binding_test_concurrent(
             if not primary_email:
                 primary_email = value
 
-    def task_log_for_attempt(*, account_position: int, account_id: int, email: str, phone: str, phone_index: int, phone_total_label: str, attempt_id: int | None = None):
+    def task_log_for_attempt(*, account_position: int, account_id: int, email_getter, phone: str, phone_index: int, phone_total_label: str, attempt_id: int | None = None):
         def _task_log(message: str, level: str = "info") -> None:
             control.checkpoint(attempt_id=attempt_id)
             raw = str(message or "")
             effective_level = classify_task_log_level(raw, level, flow="phone_binding")
+            cleaned = clean_upstream_message(raw)
+            if effective_level != "debug":
+                cleaned = restore_known_identity_for_log(
+                    cleaned,
+                    email=email_getter(),
+                    phone=phone,
+                )
             _log(
                 task_id,
                 "[手机号绑定]"
                 f"[账号 {account_position}/{total_accounts}]"
                 f"[号码 {phone_index}/{phone_total_label}] "
-                f"{clean_upstream_message(raw)}",
+                f"{cleaned}",
                 level="debug" if effective_level == "debug" else "info",
             )
         return _task_log
@@ -13851,7 +13891,7 @@ def _run_phone_binding_test_concurrent(
             task_log = task_log_for_attempt(
                 account_position=account_position,
                 account_id=account_id,
-                email=email,
+                email_getter=lambda: email,
                 phone=phone,
                 phone_index=phone_index,
                 phone_total_label=phone_total_label,
@@ -14453,6 +14493,7 @@ def _run_phone_binding_test(
         *,
         stage_index: int | None = None,
         phase_label: str = "",
+        debug: bool = False,
     ) -> str:
         index = int(stage_index or phone_log_context.get("stage_index") or 1)
         label = _phone_stage_label(index, phase_label)
@@ -14469,6 +14510,7 @@ def _run_phone_binding_test(
             stage_index=index,
             stage_total=PHONE_BINDING_STAGE_TOTAL,
             phase_label=label,
+            debug=debug,
         )
 
     def clean_phone_binding_message(message: str) -> str:
@@ -14499,7 +14541,12 @@ def _run_phone_binding_test(
         set_phone_log_context(stage_index=index, stage_label=label)
         _log(
             task_id,
-            _phone_binding_log_line(clean_phone_binding_message(message), stage_index=index, phase_label=label),
+            _phone_binding_log_line(
+                clean_phone_binding_message(message),
+                stage_index=index,
+                phase_label=label,
+                debug=str(level or "info").strip().lower() == "debug",
+            ),
             level,
         )
 
@@ -19702,7 +19749,7 @@ def get_task(task_id: str):
             )
         _ensure_task_exists(task_id)
 
-    snapshot = sanitize_task_detail(_task_store.snapshot(task_id))
+    snapshot = _sanitize_task_snapshot_for_response(_task_store.snapshot(task_id))
     if str(snapshot.get("status") or "").strip().lower() in TERMINAL_TASK_STATUSES:
         # Terminal task IDs are immutable.  Private caching protects the API
         # from stale clients even if their old React effect keeps rendering.
@@ -19715,4 +19762,7 @@ def get_task(task_id: str):
 
 @router.get("")
 def list_tasks():
-    return sanitize_task_detail(_task_store.list_snapshots())
+    return [
+        _sanitize_task_snapshot_for_response(snapshot)
+        for snapshot in _task_store.list_snapshots()
+    ]

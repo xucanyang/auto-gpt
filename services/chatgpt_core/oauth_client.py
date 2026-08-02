@@ -6,6 +6,7 @@ import time
 import secrets
 import uuid
 import json
+import math
 import random
 import re
 from contextlib import ExitStack
@@ -45,6 +46,16 @@ from .sentinel_browser import (
     merge_playwright_cookies_into_session,
 )
 from .sentinel_constants import PINNED_CHROMIUM_VERSION
+
+
+OTP_SENT_AT_CLOCK_SKEW_GRACE_SECONDS = 5
+OTP_SENT_AT_FALLBACK_GRACE_SECONDS = 60
+
+
+def _otp_request_started_at() -> float:
+    """Anchor OTP mail filtering before the request that can trigger delivery."""
+
+    return time.time() - OTP_SENT_AT_CLOCK_SKEW_GRACE_SECONDS
 
 
 class OAuthClient:
@@ -1939,6 +1950,7 @@ class OAuthClient:
                     kwargs["impersonate"] = impersonate
 
                 self._browser_pause()
+                request_started_at = _otp_request_started_at()
                 r = self.session.post(request_url, **kwargs)
                 self._log(f"/authorize/continue -> {r.status_code}")
 
@@ -2005,6 +2017,7 @@ class OAuthClient:
                     if impersonate:
                         kwargs["impersonate"] = impersonate
                     self._browser_pause()
+                    request_started_at = _otp_request_started_at()
                     r = self.session.post(request_url, **kwargs)
                     self._log(f"/authorize/continue(重试) -> {r.status_code}")
 
@@ -2016,6 +2029,8 @@ class OAuthClient:
                 flow_state = self._state_from_payload(
                     data, current_url=str(r.url) or request_url
                 )
+                if self._state_is_email_otp(flow_state):
+                    flow_state.otp_sent_at = request_started_at
                 self._log(describe_flow_state(flow_state))
                 if self._state_is_email_otp(flow_state):
                     self._log("authorize_continue 分支判定: 进入 email_otp_first / 既有账号恢复倾向链")
@@ -2112,6 +2127,7 @@ class OAuthClient:
                     kwargs["impersonate"] = impersonate
 
                 self._browser_pause()
+                request_started_at = _otp_request_started_at()
                 r = self.session.post(request_url, **kwargs)
                 self._log(f"/password/verify -> {r.status_code}")
 
@@ -2159,6 +2175,8 @@ class OAuthClient:
                 flow_state = self._state_from_payload(
                     data, current_url=str(r.url) or request_url
                 )
+                if self._state_is_email_otp(flow_state):
+                    flow_state.otp_sent_at = request_started_at
                 self._log(f"verify {describe_flow_state(flow_state)}")
                 return flow_state
             except Exception as e:
@@ -2208,6 +2226,7 @@ class OAuthClient:
                 kwargs["impersonate"] = impersonate
 
             self._browser_pause()
+            request_started_at = _otp_request_started_at()
             r = self.session.post(request_url, **kwargs)
             self._log(f"/passwordless/send-otp -> {r.status_code}")
 
@@ -2226,6 +2245,7 @@ class OAuthClient:
             )
             if not self._state_is_email_otp(flow_state):
                 flow_state = self._state_from_url(f"{self.oauth_issuer}/email-verification")
+            flow_state.otp_sent_at = request_started_at
             self._log(f"passwordless OTP 已触发 {describe_flow_state(flow_state)}")
             self._check_stop()
             return flow_state
@@ -4846,7 +4866,7 @@ class OAuthClient:
         self._log("步骤4: 检测到邮箱 OTP 验证")
         scope_log_prefix = str(scope_log_prefix or "").strip()
 
-        def _resend_email_otp() -> bool:
+        def _resend_email_otp() -> float | None:
             self._check_stop()
             prefer_passwordless = bool(
                 self.config.get("prefer_passwordless_login")
@@ -4877,6 +4897,7 @@ class OAuthClient:
                         kwargs["impersonate"] = impersonate
                     self._browser_pause()
                     self._check_stop()
+                    resend_started_at = _otp_request_started_at()
                     resp = self.session.post(request_url, **kwargs)
                     self._check_stop()
                     self._log(f"/passwordless/send-otp -> {resp.status_code}")
@@ -4889,7 +4910,7 @@ class OAuthClient:
 
             if resend_ok:
                 self._log("已触发 passwordless OTP 重发")
-                return True
+                return resend_started_at
 
             request_url = f"{self.oauth_issuer}/api/accounts/email-otp/send"
             headers = self._headers(
@@ -4912,18 +4933,19 @@ class OAuthClient:
                     kwargs["impersonate"] = impersonate
                 self._browser_pause()
                 self._check_stop()
+                resend_started_at = _otp_request_started_at()
                 resp = self.session.get(request_url, **kwargs)
                 self._check_stop()
                 self._log(f"/email-otp/send -> {resp.status_code}")
                 if resp.status_code == 200:
                     self._log("已触发 email-otp 重发")
-                    return True
+                    return resend_started_at
                 self._log(f"email-otp/send 重发失败: {resp.text[:120]}")
             except Exception as e:
                 if self._is_stop_exception(e):
                     self._raise_stop(e)
                 self._log(f"email-otp/send 重发异常: {e}")
-            return False
+            return None
 
         request_url = f"{self.oauth_issuer}/api/accounts/email-otp/validate"
         self._log(f"email_otp_validate: device_id={device_id}")
@@ -5010,11 +5032,24 @@ class OAuthClient:
         except Exception:
             otp_resend_wait_seconds = 120
         otp_resend_wait_seconds = max(30, min(otp_resend_wait_seconds, 900))
-        otp_deadline = time.time() + otp_wait_seconds
-        otp_sent_at = time.time() - 15
-        next_resend_at = time.time() + otp_resend_wait_seconds
+        now_ts = time.time()
+        otp_deadline = now_ts + otp_wait_seconds
+        otp_sent_at_source = "trigger_request"
+        try:
+            otp_sent_at = float(getattr(state, "otp_sent_at", None))
+        except (TypeError, ValueError):
+            otp_sent_at = 0.0
+        if (
+            not math.isfinite(otp_sent_at)
+            or otp_sent_at <= 0
+            or otp_sent_at > now_ts + OTP_SENT_AT_CLOCK_SKEW_GRACE_SECONDS
+        ):
+            otp_sent_at = now_ts - OTP_SENT_AT_FALLBACK_GRACE_SECONDS
+            otp_sent_at_source = "fallback"
+        next_resend_at = now_ts + otp_resend_wait_seconds
         self._log(
-            f"OAuth OTP 等待窗口: total={otp_wait_seconds}s, poll_window={otp_poll_window}s, initial_grace=15s"
+            f"OAuth OTP 等待窗口: total={otp_wait_seconds}s, poll_window={otp_poll_window}s, "
+            f"cutoff_source={otp_sent_at_source}, cutoff_age={max(0, int(now_ts - otp_sent_at))}s"
         )
 
         def validate_otp(code, *, message_id=""):
@@ -5115,11 +5150,10 @@ class OAuthClient:
                         self._log(
                             f"暂未收到 OTP，触发重发（间隔 {otp_resend_wait_seconds}s）"
                         )
-                        if _resend_email_otp():
-                            otp_sent_at = time.time() - 5
-                            next_resend_at = time.time() + otp_resend_wait_seconds
-                        else:
-                            next_resend_at = time.time() + otp_resend_wait_seconds
+                        resent_at = _resend_email_otp()
+                        if resent_at is not None:
+                            otp_sent_at = resent_at
+                        next_resend_at = time.time() + otp_resend_wait_seconds
                     elapsed = max(0, int(now_ts - (otp_deadline - otp_wait_seconds)))
                     if now_ts - last_wait_debug_at >= 120:
                         self._log(

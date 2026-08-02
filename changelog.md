@@ -24,6 +24,10 @@
 - **统一测试文档入口**：`README.md`、`AGENTS.md` 与 `docs/docker-image-release.md` 现在统一指向 Docker 测试规范，移除会吞掉收集失败的 `pytest tests -q || true` 作为推荐门禁，明确当前 `requirements-test.txt`、`docker-compose.test.yml` 和测试脚本仍待落地。
 
 ### 修复 (Fixed)
+- **修复手机号绑定与注册链路首封邮箱 OTP 被误判为旧邮件**：`services/chatgpt_core/oauth_client.py` 与 `utils.py` 为 OAuth `FlowState` 增加真实发码时间锚点，在 `/api/accounts/authorize/continue`、`/api/accounts/password/verify`、`/api/accounts/passwordless/send-otp` 请求发出前记录截止线，并贯穿到邮箱轮询；Playwright Sentinel、页面响应解析和进入 OTP 页的耗时不再把截止线重置为“开始轮询时刻”。成功重发才切换为重发请求起点，重发失败保留原截止线；只有旧调用没有时间锚点时才使用 60 秒兼容回退，并统一预留 5 秒邮件服务器时钟/队列偏差。`services/chatgpt_core/any_auto/register.py` 同步修正新账号显式发码、已有账号自动发码、密码响应直达 OTP 及遗留 Codex 登录分支，避免注册、已有账号登录和 Auth/RT 补抓重现同类问题。
+- **修复 HME 共享转发箱的旧邮件诊断归属错误**：`core/base_mailbox.py` 现在先读取邮件详情并严格校验当前物理别名或 `+tag` 传输头，再应用 `otp_sent_at` 时间过滤；其他并发账号的邮件只记录“未匹配当前 HME 别名”，不会再被错误打印成当前 alias 的“早于截止线”邮件，匹配当前 alias 的真实旧信仍保留可诊断的提前秒数。
+- **手机号绑定 Info 日志显示完整手机号和邮箱**：`services/chatgpt_core/task_logging.py` 与 `api/tasks.py` 将完整身份展示严格限定到 `phone_binding_test` 的 Info 日志，并覆盖串行/并发格式化、SSE 任务存储、任务快照读取和持久化历史；Debug 仍遮蔽手机号与邮箱，OTP、授权码、token、密码、Cookie、代理凭据和 API 密钥继续无条件脱敏。完整手机号会在 OTP 上下文脱敏前被临时保护，避免“发送验证码: +手机号”被误判为授权码而替换。
+- **同步侧栏可见版本为 `v2.8.74`**：`frontend/src/app/AppShell.tsx` 更新版本标识，便于确认三个常驻实例已加载本次 OTP 时间锚点、HME 邮件归属和手机号绑定日志修复。
 - **修复 OAIPay 手动上传弹窗无法拉取分组**：`main.py` 新增只包含 `/api/integrations/oaipay-categories` 的窄路由 `api/oaipay.py`，不重新挂载已退役的 `api.integrations`/GoPay 入口；手动弹窗继续使用旧前端路径，但现在由 `services/chatgpt_core/oaipay_upload.py` 的 `fetch_oaipay_categories()` 统一拉取分类，和自动上传共用 base URL 解析、分类接口候选、Bearer/raw 上传密钥兼容、`x-api-key` 头和 `data.items / data / categories` 响应解析，避免自动上传能分类、手动选择却 404 或认证失败。`frontend/src/pages/Accounts.tsx` 同步清空旧分类缓存并展示明确的分组拉取错误。
 - **同步侧栏可见版本为 `v2.8.73`**：`frontend/src/app/AppShell.tsx` 更新版本标识，便于确认三个常驻实例已加载本次 OAIPay 手动分组与支付链接当前状态筛选修复。
 - **修复手动手机号绑定任务启动后无实时日志**：`api/tasks.py` 将手动粘贴 `手机号----收码API` 生成的展示态 `manual` 与运行态 canonical `normal` 解耦；后台 runner 继续消费任务创建时冻结的 `phone_items`，但不会再把 `manual` 当作非法 `phone_pool_mode` 抛出 `HTTPException(400, "手机号取号模式无效")`。同时兼容旧快照中的 `manual/upload/paste` 别名，避免接口已返回 `task_id`、任务历史显示 `running`，但 background task 在首行日志前崩溃，导致前端 SSE 一直空白。
@@ -52,6 +56,7 @@
 - **修正 Docker 发布拓扑旧描述**：`docs/docker-image-release.md` 按当前 `docker-compose.multi.yml` 更新为 `auto-gpt`、`auto-gpt-plus`、`auto-plus2` 三个常驻业务实例与 `phone-api-relay` 共同运行，移除主服务 standby 的过时说法。
 
 ### 测试 (Tests)
+- **补充 OTP 时间锚点与手机号绑定日志合同回归**：`tests/test_chatgpt_register.py` 覆盖 authorize、密码、passwordless、首轮延迟、成功/失败重发；新增 `tests/test_any_auto_otp_timing.py` 覆盖注册、已有账号和显式发码；`tests/test_icloud_hme_mailbox_finalize.py` 锁定 HME 先匹配 alias 再判断新旧；`tests/test_chatgpt_task_logging.py` 与 `tests/test_register_task_controls.py` 锁定 Info 完整身份、Debug 身份遮蔽及强敏感字段始终脱敏。使用从生产镜像派生的一次性测试镜像、只读 checkout、临时运行目录和 `--network none` 分组执行，本次相关及相邻回归共 `292 passed`。
 - **补充 OAIPay 手动分组与支付链接当前状态筛选回归**：`tests/test_oaipay_sync.py` 覆盖分类拉取复用自动上传解析器、raw Authorization 失败后的 Bearer fallback、窄路由响应 envelope；`tests/test_retired_capabilities_contract.py` 确认只恢复 OAIPay 分类兼容接口而不暴露 GoPay；`tests/test_account_filters.py`、`tests/test_account_filter_presets.py` 与 `tests/test_accounts_payment_link_filter_ui.py` 锁定 `has_link` 在 Python/SQL 筛选、筛选组合和账号页静态 UI 中的合同。
 - **补充手动手机号绑定启动回归**：`tests/test_phone_pool_task_integration.py` 锁定手动上传号码时对外仍展示 `phone_pool_mode=manual`，任务 runner 实际收到 canonical `phone_pool_mode=normal`，并覆盖旧别名归一化，防止并发手机号绑定再次在创建后、首条日志前崩溃。
 - **更新 GoPay 退役回归**：`tests/test_retired_capabilities_contract.py` 继续锁定退役路由与配置键不再进入 OpenAPI / config allowlist；`tests/test_account_filters.py` 与 `tests/test_pix_payment_link_cleanup.py` 切换到“旧 gopay 只算 other”的新分类预期，避免回归时又把退役支付类型重新恢复成独立枚举。
@@ -3192,4 +3197,8 @@
 
 ## 2026-08-01 18:40:40 +0800
 - 修复 OAIPay 手动上传分组拉取并新增支付链接当前有无筛选
+- 发布模式: multi
+
+## 2026-08-02 08:06:49 +0800
+- 修复 OAuth 验证码时间锚点并显示手机号绑定完整身份
 - 发布模式: multi

@@ -79,6 +79,7 @@ class FlowState:
     source: str = ""
     payload: Dict[str, Any] = field(default_factory=dict)
     raw: Dict[str, Any] = field(default_factory=dict)
+    otp_sent_at: float | None = None
 
 
 def generate_device_id():
