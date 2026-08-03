@@ -204,6 +204,7 @@ def mailbox_state_from_account(
             "lease_state",
             "physical_hme",
             "address_mode",
+            "effective_address_mode",
             "logical_type",
             "tag",
             "tag_namespace",

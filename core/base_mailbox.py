@@ -2440,7 +2440,8 @@ class HmeReadyApiClient:
 
 class HmeReadyMailbox(BaseMailbox):
     BASE_ADDRESS_MODE_CONSUMER = "auto-gpt/chatgpt_register"
-    BASE_ADDRESS_MODE = "base"
+    PLATFORM_DEFAULT_ADDRESS_MODE = "platform_default"
+    RANDOM_TAG_ADDRESS_MODE = "random_tag"
 
     def __init__(
         self,
@@ -2979,6 +2980,7 @@ class HmeReadyMailbox(BaseMailbox):
             "lease_state": first("lease_state", "leaseState"),
             "physical_hme": first("physical_hme", "physicalHme", "apple_hme", "appleHme"),
             "address_mode": first("address_mode", "addressMode"),
+            "effective_address_mode": first("effective_address_mode", "effectiveAddressMode"),
             "logical_type": first("logical_type", "logicalType"),
             "tag": first("tag"),
             "tag_namespace": first("tag_namespace", "tagNamespace", "slot_namespace", "slotNamespace"),
@@ -3059,6 +3061,7 @@ class HmeReadyMailbox(BaseMailbox):
             "lease_state": "lease_state",
             "physical_hme": "physical_hme",
             "address_mode": "address_mode",
+            "effective_address_mode": "effective_address_mode",
             "logical_type": "logical_type",
             "tag": "tag",
             "tag_namespace": "tag_namespace",
@@ -3122,14 +3125,18 @@ class HmeReadyMailbox(BaseMailbox):
             "ttl_ms": ttl_ms,
             "max_cache_age_ms": self._helper_max_cache_age_seconds * 1000,
         }
-        request_base_address = (
+        request_platform_default = (
             self._helper_consumer == self.BASE_ADDRESS_MODE_CONSUMER
             and not self._helper_test_mode
         )
-        if request_base_address:
-            prepare_kwargs["address_mode"] = self.BASE_ADDRESS_MODE
-            self._log("[HME Ready] ChatGPT 注册请求原始 HME 地址 address_mode=base")
+        if request_platform_default:
+            prepare_kwargs["address_mode"] = self.PLATFORM_DEFAULT_ADDRESS_MODE
+            self._log(
+                "[HME Ready] ChatGPT 注册请求原地址加单一平台 Tag 组合 "
+                "address_mode=platform_default"
+            )
         if self._helper_test_mode:
+            prepare_kwargs["address_mode"] = self.RANDOM_TAG_ADDRESS_MODE
             prepare_kwargs.update(
                 {
                     "test_mode": True,

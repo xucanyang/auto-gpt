@@ -322,6 +322,8 @@ class RestoredEmailServiceTests(unittest.TestCase):
                         "registration_id": "reg-1",
                         "logical_address_id": "logical-1",
                         "physical_alias_id": "physical-1",
+                        "address_mode": "platform_default",
+                        "effective_address_mode": "random_tag",
                         "tag": "f8k2mq",
                         "tag_namespace": "random_tag",
                     },
@@ -347,6 +349,8 @@ class RestoredEmailServiceTests(unittest.TestCase):
         self.assertEqual(restored["account"]["extra"]["lease_id"], "lease-1")
         self.assertEqual(restored["account"]["extra"]["registration_id"], "reg-1")
         self.assertEqual(restored["account"]["extra"]["platform"], "chatgpt")
+        self.assertEqual(restored["account"]["extra"]["address_mode"], "platform_default")
+        self.assertEqual(restored["account"]["extra"]["effective_address_mode"], "random_tag")
 
 
 if __name__ == "__main__":
