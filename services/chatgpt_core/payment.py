@@ -39,6 +39,12 @@ CHECKOUT_CONFIG_CACHE_TTL_SECONDS = 24 * 60 * 60
 PAYMENT_LINK_FORMAT_LONG = "long_hosted"
 PAYMENT_LINK_FORMAT_SHORT = "short_chatgpt"
 DEFAULT_PAYMENT_LINK_FORMAT = PAYMENT_LINK_FORMAT_LONG
+CHATGPT_WEB_SESSION_COOKIE_NAMES = (
+    "__Secure-next-auth.session-token",
+    "__Secure-authjs.session-token",
+    "next-auth.session-token",
+    "authjs.session-token",
+)
 
 _checkout_countries_cache: dict[str, Any] = {"expires_at": 0.0, "value": None}
 _checkout_pricing_config_cache: dict[str, dict[str, Any]] = {}
@@ -63,6 +69,10 @@ class CheckoutHostedUrlResolutionError(RuntimeError):
 
 class CustomCheckoutResolutionError(CheckoutHostedUrlResolutionError):
     """Backward-compatible error name for custom checkout hosted URL resolution."""
+
+
+class ShortCheckoutWebSessionRequiredError(ValueError):
+    """Raised when a login-bound ChatGPT checkout link has no saved Web Session."""
 
 
 def _build_proxies(proxy: Optional[str]) -> Optional[dict]:
@@ -200,6 +210,71 @@ def _clean_str(value: Any, default: str = "") -> str:
     return text or default
 
 
+def extract_chatgpt_web_session_token(account: Any) -> str:
+    """Read a complete NextAuth/Auth.js session token without exposing it."""
+
+    if isinstance(account, dict):
+        extra = account
+    else:
+        extra = getattr(account, "extra", None)
+        if not isinstance(extra, dict) and callable(getattr(account, "get_extra", None)):
+            try:
+                extra = account.get_extra()
+            except Exception:
+                extra = {}
+        extra = extra if isinstance(extra, dict) else {}
+    direct_token = str(
+        getattr(account, "session_token", "")
+        or extra.get("session_token")
+        or extra.get("sessionToken")
+        or extra.get("nextauth_session_token")
+        or ""
+    ).strip()
+    if direct_token:
+        return direct_token
+
+    cookie_header = str(
+        getattr(account, "cookies", "")
+        or extra.get("cookies")
+        or extra.get("cookie_header")
+        or extra.get("cookie")
+        or ""
+    ).strip()
+    if not cookie_header:
+        return ""
+
+    values: dict[str, str] = {}
+    for item in cookie_header.split(";"):
+        if "=" not in item:
+            continue
+        name, value = item.split("=", 1)
+        normalized_name = name.strip()
+        normalized_value = value.strip()
+        if normalized_name and normalized_value:
+            values[normalized_name] = normalized_value
+
+    for root_name in CHATGPT_WEB_SESSION_COOKIE_NAMES:
+        direct_value = str(values.get(root_name) or "").strip()
+        if direct_value:
+            return direct_value
+        chunks: dict[int, str] = {}
+        prefix = f"{root_name}."
+        for name, value in values.items():
+            if not name.startswith(prefix):
+                continue
+            suffix = name[len(prefix) :]
+            if suffix.isdigit() and value:
+                chunks[int(suffix)] = value
+        indexes = sorted(chunks)
+        if indexes and indexes == list(range(len(indexes))):
+            return "".join(chunks[index] for index in indexes)
+    return ""
+
+
+def has_chatgpt_web_session(account: Any) -> bool:
+    return bool(extract_chatgpt_web_session_token(account))
+
+
 def extract_checkout_session_id(value: Any) -> str:
     match = _CHECKOUT_SESSION_RE.search(str(value or ""))
     return match.group(1) if match else ""
@@ -274,6 +349,8 @@ def normalize_chatgpt_checkout_url(url: Any, processor_entity: Any = "openai_llc
 
 
 def normalize_checkout_url_for_link_format(url: Any, link_format: Any = None) -> str:
+    if normalize_payment_link_format(link_format) == PAYMENT_LINK_FORMAT_SHORT:
+        return normalize_chatgpt_checkout_url(url)
     return normalize_hosted_checkout_url(url)
 
 
@@ -516,12 +593,13 @@ def _generate_checkout_url(
     checkout_url = str(data.get("url") or data.get("checkout_url") or data.get("cashier_url") or "").strip()
     checkout_session_id = str(data.get("checkout_session_id") or data.get("session_id") or data.get("id") or "").strip()
     if normalized_format == PAYMENT_LINK_FORMAT_SHORT:
-        return _resolve_custom_checkout_hosted_url(
-            data if isinstance(data, dict) else {},
-            checkout_url=checkout_url,
-            checkout_session_id=checkout_session_id,
-            proxy=proxy,
+        short_url = chatgpt_checkout_url_from_session_id(
+            checkout_session_id or checkout_url,
+            processor_entity,
         )
+        if short_url:
+            return short_url
+        raise CustomCheckoutResolutionError("短链生成响应未返回 checkout session id")
 
     hosted_url = _resolve_checkout_hosted_url(
         data if isinstance(data, dict) else {},
@@ -598,6 +676,10 @@ def generate_plus_link(
     country = normalize_checkout_country(country)
     currency = normalize_checkout_currency(currency, country)
     resolved_link_format = normalize_payment_link_format(link_format)
+    if resolved_link_format == PAYMENT_LINK_FORMAT_SHORT and not has_chatgpt_web_session(account):
+        raise ShortCheckoutWebSessionRequiredError(
+            "账号缺少 ChatGPT Web Session Cookie，无法生成登录态短链"
+        )
 
     payload = {
         "entry_point": "all_plans_pricing_modal",

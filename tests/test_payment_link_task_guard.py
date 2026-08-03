@@ -29,6 +29,7 @@ class TestPaymentLinkTaskGuard:
         cached: dict | None = None,
         legacy_cached: dict | None = None,
         status: str = "registered",
+        web_session: bool = False,
     ) -> int:
         row = AccountModel(
             platform="chatgpt",
@@ -42,6 +43,8 @@ class TestPaymentLinkTaskGuard:
             extra["chatgpt_last_payment_link"] = dict(cached)
         if isinstance(legacy_cached, dict):
             extra["chatgpt_paypal_url"] = dict(legacy_cached)
+        if web_session:
+            extra["cookies"] = "__Secure-next-auth.session-token=web-session"
         row.set_extra(extra)
         with Session(self.engine) as session:
             session.add(row)
@@ -56,6 +59,7 @@ class TestPaymentLinkTaskGuard:
         status: str,
         url: str = "",
         updated_at: datetime | None = None,
+        result: dict | None = None,
     ) -> None:
         with Session(self.engine) as session:
             account = session.get(AccountModel, account_id)
@@ -71,16 +75,76 @@ class TestPaymentLinkTaskGuard:
             )
             if updated_at is not None:
                 row.updated_at = updated_at
+            if isinstance(result, dict):
+                row.set_result(result)
             session.add(row)
             session.commit()
 
-    def _resolve(self, account_id: int, *, force_refresh: bool = False):
+    def _resolve(self, account_id: int, *, force_refresh: bool = False, params: dict | None = None):
         return tasks_api._resolve_batch_payment_link_accounts(
             BatchPaymentLinkTaskRequest(
                 account_ids=[account_id],
                 force_refresh=force_refresh,
+                params=params or {},
             )
         )
+
+    def test_short_link_requires_web_session_and_accepts_session_backed_account(self):
+        short_params = {
+            "plan": "plus",
+            "payment_source": "chatgpt_hosted",
+            "payment_link_format": "short_chatgpt",
+            "country": "US",
+            "currency": "USD",
+        }
+        missing_id = self._add_account(email="short-no-session@example.com")
+        eligible, _, skipped, _ = self._resolve(missing_id, params=short_params)
+        assert eligible == []
+        assert "Web Session" in skipped[0]["reason"]
+
+        session_id = self._add_account(email="short-session@example.com", web_session=True)
+        eligible, _, skipped, _ = self._resolve(session_id, params=short_params)
+        assert [item["account_id"] for item in eligible] == [session_id]
+        assert skipped == []
+
+    def test_short_and_long_success_guards_do_not_block_each_other(self):
+        short_params = {
+            "plan": "plus",
+            "payment_source": "chatgpt_hosted",
+            "payment_link_format": "short_chatgpt",
+            "country": "US",
+            "currency": "USD",
+        }
+        long_cache_id = self._add_account(
+            email="long-to-short@example.com",
+            web_session=True,
+            cached={
+                "url": "https://pay.openai.com/c/pay/cs_live_long#fid",
+                "plan": "plus",
+                "country": "US",
+                "currency": "USD",
+                "payment_source": "long_link",
+                "payment_link_format": "long_link",
+                "profile_hash": "profile-long",
+            },
+        )
+        eligible, _, skipped, _ = self._resolve(long_cache_id, params=short_params)
+        assert [item["account_id"] for item in eligible] == [long_cache_id]
+        assert skipped == []
+
+        short_history_id = self._add_account(email="short-to-long@example.com", web_session=True)
+        self._add_history(
+            short_history_id,
+            status="succeeded",
+            url="https://chatgpt.com/checkout/openai_llc/cs_live_short",
+            result={
+                **short_params,
+                "url": "https://chatgpt.com/checkout/openai_llc/cs_live_short",
+            },
+        )
+        eligible, _, skipped, _ = self._resolve(short_history_id)
+        assert [item["account_id"] for item in eligible] == [short_history_id]
+        assert skipped == []
 
     def test_success_history_and_cleaned_tombstone_block_normal_generation(self):
         history_account = self._add_account(email="history@example.com")

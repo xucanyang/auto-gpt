@@ -7,7 +7,9 @@ from core.db import AccountModel
 from services.chatgpt_core.payment_link_cache import (
     build_payment_link_cache_payload,
     normalize_payment_link_params,
+    payment_link_cache_for_params,
     payment_link_cache_matches,
+    store_payment_link_variant,
     payment_link_requires_regeneration,
 )
 from services.chatgpt_core.plugin import ChatGPTPlatform
@@ -127,6 +129,60 @@ class PaymentLinkSourceTests(unittest.TestCase):
                 {"plan": "plus", "country": "ID", "currency": "IDR", "payment_link_format": "long_hosted"},
             )
         )
+
+    def test_short_and_long_cache_variants_are_independent(self):
+        short_url = "https://chatgpt.com/checkout/openai_llc/cs_live_short_variant"
+        long_url = "https://pay.openai.com/c/pay/cs_live_long_variant#fid"
+        short_cache = build_payment_link_cache_payload(
+            {
+                "url": short_url,
+                "plan": "plus",
+                "country": "US",
+                "currency": "USD",
+                "payment_source": "chatgpt_hosted",
+                "payment_link_format": "short_chatgpt",
+            },
+            source="chatgpt_short",
+        )
+        long_cache = build_payment_link_cache_payload(
+            {
+                "url": long_url,
+                "plan": "plus",
+                "country": "US",
+                "currency": "USD",
+                "payment_source": "long_link",
+                "payment_link_format": "long_link",
+                "profile_hash": PROFILE_HASH,
+            },
+            source="long_link",
+        )
+        extra = {}
+        store_payment_link_variant(extra, short_cache, make_current=False)
+        store_payment_link_variant(extra, long_cache, make_current=False)
+
+        short_params = normalize_payment_link_params(
+            {
+                "plan": "plus",
+                "country": "US",
+                "currency": "USD",
+                "payment_source": "chatgpt_hosted",
+                "payment_link_format": "short_chatgpt",
+            }
+        )
+        long_params = normalize_payment_link_params(
+            {
+                "plan": "plus",
+                "country": "US",
+                "currency": "USD",
+                "payment_source": "long_link",
+                "payment_link_format": "long_link",
+                "profile_hash": PROFILE_HASH,
+            }
+        )
+
+        self.assertEqual(payment_link_cache_for_params(extra, short_params)["url"], short_url)
+        self.assertEqual(payment_link_cache_for_params(extra, long_params)["url"], long_url)
+        self.assertNotEqual(short_cache["variant_key"], long_cache["variant_key"])
 
     def test_pix_cache_preserves_provider_expiry_and_rejects_imminent_expiry(self):
         cached = build_payment_link_cache_payload(
@@ -268,46 +324,23 @@ class PaymentLinkSourceTests(unittest.TestCase):
         )
         self.assertNotIn("link_status", refreshed)
 
-    def test_plugin_uses_active_long_link_profile_without_calling_hosted_generator(self):
+    def test_plugin_restores_login_bound_short_link_without_calling_long_link_service(self):
         account = Account(
             platform="chatgpt",
             email="paypal@example.com",
             password="pw",
             token="access-token-secret",
+            extra={"cookies": "__Secure-next-auth.session-token=web-session"},
         )
-        client = mock.Mock()
-        client.get_profile.return_value = {
-            "profile_hash": PROFILE_HASH,
-            "link_type": "paypal",
-            "country": "GB",
-            "currency": "GBP",
-            "profile": {},
-        }
-        client.submit_batch.return_value = {
-            "batch_id": "batch_" + "a" * 32,
-            "items": [
-                {
-                    "batch_id": "batch_" + "a" * 32,
-                    "job_id": "job-1",
-                    "request_id": "batch-1:42",
-                    "profile_hash": PROFILE_HASH,
-                    "status": "done",
-                    "completed_at": 1_720_000_000,
-                    "result": {
-                        "provider_redirect_url": PAYPAL_URL,
-                        "link_type": "paypal",
-                        "currency": "GBP",
-                        "cs_id": "cs_live_123",
-                    },
-                }
-            ],
-        }
+        short_url = "https://chatgpt.com/checkout/openai_llc/cs_live_short"
         platform = ChatGPTPlatform(config=RegisterConfig(extra={}))
 
         with mock.patch(
             "services.chatgpt_core.long_link_payment_client.LongLinkPaymentClient.from_env",
-            return_value=client,
-        ), mock.patch("services.chatgpt_core.payment.generate_plus_link") as hosted_plus:
+        ) as long_client, mock.patch(
+            "services.chatgpt_core.payment.generate_plus_short_link",
+            return_value=short_url,
+        ) as short_generator:
             result = platform.execute_action(
                 "payment_link",
                 account,
@@ -321,19 +354,38 @@ class PaymentLinkSourceTests(unittest.TestCase):
             )
 
         self.assertTrue(result["ok"])
-        self.assertEqual(result["data"]["url"], PAYPAL_URL)
-        self.assertEqual(result["data"]["payment_link_format"], "long_link")
-        self.assertEqual(result["data"]["payment_source"], "long_link")
-        self.assertEqual(result["data"]["link_type"], "paypal")
-        self.assertEqual(result["data"]["paypal_url"], PAYPAL_URL)
-        self.assertEqual(result["data"]["profile_hash"], PROFILE_HASH)
-        client.get_profile.assert_called_once_with()
-        client.submit_batch.assert_called_once_with(
-            items=[{"access_token": "access-token-secret", "request_id": "batch-1:42"}],
-            expected_profile_hash=PROFILE_HASH,
+        self.assertEqual(result["data"]["url"], short_url)
+        self.assertEqual(result["data"]["payment_link_format"], "short_chatgpt")
+        self.assertEqual(result["data"]["payment_source"], "chatgpt_hosted")
+        self.assertEqual(result["data"]["link_type"], "chatgpt")
+        self.assertTrue(result["data"]["login_required"])
+        self.assertEqual(result["data"]["remote_request_id"], "batch-1:42")
+        short_generator.assert_called_once()
+        long_client.assert_not_called()
+
+    def test_plugin_rejects_short_link_without_web_session(self):
+        account = Account(
+            platform="chatgpt",
+            email="no-session@example.com",
+            password="pw",
+            token="access-token-secret",
         )
-        client.get_batch.assert_not_called()
-        hosted_plus.assert_not_called()
+        platform = ChatGPTPlatform(config=RegisterConfig(extra={}))
+
+        with mock.patch("services.chatgpt_core.payment.generate_plus_short_link") as short_generator:
+            result = platform.execute_action(
+                "payment_link",
+                account,
+                {
+                    "plan": "plus",
+                    "payment_source": "chatgpt_hosted",
+                    "payment_link_format": "short_chatgpt",
+                },
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertIn("Web Session", result["error"])
+        short_generator.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -2207,8 +2207,11 @@ class BatchPaymentLinkTaskTests(unittest.TestCase):
         status: str = "registered",
         token: str | None = None,
         cached: dict | None = None,
+        web_session: bool = False,
     ) -> int:
         extra = {"chatgpt_last_payment_link": dict(cached)} if isinstance(cached, dict) else {}
+        if web_session:
+            extra["cookies"] = "__Secure-next-auth.session-token=web-session"
         with Session(self.engine) as session:
             row = AccountModel(
                 platform="chatgpt",
@@ -2309,6 +2312,56 @@ class BatchPaymentLinkTaskTests(unittest.TestCase):
             self.assertEqual(cache["link_type"], "pix")
             self.assertEqual(cache["profile_hash"], "profile-hash-brl")
             self.assertTrue(cache["generated_at"])
+
+    def test_batch_payment_link_generates_local_short_link_and_persists_history(self):
+        task_id = "task-batch-payment-local-short"
+        account_id = self._add_account(email="short@example.com", web_session=True)
+        short_params = {
+            "plan": "plus",
+            "country": "US",
+            "currency": "USD",
+            "payment_source": "chatgpt_hosted",
+            "payment_link_format": "short_chatgpt",
+        }
+        self._create_payment_link_task(
+            task_id,
+            account_id,
+            "short@example.com",
+            params=short_params,
+        )
+        short_url = "https://chatgpt.com/checkout/openai_llc/cs_live_batch_short"
+
+        with (
+            patch(
+                "services.chatgpt_core.payment.generate_plus_short_link",
+                return_value=short_url,
+            ) as short_generator,
+            patch(
+                "services.chatgpt_core.long_link_payment_client.LongLinkPaymentClient.from_env",
+            ) as long_client,
+            patch("api.tasks._save_task_log"),
+        ):
+            _run_batch_payment_links(task_id, [account_id])
+
+        snapshot = _task_store.snapshot(task_id)
+        self.assertEqual(snapshot["status"], "done")
+        self.assertEqual(snapshot["success"], 1)
+        self.assertEqual(snapshot["meta"]["payment_link_profile"]["payment_link_format"], "short_chatgpt")
+        short_generator.assert_called_once()
+        long_client.assert_not_called()
+
+        with Session(self.engine) as session:
+            account = session.get(AccountModel, account_id)
+            generation = session.exec(select(PaymentLinkGenerationModel)).one()
+        cache = account.get_extra()["chatgpt_last_payment_link"]
+        self.assertEqual(account.cashier_url, short_url)
+        self.assertEqual(cache["url"], short_url)
+        self.assertEqual(cache["payment_source"], "chatgpt_hosted")
+        self.assertEqual(cache["payment_link_format"], "short_chatgpt")
+        self.assertTrue(cache["login_required"])
+        self.assertEqual(generation.status, "succeeded")
+        self.assertEqual(generation.url, short_url)
+        self.assertEqual(generation.get_result()["payment_link_format"], "short_chatgpt")
 
     def test_batch_payment_link_does_not_write_old_result_to_reused_account_id(self):
         task_id = "task-batch-payment-account-id-reuse"

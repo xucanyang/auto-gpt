@@ -131,6 +131,10 @@ const DEFAULT_REGISTRATION_SORT_ORDER = 'desc' as const
 const DEFAULT_TEAM_WORKSPACE_NAME = 'MyTeam'
 const DEFAULT_TEAM_CHECKOUT_UI_MODE = 'hosted' as const
 const DEFAULT_TEAM_BILLING_COUNTRY = 'US' as const
+const DEFAULT_SHORT_PAYMENT_COUNTRY = 'US' as const
+const DEFAULT_SHORT_PAYMENT_CURRENCY = 'USD' as const
+const SHORT_PAYMENT_SOURCE = 'chatgpt_hosted' as const
+const SHORT_PAYMENT_LINK_FORMAT = 'short_chatgpt' as const
 const TEAM_PROXY_COUNTRY_CODES = [
   'US', 'GB', 'CA', 'AU', 'JP', 'SG', 'HK', 'TW', 'KR', 'ID', 'MY', 'TH',
   'TR', 'VN', 'PH', 'IN', 'DE', 'FR', 'IT', 'ES', 'NL', 'IE', 'PT', 'BE',
@@ -157,7 +161,7 @@ function teamBillingCountryLabel(code: string, currency: string) {
   }
 }
 
-function normalizeTeamBillingCountryOptions(value: unknown): Array<{ value: string; label: string }> {
+function normalizeTeamBillingCountryOptions(value: unknown): Array<{ value: string; label: string; currency: string }> {
   if (!Array.isArray(value)) return []
   const currencies = new Map<string, string>()
   value.forEach((item) => {
@@ -177,6 +181,7 @@ function normalizeTeamBillingCountryOptions(value: unknown): Array<{ value: stri
     .map(([country, currency]) => ({
       value: country,
       label: teamBillingCountryLabel(country, currency),
+      currency,
     }))
 }
 
@@ -476,6 +481,8 @@ type PaymentLinkProfile = {
     seed_pool_configured?: boolean
   }
 }
+
+type PaymentLinkGenerationMode = 'plus' | 'short' | 'team'
 
 type PixLinkCleanupTaskResponse = {
   task_id?: string
@@ -2698,8 +2705,8 @@ export default function Accounts() {
   const [batchPaymentLinkProfile, setBatchPaymentLinkProfile] = useState<PaymentLinkProfile | null>(null)
   const [batchPaymentLinkProfileLoading, setBatchPaymentLinkProfileLoading] = useState(false)
   const [batchPaymentLinkProfileError, setBatchPaymentLinkProfileError] = useState('')
-  const [batchPaymentLinkPlan, setBatchPaymentLinkPlan] = useState<'plus' | 'team'>('plus')
-  const [teamBillingCountryOptions, setTeamBillingCountryOptions] = useState<Array<{ value: string; label: string }>>([])
+  const [batchPaymentLinkPlan, setBatchPaymentLinkPlan] = useState<PaymentLinkGenerationMode>('plus')
+  const [teamBillingCountryOptions, setTeamBillingCountryOptions] = useState<Array<{ value: string; label: string; currency: string }>>([])
   const [teamProxyCountrySearch, setTeamProxyCountrySearch] = useState('')
   const [registerForm] = Form.useForm()
   const [addForm] = Form.useForm()
@@ -4310,7 +4317,19 @@ export default function Accounts() {
 
   const buildBatchPaymentLinkParams = (forceRefresh = false): Record<string, unknown> => {
     const values = batchPaymentLinkForm.getFieldsValue()
-    const plan = String(values?.plan || batchPaymentLinkPlan || 'plus').trim().toLowerCase() === 'team' ? 'team' : 'plus'
+    const rawMode = String(values?.plan || batchPaymentLinkPlan || 'plus').trim().toLowerCase()
+    const mode: PaymentLinkGenerationMode = rawMode === 'team' ? 'team' : rawMode === 'short' ? 'short' : 'plus'
+    if (mode === 'short') {
+      return {
+        plan: 'plus',
+        country: normalizeCheckoutCountry(values?.short_country || DEFAULT_SHORT_PAYMENT_COUNTRY),
+        currency: normalizeCheckoutCurrency(values?.short_currency || DEFAULT_SHORT_PAYMENT_CURRENCY),
+        payment_source: SHORT_PAYMENT_SOURCE,
+        payment_link_format: SHORT_PAYMENT_LINK_FORMAT,
+        reuse_cached_link: !forceRefresh,
+      }
+    }
+    const plan = mode === 'team' ? 'team' : 'plus'
     const params: Record<string, unknown> = {
       plan,
       reuse_cached_link: !forceRefresh,
@@ -4373,6 +4392,36 @@ export default function Accounts() {
     }
   }
 
+  const loadShortPaymentLinkProfile = async (): Promise<boolean> => {
+    setBatchPaymentLinkProfileLoading(true)
+    setBatchPaymentLinkProfileError('')
+    setBatchPaymentLinkProfile(null)
+    try {
+      const profile = await apiFetch('/tasks/chatgpt/payment-links/short-profile') as PaymentLinkProfile
+      const countryOptions = normalizeTeamBillingCountryOptions(profile?.billing_country_options)
+      if (countryOptions.length === 0) {
+        throw new Error('服务端未返回短链账单国家选项')
+      }
+      setTeamBillingCountryOptions(countryOptions)
+      const selectedCountry = normalizeCheckoutCountry(
+        batchPaymentLinkForm.getFieldValue('short_country') || profile.country || DEFAULT_SHORT_PAYMENT_COUNTRY,
+      )
+      const selected = countryOptions.find((item) => item.value === selectedCountry) || countryOptions[0]
+      batchPaymentLinkForm.setFieldsValue({
+        short_country: selected.value,
+        short_currency: selected.currency,
+      })
+      return true
+    } catch (error: unknown) {
+      setBatchPaymentLinkProfileError(
+        error instanceof Error && error.message ? error.message : '无法读取登录态短链配置',
+      )
+      return false
+    } finally {
+      setBatchPaymentLinkProfileLoading(false)
+    }
+  }
+
   const handleBatchPaymentLink = (options: { forceRefresh?: boolean; account?: any } = {}) => {
     const targetAccountId = Number(options.account?.id || 0)
     setBatchPaymentLinkForceRefresh(Boolean(options.forceRefresh))
@@ -4388,6 +4437,8 @@ export default function Accounts() {
       seat_quantity: undefined,
       promo_code: '',
       cancel_url: '',
+      short_country: DEFAULT_SHORT_PAYMENT_COUNTRY,
+      short_currency: DEFAULT_SHORT_PAYMENT_CURRENCY,
     })
     setTeamProxyCountrySearch('')
     setBatchPaymentLinkProfile(null)
@@ -4540,21 +4591,30 @@ export default function Accounts() {
     const forceRefresh = Boolean(batchPaymentLinkForceRefresh)
     const requestParams = buildBatchPaymentLinkParams(forceRefresh)
     const requestedPlan = String(requestParams.plan || 'plus').trim().toLowerCase()
-    const profile = await loadBatchPaymentLinkProfile(requestParams)
-    if (!profile) return
+    const isShortPayment = batchPaymentLinkPlan === 'short'
+    let profile: PaymentLinkProfile | null = null
+    if (isShortPayment) {
+      if (batchPaymentLinkProfileError) return
+      if (teamBillingCountryOptions.length === 0 && !(await loadShortPaymentLinkProfile())) return
+    } else {
+      profile = await loadBatchPaymentLinkProfile(requestParams)
+      if (!profile) return
+    }
     const targetAccountId = Number(batchPaymentLinkTargetAccount?.id || 0)
     const hasTargetAccount = Number.isInteger(targetAccountId) && targetAccountId > 0
     const batchScope: AccountTaskScope = selectedRowKeys.length > 0 ? 'selected' : 'filtered'
     const scope: 'single' | 'selected' | 'filtered' = hasTargetAccount
       ? 'single'
       : batchScope
-    const toastKey = `payment-link:${requestedPlan}:${scope}:${forceRefresh ? 'force' : 'normal'}`
+    const toastKey = `payment-link:${batchPaymentLinkPlan}:${scope}:${forceRefresh ? 'force' : 'normal'}`
     const body: Record<string, unknown> = {
       skip_existing: !forceRefresh,
       force_refresh: forceRefresh,
       params: requestParams,
     }
-    const productLabel = requestedPlan === 'team' ? 'Team checkout 长链接' : '支付链接'
+    const productLabel = isShortPayment
+      ? 'Plus 登录态短链'
+      : requestedPlan === 'team' ? 'Team checkout 长链接' : '支付链接'
     const actionLabel = forceRefresh ? `强制重新生成${productLabel}` : `${productLabel}生成`
     const requestedCount = hasTargetAccount
       ? applyAccountTaskScopeToBody(body, {
@@ -4604,8 +4664,11 @@ export default function Accounts() {
       setRegisterModalOpen(true)
       setActiveTasksPanelOpen(true)
       void activeTasksQuery.refetch()
+      const launchSummary = isShortPayment
+        ? `CHATGPT SHORT · ${String(requestParams.country || '-').toUpperCase()} / ${String(requestParams.currency || '-').toUpperCase()} · 本地串行`
+        : `${String(profile?.link_type || 'long-link').toUpperCase()} · ${(profile?.country || profile?.billing_country || '-').toUpperCase()} / ${(profile?.currency || '-').toUpperCase()} · 并发 ${profile?.effective_concurrency || '-'}`
       message.success({
-        content: `${actionLabel}任务已启动：${String(profile.link_type || 'long-link').toUpperCase()} · ${(profile.country || profile.billing_country || '-').toUpperCase()} / ${(profile.currency || '-').toUpperCase()} · 并发 ${profile.effective_concurrency || '-'}，可执行 ${eligible} 个，跳过 ${skipped} 个${missing > 0 ? `，缺失 ${missing} 个` : ''}`,
+        content: `${actionLabel}任务已启动：${launchSummary}，可执行 ${eligible} 个，跳过 ${skipped} 个${missing > 0 ? `，缺失 ${missing} 个` : ''}`,
         key: toastKey,
       })
       showBatchActionResult(`${actionLabel}结果`, res)
@@ -8981,7 +9044,11 @@ export default function Accounts() {
       />
 
       <Modal
-        title={`${batchPaymentLinkForceRefresh ? '强制重新生成' : '生成'}${batchPaymentLinkPlan === 'team' ? ' Team checkout 长链接' : '支付链接'}`}
+        title={`${batchPaymentLinkForceRefresh ? '强制重新生成' : '生成'}${
+          batchPaymentLinkPlan === 'team'
+            ? ' Team checkout 长链接'
+            : batchPaymentLinkPlan === 'short' ? ' Plus 登录态短链' : '支付链接'
+        }`}
         open={batchPaymentLinkConfigOpen}
         onCancel={() => {
           setBatchPaymentLinkConfigOpen(false)
@@ -9007,20 +9074,28 @@ export default function Accounts() {
               billing_country: DEFAULT_TEAM_BILLING_COUNTRY,
               price_interval: '',
               seat_quantity: undefined,
+              short_country: DEFAULT_SHORT_PAYMENT_COUNTRY,
+              short_currency: DEFAULT_SHORT_PAYMENT_CURRENCY,
             }}
           >
             <Form.Item name="plan" label="生成类型" style={{ marginBottom: 12 }}>
               <Segmented
                 block
                 options={[
-                  { label: 'Plus 支付链接', value: 'plus' },
-                  { label: 'Team 优惠码长链接', value: 'team' },
+                  { label: 'Plus 管理端', value: 'plus' },
+                  { label: 'Plus 登录态短链', value: 'short' },
+                  { label: 'Team 优惠长链', value: 'team' },
                 ]}
                 onChange={(value) => {
-                  const nextPlan = String(value) === 'team' ? 'team' : 'plus'
+                  const rawMode = String(value)
+                  const nextPlan: PaymentLinkGenerationMode = rawMode === 'team' ? 'team' : rawMode === 'short' ? 'short' : 'plus'
                   setBatchPaymentLinkPlan(nextPlan)
                   setBatchPaymentLinkProfile(null)
                   setBatchPaymentLinkProfileError('')
+                  if (nextPlan === 'short') {
+                    void loadShortPaymentLinkProfile()
+                    return
+                  }
                   if (nextPlan === 'plus') {
                     void loadBatchPaymentLinkProfile({ plan: 'plus' })
                     return
@@ -9209,6 +9284,48 @@ export default function Accounts() {
                 </Button>
               </>
             ) : null}
+            {batchPaymentLinkPlan === 'short' ? (
+              <Space direction="vertical" size={12} style={{ width: '100%' }}>
+                <Alert
+                  type="warning"
+                  showIcon
+                  message="登录态短链要求账号保存 Web Session"
+                  description="任务只处理具备 ChatGPT Session Cookie 的 Plus 账号；只有 Access Token 的账号会直接跳过。链接生成后仍需在对应账号登录态中访问。"
+                />
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: '0 12px' }}>
+                  <Form.Item
+                    name="short_country"
+                    label="账单国家"
+                    rules={[{ required: true, message: '请选择账单国家' }]}
+                  >
+                    <Select
+                      showSearch
+                      optionFilterProp="label"
+                      loading={batchPaymentLinkProfileLoading}
+                      options={teamBillingCountryOptions}
+                      onChange={(value) => {
+                        const selected = teamBillingCountryOptions.find((item) => item.value === value)
+                        batchPaymentLinkForm.setFieldsValue({
+                          short_country: String(value || DEFAULT_SHORT_PAYMENT_COUNTRY).toUpperCase(),
+                          short_currency: selected?.currency || DEFAULT_SHORT_PAYMENT_CURRENCY,
+                        })
+                      }}
+                    />
+                  </Form.Item>
+                  <Form.Item
+                    name="short_currency"
+                    label="结算币种"
+                    normalize={(value) => String(value || '').toUpperCase()}
+                    rules={[
+                      { required: true, message: '请输入结算币种' },
+                      { pattern: /^[A-Za-z]{3}$/, message: '请输入三位货币代码' },
+                    ]}
+                  >
+                    <Input maxLength={3} />
+                  </Form.Item>
+                </div>
+              </Space>
+            ) : null}
           </Form>
           <Alert
             type="info"
@@ -9221,27 +9338,44 @@ export default function Accounts() {
                 : `范围：当前筛选结果 ${total} 个账号`
             }
             description={
-              batchPaymentLinkForceRefresh
+              batchPaymentLinkPlan === 'short'
+                ? batchPaymentLinkForceRefresh
+                  ? '强制模式会重新创建登录态短链；已支付、已订阅、已失效、缺少 Web Session 或正在生成的账号仍会跳过。'
+                  : '默认复用相同国家和币种的当前短链；缺少 Web Session 的账号不会进入生成队列。'
+                : batchPaymentLinkForceRefresh
                 ? `强制模式会重新生成当前${batchPaymentLinkPlan === 'team' ? ' Team 参数变体' : ' Plus 配置'}；已支付、已订阅、已失效或正在生成的账号仍会跳过。`
                 : `默认只跳过相同${batchPaymentLinkPlan === 'team' ? ' Team 参数变体' : ' Plus 配置'}的当前链接和成功记录。`
             }
           />
           {batchPaymentLinkProfileLoading ? (
-            <Alert type="info" showIcon message="正在读取 long-link 管理端当前配置..." />
+            <Alert
+              type="info"
+              showIcon
+              message={batchPaymentLinkPlan === 'short' ? '正在读取本地短链国家配置...' : '正在读取 long-link 管理端当前配置...'}
+            />
           ) : null}
           {batchPaymentLinkProfileError ? (
             <Space direction="vertical" size={8} style={{ width: '100%' }}>
-              <Alert type="error" showIcon message="无法读取 long-link 管理端配置" description={batchPaymentLinkProfileError} />
+              <Alert
+                type="error"
+                showIcon
+                message={batchPaymentLinkPlan === 'short' ? '无法读取本地短链配置' : '无法读取 long-link 管理端配置'}
+                description={batchPaymentLinkProfileError}
+              />
               <Button
                 size="small"
                 style={{ alignSelf: 'flex-start' }}
-                onClick={() => void loadBatchPaymentLinkProfile(buildBatchPaymentLinkParams(batchPaymentLinkForceRefresh))}
+                onClick={() => void (
+                  batchPaymentLinkPlan === 'short'
+                    ? loadShortPaymentLinkProfile()
+                    : loadBatchPaymentLinkProfile(buildBatchPaymentLinkParams(batchPaymentLinkForceRefresh))
+                )}
               >
                 重新读取
               </Button>
             </Space>
           ) : null}
-          {batchPaymentLinkProfile ? (
+          {batchPaymentLinkPlan !== 'short' && batchPaymentLinkProfile ? (
             <>
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 10 }}>
                 <div>

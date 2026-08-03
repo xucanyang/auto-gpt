@@ -7,12 +7,14 @@
 ## [Unreleased] (未发布)
 
 ### 新增 (Added)
+- **恢复 Plus 登录态短链生成（v2.10.0）**：`services/chatgpt_core/payment.py`、`plugin.py` 与 `api/tasks.py` 重新开放 `payment_source=chatgpt_hosted + payment_link_format=short_chatgpt`，使用 `checkout_ui_mode=custom` 创建 Checkout Session，并直接返回 `https://chatgpt.com/checkout/<processor_entity>/<cs_id>`，不再把短链归一化为 `pay.openai.com` Hosted 长链。账号页原“支付链接生成”弹窗新增“Plus 登录态短链”，支持本地账单国家/币种选择，单账号与批量范围继续复用同一任务、日志、当前链接和生成历史合同；现有 Plus long-link 与 Team 优惠码长链接入口保持不变。
 - **HME Ready-only 邮箱通道（v2.9.1）**：`core/base_mailbox.py`、`services/chatgpt_core/mailbox_state.py` 与 `services/chatgpt_core/restored_email_service.py` 将历史 `icloud_hme` / `helper_ready_api` 状态统一规范为 `hme_ready_api`。Helper 只负责 HME 出池、lease、registration/logical/physical identity 与 finalize；验证码读取固定由 auto-gpt 通过 TempMail 转发箱完成，注册状态不再依赖 Helper `/wait-code`。
 - **筛选组合支持固定账号成员**：`api/accounts.py` 将原有组合契约扩展为向后兼容的 `dynamic / fixed` 两种内容模式；未勾选账号时仍保存动态筛选条件，人工跨页勾选账号后则可从同一个“筛选组合”入口保存固定成员。固定组合使用实例本地配置持久化，支持现有的选择、置顶、复制、编辑、覆盖、还原和删除操作；账号状态变化不会改变成员，新出现的同条件账号也不会自动加入。`GET /api/accounts` 新增短参数 `filter_preset_id`，按组合 ID 分页返回固定成员，避免在 URL 中展开最多 5000 个账号 ID；现有批量任务和 PIX 导出继续复用明确的 `account_ids` 范围。
 - **支付链接列新增“当前有链接 / 当前无链接”筛选**：`frontend/src/pages/Accounts.tsx` 在账号表“支付链接”列的当前链接筛选中增加 `当前有链接`，并保留 `当前无链接`；`services/account_filters.py` 将 `has_link / with_link / current_has_link` 统一展开为 Hosted、PayPal、iDEAL、UPI、PIX、TWINT、Kakao Pay、Team 与 other 等当前实际可打开链接类型，列表接口、批量任务筛选范围和筛选组合复用同一后端语义，避免把历史“已成功提取”误当成当前仍有链接。
 - **新增 Docker 测试规范**：`docs/testing-in-docker.md` 固化运行依赖统一、测试镜像与生产镜像同源、一次性测试容器、临时数据库/共享配置、网络隔离、浏览器资源约束和外部实时烟测分层要求，明确禁止在常驻业务容器或生产挂载上执行完整 pytest。
 
 ### 优化 (Changed)
+- **隔离本地短链与 long-link 生成变体**：支付链接 variant key 现在包含来源、输出格式和本地代理维度，`payment_link_cache_for_params()` 对旧 key 做只读兼容扫描；任务 guard 同时按 source/format 区分当前链接、成功历史和运行中记录。已有 long-link 不会阻止同账号生成登录态短链，已有短链也不会阻止后续生成 long-link；历史 Plus/Team 缓存无需数据库迁移即可继续读取。批量短链使用本地串行 runner，每次请求前后核对账号邮箱、创建时间和身份摘要，避免账号删除或 SQLite ID 复用后串写 Checkout 结果。侧栏可见版本同步为 `v2.10.0`。
 - **移除旧 iCloud HME 活动面**：`main.py` 不再挂载 `/api/icloud-hme/*`，也不再启动旧自动补池/自动删除 worker；`api/config.py`、`api/system.py` 与 `frontend/src/pages/Settings.tsx` 删除 Apple Cookie、iCloud 域、全局 `icloud_forward_mailbox_id` 及旧补池/删除配置，只保留 HME Ready API + TempMail 配置。历史模块仍作为只读迁移兼容代码保留，不能通过活动路由或配置重新启用。
 - **保留账号级转发目标并刷新物理 mailbox 缓存**：全局转发地址只作无账号路由时的 fallback，已有账号的 `forward_to` 与 `forward_mailbox_id` 不再被全局值覆盖；`core/base_mailbox.py` 在 TempMail 列表/详情返回 404 时按账号转发地址重新查找邮箱并回写新的 mailbox ID，继续沿用原 `before_ids`、`otp_sent_at` 与验证码排除边界。
 - **手机号绑定失败也持久化邮箱重绑结果**：`services/chatgpt_core/subscription_auth_capture.py` 在 Auth/手机号流程失败或中断时仅更新 `chatgpt_mailbox_state`，不会改账号 `status`、token、`used`、订阅或手机号绑定字段；重试使用同一轮刚刷新的 mailbox state，避免旧 ID 循环失败。
@@ -62,7 +64,11 @@
 - **记录 Argon2 与 Sentinel 测试问题的真实边界**：文档区分宿主机缺少 `argon2` 的依赖环境漂移和 Sentinel 旧中文日志断言造成的测试契约漂移，避免以后把两类问题误判为线上认证或浏览器运行故障。
 - **修正 Docker 发布拓扑旧描述**：`docs/docker-image-release.md` 按当前 `docker-compose.multi.yml` 更新为 `auto-gpt`、`auto-gpt-plus`、`auto-plus2` 三个常驻业务实例与 `phone-api-relay` 共同运行，移除主服务 standby 的过时说法。
 
+### 安全 (Security)
+- **短链生成强制 Web Session 门禁**：登录态短链只接受持久化了完整 NextAuth/Auth.js Session Cookie（兼容非分片、连续分片及独立 `session_token`）的账号；AT-only、缺失分片或已清除网页会话的账号在任务解析阶段直接跳过，支付核心再次执行同一门禁作为纵深校验。Cookie、Session Token 和代理凭据不会写入任务元数据、生成历史、接口响应或前端配置摘要；本地短链配置接口仅返回非敏感国家/币种目录和登录态要求。
+
 ### 测试 (Tests)
+- **补齐登录态短链端到端合同回归**：`tests/test_chatgpt_payment.py` 覆盖 custom Checkout 短链、processor entity、Session Cookie 非分片/分片门禁及长短 URL 双向规范化；`tests/test_payment_link_sources.py`、`test_chatgpt_payment_link_endpoint.py`、`test_payment_link_task_guard.py` 与 `test_register_task_controls.py` 覆盖本地/远端分流、长短缓存与历史隔离、缺失 Web Session 跳过、单账号持久化及批量 runner。一次性断网、只读 checkout 测试容器相关支付回归 `109 passed`；前端 TypeScript/Vite 生产构建与 20 条 Node 合同测试通过。
 - **补充 HME Ready/TempMail 合同回归**：`tests/test_icloud_hme_mailbox_finalize.py` 覆盖列表与详情 404 自动重绑及 OTP 边界保持；`tests/test_mailbox_state.py`、`tests/test_restored_email_service.py` 覆盖 provider 规范化、历史 anonymous/lease 身份隔离和账号路由优先；`tests/test_subscription_auth_capture.py` 覆盖失败任务只持久化新 mailbox ID。相关后端专项 155 passed（7 skipped），前端 `npm run build` 与 18 条 Node 合同测试通过。
 - **补充固定筛选组合端到端合同回归**：`tests/test_account_filter_presets.py` 覆盖旧动态组合迁移、固定成员去重、ChatGPT 平台校验、5000 个成员上限、持久化身份引用、成员删除、SQLite ID 复用和全员失效空列表；新增 `tests/test_account_filter_presets_ui.py` 锁定同一筛选组合入口、按当前勾选自动选择固定模式、短组合 ID 查询、成员恢复以及批量 `account_ids` 范围。隔离测试容器相关及相邻账号筛选回归 `44 passed`，前端合同测试 `18 passed`，TypeScript 与 Vite 生产构建通过。
 - **补充 OTP 时间锚点与手机号绑定日志合同回归**：`tests/test_chatgpt_register.py` 覆盖 authorize、密码、passwordless、首轮延迟、成功/失败重发；新增 `tests/test_any_auto_otp_timing.py` 覆盖注册、已有账号和显式发码；`tests/test_icloud_hme_mailbox_finalize.py` 锁定 HME 先匹配 alias 再判断新旧；`tests/test_chatgpt_task_logging.py` 与 `tests/test_register_task_controls.py` 锁定 Info 完整身份、Debug 身份遮蔽及强敏感字段始终脱敏。使用从生产镜像派生的一次性测试镜像、只读 checkout、临时运行目录和 `--network none` 分组执行，本次相关及相邻回归共 `292 passed`。
@@ -3218,4 +3224,8 @@
 
 ## 2026-08-03 07:41:50 +0800
 - 收敛 HME Ready provider 并修复 TempMail mailbox 自动重绑
+- 发布模式: multi
+
+## 2026-08-03 08:46:05 +0800
+- 恢复 Plus 登录态短链支付并增加 Web Session 门禁
 - 发布模式: multi

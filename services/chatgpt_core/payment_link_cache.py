@@ -14,6 +14,7 @@ from core.proxy_utils import normalize_proxy_url
 from services.chatgpt_core.payment import (
     DEFAULT_PAYMENT_LINK_FORMAT,
     PAYMENT_LINK_FORMAT_LONG,
+    PAYMENT_LINK_FORMAT_SHORT,
     is_default_hosted_checkout_fragment,
     normalize_checkout_url_for_link_format,
     normalize_checkout_country,
@@ -410,6 +411,13 @@ def validate_plus_payment_request_params(params: dict[str, Any] | None) -> None:
     retired_keys = sorted(RETIRED_PAYMENT_REQUEST_KEYS.intersection(params))
     if retired_keys:
         raise ValueError(f"已下线的 Team 支付参数: {', '.join(retired_keys)}")
+    if is_local_short_payment_link_params(params):
+        country = normalize_checkout_country(params.get("country"))
+        currency = normalize_checkout_currency(params.get("currency"), country)
+        if not re.fullmatch(r"[A-Z]{2}", country):
+            raise ValueError("登录态短链 country 必须是两位国家代码")
+        if not re.fullmatch(r"[A-Z]{3}", currency):
+            raise ValueError("登录态短链 currency 必须是三位货币代码")
 
 
 def _team_param_source(params: dict[str, Any] | None) -> dict[str, Any]:
@@ -585,6 +593,8 @@ def validate_team_payment_request_params(params: dict[str, Any] | None) -> None:
 def validate_payment_link_request_params(params: dict[str, Any] | None) -> None:
     source = params if isinstance(params, dict) else {}
     raw_plan = str(source.get("plan") or "").strip().lower().replace("-", "_")
+    if is_local_short_payment_link_params(source) and raw_plan in PAYMENT_LINK_TEAM_PLAN_ALIASES:
+        raise ValueError("登录态短链仅支持 Plus 支付计划")
     if raw_plan in PAYMENT_LINK_TEAM_PLAN_ALIASES:
         validate_team_payment_request_params(source)
         return
@@ -612,6 +622,9 @@ def payment_link_variant_key(params: dict[str, Any] | None) -> str:
         "plan": plan,
         "country": country,
         "currency": currency,
+        "payment_source": normalize_payment_link_source(source.get("payment_source")),
+        "payment_link_format": normalize_payment_link_output_format(source.get("payment_link_format")),
+        "proxy": normalize_proxy_url(source.get("proxy")) or "",
         "profile_hash": str(source.get("profile_hash") or source.get("payment_profile_hash") or "").strip(),
         "checkout_proxy_region": normalize_team_checkout_proxy_region(source) if plan == PAYMENT_LINK_PLAN_TEAM else "",
     }
@@ -825,6 +838,14 @@ def normalize_payment_link_source(value: Any) -> str:
     }:
         return PAYMENT_SOURCE_LONG_LINK_PAYPAL
     return PAYMENT_SOURCE_CHATGPT_HOSTED
+
+
+def is_local_short_payment_link_params(params: dict[str, Any] | None) -> bool:
+    source = params if isinstance(params, dict) else {}
+    if normalize_payment_link_output_format(source.get("payment_link_format")) != PAYMENT_LINK_FORMAT_SHORT:
+        return False
+    raw_source = str(source.get("payment_source") or "").strip()
+    return not raw_source or normalize_payment_link_source(raw_source) == PAYMENT_SOURCE_CHATGPT_HOSTED
 
 
 def payment_link_status_label(value: Any) -> str:
@@ -1334,6 +1355,8 @@ def build_payment_link_cache_payload(
         "cancel_url",
         "checkout_proxy_region",
         "checkout_ui_mode",
+        "login_required",
+        "web_session_available",
     ):
         value = payload_source.get(key)
         if value is None or value == "":
@@ -1395,6 +1418,12 @@ def payment_link_cache_for_params(
         candidate = variants.get(expected_key)
         if isinstance(candidate, dict):
             return dict(candidate)
+        # Variant keys gained source/format dimensions when local short links
+        # were restored. Scan old keys once so existing long-link caches remain
+        # reusable without a destructive metadata migration.
+        for legacy_candidate in variants.values():
+            if isinstance(legacy_candidate, dict) and payment_link_cache_matches(legacy_candidate, params):
+                return dict(legacy_candidate)
     current = source.get("chatgpt_last_payment_link")
     if isinstance(current, dict) and payment_link_cache_matches(current, params):
         return dict(current)

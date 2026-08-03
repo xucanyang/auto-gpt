@@ -49,6 +49,7 @@ from services.chatgpt_core.payment_link_cache import (
     PAYMENT_LINK_FORMAT_LONG_LINK,
     PAYMENT_LINK_PLAN_TEAM,
     PAYMENT_LINK_GENERATION_TEAM,
+    PAYMENT_SOURCE_CHATGPT_HOSTED,
     PAYMENT_SOURCE_LONG_LINK,
     cache_checkout_link_in_extra,
     payment_link_cache_matches,
@@ -60,6 +61,7 @@ from services.chatgpt_core.payment_link_cache import (
     payment_link_requires_regeneration,
     payment_link_requires_status_sync,
     payment_link_status_label,
+    is_local_short_payment_link_params,
     normalize_payment_link_url,
     normalize_payment_link_params,
     normalize_team_billing_country,
@@ -68,6 +70,10 @@ from services.chatgpt_core.payment_link_cache import (
     team_billing_country_options,
     validate_payment_link_request_params,
     validate_plus_payment_request_params,
+)
+from services.chatgpt_core.payment import (
+    PAYMENT_LINK_FORMAT_SHORT,
+    has_chatgpt_web_session,
 )
 from services.chatgpt_core.pix_payment_link_cleanup import (
     PAYMENT_LINK_CLEANUP_TYPES,
@@ -1955,15 +1961,36 @@ def _json_object_from_config(value: Any) -> dict[str, Any]:
 
 
 def _filtered_payment_link_request_params(params: dict[str, Any] | None) -> dict[str, Any]:
-    """Keep the public task contract while removing local checkout controls.
+    """Freeze either the upstream profile contract or the local short-link mode.
 
     Provider, base proxy and runtime strategy belong to openai-pay-long-link's
     active admin profile. Team checkout explicitly freezes billing country,
     proxy country and checkout UI mode so none can inherit an unrelated payment
-    rail from the upstream admin profile. Currency remains upstream-derived.
+    rail from the upstream admin profile. The restored short-link branch accepts
+    only country/currency; proxy selection remains server-side.
     """
 
     source = params if isinstance(params, dict) else {}
+    if is_local_short_payment_link_params(source):
+        normalized = normalize_payment_link_params(
+            {
+                **source,
+                "plan": "plus",
+                "payment_source": PAYMENT_SOURCE_CHATGPT_HOSTED,
+                "payment_link_format": PAYMENT_LINK_FORMAT_SHORT,
+                "profile_hash": "",
+            }
+        )
+        return {
+            "plan": "plus",
+            "generation_kind": "plus_checkout",
+            "country": normalized["country"],
+            "currency": normalized["currency"],
+            "proxy": "",
+            "payment_source": PAYMENT_SOURCE_CHATGPT_HOSTED,
+            "payment_link_format": PAYMENT_LINK_FORMAT_SHORT,
+            "reuse_cached_link": source.get("reuse_cached_link") is not False,
+        }
     raw_plan = str(source.get("plan") or "plus").strip().lower()
     is_team = raw_plan in {"team", "team_checkout", "chatgptteamplan", "chatgpt_team_plan"}
     normalized: dict[str, Any] = {
@@ -2321,6 +2348,21 @@ def _payment_link_generation_matches_variant(
     actual_normalized = normalize_payment_link_params(actual)
     if actual_normalized.get("generation_kind") != expected.get("generation_kind"):
         return False
+    expected_is_short = is_local_short_payment_link_params(expected)
+    actual_is_short = is_local_short_payment_link_params(actual_normalized)
+    if expected_is_short or actual_is_short:
+        if expected_is_short != actual_is_short:
+            return False
+        return all(
+            actual_normalized.get(key) == expected.get(key)
+            for key in (
+                "country",
+                "currency",
+                "proxy",
+                "payment_source",
+                "payment_link_format",
+            )
+        )
     if expected.get("plan") == PAYMENT_LINK_PLAN_TEAM:
         return all(actual_normalized.get(key) == expected.get(key) for key in (
             "workspace_name",
@@ -2483,7 +2525,12 @@ def _payment_link_skip_reason(
     # hash yet, but it is still durable success evidence.  Never apply this
     # fallback to Team, where a Plus pointer must remain independent.
     raw_current = extra.get("chatgpt_last_payment_link")
-    if desired_plan != PAYMENT_LINK_PLAN_TEAM and isinstance(raw_current, dict):
+    if (
+        desired_plan != PAYMENT_LINK_PLAN_TEAM
+        and not is_local_short_payment_link_params(desired_params)
+        and not is_local_short_payment_link_params(raw_current)
+        and isinstance(raw_current, dict)
+    ):
         raw_plan = str(raw_current.get("plan") or "plus").strip().lower()
         if raw_plan not in {PAYMENT_LINK_PLAN_TEAM, "team_checkout", "chatgptteamplan"}:
             if (
@@ -2506,6 +2553,8 @@ def _payment_link_skip_reason(
         return "账号已明确支付完成，不能重复生成支付链接"
     if status == "subscribed":
         return "账号已订阅，不能生成支付链接" if bool(force_refresh) else "账号已订阅，默认不预生成支付链接"
+    if is_local_short_payment_link_params(desired_params) and not has_chatgpt_web_session(extra):
+        return "账号缺少 ChatGPT Web Session Cookie，不能生成登录态短链"
 
     loaded_history_rows = list(history_rows or [])
     if history_rows is None and session is not None and int(getattr(account, "id", 0) or 0) > 0:
@@ -2569,6 +2618,8 @@ _PAYMENT_LINK_HISTORY_RESULT_FIELDS = (
     "cancel_url",
     "checkout_proxy_region",
     "checkout_ui_mode",
+    "login_required",
+    "web_session_available",
     "plan_name",
     "country",
     "currency",
@@ -12113,8 +12164,328 @@ def _run_chatgpt_paypal_bind(task_id: str, account_ids: list[int], settings: dic
 
 
 
+def _run_local_short_payment_links(task_id: str, account_ids: list[int]):
+    """Generate login-bound ChatGPT checkout links without the long-link service."""
+
+    from api.actions import _apply_action_result, _to_platform_account
+    from core.base_platform import RegisterConfig
+    from core.config_store import config_store
+    from services.chatgpt_core import ChatGPTPlatform
+
+    control = _task_store.control_for(task_id)
+    total = max(len(account_ids), 1)
+    success_count = 0
+    skipped_count = 0
+    errors: list[str] = []
+    primary_email = ""
+
+    _task_store.mark_running(task_id)
+    _task_store.set_progress(task_id, f"0/{total}")
+
+    meta = dict(_task_store.snapshot(task_id).get("meta") or {})
+    skipped_items = list(meta.get("skipped_items") or [])
+    missing_ids = list(meta.get("missing_ids") or [])
+    request_params = _filtered_payment_link_request_params(dict(meta.get("params") or {}))
+    skip_existing = bool(meta.get("skip_existing", True))
+    force_refresh = bool(meta.get("force_refresh", False))
+    instance = ChatGPTPlatform(config=RegisterConfig(extra=config_store.get_all()))
+    instance_id = str(os.getenv("APP_INSTANCE_ID") or "auto-gpt").strip() or "auto-gpt"
+
+    local_profile = {
+        "link_type": "chatgpt",
+        "plan": "plus",
+        "country": str(request_params.get("country") or "US").strip().upper(),
+        "currency": str(request_params.get("currency") or "USD").strip().upper(),
+        "checkout_ui_mode": "custom",
+        "payment_source": PAYMENT_SOURCE_CHATGPT_HOSTED,
+        "payment_link_format": PAYMENT_LINK_FORMAT_SHORT,
+        "login_required": True,
+        "effective_concurrency": 1,
+        "variant_key": payment_link_variant_key(request_params),
+    }
+    _task_store.update_meta(
+        task_id,
+        {
+            "payment_link_profile": local_profile,
+            "payment_link_state": "preparing",
+            "params": dict(request_params),
+        },
+    )
+
+    try:
+        for missing_id in missing_ids:
+            _log(task_id, f"[MISS] 账号不存在: account_id={missing_id}")
+            errors.append(f"account_id={missing_id}: 账号不存在")
+
+        for item in skipped_items:
+            if not primary_email:
+                primary_email = str(item.get("email") or "")
+            _log(
+                task_id,
+                f"[SKIP] {item.get('email') or item.get('account_id') or '-'} - "
+                f"{item.get('reason') or '已跳过'}",
+            )
+
+        for index, account_id in enumerate(account_ids, start=1):
+            control.checkpoint(consume_skip=False)
+            email = ""
+            request_id = f"{instance_id}:{task_id}:{int(account_id or 0)}"
+            pending: dict[str, Any] = {}
+            attempt_id = _claim_next_task_attempt(control)
+            try:
+                control.checkpoint(attempt_id=attempt_id)
+                with Session(engine) as session:
+                    account = session.get(AccountModel, int(account_id or 0))
+                    if account is None or account.platform != "chatgpt":
+                        raise ValueError("ChatGPT 账号不存在")
+                    email = str(account.email or "")
+                    if not primary_email:
+                        primary_email = email
+
+                    params = _build_batch_payment_link_params(account, request_params)
+                    params["request_id"] = request_id
+                    params["reuse_cached_link"] = not force_refresh and request_params.get("reuse_cached_link") is not False
+                    skip_reason = _payment_link_skip_reason(
+                        account,
+                        force_refresh=force_refresh,
+                        session=session,
+                        exclude_request_id=request_id,
+                        variant_params=params,
+                    )
+                    if skip_reason:
+                        skipped_count += 1
+                        _log(task_id, f"[SKIP] 登录态短链生成跳过: {email or account_id} - {skip_reason}")
+                        continue
+
+                    extra = account.get_extra()
+                    cached = payment_link_cache_for_params(extra, params)
+                    cached_url = _payment_link_current_cache_url(cached)
+                    if (
+                        skip_existing
+                        and not force_refresh
+                        and cached_url
+                        and payment_link_cache_matches(cached, params)
+                    ):
+                        if str(account.cashier_url or "").strip() != cached_url:
+                            account.cashier_url = cached_url
+                            account.updated_at = datetime.now(timezone.utc)
+                            session.add(account)
+                            session.commit()
+                        _task_store.add_cashier_url(task_id, cached_url)
+                        skipped_count += 1
+                        _log(task_id, f"[SKIP] 已有可复用登录态短链: {email or account_id}")
+                        continue
+
+                    pending = {
+                        "account_id": int(account_id),
+                        "email": email,
+                        "account_email": str(account.email or "").strip().lower(),
+                        "account_created_at": _payment_link_account_created_at_text(account.created_at),
+                        "account_identity": _payment_link_account_identity(account),
+                    }
+                    _upsert_payment_link_generation(
+                        session,
+                        account_id=int(account_id),
+                        **_payment_link_pending_identity_kwargs(pending),
+                        task_id=task_id,
+                        request_id=request_id,
+                        status="submitting",
+                        link_type="chatgpt",
+                        generation_kind="plus_checkout",
+                        variant_key=payment_link_variant_key(params),
+                        submitted_at=datetime.now(timezone.utc).isoformat(),
+                        result=params,
+                    )
+                    platform_account = _to_platform_account(account)
+                    session.commit()
+
+                _log(
+                    task_id,
+                    f"[短链] {index}/{total} {email or account_id} "
+                    f"country={params.get('country')} currency={params.get('currency')} session=ready",
+                )
+                result = instance.execute_action("payment_link", platform_account, params)
+                data = result.get("data") if isinstance(result.get("data"), dict) else {}
+                checkout_url = _validated_payment_link_url(
+                    data.get("url") or data.get("checkout_url") or data.get("cashier_url")
+                )
+                if not result.get("ok") or not checkout_url:
+                    raise ValueError(str(result.get("error") or data.get("message") or "登录态短链生成失败"))
+
+                with Session(engine) as session:
+                    account = session.get(AccountModel, int(account_id or 0))
+                    if not _payment_link_pending_matches_account(account, pending):
+                        _delete_payment_link_generation_by_request_id(session, request_id)
+                        session.commit()
+                        raise ValueError("账号已被删除或替换，短链结果未写入")
+                    _apply_action_result(
+                        "chatgpt",
+                        "payment_link",
+                        account,
+                        {"ok": True, "data": data},
+                        session,
+                    )
+                    _upsert_payment_link_generation(
+                        session,
+                        account_id=int(account_id),
+                        **_payment_link_pending_identity_kwargs(pending),
+                        task_id=task_id,
+                        request_id=request_id,
+                        status="succeeded",
+                        link_type="chatgpt",
+                        generation_kind="plus_checkout",
+                        variant_key=str(data.get("variant_key") or payment_link_variant_key(params)),
+                        generated_at=str(data.get("generated_at") or datetime.now(timezone.utc).isoformat()),
+                        url=checkout_url,
+                        result=data,
+                    )
+                    session.commit()
+                _task_store.add_cashier_url(task_id, checkout_url)
+                success_count += 1
+                _log(task_id, f"[OK] 登录态短链已生成并保存: {email or account_id}")
+            except SkipCurrentAttemptRequested as exc:
+                skipped_count += 1
+                _log(task_id, f"[SKIP] 已跳过登录态短链生成: {email or account_id} - {exc}")
+            except StopTaskRequested:
+                raise
+            except Exception as exc:
+                error_text = sanitize_error_message(exc)[:1600]
+                errors.append(f"{email or account_id}: {error_text}")
+                if pending:
+                    with Session(engine) as failure_session:
+                        account = failure_session.get(AccountModel, int(account_id or 0))
+                        if _payment_link_pending_matches_account(account, pending):
+                            _upsert_payment_link_generation(
+                                failure_session,
+                                account_id=int(account_id),
+                                **_payment_link_pending_identity_kwargs(pending),
+                                task_id=task_id,
+                                request_id=request_id,
+                                status="failed",
+                                link_type="chatgpt",
+                                generation_kind="plus_checkout",
+                                variant_key=payment_link_variant_key(request_params),
+                                error=error_text,
+                            )
+                        else:
+                            _delete_payment_link_generation_by_request_id(failure_session, request_id)
+                        failure_session.commit()
+                _log(task_id, f"[FAIL] 登录态短链生成失败: {email or account_id} - {error_text}")
+            finally:
+                control.finish_attempt(attempt_id)
+                _task_store.set_progress(task_id, f"{index}/{total}")
+
+        if errors and success_count:
+            final_status = "partial"
+            aggregate = "partial_failure"
+        elif errors:
+            final_status = "failed"
+            aggregate = "total_failure"
+        else:
+            final_status = "done"
+            aggregate = "completed_success"
+        total_skipped = skipped_count + len(skipped_items)
+        summary_message = (
+            f"批量登录态短链生成完成: 成功 {success_count} 个，跳过 {total_skipped} 个，"
+            f"失败 {len(errors)} 个"
+        )
+        _task_store.update_meta(
+            task_id,
+            {
+                "payment_link_state": aggregate,
+                "payment_link_aggregate_status": aggregate,
+                "runtime_success": success_count,
+                "runtime_skipped": skipped_count,
+                "runtime_errors": list(errors),
+                "runtime_interrupted": 0,
+            },
+        )
+        _log(task_id, f"[SUMMARY] {summary_message}")
+        _save_task_log(
+            "chatgpt",
+            primary_email,
+            final_status,
+            error="" if final_status == "done" else summary_message,
+            detail=_build_task_log_detail(
+                task_id,
+                {
+                    "email": primary_email,
+                    "attempt_outcome": f"batch_payment_link_{aggregate}",
+                    "source": "batch_payment_link",
+                    "meta": dict(_task_store.snapshot(task_id).get("meta") or {}),
+                },
+            ),
+        )
+        _task_store.finish(
+            task_id,
+            status=final_status,
+            success=success_count,
+            skipped=total_skipped,
+            errors=errors,
+            error="" if final_status == "done" else summary_message,
+        )
+    except StopTaskRequested as exc:
+        _log(task_id, f"[STOP] {exc}")
+        _save_task_log(
+            "chatgpt",
+            primary_email,
+            "stopped",
+            error=str(exc),
+            detail=_build_task_log_detail(
+                task_id,
+                {
+                    "email": primary_email,
+                    "attempt_outcome": "batch_payment_link_stopped",
+                    "source": "batch_payment_link",
+                    "meta": dict(_task_store.snapshot(task_id).get("meta") or {}),
+                },
+            ),
+        )
+        _task_store.finish(
+            task_id,
+            status="stopped",
+            success=success_count,
+            skipped=skipped_count + len(skipped_items),
+            errors=errors,
+            error=str(exc),
+        )
+    except Exception as exc:
+        error_text = sanitize_error_message(exc)[:1600]
+        _log(task_id, f"[FAIL] 批量登录态短链生成失败: {error_text}")
+        _save_task_log(
+            "chatgpt",
+            primary_email,
+            "failed",
+            error=error_text,
+            detail=_build_task_log_detail(
+                task_id,
+                {
+                    "email": primary_email,
+                    "attempt_outcome": "batch_payment_link_failed",
+                    "source": "batch_payment_link",
+                    "meta": dict(_task_store.snapshot(task_id).get("meta") or {}),
+                },
+            ),
+        )
+        _task_store.finish(
+            task_id,
+            status="failed",
+            success=success_count,
+            skipped=skipped_count + len(skipped_items),
+            errors=errors or [error_text],
+            error=error_text,
+        )
+    finally:
+        _task_store.cleanup()
+
+
 def _run_batch_payment_links(task_id: str, account_ids: list[int]):
     """Submit all eligible accounts once, then poll long-link batches in bulk."""
+
+    initial_meta = dict(_task_store.snapshot(task_id).get("meta") or {})
+    initial_params = _filtered_payment_link_request_params(dict(initial_meta.get("params") or {}))
+    if is_local_short_payment_link_params(initial_params):
+        return _run_local_short_payment_links(task_id, account_ids)
 
     from api.actions import _apply_action_result
     from services.chatgpt_core.long_link_payment_client import (
@@ -18960,6 +19331,23 @@ def get_chatgpt_payment_link_profile():
         return _payment_link_profile_view(LongLinkPaymentClient.from_env().get_profile(force_refresh=True))
     except LongLinkPaymentError as exc:
         raise HTTPException(503, sanitize_error_message(exc)[:600]) from exc
+
+
+@router.get("/chatgpt/payment-links/short-profile")
+def get_chatgpt_short_payment_link_profile():
+    """Return local, non-secret defaults for login-bound ChatGPT short links."""
+
+    return {
+        "link_type": "chatgpt",
+        "plan": "plus",
+        "country": "US",
+        "currency": "USD",
+        "checkout_ui_mode": "custom",
+        "payment_source": PAYMENT_SOURCE_CHATGPT_HOSTED,
+        "payment_link_format": PAYMENT_LINK_FORMAT_SHORT,
+        "login_required": True,
+        "billing_country_options": team_billing_country_options(),
+    }
 
 
 @router.post("/chatgpt/payment-links/profile")

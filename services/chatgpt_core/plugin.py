@@ -34,6 +34,134 @@ def _generate_chatgpt_registration_password(length: int = 16) -> str:
     return "".join(characters)
 
 
+def _execute_chatgpt_short_payment_link(
+    account: object,
+    params: dict,
+    *,
+    default_proxy: str | None = None,
+) -> dict:
+    """Generate a Plus checkout URL that remains bound to ChatGPT Web login."""
+
+    from datetime import datetime, timezone
+    import uuid
+
+    from services.chatgpt_core.payment import (
+        PAYMENT_LINK_FORMAT_SHORT,
+        extract_checkout_session_id,
+        generate_plus_short_link,
+        has_chatgpt_web_session,
+        normalize_checkout_country,
+        normalize_checkout_currency,
+    )
+    from services.chatgpt_core.payment_link_cache import (
+        PAYMENT_SOURCE_CHATGPT_HOSTED,
+        normalize_payment_link_params,
+        normalize_payment_link_url,
+        payment_link_cache_for_params,
+        payment_link_cache_matches,
+        payment_link_variant_key,
+    )
+
+    if not has_chatgpt_web_session(account):
+        return {
+            "ok": False,
+            "error": "账号缺少 ChatGPT Web Session Cookie，无法生成登录态短链",
+        }
+
+    country = normalize_checkout_country(params.get("country") or "US")
+    currency = normalize_checkout_currency(params.get("currency") or "USD", country)
+    cache_request = normalize_payment_link_params(
+        {
+            "plan": "plus",
+            "country": country,
+            "currency": currency,
+            "proxy": "",
+            "payment_link_format": PAYMENT_LINK_FORMAT_SHORT,
+            "payment_source": PAYMENT_SOURCE_CHATGPT_HOSTED,
+        }
+    )
+    cache_request["variant_key"] = payment_link_variant_key(cache_request)
+    extra = getattr(account, "extra", None)
+    extra = extra if isinstance(extra, dict) else {}
+    cached_link = payment_link_cache_for_params(extra, cache_request)
+    cached_url = normalize_payment_link_url(
+        cached_link.get("url"),
+        cached_link.get("payment_link_format") or PAYMENT_LINK_FORMAT_SHORT,
+    )
+    if (
+        params.get("reuse_cached_link") is not False
+        and cached_url
+        and payment_link_cache_matches(cached_link, cache_request)
+    ):
+        cached_data = dict(cached_link)
+        cached_data.update(
+            {
+                "url": cached_url,
+                "plan": "plus",
+                "country": country,
+                "currency": currency,
+                "proxy": "",
+                "payment_link_format": PAYMENT_LINK_FORMAT_SHORT,
+                "payment_source": PAYMENT_SOURCE_CHATGPT_HOSTED,
+                "link_type": "chatgpt",
+                "checkout_ui_mode": "custom",
+                "login_required": True,
+                "web_session_available": True,
+                "cache_reused": True,
+                "cache_source": str(cached_link.get("source") or "cached_payment_link"),
+                "message": "已复用缓存登录态短链",
+            }
+        )
+        return {"ok": True, "data": cached_data, "account_extra_patch": {}}
+
+    requested_proxy = normalize_proxy_url(params.get("proxy"))
+    if requested_proxy or default_proxy:
+        payment_proxy = resolve_default_chatgpt_proxy(requested_proxy or default_proxy)
+    else:
+        try:
+            payment_proxy = resolve_default_chatgpt_proxy(None)
+        except RuntimeError as exc:
+            # A local short-link request is still valid in direct mode when no
+            # dynamic proxy template has been configured. Explicit proxy/config
+            # errors remain visible to the operator.
+            if "动态代理模式" in str(exc):
+                payment_proxy = ""
+            else:
+                raise
+    url = generate_plus_short_link(
+        account,
+        proxy=payment_proxy,
+        country=country,
+        currency=currency,
+    )
+    request_id = str(params.get("request_id") or "").strip() or f"local:{uuid.uuid4().hex}"
+    generated_at = datetime.now(timezone.utc).isoformat()
+    data = {
+        "url": url,
+        "plan": "plus",
+        "generation_kind": "plus_checkout",
+        "variant_key": cache_request["variant_key"],
+        "country": country,
+        "currency": currency,
+        "proxy": "",
+        "payment_link_format": PAYMENT_LINK_FORMAT_SHORT,
+        "payment_source": PAYMENT_SOURCE_CHATGPT_HOSTED,
+        "link_type": "chatgpt",
+        "checkout_ui_mode": "custom",
+        "login_required": True,
+        "web_session_available": True,
+        "cs_id": extract_checkout_session_id(url),
+        "processor_entity": str(extra.get("chatgpt_checkout_processor_entity") or "openai_llc"),
+        "remote_request_id": request_id,
+        "generated_at": generated_at,
+        "created_at": generated_at,
+        "cache_reused": False,
+        "cache_source": "chatgpt_short",
+        "message": "登录态短链已生成",
+    }
+    return {"ok": True, "data": data, "account_extra_patch": {}}
+
+
 class ChatGPTPlatform(BasePlatform):
     name = "chatgpt"
     display_name = "ChatGPT"
@@ -852,6 +980,7 @@ class ChatGPTPlatform(BasePlatform):
                 normalize_payment_link_url,
                 normalize_team_billing_country,
                 normalize_team_checkout_ui_mode,
+                is_local_short_payment_link_params,
                 payment_link_cache_matches,
                 payment_link_cache_for_params,
                 payment_link_variant_key,
@@ -864,6 +993,14 @@ class ChatGPTPlatform(BasePlatform):
                 return {"ok": False, "error": str(exc)}
             plan = normalize_payment_link_plan(params.get("plan"))
             is_team = plan == PAYMENT_LINK_PLAN_TEAM
+            if is_local_short_payment_link_params(params):
+                if is_team:
+                    return {"ok": False, "error": "登录态短链仅支持 Plus 支付计划"}
+                return _execute_chatgpt_short_payment_link(
+                    a,
+                    params,
+                    default_proxy=self.config.proxy if self.config else None,
+                )
             profile_overrides = {**params, "plan": plan}
             if is_team:
                 for inherited_key in ("billingCountry", "country", "currency"):

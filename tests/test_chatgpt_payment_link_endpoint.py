@@ -62,6 +62,7 @@ class ChatGPTPaymentLinkEndpointTests(unittest.TestCase):
                 password="pw",
                 token="access-token-endpoint",
             )
+            account.set_extra({"cookies": "__Secure-next-auth.session-token=web-session-endpoint"})
             session.add(account)
             session.commit()
             session.refresh(account)
@@ -70,8 +71,7 @@ class ChatGPTPaymentLinkEndpointTests(unittest.TestCase):
     def tearDown(self):
         self.core_engine_patch.stop()
 
-    def test_compatibility_endpoint_ignores_retired_local_controls_and_uses_long_link(self):
-        client = _LongLinkClient()
+    def test_compatibility_endpoint_restores_login_bound_short_link(self):
         request = actions_api.ActionRequest(
             params={
                 "plan": "plus",
@@ -83,28 +83,25 @@ class ChatGPTPaymentLinkEndpointTests(unittest.TestCase):
             }
         )
         with Session(self.engine) as session, patch(
-            "services.chatgpt_core.long_link_payment_client.LongLinkPaymentClient.from_env",
-            return_value=client,
-        ), patch("services.chatgpt_core.payment.generate_plus_link") as local_generator:
+            "services.chatgpt_core.payment.generate_plus_short_link",
+            return_value="https://chatgpt.com/checkout/openai_llc/cs_live_endpoint_short",
+        ) as short_generator:
             response = actions_api.execute_action("chatgpt", self.account_id, "payment_link", request, session=session)
             account = session.get(AccountModel, self.account_id)
             generation = session.exec(select(PaymentLinkGenerationModel)).one()
 
         self.assertTrue(response["ok"])
-        self.assertEqual(response["data"]["url"], "https://pay.example.test/endpoint")
-        self.assertEqual(response["data"]["payment_source"], "long_link")
-        self.assertEqual(response["data"]["payment_link_format"], "long_link")
-        self.assertEqual(response["data"]["country"], "BR")
-        self.assertEqual(response["data"]["currency"], "BRL")
-        self.assertEqual(len(client.submissions), 1)
-        self.assertFalse(client.submissions[0][0][0]["access_token"] == "")
-        self.assertEqual(client.submissions[0][1], client.profile_hash)
-        self.assertFalse(client.submissions[0][0][0].get("country"))
-        self.assertEqual(account.get_extra()["chatgpt_last_payment_link"]["payment_source"], "long_link")
-        self.assertEqual(account.get_extra()["chatgpt_last_payment_link"]["link_expires_at"], 1_784_170_800)
+        self.assertEqual(response["data"]["url"], "https://chatgpt.com/checkout/openai_llc/cs_live_endpoint_short")
+        self.assertEqual(response["data"]["payment_source"], "chatgpt_hosted")
+        self.assertEqual(response["data"]["payment_link_format"], "short_chatgpt")
+        self.assertEqual(response["data"]["country"], "ID")
+        self.assertEqual(response["data"]["currency"], "IDR")
+        self.assertTrue(response["data"]["login_required"])
+        self.assertEqual(account.get_extra()["chatgpt_last_payment_link"]["payment_source"], "chatgpt_hosted")
+        self.assertEqual(account.get_extra()["chatgpt_last_payment_link"]["payment_link_format"], "short_chatgpt")
         self.assertEqual(generation.status, "succeeded")
-        self.assertEqual(generation.get_result()["link_expires_at"], 1_784_170_800)
-        local_generator.assert_not_called()
+        self.assertEqual(generation.get_result()["payment_link_format"], "short_chatgpt")
+        short_generator.assert_called_once()
 
 
 if __name__ == "__main__":
