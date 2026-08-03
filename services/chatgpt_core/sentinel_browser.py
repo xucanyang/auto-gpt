@@ -12,7 +12,7 @@ import sys
 import threading
 import time
 import uuid
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 from urllib.parse import urlsplit
@@ -37,9 +37,9 @@ def _auth_browser_concurrency_limit() -> int:
         requested = int(os.getenv("AUTH_BROWSER_MAX_CONCURRENCY", "2") or 2)
     except (TypeError, ValueError):
         requested = 2
-    # The runtime has four CPUs and a 2.5 GiB container limit. More than two
-    # headed Chromium instances can exhaust GLib's worker pool before new_page.
-    return max(1, min(requested, 2))
+    # Deployments choose a conservative host-specific value. Keep a finite
+    # process-level ceiling even when Docker itself has no memory cgroup limit.
+    return max(1, min(requested, 8))
 
 
 AUTH_BROWSER_MAX_CONCURRENCY = _auth_browser_concurrency_limit()
@@ -492,16 +492,17 @@ def _run_isolated_browser_transaction(
                 pass
 
 
-def _run_with_browser_slot(
+@contextmanager
+def browser_capacity_slot(
     operation: str,
-    payload: dict[str, Any],
     *,
-    hard_timeout_seconds: float,
-    logger: Callable[[str], None],
+    logger: Optional[Callable[[str], None]] = None,
     stop_check: Optional[Callable[[], None]] = None,
-    callbacks: Optional[dict[str, Callable[[dict[str, Any]], Any]]] = None,
-) -> _BrowserWorkerOutcome:
+):
+    """Lease one process-wide browser slot, waiting interruptibly if needed."""
+
     global _BROWSER_ACTIVE_COUNT
+    log = logger or (lambda _message: None)
 
     def _try_acquire(*, blocking: bool, timeout: float = 0.0):
         global _BROWSER_ACTIVE_COUNT
@@ -511,30 +512,40 @@ def _run_with_browser_slot(
             semaphore_acquired = _AUTH_BROWSER_SEMAPHORE.acquire(blocking=False)
         if not semaphore_acquired:
             return False, "capacity", None
-        with _BROWSER_SLOT_STATE_LOCK:
-            if _BROWSER_ACTIVE_COUNT >= 1:
-                memory_state = _browser_memory_allows_second_slot()
-                if not memory_state[0]:
-                    _AUTH_BROWSER_SEMAPHORE.release()
-                    return False, "memory", memory_state
-            _BROWSER_ACTIVE_COUNT += 1
+        try:
+            with _BROWSER_SLOT_STATE_LOCK:
+                if _BROWSER_ACTIVE_COUNT >= 1:
+                    memory_state = _browser_memory_allows_second_slot()
+                    if not memory_state[0]:
+                        _AUTH_BROWSER_SEMAPHORE.release()
+                        return False, "memory", memory_state
+                _BROWSER_ACTIVE_COUNT += 1
+        except BaseException:
+            _AUTH_BROWSER_SEMAPHORE.release()
+            raise
         return True, "", None
 
     acquired, wait_reason, memory_state = _try_acquire(blocking=False)
-    memory_wait_logged = False
-    if not acquired:
-        if wait_reason == "memory" and memory_state is not None:
-            _allowed, current, limit, reserve = memory_state
-            logger(
+    logged_wait_reasons: set[str] = set()
+
+    def _log_wait(reason: str, state: Optional[tuple[bool, int, int, int]]) -> None:
+        if reason in logged_wait_reasons:
+            return
+        logged_wait_reasons.add(reason)
+        if reason == "memory" and state is not None:
+            _allowed, current, limit, reserve = state
+            log(
                 "[控制] browser_slot=waiting reason=memory "
                 f"current={current} limit={limit} reserve={reserve} operation={operation}"
             )
-            memory_wait_logged = True
-        else:
-            logger(
-                "[控制] browser_slot=waiting reason=capacity "
-                f"limit={AUTH_BROWSER_MAX_CONCURRENCY} operation={operation}"
-            )
+            return
+        log(
+            "[控制] browser_slot=waiting reason=capacity "
+            f"limit={AUTH_BROWSER_MAX_CONCURRENCY} operation={operation}"
+        )
+
+    if not acquired:
+        _log_wait(wait_reason, memory_state)
         while not acquired:
             if stop_check is not None:
                 stop_check()
@@ -546,33 +557,60 @@ def _run_with_browser_slot(
                     blocking=True,
                     timeout=0.5,
                 )
-            if (
-                not acquired
-                and wait_reason == "memory"
-                and memory_state is not None
-                and not memory_wait_logged
-            ):
-                _allowed, current, limit, reserve = memory_state
-                logger(
-                    "[控制] browser_slot=waiting reason=memory "
-                    f"current={current} limit={limit} reserve={reserve} operation={operation}"
-                )
-                memory_wait_logged = True
-        logger(f"Browser 已获取等待槽位: operation={operation}")
+            if not acquired:
+                _log_wait(wait_reason, memory_state)
+        log(
+            "[控制] browser_slot=acquired after_wait=true "
+            f"limit={AUTH_BROWSER_MAX_CONCURRENCY} operation={operation}"
+        )
     try:
-        return _run_isolated_browser_transaction(
+        yield
+    finally:
+        if acquired:
+            with _BROWSER_SLOT_STATE_LOCK:
+                _BROWSER_ACTIVE_COUNT = max(0, _BROWSER_ACTIVE_COUNT - 1)
+            _AUTH_BROWSER_SEMAPHORE.release()
+
+
+def run_with_browser_capacity(
+    operation: str,
+    callback: Callable[[], Any],
+    *,
+    logger: Optional[Callable[[str], None]] = None,
+    stop_check: Optional[Callable[[], None]] = None,
+) -> Any:
+    """Run arbitrary browser work behind the shared capacity gate."""
+
+    with browser_capacity_slot(
+        operation,
+        logger=logger,
+        stop_check=stop_check,
+    ):
+        return callback()
+
+
+def _run_with_browser_slot(
+    operation: str,
+    payload: dict[str, Any],
+    *,
+    hard_timeout_seconds: float,
+    logger: Callable[[str], None],
+    stop_check: Optional[Callable[[], None]] = None,
+    callbacks: Optional[dict[str, Callable[[dict[str, Any]], Any]]] = None,
+) -> _BrowserWorkerOutcome:
+    return run_with_browser_capacity(
+        operation,
+        lambda: _run_isolated_browser_transaction(
             operation,
             payload,
             hard_timeout_seconds=hard_timeout_seconds,
             logger=logger,
             stop_check=stop_check,
             callbacks=callbacks,
-        )
-    finally:
-        if acquired:
-            with _BROWSER_SLOT_STATE_LOCK:
-                _BROWSER_ACTIVE_COUNT = max(0, _BROWSER_ACTIVE_COUNT - 1)
-            _AUTH_BROWSER_SEMAPHORE.release()
+        ),
+        logger=logger,
+        stop_check=stop_check,
+    )
 
 
 @dataclass

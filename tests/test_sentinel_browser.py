@@ -29,6 +29,7 @@ from services.chatgpt_core.sentinel_browser import (
     run_browser_registration_stage,
     run_browser_oauth_token_recovery,
     run_sync_playwright_safely,
+    run_with_browser_capacity,
 )
 from services.chatgpt_core.utils import generate_browser_fingerprint
 
@@ -438,6 +439,61 @@ emit({"type": "result", "value": {"status_code": 200}})
         self.assertTrue(auth_result and auth_result.ok)
         self.assertEqual(sentinel_result, "sentinel-token")
 
+    def test_generic_browser_work_and_sentinel_share_capacity_limit(self):
+        active = 0
+        peak = 0
+        lock = threading.Lock()
+
+        def tracked(value):
+            nonlocal active, peak
+            with lock:
+                active += 1
+                peak = max(peak, active)
+            time.sleep(0.05)
+            with lock:
+                active -= 1
+            return value
+
+        def fake_transaction(_operation, _payload, **_kwargs):
+            tracked(None)
+            return _BrowserWorkerOutcome(status="ok", value="sentinel-token")
+
+        with (
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser._AUTH_BROWSER_SEMAPHORE",
+                threading.BoundedSemaphore(1),
+            ),
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser.AUTH_BROWSER_MAX_CONCURRENCY",
+                1,
+            ),
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser._BROWSER_ACTIVE_COUNT",
+                0,
+            ),
+            mock.patch(
+                "services.chatgpt_core.sentinel_browser._run_isolated_browser_transaction",
+                side_effect=fake_transaction,
+            ),
+        ):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                registration = pool.submit(
+                    run_with_browser_capacity,
+                    "any_auto_browser_registration",
+                    lambda: tracked("registration-result"),
+                    logger=lambda _message: None,
+                )
+                sentinel = pool.submit(
+                    get_sentinel_token_via_browser,
+                    flow="password_verify",
+                )
+                registration_result = registration.result(timeout=2)
+                sentinel_result = sentinel.result(timeout=2)
+
+        self.assertEqual(peak, 1)
+        self.assertEqual(registration_result, "registration-result")
+        self.assertEqual(sentinel_result, "sentinel-token")
+
     def test_second_browser_slot_waits_until_cgroup_memory_reserve_is_available(self):
         active = 0
         peak = 0
@@ -520,7 +576,12 @@ emit({"type": "result", "value": {"status_code": 200}})
         self.assertEqual(peak, 2)
         self.assertTrue(first_result and first_result.ok)
         self.assertTrue(second_result and second_result.ok)
-        self.assertTrue(any("第二槽内存余量不足" in line for line in logs))
+        self.assertTrue(
+            any(
+                "browser_slot=waiting" in line and "reason=memory" in line
+                for line in logs
+            )
+        )
 
     def test_browser_token_requires_all_three_sentinel_signals(self):
         self.assertEqual(

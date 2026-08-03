@@ -62,6 +62,7 @@ services:
       LOCAL_SOLVER_URL: http://127.0.0.1:8889
       SOLVER_BROWSER_TYPE: ${SOLVER_BROWSER_TYPE:-camoufox}
       PLAYWRIGHT_HEADLESS: ${PLAYWRIGHT_HEADLESS:-}
+      AUTH_BROWSER_MAX_CONCURRENCY: ${AUTH_BROWSER_MAX_CONCURRENCY_MAIN:-2}
     ports:
       - "127.0.0.1:8000:8000"
       - "127.0.0.1:${SOLVER_PORT_BIND_MAIN:-8889}:8889"
@@ -78,13 +79,9 @@ services:
       - default
       - tempmail_internal
     shm_size: "1gb"
-    # Hard host-safety guard.  The mailbox-state migration removes the former
-    # multi-GiB JSON amplification before this limit is applied.
-    mem_limit: "2560m"
-    mem_reservation: "768m"
-    memswap_limit: "3072m"
-    mem_swappiness: 10
-    pids_limit: 512
+    # Browser memory may use the host; shared browser slots remain the primary
+    # concurrency guard and the finite PID ceiling prevents process storms.
+    pids_limit: 768
 
   auto-gpt-plus:
     image: ${APP_IMAGE:-auto-gpt:latest}
@@ -112,6 +109,7 @@ services:
       LOCAL_SOLVER_URL: http://127.0.0.1:8889
       SOLVER_BROWSER_TYPE: ${SOLVER_BROWSER_TYPE:-camoufox}
       PLAYWRIGHT_HEADLESS: ${PLAYWRIGHT_HEADLESS:-}
+      AUTH_BROWSER_MAX_CONCURRENCY: ${AUTH_BROWSER_MAX_CONCURRENCY_PLUS:-3}
     depends_on:
       phone-api-relay:
         condition: service_healthy
@@ -131,13 +129,8 @@ services:
       - default
       - tempmail_internal
     shm_size: "1gb"
-    # Hard host-safety guard.  See services/chatgpt_core/mailbox_state.py and
-    # scripts/migrate_hme_mailbox_state.py for the data-side root fix.
-    mem_limit: "2560m"
-    mem_reservation: "768m"
-    memswap_limit: "3072m"
-    mem_swappiness: 10
-    pids_limit: 512
+    # Plus receives one extra browser slot for the active registration queue.
+    pids_limit: 768
 
   auto-plus2:
     image: ${APP_IMAGE:-auto-gpt:latest}
@@ -164,6 +157,7 @@ services:
       LOCAL_SOLVER_URL: http://127.0.0.1:8889
       SOLVER_BROWSER_TYPE: ${SOLVER_BROWSER_TYPE:-camoufox}
       PLAYWRIGHT_HEADLESS: ${PLAYWRIGHT_HEADLESS:-}
+      AUTH_BROWSER_MAX_CONCURRENCY: ${AUTH_BROWSER_MAX_CONCURRENCY_PLUS2:-2}
     depends_on:
       phone-api-relay:
         condition: service_healthy
@@ -183,11 +177,7 @@ services:
       - default
       - tempmail_internal
     shm_size: "1gb"
-    mem_limit: "2560m"
-    mem_reservation: "768m"
-    memswap_limit: "3072m"
-    mem_swappiness: 10
-    pids_limit: 512
+    pids_limit: 768
 
 networks:
   default:

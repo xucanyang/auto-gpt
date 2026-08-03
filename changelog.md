@@ -14,6 +14,9 @@
 - **新增 Docker 测试规范**：`docs/testing-in-docker.md` 固化运行依赖统一、测试镜像与生产镜像同源、一次性测试容器、临时数据库/共享配置、网络隔离、浏览器资源约束和外部实时烟测分层要求，明确禁止在常驻业务容器或生产挂载上执行完整 pytest。
 
 ### 优化 (Changed)
+- **注册浏览器统一进入共享容量队列（v2.10.1）**：`services/chatgpt_core/sentinel_browser.py` 抽出可复用的进程级浏览器容量租约，`services/chatgpt_core/any_auto/browser_register.py` 在启动整段 Camoufox 注册前获取同一租约；注册任务仍可用多个 worker 并行处理邮箱、代理和结果，但真正的 ChatGPT 浏览器上下文会和手机号绑定、Sentinel/Auth 浏览器共用容量并在不足时输出 `browser_slot=waiting reason=capacity|memory` 后排队，不再让注册并发数直接等于完整浏览器进程数。`AUTH_BROWSER_MAX_CONCURRENCY` 上限改为可配置，生产默认主实例 2、Plus 3、Plus2 2，侧栏可见版本同步为 `v2.10.1`。
+- **三个业务实例取消 Docker 内存上限**：`docker-compose.multi.yml` 移除 `auto-gpt`、`auto-gpt-plus`、`auto-plus2` 的 `mem_limit`、`mem_reservation`、`memswap_limit` 与 `mem_swappiness`，浏览器和 Python 进程可直接使用宿主机物理内存与系统 Swap；独立 `phone-api-relay` 继续保留 256 MiB 隔离。三个业务实例仍保留并提高为 `pids_limit=768` 的有限进程护栏，避免取消内存 cgroup 后把“可用宿主机内存”误解为无限浏览器并发。
+- **浏览器容量测试改用稳定日志合同**：`tests/test_sentinel_browser.py` 新增 any-auto 任意浏览器工作与 Sentinel 共用同一 semaphore 的并发测试，并将旧中文文案断言改为 `browser_slot=waiting` + `reason=memory` 结构化字段，避免展示文字变化掩盖真实门禁行为。
 - **隔离本地短链与 long-link 生成变体**：支付链接 variant key 现在包含来源、输出格式和本地代理维度，`payment_link_cache_for_params()` 对旧 key 做只读兼容扫描；任务 guard 同时按 source/format 区分当前链接、成功历史和运行中记录。已有 long-link 不会阻止同账号生成登录态短链，已有短链也不会阻止后续生成 long-link；历史 Plus/Team 缓存无需数据库迁移即可继续读取。批量短链使用本地串行 runner，每次请求前后核对账号邮箱、创建时间和身份摘要，避免账号删除或 SQLite ID 复用后串写 Checkout 结果。侧栏可见版本同步为 `v2.10.0`。
 - **移除旧 iCloud HME 活动面**：`main.py` 不再挂载 `/api/icloud-hme/*`，也不再启动旧自动补池/自动删除 worker；`api/config.py`、`api/system.py` 与 `frontend/src/pages/Settings.tsx` 删除 Apple Cookie、iCloud 域、全局 `icloud_forward_mailbox_id` 及旧补池/删除配置，只保留 HME Ready API + TempMail 配置。历史模块仍作为只读迁移兼容代码保留，不能通过活动路由或配置重新启用。
 - **保留账号级转发目标并刷新物理 mailbox 缓存**：全局转发地址只作无账号路由时的 fallback，已有账号的 `forward_to` 与 `forward_mailbox_id` 不再被全局值覆盖；`core/base_mailbox.py` 在 TempMail 列表/详情返回 404 时按账号转发地址重新查找邮箱并回写新的 mailbox ID，继续沿用原 `before_ids`、`otp_sent_at` 与验证码排除边界。
@@ -3228,4 +3231,8 @@
 
 ## 2026-08-03 08:46:05 +0800
 - 恢复 Plus 登录态短链支付并增加 Web Session 门禁
+- 发布模式: multi
+
+## 2026-08-03 12:30:15 +0800
+- 统一注册与手机号绑定浏览器容量门禁并移除业务容器内存上限
 - 发布模式: multi

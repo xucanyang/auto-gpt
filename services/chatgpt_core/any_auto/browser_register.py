@@ -21,6 +21,7 @@ from .constants import (
     SENTINEL_BASE,
     OAUTH_CONSENT_FORM_SELECTOR,
 )
+from ..sentinel_browser import run_with_browser_capacity
 from ..task_logging import format_http_trace_log
 
 EMAIL_INPUT_SELECTORS = [
@@ -4189,6 +4190,14 @@ class ChatGPTBrowserRegister:
         ``chatgpt.com/api/auth/session`` capture. Refresh-token/Codex OAuth is a
         separate mode-owned stage and must not run here.
         """
+        return run_with_browser_capacity(
+            "any_auto_browser_registration",
+            lambda: self._run_browser_session(email, password),
+            logger=self.log,
+            stop_check=self.stop_check,
+        )
+
+    def _run_browser_session(self, email: str, password: str) -> dict:
         launch_opts = _camoufox_launch_opts(headless=self.headless, proxy=self.proxy)
 
         with Camoufox(**launch_opts) as browser:

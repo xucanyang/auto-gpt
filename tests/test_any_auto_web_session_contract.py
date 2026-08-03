@@ -184,6 +184,11 @@ class AnyAutoWebSessionContractTests(unittest.TestCase):
             mock.patch.object(browser_register, "Camoufox") as camoufox,
             mock.patch.object(
                 browser_register,
+                "run_with_browser_capacity",
+                side_effect=lambda _operation, callback, **_kwargs: callback(),
+            ) as capacity,
+            mock.patch.object(
+                browser_register,
                 "_browser_registration_flow",
                 return_value={
                     "page_type": "oauth_callback",
@@ -237,6 +242,11 @@ class AnyAutoWebSessionContractTests(unittest.TestCase):
         self.assertIs(signup_kwargs["stop_check"], stop_check)
         self.assertIs(wait_session.call_args.kwargs["stop_check"], stop_check)
         self.assertEqual(normalize_session.call_args.args[1], final_cookies)
+        self.assertEqual(
+            capacity.call_args.args[0],
+            "any_auto_browser_registration",
+        )
+        self.assertIs(capacity.call_args.kwargs["stop_check"], stop_check)
         page.goto.assert_any_call(
             "https://chatgpt.com/auth/callback/openai?code=demo",
             wait_until="domcontentloaded",
