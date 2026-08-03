@@ -2361,6 +2361,7 @@ class HmeReadyApiClient:
         request_id: str = "",
         task_id: str = "",
         consumer: str = "",
+        address_mode: str = "",
         ttl_ms: int | None = None,
         max_cache_age_ms: int | None = None,
         test_mode: bool = False,
@@ -2379,6 +2380,9 @@ class HmeReadyApiClient:
             "task_id": str(task_id or "").strip(),
             "consumer": str(consumer or "").strip(),
         }
+        normalized_address_mode = str(address_mode or "").strip().lower()
+        if normalized_address_mode:
+            body["address_mode"] = normalized_address_mode
         if ttl_ms:
             body["ttl_ms"] = int(ttl_ms)
         if max_cache_age_ms:
@@ -2435,6 +2439,9 @@ class HmeReadyApiClient:
 
 
 class HmeReadyMailbox(BaseMailbox):
+    BASE_ADDRESS_MODE_CONSUMER = "auto-gpt/chatgpt_register"
+    BASE_ADDRESS_MODE = "base"
+
     def __init__(
         self,
         *,
@@ -2971,6 +2978,7 @@ class HmeReadyMailbox(BaseMailbox):
             "platform": first("platform", "registration_platform") or "chatgpt",
             "lease_state": first("lease_state", "leaseState"),
             "physical_hme": first("physical_hme", "physicalHme", "apple_hme", "appleHme"),
+            "address_mode": first("address_mode", "addressMode"),
             "logical_type": first("logical_type", "logicalType"),
             "tag": first("tag"),
             "tag_namespace": first("tag_namespace", "tagNamespace", "slot_namespace", "slotNamespace"),
@@ -3050,6 +3058,7 @@ class HmeReadyMailbox(BaseMailbox):
             "platform": "platform",
             "lease_state": "lease_state",
             "physical_hme": "physical_hme",
+            "address_mode": "address_mode",
             "logical_type": "logical_type",
             "tag": "tag",
             "tag_namespace": "tag_namespace",
@@ -3113,6 +3122,13 @@ class HmeReadyMailbox(BaseMailbox):
             "ttl_ms": ttl_ms,
             "max_cache_age_ms": self._helper_max_cache_age_seconds * 1000,
         }
+        request_base_address = (
+            self._helper_consumer == self.BASE_ADDRESS_MODE_CONSUMER
+            and not self._helper_test_mode
+        )
+        if request_base_address:
+            prepare_kwargs["address_mode"] = self.BASE_ADDRESS_MODE
+            self._log("[HME Ready] ChatGPT 注册请求原始 HME 地址 address_mode=base")
         if self._helper_test_mode:
             prepare_kwargs.update(
                 {

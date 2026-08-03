@@ -14,6 +14,7 @@
 - **新增 Docker 测试规范**：`docs/testing-in-docker.md` 固化运行依赖统一、测试镜像与生产镜像同源、一次性测试容器、临时数据库/共享配置、网络隔离、浏览器资源约束和外部实时烟测分层要求，明确禁止在常驻业务容器或生产挂载上执行完整 pytest。
 
 ### 优化 (Changed)
+- **ChatGPT HME 注册改用物理原地址（v2.10.2）**：`core/base_mailbox.py` 在非 Tag 实验且 Helper consumer 为 `auto-gpt/chatgpt_register` 时，为 HME Ready prepare 显式发送 `address_mode=base`；新注册由 Helper 领取物理 HME 对应的 canonical base logical address，不再默认使用 `+gpt...` random tag。auto-gpt 只声明地址策略，不重复裁决 Helper 返回结构；Helper 先行发布并作为 `physical -> logical:base -> platform registration -> lease` 身份链、单物理 HME 活跃租约、ChatGPT 额度和幂等语义的权威端。既有 tag 账号、历史 registration/lease 和其它 consumer 不迁移、不改写，验证码仍由 auto-gpt 按返回的转发目标直接读取 TempMail。Helper 回传的 `address_mode` 会随账号邮箱状态持久化，侧栏版本同步为 `v2.10.2`。
 - **注册浏览器统一进入共享容量队列（v2.10.1）**：`services/chatgpt_core/sentinel_browser.py` 抽出可复用的进程级浏览器容量租约，`services/chatgpt_core/any_auto/browser_register.py` 在启动整段 Camoufox 注册前获取同一租约；注册任务仍可用多个 worker 并行处理邮箱、代理和结果，但真正的 ChatGPT 浏览器上下文会和手机号绑定、Sentinel/Auth 浏览器共用容量并在不足时输出 `browser_slot=waiting reason=capacity|memory` 后排队，不再让注册并发数直接等于完整浏览器进程数。`AUTH_BROWSER_MAX_CONCURRENCY` 上限改为可配置，生产默认主实例 2、Plus 3、Plus2 2，侧栏可见版本同步为 `v2.10.1`。
 - **三个业务实例取消 Docker 内存上限**：`docker-compose.multi.yml` 移除 `auto-gpt`、`auto-gpt-plus`、`auto-plus2` 的 `mem_limit`、`mem_reservation`、`memswap_limit` 与 `mem_swappiness`，浏览器和 Python 进程可直接使用宿主机物理内存与系统 Swap；独立 `phone-api-relay` 继续保留 256 MiB 隔离。三个业务实例仍保留并提高为 `pids_limit=768` 的有限进程护栏，避免取消内存 cgroup 后把“可用宿主机内存”误解为无限浏览器并发。
 - **浏览器容量测试改用稳定日志合同**：`tests/test_sentinel_browser.py` 新增 any-auto 任意浏览器工作与 Sentinel 共用同一 semaphore 的并发测试，并将旧中文文案断言改为 `browser_slot=waiting` + `reason=memory` 结构化字段，避免展示文字变化掩盖真实门禁行为。
@@ -32,7 +33,7 @@
 
 - **重构手机号绑定取号模式与固定快照契约**：`frontend/src/pages/Accounts.tsx` 与 `api/tasks.py` 将手机号绑定统一为 `普通绑定`、`限定号段绑定`、`号段抽样测试`、`不可用号码全量复测` 四种 canonical `phone_pool_mode`。限定号段新增 `可用号码 / 不可用号码 / 全部号码` 的行级筛选，号段只作为范围，不再把前缀健康状态当成禁选条件；不可用/全部筛选和全池不可用复测在创建任务时冻结候选，关闭同号复用与手工粘贴入口，候选预览同时展示候选号码、账号数、预计测试数和未覆盖号码。普通可用号段绑定继续沿用原有动态分配和容量校验，号段抽样仍严格限制每段 1/2 个号码。
 - **统一固定快照任务的审计元数据**：`api/tasks.py` 为 `prefix_bind`、`unavailable_numbers` 和通用 `phone_selection` 写入号码筛选、候选数、预计测试数、未覆盖候选和是否固定快照；旧的 `prefix_bind_enabled` / `prefix_sample_enabled` 布尔请求继续兼容，新增的 `phone_number_filter`、`prefix_number_filter`、`unavailable_number_test_enabled` 可与 canonical mode 并存。
-- **增加 HME Tag 长度对照测试的任务级传递能力**：`core/base_mailbox.py` 为 Helper Ready prepare 增加显式测试字段透传，但仅在请求携带测试模式时发送 `test_run_id`、指定物理 HME、Tag 和 Tag scheme；普通注册仍保持原有 `gpt+3` 分配路径，不改变共享容量或生产调度。
+- **增加 HME Tag 长度对照测试的任务级传递能力**：`core/base_mailbox.py` 为 Helper Ready prepare 增加显式测试字段透传，但仅在请求携带测试模式时发送 `test_run_id`、指定物理 HME、Tag 和 Tag scheme；普通注册不携带测试覆盖字段，实际地址策略由当前 HME Ready consumer 合同决定。
 - **统一测试文档入口**：`README.md`、`AGENTS.md` 与 `docs/docker-image-release.md` 现在统一指向 Docker 测试规范，移除会吞掉收集失败的 `pytest tests -q || true` 作为推荐门禁，明确当前 `requirements-test.txt`、`docker-compose.test.yml` 和测试脚本仍待落地。
 
 ### 修复 (Fixed)
@@ -71,6 +72,7 @@
 - **短链生成强制 Web Session 门禁**：登录态短链只接受持久化了完整 NextAuth/Auth.js Session Cookie（兼容非分片、连续分片及独立 `session_token`）的账号；AT-only、缺失分片或已清除网页会话的账号在任务解析阶段直接跳过，支付核心再次执行同一门禁作为纵深校验。Cookie、Session Token 和代理凭据不会写入任务元数据、生成历史、接口响应或前端配置摘要；本地短链配置接口仅返回非敏感国家/币种目录和登录态要求。
 
 ### 测试 (Tests)
+- **补充 HME 原地址消费合同**：`tests/test_icloud_hme_mailbox_finalize.py` 锁定正常 ChatGPT 注册 prepare 发送 `address_mode=base`、Tag 长度实验与其它 consumer 不发送该模式，并验证 Helper 返回的 base identity 持久化；`tests/test_mailbox_state.py` 锁定 `address_mode` 作为有界账号邮箱元数据保留。测试只使用 mock/临时状态，不执行真实注册、OTP 或 HME checkout。
 - **补齐登录态短链端到端合同回归**：`tests/test_chatgpt_payment.py` 覆盖 custom Checkout 短链、processor entity、Session Cookie 非分片/分片门禁及长短 URL 双向规范化；`tests/test_payment_link_sources.py`、`test_chatgpt_payment_link_endpoint.py`、`test_payment_link_task_guard.py` 与 `test_register_task_controls.py` 覆盖本地/远端分流、长短缓存与历史隔离、缺失 Web Session 跳过、单账号持久化及批量 runner。一次性断网、只读 checkout 测试容器相关支付回归 `109 passed`；前端 TypeScript/Vite 生产构建与 20 条 Node 合同测试通过。
 - **补充 HME Ready/TempMail 合同回归**：`tests/test_icloud_hme_mailbox_finalize.py` 覆盖列表与详情 404 自动重绑及 OTP 边界保持；`tests/test_mailbox_state.py`、`tests/test_restored_email_service.py` 覆盖 provider 规范化、历史 anonymous/lease 身份隔离和账号路由优先；`tests/test_subscription_auth_capture.py` 覆盖失败任务只持久化新 mailbox ID。相关后端专项 155 passed（7 skipped），前端 `npm run build` 与 18 条 Node 合同测试通过。
 - **补充固定筛选组合端到端合同回归**：`tests/test_account_filter_presets.py` 覆盖旧动态组合迁移、固定成员去重、ChatGPT 平台校验、5000 个成员上限、持久化身份引用、成员删除、SQLite ID 复用和全员失效空列表；新增 `tests/test_account_filter_presets_ui.py` 锁定同一筛选组合入口、按当前勾选自动选择固定模式、短组合 ID 查询、成员恢复以及批量 `account_ids` 范围。隔离测试容器相关及相邻账号筛选回归 `44 passed`，前端合同测试 `18 passed`，TypeScript 与 Vite 生产构建通过。
@@ -3235,4 +3237,8 @@
 
 ## 2026-08-03 12:30:15 +0800
 - 统一注册与手机号绑定浏览器容量门禁并移除业务容器内存上限
+- 发布模式: multi
+
+## 2026-08-03 13:01:44 +0800
+- ChatGPT HME 注册改用物理原地址并保留 TempMail 收码边界
 - 发布模式: multi

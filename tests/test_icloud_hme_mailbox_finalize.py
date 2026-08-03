@@ -816,7 +816,7 @@ class IcloudHmeMailboxFinalizeTests(unittest.TestCase):
         self.assertEqual(mark_deactivated.call_args.args[0], "anon-dead")
         self.assertEqual(mark_deactivated.call_args.kwargs["task_id"], "task-dead")
 
-    def test_helper_prepare_persists_platform_registration_identity(self):
+    def test_chatgpt_registration_prepare_requests_and_persists_base_identity(self):
         mailbox = IcloudHmeMailbox(
             mail_provider_name="hme_ready_api",
             icloud_hme_mode="helper_ready_api",
@@ -835,12 +835,13 @@ class IcloudHmeMailboxFinalizeTests(unittest.TestCase):
                 "physical_alias_id": "physical-1",
                 "lease_id": "lease-1",
                 "lease_state": "checked_out",
-                "email": "base+f8k2mq@icloud.com",
+                "email": "base@icloud.com",
                 "physical_hme": "base@icloud.com",
-                "logical_type": "tag",
-                "tag": "f8k2mq",
-                "tag_namespace": "random_tag",
-                "tag_slot": 1,
+                "address_mode": "base",
+                "logical_type": "base",
+                "tag": "",
+                "tag_namespace": "",
+                "tag_slot": 0,
                 "forward_to": "global@example.com",
             }
         )
@@ -853,9 +854,12 @@ class IcloudHmeMailboxFinalizeTests(unittest.TestCase):
         self.assertEqual(account.extra["logical_address_id"], "logical-1")
         self.assertEqual(account.extra["physical_alias_id"], "physical-1")
         self.assertEqual(account.extra["physical_hme"], "base@icloud.com")
-        self.assertEqual(account.extra["tag"], "f8k2mq")
-        self.assertEqual(account.extra["tag_namespace"], "random_tag")
-        self.assertEqual(account.extra["tag_slot"], 1)
+        self.assertEqual(account.extra["address_mode"], "base")
+        self.assertEqual(account.extra["logical_type"], "base")
+        self.assertNotIn("tag", account.extra)
+        self.assertNotIn("tag_namespace", account.extra)
+        self.assertEqual(account.extra["tag_slot"], 0)
+        self.assertEqual(mailbox._helper_client.prepare.call_args.kwargs["address_mode"], "base")
 
     def test_invalid_prepare_email_early_finalizes_known_lease(self):
         mailbox = IcloudHmeMailbox(

@@ -25,6 +25,7 @@ def test_hme_state_sanitizer_keeps_recovery_identity_and_drops_global_state():
                 "platform": "ChatGPT",
                 "lease_state": "checked_out",
                 "physical_hme": "base@icloud.com",
+                "address_mode": "random_tag",
                 "logical_type": "tag",
                 "tag": "f8k2mq",
                 "tag_namespace": "random_tag",
@@ -62,6 +63,7 @@ def test_hme_state_sanitizer_keeps_recovery_identity_and_drops_global_state():
     assert cleaned["account"]["extra"]["logical_address_id"] == "logical-123"
     assert cleaned["account"]["extra"]["physical_alias_id"] == "physical-123"
     assert cleaned["account"]["extra"]["platform"] == "chatgpt"
+    assert cleaned["account"]["extra"]["address_mode"] == "random_tag"
     assert cleaned["account"]["extra"]["tag"] == "f8k2mq"
     assert cleaned["account"]["extra"]["forward_to"] == "forward@example.com"
     assert "global_copy" not in cleaned["account"]["extra"]

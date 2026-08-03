@@ -203,6 +203,7 @@ def mailbox_state_from_account(
             "registration_platform",
             "lease_state",
             "physical_hme",
+            "address_mode",
             "logical_type",
             "tag",
             "tag_namespace",
