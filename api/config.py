@@ -164,6 +164,17 @@ CONFIG_KEYS = [
     "chatgpt_save_registration_access_token_account",
     "chatgpt_existing_account_login_route_enabled",
     "chatgpt_register_unique_exit_ip_enabled",
+    "chatgpt_register_unique_exit_ip_policy",
+    "chatgpt_register_unique_exit_ip_max_refresh_attempts",
+    "chatgpt_register_unique_exit_ip_probe_timeout_seconds",
+    "chatgpt_register_unique_exit_ip_active_ttl_seconds",
+    "chatgpt_register_unique_exit_ip_cooldown_seconds",
+    "chatgpt_register_protocol_default_concurrency",
+    "chatgpt_register_protocol_max_concurrency",
+    "chatgpt_register_browser_default_concurrency",
+    "chatgpt_register_browser_max_concurrency",
+    "chatgpt_register_delay_seconds",
+    "chatgpt_register_delay_max_seconds",
     "chatgpt_local_status_probe_concurrency",
     "chatgpt_local_status_probe_unique_exit_ip_enabled",
     "chatgpt_local_status_probe_delay_seconds",
@@ -283,6 +294,7 @@ class PaymentLinkConnectionTestRequest(BaseModel):
 
 _LOCAL_STATUS_PROBE_MAX_CONCURRENCY = 10
 _LOCAL_STATUS_PROBE_MAX_DELAY_SECONDS = 3600.0
+_REGISTER_MAX_DELAY_SECONDS = 3600.0
 
 
 def _config_bool(value: Any, *, default: bool = False) -> bool:
@@ -370,6 +382,149 @@ def _normalize_local_status_probe_update(safe: dict[str, Any], current: dict[str
         raise HTTPException(400, "直连模式不能满足本地状态同步的独立出口 IP 要求，请关闭该开关或改用代理模式")
     if unique_exit_ip and mode in {"specified", "manual", "explicit"} and not failover:
         raise HTTPException(400, "指定代理模式开启独立出口 IP 时必须开启失败切换，或关闭独立出口要求")
+    return safe
+
+
+def _normalize_register_control_update(
+    safe: dict[str, Any],
+    current: dict[str, Any],
+) -> dict[str, Any]:
+    defaults: dict[str, int] = {
+        "chatgpt_register_protocol_default_concurrency": 2,
+        "chatgpt_register_protocol_max_concurrency": 3,
+        "chatgpt_register_browser_default_concurrency": 2,
+        "chatgpt_register_browser_max_concurrency": 2,
+        "chatgpt_register_unique_exit_ip_max_refresh_attempts": 6,
+        "chatgpt_register_unique_exit_ip_probe_timeout_seconds": 8,
+        "chatgpt_register_unique_exit_ip_active_ttl_seconds": 1800,
+        "chatgpt_register_unique_exit_ip_cooldown_seconds": 900,
+    }
+    concurrency_limits = {
+        "chatgpt_register_protocol_default_concurrency": 3,
+        "chatgpt_register_protocol_max_concurrency": 3,
+        "chatgpt_register_browser_default_concurrency": 2,
+        "chatgpt_register_browser_max_concurrency": 2,
+    }
+    lease_ranges = {
+        "chatgpt_register_unique_exit_ip_max_refresh_attempts": (1, 12),
+        "chatgpt_register_unique_exit_ip_probe_timeout_seconds": (2, 60),
+        "chatgpt_register_unique_exit_ip_active_ttl_seconds": (900, 7200),
+        "chatgpt_register_unique_exit_ip_cooldown_seconds": (0, 7200),
+    }
+    delay_keys = {
+        "chatgpt_register_delay_seconds",
+        "chatgpt_register_delay_max_seconds",
+    }
+    relevant = (
+        set(concurrency_limits)
+        | set(lease_ranges)
+        | delay_keys
+        | {
+            "chatgpt_register_unique_exit_ip_enabled",
+            "chatgpt_register_unique_exit_ip_policy",
+        }
+    )
+    if not relevant.intersection(safe):
+        return safe
+
+    for key in set(concurrency_limits).intersection(safe):
+        maximum = concurrency_limits[key]
+        raw = safe[key]
+        try:
+            parsed = float(raw)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(400, f"{key} 必须是 1 到 {maximum} 的整数") from exc
+        if not math.isfinite(parsed) or not parsed.is_integer() or not 1 <= parsed <= maximum:
+            raise HTTPException(400, f"{key} 必须是 1 到 {maximum} 的整数")
+        safe[key] = str(int(parsed))
+
+    for key, (minimum, maximum) in lease_ranges.items():
+        if key not in safe:
+            continue
+        raw = safe[key]
+        try:
+            parsed = float(raw)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(400, f"{key} 必须是 {minimum} 到 {maximum} 的整数") from exc
+        if not math.isfinite(parsed) or not parsed.is_integer() or not minimum <= parsed <= maximum:
+            raise HTTPException(400, f"{key} 必须是 {minimum} 到 {maximum} 的整数")
+        safe[key] = str(int(parsed))
+
+    if "chatgpt_register_unique_exit_ip_enabled" in safe:
+        safe["chatgpt_register_unique_exit_ip_enabled"] = (
+            "true"
+            if _config_bool(
+                safe["chatgpt_register_unique_exit_ip_enabled"],
+                default=False,
+            )
+            else "false"
+        )
+    if "chatgpt_register_unique_exit_ip_policy" in safe:
+        raw_policy = str(safe["chatgpt_register_unique_exit_ip_policy"] or "").strip().lower()
+        if raw_policy in {"1", "true", "yes", "on", "required", "strict"}:
+            policy = "required"
+        elif raw_policy in {"0", "false", "no", "off", "disabled"}:
+            policy = "off"
+        elif raw_policy == "auto":
+            policy = "auto"
+        else:
+            raise HTTPException(400, "chatgpt_register_unique_exit_ip_policy 必须是 auto、required 或 off")
+        safe["chatgpt_register_unique_exit_ip_policy"] = policy
+
+    # Keep the canonical three-state policy and the legacy boolean coherent.
+    # Canonical wins when both are supplied; old clients that only save the
+    # boolean are migrated to an equivalent canonical value atomically.
+    if "chatgpt_register_unique_exit_ip_policy" in safe:
+        policy = str(safe["chatgpt_register_unique_exit_ip_policy"] or "auto")
+        safe["chatgpt_register_unique_exit_ip_enabled"] = (
+            "" if policy == "auto" else "true" if policy == "required" else "false"
+        )
+    elif "chatgpt_register_unique_exit_ip_enabled" in safe:
+        safe["chatgpt_register_unique_exit_ip_policy"] = (
+            "required"
+            if safe["chatgpt_register_unique_exit_ip_enabled"] == "true"
+            else "off"
+        )
+
+    for key in delay_keys.intersection(safe):
+        raw = safe[key]
+        try:
+            parsed = float(raw)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(400, f"{key} 必须是 0 到 3600 之间的有限数字") from exc
+        if not math.isfinite(parsed) or not 0 <= parsed <= _REGISTER_MAX_DELAY_SECONDS:
+            raise HTTPException(400, f"{key} 必须是 0 到 3600 之间的有限数字")
+        safe[key] = str(int(parsed)) if parsed.is_integer() else str(parsed)
+
+    merged = dict(current or {})
+    merged.update(safe)
+
+    def _effective_int(key: str) -> int:
+        try:
+            parsed = float(merged.get(key))
+        except (TypeError, ValueError):
+            return defaults[key]
+        if not math.isfinite(parsed) or not parsed.is_integer():
+            return defaults[key]
+        return int(parsed)
+
+    for mode in ("protocol", "browser"):
+        default_key = f"chatgpt_register_{mode}_default_concurrency"
+        max_key = f"chatgpt_register_{mode}_max_concurrency"
+        if _effective_int(default_key) > _effective_int(max_key):
+            raise HTTPException(400, f"ChatGPT {mode} 默认并发不能大于并发上限")
+
+    def _effective_delay(key: str, default: float) -> float:
+        try:
+            parsed = float(merged.get(key))
+        except (TypeError, ValueError):
+            return default
+        return parsed if math.isfinite(parsed) and parsed >= 0 else default
+
+    delay_min = _effective_delay("chatgpt_register_delay_seconds", 15.0)
+    delay_max = _effective_delay("chatgpt_register_delay_max_seconds", 30.0)
+    if delay_max > 0 and delay_max < delay_min:
+        raise HTTPException(400, "ChatGPT 注册最大启动延时不能小于最小启动延时")
     return safe
 
 
@@ -578,6 +733,44 @@ def _build_config_response(*, local_only: bool = False) -> dict[str, Any]:
         all_cfg["chatgpt_local_status_probe_delay_seconds"] = "0"
     if not all_cfg.get("chatgpt_local_status_probe_delay_max_seconds"):
         all_cfg["chatgpt_local_status_probe_delay_max_seconds"] = "0"
+    if not all_cfg.get("chatgpt_register_protocol_default_concurrency"):
+        all_cfg["chatgpt_register_protocol_default_concurrency"] = "2"
+    if not all_cfg.get("chatgpt_register_protocol_max_concurrency"):
+        all_cfg["chatgpt_register_protocol_max_concurrency"] = "3"
+    if not all_cfg.get("chatgpt_register_browser_default_concurrency"):
+        all_cfg["chatgpt_register_browser_default_concurrency"] = "2"
+    if not all_cfg.get("chatgpt_register_browser_max_concurrency"):
+        all_cfg["chatgpt_register_browser_max_concurrency"] = "2"
+    if not all_cfg.get("chatgpt_register_delay_seconds"):
+        all_cfg["chatgpt_register_delay_seconds"] = "15"
+    if not all_cfg.get("chatgpt_register_delay_max_seconds"):
+        all_cfg["chatgpt_register_delay_max_seconds"] = "30"
+    if not all_cfg.get("chatgpt_register_unique_exit_ip_active_ttl_seconds"):
+        all_cfg["chatgpt_register_unique_exit_ip_active_ttl_seconds"] = "1800"
+    if not all_cfg.get("chatgpt_register_unique_exit_ip_cooldown_seconds"):
+        all_cfg["chatgpt_register_unique_exit_ip_cooldown_seconds"] = "900"
+    if not all_cfg.get("chatgpt_register_unique_exit_ip_max_refresh_attempts"):
+        all_cfg["chatgpt_register_unique_exit_ip_max_refresh_attempts"] = "6"
+    if not all_cfg.get("chatgpt_register_unique_exit_ip_probe_timeout_seconds"):
+        all_cfg["chatgpt_register_unique_exit_ip_probe_timeout_seconds"] = "8"
+    if not all_cfg.get("chatgpt_register_unique_exit_ip_policy"):
+        legacy_unique_exit_ip = all_cfg.get("chatgpt_register_unique_exit_ip_enabled")
+        if legacy_unique_exit_ip in (None, ""):
+            all_cfg["chatgpt_register_unique_exit_ip_policy"] = "auto"
+        else:
+            all_cfg["chatgpt_register_unique_exit_ip_policy"] = (
+                "required" if _config_bool(legacy_unique_exit_ip) else "off"
+            )
+    canonical_unique_exit_policy = str(
+        all_cfg.get("chatgpt_register_unique_exit_ip_policy") or "auto"
+    ).strip().lower()
+    all_cfg["chatgpt_register_unique_exit_ip_enabled"] = (
+        ""
+        if canonical_unique_exit_policy == "auto"
+        else "true"
+        if canonical_unique_exit_policy == "required"
+        else "false"
+    )
     if "chatgpt_save_registration_access_token_account" not in all_cfg:
         all_cfg["chatgpt_save_registration_access_token_account"] = "true"
     if not all_cfg.get("chatgpt_register_otp_wait_seconds"):
@@ -902,6 +1095,7 @@ def update_config(body: ConfigUpdate):
         safe.pop(removed_key, None)
     current_config = config_store.get_all()
     safe = normalize_dynamic_proxy_update(safe, current_config)
+    safe = _normalize_register_control_update(safe, current_config)
     safe = _normalize_local_status_probe_update(safe, current_config)
     safe = _normalize_payment_link_service_update(safe)
     if "dynamic_proxy_ip_retention_minutes" in safe:

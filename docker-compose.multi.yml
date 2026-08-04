@@ -61,6 +61,8 @@ services:
       SOLVER_BIND_HOST: 0.0.0.0
       LOCAL_SOLVER_URL: http://127.0.0.1:8889
       SOLVER_BROWSER_TYPE: ${SOLVER_BROWSER_TYPE:-camoufox}
+      SOLVER_MAX_BROWSERS: ${SOLVER_MAX_BROWSERS_MAIN:-4}
+      SOLVER_WARM_BROWSERS: ${SOLVER_WARM_BROWSERS_MAIN:-1}
       PLAYWRIGHT_HEADLESS: ${PLAYWRIGHT_HEADLESS:-}
       AUTH_BROWSER_MAX_CONCURRENCY: ${AUTH_BROWSER_MAX_CONCURRENCY_MAIN:-2}
     ports:
@@ -108,6 +110,8 @@ services:
       SOLVER_BIND_HOST: 0.0.0.0
       LOCAL_SOLVER_URL: http://127.0.0.1:8889
       SOLVER_BROWSER_TYPE: ${SOLVER_BROWSER_TYPE:-camoufox}
+      SOLVER_MAX_BROWSERS: ${SOLVER_MAX_BROWSERS_PLUS:-6}
+      SOLVER_WARM_BROWSERS: ${SOLVER_WARM_BROWSERS_PLUS:-1}
       PLAYWRIGHT_HEADLESS: ${PLAYWRIGHT_HEADLESS:-}
       AUTH_BROWSER_MAX_CONCURRENCY: ${AUTH_BROWSER_MAX_CONCURRENCY_PLUS:-3}
     depends_on:
@@ -128,8 +132,8 @@ services:
     networks:
       - default
       - tempmail_internal
-    shm_size: "1gb"
-    # Plus receives one extra browser slot for the active registration queue.
+    shm_size: "2gb"
+    # Plus receives one extra registration browser slot and a larger Solver pool.
     pids_limit: 768
 
   auto-plus2:
@@ -156,6 +160,8 @@ services:
       SOLVER_BIND_HOST: 0.0.0.0
       LOCAL_SOLVER_URL: http://127.0.0.1:8889
       SOLVER_BROWSER_TYPE: ${SOLVER_BROWSER_TYPE:-camoufox}
+      SOLVER_MAX_BROWSERS: ${SOLVER_MAX_BROWSERS_PLUS2:-4}
+      SOLVER_WARM_BROWSERS: ${SOLVER_WARM_BROWSERS_PLUS2:-1}
       PLAYWRIGHT_HEADLESS: ${PLAYWRIGHT_HEADLESS:-}
       AUTH_BROWSER_MAX_CONCURRENCY: ${AUTH_BROWSER_MAX_CONCURRENCY_PLUS2:-2}
     depends_on:

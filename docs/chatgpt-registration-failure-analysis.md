@@ -1,217 +1,188 @@
 # ChatGPT 注册失败根因分析报告
 
 > [!NOTE]
-> 分析对象：`auto-gpt` 主实例 + `auto-gpt-plus` 实例的 `task_logs` 数据库，结合注册代码架构。
-> 分析时间：2026-08-04
+> 分析对象：`auto-gpt` 主实例与 `auto-gpt-plus` 实例的历史 `task_logs`，并结合当前注册源码与 Docker 运行态复核。
+> 统计快照截止：主实例 `MAX(created_at)=2026-07-24 22:03:43.631796`，Plus 实例 `MAX(created_at)=2026-08-04 08:57:52.544548`；数据库时间字段本身不带时区。
+> 统计事实复核时间：2026-08-04 17:10:22 +0800；P0/P1 落地时间：2026-08-04。
+> 错误分类只能说明相关性，不能仅凭 HTTP 状态码证明失败由并发直接触发。
 
 ---
 
 ## 1. 总体失败概况
 
-### 主实例 (auto-gpt)
+### 主实例 (`auto-gpt`)
 
 | 状态 | 数量 | 占比 |
 |:---|:---:|:---:|
-| **failed** | 713 | **38.3%** |
-| success | 687 | 36.9% |
-| stopped | 256 | 13.8% |
-| running | 175 | 9.4% |
-| done | 14 | 0.8% |
+| **failed** | 713 | **38.25%** |
+| success | 687 | 36.86% |
+| stopped | 256 | 13.73% |
+| running | 175 | 9.39% |
+| skipped | 19 | 1.02% |
+| done | 14 | 0.75% |
 
-> [!WARNING]
-> 整体失败率高达 **38.3%**（排除手动停止后，纯注册失败率约 **50.9%**，即 `713/(713+687+14)`）。
+表中六类状态合计 `1864`。`713 / 1864 = 38.25%`；在 `failed + success + done` 三类明确终态中，失败占比为 `713 / (713 + 687 + 14) = 50.42%`。历史 `running` 快照、人工停止和跳过记录不能直接计入注册成功率。
 
-### Plus 实例 (auto-gpt-plus)
+### Plus 实例 (`auto-gpt-plus`)
 
-| 状态 | 数量 |
-|:---|:---:|
-| done | 485 |
-| failed | 312 |
-| stopped | 213 |
-| success | 212 |
+| 状态 | 数量 | 占比 |
+|:---|:---:|:---:|
+| done | 498 | 35.14% |
+| failed | 312 | 22.02% |
+| stopped | 214 | 15.10% |
+| success | 212 | 14.96% |
+| running | 99 | 6.99% |
+| partial | 57 | 4.02% |
+| interrupted | 24 | 1.69% |
+| skipped | 1 | 0.07% |
+
+表中八类状态合计 `1417`。在 `failed + success + done` 三类明确终态中，失败占比为 `312 / (312 + 212 + 498) = 30.53%`；`running`、`partial`、`interrupted`、`stopped` 和 `skipped` 不应被直接折算为成功或失败。
 
 ---
 
 ## 2. 失败错误分类（主实例 713 次失败）
 
-| 错误类别 | 次数 | 占比 | 与并发的关系 |
+| 错误类别 | 次数 | 占失败数 | 并发相关性判断 |
 |:---|:---:|:---:|:---|
-| 📧 **手机号绑定阶段失败** (Internal Server Error) | 67 | 9.4% | 🟡 上游 SMS 服务过载 |
-| 🛡️ **Cloudflare 403 拦截**（提交邮箱时） | 44 | 6.2% | 🔴 并发直接触发 |
-| 🔐 **验证码提交 403** | 39 | 5.5% | 🔴 并发直接触发 |
-| ⏱️ **429 请求限流** (Too many requests) | 28 | 3.9% | 🔴 并发直接触发 |
-| 📭 **HME 邮箱池耗尽** | 26 | 3.6% | 🟡 高并发消耗加速 |
-| 📦 **未获取 workspace 产物** | 25 | 3.5% | 🟢 非并发相关 |
-| 🗑️ **账号已被删除/停用** | 21 | 2.9% | 🟢 存量问题 |
-| 🔒 **最终 URL 403** (Cloudflare) | 20 | 2.8% | 🔴 并发触发 |
-| 🏠 **首页访问失败** | 15 | 2.1% | 🟡 代理/网络 |
-| 📱 **手机号验证页拦截** | 15 | 2.1% | 🟡 风控触发 |
-| 🏢 **无有效组织 workspace** | 12 | 1.7% | 🟢 账号状态 |
-| 🌐 **Browser 启动/上下文失败** | 5 | 0.7% | 🔴 内存竞争 |
-| ⛔ **注册被禁止 (IP 封禁)** | 3 | 0.4% | 🔴 同 IP 并发 |
-| 🤖 **Sentinel 浏览器不可用** | 2 | 0.3% | 🔴 信号量瓶颈 |
-| ⏳ **OAuth 浏览器事务超时** | 2 | 0.3% | 🔴 排队超时 |
+| 手机号绑定阶段失败 (`Internal Server Error`) | 67 | 9.4% | 可能受上游容量影响，不能仅凭 500 归因于并发 |
+| Cloudflare 403（提交邮箱时） | 44 | 6.2% | 可能与出口 IP、指纹、频率或会话状态相关 |
+| 验证码提交 403 | 39 | 5.5% | 可能与出口 IP、验证码状态或会话状态相关 |
+| 429 请求限流 | 28 | 3.9% | 与请求频率相关性较高，但仍需结合出口和时间窗口 |
+| HME 邮箱池耗尽 | 26 | 3.6% | 高并发会加速消耗，但根因是上游可用库存不足 |
+| 未获取 workspace 产物 | 25 | 3.5% | 通常不是并发直接导致 |
+| 账号已被删除/停用 | 21 | 2.9% | 存量账号状态问题 |
+| 最终 URL 403 | 20 | 2.8% | 可能与出口 IP、指纹或上游策略相关 |
+| 首页访问失败 | 15 | 2.1% | 代理质量、网络和负载均可能影响 |
+| 手机号验证页拦截 | 15 | 2.1% | 上游策略与手机号资源均可能影响 |
+| 无有效组织 workspace | 12 | 1.7% | 账号状态问题 |
+| Browser 启动/上下文失败 | 5 | 0.7% | 可能受 CPU、PID、SHM 或浏览器资源竞争影响 |
+| 注册被禁止 | 3 | 0.4% | 可能与 IP/身份信誉相关，样本过少 |
+| Sentinel 浏览器不可用 | 2 | 0.3% | 浏览器基础设施异常，不等同于 Solver 排队 |
+| OAuth 浏览器事务超时 | 2 | 0.3% | 可能受代理、CPU 或浏览器容量等待影响 |
 
-> [!IMPORTANT]
-> **与并发直接相关的错误（🔴 标记）合计约 139 次，占失败总量的 19.5%**。加上间接受并发影响的（🟡）约 108 次，**并发相关失败占比约 34.6%**。
-
----
-
-## 3. 六大根因深度分析
-
-### 根因 ①：Cloudflare / OpenAI 反爬 IP 级限流（最大杀手）
-
-**错误表现：**
-- `提交邮箱失败: 403 - <!DOCTYPE html><html...Just a moment...`（44 次）
-- `验证码失败: HTTP 403`（39 次）
-- `status=403 final_url=https://chatgpt.com/`（20 次）
-- `429 - Too many requests`（28 次）
-
-**根因机制：**
-
-```mermaid
-graph LR
-    A[并发线程 1] --> C[同一代理出口 IP]
-    B[并发线程 2] --> C
-    D[并发线程 3] --> C
-    C --> E[OpenAI Cloudflare WAF]
-    E -->|IP 频率超阈值| F[403/429 拦截]
-```
-
-代码中虽然有 `unique_exit_ip_enabled` 机制（`api/tasks.py:17472-17511`），但：
-
-1. **默认关闭**：`_truthy(initial_merged_extra.get("chatgpt_register_unique_exit_ip_enabled"), default=False)`
-2. 即使开启，动态代理 IP 刷新有探测预算限制（`max_refresh_attempts`），IP 池不够大时仍会冲突
-3. 三个容器实例（auto-gpt / plus / plus2）**各自独立维护 `unique_exit_ip_assigned` 集合**，无跨实例 IP 去重
-
-**并发放大效应：** 同一代理出口 IP，5 个并发线程在 ≤30 秒窗口内向 `chatgpt.com` 发起 5 组首页+CSRF+signin+authorize 请求，触发 Cloudflare 的请求频率阈值。
+按原报告的高/中相关性标色重新计算，高相关类别为 `143 / 713 = 20.06%`，中相关类别为 `123 / 713 = 17.25%`，合计 `266 / 713 = 37.31%`。这个数值只能表示“落在可能受并发放大的错误类别中”，不能证明这 266 次失败均由并发造成，也不能据此承诺独立出口会消除全部 403/429。
 
 ---
 
-### 根因 ②：Sentinel Browser 信号量瓶颈 + 内存门控
+## 3. 六类风险与代码边界
 
-**代码证据** (`services/chatgpt_core/sentinel_browser.py:35-87`):
+### 3.1 出口 IP 与 WAF/限流相关风险
 
-```python
-AUTH_BROWSER_MAX_CONCURRENCY = max(1, min(int(os.getenv("AUTH_BROWSER_MAX_CONCURRENCY", "2")), 8))
-_AUTH_BROWSER_SEMAPHORE = threading.BoundedSemaphore(AUTH_BROWSER_MAX_CONCURRENCY)
-```
+多个注册尝试复用同一出口 IP，会增加短时间内请求密度和关联信号，是 403/429 的合理风险因素，但不是唯一解释。IP 信誉、浏览器指纹、Cookie/Session 状态、代理质量和上游策略同样可能产生相同状态码。
 
-- **默认并发上限 = 2**，但注册任务的 `ThreadPoolExecutor` 最多可以开 5 个 worker
-- 当 `concurrency=5` + `executor_type=headless` 时，3 个线程被阻塞等待信号量
-- 等待期间 OTP 验证码可能超时（默认窗口 120s），浏览器内存可能触发 cgroup OOM 门控
+本次落地后的独立出口策略为：
 
-**内存双重门控** (`services/chatgpt_core/sentinel_browser.py:81-87`):
-```python
-def _browser_memory_allows_second_slot():
-    # 当已用内存 + 1280MiB 预留 > cgroup limit 时拒绝第二个浏览器
-    return current + reserve <= limit
-```
+1. `chatgpt_register_unique_exit_ip_policy=auto` 时，仅动态代理默认启用独立出口；直连、代理池和指定代理保持显式选择。
+2. 显式 `required/true` 时，动态代理会扩大刷新候选；代理池或开启 failover 的指定代理会轮换候选；不可轮换的单代理批量请求会在入队前被拒绝。
+3. 每个尝试确认真实出口 IP 后通过进程级 registry 原子领取；刚生成的首个动态候选可直接复用有效探测结果，失败切换到后续候选时重新探测，避免长 OTP 流程后沿用过期 IP。并发任务共享 active/cooldown 租约，默认 active TTL 为 `1800s`、运行期间续租、完成后冷却 `900s`。动态候选默认预算固定为 `6`、可配置范围为 `1-12`，任务预检只生成 `1` 个候选，避免探测量随目标数量二次方增长。
+4. registry 的作用域是单个 Python 进程/容器。`auto-gpt`、`auto-gpt-plus`、`auto-plus2` 之间仍未共享运行态租约；当前主要使用 Plus，因此先解决 Plus 同容器多任务碰撞。以后如需跨容器去重，应使用独立运行态租约表或协调服务，不应把高频瞬态锁混入 `shared_config.db` 的配置语义。
 
-> Camoufox 单实例内存开销约 150-400MB，两个并发浏览器 + 4 线程 Turnstile solver 在 cgroup 限制下容易触发内存拒绝。
+### 3.2 注册任务并发、注册浏览器容量与宿主机资源
 
----
+旧行为中，API 和前端默认并发均为 `1`，`_run_register()` 的 `5` 只是历史硬上限，不是默认值。历史客户端可以显式提交 `4/5`，任务线程池才会在运行时截到 5。
 
-### 根因 ③：Turnstile Solver 单端口队列化
+本次在入队前冻结有效并发，并在运行前二次校验：
 
-**现状：** 每个容器内运行 **1 个 solver 进程，4 个线程**：
-```
-/usr/local/bin/python -u /app/services/turnstile_solver/start.py --browser_type camoufox --thread 4
-```
+| 注册模式 | 默认并发 | 后端硬上限 |
+|:---|:---:|:---:|
+| protocol | 2 | 3 |
+| headless / headed | 2 | 2 |
+| 手机号注册 | 1 | 1 |
+| `manual_email_otp` | 1 | 1 |
 
-当多个注册线程同时请求 Turnstile 验证码解决时：
-- 4 线程 solver 队列满后，后续请求排队
-- solver 本身使用 Camoufox 浏览器，与 Sentinel Browser 共享宿主机内存
-- 在高并发下，solver 响应时间增加，导致注册请求在等待 captcha 期间被 OpenAI 的 session 超时截断
+任务元数据同时记录 `requested_concurrency` 和 `effective_concurrency`。历史请求中的 `4/5` 不再直接变成 4-5 个执行 worker；显式 `1` 仍保持串行。
 
----
+注册任务并发与浏览器槽是两套约束。`AUTH_BROWSER_MAX_CONCURRENCY` 控制完整 Camoufox/Auth 浏览器工作，发布配置为主实例 `2`、Plus `3`、Plus2 `2`。单个浏览器注册任务本身最多并发 2，Plus 的第 3 个槽提供同进程跨任务和其他 Auth/Sentinel 工作的总容量余量，但普通共享信号量没有专用预留或优先级；多个并发注册任务仍可能占满全部 3 个槽。
 
-### 根因 ④：CSRF Token / Session 时效性竞态
+三个业务容器当前不设置应用总内存 `mem_limit`，Docker `Memory=0`、cgroup `memory.max=max`。因此 `sentinel_browser.py` 的第二槽 cgroup 内存判断不会在当前运行态形成硬门控；浏览器最终竞争的是宿主机约 32GB RAM、8GB Swap、8 vCPU、PID 和调度时间。
 
-**注册协议流程**（`services/chatgpt_core/any_auto/register.py:415-476`）：
+`shm_size` 只控制容器 `/dev/shm` tmpfs 上限，不是容器总内存。删除该配置通常会回落到 Docker 默认约 64MiB，不会自动获得宿主机全部可用容量。本次 Plus 调整为 `2gb`，主实例和 Plus2 保持 `1gb`；三个业务实例继续保持 `pids_limit=768`，且不新增应用容器总内存硬限制。
 
-```
-① 访问 chatgpt.com → 获取 oai-did cookie
-② GET /api/auth/csrf → 获取 csrfToken
-③ POST signin/openai → 获取 authorize URL
-④ 访问 authorize URL → 进入邮箱/OTP 验证
-```
+### 3.3 独立 Turnstile Solver 当前不在 ChatGPT 注册调用链
 
-**并发问题：**
-- 每个 worker 线程各自创建独立的 `OpenAIHTTPClient` → `curl_cffi.Session`
-- 但如果使用同一个代理出口 IP，OpenAI 的 Cloudflare 层会对 **IP + oai-did** 做关联
-- 步骤 ①-② 与步骤 ③ 之间如果有延迟（等待信号量/captcha），CSRF token 可能已过期
+ChatGPT 注册确实会处理 Sentinel Turnstile，但当前两条注册链均不调用容器内独立的 `:8889/turnstile`：
 
----
+- 协议注册由 `services/chatgpt_core/any_auto/register.py::_check_sentinel()` 调用 `sentinel_vm.solve_turnstile_dx()`。
+- 浏览器注册使用自身 Camoufox 页面执行 Sentinel 挑战，并受注册浏览器容量槽控制。
+- `core/base_captcha.py::LocalSolverCaptcha` 才调用独立 Solver 的 `/turnstile` 和 `/result`，但当前 ChatGPT 注册没有 `_make_captcha()` 调用方。
 
-### 根因 ⑤：HME 邮箱资源池并发耗尽
+因此不能把当前注册失败或 `browser_slot=waiting` 归因于独立 Solver 队列。发布前 Plus Solver 为 `--thread 4`；本次将 `SOLVER_MAX_BROWSERS` 调整为 6、`SOLVER_WARM_BROWSERS` 保持 1，只是为未来接入独立 Solver 的调用方预留容量，对当前 ChatGPT 注册吞吐没有直接提升。主实例和 Plus2 保持 `4/1`。
 
-**HME (Hide My Email) 资源池** 是有限的预分配邮箱池：
-- 错误日志：`HME pool empty` / `HME Ready API 调用失败: POST /api/hme-ready/mailboxes/prepare status=503`（11-26 次）
-- 高并发时多个 worker 同时请求 HME 邮箱，池子快速耗尽
-- 后续 worker 无可用邮箱直接失败
+### 3.4 CSRF/Session 竞态目前没有证据
+
+每个注册 worker 使用独立 Session、Cookie 和 `oai-did`。协议链获取 CSRF 后立即提交 `signin/openai`，源码不存在多个 worker 共享同一个 CSRF token 的竞态，也不存在“先拿 CSRF、再等待浏览器槽或独立 Solver”的通用路径。
+
+相同出口 IP 仍可能放大 WAF 关联风险，但不能据此推导 CSRF token 因并发排队而过期。除非任务日志能给出 CSRF 获取、signin 提交和失败响应的时间证据，否则该项只能保留为待验证假设，不能列为已确认根因。
+
+### 3.5 HME 邮箱资源池容量
+
+`HME pool empty` 或 HME Ready `prepare status=503` 表明上游可用身份不足。提高注册并发会更快消耗库存，但增加本地线程、浏览器槽、Solver 或 SHM 都不能产生新的 HME 资源。该问题应通过池剩余量监控、预热/补池、任务前容量检查和明确降并发处理。
+
+### 3.6 OTP 等待窗口与负载放大
+
+当前单账号注册 OTP 策略为首次等待 `120s`、重发等待 `90s`、总预算 `210s`，不是 600 秒。并发可通过代理响应、邮件投递、宿主机 CPU 和浏览器调度增加阶段耗时。
+
+浏览器模式在完整注册浏览器会话开始前取得容量槽，并在会话结束后释放；不是提交 OTP 后再等待其他 worker 释放同一浏览器槽。因此“OTP 已到达后排队等待 Sentinel 槽”不能作为通用失败路径。
 
 ---
 
-### 根因 ⑥：OTP 验证码等待窗口与并发排队冲突
-
-**OTP 验证码预算机制**：
-- 默认等待窗口：`otp_wait_timeout=600s`（`api/tasks.py:17305`）
-- 实际首次等待：`chatgpt_register_otp_wait_seconds=120s`
-
-**并发竞态路径：**
-1. Worker A 提交邮箱 → 等待 OTP 验证码
-2. Worker B 同时提交邮箱（同 IP）→ 触发 429/403
-3. Worker A 的 OTP 验证码到达后提交 → 但中间的 Sentinel Browser 信号量被 Worker C 占用 → 排队
-4. 排队超时 → `OAuth 阶段 OTP 验证失败，已尝试 0 个验证码，等待窗口 600s`（19 次）
-
----
-
-## 4. 并发失败率更高的系统性原因汇总
+## 4. 当前共享资源关系
 
 ```mermaid
 graph TD
-    subgraph 并发注册线程池
-        T1[Worker 1]
-        T2[Worker 2]  
-        T3[Worker 3]
-        T4[Worker 4]
-        T5[Worker 5]
-    end
-    
-    subgraph 共享瓶颈资源
-        P[代理 IP 出口<br/>同IP多请求→403/429]
-        B[Browser Semaphore<br/>max=2, 排队超时]
-        S[Turnstile Solver<br/>4线程队列满]
-        M[容器内存 cgroup<br/>OOM门控]
-        E[HME邮箱池<br/>并发耗尽]
-    end
-    
-    T1 & T2 & T3 & T4 & T5 --> P
-    T1 & T2 & T3 & T4 & T5 --> B
-    T1 & T2 & T3 & T4 & T5 --> S
-    B --> M
-    T1 & T2 & T3 & T4 & T5 --> E
-    
-    P -->|最大杀手 44+39+28+20=131次| FAIL[注册失败]
-    B -->|超时/内存拒绝 ~9次| FAIL
-    S -->|队列延迟→连锁超时| FAIL
-    E -->|池空 26次| FAIL
+    P[协议注册<br/>默认2 / 最大3]
+    B[浏览器注册<br/>默认2 / 最大2]
+    IP[代理出口 IP<br/>探测 + 进程级租约]
+    MAIL[邮箱资源与 OTP 投递]
+    CPU[宿主机 CPU / PID / 调度]
+    SLOT[Auth Browser 槽<br/>主2 / Plus3 / Plus2 2]
+    SHM[/dev/shm<br/>主 1GiB / Plus 2GiB / Plus2 1GiB]
+    FAIL[403 / 429 / 超时 / 阶段失败]
+    SOLVER[独立 Solver<br/>Plus 6/1 容量预留]
+
+    P --> IP
+    B --> IP
+    P --> MAIL
+    B --> MAIL
+    P --> CPU
+    B --> SLOT
+    SLOT --> CPU
+    SLOT --> SHM
+    IP --> FAIL
+    MAIL --> FAIL
+    CPU --> FAIL
+    SHM --> FAIL
 ```
 
-**核心结论：并发失败率高的根本原因是 5 路并发线程共享了 4 个容量有限的瓶颈资源，形成了级联故障放大效应。**
+独立 Solver 当前不与 ChatGPT 注册节点或失败节点连边，因为现有注册调用链不消费它；图中的 Solver 仅表示 Plus `6/1` 的未来容量预留。
+
+核心结论不是“默认 5 路线程共享 4 个固定瓶颈”，而是注册任务并发、浏览器容量、出口 IP、邮箱资源和宿主机调度相互独立又会叠加。当前证据支持优先限制有效并发、错开启动时间并减少同出口碰撞；不支持把全部 403/429 或 OTP 失败归因于单一容量项。
 
 ---
 
-## 5. 改进建议
+## 5. P0/P1 落地配置与兼容性
 
-| 优先级 | 建议 | 预期效果 |
+| 优先级 | 落地配置 | 效果与兼容性 |
 |:---:|:---|:---|
-| P0 | **默认启用 `unique_exit_ip_enabled`**，并增加跨实例 IP 去重（可用 shared_config.db） | 消除 131 次 IP 级 403/429 错误 |
-| P0 | **降低默认并发**：协议模式 → 并发 2-3；浏览器模式 → 并发 1-2 | 减少 IP 频率触发 |
-| P1 | **增加注册间隔**：`register_delay_seconds` 默认从 0 调整到 15-30s，加随机抖动 | 分散请求时间窗口 |
-| P1 | **Turnstile Solver 线程提高到 6-8**（需配合增加容器内存限制） | 减少 captcha 排队延迟 |
-| P2 | **Browser 信号量上限提高到 3-4**（需 `AUTH_BROWSER_MAX_CONCURRENCY=4`） | 减少 Sentinel 排队超时 |
-| P2 | **HME 邮箱池预热/扩容**：注册前检查池剩余量，不足时降并发或切换 mail provider | 消除 26 次池空失败 |
-| P3 | **代理池轮换策略优化**：对 403 失败的代理 IP 增加冷却窗口（现有 `report_homepage_fail` 需加时间衰减） | 避免反复使用被标记的 IP |
-| P3 | **跨实例 Turnstile solver 共享**：Plus/Plus2 不需要各自运行 solver，可统一转发到主实例 | 节省约 600MB 内存 |
+| P0 | protocol 默认 `2`、硬上限 `3`；browser 默认 `2`、硬上限 `2`；手机号与手动邮箱固定 `1`；记录 requested/effective | 历史显式 `4/5` 会被后端截断；显式 `1` 和非 ChatGPT 注册旧上限保持不变 |
+| P0 | 动态代理缺省使用 `auto` 独立出口；同进程跨任务 active/cooldown 租约与续租；候选预算 `6`、预检 `1`；Plus 本地旧 `false` 迁移为 canonical `auto` | 减少 Plus 同容器任务撞出口，并约束正常路径的代理探测成本；不能承诺消除全部 403/429，跨容器碰撞仍是残余风险 |
+| P1 | ChatGPT 账号尝试启动间隔默认随机 `15-30s` | 抖动作用于相邻账号启动时间，不是每个 HTTP 请求；显式 `0/0` 继续关闭；旧客户端只传最小值时保持固定延迟 |
+| P1 | Plus：Solver `6/1`、SHM `2gb`、Auth Browser `3`；主实例与 Plus2：Solver `4/1`、SHM `1gb`、Auth Browser `2`；均无应用 `mem_limit` | Solver 是未来容量预留；2GiB SHM 增加 Plus 浏览器 IPC 空间，但不代表预占 2GiB，也不改善当前 ChatGPT 注册调用链或 `browser_slot` 排队 |
+
+主要修改边界：
+
+- `api/tasks.py`：模式级默认/硬上限、延迟归一化、requested/effective 元数据、代理控制冻结、独立出口策略与运行时二次冻结。
+- `api/config.py`：注册容量、延迟和出口租约配置的默认值、保存校验与响应合同。
+- `core/chatgpt_register_exit_ip_registry.py`：同进程原子领取、active TTL、冷却和 IPv6 `/64` 去重。
+- `frontend/src/pages/Accounts.tsx`、`RegisterTaskPage.tsx`、`features/auth/components/RegisterTaskModal.tsx`：前端默认值、模式上限、最大延迟持久化和 payload 对齐。
+- `docker-compose.multi.yml`：三个实例分别设置 Solver 容量，仅 Plus 将 `shm_size` 提高到 `2gb`。
+
+---
+
+## 6. 剩余风险
+
+1. 独立出口租约目前不跨容器；如果以后同时恢复三个实例的高并发注册，需要单独设计共享运行态协调。
+2. 403/429 仍可能来自 IP 信誉、指纹、Session 或上游策略，独立出口和抖动只能降低相关风险，不能保证消除。
+3. Plus 没有应用总内存上限；SHM 扩容后仍需观察宿主机内存、Swap、CPU PSI 和 PID，避免把可用内存误解为无限浏览器容量。
+4. 当前 ChatGPT 注册不消费独立 Solver。只有出现真实 `/turnstile` 调用和队列指标后，才应继续把 Solver 从 6 提高到 8。
+5. HME 池耗尽需要上游容量治理，不能由本地并发参数补偿。

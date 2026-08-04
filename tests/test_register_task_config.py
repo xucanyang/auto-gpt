@@ -1,0 +1,163 @@
+import unittest
+from unittest.mock import patch
+
+from fastapi import HTTPException
+
+import api.config as config_api
+
+
+class RegisterTaskConfigTests(unittest.TestCase):
+    def test_config_response_exposes_registration_control_defaults(self):
+        with patch.object(config_api.config_store, "get_all", return_value={}):
+            response = config_api._build_config_response()
+
+        self.assertEqual(response["chatgpt_register_protocol_default_concurrency"], "2")
+        self.assertEqual(response["chatgpt_register_protocol_max_concurrency"], "3")
+        self.assertEqual(response["chatgpt_register_browser_default_concurrency"], "2")
+        self.assertEqual(response["chatgpt_register_browser_max_concurrency"], "2")
+        self.assertEqual(response["chatgpt_register_delay_seconds"], "15")
+        self.assertEqual(response["chatgpt_register_delay_max_seconds"], "30")
+        self.assertEqual(response["chatgpt_register_unique_exit_ip_policy"], "auto")
+        self.assertEqual(response["chatgpt_register_unique_exit_ip_max_refresh_attempts"], "6")
+        self.assertEqual(response["chatgpt_register_unique_exit_ip_probe_timeout_seconds"], "8")
+        self.assertEqual(response["chatgpt_register_unique_exit_ip_active_ttl_seconds"], "1800")
+        self.assertEqual(response["chatgpt_register_unique_exit_ip_cooldown_seconds"], "900")
+
+    def test_config_response_canonical_policy_masks_conflicting_legacy_boolean(self):
+        with patch.object(
+            config_api.config_store,
+            "get_all",
+            return_value={
+                "chatgpt_register_unique_exit_ip_policy": "auto",
+                "chatgpt_register_unique_exit_ip_enabled": "false",
+            },
+        ):
+            response = config_api._build_config_response()
+
+        self.assertEqual(response["chatgpt_register_unique_exit_ip_policy"], "auto")
+        self.assertEqual(response["chatgpt_register_unique_exit_ip_enabled"], "")
+
+    def test_config_update_normalizes_registration_controls(self):
+        saved = {}
+
+        def capture(values, **_kwargs):
+            saved.update(values)
+
+        with (
+            patch.object(config_api.config_store, "get_all", return_value={}),
+            patch.object(config_api.config_store, "set_many", side_effect=capture),
+        ):
+            result = config_api.update_config(
+                config_api.ConfigUpdate(
+                    data={
+                        "chatgpt_register_protocol_default_concurrency": "3.0",
+                        "chatgpt_register_protocol_max_concurrency": 3,
+                        "chatgpt_register_browser_default_concurrency": 2,
+                        "chatgpt_register_browser_max_concurrency": "2",
+                        "chatgpt_register_delay_seconds": "5.5",
+                        "chatgpt_register_delay_max_seconds": 0,
+                        "chatgpt_register_unique_exit_ip_policy": "required",
+                        "chatgpt_register_unique_exit_ip_max_refresh_attempts": "6.0",
+                        "chatgpt_register_unique_exit_ip_probe_timeout_seconds": 8,
+                        "chatgpt_register_unique_exit_ip_active_ttl_seconds": 2400,
+                        "chatgpt_register_unique_exit_ip_cooldown_seconds": 0,
+                    }
+                )
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(saved["chatgpt_register_protocol_default_concurrency"], "3")
+        self.assertEqual(saved["chatgpt_register_protocol_max_concurrency"], "3")
+        self.assertEqual(saved["chatgpt_register_delay_seconds"], "5.5")
+        self.assertEqual(saved["chatgpt_register_delay_max_seconds"], "0")
+        self.assertEqual(saved["chatgpt_register_unique_exit_ip_policy"], "required")
+        self.assertEqual(saved["chatgpt_register_unique_exit_ip_enabled"], "true")
+        self.assertEqual(saved["chatgpt_register_unique_exit_ip_max_refresh_attempts"], "6")
+        self.assertEqual(saved["chatgpt_register_unique_exit_ip_probe_timeout_seconds"], "8")
+        self.assertEqual(saved["chatgpt_register_unique_exit_ip_active_ttl_seconds"], "2400")
+        self.assertEqual(saved["chatgpt_register_unique_exit_ip_cooldown_seconds"], "0")
+
+    def test_config_update_synchronizes_canonical_and_legacy_policy_fields(self):
+        def update(data, current=None):
+            saved = {}
+            with (
+                patch.object(config_api.config_store, "get_all", return_value=dict(current or {})),
+                patch.object(
+                    config_api.config_store,
+                    "set_many",
+                    side_effect=lambda values, **_kwargs: saved.update(values),
+                ),
+            ):
+                config_api.update_config(config_api.ConfigUpdate(data=data))
+            return saved
+
+        canonical_auto = update(
+            {
+                "chatgpt_register_unique_exit_ip_policy": "auto",
+                "chatgpt_register_unique_exit_ip_enabled": "false",
+            },
+            current={"chatgpt_register_unique_exit_ip_enabled": "false"},
+        )
+        legacy_required = update(
+            {"chatgpt_register_unique_exit_ip_enabled": "true"},
+            current={"chatgpt_register_unique_exit_ip_policy": "auto"},
+        )
+        legacy_off = update(
+            {"chatgpt_register_unique_exit_ip_enabled": "false"},
+            current={"chatgpt_register_unique_exit_ip_policy": "required"},
+        )
+
+        self.assertEqual(canonical_auto["chatgpt_register_unique_exit_ip_policy"], "auto")
+        self.assertEqual(canonical_auto["chatgpt_register_unique_exit_ip_enabled"], "")
+        self.assertEqual(legacy_required["chatgpt_register_unique_exit_ip_policy"], "required")
+        self.assertEqual(legacy_required["chatgpt_register_unique_exit_ip_enabled"], "true")
+        self.assertEqual(legacy_off["chatgpt_register_unique_exit_ip_policy"], "off")
+        self.assertEqual(legacy_off["chatgpt_register_unique_exit_ip_enabled"], "false")
+
+    def test_config_update_rejects_invalid_caps_and_delay_range(self):
+        with patch.object(config_api.config_store, "get_all", return_value={}):
+            with self.assertRaises(HTTPException) as hard_cap_error:
+                config_api.update_config(
+                    config_api.ConfigUpdate(
+                        data={"chatgpt_register_browser_max_concurrency": 3}
+                    )
+                )
+            with self.assertRaises(HTTPException) as cap_error:
+                config_api.update_config(
+                    config_api.ConfigUpdate(
+                        data={
+                            "chatgpt_register_protocol_default_concurrency": 3,
+                            "chatgpt_register_protocol_max_concurrency": 2,
+                        }
+                    )
+                )
+            with self.assertRaises(HTTPException) as delay_error:
+                config_api.update_config(
+                    config_api.ConfigUpdate(
+                        data={
+                            "chatgpt_register_delay_seconds": 30,
+                            "chatgpt_register_delay_max_seconds": 15,
+                        }
+                    )
+                )
+            with self.assertRaises(HTTPException) as refresh_budget_error:
+                config_api.update_config(
+                    config_api.ConfigUpdate(
+                        data={
+                            "chatgpt_register_unique_exit_ip_max_refresh_attempts": 13,
+                        }
+                    )
+                )
+
+        self.assertEqual(hard_cap_error.exception.status_code, 400)
+        self.assertIn("1 到 2", str(hard_cap_error.exception.detail))
+        self.assertEqual(cap_error.exception.status_code, 400)
+        self.assertIn("默认并发不能大于", str(cap_error.exception.detail))
+        self.assertEqual(delay_error.exception.status_code, 400)
+        self.assertIn("最大启动延时不能小于", str(delay_error.exception.detail))
+        self.assertEqual(refresh_budget_error.exception.status_code, 400)
+        self.assertIn("1 到 12", str(refresh_budget_error.exception.detail))
+
+
+if __name__ == "__main__":
+    unittest.main()

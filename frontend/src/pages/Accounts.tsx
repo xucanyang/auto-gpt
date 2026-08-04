@@ -62,6 +62,12 @@ import { usePersistentChatGPTRegistrationMode } from '@/hooks/usePersistentChatG
 import { parseBooleanConfigValue } from '@/lib/configValueParsers'
 import { buildChatGPTRegistrationRequestAdapter } from '@/lib/chatgptRegistrationRequestAdapter'
 import { CHATGPT_REGISTRATION_MODE_REFRESH_TOKEN } from '@/lib/chatgptRegistrationMode'
+import {
+  normalizeRegisterConcurrency,
+  normalizeRegisterDelaySettings,
+  normalizeRegisterUniqueExitPolicy,
+  type ChatGPTRegisterControlConfig,
+} from '@/lib/chatgptRegisterTaskControls'
 import { normalizeDomainList, parseStoredDomainList } from '@/lib/domainList'
 import {
   DEFAULT_GOPAY_PHONE_COUNTRY_CODE,
@@ -2795,6 +2801,7 @@ export default function Accounts() {
   const [activeTasksPanelOpen, setActiveTasksPanelOpen] = useState(false)
   const [registerLoading, setRegisterLoading] = useState(false)
   const [registerSettingsSaving, setRegisterSettingsSaving] = useState(false)
+  const [registerControlConfig, setRegisterControlConfig] = useState<ChatGPTRegisterControlConfig>({})
   const [backfillLoading, setBackfillLoading] = useState<'' | 'cliproxyapi_pending' | 'cliproxyapi_selected' | 'sub2api_pending' | 'sub2api_selected'>('')
   const [batchResumeAuthLoading, setBatchResumeAuthLoading] = useState<'' | 'selected' | 'filtered' | 'selected_phone' | 'filtered_phone'>('')
   const [batchPaymentLinkLoading, setBatchPaymentLinkLoading] = useState(false)
@@ -3847,6 +3854,7 @@ export default function Accounts() {
     loadConfigCache({ force: true })
       .then((cfg) => {
         if (cancelled) return
+        setRegisterControlConfig(cfg)
         const provider = String(cfg?.mail_provider || 'luckmail').trim() || 'luckmail'
         const savedSettings = loadRegisterFormSettings(currentPlatform)
         const hasSavedMailProfile = parseBooleanConfigValue(savedSettings.register_mail_profile_saved)
@@ -3872,19 +3880,40 @@ export default function Accounts() {
         const tempmailPrimaryDomain = hasSavedMailProfile && Object.prototype.hasOwnProperty.call(savedSettings, 'tempmail_primary_domain')
           ? String(savedSettings.tempmail_primary_domain || '').trim().replace(/^[@.]+/, '')
           : (tempmailFixedDomains[0] || '')
-        const executorFieldHydration = registerForm.isFieldTouched('executor_type')
-          ? {}
-          : {
-              executor_type: normalizeExecutorForPlatform(
-                currentPlatform,
-                String(savedSettings.executor_type || cfg.default_executor || '').trim(),
-              ),
-            }
+        const shouldHydrateExecutor = !registerForm.isFieldTouched('executor_type')
+        const hydratedExecutor = normalizeExecutorForPlatform(
+          currentPlatform,
+          String(savedSettings.executor_type || cfg.default_executor || '').trim(),
+        )
+        const executorFieldHydration = shouldHydrateExecutor ? { executor_type: hydratedExecutor } : {}
+        const effectiveExecutor = normalizeExecutorForPlatform(
+          currentPlatform,
+          shouldHydrateExecutor
+            ? hydratedExecutor
+            : registerForm.getFieldValue('executor_type'),
+        )
+        const delaySettings = normalizeRegisterDelaySettings(savedSettings, currentPlatform, cfg)
+        const effectiveMailProvider = savedProviderOverride !== '__global__' ? savedProviderOverride : provider
+        const configuredUniqueExitPolicy = normalizeRegisterUniqueExitPolicy(
+          cfg.chatgpt_register_unique_exit_ip_policy,
+          cfg.chatgpt_register_unique_exit_ip_enabled,
+        )
+        const uniqueExitPolicy = normalizeRegisterUniqueExitPolicy(
+          savedSettings.chatgpt_register_unique_exit_ip_policy,
+          savedSettings.chatgpt_register_unique_exit_ip_enabled,
+          configuredUniqueExitPolicy,
+        )
         setRegisterMailProvider(provider)
         registerForm.setFieldsValue({
           count: Number(savedSettings.count || 1) || 1,
-          concurrency: Number(savedSettings.concurrency || 1) || 1,
-          register_delay_seconds: Number(savedSettings.register_delay_seconds || 0) || 0,
+          concurrency: normalizeRegisterConcurrency(
+            savedSettings.concurrency,
+            currentPlatform,
+            effectiveExecutor,
+            effectiveMailProvider === 'manual_email_otp',
+            cfg,
+          ),
+          ...delaySettings,
           ...executorFieldHydration,
           ...proxySettings,
           mail_provider_override: savedProviderOverride,
@@ -3913,10 +3942,7 @@ export default function Accounts() {
               : cfg.chatgpt_existing_account_login_route_enabled === undefined
                 ? true
                 : parseBooleanConfigValue(cfg.chatgpt_existing_account_login_route_enabled),
-          chatgpt_register_unique_exit_ip_enabled:
-            cfg.chatgpt_register_unique_exit_ip_enabled === undefined
-              ? false
-              : parseBooleanConfigValue(cfg.chatgpt_register_unique_exit_ip_enabled),
+          chatgpt_register_unique_exit_ip_policy: uniqueExitPolicy,
           chatgpt_register_otp_wait_seconds:
             cfg.chatgpt_register_otp_wait_seconds ?? 120,
           chatgpt_register_otp_resend_wait_seconds:
@@ -3927,6 +3953,7 @@ export default function Accounts() {
       })
       .catch(() => {
         if (cancelled) return
+        setRegisterControlConfig({})
         setRegisterMailProvider('luckmail')
         const savedSettings = loadRegisterFormSettings(currentPlatform)
         const hasSavedMailProfile = parseBooleanConfigValue(savedSettings.register_mail_profile_saved)
@@ -3940,20 +3967,32 @@ export default function Accounts() {
           ? normalizeDomainList(savedSettings.tempmail_fixed_domains)
           : []
         const savedEmail = window.localStorage.getItem('auto-chatgpt.manual_email_otp.email') || ''
-        const executorFieldHydration = registerForm.isFieldTouched('executor_type')
-          ? {}
-          : {
-              executor_type: normalizeExecutorForPlatform(
-                currentPlatform,
-                String(savedSettings.executor_type || 'protocol').trim(),
-              ),
-            }
+        const shouldHydrateExecutor = !registerForm.isFieldTouched('executor_type')
+        const hydratedExecutor = normalizeExecutorForPlatform(
+          currentPlatform,
+          String(savedSettings.executor_type || 'protocol').trim(),
+        )
+        const executorFieldHydration = shouldHydrateExecutor ? { executor_type: hydratedExecutor } : {}
+        const effectiveExecutor = normalizeExecutorForPlatform(
+          currentPlatform,
+          shouldHydrateExecutor
+            ? hydratedExecutor
+            : registerForm.getFieldValue('executor_type'),
+        )
+        const delaySettings = normalizeRegisterDelaySettings(savedSettings, currentPlatform)
+        const effectiveMailProvider = savedProviderOverride !== '__global__' ? savedProviderOverride : 'luckmail'
+        const fallbackProxySettings = taskProxySettingsFromConfig({})
         registerForm.setFieldsValue({
           count: Number(savedSettings.count || 1) || 1,
-          concurrency: Number(savedSettings.concurrency || 1) || 1,
-          register_delay_seconds: Number(savedSettings.register_delay_seconds || 0) || 0,
+          concurrency: normalizeRegisterConcurrency(
+            savedSettings.concurrency,
+            currentPlatform,
+            effectiveExecutor,
+            effectiveMailProvider === 'manual_email_otp',
+          ),
+          ...delaySettings,
           ...executorFieldHydration,
-          ...taskProxySettingsFromConfig({}),
+          ...fallbackProxySettings,
           mail_provider_override: savedProviderOverride,
           email_api_lines: '',
           email_api_poll_interval_seconds: 3,
@@ -3972,7 +4011,10 @@ export default function Accounts() {
           chatgpt_existing_account_capture: savedSettings.chatgpt_existing_account_capture ?? false,
           chatgpt_save_registration_access_token_account: true,
           chatgpt_existing_account_login_route_enabled: true,
-          chatgpt_register_unique_exit_ip_enabled: false,
+          chatgpt_register_unique_exit_ip_policy: normalizeRegisterUniqueExitPolicy(
+            savedSettings.chatgpt_register_unique_exit_ip_policy,
+            savedSettings.chatgpt_register_unique_exit_ip_enabled,
+          ),
           chatgpt_register_otp_wait_seconds: 120,
           chatgpt_register_otp_resend_wait_seconds: 90,
           chatgpt_register_otp_account_budget_seconds: 210,
@@ -5698,6 +5740,11 @@ export default function Accounts() {
   }
 
   const handleSaveRegisterSettings = async () => {
+    try {
+      await registerForm.validateFields()
+    } catch {
+      return
+    }
     const values = registerForm.getFieldsValue(true)
     const mailProviderOverride = normalizeRegisterMailProviderOverride(values.mail_provider_override)
     const tempmailMode = normalizeRegisterTempMailMode(values.tempmail_mode)
@@ -5705,11 +5752,26 @@ export default function Accounts() {
     const tempmailPrimaryDomain = String(
       values.tempmail_primary_domain || tempmailFixedDomains[0] || '',
     ).trim().replace(/^[@.]+/, '')
+    const executorType = normalizeExecutorForPlatform(currentPlatform, values.executor_type)
+    const effectiveMailProvider = mailProviderOverride !== '__global__'
+      ? mailProviderOverride
+      : registerMailProvider
+    const delaySettings = normalizeRegisterDelaySettings(values, currentPlatform, registerControlConfig)
+    const uniqueExitPolicy = normalizeRegisterUniqueExitPolicy(
+      values.chatgpt_register_unique_exit_ip_policy,
+      values.chatgpt_register_unique_exit_ip_enabled,
+    )
     const settingsPayload = {
       count: Number(values.count || 1) || 1,
-      concurrency: Number(values.concurrency || 1) || 1,
-      register_delay_seconds: Number(values.register_delay_seconds || 0) || 0,
-      executor_type: normalizeExecutorForPlatform(currentPlatform, values.executor_type),
+      concurrency: normalizeRegisterConcurrency(
+        values.concurrency,
+        currentPlatform,
+        executorType,
+        effectiveMailProvider === 'manual_email_otp',
+        registerControlConfig,
+      ),
+      ...delaySettings,
+      executor_type: executorType,
       proxy_mode: String(values.proxy_mode || 'dynamic'),
       proxy: String(values.proxy || '').trim(),
       proxy_country_code: String(values.proxy_country_code || '').trim().toUpperCase(),
@@ -5730,7 +5792,7 @@ export default function Accounts() {
         values.chatgpt_existing_account_login_route_enabled === undefined
           ? true
           : Boolean(values.chatgpt_existing_account_login_route_enabled),
-      chatgpt_register_unique_exit_ip_enabled: Boolean(values.chatgpt_register_unique_exit_ip_enabled),
+      chatgpt_register_unique_exit_ip_policy: uniqueExitPolicy,
       chatgpt_register_otp_wait_seconds: Number(values.chatgpt_register_otp_wait_seconds || 120) || 120,
       chatgpt_register_otp_resend_wait_seconds: Number(values.chatgpt_register_otp_resend_wait_seconds || 90) || 90,
       chatgpt_register_otp_account_budget_seconds: Number(values.chatgpt_register_otp_account_budget_seconds || 210) || 210,
@@ -5744,12 +5806,15 @@ export default function Accounts() {
         count: settingsPayload.count,
         concurrency: settingsPayload.concurrency,
         register_delay_seconds: settingsPayload.register_delay_seconds,
+        register_delay_max_seconds: settingsPayload.register_delay_max_seconds,
         executor_type: settingsPayload.executor_type,
         mail_provider_override: settingsPayload.mail_provider_override,
         tempmail_mode: settingsPayload.tempmail_mode,
         tempmail_primary_domain: settingsPayload.tempmail_primary_domain,
         tempmail_fixed_domains: settingsPayload.tempmail_fixed_domains,
         email: settingsPayload.email,
+        chatgpt_register_unique_exit_ip_policy: settingsPayload.chatgpt_register_unique_exit_ip_policy,
+        chatgpt_register_unique_exit_ip_enabled: undefined,
       })
       await saveTaskProxySettingsToConfig(settingsPayload)
       if (currentPlatform === 'chatgpt') {
@@ -5757,7 +5822,7 @@ export default function Accounts() {
           method: 'PUT',
           body: JSON.stringify({
             data: {
-              chatgpt_register_unique_exit_ip_enabled: settingsPayload.chatgpt_register_unique_exit_ip_enabled ? 'true' : 'false',
+              chatgpt_register_unique_exit_ip_policy: settingsPayload.chatgpt_register_unique_exit_ip_policy,
               chatgpt_save_registration_access_token_account: settingsPayload.chatgpt_save_registration_access_token_account ? 'true' : 'false',
               chatgpt_existing_account_login_route_enabled: settingsPayload.chatgpt_existing_account_login_route_enabled ? 'true' : 'false',
               chatgpt_register_otp_wait_seconds: String(settingsPayload.chatgpt_register_otp_wait_seconds),
@@ -5919,8 +5984,13 @@ export default function Accounts() {
               ? true
               : Boolean(values.chatgpt_existing_account_login_route_enabled))
             : undefined,
-        chatgpt_register_unique_exit_ip_enabled:
-          currentPlatform === 'chatgpt' ? Boolean(values.chatgpt_register_unique_exit_ip_enabled) : undefined,
+        chatgpt_register_unique_exit_ip_policy:
+          currentPlatform === 'chatgpt'
+            ? normalizeRegisterUniqueExitPolicy(
+                values.chatgpt_register_unique_exit_ip_policy,
+                values.chatgpt_register_unique_exit_ip_enabled,
+              )
+            : undefined,
         chatgpt_register_otp_wait_seconds:
           currentPlatform === 'chatgpt' ? values.chatgpt_register_otp_wait_seconds : undefined,
         chatgpt_register_otp_resend_wait_seconds:
@@ -5955,12 +6025,26 @@ export default function Accounts() {
       }
 
       validateTaskProxySettings(values)
+      const concurrency = normalizeRegisterConcurrency(
+        values.concurrency,
+        currentPlatform,
+        executorType,
+        phoneSignupEnabled || resolvedMailProvider === 'manual_email_otp',
+        cfg,
+      )
+      const delaySettings = normalizeRegisterDelaySettings(values, currentPlatform, cfg)
+      const uniqueExitPolicy = normalizeRegisterUniqueExitPolicy(
+        values.chatgpt_register_unique_exit_ip_policy,
+        values.chatgpt_register_unique_exit_ip_enabled,
+      )
       mergeRegisterFormSettings(currentPlatform, {
         count: Number(values.count || 1) || 1,
-        concurrency: phoneSignupEnabled ? 1 : (Number(values.concurrency || 1) || 1),
-        register_delay_seconds: Number(values.register_delay_seconds || 0) || 0,
+        concurrency,
+        ...delaySettings,
         executor_type: executorType,
         email: String(values.email || '').trim(),
+        chatgpt_register_unique_exit_ip_policy: uniqueExitPolicy,
+        chatgpt_register_unique_exit_ip_enabled: undefined,
       })
       const proxyPayload = buildTaskProxyPayload(values)
 
@@ -5978,8 +6062,8 @@ export default function Accounts() {
               ? (normalizedLoginPassword || null)
               : null,
           count: values.count,
-          concurrency: phoneSignupEnabled ? 1 : values.concurrency,
-          register_delay_seconds: values.register_delay_seconds || 0,
+          concurrency,
+          ...delaySettings,
           executor_type: executorType,
           captcha_solver: cfg.default_captcha_solver || 'yescaptcha',
           ...proxyPayload,
@@ -8985,6 +9069,7 @@ export default function Accounts() {
         taskSnapshot={taskSnapshot}
         registerForm={registerForm}
         registerMailProvider={registerMailProvider}
+        registerControlConfig={registerControlConfig}
         chatgptRegistrationMode={chatgptRegistrationMode}
         setChatgptRegistrationMode={setChatgptRegistrationMode}
         registerLoading={registerLoading}

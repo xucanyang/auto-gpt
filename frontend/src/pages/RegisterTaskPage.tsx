@@ -5,6 +5,7 @@ import {
   Form,
   Input,
   InputNumber,
+  Segmented,
   Select,
   Button,
   Checkbox,
@@ -28,6 +29,18 @@ import { TaskVerificationPanel } from '@/components/TaskVerificationPanel'
 import { usePersistentChatGPTRegistrationMode } from '@/hooks/usePersistentChatGPTRegistrationMode'
 import { parseBooleanConfigValue } from '@/lib/configValueParsers'
 import { buildChatGPTRegistrationRequestAdapter } from '@/lib/chatgptRegistrationRequestAdapter'
+import {
+  CHATGPT_REGISTER_DEFAULT_CONCURRENCY,
+  CHATGPT_REGISTER_DEFAULT_DELAY_MAX_SECONDS,
+  CHATGPT_REGISTER_DEFAULT_DELAY_SECONDS,
+  getRegisterDefaultConcurrency,
+  getRegisterConcurrencyLimit,
+  isRegisterUniqueExitEnabled,
+  normalizeRegisterConcurrency,
+  normalizeRegisterDelaySettings,
+  normalizeRegisterUniqueExitPolicy,
+  type ChatGPTRegisterControlConfig,
+} from '@/lib/chatgptRegisterTaskControls'
 import {
   EXECUTOR_SELECTION_HELP,
   getExecutorOptions,
@@ -86,6 +99,7 @@ export default function RegisterTaskPage() {
   const [polling, setPolling] = useState(false)
   const [tempmailDomains, setTempmailDomains] = useState<any[]>([])
   const [tempmailDomainsLoading, setTempmailDomainsLoading] = useState(false)
+  const [registerControlConfig, setRegisterControlConfig] = useState<ChatGPTRegisterControlConfig>({})
   const pollTimerRef = useRef<number | null>(null)
   const taskRef = useRef<any>(null)
   const { mode: chatgptRegistrationMode, setMode: setChatgptRegistrationMode } =
@@ -93,10 +107,15 @@ export default function RegisterTaskPage() {
 
   useEffect(() => {
     apiFetch('/config').then((cfg) => {
+      setRegisterControlConfig(cfg)
       const currentPlatform = form.getFieldValue('platform') || 'chatgpt'
       const proxySettings = taskProxySettingsFromConfig(cfg)
+      const executorType = normalizeExecutorForPlatform(currentPlatform, cfg.default_executor)
+      const delaySettings = normalizeRegisterDelaySettings({}, currentPlatform, cfg)
       form.setFieldsValue({
-        executor_type: normalizeExecutorForPlatform(currentPlatform, cfg.default_executor),
+        executor_type: executorType,
+        concurrency: getRegisterDefaultConcurrency(currentPlatform, executorType, cfg),
+        ...delaySettings,
         captcha_solver: cfg.default_captcha_solver || 'yescaptcha',
         mail_provider: cfg.mail_provider || 'luckmail',
         email_api_lines: cfg.email_api_lines || '',
@@ -199,10 +218,10 @@ export default function RegisterTaskPage() {
             : cfg.chatgpt_existing_account_login_route_enabled === undefined
               ? true
               : parseBooleanConfigValue(cfg.chatgpt_existing_account_login_route_enabled),
-        chatgpt_register_unique_exit_ip_enabled:
-          cfg.chatgpt_register_unique_exit_ip_enabled === undefined
-            ? false
-            : parseBooleanConfigValue(cfg.chatgpt_register_unique_exit_ip_enabled),
+        chatgpt_register_unique_exit_ip_policy: normalizeRegisterUniqueExitPolicy(
+          cfg.chatgpt_register_unique_exit_ip_policy,
+          cfg.chatgpt_register_unique_exit_ip_enabled,
+        ),
         chatgpt_register_otp_wait_seconds: cfg.chatgpt_register_otp_wait_seconds || 120,
         chatgpt_register_otp_resend_wait_seconds: cfg.chatgpt_register_otp_resend_wait_seconds || 90,
         chatgpt_register_otp_account_budget_seconds: cfg.chatgpt_register_otp_account_budget_seconds || 210,
@@ -225,6 +244,16 @@ export default function RegisterTaskPage() {
   const submit = async () => {
     const values = await form.validateFields()
     const phoneSignupEnabled = values.platform === 'chatgpt' && values.chatgpt_registration_entry === 'phone_signup'
+    const executorType = normalizeExecutorForPlatform(values.platform, values.executor_type)
+    const forceSerial = phoneSignupEnabled || (values.platform === 'chatgpt' && values.mail_provider === 'manual_email_otp')
+    const concurrency = normalizeRegisterConcurrency(
+      values.concurrency,
+      values.platform,
+      executorType,
+      forceSerial,
+      registerControlConfig,
+    )
+    const delaySettings = normalizeRegisterDelaySettings(values, values.platform, registerControlConfig)
     if (values.mail_provider === 'tempmail_local' && (values.tempmail_mode || 'fixed_domain') === 'fixed_domain'
       && normalizeDomainList(values.tempmail_fixed_domains).length === 0) {
       message.error('固定域名模式下请至少选择一个 TempMail 可用域名')
@@ -341,8 +370,10 @@ export default function RegisterTaskPage() {
             ? true
             : Boolean(values.chatgpt_existing_account_login_route_enabled))
           : undefined,
-      chatgpt_register_unique_exit_ip_enabled:
-        platform === 'chatgpt' ? Boolean(values.chatgpt_register_unique_exit_ip_enabled) : undefined,
+      chatgpt_register_unique_exit_ip_policy:
+        platform === 'chatgpt'
+          ? normalizeRegisterUniqueExitPolicy(values.chatgpt_register_unique_exit_ip_policy)
+          : undefined,
       chatgpt_register_otp_wait_seconds:
         platform === 'chatgpt' ? values.chatgpt_register_otp_wait_seconds : undefined,
       chatgpt_register_otp_resend_wait_seconds:
@@ -381,10 +412,10 @@ export default function RegisterTaskPage() {
           email: values.email || null,
           password: phoneSignupEnabled ? String(values.login_password || values.password || '').trim() : values.password || null,
           count: values.count,
-          concurrency: phoneSignupEnabled ? 1 : values.concurrency,
-          register_delay_seconds: values.register_delay_seconds || 0,
+          concurrency,
+          ...delaySettings,
           ...proxyPayload,
-          executor_type: values.executor_type,
+          executor_type: executorType,
           captcha_solver: values.captcha_solver,
           extra: adaptedRegisterExtra,
         }),
@@ -529,14 +560,19 @@ export default function RegisterTaskPage() {
   const platform = Form.useWatch('platform', form)
   const proxyMode = Form.useWatch('proxy_mode', form)
   const proxyFailover = Form.useWatch('proxy_failover', form)
-  const uniqueExitIpEnabled = Form.useWatch('chatgpt_register_unique_exit_ip_enabled', form)
   const registerCount = Number(Form.useWatch('count', form) || 1)
   const manualEmail = Form.useWatch('email', form)
   const chatgptRegistrationEntry = Form.useWatch('chatgpt_registration_entry', form)
   const phoneSignupUsePool = Form.useWatch('chatgpt_phone_signup_use_pool', form)
+  const uniqueExitIpPolicy = Form.useWatch('chatgpt_register_unique_exit_ip_policy', form)
+  const selectedExecutor = Form.useWatch('executor_type', form)
+  const executorType = normalizeExecutorForPlatform(platform, selectedExecutor)
   const executorOptions = getExecutorOptions(platform)
   const isManualEmailOtp = platform === 'chatgpt' && mailProvider === 'manual_email_otp'
   const isPhoneSignup = platform === 'chatgpt' && chatgptRegistrationEntry === 'phone_signup'
+  const forceSerialRegistration = isManualEmailOtp || isPhoneSignup
+  const concurrencyLimit = getRegisterConcurrencyLimit(platform, executorType, registerControlConfig)
+  const uniqueExitIpEnabled = isRegisterUniqueExitEnabled(uniqueExitIpPolicy, proxyMode)
   const normalizedTempMailSelectedDomains = normalizeDomainList(tempmailSelectedDomains)
   const tempmailDomainOptions = useMemo(() => {
     const byDomain = new Map<string, any>()
@@ -600,9 +636,18 @@ export default function RegisterTaskPage() {
   }, [form, platform, mailProvider])
 
   useEffect(() => {
-    if (!isPhoneSignup) return
-    form.setFieldValue('concurrency', 1)
-  }, [form, isPhoneSignup])
+    const currentConcurrency = form.getFieldValue('concurrency')
+    const nextConcurrency = normalizeRegisterConcurrency(
+      currentConcurrency,
+      platform,
+      executorType,
+      forceSerialRegistration,
+      registerControlConfig,
+    )
+    if (Number(currentConcurrency) !== nextConcurrency) {
+      form.setFieldValue('concurrency', nextConcurrency)
+    }
+  }, [executorType, forceSerialRegistration, form, platform, registerControlConfig])
 
   useEffect(() => {
     if (!isManualEmailOtp) return
@@ -665,8 +710,10 @@ export default function RegisterTaskPage() {
         chatgpt_phone_signup_resend_interval_seconds: 60,
         ...taskProxySettingsFromConfig({}),
         count: 1,
-        concurrency: 1,
-        register_delay_seconds: 0,
+        concurrency: CHATGPT_REGISTER_DEFAULT_CONCURRENCY,
+        register_delay_seconds: CHATGPT_REGISTER_DEFAULT_DELAY_SECONDS,
+        register_delay_max_seconds: CHATGPT_REGISTER_DEFAULT_DELAY_MAX_SECONDS,
+        chatgpt_register_unique_exit_ip_policy: 'auto',
         maliapi_base_url: 'https://maliapi.215.im/v1',
         maliapi_auto_domain_strategy: 'balanced',
         solver_url: 'http://localhost:8889',
@@ -696,16 +743,37 @@ export default function RegisterTaskPage() {
             <Form.Item name="count" label="目标成功数" style={{ flex: 1 }}>
               <Input type="number" min={1} disabled={isManualEmailOtp} />
             </Form.Item>
-            <Form.Item name="concurrency" label="并发数" style={{ flex: 1 }}>
-              <Input type="number" min={1} max={5} disabled={isManualEmailOtp || isPhoneSignup} />
+            <Form.Item
+              name="concurrency"
+              label="并发数"
+              style={{ flex: 1 }}
+              extra={forceSerialRegistration ? '当前注册方式固定串行。' : `当前执行器最多并发 ${concurrencyLimit}。`}
+            >
+              <Input type="number" min={1} max={concurrencyLimit} disabled={forceSerialRegistration} />
             </Form.Item>
           </Space>
           <Space style={{ width: '100%' }}>
-            <Form.Item name="register_delay_seconds" label="最小注册延迟(秒)" initialValue={0} style={{ flex: 1 }}>
-              <InputNumber min={0} precision={1} step={0.5} style={{ width: '100%' }} placeholder="0" />
+            <Form.Item name="register_delay_seconds" label="最小注册延迟(秒)" style={{ flex: 1 }}>
+              <InputNumber min={0} max={3600} precision={1} step={0.5} style={{ width: '100%' }} placeholder="0 = 不延迟" />
             </Form.Item>
-            <Form.Item name="register_delay_max_seconds" label="最大延迟(秒)" initialValue={0} style={{ flex: 1 }}>
-              <InputNumber min={0} precision={1} step={0.5} style={{ width: '100%' }} placeholder="0" />
+            <Form.Item
+              name="register_delay_max_seconds"
+              label="最大延迟(秒)"
+              dependencies={['register_delay_seconds']}
+              rules={[
+                ({ getFieldValue }) => ({
+                  validator: (_, value) => {
+                    const maximum = Number(value || 0)
+                    const minimum = Number(getFieldValue('register_delay_seconds') || 0)
+                    return maximum === 0 || maximum >= minimum
+                      ? Promise.resolve()
+                      : Promise.reject(new Error('最大延迟不能小于最小延迟；填 0 或与最小值相同表示固定延迟'))
+                  },
+                }),
+              ]}
+              style={{ flex: 1 }}
+            >
+              <InputNumber min={0} max={3600} precision={1} step={0.5} style={{ width: '100%' }} placeholder="0 或与最小值相同 = 固定延迟" />
             </Form.Item>
             <Form.Item name="proxy_mode" label="代理模式" style={{ flex: 1 }}>
               <Select
@@ -757,12 +825,18 @@ export default function RegisterTaskPage() {
           ) : null}
           {platform === 'chatgpt' ? (
             <Form.Item
-              name="chatgpt_register_unique_exit_ip_enabled"
-              valuePropName="checked"
-              initialValue={false}
-              extra="开启后每个注册尝试会先探测真实出口 IP；本任务内已分配过的 IP 不再复用。动态代理会扩大 sid 刷新候选，代理池会换候选；不足时当前尝试会失败/补尝试，速度会明显变慢。"
+              name="chatgpt_register_unique_exit_ip_policy"
+              label="独立出口策略"
+              extra="自动仅在动态代理下启用；强制会要求当前代理模式能够轮换出口；关闭则不探测和锁定出口 IP。"
             >
-              <Checkbox>注册任务内强制独立出口 IP</Checkbox>
+              <Segmented
+                block
+                options={[
+                  { label: '自动', value: 'auto' },
+                  { label: '强制', value: 'required' },
+                  { label: '关闭', value: 'off' },
+                ]}
+              />
             </Form.Item>
           ) : null}
           {uniqueExitIpEnabled && proxyMode === 'direct' ? (

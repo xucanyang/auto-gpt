@@ -3,7 +3,7 @@ import threading
 from unittest.mock import patch
 
 import api.actions as api_actions
-from fastapi import HTTPException
+from fastapi import BackgroundTasks, HTTPException
 from sqlmodel import Session, SQLModel, create_engine, select
 from core.task_runtime import StopTaskRequested
 from services.chatgpt_core.registration_route_policy import (
@@ -18,6 +18,7 @@ from api.tasks import (
     enqueue_batch_payment_link_task,
     enqueue_batch_resume_subscription_auth_task,
     enqueue_phone_binding_test_task,
+    enqueue_register_task,
     _run_batch_payment_links,
     _create_task_record,
     _create_standalone_task_record,
@@ -352,6 +353,23 @@ class EmailApiRegisterRequestTests(unittest.TestCase):
         self.assertEqual(ctx.exception.status_code, 400)
         self.assertIn("单个指定代理无法满足多个账号独立出口 IP", str(ctx.exception.detail))
 
+    def test_prepare_register_treats_proxy_without_mode_as_specified(self):
+        req = RegisterTaskRequest(
+            platform="chatgpt",
+            count=2,
+            proxy="http://proxy.example:8080",
+            extra={
+                "mail_provider": "fake",
+                "chatgpt_register_unique_exit_ip_enabled": True,
+            },
+        )
+
+        with self.assertRaises(HTTPException) as ctx:
+            _prepare_register_request(req)
+
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertIn("单个指定代理无法满足多个账号独立出口 IP", str(ctx.exception.detail))
+
     def test_prepare_email_api_non_gmail_line_uses_one_identity(self):
         req = RegisterTaskRequest(
             platform="chatgpt",
@@ -385,7 +403,478 @@ class EmailApiRegisterRequestTests(unittest.TestCase):
         self.assertIn("----", str(ctx.exception))
 
 
+class RegisterRequestRuntimeControlTests(unittest.TestCase):
+    def _prepare(self, **kwargs):
+        config = kwargs.pop("config", {})
+        req = RegisterTaskRequest(
+            platform="chatgpt",
+            count=kwargs.pop("count", 5),
+            extra=kwargs.pop("extra", {"mail_provider": "fake"}),
+            **kwargs,
+        )
+        with patch("core.config_store.config_store.get_all", return_value=dict(config)):
+            return _prepare_register_request(req)
+
+    def test_chatgpt_protocol_uses_mode_defaults_when_request_omits_controls(self):
+        prepared = self._prepare(proxy_mode="dynamic")
+
+        self.assertEqual(prepared.concurrency, 2)
+        self.assertEqual(prepared.register_delay_seconds, 15)
+        self.assertEqual(prepared.register_delay_max_seconds, 30)
+        self.assertTrue(prepared.extra["chatgpt_register_unique_exit_ip_enabled"])
+        self.assertEqual(
+            prepared._register_control,
+            {
+                "executor_mode": "protocol",
+                "requested_concurrency": None,
+                "effective_concurrency": 2,
+                "default_concurrency": 2,
+                "concurrency_cap": 3,
+                "concurrency_reason": "",
+                "requested_delay_seconds": None,
+                "requested_delay_max_seconds": None,
+                "effective_delay_seconds": 15,
+                "effective_delay_max_seconds": 30,
+                "delay_source": "system_default",
+            },
+        )
+        self.assertEqual(prepared._register_unique_exit_ip["policy"], "auto")
+        self.assertEqual(prepared._register_unique_exit_ip["proxy_mode"], "dynamic")
+
+    def test_chatgpt_browser_default_and_cap_are_two(self):
+        prepared = self._prepare(
+            executor_type="headless",
+            concurrency=5,
+            proxy_mode="pool",
+        )
+
+        self.assertEqual(prepared.concurrency, 2)
+        self.assertEqual(prepared._register_control["requested_concurrency"], 5)
+        self.assertEqual(prepared._register_control["effective_concurrency"], 2)
+        self.assertEqual(prepared._register_control["concurrency_reason"], "browser_cap")
+        self.assertFalse(prepared.extra["chatgpt_register_unique_exit_ip_enabled"])
+
+    def test_explicit_zero_delay_range_remains_disabled(self):
+        prepared = self._prepare(
+            concurrency=5,
+            register_delay_seconds=0,
+            register_delay_max_seconds=0,
+            proxy_mode="direct",
+        )
+
+        self.assertEqual(prepared.concurrency, 3)
+        self.assertEqual(prepared.register_delay_seconds, 0)
+        self.assertEqual(prepared.register_delay_max_seconds, 0)
+        self.assertEqual(prepared._register_control["requested_concurrency"], 5)
+        self.assertEqual(prepared._register_control["effective_concurrency"], 3)
+        self.assertFalse(prepared.extra["chatgpt_register_unique_exit_ip_enabled"])
+
+    def test_legacy_single_delay_field_keeps_fixed_delay_semantics(self):
+        prepared = self._prepare(register_delay_seconds=7, proxy_mode="direct")
+
+        self.assertEqual(prepared.register_delay_seconds, 7)
+        self.assertEqual(prepared.register_delay_max_seconds, 7)
+        self.assertEqual(prepared._register_control["delay_source"], "request_fixed_legacy")
+
+    def test_explicit_zero_max_keeps_fixed_min_delay_semantics(self):
+        prepared = self._prepare(
+            register_delay_seconds=7,
+            register_delay_max_seconds=0,
+            proxy_mode="direct",
+        )
+
+        self.assertEqual(prepared._register_control["requested_delay_max_seconds"], 0)
+        self.assertEqual(prepared.register_delay_seconds, 7)
+        self.assertEqual(prepared.register_delay_max_seconds, 7)
+        self.assertEqual(prepared._register_control["delay_source"], "request_fixed")
+
+    def test_delay_range_rejects_inverted_or_non_finite_values(self):
+        with self.assertRaises(HTTPException) as inverted:
+            self._prepare(
+                register_delay_seconds=30,
+                register_delay_max_seconds=15,
+            )
+        self.assertEqual(inverted.exception.status_code, 400)
+        self.assertIn("最大启动延时不能小于", str(inverted.exception.detail))
+
+        with self.assertRaises(HTTPException) as non_finite:
+            self._prepare(register_delay_seconds=float("inf"))
+        self.assertEqual(non_finite.exception.status_code, 400)
+        self.assertIn("有限数字", str(non_finite.exception.detail))
+
+    def test_invalid_concurrency_is_rejected(self):
+        with self.assertRaises(HTTPException) as ctx:
+            self._prepare(concurrency=0)
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertIn("大于等于 1", str(ctx.exception.detail))
+
+    def test_manual_email_and_phone_signup_remain_serial(self):
+        manual = self._prepare(
+            count=3,
+            concurrency=3,
+            email="manual@example.com",
+            extra={"mail_provider": "manual_email_otp"},
+        )
+        phone = self._prepare(
+            count=3,
+            concurrency=3,
+            extra={
+                "mail_provider": "fake",
+                "chatgpt_registration_entry": "phone_signup",
+            },
+        )
+
+        self.assertEqual(manual.concurrency, 1)
+        self.assertEqual(manual._register_control["concurrency_reason"], "manual_email_otp")
+        self.assertEqual(phone.concurrency, 1)
+        self.assertEqual(phone._register_control["concurrency_reason"], "phone_signup")
+
+    def test_dynamic_auto_policy_respects_explicit_false_and_direct_is_safe(self):
+        dynamic_disabled = self._prepare(
+            proxy_mode="dynamic",
+            extra={
+                "mail_provider": "fake",
+                "chatgpt_register_unique_exit_ip_enabled": False,
+            },
+        )
+        direct_default = self._prepare(proxy_mode="direct")
+
+        self.assertFalse(dynamic_disabled.extra["chatgpt_register_unique_exit_ip_enabled"])
+        self.assertEqual(dynamic_disabled._register_unique_exit_ip["policy"], "off")
+        self.assertFalse(direct_default.extra["chatgpt_register_unique_exit_ip_enabled"])
+        self.assertEqual(direct_default._register_unique_exit_ip["policy"], "auto")
+
+    def test_canonical_unique_exit_policy_wins_over_legacy_boolean(self):
+        request_conflict = self._prepare(
+            proxy_mode="dynamic",
+            extra={
+                "mail_provider": "fake",
+                "chatgpt_register_unique_exit_ip_policy": "auto",
+                "chatgpt_register_unique_exit_ip_enabled": False,
+            },
+        )
+        config_conflict = self._prepare(
+            proxy_mode="dynamic",
+            config={
+                "chatgpt_register_unique_exit_ip_policy": "auto",
+                "chatgpt_register_unique_exit_ip_enabled": "false",
+            },
+        )
+        request_off = self._prepare(
+            proxy_mode="dynamic",
+            extra={
+                "mail_provider": "fake",
+                "chatgpt_register_unique_exit_ip_policy": "off",
+                "chatgpt_register_unique_exit_ip_enabled": True,
+            },
+        )
+
+        self.assertEqual(request_conflict._register_unique_exit_ip["policy"], "auto")
+        self.assertEqual(request_conflict._register_unique_exit_ip["source"], "request_policy")
+        self.assertTrue(request_conflict.extra["chatgpt_register_unique_exit_ip_enabled"])
+        self.assertEqual(config_conflict._register_unique_exit_ip["policy"], "auto")
+        self.assertEqual(config_conflict._register_unique_exit_ip["source"], "config_policy")
+        self.assertTrue(config_conflict.extra["chatgpt_register_unique_exit_ip_enabled"])
+        self.assertEqual(request_off._register_unique_exit_ip["policy"], "off")
+        self.assertFalse(request_off.extra["chatgpt_register_unique_exit_ip_enabled"])
+
+    def test_invalid_canonical_unique_exit_policy_is_rejected(self):
+        with self.assertRaises(HTTPException) as ctx:
+            self._prepare(
+                proxy_mode="dynamic",
+                extra={
+                    "mail_provider": "fake",
+                    "chatgpt_register_unique_exit_ip_policy": "offf",
+                },
+            )
+
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertIn("auto、required 或 off", str(ctx.exception.detail))
+
+    def test_explicit_false_failover_wins_over_global_true(self):
+        with self.assertRaises(HTTPException) as ctx:
+            self._prepare(
+                count=2,
+                proxy_mode="specified",
+                proxy="http://proxy.example:8080",
+                proxy_failover=False,
+                config={"task_proxy_failover": "true"},
+                extra={
+                    "mail_provider": "fake",
+                    "chatgpt_register_unique_exit_ip_policy": "required",
+                },
+            )
+
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertIn("单个指定代理无法满足多个账号独立出口 IP", str(ctx.exception.detail))
+
+    def test_proxy_aliases_and_global_mode_follow_core_resolver_contract(self):
+        for prefix in ("register", "probe"):
+            with self.subTest(prefix=prefix):
+                prepared = self._prepare(
+                    count=2,
+                    extra={
+                        "mail_provider": "fake",
+                        f"{prefix}_proxy": f"http://{prefix}-proxy.example:8080",
+                        f"{prefix}_proxy_mode": "specified",
+                        f"{prefix}_proxy_failover": True,
+                        "chatgpt_register_unique_exit_ip_policy": "required",
+                    },
+                )
+
+                self.assertEqual(prepared.proxy_mode, "specified")
+                self.assertEqual(
+                    prepared.proxy,
+                    f"http://{prefix}-proxy.example:8080",
+                )
+                self.assertTrue(prepared.proxy_failover)
+                self.assertEqual(prepared._register_unique_exit_ip["proxy_mode"], "specified")
+
+        inherited_global = self._prepare(
+            proxy_mode="global",
+            config={
+                "task_proxy_mode": "dynamic",
+                "task_proxy_failover": "true",
+                "dynamic_proxy_template": "http://dynamic.example:8080",
+                "dynamic_proxy_default_country": "us",
+                "chatgpt_register_unique_exit_ip_policy": "auto",
+            },
+        )
+        explicit_proxy = self._prepare(
+            count=1,
+            proxy_mode="global",
+            proxy="http://explicit-proxy.example:8080",
+            extra={
+                "mail_provider": "fake",
+                "chatgpt_register_unique_exit_ip_policy": "required",
+            },
+        )
+
+        self.assertEqual(inherited_global.proxy_mode, "dynamic")
+        self.assertEqual(inherited_global.proxy, "http://dynamic.example:8080")
+        self.assertEqual(inherited_global.proxy_country_code, "US")
+        self.assertTrue(inherited_global.proxy_failover)
+        self.assertTrue(inherited_global.extra["chatgpt_register_unique_exit_ip_enabled"])
+        self.assertEqual(explicit_proxy.proxy_mode, "specified")
+        self.assertEqual(explicit_proxy._register_unique_exit_ip["proxy_mode"], "specified")
+
+    def test_config_values_are_clamped_to_the_hard_mode_cap(self):
+        prepared = self._prepare(
+            proxy_mode="direct",
+            config={
+                "chatgpt_register_protocol_default_concurrency": "4",
+                "chatgpt_register_protocol_max_concurrency": "4",
+                "chatgpt_register_delay_seconds": "5",
+                "chatgpt_register_delay_max_seconds": "9",
+            },
+        )
+
+        self.assertEqual(prepared.concurrency, 3)
+        self.assertEqual(prepared.register_delay_seconds, 5)
+        self.assertEqual(prepared.register_delay_max_seconds, 9)
+
+    def test_non_chatgpt_request_keeps_legacy_defaults(self):
+        request = RegisterTaskRequest(platform="example", count=5)
+        with patch("core.config_store.config_store.get_all", return_value={}):
+            prepared = _prepare_register_request(request)
+
+        self.assertEqual(prepared.concurrency, 1)
+        self.assertEqual(prepared.register_delay_seconds, 0)
+        self.assertEqual(prepared.register_delay_max_seconds, 0)
+        self.assertNotIn("chatgpt_register_unique_exit_ip_enabled", prepared.extra)
+
+    def test_enqueue_meta_keeps_requested_and_frozen_effective_controls(self):
+        request = RegisterTaskRequest(
+            platform="chatgpt",
+            count=5,
+            concurrency=5,
+            executor_type="protocol",
+            proxy_mode="direct",
+            register_delay_seconds=0,
+            register_delay_max_seconds=0,
+            extra={"mail_provider": "fake"},
+        )
+        with (
+            patch("core.config_store.config_store.get_all", return_value={}),
+            patch("api.tasks._save_task_log"),
+        ):
+            task_id = enqueue_register_task(
+                request,
+                background_tasks=BackgroundTasks(),
+            )
+
+        snapshot = _task_store.snapshot(task_id)
+        controls = snapshot["meta"]["registration_control"]
+        self.assertEqual(controls["requested_concurrency"], 5)
+        self.assertEqual(controls["effective_concurrency"], 3)
+        self.assertEqual(controls["requested_delay_seconds"], 0)
+        self.assertEqual(controls["effective_delay_seconds"], 0)
+
+    def test_register_task_ids_are_unique_within_same_millisecond(self):
+        request = RegisterTaskRequest(
+            platform="chatgpt",
+            count=1,
+            concurrency=1,
+            proxy_mode="direct",
+            register_delay_seconds=0,
+            register_delay_max_seconds=0,
+            extra={
+                "mail_provider": "fake",
+                "chatgpt_register_unique_exit_ip_policy": "off",
+            },
+        )
+        with (
+            patch("core.config_store.config_store.get_all", return_value={}),
+            patch("api.tasks._save_task_log"),
+            patch("api.tasks.time.time", return_value=1_784_000_000.123),
+        ):
+            first = enqueue_register_task(request, background_tasks=BackgroundTasks())
+            second = enqueue_register_task(request, background_tasks=BackgroundTasks())
+
+        self.assertNotEqual(first, second)
+        self.assertTrue(first.startswith("task_1784000000123_"))
+        self.assertTrue(second.startswith("task_1784000000123_"))
+
+
 class RegisterTaskControlFlowTests(unittest.TestCase):
+    def test_register_start_jitter_delays_second_attempt_not_first(self):
+        task_id = "task-register-start-jitter"
+        request = RegisterTaskRequest(
+            platform="chatgpt",
+            count=2,
+            concurrency=1,
+            register_delay_seconds=15,
+            register_delay_max_seconds=30,
+            proxy_mode="direct",
+            extra={"mail_provider": "fake"},
+        )
+        _create_task_record(task_id, request, "manual", None)
+        monotonic_clock = [100.0]
+        slept = []
+
+        def fake_sleep(seconds):
+            slept.append(float(seconds))
+            monotonic_clock[0] += float(seconds)
+
+        with (
+            patch("services.chatgpt_core.ChatGPTPlatform", _FakePlatform),
+            patch("core.base_mailbox.create_mailbox", return_value=_FakeMailbox()),
+            patch("core.db.save_account", side_effect=lambda account: account),
+            patch("api.tasks._auto_upload_integrations"),
+            patch("api.tasks._save_task_log"),
+            patch("api.tasks.time.monotonic", side_effect=lambda: monotonic_clock[0]),
+            patch("api.tasks.time.sleep", side_effect=fake_sleep),
+            patch("api.tasks.random.uniform", return_value=22.0),
+        ):
+            _run_register(task_id, request)
+
+        snapshot = _task_store.snapshot(task_id)
+        delay_logs = [line for line in snapshot["logs"] if "启动前延迟" in line]
+        self.assertEqual(snapshot["success"], 2)
+        self.assertEqual(len(delay_logs), 1)
+        self.assertIn("22", delay_logs[0])
+        self.assertAlmostEqual(sum(slept), 22.0)
+
+    def test_stop_after_current_interrupts_worker_waiting_in_start_jitter(self):
+        task_id = "task-register-jitter-after-current"
+        first_started = threading.Event()
+        release_first = threading.Event()
+        calls = []
+        slept = []
+
+        class WaitingPlatform(_FakePlatform):
+            def register(self, email=None, password=None):
+                calls.append(len(calls) + 1)
+                first_started.set()
+                release_first.wait(timeout=2)
+                return Account(
+                    platform="chatgpt",
+                    email="jitter-first@example.com",
+                    password=password or "pw",
+                    token="at-jitter-first",
+                    extra={},
+                )
+
+        request = RegisterTaskRequest(
+            platform="chatgpt",
+            count=2,
+            concurrency=2,
+            register_delay_seconds=15,
+            register_delay_max_seconds=15,
+            proxy_mode="direct",
+            extra={"mail_provider": "fake"},
+        )
+        _create_task_record(task_id, request, "manual", None)
+        control = _task_store.control_for(task_id)
+
+        def stop_during_sleep(seconds):
+            slept.append(float(seconds))
+            if not first_started.wait(timeout=2):
+                raise AssertionError("first registration attempt did not start")
+            control.request_stop_after_current()
+            release_first.set()
+
+        with (
+            patch("services.chatgpt_core.ChatGPTPlatform", WaitingPlatform),
+            patch("core.base_mailbox.create_mailbox", return_value=_FakeMailbox()),
+            patch("core.db.save_account", side_effect=lambda account: account),
+            patch("api.tasks._auto_upload_integrations"),
+            patch("api.tasks._save_task_log"),
+            patch("api.tasks.time.sleep", side_effect=stop_during_sleep),
+        ):
+            _run_register(task_id, request)
+
+        snapshot = _task_store.snapshot(task_id)
+        self.assertEqual(calls, [1])
+        self.assertEqual(len(slept), 1)
+        self.assertLessEqual(sum(slept), 0.25)
+        self.assertEqual(snapshot["success"], 1)
+        self.assertEqual(snapshot["status"], "stopped")
+
+    def test_runner_uses_frozen_concurrency_cap_after_config_changes(self):
+        task_id = "task-register-frozen-cap"
+        request = RegisterTaskRequest(
+            platform="chatgpt",
+            count=2,
+            concurrency=3,
+            register_delay_seconds=0,
+            register_delay_max_seconds=0,
+            proxy_mode="direct",
+            extra={
+                "mail_provider": "fake",
+                "chatgpt_register_unique_exit_ip_policy": "off",
+            },
+        )
+        with patch(
+            "core.config_store.config_store.get_all",
+            return_value={"chatgpt_register_protocol_max_concurrency": "3"},
+        ):
+            prepared = _prepare_register_request(request)
+        _create_task_record(task_id, prepared, "manual", None)
+        _FakeChatGPTProxyFingerprintPlatform.seen = []
+
+        with (
+            patch(
+                "core.config_store.config_store.get_all",
+                return_value={
+                    "chatgpt_register_protocol_default_concurrency": "1",
+                    "chatgpt_register_protocol_max_concurrency": "1",
+                },
+            ),
+            patch("services.chatgpt_core.ChatGPTPlatform", _FakeChatGPTProxyFingerprintPlatform),
+            patch("core.base_mailbox.create_mailbox", return_value=_FakeMailbox()),
+            patch("core.db.save_account", side_effect=lambda account: account),
+            patch("api.tasks._auto_upload_integrations"),
+            patch("api.tasks._save_task_log"),
+        ):
+            _run_register(task_id, prepared)
+
+        snapshot = _task_store.snapshot(task_id)
+        controls = snapshot["meta"]["registration_control"]
+        self.assertEqual(snapshot["success"], 2)
+        self.assertEqual(controls["concurrency_cap"], 3)
+        self.assertEqual(controls["effective_concurrency"], 2)
+
     def test_sentinel_browser_unavailable_is_fatal_for_registration_batch(self):
         self.assertTrue(
             _is_fatal_registration_infrastructure_error(
@@ -1191,14 +1680,20 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
             extra={
                 "mail_provider": "fake",
                 "chatgpt_register_unique_exit_ip_enabled": True,
+                "dynamic_proxy_max_attempts": 100,
             },
         )
         _create_task_record(task_id, req, "manual", None)
         _FakeChatGPTProxyFingerprintPlatform.seen = []
+        candidate_calls = []
 
         def fake_candidates(params=None, fallback_proxy=None, default_mode="direct", target="chatgpt"):
-            self.assertTrue(params.get("proxy_failover"))
-            self.assertGreaterEqual(int(params.get("dynamic_proxy_max_attempts") or 0), 8)
+            candidate_calls.append(
+                (
+                    bool(params.get("proxy_failover")),
+                    int(params.get("dynamic_proxy_max_attempts") or 0),
+                )
+            )
             return [
                 ("http://proxy-a.local:8080", None, "dynamic country=US actual=US exit_ip=198.51.100.10 provider=test sid=refreshed probe=ok"),
                 ("http://proxy-b.local:8080", None, "dynamic country=US actual=US exit_ip=198.51.100.11 provider=test sid=refreshed probe=ok"),
@@ -1218,7 +1713,10 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
             patch("services.chatgpt_core.ChatGPTPlatform", _FakeChatGPTProxyFingerprintPlatform),
             patch("core.base_mailbox.create_mailbox", return_value=_FakeMailbox()),
             patch("core.proxy_utils.resolve_task_proxy_candidates", side_effect=fake_candidates),
-            patch("services.proxy_scanner.probe_basic", side_effect=fake_probe),
+            patch(
+                "services.proxy_scanner.probe_basic",
+                side_effect=fake_probe,
+            ) as probe_basic,
             patch("core.db.save_account", side_effect=fake_save_account),
             patch("api.tasks._save_task_log"),
         ):
@@ -1234,6 +1732,13 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
         self.assertTrue(all(isinstance(item, dict) and item.get("device_id") for item in fingerprints))
         self.assertEqual(len({item["fingerprint_signature"] for item in seen}), 2)
         self.assertEqual(len(saved_accounts), 2)
+        self.assertGreaterEqual(len(candidate_calls), 3)
+        self.assertEqual(candidate_calls[0], (False, 1))
+        self.assertTrue(all(value == (True, 6) for value in candidate_calls[1:]))
+        self.assertGreaterEqual(probe_basic.call_count, 1)
+        self.assertTrue(
+            all("proxy-b" in str(call.args[0]) for call in probe_basic.call_args_list)
+        )
         self.assertTrue(
             all(
                 isinstance((account.extra or {}).get("chatgpt_browser_fingerprint"), dict)
@@ -1243,6 +1748,70 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
         )
         unique_meta = dict((snapshot.get("meta") or {}).get("register_unique_exit_ip") or {})
         self.assertEqual(unique_meta.get("assigned_count"), 2)
+        self.assertGreaterEqual(int(unique_meta.get("collision_count") or 0), 1)
+
+    def test_register_task_never_reuses_an_ipv6_64_after_lease_release(self):
+        task_id = "task-register-ipv6-network-dedup"
+        req = RegisterTaskRequest(
+            platform="chatgpt",
+            count=2,
+            concurrency=1,
+            register_delay_seconds=0,
+            register_delay_max_seconds=0,
+            proxy_mode="dynamic",
+            proxy_country_code="US",
+            extra={
+                "mail_provider": "fake",
+                "chatgpt_register_unique_exit_ip_policy": "required",
+                "chatgpt_register_unique_exit_ip_enabled": True,
+                "chatgpt_register_unique_exit_ip_cooldown_seconds": 0,
+                "register_max_attempts": 2,
+            },
+        )
+        _create_task_record(task_id, req, "manual", None)
+        _FakeChatGPTProxyFingerprintPlatform.seen = []
+        candidate_call = [0]
+
+        def fake_candidates(params=None, fallback_proxy=None, default_mode="direct", target="chatgpt"):
+            candidate_call[0] += 1
+            if candidate_call[0] == 1:
+                return [("http://proxy-preflight.local:8080", None, "dynamic preflight")]
+            if candidate_call[0] == 2:
+                return [("http://proxy-v6-a.local:8080", None, "dynamic first")]
+            return [
+                ("http://proxy-v6-b.local:8080", None, "dynamic same-network"),
+                ("http://proxy-v6-c.local:8080", None, "dynamic next-network"),
+            ]
+
+        def fake_probe(proxy_url, timeout_seconds=8):
+            if "v6-a" in proxy_url:
+                exit_ip = "2001:db8:abcd:12::1"
+            elif "v6-b" in proxy_url:
+                exit_ip = "2001:db8:abcd:12::ffff"
+            elif "v6-c" in proxy_url:
+                exit_ip = "2001:db8:abcd:13::1"
+            else:
+                exit_ip = "2001:db8:abcd:99::1"
+            return {"ok": True, "exit_ip": exit_ip, "latency_ms": 1}
+
+        with (
+            patch("services.chatgpt_core.ChatGPTPlatform", _FakeChatGPTProxyFingerprintPlatform),
+            patch("core.base_mailbox.create_mailbox", return_value=_FakeMailbox()),
+            patch("core.proxy_utils.resolve_task_proxy_candidates", side_effect=fake_candidates),
+            patch("services.proxy_scanner.probe_basic", side_effect=fake_probe),
+            patch("core.db.save_account", side_effect=lambda account: account),
+            patch("api.tasks._save_task_log"),
+        ):
+            _run_register(task_id, req)
+
+        snapshot = _task_store.snapshot(task_id)
+        seen_exit_ips = [item["exit_ip"] for item in _FakeChatGPTProxyFingerprintPlatform.seen]
+        self.assertEqual(
+            seen_exit_ips,
+            ["2001:db8:abcd:12::1", "2001:db8:abcd:13::1"],
+        )
+        self.assertEqual(snapshot["success"], 2)
+        unique_meta = dict(snapshot["meta"]["register_unique_exit_ip"])
         self.assertGreaterEqual(int(unique_meta.get("collision_count") or 0), 1)
 
     def test_browser_executor_uses_attempt_seed_without_persisting_protocol_fingerprint(self):

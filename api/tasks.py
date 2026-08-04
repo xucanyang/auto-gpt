@@ -8,7 +8,7 @@ from urllib.parse import urlsplit
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PrivateAttr
 from sqlalchemy import func, text
 from sqlmodel import Session, select
 from typing import Any, Literal, Optional
@@ -134,6 +134,16 @@ PHONE_BINDING_MAX_CONCURRENCY = 5
 LOCAL_STATUS_PROBE_MAX_CONCURRENCY = 10
 LOCAL_STATUS_PROBE_MAX_ACCOUNTS = 5000
 LOCAL_STATUS_PROBE_MAX_DELAY_SECONDS = 3600.0
+REGISTER_CONCURRENCY_HARD_LIMIT = 5
+REGISTER_DELAY_MAX_SECONDS = 3600.0
+REGISTER_PROTOCOL_DEFAULT_CONCURRENCY = 2
+REGISTER_PROTOCOL_MAX_CONCURRENCY = 3
+REGISTER_BROWSER_DEFAULT_CONCURRENCY = 2
+REGISTER_BROWSER_MAX_CONCURRENCY = 2
+REGISTER_DELAY_DEFAULT_SECONDS = 15.0
+REGISTER_DELAY_DEFAULT_MAX_SECONDS = 30.0
+REGISTER_UNIQUE_EXIT_IP_MAX_REFRESH_ATTEMPTS_DEFAULT = 6
+REGISTER_UNIQUE_EXIT_IP_PROBE_TIMEOUT_SECONDS_DEFAULT = 8
 _task_store = RegisterTaskStore(
     max_finished_tasks=MAX_FINISHED_TASKS,
     cleanup_threshold=CLEANUP_THRESHOLD,
@@ -302,6 +312,9 @@ _legacy_empty_task_summary_poll_guard = _LegacyEmptyTaskSummaryPollGuard()
 
 
 class RegisterTaskRequest(BaseModel):
+    _register_control: dict[str, Any] = PrivateAttr(default_factory=dict)
+    _register_unique_exit_ip: dict[str, Any] = PrivateAttr(default_factory=dict)
+
     platform: str
     email: Optional[str] = None
     password: Optional[str] = None
@@ -626,9 +639,426 @@ def _ensure_task_mutable(task_id: str) -> None:
         raise HTTPException(409, "任务已结束，无法再执行控制操作")
 
 
+def _bounded_register_config_int(
+    config: dict[str, Any],
+    key: str,
+    *,
+    default: int,
+    minimum: int = 1,
+    maximum: int = REGISTER_CONCURRENCY_HARD_LIMIT,
+) -> int:
+    raw = config.get(key)
+    try:
+        parsed = float(raw)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(parsed) or not parsed.is_integer():
+        return default
+    return max(minimum, min(maximum, int(parsed)))
+
+
+def _bounded_register_config_float(
+    config: dict[str, Any],
+    key: str,
+    *,
+    default: float,
+    minimum: float = 0.0,
+    maximum: float = REGISTER_DELAY_MAX_SECONDS,
+) -> float:
+    raw = config.get(key)
+    try:
+        parsed = float(raw)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(parsed):
+        return default
+    return max(minimum, min(maximum, parsed))
+
+
+def _validate_register_delay(value: Any, label: str) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(400, f"{label}必须是 0 到 3600 之间的有限数字") from exc
+    if not math.isfinite(parsed) or not 0 <= parsed <= REGISTER_DELAY_MAX_SECONDS:
+        raise HTTPException(400, f"{label}必须是 0 到 3600 之间的有限数字")
+    return parsed
+
+
+def _normalize_register_runtime_controls(
+    prepared: RegisterTaskRequest,
+    original: RegisterTaskRequest,
+    config: dict[str, Any],
+    *,
+    forced_serial_reason: str = "",
+) -> dict[str, Any]:
+    supplied = set(getattr(original, "model_fields_set", set()) or set())
+    if str(prepared.platform or "").strip().lower() != "chatgpt":
+        requested_concurrency = int(original.concurrency)
+        control = {
+            "executor_mode": "legacy",
+            "requested_concurrency": requested_concurrency,
+            "effective_concurrency": prepared.concurrency,
+            "default_concurrency": 1,
+            "concurrency_cap": REGISTER_CONCURRENCY_HARD_LIMIT,
+            "concurrency_reason": "",
+            "requested_delay_seconds": float(original.register_delay_seconds or 0),
+            "requested_delay_max_seconds": float(original.register_delay_max_seconds or 0),
+            "effective_delay_seconds": float(prepared.register_delay_seconds or 0),
+            "effective_delay_max_seconds": float(prepared.register_delay_max_seconds or 0),
+            "delay_source": "legacy",
+        }
+        prepared._register_control = control
+        return control
+
+    browser_executor = str(prepared.executor_type or "protocol").strip().lower() in {
+        "headless",
+        "headed",
+    }
+    executor_mode = "browser" if browser_executor else "protocol"
+    if browser_executor:
+        default_concurrency = _bounded_register_config_int(
+            config,
+            "chatgpt_register_browser_default_concurrency",
+            default=REGISTER_BROWSER_DEFAULT_CONCURRENCY,
+            maximum=REGISTER_BROWSER_MAX_CONCURRENCY,
+        )
+        concurrency_cap = _bounded_register_config_int(
+            config,
+            "chatgpt_register_browser_max_concurrency",
+            default=REGISTER_BROWSER_MAX_CONCURRENCY,
+            maximum=REGISTER_BROWSER_MAX_CONCURRENCY,
+        )
+    else:
+        default_concurrency = _bounded_register_config_int(
+            config,
+            "chatgpt_register_protocol_default_concurrency",
+            default=REGISTER_PROTOCOL_DEFAULT_CONCURRENCY,
+            maximum=REGISTER_PROTOCOL_MAX_CONCURRENCY,
+        )
+        concurrency_cap = _bounded_register_config_int(
+            config,
+            "chatgpt_register_protocol_max_concurrency",
+            default=REGISTER_PROTOCOL_MAX_CONCURRENCY,
+            maximum=REGISTER_PROTOCOL_MAX_CONCURRENCY,
+        )
+    default_concurrency = min(default_concurrency, concurrency_cap)
+
+    requested_concurrency: int | None = None
+    if "concurrency" in supplied:
+        requested_concurrency = int(original.concurrency)
+        if requested_concurrency < 1:
+            raise HTTPException(400, "注册并发必须是大于等于 1 的整数")
+    selected_concurrency = requested_concurrency or default_concurrency
+    effective_concurrency = min(
+        selected_concurrency,
+        concurrency_cap,
+        max(int(prepared.count or 1), 1),
+    )
+    concurrency_reason = ""
+    if forced_serial_reason:
+        effective_concurrency = 1
+        concurrency_reason = forced_serial_reason
+    elif selected_concurrency > concurrency_cap:
+        concurrency_reason = f"{executor_mode}_cap"
+    elif selected_concurrency > max(int(prepared.count or 1), 1):
+        concurrency_reason = "target_count"
+    prepared.concurrency = max(effective_concurrency, 1)
+
+    configured_delay_min = _bounded_register_config_float(
+        config,
+        "chatgpt_register_delay_seconds",
+        default=REGISTER_DELAY_DEFAULT_SECONDS,
+    )
+    configured_delay_max = _bounded_register_config_float(
+        config,
+        "chatgpt_register_delay_max_seconds",
+        default=REGISTER_DELAY_DEFAULT_MAX_SECONDS,
+    )
+    if configured_delay_max == 0 and configured_delay_min > 0:
+        configured_delay_max = configured_delay_min
+    elif configured_delay_max < configured_delay_min:
+        configured_delay_min = REGISTER_DELAY_DEFAULT_SECONDS
+        configured_delay_max = REGISTER_DELAY_DEFAULT_MAX_SECONDS
+
+    delay_min_supplied = "register_delay_seconds" in supplied
+    delay_max_supplied = "register_delay_max_seconds" in supplied
+    requested_delay_min = (
+        _validate_register_delay(original.register_delay_seconds, "注册最小启动延时")
+        if delay_min_supplied
+        else None
+    )
+    requested_delay_max = (
+        _validate_register_delay(original.register_delay_max_seconds, "注册最大启动延时")
+        if delay_max_supplied
+        else None
+    )
+    if not delay_min_supplied and not delay_max_supplied:
+        effective_delay_min = configured_delay_min
+        effective_delay_max = configured_delay_max
+        delay_source = "system_default"
+    elif delay_min_supplied and not delay_max_supplied:
+        # Legacy clients only sent one delay field. Preserve its fixed-delay
+        # meaning instead of unexpectedly combining it with the new max default.
+        effective_delay_min = float(requested_delay_min or 0)
+        effective_delay_max = effective_delay_min
+        delay_source = "request_fixed_legacy"
+    else:
+        effective_delay_min = (
+            float(requested_delay_min)
+            if requested_delay_min is not None
+            else min(configured_delay_min, float(requested_delay_max or 0))
+        )
+        if float(requested_delay_max or 0) == 0 and effective_delay_min > 0:
+            effective_delay_max = effective_delay_min
+            delay_source = "request_fixed"
+        else:
+            effective_delay_max = float(requested_delay_max or 0)
+            delay_source = "request_range"
+    if effective_delay_max < effective_delay_min:
+        raise HTTPException(400, "注册最大启动延时不能小于最小启动延时")
+    prepared.register_delay_seconds = effective_delay_min
+    prepared.register_delay_max_seconds = effective_delay_max
+
+    control = {
+        "executor_mode": executor_mode,
+        "requested_concurrency": requested_concurrency,
+        "effective_concurrency": prepared.concurrency,
+        "default_concurrency": default_concurrency,
+        "concurrency_cap": concurrency_cap,
+        "concurrency_reason": concurrency_reason,
+        "requested_delay_seconds": requested_delay_min,
+        "requested_delay_max_seconds": requested_delay_max,
+        "effective_delay_seconds": effective_delay_min,
+        "effective_delay_max_seconds": effective_delay_max,
+        "delay_source": delay_source,
+    }
+    prepared._register_control = control
+    return control
+
+
+_REGISTER_PROXY_ALIASES = (
+    "proxy",
+    "proxy_url",
+    "register_proxy",
+    "probe_proxy",
+    "dynamic_proxy_template",
+)
+_REGISTER_PROXY_MODE_ALIASES = (
+    "proxy_mode",
+    "register_proxy_mode",
+    "probe_proxy_mode",
+)
+_REGISTER_PROXY_COUNTRY_ALIASES = (
+    "proxy_country_code",
+    "register_proxy_country_code",
+    "probe_proxy_country_code",
+)
+_REGISTER_PROXY_FAILOVER_ALIASES = (
+    "proxy_failover",
+    "register_proxy_failover",
+    "probe_proxy_failover",
+)
+
+
+def _first_register_proxy_value(
+    values: dict[str, Any],
+    aliases: tuple[str, ...],
+    *,
+    allow_empty: bool = False,
+) -> tuple[bool, Any]:
+    for key in aliases:
+        if key not in values:
+            continue
+        value = values.get(key)
+        if allow_empty or value not in (None, ""):
+            return True, value
+    return False, None
+
+
+def _canonical_register_proxy_mode(
+    value: Any,
+    *,
+    has_proxy: bool,
+    global_mode: str,
+) -> str:
+    mode = str(value or "").strip().lower()
+    if mode in {"global", "config", "task", "task_proxy", "default", "inherit"}:
+        if has_proxy:
+            return "specified"
+        mode = str(global_mode or "dynamic").strip().lower()
+    if not mode:
+        mode = "specified" if has_proxy else str(global_mode or "dynamic").strip().lower()
+    if mode in {"none", "no_proxy", "direct", "直连"}:
+        return "direct"
+    if mode in {"manual", "explicit"}:
+        return "specified"
+    if mode in {"specified", "pool", "dynamic"}:
+        return mode
+    return "specified" if has_proxy else "dynamic"
+
+
+def _normalize_register_proxy_controls(
+    prepared: RegisterTaskRequest,
+    original: RegisterTaskRequest,
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    """Freeze the resolver's effective proxy controls at enqueue time."""
+
+    request_extra = original.extra if isinstance(original.extra, dict) else {}
+    supplied_fields = set(getattr(original, "model_fields_set", set()) or set())
+
+    has_extra_proxy, extra_proxy = _first_register_proxy_value(
+        request_extra,
+        _REGISTER_PROXY_ALIASES,
+    )
+    if "proxy" in supplied_fields and original.proxy not in (None, ""):
+        request_proxy = str(original.proxy or "").strip()
+        has_request_proxy = bool(request_proxy)
+    else:
+        request_proxy = str(extra_proxy or "").strip() if has_extra_proxy else ""
+        has_request_proxy = bool(request_proxy)
+
+    global_mode = str(config.get("task_proxy_mode") or "dynamic").strip().lower()
+    has_extra_mode, extra_mode = _first_register_proxy_value(
+        request_extra,
+        _REGISTER_PROXY_MODE_ALIASES,
+    )
+    if "proxy_mode" in supplied_fields and str(original.proxy_mode or "").strip():
+        raw_mode = original.proxy_mode
+    elif has_extra_mode:
+        raw_mode = extra_mode
+    else:
+        raw_mode = ""
+    mode = _canonical_register_proxy_mode(
+        raw_mode,
+        has_proxy=has_request_proxy,
+        global_mode=global_mode,
+    )
+
+    if not request_proxy:
+        if mode == "dynamic":
+            request_proxy = str(
+                config.get("dynamic_proxy_template")
+                or config.get("task_proxy_url")
+                or ""
+            ).strip()
+        elif mode == "specified":
+            request_proxy = str(config.get("task_proxy_url") or "").strip()
+
+    has_extra_country, extra_country = _first_register_proxy_value(
+        request_extra,
+        _REGISTER_PROXY_COUNTRY_ALIASES,
+        allow_empty=True,
+    )
+    if "proxy_country_code" in supplied_fields:
+        country = str(original.proxy_country_code or "").strip().upper()
+    elif has_extra_country:
+        country = str(extra_country or "").strip().upper()
+    elif mode == "dynamic":
+        country = str(
+            config.get("dynamic_proxy_default_country")
+            or config.get("task_proxy_country_code")
+            or ""
+        ).strip().upper()
+    else:
+        country = str(config.get("task_proxy_country_code") or "").strip().upper()
+
+    has_extra_failover, extra_failover = _first_register_proxy_value(
+        request_extra,
+        _REGISTER_PROXY_FAILOVER_ALIASES,
+    )
+    if "proxy_failover" in supplied_fields:
+        failover = bool(original.proxy_failover)
+    elif has_extra_failover:
+        failover = _is_truthy(extra_failover)
+    else:
+        failover = _is_truthy(config.get("task_proxy_failover"))
+
+    prepared.proxy = request_proxy or None
+    prepared.proxy_mode = mode
+    prepared.proxy_country_code = country
+    prepared.proxy_failover = failover
+    return {
+        "proxy": request_proxy,
+        "proxy_mode": mode,
+        "proxy_country_code": country,
+        "proxy_failover": failover,
+    }
+
+
+def _resolve_register_unique_exit_ip_policy(
+    prepared: RegisterTaskRequest,
+    original: RegisterTaskRequest,
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    request_extra = original.extra if isinstance(original.extra, dict) else {}
+    raw_policy: Any = None
+    source = "default"
+    if request_extra.get("chatgpt_register_unique_exit_ip_policy") not in (None, ""):
+        raw_policy = request_extra.get("chatgpt_register_unique_exit_ip_policy")
+        source = "request_policy"
+    elif request_extra.get("chatgpt_register_unique_exit_ip_enabled") not in (None, ""):
+        raw_policy = "required" if _is_truthy(request_extra.get("chatgpt_register_unique_exit_ip_enabled")) else "off"
+        source = "request_legacy_bool"
+    elif config.get("chatgpt_register_unique_exit_ip_policy") not in (None, ""):
+        raw_policy = config.get("chatgpt_register_unique_exit_ip_policy")
+        source = "config_policy"
+    elif config.get("chatgpt_register_unique_exit_ip_enabled") not in (None, ""):
+        raw_policy = "required" if _is_truthy(config.get("chatgpt_register_unique_exit_ip_enabled")) else "off"
+        source = "config_legacy_bool"
+    else:
+        raw_policy = "auto"
+
+    policy_text = str(raw_policy or "auto").strip().lower()
+    if policy_text in {"1", "true", "yes", "on", "required", "strict"}:
+        policy = "required"
+    elif policy_text in {"0", "false", "no", "off", "disabled"}:
+        policy = "off"
+    elif policy_text == "auto":
+        policy = "auto"
+    else:
+        raise HTTPException(
+            400,
+            "chatgpt_register_unique_exit_ip_policy 必须是 auto、required 或 off",
+        )
+
+    proxy_controls = _normalize_register_proxy_controls(
+        prepared,
+        original,
+        config,
+    )
+    mode = str(proxy_controls["proxy_mode"])
+    failover_enabled = bool(proxy_controls["proxy_failover"])
+    rotatable = mode in {"dynamic", "pool"} or (
+        mode == "specified" and failover_enabled
+    )
+    # The implicit policy is intentionally conservative: only dynamic mode is
+    # guaranteed to mint a fresh candidate on demand. Pool/specified modes stay
+    # opt-in even when failover exists because their candidate set may be small.
+    auto_eligible = mode == "dynamic"
+    enabled = policy == "required" or (policy == "auto" and auto_eligible)
+    # Freeze the resolved network mode together with the registration controls.
+    # Otherwise a request that relies on global dynamic mode can enable the
+    # policy here but miss the dynamic refresh budget inside the runner.
+    prepared.extra["chatgpt_register_unique_exit_ip_policy"] = policy
+    prepared.extra["chatgpt_register_unique_exit_ip_enabled"] = enabled
+    result = {
+        "policy": policy,
+        "source": source,
+        "enabled": enabled,
+        "proxy_mode": mode,
+        "rotatable": rotatable,
+        "auto_eligible": auto_eligible,
+    }
+    prepared._register_unique_exit_ip = result
+    return result
+
+
 def _prepare_register_request(req: RegisterTaskRequest) -> RegisterTaskRequest:
     from core.config_store import config_store
 
+    config = config_store.get_all().copy()
     req_data = req.model_dump()
     req_data["extra"] = deepcopy(req_data.get("extra") or {})
     prepared = RegisterTaskRequest(**req_data)
@@ -636,35 +1066,16 @@ def _prepare_register_request(req: RegisterTaskRequest) -> RegisterTaskRequest:
     def _validate_unique_exit_ip_requirements() -> None:
         if prepared.platform != "chatgpt":
             return
-        effective_extra = config_store.get_all().copy()
-        effective_extra.update({k: v for k, v in prepared.extra.items() if v is not None and v != ""})
-        if not _is_truthy(effective_extra.get("chatgpt_register_unique_exit_ip_enabled")):
+        unique_policy = _resolve_register_unique_exit_ip_policy(prepared, req, config)
+        if not unique_policy["enabled"]:
             return
-        raw_proxy = str(
-            prepared.proxy
-            or effective_extra.get("proxy")
-            or effective_extra.get("proxy_url")
-            or effective_extra.get("task_proxy_url")
-            or effective_extra.get("dynamic_proxy_template")
-            or ""
-        ).strip()
-        mode = str(
-            prepared.proxy_mode
-            or effective_extra.get("proxy_mode")
-            or effective_extra.get("task_proxy_mode")
-            or ""
-        ).strip().lower()
-        if not mode:
-            mode = str(effective_extra.get("task_proxy_mode") or "dynamic").strip().lower() or "dynamic"
-        if mode in {"none", "no_proxy", "direct", "直连"}:
+        mode = str(unique_policy.get("proxy_mode") or "dynamic").strip().lower()
+        if unique_policy["policy"] == "required" and mode in {"none", "no_proxy", "direct", "直连"}:
             raise HTTPException(400, "开启强制独立出口 IP 时不能使用直连模式；请改用动态代理、代理池或可切换的多代理。")
         if mode in {"manual", "explicit"}:
             mode = "specified"
-        failover_enabled = bool(prepared.proxy_failover) or _is_truthy(
-            effective_extra.get("proxy_failover")
-            or effective_extra.get("task_proxy_failover")
-        )
-        if mode == "specified" and int(prepared.count or 1) > 1 and not failover_enabled:
+        failover_enabled = bool(prepared.proxy_failover)
+        if unique_policy["policy"] == "required" and mode == "specified" and int(prepared.count or 1) > 1 and not failover_enabled:
             raise HTTPException(
                 400,
                 "单个指定代理无法满足多个账号独立出口 IP；请开启失败切换/代理池/动态代理，或把注册数量降为 1。",
@@ -680,7 +1091,12 @@ def _prepare_register_request(req: RegisterTaskRequest) -> RegisterTaskRequest:
         prepared.extra["chatgpt_registration_mode"] = "access_token_only"
         prepared.extra["chatgpt_has_refresh_token_solution"] = False
         # 手机号本身是注册标识；串行能避免同一个号池号码在并发任务里被重复领取。
-        prepared.concurrency = 1
+        _normalize_register_runtime_controls(
+            prepared,
+            req,
+            config,
+            forced_serial_reason="phone_signup",
+        )
         _validate_unique_exit_ip_requirements()
         return prepared
 
@@ -738,7 +1154,6 @@ def _prepare_register_request(req: RegisterTaskRequest) -> RegisterTaskRequest:
             prepared.count = len(candidates)
         else:
             prepared.count = min(max(int(prepared.count or 1), 1), len(candidates))
-        prepared.concurrency = min(max(int(prepared.concurrency or 1), 1), prepared.count, 5)
         prepared.email = None
 
     if mail_provider in {"tempmail_local", "tempmail_api"}:
@@ -759,6 +1174,13 @@ def _prepare_register_request(req: RegisterTaskRequest) -> RegisterTaskRequest:
     if mail_provider == "luckmail":
         prepared.extra["luckmail_project_code"] = "openai"
 
+    forced_serial_reason = "manual_email_otp" if mail_provider == "manual_email_otp" else ""
+    _normalize_register_runtime_controls(
+        prepared,
+        req,
+        config,
+        forced_serial_reason=forced_serial_reason,
+    )
     _validate_unique_exit_ip_requirements()
     return prepared
 
@@ -876,9 +1298,20 @@ def enqueue_register_task(
     meta: dict | None = None,
 ) -> str:
     prepared = _prepare_register_request(req)
-    task_id = f"task_{int(time.time() * 1000)}"
+    task_id = f"task_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
     prepared_extra = _build_effective_register_extra(prepared)
     initial_meta = dict(meta or {})
+    register_control = dict(getattr(prepared, "_register_control", {}) or {})
+    unique_exit_ip_control = dict(
+        getattr(prepared, "_register_unique_exit_ip", {}) or {}
+    )
+    if register_control:
+        initial_meta.setdefault("registration_control", register_control)
+    if unique_exit_ip_control:
+        initial_meta.setdefault(
+            "register_unique_exit_ip_policy",
+            unique_exit_ip_control,
+        )
     registration_entry = str(
         prepared_extra.get("chatgpt_registration_entry")
         or prepared_extra.get("registration_entry")
@@ -920,20 +1353,23 @@ def enqueue_register_task(
                 "email": prepared.email or "",
                 "attempt_outcome": "task_created",
                 "requested_count": int(prepared.count or 0),
-                "requested_concurrency": int(prepared.concurrency or 0),
-                "requested_delay_seconds": float(prepared.register_delay_seconds or 0),
-                "requested_delay_max_seconds": float(prepared.register_delay_max_seconds or 0),
+                "requested_concurrency": register_control.get("requested_concurrency"),
+                "effective_concurrency": int(prepared.concurrency or 0),
+                "requested_delay_seconds": register_control.get("requested_delay_seconds"),
+                "requested_delay_max_seconds": register_control.get("requested_delay_max_seconds"),
+                "effective_delay_seconds": float(prepared.register_delay_seconds or 0),
+                "effective_delay_max_seconds": float(prepared.register_delay_max_seconds or 0),
                 "source": source,
                 "meta": dict(initial_meta or {}),
-                    "extra_flags": {
-                        "mail_provider": str(prepared_extra.get("mail_provider") or ""),
-                        "existing_account_capture": _is_truthy(prepared_extra.get("chatgpt_existing_account_capture")),
-                        "existing_account_login_route_enabled": _bool_config_default_true(
-                            prepared_extra.get("chatgpt_existing_account_login_route_enabled")
-                        ),
-                        "register_unique_exit_ip_enabled": _is_truthy(
-                            prepared_extra.get("chatgpt_register_unique_exit_ip_enabled")
-                        ),
+                "extra_flags": {
+                    "mail_provider": str(prepared_extra.get("mail_provider") or ""),
+                    "existing_account_capture": _is_truthy(prepared_extra.get("chatgpt_existing_account_capture")),
+                    "existing_account_login_route_enabled": _bool_config_default_true(
+                        prepared_extra.get("chatgpt_existing_account_login_route_enabled")
+                    ),
+                    "register_unique_exit_ip_enabled": _is_truthy(
+                        prepared_extra.get("chatgpt_register_unique_exit_ip_enabled")
+                    ),
                     "zero_amount_stop_enabled": _is_truthy(
                         prepared_extra.get("chatgpt_access_token_only_zero_amount_stop_enabled")
                     ),
@@ -17323,7 +17759,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
     errors = []
     fatal_registration_error = ""
     start_gate_lock = threading.Lock()
-    next_start_time = time.time()
+    next_start_time = time.monotonic()
     registration_stage_total = 9
 
     def _registration_task_log(
@@ -17366,13 +17802,19 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
         wait_seconds: float,
         *,
         attempt_id: int | None = None,
-    ) -> None:
+        stop_before_start: bool = False,
+    ) -> bool:
         remaining = max(float(wait_seconds or 0), 0.0)
         while remaining > 0:
             control.checkpoint(attempt_id=attempt_id)
+            if stop_before_start:
+                should_stop = control.should_stop_starting_new_attempts()
+                if isinstance(should_stop, bool) and should_stop:
+                    return False
             chunk = min(0.25, remaining)
             time.sleep(chunk)
             remaining -= chunk
+        return True
 
     try:
         if req.platform != "chatgpt":
@@ -17380,6 +17822,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
         PlatformCls = ChatGPTPlatform
 
         initial_merged_extra = _build_effective_register_extra(req)
+        register_control = dict(getattr(req, "_register_control", {}) or {})
         browser_executor = str(req.executor_type or "protocol").strip().lower() in {
             "headless",
             "headed",
@@ -17397,7 +17840,9 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
         chatgpt_zero_amount_stop_triggered = False
         chatgpt_checkout_amount_lock = threading.Lock()
         unique_exit_ip_lock = threading.Lock()
+        unique_exit_ip_meta_lock = threading.Lock()
         unique_exit_ip_assigned: set[str] = set()
+        unique_exit_ip_assigned_keys: set[str] = set()
         unique_exit_ip_events: list[dict[str, Any]] = []
         browser_fingerprint_lock = threading.Lock()
         browser_fingerprint_signatures: set[str] = set()
@@ -17469,43 +17914,78 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                 parsed = default
             return max(minimum, min(maximum, parsed))
 
+        def _nonnegative_int(value, default: int, maximum: int) -> int:
+            try:
+                parsed = int(float(str(value).strip()))
+            except (TypeError, ValueError):
+                parsed = default
+            return max(0, min(maximum, parsed))
+
         unique_exit_ip_enabled = (
             req.platform == "chatgpt"
             and _truthy(initial_merged_extra.get("chatgpt_register_unique_exit_ip_enabled"), default=False)
         )
-        unique_exit_ip_refresh_budget_default = max(8, min(50, int(req.count or 1) * 2))
+        unique_exit_ip_policy = str(
+            initial_merged_extra.get("chatgpt_register_unique_exit_ip_policy") or "off"
+        ).strip().lower()
+        unique_exit_ip_refresh_budget_default = (
+            REGISTER_UNIQUE_EXIT_IP_MAX_REFRESH_ATTEMPTS_DEFAULT
+        )
         unique_exit_ip_max_refresh_attempts = _positive_int(
             initial_merged_extra.get("chatgpt_register_unique_exit_ip_max_refresh_attempts")
             or initial_merged_extra.get("register_unique_exit_ip_max_refresh_attempts")
             or unique_exit_ip_refresh_budget_default,
             default=unique_exit_ip_refresh_budget_default,
             minimum=1,
-            maximum=100,
+            maximum=12,
         )
         unique_exit_ip_probe_timeout_seconds = _positive_int(
             initial_merged_extra.get("chatgpt_register_unique_exit_ip_probe_timeout_seconds")
             or initial_merged_extra.get("dynamic_proxy_probe_timeout_seconds")
-            or 8,
-            default=8,
+            or REGISTER_UNIQUE_EXIT_IP_PROBE_TIMEOUT_SECONDS_DEFAULT,
+            default=REGISTER_UNIQUE_EXIT_IP_PROBE_TIMEOUT_SECONDS_DEFAULT,
             minimum=2,
             maximum=60,
         )
+        unique_exit_ip_active_ttl_seconds = _positive_int(
+            initial_merged_extra.get("chatgpt_register_unique_exit_ip_active_ttl_seconds")
+            or 1800,
+            default=1800,
+            minimum=900,
+            maximum=7200,
+        )
+        unique_exit_ip_cooldown_seconds = _nonnegative_int(
+            initial_merged_extra.get("chatgpt_register_unique_exit_ip_cooldown_seconds")
+            if initial_merged_extra.get("chatgpt_register_unique_exit_ip_cooldown_seconds") not in (None, "")
+            else 900,
+            default=900,
+            maximum=7200,
+        )
+        from core.chatgpt_register_exit_ip_registry import (
+            normalize_register_exit_ip,
+            register_exit_ip_registry,
+        )
+
         if unique_exit_ip_enabled:
             _task_store.update_meta(
                 task_id,
                 {
                     "register_unique_exit_ip": {
                         "enabled": True,
+                        "policy": unique_exit_ip_policy,
+                        "scope": "process",
                         "assigned_count": 0,
                         "collision_count": 0,
                         "max_refresh_attempts": unique_exit_ip_max_refresh_attempts,
                         "probe_timeout_seconds": unique_exit_ip_probe_timeout_seconds,
+                        "active_ttl_seconds": unique_exit_ip_active_ttl_seconds,
+                        "cooldown_seconds": unique_exit_ip_cooldown_seconds,
                         "events": [],
                     }
                 },
             )
             _registration_task_log(
-                "[代理] 已启用注册任务内强制独立出口 IP：每个尝试会先探测出口，已分配过的 IP 本任务内不再复用",
+                "[代理] 已启用进程内跨任务独立出口 IP：每个尝试会先探测并原子锁定出口，结束后进入冷却",
                 stage_index=2,
                 phase_label="选择代理",
             )
@@ -17525,33 +18005,46 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
             if not unique_exit_ip_enabled:
                 return
             clean_event = sanitize_task_detail(event)
-            with unique_exit_ip_lock:
-                unique_exit_ip_events.append(clean_event)
-                recent_events = list(unique_exit_ip_events[-100:])
-                assigned_count = sum(1 for item in unique_exit_ip_events if str(item.get("status") or "") == "assigned")
-                collision_count = sum(1 for item in unique_exit_ip_events if str(item.get("status") or "") == "collision")
-                failed_count = sum(1 for item in unique_exit_ip_events if str(item.get("status") or "") == "failed")
-                assigned_ips = sorted(unique_exit_ip_assigned)
-            try:
-                _task_store.update_meta(
-                    task_id,
-                    {
-                        "register_unique_exit_ip": {
-                            "enabled": True,
-                            "assigned_count": assigned_count,
-                            "collision_count": collision_count,
-                            "failed_count": failed_count,
-                            "max_refresh_attempts": unique_exit_ip_max_refresh_attempts,
-                            "probe_timeout_seconds": unique_exit_ip_probe_timeout_seconds,
-                            "assigned_exit_ips": assigned_ips[-100:],
-                            "events": recent_events,
-                        }
-                    },
-                )
-            except Exception:
-                pass
+            # Keep snapshot construction and publication ordered. Without the
+            # outer lock an older one-event snapshot can overwrite a newer
+            # two-event snapshot when concurrent attempts publish out of order.
+            with unique_exit_ip_meta_lock:
+                with unique_exit_ip_lock:
+                    unique_exit_ip_events.append(clean_event)
+                    recent_events = list(unique_exit_ip_events[-100:])
+                    assigned_count = sum(1 for item in unique_exit_ip_events if str(item.get("status") or "") == "assigned")
+                    collision_count = sum(1 for item in unique_exit_ip_events if str(item.get("status") or "") == "collision")
+                    failed_count = sum(1 for item in unique_exit_ip_events if str(item.get("status") or "") == "failed")
+                    assigned_ips = sorted(unique_exit_ip_assigned)
+                try:
+                    _task_store.update_meta(
+                        task_id,
+                        {
+                            "register_unique_exit_ip": {
+                                "enabled": True,
+                                "policy": unique_exit_ip_policy,
+                                "scope": "process",
+                                "assigned_count": assigned_count,
+                                "collision_count": collision_count,
+                                "failed_count": failed_count,
+                                "max_refresh_attempts": unique_exit_ip_max_refresh_attempts,
+                                "probe_timeout_seconds": unique_exit_ip_probe_timeout_seconds,
+                                "active_ttl_seconds": unique_exit_ip_active_ttl_seconds,
+                                "cooldown_seconds": unique_exit_ip_cooldown_seconds,
+                                "assigned_exit_ips": assigned_ips[-100:],
+                                "events": recent_events,
+                            }
+                        },
+                    )
+                except Exception:
+                    pass
 
-        def _probe_unique_exit_ip(proxy: str, source: str) -> tuple[str, str]:
+        def _probe_unique_exit_ip(
+            proxy: str,
+            source: str,
+            *,
+            reuse_source_probe: bool,
+        ) -> tuple[str, str]:
             source_exit_ip = _proxy_source_exit_ip(source)
             source_text = str(source or "").strip().lower()
             fresh_source_probe = bool(
@@ -17561,6 +18054,8 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
             )
             if not proxy:
                 return "", "直连模式没有可隔离的代理出口；请改用动态代理或代理池"
+            if fresh_source_probe and reuse_source_probe:
+                return source_exit_ip, "dynamic_source_probe"
             try:
                 from services.proxy_scanner import probe_basic
 
@@ -17568,23 +18063,24 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                 if probe.get("ok") and probe.get("exit_ip"):
                     return str(probe.get("exit_ip") or "").strip(), "probe"
                 error = str(probe.get("error") or probe.get("error_code") or "出口 IP 探测失败").strip()
-                if fresh_source_probe:
-                    return source_exit_ip, f"dynamic_source_after_probe_failed:{error[:120]}"
                 return "", error
             except Exception as exc:
-                if fresh_source_probe:
-                    return source_exit_ip, f"dynamic_source_after_probe_exception:{str(exc)[:120]}"
                 return "", str(exc or "出口 IP 探测异常")
 
         def _claim_unique_register_exit_ip(
             *,
             attempt_index: int,
+            owner: str,
             proxy: str,
             source: str,
             candidate_index: int,
             candidate_total: int,
         ) -> tuple[bool, str, str]:
-            exit_ip, probe_source = _probe_unique_exit_ip(proxy, source)
+            exit_ip, probe_source = _probe_unique_exit_ip(
+                proxy,
+                source,
+                reuse_source_probe=candidate_index == 1,
+            )
             source_label = str(source or "direct").strip() or "direct"
             if not exit_ip:
                 reason = f"无法确认候选代理出口 IP: {probe_source or source_label}"
@@ -17600,13 +18096,22 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                 )
                 return False, "", reason
 
+            normalized_exit_ip = normalize_register_exit_ip(exit_ip)
             with unique_exit_ip_lock:
-                if exit_ip in unique_exit_ip_assigned:
-                    collision = True
-                else:
+                task_collision = normalized_exit_ip in unique_exit_ip_assigned_keys
+                claim = (
+                    None
+                    if task_collision
+                    else register_exit_ip_registry.claim(
+                        exit_ip,
+                        owner=owner,
+                        active_ttl_seconds=unique_exit_ip_active_ttl_seconds,
+                    )
+                )
+                if claim is not None and claim.claimed:
+                    unique_exit_ip_assigned_keys.add(claim.key)
                     unique_exit_ip_assigned.add(exit_ip)
-                    collision = False
-            if collision:
+            if task_collision:
                 reason = f"出口 IP 已在本注册任务内分配: {exit_ip}"
                 _record_unique_exit_ip_event(
                     {
@@ -17617,6 +18122,28 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                         "exit_ip": exit_ip,
                         "source": source_label,
                         "probe_source": probe_source,
+                        "reason": reason,
+                    }
+                )
+                return False, exit_ip, reason
+            if claim is None or not claim.claimed:
+                wait_seconds = int(math.ceil(claim.expires_in_seconds)) if claim else 0
+                reason = (
+                    f"出口 IP 已被同进程其他注册任务占用: {exit_ip} "
+                    f"state={claim.state if claim else 'unknown'} retry_after={wait_seconds}s"
+                )
+                _record_unique_exit_ip_event(
+                    {
+                        "attempt": attempt_index + 1,
+                        "candidate": candidate_index,
+                        "total": candidate_total,
+                        "status": "collision",
+                        "exit_ip": exit_ip,
+                        "source": source_label,
+                        "probe_source": probe_source,
+                        "collision_scope": "process",
+                        "lease_state": claim.state if claim else "unknown",
+                        "retry_after_seconds": wait_seconds,
                         "reason": reason,
                     }
                 )
@@ -17694,7 +18221,10 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
             )
             return selected_payload, selected_signature, summary
 
-        def _build_register_candidate_proxies() -> list[tuple[str, object | None, str]]:
+        def _build_register_candidate_proxies(
+            *,
+            preflight: bool = False,
+        ) -> list[tuple[str, object | None, str]]:
             from core.proxy_utils import resolve_task_proxy_candidates
 
             params = dict(req.extra or {}) if isinstance(req.extra, dict) else {}
@@ -17712,13 +18242,20 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                 params["proxy_min_score"] = req.proxy_min_score
             elif params.get("proxy_min_score") is None:
                 params.pop("proxy_min_score", None)
-            if unique_exit_ip_enabled:
-                mode = str(params.get("proxy_mode") or "").strip().lower()
+            mode = str(params.get("proxy_mode") or "").strip().lower()
+            if preflight:
+                if mode == "dynamic":
+                    params["proxy_failover"] = False
+                    params["dynamic_proxy_max_attempts"] = 1
+                elif mode == "pool":
+                    params["proxy_max_candidates"] = 1
+                elif mode in {"specified", "manual", "explicit"}:
+                    params["proxy_failover"] = False
+            elif unique_exit_ip_enabled:
                 if mode == "dynamic":
                     params["proxy_failover"] = True
-                    params["dynamic_proxy_max_attempts"] = max(
-                        _positive_int(params.get("dynamic_proxy_max_attempts") or 0, default=0, minimum=0, maximum=100),
-                        unique_exit_ip_max_refresh_attempts,
+                    params["dynamic_proxy_max_attempts"] = (
+                        unique_exit_ip_max_refresh_attempts
                     )
                 elif mode == "pool" or (mode in {"specified", "manual", "explicit"} and _truthy(params.get("proxy_failover"))):
                     params["proxy_max_candidates"] = max(
@@ -17757,6 +18294,9 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
             success_at_start = 0
             browser_register_invoked = False
             phone_signup_entry = False
+            exit_ip_lease_owner = f"{task_id}:{i + 1}"
+            exit_ip_heartbeat_stop: threading.Event | None = None
+            exit_ip_heartbeat_thread: threading.Thread | None = None
             attempt_log_context: dict[str, Any] = {
                 "attempt": i + 1,
                 "email": current_email,
@@ -17833,25 +18373,29 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                         # here, then claim only after the delay to ensure a
                         # graceful request cannot leak a queued registration.
                         control.checkpoint()
-                        now = time.time()
+                        should_stop = control.should_stop_starting_new_attempts()
+                        if isinstance(should_stop, bool) and should_stop:
+                            return AttemptResult.not_started()
+                        now = time.monotonic()
                         wait_seconds = max(0.0, next_start_time - now)
                         if wait_seconds > 0:
                             _attempt_log(
                                 f"第 {i + 1} 个账号启动前延迟 {wait_seconds:g} 秒",
                             )
-                            _sleep_with_control(
+                            if not _sleep_with_control(
                                 wait_seconds,
-                            )
+                                stop_before_start=True,
+                            ):
+                                return AttemptResult.not_started()
                         
                         delay_min = req.register_delay_seconds
                         delay_max = req.register_delay_max_seconds
                         if delay_max > delay_min:
-                            import random
                             chosen_delay = random.uniform(delay_min, delay_max)
                         else:
                             chosen_delay = delay_min
                             
-                        next_start_time = time.time() + chosen_delay
+                        next_start_time = time.monotonic() + chosen_delay
                 with success_lock:
                     # Claiming the execution unit and freezing its next
                     # success slot are one atomic dispatcher observation.
@@ -17955,6 +18499,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                         if unique_exit_ip_enabled:
                             allocation_ok, allocated_exit_ip, allocation_reason = _claim_unique_register_exit_ip(
                                 attempt_index=i,
+                                owner=exit_ip_lease_owner,
                                 proxy=_proxy,
                                 source=proxy_source,
                                 candidate_index=proxy_index,
@@ -17966,6 +18511,31 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                                     f"[代理] 独立出口 IP 检查未通过，跳过候选 {proxy_index}/{len(candidate_proxies)}：{allocation_reason}",
                                 )
                                 continue
+                            if exit_ip_heartbeat_thread is None:
+                                exit_ip_heartbeat_stop = threading.Event()
+                                heartbeat_interval = max(
+                                    5.0,
+                                    min(
+                                        float(unique_exit_ip_active_ttl_seconds) / 3.0,
+                                        300.0,
+                                    ),
+                                )
+
+                                def _refresh_exit_ip_lease() -> None:
+                                    while not exit_ip_heartbeat_stop.wait(heartbeat_interval):
+                                        refreshed = register_exit_ip_registry.refresh_owner(
+                                            exit_ip_lease_owner,
+                                            active_ttl_seconds=unique_exit_ip_active_ttl_seconds,
+                                        )
+                                        if refreshed <= 0:
+                                            return
+
+                                exit_ip_heartbeat_thread = threading.Thread(
+                                    target=_refresh_exit_ip_lease,
+                                    name=f"register-exit-ip-{i + 1}",
+                                    daemon=True,
+                                )
+                                exit_ip_heartbeat_thread.start()
                             _attempt_log(
                                 f"[代理] 独立出口 IP 已锁定: {allocated_exit_ip} candidate={proxy_index}/{len(candidate_proxies)}",
                             )
@@ -18668,6 +19238,15 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                     ),
                 )
             finally:
+                if unique_exit_ip_enabled:
+                    if exit_ip_heartbeat_stop is not None:
+                        exit_ip_heartbeat_stop.set()
+                    if exit_ip_heartbeat_thread is not None:
+                        exit_ip_heartbeat_thread.join(timeout=1.0)
+                    register_exit_ip_registry.release_owner(
+                        exit_ip_lease_owner,
+                        cooldown_seconds=unique_exit_ip_cooldown_seconds,
+                    )
                 control.finish_attempt(attempt_id)
 
         from concurrent.futures import FIRST_COMPLETED, CancelledError, ThreadPoolExecutor, wait
@@ -18742,7 +19321,70 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                 stage_index=1,
                 phase_label="准备",
             )
-        max_workers = min(req.concurrency, target_successes, attempt_cap or target_successes, 5)
+        frozen_concurrency_cap = register_control.get("concurrency_cap")
+        if frozen_concurrency_cap not in (None, ""):
+            mode_hard_cap = (
+                REGISTER_BROWSER_MAX_CONCURRENCY
+                if browser_executor
+                else REGISTER_PROTOCOL_MAX_CONCURRENCY
+            )
+            try:
+                runtime_concurrency_cap = int(frozen_concurrency_cap)
+            except (TypeError, ValueError):
+                runtime_concurrency_cap = mode_hard_cap
+            runtime_concurrency_cap = max(1, min(runtime_concurrency_cap, mode_hard_cap))
+        elif browser_executor:
+            runtime_concurrency_cap = _bounded_register_config_int(
+                initial_merged_extra,
+                "chatgpt_register_browser_max_concurrency",
+                default=REGISTER_BROWSER_MAX_CONCURRENCY,
+                maximum=REGISTER_BROWSER_MAX_CONCURRENCY,
+            )
+        else:
+            runtime_concurrency_cap = _bounded_register_config_int(
+                initial_merged_extra,
+                "chatgpt_register_protocol_max_concurrency",
+                default=REGISTER_PROTOCOL_MAX_CONCURRENCY,
+                maximum=REGISTER_PROTOCOL_MAX_CONCURRENCY,
+            )
+        runtime_forced_serial_reason = ""
+        if initial_phone_signup_entry:
+            runtime_forced_serial_reason = "phone_signup"
+        elif initial_mail_provider == "manual_email_otp":
+            runtime_forced_serial_reason = "manual_email_otp"
+        if runtime_forced_serial_reason:
+            runtime_concurrency_cap = 1
+        max_workers = max(
+            1,
+            min(
+                int(req.concurrency or 1),
+                runtime_concurrency_cap,
+                target_successes,
+                attempt_cap or target_successes,
+                REGISTER_CONCURRENCY_HARD_LIMIT,
+            ),
+        )
+        runtime_control = {
+            **register_control,
+            "requested_concurrency": register_control.get(
+                "requested_concurrency",
+                int(req.concurrency or 1),
+            ),
+            "effective_concurrency": max_workers,
+            "concurrency_cap": runtime_concurrency_cap,
+            "concurrency_reason": (
+                runtime_forced_serial_reason
+                or register_control.get("concurrency_reason")
+                or (
+                    f"{'browser' if browser_executor else 'protocol'}_cap"
+                    if int(req.concurrency or 1) > runtime_concurrency_cap
+                    else ""
+                )
+            ),
+            "effective_delay_seconds": float(req.register_delay_seconds or 0),
+            "effective_delay_max_seconds": float(req.register_delay_max_seconds or 0),
+        }
+        _task_store.update_meta(task_id, {"registration_control": runtime_control})
         if req.platform == "chatgpt":
             route_enabled = parse_route_bool(
                 initial_merged_extra.get(
@@ -18752,7 +19394,11 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
             )
             _registration_task_log(
                 "[控制] registration_policy "
-                f"executor={req.executor_type or 'protocol'} concurrency={max_workers} "
+                f"executor={req.executor_type or 'protocol'} "
+                f"requested_concurrency={runtime_control.get('requested_concurrency')} "
+                f"effective_concurrency={max_workers} cap={runtime_concurrency_cap} "
+                f"delay={float(req.register_delay_seconds or 0):g}-"
+                f"{float(req.register_delay_max_seconds or 0):g}s "
                 f"existing_account_action={'login_recovery' if route_enabled else 'skip'} "
                 "uncertain_browser_failure_slot=consume",
                 stage_index=1,
@@ -18766,7 +19412,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
 
         # 任务启动前预检代理候选：无可用 IP 时立即失败，避免刷几百条相同错误
         try:
-            _preflight_proxies = _build_register_candidate_proxies()
+            _preflight_proxies = _build_register_candidate_proxies(preflight=True)
             if not _preflight_proxies:
                 raise RuntimeError("代理候选列表为空")
             _registration_task_log(

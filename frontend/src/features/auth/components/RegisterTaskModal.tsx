@@ -7,6 +7,7 @@ import {
   Input,
   InputNumber,
   Modal,
+  Segmented,
   Select,
   Space,
   Tag,
@@ -22,7 +23,16 @@ import {
   CHATGPT_REGISTRATION_MODE_REFRESH_TOKEN,
   type ChatGPTRegistrationMode,
 } from '@/lib/chatgptRegistrationMode'
-import { EXECUTOR_SELECTION_HELP, getExecutorOptions } from '@/lib/platformExecutorOptions'
+import {
+  CHATGPT_REGISTER_DEFAULT_CONCURRENCY,
+  CHATGPT_REGISTER_DEFAULT_DELAY_MAX_SECONDS,
+  CHATGPT_REGISTER_DEFAULT_DELAY_SECONDS,
+  getRegisterConcurrencyLimit,
+  isRegisterUniqueExitEnabled,
+  normalizeRegisterConcurrency,
+  type ChatGPTRegisterControlConfig,
+} from '@/lib/chatgptRegisterTaskControls'
+import { EXECUTOR_SELECTION_HELP, getExecutorOptions, normalizeExecutorForPlatform } from '@/lib/platformExecutorOptions'
 import { apiFetch } from '@/lib/utils'
 import { normalizeDomainList } from '@/lib/domainList'
 
@@ -60,6 +70,7 @@ type RegisterTaskModalProps = {
   taskSnapshot: any
   registerForm: any
   registerMailProvider: string
+  registerControlConfig: ChatGPTRegisterControlConfig
   chatgptRegistrationMode: ChatGPTRegistrationMode
   setChatgptRegistrationMode: (mode: ChatGPTRegistrationMode) => void
   registerLoading: boolean
@@ -79,6 +90,7 @@ export function RegisterTaskModal({
   taskSnapshot,
   registerForm,
   registerMailProvider,
+  registerControlConfig,
   chatgptRegistrationMode,
   setChatgptRegistrationMode,
   registerLoading,
@@ -95,8 +107,10 @@ export function RegisterTaskModal({
   const selectedTempMailMode = String(Form.useWatch('tempmail_mode', registerForm) || '').trim().toLowerCase()
   const proxyMode = Form.useWatch('proxy_mode', registerForm)
   const proxyFailover = Form.useWatch('proxy_failover', registerForm)
-  const uniqueExitIpEnabled = Form.useWatch('chatgpt_register_unique_exit_ip_enabled', registerForm)
+  const uniqueExitIpPolicy = Form.useWatch('chatgpt_register_unique_exit_ip_policy', registerForm)
   const registerCount = Number(Form.useWatch('count', registerForm) || 1)
+  const selectedExecutor = Form.useWatch('executor_type', registerForm)
+  const executorType = normalizeExecutorForPlatform(currentPlatform, selectedExecutor)
   const [tempmailDomains, setTempmailDomains] = useState<TempMailDomainOption[]>([])
   const [tempmailDomainsLoading, setTempmailDomainsLoading] = useState(false)
   const isPhoneSignup = currentPlatform === 'chatgpt' && chatgptRegistrationEntry === 'phone_signup'
@@ -110,6 +124,10 @@ export function RegisterTaskModal({
     ? 'hme_ready_api'
     : rawEffectiveRegisterMailProvider
   const effectiveTempMailProvider = effectiveRegisterMailProvider === 'tempmail_local' || effectiveRegisterMailProvider === 'tempmail_api'
+  const forceSerialRegistration = isPhoneSignup
+    || (currentPlatform === 'chatgpt' && effectiveRegisterMailProvider === 'manual_email_otp')
+  const concurrencyLimit = getRegisterConcurrencyLimit(currentPlatform, executorType, registerControlConfig)
+  const uniqueExitIpEnabled = isRegisterUniqueExitEnabled(uniqueExitIpPolicy, proxyMode)
   const tempmailRequiresFixedDomain = effectiveTempMailProvider && selectedTempMailMode === 'fixed_domain'
   const tempmailUsesTaskSubdomain = effectiveTempMailProvider && selectedTempMailMode === 'task_subdomain'
   const normalizedSelectedTempMailDomains = normalizeDomainList(selectedTempMailDomains)
@@ -152,9 +170,19 @@ export function RegisterTaskModal({
   }, [open, tempmailRequiresFixedDomain])
 
   useEffect(() => {
-    if (!open || !isPhoneSignup) return
-    registerForm.setFieldsValue({ concurrency: 1 })
-  }, [open, isPhoneSignup, registerForm])
+    if (!open) return
+    const currentConcurrency = registerForm.getFieldValue('concurrency')
+    const nextConcurrency = normalizeRegisterConcurrency(
+      currentConcurrency,
+      currentPlatform,
+      executorType,
+      forceSerialRegistration,
+      registerControlConfig,
+    )
+    if (Number(currentConcurrency) !== nextConcurrency) {
+      registerForm.setFieldValue('concurrency', nextConcurrency)
+    }
+  }, [currentPlatform, executorType, forceSerialRegistration, open, registerControlConfig, registerForm])
 
   const isPhoneBindingTest = String(taskSnapshot?.source || '').trim() === 'phone_binding_test'
   const boundPhoneLines = Array.isArray(taskSnapshot?.meta?.bound_phone_lines) ? taskSnapshot.meta.bound_phone_lines : []
@@ -561,15 +589,43 @@ export function RegisterTaskModal({
           <Form.Item name="count" label="注册数量" initialValue={1} rules={[{ required: true }]}>
             <Input type="number" min={1} disabled={!isPhoneSignup && currentPlatform === 'chatgpt' && effectiveRegisterMailProvider === 'manual_email_otp'} />
           </Form.Item>
-          <Form.Item name="concurrency" label="并发数" initialValue={1} rules={[{ required: true }]}>
-            <Input type="number" min={1} max={5} disabled={isPhoneSignup || (currentPlatform === 'chatgpt' && ['manual_email_otp'].includes(String(effectiveRegisterMailProvider || '')))} />
+          <Form.Item
+            name="concurrency"
+            label="并发数"
+            initialValue={currentPlatform === 'chatgpt' ? CHATGPT_REGISTER_DEFAULT_CONCURRENCY : 1}
+            rules={[{ required: true }]}
+            extra={forceSerialRegistration ? '当前注册方式固定串行。' : `当前执行器最多并发 ${concurrencyLimit}。`}
+          >
+            <Input type="number" min={1} max={concurrencyLimit} disabled={forceSerialRegistration} />
           </Form.Item>
           <Space align="start" style={{ width: '100%' }}>
-            <Form.Item name="register_delay_seconds" label="最小注册延迟(秒)" initialValue={0} style={{ flex: 1 }}>
-              <InputNumber min={0} precision={1} step={0.5} style={{ width: '100%' }} placeholder="0 = 不延迟" />
+            <Form.Item
+              name="register_delay_seconds"
+              label="最小注册延迟(秒)"
+              initialValue={currentPlatform === 'chatgpt' ? CHATGPT_REGISTER_DEFAULT_DELAY_SECONDS : 0}
+              style={{ flex: 1 }}
+            >
+              <InputNumber min={0} max={3600} precision={1} step={0.5} style={{ width: '100%' }} placeholder="0 = 不延迟" />
             </Form.Item>
-            <Form.Item name="register_delay_max_seconds" label="最大注册延迟(秒)" initialValue={0} style={{ flex: 1 }}>
-              <InputNumber min={0} precision={1} step={0.5} style={{ width: '100%' }} placeholder="0 = 固定延迟" />
+            <Form.Item
+              name="register_delay_max_seconds"
+              label="最大注册延迟(秒)"
+              initialValue={currentPlatform === 'chatgpt' ? CHATGPT_REGISTER_DEFAULT_DELAY_MAX_SECONDS : 0}
+              dependencies={['register_delay_seconds']}
+              rules={[
+                ({ getFieldValue }) => ({
+                  validator: (_, value) => {
+                    const maximum = Number(value || 0)
+                    const minimum = Number(getFieldValue('register_delay_seconds') || 0)
+                    return maximum === 0 || maximum >= minimum
+                      ? Promise.resolve()
+                      : Promise.reject(new Error('最大延迟不能小于最小延迟；填 0 或与最小值相同表示固定延迟'))
+                  },
+                }),
+              ]}
+              style={{ flex: 1 }}
+            >
+              <InputNumber min={0} max={3600} precision={1} step={0.5} style={{ width: '100%' }} placeholder="0 或与最小值相同 = 固定延迟" />
             </Form.Item>
           </Space>
           <Form.Item name="proxy_mode" label="代理模式" initialValue="dynamic">
@@ -621,12 +677,19 @@ export function RegisterTaskModal({
           ) : null}
           {currentPlatform === 'chatgpt' ? (
             <Form.Item
-              name="chatgpt_register_unique_exit_ip_enabled"
-              valuePropName="checked"
-              initialValue={false}
-              extra="开启后每个注册尝试会先探测真实出口 IP；本任务内已分配过的 IP 不再复用。动态代理会扩大 sid 刷新候选，代理池会换候选；不足时当前尝试会失败/补尝试，速度会明显变慢。"
+              name="chatgpt_register_unique_exit_ip_policy"
+              label="独立出口策略"
+              initialValue="auto"
+              extra="自动仅在动态代理下启用；强制会要求当前代理模式能够轮换出口；关闭则不探测和锁定出口 IP。"
             >
-              <Checkbox>注册任务内强制独立出口 IP</Checkbox>
+              <Segmented
+                block
+                options={[
+                  { label: '自动', value: 'auto' },
+                  { label: '强制', value: 'required' },
+                  { label: '关闭', value: 'off' },
+                ]}
+              />
             </Form.Item>
           ) : null}
           {uniqueExitIpEnabled && proxyMode === 'direct' ? (

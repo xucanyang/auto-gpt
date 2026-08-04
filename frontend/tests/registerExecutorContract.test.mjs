@@ -31,7 +31,8 @@ test('the accounts registration flow submits and persists the form executor', ()
   assert.match(registerHandler, /executor_type: executorType/)
   assert.doesNotMatch(registerHandler, /normalizeExecutorForPlatform\(currentPlatform, cfg\.default_executor\)/)
   assert.match(registerHandler, /mergeRegisterFormSettings\([\s\S]+?executor_type: executorType/)
-  assert.match(saveHandler, /executor_type: normalizeExecutorForPlatform\(currentPlatform, values\.executor_type\)/)
+  assert.match(saveHandler, /const executorType = normalizeExecutorForPlatform\(currentPlatform, values\.executor_type\)/)
+  assert.match(saveHandler, /executor_type: executorType/)
   assert.match(saveHandler, /executor_type: settingsPayload\.executor_type/)
 })
 
@@ -52,8 +53,9 @@ test('the accounts registration form restores the saved executor without overwri
     2,
   )
   assert.equal(
-    hydrationSource.match(/isFieldTouched\('executor_type'\)\s*\? \{\}\s*:\s*\{\s*executor_type:/g)?.length,
+    hydrationSource.match(/const shouldHydrateExecutor = !registerForm\.isFieldTouched\('executor_type'\)/g)?.length,
     2,
   )
+  assert.equal(hydrationSource.match(/shouldHydrateExecutor \? \{ executor_type: hydratedExecutor \} : \{\}/g)?.length, 2)
   assert.equal(hydrationSource.match(/\.\.\.executorFieldHydration/g)?.length, 2)
 })
