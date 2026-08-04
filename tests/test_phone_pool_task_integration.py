@@ -139,6 +139,61 @@ class PhonePoolTaskIntegrationTests(unittest.TestCase):
         self.assertEqual(created_meta["settings"]["phone_pool_mode"], "manual")
         self.assertEqual(background_tasks.calls[0][0][4]["phone_pool_mode"], "normal")
 
+    def test_phone_binding_concurrency_is_not_capped_at_five(self):
+        created_meta = {}
+
+        class _BackgroundTasks:
+            def __init__(self):
+                self.calls = []
+
+            def add_task(self, *args, **kwargs):
+                self.calls.append((args, kwargs))
+
+        account_items = [
+            {
+                "account_id": 200 + index,
+                "email": f"parallel-{index}@example.com",
+                "status": "pending_payment",
+            }
+            for index in range(6)
+        ]
+        phone_lines = "\n".join(
+            f"+15551230{index:03d}----https://relay.example.com/{index}"
+            for index in range(6)
+        )
+        request = PhoneBindingTestTaskRequest(
+            account_ids=[item["account_id"] for item in account_items],
+            phone_lines=phone_lines,
+            concurrency=6,
+        )
+
+        def _fake_create_task(_task_id, *, platform, source, total, meta):
+            created_meta.update(meta)
+
+        with (
+            patch(
+                "api.tasks._resolve_phone_binding_test_accounts",
+                return_value=(account_items, [], [], []),
+            ),
+            patch(
+                "api.tasks._import_manual_phone_entries_to_pool",
+                side_effect=lambda entries: (
+                    entries,
+                    {"imported": len(entries), "existing": 0, "skipped": 0},
+                ),
+            ),
+            patch("api.tasks._create_standalone_task_record", side_effect=_fake_create_task),
+            patch("api.tasks._save_task_log"),
+        ):
+            response = enqueue_phone_binding_test_task(
+                request,
+                background_tasks=_BackgroundTasks(),
+            )
+
+        self.assertEqual(response["requested_concurrency"], 6)
+        self.assertEqual(response["effective_concurrency"], 6)
+        self.assertEqual(created_meta["settings"]["concurrency"], 6)
+
     def test_phone_binding_concurrency_forces_serial_when_reusing_same_phone(self):
         created_meta = {}
 

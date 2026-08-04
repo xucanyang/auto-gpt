@@ -493,6 +493,7 @@ def _execute_chatgpt_invalid_recheck(
     task_id: str = "",
     task_control=None,
     attempt_id: int | None = None,
+    proxy_url: str | None = None,
 ) -> dict[str, Any]:
     return recheck_invalid_chatgpt_account(
         int(acc_model.id or 0),
@@ -501,6 +502,7 @@ def _execute_chatgpt_invalid_recheck(
         task_id=task_id,
         task_control=task_control,
         attempt_id=attempt_id,
+        proxy_url=proxy_url,
     )
 
 
@@ -512,6 +514,7 @@ def _execute_chatgpt_invalid_recheck_action(
     result = _execute_chatgpt_invalid_recheck(
         acc_model,
         task_id=str((params or {}).get("task_id") or ""),
+        proxy_url=str((params or {}).get("proxy_url") or (params or {}).get("proxy") or "") or None,
     )
     session.refresh(acc_model)
     _apply_chatgpt_invalid_recheck_result(acc_model, result, session)

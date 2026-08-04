@@ -93,6 +93,7 @@ const TASK_MODAL_STORAGE_KEY = 'auto-chatgpt.accounts.task-modal.current-task'
 const ACCOUNT_COLUMN_VISIBILITY_STORAGE_KEY = 'auto-chatgpt.accounts.visible-columns.v3'
 const LEGACY_ACCOUNT_COLUMN_VISIBILITY_STORAGE_KEY = 'auto-chatgpt.accounts.visible-columns.v2'
 const PHONE_BINDING_SETTINGS_STORAGE_KEY = 'auto-chatgpt.accounts.phone-binding-settings.v1'
+const INVALID_RECHECK_CONCURRENCY_STORAGE_KEY = 'auto-chatgpt.accounts.invalid-recheck-concurrency.v1'
 const BAXIGPT_CDK_SETTINGS_STORAGE_KEY = 'auto-chatgpt.accounts.baxigpt-cdk-settings.v1'
 const PAYPAL_BINDING_SETTINGS_STORAGE_KEY = 'auto-chatgpt.accounts.paypal-binding-settings.v1'
 
@@ -1492,6 +1493,19 @@ function savePhoneBindingSettings(values: Record<string, unknown>) {
   window.localStorage.setItem(PHONE_BINDING_SETTINGS_STORAGE_KEY, JSON.stringify(normalizePhoneBindingSettings(values)))
 }
 
+function loadInvalidRecheckConcurrency() {
+  if (typeof window === 'undefined') return 1
+  const value = Number(window.localStorage.getItem(INVALID_RECHECK_CONCURRENCY_STORAGE_KEY) || 1)
+  return Number.isFinite(value) ? Math.max(1, Math.floor(value)) : 1
+}
+
+function saveInvalidRecheckConcurrency(value: unknown) {
+  if (typeof window === 'undefined') return
+  const parsed = Number(value)
+  const concurrency = Number.isFinite(parsed) ? Math.max(1, Math.floor(parsed)) : 1
+  window.localStorage.setItem(INVALID_RECHECK_CONCURRENCY_STORAGE_KEY, String(concurrency))
+}
+
 function normalizeBaxiGptCdkSettings(value: unknown): BaxiGptCdkSettings {
   const raw = value && typeof value === 'object' ? value as Record<string, unknown> : {}
   return {
@@ -2681,6 +2695,10 @@ export default function Accounts() {
   const [resumeAuthConfigMode, setResumeAuthConfigMode] = useState<'single' | 'batch'>('single')
   const [resumeAuthConfigAccount, setResumeAuthConfigAccount] = useState<any>(null)
   const [resumeAuthConfigScope, setResumeAuthConfigScope] = useState<'selected' | 'filtered'>('selected')
+  const [invalidRecheckConfigOpen, setInvalidRecheckConfigOpen] = useState(false)
+  const [invalidRecheckConfigMode, setInvalidRecheckConfigMode] = useState<'single' | 'batch'>('single')
+  const [invalidRecheckConfigAccount, setInvalidRecheckConfigAccount] = useState<any>(null)
+  const [invalidRecheckConfigScope, setInvalidRecheckConfigScope] = useState<'selected' | 'filtered'>('selected')
   const [phoneBindingTestOpen, setPhoneBindingTestOpen] = useState(false)
   const [phoneBindingTestLoading, setPhoneBindingTestLoading] = useState(false)
   const [phoneBindingTestScope, setPhoneBindingTestScope] = useState<'selected' | 'filtered'>('selected')
@@ -2718,6 +2736,7 @@ export default function Accounts() {
   const [addForm] = Form.useForm()
   const [detailForm] = Form.useForm()
   const [resumeAuthConfigForm] = Form.useForm()
+  const [invalidRecheckConfigForm] = Form.useForm()
   const [phoneBindingTestForm] = Form.useForm()
   const [baxiCdkSubmitForm] = Form.useForm()
   const [paypalBindingForm] = Form.useForm()
@@ -2743,6 +2762,8 @@ export default function Accounts() {
   const phoneBindingPhoneLinesValue = Form.useWatch('phone_lines', phoneBindingTestForm)
   const phoneBindingProxyModeValue = Form.useWatch('proxy_mode', phoneBindingTestForm)
   const phoneBindingProxyFailoverValue = Form.useWatch('proxy_failover', phoneBindingTestForm)
+  const invalidRecheckProxyModeValue = Form.useWatch('proxy_mode', invalidRecheckConfigForm)
+  const invalidRecheckProxyFailoverValue = Form.useWatch('proxy_failover', invalidRecheckConfigForm)
   const baxiCdkUsePoolValue = Form.useWatch('use_pool', baxiCdkSubmitForm)
   const baxiCdkCodeLinesValue = Form.useWatch('code_lines', baxiCdkSubmitForm)
   const baxiCdkSelectedIdsValue = Form.useWatch('cdk_ids', baxiCdkSubmitForm)
@@ -4723,53 +4744,94 @@ export default function Accounts() {
     }
   }
 
-  const handleInvalidRecheck = async (record: any) => {
+  const openInvalidRecheckConfig = async (mode: 'single' | 'batch', record: any = null) => {
     const accountId = Number(record?.id || 0)
-    if (!accountId) return
-    const toastKey = `invalid-recheck:${accountId}`
-    message.loading({ content: '失效测活任务创建中...', key: toastKey, duration: 0 })
+    if (mode === 'single' && !accountId) return
+    const scope: 'selected' | 'filtered' = selectedRowKeys.length > 0 ? 'selected' : 'filtered'
+    const cfg = await loadConfigCache({ force: true }).catch(() => configCache || {})
+    const proxySettings = taskProxySettingsFromConfig(cfg || {})
+    setInvalidRecheckConfigMode(mode)
+    setInvalidRecheckConfigAccount(mode === 'single' ? record : null)
+    setInvalidRecheckConfigScope(scope)
+    invalidRecheckConfigForm.setFieldsValue({
+      concurrency: loadInvalidRecheckConcurrency(),
+      ...proxySettings,
+    })
+    setInvalidRecheckConfigOpen(true)
+  }
+
+  const handleInvalidRecheck = async (record: any) => {
+    await openInvalidRecheckConfig('single', record)
+  }
+
+  const handleBatchInvalidRecheck = async () => {
+    await openInvalidRecheckConfig('batch')
+  }
+
+  const submitInvalidRecheckConfig = async () => {
+    const values = await invalidRecheckConfigForm.validateFields()
+    validateTaskProxySettings(values)
+    const proxyPayload = buildTaskProxyPayload(values)
+    const isBatch = invalidRecheckConfigMode === 'batch'
+    const requestedConcurrency = Math.max(1, Math.floor(Number(values.concurrency || 1) || 1))
+    const toastKey = isBatch
+      ? `invalid-recheck:${invalidRecheckConfigScope}`
+      : `invalid-recheck:${Number(invalidRecheckConfigAccount?.id || 0)}`
+
+    setBatchInvalidRecheckLoading(true)
+    message.loading({
+      content: `${isBatch ? '批量' : ''}失效测活任务创建中...`,
+      key: toastKey,
+      duration: 0,
+    })
     try {
-      const res = await apiFetch('/tasks/chatgpt/invalid-recheck', {
-        method: 'POST',
-        body: JSON.stringify({ account_id: accountId }),
-      })
-      const taskIdFromResponse = String(res?.task_id || '').trim()
-      if (taskIdFromResponse) {
+      if (!isBatch) {
+        const accountId = Number(invalidRecheckConfigAccount?.id || 0)
+        if (!accountId) throw new Error('失效测活账号无效')
+        const res = await apiFetch('/tasks/chatgpt/invalid-recheck', {
+          method: 'POST',
+          body: JSON.stringify({
+            account_id: accountId,
+            ...proxyPayload,
+          }),
+        })
+        const taskIdFromResponse = String(res?.task_id || '').trim()
+        if (!taskIdFromResponse) throw new Error('任务创建成功，但未返回 task_id')
         const snapshot = await apiFetch(`/tasks/${taskIdFromResponse}`)
+        setInvalidRecheckConfigOpen(false)
         setTaskModalMode('invalid_recheck')
-        setTaskModalAccount(record)
+        setTaskModalAccount(invalidRecheckConfigAccount)
         setTaskId(taskIdFromResponse)
         setTaskSnapshot(snapshot)
         setRegisterModalOpen(true)
         setActiveTasksPanelOpen(true)
         void activeTasksQuery.refetch()
+        message.success({ content: '失效测活任务已启动', key: toastKey })
+        return
       }
-      message.success({ content: '失效测活任务已启动', key: toastKey })
-    } catch (e: any) {
-      message.error({ content: `失效测活失败: ${e.message}`, key: toastKey })
-    }
-  }
 
-  const handleBatchInvalidRecheck = async () => {
-    const scope: 'selected' | 'filtered' = selectedRowKeys.length > 0 ? 'selected' : 'filtered'
-    const toastKey = `invalid-recheck:${scope}`
-    const body: Record<string, unknown> = {}
-    const requestedCount = applyAccountTaskScopeToBody(body, {
-      scope,
-      emptySelectedMessage: '请先选择要测活的失效账号',
-    })
-    if (requestedCount === null) return
+      saveInvalidRecheckConcurrency(requestedConcurrency)
+      const body: Record<string, unknown> = {
+        params: {
+          concurrency: requestedConcurrency,
+          ...proxyPayload,
+        },
+      }
+      const requestedCount = applyAccountTaskScopeToBody(body, {
+        scope: invalidRecheckConfigScope,
+        emptySelectedMessage: '请先选择要测活的失效账号',
+      })
+      if (requestedCount === null) return
 
-    setBatchInvalidRecheckLoading(true)
-    message.loading({ content: '批量失效测活任务创建中...', key: toastKey, duration: 0 })
-    try {
       const res = await postAccountScopeRequest('/tasks/chatgpt/invalid-recheck/batch', body, toastKey)
       if (!res) return
 
       const eligible = Number(res?.eligible || 0)
       const skipped = Number(res?.skipped || 0)
       const missing = Number(res?.missing || 0)
+      const effectiveConcurrency = Number(res?.effective_concurrency || Math.min(requestedConcurrency, eligible) || 1)
       const taskIdFromResponse = String(res?.task_id || '').trim()
+      setInvalidRecheckConfigOpen(false)
 
       if (!taskIdFromResponse) {
         message.info({
@@ -4784,19 +4846,19 @@ export default function Accounts() {
 
       const snapshot = await apiFetch(`/tasks/${taskIdFromResponse}`)
       setTaskModalMode('invalid_recheck')
-      setTaskModalAccount(scope === 'selected' ? null : { email: `当前筛选 ${eligible} 个失效账号` })
+      setTaskModalAccount(invalidRecheckConfigScope === 'selected' ? null : { email: `当前筛选 ${eligible} 个失效账号` })
       setTaskId(taskIdFromResponse)
       setTaskSnapshot(snapshot)
       setRegisterModalOpen(true)
       setActiveTasksPanelOpen(true)
       void activeTasksQuery.refetch()
       message.success({
-        content: `批量失效测活任务已启动：可执行 ${eligible} 个，跳过 ${skipped} 个${missing > 0 ? `，缺失 ${missing} 个` : ''}`,
+        content: `批量失效测活任务已启动：可执行 ${eligible} 个，并发 ${effectiveConcurrency}，跳过 ${skipped} 个${missing > 0 ? `，缺失 ${missing} 个` : ''}`,
         key: toastKey,
       })
       showBatchActionResult('批量失效测活结果', res)
     } catch (e: any) {
-      message.error({ content: `批量失效测活失败: ${e.message}`, key: toastKey })
+      message.error({ content: `${isBatch ? '批量' : ''}失效测活失败: ${e.message}`, key: toastKey })
     } finally {
       setBatchInvalidRecheckLoading(false)
     }
@@ -4846,7 +4908,7 @@ export default function Accounts() {
       || (prefixBindEnabled && phoneNumberFilter !== 'available')
     const usePool = !phoneLines && (Boolean(values.use_pool) || prefixBindEnabled || prefixSampleEnabled || unavailableNumberTestEnabled)
     const reusePhoneUntilUnusable = fixedSnapshotSelection || smsProbeOnly ? false : Boolean(values.reuse_phone_until_unusable)
-    const requestedConcurrency = Math.max(1, Math.min(5, Number(values.concurrency || 1) || 1))
+    const requestedConcurrency = Math.max(1, Math.floor(Number(values.concurrency || 1) || 1))
     const effectiveConcurrency = reusePhoneUntilUnusable ? 1 : requestedConcurrency
     const normalizedValues = {
       ...values,
@@ -8357,6 +8419,8 @@ export default function Accounts() {
     || (phoneBindingPrefixBindEnabled && phoneBindingPrefixNumberFilter !== 'available')
   const phoneBindingSelectedPrefixes = normalizeSelectedPrefixes(phoneBindingSelectedPrefixesValue)
   const phoneBindingProxyMode = String(phoneBindingProxyModeValue || DEFAULT_PHONE_BINDING_SETTINGS.proxy_mode)
+  const invalidRecheckProxyMode = String(invalidRecheckProxyModeValue || 'dynamic')
+  const invalidRecheckProxyFailover = Boolean(invalidRecheckProxyFailoverValue)
   const phoneBindingPrefixSampleSize = Number(phoneBindingPrefixSampleSizeValue) === 2 ? 2 : 1
   const phoneBindingPrefixSampleFilter = (() => {
     const value = String(phoneBindingPrefixSampleFilterValue || 'all')
@@ -9518,6 +9582,105 @@ export default function Accounts() {
       </Modal>
 
       <Modal
+        title={invalidRecheckConfigMode === 'single' ? '失效测活配置' : '批量失效测活配置'}
+        open={invalidRecheckConfigOpen}
+        onCancel={() => setInvalidRecheckConfigOpen(false)}
+        onOk={submitInvalidRecheckConfig}
+        confirmLoading={batchInvalidRecheckLoading}
+        okText="开始测活"
+        cancelText="取消"
+        width={720}
+        maskClosable={false}
+      >
+        <Form form={invalidRecheckConfigForm} layout="vertical">
+          <Alert
+            type="info"
+            showIcon
+            style={{ marginBottom: 16 }}
+            message={
+              invalidRecheckConfigMode === 'single'
+                ? `账号：${invalidRecheckConfigAccount?.email || invalidRecheckConfigAccount?.id || '-'}`
+                : invalidRecheckConfigScope === 'selected'
+                  ? `范围：当前选中 ${selectedRowKeys.length} 个账号`
+                  : `范围：当前筛选结果 ${total} 个账号`
+            }
+          />
+
+          {invalidRecheckConfigMode === 'batch' ? (
+            <Form.Item
+              name="concurrency"
+              label="并发数"
+              rules={[{ required: true, message: '请输入并发数' }]}
+              extra="不设固定任务上限；实际 worker 数不会超过本次可执行账号数，浏览器事务仍按实例运行容量排队。"
+            >
+              <InputNumber min={1} step={1} precision={0} style={{ width: '100%' }} />
+            </Form.Item>
+          ) : null}
+
+          <Form.Item name="proxy_mode" label="代理方式">
+            <Segmented
+              block
+              options={[
+                { label: '动态代理', value: 'dynamic' },
+                { label: '代理池', value: 'pool' },
+                { label: '指定代理', value: 'specified' },
+                { label: '直连', value: 'direct' },
+              ]}
+            />
+          </Form.Item>
+
+          {invalidRecheckProxyMode === 'specified' || invalidRecheckProxyMode === 'dynamic' ? (
+            <Space style={{ width: '100%' }} align="start" wrap>
+              <Form.Item
+                name="proxy"
+                label={invalidRecheckProxyMode === 'dynamic' ? '动态节点（本次任务可覆盖）' : '指定代理'}
+                style={{ flex: '1 1 360px' }}
+                rules={invalidRecheckProxyMode === 'specified' ? [{ required: true, message: '请输入指定代理地址' }] : undefined}
+                extra={invalidRecheckProxyMode === 'dynamic' ? '留空沿用全局动态节点。' : undefined}
+              >
+                <Input
+                  placeholder={invalidRecheckProxyMode === 'dynamic'
+                    ? '可留空；或填写本次任务使用的动态代理模板'
+                    : 'http://user:pass@host:port'}
+                />
+              </Form.Item>
+              <Form.Item name="proxy_failover" label="失败处理" valuePropName="checked" style={{ width: 200 }}>
+                <Switch
+                  checkedChildren={invalidRecheckProxyMode === 'dynamic' ? '刷新 SID' : '切换代理池'}
+                  unCheckedChildren="不切换"
+                />
+              </Form.Item>
+            </Space>
+          ) : null}
+
+          {invalidRecheckProxyMode === 'pool'
+          || invalidRecheckProxyMode === 'dynamic'
+          || (invalidRecheckProxyMode === 'specified' && invalidRecheckProxyFailover) ? (
+            <Space style={{ width: '100%' }} align="start" wrap>
+              <Form.Item
+                name="proxy_country_code"
+                label="出口国家"
+                style={{ flex: '1 1 180px' }}
+                rules={invalidRecheckProxyMode === 'dynamic' ? [{ required: true, message: '请输入动态代理出口国家' }] : undefined}
+              >
+                <Input placeholder={invalidRecheckProxyMode === 'dynamic' ? '例如 US / JP / SG' : '不限'} maxLength={2} />
+              </Form.Item>
+              {invalidRecheckProxyMode !== 'dynamic' ? (
+                <>
+                  <Form.Item name="proxy_min_score" label="最低健康分" style={{ width: 150 }}>
+                    <InputNumber min={0} max={100} precision={0} style={{ width: '100%' }} />
+                  </Form.Item>
+                  <Form.Item name="proxy_max_candidates" label="最多候选" style={{ width: 150 }}>
+                    <InputNumber min={1} max={100} precision={0} style={{ width: '100%' }} />
+                  </Form.Item>
+                </>
+              ) : null}
+            </Space>
+          ) : null}
+        </Form>
+      </Modal>
+
+      <Modal
         title={resumeAuthConfigMode === 'single' ? '补抓 Auth 配置' : '批量补抓 Auth 配置'}
         open={resumeAuthConfigOpen}
         onCancel={() => setResumeAuthConfigOpen(false)}
@@ -10039,9 +10202,9 @@ export default function Accounts() {
                 label="并发数"
                 extra={phoneBindingReusePhoneValue
                   ? '同号连续绑定模式必须串行，避免多个账号抢同一个手机号。'
-                  : '同时处理的账号数；建议 2-3，后端硬上限 5。账号/号码间隔会作为初始启动错峰。'}
+                  : '同时处理的账号数；不设固定上限，实际并发不会超过本次账号数和可用号码数。账号/号码间隔会作为初始启动错峰。'}
               >
-                <InputNumber min={1} max={5} step={1} disabled={Boolean(phoneBindingReusePhoneValue)} style={{ width: '100%' }} />
+                <InputNumber min={1} step={1} precision={0} disabled={Boolean(phoneBindingReusePhoneValue)} style={{ width: '100%' }} />
               </Form.Item>
               <Form.Item
                 name="proxy_mode"

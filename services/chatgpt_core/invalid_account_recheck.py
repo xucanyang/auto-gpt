@@ -60,17 +60,20 @@ PASSWORD_INVALID_MARKERS = (
     "密码不正确",
     "密码错误",
 )
-INVALID_RECHECK_CLEAR_EXTRA_KEYS = (
+AT_ONLY_CLEAR_EXTRA_KEYS = (
     "refresh_token",
     "id_token",
     "session_token",
-    "cookies",
-    "cookie_header",
     "workspace_id",
-    "account_id",
     "organization_id",
     "chatgpt_has_refresh_token_solution",
     "partial_auth",
+)
+INVALID_RECHECK_CLEAR_EXTRA_KEYS = (
+    *AT_ONLY_CLEAR_EXTRA_KEYS,
+    "cookies",
+    "cookie_header",
+    "account_id",
 )
 
 
@@ -490,6 +493,7 @@ def recheck_invalid_chatgpt_account(
     task_id: str = "",
     task_control: Any = None,
     attempt_id: int | None = None,
+    proxy_url: str | None = None,
 ) -> dict[str, Any]:
     action_logs: list[str] = []
 
@@ -624,6 +628,7 @@ def recheck_invalid_chatgpt_account(
                 exported_mailbox_state=exported_mailbox_state,
                 browser_mode=browser_mode,
                 log_fn=_log,
+                proxy_url=proxy_url,
                 task_control=task_control,
                 attempt_id=attempt_id,
                 stop_checker=stop_checker,

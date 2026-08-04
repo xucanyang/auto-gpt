@@ -1,5 +1,6 @@
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,7 +10,13 @@ from sqlmodel import Session, SQLModel, create_engine
 
 from api.tasks import (
     BatchInvalidRecheckTaskRequest,
+    InvalidRecheckTaskRequest,
+    _create_standalone_task_record,
+    _recheck_proxy_settings,
     _resolve_batch_invalid_recheck_accounts,
+    _run_batch_invalid_recheck,
+    _task_store,
+    enqueue_batch_invalid_recheck_task,
 )
 from core import db as core_db
 from core.db import AccountListStateModel, AccountModel
@@ -93,11 +100,13 @@ class InvalidAccountRecheckTests(unittest.TestCase):
                 account_id,
                 retry_delays_seconds=[],
                 task_id="task-recheck",
+                proxy_url="http://recheck-proxy.example:18080",
             )
 
         self.assertTrue(result["ok"])
         self.assertTrue(result["data"]["web_session_complete"])
         self.assertEqual(capture.call_count, 1)
+        self.assertEqual(capture.call_args.kwargs["proxy_url"], "http://recheck-proxy.example:18080")
         followup_auth.assert_not_called()
         schedule_refresh.assert_called_once_with(
             account_id,
@@ -233,6 +242,7 @@ class InvalidAccountRecheckTests(unittest.TestCase):
                 exported_mailbox_state={"provider": "dummy", "email": "invalid@example.com"},
                 browser_mode="protocol",
                 log_fn=lambda _message: None,
+                proxy_url="http://browser-proxy.example:18080",
             )
 
         self.assertEqual(tokens["access_token"], "at-new")
@@ -242,7 +252,130 @@ class InvalidAccountRecheckTests(unittest.TestCase):
         self.assertTrue(kwargs["login_only"])
         self.assertTrue(kwargs["headless"])
         self.assertIsNone(kwargs["phone_callback"])
+        self.assertEqual(kwargs["proxy_url"], "http://browser-proxy.example:18080")
         self.assertEqual(kwargs["otp_callback"](), "123456")
+
+    def test_invalid_recheck_proxy_settings_keep_legacy_direct_and_accept_task_modes(self):
+        self.assertEqual(
+            _recheck_proxy_settings(InvalidRecheckTaskRequest(account_id=1))["proxy_mode"],
+            "direct",
+        )
+        settings = _recheck_proxy_settings(
+            InvalidRecheckTaskRequest(
+                account_id=1,
+                proxy_mode="specified",
+                proxy="http://manual-proxy.example:18080",
+                proxy_failover=True,
+                proxy_country_code="us",
+                proxy_max_candidates=9,
+                proxy_min_score=65,
+            )
+        )
+        self.assertEqual(settings["proxy_mode"], "specified")
+        self.assertEqual(settings["proxy"], "http://manual-proxy.example:18080")
+        self.assertEqual(settings["proxy_country_code"], "US")
+        self.assertTrue(settings["proxy_failover"])
+        self.assertEqual(settings["proxy_max_candidates"], 9)
+
+    def test_batch_invalid_recheck_preserves_requested_concurrency_above_five(self):
+        account_ids = [
+            self._add_account(email=f"parallel-{index}@example.com")
+            for index in range(1, 7)
+        ]
+        created_meta = {}
+
+        class _BackgroundTasks:
+            def __init__(self):
+                self.calls = []
+
+            def add_task(self, *args, **kwargs):
+                self.calls.append((args, kwargs))
+
+        def _fake_create_task(_task_id, *, platform, source, total, meta):
+            created_meta.update(meta)
+
+        background_tasks = _BackgroundTasks()
+        request = BatchInvalidRecheckTaskRequest(
+            account_ids=account_ids,
+            params={"concurrency": 6, "proxy_mode": "direct"},
+        )
+        with (
+            mock.patch("api.tasks._create_standalone_task_record", side_effect=_fake_create_task),
+            mock.patch("api.tasks._save_task_log"),
+        ):
+            response = enqueue_batch_invalid_recheck_task(
+                request,
+                background_tasks=background_tasks,
+            )
+
+        self.assertEqual(response["requested_concurrency"], 6)
+        self.assertEqual(response["effective_concurrency"], 6)
+        self.assertEqual(created_meta["requested_concurrency"], 6)
+        self.assertEqual(created_meta["effective_concurrency"], 6)
+        runner_args = background_tasks.calls[0][0]
+        self.assertEqual(runner_args[3]["concurrency"], 6)
+        self.assertEqual(runner_args[3]["proxy_mode"], "direct")
+
+    def test_batch_invalid_recheck_runner_executes_more_than_five_workers(self):
+        account_ids = [
+            self._add_account(email=f"worker-{index}@example.com")
+            for index in range(1, 7)
+        ]
+        task_id = "task-invalid-recheck-concurrency-above-five"
+        _create_standalone_task_record(
+            task_id,
+            platform="chatgpt",
+            source="batch_invalid_recheck",
+            total=len(account_ids),
+            meta={
+                "emails": [f"worker-{index}@example.com" for index in range(1, 7)],
+                "missing_ids": [],
+                "skipped_items": [],
+                "requested_concurrency": 6,
+                "effective_concurrency": 6,
+            },
+        )
+        barrier = threading.Barrier(6)
+        state_lock = threading.Lock()
+        active = 0
+        peak = 0
+
+        def _fake_execute(*, account_id, **_kwargs):
+            nonlocal active, peak
+            with state_lock:
+                active += 1
+                peak = max(peak, active)
+            try:
+                barrier.wait(timeout=3)
+                return {"ok": True, "data": {"invalid_recheck": {}}}, f"worker-{account_id}@example.com"
+            finally:
+                with state_lock:
+                    active -= 1
+
+        with (
+            mock.patch(
+                "api.tasks._execute_invalid_recheck_with_proxy_candidates",
+                side_effect=_fake_execute,
+            ),
+            mock.patch("api.actions._apply_chatgpt_invalid_recheck_result"),
+            mock.patch("api.tasks._save_task_log"),
+        ):
+            _run_batch_invalid_recheck(
+                task_id,
+                account_ids,
+                {
+                    "requested_concurrency": 6,
+                    "concurrency": 6,
+                    "proxy_mode": "direct",
+                },
+            )
+
+        snapshot = _task_store.snapshot(task_id)
+        self.assertEqual(peak, 6)
+        self.assertEqual(snapshot["status"], "done")
+        self.assertEqual(snapshot["success"], 6)
+        self.assertEqual(snapshot["meta"]["effective_concurrency"], 6)
+        self.assertEqual(len(snapshot["meta"]["results"]), 6)
 
     def test_batch_resolver_only_allows_invalid_accounts(self):
         invalid_id = self._add_account(email="invalid-one@example.com", status="invalid")
