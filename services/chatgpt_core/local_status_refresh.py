@@ -28,7 +28,9 @@ logger = logging.getLogger(__name__)
 
 _LOCAL_STATUS_REFRESH_LOCK = threading.Lock()
 _LOCAL_STATUS_REFRESH_IN_FLIGHT: set[int] = set()
+_LOCAL_STATUS_REFRESH_PENDING: dict[int, dict[str, Any]] = {}
 _SUBSCRIPTION_RETRY_DELAY_SECONDS = 3.0
+_AUTH_MATERIAL_PROBE_MAX_ATTEMPTS = 2
 
 
 def _account_extra(account: Any) -> dict[str, Any]:
@@ -68,6 +70,52 @@ def account_has_local_status_auth_material(account: Any) -> bool:
         or ""
     ).strip()
     return bool(refresh_token or access_token)
+
+
+def _auth_material_revision(account: Any) -> tuple[str, ...]:
+    extra = _account_extra(account)
+    return (
+        str(
+            extra.get("refresh_token")
+            or extra.get("refreshToken")
+            or getattr(account, "refresh_token", "")
+            or ""
+        ).strip(),
+        str(
+            extra.get("access_token")
+            or extra.get("accessToken")
+            or getattr(account, "access_token", "")
+            or ""
+        ).strip(),
+        str(getattr(account, "token", "") or "").strip(),
+        str(
+            extra.get("client_id")
+            or getattr(account, "client_id", "")
+            or "app_EMoamEEZ73f0CkXaXp7hrann"
+        ).strip(),
+        str(getattr(account, "user_id", "") or "").strip(),
+        str(extra.get("workspace_id") or getattr(account, "workspace_id", "") or "").strip(),
+    )
+
+
+def _build_probe_account(account: AccountModel) -> SimpleNamespace:
+    extra = _account_extra(account)
+    return SimpleNamespace(
+        id=account.id,
+        email=account.email,
+        password=account.password,
+        user_id=account.user_id,
+        token=account.token,
+        status=account.status,
+        access_token=str(extra.get("access_token") or account.token or "").strip(),
+        refresh_token=str(extra.get("refresh_token") or "").strip(),
+        id_token=str(extra.get("id_token") or "").strip(),
+        session_token=str(extra.get("session_token") or "").strip(),
+        client_id=str(extra.get("client_id") or "app_EMoamEEZ73f0CkXaXp7hrann").strip(),
+        cookies=str(extra.get("cookies") or "").strip(),
+        workspace_id=str(extra.get("workspace_id") or "").strip(),
+        extra=extra,
+    )
 
 
 def _subscription_retry_reason(probe: dict[str, Any] | None) -> str:
@@ -151,38 +199,31 @@ def sync_chatgpt_account_local_status(
     polling after a paid card/order is observed.
     """
 
-    extra = account.get_extra()
-    if not isinstance(extra, dict):
-        extra = {}
-    probe_account = SimpleNamespace(
-        id=account.id,
-        email=account.email,
-        password=account.password,
-        user_id=account.user_id,
-        token=account.token,
-        status=account.status,
-        access_token=str(extra.get("access_token") or account.token or "").strip(),
-        refresh_token=str(extra.get("refresh_token") or "").strip(),
-        id_token=str(extra.get("id_token") or "").strip(),
-        session_token=str(extra.get("session_token") or "").strip(),
-        client_id=str(extra.get("client_id") or "app_EMoamEEZ73f0CkXaXp7hrann").strip(),
-        cookies=str(extra.get("cookies") or "").strip(),
-        workspace_id=str(extra.get("workspace_id") or "").strip(),
-        extra=extra,
-    )
-    probe = _probe_local_status_with_subscription_retry(
-        probe_account,
-        proxy=proxy,
-        use_default_proxy=use_default_proxy,
-    )
-    try:
-        session.commit()
-    except Exception:
-        session.rollback()
-    try:
+    probe: dict[str, Any] = {}
+    for probe_attempt in range(1, _AUTH_MATERIAL_PROBE_MAX_ATTEMPTS + 1):
+        probe_account = _build_probe_account(account)
+        probed_auth_revision = _auth_material_revision(probe_account)
+        probe = _probe_local_status_with_subscription_retry(
+            probe_account,
+            proxy=proxy,
+            use_default_proxy=use_default_proxy,
+        )
+        try:
+            session.commit()
+        except Exception:
+            session.rollback()
         session.refresh(account)
-    except Exception:
-        pass
+        if probed_auth_revision == _auth_material_revision(account):
+            break
+        logger.info(
+            "ChatGPT local status probe discarded after auth material changed account_id=%s attempt=%s/%s",
+            account.id,
+            probe_attempt,
+            _AUTH_MATERIAL_PROBE_MAX_ATTEMPTS,
+        )
+    else:
+        raise RuntimeError("账号认证材料在本地状态探测期间连续变化，已丢弃过期探测结果")
+
     latest_extra = account.get_extra()
     if not isinstance(latest_extra, dict):
         latest_extra = {}
@@ -224,43 +265,56 @@ def schedule_chatgpt_local_status_refresh_for_account_id(
     if account_id_value <= 0:
         return False
 
+    try:
+        normalized_delay_seconds = max(0.0, float(delay_seconds or 0.0))
+    except (TypeError, ValueError):
+        normalized_delay_seconds = 0.0
+    request = {
+        "proxy": proxy,
+        "use_default_proxy": bool(use_default_proxy),
+        "reason": str(reason or "account_saved"),
+        "delay_seconds": normalized_delay_seconds,
+    }
     with _LOCAL_STATUS_REFRESH_LOCK:
         if account_id_value in _LOCAL_STATUS_REFRESH_IN_FLIGHT:
-            return False
+            _LOCAL_STATUS_REFRESH_PENDING[account_id_value] = request
+            return True
         _LOCAL_STATUS_REFRESH_IN_FLIGHT.add(account_id_value)
 
     def _worker() -> None:
-        try:
-            delay = max(0.0, float(delay_seconds or 0.0))
-            if delay > 0:
-                time.sleep(delay)
-            from core.db import AccountModel, engine
+        current_request: dict[str, Any] | None = request
+        while current_request is not None:
+            try:
+                delay = float(current_request.get("delay_seconds") or 0.0)
+                if delay > 0:
+                    time.sleep(delay)
+                from core.db import AccountModel, engine
 
-            with Session(engine) as session:
-                account = session.get(AccountModel, account_id_value)
-                if account is None:
-                    return
-                if str(getattr(account, "platform", "") or "").strip().lower() != "chatgpt":
-                    return
-                if not account_has_local_status_auth_material(account):
-                    return
-                sync_chatgpt_account_local_status(
-                    session,
-                    account,
-                    proxy=proxy,
-                    use_default_proxy=use_default_proxy,
+                with Session(engine) as session:
+                    account = session.get(AccountModel, account_id_value)
+                    if (
+                        account is not None
+                        and str(getattr(account, "platform", "") or "").strip().lower() == "chatgpt"
+                        and account_has_local_status_auth_material(account)
+                    ):
+                        sync_chatgpt_account_local_status(
+                            session,
+                            account,
+                            proxy=current_request.get("proxy"),
+                            use_default_proxy=bool(current_request.get("use_default_proxy", True)),
+                        )
+            except Exception as exc:
+                logger.warning(
+                    "ChatGPT local status auto-refresh failed account_id=%s reason=%s error=%s",
+                    account_id_value,
+                    current_request.get("reason") or "account_saved",
+                    exc,
+                    exc_info=True,
                 )
-        except Exception as exc:
-            logger.warning(
-                "ChatGPT local status auto-refresh failed account_id=%s reason=%s error=%s",
-                account_id_value,
-                reason,
-                exc,
-                exc_info=True,
-            )
-        finally:
             with _LOCAL_STATUS_REFRESH_LOCK:
-                _LOCAL_STATUS_REFRESH_IN_FLIGHT.discard(account_id_value)
+                current_request = _LOCAL_STATUS_REFRESH_PENDING.pop(account_id_value, None)
+                if current_request is None:
+                    _LOCAL_STATUS_REFRESH_IN_FLIGHT.discard(account_id_value)
 
     try:
         thread = threading.Thread(
@@ -273,6 +327,7 @@ def schedule_chatgpt_local_status_refresh_for_account_id(
     except Exception as exc:
         with _LOCAL_STATUS_REFRESH_LOCK:
             _LOCAL_STATUS_REFRESH_IN_FLIGHT.discard(account_id_value)
+            _LOCAL_STATUS_REFRESH_PENDING.pop(account_id_value, None)
         logger.warning(
             "ChatGPT local status auto-refresh schedule failed account_id=%s reason=%s error=%s",
             account_id_value,

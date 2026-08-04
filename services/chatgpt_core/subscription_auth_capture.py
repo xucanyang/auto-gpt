@@ -215,21 +215,40 @@ def _persist_subscription_auth_result(
         extra["chatgpt_last_auth_capture"] = dict(auth_capture)
         extra["chatgpt_subscription_auth_result"] = dict(auth_capture)
         account.set_extra(extra)
+        previous_local_probe = extra.get("chatgpt_local") if isinstance(extra.get("chatgpt_local"), dict) else None
+        if previous_local_probe:
+            # The probe describes the replaced credentials. Preserve its plan as
+            # historical capability context, but never let an old 401 override a
+            # newly issued Auth/RT pair.
+            extra["chatgpt_capabilities"] = classify_chatgpt_capabilities(
+                account,
+                local_probe=previous_local_probe,
+            )
+            extra.pop("chatgpt_local", None)
+            account.set_extra(extra)
         extra["chatgpt_capabilities"] = classify_chatgpt_capabilities(
             account,
-            local_probe=extra.get("chatgpt_local") if isinstance(extra.get("chatgpt_local"), dict) else None,
+            local_probe={},
         )
         account.set_extra(extra)
         apply_auth_capture_status(account, getattr(primary.status, "value", primary.status))
         account.updated_at = _utcnow()
         session.add(account)
-        session.commit()
+        session.flush()
+        from services.account_filters import upsert_account_list_state_for_account_ids
+
+        upsert_account_list_state_for_account_ids(session, [account.id], commit=True)
         session.refresh(account)
-        schedule_chatgpt_local_status_refresh_for_account_id(account.id, reason="subscription_auth_capture", delay_seconds=2.0)
+        local_status_refresh_scheduled = schedule_chatgpt_local_status_refresh_for_account_id(
+            account.id,
+            reason="subscription_auth_capture",
+            delay_seconds=2.0,
+        )
         return {
             "status": str(account.status or ""),
             "user_id": str(account.user_id or ""),
             "token_saved": bool(account.token),
+            "local_status_refresh_scheduled": bool(local_status_refresh_scheduled),
         }
 
 

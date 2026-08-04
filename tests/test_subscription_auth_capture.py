@@ -136,6 +136,78 @@ class SubscriptionAuthCaptureTests(unittest.TestCase):
         self.assertEqual(extra["workspace_id"], "ws-new")
         self.assertEqual(extra["chatgpt_last_auth_capture"]["source"], "subscription_auth_capture")
 
+    def test_capture_clears_stale_invalid_probe_and_refreshes_list_state(self):
+        account_id = self._add_account(
+            status="invalid",
+            extra_json=json.dumps(
+                {
+                    "access_token": "at-expired",
+                    "refresh_token": "rt-expired",
+                    "chatgpt_local": {
+                        "version": 1,
+                        "checked_at": "2026-08-04T01:00:00+00:00",
+                        "auth": {
+                            "state": "access_token_invalidated",
+                            "http_status": 401,
+                            "error_code": "token_expired",
+                        },
+                        "subscription": {"plan": "plus"},
+                        "codex": {"state": "skipped_auth_invalid"},
+                    },
+                    "chatgpt_capabilities": {
+                        "auth_level": "invalid",
+                        "subscription_plan": "plus",
+                    },
+                    "chatgpt_mailbox_state": {
+                        "provider": "dummy",
+                        "email": "capture@example.com",
+                    },
+                }
+            ),
+        )
+        tokens = {"access_token": "at-new", "refresh_token": "rt-new", "id_token": "id-new"}
+        login_calls, email_patch, engine_patch, config_patch = self._patch_capture_runtime(tokens=tokens)
+
+        with (
+            email_patch,
+            engine_patch,
+            config_patch,
+            mock.patch.object(
+                subscription_auth_capture,
+                "schedule_chatgpt_local_status_refresh_for_account_id",
+                return_value=True,
+            ) as schedule_mock,
+        ):
+            result = subscription_auth_capture.capture_subscription_auth_for_account(
+                account_id,
+                allow_phone_verification=True,
+                retry_delays_seconds=[],
+            )
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(len(login_calls), 1)
+        self.assertTrue(result["data"]["auth_capture"]["local_status_refresh_scheduled"])
+        schedule_mock.assert_called_once_with(
+            account_id,
+            reason="subscription_auth_capture",
+            delay_seconds=2.0,
+        )
+        with Session(self.engine) as session:
+            account = session.get(AccountModel, account_id)
+            list_state = session.get(core_db.AccountListStateModel, account_id)
+            extra = account.get_extra()
+
+        self.assertEqual(account.status, "registered")
+        self.assertEqual(account.token, "at-new")
+        self.assertEqual(extra["refresh_token"], "rt-new")
+        self.assertNotIn("chatgpt_local", extra)
+        self.assertEqual(extra["chatgpt_capabilities"]["auth_level"], "refresh_token")
+        self.assertEqual(extra["chatgpt_capabilities"]["last_known_subscription_plan"], "plus")
+        self.assertIsNotNone(list_state)
+        self.assertEqual(list_state.auth_type, "refresh_token")
+        self.assertEqual(list_state.auth_level, "refresh_token")
+        self.assertEqual(list_state.account_validity, "valid")
+
     def test_add_phone_without_phone_verification_retries_short_path(self):
         account_id = self._add_account(status="pending_payment")
         login_calls, email_patch, engine_patch, config_patch = self._patch_capture_runtime(

@@ -38,6 +38,7 @@
 - **统一测试文档入口**：`README.md`、`AGENTS.md` 与 `docs/docker-image-release.md` 现在统一指向 Docker 测试规范，移除会吞掉收集失败的 `pytest tests -q || true` 作为推荐门禁，明确当前 `requirements-test.txt`、`docker-compose.test.yml` 和测试脚本仍待落地。
 
 ### 修复 (Fixed)
+- **修复手机号绑定拿到 RT 后账号仍显示失效（v2.10.4）**：`services/chatgpt_core/subscription_auth_capture.py` 在 OAuth 成功签发新 AccessToken/refresh_token 后，不再让旧凭证对应的 `chatgpt_local.access_token_invalidated / HTTP 401` 快照继续覆盖新认证事实；旧探测中的订阅计划会保留为 last-known 能力上下文，账号主状态、`chatgpt_capabilities` 与 `account_list_state` 改为同一事务内立即重算。`services/chatgpt_core/local_status_refresh.py` 为长耗时探测增加认证材料 revision 校验，新 RT 在探测期间落库时会丢弃旧 token 的结果并用最新凭证重跑；同账号已有刷新时不再吞掉新请求，而是合并一次尾随刷新。`frontend/src/pages/Accounts.tsx` 在手机号绑定、补抓 Auth、本地状态同步等任务进入终态时同时刷新任务列表与账号查询，避免 React Query 的一分钟缓存继续显示任务前的“失效”状态；侧栏版本同步为 `v2.10.4`。
 - **修复手机号绑定与注册链路首封邮箱 OTP 被误判为旧邮件**：`services/chatgpt_core/oauth_client.py` 与 `utils.py` 为 OAuth `FlowState` 增加真实发码时间锚点，在 `/api/accounts/authorize/continue`、`/api/accounts/password/verify`、`/api/accounts/passwordless/send-otp` 请求发出前记录截止线，并贯穿到邮箱轮询；Playwright Sentinel、页面响应解析和进入 OTP 页的耗时不再把截止线重置为“开始轮询时刻”。成功重发才切换为重发请求起点，重发失败保留原截止线；只有旧调用没有时间锚点时才使用 60 秒兼容回退，并统一预留 5 秒邮件服务器时钟/队列偏差。`services/chatgpt_core/any_auto/register.py` 同步修正新账号显式发码、已有账号自动发码、密码响应直达 OTP 及遗留 Codex 登录分支，避免注册、已有账号登录和 Auth/RT 补抓重现同类问题。
 - **修复 HME 共享转发箱的旧邮件诊断归属错误**：`core/base_mailbox.py` 现在先读取邮件详情并严格校验当前物理别名或 `+tag` 传输头，再应用 `otp_sent_at` 时间过滤；其他并发账号的邮件只记录“未匹配当前 HME 别名”，不会再被错误打印成当前 alias 的“早于截止线”邮件，匹配当前 alias 的真实旧信仍保留可诊断的提前秒数。
 - **手机号绑定 Info 日志显示完整手机号和邮箱**：`services/chatgpt_core/task_logging.py` 与 `api/tasks.py` 将完整身份展示严格限定到 `phone_binding_test` 的 Info 日志，并覆盖串行/并发格式化、SSE 任务存储、任务快照读取和持久化历史；Debug 仍遮蔽手机号与邮箱，OTP、授权码、token、密码、Cookie、代理凭据和 API 密钥继续无条件脱敏。完整手机号会在 OTP 上下文脱敏前被临时保护，避免“发送验证码: +手机号”被误判为授权码而替换。
@@ -123,6 +124,7 @@
 - **修复“最大尝试 9 次实际只跑 3 次”的调度语义**：此前任务层只按“浏览器是否已启动”判断所有失败均占槽，忽略 Helper 已释放租约的早期失败；目标为 3 时，1 成功加 2 失败会提前填满三个身份槽。现在早期失败不计入 `consumed_browser_failure_slots`，调度器会启动第 4 次及后续尝试，直到成功数达标、真正不确定槽满或到达最大尝试上限。
 
 ### 测试 (Tests)
+- 扩展 `tests/test_subscription_auth_capture.py`、`tests/test_chatgpt_local_status_refresh.py` 与 `tests/test_chatgpt_codex_usage.py`，覆盖原账号为 `invalid`、旧本地探测为 `token_expired / HTTP 401` 时补抓新 RT 的完整写回，断言旧探测被废弃、last-known Plus 计划保留、`account_list_state` 立即恢复为 `valid / refresh_token`，并验证探测过程中凭证换代会自动重跑、同账号刷新请求会合并而不丢失；新增前端终态轮询合同测试，锁定任务完成后必须同时刷新账号状态。
 - 扩展 `tests/test_any_auto_web_session_contract.py`、`tests/test_chatgpt_plugin.py`、`tests/test_icloud_hme_mailbox_finalize.py` 和 `tests/test_register_task_controls.py`，覆盖 finalize outcome 返回、失败 metadata 透传、`early_failure` 安全补位及未知失败继续占槽。一次性断网、只读生产依赖容器回归共 `96 passed`。
 
 ## [2.8.54] - 2026-07-26
@@ -3246,4 +3248,8 @@
 
 ## 2026-08-03 20:42:21 +0800
 - ChatGPT HME 恢复 base 加单一平台随机 tag 分配
+- 发布模式: multi
+
+## 2026-08-04 11:27:33 +0800
+- 修复手机绑定获取 RT 后本地状态未恢复
 - 发布模式: multi

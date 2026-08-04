@@ -4005,6 +4005,7 @@ export default function Accounts() {
         } else {
           clearTaskModalStorage()
           void refetchActiveTasks()
+          void refetchAccounts()
         }
       } catch {
         if (cancelled || controller.signal.aborted) return
@@ -4022,7 +4023,7 @@ export default function Accounts() {
         window.clearTimeout(timer)
       }
     }
-  }, [taskId, registerModalOpen, pageVisible, refetchActiveTasks])
+  }, [taskId, registerModalOpen, pageVisible, refetchActiveTasks, refetchAccounts])
 
   useEffect(() => {
     if (typeof window === 'undefined') return

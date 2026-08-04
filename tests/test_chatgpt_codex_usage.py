@@ -1,6 +1,7 @@
 import unittest
 from unittest import mock
 
+from services.chatgpt_core import local_status_refresh
 from services.chatgpt_core.codex_usage import (
     account_has_codex_auth_material,
     build_codex_usage_extra_updates,
@@ -274,6 +275,7 @@ class LocalStatusRefreshScheduleTests(unittest.TestCase):
             from services.chatgpt_core import local_status_refresh
 
             local_status_refresh._LOCAL_STATUS_REFRESH_IN_FLIGHT.clear()
+            local_status_refresh._LOCAL_STATUS_REFRESH_PENDING.clear()
         except Exception:
             pass
 
@@ -283,14 +285,16 @@ class LocalStatusRefreshScheduleTests(unittest.TestCase):
         self.assertTrue(account_has_local_status_auth_material(SavedAccount(access_token="at")))
         self.assertFalse(account_has_local_status_auth_material(SavedAccount()))
 
-    def test_schedule_local_status_refresh_dedupes_in_flight_account(self):
+    def test_schedule_local_status_refresh_coalesces_in_flight_account(self):
         with mock.patch("threading.Thread.start") as start:
             first = schedule_chatgpt_local_status_refresh_for_account_id(123, reason="unit_test", delay_seconds=0)
-            second = schedule_chatgpt_local_status_refresh_for_account_id(123, reason="unit_test", delay_seconds=0)
+            second = schedule_chatgpt_local_status_refresh_for_account_id(123, reason="auth_capture", delay_seconds=2)
 
         self.assertTrue(first)
-        self.assertFalse(second)
+        self.assertTrue(second)
         start.assert_called_once()
+        self.assertEqual(local_status_refresh._LOCAL_STATUS_REFRESH_PENDING[123]["reason"], "auth_capture")
+        self.assertEqual(local_status_refresh._LOCAL_STATUS_REFRESH_PENDING[123]["delay_seconds"], 2.0)
 
 
 if __name__ == "__main__":
