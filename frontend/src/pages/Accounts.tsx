@@ -2598,7 +2598,7 @@ function shouldShowInvalidRecheckButton(record: any) {
   return String(record?.status || '').trim().toLowerCase() === 'invalid'
 }
 
-function taskModalModeFromSource(source: unknown): 'register' | 'resume_auth' | 'payment_link' | 'pix_cleanup' | 'sub2api_upload' | 'oaipay_upload' | 'baxigpt_cdk' | 'paypal_bind' | 'probe_local_status' {
+function taskModalModeFromSource(source: unknown): 'register' | 'resume_auth' | 'invalid_recheck' | 'payment_link' | 'pix_cleanup' | 'sub2api_upload' | 'oaipay_upload' | 'baxigpt_cdk' | 'paypal_bind' | 'probe_local_status' {
   const normalized = String(source || '').trim().toLowerCase()
   if (normalized === 'baxigpt_cdk' || normalized === 'baxigpt_cdk_submit') return 'baxigpt_cdk'
   if (normalized === 'chatgpt_paypal_bind' || normalized === 'paypal_bind') return 'paypal_bind'
@@ -2607,7 +2607,7 @@ function taskModalModeFromSource(source: unknown): 'register' | 'resume_auth' | 
   if (normalized === 'batch_probe_local_status' || normalized === 'probe_local_status') return 'probe_local_status'
   if (normalized === 'batch_sub2api_upload') return 'sub2api_upload'
   if (normalized === 'batch_oaipay_upload') return 'oaipay_upload'
-  if (normalized === 'invalid_recheck' || normalized === 'batch_invalid_recheck') return 'resume_auth'
+  if (normalized === 'invalid_recheck' || normalized === 'batch_invalid_recheck') return 'invalid_recheck'
   if (normalized === 'payment_link' || normalized === 'batch_payment_link') return 'payment_link'
   if (normalized === 'pix_cleanup' || normalized === 'pix_payment_link_cleanup' || normalized === 'upi_payment_link_cleanup' || normalized === 'ideal_payment_link_cleanup' || normalized === 'payment_link_cleanup') return 'pix_cleanup'
   return 'register'
@@ -2666,7 +2666,7 @@ export default function Accounts() {
   const pendingFixedPresetResolutionRef = useRef('')
 
   const [registerModalOpen, setRegisterModalOpen] = useState(false)
-  const [taskModalMode, setTaskModalMode] = useState<'register' | 'resume_auth' | 'payment_link' | 'pix_cleanup' | 'sub2api_upload' | 'oaipay_upload' | 'baxigpt_cdk' | 'paypal_bind' | 'probe_local_status'>('register')
+  const [taskModalMode, setTaskModalMode] = useState<'register' | 'resume_auth' | 'invalid_recheck' | 'payment_link' | 'pix_cleanup' | 'sub2api_upload' | 'oaipay_upload' | 'baxigpt_cdk' | 'paypal_bind' | 'probe_local_status'>('register')
   const [taskModalAccount, setTaskModalAccount] = useState<any>(null)
   const [addModalOpen, setAddModalOpen] = useState(false)
   const [importModalOpen, setImportModalOpen] = useState(false)
@@ -4736,7 +4736,7 @@ export default function Accounts() {
       const taskIdFromResponse = String(res?.task_id || '').trim()
       if (taskIdFromResponse) {
         const snapshot = await apiFetch(`/tasks/${taskIdFromResponse}`)
-        setTaskModalMode('resume_auth')
+        setTaskModalMode('invalid_recheck')
         setTaskModalAccount(record)
         setTaskId(taskIdFromResponse)
         setTaskSnapshot(snapshot)
@@ -4783,7 +4783,7 @@ export default function Accounts() {
       }
 
       const snapshot = await apiFetch(`/tasks/${taskIdFromResponse}`)
-      setTaskModalMode('resume_auth')
+      setTaskModalMode('invalid_recheck')
       setTaskModalAccount(scope === 'selected' ? null : { email: `当前筛选 ${eligible} 个失效账号` })
       setTaskId(taskIdFromResponse)
       setTaskSnapshot(snapshot)

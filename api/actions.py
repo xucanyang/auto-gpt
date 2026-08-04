@@ -459,6 +459,9 @@ def _apply_chatgpt_invalid_recheck_result(acc_model: AccountModel, result: dict[
 
     acc_model.updated_at = datetime.now(timezone.utc)
     session.add(acc_model)
+    from services.account_filters import upsert_account_list_state_for_account_ids
+
+    upsert_account_list_state_for_account_ids(session, [acc_model.id], commit=False)
 
 
 def _execute_chatgpt_resume_subscription_auth_action(

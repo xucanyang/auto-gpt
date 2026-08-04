@@ -64,7 +64,7 @@ function mailProviderLabel(provider: string) {
 type RegisterTaskModalProps = {
   open: boolean
   currentPlatform: string
-  taskModalMode: 'register' | 'resume_auth' | 'payment_link' | 'pix_cleanup' | 'sub2api_upload' | 'oaipay_upload' | 'baxigpt_cdk' | 'paypal_bind' | 'probe_local_status'
+  taskModalMode: 'register' | 'resume_auth' | 'invalid_recheck' | 'payment_link' | 'pix_cleanup' | 'sub2api_upload' | 'oaipay_upload' | 'baxigpt_cdk' | 'paypal_bind' | 'probe_local_status'
   taskModalAccount: any
   taskId: string | null
   taskSnapshot: any
@@ -256,6 +256,15 @@ export function RegisterTaskModal({
     if (taskModalMode === 'payment_link') {
       const eligible = Number(taskSnapshot?.meta?.eligible || 0)
       return eligible > 0 ? `支付链接生成 (${eligible} 个)` : '支付链接生成'
+    }
+    if (taskModalMode === 'invalid_recheck') {
+      const eligible = Number(taskSnapshot?.meta?.eligible || 0)
+      if (taskSource === 'batch_invalid_recheck') {
+        return eligible > 0 ? `批量失效测活 (${eligible} 个)` : '批量失效测活'
+      }
+      return taskModalAccount?.email
+        ? `失效测活 ${taskModalAccount.email}`
+        : '失效测活'
     }
     if (taskModalMode === 'resume_auth') {
       if (isPhoneBindingTest) {

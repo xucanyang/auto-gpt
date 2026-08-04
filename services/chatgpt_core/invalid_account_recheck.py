@@ -22,8 +22,8 @@ from .account_fingerprint import inject_account_browser_fingerprint, persist_acc
 from .local_status_refresh import schedule_chatgpt_local_status_refresh_for_account_id
 from .mailbox_state import mailbox_state_summary, sanitize_mailbox_state
 from .restored_email_service import RestoredEmailService, mailbox_state_from_account
-from .refresh_token_registration_engine import EmailServiceAdapter, RefreshTokenRegistrationEngine
-from .utils import decode_jwt_payload, generate_random_birthday, generate_random_name
+from .refresh_token_registration_engine import EmailServiceAdapter
+from .utils import decode_jwt_payload
 
 
 DEFAULT_INVALID_RECHECK_RETRY_DELAYS_SECONDS = (5, 10)
@@ -60,11 +60,14 @@ PASSWORD_INVALID_MARKERS = (
     "密码不正确",
     "密码错误",
 )
-AT_ONLY_CLEAR_EXTRA_KEYS = (
+INVALID_RECHECK_CLEAR_EXTRA_KEYS = (
     "refresh_token",
     "id_token",
     "session_token",
+    "cookies",
+    "cookie_header",
     "workspace_id",
+    "account_id",
     "organization_id",
     "chatgpt_has_refresh_token_solution",
     "partial_auth",
@@ -103,28 +106,6 @@ def _retry_delays_from_config(config: dict[str, Any], explicit: Sequence[int] | 
         or config.get("chatgpt_resume_auth_retry_delays_seconds")
     )
 
-
-
-
-def _to_bool(value: Any, *, default: bool = False) -> bool:
-    if isinstance(value, bool):
-        return value
-    if value is None:
-        return default
-    text = str(value).strip().lower()
-    if text in {"1", "true", "yes", "on", "y", "是", "开启", "允许", "启用"}:
-        return True
-    if text in {"0", "false", "no", "off", "n", "否", "关闭", "禁止", "禁用"}:
-        return False
-    return default
-
-
-def _config_bool(config: dict[str, Any], key: str, *, default: bool = False) -> bool:
-    if key not in config or config.get(key) in (None, ""):
-        return default
-    return _to_bool(config.get(key), default=default)
-
-
 def _contains_any(text: str, markers: tuple[str, ...]) -> bool:
     lowered = str(text or "").lower()
     return any(marker.lower() in lowered for marker in markers)
@@ -149,7 +130,7 @@ def _classify_recheck_error(error_text: str) -> tuple[str, bool, bool | None]:
 
 def _message_for_status(status: str, raw_error: str = "") -> str:
     if status == "recovered_access_token":
-        return "失效测活成功，已重新保存 access_token"
+        return "失效测活成功，已重新保存完整 ChatGPT Web Session"
     if status == "account_deactivated":
         return "账号已被删除或停用，保持失效状态"
     if status == "password_invalid":
@@ -196,6 +177,8 @@ def _build_recheck_payload(
     recoverable: bool | None = None,
     account_id: str = "",
     has_access_token: bool = False,
+    has_session_token: bool = False,
+    has_cookies: bool = False,
     exported_mailbox_state: dict[str, Any] | None = None,
     allow_add_phone_verification: bool | None = None,
     allow_existing_phone_verification: bool | None = None,
@@ -212,6 +195,9 @@ def _build_recheck_payload(
         "checked_at": _utcnow().isoformat(),
         "account_id": str(account_id or ""),
         "has_access_token": bool(has_access_token),
+        "has_session_token": bool(has_session_token),
+        "has_cookies": bool(has_cookies),
+        "web_session_complete": bool(has_access_token and has_session_token and has_cookies),
     }
     if allow_add_phone_verification is not None:
         payload["allow_add_phone_verification"] = bool(allow_add_phone_verification)
@@ -234,6 +220,8 @@ def _build_revival_marker(
     account_row_id: int = 0,
     has_access_token: bool = False,
     has_refresh_token: bool = False,
+    has_session_token: bool = False,
+    has_cookies: bool = False,
     auth_level: str = "",
 ) -> dict[str, Any]:
     return {
@@ -244,6 +232,9 @@ def _build_revival_marker(
         "account_row_id": int(account_row_id or 0),
         "has_access_token": bool(has_access_token),
         "has_refresh_token": bool(has_refresh_token),
+        "has_session_token": bool(has_session_token),
+        "has_cookies": bool(has_cookies),
+        "web_session_complete": bool(has_access_token and has_session_token and has_cookies),
         "auth_level": str(auth_level or "").strip(),
         "revived_at": _utcnow().isoformat(),
     }
@@ -266,8 +257,6 @@ def _persist_recheck_success(
     *,
     email: str,
     tokens: dict[str, Any],
-    oauth_client: Any,
-    engine_instance: Any,
     attempts: int,
     task_id: str = "",
     exported_mailbox_state: dict[str, Any] | None = None,
@@ -275,17 +264,17 @@ def _persist_recheck_success(
     allow_existing_phone_verification: bool | None = None,
 ) -> dict[str, Any]:
     access_token = str(tokens.get("access_token") or "").strip()
-    refresh_token = str(tokens.get("refresh_token") or "").strip()
-    if not access_token:
-        raise ValueError("OAuth 登录成功但未获取 access_token")
-    token_account_id = _account_id_from_access_token(access_token)
-    if not token_account_id:
-        extract_account_info = getattr(engine_instance, "_extract_account_info", None)
-        if callable(extract_account_info):
-            try:
-                token_account_id = str((extract_account_info(tokens) or {}).get("account_id") or "").strip()
-            except Exception:
-                token_account_id = ""
+    session_token = str(tokens.get("session_token") or "").strip()
+    cookie_header = str(tokens.get("cookie_header") or tokens.get("cookies") or "").strip()
+    if not access_token or not session_token or not cookie_header:
+        raise ValueError(
+            "ChatGPT Web Session 材料不完整: "
+            f"AT状态={'存在' if access_token else '缺失'}｜"
+            f"Session状态={'存在' if session_token else '缺失'}｜"
+            f"Cookie状态={'存在' if cookie_header else '缺失'}"
+        )
+    token_account_id = str(tokens.get("account_id") or "").strip() or _account_id_from_access_token(access_token)
+    workspace_id = str(tokens.get("workspace_id") or token_account_id or "").strip()
 
     with Session(core_db.engine) as session:
         account = session.get(AccountModel, int(account_id or 0))
@@ -293,13 +282,21 @@ def _persist_recheck_success(
             raise ValueError("ChatGPT 账号不存在")
 
         extra = account.get_extra()
-        for key in AT_ONLY_CLEAR_EXTRA_KEYS:
+        for key in INVALID_RECHECK_CLEAR_EXTRA_KEYS:
             extra.pop(key, None)
         extra.pop("chatgpt_local", None)
         extra["access_token"] = access_token
+        extra["session_token"] = session_token
+        extra["cookies"] = cookie_header
+        extra["cookie_header"] = cookie_header
+        if workspace_id:
+            extra["workspace_id"] = workspace_id
+        if token_account_id:
+            extra["account_id"] = token_account_id
         extra["auth_level"] = "access_token_only"
         extra["chatgpt_registration_mode"] = "access_token_only"
         extra["chatgpt_token_source"] = "invalid_account_recheck"
+        extra["chatgpt_has_refresh_token_solution"] = False
         if exported_mailbox_state:
             cleaned_mailbox_state = sanitize_mailbox_state(
                 exported_mailbox_state,
@@ -315,7 +312,9 @@ def _persist_recheck_success(
             task_id=task_id,
             account_row_id=int(account.id or 0),
             has_access_token=True,
-            has_refresh_token=bool(refresh_token),
+            has_refresh_token=False,
+            has_session_token=True,
+            has_cookies=True,
             auth_level="access_token_only",
         )
         recheck_payload = _build_recheck_payload(
@@ -326,6 +325,8 @@ def _persist_recheck_success(
             recoverable=True,
             account_id=token_account_id or str(account.user_id or ""),
             has_access_token=True,
+            has_session_token=True,
+            has_cookies=True,
             exported_mailbox_state=exported_mailbox_state,
             allow_add_phone_verification=allow_add_phone_verification,
             allow_existing_phone_verification=allow_existing_phone_verification,
@@ -336,6 +337,8 @@ def _persist_recheck_success(
         extra = persist_account_browser_fingerprint(extra, source="invalid_account_recheck", overwrite=False)
 
         account.token = access_token
+        if token_account_id:
+            account.user_id = token_account_id
         account.set_extra(extra)
         apply_auth_capture_status(
             account,
@@ -346,6 +349,9 @@ def _persist_recheck_success(
         account.set_extra(extra)
         account.updated_at = _utcnow()
         session.add(account)
+        from services.account_filters import upsert_account_list_state_for_account_ids
+
+        upsert_account_list_state_for_account_ids(session, [account.id], commit=False)
         session.commit()
         session.refresh(account)
         schedule_chatgpt_local_status_refresh_for_account_id(account.id, reason="invalid_account_recheck:recovered", delay_seconds=2.0)
@@ -353,6 +359,7 @@ def _persist_recheck_success(
             "status": str(account.status or ""),
             "user_id": str(account.user_id or ""),
             "token_saved": bool(account.token),
+            "web_session_complete": True,
             "recheck": recheck_payload,
         }
 
@@ -411,21 +418,18 @@ def _persist_recheck_failure(
         }
 
 
-def _capture_access_token_without_refresh_token(
+def _capture_web_session_without_refresh_token(
     *,
     email: str,
     password: str,
     exported_mailbox_state: dict[str, Any],
-    merged_config: dict[str, Any],
     browser_mode: str,
     log_fn: Callable[[str], None],
     proxy_url: str | None = None,
-    login_source: str = "access_token_probe",
     task_control=None,
     attempt_id: int | None = None,
-    allow_add_phone_verification: bool = False,
-    allow_existing_phone_verification: bool = False,
-) -> tuple[dict[str, Any], dict[str, Any], Any]:
+    stop_checker: Callable[[], None] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
     try:
         email_service = RestoredEmailService(
             state=exported_mailbox_state,
@@ -445,126 +449,36 @@ def _capture_access_token_without_refresh_token(
         )
     email_service.create_email()
     email_adapter = EmailServiceAdapter(email_service, email, log_fn)
-    engine_instance = RefreshTokenRegistrationEngine(
-        email_service=email_service,
-        proxy_url=proxy_url or None,
-        callback_logger=lambda msg, level="info", *_: log_fn(str(msg)),
-        browser_mode=browser_mode,
-        extra_config=merged_config,
-    )
-    engine_instance.email = email
-    engine_instance.password = password
-    register_client = engine_instance._build_chatgpt_client()
-    oauth_client = engine_instance._build_oauth_client()
-    first_name, last_name = generate_random_name()
-    birthdate = generate_random_birthday()
+    from .any_auto.transport import run_any_auto_browser_registration
 
-    tokens = oauth_client.login_and_get_tokens(
-        email,
-        password,
-        device_id=getattr(register_client, "device_id", "") or "",
-        user_agent=getattr(register_client, "ua", None),
-        sec_ch_ua=getattr(register_client, "sec_ch_ua", None),
-        impersonate=getattr(register_client, "impersonate", None),
-        browser_fingerprint=getattr(register_client, "fingerprint", None),
-        skymail_client=email_adapter,
-        prefer_passwordless_login=True,
-        allow_phone_verification=bool(
-            allow_add_phone_verification or allow_existing_phone_verification
+    result = run_any_auto_browser_registration(
+        email=email,
+        password=password,
+        proxy_url=proxy_url or None,
+        headless=str(browser_mode or "").strip().lower() != "headed",
+        otp_callback=lambda: email_adapter.wait_for_verification_code(
+            email,
+            timeout=120,
+            phase="invalid_recheck_login_otp",
+            phase_label="失效测活登录验证码",
         ),
-        allow_add_phone_verification=bool(allow_add_phone_verification),
-        allow_existing_phone_verification=bool(allow_existing_phone_verification),
-        force_new_browser=True,
-        force_chatgpt_entry=False,
-        screen_hint="login",
-        force_password_login=bool(password),
-        complete_about_you_if_needed=True,
-        first_name=first_name,
-        last_name=last_name,
-        birthdate=birthdate,
-        login_source=str(login_source or "access_token_probe"),
-        stop_after_login=True,
-        workspace_scope_preference="free",
-        allow_add_phone_session_recovery=False,
+        phone_callback=None,
+        stop_check=stop_checker,
+        login_only=True,
+        log_fn=log_fn,
     )
     exported_state = email_service.export_state()
-    if tokens and str((tokens or {}).get("access_token") or "").strip():
-        return dict(tokens or {}), exported_state, engine_instance
-
-    stop_reason = str(getattr(oauth_client, "last_error", "") or "").strip()
-    if stop_reason and "登录链路已完成" not in stop_reason:
-        raise RuntimeError(stop_reason)
-
-    oauth_session = getattr(oauth_client, "session", None)
-    if oauth_session is not None:
-        register_client.session = oauth_session
-    register_client.last_registration_state = getattr(oauth_client, "last_state", None) or getattr(
-        register_client,
-        "last_registration_state",
-        None,
-    )
-    session_ok, session_result = register_client.reuse_session_and_get_tokens()
-    if not session_ok:
-        raise RuntimeError(
-            str(session_result or oauth_client.last_error or "无 RT 登录成功，但读取 ChatGPT Session 失败")
-        )
-    return dict(session_result or {}), exported_state, engine_instance
-
-
-def _persist_recheck_followup_result(
-    account_id: int,
-    *,
-    followup_ok: bool,
-    followup_saved_account_id: int = 0,
-    followup_payload: dict[str, Any] | None = None,
-    followup_error: str = "",
-) -> dict[str, Any]:
-    with Session(core_db.engine) as session:
-        account = session.get(AccountModel, int(account_id or 0))
-        if account is None or account.platform != "chatgpt":
-            raise ValueError("ChatGPT 账号不存在")
-        extra = account.get_extra()
-        recheck_payload = (
-            dict(extra.get("chatgpt_invalid_recheck"))
-            if isinstance(extra.get("chatgpt_invalid_recheck"), dict)
-            else {}
-        )
-        payload = dict(followup_payload or {})
-        capabilities = classify_chatgpt_capabilities(account, local_probe={})
-        recheck_payload["followup_auth_source"] = "custom_email_recheck"
-        recheck_payload["followup_auth_ok"] = bool(followup_ok)
-        recheck_payload["followup_saved_account_id"] = int(followup_saved_account_id or 0)
-        recheck_payload["followup_status"] = str(payload.get("status") or "").strip()
-        recheck_payload["followup_has_refresh_token"] = bool(payload.get("has_refresh_token"))
-        recheck_payload["followup_has_access_token"] = bool(payload.get("has_access_token"))
-        recheck_payload["final_auth_level"] = str(capabilities.get("auth_level") or "")
-        recheck_payload["final_has_refresh_token"] = bool(capabilities.get("has_refresh_token"))
-        if payload:
-            recheck_payload["followup_result"] = {
-                "status": str(payload.get("status") or "").strip(),
-                "message": str(payload.get("message") or "").strip(),
-                "saved_account_id": int(payload.get("saved_account_id") or 0),
-                "saved": bool(payload.get("saved")),
-                "has_access_token": bool(payload.get("has_access_token")),
-                "has_refresh_token": bool(payload.get("has_refresh_token")),
-            }
-        if followup_error:
-            recheck_payload["followup_error"] = str(followup_error or "").strip()
-        else:
-            recheck_payload.pop("followup_error", None)
-        extra["chatgpt_invalid_recheck"] = recheck_payload
-        account.set_extra(extra)
-        account.updated_at = _utcnow()
-        session.add(account)
-        session.commit()
-        session.refresh(account)
-        if followup_ok:
-            schedule_chatgpt_local_status_refresh_for_account_id(account.id, reason="invalid_account_recheck:followup", delay_seconds=2.0)
-        return {
-            "status": str(account.status or ""),
-            "token_saved": bool(account.token),
-            "recheck": recheck_payload,
-        }
+    if not result.ok:
+        raise RuntimeError(str(result.error_message or "登录完成但 ChatGPT Web Session 材料不完整"))
+    return {
+        "access_token": str(result.access_token or "").strip(),
+        "session_token": str(result.session_token or "").strip(),
+        "cookies": str(result.cookies or result.cookie_header or "").strip(),
+        "cookie_header": str(result.cookie_header or result.cookies or "").strip(),
+        "account_id": str(result.account_id or "").strip(),
+        "workspace_id": str(result.workspace_id or result.account_id or "").strip(),
+        "refresh_token": "",
+    }, exported_state
 
 
 def recheck_invalid_chatgpt_account(
@@ -674,12 +588,7 @@ def recheck_invalid_chatgpt_account(
         merged_config["_manual_phone_otp_enabled"] = True
         merged_config["_manual_phone_otp_timeout_seconds"] = 60
     allow_add_phone_verification = False
-    allow_existing_phone_verification = _config_bool(
-        merged_config,
-        "chatgpt_recheck_allow_existing_phone_verification",
-        default=True,
-    )
-    allow_phone_verification = bool(allow_add_phone_verification or allow_existing_phone_verification)
+    allow_existing_phone_verification = False
     browser_mode = str(
         extra.get("browser_mode")
         or merged_config.get("browser_mode")
@@ -693,47 +602,44 @@ def recheck_invalid_chatgpt_account(
     _timeline_log(log_fn, f"[失效测活][{email}] 开始：仅处理 status=invalid")
     _log(
         "[失效测活] 手机验证策略："
-        f"add_phone新绑={'允许' if allow_add_phone_verification else '不允许'}，"
-        f"已绑手机号二次验证={'允许' if allow_existing_phone_verification else '不允许'}"
+        "不执行 add_phone 新绑，不进入手机号补抓流程"
     )
     last_error = ""
     last_error_code = "unknown_error"
     retryable = False
     recoverable: bool | None = None
     attempts_executed = 0
-    stage1_result: dict[str, Any] | None = None
+    success_result: dict[str, Any] | None = None
 
     for attempt in range(1, max_attempts + 1):
         attempts_executed = attempt
         _check_stop()
         if attempt > 1:
-            _log(f"[失效测活] 开始第 {attempt}/{max_attempts} 次无 RT 登录测活")
+            _log(f"[失效测活] 开始第 {attempt}/{max_attempts} 次 Web Session 登录测活")
         try:
-            _timeline_log(log_fn, "[失效测活] 阶段 1/2：无 RT 登录测活并抓取 AccessToken")
-            session_tokens, exported_mailbox_state, engine_instance = _capture_access_token_without_refresh_token(
+            _timeline_log(log_fn, "[失效测活] 登录已有账号并抓取完整 ChatGPT Web Session")
+            session_tokens, exported_mailbox_state = _capture_web_session_without_refresh_token(
                 email=email,
                 password=password,
                 exported_mailbox_state=exported_mailbox_state,
-                merged_config=merged_config,
                 browser_mode=browser_mode,
                 log_fn=_log,
                 task_control=task_control,
                 attempt_id=attempt_id,
+                stop_checker=stop_checker,
             )
             persist_result = _persist_recheck_success(
                 account_id,
                 email=email,
                 tokens=session_tokens,
-                oauth_client=None,
-                engine_instance=engine_instance,
                 attempts=attempt,
                 task_id=task_id,
                 exported_mailbox_state=exported_mailbox_state,
                 allow_add_phone_verification=allow_add_phone_verification,
                 allow_existing_phone_verification=allow_existing_phone_verification,
             )
-            _timeline_log(log_fn, "[失效测活] 阶段 1/2 成功：AccessToken 已保存，状态已复活")
-            stage1_result = persist_result
+            _timeline_log(log_fn, "[失效测活] 结果：Web Session 已写回原账号，状态已复活并调度本地刷新")
+            success_result = persist_result
             break
         except TaskInterruption:
             raise
@@ -747,79 +653,15 @@ def recheck_invalid_chatgpt_account(
                 _log(f"[失效测活] {last_error_code}，{delay_seconds}s 后重试")
                 time.sleep(delay_seconds)
 
-    if stage1_result is not None:
-        from services.chatgpt_core.custom_email_recheck import recheck_custom_chatgpt_email
-
-        followup_payload: dict[str, Any] = {}
-        followup_error = ""
-        followup_saved_account_id = int(account_id or 0)
-        followup_full_auth_ok = False
-
-        _timeline_log(log_fn, "[失效测活] 阶段 2/2：补抓完整 Auth/RT")
-        try:
-            followup_result = recheck_custom_chatgpt_email(
-                email=email,
-                password=password,
-                save_on_success=True,
-                task_id=task_id,
-                log_fn=_log,
-                stop_checker=stop_checker,
-                task_control=task_control,
-                attempt_id=attempt_id,
-                preferred_account_id=account_id,
-                skip_access_token_probe=True,
-            )
-            followup_data = followup_result.get("data") if isinstance(followup_result.get("data"), dict) else {}
-            followup_payload = (
-                dict(followup_data.get("custom_email_recheck"))
-                if isinstance(followup_data.get("custom_email_recheck"), dict)
-                else {}
-            )
-            followup_saved_account_id = int(
-                followup_data.get("saved_account_id")
-                or followup_payload.get("saved_account_id")
-                or account_id
-                or 0
-            )
-            followup_error = sanitize_error_message(
-                followup_result.get("error")
-                or followup_data.get("message")
-                or followup_payload.get("message")
-                or ""
-            ).strip()
-            followup_full_auth_ok = bool(followup_result.get("ok")) and bool(followup_payload.get("has_refresh_token"))
-            if followup_full_auth_ok:
-                _timeline_log(log_fn, "[失效测活] 结果：复活成功，已补全完整 Auth/RT")
-            else:
-                if bool(followup_result.get("ok")):
-                    followup_error = followup_error or "第二阶段完成登录探测，但未获取 refresh_token"
-                _timeline_log(log_fn, f"[失效测活] 阶段 2/2 失败：{followup_error or '未获取 refresh_token'}；保留第一阶段复活结果")
-        except TaskInterruption:
-            raise
-        except Exception as exc:
-            followup_error = sanitize_error_message(exc or "第二阶段补抓 Auth 异常")
-            _timeline_log(log_fn, f"[失效测活] 阶段 2/2 异常：{followup_error}；保留第一阶段已保存的 access_token")
-
-        final_persist = _persist_recheck_followup_result(
-            account_id,
-            followup_ok=followup_full_auth_ok,
-            followup_saved_account_id=followup_saved_account_id,
-            followup_payload=followup_payload,
-            followup_error=followup_error,
-        )
-        if followup_full_auth_ok:
-            message = "失效测活成功，已复活原账号并补全完整 Auth"
-        else:
-            message = "失效测活成功，已保存 access_token；完整 Auth 未补全"
-            _timeline_log(log_fn, "[失效测活] 结果：复活成功，auth=access_token_only，待补抓 Auth")
+    if success_result is not None:
         return {
             "ok": True,
             "data": {
-                "message": message,
-                "status": final_persist.get("status"),
-                "token_saved": bool(final_persist.get("token_saved")),
-                "followup_auth_ok": bool(followup_full_auth_ok),
-                "invalid_recheck": final_persist.get("recheck") or {},
+                "message": "失效测活成功，已刷新原账号 Web Session 与本地状态",
+                "status": success_result.get("status"),
+                "token_saved": bool(success_result.get("token_saved")),
+                "web_session_complete": bool(success_result.get("web_session_complete")),
+                "invalid_recheck": success_result.get("recheck") or {},
                 "logs": list(action_logs),
             },
             "error": "",

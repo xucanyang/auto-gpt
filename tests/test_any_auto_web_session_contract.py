@@ -28,6 +28,29 @@ else:
 
 class AnyAutoWebSessionContractTests(unittest.TestCase):
     @unittest.skipUnless(_CAMOUFOX_AVAILABLE, "camoufox is only installed in the runtime image")
+    def test_browser_transport_forwards_login_only_to_worker(self):
+        raw_result = {
+            "success": True,
+            "access_token": "at-demo",
+            "session_token": "session-demo",
+            "cookies": "__Secure-next-auth.session-token=session-demo",
+            "cookie_header": "__Secure-next-auth.session-token=session-demo",
+        }
+        with mock.patch.object(browser_register, "ChatGPTBrowserRegister") as worker_class:
+            worker_class.return_value.run.return_value = raw_result
+            result = transport.run_any_auto_browser_registration(
+                email="user@example.com",
+                password="Password123!",
+                proxy_url=None,
+                headless=True,
+                otp_callback=lambda: "123456",
+                login_only=True,
+            )
+
+        self.assertTrue(result.ok)
+        self.assertTrue(worker_class.call_args.kwargs["login_only"])
+
+    @unittest.skipUnless(_CAMOUFOX_AVAILABLE, "camoufox is only installed in the runtime image")
     def test_session_fetch_uses_absolute_chatgpt_endpoint(self):
         page = mock.Mock()
         with mock.patch.object(
@@ -161,6 +184,85 @@ class AnyAutoWebSessionContractTests(unittest.TestCase):
         authorize_fallback.assert_not_called()
 
     @unittest.skipUnless(_CAMOUFOX_AVAILABLE, "camoufox is only installed in the runtime image")
+    def test_login_only_flow_rejects_registration_only_states(self):
+        for page_type, current_url in (
+            ("create_account_password", "https://auth.openai.com/create-account/password"),
+            ("about_you", "https://auth.openai.com/about-you"),
+        ):
+            with self.subTest(page_type=page_type):
+                page = mock.Mock()
+                page.url = current_url
+                page.evaluate.return_value = "Mozilla/5.0 Camoufox"
+                page.context.cookies.return_value = []
+                with (
+                    mock.patch.object(browser_register, "_seed_browser_device_id"),
+                    mock.patch.object(
+                        browser_register,
+                        "_start_browser_signup_via_authorize",
+                        return_value={"page_type": page_type, "current_url": current_url},
+                    ) as login_entry,
+                    mock.patch.object(browser_register, "_start_browser_signup_via_page") as signup_entry,
+                    mock.patch.object(browser_register, "_submit_password_via_page") as submit_password,
+                    mock.patch.object(browser_register, "_submit_about_you_via_page") as submit_about_you,
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "失效测活拒绝进入"):
+                        browser_register._browser_registration_flow(
+                            page,
+                            "user@example.com",
+                            "Password123!",
+                            lambda: "123456",
+                            None,
+                            lambda _message: None,
+                            login_only=True,
+                        )
+
+                login_entry.assert_called_once_with(
+                    page,
+                    "user@example.com",
+                    mock.ANY,
+                    mock.ANY,
+                    screen_hint="login",
+                )
+                signup_entry.assert_not_called()
+                submit_password.assert_not_called()
+                submit_about_you.assert_not_called()
+
+    @unittest.skipUnless(_CAMOUFOX_AVAILABLE, "camoufox is only installed in the runtime image")
+    def test_login_only_add_phone_never_invokes_phone_binding(self):
+        page = mock.Mock()
+        page.url = "https://auth.openai.com/add-phone"
+        page.evaluate.return_value = "Mozilla/5.0 Camoufox"
+        page.context.cookies.return_value = []
+        phone_callback = mock.Mock(return_value="+12025550123")
+        add_phone_state = {
+            "page_type": "add_phone",
+            "current_url": page.url,
+        }
+
+        with (
+            mock.patch.object(browser_register, "_seed_browser_device_id"),
+            mock.patch.object(
+                browser_register,
+                "_start_browser_signup_via_authorize",
+                return_value=add_phone_state,
+            ),
+            mock.patch.object(browser_register, "_handle_add_phone_challenge") as bind_phone,
+        ):
+            result = browser_register._browser_registration_flow(
+                page,
+                "user@example.com",
+                "Password123!",
+                lambda: "123456",
+                phone_callback,
+                lambda _message: None,
+                login_only=True,
+            )
+
+        self.assertEqual(result, add_phone_state)
+        phone_callback.assert_not_called()
+        bind_phone.assert_not_called()
+
+    @unittest.skipUnless(_CAMOUFOX_AVAILABLE, "camoufox is only installed in the runtime image")
     def test_browser_transport_reuses_context_cookies_and_skips_codex_oauth(self):
         page = mock.Mock()
         page.url = "https://auth.openai.com/oauth/callback"
@@ -228,6 +330,7 @@ class AnyAutoWebSessionContractTests(unittest.TestCase):
                 profile_name="Fixed Profile",
                 profile_birthdate="1990-01-02",
                 stop_check=stop_check,
+                login_only=True,
                 log_fn=lambda _message: None,
             )
             result = worker.run("user@example.com", "Password123!")
@@ -240,6 +343,7 @@ class AnyAutoWebSessionContractTests(unittest.TestCase):
         self.assertEqual(signup_kwargs["profile_name"], "Fixed Profile")
         self.assertEqual(signup_kwargs["profile_birthdate"], "1990-01-02")
         self.assertIs(signup_kwargs["stop_check"], stop_check)
+        self.assertTrue(signup_kwargs["login_only"])
         self.assertIs(wait_session.call_args.kwargs["stop_check"], stop_check)
         self.assertEqual(normalize_session.call_args.args[1], final_cookies)
         self.assertEqual(

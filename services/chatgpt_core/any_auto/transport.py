@@ -295,6 +295,7 @@ def run_any_auto_browser_registration(
     profile_name: str = "",
     profile_birthdate: str = "",
     stop_check: Optional[Callable[[], None]] = None,
+    login_only: bool = False,
 ) -> AnyAutoRegistrationResult:
     """headless/headed executor: any-auto ChatGPTBrowserRegister."""
     from .browser_register import ChatGPTBrowserRegister
@@ -308,6 +309,7 @@ def run_any_auto_browser_registration(
         profile_name=profile_name,
         profile_birthdate=profile_birthdate,
         stop_check=stop_check,
+        login_only=login_only,
         log_fn=log_fn,
     )
     try:

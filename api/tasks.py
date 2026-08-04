@@ -8664,9 +8664,9 @@ def _run_invalid_recheck(task_id: str, account_id: int):
             phase="prepare",
             phase_label="准备测活",
             stage_index=1,
-            stage_total=2,
+            stage_total=1,
             message="开始：仅处理 status=invalid",
-            next_step="无 RT 登录测活并抓取 AccessToken",
+            next_step="登录已有账号并抓取完整 ChatGPT Web Session",
             reset_started_at=True,
         )
         attempt_id = _claim_next_task_attempt(control)
@@ -8681,12 +8681,12 @@ def _run_invalid_recheck(task_id: str, account_id: int):
                     task="失效测活",
                     email=email,
                     account_id=account_id,
-                    phase="stage1_login_probe",
-                    phase_label="无 RT 登录测活并抓取 AccessToken",
+                    phase="web_session_liveness",
+                    phase_label="登录测活并刷新 Web Session",
                     stage_index=1,
-                    stage_total=2,
-                    message="开始执行第一阶段登录测活",
-                    next_step="等待 OAuth 邮箱验证码",
+                    stage_total=1,
+                    message="开始登录已有账号并读取 Web Session",
+                    next_step="需要时等待登录邮箱验证码",
                     reset_started_at=True,
                 )
                 result = _execute_chatgpt_invalid_recheck(
@@ -8709,7 +8709,6 @@ def _run_invalid_recheck(task_id: str, account_id: int):
             control.finish_attempt(attempt_id)
 
         _task_store.set_progress(task_id, "1/1")
-        result_data = result.get("data") if isinstance(result.get("data"), dict) else {}
         _task_timeline_log(
             task_id,
             task="失效测活",
@@ -8717,13 +8716,9 @@ def _run_invalid_recheck(task_id: str, account_id: int):
             account_id=account_id,
             phase="done",
             phase_label="失效测活结果",
-            stage_index=2,
-            stage_total=2,
-            message=(
-                "结果：复活成功，已补全完整 Auth/RT"
-                if bool(result_data.get("followup_auth_ok"))
-                else "结果：复活成功，auth=access_token_only，待补抓 Auth"
-            ),
+            stage_index=1,
+            stage_total=1,
+            message="结果：完整 Web Session 已写回原账号，本地状态刷新已调度",
             next_step="任务完成",
             reset_started_at=True,
         )
@@ -8750,8 +8745,8 @@ def _run_invalid_recheck(task_id: str, account_id: int):
             account_id=account_id,
             phase="skipped",
             phase_label="已跳过",
-            stage_index=2,
-            stage_total=2,
+            stage_index=1,
+            stage_total=1,
             message=str(exc),
             next_step="任务停止",
             reset_started_at=True,
@@ -8781,8 +8776,8 @@ def _run_invalid_recheck(task_id: str, account_id: int):
             account_id=account_id,
             phase="stopped",
             phase_label="已停止",
-            stage_index=2,
-            stage_total=2,
+            stage_index=1,
+            stage_total=1,
             message=str(exc),
             next_step="任务停止",
             reset_started_at=True,
@@ -8813,8 +8808,8 @@ def _run_invalid_recheck(task_id: str, account_id: int):
             account_id=account_id,
             phase="failed",
             phase_label="失效测活失败",
-            stage_index=2,
-            stage_total=2,
+            stage_index=1,
+            stage_total=1,
             message=error_text,
             next_step="查看 Debug 详情",
             reset_started_at=True,
@@ -16992,7 +16987,7 @@ def _run_batch_invalid_recheck(task_id: str, account_ids: list[int]):
                         raise ValueError(str(result.get("error") or data.get("message") or "失效测活失败"))
                     session.commit()
                 success_count += 1
-                _log(task_id, f"[OK] 失效测活恢复成功: {email or account_id}")
+                _log(task_id, f"[OK] 失效测活恢复成功，Web Session 已刷新: {email or account_id}")
             except SkipCurrentAttemptRequested as exc:
                 skipped_count += 1
                 _log(task_id, f"[SKIP] 已跳过失效测活: {email or account_id} - {exc}")

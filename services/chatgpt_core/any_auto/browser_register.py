@@ -1120,8 +1120,16 @@ def _start_browser_signup_via_page(page, email: str, log) -> dict:
     )
 
 
-def _start_browser_signup_via_authorize(page, email: str, device_id: str, log) -> dict:
-    log("访问 ChatGPT 首页...")
+def _start_browser_signup_via_authorize(
+    page,
+    email: str,
+    device_id: str,
+    log,
+    *,
+    screen_hint: str = "login_or_signup",
+) -> dict:
+    login_only = str(screen_hint or "").strip().lower() == "login"
+    log("访问 ChatGPT 登录入口..." if login_only else "访问 ChatGPT 首页...")
     try:
         page.goto(f"{CHATGPT_APP}/", wait_until="commit", timeout=30000)
     except Exception as exc:
@@ -1157,6 +1165,7 @@ def _start_browser_signup_via_authorize(page, email: str, device_id: str, log) -
         email,
         device_id,
         csrf_token,
+        screen_hint="login" if login_only else "login_or_signup",
         log=log,
     )
     if not authorize_url:
@@ -3988,6 +3997,7 @@ def _browser_registration_flow(
     profile_name: str = "",
     profile_birthdate: str = "",
     stop_check: Callable[[], None] | None = None,
+    login_only: bool = False,
 ) -> dict:
     device_id = str(uuid.uuid4())
     try:
@@ -3996,18 +4006,31 @@ def _browser_registration_flow(
         user_agent = _random_chrome_ua()
 
     _seed_browser_device_id(page, device_id)
-    try:
-        state = _start_browser_signup_via_page(page, email, log)
-    except _BrowserSignupEntryUnavailable as exc:
-        log(f"页面驱动注册入口失败，回退 ChatGPT authorize 入口: {exc}")
-        state = _start_browser_signup_via_authorize(page, email, device_id, log)
+    if login_only:
+        state = _start_browser_signup_via_authorize(
+            page,
+            email,
+            device_id,
+            log,
+            screen_hint="login",
+        )
+    else:
+        try:
+            state = _start_browser_signup_via_page(page, email, log)
+        except _BrowserSignupEntryUnavailable as exc:
+            log(f"页面驱动注册入口失败，回退 ChatGPT authorize 入口: {exc}")
+            state = _start_browser_signup_via_authorize(page, email, device_id, log)
     auth_cookies = _get_cookies(page)
     log(
         "授权态 cookies: "
         f"login_session={'yes' if auth_cookies.get('login_session') else 'no'}, "
         f"oai-did={'yes' if auth_cookies.get('oai-did') else 'no'}"
     )
-    log(f"注册状态起点: page={state.get('page_type') or '-'} url={(state.get('current_url') or '')[:100]}")
+    flow_label = "登录测活" if login_only else "注册"
+    log(
+        f"{flow_label}状态起点: page={state.get('page_type') or '-'} "
+        f"url={(state.get('current_url') or '')[:100]}"
+    )
     register_submitted = False
     seen_states: dict[str, int] = {}
 
@@ -4024,14 +4047,15 @@ def _browser_registration_flow(
         )
         seen_states[signature] = seen_states.get(signature, 0) + 1
         log(
-            f"注册状态推进: step={step+1} page={state.get('page_type') or '-'} "
+            f"{flow_label}状态推进: step={step+1} page={state.get('page_type') or '-'} "
             f"next={str(state.get('continue_url') or '')[:60]} seen={seen_states[signature]}"
         )
         if seen_states[signature] > 2:
-            raise RuntimeError(f"注册状态卡住: page={state.get('page_type') or '-'}")
+            raise RuntimeError(f"{flow_label}状态卡住: page={state.get('page_type') or '-'}")
 
         if _is_registration_complete(state):
-            _handle_post_signup_onboarding(page, log)
+            if not login_only:
+                _handle_post_signup_onboarding(page, log)
             completed_state = dict(state or {})
             completed_state["page_url"] = str(page.url or "")
             completed_state["current_url"] = str(page.url or "") or str(
@@ -4040,6 +4064,8 @@ def _browser_registration_flow(
             return completed_state
 
         if _is_password_registration(state):
+            if login_only:
+                raise RuntimeError("失效测活拒绝进入新账号注册密码阶段")
             if register_submitted:
                 raise RuntimeError("重复进入密码注册阶段")
             log("提交注册密码...")
@@ -4063,10 +4089,14 @@ def _browser_registration_flow(
             continue
 
         if str(state.get("page_type") or "") == "login_password":
-            if _recover_signup_password_page(page, log):
+            if not login_only and _recover_signup_password_page(page, log):
                 state = _derive_registration_state_from_page(page)
                 continue
-            log("注册流程落到已有账号登录密码页，按登录流程继续认证...")
+            log(
+                "提交已有账号登录密码..."
+                if login_only
+                else "注册流程落到已有账号登录密码页，按登录流程继续认证..."
+            )
             login_resp = _submit_oauth_password_direct(page, password, log)
             log(f"登录密码页提交状态: {login_resp.get('status', 0)}")
             if not login_resp.get("ok"):
@@ -4078,8 +4108,8 @@ def _browser_registration_flow(
 
         if _is_email_otp(state):
             if not otp_callback:
-                raise RuntimeError("ChatGPT 注册需要邮箱验证码但未提供 otp_callback")
-            log("等待 ChatGPT 验证码")
+                raise RuntimeError(f"ChatGPT {flow_label}需要邮箱验证码但未提供 otp_callback")
+            log(f"等待 ChatGPT {flow_label}验证码")
             code = otp_callback()
             if not code:
                 raise RuntimeError("未获取到验证码")
@@ -4097,6 +4127,8 @@ def _browser_registration_flow(
             continue
 
         if _is_about_you(state):
+            if login_only:
+                raise RuntimeError("失效测活拒绝进入新账号 about_you 阶段")
             log("提交 about_you 信息...")
             target_url = _normalize_url(
                 str(state.get("current_url") or state.get("continue_url") or f"{OPENAI_AUTH}/about-you"),
@@ -4135,6 +4167,9 @@ def _browser_registration_flow(
             continue
 
         if _is_add_phone(state):
+            if login_only:
+                log("已有账号登录进入 add_phone；跳过手机号绑定，直接尝试捕获 Web Session")
+                return state
             if not phone_callback:
                 return state
             log("注册流程进入 add_phone，尝试短信验证...")
@@ -4149,7 +4184,10 @@ def _browser_registration_flow(
             continue
 
         if _requires_registration_navigation(state):
-            target_url = _normalize_url(str(state.get("continue_url") or state.get("current_url") or ""), OPENAI_AUTH)
+            target_url = _normalize_url(
+                str(state.get("continue_url") or state.get("current_url") or ""),
+                OPENAI_AUTH,
+            )
             if not target_url:
                 raise RuntimeError("缺少可跟随的 continue_url")
             page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
@@ -4158,7 +4196,7 @@ def _browser_registration_flow(
 
         raise RuntimeError(f"未支持的注册状态: page={state.get('page_type') or '-'}")
 
-    raise RuntimeError("注册状态机超出最大步数")
+    raise RuntimeError(f"{flow_label}状态机超出最大步数")
 
 
 class ChatGPTBrowserRegister:
@@ -4172,6 +4210,7 @@ class ChatGPTBrowserRegister:
         profile_name: str = "",
         profile_birthdate: str = "",
         stop_check: Optional[Callable[[], None]] = None,
+        login_only: bool = False,
         log_fn: Callable[[str], None] = print,
     ):
         self.headless = headless
@@ -4181,12 +4220,13 @@ class ChatGPTBrowserRegister:
         self.profile_name = str(profile_name or "").strip()
         self.profile_birthdate = str(profile_birthdate or "").strip()
         self.stop_check = stop_check
+        self.login_only = bool(login_only)
         self.log = log_fn
 
     def run(self, email: str, password: str) -> dict:
-        """Complete GPT signup and capture the ChatGPT Web session in one context.
+        """Complete signup or existing-account login and capture one Web Session.
 
-        The browser transport owns only the OpenAI signup and the subsequent
+        The browser transport owns only the OpenAI auth flow and the subsequent
         ``chatgpt.com/api/auth/session`` capture. Refresh-token/Codex OAuth is a
         separate mode-owned stage and must not run here.
         """
@@ -4315,7 +4355,11 @@ class ChatGPTBrowserRegister:
             page.on("request", _on_request)
             page.on("response", _on_response)
             page.on("requestfailed", _on_request_failed)
-            self.log("[注册] 浏览器上下文已启动")
+            self.log(
+                "[失效测活] 登录浏览器上下文已启动"
+                if self.login_only
+                else "[注册] 浏览器上下文已启动"
+            )
             final_state = _browser_registration_flow(
                 page,
                 email,
@@ -4326,12 +4370,15 @@ class ChatGPTBrowserRegister:
                 profile_name=self.profile_name,
                 profile_birthdate=self.profile_birthdate,
                 stop_check=self.stop_check,
+                login_only=self.login_only,
             )
-            self.log(f"注册流程完成: page={final_state.get('page_type') or '-'}")
+            self.log(
+                f"{'登录测活' if self.login_only else '注册'}流程完成: "
+                f"page={final_state.get('page_type') or '-'}"
+            )
 
-            # The signup callback may still be on platform.openai.com. Reuse
-            # the project-owned bridge to establish ChatGPT next-auth, then
-            # read the absolute /api/auth/session endpoint in this context.
+            # The OpenAI auth callback may still be on platform.openai.com.
+            # Reuse the project-owned bridge to establish ChatGPT next-auth.
             from services.chatgpt_core.browser_registration import (
                 _normalize_browser_web_session,
                 _wait_for_web_session,
@@ -4400,10 +4447,14 @@ class ChatGPTBrowserRegister:
                 "cookies": cookie_items,
                 "cookie_header": cookie_header,
                 "metadata": {
-                    "registration_stage_complete": True,
+                    "registration_stage_complete": not self.login_only,
                     "registration_session_capture": "chatgpt_api_auth_session",
                     "registration_page_type": str(final_state.get("page_type") or ""),
                     "registration_page_url": str(page.url or ""),
+                    "login_only": self.login_only,
+                    "web_session_capture_mode": (
+                        "existing_account_login" if self.login_only else "signup"
+                    ),
                 },
                 "source": "any_auto_browser_web_session",
             }
