@@ -541,6 +541,48 @@ def resolve_default_chatgpt_proxy_with_metadata(
     explicit_proxy = normalize_proxy_url(proxy_url)
     if explicit_proxy:
         return explicit_proxy, None, "explicit"
+
+    # This API returns one proxy. In dynamic mode, resolving the ordinary
+    # failover list would eagerly create and health-check every configured SID
+    # only to discard all but the first. Resolve one candidate at a time and
+    # spend the remaining budget only when candidate preparation itself fails.
+    if _global_task_proxy_mode("dynamic") == "dynamic":
+        failover = _truthy(
+            _configured_value("task_proxy_failover", "false"),
+            default=False,
+        )
+        attempt_budget = (
+            _positive_int(
+                _configured_value("dynamic_proxy_max_attempts", "5"),
+                default=5,
+                minimum=1,
+                maximum=100,
+            )
+            if failover
+            else 1
+        )
+        last_error: Exception | None = None
+        for _ in range(attempt_budget):
+            try:
+                candidates = resolve_task_proxy_candidates(
+                    {
+                        "proxy_mode": "dynamic",
+                        "proxy_failover": False,
+                        "dynamic_proxy_max_attempts": 1,
+                    },
+                    fallback_proxy=None,
+                    default_mode="global",
+                    target="chatgpt",
+                )
+            except Exception as exc:
+                last_error = exc
+                continue
+            if candidates:
+                return candidates[0]
+        if last_error is not None:
+            raise last_error
+        return "", None, "direct"
+
     candidates = resolve_task_proxy_candidates(
         {},
         fallback_proxy=None,

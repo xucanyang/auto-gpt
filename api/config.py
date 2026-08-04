@@ -1,5 +1,6 @@
 import os
 import math
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -348,7 +349,7 @@ def _normalize_local_status_probe_update(safe: dict[str, Any], current: dict[str
 
     if "chatgpt_local_status_probe_unique_exit_ip_enabled" in safe:
         safe["chatgpt_local_status_probe_unique_exit_ip_enabled"] = (
-            "true" if _config_bool(safe["chatgpt_local_status_probe_unique_exit_ip_enabled"], default=True) else "false"
+            "true" if _config_bool(safe["chatgpt_local_status_probe_unique_exit_ip_enabled"], default=False) else "false"
         )
 
     for key, label in (
@@ -375,7 +376,7 @@ def _normalize_local_status_probe_update(safe: dict[str, Any], current: dict[str
     mode = str(merged.get("task_proxy_mode") or "dynamic").strip().lower()
     unique_exit_ip = _config_bool(
         merged.get("chatgpt_local_status_probe_unique_exit_ip_enabled"),
-        default=True,
+        default=False,
     )
     failover = _config_bool(merged.get("task_proxy_failover"), default=False)
     if unique_exit_ip and mode in {"direct", "none", "no_proxy", "直连"}:
@@ -728,7 +729,7 @@ def _build_config_response(*, local_only: bool = False) -> dict[str, Any]:
     if not all_cfg.get("chatgpt_local_status_probe_concurrency"):
         all_cfg["chatgpt_local_status_probe_concurrency"] = "1"
     if not all_cfg.get("chatgpt_local_status_probe_unique_exit_ip_enabled"):
-        all_cfg["chatgpt_local_status_probe_unique_exit_ip_enabled"] = "true"
+        all_cfg["chatgpt_local_status_probe_unique_exit_ip_enabled"] = "false"
     if not all_cfg.get("chatgpt_local_status_probe_delay_seconds"):
         all_cfg["chatgpt_local_status_probe_delay_seconds"] = "0"
     if not all_cfg.get("chatgpt_local_status_probe_delay_max_seconds"):
@@ -1107,10 +1108,25 @@ def update_config(body: ConfigUpdate):
             )
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
-    try:
-        config_store.set_many(safe, base_revision=body.base_revision)
-    except SharedConfigConflict as exc:
-        raise HTTPException(409, str(exc)) from exc
+    concurrency_key = "chatgpt_local_status_probe_concurrency"
+    concurrency_update = concurrency_key in safe
+    if concurrency_update:
+        from services.chatgpt_core.local_status_refresh import (
+            configure_local_status_concurrency,
+            local_status_concurrency_update_guard,
+        )
+
+        update_guard = local_status_concurrency_update_guard()
+    else:
+        update_guard = nullcontext()
+
+    with update_guard:
+        try:
+            config_store.set_many(safe, base_revision=body.base_revision)
+        except SharedConfigConflict as exc:
+            raise HTTPException(409, str(exc)) from exc
+        if concurrency_update:
+            configure_local_status_concurrency(safe[concurrency_key])
     return {"ok": True, "updated": list(safe.keys())}
 
 

@@ -1,4 +1,5 @@
 """account_manager - ChatGPT 账号管理后台"""
+import logging
 import os
 import sys
 from contextlib import asynccontextmanager
@@ -7,6 +8,7 @@ from fastapi import HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
+from starlette.concurrency import run_in_threadpool
 from core.db import init_db
 from api.accounts import router as accounts_router
 from api.chatgpt import router as chatgpt_router
@@ -31,6 +33,8 @@ from api.delivery_cards import router as delivery_cards_router
 from api.oaipay import router as oaipay_router
 from api.system import router as system_router
 from services.chatgpt_core import ChatGPTPlatform
+
+logger = logging.getLogger(__name__)
 
 EXPECTED_CONDA_ENV = os.getenv("APP_CONDA_ENV", "auto-chatgpt")
 PUBLIC_API_PATHS = {
@@ -310,7 +314,15 @@ async def auth_middleware(request: Request, call_next):
     if path.startswith("/api/auth/") or not path.startswith("/api/"):
         return await call_next(request)
     from core.config_store import config_store as _cs
-    if not _cs.get("auth_password_hash", ""):
+    try:
+        password_hash = await run_in_threadpool(_cs.get, "auth_password_hash", "")
+    except Exception as exc:
+        logger.warning("Admin auth configuration read failed: %s", exc)
+        return JSONResponse(
+            {"detail": "认证存储暂时不可用，请稍后重试"},
+            status_code=503,
+        )
+    if not password_hash:
         return JSONResponse(
             {"detail": "管理员认证尚未初始化，请先设置管理员密码"},
             status_code=503,
@@ -323,9 +335,15 @@ async def auth_middleware(request: Request, call_next):
         return JSONResponse({"detail": "未认证，请先登录"}, status_code=401)
     try:
         from api.auth import verify_token
-        verify_token(token)
+        await run_in_threadpool(verify_token, token)
     except HTTPException as e:
         return JSONResponse({"detail": e.detail}, status_code=e.status_code)
+    except Exception as exc:
+        logger.warning("Admin token verification storage failure: %s", exc)
+        return JSONResponse(
+            {"detail": "认证存储暂时不可用，请稍后重试"},
+            status_code=503,
+        )
     return await call_next(request)
 
 

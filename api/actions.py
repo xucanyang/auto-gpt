@@ -18,7 +18,11 @@ from services.account_filters import (
 from services.account_rate_limit_recovery import reconcile_rate_limited_accounts
 from services.chatgpt_account_state import apply_chatgpt_status_policy, classify_chatgpt_capabilities, mark_payment_pending
 from services.chatgpt_core import ChatGPTPlatform
-from services.chatgpt_core.local_status_refresh import schedule_chatgpt_local_status_refresh_for_account_id
+from services.chatgpt_core.local_status_refresh import (
+    build_chatgpt_local_status_probe_account,
+    schedule_chatgpt_local_status_refresh_for_account_id,
+    sync_chatgpt_account_local_status_by_id,
+)
 from services.chatgpt_core.invalid_account_recheck import recheck_invalid_chatgpt_account
 from services.chatgpt_core.payment_link_cache import (
     PAYMENT_LINK_FORMAT_PAYPAL,
@@ -332,6 +336,9 @@ def _apply_action_result(
 def _action_should_auto_refresh_local_status(action_id: str, result: dict[str, Any], acc_model: AccountModel) -> bool:
     if not bool(result.get("ok")):
         return False
+    if str(action_id or "") == "probe_local_status":
+        # This action already persists through the synchronous by-id refresh.
+        return False
     if str(action_id or "") in _LOCAL_STATUS_AUTH_ACTION_IDS:
         return True
 
@@ -508,6 +515,39 @@ def _execute_chatgpt_invalid_recheck_action(
     return result
 
 
+def _execute_chatgpt_probe_local_status_action(
+    instance: ChatGPTPlatform,
+    acc_model: AccountModel,
+    session: Session,
+    params: dict | None = None,
+) -> dict[str, Any]:
+    try:
+        account_id = int(acc_model.id or 0)
+    except (TypeError, ValueError):
+        account_id = 0
+    if account_id <= 0:
+        raise ValueError("本地状态刷新账号 ID 无效")
+
+    prepared_account = build_chatgpt_local_status_probe_account(acc_model)
+    candidate_state: dict[str, Any] = {}
+    # The request/batch Session loaded this ORM row and therefore owns a checked
+    # out connection. End that transaction before the by-id helper starts its
+    # short-read -> connection-free probe -> short-write lifecycle.
+    session.commit()
+    sync_result = sync_chatgpt_account_local_status_by_id(
+        account_id,
+        prepared_account=prepared_account,
+        probe_runner=lambda probe_account: instance.probe_local_status_with_candidates(
+            probe_account,
+            dict(params or {}),
+            manage_local_status_slots=False,
+            candidate_state=candidate_state,
+        ),
+    )
+    session.refresh(acc_model)
+    return instance.build_local_status_probe_action_result(sync_result.get("probe") or {})
+
+
 def _execute_platform_action(
     instance: Any,
     platform: str,
@@ -516,6 +556,9 @@ def _execute_platform_action(
     params: dict,
     session: Session,
 ) -> dict[str, Any]:
+    if platform == "chatgpt" and action_id == "probe_local_status":
+        return _execute_chatgpt_probe_local_status_action(instance, acc_model, session, params)
+
     if platform == "chatgpt" and action_id == "resume_subscription_auth":
         return _execute_chatgpt_resume_subscription_auth_action(acc_model, session, params)
 
@@ -864,6 +907,10 @@ def execute_batch_action(
                     "status": acc_model.status,
                 }
             )
+        if platform == "chatgpt" and action_id == "probe_local_status":
+            # The by-id helper already committed its write. Release the short
+            # response refresh transaction before any inter-account delay.
+            session.commit()
 
     session.commit()
     for account_id_value in dict.fromkeys(local_status_auto_refresh_ids):

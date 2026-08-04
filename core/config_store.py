@@ -4,7 +4,7 @@ import re
 import time
 from pathlib import Path
 from typing import Any, Optional
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from sqlmodel import Field, SQLModel, Session, select
 from .db import engine
 from .shared_config import (
@@ -147,12 +147,12 @@ class ConfigStore:
                     text = str(item.value or "").strip()
                     if text:
                         self._cache[item.key] = text
-        except OperationalError:
+        except SQLAlchemyError:
             pass
 
     def _get_local(self, key: str, default: str = "", *, env_values: Optional[dict[str, str]] = None) -> str:
         env_values = env_values if env_values is not None else _runtime_env_values()
-        last_error: OperationalError | None = None
+        last_error: SQLAlchemyError | None = None
         for attempt in range(3):
             try:
                 with Session(engine) as s:
@@ -162,9 +162,14 @@ class ConfigStore:
                         self._cache[key] = value
                         return value
                     break
-            except OperationalError as exc:
+            except SQLAlchemyError as exc:
                 last_error = exc
-                if "database is locked" not in str(exc).lower() or attempt >= 2:
+                retry_locked = (
+                    isinstance(exc, OperationalError)
+                    and "database is locked" in str(exc).lower()
+                    and attempt < 2
+                )
+                if not retry_locked:
                     break
                 time.sleep(0.05 * (attempt + 1))
 
@@ -203,7 +208,7 @@ class ConfigStore:
                     text = str(value or "").strip()
                     if text:
                         self._cache[key] = text
-        except OperationalError:
+        except SQLAlchemyError:
             values = dict(self._cache)
         return _merge_env_fallback(values, env_values=env_values)
 
@@ -241,7 +246,7 @@ class ConfigStore:
                     else:
                         self._cache.pop(key, None)
                 return values
-        except OperationalError:
+        except SQLAlchemyError:
             return dict(self._cache)
 
     def shared_enabled(self) -> bool:
@@ -323,7 +328,9 @@ class ConfigStore:
         return result
 
     def get(self, key: str, default: str = "") -> str:
-        if self.shared_enabled() and is_shareable_key(key):
+        # Local-only keys (notably auth_*) must not spend an extra connection
+        # checking the shared-config mode on every request.
+        if is_shareable_key(key) and self.shared_enabled():
             try:
                 found, value = shared_config_store.get_entry(key)
                 if found:

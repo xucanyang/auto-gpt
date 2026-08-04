@@ -4517,15 +4517,24 @@ def _prepare_batch_probe_local_status_params(
     params["delay_max_seconds"] = _coerce_probe_delay(
         delay_max if delay_max is not None else config.get("chatgpt_local_status_probe_delay_max_seconds")
     )
+    configured_concurrency_limit = _coerce_batch_probe_positive_int(
+        config.get("chatgpt_local_status_probe_concurrency") or 1,
+        default=1,
+        maximum=LOCAL_STATUS_PROBE_MAX_CONCURRENCY,
+    )
     requested_concurrency = _coerce_batch_probe_positive_int(
         _first_batch_probe_param(params, "concurrency", "probe_concurrency", "local_status_probe_concurrency")
-        or config.get("chatgpt_local_status_probe_concurrency")
+        or configured_concurrency_limit
         or 1,
         default=1,
         maximum=LOCAL_STATUS_PROBE_MAX_CONCURRENCY,
     )
     account_count = max(int(eligible_count or 0), 0)
-    effective_concurrency = min(requested_concurrency, max(account_count, 1))
+    effective_concurrency = min(
+        requested_concurrency,
+        configured_concurrency_limit,
+        max(account_count, 1),
+    )
 
     raw_unique_exit_ip = _first_batch_probe_param(
         params,
@@ -4537,7 +4546,7 @@ def _prepare_batch_probe_local_status_params(
         raw_unique_exit_ip,
         default=_coerce_batch_probe_bool(
             config.get("chatgpt_local_status_probe_unique_exit_ip_enabled"),
-            default=True,
+            default=False,
         ),
     )
     unique_exit_ip_enabled = bool(unique_exit_ip_requested and account_count > 1)
@@ -4643,11 +4652,14 @@ def _prepare_batch_probe_local_status_params(
                 candidate_floor,
             )
 
-    params["concurrency"] = requested_concurrency
+    params["requested_concurrency"] = requested_concurrency
+    params["concurrency"] = effective_concurrency
+    params["global_concurrency_limit"] = configured_concurrency_limit
     params["unique_exit_ip_enabled"] = unique_exit_ip_enabled
     settings = {
         "requested_concurrency": requested_concurrency,
         "effective_concurrency": effective_concurrency,
+        "global_concurrency_limit": configured_concurrency_limit,
         "delay_seconds": params["delay_seconds"],
         "delay_max_seconds": params["delay_max_seconds"],
         "unique_exit_ip_requested": unique_exit_ip_requested,
@@ -4752,6 +4764,7 @@ def enqueue_batch_probe_local_status_task(
         "missing_ids": missing_ids,
         "requested_concurrency": execution_settings["requested_concurrency"],
         "effective_concurrency": execution_settings["effective_concurrency"],
+        "global_concurrency_limit": execution_settings["global_concurrency_limit"],
         "unique_exit_ip_enabled": execution_settings["unique_exit_ip_enabled"],
     }
 
@@ -17064,26 +17077,56 @@ def _run_batch_invalid_recheck(task_id: str, account_ids: list[int]):
 def _run_batch_probe_local_status(task_id: str, account_ids: list[int], params: dict[str, Any]):
     from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
     from core.db import AccountModel, engine
-    from core.proxy_utils import is_proxy_error_text, resolve_probe_candidate_proxies
+    from core.proxy_utils import resolve_probe_candidate_proxies
     from services.chatgpt_core.account_fingerprint import (
         fingerprint_signature,
         resolve_account_browser_fingerprint,
     )
-    from services.chatgpt_core.local_status_refresh import sync_chatgpt_account_local_status
+    from services.chatgpt_core.local_status_refresh import (
+        build_chatgpt_local_status_probe_account,
+        probe_chatgpt_account_local_status,
+        refresh_local_status_concurrency_from_store,
+        sync_chatgpt_account_local_status_by_id,
+    )
+    from services.chatgpt_core.local_status_proxy import (
+        is_local_status_proxy_configuration_error,
+        is_local_status_proxy_transport_error,
+        local_status_probe_proxy_failure,
+    )
 
     runtime_params = dict(params or {}) if isinstance(params, dict) else {}
     control = _task_store.control_for(task_id)
     total = max(len(account_ids), 1)
     requested_concurrency = _coerce_batch_probe_positive_int(
-        runtime_params.get("concurrency"),
+        runtime_params.get("requested_concurrency") or runtime_params.get("concurrency"),
         default=1,
         maximum=LOCAL_STATUS_PROBE_MAX_CONCURRENCY,
     )
-    effective_concurrency = min(requested_concurrency, total)
+    global_concurrency_limit = refresh_local_status_concurrency_from_store()
+    task_concurrency = _coerce_batch_probe_positive_int(
+        runtime_params.get("concurrency"),
+        default=min(requested_concurrency, global_concurrency_limit),
+        maximum=LOCAL_STATUS_PROBE_MAX_CONCURRENCY,
+    )
+    effective_concurrency = min(task_concurrency, global_concurrency_limit, total)
     unique_exit_ip_enabled = _coerce_batch_probe_bool(
         runtime_params.get("unique_exit_ip_enabled"),
         default=False,
     ) and len(account_ids) > 1
+    proxy_mode = str(runtime_params.get("proxy_mode") or "global").strip().lower()
+    proxy_failover_enabled = _coerce_batch_probe_bool(
+        runtime_params.get("proxy_failover"),
+        default=False,
+    )
+    dynamic_proxy_attempt_budget = (
+        _coerce_batch_probe_positive_int(
+            runtime_params.get("dynamic_proxy_max_attempts"),
+            default=1,
+            maximum=100,
+        )
+        if proxy_mode == "dynamic" and proxy_failover_enabled
+        else 1
+    )
 
     def _coerce_delay(value: Any) -> float:
         try:
@@ -17100,18 +17143,21 @@ def _run_batch_probe_local_status(task_id: str, account_ids: list[int], params: 
 
     state_lock = threading.RLock()
     unique_exit_ip_lock = threading.Lock()
-    fingerprint_gate_lock = threading.Lock()
+    fingerprint_state_lock = threading.Lock()
+    shared_proxy_lock = threading.Lock()
     start_gate_lock = threading.Lock()
     next_start_at = time.monotonic()
     unique_exit_ips: set[str] = set()
     unique_exit_events: list[dict[str, Any]] = []
-    fingerprint_gates: dict[str, threading.Lock] = {}
     fingerprint_seen: set[str] = set()
     fingerprint_stats = {
         "account_profile_count": 0,
         "legacy_fallback_count": 0,
         "shared_profile_serialized_count": 0,
     }
+    shared_proxy_candidates: dict[str, tuple[str, Any, str]] = {}
+    failed_proxy_candidates: set[str] = set()
+    shared_proxy_uses: dict[str, int] = {}
     success_count = 0
     skipped_count = 0
     errors: list[str] = []
@@ -17207,6 +17253,65 @@ def _run_batch_probe_local_status(task_id: str, account_ids: list[int], params: 
             return "指定代理"
         return "已配置代理"
 
+    def proxy_candidate_key(candidate: tuple[str, Any, str]) -> str:
+        return str(candidate[0] or "").strip()
+
+    def remember_shared_proxy(candidate: tuple[str, Any, str]) -> None:
+        if unique_exit_ip_enabled:
+            return
+        key = proxy_candidate_key(candidate)
+        if not key:
+            return
+        with shared_proxy_lock:
+            if key in failed_proxy_candidates:
+                return
+            shared_proxy_candidates[key] = candidate
+            shared_proxy_uses.setdefault(key, 0)
+
+    def mark_shared_proxy_failed(candidate: tuple[str, Any, str]) -> None:
+        key = proxy_candidate_key(candidate)
+        if not key:
+            return
+        with shared_proxy_lock:
+            failed_proxy_candidates.add(key)
+            shared_proxy_candidates.pop(key, None)
+            shared_proxy_uses.pop(key, None)
+
+    def is_shared_proxy_failed(candidate: tuple[str, Any, str]) -> bool:
+        key = proxy_candidate_key(candidate)
+        if not key:
+            return False
+        with shared_proxy_lock:
+            return key in failed_proxy_candidates
+
+    def select_shared_proxy(excluded: set[str]) -> tuple[str, Any, str] | None:
+        if unique_exit_ip_enabled:
+            return None
+        with shared_proxy_lock:
+            available = [
+                (shared_proxy_uses.get(key, 0), key, candidate)
+                for key, candidate in shared_proxy_candidates.items()
+                if key not in excluded and key not in failed_proxy_candidates
+            ]
+            if not available:
+                return None
+            _uses, key, candidate = min(available, key=lambda item: (item[0], item[1]))
+            shared_proxy_uses[key] = shared_proxy_uses.get(key, 0) + 1
+            return candidate
+
+    def resolve_fresh_dynamic_proxy() -> tuple[str, Any, str]:
+        single_candidate_params = dict(runtime_params)
+        single_candidate_params["proxy_failover"] = False
+        single_candidate_params["dynamic_proxy_max_attempts"] = 1
+        candidates = resolve_probe_candidate_proxies(
+            single_candidate_params,
+            fallback_proxy="",
+            default_mode="global",
+        )
+        if not candidates:
+            raise RuntimeError("动态代理没有可用候选")
+        return candidates[0]
+
     def probe_exit_ip(proxy_url: str, source: str) -> tuple[str, str]:
         source_ip = source_exit_ip(source)
         source_text = str(source or "").strip().lower()
@@ -17294,7 +17399,7 @@ def _run_batch_probe_local_status(task_id: str, account_ids: list[int], params: 
         )
         return True, exit_ip, ""
 
-    def fingerprint_gate_for_account(account: Any) -> tuple[threading.Lock, str, bool]:
+    def fingerprint_state_for_account(account: Any) -> tuple[str, bool]:
         try:
             extra = account.get_extra() if hasattr(account, "get_extra") else getattr(account, "extra", {})
         except Exception:
@@ -17303,16 +17408,11 @@ def _run_batch_probe_local_status(task_id: str, account_ids: list[int], params: 
         signature = fingerprint_signature(fingerprint, include_device=True) if fingerprint else ""
         source = "account" if signature else "legacy_default"
         gate_key = f"account:{signature}" if signature else "legacy_default"
-        with fingerprint_gate_lock:
+        with fingerprint_state_lock:
             shared = gate_key in fingerprint_seen
             fingerprint_seen.add(gate_key)
-            gate = fingerprint_gates.setdefault(gate_key, threading.Lock())
         record_fingerprint_state(source=source, shared=shared)
-        return gate, source, shared
-
-    def acquire_fingerprint_gate(gate: threading.Lock, *, attempt_id: int) -> None:
-        while not gate.acquire(timeout=0.25):
-            control.checkpoint(attempt_id=attempt_id)
+        return source, shared
 
     def reserve_start_delay(position: int) -> float:
         nonlocal next_start_at
@@ -17332,8 +17432,6 @@ def _run_batch_probe_local_status(task_id: str, account_ids: list[int], params: 
         attempt_id: int,
         start_delay: float,
     ) -> dict[str, Any]:
-        fingerprint_gate: threading.Lock | None = None
-        fingerprint_gate_acquired = False
         email = ""
         try:
             if start_delay > 0:
@@ -17352,60 +17450,139 @@ def _run_batch_probe_local_status(task_id: str, account_ids: list[int], params: 
                         attempt_id=attempt_id,
                     )
                     return {"status": "skipped", "account_id": account_id, "email": ""}
-
                 email = str(account.email or "")
-                fingerprint_gate, fingerprint_source, fingerprint_shared = fingerprint_gate_for_account(account)
-                acquire_fingerprint_gate(fingerprint_gate, attempt_id=attempt_id)
-                fingerprint_gate_acquired = True
-                if fingerprint_source == "legacy_default":
-                    task_log(
-                        f"[{account_position}/{total}] 账号未保存浏览器指纹，已按兼容指纹串行化",
-                        attempt_id=attempt_id,
-                    )
-                elif fingerprint_shared:
-                    task_log(
-                        f"[{account_position}/{total}] 检测到重复账号浏览器指纹，已串行化该身份",
-                        attempt_id=attempt_id,
-                    )
+                prepared_account = build_chatgpt_local_status_probe_account(account)
+
+            fingerprint_source, fingerprint_shared = fingerprint_state_for_account(prepared_account)
+            if fingerprint_source == "legacy_default":
                 task_log(
-                    f"[{account_position}/{total}] 开始同步本地状态 账号ID：{account_id}｜邮箱：{email}",
+                    f"[{account_position}/{total}] 账号未保存浏览器指纹，已按兼容指纹串行化",
+                    attempt_id=attempt_id,
+                )
+            elif fingerprint_shared:
+                task_log(
+                    f"[{account_position}/{total}] 检测到重复账号浏览器指纹，已串行化该身份",
                     attempt_id=attempt_id,
                 )
 
-                try:
-                    candidates = resolve_probe_candidate_proxies(
-                        runtime_params,
-                        fallback_proxy="",
-                        default_mode="global",
-                    )
-                except Exception as exc:
-                    error_text = sanitize_error_message(str(exc) or "代理配置解析失败")
-                    task_log(
-                        f" -> [失败] 代理配置解析失败: {error_text}",
-                        attempt_id=attempt_id,
-                    )
-                    return {
-                        "status": "failed",
-                        "account_id": account_id,
-                        "email": email,
-                        "error": error_text,
-                        "fatal_configuration": True,
-                    }
+            reusable_account_candidate: tuple[str, Any, str] | None = None
+            reusable_account_exit_ip = ""
 
+            def run_network_probe(probe_account: Any) -> dict[str, Any]:
+                nonlocal reusable_account_candidate, reusable_account_exit_ip
+                if (
+                    reusable_account_candidate is not None
+                    and is_shared_proxy_failed(reusable_account_candidate)
+                ):
+                    reusable_account_candidate = None
+                    reusable_account_exit_ip = ""
+                try:
+                    static_candidates = (
+                        []
+                        if proxy_mode == "dynamic"
+                        else resolve_probe_candidate_proxies(
+                            runtime_params,
+                            fallback_proxy="",
+                            default_mode="global",
+                        )
+                    )
+                    if reusable_account_candidate is not None and proxy_mode != "dynamic":
+                        reusable_key = proxy_candidate_key(reusable_account_candidate)
+                        static_candidates = [reusable_account_candidate] + [
+                            candidate
+                            for candidate in static_candidates
+                            if proxy_candidate_key(candidate) != reusable_key
+                        ]
+                except Exception as exc:
+                    raise RuntimeError(
+                        sanitize_error_message(str(exc) or "代理配置解析失败")
+                    ) from exc
+
+                candidate_total = (
+                    dynamic_proxy_attempt_budget
+                    if proxy_mode == "dynamic"
+                    else max(len(static_candidates), 1)
+                )
+                attempted_proxy_keys: set[str] = set()
                 last_error = ""
-                for candidate_index, (proxy_url, proxy_pool, source) in enumerate(candidates, start=1):
+
+                for candidate_index in range(1, candidate_total + 1):
                     control.checkpoint(attempt_id=attempt_id)
+                    candidate_origin = ""
+                    reused_account_candidate = False
+                    if proxy_mode == "dynamic":
+                        candidate = None
+                        if candidate_index == 1 and reusable_account_candidate is not None:
+                            candidate = reusable_account_candidate
+                            reused_account_candidate = True
+                            candidate_origin = "复用账号上一轮已到达上游 SID"
+                        elif candidate_index > 1:
+                            candidate = select_shared_proxy(attempted_proxy_keys)
+                            if candidate is not None:
+                                candidate_origin = "复用任务内已验证健康 SID"
+                        if candidate is None:
+                            candidate_origin = "新主 SID" if candidate_index == 1 else "新补位 SID"
+                            try:
+                                candidate = resolve_fresh_dynamic_proxy()
+                            except Exception as exc:
+                                last_error = sanitize_error_message(str(exc) or "动态代理 SID 准备失败")
+                                task_log(
+                                    f" -> [代理 {candidate_index}/{candidate_total}] {candidate_origin} 准备失败: {last_error}",
+                                    attempt_id=attempt_id,
+                                )
+                                if is_local_status_proxy_configuration_error(last_error):
+                                    raise RuntimeError(last_error) from exc
+                                continue
+                    else:
+                        if candidate_index > len(static_candidates):
+                            break
+                        candidate = static_candidates[candidate_index - 1]
+                        reused_account_candidate = (
+                            reusable_account_candidate is not None
+                            and proxy_candidate_key(candidate)
+                            == proxy_candidate_key(reusable_account_candidate)
+                        )
+
+                    proxy_url, proxy_pool, source = candidate
+                    candidate_key = proxy_candidate_key(candidate)
+                    if candidate_key and candidate_key in attempted_proxy_keys:
+                        last_error = "动态代理返回了本账号已尝试的 SID"
+                        task_log(
+                            f" -> [跳过候选] {last_error}",
+                            attempt_id=attempt_id,
+                        )
+                        continue
+                    if candidate_key:
+                        attempted_proxy_keys.add(candidate_key)
+
                     network_label = candidate_network_label(proxy_url, source)
                     exit_ip = ""
                     if unique_exit_ip_enabled:
-                        claimed, exit_ip, claim_error = claim_unique_exit_ip(
-                            account_position=account_position,
-                            account_id=account_id,
-                            candidate_index=candidate_index,
-                            candidate_total=len(candidates),
-                            proxy_url=proxy_url,
-                            source=source,
-                        )
+                        if reused_account_candidate and reusable_account_exit_ip:
+                            claimed = True
+                            exit_ip = reusable_account_exit_ip
+                            claim_error = ""
+                            record_unique_exit_ip_event(
+                                {
+                                    "account_position": account_position,
+                                    "account_id": account_id,
+                                    "candidate": candidate_index,
+                                    "total": candidate_total,
+                                    "status": "reused",
+                                    "exit_ip": exit_ip,
+                                    "source": candidate_network_label(proxy_url, source),
+                                    "reason": "auth_revision_retry",
+                                }
+                            )
+                        else:
+                            claimed, exit_ip, claim_error = claim_unique_exit_ip(
+                                account_position=account_position,
+                                account_id=account_id,
+                                candidate_index=candidate_index,
+                                candidate_total=candidate_total,
+                                proxy_url=proxy_url,
+                                source=source,
+                            )
                         if not claimed:
                             last_error = claim_error
                             task_log(
@@ -17414,48 +17591,98 @@ def _run_batch_probe_local_status(task_id: str, account_ids: list[int], params: 
                             )
                             continue
 
+                    origin_note = f"｜SID={candidate_origin}" if candidate_origin else ""
                     exit_note = f"｜出口IP: {exit_ip}" if exit_ip else ""
                     task_log(
-                        f" -> [尝试 {candidate_index}/{len(candidates)}] 网络方式: {network_label}{exit_note}",
+                        f" -> [尝试 {candidate_index}/{candidate_total}] 网络方式: {network_label}{origin_note}{exit_note}",
                         attempt_id=attempt_id,
                     )
                     try:
-                        result = sync_chatgpt_account_local_status(
-                            session,
-                            account,
+                        probe = probe_chatgpt_account_local_status(
+                            probe_account,
                             proxy=proxy_url,
                             use_default_proxy=False,
                         )
-                        plan = result.get("probe", {}).get("subscription", {}).get("plan", "unknown")
-                        task_log(
-                            f" -> [成功] 账号 {email} 本地状态同步完成｜当前订阅计划: {plan}",
-                            attempt_id=attempt_id,
-                        )
-                        if proxy_pool is not None and proxy_url:
-                            try:
-                                proxy_pool.report_success(proxy_url)
-                            except Exception:
-                                pass
-                        return {"status": "success", "account_id": account_id, "email": email}
                     except Exception as exc:
-                        last_error = sanitize_error_message(str(exc) or "探测失败")
-                        task_log(
-                            f" -> [失败] {network_label} 探测异常: {last_error}",
-                            attempt_id=attempt_id,
-                        )
-                        if candidate_index < len(candidates) and proxy_pool is not None and proxy_url:
-                            if is_proxy_error_text(last_error):
+                        error_text = sanitize_error_message(str(exc) or "探测失败")
+                        if not is_local_status_proxy_transport_error(error_text):
+                            raise RuntimeError(error_text) from exc
+                        proxy_error = error_text
+                        probe = None
+                    else:
+                        proxy_error = local_status_probe_proxy_failure(probe)
+                        if not proxy_error:
+                            if proxy_pool is not None and proxy_url:
                                 try:
-                                    proxy_pool.report_fail(proxy_url)
+                                    proxy_pool.report_success(proxy_url)
                                 except Exception:
                                     pass
+                            if proxy_mode == "dynamic":
+                                remember_shared_proxy(candidate)
+                            reusable_account_candidate = candidate
+                            reusable_account_exit_ip = exit_ip
+                            return probe
 
-                error_text = last_error or "探测失败"
+                    last_error = sanitize_error_message(proxy_error or "代理探测失败")
+                    if proxy_mode == "dynamic":
+                        mark_shared_proxy_failed(candidate)
+                    if (
+                        reusable_account_candidate is not None
+                        and proxy_candidate_key(candidate)
+                        == proxy_candidate_key(reusable_account_candidate)
+                    ):
+                        reusable_account_candidate = None
+                        reusable_account_exit_ip = ""
+                    if proxy_pool is not None and proxy_url:
+                        try:
+                            proxy_pool.report_fail(proxy_url)
+                        except Exception:
+                            pass
+                    task_log(
+                        f" -> [代理失败] {network_label}: {last_error}"
+                        + ("，按需切换下一个 SID" if candidate_index < candidate_total else ""),
+                        attempt_id=attempt_id,
+                    )
+
+                raise RuntimeError(last_error or "代理候选全部失败")
+
+            stop_check = lambda: control.checkpoint(attempt_id=attempt_id)
+            def on_probe_start(_probe_account: Any, _probe_attempt: int) -> None:
+                if _probe_attempt <= 1:
+                    task_log(
+                        f"[{account_position}/{total}] 开始同步本地状态 账号ID：{account_id}｜邮箱：{email}",
+                        attempt_id=attempt_id,
+                    )
+                else:
+                    task_log(
+                        f"[{account_position}/{total}] 认证材料已更新，重新同步账号 "
+                        f"账号ID：{account_id}｜邮箱：{email}｜探测轮次={_probe_attempt}",
+                        attempt_id=attempt_id,
+                    )
+
+            result = sync_chatgpt_account_local_status_by_id(
+                account_id,
+                prepared_account=prepared_account,
+                probe_runner=run_network_probe,
+                on_probe_start=on_probe_start,
+                stop_check=stop_check,
+            )
+
+            final_proxy_error = local_status_probe_proxy_failure(result.get("probe") or {})
+            if final_proxy_error:
+                error_text = sanitize_error_message(final_proxy_error)
                 task_log(
                     f" -> [异常] 账号 {email or account_id} 本地状态全部失败: {error_text}",
                     attempt_id=attempt_id,
                 )
                 return {"status": "failed", "account_id": account_id, "email": email, "error": error_text}
+
+            plan = result.get("probe", {}).get("subscription", {}).get("plan", "unknown")
+            task_log(
+                f" -> [成功] 账号 {email} 本地状态同步完成｜当前订阅计划: {plan}",
+                attempt_id=attempt_id,
+            )
+            return {"status": "success", "account_id": account_id, "email": email}
         except SkipCurrentAttemptRequested as exc:
             task_log(
                 f"[{account_position}/{total}] 已跳过 {email or account_id}: {exc}",
@@ -17472,10 +17699,14 @@ def _run_batch_probe_local_status(task_id: str, account_ids: list[int], params: 
                 attempt_id=attempt_id,
                 check_stop=False,
             )
-            return {"status": "failed", "account_id": account_id, "email": email, "error": error_text}
+            return {
+                "status": "failed",
+                "account_id": account_id,
+                "email": email,
+                "error": error_text,
+                "fatal_configuration": is_local_status_proxy_configuration_error(error_text),
+            }
         finally:
-            if fingerprint_gate_acquired and fingerprint_gate is not None:
-                fingerprint_gate.release()
             control.finish_attempt(attempt_id)
 
     def apply_result(result: dict[str, Any]) -> None:
@@ -17509,6 +17740,7 @@ def _run_batch_probe_local_status(task_id: str, account_ids: list[int], params: 
                     **dict(meta.get("settings") or {}),
                     "requested_concurrency": requested_concurrency,
                     "effective_concurrency": effective_concurrency,
+                    "global_concurrency_limit": global_concurrency_limit,
                     "unique_exit_ip_enabled": unique_exit_ip_enabled,
                     "fingerprint_policy": "reuse_account_profile; serialize_shared_or_missing",
                 },
@@ -17536,6 +17768,7 @@ def _run_batch_probe_local_status(task_id: str, account_ids: list[int], params: 
         task_log(
             "[配置] 批量本地状态同步"
             f"｜请求并发={requested_concurrency}｜实际并发={effective_concurrency}"
+            f"｜进程全局上限={global_concurrency_limit}"
             f"｜独立出口IP={'开启' if unique_exit_ip_enabled else '关闭'}"
             "｜指纹=复用账号已保存指纹，缺失或重复时串行化",
         )

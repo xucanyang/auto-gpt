@@ -230,6 +230,66 @@ def test_default_chatgpt_proxy_uses_global_dynamic_config(monkeypatch):
     assert "dynamic country=US" in source
 
 
+def test_default_dynamic_proxy_stops_after_first_usable_sid(monkeypatch):
+    calls = []
+
+    def fake_configured_value(key, default=""):
+        values = {
+            "task_proxy_mode": "dynamic",
+            "task_proxy_failover": "true",
+            "dynamic_proxy_max_attempts": "5",
+        }
+        return values.get(key, default)
+
+    def fake_resolve(params, **_kwargs):
+        calls.append(dict(params))
+        return [("socks5h://main-sid.example:3010", None, "dynamic probe=ok")]
+
+    monkeypatch.setattr("core.proxy_utils._configured_value", fake_configured_value)
+    monkeypatch.setattr("core.proxy_utils.resolve_task_proxy_candidates", fake_resolve)
+
+    proxy_url, proxy_pool, source = resolve_default_chatgpt_proxy_with_metadata()
+
+    assert proxy_url == "socks5h://main-sid.example:3010"
+    assert proxy_pool is None
+    assert source == "dynamic probe=ok"
+    assert calls == [
+        {
+            "proxy_mode": "dynamic",
+            "proxy_failover": False,
+            "dynamic_proxy_max_attempts": 1,
+        }
+    ]
+
+
+def test_default_dynamic_proxy_uses_more_sid_budget_only_after_prepare_failure(monkeypatch):
+    calls = []
+
+    def fake_configured_value(key, default=""):
+        values = {
+            "task_proxy_mode": "dynamic",
+            "task_proxy_failover": "true",
+            "dynamic_proxy_max_attempts": "5",
+        }
+        return values.get(key, default)
+
+    def fake_resolve(params, **_kwargs):
+        calls.append(dict(params))
+        if len(calls) < 3:
+            raise RuntimeError(f"candidate {len(calls)} failed health probe")
+        return [("socks5h://replacement-sid.example:3010", None, "dynamic probe=ok")]
+
+    monkeypatch.setattr("core.proxy_utils._configured_value", fake_configured_value)
+    monkeypatch.setattr("core.proxy_utils.resolve_task_proxy_candidates", fake_resolve)
+
+    proxy_url, _, _ = resolve_default_chatgpt_proxy_with_metadata()
+
+    assert proxy_url == "socks5h://replacement-sid.example:3010"
+    assert len(calls) == 3
+    assert all(call["dynamic_proxy_max_attempts"] == 1 for call in calls)
+    assert all(call["proxy_failover"] is False for call in calls)
+
+
 def test_global_dynamic_canonical_template_wins_over_legacy_task_proxy_url(monkeypatch):
     canonical_template = "socks5://canonical-region-Rand-sid-oldsid-t-1:secret@canonical.example:3010"
     legacy_template = "socks5://legacy-region-Rand-sid-oldsid-t-1:secret@legacy.example:3010"

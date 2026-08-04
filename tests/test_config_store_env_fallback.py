@@ -1,8 +1,12 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
+
+from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 
 from core.config_store import (
+    ConfigStore,
     _canonical_config_key,
     _get_env_fallback_value,
     _load_env_file,
@@ -66,6 +70,31 @@ class ConfigStoreEnvFallbackTests(unittest.TestCase):
         self.assertEqual(_canonical_config_key("SMSTOME_COOKIE"), "smstome_cookie")
         self.assertEqual(merged["smstome_cookie"], "cf_clearance=demo")
         self.assertEqual(merged["cfworker_custom_auth"], "db-value")
+
+    def test_local_auth_read_uses_cache_on_pool_timeout_without_shared_mode_query(self):
+        store = object.__new__(ConfigStore)
+        store._cache = {"auth_password_hash": "cached-password-hash"}
+        store.shared_enabled = mock.Mock(side_effect=AssertionError("local auth key queried shared mode"))
+
+        with mock.patch(
+            "core.config_store.Session",
+            side_effect=SQLAlchemyTimeoutError("QueuePool timed out"),
+        ):
+            value = store.get("auth_password_hash", "")
+
+        self.assertEqual(value, "cached-password-hash")
+        store.shared_enabled.assert_not_called()
+
+    def test_local_status_unique_exit_defaults_to_disabled_when_config_is_missing(self):
+        from api import config as config_api
+
+        with mock.patch.object(config_api.config_store, "get_all", return_value={}):
+            response = config_api._build_config_response()
+
+        self.assertEqual(
+            response["chatgpt_local_status_probe_unique_exit_ip_enabled"],
+            "false",
+        )
 
 
 if __name__ == "__main__":

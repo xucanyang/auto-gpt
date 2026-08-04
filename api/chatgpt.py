@@ -22,7 +22,6 @@ from services.account_filters import (
     resolve_filtered_accounts,
 )
 from services.chatgpt_account_state import (
-    apply_chatgpt_status_policy,
     apply_payment_snapshot_status,
     classify_chatgpt_capabilities,
     is_chatgpt_upload_ready,
@@ -39,7 +38,11 @@ from services.chatgpt_core.codex_usage import (
     persist_codex_usage_probe,
     probe_codex_usage_window,
 )
-from services.chatgpt_core.local_status_refresh import schedule_chatgpt_local_status_refresh_for_account_id
+from services.chatgpt_core.local_status_refresh import (
+    build_chatgpt_local_status_probe_account,
+    schedule_chatgpt_local_status_refresh_for_account_id,
+    sync_chatgpt_account_local_status_by_id,
+)
 from services.chatgpt_core.payment_link_cache import validate_plus_payment_request_params
 from services.chatgpt_core.sentinel_constants import PINNED_CHROMIUM_VERSION
 import json, sys
@@ -168,15 +171,21 @@ def _to_gopay_account(acc: AccountModel, access_token: Optional[str] = None):
     return codex_acc
 
 
-def _persist_local_probe(acc: AccountModel, probe: dict, session: Session) -> None:
-    extra = acc.get_extra()
-    extra["chatgpt_local"] = probe
-    acc.set_extra(extra)
-    apply_chatgpt_status_policy(acc, local_probe=probe)
-    from datetime import datetime
-    acc.updated_at = datetime.utcnow()
-    session.add(acc)
-    session.commit()
+def _prepare_local_probe_account(
+    account_id: int,
+    session: Session,
+) -> tuple[str, Any]:
+    """Detach probe inputs and return the dependency connection before I/O."""
+
+    account = _get_account(account_id, session)
+    email = str(account.email or "")
+    probe_account = build_chatgpt_local_status_probe_account(account)
+    try:
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    return email, probe_account
 
 
 def _persist_codex_usage_probe(acc: AccountModel, codex_probe: dict[str, Any], session: Session) -> dict[str, Any]:
@@ -2873,15 +2882,15 @@ def _active_gopay_batch_task() -> dict | None:
 @router.get("/{account_id}/subscription")
 def check_subscription(account_id: int, proxy: Optional[str] = None,
                        session: Session = Depends(get_session)):
-    acc = _get_account(account_id, session)
-    codex_acc = _to_codex_account(acc)
-
-    from services.chatgpt_core.status_probe import probe_local_chatgpt_status
-
-    probe = probe_local_chatgpt_status(codex_acc, proxy=proxy)
-    _persist_local_probe(acc, probe, session)
+    email, probe_account = _prepare_local_probe_account(account_id, session)
+    result = sync_chatgpt_account_local_status_by_id(
+        account_id,
+        proxy=proxy,
+        prepared_account=probe_account,
+    )
+    probe = result.get("probe") or {}
     return {
-        "email": acc.email,
+        "email": email,
         "subscription": probe.get("subscription", {}).get("plan", "unknown"),
         "probe": probe,
     }
@@ -2890,14 +2899,13 @@ def check_subscription(account_id: int, proxy: Optional[str] = None,
 @router.post("/{account_id}/probe-local")
 def probe_local_status(account_id: int, proxy: Optional[str] = None,
                        session: Session = Depends(get_session)):
-    acc = _get_account(account_id, session)
-    codex_acc = _to_codex_account(acc)
-
-    from services.chatgpt_core.status_probe import probe_local_chatgpt_status
-
-    probe = probe_local_chatgpt_status(codex_acc, proxy=proxy)
-    _persist_local_probe(acc, probe, session)
-    return {"ok": True, "email": acc.email, "probe": probe}
+    email, probe_account = _prepare_local_probe_account(account_id, session)
+    result = sync_chatgpt_account_local_status_by_id(
+        account_id,
+        proxy=proxy,
+        prepared_account=probe_account,
+    )
+    return {"ok": True, "email": email, "probe": result.get("probe") or {}}
 
 
 # ── CPA 上传 ────────────────────────────────────────────────

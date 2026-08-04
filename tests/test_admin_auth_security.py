@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 from sqlmodel import SQLModel, Session, create_engine, select
 from starlette.requests import Request
@@ -95,6 +98,13 @@ def _request(peer: str, headers: dict[str, str] | None = None) -> Request:
             "server": ("testserver", 80),
         }
     )
+
+
+def _protected_request(headers: dict[str, str] | None = None) -> Request:
+    request = _request("127.0.0.1", headers)
+    request.scope["path"] = "/api/private"
+    request.scope["raw_path"] = b"/api/private"
+    return request
 
 
 def test_legacy_sha256_login_migrates_to_argon2id_and_persists_session(auth_context):
@@ -489,9 +499,135 @@ def test_main_middleware_fails_closed_when_password_is_missing(monkeypatch):
     assert response.status_code == 503
     assert response.json()["detail"] == "管理员认证尚未初始化，请先设置管理员密码"
 
+
+def test_main_middleware_config_read_does_not_block_event_loop(monkeypatch):
+    import main
+    from core.config_store import config_store
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_config_read(_key, _default=""):
+        started.set()
+        release.wait(timeout=1)
+        return ""
+
+    monkeypatch.setattr(config_store, "get", slow_config_read)
+
+    async def call_next(_request):
+        raise AssertionError("protected request must not reach route")
+
+    async def scenario():
+        started_at = time.monotonic()
+        task = asyncio.create_task(main.auth_middleware(_protected_request(), call_next))
+        while not started.is_set() and time.monotonic() - started_at < 0.5:
+            await asyncio.sleep(0.005)
+        observed_after = time.monotonic() - started_at
+        release.set()
+        return observed_after, await task
+
+    try:
+        observed_after, response = asyncio.run(scenario())
+    finally:
+        release.set()
+
+    assert observed_after < 0.25
+    assert response.status_code == 503
+
+
+def test_main_middleware_storage_error_fails_closed_with_503(monkeypatch):
+    import main
+    from core.config_store import config_store
+
+    def failed_config_read(_key, _default=""):
+        raise RuntimeError("QueuePool timed out")
+
+    monkeypatch.setattr(config_store, "get", failed_config_read)
+
+    async def call_next(_request):
+        raise AssertionError("protected request must not reach route")
+
+    response = asyncio.run(main.auth_middleware(_protected_request(), call_next))
+    assert response.status_code == 503
+    assert response.body.decode("utf-8").find("认证存储暂时不可用") >= 0
+
+
+def test_main_middleware_token_verification_does_not_block_event_loop(monkeypatch):
+    import main
+    from core.config_store import config_store
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_verify(_token):
+        started.set()
+        release.wait(timeout=1)
+        return {"sub": "admin"}
+
+    monkeypatch.setattr(config_store, "get", lambda _key, _default="": "configured-hash")
+    monkeypatch.setattr(auth, "verify_token", slow_verify)
+
+    async def call_next(_request):
+        return JSONResponse({"ok": True})
+
+    async def scenario():
+        started_at = time.monotonic()
+        task = asyncio.create_task(
+            main.auth_middleware(
+                _protected_request({"Authorization": "Bearer test-token"}),
+                call_next,
+            )
+        )
+        while not started.is_set() and time.monotonic() - started_at < 0.5:
+            await asyncio.sleep(0.005)
+        observed_after = time.monotonic() - started_at
+        release.set()
+        return observed_after, await task
+
+    try:
+        observed_after, response = asyncio.run(scenario())
+    finally:
+        release.set()
+
+    assert observed_after < 0.25
+    assert response.status_code == 200
+
+
+def test_main_middleware_preserves_401_and_maps_unhandled_verify_failure_to_503(monkeypatch):
+    import main
+    from core.config_store import config_store
+
+    monkeypatch.setattr(config_store, "get", lambda _key, _default="": "configured-hash")
+
+    async def call_next(_request):
+        raise AssertionError("failed auth must not reach route")
+
+    def reject_token(_token):
+        raise HTTPException(401, "bad token")
+
+    monkeypatch.setattr(auth, "verify_token", reject_token)
+    invalid = asyncio.run(
+        main.auth_middleware(
+            _protected_request({"Authorization": "Bearer invalid-token"}),
+            call_next,
+        )
+    )
+    assert invalid.status_code == 401
+
+    def unavailable_storage(_token):
+        raise RuntimeError("QueuePool timed out")
+
+    monkeypatch.setattr(auth, "verify_token", unavailable_storage)
+    unavailable = asyncio.run(
+        main.auth_middleware(
+            _protected_request({"Authorization": "Bearer valid-shape-token"}),
+            call_next,
+        )
+    )
+    assert unavailable.status_code == 503
+
 def test_auth_request_models_bound_credential_field_sizes():
     source = (ROOT / "api" / "auth.py").read_text(encoding="utf-8")
     assert "password: str = Field(min_length=1, max_length=1024)" in source
     assert "temp_token: str = Field(min_length=1, max_length=128)" in source
     assert "code: str = Field(min_length=1, max_length=16)" in source
-

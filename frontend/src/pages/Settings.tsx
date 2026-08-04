@@ -2755,7 +2755,7 @@ export default function Settings() {
       data.chatgpt_local_status_probe_unique_exit_ip_enabled =
         data.chatgpt_local_status_probe_unique_exit_ip_enabled === '' ||
         data.chatgpt_local_status_probe_unique_exit_ip_enabled === undefined
-          ? true
+          ? false
           : parseBooleanConfigValue(data.chatgpt_local_status_probe_unique_exit_ip_enabled)
       if (data.chatgpt_local_status_probe_delay_seconds === undefined || data.chatgpt_local_status_probe_delay_seconds === '') {
         data.chatgpt_local_status_probe_delay_seconds = '0'
@@ -2893,7 +2893,7 @@ export default function Settings() {
       )
       values.chatgpt_local_status_probe_unique_exit_ip_enabled = parseBooleanConfigValue(
         values.chatgpt_local_status_probe_unique_exit_ip_enabled === undefined
-          ? true
+          ? false
           : values.chatgpt_local_status_probe_unique_exit_ip_enabled,
       )
       const normalizeLocalProbeDelay = (value: unknown) => {

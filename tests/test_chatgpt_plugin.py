@@ -1,4 +1,5 @@
 import unittest
+from contextlib import contextmanager
 from unittest import mock
 
 from core.base_mailbox import MailboxAccount
@@ -385,7 +386,17 @@ class ChatGPTPluginTests(unittest.TestCase):
             user_id="acct-123",
             extra={"access_token": "at-demo"},
         )
-        platform = ChatGPTPlatform(config=RegisterConfig(proxy="http://proxy.example:8080", extra={}))
+        platform = ChatGPTPlatform(
+            config=RegisterConfig(
+                proxy="http://proxy.example:8080",
+                extra={
+                    "task_proxy_mode": "dynamic",
+                    "task_proxy_failover": False,
+                    "dynamic_proxy_template": "http://region-XX-sid-seed.proxy.test:8080",
+                    "dynamic_proxy_default_country": "US",
+                },
+            )
+        )
 
         with mock.patch(
             "core.proxy_utils.resolve_probe_candidate_proxies",
@@ -405,6 +416,73 @@ class ChatGPTPluginTests(unittest.TestCase):
         probe.assert_called_once()
         self.assertEqual(probe.call_args.kwargs.get("proxy"), "http://global.proxy:8080")
         self.assertFalse(probe.call_args.kwargs.get("use_default_proxy"))
+
+    def test_probe_local_status_direct_action_uses_shared_identity_and_capacity(self):
+        account = mock.Mock(
+            email="limited@example.com",
+            token="at-limited",
+            user_id="acct-limited",
+            extra={"access_token": "at-limited"},
+        )
+        platform = ChatGPTPlatform(
+            config=RegisterConfig(extra={"task_proxy_mode": "direct"})
+        )
+        events = []
+
+        @contextmanager
+        def identity_slot(_account, **_kwargs):
+            events.append("identity_enter")
+            try:
+                yield
+            finally:
+                events.append("identity_exit")
+
+        @contextmanager
+        def capacity_slot(**_kwargs):
+            events.append("capacity_enter")
+            try:
+                yield
+            finally:
+                events.append("capacity_exit")
+
+        def run_probe(*_args, **_kwargs):
+            events.append("probe")
+            return {
+                "auth": {"state": "access_token_valid"},
+                "subscription": {"plan": "free"},
+                "codex": {"state": "usable"},
+            }
+
+        with mock.patch(
+            "services.chatgpt_core.local_status_refresh.refresh_local_status_concurrency_from_store",
+            side_effect=lambda: events.append("refresh") or 2,
+        ), mock.patch(
+            "services.chatgpt_core.local_status_refresh.local_status_identity_slot",
+            side_effect=identity_slot,
+        ), mock.patch(
+            "services.chatgpt_core.local_status_refresh.local_status_capacity_slot",
+            side_effect=capacity_slot,
+        ), mock.patch(
+            "core.proxy_utils.resolve_probe_candidate_proxies",
+            return_value=[("", None, "direct")],
+        ), mock.patch(
+            "services.chatgpt_core.status_probe.probe_local_chatgpt_status",
+            side_effect=run_probe,
+        ):
+            result = platform.execute_action("probe_local_status", account, {})
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(
+            events,
+            [
+                "refresh",
+                "identity_enter",
+                "capacity_enter",
+                "probe",
+                "capacity_exit",
+                "identity_exit",
+            ],
+        )
 
     def test_custom_provider_reuses_existing_mailbox_on_second_create_call(self):
         mailbox = _ReuseThenCreateFailMailbox()

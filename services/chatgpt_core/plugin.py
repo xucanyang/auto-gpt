@@ -755,6 +755,59 @@ class ChatGPTPlatform(BasePlatform):
             },
         ]
 
+    @staticmethod
+    def build_local_status_probe_action_result(probe_result: dict) -> dict:
+        summary = (
+            f"认证={probe_result.get('auth', {}).get('state', 'unknown')}, "
+            f"订阅={probe_result.get('subscription', {}).get('plan', 'unknown')}, "
+            f"Codex={probe_result.get('codex', {}).get('state', 'unknown')}"
+        )
+        return {
+            "ok": True,
+            "data": {
+                "message": f"本地状态探测完成：{summary}",
+                "probe": probe_result,
+            },
+            "account_extra_patch": {
+                "chatgpt_local": probe_result,
+            },
+        }
+
+    def probe_local_status_with_candidates(
+        self,
+        account: object,
+        params: dict,
+        *,
+        manage_local_status_slots: bool = True,
+        candidate_state: dict | None = None,
+    ) -> dict:
+        from services.chatgpt_core.local_status_proxy import run_local_status_probe_with_candidates
+        from services.chatgpt_core.status_probe import probe_local_chatgpt_status
+
+        def run_candidates() -> dict:
+            return run_local_status_probe_with_candidates(
+                account,
+                params,
+                probe_local_chatgpt_status,
+                default_mode="global",
+                candidate_state=candidate_state,
+                config_values=self.config.extra if isinstance(self.config.extra, dict) else {},
+            )
+
+        if not manage_local_status_slots:
+            return run_candidates()
+
+        from services.chatgpt_core.local_status_refresh import (
+            local_status_capacity_slot,
+            local_status_identity_slot,
+            refresh_local_status_concurrency_from_store,
+        )
+
+        refresh_local_status_concurrency_from_store()
+        with local_status_identity_slot(account):
+            with local_status_capacity_slot():
+                return run_candidates()
+
     def execute_action(self, action_id: str, account: Account, params: dict) -> dict:
         extra = account.extra or {}
 
@@ -774,63 +827,11 @@ class ChatGPTPlatform(BasePlatform):
         a.extra = extra
 
         if action_id == "probe_local_status":
-            from services.chatgpt_core.status_probe import probe_local_chatgpt_status
-            from core.proxy_utils import resolve_probe_candidate_proxies, is_proxy_error_text
-
-            candidates = resolve_probe_candidate_proxies(
+            probe_result = self.probe_local_status_with_candidates(
+                a,
                 params,
-                fallback_proxy=None,
-                default_mode="global",
             )
-            last_error = None
-            for i, (proxy_url, proxy_pool, source) in enumerate(candidates):
-                try:
-                    probe_result = probe_local_chatgpt_status(
-                        a,
-                        proxy=proxy_url,
-                        use_default_proxy=False,
-                    )
-                    auth_state = str(probe_result.get("auth", {}).get("state") or "").strip()
-                    if auth_state == "probe_failed" and i < len(candidates) - 1:
-                        if proxy_pool is not None and proxy_url:
-                            msg = str(probe_result.get("auth", {}).get("message") or "")
-                            if is_proxy_error_text(msg):
-                                try:
-                                    proxy_pool.report_fail(proxy_url)
-                                except Exception:
-                                    pass
-                        continue
-                    if proxy_pool is not None and proxy_url:
-                        try:
-                            proxy_pool.report_success(proxy_url)
-                        except Exception:
-                            pass
-                    summary = (
-                        f"认证={probe_result.get('auth', {}).get('state', 'unknown')}, "
-                        f"订阅={probe_result.get('subscription', {}).get('plan', 'unknown')}, "
-                        f"Codex={probe_result.get('codex', {}).get('state', 'unknown')}"
-                    )
-                    return {
-                        "ok": True,
-                        "data": {
-                            "message": f"本地状态探测完成：{summary}",
-                            "probe": probe_result,
-                        },
-                        "account_extra_patch": {
-                            "chatgpt_local": probe_result,
-                        },
-                    }
-                except Exception as exc:
-                    last_error = exc
-                    if proxy_pool is not None and proxy_url and is_proxy_error_text(str(exc)):
-                        try:
-                            proxy_pool.report_fail(proxy_url)
-                        except Exception:
-                            pass
-                    if i == len(candidates) - 1:
-                        raise
-            if last_error:
-                raise last_error
+            return self.build_local_status_probe_action_result(probe_result)
 
         if action_id == "sync_cliproxyapi_status":
             from services.cliproxyapi_sync import sync_chatgpt_cliproxyapi_status
