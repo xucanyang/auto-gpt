@@ -12,6 +12,7 @@
 - **筛选组合支持固定账号成员**：`api/accounts.py` 将原有组合契约扩展为向后兼容的 `dynamic / fixed` 两种内容模式；未勾选账号时仍保存动态筛选条件，人工跨页勾选账号后则可从同一个“筛选组合”入口保存固定成员。固定组合使用实例本地配置持久化，支持现有的选择、置顶、复制、编辑、覆盖、还原和删除操作；账号状态变化不会改变成员，新出现的同条件账号也不会自动加入。`GET /api/accounts` 新增短参数 `filter_preset_id`，按组合 ID 分页返回固定成员，避免在 URL 中展开最多 5000 个账号 ID；现有批量任务和 PIX 导出继续复用明确的 `account_ids` 范围。
 - **支付链接列新增“当前有链接 / 当前无链接”筛选**：`frontend/src/pages/Accounts.tsx` 在账号表“支付链接”列的当前链接筛选中增加 `当前有链接`，并保留 `当前无链接`；`services/account_filters.py` 将 `has_link / with_link / current_has_link` 统一展开为 Hosted、PayPal、iDEAL、UPI、PIX、TWINT、Kakao Pay、Team 与 other 等当前实际可打开链接类型，列表接口、批量任务筛选范围和筛选组合复用同一后端语义，避免把历史“已成功提取”误当成当前仍有链接。
 - **新增 Docker 测试规范**：`docs/testing-in-docker.md` 固化运行依赖统一、测试镜像与生产镜像同源、一次性测试容器、临时数据库/共享配置、网络隔离、浏览器资源约束和外部实时烟测分层要求，明确禁止在常驻业务容器或生产挂载上执行完整 pytest。
+- **新增 ChatGPT 注册失败根因分析文档**：`docs/chatgpt-registration-failure-analysis.md` 基于主实例与 Plus 实例的 `task_logs` 数据库全量统计，归纳六大失败根因（Cloudflare IP 级限流、Sentinel Browser 信号量瓶颈、Turnstile Solver 队列化、CSRF/Session 竞态、HME 邮箱池耗尽、OTP 等待窗口冲突），量化并发相关失败占比约 34.6%，并提出 P0-P3 共 8 项改进建议。
 
 ### 优化 (Changed)
 - **ChatGPT HME 恢复原地址 + 单一平台 Tag 组合（v2.10.3）**：`core/base_mailbox.py` 将正常 ChatGPT HME Ready prepare 从严格 `address_mode=base` 改为 `address_mode=platform_default`，由已先行发布的 Helper 按同一物理 HME 最多分配 `base 1 + 一个 +gpt[a-z0-9]{3} Tag = 2` 个身份；不能用两个 Tag 替代原地址加 Tag，early failure 继续复用同一 registration/Tag，历史账号、旧 `+gpt1..4` 和既有 lease 不迁移、不改写。Tag 长度实验仍显式使用隔离的 `random_tag` 模式，其他平台继续遵循 Helper 的通用 `base 1 + random 4 = 5` 组合和四个跨平台 random slot 物理容量。`effective_address_mode=base|random_tag` 现在贯穿 Helper 响应解析、账号邮箱状态白名单和恢复服务，调用方不再从邮箱文本反推实际形态；侧栏版本同步为 `v2.10.3`。
@@ -3253,3 +3254,7 @@
 ## 2026-08-04 11:27:33 +0800
 - 修复手机绑定获取 RT 后本地状态未恢复
 - 发布模式: multi
+
+## 2026-08-04 15:24:02 +0800
+- docs: 新增 ChatGPT 注册失败根因分析文档 (chatgpt-registration-failure-analysis.md)
+- 发布模式: hot
