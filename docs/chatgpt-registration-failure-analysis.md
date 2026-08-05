@@ -92,11 +92,11 @@
 
 任务元数据同时记录 `requested_concurrency` 和 `effective_concurrency`。历史请求中的 `4/5` 不再直接变成 4-5 个执行 worker；显式 `1` 仍保持串行。
 
-注册任务并发与浏览器槽是两套约束。`AUTH_BROWSER_MAX_CONCURRENCY` 控制完整 Camoufox/Auth 浏览器工作，发布配置为主实例 `2`、Plus `3`、Plus2 `2`。单个浏览器注册任务本身最多并发 2，Plus 的第 3 个槽提供同进程跨任务和其他 Auth/Sentinel 工作的总容量余量，但普通共享信号量没有专用预留或优先级；多个并发注册任务仍可能占满全部 3 个槽。
+注册任务并发与浏览器槽是两套约束。`AUTH_BROWSER_MAX_CONCURRENCY` 控制完整 Camoufox/Auth 浏览器工作，发布配置为主实例 `2`、Plus `5`、Plus2 `2`。单个浏览器注册任务本身仍最多并发 2；Plus 的五槽是同进程所有注册任务及其他 Auth/Sentinel 工作共享的总容量，不会把单任务上限放大为 5，也没有任务级专用预留或优先级。
 
 三个业务容器当前不设置应用总内存 `mem_limit`，Docker `Memory=0`、cgroup `memory.max=max`。因此 `sentinel_browser.py` 的第二槽 cgroup 内存判断不会在当前运行态形成硬门控；浏览器最终竞争的是宿主机约 32GB RAM、8GB Swap、8 vCPU、PID 和调度时间。
 
-`shm_size` 只控制容器 `/dev/shm` tmpfs 上限，不是容器总内存。删除该配置通常会回落到 Docker 默认约 64MiB，不会自动获得宿主机全部可用容量。本次 Plus 调整为 `2gb`，主实例和 Plus2 保持 `1gb`；三个业务实例继续保持 `pids_limit=768`，且不新增应用容器总内存硬限制。
+`shm_size` 只控制容器 `/dev/shm` tmpfs 上限，不是容器总内存。删除该配置通常会回落到 Docker 默认约 64MiB，不会自动获得宿主机全部可用容量。Plus 保持 `2gb`，主实例和 Plus2 保持 `1gb`；Plus 的 `pids_limit` 提高到 `1536`，主实例和 Plus2 保持 `768`，且三个实例均不新增应用容器总内存硬限制。Plus 每次申请浏览器槽时要求 `pids.current + 220 <= pids.max`，相邻浏览器启动至少间隔 `4s`；PID 余量不足会释放 semaphore 并输出 `browser_slot=waiting reason=pids` 后重试，避免五个 Camoufox 同时集中拉起。
 
 ### 3.3 独立 Turnstile Solver 当前不在 ChatGPT 注册调用链
 
@@ -106,7 +106,7 @@ ChatGPT 注册确实会处理 Sentinel Turnstile，但当前两条注册链均�
 - 浏览器注册使用自身 Camoufox 页面执行 Sentinel 挑战，并受注册浏览器容量槽控制。
 - `core/base_captcha.py::LocalSolverCaptcha` 才调用独立 Solver 的 `/turnstile` 和 `/result`，但当前 ChatGPT 注册没有 `_make_captcha()` 调用方。
 
-因此不能把当前注册失败或 `browser_slot=waiting` 归因于独立 Solver 队列。发布前 Plus Solver 为 `--thread 4`；本次将 `SOLVER_MAX_BROWSERS` 调整为 6、`SOLVER_WARM_BROWSERS` 保持 1，只是为未来接入独立 Solver 的调用方预留容量，对当前 ChatGPT 注册吞吐没有直接提升。主实例和 Plus2 保持 `4/1`。
+因此不能把当前注册失败或 `browser_slot=waiting` 归因于独立 Solver 队列。Plus 的独立 Solver 从此前的 `6/1` 收敛为 `1/1`，避免未被当前注册链消费的预留浏览器与五个 Auth Browser 槽争抢 PID、CPU 和内存；主实例和 Plus2 保持 `4/1`。这个调整不会降低当前 ChatGPT 注册吞吐。
 
 ### 3.4 CSRF/Session 竞态目前没有证据
 
@@ -135,10 +135,10 @@ graph TD
     IP[代理出口 IP<br/>探测 + 进程级租约]
     MAIL[邮箱资源与 OTP 投递]
     CPU[宿主机 CPU / PID / 调度]
-    SLOT[Auth Browser 槽<br/>主2 / Plus3 / Plus2 2]
+    SLOT[Auth Browser 槽<br/>主2 / Plus5 / Plus2 2]
     SHM[/dev/shm<br/>主 1GiB / Plus 2GiB / Plus2 1GiB]
     FAIL[403 / 429 / 超时 / 阶段失败]
-    SOLVER[独立 Solver<br/>Plus 6/1 容量预留]
+    SOLVER[独立 Solver<br/>Plus 1/1]
 
     P --> IP
     B --> IP
@@ -154,7 +154,7 @@ graph TD
     SHM --> FAIL
 ```
 
-独立 Solver 当前不与 ChatGPT 注册节点或失败节点连边，因为现有注册调用链不消费它；图中的 Solver 仅表示 Plus `6/1` 的未来容量预留。
+独立 Solver 当前不与 ChatGPT 注册节点或失败节点连边，因为现有注册调用链不消费它；图中的 Solver 仅表示 Plus 保留一个 warm 浏览器以兼容其他潜在调用方。
 
 核心结论不是“默认 5 路线程共享 4 个固定瓶颈”，而是注册任务并发、浏览器容量、出口 IP、邮箱资源和宿主机调度相互独立又会叠加。当前证据支持优先限制有效并发、错开启动时间并减少同出口碰撞；不支持把全部 403/429 或 OTP 失败归因于单一容量项。
 
@@ -167,7 +167,7 @@ graph TD
 | P0 | protocol 默认 `2`、硬上限 `3`；browser 默认 `2`、硬上限 `2`；手机号与手动邮箱固定 `1`；记录 requested/effective | 历史显式 `4/5` 会被后端截断；显式 `1` 和非 ChatGPT 注册旧上限保持不变 |
 | P0 | 动态代理缺省使用 `auto` 独立出口；同进程跨任务 active/cooldown 租约与续租；候选预算 `6`、预检 `1`；Plus 本地旧 `false` 迁移为 canonical `auto` | 减少 Plus 同容器任务撞出口，并约束正常路径的代理探测成本；不能承诺消除全部 403/429，跨容器碰撞仍是残余风险 |
 | P1 | ChatGPT 账号尝试启动间隔默认随机 `15-30s` | 抖动作用于相邻账号启动时间，不是每个 HTTP 请求；显式 `0/0` 继续关闭；旧客户端只传最小值时保持固定延迟 |
-| P1 | Plus：Solver `6/1`、SHM `2gb`、Auth Browser `3`；主实例与 Plus2：Solver `4/1`、SHM `1gb`、Auth Browser `2`；均无应用 `mem_limit` | Solver 是未来容量预留；2GiB SHM 增加 Plus 浏览器 IPC 空间，但不代表预占 2GiB，也不改善当前 ChatGPT 注册调用链或 `browser_slot` 排队 |
+| P1 | Plus：Solver `1/1`、SHM `2gb`、Auth Browser `5`、PID `1536`、启动 PID 余量 `220`、启动间隔 `4s`；主实例与 Plus2：Solver `4/1`、SHM `1gb`、Auth Browser `2`、PID `768`，PID 余量与启动间隔关闭；均无应用 `mem_limit` | 五槽提升同进程跨任务总容量，单任务浏览器并发仍为 2；PID 门控和错峰降低集中拉起风险，2GiB SHM 不代表预占 2GiB；Solver 收敛不影响当前 ChatGPT 注册链 |
 
 主要修改边界：
 
@@ -175,7 +175,8 @@ graph TD
 - `api/config.py`：注册容量、延迟和出口租约配置的默认值、保存校验与响应合同。
 - `core/chatgpt_register_exit_ip_registry.py`：同进程原子领取、active TTL、冷却和 IPv6 `/64` 去重。
 - `frontend/src/pages/Accounts.tsx`、`RegisterTaskPage.tsx`、`features/auth/components/RegisterTaskModal.tsx`：前端默认值、模式上限、最大延迟持久化和 payload 对齐。
-- `docker-compose.multi.yml`：三个实例分别设置 Solver 容量，仅 Plus 将 `shm_size` 提高到 `2gb`。
+- `docker-compose.multi.yml`：三个实例分别设置 Solver、Auth Browser、PID 余量和启动间隔，仅 Plus 使用五槽、`2gb` SHM 与 `pids_limit=1536`。
+- `services/chatgpt_core/sentinel_browser.py`：共享容量槽在启动前检查 cgroup PID 余量，并以进程级单调时钟错开实际浏览器事务启动；等待和取消都保持 semaphore 成对释放。
 
 ---
 
@@ -183,6 +184,6 @@ graph TD
 
 1. 独立出口租约目前不跨容器；如果以后同时恢复三个实例的高并发注册，需要单独设计共享运行态协调。
 2. 403/429 仍可能来自 IP 信誉、指纹、Session 或上游策略，独立出口和抖动只能降低相关风险，不能保证消除。
-3. Plus 没有应用总内存上限；SHM 扩容后仍需观察宿主机内存、Swap、CPU PSI 和 PID，避免把可用内存误解为无限浏览器容量。
-4. 当前 ChatGPT 注册不消费独立 Solver。只有出现真实 `/turnstile` 调用和队列指标后，才应继续把 Solver 从 6 提高到 8。
+3. Plus 没有应用总内存上限；五槽启用后仍需观察宿主机内存、Swap、CPU PSI、容器 `pids.current` 和 `browser_slot=waiting`，不能把 PID 余量门控误解为内存保护。
+4. 当前 ChatGPT 注册不消费独立 Solver。只有出现真实 `/turnstile` 调用和队列指标后，才应重新评估 Solver 是否需要超过 `1/1`。
 5. HME 池耗尽需要上游容量治理，不能由本地并发参数补偿。

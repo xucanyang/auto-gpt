@@ -23,7 +23,7 @@
 
 ### Sentinel 红灯是测试契约漂移
 
-[`tests/test_sentinel_browser.py`](../tests/test_sentinel_browser.py) 的内存门控场景行为是正确的：第二个浏览器槽位会等待内存余量恢复，随后两个任务都成功，峰值并发为 2。该测试固定模拟两槽 cgroup 场景；生产多实例通过 `AUTH_BROWSER_MAX_CONCURRENCY_MAIN/PLUS/PLUS2` 选择实际槽位（当前默认 `2/3/2`），不把任务 worker 数直接当作浏览器数。
+[`tests/test_sentinel_browser.py`](../tests/test_sentinel_browser.py) 的资源门控场景行为是正确的：后续浏览器槽会分别在内存或 PID 余量不足时等待，资源恢复后再继续。测试固定模拟 cgroup 场景；生产多实例通过 `AUTH_BROWSER_MAX_CONCURRENCY_MAIN/PLUS/PLUS2` 选择实际槽位（当前默认 `2/5/2`），不把任务 worker 数直接当作浏览器数。Plus 另以 `AUTH_BROWSER_PID_RESERVE=220` 和 `AUTH_BROWSER_LAUNCH_INTERVAL_SECONDS=4` 限制五槽集中拉起；主实例与 Plus2 的两项默认值均为 `0`，保持原启动行为。
 
 历史红灯来自日志文案断言漂移：旧测试查找 `第二槽内存余量不足`，而 [Sentinel 实现](../services/chatgpt_core/sentinel_browser.py) 输出的是稳定结构化字段；当前测试已改为断言：
 

@@ -2958,9 +2958,8 @@ export default function Accounts() {
     return accountFilterPresetSignature(activeFilterPreset.filters) !== accountFilterPresetSignature(currentFilterPresetFilters)
   }, [activeFilterPreset, currentFilterPresetFilters, selectedRowKeys])
   const pinnedFilterPresets = useMemo(() => {
-    const items = filterPresets.filter((item) => item.pinned)
-    return items.slice(0, isMobile ? 4 : 8)
-  }, [filterPresets, isMobile])
+    return filterPresets.filter((item) => item.pinned)
+  }, [filterPresets])
 
   const loadFilterPresets = useCallback(async (silent = false) => {
     setFilterPresetLoading(true)

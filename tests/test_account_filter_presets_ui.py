@@ -40,3 +40,12 @@ def test_fixed_filter_preset_uses_short_preset_id_query_and_existing_batch_scope
     assert "params.set('filter_preset_id', filterPresetId)" in query
     assert "fixed_preset?:" in query
     assert "resolved_account_ids: number[]" in query
+
+
+def test_pinned_filter_preset_bar_renders_every_pinned_combination():
+    page = ACCOUNTS_PAGE.read_text(encoding="utf-8")
+    bar = FILTER_PRESET_BAR.read_text(encoding="utf-8")
+
+    assert "filterPresets.filter((item) => item.pinned)" in page
+    assert "slice(0, isMobile ? 4 : 8)" not in page
+    assert "pinnedFilterPresets.map((preset) => {" in bar

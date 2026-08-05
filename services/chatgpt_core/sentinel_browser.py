@@ -46,6 +46,8 @@ AUTH_BROWSER_MAX_CONCURRENCY = _auth_browser_concurrency_limit()
 _AUTH_BROWSER_SEMAPHORE = threading.BoundedSemaphore(AUTH_BROWSER_MAX_CONCURRENCY)
 _BROWSER_SLOT_STATE_LOCK = threading.Lock()
 _BROWSER_ACTIVE_COUNT = 0
+_BROWSER_LAUNCH_STATE_LOCK = threading.Lock()
+_BROWSER_NEXT_LAUNCH_AT = 0.0
 
 _BROWSER_WORKER_POLL_SECONDS = 0.2
 _BROWSER_WORKER_TERM_GRACE_SECONDS = 2.0
@@ -85,6 +87,69 @@ def _browser_memory_allows_second_slot() -> tuple[bool, int, int, int]:
     if current is None or limit is None or limit <= 0:
         return True, int(current or 0), int(limit or 0), reserve
     return current + reserve <= limit, current, limit, reserve
+
+
+def _auth_browser_pid_reserve() -> int:
+    try:
+        reserve = int(float(os.getenv("AUTH_BROWSER_PID_RESERVE", "0") or 0))
+    except (TypeError, ValueError):
+        reserve = 0
+    return max(0, min(reserve, 4096))
+
+
+def _browser_pid_headroom_allows_slot() -> tuple[bool, int, int, int]:
+    current = _read_int_file("/sys/fs/cgroup/pids.current")
+    limit = _read_int_file("/sys/fs/cgroup/pids.max")
+    reserve = _auth_browser_pid_reserve()
+    if reserve <= 0 or current is None or limit is None or limit <= 0:
+        return True, int(current or 0), int(limit or 0), reserve
+    return current + reserve <= limit, current, limit, reserve
+
+
+def _auth_browser_launch_interval_seconds() -> float:
+    try:
+        interval = float(
+            os.getenv("AUTH_BROWSER_LAUNCH_INTERVAL_SECONDS", "0") or 0
+        )
+    except (TypeError, ValueError):
+        interval = 0.0
+    return max(0.0, min(interval, 60.0))
+
+
+def _wait_for_browser_launch_turn(
+    operation: str,
+    *,
+    logger: Callable[[str], None],
+    stop_check: Optional[Callable[[], None]] = None,
+) -> None:
+    """Space process-wide browser launches without reducing active capacity."""
+
+    global _BROWSER_NEXT_LAUNCH_AT
+    interval = _auth_browser_launch_interval_seconds()
+    if interval <= 0:
+        return
+    if stop_check is not None:
+        stop_check()
+
+    with _BROWSER_LAUNCH_STATE_LOCK:
+        now = time.monotonic()
+        launch_at = max(now, _BROWSER_NEXT_LAUNCH_AT)
+        _BROWSER_NEXT_LAUNCH_AT = launch_at + interval
+
+    wait_logged = False
+    while True:
+        if stop_check is not None:
+            stop_check()
+        remaining = launch_at - time.monotonic()
+        if remaining <= 0:
+            return
+        if not wait_logged:
+            logger(
+                "[控制] browser_launch=waiting reason=stagger "
+                f"delay={remaining:.3f} interval={interval:.3f} operation={operation}"
+            )
+            wait_logged = True
+        time.sleep(min(remaining, 0.2))
 
 
 def _browser_hard_timeout_seconds(env_name: str, default: float) -> float:
@@ -514,6 +579,10 @@ def browser_capacity_slot(
             return False, "capacity", None
         try:
             with _BROWSER_SLOT_STATE_LOCK:
+                pid_state = _browser_pid_headroom_allows_slot()
+                if not pid_state[0]:
+                    _AUTH_BROWSER_SEMAPHORE.release()
+                    return False, "pids", pid_state
                 if _BROWSER_ACTIVE_COUNT >= 1:
                     memory_state = _browser_memory_allows_second_slot()
                     if not memory_state[0]:
@@ -525,7 +594,7 @@ def browser_capacity_slot(
             raise
         return True, "", None
 
-    acquired, wait_reason, memory_state = _try_acquire(blocking=False)
+    acquired, wait_reason, gate_state = _try_acquire(blocking=False)
     logged_wait_reasons: set[str] = set()
 
     def _log_wait(reason: str, state: Optional[tuple[bool, int, int, int]]) -> None:
@@ -539,26 +608,33 @@ def browser_capacity_slot(
                 f"current={current} limit={limit} reserve={reserve} operation={operation}"
             )
             return
+        if reason == "pids" and state is not None:
+            _allowed, current, limit, reserve = state
+            log(
+                "[控制] browser_slot=waiting reason=pids "
+                f"current={current} limit={limit} reserve={reserve} operation={operation}"
+            )
+            return
         log(
             "[控制] browser_slot=waiting reason=capacity "
             f"limit={AUTH_BROWSER_MAX_CONCURRENCY} operation={operation}"
         )
 
     if not acquired:
-        _log_wait(wait_reason, memory_state)
+        _log_wait(wait_reason, gate_state)
         while not acquired:
             if stop_check is not None:
                 stop_check()
-            if wait_reason == "memory":
+            if wait_reason in {"memory", "pids"}:
                 time.sleep(0.5)
-                acquired, wait_reason, memory_state = _try_acquire(blocking=False)
+                acquired, wait_reason, gate_state = _try_acquire(blocking=False)
             else:
-                acquired, wait_reason, memory_state = _try_acquire(
+                acquired, wait_reason, gate_state = _try_acquire(
                     blocking=True,
                     timeout=0.5,
                 )
             if not acquired:
-                _log_wait(wait_reason, memory_state)
+                _log_wait(wait_reason, gate_state)
         log(
             "[控制] browser_slot=acquired after_wait=true "
             f"limit={AUTH_BROWSER_MAX_CONCURRENCY} operation={operation}"
@@ -586,6 +662,11 @@ def run_with_browser_capacity(
         logger=logger,
         stop_check=stop_check,
     ):
+        _wait_for_browser_launch_turn(
+            operation,
+            logger=logger or (lambda _message: None),
+            stop_check=stop_check,
+        )
         return callback()
 
 
