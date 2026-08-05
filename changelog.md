@@ -51,6 +51,7 @@
 - **统一测试文档入口**：`README.md`、`AGENTS.md` 与 `docs/docker-image-release.md` 现在统一指向 Docker 测试规范，移除会吞掉收集失败的 `pytest tests -q || true` 作为推荐门禁，明确当前 `requirements-test.txt`、`docker-compose.test.yml` 和测试脚本仍待落地。
 
 ### 修复 (Fixed)
+- **修复失效测活将 OTP 成功响应误判为超时（v2.12.8）**：`services/chatgpt_core/any_auto/browser_register.py` 将验证码提交后的同步 Playwright 等待改为可持续派发 response/navigation 回调的页面事件轮询，并把提交窗口从固定 20 秒扩展为 45 秒；截止时再次排空事件队列并重新核对 `/api/accounts/email-otp/validate` 响应、当前页面和页面错误，避免 `validate -> 200`、OAuth callback 与 `chatgpt.com/ -> 200` 已完成后仍返回“验证码提交后未收到校验响应”。响应监听现在在输入 OTP 前注册，覆盖末位输入触发自动提交、页面推进导致输入框消失和 Continue 按钮已消失的分支；明确 `4xx`（包括 `account_deactivated`）仍优先保留结构化失败详情，未收到响应且页面未推进时继续关闭式失败。`tests/test_any_auto_web_session_contract.py` 新增旧超时边界延迟派发成功响应和输入时自动提交的回归合同；侧栏可见版本同步为 `v2.12.8`。
 - **修复失效测活吞掉 OTP 403 真实停用原因并同步账号终态（v2.12.7）**：`services/chatgpt_core/any_auto/browser_register.py` 在 Camoufox 验证码页提交前定向监听 `auth.openai.com/api/accounts/email-otp/validate`，仅提取并有界脱敏响应中的 `code/type/message`；明确的 `account_deactivated/account_deleted/account_delete/deactivated_workspace` 会立即交回失效测活分类器，不再等待 20 秒后降级成“验证码页提交后未跳转”。`services/chatgpt_core/invalid_account_recheck.py`、`subscription_auth_capture.py` 与 `api/actions.py` 将明确停用写为账号主状态 `account_deactivated`，同步 `chatgpt_capabilities` 和 `account_list_state`，并通过独立短事务保证补抓外层回滚不会抹掉停用证据；裸 `403`、Cloudflare HTML 拒绝、`invalid_code` 和 OTP 限流仍分别保留原始语义，不会仅凭 HTTP 状态误判账号停用。
 - **修复手机号绑定未识别已删除或停用账号（v2.12.7）**：`api/tasks.py` 为串行、并行手机号绑定统一增加 `account_deactivated` 账号错误分类和可见标签；当明确死号发生在 OAuth/邮箱 OTP 阶段且收码服务尚未发码、收码或产生号码侧状态时，当前手机号回退给下一个账号继续使用，不再被记为未知错误或错误消耗。手机号已经触碰 OpenAI/收码 API 时仍按真实号码结果收口，避免把已使用资源重新分配。侧栏可见版本同步为 `v2.12.7`。
 - **修复 HME Ready 转发邮件把路由地址数字误当 OTP（v2.12.6）**：`core/base_mailbox.py` 将 HME Ready 的别名归属与验证码提取拆成两个严格边界：`Return-Path`、`Delivered-To`、`X-ICLOUD-HME` 等原始传输头继续只用于物理 HME/`+tag` 路由匹配，验证码候选不再包含原始 MIME 或路由地址。新增标准库 MIME 解码，支持 Base64、Quoted-Printable、multipart、编码主题和中英日验证码文案，并从可见 `text/plain` / `text/html` 正文中排除附件、`head/style/script/noscript`、HTML 注释与追踪 URL 后评分取码；正文无法解析时继续等待或明确超时，不再从 `b@666800.xyz` 等转发地址误提取 `666800` 并触发 `/api/accounts/email-otp/validate -> 403`。该共享路径同时覆盖 ChatGPT 注册、失效测活和使用持久化 mailbox state 的恢复链；非 HME 邮箱实现、`before_ids`、`otp_sent_at`、排除码、Helper lease/finalize 与 `account_deactivated` 判定均保持原合同。侧栏可见版本同步为 `v2.12.6`。
@@ -3328,4 +3329,8 @@
 
 ## 2026-08-05 21:03:43 +0800
 - 修复失效测活停用响应识别并同步手机绑定账号状态 v2.12.7
+- 发布模式: multi
+
+## 2026-08-05 21:55:41 +0800
+- 修复失效测活 OTP 成功响应超时竞态 v2.12.8
 - 发布模式: multi

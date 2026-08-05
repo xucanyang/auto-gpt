@@ -82,6 +82,112 @@ class AnyAutoWebSessionContractTests(unittest.TestCase):
         )
 
     @unittest.skipUnless(_CAMOUFOX_AVAILABLE, "camoufox is only installed in the runtime image")
+    def test_otp_submit_accepts_validate_200_dispatched_at_timeout_boundary(self):
+        page = mock.Mock()
+        page.url = "https://auth.openai.com/email-verification"
+        page.locator.return_value.count.return_value = 0
+        otp_input = page.get_by_label.return_value.first
+        otp_input.input_value.return_value = "123456"
+        captured_response_handler = {}
+        click_state = {"clicked": False, "flushed": False}
+
+        def register_handler(event, handler):
+            if event == "response":
+                captured_response_handler["handler"] = handler
+
+        page.on.side_effect = register_handler
+        response = mock.Mock()
+        response.url = "https://auth.openai.com/api/accounts/email-otp/validate"
+        response.status = 200
+        response.json.return_value = {}
+
+        def click_submit(*_args, **_kwargs):
+            click_state["clicked"] = True
+            return 'button[type="submit"]'
+
+        def flush_queued_response(_milliseconds):
+            if click_state["clicked"] and not click_state["flushed"]:
+                click_state["flushed"] = True
+                captured_response_handler["handler"](response)
+                page.url = "https://chatgpt.com/"
+
+        def derive_state(current_page):
+            page_type = "chatgpt_home" if "chatgpt.com" in str(current_page.url or "") else "email_otp_verification"
+            return {"page_type": page_type, "current_url": str(current_page.url or "")}
+
+        page.wait_for_timeout.side_effect = flush_queued_response
+        with (
+            mock.patch.object(browser_register, "_browser_pause"),
+            mock.patch.object(browser_register, "_click_first", side_effect=click_submit),
+            mock.patch.object(browser_register, "_derive_registration_state_from_page", side_effect=derive_state),
+            mock.patch.object(browser_register.time, "sleep"),
+            mock.patch.object(browser_register.time, "monotonic", side_effect=[100.0, 146.0]),
+        ):
+            result = browser_register._submit_otp_via_page(
+                page,
+                "123456",
+                lambda _message: None,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], 200)
+        self.assertEqual(result["url"], "https://chatgpt.com/")
+        self.assertTrue(click_state["flushed"])
+        page.remove_listener.assert_called_once_with(
+            "response",
+            captured_response_handler["handler"],
+        )
+
+    @unittest.skipUnless(_CAMOUFOX_AVAILABLE, "camoufox is only installed in the runtime image")
+    def test_otp_submit_listener_captures_auto_submit_while_typing(self):
+        page = mock.Mock()
+        page.url = "https://auth.openai.com/email-verification"
+        page.locator.return_value.count.return_value = 0
+        otp_input = page.get_by_label.return_value.first
+        otp_input.input_value.return_value = "123456"
+        captured_response_handler = {}
+
+        def register_handler(event, handler):
+            if event == "response":
+                captured_response_handler["handler"] = handler
+
+        page.on.side_effect = register_handler
+        response = mock.Mock()
+        response.url = "https://auth.openai.com/api/accounts/email-otp/validate"
+        response.status = 200
+        response.json.return_value = {}
+
+        def type_and_auto_submit(*_args, **_kwargs):
+            captured_response_handler["handler"](response)
+            page.url = "https://chatgpt.com/"
+
+        def derive_state(current_page):
+            page_type = "chatgpt_home" if "chatgpt.com" in str(current_page.url or "") else "email_otp_verification"
+            return {"page_type": page_type, "current_url": str(current_page.url or "")}
+
+        otp_input.type.side_effect = type_and_auto_submit
+        with (
+            mock.patch.object(browser_register, "_browser_pause") as browser_pause,
+            mock.patch.object(browser_register, "_click_first") as click_first,
+            mock.patch.object(browser_register, "_derive_registration_state_from_page", side_effect=derive_state),
+            mock.patch.object(browser_register.time, "sleep"),
+        ):
+            result = browser_register._submit_otp_via_page(
+                page,
+                "123456",
+                lambda _message: None,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], 200)
+        click_first.assert_not_called()
+        browser_pause.assert_not_called()
+        page.remove_listener.assert_called_once_with(
+            "response",
+            captured_response_handler["handler"],
+        )
+
+    @unittest.skipUnless(_CAMOUFOX_AVAILABLE, "camoufox is only installed in the runtime image")
     def test_otp_error_summary_keeps_rate_limit_without_marking_deactivated(self):
         response = mock.Mock()
         response.status = 403

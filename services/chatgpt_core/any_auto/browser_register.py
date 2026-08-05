@@ -70,6 +70,10 @@ OTP_INPUT_SELECTORS = [
     "input[id*='code' i]",
 ]
 
+OTP_SUBMIT_TIMEOUT_SECONDS = 45.0
+OTP_EVENT_POLL_MILLISECONDS = 250
+OTP_FINAL_EVENT_FLUSH_COUNT = 3
+
 SIGNUP_RECOVERY_SELECTORS = [
     'a:has-text("Sign up")',
     'button:has-text("Sign up")',
@@ -3260,6 +3264,87 @@ def _submit_otp_via_page(page, code: str, log) -> dict:
             "text": "",
         }
 
+    validation_responses: list[object] = []
+    listener_attached = False
+    listener_attach_attempted = False
+
+    def _capture_validation_response(response) -> None:
+        try:
+            parsed = urlparse(str(getattr(response, "url", "") or ""))
+        except Exception:
+            return
+        if parsed.hostname == "auth.openai.com" and parsed.path.rstrip("/").endswith(
+            "/api/accounts/email-otp/validate"
+        ):
+            validation_responses.append(response)
+
+    def _ensure_validation_listener() -> None:
+        nonlocal listener_attached, listener_attach_attempted
+        if listener_attached or listener_attach_attempted:
+            return
+        listener_attach_attempted = True
+        try:
+            page.on("response", _capture_validation_response)
+        except Exception as exc:
+            log(f"验证码校验响应监听未启用，将使用页面状态兜底: {sanitize_error_message(exc)[:160]}")
+            return
+        listener_attached = True
+
+    def _remove_validation_listener() -> None:
+        nonlocal listener_attached
+        if not listener_attached:
+            return
+        try:
+            page.remove_listener("response", _capture_validation_response)
+        except Exception:
+            pass
+        listener_attached = False
+
+    def _validation_status(response) -> int:
+        try:
+            return int(getattr(response, "status", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _current_url() -> str:
+        try:
+            return str(page.url or "")
+        except Exception:
+            return ""
+
+    def _settled_otp_result() -> dict | None:
+        current_url = _current_url()
+        validation_status = 0
+        if validation_responses:
+            validation_response = validation_responses[-1]
+            validation_status = _validation_status(validation_response)
+            if validation_status >= 400:
+                return {
+                    "ok": False,
+                    "status": validation_status,
+                    "url": current_url,
+                    "data": None,
+                    "text": _auth_response_error_text(validation_response),
+                }
+
+        advanced_state = _otp_advanced_state(page)
+        if advanced_state is None:
+            return None
+        return {
+            "ok": True,
+            "status": validation_status if 200 <= validation_status < 400 else 200,
+            "url": current_url or str(advanced_state.get("current_url") or ""),
+            "data": None,
+            "text": "",
+        }
+
+    def _pump_page_events(milliseconds: int = OTP_EVENT_POLL_MILLISECONDS) -> None:
+        delay_ms = max(int(milliseconds or 0), 1)
+        try:
+            page.wait_for_timeout(delay_ms)
+        except Exception:
+            time.sleep(delay_ms / 1000)
+
     filled = False
 
     # 先尝试 6 格 OTP 输入框
@@ -3269,6 +3354,7 @@ def _submit_otp_via_page(page, code: str, log) -> dict:
         )
         count = digit_inputs.count()
         if count >= len(otp):
+            _ensure_validation_listener()
             done = 0
             for i in range(min(count, len(otp))):
                 box = digit_inputs.nth(i)
@@ -3302,6 +3388,7 @@ def _submit_otp_via_page(page, code: str, log) -> dict:
                 target.wait_for(state="visible", timeout=1200)
                 target.click(timeout=1200)
                 target.fill("")
+                _ensure_validation_listener()
                 target.type(otp, delay=random.randint(18, 45))
                 final_value = str(target.input_value() or "").strip()
                 if final_value:
@@ -3326,6 +3413,7 @@ def _submit_otp_via_page(page, code: str, log) -> dict:
                 if target.is_visible(timeout=2000):
                     target.click(timeout=1500)
                     target.fill("")
+                    _ensure_validation_listener()
                     target.type(otp, delay=random.randint(18, 45))
                     if str(target.input_value() or "").strip():
                         filled = True
@@ -3335,36 +3423,24 @@ def _submit_otp_via_page(page, code: str, log) -> dict:
                 continue
 
     if not filled:
-        advanced_state = _otp_advanced_state(page)
-        if advanced_state is not None:
-            return {
-                "ok": True,
-                "status": 200,
-                "url": str(page.url or advanced_state.get("current_url") or ""),
-                "data": None,
-                "text": "",
-            }
+        settled_result = _settled_otp_result()
+        if settled_result is not None:
+            _remove_validation_listener()
+            return settled_result
         page_error = _otp_page_error_text(page)
         location = _safe_page_location(page)
         detail = page_error or "验证码页未找到可填写输入框"
         if location:
             detail = f"{detail} (page={location})"
-        return {"ok": False, "status": 0, "url": page.url, "data": None, "text": detail}
+        _remove_validation_listener()
+        return {"ok": False, "status": 0, "url": _current_url(), "data": None, "text": detail}
 
+    _ensure_validation_listener()
+    settled_result = _settled_otp_result()
+    if settled_result is not None:
+        _remove_validation_listener()
+        return settled_result
     _browser_pause(page)
-    validation_responses: list[object] = []
-
-    def _capture_validation_response(response) -> None:
-        try:
-            parsed = urlparse(str(getattr(response, "url", "") or ""))
-        except Exception:
-            return
-        if parsed.hostname == "auth.openai.com" and parsed.path.rstrip("/").endswith(
-            "/api/accounts/email-otp/validate"
-        ):
-            validation_responses.append(response)
-
-    page.on("response", _capture_validation_response)
     try:
         submit_selector = _click_first(
             page,
@@ -3381,64 +3457,62 @@ def _submit_otp_via_page(page, code: str, log) -> dict:
             timeout=8,
         )
         if not submit_selector:
+            settled_result = _settled_otp_result()
+            if settled_result is not None:
+                return settled_result
             page_error = _otp_page_error_text(page)
+            settled_result = _settled_otp_result()
+            if settled_result is not None:
+                return settled_result
             return {
                 "ok": False,
                 "status": 0,
-                "url": page.url,
+                "url": _current_url(),
                 "data": None,
                 "text": page_error or "验证码页未找到 Continue 按钮",
             }
         log(f"验证码页已点击继续按钮: {submit_selector}")
 
-        deadline = time.time() + 20
-        last_url = page.url
-        while time.time() < deadline:
-            current_url = page.url
-            last_url = current_url or last_url
+        deadline = time.monotonic() + OTP_SUBMIT_TIMEOUT_SECONDS
+        while time.monotonic() < deadline:
+            settled_result = _settled_otp_result()
+            if settled_result is not None:
+                return settled_result
+            remaining_ms = max(int((deadline - time.monotonic()) * 1000), 1)
+            _pump_page_events(min(OTP_EVENT_POLL_MILLISECONDS, remaining_ms))
 
-            if validation_responses:
-                validation_response = validation_responses[-1]
-                try:
-                    validation_status = int(getattr(validation_response, "status", 0) or 0)
-                except (TypeError, ValueError):
-                    validation_status = 0
-                if validation_status >= 400:
-                    return {
-                        "ok": False,
-                        "status": validation_status,
-                        "url": current_url,
-                        "data": None,
-                        "text": _auth_response_error_text(validation_response),
-                    }
+        # Sync Playwright dispatches queued response/navigation callbacks while
+        # executing Playwright APIs. Flush once more at the deadline, then
+        # re-check both the validate response and the actual page state.
+        for _ in range(OTP_FINAL_EVENT_FLUSH_COUNT):
+            _pump_page_events()
+            settled_result = _settled_otp_result()
+            if settled_result is not None:
+                return settled_result
 
-            advanced_state = _otp_advanced_state(page)
-            if advanced_state is not None:
-                return {"ok": True, "status": 200, "url": current_url, "data": None, "text": ""}
-            time.sleep(0.5)
-
+        page_error = _otp_page_error_text(page)
+        settled_result = _settled_otp_result()
+        if settled_result is not None:
+            return settled_result
         if validation_responses:
-            response_summary = _auth_response_error_text(validation_responses[-1])
+            validation_response = validation_responses[-1]
+            response_summary = _auth_response_error_text(validation_response)
             return {
                 "ok": False,
-                "status": int(getattr(validation_responses[-1], "status", 0) or 0),
-                "url": last_url,
+                "status": _validation_status(validation_response),
+                "url": _current_url(),
                 "data": None,
                 "text": f"验证码校验响应后页面未推进: {response_summary}",
             }
-        page_error = _otp_page_error_text(page)
         return {
             "ok": False,
             "status": 0,
-            "url": last_url,
+            "url": _current_url(),
             "data": None,
             "text": page_error or "验证码提交后未收到校验响应",
         }
     finally:
-        try:
-            page.remove_listener("response", _capture_validation_response)
-        except Exception:
-            pass
+        _remove_validation_listener()
 
 
 def _submit_about_you_via_page(
