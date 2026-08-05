@@ -6,6 +6,7 @@ from unittest import mock
 
 from sqlmodel import Session, SQLModel, create_engine
 
+from api import actions as api_actions
 from core import db as core_db
 from core.db import AccountModel
 from services.chatgpt_core import subscription_auth_capture
@@ -273,6 +274,77 @@ class SubscriptionAuthCaptureTests(unittest.TestCase):
         self.assertTrue(result["data"]["retryable"])
         self.assertEqual(len(login_calls), 2)
         sleep_mock.assert_not_called()
+
+    def test_account_deactivated_is_not_retried_and_persists_terminal_status(self):
+        account_id = self._add_account(status="subscribed")
+        login_calls, email_patch, engine_patch, config_patch = self._patch_capture_runtime(
+            tokens=None,
+            error=(
+                "account_deactivated: You do not have an account because it has been "
+                "deleted or deactivated."
+            ),
+        )
+
+        with (
+            email_patch,
+            engine_patch,
+            config_patch,
+            mock.patch.object(subscription_auth_capture.time, "sleep") as sleep_mock,
+        ):
+            result = subscription_auth_capture.capture_subscription_auth_for_account(
+                account_id,
+                allow_phone_verification=True,
+                retry_delays_seconds=[0, 0],
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["data"]["error_code"], "account_deactivated")
+        self.assertEqual(result["data"]["auth_capture"]["error_code"], "account_deactivated")
+        self.assertEqual(len(login_calls), 1)
+        sleep_mock.assert_not_called()
+        with Session(self.engine) as session:
+            account = session.get(AccountModel, account_id)
+            list_state = session.get(core_db.AccountListStateModel, account_id)
+            extra = account.get_extra()
+
+        self.assertEqual(account.status, "account_deactivated")
+        self.assertEqual(extra["chatgpt_last_auth_capture"]["error_code"], "account_deactivated")
+        self.assertEqual(extra["chatgpt_capabilities"]["auth_level"], "invalid")
+        self.assertEqual(extra["chatgpt_capabilities"]["upload_gate"], "blocked_auth_invalid")
+        self.assertIsNotNone(list_state)
+
+    def test_action_result_applier_promotes_explicit_deactivation(self):
+        account_id = self._add_account(status="pending_payment")
+        result = {
+            "ok": False,
+            "error": (
+                "account_deactivated: You do not have an account because it has been "
+                "deleted or deactivated."
+            ),
+            "data": {
+                "message": "Account has been deleted or deactivated.",
+                "error_code": "account_deactivated",
+                "auth_capture": {
+                    "ok": False,
+                    "error_code": "account_deactivated",
+                },
+            },
+        }
+
+        with Session(self.engine) as session:
+            account = session.get(AccountModel, account_id)
+            api_actions._apply_chatgpt_resume_auth_result(account, result, session)
+            session.commit()
+
+        with Session(self.engine) as session:
+            account = session.get(AccountModel, account_id)
+            list_state = session.get(core_db.AccountListStateModel, account_id)
+            extra = account.get_extra()
+
+        self.assertEqual(account.status, "account_deactivated")
+        self.assertEqual(extra["chatgpt_capabilities"]["auth_level"], "invalid")
+        self.assertEqual(extra["chatgpt_capabilities"]["upload_gate"], "blocked_auth_invalid")
+        self.assertIsNotNone(list_state)
 
     def test_failed_phone_auth_persists_refreshed_mailbox_id_only(self):
         original_state = {

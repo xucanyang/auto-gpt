@@ -135,7 +135,7 @@ def _message_for_status(status: str, raw_error: str = "") -> str:
     if status == "recovered_access_token":
         return "失效测活成功，已重新保存完整 ChatGPT Web Session"
     if status == "account_deactivated":
-        return "账号已被删除或停用，保持失效状态"
+        return "账号已被删除或停用，已标记 account_deactivated"
     if status == "password_invalid":
         return "登录失败，密码可能不正确"
     if status == "login_blocked":
@@ -405,13 +405,16 @@ def _persist_recheck_failure(
             if cleaned_mailbox_state:
                 extra["chatgpt_mailbox_state"] = cleaned_mailbox_state
         extra = persist_account_browser_fingerprint(extra, source="invalid_account_recheck", overwrite=False)
-        account.status = "invalid"
+        account.status = "account_deactivated" if status == "account_deactivated" else "invalid"
         extra["chatgpt_capabilities"] = classify_chatgpt_capabilities(account)
         extra["chatgpt_capabilities"]["auth_level"] = "invalid"
         extra["chatgpt_capabilities"]["upload_gate"] = "blocked_auth_invalid"
         account.set_extra(extra)
         account.updated_at = _utcnow()
         session.add(account)
+        from services.account_filters import upsert_account_list_state_for_account_ids
+
+        upsert_account_list_state_for_account_ids(session, [account.id], commit=False)
         session.commit()
         session.refresh(account)
         return {

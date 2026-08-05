@@ -12,7 +12,11 @@ from core.db import AccountModel
 from core.config_store import config_store
 from core.proxy_utils import normalize_proxy_url
 from core.task_runtime import TaskInterruption
-from services.chatgpt_account_state import apply_auth_capture_status, classify_chatgpt_capabilities
+from services.chatgpt_account_state import (
+    apply_auth_capture_status,
+    classify_chatgpt_capabilities,
+    is_account_deactivated_message,
+)
 from services.chatgpt_core.task_logging import redact_log_text, redact_proxy_url, sanitize_error_message, sanitize_task_detail
 from .chatgpt_registration_mode_adapter import RefreshTokenChatGPTRegistrationAdapter
 from .account_fingerprint import (
@@ -131,6 +135,8 @@ def _classify_capture_error(error_text: str, *, allow_phone_verification: bool) 
     text = str(error_text or "").strip()
     if not text:
         return "auth_capture_failed", False
+    if is_account_deactivated_message("", text):
+        return "account_deactivated", False
     if allow_phone_verification and _contains_any(text, PHONE_UNAVAILABLE_MARKERS):
         return "phone_verification_unavailable", False
     if _contains_any(text, ADD_PHONE_ERROR_MARKERS):
@@ -278,6 +284,35 @@ def _persist_restored_mailbox_state(
         account.set_extra(extra)
         account.updated_at = _utcnow()
         session.add(account)
+        session.commit()
+        return True
+
+
+def _persist_account_deactivated_failure(
+    account_id: int,
+    *,
+    auth_capture: dict[str, Any],
+) -> bool:
+    """Persist a terminal OpenAI deactivation independently of caller sessions."""
+
+    with Session(core_db.engine) as session:
+        account = session.get(AccountModel, int(account_id or 0))
+        if account is None or account.platform != "chatgpt":
+            return False
+        account.status = "account_deactivated"
+        extra = account.get_extra()
+        extra["chatgpt_last_auth_capture"] = dict(auth_capture)
+        extra["chatgpt_subscription_auth_result"] = dict(auth_capture)
+        capabilities = classify_chatgpt_capabilities(account, local_probe=extra.get("chatgpt_local"))
+        capabilities["auth_level"] = "invalid"
+        capabilities["upload_gate"] = "blocked_auth_invalid"
+        extra["chatgpt_capabilities"] = capabilities
+        account.set_extra(extra)
+        account.updated_at = _utcnow()
+        session.add(account)
+        from services.account_filters import upsert_account_list_state_for_account_ids
+
+        upsert_account_list_state_for_account_ids(session, [account.id], commit=False)
         session.commit()
         return True
 
@@ -615,6 +650,24 @@ def capture_subscription_auth_for_account(
     message = sanitize_error_message(last_error or "补抓 Auth 失败")
     _log(f"[补抓] 失败：{message}")
     _timeline_log(log_fn, f"[补抓Auth] 失败：{message}")
+    failed_auth_capture = {
+        "ok": False,
+        "email": email,
+        "source": "subscription_auth_capture",
+        "allow_phone_verification": allow_phone_verification,
+        "allow_add_phone_verification": allow_add_phone_verification,
+        "allow_existing_phone_verification": allow_existing_phone_verification,
+        "attempts": max_attempts,
+        "error_code": last_error_code,
+        "error": sanitize_error_message(message),
+        "captured_at": _utcnow().isoformat(),
+    }
+    if last_error_code == "account_deactivated":
+        _persist_account_deactivated_failure(
+            account_id,
+            auth_capture=failed_auth_capture,
+        )
+
     return {
         "ok": False,
         "error": sanitize_error_message(message),
@@ -624,16 +677,6 @@ def capture_subscription_auth_for_account(
             "retryable": bool(retryable),
             "allow_phone_verification": allow_phone_verification,
             "logs": list(action_logs),
-            "auth_capture": {
-                "ok": False,
-                "email": email,
-                "source": "subscription_auth_capture",
-                "allow_phone_verification": allow_phone_verification,
-                "allow_add_phone_verification": allow_add_phone_verification,
-                "allow_existing_phone_verification": allow_existing_phone_verification,
-                "attempts": max_attempts,
-                "error_code": last_error_code,
-                "error": sanitize_error_message(message),
-            },
+            "auth_capture": failed_auth_capture,
         },
     }
