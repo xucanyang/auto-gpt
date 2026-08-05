@@ -176,7 +176,7 @@ class InvalidAccountRecheckTests(unittest.TestCase):
         self.assertIn("chatgpt_local", extra)
         self.assertFalse(extra["chatgpt_invalid_recheck"]["web_session_complete"])
 
-    def test_deactivated_result_persists_terminal_status_and_reason(self):
+    def test_deactivated_result_stays_invalid_and_records_reason(self):
         account_id = self._add_account()
         with (
             mock.patch.object(invalid_account_recheck.config_store, "get_all", return_value={}),
@@ -198,13 +198,11 @@ class InvalidAccountRecheckTests(unittest.TestCase):
         self.assertEqual(capture.call_count, 1)
         with Session(self.engine) as session:
             account = session.get(AccountModel, account_id)
-            list_state = session.get(core_db.AccountListStateModel, account_id)
             extra = account.get_extra()
-        self.assertEqual(account.status, "account_deactivated")
+        self.assertEqual(account.status, "invalid")
         self.assertEqual(account.token, "old-token")
         self.assertEqual(extra["chatgpt_invalid_recheck"]["status"], "account_deactivated")
         self.assertEqual(extra["chatgpt_capabilities"]["auth_level"], "invalid")
-        self.assertIsNotNone(list_state)
 
     def test_web_session_capture_uses_login_only_browser_transport(self):
         transport_result = SimpleNamespace(

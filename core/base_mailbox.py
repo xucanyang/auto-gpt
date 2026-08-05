@@ -32,11 +32,6 @@ VERIFICATION_KEYWORDS = (
     "验证代码",
     "临时验证码",
     "临时代码",
-    "認証コード",
-    "検証コード",
-    "ログインコード",
-    "ワンタイムコード",
-    "一時ログインコード",
 )
 
 
@@ -169,71 +164,10 @@ class BaseMailbox(ABC):
         text = str(content or "")
         if not text:
             return ""
-        text = re.sub(r"(?is)<!--.*?-->", " ", text)
-        text = re.sub(
-            r"(?is)<(?:head|style|script|noscript)\b[^>]*>.*?"
-            r"</(?:head|style|script|noscript)\s*>",
-            " ",
-            text,
-        )
-        text = re.sub(r"(?i)<br\s*/?>|</(?:p|div|li|tr|td|h[1-6])\s*>", "\n", text)
-        text = re.sub(r"<[^>]+>", " ", text)
         text = html.unescape(text)
-        text = re.sub(r"https?://\S+", " ", text, flags=re.IGNORECASE)
-        text = re.sub(r"[ \t\f\v]+", " ", text)
-        text = re.sub(r" *\n *", "\n", text)
-        text = re.sub(r"\n{3,}", "\n\n", text).strip()
+        text = re.sub(r"<[^>]+>", " ", text)
+        text = re.sub(r"\s+", " ", text).strip()
         return text
-
-    def _parse_mime_visible_content(self, raw_message: str) -> tuple[str, str, str]:
-        """Return decoded subject, plain text and HTML without transport headers."""
-        from email import policy
-        from email.parser import Parser
-
-        raw = str(raw_message or "")
-        if not raw:
-            return "", "", ""
-
-        try:
-            message = Parser(policy=policy.default).parsestr(raw)
-        except Exception:
-            return "", "", ""
-
-        subject = str(message.get("subject") or "").strip()
-        plain_parts: list[str] = []
-        html_parts: list[str] = []
-        for part in message.walk():
-            if part.is_multipart():
-                continue
-            if part.get_content_disposition() == "attachment" or part.get_filename():
-                continue
-            content_type = str(part.get_content_type() or "").lower()
-            if content_type not in {"text/plain", "text/html"}:
-                continue
-            try:
-                content = part.get_content()
-            except Exception:
-                try:
-                    payload = part.get_payload(decode=True)
-                    if isinstance(payload, bytes):
-                        content = payload.decode(
-                            part.get_content_charset() or "utf-8",
-                            errors="replace",
-                        )
-                    else:
-                        content = str(payload or "")
-                except Exception:
-                    content = ""
-            if isinstance(content, bytes):
-                content = content.decode(part.get_content_charset() or "utf-8", errors="replace")
-            normalized = str(content or "").strip()
-            if not normalized:
-                continue
-            if content_type == "text/html":
-                html_parts.append(normalized)
-            else:
-                plain_parts.append(normalized)
-        return subject, "\n".join(plain_parts), "\n".join(html_parts)
 
     def _extract_verification_code_scored(
         self, subject: str, text: str, html_content: str
@@ -311,39 +245,13 @@ class BaseMailbox(ABC):
                 score = base_score + (180 if has_keyword else 0) - len(code)
                 _score_candidate(code, score, source)
 
-        verification_labels = "|".join(
-            re.escape(label)
-            for label in (
-                "临时验证码",
-                "临时代码",
-                "验证码",
-                "校验码",
-                "验证代码",
-                "代码",
-                "一時ログインコード",
-                "ワンタイムコード",
-                "ログインコード",
-                "認証コード",
-                "検証コード",
-                "verification codes",
-                "verification code",
-                "security codes",
-                "security code",
-                "one-time code",
-                "temporary code",
-                "otp",
-                "code",
-            )
-        )
         keyword_patterns = [
             re.compile(
-                rf"({verification_labels})(?:[^A-Za-z0-9]{{0,20}})"
-                r"([A-Za-z0-9]{4,8})",
+                r"(验证码|校验码|验证代码|代码|临时验证码|临时代码|verification code|verification codes|security code|security codes|one-time code|temporary code|otp|code)(?:[^A-Za-z0-9]{0,20})([A-Za-z0-9]{4,8})",
                 re.I,
             ),
             re.compile(
-                r"([A-Za-z0-9]{4,8})(?:[^A-Za-z0-9]{0,20})"
-                rf"({verification_labels})",
+                r"([A-Za-z0-9]{4,8})(?:[^A-Za-z0-9]{0,20})(验证码|校验码|验证代码|代码|临时验证码|临时代码|verification code|verification codes|security code|security codes|one-time code|temporary code|otp|code)",
                 re.I,
             ),
         ]
@@ -3556,52 +3464,20 @@ class HmeReadyMailbox(BaseMailbox):
                             seen.add(scoped_mid)
                             continue
 
-                        mime_subject, mime_text, mime_html = self._parse_mime_visible_content(
-                            raw_message
+                        full_text = " ".join(
+                            [
+                                str(msg.get("subject") or ""),
+                                str(detail.get("subject") or ""),
+                                str(detail.get("body_text") or ""),
+                                str(detail.get("body_html") or ""),
+                                str(detail.get("raw_message") or ""),
+                            ]
                         )
-                        visible_subject = str(
-                            detail.get("subject")
-                            or msg.get("subject")
-                            or mime_subject
-                            or ""
-                        ).strip()
-                        visible_text = "\n".join(
-                            part
-                            for part in (
-                                str(detail.get("body_text") or "").strip(),
-                                mime_text,
-                            )
-                            if part
-                        )
-                        visible_html = "\n".join(
-                            part
-                            for part in (
-                                str(detail.get("body_html") or "").strip(),
-                                mime_html,
-                            )
-                            if part
-                        )
-                        searchable_text = "\n".join(
-                            part
-                            for part in (
-                                visible_subject,
-                                visible_text,
-                                self._strip_html_to_text(visible_html),
-                            )
-                            if part
-                        )
-                        if code_pattern:
-                            code = self._safe_extract(searchable_text, code_pattern)
-                            code_match_source = "custom_pattern" if code else ""
-                        else:
-                            code, code_match_source = self._extract_verification_code_scored(
-                                visible_subject,
-                                visible_text,
-                                visible_html,
-                            )
-                            if not code:
-                                code = self._safe_extract(searchable_text)
-                                code_match_source = "visible_text_fallback" if code else ""
+                        if not str(detail.get("body_text") or "").strip() and raw_message:
+                            decoded_raw = self._decode_raw_content(raw_message)
+                            if decoded_raw:
+                                full_text = f"{full_text} {decoded_raw}"
+                        code = self._safe_extract(full_text, code_pattern)
                         seen.add(scoped_mid)
                         if not code:
                             self._log(
@@ -3635,7 +3511,6 @@ class HmeReadyMailbox(BaseMailbox):
                                 "lease_id": helper_lease_id,
                                 "matched_forward_to": str(getattr(forward_mailbox, "email", "") or ""),
                                 "matched_mailbox_id": m_id,
-                                "code_match_source": code_match_source,
                             },
                         )
                         self._log(f"[HME Ready] TempMail 转发箱命中验证码: {code}")

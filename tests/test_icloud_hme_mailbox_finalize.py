@@ -1,6 +1,4 @@
-import base64
 import unittest
-from email.header import Header
 from unittest.mock import Mock, patch
 
 from core.base_mailbox import IcloudHmeMailbox, MailboxAccount
@@ -11,28 +9,6 @@ from services.chatgpt_core.refresh_token_registration_engine import (
 
 
 class IcloudHmeMailboxFinalizeTests(unittest.TestCase):
-    @staticmethod
-    def _build_tagged_base64_message(body_html: str) -> str:
-        encoded_subject = Header("ChatGPT 用の一時ログインコード", "utf-8").encode()
-        encoded_body = base64.b64encode(body_html.encode("utf-8")).decode("ascii")
-        return "\r\n".join(
-            (
-                "Return-Path: <bounces+20216706-loony_gallon_2b+gptowg="
-                "icloud.com_at_tm_openai_com_demo@icloud.com>",
-                "Delivered-To: b@666800.xyz",
-                f"Subject: {encoded_subject}",
-                "To: Hide My Email <loony_gallon_2b@icloud.com>",
-                "X-ICLOUD-HME: p=loony_gallon_2b@icloud.com; "
-                "f=b@666800.xyz; s=noreply@tm.openai.com",
-                'Content-Type: text/html; charset="utf-8"',
-                "Content-Transfer-Encoding: base64",
-                "MIME-Version: 1.0",
-                "",
-                encoded_body,
-                "",
-            )
-        )
-
     def _build_mailbox(self):
         return IcloudHmeMailbox(
             icloud_hme_mode="import_pool",
@@ -343,104 +319,6 @@ class IcloudHmeMailboxFinalizeTests(unittest.TestCase):
         self.assertEqual(code, "123456")
         mailbox._helper_client.wait_code.assert_not_called()
         self.assertEqual(mailbox._last_verification_result["alias_match_source"], "tagged_hme_transport_header")
-
-    def test_helper_ready_decodes_base64_mime_without_extracting_forward_address_digits(self):
-        mailbox = IcloudHmeMailbox(
-            icloud_hme_mode="helper_ready_api",
-            icloud_cookie="",
-            icloud_forward_to="b@666800.xyz",
-            tempmail_api_url="http://tempmail-api-1:8080",
-            tempmail_api_key="test-key",
-            icloud_hme_helper_api_url="http://helper-api",
-            icloud_hme_helper_internal_key="helper-key",
-        )
-        account = MailboxAccount(
-            email="loony_gallon_2b+gptowg@icloud.com",
-            account_id="lease-base64-1",
-            extra={
-                "provider": "hme_ready_api",
-                "mode": "helper_ready_api",
-                "lease_id": "lease-base64-1",
-                "forward_to": "b@666800.xyz",
-                "forward_mailbox_id": "forward-base64-1",
-            },
-        )
-        raw_message = self._build_tagged_base64_message(
-            """
-            <html>
-              <head><style>.code { color: #5D5D5D; background: #F3F3F3; }</style></head>
-              <body>
-                <p>この一時検証コードを入力して続行してください:</p>
-                <p class="code"><!-- outlook wrapper -->905911</p>
-                <a href="https://example.test/click/353740/202123">続行</a>
-              </body>
-            </html>
-            """
-        )
-        mailbox._tempmail_mailbox._list_emails = Mock(
-            return_value=[{"id": "base64-message", "subject": "ChatGPT 用の一時ログインコード"}]
-        )
-        mailbox._tempmail_mailbox._get_email_detail = Mock(
-            return_value={
-                "received_for": ["loony_gallon_2b@icloud.com"],
-                "subject": "ChatGPT 用の一時ログインコード",
-                "body_text": "",
-                "body_html": "",
-                "raw_message": raw_message,
-            }
-        )
-
-        code = mailbox.wait_for_code(account, timeout=1)
-
-        self.assertEqual(code, "905911")
-        self.assertNotEqual(code, "666800")
-        self.assertEqual(
-            mailbox._last_verification_result["code_match_source"],
-            "正文独立数字行命中",
-        )
-
-    def test_helper_ready_never_extracts_otp_from_mime_transport_headers(self):
-        mailbox = IcloudHmeMailbox(
-            icloud_hme_mode="helper_ready_api",
-            icloud_cookie="",
-            icloud_forward_to="b@666800.xyz",
-            tempmail_api_url="http://tempmail-api-1:8080",
-            tempmail_api_key="test-key",
-            icloud_hme_helper_api_url="http://helper-api",
-            icloud_hme_helper_internal_key="helper-key",
-        )
-        account = MailboxAccount(
-            email="loony_gallon_2b+gptowg@icloud.com",
-            account_id="lease-no-code-1",
-            extra={
-                "provider": "hme_ready_api",
-                "mode": "helper_ready_api",
-                "lease_id": "lease-no-code-1",
-                "forward_to": "b@666800.xyz",
-                "forward_mailbox_id": "forward-no-code-1",
-            },
-        )
-        raw_message = self._build_tagged_base64_message(
-            "<html><body><p>コードを取得できませんでした。</p></body></html>"
-        )
-        mailbox._tempmail_mailbox._list_emails = Mock(
-            return_value=[{"id": "no-code-message", "subject": "ChatGPT 用の一時ログインコード"}]
-        )
-        mailbox._tempmail_mailbox._get_email_detail = Mock(
-            return_value={
-                "received_for": ["loony_gallon_2b@icloud.com"],
-                "subject": "ChatGPT 用の一時ログインコード",
-                "body_text": "",
-                "body_html": "",
-                "raw_message": raw_message,
-            }
-        )
-        mailbox._run_polling_wait = Mock(side_effect=lambda **kwargs: kwargs["poll_once"]())
-
-        code = mailbox.wait_for_code(account, timeout=1)
-
-        self.assertIsNone(code)
-        self.assertFalse(getattr(mailbox, "_last_verification_result", {}))
 
     def test_tagged_hme_checks_alias_before_logging_early_cutoff(self):
         mailbox = IcloudHmeMailbox(

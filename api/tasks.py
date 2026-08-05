@@ -44,7 +44,6 @@ from services.account_rate_limit_recovery import (
     mark_account_rate_limited,
     reconcile_rate_limited_accounts,
 )
-from services.chatgpt_account_state import is_account_deactivated_message
 from services.chatgpt_core.payment_link_cache import (
     PAYMENT_LINK_CLEANED_STATUSES,
     PAYMENT_LINK_FORMAT_LONG_LINK,
@@ -14161,8 +14160,6 @@ def _phone_binding_error_status(error_text: str) -> str:
     lowered = str(error_text or "").strip().lower()
     if not lowered:
         return "unknown"
-    if is_account_deactivated_message("", lowered):
-        return "account_deactivated"
     if any(
         marker in lowered
         for marker in (
@@ -14277,23 +14274,10 @@ def _phone_binding_status_label(status: str) -> str:
         "rate_limited": "OpenAI 限流",
         "browser_error": "浏览器/网络异常",
         "account_auth_error": "账号 Auth 异常",
-        "account_deactivated": "账号已删除或停用",
         "account_missing": "账号不存在",
         "not_tested": "未测试",
         "unknown": "未知",
     }.get(str(status or ""), str(status or "unknown"))
-
-
-def _phone_binding_should_keep_phone_for_next_account(
-    status: str,
-    *,
-    phone_was_touched: bool,
-) -> bool:
-    return (
-        str(status or "")
-        in {"account_auth_error", "account_deactivated", "browser_error", "unknown"}
-        and not bool(phone_was_touched)
-    )
 
 
 def _phone_binding_effective_api_fields(
@@ -14668,10 +14652,7 @@ def _run_phone_binding_test_concurrent(
         return str(result.get("error") or data.get("message") or default)
 
     def should_keep_phone_for_next_account(status: str, phone_service: Any) -> bool:
-        return _phone_binding_should_keep_phone_for_next_account(
-            status,
-            phone_was_touched=phone_was_touched(phone_service),
-        )
+        return status in {"account_auth_error", "browser_error", "unknown"} and not phone_was_touched(phone_service)
 
     def is_account_rate_limit_error(status: str, error_text: str) -> bool:
         if status != "account_auth_error":
@@ -15318,10 +15299,7 @@ def _run_phone_binding_test_concurrent(
             )
         )
         forward_issue_count = int(runtime_status_counts.get("api_forward_error", 0))
-        account_issue_count = sum(
-            int(account_status_counts.get(status, 0))
-            for status in ("account_auth_error", "account_deactivated", "unknown", "rate_limited")
-        )
+        account_issue_count = sum(int(account_status_counts.get(status, 0)) for status in ("account_auth_error", "unknown", "rate_limited"))
         summary_message = (
             f"OpenAI 手机号绑定完成：成功 {success_snapshot}/{len(account_ids)}，"
             f"手机号问题 {phone_issue_count}，转发问题 {forward_issue_count}，"
@@ -15898,10 +15876,7 @@ def _run_phone_binding_test(
             pass
 
     def should_keep_phone_for_next_account(status: str, phone_service: Any) -> bool:
-        return _phone_binding_should_keep_phone_for_next_account(
-            status,
-            phone_was_touched=phone_was_touched(phone_service),
-        )
+        return status in {"account_auth_error", "browser_error", "unknown"} and not phone_was_touched(phone_service)
 
     def is_account_rate_limit_error(status: str, error_text: str) -> bool:
         if status != "account_auth_error":
@@ -16924,7 +16899,7 @@ def _run_phone_binding_test(
         forward_issue_count = int(runtime_status_counts.get("api_forward_error", 0))
         account_issue_count = sum(
             int(account_status_counts.get(status, 0))
-            for status in ("account_auth_error", "account_deactivated", "unknown", "rate_limited")
+            for status in ("account_auth_error", "unknown", "rate_limited")
         )
         summary_message = (
             f"OpenAI 手机号绑定完成：成功 {success_count}/{len(account_ids)}，"
@@ -16964,7 +16939,6 @@ def _run_phone_binding_test(
                 "used_for_binding": "完成绑定",
                 "used_for_binding_auth_failed": "已绑定但补Auth失败",
                 "account_auth_error": "账号Auth异常",
-                "account_deactivated": "账号已删除或停用",
                 "rate_limited": "账号限流",
                 "unknown": "未知/OTP冷却",
                 "account_phone_bound": "无需绑定",

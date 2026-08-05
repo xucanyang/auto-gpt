@@ -16,12 +16,7 @@ from services.account_filters import (
     resolve_filtered_accounts,
 )
 from services.account_rate_limit_recovery import reconcile_rate_limited_accounts
-from services.chatgpt_account_state import (
-    apply_chatgpt_status_policy,
-    classify_chatgpt_capabilities,
-    is_account_deactivated_message,
-    mark_payment_pending,
-)
+from services.chatgpt_account_state import apply_chatgpt_status_policy, classify_chatgpt_capabilities, mark_payment_pending
 from services.chatgpt_core import ChatGPTPlatform
 from services.chatgpt_core.local_status_refresh import (
     build_chatgpt_local_status_probe_account,
@@ -432,17 +427,6 @@ def _execute_chatgpt_resume_subscription_auth(
 def _apply_chatgpt_resume_auth_result(acc_model: AccountModel, result: dict[str, Any], session: Session) -> None:
     data = result.get("data") if isinstance(result.get("data"), dict) else {}
     auth_capture = data.get("auth_capture") if isinstance(data.get("auth_capture"), dict) else {}
-    error_code = str(data.get("error_code") or auth_capture.get("error_code") or "").strip()
-    error_message = str(
-        result.get("error")
-        or data.get("message")
-        or auth_capture.get("error")
-        or auth_capture.get("message")
-        or ""
-    ).strip()
-    account_deactivated = is_account_deactivated_message(error_code, error_message)
-    if account_deactivated:
-        acc_model.status = "account_deactivated"
     extra = acc_model.get_extra()
     _merge_extra_patch(
         extra,
@@ -451,20 +435,12 @@ def _apply_chatgpt_resume_auth_result(acc_model: AccountModel, result: dict[str,
             "chatgpt_last_auth_capture": auth_capture,
         },
     )
-    capabilities = classify_chatgpt_capabilities(acc_model, local_probe=extra.get("chatgpt_local"))
-    if account_deactivated:
-        capabilities["auth_level"] = "invalid"
-        capabilities["upload_gate"] = "blocked_auth_invalid"
-    extra["chatgpt_capabilities"] = capabilities
+    extra["chatgpt_capabilities"] = classify_chatgpt_capabilities(acc_model, local_probe=extra.get("chatgpt_local"))
     acc_model.set_extra(extra)
     from datetime import datetime, timezone
 
     acc_model.updated_at = datetime.now(timezone.utc)
     session.add(acc_model)
-    if account_deactivated:
-        from services.account_filters import upsert_account_list_state_for_account_ids
-
-        upsert_account_list_state_for_account_ids(session, [acc_model.id], commit=False)
 
 
 def _apply_chatgpt_invalid_recheck_result(acc_model: AccountModel, result: dict[str, Any], session: Session) -> None:

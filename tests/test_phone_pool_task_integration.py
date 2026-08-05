@@ -7,7 +7,6 @@ from api.tasks import (
     PhoneBindingTestTaskRequest,
     _create_standalone_task_record,
     _phone_binding_error_status,
-    _phone_binding_should_keep_phone_for_next_account,
     _phone_binding_status_label,
     _phone_binding_prefix4,
     _normalize_phone_binding_pool_mode,
@@ -26,27 +25,6 @@ class PhonePoolTaskIntegrationTests(unittest.TestCase):
             "api_forward_error",
         )
         self.assertEqual(_phone_binding_status_label("api_forward_error"), "API 转发暂时不可用")
-
-    def test_account_deactivated_is_terminal_account_status_without_consuming_phone(self):
-        error = (
-            "account_deactivated: You do not have an account because it has been "
-            "deleted or deactivated."
-        )
-
-        self.assertEqual(_phone_binding_error_status(error), "account_deactivated")
-        self.assertEqual(_phone_binding_status_label("account_deactivated"), "账号已删除或停用")
-        self.assertTrue(
-            _phone_binding_should_keep_phone_for_next_account(
-                "account_deactivated",
-                phone_was_touched=False,
-            )
-        )
-        self.assertFalse(
-            _phone_binding_should_keep_phone_for_next_account(
-                "account_deactivated",
-                phone_was_touched=True,
-            )
-        )
 
     def test_phone_pool_prefix4_uses_local_number_digits(self):
         self.assertEqual(_phone_prefix4("+12532241242"), "1253")
