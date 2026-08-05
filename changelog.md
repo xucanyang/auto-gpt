@@ -51,6 +51,7 @@
 - **统一测试文档入口**：`README.md`、`AGENTS.md` 与 `docs/docker-image-release.md` 现在统一指向 Docker 测试规范，移除会吞掉收集失败的 `pytest tests -q || true` 作为推荐门禁，明确当前 `requirements-test.txt`、`docker-compose.test.yml` 和测试脚本仍待落地。
 
 ### 修复 (Fixed)
+- **定向修复 OAIPay Plus/Pro 仅 AT 未接码上传（v2.12.5）**：`services/oaipay_sync.py` 新增 OAIPay 私有 readiness 判定，只对认证有效、具备 AccessToken 与 account/workspace 标识、当前或最近有效订阅为 Plus/Pro 的无 RefreshToken 账号放行；`services/chatgpt_core/oaipay_upload.py` 同步收紧底层门禁，使该类账号携带空 RT 进入既有 `paid_without_refresh_token` 自动分类并上传到 `PLUS--未接码`。缺少 AccessToken、缺少 workspace/account_id、Free 无 RT、认证失效及 Team/Business/Enterprise 账号仍关闭式拒绝；共享 `services/chatgpt_account_state.py`、Sub2API、CPA、失效测活与注册链均未修改。侧栏可见版本同步为 `v2.12.5`。
 - **恢复邮箱登录测活对失效测活公共常量的兼容导入（v2.12.0）**：v2.11.2 将 `AT_ONLY_CLEAR_EXTRA_KEYS` 重命名并扩展为失效测活专用集合时，`services/chatgpt_core/custom_email_recheck.py` 的既有导入没有同步，导致邮箱登录测活模块首次加载即 `ImportError`。`invalid_account_recheck.py` 现在恢复旧常量及其原始字段语义，并在此基础上单独扩展失效测活需要清理的 Cookie 与账号 ID；邮箱测活不会因此新增凭据清理行为，失效测活的完整 Web Session 覆盖规则也保持不变。
 - **修复失效测活误入补抓 Auth/RT 与手机号链路（v2.11.2）**：`services/chatgpt_core/invalid_account_recheck.py` 将 `status=invalid` 的账号恢复收口为单一登录测活事务：使用 any-auto Camoufox 的 `login_only` 模式登录已有账号，只在同时取得新的 AccessToken、NextAuth/Auth.js session token 与完整 Cookie header 后写回原账号；成功时清除旧 refresh token、旧 `chatgpt_local` 失效证据，恢复账号主状态与 `account_list_state`，并用新 AT 调度常规本地状态刷新后立即结束。该路径不再调用 `custom_email_recheck`，不再进入 Codex OAuth/RT、`resume_subscription_auth` 或 `add_phone` 绑定；登录落到新账号密码页或 `about_you` 时关闭式失败，落到 `add_phone` 时也只尝试 Web Session 桥接且不会调用手机号回调。
 - **恢复失效测活独立任务身份与单阶段时间线（v2.11.2）**：`frontend/src/pages/Accounts.tsx` 与 `RegisterTaskModal.tsx` 新增独立 `invalid_recheck` 弹窗模式，单个、批量、活动任务恢复和历史快照均显示“失效测活”，不再映射为“补抓Auth”；`api/tasks.py` 将任务时间线改为“登录已有账号并刷新 Web Session”的单阶段合同，完成文案只报告会话写回与本地刷新，不再出现“完整 Auth/RT”或“待补抓 Auth”。侧栏版本同步为 `v2.11.2`。
@@ -92,6 +93,7 @@
 - **短链生成强制 Web Session 门禁**：登录态短链只接受持久化了完整 NextAuth/Auth.js Session Cookie（兼容非分片、连续分片及独立 `session_token`）的账号；AT-only、缺失分片或已清除网页会话的账号在任务解析阶段直接跳过，支付核心再次执行同一门禁作为纵深校验。Cookie、Session Token 和代理凭据不会写入任务元数据、生成历史、接口响应或前端配置摘要；本地短链配置接口仅返回非敏感国家/币种目录和登录态要求。
 
 ### 测试 (Tests)
+- **补齐 OAIPay 私有门禁回归（v2.12.5）**：`tests/test_oaipay_sync.py` 覆盖 Plus 仅 AT 账号通过 backfill、空 RT payload 自动进入 `PLUS--未接码`，并锁定无 AccessToken、Free 无 RT 及缺少 workspace 的账号均在分类/上传网络请求前被拒绝，避免 OAIPay 例外再次扩散到通用上传 readiness 或其他业务链路。基于 `auto-gpt:test-v2121-predeploy` 的一次性断网、只读 checkout、临时 SQLite/shared config/runtime 容器中，OAIPay 专项及通用账号能力、Sub2API、退役能力相邻回归共 `66 passed`；前端 TypeScript 与 Vite 生产构建通过。
 - **验证现场回退后的 v2.12.1 运行基线**：在只读 checkout、临时 SQLite/shared config/runtime 和 `--network none` 的 `auto-gpt:test-v2121-predeploy` 容器中，重新运行失效测活、Web Session、动态代理、共享任务代理、代理扫描、OAIPay v2.12.1 基线、Sentinel 浏览器容量与筛选 UI 回归，共 `124 passed`；另执行前端 TypeScript/Vite 生产构建与回退涉及 Python 模块的 `py_compile`，测试未访问真实账号、邮箱、代理、OAIPay 或 OpenAI。
 - **验证 v2.12.1 完整回退基线**：使用 `auto-gpt:test-v2121-predeploy` 同源依赖镜像，以只读 checkout、临时 SQLite/shared config/runtime 和 `--network none` 运行失效测活、Web Session、动态代理、共享任务代理、代理扫描、OAIPay、Sentinel 浏览器容量与筛选 UI 回归，共 `124 passed`；测试未访问真实账号、邮箱、代理或 OpenAI。另执行前端 TypeScript/Vite 生产构建和回退涉及 Python 模块的 `py_compile`，确保发布内容与 `5e65526` 行为基线一致且可加载。
 - **补齐五槽资源门控与置顶组合显示合同（v2.12.1）**：`tests/test_sentinel_browser.py` 覆盖 PID 余量不足时后续浏览器等待、余量恢复后继续、结构化 `reason=pids` 日志，以及启动间隔不会绕过共享容量上限；`tests/test_account_filter_presets_ui.py` 锁定置顶组合仍按 `pinned` 过滤、旧 `slice(0, isMobile ? 4 : 8)` 截断不再出现，并确认组件遍历全部 `pinnedFilterPresets`。基于当前生产镜像派生的一次性 pytest 镜像，以只读 checkout、临时 runtime/shared config 和 `--network none` 运行两个专项文件，结果 `31 passed`；前端 TypeScript 与 Vite 生产构建通过，Compose 展开校验确认三实例资源参数分别为 Auth `2/5/2`、Solver `4/1/4`、PID `768/1536/768`。
@@ -3309,4 +3311,8 @@
 
 ## 2026-08-05 17:12:23 +0800
 - 根据现场测活结果再次回退至 v2.12.1
+- 发布模式: multi
+
+## 2026-08-05 18:15:26 +0800
+- 定向修复 OAIPay Plus 仅 AT 未接码上传 v2.12.5
 - 发布模式: multi

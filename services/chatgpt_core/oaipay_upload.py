@@ -796,13 +796,6 @@ def upload_to_oaipay_detailed(
             "upload_gate": "blocked_missing_at",
             "message": "跳过上传：缺少 access_token，认证材料尚未就绪",
         }
-    if not str(token_data.get("refresh_token") or "").strip():
-        return {
-            "ok": False,
-            "skipped": True,
-            "upload_gate": "blocked_missing_rt",
-            "message": "跳过上传：缺少 refresh_token",
-        }
 
     if capabilities is None:
         from services.chatgpt_account_state import classify_chatgpt_capabilities
@@ -817,6 +810,16 @@ def upload_to_oaipay_detailed(
             "ok": False,
             "skipped": True,
             "message": f"订阅类型 {subscription_plan} 已退役，禁止上传 OAIPay",
+        }
+    if (
+        not str(token_data.get("refresh_token") or "").strip()
+        and subscription_plan not in {"plus", "pro"}
+    ):
+        return {
+            "ok": False,
+            "skipped": True,
+            "upload_gate": "blocked_missing_rt",
+            "message": "跳过上传：仅 Plus/Pro 未接码账号支持无 refresh_token 上传",
         }
 
     api_url = str(api_url or _get_config_value("oaipay_api_url")).strip()

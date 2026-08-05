@@ -11,6 +11,7 @@ from core.db import AccountModel
 from services.chatgpt_core.oaipay_upload import build_oaipay_lookup_payload, upload_to_oaipay_detailed
 from services.chatgpt_account_state import (
     RETIRED_SUBSCRIPTION_TYPES,
+    chatgpt_upload_gate_message,
     classify_chatgpt_capabilities,
     effective_subscription_plan,
     is_chatgpt_upload_ready,
@@ -18,6 +19,7 @@ from services.chatgpt_account_state import (
 from services.chatgpt_sync import build_chatgpt_sync_account
 
 SUB2API_SYNC_NAME = "oaipay"
+OAIPAY_ACCESS_TOKEN_ONLY_PLANS = frozenset({"plus", "pro"})
 
 
 def _utcnow() -> datetime:
@@ -513,6 +515,22 @@ def _build_upload_success_state(result: dict[str, Any], *, started_at: str, init
     }
 
 
+def _is_oaipay_upload_ready(account: AccountModel) -> tuple[bool, str, dict[str, Any]]:
+    ready, gate_message, capabilities = is_chatgpt_upload_ready(account)
+    if ready or _safe_str(capabilities.get("upload_gate")) != "blocked_missing_rt":
+        return ready, gate_message, capabilities
+
+    if effective_subscription_plan(capabilities) not in OAIPAY_ACCESS_TOKEN_ONLY_PLANS:
+        return ready, gate_message, capabilities
+
+    if not capabilities.get("has_account_id") or not capabilities.get("has_workspace"):
+        capabilities = {**capabilities, "upload_gate": "blocked_missing_workspace"}
+        return False, chatgpt_upload_gate_message(capabilities), capabilities
+
+    capabilities = {**capabilities, "upload_gate": "ready"}
+    return True, "", capabilities
+
+
 def backfill_chatgpt_account_to_oaipay(
     account: AccountModel,
     *,
@@ -525,7 +543,7 @@ def backfill_chatgpt_account_to_oaipay(
     results: list[dict[str, Any]] = []
     started_at = _utcnow_iso()
     cached_sync = get_oaipay_sync_state(account)
-    ready, gate_message, capabilities = is_chatgpt_upload_ready(account)
+    ready, gate_message, capabilities = _is_oaipay_upload_ready(account)
     if not ready:
         upload_state = _build_upload_failure_state(
             gate_message,
