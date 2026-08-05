@@ -51,6 +51,7 @@
 - **统一测试文档入口**：`README.md`、`AGENTS.md` 与 `docs/docker-image-release.md` 现在统一指向 Docker 测试规范，移除会吞掉收集失败的 `pytest tests -q || true` 作为推荐门禁，明确当前 `requirements-test.txt`、`docker-compose.test.yml` 和测试脚本仍待落地。
 
 ### 修复 (Fixed)
+- **修复 HME Ready 转发邮件把路由地址数字误当 OTP（v2.12.6）**：`core/base_mailbox.py` 将 HME Ready 的别名归属与验证码提取拆成两个严格边界：`Return-Path`、`Delivered-To`、`X-ICLOUD-HME` 等原始传输头继续只用于物理 HME/`+tag` 路由匹配，验证码候选不再包含原始 MIME 或路由地址。新增标准库 MIME 解码，支持 Base64、Quoted-Printable、multipart、编码主题和中英日验证码文案，并从可见 `text/plain` / `text/html` 正文中排除附件、`head/style/script/noscript`、HTML 注释与追踪 URL 后评分取码；正文无法解析时继续等待或明确超时，不再从 `b@666800.xyz` 等转发地址误提取 `666800` 并触发 `/api/accounts/email-otp/validate -> 403`。该共享路径同时覆盖 ChatGPT 注册、失效测活和使用持久化 mailbox state 的恢复链；非 HME 邮箱实现、`before_ids`、`otp_sent_at`、排除码、Helper lease/finalize 与 `account_deactivated` 判定均保持原合同。侧栏可见版本同步为 `v2.12.6`。
 - **定向修复 OAIPay Plus/Pro 仅 AT 未接码上传（v2.12.5）**：`services/oaipay_sync.py` 新增 OAIPay 私有 readiness 判定，只对认证有效、具备 AccessToken 与 account/workspace 标识、当前或最近有效订阅为 Plus/Pro 的无 RefreshToken 账号放行；`services/chatgpt_core/oaipay_upload.py` 同步收紧底层门禁，使该类账号携带空 RT 进入既有 `paid_without_refresh_token` 自动分类并上传到 `PLUS--未接码`。缺少 AccessToken、缺少 workspace/account_id、Free 无 RT、认证失效及 Team/Business/Enterprise 账号仍关闭式拒绝；共享 `services/chatgpt_account_state.py`、Sub2API、CPA、失效测活与注册链均未修改。侧栏可见版本同步为 `v2.12.5`。
 - **恢复邮箱登录测活对失效测活公共常量的兼容导入（v2.12.0）**：v2.11.2 将 `AT_ONLY_CLEAR_EXTRA_KEYS` 重命名并扩展为失效测活专用集合时，`services/chatgpt_core/custom_email_recheck.py` 的既有导入没有同步，导致邮箱登录测活模块首次加载即 `ImportError`。`invalid_account_recheck.py` 现在恢复旧常量及其原始字段语义，并在此基础上单独扩展失效测活需要清理的 Cookie 与账号 ID；邮箱测活不会因此新增凭据清理行为，失效测活的完整 Web Session 覆盖规则也保持不变。
 - **修复失效测活误入补抓 Auth/RT 与手机号链路（v2.11.2）**：`services/chatgpt_core/invalid_account_recheck.py` 将 `status=invalid` 的账号恢复收口为单一登录测活事务：使用 any-auto Camoufox 的 `login_only` 模式登录已有账号，只在同时取得新的 AccessToken、NextAuth/Auth.js session token 与完整 Cookie header 后写回原账号；成功时清除旧 refresh token、旧 `chatgpt_local` 失效证据，恢复账号主状态与 `account_list_state`，并用新 AT 调度常规本地状态刷新后立即结束。该路径不再调用 `custom_email_recheck`，不再进入 Codex OAuth/RT、`resume_subscription_auth` 或 `add_phone` 绑定；登录落到新账号密码页或 `about_you` 时关闭式失败，落到 `add_phone` 时也只尝试 Web Session 桥接且不会调用手机号回调。
@@ -93,6 +94,7 @@
 - **短链生成强制 Web Session 门禁**：登录态短链只接受持久化了完整 NextAuth/Auth.js Session Cookie（兼容非分片、连续分片及独立 `session_token`）的账号；AT-only、缺失分片或已清除网页会话的账号在任务解析阶段直接跳过，支付核心再次执行同一门禁作为纵深校验。Cookie、Session Token 和代理凭据不会写入任务元数据、生成历史、接口响应或前端配置摘要；本地短链配置接口仅返回非敏感国家/币种目录和登录态要求。
 
 ### 测试 (Tests)
+- **补齐 HME MIME 可见正文取码回归（v2.12.6）**：`tests/test_icloud_hme_mailbox_finalize.py` 使用与现场一致的日文 OpenAI Base64 HTML 邮件，固定 `+tag` 只通过可信 `Return-Path` 匹配，并同时注入 `b@666800.xyz`、CSS 色值和追踪 URL 数字，断言最终只提取正文独立 OTP；另覆盖正文无验证码时不得回退传输头数字。现场存档 MIME 经新解析器只读复算后可正确解码 HTML，结果不再为旧误值 `666800`。一次性断网、只读 checkout、临时 runtime 的 Docker 测试容器中，HME 专项 `32 passed`，扩大到恢复邮箱、失效测活、注册 OTP 与其他邮箱相邻回归共 `154 passed`；全仓结果为 `1243 passed, 1 skipped, 7 failed`，其中 2 条 Camoufox 用例是容器 `/tmp` 挂载为 `noexec` 的环境失败，切换到可执行临时目录后单独复跑 `2 passed`，其余 5 条均为本次修改前已存在的过期断言（已删除浏览器入口、导航等待参数、手机号文案及退役 GoPay 能力），与取码逻辑无关。前端单测 `33 passed`，TypeScript/Vite 生产构建通过。
 - **补齐 OAIPay 私有门禁回归（v2.12.5）**：`tests/test_oaipay_sync.py` 覆盖 Plus 仅 AT 账号通过 backfill、空 RT payload 自动进入 `PLUS--未接码`，并锁定无 AccessToken、Free 无 RT 及缺少 workspace 的账号均在分类/上传网络请求前被拒绝，避免 OAIPay 例外再次扩散到通用上传 readiness 或其他业务链路。基于 `auto-gpt:test-v2121-predeploy` 的一次性断网、只读 checkout、临时 SQLite/shared config/runtime 容器中，OAIPay 专项及通用账号能力、Sub2API、退役能力相邻回归共 `66 passed`；前端 TypeScript 与 Vite 生产构建通过。
 - **验证现场回退后的 v2.12.1 运行基线**：在只读 checkout、临时 SQLite/shared config/runtime 和 `--network none` 的 `auto-gpt:test-v2121-predeploy` 容器中，重新运行失效测活、Web Session、动态代理、共享任务代理、代理扫描、OAIPay v2.12.1 基线、Sentinel 浏览器容量与筛选 UI 回归，共 `124 passed`；另执行前端 TypeScript/Vite 生产构建与回退涉及 Python 模块的 `py_compile`，测试未访问真实账号、邮箱、代理、OAIPay 或 OpenAI。
 - **验证 v2.12.1 完整回退基线**：使用 `auto-gpt:test-v2121-predeploy` 同源依赖镜像，以只读 checkout、临时 SQLite/shared config/runtime 和 `--network none` 运行失效测活、Web Session、动态代理、共享任务代理、代理扫描、OAIPay、Sentinel 浏览器容量与筛选 UI 回归，共 `124 passed`；测试未访问真实账号、邮箱、代理或 OpenAI。另执行前端 TypeScript/Vite 生产构建和回退涉及 Python 模块的 `py_compile`，确保发布内容与 `5e65526` 行为基线一致且可加载。
@@ -3315,4 +3317,8 @@
 
 ## 2026-08-05 18:15:26 +0800
 - 定向修复 OAIPay Plus 仅 AT 未接码上传 v2.12.5
+- 发布模式: multi
+
+## 2026-08-05 19:21:43 +0800
+- 修复 HME MIME 验证码解析并阻止路由地址误取码 v2.12.6
 - 发布模式: multi
