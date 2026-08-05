@@ -16,6 +16,7 @@
 - **新增并校正 ChatGPT 注册失败分析文档**：`docs/chatgpt-registration-failure-analysis.md` 基于主实例与 Plus 实例的历史 `task_logs`，结合 `api/tasks.py`、any-auto 注册链、Sentinel 浏览器和 Docker 运行态重新核对统计与调用边界。文档不再把旧线程池上限 `5` 写成默认并发，不再把独立 `:8889` Solver、无 cgroup 总内存上限时的第二槽门控或未经日志证明的 CSRF 假设写成当前注册根因，并明确区分相关性、因果性、同进程出口租约和跨容器残余风险。
 
 ### 优化 (Changed)
+- **按现场要求回退运行版本至 v2.12.7**：撤销 `v2.12.8` 对失效测活 OTP 提交等待的 45 秒 Playwright 事件轮询、截止事件排空、输入时自动提交兼容及对应新增测试，恢复 `c428b5a` 发布前的 `v2.12.7` 代码与侧栏版本。`v2.12.7` 已有的 OTP `403` 结构化响应保真、`account_deactivated` 明确分类、手机号绑定停用账号状态同步和三实例代理/并发合同继续保留；本次只回退代码与静态资源，不反向改写主服务、Plus、Plus2 的账号数据库、任务历史、实例 `.env` 或共享配置，回退前已经成功复活的账号状态保持原样。
 - **根据现场测活结果再次回退至 v2.12.1**：`v2.12.2` 虽仅包含 OAIPay Plus 仅 AT 上传补丁，但操作方确认其线上失效测活不可用、`v2.12.1` 可用，因此本次反向撤销定向恢复提交 `7843de1fc3edb122bc807c196b2b44911ce1b689`，将全部代码和前端重新恢复到 `043ef6ba84e1088dfec2e0bb3585230c92cb152f` 的 `v2.12.1` 状态。账号数据库、任务日志、实例 `.env` 与 `shared_config` 不迁移、不改写；OAIPay 再次恢复要求 RefreshToken，失效测活继续使用 v2.12.1 的 OTP 和浏览器状态机行为。
 - **运行版本整体回退至 v2.12.1**：按操作方要求将源码与前端恢复到提交 `5e65526d9ed5f89fad5bf6a8c093746cc838b9c3` 的完整行为基线，并使用新的反向提交保留后续版本历史，不改动主服务、Plus、Plus2 的账号数据库、任务日志、实例 `.env` 或 `shared_config`。本次完整回退同时撤销 v2.12.2 的 OAIPay Plus 仅 AT 上传例外、v2.12.3 的 OTP validate 响应监听与 403 结构化分类、v2.12.4 的动态代理候选探测停止检查；因此 OAIPay 恢复要求 RefreshToken，OTP 403 恢复显示旧的“提交后未跳转”，动态代理准备阶段的立即停止也恢复 v2.12.1 行为。侧栏可见版本恢复为 `v2.12.1`。
 - **Plus 注册浏览器扩容到五槽并增加启动保护（v2.12.1）**：`docker-compose.multi.yml` 将 `auto-gpt-plus` 的进程级 `AUTH_BROWSER_MAX_CONCURRENCY` 从 `3` 提高到 `5`，`pids_limit` 从 `768` 提高到 `1536`，保持 `/dev/shm=2gb`，并把当前 ChatGPT 注册链未使用的独立 Solver 从 `6/1` 收敛为 `1/1`；单个浏览器注册任务自身的有效并发上限仍为 `2`，主实例与 Plus2 继续使用 Auth `2`、Solver `4/1`、PID `768`。`services/chatgpt_core/sentinel_browser.py` 新增 cgroup PID 余量门控与进程级启动错峰：Plus 仅在 `pids.current + 220 <= pids.max` 时领取实际浏览器槽，相邻 Camoufox/Auth 浏览器至少间隔 `4s` 启动；PID 不足会释放 semaphore、按 `browser_slot=waiting reason=pids` 等待重试，停止或异常仍成对释放容量。主实例与 Plus2 的 PID 余量和启动间隔默认均为 `0`，保持原行为。
@@ -51,7 +52,6 @@
 - **统一测试文档入口**：`README.md`、`AGENTS.md` 与 `docs/docker-image-release.md` 现在统一指向 Docker 测试规范，移除会吞掉收集失败的 `pytest tests -q || true` 作为推荐门禁，明确当前 `requirements-test.txt`、`docker-compose.test.yml` 和测试脚本仍待落地。
 
 ### 修复 (Fixed)
-- **修复失效测活将 OTP 成功响应误判为超时（v2.12.8）**：`services/chatgpt_core/any_auto/browser_register.py` 将验证码提交后的同步 Playwright 等待改为可持续派发 response/navigation 回调的页面事件轮询，并把提交窗口从固定 20 秒扩展为 45 秒；截止时再次排空事件队列并重新核对 `/api/accounts/email-otp/validate` 响应、当前页面和页面错误，避免 `validate -> 200`、OAuth callback 与 `chatgpt.com/ -> 200` 已完成后仍返回“验证码提交后未收到校验响应”。响应监听现在在输入 OTP 前注册，覆盖末位输入触发自动提交、页面推进导致输入框消失和 Continue 按钮已消失的分支；明确 `4xx`（包括 `account_deactivated`）仍优先保留结构化失败详情，未收到响应且页面未推进时继续关闭式失败。`tests/test_any_auto_web_session_contract.py` 新增旧超时边界延迟派发成功响应和输入时自动提交的回归合同；侧栏可见版本同步为 `v2.12.8`。
 - **修复失效测活吞掉 OTP 403 真实停用原因并同步账号终态（v2.12.7）**：`services/chatgpt_core/any_auto/browser_register.py` 在 Camoufox 验证码页提交前定向监听 `auth.openai.com/api/accounts/email-otp/validate`，仅提取并有界脱敏响应中的 `code/type/message`；明确的 `account_deactivated/account_deleted/account_delete/deactivated_workspace` 会立即交回失效测活分类器，不再等待 20 秒后降级成“验证码页提交后未跳转”。`services/chatgpt_core/invalid_account_recheck.py`、`subscription_auth_capture.py` 与 `api/actions.py` 将明确停用写为账号主状态 `account_deactivated`，同步 `chatgpt_capabilities` 和 `account_list_state`，并通过独立短事务保证补抓外层回滚不会抹掉停用证据；裸 `403`、Cloudflare HTML 拒绝、`invalid_code` 和 OTP 限流仍分别保留原始语义，不会仅凭 HTTP 状态误判账号停用。
 - **修复手机号绑定未识别已删除或停用账号（v2.12.7）**：`api/tasks.py` 为串行、并行手机号绑定统一增加 `account_deactivated` 账号错误分类和可见标签；当明确死号发生在 OAuth/邮箱 OTP 阶段且收码服务尚未发码、收码或产生号码侧状态时，当前手机号回退给下一个账号继续使用，不再被记为未知错误或错误消耗。手机号已经触碰 OpenAI/收码 API 时仍按真实号码结果收口，避免把已使用资源重新分配。侧栏可见版本同步为 `v2.12.7`。
 - **修复 HME Ready 转发邮件把路由地址数字误当 OTP（v2.12.6）**：`core/base_mailbox.py` 将 HME Ready 的别名归属与验证码提取拆成两个严格边界：`Return-Path`、`Delivered-To`、`X-ICLOUD-HME` 等原始传输头继续只用于物理 HME/`+tag` 路由匹配，验证码候选不再包含原始 MIME 或路由地址。新增标准库 MIME 解码，支持 Base64、Quoted-Printable、multipart、编码主题和中英日验证码文案，并从可见 `text/plain` / `text/html` 正文中排除附件、`head/style/script/noscript`、HTML 注释与追踪 URL 后评分取码；正文无法解析时继续等待或明确超时，不再从 `b@666800.xyz` 等转发地址误提取 `666800` 并触发 `/api/accounts/email-otp/validate -> 403`。该共享路径同时覆盖 ChatGPT 注册、失效测活和使用持久化 mailbox state 的恢复链；非 HME 邮箱实现、`before_ids`、`otp_sent_at`、排除码、Helper lease/finalize 与 `account_deactivated` 判定均保持原合同。侧栏可见版本同步为 `v2.12.6`。
@@ -3331,6 +3331,6 @@
 - 修复失效测活停用响应识别并同步手机绑定账号状态 v2.12.7
 - 发布模式: multi
 
-## 2026-08-05 21:55:41 +0800
-- 修复失效测活 OTP 成功响应超时竞态 v2.12.8
+## 2026-08-05 22:09:42 +0800
+- 按现场要求回退运行版本至 v2.12.7
 - 发布模式: multi
