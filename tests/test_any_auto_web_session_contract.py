@@ -28,6 +28,74 @@ else:
 
 class AnyAutoWebSessionContractTests(unittest.TestCase):
     @unittest.skipUnless(_CAMOUFOX_AVAILABLE, "camoufox is only installed in the runtime image")
+    def test_otp_submit_preserves_deactivated_response_detail(self):
+        page = mock.Mock()
+        page.url = "https://auth.openai.com/email-verification"
+        page.locator.return_value.count.return_value = 0
+        otp_input = page.get_by_label.return_value.first
+        otp_input.input_value.return_value = "123456"
+        captured_response_handler = {}
+
+        def register_handler(event, handler):
+            if event == "response":
+                captured_response_handler["handler"] = handler
+
+        page.on.side_effect = register_handler
+        response = mock.Mock()
+        response.url = "https://auth.openai.com/api/accounts/email-otp/validate"
+        response.status = 403
+        response.json.return_value = {
+            "error": {
+                "code": "account_deactivated",
+                "message": "You do not have an account because it has been deleted or deactivated.",
+            }
+        }
+
+        def click_and_reject(*_args, **_kwargs):
+            captured_response_handler["handler"](response)
+            return 'button[type="submit"]'
+
+        with (
+            mock.patch.object(browser_register, "_browser_pause"),
+            mock.patch.object(browser_register, "_click_first", side_effect=click_and_reject),
+            mock.patch.object(
+                browser_register,
+                "_derive_registration_state_from_page",
+                return_value={"page_type": "email_otp_verification"},
+            ),
+            mock.patch.object(browser_register.time, "sleep"),
+        ):
+            result = browser_register._submit_otp_via_page(
+                page,
+                "123456",
+                lambda _message: None,
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], 403)
+        self.assertIn("account_deactivated", result["text"])
+        self.assertIn("deleted or deactivated", result["text"])
+        self.assertNotIn("未跳转", result["text"])
+        page.remove_listener.assert_called_once_with("response", captured_response_handler["handler"])
+
+    @unittest.skipUnless(_CAMOUFOX_AVAILABLE, "camoufox is only installed in the runtime image")
+    def test_otp_submit_preserves_rate_limit_response_detail(self):
+        response = mock.Mock()
+        response.status = 403
+        response.json.return_value = {
+            "error": {
+                "type": "invalid_request_error",
+                "message": "Too many tries. Please wait a few minutes and try again.",
+            }
+        }
+
+        summary = browser_register._auth_response_error_text(response)
+
+        self.assertIn("HTTP 403", summary)
+        self.assertIn("Too many tries", summary)
+        self.assertIn("Please wait a few minutes", summary)
+
+    @unittest.skipUnless(_CAMOUFOX_AVAILABLE, "camoufox is only installed in the runtime image")
     def test_browser_transport_forwards_login_only_to_worker(self):
         raw_result = {
             "success": True,
