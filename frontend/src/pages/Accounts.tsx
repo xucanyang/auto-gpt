@@ -30,6 +30,8 @@ import type { CheckboxOptionType } from 'antd/es/checkbox/Group'
 import type { MenuProps } from 'antd'
 import {
   CheckOutlined,
+  ArrowDownOutlined,
+  ArrowUpOutlined,
   CopyOutlined,
   DeleteOutlined,
   DownOutlined,
@@ -626,6 +628,7 @@ export type AccountFilterPreset = {
   description?: string
   summary?: string
   mode: 'dynamic' | 'fixed'
+  parent_preset_id?: string
   filters: AccountFilterPresetFilters
   account_ids: number[]
   account_count: number
@@ -633,6 +636,7 @@ export type AccountFilterPreset = {
   built_in?: boolean
   created_at?: string
   updated_at?: string
+  revision?: number
 }
 
 function normalizeAccountFilterPresetItem(value: unknown): AccountFilterPreset | null {
@@ -652,6 +656,7 @@ function normalizeAccountFilterPresetItem(value: unknown): AccountFilterPreset |
     description: String(item?.description || ''),
     summary: String(item?.summary || ''),
     mode,
+    parent_preset_id: String(item?.parent_preset_id || ''),
     filters: normalizeAccountFilterPresetFilters(item.filters as AccountFilterPresetFilters | undefined),
     account_ids: accountIds,
     account_count: accountIds.length,
@@ -659,6 +664,7 @@ function normalizeAccountFilterPresetItem(value: unknown): AccountFilterPreset |
     built_in: Boolean(item?.built_in),
     created_at: String(item?.created_at || ''),
     updated_at: String(item?.updated_at || ''),
+    revision: Number(item?.revision || 1),
   }
 }
 
@@ -669,10 +675,6 @@ function normalizeAccountFilterPresetItems(value: unknown): AccountFilterPreset[
     if (item) items.push(item)
     return items
   }, [])
-}
-
-function accountIdMembershipSignature(values: Iterable<unknown>) {
-  return normalizeAccountIds(values).sort((a, b) => a - b).join(',')
 }
 
 const STATUS_FILTER_OPTIONS = [
@@ -2668,6 +2670,8 @@ export default function Accounts() {
   const [selectedRowKeys, setSelectedRowKeys] = useState<React.Key[]>([])
   const [selectedAccountSnapshots, setSelectedAccountSnapshots] = useState<Record<string, any>>({})
   const [filterPresets, setFilterPresets] = useState<AccountFilterPreset[]>([])
+  const [fixedGroups, setFixedGroups] = useState<AccountFilterPreset[]>([])
+  const [legacyFixedPresets, setLegacyFixedPresets] = useState<AccountFilterPreset[]>([])
   const [filterPresetLoading, setFilterPresetLoading] = useState(false)
   const [filterPresetSaving, setFilterPresetSaving] = useState(false)
   const [activeFilterPresetId, setActiveFilterPresetId] = useState('')
@@ -2676,8 +2680,13 @@ export default function Accounts() {
   const [filterPresetEditing, setFilterPresetEditing] = useState<AccountFilterPreset | null>(null)
   const [filterPresetEditorMode, setFilterPresetEditorMode] = useState<'create-current' | 'edit-meta' | 'copy-preset'>('create-current')
   const [filterPresetEditorAccountIds, setFilterPresetEditorAccountIds] = useState<number[]>([])
-  const [activeFixedResolvedAccountIds, setActiveFixedResolvedAccountIds] = useState<number[] | null>(null)
-  const pendingFixedPresetResolutionRef = useRef('')
+  const [secondaryFilterScope, setSecondaryFilterScope] = useState<'unassigned' | 'fixed'>('unassigned')
+  const [activeFixedGroupId, setActiveFixedGroupId] = useState('')
+  const [fixedMigrationOpen, setFixedMigrationOpen] = useState(false)
+  const [fixedMigrationLoading, setFixedMigrationLoading] = useState(false)
+  const [fixedMigrationParentById, setFixedMigrationParentById] = useState<Record<string, string>>({})
+  const [fixedMigrationPriority, setFixedMigrationPriority] = useState<string[]>([])
+  const [fixedMigrationPreview, setFixedMigrationPreview] = useState<any>(null)
 
   const [registerModalOpen, setRegisterModalOpen] = useState(false)
   const [taskModalMode, setTaskModalMode] = useState<'register' | 'resume_auth' | 'invalid_recheck' | 'payment_link' | 'pix_cleanup' | 'sub2api_upload' | 'oaipay_upload' | 'baxigpt_cdk' | 'paypal_bind' | 'probe_local_status'>('register')
@@ -2863,13 +2872,19 @@ export default function Accounts() {
     () => filterPresets.find((item) => item.id === activeFilterPresetId) || null,
     [activeFilterPresetId, filterPresets],
   )
-  const activeFixedFilterPresetId = activeFilterPreset?.mode === 'fixed' ? activeFilterPreset.id : ''
-  const activeFixedFilterPresetRevision = activeFilterPreset?.mode === 'fixed'
-    ? `${activeFilterPreset.updated_at || ''}:${accountIdMembershipSignature(activeFilterPreset.account_ids)}`
-    : ''
+  const activeFixedGroup = useMemo(
+    () => fixedGroups.find((item) => item.id === activeFixedGroupId) || null,
+    [activeFixedGroupId, fixedGroups],
+  )
+  const currentParentFixedGroups = useMemo(
+    () => fixedGroups.filter((item) => item.parent_preset_id === activeFilterPresetId),
+    [activeFilterPresetId, fixedGroups],
+  )
   const accountsQuery = useAccountsQuery({
-    filterPresetId: activeFixedFilterPresetId,
-    filterPresetRevision: activeFixedFilterPresetRevision,
+    primaryPresetId: activeFilterPresetId,
+    secondaryScope: activeFilterPresetId ? secondaryFilterScope : '',
+    fixedGroupId: secondaryFilterScope === 'fixed' ? activeFixedGroupId : '',
+    fixedGroupRevision: secondaryFilterScope === 'fixed' ? activeFixedGroup?.revision : undefined,
     email: debouncedSearch,
     status: filterStatus,
     manuallyUsed: columnFilters.manuallyUsed.join(','),
@@ -2952,20 +2967,27 @@ export default function Accounts() {
   )
   const activeFilterPresetDirty = useMemo(() => {
     if (!activeFilterPreset) return false
-    if (activeFilterPreset.mode === 'fixed') {
-      return accountIdMembershipSignature(activeFilterPreset.account_ids) !== accountIdMembershipSignature(selectedRowKeys)
-    }
+    if (secondaryFilterScope === 'fixed') return false
     return accountFilterPresetSignature(activeFilterPreset.filters) !== accountFilterPresetSignature(currentFilterPresetFilters)
-  }, [activeFilterPreset, currentFilterPresetFilters, selectedRowKeys])
+  }, [activeFilterPreset, currentFilterPresetFilters, secondaryFilterScope])
   const pinnedFilterPresets = useMemo(() => {
     return filterPresets.filter((item) => item.pinned)
   }, [filterPresets])
+  const pinnedFixedGroups = useMemo(() => {
+    return currentParentFixedGroups.filter((item) => item.pinned)
+  }, [currentParentFixedGroups])
 
   const loadFilterPresets = useCallback(async (silent = false) => {
     setFilterPresetLoading(true)
     try {
       const data = await apiFetch('/accounts/filter-presets')
-      setFilterPresets(normalizeAccountFilterPresetItems(data?.items))
+      const dynamicItems = normalizeAccountFilterPresetItems(data?.dynamic_items ?? data?.items)
+        .filter((item) => item.mode === 'dynamic')
+      const nextFixedGroups = normalizeAccountFilterPresetItems(data?.fixed_groups)
+        .filter((item) => item.mode === 'fixed' && item.parent_preset_id)
+      setFilterPresets(dynamicItems)
+      setFixedGroups(nextFixedGroups)
+      setLegacyFixedPresets(normalizeAccountFilterPresetItems(data?.legacy_fixed_items))
     } catch (e: any) {
       if (!silent) message.error(e?.message || '读取筛选组合失败')
     } finally {
@@ -2985,8 +3007,27 @@ export default function Accounts() {
   }, [loadFilterPresets])
 
   useEffect(() => {
+    if (!activeFilterPresetId) return
+    if (filterPresets.some((item) => item.id === activeFilterPresetId)) return
+    setActiveFilterPresetId('')
+    setActiveFixedGroupId('')
+    setSecondaryFilterScope('unassigned')
+    setSelectedRowKeys([])
+    setSelectedAccountSnapshots({})
+  }, [activeFilterPresetId, filterPresets])
+
+  useEffect(() => {
+    if (secondaryFilterScope !== 'fixed' || !activeFixedGroupId) return
+    if (fixedGroups.some((item) => item.id === activeFixedGroupId && item.parent_preset_id === activeFilterPresetId)) return
+    setActiveFixedGroupId('')
+    setSecondaryFilterScope('unassigned')
+    setSelectedRowKeys([])
+    setSelectedAccountSnapshots({})
+  }, [activeFilterPresetId, activeFixedGroupId, fixedGroups, secondaryFilterScope])
+
+  useEffect(() => {
     setCurrentPage(1)
-  }, [activeFixedFilterPresetId, activeFixedFilterPresetRevision, debouncedSearch, filterStatus, columnFilters.manuallyUsed, columnFilters.authType, columnFilters.phoneBindingState, columnFilters.paymentLinkPlatform, columnFilters.paymentLinkGenerated, columnFilters.subscriptionType, columnFilters.accountValidity, columnFilters.sub2apiState, columnFilters.oaipayState, columnFilters.submitState, columnFilters.hasSubmitted, subscriptionExpirySortOrder, registrationSortOrder])
+  }, [activeFilterPresetId, activeFixedGroupId, secondaryFilterScope, debouncedSearch, filterStatus, columnFilters.manuallyUsed, columnFilters.authType, columnFilters.phoneBindingState, columnFilters.paymentLinkPlatform, columnFilters.paymentLinkGenerated, columnFilters.subscriptionType, columnFilters.accountValidity, columnFilters.sub2apiState, columnFilters.oaipayState, columnFilters.submitState, columnFilters.hasSubmitted, subscriptionExpirySortOrder, registrationSortOrder])
 
   useEffect(() => {
     if (typeof document === 'undefined') return
@@ -3179,25 +3220,15 @@ export default function Accounts() {
     delete body.all_filtered
     delete body.pending_only
     delete body.expected_total
+    delete body.primary_preset_id
+    delete body.secondary_scope
+    delete body.fixed_group_id
+    delete body.fixed_group_revision
 
     if (options.scope === 'selected') {
       const accountIds = normalizeAccountIds(options.selectedIds ?? selectedRowKeys)
       if (accountIds.length === 0) {
         appMessage.warning(options.emptySelectedMessage || '请先选择要处理的账号')
-        return null
-      }
-      body.account_ids = accountIds
-      return accountIds.length
-    }
-
-    if (activeFilterPreset?.mode === 'fixed') {
-      const accountIds = normalizeAccountIds(
-        activeFixedResolvedAccountIds !== null
-          ? activeFixedResolvedAccountIds
-          : activeFilterPreset.account_ids,
-      )
-      if (accountIds.length === 0) {
-        appMessage.warning('当前固定筛选组合没有可处理的账号')
         return null
       }
       body.account_ids = accountIds
@@ -3210,10 +3241,18 @@ export default function Accounts() {
     }
 
     Object.assign(body, currentAccountFilterBody)
+    if (activeFilterPreset) {
+      body.primary_preset_id = activeFilterPreset.id
+      body.secondary_scope = secondaryFilterScope
+      if (secondaryFilterScope === 'fixed' && activeFixedGroup) {
+        body.fixed_group_id = activeFixedGroup.id
+        body.fixed_group_revision = activeFixedGroup.revision || 1
+      }
+    }
     body[options.filteredMarker || 'all_filtered'] = true
     body.expected_total = currentFilteredTotal
     return currentFilteredTotal
-  }, [activeFilterPreset, activeFixedResolvedAccountIds, appMessage, currentAccountFilterBody, currentFilterScopeReady, currentFilteredTotal, selectedRowKeys])
+  }, [activeFilterPreset, activeFixedGroup, appMessage, currentAccountFilterBody, currentFilterScopeReady, currentFilteredTotal, secondaryFilterScope, selectedRowKeys])
 
   const postAccountScopeRequest = useCallback(async (
     path: string,
@@ -3243,7 +3282,14 @@ export default function Accounts() {
       page_size: '1',
       detail: 'false',
     })
-    if (activeFixedFilterPresetId) params.set('filter_preset_id', activeFixedFilterPresetId)
+    if (activeFilterPreset) {
+      params.set('primary_preset_id', activeFilterPreset.id)
+      params.set('secondary_scope', secondaryFilterScope)
+    }
+    if (secondaryFilterScope === 'fixed' && activeFixedGroup) {
+      params.set('fixed_group_id', activeFixedGroup.id)
+      params.set('fixed_group_revision', String(activeFixedGroup.revision || 1))
+    }
     if (body.email) params.set('email', String(body.email))
     if (body.status) params.set('status', String(body.status))
     if (body.manually_used) params.set('manually_used', String(body.manually_used))
@@ -3258,7 +3304,7 @@ export default function Accounts() {
     if (body.submit_state) params.set('submit_state', String(body.submit_state))
     if (body.has_submitted) params.set('has_submitted', String(body.has_submitted))
     return params
-  }, [activeFixedFilterPresetId, currentAccountFilterBody])
+  }, [activeFilterPreset, activeFixedGroup, currentAccountFilterBody, secondaryFilterScope])
 
   useEffect(() => {
     if (!phoneBindingTestOpen) return
@@ -3300,33 +3346,11 @@ export default function Accounts() {
     setAccounts((data.items || []).map(normalizeAccount))
     setTotal(nextTotal)
 
-    const fixedScope = data.fixed_preset
-    if (fixedScope?.id && fixedScope.id === activeFixedFilterPresetId) {
-      setActiveFixedResolvedAccountIds(normalizeAccountIds(fixedScope.resolved_account_ids || []))
-    }
-    if (fixedScope?.id && pendingFixedPresetResolutionRef.current === fixedScope.id) {
-      const resolvedIds = normalizeAccountIds(fixedScope.resolved_account_ids || [])
-      const missingIds = normalizeAccountIds(fixedScope.missing_account_ids || [])
-      setSelectedRowKeys(resolvedIds)
-      setActiveFixedResolvedAccountIds(resolvedIds)
-      setSelectedAccountSnapshots((prev) => {
-        const next: Record<string, object> = {}
-        resolvedIds.forEach((accountId) => {
-          next[String(accountId)] = prev[String(accountId)] || { id: accountId }
-        })
-        return next
-      })
-      pendingFixedPresetResolutionRef.current = ''
-      if (missingIds.length > 0) {
-        message.warning(`组合中有 ${missingIds.length} 个账号已不存在，本次已自动忽略`)
-      }
-    }
-
     const maxPage = Math.max(1, Math.ceil(nextTotal / accountsPageSize))
     if (currentPage > maxPage) {
       setCurrentPage(maxPage)
     }
-  }, [accountsQuery.data, accountsPageSize, activeFixedFilterPresetId, currentPage])
+  }, [accountsQuery.data, accountsPageSize, currentPage])
 
   const handleAccountsPageSizeChange = useCallback((pageSize: number) => {
     const nextPageSize = ACCOUNT_PAGE_SIZE_OPTIONS.includes(pageSize) ? pageSize : DEFAULT_ACCOUNTS_PAGE_SIZE
@@ -3338,31 +3362,7 @@ export default function Accounts() {
   }, [])
 
   const applyFilterPreset = useCallback((preset: AccountFilterPreset, options?: { silent?: boolean }) => {
-    if (preset.mode === 'fixed') {
-      const accountIds = normalizeAccountIds(preset.account_ids)
-      setSearch('')
-      setDebouncedSearch('')
-      setColumnFilters(EMPTY_ACCOUNT_FILTERS)
-      setFilterStatus('')
-      setSubscriptionExpirySortOrder('')
-      setRegistrationSortOrder(DEFAULT_REGISTRATION_SORT_ORDER)
-      setCurrentPage(1)
-      setSelectedRowKeys(accountIds)
-      setActiveFixedResolvedAccountIds(null)
-      setSelectedAccountSnapshots((prev) => {
-        const next: Record<string, object> = {}
-        accountIds.forEach((accountId) => {
-          next[String(accountId)] = prev[String(accountId)] || { id: accountId }
-        })
-        return next
-      })
-      pendingFixedPresetResolutionRef.current = preset.id
-      setActiveFilterPresetId(preset.id)
-      if (!options?.silent) {
-        message.success(`已应用筛选组合：${preset.name}（固定 ${accountIds.length} 个账号）`)
-      }
-      return
-    }
+    if (preset.mode !== 'dynamic') return
     const filters = normalizeAccountFilterPresetFilters(preset.filters)
     setSearch(filters.search)
     setDebouncedSearch(filters.search)
@@ -3374,13 +3374,42 @@ export default function Accounts() {
     setCurrentPage(1)
     setSelectedRowKeys([])
     setSelectedAccountSnapshots({})
-    setActiveFixedResolvedAccountIds(null)
-    pendingFixedPresetResolutionRef.current = ''
+    setSecondaryFilterScope('unassigned')
+    setActiveFixedGroupId('')
     setActiveFilterPresetId(preset.id)
     if (!options?.silent) {
       message.success(`已应用筛选组合：${preset.name}`)
     }
   }, [handleAccountsPageSizeChange])
+
+  const applyUnassignedScope = useCallback((options?: { silent?: boolean }) => {
+    if (!activeFilterPreset) return
+    applyFilterPreset(activeFilterPreset, { silent: true })
+    if (!options?.silent) message.success(`已切换固定账号组合：未固定`)
+  }, [activeFilterPreset, applyFilterPreset])
+
+  const applyFixedGroup = useCallback((group: AccountFilterPreset, options?: { silent?: boolean }) => {
+    const parentPreset = group.parent_preset_id === activeFilterPreset?.id
+      ? activeFilterPreset
+      : filterPresets.find((item) => item.id === group.parent_preset_id) || null
+    if (!parentPreset) {
+      message.error('固定账号组合不属于当前条件筛选组合')
+      return
+    }
+    setSearch('')
+    setDebouncedSearch('')
+    setColumnFilters(EMPTY_ACCOUNT_FILTERS)
+    setFilterStatus('')
+    setSubscriptionExpirySortOrder('')
+    setRegistrationSortOrder(DEFAULT_REGISTRATION_SORT_ORDER)
+    setCurrentPage(1)
+    setSelectedRowKeys([])
+    setSelectedAccountSnapshots({})
+    setActiveFilterPresetId(parentPreset.id)
+    setSecondaryFilterScope('fixed')
+    setActiveFixedGroupId(group.id)
+    if (!options?.silent) message.success(`已切换固定账号组合：${group.name}`)
+  }, [activeFilterPreset, filterPresets])
 
   const clearFilterPreset = useCallback((options?: { silent?: boolean }) => {
     setSearch('')
@@ -3392,8 +3421,8 @@ export default function Accounts() {
     setCurrentPage(1)
     setSelectedRowKeys([])
     setSelectedAccountSnapshots({})
-    setActiveFixedResolvedAccountIds(null)
-    pendingFixedPresetResolutionRef.current = ''
+    setSecondaryFilterScope('unassigned')
+    setActiveFixedGroupId('')
     setActiveFilterPresetId('')
     if (!options?.silent) {
       message.success('已清除筛选组合与账号选择')
@@ -3422,33 +3451,58 @@ export default function Accounts() {
   }, [filterPresetForm])
 
   const openCreateCurrentFilterPreset = useCallback(() => {
+    setFilterPresetEditing(null)
+    setFilterPresetEditorMode('create-current')
+    setFilterPresetEditorAccountIds([])
+    filterPresetForm.setFieldsValue({
+      name: '',
+      description: buildAccountFilterPresetSummary(currentFilterPresetFilters),
+      mode: 'dynamic',
+      parent_preset_id: '',
+      pinned: true,
+    })
+    fillFilterFormFields(currentFilterPresetFilters)
+    setFilterPresetEditorOpen(true)
+  }, [currentFilterPresetFilters, fillFilterFormFields, filterPresetForm])
+
+  const openCreateFixedGroup = useCallback(() => {
+    if (!activeFilterPreset) {
+      message.warning('请先选择一级条件筛选组合')
+      return
+    }
+    if (secondaryFilterScope !== 'unassigned') {
+      message.warning('请先切换到“未固定”后选择账号')
+      return
+    }
     const selectedIds = normalizeAccountIds(selectedRowKeys)
-    const mode = selectedIds.length > 0 ? 'fixed' : 'dynamic'
+    if (selectedIds.length === 0) {
+      message.warning('请先选择要加入固定账号组合的账号')
+      return
+    }
     setFilterPresetEditing(null)
     setFilterPresetEditorMode('create-current')
     setFilterPresetEditorAccountIds(selectedIds)
     filterPresetForm.setFieldsValue({
       name: '',
-      description: mode === 'fixed'
-        ? `固定保存当前选中的 ${selectedIds.length} 个账号`
-        : buildAccountFilterPresetSummary(currentFilterPresetFilters),
-      mode,
+      description: '',
+      mode: 'fixed',
+      parent_preset_id: activeFilterPreset.id,
       pinned: true,
     })
-    fillFilterFormFields(currentFilterPresetFilters)
+    fillFilterFormFields(undefined)
     setFilterPresetEditorOpen(true)
-  }, [currentFilterPresetFilters, fillFilterFormFields, filterPresetForm, selectedRowKeys])
+  }, [activeFilterPreset, fillFilterFormFields, filterPresetForm, secondaryFilterScope, selectedRowKeys])
 
   const openCopyFilterPreset = useCallback((preset: AccountFilterPreset) => {
+    if (preset.mode !== 'dynamic') return
     setFilterPresetEditing(preset)
     setFilterPresetEditorMode('copy-preset')
-    setFilterPresetEditorAccountIds(preset.account_ids)
+    setFilterPresetEditorAccountIds([])
     filterPresetForm.setFieldsValue({
       name: `${preset.name} 副本`,
-      description: preset.description || (preset.mode === 'fixed'
-        ? `固定保存 ${preset.account_count} 个账号`
-        : buildAccountFilterPresetSummary(preset.filters)),
-      mode: preset.mode,
+      description: preset.description || buildAccountFilterPresetSummary(preset.filters),
+      mode: 'dynamic',
+      parent_preset_id: '',
       pinned: true,
     })
     fillFilterFormFields(preset.filters)
@@ -3463,6 +3517,7 @@ export default function Accounts() {
       name: preset.name,
       description: preset.description || '',
       mode: preset.mode,
+      parent_preset_id: preset.parent_preset_id || '',
       pinned: Boolean(preset.pinned),
     })
     fillFilterFormFields(preset.filters)
@@ -3518,6 +3573,9 @@ export default function Accounts() {
       mode,
       filters,
       account_ids: accountIds,
+      parent_preset_id: mode === 'fixed'
+        ? String(values.parent_preset_id || editingPreset?.parent_preset_id || activeFilterPreset?.id || '')
+        : '',
     }
     setFilterPresetSaving(true)
     try {
@@ -3526,22 +3584,25 @@ export default function Accounts() {
         method: isEditMeta ? 'PUT' : 'POST',
         body: JSON.stringify(body),
       })
-      const normalizedItems = normalizeAccountFilterPresetItems(data?.items)
-      setFilterPresets(normalizedItems)
+      setFilterPresets(normalizeAccountFilterPresetItems(data?.dynamic_items).filter((item) => item.mode === 'dynamic'))
+      setFixedGroups(normalizeAccountFilterPresetItems(data?.fixed_groups).filter((item) => item.mode === 'fixed'))
+      setLegacyFixedPresets(normalizeAccountFilterPresetItems(data?.legacy_fixed_items))
       const saved = normalizeAccountFilterPresetItem(data?.item)
-      if (saved && (!isEditMeta || activeFilterPresetId === saved.id)) {
+      if (saved?.mode === 'dynamic' && (!isEditMeta || activeFilterPresetId === saved.id)) {
         applyFilterPreset(saved, { silent: true })
+      } else if (saved?.mode === 'fixed' && saved.parent_preset_id === activeFilterPreset?.id) {
+        applyFixedGroup(saved, { silent: true })
       }
       setFilterPresetEditorOpen(false)
       const discardedCount = normalizeAccountIds(data?.discarded_account_ids || []).length
       const discardedCopy = discardedCount > 0 ? `，已忽略 ${discardedCount} 个不存在的账号` : ''
-      message.success(`${isEditMeta ? '筛选组合已更新' : '筛选组合已保存'}${discardedCopy}`)
+      message.success(`${isEditMeta ? '组合已更新' : mode === 'fixed' ? '固定账号组合已创建' : '条件筛选组合已保存'}${discardedCopy}`)
     } catch (e: any) {
       message.error(e?.message || '保存筛选组合失败')
     } finally {
       setFilterPresetSaving(false)
     }
-  }, [activeFilterPresetId, applyFilterPreset, filterPresetEditing, filterPresetEditorAccountIds, filterPresetEditorMode, filterPresetForm])
+  }, [activeFilterPreset, activeFilterPresetId, applyFilterPreset, applyFixedGroup, filterPresetEditing, filterPresetEditorAccountIds, filterPresetEditorMode, filterPresetForm])
 
   const overwritePresetWithCurrent = useCallback(async (targetPreset?: AccountFilterPreset | null) => {
     const target = targetPreset || activeFilterPreset
@@ -3564,15 +3625,19 @@ export default function Accounts() {
           description: target.description || '',
           pinned: Boolean(target.pinned),
           mode: target.mode,
+          parent_preset_id: target.parent_preset_id || '',
           filters: normalizeAccountFilterPresetFilters(currentFilterPresetFilters),
           account_ids: fixedAccountIds,
         }),
       })
-      const normalizedItems = normalizeAccountFilterPresetItems(data?.items)
-      setFilterPresets(normalizedItems)
+      setFilterPresets(normalizeAccountFilterPresetItems(data?.dynamic_items).filter((item) => item.mode === 'dynamic'))
+      setFixedGroups(normalizeAccountFilterPresetItems(data?.fixed_groups).filter((item) => item.mode === 'fixed'))
+      setLegacyFixedPresets(normalizeAccountFilterPresetItems(data?.legacy_fixed_items))
       const saved = normalizeAccountFilterPresetItem(data?.item)
-      if (saved && activeFilterPresetId === saved.id) {
+      if (saved?.mode === 'dynamic' && activeFilterPresetId === saved.id) {
         applyFilterPreset(saved, { silent: true })
+      } else if (saved?.mode === 'fixed' && activeFixedGroupId === saved.id) {
+        applyFixedGroup(saved, { silent: true })
       }
       const discardedCount = normalizeAccountIds(data?.discarded_account_ids || []).length
       const discardedCopy = discardedCount > 0 ? `，忽略 ${discardedCount} 个不存在的账号` : ''
@@ -3582,7 +3647,7 @@ export default function Accounts() {
     } finally {
       setFilterPresetSaving(false)
     }
-  }, [activeFilterPreset, activeFilterPresetId, applyFilterPreset, currentFilterPresetFilters, selectedRowKeys])
+  }, [activeFilterPreset, activeFilterPresetId, activeFixedGroupId, applyFilterPreset, applyFixedGroup, currentFilterPresetFilters, selectedRowKeys])
 
   const overwriteActiveFilterPreset = useCallback(() => overwritePresetWithCurrent(activeFilterPreset), [activeFilterPreset, overwritePresetWithCurrent])
 
@@ -3590,15 +3655,72 @@ export default function Accounts() {
     setFilterPresetSaving(true)
     try {
       const data = await apiFetch(`/accounts/filter-presets/${preset.id}`, { method: 'DELETE' })
-      setFilterPresets(normalizeAccountFilterPresetItems(data?.items))
+      setFilterPresets(normalizeAccountFilterPresetItems(data?.dynamic_items).filter((item) => item.mode === 'dynamic'))
+      setFixedGroups(normalizeAccountFilterPresetItems(data?.fixed_groups).filter((item) => item.mode === 'fixed'))
+      setLegacyFixedPresets(normalizeAccountFilterPresetItems(data?.legacy_fixed_items))
       if (activeFilterPresetId === preset.id) clearFilterPreset({ silent: true })
+      if (activeFixedGroupId === preset.id) applyUnassignedScope({ silent: true })
       message.success('筛选组合已删除')
     } catch (e: any) {
       message.error(e?.message || '删除筛选组合失败')
     } finally {
       setFilterPresetSaving(false)
     }
-  }, [activeFilterPresetId, clearFilterPreset])
+  }, [activeFilterPresetId, activeFixedGroupId, applyUnassignedScope, clearFilterPreset])
+
+  const openFixedMigration = useCallback(() => {
+    setFixedMigrationParentById({})
+    setFixedMigrationPriority(legacyFixedPresets.map((preset) => preset.id))
+    setFixedMigrationPreview(null)
+    setFixedMigrationOpen(true)
+  }, [legacyFixedPresets])
+
+  const moveFixedMigrationPriority = useCallback((presetId: string, offset: -1 | 1) => {
+    setFixedMigrationPriority((current) => {
+      const index = current.indexOf(presetId)
+      const nextIndex = index + offset
+      if (index < 0 || nextIndex < 0 || nextIndex >= current.length) return current
+      const next = [...current]
+      ;[next[index], next[nextIndex]] = [next[nextIndex], next[index]]
+      return next
+    })
+    setFixedMigrationPreview(null)
+  }, [])
+
+  const runFixedMigration = useCallback(async (commit: boolean) => {
+    const missingParent = legacyFixedPresets.find((preset) => !fixedMigrationParentById[preset.id])
+    if (missingParent) {
+      message.warning(`请为“${missingParent.name}”选择一级条件组合`)
+      return
+    }
+    setFixedMigrationLoading(true)
+    try {
+      const data = await apiFetch('/accounts/filter-presets/migrate-fixed', {
+        method: 'POST',
+        body: JSON.stringify({
+          parent_by_preset_id: fixedMigrationParentById,
+          priority_order: fixedMigrationPriority,
+          commit,
+        }),
+      })
+      setFixedMigrationPreview(data?.preview || null)
+      if (!commit) {
+        message.success('迁移预览已生成')
+        return
+      }
+      setFilterPresets(normalizeAccountFilterPresetItems(data?.dynamic_items).filter((item) => item.mode === 'dynamic'))
+      setFixedGroups(normalizeAccountFilterPresetItems(data?.fixed_groups).filter((item) => item.mode === 'fixed'))
+      setLegacyFixedPresets(normalizeAccountFilterPresetItems(data?.legacy_fixed_items))
+      setFixedMigrationOpen(false)
+      setSelectedRowKeys([])
+      setSelectedAccountSnapshots({})
+      message.success('旧固定组合迁移完成')
+    } catch (e: any) {
+      message.error(e?.message || '旧固定组合迁移失败')
+    } finally {
+      setFixedMigrationLoading(false)
+    }
+  }, [fixedMigrationParentById, fixedMigrationPriority, legacyFixedPresets])
 
   useEffect(() => {
     const ids = new Set<number>()
@@ -4157,28 +4279,11 @@ export default function Accounts() {
         }
         if (exportMode === 'pix_payment_links') {
           if (exportScope === 'filtered') {
-            if (activeFilterPreset?.mode === 'fixed') {
-              const fixedIds = normalizeAccountIds(
-                activeFixedResolvedAccountIds !== null
-                  ? activeFixedResolvedAccountIds
-                  : activeFilterPreset.account_ids,
-              )
-              if (fixedIds.length === 0) {
-                appMessage.warning('当前固定筛选组合没有可导出的账号')
-                return
-              }
-              body.ids = fixedIds
-            } else {
-              if (!currentFilterScopeReady) {
-                appMessage.warning('账号列表正在更新，请等待当前筛选数量刷新后再导出 PIX 支付链接')
-                return
-              }
-              body.ids = []
-              Object.assign(body, currentAccountFilterBody, {
-                all_filtered: true,
-                expected_total: currentFilteredTotal,
-              })
-            }
+            body.ids = []
+            if (applyAccountTaskScopeToBody(body, {
+              scope: 'filtered',
+              emptySelectedMessage: '当前范围没有可导出的账号',
+            }) === null) return
           } else if (selectedIds.length === 0) {
             appMessage.warning('请先选择要导出 PIX 支付链接的账号')
             return
@@ -8816,12 +8921,19 @@ export default function Accounts() {
         filterPresets={filterPresets}
         pinnedFilterPresets={pinnedFilterPresets}
         activeFilterPreset={activeFilterPreset}
+        fixedGroups={currentParentFixedGroups}
+        pinnedFixedGroups={pinnedFixedGroups}
+        activeFixedGroupId={activeFixedGroupId}
+        secondaryScope={secondaryFilterScope}
         currentFilterPresetFilters={currentFilterPresetFilters}
         activeFilterPresetDirty={activeFilterPresetDirty}
         filterPresetSaving={filterPresetSaving}
         applyFilterPreset={applyFilterPreset}
+        applyUnassignedScope={applyUnassignedScope}
+        applyFixedGroup={applyFixedGroup}
         clearFilterPreset={clearFilterPreset}
         openCreateCurrentFilterPreset={openCreateCurrentFilterPreset}
+        openCreateFixedGroup={openCreateFixedGroup}
         setFilterPresetManageOpen={setFilterPresetManageOpen}
         loadFilterPresets={loadFilterPresets}
         overwriteActiveFilterPreset={overwriteActiveFilterPreset}
@@ -8853,7 +8965,11 @@ export default function Accounts() {
       />
 
       <Modal
-        title={filterPresetEditorMode === 'edit-meta' ? '编辑筛选组合' : filterPresetEditorMode === 'copy-preset' ? '复制筛选组合' : '保存筛选组合'}
+        title={filterPresetEditorMode === 'edit-meta'
+          ? filterPresetContentMode === 'fixed' ? '编辑固定账号组合' : '编辑条件筛选组合'
+          : filterPresetEditorMode === 'copy-preset'
+            ? '复制条件筛选组合'
+            : filterPresetContentMode === 'fixed' ? '新建固定账号组合' : '保存条件筛选组合'}
         open={filterPresetEditorOpen}
         onOk={() => { void saveFilterPresetForm() }}
         onCancel={() => setFilterPresetEditorOpen(false)}
@@ -8864,27 +8980,20 @@ export default function Accounts() {
       >
         <Space direction="vertical" size={12} style={{ width: '100%' }}>
           <Form form={filterPresetForm} layout="vertical" preserve={false}>
-            <Form.Item name="mode" label="组合内容" rules={[{ required: true }]}>
-              <Segmented
-                block
-                options={[
-                  { value: 'dynamic', label: '筛选条件' },
-                  { value: 'fixed', label: `固定账号 (${filterPresetEditorAccountIds.length})` },
-                ]}
-              />
-            </Form.Item>
+            <Form.Item name="mode" hidden><Input /></Form.Item>
+            <Form.Item name="parent_preset_id" hidden><Input /></Form.Item>
             <Form.Item
               name="name"
               label="组合名称"
               rules={[{ required: true, message: '请输入筛选组合名称' }, { max: 80, message: '名称最多 80 个字符' }]}
             >
-              <Input placeholder="例如：Plus 长效未上传 OAIPay" />
+              <Input placeholder={filterPresetContentMode === 'fixed' ? '例如：固定50' : '例如：Plus 长效未上传 OAIPay'} />
             </Form.Item>
             <Form.Item name="description" label="描述" rules={[{ max: 240, message: '描述最多 240 个字符' }]}>
               <Input.TextArea rows={2} placeholder="说明这组条件的用途，便于后续区分" />
             </Form.Item>
             <Form.Item name="pinned" valuePropName="checked" style={{ marginBottom: 12 }}>
-              <Checkbox>置顶到账号页快捷筛选</Checkbox>
+              <Checkbox>置顶到账号页快捷入口</Checkbox>
             </Form.Item>
             {filterPresetContentMode === 'fixed' ? (
               <div
@@ -9032,23 +9141,39 @@ export default function Accounts() {
       </Modal>
 
       <Modal
-        title="筛选组合管理"
+        title="组合管理"
         open={filterPresetManageOpen}
         onCancel={() => setFilterPresetManageOpen(false)}
         footer={[
           <Button key="refresh" icon={<SyncOutlined spin={filterPresetLoading} />} onClick={() => void loadFilterPresets(false)}>
             刷新
           </Button>,
-          <Button key="new" type="primary" icon={<SaveOutlined />} onClick={openCreateCurrentFilterPreset}>
-            {selectedRowKeys.length > 0 ? `保存已选账号 (${selectedRowKeys.length})` : '保存当前筛选'}
+          <Button key="new-condition" icon={<SaveOutlined />} onClick={openCreateCurrentFilterPreset}>
+            保存当前条件组合
           </Button>,
+          activeFilterPreset && secondaryFilterScope === 'unassigned' && selectedRowKeys.length > 0 ? (
+            <Button key="new-fixed" type="primary" onClick={openCreateFixedGroup}>
+              新建固定账号组合
+            </Button>
+          ) : null,
           <Button key="close" onClick={() => setFilterPresetManageOpen(false)}>
             关闭
           </Button>,
-        ]}
+        ].filter(Boolean)}
         width={860}
       >
-        <Space direction="vertical" size={10} style={{ width: '100%' }}>
+        <Space direction="vertical" size={12} style={{ width: '100%' }}>
+          {legacyFixedPresets.length > 0 ? (
+            <Alert
+              type="warning"
+              showIcon
+              message="检测到旧固定组合"
+              description="旧数据没有一级父级且可能存在重复成员，需预览并确认后迁移到两级结构。"
+              action={<Button size="small" onClick={openFixedMigration}>迁移旧组合</Button>}
+            />
+          ) : null}
+
+          <Text strong>条件筛选组合</Text>
           {filterPresets.map((preset) => (
             <div
               key={preset.id}
@@ -9067,9 +9192,6 @@ export default function Accounts() {
               <div style={{ minWidth: 0, flex: 1 }}>
                 <Space size={6} wrap style={{ marginBottom: 4 }}>
                   <Text strong>{preset.name}</Text>
-                  <Tag color={preset.mode === 'fixed' ? 'gold' : 'default'} style={{ marginInlineEnd: 0 }}>
-                    {preset.mode === 'fixed' ? `固定 ${preset.account_count} 个` : '按条件'}
-                  </Tag>
                   {preset.built_in ? <Tag style={{ marginInlineEnd: 0 }}>内置</Tag> : null}
                   {preset.pinned ? <Tag color="processing" style={{ marginInlineEnd: 0 }}>置顶</Tag> : null}
                   {preset.id === activeFilterPresetId ? <Tag color="success" style={{ marginInlineEnd: 0 }}>当前</Tag> : null}
@@ -9080,7 +9202,7 @@ export default function Accounts() {
                   </Text>
                 ) : null}
                 <Text type="secondary" style={{ display: 'block', fontSize: 12 }}>
-                  {preset.summary || (preset.mode === 'fixed' ? `固定账号 · ${preset.account_count} 个` : buildAccountFilterPresetSummary(preset.filters))}
+                  {preset.summary || buildAccountFilterPresetSummary(preset.filters)}
                 </Text>
               </div>
               <Space size={6} wrap>
@@ -9094,13 +9216,11 @@ export default function Accounts() {
                   编辑
                 </Button>
                 <Popconfirm
-                  title={preset.mode === 'fixed'
-                    ? `确认将当前选中的 ${selectedRowKeys.length} 个账号覆盖保存到「${preset.name}」？`
-                    : `确认将当前页面的筛选条件覆盖保存到「${preset.name}」？`}
+                  title={`确认将当前页面的筛选条件覆盖保存到「${preset.name}」？`}
                   onConfirm={() => { void overwritePresetWithCurrent(preset) }}
                 >
-                  <Button size="small" icon={<SyncOutlined />} loading={filterPresetSaving} disabled={preset.mode === 'fixed' && selectedRowKeys.length === 0}>
-                    {preset.mode === 'fixed' ? '覆盖成员' : '覆盖条件'}
+                  <Button size="small" icon={<SyncOutlined />} loading={filterPresetSaving}>
+                    覆盖条件
                   </Button>
                 </Popconfirm>
                 <Button size="small" icon={<CopyOutlined />} onClick={() => openCopyFilterPreset(preset)}>
@@ -9118,7 +9238,137 @@ export default function Accounts() {
             </div>
           ))}
           {!filterPresetLoading && filterPresets.length === 0 ? (
-            <Alert type="info" showIcon message="暂无筛选组合" />
+            <Alert type="info" showIcon message="暂无条件筛选组合" />
+          ) : null}
+
+          <Text strong style={{ marginTop: 4 }}>固定账号组合</Text>
+          {fixedGroups.map((group) => {
+            const parent = filterPresets.find((item) => item.id === group.parent_preset_id)
+            return (
+              <div
+                key={group.id}
+                style={{
+                  display: 'flex',
+                  flexWrap: 'wrap',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  gap: 12,
+                  padding: '10px 12px',
+                  border: `1px solid ${group.id === activeFixedGroupId ? token.colorPrimaryBorder : token.colorBorderSecondary}`,
+                  borderRadius: 8,
+                  background: group.id === activeFixedGroupId ? token.colorPrimaryBg : token.colorFillAlter,
+                }}
+              >
+                <div style={{ minWidth: 0, flex: 1 }}>
+                  <Space size={6} wrap style={{ marginBottom: 4 }}>
+                    <Text strong>{group.name}</Text>
+                    {parent ? <Tag style={{ marginInlineEnd: 0 }}>{parent.name}</Tag> : null}
+                    {group.pinned ? <Tag color="processing" style={{ marginInlineEnd: 0 }}>置顶</Tag> : null}
+                    {group.id === activeFixedGroupId ? <Tag color="success" style={{ marginInlineEnd: 0 }}>当前</Tag> : null}
+                  </Space>
+                  {group.description ? (
+                    <Text type="secondary" style={{ display: 'block', fontSize: 12 }}>{group.description}</Text>
+                  ) : null}
+                </div>
+                <Space size={6} wrap>
+                  <Button size="small" onClick={() => {
+                    applyFixedGroup(group)
+                    setFilterPresetManageOpen(false)
+                  }}>
+                    应用
+                  </Button>
+                  <Button size="small" icon={<EditOutlined />} onClick={() => openEditFilterPresetMeta(group)}>
+                    编辑
+                  </Button>
+                  <Popconfirm
+                    title={`确认删除固定账号组合「${group.name}」？其中账号将解除固定归属。`}
+                    onConfirm={() => { void deleteFilterPreset(group) }}
+                  >
+                    <Button size="small" danger icon={<DeleteOutlined />} loading={filterPresetSaving}>删除</Button>
+                  </Popconfirm>
+                </Space>
+              </div>
+            )
+          })}
+          {!filterPresetLoading && fixedGroups.length === 0 ? (
+            <Alert type="info" showIcon message="暂无固定账号组合" />
+          ) : null}
+        </Space>
+      </Modal>
+
+      <Modal
+        title="迁移旧固定组合"
+        open={fixedMigrationOpen}
+        onCancel={() => setFixedMigrationOpen(false)}
+        width={860}
+        footer={[
+          <Button key="cancel" onClick={() => setFixedMigrationOpen(false)}>取消</Button>,
+          <Button key="preview" loading={fixedMigrationLoading} onClick={() => { void runFixedMigration(false) }}>
+            生成预览
+          </Button>,
+          <Popconfirm
+            key="commit"
+            title="确认按当前父级和优先级迁移？重复账号只归入优先级最高的组合。"
+            disabled={!fixedMigrationPreview || Number(fixedMigrationPreview?.outside_parent_account_count || 0) > 0}
+            onConfirm={() => { void runFixedMigration(true) }}
+          >
+            <Button
+              type="primary"
+              loading={fixedMigrationLoading}
+              disabled={!fixedMigrationPreview || Number(fixedMigrationPreview?.outside_parent_account_count || 0) > 0}
+            >
+              确认迁移
+            </Button>
+          </Popconfirm>,
+        ]}
+      >
+        <Space direction="vertical" size={12} style={{ width: '100%' }}>
+          <Alert type="info" showIcon message="排序越靠前，重复账号的归属优先级越高。迁移不会自动更改一级组合条件。" />
+          {fixedMigrationPriority.map((presetId, index) => {
+            const preset = legacyFixedPresets.find((item) => item.id === presetId)
+            if (!preset) return null
+            return (
+              <div key={preset.id} className="accounts-fixed-migration-row">
+                <Text className="accounts-fixed-migration-name" ellipsis={{ tooltip: preset.name }}>{preset.name}</Text>
+                <Select
+                  value={fixedMigrationParentById[preset.id] || undefined}
+                  placeholder="选择一级条件组合"
+                  options={filterPresets.map((item) => ({ value: item.id, label: item.name }))}
+                  onChange={(value) => {
+                    setFixedMigrationParentById((current) => ({ ...current, [preset.id]: value }))
+                    setFixedMigrationPreview(null)
+                  }}
+                />
+                <Space.Compact>
+                  <Button icon={<ArrowUpOutlined />} aria-label="提高优先级" disabled={index === 0} onClick={() => moveFixedMigrationPriority(preset.id, -1)} />
+                  <Button icon={<ArrowDownOutlined />} aria-label="降低优先级" disabled={index === fixedMigrationPriority.length - 1} onClick={() => moveFixedMigrationPriority(preset.id, 1)} />
+                </Space.Compact>
+              </div>
+            )
+          })}
+          {fixedMigrationPreview ? (
+            <div style={{ paddingTop: 4 }}>
+              <Text strong>迁移预览</Text>
+              <Space direction="vertical" size={6} style={{ display: 'flex', marginTop: 8 }}>
+                {(fixedMigrationPreview.groups || []).map((item: any) => (
+                  <div key={item.id} style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 6 }}>
+                    <Text style={{ minWidth: 140 }}>{item.name}</Text>
+                    <Tag>迁入 {item.assigned_account_count}</Tag>
+                    {item.conflict_account_count > 0 ? <Tag color="warning">冲突 {item.conflict_account_count}</Tag> : null}
+                    {item.missing_account_count > 0 ? <Tag color="error">缺失 {item.missing_account_count}</Tag> : null}
+                    {item.outside_parent_account_count > 0 ? <Tag color="error">不符合父级 {item.outside_parent_account_count}</Tag> : null}
+                  </div>
+                ))}
+              </Space>
+              {Number(fixedMigrationPreview.outside_parent_account_count || 0) > 0 ? (
+                <Alert
+                  type="error"
+                  showIcon
+                  style={{ marginTop: 10 }}
+                  message="存在不符合父级条件的账号，当前预览不能提交"
+                />
+              ) : null}
+            </div>
           ) : null}
         </Space>
       </Modal>

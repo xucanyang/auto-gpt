@@ -9,10 +9,15 @@ from typing import Any, Iterable, Mapping
 from urllib.parse import urlsplit
 
 from pydantic import BaseModel, Field
-from sqlalchemy import text
+from sqlalchemy import String, cast, exists, func, text
 from sqlmodel import Session, select
 
-from core.db import AccountListStateModel, AccountModel
+from core.db import (
+    AccountFixedGroupMemberModel,
+    AccountFixedGroupModel,
+    AccountListStateModel,
+    AccountModel,
+)
 from services.chatgpt_account_state import (
     AUTH_INVALID_STATES,
     classify_chatgpt_capabilities,
@@ -21,7 +26,7 @@ from services.chatgpt_account_state import (
 
 AUTO_DELETE_REVIVAL_TASK_ID = "icloud_hme_auto_delete"
 ACCOUNT_LIST_STATE_DERIVATION_VERSION = "integration-upload-state-v1-payment-link-history-v4-all-status-delete"
-ACCOUNT_FILTER_RESOLVER_VERSION = "account-list-state-v9-payment-link-delete"
+ACCOUNT_FILTER_RESOLVER_VERSION = "account-list-state-v10-fixed-group-scope"
 ACCOUNT_FILTER_FIELD_NAMES = (
     "email",
     "status",
@@ -37,6 +42,10 @@ ACCOUNT_FILTER_FIELD_NAMES = (
     "idea_submit_state",
     "submit_state",
     "has_submitted",
+    "primary_preset_id",
+    "secondary_scope",
+    "fixed_group_id",
+    "fixed_group_revision",
 )
 ACCOUNT_SORT_CREATED_AT = "created_at"
 ACCOUNT_SORT_SUBSCRIPTION_ACTIVE_UNTIL = "subscription_active_until"
@@ -65,6 +74,10 @@ class AccountFilterRequestMixin(BaseModel):
     idea_submit_state: str = ""
     submit_state: str = ""
     has_submitted: str | None = None
+    primary_preset_id: str = ""
+    secondary_scope: str = ""
+    fixed_group_id: str = ""
+    fixed_group_revision: int | None = Field(default=None, ge=1)
     expected_total: int | None = Field(default=None, ge=0)
 
 
@@ -83,6 +96,15 @@ class AccountFilterScopeChangedError(ValueError):
             "message": message,
         }
         super().__init__(message)
+
+
+class AccountFixedGroupScopeChangedError(AccountFilterScopeChangedError):
+    def __init__(self, message: str, *, code: str = "FIXED_GROUP_SCOPE_CHANGED"):
+        self.detail = {
+            "code": code,
+            "message": message,
+        }
+        ValueError.__init__(self, message)
 
 
 @dataclass(frozen=True)
@@ -369,6 +391,11 @@ def _normalize_filter_values(
 def normalize_account_filter(source: Any) -> dict[str, Any]:
     """Return the canonical account filter represented by a flat request."""
 
+    raw_fixed_group_revision = _filter_source_value(source, "fixed_group_revision")
+    try:
+        fixed_group_revision = int(raw_fixed_group_revision) if raw_fixed_group_revision is not None else None
+    except (TypeError, ValueError):
+        fixed_group_revision = None
     return {
         "email": _safe_str(_filter_source_value(source, "email")),
         "status": _normalize_filter_values(_filter_source_value(source, "status")),
@@ -404,7 +431,20 @@ def normalize_account_filter(source: Any) -> dict[str, Any]:
             idea_submit=True,
         ),
         "has_submitted": normalize_optional_bool(_filter_source_value(source, "has_submitted")),
+        "primary_preset_id": _safe_str(_filter_source_value(source, "primary_preset_id")),
+        "secondary_scope": normalize_secondary_scope(_filter_source_value(source, "secondary_scope")),
+        "fixed_group_id": _safe_str(_filter_source_value(source, "fixed_group_id")),
+        "fixed_group_revision": fixed_group_revision,
     }
+
+
+def normalize_secondary_scope(value: Any) -> str:
+    normalized = _safe_str(value).lower().replace("-", "_")
+    if normalized in {"unassigned", "unfixed", "available"}:
+        return "unassigned"
+    if normalized in {"fixed", "group", "fixed_group"}:
+        return "fixed"
+    return ""
 
 
 def _normalized_account_ids(account_ids: Iterable[Any]) -> list[int]:
@@ -2399,6 +2439,7 @@ def account_filtered_query(
     platform: str | None,
     filter_source: Any,
     refresh_state: bool = True,
+    include_fixed_members: bool = False,
 ) -> tuple[Any, bool, dict[str, Any]]:
     """Build the canonical account-list query used by list and batch scopes."""
 
@@ -2431,6 +2472,27 @@ def account_filtered_query(
         status=normalized["status"],
         email=normalized["email"],
     )
+    secondary_scope = normalized.get("secondary_scope") or ""
+    fixed_group_id = normalized.get("fixed_group_id") or ""
+    stable_membership = select(AccountFixedGroupMemberModel.account_id).where(
+        AccountFixedGroupMemberModel.account_id == AccountModel.id,
+        func.lower(AccountFixedGroupMemberModel.account_email) == func.lower(AccountModel.email),
+        AccountFixedGroupMemberModel.account_created_at
+        == func.replace(cast(AccountModel.created_at, String), " ", "T"),
+    )
+    if secondary_scope == "fixed":
+        fixed_membership = stable_membership.where(
+            AccountFixedGroupMemberModel.fixed_group_id == fixed_group_id
+        )
+        query = query.where(exists(fixed_membership))
+    elif not include_fixed_members and (
+        secondary_scope == "unassigned"
+        or _safe_str(platform).lower() == "chatgpt"
+    ):
+        # Fixed ownership is an exclusive pool boundary. Any condition-based
+        # ChatGPT scope defaults to the unassigned pool unless a fixed group is
+        # explicitly selected.
+        query = query.where(~exists(stable_membership))
     if not use_list_state:
         return query, False, normalized
 
@@ -2464,6 +2526,21 @@ def resolve_filtered_accounts(
     filter_source: Any,
     verify_expected_total: bool = False,
 ) -> AccountFilterResolution:
+    secondary_scope = normalize_secondary_scope(_filter_source_value(filter_source, "secondary_scope"))
+    if secondary_scope == "fixed":
+        fixed_group_id = _safe_str(_filter_source_value(filter_source, "fixed_group_id"))
+        primary_preset_id = _safe_str(_filter_source_value(filter_source, "primary_preset_id"))
+        if not fixed_group_id:
+            raise AccountFixedGroupScopeChangedError("固定账号组合范围缺少组合 ID")
+        group = session.get(AccountFixedGroupModel, fixed_group_id)
+        if group is None:
+            raise AccountFixedGroupScopeChangedError("固定账号组合已不存在，请刷新列表后重试")
+        if primary_preset_id and group.parent_preset_id != primary_preset_id:
+            raise AccountFixedGroupScopeChangedError("固定账号组合所属的条件组合已变化，请刷新列表后重试")
+        raw_revision = _filter_source_value(filter_source, "fixed_group_revision")
+        if raw_revision is not None and int(raw_revision) != int(group.revision or 1):
+            raise AccountFixedGroupScopeChangedError("固定账号组合成员已变化，请刷新列表后重新确认范围")
+
     query, _, normalized = account_filtered_query(
         session,
         platform=platform,

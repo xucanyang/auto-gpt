@@ -7,6 +7,8 @@
 ## [Unreleased] (未发布)
 
 ### 新增 (Added)
+- **账号筛选组合升级为两级排他结构（v2.13.0）**：`core/db.py` 与新增的 `services/account_fixed_groups.py` 引入实例本地 `account_fixed_groups / account_fixed_group_members`，一级仅保存动态条件组合，二级固定账号组合必须挂在一个一级组合下；成员表以账号 ID 为唯一主键，并同时保存规范化邮箱与创建时间，保证一个账号在单实例内最多归属一个固定组合且 SQLite ID 复用不会误绑定。`api/accounts.py` 的组合接口新增 `dynamic_items / fixed_groups / legacy_fixed_items` 分区响应、父级校验、冲突 `409`、成员 revision 和显式移动能力，旧 `items` 与 `filter_preset_id` 继续兼容。
+- **旧固定组合提供显式迁移预览（v2.13.0）**：账号页组合管理新增旧结构迁移入口，操作方必须逐组选择一级父级并明确排列冲突优先级；预览展示迁入、重复、缺失和不符合父级的账号数，不符合父级时禁止提交。提交前使用 SQLite backup API 备份实例账号库并执行 `PRAGMA integrity_check`，成功后才移除已迁移的旧配置；发布过程不会自动选择父级、不会自动处理重复归属，也不会触发迁移。
 - **失效测活支持统一代理方式与账号级批量并发（v2.12.0）**：`frontend/src/pages/Accounts.tsx` 将账号行内与工具栏“批量失效测活”统一接入同一个任务配置弹窗，可选择动态代理、代理池、指定代理或直连；批量入口新增可持久化的并发数。`api/tasks.py`、`api/actions.py` 与 `services/chatgpt_core/invalid_account_recheck.py` 将任务级代理参数贯穿到 any-auto Camoufox `login_only` 浏览器事务，按现有候选策略执行代理池筛选、动态 SID 刷新和仅限网络/代理故障的候选切换，并在任务 meta 中记录脱敏代理摘要、请求/实际并发和逐账号结果。批量 runner 使用滚动补位线程池，账号读取、浏览器网络事务和结果写回使用分离的短数据库 Session，避免并发登录期间占满 SQLAlchemy 连接池；旧客户端未传代理或并发时继续保持直连、串行，现有筛选范围和 `status=invalid` 门禁不变。
 - **恢复 Plus 登录态短链生成（v2.10.0）**：`services/chatgpt_core/payment.py`、`plugin.py` 与 `api/tasks.py` 重新开放 `payment_source=chatgpt_hosted + payment_link_format=short_chatgpt`，使用 `checkout_ui_mode=custom` 创建 Checkout Session，并直接返回 `https://chatgpt.com/checkout/<processor_entity>/<cs_id>`，不再把短链归一化为 `pay.openai.com` Hosted 长链。账号页原“支付链接生成”弹窗新增“Plus 登录态短链”，支持本地账单国家/币种选择，单账号与批量范围继续复用同一任务、日志、当前链接和生成历史合同；现有 Plus long-link 与 Team 优惠码长链接入口保持不变。
 - **HME Ready-only 邮箱通道（v2.9.1）**：`core/base_mailbox.py`、`services/chatgpt_core/mailbox_state.py` 与 `services/chatgpt_core/restored_email_service.py` 将历史 `icloud_hme` / `helper_ready_api` 状态统一规范为 `hme_ready_api`。Helper 只负责 HME 出池、lease、registration/logical/physical identity 与 finalize；验证码读取固定由 auto-gpt 通过 TempMail 转发箱完成，注册状态不再依赖 Helper `/wait-code`。
@@ -16,6 +18,8 @@
 - **新增并校正 ChatGPT 注册失败分析文档**：`docs/chatgpt-registration-failure-analysis.md` 基于主实例与 Plus 实例的历史 `task_logs`，结合 `api/tasks.py`、any-auto 注册链、Sentinel 浏览器和 Docker 运行态重新核对统计与调用边界。文档不再把旧线程池上限 `5` 写成默认并发，不再把独立 `:8889` Solver、无 cgroup 总内存上限时的第二槽门控或未经日志证明的 CSRF 假设写成当前注册根因，并明确区分相关性、因果性、同进程出口租约和跨容器残余风险。
 
 ### 优化 (Changed)
+- **账号页组合栏改为两行名称选择（v2.13.0）**：`frontend/src/features/accounts/components/FilterPresetBar.tsx`、`frontend/src/pages/Accounts.tsx` 与 `frontend/src/index.css` 分别显示“条件筛选组合”和“固定账号组合”；二级只提供“未固定”或当前父级下的固定组，快捷项与下拉项只显示自定义名称，不追加数量、“按条件”或“内置”。选中态同时使用按钮状态、勾选图标与 `aria-pressed`，移动端改为稳定的两行全宽布局；新建固定组只在已选一级、“未固定”范围且已勾选账号时开放。
+- **查看范围、临时勾选与批量任务彻底解耦（v2.13.0）**：切换一级或二级组合会清空表格临时勾选，但选择固定组不再自动全选成员；跨页勾选继续只代表本次明确 ID 操作。`useAccountsQuery.ts` 和统一批任务请求增加 `primary_preset_id / secondary_scope / fixed_group_id / fixed_group_revision`，列表、OAIPay/Sub2API、手机号绑定、失效测活、支付链接和 PIX 导出共用同一范围解析；固定组状态变化只影响临时表格条件，不改变持久归属，成员 revision 仅在成员实际新增、移动、移除或身份重绑定时递增。
 - **按现场要求整体回退运行版本至 v2.12.5**：将运行代码、测试合同和侧栏版本恢复到提交 `d3418b418e14e50d868eeea9f9a688493cae5982`，撤销 `v2.12.6` 的 HME MIME 可见正文取码与路由数字隔离，以及 `v2.12.7` 的 OTP `403` 停用原因保真、`account_deactivated` 账号终态同步和手机号资源复用边界；此前已撤销的 `v2.12.8` OTP 成功响应事件轮询继续不启用。`v2.12.5` 的 OAIPay Plus/Pro 仅 AT 无 RT 私有门禁及 `PLUS--未接码` 自动分类完整保留。此次仅回退代码与静态资源，不反向改写主服务、Plus、Plus2 的账号数据库、任务历史、实例 `.env` 或共享配置；历史任务和已经落库的账号状态保持原样。
 - **按现场要求回退运行版本至 v2.12.7**：撤销 `v2.12.8` 对失效测活 OTP 提交等待的 45 秒 Playwright 事件轮询、截止事件排空、输入时自动提交兼容及对应新增测试，恢复 `c428b5a` 发布前的 `v2.12.7` 代码与侧栏版本。`v2.12.7` 已有的 OTP `403` 结构化响应保真、`account_deactivated` 明确分类、手机号绑定停用账号状态同步和三实例代理/并发合同继续保留；本次只回退代码与静态资源，不反向改写主服务、Plus、Plus2 的账号数据库、任务历史、实例 `.env` 或共享配置，回退前已经成功复活的账号状态保持原样。
 - **根据现场测活结果再次回退至 v2.12.1**：`v2.12.2` 虽仅包含 OAIPay Plus 仅 AT 上传补丁，但操作方确认其线上失效测活不可用、`v2.12.1` 可用，因此本次反向撤销定向恢复提交 `7843de1fc3edb122bc807c196b2b44911ce1b689`，将全部代码和前端重新恢复到 `043ef6ba84e1088dfec2e0bb3585230c92cb152f` 的 `v2.12.1` 状态。账号数据库、任务日志、实例 `.env` 与 `shared_config` 不迁移、不改写；OAIPay 再次恢复要求 RefreshToken，失效测活继续使用 v2.12.1 的 OTP 和浏览器状态机行为。
@@ -53,6 +57,8 @@
 - **统一测试文档入口**：`README.md`、`AGENTS.md` 与 `docs/docker-image-release.md` 现在统一指向 Docker 测试规范，移除会吞掉收集失败的 `pytest tests -q || true` 作为推荐门禁，明确当前 `requirements-test.txt`、`docker-compose.test.yml` 和测试脚本仍待落地。
 
 ### 修复 (Fixed)
+- **固定账号不再被任意条件范围重新吸收（v2.13.0）**：`services/account_filters.py` 将固定归属设为 ChatGPT 条件查询的默认排他边界；未明确选择固定组的列表和条件批任务只解析未固定账号，固定组成员不会再同时出现在 Free 已注册、Plus 或其他临时条件结果中。明确账号 ID 的编辑、删除和维护接口不受该边界限制；按条件删除继续关闭式排除全部固定成员。
+- **修复固定组身份漂移、父级越界和响应丢失（v2.13.0）**：固定组创建及后续新增成员都必须在加入时满足父级动态条件，已加入成员之后状态变化不会自动退出；父级或成员 revision 变化会在批任务冻结前返回 `409`。稳定身份 SQL 同时比对 ID、邮箱和创建时间，账号删除触发器清理旧归属，避免主键复用串组；创建响应现在合并返回跨平台、不存在等全部被忽略账号，前端可以准确提示影响数量。
 - **定向修复 OAIPay Plus/Pro 仅 AT 未接码上传（v2.12.5）**：`services/oaipay_sync.py` 新增 OAIPay 私有 readiness 判定，只对认证有效、具备 AccessToken 与 account/workspace 标识、当前或最近有效订阅为 Plus/Pro 的无 RefreshToken 账号放行；`services/chatgpt_core/oaipay_upload.py` 同步收紧底层门禁，使该类账号携带空 RT 进入既有 `paid_without_refresh_token` 自动分类并上传到 `PLUS--未接码`。缺少 AccessToken、缺少 workspace/account_id、Free 无 RT、认证失效及 Team/Business/Enterprise 账号仍关闭式拒绝；共享 `services/chatgpt_account_state.py`、Sub2API、CPA、失效测活与注册链均未修改。侧栏可见版本同步为 `v2.12.5`。
 - **恢复邮箱登录测活对失效测活公共常量的兼容导入（v2.12.0）**：v2.11.2 将 `AT_ONLY_CLEAR_EXTRA_KEYS` 重命名并扩展为失效测活专用集合时，`services/chatgpt_core/custom_email_recheck.py` 的既有导入没有同步，导致邮箱登录测活模块首次加载即 `ImportError`。`invalid_account_recheck.py` 现在恢复旧常量及其原始字段语义，并在此基础上单独扩展失效测活需要清理的 Cookie 与账号 ID；邮箱测活不会因此新增凭据清理行为，失效测活的完整 Web Session 覆盖规则也保持不变。
 - **修复失效测活误入补抓 Auth/RT 与手机号链路（v2.11.2）**：`services/chatgpt_core/invalid_account_recheck.py` 将 `status=invalid` 的账号恢复收口为单一登录测活事务：使用 any-auto Camoufox 的 `login_only` 模式登录已有账号，只在同时取得新的 AccessToken、NextAuth/Auth.js session token 与完整 Cookie header 后写回原账号；成功时清除旧 refresh token、旧 `chatgpt_local` 失效证据，恢复账号主状态与 `account_list_state`，并用新 AT 调度常规本地状态刷新后立即结束。该路径不再调用 `custom_email_recheck`，不再进入 Codex OAuth/RT、`resume_subscription_auth` 或 `add_phone` 绑定；登录落到新账号密码页或 `about_you` 时关闭式失败，落到 `add_phone` 时也只尝试 Web Session 桥接且不会调用手机号回调。
@@ -95,6 +101,7 @@
 - **短链生成强制 Web Session 门禁**：登录态短链只接受持久化了完整 NextAuth/Auth.js Session Cookie（兼容非分片、连续分片及独立 `session_token`）的账号；AT-only、缺失分片或已清除网页会话的账号在任务解析阶段直接跳过，支付核心再次执行同一门禁作为纵深校验。Cookie、Session Token 和代理凭据不会写入任务元数据、生成历史、接口响应或前端配置摘要；本地短链配置接口仅返回非敏感国家/币种目录和登录态要求。
 
 ### 测试 (Tests)
+- **补齐两级组合与排他范围回归（v2.13.0）**：`tests/test_account_filter_presets.py` 覆盖父子 CRUD、全实例唯一归属、默认未固定范围、父级成员门禁、状态漂移稳定归属、成员 revision、SQLite ID 复用、旧 fixed 冲突优先级及父级不匹配迁移阻断；`tests/test_account_filter_presets_ui.py` 锁定两行名称 UI、固定组切换不自动勾选、统一任务 scope 和迁移父级不预填。一次性同源 pytest 镜像以只读 checkout、临时 SQLite/shared config 和 `--network none` 运行专项及共享筛选回归，结果 `31 passed`；完整 `tests/` 为 `1246 passed, 1 skipped, 7 failed`，7 条均位于未修改的浏览器旧接口/导航断言、Camoufox 临时可执行权限、手机号旧文案和已退役 GoPay 类型合同，与本次功能无关。前端 TypeScript/Vite 生产构建及 Python 编译检查通过，侧栏可见版本同步为 `v2.13.0`。
 - **补齐 OAIPay 私有门禁回归（v2.12.5）**：`tests/test_oaipay_sync.py` 覆盖 Plus 仅 AT 账号通过 backfill、空 RT payload 自动进入 `PLUS--未接码`，并锁定无 AccessToken、Free 无 RT 及缺少 workspace 的账号均在分类/上传网络请求前被拒绝，避免 OAIPay 例外再次扩散到通用上传 readiness 或其他业务链路。基于 `auto-gpt:test-v2121-predeploy` 的一次性断网、只读 checkout、临时 SQLite/shared config/runtime 容器中，OAIPay 专项及通用账号能力、Sub2API、退役能力相邻回归共 `66 passed`；前端 TypeScript 与 Vite 生产构建通过。
 - **验证现场回退后的 v2.12.1 运行基线**：在只读 checkout、临时 SQLite/shared config/runtime 和 `--network none` 的 `auto-gpt:test-v2121-predeploy` 容器中，重新运行失效测活、Web Session、动态代理、共享任务代理、代理扫描、OAIPay v2.12.1 基线、Sentinel 浏览器容量与筛选 UI 回归，共 `124 passed`；另执行前端 TypeScript/Vite 生产构建与回退涉及 Python 模块的 `py_compile`，测试未访问真实账号、邮箱、代理、OAIPay 或 OpenAI。
 - **验证 v2.12.1 完整回退基线**：使用 `auto-gpt:test-v2121-predeploy` 同源依赖镜像，以只读 checkout、临时 SQLite/shared config/runtime 和 `--network none` 运行失效测活、Web Session、动态代理、共享任务代理、代理扫描、OAIPay、Sentinel 浏览器容量与筛选 UI 回归，共 `124 passed`；测试未访问真实账号、邮箱、代理或 OpenAI。另执行前端 TypeScript/Vite 生产构建和回退涉及 Python 模块的 `py_compile`，确保发布内容与 `5e65526` 行为基线一致且可加载。
@@ -3332,4 +3339,8 @@
 
 ## 2026-08-05 22:22:48 +0800
 - 按现场要求整体回退运行版本至 v2.12.5
+- 发布模式: multi
+
+## 2026-08-06 05:03:04 +0800
+- 新增两级筛选组合与排他固定账号组 v2.13.0
 - 发布模式: multi

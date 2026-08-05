@@ -4,6 +4,10 @@ import { apiFetch } from '@/lib/utils'
 export type AccountsQueryParams = {
   filterPresetId?: string
   filterPresetRevision?: string
+  primaryPresetId?: string
+  secondaryScope?: '' | 'unassigned' | 'fixed'
+  fixedGroupId?: string
+  fixedGroupRevision?: number
   email?: string
   status?: string
   manuallyUsed?: string
@@ -32,6 +36,9 @@ export type AccountsQueryResult = {
   items: any[]
   fixed_preset?: {
     id: string
+    parent_preset_id?: string
+    revision?: number
+    legacy?: boolean
     stored_account_count: number
     resolved_account_ids: number[]
     missing_account_ids: number[]
@@ -41,6 +48,10 @@ export type AccountsQueryResult = {
 export function useAccountsQuery({
   filterPresetId = '',
   filterPresetRevision = '',
+  primaryPresetId = '',
+  secondaryScope = '',
+  fixedGroupId = '',
+  fixedGroupRevision,
   email = '',
   status = '',
   manuallyUsed = '',
@@ -63,7 +74,7 @@ export function useAccountsQuery({
 }: AccountsQueryParams) {
   const canonicalSubmitState = submitState || ''
   return useQuery<AccountsQueryResult>({
-    queryKey: ['accounts', { filterPresetId, filterPresetRevision, email, status, manuallyUsed, authType, phoneBindingState, paymentLinkPlatform, paymentLinkGenerated, subscriptionType, accountValidity, sub2apiState, oaipayState, submitState: canonicalSubmitState, hasSubmitted, ideaSubmitState, revivalState, sortBy, sortOrder, page, pageSize }],
+    queryKey: ['accounts', { filterPresetId, filterPresetRevision, primaryPresetId, secondaryScope, fixedGroupId, fixedGroupRevision, email, status, manuallyUsed, authType, phoneBindingState, paymentLinkPlatform, paymentLinkGenerated, subscriptionType, accountValidity, sub2apiState, oaipayState, submitState: canonicalSubmitState, hasSubmitted, ideaSubmitState, revivalState, sortBy, sortOrder, page, pageSize }],
     queryFn: async ({ signal }) => {
       const params = new URLSearchParams({
         platform: 'chatgpt',
@@ -72,6 +83,10 @@ export function useAccountsQuery({
         detail: 'false',
       })
       if (filterPresetId) params.set('filter_preset_id', filterPresetId)
+      if (primaryPresetId) params.set('primary_preset_id', primaryPresetId)
+      if (secondaryScope) params.set('secondary_scope', secondaryScope)
+      if (fixedGroupId) params.set('fixed_group_id', fixedGroupId)
+      if (fixedGroupRevision) params.set('fixed_group_revision', String(fixedGroupRevision))
       if (email) params.set('email', email)
       if (status) params.set('status', status)
       if (manuallyUsed) params.set('manually_used', manuallyUsed)
@@ -96,6 +111,6 @@ export function useAccountsQuery({
       return apiFetch(`/accounts?${params}`, { signal }) as Promise<AccountsQueryResult>
     },
     placeholderData: (previousData) => previousData,
-    staleTime: filterPresetId ? 0 : 60_000,
+    staleTime: filterPresetId || secondaryScope ? 0 : 60_000,
   })
 }

@@ -3,7 +3,13 @@ from fastapi.responses import StreamingResponse
 from sqlmodel import Session, select, func
 from pydantic import BaseModel, Field
 from core.config_store import config_store
-from core.db import AccountListStateModel, AccountModel, get_session
+from core.db import (
+    AccountFixedGroupMemberModel,
+    AccountListStateModel,
+    AccountModel,
+    engine,
+    get_session,
+)
 from services.account_filters import (
     account_auth_type,
     account_payment_link_generated,
@@ -16,6 +22,18 @@ from services.account_filters import (
     delete_account_list_state_for_account_ids,
     refresh_account_list_state,
     upsert_account_list_state_for_account_ids,
+)
+from services.account_fixed_groups import (
+    FixedGroupConflictError,
+    create_fixed_group,
+    delete_fixed_group,
+    fixed_group_member_ids,
+    fixed_group_name_exists,
+    get_fixed_group,
+    list_fixed_groups,
+    replace_fixed_group_members,
+    serialize_fixed_group,
+    update_fixed_group_meta,
 )
 from services.account_rate_limit_recovery import (
     RATE_LIMITED_STATUS,
@@ -31,7 +49,8 @@ from services.chatgpt_core.local_status_refresh import schedule_chatgpt_local_st
 from services.chatgpt_core.payment_link_cache import payment_link_type_from_payload
 from typing import Any, Optional
 from datetime import datetime, timezone
-import io, csv, json, logging, threading, time, uuid
+from pathlib import Path
+import io, csv, json, logging, sqlite3, threading, time, uuid
 
 logger = logging.getLogger(__name__)
 
@@ -109,7 +128,15 @@ class AccountFilterPresetBody(BaseModel):
     mode: str = ACCOUNT_FILTER_PRESET_MODE_DYNAMIC
     filters: dict[str, Any] = Field(default_factory=dict)
     account_ids: list[int] = Field(default_factory=list)
+    parent_preset_id: str = ""
+    move_conflicts: bool = False
     pinned: bool = False
+
+
+class FixedPresetMigrationBody(BaseModel):
+    parent_by_preset_id: dict[str, str] = Field(default_factory=dict)
+    priority_order: list[str] = Field(default_factory=list)
+    commit: bool = False
 
 
 def _utc_iso() -> str:
@@ -823,30 +850,361 @@ def _public_filter_preset(item: dict[str, Any]) -> dict[str, Any]:
     return public_item
 
 
-def _build_filter_presets_response(state: dict[str, Any] | None = None) -> dict[str, Any]:
-    state = state if state is not None else _load_filter_preset_state()
-    custom = list(state.get("custom") or [])
-    builtin_items = _visible_builtin_filter_presets(state)
-    ordered_custom = sorted(
-        custom,
-        key=lambda item: (not bool(item.get("pinned")), str(item.get("updated_at") or "")),
+def _ordered_config_filter_presets(state: dict[str, Any]) -> list[dict[str, Any]]:
+    custom = sorted(
+        list(state.get("custom") or []),
+        key=lambda item: (
+            not bool(item.get("pinned")),
+            str(item.get("updated_at") or ""),
+        ),
     )
-    internal_items = [*builtin_items, *ordered_custom]
+    return [*_visible_builtin_filter_presets(state), *custom]
+
+
+def _find_dynamic_filter_preset(
+    preset_id: str,
+    state: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    item = _find_visible_filter_preset(preset_id, state)
+    if item and item.get("mode") != ACCOUNT_FILTER_PRESET_MODE_FIXED:
+        return item
+    return None
+
+
+def _filter_preset_filters_to_request(filters: dict[str, Any]) -> dict[str, Any]:
+    normalized = _normalize_filter_preset_filters(filters)
+    columns = normalized.get("columnFilters") if isinstance(normalized.get("columnFilters"), dict) else {}
+
+    def joined(key: str) -> str:
+        return ",".join(_filter_value_list(columns.get(key)))
+
+    return {
+        "email": normalized.get("search") or "",
+        "status": ",".join(_filter_value_list(normalized.get("status"))),
+        "manually_used": joined("manuallyUsed") or None,
+        "auth_type": joined("authType"),
+        "phone_binding_state": joined("phoneBindingState"),
+        "payment_link_platform": joined("paymentLinkPlatform"),
+        "payment_link_generated": joined("paymentLinkGenerated") or None,
+        "subscription_type": joined("subscriptionType"),
+        "account_validity": joined("accountValidity"),
+        "sub2api_state": joined("sub2apiState"),
+        "oaipay_state": joined("oaipayState"),
+        "submit_state": joined("submitState") or joined("ideaSubmitState"),
+        "has_submitted": joined("hasSubmitted") or None,
+    }
+
+
+def _fixed_group_parent_matching_ids(
+    session: Session,
+    *,
+    parent: dict[str, Any],
+    account_ids: list[int],
+) -> set[int]:
+    requested_ids = _normalize_filter_preset_account_ids(account_ids)
+    if not requested_ids:
+        return set()
+    query, _, _ = account_filtered_query(
+        session,
+        platform="chatgpt",
+        filter_source=_filter_preset_filters_to_request(parent.get("filters") or {}),
+        include_fixed_members=True,
+    )
+    return {
+        int(account.id)
+        for account in session.exec(query.where(AccountModel.id.in_(requested_ids))).all()
+        if _safe_int(account.id) > 0
+    }
+
+
+def _validate_fixed_group_parent_members(
+    session: Session,
+    *,
+    parent: dict[str, Any],
+    account_ids: list[int],
+) -> None:
+    requested_ids = _normalize_filter_preset_account_ids(account_ids)
+    if not requested_ids:
+        raise HTTPException(400, "固定账号组合至少需要一个有效账号")
+    matched_ids = _fixed_group_parent_matching_ids(
+        session,
+        parent=parent,
+        account_ids=requested_ids,
+    )
+    outside_ids = [account_id for account_id in requested_ids if account_id not in matched_ids]
+    if outside_ids:
+        raise HTTPException(
+            409,
+            {
+                "code": "FIXED_GROUP_PARENT_SCOPE_CHANGED",
+                "message": "所选账号已不再全部满足一级条件组合，请刷新列表后重新选择",
+                "account_ids": outside_ids,
+            },
+        )
+
+
+def _build_filter_presets_response(
+    session: Session,
+    state: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    state = state if state is not None else _load_filter_preset_state()
+    config_items = _ordered_config_filter_presets(state)
+    dynamic_items = [item for item in config_items if item.get("mode") != ACCOUNT_FILTER_PRESET_MODE_FIXED]
+    legacy_fixed_items = [item for item in config_items if item.get("mode") == ACCOUNT_FILTER_PRESET_MODE_FIXED]
+    fixed_items = [serialize_fixed_group(session, group) for group in list_fixed_groups(session)]
+    public_dynamic = [_public_filter_preset(item) for item in dynamic_items]
+    public_legacy = [_public_filter_preset(item) for item in legacy_fixed_items]
     return {
         "ok": True,
-        "items": [_public_filter_preset(item) for item in internal_items],
-        "built_in_count": len(builtin_items),
-        "custom_count": len(custom),
-        "dynamic_count": sum(1 for item in internal_items if item.get("mode") != ACCOUNT_FILTER_PRESET_MODE_FIXED),
-        "fixed_count": sum(1 for item in internal_items if item.get("mode") == ACCOUNT_FILTER_PRESET_MODE_FIXED),
+        # `items` remains a compatibility union for older clients. New clients
+        # consume the explicit primary/secondary arrays below.
+        "items": [*public_dynamic, *fixed_items, *public_legacy],
+        "dynamic_items": public_dynamic,
+        "fixed_groups": fixed_items,
+        "legacy_fixed_items": public_legacy,
+        "migration_required": bool(public_legacy),
+        "built_in_count": sum(1 for item in dynamic_items if item.get("built_in")),
+        "custom_count": sum(1 for item in dynamic_items if not item.get("built_in")),
+        "dynamic_count": len(dynamic_items),
+        "fixed_count": len(fixed_items),
+        "legacy_fixed_count": len(legacy_fixed_items),
         "deleted_builtin_count": len(set(state.get("deleted_builtin_ids") or set())),
         "builtin_override_count": len(dict(state.get("builtin_overrides") or {})),
     }
 
 
 @router.get("/filter-presets")
-def list_account_filter_presets():
-    return _build_filter_presets_response()
+def list_account_filter_presets(session: Session = Depends(get_session)):
+    return _build_filter_presets_response(session)
+
+
+def _resolved_legacy_fixed_account_ids(
+    session: Session,
+    preset: dict[str, Any],
+) -> tuple[list[int], list[int]]:
+    account_ids = _normalize_filter_preset_account_ids(preset.get("account_ids"))
+    refs = _normalize_filter_preset_account_refs(preset.get("account_refs"), account_ids)
+    refs_by_id = {int(ref["id"]): ref for ref in refs}
+    if not account_ids:
+        return [], []
+    accounts = session.exec(
+        select(AccountModel).where(
+            AccountModel.platform == "chatgpt",
+            AccountModel.id.in_(account_ids),
+        )
+    ).all()
+    resolved_set = {
+        int(account.id)
+        for account in accounts
+        if _safe_int(account.id) > 0
+        and _filter_preset_account_matches_ref(account, refs_by_id.get(int(account.id)))
+    }
+    return (
+        [account_id for account_id in account_ids if account_id in resolved_set],
+        [account_id for account_id in account_ids if account_id not in resolved_set],
+    )
+
+
+def _fixed_preset_migration_plan(
+    session: Session,
+    body: FixedPresetMigrationBody,
+) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
+    state = _load_filter_preset_state()
+    legacy_items = [
+        item
+        for item in _ordered_config_filter_presets(state)
+        if item.get("mode") == ACCOUNT_FILTER_PRESET_MODE_FIXED
+    ]
+    if not legacy_items:
+        return state, {
+            "groups": [],
+            "conflict_account_count": 0,
+            "missing_account_count": 0,
+            "outside_parent_account_count": 0,
+        }, []
+    if any(item.get("built_in") for item in legacy_items):
+        raise HTTPException(409, "内置组合已被改成旧固定模式，请先恢复为一级条件组合后再迁移")
+
+    legacy_by_id = {str(item.get("id") or ""): item for item in legacy_items}
+    requested_order = [
+        _trim_text(item, max_length=80)
+        for item in body.priority_order
+        if _trim_text(item, max_length=80)
+    ]
+    if not requested_order:
+        raise HTTPException(400, "迁移前必须明确排列全部旧固定组合的归属优先级")
+    if set(requested_order) != set(legacy_by_id) or len(requested_order) != len(legacy_by_id):
+        raise HTTPException(400, "迁移优先级必须完整包含全部旧固定组合")
+
+    parent_by_id: dict[str, str] = {}
+    for preset_id in requested_order:
+        parent_id = _trim_text(body.parent_by_preset_id.get(preset_id), max_length=80)
+        parent = _find_dynamic_filter_preset(parent_id, state)
+        if not parent:
+            raise HTTPException(400, f"旧固定组合 {legacy_by_id[preset_id].get('name') or preset_id} 尚未选择有效的一级条件组合")
+        existing_group = get_fixed_group(session, preset_id)
+        if existing_group is not None and existing_group.parent_preset_id != parent_id:
+            raise HTTPException(409, f"旧固定组合 {legacy_by_id[preset_id].get('name') or preset_id} 已存在于其他一级条件组合下")
+        if fixed_group_name_exists(
+            session,
+            parent_preset_id=parent_id,
+            name=str(legacy_by_id[preset_id].get("name") or ""),
+            ignore_group_id=preset_id,
+        ):
+            raise HTTPException(409, f"一级条件组合下已存在同名固定账号组合：{legacy_by_id[preset_id].get('name') or preset_id}")
+        parent_by_id[preset_id] = parent_id
+
+    claimed_by = {
+        int(row.account_id): str(row.fixed_group_id)
+        for row in session.exec(select(AccountFixedGroupMemberModel)).all()
+    }
+    plan_groups: list[dict[str, Any]] = []
+    commit_groups: list[dict[str, Any]] = []
+    all_conflicts: set[int] = set()
+    all_missing: set[int] = set()
+    all_outside_parent: set[int] = set()
+    for priority, preset_id in enumerate(requested_order, start=1):
+        preset = legacy_by_id[preset_id]
+        resolved_ids, missing_ids = _resolved_legacy_fixed_account_ids(session, preset)
+        parent = _find_dynamic_filter_preset(parent_by_id[preset_id], state)
+        parent_matched_ids = _fixed_group_parent_matching_ids(
+            session,
+            parent=parent or {},
+            account_ids=resolved_ids,
+        )
+        outside_parent_ids = [account_id for account_id in resolved_ids if account_id not in parent_matched_ids]
+        eligible_ids = [account_id for account_id in resolved_ids if account_id in parent_matched_ids]
+        conflict_ids = [
+            account_id
+            for account_id in eligible_ids
+            if account_id in claimed_by and claimed_by[account_id] != preset_id
+        ]
+        assigned_ids = [
+            account_id
+            for account_id in eligible_ids
+            if account_id not in claimed_by or claimed_by[account_id] == preset_id
+        ]
+        for account_id in assigned_ids:
+            claimed_by[account_id] = preset_id
+        all_conflicts.update(conflict_ids)
+        all_missing.update(missing_ids)
+        all_outside_parent.update(outside_parent_ids)
+        plan_item = {
+            "id": preset_id,
+            "name": str(preset.get("name") or ""),
+            "parent_preset_id": parent_by_id[preset_id],
+            "priority": priority,
+            "stored_account_count": len(_normalize_filter_preset_account_ids(preset.get("account_ids"))),
+            "resolved_account_count": len(resolved_ids),
+            "assigned_account_count": len(assigned_ids),
+            "conflict_account_count": len(conflict_ids),
+            "missing_account_count": len(missing_ids),
+            "outside_parent_account_count": len(outside_parent_ids),
+        }
+        plan_groups.append(plan_item)
+        commit_groups.append({"preset": preset, "plan": plan_item, "account_ids": assigned_ids})
+    return state, {
+        "groups": plan_groups,
+        "conflict_account_count": len(all_conflicts),
+        "missing_account_count": len(all_missing),
+        "outside_parent_account_count": len(all_outside_parent),
+    }, commit_groups
+
+
+def _backup_account_database_before_fixed_migration() -> str:
+    database_path = str(engine.url.database or "").strip()
+    if not database_path or database_path == ":memory:":
+        return ""
+    source_path = Path(database_path).resolve()
+    backup_dir = source_path.parent / "backups"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    backup_path = backup_dir / f"{source_path.stem}.before-fixed-group-migration-{stamp}{source_path.suffix or '.db'}"
+    source = sqlite3.connect(f"file:{source_path}?mode=ro", uri=True)
+    target = sqlite3.connect(str(backup_path))
+    try:
+        source.backup(target)
+        integrity = target.execute("PRAGMA integrity_check").fetchone()
+        if not integrity or str(integrity[0]).lower() != "ok":
+            raise RuntimeError("固定组合迁移备份完整性检查失败")
+    finally:
+        target.close()
+        source.close()
+    return str(backup_path)
+
+
+@router.post("/filter-presets/migrate-fixed")
+def migrate_legacy_fixed_presets(
+    body: FixedPresetMigrationBody,
+    session: Session = Depends(get_session),
+):
+    state, preview, commit_groups = _fixed_preset_migration_plan(session, body)
+    if not body.commit or not commit_groups:
+        return {
+            "ok": True,
+            "committed": False,
+            "preview": preview,
+            **_build_filter_presets_response(session, state),
+        }
+    if int(preview.get("outside_parent_account_count") or 0) > 0:
+        raise HTTPException(
+            409,
+            {
+                "code": "FIXED_GROUP_PARENT_SCOPE_CHANGED",
+                "message": "部分旧固定账号不满足所选一级条件组合，请调整父级后重新生成预览",
+                "outside_parent_account_count": int(preview["outside_parent_account_count"]),
+            },
+        )
+
+    try:
+        backup_path = _backup_account_database_before_fixed_migration()
+    except Exception as exc:
+        raise HTTPException(500, f"创建固定组合迁移备份失败: {exc}") from exc
+
+    migrated_ids: list[str] = []
+    try:
+        for item in commit_groups:
+            preset = item["preset"]
+            plan_item = item["plan"]
+            preset_id = str(preset.get("id") or "")
+            group = get_fixed_group(session, preset_id)
+            if group is None:
+                group = create_fixed_group(
+                    session,
+                    group_id=preset_id,
+                    parent_preset_id=plan_item["parent_preset_id"],
+                    name=str(preset.get("name") or ""),
+                    description=str(preset.get("description") or ""),
+                    pinned=bool(preset.get("pinned")),
+                )
+            if item["account_ids"]:
+                replace_fixed_group_members(
+                    session,
+                    group,
+                    item["account_ids"],
+                    move_conflicts=False,
+                    max_members=ACCOUNT_FILTER_PRESET_MAX_ACCOUNT_IDS,
+                )
+            migrated_ids.append(preset_id)
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+
+    state["custom"] = [
+        item
+        for item in list(state.get("custom") or [])
+        if str(item.get("id") or "") not in set(migrated_ids)
+    ]
+    state = _save_filter_preset_state(state)
+    return {
+        "ok": True,
+        "committed": True,
+        "preview": preview,
+        "migrated_ids": migrated_ids,
+        "backup_path": backup_path,
+        **_build_filter_presets_response(session, state),
+    }
 
 
 @router.post("/filter-presets")
@@ -857,10 +1215,68 @@ def create_account_filter_preset(
     name = _trim_text(body.name, max_length=80)
     if not name:
         raise HTTPException(400, "筛选组合名称不能为空")
+    mode, filters, account_ids, account_refs, discarded_ids = _validate_filter_preset_content(body, session=session)
     state = _load_filter_preset_state()
+    if mode == ACCOUNT_FILTER_PRESET_MODE_FIXED:
+        parent_preset_id = _trim_text(body.parent_preset_id, max_length=80)
+        parent = _find_dynamic_filter_preset(parent_preset_id, state)
+        if not parent:
+            raise HTTPException(400, "请选择有效的一级条件筛选组合")
+        if fixed_group_name_exists(
+            session,
+            parent_preset_id=parent_preset_id,
+            name=name,
+        ):
+            raise HTTPException(400, "当前一级组合下已存在同名固定账号组合")
+        _validate_fixed_group_parent_members(
+            session,
+            parent=parent,
+            account_ids=account_ids,
+        )
+        group = create_fixed_group(
+            session,
+            group_id="fixed_" + uuid.uuid4().hex[:12],
+            parent_preset_id=parent_preset_id,
+            name=name,
+            description=_trim_text(body.description, max_length=240),
+            pinned=bool(body.pinned),
+        )
+        try:
+            member_result = replace_fixed_group_members(
+                session,
+                group,
+                account_ids,
+                move_conflicts=bool(body.move_conflicts),
+                max_members=ACCOUNT_FILTER_PRESET_MAX_ACCOUNT_IDS,
+            )
+        except FixedGroupConflictError as exc:
+            session.rollback()
+            raise HTTPException(
+                409,
+                {
+                    "code": "FIXED_GROUP_MEMBER_CONFLICT",
+                    "message": "部分账号已属于其他固定账号组合",
+                    "conflicts": exc.conflicts,
+                },
+            ) from exc
+        except ValueError as exc:
+            session.rollback()
+            raise HTTPException(400, str(exc)) from exc
+        session.commit()
+        session.refresh(group)
+        saved_group = serialize_fixed_group(session, group)
+        return {
+            "ok": True,
+            "item": saved_group,
+            "discarded_account_ids": _normalize_filter_preset_account_ids([
+                *discarded_ids,
+                *member_result["discarded_account_ids"],
+            ]),
+            **_build_filter_presets_response(session, state),
+        }
+
     if _duplicate_filter_preset_name(state, name):
         raise HTTPException(400, "已存在同名筛选组合")
-    mode, filters, account_ids, account_refs, discarded_ids = _validate_filter_preset_content(body, session=session)
     now = _utc_iso()
     item = {
         "id": "preset_" + uuid.uuid4().hex[:12],
@@ -884,7 +1300,7 @@ def create_account_filter_preset(
         "ok": True,
         "item": _public_filter_preset(saved_item),
         "discarded_account_ids": discarded_ids,
-        **_build_filter_presets_response(state),
+        **_build_filter_presets_response(session, state),
     }
 
 
@@ -899,6 +1315,72 @@ def update_account_filter_preset(
     if not name:
         raise HTTPException(400, "筛选组合名称不能为空")
     state = _load_filter_preset_state()
+    fixed_group = get_fixed_group(session, preset_id)
+    if fixed_group is not None:
+        if _normalize_filter_preset_mode(body.mode) != ACCOUNT_FILTER_PRESET_MODE_FIXED:
+            raise HTTPException(400, "固定账号组合不能转换为一级条件组合")
+        requested_parent_id = _trim_text(body.parent_preset_id, max_length=80)
+        if requested_parent_id and requested_parent_id != fixed_group.parent_preset_id:
+            raise HTTPException(400, "固定账号组合不能通过普通编辑更换一级组合")
+        if fixed_group_name_exists(
+            session,
+            parent_preset_id=fixed_group.parent_preset_id,
+            name=name,
+            ignore_group_id=fixed_group.id,
+        ):
+            raise HTTPException(400, "当前一级组合下已存在同名固定账号组合")
+        account_ids = _normalize_filter_preset_account_ids(body.account_ids)
+        if len(list(body.account_ids or [])) > ACCOUNT_FILTER_PRESET_MAX_ACCOUNT_IDS:
+            raise HTTPException(400, f"固定账号组合最多保存 {ACCOUNT_FILTER_PRESET_MAX_ACCOUNT_IDS} 个账号")
+        parent = _find_dynamic_filter_preset(fixed_group.parent_preset_id, state)
+        if not parent:
+            raise HTTPException(409, "固定账号组合所属的一级条件组合已不存在")
+        current_member_ids = set(fixed_group_member_ids(session, fixed_group.id))
+        added_account_ids = [account_id for account_id in account_ids if account_id not in current_member_ids]
+        if added_account_ids:
+            _validate_fixed_group_parent_members(
+                session,
+                parent=parent,
+                account_ids=added_account_ids,
+            )
+        update_fixed_group_meta(
+            session,
+            fixed_group,
+            name=name,
+            description=_trim_text(body.description, max_length=240),
+            pinned=bool(body.pinned),
+        )
+        try:
+            member_result = replace_fixed_group_members(
+                session,
+                fixed_group,
+                account_ids,
+                move_conflicts=bool(body.move_conflicts),
+                max_members=ACCOUNT_FILTER_PRESET_MAX_ACCOUNT_IDS,
+            )
+        except FixedGroupConflictError as exc:
+            session.rollback()
+            raise HTTPException(
+                409,
+                {
+                    "code": "FIXED_GROUP_MEMBER_CONFLICT",
+                    "message": "部分账号已属于其他固定账号组合",
+                    "conflicts": exc.conflicts,
+                },
+            ) from exc
+        except ValueError as exc:
+            session.rollback()
+            raise HTTPException(400, str(exc)) from exc
+        session.commit()
+        session.refresh(fixed_group)
+        saved_group = serialize_fixed_group(session, fixed_group)
+        return {
+            "ok": True,
+            "item": saved_group,
+            "discarded_account_ids": member_result["discarded_account_ids"],
+            **_build_filter_presets_response(session, state),
+        }
+
     if preset_id in BUILTIN_ACCOUNT_FILTER_PRESETS_BY_ID and preset_id in set(state.get("deleted_builtin_ids") or set()):
         raise HTTPException(404, "筛选组合不存在")
     is_builtin = preset_id in BUILTIN_ACCOUNT_FILTER_PRESETS_BY_ID
@@ -909,6 +1391,14 @@ def update_account_filter_preset(
     if _duplicate_filter_preset_name(state, name, ignore_id=preset_id):
         raise HTTPException(400, "已存在同名筛选组合")
     mode, filters, account_ids, account_refs, discarded_ids = _validate_filter_preset_content(body, session=session)
+    existing_item = (
+        (state.get("builtin_overrides") or {}).get(preset_id)
+        or BUILTIN_ACCOUNT_FILTER_PRESETS_BY_ID.get(preset_id)
+        if is_builtin
+        else items[index]
+    )
+    if existing_item and existing_item.get("mode") != mode:
+        raise HTTPException(400, "一级条件组合与固定账号组合不能相互转换")
 
     if is_builtin:
         current = dict(
@@ -938,7 +1428,7 @@ def update_account_filter_preset(
             "ok": True,
             "item": _public_filter_preset(saved_item),
             "discarded_account_ids": discarded_ids,
-            **_build_filter_presets_response(state),
+            **_build_filter_presets_response(session, state),
         }
 
     current = dict(items[index])
@@ -964,14 +1454,36 @@ def update_account_filter_preset(
         "ok": True,
         "item": _public_filter_preset(saved_item),
         "discarded_account_ids": discarded_ids,
-        **_build_filter_presets_response(state),
+        **_build_filter_presets_response(session, state),
     }
 
 
 @router.delete("/filter-presets/{preset_id}")
-def delete_account_filter_preset(preset_id: str):
+def delete_account_filter_preset(
+    preset_id: str,
+    session: Session = Depends(get_session),
+):
     preset_id = _trim_text(preset_id, max_length=80)
     state = _load_filter_preset_state()
+    fixed_group = get_fixed_group(session, preset_id)
+    if fixed_group is not None:
+        released_ids = delete_fixed_group(session, fixed_group)
+        session.commit()
+        return {
+            **_build_filter_presets_response(session, state),
+            "released_account_ids": released_ids,
+        }
+
+    child_groups = list_fixed_groups(session, parent_preset_id=preset_id)
+    if child_groups:
+        raise HTTPException(
+            409,
+            {
+                "code": "FILTER_PRESET_HAS_FIXED_GROUPS",
+                "message": "该条件组合下仍有固定账号组合，请先移动或删除子组合",
+                "fixed_group_ids": [group.id for group in child_groups],
+            },
+        )
     if preset_id in BUILTIN_ACCOUNT_FILTER_PRESETS_BY_ID:
         deleted_ids = set(state.get("deleted_builtin_ids") or set())
         if preset_id in deleted_ids:
@@ -982,7 +1494,7 @@ def delete_account_filter_preset(preset_id: str):
         overrides.pop(preset_id, None)
         state["builtin_overrides"] = overrides
         state = _save_filter_preset_state(state)
-        return _build_filter_presets_response(state)
+        return _build_filter_presets_response(session, state)
 
     items = list(state.get("custom") or [])
     next_items = [item for item in items if str(item.get("id") or "") != preset_id]
@@ -990,7 +1502,7 @@ def delete_account_filter_preset(preset_id: str):
         raise HTTPException(404, "筛选组合不存在")
     state["custom"] = next_items
     state = _save_filter_preset_state(state)
-    return _build_filter_presets_response(state)
+    return _build_filter_presets_response(session, state)
 
 
 def _maybe_reconcile_rate_limited_accounts(session: Session, *, platform: Optional[str] = None) -> None:
@@ -1835,6 +2347,10 @@ def _parse_secret_fields(value: Any) -> list[str]:
 def list_accounts(
     platform: Optional[str] = None,
     filter_preset_id: Optional[str] = None,
+    primary_preset_id: Optional[str] = None,
+    secondary_scope: Optional[str] = None,
+    fixed_group_id: Optional[str] = None,
+    fixed_group_revision: Optional[int] = None,
     status: Optional[str] = None,
     email: Optional[str] = None,
     payment_link_generated: Optional[str] = None,
@@ -1862,46 +2378,85 @@ def list_accounts(
     page_size_value = max(1, min(int(page_size or 20), 200))
     fixed_preset_scope: dict[str, Any] | None = None
     fixed_account_ids: list[int] = []
+    normalized_primary_preset_id = _trim_text(primary_preset_id, max_length=80)
+    normalized_secondary_scope = _trim_text(secondary_scope, max_length=24).lower().replace("-", "_")
+    if normalized_secondary_scope in {"unfixed", "available"}:
+        normalized_secondary_scope = "unassigned"
+    elif normalized_secondary_scope in {"group", "fixed_group"}:
+        normalized_secondary_scope = "fixed"
+    elif normalized_secondary_scope not in {"unassigned", "fixed"}:
+        normalized_secondary_scope = ""
+    normalized_fixed_group_id = _trim_text(fixed_group_id, max_length=80)
     normalized_filter_preset_id = _trim_text(filter_preset_id, max_length=80)
     if normalized_filter_preset_id:
-        preset = _find_visible_filter_preset(normalized_filter_preset_id)
-        if not preset:
-            raise HTTPException(404, "筛选组合不存在")
-        if preset.get("mode") != ACCOUNT_FILTER_PRESET_MODE_FIXED:
-            raise HTTPException(400, "该筛选组合不是固定账号模式")
-        fixed_account_ids = _normalize_filter_preset_account_ids(preset.get("account_ids"))
-        if not fixed_account_ids:
-            raise HTTPException(409, "固定账号组合没有可用成员")
-        account_refs = _normalize_filter_preset_account_refs(
-            preset.get("account_refs"),
-            fixed_account_ids,
-        )
-        refs_by_id = {int(item["id"]): item for item in account_refs}
+        compatibility_group = get_fixed_group(session, normalized_filter_preset_id)
+        if compatibility_group is not None:
+            normalized_primary_preset_id = compatibility_group.parent_preset_id
+            normalized_secondary_scope = "fixed"
+            normalized_fixed_group_id = compatibility_group.id
+        else:
+            preset = _find_visible_filter_preset(normalized_filter_preset_id)
+            if not preset:
+                raise HTTPException(404, "筛选组合不存在")
+            if preset.get("mode") != ACCOUNT_FILTER_PRESET_MODE_FIXED:
+                raise HTTPException(400, "该筛选组合不是固定账号模式")
+            fixed_account_ids = _normalize_filter_preset_account_ids(preset.get("account_ids"))
+            if not fixed_account_ids:
+                raise HTTPException(409, "固定账号组合没有可用成员")
+            account_refs = _normalize_filter_preset_account_refs(
+                preset.get("account_refs"),
+                fixed_account_ids,
+            )
+            refs_by_id = {int(item["id"]): item for item in account_refs}
 
-        existing_rows = session.exec(
-            select(AccountModel).where(
-                AccountModel.platform == "chatgpt",
-                AccountModel.id.in_(fixed_account_ids),
-            )
-        ).all()
-        existing_ids = {
-            int(account.id)
-            for account in existing_rows
-            if _safe_int(account.id) > 0
-            and _filter_preset_account_matches_ref(
-                account,
-                refs_by_id.get(int(account.id)),
-            )
-        }
-        resolved_ids = [account_id for account_id in fixed_account_ids if account_id in existing_ids]
-        missing_ids = [account_id for account_id in fixed_account_ids if account_id not in existing_ids]
+            existing_rows = session.exec(
+                select(AccountModel).where(
+                    AccountModel.platform == "chatgpt",
+                    AccountModel.id.in_(fixed_account_ids),
+                )
+            ).all()
+            existing_ids = {
+                int(account.id)
+                for account in existing_rows
+                if _safe_int(account.id) > 0
+                and _filter_preset_account_matches_ref(
+                    account,
+                    refs_by_id.get(int(account.id)),
+                )
+            }
+            resolved_ids = [account_id for account_id in fixed_account_ids if account_id in existing_ids]
+            missing_ids = [account_id for account_id in fixed_account_ids if account_id not in existing_ids]
+            fixed_preset_scope = {
+                "id": normalized_filter_preset_id,
+                "stored_account_count": len(fixed_account_ids),
+                "resolved_account_ids": resolved_ids,
+                "missing_account_ids": missing_ids,
+                "legacy": True,
+            }
+            fixed_account_ids = resolved_ids
+
+    if normalized_secondary_scope:
+        parent = _find_dynamic_filter_preset(normalized_primary_preset_id)
+        if not parent:
+            raise HTTPException(404, "一级条件筛选组合不存在")
+    if normalized_secondary_scope == "fixed":
+        group = get_fixed_group(session, normalized_fixed_group_id)
+        if group is None:
+            raise HTTPException(404, "固定账号组合不存在")
+        if group.parent_preset_id != normalized_primary_preset_id:
+            raise HTTPException(409, "固定账号组合不属于当前一级条件组合")
+        if fixed_group_revision is not None and int(fixed_group_revision) != int(group.revision or 1):
+            raise HTTPException(409, "固定账号组合成员已变化，请刷新后重试")
+        resolved_ids = fixed_group_member_ids(session, group.id)
         fixed_preset_scope = {
-            "id": normalized_filter_preset_id,
-            "stored_account_count": len(fixed_account_ids),
+            "id": group.id,
+            "parent_preset_id": group.parent_preset_id,
+            "revision": int(group.revision or 1),
+            "stored_account_count": len(resolved_ids),
             "resolved_account_ids": resolved_ids,
-            "missing_account_ids": missing_ids,
+            "missing_account_ids": [],
+            "legacy": False,
         }
-        fixed_account_ids = resolved_ids
     q, use_list_state, _ = account_filtered_query(
         session,
         platform=platform,
@@ -1923,9 +2478,12 @@ def list_accounts(
             "revival_state": revival_state,
             "sort_by": sort_by,
             "sort_order": sort_order,
+            "primary_preset_id": normalized_primary_preset_id,
+            "secondary_scope": normalized_secondary_scope,
+            "fixed_group_id": normalized_fixed_group_id,
         },
     )
-    if fixed_preset_scope is not None:
+    if fixed_preset_scope is not None and fixed_preset_scope.get("legacy"):
         q = q.where(AccountModel.id.in_(fixed_account_ids))
     count_q = select(func.count()).select_from(q.subquery())
     total = int(session.exec(count_q).one())
@@ -2250,13 +2808,17 @@ def batch_delete_accounts_by_filter(
         raise HTTPException(400, "至少需要一个筛选条件")
 
     reconcile_rate_limited_accounts(session, platform=body.platform)
-    q = select(AccountModel)
-    if body.platform:
-        q = q.where(AccountModel.platform == body.platform)
-    if body.status:
-        q = q.where(AccountModel.status == body.status)
-    if body.email:
-        q = q.where(AccountModel.email.contains(body.email))
+    q, _, _ = account_filtered_query(
+        session,
+        platform=body.platform,
+        filter_source={
+            "status": body.status,
+            "email": body.email,
+            # Destructive condition scopes never absorb fixed-group members.
+            # Operators can still delete those accounts through explicit IDs.
+            "secondary_scope": "unassigned" if body.platform == "chatgpt" else "",
+        },
+    )
 
     accounts = session.exec(q).all()
     deleted_count = 0

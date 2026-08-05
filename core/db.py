@@ -309,6 +309,36 @@ class AccountListStateModel(SQLModel, table=True):
     derivation_version: str = Field(default="", index=True)
 
 
+class AccountFixedGroupModel(SQLModel, table=True):
+    """Instance-local fixed account group attached to one dynamic preset."""
+
+    __tablename__ = "account_fixed_groups"
+    __table_args__ = (
+        Index("idx_account_fixed_groups_parent", "parent_preset_id", "pinned", "updated_at"),
+    )
+
+    id: str = Field(primary_key=True, max_length=80)
+    parent_preset_id: str = Field(index=True, max_length=80)
+    name: str = Field(max_length=80)
+    description: str = Field(default="", max_length=240)
+    pinned: bool = Field(default=True, index=True)
+    revision: int = Field(default=1)
+    created_at: str = ""
+    updated_at: str = ""
+
+
+class AccountFixedGroupMemberModel(SQLModel, table=True):
+    """Exclusive fixed-group ownership for one stable account identity."""
+
+    __tablename__ = "account_fixed_group_members"
+
+    account_id: int = Field(primary_key=True, foreign_key="accounts.id")
+    fixed_group_id: str = Field(foreign_key="account_fixed_groups.id", index=True, max_length=80)
+    account_email: str = Field(default="", max_length=320)
+    account_created_at: str = Field(default="", max_length=80)
+    assigned_at: str = ""
+
+
 class ExternalSubscriptionClaimModel(SQLModel, table=True):
     __tablename__ = "external_subscription_claims"
 
@@ -3566,6 +3596,36 @@ def _ensure_account_list_state_schema() -> None:
         )
 
 
+def _ensure_account_fixed_group_schema() -> None:
+    with engine.begin() as conn:
+        conn.exec_driver_sql(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_account_fixed_groups_parent_name_nocase "
+            "ON account_fixed_groups(parent_preset_id, name COLLATE NOCASE)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS idx_account_fixed_group_members_group "
+            "ON account_fixed_group_members(fixed_group_id, account_id)"
+        )
+        conn.exec_driver_sql(
+            """
+            CREATE TRIGGER IF NOT EXISTS trg_accounts_delete_fixed_group_member
+            AFTER DELETE ON accounts
+            BEGIN
+                DELETE FROM account_fixed_group_members WHERE account_id = OLD.id;
+            END
+            """
+        )
+        conn.exec_driver_sql(
+            """
+            CREATE TRIGGER IF NOT EXISTS trg_fixed_group_delete_members
+            AFTER DELETE ON account_fixed_groups
+            BEGIN
+                DELETE FROM account_fixed_group_members WHERE fixed_group_id = OLD.id;
+            END
+            """
+        )
+
+
 def _ensure_payment_link_generation_schema() -> None:
     """Add immutable account identity columns to payment-link history.
 
@@ -3663,6 +3723,7 @@ def init_db():
     _ensure_payment_link_generation_schema()
     _ensure_payment_link_generation_cleanup_trigger()
     _ensure_account_list_state_schema()
+    _ensure_account_fixed_group_schema()
     _ensure_delivery_card_schema()
     _ensure_task_log_schema()
     _ensure_proxy_schema()

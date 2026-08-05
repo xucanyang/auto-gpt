@@ -243,6 +243,26 @@ body {
   white-space: nowrap;
 }
 
+.accounts-filter-scope-row {
+  display: grid;
+  grid-template-columns: 128px minmax(140px, 180px) minmax(0, 1fr) 28px;
+  gap: 8px;
+  align-items: center;
+  width: 100%;
+  min-width: 0;
+}
+
+.accounts-filter-scope-row .accounts-filter-preset-label {
+  width: 128px;
+}
+
+.accounts-fixed-migration-row {
+  display: grid;
+  grid-template-columns: minmax(140px, 1fr) minmax(180px, 260px) auto;
+  gap: 8px;
+  align-items: center;
+}
+
 .accounts-filter-preset-label,
 .accounts-filter-preset-pinned-label {
   display: inline-flex;
@@ -1266,6 +1286,33 @@ body {
   .accounts-filter-preset-select {
     flex: 1 1 auto;
     width: auto !important;
+    min-width: 0;
+  }
+
+  .accounts-filter-scope-row {
+    grid-template-columns: minmax(0, 1fr) 28px;
+  }
+
+  .accounts-filter-scope-row .accounts-filter-preset-label {
+    grid-column: 1 / -1;
+    width: auto;
+  }
+
+  .accounts-filter-scope-row .accounts-filter-preset-select {
+    grid-column: 1;
+    width: 100% !important;
+  }
+
+  .accounts-fixed-migration-row {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .accounts-fixed-migration-name {
+    grid-column: 1 / -1;
+  }
+
+  .accounts-fixed-migration-row .ant-select {
+    width: 100%;
     min-width: 0;
   }
 
