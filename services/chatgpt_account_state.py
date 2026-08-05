@@ -457,9 +457,27 @@ def chatgpt_upload_gate_message(capabilities: dict[str, Any]) -> str:
     return "跳过上传：账号材料不完整"
 
 
-def is_chatgpt_upload_ready(account: Any, *, local_probe: dict[str, Any] | None = None) -> tuple[bool, str, dict[str, Any]]:
+def is_chatgpt_upload_ready(
+    account: Any,
+    *,
+    local_probe: dict[str, Any] | None = None,
+    require_refresh_token: bool = True,
+) -> tuple[bool, str, dict[str, Any]]:
     capabilities = classify_chatgpt_capabilities(account, local_probe=local_probe)
-    ok = str(capabilities.get("upload_gate") or "") == "ready"
+    if str(capabilities.get("auth_level") or "") == "invalid":
+        upload_gate = "blocked_auth_invalid"
+    elif not capabilities.get("has_access_token"):
+        upload_gate = "blocked_missing_at"
+    elif require_refresh_token and not capabilities.get("has_refresh_token"):
+        upload_gate = "blocked_missing_rt"
+    elif not capabilities.get("has_account_id") or not capabilities.get("has_workspace"):
+        upload_gate = "blocked_missing_workspace"
+    else:
+        upload_gate = "ready"
+
+    if upload_gate != capabilities.get("upload_gate"):
+        capabilities = {**capabilities, "upload_gate": upload_gate}
+    ok = upload_gate == "ready"
     return ok, "" if ok else chatgpt_upload_gate_message(capabilities), capabilities
 
 

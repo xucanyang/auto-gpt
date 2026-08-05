@@ -525,7 +525,10 @@ def backfill_chatgpt_account_to_oaipay(
     results: list[dict[str, Any]] = []
     started_at = _utcnow_iso()
     cached_sync = get_oaipay_sync_state(account)
-    ready, gate_message, capabilities = is_chatgpt_upload_ready(account)
+    ready, gate_message, capabilities = is_chatgpt_upload_ready(
+        account,
+        require_refresh_token=False,
+    )
     if not ready:
         upload_state = _build_upload_failure_state(
             gate_message,

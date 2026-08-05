@@ -189,6 +189,25 @@ class OaiPaySyncTests(unittest.TestCase):
         self.assertEqual(state["remote_account_id"], 202)
         self.assertEqual(state["last_upload"]["status"], "failed")
 
+    def test_backfill_allows_plus_access_token_only_account(self):
+        account = self._make_account()
+        extra = account.get_extra()
+        extra.pop("refresh_token")
+        extra["chatgpt_local"] = {"subscription": {"plan": "plus"}}
+        account.set_extra(extra)
+
+        with mock.patch(
+            "services.oaipay_sync.upload_to_oaipay_detailed",
+            return_value={"ok": True, "message": "上传成功，导入 1 个账号", "remote_status": "uploaded"},
+        ) as upload:
+            result = backfill_chatgpt_account_to_oaipay(account, commit=False)
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["uploaded"])
+        capabilities = upload.call_args.kwargs["capabilities"]
+        self.assertFalse(capabilities["has_refresh_token"])
+        self.assertEqual(capabilities["upload_gate"], "ready")
+
     def test_backfill_blocks_registered_auth_pending_before_low_level_upload(self):
         account = AccountModel(
             platform="chatgpt",
@@ -213,36 +232,30 @@ class OaiPaySyncTests(unittest.TestCase):
         self.assertEqual(state["upload_gate"], "blocked_missing_at")
         self.assertEqual(state["last_upload"]["status"], "skipped")
 
-    def test_direct_upload_rejects_missing_at_or_rt_without_network(self):
-        cases = (
-            ({"registered_auth_pending": True}, "blocked_missing_at"),
-            ({"access_token": "at-only"}, "blocked_missing_rt"),
+    def test_direct_upload_rejects_missing_at_without_network(self):
+        account = AccountModel(
+            platform="chatgpt",
+            email="incomplete_oai@example.com",
+            password="secret",
+            token="",
+            status="pending_payment",
         )
-        for extra, expected_gate in cases:
-            with self.subTest(expected_gate=expected_gate):
-                account = AccountModel(
-                    platform="chatgpt",
-                    email="incomplete_oai@example.com",
-                    password="secret",
-                    token="",
-                    status="pending_payment",
+        account.set_extra({"registered_auth_pending": True})
+        with mock.patch("services.chatgpt_core.oaipay_upload.cffi_requests.get") as get:
+            with mock.patch("services.chatgpt_core.oaipay_upload.cffi_requests.post") as post:
+                result = upload_to_oaipay_detailed(
+                    account,
+                    api_url="https://oaipay.example",
+                    api_key="upload-key",
+                    group_ids=[2],
+                    category_mode="manual",
                 )
-                account.set_extra(extra)
-                with mock.patch("services.chatgpt_core.oaipay_upload.cffi_requests.get") as get:
-                    with mock.patch("services.chatgpt_core.oaipay_upload.cffi_requests.post") as post:
-                        result = upload_to_oaipay_detailed(
-                            account,
-                            api_url="https://oaipay.example",
-                            api_key="upload-key",
-                            group_ids=[2],
-                            category_mode="manual",
-                        )
 
-                self.assertFalse(result["ok"])
-                self.assertTrue(result["skipped"])
-                self.assertEqual(result["upload_gate"], expected_gate)
-                get.assert_not_called()
-                post.assert_not_called()
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["skipped"])
+        self.assertEqual(result["upload_gate"], "blocked_missing_at")
+        get.assert_not_called()
+        post.assert_not_called()
 
     def test_payload_uses_saved_subscription_without_local_probe(self):
         account = self._make_account()
@@ -323,6 +336,42 @@ class OaiPaySyncTests(unittest.TestCase):
         self.assertEqual(result["category_id"], 1)
         self.assertEqual(result["category_name"], "PLUS--未接码")
         self.assertEqual(mock_post.call_args.kwargs["json"]["group"], "1")
+
+    def test_upload_auto_category_routes_plus_without_rt_to_unverified(self):
+        account = self._make_account()
+        extra = account.get_extra()
+        extra.pop("refresh_token")
+        account.set_extra(extra)
+        categories_response = FakeOaiPayResponse(
+            200,
+            [
+                {"id": 1, "name": "PLUS--未接码"},
+                {"id": 2, "name": "PLUS--已接美国长效"},
+            ],
+        )
+        upload_response = FakeOaiPayResponse(200, {"success": True, "imported": 1, "category_id": 1, "group": "1"})
+        with mock.patch("services.chatgpt_core.oaipay_upload.cffi_requests.get", return_value=categories_response):
+            with mock.patch("services.chatgpt_core.oaipay_upload.cffi_requests.post", return_value=upload_response) as mock_post:
+                result = upload_to_oaipay_detailed(
+                    account,
+                    api_url="https://gpt.cccy.me",
+                    api_key="upload-key",
+                    capabilities={
+                        "has_refresh_token": False,
+                        "has_paid_subscription": True,
+                        "has_confirmed_phone_binding": False,
+                        "subscription_plan": "plus",
+                    },
+                )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["category_rule"], "paid_without_refresh_token")
+        self.assertEqual(result["category_id"], 1)
+        self.assertEqual(result["category_name"], "PLUS--未接码")
+        payload = mock_post.call_args.kwargs["json"]
+        self.assertEqual(payload["group"], "1")
+        token_data = json.loads(payload["accounts"][0]["extra_info"])
+        self.assertFalse(token_data.get("refresh_token"))
 
     def test_upload_manual_category_overrides_auto_category(self):
         account = self._make_account()
