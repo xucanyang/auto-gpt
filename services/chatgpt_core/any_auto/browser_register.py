@@ -22,7 +22,7 @@ from .constants import (
     OAUTH_CONSENT_FORM_SELECTOR,
 )
 from ..sentinel_browser import run_with_browser_capacity
-from ..task_logging import format_http_trace_log, sanitize_error_message
+from ..task_logging import format_http_trace_log
 
 EMAIL_INPUT_SELECTORS = [
     'input#login-email',
@@ -617,112 +617,6 @@ def _get_visible_page_text(page) -> str:
         return str(page.evaluate("() => document.body?.innerText || ''") or "")
     except Exception:
         return ""
-
-
-def _safe_page_location(page) -> str:
-    try:
-        parsed = urlparse(str(page.url or ""))
-    except Exception:
-        return ""
-    if not parsed.hostname:
-        return ""
-    return f"{parsed.hostname}{parsed.path or '/'}"
-
-
-def _auth_response_error_text(response) -> str:
-    """Return a bounded, redacted error summary from an OpenAI auth response."""
-
-    try:
-        status = int(getattr(response, "status", 0) or 0)
-    except (TypeError, ValueError):
-        status = 0
-
-    try:
-        response.finished()
-    except Exception:
-        pass
-
-    payload = None
-    try:
-        payload = response.json()
-    except Exception:
-        payload = None
-
-    parts: list[str] = []
-    if isinstance(payload, dict):
-        raw_error = payload.get("error")
-        error = raw_error if isinstance(raw_error, dict) else {}
-        detail = payload.get("detail")
-        detail_fields = detail if isinstance(detail, dict) else {}
-        if isinstance(detail, dict):
-            detail_error = detail.get("error") if isinstance(detail.get("error"), dict) else {}
-            error = {**detail_error, **error}
-        seen_values: set[str] = set()
-        for label, value in (
-            (
-                "code",
-                error.get("code")
-                or detail_fields.get("code")
-                or payload.get("code")
-                or (raw_error if isinstance(raw_error, str) else ""),
-            ),
-            ("type", error.get("type") or detail_fields.get("type") or payload.get("type")),
-            (
-                "message",
-                error.get("message")
-                or detail_fields.get("message")
-                or payload.get("message")
-                or (detail if isinstance(detail, str) else ""),
-            ),
-        ):
-            normalized = sanitize_error_message(value).strip()
-            if normalized and normalized not in seen_values:
-                parts.append(f"{label}={normalized[:240]}")
-                seen_values.add(normalized)
-
-    if not parts:
-        try:
-            raw_text = str(response.text() or "")
-        except Exception:
-            raw_text = ""
-        normalized = sanitize_error_message(re.sub(r"<[^>]+>", " ", raw_text))
-        normalized = re.sub(r"\s+", " ", normalized).strip()
-        if normalized:
-            parts.append(f"message={normalized[:300]}")
-
-    status_text = f"HTTP {status}" if status else "HTTP 状态未知"
-    return f"{status_text}, {', '.join(parts)}" if parts else status_text
-
-
-def _otp_page_error_text(page) -> str:
-    error_text = sanitize_error_message(_extract_auth_error_text(page)).strip()
-    if error_text:
-        return error_text[:300]
-
-    visible_text = re.sub(r"\s+", " ", _get_visible_page_text(page)).strip()
-    if not visible_text:
-        return ""
-    known_error = re.search(
-        r"(?:you do not have an account because it has been deleted or deactivated|"
-        r"account(?: has been)? (?:deleted|deactivated)|account_deactivated|"
-        r"too many (?:tries|attempts)|please wait a few minutes|rate[_ -]?limit(?:ed)?|"
-        r"invalid (?:verification )?code|code (?:is )?(?:invalid|expired))",
-        visible_text,
-        flags=re.IGNORECASE,
-    )
-    if not known_error:
-        return ""
-    start = max(0, known_error.start() - 80)
-    end = min(len(visible_text), known_error.end() + 160)
-    return sanitize_error_message(visible_text[start:end]).strip()[:300]
-
-
-def _otp_advanced_state(page) -> dict | None:
-    state = _derive_registration_state_from_page(page)
-    page_type = str(state.get("page_type") or "").strip()
-    if not page_type or _is_email_otp(state):
-        return None
-    return state
 
 
 def _has_signup_registration_choice(page) -> bool:
@@ -3251,16 +3145,6 @@ def _submit_otp_via_page(page, code: str, log) -> dict:
         pass
     time.sleep(1)
 
-    advanced_state = _otp_advanced_state(page)
-    if advanced_state is not None:
-        return {
-            "ok": True,
-            "status": 200,
-            "url": str(page.url or advanced_state.get("current_url") or ""),
-            "data": None,
-            "text": "",
-        }
-
     filled = False
 
     # 先尝试 6 格 OTP 输入框
@@ -3336,110 +3220,46 @@ def _submit_otp_via_page(page, code: str, log) -> dict:
                 continue
 
     if not filled:
-        advanced_state = _otp_advanced_state(page)
-        if advanced_state is not None:
-            return {
-                "ok": True,
-                "status": 200,
-                "url": str(page.url or advanced_state.get("current_url") or ""),
-                "data": None,
-                "text": "",
-            }
-        page_error = _otp_page_error_text(page)
-        location = _safe_page_location(page)
-        detail = page_error or "验证码页未找到可填写输入框"
-        if location:
-            detail = f"{detail} (page={location})"
-        return {"ok": False, "status": 0, "url": page.url, "data": None, "text": detail}
+        return {"ok": False, "status": 0, "url": page.url, "data": None, "text": "验证码页未找到可填写输入框"}
 
     _browser_pause(page)
-    validation_responses: list[object] = []
+    submit_selector = _click_first(
+        page,
+        [
+            'button[type="submit"]',
+            'button[data-testid="continue-button"]',
+            'button:has-text("Continue")',
+            'button:has-text("continue")',
+            'button:has-text("Verify")',
+            'button:has-text("verify")',
+            'button:has-text("Next")',
+            'button:has-text("next")',
+        ],
+        timeout=8,
+    )
+    if not submit_selector:
+        return {"ok": False, "status": 0, "url": page.url, "data": None, "text": "验证码页未找到 Continue 按钮"}
+    log(f"验证码页已点击继续按钮: {submit_selector}")
 
-    def _capture_validation_response(response) -> None:
+    deadline = time.time() + 20
+    last_url = page.url
+    while time.time() < deadline:
+        current_url = page.url
+        last_url = current_url or last_url
+        if "about-you" in current_url:
+            return {"ok": True, "status": 200, "url": current_url, "data": None, "text": ""}
+        if "add-phone" in current_url or "chatgpt.com" in current_url or "code=" in current_url:
+            return {"ok": True, "status": 200, "url": current_url, "data": None, "text": ""}
+        if "consent" in current_url or "sign-in-with-chatgpt" in current_url or "workspace" in current_url or "organization" in current_url:
+            return {"ok": True, "status": 200, "url": current_url, "data": None, "text": ""}
         try:
-            parsed = urlparse(str(getattr(response, "url", "") or ""))
+            error_text = page.locator("text=Invalid code").first.text_content(timeout=400)
         except Exception:
-            return
-        if parsed.hostname == "auth.openai.com" and parsed.path.rstrip("/").endswith(
-            "/api/accounts/email-otp/validate"
-        ):
-            validation_responses.append(response)
-
-    page.on("response", _capture_validation_response)
-    try:
-        submit_selector = _click_first(
-            page,
-            [
-                'button[type="submit"]',
-                'button[data-testid="continue-button"]',
-                'button:has-text("Continue")',
-                'button:has-text("continue")',
-                'button:has-text("Verify")',
-                'button:has-text("verify")',
-                'button:has-text("Next")',
-                'button:has-text("next")',
-            ],
-            timeout=8,
-        )
-        if not submit_selector:
-            page_error = _otp_page_error_text(page)
-            return {
-                "ok": False,
-                "status": 0,
-                "url": page.url,
-                "data": None,
-                "text": page_error or "验证码页未找到 Continue 按钮",
-            }
-        log(f"验证码页已点击继续按钮: {submit_selector}")
-
-        deadline = time.time() + 20
-        last_url = page.url
-        while time.time() < deadline:
-            current_url = page.url
-            last_url = current_url or last_url
-
-            if validation_responses:
-                validation_response = validation_responses[-1]
-                try:
-                    validation_status = int(getattr(validation_response, "status", 0) or 0)
-                except (TypeError, ValueError):
-                    validation_status = 0
-                if validation_status >= 400:
-                    return {
-                        "ok": False,
-                        "status": validation_status,
-                        "url": current_url,
-                        "data": None,
-                        "text": _auth_response_error_text(validation_response),
-                    }
-
-            advanced_state = _otp_advanced_state(page)
-            if advanced_state is not None:
-                return {"ok": True, "status": 200, "url": current_url, "data": None, "text": ""}
-            time.sleep(0.5)
-
-        if validation_responses:
-            response_summary = _auth_response_error_text(validation_responses[-1])
-            return {
-                "ok": False,
-                "status": int(getattr(validation_responses[-1], "status", 0) or 0),
-                "url": last_url,
-                "data": None,
-                "text": f"验证码校验响应后页面未推进: {response_summary}",
-            }
-        page_error = _otp_page_error_text(page)
-        return {
-            "ok": False,
-            "status": 0,
-            "url": last_url,
-            "data": None,
-            "text": page_error or "验证码提交后未收到校验响应",
-        }
-    finally:
-        try:
-            page.remove_listener("response", _capture_validation_response)
-        except Exception:
-            pass
+            error_text = ""
+        if error_text:
+            return {"ok": False, "status": 400, "url": current_url, "data": None, "text": error_text}
+        time.sleep(0.5)
+    return {"ok": False, "status": 0, "url": last_url, "data": None, "text": "验证码页提交后未跳转"}
 
 
 def _submit_about_you_via_page(

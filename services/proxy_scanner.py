@@ -10,7 +10,7 @@ import json
 import threading
 import time
 import uuid
-from typing import Any, Callable, Iterable
+from typing import Any, Iterable
 from urllib.parse import unquote, urlsplit
 
 import requests
@@ -25,7 +25,6 @@ from sqlmodel import Session, select
 from core.config_store import config_store
 from core.db import ProxyModel, engine
 from core.proxy_utils import build_requests_proxy_config, normalize_proxy_url
-from core.task_runtime import TaskInterruption
 
 BASIC_TARGETS = (
     "https://api.ipify.org?format=json",
@@ -64,11 +63,6 @@ PROXY_LEVEL_ERROR_CODES = {
     "timeout",
     "tls_error",
 }
-
-
-def _run_stop_checker(stop_checker: Callable[[], None] | None) -> None:
-    if callable(stop_checker):
-        stop_checker()
 
 
 def utcnow() -> datetime:
@@ -309,13 +303,7 @@ def _request_via_proxy(url: str, proxy_url: str, *, timeout_seconds: int) -> dic
         }
 
 
-def probe_basic(
-    proxy_url: str,
-    *,
-    timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
-    stop_checker: Callable[[], None] | None = None,
-) -> dict[str, Any]:
-    _run_stop_checker(stop_checker)
+def probe_basic(proxy_url: str, *, timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS) -> dict[str, Any]:
     valid, message = _validate_proxy_url(proxy_url)
     if not valid:
         return {
@@ -330,9 +318,7 @@ def probe_basic(
 
     failures: list[dict[str, Any]] = []
     for target in BASIC_TARGETS:
-        _run_stop_checker(stop_checker)
         result = _request_via_proxy(target, proxy_url, timeout_seconds=timeout_seconds)
-        _run_stop_checker(stop_checker)
         if result.get("ok"):
             exit_ip = _extract_ip(result.get("json") or {}, str(result.get("text") or ""))
             if exit_ip:
@@ -402,13 +388,7 @@ def _parse_geo_payload(payload: dict[str, Any], *, source: str) -> dict[str, Any
     return {}
 
 
-def lookup_geo(
-    exit_ip: str,
-    *,
-    timeout_seconds: int = 6,
-    stop_checker: Callable[[], None] | None = None,
-) -> dict[str, Any]:
-    _run_stop_checker(stop_checker)
+def lookup_geo(exit_ip: str, *, timeout_seconds: int = 6) -> dict[str, Any]:
     ip = str(exit_ip or "").strip()
     if not ip:
         return {"ok": False, "error_code": "exit_ip_missing", "error": "缺少出口 IP"}
@@ -419,13 +399,11 @@ def lookup_geo(
 
     failures: list[dict[str, Any]] = []
     for template in GEO_TARGETS:
-        _run_stop_checker(stop_checker)
         source = "ipapi" if "ipapi.co" in template else "ipinfo"
         url = template.format(ip=ip)
         start = time.perf_counter()
         try:
             response = requests.get(url, timeout=timeout_seconds, headers={"Accept": "application/json"})
-            _run_stop_checker(stop_checker)
             latency_ms = _elapsed_ms(start)
             if response.status_code >= 400:
                 failures.append(
@@ -446,8 +424,6 @@ def lookup_geo(
             if parsed.get("country_code"):
                 return {"ok": True, "latency_ms": latency_ms, **parsed}
             failures.append({"source": source, "error_code": "geo_country_missing", "error": "GeoIP 未返回国家", "latency_ms": latency_ms})
-        except TaskInterruption:
-            raise
         except Exception as exc:
             failures.append({"source": source, "error_code": classify_error(exc), "error": str(exc)[:500], "latency_ms": _elapsed_ms(start)})
     last = failures[-1] if failures else {}
@@ -485,19 +461,12 @@ def _parse_cloudflare_trace(text: str) -> dict[str, str]:
     }
 
 
-def lookup_geo_via_proxy_trace(
-    proxy_url: str,
-    *,
-    timeout_seconds: int = 6,
-    stop_checker: Callable[[], None] | None = None,
-) -> dict[str, Any]:
-    _run_stop_checker(stop_checker)
+def lookup_geo_via_proxy_trace(proxy_url: str, *, timeout_seconds: int = 6) -> dict[str, Any]:
     valid, message = _validate_proxy_url(proxy_url)
     if not valid:
         return {"ok": False, "error_code": "invalid_url", "error": message}
 
     result = _request_via_proxy(CLOUDFLARE_TRACE_TARGET, proxy_url, timeout_seconds=timeout_seconds)
-    _run_stop_checker(stop_checker)
     if not result.get("ok"):
         return {
             "ok": False,
@@ -860,9 +829,7 @@ def scan_proxy_url(
     timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
     refresh_geo: bool = True,
     existing_geo: dict[str, Any] | None = None,
-    stop_checker: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
-    _run_stop_checker(stop_checker)
     normalized_targets = normalize_targets(targets)
     timeout = parse_int(timeout_seconds, DEFAULT_TIMEOUT_SECONDS, minimum=2, maximum=60)
     started = utcnow()
@@ -878,12 +845,7 @@ def scan_proxy_url(
 
     basic_result: dict[str, Any] | None = None
     if "basic" in normalized_targets:
-        basic_result = probe_basic(
-            proxy_url,
-            timeout_seconds=timeout,
-            stop_checker=stop_checker,
-        )
-        _run_stop_checker(stop_checker)
+        basic_result = probe_basic(proxy_url, timeout_seconds=timeout)
         summary["basic"] = basic_result
 
     if "geo" in normalized_targets:
@@ -897,22 +859,14 @@ def scan_proxy_url(
         ):
             summary["geo"] = {"ok": True, "source": existing.get("source") or "cached", **existing}
         elif exit_ip:
-            proxy_trace_geo = lookup_geo_via_proxy_trace(
-                proxy_url,
-                timeout_seconds=min(timeout, 8),
-                stop_checker=stop_checker,
-            )
+            proxy_trace_geo = lookup_geo_via_proxy_trace(proxy_url, timeout_seconds=min(timeout, 8))
             if proxy_trace_geo.get("ok"):
                 trace_exit_ip = str(proxy_trace_geo.get("exit_ip") or "").strip()
                 if trace_exit_ip:
                     proxy_trace_geo["exit_ip"] = trace_exit_ip
                 summary["geo"] = proxy_trace_geo
             else:
-                ip_geo = lookup_geo(
-                    exit_ip,
-                    timeout_seconds=min(timeout, 8),
-                    stop_checker=stop_checker,
-                )
+                ip_geo = lookup_geo(exit_ip, timeout_seconds=min(timeout, 8))
                 if not ip_geo.get("ok"):
                     failures: list[dict[str, Any]] = []
                     trace_failure = {
@@ -931,7 +885,6 @@ def scan_proxy_url(
 
     chatgpt_result: dict[str, Any] | None = None
     if "chatgpt" in normalized_targets:
-        _run_stop_checker(stop_checker)
         basic_error_code = str((basic_result or {}).get("error_code") or "")
         if basic_result is not None and not basic_result.get("ok") and basic_error_code in PROXY_LEVEL_ERROR_CODES:
             chatgpt_result = {
@@ -946,7 +899,6 @@ def scan_proxy_url(
             }
         else:
             chatgpt_result = probe_chatgpt(proxy_url, timeout_seconds=timeout)
-        _run_stop_checker(stop_checker)
         summary["chatgpt"] = chatgpt_result
 
     summary["scan_status"] = _scan_status_from_results(basic_result, chatgpt_result)

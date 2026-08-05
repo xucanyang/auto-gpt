@@ -2,7 +2,6 @@ import unittest
 from unittest import mock
 
 from core.db import ProxyModel
-from core.task_runtime import StopTaskRequested
 from services import proxy_scanner
 
 
@@ -78,51 +77,6 @@ class ProxyScannerTests(unittest.TestCase):
         self.assertEqual(result["geo"]["country_code"], "US")
         self.assertEqual(result["geo"]["source"], "cloudflare_trace")
         lookup_geo.assert_not_called()
-
-    def test_scan_proxy_url_threads_stop_checker_through_network_phases(self):
-        stop_checker = mock.Mock()
-        with mock.patch(
-            "services.proxy_scanner.probe_basic",
-            return_value={"ok": True, "exit_ip": "203.0.113.10", "latency_ms": 10},
-        ) as probe_basic, mock.patch(
-            "services.proxy_scanner.lookup_geo_via_proxy_trace",
-            return_value={"ok": True, "country_code": "US", "source": "cloudflare_trace"},
-        ) as proxy_trace:
-            proxy_scanner.scan_proxy_url(
-                "socks5://user:pass@127.0.0.1:1080",
-                targets=["basic", "geo"],
-                stop_checker=stop_checker,
-            )
-
-        self.assertIs(probe_basic.call_args.kwargs["stop_checker"], stop_checker)
-        self.assertIs(proxy_trace.call_args.kwargs["stop_checker"], stop_checker)
-        self.assertGreaterEqual(stop_checker.call_count, 2)
-
-    def test_scan_proxy_url_stops_before_starting_network_probe(self):
-        stop_checker = mock.Mock(side_effect=RuntimeError("stop requested"))
-        with mock.patch("services.proxy_scanner.probe_basic") as probe_basic:
-            with self.assertRaisesRegex(RuntimeError, "stop requested"):
-                proxy_scanner.scan_proxy_url(
-                    "socks5://user:pass@127.0.0.1:1080",
-                    targets=["basic", "geo"],
-                    stop_checker=stop_checker,
-                )
-
-        probe_basic.assert_not_called()
-
-    def test_lookup_geo_does_not_swallow_task_interruption_after_request(self):
-        stop_checker = mock.Mock(
-            side_effect=[None, None, StopTaskRequested()],
-        )
-        with mock.patch(
-            "services.proxy_scanner.requests.get",
-            return_value=_Response(payload={"country_code": "JP"}),
-        ):
-            with self.assertRaises(StopTaskRequested):
-                proxy_scanner.lookup_geo(
-                    "203.0.113.10",
-                    stop_checker=stop_checker,
-                )
 
     def test_calculate_health_score_penalizes_blocked_chatgpt(self):
         proxy = ProxyModel(url="http://127.0.0.1:8080", is_active=True)

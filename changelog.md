@@ -16,6 +16,7 @@
 - **新增并校正 ChatGPT 注册失败分析文档**：`docs/chatgpt-registration-failure-analysis.md` 基于主实例与 Plus 实例的历史 `task_logs`，结合 `api/tasks.py`、any-auto 注册链、Sentinel 浏览器和 Docker 运行态重新核对统计与调用边界。文档不再把旧线程池上限 `5` 写成默认并发，不再把独立 `:8889` Solver、无 cgroup 总内存上限时的第二槽门控或未经日志证明的 CSRF 假设写成当前注册根因，并明确区分相关性、因果性、同进程出口租约和跨容器残余风险。
 
 ### 优化 (Changed)
+- **运行版本整体回退至 v2.12.1**：按操作方要求将源码与前端恢复到提交 `5e65526d9ed5f89fad5bf6a8c093746cc838b9c3` 的完整行为基线，并使用新的反向提交保留后续版本历史，不改动主服务、Plus、Plus2 的账号数据库、任务日志、实例 `.env` 或 `shared_config`。本次完整回退同时撤销 v2.12.2 的 OAIPay Plus 仅 AT 上传例外、v2.12.3 的 OTP validate 响应监听与 403 结构化分类、v2.12.4 的动态代理候选探测停止检查；因此 OAIPay 恢复要求 RefreshToken，OTP 403 恢复显示旧的“提交后未跳转”，动态代理准备阶段的立即停止也恢复 v2.12.1 行为。侧栏可见版本恢复为 `v2.12.1`。
 - **Plus 注册浏览器扩容到五槽并增加启动保护（v2.12.1）**：`docker-compose.multi.yml` 将 `auto-gpt-plus` 的进程级 `AUTH_BROWSER_MAX_CONCURRENCY` 从 `3` 提高到 `5`，`pids_limit` 从 `768` 提高到 `1536`，保持 `/dev/shm=2gb`，并把当前 ChatGPT 注册链未使用的独立 Solver 从 `6/1` 收敛为 `1/1`；单个浏览器注册任务自身的有效并发上限仍为 `2`，主实例与 Plus2 继续使用 Auth `2`、Solver `4/1`、PID `768`。`services/chatgpt_core/sentinel_browser.py` 新增 cgroup PID 余量门控与进程级启动错峰：Plus 仅在 `pids.current + 220 <= pids.max` 时领取实际浏览器槽，相邻 Camoufox/Auth 浏览器至少间隔 `4s` 启动；PID 不足会释放 semaphore、按 `browser_slot=waiting reason=pids` 等待重试，停止或异常仍成对释放容量。主实例与 Plus2 的 PID 余量和启动间隔默认均为 `0`，保持原行为。
 - **置顶筛选组合不再限制显示数量（v2.12.1）**：`frontend/src/pages/Accounts.tsx` 移除桌面最多 `8` 个、移动端最多 `4` 个置顶组合的硬截断，所有 `pinned=true` 组合都会交给既有 `FilterPresetBar` 渲染，并继续使用单行横向滚动承载超出宽度的内容；后端组合数量、账号列表排序、分页和每页数量均未调整。`frontend/src/app/AppShell.tsx` 同步可见版本为 `v2.12.1`。
 - **取消手机号绑定与失效测活的固定并发 5 上限（v2.12.0）**：`api/tasks.py` 和 `frontend/src/pages/Accounts.tsx` 删除手机号绑定的 `PHONE_BINDING_MAX_CONCURRENCY=5`、提交端 `Math.min(5, ...)` 与输入框 `max=5`，新批量失效测活同样不设置固定 worker 数上限；两类任务的实际并发只按本次可执行账号数收敛，手机号绑定还会按可用号码数收敛。`reuse_phone_until_unusable` 的同号连续绑定仍强制串行，实例级共享浏览器容量仍负责真实浏览器资源排队，避免把取消表单/任务硬截断误解为绕过身份互斥或运行资源门禁。
@@ -49,9 +50,6 @@
 - **统一测试文档入口**：`README.md`、`AGENTS.md` 与 `docs/docker-image-release.md` 现在统一指向 Docker 测试规范，移除会吞掉收集失败的 `pytest tests -q || true` 作为推荐门禁，明确当前 `requirements-test.txt`、`docker-compose.test.yml` 和测试脚本仍待落地。
 
 ### 修复 (Fixed)
-- **修复失效测活动态代理准备阶段无法立即停止（v2.12.4）**：最近一轮串行任务在账号 2 开始后收到“立即停止”，但仍延迟约 62 秒才落 `STOP`；现场调用链确认 `api/tasks.py` 会在登录前同步生成并探测最多 5 个动态候选，而 `core/proxy_utils.py` / `services/proxy_scanner.py` 的基础出口、Cloudflare trace 与 GeoIP 网络边界没有任务 stop checkpoint。现在失效测活、邮箱测活和 HME 复测把同一 `RegisterTaskControl.checkpoint()` 贯穿到候选生成及每个探测请求前后，停止请求不再继续后续候选或后续探测；已在途的单次 HTTP 请求仍遵守现有最多 8 秒超时，候选质量、国家校验、failover 数量、代理池评分和正常任务结果不变。侧栏可见版本同步为 `v2.12.4`。
-- **修复失效测活吞掉 OTP 403 真实原因（v2.12.3）**：`services/chatgpt_core/any_auto/browser_register.py` 在页面提交验证码前挂载仅匹配 `auth.openai.com/api/accounts/email-otp/validate` 的响应观察器，非 2xx 时读取并脱敏结构化 `code/type/message`，立即把 `account_deactivated`、OTP 冷却/限流或其他 HTTP 拒绝交回 `invalid_account_recheck.py` 的既有分类器；不再等待 20 秒后统一伪装成“验证码页提交后未跳转”和 `unknown_error`。OTP 等待期间页面已推进时直接继续原状态机，无输入框或无提交按钮时优先提取页面明确错误并附不含查询串的 host/path 诊断。成功条件、邮箱归属、代理/并发、Web Session 完整性和账号状态写回规则均保持不变；侧栏可见版本同步为 `v2.12.3`。
-- **修复 OAIPay 将 Plus 仅 AT 账号错误拦截为缺少 RT（v2.12.2）**：`services/chatgpt_account_state.py` 为通用上传 readiness 增加调用方可选的 refresh token 要求，默认仍保持 RT 必填；`services/oaipay_sync.py` 仅在 OAIPay 路径关闭该要求，同时继续阻止认证失效、缺少 AccessToken 或缺少 account/workspace 标识的账号。`services/chatgpt_core/oaipay_upload.py` 移除重复的 RT 硬门禁，使 `Plus + 有 AT + 无 RT` 能进入既有 `paid_without_refresh_token` 自动分类并上传到 `PLUS--未接码`；Sub2API、CPA 与其他 Codex 上传路径不传新选项，原有 RT 门禁不变。侧栏可见版本同步为 `v2.12.2`。
 - **恢复邮箱登录测活对失效测活公共常量的兼容导入（v2.12.0）**：v2.11.2 将 `AT_ONLY_CLEAR_EXTRA_KEYS` 重命名并扩展为失效测活专用集合时，`services/chatgpt_core/custom_email_recheck.py` 的既有导入没有同步，导致邮箱登录测活模块首次加载即 `ImportError`。`invalid_account_recheck.py` 现在恢复旧常量及其原始字段语义，并在此基础上单独扩展失效测活需要清理的 Cookie 与账号 ID；邮箱测活不会因此新增凭据清理行为，失效测活的完整 Web Session 覆盖规则也保持不变。
 - **修复失效测活误入补抓 Auth/RT 与手机号链路（v2.11.2）**：`services/chatgpt_core/invalid_account_recheck.py` 将 `status=invalid` 的账号恢复收口为单一登录测活事务：使用 any-auto Camoufox 的 `login_only` 模式登录已有账号，只在同时取得新的 AccessToken、NextAuth/Auth.js session token 与完整 Cookie header 后写回原账号；成功时清除旧 refresh token、旧 `chatgpt_local` 失效证据，恢复账号主状态与 `account_list_state`，并用新 AT 调度常规本地状态刷新后立即结束。该路径不再调用 `custom_email_recheck`，不再进入 Codex OAuth/RT、`resume_subscription_auth` 或 `add_phone` 绑定；登录落到新账号密码页或 `about_you` 时关闭式失败，落到 `add_phone` 时也只尝试 Web Session 桥接且不会调用手机号回调。
 - **恢复失效测活独立任务身份与单阶段时间线（v2.11.2）**：`frontend/src/pages/Accounts.tsx` 与 `RegisterTaskModal.tsx` 新增独立 `invalid_recheck` 弹窗模式，单个、批量、活动任务恢复和历史快照均显示“失效测活”，不再映射为“补抓Auth”；`api/tasks.py` 将任务时间线改为“登录已有账号并刷新 Web Session”的单阶段合同，完成文案只报告会话写回与本地刷新，不再出现“完整 Auth/RT”或“待补抓 Auth”。侧栏版本同步为 `v2.11.2`。
@@ -93,9 +91,7 @@
 - **短链生成强制 Web Session 门禁**：登录态短链只接受持久化了完整 NextAuth/Auth.js Session Cookie（兼容非分片、连续分片及独立 `session_token`）的账号；AT-only、缺失分片或已清除网页会话的账号在任务解析阶段直接跳过，支付核心再次执行同一门禁作为纵深校验。Cookie、Session Token 和代理凭据不会写入任务元数据、生成历史、接口响应或前端配置摘要；本地短链配置接口仅返回非敏感国家/币种目录和登录态要求。
 
 ### 测试 (Tests)
-- **补齐动态代理协作式停止回归（v2.12.4）**：`tests/test_proxy_scanner.py` 锁定 stop checker 会贯穿基础出口和 GeoIP/Cloudflare trace 探测，并可在任何网络探测启动前直接中断；`tests/test_proxy_utils.py` 进一步锁定网络请求返回后或动态 SID 解析后抛出的 `TaskInterruption` 不会被宽泛异常捕获降级为普通代理失败；`tests/test_invalid_account_recheck.py` 锁定失效测活代理构建器不再丢失任务控制回调。基于现有生产依赖同源测试镜像，以只读 checkout、临时 SQLite/shared config/runtime 和 `--network none` 运行代理扫描、动态代理、共享代理配置、任务中断、失效测活、邮箱测活、HME 复测及 Web Session 相邻回归，共 `97 passed`；测试使用模拟代理响应，不访问真实代理、账号或 OpenAI。
-- **补齐失效测活 OTP 拒绝分类回归（v2.12.3）**：`tests/test_any_auto_web_session_contract.py` 覆盖浏览器页面提交 OTP 收到 `403 account_deactivated` 时保留停用码与原始说明、收到 `403 Too many tries` 时保留冷却语义，并锁定两类响应不得再降级成“未跳转”。基于现有生产依赖同源测试镜像，以只读 checkout、临时 SQLite/shared config 和 `--network none` 运行失效测活/Web Session 专项 `24 passed`；扩大到所有直接引用浏览器注册、恢复邮箱状态与 AccessToken-only 会话链的回归为 `106 passed, 3 failed`，3 条均为 changelog 已记录的旧 `_run_browser_registration`/导航参数断言，未触及本次 OTP 路径。运行镜像内 `py_compile` 与前端 TypeScript/Vite 生产构建通过；测试未访问真实账号、邮箱或 OpenAI。
-- **补齐 OAIPay 仅 AT Plus 分类回归（v2.12.2）**：`tests/test_oaipay_sync.py` 覆盖 backfill readiness 允许有 AT、无 RT 的 Plus 账号继续上传，底层 payload 保留空 RT 并按 `paid_without_refresh_token` 解析到 `PLUS--未接码`；同时锁定缺少 AccessToken 时仍在任何分类或上传网络请求前关闭式跳过，防止本次 OAIPay 例外扩散到无认证材料账号。基于当前生产镜像派生的一次性断网测试容器，以只读 checkout、临时 SQLite/shared config/runtime 运行 OAIPay、通用账号能力、Sub2API、API gate 及批量范围/日志相邻合同，共 `65 passed`；前端 TypeScript 与 Vite 生产构建通过。
+- **验证 v2.12.1 完整回退基线**：使用 `auto-gpt:test-v2121-predeploy` 同源依赖镜像，以只读 checkout、临时 SQLite/shared config/runtime 和 `--network none` 运行失效测活、Web Session、动态代理、共享任务代理、代理扫描、OAIPay、Sentinel 浏览器容量与筛选 UI 回归，共 `124 passed`；测试未访问真实账号、邮箱、代理或 OpenAI。另执行前端 TypeScript/Vite 生产构建和回退涉及 Python 模块的 `py_compile`，确保发布内容与 `5e65526` 行为基线一致且可加载。
 - **补齐五槽资源门控与置顶组合显示合同（v2.12.1）**：`tests/test_sentinel_browser.py` 覆盖 PID 余量不足时后续浏览器等待、余量恢复后继续、结构化 `reason=pids` 日志，以及启动间隔不会绕过共享容量上限；`tests/test_account_filter_presets_ui.py` 锁定置顶组合仍按 `pinned` 过滤、旧 `slice(0, isMobile ? 4 : 8)` 截断不再出现，并确认组件遍历全部 `pinnedFilterPresets`。基于当前生产镜像派生的一次性 pytest 镜像，以只读 checkout、临时 runtime/shared config 和 `--network none` 运行两个专项文件，结果 `31 passed`；前端 TypeScript 与 Vite 生产构建通过，Compose 展开校验确认三实例资源参数分别为 Auth `2/5/2`、Solver `4/1/4`、PID `768/1536/768`。
 - **补齐失效测活代理/并发与手机号无固定上限回归（v2.12.0）**：`tests/test_invalid_account_recheck.py` 覆盖任务代理进入实际浏览器运输、旧直连合同、指定代理参数、批量请求并发 `6` 不被截断及线程池实测峰值 `6`；`tests/test_phone_pool_task_integration.py` 锁定手机号绑定请求/实际并发 `6` 与任务快照一致；`frontend/tests/invalidRecheckTaskModalContract.test.mjs` 锁定单个/批量配置入口、四种代理方式、并发 payload 及前端不再出现 5 上限。基于生产依赖派生的只读 checkout、临时 SQLite/shared config、断网一次性测试容器中专项 `33 passed`，扩大到代理解析、筛选范围、浏览器登录合同、手机号分配与任务日志后 `119 passed`；修复兼容常量后全仓为 `1236 passed, 1 skipped, 5 failed`，5 条均是既有 changelog 已记录的旧浏览器接口/导航断言、手机号旧文案和已退役 GoPay 类型合同，没有本次新增失败。前端 Node 合同 `33 passed`，TypeScript/Vite 生产构建通过。
 - **补齐失效测活 Web Session 收口回归（v2.11.2）**：`tests/test_invalid_account_recheck.py` 覆盖完整 AT/session/cookie 覆盖旧材料、清理旧 RT 与本地失效证据、原账号状态及派生列表状态同步、禁止后续 Auth 调用、缺失 session/cookie 保持失效、停用账号分类和 `login_only` 运输参数；`tests/test_any_auto_web_session_contract.py` 覆盖只登录模式透传、注册专属状态拒绝、`add_phone` 不触发手机号绑定以及登录后继续执行 Web Session 桥接；`frontend/tests/invalidRecheckTaskModalContract.test.mjs` 锁定失效测活来源、启动处理器和标题均不得回退为 `resume_auth` / “补抓Auth”。从当前生产镜像派生的一次性断网测试容器中专项 `19 passed`；浏览器状态机、AccessToken-only 注册和账号筛选相邻回归 `106 passed, 3 failed`，3 条失败已在镜像内置的发布前源码复现，均为 changelog 已记录的旧 `_run_browser_registration` / 导航参数测试漂移；前端 Node 合同 `32 passed`，TypeScript/Vite 生产构建通过。全仓 ESLint 仍有既存的 `489 errors, 9 warnings`，主要来自历史 `no-explicit-any` 与 React hooks 规则，不属于本次改动。
@@ -3305,14 +3301,6 @@
 - 扩容 Plus 注册浏览器至五槽并开放全部置顶筛选组合
 - 发布模式: multi
 
-## 2026-08-05 13:05:05 +0800
-- 修复 OAIPay Plus 仅 AT 账号误拦截并恢复未接码自动分类 v2.12.2
-- 发布模式: multi
-
-## 2026-08-05 14:56:39 +0800
-- 修复失效测活 OTP 403 原因捕获与分类 v2.12.3
-- 发布模式: multi
-
-## 2026-08-05 15:07:28 +0800
-- 修复失效测活动态代理准备阶段立即停止 v2.12.4
+## 2026-08-05 16:18:05 +0800
+- 整体回退运行版本至 v2.12.1
 - 发布模式: multi

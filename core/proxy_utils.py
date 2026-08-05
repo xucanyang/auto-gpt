@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 import ipaddress
-from typing import Any, Callable, Optional
+from typing import Any, Optional
 from urllib.parse import unquote, urlsplit
-
-from .task_runtime import TaskInterruption
 
 
 def normalize_proxy_url(proxy_url: Optional[str]) -> Optional[str]:
@@ -203,7 +201,6 @@ def _dynamic_probe_source(
     sid_refreshed: bool,
     timeout_seconds: int,
     require_country_match: bool,
-    stop_checker: Callable[[], None] | None = None,
 ) -> tuple[bool, str]:
     from services.proxy_scanner import scan_proxy_url
 
@@ -212,7 +209,6 @@ def _dynamic_probe_source(
         targets=["basic", "geo"],
         timeout_seconds=timeout_seconds,
         refresh_geo=True,
-        stop_checker=stop_checker,
     )
     basic = summary.get("basic") if isinstance(summary.get("basic"), dict) else {}
     geo = summary.get("geo") if isinstance(summary.get("geo"), dict) else {}
@@ -253,7 +249,6 @@ def _dynamic_candidate_tuples(
     require_country_match: bool,
     timeout_seconds: int,
     retention_minutes: Any = None,
-    stop_checker: Callable[[], None] | None = None,
 ) -> list[tuple[str, Any, str]]:
     from .dynamic_proxy import resolve_dynamic_proxy_template
 
@@ -269,8 +264,6 @@ def _dynamic_candidate_tuples(
     seen: set[str] = set()
 
     for _ in range(desired_count):
-        if callable(stop_checker):
-            stop_checker()
         try:
             resolved = resolve_dynamic_proxy_template(
                 template,
@@ -278,8 +271,6 @@ def _dynamic_candidate_tuples(
                 refresh_sid=True,
                 retention_minutes=retention_minutes,
             )
-            if callable(stop_checker):
-                stop_checker()
             runtime_proxy = normalize_proxy_url(resolved.proxy_url) or ""
             if not runtime_proxy:
                 raise RuntimeError("动态节点地址解析后为空")
@@ -297,10 +288,7 @@ def _dynamic_candidate_tuples(
                     sid_refreshed=resolved.sid_refreshed,
                     timeout_seconds=timeout_seconds,
                     require_country_match=require_country_match,
-                    stop_checker=stop_checker,
                 )
-                if callable(stop_checker):
-                    stop_checker()
                 if not ok:
                     errors.append(source)
                     continue
@@ -309,8 +297,6 @@ def _dynamic_candidate_tuples(
                 retention_text = f" retention=t-{resolved.retention_minutes}" if resolved.retention_minutes else ""
                 source = f"dynamic country={resolved.requested_country_code} actual=unverified provider={resolved.provider} sid={sid_text}{retention_text} probe=disabled"
             candidates.append((runtime_proxy, None, source))
-        except TaskInterruption:
-            raise
         except Exception as exc:
             errors.append(_safe_source_text(exc))
             if not failover:
@@ -328,7 +314,6 @@ def resolve_task_proxy_candidates(
     default_mode: str = "direct",
     *,
     target: str = "chatgpt",
-    stop_checker: Callable[[], None] | None = None,
 ) -> list[tuple[str, Any, str]]:
     """统一解析任务级代理候选，支持 direct / specified / pool / dynamic。"""
     if params is None or not isinstance(params, dict):
@@ -508,7 +493,6 @@ def resolve_task_proxy_candidates(
             probe_enabled=probe_enabled,
             require_country_match=require_country_match,
             timeout_seconds=timeout_seconds,
-            stop_checker=stop_checker,
         )
 
     try:
