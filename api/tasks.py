@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, PrivateAttr
 from sqlalchemy import func, text
 from sqlmodel import Session, select
-from typing import Any, Literal, Optional
+from typing import Any, Callable, Literal, Optional
 from copy import deepcopy
 from core.db import AccountModel, PaymentLinkGenerationModel, TaskLog, engine
 from core.pix_cdk_usage import (
@@ -3561,7 +3561,11 @@ def _custom_email_account_delay_seconds(value: Any) -> float:
     return min(delay, 600.0)
 
 
-def _build_custom_email_recheck_candidate_proxies(settings: dict[str, Any] | None) -> list[tuple[str, object | None, str]]:
+def _build_custom_email_recheck_candidate_proxies(
+    settings: dict[str, Any] | None,
+    *,
+    stop_checker: Callable[[], None] | None = None,
+) -> list[tuple[str, object | None, str]]:
     from core.proxy_utils import resolve_task_proxy_candidates
 
     return resolve_task_proxy_candidates(
@@ -3569,6 +3573,7 @@ def _build_custom_email_recheck_candidate_proxies(settings: dict[str, Any] | Non
         fallback_proxy=None,
         default_mode="global",
         target="chatgpt",
+        stop_checker=stop_checker,
     )
 
 
@@ -3690,7 +3695,10 @@ def _execute_invalid_recheck_with_proxy_candidates(
             raise ValueError("仅 status=invalid 的账号需要失效测活")
         email = str(account.email or "")
 
-    candidate_proxies = _build_custom_email_recheck_candidate_proxies(proxy_settings)
+    candidate_proxies = _build_custom_email_recheck_candidate_proxies(
+        proxy_settings,
+        stop_checker=lambda: control.checkpoint(attempt_id=attempt_id),
+    )
     last_result: dict[str, Any] = {}
     last_proxy_error = ""
     for proxy_index, (candidate_proxy, candidate_proxy_pool, candidate_proxy_source) in enumerate(
@@ -4274,7 +4282,10 @@ def _run_icloud_hme_recheck_batch(
             try:
                 control.checkpoint(attempt_id=attempt_id)
                 _log(task_id, f"[HME复测] -------- {index}/{total} | {email} --------")
-                candidate_proxies = _build_custom_email_recheck_candidate_proxies(proxy_settings)
+                candidate_proxies = _build_custom_email_recheck_candidate_proxies(
+                    proxy_settings,
+                    stop_checker=lambda: control.checkpoint(attempt_id=attempt_id),
+                )
                 last_proxy_error = ""
                 final_error = ""
                 result: dict[str, Any] = {}
@@ -8222,7 +8233,10 @@ def _run_custom_email_recheck(
         attempt_id = _claim_next_task_attempt(control)
         try:
             control.checkpoint(attempt_id=attempt_id)
-            candidate_proxies = _build_custom_email_recheck_candidate_proxies(proxy_settings)
+            candidate_proxies = _build_custom_email_recheck_candidate_proxies(
+                proxy_settings,
+                stop_checker=lambda: control.checkpoint(attempt_id=attempt_id),
+            )
             last_proxy_error = ""
             final_error = ""
             result: dict[str, Any] = {}
@@ -8539,7 +8553,10 @@ def _run_batch_custom_email_recheck(
                     next_step="登录测活并抓取 AccessToken",
                     reset_started_at=True,
                 )
-                candidate_proxies = _build_custom_email_recheck_candidate_proxies(proxy_settings)
+                candidate_proxies = _build_custom_email_recheck_candidate_proxies(
+                    proxy_settings,
+                    stop_checker=lambda: control.checkpoint(attempt_id=attempt_id),
+                )
                 last_proxy_error = ""
                 final_error = ""
                 result: dict[str, Any] = {}

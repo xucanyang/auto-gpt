@@ -1,4 +1,9 @@
+from types import SimpleNamespace
+
+import pytest
+
 from core.proxy_utils import is_proxy_error_text
+from core.task_runtime import StopTaskRequested
 
 
 def test_hme_ready_control_plane_timeout_is_not_a_proxy_failure():
@@ -67,3 +72,36 @@ def test_dynamic_empty_country_raises_instead_of_defaulting_jp(monkeypatch):
     except RuntimeError as exc:
         text = str(exc)
         assert "出口国家" in text or "country" in text.lower()
+
+
+def test_dynamic_candidate_does_not_swallow_task_interruption(monkeypatch):
+    from core import proxy_utils as pu
+
+    monkeypatch.setattr(
+        "core.dynamic_proxy.resolve_dynamic_proxy_template",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            proxy_url="socks5://user:pass@127.0.0.1:1080",
+            requested_country_code="JP",
+            resolved_country_code="JP",
+            provider="test",
+            sid_refreshed=True,
+            retention_minutes=5,
+        ),
+    )
+    checkpoints = iter((False, True))
+
+    def stop_checker():
+        if next(checkpoints):
+            raise StopTaskRequested()
+
+    with pytest.raises(StopTaskRequested):
+        pu._dynamic_candidate_tuples(
+            template="socks5://user:pass@127.0.0.1:1080",
+            country_code="JP",
+            max_candidates=1,
+            failover=True,
+            probe_enabled=False,
+            require_country_match=True,
+            timeout_seconds=8,
+            stop_checker=stop_checker,
+        )

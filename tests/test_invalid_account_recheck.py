@@ -12,6 +12,7 @@ from api.tasks import (
     BatchInvalidRecheckTaskRequest,
     InvalidRecheckTaskRequest,
     _create_standalone_task_record,
+    _build_custom_email_recheck_candidate_proxies,
     _recheck_proxy_settings,
     _resolve_batch_invalid_recheck_accounts,
     _run_batch_invalid_recheck,
@@ -276,6 +277,20 @@ class InvalidAccountRecheckTests(unittest.TestCase):
         self.assertEqual(settings["proxy_country_code"], "US")
         self.assertTrue(settings["proxy_failover"])
         self.assertEqual(settings["proxy_max_candidates"], 9)
+
+    def test_invalid_recheck_proxy_builder_forwards_stop_checker(self):
+        stop_checker = mock.Mock()
+        with mock.patch(
+            "core.proxy_utils.resolve_task_proxy_candidates",
+            return_value=[("", None, "direct")],
+        ) as resolver:
+            candidates = _build_custom_email_recheck_candidate_proxies(
+                {"proxy_mode": "direct"},
+                stop_checker=stop_checker,
+            )
+
+        self.assertEqual(candidates, [("", None, "direct")])
+        self.assertIs(resolver.call_args.kwargs["stop_checker"], stop_checker)
 
     def test_batch_invalid_recheck_preserves_requested_concurrency_above_five(self):
         account_ids = [
