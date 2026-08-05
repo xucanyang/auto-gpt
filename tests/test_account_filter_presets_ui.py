@@ -66,6 +66,7 @@ def test_legacy_fixed_migration_requires_explicit_parent_selection():
         "const moveFixedMigrationPriority",
         1,
     )[0]
+    assert "setFilterPresetManageOpen(false)" in migration_handler
     assert "setFixedMigrationParentById({})" in migration_handler
     assert "fallbackParentId" not in migration_handler
     assert "outside_parent_account_count" in page

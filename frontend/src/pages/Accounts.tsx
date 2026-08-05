@@ -3669,6 +3669,7 @@ export default function Accounts() {
   }, [activeFilterPresetId, activeFixedGroupId, applyUnassignedScope, clearFilterPreset])
 
   const openFixedMigration = useCallback(() => {
+    setFilterPresetManageOpen(false)
     setFixedMigrationParentById({})
     setFixedMigrationPriority(legacyFixedPresets.map((preset) => preset.id))
     setFixedMigrationPreview(null)
