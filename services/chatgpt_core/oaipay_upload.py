@@ -796,14 +796,6 @@ def upload_to_oaipay_detailed(
             "upload_gate": "blocked_missing_at",
             "message": "跳过上传：缺少 access_token，认证材料尚未就绪",
         }
-    if not str(token_data.get("refresh_token") or "").strip():
-        return {
-            "ok": False,
-            "skipped": True,
-            "upload_gate": "blocked_missing_rt",
-            "message": "跳过上传：缺少 refresh_token",
-        }
-
     if capabilities is None:
         from services.chatgpt_account_state import classify_chatgpt_capabilities
         caps = classify_chatgpt_capabilities(upload_account)

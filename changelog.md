@@ -49,6 +49,7 @@
 - **统一测试文档入口**：`README.md`、`AGENTS.md` 与 `docs/docker-image-release.md` 现在统一指向 Docker 测试规范，移除会吞掉收集失败的 `pytest tests -q || true` 作为推荐门禁，明确当前 `requirements-test.txt`、`docker-compose.test.yml` 和测试脚本仍待落地。
 
 ### 修复 (Fixed)
+- **修复 OAIPay 将 Plus 仅 AT 账号错误拦截为缺少 RT（v2.12.2）**：`services/chatgpt_account_state.py` 为通用上传 readiness 增加调用方可选的 refresh token 要求，默认仍保持 RT 必填；`services/oaipay_sync.py` 仅在 OAIPay 路径关闭该要求，同时继续阻止认证失效、缺少 AccessToken 或缺少 account/workspace 标识的账号。`services/chatgpt_core/oaipay_upload.py` 移除重复的 RT 硬门禁，使 `Plus + 有 AT + 无 RT` 能进入既有 `paid_without_refresh_token` 自动分类并上传到 `PLUS--未接码`；Sub2API、CPA 与其他 Codex 上传路径不传新选项，原有 RT 门禁不变。侧栏可见版本同步为 `v2.12.2`。
 - **恢复邮箱登录测活对失效测活公共常量的兼容导入（v2.12.0）**：v2.11.2 将 `AT_ONLY_CLEAR_EXTRA_KEYS` 重命名并扩展为失效测活专用集合时，`services/chatgpt_core/custom_email_recheck.py` 的既有导入没有同步，导致邮箱登录测活模块首次加载即 `ImportError`。`invalid_account_recheck.py` 现在恢复旧常量及其原始字段语义，并在此基础上单独扩展失效测活需要清理的 Cookie 与账号 ID；邮箱测活不会因此新增凭据清理行为，失效测活的完整 Web Session 覆盖规则也保持不变。
 - **修复失效测活误入补抓 Auth/RT 与手机号链路（v2.11.2）**：`services/chatgpt_core/invalid_account_recheck.py` 将 `status=invalid` 的账号恢复收口为单一登录测活事务：使用 any-auto Camoufox 的 `login_only` 模式登录已有账号，只在同时取得新的 AccessToken、NextAuth/Auth.js session token 与完整 Cookie header 后写回原账号；成功时清除旧 refresh token、旧 `chatgpt_local` 失效证据，恢复账号主状态与 `account_list_state`，并用新 AT 调度常规本地状态刷新后立即结束。该路径不再调用 `custom_email_recheck`，不再进入 Codex OAuth/RT、`resume_subscription_auth` 或 `add_phone` 绑定；登录落到新账号密码页或 `about_you` 时关闭式失败，落到 `add_phone` 时也只尝试 Web Session 桥接且不会调用手机号回调。
 - **恢复失效测活独立任务身份与单阶段时间线（v2.11.2）**：`frontend/src/pages/Accounts.tsx` 与 `RegisterTaskModal.tsx` 新增独立 `invalid_recheck` 弹窗模式，单个、批量、活动任务恢复和历史快照均显示“失效测活”，不再映射为“补抓Auth”；`api/tasks.py` 将任务时间线改为“登录已有账号并刷新 Web Session”的单阶段合同，完成文案只报告会话写回与本地刷新，不再出现“完整 Auth/RT”或“待补抓 Auth”。侧栏版本同步为 `v2.11.2`。
@@ -90,6 +91,7 @@
 - **短链生成强制 Web Session 门禁**：登录态短链只接受持久化了完整 NextAuth/Auth.js Session Cookie（兼容非分片、连续分片及独立 `session_token`）的账号；AT-only、缺失分片或已清除网页会话的账号在任务解析阶段直接跳过，支付核心再次执行同一门禁作为纵深校验。Cookie、Session Token 和代理凭据不会写入任务元数据、生成历史、接口响应或前端配置摘要；本地短链配置接口仅返回非敏感国家/币种目录和登录态要求。
 
 ### 测试 (Tests)
+- **补齐 OAIPay 仅 AT Plus 分类回归（v2.12.2）**：`tests/test_oaipay_sync.py` 覆盖 backfill readiness 允许有 AT、无 RT 的 Plus 账号继续上传，底层 payload 保留空 RT 并按 `paid_without_refresh_token` 解析到 `PLUS--未接码`；同时锁定缺少 AccessToken 时仍在任何分类或上传网络请求前关闭式跳过，防止本次 OAIPay 例外扩散到无认证材料账号。基于当前生产镜像派生的一次性断网测试容器，以只读 checkout、临时 SQLite/shared config/runtime 运行 OAIPay、通用账号能力、Sub2API、API gate 及批量范围/日志相邻合同，共 `65 passed`；前端 TypeScript 与 Vite 生产构建通过。
 - **补齐五槽资源门控与置顶组合显示合同（v2.12.1）**：`tests/test_sentinel_browser.py` 覆盖 PID 余量不足时后续浏览器等待、余量恢复后继续、结构化 `reason=pids` 日志，以及启动间隔不会绕过共享容量上限；`tests/test_account_filter_presets_ui.py` 锁定置顶组合仍按 `pinned` 过滤、旧 `slice(0, isMobile ? 4 : 8)` 截断不再出现，并确认组件遍历全部 `pinnedFilterPresets`。基于当前生产镜像派生的一次性 pytest 镜像，以只读 checkout、临时 runtime/shared config 和 `--network none` 运行两个专项文件，结果 `31 passed`；前端 TypeScript 与 Vite 生产构建通过，Compose 展开校验确认三实例资源参数分别为 Auth `2/5/2`、Solver `4/1/4`、PID `768/1536/768`。
 - **补齐失效测活代理/并发与手机号无固定上限回归（v2.12.0）**：`tests/test_invalid_account_recheck.py` 覆盖任务代理进入实际浏览器运输、旧直连合同、指定代理参数、批量请求并发 `6` 不被截断及线程池实测峰值 `6`；`tests/test_phone_pool_task_integration.py` 锁定手机号绑定请求/实际并发 `6` 与任务快照一致；`frontend/tests/invalidRecheckTaskModalContract.test.mjs` 锁定单个/批量配置入口、四种代理方式、并发 payload 及前端不再出现 5 上限。基于生产依赖派生的只读 checkout、临时 SQLite/shared config、断网一次性测试容器中专项 `33 passed`，扩大到代理解析、筛选范围、浏览器登录合同、手机号分配与任务日志后 `119 passed`；修复兼容常量后全仓为 `1236 passed, 1 skipped, 5 failed`，5 条均是既有 changelog 已记录的旧浏览器接口/导航断言、手机号旧文案和已退役 GoPay 类型合同，没有本次新增失败。前端 Node 合同 `33 passed`，TypeScript/Vite 生产构建通过。
 - **补齐失效测活 Web Session 收口回归（v2.11.2）**：`tests/test_invalid_account_recheck.py` 覆盖完整 AT/session/cookie 覆盖旧材料、清理旧 RT 与本地失效证据、原账号状态及派生列表状态同步、禁止后续 Auth 调用、缺失 session/cookie 保持失效、停用账号分类和 `login_only` 运输参数；`tests/test_any_auto_web_session_contract.py` 覆盖只登录模式透传、注册专属状态拒绝、`add_phone` 不触发手机号绑定以及登录后继续执行 Web Session 桥接；`frontend/tests/invalidRecheckTaskModalContract.test.mjs` 锁定失效测活来源、启动处理器和标题均不得回退为 `resume_auth` / “补抓Auth”。从当前生产镜像派生的一次性断网测试容器中专项 `19 passed`；浏览器状态机、AccessToken-only 注册和账号筛选相邻回归 `106 passed, 3 failed`，3 条失败已在镜像内置的发布前源码复现，均为 changelog 已记录的旧 `_run_browser_registration` / 导航参数测试漂移；前端 Node 合同 `32 passed`，TypeScript/Vite 生产构建通过。全仓 ESLint 仍有既存的 `489 errors, 9 warnings`，主要来自历史 `no-explicit-any` 与 React hooks 规则，不属于本次改动。
@@ -3297,4 +3299,8 @@
 
 ## 2026-08-05 10:45:36 +0800
 - 扩容 Plus 注册浏览器至五槽并开放全部置顶筛选组合
+- 发布模式: multi
+
+## 2026-08-05 13:05:05 +0800
+- 修复 OAIPay Plus 仅 AT 账号误拦截并恢复未接码自动分类 v2.12.2
 - 发布模式: multi
